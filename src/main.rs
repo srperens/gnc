@@ -61,15 +61,19 @@ enum Command {
         csv: Option<String>,
     },
 
-    /// Run all Phase 1 experiments on an input image
+    /// Run experiments on an input image
     Sweep {
         /// Input image file
         #[arg(short, long)]
         input: String,
 
         /// Output CSV file for results
-        #[arg(long, default_value = "results/phase1_sweep.csv")]
+        #[arg(long, default_value = "results/sweep.csv")]
         csv: String,
+
+        /// Experiment set: all, baseline, deadzone, levels, subband
+        #[arg(short, long, default_value = "all")]
+        experiment: String,
     },
 }
 
@@ -111,6 +115,7 @@ fn main() {
                 quantization_step: qstep,
                 dead_zone: 0.0,
                 wavelet_levels: 3,
+                subband_weights: gnc::SubbandWeights::uniform(3),
             };
 
             let compressed = encoder.encode(&ctx, &rgb_data, w, h, &config);
@@ -185,13 +190,13 @@ fn main() {
 
             println!("Quality: {}", qm);
 
-            // Throughput measurement
+            // Throughput measurement (decode uses u8 path — 4x less readback)
             let tp = throughput::measure_throughput(
                 || {
                     encoder.encode(&ctx, &rgb_data, w, h, &config);
                 },
                 || {
-                    decoder.decode(&ctx, &compressed);
+                    decoder.decode_u8(&ctx, &compressed);
                 },
                 w,
                 h,
@@ -218,16 +223,31 @@ fn main() {
             }
         }
 
-        Command::Sweep { input, csv } => {
+        Command::Sweep { input, csv, experiment } => {
             let (rgb_data, w, h) = load_image_rgb_f32(&input);
-            println!("Phase 1 sweep: {}x{} image", w, h);
+            println!("Sweep ({}): {}x{} image", experiment, w, h);
 
             let ctx = GpuContext::new();
             let encoder = EncoderPipeline::new(&ctx);
             let decoder = DecoderPipeline::new(&ctx);
 
-            let mut all_experiments = experiments::phase1_experiments();
-            all_experiments.extend(experiments::wavelet_level_experiments());
+            let all_experiments = match experiment.as_str() {
+                "baseline" => experiments::phase1_experiments(),
+                "deadzone" => experiments::dead_zone_experiments(),
+                "levels" => experiments::wavelet_level_experiments(),
+                "subband" => experiments::subband_weight_experiments(),
+                "all" => {
+                    let mut e = experiments::phase1_experiments();
+                    e.extend(experiments::wavelet_level_experiments());
+                    e.extend(experiments::dead_zone_experiments());
+                    e.extend(experiments::subband_weight_experiments());
+                    e
+                }
+                other => {
+                    eprintln!("Unknown experiment set: {}. Use: all, baseline, deadzone, levels, subband", other);
+                    std::process::exit(1);
+                }
+            };
             let mut results = Vec::new();
 
             for exp in &all_experiments {
@@ -274,12 +294,13 @@ fn main() {
     }
 }
 
-// Serialization for compressed frames (rANS per-tile)
+// Serialization for compressed frames (interleaved rANS per-tile)
+// GPC4 format: adds subband weights to the header for correct decoder round-trip.
 fn serialize_compressed(frame: &gnc::CompressedFrame) -> Vec<u8> {
     use gnc::encoder::rans;
     let mut out = Vec::new();
     // Header
-    out.extend_from_slice(b"GPC2"); // version 2 = rANS
+    out.extend_from_slice(b"GPC4"); // version 4 = subband-weighted quantization
     out.extend_from_slice(&frame.info.width.to_le_bytes());
     out.extend_from_slice(&frame.info.height.to_le_bytes());
     out.extend_from_slice(&frame.info.bit_depth.to_le_bytes());
@@ -287,11 +308,22 @@ fn serialize_compressed(frame: &gnc::CompressedFrame) -> Vec<u8> {
     out.extend_from_slice(&frame.config.quantization_step.to_le_bytes());
     out.extend_from_slice(&frame.config.dead_zone.to_le_bytes());
     out.extend_from_slice(&frame.config.wavelet_levels.to_le_bytes());
+    // Subband weights: ll, num_detail_levels, per-level [LH, HL, HH], chroma_weight
+    let sw = &frame.config.subband_weights;
+    out.extend_from_slice(&sw.ll.to_le_bytes());
+    let num_detail = sw.detail.len() as u32;
+    out.extend_from_slice(&num_detail.to_le_bytes());
+    for level in &sw.detail {
+        out.extend_from_slice(&level[0].to_le_bytes()); // LH
+        out.extend_from_slice(&level[1].to_le_bytes()); // HL
+        out.extend_from_slice(&level[2].to_le_bytes()); // HH
+    }
+    out.extend_from_slice(&sw.chroma_weight.to_le_bytes());
+    // Tile count + per-tile data
     let num_tiles = frame.tiles.len() as u32;
     out.extend_from_slice(&num_tiles.to_le_bytes());
-    // Per-tile data
     for tile in &frame.tiles {
-        let tile_bytes = rans::serialize_tile(tile);
+        let tile_bytes = rans::serialize_tile_interleaved(tile);
         out.extend_from_slice(&tile_bytes);
     }
     out
@@ -300,7 +332,11 @@ fn serialize_compressed(frame: &gnc::CompressedFrame) -> Vec<u8> {
 fn deserialize_compressed(data: &[u8]) -> gnc::CompressedFrame {
     use gnc::encoder::rans;
     assert!(data.len() >= 36, "File too small");
-    assert_eq!(&data[0..4], b"GPC2", "Invalid magic (expected GPC2 for rANS format)");
+    assert_eq!(
+        &data[0..4],
+        b"GPC4",
+        "Invalid magic (expected GPC4 for subband-weighted format)"
+    );
 
     let width = u32::from_le_bytes(data[4..8].try_into().unwrap());
     let height = u32::from_le_bytes(data[8..12].try_into().unwrap());
@@ -309,12 +345,28 @@ fn deserialize_compressed(data: &[u8]) -> gnc::CompressedFrame {
     let qstep = f32::from_le_bytes(data[20..24].try_into().unwrap());
     let dead_zone = f32::from_le_bytes(data[24..28].try_into().unwrap());
     let wavelet_levels = u32::from_le_bytes(data[28..32].try_into().unwrap());
-    let num_tiles = u32::from_le_bytes(data[32..36].try_into().unwrap()) as usize;
 
-    let mut pos = 36;
+    // Subband weights
+    let ll = f32::from_le_bytes(data[32..36].try_into().unwrap());
+    let num_detail = u32::from_le_bytes(data[36..40].try_into().unwrap()) as usize;
+    let mut pos = 40;
+    let mut detail = Vec::with_capacity(num_detail);
+    for _ in 0..num_detail {
+        let lh = f32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
+        let hl = f32::from_le_bytes(data[pos + 4..pos + 8].try_into().unwrap());
+        let hh = f32::from_le_bytes(data[pos + 8..pos + 12].try_into().unwrap());
+        detail.push([lh, hl, hh]);
+        pos += 12;
+    }
+    let chroma_weight = f32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
+    pos += 4;
+
+    let num_tiles = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+    pos += 4;
+
     let mut tiles = Vec::with_capacity(num_tiles);
     for _ in 0..num_tiles {
-        let (tile, consumed) = rans::deserialize_tile(&data[pos..]);
+        let (tile, consumed) = rans::deserialize_tile_interleaved(&data[pos..]);
         tiles.push(tile);
         pos += consumed;
     }
@@ -331,6 +383,11 @@ fn deserialize_compressed(data: &[u8]) -> gnc::CompressedFrame {
             quantization_step: qstep,
             dead_zone,
             wavelet_levels,
+            subband_weights: gnc::SubbandWeights {
+                ll,
+                detail,
+                chroma_weight,
+            },
         },
         tiles,
     }

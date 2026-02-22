@@ -251,6 +251,189 @@ fn normalize_histogram(hist: &[u32], target_sum: u32) -> Vec<u32> {
     freqs
 }
 
+pub const STREAMS_PER_TILE: usize = 32;
+
+/// A compressed tile using 32 interleaved rANS streams.
+/// Coefficients are split stride-32 across streams sharing one frequency table.
+/// Designed for GPU decode: one thread per stream, one workgroup per tile.
+#[derive(Debug, Clone)]
+pub struct InterleavedRansTile {
+    /// Minimum coefficient value (offset for symbol mapping)
+    pub min_val: i32,
+    /// Number of symbols in alphabet
+    pub alphabet_size: u32,
+    /// Number of coefficients encoded
+    pub num_coefficients: u32,
+    /// Normalized frequency table (sum = RANS_M = 4096)
+    pub freqs: Vec<u32>,
+    /// Cumulative frequency table (length = alphabet_size + 1)
+    pub cumfreqs: Vec<u32>,
+    /// Per-stream encoded byte data (renormalization bytes, excludes initial state)
+    pub stream_data: Vec<Vec<u8>>,
+    /// Per-stream initial rANS state
+    pub stream_initial_state: Vec<u32>,
+}
+
+impl InterleavedRansTile {
+    pub fn byte_size(&self) -> usize {
+        // header: 12 + 32*4 (stream lengths) + 32*4 (initial states) = 268
+        // freq table: alphabet_size * 2
+        // stream data: sum of all stream lengths
+        268 + self.alphabet_size as usize * 2
+            + self.stream_data.iter().map(|s| s.len()).sum::<usize>()
+    }
+}
+
+/// Encode a tile's quantized coefficients using 32 interleaved rANS streams.
+/// All streams share one frequency table built from all coefficients.
+/// Stream i gets coefficients at indices i, i+32, i+64, ... (stride-32).
+pub fn rans_encode_tile_interleaved(coefficients: &[i32]) -> InterleavedRansTile {
+    if coefficients.is_empty() {
+        return InterleavedRansTile {
+            min_val: 0,
+            alphabet_size: 0,
+            num_coefficients: 0,
+            freqs: vec![],
+            cumfreqs: vec![0],
+            stream_data: vec![vec![]; STREAMS_PER_TILE],
+            stream_initial_state: vec![RANS_BYTE_L; STREAMS_PER_TILE],
+        };
+    }
+
+    // Build shared frequency table from ALL coefficients
+    let min_val = *coefficients.iter().min().unwrap();
+    let max_val = *coefficients.iter().max().unwrap();
+    let alphabet_size = (max_val - min_val + 1) as usize;
+
+    let mut hist = vec![0u32; alphabet_size];
+    for &c in coefficients {
+        hist[(c - min_val) as usize] += 1;
+    }
+
+    let freqs = normalize_histogram(&hist, RANS_M);
+
+    let mut cumfreqs = vec![0u32; alphabet_size + 1];
+    for i in 0..alphabet_size {
+        cumfreqs[i + 1] = cumfreqs[i] + freqs[i];
+    }
+    debug_assert_eq!(cumfreqs[alphabet_size], RANS_M);
+
+    // Encode each of the 32 streams independently
+    let num_coefficients = coefficients.len();
+    let mut stream_data = Vec::with_capacity(STREAMS_PER_TILE);
+    let mut stream_initial_state = Vec::with_capacity(STREAMS_PER_TILE);
+
+    for s in 0..STREAMS_PER_TILE {
+        let stream_coeffs: Vec<i32> = coefficients
+            .iter()
+            .skip(s)
+            .step_by(STREAMS_PER_TILE)
+            .copied()
+            .collect();
+
+        if stream_coeffs.is_empty() {
+            stream_data.push(vec![]);
+            stream_initial_state.push(RANS_BYTE_L);
+            continue;
+        }
+
+        let buf_size = stream_coeffs.len() * 2 + 64;
+        let mut buf = vec![0u8; buf_size];
+        let mut ptr = buf_size;
+        let mut state: u32 = RANS_BYTE_L;
+
+        for &c in stream_coeffs.iter().rev() {
+            let sym = (c - min_val) as usize;
+            let start = cumfreqs[sym];
+            let freq = freqs[sym];
+
+            let x_max = ((RANS_BYTE_L >> RANS_PRECISION) << 8) * freq;
+            while state >= x_max {
+                ptr -= 1;
+                buf[ptr] = (state & 0xff) as u8;
+                state >>= 8;
+            }
+
+            state = ((state / freq) << RANS_PRECISION) + (state % freq) + start;
+        }
+
+        // Store final encoder state as the initial decoder state
+        stream_initial_state.push(state);
+        // Remaining bytes are renormalization data for the decoder
+        stream_data.push(buf[ptr..].to_vec());
+    }
+
+    InterleavedRansTile {
+        min_val,
+        alphabet_size: alphabet_size as u32,
+        num_coefficients: num_coefficients as u32,
+        freqs,
+        cumfreqs,
+        stream_data,
+        stream_initial_state,
+    }
+}
+
+/// Decode an interleaved rANS tile back to integer coefficients (CPU reference).
+pub fn rans_decode_tile_interleaved(tile: &InterleavedRansTile) -> Vec<i32> {
+    if tile.num_coefficients == 0 {
+        return vec![];
+    }
+
+    let alphabet_size = tile.alphabet_size as usize;
+    let num_coefficients = tile.num_coefficients as usize;
+    let mut output = vec![0i32; num_coefficients];
+
+    for s in 0..STREAMS_PER_TILE {
+        if s >= num_coefficients {
+            break;
+        }
+        let stream_len = 1 + (num_coefficients - 1 - s) / STREAMS_PER_TILE;
+
+        let mut state = tile.stream_initial_state[s];
+        let buf = &tile.stream_data[s];
+        let mut ptr: usize = 0;
+        let mask = RANS_M - 1;
+
+        for i in 0..stream_len {
+            let slot = state & mask;
+            let sym = binary_search_cumfreq(&tile.cumfreqs, slot, alphabet_size);
+
+            output[s + i * STREAMS_PER_TILE] = sym as i32 + tile.min_val;
+
+            let start = tile.cumfreqs[sym];
+            let freq = tile.cumfreqs[sym + 1] - tile.cumfreqs[sym];
+            state = freq * (state >> RANS_PRECISION) + (state & mask) - start;
+
+            while state < RANS_BYTE_L {
+                if ptr < buf.len() {
+                    state = (state << 8) | buf[ptr] as u32;
+                    ptr += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    output
+}
+
+/// Binary search on cumfreq: find sym where cumfreq[sym] <= slot < cumfreq[sym+1].
+fn binary_search_cumfreq(cumfreqs: &[u32], slot: u32, alphabet_size: usize) -> usize {
+    let mut lo = 0usize;
+    let mut hi = alphabet_size;
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if cumfreqs[mid + 1] <= slot {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
 /// Serialize a RansTile to bytes.
 pub fn serialize_tile(tile: &RansTile) -> Vec<u8> {
     let mut out = Vec::new();
@@ -296,6 +479,91 @@ pub fn deserialize_tile(data: &[u8]) -> (RansTile, usize) {
             freqs,
             data: encoded_data,
             num_coefficients,
+        },
+        pos,
+    )
+}
+
+/// Serialize an InterleavedRansTile to bytes.
+pub fn serialize_tile_interleaved(tile: &InterleavedRansTile) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&tile.min_val.to_le_bytes());
+    out.extend_from_slice(&tile.alphabet_size.to_le_bytes());
+    out.extend_from_slice(&tile.num_coefficients.to_le_bytes());
+    // 32 stream data lengths
+    for s in 0..STREAMS_PER_TILE {
+        let len = tile.stream_data[s].len() as u32;
+        out.extend_from_slice(&len.to_le_bytes());
+    }
+    // 32 initial states
+    for s in 0..STREAMS_PER_TILE {
+        out.extend_from_slice(&tile.stream_initial_state[s].to_le_bytes());
+    }
+    // Frequency table as u16
+    for &f in &tile.freqs {
+        out.extend_from_slice(&(f as u16).to_le_bytes());
+    }
+    // Stream data (concatenated)
+    for s in 0..STREAMS_PER_TILE {
+        out.extend_from_slice(&tile.stream_data[s]);
+    }
+    out
+}
+
+/// Deserialize an InterleavedRansTile from bytes. Returns (tile, bytes_consumed).
+pub fn deserialize_tile_interleaved(data: &[u8]) -> (InterleavedRansTile, usize) {
+    let mut pos = 0;
+
+    let min_val = i32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
+    pos += 4;
+    let alphabet_size = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
+    pos += 4;
+    let num_coefficients = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
+    pos += 4;
+
+    let mut stream_lengths = Vec::with_capacity(STREAMS_PER_TILE);
+    for _ in 0..STREAMS_PER_TILE {
+        let len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
+        stream_lengths.push(len);
+        pos += 4;
+    }
+
+    let mut stream_initial_state = Vec::with_capacity(STREAMS_PER_TILE);
+    for _ in 0..STREAMS_PER_TILE {
+        let state = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
+        stream_initial_state.push(state);
+        pos += 4;
+    }
+
+    let mut freqs = Vec::with_capacity(alphabet_size as usize);
+    for _ in 0..alphabet_size {
+        let f = u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap());
+        freqs.push(f as u32);
+        pos += 2;
+    }
+
+    // Compute cumfreqs
+    let mut cumfreqs = vec![0u32; alphabet_size as usize + 1];
+    for i in 0..alphabet_size as usize {
+        cumfreqs[i + 1] = cumfreqs[i] + freqs[i];
+    }
+
+    let mut stream_data = Vec::with_capacity(STREAMS_PER_TILE);
+    for len in &stream_lengths {
+        let len = *len as usize;
+        stream_data.push(data[pos..pos + len].to_vec());
+        pos += len;
+    }
+
+    (
+        InterleavedRansTile {
+            min_val,
+            alphabet_size,
+            num_coefficients,
+            freqs,
+            cumfreqs,
+            stream_data,
+            stream_initial_state,
         },
         pos,
     )
@@ -371,5 +639,73 @@ mod tests {
             rans_size,
             raw_size
         );
+    }
+
+    #[test]
+    fn test_interleaved_roundtrip_simple() {
+        let coefficients = vec![0, 1, -1, 0, 2, -2, 0, 0, 1, -1, 0, 3];
+        let tile = rans_encode_tile_interleaved(&coefficients);
+        let decoded = rans_decode_tile_interleaved(&tile);
+        assert_eq!(coefficients, decoded);
+    }
+
+    #[test]
+    fn test_interleaved_roundtrip_large() {
+        // 65536 coefficients = standard tile size, simulating wavelet output
+        let mut coefficients = Vec::new();
+        for i in 0..65536 {
+            let v = if i % 7 == 0 {
+                (i % 50) as i32 - 25
+            } else if i % 3 == 0 {
+                (i % 10) as i32 - 5
+            } else {
+                0
+            };
+            coefficients.push(v);
+        }
+        let tile = rans_encode_tile_interleaved(&coefficients);
+        let decoded = rans_decode_tile_interleaved(&tile);
+        assert_eq!(coefficients, decoded);
+    }
+
+    #[test]
+    fn test_interleaved_matches_standard() {
+        // Verify interleaved decode produces same output as standard decode
+        let mut coefficients = vec![0i32; 65536];
+        for i in (0..65536).step_by(3) {
+            coefficients[i] = (i % 20) as i32 - 10;
+        }
+        let standard_tile = rans_encode_tile(&coefficients);
+        let standard_decoded = rans_decode_tile(&standard_tile);
+
+        let interleaved_tile = rans_encode_tile_interleaved(&coefficients);
+        let interleaved_decoded = rans_decode_tile_interleaved(&interleaved_tile);
+
+        assert_eq!(standard_decoded, interleaved_decoded);
+    }
+
+    #[test]
+    fn test_interleaved_serialize_roundtrip() {
+        let mut coefficients = Vec::new();
+        for i in 0..65536 {
+            coefficients.push(if i % 4 == 0 { (i % 10) as i32 - 5 } else { 0 });
+        }
+        let tile = rans_encode_tile_interleaved(&coefficients);
+        let serialized = serialize_tile_interleaved(&tile);
+        let (deserialized, consumed) = deserialize_tile_interleaved(&serialized);
+        assert_eq!(consumed, serialized.len());
+        let decoded = rans_decode_tile_interleaved(&deserialized);
+        assert_eq!(coefficients, decoded);
+    }
+
+    #[test]
+    fn test_interleaved_zeros() {
+        let coefficients = vec![0; 65536];
+        let tile = rans_encode_tile_interleaved(&coefficients);
+        let decoded = rans_decode_tile_interleaved(&tile);
+        assert_eq!(coefficients, decoded);
+        // All zeros should compress very well even with 32 stream overhead
+        let total_stream_bytes: usize = tile.stream_data.iter().map(|s| s.len()).sum();
+        assert!(total_stream_bytes < 200, "Stream data {} should be small for all-zero input", total_stream_bytes);
     }
 }

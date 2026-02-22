@@ -1,3 +1,5 @@
+/// GPU plane interleaver — merges 3 separate plane buffers into one interleaved buffer.
+/// Eliminates the CPU interleave loop that was a transfer bottleneck.
 use bytemuck::{Pod, Zeroable};
 use wgpu;
 use wgpu::util::DeviceExt;
@@ -6,39 +8,33 @@ use crate::GpuContext;
 
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
-struct QuantizeParams {
-    total_count: u32,
-    step_size: f32,
-    direction: u32,
-    dead_zone: f32,
-    width: u32,
-    height: u32,
-    tile_size: u32,
-    num_levels: u32,
-    weights0: [f32; 4],
-    weights1: [f32; 4],
-    weights2: [f32; 4],
-    weights3: [f32; 4],
+struct InterleaveParams {
+    total_pixels: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
-pub struct Quantizer {
+pub struct PlaneInterleaver {
     pipeline: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
 }
 
-impl Quantizer {
+impl PlaneInterleaver {
     pub fn new(ctx: &GpuContext) -> Self {
         let shader = ctx
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("quantize"),
-                source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/quantize.wgsl").into()),
+                label: Some("interleave"),
+                source: wgpu::ShaderSource::Wgsl(
+                    include_str!("../shaders/interleave.wgsl").into(),
+                ),
             });
 
         let bind_group_layout =
             ctx.device
                 .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                    label: Some("quantize_bgl"),
+                    label: Some("interleave_bgl"),
                     entries: &[
                         wgpu::BindGroupLayoutEntry {
                             binding: 0,
@@ -64,6 +60,26 @@ impl Quantizer {
                             binding: 2,
                             visibility: wgpu::ShaderStages::COMPUTE,
                             ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 3,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 4,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
                                 ty: wgpu::BufferBindingType::Storage { read_only: false },
                                 has_dynamic_offset: false,
                                 min_binding_size: None,
@@ -73,24 +89,24 @@ impl Quantizer {
                     ],
                 });
 
-        let pipeline_layout = ctx
-            .device
-            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("quantize_pl"),
-                bind_group_layouts: &[&bind_group_layout],
-                push_constant_ranges: &[],
-            });
+        let pipeline_layout =
+            ctx.device
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("interleave_pl"),
+                    bind_group_layouts: &[&bind_group_layout],
+                    push_constant_ranges: &[],
+                });
 
-        let pipeline = ctx
-            .device
-            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("quantize_pipeline"),
-                layout: Some(&pipeline_layout),
-                module: &shader,
-                entry_point: Some("main"),
-                compilation_options: Default::default(),
-                cache: None,
-            });
+        let pipeline =
+            ctx.device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("interleave_pipeline"),
+                    layout: Some(&pipeline_layout),
+                    module: &shader,
+                    entry_point: Some("main"),
+                    compilation_options: Default::default(),
+                    cache: None,
+                });
 
         Self {
             pipeline,
@@ -98,48 +114,34 @@ impl Quantizer {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// Dispatch interleave: 3 plane buffers → 1 interleaved output buffer.
     pub fn dispatch(
         &self,
         ctx: &GpuContext,
         encoder: &mut wgpu::CommandEncoder,
-        input_buf: &wgpu::Buffer,
-        output_buf: &wgpu::Buffer,
-        total_count: u32,
-        step_size: f32,
-        dead_zone: f32,
-        forward: bool,
-        width: u32,
-        height: u32,
-        tile_size: u32,
-        num_levels: u32,
-        weights: &[f32; 16],
+        plane0: &wgpu::Buffer,
+        plane1: &wgpu::Buffer,
+        plane2: &wgpu::Buffer,
+        output: &wgpu::Buffer,
+        total_pixels: u32,
     ) {
-        let params = QuantizeParams {
-            total_count,
-            step_size,
-            direction: if forward { 0 } else { 1 },
-            dead_zone,
-            width,
-            height,
-            tile_size,
-            num_levels,
-            weights0: [weights[0], weights[1], weights[2], weights[3]],
-            weights1: [weights[4], weights[5], weights[6], weights[7]],
-            weights2: [weights[8], weights[9], weights[10], weights[11]],
-            weights3: [weights[12], weights[13], weights[14], weights[15]],
+        let params = InterleaveParams {
+            total_pixels,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
         };
 
         let params_buf = ctx
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("quantize_params"),
+                label: Some("interleave_params"),
                 contents: bytemuck::bytes_of(&params),
                 usage: wgpu::BufferUsages::UNIFORM,
             });
 
         let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("quantize_bg"),
+            label: Some("interleave_bg"),
             layout: &self.bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -148,19 +150,27 @@ impl Quantizer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: input_buf.as_entire_binding(),
+                    resource: plane0.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: output_buf.as_entire_binding(),
+                    resource: plane1.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: plane2.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: output.as_entire_binding(),
                 },
             ],
         });
 
-        let workgroups = (total_count + 255) / 256;
+        let workgroups = total_pixels.div_ceil(256);
 
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("quantize_pass"),
+            label: Some("interleave_pass"),
             timestamp_writes: None,
         });
         pass.set_pipeline(&self.pipeline);

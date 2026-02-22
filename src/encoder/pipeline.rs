@@ -2,7 +2,7 @@ use wgpu;
 
 use super::color::ColorConverter;
 use super::quantize::Quantizer;
-use super::rans::{self, RansTile};
+use super::rans::{self, InterleavedRansTile};
 use super::transform::WaveletTransform;
 use crate::{CodecConfig, CompressedFrame, FrameInfo, GpuContext};
 
@@ -117,10 +117,14 @@ impl EncoderPipeline {
 
         // Step 2 & 3: Wavelet transform + quantize per plane on GPU,
         // then rANS encode per tile on CPU
-        let mut all_tiles: Vec<RansTile> = Vec::new();
+        let mut all_tiles: Vec<InterleavedRansTile> = Vec::new();
         let tile_size = config.tile_size as usize;
         let tiles_x = info.tiles_x() as usize;
         let tiles_y = info.tiles_y() as usize;
+
+        // Pre-pack subband weights: luma and chroma variants
+        let weights_luma = config.subband_weights.pack_weights();
+        let weights_chroma = config.subband_weights.pack_weights_chroma();
 
         for p in 0..3 {
             ctx.queue
@@ -136,7 +140,8 @@ impl EncoderPipeline {
             self.transform
                 .forward(ctx, &mut cmd, &plane_buf_a, &plane_buf_b, &plane_buf_c, &info, config.wavelet_levels);
 
-            // Quantize
+            // Quantize — planes 1,2 (Co, Cg) use chroma-weighted weights
+            let weights = if p == 0 { &weights_luma } else { &weights_chroma };
             self.quantize.dispatch(
                 ctx,
                 &mut cmd,
@@ -146,6 +151,11 @@ impl EncoderPipeline {
                 config.quantization_step,
                 config.dead_zone,
                 true,
+                padded_w,
+                padded_h,
+                config.tile_size,
+                config.wavelet_levels,
+                weights,
             );
 
             ctx.queue.submit(Some(cmd.finish()));
@@ -163,7 +173,7 @@ impl EncoderPipeline {
                         ty,
                         tile_size,
                     );
-                    let tile = rans::rans_encode_tile(&coeffs);
+                    let tile = rans::rans_encode_tile_interleaved(&coeffs);
                     all_tiles.push(tile);
                 }
             }

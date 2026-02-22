@@ -41,6 +41,73 @@ impl FrameInfo {
     }
 }
 
+/// Per-subband quantization weight multipliers.
+///
+/// Higher weight = coarser quantization (more compression, less quality).
+/// The effective step size for a coefficient is `base_step * weight`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubbandWeights {
+    /// Weight for the LL (DC) subband
+    pub ll: f32,
+    /// Per-level detail weights: \[LH, HL, HH\] for each decomposition level.
+    /// Index 0 = outermost (highest spatial frequency), last = innermost.
+    pub detail: Vec<[f32; 3]>,
+    /// Multiplier applied to all weights for chroma planes (Co, Cg)
+    pub chroma_weight: f32,
+}
+
+impl SubbandWeights {
+    /// All weights = 1.0, reproducing the old uniform quantization behavior.
+    pub fn uniform(levels: u32) -> Self {
+        Self {
+            ll: 1.0,
+            detail: vec![[1.0, 1.0, 1.0]; levels as usize],
+            chroma_weight: 1.0,
+        }
+    }
+
+    /// Perceptual weights: quantize HH harder, inner levels harder, chroma harder.
+    pub fn perceptual(levels: u32) -> Self {
+        let mut detail = Vec::with_capacity(levels as usize);
+        for i in 0..levels as usize {
+            let lh_hl = 1.0 + 0.5 * i as f32;
+            let is_innermost = i == levels as usize - 1;
+            let hh = lh_hl + if is_innermost { 1.0 } else { 0.5 };
+            detail.push([lh_hl, lh_hl, hh]);
+        }
+        Self {
+            ll: 1.0,
+            detail,
+            chroma_weight: 1.5,
+        }
+    }
+
+    /// Pack into 16 f32s for the GPU uniform buffer (4 × vec4).
+    /// Layout: [LL, L0_LH, L0_HL, L0_HH, L1_LH, L1_HL, L1_HH, ...]
+    pub fn pack_weights(&self) -> [f32; 16] {
+        let mut w = [1.0f32; 16];
+        w[0] = self.ll;
+        for (i, level) in self.detail.iter().enumerate() {
+            let base = 1 + i * 3;
+            if base + 2 < 16 {
+                w[base] = level[0];     // LH
+                w[base + 1] = level[1]; // HL
+                w[base + 2] = level[2]; // HH
+            }
+        }
+        w
+    }
+
+    /// Pack with chroma multiplier applied to all weights.
+    pub fn pack_weights_chroma(&self) -> [f32; 16] {
+        let mut w = self.pack_weights();
+        for v in &mut w {
+            *v *= self.chroma_weight;
+        }
+        w
+    }
+}
+
 /// Codec configuration
 #[derive(Debug, Clone)]
 pub struct CodecConfig {
@@ -48,6 +115,7 @@ pub struct CodecConfig {
     pub quantization_step: f32,
     pub dead_zone: f32,
     pub wavelet_levels: u32,
+    pub subband_weights: SubbandWeights,
 }
 
 impl Default for CodecConfig {
@@ -57,17 +125,18 @@ impl Default for CodecConfig {
             quantization_step: 4.0,
             dead_zone: 0.0,
             wavelet_levels: 3,
+            subband_weights: SubbandWeights::uniform(3),
         }
     }
 }
 
-/// Compressed frame data (rANS entropy coded, per-tile)
+/// Compressed frame data (interleaved rANS entropy coded, per-tile)
 #[derive(Debug, Clone)]
 pub struct CompressedFrame {
     pub info: FrameInfo,
     pub config: CodecConfig,
-    /// Per-tile rANS compressed data, ordered: plane 0 tiles, plane 1 tiles, plane 2 tiles
-    pub tiles: Vec<encoder::rans::RansTile>,
+    /// Per-tile interleaved rANS compressed data, ordered: plane 0 tiles, plane 1 tiles, plane 2 tiles
+    pub tiles: Vec<encoder::rans::InterleavedRansTile>,
 }
 
 impl CompressedFrame {

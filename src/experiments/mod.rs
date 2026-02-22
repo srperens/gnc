@@ -1,6 +1,6 @@
 /// Experiment configurations.
 /// Each experiment is a named set of codec parameters.
-use crate::CodecConfig;
+use crate::{CodecConfig, SubbandWeights};
 
 pub struct Experiment {
     pub name: String,
@@ -25,9 +25,39 @@ pub fn phase1_experiments() -> Vec<Experiment> {
                 quantization_step: step,
                 dead_zone: 0.0,
                 wavelet_levels: 3,
+                subband_weights: SubbandWeights::uniform(3),
             },
         })
         .collect()
+}
+
+/// Sweep dead-zone width at several quantization steps.
+/// Dead zone is expressed as a fraction of step_size.
+/// Values below dead_zone * step_size are mapped to zero.
+pub fn dead_zone_experiments() -> Vec<Experiment> {
+    let steps = [4.0, 8.0, 16.0];
+    let zones = [0.0, 0.25, 0.5, 0.75, 1.0];
+
+    let mut exps = Vec::new();
+    for &step in &steps {
+        for &dz in &zones {
+            exps.push(Experiment {
+                name: format!("dz{:.0}_q{}", dz * 100.0, step as u32),
+                description: format!(
+                    "dead_zone={:.2} * step, qstep={}, 3-level wavelet",
+                    dz, step
+                ),
+                config: CodecConfig {
+                    tile_size: 256,
+                    quantization_step: step,
+                    dead_zone: dz,
+                    wavelet_levels: 3,
+                    subband_weights: SubbandWeights::uniform(3),
+                },
+            });
+        }
+    }
+    exps
 }
 
 /// Compare wavelet decomposition levels at a fixed quantization step
@@ -44,7 +74,73 @@ pub fn wavelet_level_experiments() -> Vec<Experiment> {
                 quantization_step: 4.0,
                 dead_zone: 0.0,
                 wavelet_levels: levels,
+                subband_weights: SubbandWeights::uniform(levels),
             },
         })
         .collect()
+}
+
+/// Subband weight experiments: compare uniform vs perceptual vs aggressive
+/// across multiple quantization steps.
+pub fn subband_weight_experiments() -> Vec<Experiment> {
+    let steps = [4.0, 8.0, 16.0];
+    let levels = 3u32;
+
+    let presets: Vec<(&str, &str, SubbandWeights)> = vec![
+        (
+            "uniform",
+            "all weights = 1.0 (baseline behavior)",
+            SubbandWeights::uniform(levels),
+        ),
+        (
+            "perceptual",
+            "perceptual weights (HH harder, inner harder, chroma 1.5x)",
+            SubbandWeights::perceptual(levels),
+        ),
+        (
+            "aggressive_hh",
+            "aggressive HH quantization (4x at innermost)",
+            SubbandWeights {
+                ll: 1.0,
+                detail: vec![[1.0, 1.0, 2.0], [1.0, 1.0, 3.0], [1.0, 1.0, 4.0]],
+                chroma_weight: 1.0,
+            },
+        ),
+        (
+            "chroma_save",
+            "uniform luma, chroma 2x multiplier",
+            SubbandWeights {
+                ll: 1.0,
+                detail: vec![[1.0, 1.0, 1.0]; levels as usize],
+                chroma_weight: 2.0,
+            },
+        ),
+        (
+            "full_perceptual",
+            "perceptual subband + aggressive chroma (2x)",
+            SubbandWeights {
+                ll: 1.0,
+                detail: vec![[1.0, 1.0, 1.5], [1.5, 1.5, 2.0], [2.0, 2.0, 3.0]],
+                chroma_weight: 2.0,
+            },
+        ),
+    ];
+
+    let mut exps = Vec::new();
+    for &step in &steps {
+        for (name, desc, ref weights) in &presets {
+            exps.push(Experiment {
+                name: format!("sb_{}_q{}", name, step as u32),
+                description: format!("qstep={}, {}", step, desc),
+                config: CodecConfig {
+                    tile_size: 256,
+                    quantization_step: step,
+                    dead_zone: 0.0,
+                    wavelet_levels: levels,
+                    subband_weights: weights.clone(),
+                },
+            });
+        }
+    }
+    exps
 }

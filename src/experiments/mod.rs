@@ -144,3 +144,44 @@ pub fn subband_weight_experiments() -> Vec<Experiment> {
     }
     exps
 }
+
+/// Combined dead-zone + subband weight experiments.
+/// Tests whether dead-zone and perceptual weights stack for additive compression gains.
+pub fn combined_dz_subband_experiments() -> Vec<Experiment> {
+    let steps = [4.0, 8.0, 16.0];
+    let zones = [0.0, 0.5, 0.75];
+    let levels = 3u32;
+
+    let weight_presets: Vec<(&str, SubbandWeights)> = vec![
+        ("uniform", SubbandWeights::uniform(levels)),
+        ("perceptual", SubbandWeights::perceptual(levels)),
+        ("full_perceptual", SubbandWeights {
+            ll: 1.0,
+            detail: vec![[1.0, 1.0, 1.5], [1.5, 1.5, 2.0], [2.0, 2.0, 3.0]],
+            chroma_weight: 2.0,
+        }),
+    ];
+
+    let mut exps = Vec::new();
+    for &step in &steps {
+        for &dz in &zones {
+            for (wname, ref weights) in &weight_presets {
+                exps.push(Experiment {
+                    name: format!("combo_{}_dz{}_q{}", wname, (dz * 100.0) as u32, step as u32),
+                    description: format!(
+                        "qstep={}, dz={:.2}, weights={}",
+                        step, dz, wname
+                    ),
+                    config: CodecConfig {
+                        tile_size: 256,
+                        quantization_step: step,
+                        dead_zone: dz,
+                        wavelet_levels: levels,
+                        subband_weights: weights.clone(),
+                    },
+                });
+            }
+        }
+    }
+    exps
+}

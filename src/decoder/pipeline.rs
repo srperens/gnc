@@ -61,6 +61,7 @@ pub struct DecoderPipeline {
     pack_pipeline: wgpu::ComputePipeline,
     pack_bgl: wgpu::BindGroupLayout,
     cached: RefCell<Option<CachedBuffers>>,
+    pending_rx: RefCell<Option<std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>>,
 }
 
 impl DecoderPipeline {
@@ -209,6 +210,7 @@ impl DecoderPipeline {
             pack_pipeline,
             pack_bgl,
             cached: RefCell::new(None),
+            pending_rx: RefCell::new(None),
         }
     }
 
@@ -643,33 +645,139 @@ impl DecoderPipeline {
             tx.send(result).unwrap();
         });
         ctx.device.poll(wgpu::Maintain::Wait);
-        let t_poll = t_start.elapsed();
         rx.recv().unwrap().unwrap();
-        let t_recv = t_start.elapsed();
 
         let data = slice.get_mapped_range();
         let bytes: &[u8] = &data;
         let result = bytes[..total_f32s as usize].to_vec();
         drop(data);
-        let t_copy = t_start.elapsed();
         bufs.staging_u8.unmap();
         drop(cached);
 
         if profile {
             let t_total = t_start.elapsed();
             eprintln!(
-                "[decode_u8 profile] alloc={:.2}ms prepare={:.2}ms cmd={:.2}ms submit={:.2}ms poll={:.2}ms recv={:.2}ms copy={:.2}ms cleanup={:.2}ms total={:.2}ms",
+                "[decode_u8 profile] alloc={:.2}ms prepare={:.2}ms cmd={:.2}ms submit={:.2}ms readback={:.2}ms total={:.2}ms",
                 t_alloc.as_secs_f64() * 1000.0,
                 (t_prepare - t_alloc).as_secs_f64() * 1000.0,
                 (t_encode_cmd - t_prepare).as_secs_f64() * 1000.0,
                 (t_submit - t_encode_cmd).as_secs_f64() * 1000.0,
-                (t_poll - t_submit).as_secs_f64() * 1000.0,
-                (t_recv - t_poll).as_secs_f64() * 1000.0,
-                (t_copy - t_recv).as_secs_f64() * 1000.0,
-                (t_total - t_copy).as_secs_f64() * 1000.0,
+                (t_total - t_submit).as_secs_f64() * 1000.0,
                 t_total.as_secs_f64() * 1000.0,
             );
         }
+
+        result
+    }
+
+    /// Submit GPU decode work without waiting for the result.
+    /// Returns an opaque token that can be used with `finish_decode_u8` to get the result.
+    /// This enables pipelined decode: submit frame N, do CPU work for frame N+1,
+    /// then finish frame N's readback.
+    pub fn submit_decode_u8(
+        &self,
+        ctx: &GpuContext,
+        frame: &CompressedFrame,
+    ) {
+        let info = &frame.info;
+        let w = info.width;
+        let h = info.height;
+        let total_f32s = (w * h * 3) as u32;
+        let packed_u32s = total_f32s.div_ceil(4);
+        let packed_byte_size = (packed_u32s as u64) * 4;
+
+        self.ensure_cached(ctx, info.padded_width(), info.padded_height(), w, h);
+
+        let rans_bufs = self.prepare_rans_bufs(ctx, frame);
+
+        let cached = self.cached.borrow();
+        let bufs = cached.as_ref().unwrap();
+
+        let (mut cmd, _crop_params_buf) = self.encode_gpu_work(ctx, frame, bufs, &rans_bufs);
+
+        // GPU pack: f32 → packed u8
+        let pack_params = PackParams {
+            total_f32s,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
+        };
+        let pack_params_buf = ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("pack_params"),
+                contents: bytemuck::bytes_of(&pack_params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+
+        {
+            let pack_bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("pack_bg"),
+                layout: &self.pack_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: pack_params_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: bufs.cropped_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: bufs.packed_u8_buf.as_entire_binding(),
+                    },
+                ],
+            });
+
+            let workgroups = packed_u32s.div_ceil(256);
+            let mut pass = cmd.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("pack_pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pack_pipeline);
+            pass.set_bind_group(0, &pack_bg, &[]);
+            pass.dispatch_workgroups(workgroups, 1, 1);
+        }
+
+        // Copy packed u8 to staging
+        cmd.copy_buffer_to_buffer(&bufs.packed_u8_buf, 0, &bufs.staging_u8, 0, packed_byte_size);
+
+        ctx.queue.submit(Some(cmd.finish()));
+
+        // Request map (non-blocking — will be ready after poll)
+        let slice = bufs.staging_u8.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            tx.send(result).unwrap();
+        });
+        drop(cached);
+
+        // Store the receiver for later retrieval
+        *self.pending_rx.borrow_mut() = Some(rx);
+    }
+
+    /// Finish a previously submitted decode_u8 operation.
+    /// Blocks until the GPU work is complete and returns the u8 result.
+    pub fn finish_decode_u8(&self, ctx: &GpuContext, width: u32, height: u32) -> Vec<u8> {
+        let rx = self.pending_rx.borrow_mut().take()
+            .expect("finish_decode_u8 called without prior submit_decode_u8");
+
+        let total_bytes = (width * height * 3) as usize;
+
+        ctx.device.poll(wgpu::Maintain::Wait);
+        rx.recv().unwrap().unwrap();
+
+        let cached = self.cached.borrow();
+        let bufs = cached.as_ref().unwrap();
+
+        let slice = bufs.staging_u8.slice(..);
+        let data = slice.get_mapped_range();
+        let bytes: &[u8] = &data;
+        let result = bytes[..total_bytes].to_vec();
+        drop(data);
+        bufs.staging_u8.unmap();
+        drop(cached);
 
         result
     }

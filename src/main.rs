@@ -190,7 +190,9 @@ fn main() {
 
             println!("Quality: {}", qm);
 
-            // Throughput measurement (decode uses u8 path — 4x less readback)
+            // Throughput measurement
+            // Encode: sequential (each call is self-contained)
+            // Decode: pipelined (overlap GPU work with CPU prep for next frame)
             let tp = throughput::measure_throughput(
                 || {
                     encoder.encode(&ctx, &rgb_data, w, h, &config);
@@ -202,7 +204,32 @@ fn main() {
                 h,
                 iterations,
             );
-            println!("Throughput: {}", tp);
+            println!("Throughput (sequential): {}", tp);
+
+            // Pipelined decode: overlap submit/prepare with GPU execution
+            {
+                // Warmup
+                decoder.submit_decode_u8(&ctx, &compressed);
+                decoder.finish_decode_u8(&ctx, w, h);
+
+                let start = std::time::Instant::now();
+                // Submit first frame
+                decoder.submit_decode_u8(&ctx, &compressed);
+                for _ in 1..iterations {
+                    // Finish previous frame + submit next (overlaps CPU prep with GPU)
+                    decoder.finish_decode_u8(&ctx, w, h);
+                    decoder.submit_decode_u8(&ctx, &compressed);
+                }
+                // Finish last frame
+                decoder.finish_decode_u8(&ctx, w, h);
+                let decode_total = start.elapsed();
+                let decode_ms = decode_total.as_secs_f64() * 1000.0 / iterations as f64;
+                let decode_fps = 1000.0 / decode_ms;
+                println!(
+                    "Throughput (pipelined): Decode: {:.2} ms ({:.1} fps)",
+                    decode_ms, decode_fps
+                );
+            }
 
             if let Some(csv_path) = csv {
                 let result = BenchmarkResult {
@@ -236,15 +263,17 @@ fn main() {
                 "deadzone" => experiments::dead_zone_experiments(),
                 "levels" => experiments::wavelet_level_experiments(),
                 "subband" => experiments::subband_weight_experiments(),
+                "combined" => experiments::combined_dz_subband_experiments(),
                 "all" => {
                     let mut e = experiments::phase1_experiments();
                     e.extend(experiments::wavelet_level_experiments());
                     e.extend(experiments::dead_zone_experiments());
                     e.extend(experiments::subband_weight_experiments());
+                    e.extend(experiments::combined_dz_subband_experiments());
                     e
                 }
                 other => {
-                    eprintln!("Unknown experiment set: {}. Use: all, baseline, deadzone, levels, subband", other);
+                    eprintln!("Unknown experiment set: {}. Use: all, baseline, deadzone, levels, subband, combined", other);
                     std::process::exit(1);
                 }
             };

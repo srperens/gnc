@@ -1,0 +1,7 @@
+name,input,width,height,tile_size,qstep,dead_zone,psnr_db,psnr_r,psnr_g,psnr_b,ssim,bpp,compressed_bytes,encode_ms,decode_ms,encode_fps,decode_fps
+cfl_off_q4,test_material/frames/blue_sky_1080p.png,1920,1080,256,4,0,43.47,43.31,43.91,43.21,0.9997,5.44,1411280,,,,
+cfl_on_q4,test_material/frames/blue_sky_1080p.png,1920,1080,256,4,0,43.46,43.26,43.93,43.24,0.9997,5.35,1387870,,,,
+cfl_off_q8,test_material/frames/blue_sky_1080p.png,1920,1080,256,8,0,38.19,38.05,38.99,37.65,0.9989,3.32,861749,,,,
+cfl_on_q8,test_material/frames/blue_sky_1080p.png,1920,1080,256,8,0,38.31,38.00,38.94,38.05,0.9989,3.24,839918,,,,
+cfl_off_q16,test_material/frames/blue_sky_1080p.png,1920,1080,256,16,0,32.68,32.29,33.66,32.25,0.9959,1.97,510844,,,,
+cfl_on_q16,test_material/frames/blue_sky_1080p.png,1920,1080,256,16,0,32.87,32.26,33.88,32.63,0.9957,1.89,490971,,,,

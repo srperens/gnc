@@ -185,22 +185,22 @@ impl GpuRansDecoder {
 
             cumfreq_all.extend_from_slice(&tile.cumfreqs);
 
-            // [3]: stream_data_byte_base
-            let tile_stream_byte_base = stream_bytes_all.len() as u32;
-            tile_info_data[base + 3] = tile_stream_byte_base;
+            // [3]: zrun_base (0 = no ZRL)
+            tile_info_data[base + 3] = tile.zrun_base as u32;
 
-            // Per-stream info
+            // [4]: stream_data_byte_base
+            let tile_stream_byte_base = stream_bytes_all.len() as u32;
+            tile_info_data[base + 4] = tile_stream_byte_base;
+
+            // Per-stream info (shifted +1 for zrun_base field)
             let mut stream_byte_offset = 0u32;
             for s in 0..STREAMS_PER_TILE {
-                // [4+s]: initial_state
-                tile_info_data[base + 4 + s] = tile.stream_initial_state[s];
-                // [36+s]: byte offset within tile's stream region
-                tile_info_data[base + 36 + s] = stream_byte_offset;
-                // [68+s]: byte count
-                let byte_count = tile.stream_data[s].len() as u32;
-                tile_info_data[base + 68 + s] = byte_count;
+                // [5+s]: initial_state
+                tile_info_data[base + 5 + s] = tile.stream_initial_state[s];
+                // [37+s]: byte offset within tile's stream region
+                tile_info_data[base + 37 + s] = stream_byte_offset;
 
-                stream_byte_offset += byte_count;
+                stream_byte_offset += tile.stream_data[s].len() as u32;
             }
 
             // Append all stream bytes for this tile

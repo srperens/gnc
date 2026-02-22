@@ -3,6 +3,7 @@ use bytemuck::{Pod, Zeroable};
 use wgpu;
 use wgpu::util::DeviceExt;
 
+use crate::encoder::cfl::{self, CflPredictor};
 use crate::encoder::color::ColorConverter;
 use crate::encoder::interleave::PlaneInterleaver;
 use crate::encoder::quantize::Quantizer;
@@ -44,6 +45,8 @@ struct CachedBuffers {
     packed_u8_buf: wgpu::Buffer,
     staging: wgpu::Buffer,
     staging_u8: wgpu::Buffer,
+    /// Dequantized Y wavelet coefficients for CfL prediction
+    y_ref_wavelet_buf: wgpu::Buffer,
 }
 
 /// Full decoding pipeline: GPU rANS Decode -> Dequantize -> Inverse Wavelet -> Interleave -> Inverse Color -> Crop
@@ -56,6 +59,7 @@ pub struct DecoderPipeline {
     quantize: Quantizer,
     rans_decoder: GpuRansDecoder,
     interleaver: PlaneInterleaver,
+    cfl_predictor: CflPredictor,
     crop_pipeline: wgpu::ComputePipeline,
     crop_bgl: wgpu::BindGroupLayout,
     pack_pipeline: wgpu::ComputePipeline,
@@ -205,6 +209,7 @@ impl DecoderPipeline {
             quantize: Quantizer::new(ctx),
             rans_decoder: GpuRansDecoder::new(ctx),
             interleaver: PlaneInterleaver::new(ctx),
+            cfl_predictor: CflPredictor::new(ctx),
             crop_pipeline,
             crop_bgl,
             pack_pipeline,
@@ -301,6 +306,13 @@ impl DecoderPipeline {
             mapped_at_creation: false,
         });
 
+        let y_ref_wavelet_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dec_y_ref_wavelet"),
+            size: plane_size,
+            usage: scratch_usage,
+            mapped_at_creation: false,
+        });
+
         *cached = Some(CachedBuffers {
             padded_w,
             padded_h,
@@ -316,6 +328,7 @@ impl DecoderPipeline {
             packed_u8_buf,
             staging,
             staging_u8,
+            y_ref_wavelet_buf,
         });
     }
 
@@ -364,7 +377,26 @@ impl DecoderPipeline {
                 label: Some("decode_full"),
             });
 
-        // Per-plane: rANS → dequantize → inverse wavelet → copy to result buffer
+        // Prepare CfL alpha buffer if needed
+        let has_cfl = frame.cfl_alphas.is_some();
+        let cfl_alpha_buf = if has_cfl {
+            let cfl_data = frame.cfl_alphas.as_ref().unwrap();
+            let nsb = cfl_data.num_subbands;
+            let total_tiles = info.tiles_x() as usize * info.tiles_y() as usize;
+            // Dequantize all alphas to f32 for the GPU shader
+            // Layout: [Co alphas for all tiles][Cg alphas for all tiles]
+            // Each chroma plane's alphas = total_tiles * nsb values
+            let alphas_per_plane = total_tiles * nsb as usize;
+            let all_f32: Vec<f32> = cfl_data.alphas.iter()
+                .map(|&q| cfl::dequantize_alpha(q))
+                .collect();
+            // We'll index into this per plane during dispatch
+            Some((cfl::upload_alpha_buffer(ctx, &all_f32), alphas_per_plane))
+        } else {
+            None
+        };
+
+        // Per-plane: rANS → dequantize → (CfL inverse predict) → inverse wavelet → copy to result buffer
         for p in 0..3 {
             let (ref params_buf, ref tile_info_buf, ref cumfreq_buf, ref stream_data_buf) =
                 rans_bufs[p];
@@ -397,15 +429,59 @@ impl DecoderPipeline {
                 weights,
             );
 
-            self.transform.inverse(
-                ctx,
-                &mut cmd,
-                &bufs.scratch_b,
-                &bufs.scratch_c,
-                &bufs.scratch_a,
-                info,
-                config.wavelet_levels,
-            );
+            if p == 0 && has_cfl {
+                // Save dequantized Y wavelet for CfL chroma prediction
+                cmd.copy_buffer_to_buffer(
+                    &bufs.scratch_b, 0, &bufs.y_ref_wavelet_buf, 0, plane_size,
+                );
+            }
+
+            if p > 0 && has_cfl {
+                // CfL inverse prediction: scratch_b (dequantized residual) + alpha * y_ref → scratch_c
+                let (ref alpha_buf, alphas_per_plane) = *cfl_alpha_buf.as_ref().unwrap();
+                // Plane 1 (Co) alphas start at offset 0, plane 2 (Cg) at offset alphas_per_plane
+                let plane_alpha_offset = (p - 1) * alphas_per_plane;
+                let plane_alpha_byte_offset = (plane_alpha_offset * std::mem::size_of::<f32>()) as u64;
+                let plane_alpha_byte_size = (alphas_per_plane * std::mem::size_of::<f32>()) as u64;
+
+                // Create a sub-buffer view for this plane's alphas
+                let plane_alpha_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("cfl_plane_alpha"),
+                    size: plane_alpha_byte_size,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                cmd.copy_buffer_to_buffer(
+                    alpha_buf, plane_alpha_byte_offset,
+                    &plane_alpha_buf, 0,
+                    plane_alpha_byte_size,
+                );
+
+                self.cfl_predictor.dispatch_inverse(
+                    ctx, &mut cmd,
+                    &bufs.scratch_b,        // dequantized residual
+                    &bufs.y_ref_wavelet_buf, // reconstructed Y wavelet
+                    &plane_alpha_buf,        // per-tile per-subband alphas
+                    &bufs.scratch_c,         // output: reconstructed chroma wavelet
+                    padded_pixels as u32,
+                    padded_w, padded_h,
+                    config.tile_size, config.wavelet_levels,
+                );
+
+                // Inverse wavelet: scratch_c → (temp scratch_b) → scratch_a
+                self.transform.inverse(
+                    ctx, &mut cmd,
+                    &bufs.scratch_c, &bufs.scratch_b, &bufs.scratch_a,
+                    info, config.wavelet_levels,
+                );
+            } else {
+                // Standard path: inverse wavelet from scratch_b
+                self.transform.inverse(
+                    ctx, &mut cmd,
+                    &bufs.scratch_b, &bufs.scratch_c, &bufs.scratch_a,
+                    info, config.wavelet_levels,
+                );
+            }
 
             cmd.copy_buffer_to_buffer(
                 &bufs.scratch_a,

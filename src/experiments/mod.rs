@@ -26,6 +26,7 @@ pub fn phase1_experiments() -> Vec<Experiment> {
                 dead_zone: 0.0,
                 wavelet_levels: 3,
                 subband_weights: SubbandWeights::uniform(3),
+                cfl_enabled: false,
             },
         })
         .collect()
@@ -53,6 +54,7 @@ pub fn dead_zone_experiments() -> Vec<Experiment> {
                     dead_zone: dz,
                     wavelet_levels: 3,
                     subband_weights: SubbandWeights::uniform(3),
+                    cfl_enabled: false,
                 },
             });
         }
@@ -75,6 +77,7 @@ pub fn wavelet_level_experiments() -> Vec<Experiment> {
                 dead_zone: 0.0,
                 wavelet_levels: levels,
                 subband_weights: SubbandWeights::uniform(levels),
+                cfl_enabled: false,
             },
         })
         .collect()
@@ -138,9 +141,47 @@ pub fn subband_weight_experiments() -> Vec<Experiment> {
                     dead_zone: 0.0,
                     wavelet_levels: levels,
                     subband_weights: weights.clone(),
+                    cfl_enabled: false,
                 },
             });
         }
+    }
+    exps
+}
+
+/// CfL (Chroma-from-Luma) experiments: compare CfL on/off across quantization steps.
+pub fn cfl_experiments() -> Vec<Experiment> {
+    let steps = [4.0, 8.0, 16.0];
+    let levels = 3u32;
+
+    let mut exps = Vec::new();
+    for &step in &steps {
+        // Without CfL
+        exps.push(Experiment {
+            name: format!("cfl_off_q{}", step as u32),
+            description: format!("qstep={}, CfL disabled (baseline)", step),
+            config: CodecConfig {
+                tile_size: 256,
+                quantization_step: step,
+                dead_zone: 0.0,
+                wavelet_levels: levels,
+                subband_weights: SubbandWeights::uniform(levels),
+                cfl_enabled: false,
+            },
+        });
+        // With CfL
+        exps.push(Experiment {
+            name: format!("cfl_on_q{}", step as u32),
+            description: format!("qstep={}, CfL enabled", step),
+            config: CodecConfig {
+                tile_size: 256,
+                quantization_step: step,
+                dead_zone: 0.0,
+                wavelet_levels: levels,
+                subband_weights: SubbandWeights::uniform(levels),
+                cfl_enabled: true,
+            },
+        });
     }
     exps
 }
@@ -178,6 +219,7 @@ pub fn combined_dz_subband_experiments() -> Vec<Experiment> {
                         dead_zone: dz,
                         wavelet_levels: levels,
                         subband_weights: weights.clone(),
+                        cfl_enabled: false,
                     },
                 });
             }

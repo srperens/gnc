@@ -10,6 +10,7 @@
 const RANS_BYTE_L: u32 = 1 << 23;
 const RANS_PRECISION: u32 = 12;
 const RANS_M: u32 = 1 << RANS_PRECISION;
+const MAX_ZERO_RUN: i32 = 256;
 
 /// A compressed tile: frequency table + rANS-encoded data.
 #[derive(Debug, Clone)]
@@ -264,6 +265,8 @@ pub struct InterleavedRansTile {
     pub alphabet_size: u32,
     /// Number of coefficients encoded
     pub num_coefficients: u32,
+    /// Zero-run-length base symbol (0 = no ZRL for backward compat)
+    pub zrun_base: i32,
     /// Normalized frequency table (sum = RANS_M = 4096)
     pub freqs: Vec<u32>,
     /// Cumulative frequency table (length = alphabet_size + 1)
@@ -276,10 +279,10 @@ pub struct InterleavedRansTile {
 
 impl InterleavedRansTile {
     pub fn byte_size(&self) -> usize {
-        // header: 12 + 32*4 (stream lengths) + 32*4 (initial states) = 268
+        // header: 16 + 32*4 (stream lengths) + 32*4 (initial states) = 272
         // freq table: alphabet_size * 2
         // stream data: sum of all stream lengths
-        268 + self.alphabet_size as usize * 2
+        272 + self.alphabet_size as usize * 2
             + self.stream_data.iter().map(|s| s.len()).sum::<usize>()
     }
 }
@@ -293,6 +296,7 @@ pub fn rans_encode_tile_interleaved(coefficients: &[i32]) -> InterleavedRansTile
             min_val: 0,
             alphabet_size: 0,
             num_coefficients: 0,
+            zrun_base: 0,
             freqs: vec![],
             cumfreqs: vec![0],
             stream_data: vec![vec![]; STREAMS_PER_TILE],
@@ -367,6 +371,182 @@ pub fn rans_encode_tile_interleaved(coefficients: &[i32]) -> InterleavedRansTile
         min_val,
         alphabet_size: alphabet_size as u32,
         num_coefficients: num_coefficients as u32,
+        zrun_base: 0,
+        freqs,
+        cumfreqs,
+        stream_data,
+        stream_initial_state,
+    }
+}
+
+/// Zero-run-length encode: replace consecutive zeros with run symbols.
+/// Run symbol value = zrun_base + (run_length - 1). Non-zero values pass through.
+pub fn zero_run_encode(coefficients: &[i32], zrun_base: i32) -> Vec<i32> {
+    let mut symbols = Vec::with_capacity(coefficients.len());
+    let mut i = 0;
+    while i < coefficients.len() {
+        if coefficients[i] == 0 {
+            let mut run_len = 0i32;
+            while i < coefficients.len() && coefficients[i] == 0 && run_len < MAX_ZERO_RUN {
+                run_len += 1;
+                i += 1;
+            }
+            symbols.push(zrun_base + run_len - 1);
+        } else {
+            symbols.push(coefficients[i]);
+            i += 1;
+        }
+    }
+    symbols
+}
+
+/// Zero-run-length decode: expand run symbols back to zeros.
+pub fn zero_run_decode(symbols: &[i32], zrun_base: i32, output_len: usize) -> Vec<i32> {
+    let mut output = Vec::with_capacity(output_len);
+    for &sym in symbols {
+        if sym >= zrun_base {
+            let run_len = (sym - zrun_base + 1) as usize;
+            output.extend(std::iter::repeat_n(0, run_len));
+        } else {
+            output.push(sym);
+        }
+    }
+    debug_assert_eq!(output.len(), output_len, "ZRL decode length mismatch");
+    output
+}
+
+/// Adaptive ZRL encoder: tries both ZRL and plain rANS, returns whichever
+/// produces a smaller tile. Skips ZRL entirely when zero density is too low
+/// (< 60%) since the alphabet expansion overhead would dominate.
+pub fn rans_encode_tile_interleaved_zrl(coefficients: &[i32]) -> InterleavedRansTile {
+    if coefficients.is_empty() {
+        return rans_encode_tile_interleaved(coefficients);
+    }
+
+    // Quick zero-density check: ZRL can only help if there are enough consecutive zeros
+    let zero_count = coefficients.iter().filter(|&&c| c == 0).count();
+    let zero_fraction = zero_count as f64 / coefficients.len() as f64;
+    if zero_fraction < 0.6 {
+        return rans_encode_tile_interleaved(coefficients);
+    }
+
+    let tile_plain = rans_encode_tile_interleaved(coefficients);
+    let tile_zrl = rans_encode_tile_interleaved_zrl_inner(coefficients);
+    if tile_zrl.byte_size() < tile_plain.byte_size() {
+        tile_zrl
+    } else {
+        tile_plain
+    }
+}
+
+/// Core ZRL encoder: always applies zero-run-length coding before rANS.
+fn rans_encode_tile_interleaved_zrl_inner(coefficients: &[i32]) -> InterleavedRansTile {
+    if coefficients.is_empty() {
+        return InterleavedRansTile {
+            min_val: 0,
+            alphabet_size: 0,
+            num_coefficients: 0,
+            zrun_base: 0,
+            freqs: vec![],
+            cumfreqs: vec![0],
+            stream_data: vec![vec![]; STREAMS_PER_TILE],
+            stream_initial_state: vec![RANS_BYTE_L; STREAMS_PER_TILE],
+        };
+    }
+
+    // zrun_base = max(|non-zero coeff|) + 1, so run symbols never collide with coefficients
+    let max_abs = coefficients
+        .iter()
+        .filter(|&&c| c != 0)
+        .map(|&c| c.abs())
+        .max()
+        .unwrap_or(0);
+    let zrun_base = max_abs + 1;
+
+    // Extract stride-32 per-stream coefficients and apply ZRL per stream
+    let num_coefficients = coefficients.len();
+    let mut all_zrl_streams: Vec<Vec<i32>> = Vec::with_capacity(STREAMS_PER_TILE);
+
+    for s in 0..STREAMS_PER_TILE {
+        let stream_coeffs: Vec<i32> = coefficients
+            .iter()
+            .skip(s)
+            .step_by(STREAMS_PER_TILE)
+            .copied()
+            .collect();
+        all_zrl_streams.push(zero_run_encode(&stream_coeffs, zrun_base));
+    }
+
+    // Build shared histogram from ALL ZRL-transformed symbols across all streams
+    let min_val = all_zrl_streams
+        .iter()
+        .flat_map(|s| s.iter())
+        .copied()
+        .min()
+        .unwrap();
+    let max_val = all_zrl_streams
+        .iter()
+        .flat_map(|s| s.iter())
+        .copied()
+        .max()
+        .unwrap();
+    let alphabet_size = (max_val - min_val + 1) as usize;
+
+    let mut hist = vec![0u32; alphabet_size];
+    for stream in &all_zrl_streams {
+        for &sym in stream {
+            hist[(sym - min_val) as usize] += 1;
+        }
+    }
+
+    let freqs = normalize_histogram(&hist, RANS_M);
+
+    let mut cumfreqs = vec![0u32; alphabet_size + 1];
+    for i in 0..alphabet_size {
+        cumfreqs[i + 1] = cumfreqs[i] + freqs[i];
+    }
+    debug_assert_eq!(cumfreqs[alphabet_size], RANS_M);
+
+    // rANS encode each ZRL-transformed stream
+    let mut stream_data = Vec::with_capacity(STREAMS_PER_TILE);
+    let mut stream_initial_state = Vec::with_capacity(STREAMS_PER_TILE);
+
+    for zrl_stream in &all_zrl_streams {
+        if zrl_stream.is_empty() {
+            stream_data.push(vec![]);
+            stream_initial_state.push(RANS_BYTE_L);
+            continue;
+        }
+
+        let buf_size = zrl_stream.len() * 2 + 64;
+        let mut buf = vec![0u8; buf_size];
+        let mut ptr = buf_size;
+        let mut state: u32 = RANS_BYTE_L;
+
+        for &c in zrl_stream.iter().rev() {
+            let sym = (c - min_val) as usize;
+            let start = cumfreqs[sym];
+            let freq = freqs[sym];
+
+            let x_max = ((RANS_BYTE_L >> RANS_PRECISION) << 8) * freq;
+            while state >= x_max {
+                ptr -= 1;
+                buf[ptr] = (state & 0xff) as u8;
+                state >>= 8;
+            }
+
+            state = ((state / freq) << RANS_PRECISION) + (state % freq) + start;
+        }
+
+        stream_initial_state.push(state);
+        stream_data.push(buf[ptr..].to_vec());
+    }
+
+    InterleavedRansTile {
+        min_val,
+        alphabet_size: alphabet_size as u32,
+        num_coefficients: num_coefficients as u32,
+        zrun_base,
         freqs,
         cumfreqs,
         stream_data,
@@ -388,29 +568,64 @@ pub fn rans_decode_tile_interleaved(tile: &InterleavedRansTile) -> Vec<i32> {
         if s >= num_coefficients {
             break;
         }
-        let stream_len = 1 + (num_coefficients - 1 - s) / STREAMS_PER_TILE;
+        let stream_output_len = 1 + (num_coefficients - 1 - s) / STREAMS_PER_TILE;
 
         let mut state = tile.stream_initial_state[s];
         let buf = &tile.stream_data[s];
         let mut ptr: usize = 0;
         let mask = RANS_M - 1;
 
-        for i in 0..stream_len {
-            let slot = state & mask;
-            let sym = binary_search_cumfreq(&tile.cumfreqs, slot, alphabet_size);
+        if tile.zrun_base != 0 {
+            // ZRL-aware decode: while-loop tracking output position
+            let mut output_i = 0;
+            while output_i < stream_output_len {
+                let slot = state & mask;
+                let sym = binary_search_cumfreq(&tile.cumfreqs, slot, alphabet_size);
+                let value = sym as i32 + tile.min_val;
 
-            output[s + i * STREAMS_PER_TILE] = sym as i32 + tile.min_val;
+                let start = tile.cumfreqs[sym];
+                let freq = tile.cumfreqs[sym + 1] - tile.cumfreqs[sym];
+                state = freq * (state >> RANS_PRECISION) + (state & mask) - start;
 
-            let start = tile.cumfreqs[sym];
-            let freq = tile.cumfreqs[sym + 1] - tile.cumfreqs[sym];
-            state = freq * (state >> RANS_PRECISION) + (state & mask) - start;
+                while state < RANS_BYTE_L {
+                    if ptr < buf.len() {
+                        state = (state << 8) | buf[ptr] as u32;
+                        ptr += 1;
+                    } else {
+                        break;
+                    }
+                }
 
-            while state < RANS_BYTE_L {
-                if ptr < buf.len() {
-                    state = (state << 8) | buf[ptr] as u32;
-                    ptr += 1;
+                if value >= tile.zrun_base {
+                    let run_len = (value - tile.zrun_base + 1) as usize;
+                    for j in 0..run_len {
+                        output[s + (output_i + j) * STREAMS_PER_TILE] = 0;
+                    }
+                    output_i += run_len;
                 } else {
-                    break;
+                    output[s + output_i * STREAMS_PER_TILE] = value;
+                    output_i += 1;
+                }
+            }
+        } else {
+            // Original decode path (no ZRL)
+            for i in 0..stream_output_len {
+                let slot = state & mask;
+                let sym = binary_search_cumfreq(&tile.cumfreqs, slot, alphabet_size);
+
+                output[s + i * STREAMS_PER_TILE] = sym as i32 + tile.min_val;
+
+                let start = tile.cumfreqs[sym];
+                let freq = tile.cumfreqs[sym + 1] - tile.cumfreqs[sym];
+                state = freq * (state >> RANS_PRECISION) + (state & mask) - start;
+
+                while state < RANS_BYTE_L {
+                    if ptr < buf.len() {
+                        state = (state << 8) | buf[ptr] as u32;
+                        ptr += 1;
+                    } else {
+                        break;
+                    }
                 }
             }
         }
@@ -490,6 +705,7 @@ pub fn serialize_tile_interleaved(tile: &InterleavedRansTile) -> Vec<u8> {
     out.extend_from_slice(&tile.min_val.to_le_bytes());
     out.extend_from_slice(&tile.alphabet_size.to_le_bytes());
     out.extend_from_slice(&tile.num_coefficients.to_le_bytes());
+    out.extend_from_slice(&tile.zrun_base.to_le_bytes());
     // 32 stream data lengths
     for s in 0..STREAMS_PER_TILE {
         let len = tile.stream_data[s].len() as u32;
@@ -519,6 +735,8 @@ pub fn deserialize_tile_interleaved(data: &[u8]) -> (InterleavedRansTile, usize)
     let alphabet_size = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
     pos += 4;
     let num_coefficients = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
+    pos += 4;
+    let zrun_base = i32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
     pos += 4;
 
     let mut stream_lengths = Vec::with_capacity(STREAMS_PER_TILE);
@@ -560,6 +778,7 @@ pub fn deserialize_tile_interleaved(data: &[u8]) -> (InterleavedRansTile, usize)
             min_val,
             alphabet_size,
             num_coefficients,
+            zrun_base,
             freqs,
             cumfreqs,
             stream_data,
@@ -707,5 +926,129 @@ mod tests {
         // All zeros should compress very well even with 32 stream overhead
         let total_stream_bytes: usize = tile.stream_data.iter().map(|s| s.len()).sum();
         assert!(total_stream_bytes < 200, "Stream data {} should be small for all-zero input", total_stream_bytes);
+    }
+
+    // --- Zero-run-length coding tests ---
+
+    #[test]
+    fn test_zrl_encode_decode_basic() {
+        let coefficients = vec![0, 0, 0, 5, -3, 0, 0, 7, 0];
+        let zrun_base = 8; // max_abs=7, zrun_base=8
+        let encoded = zero_run_encode(&coefficients, zrun_base);
+        // run(3)=10, 5, -3, run(2)=9, 7, run(1)=8
+        assert_eq!(encoded, vec![10, 5, -3, 9, 7, 8]);
+        let decoded = zero_run_decode(&encoded, zrun_base, coefficients.len());
+        assert_eq!(decoded, coefficients);
+    }
+
+    #[test]
+    fn test_zrl_all_zeros() {
+        let coefficients = vec![0; 1000];
+        let zrun_base = 1; // max_abs=0, zrun_base=1
+        let encoded = zero_run_encode(&coefficients, zrun_base);
+        // 1000 zeros = 3 runs of 256 + 1 run of 232
+        assert_eq!(encoded.len(), 4);
+        let decoded = zero_run_decode(&encoded, zrun_base, 1000);
+        assert_eq!(decoded, coefficients);
+    }
+
+    #[test]
+    fn test_zrl_no_zeros() {
+        let coefficients = vec![1, -2, 3, -4, 5];
+        let zrun_base = 6;
+        let encoded = zero_run_encode(&coefficients, zrun_base);
+        assert_eq!(encoded, coefficients); // no change
+        let decoded = zero_run_decode(&encoded, zrun_base, coefficients.len());
+        assert_eq!(decoded, coefficients);
+    }
+
+    #[test]
+    fn test_zrl_interleaved_roundtrip_simple() {
+        // Adaptive wrapper: may pick plain or ZRL, but must roundtrip correctly
+        let coefficients = vec![0, 1, -1, 0, 2, -2, 0, 0, 1, -1, 0, 3];
+        let tile = rans_encode_tile_interleaved_zrl(&coefficients);
+        let decoded = rans_decode_tile_interleaved(&tile);
+        assert_eq!(coefficients, decoded);
+    }
+
+    #[test]
+    fn test_zrl_inner_roundtrip() {
+        // Test the inner ZRL encoder directly (always applies ZRL)
+        let coefficients = vec![0, 1, -1, 0, 2, -2, 0, 0, 1, -1, 0, 3];
+        let tile = rans_encode_tile_interleaved_zrl_inner(&coefficients);
+        assert_ne!(tile.zrun_base, 0);
+        let decoded = rans_decode_tile_interleaved(&tile);
+        assert_eq!(coefficients, decoded);
+    }
+
+    #[test]
+    fn test_zrl_interleaved_roundtrip_large() {
+        // 65536 coefficients = standard tile, mostly zeros (simulating wavelet output)
+        let mut coefficients = Vec::new();
+        for i in 0..65536 {
+            let v = if i % 7 == 0 {
+                (i % 50) as i32 - 25
+            } else if i % 3 == 0 {
+                (i % 10) as i32 - 5
+            } else {
+                0
+            };
+            coefficients.push(v);
+        }
+        let tile = rans_encode_tile_interleaved_zrl(&coefficients);
+        let decoded = rans_decode_tile_interleaved(&tile);
+        assert_eq!(coefficients, decoded);
+    }
+
+    #[test]
+    fn test_zrl_all_zeros_roundtrip() {
+        // Inner ZRL encoder on all-zeros data
+        let coefficients = vec![0; 65536];
+        let tile = rans_encode_tile_interleaved_zrl_inner(&coefficients);
+        assert_eq!(tile.zrun_base, 1);
+        let decoded = rans_decode_tile_interleaved(&tile);
+        assert_eq!(coefficients, decoded);
+    }
+
+    #[test]
+    fn test_zrl_serialize_roundtrip() {
+        let mut coefficients = Vec::new();
+        for i in 0..65536 {
+            coefficients.push(if i % 4 == 0 { (i % 10) as i32 - 5 } else { 0 });
+        }
+        let tile = rans_encode_tile_interleaved_zrl(&coefficients);
+        let serialized = serialize_tile_interleaved(&tile);
+        let (deserialized, consumed) = deserialize_tile_interleaved(&serialized);
+        assert_eq!(consumed, serialized.len());
+        assert_eq!(deserialized.zrun_base, tile.zrun_base);
+        let decoded = rans_decode_tile_interleaved(&deserialized);
+        assert_eq!(coefficients, decoded);
+    }
+
+    #[test]
+    fn test_zrl_compression_improvement() {
+        // Zero-heavy data: ZRL stream data should be smaller (test inner encoder)
+        let mut coefficients = vec![0i32; 65536];
+        for i in (0..65536).step_by(100) {
+            coefficients[i] = (i % 5) as i32 - 2;
+        }
+        let tile_no_zrl = rans_encode_tile_interleaved(&coefficients);
+        let tile_zrl = rans_encode_tile_interleaved_zrl_inner(&coefficients);
+
+        let no_zrl_bytes: usize = tile_no_zrl.stream_data.iter().map(|s| s.len()).sum();
+        let zrl_bytes: usize = tile_zrl.stream_data.iter().map(|s| s.len()).sum();
+
+        assert!(
+            zrl_bytes < no_zrl_bytes,
+            "ZRL stream data {} should be smaller than non-ZRL {}",
+            zrl_bytes,
+            no_zrl_bytes
+        );
+
+        // Verify both decode correctly
+        assert_eq!(
+            rans_decode_tile_interleaved(&tile_no_zrl),
+            rans_decode_tile_interleaved(&tile_zrl)
+        );
     }
 }

@@ -108,6 +108,20 @@ impl SubbandWeights {
     }
 }
 
+/// Quantized CfL (Chroma-from-Luma) alpha coefficients.
+///
+/// For each tile and each wavelet subband, stores the linear scaling factor
+/// `alpha` that predicts chroma from luma: `chroma ≈ alpha * luma`.
+/// Encoding the residual `chroma - alpha * luma` instead of raw chroma
+/// reduces chroma entropy.
+#[derive(Debug, Clone)]
+pub struct CflAlphas {
+    /// Quantized alpha values (u8), layout: [tile0_co_sb0, tile0_co_sb1, ..., tile0_cg_sb0, ...]
+    pub alphas: Vec<u8>,
+    /// Number of subbands per tile (1 LL + 3 * num_levels detail = 1 + 3*L)
+    pub num_subbands: u32,
+}
+
 /// Codec configuration
 #[derive(Debug, Clone)]
 pub struct CodecConfig {
@@ -116,6 +130,7 @@ pub struct CodecConfig {
     pub dead_zone: f32,
     pub wavelet_levels: u32,
     pub subband_weights: SubbandWeights,
+    pub cfl_enabled: bool,
 }
 
 impl Default for CodecConfig {
@@ -126,6 +141,7 @@ impl Default for CodecConfig {
             dead_zone: 0.0,
             wavelet_levels: 3,
             subband_weights: SubbandWeights::uniform(3),
+            cfl_enabled: false,
         }
     }
 }
@@ -137,12 +153,19 @@ pub struct CompressedFrame {
     pub config: CodecConfig,
     /// Per-tile interleaved rANS compressed data, ordered: plane 0 tiles, plane 1 tiles, plane 2 tiles
     pub tiles: Vec<encoder::rans::InterleavedRansTile>,
+    /// CfL alpha coefficients (present when cfl_enabled)
+    pub cfl_alphas: Option<CflAlphas>,
 }
 
 impl CompressedFrame {
-    /// Total compressed size in bytes (all tiles)
+    /// Total compressed size in bytes (all tiles + CfL alpha overhead)
     pub fn byte_size(&self) -> usize {
-        self.tiles.iter().map(|t| t.byte_size()).sum()
+        let tile_bytes: usize = self.tiles.iter().map(|t| t.byte_size()).sum();
+        let cfl_bytes = self
+            .cfl_alphas
+            .as_ref()
+            .map_or(0, |a| a.alphas.len());
+        tile_bytes + cfl_bytes
     }
 
     /// Bits per pixel

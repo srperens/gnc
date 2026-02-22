@@ -85,16 +85,17 @@ fn main(
     workgroupBarrier();
 
     let min_val = bitcast<i32>(tile_info[base]);
+    let zrun_base = bitcast<i32>(tile_info[base + 3u]);
 
-    // Per-stream: initial state, byte offset, byte count
-    let stream_byte_base = tile_info[base + 3u];
-    let initial_state = tile_info[base + 4u + thread_id];
-    let stream_offset = tile_info[base + 36u + thread_id];
+    // Per-stream: initial state, byte offset (shifted +1 for zrun_base field)
+    let stream_byte_base = tile_info[base + 4u];
+    let initial_state = tile_info[base + 5u + thread_id];
+    let stream_offset = tile_info[base + 37u + thread_id];
 
     var state = initial_state;
     var byte_ptr = stream_byte_base + stream_offset;
 
-    let symbols_per_thread = params.coefficients_per_tile / STREAMS_PER_TILE;
+    let target_outputs = params.coefficients_per_tile / STREAMS_PER_TILE;
 
     // Compute tile position in the plane
     let tile_x = tile_id % params.tiles_x;
@@ -102,20 +103,14 @@ fn main(
     let tile_origin_x = tile_x * params.tile_size;
     let tile_origin_y = tile_y * params.tile_size;
 
-    // Decode symbols for this stream
-    for (var i = 0u; i < symbols_per_thread; i++) {
+    // Decode symbols with zero-run expansion.
+    // Each rANS symbol is either a coefficient value or a zero-run marker.
+    // When zrun_base == 0 (no ZRL), every symbol produces exactly one output.
+    var output_i = 0u;
+    while (output_i < target_outputs) {
         // Extract slot from current state
         let slot = state & RANS_MASK;
         let sym = binary_search(slot, alphabet_size);
-
-        // Compute output position: stride-32 deinterleave into tile, then into plane
-        let coeff_idx = thread_id + i * STREAMS_PER_TILE;
-        let tile_row = coeff_idx / params.tile_size;
-        let tile_col = coeff_idx % params.tile_size;
-        let plane_idx = (tile_origin_y + tile_row) * params.plane_width
-                      + (tile_origin_x + tile_col);
-
-        output[plane_idx] = f32(i32(sym) + min_val);
 
         // Advance rANS state
         let start = shared_cumfreq[sym];
@@ -128,6 +123,35 @@ fn main(
             let byte_val = read_byte(byte_ptr);
             state = (state << 8u) | byte_val;
             byte_ptr++;
+        }
+
+        let value = i32(sym) + min_val;
+
+        if (zrun_base != 0 && value >= zrun_base) {
+            // Zero-run symbol: write N zeros
+            var run_len = u32(value - zrun_base) + 1u;
+            // Clamp to not exceed output buffer
+            if (output_i + run_len > target_outputs) {
+                run_len = target_outputs - output_i;
+            }
+            for (var j = 0u; j < run_len; j++) {
+                let coeff_idx = thread_id + (output_i + j) * STREAMS_PER_TILE;
+                let tile_row = coeff_idx / params.tile_size;
+                let tile_col = coeff_idx % params.tile_size;
+                let plane_idx = (tile_origin_y + tile_row) * params.plane_width
+                              + (tile_origin_x + tile_col);
+                output[plane_idx] = 0.0;
+            }
+            output_i += run_len;
+        } else {
+            // Regular coefficient
+            let coeff_idx = thread_id + output_i * STREAMS_PER_TILE;
+            let tile_row = coeff_idx / params.tile_size;
+            let tile_col = coeff_idx % params.tile_size;
+            let plane_idx = (tile_origin_y + tile_row) * params.plane_width
+                          + (tile_origin_x + tile_col);
+            output[plane_idx] = f32(value);
+            output_i += 1u;
         }
     }
 }

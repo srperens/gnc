@@ -33,6 +33,10 @@ enum Command {
         /// Tile size
         #[arg(short, long, default_value = "256")]
         tile_size: u32,
+
+        /// Enable Chroma-from-Luma prediction
+        #[arg(long)]
+        cfl: bool,
     },
 
     /// Decode a compressed file back to an image
@@ -103,6 +107,7 @@ fn main() {
             output,
             qstep,
             tile_size,
+            cfl,
         } => {
             let (rgb_data, w, h) = load_image_rgb_f32(&input);
             println!("Input: {}x{} ({} pixels)", w, h, w * h);
@@ -116,6 +121,7 @@ fn main() {
                 dead_zone: 0.0,
                 wavelet_levels: 3,
                 subband_weights: gnc::SubbandWeights::uniform(3),
+                cfl_enabled: cfl,
             };
 
             let compressed = encoder.encode(&ctx, &rgb_data, w, h, &config);
@@ -264,16 +270,18 @@ fn main() {
                 "levels" => experiments::wavelet_level_experiments(),
                 "subband" => experiments::subband_weight_experiments(),
                 "combined" => experiments::combined_dz_subband_experiments(),
+                "cfl" => experiments::cfl_experiments(),
                 "all" => {
                     let mut e = experiments::phase1_experiments();
                     e.extend(experiments::wavelet_level_experiments());
                     e.extend(experiments::dead_zone_experiments());
                     e.extend(experiments::subband_weight_experiments());
                     e.extend(experiments::combined_dz_subband_experiments());
+                    e.extend(experiments::cfl_experiments());
                     e
                 }
                 other => {
-                    eprintln!("Unknown experiment set: {}. Use: all, baseline, deadzone, levels, subband, combined", other);
+                    eprintln!("Unknown experiment set: {}. Use: all, baseline, deadzone, levels, subband, combined, cfl", other);
                     std::process::exit(1);
                 }
             };
@@ -324,12 +332,12 @@ fn main() {
 }
 
 // Serialization for compressed frames (interleaved rANS per-tile)
-// GPC4 format: adds subband weights to the header for correct decoder round-trip.
+// GPC5 format: CfL alpha side info + per-tile ZRL (zrun_base in tile serialization).
 fn serialize_compressed(frame: &gnc::CompressedFrame) -> Vec<u8> {
     use gnc::encoder::rans;
     let mut out = Vec::new();
     // Header
-    out.extend_from_slice(b"GPC4"); // version 4 = subband-weighted quantization
+    out.extend_from_slice(b"GPC5"); // version 5 = CfL support
     out.extend_from_slice(&frame.info.width.to_le_bytes());
     out.extend_from_slice(&frame.info.height.to_le_bytes());
     out.extend_from_slice(&frame.info.bit_depth.to_le_bytes());
@@ -348,6 +356,17 @@ fn serialize_compressed(frame: &gnc::CompressedFrame) -> Vec<u8> {
         out.extend_from_slice(&level[2].to_le_bytes()); // HH
     }
     out.extend_from_slice(&sw.chroma_weight.to_le_bytes());
+    // CfL alpha side info
+    let cfl_enabled: u8 = if frame.cfl_alphas.is_some() { 1 } else { 0 };
+    out.push(cfl_enabled);
+    if let Some(ref cfl) = frame.cfl_alphas {
+        out.extend_from_slice(&cfl.num_subbands.to_le_bytes());
+        let tiles_x = frame.info.width.div_ceil(frame.info.tile_size);
+        let tiles_y = frame.info.height.div_ceil(frame.info.tile_size);
+        let num_cfl_tiles = tiles_x * tiles_y;
+        out.extend_from_slice(&num_cfl_tiles.to_le_bytes());
+        out.extend_from_slice(&cfl.alphas);
+    }
     // Tile count + per-tile data
     let num_tiles = frame.tiles.len() as u32;
     out.extend_from_slice(&num_tiles.to_le_bytes());
@@ -361,11 +380,12 @@ fn serialize_compressed(frame: &gnc::CompressedFrame) -> Vec<u8> {
 fn deserialize_compressed(data: &[u8]) -> gnc::CompressedFrame {
     use gnc::encoder::rans;
     assert!(data.len() >= 36, "File too small");
-    assert_eq!(
-        &data[0..4],
-        b"GPC4",
-        "Invalid magic (expected GPC4 for subband-weighted format)"
+    let magic = &data[0..4];
+    assert!(
+        magic == b"GPC5",
+        "Invalid magic (expected GPC5; GPC4 files must be re-encoded)"
     );
+    let is_v5 = true;
 
     let width = u32::from_le_bytes(data[4..8].try_into().unwrap());
     let height = u32::from_le_bytes(data[8..12].try_into().unwrap());
@@ -389,6 +409,27 @@ fn deserialize_compressed(data: &[u8]) -> gnc::CompressedFrame {
     }
     let chroma_weight = f32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
     pos += 4;
+
+    // CfL alpha side info (GPC5 only)
+    let (cfl_enabled, cfl_alphas) = if is_v5 {
+        let cfl_flag = data[pos];
+        pos += 1;
+        if cfl_flag != 0 {
+            let nsb = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
+            pos += 4;
+            let num_cfl_tiles = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
+            pos += 4;
+            // 2 chroma planes × num_cfl_tiles × nsb alpha bytes
+            let alpha_count = (2 * num_cfl_tiles * nsb) as usize;
+            let alphas = data[pos..pos + alpha_count].to_vec();
+            pos += alpha_count;
+            (true, Some(gnc::CflAlphas { alphas, num_subbands: nsb }))
+        } else {
+            (false, None)
+        }
+    } else {
+        (false, None)
+    };
 
     let num_tiles = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
     pos += 4;
@@ -417,7 +458,9 @@ fn deserialize_compressed(data: &[u8]) -> gnc::CompressedFrame {
                 detail,
                 chroma_weight,
             },
+            cfl_enabled,
         },
         tiles,
+        cfl_alphas,
     }
 }

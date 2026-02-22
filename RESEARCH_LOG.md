@@ -393,3 +393,86 @@ Dead-zone 0.5 produces identical results to dz=0.0 in every case. This confirms 
 1. GPU rANS throughput optimization — CPU-side rANS is the bottleneck
 2. Context-modeled entropy coding — could save another 10-20%
 3. Consider making q=8 + perceptual + dz=0.75 the default codec profile
+
+---
+
+## 2026-02-22: Zero-Run-Length Coding Before rANS (Negative Result)
+
+### Hypothesis
+After quantization + dead-zone + perceptual subband weights, ~70-80% of wavelet coefficients are zero. The current rANS encoder treats each zero as an individual symbol costing ~0.3-0.5 bits. Consecutive zeros are common (especially in HH subbands) but rANS has no way to exploit run-length structure. Replacing N consecutive zeros with a single "zero-run-of-N" symbol before rANS encoding should reduce BPP by ~15-25% at identical PSNR, analogous to MJPEG's run-length coding before Huffman.
+
+### Implementation
+- **Symbol mapping**: Non-zero coefficients keep their value; consecutive zeros become `zrun_base + (N - 1)` where `zrun_base = max(|coeff|) + 1`. Symbol 0 never appears in the transformed stream.
+- **MAX_ZERO_RUN = 256**: longer runs split into multiple symbols.
+- **Per-stream ZRL**: applied per stride-32 stream after deinterleaving, before rANS encoding. Shared histogram built from all ZRL-transformed symbols across all 32 streams.
+- **Adaptive per-tile**: encoder tries both plain and ZRL, picks whichever produces a smaller tile. Zero-density heuristic (< 60% zeros → skip ZRL) avoids double-encoding overhead on low-zero tiles.
+- **GPU decoder**: shader reads `zrun_base` from tile_info; decode loop changed from fixed-count `for` to output-driven `while` with run expansion. When `zrun_base == 0`, the shader falls back to the original one-symbol-per-output path.
+- **Backward compat**: `zrun_base = 0` in tile header means no ZRL (old tiles decode identically).
+- **Bitstream**: `zrun_base` added to per-tile serialization (InterleavedRansTile header). File format stays GPC5 (ZRL is transparent per-tile).
+
+### Results — blue_sky (1920x1080)
+
+| Weights | Dead Zone | QStep | PSNR (dB) | BPP (prev) | BPP (ZRL) | Change |
+|---------|-----------|-------|-----------|-----------|-----------|--------|
+| uniform         | 0.00 | 4  | 43.47 | 5.03 | 5.02 | -0.2% |
+| uniform         | 0.00 | 8  | 38.19 | 3.02 | 3.02 | 0%    |
+| uniform         | 0.00 | 16 | 32.68 | 1.76 | 1.76 | 0%    |
+| uniform         | 0.75 | 4  | 42.70 | 4.15 | 4.14 | -0.2% |
+| uniform         | 0.75 | 8  | 37.36 | 2.45 | 2.44 | -0.4% |
+| uniform         | 0.75 | 16 | 31.83 | 1.35 | 1.35 | 0%    |
+| perceptual      | 0.75 | 4  | 39.49 | 2.95 | 2.95 | 0%    |
+| perceptual      | 0.75 | 8  | 34.18 | 1.66 | 1.65 | -0.6% |
+| perceptual      | 0.75 | 16 | 29.21 | 0.87 | 0.87 | 0%    |
+| full_perceptual | 0.75 | 8  | 33.11 | 1.42 | 1.41 | -0.7% |
+| full_perceptual | 0.75 | 16 | 28.18 | 0.74 | 0.73 | **-1.4%** |
+
+### Results — touchdown_pass (1920x1080)
+
+| Weights | Dead Zone | QStep | PSNR (dB) | BPP (prev) | BPP (ZRL) | Change |
+|---------|-----------|-------|-----------|-----------|-----------|--------|
+| uniform         | 0.00 | 4  | 42.98 | 5.42 | 5.41 | -0.2% |
+| uniform         | 0.00 | 8  | 37.52 | 2.81 | 2.81 | 0%    |
+| uniform         | 0.75 | 8  | 36.39 | 2.02 | 2.02 | 0%    |
+| perceptual      | 0.75 | 8  | 33.77 | 1.47 | 1.47 | 0%    |
+| perceptual      | 0.75 | 16 | 29.84 | 0.78 | 0.78 | 0%    |
+| full_perceptual | 0.75 | 16 | 26.40 | 0.63 | 0.63 | 0%    |
+
+### Throughput (blue_sky, 1920x1080, default config, 10 iterations)
+
+| Metric | Value |
+|--------|-------|
+| Encode | 187.70 ms (5.3 fps) |
+| Decode (sequential) | 36.24 ms (27.6 fps) |
+| Decode (pipelined) | 34.15 ms (29.3 fps) |
+
+Encode speed regressed ~1.7x due to the adaptive double-encoding (try both, pick smaller). The zero-density heuristic (skip ZRL when < 60% zeros) mitigates this for low-Q tiles. Decode speed is unaffected — the while-loop decoder runs identically whether processing ZRL or non-ZRL tiles.
+
+### Analysis
+
+**The hypothesis was wrong.** ZRL before rANS provides 0-1.4% BPP reduction — far short of the expected 15-25%. The adaptive approach correctly prevents regressions (PSNR is identical, BPP never increases), but the technique is essentially a no-op for this codec.
+
+**Why ZRL fails before rANS (but succeeds before Huffman):**
+
+1. **rANS already encodes zeros cheaply.** In a distribution where zeros are 70-80% of symbols, the zero symbol has frequency ~3000/4096. rANS encodes it for ~0.35 bits — nearly at the entropy limit. ZRL can't beat this for isolated zeros or short runs.
+
+2. **Alphabet expansion overhead.** ZRL adds run symbols above `max_abs`, expanding the per-tile frequency table by up to `MAX_ZERO_RUN × 2 = 512 bytes`. For 256×256 tiles at moderate bitrates, this overhead often exceeds the stream savings.
+
+3. **Short runs dominate.** Wavelet coefficient zeros are distributed across interleaved subbands. After stride-32 deinterleaving, zero runs within each stream tend to be short (1-5 zeros) because non-zero LL/LH/HL coefficients break up the runs. A run of 3 zeros costs one run symbol (~2-4 bits) vs three zero symbols (~1.0 bits). The savings per run is marginal.
+
+4. **MJPEG's RLC works differently.** MJPEG uses run-length coding before Huffman, where each symbol costs minimum 1 bit. Encoding 256 zeros costs minimum 256 bits with Huffman; one run symbol costs ~8-16 bits. That's 16-32x savings. With rANS, 256 zeros cost ~90 bits total (0.35 bits each); one run symbol costs ~8-10 bits. That's only ~10x savings, and the alphabet overhead eats most of it.
+
+**Where ZRL provides marginal benefit (up to 1.4%):**
+- High quantization (q=16) + aggressive dead-zone (0.75) + full_perceptual weights
+- These settings maximize zero density (>95%) and create longer runs in HH subbands
+- Even here, the benefit barely exceeds the frequency table overhead
+
+### Conclusion
+
+ZRL before rANS is a conceptual mismatch. rANS is near-optimal for symbol-by-symbol entropy coding — its strength IS efficiently encoding highly probable symbols. Run-length coding is valuable before fixed-length or minimum-1-bit codes (Huffman), but adds negligible value before an arithmetic-family coder that already exploits skewed distributions.
+
+The adaptive encoder infrastructure (zrun_base field, GPU while-loop decoder, per-tile ZRL flag) is retained with zero overhead on non-ZRL tiles. If a future entropy coder with higher per-symbol overhead is explored, ZRL could be re-evaluated.
+
+### Next steps
+1. **Context-modeled entropy coding** — the real opportunity for BPP reduction. Neighboring coefficients in the same subband are correlated; using context from already-decoded neighbors to modulate rANS frequencies could save 10-20%.
+2. **Trellis quantization** — optimize quantized values to minimize rate at a given distortion target, rather than simple rounding.
+3. **GPU rANS encode** — move rANS encoding to GPU with 32 parallel streams to recover encode throughput.

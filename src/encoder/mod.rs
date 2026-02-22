@@ -1,3 +1,4 @@
+pub mod cfl;
 pub mod color;
 pub mod entropy;
 pub mod interleave;

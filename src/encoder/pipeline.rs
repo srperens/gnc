@@ -1,10 +1,11 @@
 use wgpu;
 
+use super::cfl;
 use super::color::ColorConverter;
 use super::quantize::Quantizer;
 use super::rans::{self, InterleavedRansTile};
 use super::transform::WaveletTransform;
-use crate::{CodecConfig, CompressedFrame, FrameInfo, GpuContext};
+use crate::{CflAlphas, CodecConfig, CompressedFrame, FrameInfo, GpuContext};
 
 /// Full encoding pipeline: Color -> Wavelet -> Quantize -> rANS Entropy
 pub struct EncoderPipeline {
@@ -126,7 +127,15 @@ impl EncoderPipeline {
         let weights_luma = config.subband_weights.pack_weights();
         let weights_chroma = config.subband_weights.pack_weights_chroma();
 
+        // CfL state: reconstructed Y wavelet (dequantized) for chroma prediction
+        let mut recon_y_wavelet: Option<Vec<f32>> = None;
+        let mut cfl_alphas_all: Vec<u8> = Vec::new();
+        let nsb = cfl::num_subbands(config.wavelet_levels);
+
         for p in 0..3 {
+            let is_chroma = p > 0;
+            let use_cfl = config.cfl_enabled && is_chroma;
+
             ctx.queue
                 .write_buffer(&plane_buf_a, 0, bytemuck::cast_slice(&planes[p]));
 
@@ -136,53 +145,133 @@ impl EncoderPipeline {
                     label: Some("encode_plane"),
                 });
 
-            // Wavelet forward
+            // Wavelet forward: plane_buf_a → (temp plane_buf_b) → plane_buf_c (wavelet coefficients)
             self.transform
                 .forward(ctx, &mut cmd, &plane_buf_a, &plane_buf_b, &plane_buf_c, &info, config.wavelet_levels);
 
-            // Quantize — planes 1,2 (Co, Cg) use chroma-weighted weights
-            let weights = if p == 0 { &weights_luma } else { &weights_chroma };
-            self.quantize.dispatch(
-                ctx,
-                &mut cmd,
-                &plane_buf_c,
-                &plane_buf_b,
-                padded_pixels as u32,
-                config.quantization_step,
-                config.dead_zone,
-                true,
-                padded_w,
-                padded_h,
-                config.tile_size,
-                config.wavelet_levels,
-                weights,
-            );
+            if p == 0 && config.cfl_enabled {
+                // Y plane with CfL: quantize, then dequantize to get reconstructed Y wavelet.
+                // Quantize: plane_buf_c → plane_buf_b (quantized)
+                self.quantize.dispatch(
+                    ctx, &mut cmd, &plane_buf_c, &plane_buf_b,
+                    padded_pixels as u32, config.quantization_step, config.dead_zone,
+                    true, padded_w, padded_h, config.tile_size, config.wavelet_levels,
+                    &weights_luma,
+                );
+                // Dequantize: plane_buf_b → plane_buf_a (reconstructed Y wavelet)
+                self.quantize.dispatch(
+                    ctx, &mut cmd, &plane_buf_b, &plane_buf_a,
+                    padded_pixels as u32, config.quantization_step, config.dead_zone,
+                    false, padded_w, padded_h, config.tile_size, config.wavelet_levels,
+                    &weights_luma,
+                );
+                ctx.queue.submit(Some(cmd.finish()));
 
-            ctx.queue.submit(Some(cmd.finish()));
+                // Read back both quantized Y and reconstructed Y wavelet
+                let quantized = read_buffer_f32(ctx, &plane_buf_b, padded_pixels);
+                recon_y_wavelet = Some(read_buffer_f32(ctx, &plane_buf_a, padded_pixels));
 
-            // Read back quantized plane
-            let quantized = read_buffer_f32(ctx, &plane_buf_b, padded_pixels);
+                // rANS encode Y tiles
+                for ty in 0..tiles_y {
+                    for tx in 0..tiles_x {
+                        let coeffs = extract_tile_coefficients(
+                            &quantized, padded_w as usize, tx, ty, tile_size,
+                        );
+                        let tile = rans::rans_encode_tile_interleaved_zrl(&coeffs);
+                        all_tiles.push(tile);
+                    }
+                }
+            } else if use_cfl {
+                // Chroma plane with CfL prediction
+                ctx.queue.submit(Some(cmd.finish()));
 
-            // rANS encode each tile independently
-            for ty in 0..tiles_y {
-                for tx in 0..tiles_x {
-                    let coeffs = extract_tile_coefficients(
-                        &quantized,
-                        padded_w as usize,
-                        tx,
-                        ty,
-                        tile_size,
-                    );
-                    let tile = rans::rans_encode_tile_interleaved(&coeffs);
-                    all_tiles.push(tile);
+                // Read back chroma wavelet coefficients from plane_buf_c
+                let chroma_wavelet = read_buffer_f32(ctx, &plane_buf_c, padded_pixels);
+                let recon_y = recon_y_wavelet.as_ref().unwrap();
+
+                // Compute per-tile per-subband alpha
+                let alphas_f32 = cfl::compute_cfl_alphas(
+                    recon_y, &chroma_wavelet,
+                    padded_w, padded_h, config.tile_size, config.wavelet_levels,
+                );
+
+                // Quantize then dequantize alphas (encoder must use same values as decoder)
+                let q_alphas: Vec<u8> = alphas_f32.iter().map(|&a| cfl::quantize_alpha(a)).collect();
+                let dq_alphas: Vec<f32> = q_alphas.iter().map(|&q| cfl::dequantize_alpha(q)).collect();
+
+                // Compute residual on CPU: residual = chroma_wavelet - alpha * recon_y
+                let residual = cfl::apply_cfl_predict_cpu(
+                    &chroma_wavelet, recon_y, &dq_alphas,
+                    padded_w, padded_h, config.tile_size, config.wavelet_levels,
+                );
+
+                // Upload residual, quantize on GPU, read back
+                ctx.queue.write_buffer(&plane_buf_c, 0, bytemuck::cast_slice(&residual));
+                let mut cmd = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("encode_cfl_residual"),
+                });
+                self.quantize.dispatch(
+                    ctx, &mut cmd, &plane_buf_c, &plane_buf_b,
+                    padded_pixels as u32, config.quantization_step, config.dead_zone,
+                    true, padded_w, padded_h, config.tile_size, config.wavelet_levels,
+                    &weights_chroma,
+                );
+                ctx.queue.submit(Some(cmd.finish()));
+
+                let quantized = read_buffer_f32(ctx, &plane_buf_b, padded_pixels);
+
+                // rANS encode residual tiles
+                for ty in 0..tiles_y {
+                    for tx in 0..tiles_x {
+                        let coeffs = extract_tile_coefficients(
+                            &quantized, padded_w as usize, tx, ty, tile_size,
+                        );
+                        let tile = rans::rans_encode_tile_interleaved_zrl(&coeffs);
+                        all_tiles.push(tile);
+                    }
+                }
+
+                // Store quantized alphas for serialization
+                cfl_alphas_all.extend_from_slice(&q_alphas);
+            } else {
+                // Non-CfL path (original flow)
+                let weights = if p == 0 { &weights_luma } else { &weights_chroma };
+                self.quantize.dispatch(
+                    ctx, &mut cmd, &plane_buf_c, &plane_buf_b,
+                    padded_pixels as u32, config.quantization_step, config.dead_zone,
+                    true, padded_w, padded_h, config.tile_size, config.wavelet_levels,
+                    weights,
+                );
+                ctx.queue.submit(Some(cmd.finish()));
+
+                let quantized = read_buffer_f32(ctx, &plane_buf_b, padded_pixels);
+
+                for ty in 0..tiles_y {
+                    for tx in 0..tiles_x {
+                        let coeffs = extract_tile_coefficients(
+                            &quantized, padded_w as usize, tx, ty, tile_size,
+                        );
+                        let tile = rans::rans_encode_tile_interleaved_zrl(&coeffs);
+                        all_tiles.push(tile);
+                    }
                 }
             }
         }
+
+        let cfl_alphas = if config.cfl_enabled {
+            Some(CflAlphas {
+                alphas: cfl_alphas_all,
+                num_subbands: nsb,
+            })
+        } else {
+            None
+        };
 
         CompressedFrame {
             info,
             config: config.clone(),
             tiles: all_tiles,
+            cfl_alphas,
         }
     }
 }

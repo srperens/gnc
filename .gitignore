@@ -1,0 +1,14 @@
+/target
+.claude/
+
+# Test media (binary assets stay out of git)
+test_material/*.png
+test_material/*.jpg
+test_material/*.y4m
+test_material/*.y4m.xz
+test_material/*.yuv
+test_material/*.tiff
+test_material/*.exr
+test_material/*.dpx
+test_material/*.raw
+test_material/frames/

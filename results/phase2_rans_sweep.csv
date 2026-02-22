@@ -1,0 +1,7 @@
+name,input,width,height,tile_size,qstep,dead_zone,psnr_db,psnr_r,psnr_g,psnr_b,ssim,bpp,compressed_bytes,encode_ms,decode_ms,encode_fps,decode_fps
+baseline_q1,test_material/test_512.png,512,512,256,1,0,55.88,54.32,59.19,55.47,1.0000,10.78,353163,,,,
+baseline_q2,test_material/test_512.png,512,512,256,2,0,51.89,53.17,51.39,51.35,1.0000,8.51,278820,,,,
+baseline_q4,test_material/test_512.png,512,512,256,4,0,46.29,46.11,46.48,46.30,0.9999,7.33,240097,,,,
+baseline_q8,test_material/test_512.png,512,512,256,8,0,40.01,39.59,40.51,39.97,0.9994,6.46,211549,,,,
+baseline_q16,test_material/test_512.png,512,512,256,16,0,33.71,33.31,34.27,33.60,0.9975,5.57,182566,,,,
+baseline_q32,test_material/test_512.png,512,512,256,32,0,27.57,27.20,28.25,27.34,0.9898,4.61,150903,,,,

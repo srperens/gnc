@@ -1,0 +1,11 @@
+name,input,width,height,tile_size,qstep,dead_zone,psnr_db,psnr_r,psnr_g,psnr_b,ssim,bpp,compressed_bytes,encode_ms,decode_ms,encode_fps,decode_fps
+baseline_q1,test_material/test_512.png,512,512,256,1,0,54.23,53.24,55.51,54.23,1.0000,5.67,185785,,,,
+baseline_q2,test_material/test_512.png,512,512,256,2,0,50.76,51.47,50.12,50.81,1.0000,3.42,112230,,,,
+baseline_q4,test_material/test_512.png,512,512,256,4,0,46.20,45.42,46.68,46.63,0.9998,2.70,88359,,,,
+baseline_q8,test_material/test_512.png,512,512,256,8,0,40.43,40.25,40.43,40.63,0.9995,2.32,75895,,,,
+baseline_q16,test_material/test_512.png,512,512,256,16,0,34.54,33.76,35.28,34.74,0.9977,1.93,63286,,,,
+baseline_q32,test_material/test_512.png,512,512,256,32,0,28.56,27.94,29.71,28.24,0.9913,1.51,49569,,,,
+levels_1,test_material/test_512.png,512,512,256,4,0,46.29,46.11,46.48,46.30,0.9999,7.33,240097,,,,
+levels_2,test_material/test_512.png,512,512,256,4,0,47.08,47.20,46.74,47.32,0.9999,3.63,118921,,,,
+levels_3,test_material/test_512.png,512,512,256,4,0,46.20,45.42,46.68,46.63,0.9998,2.70,88359,,,,
+levels_4,test_material/test_512.png,512,512,256,4,0,44.42,43.82,45.21,44.35,0.9998,2.57,84112,,,,

@@ -307,3 +307,89 @@ Supports up to 5 decomposition levels (1 + 5×3 = 16 slots).
 2. Tune weights further: the current weights were chosen by intuition — a grid search over weight values could find a better operating point
 3. Combine with dead-zone quantization (dz=0.75 + perceptual weights) for maximum compression
 4. GPU rANS optimization remains the throughput bottleneck
+
+---
+
+## 2026-02-22: Combined Dead-Zone + Subband Weights
+
+### Hypothesis
+Dead-zone quantization and subband-specific weights attack different sources of redundancy: dead-zone zeros out near-zero coefficients across all subbands, while subband weights apply coarser quantization to perceptually unimportant subbands. They should stack for near-additive BPP savings.
+
+### Implementation
+No code changes to the pipeline — just a new experiment set (`combined_dz_subband_experiments`) sweeping 3 QSteps × 3 dead-zones (0, 0.5, 0.75) × 3 weight presets (uniform, perceptual, full_perceptual) = 27 configurations.
+
+### Key finding: dz=0.5 has no effect
+Dead-zone 0.5 produces identical results to dz=0.0 in every case. This confirms the earlier observation: standard `floor(abs/step + 0.5)` rounding already maps values below `0.5 * step` to zero, so the dead-zone parameter only adds value above 0.5. Future sweeps should skip dz < 0.5.
+
+### Results — blue_sky (1920x1080)
+
+| Weights | Dead Zone | QStep | PSNR (dB) | BPP  | vs uniform/dz=0 |
+|---------|-----------|-------|-----------|------|------------------|
+| uniform         | 0.00 | 4  | 43.47 | 5.03 | baseline |
+| perceptual      | 0.00 | 4  | 40.54 | 3.66 | -27% |
+| full_perceptual | 0.00 | 4  | 39.42 | 3.27 | -35% |
+| uniform         | 0.75 | 4  | 42.70 | 4.15 | -17% |
+| perceptual      | 0.75 | 4  | 39.49 | 2.95 | -41% |
+| full_perceptual | 0.75 | 4  | 38.19 | 2.59 | -49% |
+| uniform         | 0.00 | 8  | 38.19 | 3.02 | baseline |
+| perceptual      | 0.00 | 8  | 35.34 | 2.13 | -29% |
+| full_perceptual | 0.00 | 8  | 34.34 | 1.85 | -39% |
+| uniform         | 0.75 | 8  | 37.36 | 2.45 | -19% |
+| **perceptual**  | **0.75** | **8** | **34.18** | **1.66** | **-45%** |
+| full_perceptual | 0.75 | 8  | 33.11 | 1.42 | -53% |
+| uniform         | 0.00 | 16 | 32.68 | 1.76 | baseline |
+| perceptual      | 0.00 | 16 | 30.27 | 1.19 | -32% |
+| full_perceptual | 0.00 | 16 | 29.48 | 1.02 | -42% |
+| uniform         | 0.75 | 16 | 31.83 | 1.35 | -23% |
+| perceptual      | 0.75 | 16 | 29.21 | 0.87 | -51% |
+| full_perceptual | 0.75 | 16 | 28.18 | 0.74 | -58% |
+
+### Results — touchdown_pass (1920x1080)
+
+| Weights | Dead Zone | QStep | PSNR (dB) | BPP  | vs uniform/dz=0 |
+|---------|-----------|-------|-----------|------|------------------|
+| uniform         | 0.00 | 4  | 42.98 | 5.42 | baseline |
+| perceptual      | 0.00 | 4  | 39.67 | 3.69 | -32% |
+| full_perceptual | 0.00 | 4  | 39.15 | 3.30 | -39% |
+| uniform         | 0.75 | 4  | 41.78 | 4.16 | -23% |
+| perceptual      | 0.75 | 4  | 38.45 | 2.86 | -47% |
+| full_perceptual | 0.75 | 4  | 38.04 | 2.67 | -51% |
+| uniform         | 0.00 | 8  | 37.52 | 2.81 | baseline |
+| perceptual      | 0.00 | 8  | 34.74 | 2.00 | -29% |
+| full_perceptual | 0.00 | 8  | 33.85 | 1.90 | -32% |
+| uniform         | 0.75 | 8  | 36.39 | 2.02 | -28% |
+| **perceptual**  | **0.75** | **8** | **33.77** | **1.47** | **-48%** |
+| full_perceptual | 0.75 | 8  | 33.00 | 1.42 | -49% |
+| uniform         | 0.00 | 16 | 32.26 | 1.42 | baseline |
+| perceptual      | 0.00 | 16 | 30.89 | 1.06 | -25% |
+| full_perceptual | 0.00 | 16 | 29.03 | 1.02 | -28% |
+| uniform         | 0.75 | 16 | 31.56 | 1.06 | -25% |
+| perceptual      | 0.75 | 16 | 29.84 | 0.78 | -45% |
+| full_perceptual | 0.75 | 16 | 26.40 | 0.63 | -56% |
+
+### Analysis
+
+**The gains stack.** At q=8, perceptual alone saves ~29%, dz=0.75 alone saves ~19-28%, combined saves **45-48%**. Not perfectly additive but close — the two techniques attack largely orthogonal redundancy.
+
+**Recommended operating points for 1080p50:**
+
+| Target | Config | PSNR | BPP | Bitrate |
+|--------|--------|------|-----|---------|
+| High quality | q=4, perceptual, dz=0.75 | ~39 dB | ~2.9 bpp | ~300 Mbps |
+| Contribution | q=8, perceptual, dz=0.75 | ~34 dB | ~1.5-1.7 bpp | ~170 Mbps |
+| Distribution | q=16, perceptual, dz=0.75 | ~29-30 dB | ~0.8-0.9 bpp | ~90 Mbps |
+
+**The full_perceptual preset offers diminishing returns** at high Q: at q=16+dz=0.75, touchdown drops to 26.4 dB which is visually poor. The aggressive chroma weight (2.0×) pushes blue channel PSNR down to 24.3 dB. The standard perceptual preset (chroma 1.5×) is the safer default.
+
+**Cumulative compression progress** (blue_sky, q=8 operating point):
+1. Baseline (i16 packing): 48.00 bpp
+2. + rANS entropy coding: 6.46 bpp (7.4×)
+3. + 3-level wavelet: 2.91 bpp (2.2×)
+4. + Dead-zone 0.75: 2.34 bpp (1.2×)
+5. + Perceptual subband weights: **1.66 bpp** (1.4×)
+6. Total compression: **29× vs baseline**, from 48 bpp to 1.66 bpp
+
+### Next steps
+1. GPU rANS throughput optimization — CPU-side rANS is the bottleneck
+2. Context-modeled entropy coding — could save another 10-20%
+3. Consider making q=8 + perceptual + dz=0.75 the default codec profile

@@ -104,24 +104,24 @@ impl GpuRansDecoder {
                     ],
                 });
 
-        let pipeline_layout =
-            ctx.device
-                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("rans_decode_pl"),
-                    bind_group_layouts: &[&bind_group_layout],
-                    push_constant_ranges: &[],
-                });
+        let pipeline_layout = ctx
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("rans_decode_pl"),
+                bind_group_layouts: &[&bind_group_layout],
+                push_constant_ranges: &[],
+            });
 
-        let pipeline =
-            ctx.device
-                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some("rans_decode_pipeline"),
-                    layout: Some(&pipeline_layout),
-                    module: &shader,
-                    entry_point: Some("main"),
-                    compilation_options: Default::default(),
-                    cache: None,
-                });
+        let pipeline = ctx
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("rans_decode_pipeline"),
+                layout: Some(&pipeline_layout),
+                module: &shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
 
         Self {
             pipeline,
@@ -169,8 +169,8 @@ impl GpuRansDecoder {
 
         for (t, tile) in tiles.iter().enumerate() {
             assert!(
-                tile.alphabet_size <= 1024,
-                "Alphabet size {} exceeds GPU max 1024",
+                tile.alphabet_size <= 2048,
+                "Alphabet size {} exceeds GPU max 2048",
                 tile.alphabet_size
             );
 

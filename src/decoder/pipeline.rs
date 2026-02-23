@@ -1,15 +1,17 @@
-use std::cell::RefCell;
 use bytemuck::{Pod, Zeroable};
+use std::cell::RefCell;
 use wgpu;
 use wgpu::util::DeviceExt;
 
+use crate::encoder::adaptive::AQ_BLOCK_SIZE;
+use crate::encoder::bitplane::GpuBitplaneDecoder;
 use crate::encoder::cfl::{self, CflPredictor};
 use crate::encoder::color::ColorConverter;
 use crate::encoder::interleave::PlaneInterleaver;
 use crate::encoder::quantize::Quantizer;
 use crate::encoder::rans_gpu::GpuRansDecoder;
 use crate::encoder::transform::WaveletTransform;
-use crate::{CompressedFrame, GpuContext};
+use crate::{CompressedFrame, EntropyData, GpuContext};
 
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
@@ -49,6 +51,19 @@ struct CachedBuffers {
     y_ref_wavelet_buf: wgpu::Buffer,
 }
 
+/// Prepared entropy decode buffers — either rANS or bitplane, ready for GPU dispatch.
+enum PreparedEntropyBufs {
+    /// Per-plane: (params, tile_info, cumfreq, stream_data)
+    Rans(Vec<(wgpu::Buffer, wgpu::Buffer, wgpu::Buffer, wgpu::Buffer)>),
+    /// Per-plane: ((params, tile_info, block_info, bitplane_data), total_blocks)
+    Bitplane(
+        Vec<(
+            (wgpu::Buffer, wgpu::Buffer, wgpu::Buffer, wgpu::Buffer),
+            u32,
+        )>,
+    ),
+}
+
 /// Full decoding pipeline: GPU rANS Decode -> Dequantize -> Inverse Wavelet -> Interleave -> Inverse Color -> Crop
 ///
 /// All GPU stages run without CPU readback until the final RGB output.
@@ -58,6 +73,7 @@ pub struct DecoderPipeline {
     transform: WaveletTransform,
     quantize: Quantizer,
     rans_decoder: GpuRansDecoder,
+    bitplane_decoder: GpuBitplaneDecoder,
     interleaver: PlaneInterleaver,
     cfl_predictor: CflPredictor,
     crop_pipeline: wgpu::ComputePipeline,
@@ -74,140 +90,137 @@ impl DecoderPipeline {
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("crop"),
-                source: wgpu::ShaderSource::Wgsl(
-                    include_str!("../shaders/crop.wgsl").into(),
-                ),
+                source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/crop.wgsl").into()),
             });
 
-        let crop_bgl =
-            ctx.device
-                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                    label: Some("crop_bgl"),
-                    entries: &[
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 0,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Uniform,
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
+        let crop_bgl = ctx
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("crop_bgl"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
                         },
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 1,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Storage { read_only: true },
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
                         },
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 2,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Storage { read_only: false },
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
                         },
-                    ],
-                });
+                        count: None,
+                    },
+                ],
+            });
 
-        let crop_pl =
-            ctx.device
-                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("crop_pl"),
-                    bind_group_layouts: &[&crop_bgl],
-                    push_constant_ranges: &[],
-                });
+        let crop_pl = ctx
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("crop_pl"),
+                bind_group_layouts: &[&crop_bgl],
+                push_constant_ranges: &[],
+            });
 
-        let crop_pipeline =
-            ctx.device
-                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some("crop_pipeline"),
-                    layout: Some(&crop_pl),
-                    module: &crop_shader,
-                    entry_point: Some("main"),
-                    compilation_options: Default::default(),
-                    cache: None,
-                });
+        let crop_pipeline = ctx
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("crop_pipeline"),
+                layout: Some(&crop_pl),
+                module: &crop_shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
 
         // Pack u8 shader (f32 → packed u8)
         let pack_shader = ctx
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("pack_u8"),
-                source: wgpu::ShaderSource::Wgsl(
-                    include_str!("../shaders/pack_u8.wgsl").into(),
-                ),
+                source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/pack_u8.wgsl").into()),
             });
 
-        let pack_bgl =
-            ctx.device
-                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                    label: Some("pack_bgl"),
-                    entries: &[
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 0,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Uniform,
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
+        let pack_bgl = ctx
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("pack_bgl"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
                         },
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 1,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Storage { read_only: true },
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
                         },
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 2,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Storage { read_only: false },
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
                         },
-                    ],
-                });
+                        count: None,
+                    },
+                ],
+            });
 
-        let pack_pl =
-            ctx.device
-                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("pack_pl"),
-                    bind_group_layouts: &[&pack_bgl],
-                    push_constant_ranges: &[],
-                });
+        let pack_pl = ctx
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("pack_pl"),
+                bind_group_layouts: &[&pack_bgl],
+                push_constant_ranges: &[],
+            });
 
-        let pack_pipeline =
-            ctx.device
-                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some("pack_pipeline"),
-                    layout: Some(&pack_pl),
-                    module: &pack_shader,
-                    entry_point: Some("main"),
-                    compilation_options: Default::default(),
-                    cache: None,
-                });
+        let pack_pipeline = ctx
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("pack_pipeline"),
+                layout: Some(&pack_pl),
+                module: &pack_shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
 
         Self {
             color: ColorConverter::new(ctx),
             transform: WaveletTransform::new(ctx),
             quantize: Quantizer::new(ctx),
             rans_decoder: GpuRansDecoder::new(ctx),
+            bitplane_decoder: GpuBitplaneDecoder::new(ctx),
             interleaver: PlaneInterleaver::new(ctx),
             cfl_predictor: CflPredictor::new(ctx),
             crop_pipeline,
@@ -219,10 +232,21 @@ impl DecoderPipeline {
         }
     }
 
-    fn ensure_cached(&self, ctx: &GpuContext, padded_w: u32, padded_h: u32, width: u32, height: u32) {
+    fn ensure_cached(
+        &self,
+        ctx: &GpuContext,
+        padded_w: u32,
+        padded_h: u32,
+        width: u32,
+        height: u32,
+    ) {
         let mut cached = self.cached.borrow_mut();
         if let Some(ref c) = *cached {
-            if c.padded_w == padded_w && c.padded_h == padded_h && c.width == width && c.height == height {
+            if c.padded_w == padded_w
+                && c.padded_h == padded_h
+                && c.width == width
+                && c.height == height
+            {
                 return;
             }
         }
@@ -332,6 +356,26 @@ impl DecoderPipeline {
         });
     }
 
+    /// Upload the weight map from the compressed frame to GPU, if present.
+    fn upload_weight_map(
+        &self,
+        ctx: &GpuContext,
+        frame: &CompressedFrame,
+    ) -> Option<(wgpu::Buffer, u32)> {
+        let wm = frame.weight_map.as_ref()?;
+        let padded_w = frame.info.padded_width();
+        let blocks_x = (padded_w + AQ_BLOCK_SIZE - 1) / AQ_BLOCK_SIZE;
+
+        let buf = ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("dec_weight_map"),
+                contents: bytemuck::cast_slice(wm),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+        Some((buf, blocks_x))
+    }
+
     /// Encode GPU commands for the full decode pipeline up to and including crop.
     /// Returns the command encoder with all work recorded, plus the crop params buffer
     /// (which must stay alive until submission).
@@ -341,7 +385,8 @@ impl DecoderPipeline {
         ctx: &GpuContext,
         frame: &CompressedFrame,
         bufs: &CachedBuffers,
-        rans_bufs: &[(wgpu::Buffer, wgpu::Buffer, wgpu::Buffer, wgpu::Buffer)],
+        entropy_bufs: &PreparedEntropyBufs,
+        weight_map_gpu: &Option<(wgpu::Buffer, u32)>,
     ) -> (wgpu::CommandEncoder, wgpu::Buffer) {
         let info = &frame.info;
         let config = &frame.config;
@@ -387,7 +432,9 @@ impl DecoderPipeline {
             // Layout: [Co alphas for all tiles][Cg alphas for all tiles]
             // Each chroma plane's alphas = total_tiles * nsb values
             let alphas_per_plane = total_tiles * nsb as usize;
-            let all_f32: Vec<f32> = cfl_data.alphas.iter()
+            let all_f32: Vec<f32> = cfl_data
+                .alphas
+                .iter()
                 .map(|&q| cfl::dequantize_alpha(q))
                 .collect();
             // We'll index into this per plane during dispatch
@@ -396,24 +443,48 @@ impl DecoderPipeline {
             None
         };
 
-        // Per-plane: rANS → dequantize → (CfL inverse predict) → inverse wavelet → copy to result buffer
+        // Per-plane: entropy decode → dequantize → (CfL inverse predict) → inverse wavelet → copy to result buffer
         for p in 0..3 {
-            let (ref params_buf, ref tile_info_buf, ref cumfreq_buf, ref stream_data_buf) =
-                rans_bufs[p];
+            match entropy_bufs {
+                PreparedEntropyBufs::Rans(ref rans_bufs) => {
+                    let (ref params_buf, ref tile_info_buf, ref cumfreq_buf, ref stream_data_buf) =
+                        rans_bufs[p];
+                    self.rans_decoder.dispatch_decode(
+                        ctx,
+                        &mut cmd,
+                        params_buf,
+                        tile_info_buf,
+                        cumfreq_buf,
+                        stream_data_buf,
+                        &bufs.scratch_a,
+                        tiles_per_plane as u32,
+                    );
+                }
+                PreparedEntropyBufs::Bitplane(ref bp_bufs) => {
+                    let (ref params_buf, ref tile_info_buf, ref block_info_buf, ref data_buf) =
+                        bp_bufs[p].0;
+                    self.bitplane_decoder.dispatch_decode(
+                        ctx,
+                        &mut cmd,
+                        params_buf,
+                        tile_info_buf,
+                        block_info_buf,
+                        data_buf,
+                        &bufs.scratch_a,
+                        bp_bufs[p].1,
+                    );
+                }
+            }
 
-            self.rans_decoder.dispatch_decode(
-                ctx,
-                &mut cmd,
-                params_buf,
-                tile_info_buf,
-                cumfreq_buf,
-                stream_data_buf,
-                &bufs.scratch_a,
-                tiles_per_plane as u32,
-            );
-
-            let weights = if p == 0 { &weights_luma } else { &weights_chroma };
-            self.quantize.dispatch(
+            let weights = if p == 0 {
+                &weights_luma
+            } else {
+                &weights_chroma
+            };
+            let wm_param = weight_map_gpu
+                .as_ref()
+                .map(|(buf, blocks_x)| (buf, AQ_BLOCK_SIZE, *blocks_x));
+            self.quantize.dispatch_adaptive(
                 ctx,
                 &mut cmd,
                 &bufs.scratch_a,
@@ -427,12 +498,17 @@ impl DecoderPipeline {
                 config.tile_size,
                 config.wavelet_levels,
                 weights,
+                wm_param,
             );
 
             if p == 0 && has_cfl {
                 // Save dequantized Y wavelet for CfL chroma prediction
                 cmd.copy_buffer_to_buffer(
-                    &bufs.scratch_b, 0, &bufs.y_ref_wavelet_buf, 0, plane_size,
+                    &bufs.scratch_b,
+                    0,
+                    &bufs.y_ref_wavelet_buf,
+                    0,
+                    plane_size,
                 );
             }
 
@@ -441,7 +517,8 @@ impl DecoderPipeline {
                 let (ref alpha_buf, alphas_per_plane) = *cfl_alpha_buf.as_ref().unwrap();
                 // Plane 1 (Co) alphas start at offset 0, plane 2 (Cg) at offset alphas_per_plane
                 let plane_alpha_offset = (p - 1) * alphas_per_plane;
-                let plane_alpha_byte_offset = (plane_alpha_offset * std::mem::size_of::<f32>()) as u64;
+                let plane_alpha_byte_offset =
+                    (plane_alpha_offset * std::mem::size_of::<f32>()) as u64;
                 let plane_alpha_byte_size = (alphas_per_plane * std::mem::size_of::<f32>()) as u64;
 
                 // Create a sub-buffer view for this plane's alphas
@@ -452,44 +529,53 @@ impl DecoderPipeline {
                     mapped_at_creation: false,
                 });
                 cmd.copy_buffer_to_buffer(
-                    alpha_buf, plane_alpha_byte_offset,
-                    &plane_alpha_buf, 0,
+                    alpha_buf,
+                    plane_alpha_byte_offset,
+                    &plane_alpha_buf,
+                    0,
                     plane_alpha_byte_size,
                 );
 
                 self.cfl_predictor.dispatch_inverse(
-                    ctx, &mut cmd,
-                    &bufs.scratch_b,        // dequantized residual
+                    ctx,
+                    &mut cmd,
+                    &bufs.scratch_b,         // dequantized residual
                     &bufs.y_ref_wavelet_buf, // reconstructed Y wavelet
                     &plane_alpha_buf,        // per-tile per-subband alphas
                     &bufs.scratch_c,         // output: reconstructed chroma wavelet
                     padded_pixels as u32,
-                    padded_w, padded_h,
-                    config.tile_size, config.wavelet_levels,
+                    padded_w,
+                    padded_h,
+                    config.tile_size,
+                    config.wavelet_levels,
                 );
 
                 // Inverse wavelet: scratch_c → (temp scratch_b) → scratch_a
                 self.transform.inverse(
-                    ctx, &mut cmd,
-                    &bufs.scratch_c, &bufs.scratch_b, &bufs.scratch_a,
-                    info, config.wavelet_levels,
+                    ctx,
+                    &mut cmd,
+                    &bufs.scratch_c,
+                    &bufs.scratch_b,
+                    &bufs.scratch_a,
+                    info,
+                    config.wavelet_levels,
+                    config.wavelet_type,
                 );
             } else {
                 // Standard path: inverse wavelet from scratch_b
                 self.transform.inverse(
-                    ctx, &mut cmd,
-                    &bufs.scratch_b, &bufs.scratch_c, &bufs.scratch_a,
-                    info, config.wavelet_levels,
+                    ctx,
+                    &mut cmd,
+                    &bufs.scratch_b,
+                    &bufs.scratch_c,
+                    &bufs.scratch_a,
+                    info,
+                    config.wavelet_levels,
+                    config.wavelet_type,
                 );
             }
 
-            cmd.copy_buffer_to_buffer(
-                &bufs.scratch_a,
-                0,
-                &bufs.plane_results[p],
-                0,
-                plane_size,
-            );
+            cmd.copy_buffer_to_buffer(&bufs.scratch_a, 0, &bufs.plane_results[p], 0, plane_size);
         }
 
         // GPU interleave: 3 planes → interleaved YCoCg
@@ -548,24 +634,43 @@ impl DecoderPipeline {
         (cmd, crop_params_buf)
     }
 
-    /// Prepare rANS GPU buffers for all 3 planes.
-    fn prepare_rans_bufs(
+    /// Prepare entropy decode GPU buffers for all 3 planes.
+    fn prepare_entropy_bufs(
         &self,
         ctx: &GpuContext,
         frame: &CompressedFrame,
-    ) -> Vec<(wgpu::Buffer, wgpu::Buffer, wgpu::Buffer, wgpu::Buffer)> {
+    ) -> PreparedEntropyBufs {
         let info = &frame.info;
         let tiles_per_plane = info.tiles_x() as usize * info.tiles_y() as usize;
-        let mut rans_bufs = Vec::with_capacity(3);
-        for p in 0..3 {
-            let plane_tiles =
-                &frame.tiles[p * tiles_per_plane..(p + 1) * tiles_per_plane];
-            rans_bufs.push(
-                self.rans_decoder
-                    .prepare_decode_buffers(ctx, plane_tiles, info),
-            );
+        let blocks_per_tile_side = info.tile_size as usize / 32;
+        let blocks_per_tile = blocks_per_tile_side * blocks_per_tile_side;
+
+        match &frame.entropy {
+            EntropyData::Rans(tiles) => {
+                let mut rans_bufs = Vec::with_capacity(3);
+                for p in 0..3 {
+                    let plane_tiles = &tiles[p * tiles_per_plane..(p + 1) * tiles_per_plane];
+                    rans_bufs.push(self.rans_decoder.prepare_decode_buffers(
+                        ctx,
+                        plane_tiles,
+                        info,
+                    ));
+                }
+                PreparedEntropyBufs::Rans(rans_bufs)
+            }
+            EntropyData::Bitplane(tiles) => {
+                let mut bp_bufs = Vec::with_capacity(3);
+                for p in 0..3 {
+                    let plane_tiles = &tiles[p * tiles_per_plane..(p + 1) * tiles_per_plane];
+                    let total_blocks = (plane_tiles.len() * blocks_per_tile) as u32;
+                    let bufs = self
+                        .bitplane_decoder
+                        .prepare_decode_buffers(ctx, plane_tiles, info);
+                    bp_bufs.push((bufs, total_blocks));
+                }
+                PreparedEntropyBufs::Bitplane(bp_bufs)
+            }
         }
-        rans_bufs
     }
 
     /// Decode a compressed frame back to RGB f32 data.
@@ -584,14 +689,16 @@ impl DecoderPipeline {
 
         let t_alloc = t_start.elapsed();
 
-        let rans_bufs = self.prepare_rans_bufs(ctx, frame);
+        let entropy_bufs = self.prepare_entropy_bufs(ctx, frame);
+        let weight_map_gpu = self.upload_weight_map(ctx, frame);
 
         let t_prepare = t_start.elapsed();
 
         let cached = self.cached.borrow();
         let bufs = cached.as_ref().unwrap();
 
-        let (mut cmd, _crop_params_buf) = self.encode_gpu_work(ctx, frame, bufs, &rans_bufs);
+        let (mut cmd, _crop_params_buf) =
+            self.encode_gpu_work(ctx, frame, bufs, &entropy_bufs, &weight_map_gpu);
 
         // Copy f32 cropped output to staging
         cmd.copy_buffer_to_buffer(&bufs.cropped_buf, 0, &bufs.staging, 0, output_size);
@@ -651,14 +758,16 @@ impl DecoderPipeline {
 
         let t_alloc = t_start.elapsed();
 
-        let rans_bufs = self.prepare_rans_bufs(ctx, frame);
+        let entropy_bufs = self.prepare_entropy_bufs(ctx, frame);
+        let weight_map_gpu = self.upload_weight_map(ctx, frame);
 
         let t_prepare = t_start.elapsed();
 
         let cached = self.cached.borrow();
         let bufs = cached.as_ref().unwrap();
 
-        let (mut cmd, _crop_params_buf) = self.encode_gpu_work(ctx, frame, bufs, &rans_bufs);
+        let (mut cmd, _crop_params_buf) =
+            self.encode_gpu_work(ctx, frame, bufs, &entropy_bufs, &weight_map_gpu);
 
         // GPU pack: f32 → packed u8
         let pack_params = PackParams {
@@ -706,7 +815,13 @@ impl DecoderPipeline {
         }
 
         // Copy packed u8 to staging
-        cmd.copy_buffer_to_buffer(&bufs.packed_u8_buf, 0, &bufs.staging_u8, 0, packed_byte_size);
+        cmd.copy_buffer_to_buffer(
+            &bufs.packed_u8_buf,
+            0,
+            &bufs.staging_u8,
+            0,
+            packed_byte_size,
+        );
 
         let t_encode_cmd = t_start.elapsed();
 
@@ -750,11 +865,7 @@ impl DecoderPipeline {
     /// Returns an opaque token that can be used with `finish_decode_u8` to get the result.
     /// This enables pipelined decode: submit frame N, do CPU work for frame N+1,
     /// then finish frame N's readback.
-    pub fn submit_decode_u8(
-        &self,
-        ctx: &GpuContext,
-        frame: &CompressedFrame,
-    ) {
+    pub fn submit_decode_u8(&self, ctx: &GpuContext, frame: &CompressedFrame) {
         let info = &frame.info;
         let w = info.width;
         let h = info.height;
@@ -764,12 +875,14 @@ impl DecoderPipeline {
 
         self.ensure_cached(ctx, info.padded_width(), info.padded_height(), w, h);
 
-        let rans_bufs = self.prepare_rans_bufs(ctx, frame);
+        let entropy_bufs = self.prepare_entropy_bufs(ctx, frame);
+        let weight_map_gpu = self.upload_weight_map(ctx, frame);
 
         let cached = self.cached.borrow();
         let bufs = cached.as_ref().unwrap();
 
-        let (mut cmd, _crop_params_buf) = self.encode_gpu_work(ctx, frame, bufs, &rans_bufs);
+        let (mut cmd, _crop_params_buf) =
+            self.encode_gpu_work(ctx, frame, bufs, &entropy_bufs, &weight_map_gpu);
 
         // GPU pack: f32 → packed u8
         let pack_params = PackParams {
@@ -817,7 +930,13 @@ impl DecoderPipeline {
         }
 
         // Copy packed u8 to staging
-        cmd.copy_buffer_to_buffer(&bufs.packed_u8_buf, 0, &bufs.staging_u8, 0, packed_byte_size);
+        cmd.copy_buffer_to_buffer(
+            &bufs.packed_u8_buf,
+            0,
+            &bufs.staging_u8,
+            0,
+            packed_byte_size,
+        );
 
         ctx.queue.submit(Some(cmd.finish()));
 
@@ -836,7 +955,10 @@ impl DecoderPipeline {
     /// Finish a previously submitted decode_u8 operation.
     /// Blocks until the GPU work is complete and returns the u8 result.
     pub fn finish_decode_u8(&self, ctx: &GpuContext, width: u32, height: u32) -> Vec<u8> {
-        let rx = self.pending_rx.borrow_mut().take()
+        let rx = self
+            .pending_rx
+            .borrow_mut()
+            .take()
             .expect("finish_decode_u8 called without prior submit_decode_u8");
 
         let total_bytes = (width * height * 3) as usize;

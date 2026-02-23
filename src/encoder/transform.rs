@@ -2,7 +2,7 @@ use bytemuck::{Pod, Zeroable};
 use wgpu;
 use wgpu::util::DeviceExt;
 
-use crate::{FrameInfo, GpuContext};
+use crate::{FrameInfo, GpuContext, WaveletType};
 
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
@@ -18,19 +18,13 @@ struct TransformParams {
 }
 
 pub struct WaveletTransform {
-    pipeline: wgpu::ComputePipeline,
+    pipeline_53: wgpu::ComputePipeline,
+    pipeline_97: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
 }
 
 impl WaveletTransform {
     pub fn new(ctx: &GpuContext) -> Self {
-        let shader = ctx
-            .device
-            .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("transform"),
-                source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/transform.wgsl").into()),
-            });
-
         let bind_group_layout =
             ctx.device
                 .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -77,19 +71,49 @@ impl WaveletTransform {
                 push_constant_ranges: &[],
             });
 
-        let pipeline = ctx
+        // LeGall 5/3 pipeline
+        let shader_53 = ctx
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("transform_53"),
+                source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/transform.wgsl").into()),
+            });
+
+        let pipeline_53 = ctx
             .device
             .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("transform_pipeline"),
+                label: Some("transform_pipeline_53"),
                 layout: Some(&pipeline_layout),
-                module: &shader,
+                module: &shader_53,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+
+        // CDF 9/7 pipeline
+        let shader_97 = ctx
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("transform_97"),
+                source: wgpu::ShaderSource::Wgsl(
+                    include_str!("../shaders/transform_97.wgsl").into(),
+                ),
+            });
+
+        let pipeline_97 = ctx
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("transform_pipeline_97"),
+                layout: Some(&pipeline_layout),
+                module: &shader_97,
                 entry_point: Some("main"),
                 compilation_options: Default::default(),
                 cache: None,
             });
 
         Self {
-            pipeline,
+            pipeline_53,
+            pipeline_97,
             bind_group_layout,
         }
     }
@@ -107,6 +131,7 @@ impl WaveletTransform {
         forward: bool,
         pass_mode: u32,
         region_size: u32,
+        wavelet_type: WaveletType,
     ) {
         let params = TransformParams {
             width: info.padded_width(),
@@ -146,6 +171,11 @@ impl WaveletTransform {
             ],
         });
 
+        let pipeline = match wavelet_type {
+            WaveletType::LeGall53 => &self.pipeline_53,
+            WaveletType::CDF97 => &self.pipeline_97,
+        };
+
         // Dispatch: one workgroup per line (row or column) per tile
         let lines_per_tile = region_size;
         let total_tiles = info.total_tiles();
@@ -154,7 +184,7 @@ impl WaveletTransform {
             label: Some("transform_pass"),
             timestamp_writes: None,
         });
-        cpass.set_pipeline(&self.pipeline);
+        cpass.set_pipeline(pipeline);
         cpass.set_bind_group(0, &bind_group, &[]);
         cpass.dispatch_workgroups(lines_per_tile, total_tiles, 1);
     }
@@ -170,6 +200,7 @@ impl WaveletTransform {
         output_buf: &wgpu::Buffer,
         info: &FrameInfo,
         levels: u32,
+        wavelet_type: WaveletType,
     ) {
         let mut region = info.tile_size;
 
@@ -179,10 +210,30 @@ impl WaveletTransform {
             let src = if level == 0 { input_buf } else { output_buf };
 
             // Row pass: src -> temp_buf
-            self.dispatch_pass(ctx, encoder, src, temp_buf, info, true, 0, region);
+            self.dispatch_pass(
+                ctx,
+                encoder,
+                src,
+                temp_buf,
+                info,
+                true,
+                0,
+                region,
+                wavelet_type,
+            );
 
             // Column pass: temp_buf -> output_buf
-            self.dispatch_pass(ctx, encoder, temp_buf, output_buf, info, true, 1, region);
+            self.dispatch_pass(
+                ctx,
+                encoder,
+                temp_buf,
+                output_buf,
+                info,
+                true,
+                1,
+                region,
+                wavelet_type,
+            );
 
             region /= 2;
         }
@@ -199,6 +250,7 @@ impl WaveletTransform {
         output_buf: &wgpu::Buffer,
         info: &FrameInfo,
         levels: u32,
+        wavelet_type: WaveletType,
     ) {
         let buf_size = (info.padded_width() * info.padded_height()) as u64 * 4;
 
@@ -212,10 +264,30 @@ impl WaveletTransform {
 
         for _level in 0..levels {
             // Inverse column pass: output_buf -> temp_buf
-            self.dispatch_pass(ctx, encoder, output_buf, temp_buf, info, false, 1, region);
+            self.dispatch_pass(
+                ctx,
+                encoder,
+                output_buf,
+                temp_buf,
+                info,
+                false,
+                1,
+                region,
+                wavelet_type,
+            );
 
             // Inverse row pass: temp_buf -> output_buf
-            self.dispatch_pass(ctx, encoder, temp_buf, output_buf, info, false, 0, region);
+            self.dispatch_pass(
+                ctx,
+                encoder,
+                temp_buf,
+                output_buf,
+                info,
+                false,
+                0,
+                region,
+                wavelet_type,
+            );
 
             region *= 2;
         }

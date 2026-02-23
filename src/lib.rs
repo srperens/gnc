@@ -90,7 +90,7 @@ impl SubbandWeights {
         for (i, level) in self.detail.iter().enumerate() {
             let base = 1 + i * 3;
             if base + 2 < 16 {
-                w[base] = level[0];     // LH
+                w[base] = level[0]; // LH
                 w[base + 1] = level[1]; // HL
                 w[base + 2] = level[2]; // HH
             }
@@ -122,6 +122,25 @@ pub struct CflAlphas {
     pub num_subbands: u32,
 }
 
+/// Which wavelet transform to use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaveletType {
+    /// LeGall 5/3 — integer-exact, lossless-capable
+    LeGall53,
+    /// CDF 9/7 — better energy compaction for lossy compression (JPEG 2000 lossy wavelet)
+    CDF97,
+}
+
+/// Which entropy coder to use for the final coding stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntropyCoder {
+    /// rANS with interleaved streams and zero-run-length pre-coding (CPU encode, GPU decode)
+    Rans,
+    /// Bitplane coding: sign + magnitude bitplanes per 32x32 block (CPU encode, GPU decode).
+    /// Fully parallel on decode, no serial state machines.
+    Bitplane,
+}
+
 /// Codec configuration
 #[derive(Debug, Clone)]
 pub struct CodecConfig {
@@ -131,6 +150,17 @@ pub struct CodecConfig {
     pub wavelet_levels: u32,
     pub subband_weights: SubbandWeights,
     pub cfl_enabled: bool,
+    /// Which entropy coder to use (default: Rans for backward compatibility)
+    pub entropy_coder: EntropyCoder,
+    /// Which wavelet transform to use (default: LeGall53 for backward compatibility)
+    pub wavelet_type: WaveletType,
+    /// Enable SSIM-guided adaptive quantization.
+    /// When enabled, per-block variance analysis drives spatial quantization weighting:
+    /// smooth regions get coarser quantization, textured regions get finer.
+    pub adaptive_quantization: bool,
+    /// Strength of adaptive quantization (0.0 = off, 1.0 = full strength).
+    /// Controls how aggressively bits are redistributed from smooth to textured regions.
+    pub aq_strength: f32,
 }
 
 impl Default for CodecConfig {
@@ -142,30 +172,56 @@ impl Default for CodecConfig {
             wavelet_levels: 3,
             subband_weights: SubbandWeights::uniform(3),
             cfl_enabled: false,
+            entropy_coder: EntropyCoder::Rans,
+            wavelet_type: WaveletType::LeGall53,
+            adaptive_quantization: false,
+            aq_strength: 0.0,
         }
     }
 }
 
-/// Compressed frame data (interleaved rANS entropy coded, per-tile)
+/// Entropy-coded tile data — either rANS or bitplane coded.
+/// Tiles are ordered: plane 0 tiles, plane 1 tiles, plane 2 tiles.
+#[derive(Debug, Clone)]
+pub enum EntropyData {
+    Rans(Vec<encoder::rans::InterleavedRansTile>),
+    Bitplane(Vec<encoder::bitplane::BitplaneTile>),
+}
+
+impl EntropyData {
+    pub fn byte_size(&self) -> usize {
+        match self {
+            EntropyData::Rans(tiles) => tiles.iter().map(|t| t.byte_size()).sum(),
+            EntropyData::Bitplane(tiles) => tiles.iter().map(|t| t.byte_size()).sum(),
+        }
+    }
+}
+
+/// Compressed frame data
 #[derive(Debug, Clone)]
 pub struct CompressedFrame {
     pub info: FrameInfo,
     pub config: CodecConfig,
-    /// Per-tile interleaved rANS compressed data, ordered: plane 0 tiles, plane 1 tiles, plane 2 tiles
-    pub tiles: Vec<encoder::rans::InterleavedRansTile>,
+    /// Entropy-coded tile data (rANS or bitplane)
+    pub entropy: EntropyData,
     /// CfL alpha coefficients (present when cfl_enabled)
     pub cfl_alphas: Option<CflAlphas>,
+    /// Per-block spatial weight map for adaptive quantization.
+    /// `None` when adaptive quantization is disabled.
+    /// Stored in row-major order, one f32 per AQ_BLOCK_SIZE x AQ_BLOCK_SIZE block.
+    pub weight_map: Option<Vec<f32>>,
 }
 
 impl CompressedFrame {
-    /// Total compressed size in bytes (all tiles + CfL alpha overhead)
+    /// Total compressed size in bytes (all tiles + CfL alpha + weight map overhead)
     pub fn byte_size(&self) -> usize {
-        let tile_bytes: usize = self.tiles.iter().map(|t| t.byte_size()).sum();
-        let cfl_bytes = self
-            .cfl_alphas
+        let tile_bytes = self.entropy.byte_size();
+        let cfl_bytes = self.cfl_alphas.as_ref().map_or(0, |a| a.alphas.len());
+        let wm_bytes = self
+            .weight_map
             .as_ref()
-            .map_or(0, |a| a.alphas.len());
-        tile_bytes + cfl_bytes
+            .map_or(0, |wm| wm.len() * std::mem::size_of::<f32>());
+        tile_bytes + cfl_bytes + wm_bytes
     }
 
     /// Bits per pixel

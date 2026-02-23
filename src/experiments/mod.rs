@@ -1,6 +1,6 @@
 /// Experiment configurations.
 /// Each experiment is a named set of codec parameters.
-use crate::{CodecConfig, SubbandWeights};
+use crate::{CodecConfig, SubbandWeights, WaveletType};
 
 pub struct Experiment {
     pub name: String,
@@ -27,6 +27,7 @@ pub fn phase1_experiments() -> Vec<Experiment> {
                 wavelet_levels: 3,
                 subband_weights: SubbandWeights::uniform(3),
                 cfl_enabled: false,
+                ..Default::default()
             },
         })
         .collect()
@@ -55,6 +56,7 @@ pub fn dead_zone_experiments() -> Vec<Experiment> {
                     wavelet_levels: 3,
                     subband_weights: SubbandWeights::uniform(3),
                     cfl_enabled: false,
+                    ..Default::default()
                 },
             });
         }
@@ -67,10 +69,7 @@ pub fn wavelet_level_experiments() -> Vec<Experiment> {
     (1..=4)
         .map(|levels| Experiment {
             name: format!("levels_{}", levels),
-            description: format!(
-                "LeGall 5/3 with {} decomposition level(s), qstep=4",
-                levels
-            ),
+            description: format!("LeGall 5/3 with {} decomposition level(s), qstep=4", levels),
             config: CodecConfig {
                 tile_size: 256,
                 quantization_step: 4.0,
@@ -78,6 +77,7 @@ pub fn wavelet_level_experiments() -> Vec<Experiment> {
                 wavelet_levels: levels,
                 subband_weights: SubbandWeights::uniform(levels),
                 cfl_enabled: false,
+                ..Default::default()
             },
         })
         .collect()
@@ -142,6 +142,7 @@ pub fn subband_weight_experiments() -> Vec<Experiment> {
                     wavelet_levels: levels,
                     subband_weights: weights.clone(),
                     cfl_enabled: false,
+                    ..Default::default()
                 },
             });
         }
@@ -167,6 +168,7 @@ pub fn cfl_experiments() -> Vec<Experiment> {
                 wavelet_levels: levels,
                 subband_weights: SubbandWeights::uniform(levels),
                 cfl_enabled: false,
+                ..Default::default()
             },
         });
         // With CfL
@@ -180,6 +182,46 @@ pub fn cfl_experiments() -> Vec<Experiment> {
                 wavelet_levels: levels,
                 subband_weights: SubbandWeights::uniform(levels),
                 cfl_enabled: true,
+                ..Default::default()
+            },
+        });
+    }
+    exps
+}
+
+/// Wavelet type experiments: compare LeGall 5/3 vs CDF 9/7 at several quantization steps.
+pub fn wavelet_experiments() -> Vec<Experiment> {
+    let steps = [4.0, 8.0, 16.0];
+    let levels = 3u32;
+
+    let mut exps = Vec::new();
+    for &step in &steps {
+        exps.push(Experiment {
+            name: format!("wavelet_53_q{}", step as u32),
+            description: format!("qstep={}, LeGall 5/3 wavelet", step),
+            config: CodecConfig {
+                tile_size: 256,
+                quantization_step: step,
+                dead_zone: 0.0,
+                wavelet_levels: levels,
+                subband_weights: SubbandWeights::uniform(levels),
+                cfl_enabled: false,
+                wavelet_type: WaveletType::LeGall53,
+                ..Default::default()
+            },
+        });
+        exps.push(Experiment {
+            name: format!("wavelet_97_q{}", step as u32),
+            description: format!("qstep={}, CDF 9/7 wavelet", step),
+            config: CodecConfig {
+                tile_size: 256,
+                quantization_step: step,
+                dead_zone: 0.0,
+                wavelet_levels: levels,
+                subband_weights: SubbandWeights::uniform(levels),
+                cfl_enabled: false,
+                wavelet_type: WaveletType::CDF97,
+                ..Default::default()
             },
         });
     }
@@ -196,11 +238,14 @@ pub fn combined_dz_subband_experiments() -> Vec<Experiment> {
     let weight_presets: Vec<(&str, SubbandWeights)> = vec![
         ("uniform", SubbandWeights::uniform(levels)),
         ("perceptual", SubbandWeights::perceptual(levels)),
-        ("full_perceptual", SubbandWeights {
-            ll: 1.0,
-            detail: vec![[1.0, 1.0, 1.5], [1.5, 1.5, 2.0], [2.0, 2.0, 3.0]],
-            chroma_weight: 2.0,
-        }),
+        (
+            "full_perceptual",
+            SubbandWeights {
+                ll: 1.0,
+                detail: vec![[1.0, 1.0, 1.5], [1.5, 1.5, 2.0], [2.0, 2.0, 3.0]],
+                chroma_weight: 2.0,
+            },
+        ),
     ];
 
     let mut exps = Vec::new();
@@ -209,10 +254,7 @@ pub fn combined_dz_subband_experiments() -> Vec<Experiment> {
             for (wname, ref weights) in &weight_presets {
                 exps.push(Experiment {
                     name: format!("combo_{}_dz{}_q{}", wname, (dz * 100.0) as u32, step as u32),
-                    description: format!(
-                        "qstep={}, dz={:.2}, weights={}",
-                        step, dz, wname
-                    ),
+                    description: format!("qstep={}, dz={:.2}, weights={}", step, dz, wname),
                     config: CodecConfig {
                         tile_size: 256,
                         quantization_step: step,
@@ -220,6 +262,7 @@ pub fn combined_dz_subband_experiments() -> Vec<Experiment> {
                         wavelet_levels: levels,
                         subband_weights: weights.clone(),
                         cfl_enabled: false,
+                        ..Default::default()
                     },
                 });
             }

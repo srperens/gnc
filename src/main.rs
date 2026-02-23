@@ -37,6 +37,14 @@ enum Command {
         /// Enable Chroma-from-Luma prediction
         #[arg(long)]
         cfl: bool,
+
+        /// Use bitplane entropy coder instead of rANS
+        #[arg(long)]
+        bitplane: bool,
+
+        /// Wavelet type: 53 (LeGall 5/3, default) or 97 (CDF 9/7)
+        #[arg(long, default_value = "53")]
+        wavelet: String,
     },
 
     /// Decode a compressed file back to an image
@@ -63,6 +71,10 @@ enum Command {
         /// Output CSV file for results
         #[arg(long)]
         csv: Option<String>,
+
+        /// Use bitplane entropy coder instead of rANS
+        #[arg(long)]
+        bitplane: bool,
     },
 
     /// Run experiments on an input image
@@ -108,12 +120,23 @@ fn main() {
             qstep,
             tile_size,
             cfl,
+            bitplane,
+            wavelet,
         } => {
             let (rgb_data, w, h) = load_image_rgb_f32(&input);
             println!("Input: {}x{} ({} pixels)", w, h, w * h);
 
             let ctx = GpuContext::new();
             let encoder = EncoderPipeline::new(&ctx);
+
+            let wavelet_type = match wavelet.as_str() {
+                "53" => gnc::WaveletType::LeGall53,
+                "97" => gnc::WaveletType::CDF97,
+                other => {
+                    eprintln!("Unknown wavelet type: {}. Use: 53 or 97", other);
+                    std::process::exit(1);
+                }
+            };
 
             let config = CodecConfig {
                 tile_size,
@@ -122,6 +145,13 @@ fn main() {
                 wavelet_levels: 3,
                 subband_weights: gnc::SubbandWeights::uniform(3),
                 cfl_enabled: cfl,
+                entropy_coder: if bitplane {
+                    gnc::EntropyCoder::Bitplane
+                } else {
+                    gnc::EntropyCoder::Rans
+                },
+                wavelet_type,
+                ..Default::default()
             };
 
             let compressed = encoder.encode(&ctx, &rgb_data, w, h, &config);
@@ -166,15 +196,27 @@ fn main() {
             input,
             iterations,
             csv,
+            bitplane,
         } => {
             let (rgb_data, w, h) = load_image_rgb_f32(&input);
-            println!("Benchmark: {}x{} image, {} iterations", w, h, iterations);
+            let coder_name = if bitplane { "bitplane" } else { "rANS" };
+            println!(
+                "Benchmark: {}x{} image, {} iterations, entropy: {}",
+                w, h, iterations, coder_name
+            );
 
             let ctx = GpuContext::new();
             let encoder = EncoderPipeline::new(&ctx);
             let decoder = DecoderPipeline::new(&ctx);
 
-            let config = CodecConfig::default();
+            let config = CodecConfig {
+                entropy_coder: if bitplane {
+                    gnc::EntropyCoder::Bitplane
+                } else {
+                    gnc::EntropyCoder::Rans
+                },
+                ..Default::default()
+            };
 
             // Quality measurement
             let compressed = encoder.encode(&ctx, &rgb_data, w, h, &config);
@@ -239,7 +281,7 @@ fn main() {
 
             if let Some(csv_path) = csv {
                 let result = BenchmarkResult {
-                    name: "baseline".to_string(),
+                    name: format!("baseline_{}", coder_name),
                     quality: qm,
                     throughput: Some(tp),
                     config: BenchmarkConfig {
@@ -256,7 +298,11 @@ fn main() {
             }
         }
 
-        Command::Sweep { input, csv, experiment } => {
+        Command::Sweep {
+            input,
+            csv,
+            experiment,
+        } => {
             let (rgb_data, w, h) = load_image_rgb_f32(&input);
             println!("Sweep ({}): {}x{} image", experiment, w, h);
 
@@ -271,6 +317,7 @@ fn main() {
                 "subband" => experiments::subband_weight_experiments(),
                 "combined" => experiments::combined_dz_subband_experiments(),
                 "cfl" => experiments::cfl_experiments(),
+                "wavelet" => experiments::wavelet_experiments(),
                 "all" => {
                     let mut e = experiments::phase1_experiments();
                     e.extend(experiments::wavelet_level_experiments());
@@ -278,10 +325,11 @@ fn main() {
                     e.extend(experiments::subband_weight_experiments());
                     e.extend(experiments::combined_dz_subband_experiments());
                     e.extend(experiments::cfl_experiments());
+                    e.extend(experiments::wavelet_experiments());
                     e
                 }
                 other => {
-                    eprintln!("Unknown experiment set: {}. Use: all, baseline, deadzone, levels, subband, combined, cfl", other);
+                    eprintln!("Unknown experiment set: {}. Use: all, baseline, deadzone, levels, subband, combined, cfl, wavelet", other);
                     std::process::exit(1);
                 }
             };
@@ -331,13 +379,13 @@ fn main() {
     }
 }
 
-// Serialization for compressed frames (interleaved rANS per-tile)
-// GPC5 format: CfL alpha side info + per-tile ZRL (zrun_base in tile serialization).
+// Serialization for compressed frames.
+// GPC8 format: adds wavelet type (LeGall 5/3 or CDF 9/7).
 fn serialize_compressed(frame: &gnc::CompressedFrame) -> Vec<u8> {
-    use gnc::encoder::rans;
+    use gnc::encoder::{bitplane, rans};
     let mut out = Vec::new();
     // Header
-    out.extend_from_slice(b"GPC5"); // version 5 = CfL support
+    out.extend_from_slice(b"GPC8"); // version 8 = wavelet type support
     out.extend_from_slice(&frame.info.width.to_le_bytes());
     out.extend_from_slice(&frame.info.height.to_le_bytes());
     out.extend_from_slice(&frame.info.bit_depth.to_le_bytes());
@@ -345,6 +393,12 @@ fn serialize_compressed(frame: &gnc::CompressedFrame) -> Vec<u8> {
     out.extend_from_slice(&frame.config.quantization_step.to_le_bytes());
     out.extend_from_slice(&frame.config.dead_zone.to_le_bytes());
     out.extend_from_slice(&frame.config.wavelet_levels.to_le_bytes());
+    // Wavelet type: 0 = LeGall53, 1 = CDF97
+    let wavelet_byte: u8 = match frame.config.wavelet_type {
+        gnc::WaveletType::LeGall53 => 0,
+        gnc::WaveletType::CDF97 => 1,
+    };
+    out.push(wavelet_byte);
     // Subband weights: ll, num_detail_levels, per-level [LH, HL, HH], chroma_weight
     let sw = &frame.config.subband_weights;
     out.extend_from_slice(&sw.ll.to_le_bytes());
@@ -367,25 +421,59 @@ fn serialize_compressed(frame: &gnc::CompressedFrame) -> Vec<u8> {
         out.extend_from_slice(&num_cfl_tiles.to_le_bytes());
         out.extend_from_slice(&cfl.alphas);
     }
-    // Tile count + per-tile data
-    let num_tiles = frame.tiles.len() as u32;
-    out.extend_from_slice(&num_tiles.to_le_bytes());
-    for tile in &frame.tiles {
-        let tile_bytes = rans::serialize_tile_interleaved(tile);
-        out.extend_from_slice(&tile_bytes);
+    // Adaptive quantization config + weight map
+    let aq_flag: u32 = if frame.config.adaptive_quantization {
+        1
+    } else {
+        0
+    };
+    out.extend_from_slice(&aq_flag.to_le_bytes());
+    out.extend_from_slice(&frame.config.aq_strength.to_le_bytes());
+    if let Some(ref wm) = frame.weight_map {
+        let wm_len = wm.len() as u32;
+        out.extend_from_slice(&wm_len.to_le_bytes());
+        for &w in wm {
+            out.extend_from_slice(&w.to_le_bytes());
+        }
+    } else {
+        out.extend_from_slice(&0u32.to_le_bytes());
+    }
+    // Entropy coder type: 0 = rANS, 1 = bitplane
+    let entropy_type: u32 = match &frame.entropy {
+        gnc::EntropyData::Rans(_) => 0,
+        gnc::EntropyData::Bitplane(_) => 1,
+    };
+    out.extend_from_slice(&entropy_type.to_le_bytes());
+    // Tile data
+    match &frame.entropy {
+        gnc::EntropyData::Rans(tiles) => {
+            let num_tiles = tiles.len() as u32;
+            out.extend_from_slice(&num_tiles.to_le_bytes());
+            for tile in tiles {
+                let tile_bytes = rans::serialize_tile_interleaved(tile);
+                out.extend_from_slice(&tile_bytes);
+            }
+        }
+        gnc::EntropyData::Bitplane(tiles) => {
+            let num_tiles = tiles.len() as u32;
+            out.extend_from_slice(&num_tiles.to_le_bytes());
+            for tile in tiles {
+                let tile_bytes = bitplane::serialize_tile_bitplane(tile);
+                out.extend_from_slice(&tile_bytes);
+            }
+        }
     }
     out
 }
 
 fn deserialize_compressed(data: &[u8]) -> gnc::CompressedFrame {
-    use gnc::encoder::rans;
-    assert!(data.len() >= 36, "File too small");
+    use gnc::encoder::{bitplane, rans};
+    assert!(data.len() >= 37, "File too small");
     let magic = &data[0..4];
     assert!(
-        magic == b"GPC5",
-        "Invalid magic (expected GPC5; GPC4 files must be re-encoded)"
+        magic == b"GPC8",
+        "Invalid magic (expected GPC8; older files must be re-encoded)"
     );
-    let is_v5 = true;
 
     let width = u32::from_le_bytes(data[4..8].try_into().unwrap());
     let height = u32::from_le_bytes(data[8..12].try_into().unwrap());
@@ -395,10 +483,17 @@ fn deserialize_compressed(data: &[u8]) -> gnc::CompressedFrame {
     let dead_zone = f32::from_le_bytes(data[24..28].try_into().unwrap());
     let wavelet_levels = u32::from_le_bytes(data[28..32].try_into().unwrap());
 
+    // Wavelet type
+    let wavelet_type = match data[32] {
+        0 => gnc::WaveletType::LeGall53,
+        1 => gnc::WaveletType::CDF97,
+        w => panic!("Unknown wavelet type: {}", w),
+    };
+
     // Subband weights
-    let ll = f32::from_le_bytes(data[32..36].try_into().unwrap());
-    let num_detail = u32::from_le_bytes(data[36..40].try_into().unwrap()) as usize;
-    let mut pos = 40;
+    let ll = f32::from_le_bytes(data[33..37].try_into().unwrap());
+    let num_detail = u32::from_le_bytes(data[37..41].try_into().unwrap()) as usize;
+    let mut pos = 41;
     let mut detail = Vec::with_capacity(num_detail);
     for _ in 0..num_detail {
         let lh = f32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
@@ -410,36 +505,79 @@ fn deserialize_compressed(data: &[u8]) -> gnc::CompressedFrame {
     let chroma_weight = f32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
     pos += 4;
 
-    // CfL alpha side info (GPC5 only)
-    let (cfl_enabled, cfl_alphas) = if is_v5 {
-        let cfl_flag = data[pos];
-        pos += 1;
-        if cfl_flag != 0 {
-            let nsb = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
-            pos += 4;
-            let num_cfl_tiles = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
-            pos += 4;
-            // 2 chroma planes × num_cfl_tiles × nsb alpha bytes
-            let alpha_count = (2 * num_cfl_tiles * nsb) as usize;
-            let alphas = data[pos..pos + alpha_count].to_vec();
-            pos += alpha_count;
-            (true, Some(gnc::CflAlphas { alphas, num_subbands: nsb }))
-        } else {
-            (false, None)
-        }
+    // CfL alpha side info
+    let cfl_flag = data[pos];
+    pos += 1;
+    let (cfl_enabled, cfl_alphas) = if cfl_flag != 0 {
+        let nsb = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
+        pos += 4;
+        let num_cfl_tiles = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
+        pos += 4;
+        let alpha_count = (2 * num_cfl_tiles * nsb) as usize;
+        let alphas = data[pos..pos + alpha_count].to_vec();
+        pos += alpha_count;
+        (
+            true,
+            Some(gnc::CflAlphas {
+                alphas,
+                num_subbands: nsb,
+            }),
+        )
     } else {
         (false, None)
     };
 
+    // Adaptive quantization config + weight map
+    let aq_flag = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
+    pos += 4;
+    let aq_strength = f32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
+    pos += 4;
+    let adaptive_quantization = aq_flag != 0;
+
+    let wm_len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+    pos += 4;
+    let weight_map = if wm_len > 0 {
+        let mut wm = Vec::with_capacity(wm_len);
+        for _ in 0..wm_len {
+            wm.push(f32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()));
+            pos += 4;
+        }
+        Some(wm)
+    } else {
+        None
+    };
+
+    // Entropy coder type: 0 = rANS, 1 = bitplane
+    let entropy_type = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
+    pos += 4;
+
     let num_tiles = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
     pos += 4;
 
-    let mut tiles = Vec::with_capacity(num_tiles);
-    for _ in 0..num_tiles {
-        let (tile, consumed) = rans::deserialize_tile_interleaved(&data[pos..]);
-        tiles.push(tile);
-        pos += consumed;
-    }
+    let (entropy_coder, entropy) = match entropy_type {
+        0 => {
+            let mut tiles = Vec::with_capacity(num_tiles);
+            for _ in 0..num_tiles {
+                let (tile, consumed) = rans::deserialize_tile_interleaved(&data[pos..]);
+                tiles.push(tile);
+                pos += consumed;
+            }
+            (gnc::EntropyCoder::Rans, gnc::EntropyData::Rans(tiles))
+        }
+        1 => {
+            let mut tiles = Vec::with_capacity(num_tiles);
+            for _ in 0..num_tiles {
+                let (tile, consumed) = bitplane::deserialize_tile_bitplane(&data[pos..]);
+                tiles.push(tile);
+                pos += consumed;
+            }
+            (
+                gnc::EntropyCoder::Bitplane,
+                gnc::EntropyData::Bitplane(tiles),
+            )
+        }
+        _ => panic!("Unknown entropy coder type: {}", entropy_type),
+    };
 
     gnc::CompressedFrame {
         info: gnc::FrameInfo {
@@ -459,8 +597,13 @@ fn deserialize_compressed(data: &[u8]) -> gnc::CompressedFrame {
                 chroma_weight,
             },
             cfl_enabled,
+            entropy_coder,
+            wavelet_type,
+            adaptive_quantization,
+            aq_strength,
         },
-        tiles,
+        entropy,
         cfl_alphas,
+        weight_map,
     }
 }

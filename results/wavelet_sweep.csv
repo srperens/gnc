@@ -1,0 +1,7 @@
+name,input,width,height,tile_size,qstep,dead_zone,psnr_db,psnr_r,psnr_g,psnr_b,ssim,bpp,compressed_bytes,encode_ms,decode_ms,encode_fps,decode_fps
+wavelet_53_q4,test_material/test_512.png,512,512,256,4,0,46.20,45.42,46.68,46.63,0.9998,2.34,76537,,,,
+wavelet_97_q4,test_material/test_512.png,512,512,256,4,0,51.59,50.74,51.35,52.98,1.0000,4.53,148523,,,,
+wavelet_53_q8,test_material/test_512.png,512,512,256,8,0,40.43,40.25,40.43,40.63,0.9995,2.00,65403,,,,
+wavelet_97_q8,test_material/test_512.png,512,512,256,8,0,45.64,45.17,45.89,45.91,0.9998,3.63,118892,,,,
+wavelet_53_q16,test_material/test_512.png,512,512,256,16,0,34.54,33.76,35.28,34.74,0.9977,1.65,54103,,,,
+wavelet_97_q16,test_material/test_512.png,512,512,256,16,0,40.71,41.11,40.21,40.86,0.9996,2.73,89324,,,,

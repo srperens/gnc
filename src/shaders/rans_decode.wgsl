@@ -8,7 +8,7 @@ const RANS_BYTE_L: u32 = 8388608u;  // 1 << 23
 const RANS_PRECISION: u32 = 12u;
 const RANS_MASK: u32 = 4095u;       // (1 << 12) - 1
 const STREAMS_PER_TILE: u32 = 32u;
-const MAX_ALPHABET: u32 = 1024u;
+const MAX_ALPHABET: u32 = 2048u;
 
 // Per-tile info stride in u32s (must match host TILE_INFO_STRIDE)
 const TILE_INFO_STRIDE: u32 = 100u;
@@ -31,7 +31,7 @@ struct Params {
 @group(0) @binding(4) var<storage, read_write> output: array<f32>;
 
 // Shared cumfreq table for the current tile (loaded cooperatively)
-var<workgroup> shared_cumfreq: array<u32, 1025>;  // MAX_ALPHABET + 1
+var<workgroup> shared_cumfreq: array<u32, 2049>;  // MAX_ALPHABET + 1
 
 // Read one byte from the packed u32 stream data array.
 // Bytes are packed little-endian: byte 0 is bits [0:7] of u32[0].

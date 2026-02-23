@@ -179,7 +179,7 @@ pub fn rans_decode_tile(tile: &RansTile) -> Vec<i32> {
 /// Normalize a histogram so that:
 /// - Sum of all frequencies = target_sum (power of 2)
 /// - Every non-zero entry stays >= 1
-fn normalize_histogram(hist: &[u32], target_sum: u32) -> Vec<u32> {
+pub fn normalize_histogram(hist: &[u32], target_sum: u32) -> Vec<u32> {
     let total: u64 = hist.iter().map(|&h| h as u64).sum();
     if total == 0 {
         // All zeros — shouldn't happen but handle gracefully

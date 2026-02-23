@@ -122,6 +122,24 @@ pub struct CflAlphas {
     pub num_subbands: u32,
 }
 
+/// Frame type for temporal coding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameType {
+    /// I-frame: self-contained, no reference needed
+    Intra,
+    /// P-frame: encoded as residual from previous frame
+    Predicted,
+}
+
+/// Per-tile motion vectors: one (dx, dy) per ME_BLOCK_SIZE block.
+#[derive(Debug, Clone)]
+pub struct MotionField {
+    /// (dx, dy) per block, row-major within tile, tiles ordered raster
+    pub vectors: Vec<[i16; 2]>,
+    /// Block size used for motion estimation (typically 16)
+    pub block_size: u32,
+}
+
 /// Which wavelet transform to use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaveletType {
@@ -165,6 +183,12 @@ pub struct CodecConfig {
     /// Each subband group (LL + one per detail level) gets its own rANS frequency table,
     /// improving compression by modeling each distribution tightly.
     pub per_subband_entropy: bool,
+    /// Keyframe interval for temporal coding.
+    /// 1 = all I-frames (default, backward compat). N > 1 = I-frame every N frames.
+    pub keyframe_interval: u32,
+    /// Use GPU compute shaders for rANS entropy encoding (default: true).
+    /// When false, falls back to CPU entropy encoding.
+    pub gpu_entropy_encode: bool,
 }
 
 impl Default for CodecConfig {
@@ -181,6 +205,8 @@ impl Default for CodecConfig {
             adaptive_quantization: false,
             aq_strength: 0.0,
             per_subband_entropy: false,
+            keyframe_interval: 1,
+            gpu_entropy_encode: true,
         }
     }
 }
@@ -217,10 +243,14 @@ pub struct CompressedFrame {
     /// `None` when adaptive quantization is disabled.
     /// Stored in row-major order, one f32 per AQ_BLOCK_SIZE x AQ_BLOCK_SIZE block.
     pub weight_map: Option<Vec<f32>>,
+    /// Frame type for temporal coding (Intra or Predicted)
+    pub frame_type: FrameType,
+    /// Motion field for P-frames (None for I-frames)
+    pub motion_field: Option<MotionField>,
 }
 
 impl CompressedFrame {
-    /// Total compressed size in bytes (all tiles + CfL alpha + weight map overhead)
+    /// Total compressed size in bytes (all tiles + CfL alpha + weight map + MV overhead)
     pub fn byte_size(&self) -> usize {
         let tile_bytes = self.entropy.byte_size();
         let cfl_bytes = self.cfl_alphas.as_ref().map_or(0, |a| a.alphas.len());
@@ -228,7 +258,11 @@ impl CompressedFrame {
             .weight_map
             .as_ref()
             .map_or(0, |wm| wm.len() * std::mem::size_of::<f32>());
-        tile_bytes + cfl_bytes + wm_bytes
+        let mv_bytes = self
+            .motion_field
+            .as_ref()
+            .map_or(0, |mf| mf.vectors.len() * 4); // 2 × i16 per block
+        tile_bytes + cfl_bytes + wm_bytes + mv_bytes
     }
 
     /// Bits per pixel

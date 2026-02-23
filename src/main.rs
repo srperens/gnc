@@ -49,6 +49,10 @@ enum Command {
         /// Disable per-subband entropy coding (enabled by default)
         #[arg(long)]
         no_per_subband: bool,
+
+        /// Use CPU entropy encoding instead of GPU (for testing/debugging)
+        #[arg(long)]
+        cpu_encode: bool,
     },
 
     /// Decode a compressed file back to an image
@@ -79,6 +83,29 @@ enum Command {
         /// Use bitplane entropy coder instead of rANS
         #[arg(long)]
         bitplane: bool,
+
+        /// Use CPU entropy encoding instead of GPU
+        #[arg(long)]
+        cpu_encode: bool,
+    },
+
+    /// Benchmark temporal (I+P frame) encoding on a sequence of frames
+    BenchmarkSequence {
+        /// Input frame pattern (e.g., "frames/frame_%04d.png")
+        #[arg(short, long)]
+        input: String,
+
+        /// Number of frames to encode
+        #[arg(short = 'n', long, default_value = "10")]
+        num_frames: usize,
+
+        /// Keyframe interval (1 = all I-frames)
+        #[arg(short, long, default_value = "8")]
+        keyframe_interval: u32,
+
+        /// Quantization step size
+        #[arg(short, long, default_value = "4.0")]
+        qstep: f32,
     },
 
     /// Run experiments on an input image
@@ -127,6 +154,7 @@ fn main() {
             bitplane,
             wavelet,
             no_per_subband,
+            cpu_encode,
         } => {
             let (rgb_data, w, h) = load_image_rgb_f32(&input);
             println!("Input: {}x{} ({} pixels)", w, h, w * h);
@@ -157,6 +185,7 @@ fn main() {
                 },
                 wavelet_type,
                 per_subband_entropy: !no_per_subband,
+                gpu_entropy_encode: !cpu_encode,
                 ..Default::default()
             };
 
@@ -203,12 +232,14 @@ fn main() {
             iterations,
             csv,
             bitplane,
+            cpu_encode,
         } => {
             let (rgb_data, w, h) = load_image_rgb_f32(&input);
             let coder_name = if bitplane { "bitplane" } else { "rANS" };
+            let encode_mode = if cpu_encode { "CPU" } else { "GPU" };
             println!(
-                "Benchmark: {}x{} image, {} iterations, entropy: {}",
-                w, h, iterations, coder_name
+                "Benchmark: {}x{} image, {} iterations, entropy: {} ({})",
+                w, h, iterations, coder_name, encode_mode
             );
 
             let ctx = GpuContext::new();
@@ -221,6 +252,7 @@ fn main() {
                 } else {
                     gnc::EntropyCoder::Rans
                 },
+                gpu_entropy_encode: !cpu_encode,
                 ..Default::default()
             };
 
@@ -386,16 +418,140 @@ fn main() {
             write_csv(&results, &csv).expect("Failed to write CSV");
             println!("\nResults written to {}", csv);
         }
+
+        Command::BenchmarkSequence {
+            input,
+            num_frames,
+            keyframe_interval,
+            qstep,
+        } => {
+            println!(
+                "Sequence benchmark: pattern={}, frames={}, ki={}, qstep={}",
+                input, num_frames, keyframe_interval, qstep
+            );
+
+            let ctx = GpuContext::new();
+            let encoder = EncoderPipeline::new(&ctx);
+            let decoder = DecoderPipeline::new(&ctx);
+
+            // Load frames from pattern (e.g., "frames/frame_%04d.png")
+            let mut frames_data: Vec<Vec<f32>> = Vec::new();
+            let mut w = 0u32;
+            let mut h = 0u32;
+            for i in 0..num_frames {
+                let path = input.replace("%04d", &format!("{:04}", i));
+                let (rgb, fw, fh) = load_image_rgb_f32(&path);
+                w = fw;
+                h = fh;
+                frames_data.push(rgb);
+            }
+
+            let frame_refs: Vec<&[f32]> = frames_data.iter().map(|f| f.as_slice()).collect();
+
+            // --- I+P encoding ---
+            let config_ip = CodecConfig {
+                quantization_step: qstep,
+                keyframe_interval,
+                ..Default::default()
+            };
+
+            let start = std::time::Instant::now();
+            let compressed_ip = encoder.encode_sequence(&ctx, &frame_refs, w, h, &config_ip);
+            let elapsed_ip = start.elapsed();
+
+            println!("\n=== I+P (keyframe_interval={}) ===", keyframe_interval);
+            let mut total_bytes_ip: usize = 0;
+            for (i, cf) in compressed_ip.iter().enumerate() {
+                let ft = if cf.frame_type == gnc::FrameType::Intra {
+                    "I"
+                } else {
+                    "P"
+                };
+                let decoded = decoder.decode(&ctx, cf);
+                let psnr = quality::psnr(&frames_data[i], &decoded, 255.0);
+                total_bytes_ip += cf.byte_size();
+                println!(
+                    "  Frame {:2} [{}]: {:6} bytes, {:.2} bpp, PSNR {:.2} dB",
+                    i,
+                    ft,
+                    cf.byte_size(),
+                    cf.bpp(),
+                    psnr,
+                );
+            }
+
+            let avg_bpp_ip =
+                compressed_ip.iter().map(|f| f.bpp()).sum::<f64>() / compressed_ip.len() as f64;
+            let i_count = compressed_ip
+                .iter()
+                .filter(|f| f.frame_type == gnc::FrameType::Intra)
+                .count();
+
+            println!(
+                "  Total: {} bytes, avg {:.2} bpp, {:.1}ms ({:.1} fps), {}I+{}P",
+                total_bytes_ip,
+                avg_bpp_ip,
+                elapsed_ip.as_secs_f64() * 1000.0,
+                compressed_ip.len() as f64 / elapsed_ip.as_secs_f64(),
+                i_count,
+                compressed_ip.len() - i_count,
+            );
+
+            // --- All I-frame baseline ---
+            let config_i = CodecConfig {
+                quantization_step: qstep,
+                keyframe_interval: 1,
+                ..Default::default()
+            };
+
+            let start = std::time::Instant::now();
+            let compressed_i = encoder.encode_sequence(&ctx, &frame_refs, w, h, &config_i);
+            let elapsed_i = start.elapsed();
+
+            println!("\n=== All I-frames (baseline) ===");
+            let mut total_bytes_i: usize = 0;
+            for (i, cf) in compressed_i.iter().enumerate() {
+                let decoded = decoder.decode(&ctx, cf);
+                let psnr = quality::psnr(&frames_data[i], &decoded, 255.0);
+                total_bytes_i += cf.byte_size();
+                println!(
+                    "  Frame {:2} [I]: {:6} bytes, {:.2} bpp, PSNR {:.2} dB",
+                    i,
+                    cf.byte_size(),
+                    cf.bpp(),
+                    psnr,
+                );
+            }
+
+            let avg_bpp_i =
+                compressed_i.iter().map(|f| f.bpp()).sum::<f64>() / compressed_i.len() as f64;
+
+            println!(
+                "  Total: {} bytes, avg {:.2} bpp, {:.1}ms ({:.1} fps)",
+                total_bytes_i,
+                avg_bpp_i,
+                elapsed_i.as_secs_f64() * 1000.0,
+                compressed_i.len() as f64 / elapsed_i.as_secs_f64(),
+            );
+
+            // --- Comparison ---
+            let saving_pct =
+                (1.0 - total_bytes_ip as f64 / total_bytes_i as f64) * 100.0;
+            println!(
+                "\n=== Comparison ===\n  I-only: {} bytes ({:.2} bpp)\n  I+P:    {} bytes ({:.2} bpp)\n  Saving: {:.1}%",
+                total_bytes_i, avg_bpp_i, total_bytes_ip, avg_bpp_ip, saving_pct,
+            );
+        }
     }
 }
 
 // Serialization for compressed frames.
-// GPC9 format: adds per-subband entropy coding flag.
+// GP10 format: adds temporal coding (frame_type + motion vectors).
 fn serialize_compressed(frame: &gnc::CompressedFrame) -> Vec<u8> {
     use gnc::encoder::{bitplane, rans};
     let mut out = Vec::new();
     // Header
-    out.extend_from_slice(b"GPC9"); // version 9 = per-subband entropy
+    out.extend_from_slice(b"GP10"); // version 10 = temporal coding
     out.extend_from_slice(&frame.info.width.to_le_bytes());
     out.extend_from_slice(&frame.info.height.to_le_bytes());
     out.extend_from_slice(&frame.info.bit_depth.to_le_bytes());
@@ -455,6 +611,22 @@ fn serialize_compressed(frame: &gnc::CompressedFrame) -> Vec<u8> {
     } else {
         out.extend_from_slice(&0u32.to_le_bytes());
     }
+    // Frame type: 0 = Intra, 1 = Predicted (GP10)
+    let frame_type_byte: u8 = match frame.frame_type {
+        gnc::FrameType::Intra => 0,
+        gnc::FrameType::Predicted => 1,
+    };
+    out.push(frame_type_byte);
+    // Motion field (only for P-frames)
+    if let Some(ref mf) = frame.motion_field {
+        out.extend_from_slice(&(mf.block_size as u16).to_le_bytes());
+        let num_blocks = mf.vectors.len() as u32;
+        out.extend_from_slice(&num_blocks.to_le_bytes());
+        for mv in &mf.vectors {
+            out.extend_from_slice(&mv[0].to_le_bytes());
+            out.extend_from_slice(&mv[1].to_le_bytes());
+        }
+    }
     // Entropy coder type: 0 = rANS, 1 = bitplane, 2 = per-subband rANS
     let entropy_type: u32 = match &frame.entropy {
         gnc::EntropyData::Rans(_) => 0,
@@ -497,9 +669,10 @@ fn deserialize_compressed(data: &[u8]) -> gnc::CompressedFrame {
     assert!(data.len() >= 37, "File too small");
     let magic = &data[0..4];
     let is_gpc9 = magic == b"GPC9";
+    let is_gp10 = magic == b"GP10";
     assert!(
-        magic == b"GPC8" || is_gpc9,
-        "Invalid magic (expected GPC8 or GPC9; older files must be re-encoded)"
+        magic == b"GPC8" || is_gpc9 || is_gp10,
+        "Invalid magic (expected GPC8, GPC9 or GP10; older files must be re-encoded)"
     );
 
     let width = u32::from_le_bytes(data[4..8].try_into().unwrap());
@@ -517,8 +690,8 @@ fn deserialize_compressed(data: &[u8]) -> gnc::CompressedFrame {
         w => panic!("Unknown wavelet type: {}", w),
     };
 
-    // Per-subband entropy flag (GPC9 only)
-    let (per_subband_entropy, subband_weights_start) = if is_gpc9 {
+    // Per-subband entropy flag (GPC9 and GP10)
+    let (per_subband_entropy, subband_weights_start) = if is_gpc9 || is_gp10 {
         (data[33] != 0, 34)
     } else {
         (false, 33)
@@ -587,6 +760,39 @@ fn deserialize_compressed(data: &[u8]) -> gnc::CompressedFrame {
         Some(wm)
     } else {
         None
+    };
+
+    // Frame type + motion field (GP10 only)
+    let (frame_type, motion_field) = if is_gp10 {
+        let ft = match data[pos] {
+            0 => gnc::FrameType::Intra,
+            1 => gnc::FrameType::Predicted,
+            f => panic!("Unknown frame type: {}", f),
+        };
+        pos += 1;
+        let mf = if ft == gnc::FrameType::Predicted {
+            let block_size = u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap()) as u32;
+            pos += 2;
+            let num_blocks =
+                u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+            pos += 4;
+            let mut vectors = Vec::with_capacity(num_blocks);
+            for _ in 0..num_blocks {
+                let dx = i16::from_le_bytes(data[pos..pos + 2].try_into().unwrap());
+                let dy = i16::from_le_bytes(data[pos + 2..pos + 4].try_into().unwrap());
+                vectors.push([dx, dy]);
+                pos += 4;
+            }
+            Some(gnc::MotionField {
+                vectors,
+                block_size,
+            })
+        } else {
+            None
+        };
+        (ft, mf)
+    } else {
+        (gnc::FrameType::Intra, None)
     };
 
     // Entropy coder type: 0 = rANS, 1 = bitplane, 2 = per-subband rANS
@@ -658,9 +864,12 @@ fn deserialize_compressed(data: &[u8]) -> gnc::CompressedFrame {
             adaptive_quantization,
             aq_strength,
             per_subband_entropy: per_subband_entropy || per_subband,
+            ..Default::default()
         },
         entropy,
         cfl_alphas,
         weight_map,
+        frame_type,
+        motion_field,
     }
 }

@@ -8,10 +8,11 @@ use crate::encoder::bitplane::GpuBitplaneDecoder;
 use crate::encoder::cfl::{self, CflPredictor};
 use crate::encoder::color::ColorConverter;
 use crate::encoder::interleave::PlaneInterleaver;
+use crate::encoder::motion::MotionEstimator;
 use crate::encoder::quantize::Quantizer;
 use crate::encoder::rans_gpu::GpuRansDecoder;
 use crate::encoder::transform::WaveletTransform;
-use crate::{CompressedFrame, EntropyData, GpuContext};
+use crate::{CompressedFrame, EntropyData, FrameType, GpuContext};
 
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
@@ -49,6 +50,8 @@ struct CachedBuffers {
     staging_u8: wgpu::Buffer,
     /// Dequantized Y wavelet coefficients for CfL prediction
     y_ref_wavelet_buf: wgpu::Buffer,
+    /// Reference planes from previous decoded frame (for temporal prediction)
+    reference_planes: [wgpu::Buffer; 3],
 }
 
 /// Prepared entropy decode buffers — either rANS or bitplane, ready for GPU dispatch.
@@ -76,6 +79,7 @@ pub struct DecoderPipeline {
     bitplane_decoder: GpuBitplaneDecoder,
     interleaver: PlaneInterleaver,
     cfl_predictor: CflPredictor,
+    motion: MotionEstimator,
     crop_pipeline: wgpu::ComputePipeline,
     crop_bgl: wgpu::BindGroupLayout,
     pack_pipeline: wgpu::ComputePipeline,
@@ -223,6 +227,7 @@ impl DecoderPipeline {
             bitplane_decoder: GpuBitplaneDecoder::new(ctx),
             interleaver: PlaneInterleaver::new(ctx),
             cfl_predictor: CflPredictor::new(ctx),
+            motion: MotionEstimator::new(ctx),
             crop_pipeline,
             crop_bgl,
             pack_pipeline,
@@ -284,7 +289,9 @@ impl DecoderPipeline {
             ctx.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(&format!("dec_plane_result_{p}")),
                 size: plane_size,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::COPY_SRC,
                 mapped_at_creation: false,
             })
         });
@@ -337,6 +344,15 @@ impl DecoderPipeline {
             mapped_at_creation: false,
         });
 
+        let reference_planes = std::array::from_fn(|p| {
+            ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(&format!("dec_reference_{p}")),
+                size: plane_size,
+                usage: scratch_usage,
+                mapped_at_creation: false,
+            })
+        });
+
         *cached = Some(CachedBuffers {
             padded_w,
             padded_h,
@@ -353,6 +369,7 @@ impl DecoderPipeline {
             staging,
             staging_u8,
             y_ref_wavelet_buf,
+            reference_planes,
         });
     }
 
@@ -376,6 +393,16 @@ impl DecoderPipeline {
         Some((buf, blocks_x))
     }
 
+    /// Upload motion vectors from compressed frame to GPU, if present.
+    fn upload_motion_vectors(
+        &self,
+        ctx: &GpuContext,
+        frame: &CompressedFrame,
+    ) -> Option<wgpu::Buffer> {
+        let mf = frame.motion_field.as_ref()?;
+        Some(MotionEstimator::upload_motion_vectors(ctx, &mf.vectors))
+    }
+
     /// Encode GPU commands for the full decode pipeline up to and including crop.
     /// Returns the command encoder with all work recorded, plus the crop params buffer
     /// (which must stay alive until submission).
@@ -387,12 +414,14 @@ impl DecoderPipeline {
         bufs: &CachedBuffers,
         entropy_bufs: &PreparedEntropyBufs,
         weight_map_gpu: &Option<(wgpu::Buffer, u32)>,
+        mv_buf: &Option<wgpu::Buffer>,
     ) -> (wgpu::CommandEncoder, wgpu::Buffer) {
         let info = &frame.info;
         let config = &frame.config;
         let padded_w = info.padded_width();
         let padded_h = info.padded_height();
         let padded_pixels = (padded_w * padded_h) as usize;
+        let is_pframe = frame.frame_type == FrameType::Predicted;
         let tiles_per_plane = info.tiles_x() as usize * info.tiles_y() as usize;
 
         let weights_luma = config.subband_weights.pack_weights();
@@ -575,7 +604,40 @@ impl DecoderPipeline {
                 );
             }
 
-            cmd.copy_buffer_to_buffer(&bufs.scratch_a, 0, &bufs.plane_results[p], 0, plane_size);
+            if is_pframe {
+                // P-frame: scratch_a has residual, add MC prediction from reference
+                // recon = residual + MC(reference)
+                // scratch_a (residual) + reference_planes[p] → plane_results[p]
+                self.motion.compensate(
+                    ctx,
+                    &mut cmd,
+                    &bufs.scratch_a,
+                    &bufs.reference_planes[p],
+                    mv_buf.as_ref().unwrap(),
+                    &bufs.plane_results[p],
+                    padded_w,
+                    padded_h,
+                    false, // inverse: recon = residual + predicted
+                );
+            } else {
+                // I-frame: scratch_a has reconstructed spatial data
+                cmd.copy_buffer_to_buffer(
+                    &bufs.scratch_a,
+                    0,
+                    &bufs.plane_results[p],
+                    0,
+                    plane_size,
+                );
+            }
+
+            // Copy reconstructed plane to reference buffer for next frame
+            cmd.copy_buffer_to_buffer(
+                &bufs.plane_results[p],
+                0,
+                &bufs.reference_planes[p],
+                0,
+                plane_size,
+            );
         }
 
         // GPU interleave: 3 planes → interleaved YCoCg
@@ -703,6 +765,7 @@ impl DecoderPipeline {
 
         let entropy_bufs = self.prepare_entropy_bufs(ctx, frame);
         let weight_map_gpu = self.upload_weight_map(ctx, frame);
+        let mv_buf = self.upload_motion_vectors(ctx, frame);
 
         let t_prepare = t_start.elapsed();
 
@@ -710,7 +773,7 @@ impl DecoderPipeline {
         let bufs = cached.as_ref().unwrap();
 
         let (mut cmd, _crop_params_buf) =
-            self.encode_gpu_work(ctx, frame, bufs, &entropy_bufs, &weight_map_gpu);
+            self.encode_gpu_work(ctx, frame, bufs, &entropy_bufs, &weight_map_gpu, &mv_buf);
 
         // Copy f32 cropped output to staging
         cmd.copy_buffer_to_buffer(&bufs.cropped_buf, 0, &bufs.staging, 0, output_size);
@@ -772,6 +835,7 @@ impl DecoderPipeline {
 
         let entropy_bufs = self.prepare_entropy_bufs(ctx, frame);
         let weight_map_gpu = self.upload_weight_map(ctx, frame);
+        let mv_buf = self.upload_motion_vectors(ctx, frame);
 
         let t_prepare = t_start.elapsed();
 
@@ -779,7 +843,7 @@ impl DecoderPipeline {
         let bufs = cached.as_ref().unwrap();
 
         let (mut cmd, _crop_params_buf) =
-            self.encode_gpu_work(ctx, frame, bufs, &entropy_bufs, &weight_map_gpu);
+            self.encode_gpu_work(ctx, frame, bufs, &entropy_bufs, &weight_map_gpu, &mv_buf);
 
         // GPU pack: f32 → packed u8
         let pack_params = PackParams {
@@ -889,12 +953,13 @@ impl DecoderPipeline {
 
         let entropy_bufs = self.prepare_entropy_bufs(ctx, frame);
         let weight_map_gpu = self.upload_weight_map(ctx, frame);
+        let mv_buf = self.upload_motion_vectors(ctx, frame);
 
         let cached = self.cached.borrow();
         let bufs = cached.as_ref().unwrap();
 
         let (mut cmd, _crop_params_buf) =
-            self.encode_gpu_work(ctx, frame, bufs, &entropy_bufs, &weight_map_gpu);
+            self.encode_gpu_work(ctx, frame, bufs, &entropy_bufs, &weight_map_gpu, &mv_buf);
 
         // GPU pack: f32 → packed u8
         let pack_params = PackParams {

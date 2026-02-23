@@ -42,13 +42,13 @@ enum Command {
         #[arg(long)]
         bitplane: bool,
 
-        /// Wavelet type: 53 (LeGall 5/3, default) or 97 (CDF 9/7)
-        #[arg(long, default_value = "53")]
+        /// Wavelet type: 97 (CDF 9/7, default for lossy) or 53 (LeGall 5/3, for lossless)
+        #[arg(long, default_value = "97")]
         wavelet: String,
 
-        /// Enable per-subband entropy coding (separate freq tables per wavelet level)
+        /// Disable per-subband entropy coding (enabled by default)
         #[arg(long)]
-        per_subband: bool,
+        no_per_subband: bool,
     },
 
     /// Decode a compressed file back to an image
@@ -126,7 +126,7 @@ fn main() {
             cfl,
             bitplane,
             wavelet,
-            per_subband,
+            no_per_subband,
         } => {
             let (rgb_data, w, h) = load_image_rgb_f32(&input);
             println!("Input: {}x{} ({} pixels)", w, h, w * h);
@@ -156,7 +156,7 @@ fn main() {
                     gnc::EntropyCoder::Rans
                 },
                 wavelet_type,
-                per_subband_entropy: per_subband,
+                per_subband_entropy: !no_per_subband,
                 ..Default::default()
             };
 
@@ -325,6 +325,7 @@ fn main() {
                 "entropy" => experiments::entropy_experiments(),
                 "cfl" => experiments::cfl_experiments(),
                 "wavelet" => experiments::wavelet_experiments(),
+                "best" => experiments::best_config_experiments(),
                 "all" => {
                     let mut e = experiments::phase1_experiments();
                     e.extend(experiments::wavelet_level_experiments());
@@ -334,10 +335,11 @@ fn main() {
                     e.extend(experiments::cfl_experiments());
                     e.extend(experiments::wavelet_experiments());
                     e.extend(experiments::entropy_experiments());
+                    e.extend(experiments::best_config_experiments());
                     e
                 }
                 other => {
-                    eprintln!("Unknown experiment set: {}. Use: all, baseline, deadzone, levels, subband, combined, cfl, wavelet, entropy", other);
+                    eprintln!("Unknown experiment set: {}. Use: all, baseline, deadzone, levels, subband, combined, cfl, wavelet, entropy, best", other);
                     std::process::exit(1);
                 }
             };

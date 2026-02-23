@@ -273,6 +273,119 @@ pub fn entropy_experiments() -> Vec<Experiment> {
     exps
 }
 
+/// Best-config experiments: stack CDF 9/7 + per-subband entropy + CfL + perceptual weights.
+/// Systematically tests feature combinations to find the best operating point.
+pub fn best_config_experiments() -> Vec<Experiment> {
+    let steps = [4.0, 8.0, 16.0, 32.0];
+    let levels = 3u32;
+
+    // Feature flags to combine: (wavelet, per_subband, cfl, weights_name, weights)
+    struct FeatureSet {
+        tag: &'static str,
+        wavelet: WaveletType,
+        per_subband: bool,
+        cfl: bool,
+        weights: SubbandWeights,
+    }
+
+    let configs = vec![
+        // 5/3 baseline (no features)
+        FeatureSet {
+            tag: "53_base",
+            wavelet: WaveletType::LeGall53,
+            per_subband: false,
+            cfl: false,
+            weights: SubbandWeights::uniform(levels),
+        },
+        // 9/7 only
+        FeatureSet {
+            tag: "97_base",
+            wavelet: WaveletType::CDF97,
+            per_subband: false,
+            cfl: false,
+            weights: SubbandWeights::uniform(levels),
+        },
+        // 9/7 + per-subband entropy
+        FeatureSet {
+            tag: "97_sb",
+            wavelet: WaveletType::CDF97,
+            per_subband: true,
+            cfl: false,
+            weights: SubbandWeights::uniform(levels),
+        },
+        // 9/7 + CfL
+        FeatureSet {
+            tag: "97_cfl",
+            wavelet: WaveletType::CDF97,
+            per_subband: false,
+            cfl: true,
+            weights: SubbandWeights::uniform(levels),
+        },
+        // 9/7 + per-subband + CfL
+        FeatureSet {
+            tag: "97_sb_cfl",
+            wavelet: WaveletType::CDF97,
+            per_subband: true,
+            cfl: true,
+            weights: SubbandWeights::uniform(levels),
+        },
+        // 9/7 + per-subband + CfL + perceptual weights
+        FeatureSet {
+            tag: "97_sb_cfl_perc",
+            wavelet: WaveletType::CDF97,
+            per_subband: true,
+            cfl: true,
+            weights: SubbandWeights::perceptual(levels),
+        },
+        // 5/3 with all features (for comparison)
+        FeatureSet {
+            tag: "53_sb_cfl_perc",
+            wavelet: WaveletType::LeGall53,
+            per_subband: true,
+            cfl: true,
+            weights: SubbandWeights::perceptual(levels),
+        },
+        // 9/7 + everything + dead zone 0.75
+        FeatureSet {
+            tag: "97_all_dz75",
+            wavelet: WaveletType::CDF97,
+            per_subband: true,
+            cfl: true,
+            weights: SubbandWeights::perceptual(levels),
+        },
+    ];
+
+    let mut exps = Vec::new();
+    for &step in &steps {
+        for cfg in &configs {
+            let dz = if cfg.tag.contains("dz75") { 0.75 } else { 0.0 };
+            exps.push(Experiment {
+                name: format!("{}_q{}", cfg.tag, step as u32),
+                description: format!(
+                    "qstep={}, wavelet={}, per_subband={}, cfl={}, dz={}",
+                    step,
+                    if matches!(cfg.wavelet, WaveletType::CDF97) { "9/7" } else { "5/3" },
+                    cfg.per_subband,
+                    cfg.cfl,
+                    dz,
+                ),
+                config: CodecConfig {
+                    tile_size: 256,
+                    quantization_step: step,
+                    dead_zone: dz,
+                    wavelet_levels: levels,
+                    subband_weights: cfg.weights.clone(),
+                    cfl_enabled: cfg.cfl,
+                    per_subband_entropy: cfg.per_subband,
+                    wavelet_type: cfg.wavelet,
+                    ..Default::default()
+                },
+            });
+        }
+    }
+    exps
+}
+
 /// Combined dead-zone + subband weight experiments.
 /// Tests whether dead-zone and perceptual weights stack for additive compression gains.
 pub fn combined_dz_subband_experiments() -> Vec<Experiment> {

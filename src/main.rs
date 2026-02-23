@@ -160,7 +160,7 @@ fn main() {
             println!("Input: {}x{} ({} pixels)", w, h, w * h);
 
             let ctx = GpuContext::new();
-            let encoder = EncoderPipeline::new(&ctx);
+            let mut encoder = EncoderPipeline::new(&ctx);
 
             let wavelet_type = match wavelet.as_str() {
                 "53" => gnc::WaveletType::LeGall53,
@@ -243,7 +243,7 @@ fn main() {
             );
 
             let ctx = GpuContext::new();
-            let encoder = EncoderPipeline::new(&ctx);
+            let mut encoder = EncoderPipeline::new(&ctx);
             let decoder = DecoderPipeline::new(&ctx);
 
             let config = CodecConfig {
@@ -345,7 +345,7 @@ fn main() {
             println!("Sweep ({}): {}x{} image", experiment, w, h);
 
             let ctx = GpuContext::new();
-            let encoder = EncoderPipeline::new(&ctx);
+            let mut encoder = EncoderPipeline::new(&ctx);
             let decoder = DecoderPipeline::new(&ctx);
 
             let all_experiments = match experiment.as_str() {
@@ -431,7 +431,7 @@ fn main() {
             );
 
             let ctx = GpuContext::new();
-            let encoder = EncoderPipeline::new(&ctx);
+            let mut encoder = EncoderPipeline::new(&ctx);
             let decoder = DecoderPipeline::new(&ctx);
 
             // Load frames from pattern (e.g., "frames/frame_%04d.png")

@@ -42,13 +42,11 @@ var<workgroup> shared_cumfreq: array<u32, 2049>;  // MAX_ALPHABET + 1
 
 // Write one byte into the packed u32 output array.
 // Each stream writes to its own non-overlapping region, so no atomics needed.
-// Buffer must be zero-initialized.
+// Buffer must be zero-initialized; we use OR to set individual bytes within u32 words.
 fn write_byte(byte_offset: u32, value: u32) {
     let word_idx = byte_offset >> 2u;
     let byte_pos = byte_offset & 3u;
-    let shift = byte_pos * 8u;
-    let mask = ~(0xFFu << shift);
-    stream_output[word_idx] = (stream_output[word_idx] & mask) | ((value & 0xFFu) << shift);
+    stream_output[word_idx] = stream_output[word_idx] | ((value & 0xFFu) << (byte_pos * 8u));
 }
 
 // Compute subband group for a tile-local position.

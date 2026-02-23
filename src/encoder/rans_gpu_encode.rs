@@ -1,26 +1,35 @@
-//! GPU rANS encoder — dispatches histogram + encode compute shaders.
+//! GPU rANS encoder — fused histogram → normalize → encode pipeline.
 //!
-//! Two-pass pipeline:
-//!   1. rans_histogram.wgsl: build per-tile histograms on GPU (256 threads/workgroup)
-//!   2. CPU: read back histograms, normalize frequencies, build cumfreq tables
+//! Three-pass GPU pipeline in a single command encoder submission:
+//!   1. rans_histogram.wgsl: build per-tile histograms (256 threads/workgroup)
+//!   2. rans_normalize.wgsl: normalize frequencies + build cumfreq tables (256 threads/workgroup)
 //!   3. rans_encode.wgsl: encode 32 interleaved rANS streams per tile (32 threads/workgroup)
-//!   4. CPU: read back encoded streams, pack into tile structs
 //!
-//! Eliminates the 30MB quantized-coefficient readback and 170ms of serial CPU encoding.
+//! All intermediate data stays on GPU — only the final encoded streams and
+//! frequency tables are read back to CPU in a single map operation.
+//! Buffers are cached across calls to eliminate per-frame allocation overhead.
 
 use bytemuck::{Pod, Zeroable};
 use wgpu;
 use wgpu::util::DeviceExt;
 
-use super::rans::{
-    normalize_histogram, InterleavedRansTile, SubbandGroupFreqs, SubbandRansTile, STREAMS_PER_TILE,
-};
+use super::rans::{InterleavedRansTile, SubbandGroupFreqs, SubbandRansTile, STREAMS_PER_TILE};
 use crate::{FrameInfo, GpuContext};
 
-const RANS_M: u32 = 1 << 12; // Must match RANS_PRECISION in shaders
 const MAX_STREAM_BYTES: usize = 4096;
 const HIST_TILE_STRIDE: usize = 2060;
 const ENCODE_TILE_INFO_STRIDE: usize = 32;
+const MAX_ALPHABET: usize = 2048;
+const MAX_GROUP_ALPHABET: usize = 512;
+const MAX_GROUPS: usize = 8;
+
+fn cumfreq_stride(per_subband: bool) -> usize {
+    if per_subband {
+        MAX_GROUPS * (MAX_GROUP_ALPHABET + 1)
+    } else {
+        MAX_ALPHABET + 1
+    }
+}
 
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
@@ -36,37 +45,136 @@ struct RansEncodeParams {
 }
 
 /// Normalized frequency data for one tile (single-table mode).
-pub struct NormalizedTileFreqs {
-    pub min_val: i32,
-    pub alphabet_size: u32,
-    pub freqs: Vec<u32>,
-    pub cumfreqs: Vec<u32>,
+struct NormalizedTileFreqs {
+    min_val: i32,
+    alphabet_size: u32,
+    freqs: Vec<u32>,
+    cumfreqs: Vec<u32>,
 }
 
 /// Normalized frequency data for one tile (per-subband mode).
-pub struct NormalizedSubbandTileFreqs {
-    pub num_groups: u32,
-    pub groups: Vec<NormalizedGroupFreqs>,
+struct NormalizedSubbandTileFreqs {
+    num_groups: u32,
+    groups: Vec<NormalizedGroupFreqs>,
 }
 
-pub struct NormalizedGroupFreqs {
-    pub min_val: i32,
-    pub alphabet_size: u32,
-    pub freqs: Vec<u32>,
-    pub cumfreqs: Vec<u32>,
+struct NormalizedGroupFreqs {
+    min_val: i32,
+    alphabet_size: u32,
+    freqs: Vec<u32>,
+    cumfreqs: Vec<u32>,
 }
 
 /// Unified normalized frequency data for one tile.
-pub enum TileFreqs {
+enum TileFreqs {
     Single(NormalizedTileFreqs),
     Subband(NormalizedSubbandTileFreqs),
+}
+
+/// Pre-allocated GPU buffers, reused across encode calls for the same configuration.
+struct CachedEncodeBuffers {
+    num_tiles: usize,
+    per_subband: bool,
+    // Intermediate GPU buffers
+    hist_buf: wgpu::Buffer,
+    cumfreq_buf: wgpu::Buffer,
+    tile_info_buf: wgpu::Buffer,
+    stream_buf: wgpu::Buffer,
+    meta_buf: wgpu::Buffer,
+    // Staging buffers for CPU readback
+    stream_staging: wgpu::Buffer,
+    meta_staging: wgpu::Buffer,
+    cumfreq_staging: wgpu::Buffer,
+    tile_info_staging: wgpu::Buffer,
+}
+
+impl CachedEncodeBuffers {
+    fn new(ctx: &GpuContext, num_tiles: usize, per_subband: bool) -> Self {
+        let total_streams = num_tiles * STREAMS_PER_TILE;
+        let cf_stride = cumfreq_stride(per_subband);
+
+        let hist_size = (num_tiles * HIST_TILE_STRIDE * 4) as u64;
+        let cumfreq_size = (num_tiles * cf_stride * 4) as u64;
+        let tile_info_size = (num_tiles * ENCODE_TILE_INFO_STRIDE * 4) as u64;
+        let stream_size = (total_streams * MAX_STREAM_BYTES) as u64;
+        let meta_size = (total_streams * 2 * 4) as u64;
+
+        let sc = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC;
+        let mr = wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST;
+
+        Self {
+            num_tiles,
+            per_subband,
+            hist_buf: ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("rans_hist"),
+                size: hist_size.max(4),
+                usage: sc,
+                mapped_at_creation: false,
+            }),
+            cumfreq_buf: ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("rans_cumfreq"),
+                size: cumfreq_size.max(4),
+                usage: sc,
+                mapped_at_creation: false,
+            }),
+            tile_info_buf: ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("rans_tile_info"),
+                size: tile_info_size.max(4),
+                usage: sc,
+                mapped_at_creation: false,
+            }),
+            stream_buf: ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("rans_stream"),
+                size: stream_size.max(4),
+                usage: sc | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            meta_buf: ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("rans_meta"),
+                size: meta_size.max(4),
+                usage: sc,
+                mapped_at_creation: false,
+            }),
+            stream_staging: ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("rans_stream_stg"),
+                size: stream_size.max(4),
+                usage: mr,
+                mapped_at_creation: false,
+            }),
+            meta_staging: ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("rans_meta_stg"),
+                size: meta_size.max(4),
+                usage: mr,
+                mapped_at_creation: false,
+            }),
+            cumfreq_staging: ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("rans_cf_stg"),
+                size: cumfreq_size.max(4),
+                usage: mr,
+                mapped_at_creation: false,
+            }),
+            tile_info_staging: ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("rans_ti_stg"),
+                size: tile_info_size.max(4),
+                usage: mr,
+                mapped_at_creation: false,
+            }),
+        }
+    }
+
+    fn matches(&self, num_tiles: usize, per_subband: bool) -> bool {
+        self.num_tiles == num_tiles && self.per_subband == per_subband
+    }
 }
 
 pub struct GpuRansEncoder {
     histogram_pipeline: wgpu::ComputePipeline,
     histogram_bgl: wgpu::BindGroupLayout,
+    normalize_pipeline: wgpu::ComputePipeline,
+    normalize_bgl: wgpu::BindGroupLayout,
     encode_pipeline: wgpu::ComputePipeline,
     encode_bgl: wgpu::BindGroupLayout,
+    cached: Option<CachedEncodeBuffers>,
 }
 
 fn make_storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
@@ -112,9 +220,9 @@ impl GpuRansEncoder {
                 .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                     label: Some("rans_histogram_bgl"),
                     entries: &[
-                        make_uniform_entry(0),        // params
-                        make_storage_entry(1, true),   // input coefficients
-                        make_storage_entry(2, false),  // histogram output
+                        make_uniform_entry(0),
+                        make_storage_entry(1, true),
+                        make_storage_entry(2, false),
                     ],
                 });
 
@@ -137,6 +245,47 @@ impl GpuRansEncoder {
                     cache: None,
                 });
 
+        // --- Normalize pipeline ---
+        let norm_shader = ctx
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("rans_normalize"),
+                source: wgpu::ShaderSource::Wgsl(
+                    include_str!("../shaders/rans_normalize.wgsl").into(),
+                ),
+            });
+
+        let normalize_bgl =
+            ctx.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("rans_normalize_bgl"),
+                    entries: &[
+                        make_uniform_entry(0),        // params
+                        make_storage_entry(1, true),   // hist_input
+                        make_storage_entry(2, false),  // cumfreq_out
+                        make_storage_entry(3, false),  // tile_info_out
+                    ],
+                });
+
+        let norm_pl = ctx
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("rans_normalize_pl"),
+                bind_group_layouts: &[&normalize_bgl],
+                push_constant_ranges: &[],
+            });
+
+        let normalize_pipeline =
+            ctx.device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("rans_normalize_pipeline"),
+                    layout: Some(&norm_pl),
+                    module: &norm_shader,
+                    entry_point: Some("main"),
+                    compilation_options: Default::default(),
+                    cache: None,
+                });
+
         // --- Encode pipeline ---
         let enc_shader = ctx
             .device
@@ -152,12 +301,12 @@ impl GpuRansEncoder {
                 .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                     label: Some("rans_encode_bgl"),
                     entries: &[
-                        make_uniform_entry(0),        // params
-                        make_storage_entry(1, true),   // input coefficients
-                        make_storage_entry(2, true),   // cumfreq_data
-                        make_storage_entry(3, true),   // tile_info
-                        make_storage_entry(4, false),  // stream_output
-                        make_storage_entry(5, false),  // stream_metadata
+                        make_uniform_entry(0),
+                        make_storage_entry(1, true),
+                        make_storage_entry(2, true),
+                        make_storage_entry(3, true),
+                        make_storage_entry(4, false),
+                        make_storage_entry(5, false),
                     ],
                 });
 
@@ -183,37 +332,32 @@ impl GpuRansEncoder {
         Self {
             histogram_pipeline,
             histogram_bgl,
+            normalize_pipeline,
+            normalize_bgl,
             encode_pipeline,
             encode_bgl,
+            cached: None,
         }
     }
 
-    /// Run the full GPU encode pipeline for one plane's quantized data.
-    /// Returns encoded tile data ready for serialization.
-    ///
-    /// `quantized_buf` must contain quantized f32 coefficients in 2D plane layout.
-    pub fn encode_plane(
-        &self,
-        ctx: &GpuContext,
-        quantized_buf: &wgpu::Buffer,
-        info: &FrameInfo,
-        per_subband: bool,
-        num_levels: u32,
-    ) -> Vec<TileFreqs> {
-        let num_tiles = (info.tiles_x() * info.tiles_y()) as usize;
-
-        // Step 1: GPU histogram
-        let hist_buf = self.dispatch_histogram(ctx, quantized_buf, info, per_subband, num_levels);
-
-        // Step 2: Read back and normalize
-        let hist_data = read_buffer_u32(ctx, &hist_buf, num_tiles * HIST_TILE_STRIDE);
-        Self::normalize_histograms(&hist_data, num_tiles, per_subband)
+    /// Ensure cached buffers match the current tile configuration.
+    fn ensure_buffers(&mut self, ctx: &GpuContext, num_tiles: usize, per_subband: bool) {
+        if self
+            .cached
+            .as_ref()
+            .is_none_or(|c| !c.matches(num_tiles, per_subband))
+        {
+            self.cached = Some(CachedEncodeBuffers::new(ctx, num_tiles, per_subband));
+        }
     }
 
-    /// Run the full GPU encode pipeline and return packed tile structs.
+    /// Run the fused GPU encode pipeline and return packed tile structs.
+    ///
+    /// Single command encoder submission: histogram → normalize → encode → copy.
+    /// Single device poll for all readbacks.
     #[allow(clippy::type_complexity)]
     pub fn encode_plane_to_tiles(
-        &self,
+        &mut self,
         ctx: &GpuContext,
         quantized_buf: &wgpu::Buffer,
         info: &FrameInfo,
@@ -221,81 +365,34 @@ impl GpuRansEncoder {
         num_levels: u32,
     ) -> (Vec<InterleavedRansTile>, Vec<SubbandRansTile>) {
         let num_tiles = (info.tiles_x() * info.tiles_y()) as usize;
-
-        // Step 1: GPU histogram
-        let hist_buf = self.dispatch_histogram(ctx, quantized_buf, info, per_subband, num_levels);
-
-        // Step 2: Read back histograms and normalize on CPU
-        let hist_data = read_buffer_u32(ctx, &hist_buf, num_tiles * HIST_TILE_STRIDE);
-        let tile_freqs = Self::normalize_histograms(&hist_data, num_tiles, per_subband);
-
-        // Step 3: GPU encode
-        let (stream_buf, meta_buf) =
-            self.dispatch_encode(ctx, quantized_buf, &tile_freqs, info, per_subband, num_levels);
-
-        // Step 4: Read back encoded streams
         let total_streams = num_tiles * STREAMS_PER_TILE;
-        let stream_u32s = total_streams * MAX_STREAM_BYTES / 4;
-        let meta_u32s = total_streams * 2;
+        let cf_stride = cumfreq_stride(per_subband);
 
-        let stream_data = read_buffer_u32(ctx, &stream_buf, stream_u32s);
-        let meta_data = read_buffer_u32(ctx, &meta_buf, meta_u32s);
+        self.ensure_buffers(ctx, num_tiles, per_subband);
+        let bufs = self.cached.as_ref().unwrap();
 
-        // Step 5: Pack into tile structs
-        Self::pack_tiles(
-            &stream_data,
-            &meta_data,
-            &tile_freqs,
-            num_tiles,
-            info,
-            per_subband,
-            num_levels,
-        )
-    }
-
-    /// Dispatch the histogram shader. Returns the histogram output buffer.
-    fn dispatch_histogram(
-        &self,
-        ctx: &GpuContext,
-        quantized_buf: &wgpu::Buffer,
-        info: &FrameInfo,
-        per_subband: bool,
-        num_levels: u32,
-    ) -> wgpu::Buffer {
-        let num_tiles = info.tiles_x() * info.tiles_y();
-        let tile_size = info.tile_size;
-        let coefficients_per_tile = tile_size * tile_size;
-
+        // Params buffer (small, changes per plane)
         let params = RansEncodeParams {
-            num_tiles,
-            coefficients_per_tile,
+            num_tiles: num_tiles as u32,
+            coefficients_per_tile: info.tile_size * info.tile_size,
             plane_width: info.padded_width(),
-            tile_size,
+            tile_size: info.tile_size,
             tiles_x: info.tiles_x(),
-            per_subband: if per_subband { 1 } else { 0 },
+            per_subband: u32::from(per_subband),
             num_levels,
             _pad: 0,
         };
-
         let params_buf = ctx
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("rans_hist_params"),
+                label: Some("rans_params"),
                 contents: bytemuck::bytes_of(&params),
                 usage: wgpu::BufferUsages::UNIFORM,
             });
 
-        let hist_buf_size =
-            (num_tiles as usize * HIST_TILE_STRIDE * std::mem::size_of::<u32>()) as u64;
-        let hist_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("rans_hist_output"),
-            size: hist_buf_size.max(4),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-
-        let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("rans_histogram_bg"),
+        // --- Bind groups ---
+        let hist_bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("rans_hist_bg"),
             layout: &self.histogram_bgl,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -308,61 +405,222 @@ impl GpuRansEncoder {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: hist_buf.as_entire_binding(),
+                    resource: bufs.hist_buf.as_entire_binding(),
                 },
             ],
         });
 
+        let norm_bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("rans_norm_bg"),
+            layout: &self.normalize_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: bufs.hist_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: bufs.cumfreq_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: bufs.tile_info_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        let encode_bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("rans_encode_bg"),
+            layout: &self.encode_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: quantized_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: bufs.cumfreq_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: bufs.tile_info_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: bufs.stream_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: bufs.meta_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        // --- Single command encoder: 3 compute passes + copies ---
         let mut cmd = ctx
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("rans_histogram_cmd"),
+                label: Some("rans_fused_cmd"),
             });
 
+        // Zero-initialize stream buffer (required by write_byte OR pattern)
+        cmd.clear_buffer(&bufs.stream_buf, 0, None);
+
+        // Pass 1: Histogram
         {
             let mut pass = cmd.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("rans_histogram_pass"),
+                label: Some("rans_hist_pass"),
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.histogram_pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(num_tiles, 1, 1);
+            pass.set_bind_group(0, &hist_bg, &[]);
+            pass.dispatch_workgroups(num_tiles as u32, 1, 1);
         }
 
+        // Pass 2: Normalize (reads hist_buf, writes cumfreq_buf + tile_info_buf)
+        {
+            let mut pass = cmd.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("rans_norm_pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.normalize_pipeline);
+            pass.set_bind_group(0, &norm_bg, &[]);
+            pass.dispatch_workgroups(num_tiles as u32, 1, 1);
+        }
+
+        // Pass 3: Encode (reads cumfreq_buf + tile_info_buf, writes stream_buf + meta_buf)
+        {
+            let mut pass = cmd.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("rans_encode_pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.encode_pipeline);
+            pass.set_bind_group(0, &encode_bg, &[]);
+            pass.dispatch_workgroups(num_tiles as u32, 1, 1);
+        }
+
+        // Copy all results to staging buffers
+        let stream_size = (total_streams * MAX_STREAM_BYTES) as u64;
+        let meta_size = (total_streams * 2 * 4) as u64;
+        let cumfreq_size = (num_tiles * cf_stride * 4) as u64;
+        let tile_info_size = (num_tiles * ENCODE_TILE_INFO_STRIDE * 4) as u64;
+
+        cmd.copy_buffer_to_buffer(&bufs.stream_buf, 0, &bufs.stream_staging, 0, stream_size);
+        cmd.copy_buffer_to_buffer(&bufs.meta_buf, 0, &bufs.meta_staging, 0, meta_size);
+        cmd.copy_buffer_to_buffer(
+            &bufs.cumfreq_buf,
+            0,
+            &bufs.cumfreq_staging,
+            0,
+            cumfreq_size,
+        );
+        cmd.copy_buffer_to_buffer(
+            &bufs.tile_info_buf,
+            0,
+            &bufs.tile_info_staging,
+            0,
+            tile_info_size,
+        );
+
+        // Single submit
         ctx.queue.submit(Some(cmd.finish()));
 
-        hist_buf
+        // Map all 4 staging buffers, single poll
+        let (tx, rx) = std::sync::mpsc::channel();
+        for staging in [
+            &bufs.stream_staging,
+            &bufs.meta_staging,
+            &bufs.cumfreq_staging,
+            &bufs.tile_info_staging,
+        ] {
+            let tx_clone = tx.clone();
+            staging
+                .slice(..)
+                .map_async(wgpu::MapMode::Read, move |result| {
+                    tx_clone.send(result).unwrap();
+                });
+        }
+        drop(tx);
+        ctx.device.poll(wgpu::Maintain::Wait);
+        for _ in 0..4 {
+            rx.recv().unwrap().unwrap();
+        }
+
+        // Read back all data
+        let stream_data: Vec<u32> = {
+            let view = bufs.stream_staging.slice(..).get_mapped_range();
+            bytemuck::cast_slice(&view).to_vec()
+        };
+        let meta_data: Vec<u32> = {
+            let view = bufs.meta_staging.slice(..).get_mapped_range();
+            bytemuck::cast_slice(&view).to_vec()
+        };
+        let cumfreq_data: Vec<u32> = {
+            let view = bufs.cumfreq_staging.slice(..).get_mapped_range();
+            bytemuck::cast_slice(&view).to_vec()
+        };
+        let tile_info_data: Vec<u32> = {
+            let view = bufs.tile_info_staging.slice(..).get_mapped_range();
+            bytemuck::cast_slice(&view).to_vec()
+        };
+
+        bufs.stream_staging.unmap();
+        bufs.meta_staging.unmap();
+        bufs.cumfreq_staging.unmap();
+        bufs.tile_info_staging.unmap();
+
+        // Reconstruct TileFreqs from GPU-computed cumfreq + tile_info
+        let tile_freqs =
+            Self::reconstruct_tile_freqs(&cumfreq_data, &tile_info_data, num_tiles, per_subband);
+
+        // Pack into tile structs
+        Self::pack_tiles(
+            &stream_data,
+            &meta_data,
+            &tile_freqs,
+            num_tiles,
+            info,
+            per_subband,
+            num_levels,
+        )
     }
 
-    /// Read back raw histograms and normalize on CPU.
-    fn normalize_histograms(
-        hist_data: &[u32],
+    /// Reconstruct TileFreqs from GPU-computed cumfreq and tile_info readbacks.
+    /// Frequencies are derived as freq[i] = cumfreq[i+1] - cumfreq[i].
+    fn reconstruct_tile_freqs(
+        cumfreq_data: &[u32],
+        tile_info_data: &[u32],
         num_tiles: usize,
         per_subband: bool,
     ) -> Vec<TileFreqs> {
         let mut tile_freqs = Vec::with_capacity(num_tiles);
 
         for t in 0..num_tiles {
-            let base = t * HIST_TILE_STRIDE;
+            let info_base = t * ENCODE_TILE_INFO_STRIDE;
 
             if per_subband {
-                let num_groups = hist_data[base] as usize;
+                let num_groups = tile_info_data[info_base] as usize;
                 let mut groups = Vec::with_capacity(num_groups);
-                let mut off = 1usize;
 
-                for _g in 0..num_groups {
-                    let min_val = hist_data[base + off] as i32;
-                    let alphabet_size = hist_data[base + off + 1] as usize;
-                    off += 2;
+                for g in 0..num_groups {
+                    let gi = info_base + 1 + g * 3;
+                    let min_val = tile_info_data[gi] as i32;
+                    let alphabet_size = tile_info_data[gi + 1] as usize;
+                    let cf_offset = tile_info_data[gi + 2] as usize;
 
-                    let hist: Vec<u32> = hist_data[base + off..base + off + alphabet_size].to_vec();
-                    off += alphabet_size;
-
-                    let freqs = normalize_histogram(&hist, RANS_M);
-                    let mut cumfreqs = vec![0u32; alphabet_size + 1];
-                    for i in 0..alphabet_size {
-                        cumfreqs[i + 1] = cumfreqs[i] + freqs[i];
-                    }
+                    let cumfreqs: Vec<u32> =
+                        cumfreq_data[cf_offset..cf_offset + alphabet_size + 1].to_vec();
+                    let freqs: Vec<u32> = (0..alphabet_size)
+                        .map(|i| cumfreqs[i + 1] - cumfreqs[i])
+                        .collect();
 
                     groups.push(NormalizedGroupFreqs {
                         min_val,
@@ -377,16 +635,15 @@ impl GpuRansEncoder {
                     groups,
                 }));
             } else {
-                let min_val = hist_data[base] as i32;
-                let alphabet_size = hist_data[base + 1] as usize;
-                let hist: Vec<u32> =
-                    hist_data[base + 2..base + 2 + alphabet_size].to_vec();
+                let min_val = tile_info_data[info_base] as i32;
+                let alphabet_size = tile_info_data[info_base + 1] as usize;
+                let cf_offset = tile_info_data[info_base + 2] as usize;
 
-                let freqs = normalize_histogram(&hist, RANS_M);
-                let mut cumfreqs = vec![0u32; alphabet_size + 1];
-                for i in 0..alphabet_size {
-                    cumfreqs[i + 1] = cumfreqs[i] + freqs[i];
-                }
+                let cumfreqs: Vec<u32> =
+                    cumfreq_data[cf_offset..cf_offset + alphabet_size + 1].to_vec();
+                let freqs: Vec<u32> = (0..alphabet_size)
+                    .map(|i| cumfreqs[i + 1] - cumfreqs[i])
+                    .collect();
 
                 tile_freqs.push(TileFreqs::Single(NormalizedTileFreqs {
                     min_val,
@@ -398,160 +655,6 @@ impl GpuRansEncoder {
         }
 
         tile_freqs
-    }
-
-    /// Upload cumfreqs and dispatch GPU rANS encode.
-    /// Returns (stream_output_buf, stream_metadata_buf).
-    fn dispatch_encode(
-        &self,
-        ctx: &GpuContext,
-        quantized_buf: &wgpu::Buffer,
-        tile_freqs: &[TileFreqs],
-        info: &FrameInfo,
-        per_subband: bool,
-        num_levels: u32,
-    ) -> (wgpu::Buffer, wgpu::Buffer) {
-        let num_tiles = tile_freqs.len();
-        let tile_size = info.tile_size;
-        let coefficients_per_tile = tile_size * tile_size;
-        let total_streams = num_tiles * STREAMS_PER_TILE;
-
-        let params = RansEncodeParams {
-            num_tiles: num_tiles as u32,
-            coefficients_per_tile,
-            plane_width: info.padded_width(),
-            tile_size,
-            tiles_x: info.tiles_x(),
-            per_subband: if per_subband { 1 } else { 0 },
-            num_levels,
-            _pad: 0,
-        };
-
-        let params_buf = ctx
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("rans_encode_params"),
-                contents: bytemuck::bytes_of(&params),
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
-
-        // Build tile_info and cumfreq_data buffers
-        let mut tile_info_data = vec![0u32; num_tiles * ENCODE_TILE_INFO_STRIDE];
-        let mut cumfreq_all: Vec<u32> = Vec::new();
-
-        for (t, tf) in tile_freqs.iter().enumerate() {
-            let base = t * ENCODE_TILE_INFO_STRIDE;
-            match tf {
-                TileFreqs::Single(s) => {
-                    tile_info_data[base] = s.min_val as u32;
-                    tile_info_data[base + 1] = s.alphabet_size;
-                    tile_info_data[base + 2] = cumfreq_all.len() as u32;
-                    cumfreq_all.extend_from_slice(&s.cumfreqs);
-                }
-                TileFreqs::Subband(sb) => {
-                    tile_info_data[base] = sb.num_groups;
-                    for (g, group) in sb.groups.iter().enumerate() {
-                        let gi = base + 1 + g * 3;
-                        tile_info_data[gi] = group.min_val as u32;
-                        tile_info_data[gi + 1] = group.alphabet_size;
-                        tile_info_data[gi + 2] = cumfreq_all.len() as u32;
-                        cumfreq_all.extend_from_slice(&group.cumfreqs);
-                    }
-                }
-            }
-        }
-
-        // Ensure non-empty buffers
-        if cumfreq_all.is_empty() {
-            cumfreq_all.push(0);
-        }
-
-        let tile_info_buf = ctx
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("rans_encode_tile_info"),
-                contents: bytemuck::cast_slice(&tile_info_data),
-                usage: wgpu::BufferUsages::STORAGE,
-            });
-
-        let cumfreq_buf = ctx
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("rans_encode_cumfreq"),
-                contents: bytemuck::cast_slice(&cumfreq_all),
-                usage: wgpu::BufferUsages::STORAGE,
-            });
-
-        // Stream output buffer: zero-initialized (required by write_byte)
-        let stream_buf_size = (total_streams * MAX_STREAM_BYTES) as u64;
-        let stream_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("rans_encode_stream_output"),
-            size: stream_buf_size.max(4),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: true,
-        });
-        // Zero-initialize by mapping then unmapping (mapped_at_creation gives zeroed memory)
-        stream_buf.unmap();
-
-        // Metadata buffer: [write_ptr, final_state] per stream
-        let meta_buf_size = (total_streams * 2 * std::mem::size_of::<u32>()) as u64;
-        let meta_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("rans_encode_stream_meta"),
-            size: meta_buf_size.max(4),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-
-        let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("rans_encode_bg"),
-            layout: &self.encode_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: params_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: quantized_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: cumfreq_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: tile_info_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: stream_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: meta_buf.as_entire_binding(),
-                },
-            ],
-        });
-
-        let mut cmd = ctx
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("rans_encode_cmd"),
-            });
-
-        {
-            let mut pass = cmd.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("rans_encode_pass"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.encode_pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(num_tiles as u32, 1, 1);
-        }
-
-        ctx.queue.submit(Some(cmd.finish()));
-
-        (stream_buf, meta_buf)
     }
 
     /// Read back encoded streams and pack into tile structs.
@@ -570,7 +673,6 @@ impl GpuRansEncoder {
         let coefficients_per_tile = (info.tile_size * info.tile_size) as usize;
 
         for t in 0..num_tiles {
-            // Extract per-stream data from the GPU output
             let mut per_stream_data: Vec<Vec<u8>> = Vec::with_capacity(STREAMS_PER_TILE);
             let mut per_stream_state: Vec<u32> = Vec::with_capacity(STREAMS_PER_TILE);
 
@@ -580,9 +682,8 @@ impl GpuRansEncoder {
                 let write_ptr = meta_data[meta_base] as usize;
                 let final_state = meta_data[meta_base + 1];
 
-                // Extract bytes from write_ptr..MAX_STREAM_BYTES
                 let stream_byte_base = stream_idx * MAX_STREAM_BYTES;
-                let mut bytes = Vec::new();
+                let mut bytes = Vec::with_capacity(MAX_STREAM_BYTES - write_ptr);
                 for byte_off in write_ptr..MAX_STREAM_BYTES {
                     let global_byte = stream_byte_base + byte_off;
                     let word_idx = global_byte / 4;
@@ -628,7 +729,7 @@ impl GpuRansEncoder {
                             min_val: s.min_val,
                             alphabet_size: s.alphabet_size,
                             num_coefficients: coefficients_per_tile as u32,
-                            zrun_base: 0, // GPU encode does not use ZRL
+                            zrun_base: 0,
                             freqs: s.freqs.clone(),
                             cumfreqs: s.cumfreqs.clone(),
                             stream_data: per_stream_data,
@@ -642,64 +743,4 @@ impl GpuRansEncoder {
 
         (rans_tiles, subband_tiles)
     }
-}
-
-/// Result of GPU-encoding one plane.
-pub enum PlaneEncodedTiles {
-    Rans(Vec<InterleavedRansTile>),
-    SubbandRans(Vec<SubbandRansTile>),
-}
-
-impl GpuRansEncoder {
-    /// High-level: GPU encode a full plane, returning packed tile structs.
-    /// This is the main entry point used by the encoder pipeline.
-    pub fn gpu_encode_plane(
-        &self,
-        ctx: &GpuContext,
-        quantized_buf: &wgpu::Buffer,
-        info: &FrameInfo,
-        per_subband: bool,
-        num_levels: u32,
-    ) -> PlaneEncodedTiles {
-        let (rans, subband) =
-            self.encode_plane_to_tiles(ctx, quantized_buf, info, per_subband, num_levels);
-        if per_subband {
-            PlaneEncodedTiles::SubbandRans(subband)
-        } else {
-            PlaneEncodedTiles::Rans(rans)
-        }
-    }
-}
-
-/// Read a GPU buffer back to CPU as Vec<u32>.
-fn read_buffer_u32(ctx: &GpuContext, buffer: &wgpu::Buffer, count: usize) -> Vec<u32> {
-    let size = (count * std::mem::size_of::<u32>()) as u64;
-    let staging = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("staging_read_u32"),
-        size,
-        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-
-    let mut cmd = ctx
-        .device
-        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("copy_to_staging_u32"),
-        });
-    cmd.copy_buffer_to_buffer(buffer, 0, &staging, 0, size);
-    ctx.queue.submit(Some(cmd.finish()));
-
-    let slice = staging.slice(..);
-    let (tx, rx) = std::sync::mpsc::channel();
-    slice.map_async(wgpu::MapMode::Read, move |result| {
-        tx.send(result).unwrap();
-    });
-    ctx.device.poll(wgpu::Maintain::Wait);
-    rx.recv().unwrap().unwrap();
-
-    let data = slice.get_mapped_range();
-    let result: Vec<u32> = bytemuck::cast_slice(&data).to_vec();
-    drop(data);
-    staging.unmap();
-    result
 }

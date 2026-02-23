@@ -755,3 +755,69 @@ PSNR is identical. BPP differs by <0.2% due to histogram normalization rounding 
 3. **Fused quantize+histogram** — a single shader pass that quantizes AND builds the histogram simultaneously would eliminate one GPU dispatch + the intermediate buffer
 4. **Context-modeled entropy coding** — the remaining path to close the 1.5x JPEG 2000 gap
 5. **Temporal prediction benchmarks** — P-frame encoding with motion estimation is implemented but not yet benchmarked
+
+## 2026-02-23: Temporal Prediction (P-frames) Benchmarks
+
+### Hypothesis
+P-frame encoding with 16x16 block matching motion estimation should reduce bitrate for sequences with temporal redundancy (animation, talking heads) while maintaining quality. Camera-pan content with global motion may not benefit due to limited search range (±16 pixels) and block-level granularity.
+
+### Implementation (already present)
+- **Motion estimation**: GPU block matching on Y plane, 16x16 blocks, ±16 search range
+- **Motion compensation**: GPU shader computes residual (encode) or reconstruction (decode)
+- **Encoder local decode loop**: I-frame: entropy decode → dequant → inv wavelet → reference planes. P-frame: same + inverse MC to reconstruct reference.
+- **Decoder**: maintains `reference_planes` buffers, applies MC for P-frames automatically
+- **Encode sequence**: `encode_sequence()` schedules I/P frames based on `keyframe_interval`
+
+### Results — BBB (1080p animation, 25fps, 10 consecutive frames)
+
+| KI | I+P Size | I-only Size | Saving | I+P fps | I-only fps |
+|----|----------|-------------|--------|---------|------------|
+| 8 (IPPPPPPP) | 12.6 MB (4.85 bpp) | 17.0 MB (6.57 bpp) | **26.1%** | 1.7 | 3.9 |
+| 4 (IPPP) | 13.0 MB (5.03 bpp) | 17.0 MB (6.57 bpp) | **23.4%** | 1.8 | 3.9 |
+| 2 (IP) | 14.0 MB (5.41 bpp) | 17.0 MB (6.57 bpp) | **17.6%** | 2.2 | 3.8 |
+
+P-frame quality: 43.07–43.26 dB vs I-frame 43.41 dB (only 0.15–0.34 dB degradation).
+
+Individual P-frame sizes: ~4.24–4.55 bpp (35% smaller than I-frames at 6.57 bpp).
+
+### Results — blue_sky (1080p nature, camera pan, 10 consecutive frames)
+
+| KI | I+P Size | I-only Size | Saving | I+P fps | I-only fps |
+|----|----------|-------------|--------|---------|------------|
+| 8 | 14.2 MB (5.49 bpp) | 13.2 MB (5.11 bpp) | **-7.4%** | 1.7 | 4.2 |
+| 4 | 13.8 MB (5.33 bpp) | 13.2 MB (5.11 bpp) | **-4.2%** | 1.9 | 4.1 |
+
+P-frames are **larger** than I-frames for camera pan content. Quality drifts from 43.47→42.80 dB over 7 P-frames (ki=8).
+
+### Analysis
+
+**P-frames work well for animation (+26% savings) but fail for camera pan (-7%).** This matches expectations:
+
+1. **BBB (animation)**: mostly static backgrounds with localized character motion. 16x16 block matching captures this efficiently. P-frames at ~4.3 bpp vs I-frames at 6.6 bpp — the temporal residual has much lower energy than the original signal.
+
+2. **blue_sky (camera pan)**: global translational motion across the entire frame. 16x16 blocks with ±16 pixel search range can find local matches, but the ME overhead (motion vectors + residual coding overhead) exceeds the savings. The residual after MC still contains the quantization noise from the local decode loop, which is harder to compress than the original smooth gradient content.
+
+**Speed impact**: P-frame encode is ~2x slower than I-frame encode due to:
+- Motion estimation (block matching across search range)
+- Motion compensation (3 planes × GPU dispatch)
+- Local decode loop (entropy decode → dequant → inv wavelet → inv MC, all 3 planes)
+- This brings I+P sequence throughput to 1.7 fps vs 3.9 fps for I-only
+
+**Quality drift**: P-frames accumulate small quality losses through the encode→decode→reference→encode chain. BBB shows only 0.3 dB drift over 7 P-frames. blue_sky shows 0.6 dB drift, amplified by the larger residual.
+
+### Test coverage (5 new tests, all passing)
+- `test_encode_sequence_all_iframes` — ki=1 produces only I-frames
+- `test_encode_sequence_ip_pattern` — ki=4 produces correct I/P/P/P pattern with MVs
+- `test_pframe_roundtrip_quality` — encode I+P → decode → PSNR > 25 dB
+- `test_pframe_identical_frames_correct_decode` — identical frames: good decode quality, near-zero MVs
+- `test_sequence_decode_all_frames` — 5-frame I/P/P/I/P sequence roundtrips correctly
+
+Total test count: 51 (all passing in release mode).
+
+### Next steps for temporal prediction
+1. **Global motion estimation** — detect and compensate global translation/rotation before block matching (would fix blue_sky)
+2. **Sub-pixel ME** — half-pel or quarter-pel refinement for better residual reduction
+3. **Larger search range** — ±32 or ±64 pixels for faster motion (blue_sky pans ~10 px/frame)
+4. **Adaptive I/P decision** — skip P-frame when residual energy exceeds I-frame estimate
+5. **P-frame encode speed** — the local decode loop is expensive; could be GPU-accelerated with GPU rANS decode in the encoder
+6. **B-frames** — bi-directional prediction for further compression gains

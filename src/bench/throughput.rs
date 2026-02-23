@@ -42,15 +42,15 @@ where
 
 /// Run encode/decode multiple times and compute average throughput.
 pub fn measure_throughput<E, D>(
-    encode_fn: E,
+    mut encode_fn: E,
     decode_fn: D,
     width: u32,
     height: u32,
     iterations: u32,
 ) -> ThroughputMetrics
 where
-    E: Fn() -> (),
-    D: Fn() -> (),
+    E: FnMut(),
+    D: Fn(),
 {
     // Warmup
     encode_fn();

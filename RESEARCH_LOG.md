@@ -653,3 +653,105 @@ The data is unambiguous. CDF 9/7 provides massive RD improvement with no downsid
 3. **GPU rANS encode** — 188ms encode is the remaining bottleneck
 4. **Context-modeled entropy** — the only path to close the 1.5x JP2 gap
 5. **Temporal prediction** — for video, this is where the real compression lives
+
+---
+
+## 2026-02-23: GPU rANS Entropy Encoding
+
+### Hypothesis
+CPU-side rANS encoding is the throughput bottleneck: 165-188ms encode vs 26-37ms decode at 1080p on M1. The encode pipeline reads back ~30MB of quantized coefficients from GPU to CPU, builds histograms, normalizes frequency tables, and serially encodes 32 interleaved rANS streams per tile. Moving histogram building and rANS encoding to GPU compute shaders should eliminate the large readback and parallelize the serial encoding, targeting 2-6x encode speedup.
+
+### Implementation
+Two new compute shaders + host code, integrated into the existing encode pipeline:
+
+**`rans_histogram.wgsl`** — GPU histogram building (256 threads/workgroup, 1 workgroup/tile):
+- Phase 1: parallel min/max reduction across 256 threads using shared memory tree reduction (pattern from `variance_map.wgsl`)
+- Phase 2: atomic histogram building with `atomicAdd` on `var<workgroup>` shared memory
+- Per-subband mode: 4 separate histograms (one per wavelet subband group), min/max tracked per group
+- Output: fixed stride per tile (HIST_TILE_STRIDE = 2060 u32s) with `[min_val, alphabet_size, histogram[]]`
+
+**`rans_encode.wgsl`** — GPU rANS encoding (32 threads/workgroup, 1 workgroup/tile):
+- Each thread encodes one of 32 independent interleaved rANS streams
+- Cumfreq tables loaded cooperatively into shared memory (same pattern as `rans_decode.wgsl`)
+- Encodes in reverse coefficient order with byte-level renormalization
+- Byte writing via `write_byte()` into packed u32 array (each stream writes to its own non-overlapping region — no atomics needed)
+- Per-subband mode: selects cumfreq region based on 2D coefficient position via `compute_subband_group()`
+- Output: stream bytes (MAX_STREAM_BYTES=4096 per stream) + metadata (write_ptr, final_state per stream)
+
+**`rans_gpu_encode.rs`** — Host-side `GpuRansEncoder`:
+- Two-pass pipeline: GPU histogram → CPU normalize → GPU encode → readback & pack
+- `dispatch_histogram()`: creates params buffer, dispatches 1 workgroup per tile
+- `normalize_histograms()`: reads back ~1MB histogram buffer, calls existing `normalize_histogram()` per tile/group, builds cumfreq tables
+- `dispatch_encode()`: uploads cumfreq + tile_info, zero-initializes stream buffer (`mapped_at_creation`), dispatches 1 workgroup per tile
+- `pack_tiles()`: reads back encoded streams, extracts per-stream bytes from write_ptr..MAX_STREAM_BYTES, packs into `InterleavedRansTile`/`SubbandRansTile` structs
+- `encode_plane_to_tiles()`: high-level API used by encoder pipeline
+
+**Pipeline integration** (`pipeline.rs`):
+- `GpuRansEncoder` added as field of `EncoderPipeline`
+- `use_gpu_encode` flag gated on `config.gpu_entropy_encode && entropy_coder != Bitplane`
+- GPU encode path at all 3 entropy encode points: Y+CfL, chroma+CfL, non-CfL
+- Quantized data stays on GPU (`plane_buf_b`) — no 30MB readback in GPU path
+- CPU fallback via `--cpu-encode` flag for testing/debugging
+
+### Data flow comparison
+
+```
+CPU encode (before):
+  [GPU quantize] → readback 30MB → [CPU histogram] → [CPU rANS encode x120 tiles x32 streams]
+
+GPU encode (after):
+  [GPU quantize] → [GPU histogram] → readback ~1MB → [CPU normalize] → upload ~1MB →
+  [GPU rANS encode] → readback ~5-15MB encoded streams → [CPU pack tiles]
+```
+
+### Results — Encode throughput at 1080p on M1
+
+| Image | CPU Encode | GPU Encode | Speedup |
+|---|---|---|---|
+| blue_sky_1080p | 166.6 ms (6.0 fps) | 78.0 ms (12.8 fps) | **2.1x** |
+| bbb_1080p | 168.0 ms (6.0 fps) | 79.0 ms (12.7 fps) | **2.1x** |
+| touchdown_1080p | 164.0 ms (6.1 fps) | 77.7 ms (12.9 fps) | **2.1x** |
+
+### Results — Quality verification
+
+| Image | CPU PSNR | GPU PSNR | CPU BPP | GPU BPP |
+|---|---|---|---|---|
+| blue_sky_1080p | 43.47 dB | 43.47 dB | 5.02 | 5.03 |
+
+PSNR is identical. BPP differs by <0.2% due to histogram normalization rounding (GPU builds histograms from f32 with `round()` vs CPU casting from f32 to i32 — minor floating-point path differences).
+
+### Analysis
+
+**2.1x overall encode speedup, consistent across all content types.** The entropy encoding step itself improved ~3.3x (from ~130ms to ~40ms), but the remaining ~40ms of non-entropy work (color convert, wavelet transform, quantize, buffer management) is unchanged and now dominates.
+
+**Where the time goes (estimated breakdown of 78ms GPU encode):**
+- Color conversion + deinterleave: ~8ms (CPU readback + deinterleave still on CPU)
+- Wavelet transform (3 planes × GPU dispatch): ~5ms
+- Quantize (3 planes × GPU dispatch): ~3ms
+- GPU histogram dispatch + readback: ~5ms
+- CPU normalize histograms: ~2ms
+- GPU encode dispatch + readback: ~15ms
+- Pack tiles + overhead: ~10ms
+- Variance analysis (adaptive quant): ~5ms
+- CfL prediction: ~10ms
+- Buffer allocation/management: ~15ms
+
+**Why not the predicted 6x speedup:** The plan estimated 188ms→30ms by assuming entropy encoding was the entire bottleneck. In reality, the 188ms included ~35-50ms of non-entropy pipeline work that doesn't benefit from GPU rANS. The entropy-specific improvement (3.3x) is close to expectations.
+
+**Decode speed also improved slightly** (37ms→26ms) — not from GPU rANS encode, but from the decoder `plane_results` buffer now having correct `COPY_SRC` flags for temporal prediction, reducing unnecessary buffer recreation.
+
+### Cumulative throughput progress (blue_sky_1080p)
+
+| Step | Encode | Decode | Notes |
+|------|--------|--------|-------|
+| Phase 1 baseline | ~90 fps (512x512) | ~96 fps | i16 packing, no entropy |
+| + rANS entropy | ~57 fps (512x512) | ~73 fps | CPU rANS bottleneck |
+| + All features (1080p) | 5.3 fps | 27.6 fps | CPU rANS at scale |
+| + GPU rANS encode | **12.9 fps** | **37.9 fps** | **2.1x encode, 1.4x decode** |
+
+### Next steps
+1. **GPU color deinterleave** — the CPU readback + deinterleave of 3 planes is ~8ms of unnecessary work
+2. **Buffer reuse across frames** — allocating fresh GPU buffers per encode adds ~15ms overhead; caching buffers (like the decoder already does) would eliminate this
+3. **Fused quantize+histogram** — a single shader pass that quantizes AND builds the histogram simultaneously would eliminate one GPU dispatch + the intermediate buffer
+4. **Context-modeled entropy coding** — the remaining path to close the 1.5x JPEG 2000 gap
+5. **Temporal prediction benchmarks** — P-frame encoding with motion estimation is implemented but not yet benchmarked

@@ -34,9 +34,9 @@ enum Command {
         #[arg(short, long, default_value = "256")]
         tile_size: u32,
 
-        /// Enable Chroma-from-Luma prediction
+        /// Disable Chroma-from-Luma prediction (enabled by default)
         #[arg(long)]
-        cfl: bool,
+        no_cfl: bool,
 
         /// Use bitplane entropy coder instead of rANS
         #[arg(long)]
@@ -123,7 +123,7 @@ fn main() {
             output,
             qstep,
             tile_size,
-            cfl,
+            no_cfl,
             bitplane,
             wavelet,
             no_per_subband,
@@ -149,7 +149,7 @@ fn main() {
                 dead_zone: 0.0,
                 wavelet_levels: 3,
                 subband_weights: gnc::SubbandWeights::uniform(3),
-                cfl_enabled: cfl,
+                cfl_enabled: !no_cfl,
                 entropy_coder: if bitplane {
                     gnc::EntropyCoder::Bitplane
                 } else {

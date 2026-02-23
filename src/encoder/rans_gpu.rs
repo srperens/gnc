@@ -7,7 +7,7 @@ use bytemuck::{Pod, Zeroable};
 use wgpu;
 use wgpu::util::DeviceExt;
 
-use super::rans::{InterleavedRansTile, STREAMS_PER_TILE};
+use super::rans::{InterleavedRansTile, SubbandRansTile, STREAMS_PER_TILE};
 use crate::{FrameInfo, GpuContext};
 
 const TILE_INFO_STRIDE: usize = 100;
@@ -20,8 +20,8 @@ struct RansDecodeParams {
     plane_width: u32,
     tile_size: u32,
     tiles_x: u32,
-    _pad0: u32,
-    _pad1: u32,
+    per_subband: u32,
+    num_levels: u32,
     _pad2: u32,
 }
 
@@ -149,8 +149,8 @@ impl GpuRansDecoder {
             plane_width: padded_w,
             tile_size,
             tiles_x,
-            _pad0: 0,
-            _pad1: 0,
+            per_subband: 0,
+            num_levels: 0,
             _pad2: 0,
         };
 
@@ -248,6 +248,140 @@ impl GpuRansDecoder {
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("rans_stream_data"),
+                contents: bytemuck::cast_slice(&stream_data_final),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+
+        (params_buf, tile_info_buf, cumfreq_buf, stream_data_buf)
+    }
+
+    /// Pack per-subband interleaved tiles into GPU buffers for a single plane.
+    ///
+    /// Tile-info layout (per tile, 100 u32s):
+    ///   [0]: num_groups
+    ///   [1 + g*3 + 0]: group g min_val (bitcast i32→u32)
+    ///   [1 + g*3 + 1]: group g alphabet_size
+    ///   [1 + g*3 + 2]: group g cumfreq_offset into cumfreq_data
+    ///   [13]: stream_data_byte_base
+    ///   [14..46]: 32 initial states
+    ///   [46..78]: 32 stream byte offsets
+    pub fn prepare_decode_buffers_subband(
+        &self,
+        ctx: &GpuContext,
+        tiles: &[SubbandRansTile],
+        info: &FrameInfo,
+    ) -> (wgpu::Buffer, wgpu::Buffer, wgpu::Buffer, wgpu::Buffer) {
+        let num_tiles = tiles.len();
+        let tile_size = info.tile_size;
+        let coefficients_per_tile = tile_size * tile_size;
+        let padded_w = info.padded_width();
+        let tiles_x = info.tiles_x();
+        let num_levels = if num_tiles > 0 {
+            tiles[0].num_levels
+        } else {
+            0
+        };
+
+        let params = RansDecodeParams {
+            num_tiles: num_tiles as u32,
+            coefficients_per_tile,
+            plane_width: padded_w,
+            tile_size,
+            tiles_x,
+            per_subband: 1,
+            num_levels,
+            _pad2: 0,
+        };
+
+        let params_buf = ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("rans_decode_params_subband"),
+                contents: bytemuck::bytes_of(&params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+
+        let mut tile_info_data = vec![0u32; num_tiles * TILE_INFO_STRIDE];
+        let mut cumfreq_all: Vec<u32> = Vec::new();
+        let mut stream_bytes_all: Vec<u8> = Vec::new();
+
+        for (t, tile) in tiles.iter().enumerate() {
+            let base = t * TILE_INFO_STRIDE;
+
+            // [0]: num_groups
+            tile_info_data[base] = tile.num_groups;
+
+            // Per-group metadata: [1+g*3]: min_val, [2+g*3]: alphabet_size, [3+g*3]: cumfreq_offset
+            for (g, group) in tile.groups.iter().enumerate() {
+                assert!(
+                    group.alphabet_size <= 2048,
+                    "Group {} alphabet size {} exceeds GPU max 2048",
+                    g,
+                    group.alphabet_size
+                );
+                let gi = base + 1 + g * 3;
+                tile_info_data[gi] = group.min_val as u32;
+                tile_info_data[gi + 1] = group.alphabet_size;
+                tile_info_data[gi + 2] = cumfreq_all.len() as u32;
+                cumfreq_all.extend_from_slice(&group.cumfreqs);
+            }
+
+            // [13]: stream_data_byte_base
+            let tile_stream_byte_base = stream_bytes_all.len() as u32;
+            tile_info_data[base + 13] = tile_stream_byte_base;
+
+            // [14..46]: 32 initial states
+            let mut stream_byte_offset = 0u32;
+            for s in 0..STREAMS_PER_TILE {
+                tile_info_data[base + 14 + s] = tile.stream_initial_state[s];
+                tile_info_data[base + 46 + s] = stream_byte_offset;
+                stream_byte_offset += tile.stream_data[s].len() as u32;
+            }
+
+            // Append all stream bytes for this tile
+            for s in 0..STREAMS_PER_TILE {
+                stream_bytes_all.extend_from_slice(&tile.stream_data[s]);
+            }
+        }
+
+        // Pad to u32 boundary and pack as u32 array
+        while !stream_bytes_all.len().is_multiple_of(4) {
+            stream_bytes_all.push(0);
+        }
+        let stream_data_u32: Vec<u32> = stream_bytes_all
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+
+        if cumfreq_all.is_empty() {
+            cumfreq_all.push(0);
+        }
+        let stream_data_final = if stream_data_u32.is_empty() {
+            vec![0u32]
+        } else {
+            stream_data_u32
+        };
+
+        let tile_info_buf = ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("rans_tile_info_subband"),
+                contents: bytemuck::cast_slice(&tile_info_data),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+
+        let cumfreq_buf = ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("rans_cumfreq_subband"),
+                contents: bytemuck::cast_slice(&cumfreq_all),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+
+        let stream_data_buf = ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("rans_stream_data_subband"),
                 contents: bytemuck::cast_slice(&stream_data_final),
                 usage: wgpu::BufferUsages::STORAGE,
             });

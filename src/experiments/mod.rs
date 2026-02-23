@@ -228,6 +228,51 @@ pub fn wavelet_experiments() -> Vec<Experiment> {
     exps
 }
 
+/// Per-subband entropy experiments: compare single-table vs per-subband rANS.
+pub fn entropy_experiments() -> Vec<Experiment> {
+    let steps = [4.0, 8.0, 16.0];
+    let levels = 3u32;
+
+    let mut exps = Vec::new();
+    for &step in &steps {
+        // Baseline: single frequency table (with ZRL)
+        exps.push(Experiment {
+            name: format!("entropy_single_q{}", step as u32),
+            description: format!("qstep={}, single freq table per tile (baseline)", step),
+            config: CodecConfig {
+                tile_size: 256,
+                quantization_step: step,
+                dead_zone: 0.0,
+                wavelet_levels: levels,
+                subband_weights: SubbandWeights::uniform(levels),
+                cfl_enabled: false,
+                per_subband_entropy: false,
+                ..Default::default()
+            },
+        });
+        // Per-subband: separate freq table per wavelet level group
+        exps.push(Experiment {
+            name: format!("entropy_subband_q{}", step as u32),
+            description: format!(
+                "qstep={}, per-subband freq tables ({} groups)",
+                step,
+                1 + levels
+            ),
+            config: CodecConfig {
+                tile_size: 256,
+                quantization_step: step,
+                dead_zone: 0.0,
+                wavelet_levels: levels,
+                subband_weights: SubbandWeights::uniform(levels),
+                cfl_enabled: false,
+                per_subband_entropy: true,
+                ..Default::default()
+            },
+        });
+    }
+    exps
+}
+
 /// Combined dead-zone + subband weight experiments.
 /// Tests whether dead-zone and perceptual weights stack for additive compression gains.
 pub fn combined_dz_subband_experiments() -> Vec<Experiment> {

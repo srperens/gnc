@@ -45,6 +45,10 @@ enum Command {
         /// Wavelet type: 53 (LeGall 5/3, default) or 97 (CDF 9/7)
         #[arg(long, default_value = "53")]
         wavelet: String,
+
+        /// Enable per-subband entropy coding (separate freq tables per wavelet level)
+        #[arg(long)]
+        per_subband: bool,
     },
 
     /// Decode a compressed file back to an image
@@ -87,7 +91,7 @@ enum Command {
         #[arg(long, default_value = "results/sweep.csv")]
         csv: String,
 
-        /// Experiment set: all, baseline, deadzone, levels, subband
+        /// Experiment set: all, baseline, deadzone, levels, subband, entropy
         #[arg(short, long, default_value = "all")]
         experiment: String,
     },
@@ -122,6 +126,7 @@ fn main() {
             cfl,
             bitplane,
             wavelet,
+            per_subband,
         } => {
             let (rgb_data, w, h) = load_image_rgb_f32(&input);
             println!("Input: {}x{} ({} pixels)", w, h, w * h);
@@ -151,6 +156,7 @@ fn main() {
                     gnc::EntropyCoder::Rans
                 },
                 wavelet_type,
+                per_subband_entropy: per_subband,
                 ..Default::default()
             };
 
@@ -316,6 +322,7 @@ fn main() {
                 "levels" => experiments::wavelet_level_experiments(),
                 "subband" => experiments::subband_weight_experiments(),
                 "combined" => experiments::combined_dz_subband_experiments(),
+                "entropy" => experiments::entropy_experiments(),
                 "cfl" => experiments::cfl_experiments(),
                 "wavelet" => experiments::wavelet_experiments(),
                 "all" => {
@@ -326,10 +333,11 @@ fn main() {
                     e.extend(experiments::combined_dz_subband_experiments());
                     e.extend(experiments::cfl_experiments());
                     e.extend(experiments::wavelet_experiments());
+                    e.extend(experiments::entropy_experiments());
                     e
                 }
                 other => {
-                    eprintln!("Unknown experiment set: {}. Use: all, baseline, deadzone, levels, subband, combined, cfl, wavelet", other);
+                    eprintln!("Unknown experiment set: {}. Use: all, baseline, deadzone, levels, subband, combined, cfl, wavelet, entropy", other);
                     std::process::exit(1);
                 }
             };
@@ -380,12 +388,12 @@ fn main() {
 }
 
 // Serialization for compressed frames.
-// GPC8 format: adds wavelet type (LeGall 5/3 or CDF 9/7).
+// GPC9 format: adds per-subband entropy coding flag.
 fn serialize_compressed(frame: &gnc::CompressedFrame) -> Vec<u8> {
     use gnc::encoder::{bitplane, rans};
     let mut out = Vec::new();
     // Header
-    out.extend_from_slice(b"GPC8"); // version 8 = wavelet type support
+    out.extend_from_slice(b"GPC9"); // version 9 = per-subband entropy
     out.extend_from_slice(&frame.info.width.to_le_bytes());
     out.extend_from_slice(&frame.info.height.to_le_bytes());
     out.extend_from_slice(&frame.info.bit_depth.to_le_bytes());
@@ -399,6 +407,13 @@ fn serialize_compressed(frame: &gnc::CompressedFrame) -> Vec<u8> {
         gnc::WaveletType::CDF97 => 1,
     };
     out.push(wavelet_byte);
+    // Per-subband entropy: 0 = off, 1 = on
+    let per_subband_byte: u8 = if frame.config.per_subband_entropy {
+        1
+    } else {
+        0
+    };
+    out.push(per_subband_byte);
     // Subband weights: ll, num_detail_levels, per-level [LH, HL, HH], chroma_weight
     let sw = &frame.config.subband_weights;
     out.extend_from_slice(&sw.ll.to_le_bytes());
@@ -438,9 +453,10 @@ fn serialize_compressed(frame: &gnc::CompressedFrame) -> Vec<u8> {
     } else {
         out.extend_from_slice(&0u32.to_le_bytes());
     }
-    // Entropy coder type: 0 = rANS, 1 = bitplane
+    // Entropy coder type: 0 = rANS, 1 = bitplane, 2 = per-subband rANS
     let entropy_type: u32 = match &frame.entropy {
         gnc::EntropyData::Rans(_) => 0,
+        gnc::EntropyData::SubbandRans(_) => 2,
         gnc::EntropyData::Bitplane(_) => 1,
     };
     out.extend_from_slice(&entropy_type.to_le_bytes());
@@ -451,6 +467,14 @@ fn serialize_compressed(frame: &gnc::CompressedFrame) -> Vec<u8> {
             out.extend_from_slice(&num_tiles.to_le_bytes());
             for tile in tiles {
                 let tile_bytes = rans::serialize_tile_interleaved(tile);
+                out.extend_from_slice(&tile_bytes);
+            }
+        }
+        gnc::EntropyData::SubbandRans(tiles) => {
+            let num_tiles = tiles.len() as u32;
+            out.extend_from_slice(&num_tiles.to_le_bytes());
+            for tile in tiles {
+                let tile_bytes = rans::serialize_tile_subband(tile);
                 out.extend_from_slice(&tile_bytes);
             }
         }
@@ -470,9 +494,10 @@ fn deserialize_compressed(data: &[u8]) -> gnc::CompressedFrame {
     use gnc::encoder::{bitplane, rans};
     assert!(data.len() >= 37, "File too small");
     let magic = &data[0..4];
+    let is_gpc9 = magic == b"GPC9";
     assert!(
-        magic == b"GPC8",
-        "Invalid magic (expected GPC8; older files must be re-encoded)"
+        magic == b"GPC8" || is_gpc9,
+        "Invalid magic (expected GPC8 or GPC9; older files must be re-encoded)"
     );
 
     let width = u32::from_le_bytes(data[4..8].try_into().unwrap());
@@ -490,10 +515,25 @@ fn deserialize_compressed(data: &[u8]) -> gnc::CompressedFrame {
         w => panic!("Unknown wavelet type: {}", w),
     };
 
+    // Per-subband entropy flag (GPC9 only)
+    let (per_subband_entropy, subband_weights_start) = if is_gpc9 {
+        (data[33] != 0, 34)
+    } else {
+        (false, 33)
+    };
+
     // Subband weights
-    let ll = f32::from_le_bytes(data[33..37].try_into().unwrap());
-    let num_detail = u32::from_le_bytes(data[37..41].try_into().unwrap()) as usize;
-    let mut pos = 41;
+    let ll = f32::from_le_bytes(
+        data[subband_weights_start..subband_weights_start + 4]
+            .try_into()
+            .unwrap(),
+    );
+    let num_detail = u32::from_le_bytes(
+        data[subband_weights_start + 4..subband_weights_start + 8]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let mut pos = subband_weights_start + 8;
     let mut detail = Vec::with_capacity(num_detail);
     for _ in 0..num_detail {
         let lh = f32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
@@ -547,14 +587,14 @@ fn deserialize_compressed(data: &[u8]) -> gnc::CompressedFrame {
         None
     };
 
-    // Entropy coder type: 0 = rANS, 1 = bitplane
+    // Entropy coder type: 0 = rANS, 1 = bitplane, 2 = per-subband rANS
     let entropy_type = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
     pos += 4;
 
     let num_tiles = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
     pos += 4;
 
-    let (entropy_coder, entropy) = match entropy_type {
+    let (entropy_coder, entropy, per_subband) = match entropy_type {
         0 => {
             let mut tiles = Vec::with_capacity(num_tiles);
             for _ in 0..num_tiles {
@@ -562,7 +602,7 @@ fn deserialize_compressed(data: &[u8]) -> gnc::CompressedFrame {
                 tiles.push(tile);
                 pos += consumed;
             }
-            (gnc::EntropyCoder::Rans, gnc::EntropyData::Rans(tiles))
+            (gnc::EntropyCoder::Rans, gnc::EntropyData::Rans(tiles), false)
         }
         1 => {
             let mut tiles = Vec::with_capacity(num_tiles);
@@ -574,6 +614,20 @@ fn deserialize_compressed(data: &[u8]) -> gnc::CompressedFrame {
             (
                 gnc::EntropyCoder::Bitplane,
                 gnc::EntropyData::Bitplane(tiles),
+                false,
+            )
+        }
+        2 => {
+            let mut tiles = Vec::with_capacity(num_tiles);
+            for _ in 0..num_tiles {
+                let (tile, consumed) = rans::deserialize_tile_subband(&data[pos..]);
+                tiles.push(tile);
+                pos += consumed;
+            }
+            (
+                gnc::EntropyCoder::Rans,
+                gnc::EntropyData::SubbandRans(tiles),
+                true,
             )
         }
         _ => panic!("Unknown entropy coder type: {}", entropy_type),
@@ -601,6 +655,7 @@ fn deserialize_compressed(data: &[u8]) -> gnc::CompressedFrame {
             wavelet_type,
             adaptive_quantization,
             aq_strength,
+            per_subband_entropy: per_subband_entropy || per_subband,
         },
         entropy,
         cfl_alphas,

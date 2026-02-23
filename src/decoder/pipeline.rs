@@ -658,6 +658,18 @@ impl DecoderPipeline {
                 }
                 PreparedEntropyBufs::Rans(rans_bufs)
             }
+            EntropyData::SubbandRans(tiles) => {
+                let mut rans_bufs = Vec::with_capacity(3);
+                for p in 0..3 {
+                    let plane_tiles = &tiles[p * tiles_per_plane..(p + 1) * tiles_per_plane];
+                    rans_bufs.push(self.rans_decoder.prepare_decode_buffers_subband(
+                        ctx,
+                        plane_tiles,
+                        info,
+                    ));
+                }
+                PreparedEntropyBufs::Rans(rans_bufs)
+            }
             EntropyData::Bitplane(tiles) => {
                 let mut bp_bufs = Vec::with_capacity(3);
                 for p in 0..3 {

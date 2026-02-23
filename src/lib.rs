@@ -161,6 +161,10 @@ pub struct CodecConfig {
     /// Strength of adaptive quantization (0.0 = off, 1.0 = full strength).
     /// Controls how aggressively bits are redistributed from smooth to textured regions.
     pub aq_strength: f32,
+    /// Enable per-subband entropy coding (separate frequency tables per wavelet level).
+    /// Each subband group (LL + one per detail level) gets its own rANS frequency table,
+    /// improving compression by modeling each distribution tightly.
+    pub per_subband_entropy: bool,
 }
 
 impl Default for CodecConfig {
@@ -176,15 +180,17 @@ impl Default for CodecConfig {
             wavelet_type: WaveletType::LeGall53,
             adaptive_quantization: false,
             aq_strength: 0.0,
+            per_subband_entropy: false,
         }
     }
 }
 
-/// Entropy-coded tile data — either rANS or bitplane coded.
+/// Entropy-coded tile data — rANS, per-subband rANS, or bitplane coded.
 /// Tiles are ordered: plane 0 tiles, plane 1 tiles, plane 2 tiles.
 #[derive(Debug, Clone)]
 pub enum EntropyData {
     Rans(Vec<encoder::rans::InterleavedRansTile>),
+    SubbandRans(Vec<encoder::rans::SubbandRansTile>),
     Bitplane(Vec<encoder::bitplane::BitplaneTile>),
 }
 
@@ -192,6 +198,7 @@ impl EntropyData {
     pub fn byte_size(&self) -> usize {
         match self {
             EntropyData::Rans(tiles) => tiles.iter().map(|t| t.byte_size()).sum(),
+            EntropyData::SubbandRans(tiles) => tiles.iter().map(|t| t.byte_size()).sum(),
             EntropyData::Bitplane(tiles) => tiles.iter().map(|t| t.byte_size()).sum(),
         }
     }

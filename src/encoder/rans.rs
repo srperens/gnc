@@ -786,6 +786,394 @@ pub fn deserialize_tile_interleaved(data: &[u8]) -> (InterleavedRansTile, usize)
     )
 }
 
+// --- Per-subband entropy coding ---
+
+/// Compute which subband group (0..num_levels) a tile-local position belongs to.
+///
+/// Group 0 = LL (DC subband).
+/// Group k (1..=num_levels) = Level (k-1) detail subbands (LH + HL + HH combined).
+///
+/// This mirrors `compute_subband_index` from cfl.rs but collapses LH/HL/HH
+/// within each level into a single group, since their statistical distributions
+/// are similar enough to share one frequency table.
+pub fn compute_subband_group(lx: u32, ly: u32, tile_size: u32, num_levels: u32) -> usize {
+    let mut region = tile_size;
+    for level in 0..num_levels {
+        let half = region / 2;
+        if lx >= half || ly >= half {
+            return (level + 1) as usize;
+        }
+        region = half;
+    }
+    0 // LL
+}
+
+/// Frequency table for one subband group within a tile.
+#[derive(Debug, Clone)]
+pub struct SubbandGroupFreqs {
+    pub min_val: i32,
+    pub alphabet_size: u32,
+    pub freqs: Vec<u32>,
+    pub cumfreqs: Vec<u32>,
+}
+
+/// A compressed tile using per-subband frequency tables + 32 interleaved rANS streams.
+///
+/// Each of the `num_groups` (= 1 + num_levels) subband groups gets its own frequency table.
+/// During encoding/decoding, the table selection for each coefficient is determined by its
+/// 2D position within the tile (which subband group it falls in).
+///
+/// ZRL is not used with per-subband coding — the per-group tables already model
+/// zero-heavy distributions tightly, making ZRL's alphabet expansion counterproductive.
+#[derive(Debug, Clone)]
+pub struct SubbandRansTile {
+    pub num_coefficients: u32,
+    pub tile_size: u32,
+    pub num_levels: u32,
+    pub num_groups: u32,
+    pub groups: Vec<SubbandGroupFreqs>,
+    pub stream_data: Vec<Vec<u8>>,
+    pub stream_initial_state: Vec<u32>,
+}
+
+impl SubbandRansTile {
+    pub fn byte_size(&self) -> usize {
+        // header: num_coefficients(4) + tile_size(4) + num_levels(4) + num_groups(4) = 16
+        // per-group: min_val(4) + alphabet_size(4) + freqs(alphabet_size * 2)
+        // streams: 32 stream_lengths(4 each) + 32 initial_states(4 each) = 256
+        // stream data: sum of all stream bytes
+        let group_overhead: usize = self
+            .groups
+            .iter()
+            .map(|g| 8 + g.alphabet_size as usize * 2)
+            .sum();
+        16 + group_overhead + 256 + self.stream_data.iter().map(|s| s.len()).sum::<usize>()
+    }
+}
+
+/// Encode a tile's quantized coefficients using per-subband frequency tables
+/// and 32 interleaved rANS streams.
+///
+/// Each subband group (LL, and one per wavelet detail level) gets its own
+/// frequency table, allowing rANS to model each distribution tightly.
+pub fn rans_encode_tile_interleaved_subband(
+    coefficients: &[i32],
+    tile_size: u32,
+    num_levels: u32,
+) -> SubbandRansTile {
+    let num_groups = 1 + num_levels as usize;
+
+    if coefficients.is_empty() {
+        return SubbandRansTile {
+            num_coefficients: 0,
+            tile_size,
+            num_levels,
+            num_groups: num_groups as u32,
+            groups: (0..num_groups)
+                .map(|_| SubbandGroupFreqs {
+                    min_val: 0,
+                    alphabet_size: 0,
+                    freqs: vec![],
+                    cumfreqs: vec![0],
+                })
+                .collect(),
+            stream_data: vec![vec![]; STREAMS_PER_TILE],
+            stream_initial_state: vec![RANS_BYTE_L; STREAMS_PER_TILE],
+        };
+    }
+
+    let ts = tile_size as usize;
+
+    // Step 1: Classify each coefficient into its subband group and build per-group histograms
+    let mut group_min = vec![i32::MAX; num_groups];
+    let mut group_max = vec![i32::MIN; num_groups];
+    let mut group_has_data = vec![false; num_groups];
+
+    for (i, &c) in coefficients.iter().enumerate() {
+        let lx = (i % ts) as u32;
+        let ly = (i / ts) as u32;
+        let g = compute_subband_group(lx, ly, tile_size, num_levels);
+        group_has_data[g] = true;
+        group_min[g] = group_min[g].min(c);
+        group_max[g] = group_max[g].max(c);
+    }
+
+    // Step 2: Build per-group frequency tables
+    let mut groups: Vec<SubbandGroupFreqs> = Vec::with_capacity(num_groups);
+    let mut group_hists: Vec<Vec<u32>> = Vec::with_capacity(num_groups);
+
+    for g in 0..num_groups {
+        if !group_has_data[g] {
+            groups.push(SubbandGroupFreqs {
+                min_val: 0,
+                alphabet_size: 1,
+                freqs: vec![RANS_M],
+                cumfreqs: vec![0, RANS_M],
+            });
+            group_hists.push(vec![RANS_M]);
+            continue;
+        }
+
+        let min_val = group_min[g];
+        let max_val = group_max[g];
+        let alphabet_size = (max_val - min_val + 1) as usize;
+
+        let mut hist = vec![0u32; alphabet_size];
+        for (i, &c) in coefficients.iter().enumerate() {
+            let lx = (i % ts) as u32;
+            let ly = (i / ts) as u32;
+            if compute_subband_group(lx, ly, tile_size, num_levels) == g {
+                hist[(c - min_val) as usize] += 1;
+            }
+        }
+
+        let freqs = normalize_histogram(&hist, RANS_M);
+
+        let mut cumfreqs = vec![0u32; alphabet_size + 1];
+        for i in 0..alphabet_size {
+            cumfreqs[i + 1] = cumfreqs[i] + freqs[i];
+        }
+        debug_assert_eq!(cumfreqs[alphabet_size], RANS_M);
+
+        group_hists.push(freqs.clone());
+        groups.push(SubbandGroupFreqs {
+            min_val,
+            alphabet_size: alphabet_size as u32,
+            freqs,
+            cumfreqs,
+        });
+    }
+
+    // Step 3: Encode 32 interleaved streams, selecting table per-symbol
+    let num_coefficients = coefficients.len();
+    let mut stream_data = Vec::with_capacity(STREAMS_PER_TILE);
+    let mut stream_initial_state = Vec::with_capacity(STREAMS_PER_TILE);
+
+    for s in 0..STREAMS_PER_TILE {
+        // Collect this stream's coefficient indices
+        let indices: Vec<usize> = (s..num_coefficients).step_by(STREAMS_PER_TILE).collect();
+
+        if indices.is_empty() {
+            stream_data.push(vec![]);
+            stream_initial_state.push(RANS_BYTE_L);
+            continue;
+        }
+
+        let buf_size = indices.len() * 2 + 64;
+        let mut buf = vec![0u8; buf_size];
+        let mut ptr = buf_size;
+        let mut state: u32 = RANS_BYTE_L;
+
+        // Encode in reverse order
+        for &idx in indices.iter().rev() {
+            let c = coefficients[idx];
+            let lx = (idx % ts) as u32;
+            let ly = (idx / ts) as u32;
+            let g = compute_subband_group(lx, ly, tile_size, num_levels);
+            let group = &groups[g];
+
+            let sym = (c - group.min_val) as usize;
+            let start = group.cumfreqs[sym];
+            let freq = group.freqs[sym];
+
+            let x_max = ((RANS_BYTE_L >> RANS_PRECISION) << 8) * freq;
+            while state >= x_max {
+                ptr -= 1;
+                buf[ptr] = (state & 0xff) as u8;
+                state >>= 8;
+            }
+
+            state = ((state / freq) << RANS_PRECISION) + (state % freq) + start;
+        }
+
+        stream_initial_state.push(state);
+        stream_data.push(buf[ptr..].to_vec());
+    }
+
+    SubbandRansTile {
+        num_coefficients: num_coefficients as u32,
+        tile_size,
+        num_levels,
+        num_groups: num_groups as u32,
+        groups,
+        stream_data,
+        stream_initial_state,
+    }
+}
+
+/// CPU reference decoder for per-subband interleaved rANS tiles.
+pub fn rans_decode_tile_interleaved_subband(tile: &SubbandRansTile) -> Vec<i32> {
+    if tile.num_coefficients == 0 {
+        return vec![];
+    }
+
+    let num_coefficients = tile.num_coefficients as usize;
+    let ts = tile.tile_size as usize;
+    let mut output = vec![0i32; num_coefficients];
+
+    // Build per-group slot-to-symbol lookup tables
+    let slot_tables: Vec<Vec<u16>> = tile
+        .groups
+        .iter()
+        .map(|g| {
+            let mut table = vec![0u16; RANS_M as usize];
+            let asize = g.alphabet_size as usize;
+            for sym in 0..asize {
+                for j in g.cumfreqs[sym]..g.cumfreqs[sym + 1] {
+                    table[j as usize] = sym as u16;
+                }
+            }
+            table
+        })
+        .collect();
+
+    for s in 0..STREAMS_PER_TILE {
+        if s >= num_coefficients {
+            break;
+        }
+        let stream_output_count = 1 + (num_coefficients - 1 - s) / STREAMS_PER_TILE;
+
+        let mut state = tile.stream_initial_state[s];
+        let buf = &tile.stream_data[s];
+        let mut ptr: usize = 0;
+        let mask = RANS_M - 1;
+
+        for i in 0..stream_output_count {
+            let coeff_idx = s + i * STREAMS_PER_TILE;
+            let lx = (coeff_idx % ts) as u32;
+            let ly = (coeff_idx / ts) as u32;
+            let g = compute_subband_group(lx, ly, tile.tile_size, tile.num_levels);
+            let group = &tile.groups[g];
+
+            let slot = state & mask;
+            let sym = slot_tables[g][slot as usize] as usize;
+
+            output[coeff_idx] = sym as i32 + group.min_val;
+
+            let start = group.cumfreqs[sym];
+            let freq = group.cumfreqs[sym + 1] - group.cumfreqs[sym];
+            state = freq * (state >> RANS_PRECISION) + (state & mask) - start;
+
+            while state < RANS_BYTE_L {
+                if ptr < buf.len() {
+                    state = (state << 8) | buf[ptr] as u32;
+                    ptr += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    output
+}
+
+/// Serialize a SubbandRansTile to bytes.
+pub fn serialize_tile_subband(tile: &SubbandRansTile) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&tile.num_coefficients.to_le_bytes());
+    out.extend_from_slice(&tile.tile_size.to_le_bytes());
+    out.extend_from_slice(&tile.num_levels.to_le_bytes());
+    out.extend_from_slice(&tile.num_groups.to_le_bytes());
+    // Per-group frequency tables
+    for g in &tile.groups {
+        out.extend_from_slice(&g.min_val.to_le_bytes());
+        out.extend_from_slice(&g.alphabet_size.to_le_bytes());
+        for &f in &g.freqs {
+            out.extend_from_slice(&(f as u16).to_le_bytes());
+        }
+    }
+    // 32 stream data lengths
+    for s in 0..STREAMS_PER_TILE {
+        let len = tile.stream_data[s].len() as u32;
+        out.extend_from_slice(&len.to_le_bytes());
+    }
+    // 32 initial states
+    for s in 0..STREAMS_PER_TILE {
+        out.extend_from_slice(&tile.stream_initial_state[s].to_le_bytes());
+    }
+    // Stream data (concatenated)
+    for s in 0..STREAMS_PER_TILE {
+        out.extend_from_slice(&tile.stream_data[s]);
+    }
+    out
+}
+
+/// Deserialize a SubbandRansTile from bytes. Returns (tile, bytes_consumed).
+pub fn deserialize_tile_subband(data: &[u8]) -> (SubbandRansTile, usize) {
+    let mut pos = 0;
+
+    let num_coefficients = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
+    pos += 4;
+    let tile_size = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
+    pos += 4;
+    let num_levels = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
+    pos += 4;
+    let num_groups = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
+    pos += 4;
+
+    let mut groups = Vec::with_capacity(num_groups as usize);
+    for _ in 0..num_groups {
+        let min_val = i32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
+        pos += 4;
+        let alphabet_size = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
+        pos += 4;
+
+        let mut freqs = Vec::with_capacity(alphabet_size as usize);
+        for _ in 0..alphabet_size {
+            let f = u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap());
+            freqs.push(f as u32);
+            pos += 2;
+        }
+
+        let mut cumfreqs = vec![0u32; alphabet_size as usize + 1];
+        for i in 0..alphabet_size as usize {
+            cumfreqs[i + 1] = cumfreqs[i] + freqs[i];
+        }
+
+        groups.push(SubbandGroupFreqs {
+            min_val,
+            alphabet_size,
+            freqs,
+            cumfreqs,
+        });
+    }
+
+    let mut stream_lengths = Vec::with_capacity(STREAMS_PER_TILE);
+    for _ in 0..STREAMS_PER_TILE {
+        let len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
+        stream_lengths.push(len);
+        pos += 4;
+    }
+
+    let mut stream_initial_state = Vec::with_capacity(STREAMS_PER_TILE);
+    for _ in 0..STREAMS_PER_TILE {
+        let state = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
+        stream_initial_state.push(state);
+        pos += 4;
+    }
+
+    let mut stream_data = Vec::with_capacity(STREAMS_PER_TILE);
+    for len in &stream_lengths {
+        let len = *len as usize;
+        stream_data.push(data[pos..pos + len].to_vec());
+        pos += len;
+    }
+
+    (
+        SubbandRansTile {
+            num_coefficients,
+            tile_size,
+            num_levels,
+            num_groups,
+            groups,
+            stream_data,
+            stream_initial_state,
+        },
+        pos,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1051,6 +1439,173 @@ mod tests {
         assert_eq!(
             rans_decode_tile_interleaved(&tile_no_zrl),
             rans_decode_tile_interleaved(&tile_zrl)
+        );
+    }
+
+    // --- Per-subband entropy coding tests ---
+
+    #[test]
+    fn test_subband_group_mapping() {
+        // 256x256 tile, 3 levels → groups: 0=LL, 1=level0, 2=level1, 3=level2
+        // (0,0) = LL = group 0
+        assert_eq!(compute_subband_group(0, 0, 256, 3), 0);
+        // (128,128) = level 0 HH = group 1
+        assert_eq!(compute_subband_group(128, 128, 256, 3), 1);
+        // (128,0) = level 0 HL = group 1
+        assert_eq!(compute_subband_group(128, 0, 256, 3), 1);
+        // (0,128) = level 0 LH = group 1
+        assert_eq!(compute_subband_group(0, 128, 256, 3), 1);
+        // (64,0) = level 1 HL = group 2
+        assert_eq!(compute_subband_group(64, 0, 256, 3), 2);
+        // (32,0) = level 2 HL = group 3
+        assert_eq!(compute_subband_group(32, 0, 256, 3), 3);
+        // (0,0) still LL with 1 level
+        assert_eq!(compute_subband_group(0, 0, 8, 1), 0);
+        // (4,0) = level 0 HL with tile_size=8, 1 level = group 1
+        assert_eq!(compute_subband_group(4, 0, 8, 1), 1);
+    }
+
+    #[test]
+    fn test_subband_roundtrip_simple() {
+        // 256x256 tile (65536 coefficients), 3 levels
+        let mut coefficients = vec![0i32; 65536];
+        // Set some LL coefficients (top-left 32x32) to larger values
+        for y in 0..32 {
+            for x in 0..32 {
+                coefficients[y * 256 + x] = ((x + y) % 20) as i32 + 5;
+            }
+        }
+        // Scatter some detail coefficients
+        for i in (8192..65536).step_by(7) {
+            coefficients[i] = (i % 11) as i32 - 5;
+        }
+
+        let tile =
+            rans_encode_tile_interleaved_subband(&coefficients, 256, 3);
+        assert_eq!(tile.num_groups, 4);
+        let decoded = rans_decode_tile_interleaved_subband(&tile);
+        assert_eq!(coefficients, decoded);
+    }
+
+    #[test]
+    fn test_subband_roundtrip_all_zeros() {
+        let coefficients = vec![0i32; 65536];
+        let tile =
+            rans_encode_tile_interleaved_subband(&coefficients, 256, 3);
+        let decoded = rans_decode_tile_interleaved_subband(&tile);
+        assert_eq!(coefficients, decoded);
+    }
+
+    #[test]
+    fn test_subband_roundtrip_varied() {
+        // Simulate realistic wavelet output: LL large, detail mostly zeros
+        let mut coefficients = vec![0i32; 65536];
+        for i in 0..65536 {
+            let y = i / 256;
+            let x = i % 256;
+            let g = compute_subband_group(x as u32, y as u32, 256, 3);
+            coefficients[i] = match g {
+                0 => ((x + y) % 40) as i32 + 10, // LL: large positive
+                1 => {
+                    // Level 0 detail: mostly zeros
+                    if i % 5 == 0 {
+                        (i % 7) as i32 - 3
+                    } else {
+                        0
+                    }
+                }
+                2 => {
+                    // Level 1 detail: moderate zeros
+                    if i % 3 == 0 {
+                        (i % 9) as i32 - 4
+                    } else {
+                        0
+                    }
+                }
+                _ => {
+                    // Level 2 detail: fewer zeros
+                    if i % 2 == 0 {
+                        (i % 5) as i32 - 2
+                    } else {
+                        0
+                    }
+                }
+            };
+        }
+
+        let tile =
+            rans_encode_tile_interleaved_subband(&coefficients, 256, 3);
+        let decoded = rans_decode_tile_interleaved_subband(&tile);
+        assert_eq!(coefficients, decoded);
+    }
+
+    #[test]
+    fn test_subband_serialize_roundtrip() {
+        let mut coefficients = vec![0i32; 65536];
+        for i in (0..65536).step_by(3) {
+            coefficients[i] = (i % 15) as i32 - 7;
+        }
+        let tile =
+            rans_encode_tile_interleaved_subband(&coefficients, 256, 3);
+        let serialized = serialize_tile_subband(&tile);
+        let (deserialized, consumed) = deserialize_tile_subband(&serialized);
+        assert_eq!(consumed, serialized.len());
+        assert_eq!(deserialized.num_groups, tile.num_groups);
+        assert_eq!(deserialized.tile_size, tile.tile_size);
+        assert_eq!(deserialized.num_levels, tile.num_levels);
+        let decoded = rans_decode_tile_interleaved_subband(&deserialized);
+        assert_eq!(
+            coefficients, decoded,
+            "serialize roundtrip failed"
+        );
+    }
+
+    #[test]
+    fn test_subband_matches_single_table() {
+        // Per-subband and single-table should produce the same decoded output
+        // (both lossless for the same integer coefficients)
+        let mut coefficients = vec![0i32; 65536];
+        for i in (0..65536).step_by(5) {
+            coefficients[i] = (i % 20) as i32 - 10;
+        }
+        let single = rans_encode_tile_interleaved(&coefficients);
+        let subband =
+            rans_encode_tile_interleaved_subband(&coefficients, 256, 3);
+        let decoded_single = rans_decode_tile_interleaved(&single);
+        let decoded_subband = rans_decode_tile_interleaved_subband(&subband);
+        assert_eq!(decoded_single, decoded_subband);
+    }
+
+    #[test]
+    fn test_subband_compression_improvement() {
+        // Per-subband should compress better than single-table for wavelet-like data
+        let mut coefficients = vec![0i32; 65536];
+        // LL: large positive narrow range
+        for y in 0..32 {
+            for x in 0..32 {
+                coefficients[y * 256 + x] = 100 + ((x + y) % 10) as i32;
+            }
+        }
+        // Detail: mostly zeros with occasional small values
+        for i in 0..65536 {
+            let y = i / 256;
+            let x = i % 256;
+            if compute_subband_group(x as u32, y as u32, 256, 3) > 0 && i % 10 == 0 {
+                coefficients[i] = (i % 5) as i32 - 2;
+            }
+        }
+
+        let single = rans_encode_tile_interleaved(&coefficients);
+        let subband =
+            rans_encode_tile_interleaved_subband(&coefficients, 256, 3);
+
+        let single_bytes = single.byte_size();
+        let subband_bytes = subband.byte_size();
+        assert!(
+            subband_bytes < single_bytes,
+            "Per-subband {} should be smaller than single-table {} for wavelet-like data",
+            subband_bytes,
+            single_bytes
         );
     }
 }

@@ -12,6 +12,13 @@ use crate::{
     CflAlphas, CodecConfig, CompressedFrame, EntropyCoder, EntropyData, FrameInfo, GpuContext,
 };
 
+/// Which entropy path to use (resolved from CodecConfig).
+enum EntropyMode {
+    Rans,
+    SubbandRans,
+    Bitplane,
+}
+
 /// Full encoding pipeline: Color -> (Variance Analysis) -> Wavelet -> Quantize -> rANS Entropy
 pub struct EncoderPipeline {
     color: ColorConverter,
@@ -178,8 +185,15 @@ impl EncoderPipeline {
         // Step 2 & 3: Wavelet transform + quantize per plane on GPU,
         // then entropy encode per tile on CPU
         let mut rans_tiles: Vec<rans::InterleavedRansTile> = Vec::new();
+        let mut subband_tiles: Vec<rans::SubbandRansTile> = Vec::new();
         let mut bp_tiles: Vec<bitplane::BitplaneTile> = Vec::new();
-        let use_bitplane = config.entropy_coder == EntropyCoder::Bitplane;
+        let entropy_mode = if config.entropy_coder == EntropyCoder::Bitplane {
+            EntropyMode::Bitplane
+        } else if config.per_subband_entropy {
+            EntropyMode::SubbandRans
+        } else {
+            EntropyMode::Rans
+        };
         let tile_size = config.tile_size as usize;
         let tiles_x = info.tiles_x() as usize;
         let tiles_y = info.tiles_y() as usize;
@@ -265,9 +279,11 @@ impl EncoderPipeline {
                     tiles_x,
                     tiles_y,
                     tile_size,
-                    use_bitplane,
+                    &entropy_mode,
                     config.tile_size,
+                    config.wavelet_levels,
                     &mut rans_tiles,
+                    &mut subband_tiles,
                     &mut bp_tiles,
                 );
             } else if use_cfl {
@@ -339,9 +355,11 @@ impl EncoderPipeline {
                     tiles_x,
                     tiles_y,
                     tile_size,
-                    use_bitplane,
+                    &entropy_mode,
                     config.tile_size,
+                    config.wavelet_levels,
                     &mut rans_tiles,
+                    &mut subband_tiles,
                     &mut bp_tiles,
                 );
 
@@ -383,9 +401,11 @@ impl EncoderPipeline {
                     tiles_x,
                     tiles_y,
                     tile_size,
-                    use_bitplane,
+                    &entropy_mode,
                     config.tile_size,
+                    config.wavelet_levels,
                     &mut rans_tiles,
+                    &mut subband_tiles,
                     &mut bp_tiles,
                 );
             }
@@ -400,10 +420,10 @@ impl EncoderPipeline {
             None
         };
 
-        let entropy = if use_bitplane {
-            EntropyData::Bitplane(bp_tiles)
-        } else {
-            EntropyData::Rans(rans_tiles)
+        let entropy = match entropy_mode {
+            EntropyMode::Bitplane => EntropyData::Bitplane(bp_tiles),
+            EntropyMode::SubbandRans => EntropyData::SubbandRans(subband_tiles),
+            EntropyMode::Rans => EntropyData::Rans(rans_tiles),
         };
 
         CompressedFrame {
@@ -417,24 +437,37 @@ impl EncoderPipeline {
 }
 
 /// Entropy-encode all tiles from a quantized plane.
+#[allow(clippy::too_many_arguments)]
 fn entropy_encode_tiles(
     quantized: &[f32],
     plane_width: usize,
     tiles_x: usize,
     tiles_y: usize,
     tile_size: usize,
-    use_bitplane: bool,
+    mode: &EntropyMode,
     tile_size_u32: u32,
+    num_levels: u32,
     rans_tiles: &mut Vec<rans::InterleavedRansTile>,
+    subband_tiles: &mut Vec<rans::SubbandRansTile>,
     bp_tiles: &mut Vec<bitplane::BitplaneTile>,
 ) {
     for ty in 0..tiles_y {
         for tx in 0..tiles_x {
             let coeffs = extract_tile_coefficients(quantized, plane_width, tx, ty, tile_size);
-            if use_bitplane {
-                bp_tiles.push(bitplane::bitplane_encode_tile(&coeffs, tile_size_u32));
-            } else {
-                rans_tiles.push(rans::rans_encode_tile_interleaved_zrl(&coeffs));
+            match mode {
+                EntropyMode::Bitplane => {
+                    bp_tiles.push(bitplane::bitplane_encode_tile(&coeffs, tile_size_u32));
+                }
+                EntropyMode::SubbandRans => {
+                    subband_tiles.push(rans::rans_encode_tile_interleaved_subband(
+                        &coeffs,
+                        tile_size_u32,
+                        num_levels,
+                    ));
+                }
+                EntropyMode::Rans => {
+                    rans_tiles.push(rans::rans_encode_tile_interleaved_zrl(&coeffs));
+                }
             }
         }
     }

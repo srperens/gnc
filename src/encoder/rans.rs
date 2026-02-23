@@ -206,9 +206,7 @@ fn normalize_histogram(hist: &[u32], target_sum: u32) -> Vec<u32> {
 
     // Adjust to hit exact target_sum
     // Find the entries we can adjust (prefer adjusting the most frequent)
-    let mut adjustable: Vec<usize> = (0..hist.len())
-        .filter(|&i| hist[i] > 0)
-        .collect();
+    let mut adjustable: Vec<usize> = (0..hist.len()).filter(|&i| hist[i] > 0).collect();
     adjustable.sort_by(|&a, &b| hist[b].cmp(&hist[a]));
 
     if assigned < target_sum {
@@ -925,7 +923,11 @@ mod tests {
         assert_eq!(coefficients, decoded);
         // All zeros should compress very well even with 32 stream overhead
         let total_stream_bytes: usize = tile.stream_data.iter().map(|s| s.len()).sum();
-        assert!(total_stream_bytes < 200, "Stream data {} should be small for all-zero input", total_stream_bytes);
+        assert!(
+            total_stream_bytes < 200,
+            "Stream data {} should be small for all-zero input",
+            total_stream_bytes
+        );
     }
 
     // --- Zero-run-length coding tests ---

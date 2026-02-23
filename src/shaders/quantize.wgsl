@@ -1,7 +1,12 @@
-// Subband-aware scalar quantization / dequantization.
-// Each thread processes one coefficient. The effective step size is
-// base_step * subband_weight, determined from the coefficient's 2D position
-// within its tile and the wavelet decomposition layout.
+// Subband-aware scalar quantization / dequantization with optional
+// spatial adaptive weighting.
+//
+// Each thread processes one coefficient. The effective step size is:
+//   base_step * subband_weight * spatial_weight
+//
+// The subband_weight comes from the wavelet decomposition level/orientation.
+// The spatial_weight comes from a per-block variance-derived weight map
+// (when adaptive quantization is enabled; otherwise spatial_weight = 1.0).
 
 struct Params {
     total_count: u32,
@@ -20,11 +25,21 @@ struct Params {
     weights1: vec4<f32>,
     weights2: vec4<f32>,
     weights3: vec4<f32>,
+    // Adaptive quantization params
+    // 0 = disabled, 1 = enabled
+    aq_enabled: u32,
+    // Block size for the spatial weight map (e.g. 32)
+    aq_block_size: u32,
+    // Number of weight-map blocks in x direction
+    aq_blocks_x: u32,
+    _pad: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var<storage, read> input: array<f32>;
 @group(0) @binding(2) var<storage, read_write> output: array<f32>;
+// Spatial weight map: one f32 per block. Only read when aq_enabled == 1.
+@group(0) @binding(3) var<storage, read> weight_map: array<f32>;
 
 // Look up a packed weight by flat index (0..15).
 fn get_weight(index: u32) -> f32 {
@@ -43,11 +58,11 @@ fn get_weight(index: u32) -> f32 {
 // Determine the flat weight index for a coefficient at tile-local position (lx, ly).
 // Walks from the outermost decomposition level inward:
 //   Level 0 (outermost): region = tile_size, half = tile_size/2
-//     Top-right quadrant → HL (index 1+0*3+1=2)
-//     Bottom-left quadrant → LH (index 1+0*3+0=1)
-//     Bottom-right quadrant → HH (index 1+0*3+2=3)
+//     Top-right quadrant -> HL (index 1+0*3+1=2)
+//     Bottom-left quadrant -> LH (index 1+0*3+0=1)
+//     Bottom-right quadrant -> HH (index 1+0*3+2=3)
 //   Coefficients in the top-left (LL) quadrant continue to the next level.
-//   If all levels exhausted → LL (index 0).
+//   If all levels exhausted -> LL (index 0).
 fn compute_subband_index(lx: u32, ly: u32) -> u32 {
     var region = params.tile_size;
     for (var level = 0u; level < params.num_levels; level = level + 1u) {
@@ -68,6 +83,18 @@ fn compute_subband_index(lx: u32, ly: u32) -> u32 {
     return 0u; // LL
 }
 
+// Look up the spatial weight for a given pixel position.
+// Returns 1.0 when adaptive quantization is disabled.
+fn get_spatial_weight(x: u32, y: u32) -> f32 {
+    if params.aq_enabled == 0u {
+        return 1.0;
+    }
+    let bx = x / params.aq_block_size;
+    let by = y / params.aq_block_size;
+    let block_idx = by * params.aq_blocks_x + bx;
+    return weight_map[block_idx];
+}
+
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
@@ -81,13 +108,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let lx = x % params.tile_size;
     let ly = y % params.tile_size;
 
-    let weight = get_weight(compute_subband_index(lx, ly));
-    let effective_step = params.step_size * weight;
+    let subband_weight = get_weight(compute_subband_index(lx, ly));
+    let spatial_weight = get_spatial_weight(x, y);
+    let effective_step = params.step_size * subband_weight * spatial_weight;
 
     let val = input[idx];
 
     if params.direction == 0u {
-        // Forward: quantize with per-subband step
+        // Forward: quantize with per-subband + spatial step
         let abs_val = abs(val);
         let sign_val = sign(val);
         let threshold = params.dead_zone * effective_step;
@@ -98,7 +126,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             output[idx] = sign_val * floor(abs_val / effective_step + 0.5);
         }
     } else {
-        // Inverse: dequantize with per-subband step
+        // Inverse: dequantize with per-subband + spatial step
         output[idx] = val * effective_step;
     }
 }

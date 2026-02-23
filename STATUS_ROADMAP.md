@@ -16,26 +16,58 @@ sequential work.
 
 ---
 
-## Current State
+## Current State (2026-02-23)
 
 ### What works
-- End-to-end encode pipeline runs on GPU
-- LeGall 5/3 integer wavelet transform (lossless-capable)
-- Uniform scalar quantization with configurable QStep
-- Per-tile rANS entropy coding (32 interleaved streams per tile)
-- CLI: encode, decode, benchmark, sweep commands
+- End-to-end encode/decode pipeline on GPU
+- LeGall 5/3 integer wavelet transform (lossless-capable, 1-4 levels)
+- Per-subband weighted quantization (uniform, perceptual, custom presets)
+- Dead-zone quantization (configurable threshold)
+- Per-tile rANS entropy coding (32 interleaved streams per tile, ZRL)
+- Chroma-from-Luma (CfL) prediction (per-tile per-subband alpha)
+- Adaptive quantization infrastructure (weight maps, SSIM-guided — in progress)
+- GPU rANS decoder (CPU encoder, GPU decoder)
+- Pipelined decode path (overlap GPU/CPU for throughput)
+- CLI: encode (`--cfl`), decode, benchmark, sweep (7 experiment sets)
+- GPC6 bitstream format (backward-compatible evolution from GPC4/5)
 
-### Compression performance (baseline)
-| QStep | PSNR   | BPP   |
-|-------|--------|-------|
-| 4     | 46.2 dB | 2.70 |
-| 8     | 40.4 dB | 2.32 |
-| 16    | 34.5 dB | 1.93 |
+### Compression performance (blue_sky 1920x1080)
 
-At QStep 8, GNC is roughly comparable to JPEG (1992). JPEG 2000 and H.264
-intra-only are meaningfully better (~1.5–1.8 bpp at similar PSNR). This gap
-is expected for an early-stage research codec without tuned quantization or
-contextual entropy.
+**Baseline (uniform quantization, no dead zone):**
+
+| QStep | PSNR    | BPP  |
+|-------|---------|------|
+| 4     | 43.47 dB | 5.44 |
+| 8     | 38.19 dB | 3.32 |
+| 16    | 32.68 dB | 1.97 |
+
+**With CfL enabled (1.7-3.9% bitrate reduction, quality-neutral):**
+
+| QStep | PSNR    | BPP  | Savings |
+|-------|---------|------|---------|
+| 4     | 43.46 dB | 5.35 | -1.7%   |
+| 8     | 38.31 dB | 3.24 | -2.5%   |
+| 16    | 32.87 dB | 1.89 | -3.9%   |
+
+**Best combined settings (perceptual weights + dead zone 0.75):**
+
+| QStep | PSNR    | BPP  | vs baseline |
+|-------|---------|------|-------------|
+| 8     | 34.18 dB | 1.66 | -50%        |
+| 16    | 29.21 dB | 0.87 | -56%        |
+
+From initial i16 packing (48 bpp) to current best (1.66 bpp at q=8): **29x
+total compression**. The pipeline improvements stack: rANS (7.4x), wavelet
+(2.2x), dead zone + subband weights (1.8x combined).
+
+### Throughput (blue_sky 1920x1080, Apple M1)
+- Encode: 188 ms (5.3 fps) — bottleneck is CPU-side rANS
+- Decode: 36 ms sequential (27.6 fps), 34 ms pipelined (29.3 fps)
+
+### What was tried and rejected
+- **Zero-run-length coding**: rANS already handles zeros efficiently. ZRL
+  added 0-1.4% savings — not worth the complexity. Code remains but is a
+  negative result.
 
 ### Hardware compatibility
 - Requires `max_storage_buffers_per_shader_stage >= 4`
@@ -88,40 +120,51 @@ is selected. This could even be adaptive per-tile based on local content.
 
 ## What To Do Next
 
-### 1. Fix the decode hardware limit (immediate)
-The decoder's rANS shader uses 4 storage buffers but some hardware only allows
-2 per shader stage. Split into two bind groups or restructure to use fewer
-buffers simultaneously.
+### 1. Per-subband entropy coding (high ROI, moderate effort)
+The rANS coder uses one frequency table per tile across all subbands. LL
+coefficients have very different distributions from HH detail. Splitting
+statistics by subband within each tile would improve compression 10-20%
+with minimal complexity — the subband index computation already exists.
+Still fully parallel, no cross-tile dependencies.
 
-### 2. Switch to CDF 9/7 for lossy mode
+### 2. GPU rANS encode (throughput bottleneck)
+CPU-side rANS encoding is the 3.6x throughput bottleneck (188ms encode vs
+36ms decode). Moving rANS encode to GPU compute shaders could push encode
+to 30-50 fps at 1080p. The GPU rANS decoder already exists as reference.
+
+### 3. CDF 9/7 for lossy mode
 LeGall 5/3 is optimal for lossless but suboptimal for lossy. CDF 9/7 (the
 JPEG 2000 lossy wavelet) gives significantly better energy compaction and would
-close much of the gap to JPEG 2000. This is the single highest-leverage
-compression improvement.
+close much of the gap to JPEG 2000. Requires keeping both 5/3 (lossless) and
+9/7 (lossy) paths — straightforward with tile-independent architecture.
 
-### 3. Adaptive quantization per tile
-Compute local variance in a GPU pass before quantization. Scale QStep per tile
-based on content complexity. The receiver can replicate the same calculation —
-no extra signaling needed. Large perceptual quality improvement for free.
+### 4. Rate control (target bitrate)
+Currently you pick qstep and get whatever bpp falls out. Real-time use cases
+need target-bpp encoding. A per-tile qstep adjustment pass (encode, measure,
+adjust) is GPU-friendly and essential for any streaming application.
 
-### 4. Contextual entropy coding
-Currently entropy coding uses flat probability estimates. Modeling symbol
-probabilities based on wavelet subband position (low-freq vs high-freq) would
-meaningfully improve compression. Still fully parallel — context is computed
-per-tile.
+### 5. Finish adaptive quantization
+Infrastructure is in place (weight maps, aq_strength, SSIM-guided pipeline).
+Needs tuning and validation. Expected gain: redistribute bits from smooth
+regions to textured regions for better perceptual quality at same bitrate.
 
-### 5. Temporal extension (video)
+### 6. Temporal extension (video)
 The biggest compression opportunity. Two GPU-native approaches worth exploring:
-- **3D wavelet in time**: apply LeGall 5/3 across N frames in the time
-  dimension. No explicit motion estimation. Fully parallel per tile group.
 - **GPU block matching**: find best matching tile in previous frame via compute
   shader, encode residuals only. Massively parallel, patent-free.
+- **3D wavelet in time**: apply LeGall 5/3 across N frames in the time
+  dimension. Simpler but less effective without motion compensation.
 
-### 6. Benchmark honestly against JPEG and JPEG 2000
+### 7. Tile index table for random access
+Tiles are independent but the bitstream is sequential. Adding a tile offset
+table in the header enables O(1) random access — critical for region-of-interest
+decode in VR/AR and partial frame updates.
+
+### 8. Benchmark against JPEG and JPEG 2000
 Use standard test images (Kodak dataset, Xiph frames). Measure PSNR, SSIM,
 encode time, decode time. Establish a real baseline to track progress against.
 
-### 7. WebAssembly / WebGPU build
+### 9. WebAssembly / WebGPU build
 wgpu supports WASM targets. A browser-runnable demo would be the easiest way
 to demonstrate GNC across platforms including mobile, without native app
 packaging.

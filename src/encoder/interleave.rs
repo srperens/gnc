@@ -26,9 +26,7 @@ impl PlaneInterleaver {
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("interleave"),
-                source: wgpu::ShaderSource::Wgsl(
-                    include_str!("../shaders/interleave.wgsl").into(),
-                ),
+                source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/interleave.wgsl").into()),
             });
 
         let bind_group_layout =
@@ -89,24 +87,24 @@ impl PlaneInterleaver {
                     ],
                 });
 
-        let pipeline_layout =
-            ctx.device
-                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("interleave_pl"),
-                    bind_group_layouts: &[&bind_group_layout],
-                    push_constant_ranges: &[],
-                });
+        let pipeline_layout = ctx
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("interleave_pl"),
+                bind_group_layouts: &[&bind_group_layout],
+                push_constant_ranges: &[],
+            });
 
-        let pipeline =
-            ctx.device
-                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some("interleave_pipeline"),
-                    layout: Some(&pipeline_layout),
-                    module: &shader,
-                    entry_point: Some("main"),
-                    compilation_options: Default::default(),
-                    cache: None,
-                });
+        let pipeline = ctx
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("interleave_pipeline"),
+                layout: Some(&pipeline_layout),
+                module: &shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
 
         Self {
             pipeline,

@@ -19,11 +19,19 @@ struct QuantizeParams {
     weights1: [f32; 4],
     weights2: [f32; 4],
     weights3: [f32; 4],
+    // Adaptive quantization parameters
+    aq_enabled: u32,
+    aq_block_size: u32,
+    aq_blocks_x: u32,
+    _pad: u32,
 }
 
 pub struct Quantizer {
     pipeline: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
+    /// Dummy 1-element buffer used when adaptive quantization is disabled.
+    /// Avoids needing separate pipelines for adaptive vs non-adaptive.
+    dummy_weight_buf: wgpu::Buffer,
 }
 
 impl Quantizer {
@@ -70,6 +78,16 @@ impl Quantizer {
                             },
                             count: None,
                         },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 3,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
                     ],
                 });
 
@@ -92,12 +110,23 @@ impl Quantizer {
                 cache: None,
             });
 
+        // Dummy weight map buffer (single 1.0) for when AQ is disabled
+        let dummy_weight_buf = ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("dummy_weight_map"),
+                contents: bytemuck::bytes_of(&1.0f32),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+
         Self {
             pipeline,
             bind_group_layout,
+            dummy_weight_buf,
         }
     }
 
+    /// Dispatch quantization/dequantization without adaptive spatial weighting.
     #[allow(clippy::too_many_arguments)]
     pub fn dispatch(
         &self,
@@ -115,6 +144,50 @@ impl Quantizer {
         num_levels: u32,
         weights: &[f32; 16],
     ) {
+        self.dispatch_adaptive(
+            ctx,
+            encoder,
+            input_buf,
+            output_buf,
+            total_count,
+            step_size,
+            dead_zone,
+            forward,
+            width,
+            height,
+            tile_size,
+            num_levels,
+            weights,
+            None,
+        );
+    }
+
+    /// Dispatch quantization/dequantization with optional adaptive spatial weighting.
+    ///
+    /// `weight_map`: if Some, provides (buffer, aq_block_size, aq_blocks_x).
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_adaptive(
+        &self,
+        ctx: &GpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+        input_buf: &wgpu::Buffer,
+        output_buf: &wgpu::Buffer,
+        total_count: u32,
+        step_size: f32,
+        dead_zone: f32,
+        forward: bool,
+        width: u32,
+        height: u32,
+        tile_size: u32,
+        num_levels: u32,
+        weights: &[f32; 16],
+        weight_map: Option<(&wgpu::Buffer, u32, u32)>,
+    ) {
+        let (aq_enabled, aq_block_size, aq_blocks_x, wm_buf) = match weight_map {
+            Some((buf, block_size, blocks_x)) => (1u32, block_size, blocks_x, buf),
+            None => (0u32, 32, 1, &self.dummy_weight_buf),
+        };
+
         let params = QuantizeParams {
             total_count,
             step_size,
@@ -128,6 +201,10 @@ impl Quantizer {
             weights1: [weights[4], weights[5], weights[6], weights[7]],
             weights2: [weights[8], weights[9], weights[10], weights[11]],
             weights3: [weights[12], weights[13], weights[14], weights[15]],
+            aq_enabled,
+            aq_block_size,
+            aq_blocks_x,
+            _pad: 0,
         };
 
         let params_buf = ctx
@@ -153,6 +230,10 @@ impl Quantizer {
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: output_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wm_buf.as_entire_binding(),
                 },
             ],
         });

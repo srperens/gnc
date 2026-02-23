@@ -1,3 +1,5 @@
+pub mod adaptive;
+pub mod bitplane;
 pub mod cfl;
 pub mod color;
 pub mod entropy;

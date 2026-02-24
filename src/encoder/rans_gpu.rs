@@ -138,7 +138,7 @@ impl GpuRansDecoder {
     }
 
     /// Pack interleaved rANS tile data into CPU arrays for one plane.
-    pub fn pack_decode_data(tiles: &[InterleavedRansTile], info: &FrameInfo) -> PackedRansPlane {
+    pub(crate) fn pack_decode_data(tiles: &[InterleavedRansTile], info: &FrameInfo) -> PackedRansPlane {
         let num_tiles = tiles.len();
         let tile_size = info.tile_size;
         let coefficients_per_tile = tile_size * tile_size;
@@ -272,7 +272,7 @@ impl GpuRansDecoder {
     }
 
     /// Pack per-subband interleaved rANS tile data into CPU arrays for one plane.
-    pub fn pack_decode_data_subband(
+    pub(crate) fn pack_decode_data_subband(
         tiles: &[SubbandRansTile],
         info: &FrameInfo,
     ) -> PackedRansPlane {

@@ -706,7 +706,7 @@ impl DecoderPipeline {
         let plane_size = (padded_pixels * std::mem::size_of::<f32>()) as u64;
         let w = info.width;
         let h = info.height;
-        let output_pixels = (w * h) as u32;
+        let output_pixels = w * h;
 
         let mut cmd = ctx
             .device
@@ -759,7 +759,7 @@ impl DecoderPipeline {
                 &weights_chroma
             };
             let wm_param = if frame.weight_map.is_some() {
-                let blocks_x = (padded_w + AQ_BLOCK_SIZE - 1) / AQ_BLOCK_SIZE;
+                let blocks_x = padded_w.div_ceil(AQ_BLOCK_SIZE);
                 Some((&bufs.weight_map_buf, AQ_BLOCK_SIZE, blocks_x))
             } else {
                 None
@@ -947,7 +947,7 @@ impl DecoderPipeline {
         let info = &frame.info;
         let w = info.width;
         let h = info.height;
-        let output_pixels = (w * h) as u32;
+        let output_pixels = w * h;
         let output_size = (output_pixels as u64) * 3 * 4;
 
         self.ensure_cached(ctx, info.padded_width(), info.padded_height(), w, h, info.tile_size);
@@ -1013,7 +1013,7 @@ impl DecoderPipeline {
         let info = &frame.info;
         let w = info.width;
         let h = info.height;
-        let total_f32s = (w * h * 3) as u32;
+        let total_f32s = w * h * 3;
         let packed_u32s = total_f32s.div_ceil(4);
         let packed_byte_size = (packed_u32s as u64) * 4;
 
@@ -1116,7 +1116,7 @@ impl DecoderPipeline {
         let info = &frame.info;
         let w = info.width;
         let h = info.height;
-        let total_f32s = (w * h * 3) as u32;
+        let total_f32s = w * h * 3;
         let packed_u32s = total_f32s.div_ceil(4);
         let packed_byte_size = (packed_u32s as u64) * 4;
 

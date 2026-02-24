@@ -431,7 +431,10 @@ impl GpuBitplaneDecoder {
     }
 
     /// Pack bitplane tile data into CPU arrays for one plane.
-    pub(crate) fn pack_decode_data(tiles: &[BitplaneTile], info: &FrameInfo) -> PackedBitplanePlane {
+    pub(crate) fn pack_decode_data(
+        tiles: &[BitplaneTile],
+        info: &FrameInfo,
+    ) -> PackedBitplanePlane {
         let num_tiles = tiles.len();
         let tile_size = info.tile_size;
         let coefficients_per_tile = tile_size * tile_size;

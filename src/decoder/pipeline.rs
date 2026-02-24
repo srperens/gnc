@@ -369,18 +369,15 @@ impl DecoderPipeline {
         });
 
         // --- Pre-allocated entropy decode buffers ---
-        let tiles_per_plane =
-            ((padded_w / tile_size) * (padded_h / tile_size)) as usize;
+        let tiles_per_plane = ((padded_w / tile_size) * (padded_h / tile_size)) as usize;
         // rANS TILE_INFO_STRIDE (100) > bitplane (8), so use rANS stride for max
         let tile_info_size =
             (tiles_per_plane * crate::encoder::rans_gpu::TILE_INFO_STRIDE * 4).max(4) as u64;
         let var_a_init_cap = (tiles_per_plane * 2048 * 4).max(4) as u64;
         let var_b_init_cap = plane_size.max(4);
 
-        let storage_dst =
-            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
-        let uniform_dst =
-            wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST;
+        let storage_dst = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
+        let uniform_dst = wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST;
 
         let entropy_params: [wgpu::Buffer; 3] = std::array::from_fn(|p| {
             ctx.device.create_buffer(&wgpu::BufferDescriptor {
@@ -555,8 +552,7 @@ impl DecoderPipeline {
         let info = &frame.info;
         let tiles_per_plane = info.tiles_x() as usize * info.tiles_y() as usize;
 
-        let storage_dst =
-            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
+        let storage_dst = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
 
         // --- Entropy data ---
         match &frame.entropy {
@@ -568,18 +564,42 @@ impl DecoderPipeline {
                     let b_size = (packed.stream_data.len() * 4) as u64;
 
                     Self::ensure_var_buf(
-                        ctx, &mut bufs.entropy_var_a[p], &mut bufs.entropy_var_a_cap[p],
-                        a_size, "dec_entropy_var_a", storage_dst,
+                        ctx,
+                        &mut bufs.entropy_var_a[p],
+                        &mut bufs.entropy_var_a_cap[p],
+                        a_size,
+                        "dec_entropy_var_a",
+                        storage_dst,
                     );
                     Self::ensure_var_buf(
-                        ctx, &mut bufs.entropy_var_b[p], &mut bufs.entropy_var_b_cap[p],
-                        b_size, "dec_entropy_var_b", storage_dst,
+                        ctx,
+                        &mut bufs.entropy_var_b[p],
+                        &mut bufs.entropy_var_b_cap[p],
+                        b_size,
+                        "dec_entropy_var_b",
+                        storage_dst,
                     );
 
-                    ctx.queue.write_buffer(&bufs.entropy_params[p], 0, bytemuck::bytes_of(&packed.params));
-                    ctx.queue.write_buffer(&bufs.entropy_tile_info[p], 0, bytemuck::cast_slice(&packed.tile_info));
-                    ctx.queue.write_buffer(&bufs.entropy_var_a[p], 0, bytemuck::cast_slice(&packed.cumfreq));
-                    ctx.queue.write_buffer(&bufs.entropy_var_b[p], 0, bytemuck::cast_slice(&packed.stream_data));
+                    ctx.queue.write_buffer(
+                        &bufs.entropy_params[p],
+                        0,
+                        bytemuck::bytes_of(&packed.params),
+                    );
+                    ctx.queue.write_buffer(
+                        &bufs.entropy_tile_info[p],
+                        0,
+                        bytemuck::cast_slice(&packed.tile_info),
+                    );
+                    ctx.queue.write_buffer(
+                        &bufs.entropy_var_a[p],
+                        0,
+                        bytemuck::cast_slice(&packed.cumfreq),
+                    );
+                    ctx.queue.write_buffer(
+                        &bufs.entropy_var_b[p],
+                        0,
+                        bytemuck::cast_slice(&packed.stream_data),
+                    );
                 }
             }
             EntropyData::SubbandRans(tiles) => {
@@ -590,18 +610,42 @@ impl DecoderPipeline {
                     let b_size = (packed.stream_data.len() * 4) as u64;
 
                     Self::ensure_var_buf(
-                        ctx, &mut bufs.entropy_var_a[p], &mut bufs.entropy_var_a_cap[p],
-                        a_size, "dec_entropy_var_a", storage_dst,
+                        ctx,
+                        &mut bufs.entropy_var_a[p],
+                        &mut bufs.entropy_var_a_cap[p],
+                        a_size,
+                        "dec_entropy_var_a",
+                        storage_dst,
                     );
                     Self::ensure_var_buf(
-                        ctx, &mut bufs.entropy_var_b[p], &mut bufs.entropy_var_b_cap[p],
-                        b_size, "dec_entropy_var_b", storage_dst,
+                        ctx,
+                        &mut bufs.entropy_var_b[p],
+                        &mut bufs.entropy_var_b_cap[p],
+                        b_size,
+                        "dec_entropy_var_b",
+                        storage_dst,
                     );
 
-                    ctx.queue.write_buffer(&bufs.entropy_params[p], 0, bytemuck::bytes_of(&packed.params));
-                    ctx.queue.write_buffer(&bufs.entropy_tile_info[p], 0, bytemuck::cast_slice(&packed.tile_info));
-                    ctx.queue.write_buffer(&bufs.entropy_var_a[p], 0, bytemuck::cast_slice(&packed.cumfreq));
-                    ctx.queue.write_buffer(&bufs.entropy_var_b[p], 0, bytemuck::cast_slice(&packed.stream_data));
+                    ctx.queue.write_buffer(
+                        &bufs.entropy_params[p],
+                        0,
+                        bytemuck::bytes_of(&packed.params),
+                    );
+                    ctx.queue.write_buffer(
+                        &bufs.entropy_tile_info[p],
+                        0,
+                        bytemuck::cast_slice(&packed.tile_info),
+                    );
+                    ctx.queue.write_buffer(
+                        &bufs.entropy_var_a[p],
+                        0,
+                        bytemuck::cast_slice(&packed.cumfreq),
+                    );
+                    ctx.queue.write_buffer(
+                        &bufs.entropy_var_b[p],
+                        0,
+                        bytemuck::cast_slice(&packed.stream_data),
+                    );
                 }
             }
             EntropyData::Bitplane(tiles) => {
@@ -612,18 +656,42 @@ impl DecoderPipeline {
                     let b_size = (packed.bitplane_data.len() * 4) as u64;
 
                     Self::ensure_var_buf(
-                        ctx, &mut bufs.entropy_var_a[p], &mut bufs.entropy_var_a_cap[p],
-                        a_size, "dec_entropy_var_a", storage_dst,
+                        ctx,
+                        &mut bufs.entropy_var_a[p],
+                        &mut bufs.entropy_var_a_cap[p],
+                        a_size,
+                        "dec_entropy_var_a",
+                        storage_dst,
                     );
                     Self::ensure_var_buf(
-                        ctx, &mut bufs.entropy_var_b[p], &mut bufs.entropy_var_b_cap[p],
-                        b_size, "dec_entropy_var_b", storage_dst,
+                        ctx,
+                        &mut bufs.entropy_var_b[p],
+                        &mut bufs.entropy_var_b_cap[p],
+                        b_size,
+                        "dec_entropy_var_b",
+                        storage_dst,
                     );
 
-                    ctx.queue.write_buffer(&bufs.entropy_params[p], 0, bytemuck::bytes_of(&packed.params));
-                    ctx.queue.write_buffer(&bufs.entropy_tile_info[p], 0, bytemuck::cast_slice(&packed.tile_info));
-                    ctx.queue.write_buffer(&bufs.entropy_var_a[p], 0, bytemuck::cast_slice(&packed.block_info));
-                    ctx.queue.write_buffer(&bufs.entropy_var_b[p], 0, bytemuck::cast_slice(&packed.bitplane_data));
+                    ctx.queue.write_buffer(
+                        &bufs.entropy_params[p],
+                        0,
+                        bytemuck::bytes_of(&packed.params),
+                    );
+                    ctx.queue.write_buffer(
+                        &bufs.entropy_tile_info[p],
+                        0,
+                        bytemuck::cast_slice(&packed.tile_info),
+                    );
+                    ctx.queue.write_buffer(
+                        &bufs.entropy_var_a[p],
+                        0,
+                        bytemuck::cast_slice(&packed.block_info),
+                    );
+                    ctx.queue.write_buffer(
+                        &bufs.entropy_var_b[p],
+                        0,
+                        bytemuck::cast_slice(&packed.bitplane_data),
+                    );
                 }
             }
         }
@@ -637,9 +705,14 @@ impl DecoderPipeline {
                 .collect();
             let alpha_size = (all_f32.len() * 4) as u64;
             Self::ensure_var_buf(
-                ctx, &mut bufs.cfl_alpha_buf, &mut bufs.cfl_alpha_cap,
-                alpha_size, "dec_cfl_alpha",
-                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+                ctx,
+                &mut bufs.cfl_alpha_buf,
+                &mut bufs.cfl_alpha_cap,
+                alpha_size,
+                "dec_cfl_alpha",
+                wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
             );
             cfl::write_alpha_buffer_into(ctx, &all_f32, &bufs.cfl_alpha_buf);
 
@@ -665,8 +738,12 @@ impl DecoderPipeline {
         if let Some(wm) = &frame.weight_map {
             let wm_size = (wm.len() * 4) as u64;
             Self::ensure_var_buf(
-                ctx, &mut bufs.weight_map_buf, &mut bufs.weight_map_cap,
-                wm_size, "dec_weight_map", storage_dst,
+                ctx,
+                &mut bufs.weight_map_buf,
+                &mut bufs.weight_map_cap,
+                wm_size,
+                "dec_weight_map",
+                storage_dst,
             );
             ctx.queue
                 .write_buffer(&bufs.weight_map_buf, 0, bytemuck::cast_slice(wm));
@@ -676,8 +753,12 @@ impl DecoderPipeline {
         if let Some(mf) = &frame.motion_field {
             let mv_size = (mf.vectors.len() * 2 * 4) as u64;
             Self::ensure_var_buf(
-                ctx, &mut bufs.mv_buf, &mut bufs.mv_cap,
-                mv_size, "dec_mv", storage_dst,
+                ctx,
+                &mut bufs.mv_buf,
+                &mut bufs.mv_cap,
+                mv_size,
+                "dec_mv",
+                storage_dst,
             );
             MotionEstimator::write_motion_vectors_into(ctx, &mf.vectors, &bufs.mv_buf);
         }
@@ -812,10 +893,10 @@ impl DecoderPipeline {
                 self.cfl_predictor.dispatch_inverse(
                     ctx,
                     &mut cmd,
-                    &bufs.scratch_b,         // dequantized residual
-                    &bufs.y_ref_wavelet_buf, // reconstructed Y wavelet
+                    &bufs.scratch_b,               // dequantized residual
+                    &bufs.y_ref_wavelet_buf,       // reconstructed Y wavelet
                     &bufs.plane_alpha_bufs[p - 1], // per-tile per-subband alphas
-                    &bufs.scratch_c,         // output: reconstructed chroma wavelet
+                    &bufs.scratch_c,               // output: reconstructed chroma wavelet
                     padded_pixels as u32,
                     padded_w,
                     padded_h,
@@ -950,7 +1031,14 @@ impl DecoderPipeline {
         let output_pixels = w * h;
         let output_size = (output_pixels as u64) * 3 * 4;
 
-        self.ensure_cached(ctx, info.padded_width(), info.padded_height(), w, h, info.tile_size);
+        self.ensure_cached(
+            ctx,
+            info.padded_width(),
+            info.padded_height(),
+            w,
+            h,
+            info.tile_size,
+        );
 
         let t_alloc = t_start.elapsed();
 
@@ -1017,7 +1105,14 @@ impl DecoderPipeline {
         let packed_u32s = total_f32s.div_ceil(4);
         let packed_byte_size = (packed_u32s as u64) * 4;
 
-        self.ensure_cached(ctx, info.padded_width(), info.padded_height(), w, h, info.tile_size);
+        self.ensure_cached(
+            ctx,
+            info.padded_width(),
+            info.padded_height(),
+            w,
+            h,
+            info.tile_size,
+        );
 
         let t_alloc = t_start.elapsed();
 
@@ -1120,7 +1215,14 @@ impl DecoderPipeline {
         let packed_u32s = total_f32s.div_ceil(4);
         let packed_byte_size = (packed_u32s as u64) * 4;
 
-        self.ensure_cached(ctx, info.padded_width(), info.padded_height(), w, h, info.tile_size);
+        self.ensure_cached(
+            ctx,
+            info.padded_width(),
+            info.padded_height(),
+            w,
+            h,
+            info.tile_size,
+        );
 
         self.prepare_frame_data(ctx, frame);
 

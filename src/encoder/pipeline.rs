@@ -429,26 +429,34 @@ impl EncoderPipeline {
                     // Copy recon Y to persistent buffer (stays on GPU for chroma CfL)
                     cmd.copy_buffer_to_buffer(&bufs.plane_a, 0, &bufs.recon_y, 0, plane_size);
 
+                    // Save Y quantized for batched rANS encode
+                    if use_gpu_encode {
+                        cmd.copy_buffer_to_buffer(
+                            &bufs.plane_b, 0, &bufs.mc_out, 0, plane_size,
+                        );
+                    }
+
                     ctx.queue.submit(Some(cmd.finish()));
 
-                    // Entropy encode from plane_b (quantized Y)
-                    Self::encode_entropy(
-                        &mut self.gpu_encoder,
-                        ctx,
-                        &bufs.plane_b,
-                        padded_pixels,
-                        padded_w as usize,
-                        tiles_x,
-                        tiles_y,
-                        tile_size,
-                        &entropy_mode,
-                        config,
-                        use_gpu_encode,
-                        &info,
-                        &mut rans_tiles,
-                        &mut subband_tiles,
-                        &mut bp_tiles,
-                    );
+                    if !use_gpu_encode {
+                        Self::encode_entropy(
+                            &mut self.gpu_encoder,
+                            ctx,
+                            &bufs.plane_b,
+                            padded_pixels,
+                            padded_w as usize,
+                            tiles_x,
+                            tiles_y,
+                            tile_size,
+                            &entropy_mode,
+                            config,
+                            use_gpu_encode,
+                            &info,
+                            &mut rans_tiles,
+                            &mut subband_tiles,
+                            &mut bp_tiles,
+                        );
+                    }
                 } else {
                     // Non-CfL Y: adaptive quantize
                     let wm_param = if config.adaptive_quantization && config.aq_strength > 0.0 {
@@ -473,25 +481,34 @@ impl EncoderPipeline {
                         &weights_luma,
                         wm_param,
                     );
+
+                    if use_gpu_encode {
+                        cmd.copy_buffer_to_buffer(
+                            &bufs.plane_b, 0, &bufs.mc_out, 0, plane_size,
+                        );
+                    }
+
                     ctx.queue.submit(Some(cmd.finish()));
 
-                    Self::encode_entropy(
-                        &mut self.gpu_encoder,
-                        ctx,
-                        &bufs.plane_b,
-                        padded_pixels,
-                        padded_w as usize,
-                        tiles_x,
-                        tiles_y,
-                        tile_size,
-                        &entropy_mode,
-                        config,
-                        use_gpu_encode,
-                        &info,
-                        &mut rans_tiles,
-                        &mut subband_tiles,
-                        &mut bp_tiles,
-                    );
+                    if !use_gpu_encode {
+                        Self::encode_entropy(
+                            &mut self.gpu_encoder,
+                            ctx,
+                            &bufs.plane_b,
+                            padded_pixels,
+                            padded_w as usize,
+                            tiles_x,
+                            tiles_y,
+                            tile_size,
+                            &entropy_mode,
+                            config,
+                            use_gpu_encode,
+                            &info,
+                            &mut rans_tiles,
+                            &mut subband_tiles,
+                            &mut bp_tiles,
+                        );
+                    }
                 }
             } else if use_cfl {
                 // Chroma plane with CfL: wavelet + alpha + forward + quantize all on GPU
@@ -562,6 +579,13 @@ impl EncoderPipeline {
                     &weights_chroma,
                 );
 
+                // Save Co quantized for batched rANS encode
+                if use_gpu_encode && p == 1 {
+                    cmd.copy_buffer_to_buffer(
+                        &bufs.plane_b, 0, &bufs.ref_upload, 0, plane_size,
+                    );
+                }
+
                 ctx.queue.submit(Some(cmd.finish()));
 
                 // Tiny readback of raw alphas (~few hundred bytes) for u8 serialization
@@ -570,23 +594,25 @@ impl EncoderPipeline {
                     raw_alphas.iter().map(|&a| cfl::quantize_alpha(a)).collect();
                 cfl_alphas_all.extend_from_slice(&q_alphas);
 
-                Self::encode_entropy(
-                    &mut self.gpu_encoder,
-                    ctx,
-                    &bufs.plane_b,
-                    padded_pixels,
-                    padded_w as usize,
-                    tiles_x,
-                    tiles_y,
-                    tile_size,
-                    &entropy_mode,
-                    config,
-                    use_gpu_encode,
-                    &info,
-                    &mut rans_tiles,
-                    &mut subband_tiles,
-                    &mut bp_tiles,
-                );
+                if !use_gpu_encode {
+                    Self::encode_entropy(
+                        &mut self.gpu_encoder,
+                        ctx,
+                        &bufs.plane_b,
+                        padded_pixels,
+                        padded_w as usize,
+                        tiles_x,
+                        tiles_y,
+                        tile_size,
+                        &entropy_mode,
+                        config,
+                        use_gpu_encode,
+                        &info,
+                        &mut rans_tiles,
+                        &mut subband_tiles,
+                        &mut bp_tiles,
+                    );
+                }
             } else {
                 // Non-CfL chroma: wavelet + quantize
                 let chroma_source = if p == 1 {
@@ -629,26 +655,49 @@ impl EncoderPipeline {
                     &weights_chroma,
                     wm_param,
                 );
+
+                if use_gpu_encode && p == 1 {
+                    cmd.copy_buffer_to_buffer(
+                        &bufs.plane_b, 0, &bufs.ref_upload, 0, plane_size,
+                    );
+                }
+
                 ctx.queue.submit(Some(cmd.finish()));
 
-                Self::encode_entropy(
-                    &mut self.gpu_encoder,
-                    ctx,
-                    &bufs.plane_b,
-                    padded_pixels,
-                    padded_w as usize,
-                    tiles_x,
-                    tiles_y,
-                    tile_size,
-                    &entropy_mode,
-                    config,
-                    use_gpu_encode,
-                    &info,
-                    &mut rans_tiles,
-                    &mut subband_tiles,
-                    &mut bp_tiles,
-                );
+                if !use_gpu_encode {
+                    Self::encode_entropy(
+                        &mut self.gpu_encoder,
+                        ctx,
+                        &bufs.plane_b,
+                        padded_pixels,
+                        padded_w as usize,
+                        tiles_x,
+                        tiles_y,
+                        tile_size,
+                        &entropy_mode,
+                        config,
+                        use_gpu_encode,
+                        &info,
+                        &mut rans_tiles,
+                        &mut subband_tiles,
+                        &mut bp_tiles,
+                    );
+                }
             }
+        }
+
+        // Batched 3-plane rANS encode: single submit + single poll for all planes
+        if use_gpu_encode {
+            // Y quantized in mc_out, Co in ref_upload, Cg in plane_b
+            let (mut rt, mut st) = self.gpu_encoder.encode_3planes_to_tiles(
+                ctx,
+                [&bufs.mc_out, &bufs.ref_upload, &bufs.plane_b],
+                &info,
+                config.per_subband_entropy,
+                config.wavelet_levels,
+            );
+            rans_tiles.append(&mut rt);
+            subband_tiles.append(&mut st);
         }
 
         let cfl_alphas = if config.cfl_enabled {

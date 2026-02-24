@@ -16,6 +16,10 @@ csv = "1"
 log = "0.4"
 env_logger = "0.11"
 
+[profile.dev-fast]
+inherits = "dev"
+opt-level = 2
+
 [profile.release]
 opt-level = 3
-lto = true
+lto = "thin"

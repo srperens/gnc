@@ -13,6 +13,13 @@ use crate::encoder::rans_gpu::GpuRansDecoder;
 use crate::encoder::transform::WaveletTransform;
 use crate::{CompressedFrame, EntropyData, FrameType, GpuContext};
 
+/// Handle returned by `decode_to_texture` with metadata about the decoded frame.
+/// The actual texture view is accessible via `DecoderPipeline::output_texture_view()`.
+pub struct TextureHandle {
+    pub width: u32,
+    pub height: u32,
+}
+
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 struct CropParams {
@@ -29,6 +36,15 @@ struct PackParams {
     _pad0: u32,
     _pad1: u32,
     _pad2: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct TextureParams {
+    width: u32,
+    height: u32,
+    _pad0: u32,
+    _pad1: u32,
 }
 
 /// Cached GPU buffers for decode — allocated once, reused across frames.
@@ -78,6 +94,15 @@ struct CachedBuffers {
     weight_map_cap: u64,
     mv_buf: wgpu::Buffer,
     mv_cap: u64,
+
+    // Output texture for zero-readback decode path
+    // (texture and params_buf kept alive for the view and bind group that reference them)
+    #[allow(dead_code)]
+    output_texture: wgpu::Texture,
+    output_texture_view: wgpu::TextureView,
+    buf_to_tex_bind_group: wgpu::BindGroup,
+    #[allow(dead_code)]
+    buf_to_tex_params_buf: wgpu::Buffer,
 }
 
 /// Full decoding pipeline: GPU rANS Decode -> Dequantize -> Inverse Wavelet -> Interleave -> Inverse Color -> Crop
@@ -97,6 +122,8 @@ pub struct DecoderPipeline {
     crop_bgl: wgpu::BindGroupLayout,
     pack_pipeline: wgpu::ComputePipeline,
     pack_bgl: wgpu::BindGroupLayout,
+    buf_to_tex_pipeline: wgpu::ComputePipeline,
+    buf_to_tex_bgl: wgpu::BindGroupLayout,
     cached: RefCell<Option<CachedBuffers>>,
     pending_rx: RefCell<Option<std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>>,
 }
@@ -232,6 +259,73 @@ impl DecoderPipeline {
                 cache: None,
             });
 
+        // Buffer-to-texture shader (f32 RGB buffer → rgba8unorm texture)
+        let buf_to_tex_shader = ctx
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("buffer_to_texture"),
+                source: wgpu::ShaderSource::Wgsl(
+                    include_str!("../shaders/buffer_to_texture.wgsl").into(),
+                ),
+            });
+
+        let buf_to_tex_bgl =
+            ctx.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("buf_to_tex_bgl"),
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 2,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::StorageTexture {
+                                access: wgpu::StorageTextureAccess::WriteOnly,
+                                format: wgpu::TextureFormat::Rgba8Unorm,
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                            },
+                            count: None,
+                        },
+                    ],
+                });
+
+        let buf_to_tex_pl = ctx
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("buf_to_tex_pl"),
+                bind_group_layouts: &[&buf_to_tex_bgl],
+                push_constant_ranges: &[],
+            });
+
+        let buf_to_tex_pipeline =
+            ctx.device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("buf_to_tex_pipeline"),
+                    layout: Some(&buf_to_tex_pl),
+                    module: &buf_to_tex_shader,
+                    entry_point: Some("main"),
+                    compilation_options: Default::default(),
+                    cache: None,
+                });
+
         Self {
             color: ColorConverter::new(ctx),
             transform: WaveletTransform::new(ctx),
@@ -245,6 +339,8 @@ impl DecoderPipeline {
             crop_bgl,
             pack_pipeline,
             pack_bgl,
+            buf_to_tex_pipeline,
+            buf_to_tex_bgl,
             cached: RefCell::new(None),
             pending_rx: RefCell::new(None),
         }
@@ -486,6 +582,61 @@ impl DecoderPipeline {
             mapped_at_creation: false,
         });
 
+        // Output texture for zero-readback decode path
+        let output_texture = ctx.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("dec_output_texture"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let output_texture_view =
+            output_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let buf_to_tex_params = TextureParams {
+            width,
+            height,
+            _pad0: 0,
+            _pad1: 0,
+        };
+        let buf_to_tex_params_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dec_buf_to_tex_params"),
+            size: std::mem::size_of::<TextureParams>() as u64,
+            usage: uniform_dst,
+            mapped_at_creation: false,
+        });
+        ctx.queue.write_buffer(
+            &buf_to_tex_params_buf,
+            0,
+            bytemuck::bytes_of(&buf_to_tex_params),
+        );
+
+        let buf_to_tex_bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("buf_to_tex_bg"),
+            layout: &self.buf_to_tex_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: buf_to_tex_params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: cropped_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&output_texture_view),
+                },
+            ],
+        });
+
         *cached = Some(CachedBuffers {
             padded_w,
             padded_h,
@@ -520,6 +671,10 @@ impl DecoderPipeline {
             weight_map_cap,
             mv_buf,
             mv_cap,
+            output_texture,
+            output_texture_view,
+            buf_to_tex_bind_group,
+            buf_to_tex_params_buf,
         });
     }
 
@@ -1203,6 +1358,65 @@ impl DecoderPipeline {
         result
     }
 
+    /// Decode a compressed frame to an on-GPU rgba8unorm texture.
+    /// Zero readback: data stays entirely on the GPU. Returns a reference to the
+    /// texture view that can be used directly for rendering (e.g. as a sampled texture
+    /// in a render pass). The texture is owned by the cached buffers and reused across
+    /// frames — the caller must use or copy it before the next decode call.
+    pub fn decode_to_texture(&self, ctx: &GpuContext, frame: &CompressedFrame) -> TextureHandle {
+        let info = &frame.info;
+        let w = info.width;
+        let h = info.height;
+
+        self.ensure_cached(
+            ctx,
+            info.padded_width(),
+            info.padded_height(),
+            w,
+            h,
+            info.tile_size,
+        );
+
+        self.prepare_frame_data(ctx, frame);
+
+        let cached = self.cached.borrow();
+        let bufs = cached.as_ref().unwrap();
+
+        let mut cmd = self.encode_gpu_work(ctx, frame, bufs);
+
+        // Buffer-to-texture: cropped f32 RGB → rgba8unorm texture
+        {
+            let wg_x = w.div_ceil(16);
+            let wg_y = h.div_ceil(16);
+            let mut pass = cmd.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("buf_to_tex_pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.buf_to_tex_pipeline);
+            pass.set_bind_group(0, &bufs.buf_to_tex_bind_group, &[]);
+            pass.dispatch_workgroups(wg_x, wg_y, 1);
+        }
+
+        ctx.queue.submit(Some(cmd.finish()));
+
+        TextureHandle {
+            width: w,
+            height: h,
+        }
+    }
+
+    /// Get a reference to the output texture view from the most recent decode_to_texture call.
+    /// Returns None if no frame has been decoded yet.
+    pub fn output_texture_view(&self) -> Option<std::cell::Ref<'_, wgpu::TextureView>> {
+        let cached = self.cached.borrow();
+        if cached.is_none() {
+            return None;
+        }
+        Some(std::cell::Ref::map(cached, |c| {
+            &c.as_ref().unwrap().output_texture_view
+        }))
+    }
+
     /// Submit GPU decode work without waiting for the result.
     /// Returns an opaque token that can be used with `finish_decode_u8` to get the result.
     /// This enables pipelined decode: submit frame N, do CPU work for frame N+1,
@@ -1311,5 +1525,73 @@ impl DecoderPipeline {
         drop(cached);
 
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::encoder::pipeline::EncoderPipeline;
+    use crate::CodecConfig;
+
+    fn make_gradient_frame(w: u32, h: u32) -> Vec<f32> {
+        let mut data = Vec::with_capacity((w * h * 3) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                let r = (x as f32 / w as f32 * 255.0).clamp(0.0, 255.0);
+                let g = (y as f32 / h as f32 * 255.0).clamp(0.0, 255.0);
+                let b = ((x + y) as f32 / (w + h) as f32 * 255.0).clamp(0.0, 255.0);
+                data.push(r);
+                data.push(g);
+                data.push(b);
+            }
+        }
+        data
+    }
+
+    #[test]
+    fn test_decode_to_texture_dimensions() {
+        let ctx = GpuContext::new();
+        let mut enc = EncoderPipeline::new(&ctx);
+        let dec = DecoderPipeline::new(&ctx);
+
+        let w = 256;
+        let h = 256;
+        let frame_data = make_gradient_frame(w, h);
+
+        let mut config = CodecConfig::default();
+        config.tile_size = 256;
+        config.keyframe_interval = 1;
+
+        let compressed = enc.encode_sequence(&ctx, &[frame_data.as_slice()], w, h, &config);
+        assert_eq!(compressed.len(), 1);
+
+        let handle = dec.decode_to_texture(&ctx, &compressed[0]);
+        assert_eq!(handle.width, w);
+        assert_eq!(handle.height, h);
+
+        // Verify the texture view is accessible
+        let view = dec.output_texture_view();
+        assert!(view.is_some());
+    }
+
+    #[test]
+    fn test_decode_to_texture_non_square() {
+        let ctx = GpuContext::new();
+        let mut enc = EncoderPipeline::new(&ctx);
+        let dec = DecoderPipeline::new(&ctx);
+
+        let w = 320;
+        let h = 192;
+        let frame_data = make_gradient_frame(w, h);
+
+        let mut config = CodecConfig::default();
+        config.tile_size = 64;
+        config.keyframe_interval = 1;
+
+        let compressed = enc.encode_sequence(&ctx, &[frame_data.as_slice()], w, h, &config);
+        let handle = dec.decode_to_texture(&ctx, &compressed[0]);
+        assert_eq!(handle.width, w);
+        assert_eq!(handle.height, h);
     }
 }

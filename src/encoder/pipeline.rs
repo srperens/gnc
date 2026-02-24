@@ -1,10 +1,11 @@
 use wgpu;
 use wgpu::util::DeviceExt;
 
-use super::adaptive::{self, VarianceAnalyzer, AQ_BLOCK_SIZE};
+use super::adaptive::{self, VarianceAnalyzer, WeightMapNormalizer, AQ_BLOCK_SIZE};
 use super::bitplane;
-use super::cfl;
+use super::cfl::{self, CflAlphaComputer, CflForwardPredictor};
 use super::color::ColorConverter;
+use super::interleave::PlaneDeinterleaver;
 use super::motion::{MotionEstimator, ME_BLOCK_SIZE};
 use super::quantize::Quantizer;
 use super::rans;
@@ -30,6 +31,10 @@ pub struct EncoderPipeline {
     variance: VarianceAnalyzer,
     motion: MotionEstimator,
     gpu_encoder: GpuRansEncoder,
+    deinterleaver: PlaneDeinterleaver,
+    weight_normalizer: WeightMapNormalizer,
+    cfl_alpha: CflAlphaComputer,
+    cfl_forward: CflForwardPredictor,
 }
 
 impl EncoderPipeline {
@@ -41,6 +46,10 @@ impl EncoderPipeline {
             variance: VarianceAnalyzer::new(ctx),
             motion: MotionEstimator::new(ctx),
             gpu_encoder: GpuRansEncoder::new(ctx),
+            deinterleaver: PlaneDeinterleaver::new(ctx),
+            weight_normalizer: WeightMapNormalizer::new(ctx),
+            cfl_alpha: CflAlphaComputer::new(ctx),
+            cfl_forward: CflForwardPredictor::new(ctx),
         }
     }
 
@@ -83,114 +92,106 @@ impl EncoderPipeline {
         let color_out = ctx.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("enc_color_out"),
             size: buf_size,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
 
         // Per-plane buffers for wavelet + quantize
         let plane_size = (padded_pixels * std::mem::size_of::<f32>()) as u64;
-        let plane_buf_a = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("enc_plane_a"),
-            size: plane_size,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let plane_buf_b = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("enc_plane_b"),
-            size: plane_size,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_SRC
-                | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let plane_buf_c = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("enc_plane_c"),
-            size: plane_size,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_SRC
-                | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let plane_buf_a = create_plane_buffer(ctx, plane_size, "enc_plane_a");
+        let plane_buf_b = create_plane_buffer(ctx, plane_size, "enc_plane_b");
+        let plane_buf_c = create_plane_buffer(ctx, plane_size, "enc_plane_c");
+
+        // Separate Co/Cg buffers so deinterleave writes all 3 planes at once
+        let co_plane_buf = create_plane_buffer(ctx, plane_size, "enc_co_plane");
+        let cg_plane_buf = create_plane_buffer(ctx, plane_size, "enc_cg_plane");
 
         // Upload input
         ctx.queue
             .write_buffer(&input_buf, 0, bytemuck::cast_slice(&padded_rgb));
 
-        // Step 1: Color convert (RGB -> YCoCg-R) on GPU
+        // ---- Submit 1: color convert + deinterleave + (variance + weight normalize) ----
         let mut cmd = ctx
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("encode_color"),
+                label: Some("encode_preprocess"),
             });
+
+        // Color convert (RGB -> YCoCg-R): input_buf -> color_out (interleaved)
         self.color.dispatch(
             ctx, &mut cmd, &input_buf, &color_out, padded_w, padded_h, true,
         );
-        ctx.queue.submit(Some(cmd.finish()));
 
-        // Read back and deinterleave into 3 planes
-        let color_data = read_buffer_f32(ctx, &color_out, pixel_count_3);
-        let mut planes: [Vec<f32>; 3] = [
-            vec![0.0; padded_pixels],
-            vec![0.0; padded_pixels],
-            vec![0.0; padded_pixels],
-        ];
-        for i in 0..padded_pixels {
-            planes[0][i] = color_data[i * 3];
-            planes[1][i] = color_data[i * 3 + 1];
-            planes[2][i] = color_data[i * 3 + 2];
-        }
+        // GPU deinterleave: color_out -> plane_buf_a(Y), co_plane_buf(Co), cg_plane_buf(Cg)
+        self.deinterleaver.dispatch(
+            ctx,
+            &mut cmd,
+            &color_out,
+            &plane_buf_a,
+            &co_plane_buf,
+            &cg_plane_buf,
+            padded_pixels as u32,
+        );
 
-        // Step 1.5: Adaptive quantization — compute variance from Y plane, build weight map
+        // Adaptive quantization: variance + weight normalization on GPU
         let (weight_map, weight_map_gpu) = if config.adaptive_quantization
             && config.aq_strength > 0.0
         {
             let (blocks_x, blocks_y, total_blocks) = adaptive::weight_map_dims(padded_w, padded_h);
-
-            let y_buf = ctx
-                .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("enc_y_plane"),
-                    contents: bytemuck::cast_slice(&planes[0]),
-                    usage: wgpu::BufferUsages::STORAGE,
-                });
+            let wm_buf_size = (total_blocks as usize * std::mem::size_of::<f32>()) as u64;
 
             let variance_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("enc_variance"),
-                size: (total_blocks as usize * std::mem::size_of::<f32>()) as u64,
+                size: wm_buf_size,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            let scratch_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("enc_wm_scratch"),
+                size: wm_buf_size,
+                usage: wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            });
+            let weight_map_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("enc_weight_map"),
+                size: wm_buf_size,
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
                 mapped_at_creation: false,
             });
 
-            let mut cmd = ctx
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("encode_variance"),
-                });
-            self.variance
-                .dispatch(ctx, &mut cmd, &y_buf, &variance_buf, padded_w, padded_h);
+            // Variance analysis reads Y from plane_buf_a (already on GPU from deinterleave)
+            self.variance.dispatch(
+                ctx,
+                &mut cmd,
+                &plane_buf_a,
+                &variance_buf,
+                padded_w,
+                padded_h,
+            );
+
+            // Weight map normalization on GPU (replaces CPU compute_weight_map)
+            self.weight_normalizer.dispatch(
+                ctx,
+                &mut cmd,
+                &variance_buf,
+                &scratch_buf,
+                &weight_map_buf,
+                blocks_x,
+                blocks_y,
+                config.aq_strength,
+            );
+
             ctx.queue.submit(Some(cmd.finish()));
 
-            let raw_variance = read_buffer_f32(ctx, &variance_buf, total_blocks as usize);
-            let wm =
-                adaptive::compute_weight_map(&raw_variance, blocks_x, blocks_y, config.aq_strength);
-
-            let wm_gpu = ctx
-                .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("enc_weight_map"),
-                    contents: bytemuck::cast_slice(&wm),
-                    usage: wgpu::BufferUsages::STORAGE,
-                });
-
-            (Some(wm), Some((wm_gpu, blocks_x)))
+            // Small readback (~8KB for 1080p) for CompressedFrame serialization only
+            let wm = read_buffer_f32(ctx, &weight_map_buf, total_blocks as usize);
+            (Some(wm), Some((weight_map_buf, blocks_x)))
         } else {
+            ctx.queue.submit(Some(cmd.finish()));
             (None, None)
         };
 
-        // Step 2 & 3: Wavelet transform + quantize per plane on GPU,
-        // then entropy encode per tile
+        // ---- Per-plane encoding ----
         let mut rans_tiles: Vec<rans::InterleavedRansTile> = Vec::new();
         let mut subband_tiles: Vec<rans::SubbandRansTile> = Vec::new();
         let mut bp_tiles: Vec<bitplane::BitplaneTile> = Vec::new();
@@ -204,25 +205,24 @@ impl EncoderPipeline {
         let tile_size = config.tile_size as usize;
         let tiles_x = info.tiles_x() as usize;
         let tiles_y = info.tiles_y() as usize;
-        // GPU encode is used for rANS modes when enabled (not for bitplane)
         let use_gpu_encode =
             config.gpu_entropy_encode && config.entropy_coder != EntropyCoder::Bitplane;
 
-        // Pre-pack subband weights: luma and chroma variants
         let weights_luma = config.subband_weights.pack_weights();
         let weights_chroma = config.subband_weights.pack_weights_chroma();
 
-        // CfL state: reconstructed Y wavelet (dequantized) for chroma prediction
-        let mut recon_y_wavelet: Option<Vec<f32>> = None;
-        let mut cfl_alphas_all: Vec<u8> = Vec::new();
         let nsb = cfl::num_subbands(config.wavelet_levels);
+        let mut cfl_alphas_all: Vec<u8> = Vec::new();
+
+        // Persistent recon_y buffer for CfL (stays on GPU across plane loop)
+        let mut recon_y_buf: Option<wgpu::Buffer> = None;
+
+        // Chroma source buffers indexed by plane
+        let chroma_sources = [&co_plane_buf, &cg_plane_buf];
 
         for p in 0..3 {
             let is_chroma = p > 0;
             let use_cfl = config.cfl_enabled && is_chroma;
-
-            ctx.queue
-                .write_buffer(&plane_buf_a, 0, bytemuck::cast_slice(&planes[p]));
 
             let mut cmd = ctx
                 .device
@@ -230,132 +230,188 @@ impl EncoderPipeline {
                     label: Some("encode_plane"),
                 });
 
-            // Wavelet forward: plane_buf_a → (temp plane_buf_b) → plane_buf_c (wavelet coefficients)
-            self.transform.forward(
-                ctx,
-                &mut cmd,
-                &plane_buf_a,
-                &plane_buf_b,
-                &plane_buf_c,
-                &info,
-                config.wavelet_levels,
-                config.wavelet_type,
-            );
+            if p == 0 {
+                // Y plane: data already in plane_buf_a from deinterleave
 
-            if p == 0 && config.cfl_enabled {
-                // Y plane with CfL: quantize, then dequantize to get reconstructed Y wavelet.
-                // Quantize: plane_buf_c → plane_buf_b (quantized)
-                self.quantize.dispatch(
+                // Wavelet forward: plane_buf_a -> plane_buf_b(scratch) -> plane_buf_c
+                self.transform.forward(
                     ctx,
                     &mut cmd,
-                    &plane_buf_c,
-                    &plane_buf_b,
-                    padded_pixels as u32,
-                    config.quantization_step,
-                    config.dead_zone,
-                    true,
-                    padded_w,
-                    padded_h,
-                    config.tile_size,
-                    config.wavelet_levels,
-                    &weights_luma,
-                );
-                // Dequantize: plane_buf_b → plane_buf_a (reconstructed Y wavelet)
-                self.quantize.dispatch(
-                    ctx,
-                    &mut cmd,
-                    &plane_buf_b,
                     &plane_buf_a,
-                    padded_pixels as u32,
-                    config.quantization_step,
-                    config.dead_zone,
-                    false,
-                    padded_w,
-                    padded_h,
-                    config.tile_size,
+                    &plane_buf_b,
+                    &plane_buf_c,
+                    &info,
                     config.wavelet_levels,
-                    &weights_luma,
+                    config.wavelet_type,
                 );
-                ctx.queue.submit(Some(cmd.finish()));
 
-                // Read back reconstructed Y wavelet (needed for CfL chroma prediction)
-                recon_y_wavelet = Some(read_buffer_f32(ctx, &plane_buf_a, padded_pixels));
+                if config.cfl_enabled {
+                    // Y with CfL: quantize + dequantize to get reconstructed Y wavelet
+                    self.quantize.dispatch(
+                        ctx,
+                        &mut cmd,
+                        &plane_buf_c,
+                        &plane_buf_b,
+                        padded_pixels as u32,
+                        config.quantization_step,
+                        config.dead_zone,
+                        true,
+                        padded_w,
+                        padded_h,
+                        config.tile_size,
+                        config.wavelet_levels,
+                        &weights_luma,
+                    );
+                    self.quantize.dispatch(
+                        ctx,
+                        &mut cmd,
+                        &plane_buf_b,
+                        &plane_buf_a,
+                        padded_pixels as u32,
+                        config.quantization_step,
+                        config.dead_zone,
+                        false,
+                        padded_w,
+                        padded_h,
+                        config.tile_size,
+                        config.wavelet_levels,
+                        &weights_luma,
+                    );
 
-                if use_gpu_encode {
-                    // GPU encode: plane_buf_b stays on GPU, no readback needed
-                    let (mut rt, mut st) = self.gpu_encoder.encode_plane_to_tiles(
+                    // Copy recon Y to persistent buffer (stays on GPU for chroma CfL)
+                    let ry_buf = create_plane_buffer(ctx, plane_size, "enc_recon_y");
+                    cmd.copy_buffer_to_buffer(&plane_buf_a, 0, &ry_buf, 0, plane_size);
+                    recon_y_buf = Some(ry_buf);
+
+                    ctx.queue.submit(Some(cmd.finish()));
+
+                    // Entropy encode from plane_buf_b (quantized Y)
+                    Self::encode_entropy(
+                        &mut self.gpu_encoder,
                         ctx,
                         &plane_buf_b,
-                        &info,
-                        config.per_subband_entropy,
-                        config.wavelet_levels,
-                    );
-                    rans_tiles.append(&mut rt);
-                    subband_tiles.append(&mut st);
-                } else {
-                    // CPU fallback: read back quantized data
-                    let quantized = read_buffer_f32(ctx, &plane_buf_b, padded_pixels);
-                    entropy_encode_tiles(
-                        &quantized,
+                        padded_pixels,
                         padded_w as usize,
                         tiles_x,
                         tiles_y,
                         tile_size,
                         &entropy_mode,
+                        config,
+                        use_gpu_encode,
+                        &info,
+                        &mut rans_tiles,
+                        &mut subband_tiles,
+                        &mut bp_tiles,
+                    );
+                } else {
+                    // Non-CfL Y: adaptive quantize
+                    let wm_param = weight_map_gpu
+                        .as_ref()
+                        .map(|(buf, blocks_x)| (buf, AQ_BLOCK_SIZE, *blocks_x));
+                    self.quantize.dispatch_adaptive(
+                        ctx,
+                        &mut cmd,
+                        &plane_buf_c,
+                        &plane_buf_b,
+                        padded_pixels as u32,
+                        config.quantization_step,
+                        config.dead_zone,
+                        true,
+                        padded_w,
+                        padded_h,
                         config.tile_size,
                         config.wavelet_levels,
+                        &weights_luma,
+                        wm_param,
+                    );
+                    ctx.queue.submit(Some(cmd.finish()));
+
+                    Self::encode_entropy(
+                        &mut self.gpu_encoder,
+                        ctx,
+                        &plane_buf_b,
+                        padded_pixels,
+                        padded_w as usize,
+                        tiles_x,
+                        tiles_y,
+                        tile_size,
+                        &entropy_mode,
+                        config,
+                        use_gpu_encode,
+                        &info,
                         &mut rans_tiles,
                         &mut subband_tiles,
                         &mut bp_tiles,
                     );
                 }
             } else if use_cfl {
-                // Chroma plane with CfL prediction
-                ctx.queue.submit(Some(cmd.finish()));
+                // Chroma plane with CfL: wavelet + alpha + forward + quantize all on GPU
+                let chroma_source = chroma_sources[p - 1];
 
-                // Read back chroma wavelet coefficients from plane_buf_c
-                let chroma_wavelet = read_buffer_f32(ctx, &plane_buf_c, padded_pixels);
-                let recon_y = recon_y_wavelet.as_ref().unwrap();
+                // Wavelet forward: chroma_source -> plane_buf_b(scratch) -> plane_buf_c
+                self.transform.forward(
+                    ctx,
+                    &mut cmd,
+                    chroma_source,
+                    &plane_buf_b,
+                    &plane_buf_c,
+                    &info,
+                    config.wavelet_levels,
+                    config.wavelet_type,
+                );
 
-                // Compute per-tile per-subband alpha
-                let alphas_f32 = cfl::compute_cfl_alphas(
-                    recon_y,
-                    &chroma_wavelet,
+                // GPU CfL alpha computation
+                let total_tiles = (tiles_x * tiles_y) as u32;
+                let alpha_count = (total_tiles * nsb) as usize;
+                let alpha_buf_size = (alpha_count * std::mem::size_of::<f32>()) as u64;
+
+                let raw_alpha_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("enc_raw_alpha"),
+                    size: alpha_buf_size,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: false,
+                });
+                let dq_alpha_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("enc_dq_alpha"),
+                    size: alpha_buf_size,
+                    usage: wgpu::BufferUsages::STORAGE,
+                    mapped_at_creation: false,
+                });
+
+                let ry_buf = recon_y_buf.as_ref().unwrap();
+                self.cfl_alpha.dispatch(
+                    ctx,
+                    &mut cmd,
+                    ry_buf,
+                    &plane_buf_c,
+                    &raw_alpha_buf,
+                    &dq_alpha_buf,
                     padded_w,
                     padded_h,
                     config.tile_size,
                     config.wavelet_levels,
                 );
 
-                // Quantize then dequantize alphas (encoder must use same values as decoder)
-                let q_alphas: Vec<u8> =
-                    alphas_f32.iter().map(|&a| cfl::quantize_alpha(a)).collect();
-                let dq_alphas: Vec<f32> =
-                    q_alphas.iter().map(|&q| cfl::dequantize_alpha(q)).collect();
-
-                // Compute residual on CPU: residual = chroma_wavelet - alpha * recon_y
-                let residual = cfl::apply_cfl_predict_cpu(
-                    &chroma_wavelet,
-                    recon_y,
-                    &dq_alphas,
-                    padded_w,
-                    padded_h,
-                    config.tile_size,
-                    config.wavelet_levels,
-                );
-
-                // Upload residual, quantize on GPU
-                ctx.queue
-                    .write_buffer(&plane_buf_c, 0, bytemuck::cast_slice(&residual));
-                let mut cmd = ctx
-                    .device
-                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                        label: Some("encode_cfl_residual"),
-                    });
-                self.quantize.dispatch(
+                // GPU CfL forward: residual = chroma_wavelet - alpha * recon_y -> plane_buf_a
+                self.cfl_forward.dispatch(
                     ctx,
                     &mut cmd,
                     &plane_buf_c,
+                    ry_buf,
+                    &dq_alpha_buf,
+                    &plane_buf_a,
+                    padded_pixels as u32,
+                    padded_w,
+                    padded_h,
+                    config.tile_size,
+                    config.wavelet_levels,
+                );
+
+                // Quantize residual: plane_buf_a -> plane_buf_b
+                self.quantize.dispatch(
+                    ctx,
+                    &mut cmd,
+                    &plane_buf_a,
                     &plane_buf_b,
                     padded_pixels as u32,
                     config.quantization_step,
@@ -367,45 +423,48 @@ impl EncoderPipeline {
                     config.wavelet_levels,
                     &weights_chroma,
                 );
+
                 ctx.queue.submit(Some(cmd.finish()));
 
-                if use_gpu_encode {
-                    // GPU encode: plane_buf_b stays on GPU
-                    let (mut rt, mut st) = self.gpu_encoder.encode_plane_to_tiles(
-                        ctx,
-                        &plane_buf_b,
-                        &info,
-                        config.per_subband_entropy,
-                        config.wavelet_levels,
-                    );
-                    rans_tiles.append(&mut rt);
-                    subband_tiles.append(&mut st);
-                } else {
-                    let quantized = read_buffer_f32(ctx, &plane_buf_b, padded_pixels);
-                    entropy_encode_tiles(
-                        &quantized,
-                        padded_w as usize,
-                        tiles_x,
-                        tiles_y,
-                        tile_size,
-                        &entropy_mode,
-                        config.tile_size,
-                        config.wavelet_levels,
-                        &mut rans_tiles,
-                        &mut subband_tiles,
-                        &mut bp_tiles,
-                    );
-                }
-
-                // Store quantized alphas for serialization
+                // Tiny readback of raw alphas (~few hundred bytes) for u8 serialization
+                let raw_alphas = read_buffer_f32(ctx, &raw_alpha_buf, alpha_count);
+                let q_alphas: Vec<u8> =
+                    raw_alphas.iter().map(|&a| cfl::quantize_alpha(a)).collect();
                 cfl_alphas_all.extend_from_slice(&q_alphas);
+
+                Self::encode_entropy(
+                    &mut self.gpu_encoder,
+                    ctx,
+                    &plane_buf_b,
+                    padded_pixels,
+                    padded_w as usize,
+                    tiles_x,
+                    tiles_y,
+                    tile_size,
+                    &entropy_mode,
+                    config,
+                    use_gpu_encode,
+                    &info,
+                    &mut rans_tiles,
+                    &mut subband_tiles,
+                    &mut bp_tiles,
+                );
             } else {
-                // Non-CfL path (original flow) — with optional adaptive quantization
-                let weights = if p == 0 {
-                    &weights_luma
-                } else {
-                    &weights_chroma
-                };
+                // Non-CfL chroma: copy from deinterleaved buffer, wavelet + quantize
+                let chroma_source = chroma_sources[p - 1];
+
+                // Wavelet forward: chroma_source -> plane_buf_b(scratch) -> plane_buf_c
+                self.transform.forward(
+                    ctx,
+                    &mut cmd,
+                    chroma_source,
+                    &plane_buf_b,
+                    &plane_buf_c,
+                    &info,
+                    config.wavelet_levels,
+                    config.wavelet_type,
+                );
+
                 let wm_param = weight_map_gpu
                     .as_ref()
                     .map(|(buf, blocks_x)| (buf, AQ_BLOCK_SIZE, *blocks_x));
@@ -422,38 +481,28 @@ impl EncoderPipeline {
                     padded_h,
                     config.tile_size,
                     config.wavelet_levels,
-                    weights,
+                    &weights_chroma,
                     wm_param,
                 );
                 ctx.queue.submit(Some(cmd.finish()));
 
-                if use_gpu_encode {
-                    // GPU encode: plane_buf_b stays on GPU
-                    let (mut rt, mut st) = self.gpu_encoder.encode_plane_to_tiles(
-                        ctx,
-                        &plane_buf_b,
-                        &info,
-                        config.per_subband_entropy,
-                        config.wavelet_levels,
-                    );
-                    rans_tiles.append(&mut rt);
-                    subband_tiles.append(&mut st);
-                } else {
-                    let quantized = read_buffer_f32(ctx, &plane_buf_b, padded_pixels);
-                    entropy_encode_tiles(
-                        &quantized,
-                        padded_w as usize,
-                        tiles_x,
-                        tiles_y,
-                        tile_size,
-                        &entropy_mode,
-                        config.tile_size,
-                        config.wavelet_levels,
-                        &mut rans_tiles,
-                        &mut subband_tiles,
-                        &mut bp_tiles,
-                    );
-                }
+                Self::encode_entropy(
+                    &mut self.gpu_encoder,
+                    ctx,
+                    &plane_buf_b,
+                    padded_pixels,
+                    padded_w as usize,
+                    tiles_x,
+                    tiles_y,
+                    tile_size,
+                    &entropy_mode,
+                    config,
+                    use_gpu_encode,
+                    &info,
+                    &mut rans_tiles,
+                    &mut subband_tiles,
+                    &mut bp_tiles,
+                );
             }
         }
 
@@ -480,6 +529,53 @@ impl EncoderPipeline {
             weight_map,
             frame_type: FrameType::Intra,
             motion_field: None,
+        }
+    }
+
+    /// Helper: entropy-encode a quantized plane buffer (GPU or CPU path).
+    #[allow(clippy::too_many_arguments)]
+    fn encode_entropy(
+        gpu_encoder: &mut GpuRansEncoder,
+        ctx: &GpuContext,
+        quantized_buf: &wgpu::Buffer,
+        padded_pixels: usize,
+        padded_w: usize,
+        tiles_x: usize,
+        tiles_y: usize,
+        tile_size: usize,
+        entropy_mode: &EntropyMode,
+        config: &CodecConfig,
+        use_gpu_encode: bool,
+        info: &FrameInfo,
+        rans_tiles: &mut Vec<rans::InterleavedRansTile>,
+        subband_tiles: &mut Vec<rans::SubbandRansTile>,
+        bp_tiles: &mut Vec<bitplane::BitplaneTile>,
+    ) {
+        if use_gpu_encode {
+            let (mut rt, mut st) = gpu_encoder.encode_plane_to_tiles(
+                ctx,
+                quantized_buf,
+                info,
+                config.per_subband_entropy,
+                config.wavelet_levels,
+            );
+            rans_tiles.append(&mut rt);
+            subband_tiles.append(&mut st);
+        } else {
+            let quantized = read_buffer_f32(ctx, quantized_buf, padded_pixels);
+            entropy_encode_tiles(
+                &quantized,
+                padded_w,
+                tiles_x,
+                tiles_y,
+                tile_size,
+                entropy_mode,
+                config.tile_size,
+                config.wavelet_levels,
+                rans_tiles,
+                subband_tiles,
+                bp_tiles,
+            );
         }
     }
 
@@ -594,14 +690,30 @@ impl EncoderPipeline {
                 });
 
             self.quantize.dispatch(
-                ctx, &mut cmd, &buf_a, &buf_b, padded_pixels as u32,
-                config.quantization_step, config.dead_zone, false,
-                padded_w, padded_h, config.tile_size, config.wavelet_levels, weights,
+                ctx,
+                &mut cmd,
+                &buf_a,
+                &buf_b,
+                padded_pixels as u32,
+                config.quantization_step,
+                config.dead_zone,
+                false,
+                padded_w,
+                padded_h,
+                config.tile_size,
+                config.wavelet_levels,
+                weights,
             );
 
             self.transform.inverse(
-                ctx, &mut cmd, &buf_b, &buf_c, &buf_a,
-                info, config.wavelet_levels, config.wavelet_type,
+                ctx,
+                &mut cmd,
+                &buf_b,
+                &buf_c,
+                &buf_a,
+                info,
+                config.wavelet_levels,
+                config.wavelet_type,
             );
 
             ctx.queue.submit(Some(cmd.finish()));
@@ -611,7 +723,7 @@ impl EncoderPipeline {
         result_planes
     }
 
-    /// Encode a P-frame: ME → MC → encode residual → local decode loop.
+    /// Encode a P-frame: ME -> MC -> encode residual -> local decode loop.
     #[allow(clippy::too_many_arguments)]
     fn encode_pframe(
         &mut self,
@@ -630,8 +742,7 @@ impl EncoderPipeline {
         let pixel_count_3 = padded_pixels * 3;
         let buf_size = (pixel_count_3 * std::mem::size_of::<f32>()) as u64;
 
-        // Color convert to YCoCg-R
-        let padded_rgb = pad_frame(rgb_data, width, height, padded_w, padded_h);
+        // Create GPU buffers
         let input_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("pf_input"),
             size: buf_size,
@@ -641,41 +752,42 @@ impl EncoderPipeline {
         let color_out = ctx.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("pf_color_out"),
             size: buf_size,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
 
+        // Plane buffers: Y goes to plane_buf_a, Co/Cg to separate buffers
+        let plane_buf_a = create_plane_buffer(ctx, plane_size, "pf_a");
+        let plane_buf_b = create_plane_buffer(ctx, plane_size, "pf_b");
+        let plane_buf_c = create_plane_buffer(ctx, plane_size, "pf_c");
+        let co_plane_buf = create_plane_buffer(ctx, plane_size, "pf_co");
+        let cg_plane_buf = create_plane_buffer(ctx, plane_size, "pf_cg");
+
+        // Color convert + deinterleave on GPU
+        let padded_rgb = pad_frame(rgb_data, width, height, padded_w, padded_h);
         ctx.queue
             .write_buffer(&input_buf, 0, bytemuck::cast_slice(&padded_rgb));
+
         let mut cmd = ctx
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("pf_color"),
+                label: Some("pf_preprocess"),
             });
-        self.color
-            .dispatch(ctx, &mut cmd, &input_buf, &color_out, padded_w, padded_h, true);
+        self.color.dispatch(
+            ctx, &mut cmd, &input_buf, &color_out, padded_w, padded_h, true,
+        );
+        self.deinterleaver.dispatch(
+            ctx,
+            &mut cmd,
+            &color_out,
+            &plane_buf_a,
+            &co_plane_buf,
+            &cg_plane_buf,
+            padded_pixels as u32,
+        );
         ctx.queue.submit(Some(cmd.finish()));
 
-        let color_data = read_buffer_f32(ctx, &color_out, pixel_count_3);
-        let mut current_planes: [Vec<f32>; 3] = [
-            vec![0.0; padded_pixels],
-            vec![0.0; padded_pixels],
-            vec![0.0; padded_pixels],
-        ];
-        for i in 0..padded_pixels {
-            current_planes[0][i] = color_data[i * 3];
-            current_planes[1][i] = color_data[i * 3 + 1];
-            current_planes[2][i] = color_data[i * 3 + 2];
-        }
-
-        // Block matching on Y plane
-        let current_y_buf = ctx
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("pf_cur_y"),
-                contents: bytemuck::cast_slice(&current_planes[0]),
-                usage: wgpu::BufferUsages::STORAGE,
-            });
+        // Block matching on Y plane (already on GPU as plane_buf_a)
         let ref_y_buf = ctx
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -691,7 +803,7 @@ impl EncoderPipeline {
             });
         let (mv_buf, _sad_buf) =
             self.motion
-                .estimate(ctx, &mut cmd, &current_y_buf, &ref_y_buf, padded_w, padded_h);
+                .estimate(ctx, &mut cmd, &plane_buf_a, &ref_y_buf, padded_w, padded_h);
         ctx.queue.submit(Some(cmd.finish()));
 
         let blocks_x = padded_w / ME_BLOCK_SIZE;
@@ -700,48 +812,7 @@ impl EncoderPipeline {
         let mvs = MotionEstimator::read_motion_vectors(ctx, &mv_buf, total_blocks);
         let mv_buf_ro = MotionEstimator::upload_motion_vectors(ctx, &mvs);
 
-        // Compute residual planes: residual = current - MC(reference, MVs)
-        let mut residual_planes: [Vec<f32>; 3] = [Vec::new(), Vec::new(), Vec::new()];
-        for p in 0..3 {
-            let cur_buf = ctx
-                .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("pf_cur"),
-                    contents: bytemuck::cast_slice(&current_planes[p]),
-                    usage: wgpu::BufferUsages::STORAGE,
-                });
-            let ref_buf = ctx
-                .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("pf_ref"),
-                    contents: bytemuck::cast_slice(&ref_planes[p]),
-                    usage: wgpu::BufferUsages::STORAGE,
-                });
-            let residual_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("pf_residual"),
-                size: plane_size,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-                mapped_at_creation: false,
-            });
-
-            let mut cmd = ctx
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("pf_mc"),
-                });
-            self.motion.compensate(
-                ctx, &mut cmd, &cur_buf, &ref_buf, &mv_buf_ro, &residual_buf,
-                padded_w, padded_h, true,
-            );
-            ctx.queue.submit(Some(cmd.finish()));
-            residual_planes[p] = read_buffer_f32(ctx, &residual_buf, padded_pixels);
-        }
-
-        // Encode residual: wavelet → quantize → entropy
-        let plane_buf_a = create_plane_buffer(ctx, plane_size, "pf_a");
-        let plane_buf_b = create_plane_buffer(ctx, plane_size, "pf_b");
-        let plane_buf_c = create_plane_buffer(ctx, plane_size, "pf_c");
-
+        // MC + wavelet + quantize per plane, keeping data on GPU
         let entropy_mode = if config.entropy_coder == EntropyCoder::Bitplane {
             EntropyMode::Bitplane
         } else if config.per_subband_entropy {
@@ -754,16 +825,34 @@ impl EncoderPipeline {
         let tiles_y = info.tiles_y() as usize;
         let weights_luma = config.subband_weights.pack_weights();
         let weights_chroma = config.subband_weights.pack_weights_chroma();
+        let use_gpu_encode =
+            config.gpu_entropy_encode && config.entropy_coder != EntropyCoder::Bitplane;
 
         let mut rans_tiles: Vec<rans::InterleavedRansTile> = Vec::new();
         let mut subband_tiles: Vec<rans::SubbandRansTile> = Vec::new();
         let mut bp_tiles: Vec<bitplane::BitplaneTile> = Vec::new();
 
-        for p in 0..3 {
-            ctx.queue
-                .write_buffer(&plane_buf_a, 0, bytemuck::cast_slice(&residual_planes[p]));
+        // Current plane sources on GPU: [plane_buf_a(Y), co_plane_buf, cg_plane_buf]
+        let cur_plane_bufs = [&plane_buf_a, &co_plane_buf, &cg_plane_buf];
 
-            let weights = if p == 0 { &weights_luma } else { &weights_chroma };
+        for p in 0..3 {
+            let weights = if p == 0 {
+                &weights_luma
+            } else {
+                &weights_chroma
+            };
+
+            // Upload reference plane (from local decode of previous frame)
+            let ref_buf = ctx
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("pf_ref"),
+                    contents: bytemuck::cast_slice(&ref_planes[p]),
+                    usage: wgpu::BufferUsages::STORAGE,
+                });
+
+            // MC residual buffer: can't write to same buffer we read from
+            let mc_out = create_plane_buffer(ctx, plane_size, "pf_mc_out");
 
             let mut cmd = ctx
                 .device
@@ -771,23 +860,69 @@ impl EncoderPipeline {
                     label: Some("pf_enc"),
                 });
 
-            self.transform.forward(
-                ctx, &mut cmd, &plane_buf_a, &plane_buf_b, &plane_buf_c,
-                info, config.wavelet_levels, config.wavelet_type,
+            // MC: current - reference -> mc_out (residual)
+            self.motion.compensate(
+                ctx,
+                &mut cmd,
+                cur_plane_bufs[p],
+                &ref_buf,
+                &mv_buf_ro,
+                &mc_out,
+                padded_w,
+                padded_h,
+                true,
             );
 
+            // Copy residual to plane_buf_a for wavelet input
+            cmd.copy_buffer_to_buffer(&mc_out, 0, &plane_buf_a, 0, plane_size);
+
+            // Wavelet forward: plane_buf_a -> plane_buf_b(scratch) -> plane_buf_c
+            self.transform.forward(
+                ctx,
+                &mut cmd,
+                &plane_buf_a,
+                &plane_buf_b,
+                &plane_buf_c,
+                info,
+                config.wavelet_levels,
+                config.wavelet_type,
+            );
+
+            // Quantize: plane_buf_c -> plane_buf_b
             self.quantize.dispatch(
-                ctx, &mut cmd, &plane_buf_c, &plane_buf_b, padded_pixels as u32,
-                config.quantization_step, config.dead_zone, true,
-                padded_w, padded_h, config.tile_size, config.wavelet_levels, weights,
+                ctx,
+                &mut cmd,
+                &plane_buf_c,
+                &plane_buf_b,
+                padded_pixels as u32,
+                config.quantization_step,
+                config.dead_zone,
+                true,
+                padded_w,
+                padded_h,
+                config.tile_size,
+                config.wavelet_levels,
+                weights,
             );
             ctx.queue.submit(Some(cmd.finish()));
 
-            let quantized = read_buffer_f32(ctx, &plane_buf_b, padded_pixels);
-            entropy_encode_tiles(
-                &quantized, padded_w as usize, tiles_x, tiles_y, tile_size,
-                &entropy_mode, config.tile_size, config.wavelet_levels,
-                &mut rans_tiles, &mut subband_tiles, &mut bp_tiles,
+            // Entropy encode from plane_buf_b
+            Self::encode_entropy(
+                &mut self.gpu_encoder,
+                ctx,
+                &plane_buf_b,
+                padded_pixels,
+                padded_w as usize,
+                tiles_x,
+                tiles_y,
+                tile_size,
+                &entropy_mode,
+                config,
+                use_gpu_encode,
+                info,
+                &mut rans_tiles,
+                &mut subband_tiles,
+                &mut bp_tiles,
             );
         }
 
@@ -810,19 +945,27 @@ impl EncoderPipeline {
             }),
         };
 
-        // Local decode loop: dequant → inv wavelet → add prediction → new reference
+        // Local decode loop: dequant -> inv wavelet -> add prediction -> new reference
         let tiles_per_plane = tiles_x * tiles_y;
         let mut recon_planes: [Vec<f32>; 3] = [Vec::new(), Vec::new(), Vec::new()];
 
         for p in 0..3 {
             let quantized = entropy_decode_plane(
-                &compressed.entropy, p, tiles_per_plane, tile_size, padded_w as usize,
+                &compressed.entropy,
+                p,
+                tiles_per_plane,
+                tile_size,
+                padded_w as usize,
             );
 
             ctx.queue
                 .write_buffer(&plane_buf_a, 0, bytemuck::cast_slice(&quantized));
 
-            let weights = if p == 0 { &weights_luma } else { &weights_chroma };
+            let weights = if p == 0 {
+                &weights_luma
+            } else {
+                &weights_chroma
+            };
 
             let mut cmd = ctx
                 .device
@@ -831,14 +974,30 @@ impl EncoderPipeline {
                 });
 
             self.quantize.dispatch(
-                ctx, &mut cmd, &plane_buf_a, &plane_buf_b, padded_pixels as u32,
-                config.quantization_step, config.dead_zone, false,
-                padded_w, padded_h, config.tile_size, config.wavelet_levels, weights,
+                ctx,
+                &mut cmd,
+                &plane_buf_a,
+                &plane_buf_b,
+                padded_pixels as u32,
+                config.quantization_step,
+                config.dead_zone,
+                false,
+                padded_w,
+                padded_h,
+                config.tile_size,
+                config.wavelet_levels,
+                weights,
             );
 
             self.transform.inverse(
-                ctx, &mut cmd, &plane_buf_b, &plane_buf_c, &plane_buf_a,
-                info, config.wavelet_levels, config.wavelet_type,
+                ctx,
+                &mut cmd,
+                &plane_buf_b,
+                &plane_buf_c,
+                &plane_buf_a,
+                info,
+                config.wavelet_levels,
+                config.wavelet_type,
             );
             ctx.queue.submit(Some(cmd.finish()));
 
@@ -872,8 +1031,8 @@ impl EncoderPipeline {
                     label: Some("pf_ld_mc"),
                 });
             self.motion.compensate(
-                ctx, &mut cmd, &res_buf, &ref_buf, &mv_buf_ro, &recon_buf,
-                padded_w, padded_h, false,
+                ctx, &mut cmd, &res_buf, &ref_buf, &mv_buf_ro, &recon_buf, padded_w, padded_h,
+                false,
             );
             ctx.queue.submit(Some(cmd.finish()));
             recon_planes[p] = read_buffer_f32(ctx, &recon_buf, padded_pixels);
@@ -915,15 +1074,11 @@ fn entropy_decode_plane(
         let ty = t / tiles_x;
 
         let coeffs: Vec<i32> = match entropy {
-            EntropyData::Rans(tiles) => {
-                rans::rans_decode_tile_interleaved(&tiles[tile_start + t])
-            }
+            EntropyData::Rans(tiles) => rans::rans_decode_tile_interleaved(&tiles[tile_start + t]),
             EntropyData::SubbandRans(tiles) => {
                 rans::rans_decode_tile_interleaved_subband(&tiles[tile_start + t])
             }
-            EntropyData::Bitplane(tiles) => {
-                bitplane::bitplane_decode_tile(&tiles[tile_start + t])
-            }
+            EntropyData::Bitplane(tiles) => bitplane::bitplane_decode_tile(&tiles[tile_start + t]),
         };
 
         // Scatter tile coefficients back into flat plane
@@ -1220,10 +1375,7 @@ mod tests {
                 cf.frame_type,
                 cf.byte_size()
             );
-            assert!(
-                psnr > 25.0,
-                "Frame {i} PSNR too low: {psnr:.2} dB"
-            );
+            assert!(psnr > 25.0, "Frame {i} PSNR too low: {psnr:.2} dB");
         }
     }
 }

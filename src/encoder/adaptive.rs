@@ -242,6 +242,177 @@ pub fn compute_weight_map(
     }
 }
 
+/// GPU pipeline for normalizing the variance map into a weight map.
+///
+/// Replaces the CPU `compute_weight_map()` for the hot path.
+/// Single-workgroup dispatch handles all blocks.
+pub struct WeightMapNormalizer {
+    pipeline: wgpu::ComputePipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct WeightNormParams {
+    blocks_x: u32,
+    blocks_y: u32,
+    total_blocks: u32,
+    aq_strength: f32,
+}
+
+impl WeightMapNormalizer {
+    pub fn new(ctx: &GpuContext) -> Self {
+        let shader = ctx
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("weight_map_normalize"),
+                source: wgpu::ShaderSource::Wgsl(
+                    include_str!("../shaders/weight_map_normalize.wgsl").into(),
+                ),
+            });
+
+        let bind_group_layout =
+            ctx.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("weight_norm_bgl"),
+                    entries: &[
+                        // binding 0: uniform params
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        // binding 1: variance (read)
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        // binding 2: scratch (rw)
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 2,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        // binding 3: weight_map (rw)
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 3,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                    ],
+                });
+
+        let pipeline_layout = ctx
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("weight_norm_pl"),
+                bind_group_layouts: &[&bind_group_layout],
+                push_constant_ranges: &[],
+            });
+
+        let pipeline = ctx
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("weight_norm_pipeline"),
+                layout: Some(&pipeline_layout),
+                module: &shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+
+        Self {
+            pipeline,
+            bind_group_layout,
+        }
+    }
+
+    /// Dispatch weight map normalization on the GPU.
+    ///
+    /// Reads raw variance from `variance_buf`, writes normalized + smoothed
+    /// weights to `weight_map_buf`. `scratch_buf` is used as intermediate storage.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch(
+        &self,
+        ctx: &GpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+        variance_buf: &wgpu::Buffer,
+        scratch_buf: &wgpu::Buffer,
+        weight_map_buf: &wgpu::Buffer,
+        blocks_x: u32,
+        blocks_y: u32,
+        aq_strength: f32,
+    ) {
+        let total_blocks = blocks_x * blocks_y;
+        let params = WeightNormParams {
+            blocks_x,
+            blocks_y,
+            total_blocks,
+            aq_strength,
+        };
+
+        let params_buf = ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("weight_norm_params"),
+                contents: bytemuck::bytes_of(&params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+
+        let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("weight_norm_bg"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: variance_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: scratch_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: weight_map_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("weight_norm_pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(1, 1, 1);
+    }
+}
+
 /// 3x3 box-filter smoothing of the weight map.
 /// Reduces visible block boundaries in the adaptive quantization.
 fn smooth_weight_map(weights: &[f32], blocks_x: u32, blocks_y: u32) -> Vec<f32> {

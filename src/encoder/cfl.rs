@@ -368,6 +368,387 @@ impl CflPredictor {
     }
 }
 
+// ---------------------------------------------------------------------------
+// GPU-side forward prediction (encoder): CflForwardPredictor
+// ---------------------------------------------------------------------------
+
+/// GPU pipeline for CfL forward prediction (used by encoder).
+///
+/// Computes `output[i] = chroma[i] - alpha[tile][sb] * luma_ref[i]`
+pub struct CflForwardPredictor {
+    pipeline: wgpu::ComputePipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+}
+
+impl CflForwardPredictor {
+    pub fn new(ctx: &GpuContext) -> Self {
+        let shader = ctx
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("cfl_forward"),
+                source: wgpu::ShaderSource::Wgsl(
+                    include_str!("../shaders/cfl_forward.wgsl").into(),
+                ),
+            });
+
+        let bind_group_layout =
+            ctx.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("cfl_fwd_bgl"),
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 2,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 3,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 4,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                    ],
+                });
+
+        let pipeline_layout = ctx
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("cfl_fwd_pl"),
+                bind_group_layouts: &[&bind_group_layout],
+                push_constant_ranges: &[],
+            });
+
+        let pipeline = ctx
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("cfl_fwd_pipeline"),
+                layout: Some(&pipeline_layout),
+                module: &shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+
+        Self {
+            pipeline,
+            bind_group_layout,
+        }
+    }
+
+    /// Dispatch forward CfL prediction: residual = chroma - alpha * luma_ref
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch(
+        &self,
+        ctx: &GpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+        chroma_buf: &wgpu::Buffer,
+        luma_ref_buf: &wgpu::Buffer,
+        alpha_buf: &wgpu::Buffer,
+        output_buf: &wgpu::Buffer,
+        total_count: u32,
+        width: u32,
+        height: u32,
+        tile_size: u32,
+        num_levels: u32,
+    ) {
+        let nsb = num_subbands(num_levels);
+        let params = CflParams {
+            total_count,
+            width,
+            height,
+            tile_size,
+            num_levels,
+            num_subbands: nsb,
+            _pad0: 0,
+            _pad1: 0,
+        };
+
+        let params_buf = ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("cfl_fwd_params"),
+                contents: bytemuck::bytes_of(&params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+
+        let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("cfl_fwd_bg"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: chroma_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: luma_ref_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: alpha_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: output_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        let workgroups = total_count.div_ceil(256);
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("cfl_forward_pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(workgroups, 1, 1);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GPU-side alpha computation (encoder): CflAlphaComputer
+// ---------------------------------------------------------------------------
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct CflAlphaParams {
+    tile_pixels: u32,
+    tile_size: u32,
+    num_levels: u32,
+    num_subbands: u32,
+    width: u32,
+    height: u32,
+    tiles_x: u32,
+    _pad: u32,
+}
+
+/// GPU pipeline for computing per-tile per-subband CfL alpha values.
+///
+/// Outputs raw alphas (for CPU serialization) and dequantized alphas (for GPU forward prediction).
+pub struct CflAlphaComputer {
+    pipeline: wgpu::ComputePipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+}
+
+impl CflAlphaComputer {
+    pub fn new(ctx: &GpuContext) -> Self {
+        let shader = ctx
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("cfl_alpha"),
+                source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/cfl_alpha.wgsl").into()),
+            });
+
+        let bind_group_layout =
+            ctx.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("cfl_alpha_bgl"),
+                    entries: &[
+                        // binding 0: uniform params
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        // binding 1: recon_y (read)
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        // binding 2: chroma (read)
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 2,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        // binding 3: raw_alphas (rw)
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 3,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        // binding 4: dq_alphas (rw)
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 4,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                    ],
+                });
+
+        let pipeline_layout = ctx
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("cfl_alpha_pl"),
+                bind_group_layouts: &[&bind_group_layout],
+                push_constant_ranges: &[],
+            });
+
+        let pipeline = ctx
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("cfl_alpha_pipeline"),
+                layout: Some(&pipeline_layout),
+                module: &shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+
+        Self {
+            pipeline,
+            bind_group_layout,
+        }
+    }
+
+    /// Dispatch CfL alpha computation on the GPU.
+    ///
+    /// One workgroup per tile. Outputs raw and dequantized alphas.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch(
+        &self,
+        ctx: &GpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+        recon_y_buf: &wgpu::Buffer,
+        chroma_buf: &wgpu::Buffer,
+        raw_alpha_buf: &wgpu::Buffer,
+        dq_alpha_buf: &wgpu::Buffer,
+        width: u32,
+        height: u32,
+        tile_size: u32,
+        num_levels: u32,
+    ) {
+        let nsb = num_subbands(num_levels);
+        let tiles_x = width.div_ceil(tile_size);
+        let tiles_y = height.div_ceil(tile_size);
+        let total_tiles = tiles_x * tiles_y;
+        let tile_pixels = tile_size * tile_size;
+
+        let params = CflAlphaParams {
+            tile_pixels,
+            tile_size,
+            num_levels,
+            num_subbands: nsb,
+            width,
+            height,
+            tiles_x,
+            _pad: 0,
+        };
+
+        let params_buf = ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("cfl_alpha_params"),
+                contents: bytemuck::bytes_of(&params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+
+        let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("cfl_alpha_bg"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: recon_y_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: chroma_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: raw_alpha_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: dq_alpha_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("cfl_alpha_pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(total_tiles, 1, 1);
+    }
+}
+
 /// Upload dequantized alpha values as a GPU f32 buffer for the CfL shader.
 pub fn upload_alpha_buffer(ctx: &GpuContext, alphas_f32: &[f32]) -> wgpu::Buffer {
     ctx.device
@@ -376,6 +757,12 @@ pub fn upload_alpha_buffer(ctx: &GpuContext, alphas_f32: &[f32]) -> wgpu::Buffer
             contents: bytemuck::cast_slice(alphas_f32),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         })
+}
+
+/// Write dequantized alpha values into a pre-allocated GPU buffer via queue.write_buffer().
+pub fn write_alpha_buffer_into(ctx: &GpuContext, alphas_f32: &[f32], buf: &wgpu::Buffer) {
+    ctx.queue
+        .write_buffer(buf, 0, bytemuck::cast_slice(alphas_f32));
 }
 
 // ---------------------------------------------------------------------------

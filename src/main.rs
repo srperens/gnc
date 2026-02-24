@@ -26,9 +26,14 @@ enum Command {
         #[arg(short, long)]
         output: String,
 
-        /// Quantization step size
-        #[arg(short, long, default_value = "4.0")]
-        qstep: f32,
+        /// Quality preset (1-100). Sets qstep, wavelet, dead zone, etc. from research-tuned presets.
+        /// Individual flags (--qstep, --wavelet, etc.) override the preset when specified.
+        #[arg(short = 'q', long)]
+        quality: Option<u32>,
+
+        /// Quantization step size (overrides quality preset if both specified)
+        #[arg(long)]
+        qstep: Option<f32>,
 
         /// Tile size
         #[arg(short, long, default_value = "256")]
@@ -42,9 +47,9 @@ enum Command {
         #[arg(long)]
         bitplane: bool,
 
-        /// Wavelet type: 97 (CDF 9/7, default for lossy) or 53 (LeGall 5/3, for lossless)
-        #[arg(long, default_value = "97")]
-        wavelet: String,
+        /// Wavelet type: 97 (CDF 9/7) or 53 (LeGall 5/3). Overrides quality preset if specified.
+        #[arg(long)]
+        wavelet: Option<String>,
 
         /// Disable per-subband entropy coding (enabled by default)
         #[arg(long)]
@@ -80,6 +85,10 @@ enum Command {
         #[arg(long)]
         csv: Option<String>,
 
+        /// Quality preset (1-100, default 75 = good general-purpose quality)
+        #[arg(short = 'q', long, default_value = "75")]
+        quality: u32,
+
         /// Use bitplane entropy coder instead of rANS
         #[arg(long)]
         bitplane: bool,
@@ -103,9 +112,13 @@ enum Command {
         #[arg(short, long, default_value = "8")]
         keyframe_interval: u32,
 
-        /// Quantization step size
-        #[arg(short, long, default_value = "4.0")]
-        qstep: f32,
+        /// Quality preset (1-100). Sets qstep, wavelet, dead zone, etc.
+        #[arg(short = 'q', long)]
+        quality: Option<u32>,
+
+        /// Quantization step size (overrides quality preset if both specified)
+        #[arg(long)]
+        qstep: Option<f32>,
     },
 
     /// Run experiments on an input image
@@ -140,6 +153,17 @@ fn save_image_rgb_f32(path: &str, data: &[f32], width: u32, height: u32) {
     img.save(path).expect("Failed to save image");
 }
 
+fn parse_wavelet_type(s: &str) -> gnc::WaveletType {
+    match s {
+        "53" => gnc::WaveletType::LeGall53,
+        "97" => gnc::WaveletType::CDF97,
+        other => {
+            eprintln!("Unknown wavelet type: {}. Use: 53 or 97", other);
+            std::process::exit(1);
+        }
+    }
+}
+
 fn main() {
     env_logger::init();
     let cli = Cli::parse();
@@ -148,6 +172,7 @@ fn main() {
         Command::Encode {
             input,
             output,
+            quality,
             qstep,
             tile_size,
             no_cfl,
@@ -162,32 +187,40 @@ fn main() {
             let ctx = GpuContext::new();
             let mut encoder = EncoderPipeline::new(&ctx);
 
-            let wavelet_type = match wavelet.as_str() {
-                "53" => gnc::WaveletType::LeGall53,
-                "97" => gnc::WaveletType::CDF97,
-                other => {
-                    eprintln!("Unknown wavelet type: {}. Use: 53 or 97", other);
-                    std::process::exit(1);
+            // Build config: quality preset as base, or manual defaults
+            let mut config = if let Some(q) = quality {
+                println!("Quality preset: q={}", q);
+                gnc::quality_preset(q)
+            } else {
+                CodecConfig {
+                    quantization_step: qstep.unwrap_or(4.0),
+                    wavelet_type: parse_wavelet_type(wavelet.as_deref().unwrap_or("97")),
+                    cfl_enabled: true,
+                    per_subband_entropy: true,
+                    ..Default::default()
                 }
             };
 
-            let config = CodecConfig {
-                tile_size,
-                quantization_step: qstep,
-                dead_zone: 0.0,
-                wavelet_levels: 3,
-                subband_weights: gnc::SubbandWeights::uniform(3),
-                cfl_enabled: !no_cfl,
-                entropy_coder: if bitplane {
-                    gnc::EntropyCoder::Bitplane
-                } else {
-                    gnc::EntropyCoder::Rans
-                },
-                wavelet_type,
-                per_subband_entropy: !no_per_subband,
-                gpu_entropy_encode: !cpu_encode,
-                ..Default::default()
-            };
+            // Apply explicit CLI overrides
+            config.tile_size = tile_size;
+            if let Some(qs) = qstep {
+                config.quantization_step = qs;
+            }
+            if let Some(ref wv) = wavelet {
+                config.wavelet_type = parse_wavelet_type(wv);
+            }
+            if no_cfl {
+                config.cfl_enabled = false;
+            }
+            if bitplane {
+                config.entropy_coder = gnc::EntropyCoder::Bitplane;
+            }
+            if no_per_subband {
+                config.per_subband_entropy = false;
+            }
+            if cpu_encode {
+                config.gpu_entropy_encode = false;
+            }
 
             let compressed = encoder.encode(&ctx, &rgb_data, w, h, &config);
             println!(
@@ -231,30 +264,34 @@ fn main() {
             input,
             iterations,
             csv,
+            quality,
             bitplane,
             cpu_encode,
         } => {
             let (rgb_data, w, h) = load_image_rgb_f32(&input);
-            let coder_name = if bitplane { "bitplane" } else { "rANS" };
-            let encode_mode = if cpu_encode { "CPU" } else { "GPU" };
-            println!(
-                "Benchmark: {}x{} image, {} iterations, entropy: {} ({})",
-                w, h, iterations, coder_name, encode_mode
-            );
 
             let ctx = GpuContext::new();
             let mut encoder = EncoderPipeline::new(&ctx);
             let decoder = DecoderPipeline::new(&ctx);
 
-            let config = CodecConfig {
-                entropy_coder: if bitplane {
-                    gnc::EntropyCoder::Bitplane
-                } else {
-                    gnc::EntropyCoder::Rans
-                },
-                gpu_entropy_encode: !cpu_encode,
-                ..Default::default()
+            let mut config = gnc::quality_preset(quality);
+            if bitplane {
+                config.entropy_coder = gnc::EntropyCoder::Bitplane;
+            }
+            if cpu_encode {
+                config.gpu_entropy_encode = false;
+            }
+
+            let coder_name = match config.entropy_coder {
+                gnc::EntropyCoder::Bitplane => "bitplane".to_string(),
+                gnc::EntropyCoder::Rans if config.per_subband_entropy => "rANS subband".to_string(),
+                gnc::EntropyCoder::Rans => "rANS single-table".to_string(),
             };
+            let encode_mode = if config.gpu_entropy_encode { "GPU" } else { "CPU" };
+            println!(
+                "Benchmark: {}x{} image, {} iterations, q={}, entropy: {} ({})",
+                w, h, iterations, quality, coder_name, encode_mode
+            );
 
             // Quality measurement
             let compressed = encoder.encode(&ctx, &rgb_data, w, h, &config);
@@ -423,11 +460,16 @@ fn main() {
             input,
             num_frames,
             keyframe_interval,
+            quality,
             qstep,
         } => {
+            let qstep_display = qstep
+                .map(|q| format!("{}", q))
+                .or_else(|| quality.map(|q| format!("q={}", q)))
+                .unwrap_or_else(|| "4.0".to_string());
             println!(
-                "Sequence benchmark: pattern={}, frames={}, ki={}, qstep={}",
-                input, num_frames, keyframe_interval, qstep
+                "Sequence benchmark: pattern={}, frames={}, ki={}, {}",
+                input, num_frames, keyframe_interval, qstep_display
             );
 
             let ctx = GpuContext::new();
@@ -449,11 +491,18 @@ fn main() {
             let frame_refs: Vec<&[f32]> = frames_data.iter().map(|f| f.as_slice()).collect();
 
             // --- I+P encoding ---
-            let config_ip = CodecConfig {
-                quantization_step: qstep,
-                keyframe_interval,
-                ..Default::default()
+            let mut config_ip = if let Some(q) = quality {
+                gnc::quality_preset(q)
+            } else {
+                CodecConfig {
+                    quantization_step: qstep.unwrap_or(4.0),
+                    ..Default::default()
+                }
             };
+            if let Some(qs) = qstep {
+                config_ip.quantization_step = qs;
+            }
+            config_ip.keyframe_interval = keyframe_interval;
 
             let start = std::time::Instant::now();
             let compressed_ip = encoder.encode_sequence(&ctx, &frame_refs, w, h, &config_ip);
@@ -498,11 +547,8 @@ fn main() {
             );
 
             // --- All I-frame baseline ---
-            let config_i = CodecConfig {
-                quantization_step: qstep,
-                keyframe_interval: 1,
-                ..Default::default()
-            };
+            let mut config_i = config_ip.clone();
+            config_i.keyframe_interval = 1;
 
             let start = std::time::Instant::now();
             let compressed_i = encoder.encode_sequence(&ctx, &frame_refs, w, h, &config_i);

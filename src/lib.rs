@@ -211,6 +211,88 @@ impl Default for CodecConfig {
     }
 }
 
+/// Map a quality value (1–100) to codec parameters.
+///
+/// Higher values = better quality, larger files. Lower = more compression.
+/// Anchor points based on research log experiments:
+/// - 100: near-lossless (qstep=1, LeGall 5/3, uniform weights)
+/// - 90: high quality (qstep=2, CDF 9/7, CfL, per-subband)
+/// - 75: good quality (qstep=4, perceptual weights, dead zone 0.5)
+/// - 50: balanced (qstep=8, dead zone 0.75)
+/// - 25: high compression (qstep=16)
+/// - 10: maximum compression (qstep=32)
+///
+/// Intermediate values interpolate between anchor points (log-scale for qstep).
+pub fn quality_preset(q: u32) -> CodecConfig {
+    let q = q.clamp(1, 100);
+
+    struct Anchor {
+        q: u32,
+        qstep: f32,
+        dead_zone: f32,
+        perceptual: bool,
+        cdf97: bool,
+        cfl: bool,
+        per_subband: bool,
+    }
+
+    let anchors: &[Anchor] = &[
+        Anchor { q: 1,   qstep: 64.0, dead_zone: 1.0,  perceptual: true,  cdf97: true,  cfl: true,  per_subband: true },
+        Anchor { q: 10,  qstep: 32.0, dead_zone: 0.75, perceptual: true,  cdf97: true,  cfl: true,  per_subband: true },
+        Anchor { q: 25,  qstep: 16.0, dead_zone: 0.75, perceptual: true,  cdf97: true,  cfl: true,  per_subband: true },
+        Anchor { q: 50,  qstep: 8.0,  dead_zone: 0.75, perceptual: true,  cdf97: true,  cfl: true,  per_subband: true },
+        Anchor { q: 75,  qstep: 4.0,  dead_zone: 0.5,  perceptual: true,  cdf97: true,  cfl: true,  per_subband: true },
+        Anchor { q: 90,  qstep: 2.0,  dead_zone: 0.0,  perceptual: false, cdf97: true,  cfl: true,  per_subband: true },
+        Anchor { q: 100, qstep: 1.0,  dead_zone: 0.0,  perceptual: false, cdf97: false, cfl: false, per_subband: false },
+    ];
+
+    // Find surrounding anchors and interpolation factor
+    let (lo, hi, t) = if q <= anchors[0].q {
+        (&anchors[0], &anchors[0], 0.0f32)
+    } else if q >= anchors[anchors.len() - 1].q {
+        let last = &anchors[anchors.len() - 1];
+        (last, last, 0.0f32)
+    } else {
+        let idx = anchors.iter().position(|a| a.q >= q).unwrap();
+        if anchors[idx].q == q {
+            (&anchors[idx], &anchors[idx], 0.0f32)
+        } else {
+            let lo = &anchors[idx - 1];
+            let hi = &anchors[idx];
+            let t = (q - lo.q) as f32 / (hi.q - lo.q) as f32;
+            (lo, hi, t)
+        }
+    };
+
+    // Log-interpolate qstep for perceptually uniform spacing
+    let qstep = (lo.qstep.ln() + t * (hi.qstep.ln() - lo.qstep.ln())).exp();
+    // Linear-interpolate dead zone
+    let dead_zone = lo.dead_zone + t * (hi.dead_zone - lo.dead_zone);
+
+    // Discrete settings: use lower-quality anchor until midpoint
+    let disc = if t < 0.5 { lo } else { hi };
+
+    let wavelet_levels = 3;
+    CodecConfig {
+        quantization_step: qstep,
+        dead_zone,
+        wavelet_levels,
+        subband_weights: if disc.perceptual {
+            SubbandWeights::perceptual(wavelet_levels)
+        } else {
+            SubbandWeights::uniform(wavelet_levels)
+        },
+        cfl_enabled: disc.cfl,
+        wavelet_type: if disc.cdf97 {
+            WaveletType::CDF97
+        } else {
+            WaveletType::LeGall53
+        },
+        per_subband_entropy: disc.per_subband,
+        ..Default::default()
+    }
+}
+
 /// Entropy-coded tile data — rANS, per-subband rANS, or bitplane coded.
 /// Tiles are ordered: plane 0 tiles, plane 1 tiles, plane 2 tiles.
 #[derive(Debug, Clone)]

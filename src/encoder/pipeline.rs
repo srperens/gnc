@@ -1081,26 +1081,48 @@ impl EncoderPipeline {
                 config.wavelet_levels,
                 weights,
             );
+
+            // Save quantized for batched rANS (Y→recon_y, Co→co_plane, Cg stays in plane_b)
+            if use_gpu_encode && p == 0 {
+                cmd.copy_buffer_to_buffer(&bufs.plane_b, 0, &bufs.recon_y, 0, plane_size);
+            } else if use_gpu_encode && p == 1 {
+                cmd.copy_buffer_to_buffer(&bufs.plane_b, 0, &bufs.co_plane, 0, plane_size);
+            }
+
             ctx.queue.submit(Some(cmd.finish()));
 
-            // Entropy encode from plane_b
-            Self::encode_entropy(
-                &mut self.gpu_encoder,
+            if !use_gpu_encode {
+                Self::encode_entropy(
+                    &mut self.gpu_encoder,
+                    ctx,
+                    &bufs.plane_b,
+                    padded_pixels,
+                    padded_w as usize,
+                    tiles_x,
+                    tiles_y,
+                    tile_size,
+                    &entropy_mode,
+                    config,
+                    use_gpu_encode,
+                    info,
+                    &mut rans_tiles,
+                    &mut subband_tiles,
+                    &mut bp_tiles,
+                );
+            }
+        }
+
+        // Batched 3-plane rANS encode for P-frame
+        if use_gpu_encode {
+            let (mut rt, mut st) = self.gpu_encoder.encode_3planes_to_tiles(
                 ctx,
-                &bufs.plane_b,
-                padded_pixels,
-                padded_w as usize,
-                tiles_x,
-                tiles_y,
-                tile_size,
-                &entropy_mode,
-                config,
-                use_gpu_encode,
+                [&bufs.recon_y, &bufs.co_plane, &bufs.plane_b],
                 info,
-                &mut rans_tiles,
-                &mut subband_tiles,
-                &mut bp_tiles,
+                config.per_subband_entropy,
+                config.wavelet_levels,
             );
+            rans_tiles.append(&mut rt);
+            subband_tiles.append(&mut st);
         }
 
         let entropy = match entropy_mode {

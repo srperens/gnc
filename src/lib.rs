@@ -2,6 +2,9 @@ pub mod bench;
 pub mod decoder;
 pub mod encoder;
 pub mod experiments;
+pub mod format;
+pub mod gpu_util;
+pub mod image_util;
 
 use wgpu;
 
@@ -237,13 +240,69 @@ pub fn quality_preset(q: u32) -> CodecConfig {
     }
 
     let anchors: &[Anchor] = &[
-        Anchor { q: 1,   qstep: 64.0, dead_zone: 1.0,  perceptual: true,  cdf97: true,  cfl: true,  per_subband: true },
-        Anchor { q: 10,  qstep: 32.0, dead_zone: 0.75, perceptual: true,  cdf97: true,  cfl: true,  per_subband: true },
-        Anchor { q: 25,  qstep: 16.0, dead_zone: 0.75, perceptual: true,  cdf97: true,  cfl: true,  per_subband: true },
-        Anchor { q: 50,  qstep: 8.0,  dead_zone: 0.75, perceptual: true,  cdf97: true,  cfl: true,  per_subband: true },
-        Anchor { q: 75,  qstep: 4.0,  dead_zone: 0.5,  perceptual: true,  cdf97: true,  cfl: true,  per_subband: true },
-        Anchor { q: 90,  qstep: 2.0,  dead_zone: 0.0,  perceptual: false, cdf97: true,  cfl: true,  per_subband: true },
-        Anchor { q: 100, qstep: 1.0,  dead_zone: 0.0,  perceptual: false, cdf97: false, cfl: false, per_subband: false },
+        Anchor {
+            q: 1,
+            qstep: 64.0,
+            dead_zone: 1.0,
+            perceptual: true,
+            cdf97: true,
+            cfl: true,
+            per_subband: true,
+        },
+        Anchor {
+            q: 10,
+            qstep: 32.0,
+            dead_zone: 0.75,
+            perceptual: true,
+            cdf97: true,
+            cfl: true,
+            per_subband: true,
+        },
+        Anchor {
+            q: 25,
+            qstep: 16.0,
+            dead_zone: 0.75,
+            perceptual: true,
+            cdf97: true,
+            cfl: true,
+            per_subband: true,
+        },
+        Anchor {
+            q: 50,
+            qstep: 8.0,
+            dead_zone: 0.75,
+            perceptual: true,
+            cdf97: true,
+            cfl: true,
+            per_subband: true,
+        },
+        Anchor {
+            q: 75,
+            qstep: 4.0,
+            dead_zone: 0.5,
+            perceptual: true,
+            cdf97: true,
+            cfl: true,
+            per_subband: true,
+        },
+        Anchor {
+            q: 90,
+            qstep: 2.0,
+            dead_zone: 0.0,
+            perceptual: false,
+            cdf97: true,
+            cfl: true,
+            per_subband: true,
+        },
+        Anchor {
+            q: 100,
+            qstep: 1.0,
+            dead_zone: 0.0,
+            perceptual: false,
+            cdf97: false,
+            cfl: false,
+            per_subband: false,
+        },
     ];
 
     // Find surrounding anchors and interpolation factor

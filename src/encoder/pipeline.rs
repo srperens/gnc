@@ -10,6 +10,7 @@ use super::quantize::Quantizer;
 use super::rans;
 use super::rans_gpu_encode::GpuRansEncoder;
 use super::transform::WaveletTransform;
+use crate::gpu_util::{ensure_var_buf, read_buffer_f32};
 use crate::{
     CflAlphas, CodecConfig, CompressedFrame, EntropyCoder, EntropyData, FrameInfo, FrameType,
     GpuContext, MotionField,
@@ -314,7 +315,7 @@ impl EncoderPipeline {
             ctx.queue.submit(Some(cmd.finish()));
 
             // Small readback (~8KB for 1080p) for CompressedFrame serialization only
-            let wm = read_buffer_f32_cached(ctx, &bufs.weight_map_buf, total_blocks as usize);
+            let wm = read_buffer_f32(ctx, &bufs.weight_map_buf, total_blocks as usize);
             Some(wm)
         } else {
             ctx.queue.submit(Some(cmd.finish()));
@@ -431,9 +432,7 @@ impl EncoderPipeline {
 
                     // Save Y quantized for batched rANS encode
                     if use_gpu_encode {
-                        cmd.copy_buffer_to_buffer(
-                            &bufs.plane_b, 0, &bufs.mc_out, 0, plane_size,
-                        );
+                        cmd.copy_buffer_to_buffer(&bufs.plane_b, 0, &bufs.mc_out, 0, plane_size);
                     }
 
                     ctx.queue.submit(Some(cmd.finish()));
@@ -483,9 +482,7 @@ impl EncoderPipeline {
                     );
 
                     if use_gpu_encode {
-                        cmd.copy_buffer_to_buffer(
-                            &bufs.plane_b, 0, &bufs.mc_out, 0, plane_size,
-                        );
+                        cmd.copy_buffer_to_buffer(&bufs.plane_b, 0, &bufs.mc_out, 0, plane_size);
                     }
 
                     ctx.queue.submit(Some(cmd.finish()));
@@ -581,15 +578,13 @@ impl EncoderPipeline {
 
                 // Save Co quantized for batched rANS encode
                 if use_gpu_encode && p == 1 {
-                    cmd.copy_buffer_to_buffer(
-                        &bufs.plane_b, 0, &bufs.ref_upload, 0, plane_size,
-                    );
+                    cmd.copy_buffer_to_buffer(&bufs.plane_b, 0, &bufs.ref_upload, 0, plane_size);
                 }
 
                 ctx.queue.submit(Some(cmd.finish()));
 
                 // Tiny readback of raw alphas (~few hundred bytes) for u8 serialization
-                let raw_alphas = read_buffer_f32_cached(ctx, &bufs.raw_alpha, alpha_count);
+                let raw_alphas = read_buffer_f32(ctx, &bufs.raw_alpha, alpha_count);
                 let q_alphas: Vec<u8> =
                     raw_alphas.iter().map(|&a| cfl::quantize_alpha(a)).collect();
                 cfl_alphas_all.extend_from_slice(&q_alphas);
@@ -657,9 +652,7 @@ impl EncoderPipeline {
                 );
 
                 if use_gpu_encode && p == 1 {
-                    cmd.copy_buffer_to_buffer(
-                        &bufs.plane_b, 0, &bufs.ref_upload, 0, plane_size,
-                    );
+                    cmd.copy_buffer_to_buffer(&bufs.plane_b, 0, &bufs.ref_upload, 0, plane_size);
                 }
 
                 ctx.queue.submit(Some(cmd.finish()));
@@ -756,7 +749,7 @@ impl EncoderPipeline {
             rans_tiles.append(&mut rt);
             subband_tiles.append(&mut st);
         } else {
-            let quantized = read_buffer_f32_cached(ctx, quantized_buf, padded_pixels);
+            let quantized = read_buffer_f32(ctx, quantized_buf, padded_pixels);
             entropy_encode_tiles(
                 &quantized,
                 padded_w,
@@ -909,7 +902,7 @@ impl EncoderPipeline {
             );
 
             ctx.queue.submit(Some(cmd.finish()));
-            result_planes[p] = read_buffer_f32_cached(ctx, &bufs.plane_a, padded_pixels);
+            result_planes[p] = read_buffer_f32(ctx, &bufs.plane_a, padded_pixels);
         }
 
         result_planes
@@ -1218,66 +1211,11 @@ impl EncoderPipeline {
                 false,
             );
             ctx.queue.submit(Some(cmd.finish()));
-            recon_planes[p] = read_buffer_f32_cached(ctx, &bufs.recon_out, padded_pixels);
+            recon_planes[p] = read_buffer_f32(ctx, &bufs.recon_out, padded_pixels);
         }
 
         (compressed, recon_planes)
     }
-}
-
-/// Grow a variable-size cached buffer if the required size exceeds capacity (2× growth).
-fn ensure_var_buf(
-    ctx: &GpuContext,
-    buf: &mut wgpu::Buffer,
-    cap: &mut u64,
-    required: u64,
-    label: &str,
-    usage: wgpu::BufferUsages,
-) {
-    if required > *cap {
-        let new_cap = (required * 2).max(4);
-        *buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some(label),
-            size: new_cap,
-            usage,
-            mapped_at_creation: false,
-        });
-        *cap = new_cap;
-    }
-}
-
-/// Read a GPU buffer back to CPU as Vec<f32>, using a mapped_at_creation staging buffer
-/// to avoid requiring a separate copy command submission.
-fn read_buffer_f32_cached(ctx: &GpuContext, buffer: &wgpu::Buffer, count: usize) -> Vec<f32> {
-    let size = (count * std::mem::size_of::<f32>()) as u64;
-    let staging = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("staging_read"),
-        size,
-        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-
-    let mut cmd = ctx
-        .device
-        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("copy_to_staging"),
-        });
-    cmd.copy_buffer_to_buffer(buffer, 0, &staging, 0, size);
-    ctx.queue.submit(Some(cmd.finish()));
-
-    let slice = staging.slice(..);
-    let (tx, rx) = std::sync::mpsc::channel();
-    slice.map_async(wgpu::MapMode::Read, move |result| {
-        tx.send(result).unwrap();
-    });
-    ctx.device.poll(wgpu::Maintain::Wait);
-    rx.recv().unwrap().unwrap();
-
-    let data = slice.get_mapped_range();
-    let result: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
-    drop(data);
-    staging.unmap();
-    result
 }
 
 /// CPU entropy decode for a single plane: reconstruct quantized f32 coefficients from tiles.

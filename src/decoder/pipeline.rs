@@ -11,6 +11,7 @@ use crate::encoder::motion::{MotionEstimator, ME_BLOCK_SIZE};
 use crate::encoder::quantize::Quantizer;
 use crate::encoder::rans_gpu::GpuRansDecoder;
 use crate::encoder::transform::WaveletTransform;
+use crate::gpu_util::ensure_var_buf;
 use crate::{CompressedFrame, EntropyData, FrameType, GpuContext};
 
 /// Handle returned by `decode_to_texture` with metadata about the decoded frame.
@@ -678,27 +679,6 @@ impl DecoderPipeline {
         });
     }
 
-    /// Grow a variable-size buffer if it's too small, using 2× growth strategy.
-    fn ensure_var_buf(
-        ctx: &GpuContext,
-        buf: &mut wgpu::Buffer,
-        cap: &mut u64,
-        required: u64,
-        label: &str,
-        usage: wgpu::BufferUsages,
-    ) {
-        if required > *cap {
-            let new_cap = (required * 2).max(4);
-            *buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(label),
-                size: new_cap,
-                usage,
-                mapped_at_creation: false,
-            });
-            *cap = new_cap;
-        }
-    }
-
     /// Write per-frame data into pre-allocated cached buffers.
     /// Handles entropy data, CfL alphas, weight map, and motion vectors.
     fn prepare_frame_data(&self, ctx: &GpuContext, frame: &CompressedFrame) {
@@ -718,7 +698,7 @@ impl DecoderPipeline {
                     let a_size = (packed.cumfreq.len() * 4) as u64;
                     let b_size = (packed.stream_data.len() * 4) as u64;
 
-                    Self::ensure_var_buf(
+                    ensure_var_buf(
                         ctx,
                         &mut bufs.entropy_var_a[p],
                         &mut bufs.entropy_var_a_cap[p],
@@ -726,7 +706,7 @@ impl DecoderPipeline {
                         "dec_entropy_var_a",
                         storage_dst,
                     );
-                    Self::ensure_var_buf(
+                    ensure_var_buf(
                         ctx,
                         &mut bufs.entropy_var_b[p],
                         &mut bufs.entropy_var_b_cap[p],
@@ -764,7 +744,7 @@ impl DecoderPipeline {
                     let a_size = (packed.cumfreq.len() * 4) as u64;
                     let b_size = (packed.stream_data.len() * 4) as u64;
 
-                    Self::ensure_var_buf(
+                    ensure_var_buf(
                         ctx,
                         &mut bufs.entropy_var_a[p],
                         &mut bufs.entropy_var_a_cap[p],
@@ -772,7 +752,7 @@ impl DecoderPipeline {
                         "dec_entropy_var_a",
                         storage_dst,
                     );
-                    Self::ensure_var_buf(
+                    ensure_var_buf(
                         ctx,
                         &mut bufs.entropy_var_b[p],
                         &mut bufs.entropy_var_b_cap[p],
@@ -810,7 +790,7 @@ impl DecoderPipeline {
                     let a_size = (packed.block_info.len() * 4) as u64;
                     let b_size = (packed.bitplane_data.len() * 4) as u64;
 
-                    Self::ensure_var_buf(
+                    ensure_var_buf(
                         ctx,
                         &mut bufs.entropy_var_a[p],
                         &mut bufs.entropy_var_a_cap[p],
@@ -818,7 +798,7 @@ impl DecoderPipeline {
                         "dec_entropy_var_a",
                         storage_dst,
                     );
-                    Self::ensure_var_buf(
+                    ensure_var_buf(
                         ctx,
                         &mut bufs.entropy_var_b[p],
                         &mut bufs.entropy_var_b_cap[p],
@@ -859,7 +839,7 @@ impl DecoderPipeline {
                 .map(|&q| cfl::dequantize_alpha(q))
                 .collect();
             let alpha_size = (all_f32.len() * 4) as u64;
-            Self::ensure_var_buf(
+            ensure_var_buf(
                 ctx,
                 &mut bufs.cfl_alpha_buf,
                 &mut bufs.cfl_alpha_cap,
@@ -892,7 +872,7 @@ impl DecoderPipeline {
         // --- Weight map ---
         if let Some(wm) = &frame.weight_map {
             let wm_size = (wm.len() * 4) as u64;
-            Self::ensure_var_buf(
+            ensure_var_buf(
                 ctx,
                 &mut bufs.weight_map_buf,
                 &mut bufs.weight_map_cap,
@@ -907,7 +887,7 @@ impl DecoderPipeline {
         // --- Motion vectors ---
         if let Some(mf) = &frame.motion_field {
             let mv_size = (mf.vectors.len() * 2 * 4) as u64;
-            Self::ensure_var_buf(
+            ensure_var_buf(
                 ctx,
                 &mut bufs.mv_buf,
                 &mut bufs.mv_cap,

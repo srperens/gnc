@@ -757,13 +757,7 @@ impl GpuRansEncoder {
             }
 
             // Copy results to this plane's staging buffers
-            cmd.copy_buffer_to_buffer(
-                &bufs.stream_buf,
-                0,
-                &bufs.stream_staging[p],
-                0,
-                stream_size,
-            );
+            cmd.copy_buffer_to_buffer(&bufs.stream_buf, 0, &bufs.stream_staging[p], 0, stream_size);
             cmd.copy_buffer_to_buffer(&bufs.meta_buf, 0, &bufs.meta_staging[p], 0, meta_size);
             cmd.copy_buffer_to_buffer(
                 &bufs.cumfreq_buf,

@@ -535,8 +535,7 @@ fn main() {
             );
 
             // --- Comparison ---
-            let saving_pct =
-                (1.0 - total_bytes_ip as f64 / total_bytes_i as f64) * 100.0;
+            let saving_pct = (1.0 - total_bytes_ip as f64 / total_bytes_i as f64) * 100.0;
             println!(
                 "\n=== Comparison ===\n  I-only: {} bytes ({:.2} bpp)\n  I+P:    {} bytes ({:.2} bpp)\n  Saving: {:.1}%",
                 total_bytes_i, avg_bpp_i, total_bytes_ip, avg_bpp_ip, saving_pct,
@@ -773,8 +772,7 @@ fn deserialize_compressed(data: &[u8]) -> gnc::CompressedFrame {
         let mf = if ft == gnc::FrameType::Predicted {
             let block_size = u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap()) as u32;
             pos += 2;
-            let num_blocks =
-                u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+            let num_blocks = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
             pos += 4;
             let mut vectors = Vec::with_capacity(num_blocks);
             for _ in 0..num_blocks {
@@ -810,7 +808,11 @@ fn deserialize_compressed(data: &[u8]) -> gnc::CompressedFrame {
                 tiles.push(tile);
                 pos += consumed;
             }
-            (gnc::EntropyCoder::Rans, gnc::EntropyData::Rans(tiles), false)
+            (
+                gnc::EntropyCoder::Rans,
+                gnc::EntropyData::Rans(tiles),
+                false,
+            )
         }
         1 => {
             let mut tiles = Vec::with_capacity(num_tiles);

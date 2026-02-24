@@ -298,15 +298,15 @@ pub fn deserialize_tile_bitplane(data: &[u8]) -> (BitplaneTile, usize) {
 
 /// Per-tile info stride in u32s for the GPU bitplane decode shader.
 /// Layout: [num_blocks, block_info_offset, plane_tile_x, plane_tile_y, padding...]
-const BITPLANE_TILE_INFO_STRIDE: usize = 8;
+pub(crate) const BITPLANE_TILE_INFO_STRIDE: usize = 8;
 
 /// Per-block info stride in u32s.
 /// Layout: [max_bitplane, data_byte_offset, padding...]
-const BITPLANE_BLOCK_INFO_STRIDE: usize = 4;
+pub(crate) const BITPLANE_BLOCK_INFO_STRIDE: usize = 4;
 
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
-struct BitplaneDecodeParams {
+pub(crate) struct BitplaneDecodeParams {
     num_tiles: u32,
     coefficients_per_tile: u32,
     plane_width: u32,
@@ -315,6 +315,14 @@ struct BitplaneDecodeParams {
     block_size: u32,
     blocks_per_tile_side: u32,
     _pad: u32,
+}
+
+/// CPU-packed bitplane plane data, ready for writing into pre-allocated GPU buffers.
+pub(crate) struct PackedBitplanePlane {
+    pub params: BitplaneDecodeParams,
+    pub tile_info: Vec<u32>,
+    pub block_info: Vec<u32>,
+    pub bitplane_data: Vec<u32>,
 }
 
 /// GPU bitplane decoder.
@@ -422,14 +430,8 @@ impl GpuBitplaneDecoder {
         }
     }
 
-    /// Pack bitplane tiles into GPU buffers for a single plane.
-    /// Returns (params_buf, tile_info_buf, block_info_buf, bitplane_data_buf).
-    pub fn prepare_decode_buffers(
-        &self,
-        ctx: &GpuContext,
-        tiles: &[BitplaneTile],
-        info: &FrameInfo,
-    ) -> (wgpu::Buffer, wgpu::Buffer, wgpu::Buffer, wgpu::Buffer) {
+    /// Pack bitplane tile data into CPU arrays for one plane.
+    pub fn pack_decode_data(tiles: &[BitplaneTile], info: &FrameInfo) -> PackedBitplanePlane {
         let num_tiles = tiles.len();
         let tile_size = info.tile_size;
         let coefficients_per_tile = tile_size * tile_size;
@@ -449,15 +451,6 @@ impl GpuBitplaneDecoder {
             _pad: 0,
         };
 
-        let params_buf = ctx
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("bitplane_decode_params"),
-                contents: bytemuck::bytes_of(&params),
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
-
-        // Build packed buffers
         let total_blocks = num_tiles * blocks_per_tile;
         let mut tile_info_data = vec![0u32; num_tiles * BITPLANE_TILE_INFO_STRIDE];
         let mut block_info_data = vec![0u32; total_blocks * BITPLANE_BLOCK_INFO_STRIDE];
@@ -518,33 +511,56 @@ impl GpuBitplaneDecoder {
             .collect();
 
         // wgpu requires non-zero buffer sizes
-        let bitplane_data_final = if bitplane_data_u32.is_empty() {
+        let bitplane_data = if bitplane_data_u32.is_empty() {
             vec![0u32]
         } else {
             bitplane_data_u32
         };
 
+        PackedBitplanePlane {
+            params,
+            tile_info: tile_info_data,
+            block_info: block_info_data,
+            bitplane_data,
+        }
+    }
+
+    /// Pack bitplane tiles into GPU buffers for a single plane.
+    /// Returns (params_buf, tile_info_buf, block_info_buf, bitplane_data_buf).
+    pub fn prepare_decode_buffers(
+        &self,
+        ctx: &GpuContext,
+        tiles: &[BitplaneTile],
+        info: &FrameInfo,
+    ) -> (wgpu::Buffer, wgpu::Buffer, wgpu::Buffer, wgpu::Buffer) {
+        let packed = Self::pack_decode_data(tiles, info);
+
+        let params_buf = ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("bitplane_decode_params"),
+                contents: bytemuck::bytes_of(&packed.params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
         let tile_info_buf = ctx
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("bitplane_tile_info"),
-                contents: bytemuck::cast_slice(&tile_info_data),
+                contents: bytemuck::cast_slice(&packed.tile_info),
                 usage: wgpu::BufferUsages::STORAGE,
             });
-
         let block_info_buf = ctx
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("bitplane_block_info"),
-                contents: bytemuck::cast_slice(&block_info_data),
+                contents: bytemuck::cast_slice(&packed.block_info),
                 usage: wgpu::BufferUsages::STORAGE,
             });
-
         let bitplane_data_buf = ctx
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("bitplane_data"),
-                contents: bytemuck::cast_slice(&bitplane_data_final),
+                contents: bytemuck::cast_slice(&packed.bitplane_data),
                 usage: wgpu::BufferUsages::STORAGE,
             });
 

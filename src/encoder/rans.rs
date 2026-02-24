@@ -1480,8 +1480,7 @@ mod tests {
             coefficients[i] = (i % 11) as i32 - 5;
         }
 
-        let tile =
-            rans_encode_tile_interleaved_subband(&coefficients, 256, 3);
+        let tile = rans_encode_tile_interleaved_subband(&coefficients, 256, 3);
         assert_eq!(tile.num_groups, 4);
         let decoded = rans_decode_tile_interleaved_subband(&tile);
         assert_eq!(coefficients, decoded);
@@ -1490,8 +1489,7 @@ mod tests {
     #[test]
     fn test_subband_roundtrip_all_zeros() {
         let coefficients = vec![0i32; 65536];
-        let tile =
-            rans_encode_tile_interleaved_subband(&coefficients, 256, 3);
+        let tile = rans_encode_tile_interleaved_subband(&coefficients, 256, 3);
         let decoded = rans_decode_tile_interleaved_subband(&tile);
         assert_eq!(coefficients, decoded);
     }
@@ -1533,8 +1531,7 @@ mod tests {
             };
         }
 
-        let tile =
-            rans_encode_tile_interleaved_subband(&coefficients, 256, 3);
+        let tile = rans_encode_tile_interleaved_subband(&coefficients, 256, 3);
         let decoded = rans_decode_tile_interleaved_subband(&tile);
         assert_eq!(coefficients, decoded);
     }
@@ -1545,8 +1542,7 @@ mod tests {
         for i in (0..65536).step_by(3) {
             coefficients[i] = (i % 15) as i32 - 7;
         }
-        let tile =
-            rans_encode_tile_interleaved_subband(&coefficients, 256, 3);
+        let tile = rans_encode_tile_interleaved_subband(&coefficients, 256, 3);
         let serialized = serialize_tile_subband(&tile);
         let (deserialized, consumed) = deserialize_tile_subband(&serialized);
         assert_eq!(consumed, serialized.len());
@@ -1554,10 +1550,7 @@ mod tests {
         assert_eq!(deserialized.tile_size, tile.tile_size);
         assert_eq!(deserialized.num_levels, tile.num_levels);
         let decoded = rans_decode_tile_interleaved_subband(&deserialized);
-        assert_eq!(
-            coefficients, decoded,
-            "serialize roundtrip failed"
-        );
+        assert_eq!(coefficients, decoded, "serialize roundtrip failed");
     }
 
     #[test]
@@ -1569,8 +1562,7 @@ mod tests {
             coefficients[i] = (i % 20) as i32 - 10;
         }
         let single = rans_encode_tile_interleaved(&coefficients);
-        let subband =
-            rans_encode_tile_interleaved_subband(&coefficients, 256, 3);
+        let subband = rans_encode_tile_interleaved_subband(&coefficients, 256, 3);
         let decoded_single = rans_decode_tile_interleaved(&single);
         let decoded_subband = rans_decode_tile_interleaved_subband(&subband);
         assert_eq!(decoded_single, decoded_subband);
@@ -1596,8 +1588,7 @@ mod tests {
         }
 
         let single = rans_encode_tile_interleaved(&coefficients);
-        let subband =
-            rans_encode_tile_interleaved_subband(&coefficients, 256, 3);
+        let subband = rans_encode_tile_interleaved_subband(&coefficients, 256, 3);
 
         let single_bytes = single.byte_size();
         let subband_bytes = subband.byte_size();

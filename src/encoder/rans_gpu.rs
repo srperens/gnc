@@ -10,11 +10,11 @@ use wgpu::util::DeviceExt;
 use super::rans::{InterleavedRansTile, SubbandRansTile, STREAMS_PER_TILE};
 use crate::{FrameInfo, GpuContext};
 
-const TILE_INFO_STRIDE: usize = 100;
+pub(crate) const TILE_INFO_STRIDE: usize = 100;
 
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
-struct RansDecodeParams {
+pub(crate) struct RansDecodeParams {
     num_tiles: u32,
     coefficients_per_tile: u32,
     plane_width: u32,
@@ -23,6 +23,14 @@ struct RansDecodeParams {
     per_subband: u32,
     num_levels: u32,
     _pad2: u32,
+}
+
+/// CPU-packed rANS plane data, ready for writing into pre-allocated GPU buffers.
+pub(crate) struct PackedRansPlane {
+    pub params: RansDecodeParams,
+    pub tile_info: Vec<u32>,
+    pub cumfreq: Vec<u32>,
+    pub stream_data: Vec<u32>,
 }
 
 pub struct GpuRansDecoder {
@@ -129,14 +137,8 @@ impl GpuRansDecoder {
         }
     }
 
-    /// Pack interleaved tiles into GPU buffers for a single plane.
-    /// Returns (params_buf, tile_info_buf, cumfreq_buf, stream_data_buf).
-    pub fn prepare_decode_buffers(
-        &self,
-        ctx: &GpuContext,
-        tiles: &[InterleavedRansTile],
-        info: &FrameInfo,
-    ) -> (wgpu::Buffer, wgpu::Buffer, wgpu::Buffer, wgpu::Buffer) {
+    /// Pack interleaved rANS tile data into CPU arrays for one plane.
+    pub fn pack_decode_data(tiles: &[InterleavedRansTile], info: &FrameInfo) -> PackedRansPlane {
         let num_tiles = tiles.len();
         let tile_size = info.tile_size;
         let coefficients_per_tile = tile_size * tile_size;
@@ -154,15 +156,6 @@ impl GpuRansDecoder {
             _pad2: 0,
         };
 
-        let params_buf = ctx
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("rans_decode_params"),
-                contents: bytemuck::bytes_of(&params),
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
-
-        // Build packed buffers
         let mut tile_info_data = vec![0u32; num_tiles * TILE_INFO_STRIDE];
         let mut cumfreq_all: Vec<u32> = Vec::new();
         let mut stream_bytes_all: Vec<u8> = Vec::new();
@@ -222,55 +215,67 @@ impl GpuRansDecoder {
         if cumfreq_all.is_empty() {
             cumfreq_all.push(0);
         }
-        let stream_data_final = if stream_data_u32.is_empty() {
+        let stream_data = if stream_data_u32.is_empty() {
             vec![0u32]
         } else {
             stream_data_u32
         };
 
+        PackedRansPlane {
+            params,
+            tile_info: tile_info_data,
+            cumfreq: cumfreq_all,
+            stream_data,
+        }
+    }
+
+    /// Pack interleaved tiles into GPU buffers for a single plane.
+    /// Returns (params_buf, tile_info_buf, cumfreq_buf, stream_data_buf).
+    pub fn prepare_decode_buffers(
+        &self,
+        ctx: &GpuContext,
+        tiles: &[InterleavedRansTile],
+        info: &FrameInfo,
+    ) -> (wgpu::Buffer, wgpu::Buffer, wgpu::Buffer, wgpu::Buffer) {
+        let packed = Self::pack_decode_data(tiles, info);
+
+        let params_buf = ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("rans_decode_params"),
+                contents: bytemuck::bytes_of(&packed.params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
         let tile_info_buf = ctx
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("rans_tile_info"),
-                contents: bytemuck::cast_slice(&tile_info_data),
+                contents: bytemuck::cast_slice(&packed.tile_info),
                 usage: wgpu::BufferUsages::STORAGE,
             });
-
         let cumfreq_buf = ctx
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("rans_cumfreq"),
-                contents: bytemuck::cast_slice(&cumfreq_all),
+                contents: bytemuck::cast_slice(&packed.cumfreq),
                 usage: wgpu::BufferUsages::STORAGE,
             });
-
         let stream_data_buf = ctx
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("rans_stream_data"),
-                contents: bytemuck::cast_slice(&stream_data_final),
+                contents: bytemuck::cast_slice(&packed.stream_data),
                 usage: wgpu::BufferUsages::STORAGE,
             });
 
         (params_buf, tile_info_buf, cumfreq_buf, stream_data_buf)
     }
 
-    /// Pack per-subband interleaved tiles into GPU buffers for a single plane.
-    ///
-    /// Tile-info layout (per tile, 100 u32s):
-    ///   [0]: num_groups
-    ///   [1 + g*3 + 0]: group g min_val (bitcast i32→u32)
-    ///   [1 + g*3 + 1]: group g alphabet_size
-    ///   [1 + g*3 + 2]: group g cumfreq_offset into cumfreq_data
-    ///   [13]: stream_data_byte_base
-    ///   [14..46]: 32 initial states
-    ///   [46..78]: 32 stream byte offsets
-    pub fn prepare_decode_buffers_subband(
-        &self,
-        ctx: &GpuContext,
+    /// Pack per-subband interleaved rANS tile data into CPU arrays for one plane.
+    pub fn pack_decode_data_subband(
         tiles: &[SubbandRansTile],
         info: &FrameInfo,
-    ) -> (wgpu::Buffer, wgpu::Buffer, wgpu::Buffer, wgpu::Buffer) {
+    ) -> PackedRansPlane {
         let num_tiles = tiles.len();
         let tile_size = info.tile_size;
         let coefficients_per_tile = tile_size * tile_size;
@@ -292,14 +297,6 @@ impl GpuRansDecoder {
             num_levels,
             _pad2: 0,
         };
-
-        let params_buf = ctx
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("rans_decode_params_subband"),
-                contents: bytemuck::bytes_of(&params),
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
 
         let mut tile_info_data = vec![0u32; num_tiles * TILE_INFO_STRIDE];
         let mut cumfreq_all: Vec<u32> = Vec::new();
@@ -356,33 +353,64 @@ impl GpuRansDecoder {
         if cumfreq_all.is_empty() {
             cumfreq_all.push(0);
         }
-        let stream_data_final = if stream_data_u32.is_empty() {
+        let stream_data = if stream_data_u32.is_empty() {
             vec![0u32]
         } else {
             stream_data_u32
         };
 
+        PackedRansPlane {
+            params,
+            tile_info: tile_info_data,
+            cumfreq: cumfreq_all,
+            stream_data,
+        }
+    }
+
+    /// Pack per-subband interleaved tiles into GPU buffers for a single plane.
+    ///
+    /// Tile-info layout (per tile, 100 u32s):
+    ///   [0]: num_groups
+    ///   [1 + g*3 + 0]: group g min_val (bitcast i32→u32)
+    ///   [1 + g*3 + 1]: group g alphabet_size
+    ///   [1 + g*3 + 2]: group g cumfreq_offset into cumfreq_data
+    ///   [13]: stream_data_byte_base
+    ///   [14..46]: 32 initial states
+    ///   [46..78]: 32 stream byte offsets
+    pub fn prepare_decode_buffers_subband(
+        &self,
+        ctx: &GpuContext,
+        tiles: &[SubbandRansTile],
+        info: &FrameInfo,
+    ) -> (wgpu::Buffer, wgpu::Buffer, wgpu::Buffer, wgpu::Buffer) {
+        let packed = Self::pack_decode_data_subband(tiles, info);
+
+        let params_buf = ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("rans_decode_params_subband"),
+                contents: bytemuck::bytes_of(&packed.params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
         let tile_info_buf = ctx
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("rans_tile_info_subband"),
-                contents: bytemuck::cast_slice(&tile_info_data),
+                contents: bytemuck::cast_slice(&packed.tile_info),
                 usage: wgpu::BufferUsages::STORAGE,
             });
-
         let cumfreq_buf = ctx
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("rans_cumfreq_subband"),
-                contents: bytemuck::cast_slice(&cumfreq_all),
+                contents: bytemuck::cast_slice(&packed.cumfreq),
                 usage: wgpu::BufferUsages::STORAGE,
             });
-
         let stream_data_buf = ctx
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("rans_stream_data_subband"),
-                contents: bytemuck::cast_slice(&stream_data_final),
+                contents: bytemuck::cast_slice(&packed.stream_data),
                 usage: wgpu::BufferUsages::STORAGE,
             });
 

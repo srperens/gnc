@@ -215,16 +215,16 @@ impl GpuRansEncoder {
                 ),
             });
 
-        let histogram_bgl =
-            ctx.device
-                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                    label: Some("rans_histogram_bgl"),
-                    entries: &[
-                        make_uniform_entry(0),
-                        make_storage_entry(1, true),
-                        make_storage_entry(2, false),
-                    ],
-                });
+        let histogram_bgl = ctx
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("rans_histogram_bgl"),
+                entries: &[
+                    make_uniform_entry(0),
+                    make_storage_entry(1, true),
+                    make_storage_entry(2, false),
+                ],
+            });
 
         let hist_pl = ctx
             .device
@@ -255,17 +255,17 @@ impl GpuRansEncoder {
                 ),
             });
 
-        let normalize_bgl =
-            ctx.device
-                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                    label: Some("rans_normalize_bgl"),
-                    entries: &[
-                        make_uniform_entry(0),        // params
-                        make_storage_entry(1, true),   // hist_input
-                        make_storage_entry(2, false),  // cumfreq_out
-                        make_storage_entry(3, false),  // tile_info_out
-                    ],
-                });
+        let normalize_bgl = ctx
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("rans_normalize_bgl"),
+                entries: &[
+                    make_uniform_entry(0),        // params
+                    make_storage_entry(1, true),  // hist_input
+                    make_storage_entry(2, false), // cumfreq_out
+                    make_storage_entry(3, false), // tile_info_out
+                ],
+            });
 
         let norm_pl = ctx
             .device
@@ -296,19 +296,19 @@ impl GpuRansEncoder {
                 ),
             });
 
-        let encode_bgl =
-            ctx.device
-                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                    label: Some("rans_encode_bgl"),
-                    entries: &[
-                        make_uniform_entry(0),
-                        make_storage_entry(1, true),
-                        make_storage_entry(2, true),
-                        make_storage_entry(3, true),
-                        make_storage_entry(4, false),
-                        make_storage_entry(5, false),
-                    ],
-                });
+        let encode_bgl = ctx
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("rans_encode_bgl"),
+                entries: &[
+                    make_uniform_entry(0),
+                    make_storage_entry(1, true),
+                    make_storage_entry(2, true),
+                    make_storage_entry(3, true),
+                    make_storage_entry(4, false),
+                    make_storage_entry(5, false),
+                ],
+            });
 
         let enc_pl = ctx
             .device
@@ -515,13 +515,7 @@ impl GpuRansEncoder {
 
         cmd.copy_buffer_to_buffer(&bufs.stream_buf, 0, &bufs.stream_staging, 0, stream_size);
         cmd.copy_buffer_to_buffer(&bufs.meta_buf, 0, &bufs.meta_staging, 0, meta_size);
-        cmd.copy_buffer_to_buffer(
-            &bufs.cumfreq_buf,
-            0,
-            &bufs.cumfreq_staging,
-            0,
-            cumfreq_size,
-        );
+        cmd.copy_buffer_to_buffer(&bufs.cumfreq_buf, 0, &bufs.cumfreq_staging, 0, cumfreq_size);
         cmd.copy_buffer_to_buffer(
             &bufs.tile_info_buf,
             0,

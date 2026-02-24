@@ -1,14 +1,13 @@
 use bytemuck::{Pod, Zeroable};
 use std::cell::RefCell;
 use wgpu;
-use wgpu::util::DeviceExt;
 
 use crate::encoder::adaptive::AQ_BLOCK_SIZE;
 use crate::encoder::bitplane::GpuBitplaneDecoder;
 use crate::encoder::cfl::{self, CflPredictor};
 use crate::encoder::color::ColorConverter;
 use crate::encoder::interleave::PlaneInterleaver;
-use crate::encoder::motion::MotionEstimator;
+use crate::encoder::motion::{MotionEstimator, ME_BLOCK_SIZE};
 use crate::encoder::quantize::Quantizer;
 use crate::encoder::rans_gpu::GpuRansDecoder;
 use crate::encoder::transform::WaveletTransform;
@@ -33,11 +32,14 @@ struct PackParams {
 }
 
 /// Cached GPU buffers for decode — allocated once, reused across frames.
+/// Zero buffer allocations in steady-state decode: all buffers pre-allocated
+/// on resolution init, data uploaded via queue.write_buffer().
 struct CachedBuffers {
     padded_w: u32,
     padded_h: u32,
     width: u32,
     height: u32,
+    tile_size: u32,
     scratch_a: wgpu::Buffer,
     scratch_b: wgpu::Buffer,
     scratch_c: wgpu::Buffer,
@@ -52,19 +54,30 @@ struct CachedBuffers {
     y_ref_wavelet_buf: wgpu::Buffer,
     /// Reference planes from previous decoded frame (for temporal prediction)
     reference_planes: [wgpu::Buffer; 3],
-}
 
-/// Prepared entropy decode buffers — either rANS or bitplane, ready for GPU dispatch.
-enum PreparedEntropyBufs {
-    /// Per-plane: (params, tile_info, cumfreq, stream_data)
-    Rans(Vec<(wgpu::Buffer, wgpu::Buffer, wgpu::Buffer, wgpu::Buffer)>),
-    /// Per-plane: ((params, tile_info, block_info, bitplane_data), total_blocks)
-    Bitplane(
-        Vec<(
-            (wgpu::Buffer, wgpu::Buffer, wgpu::Buffer, wgpu::Buffer),
-            u32,
-        )>,
-    ),
+    // Per-plane entropy decode buffers (reused across frames)
+    entropy_params: [wgpu::Buffer; 3],
+    entropy_tile_info: [wgpu::Buffer; 3],
+    entropy_var_a: [wgpu::Buffer; 3],
+    entropy_var_b: [wgpu::Buffer; 3],
+    entropy_var_a_cap: [u64; 3],
+    entropy_var_b_cap: [u64; 3],
+
+    // Fixed small params buffers (written once per resolution)
+    crop_params_buf: wgpu::Buffer,
+    pack_params_buf: wgpu::Buffer,
+
+    // CfL buffers (reused when CfL enabled)
+    cfl_alpha_buf: wgpu::Buffer,
+    cfl_alpha_cap: u64,
+    plane_alpha_bufs: [wgpu::Buffer; 2],
+    plane_alpha_cap: u64,
+
+    // Conditional per-frame uploads
+    weight_map_buf: wgpu::Buffer,
+    weight_map_cap: u64,
+    mv_buf: wgpu::Buffer,
+    mv_cap: u64,
 }
 
 /// Full decoding pipeline: GPU rANS Decode -> Dequantize -> Inverse Wavelet -> Interleave -> Inverse Color -> Crop
@@ -244,6 +257,7 @@ impl DecoderPipeline {
         padded_h: u32,
         width: u32,
         height: u32,
+        tile_size: u32,
     ) {
         let mut cached = self.cached.borrow_mut();
         if let Some(ref c) = *cached {
@@ -251,6 +265,7 @@ impl DecoderPipeline {
                 && c.padded_h == padded_h
                 && c.width == width
                 && c.height == height
+                && c.tile_size == tile_size
             {
                 return;
             }
@@ -353,11 +368,133 @@ impl DecoderPipeline {
             })
         });
 
+        // --- Pre-allocated entropy decode buffers ---
+        let tiles_per_plane =
+            ((padded_w / tile_size) * (padded_h / tile_size)) as usize;
+        // rANS TILE_INFO_STRIDE (100) > bitplane (8), so use rANS stride for max
+        let tile_info_size =
+            (tiles_per_plane * crate::encoder::rans_gpu::TILE_INFO_STRIDE * 4).max(4) as u64;
+        let var_a_init_cap = (tiles_per_plane * 2048 * 4).max(4) as u64;
+        let var_b_init_cap = plane_size.max(4);
+
+        let storage_dst =
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
+        let uniform_dst =
+            wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST;
+
+        let entropy_params: [wgpu::Buffer; 3] = std::array::from_fn(|p| {
+            ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(&format!("dec_entropy_params_{p}")),
+                size: 32,
+                usage: uniform_dst,
+                mapped_at_creation: false,
+            })
+        });
+        let entropy_tile_info: [wgpu::Buffer; 3] = std::array::from_fn(|p| {
+            ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(&format!("dec_entropy_tile_info_{p}")),
+                size: tile_info_size,
+                usage: storage_dst,
+                mapped_at_creation: false,
+            })
+        });
+        let entropy_var_a: [wgpu::Buffer; 3] = std::array::from_fn(|p| {
+            ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(&format!("dec_entropy_var_a_{p}")),
+                size: var_a_init_cap,
+                usage: storage_dst,
+                mapped_at_creation: false,
+            })
+        });
+        let entropy_var_b: [wgpu::Buffer; 3] = std::array::from_fn(|p| {
+            ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(&format!("dec_entropy_var_b_{p}")),
+                size: var_b_init_cap,
+                usage: storage_dst,
+                mapped_at_creation: false,
+            })
+        });
+
+        // Crop params (constant per resolution)
+        let crop_params = CropParams {
+            src_width: padded_w,
+            dst_width: width,
+            dst_height: height,
+            _pad: 0,
+        };
+        let crop_params_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dec_crop_params"),
+            size: std::mem::size_of::<CropParams>() as u64,
+            usage: uniform_dst,
+            mapped_at_creation: false,
+        });
+        ctx.queue
+            .write_buffer(&crop_params_buf, 0, bytemuck::bytes_of(&crop_params));
+
+        // Pack params (constant per resolution)
+        let pack_params = PackParams {
+            total_f32s: total_f32s as u32,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
+        };
+        let pack_params_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dec_pack_params"),
+            size: std::mem::size_of::<PackParams>() as u64,
+            usage: uniform_dst,
+            mapped_at_creation: false,
+        });
+        ctx.queue
+            .write_buffer(&pack_params_buf, 0, bytemuck::bytes_of(&pack_params));
+
+        // CfL alpha buffers
+        let cfl_alpha_cap = (tiles_per_plane * 16 * 2 * 4).max(4) as u64;
+        let cfl_alpha_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dec_cfl_alpha"),
+            size: cfl_alpha_cap,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let plane_alpha_cap = (tiles_per_plane * 16 * 4).max(4) as u64;
+        let plane_alpha_bufs: [wgpu::Buffer; 2] = std::array::from_fn(|i| {
+            ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(&format!("dec_plane_alpha_{i}")),
+                size: plane_alpha_cap,
+                usage: storage_dst,
+                mapped_at_creation: false,
+            })
+        });
+
+        // Weight map buffer
+        let aq_blocks_x = padded_w.div_ceil(AQ_BLOCK_SIZE);
+        let aq_blocks_y = padded_h.div_ceil(AQ_BLOCK_SIZE);
+        let weight_map_cap = (aq_blocks_x * aq_blocks_y * 4).max(4) as u64;
+        let weight_map_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dec_weight_map"),
+            size: weight_map_cap,
+            usage: storage_dst,
+            mapped_at_creation: false,
+        });
+
+        // Motion vector buffer
+        let mv_blocks_x = padded_w / ME_BLOCK_SIZE;
+        let mv_blocks_y = padded_h / ME_BLOCK_SIZE;
+        let mv_cap = (mv_blocks_x * mv_blocks_y * 2 * 4).max(4) as u64;
+        let mv_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dec_mv"),
+            size: mv_cap,
+            usage: storage_dst,
+            mapped_at_creation: false,
+        });
+
         *cached = Some(CachedBuffers {
             padded_w,
             padded_h,
             width,
             height,
+            tile_size,
             scratch_a,
             scratch_b,
             scratch_c,
@@ -370,52 +507,190 @@ impl DecoderPipeline {
             staging_u8,
             y_ref_wavelet_buf,
             reference_planes,
+            entropy_params,
+            entropy_tile_info,
+            entropy_var_a,
+            entropy_var_b,
+            entropy_var_a_cap: [var_a_init_cap; 3],
+            entropy_var_b_cap: [var_b_init_cap; 3],
+            crop_params_buf,
+            pack_params_buf,
+            cfl_alpha_buf,
+            cfl_alpha_cap,
+            plane_alpha_bufs,
+            plane_alpha_cap,
+            weight_map_buf,
+            weight_map_cap,
+            mv_buf,
+            mv_cap,
         });
     }
 
-    /// Upload the weight map from the compressed frame to GPU, if present.
-    fn upload_weight_map(
-        &self,
+    /// Grow a variable-size buffer if it's too small, using 2× growth strategy.
+    fn ensure_var_buf(
         ctx: &GpuContext,
-        frame: &CompressedFrame,
-    ) -> Option<(wgpu::Buffer, u32)> {
-        let wm = frame.weight_map.as_ref()?;
-        let padded_w = frame.info.padded_width();
-        let blocks_x = (padded_w + AQ_BLOCK_SIZE - 1) / AQ_BLOCK_SIZE;
-
-        let buf = ctx
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("dec_weight_map"),
-                contents: bytemuck::cast_slice(wm),
-                usage: wgpu::BufferUsages::STORAGE,
+        buf: &mut wgpu::Buffer,
+        cap: &mut u64,
+        required: u64,
+        label: &str,
+        usage: wgpu::BufferUsages,
+    ) {
+        if required > *cap {
+            let new_cap = (required * 2).max(4);
+            *buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: new_cap,
+                usage,
+                mapped_at_creation: false,
             });
-        Some((buf, blocks_x))
+            *cap = new_cap;
+        }
     }
 
-    /// Upload motion vectors from compressed frame to GPU, if present.
-    fn upload_motion_vectors(
-        &self,
-        ctx: &GpuContext,
-        frame: &CompressedFrame,
-    ) -> Option<wgpu::Buffer> {
-        let mf = frame.motion_field.as_ref()?;
-        Some(MotionEstimator::upload_motion_vectors(ctx, &mf.vectors))
+    /// Write per-frame data into pre-allocated cached buffers.
+    /// Handles entropy data, CfL alphas, weight map, and motion vectors.
+    fn prepare_frame_data(&self, ctx: &GpuContext, frame: &CompressedFrame) {
+        let mut cached = self.cached.borrow_mut();
+        let bufs = cached.as_mut().unwrap();
+        let info = &frame.info;
+        let tiles_per_plane = info.tiles_x() as usize * info.tiles_y() as usize;
+
+        let storage_dst =
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
+
+        // --- Entropy data ---
+        match &frame.entropy {
+            EntropyData::Rans(tiles) => {
+                for p in 0..3 {
+                    let plane_tiles = &tiles[p * tiles_per_plane..(p + 1) * tiles_per_plane];
+                    let packed = GpuRansDecoder::pack_decode_data(plane_tiles, info);
+                    let a_size = (packed.cumfreq.len() * 4) as u64;
+                    let b_size = (packed.stream_data.len() * 4) as u64;
+
+                    Self::ensure_var_buf(
+                        ctx, &mut bufs.entropy_var_a[p], &mut bufs.entropy_var_a_cap[p],
+                        a_size, "dec_entropy_var_a", storage_dst,
+                    );
+                    Self::ensure_var_buf(
+                        ctx, &mut bufs.entropy_var_b[p], &mut bufs.entropy_var_b_cap[p],
+                        b_size, "dec_entropy_var_b", storage_dst,
+                    );
+
+                    ctx.queue.write_buffer(&bufs.entropy_params[p], 0, bytemuck::bytes_of(&packed.params));
+                    ctx.queue.write_buffer(&bufs.entropy_tile_info[p], 0, bytemuck::cast_slice(&packed.tile_info));
+                    ctx.queue.write_buffer(&bufs.entropy_var_a[p], 0, bytemuck::cast_slice(&packed.cumfreq));
+                    ctx.queue.write_buffer(&bufs.entropy_var_b[p], 0, bytemuck::cast_slice(&packed.stream_data));
+                }
+            }
+            EntropyData::SubbandRans(tiles) => {
+                for p in 0..3 {
+                    let plane_tiles = &tiles[p * tiles_per_plane..(p + 1) * tiles_per_plane];
+                    let packed = GpuRansDecoder::pack_decode_data_subband(plane_tiles, info);
+                    let a_size = (packed.cumfreq.len() * 4) as u64;
+                    let b_size = (packed.stream_data.len() * 4) as u64;
+
+                    Self::ensure_var_buf(
+                        ctx, &mut bufs.entropy_var_a[p], &mut bufs.entropy_var_a_cap[p],
+                        a_size, "dec_entropy_var_a", storage_dst,
+                    );
+                    Self::ensure_var_buf(
+                        ctx, &mut bufs.entropy_var_b[p], &mut bufs.entropy_var_b_cap[p],
+                        b_size, "dec_entropy_var_b", storage_dst,
+                    );
+
+                    ctx.queue.write_buffer(&bufs.entropy_params[p], 0, bytemuck::bytes_of(&packed.params));
+                    ctx.queue.write_buffer(&bufs.entropy_tile_info[p], 0, bytemuck::cast_slice(&packed.tile_info));
+                    ctx.queue.write_buffer(&bufs.entropy_var_a[p], 0, bytemuck::cast_slice(&packed.cumfreq));
+                    ctx.queue.write_buffer(&bufs.entropy_var_b[p], 0, bytemuck::cast_slice(&packed.stream_data));
+                }
+            }
+            EntropyData::Bitplane(tiles) => {
+                for p in 0..3 {
+                    let plane_tiles = &tiles[p * tiles_per_plane..(p + 1) * tiles_per_plane];
+                    let packed = GpuBitplaneDecoder::pack_decode_data(plane_tiles, info);
+                    let a_size = (packed.block_info.len() * 4) as u64;
+                    let b_size = (packed.bitplane_data.len() * 4) as u64;
+
+                    Self::ensure_var_buf(
+                        ctx, &mut bufs.entropy_var_a[p], &mut bufs.entropy_var_a_cap[p],
+                        a_size, "dec_entropy_var_a", storage_dst,
+                    );
+                    Self::ensure_var_buf(
+                        ctx, &mut bufs.entropy_var_b[p], &mut bufs.entropy_var_b_cap[p],
+                        b_size, "dec_entropy_var_b", storage_dst,
+                    );
+
+                    ctx.queue.write_buffer(&bufs.entropy_params[p], 0, bytemuck::bytes_of(&packed.params));
+                    ctx.queue.write_buffer(&bufs.entropy_tile_info[p], 0, bytemuck::cast_slice(&packed.tile_info));
+                    ctx.queue.write_buffer(&bufs.entropy_var_a[p], 0, bytemuck::cast_slice(&packed.block_info));
+                    ctx.queue.write_buffer(&bufs.entropy_var_b[p], 0, bytemuck::cast_slice(&packed.bitplane_data));
+                }
+            }
+        }
+
+        // --- CfL alphas ---
+        if let Some(cfl_data) = &frame.cfl_alphas {
+            let all_f32: Vec<f32> = cfl_data
+                .alphas
+                .iter()
+                .map(|&q| cfl::dequantize_alpha(q))
+                .collect();
+            let alpha_size = (all_f32.len() * 4) as u64;
+            Self::ensure_var_buf(
+                ctx, &mut bufs.cfl_alpha_buf, &mut bufs.cfl_alpha_cap,
+                alpha_size, "dec_cfl_alpha",
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            );
+            cfl::write_alpha_buffer_into(ctx, &all_f32, &bufs.cfl_alpha_buf);
+
+            // Ensure plane_alpha_bufs are large enough
+            let nsb = cfl_data.num_subbands as usize;
+            let alphas_per_plane = tiles_per_plane * nsb;
+            let plane_alpha_size = (alphas_per_plane * 4) as u64;
+            if plane_alpha_size > bufs.plane_alpha_cap {
+                let new_cap = (plane_alpha_size * 2).max(4);
+                for i in 0..2 {
+                    bufs.plane_alpha_bufs[i] = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some(&format!("dec_plane_alpha_{i}")),
+                        size: new_cap,
+                        usage: storage_dst,
+                        mapped_at_creation: false,
+                    });
+                }
+                bufs.plane_alpha_cap = new_cap;
+            }
+        }
+
+        // --- Weight map ---
+        if let Some(wm) = &frame.weight_map {
+            let wm_size = (wm.len() * 4) as u64;
+            Self::ensure_var_buf(
+                ctx, &mut bufs.weight_map_buf, &mut bufs.weight_map_cap,
+                wm_size, "dec_weight_map", storage_dst,
+            );
+            ctx.queue
+                .write_buffer(&bufs.weight_map_buf, 0, bytemuck::cast_slice(wm));
+        }
+
+        // --- Motion vectors ---
+        if let Some(mf) = &frame.motion_field {
+            let mv_size = (mf.vectors.len() * 2 * 4) as u64;
+            Self::ensure_var_buf(
+                ctx, &mut bufs.mv_buf, &mut bufs.mv_cap,
+                mv_size, "dec_mv", storage_dst,
+            );
+            MotionEstimator::write_motion_vectors_into(ctx, &mf.vectors, &bufs.mv_buf);
+        }
     }
 
     /// Encode GPU commands for the full decode pipeline up to and including crop.
-    /// Returns the command encoder with all work recorded, plus the crop params buffer
-    /// (which must stay alive until submission).
-    #[allow(clippy::too_many_arguments)]
+    /// All buffers are read from CachedBuffers (written by prepare_frame_data).
     fn encode_gpu_work(
         &self,
         ctx: &GpuContext,
         frame: &CompressedFrame,
         bufs: &CachedBuffers,
-        entropy_bufs: &PreparedEntropyBufs,
-        weight_map_gpu: &Option<(wgpu::Buffer, u32)>,
-        mv_buf: &Option<wgpu::Buffer>,
-    ) -> (wgpu::CommandEncoder, wgpu::Buffer) {
+    ) -> wgpu::CommandEncoder {
         let info = &frame.info;
         let config = &frame.config;
         let padded_w = info.padded_width();
@@ -423,6 +698,8 @@ impl DecoderPipeline {
         let padded_pixels = (padded_w * padded_h) as usize;
         let is_pframe = frame.frame_type == FrameType::Predicted;
         let tiles_per_plane = info.tiles_x() as usize * info.tiles_y() as usize;
+        let blocks_per_tile_side = info.tile_size as usize / 32;
+        let blocks_per_tile = blocks_per_tile_side * blocks_per_tile_side;
 
         let weights_luma = config.subband_weights.pack_weights();
         let weights_chroma = config.subband_weights.pack_weights_chroma();
@@ -431,76 +708,47 @@ impl DecoderPipeline {
         let h = info.height;
         let output_pixels = (w * h) as u32;
 
-        let crop_params = CropParams {
-            src_width: padded_w,
-            dst_width: w,
-            dst_height: h,
-            _pad: 0,
-        };
-        let crop_params_buf = ctx
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("crop_params"),
-                contents: bytemuck::bytes_of(&crop_params),
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
-
         let mut cmd = ctx
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("decode_full"),
             });
 
-        // Prepare CfL alpha buffer if needed
+        // CfL metadata
         let has_cfl = frame.cfl_alphas.is_some();
-        let cfl_alpha_buf = if has_cfl {
+        let cfl_alphas_per_plane = if has_cfl {
             let cfl_data = frame.cfl_alphas.as_ref().unwrap();
-            let nsb = cfl_data.num_subbands;
-            let total_tiles = info.tiles_x() as usize * info.tiles_y() as usize;
-            // Dequantize all alphas to f32 for the GPU shader
-            // Layout: [Co alphas for all tiles][Cg alphas for all tiles]
-            // Each chroma plane's alphas = total_tiles * nsb values
-            let alphas_per_plane = total_tiles * nsb as usize;
-            let all_f32: Vec<f32> = cfl_data
-                .alphas
-                .iter()
-                .map(|&q| cfl::dequantize_alpha(q))
-                .collect();
-            // We'll index into this per plane during dispatch
-            Some((cfl::upload_alpha_buffer(ctx, &all_f32), alphas_per_plane))
+            tiles_per_plane * cfl_data.num_subbands as usize
         } else {
-            None
+            0
         };
 
         // Per-plane: entropy decode → dequantize → (CfL inverse predict) → inverse wavelet → copy to result buffer
         for p in 0..3 {
-            match entropy_bufs {
-                PreparedEntropyBufs::Rans(ref rans_bufs) => {
-                    let (ref params_buf, ref tile_info_buf, ref cumfreq_buf, ref stream_data_buf) =
-                        rans_bufs[p];
+            match &frame.entropy {
+                EntropyData::Rans(_) | EntropyData::SubbandRans(_) => {
                     self.rans_decoder.dispatch_decode(
                         ctx,
                         &mut cmd,
-                        params_buf,
-                        tile_info_buf,
-                        cumfreq_buf,
-                        stream_data_buf,
+                        &bufs.entropy_params[p],
+                        &bufs.entropy_tile_info[p],
+                        &bufs.entropy_var_a[p],
+                        &bufs.entropy_var_b[p],
                         &bufs.scratch_a,
                         tiles_per_plane as u32,
                     );
                 }
-                PreparedEntropyBufs::Bitplane(ref bp_bufs) => {
-                    let (ref params_buf, ref tile_info_buf, ref block_info_buf, ref data_buf) =
-                        bp_bufs[p].0;
+                EntropyData::Bitplane(_) => {
+                    let total_blocks = (tiles_per_plane * blocks_per_tile) as u32;
                     self.bitplane_decoder.dispatch_decode(
                         ctx,
                         &mut cmd,
-                        params_buf,
-                        tile_info_buf,
-                        block_info_buf,
-                        data_buf,
+                        &bufs.entropy_params[p],
+                        &bufs.entropy_tile_info[p],
+                        &bufs.entropy_var_a[p],
+                        &bufs.entropy_var_b[p],
                         &bufs.scratch_a,
-                        bp_bufs[p].1,
+                        total_blocks,
                     );
                 }
             }
@@ -510,9 +758,12 @@ impl DecoderPipeline {
             } else {
                 &weights_chroma
             };
-            let wm_param = weight_map_gpu
-                .as_ref()
-                .map(|(buf, blocks_x)| (buf, AQ_BLOCK_SIZE, *blocks_x));
+            let wm_param = if frame.weight_map.is_some() {
+                let blocks_x = (padded_w + AQ_BLOCK_SIZE - 1) / AQ_BLOCK_SIZE;
+                Some((&bufs.weight_map_buf, AQ_BLOCK_SIZE, blocks_x))
+            } else {
+                None
+            };
             self.quantize.dispatch_adaptive(
                 ctx,
                 &mut cmd,
@@ -543,24 +794,17 @@ impl DecoderPipeline {
 
             if p > 0 && has_cfl {
                 // CfL inverse prediction: scratch_b (dequantized residual) + alpha * y_ref → scratch_c
-                let (ref alpha_buf, alphas_per_plane) = *cfl_alpha_buf.as_ref().unwrap();
-                // Plane 1 (Co) alphas start at offset 0, plane 2 (Cg) at offset alphas_per_plane
-                let plane_alpha_offset = (p - 1) * alphas_per_plane;
+                let plane_alpha_offset = (p - 1) * cfl_alphas_per_plane;
                 let plane_alpha_byte_offset =
                     (plane_alpha_offset * std::mem::size_of::<f32>()) as u64;
-                let plane_alpha_byte_size = (alphas_per_plane * std::mem::size_of::<f32>()) as u64;
+                let plane_alpha_byte_size =
+                    (cfl_alphas_per_plane * std::mem::size_of::<f32>()) as u64;
 
-                // Create a sub-buffer view for this plane's alphas
-                let plane_alpha_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("cfl_plane_alpha"),
-                    size: plane_alpha_byte_size,
-                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                });
+                // Copy this plane's alphas from the full alpha buffer to the per-plane buffer
                 cmd.copy_buffer_to_buffer(
-                    alpha_buf,
+                    &bufs.cfl_alpha_buf,
                     plane_alpha_byte_offset,
-                    &plane_alpha_buf,
+                    &bufs.plane_alpha_bufs[p - 1],
                     0,
                     plane_alpha_byte_size,
                 );
@@ -570,7 +814,7 @@ impl DecoderPipeline {
                     &mut cmd,
                     &bufs.scratch_b,         // dequantized residual
                     &bufs.y_ref_wavelet_buf, // reconstructed Y wavelet
-                    &plane_alpha_buf,        // per-tile per-subband alphas
+                    &bufs.plane_alpha_bufs[p - 1], // per-tile per-subband alphas
                     &bufs.scratch_c,         // output: reconstructed chroma wavelet
                     padded_pixels as u32,
                     padded_w,
@@ -606,14 +850,12 @@ impl DecoderPipeline {
 
             if is_pframe {
                 // P-frame: scratch_a has residual, add MC prediction from reference
-                // recon = residual + MC(reference)
-                // scratch_a (residual) + reference_planes[p] → plane_results[p]
                 self.motion.compensate(
                     ctx,
                     &mut cmd,
                     &bufs.scratch_a,
                     &bufs.reference_planes[p],
-                    mv_buf.as_ref().unwrap(),
+                    &bufs.mv_buf,
                     &bufs.plane_results[p],
                     padded_w,
                     padded_h,
@@ -670,7 +912,7 @@ impl DecoderPipeline {
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: crop_params_buf.as_entire_binding(),
+                        resource: bufs.crop_params_buf.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
@@ -693,58 +935,7 @@ impl DecoderPipeline {
             pass.dispatch_workgroups(workgroups, 1, 1);
         }
 
-        (cmd, crop_params_buf)
-    }
-
-    /// Prepare entropy decode GPU buffers for all 3 planes.
-    fn prepare_entropy_bufs(
-        &self,
-        ctx: &GpuContext,
-        frame: &CompressedFrame,
-    ) -> PreparedEntropyBufs {
-        let info = &frame.info;
-        let tiles_per_plane = info.tiles_x() as usize * info.tiles_y() as usize;
-        let blocks_per_tile_side = info.tile_size as usize / 32;
-        let blocks_per_tile = blocks_per_tile_side * blocks_per_tile_side;
-
-        match &frame.entropy {
-            EntropyData::Rans(tiles) => {
-                let mut rans_bufs = Vec::with_capacity(3);
-                for p in 0..3 {
-                    let plane_tiles = &tiles[p * tiles_per_plane..(p + 1) * tiles_per_plane];
-                    rans_bufs.push(self.rans_decoder.prepare_decode_buffers(
-                        ctx,
-                        plane_tiles,
-                        info,
-                    ));
-                }
-                PreparedEntropyBufs::Rans(rans_bufs)
-            }
-            EntropyData::SubbandRans(tiles) => {
-                let mut rans_bufs = Vec::with_capacity(3);
-                for p in 0..3 {
-                    let plane_tiles = &tiles[p * tiles_per_plane..(p + 1) * tiles_per_plane];
-                    rans_bufs.push(self.rans_decoder.prepare_decode_buffers_subband(
-                        ctx,
-                        plane_tiles,
-                        info,
-                    ));
-                }
-                PreparedEntropyBufs::Rans(rans_bufs)
-            }
-            EntropyData::Bitplane(tiles) => {
-                let mut bp_bufs = Vec::with_capacity(3);
-                for p in 0..3 {
-                    let plane_tiles = &tiles[p * tiles_per_plane..(p + 1) * tiles_per_plane];
-                    let total_blocks = (plane_tiles.len() * blocks_per_tile) as u32;
-                    let bufs = self
-                        .bitplane_decoder
-                        .prepare_decode_buffers(ctx, plane_tiles, info);
-                    bp_bufs.push((bufs, total_blocks));
-                }
-                PreparedEntropyBufs::Bitplane(bp_bufs)
-            }
-        }
+        cmd
     }
 
     /// Decode a compressed frame back to RGB f32 data.
@@ -759,21 +950,18 @@ impl DecoderPipeline {
         let output_pixels = (w * h) as u32;
         let output_size = (output_pixels as u64) * 3 * 4;
 
-        self.ensure_cached(ctx, info.padded_width(), info.padded_height(), w, h);
+        self.ensure_cached(ctx, info.padded_width(), info.padded_height(), w, h, info.tile_size);
 
         let t_alloc = t_start.elapsed();
 
-        let entropy_bufs = self.prepare_entropy_bufs(ctx, frame);
-        let weight_map_gpu = self.upload_weight_map(ctx, frame);
-        let mv_buf = self.upload_motion_vectors(ctx, frame);
+        self.prepare_frame_data(ctx, frame);
 
         let t_prepare = t_start.elapsed();
 
         let cached = self.cached.borrow();
         let bufs = cached.as_ref().unwrap();
 
-        let (mut cmd, _crop_params_buf) =
-            self.encode_gpu_work(ctx, frame, bufs, &entropy_bufs, &weight_map_gpu, &mv_buf);
+        let mut cmd = self.encode_gpu_work(ctx, frame, bufs);
 
         // Copy f32 cropped output to staging
         cmd.copy_buffer_to_buffer(&bufs.cropped_buf, 0, &bufs.staging, 0, output_size);
@@ -829,37 +1017,20 @@ impl DecoderPipeline {
         let packed_u32s = total_f32s.div_ceil(4);
         let packed_byte_size = (packed_u32s as u64) * 4;
 
-        self.ensure_cached(ctx, info.padded_width(), info.padded_height(), w, h);
+        self.ensure_cached(ctx, info.padded_width(), info.padded_height(), w, h, info.tile_size);
 
         let t_alloc = t_start.elapsed();
 
-        let entropy_bufs = self.prepare_entropy_bufs(ctx, frame);
-        let weight_map_gpu = self.upload_weight_map(ctx, frame);
-        let mv_buf = self.upload_motion_vectors(ctx, frame);
+        self.prepare_frame_data(ctx, frame);
 
         let t_prepare = t_start.elapsed();
 
         let cached = self.cached.borrow();
         let bufs = cached.as_ref().unwrap();
 
-        let (mut cmd, _crop_params_buf) =
-            self.encode_gpu_work(ctx, frame, bufs, &entropy_bufs, &weight_map_gpu, &mv_buf);
+        let mut cmd = self.encode_gpu_work(ctx, frame, bufs);
 
-        // GPU pack: f32 → packed u8
-        let pack_params = PackParams {
-            total_f32s,
-            _pad0: 0,
-            _pad1: 0,
-            _pad2: 0,
-        };
-        let pack_params_buf = ctx
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("pack_params"),
-                contents: bytemuck::bytes_of(&pack_params),
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
-
+        // GPU pack: f32 → packed u8 (using cached pack_params_buf)
         {
             let pack_bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("pack_bg"),
@@ -867,7 +1038,7 @@ impl DecoderPipeline {
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: pack_params_buf.as_entire_binding(),
+                        resource: bufs.pack_params_buf.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
@@ -949,33 +1120,16 @@ impl DecoderPipeline {
         let packed_u32s = total_f32s.div_ceil(4);
         let packed_byte_size = (packed_u32s as u64) * 4;
 
-        self.ensure_cached(ctx, info.padded_width(), info.padded_height(), w, h);
+        self.ensure_cached(ctx, info.padded_width(), info.padded_height(), w, h, info.tile_size);
 
-        let entropy_bufs = self.prepare_entropy_bufs(ctx, frame);
-        let weight_map_gpu = self.upload_weight_map(ctx, frame);
-        let mv_buf = self.upload_motion_vectors(ctx, frame);
+        self.prepare_frame_data(ctx, frame);
 
         let cached = self.cached.borrow();
         let bufs = cached.as_ref().unwrap();
 
-        let (mut cmd, _crop_params_buf) =
-            self.encode_gpu_work(ctx, frame, bufs, &entropy_bufs, &weight_map_gpu, &mv_buf);
+        let mut cmd = self.encode_gpu_work(ctx, frame, bufs);
 
-        // GPU pack: f32 → packed u8
-        let pack_params = PackParams {
-            total_f32s,
-            _pad0: 0,
-            _pad1: 0,
-            _pad2: 0,
-        };
-        let pack_params_buf = ctx
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("pack_params"),
-                contents: bytemuck::bytes_of(&pack_params),
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
-
+        // GPU pack: f32 → packed u8 (using cached pack_params_buf)
         {
             let pack_bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("pack_bg"),
@@ -983,7 +1137,7 @@ impl DecoderPipeline {
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: pack_params_buf.as_entire_binding(),
+                        resource: bufs.pack_params_buf.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,

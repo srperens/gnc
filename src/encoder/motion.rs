@@ -62,18 +62,18 @@ impl MotionEstimator {
             });
 
         // Block match bind group layout: uniform, current_y, reference_y, mvs, sads
-        let match_bgl =
-            ctx.device
-                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                    label: Some("block_match_bgl"),
-                    entries: &[
-                        bgl_uniform(0),
-                        bgl_storage_ro(1),
-                        bgl_storage_ro(2),
-                        bgl_storage_rw(3),
-                        bgl_storage_rw(4),
-                    ],
-                });
+        let match_bgl = ctx
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("block_match_bgl"),
+                entries: &[
+                    bgl_uniform(0),
+                    bgl_storage_ro(1),
+                    bgl_storage_ro(2),
+                    bgl_storage_rw(3),
+                    bgl_storage_rw(4),
+                ],
+            });
 
         let match_pl = ctx
             .device
@@ -83,16 +83,16 @@ impl MotionEstimator {
                 push_constant_ranges: &[],
             });
 
-        let match_pipeline =
-            ctx.device
-                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some("block_match_pipeline"),
-                    layout: Some(&match_pl),
-                    module: &match_shader,
-                    entry_point: Some("main"),
-                    compilation_options: Default::default(),
-                    cache: None,
-                });
+        let match_pipeline = ctx
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("block_match_pipeline"),
+                layout: Some(&match_pl),
+                module: &match_shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
 
         // Motion compensate bind group layout: uniform, input, reference, mvs, output
         let compensate_bgl =
@@ -108,13 +108,13 @@ impl MotionEstimator {
                     ],
                 });
 
-        let compensate_pl =
-            ctx.device
-                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("motion_compensate_pl"),
-                    bind_group_layouts: &[&compensate_bgl],
-                    push_constant_ranges: &[],
-                });
+        let compensate_pl = ctx
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("motion_compensate_pl"),
+                bind_group_layouts: &[&compensate_bgl],
+                push_constant_ranges: &[],
+            });
 
         let compensate_pipeline =
             ctx.device
@@ -348,10 +348,7 @@ impl MotionEstimator {
     }
 
     /// Upload motion vectors from CPU (i16 pairs) to GPU buffer (i32 pairs).
-    pub fn upload_motion_vectors(
-        ctx: &GpuContext,
-        mvs: &[[i16; 2]],
-    ) -> wgpu::Buffer {
+    pub fn upload_motion_vectors(ctx: &GpuContext, mvs: &[[i16; 2]]) -> wgpu::Buffer {
         let i32_data: Vec<i32> = mvs
             .iter()
             .flat_map(|mv| [mv[0] as i32, mv[1] as i32])
@@ -363,6 +360,16 @@ impl MotionEstimator {
                 contents: bytemuck::cast_slice(&i32_data),
                 usage: wgpu::BufferUsages::STORAGE,
             })
+    }
+
+    /// Write motion vectors into a pre-allocated GPU buffer via queue.write_buffer().
+    pub fn write_motion_vectors_into(ctx: &GpuContext, mvs: &[[i16; 2]], buf: &wgpu::Buffer) {
+        let i32_data: Vec<i32> = mvs
+            .iter()
+            .flat_map(|mv| [mv[0] as i32, mv[1] as i32])
+            .collect();
+        ctx.queue
+            .write_buffer(buf, 0, bytemuck::cast_slice(&i32_data));
     }
 }
 
@@ -485,8 +492,7 @@ mod tests {
             for x in 0..width {
                 let rx = (x as i32 + shift_x).clamp(0, width as i32 - 1) as u32;
                 let ry = (y as i32 + shift_y).clamp(0, height as i32 - 1) as u32;
-                current_data[(y * width + x) as usize] =
-                    reference_data[(ry * width + rx) as usize];
+                current_data[(y * width + x) as usize] = reference_data[(ry * width + rx) as usize];
             }
         }
 
@@ -643,11 +649,7 @@ mod tests {
             .zip(recon.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
-        assert!(
-            max_err < 0.01,
-            "MC roundtrip error too large: {}",
-            max_err
-        );
+        assert!(max_err < 0.01, "MC roundtrip error too large: {}", max_err);
     }
 
     /// Read a GPU buffer back to CPU as Vec<f32>.

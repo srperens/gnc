@@ -364,7 +364,11 @@ pub fn best_config_experiments() -> Vec<Experiment> {
                 description: format!(
                     "qstep={}, wavelet={}, per_subband={}, cfl={}, dz={}",
                     step,
-                    if matches!(cfg.wavelet, WaveletType::CDF97) { "9/7" } else { "5/3" },
+                    if matches!(cfg.wavelet, WaveletType::CDF97) {
+                        "9/7"
+                    } else {
+                        "5/3"
+                    },
                     cfg.per_subband,
                     cfg.cfl,
                     dz,

@@ -1,8 +1,10 @@
 pub mod adaptive;
 pub mod bitplane;
+mod buffer_cache;
 pub mod cfl;
 pub mod color;
 pub mod entropy;
+mod entropy_helpers;
 pub mod interleave;
 pub mod motion;
 pub mod pipeline;
@@ -10,4 +12,5 @@ pub mod quantize;
 pub mod rans;
 pub mod rans_gpu;
 pub mod rans_gpu_encode;
+mod sequence;
 pub mod transform;

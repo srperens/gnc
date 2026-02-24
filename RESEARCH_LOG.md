@@ -867,3 +867,51 @@ Total improvement from original CPU-bottlenecked pipeline: **~5x faster encode**
 4. **Adaptive I/P decision** — skip P-frame when residual energy exceeds I-frame estimate
 5. **P-frame encode speed** — the local decode loop is expensive; could be GPU-accelerated with GPU rANS decode in the encoder
 6. **B-frames** — bi-directional prediction for further compression gains
+
+---
+
+## 2026-02-24: Encoder Buffer Caching
+
+### Hypothesis
+The encoder allocates ~15 GPU buffers per encode() call (~60MB+ for 1080p). Caching these buffers across frames should eliminate allocation overhead and improve throughput, especially for multi-frame sequences. The decoder already implements buffer caching successfully.
+
+### Implementation
+- **CachedEncodeBuffers struct**: 15 GPU buffers persisted in `EncoderPipeline` across encode() calls
+  - 3-channel: `input_buf`, `color_out`
+  - Single-plane work: `plane_a/b/c`, `co_plane`, `cg_plane`, `recon_y`
+  - AQ: `variance_buf`, `wm_scratch`, `weight_map_buf`
+  - CfL: `raw_alpha`, `dq_alpha` (variable size, 2× growth)
+  - P-frame: `mc_out`, `ref_upload`, `recon_out`
+- **Resolution-aware**: buffers are reallocated only when padded dimensions change
+- **P-frame local decode optimization**: decoded residual stays on GPU (`plane_a`) for inverse MC instead of readback+reupload — eliminates ~8MB transfer per plane per P-frame
+- Removed unused `create_plane_buffer` and `read_buffer_f32` helpers; replaced with `read_buffer_f32_cached` and `ensure_var_buf`
+
+### Results — 1080p Encode/Decode Throughput (bbb_1080p, q=8, CfL, GPU rANS)
+
+| Platform | Encode | Decode | Decode (pipelined) |
+|----------|--------|--------|--------------------|
+| Windows DX12 (native GPU) | **34.4 ms (29.1 fps)** | **15.0 ms (66.9 fps)** | **11.9 ms (84.1 fps)** |
+| WSL2 (virtualized GPU) | 133.7 ms (7.5 fps) | 109.3 ms (9.2 fps) | 110.0 ms (9.1 fps) |
+
+Quality unchanged: PSNR 43.41 dB, SSIM 0.9997, BPP 6.57
+
+### Analysis
+- Encode throughput on native DX12 matches the ~30 fps measured before buffer caching — first-frame allocation cost is amortized over 20 iterations, so the benchmark already captured steady-state performance
+- The real win is for **multi-frame encoding** (encode_sequence) where buffer allocation was repeated per frame — now zero allocations after frame 1
+- WSL2 is ~4× slower than native DX12 due to GPU virtualization overhead
+- **Decode improved significantly**: 66.9 fps (was ~39 fps before decoder buffer caching) — the decoder buffer caching from the previous session is now paying off
+- Pipelined decode reaches **84.1 fps** — well above real-time 1080p60
+
+### Cumulative throughput progress (1080p, native DX12)
+
+| Version | Encode FPS | Decode FPS |
+|---------|-----------|------------|
+| CPU rANS baseline | 6.0 | ~40 |
+| + GPU rANS encode | 12.8 | ~40 |
+| + Full GPU pipeline | 28–30 | ~40 |
+| + Buffer caching | **29** | **67 (84 pipelined)** |
+
+### Next steps
+1. **Benchmark encode_sequence** — measure per-frame encode time for frames 2+ to quantify buffer caching benefit for temporal encoding
+2. **Profile remaining bottlenecks** — GPU rANS encode is likely the dominant cost now (~15ms); histogram+normalize+encode could be further optimized
+3. **Reduce pad_frame CPU cost** — currently allocates+copies each frame; could upload directly and pad on GPU

@@ -155,6 +155,15 @@ pub enum WaveletType {
     CDF97,
 }
 
+/// Rate control mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateMode {
+    /// Constant bitrate: strictly constrain output to target bitrate via VBV buffer.
+    CBR,
+    /// Variable bitrate: allow frame-to-frame bitrate variation while targeting average.
+    VBR,
+}
+
 /// Which entropy coder to use for the final coding stage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntropyCoder {
@@ -201,6 +210,11 @@ pub struct CodecConfig {
     /// the same subband) is zero, and one for coefficients with nonzero above neighbor.
     /// Requires per_subband_entropy = true.
     pub context_adaptive: bool,
+    /// Target bitrate in bits per second (e.g. 10_000_000.0 for 10 Mbps).
+    /// When `None`, quality-based encoding is used (no rate control).
+    pub target_bitrate: Option<f64>,
+    /// Rate control mode: CBR (strict) or VBR (relaxed). Only used when target_bitrate is set.
+    pub rate_mode: RateMode,
 }
 
 impl Default for CodecConfig {
@@ -220,6 +234,8 @@ impl Default for CodecConfig {
             keyframe_interval: 1,
             gpu_entropy_encode: true,
             context_adaptive: false,
+            target_bitrate: None,
+            rate_mode: RateMode::VBR,
         }
     }
 }

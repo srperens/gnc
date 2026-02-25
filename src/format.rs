@@ -1,4 +1,252 @@
 use crate::encoder::{bitplane, rans};
+use crate::FrameType;
+
+// ---- GNV1 Sequence Container Format ----
+//
+// File layout:
+//   File Header (28 bytes, fixed):
+//     magic: "GNV1" (4 bytes)
+//     version: u32 LE           (currently 1)
+//     width: u32 LE
+//     height: u32 LE
+//     frame_count: u32 LE
+//     framerate_num: u32 LE     (e.g. 30000)
+//     framerate_den: u32 LE     (e.g. 1001)
+//
+//   Frame Index Table (frame_count entries, 21 bytes each):
+//     offset: u64 LE            (byte offset from start of file to frame data)
+//     size: u32 LE              (frame data size in bytes)
+//     frame_type: u8            (0 = Intra, 1 = Predicted)
+//     pts: u64 LE               (presentation timestamp, frame number)
+//
+//   Frame Data:
+//     [frame 0 GP10 data] [frame 1 GP10 data] ... [frame N-1 GP10 data]
+
+const GNV1_MAGIC: &[u8; 4] = b"GNV1";
+const GNV1_VERSION: u32 = 1;
+const GNV1_HEADER_SIZE: usize = 28;
+const GNV1_INDEX_ENTRY_SIZE: usize = 21; // 8 + 4 + 1 + 8
+
+/// Entry in the GNV1 frame index table.
+#[derive(Debug, Clone, Copy)]
+pub struct FrameIndexEntry {
+    /// Byte offset from start of file to frame data
+    pub offset: u64,
+    /// Size of this frame's serialized data in bytes
+    pub size: u32,
+    /// Frame type: 0 = Intra, 1 = Predicted
+    pub frame_type: u8,
+    /// Presentation timestamp (frame number)
+    pub pts: u64,
+}
+
+/// Parsed GNV1 sequence header with frame index for random access.
+#[derive(Debug, Clone)]
+pub struct SequenceHeader {
+    pub version: u32,
+    pub width: u32,
+    pub height: u32,
+    pub frame_count: u32,
+    pub framerate_num: u32,
+    pub framerate_den: u32,
+    /// Frame index table for random access
+    pub index: Vec<FrameIndexEntry>,
+}
+
+impl SequenceHeader {
+    /// Duration in seconds (frame_count / framerate)
+    pub fn duration_secs(&self) -> f64 {
+        if self.framerate_num == 0 {
+            return 0.0;
+        }
+        self.frame_count as f64 * self.framerate_den as f64 / self.framerate_num as f64
+    }
+
+    /// Frames per second
+    pub fn fps(&self) -> f64 {
+        if self.framerate_den == 0 {
+            return 0.0;
+        }
+        self.framerate_num as f64 / self.framerate_den as f64
+    }
+}
+
+/// Serialize a sequence of CompressedFrames into the GNV1 container format.
+///
+/// Each frame is serialized using the existing GP10 format and wrapped in
+/// a container with a file header and frame index table for random access.
+pub fn serialize_sequence(frames: &[crate::CompressedFrame], framerate: (u32, u32)) -> Vec<u8> {
+    assert!(!frames.is_empty(), "Cannot serialize empty sequence");
+
+    let frame_count = frames.len() as u32;
+    let first = &frames[0];
+
+    // Serialize each frame to GP10 bytes
+    let frame_blobs: Vec<Vec<u8>> = frames.iter().map(serialize_compressed).collect();
+
+    // Compute offsets: header + index table + frame data
+    let index_table_size = frames.len() * GNV1_INDEX_ENTRY_SIZE;
+    let data_start = GNV1_HEADER_SIZE + index_table_size;
+
+    let mut offsets = Vec::with_capacity(frames.len());
+    let mut current_offset = data_start as u64;
+    for blob in &frame_blobs {
+        offsets.push(current_offset);
+        current_offset += blob.len() as u64;
+    }
+    let total_size = current_offset as usize;
+
+    let mut out = Vec::with_capacity(total_size);
+
+    // File header (28 bytes)
+    out.extend_from_slice(GNV1_MAGIC);
+    out.extend_from_slice(&GNV1_VERSION.to_le_bytes());
+    out.extend_from_slice(&first.info.width.to_le_bytes());
+    out.extend_from_slice(&first.info.height.to_le_bytes());
+    out.extend_from_slice(&frame_count.to_le_bytes());
+    out.extend_from_slice(&framerate.0.to_le_bytes());
+    out.extend_from_slice(&framerate.1.to_le_bytes());
+
+    // Frame index table
+    for (i, blob) in frame_blobs.iter().enumerate() {
+        out.extend_from_slice(&offsets[i].to_le_bytes());
+        out.extend_from_slice(&(blob.len() as u32).to_le_bytes());
+        let ft: u8 = match frames[i].frame_type {
+            FrameType::Intra => 0,
+            FrameType::Predicted => 1,
+        };
+        out.push(ft);
+        // PTS = frame number
+        out.extend_from_slice(&(i as u64).to_le_bytes());
+    }
+
+    // Frame data
+    for blob in &frame_blobs {
+        out.extend_from_slice(blob);
+    }
+
+    out
+}
+
+/// Parse the GNV1 file header and frame index table from raw bytes.
+///
+/// Returns a `SequenceHeader` that can be used with `deserialize_sequence_frame`
+/// for random access to individual frames.
+pub fn deserialize_sequence_header(data: &[u8]) -> SequenceHeader {
+    assert!(
+        data.len() >= GNV1_HEADER_SIZE,
+        "GNV1 data too small for header ({} bytes, need at least {})",
+        data.len(),
+        GNV1_HEADER_SIZE
+    );
+    assert!(
+        &data[0..4] == GNV1_MAGIC,
+        "Invalid GNV1 magic (expected GNV1, got {:?})",
+        &data[0..4]
+    );
+
+    let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
+    let width = u32::from_le_bytes(data[8..12].try_into().unwrap());
+    let height = u32::from_le_bytes(data[12..16].try_into().unwrap());
+    let frame_count = u32::from_le_bytes(data[16..20].try_into().unwrap());
+    let framerate_num = u32::from_le_bytes(data[20..24].try_into().unwrap());
+    let framerate_den = u32::from_le_bytes(data[24..28].try_into().unwrap());
+
+    let index_table_size = frame_count as usize * GNV1_INDEX_ENTRY_SIZE;
+    assert!(
+        data.len() >= GNV1_HEADER_SIZE + index_table_size,
+        "GNV1 data too small for index table"
+    );
+
+    let mut index = Vec::with_capacity(frame_count as usize);
+    let mut pos = GNV1_HEADER_SIZE;
+    for _ in 0..frame_count {
+        let offset = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+        pos += 8;
+        let size = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
+        pos += 4;
+        let frame_type = data[pos];
+        pos += 1;
+        let pts = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+        pos += 8;
+        index.push(FrameIndexEntry {
+            offset,
+            size,
+            frame_type,
+            pts,
+        });
+    }
+
+    SequenceHeader {
+        version,
+        width,
+        height,
+        frame_count,
+        framerate_num,
+        framerate_den,
+        index,
+    }
+}
+
+/// Deserialize a single frame from a GNV1 container by index.
+///
+/// Uses the frame index table for O(1) random access — no need to parse
+/// preceding frames.
+pub fn deserialize_sequence_frame(
+    data: &[u8],
+    header: &SequenceHeader,
+    frame_idx: usize,
+) -> crate::CompressedFrame {
+    assert!(
+        frame_idx < header.frame_count as usize,
+        "Frame index {} out of range (sequence has {} frames)",
+        frame_idx,
+        header.frame_count
+    );
+
+    let entry = &header.index[frame_idx];
+    let start = entry.offset as usize;
+    let end = start + entry.size as usize;
+    assert!(
+        end <= data.len(),
+        "Frame {} data extends beyond file (offset {}..{}, file size {})",
+        frame_idx,
+        start,
+        end,
+        data.len()
+    );
+
+    deserialize_compressed(&data[start..end])
+}
+
+/// Find the nearest preceding I-frame (keyframe) for a target PTS.
+///
+/// Scans the frame index backwards from the frame at or after `target_pts`
+/// to find the most recent Intra frame. Returns the frame index of that
+/// keyframe. Used for seek operations.
+pub fn seek_to_keyframe(header: &SequenceHeader, target_pts: u64) -> usize {
+    if header.index.is_empty() {
+        return 0;
+    }
+
+    // Find the frame at or just before target_pts
+    let target_frame = header
+        .index
+        .iter()
+        .rposition(|e| e.pts <= target_pts)
+        .unwrap_or(0);
+
+    // Scan backwards to find the nearest preceding I-frame
+    for i in (0..=target_frame).rev() {
+        if header.index[i].frame_type == 0 {
+            // Intra
+            return i;
+        }
+    }
+
+    // Fallback: first frame (should always be an I-frame)
+    0
+}
 
 /// Serialize a CompressedFrame to the GP10 binary format.
 /// GP10 format supports temporal coding (frame_type + motion vectors).

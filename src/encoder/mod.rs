@@ -12,5 +12,6 @@ pub mod quantize;
 pub mod rans;
 pub mod rans_gpu;
 pub mod rans_gpu_encode;
+pub mod rate_control;
 mod sequence;
 pub mod transform;

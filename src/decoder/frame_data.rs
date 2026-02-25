@@ -73,7 +73,9 @@ impl DecoderPipeline {
             }
             EntropyData::SubbandRans(tiles) => {
                 // Detect context-adaptive tiles: num_groups > 1 + num_levels
-                let is_ctx_adaptive = tiles.first().is_some_and(|t| t.num_groups > 1 + t.num_levels);
+                let is_ctx_adaptive = tiles
+                    .first()
+                    .is_some_and(|t| t.num_groups > 1 + t.num_levels);
                 bufs.ctx_adaptive_decode = is_ctx_adaptive;
 
                 if is_ctx_adaptive {

@@ -5,7 +5,7 @@ use wgpu::util::DeviceExt;
 use crate::GpuContext;
 
 pub const ME_BLOCK_SIZE: u32 = 16;
-pub const ME_SEARCH_RANGE: u32 = 32;
+pub const ME_SEARCH_RANGE: u32 = 64;
 
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
@@ -347,6 +347,45 @@ impl MotionEstimator {
         mvs
     }
 
+    /// Read SAD values from GPU buffer back to CPU.
+    pub fn read_sad_values(
+        ctx: &GpuContext,
+        sad_buf: &wgpu::Buffer,
+        total_blocks: u32,
+    ) -> Vec<u32> {
+        let count = total_blocks as usize;
+        let size = (count * std::mem::size_of::<u32>()) as u64;
+
+        let staging = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("sad_staging"),
+            size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let mut cmd = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("copy_sad"),
+            });
+        cmd.copy_buffer_to_buffer(sad_buf, 0, &staging, 0, size);
+        ctx.queue.submit(Some(cmd.finish()));
+
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            tx.send(result).unwrap();
+        });
+        ctx.device.poll(wgpu::Maintain::Wait);
+        rx.recv().unwrap().unwrap();
+
+        let data = slice.get_mapped_range();
+        let result: Vec<u32> = bytemuck::cast_slice(&data).to_vec();
+        drop(data);
+        staging.unmap();
+        result
+    }
+
     /// Upload motion vectors from CPU (i16 pairs) to GPU buffer (i32 pairs).
     pub fn upload_motion_vectors(ctx: &GpuContext, mvs: &[[i16; 2]]) -> wgpu::Buffer {
         let i32_data: Vec<i32> = mvs
@@ -525,6 +564,10 @@ mod tests {
         let total_blocks = blocks_x * blocks_y;
         let mvs = MotionEstimator::read_motion_vectors(&ctx, &mv_buf, total_blocks);
 
+        // MVs are now in half-pel units, so expected values are shift * 2
+        let expected_dx = (shift_x * 2) as i16;
+        let expected_dy = (shift_y * 2) as i16;
+
         // Interior blocks (not near edges) should find the correct shift
         let mut correct_count = 0;
         let mut total_interior = 0;
@@ -532,16 +575,16 @@ mod tests {
             for bx in 2..blocks_x - 2 {
                 let idx = (by * blocks_x + bx) as usize;
                 total_interior += 1;
-                if mvs[idx][0] == shift_x as i16 && mvs[idx][1] == shift_y as i16 {
+                if mvs[idx][0] == expected_dx && mvs[idx][1] == expected_dy {
                     correct_count += 1;
                 }
             }
         }
         assert!(
             correct_count > total_interior / 2,
-            "Most interior blocks should find shift ({},{}): {}/{} correct",
-            shift_x,
-            shift_y,
+            "Most interior blocks should find shift ({},{}) in half-pel units: {}/{} correct",
+            expected_dx,
+            expected_dy,
             correct_count,
             total_interior
         );

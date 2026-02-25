@@ -8,9 +8,12 @@ use gnc::bench::throughput;
 use gnc::decoder::pipeline::DecoderPipeline;
 use gnc::encoder::pipeline::EncoderPipeline;
 use gnc::experiments;
-use gnc::format::{deserialize_compressed, serialize_compressed};
+use gnc::format::{
+    deserialize_compressed, deserialize_sequence_frame, deserialize_sequence_header,
+    seek_to_keyframe, serialize_compressed, serialize_sequence,
+};
 use gnc::image_util::{load_image_rgb_f32, parse_wavelet_type, save_image_rgb_f32};
-use gnc::{CodecConfig, GpuContext};
+use gnc::{CodecConfig, GpuContext, RateMode};
 
 #[derive(Parser)]
 #[command(name = "gnc", about = "GPU-native broadcast video codec")]
@@ -128,6 +131,82 @@ enum Command {
         /// Output CSV file for per-frame metrics and sequence summary
         #[arg(long)]
         csv: Option<String>,
+
+        /// Target bitrate for rate control (e.g., "10M" for 10 Mbps, "500K" for 500 Kbps).
+        /// When set, the encoder adjusts qstep per frame to hit this target.
+        #[arg(long)]
+        bitrate: Option<String>,
+
+        /// Rate control mode: "cbr" (constant bitrate) or "vbr" (variable bitrate).
+        /// Only used when --bitrate is set. Default: vbr.
+        #[arg(long, default_value = "vbr")]
+        rate_mode: String,
+
+        /// Frame rate in fps (used for rate control bitrate calculations).
+        /// Default: 30.
+        #[arg(long, default_value = "30")]
+        fps: f64,
+    },
+
+    /// Encode a sequence of image frames into a .gnv container
+    EncodeSequence {
+        /// Input frame pattern (e.g., "frames/%04d.png")
+        #[arg(short, long)]
+        input: String,
+
+        /// Output .gnv file
+        #[arg(short, long)]
+        output: String,
+
+        /// Quality preset (1-100)
+        #[arg(short = 'q', long, default_value = "75")]
+        quality: u32,
+
+        /// Quantization step size (overrides quality preset if specified)
+        #[arg(long)]
+        qstep: Option<f32>,
+
+        /// Keyframe interval (1 = all I-frames)
+        #[arg(long, default_value = "8")]
+        keyframe_interval: u32,
+
+        /// Number of frames to encode (auto-detect if not specified)
+        #[arg(short = 'n', long)]
+        num_frames: Option<usize>,
+
+        /// Framerate numerator (e.g. 30 for 30fps, 30000 for 29.97fps)
+        #[arg(long, default_value = "30")]
+        fps_num: u32,
+
+        /// Framerate denominator (e.g. 1 for 30fps, 1001 for 29.97fps)
+        #[arg(long, default_value = "1")]
+        fps_den: u32,
+
+        /// Target bitrate for rate control (e.g., "10M" for 10 Mbps, "500K" for 500 Kbps).
+        /// When set, the encoder adjusts qstep per frame to hit this target.
+        #[arg(long)]
+        bitrate: Option<String>,
+
+        /// Rate control mode: "cbr" (constant bitrate) or "vbr" (variable bitrate).
+        /// Only used when --bitrate is set. Default: vbr.
+        #[arg(long, default_value = "vbr")]
+        rate_mode: String,
+    },
+
+    /// Decode a .gnv container back to image frames
+    DecodeSequence {
+        /// Input .gnv file
+        #[arg(short, long)]
+        input: String,
+
+        /// Output frame pattern (e.g., "frames/%04d.png")
+        #[arg(short, long)]
+        output: String,
+
+        /// Seek to this time (in seconds) before decoding. Decodes from the
+        /// nearest preceding keyframe through the target frame.
+        #[arg(long)]
+        seek: Option<f64>,
     },
 
     /// Run experiments on an input image
@@ -167,6 +246,43 @@ enum Command {
         #[arg(long)]
         compare_codecs: bool,
     },
+}
+
+/// Parse a bitrate string like "10M", "500K", "1.5M", or raw number "10000000".
+/// Returns bits per second.
+fn parse_bitrate(s: &str) -> f64 {
+    let s = s.trim();
+    if s.is_empty() {
+        panic!("Empty bitrate string");
+    }
+    let (num_part, multiplier) = if s.ends_with('M') || s.ends_with('m') {
+        (&s[..s.len() - 1], 1_000_000.0)
+    } else if s.ends_with('K') || s.ends_with('k') {
+        (&s[..s.len() - 1], 1_000.0)
+    } else if s.ends_with('G') || s.ends_with('g') {
+        (&s[..s.len() - 1], 1_000_000_000.0)
+    } else {
+        (s, 1.0)
+    };
+    let value: f64 = num_part
+        .parse()
+        .unwrap_or_else(|_| panic!("Invalid bitrate number: '{}'", num_part));
+    value * multiplier
+}
+
+/// Parse rate mode string ("cbr" or "vbr").
+fn parse_rate_mode(s: &str) -> RateMode {
+    match s.to_lowercase().as_str() {
+        "cbr" => RateMode::CBR,
+        "vbr" => RateMode::VBR,
+        other => {
+            eprintln!(
+                "Unknown rate mode '{}'. Use 'cbr' or 'vbr'. Defaulting to VBR.",
+                other
+            );
+            RateMode::VBR
+        }
+    }
 }
 
 fn main() {
@@ -472,14 +588,22 @@ fn main() {
             quality,
             qstep,
             csv,
+            bitrate,
+            rate_mode,
+            fps,
         } => {
             let qstep_display = qstep
                 .map(|q| format!("{}", q))
                 .or_else(|| quality.map(|q| format!("q={}", q)))
                 .unwrap_or_else(|| "4.0".to_string());
+            let rc_display = if let Some(ref br) = bitrate {
+                format!(", rate_control={} {}", br, rate_mode)
+            } else {
+                String::new()
+            };
             println!(
-                "Sequence benchmark: pattern={}, frames={}, ki={}, {}",
-                input, num_frames, keyframe_interval, qstep_display
+                "Sequence benchmark: pattern={}, frames={}, ki={}, {}{}",
+                input, num_frames, keyframe_interval, qstep_display, rc_display
             );
 
             let ctx = GpuContext::new();
@@ -514,8 +638,15 @@ fn main() {
             }
             config_ip.keyframe_interval = keyframe_interval;
 
+            // Apply rate control settings
+            if let Some(ref br) = bitrate {
+                config_ip.target_bitrate = Some(parse_bitrate(br));
+                config_ip.rate_mode = parse_rate_mode(&rate_mode);
+            }
+
             let start = std::time::Instant::now();
-            let compressed_ip = encoder.encode_sequence(&ctx, &frame_refs, w, h, &config_ip);
+            let compressed_ip =
+                encoder.encode_sequence_with_fps(&ctx, &frame_refs, w, h, &config_ip, fps);
             let elapsed_ip = start.elapsed();
 
             println!("\n=== I+P (keyframe_interval={}) ===", keyframe_interval);
@@ -642,6 +773,230 @@ fn main() {
                     .expect("Failed to write sequence CSV");
                 println!("\nSequence metrics written to {}", csv_path);
             }
+        }
+
+        Command::EncodeSequence {
+            input,
+            output,
+            quality,
+            qstep,
+            keyframe_interval,
+            num_frames,
+            fps_num,
+            fps_den,
+            bitrate,
+            rate_mode,
+        } => {
+            // Auto-detect frame count if not specified
+            let frame_count = if let Some(n) = num_frames {
+                n
+            } else {
+                let mut n = 0;
+                loop {
+                    let path = input.replace("%04d", &format!("{:04}", n));
+                    if !std::path::Path::new(&path).exists() {
+                        break;
+                    }
+                    n += 1;
+                }
+                if n == 0 {
+                    eprintln!(
+                        "Error: no frames found matching pattern '{}' (tried index 0)",
+                        input
+                    );
+                    std::process::exit(1);
+                }
+                n
+            };
+
+            println!(
+                "Encoding sequence: {} frames from '{}', ki={}, q={}, {}fps",
+                frame_count,
+                input,
+                keyframe_interval,
+                quality,
+                if fps_den == 1 {
+                    format!("{}", fps_num)
+                } else {
+                    format!("{:.3}", fps_num as f64 / fps_den as f64)
+                }
+            );
+
+            // Load all frames
+            let mut frames_data: Vec<Vec<f32>> = Vec::with_capacity(frame_count);
+            let mut w = 0u32;
+            let mut h = 0u32;
+            for i in 0..frame_count {
+                let path = input.replace("%04d", &format!("{:04}", i));
+                let (rgb, fw, fh) = load_image_rgb_f32(&path);
+                if i == 0 {
+                    w = fw;
+                    h = fh;
+                } else {
+                    assert!(
+                        fw == w && fh == h,
+                        "Frame {} has different dimensions ({}x{} vs {}x{})",
+                        i,
+                        fw,
+                        fh,
+                        w,
+                        h
+                    );
+                }
+                frames_data.push(rgb);
+            }
+
+            let frame_refs: Vec<&[f32]> = frames_data.iter().map(|f| f.as_slice()).collect();
+
+            let ctx = GpuContext::new();
+            let mut encoder = EncoderPipeline::new(&ctx);
+
+            let mut config = gnc::quality_preset(quality);
+            if let Some(qs) = qstep {
+                config.quantization_step = qs;
+            }
+            config.keyframe_interval = keyframe_interval;
+
+            // Apply rate control settings
+            if let Some(ref br) = bitrate {
+                config.target_bitrate = Some(parse_bitrate(br));
+                config.rate_mode = parse_rate_mode(&rate_mode);
+            }
+
+            let actual_fps = fps_num as f64 / fps_den as f64;
+            let start = std::time::Instant::now();
+            let compressed =
+                encoder.encode_sequence_with_fps(&ctx, &frame_refs, w, h, &config, actual_fps);
+            let encode_time = start.elapsed();
+
+            // Print per-frame summary
+            for (i, cf) in compressed.iter().enumerate() {
+                let ft = if cf.frame_type == gnc::FrameType::Intra {
+                    "I"
+                } else {
+                    "P"
+                };
+                println!(
+                    "  Frame {:4} [{}]: {:6} bytes, {:.2} bpp",
+                    i,
+                    ft,
+                    cf.byte_size(),
+                    cf.bpp()
+                );
+            }
+
+            // Serialize to GNV1 container
+            let gnv_data = serialize_sequence(&compressed, (fps_num, fps_den));
+            std::fs::write(&output, &gnv_data).expect("Failed to write output file");
+
+            let avg_bpp = compressed.iter().map(|f| f.bpp()).sum::<f64>() / compressed.len() as f64;
+            let i_count = compressed
+                .iter()
+                .filter(|f| f.frame_type == gnc::FrameType::Intra)
+                .count();
+            let fps = compressed.len() as f64 / encode_time.as_secs_f64();
+
+            println!(
+                "\nEncoded {} frames ({}I + {}P) in {:.1}ms ({:.1} fps)",
+                compressed.len(),
+                i_count,
+                compressed.len() - i_count,
+                encode_time.as_secs_f64() * 1000.0,
+                fps,
+            );
+            println!(
+                "Container: {} bytes, avg {:.2} bpp",
+                gnv_data.len(),
+                avg_bpp
+            );
+            println!("Written to {}", output);
+        }
+
+        Command::DecodeSequence {
+            input,
+            output,
+            seek,
+        } => {
+            let gnv_data = std::fs::read(&input).expect("Failed to read input file");
+            let header = deserialize_sequence_header(&gnv_data);
+
+            println!(
+                "GNV1 sequence: {}x{}, {} frames, {:.3} fps, {:.2}s duration",
+                header.width,
+                header.height,
+                header.frame_count,
+                header.fps(),
+                header.duration_secs(),
+            );
+
+            let ctx = GpuContext::new();
+            let decoder = DecoderPipeline::new(&ctx);
+
+            // Determine range of frames to decode
+            let (start_frame, end_frame) = if let Some(seek_time) = seek {
+                // Convert seek time to PTS (frame number)
+                let target_pts = if header.framerate_den == 0 {
+                    0u64
+                } else {
+                    (seek_time * header.framerate_num as f64 / header.framerate_den as f64) as u64
+                };
+                let keyframe_idx = seek_to_keyframe(&header, target_pts);
+                let target_frame = header
+                    .index
+                    .iter()
+                    .rposition(|e| e.pts <= target_pts)
+                    .unwrap_or(0);
+
+                println!(
+                    "Seeking to {:.2}s (PTS {}): keyframe at frame {}, target frame {}",
+                    seek_time, target_pts, keyframe_idx, target_frame
+                );
+
+                // Decode from keyframe through the target frame so P-frame
+                // references are valid, but only output the target frame.
+                (keyframe_idx, target_frame + 1)
+            } else {
+                (0, header.frame_count as usize)
+            };
+
+            let start = std::time::Instant::now();
+
+            // For P-frame decoding, we need the decoder to maintain reference frames.
+            // We use the DecoderPipeline's standard decode path for each frame.
+            // P-frames need their reference, so we decode sequentially from the keyframe.
+            let mut output_count = 0usize;
+
+            for idx in start_frame..end_frame {
+                let compressed = deserialize_sequence_frame(&gnv_data, &header, idx);
+                let rgb_data = decoder.decode(&ctx, &compressed);
+
+                // Only write output frames (when not seeking, write all; when seeking,
+                // only write frames that are at or after the seek target)
+                let should_output = if seek.is_some() {
+                    // When seeking, output only the target frame (last in range)
+                    idx == end_frame - 1
+                } else {
+                    true
+                };
+
+                if should_output {
+                    let frame_path = output.replace("%04d", &format!("{:04}", idx));
+                    save_image_rgb_f32(&frame_path, &rgb_data, header.width, header.height);
+                    output_count += 1;
+                }
+            }
+
+            let decode_time = start.elapsed();
+            let decoded_count = end_frame - start_frame;
+            let fps = decoded_count as f64 / decode_time.as_secs_f64();
+
+            println!(
+                "Decoded {} frames ({} output) in {:.1}ms ({:.1} fps)",
+                decoded_count,
+                output_count,
+                decode_time.as_secs_f64() * 1000.0,
+                fps,
+            );
         }
 
         Command::RdCurve {

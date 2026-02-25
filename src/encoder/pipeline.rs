@@ -3,7 +3,7 @@ use wgpu;
 use super::adaptive::{self, VarianceAnalyzer, WeightMapNormalizer, AQ_LL_BLOCK_SIZE};
 use super::bitplane;
 use super::buffer_cache::{pad_frame, CachedEncodeBuffers};
-use super::cfl::{self, CflAlphaComputer, CflForwardPredictor};
+use super::cfl::{self, CflAlphaComputer, CflForwardPredictor, CflPredictor};
 use super::color::ColorConverter;
 use super::entropy_helpers::{encode_entropy, EntropyMode};
 use super::interleave::PlaneDeinterleaver;
@@ -32,6 +32,7 @@ pub struct EncoderPipeline {
     pub(super) weight_normalizer: WeightMapNormalizer,
     pub(super) cfl_alpha: CflAlphaComputer,
     pub(super) cfl_forward: CflForwardPredictor,
+    pub(super) cfl_inverse: CflPredictor,
     pub(super) cached: Option<CachedEncodeBuffers>,
 }
 
@@ -48,6 +49,7 @@ impl EncoderPipeline {
             weight_normalizer: WeightMapNormalizer::new(ctx),
             cfl_alpha: CflAlphaComputer::new(ctx),
             cfl_forward: CflForwardPredictor::new(ctx),
+            cfl_inverse: CflPredictor::new(ctx),
             cached: None,
         }
     }
@@ -155,18 +157,22 @@ impl EncoderPipeline {
             ensure_var_buf(
                 ctx,
                 &mut bufs.raw_alpha,
-                &mut bufs.alpha_cap,
+                &mut bufs.raw_alpha_cap,
                 alpha_buf_size,
                 "enc_raw_alpha",
-                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
             );
             ensure_var_buf(
                 ctx,
                 &mut bufs.dq_alpha,
-                &mut bufs.alpha_cap,
+                &mut bufs.dq_alpha_cap,
                 alpha_buf_size,
                 "enc_dq_alpha",
-                wgpu::BufferUsages::STORAGE,
+                wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
             );
         }
         let bufs = self.cached.as_ref().unwrap();

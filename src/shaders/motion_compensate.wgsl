@@ -1,7 +1,10 @@
-// Motion compensation shader.
+// Motion compensation shader with half-pel bilinear interpolation.
 // Two modes:
-//   Forward (encoder): residual[x,y] = current[x,y] - reference[x+dx, y+dy]
-//   Inverse (decoder): reconstructed[x,y] = residual[x,y] + reference[x+dx, y+dy]
+//   Forward (encoder): residual[x,y] = current[x,y] - predicted[x,y]
+//   Inverse (decoder): reconstructed[x,y] = residual[x,y] + predicted[x,y]
+//
+// Motion vectors are in half-pel units. When the MV has a fractional
+// (odd) component, bilinear interpolation of the reference is used.
 //
 // One thread per pixel. Each thread reads its block's MV and applies it.
 // Operates on a single plane — dispatch 3 times for Y, Co, Cg.
@@ -23,6 +26,43 @@ struct Params {
 @group(0) @binding(3) var<storage, read> motion_vectors: array<i32>;
 @group(0) @binding(4) var<storage, read_write> output_plane: array<f32>;
 
+// Bilinear sample from reference plane at half-pel position (hx, hy).
+// hx, hy are in half-pel units (pixel * 2 + subpel_offset).
+fn bilinear_ref(hx: i32, hy: i32) -> f32 {
+    let w = i32(params.width);
+    let h = i32(params.height);
+
+    let ix = hx >> 1;        // integer part (floor for positive, rounds toward zero)
+    let iy = hy >> 1;
+    let fx = hx & 1;         // fractional half-pel flag
+    let fy = hy & 1;
+
+    if fx == 0 && fy == 0 {
+        // On integer grid — direct lookup (most common case)
+        let cx = clamp(ix, 0, w - 1);
+        let cy = clamp(iy, 0, h - 1);
+        return reference_plane[u32(cy) * params.width + u32(cx)];
+    }
+
+    // Bilinear: average of 2 or 4 neighbors
+    let x0 = clamp(ix, 0, w - 1);
+    let x1 = clamp(ix + 1, 0, w - 1);
+    let y0 = clamp(iy, 0, h - 1);
+    let y1 = clamp(iy + 1, 0, h - 1);
+
+    let p00 = reference_plane[u32(y0) * params.width + u32(x0)];
+    let p10 = reference_plane[u32(y0) * params.width + u32(x1)];
+    let p01 = reference_plane[u32(y1) * params.width + u32(x0)];
+    let p11 = reference_plane[u32(y1) * params.width + u32(x1)];
+
+    let ffx = f32(fx) * 0.5;
+    let ffy = f32(fy) * 0.5;
+
+    let top = p00 * (1.0 - ffx) + p10 * ffx;
+    let bot = p01 * (1.0 - ffx) + p11 * ffx;
+    return top * (1.0 - ffy) + bot * ffy;
+}
+
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let pixel_idx = global_id.x;
@@ -38,17 +78,16 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let by = y / params.block_size;
     let block_idx = by * params.blocks_x + bx;
 
-    // Read motion vector for this block
-    let dx = motion_vectors[block_idx * 2u];
-    let dy = motion_vectors[block_idx * 2u + 1u];
+    // Read motion vector for this block (in half-pel units)
+    let dx_hp = motion_vectors[block_idx * 2u];
+    let dy_hp = motion_vectors[block_idx * 2u + 1u];
 
-    // Reference coordinate (clamped to frame bounds)
-    let ref_x = clamp(i32(x) + dx, 0, i32(params.width) - 1);
-    let ref_y = clamp(i32(y) + dy, 0, i32(params.height) - 1);
-    let ref_idx = u32(ref_y) * params.width + u32(ref_x);
+    // Reference position in half-pel units
+    let ref_hx = i32(x) * 2 + dx_hp;
+    let ref_hy = i32(y) * 2 + dy_hp;
 
     let input_val = input_plane[pixel_idx];
-    let ref_val = reference_plane[ref_idx];
+    let ref_val = bilinear_ref(ref_hx, ref_hy);
 
     if params.mode == 0u {
         // Forward: residual = current - predicted

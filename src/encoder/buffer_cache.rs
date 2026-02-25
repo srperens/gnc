@@ -26,10 +26,11 @@ pub(super) struct CachedEncodeBuffers {
     pub(super) wm_scratch: wgpu::Buffer,
     pub(super) weight_map_buf: wgpu::Buffer,
 
-    // CfL alpha buffers (variable size, 2x growth)
+    // CfL alpha buffers (variable size, 2x growth, separate caps)
     pub(super) raw_alpha: wgpu::Buffer,
     pub(super) dq_alpha: wgpu::Buffer,
-    pub(super) alpha_cap: u64,
+    pub(super) raw_alpha_cap: u64,
+    pub(super) dq_alpha_cap: u64,
 
     // P-frame work buffers (size = plane_size each)
     pub(super) mc_out: wgpu::Buffer,
@@ -128,23 +129,30 @@ impl CachedEncodeBuffers {
             weight_map_buf: ctx.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("enc_weight_map"),
                 size: wm_buf_size.max(4),
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }),
 
             raw_alpha: ctx.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("enc_raw_alpha"),
                 size: alpha_init_cap,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }),
             dq_alpha: ctx.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("enc_dq_alpha"),
                 size: alpha_init_cap,
-                usage: wgpu::BufferUsages::STORAGE,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }),
-            alpha_cap: alpha_init_cap,
+            raw_alpha_cap: alpha_init_cap,
+            dq_alpha_cap: alpha_init_cap,
 
             mc_out: ctx.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("enc_mc_out"),

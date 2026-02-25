@@ -85,11 +85,13 @@ Largest single compression opportunity. Current rANS treats each coefficient ind
 
 **Why:** Transform from image codec to functioning video codec. Temporal compression, rate control, and proper sequence handling.
 
-### 3A: Improved Motion Estimation
-- **Half-pel refinement**: bilinear interpolation on GPU after integer-pel full search. ~20-30% residual energy reduction.
-- **Variable block size**: 8x8 alongside 16x16, SAD-based split decision
-- **Larger search range**: 64px (camera pan content currently makes P-frames larger than I-frames)
-- **Per-tile adaptive I/P**: if tile residual exceeds I-frame cost, encode as intra within P-frame
+### 3A: Improved Motion Estimation ✅
+- **Half-pel refinement**: bilinear interpolation on GPU after integer-pel full search ✅
+- **Variable block size**: 8x8 alongside 16x16, SAD-based split decision (deferred — needs more infrastructure)
+- **Larger search range**: ±64px ✅
+- **Per-tile adaptive I/P**: if tile residual exceeds I-frame cost, zero MVs for that tile ✅
+- **Critical fix**: encoder local decode now matches decoder (AQ + CfL), fixing P-frame reference drift ✅
+- **Result**: bbb 22.6% savings at q=75; blue_sky still -1.5% (camera pan)
 
 ### 3B: B-Frame Support
 - Add `FrameType::Bidirectional` to `FrameType` enum
@@ -98,17 +100,17 @@ Largest single compression opportunity. Current rANS treats each coefficient ind
 - Weighted average prediction
 - **Expected: B-frames 20-30% smaller than P-frames**
 
-### 3C: Rate Control
-- **Per-frame**: given target bpp, estimate qstep via linear model (bpp ~ c * qstep^-α), max 2 encode passes
-- **VBV (leaky bucket)**: max buffer size, target bitrate, constrain per-frame qstep
-- **CBR and VBR modes**: constant bitrate (with VBV) and variable bitrate (average target)
-- Add `--bitrate` CLI flag alongside `--quality`
+### 3C: Rate Control ✅
+- **Per-frame**: R-Q model (bpp ~ c * qstep^-α) with exponential smoothing ✅
+- **VBV (leaky bucket)**: max buffer size, target bitrate, constrain per-frame qstep ✅
+- **CBR and VBR modes**: constant bitrate and variable bitrate ✅
+- `--bitrate` and `--rate-mode` CLI flags ✅
 
-### 3D: Sequence Container
-- Minimal container: file header + frame index table + frame data
-- Frame index: `[offset, size, frame_type, pts]` per frame — enables random access
-- I-frame seeking: `gnc decode --seek 5.0` finds nearest preceding I-frame
-- Extend `gnc encode` to accept numbered frames or `.y4m`
+### 3D: Sequence Container ✅
+- GNV1 container: file header + frame index table + frame data ✅
+- Frame index with offset, size, frame_type, pts — enables random access ✅
+- I-frame seeking: `seek_to_keyframe()` ✅
+- `encode-sequence` and `decode-sequence` CLI subcommands ✅
 
 ### Definition of Done
 - P-frame bpp savings ≥50% vs I-frames on all test content (currently 26%, camera pan negative)

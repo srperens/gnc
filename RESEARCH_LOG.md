@@ -1136,3 +1136,54 @@ Using above-neighbor context to select among multiple frequency tables per subba
 
 ### M2 Status Summary
 All four M2 sub-tasks complete (2A CfL, 2B AQ, 2C ZRL, 2D context-adaptive). Combined impact on synthetic images is significant for hard content (checker q25: -21% bpp total vs pre-M2) but modest for easy content. Real-image evaluation needed to assess true compression gap vs JPEG 2000.
+
+---
+
+## 2026-02-25: M3A/C/D — Video Codec Fundamentals (Phase 1)
+
+### Hypothesis
+Improved motion estimation (half-pel, larger search range, per-tile adaptive I/P), rate control, and a proper sequence container will transform the image codec into a functioning video codec with significant temporal savings.
+
+### Implementation
+
+**M3A: Improved Motion Estimation**
+- Half-pel bilinear interpolation in `block_match.wgsl`: Phase 1 integer-pel full search, Phase 2 half-pel refinement around winner (8 neighbors tested by threads 0-7)
+- MVs now in half-pel units throughout the pipeline (block_match → motion_compensate)
+- `motion_compensate.wgsl` updated with bilinear reference sampling
+- Search range increased from ±32 to ±64 pixels
+- Per-tile adaptive I/P decision: compare tile SAD (residual energy) vs tile original energy; zero MVs if residual is worse
+
+**M3C: Rate Control**
+- `rate_control.rs`: R-Q model (bpp ~ c * qstep^-alpha), VBV buffer, CBR/VBR modes
+- Integrates into `encode_sequence_with_fps()` — per-frame qstep adjustment
+- `--bitrate` and `--rate-mode` CLI flags
+
+**M3D: Sequence Container**
+- GNV1 format in `format.rs`: file header + frame index table + frame data
+- `serialize_sequence()`, `deserialize_sequence_header/frame()`, `seek_to_keyframe()`
+- `encode-sequence` and `decode-sequence` CLI subcommands
+
+**Critical Bug Fix: Encoder/Decoder Reference Drift**
+- Root cause: encoder's `local_decode_iframe()` did not apply AQ (weight map) dequantization or CfL inverse prediction, but the standalone decoder did. This caused different reference planes, making all P-frames accumulate drift.
+- Fix: rewrote `local_decode_iframe()` to exactly match the decoder pipeline (dispatch_adaptive with weight map, CfL inverse prediction for chroma)
+- Also fixed shared `alpha_cap` bug: raw_alpha and dq_alpha shared one capacity variable, so only raw_alpha was grown — split into separate caps.
+
+### Results
+
+| Content | Metric | I-only | I+P (ki=8) | Change |
+|---------|--------|--------|------------|--------|
+| bbb_1080p | avg bpp | 5.98 | 4.62 | **-22.6%** |
+| bbb_1080p | I-frame PSNR | 33.7 dB | 33.7 dB | same |
+| bbb_1080p | P-frame PSNR | — | 44.0 dB | +10.3 dB vs I |
+| blue_sky | avg bpp | 5.06 | 5.14 | **+1.5%** (worse) |
+| blue_sky | P-frame PSNR | — | 44.1 dB | +27 dB vs I |
+
+Before the encoder/decoder reference drift fix, P-frame PSNR was 18.6 dB. After fix: 44.0 dB.
+
+### Analysis
+- **bbb_1080p** (slow pan): 22.6% savings. Motion estimation works well for gradual content changes.
+- **blue_sky** (camera pan): P-frames are actually LARGER than I-frames (-1.5% savings). The per-tile adaptive I/P decision helps (prevents quality degradation) but the residuals are still big because global camera motion produces large displacements.
+- P-frame PSNR (44 dB) is higher than I-frame (33.7 dB) because the residual signal is small and easy to compress with high precision.
+- Camera pan content needs either: (a) global motion compensation, or (b) B-frames (bidirectional prediction), or (c) larger block sizes for global motion.
+- Sequence encode throughput: 0.9 fps (needs optimization — GPU pipeline not yet pipelined across frames).
+- The reference drift bug shows the importance of exact encoder/decoder matching in any codec with temporal prediction.

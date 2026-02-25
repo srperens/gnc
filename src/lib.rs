@@ -384,7 +384,7 @@ pub fn quality_preset(q: u32) -> CodecConfig {
         per_subband_entropy: disc.per_subband,
         adaptive_quantization: aq_enabled,
         aq_strength,
-        context_adaptive: disc.per_subband,
+        context_adaptive: false, // CPU-only; enable explicitly when GPU implementation exists
         ..Default::default()
     }
 }

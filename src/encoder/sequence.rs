@@ -9,7 +9,6 @@ use super::motion::{MotionEstimator, ME_BLOCK_SIZE};
 use super::pipeline::EncoderPipeline;
 use super::rans;
 use super::rate_control::RateController;
-use crate::gpu_util::read_buffer_f32;
 use crate::{
     CodecConfig, CompressedFrame, EntropyCoder, EntropyData, FrameInfo, FrameType, GpuContext,
     MotionField,
@@ -51,7 +50,7 @@ impl EncoderPipeline {
     ) -> Vec<CompressedFrame> {
         let ki = config.keyframe_interval;
         let mut results = Vec::with_capacity(frames.len());
-        let mut reference_planes: Option<[Vec<f32>; 3]> = None;
+        let mut has_reference = false;
 
         let info = FrameInfo {
             width,
@@ -63,13 +62,16 @@ impl EncoderPipeline {
         let padded_h = info.padded_height();
         let padded_pixels = (padded_w * padded_h) as usize;
 
+        // Ensure cached buffers (including gpu_ref_planes) exist for this resolution
+        self.ensure_cached(ctx, padded_w, padded_h);
+
         // Create rate controller if target bitrate is set
         let mut rate_ctrl = config
             .target_bitrate
             .map(|bitrate| RateController::new(bitrate, fps, width, height, config.rate_mode));
 
         for (i, rgb_data) in frames.iter().enumerate() {
-            let is_keyframe = ki <= 1 || i % ki as usize == 0 || reference_planes.is_none();
+            let is_keyframe = ki <= 1 || i % ki as usize == 0 || !has_reference;
 
             // Build per-frame config: override qstep if rate control is active
             let frame_config = if let Some(ref rc) = rate_ctrl {
@@ -89,17 +91,15 @@ impl EncoderPipeline {
                     rc.update(frame_config.quantization_step, compressed.bpp());
                 }
 
-                // Local decode to get reference planes for subsequent P-frames
-                let planes =
-                    self.local_decode_iframe(ctx, &compressed, padded_w, padded_h, padded_pixels);
-                reference_planes = Some(planes);
+                // Local decode writes directly to gpu_ref_planes — no CPU readback
+                self.local_decode_iframe(ctx, &compressed, padded_w, padded_h, padded_pixels);
+                has_reference = true;
                 results.push(compressed);
             } else {
-                let ref_planes = reference_planes.as_ref().unwrap();
-                let (compressed, new_ref) = self.encode_pframe(
+                // Reference planes are already on GPU in gpu_ref_planes
+                let compressed = self.encode_pframe(
                     ctx,
                     rgb_data,
-                    ref_planes,
                     width,
                     height,
                     padded_w,
@@ -114,7 +114,7 @@ impl EncoderPipeline {
                     rc.update(frame_config.quantization_step, compressed.bpp());
                 }
 
-                reference_planes = Some(new_ref);
+                // encode_pframe updates gpu_ref_planes in place
                 results.push(compressed);
             }
         }
@@ -124,6 +124,7 @@ impl EncoderPipeline {
 
     /// I-frame local decode: entropy decode → dequantize (with AQ) → CfL inverse → inverse wavelet.
     /// Must match the standalone decoder exactly so P-frame references don't drift.
+    /// Results are written directly to `gpu_ref_planes` — no CPU readback.
     fn local_decode_iframe(
         &mut self,
         ctx: &GpuContext,
@@ -131,7 +132,7 @@ impl EncoderPipeline {
         padded_w: u32,
         padded_h: u32,
         padded_pixels: usize,
-    ) -> [Vec<f32>; 3] {
+    ) {
         let config = &frame.config;
         let info = &frame.info;
         let weights_luma = config.subband_weights.pack_weights();
@@ -208,8 +209,6 @@ impl EncoderPipeline {
             ctx.queue
                 .write_buffer(&bufs.dq_alpha, 0, bytemuck::cast_slice(&all_cfl_f32));
         }
-
-        let mut result_planes: [Vec<f32>; 3] = [Vec::new(), Vec::new(), Vec::new()];
 
         for p in 0..3 {
             let quantized = entropy_decode_plane(
@@ -314,20 +313,19 @@ impl EncoderPipeline {
                 );
             }
 
+            // Copy decoded plane directly to persistent GPU reference buffer
+            cmd.copy_buffer_to_buffer(&bufs.plane_a, 0, &bufs.gpu_ref_planes[p], 0, plane_size);
             ctx.queue.submit(Some(cmd.finish()));
-            result_planes[p] = read_buffer_f32(ctx, &bufs.plane_a, padded_pixels);
         }
-
-        result_planes
     }
 
     /// Encode a P-frame: ME -> MC -> encode residual -> local decode loop.
+    /// Reference planes are read from and written to `gpu_ref_planes` — no CPU roundtrip.
     #[allow(clippy::too_many_arguments)]
     fn encode_pframe(
         &mut self,
         ctx: &GpuContext,
         rgb_data: &[f32],
-        ref_planes: &[Vec<f32>; 3],
         width: u32,
         height: u32,
         padded_w: u32,
@@ -335,7 +333,7 @@ impl EncoderPipeline {
         padded_pixels: usize,
         info: &FrameInfo,
         config: &CodecConfig,
-    ) -> (CompressedFrame, [Vec<f32>; 3]) {
+    ) -> CompressedFrame {
         let plane_size = (padded_pixels * std::mem::size_of::<f32>()) as u64;
 
         // Ensure cached buffers exist for this resolution
@@ -372,85 +370,29 @@ impl EncoderPipeline {
         );
         ctx.queue.submit(Some(cmd.finish()));
 
-        // Block matching on Y plane (already on GPU as plane_a)
-        // Upload reference Y to ref_upload buffer
-        ctx.queue
-            .write_buffer(&bufs.ref_upload, 0, bytemuck::cast_slice(&ref_planes[0]));
-
+        // Block matching on Y plane — reference Y is already on GPU in gpu_ref_planes[0]
         let mut cmd = ctx
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("pf_me"),
             });
-        let (mv_buf, sad_buf) = self.motion.estimate(
+        let (mv_buf, _sad_buf) = self.motion.estimate(
             ctx,
             &mut cmd,
             &bufs.plane_a,
-            &bufs.ref_upload,
+            &bufs.gpu_ref_planes[0],
             padded_w,
             padded_h,
         );
         ctx.queue.submit(Some(cmd.finish()));
 
+        // Read back MVs for bitstream serialization (small: ~64KB at 1080p)
         let me_blocks_x = padded_w / ME_BLOCK_SIZE;
         let me_blocks_y = padded_h / ME_BLOCK_SIZE;
         let me_total_blocks = me_blocks_x * me_blocks_y;
-        let mut mvs = MotionEstimator::read_motion_vectors(ctx, &mv_buf, me_total_blocks);
-        let sads = MotionEstimator::read_sad_values(ctx, &sad_buf, me_total_blocks);
+        let mvs = MotionEstimator::read_motion_vectors(ctx, &mv_buf, me_total_blocks);
 
-        // Per-tile adaptive I/P decision:
-        // Compare residual energy (SAD) vs original energy per tile.
-        // If residual >= original, zero out the tile's MVs.
-        let current_y = crate::gpu_util::read_buffer_f32(ctx, &bufs.plane_a, padded_pixels);
-        let tile_size_usize = config.tile_size as usize;
-        let blocks_per_tile_x = tile_size_usize / ME_BLOCK_SIZE as usize;
-        let blocks_per_tile_y = tile_size_usize / ME_BLOCK_SIZE as usize;
-        let tiles_x_count = info.tiles_x() as usize;
-        let tiles_y_count = info.tiles_y() as usize;
-
-        for ty in 0..tiles_y_count {
-            for tx in 0..tiles_x_count {
-                let mut tile_sad: u64 = 0;
-                for bty in 0..blocks_per_tile_y {
-                    for btx in 0..blocks_per_tile_x {
-                        let global_bx = tx * blocks_per_tile_x + btx;
-                        let global_by = ty * blocks_per_tile_y + bty;
-                        let block_idx = global_by * me_blocks_x as usize + global_bx;
-                        if block_idx < sads.len() {
-                            tile_sad += sads[block_idx] as u64;
-                        }
-                    }
-                }
-
-                let mut tile_energy: u64 = 0;
-                let tile_px_x = tx * tile_size_usize;
-                let tile_px_y = ty * tile_size_usize;
-                for py in 0..tile_size_usize {
-                    for px in 0..tile_size_usize {
-                        let gx = tile_px_x + px;
-                        let gy = tile_px_y + py;
-                        if gx < padded_w as usize && gy < padded_h as usize {
-                            let idx = gy * padded_w as usize + gx;
-                            tile_energy += current_y[idx].abs() as u64;
-                        }
-                    }
-                }
-
-                if tile_sad >= tile_energy {
-                    for bty in 0..blocks_per_tile_y {
-                        for btx in 0..blocks_per_tile_x {
-                            let global_bx = tx * blocks_per_tile_x + btx;
-                            let global_by = ty * blocks_per_tile_y + bty;
-                            let block_idx = global_by * me_blocks_x as usize + global_bx;
-                            if block_idx < mvs.len() {
-                                mvs[block_idx] = [0, 0];
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
+        // Re-upload MVs as read-only buffer for MC dispatches
         let mv_buf_ro = MotionEstimator::upload_motion_vectors(ctx, &mvs);
 
         // MC + wavelet + quantize per plane, keeping data on GPU
@@ -467,16 +409,18 @@ impl EncoderPipeline {
         let mut subband_tiles: Vec<rans::SubbandRansTile> = Vec::new();
         let mut bp_tiles: Vec<bitplane::BitplaneTile> = Vec::new();
 
+        // Forward encode: MC + wavelet + quantize per plane.
+        // Always save quantized data to separate buffers for both entropy encode AND
+        // local decode (avoids entropy decode round-trip in local decode loop).
+        //   Y quantized → recon_y
+        //   Co quantized → co_plane (overwrites original)
+        //   Cg quantized stays in plane_b
         for p in 0..3 {
             let weights = if p == 0 {
                 &weights_luma
             } else {
                 &weights_chroma
             };
-
-            // Upload reference plane to cached ref_upload buffer
-            ctx.queue
-                .write_buffer(&bufs.ref_upload, 0, bytemuck::cast_slice(&ref_planes[p]));
 
             let cur_plane = if p == 0 {
                 &bufs.plane_a
@@ -492,12 +436,12 @@ impl EncoderPipeline {
                     label: Some("pf_enc"),
                 });
 
-            // MC: current - reference -> mc_out (residual)
+            // MC: current - gpu_ref → mc_out (residual) — reference already on GPU
             self.motion.compensate(
                 ctx,
                 &mut cmd,
                 cur_plane,
-                &bufs.ref_upload,
+                &bufs.gpu_ref_planes[p],
                 &mv_buf_ro,
                 &bufs.mc_out,
                 padded_w,
@@ -537,10 +481,11 @@ impl EncoderPipeline {
                 weights,
             );
 
-            // Save quantized for batched rANS (Y→recon_y, Co→co_plane, Cg stays in plane_b)
-            if use_gpu_encode && p == 0 {
+            // Persist quantized data to separate buffers (always, not just for GPU encode).
+            // These buffers are reused by: (1) batched GPU rANS, (2) local decode loop below.
+            if p == 0 {
                 cmd.copy_buffer_to_buffer(&bufs.plane_b, 0, &bufs.recon_y, 0, plane_size);
-            } else if use_gpu_encode && p == 1 {
+            } else if p == 1 {
                 cmd.copy_buffer_to_buffer(&bufs.plane_b, 0, &bufs.co_plane, 0, plane_size);
             }
 
@@ -601,23 +546,14 @@ impl EncoderPipeline {
             }),
         };
 
-        // Local decode loop: dequant -> inv wavelet -> MC inverse -> new reference
-        // Keeps decoded residual on GPU (plane_a) to avoid readback+reupload.
-        let tiles_per_plane = tiles_x * tiles_y;
-        let mut recon_planes: [Vec<f32>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        // Local decode loop — entirely on GPU, no entropy round-trip.
+        // Quantized data is already on GPU from the forward encode:
+        //   Y in recon_y, Co in co_plane, Cg in plane_b.
+        // Use cg_plane as scratch (original Cg spatial data is no longer needed).
+        // For each plane: dequantize → inverse wavelet → inverse MC → update gpu_ref.
+        let quant_bufs: [&wgpu::Buffer; 3] = [&bufs.recon_y, &bufs.co_plane, &bufs.plane_b];
 
         for p in 0..3 {
-            let quantized = entropy_decode_plane(
-                &compressed.entropy,
-                p,
-                tiles_per_plane,
-                tile_size,
-                padded_w as usize,
-            );
-
-            ctx.queue
-                .write_buffer(&bufs.plane_a, 0, bytemuck::cast_slice(&quantized));
-
             let weights = if p == 0 {
                 &weights_luma
             } else {
@@ -630,11 +566,12 @@ impl EncoderPipeline {
                     label: Some("pf_ld"),
                 });
 
+            // Dequantize: quant_buf[p] → cg_plane (scratch)
             self.quantize.dispatch(
                 ctx,
                 &mut cmd,
-                &bufs.plane_a,
-                &bufs.plane_b,
+                quant_bufs[p],
+                &bufs.cg_plane,
                 padded_pixels as u32,
                 config.quantization_step,
                 config.dead_zone,
@@ -646,10 +583,11 @@ impl EncoderPipeline {
                 weights,
             );
 
+            // Inverse wavelet: cg_plane → plane_c(scratch) → plane_a
             self.transform.inverse(
                 ctx,
                 &mut cmd,
-                &bufs.plane_b,
+                &bufs.cg_plane,
                 &bufs.plane_c,
                 &bufs.plane_a,
                 info,
@@ -657,27 +595,24 @@ impl EncoderPipeline {
                 config.wavelet_type,
             );
 
-            // Upload reference plane for inverse MC
-            ctx.queue
-                .write_buffer(&bufs.ref_upload, 0, bytemuck::cast_slice(&ref_planes[p]));
-
-            // Inverse MC: recon = decoded_residual(plane_a) + MC(ref_upload) -> recon_out
-            // Residual stays on GPU in plane_a — no readback+reupload needed.
+            // Inverse MC: recon = decoded_residual(plane_a) + gpu_ref(p) → recon_out
             self.motion.compensate(
                 ctx,
                 &mut cmd,
                 &bufs.plane_a,
-                &bufs.ref_upload,
+                &bufs.gpu_ref_planes[p],
                 &mv_buf_ro,
                 &bufs.recon_out,
                 padded_w,
                 padded_h,
                 false,
             );
+
+            // Update persistent GPU reference for next frame
+            cmd.copy_buffer_to_buffer(&bufs.recon_out, 0, &bufs.gpu_ref_planes[p], 0, plane_size);
             ctx.queue.submit(Some(cmd.finish()));
-            recon_planes[p] = read_buffer_f32(ctx, &bufs.recon_out, padded_pixels);
         }
 
-        (compressed, recon_planes)
+        compressed
     }
 }

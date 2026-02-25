@@ -1,6 +1,9 @@
 use clap::{Parser, Subcommand};
+use gnc::bench::bdrate;
+use gnc::bench::codec_compare;
 use gnc::bench::compare::{write_csv, BenchmarkConfig, BenchmarkResult};
 use gnc::bench::quality::{self, QualityMetrics};
+use gnc::bench::sequence_metrics::{self, FrameMetrics};
 use gnc::bench::throughput;
 use gnc::decoder::pipeline::DecoderPipeline;
 use gnc::encoder::pipeline::EncoderPipeline;
@@ -121,6 +124,10 @@ enum Command {
         /// Quantization step size (overrides quality preset if both specified)
         #[arg(long)]
         qstep: Option<f32>,
+
+        /// Output CSV file for per-frame metrics and sequence summary
+        #[arg(long)]
+        csv: Option<String>,
     },
 
     /// Run experiments on an input image
@@ -136,6 +143,29 @@ enum Command {
         /// Experiment set: all, baseline, deadzone, levels, subband, entropy
         #[arg(short, long, default_value = "all")]
         experiment: String,
+    },
+
+    /// Generate rate-distortion curve or compute BD-rate between two curves
+    RdCurve {
+        /// Input image file (encode sweep mode)
+        #[arg(short, long)]
+        input: Option<String>,
+
+        /// Output CSV file for RD curve results
+        #[arg(short, long, default_value = "rd_curve.csv")]
+        output: String,
+
+        /// Second CSV to compute BD-rate against
+        #[arg(long)]
+        compare: Option<String>,
+
+        /// Comma-separated quality values to sweep
+        #[arg(long, default_value = "10,20,30,40,50,60,70,80,90,100")]
+        q_values: String,
+
+        /// Also sweep JPEG and JPEG 2000, producing a unified comparison CSV
+        #[arg(long)]
+        compare_codecs: bool,
     },
 }
 
@@ -441,6 +471,7 @@ fn main() {
             keyframe_interval,
             quality,
             qstep,
+            csv,
         } => {
             let qstep_display = qstep
                 .map(|q| format!("{}", q))
@@ -489,6 +520,7 @@ fn main() {
 
             println!("\n=== I+P (keyframe_interval={}) ===", keyframe_interval);
             let mut total_bytes_ip: usize = 0;
+            let mut frame_metrics_ip: Vec<FrameMetrics> = Vec::new();
             for (i, cf) in compressed_ip.iter().enumerate() {
                 let ft = if cf.frame_type == gnc::FrameType::Intra {
                     "I"
@@ -497,15 +529,25 @@ fn main() {
                 };
                 let decoded = decoder.decode(&ctx, cf);
                 let psnr = quality::psnr(&frames_data[i], &decoded, 255.0);
+                let ssim = quality::ssim_approx(&frames_data[i], &decoded, 255.0);
                 total_bytes_ip += cf.byte_size();
                 println!(
-                    "  Frame {:2} [{}]: {:6} bytes, {:.2} bpp, PSNR {:.2} dB",
+                    "  Frame {:2} [{}]: {:6} bytes, {:.2} bpp, PSNR {:.2} dB, SSIM {:.4}",
                     i,
                     ft,
                     cf.byte_size(),
                     cf.bpp(),
                     psnr,
+                    ssim,
                 );
+                frame_metrics_ip.push(FrameMetrics {
+                    frame_idx: i,
+                    frame_type: ft.to_string(),
+                    psnr,
+                    ssim,
+                    bpp: cf.bpp(),
+                    encoded_bytes: cf.byte_size(),
+                });
             }
 
             let avg_bpp_ip =
@@ -525,6 +567,10 @@ fn main() {
                 compressed_ip.len() - i_count,
             );
 
+            // Compute and display I+P sequence summary
+            let summary_ip = sequence_metrics::compute_sequence_metrics(&frame_metrics_ip);
+            println!("\n{}", summary_ip);
+
             // --- All I-frame baseline ---
             let mut config_i = config_ip.clone();
             config_i.keyframe_interval = 1;
@@ -533,19 +579,30 @@ fn main() {
             let compressed_i = encoder.encode_sequence(&ctx, &frame_refs, w, h, &config_i);
             let elapsed_i = start.elapsed();
 
-            println!("\n=== All I-frames (baseline) ===");
+            println!("=== All I-frames (baseline) ===");
             let mut total_bytes_i: usize = 0;
+            let mut frame_metrics_i: Vec<FrameMetrics> = Vec::new();
             for (i, cf) in compressed_i.iter().enumerate() {
                 let decoded = decoder.decode(&ctx, cf);
                 let psnr = quality::psnr(&frames_data[i], &decoded, 255.0);
+                let ssim = quality::ssim_approx(&frames_data[i], &decoded, 255.0);
                 total_bytes_i += cf.byte_size();
                 println!(
-                    "  Frame {:2} [I]: {:6} bytes, {:.2} bpp, PSNR {:.2} dB",
+                    "  Frame {:2} [I]: {:6} bytes, {:.2} bpp, PSNR {:.2} dB, SSIM {:.4}",
                     i,
                     cf.byte_size(),
                     cf.bpp(),
                     psnr,
+                    ssim,
                 );
+                frame_metrics_i.push(FrameMetrics {
+                    frame_idx: i,
+                    frame_type: "I".to_string(),
+                    psnr,
+                    ssim,
+                    bpp: cf.bpp(),
+                    encoded_bytes: cf.byte_size(),
+                });
             }
 
             let avg_bpp_i =
@@ -559,12 +616,309 @@ fn main() {
                 compressed_i.len() as f64 / elapsed_i.as_secs_f64(),
             );
 
+            // Compute and display I-only sequence summary
+            let summary_i = sequence_metrics::compute_sequence_metrics(&frame_metrics_i);
+            println!("\n{}", summary_i);
+
             // --- Comparison ---
             let saving_pct = (1.0 - total_bytes_ip as f64 / total_bytes_i as f64) * 100.0;
             println!(
-                "\n=== Comparison ===\n  I-only: {} bytes ({:.2} bpp)\n  I+P:    {} bytes ({:.2} bpp)\n  Saving: {:.1}%",
+                "=== Comparison ===\n  I-only: {} bytes ({:.2} bpp)\n  I+P:    {} bytes ({:.2} bpp)\n  Saving: {:.1}%",
                 total_bytes_i, avg_bpp_i, total_bytes_ip, avg_bpp_ip, saving_pct,
             );
+
+            // Temporal consistency comparison
+            println!(
+                "\n=== Temporal Consistency ===\n  I+P:    max PSNR drop {:.2} dB, consistency {:.2} dB\n  I-only: max PSNR drop {:.2} dB, consistency {:.2} dB",
+                summary_ip.max_psnr_drop,
+                summary_ip.temporal_consistency,
+                summary_i.max_psnr_drop,
+                summary_i.temporal_consistency,
+            );
+
+            // Write CSV if requested (I+P metrics — the primary encoding mode)
+            if let Some(csv_path) = csv {
+                sequence_metrics::write_sequence_csv(&csv_path, &frame_metrics_ip, &summary_ip)
+                    .expect("Failed to write sequence CSV");
+                println!("\nSequence metrics written to {}", csv_path);
+            }
+        }
+
+        Command::RdCurve {
+            input,
+            output,
+            compare,
+            q_values,
+            compare_codecs,
+        } => {
+            // Parse quality values
+            let q_vals: Vec<u32> = q_values
+                .split(',')
+                .map(|s| {
+                    s.trim()
+                        .parse::<u32>()
+                        .unwrap_or_else(|_| panic!("Invalid quality value: '{}'", s.trim()))
+                })
+                .collect();
+
+            // Collect GNC RD points and SSIM values for codec comparison
+            let mut gnc_rd_points: Vec<(u32, bdrate::RdPoint)> = Vec::new();
+            let mut gnc_ssim_values: Vec<f64> = Vec::new();
+
+            // Encode sweep mode: generate RD curve from input image
+            if let Some(ref input_path) = input {
+                let (rgb_data, w, h) = load_image_rgb_f32(input_path);
+                println!(
+                    "RD curve sweep: {}x{} image, {} quality points",
+                    w,
+                    h,
+                    q_vals.len()
+                );
+
+                let ctx = GpuContext::new();
+                let mut encoder = EncoderPipeline::new(&ctx);
+                let decoder = DecoderPipeline::new(&ctx);
+
+                // CSV writer
+                let mut wtr = csv::Writer::from_path(&output).expect("Failed to create CSV file");
+                wtr.write_record(["q", "qstep", "psnr", "ssim", "bpp", "encode_ms", "decode_ms"])
+                    .expect("Failed to write CSV header");
+
+                // Print table header
+                println!(
+                    "\n{:>5} {:>8} {:>8} {:>8} {:>8} {:>10} {:>10}",
+                    "q", "qstep", "psnr", "ssim", "bpp", "enc_ms", "dec_ms"
+                );
+                println!("{}", "-".repeat(68));
+
+                for &q in &q_vals {
+                    let config = gnc::quality_preset(q);
+                    let qstep = config.quantization_step;
+
+                    // Time encode
+                    let enc_start = std::time::Instant::now();
+                    let compressed = encoder.encode(&ctx, &rgb_data, w, h, &config);
+                    let encode_ms = enc_start.elapsed().as_secs_f64() * 1000.0;
+
+                    // Time decode
+                    let dec_start = std::time::Instant::now();
+                    let reconstructed = decoder.decode(&ctx, &compressed);
+                    let decode_ms = dec_start.elapsed().as_secs_f64() * 1000.0;
+
+                    let psnr = quality::psnr(&rgb_data, &reconstructed, 255.0);
+                    let ssim = quality::ssim_approx(&rgb_data, &reconstructed, 255.0);
+                    let bpp = compressed.bpp();
+
+                    // Collect for codec comparison
+                    gnc_rd_points.push((q, bdrate::RdPoint { bpp, psnr }));
+                    gnc_ssim_values.push(ssim);
+
+                    // Write CSV row
+                    wtr.write_record(&[
+                        format!("{}", q),
+                        format!("{:.4}", qstep),
+                        format!("{:.4}", psnr),
+                        format!("{:.6}", ssim),
+                        format!("{:.6}", bpp),
+                        format!("{:.2}", encode_ms),
+                        format!("{:.2}", decode_ms),
+                    ])
+                    .expect("Failed to write CSV row");
+
+                    // Print table row
+                    println!(
+                        "{:>5} {:>8.4} {:>8.2} {:>8.4} {:>8.4} {:>10.2} {:>10.2}",
+                        q, qstep, psnr, ssim, bpp, encode_ms, decode_ms
+                    );
+                }
+
+                wtr.flush().expect("Failed to flush CSV");
+                println!("\nRD curve written to {}", output);
+
+                // Multi-codec comparison mode
+                if compare_codecs {
+                    println!("\n=== Multi-Codec Comparison ===");
+
+                    // JPEG sweep
+                    let jpeg_q_values = codec_compare::default_jpeg_quality_values();
+                    println!("\nSweeping JPEG ({} quality points)...", jpeg_q_values.len());
+                    let jpeg_points = codec_compare::jpeg_rd_curve(input_path, &jpeg_q_values);
+                    let jpeg_ssim = codec_compare::jpeg_ssim_values(input_path, &jpeg_q_values);
+
+                    // JPEG 2000 sweep
+                    let j2k_rates = codec_compare::default_j2k_rates();
+                    println!("Sweeping JPEG 2000 ({} rate points)...", j2k_rates.len());
+                    let j2k_points = codec_compare::jpeg2000_rd_curve(input_path, &j2k_rates)
+                        .unwrap_or_else(|| {
+                            println!(
+                                "  opj_compress not found in PATH, skipping JPEG 2000"
+                            );
+                            Vec::new()
+                        });
+
+                    // Print summary table
+                    codec_compare::print_comparison_summary(
+                        &gnc_rd_points,
+                        &jpeg_points,
+                        &j2k_points,
+                    );
+
+                    // Write unified comparison CSV
+                    let comparison_csv = output.replace(".csv", "_comparison.csv");
+                    codec_compare::write_comparison_csv(
+                        &comparison_csv,
+                        &gnc_rd_points,
+                        &jpeg_points,
+                        &j2k_points,
+                        &gnc_ssim_values,
+                        &jpeg_ssim,
+                    )
+                    .expect("Failed to write comparison CSV");
+                    println!("\nComparison CSV written to {}", comparison_csv);
+
+                    // BD-rate: GNC vs JPEG
+                    let gnc_rd: Vec<bdrate::RdPoint> =
+                        codec_compare::extract_rd_points_u32(&gnc_rd_points);
+                    let jpeg_rd: Vec<bdrate::RdPoint> =
+                        codec_compare::extract_rd_points_u32(&jpeg_points);
+
+                    println!("\n--- BD-rate: GNC vs JPEG ---");
+                    match bdrate::bd_rate(&jpeg_rd, &gnc_rd) {
+                        Some(rate) => {
+                            let better_worse = if rate < 0.0 { "better" } else { "worse" };
+                            println!(
+                                "  BD-rate:  {:.2}% (GNC uses {:.1}% {} bits than JPEG at same quality)",
+                                rate,
+                                rate.abs(),
+                                better_worse
+                            );
+                        }
+                        None => println!("  BD-rate:  N/A (need >= 4 overlapping PSNR points)"),
+                    }
+                    match bdrate::bd_psnr(&jpeg_rd, &gnc_rd) {
+                        Some(psnr) => {
+                            let better_worse = if psnr > 0.0 { "better" } else { "worse" };
+                            println!(
+                                "  BD-PSNR:  {:.2} dB (GNC is {:.2} dB {} than JPEG at same bitrate)",
+                                psnr,
+                                psnr.abs(),
+                                better_worse
+                            );
+                        }
+                        None => println!("  BD-PSNR:  N/A (need >= 4 overlapping points)"),
+                    }
+
+                    // BD-rate: GNC vs JPEG 2000
+                    if !j2k_points.is_empty() {
+                        let j2k_rd: Vec<bdrate::RdPoint> =
+                            codec_compare::extract_rd_points_f32(&j2k_points);
+
+                        println!("\n--- BD-rate: GNC vs JPEG 2000 ---");
+                        match bdrate::bd_rate(&j2k_rd, &gnc_rd) {
+                            Some(rate) => {
+                                let better_worse = if rate < 0.0 { "better" } else { "worse" };
+                                println!(
+                                    "  BD-rate:  {:.2}% (GNC uses {:.1}% {} bits than JPEG 2000 at same quality)",
+                                    rate,
+                                    rate.abs(),
+                                    better_worse
+                                );
+                            }
+                            None => println!(
+                                "  BD-rate:  N/A (need >= 4 overlapping PSNR points)"
+                            ),
+                        }
+                        match bdrate::bd_psnr(&j2k_rd, &gnc_rd) {
+                            Some(psnr) => {
+                                let better_worse = if psnr > 0.0 { "better" } else { "worse" };
+                                println!(
+                                    "  BD-PSNR:  {:.2} dB (GNC is {:.2} dB {} than JPEG 2000 at same bitrate)",
+                                    psnr,
+                                    psnr.abs(),
+                                    better_worse
+                                );
+                            }
+                            None => println!(
+                                "  BD-PSNR:  N/A (need >= 4 overlapping points)"
+                            ),
+                        }
+                    }
+                }
+            }
+
+            // BD-rate comparison mode
+            if let Some(ref compare_path) = compare {
+                // Determine reference curve path: either the just-generated output or
+                // the output path when no input was given
+                let ref_path = &output;
+
+                // If no input was provided, ref_path must be an existing CSV
+                if input.is_none()
+                    && !std::path::Path::new(ref_path).exists()
+                {
+                    eprintln!(
+                        "Error: no --input given and reference CSV '{}' does not exist.",
+                        ref_path
+                    );
+                    std::process::exit(1);
+                }
+
+                println!(
+                    "\nBD-rate comparison: '{}' vs '{}'",
+                    ref_path, compare_path
+                );
+
+                let reference = bdrate::load_rd_curve(ref_path)
+                    .unwrap_or_else(|e| {
+                        eprintln!("Failed to load reference CSV '{}': {}", ref_path, e);
+                        std::process::exit(1);
+                    });
+                let test = bdrate::load_rd_curve(compare_path)
+                    .unwrap_or_else(|e| {
+                        eprintln!("Failed to load test CSV '{}': {}", compare_path, e);
+                        std::process::exit(1);
+                    });
+
+                println!(
+                    "  Reference: {} points, Test: {} points",
+                    reference.len(),
+                    test.len()
+                );
+
+                match bdrate::bd_rate(&reference, &test) {
+                    Some(rate) => {
+                        let better_worse = if rate < 0.0 { "better" } else { "worse" };
+                        println!(
+                            "  BD-rate:  {:.2}% ({} uses {:.1}% {} bits at same quality)",
+                            rate,
+                            compare_path,
+                            rate.abs(),
+                            better_worse
+                        );
+                    }
+                    None => println!("  BD-rate:  N/A (need >= 4 overlapping points)"),
+                }
+
+                match bdrate::bd_psnr(&reference, &test) {
+                    Some(psnr) => {
+                        let better_worse = if psnr > 0.0 { "better" } else { "worse" };
+                        println!(
+                            "  BD-PSNR:  {:.2} dB ({} is {:.2} dB {} at same bitrate)",
+                            psnr,
+                            compare_path,
+                            psnr.abs(),
+                            better_worse
+                        );
+                    }
+                    None => println!("  BD-PSNR:  N/A (need >= 4 overlapping points)"),
+                }
+            }
+
+            // Neither input nor compare given
+            if input.is_none() && compare.is_none() {
+                eprintln!("Error: provide --input for RD sweep, --compare for BD-rate, or both.");
+                std::process::exit(1);
+            }
         }
     }
 }

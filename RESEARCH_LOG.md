@@ -1009,3 +1009,44 @@ Encode improved from 33.5ms → 31.8ms (5% speedup) due to GPU submission batchi
 - **AQ fundamentally broken**: spatial-domain weights applied to wavelet-domain positions. Needs redesign to compute weights per wavelet subband (e.g., from LL subband energy) rather than spatial variance
 - **BPP still high**: 5.93 bpp at 44 dB for bbb_1080p. Target was ~1 bpp. Main opportunities: better ZRL on GPU path (currently CPU-only), tighter frequency tables, context modeling
 - **local_decode_iframe**: still 3 separate submits (hard sequential dependency on plane_a buffer reuse)
+
+## 2026-02-25: M1 — Evaluation Framework Complete
+
+### Hypothesis
+Automated regression testing and BD-rate measurement are prerequisites for safe iterative development. Without them, improvements cannot be verified and regressions go undetected.
+
+### Implementation
+
+**1. Golden-baseline regression tests** (`tests/quality_regression.rs`, `tests/golden_baselines.toml`)
+- 10 tests: 8 quality regression (gradient + checkerboard at q=25/50/75/90), 1 monotonicity, 1 serialize roundtrip
+- Baselines stored in TOML, auto-updatable via `--ignored update_golden_baselines`
+- Tolerances: 0.5 dB PSNR, 5% bpp
+
+**2. `gnc rd-curve` CLI command** (`src/main.rs`, `src/bench/bdrate.rs`)
+- Sweeps q=10,20,...,100 with timing, outputs CSV (q, qstep, psnr, ssim, bpp, encode_ms, decode_ms)
+- BD-rate and BD-PSNR computation via natural cubic spline integration
+- `--compare` flag for standalone CSV comparison
+- Unit tests verify: identical curves → 0% BD-rate, 2x bitrate → ~-50% BD-rate
+
+**3. Multi-codec comparison** (`src/bench/codec_compare.rs`)
+- JPEG sweep via `image` crate (no external tools needed)
+- JPEG 2000 via `opj_compress`/`opj_decompress` with graceful fallback
+- `--compare-codecs` flag on rd-curve produces unified comparison CSV
+- BD-rate of GNC vs JPEG and GNC vs J2K computed automatically
+
+**4. Sequence metrics** (`src/bench/sequence_metrics.rs`)
+- Per-frame PSNR/SSIM/bpp tracking with FrameMetrics struct
+- SequenceSummary: avg/min/max/stddev + temporal consistency (max PSNR drop, inter-frame stddev)
+- `--csv` flag on benchmark-sequence writes full per-frame CSV
+- Integrated into existing BenchmarkSequence command
+
+### Results
+- `cargo test --release` passes all 10 regression tests + unit tests in < 1 second
+- Golden baselines established for gradient/checkerboard at 4 quality levels
+- BD-rate computation verified against known pairs (identical=0%, half-bitrate≈-50%)
+
+### Analysis
+The evaluation framework is now solid enough for safe iteration on M2. Key baselines:
+- Gradient 512x512: q75 → 60.86 dB / 0.62 bpp, q25 → 49.97 dB / 0.41 bpp
+- Checkerboard 512x512: q75 → 43.43 dB / 4.29 bpp, q25 → 32.65 dB / 1.09 bpp
+- Checkerboard compresses poorly (high-frequency content), as expected for wavelet codec

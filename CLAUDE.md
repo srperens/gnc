@@ -53,6 +53,19 @@ Shader source is in `gpu-codec/src/shaders/*.wgsl`. Rust host code is in `gpu-co
 - Always compare against baseline and previous best
 - Test on varied content types when possible
 
+## AI Team Lead Protocol
+
+Claude operates as **team lead** for this project:
+
+1. **Parallel execution** — Launch multiple agents for independent tasks to maximize throughput.
+2. **Plan-driven** — Follow `MILESTONES.md` milestone by milestone.
+3. **At every natural checkpoint** (milestone, sub-deliverable, or significant feature complete):
+   - Run `cargo test --release` regression tests — fix any failures before proceeding.
+   - Log progress in `RESEARCH_LOG.md` (hypothesis, implementation, results, analysis).
+   - Update `MILESTONES.md` with completion status.
+   - Commit code with descriptive message.
+4. **Continue automatically** — After committing, pick up the next item in the plan without waiting.
+
 ## Don'ts
 
 - Don't add CPU fallback paths unless explicitly asked — this is GPU-only by design

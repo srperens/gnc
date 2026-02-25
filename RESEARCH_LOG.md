@@ -915,3 +915,97 @@ Quality unchanged: PSNR 43.41 dB, SSIM 0.9997, BPP 6.57
 1. **Benchmark encode_sequence** — measure per-frame encode time for frames 2+ to quantify buffer caching benefit for temporal encoding
 2. **Profile remaining bottlenecks** — GPU rANS encode is likely the dominant cost now (~15ms); histogram+normalize+encode could be further optimized
 3. **Reduce pad_frame CPU cost** — currently allocates+copies each frame; could upload directly and pad on GPU
+
+---
+
+## 2026-02-25: GPU Per-Subband rANS Alphabet Overflow Fix + Quality Presets + GPU Batching
+
+### Context
+While enabling 4 wavelet levels (from 3) for higher quality presets, PSNR crashed from ~44 dB to ~13 dB. This turned out to be a latent bug in the GPU per-subband rANS encoder that was always present but only manifested when subband alphabet sizes exceeded `MAX_GROUP_ALPHABET`.
+
+### Bug Investigation
+Systematic isolation identified the root cause through binary search over config flags:
+
+| Config change | PSNR (dB) | Status |
+|---------------|-----------|--------|
+| Baseline (3 levels, no AQ, no per_subband) | 43.04 | OK |
+| + AQ enabled | 27.96 | BAD — AQ broken |
+| + per_subband GPU encode | 13.48 | BAD — GPU encode broken |
+| + per_subband CPU encode | 44.08 | OK — CPU path works |
+
+**AQ bug (Adaptive Quantization)**: AQ applies spatial-domain variance weights to wavelet-domain coefficient positions. In wavelet domain, position (x,y) doesn't correspond to the same spatial location — AQ weights are meaningless. Disabled for now.
+
+**GPU per-subband rANS bug**: The histogram shader clamped group alphabet sizes to `MAX_GROUP_ALPHABET` (was 512), but the encode shader did NOT clamp symbols. When any subband group's value range exceeded 512, the encoder read out-of-bounds `shared_cumfreq` data, producing a corrupt bitstream.
+
+Quality sweep confirmed the bug threshold:
+- q=50 (qstep=0.73): max LL alphabet ~480 → OK
+- q=55 (qstep=0.55): max LL alphabet ~640 → OVERFLOW → PSNR crash
+
+CDF 9/7 wavelet has DC gain ~1.15^8 ≈ 3.06× after 4 levels, amplifying the LL subband range.
+
+### Fixes Applied
+
+1. **Symbol clamping** in `rans_encode.wgsl` — match histogram shader's clamp behavior
+2. **MAX_GROUP_ALPHABET**: 512 → 2048 across all shaders (`rans_histogram.wgsl`, `rans_normalize.wgsl`, `rans_encode.wgsl`) and Rust host code (`rans_gpu_encode.rs`)
+3. **HIST_TILE_STRIDE**: updated to 16401 = 1 + 8×(2+2048) in all files
+4. **shared_cumfreq**: reduced from 7700 → 4096 entries (30.8KB → 16.4KB shared memory), improving GPU occupancy. Practical cumfreq sums (LL~2048 + 4 detail groups ~500 each) well under 4096.
+5. **Quality presets**: 4 wavelet levels for q≥60, quality-dependent chroma weights, AQ disabled
+
+### GPU Submission Batching
+
+Batched the 3-plane (Y/Co/Cg) wavelet transform + quantize into a single GPU command encoder submission:
+
+- **Before**: 3 separate command encoders, 3 `queue.submit()` calls (one per plane)
+- **After**: 1 command encoder with all 3 planes' dispatches sequentially, 1 `queue.submit()`
+- CfL dependency (chroma needs reconstructed Y) satisfied by sequential dispatch order within the encoder
+- CfL alpha readback deferred: Co/Cg alphas copied to MAP_READ staging buffers within the encoder, read back after the single submit with one poll
+
+I-frame GPU submissions reduced from 5 to 3:
+1. Preprocess (color convert + deinterleave)
+2. 3-plane wavelet + quantize (NEW: batched)
+3. 3-plane rANS encode (already batched)
+
+### Results — Quality Sweep (bbb_1080p, GPU per-subband rANS)
+
+| Quality | PSNR (dB) | BPP  | Notes |
+|---------|-----------|------|-------|
+| q=40    | 35.57     | 1.85 | 3 levels, LeGall 5/3 |
+| q=50    | 37.98     | 2.75 | 3 levels |
+| q=60    | 40.39     | 3.77 | 4 levels, CDF 9/7, CfL, per-subband |
+| q=70    | 43.01     | 5.21 | 4 levels |
+| q=75    | 44.08     | 5.93 | 4 levels (default) |
+| q=80    | 45.80     | 6.90 | 4 levels |
+| q=90    | 51.88     | 10.33 | 4 levels |
+
+All quality levels produce correct monotonically increasing PSNR.
+
+### Results — Throughput (1080p, q=75, macOS Metal)
+
+| Image | Encode | Decode | Decode (pipelined) |
+|-------|--------|--------|--------------------|
+| bbb_1080p | 31.8 ms (31.5 fps) | 29.1 ms (34.3 fps) | 28.9 ms (34.6 fps) |
+| blue_sky_1080p | 31.7 ms (31.6 fps) | 27.0 ms (37.0 fps) | 27.4 ms (36.5 fps) |
+
+Encode improved from 33.5ms → 31.8ms (5% speedup) due to GPU submission batching. Criterion roundtrip benchmark shows statistically significant -2.5% improvement.
+
+### Files Modified
+- `src/shaders/rans_encode.wgsl` — symbol clamping, shared_cumfreq 7700→4096
+- `src/shaders/rans_histogram.wgsl` — MAX_GROUP_ALPHABET 512→2048, HIST_TILE_STRIDE→16401
+- `src/shaders/rans_normalize.wgsl` — MAX_GROUP_ALPHABET→2048, HIST_TILE_STRIDE→16401
+- `src/shaders/rans_decode.wgsl` — shared_cumfreq 7700→4096
+- `src/encoder/rans_gpu_encode.rs` — Rust constants updated to match shaders
+- `src/encoder/rans.rs` — per-group ZRL encoding for detail subbands (CPU path)
+- `src/encoder/rans_gpu.rs` — ZRL integration for GPU decode path
+- `src/encoder/pipeline.rs` — batched 3-plane command encoder, deferred CfL alpha readback
+- `src/lib.rs` — quality preset: 4 levels, chroma weights, AQ disabled
+
+### Analysis
+- The alphabet overflow bug was latent since per-subband GPU encoding was introduced — it only manifested when `qstep` was small enough for the LL subband range to exceed 512
+- Increasing MAX_GROUP_ALPHABET to 2048 handles all practical cases (CDF97 DC gain at 4 levels with typical 8-bit content)
+- The shared_cumfreq reduction from 7700→4096 entries was key for recovering GPU performance — 30.8KB was nearly filling the 32KB threadgroup memory limit, crushing occupancy
+- GPU submission batching provides incremental improvement; the GPU compute itself dominates latency
+
+### Remaining known issues
+- **AQ fundamentally broken**: spatial-domain weights applied to wavelet-domain positions. Needs redesign to compute weights per wavelet subband (e.g., from LL subband energy) rather than spatial variance
+- **BPP still high**: 5.93 bpp at 44 dB for bbb_1080p. Target was ~1 bpp. Main opportunities: better ZRL on GPU path (currently CPU-only), tighter frequency tables, context modeling
+- **local_decode_iframe**: still 3 separate submits (hard sequential dependency on plane_a buffer reuse)

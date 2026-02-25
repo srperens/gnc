@@ -21,9 +21,9 @@ struct QuantizeParams {
     weights3: [f32; 4],
     // Adaptive quantization parameters
     aq_enabled: u32,
-    aq_block_size: u32,
-    aq_blocks_x: u32,
-    _pad: u32,
+    aq_ll_block_size: u32,
+    aq_ll_blocks_per_tile_x: u32,
+    aq_tiles_x: u32,
 }
 
 pub struct Quantizer {
@@ -164,7 +164,7 @@ impl Quantizer {
 
     /// Dispatch quantization/dequantization with optional adaptive spatial weighting.
     ///
-    /// `weight_map`: if Some, provides (buffer, aq_block_size, aq_blocks_x).
+    /// `weight_map`: if Some, provides (buffer, ll_block_size, ll_blocks_per_tile_x, tiles_x).
     #[allow(clippy::too_many_arguments)]
     pub fn dispatch_adaptive(
         &self,
@@ -181,12 +181,15 @@ impl Quantizer {
         tile_size: u32,
         num_levels: u32,
         weights: &[f32; 16],
-        weight_map: Option<(&wgpu::Buffer, u32, u32)>,
+        weight_map: Option<(&wgpu::Buffer, u32, u32, u32)>,
     ) {
-        let (aq_enabled, aq_block_size, aq_blocks_x, wm_buf) = match weight_map {
-            Some((buf, block_size, blocks_x)) => (1u32, block_size, blocks_x, buf),
-            None => (0u32, 32, 1, &self.dummy_weight_buf),
-        };
+        let (aq_enabled, aq_ll_block_size, aq_ll_blocks_per_tile_x, aq_tiles_x, wm_buf) =
+            match weight_map {
+                Some((buf, ll_block_size, ll_blocks_per_tile_x, tiles_x)) => {
+                    (1u32, ll_block_size, ll_blocks_per_tile_x, tiles_x, buf)
+                }
+                None => (0u32, 8, 1, 1, &self.dummy_weight_buf),
+            };
 
         let params = QuantizeParams {
             total_count,
@@ -202,9 +205,9 @@ impl Quantizer {
             weights2: [weights[8], weights[9], weights[10], weights[11]],
             weights3: [weights[12], weights[13], weights[14], weights[15]],
             aq_enabled,
-            aq_block_size,
-            aq_blocks_x,
-            _pad: 0,
+            aq_ll_block_size,
+            aq_ll_blocks_per_tile_x,
+            aq_tiles_x,
         };
 
         let params_buf = ctx

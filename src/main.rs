@@ -681,8 +681,16 @@ fn main() {
 
                 // CSV writer
                 let mut wtr = csv::Writer::from_path(&output).expect("Failed to create CSV file");
-                wtr.write_record(["q", "qstep", "psnr", "ssim", "bpp", "encode_ms", "decode_ms"])
-                    .expect("Failed to write CSV header");
+                wtr.write_record([
+                    "q",
+                    "qstep",
+                    "psnr",
+                    "ssim",
+                    "bpp",
+                    "encode_ms",
+                    "decode_ms",
+                ])
+                .expect("Failed to write CSV header");
 
                 // Print table header
                 println!(
@@ -741,7 +749,10 @@ fn main() {
 
                     // JPEG sweep
                     let jpeg_q_values = codec_compare::default_jpeg_quality_values();
-                    println!("\nSweeping JPEG ({} quality points)...", jpeg_q_values.len());
+                    println!(
+                        "\nSweeping JPEG ({} quality points)...",
+                        jpeg_q_values.len()
+                    );
                     let jpeg_points = codec_compare::jpeg_rd_curve(input_path, &jpeg_q_values);
                     let jpeg_ssim = codec_compare::jpeg_ssim_values(input_path, &jpeg_q_values);
 
@@ -750,9 +761,7 @@ fn main() {
                     println!("Sweeping JPEG 2000 ({} rate points)...", j2k_rates.len());
                     let j2k_points = codec_compare::jpeg2000_rd_curve(input_path, &j2k_rates)
                         .unwrap_or_else(|| {
-                            println!(
-                                "  opj_compress not found in PATH, skipping JPEG 2000"
-                            );
+                            println!("  opj_compress not found in PATH, skipping JPEG 2000");
                             Vec::new()
                         });
 
@@ -824,9 +833,7 @@ fn main() {
                                     better_worse
                                 );
                             }
-                            None => println!(
-                                "  BD-rate:  N/A (need >= 4 overlapping PSNR points)"
-                            ),
+                            None => println!("  BD-rate:  N/A (need >= 4 overlapping PSNR points)"),
                         }
                         match bdrate::bd_psnr(&j2k_rd, &gnc_rd) {
                             Some(psnr) => {
@@ -838,9 +845,7 @@ fn main() {
                                     better_worse
                                 );
                             }
-                            None => println!(
-                                "  BD-PSNR:  N/A (need >= 4 overlapping points)"
-                            ),
+                            None => println!("  BD-PSNR:  N/A (need >= 4 overlapping points)"),
                         }
                     }
                 }
@@ -853,9 +858,7 @@ fn main() {
                 let ref_path = &output;
 
                 // If no input was provided, ref_path must be an existing CSV
-                if input.is_none()
-                    && !std::path::Path::new(ref_path).exists()
-                {
+                if input.is_none() && !std::path::Path::new(ref_path).exists() {
                     eprintln!(
                         "Error: no --input given and reference CSV '{}' does not exist.",
                         ref_path
@@ -863,21 +866,16 @@ fn main() {
                     std::process::exit(1);
                 }
 
-                println!(
-                    "\nBD-rate comparison: '{}' vs '{}'",
-                    ref_path, compare_path
-                );
+                println!("\nBD-rate comparison: '{}' vs '{}'", ref_path, compare_path);
 
-                let reference = bdrate::load_rd_curve(ref_path)
-                    .unwrap_or_else(|e| {
-                        eprintln!("Failed to load reference CSV '{}': {}", ref_path, e);
-                        std::process::exit(1);
-                    });
-                let test = bdrate::load_rd_curve(compare_path)
-                    .unwrap_or_else(|e| {
-                        eprintln!("Failed to load test CSV '{}': {}", compare_path, e);
-                        std::process::exit(1);
-                    });
+                let reference = bdrate::load_rd_curve(ref_path).unwrap_or_else(|e| {
+                    eprintln!("Failed to load reference CSV '{}': {}", ref_path, e);
+                    std::process::exit(1);
+                });
+                let test = bdrate::load_rd_curve(compare_path).unwrap_or_else(|e| {
+                    eprintln!("Failed to load test CSV '{}': {}", compare_path, e);
+                    std::process::exit(1);
+                });
 
                 println!(
                     "  Reference: {} points, Test: {} points",

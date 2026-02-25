@@ -1,7 +1,7 @@
 use bytemuck::{Pod, Zeroable};
 use wgpu;
 
-use crate::encoder::adaptive::AQ_BLOCK_SIZE;
+use crate::encoder::adaptive::AQ_LL_BLOCK_SIZE;
 use crate::encoder::motion::ME_BLOCK_SIZE;
 use crate::encoder::rans_gpu;
 use crate::GpuContext;
@@ -293,10 +293,10 @@ impl CachedBuffers {
             })
         });
 
-        // Weight map buffer
-        let aq_blocks_x = padded_w.div_ceil(AQ_BLOCK_SIZE);
-        let aq_blocks_y = padded_h.div_ceil(AQ_BLOCK_SIZE);
-        let weight_map_cap = (aq_blocks_x * aq_blocks_y * 4).max(4) as u64;
+        // Weight map buffer: allocate for worst case (fewest wavelet levels).
+        // Upper bound: padded_pixels / AQ_LL_BLOCK_SIZE^2 blocks.
+        let max_wm_blocks = (padded_w * padded_h) / (AQ_LL_BLOCK_SIZE * AQ_LL_BLOCK_SIZE);
+        let weight_map_cap = (max_wm_blocks.max(1) * 4) as u64;
         let weight_map_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("dec_weight_map"),
             size: weight_map_cap,

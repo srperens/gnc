@@ -15,20 +15,40 @@ use wgpu::util::DeviceExt;
 use crate::GpuContext;
 
 // ---------------------------------------------------------------------------
-// Alpha quantization: map f32 in [-2, 2] to u8 [0, 255] and back
+// Alpha quantization (i16): map f32 in [-2, 2] to i16 [-16384, 16384]
 // ---------------------------------------------------------------------------
 
 const ALPHA_MIN: f32 = -2.0;
 const ALPHA_MAX: f32 = 2.0;
 const ALPHA_RANGE: f32 = ALPHA_MAX - ALPHA_MIN; // 4.0
+/// Scale factor: 8192.0 maps [-2, 2] to [-16384, 16384] (14-bit, step ~0.000244)
+const ALPHA_SCALE: f32 = 8192.0;
 
-pub fn quantize_alpha(alpha: f32) -> u8 {
+/// Quantize alpha to i16 with 14-bit precision.
+/// Maps [-2.0, 2.0] to [-16384, 16384], step size ~0.000244.
+pub fn quantize_alpha(alpha: f32) -> i16 {
+    let clamped = alpha.clamp(ALPHA_MIN, ALPHA_MAX);
+    (clamped * ALPHA_SCALE).round() as i16
+}
+
+/// Dequantize i16 alpha back to f32.
+pub fn dequantize_alpha(q: i16) -> f32 {
+    q as f32 / ALPHA_SCALE
+}
+
+// ---------------------------------------------------------------------------
+// Legacy u8 alpha quantization (backward compatibility)
+// ---------------------------------------------------------------------------
+
+/// Legacy u8 quantization: map f32 in [-2, 2] to u8 [0, 255].
+pub fn quantize_alpha_u8(alpha: f32) -> u8 {
     let clamped = alpha.clamp(ALPHA_MIN, ALPHA_MAX);
     let normalized = (clamped - ALPHA_MIN) / ALPHA_RANGE; // [0, 1]
     (normalized * 255.0).round() as u8
 }
 
-pub fn dequantize_alpha(q: u8) -> f32 {
+/// Legacy u8 dequantization: map u8 [0, 255] back to f32 [-2, 2].
+pub fn dequantize_alpha_u8(q: u8) -> f32 {
     (q as f32 / 255.0) * ALPHA_RANGE + ALPHA_MIN
 }
 
@@ -776,21 +796,21 @@ mod tests {
     #[test]
     fn alpha_quantize_roundtrip() {
         // Test exact center
-        assert_eq!(quantize_alpha(0.0), 128); // (0 - (-2)) / 4 * 255 = 127.5 → 128
-        assert_eq!(dequantize_alpha(128), 0.0 + (128.0 / 255.0) * 4.0 - 2.0);
+        assert_eq!(quantize_alpha(0.0), 0i16);
+        assert!((dequantize_alpha(0) - 0.0).abs() < 1e-6);
 
         // Test boundaries
-        assert_eq!(quantize_alpha(-2.0), 0);
-        assert_eq!(quantize_alpha(2.0), 255);
+        assert_eq!(quantize_alpha(-2.0), -16384i16);
+        assert_eq!(quantize_alpha(2.0), 16384i16);
 
-        // Roundtrip precision: max error should be ALPHA_RANGE / 255 / 2 ≈ 0.0078
-        for i in 0..=255u8 {
-            let alpha = dequantize_alpha(i);
+        // Roundtrip precision: max error should be 1 / ALPHA_SCALE / 2 ≈ 0.000061
+        for q in (-16384i16..=16384).step_by(17) {
+            let alpha = dequantize_alpha(q);
             let requantized = quantize_alpha(alpha);
             assert!(
-                (requantized as i16 - i as i16).unsigned_abs() <= 1,
+                (requantized - q).unsigned_abs() <= 1,
                 "roundtrip failed for {}: {} -> {} -> {}",
-                i,
+                q,
                 alpha,
                 quantize_alpha(alpha),
                 requantized
@@ -800,8 +820,17 @@ mod tests {
 
     #[test]
     fn alpha_clamp() {
-        assert_eq!(quantize_alpha(-5.0), 0);
-        assert_eq!(quantize_alpha(5.0), 255);
+        assert_eq!(quantize_alpha(-5.0), -16384);
+        assert_eq!(quantize_alpha(5.0), 16384);
+    }
+
+    #[test]
+    fn alpha_u8_legacy_roundtrip() {
+        // Verify legacy u8 functions still work
+        assert_eq!(quantize_alpha_u8(0.0), 128);
+        assert_eq!(quantize_alpha_u8(-2.0), 0);
+        assert_eq!(quantize_alpha_u8(2.0), 255);
+        assert!((dequantize_alpha_u8(128) - 0.007843).abs() < 0.01);
     }
 
     #[test]
@@ -868,7 +897,7 @@ mod tests {
         let alphas = compute_cfl_alphas(&recon_y, &chroma, w, h, tile_size, num_levels);
 
         // Quantize then dequantize to simulate what encoder/decoder actually uses
-        let q_alphas: Vec<u8> = alphas.iter().map(|&a| quantize_alpha(a)).collect();
+        let q_alphas: Vec<i16> = alphas.iter().map(|&a| quantize_alpha(a)).collect();
         let dq_alphas: Vec<f32> = q_alphas.iter().map(|&q| dequantize_alpha(q)).collect();
 
         let residual =

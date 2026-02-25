@@ -1,6 +1,6 @@
 use wgpu;
 
-use super::adaptive::{self, VarianceAnalyzer, WeightMapNormalizer, AQ_BLOCK_SIZE};
+use super::adaptive::{self, VarianceAnalyzer, WeightMapNormalizer, AQ_LL_BLOCK_SIZE};
 use super::bitplane;
 use super::buffer_cache::{pad_frame, CachedEncodeBuffers};
 use super::cfl::{self, CflAlphaComputer, CflForwardPredictor};
@@ -20,7 +20,7 @@ use crate::{
 // Temporal coding (encode_sequence, encode_pframe, local_decode_iframe)
 // is in the `sequence` sibling module which adds an `impl EncoderPipeline` block.
 
-/// Full encoding pipeline: Color -> (Variance Analysis) -> Wavelet -> Quantize -> rANS Entropy
+/// Full encoding pipeline: Color -> Wavelet -> (LL Variance Analysis) -> Quantize -> rANS Entropy
 pub struct EncoderPipeline {
     pub(super) color: ColorConverter,
     pub(super) transform: WaveletTransform,
@@ -98,7 +98,7 @@ impl EncoderPipeline {
         ctx.queue
             .write_buffer(&bufs.input_buf, 0, bytemuck::cast_slice(&padded_rgb));
 
-        // ---- Submit 1: color convert + deinterleave + (variance + weight normalize) ----
+        // ---- Submit 1: color convert + deinterleave ----
         let mut cmd = ctx
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -127,41 +127,7 @@ impl EncoderPipeline {
             padded_pixels as u32,
         );
 
-        // Adaptive quantization: variance + weight normalization on GPU
-        let weight_map = if config.adaptive_quantization && config.aq_strength > 0.0 {
-            let (blocks_x, blocks_y, total_blocks) = adaptive::weight_map_dims(padded_w, padded_h);
-
-            // Variance analysis reads Y from plane_a (already on GPU from deinterleave)
-            self.variance.dispatch(
-                ctx,
-                &mut cmd,
-                &bufs.plane_a,
-                &bufs.variance_buf,
-                padded_w,
-                padded_h,
-            );
-
-            // Weight map normalization on GPU (replaces CPU compute_weight_map)
-            self.weight_normalizer.dispatch(
-                ctx,
-                &mut cmd,
-                &bufs.variance_buf,
-                &bufs.wm_scratch,
-                &bufs.weight_map_buf,
-                blocks_x,
-                blocks_y,
-                config.aq_strength,
-            );
-
-            ctx.queue.submit(Some(cmd.finish()));
-
-            // Small readback (~8KB for 1080p) for CompressedFrame serialization only
-            let wm = read_buffer_f32(ctx, &bufs.weight_map_buf, total_blocks as usize);
-            Some(wm)
-        } else {
-            ctx.queue.submit(Some(cmd.finish()));
-            None
-        };
+        ctx.queue.submit(Some(cmd.finish()));
 
         // ---- Per-plane encoding ----
         let mut rans_tiles: Vec<rans::InterleavedRansTile> = Vec::new();
@@ -178,7 +144,7 @@ impl EncoderPipeline {
         let weights_chroma = config.subband_weights.pack_weights_chroma();
 
         let nsb = cfl::num_subbands(config.wavelet_levels);
-        let mut cfl_alphas_all: Vec<u8> = Vec::new();
+        let mut cfl_alphas_all: Vec<i16> = Vec::new();
 
         // Ensure CfL alpha buffers are large enough
         if config.cfl_enabled {
@@ -204,7 +170,7 @@ impl EncoderPipeline {
         }
         let bufs = self.cached.as_ref().unwrap();
 
-        // ---- Single command encoder for all 3 planes: wavelet + quantize ----
+        // ---- Single command encoder for all 3 planes: wavelet + AQ + quantize ----
         // Dispatches execute sequentially within the encoder, so CfL dependencies
         // (chroma needs reconstructed Y) are naturally satisfied.
         let mut cmd = ctx
@@ -243,7 +209,7 @@ impl EncoderPipeline {
             })
         };
 
-        // --- Y plane: wavelet + quantize ---
+        // --- Y plane: wavelet transform ---
         self.transform.forward(
             ctx,
             &mut cmd,
@@ -254,9 +220,74 @@ impl EncoderPipeline {
             config.wavelet_levels,
             config.wavelet_type,
         );
+        // After wavelet: plane_c has Y wavelet coefficients
+
+        // --- Adaptive quantization: variance analysis on Y's LL subband ---
+        // Must run AFTER wavelet transform so we read from wavelet-domain data.
+        // The LL subband at the deepest level naturally represents spatial content.
+        let aq_active = config.adaptive_quantization && config.aq_strength > 0.0;
+        if aq_active {
+            // Variance analysis reads from Y wavelet buffer (plane_c)
+            self.variance.dispatch(
+                ctx,
+                &mut cmd,
+                &bufs.plane_c,
+                &bufs.variance_buf,
+                padded_w,
+                padded_h,
+                config.tile_size,
+                config.wavelet_levels,
+            );
+
+            // Weight map normalization on GPU.
+            // Pass global grid dimensions (tiles_x * ll_blocks_per_tile) so the
+            // 3x3 smoothing filter sees a coherent 2D layout across all tiles.
+            let (ll_bx, ll_by, total_blocks, _, tiles_x_u32, tiles_y_u32) = adaptive::ll_block_dims(
+                padded_w,
+                padded_h,
+                config.tile_size,
+                config.wavelet_levels,
+            );
+            let global_bx = ll_bx * tiles_x_u32;
+            let global_by = ll_by * tiles_y_u32;
+            self.weight_normalizer.dispatch(
+                ctx,
+                &mut cmd,
+                &bufs.variance_buf,
+                &bufs.wm_scratch,
+                &bufs.weight_map_buf,
+                global_bx,
+                global_by,
+                total_blocks,
+                config.aq_strength,
+            );
+        }
+
+        // --- Y plane: quantize ---
+        // Precompute AQ dimensions (used for all 3 planes when AQ is active)
+        let aq_dims = if aq_active {
+            let (_, ll_bx, _, tx) = adaptive::weight_map_dims(
+                padded_w,
+                padded_h,
+                config.tile_size,
+                config.wavelet_levels,
+            );
+            let ll_size = config.tile_size >> config.wavelet_levels;
+            let ll_block_size = AQ_LL_BLOCK_SIZE.min(ll_size);
+            Some((ll_block_size, ll_bx, tx))
+        } else {
+            None
+        };
+
+        // Build AQ weight map parameter for quantizer dispatch.
+        // Uses the precomputed aq_dims and the cached weight_map_buf.
+        let wm_param = aq_dims
+            .as_ref()
+            .map(|&(ll_bs, ll_bx, tx)| (&bufs.weight_map_buf, ll_bs, ll_bx, tx));
 
         if config.cfl_enabled {
             // Quantize + dequantize to get reconstructed Y wavelet for CfL
+            // (CfL path currently does not use AQ; can be extended later)
             self.quantize.dispatch(
                 ctx,
                 &mut cmd,
@@ -289,12 +320,6 @@ impl EncoderPipeline {
             );
             cmd.copy_buffer_to_buffer(&bufs.plane_a, 0, &bufs.recon_y, 0, plane_size);
         } else {
-            let wm_param = if config.adaptive_quantization && config.aq_strength > 0.0 {
-                let (_, _, blocks_x) = adaptive::weight_map_dims(padded_w, padded_h);
-                Some((&bufs.weight_map_buf, AQ_BLOCK_SIZE, blocks_x))
-            } else {
-                None
-            };
             self.quantize.dispatch_adaptive(
                 ctx,
                 &mut cmd,
@@ -371,12 +396,6 @@ impl EncoderPipeline {
             // Preserve Co alpha before Cg overwrites raw_alpha
             cmd.copy_buffer_to_buffer(&bufs.raw_alpha, 0, &alpha_staging[0], 0, alpha_bytes);
         } else {
-            let wm_param = if config.adaptive_quantization && config.aq_strength > 0.0 {
-                let (_, _, blocks_x) = adaptive::weight_map_dims(padded_w, padded_h);
-                Some((&bufs.weight_map_buf, AQ_BLOCK_SIZE, blocks_x))
-            } else {
-                None
-            };
             self.quantize.dispatch_adaptive(
                 ctx,
                 &mut cmd,
@@ -453,12 +472,6 @@ impl EncoderPipeline {
             // Copy Cg alpha to staging for deferred readback
             cmd.copy_buffer_to_buffer(&bufs.raw_alpha, 0, &alpha_staging[1], 0, alpha_bytes);
         } else {
-            let wm_param = if config.adaptive_quantization && config.aq_strength > 0.0 {
-                let (_, _, blocks_x) = adaptive::weight_map_dims(padded_w, padded_h);
-                Some((&bufs.weight_map_buf, AQ_BLOCK_SIZE, blocks_x))
-            } else {
-                None
-            };
             self.quantize.dispatch_adaptive(
                 ctx,
                 &mut cmd,
@@ -481,6 +494,20 @@ impl EncoderPipeline {
         // Single submit for all 3 planes
         ctx.queue.submit(Some(cmd.finish()));
 
+        // Weight map readback (for serialization into CompressedFrame)
+        let weight_map = if aq_active {
+            let (total_blocks, _, _, _) = adaptive::weight_map_dims(
+                padded_w,
+                padded_h,
+                config.tile_size,
+                config.wavelet_levels,
+            );
+            let wm = read_buffer_f32(ctx, &bufs.weight_map_buf, total_blocks as usize);
+            Some(wm)
+        } else {
+            None
+        };
+
         // Deferred CfL alpha readback (single poll for both chroma planes)
         if config.cfl_enabled {
             let (tx, rx) = std::sync::mpsc::channel();
@@ -497,9 +524,9 @@ impl EncoderPipeline {
             }
             for stg in &alpha_staging {
                 let view = stg.slice(..).get_mapped_range();
-                let raw_alphas: &[f32] = bytemuck::cast_slice(&view);
-                let q_alphas: Vec<u8> =
-                    raw_alphas.iter().map(|&a| cfl::quantize_alpha(a)).collect();
+                // Shader writes i32 values quantized to i16 range [-16384, 16384]
+                let raw_alphas: &[i32] = bytemuck::cast_slice(&view);
+                let q_alphas: Vec<i16> = raw_alphas.iter().map(|&a| a as i16).collect();
                 cfl_alphas_all.extend_from_slice(&q_alphas);
                 drop(view);
                 stg.unmap();

@@ -1,23 +1,33 @@
-// GPU rANS encoder — 32 interleaved streams per tile.
+// GPU rANS encoder — 32 interleaved streams per tile, with ZRL support.
 //
 // Each workgroup encodes one tile. 32 threads = 32 independent rANS streams.
 // Cumfreq table is loaded cooperatively into workgroup shared memory.
 // Encoding proceeds in reverse symbol order (last symbol first).
 //
+// ZRL (zero-run-length) encoding: consecutive zeros within each stream are
+// replaced by run-length symbols (zrun_base + run_length - 1) before rANS.
+// Each stream's ZRL is independent — runs don't cross stream boundaries.
+//
 // Supports two modes (selected by params.per_subband):
-//   0 = Single frequency table per tile
-//   1 = Per-subband frequency tables (one table per wavelet level group)
+//   0 = Single frequency table per tile (with optional ZRL)
+//   1 = Per-subband frequency tables (with per-group ZRL)
 
 const RANS_BYTE_L: u32 = 8388608u;  // 1 << 23
 const RANS_PRECISION: u32 = 12u;
 const STREAMS_PER_TILE: u32 = 32u;
 const MAX_ALPHABET: u32 = 2048u;
 const MAX_STREAM_BYTES: u32 = 4096u;
+const MAX_ZERO_RUN: u32 = 256u;
 
 // Per-tile encode info stride in u32s.
-// Single-table: [0]=min_val, [1]=alphabet_size, [2]=cumfreq_offset
-// Per-subband:  [0]=num_groups, [1+g*4]=min_val, [2+g*4]=alphabet_size, [3+g*4]=cumfreq_offset, [4+g*4]=zrun_base
+// Single-table: [0]=min_val, [1]=alphabet_size, [2]=cumfreq_offset, [3]=zrun_base
+// Per-subband:  [0]=num_groups, [1+g*4]=min_val, [2+g*4]=alphabet_size,
+//               [3+g*4]=cumfreq_offset, [4+g*4]=zrun_base
 const ENCODE_TILE_INFO_STRIDE: u32 = 32u;
+
+// Max ZRL-encoded symbols per stream. With ZRL, the symbol count can only
+// decrease (runs of zeros become single symbols), so this is a safe upper bound.
+const MAX_ZRL_SYMBOLS: u32 = 2048u;
 
 struct Params {
     num_tiles: u32,
@@ -38,8 +48,6 @@ struct Params {
 @group(0) @binding(5) var<storage, read_write> stream_metadata: array<u32>;
 
 // Shared cumfreq table for the current tile (loaded cooperatively)
-// Per-subband: up to MAX_GROUPS * (MAX_GROUP_ALPHABET + 1) entries
-// Single-table: up to MAX_ALPHABET + 1 = 2049 entries
 var<workgroup> shared_cumfreq: array<u32, 4096>;
 
 // Write one byte into the packed u32 output array.
@@ -63,6 +71,30 @@ fn compute_subband_group(lx: u32, ly: u32) -> u32 {
         region = half;
     }
     return 0u;
+}
+
+// Encode a single rANS symbol given its cumfreq start and freq.
+// Returns updated (state, write_ptr).
+fn rans_encode_sym(
+    state_in: u32, write_ptr_in: u32,
+    stream_base_byte: u32,
+    start: u32, freq: u32
+) -> vec2<u32> {
+    var state = state_in;
+    var write_ptr = write_ptr_in;
+
+    // Renormalize: emit bytes while state is too large
+    let x_max = ((RANS_BYTE_L >> RANS_PRECISION) << 8u) * freq;
+    for (var r = 0u; r < 4u; r++) {
+        if (state < x_max) { break; }
+        write_ptr -= 1u;
+        write_byte(stream_base_byte + write_ptr, state & 0xFFu);
+        state >>= 8u;
+    }
+
+    // Encode
+    state = ((state / freq) << RANS_PRECISION) + (state % freq) + start;
+    return vec2<u32>(state, write_ptr);
 }
 
 @compute @workgroup_size(32)
@@ -95,20 +127,26 @@ fn main(
     var state: u32 = RANS_BYTE_L;
 
     if (params.per_subband != 0u) {
-        // --- Per-subband encode path ---
+        // --- Per-subband encode path with ZRL ---
         let num_groups = tile_info[base];
 
         // Load per-group metadata into local arrays
         var group_min: array<i32, 8>;
         var group_asize: array<u32, 8>;
         var group_cf_start: array<u32, 8>;
+        var group_zrun: array<i32, 8>;
         var total_cf_entries = 0u;
+        var has_any_zrl = false;
 
         for (var g = 0u; g < num_groups; g++) {
             let gi = base + 1u + g * 4u;
             group_min[g] = bitcast<i32>(tile_info[gi]);
             group_asize[g] = tile_info[gi + 1u];
             let cf_global = tile_info[gi + 2u];
+            group_zrun[g] = bitcast<i32>(tile_info[gi + 3u]);
+            if (group_zrun[g] != 0) {
+                has_any_zrl = true;
+            }
             group_cf_start[g] = total_cf_entries;
             let entries = group_asize[g] + 1u;
 
@@ -121,48 +159,112 @@ fn main(
 
         workgroupBarrier();
 
-        // Encode in reverse order
-        for (var countdown = 0u; countdown < symbols_per_stream; countdown++) {
-            let i = symbols_per_stream - 1u - countdown;
-            let coeff_idx = thread_id + i * STREAMS_PER_TILE;
+        if (has_any_zrl) {
+            // ZRL-aware encode: first build the forward ZRL symbol sequence,
+            // then encode in reverse order.
+            //
+            // We store (symbol_value, group_index) pairs in local arrays.
+            // The symbol_value is the ZRL-transformed value (run symbols for zeros).
+            var zrl_sym_vals: array<i32, 2048>;
+            var zrl_sym_groups: array<u32, 2048>;
+            var zrl_count = 0u;
 
-            let tile_row = coeff_idx / params.tile_size;
-            let tile_col = coeff_idx % params.tile_size;
+            // Forward pass: build ZRL symbol sequence for this stream
+            var i = 0u;
+            while (i < symbols_per_stream) {
+                let coeff_idx = thread_id + i * STREAMS_PER_TILE;
+                let tile_row = coeff_idx / params.tile_size;
+                let tile_col = coeff_idx % params.tile_size;
+                let plane_idx = (tile_origin_y + tile_row) * params.plane_width
+                              + (tile_origin_x + tile_col);
+                let coeff = i32(round(input[plane_idx]));
+                let g = compute_subband_group(tile_col, tile_row);
+                let zrun = group_zrun[g];
 
-            let plane_idx = (tile_origin_y + tile_row) * params.plane_width
-                          + (tile_origin_x + tile_col);
-            let coeff = input[plane_idx];
-
-            let g = compute_subband_group(tile_col, tile_row);
-            let gmin = group_min[g];
-            var sym = u32(i32(round(coeff)) - gmin);
-            // Clamp to alphabet — must match histogram shader clamping
-            if (sym >= group_asize[g]) {
-                sym = group_asize[g] - 1u;
+                if (zrun != 0 && coeff == 0) {
+                    // Count consecutive zeros in same group within this stream
+                    var run_len = 0u;
+                    while (i < symbols_per_stream && run_len < MAX_ZERO_RUN) {
+                        let ci = thread_id + i * STREAMS_PER_TILE;
+                        let cr = ci / params.tile_size;
+                        let cc = ci % params.tile_size;
+                        let pi = (tile_origin_y + cr) * params.plane_width
+                               + (tile_origin_x + cc);
+                        let cv = i32(round(input[pi]));
+                        let cg = compute_subband_group(cc, cr);
+                        if (cv != 0 || cg != g) { break; }
+                        run_len += 1u;
+                        i += 1u;
+                    }
+                    // Run symbol value = zrun_base + (run_len - 1)
+                    zrl_sym_vals[zrl_count] = zrun + i32(run_len) - 1;
+                    zrl_sym_groups[zrl_count] = g;
+                    zrl_count += 1u;
+                } else {
+                    zrl_sym_vals[zrl_count] = coeff;
+                    zrl_sym_groups[zrl_count] = g;
+                    zrl_count += 1u;
+                    i += 1u;
+                }
             }
 
-            let cf_start = group_cf_start[g];
-            let start = shared_cumfreq[cf_start + sym];
-            let freq = shared_cumfreq[cf_start + sym + 1u] - start;
+            // Reverse pass: rANS encode ZRL symbols
+            for (var countdown = 0u; countdown < zrl_count; countdown++) {
+                let si = zrl_count - 1u - countdown;
+                let sym_val = zrl_sym_vals[si];
+                let g = zrl_sym_groups[si];
+                let gmin = group_min[g];
 
-            // Renormalize: emit bytes while state is too large
-            let x_max = ((RANS_BYTE_L >> RANS_PRECISION) << 8u) * freq;
-            for (var r = 0u; r < 4u; r++) {
-                if (state < x_max) { break; }
-                write_ptr -= 1u;
-                write_byte(stream_base_byte + write_ptr, state & 0xFFu);
-                state >>= 8u;
+                var sym = u32(sym_val - gmin);
+                if (sym >= group_asize[g]) {
+                    sym = group_asize[g] - 1u;
+                }
+
+                let cf_start = group_cf_start[g];
+                let start = shared_cumfreq[cf_start + sym];
+                let freq = shared_cumfreq[cf_start + sym + 1u] - start;
+
+                let result = rans_encode_sym(state, write_ptr, stream_base_byte, start, freq);
+                state = result.x;
+                write_ptr = result.y;
             }
 
-            // Encode
-            state = ((state / freq) << RANS_PRECISION) + (state % freq) + start;
+        } else {
+            // No ZRL: standard encode in reverse order
+            for (var countdown = 0u; countdown < symbols_per_stream; countdown++) {
+                let i = symbols_per_stream - 1u - countdown;
+                let coeff_idx = thread_id + i * STREAMS_PER_TILE;
+
+                let tile_row = coeff_idx / params.tile_size;
+                let tile_col = coeff_idx % params.tile_size;
+
+                let plane_idx = (tile_origin_y + tile_row) * params.plane_width
+                              + (tile_origin_x + tile_col);
+                let coeff = input[plane_idx];
+
+                let g = compute_subband_group(tile_col, tile_row);
+                let gmin = group_min[g];
+                var sym = u32(i32(round(coeff)) - gmin);
+                if (sym >= group_asize[g]) {
+                    sym = group_asize[g] - 1u;
+                }
+
+                let cf_start = group_cf_start[g];
+                let start = shared_cumfreq[cf_start + sym];
+                let freq = shared_cumfreq[cf_start + sym + 1u] - start;
+
+                let result = rans_encode_sym(state, write_ptr, stream_base_byte, start, freq);
+                state = result.x;
+                write_ptr = result.y;
+            }
         }
 
     } else {
-        // --- Single-table encode path ---
+        // --- Single-table encode path with optional ZRL ---
         let min_val = bitcast<i32>(tile_info[base]);
         let alphabet_size = tile_info[base + 1u];
         let cumfreq_offset = tile_info[base + 2u];
+        let zrun_base = bitcast<i32>(tile_info[base + 3u]);
         let alphabet_size_plus_one = alphabet_size + 1u;
 
         // Cooperatively load cumfreq into shared memory
@@ -172,38 +274,82 @@ fn main(
 
         workgroupBarrier();
 
-        // Encode in reverse order
-        for (var countdown = 0u; countdown < symbols_per_stream; countdown++) {
-            let i = symbols_per_stream - 1u - countdown;
-            let coeff_idx = thread_id + i * STREAMS_PER_TILE;
+        if (zrun_base != 0) {
+            // ZRL-aware encode: build forward ZRL sequence, then encode in reverse
+            var zrl_sym_vals: array<i32, 2048>;
+            var zrl_count = 0u;
 
-            let tile_row = coeff_idx / params.tile_size;
-            let tile_col = coeff_idx % params.tile_size;
+            var i = 0u;
+            while (i < symbols_per_stream) {
+                let coeff_idx = thread_id + i * STREAMS_PER_TILE;
+                let tile_row = coeff_idx / params.tile_size;
+                let tile_col = coeff_idx % params.tile_size;
+                let plane_idx = (tile_origin_y + tile_row) * params.plane_width
+                              + (tile_origin_x + tile_col);
+                let coeff = i32(round(input[plane_idx]));
 
-            let plane_idx = (tile_origin_y + tile_row) * params.plane_width
-                          + (tile_origin_x + tile_col);
-            let coeff = input[plane_idx];
-            let sym = u32(i32(round(coeff)) - min_val);
-
-            let start = shared_cumfreq[sym];
-            let freq = shared_cumfreq[sym + 1u] - start;
-
-            // Renormalize: emit bytes while state is too large
-            let x_max = ((RANS_BYTE_L >> RANS_PRECISION) << 8u) * freq;
-            for (var r = 0u; r < 4u; r++) {
-                if (state < x_max) { break; }
-                write_ptr -= 1u;
-                write_byte(stream_base_byte + write_ptr, state & 0xFFu);
-                state >>= 8u;
+                if (coeff == 0) {
+                    // Count consecutive zeros in this stream
+                    var run_len = 0u;
+                    while (i < symbols_per_stream && run_len < MAX_ZERO_RUN) {
+                        let ci = thread_id + i * STREAMS_PER_TILE;
+                        let cr = ci / params.tile_size;
+                        let cc = ci % params.tile_size;
+                        let pi = (tile_origin_y + cr) * params.plane_width
+                               + (tile_origin_x + cc);
+                        let cv = i32(round(input[pi]));
+                        if (cv != 0) { break; }
+                        run_len += 1u;
+                        i += 1u;
+                    }
+                    zrl_sym_vals[zrl_count] = zrun_base + i32(run_len) - 1;
+                    zrl_count += 1u;
+                } else {
+                    zrl_sym_vals[zrl_count] = coeff;
+                    zrl_count += 1u;
+                    i += 1u;
+                }
             }
 
-            // Encode
-            state = ((state / freq) << RANS_PRECISION) + (state % freq) + start;
+            // Reverse pass: rANS encode
+            for (var countdown = 0u; countdown < zrl_count; countdown++) {
+                let si = zrl_count - 1u - countdown;
+                var sym = u32(zrl_sym_vals[si] - min_val);
+                if (sym >= alphabet_size) { sym = alphabet_size - 1u; }
+
+                let start = shared_cumfreq[sym];
+                let freq = shared_cumfreq[sym + 1u] - start;
+
+                let result = rans_encode_sym(state, write_ptr, stream_base_byte, start, freq);
+                state = result.x;
+                write_ptr = result.y;
+            }
+
+        } else {
+            // No ZRL: standard encode in reverse order
+            for (var countdown = 0u; countdown < symbols_per_stream; countdown++) {
+                let i = symbols_per_stream - 1u - countdown;
+                let coeff_idx = thread_id + i * STREAMS_PER_TILE;
+
+                let tile_row = coeff_idx / params.tile_size;
+                let tile_col = coeff_idx % params.tile_size;
+
+                let plane_idx = (tile_origin_y + tile_row) * params.plane_width
+                              + (tile_origin_x + tile_col);
+                let coeff = input[plane_idx];
+                let sym = u32(i32(round(coeff)) - min_val);
+
+                let start = shared_cumfreq[sym];
+                let freq = shared_cumfreq[sym + 1u] - start;
+
+                let result = rans_encode_sym(state, write_ptr, stream_base_byte, start, freq);
+                state = result.x;
+                write_ptr = result.y;
+            }
         }
     }
 
     // Write final state and write_ptr to metadata buffer
-    // Layout: [write_ptr, final_state] per stream, indexed by (tile_id * 32 + thread_id) * 2
     let meta_base = (tile_id * STREAMS_PER_TILE + thread_id) * 2u;
     stream_metadata[meta_base] = write_ptr;
     stream_metadata[meta_base + 1u] = state;

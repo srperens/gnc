@@ -1,7 +1,7 @@
 // GPU histogram normalization + cumfreq builder for rANS entropy coding.
 //
-// Reads raw histograms from the histogram shader output, normalizes
-// frequencies to sum exactly to RANS_M, and builds cumulative frequency
+// Reads raw histograms from the histogram shader output (including ZRL metadata),
+// normalizes frequencies to sum exactly to RANS_M, and builds cumulative frequency
 // tables.  This eliminates the CPU roundtrip between histogram and encode
 // dispatches — the entire histogram→normalize→encode chain runs on GPU
 // in a single command encoder submission.
@@ -13,7 +13,7 @@ const RANS_M: u32 = 4096u;           // 1 << 12, must match RANS_PRECISION
 const MAX_ALPHABET: u32 = 2048u;
 const MAX_GROUP_ALPHABET: u32 = 2048u;
 const MAX_GROUPS: u32 = 8u;
-const HIST_TILE_STRIDE: u32 = 16401u;  // 1 + MAX_GROUPS*(2+MAX_GROUP_ALPHABET)
+const HIST_TILE_STRIDE: u32 = 16409u;  // 1 + MAX_GROUPS*(3+MAX_GROUP_ALPHABET)
 const ENCODE_TILE_INFO_STRIDE: u32 = 32u;
 
 struct Params {
@@ -42,6 +42,7 @@ var<workgroup> w_max_idx: u32;
 // Per-subband group metadata (broadcast by thread 0)
 var<workgroup> w_min_val: u32;
 var<workgroup> w_asize: u32;
+var<workgroup> w_zrun_base: u32;
 var<workgroup> w_hist_data_off: u32;
 var<workgroup> w_hist_read_off: u32;
 
@@ -87,8 +88,6 @@ fn normalize_inplace(lid: u32, asize: u32) {
             if (scaled == 0u) { scaled = 1u; }
             shared_freq[i] = scaled;
         }
-        // Zero entries stay zero (already 0 if h was 0 — but be explicit
-        // only when needed; the buffer already holds 0 from the load)
     }
     workgroupBarrier();
 
@@ -163,6 +162,7 @@ fn main(
 
     if (params.per_subband != 0u) {
         // ===== Per-subband mode =====
+        // Histogram layout per group: [min_val, alphabet_size, zrun_base, hist[0..asize]]
         let num_groups = hist_input[hist_base];
         let cf_group_stride = MAX_GROUP_ALPHABET + 1u;
         let cf_tile_stride = MAX_GROUPS * cf_group_stride;
@@ -181,7 +181,8 @@ fn main(
                 let off = w_hist_read_off;
                 w_min_val = hist_input[hist_base + off];
                 w_asize = hist_input[hist_base + off + 1u];
-                w_hist_data_off = off + 2u;
+                w_zrun_base = hist_input[hist_base + off + 2u];
+                w_hist_data_off = off + 3u;  // histogram data starts after min_val, asize, zrun_base
             }
             workgroupBarrier();
 
@@ -210,7 +211,7 @@ fn main(
                 tile_info_out[gi] = w_min_val;
                 tile_info_out[gi + 1u] = asize;
                 tile_info_out[gi + 2u] = cf_base;
-                tile_info_out[gi + 3u] = 0u;  // zrun_base (GPU encode does not apply ZRL)
+                tile_info_out[gi + 3u] = w_zrun_base;  // pass through ZRL base from histogram
 
                 // Advance read offset for next group
                 w_hist_read_off = w_hist_data_off + asize;
@@ -220,12 +221,14 @@ fn main(
 
     } else {
         // ===== Single-table mode =====
+        // Histogram layout: [min_val, alphabet_size, zrun_base, hist[0..asize]]
         let min_val = hist_input[hist_base];
         let asize = hist_input[hist_base + 1u];
+        let zrun_base = hist_input[hist_base + 2u];
 
-        // Load histogram into shared_freq
+        // Load histogram into shared_freq (data starts at offset 3)
         for (var i = lid; i < asize; i += WG_SIZE) {
-            shared_freq[i] = hist_input[hist_base + 2u + i];
+            shared_freq[i] = hist_input[hist_base + 3u + i];
         }
         workgroupBarrier();
 
@@ -242,11 +245,12 @@ fn main(
             }
         }
 
-        // Write tile_info
+        // Write tile_info: [min_val, alphabet_size, cumfreq_offset, zrun_base]
         if (lid == 0u) {
             tile_info_out[info_base] = min_val;
             tile_info_out[info_base + 1u] = asize;
             tile_info_out[info_base + 2u] = cf_base;
+            tile_info_out[info_base + 3u] = zrun_base;
         }
     }
 }

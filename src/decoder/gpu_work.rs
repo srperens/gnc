@@ -2,7 +2,7 @@ use wgpu;
 
 use super::buffer_cache::CachedBuffers;
 use super::pipeline::DecoderPipeline;
-use crate::encoder::adaptive::AQ_BLOCK_SIZE;
+use crate::encoder::adaptive::{self, AQ_LL_BLOCK_SIZE};
 use crate::{CompressedFrame, EntropyData, FrameType, GpuContext};
 
 impl DecoderPipeline {
@@ -82,8 +82,15 @@ impl DecoderPipeline {
                 &weights_chroma
             };
             let wm_param = if frame.weight_map.is_some() {
-                let blocks_x = padded_w.div_ceil(AQ_BLOCK_SIZE);
-                Some((&bufs.weight_map_buf, AQ_BLOCK_SIZE, blocks_x))
+                let (_, ll_bx, _, tx) = adaptive::weight_map_dims(
+                    padded_w,
+                    padded_h,
+                    config.tile_size,
+                    config.wavelet_levels,
+                );
+                let ll_size = config.tile_size >> config.wavelet_levels;
+                let ll_block_size = AQ_LL_BLOCK_SIZE.min(ll_size);
+                Some((&bufs.weight_map_buf, ll_block_size, ll_bx, tx))
             } else {
                 None
             };

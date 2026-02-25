@@ -44,9 +44,7 @@ pub fn bd_rate(reference: &[RdPoint], test: &[RdPoint]) -> Option<f64> {
     }
 
     // Overlapping PSNR range
-    let psnr_min = ref_log[0]
-        .0
-        .max(test_log[0].0);
+    let psnr_min = ref_log[0].0.max(test_log[0].0);
     let psnr_max = ref_log[ref_log.len() - 1]
         .0
         .min(test_log[test_log.len() - 1].0);
@@ -228,10 +226,8 @@ fn integrate_trapezoidal(points: &[(f64, f64)], a: f64, b: f64) -> f64 {
         if t.abs() < 1e-15 {
             continue;
         }
-        let y0 = points[i].1
-            + (points[i + 1].1 - points[i].1) * (x0 - points[i].0) / t;
-        let y1 = points[i].1
-            + (points[i + 1].1 - points[i].1) * (x1 - points[i].0) / t;
+        let y0 = points[i].1 + (points[i + 1].1 - points[i].1) * (x0 - points[i].0) / t;
+        let y1 = points[i].1 + (points[i + 1].1 - points[i].1) * (x1 - points[i].0) / t;
         integral += (y0 + y1) / 2.0 * (x1 - x0);
     }
     integral
@@ -293,10 +289,22 @@ mod tests {
     #[test]
     fn test_bd_rate_identical_curves() {
         let curve: Vec<RdPoint> = vec![
-            RdPoint { psnr: 30.0, bpp: 0.5 },
-            RdPoint { psnr: 35.0, bpp: 1.0 },
-            RdPoint { psnr: 40.0, bpp: 2.0 },
-            RdPoint { psnr: 45.0, bpp: 4.0 },
+            RdPoint {
+                psnr: 30.0,
+                bpp: 0.5,
+            },
+            RdPoint {
+                psnr: 35.0,
+                bpp: 1.0,
+            },
+            RdPoint {
+                psnr: 40.0,
+                bpp: 2.0,
+            },
+            RdPoint {
+                psnr: 45.0,
+                bpp: 4.0,
+            },
         ];
 
         let rate = bd_rate(&curve, &curve).unwrap();
@@ -310,17 +318,41 @@ mod tests {
     fn test_bd_rate_better_codec() {
         // Reference codec
         let reference = vec![
-            RdPoint { psnr: 30.0, bpp: 1.0 },
-            RdPoint { psnr: 35.0, bpp: 2.0 },
-            RdPoint { psnr: 40.0, bpp: 4.0 },
-            RdPoint { psnr: 45.0, bpp: 8.0 },
+            RdPoint {
+                psnr: 30.0,
+                bpp: 1.0,
+            },
+            RdPoint {
+                psnr: 35.0,
+                bpp: 2.0,
+            },
+            RdPoint {
+                psnr: 40.0,
+                bpp: 4.0,
+            },
+            RdPoint {
+                psnr: 45.0,
+                bpp: 8.0,
+            },
         ];
         // Test codec uses half the bitrate at every quality
         let test = vec![
-            RdPoint { psnr: 30.0, bpp: 0.5 },
-            RdPoint { psnr: 35.0, bpp: 1.0 },
-            RdPoint { psnr: 40.0, bpp: 2.0 },
-            RdPoint { psnr: 45.0, bpp: 4.0 },
+            RdPoint {
+                psnr: 30.0,
+                bpp: 0.5,
+            },
+            RdPoint {
+                psnr: 35.0,
+                bpp: 1.0,
+            },
+            RdPoint {
+                psnr: 40.0,
+                bpp: 2.0,
+            },
+            RdPoint {
+                psnr: 45.0,
+                bpp: 4.0,
+            },
         ];
 
         let rate = bd_rate(&reference, &test).unwrap();
@@ -334,17 +366,41 @@ mod tests {
     #[test]
     fn test_bd_psnr_better_codec() {
         let reference = vec![
-            RdPoint { psnr: 30.0, bpp: 0.5 },
-            RdPoint { psnr: 35.0, bpp: 1.0 },
-            RdPoint { psnr: 40.0, bpp: 2.0 },
-            RdPoint { psnr: 45.0, bpp: 4.0 },
+            RdPoint {
+                psnr: 30.0,
+                bpp: 0.5,
+            },
+            RdPoint {
+                psnr: 35.0,
+                bpp: 1.0,
+            },
+            RdPoint {
+                psnr: 40.0,
+                bpp: 2.0,
+            },
+            RdPoint {
+                psnr: 45.0,
+                bpp: 4.0,
+            },
         ];
         // Test codec has 3 dB better PSNR at every bitrate
         let test = vec![
-            RdPoint { psnr: 33.0, bpp: 0.5 },
-            RdPoint { psnr: 38.0, bpp: 1.0 },
-            RdPoint { psnr: 43.0, bpp: 2.0 },
-            RdPoint { psnr: 48.0, bpp: 4.0 },
+            RdPoint {
+                psnr: 33.0,
+                bpp: 0.5,
+            },
+            RdPoint {
+                psnr: 38.0,
+                bpp: 1.0,
+            },
+            RdPoint {
+                psnr: 43.0,
+                bpp: 2.0,
+            },
+            RdPoint {
+                psnr: 48.0,
+                bpp: 4.0,
+            },
         ];
 
         let psnr_diff = bd_psnr(&reference, &test).unwrap();

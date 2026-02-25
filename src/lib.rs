@@ -117,10 +117,13 @@ impl SubbandWeights {
 /// `alpha` that predicts chroma from luma: `chroma ≈ alpha * luma`.
 /// Encoding the residual `chroma - alpha * luma` instead of raw chroma
 /// reduces chroma entropy.
+///
+/// Alphas are quantized to i16 with 14-bit precision: [-16384, 16384] maps
+/// to [-2.0, 2.0] with step size ~0.000244 (vs ~0.0157 for old u8 encoding).
 #[derive(Debug, Clone)]
 pub struct CflAlphas {
-    /// Quantized alpha values (u8), layout: [tile0_co_sb0, tile0_co_sb1, ..., tile0_cg_sb0, ...]
-    pub alphas: Vec<u8>,
+    /// Quantized alpha values (i16), layout: [tile0_co_sb0, tile0_co_sb1, ..., tile0_cg_sb0, ...]
+    pub alphas: Vec<i16>,
     /// Number of subbands per tile (1 LL + 3 * num_levels detail = 1 + 3*L)
     pub num_subbands: u32,
 }
@@ -332,7 +335,7 @@ pub fn quality_preset(q: u32) -> CodecConfig {
     let disc = if t < 0.5 { lo } else { hi };
 
     let wavelet_levels = if q >= 60 { 4 } else { 3 };
-    let aq_enabled = false; // AQ broken: spatial weights applied to wavelet-domain positions
+    let aq_enabled = q <= 80; // AQ helps in lossy range; variance computed on LL subband
     let aq_strength = if q >= 70 { 0.4 } else { 0.3 };
     let mut weights = if disc.perceptual {
         SubbandWeights::perceptual(wavelet_levels)
@@ -349,7 +352,7 @@ pub fn quality_preset(q: u32) -> CodecConfig {
         dead_zone,
         wavelet_levels,
         subband_weights: weights,
-        cfl_enabled: false, // CfL disabled for now — needs per-subband alpha quantization fixes
+        cfl_enabled: disc.cfl,
         wavelet_type: if disc.cdf97 {
             WaveletType::CDF97
         } else {
@@ -390,9 +393,9 @@ pub struct CompressedFrame {
     pub entropy: EntropyData,
     /// CfL alpha coefficients (present when cfl_enabled)
     pub cfl_alphas: Option<CflAlphas>,
-    /// Per-block spatial weight map for adaptive quantization.
+    /// Per-LL-block weight map for adaptive quantization.
     /// `None` when adaptive quantization is disabled.
-    /// Stored in row-major order, one f32 per AQ_BLOCK_SIZE x AQ_BLOCK_SIZE block.
+    /// Stored in tile-row-major order, one f32 per LL-subband block.
     pub weight_map: Option<Vec<f32>>,
     /// Frame type for temporal coding (Intra or Predicted)
     pub frame_type: FrameType,
@@ -404,7 +407,10 @@ impl CompressedFrame {
     /// Total compressed size in bytes (all tiles + CfL alpha + weight map + MV overhead)
     pub fn byte_size(&self) -> usize {
         let tile_bytes = self.entropy.byte_size();
-        let cfl_bytes = self.cfl_alphas.as_ref().map_or(0, |a| a.alphas.len());
+        let cfl_bytes = self
+            .cfl_alphas
+            .as_ref()
+            .map_or(0, |a| a.alphas.len() * std::mem::size_of::<i16>());
         let wm_bytes = self
             .weight_map
             .as_ref()

@@ -1,11 +1,15 @@
-//! Adaptive quantization: per-block variance analysis and weight map generation.
+//! Adaptive quantization: per-block variance analysis on the wavelet LL subband.
 //!
 //! Pipeline:
-//! 1. GPU compute: measure per-32x32-block variance from the Y (luma) plane
-//! 2. CPU: convert raw variance to log-domain weights, normalize to average 1.0
+//! 1. GPU compute: after wavelet transform, measure per-block variance on the LL
+//!    (lowpass) subband within each tile. The LL subband at level L occupies the
+//!    top-left corner of each tile: [0..tile_size/(2^L), 0..tile_size/(2^L)].
+//! 2. GPU normalize: convert variance -> log-domain weights, normalize to average 1.0,
+//!    smooth with 3x3 box filter (via WeightMapNormalizer shader).
 //!
-//! The weight map is small (~2560 f32s for 1080p), so the CPU normalization step
-//! is negligible compared to the GPU work.
+//! The weight map is indexed by tile + LL-block position. The quantizer maps each
+//! wavelet coefficient back to the correct LL-block weight using subband-aware
+//! coordinate conversion.
 
 use bytemuck::{Pod, Zeroable};
 use wgpu;
@@ -13,19 +17,72 @@ use wgpu::util::DeviceExt;
 
 use crate::GpuContext;
 
-/// Block size used for variance analysis (matches well with 256x256 tile structure)
-pub const AQ_BLOCK_SIZE: u32 = 32;
+/// Block size for variance analysis in LL-subband coordinates.
+/// With tile_size=256 and 3 wavelet levels, LL is 32x32 per tile.
+/// An 8x8 LL block means 4x4 = 16 blocks per tile, each covering
+/// a 64x64 spatial region. This provides reasonable spatial granularity.
+pub const AQ_LL_BLOCK_SIZE: u32 = 8;
 
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 struct VarianceParams {
     width: u32,
     height: u32,
-    blocks_x: u32,
+    tile_size: u32,
+    num_levels: u32,
+    ll_size: u32,
+    ll_block_size: u32,
+    ll_blocks_per_tile_x: u32,
+    ll_blocks_per_tile_y: u32,
+    tiles_x: u32,
     total_blocks: u32,
+    global_blocks_x: u32,
+    _pad: u32,
 }
 
-/// GPU pipeline for computing per-block variance from the Y (luma) plane.
+/// Compute LL-subband block layout for a given resolution and wavelet config.
+///
+/// Returns (ll_blocks_per_tile_x, ll_blocks_per_tile_y, total_blocks, ll_size, tiles_x, tiles_y).
+pub fn ll_block_dims(
+    padded_w: u32,
+    padded_h: u32,
+    tile_size: u32,
+    num_levels: u32,
+) -> (u32, u32, u32, u32, u32, u32) {
+    let ll_size = tile_size >> num_levels; // tile_size / 2^num_levels
+    let ll_block_size = AQ_LL_BLOCK_SIZE.min(ll_size); // Don't exceed LL size
+    let ll_blocks_per_tile_x = ll_size.div_ceil(ll_block_size);
+    let ll_blocks_per_tile_y = ll_size.div_ceil(ll_block_size);
+    let tiles_x = padded_w / tile_size;
+    let tiles_y = padded_h / tile_size;
+    let total_tiles = tiles_x * tiles_y;
+    let blocks_per_tile = ll_blocks_per_tile_x * ll_blocks_per_tile_y;
+    let total_blocks = total_tiles * blocks_per_tile;
+    (
+        ll_blocks_per_tile_x,
+        ll_blocks_per_tile_y,
+        total_blocks,
+        ll_size,
+        tiles_x,
+        tiles_y,
+    )
+}
+
+/// Compute the weight map dimensions for the normalized weight output.
+/// The weight map has one entry per LL-block across all tiles.
+///
+/// Returns (total_blocks, ll_blocks_per_tile_x, ll_blocks_per_tile_y, tiles_x).
+pub fn weight_map_dims(
+    padded_w: u32,
+    padded_h: u32,
+    tile_size: u32,
+    num_levels: u32,
+) -> (u32, u32, u32, u32) {
+    let (lbx, lby, total, _, tx, _) = ll_block_dims(padded_w, padded_h, tile_size, num_levels);
+    (total, lbx, lby, tx)
+}
+
+/// GPU pipeline for computing per-block variance from the LL wavelet subband.
 pub struct VarianceAnalyzer {
     pipeline: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
@@ -105,29 +162,43 @@ impl VarianceAnalyzer {
         }
     }
 
-    /// Dispatch variance computation on the GPU.
+    /// Dispatch variance computation on the LL subband of the wavelet-domain buffer.
     ///
-    /// `y_plane_buf`: GPU buffer containing the Y (luma) plane as f32 values
-    /// `variance_buf`: output GPU buffer for the variance map (one f32 per block)
+    /// `wavelet_buf`: GPU buffer containing wavelet-domain coefficients (after forward transform)
+    /// `variance_buf`: output GPU buffer for the variance map (one f32 per LL-block)
     /// `width`, `height`: padded plane dimensions
+    /// `tile_size`: tile size in pixels
+    /// `num_levels`: number of wavelet decomposition levels
+    #[allow(clippy::too_many_arguments)]
     pub fn dispatch(
         &self,
         ctx: &GpuContext,
         encoder: &mut wgpu::CommandEncoder,
-        y_plane_buf: &wgpu::Buffer,
+        wavelet_buf: &wgpu::Buffer,
         variance_buf: &wgpu::Buffer,
         width: u32,
         height: u32,
+        tile_size: u32,
+        num_levels: u32,
     ) {
-        let blocks_x = (width + AQ_BLOCK_SIZE - 1) / AQ_BLOCK_SIZE;
-        let blocks_y = (height + AQ_BLOCK_SIZE - 1) / AQ_BLOCK_SIZE;
-        let total_blocks = blocks_x * blocks_y;
+        let (ll_blocks_per_tile_x, ll_blocks_per_tile_y, total_blocks, ll_size, tiles_x, _) =
+            ll_block_dims(width, height, tile_size, num_levels);
+        let ll_block_size = AQ_LL_BLOCK_SIZE.min(ll_size);
+        let global_blocks_x = ll_blocks_per_tile_x * tiles_x;
 
         let params = VarianceParams {
             width,
             height,
-            blocks_x,
+            tile_size,
+            num_levels,
+            ll_size,
+            ll_block_size,
+            ll_blocks_per_tile_x,
+            ll_blocks_per_tile_y,
+            tiles_x,
             total_blocks,
+            global_blocks_x,
+            _pad: 0,
         };
 
         let params_buf = ctx
@@ -148,7 +219,7 @@ impl VarianceAnalyzer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: y_plane_buf.as_entire_binding(),
+                    resource: wavelet_buf.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
@@ -163,16 +234,9 @@ impl VarianceAnalyzer {
         });
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
-        // One workgroup per block, each with 1024 threads (32x32)
+        // One workgroup per LL-block
         pass.dispatch_workgroups(total_blocks, 1, 1);
     }
-}
-
-/// Compute dimensions for the variance/weight map.
-pub fn weight_map_dims(padded_w: u32, padded_h: u32) -> (u32, u32, u32) {
-    let blocks_x = (padded_w + AQ_BLOCK_SIZE - 1) / AQ_BLOCK_SIZE;
-    let blocks_y = (padded_h + AQ_BLOCK_SIZE - 1) / AQ_BLOCK_SIZE;
-    (blocks_x, blocks_y, blocks_x * blocks_y)
 }
 
 /// Convert raw variance values to a normalized weight map on the CPU.
@@ -352,6 +416,13 @@ impl WeightMapNormalizer {
     ///
     /// Reads raw variance from `variance_buf`, writes normalized + smoothed
     /// weights to `weight_map_buf`. `scratch_buf` is used as intermediate storage.
+    ///
+    /// `blocks_x` and `blocks_y` are the per-tile LL-block counts. The normalizer
+    /// treats the flat array of all LL-blocks as a 2D grid for smoothing purposes.
+    /// For multi-tile layouts, `blocks_x` should be `ll_blocks_per_tile_x * tiles_x`
+    /// and `blocks_y` should be `ll_blocks_per_tile_y * tiles_y` for correct smoothing.
+    /// However, since smoothing should NOT cross tile boundaries, we pass the per-tile
+    /// dimensions and let the shader smooth within each tile's block grid.
     #[allow(clippy::too_many_arguments)]
     pub fn dispatch(
         &self,
@@ -362,9 +433,9 @@ impl WeightMapNormalizer {
         weight_map_buf: &wgpu::Buffer,
         blocks_x: u32,
         blocks_y: u32,
+        total_blocks: u32,
         aq_strength: f32,
     ) {
-        let total_blocks = blocks_x * blocks_y;
         let params = WeightNormParams {
             blocks_x,
             blocks_y,
@@ -493,10 +564,25 @@ mod tests {
     }
 
     #[test]
-    fn test_weight_map_dims() {
-        let (bx, by, total) = weight_map_dims(1920, 1088);
-        assert_eq!(bx, 60);
-        assert_eq!(by, 34);
-        assert_eq!(total, 60 * 34);
+    fn test_ll_block_dims() {
+        // 1920x1088 padded, tile_size=256, 3 levels
+        // LL size = 256/8 = 32. ll_block_size = 8. ll_blocks_per_tile = 4x4 = 16.
+        // tiles_x = 1920/256 = 7.5 -> need padded: 8 tiles. Let's use 2048x1280.
+        let (lbx, lby, total, ll_size, tx, ty) = ll_block_dims(2048, 1280, 256, 3);
+        assert_eq!(ll_size, 32);
+        assert_eq!(lbx, 4);
+        assert_eq!(lby, 4);
+        assert_eq!(tx, 8);
+        assert_eq!(ty, 5);
+        assert_eq!(total, 8 * 5 * 16);
+    }
+
+    #[test]
+    fn test_weight_map_dims_fn() {
+        let (total, lbx, lby, tx) = weight_map_dims(2048, 1280, 256, 3);
+        assert_eq!(lbx, 4);
+        assert_eq!(lby, 4);
+        assert_eq!(tx, 8);
+        assert_eq!(total, 8 * 5 * 16);
     }
 }

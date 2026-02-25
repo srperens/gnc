@@ -4,8 +4,8 @@
 // sum_yc and sum_yy per subband, then a sequential per-subband parallel
 // reduction computes alpha = sum_yc / sum_yy.
 //
-// Outputs both raw alphas (for CPU u8 serialization readback) and
-// dequantized alphas (for GPU forward prediction — stays on device).
+// Outputs both raw alphas (i32 quantized to i16 range for CPU readback) and
+// dequantized alphas (f32 for GPU forward prediction — stays on device).
 
 const MAX_SUBBANDS: u32 = 16u; // 1 + 3*5 for up to 5 wavelet levels
 
@@ -23,7 +23,7 @@ struct Params {
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var<storage, read> recon_y: array<f32>;
 @group(0) @binding(2) var<storage, read> chroma: array<f32>;
-@group(0) @binding(3) var<storage, read_write> raw_alphas: array<f32>;
+@group(0) @binding(3) var<storage, read_write> raw_alphas: array<i32>;
 @group(0) @binding(4) var<storage, read_write> dq_alphas: array<f32>;
 
 var<workgroup> shared_yc: array<f32, 256>;
@@ -104,20 +104,19 @@ fn main(
             workgroupBarrier();
         }
 
-        // Thread 0: compute alpha, quantize+dequantize, store both outputs
+        // Thread 0: compute alpha, quantize to i16 range, store both outputs
         if lid == 0u {
             var alpha = 0.0;
             if shared_yy[0] > 1e-10 {
                 alpha = shared_yc[0] / shared_yy[0];
             }
-            raw_alphas[alpha_base + s] = alpha;
 
-            // Quantize + dequantize (matches Rust quantize_alpha/dequantize_alpha)
+            // Quantize to i16 range [-16384, 16384] (14-bit, step ~0.000244)
+            // Matches Rust quantize_alpha/dequantize_alpha with ALPHA_SCALE = 8192.0
             let clamped = clamp(alpha, -2.0, 2.0);
-            let normalized = (clamped + 2.0) / 4.0;
-            let q = u32(round(normalized * 255.0));
-            let dq = (f32(q) / 255.0) * 4.0 - 2.0;
-            dq_alphas[alpha_base + s] = dq;
+            let q = i32(round(clamped * 8192.0));
+            raw_alphas[alpha_base + s] = q;
+            dq_alphas[alpha_base + s] = f32(q) / 8192.0;
         }
         workgroupBarrier();
     }

@@ -46,7 +46,10 @@ pub fn serialize_compressed(frame: &crate::CompressedFrame) -> Vec<u8> {
         let tiles_y = frame.info.height.div_ceil(frame.info.tile_size);
         let num_cfl_tiles = tiles_x * tiles_y;
         out.extend_from_slice(&num_cfl_tiles.to_le_bytes());
-        out.extend_from_slice(&cfl.alphas);
+        // CfL alphas stored as i16 LE (2 bytes each)
+        for &a in &cfl.alphas {
+            out.extend_from_slice(&a.to_le_bytes());
+        }
     }
     // Adaptive quantization config + weight map
     let aq_flag: u32 = if frame.config.adaptive_quantization {
@@ -182,9 +185,14 @@ pub fn deserialize_compressed(data: &[u8]) -> crate::CompressedFrame {
         pos += 4;
         let num_cfl_tiles = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
         pos += 4;
+        // 2 chroma planes * num_tiles * num_subbands i16 values
         let alpha_count = (2 * num_cfl_tiles * nsb) as usize;
-        let alphas = data[pos..pos + alpha_count].to_vec();
-        pos += alpha_count;
+        let mut alphas = Vec::with_capacity(alpha_count);
+        for _ in 0..alpha_count {
+            let v = i16::from_le_bytes(data[pos..pos + 2].try_into().unwrap());
+            alphas.push(v);
+            pos += 2;
+        }
         (
             true,
             Some(crate::CflAlphas {

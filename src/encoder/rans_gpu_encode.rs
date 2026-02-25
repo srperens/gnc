@@ -17,7 +17,7 @@ use super::rans::{InterleavedRansTile, SubbandGroupFreqs, SubbandRansTile, STREA
 use crate::{FrameInfo, GpuContext};
 
 const MAX_STREAM_BYTES: usize = 4096;
-const HIST_TILE_STRIDE: usize = 16401; // 1 + MAX_GROUPS*(2+MAX_GROUP_ALPHABET)
+const HIST_TILE_STRIDE: usize = 16409; // 1 + MAX_GROUPS*(3+MAX_GROUP_ALPHABET)
 const ENCODE_TILE_INFO_STRIDE: usize = 32;
 const MAX_ALPHABET: usize = 2048;
 const MAX_GROUP_ALPHABET: usize = 2048;
@@ -48,6 +48,7 @@ struct RansEncodeParams {
 struct NormalizedTileFreqs {
     min_val: i32,
     alphabet_size: u32,
+    zrun_base: i32,
     freqs: Vec<u32>,
     cumfreqs: Vec<u32>,
 }
@@ -61,6 +62,7 @@ struct NormalizedSubbandTileFreqs {
 struct NormalizedGroupFreqs {
     min_val: i32,
     alphabet_size: u32,
+    zrun_base: i32,
     freqs: Vec<u32>,
     cumfreqs: Vec<u32>,
 }
@@ -873,6 +875,7 @@ impl GpuRansEncoder {
                     let min_val = tile_info_data[gi] as i32;
                     let alphabet_size = tile_info_data[gi + 1] as usize;
                     let cf_offset = tile_info_data[gi + 2] as usize;
+                    let zrun_base = tile_info_data[gi + 3] as i32;
 
                     let cumfreqs: Vec<u32> =
                         cumfreq_data[cf_offset..cf_offset + alphabet_size + 1].to_vec();
@@ -883,6 +886,7 @@ impl GpuRansEncoder {
                     groups.push(NormalizedGroupFreqs {
                         min_val,
                         alphabet_size: alphabet_size as u32,
+                        zrun_base,
                         freqs,
                         cumfreqs,
                     });
@@ -896,6 +900,7 @@ impl GpuRansEncoder {
                 let min_val = tile_info_data[info_base] as i32;
                 let alphabet_size = tile_info_data[info_base + 1] as usize;
                 let cf_offset = tile_info_data[info_base + 2] as usize;
+                let zrun_base = tile_info_data[info_base + 3] as i32;
 
                 let cumfreqs: Vec<u32> =
                     cumfreq_data[cf_offset..cf_offset + alphabet_size + 1].to_vec();
@@ -906,6 +911,7 @@ impl GpuRansEncoder {
                 tile_freqs.push(TileFreqs::Single(NormalizedTileFreqs {
                     min_val,
                     alphabet_size: alphabet_size as u32,
+                    zrun_base,
                     freqs,
                     cumfreqs,
                 }));
@@ -963,7 +969,7 @@ impl GpuRansEncoder {
                             .map(|g| SubbandGroupFreqs {
                                 min_val: g.min_val,
                                 alphabet_size: g.alphabet_size,
-                                zrun_base: 0, // GPU encode path does not apply ZRL
+                                zrun_base: g.zrun_base,
                                 freqs: g.freqs.clone(),
                                 cumfreqs: g.cumfreqs.clone(),
                             })
@@ -988,7 +994,7 @@ impl GpuRansEncoder {
                             min_val: s.min_val,
                             alphabet_size: s.alphabet_size,
                             num_coefficients: coefficients_per_tile as u32,
-                            zrun_base: 0,
+                            zrun_base: s.zrun_base,
                             freqs: s.freqs.clone(),
                             cumfreqs: s.cumfreqs.clone(),
                             stream_data: per_stream_data,

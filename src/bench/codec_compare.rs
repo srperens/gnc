@@ -29,7 +29,8 @@ pub fn jpeg_rd_curve(input_png: &str, quality_values: &[u32]) -> Vec<(u32, RdPoi
         let mut jpeg_buf: Vec<u8> = Vec::new();
         {
             let mut cursor = Cursor::new(&mut jpeg_buf);
-            let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cursor, q_clamped);
+            let encoder =
+                image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cursor, q_clamped);
             rgb8.write_with_encoder(encoder)
                 .expect("JPEG encode failed");
         }
@@ -241,7 +242,8 @@ pub fn jpeg_ssim_values(input_png: &str, quality_values: &[u32]) -> Vec<f64> {
         let mut jpeg_buf: Vec<u8> = Vec::new();
         {
             let mut cursor = Cursor::new(&mut jpeg_buf);
-            let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cursor, q_clamped);
+            let encoder =
+                image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cursor, q_clamped);
             rgb8.write_with_encoder(encoder)
                 .expect("JPEG encode failed");
         }
@@ -334,8 +336,20 @@ mod tests {
     #[test]
     fn test_extract_rd_points() {
         let tagged = vec![
-            (10u32, RdPoint { bpp: 0.5, psnr: 30.0 }),
-            (20, RdPoint { bpp: 1.0, psnr: 35.0 }),
+            (
+                10u32,
+                RdPoint {
+                    bpp: 0.5,
+                    psnr: 30.0,
+                },
+            ),
+            (
+                20,
+                RdPoint {
+                    bpp: 1.0,
+                    psnr: 35.0,
+                },
+            ),
         ];
         let points = extract_rd_points_u32(&tagged);
         assert_eq!(points.len(), 2);

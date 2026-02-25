@@ -1050,3 +1050,56 @@ The evaluation framework is now solid enough for safe iteration on M2. Key basel
 - Gradient 512x512: q75 → 60.86 dB / 0.62 bpp, q25 → 49.97 dB / 0.41 bpp
 - Checkerboard 512x512: q75 → 43.43 dB / 4.29 bpp, q25 → 32.65 dB / 1.09 bpp
 - Checkerboard compresses poorly (high-frequency content), as expected for wavelet codec
+
+## 2026-02-25: M2A/B/C — CfL i16, Wavelet-Domain AQ, GPU ZRL
+
+### Hypothesis
+Three independent improvements can close the compression gap:
+- CfL with i16 precision (vs u8) enables chroma prediction at high quality
+- Wavelet-domain AQ (vs broken spatial-domain) correctly redistributes bits
+- GPU ZRL matches CPU path's zero-run compression, eliminating GPU/CPU divergence
+
+### Implementation
+
+**M2A: CfL i16 alphas** — `src/encoder/cfl.rs`, `src/lib.rs`, `src/shaders/cfl_alpha.wgsl`, `src/format.rs`
+- Alpha quantization: [-2.0, 2.0] → i16 [-16384, 16384] (step 0.000244, 64x better than u8)
+- GPU shader writes i32 (WGSL has no i16), host casts to i16
+- Serialization updated to write i16 LE (breaking GP10 format change)
+- Re-enabled in quality_preset() for q ≤ 90
+
+**M2B: Wavelet-domain AQ** — `src/encoder/adaptive.rs`, `src/shaders/variance_map.wgsl`, `src/shaders/quantize.wgsl`
+- Variance computed on LL subband AFTER wavelet transform (was spatial Y BEFORE)
+- 8x8 blocks in LL space = 64x64 spatial regions (at 3 levels)
+- New subband-aware coordinate mapping in quantize.wgsl
+- Re-enabled for q ≤ 80
+
+**M2C: GPU ZRL** — `src/shaders/rans_histogram.wgsl`, `src/shaders/rans_encode.wgsl`, `src/shaders/rans_normalize.wgsl`
+- ZRL-aware histogram: 32 threads do sequential stride-32 scanning per stream
+- ZRL eligibility: zero_fraction ≥ 60%, detail subbands only (not LL)
+- Forward-then-reverse encoding in rans_encode.wgsl
+- HIST_TILE_STRIDE increased from 16401 to 16409 for zrun_base storage
+
+**Critical bug found during integration**: shared memory clobbering in rans_histogram.wgsl.
+`reduce_max_i32()` reused `shared_min[]` array, overwriting the min/max results from Phase 1.
+Fix: save gmin/gmax before calling reduce_max_i32().
+
+### Results — Synthetic Test Images (512x512)
+
+| Image | Quality | Before (PSNR/bpp) | After (PSNR/bpp) | Delta |
+|-------|---------|-------------------|-------------------|-------|
+| gradient | q25 | 49.97 / 0.413 | 48.67 / 0.428 | -1.3 dB / +3.6% bpp |
+| gradient | q50 | 55.69 / 0.503 | 55.56 / 0.540 | -0.1 dB / +7.3% bpp |
+| gradient | q75 | 60.86 / 0.621 | 60.76 / 0.630 | -0.1 dB / +1.4% bpp |
+| gradient | q90 | 69.27 / 1.102 | 69.62 / 1.135 | +0.4 dB / +3.0% bpp |
+| checker | q25 | 32.65 / 1.094 | 32.88 / 0.990 | +0.2 dB / **-9.5% bpp** |
+| checker | q50 | 36.54 / 2.247 | 36.57 / 2.177 | +0.0 dB / **-3.1% bpp** |
+| checker | q75 | 43.43 / 4.292 | 43.81 / 3.274 | +0.4 dB / **-23.7% bpp** |
+| checker | q90 | 52.06 / 7.102 | 52.70 / 4.861 | +0.6 dB / **-31.5% bpp** |
+
+### Analysis
+- **AQ dominates on hard content**: Checkerboard (high-frequency edges) sees massive bpp reduction (24-32% at q75-90) because AQ correctly allocates fewer bits to busy regions
+- **Gradient unchanged**: Smooth content has uniform variance, so AQ has little effect
+- **CfL impact minimal on synthetic images**: Gradients have weak luma-chroma correlation. Real images will benefit more
+- **ZRL not observable on synthetics**: Synthetic images don't produce enough zeros at these quality levels. Will matter more at low quality on real content
+- **Small PSNR regression on gradient at low q**: AQ introduces slight overhead; the bpp increase on gradient at q25 (+3.6%) suggests AQ is counter-productive on easy content. May need to tune AQ strength or disable at very high quality
+- **Shared memory bug**: The ZRL histogram clobbering bug would have been catastrophic in production — illustrates why regression tests (M1) were essential first

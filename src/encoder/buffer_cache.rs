@@ -44,9 +44,13 @@ impl CachedEncodeBuffers {
         let plane_size = (padded_pixels * std::mem::size_of::<f32>()) as u64;
         let buf_size_3 = (padded_pixels * 3 * std::mem::size_of::<f32>()) as u64;
 
-        let (blocks_x, blocks_y, total_blocks) = adaptive::weight_map_dims(padded_w, padded_h);
-        let _ = (blocks_x, blocks_y);
-        let wm_buf_size = (total_blocks as usize * std::mem::size_of::<f32>()) as u64;
+        // Upper bound on weight map blocks: assumes worst case (fewest wavelet levels).
+        // With tile_size=256, num_levels=3: 4x4=16 blocks per tile (common case).
+        // With num_levels=1: up to 64x64=4096 blocks per tile (extreme).
+        // Use padded_pixels / (AQ_LL_BLOCK_SIZE^2) as a safe ceiling.
+        let max_wm_blocks =
+            padded_pixels / (adaptive::AQ_LL_BLOCK_SIZE * adaptive::AQ_LL_BLOCK_SIZE) as usize;
+        let wm_buf_size = (max_wm_blocks.max(1) * std::mem::size_of::<f32>()) as u64;
 
         // Initial alpha capacity: generous default
         let alpha_init_cap = 4096u64;
@@ -151,7 +155,7 @@ impl CachedEncodeBuffers {
             ref_upload: ctx.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("enc_ref_upload"),
                 size: plane_size,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                usage: plane_usage, // needs COPY_SRC for CPU entropy encode readback
                 mapped_at_creation: false,
             }),
             recon_out: ctx.device.create_buffer(&wgpu::BufferDescriptor {

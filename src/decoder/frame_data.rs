@@ -163,6 +163,7 @@ impl DecoderPipeline {
 
         // --- CfL alphas ---
         if let Some(cfl_data) = &frame.cfl_alphas {
+            // Dequantize i16 alphas to f32 for GPU prediction shaders
             let all_f32: Vec<f32> = cfl_data
                 .alphas
                 .iter()

@@ -40,7 +40,11 @@ pub struct SequenceSummary {
 
 impl std::fmt::Display for SequenceSummary {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "Sequence Summary ({} frames, {} bytes):", self.total_frames, self.total_bytes)?;
+        writeln!(
+            f,
+            "Sequence Summary ({} frames, {} bytes):",
+            self.total_frames, self.total_bytes
+        )?;
         writeln!(
             f,
             "  PSNR:  avg {:.2} dB  min {:.2}  max {:.2}  stddev {:.2}",
@@ -106,16 +110,10 @@ pub fn compute_sequence_metrics(frames: &[FrameMetrics]) -> SequenceSummary {
 
     // Temporal consistency: analyze inter-frame PSNR differences
     let (max_psnr_drop, temporal_consistency) = if frames.len() >= 2 {
-        let diffs: Vec<f64> = psnr_values
-            .windows(2)
-            .map(|w| w[1] - w[0])
-            .collect();
+        let diffs: Vec<f64> = psnr_values.windows(2).map(|w| w[1] - w[0]).collect();
 
         // max_psnr_drop: largest decrease (most negative diff, reported as positive)
-        let max_drop = diffs
-            .iter()
-            .cloned()
-            .fold(0.0f64, |worst, d| worst.max(-d));
+        let max_drop = diffs.iter().cloned().fold(0.0f64, |worst, d| worst.max(-d));
 
         // temporal_consistency: stddev of inter-frame PSNR differences
         let diff_stats = compute_stats(&diffs);

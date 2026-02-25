@@ -64,7 +64,9 @@ struct Baseline {
 fn load_baselines() -> HashMap<String, Baseline> {
     let toml_path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden_baselines.toml");
     let content = std::fs::read_to_string(toml_path).expect("Failed to read golden_baselines.toml");
-    let table: toml::Table = content.parse().expect("Failed to parse golden_baselines.toml");
+    let table: toml::Table = content
+        .parse()
+        .expect("Failed to parse golden_baselines.toml");
 
     let mut baselines = HashMap::new();
     for (image_key, value) in &table {
@@ -308,7 +310,10 @@ fn regression_serialize_roundtrip() {
     let decoded = decoder.decode(ctx, &deserialized);
     let psnr = quality::psnr(&img, &decoded, 255.0);
 
-    eprintln!("serialize roundtrip: PSNR={psnr:.2} dB, serialized size={} bytes", serialized.len());
+    eprintln!(
+        "serialize roundtrip: PSNR={psnr:.2} dB, serialized size={} bytes",
+        serialized.len()
+    );
     assert!(psnr > 30.0, "Serialize round-trip PSNR too low: {psnr:.2}");
 }
 

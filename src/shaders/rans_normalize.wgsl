@@ -11,9 +11,9 @@
 const WG_SIZE: u32 = 256u;
 const RANS_M: u32 = 4096u;           // 1 << 12, must match RANS_PRECISION
 const MAX_ALPHABET: u32 = 2048u;
-const MAX_GROUP_ALPHABET: u32 = 512u;
+const MAX_GROUP_ALPHABET: u32 = 2048u;
 const MAX_GROUPS: u32 = 8u;
-const HIST_TILE_STRIDE: u32 = 2060u;
+const HIST_TILE_STRIDE: u32 = 16401u;  // 1 + MAX_GROUPS*(2+MAX_GROUP_ALPHABET)
 const ENCODE_TILE_INFO_STRIDE: u32 = 32u;
 
 struct Params {
@@ -205,11 +205,12 @@ fn main(
                     cumfreq_out[cf_base + i + 1u] = cumfreq_out[cf_base + i] + shared_freq[i];
                 }
 
-                // Write tile_info for this group
-                let gi = info_base + 1u + g * 3u;
+                // Write tile_info for this group (4 u32s per group)
+                let gi = info_base + 1u + g * 4u;
                 tile_info_out[gi] = w_min_val;
                 tile_info_out[gi + 1u] = asize;
                 tile_info_out[gi + 2u] = cf_base;
+                tile_info_out[gi + 3u] = 0u;  // zrun_base (GPU encode does not apply ZRL)
 
                 // Advance read offset for next group
                 w_hist_read_off = w_hist_data_off + asize;

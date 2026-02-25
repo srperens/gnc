@@ -311,7 +311,9 @@ impl GpuRansDecoder {
             // [0]: num_groups
             tile_info_data[base] = tile.num_groups;
 
-            // Per-group metadata: [1+g*3]: min_val, [2+g*3]: alphabet_size, [3+g*3]: cumfreq_offset
+            // Per-group metadata (4 u32s each):
+            //   [1+g*4+0]: min_val, [1+g*4+1]: alphabet_size,
+            //   [1+g*4+2]: cumfreq_offset, [1+g*4+3]: zrun_base
             for (g, group) in tile.groups.iter().enumerate() {
                 assert!(
                     group.alphabet_size <= 2048,
@@ -319,22 +321,24 @@ impl GpuRansDecoder {
                     g,
                     group.alphabet_size
                 );
-                let gi = base + 1 + g * 3;
+                let gi = base + 1 + g * 4;
                 tile_info_data[gi] = group.min_val as u32;
                 tile_info_data[gi + 1] = group.alphabet_size;
                 tile_info_data[gi + 2] = cumfreq_all.len() as u32;
+                tile_info_data[gi + 3] = group.zrun_base as u32;
                 cumfreq_all.extend_from_slice(&group.cumfreqs);
             }
 
-            // [13]: stream_data_byte_base
+            // With 4 u32s per group and max 8 groups: 1 + 8*4 = 33
+            // [33]: stream_data_byte_base
             let tile_stream_byte_base = stream_bytes_all.len() as u32;
-            tile_info_data[base + 13] = tile_stream_byte_base;
+            tile_info_data[base + 33] = tile_stream_byte_base;
 
-            // [14..46]: 32 initial states
+            // [34..66]: 32 initial states
             let mut stream_byte_offset = 0u32;
             for s in 0..STREAMS_PER_TILE {
-                tile_info_data[base + 14 + s] = tile.stream_initial_state[s];
-                tile_info_data[base + 46 + s] = stream_byte_offset;
+                tile_info_data[base + 34 + s] = tile.stream_initial_state[s];
+                tile_info_data[base + 66 + s] = stream_byte_offset;
                 stream_byte_offset += tile.stream_data[s].len() as u32;
             }
 
@@ -374,12 +378,13 @@ impl GpuRansDecoder {
     ///
     /// Tile-info layout (per tile, 100 u32s):
     ///   [0]: num_groups
-    ///   [1 + g*3 + 0]: group g min_val (bitcast i32→u32)
-    ///   [1 + g*3 + 1]: group g alphabet_size
-    ///   [1 + g*3 + 2]: group g cumfreq_offset into cumfreq_data
-    ///   [13]: stream_data_byte_base
-    ///   [14..46]: 32 initial states
-    ///   [46..78]: 32 stream byte offsets
+    ///   [1 + g*4 + 0]: group g min_val (bitcast i32->u32)
+    ///   [1 + g*4 + 1]: group g alphabet_size
+    ///   [1 + g*4 + 2]: group g cumfreq_offset into cumfreq_data
+    ///   [1 + g*4 + 3]: group g zrun_base (0 = no ZRL)
+    ///   [33]: stream_data_byte_base
+    ///   [34..66]: 32 initial states
+    ///   [66..98]: 32 stream byte offsets
     pub fn prepare_decode_buffers_subband(
         &self,
         ctx: &GpuContext,

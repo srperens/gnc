@@ -813,6 +813,8 @@ pub fn compute_subband_group(lx: u32, ly: u32, tile_size: u32, num_levels: u32) 
 pub struct SubbandGroupFreqs {
     pub min_val: i32,
     pub alphabet_size: u32,
+    /// Zero-run-length base symbol (0 = no ZRL for this group)
+    pub zrun_base: i32,
     pub freqs: Vec<u32>,
     pub cumfreqs: Vec<u32>,
 }
@@ -823,8 +825,9 @@ pub struct SubbandGroupFreqs {
 /// During encoding/decoding, the table selection for each coefficient is determined by its
 /// 2D position within the tile (which subband group it falls in).
 ///
-/// ZRL is not used with per-subband coding — the per-group tables already model
-/// zero-heavy distributions tightly, making ZRL's alphabet expansion counterproductive.
+/// Detail subband groups (groups > 0) use per-group zero-run-length encoding to collapse
+/// consecutive zero runs into single symbols. The LL subband (group 0) does not use ZRL
+/// since it has few zeros. Each group's `zrun_base` is stored in its `SubbandGroupFreqs`.
 #[derive(Debug, Clone)]
 pub struct SubbandRansTile {
     pub num_coefficients: u32,
@@ -839,23 +842,26 @@ pub struct SubbandRansTile {
 impl SubbandRansTile {
     pub fn byte_size(&self) -> usize {
         // header: num_coefficients(4) + tile_size(4) + num_levels(4) + num_groups(4) = 16
-        // per-group: min_val(4) + alphabet_size(4) + freqs(alphabet_size * 2)
+        // per-group: min_val(4) + alphabet_size(4) + zrun_base(4) + freqs(alphabet_size * 2)
         // streams: 32 stream_lengths(4 each) + 32 initial_states(4 each) = 256
         // stream data: sum of all stream bytes
         let group_overhead: usize = self
             .groups
             .iter()
-            .map(|g| 8 + g.alphabet_size as usize * 2)
+            .map(|g| 12 + g.alphabet_size as usize * 2)
             .sum();
         16 + group_overhead + 256 + self.stream_data.iter().map(|s| s.len()).sum::<usize>()
     }
 }
 
 /// Encode a tile's quantized coefficients using per-subband frequency tables
-/// and 32 interleaved rANS streams.
+/// and 32 interleaved rANS streams, with per-group zero-run-length encoding.
 ///
 /// Each subband group (LL, and one per wavelet detail level) gets its own
 /// frequency table, allowing rANS to model each distribution tightly.
+/// Detail subband groups (g > 0) also get ZRL encoding: consecutive zeros
+/// within the same group in a stream are collapsed into run-length symbols.
+/// The LL subband (group 0) does not use ZRL since it has few zeros.
 pub fn rans_encode_tile_interleaved_subband(
     coefficients: &[i32],
     tile_size: u32,
@@ -873,6 +879,7 @@ pub fn rans_encode_tile_interleaved_subband(
                 .map(|_| SubbandGroupFreqs {
                     min_val: 0,
                     alphabet_size: 0,
+                    zrun_base: 0,
                     freqs: vec![],
                     cumfreqs: vec![0],
                 })
@@ -884,33 +891,113 @@ pub fn rans_encode_tile_interleaved_subband(
 
     let ts = tile_size as usize;
 
-    // Step 1: Classify each coefficient into its subband group and build per-group histograms
-    let mut group_min = vec![i32::MAX; num_groups];
-    let mut group_max = vec![i32::MIN; num_groups];
+    // Precompute subband group for each coefficient position
+    let group_map: Vec<usize> = (0..coefficients.len())
+        .map(|i| {
+            let lx = (i % ts) as u32;
+            let ly = (i / ts) as u32;
+            compute_subband_group(lx, ly, tile_size, num_levels)
+        })
+        .collect();
+
+    // Step 1: Compute per-group zrun_base for detail subbands (g > 0).
+    // zrun_base = max(|non-zero coeff|) + 1 for that group, so run symbols never collide.
+    // Group 0 (LL) gets zrun_base = 0 (no ZRL).
+    let mut group_max_abs = vec![0i32; num_groups];
+    let mut group_zero_count = vec![0usize; num_groups];
+    let mut group_total_count = vec![0usize; num_groups];
     let mut group_has_data = vec![false; num_groups];
 
     for (i, &c) in coefficients.iter().enumerate() {
-        let lx = (i % ts) as u32;
-        let ly = (i / ts) as u32;
-        let g = compute_subband_group(lx, ly, tile_size, num_levels);
+        let g = group_map[i];
         group_has_data[g] = true;
-        group_min[g] = group_min[g].min(c);
-        group_max[g] = group_max[g].max(c);
+        group_total_count[g] += 1;
+        if c == 0 {
+            group_zero_count[g] += 1;
+        } else {
+            group_max_abs[g] = group_max_abs[g].max(c.abs());
+        }
     }
 
-    // Step 2: Build per-group frequency tables
+    let mut group_zrun_base = vec![0i32; num_groups];
+    for g in 1..num_groups {
+        // Apply ZRL only when it is likely to help: high zero density AND the
+        // existing coefficient alphabet is large enough that the overhead of
+        // 256 extra run-length symbols in the frequency table is proportionally
+        // small. For tiny alphabets (e.g. 5 symbols), rANS already gives the
+        // zero symbol a very high frequency — ZRL can only hurt by bloating
+        // the frequency table from 5 to 261 entries.
+        if group_has_data[g] && group_total_count[g] > 0 {
+            let zero_frac = group_zero_count[g] as f64 / group_total_count[g] as f64;
+            let non_zrl_alphabet = (2 * group_max_abs[g] + 1) as usize; // rough: -max..+max + 0
+            if zero_frac >= 0.6 && non_zrl_alphabet >= 16 {
+                group_zrun_base[g] = group_max_abs[g] + 1;
+            }
+        }
+    }
+
+    // Step 2: Build per-stream ZRL-transformed symbol sequences.
+    // For each stream, walk through its coefficient positions and apply per-group ZRL.
+    let num_coefficients = coefficients.len();
+    let mut stream_zrl_symbols: Vec<Vec<(i32, usize)>> = Vec::with_capacity(STREAMS_PER_TILE);
+
+    for s in 0..STREAMS_PER_TILE {
+        let indices: Vec<usize> = (s..num_coefficients).step_by(STREAMS_PER_TILE).collect();
+        let mut symbols: Vec<(i32, usize)> = Vec::with_capacity(indices.len()); // (symbol, group)
+
+        let mut i = 0;
+        while i < indices.len() {
+            let idx = indices[i];
+            let g = group_map[idx];
+            let c = coefficients[idx];
+            let zrun_base = group_zrun_base[g];
+
+            if zrun_base != 0 && c == 0 {
+                // Count consecutive zeros in the same group within this stream
+                let mut run_len = 0i32;
+                while i < indices.len()
+                    && coefficients[indices[i]] == 0
+                    && group_map[indices[i]] == g
+                    && run_len < MAX_ZERO_RUN
+                {
+                    run_len += 1;
+                    i += 1;
+                }
+                symbols.push((zrun_base + run_len - 1, g));
+            } else {
+                symbols.push((c, g));
+                i += 1;
+            }
+        }
+
+        stream_zrl_symbols.push(symbols);
+    }
+
+    // Step 3: Build per-group frequency tables from ZRL-transformed symbols
+    let mut group_min = vec![i32::MAX; num_groups];
+    let mut group_max = vec![i32::MIN; num_groups];
+    // Reset group_has_data based on ZRL symbols
+    group_has_data = vec![false; num_groups];
+
+    for stream_syms in &stream_zrl_symbols {
+        for &(sym, g) in stream_syms {
+            group_has_data[g] = true;
+            group_min[g] = group_min[g].min(sym);
+            group_max[g] = group_max[g].max(sym);
+        }
+    }
+
     let mut groups: Vec<SubbandGroupFreqs> = Vec::with_capacity(num_groups);
-    let mut group_hists: Vec<Vec<u32>> = Vec::with_capacity(num_groups);
 
     for g in 0..num_groups {
         if !group_has_data[g] {
             groups.push(SubbandGroupFreqs {
                 min_val: 0,
                 alphabet_size: 1,
+                zrun_base: 0,
                 freqs: vec![RANS_M],
                 cumfreqs: vec![0, RANS_M],
             });
-            group_hists.push(vec![RANS_M]);
             continue;
         }
 
@@ -919,11 +1006,11 @@ pub fn rans_encode_tile_interleaved_subband(
         let alphabet_size = (max_val - min_val + 1) as usize;
 
         let mut hist = vec![0u32; alphabet_size];
-        for (i, &c) in coefficients.iter().enumerate() {
-            let lx = (i % ts) as u32;
-            let ly = (i / ts) as u32;
-            if compute_subband_group(lx, ly, tile_size, num_levels) == g {
-                hist[(c - min_val) as usize] += 1;
+        for stream_syms in &stream_zrl_symbols {
+            for &(sym, sg) in stream_syms {
+                if sg == g {
+                    hist[(sym - min_val) as usize] += 1;
+                }
             }
         }
 
@@ -935,44 +1022,36 @@ pub fn rans_encode_tile_interleaved_subband(
         }
         debug_assert_eq!(cumfreqs[alphabet_size], RANS_M);
 
-        group_hists.push(freqs.clone());
         groups.push(SubbandGroupFreqs {
             min_val,
             alphabet_size: alphabet_size as u32,
+            zrun_base: group_zrun_base[g],
             freqs,
             cumfreqs,
         });
     }
 
-    // Step 3: Encode 32 interleaved streams, selecting table per-symbol
-    let num_coefficients = coefficients.len();
+    // Step 4: rANS encode each stream's ZRL-transformed symbols
     let mut stream_data = Vec::with_capacity(STREAMS_PER_TILE);
     let mut stream_initial_state = Vec::with_capacity(STREAMS_PER_TILE);
 
-    for s in 0..STREAMS_PER_TILE {
-        // Collect this stream's coefficient indices
-        let indices: Vec<usize> = (s..num_coefficients).step_by(STREAMS_PER_TILE).collect();
-
-        if indices.is_empty() {
+    for stream_syms in &stream_zrl_symbols {
+        if stream_syms.is_empty() {
             stream_data.push(vec![]);
             stream_initial_state.push(RANS_BYTE_L);
             continue;
         }
 
-        let buf_size = indices.len() * 2 + 64;
+        let buf_size = stream_syms.len() * 2 + 64;
         let mut buf = vec![0u8; buf_size];
         let mut ptr = buf_size;
         let mut state: u32 = RANS_BYTE_L;
 
         // Encode in reverse order
-        for &idx in indices.iter().rev() {
-            let c = coefficients[idx];
-            let lx = (idx % ts) as u32;
-            let ly = (idx / ts) as u32;
-            let g = compute_subband_group(lx, ly, tile_size, num_levels);
+        for &(sym_val, g) in stream_syms.iter().rev() {
             let group = &groups[g];
 
-            let sym = (c - group.min_val) as usize;
+            let sym = (sym_val - group.min_val) as usize;
             let start = group.cumfreqs[sym];
             let freq = group.freqs[sym];
 
@@ -1002,6 +1081,8 @@ pub fn rans_encode_tile_interleaved_subband(
 }
 
 /// CPU reference decoder for per-subband interleaved rANS tiles.
+/// Supports per-group ZRL: detail subbands with zrun_base > 0 have their
+/// run-length symbols expanded back to consecutive zeros.
 pub fn rans_decode_tile_interleaved_subband(tile: &SubbandRansTile) -> Vec<i32> {
     if tile.num_coefficients == 0 {
         return vec![];
@@ -1010,6 +1091,9 @@ pub fn rans_decode_tile_interleaved_subband(tile: &SubbandRansTile) -> Vec<i32> 
     let num_coefficients = tile.num_coefficients as usize;
     let ts = tile.tile_size as usize;
     let mut output = vec![0i32; num_coefficients];
+
+    // Check if any group uses ZRL
+    let has_zrl = tile.groups.iter().any(|g| g.zrun_base != 0);
 
     // Build per-group slot-to-symbol lookup tables
     let slot_tables: Vec<Vec<u16>> = tile
@@ -1038,28 +1122,70 @@ pub fn rans_decode_tile_interleaved_subband(tile: &SubbandRansTile) -> Vec<i32> 
         let mut ptr: usize = 0;
         let mask = RANS_M - 1;
 
-        for i in 0..stream_output_count {
-            let coeff_idx = s + i * STREAMS_PER_TILE;
-            let lx = (coeff_idx % ts) as u32;
-            let ly = (coeff_idx / ts) as u32;
-            let g = compute_subband_group(lx, ly, tile.tile_size, tile.num_levels);
-            let group = &tile.groups[g];
+        if has_zrl {
+            // ZRL-aware decode: output_i tracks position, may advance by more than 1
+            let mut output_i = 0;
+            while output_i < stream_output_count {
+                let coeff_idx = s + output_i * STREAMS_PER_TILE;
+                let lx = (coeff_idx % ts) as u32;
+                let ly = (coeff_idx / ts) as u32;
+                let g = compute_subband_group(lx, ly, tile.tile_size, tile.num_levels);
+                let group = &tile.groups[g];
 
-            let slot = state & mask;
-            let sym = slot_tables[g][slot as usize] as usize;
+                let slot = state & mask;
+                let sym = slot_tables[g][slot as usize] as usize;
+                let value = sym as i32 + group.min_val;
 
-            output[coeff_idx] = sym as i32 + group.min_val;
+                let start = group.cumfreqs[sym];
+                let freq = group.cumfreqs[sym + 1] - group.cumfreqs[sym];
+                state = freq * (state >> RANS_PRECISION) + (state & mask) - start;
 
-            let start = group.cumfreqs[sym];
-            let freq = group.cumfreqs[sym + 1] - group.cumfreqs[sym];
-            state = freq * (state >> RANS_PRECISION) + (state & mask) - start;
+                while state < RANS_BYTE_L {
+                    if ptr < buf.len() {
+                        state = (state << 8) | buf[ptr] as u32;
+                        ptr += 1;
+                    } else {
+                        break;
+                    }
+                }
 
-            while state < RANS_BYTE_L {
-                if ptr < buf.len() {
-                    state = (state << 8) | buf[ptr] as u32;
-                    ptr += 1;
+                if group.zrun_base != 0 && value >= group.zrun_base {
+                    // ZRL run symbol: expand to consecutive zeros
+                    let run_len = (value - group.zrun_base + 1) as usize;
+                    for j in 0..run_len {
+                        output[s + (output_i + j) * STREAMS_PER_TILE] = 0;
+                    }
+                    output_i += run_len;
                 } else {
-                    break;
+                    output[coeff_idx] = value;
+                    output_i += 1;
+                }
+            }
+        } else {
+            // Original decode path (no ZRL in any group)
+            for i in 0..stream_output_count {
+                let coeff_idx = s + i * STREAMS_PER_TILE;
+                let lx = (coeff_idx % ts) as u32;
+                let ly = (coeff_idx / ts) as u32;
+                let g = compute_subband_group(lx, ly, tile.tile_size, tile.num_levels);
+                let group = &tile.groups[g];
+
+                let slot = state & mask;
+                let sym = slot_tables[g][slot as usize] as usize;
+
+                output[coeff_idx] = sym as i32 + group.min_val;
+
+                let start = group.cumfreqs[sym];
+                let freq = group.cumfreqs[sym + 1] - group.cumfreqs[sym];
+                state = freq * (state >> RANS_PRECISION) + (state & mask) - start;
+
+                while state < RANS_BYTE_L {
+                    if ptr < buf.len() {
+                        state = (state << 8) | buf[ptr] as u32;
+                        ptr += 1;
+                    } else {
+                        break;
+                    }
                 }
             }
         }
@@ -1075,10 +1201,11 @@ pub fn serialize_tile_subband(tile: &SubbandRansTile) -> Vec<u8> {
     out.extend_from_slice(&tile.tile_size.to_le_bytes());
     out.extend_from_slice(&tile.num_levels.to_le_bytes());
     out.extend_from_slice(&tile.num_groups.to_le_bytes());
-    // Per-group frequency tables
+    // Per-group frequency tables (with zrun_base)
     for g in &tile.groups {
         out.extend_from_slice(&g.min_val.to_le_bytes());
         out.extend_from_slice(&g.alphabet_size.to_le_bytes());
+        out.extend_from_slice(&g.zrun_base.to_le_bytes());
         for &f in &g.freqs {
             out.extend_from_slice(&(f as u16).to_le_bytes());
         }
@@ -1118,6 +1245,8 @@ pub fn deserialize_tile_subband(data: &[u8]) -> (SubbandRansTile, usize) {
         pos += 4;
         let alphabet_size = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
         pos += 4;
+        let zrun_base = i32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
+        pos += 4;
 
         let mut freqs = Vec::with_capacity(alphabet_size as usize);
         for _ in 0..alphabet_size {
@@ -1134,6 +1263,7 @@ pub fn deserialize_tile_subband(data: &[u8]) -> (SubbandRansTile, usize) {
         groups.push(SubbandGroupFreqs {
             min_val,
             alphabet_size,
+            zrun_base,
             freqs,
             cumfreqs,
         });
@@ -1598,5 +1728,122 @@ mod tests {
             subband_bytes,
             single_bytes
         );
+    }
+
+    // --- Per-subband ZRL tests ---
+
+    #[test]
+    fn test_subband_zrl_roundtrip_with_large_detail() {
+        // Create data where detail subbands have large value ranges and high zero density,
+        // which triggers ZRL encoding (alphabet >= 16 and zero_frac >= 0.6).
+        let mut coefficients = vec![0i32; 65536];
+        // LL: narrow range, no zeros
+        for y in 0..32 {
+            for x in 0..32 {
+                coefficients[y * 256 + x] = 50 + ((x + y) % 10) as i32;
+            }
+        }
+        // Detail subbands: wide range (-15..15) but mostly zeros (95%)
+        for i in 0..65536 {
+            let y = i / 256;
+            let x = i % 256;
+            if compute_subband_group(x as u32, y as u32, 256, 3) > 0 && i % 20 == 0 {
+                coefficients[i] = ((i as i32 * 7) % 31) - 15;
+            }
+        }
+
+        let tile = rans_encode_tile_interleaved_subband(&coefficients, 256, 3);
+
+        // Verify ZRL is active in at least one detail group
+        let zrl_active = tile.groups.iter().skip(1).any(|g| g.zrun_base != 0);
+        assert!(
+            zrl_active,
+            "Expected ZRL to be active in at least one detail subband group"
+        );
+
+        // Verify LL group does NOT use ZRL
+        assert_eq!(tile.groups[0].zrun_base, 0, "LL group should not use ZRL");
+
+        // Roundtrip
+        let decoded = rans_decode_tile_interleaved_subband(&tile);
+        assert_eq!(coefficients, decoded, "ZRL subband roundtrip failed");
+    }
+
+    #[test]
+    fn test_subband_zrl_serialize_roundtrip() {
+        // Test that serialization preserves per-group zrun_base
+        let mut coefficients = vec![0i32; 65536];
+        for y in 0..32 {
+            for x in 0..32 {
+                coefficients[y * 256 + x] = 50 + ((x + y) % 10) as i32;
+            }
+        }
+        // Wide-range, high zero density detail coefficients
+        for i in 0..65536 {
+            let y = i / 256;
+            let x = i % 256;
+            if compute_subband_group(x as u32, y as u32, 256, 3) > 0 && i % 20 == 0 {
+                coefficients[i] = ((i as i32 * 7) % 31) - 15;
+            }
+        }
+
+        let tile = rans_encode_tile_interleaved_subband(&coefficients, 256, 3);
+        let serialized = serialize_tile_subband(&tile);
+        let (deserialized, consumed) = deserialize_tile_subband(&serialized);
+        assert_eq!(consumed, serialized.len());
+
+        // Verify per-group zrun_base is preserved
+        for (g, (orig, deser)) in tile
+            .groups
+            .iter()
+            .zip(deserialized.groups.iter())
+            .enumerate()
+        {
+            assert_eq!(
+                orig.zrun_base, deser.zrun_base,
+                "Group {} zrun_base mismatch after serialization",
+                g
+            );
+        }
+
+        let decoded = rans_decode_tile_interleaved_subband(&deserialized);
+        assert_eq!(
+            coefficients, decoded,
+            "ZRL subband serialize roundtrip failed"
+        );
+    }
+
+    #[test]
+    fn test_subband_zrl_no_zrl_for_small_alphabet() {
+        // Detail subbands with small value range (< 16 distinct values) should NOT use ZRL
+        let mut coefficients = vec![0i32; 65536];
+        for y in 0..32 {
+            for x in 0..32 {
+                coefficients[y * 256 + x] = 50 + ((x + y) % 10) as i32;
+            }
+        }
+        // Detail: values -2..2 (alphabet=5, below 16 threshold)
+        for i in 0..65536 {
+            let y = i / 256;
+            let x = i % 256;
+            if compute_subband_group(x as u32, y as u32, 256, 3) > 0 && i % 10 == 0 {
+                coefficients[i] = (i % 5) as i32 - 2;
+            }
+        }
+
+        let tile = rans_encode_tile_interleaved_subband(&coefficients, 256, 3);
+
+        // No group should use ZRL with such a small alphabet
+        for (g, group) in tile.groups.iter().enumerate() {
+            assert_eq!(
+                group.zrun_base, 0,
+                "Group {} should not use ZRL with small alphabet (alphabet_size={})",
+                g, group.alphabet_size
+            );
+        }
+
+        // Roundtrip should still work
+        let decoded = rans_decode_tile_interleaved_subband(&tile);
+        assert_eq!(coefficients, decoded);
     }
 }

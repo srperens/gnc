@@ -17,10 +17,10 @@ use super::rans::{InterleavedRansTile, SubbandGroupFreqs, SubbandRansTile, STREA
 use crate::{FrameInfo, GpuContext};
 
 const MAX_STREAM_BYTES: usize = 4096;
-const HIST_TILE_STRIDE: usize = 2060;
+const HIST_TILE_STRIDE: usize = 16401; // 1 + MAX_GROUPS*(2+MAX_GROUP_ALPHABET)
 const ENCODE_TILE_INFO_STRIDE: usize = 32;
 const MAX_ALPHABET: usize = 2048;
-const MAX_GROUP_ALPHABET: usize = 512;
+const MAX_GROUP_ALPHABET: usize = 2048;
 const MAX_GROUPS: usize = 8;
 
 fn cumfreq_stride(per_subband: bool) -> usize {
@@ -869,7 +869,7 @@ impl GpuRansEncoder {
                 let mut groups = Vec::with_capacity(num_groups);
 
                 for g in 0..num_groups {
-                    let gi = info_base + 1 + g * 3;
+                    let gi = info_base + 1 + g * 4;
                     let min_val = tile_info_data[gi] as i32;
                     let alphabet_size = tile_info_data[gi + 1] as usize;
                     let cf_offset = tile_info_data[gi + 2] as usize;
@@ -963,6 +963,7 @@ impl GpuRansEncoder {
                             .map(|g| SubbandGroupFreqs {
                                 min_val: g.min_val,
                                 alphabet_size: g.alphabet_size,
+                                zrun_base: 0, // GPU encode path does not apply ZRL
                                 freqs: g.freqs.clone(),
                                 cumfreqs: g.cumfreqs.clone(),
                             })

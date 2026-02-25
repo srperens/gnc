@@ -11,13 +11,13 @@
 
 const WG_SIZE: u32 = 256u;
 const MAX_ALPHABET: u32 = 2048u;
-const MAX_GROUP_ALPHABET: u32 = 512u;
+const MAX_GROUP_ALPHABET: u32 = 2048u;
 const MAX_GROUPS: u32 = 8u;
 
 // Output stride per tile in u32s.
 // Single-table: [min_val, alphabet_size, hist[0..MAX_ALPHABET]]
 // Per-subband:  [num_groups, {min_val, alphabet_size, hist[0..MAX_GROUP_ALPHABET]} x groups]
-const HIST_TILE_STRIDE: u32 = 2060u;
+const HIST_TILE_STRIDE: u32 = 16401u;  // 1 + MAX_GROUPS*(2+MAX_GROUP_ALPHABET)
 
 struct Params {
     num_tiles: u32,
@@ -39,7 +39,8 @@ var<workgroup> shared_min: array<i32, 256>;
 var<workgroup> shared_max: array<i32, 256>;
 
 // Shared memory for histogram building (atomic)
-var<workgroup> shared_hist: array<atomic<u32>, 2048>;
+// Size must fit sum of all group alphabets: up to MAX_GROUPS * MAX_GROUP_ALPHABET
+var<workgroup> shared_hist: array<atomic<u32>, 5120>;
 
 // Per-group metadata broadcast from thread 0
 var<workgroup> shared_group_min: array<i32, 8>;

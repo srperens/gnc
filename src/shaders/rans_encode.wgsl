@@ -16,7 +16,7 @@ const MAX_STREAM_BYTES: u32 = 4096u;
 
 // Per-tile encode info stride in u32s.
 // Single-table: [0]=min_val, [1]=alphabet_size, [2]=cumfreq_offset
-// Per-subband:  [0]=num_groups, [1+g*3]=min_val, [2+g*3]=alphabet_size, [3+g*3]=cumfreq_offset
+// Per-subband:  [0]=num_groups, [1+g*4]=min_val, [2+g*4]=alphabet_size, [3+g*4]=cumfreq_offset, [4+g*4]=zrun_base
 const ENCODE_TILE_INFO_STRIDE: u32 = 32u;
 
 struct Params {
@@ -38,7 +38,9 @@ struct Params {
 @group(0) @binding(5) var<storage, read_write> stream_metadata: array<u32>;
 
 // Shared cumfreq table for the current tile (loaded cooperatively)
-var<workgroup> shared_cumfreq: array<u32, 2049>;  // MAX_ALPHABET + 1
+// Per-subband: up to MAX_GROUPS * (MAX_GROUP_ALPHABET + 1) entries
+// Single-table: up to MAX_ALPHABET + 1 = 2049 entries
+var<workgroup> shared_cumfreq: array<u32, 4096>;
 
 // Write one byte into the packed u32 output array.
 // Each stream writes to its own non-overlapping region, so no atomics needed.
@@ -103,7 +105,7 @@ fn main(
         var total_cf_entries = 0u;
 
         for (var g = 0u; g < num_groups; g++) {
-            let gi = base + 1u + g * 3u;
+            let gi = base + 1u + g * 4u;
             group_min[g] = bitcast<i32>(tile_info[gi]);
             group_asize[g] = tile_info[gi + 1u];
             let cf_global = tile_info[gi + 2u];
@@ -133,7 +135,11 @@ fn main(
 
             let g = compute_subband_group(tile_col, tile_row);
             let gmin = group_min[g];
-            let sym = u32(i32(round(coeff)) - gmin);
+            var sym = u32(i32(round(coeff)) - gmin);
+            // Clamp to alphabet — must match histogram shader clamping
+            if (sym >= group_asize[g]) {
+                sym = group_asize[g] - 1u;
+            }
 
             let cf_start = group_cf_start[g];
             let start = shared_cumfreq[cf_start + sym];

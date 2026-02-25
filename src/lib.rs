@@ -69,7 +69,7 @@ impl SubbandWeights {
         }
     }
 
-    /// Perceptual weights: quantize HH harder, inner levels harder, chroma harder.
+    /// Perceptual weights: quantize inner detail harder (less energy), preserve outer detail.
     pub fn perceptual(levels: u32) -> Self {
         let mut detail = Vec::with_capacity(levels as usize);
         for i in 0..levels as usize {
@@ -81,7 +81,7 @@ impl SubbandWeights {
         Self {
             ll: 1.0,
             detail,
-            chroma_weight: 1.5,
+            chroma_weight: 1.0,
         }
     }
 
@@ -331,23 +331,33 @@ pub fn quality_preset(q: u32) -> CodecConfig {
     // Discrete settings: use lower-quality anchor until midpoint
     let disc = if t < 0.5 { lo } else { hi };
 
-    let wavelet_levels = 3;
+    let wavelet_levels = if q >= 60 { 4 } else { 3 };
+    let aq_enabled = false; // AQ broken: spatial weights applied to wavelet-domain positions
+    let aq_strength = if q >= 70 { 0.4 } else { 0.3 };
+    let mut weights = if disc.perceptual {
+        SubbandWeights::perceptual(wavelet_levels)
+    } else {
+        SubbandWeights::uniform(wavelet_levels)
+    };
+    if q < 50 {
+        weights.chroma_weight = 1.5;
+    } else if q < 70 {
+        weights.chroma_weight = 1.1;
+    }
     CodecConfig {
         quantization_step: qstep,
         dead_zone,
         wavelet_levels,
-        subband_weights: if disc.perceptual {
-            SubbandWeights::perceptual(wavelet_levels)
-        } else {
-            SubbandWeights::uniform(wavelet_levels)
-        },
-        cfl_enabled: disc.cfl,
+        subband_weights: weights,
+        cfl_enabled: false, // CfL disabled for now — needs per-subband alpha quantization fixes
         wavelet_type: if disc.cdf97 {
             WaveletType::CDF97
         } else {
             WaveletType::LeGall53
         },
         per_subband_entropy: disc.per_subband,
+        adaptive_quantization: aq_enabled,
+        aq_strength,
         ..Default::default()
     }
 }

@@ -36,7 +36,9 @@ struct Params {
 @group(0) @binding(4) var<storage, read_write> output: array<f32>;
 
 // Shared cumfreq table for the current tile (loaded cooperatively)
-var<workgroup> shared_cumfreq: array<u32, 2049>;  // MAX_ALPHABET + 1
+// Per-subband: up to MAX_GROUPS * (MAX_GROUP_ALPHABET + 1) entries
+// Single-table: up to MAX_ALPHABET + 1 = 2049 entries
+var<workgroup> shared_cumfreq: array<u32, 4096>;
 
 // Read one byte from the packed u32 stream data array.
 // Bytes are packed little-endian: byte 0 is bits [0:7] of u32[0].
@@ -118,15 +120,16 @@ fn main(
     let target_outputs = params.coefficients_per_tile / STREAMS_PER_TILE;
 
     if (params.per_subband != 0u) {
-        // --- Per-subband decode path ---
-        // Tile-info layout:
+        // --- Per-subband decode path (with per-group ZRL) ---
+        // Tile-info layout (4 u32s per group):
         //   [0]: num_groups
-        //   [1+g*3+0]: group g min_val
-        //   [1+g*3+1]: group g alphabet_size
-        //   [1+g*3+2]: group g cumfreq_offset (into cumfreq_data)
-        //   [13]: stream_data_byte_base
-        //   [14..46]: 32 initial states
-        //   [46..78]: 32 stream byte offsets
+        //   [1+g*4+0]: group g min_val
+        //   [1+g*4+1]: group g alphabet_size
+        //   [1+g*4+2]: group g cumfreq_offset (into cumfreq_data)
+        //   [1+g*4+3]: group g zrun_base (0 = no ZRL)
+        //   [33]: stream_data_byte_base
+        //   [34..66]: 32 initial states
+        //   [66..98]: 32 stream byte offsets
 
         let num_groups = tile_info[base];
 
@@ -134,13 +137,19 @@ fn main(
         var group_min: array<i32, 8>;
         var group_asize: array<u32, 8>;
         var group_cf_start: array<u32, 8>;  // start index in shared_cumfreq
+        var group_zrun: array<i32, 8>;      // per-group zrun_base
         var total_cf_entries = 0u;
+        var has_any_zrl = false;
 
         for (var g = 0u; g < num_groups; g++) {
-            let gi = base + 1u + g * 3u;
+            let gi = base + 1u + g * 4u;
             group_min[g] = bitcast<i32>(tile_info[gi]);
             group_asize[g] = tile_info[gi + 1u];
             let cf_global = tile_info[gi + 2u];
+            group_zrun[g] = bitcast<i32>(tile_info[gi + 3u]);
+            if (group_zrun[g] != 0) {
+                has_any_zrl = true;
+            }
             group_cf_start[g] = total_cf_entries;
             let entries = group_asize[g] + 1u;
 
@@ -154,46 +163,96 @@ fn main(
         workgroupBarrier();
 
         // Per-stream decode setup
-        let stream_byte_base = tile_info[base + 13u];
-        let initial_state = tile_info[base + 14u + thread_id];
-        let stream_offset = tile_info[base + 46u + thread_id];
+        let stream_byte_base = tile_info[base + 33u];
+        let initial_state = tile_info[base + 34u + thread_id];
+        let stream_offset = tile_info[base + 66u + thread_id];
 
         var state = initial_state;
         var byte_ptr = stream_byte_base + stream_offset;
 
-        // Decode loop: no ZRL, direct coefficient output
-        for (var output_i = 0u; output_i < target_outputs; output_i++) {
-            // Compute 2D tile-local position from linear index
-            let coeff_idx = thread_id + output_i * STREAMS_PER_TILE;
-            let tile_row = coeff_idx / params.tile_size;
-            let tile_col = coeff_idx % params.tile_size;
-            let g = compute_subband_group(tile_col, tile_row);
+        if (has_any_zrl) {
+            // ZRL-aware decode: output_i may advance by more than 1 per symbol
+            var output_i = 0u;
+            while (output_i < target_outputs) {
+                let coeff_idx = thread_id + output_i * STREAMS_PER_TILE;
+                let tile_row = coeff_idx / params.tile_size;
+                let tile_col = coeff_idx % params.tile_size;
+                let g = compute_subband_group(tile_col, tile_row);
 
-            let cf_start = group_cf_start[g];
-            let asize = group_asize[g];
-            let gmin = group_min[g];
+                let cf_start = group_cf_start[g];
+                let asize = group_asize[g];
+                let gmin = group_min[g];
+                let zrun = group_zrun[g];
 
-            // Extract slot from current state
-            let slot = state & RANS_MASK;
-            let sym = binary_search_at(slot, cf_start, asize);
+                let slot = state & RANS_MASK;
+                let sym = binary_search_at(slot, cf_start, asize);
 
-            // Advance rANS state
-            let start = shared_cumfreq[cf_start + sym];
-            let freq = shared_cumfreq[cf_start + sym + 1u] - start;
-            state = freq * (state >> RANS_PRECISION) + (state & RANS_MASK) - start;
+                let start = shared_cumfreq[cf_start + sym];
+                let freq = shared_cumfreq[cf_start + sym + 1u] - start;
+                state = freq * (state >> RANS_PRECISION) + (state & RANS_MASK) - start;
 
-            // Renormalize
-            for (var r = 0u; r < 3u; r++) {
-                if (state >= RANS_BYTE_L) { break; }
-                let byte_val = read_byte(byte_ptr);
-                state = (state << 8u) | byte_val;
-                byte_ptr++;
+                for (var r = 0u; r < 3u; r++) {
+                    if (state >= RANS_BYTE_L) { break; }
+                    let byte_val = read_byte(byte_ptr);
+                    state = (state << 8u) | byte_val;
+                    byte_ptr++;
+                }
+
+                let value = i32(sym) + gmin;
+
+                if (zrun != 0 && value >= zrun) {
+                    // ZRL run symbol: expand to consecutive zeros
+                    var run_len = u32(value - zrun) + 1u;
+                    if (output_i + run_len > target_outputs) {
+                        run_len = target_outputs - output_i;
+                    }
+                    for (var j = 0u; j < run_len; j++) {
+                        let ri = thread_id + (output_i + j) * STREAMS_PER_TILE;
+                        let rrow = ri / params.tile_size;
+                        let rcol = ri % params.tile_size;
+                        let pidx = (tile_origin_y + rrow) * params.plane_width
+                                 + (tile_origin_x + rcol);
+                        output[pidx] = 0.0;
+                    }
+                    output_i += run_len;
+                } else {
+                    let plane_idx = (tile_origin_y + tile_row) * params.plane_width
+                                  + (tile_origin_x + tile_col);
+                    output[plane_idx] = f32(value);
+                    output_i += 1u;
+                }
             }
+        } else {
+            // No ZRL in any group: simple for-loop decode
+            for (var output_i = 0u; output_i < target_outputs; output_i++) {
+                let coeff_idx = thread_id + output_i * STREAMS_PER_TILE;
+                let tile_row = coeff_idx / params.tile_size;
+                let tile_col = coeff_idx % params.tile_size;
+                let g = compute_subband_group(tile_col, tile_row);
 
-            let value = i32(sym) + gmin;
-            let plane_idx = (tile_origin_y + tile_row) * params.plane_width
-                          + (tile_origin_x + tile_col);
-            output[plane_idx] = f32(value);
+                let cf_start = group_cf_start[g];
+                let asize = group_asize[g];
+                let gmin = group_min[g];
+
+                let slot = state & RANS_MASK;
+                let sym = binary_search_at(slot, cf_start, asize);
+
+                let start = shared_cumfreq[cf_start + sym];
+                let freq = shared_cumfreq[cf_start + sym + 1u] - start;
+                state = freq * (state >> RANS_PRECISION) + (state & RANS_MASK) - start;
+
+                for (var r = 0u; r < 3u; r++) {
+                    if (state >= RANS_BYTE_L) { break; }
+                    let byte_val = read_byte(byte_ptr);
+                    state = (state << 8u) | byte_val;
+                    byte_ptr++;
+                }
+
+                let value = i32(sym) + gmin;
+                let plane_idx = (tile_origin_y + tile_row) * params.plane_width
+                              + (tile_origin_x + tile_col);
+                output[plane_idx] = f32(value);
+            }
         }
     } else {
         // --- Single-table decode path (original, with optional ZRL) ---

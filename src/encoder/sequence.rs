@@ -361,7 +361,9 @@ impl EncoderPipeline {
 
         let entropy = match entropy_mode {
             EntropyMode::Bitplane => EntropyData::Bitplane(bp_tiles),
-            EntropyMode::SubbandRans => EntropyData::SubbandRans(subband_tiles),
+            EntropyMode::SubbandRans | EntropyMode::SubbandRansCtx => {
+                EntropyData::SubbandRans(subband_tiles)
+            }
             EntropyMode::Rans => EntropyData::Rans(rans_tiles),
         };
 

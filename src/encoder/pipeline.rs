@@ -137,8 +137,9 @@ impl EncoderPipeline {
         let tile_size = config.tile_size as usize;
         let tiles_x = info.tiles_x() as usize;
         let tiles_y = info.tiles_y() as usize;
-        let use_gpu_encode =
-            config.gpu_entropy_encode && config.entropy_coder != EntropyCoder::Bitplane;
+        let use_gpu_encode = config.gpu_entropy_encode
+            && config.entropy_coder != EntropyCoder::Bitplane
+            && !config.context_adaptive;
 
         let weights_luma = config.subband_weights.pack_weights();
         let weights_chroma = config.subband_weights.pack_weights_chroma();
@@ -586,7 +587,9 @@ impl EncoderPipeline {
 
         let entropy = match entropy_mode {
             EntropyMode::Bitplane => EntropyData::Bitplane(bp_tiles),
-            EntropyMode::SubbandRans => EntropyData::SubbandRans(subband_tiles),
+            EntropyMode::SubbandRans | EntropyMode::SubbandRansCtx => {
+                EntropyData::SubbandRans(subband_tiles)
+            }
             EntropyMode::Rans => EntropyData::Rans(rans_tiles),
         };
 

@@ -1194,6 +1194,433 @@ pub fn rans_decode_tile_interleaved_subband(tile: &SubbandRansTile) -> Vec<i32> 
     output
 }
 
+/// Compute the "above-neighbor" context for a coefficient at tile position (lx, ly).
+///
+/// Returns 0 if the coefficient directly above in the same subband is zero or out-of-bounds.
+/// Returns 1 if the above coefficient is nonzero.
+/// LL subband (group 0) always returns context 0.
+///
+/// For a coefficient at (lx, ly):
+/// - Find which subband it belongs to (within a wavelet level)
+/// - Find the top-left corner and height of that subband region
+/// - If this is the first row of the subband region, context = 0
+/// - Otherwise, look at (lx, ly - 1) in the coefficient buffer
+fn compute_above_context(
+    coefficients: &[i32],
+    lx: u32,
+    ly: u32,
+    tile_size: u32,
+    num_levels: u32,
+) -> u32 {
+    let group = compute_subband_group(lx, ly, tile_size, num_levels);
+    if group == 0 {
+        return 0; // LL: always context 0
+    }
+
+    // Find the subband region boundaries for this coefficient.
+    // Subband group `g` (1..=num_levels) corresponds to wavelet level (g-1).
+    // At level L, the detail subbands occupy the region outside the (tile_size >> (L+1)) square
+    // but inside the (tile_size >> L) square.
+    let level = group - 1;
+    let region = tile_size >> level;
+    let half = region / 2;
+
+    // Determine which sub-subband (LH, HL, or HH) and its top-left corner
+    let subband_y_start = if ly < half {
+        // HL subband: rows [0, half), cols [half, region)
+        0
+    } else if lx < half {
+        // LH subband: rows [half, region), cols [0, half)
+        half
+    } else {
+        // HH subband: rows [half, region), cols [half, region)
+        half
+    };
+
+    // If this is the first row of the subband, no above neighbor
+    if ly == subband_y_start {
+        return 0;
+    }
+
+    // Look at the coefficient directly above
+    let above_idx = ((ly - 1) * tile_size + lx) as usize;
+    if coefficients[above_idx] == 0 {
+        0
+    } else {
+        1
+    }
+}
+
+/// Map a subband group index and context to the expanded group index for context-adaptive mode.
+///
+/// Layout: groups[0] = LL (context 0 only)
+///         groups[1 + (g-1)*2] = detail group g, context 0
+///         groups[1 + (g-1)*2 + 1] = detail group g, context 1
+///
+/// Total expanded groups = 1 + num_detail_groups * 2
+fn context_group_index(subband_group: usize, context: u32) -> usize {
+    if subband_group == 0 {
+        0
+    } else {
+        1 + (subband_group - 1) * 2 + context as usize
+    }
+}
+
+/// Number of expanded groups in context-adaptive mode.
+fn num_context_groups(num_levels: u32) -> usize {
+    1 + num_levels as usize * 2
+}
+
+/// Encode a tile using per-subband frequency tables with context-adaptive coding.
+///
+/// Like `rans_encode_tile_interleaved_subband` but each detail subband group gets
+/// 2 frequency tables: one for coefficients whose above neighbor is zero (context 0)
+/// and one for coefficients whose above neighbor is nonzero (context 1).
+pub fn rans_encode_tile_interleaved_subband_ctx(
+    coefficients: &[i32],
+    tile_size: u32,
+    num_levels: u32,
+) -> SubbandRansTile {
+    let num_groups = num_context_groups(num_levels);
+
+    if coefficients.is_empty() {
+        return SubbandRansTile {
+            num_coefficients: 0,
+            tile_size,
+            num_levels,
+            num_groups: num_groups as u32,
+            groups: (0..num_groups)
+                .map(|_| SubbandGroupFreqs {
+                    min_val: 0,
+                    alphabet_size: 0,
+                    zrun_base: 0,
+                    freqs: vec![],
+                    cumfreqs: vec![0],
+                })
+                .collect(),
+            stream_data: vec![vec![]; STREAMS_PER_TILE],
+            stream_initial_state: vec![RANS_BYTE_L; STREAMS_PER_TILE],
+        };
+    }
+
+    let ts = tile_size as usize;
+
+    // Precompute subband group AND context for each coefficient position
+    let group_map: Vec<usize> = (0..coefficients.len())
+        .map(|i| {
+            let lx = (i % ts) as u32;
+            let ly = (i / ts) as u32;
+            let g = compute_subband_group(lx, ly, tile_size, num_levels);
+            let ctx = compute_above_context(coefficients, lx, ly, tile_size, num_levels);
+            context_group_index(g, ctx)
+        })
+        .collect();
+
+    // Compute per-expanded-group stats for ZRL decision
+    let mut group_max_abs = vec![0i32; num_groups];
+    let mut group_zero_count = vec![0usize; num_groups];
+    let mut group_total_count = vec![0usize; num_groups];
+    let mut group_has_data = vec![false; num_groups];
+
+    for (i, &c) in coefficients.iter().enumerate() {
+        let eg = group_map[i];
+        group_has_data[eg] = true;
+        group_total_count[eg] += 1;
+        if c == 0 {
+            group_zero_count[eg] += 1;
+        } else {
+            group_max_abs[eg] = group_max_abs[eg].max(c.abs());
+        }
+    }
+
+    // ZRL decision: apply to detail context groups (expanded groups > 0)
+    // Both context 0 and context 1 of the same original group share the same zrun_base
+    // because they share the same coefficient value range.
+    let mut group_zrun_base = vec![0i32; num_groups];
+    for orig_g in 1..=num_levels as usize {
+        // Check both context sub-groups; use shared zrun decision
+        let eg0 = context_group_index(orig_g, 0);
+        let eg1 = context_group_index(orig_g, 1);
+        let total_max_abs = group_max_abs[eg0].max(group_max_abs[eg1]);
+        let total_zeros = group_zero_count[eg0] + group_zero_count[eg1];
+        let total_count = group_total_count[eg0] + group_total_count[eg1];
+
+        if total_count > 0 {
+            let zero_frac = total_zeros as f64 / total_count as f64;
+            let non_zrl_alphabet = (2 * total_max_abs + 1) as usize;
+            if zero_frac >= 0.6 && non_zrl_alphabet >= 16 {
+                let zb = total_max_abs + 1;
+                group_zrun_base[eg0] = zb;
+                group_zrun_base[eg1] = zb;
+            }
+        }
+    }
+
+    // Build per-stream ZRL-transformed symbol sequences with expanded group indices
+    let num_coefficients = coefficients.len();
+    let mut stream_zrl_symbols: Vec<Vec<(i32, usize)>> = Vec::with_capacity(STREAMS_PER_TILE);
+
+    for s in 0..STREAMS_PER_TILE {
+        let indices: Vec<usize> = (s..num_coefficients).step_by(STREAMS_PER_TILE).collect();
+        let mut symbols: Vec<(i32, usize)> = Vec::with_capacity(indices.len());
+
+        let mut i = 0;
+        while i < indices.len() {
+            let idx = indices[i];
+            let eg = group_map[idx];
+            let c = coefficients[idx];
+            let zrun_base = group_zrun_base[eg];
+
+            if zrun_base != 0 && c == 0 {
+                let mut run_len = 0i32;
+                while i < indices.len()
+                    && coefficients[indices[i]] == 0
+                    && group_map[indices[i]] == eg
+                    && run_len < MAX_ZERO_RUN
+                {
+                    run_len += 1;
+                    i += 1;
+                }
+                symbols.push((zrun_base + run_len - 1, eg));
+            } else {
+                symbols.push((c, eg));
+                i += 1;
+            }
+        }
+
+        stream_zrl_symbols.push(symbols);
+    }
+
+    // Build per-expanded-group frequency tables from ZRL-transformed symbols
+    let mut group_min = vec![i32::MAX; num_groups];
+    let mut group_max = vec![i32::MIN; num_groups];
+    group_has_data = vec![false; num_groups];
+
+    for stream_syms in &stream_zrl_symbols {
+        for &(sym, eg) in stream_syms {
+            group_has_data[eg] = true;
+            group_min[eg] = group_min[eg].min(sym);
+            group_max[eg] = group_max[eg].max(sym);
+        }
+    }
+
+    let mut groups: Vec<SubbandGroupFreqs> = Vec::with_capacity(num_groups);
+
+    for eg in 0..num_groups {
+        if !group_has_data[eg] {
+            groups.push(SubbandGroupFreqs {
+                min_val: 0,
+                alphabet_size: 1,
+                zrun_base: 0,
+                freqs: vec![RANS_M],
+                cumfreqs: vec![0, RANS_M],
+            });
+            continue;
+        }
+
+        let min_val = group_min[eg];
+        let max_val = group_max[eg];
+        let alphabet_size = (max_val - min_val + 1) as usize;
+
+        let mut hist = vec![0u32; alphabet_size];
+        for stream_syms in &stream_zrl_symbols {
+            for &(sym, sg) in stream_syms {
+                if sg == eg {
+                    hist[(sym - min_val) as usize] += 1;
+                }
+            }
+        }
+
+        let freqs = normalize_histogram(&hist, RANS_M);
+
+        let mut cumfreqs = vec![0u32; alphabet_size + 1];
+        for i in 0..alphabet_size {
+            cumfreqs[i + 1] = cumfreqs[i] + freqs[i];
+        }
+        debug_assert_eq!(cumfreqs[alphabet_size], RANS_M);
+
+        groups.push(SubbandGroupFreqs {
+            min_val,
+            alphabet_size: alphabet_size as u32,
+            zrun_base: group_zrun_base[eg],
+            freqs,
+            cumfreqs,
+        });
+    }
+
+    // rANS encode each stream's ZRL-transformed symbols
+    let mut stream_data = Vec::with_capacity(STREAMS_PER_TILE);
+    let mut stream_initial_state = Vec::with_capacity(STREAMS_PER_TILE);
+
+    for stream_syms in &stream_zrl_symbols {
+        if stream_syms.is_empty() {
+            stream_data.push(vec![]);
+            stream_initial_state.push(RANS_BYTE_L);
+            continue;
+        }
+
+        let buf_size = stream_syms.len() * 2 + 64;
+        let mut buf = vec![0u8; buf_size];
+        let mut ptr = buf_size;
+        let mut state: u32 = RANS_BYTE_L;
+
+        for &(sym_val, eg) in stream_syms.iter().rev() {
+            let group = &groups[eg];
+            let sym = (sym_val - group.min_val) as usize;
+            let start = group.cumfreqs[sym];
+            let freq = group.freqs[sym];
+
+            let x_max = ((RANS_BYTE_L >> RANS_PRECISION) << 8) * freq;
+            while state >= x_max {
+                ptr -= 1;
+                buf[ptr] = (state & 0xff) as u8;
+                state >>= 8;
+            }
+
+            state = ((state / freq) << RANS_PRECISION) + (state % freq) + start;
+        }
+
+        stream_initial_state.push(state);
+        stream_data.push(buf[ptr..].to_vec());
+    }
+
+    SubbandRansTile {
+        num_coefficients: num_coefficients as u32,
+        tile_size,
+        num_levels,
+        num_groups: num_groups as u32,
+        groups,
+        stream_data,
+        stream_initial_state,
+    }
+}
+
+/// CPU reference decoder for context-adaptive per-subband interleaved rANS tiles.
+///
+/// Each detail subband group has 2 frequency tables (context 0 and context 1).
+/// Context is reconstructed on-the-fly: for each coefficient, check if the
+/// coefficient directly above (same column, previous row within the same subband)
+/// is zero or nonzero.
+pub fn rans_decode_tile_interleaved_subband_ctx(tile: &SubbandRansTile) -> Vec<i32> {
+    if tile.num_coefficients == 0 {
+        return vec![];
+    }
+
+    let num_coefficients = tile.num_coefficients as usize;
+    let ts = tile.tile_size as usize;
+    let mut output = vec![0i32; num_coefficients];
+    let num_ctx_groups = num_context_groups(tile.num_levels);
+
+    // Build per-expanded-group slot-to-symbol lookup tables
+    let slot_tables: Vec<Vec<u16>> = tile
+        .groups
+        .iter()
+        .map(|g| {
+            let mut table = vec![0u16; RANS_M as usize];
+            let asize = g.alphabet_size as usize;
+            for sym in 0..asize {
+                for j in g.cumfreqs[sym]..g.cumfreqs[sym + 1] {
+                    table[j as usize] = sym as u16;
+                }
+            }
+            table
+        })
+        .collect();
+
+    // Check if any group uses ZRL
+    let has_zrl = tile.groups.iter().any(|g| g.zrun_base != 0);
+
+    for s in 0..STREAMS_PER_TILE {
+        if s >= num_coefficients {
+            break;
+        }
+        let stream_output_count = 1 + (num_coefficients - 1 - s) / STREAMS_PER_TILE;
+
+        let mut state = tile.stream_initial_state[s];
+        let buf = &tile.stream_data[s];
+        let mut ptr: usize = 0;
+        let mask = RANS_M - 1;
+
+        if has_zrl {
+            let mut output_i = 0;
+            while output_i < stream_output_count {
+                let coeff_idx = s + output_i * STREAMS_PER_TILE;
+                let lx = (coeff_idx % ts) as u32;
+                let ly = (coeff_idx / ts) as u32;
+                let g = compute_subband_group(lx, ly, tile.tile_size, tile.num_levels);
+
+                // Reconstruct context from already-decoded output
+                let ctx = compute_above_context(&output, lx, ly, tile.tile_size, tile.num_levels);
+                let eg = context_group_index(g, ctx);
+                let eg = eg.min(num_ctx_groups - 1);
+
+                let group = &tile.groups[eg];
+
+                let slot = state & mask;
+                let sym = slot_tables[eg][slot as usize] as usize;
+                let value = sym as i32 + group.min_val;
+
+                let start = group.cumfreqs[sym];
+                let freq = group.cumfreqs[sym + 1] - group.cumfreqs[sym];
+                state = freq * (state >> RANS_PRECISION) + (state & mask) - start;
+
+                while state < RANS_BYTE_L {
+                    if ptr < buf.len() {
+                        state = (state << 8) | buf[ptr] as u32;
+                        ptr += 1;
+                    } else {
+                        break;
+                    }
+                }
+
+                if group.zrun_base != 0 && value >= group.zrun_base {
+                    let run_len = (value - group.zrun_base + 1) as usize;
+                    for j in 0..run_len {
+                        output[s + (output_i + j) * STREAMS_PER_TILE] = 0;
+                    }
+                    output_i += run_len;
+                } else {
+                    output[coeff_idx] = value;
+                    output_i += 1;
+                }
+            }
+        } else {
+            for i in 0..stream_output_count {
+                let coeff_idx = s + i * STREAMS_PER_TILE;
+                let lx = (coeff_idx % ts) as u32;
+                let ly = (coeff_idx / ts) as u32;
+                let g = compute_subband_group(lx, ly, tile.tile_size, tile.num_levels);
+
+                let ctx = compute_above_context(&output, lx, ly, tile.tile_size, tile.num_levels);
+                let eg = context_group_index(g, ctx);
+                let eg = eg.min(num_ctx_groups - 1);
+
+                let group = &tile.groups[eg];
+
+                let slot = state & mask;
+                let sym = slot_tables[eg][slot as usize] as usize;
+
+                output[coeff_idx] = sym as i32 + group.min_val;
+
+                let start = group.cumfreqs[sym];
+                let freq = group.cumfreqs[sym + 1] - group.cumfreqs[sym];
+                state = freq * (state >> RANS_PRECISION) + (state & mask) - start;
+
+                while state < RANS_BYTE_L {
+                    if ptr < buf.len() {
+                        state = (state << 8) | buf[ptr] as u32;
+                        ptr += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    output
+}
+
 /// Serialize a SubbandRansTile to bytes.
 pub fn serialize_tile_subband(tile: &SubbandRansTile) -> Vec<u8> {
     let mut out = Vec::new();
@@ -1845,5 +2272,153 @@ mod tests {
         // Roundtrip should still work
         let decoded = rans_decode_tile_interleaved_subband(&tile);
         assert_eq!(coefficients, decoded);
+    }
+
+    // --- Context-adaptive entropy coding tests ---
+
+    #[test]
+    fn test_ctx_adaptive_roundtrip_simple() {
+        // 256x256 tile, 3 levels
+        let mut coefficients = vec![0i32; 65536];
+        for y in 0..32 {
+            for x in 0..32 {
+                coefficients[y * 256 + x] = ((x + y) % 20) as i32 + 5;
+            }
+        }
+        for i in (8192..65536).step_by(7) {
+            coefficients[i] = (i % 11) as i32 - 5;
+        }
+
+        let tile = rans_encode_tile_interleaved_subband_ctx(&coefficients, 256, 3);
+        // Should have 1 + 3*2 = 7 expanded groups
+        assert_eq!(tile.num_groups, 7);
+        let decoded = rans_decode_tile_interleaved_subband_ctx(&tile);
+        assert_eq!(coefficients, decoded);
+    }
+
+    #[test]
+    fn test_ctx_adaptive_roundtrip_all_zeros() {
+        let coefficients = vec![0i32; 65536];
+        let tile = rans_encode_tile_interleaved_subband_ctx(&coefficients, 256, 3);
+        let decoded = rans_decode_tile_interleaved_subband_ctx(&tile);
+        assert_eq!(coefficients, decoded);
+    }
+
+    #[test]
+    fn test_ctx_adaptive_roundtrip_varied() {
+        // Realistic wavelet output
+        let mut coefficients = vec![0i32; 65536];
+        for i in 0..65536 {
+            let y = i / 256;
+            let x = i % 256;
+            let g = compute_subband_group(x as u32, y as u32, 256, 3);
+            coefficients[i] = match g {
+                0 => ((x + y) % 40) as i32 + 10,
+                1 => {
+                    if i % 5 == 0 {
+                        (i % 7) as i32 - 3
+                    } else {
+                        0
+                    }
+                }
+                2 => {
+                    if i % 3 == 0 {
+                        (i % 9) as i32 - 4
+                    } else {
+                        0
+                    }
+                }
+                _ => {
+                    if i % 2 == 0 {
+                        (i % 15) as i32 - 7
+                    } else {
+                        0
+                    }
+                }
+            };
+        }
+
+        let tile = rans_encode_tile_interleaved_subband_ctx(&coefficients, 256, 3);
+        let decoded = rans_decode_tile_interleaved_subband_ctx(&tile);
+        assert_eq!(coefficients, decoded);
+    }
+
+    #[test]
+    fn test_ctx_adaptive_serialize_roundtrip() {
+        let mut coefficients = vec![0i32; 65536];
+        for y in 0..32 {
+            for x in 0..32 {
+                coefficients[y * 256 + x] = 50 + ((x + y) % 10) as i32;
+            }
+        }
+        for i in 0..65536 {
+            let y = i / 256;
+            let x = i % 256;
+            if compute_subband_group(x as u32, y as u32, 256, 3) > 0 && i % 10 == 0 {
+                coefficients[i] = ((i as i32 * 3) % 21) - 10;
+            }
+        }
+
+        let tile = rans_encode_tile_interleaved_subband_ctx(&coefficients, 256, 3);
+        let serialized = serialize_tile_subband(&tile);
+        let (deserialized, consumed) = deserialize_tile_subband(&serialized);
+        assert_eq!(consumed, serialized.len());
+        let decoded = rans_decode_tile_interleaved_subband_ctx(&deserialized);
+        assert_eq!(coefficients, decoded);
+    }
+
+    #[test]
+    fn test_ctx_adaptive_compression_improvement() {
+        // Realistic wavelet-like data with spatial correlation (above-neighbor context should help)
+        let mut coefficients = vec![0i32; 65536];
+        // LL: smooth slowly-varying values
+        for y in 0..32 {
+            for x in 0..32 {
+                coefficients[y * 256 + x] = 100 + ((x + y) % 20) as i32;
+            }
+        }
+        // Detail subbands: spatially correlated sparsity — rows of zeros followed by rows
+        // with values. This pattern benefits from above-neighbor context.
+        for i in 0..65536 {
+            let y = i / 256;
+            let x = i % 256;
+            let g = compute_subband_group(x as u32, y as u32, 256, 3);
+            if g > 0 {
+                // Create spatially correlated patterns: zero rows alternate with value rows
+                let local_y = y % 32; // position within subband region
+                if local_y % 4 < 2 {
+                    // Zero rows
+                    coefficients[i] = 0;
+                } else {
+                    // Value rows: small coefficients
+                    coefficients[i] = ((x + y) % 7) as i32 - 3;
+                }
+            }
+        }
+
+        let plain = rans_encode_tile_interleaved_subband(&coefficients, 256, 3);
+        let ctx = rans_encode_tile_interleaved_subband_ctx(&coefficients, 256, 3);
+
+        let plain_bytes = plain.byte_size();
+        let ctx_bytes = ctx.byte_size();
+
+        // Context-adaptive should be smaller (or at least not worse) for correlated data
+        let savings_pct = 100.0 * (1.0 - ctx_bytes as f64 / plain_bytes as f64);
+        eprintln!(
+            "Context-adaptive: {} bytes vs plain: {} bytes ({:.1}% savings)",
+            ctx_bytes, plain_bytes, savings_pct
+        );
+
+        // Verify roundtrip
+        let decoded = rans_decode_tile_interleaved_subband_ctx(&ctx);
+        assert_eq!(coefficients, decoded);
+
+        // We expect some improvement for spatially correlated data
+        assert!(
+            ctx_bytes <= plain_bytes,
+            "Context-adaptive ({}) should not be worse than plain ({}) for correlated data",
+            ctx_bytes,
+            plain_bytes
+        );
     }
 }

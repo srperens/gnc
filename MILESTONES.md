@@ -35,7 +35,7 @@ GNC is a GPU-native codec research project (Rust + wgpu/WGSL). It currently work
 
 ---
 
-## M2: Close the Image Compression Gap
+## M2: Close the Image Compression Gap ✅ COMPLETE (2026-02-25)
 
 **Why:** Per-frame compression efficiency is the foundation that temporal coding amplifies. Fixing disabled features and adding context-adaptive entropy closes the 1.5x gap to JPEG 2000.
 

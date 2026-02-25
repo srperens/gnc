@@ -4,7 +4,7 @@ mod buffer_cache;
 pub mod cfl;
 pub mod color;
 pub mod entropy;
-mod entropy_helpers;
+pub(crate) mod entropy_helpers;
 pub mod interleave;
 pub mod motion;
 pub mod pipeline;

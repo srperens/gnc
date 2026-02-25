@@ -8,6 +8,8 @@ use crate::{CodecConfig, EntropyCoder, EntropyData, FrameInfo, GpuContext};
 pub(super) enum EntropyMode {
     Rans,
     SubbandRans,
+    /// Context-adaptive per-subband rANS (2 tables per detail group)
+    SubbandRansCtx,
     Bitplane,
 }
 
@@ -15,6 +17,8 @@ impl EntropyMode {
     pub(super) fn from_config(config: &CodecConfig) -> Self {
         if config.entropy_coder == EntropyCoder::Bitplane {
             EntropyMode::Bitplane
+        } else if config.per_subband_entropy && config.context_adaptive {
+            EntropyMode::SubbandRansCtx
         } else if config.per_subband_entropy {
             EntropyMode::SubbandRans
         } else {
@@ -71,7 +75,7 @@ pub(super) fn encode_entropy(
 }
 
 /// CPU entropy decode for a single plane: reconstruct quantized f32 coefficients from tiles.
-pub(super) fn entropy_decode_plane(
+pub(crate) fn entropy_decode_plane(
     entropy: &EntropyData,
     plane_idx: usize,
     tiles_per_plane: usize,
@@ -92,7 +96,14 @@ pub(super) fn entropy_decode_plane(
         let coeffs: Vec<i32> = match entropy {
             EntropyData::Rans(tiles) => rans::rans_decode_tile_interleaved(&tiles[tile_start + t]),
             EntropyData::SubbandRans(tiles) => {
-                rans::rans_decode_tile_interleaved_subband(&tiles[tile_start + t])
+                let tile = &tiles[tile_start + t];
+                // Detect context-adaptive mode: expanded group count > 1 + num_levels
+                let expected_plain = 1 + tile.num_levels;
+                if tile.num_groups > expected_plain {
+                    rans::rans_decode_tile_interleaved_subband_ctx(tile)
+                } else {
+                    rans::rans_decode_tile_interleaved_subband(tile)
+                }
             }
             EntropyData::Bitplane(tiles) => bitplane::bitplane_decode_tile(&tiles[tile_start + t]),
         };
@@ -134,6 +145,13 @@ pub(super) fn entropy_encode_tiles(
                 }
                 EntropyMode::SubbandRans => {
                     subband_tiles.push(rans::rans_encode_tile_interleaved_subband(
+                        &coeffs,
+                        tile_size_u32,
+                        num_levels,
+                    ));
+                }
+                EntropyMode::SubbandRansCtx => {
+                    subband_tiles.push(rans::rans_encode_tile_interleaved_subband_ctx(
                         &coeffs,
                         tile_size_u32,
                         num_levels,

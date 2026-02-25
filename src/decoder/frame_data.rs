@@ -3,6 +3,7 @@ use wgpu;
 use super::pipeline::DecoderPipeline;
 use crate::encoder::bitplane::GpuBitplaneDecoder;
 use crate::encoder::cfl;
+use crate::encoder::entropy_helpers;
 use crate::encoder::motion::MotionEstimator;
 use crate::encoder::rans_gpu::GpuRansDecoder;
 use crate::gpu_util::ensure_var_buf;
@@ -20,6 +21,9 @@ impl DecoderPipeline {
         let storage_dst = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
 
         // --- Entropy data ---
+        // Reset context-adaptive flag; only SubbandRans with expanded groups sets it true.
+        bufs.ctx_adaptive_decode = false;
+
         match &frame.entropy {
             EntropyData::Rans(tiles) => {
                 for p in 0..3 {
@@ -68,49 +72,74 @@ impl DecoderPipeline {
                 }
             }
             EntropyData::SubbandRans(tiles) => {
-                for p in 0..3 {
-                    let plane_tiles = &tiles[p * tiles_per_plane..(p + 1) * tiles_per_plane];
-                    let packed = GpuRansDecoder::pack_decode_data_subband(plane_tiles, info);
-                    let a_size = (packed.cumfreq.len() * 4) as u64;
-                    let b_size = (packed.stream_data.len() * 4) as u64;
+                // Detect context-adaptive tiles: num_groups > 1 + num_levels
+                let is_ctx_adaptive = tiles.first().is_some_and(|t| t.num_groups > 1 + t.num_levels);
+                bufs.ctx_adaptive_decode = is_ctx_adaptive;
 
-                    ensure_var_buf(
-                        ctx,
-                        &mut bufs.entropy_var_a[p],
-                        &mut bufs.entropy_var_a_cap[p],
-                        a_size,
-                        "dec_entropy_var_a",
-                        storage_dst,
-                    );
-                    ensure_var_buf(
-                        ctx,
-                        &mut bufs.entropy_var_b[p],
-                        &mut bufs.entropy_var_b_cap[p],
-                        b_size,
-                        "dec_entropy_var_b",
-                        storage_dst,
-                    );
+                if is_ctx_adaptive {
+                    // CPU decode for context-adaptive tiles; write decoded f32 coefficients
+                    // directly into cpu_decoded_planes buffers for each plane.
+                    let padded_w = info.padded_width() as usize;
+                    let tile_size = info.tile_size as usize;
+                    for p in 0..3 {
+                        let plane_data = entropy_helpers::entropy_decode_plane(
+                            &frame.entropy,
+                            p,
+                            tiles_per_plane,
+                            tile_size,
+                            padded_w,
+                        );
+                        ctx.queue.write_buffer(
+                            &bufs.cpu_decoded_planes[p],
+                            0,
+                            bytemuck::cast_slice(&plane_data),
+                        );
+                    }
+                } else {
+                    for p in 0..3 {
+                        let plane_tiles = &tiles[p * tiles_per_plane..(p + 1) * tiles_per_plane];
+                        let packed = GpuRansDecoder::pack_decode_data_subband(plane_tiles, info);
+                        let a_size = (packed.cumfreq.len() * 4) as u64;
+                        let b_size = (packed.stream_data.len() * 4) as u64;
 
-                    ctx.queue.write_buffer(
-                        &bufs.entropy_params[p],
-                        0,
-                        bytemuck::bytes_of(&packed.params),
-                    );
-                    ctx.queue.write_buffer(
-                        &bufs.entropy_tile_info[p],
-                        0,
-                        bytemuck::cast_slice(&packed.tile_info),
-                    );
-                    ctx.queue.write_buffer(
-                        &bufs.entropy_var_a[p],
-                        0,
-                        bytemuck::cast_slice(&packed.cumfreq),
-                    );
-                    ctx.queue.write_buffer(
-                        &bufs.entropy_var_b[p],
-                        0,
-                        bytemuck::cast_slice(&packed.stream_data),
-                    );
+                        ensure_var_buf(
+                            ctx,
+                            &mut bufs.entropy_var_a[p],
+                            &mut bufs.entropy_var_a_cap[p],
+                            a_size,
+                            "dec_entropy_var_a",
+                            storage_dst,
+                        );
+                        ensure_var_buf(
+                            ctx,
+                            &mut bufs.entropy_var_b[p],
+                            &mut bufs.entropy_var_b_cap[p],
+                            b_size,
+                            "dec_entropy_var_b",
+                            storage_dst,
+                        );
+
+                        ctx.queue.write_buffer(
+                            &bufs.entropy_params[p],
+                            0,
+                            bytemuck::bytes_of(&packed.params),
+                        );
+                        ctx.queue.write_buffer(
+                            &bufs.entropy_tile_info[p],
+                            0,
+                            bytemuck::cast_slice(&packed.tile_info),
+                        );
+                        ctx.queue.write_buffer(
+                            &bufs.entropy_var_a[p],
+                            0,
+                            bytemuck::cast_slice(&packed.cumfreq),
+                        );
+                        ctx.queue.write_buffer(
+                            &bufs.entropy_var_b[p],
+                            0,
+                            bytemuck::cast_slice(&packed.stream_data),
+                        );
+                    }
                 }
             }
             EntropyData::Bitplane(tiles) => {

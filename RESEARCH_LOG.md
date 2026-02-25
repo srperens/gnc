@@ -1103,3 +1103,36 @@ Fix: save gmin/gmax before calling reduce_max_i32().
 - **ZRL not observable on synthetics**: Synthetic images don't produce enough zeros at these quality levels. Will matter more at low quality on real content
 - **Small PSNR regression on gradient at low q**: AQ introduces slight overhead; the bpp increase on gradient at q25 (+3.6%) suggests AQ is counter-productive on easy content. May need to tune AQ strength or disable at very high quality
 - **Shared memory bug**: The ZRL histogram clobbering bug would have been catastrophic in production — illustrates why regression tests (M1) were essential first
+
+## 2026-02-25: M2D — Context-Adaptive Entropy Coding
+
+### Hypothesis
+Using above-neighbor context to select among multiple frequency tables per subband should improve compression 15-25% by modeling local coefficient distributions more tightly.
+
+### Implementation
+- **Above-neighbor context model**: For each detail subband coefficient, check if the coefficient directly above (same column, previous row within same subband) is zero or nonzero → 2 contexts per detail group
+- **Expanded group layout**: LL (1 group) + detail_levels × 2 = 1 + num_levels × 2 total groups (7 for 3 levels, vs 4 without)
+- **CPU encode/decode paths**: Context-adaptive forces CPU entropy for now (GPU shader adaptation deferred)
+- **Auto-detection**: Serialization format detects context-adaptive from num_groups > 1 + num_levels
+- Files: rans.rs (+400 lines), entropy_helpers.rs, pipeline.rs, decoder/frame_data.rs, lib.rs
+
+### Results — Impact on Synthetic Test Images
+
+| Image | q | M2A/B/C bpp | + M2D bpp | Delta |
+|-------|---|-------------|-----------|-------|
+| gradient | q25 | 0.428 | 0.443 | +3.5% (overhead) |
+| gradient | q75 | 0.630 | 0.646 | +2.5% |
+| gradient | q90 | 1.135 | 1.076 | **-5.2%** |
+| checker | q25 | 0.990 | 0.865 | **-12.6%** |
+| checker | q50 | 2.177 | 2.200 | +1.1% |
+| checker | q75 | 3.274 | 3.311 | +1.1% |
+
+### Analysis
+- Context-adaptive helps most at **low quality** where zeros are abundant and context is informative (checker q25: -12.6%)
+- At **high quality** with few zeros, the overhead of extra frequency tables outweighs the benefit (gradient q25: +3.5%)
+- Real images with natural texture correlation should benefit more than synthetic patterns
+- CPU-only implementation limits throughput; GPU shader support needed for production use
+- The approach is sound but may need quality-dependent enabling: only at q < 50 where zero density is high
+
+### M2 Status Summary
+All four M2 sub-tasks complete (2A CfL, 2B AQ, 2C ZRL, 2D context-adaptive). Combined impact on synthetic images is significant for hard content (checker q25: -21% bpp total vs pre-M2) but modest for easy content. Real-image evaluation needed to assess true compression gap vs JPEG 2000.

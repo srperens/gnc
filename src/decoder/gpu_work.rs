@@ -48,31 +48,43 @@ impl DecoderPipeline {
 
         // Per-plane: entropy decode → dequantize → (CfL inverse predict) → inverse wavelet → copy to result buffer
         for p in 0..3 {
-            match &frame.entropy {
-                EntropyData::Rans(_) | EntropyData::SubbandRans(_) => {
-                    self.rans_decoder.dispatch_decode(
-                        ctx,
-                        &mut cmd,
-                        &bufs.entropy_params[p],
-                        &bufs.entropy_tile_info[p],
-                        &bufs.entropy_var_a[p],
-                        &bufs.entropy_var_b[p],
-                        &bufs.scratch_a,
-                        tiles_per_plane as u32,
-                    );
-                }
-                EntropyData::Bitplane(_) => {
-                    let total_blocks = (tiles_per_plane * blocks_per_tile) as u32;
-                    self.bitplane_decoder.dispatch_decode(
-                        ctx,
-                        &mut cmd,
-                        &bufs.entropy_params[p],
-                        &bufs.entropy_tile_info[p],
-                        &bufs.entropy_var_a[p],
-                        &bufs.entropy_var_b[p],
-                        &bufs.scratch_a,
-                        total_blocks,
-                    );
+            if bufs.ctx_adaptive_decode {
+                // Context-adaptive tiles were CPU-decoded in prepare_frame_data;
+                // copy the already-decoded coefficients into scratch_a.
+                cmd.copy_buffer_to_buffer(
+                    &bufs.cpu_decoded_planes[p],
+                    0,
+                    &bufs.scratch_a,
+                    0,
+                    plane_size,
+                );
+            } else {
+                match &frame.entropy {
+                    EntropyData::Rans(_) | EntropyData::SubbandRans(_) => {
+                        self.rans_decoder.dispatch_decode(
+                            ctx,
+                            &mut cmd,
+                            &bufs.entropy_params[p],
+                            &bufs.entropy_tile_info[p],
+                            &bufs.entropy_var_a[p],
+                            &bufs.entropy_var_b[p],
+                            &bufs.scratch_a,
+                            tiles_per_plane as u32,
+                        );
+                    }
+                    EntropyData::Bitplane(_) => {
+                        let total_blocks = (tiles_per_plane * blocks_per_tile) as u32;
+                        self.bitplane_decoder.dispatch_decode(
+                            ctx,
+                            &mut cmd,
+                            &bufs.entropy_params[p],
+                            &bufs.entropy_tile_info[p],
+                            &bufs.entropy_var_a[p],
+                            &bufs.entropy_var_b[p],
+                            &bufs.scratch_a,
+                            total_blocks,
+                        );
+                    }
                 }
             }
 

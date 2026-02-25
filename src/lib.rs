@@ -195,6 +195,12 @@ pub struct CodecConfig {
     /// Use GPU compute shaders for rANS entropy encoding (default: true).
     /// When false, falls back to CPU entropy encoding.
     pub gpu_entropy_encode: bool,
+    /// Enable context-adaptive entropy coding (2 frequency tables per detail subband).
+    /// When enabled with per_subband_entropy, each detail subband group gets 2 tables:
+    /// one for coefficients whose "above" neighbor (same column, previous row within
+    /// the same subband) is zero, and one for coefficients with nonzero above neighbor.
+    /// Requires per_subband_entropy = true.
+    pub context_adaptive: bool,
 }
 
 impl Default for CodecConfig {
@@ -213,6 +219,7 @@ impl Default for CodecConfig {
             per_subband_entropy: false,
             keyframe_interval: 1,
             gpu_entropy_encode: true,
+            context_adaptive: false,
         }
     }
 }
@@ -361,6 +368,7 @@ pub fn quality_preset(q: u32) -> CodecConfig {
         per_subband_entropy: disc.per_subband,
         adaptive_quantization: aq_enabled,
         aq_strength,
+        context_adaptive: disc.per_subband,
         ..Default::default()
     }
 }

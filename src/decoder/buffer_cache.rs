@@ -75,6 +75,12 @@ pub(super) struct CachedBuffers {
     pub(super) plane_alpha_bufs: [wgpu::Buffer; 2],
     pub(super) plane_alpha_cap: u64,
 
+    /// When true, entropy decoding was done on CPU (context-adaptive mode).
+    /// `encode_gpu_work` should copy from `cpu_decoded_planes` instead of GPU decode.
+    pub(super) ctx_adaptive_decode: bool,
+    /// Per-plane CPU-decoded coefficient buffers (used for context-adaptive decode).
+    pub(super) cpu_decoded_planes: [wgpu::Buffer; 3],
+
     // Conditional per-frame uploads
     pub(super) weight_map_buf: wgpu::Buffer,
     pub(super) weight_map_cap: u64,
@@ -400,6 +406,17 @@ impl CachedBuffers {
             cfl_alpha_cap,
             plane_alpha_bufs,
             plane_alpha_cap,
+            ctx_adaptive_decode: false,
+            cpu_decoded_planes: std::array::from_fn(|i| {
+                ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(["dec_cpu_plane0", "dec_cpu_plane1", "dec_cpu_plane2"][i]),
+                    size: plane_size.max(4),
+                    usage: wgpu::BufferUsages::STORAGE
+                        | wgpu::BufferUsages::COPY_DST
+                        | wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: false,
+                })
+            }),
             weight_map_buf,
             weight_map_cap,
             mv_buf,

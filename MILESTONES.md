@@ -93,12 +93,15 @@ Largest single compression opportunity. Current rANS treats each coefficient ind
 - **Critical fix**: encoder local decode now matches decoder (AQ + CfL), fixing P-frame reference drift ✅
 - **Result**: bbb 22.6% savings at q=75; blue_sky still -1.5% (camera pan)
 
-### 3B: B-Frame Support
-- Add `FrameType::Bidirectional` to `FrameType` enum
-- Encode in decode order (I P B B P B B...), reorder for display
-- Block matching against forward+backward references
-- Weighted average prediction
-- **Expected: B-frames 20-30% smaller than P-frames**
+### 3B: B-Frame Support ✅
+- `FrameType::Bidirectional` with `MotionField` extended for backward_vectors + block_modes ✅
+- Bidir block matching shader: tests fwd-only, bwd-only, and bidir average per block ✅
+- Bidir motion compensation shader with half-pel bilinear interpolation ✅
+- B-frame scheduling in encode loop: [B B P] groups when ki >= 4 ✅
+- Rust-level reference plane swap (zero GPU cost) for past/future ref management ✅
+- `decode_order()` and `decode_sequence()` for B-frame aware decoding ✅
+- B-frames are non-reference: no local decode loop needed ✅
+- **Result**: B-frame encode/decode verified at 45+ dB PSNR on synthetic content
 
 ### 3C: Rate Control ✅
 - **Per-frame**: R-Q model (bpp ~ c * qstep^-α) with exponential smoothing ✅

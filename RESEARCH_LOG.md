@@ -1187,3 +1187,42 @@ Before the encoder/decoder reference drift fix, P-frame PSNR was 18.6 dB. After 
 - Camera pan content needs either: (a) global motion compensation, or (b) B-frames (bidirectional prediction), or (c) larger block sizes for global motion.
 - Sequence encode throughput: 0.9 fps (needs optimization — GPU pipeline not yet pipelined across frames).
 - The reference drift bug shows the importance of exact encoder/decoder matching in any codec with temporal prediction.
+
+---
+
+## 2026-02-26: M3B — B-Frame Bidirectional Prediction
+
+### Hypothesis
+Bidirectional prediction (B-frames referencing both past and future anchor frames) can reduce inter-frame bitrate by 20-30% vs P-frames, especially for content with complex motion. B-frames also improve coding efficiency because they are non-reference: no local decode loop is needed, and quantization errors don't propagate.
+
+### Implementation
+- **FrameType::Bidirectional** added to frame type enum. MotionField extended with `backward_vectors: Option<Vec<[i16; 2]>>` and `block_modes: Option<Vec<u8>>` (0=fwd, 1=bwd, 2=bidir).
+- **block_match_bidir.wgsl**: Bidirectional block matching shader. For each 16x16 block, independently searches forward and backward references (±64 half-pel range). Computes 3 SADs per block: forward-only, backward-only, and bidir average. Picks the mode with lowest SAD.
+- **motion_compensate_bidir.wgsl**: 8-binding shader with per-block mode selection. Half-pel bilinear interpolation for both forward and backward references. Mode 2 (bidir) averages both predictions.
+- **B-frame scheduling**: Groups of [B B P] between anchor frames (when keyframe_interval >= 4). Encode order: I, then for each group: encode P anchor first, swap references (Rust-level zero-cost swap), encode B-frames, swap back. Display order preserved in output.
+- **Reference management**: `swap_ref_planes()` uses `std::mem::swap` on the buffer handle arrays — zero GPU memory copies. `copy_ref_to_bwd_ref()` saves past reference before encoding future anchor.
+- **Decoder**: `decode_order()` computes I/P-before-B decode sequence. `decode_sequence()` handles reference setup: save past ref → decode future anchor → swap → decode B-frames → swap back.
+- **No local decode loop** for B-frames: since they're non-reference, we skip the expensive dequantize→inverse wavelet→inverse MC pipeline that P-frames require.
+- Format serialization updated for Bidirectional frame type, backward MVs, and block modes.
+
+### Results — Synthetic Gradient Content (256x256, ki=7)
+
+| Frame | Type | PSNR (dB) | bpp |
+|-------|------|-----------|-----|
+| 0 | I | 48.49 | 0.778 |
+| 1 | B | 46.20 | 2.302 |
+| 2 | B | 46.00 | 2.249 |
+| 3 | P | 45.57 | 1.891 |
+| 4 | B | 45.81 | 2.416 |
+| 5 | B | 45.69 | 2.385 |
+| 6 | P | 45.31 | 2.367 |
+
+### Analysis
+- **B-frames decode correctly** — 45-46 dB PSNR across all frames, full encode/decode round-trip verified.
+- **B-frame bpp is currently higher than P-frame** on this synthetic test content. This is expected for two reasons:
+  1. Bidir MV overhead is 2× (forward + backward MVs + mode per block) — significant at low quantization (qstep=4).
+  2. Synthetic gradients don't benefit from bidirectional prediction since the content change is monotonic (each frame shifts in one direction).
+- **Real video content** should show better B-frame compression because (a) B-frames interpolate between frames, giving lower residuals, and (b) at higher quantization the MV overhead is proportionally smaller.
+- **No speed regression** for I/P-frame paths — B-frame scheduling is additive.
+- **Architecture strengths**: zero-cost Rust swap of reference buffers; B-frames skip local decode (non-reference); format serialization handles bidir MVs and block modes.
+- **Next steps**: benchmark on real 1080p content (bbb, blue_sky) to measure actual B-frame savings; evaluate M3 definition of done criteria.

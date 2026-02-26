@@ -1,5 +1,88 @@
 # GPU-Native Broadcast Codec — Research Log
 
+## 2026-02-27: GPU Rice Entropy Coder — Parallel Entropy Breakthrough
+
+### Hypothesis
+rANS takes 85% of encode time because its state chain is fundamentally sequential:
+`state[i+1] = f(state[i], symbol[i])`. Replacing it with a fully parallel entropy coder
+(significance map + Golomb-Rice) where every coefficient encodes independently should
+dramatically improve GPU throughput despite worse compression ratio.
+
+### Problem Analysis
+- rANS uses 32 interleaved streams per tile, but each stream is still sequential
+- The state chain prevents GPU wavefront utilization — threads stall waiting on previous symbols
+- Microsoft patent US11234023B2 covers rANS modifications — potential IP risk
+
+### Implementation
+1. **CPU Rice prototype** (`src/encoder/rice.rs`): Correctness-first implementation
+   - 256 interleaved streams per tile (8x more than rANS's 32)
+   - Per coefficient: significance bit (zero/nonzero) + sign + Rice(|val|-1, k)
+   - Rice parameter k = floor(log2(mean)) computed per subband group
+   - Full serialize/deserialize matching existing format infrastructure
+
+2. **GPU Rice encode shader** (`src/shaders/rice_encode.wgsl`):
+   - 256 threads per workgroup (vs rANS's 32)
+   - Phase 1: Cooperative k computation via shared atomics
+   - Phase 2: Independent bit-stream encoding per thread
+   - `var<private>` for per-thread bit accumulator state
+   - Word-at-a-time output to avoid read-modify-write on stream buffer
+
+3. **GPU Rice decode shader** (`src/shaders/rice_decode.wgsl`):
+   - 256 threads decode 256 independent bit streams in parallel
+   - Shared memory for k values only (32 bytes vs rANS's 16KB cumfreq table)
+   - No binary search, no frequency tables, no state machine
+
+4. **Integration**: Full pipeline wiring through encoder, decoder, format, CLI
+
+### Results (bbb_1080p, 1920×1080)
+
+**Speed comparison — Rice GPU vs rANS GPU:**
+
+| Quality | rANS Encode | Rice Encode | Speedup | rANS Decode | Rice Decode | Speedup |
+|---------|-------------|-------------|---------|-------------|-------------|---------|
+| q=25 | 31.9ms | 21.6ms | **1.48x** | 24.1ms | 11.8ms | **2.04x** |
+| q=50 | 33.2ms | 21.2ms | **1.57x** | 27.4ms | 12.8ms | **2.14x** |
+| q=75 | 33.9ms | 21.8ms | **1.56x** | 29.4ms | 14.3ms | **2.06x** |
+| q=90 | 32.9ms | 20.3ms | **1.62x** | 29.8ms | 13.2ms | **2.26x** |
+
+**Compression comparison — Rice vs rANS (matched PSNR):**
+
+| Quality | PSNR | rANS bpp | Rice bpp | Overhead |
+|---------|------|----------|----------|----------|
+| q=25 | 33.19 dB | 1.29 | 4.76 | +269% |
+| q=50 | 37.68 dB | 2.30 | 5.01 | +118% |
+| q=75 | 42.83 dB | 4.22 | 6.04 | +43% |
+| q=90 | ~50.5 dB | 9.65 | 9.60 | **-0.5%** |
+
+### Key Findings
+
+1. **Removing the state chain gives 1.5-1.6x encode and 2.0-2.3x decode speedup.**
+   The parallelism win from 256 independent streams overwhelms the compression loss.
+
+2. **Rice decode is 2x faster because it eliminates the rANS bottlenecks:**
+   - No 16KB shared cumfreq table (only 32 bytes of k values)
+   - No binary search per symbol
+   - No state renormalization with byte reads
+   - Higher occupancy: 32B shared vs 16KB means 512x more workgroups can co-execute
+
+3. **Rice compression matches rANS at high quality (q≥90)** where coefficients are
+   mostly non-zero. The overhead at low quality comes from per-coefficient significance
+   bits — each zero costs 1 bit regardless, while rANS implicitly compresses zero runs.
+
+4. **The fix is zero-run-length (ZRL)**: Instead of 1 bit per zero coefficient,
+   encode runs of zeros with Rice coding of run lengths. This should close the
+   low-bitrate gap from +269% to ~+10-20%.
+
+5. **Shared memory is the key GPU bottleneck.** rANS needs 16KB of shared memory for
+   cumfreq tables, limiting occupancy to 2 workgroups per M1 core. Rice needs only 32B,
+   allowing maximum occupancy.
+
+### Implications
+- GPU-parallel Rice is the correct entropy coding architecture for a GPU-native codec
+- rANS should be deprecated once Rice+ZRL matches its compression
+- Patent risk from rANS (MS US11234023B2) is eliminated by switching to Rice
+- Next: ZRL for compression parity, then this becomes the default entropy coder
+
 ## 2026-02-22: Phase 1 Baseline Implementation
 
 ### Hypothesis

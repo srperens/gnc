@@ -227,9 +227,12 @@ Largest single compression opportunity. Current rANS treats each coefficient ind
 - Fused quantize+histogram (single read of coefficients)
 - **Result**: encode 124ms → 34ms (29→30 fps), no quality regression
 
-### 6B: 4K Validation
-- Benchmark 3840x2160 content
-- Per-pixel throughput within 25% of 1080p
+### 6B: 4K Validation ✅
+- Benchmark 3840x2160 content ✅
+- Per-pixel throughput within 25% of 1080p ✅
+- **Result**: 4K is 34-71% *faster* per pixel than 1080p (better GPU occupancy)
+  - 4K encode: 101ms (82 MP/s) vs 1080p: 34ms (61 MP/s)
+  - 4K decode: 70ms (118 MP/s) vs 1080p: 30ms (69 MP/s)
 
 ### 6C: Multi-Frame Pipelining
 - Pipeline frame N+1's color+wavelet while frame N's entropy runs

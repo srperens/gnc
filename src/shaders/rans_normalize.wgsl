@@ -35,6 +35,7 @@ struct Params {
 // Shared memory for normalization
 var<workgroup> shared_freq: array<u32, 4096>;
 var<workgroup> shared_sum: array<u32, 256>;
+var<workgroup> shared_max_idx: array<u32, 256>;  // for parallel max-reduction
 var<workgroup> w_total: u32;
 var<workgroup> w_assigned: u32;
 var<workgroup> w_max_idx: u32;
@@ -106,25 +107,45 @@ fn normalize_inplace(lid: u32, asize: u32) {
         workgroupBarrier();
     }
 
-    // --- Step 4: adjust largest entry to hit exact target ---
+    // Save assigned sum before shared_sum is reused for max-reduction
     if (lid == 0u) {
-        let assigned = shared_sum[0];
+        w_assigned = shared_sum[0];
+    }
+    workgroupBarrier();
 
-        // Find the max entry
-        var max_val = 0u;
-        var max_i = 0u;
-        for (var i = 0u; i < asize; i++) {
-            if (shared_freq[i] > max_val) {
-                max_val = shared_freq[i];
-                max_i = i;
+    // --- Step 4: find max entry via parallel reduction, then adjust ---
+    // Each thread finds its local max across its strided elements
+    var local_max_val = 0u;
+    var local_max_idx = 0u;
+    for (var i = lid; i < asize; i += WG_SIZE) {
+        if (shared_freq[i] > local_max_val) {
+            local_max_val = shared_freq[i];
+            local_max_idx = i;
+        }
+    }
+    shared_sum[lid] = local_max_val;
+    shared_max_idx[lid] = local_max_idx;
+    workgroupBarrier();
+
+    // Tree reduction for argmax
+    for (var stride = WG_SIZE / 2u; stride > 0u; stride = stride >> 1u) {
+        if (lid < stride) {
+            if (shared_sum[lid + stride] > shared_sum[lid]) {
+                shared_sum[lid] = shared_sum[lid + stride];
+                shared_max_idx[lid] = shared_max_idx[lid + stride];
             }
         }
+        workgroupBarrier();
+    }
+
+    // Thread 0 applies the deficit/surplus adjustment
+    if (lid == 0u) {
+        let assigned = w_assigned;
+        let max_i = shared_max_idx[0];
 
         if (assigned < RANS_M) {
-            // Deficit — add to the largest entry
             shared_freq[max_i] += RANS_M - assigned;
         } else if (assigned > RANS_M) {
-            // Surplus — subtract from largest, keeping >= 1
             var surplus = assigned - RANS_M;
             if (shared_freq[max_i] > surplus + 1u) {
                 shared_freq[max_i] -= surplus;

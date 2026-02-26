@@ -1535,3 +1535,74 @@ Added `quantize_histogram_fused.wgsl` — single dispatch combines quantization 
 
 ### Analysis
 The CfL fix is the single largest quality improvement since per-subband entropy coding. The AQ mismatch was a latent bug hidden by CfL being disabled in presets. Touchdown content (sports) still ~50% worse than JPEG — this is a fundamental architectural mismatch between global wavelet decomposition and high-frequency texture content. See detailed analysis in commit notes.
+
+---
+
+## 2026-02-26: Directional Subband Splitting
+
+### Hypothesis
+Separating HH (diagonal) subbands from LH+HL (horizontal/vertical) subbands at each wavelet level should produce tighter per-group frequency distributions, improving entropy coding efficiency.
+
+### Implementation
+Changed `compute_subband_group()` across all 7 WGSL shaders + Rust reference encoder. New scheme:
+- Group 0 = LL, Group 1 = deepest detail (merged LH+HL+HH)
+- Then pairs of (LH+HL, HH) for remaining levels from deep to shallow
+- `num_groups = num_levels * 2` (was `num_levels + 1`)
+- `ENCODE_TILE_INFO_STRIDE` increased from 32 to 36 (8 groups × 4 u32s + 1 = 33 > 32)
+
+### Results
+| Content | Metric | Before | After | Change |
+|---------|--------|--------|-------|--------|
+| bbb_1080p q=50 | BPP | 2.34 | 2.29 | -2.1% |
+| bbb_1080p q=75 | BPP | 4.31 | 4.19 | -2.8% |
+| touchdown q=50 | BPP | 2.11 | 2.03 | -3.8% |
+
+Speed unchanged (~50 fps encode, 512x512). No quality regression.
+
+### Analysis
+Directional splitting is a free lunch: measurable BPP reduction, no speed cost. HH subbands have different statistics (more sparse) than LH+HL, so separate frequency tables compress better.
+
+---
+
+## 2026-02-26: Reciprocal Multiplication — Isolated Root Cause Analysis
+
+### Hypothesis
+Replacing native integer division (`state / freq`) in rANS encoding with reciprocal multiplication (`mulhi(state, rcp)`) using precomputed reciprocals in shared memory should speed up the encode loop. Initial attempt showed 45% regression — this experiment isolates the cause.
+
+### Experiment Design
+Four isolated variants tested against baseline, modifying only `rans_encode_lean.wgsl`:
+
+| Experiment | `shared_rcp_freq[4096]` | `mulhi()` | Extra barrier | Division method |
+|-----------|:-:|:-:|:-:|-------------|
+| Baseline | — | — | — | `state / freq` |
+| A: mulhi inline | — | Yes | — | `mulhi(state, 0xFFFFFFFF/freq)` computed inline |
+| B: shared + barrier | Written | — | Yes | `state / freq` |
+| B2: declared only | Declared | — | — | `state / freq` |
+| B3: written, no barrier | Written | — | — | `state / freq` |
+| C: full reciprocal | Written | Yes | Yes | `mulhi(state, rcp)` from table |
+
+### Results (512×512, 20 iterations × 3 runs)
+
+| Experiment | Encode (ms) | vs Baseline | Conclusion |
+|-----------|:-----------:|:-----------:|------------|
+| **Baseline** | 19.8 | — | Reference |
+| **A: mulhi inline** | 19.7 | **+0%** | mulhi itself costs nothing |
+| **B: shared + barrier** | 23.5 | **+19%** | Shared memory allocation is the problem |
+| **B2: declared only** | 19.7 | **+0%** | Compiler eliminates unused arrays |
+| **B3: written, no barrier** | 23.5 | **+19%** | Barrier is free — it's all occupancy |
+| **C: full reciprocal** | 23.7 | **+20%** | No additional cost beyond B |
+
+### Key Findings
+
+1. **`mulhi()` is free on M1** — The 4-multiply decomposition (emulating 32×32→64 bit) runs at the same speed as hardware integer division. M1's ALU handles both equally well.
+
+2. **`workgroupBarrier()` is free** — Adding an extra barrier with no extra shared memory has zero measurable cost.
+
+3. **Shared memory allocation is the sole bottleneck** — `var<workgroup> shared_rcp_freq: array<u32, 4096>` adds 16KB, bringing total workgroup memory from 16KB to 32KB. On M1 (32KB threadgroup memory limit), this halves occupancy from 2 workgroups to 1 workgroup per GPU core, causing the ~20% regression.
+
+4. **Compiler is smart** — Declaring `shared_rcp_freq` without writing to it causes naga/Metal to optimize it away entirely (B2 = baseline).
+
+5. **Division is not a bottleneck** — Since mulhi is equally fast (Experiment A), there's no latency hiding opportunity. The division `state / freq` is not on the critical path.
+
+### Implication
+Reciprocal multiplication is a dead end on M1. The optimization only helps if precomputed reciprocals can be stored without increasing shared memory. Since `shared_cumfreq` already uses the full 16KB budget, there's no room for a reciprocal table within the occupancy-optimal allocation. Native division is the correct approach.

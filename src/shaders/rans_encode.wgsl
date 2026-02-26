@@ -50,6 +50,10 @@ struct Params {
 // Shared cumfreq table for the current tile (loaded cooperatively)
 var<workgroup> shared_cumfreq: array<u32, 4096>;
 
+// --- EXPERIMENTAL: reciprocal multiplication (commented out — 45% slower on M1,
+//     root cause not fully isolated: occupancy loss? mulhi cost? extra barrier?)
+// var<workgroup> shared_rcp_freq: array<u32, 4096>;
+
 // Write one byte into the packed u32 output array.
 // Each stream writes to its own non-overlapping region, so no atomics needed.
 // Buffer must be zero-initialized; we use OR to set individual bytes within u32 words.
@@ -58,6 +62,28 @@ fn write_byte(byte_offset: u32, value: u32) {
     let byte_pos = byte_offset & 3u;
     stream_output[word_idx] = stream_output[word_idx] | ((value & 0xFFu) << (byte_pos * 8u));
 }
+
+// --- EXPERIMENTAL: reciprocal multiplication helpers (commented out)
+// fn mulhi(a: u32, b: u32) -> u32 {
+//     let a_lo = a & 0xFFFFu;
+//     let a_hi = a >> 16u;
+//     let b_lo = b & 0xFFFFu;
+//     let b_hi = b >> 16u;
+//     let t = a_lo * b_hi + ((a_lo * b_lo) >> 16u);
+//     let w = a_hi * b_lo + (t & 0xFFFFu);
+//     return a_hi * b_hi + (t >> 16u) + (w >> 16u);
+// }
+//
+// fn compute_reciprocals(thread_id: u32, start_idx: u32, count: u32) {
+//     for (var i = thread_id; i < count; i += STREAMS_PER_TILE) {
+//         let f = shared_cumfreq[start_idx + i + 1u] - shared_cumfreq[start_idx + i];
+//         if (f > 1u) {
+//             shared_rcp_freq[start_idx + i] = 0xFFFFFFFFu / f;
+//         } else {
+//             shared_rcp_freq[start_idx + i] = 0xFFFFFFFFu;
+//         }
+//     }
+// }
 
 // Directional subband grouping: separates HH from LH+HL at each level.
 // Group 0 = LL, Group 1 = deepest detail (merged), then pairs of (LH+HL, HH)
@@ -99,10 +125,31 @@ fn rans_encode_sym(
         state >>= 8u;
     }
 
-    // Encode
     state = ((state / freq) << RANS_PRECISION) + (state % freq) + start;
     return vec2<u32>(state, write_ptr);
 }
+
+// --- EXPERIMENTAL: reciprocal-based rans_encode_sym (commented out)
+// fn rans_encode_sym_rcp(
+//     state_in: u32, write_ptr_in: u32,
+//     stream_base_byte: u32,
+//     start: u32, freq: u32, rcp: u32
+// ) -> vec2<u32> {
+//     var state = state_in;
+//     var write_ptr = write_ptr_in;
+//     let x_max = ((RANS_BYTE_L >> RANS_PRECISION) << 8u) * freq;
+//     for (var r = 0u; r < 4u; r++) {
+//         if (state < x_max) { break; }
+//         write_ptr -= 1u;
+//         write_byte(stream_base_byte + write_ptr, state & 0xFFu);
+//         state >>= 8u;
+//     }
+//     var q = mulhi(state, rcp);
+//     var rem = state - q * freq;
+//     if (rem >= freq) { q += 1u; rem -= freq; }
+//     state = (q << RANS_PRECISION) + rem + start;
+//     return vec2<u32>(state, write_ptr);
+// }
 
 @compute @workgroup_size(32)
 fn main(

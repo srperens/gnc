@@ -1,6 +1,39 @@
 use crate::encoder::{bitplane, rans};
 use crate::FrameType;
 
+// ---- CRC-32 (ISO 3309 / ITU-T V.42, same as zlib/gzip/PNG) ----
+
+/// CRC-32 lookup table (polynomial 0xEDB88320, reflected).
+const CRC32_TABLE: [u32; 256] = {
+    let mut table = [0u32; 256];
+    let mut i = 0u32;
+    while i < 256 {
+        let mut crc = i;
+        let mut j = 0;
+        while j < 8 {
+            if crc & 1 != 0 {
+                crc = (crc >> 1) ^ 0xEDB88320;
+            } else {
+                crc >>= 1;
+            }
+            j += 1;
+        }
+        table[i as usize] = crc;
+        i += 1;
+    }
+    table
+};
+
+/// Compute CRC-32 checksum over a byte slice.
+pub fn crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &byte in data {
+        let index = ((crc ^ byte as u32) & 0xFF) as usize;
+        crc = (crc >> 8) ^ CRC32_TABLE[index];
+    }
+    crc ^ 0xFFFF_FFFF
+}
+
 // ---- GNV1 Sequence Container Format ----
 //
 // File layout:
@@ -20,7 +53,7 @@ use crate::FrameType;
 //     pts: u64 LE               (presentation timestamp, frame number)
 //
 //   Frame Data:
-//     [frame 0 GP10 data] [frame 1 GP10 data] ... [frame N-1 GP10 data]
+//     [frame 0 GP11 data] [frame 1 GP11 data] ... [frame N-1 GP11 data]
 
 const GNV1_MAGIC: &[u8; 4] = b"GNV1";
 const GNV1_VERSION: u32 = 1;
@@ -73,7 +106,7 @@ impl SequenceHeader {
 
 /// Serialize a sequence of CompressedFrames into the GNV1 container format.
 ///
-/// Each frame is serialized using the existing GP10 format and wrapped in
+/// Each frame is serialized using the GP11 format and wrapped in
 /// a container with a file header and frame index table for random access.
 pub fn serialize_sequence(frames: &[crate::CompressedFrame], framerate: (u32, u32)) -> Vec<u8> {
     assert!(!frames.is_empty(), "Cannot serialize empty sequence");
@@ -249,12 +282,8 @@ pub fn seek_to_keyframe(header: &SequenceHeader, target_pts: u64) -> usize {
     0
 }
 
-/// Serialize a CompressedFrame to the GP10 binary format.
-/// GP10 format supports temporal coding (frame_type + motion vectors).
-pub fn serialize_compressed(frame: &crate::CompressedFrame) -> Vec<u8> {
-    let mut out = Vec::new();
-    // Header
-    out.extend_from_slice(b"GP10"); // version 10 = temporal coding
+/// Serialize frame header fields common to GP10 and GP11.
+fn serialize_frame_header(frame: &crate::CompressedFrame, out: &mut Vec<u8>) {
     out.extend_from_slice(&frame.info.width.to_le_bytes());
     out.extend_from_slice(&frame.info.height.to_le_bytes());
     out.extend_from_slice(&frame.info.bit_depth.to_le_bytes());
@@ -269,12 +298,7 @@ pub fn serialize_compressed(frame: &crate::CompressedFrame) -> Vec<u8> {
     };
     out.push(wavelet_byte);
     // Per-subband entropy: 0 = off, 1 = on
-    let per_subband_byte: u8 = if frame.config.per_subband_entropy {
-        1
-    } else {
-        0
-    };
-    out.push(per_subband_byte);
+    out.push(u8::from(frame.config.per_subband_entropy));
     // Subband weights: ll, num_detail_levels, per-level [LH, HL, HH], chroma_weight
     let sw = &frame.config.subband_weights;
     out.extend_from_slice(&sw.ll.to_le_bytes());
@@ -287,7 +311,7 @@ pub fn serialize_compressed(frame: &crate::CompressedFrame) -> Vec<u8> {
     }
     out.extend_from_slice(&sw.chroma_weight.to_le_bytes());
     // CfL alpha side info
-    let cfl_enabled: u8 = if frame.cfl_alphas.is_some() { 1 } else { 0 };
+    let cfl_enabled: u8 = u8::from(frame.cfl_alphas.is_some());
     out.push(cfl_enabled);
     if let Some(ref cfl) = frame.cfl_alphas {
         out.extend_from_slice(&cfl.num_subbands.to_le_bytes());
@@ -295,17 +319,12 @@ pub fn serialize_compressed(frame: &crate::CompressedFrame) -> Vec<u8> {
         let tiles_y = frame.info.height.div_ceil(frame.info.tile_size);
         let num_cfl_tiles = tiles_x * tiles_y;
         out.extend_from_slice(&num_cfl_tiles.to_le_bytes());
-        // CfL alphas stored as i16 LE (2 bytes each)
         for &a in &cfl.alphas {
             out.extend_from_slice(&a.to_le_bytes());
         }
     }
     // Adaptive quantization config + weight map
-    let aq_flag: u32 = if frame.config.adaptive_quantization {
-        1
-    } else {
-        0
-    };
+    let aq_flag: u32 = u32::from(frame.config.adaptive_quantization);
     out.extend_from_slice(&aq_flag.to_le_bytes());
     out.extend_from_slice(&frame.config.aq_strength.to_le_bytes());
     if let Some(ref wm) = frame.weight_map {
@@ -324,14 +343,62 @@ pub fn serialize_compressed(frame: &crate::CompressedFrame) -> Vec<u8> {
         crate::FrameType::Bidirectional => 2,
     };
     out.push(frame_type_byte);
-    // Motion field (only for P-frames)
+}
+
+/// Serialize tile data blobs from entropy data.
+fn serialize_tile_blobs(entropy: &crate::EntropyData) -> Vec<Vec<u8>> {
+    match entropy {
+        crate::EntropyData::Rans(tiles) => {
+            tiles.iter().map(rans::serialize_tile_interleaved).collect()
+        }
+        crate::EntropyData::SubbandRans(tiles) => {
+            tiles.iter().map(rans::serialize_tile_subband).collect()
+        }
+        crate::EntropyData::Bitplane(tiles) => {
+            tiles.iter().map(bitplane::serialize_tile_bitplane).collect()
+        }
+    }
+}
+
+/// Serialize a CompressedFrame to the GP11 binary format.
+///
+/// GP11 adds over GP10:
+/// - Per-tile CRC-32 checksums for error detection
+/// - Tile index table (sizes + CRCs) for random tile access
+/// - Full B-frame motion serialization (backward vectors + block modes)
+pub fn serialize_compressed(frame: &crate::CompressedFrame) -> Vec<u8> {
+    let mut out = Vec::new();
+    // Magic: GP11
+    out.extend_from_slice(b"GP11");
+    // Common header fields
+    serialize_frame_header(frame, &mut out);
+    // Motion field — GP11 serializes full motion for P and B frames
     if let Some(ref mf) = frame.motion_field {
         out.extend_from_slice(&(mf.block_size as u16).to_le_bytes());
         let num_blocks = mf.vectors.len() as u32;
         out.extend_from_slice(&num_blocks.to_le_bytes());
+        // Forward motion vectors
         for mv in &mf.vectors {
             out.extend_from_slice(&mv[0].to_le_bytes());
             out.extend_from_slice(&mv[1].to_le_bytes());
+        }
+        // B-frame backward vectors + block modes (GP11 extension)
+        if frame.frame_type == crate::FrameType::Bidirectional {
+            if let Some(ref bwd) = mf.backward_vectors {
+                out.extend_from_slice(&(bwd.len() as u32).to_le_bytes());
+                for mv in bwd {
+                    out.extend_from_slice(&mv[0].to_le_bytes());
+                    out.extend_from_slice(&mv[1].to_le_bytes());
+                }
+            } else {
+                out.extend_from_slice(&0u32.to_le_bytes());
+            }
+            if let Some(ref modes) = mf.block_modes {
+                out.extend_from_slice(&(modes.len() as u32).to_le_bytes());
+                out.extend_from_slice(modes);
+            } else {
+                out.extend_from_slice(&0u32.to_le_bytes());
+            }
         }
     }
     // Entropy coder type: 0 = rANS, 1 = bitplane, 2 = per-subband rANS
@@ -341,47 +408,173 @@ pub fn serialize_compressed(frame: &crate::CompressedFrame) -> Vec<u8> {
         crate::EntropyData::Bitplane(_) => 1,
     };
     out.extend_from_slice(&entropy_type.to_le_bytes());
-    // Tile data
-    match &frame.entropy {
-        crate::EntropyData::Rans(tiles) => {
-            let num_tiles = tiles.len() as u32;
-            out.extend_from_slice(&num_tiles.to_le_bytes());
-            for tile in tiles {
-                let tile_bytes = rans::serialize_tile_interleaved(tile);
-                out.extend_from_slice(&tile_bytes);
-            }
-        }
-        crate::EntropyData::SubbandRans(tiles) => {
-            let num_tiles = tiles.len() as u32;
-            out.extend_from_slice(&num_tiles.to_le_bytes());
-            for tile in tiles {
-                let tile_bytes = rans::serialize_tile_subband(tile);
-                out.extend_from_slice(&tile_bytes);
-            }
-        }
-        crate::EntropyData::Bitplane(tiles) => {
-            let num_tiles = tiles.len() as u32;
-            out.extend_from_slice(&num_tiles.to_le_bytes());
-            for tile in tiles {
-                let tile_bytes = bitplane::serialize_tile_bitplane(tile);
-                out.extend_from_slice(&tile_bytes);
-            }
-        }
+    // Serialize each tile to bytes, compute CRC-32
+    let tile_blobs = serialize_tile_blobs(&frame.entropy);
+    let num_tiles = tile_blobs.len() as u32;
+    out.extend_from_slice(&num_tiles.to_le_bytes());
+    // Tile index table: [size: u32, crc32: u32] × num_tiles
+    for blob in &tile_blobs {
+        out.extend_from_slice(&(blob.len() as u32).to_le_bytes());
+        out.extend_from_slice(&crc32(blob).to_le_bytes());
+    }
+    // Tile data (concatenated, sizes from index)
+    for blob in &tile_blobs {
+        out.extend_from_slice(blob);
     }
     out
 }
 
-/// Deserialize a CompressedFrame from the GP10/GPC9/GPC8 binary format.
+/// Tile CRC validation result returned by GP11 deserialization.
+#[derive(Debug, Clone)]
+pub struct TileCrcResult {
+    /// Index of the tile
+    pub tile_index: usize,
+    /// Expected CRC from the bitstream
+    pub expected: u32,
+    /// Actual CRC computed from tile data
+    pub actual: u32,
+}
+
+impl TileCrcResult {
+    pub fn is_valid(&self) -> bool {
+        self.expected == self.actual
+    }
+}
+
+/// Result of deserializing a GP11 frame with CRC validation.
+#[derive(Debug, Clone)]
+pub struct DeserializeResult {
+    pub frame: crate::CompressedFrame,
+    /// Per-tile CRC validation (empty for GP10/GPC9/GPC8 which have no CRCs)
+    pub tile_crcs: Vec<TileCrcResult>,
+}
+
+impl DeserializeResult {
+    /// Returns indices of tiles that failed CRC validation.
+    pub fn corrupt_tiles(&self) -> Vec<usize> {
+        self.tile_crcs
+            .iter()
+            .filter(|c| !c.is_valid())
+            .map(|c| c.tile_index)
+            .collect()
+    }
+
+    /// True if all tile CRCs are valid (or no CRCs present).
+    pub fn all_valid(&self) -> bool {
+        self.tile_crcs.iter().all(|c| c.is_valid())
+    }
+
+    /// Replace corrupt tiles with zero-data tiles (decode to mid-gray).
+    /// Returns the list of tile indices that were substituted.
+    pub fn substitute_corrupt_tiles(&mut self) -> Vec<usize> {
+        let corrupt = self.corrupt_tiles();
+        if corrupt.is_empty() {
+            return corrupt;
+        }
+        substitute_tiles(&mut self.frame, &corrupt);
+        corrupt
+    }
+}
+
+/// Replace specified tile indices with trivial zero tiles in-place.
+/// Zero tiles decode to zero-valued coefficients, which produce mid-gray
+/// after inverse wavelet and inverse color conversion.
+pub fn substitute_tiles(frame: &mut crate::CompressedFrame, tile_indices: &[usize]) {
+    for &idx in tile_indices {
+        match &mut frame.entropy {
+            crate::EntropyData::Rans(ref mut tiles) => {
+                if idx < tiles.len() {
+                    tiles[idx] = make_zero_interleaved_tile(tiles[idx].num_coefficients);
+                }
+            }
+            crate::EntropyData::SubbandRans(ref mut tiles) => {
+                if idx < tiles.len() {
+                    let t = &tiles[idx];
+                    tiles[idx] = make_zero_subband_tile(
+                        t.num_coefficients,
+                        t.tile_size,
+                        t.num_levels,
+                    );
+                }
+            }
+            crate::EntropyData::Bitplane(ref mut tiles) => {
+                if idx < tiles.len() {
+                    let t = &tiles[idx];
+                    tiles[idx] = crate::encoder::bitplane::BitplaneTile {
+                        num_coefficients: t.num_coefficients,
+                        tile_size: t.tile_size,
+                        block_offsets: vec![0; t.block_offsets.len()],
+                        block_data: Vec::new(),
+                    };
+                }
+            }
+        }
+    }
+}
+
+/// Create a trivial InterleavedRansTile that decodes to all zeros.
+fn make_zero_interleaved_tile(num_coefficients: u32) -> crate::encoder::rans::InterleavedRansTile {
+    // Single-symbol alphabet: just symbol 0 with probability 1.0
+    crate::encoder::rans::InterleavedRansTile {
+        min_val: 0,
+        alphabet_size: 1,
+        num_coefficients,
+        zrun_base: 0,
+        freqs: vec![4096], // full probability on symbol 0
+        cumfreqs: vec![0, 4096],
+        stream_data: vec![Vec::new(); 32],
+        stream_initial_state: vec![4096; 32], // initial state = RANS_M for single symbol
+    }
+}
+
+/// Create a trivial SubbandRansTile that decodes to all zeros.
+fn make_zero_subband_tile(
+    num_coefficients: u32,
+    tile_size: u32,
+    num_levels: u32,
+) -> crate::encoder::rans::SubbandRansTile {
+    let num_groups = 1 + num_levels;
+    let groups = (0..num_groups)
+        .map(|_| crate::encoder::rans::SubbandGroupFreqs {
+            min_val: 0,
+            alphabet_size: 1,
+            zrun_base: 0,
+            freqs: vec![4096],
+            cumfreqs: vec![0, 4096],
+        })
+        .collect();
+    crate::encoder::rans::SubbandRansTile {
+        num_coefficients,
+        tile_size,
+        num_levels,
+        num_groups,
+        groups,
+        stream_data: vec![Vec::new(); 32],
+        stream_initial_state: vec![4096; 32],
+    }
+}
+
+/// Deserialize a CompressedFrame from GP11/GP10/GPC9/GPC8 binary format.
+/// Returns the frame without CRC validation. Use `deserialize_compressed_validated`
+/// for GP11 CRC checking.
 pub fn deserialize_compressed(data: &[u8]) -> crate::CompressedFrame {
+    deserialize_compressed_validated(data).frame
+}
+
+/// Deserialize a CompressedFrame with per-tile CRC validation (GP11).
+/// For GP10/GPC9/GPC8, returns empty `tile_crcs`.
+pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
     assert!(data.len() >= 37, "File too small");
     let magic = &data[0..4];
     let is_gpc9 = magic == b"GPC9";
     let is_gp10 = magic == b"GP10";
+    let is_gp11 = magic == b"GP11";
     assert!(
-        magic == b"GPC8" || is_gpc9 || is_gp10,
-        "Invalid magic (expected GPC8, GPC9 or GP10; older files must be re-encoded)"
+        magic == b"GPC8" || is_gpc9 || is_gp10 || is_gp11,
+        "Invalid magic (expected GPC8, GPC9, GP10 or GP11; older files must be re-encoded)"
     );
 
+    // --- Common header (same layout for GPC9/GP10/GP11; GPC8 lacks per-subband flag) ---
     let width = u32::from_le_bytes(data[4..8].try_into().unwrap());
     let height = u32::from_le_bytes(data[8..12].try_into().unwrap());
     let bit_depth = u32::from_le_bytes(data[12..16].try_into().unwrap());
@@ -389,33 +582,23 @@ pub fn deserialize_compressed(data: &[u8]) -> crate::CompressedFrame {
     let qstep = f32::from_le_bytes(data[20..24].try_into().unwrap());
     let dead_zone = f32::from_le_bytes(data[24..28].try_into().unwrap());
     let wavelet_levels = u32::from_le_bytes(data[28..32].try_into().unwrap());
-
-    // Wavelet type
     let wavelet_type = match data[32] {
         0 => crate::WaveletType::LeGall53,
         1 => crate::WaveletType::CDF97,
-        w => panic!("Unknown wavelet type: {}", w),
+        w => panic!("Unknown wavelet type: {w}"),
     };
 
-    // Per-subband entropy flag (GPC9 and GP10)
-    let (per_subband_entropy, subband_weights_start) = if is_gpc9 || is_gp10 {
+    // Per-subband entropy flag (GPC9/GP10/GP11 only)
+    let (per_subband_entropy, mut pos) = if is_gpc9 || is_gp10 || is_gp11 {
         (data[33] != 0, 34)
     } else {
         (false, 33)
     };
 
-    // Subband weights
-    let ll = f32::from_le_bytes(
-        data[subband_weights_start..subband_weights_start + 4]
-            .try_into()
-            .unwrap(),
-    );
-    let num_detail = u32::from_le_bytes(
-        data[subband_weights_start + 4..subband_weights_start + 8]
-            .try_into()
-            .unwrap(),
-    ) as usize;
-    let mut pos = subband_weights_start + 8;
+    // --- Subband weights ---
+    let ll = f32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
+    let num_detail = u32::from_le_bytes(data[pos + 4..pos + 8].try_into().unwrap()) as usize;
+    pos += 8;
     let mut detail = Vec::with_capacity(num_detail);
     for _ in 0..num_detail {
         let lh = f32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
@@ -427,7 +610,7 @@ pub fn deserialize_compressed(data: &[u8]) -> crate::CompressedFrame {
     let chroma_weight = f32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
     pos += 4;
 
-    // CfL alpha side info
+    // --- CfL alpha side info ---
     let cfl_flag = data[pos];
     pos += 1;
     let (cfl_enabled, cfl_alphas) = if cfl_flag != 0 {
@@ -435,7 +618,6 @@ pub fn deserialize_compressed(data: &[u8]) -> crate::CompressedFrame {
         pos += 4;
         let num_cfl_tiles = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
         pos += 4;
-        // 2 chroma planes * num_tiles * num_subbands i16 values
         let alpha_count = (2 * num_cfl_tiles * nsb) as usize;
         let mut alphas = Vec::with_capacity(alpha_count);
         for _ in 0..alpha_count {
@@ -454,13 +636,12 @@ pub fn deserialize_compressed(data: &[u8]) -> crate::CompressedFrame {
         (false, None)
     };
 
-    // Adaptive quantization config + weight map
+    // --- Adaptive quantization ---
     let aq_flag = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
     pos += 4;
     let aq_strength = f32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
     pos += 4;
     let adaptive_quantization = aq_flag != 0;
-
     let wm_len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
     pos += 4;
     let weight_map = if wm_len > 0 {
@@ -474,19 +655,20 @@ pub fn deserialize_compressed(data: &[u8]) -> crate::CompressedFrame {
         None
     };
 
-    // Frame type + motion field (GP10 only)
-    let (frame_type, motion_field) = if is_gp10 {
+    // --- Frame type + motion field (GP10/GP11 only) ---
+    let (frame_type, motion_field) = if is_gp10 || is_gp11 {
         let ft = match data[pos] {
             0 => crate::FrameType::Intra,
             1 => crate::FrameType::Predicted,
             2 => crate::FrameType::Bidirectional,
-            f => panic!("Unknown frame type: {}", f),
+            f => panic!("Unknown frame type: {f}"),
         };
         pos += 1;
         let mf = if ft == crate::FrameType::Predicted || ft == crate::FrameType::Bidirectional {
             let block_size = u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap()) as u32;
             pos += 2;
-            let num_blocks = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+            let num_blocks =
+                u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
             pos += 4;
             let mut vectors = Vec::with_capacity(num_blocks);
             for _ in 0..num_blocks {
@@ -495,45 +677,114 @@ pub fn deserialize_compressed(data: &[u8]) -> crate::CompressedFrame {
                 vectors.push([dx, dy]);
                 pos += 4;
             }
+            // GP11 B-frames: backward vectors + block modes
+            let (backward_vectors, block_modes) =
+                if is_gp11 && ft == crate::FrameType::Bidirectional {
+                    let bwd_count =
+                        u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+                    pos += 4;
+                    let bwd = if bwd_count > 0 {
+                        let mut bv = Vec::with_capacity(bwd_count);
+                        for _ in 0..bwd_count {
+                            let dx =
+                                i16::from_le_bytes(data[pos..pos + 2].try_into().unwrap());
+                            let dy =
+                                i16::from_le_bytes(data[pos + 2..pos + 4].try_into().unwrap());
+                            bv.push([dx, dy]);
+                            pos += 4;
+                        }
+                        Some(bv)
+                    } else {
+                        None
+                    };
+                    let modes_count =
+                        u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+                    pos += 4;
+                    let modes = if modes_count > 0 {
+                        let m = data[pos..pos + modes_count].to_vec();
+                        pos += modes_count;
+                        Some(m)
+                    } else {
+                        None
+                    };
+                    (bwd, modes)
+                } else {
+                    (None, None)
+                };
             Some(crate::MotionField {
                 vectors,
                 block_size,
-                backward_vectors: None,
-                block_modes: None,
+                backward_vectors,
+                block_modes,
             })
         } else {
             None
         };
         (ft, mf)
     } else {
+        // GPC8/GPC9: always Intra, no motion
         (crate::FrameType::Intra, None)
     };
 
-    // Entropy coder type: 0 = rANS, 1 = bitplane, 2 = per-subband rANS
+    // --- Entropy tiles ---
     let entropy_type = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
     pos += 4;
-
     let num_tiles = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
     pos += 4;
 
+    // GP11: tile index table with sizes + CRC-32s
+    let (tile_sizes, tile_crcs) = if is_gp11 {
+        let mut sizes = Vec::with_capacity(num_tiles);
+        let mut expected_crcs = Vec::with_capacity(num_tiles);
+        for _ in 0..num_tiles {
+            sizes.push(u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()));
+            pos += 4;
+            expected_crcs.push(u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()));
+            pos += 4;
+        }
+        // Validate CRCs
+        let mut crcs = Vec::with_capacity(num_tiles);
+        let mut offset = pos;
+        for i in 0..num_tiles {
+            let sz = sizes[i] as usize;
+            let actual = crc32(&data[offset..offset + sz]);
+            crcs.push(TileCrcResult {
+                tile_index: i,
+                expected: expected_crcs[i],
+                actual,
+            });
+            offset += sz;
+        }
+        (Some(sizes), crcs)
+    } else {
+        (None, Vec::new())
+    };
+
+    // Deserialize tile data
     let (entropy_coder, entropy, per_subband) = match entropy_type {
         0 => {
             let mut tiles = Vec::with_capacity(num_tiles);
-            for _ in 0..num_tiles {
-                let (tile, consumed) = rans::deserialize_tile_interleaved(&data[pos..]);
+            for i in 0..num_tiles {
+                let slice = if let Some(ref sizes) = tile_sizes {
+                    &data[pos..pos + sizes[i] as usize]
+                } else {
+                    &data[pos..]
+                };
+                let (tile, consumed) = rans::deserialize_tile_interleaved(slice);
                 tiles.push(tile);
                 pos += consumed;
             }
-            (
-                crate::EntropyCoder::Rans,
-                crate::EntropyData::Rans(tiles),
-                false,
-            )
+            (crate::EntropyCoder::Rans, crate::EntropyData::Rans(tiles), false)
         }
         1 => {
             let mut tiles = Vec::with_capacity(num_tiles);
-            for _ in 0..num_tiles {
-                let (tile, consumed) = bitplane::deserialize_tile_bitplane(&data[pos..]);
+            for i in 0..num_tiles {
+                let slice = if let Some(ref sizes) = tile_sizes {
+                    &data[pos..pos + sizes[i] as usize]
+                } else {
+                    &data[pos..]
+                };
+                let (tile, consumed) = bitplane::deserialize_tile_bitplane(slice);
                 tiles.push(tile);
                 pos += consumed;
             }
@@ -545,8 +796,13 @@ pub fn deserialize_compressed(data: &[u8]) -> crate::CompressedFrame {
         }
         2 => {
             let mut tiles = Vec::with_capacity(num_tiles);
-            for _ in 0..num_tiles {
-                let (tile, consumed) = rans::deserialize_tile_subband(&data[pos..]);
+            for i in 0..num_tiles {
+                let slice = if let Some(ref sizes) = tile_sizes {
+                    &data[pos..pos + sizes[i] as usize]
+                } else {
+                    &data[pos..]
+                };
+                let (tile, consumed) = rans::deserialize_tile_subband(slice);
                 tiles.push(tile);
                 pos += consumed;
             }
@@ -556,38 +812,41 @@ pub fn deserialize_compressed(data: &[u8]) -> crate::CompressedFrame {
                 true,
             )
         }
-        _ => panic!("Unknown entropy coder type: {}", entropy_type),
+        _ => panic!("Unknown entropy coder type: {entropy_type}"),
     };
 
-    crate::CompressedFrame {
-        info: crate::FrameInfo {
-            width,
-            height,
-            bit_depth,
-            tile_size,
-        },
-        config: crate::CodecConfig {
-            tile_size,
-            quantization_step: qstep,
-            dead_zone,
-            wavelet_levels,
-            subband_weights: crate::SubbandWeights {
-                ll,
-                detail,
-                chroma_weight,
+    DeserializeResult {
+        frame: crate::CompressedFrame {
+            info: crate::FrameInfo {
+                width,
+                height,
+                bit_depth,
+                tile_size,
             },
-            cfl_enabled,
-            entropy_coder,
-            wavelet_type,
-            adaptive_quantization,
-            aq_strength,
-            per_subband_entropy: per_subband_entropy || per_subband,
-            ..Default::default()
+            config: crate::CodecConfig {
+                tile_size,
+                quantization_step: qstep,
+                dead_zone,
+                wavelet_levels,
+                subband_weights: crate::SubbandWeights {
+                    ll,
+                    detail,
+                    chroma_weight,
+                },
+                cfl_enabled,
+                entropy_coder,
+                wavelet_type,
+                adaptive_quantization,
+                aq_strength,
+                per_subband_entropy: per_subband_entropy || per_subband,
+                ..Default::default()
+            },
+            entropy,
+            cfl_alphas,
+            weight_map,
+            frame_type,
+            motion_field,
         },
-        entropy,
-        cfl_alphas,
-        weight_map,
-        frame_type,
-        motion_field,
+        tile_crcs,
     }
 }

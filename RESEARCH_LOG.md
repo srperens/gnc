@@ -1425,3 +1425,53 @@ CfL was NET NEGATIVE for RD efficiency across the entire quality range. Root cau
 This is a significant finding: the CfL implementation from M2A, while technically functional, has a fundamental precision issue that makes it counterproductive. The alpha values are quantized too coarsely (likely u8 or low-precision f16), causing large reconstruction errors in chroma planes.
 
 CfL should remain disabled until the alpha precision is reworked (e.g., f32 alphas or adaptive precision scaling by qstep). This is a potential future improvement but not blocking any current milestone.
+
+---
+
+## M5A/B: GP11 Format, Error Resilience, and Conformance Tests (2026-02-26)
+
+### Hypothesis
+Adding per-tile CRC-32 checksums and a tile index table to the bitstream format (GP11) enables error detection and graceful corruption recovery, which is essential for broadcast and streaming deployment.
+
+### Implementation
+
+**GP11 format** (`format.rs`):
+- New magic `"GP11"` with backward-compatible reading of GP10/GPC9/GPC8
+- Tile index table after entropy header: `[tile_size: u32, tile_crc32: u32]` per tile
+- Tile data follows index table (concatenated, sizes from index)
+- Full B-frame motion serialization: backward vectors + block modes (GP10 only had forward vectors)
+- CRC-32: ISO 3309 polynomial 0xEDB88320 (same as zlib/gzip/PNG), implemented as const lookup table
+
+**Error resilience** (`format.rs`):
+- `deserialize_compressed_validated()` returns `DeserializeResult` with per-tile CRC validation
+- `substitute_corrupt_tiles()` replaces corrupt tiles with zero-data tiles that decode to mid-gray
+- Zero tiles: single-symbol rANS alphabet (symbol 0, probability 1.0), producing all-zero coefficients
+
+**Conformance tests** (`tests/conformance.rs`):
+- 5 conformance bitstreams: gradient q25/q75, checkerboard q50/q90, lossless q100
+- Each verified for deterministic decode (hash match across runs)
+- GP11 magic byte verification
+- Lossless pixel-exact verification
+- CRC corruption detection: flip byte in tile data, verify CRC catches it
+- Corrupt tile recovery: substitute and decode, verify finite PSNR output
+
+**Bitstream specification** (`BITSTREAM_SPEC.md`):
+- Complete GP11 frame format with byte-level field descriptions
+- GNV1 sequence container format
+- All three tile formats (InterleavedRans, SubbandRans, Bitplane)
+- Codec pipeline description (color space, wavelet, quantization)
+- Error resilience protocol
+
+### Results
+- 103 tests pass (84 unit + 8 conformance + 11 regression)
+- GP11 serialize/deserialize round-trip verified at all quality levels
+- CRC detects single-byte corruption in tile data
+- Corrupt tile substitution produces decodable output (finite PSNR)
+- 5 conformance bitstreams generated with known decode hashes
+- Bitstream spec covers all format details for independent implementation
+
+### Key Files
+- `src/format.rs` — GP11 serialization/deserialization, CRC-32, error resilience
+- `tests/conformance.rs` — 8 conformance tests
+- `tests/conformance/` — 5 reference bitstreams + manifest
+- `BITSTREAM_SPEC.md` — format specification document

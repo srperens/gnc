@@ -188,24 +188,27 @@ Largest single compression opportunity. Current rANS treats each coefficient ind
 
 **Why:** Make the codec deployable in real-world pipelines.
 
-### 5A: Bitstream Stability
-- Freeze format as GP11 with backward-compatible GP10 reading
-- Bitstream specification document (enough for independent implementation)
-- 5+ conformance test bitstreams with known decode output hashes
+### 5A: Bitstream Stability ✅
+- GP11 format with backward-compatible GP10/GPC9/GPC8 reading ✅
+- Bitstream specification document: `BITSTREAM_SPEC.md` ✅
+- 5 conformance test bitstreams in `tests/conformance/` with decode output hashes ✅
+- GP11 adds: per-tile CRC-32 checksums, tile index table, full B-frame motion serialization
 
-### 5B: Error Resilience
-- Per-tile CRC-32 checksums in bitstream
-- Graceful corrupt tile handling (substitute previous frame's tile or gray)
+### 5B: Error Resilience ✅
+- Per-tile CRC-32 checksums (ISO 3309) in GP11 bitstream ✅
+- `deserialize_compressed_validated()` returns per-tile CRC results ✅
+- `substitute_corrupt_tiles()` replaces corrupt tiles with zero-data (mid-gray) ✅
+- 8 conformance tests including corruption detection and recovery ✅
 
 ### 5C: WebGPU/WASM
 - Verify full pipeline compiles to `wasm32-unknown-unknown` with WebGPU backend
 - Minimal browser demo: decode and display `.gnc` file
 
 ### Definition of Done
-- Specification document exists
-- 5+ conformance bitstreams in repo
-- Corrupt tile detection and recovery demonstrated
-- WASM build works, browser demo decodes a frame
+- Specification document exists — **✅ BITSTREAM_SPEC.md**
+- 5+ conformance bitstreams in repo — **✅ 5 bitstreams**
+- Corrupt tile detection and recovery demonstrated — **✅ conformance_corrupt_tile_recovery test**
+- WASM build works, browser demo decodes a frame — pending (M5C)
 
 ---
 

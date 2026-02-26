@@ -1226,3 +1226,55 @@ Bidirectional prediction (B-frames referencing both past and future anchor frame
 - **No speed regression** for I/P-frame paths — B-frame scheduling is additive.
 - **Architecture strengths**: zero-cost Rust swap of reference buffers; B-frames skip local decode (non-reference); format serialization handles bidir MVs and block modes.
 - **Next steps**: benchmark on real 1080p content (bbb, blue_sky) to measure actual B-frame savings; evaluate M3 definition of done criteria.
+
+---
+
+## 2026-02-26: M3 Speed Optimization — Hierarchical ME + Batched GPU Pipeline
+
+### Hypothesis
+Sequence encode at 0.8 fps is dominated by block matching memory bandwidth. At ±64 search range, each 16×16 block evaluates 16,641 candidates × 256 pixel reads = 4.3M reads. At 1080p (8,160 blocks), total reference reads are ~139 GB per ME dispatch. The M1 GPU has ~68 GB/s bandwidth, meaning ME alone takes ~2 seconds — matching observed ~1.6 seconds per inter frame. Reducing memory reads via hierarchical search should yield a proportional speedup.
+
+A secondary hypothesis: CPU/GPU synchronization from MV readback between ME and MC stages causes pipeline stalls. Eliminating readback/re-upload by keeping buffers on GPU, and batching multiple passes into single command encoders, should further reduce overhead.
+
+### Implementation
+
+**Hierarchical coarse-to-fine block matching** (block_match.wgsl, block_match_bidir.wgsl):
+- Phase 1 (Coarse): Search full ±64 range with 4×4 subsampled SAD (every 4th pixel in each dimension = 16 samples vs 256). 14.8× fewer memory reads per candidate.
+- Phase 2 (Fine): ±4 pixels around coarse winner with full 16×16 SAD. Only 81 candidates at full resolution.
+- Phase 3 (Half-pel): Unchanged — 8 neighbors + integer center with bilinear interpolation.
+- Total memory reduction: 286K reads per block (was 4.3M). ~15× reduction.
+
+**Batched GPU pipeline** (sequence.rs):
+- Preprocess + ME + 3-plane forward encode batched into single command encoder submission.
+- All 3 planes' local decode (for P-frame reference reconstruction) batched into single command encoder.
+- MV buffers from `estimate()` used directly in `compensate()` — no readback/re-upload roundtrip.
+- MV readback deferred to end of frame (only needed for bitstream serialization).
+- B-frame bidir readback uses single `read_bidir_data()` call (1 poll instead of 3).
+
+### Results — bbb_1080p (ki=8, q=50, 10 frames)
+
+| Metric | Before | After | Change |
+|--------|--------|-------|--------|
+| Total encode time | 13,138 ms | 2,012 ms | **6.5× faster** |
+| Sequence fps | 0.8 fps | 5.0 fps | **6.2× faster** |
+| Avg PSNR | 35.98 dB | 35.94 dB | -0.04 dB |
+| Avg SSIM | 0.9963 | 0.9963 | unchanged |
+| Avg savings | 37.8% | 33.3% | -4.5pp |
+
+Blue sky (ki=8, q=50): 4.6 fps, 0% savings (camera pan — coarse search hurts uniform large motion).
+
+### Analysis
+- **Pipeline batching alone gave no measurable speedup** (13,138 → 13,074 ms). The CPU/GPU sync overhead was negligible compared to raw GPU compute time.
+- **Hierarchical ME was the decisive optimization** — reducing memory reads by 15× directly translated to 6.5× speedup.
+- **Quality trade-off is small** (-0.04 dB PSNR) from coarse-to-fine approximation. SSIM is unchanged.
+- **Compression efficiency dropped slightly** (37.8% → 33.3% savings) because the coarse search can miss the optimal MV, leading to slightly larger residuals.
+- **Camera pan content is a known weakness**: blue_sky has large uniform horizontal motion. The 4×4 subsampled coarse search can miss the correct MV when the entire block moves uniformly — the subsampled SAD has too few samples to discriminate between similar candidates at large displacements.
+- **Still 2× below 10 fps target**. Remaining bottleneck is still ME compute. Options: reduce search range for P-frames with good temporal prediction, or use temporal MV prediction from previous frame's MVs as starting point.
+
+### M3 Definition of Done Status
+- P-frame savings ≥50%: ⚠️ 33% on bbb, 0% on blue_sky
+- B-frames 20% smaller than P-frames: ✅ ~20% on bbb
+- Rate control ±10%: ✅
+- Sequence round-trip: ✅
+- Sequence encode ≥10 fps: ⚠️ 5.0 fps (up from 0.8)
+- Regression tests: ✅ all 93 pass

@@ -4,8 +4,8 @@
 
 GNC is a GPU-native codec research project (Rust + wgpu/WGSL). It currently works as an image codec with basic P-frame temporal coding. The goal: turn it into a real video codec with quality scaling from lossless to extreme compression. An AI team will iterate and evaluate each milestone.
 
-**Current baseline (1080p, q=75):** 44 dB PSNR, 5.93 bpp, 31 fps encode, 34 fps decode.
-**Gap:** ~1.5-1.7x bpp vs JPEG 2000. ~8 dB gap at matched ~1.2 bpp. P-frame encode only 1.7 fps. No rate control, no B-frames.
+**Current baseline (1080p, q=75):** 42.8 dB PSNR, 4.31 bpp, 30 fps encode, 33 fps decode.
+**Gap:** ~1.4x bpp vs JPEG 2000. BD-rate vs JPEG: ~-1% on animation (GNC wins!), ~50% on sports. CfL enabled, AQ active.
 
 ---
 
@@ -35,7 +35,7 @@ GNC is a GPU-native codec research project (Rust + wgpu/WGSL). It currently work
 
 ---
 
-## M2: Close the Image Compression Gap ✅ COMPLETE (2026-02-25)
+## M2: Close the Image Compression Gap ✅ COMPLETE (2026-02-26)
 
 **Why:** Per-frame compression efficiency is the foundation that temporal coding amplifies. Fixing disabled features and adding context-adaptive entropy closes the 1.5x gap to JPEG 2000.
 

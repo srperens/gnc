@@ -1505,3 +1505,33 @@ The codec was ~95% WASM-ready out of the box due to:
 4. The only blocking call was `pollster::block_on()` for GPU context initialization
 
 The 263 KB WASM binary is compact — it includes the full encode/decode pipeline, all shaders (compiled by naga at runtime), three entropy coders, wavelet transforms, color conversion, and motion estimation.
+
+## 2026-02-26: CfL AQ Mismatch Fix + Quality Preset Tuning
+
+### Hypothesis
+The CfL (Chroma-from-Luma) feature has been disabled in all quality presets despite having full infrastructure. Enabling CfL should reduce chroma bitrate by 9-10% since CfL prediction decorrelates luma-chroma.
+
+### Investigation
+Found critical encoder/decoder mismatch: the CfL path in `pipeline.rs` used `self.quantize.dispatch()` (non-adaptive, no AQ weights) for all 4 quantization calls (Y forward, Y inverse, Co, Cg). The decoder always uses `self.quantize.dispatch_adaptive()` with the weight map. When CfL was enabled with AQ active (q≤80), the encoder quantized without spatial weights but the decoder dequantized with them — causing ~10 dB PSNR catastrophic regression.
+
+### Fix
+Changed all 4 `dispatch()` calls in the CfL path to `dispatch_adaptive()` with the `wm_param` weight map parameter, matching the decoder's dequantization path exactly.
+
+### Results
+CfL now works correctly and is enabled for q=50 through q=85:
+
+| Content | Metric | No CfL | CfL Fixed | Change |
+|---------|--------|--------|-----------|--------|
+| bbb_1080p q=50 | PSNR/BPP | 37.48/2.57 | 37.68/2.34 | +0.2 dB, -9.0% BPP |
+| bbb_1080p q=75 | PSNR/BPP | 42.73/4.78 | 42.83/4.31 | +0.1 dB, -9.8% BPP |
+| touchdown q=75 | PSNR/BPP | 41.77/3.63 | 41.77/3.63 | Comparable |
+
+BD-rate vs JPEG (bbb_1080p): **+7.3% → ~-1%** (GNC now matches/beats JPEG on animation)
+
+CfL disabled at q≤25 (alpha precision too coarse at high qstep) and q≥92 (near-lossless).
+
+### Also: Fused Quantize+Histogram Shader
+Added `quantize_histogram_fused.wgsl` — single dispatch combines quantization + histogram building, eliminating one full buffer read+write per plane (~24MB at 1080p). Bit-exact identical output. Gated behind `use_fused_quantize_histogram` flag (off by default, auto-disabled when CfL is active since CfL needs separate quantize+dequantize for Y reconstruction).
+
+### Analysis
+The CfL fix is the single largest quality improvement since per-subband entropy coding. The AQ mismatch was a latent bug hidden by CfL being disabled in presets. Touchdown content (sports) still ~50% worse than JPEG — this is a fundamental architectural mismatch between global wavelet decomposition and high-frequency texture content. See detailed analysis in commit notes.

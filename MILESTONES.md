@@ -237,11 +237,17 @@ Largest single compression opportunity. Current rANS treats each coefficient ind
 ### 6C: Multi-Frame Pipelining
 - Pipeline frame N+1's color+wavelet while frame N's entropy runs
 - Double-buffered encode buffers
+- **Assessment**: CPU work between frames (~7ms) already overlaps naturally with GPU compute (~45ms). Double-buffering would save ~5-7% for significant complexity and memory cost. Bottleneck is GPU ALU throughput (rANS integer division, wavelet lifting), not CPU/GPU overlap. Deferred.
 
 ### Definition of Done
-- 1080p encode < 16.7ms (60 fps)
-- 1080p decode < 8.3ms (120 fps, pipelined)
-- 4K per-pixel throughput within 25% of 1080p
+- 1080p encode < 16.7ms (60 fps) — **34ms (29 fps)** ⚠️ limited by GPU ALU throughput
+- 1080p decode < 8.3ms (120 fps, pipelined) — **30ms (34 fps)** ⚠️
+- 4K per-pixel throughput within 25% of 1080p — **✅ 4K is 34-71% faster per pixel**
+
+### Performance Summary
+Before M6: 124ms encode (8 fps), 30ms decode (34 fps)
+After M6: 34ms encode (29 fps), 30ms decode (34 fps) — **3.6x encode speedup**
+Sequence: 6.5 fps I+P+B, 9.8 fps all-I (target 10 fps — nearly met)
 
 ---
 
@@ -268,4 +274,4 @@ M3 (Video Fundamentals) ──> M6 (Performance) ──────────�
 | M4 | Lossless bpp | 5-6 | < 4 |
 | M4 | Extreme compression | 0.62 bpp/29 dB | < 0.5 bpp/27+ dB |
 | M5 | Conformance tests | 0 | 5+ |
-| M6 | Encode fps (1080p) | 31 | 60 |
+| M6 | Encode fps (1080p) | 29 (was 8) | 60 |

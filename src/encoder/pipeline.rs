@@ -9,6 +9,7 @@ use super::color::ColorConverter;
 use super::entropy_helpers::{encode_entropy, EntropyMode};
 use super::interleave::PlaneDeinterleaver;
 use super::quantize::Quantizer;
+use super::quantize_histogram_fused::FusedQuantizeHistogram;
 use super::rans;
 use super::rans_gpu_encode::GpuRansEncoder;
 use super::transform::WaveletTransform;
@@ -34,6 +35,7 @@ pub struct EncoderPipeline {
     pub(super) cfl_alpha: CflAlphaComputer,
     pub(super) cfl_forward: CflForwardPredictor,
     pub(super) cfl_inverse: CflPredictor,
+    pub(super) fused_qh: FusedQuantizeHistogram,
     pad_pipeline: wgpu::ComputePipeline,
     pad_bgl: wgpu::BindGroupLayout,
     pub(super) cached: Option<CachedEncodeBuffers>,
@@ -117,6 +119,7 @@ impl EncoderPipeline {
             cfl_alpha: CflAlphaComputer::new(ctx),
             cfl_forward: CflForwardPredictor::new(ctx),
             cfl_inverse: CflPredictor::new(ctx),
+            fused_qh: FusedQuantizeHistogram::new(ctx),
             pad_pipeline,
             pad_bgl,
             cached: None,
@@ -285,6 +288,13 @@ impl EncoderPipeline {
             && config.entropy_coder != EntropyCoder::Bitplane
             && !config.context_adaptive;
 
+        // Fused quantize+histogram: saves one full buffer read+write per plane.
+        // Only applicable when GPU entropy encoding is active and CfL is off
+        // (CfL needs separate quantize+dequantize for Y reconstruction).
+        let use_fused_qh = config.use_fused_quantize_histogram
+            && use_gpu_encode
+            && !config.cfl_enabled;
+
         let weights_luma = config.subband_weights.pack_weights();
         let weights_chroma = config.subband_weights.pack_weights_chroma();
 
@@ -317,6 +327,14 @@ impl EncoderPipeline {
                     | wgpu::BufferUsages::COPY_DST,
             );
         }
+
+        // Ensure per-plane histogram buffers for fused quantize+histogram path
+        if use_fused_qh {
+            let total_tiles_for_hist = info.tiles_x() * info.tiles_y();
+            let bufs = self.cached.as_mut().unwrap();
+            bufs.ensure_fused_hist_bufs(ctx, total_tiles_for_hist);
+        }
+
         let bufs = self.cached.as_ref().unwrap();
 
         // ---- Single command encoder for all 3 planes: wavelet + AQ + quantize ----
@@ -436,8 +454,8 @@ impl EncoderPipeline {
 
         if config.cfl_enabled {
             // Quantize + dequantize to get reconstructed Y wavelet for CfL
-            // (CfL path currently does not use AQ; can be extended later)
-            self.quantize.dispatch(
+            // Must use dispatch_adaptive to match decoder's dequantization path
+            self.quantize.dispatch_adaptive(
                 ctx,
                 &mut cmd,
                 &bufs.plane_c,
@@ -451,8 +469,9 @@ impl EncoderPipeline {
                 config.tile_size,
                 config.wavelet_levels,
                 &weights_luma,
+                wm_param,
             );
-            self.quantize.dispatch(
+            self.quantize.dispatch_adaptive(
                 ctx,
                 &mut cmd,
                 &bufs.plane_b,
@@ -466,8 +485,30 @@ impl EncoderPipeline {
                 config.tile_size,
                 config.wavelet_levels,
                 &weights_luma,
+                wm_param,
             );
             cmd.copy_buffer_to_buffer(&bufs.plane_a, 0, &bufs.recon_y, 0, plane_size);
+        } else if use_fused_qh {
+            // Fused quantize + histogram: writes quantized to plane_b AND histogram
+            // to fused_hist_bufs[0] in a single dispatch.
+            let hist_bufs = bufs.fused_hist_bufs.as_ref().unwrap();
+            self.fused_qh.dispatch(
+                ctx,
+                &mut cmd,
+                &bufs.plane_c,
+                &bufs.plane_b,
+                &hist_bufs[0],
+                padded_w,
+                padded_h,
+                config.tile_size,
+                config.wavelet_levels,
+                config.quantization_step,
+                config.dead_zone,
+                &weights_luma,
+                config.per_subband_entropy,
+                1, // flags: disable ZRL (lean encoder)
+                wm_param,
+            );
         } else {
             self.quantize.dispatch_adaptive(
                 ctx,
@@ -527,7 +568,7 @@ impl EncoderPipeline {
                 config.tile_size,
                 config.wavelet_levels,
             );
-            self.quantize.dispatch(
+            self.quantize.dispatch_adaptive(
                 ctx,
                 &mut cmd,
                 &bufs.plane_a,
@@ -541,9 +582,29 @@ impl EncoderPipeline {
                 config.tile_size,
                 config.wavelet_levels,
                 &weights_chroma,
+                wm_param,
             );
             // Preserve Co alpha before Cg overwrites raw_alpha
             cmd.copy_buffer_to_buffer(&bufs.raw_alpha, 0, &alpha_staging[0], 0, alpha_bytes);
+        } else if use_fused_qh {
+            let hist_bufs = bufs.fused_hist_bufs.as_ref().unwrap();
+            self.fused_qh.dispatch(
+                ctx,
+                &mut cmd,
+                &bufs.plane_c,
+                &bufs.plane_b,
+                &hist_bufs[1],
+                padded_w,
+                padded_h,
+                config.tile_size,
+                config.wavelet_levels,
+                config.quantization_step,
+                config.dead_zone,
+                &weights_chroma,
+                config.per_subband_entropy,
+                1, // flags: disable ZRL
+                wm_param,
+            );
         } else {
             self.quantize.dispatch_adaptive(
                 ctx,
@@ -603,7 +664,7 @@ impl EncoderPipeline {
                 config.tile_size,
                 config.wavelet_levels,
             );
-            self.quantize.dispatch(
+            self.quantize.dispatch_adaptive(
                 ctx,
                 &mut cmd,
                 &bufs.plane_a,
@@ -617,9 +678,29 @@ impl EncoderPipeline {
                 config.tile_size,
                 config.wavelet_levels,
                 &weights_chroma,
+                wm_param,
             );
             // Copy Cg alpha to staging for deferred readback
             cmd.copy_buffer_to_buffer(&bufs.raw_alpha, 0, &alpha_staging[1], 0, alpha_bytes);
+        } else if use_fused_qh {
+            let hist_bufs = bufs.fused_hist_bufs.as_ref().unwrap();
+            self.fused_qh.dispatch(
+                ctx,
+                &mut cmd,
+                &bufs.plane_c,
+                &bufs.plane_b,
+                &hist_bufs[2],
+                padded_w,
+                padded_h,
+                config.tile_size,
+                config.wavelet_levels,
+                config.quantization_step,
+                config.dead_zone,
+                &weights_chroma,
+                config.per_subband_entropy,
+                1, // flags: disable ZRL
+                wm_param,
+            );
         } else {
             self.quantize.dispatch_adaptive(
                 ctx,
@@ -699,7 +780,21 @@ impl EncoderPipeline {
         // Batched 3-plane rANS encode: single submit + single poll for all planes.
         // GPU queue guarantees sequential execution: wavelet+quantize finishes before
         // entropy starts reading quantized buffers. No intermediate poll needed.
-        if use_gpu_encode {
+        if use_gpu_encode && use_fused_qh {
+            // Fused path: histograms already computed by fused quantize+histogram shader.
+            // Skip histogram pass, go straight to normalize + encode.
+            let hist_bufs = bufs.fused_hist_bufs.as_ref().unwrap();
+            let (mut rt, mut st) = self.gpu_encoder.encode_3planes_skip_histogram(
+                ctx,
+                [&bufs.mc_out, &bufs.ref_upload, &bufs.plane_b],
+                [&hist_bufs[0], &hist_bufs[1], &hist_bufs[2]],
+                &info,
+                config.per_subband_entropy,
+                config.wavelet_levels,
+            );
+            rans_tiles.append(&mut rt);
+            subband_tiles.append(&mut st);
+        } else if use_gpu_encode {
             // Y quantized in mc_out, Co in ref_upload, Cg in plane_b
             let (mut rt, mut st) = self.gpu_encoder.encode_3planes_to_tiles(
                 ctx,

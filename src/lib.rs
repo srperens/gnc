@@ -220,6 +220,11 @@ pub struct CodecConfig {
     pub target_bitrate: Option<f64>,
     /// Rate control mode: CBR (strict) or VBR (relaxed). Only used when target_bitrate is set.
     pub rate_mode: RateMode,
+    /// Fuse quantization and histogram building into a single GPU dispatch.
+    /// Eliminates one full read+write of the coefficient buffer per plane,
+    /// saving ~24MB bandwidth at 1080p. Requires gpu_entropy_encode = true and
+    /// non-CfL path (CfL needs separate quantize + dequantize for reconstruction).
+    pub use_fused_quantize_histogram: bool,
 }
 
 impl CodecConfig {
@@ -251,6 +256,7 @@ impl Default for CodecConfig {
             context_adaptive: false,
             target_bitrate: None,
             rate_mode: RateMode::VBR,
+            use_fused_quantize_histogram: false,
         }
     }
 }
@@ -303,7 +309,7 @@ pub fn quality_preset(q: u32) -> CodecConfig {
             qstep: 16.0,
             dead_zone: 0.75,
             perceptual: true,
-            cfl: false, // CfL alpha precision still hurts at qstep=16
+            cfl: false, // CfL alpha too coarse at qstep=16; hurts gradients
             per_subband: true,
         },
         Anchor {
@@ -311,7 +317,7 @@ pub fn quality_preset(q: u32) -> CodecConfig {
             qstep: 8.0,
             dead_zone: 0.75,
             perceptual: true,
-            cfl: false,
+            cfl: true,
             per_subband: true,
         },
         Anchor {
@@ -319,7 +325,7 @@ pub fn quality_preset(q: u32) -> CodecConfig {
             qstep: 4.0,
             dead_zone: 0.75,
             perceptual: true,
-            cfl: false,
+            cfl: true,
             per_subband: true,
         },
         Anchor {
@@ -327,7 +333,7 @@ pub fn quality_preset(q: u32) -> CodecConfig {
             qstep: 2.8,
             dead_zone: 0.5,
             perceptual: true,
-            cfl: false,
+            cfl: true,
             per_subband: true,
         },
         // CDF 9/7 at qstep >= 2.0 keeps rANS alphabet within GPU limits

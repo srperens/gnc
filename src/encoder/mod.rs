@@ -9,6 +9,7 @@ pub mod interleave;
 pub mod motion;
 pub mod pipeline;
 pub mod quantize;
+pub mod quantize_histogram_fused;
 pub mod rans;
 pub mod rans_gpu;
 pub mod rans_gpu_encode;

@@ -50,6 +50,11 @@ pub(super) struct CachedEncodeBuffers {
     pub(super) gpu_ref_planes: [wgpu::Buffer; 3],
     // Backward (future) reference planes for B-frame encoding.
     pub(super) gpu_bwd_ref_planes: [wgpu::Buffer; 3],
+
+    // Per-plane histogram buffers for fused quantize+histogram path.
+    // Each buffer holds HIST_TILE_STRIDE * num_tiles u32s.
+    // Only allocated when fused path is used (lazily via ensure_fused_hist_bufs).
+    pub(super) fused_hist_bufs: Option<[wgpu::Buffer; 3]>,
 }
 
 impl CachedEncodeBuffers {
@@ -232,7 +237,28 @@ impl CachedEncodeBuffers {
                     mapped_at_creation: false,
                 })
             }),
+
+            fused_hist_bufs: None,
         }
+    }
+
+    /// Ensure per-plane histogram buffers are allocated for the fused quantize+histogram path.
+    /// Allocates lazily on first use.
+    pub(super) fn ensure_fused_hist_bufs(&mut self, ctx: &GpuContext, num_tiles: u32) {
+        if self.fused_hist_bufs.is_some() {
+            return;
+        }
+        const HIST_TILE_STRIDE: u64 = 32793;
+        let hist_size = (num_tiles as u64) * HIST_TILE_STRIDE * 4;
+        let usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC;
+        self.fused_hist_bufs = Some(std::array::from_fn(|i| {
+            ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(["enc_fused_hist_y", "enc_fused_hist_co", "enc_fused_hist_cg"][i]),
+                size: hist_size.max(4),
+                usage,
+                mapped_at_creation: false,
+            })
+        }));
     }
 }
 

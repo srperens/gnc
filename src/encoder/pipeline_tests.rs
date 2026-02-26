@@ -342,3 +342,126 @@ fn test_lossless_roundtrip_bit_exact() {
         );
     }
 }
+
+/// Verify fused quantize+histogram produces identical decoded output to the
+/// separate quantize + histogram path. Tests both with and without adaptive QP.
+#[test]
+fn test_fused_quantize_histogram_matches_separate() {
+    let ctx = GpuContext::new();
+    let mut enc = EncoderPipeline::new(&ctx);
+    let dec = DecoderPipeline::new(&ctx);
+
+    let w = 256u32;
+    let h = 256u32;
+    let frame = make_gradient_frame(w, h, 42.0);
+
+    // Baseline: separate quantize + histogram (default path)
+    let mut config_separate = CodecConfig::default();
+    config_separate.use_fused_quantize_histogram = false;
+    config_separate.gpu_entropy_encode = true;
+    config_separate.per_subband_entropy = true;
+    config_separate.quantization_step = 4.0;
+    config_separate.dead_zone = 0.5;
+    config_separate.cfl_enabled = false;
+
+    let compressed_sep = enc.encode(&ctx, &frame, w, h, &config_separate);
+    let decoded_sep = dec.decode(&ctx, &compressed_sep);
+
+    // Fused path: quantize + histogram in single dispatch
+    let mut config_fused = config_separate.clone();
+    config_fused.use_fused_quantize_histogram = true;
+
+    let compressed_fused = enc.encode(&ctx, &frame, w, h, &config_fused);
+    let decoded_fused = dec.decode(&ctx, &compressed_fused);
+
+    // Compare decoded pixels: must be identical (same quantization, same entropy)
+    assert_eq!(decoded_sep.len(), decoded_fused.len(), "decoded length mismatch");
+    let mut max_diff: f32 = 0.0;
+    let mut diff_count = 0usize;
+    for (i, (a, b)) in decoded_sep.iter().zip(decoded_fused.iter()).enumerate() {
+        let d = (a - b).abs();
+        if d > 0.5 {
+            diff_count += 1;
+            if diff_count <= 5 {
+                eprintln!("pixel {i}: separate={a}, fused={b}, diff={d}");
+            }
+        }
+        max_diff = max_diff.max(d);
+    }
+    assert!(
+        diff_count == 0,
+        "Fused vs separate mismatch: {diff_count} pixels differ, max_diff={max_diff}"
+    );
+
+    // Also verify bitrate is identical (same entropy coding)
+    let bpp_sep = compressed_sep.bpp();
+    let bpp_fused = compressed_fused.bpp();
+    let bpp_diff = (bpp_sep - bpp_fused).abs();
+    eprintln!("bpp: separate={bpp_sep:.4}, fused={bpp_fused:.4}, diff={bpp_diff:.6}");
+    assert!(
+        bpp_diff < 0.001,
+        "Bitrate mismatch: separate={bpp_sep:.4} vs fused={bpp_fused:.4}"
+    );
+}
+
+/// Verify fused quantize+histogram with adaptive quantization produces
+/// identical results to the separate path.
+#[test]
+fn test_fused_quantize_histogram_with_aq() {
+    let ctx = GpuContext::new();
+    let mut enc = EncoderPipeline::new(&ctx);
+    let dec = DecoderPipeline::new(&ctx);
+
+    let w = 256u32;
+    let h = 256u32;
+    let frame = make_gradient_frame(w, h, 17.0);
+
+    // Baseline: separate path with AQ
+    let mut config_separate = CodecConfig::default();
+    config_separate.use_fused_quantize_histogram = false;
+    config_separate.gpu_entropy_encode = true;
+    config_separate.per_subband_entropy = true;
+    config_separate.quantization_step = 4.0;
+    config_separate.dead_zone = 0.5;
+    config_separate.cfl_enabled = false;
+    config_separate.adaptive_quantization = true;
+    config_separate.aq_strength = 0.5;
+
+    let compressed_sep = enc.encode(&ctx, &frame, w, h, &config_separate);
+    let decoded_sep = dec.decode(&ctx, &compressed_sep);
+
+    // Fused path with AQ
+    let mut config_fused = config_separate.clone();
+    config_fused.use_fused_quantize_histogram = true;
+
+    let compressed_fused = enc.encode(&ctx, &frame, w, h, &config_fused);
+    let decoded_fused = dec.decode(&ctx, &compressed_fused);
+
+    // Compare decoded pixels
+    assert_eq!(decoded_sep.len(), decoded_fused.len(), "decoded length mismatch");
+    let mut max_diff: f32 = 0.0;
+    let mut diff_count = 0usize;
+    for (i, (a, b)) in decoded_sep.iter().zip(decoded_fused.iter()).enumerate() {
+        let d = (a - b).abs();
+        if d > 0.5 {
+            diff_count += 1;
+            if diff_count <= 5 {
+                eprintln!("pixel {i}: separate={a}, fused={b}, diff={d}");
+            }
+        }
+        max_diff = max_diff.max(d);
+    }
+    assert!(
+        diff_count == 0,
+        "Fused+AQ vs separate+AQ mismatch: {diff_count} pixels differ, max_diff={max_diff}"
+    );
+
+    let bpp_sep = compressed_sep.bpp();
+    let bpp_fused = compressed_fused.bpp();
+    let bpp_diff = (bpp_sep - bpp_fused).abs();
+    eprintln!("bpp (AQ): separate={bpp_sep:.4}, fused={bpp_fused:.4}, diff={bpp_diff:.6}");
+    assert!(
+        bpp_diff < 0.001,
+        "Bitrate mismatch (AQ): separate={bpp_sep:.4} vs fused={bpp_fused:.4}"
+    );
+}

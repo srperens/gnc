@@ -157,7 +157,7 @@ Uses per-subband frequency tables with 32 interleaved rANS streams.
 | 4 | u32 | num_coefficients | Total coefficients |
 | 4 | u32 | tile_size | Tile dimension |
 | 4 | u32 | num_levels | Wavelet decomposition levels |
-| 4 | u32 | num_groups | 1 + num_levels (LL + one per detail level) |
+| 4 | u32 | num_groups | num_levels * 2 (LL + deepest merged + directional pairs) |
 
 For each group (num_groups times):
 
@@ -176,7 +176,7 @@ After all groups:
 | 32 * 4 | u32[32] | stream_states | Initial rANS state per stream |
 | variable | u8[] | stream_data | Concatenated stream bytes |
 
-**Group assignment:** Group 0 = LL subband. Group `g` (g > 0) = all three subbands (LH, HL, HH) at wavelet level `g`. Coefficients within each stream are processed in raster scan order within each subband, advancing through groups sequentially.
+**Group assignment (directional splitting):** Group 0 = LL subband. Group 1 = deepest detail level (LH+HL+HH merged). For remaining levels (deep to shallow): even groups = LH+HL subbands, odd groups = HH subband. Total groups = num_levels * 2. This separates diagonal (HH) from horizontal/vertical (LH+HL) detail for tighter frequency distributions.
 
 ### 2.3 Bitplane Tile (entropy_type = 1)
 

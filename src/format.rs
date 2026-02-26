@@ -533,7 +533,7 @@ fn make_zero_subband_tile(
     tile_size: u32,
     num_levels: u32,
 ) -> crate::encoder::rans::SubbandRansTile {
-    let num_groups = 1 + num_levels;
+    let num_groups = num_levels * 2;
     let groups = (0..num_groups)
         .map(|_| crate::encoder::rans::SubbandGroupFreqs {
             min_val: 0,

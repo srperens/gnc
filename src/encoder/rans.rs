@@ -795,12 +795,21 @@ pub fn deserialize_tile_interleaved(data: &[u8]) -> (InterleavedRansTile, usize)
 /// This mirrors `compute_subband_index` from cfl.rs but collapses LH/HL/HH
 /// within each level into a single group, since their statistical distributions
 /// are similar enough to share one frequency table.
+/// Directional subband grouping: separates HH from LH+HL at each level.
+/// Group 0 = LL, Group 1 = deepest detail (merged), then pairs of (LH+HL, HH)
+/// for remaining levels from deep to shallow. Total groups = num_levels * 2.
 pub fn compute_subband_group(lx: u32, ly: u32, tile_size: u32, num_levels: u32) -> usize {
     let mut region = tile_size;
     for level in 0..num_levels {
         let half = region / 2;
         if lx >= half || ly >= half {
-            return (level + 1) as usize;
+            let lfd = num_levels - 1 - level;
+            if lfd == 0 {
+                return 1; // Deepest detail level: merged LH+HL+HH
+            }
+            let is_hh = lx >= half && ly >= half;
+            let base = 2 + (lfd - 1) as usize * 2;
+            return if is_hh { base + 1 } else { base };
         }
         region = half;
     }
@@ -866,7 +875,7 @@ pub fn rans_encode_tile_interleaved_subband(
     tile_size: u32,
     num_levels: u32,
 ) -> SubbandRansTile {
-    let num_groups = 1 + num_levels as usize;
+    let num_groups = num_levels as usize * 2;
 
     if coefficients.is_empty() {
         return SubbandRansTile {
@@ -1250,24 +1259,25 @@ fn compute_above_context(
     }
 }
 
-/// Map a subband group index and context to the expanded group index for context-adaptive mode.
+/// Map a directional subband group and context to the expanded context-adaptive group index.
 ///
-/// Layout: groups[0] = LL (context 0 only)
-///         groups[1 + (g-1)*2] = detail group g, context 0
-///         groups[1 + (g-1)*2 + 1] = detail group g, context 1
-///
-/// Total expanded groups = 1 + num_detail_groups * 2
+/// Groups 0 (LL) and 1 (deepest merged) stay single (no context split).
+/// Groups 2..num_levels*2 each get 2 context variants (zero/nonzero above).
 fn context_group_index(subband_group: usize, context: u32) -> usize {
-    if subband_group == 0 {
-        0
+    if subband_group <= 1 {
+        subband_group
     } else {
-        1 + (subband_group - 1) * 2 + context as usize
+        2 + (subband_group - 2) * 2 + context as usize
     }
 }
 
 /// Number of expanded groups in context-adaptive mode.
+/// Based on directional grouping (num_levels * 2), but each non-LL,
+/// non-merged group gets 2 context variants. Group 0 (LL) and group 1
+/// (deepest merged) stay single. Groups 2..num_levels*2 each split into 2.
 fn num_context_groups(num_levels: u32) -> usize {
-    1 + num_levels as usize * 2
+    // Groups 0,1 stay single; groups 2..num_levels*2 each double
+    2 + (num_levels as usize * 2 - 2) * 2
 }
 
 /// Encode a tile using per-subband frequency tables with context-adaptive coding.
@@ -2002,22 +2012,26 @@ mod tests {
 
     #[test]
     fn test_subband_group_mapping() {
-        // 256x256 tile, 3 levels → groups: 0=LL, 1=level0, 2=level1, 3=level2
+        // 256x256 tile, 3 levels, directional grouping:
+        // 0=LL, 1=deepest_merged, 2=mid_LH+HL, 3=mid_HH, 4=outer_LH+HL, 5=outer_HH
         // (0,0) = LL = group 0
         assert_eq!(compute_subband_group(0, 0, 256, 3), 0);
-        // (128,128) = level 0 HH = group 1
-        assert_eq!(compute_subband_group(128, 128, 256, 3), 1);
-        // (128,0) = level 0 HL = group 1
-        assert_eq!(compute_subband_group(128, 0, 256, 3), 1);
-        // (0,128) = level 0 LH = group 1
-        assert_eq!(compute_subband_group(0, 128, 256, 3), 1);
-        // (64,0) = level 1 HL = group 2
+        // (32,0) = level 2 (deepest) HL → group 1 (merged)
+        assert_eq!(compute_subband_group(32, 0, 256, 3), 1);
+        // (32,32) = level 2 (deepest) HH → group 1 (merged)
+        assert_eq!(compute_subband_group(32, 32, 256, 3), 1);
+        // (64,0) = level 1 (mid) HL → group 2 (LH+HL)
         assert_eq!(compute_subband_group(64, 0, 256, 3), 2);
-        // (32,0) = level 2 HL = group 3
-        assert_eq!(compute_subband_group(32, 0, 256, 3), 3);
-        // (0,0) still LL with 1 level
+        // (64,64) = level 1 (mid) HH → group 3
+        assert_eq!(compute_subband_group(64, 64, 256, 3), 3);
+        // (128,0) = level 0 (outer) HL → group 4 (LH+HL)
+        assert_eq!(compute_subband_group(128, 0, 256, 3), 4);
+        // (0,128) = level 0 (outer) LH → group 4 (LH+HL)
+        assert_eq!(compute_subband_group(0, 128, 256, 3), 4);
+        // (128,128) = level 0 (outer) HH → group 5
+        assert_eq!(compute_subband_group(128, 128, 256, 3), 5);
+        // 1 level: (0,0) = LL, (4,0) = deepest = group 1
         assert_eq!(compute_subband_group(0, 0, 8, 1), 0);
-        // (4,0) = level 0 HL with tile_size=8, 1 level = group 1
         assert_eq!(compute_subband_group(4, 0, 8, 1), 1);
     }
 
@@ -2037,7 +2051,7 @@ mod tests {
         }
 
         let tile = rans_encode_tile_interleaved_subband(&coefficients, 256, 3);
-        assert_eq!(tile.num_groups, 4);
+        assert_eq!(tile.num_groups, 6); // 3 levels * 2 = 6 directional groups
         let decoded = rans_decode_tile_interleaved_subband(&tile);
         assert_eq!(coefficients, decoded);
     }
@@ -2289,8 +2303,8 @@ mod tests {
         }
 
         let tile = rans_encode_tile_interleaved_subband_ctx(&coefficients, 256, 3);
-        // Should have 1 + 3*2 = 7 expanded groups
-        assert_eq!(tile.num_groups, 7);
+        // Directional: 2 + (3*2 - 2)*2 = 10 expanded groups
+        assert_eq!(tile.num_groups, 10);
         let decoded = rans_decode_tile_interleaved_subband_ctx(&tile);
         assert_eq!(coefficients, decoded);
     }

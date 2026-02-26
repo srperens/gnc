@@ -11,7 +11,7 @@ const RANS_PRECISION: u32 = 12u;
 const STREAMS_PER_TILE: u32 = 32u;
 const MAX_ALPHABET: u32 = 4096u;
 const MAX_STREAM_BYTES: u32 = 4096u;
-const ENCODE_TILE_INFO_STRIDE: u32 = 32u;
+const ENCODE_TILE_INFO_STRIDE: u32 = 36u;
 
 struct Params {
     num_tiles: u32,
@@ -39,16 +39,25 @@ fn write_byte(byte_offset: u32, value: u32) {
     stream_output[word_idx] = stream_output[word_idx] | ((value & 0xFFu) << (byte_pos * 8u));
 }
 
+// Directional subband grouping: separates HH from LH+HL at each level.
+// Group 0 = LL, Group 1 = deepest detail (merged), then pairs of (LH+HL, HH)
+// for remaining levels from deep to shallow. Total groups = num_levels * 2.
 fn compute_subband_group(lx: u32, ly: u32) -> u32 {
     var region = params.tile_size;
     for (var level = 0u; level < params.num_levels; level++) {
         let half = region / 2u;
         if (lx >= half || ly >= half) {
-            return level + 1u;
+            let lfd = params.num_levels - 1u - level;
+            if (lfd == 0u) {
+                return 1u;  // Deepest detail level: merged LH+HL+HH
+            }
+            let is_hh = (lx >= half) && (ly >= half);
+            let base = 2u + (lfd - 1u) * 2u;
+            return select(base, base + 1u, is_hh);
         }
         region = half;
     }
-    return 0u;
+    return 0u;  // LL
 }
 
 fn rans_encode_sym(

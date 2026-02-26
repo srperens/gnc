@@ -23,7 +23,7 @@ const MAX_ZERO_RUN: u32 = 256u;
 // Single-table: [0]=min_val, [1]=alphabet_size, [2]=cumfreq_offset, [3]=zrun_base
 // Per-subband:  [0]=num_groups, [1+g*4]=min_val, [2+g*4]=alphabet_size,
 //               [3+g*4]=cumfreq_offset, [4+g*4]=zrun_base
-const ENCODE_TILE_INFO_STRIDE: u32 = 32u;
+const ENCODE_TILE_INFO_STRIDE: u32 = 36u;
 
 // Max ZRL-encoded symbols per stream. With ZRL, the symbol count can only
 // decrease (runs of zeros become single symbols), so this is a safe upper bound.
@@ -59,18 +59,25 @@ fn write_byte(byte_offset: u32, value: u32) {
     stream_output[word_idx] = stream_output[word_idx] | ((value & 0xFFu) << (byte_pos * 8u));
 }
 
-// Compute subband group for a tile-local position.
-// Group 0 = LL, Group k (1..num_levels) = Level (k-1) detail subbands.
+// Directional subband grouping: separates HH from LH+HL at each level.
+// Group 0 = LL, Group 1 = deepest detail (merged), then pairs of (LH+HL, HH)
+// for remaining levels from deep to shallow. Total groups = num_levels * 2.
 fn compute_subband_group(lx: u32, ly: u32) -> u32 {
     var region = params.tile_size;
     for (var level = 0u; level < params.num_levels; level++) {
         let half = region / 2u;
         if (lx >= half || ly >= half) {
-            return level + 1u;
+            let lfd = params.num_levels - 1u - level;
+            if (lfd == 0u) {
+                return 1u;  // Deepest detail level: merged LH+HL+HH
+            }
+            let is_hh = (lx >= half) && (ly >= half);
+            let base = 2u + (lfd - 1u) * 2u;
+            return select(base, base + 1u, is_hh);
         }
         region = half;
     }
-    return 0u;
+    return 0u;  // LL
 }
 
 // Encode a single rANS symbol given its cumfreq start and freq.

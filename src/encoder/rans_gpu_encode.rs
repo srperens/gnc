@@ -18,7 +18,7 @@ use crate::{FrameInfo, GpuContext};
 
 const MAX_STREAM_BYTES: usize = 4096;
 const HIST_TILE_STRIDE: usize = 32793; // 1 + MAX_GROUPS*(3+MAX_GROUP_ALPHABET)
-const ENCODE_TILE_INFO_STRIDE: usize = 32;
+const ENCODE_TILE_INFO_STRIDE: usize = 36;
 const MAX_ALPHABET: usize = 4096;
 const MAX_GROUP_ALPHABET: usize = 4096;
 const MAX_GROUPS: usize = 8;
@@ -188,6 +188,9 @@ pub struct GpuRansEncoder {
     encode_pipeline: wgpu::ComputePipeline,
     encode_lean_pipeline: wgpu::ComputePipeline,
     encode_bgl: wgpu::BindGroupLayout,
+    // Fused normalize+encode: single dispatch replaces normalize + encode_lean
+    fused_norm_enc_pipeline: wgpu::ComputePipeline,
+    fused_norm_enc_bgl: wgpu::BindGroupLayout,
     cached: Option<CachedEncodeBuffers>,
 }
 
@@ -364,6 +367,50 @@ impl GpuRansEncoder {
                     cache: None,
                 });
 
+        // --- Fused normalize+encode pipeline ---
+        let fused_ne_shader =
+            ctx.device
+                .create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("rans_normalize_encode_fused"),
+                    source: wgpu::ShaderSource::Wgsl(
+                        include_str!("../shaders/rans_normalize_encode_fused.wgsl").into(),
+                    ),
+                });
+
+        let fused_norm_enc_bgl =
+            ctx.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("rans_fused_ne_bgl"),
+                    entries: &[
+                        make_uniform_entry(0),        // params
+                        make_storage_entry(1, true),  // hist_input
+                        make_storage_entry(2, true),  // coeff_input
+                        make_storage_entry(3, false), // cumfreq_out
+                        make_storage_entry(4, false), // tile_info_out
+                        make_storage_entry(5, false), // stream_output
+                        make_storage_entry(6, false), // stream_metadata
+                    ],
+                });
+
+        let fused_ne_pl =
+            ctx.device
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("rans_fused_ne_pl"),
+                    bind_group_layouts: &[&fused_norm_enc_bgl],
+                    push_constant_ranges: &[],
+                });
+
+        let fused_norm_enc_pipeline =
+            ctx.device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("rans_fused_ne_pipeline"),
+                    layout: Some(&fused_ne_pl),
+                    module: &fused_ne_shader,
+                    entry_point: Some("main"),
+                    compilation_options: Default::default(),
+                    cache: None,
+                });
+
         Self {
             histogram_pipeline,
             histogram_bgl,
@@ -372,6 +419,8 @@ impl GpuRansEncoder {
             encode_pipeline,
             encode_lean_pipeline,
             encode_bgl,
+            fused_norm_enc_pipeline,
+            fused_norm_enc_bgl,
             cached: None,
         }
     }
@@ -892,6 +941,253 @@ impl GpuRansEncoder {
         if std::env::var("GNC_PROFILE").is_ok() {
             eprintln!(
                 "[rans_3plane] submit={:.2}ms map_async={:.2}ms poll={:.2}ms recv={:.2}ms pack={:.2}ms total={:.2}ms readback_bytes={:.1}MB",
+                t_submit.as_secs_f64() * 1000.0,
+                (t_map_async - t_submit).as_secs_f64() * 1000.0,
+                (t_poll - t_map_async).as_secs_f64() * 1000.0,
+                (t_readback - t_poll).as_secs_f64() * 1000.0,
+                (t_pack - t_readback).as_secs_f64() * 1000.0,
+                t_pack.as_secs_f64() * 1000.0,
+                (stream_size * 3 + meta_size * 3 + cumfreq_size * 3 + tile_info_size * 3) as f64 / 1_048_576.0,
+            );
+        }
+
+        (all_rans_tiles, all_subband_tiles)
+    }
+
+    /// Fused 3-plane encode: histogram → fused_normalize_encode (2 dispatches instead of 3).
+    /// The fused shader keeps cumfreq in shared memory and uses reciprocal multiplication
+    /// for faster rANS division.
+    pub fn encode_3planes_fused(
+        &mut self,
+        ctx: &GpuContext,
+        quantized_bufs: [&wgpu::Buffer; 3],
+        info: &FrameInfo,
+        per_subband: bool,
+        num_levels: u32,
+    ) -> (Vec<InterleavedRansTile>, Vec<SubbandRansTile>) {
+        let num_tiles = (info.tiles_x() * info.tiles_y()) as usize;
+        let total_streams = num_tiles * STREAMS_PER_TILE;
+        let cf_stride = cumfreq_stride(per_subband);
+
+        self.ensure_buffers(ctx, num_tiles, per_subband);
+        let bufs = self.cached.as_ref().unwrap();
+
+        let stream_size = (total_streams * MAX_STREAM_BYTES) as u64;
+        let meta_size = (total_streams * 2 * 4) as u64;
+        let cumfreq_size = (num_tiles * cf_stride * 4) as u64;
+        let tile_info_size = (num_tiles * ENCODE_TILE_INFO_STRIDE * 4) as u64;
+
+        let params = RansEncodeParams {
+            num_tiles: num_tiles as u32,
+            coefficients_per_tile: info.tile_size * info.tile_size,
+            plane_width: info.padded_width(),
+            tile_size: info.tile_size,
+            tiles_x: info.tiles_x(),
+            per_subband: u32::from(per_subband),
+            num_levels,
+            flags: 1, // disable ZRL (lean encoder)
+        };
+        let params_buf = ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("rans_params"),
+                contents: bytemuck::bytes_of(&params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+
+        let mut cmd = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("rans_3plane_fused_cmd"),
+            });
+
+        for (p, quantized_buf) in quantized_bufs.iter().enumerate() {
+            let hist_bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("rans_hist_bg"),
+                layout: &self.histogram_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: params_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: quantized_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: bufs.hist_buf.as_entire_binding(),
+                    },
+                ],
+            });
+
+            let fused_bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("rans_fused_ne_bg"),
+                layout: &self.fused_norm_enc_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: params_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: bufs.hist_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: quantized_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: bufs.cumfreq_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: bufs.tile_info_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: bufs.stream_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: bufs.meta_buf.as_entire_binding(),
+                    },
+                ],
+            });
+
+            // Zero-initialize stream buffer
+            cmd.clear_buffer(&bufs.stream_buf, 0, None);
+
+            // Pass 1: Histogram (256 threads)
+            {
+                let mut pass = cmd.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("rans_hist_pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.histogram_pipeline);
+                pass.set_bind_group(0, &hist_bg, &[]);
+                pass.dispatch_workgroups(num_tiles as u32, 1, 1);
+            }
+
+            // Pass 2: Fused normalize+encode (256 threads, replaces 2 separate dispatches)
+            {
+                let mut pass = cmd.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("rans_fused_ne_pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.fused_norm_enc_pipeline);
+                pass.set_bind_group(0, &fused_bg, &[]);
+                pass.dispatch_workgroups(num_tiles as u32, 1, 1);
+            }
+
+            // Copy results to staging
+            cmd.copy_buffer_to_buffer(
+                &bufs.stream_buf,
+                0,
+                &bufs.stream_staging[p],
+                0,
+                stream_size,
+            );
+            cmd.copy_buffer_to_buffer(&bufs.meta_buf, 0, &bufs.meta_staging[p], 0, meta_size);
+            cmd.copy_buffer_to_buffer(
+                &bufs.cumfreq_buf,
+                0,
+                &bufs.cumfreq_staging[p],
+                0,
+                cumfreq_size,
+            );
+            cmd.copy_buffer_to_buffer(
+                &bufs.tile_info_buf,
+                0,
+                &bufs.tile_info_staging[p],
+                0,
+                tile_info_size,
+            );
+        }
+
+        let t_gpu_start = std::time::Instant::now();
+        ctx.queue.submit(Some(cmd.finish()));
+        let t_submit = t_gpu_start.elapsed();
+
+        // Map all 12 staging buffers, single poll
+        let (tx, rx) = std::sync::mpsc::channel();
+        for p in 0..3 {
+            for staging in [
+                &bufs.stream_staging[p],
+                &bufs.meta_staging[p],
+                &bufs.cumfreq_staging[p],
+                &bufs.tile_info_staging[p],
+            ] {
+                let tx_clone = tx.clone();
+                staging
+                    .slice(..)
+                    .map_async(wgpu::MapMode::Read, move |result| {
+                        tx_clone.send(result).unwrap();
+                    });
+            }
+        }
+        drop(tx);
+        let t_map_async = t_gpu_start.elapsed();
+        ctx.device.poll(wgpu::Maintain::Wait);
+        let t_poll = t_gpu_start.elapsed();
+        for _ in 0..12 {
+            rx.recv().unwrap().unwrap();
+        }
+        let t_readback = t_gpu_start.elapsed();
+
+        // Read back and pack all 3 planes
+        let mut all_rans_tiles = Vec::new();
+        let mut all_subband_tiles = Vec::new();
+
+        for p in 0..3 {
+            let stream_data: Vec<u32> = {
+                let view = bufs.stream_staging[p].slice(..).get_mapped_range();
+                bytemuck::cast_slice(&view).to_vec()
+            };
+            let meta_data: Vec<u32> = {
+                let view = bufs.meta_staging[p].slice(..).get_mapped_range();
+                bytemuck::cast_slice(&view).to_vec()
+            };
+            let cumfreq_data: Vec<u32> = {
+                let view = bufs.cumfreq_staging[p].slice(..).get_mapped_range();
+                bytemuck::cast_slice(&view).to_vec()
+            };
+            let tile_info_data: Vec<u32> = {
+                let view = bufs.tile_info_staging[p].slice(..).get_mapped_range();
+                bytemuck::cast_slice(&view).to_vec()
+            };
+
+            bufs.stream_staging[p].unmap();
+            bufs.meta_staging[p].unmap();
+            bufs.cumfreq_staging[p].unmap();
+            bufs.tile_info_staging[p].unmap();
+
+            let tile_freqs = Self::reconstruct_tile_freqs(
+                &cumfreq_data,
+                &tile_info_data,
+                num_tiles,
+                per_subband,
+            );
+
+            let (mut rt, mut st) = Self::pack_tiles(
+                &stream_data,
+                &meta_data,
+                &tile_freqs,
+                num_tiles,
+                info,
+                per_subband,
+                num_levels,
+            );
+            all_rans_tiles.append(&mut rt);
+            all_subband_tiles.append(&mut st);
+        }
+
+        let t_pack = t_gpu_start.elapsed();
+
+        if std::env::var("GNC_PROFILE").is_ok() {
+            eprintln!(
+                "[rans_3plane_fused] submit={:.2}ms map_async={:.2}ms poll={:.2}ms recv={:.2}ms pack={:.2}ms total={:.2}ms readback_bytes={:.1}MB",
                 t_submit.as_secs_f64() * 1000.0,
                 (t_map_async - t_submit).as_secs_f64() * 1000.0,
                 (t_poll - t_map_async).as_secs_f64() * 1000.0,

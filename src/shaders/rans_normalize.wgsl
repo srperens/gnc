@@ -14,7 +14,7 @@ const MAX_ALPHABET: u32 = 4096u;
 const MAX_GROUP_ALPHABET: u32 = 4096u;
 const MAX_GROUPS: u32 = 8u;
 const HIST_TILE_STRIDE: u32 = 32793u;  // 1 + MAX_GROUPS*(3+MAX_GROUP_ALPHABET)
-const ENCODE_TILE_INFO_STRIDE: u32 = 32u;
+const ENCODE_TILE_INFO_STRIDE: u32 = 36u;
 
 struct Params {
     num_tiles: u32,

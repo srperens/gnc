@@ -181,16 +181,25 @@ fn quantize_coeff(val: f32, effective_step: f32) -> i32 {
 
 // ---- Histogram helpers (from rans_histogram.wgsl) ----
 
+// Directional subband grouping: separates HH from LH+HL at each level.
+// Group 0 = LL, Group 1 = deepest detail (merged), then pairs of (LH+HL, HH)
+// for remaining levels from deep to shallow. Total groups = num_levels * 2.
 fn compute_subband_group(lx: u32, ly: u32) -> u32 {
     var region = params.tile_size;
     for (var level = 0u; level < params.num_levels; level++) {
         let half = region / 2u;
         if (lx >= half || ly >= half) {
-            return level + 1u;
+            let lfd = params.num_levels - 1u - level;
+            if (lfd == 0u) {
+                return 1u;  // Deepest detail level: merged LH+HL+HH
+            }
+            let is_hh = (lx >= half) && (ly >= half);
+            let base = 2u + (lfd - 1u) * 2u;
+            return select(base, base + 1u, is_hh);
         }
         region = half;
     }
-    return 0u;
+    return 0u;  // LL
 }
 
 // Read one coefficient from the plane, quantize it, and write to output.
@@ -266,7 +275,7 @@ fn main(
 
     if (params.per_subband != 0u) {
         // --- Per-subband mode ---
-        let num_groups = params.num_levels + 1u;
+        let num_groups = params.num_levels * 2u;
 
         // Phase 1: Quantize all coefficients, track per-group min/max/zeros/max_abs
         var local_min: array<i32, 8>;

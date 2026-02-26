@@ -76,7 +76,7 @@ impl WaveletTransform {
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("transform_53"),
-                source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/transform.wgsl").into()),
+                source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/transform_53.wgsl").into()),
             });
 
         let pipeline_53 = ctx

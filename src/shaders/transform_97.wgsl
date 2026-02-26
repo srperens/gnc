@@ -33,7 +33,7 @@ struct Params {
 @group(0) @binding(1) var<storage, read> input: array<f32>;
 @group(0) @binding(2) var<storage, read_write> output: array<f32>;
 
-// Shared memory — same layout as transform.wgsl
+// Shared memory — same layout as transform_53.wgsl
 var<workgroup> shared_data: array<f32, 256>;
 var<workgroup> shared_low: array<f32, 128>;
 var<workgroup> shared_high: array<f32, 128>;

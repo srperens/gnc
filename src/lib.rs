@@ -426,6 +426,7 @@ pub fn quality_preset(q: u32) -> CodecConfig {
         adaptive_quantization: aq_enabled,
         aq_strength,
         context_adaptive: false, // CPU-only; enable explicitly when GPU implementation exists
+        use_fused_quantize_histogram: true, // auto-disabled when CfL is active
         ..Default::default()
     }
 }

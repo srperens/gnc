@@ -79,7 +79,7 @@ impl EncoderPipeline {
         let plane_size = (padded_pixels * std::mem::size_of::<f32>()) as u64;
 
         // Ensure cached buffers (including gpu_ref_planes) exist for this resolution
-        self.ensure_cached(ctx, padded_w, padded_h);
+        self.ensure_cached(ctx, padded_w, padded_h, width, height);
 
         // Create rate controller if target bitrate is set
         let mut rate_ctrl = config
@@ -459,7 +459,7 @@ impl EncoderPipeline {
     ) -> CompressedFrame {
         let plane_size = (padded_pixels * std::mem::size_of::<f32>()) as u64;
 
-        self.ensure_cached(ctx, padded_w, padded_h);
+        self.ensure_cached(ctx, padded_w, padded_h, width, height);
         let bufs = self.cached.as_ref().unwrap();
 
         let padded_rgb = pad_frame(rgb_data, width, height, padded_w, padded_h);
@@ -826,7 +826,7 @@ impl EncoderPipeline {
     ) -> CompressedFrame {
         let plane_size = (padded_pixels * std::mem::size_of::<f32>()) as u64;
 
-        self.ensure_cached(ctx, padded_w, padded_h);
+        self.ensure_cached(ctx, padded_w, padded_h, width, height);
         let bufs = self.cached.as_ref().unwrap();
 
         let padded_rgb = pad_frame(rgb_data, width, height, padded_w, padded_h);

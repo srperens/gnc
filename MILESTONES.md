@@ -220,9 +220,12 @@ Largest single compression opportunity. Current rANS treats each coefficient ind
 **Why:** Real-time 1080p60 encode/decode is the throughput target for broadcast.
 
 ### 6A: Fused GPU Kernels
+- Lean rANS encode shader without ZRL arrays (eliminates 16 KB/thread register spilling) ✅
+- GPU-side frame padding shader (replaces CPU `pad_frame()`, saves ~6ms at 1080p) ✅
+- Deferred weight map readback (eliminates intermediate GPU poll, saves ~5ms) ✅
 - Fused wavelet+quantize shader (eliminate intermediate buffer)
 - Fused quantize+histogram (single read of coefficients)
-- GPU-side frame padding (eliminate CPU `pad_frame()`)
+- **Result**: encode 124ms → 34ms (29→30 fps), no quality regression
 
 ### 6B: 4K Validation
 - Benchmark 3840x2160 content

@@ -41,7 +41,7 @@ struct RansEncodeParams {
     tiles_x: u32,
     per_subband: u32,
     num_levels: u32,
-    _pad: u32,
+    flags: u32, // bit 0: disable ZRL (use lean encoder)
 }
 
 /// Normalized frequency data for one tile (single-table mode).
@@ -182,7 +182,9 @@ pub struct GpuRansEncoder {
     histogram_bgl: wgpu::BindGroupLayout,
     normalize_pipeline: wgpu::ComputePipeline,
     normalize_bgl: wgpu::BindGroupLayout,
+    #[allow(dead_code)] // ZRL variant kept as fallback for quality-over-speed mode
     encode_pipeline: wgpu::ComputePipeline,
+    encode_lean_pipeline: wgpu::ComputePipeline,
     encode_bgl: wgpu::BindGroupLayout,
     cached: Option<CachedEncodeBuffers>,
 }
@@ -339,12 +341,34 @@ impl GpuRansEncoder {
                     cache: None,
                 });
 
+        // --- Lean encode pipeline (no ZRL, avoids 16 KB/thread register spilling) ---
+        let enc_lean_shader =
+            ctx.device
+                .create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("rans_encode_lean"),
+                    source: wgpu::ShaderSource::Wgsl(
+                        include_str!("../shaders/rans_encode_lean.wgsl").into(),
+                    ),
+                });
+
+        let encode_lean_pipeline =
+            ctx.device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("rans_encode_lean_pipeline"),
+                    layout: Some(&enc_pl),
+                    module: &enc_lean_shader,
+                    entry_point: Some("main"),
+                    compilation_options: Default::default(),
+                    cache: None,
+                });
+
         Self {
             histogram_pipeline,
             histogram_bgl,
             normalize_pipeline,
             normalize_bgl,
             encode_pipeline,
+            encode_lean_pipeline,
             encode_bgl,
             cached: None,
         }
@@ -382,6 +406,7 @@ impl GpuRansEncoder {
         let bufs = self.cached.as_ref().unwrap();
 
         // Params buffer (small, changes per plane)
+        // flags bit 0 = disable ZRL (use lean encoder for ~10x GPU speedup)
         let params = RansEncodeParams {
             num_tiles: num_tiles as u32,
             coefficients_per_tile: info.tile_size * info.tile_size,
@@ -390,7 +415,7 @@ impl GpuRansEncoder {
             tiles_x: info.tiles_x(),
             per_subband: u32::from(per_subband),
             num_levels,
-            _pad: 0,
+            flags: 1, // disable ZRL
         };
         let params_buf = ctx
             .device
@@ -507,12 +532,13 @@ impl GpuRansEncoder {
         }
 
         // Pass 3: Encode (reads cumfreq_buf + tile_info_buf, writes stream_buf + meta_buf)
+        // Use lean pipeline (no ZRL arrays) to avoid register spilling
         {
             let mut pass = cmd.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("rans_encode_pass"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.encode_pipeline);
+            pass.set_pipeline(&self.encode_lean_pipeline);
             pass.set_bind_group(0, &encode_bg, &[]);
             pass.dispatch_workgroups(num_tiles as u32, 1, 1);
         }
@@ -634,7 +660,7 @@ impl GpuRansEncoder {
             tiles_x: info.tiles_x(),
             per_subband: u32::from(per_subband),
             num_levels,
-            _pad: 0,
+            flags: 1, // disable ZRL (lean encoder)
         };
         let params_buf = ctx
             .device
@@ -748,12 +774,13 @@ impl GpuRansEncoder {
                 pass.set_bind_group(0, &norm_bg, &[]);
                 pass.dispatch_workgroups(num_tiles as u32, 1, 1);
             }
+            // Use lean pipeline (no ZRL arrays) to avoid register spilling
             {
                 let mut pass = cmd.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("rans_encode_pass"),
                     timestamp_writes: None,
                 });
-                pass.set_pipeline(&self.encode_pipeline);
+                pass.set_pipeline(&self.encode_lean_pipeline);
                 pass.set_bind_group(0, &encode_bg, &[]);
                 pass.dispatch_workgroups(num_tiles as u32, 1, 1);
             }
@@ -777,8 +804,12 @@ impl GpuRansEncoder {
             );
         }
 
+        let t_gpu_start = std::time::Instant::now();
+
         // Single submit for all 3 planes
         ctx.queue.submit(Some(cmd.finish()));
+
+        let t_submit = t_gpu_start.elapsed();
 
         // Map all 12 staging buffers, single poll
         let (tx, rx) = std::sync::mpsc::channel();
@@ -798,10 +829,14 @@ impl GpuRansEncoder {
             }
         }
         drop(tx);
+        let t_map_async = t_gpu_start.elapsed();
         ctx.device.poll(wgpu::Maintain::Wait);
+        let t_poll = t_gpu_start.elapsed();
         for _ in 0..12 {
             rx.recv().unwrap().unwrap();
         }
+
+        let t_readback = t_gpu_start.elapsed();
 
         // Read back and pack all 3 planes
         let mut all_rans_tiles = Vec::new();
@@ -848,6 +883,21 @@ impl GpuRansEncoder {
             );
             all_rans_tiles.append(&mut rt);
             all_subband_tiles.append(&mut st);
+        }
+
+        let t_pack = t_gpu_start.elapsed();
+
+        if std::env::var("GNC_PROFILE").is_ok() {
+            eprintln!(
+                "[rans_3plane] submit={:.2}ms map_async={:.2}ms poll={:.2}ms recv={:.2}ms pack={:.2}ms total={:.2}ms readback_bytes={:.1}MB",
+                t_submit.as_secs_f64() * 1000.0,
+                (t_map_async - t_submit).as_secs_f64() * 1000.0,
+                (t_poll - t_map_async).as_secs_f64() * 1000.0,
+                (t_readback - t_poll).as_secs_f64() * 1000.0,
+                (t_pack - t_readback).as_secs_f64() * 1000.0,
+                t_pack.as_secs_f64() * 1000.0,
+                (stream_size * 3 + meta_size * 3 + cumfreq_size * 3 + tile_info_size * 3) as f64 / 1_048_576.0,
+            );
         }
 
         (all_rans_tiles, all_subband_tiles)
@@ -940,21 +990,17 @@ impl GpuRansEncoder {
             let mut per_stream_data: Vec<Vec<u8>> = Vec::with_capacity(STREAMS_PER_TILE);
             let mut per_stream_state: Vec<u32> = Vec::with_capacity(STREAMS_PER_TILE);
 
+            // Cast u32 stream data to bytes once (little-endian, zero-copy reinterpret)
+            let stream_bytes: &[u8] = bytemuck::cast_slice(stream_data);
+
             for s in 0..STREAMS_PER_TILE {
                 let stream_idx = t * STREAMS_PER_TILE + s;
                 let meta_base = stream_idx * 2;
                 let write_ptr = meta_data[meta_base] as usize;
                 let final_state = meta_data[meta_base + 1];
 
-                let stream_byte_base = stream_idx * MAX_STREAM_BYTES;
-                let mut bytes = Vec::with_capacity(MAX_STREAM_BYTES - write_ptr);
-                for byte_off in write_ptr..MAX_STREAM_BYTES {
-                    let global_byte = stream_byte_base + byte_off;
-                    let word_idx = global_byte / 4;
-                    let byte_pos = global_byte % 4;
-                    let byte_val = (stream_data[word_idx] >> (byte_pos as u32 * 8)) & 0xFF;
-                    bytes.push(byte_val as u8);
-                }
+                let byte_base = stream_idx * MAX_STREAM_BYTES;
+                let bytes = stream_bytes[byte_base + write_ptr..byte_base + MAX_STREAM_BYTES].to_vec();
 
                 per_stream_data.push(bytes);
                 per_stream_state.push(final_state);

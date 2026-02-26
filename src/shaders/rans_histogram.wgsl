@@ -34,7 +34,7 @@ struct Params {
     tiles_x: u32,
     per_subband: u32,
     num_levels: u32,
-    _pad: u32,
+    flags: u32,        // bit 0: disable ZRL (use lean encoder)
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -216,9 +216,10 @@ fn main(
                     shared_group_zrun[g] = 0;
                 } else {
                     // ZRL decision: detail subbands only (g > 0), high zero density,
-                    // sufficient non-ZRL alphabet size
+                    // sufficient non-ZRL alphabet size.
+                    // Disabled when flags bit 0 is set (lean encoder mode).
                     var zrun_base_val = 0;
-                    if (g > 0u && total_count > 0u) {
+                    if ((params.flags & 1u) == 0u && g > 0u && total_count > 0u) {
                         let non_zrl_asize = u32(2 * max_abs_nz + 1);
                         // Zero fraction check: >= 60% zeros
                         // (multiply to avoid float: total_zeros * 5 >= total_count * 3)
@@ -423,10 +424,10 @@ fn main(
         // max_abs_nonzero reduction
         let max_abs_nz = reduce_max_i32(lid, local_max_abs_nz);
 
-        // Thread 0 decides ZRL and broadcasts
+        // Thread 0 decides ZRL and broadcasts (disabled when flags bit 0 set)
         if (lid == 0u) {
             var zrun_base_val = 0;
-            if (total_count > 0u) {
+            if ((params.flags & 1u) == 0u && total_count > 0u) {
                 let non_zrl_asize = u32(2 * max_abs_nz + 1);
                 let zrl_eligible = (total_zeros * 5u >= total_count * 3u)
                                 && (non_zrl_asize >= 16u);

@@ -1,8 +1,9 @@
 use wgpu;
+use wgpu::util::DeviceExt;
 
 use super::adaptive::{self, VarianceAnalyzer, WeightMapNormalizer, AQ_LL_BLOCK_SIZE};
 use super::bitplane;
-use super::buffer_cache::{pad_frame, CachedEncodeBuffers};
+use super::buffer_cache::CachedEncodeBuffers;
 use super::cfl::{self, CflAlphaComputer, CflForwardPredictor, CflPredictor};
 use super::color::ColorConverter;
 use super::entropy_helpers::{encode_entropy, EntropyMode};
@@ -11,7 +12,7 @@ use super::quantize::Quantizer;
 use super::rans;
 use super::rans_gpu_encode::GpuRansEncoder;
 use super::transform::WaveletTransform;
-use crate::gpu_util::{ensure_var_buf, read_buffer_f32};
+use crate::gpu_util::ensure_var_buf;
 use crate::{
     CflAlphas, CodecConfig, CompressedFrame, EntropyCoder, EntropyData, FrameInfo, FrameType,
     GpuContext,
@@ -33,11 +34,77 @@ pub struct EncoderPipeline {
     pub(super) cfl_alpha: CflAlphaComputer,
     pub(super) cfl_forward: CflForwardPredictor,
     pub(super) cfl_inverse: CflPredictor,
+    pad_pipeline: wgpu::ComputePipeline,
+    pad_bgl: wgpu::BindGroupLayout,
     pub(super) cached: Option<CachedEncodeBuffers>,
 }
 
 impl EncoderPipeline {
     pub fn new(ctx: &GpuContext) -> Self {
+        // GPU pad pipeline
+        let pad_shader = ctx
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("pad"),
+                source: wgpu::ShaderSource::Wgsl(
+                    include_str!("../shaders/pad.wgsl").into(),
+                ),
+            });
+        let pad_bgl =
+            ctx.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("pad_bgl"),
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 2,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                    ],
+                });
+        let pad_pl =
+            ctx.device
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("pad_pl"),
+                    bind_group_layouts: &[&pad_bgl],
+                    push_constant_ranges: &[],
+                });
+        let pad_pipeline =
+            ctx.device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("pad_pipeline"),
+                    layout: Some(&pad_pl),
+                    module: &pad_shader,
+                    entry_point: Some("main"),
+                    compilation_options: Default::default(),
+                    cache: None,
+                });
+
         Self {
             color: ColorConverter::new(ctx),
             transform: WaveletTransform::new(ctx),
@@ -50,20 +117,36 @@ impl EncoderPipeline {
             cfl_alpha: CflAlphaComputer::new(ctx),
             cfl_forward: CflForwardPredictor::new(ctx),
             cfl_inverse: CflPredictor::new(ctx),
+            pad_pipeline,
+            pad_bgl,
             cached: None,
         }
     }
 
-    /// Ensure cached buffers exist and match the given padded resolution.
-    pub(super) fn ensure_cached(&mut self, ctx: &GpuContext, padded_w: u32, padded_h: u32) {
+    /// Ensure cached buffers exist and match the given resolution.
+    pub(super) fn ensure_cached(
+        &mut self,
+        ctx: &GpuContext,
+        padded_w: u32,
+        padded_h: u32,
+        orig_w: u32,
+        orig_h: u32,
+    ) {
         let needs_alloc = match &self.cached {
-            Some(c) => c.padded_w != padded_w || c.padded_h != padded_h,
+            Some(c) => {
+                c.padded_w != padded_w
+                    || c.padded_h != padded_h
+                    || c.orig_w != orig_w
+                    || c.orig_h != orig_h
+            }
             None => true,
         };
         if !needs_alloc {
             return;
         }
-        self.cached = Some(CachedEncodeBuffers::new(ctx, padded_w, padded_h));
+        self.cached = Some(CachedEncodeBuffers::new(
+            ctx, padded_w, padded_h, orig_w, orig_h,
+        ));
     }
 
     /// Encode an RGB frame.
@@ -77,6 +160,9 @@ impl EncoderPipeline {
         height: u32,
         config: &CodecConfig,
     ) -> CompressedFrame {
+        let profile = std::env::var("GNC_PROFILE").is_ok();
+        let t_start = std::time::Instant::now();
+
         let info = FrameInfo {
             width,
             height,
@@ -90,22 +176,75 @@ impl EncoderPipeline {
         let plane_size = (padded_pixels * std::mem::size_of::<f32>()) as u64;
 
         // Ensure cached buffers exist for this resolution
-        self.ensure_cached(ctx, padded_w, padded_h);
+        self.ensure_cached(ctx, padded_w, padded_h, width, height);
         let bufs = self.cached.as_ref().unwrap();
 
-        // Pad input to tile-aligned dimensions
-        let padded_rgb = pad_frame(rgb_data, width, height, padded_w, padded_h);
+        let t_setup = t_start.elapsed();
 
-        // Upload input
+        // Upload raw (unpadded) input directly to GPU — GPU shader handles padding
         ctx.queue
-            .write_buffer(&bufs.input_buf, 0, bytemuck::cast_slice(&padded_rgb));
+            .write_buffer(&bufs.raw_input_buf, 0, bytemuck::cast_slice(rgb_data));
 
-        // ---- Submit 1: color convert + deinterleave ----
+        let t_pad = t_start.elapsed();
+
+        // ---- Submit 1: GPU pad + color convert + deinterleave ----
         let mut cmd = ctx
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("encode_preprocess"),
             });
+
+        // GPU pad: raw_input_buf -> input_buf (edge-replicate to tile alignment)
+        {
+            #[repr(C)]
+            #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+            struct PadParams {
+                width: u32,
+                height: u32,
+                padded_w: u32,
+                padded_h: u32,
+            }
+            let pad_params = PadParams {
+                width,
+                height,
+                padded_w,
+                padded_h,
+            };
+            let pad_params_buf =
+                ctx.device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("pad_params"),
+                        contents: bytemuck::bytes_of(&pad_params),
+                        usage: wgpu::BufferUsages::UNIFORM,
+                    });
+            let pad_bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("pad_bg"),
+                layout: &self.pad_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: pad_params_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: bufs.raw_input_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: bufs.input_buf.as_entire_binding(),
+                    },
+                ],
+            });
+            let total_padded_pixels = padded_w * padded_h;
+            let workgroups = total_padded_pixels.div_ceil(256);
+            let mut pass = cmd.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("pad_pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pad_pipeline);
+            pass.set_bind_group(0, &pad_bg, &[]);
+            pass.dispatch_workgroups(workgroups, 1, 1);
+        }
 
         // Color convert (RGB -> YCoCg-R): input_buf -> color_out (interleaved)
         self.color.dispatch(
@@ -131,6 +270,8 @@ impl EncoderPipeline {
         );
 
         ctx.queue.submit(Some(cmd.finish()));
+
+        let t_preprocess = t_start.elapsed();
 
         // ---- Per-plane encoding ----
         let mut rans_tiles: Vec<rans::InterleavedRansTile> = Vec::new();
@@ -499,47 +640,33 @@ impl EncoderPipeline {
         }
         // Cg quantized stays in plane_b (last plane, no overwrite)
 
-        // Single submit for all 3 planes
-        ctx.queue.submit(Some(cmd.finish()));
-
-        // Weight map readback (for serialization into CompressedFrame)
-        let weight_map = if aq_active {
+        // Add weight map copy to staging WITHIN this command encoder (deferred readback)
+        let wm_total_blocks = if aq_active {
             let (total_blocks, _, _, _) = adaptive::weight_map_dims(
                 padded_w,
                 padded_h,
                 config.tile_size,
                 config.wavelet_levels,
             );
-            let wm = read_buffer_f32(ctx, &bufs.weight_map_buf, total_blocks as usize);
-            Some(wm)
+            let wm_bytes = (total_blocks as u64) * std::mem::size_of::<f32>() as u64;
+            cmd.copy_buffer_to_buffer(
+                &bufs.weight_map_buf,
+                0,
+                &bufs.weight_map_staging,
+                0,
+                wm_bytes,
+            );
+            total_blocks as usize
         } else {
-            None
+            0
         };
 
-        // Deferred CfL alpha readback (single poll for both chroma planes)
-        if config.cfl_enabled {
-            let (tx, rx) = std::sync::mpsc::channel();
-            for stg in &alpha_staging {
-                let tx_c = tx.clone();
-                stg.slice(..).map_async(wgpu::MapMode::Read, move |result| {
-                    tx_c.send(result).unwrap();
-                });
-            }
-            drop(tx);
-            ctx.device.poll(wgpu::Maintain::Wait);
-            for _ in 0..2 {
-                rx.recv().unwrap().unwrap();
-            }
-            for stg in &alpha_staging {
-                let view = stg.slice(..).get_mapped_range();
-                // Shader writes i32 values quantized to i16 range [-16384, 16384]
-                let raw_alphas: &[i32] = bytemuck::cast_slice(&view);
-                let q_alphas: Vec<i16> = raw_alphas.iter().map(|&a| a as i16).collect();
-                cfl_alphas_all.extend_from_slice(&q_alphas);
-                drop(view);
-                stg.unmap();
-            }
-        }
+        let t_wavelet_quant = t_start.elapsed();
+
+        // Single submit for all 3 planes + weight map copy (no blocking poll!)
+        ctx.queue.submit(Some(cmd.finish()));
+
+        let t_submit_wq = t_start.elapsed();
 
         // CPU entropy encode path: each plane reads from its persisted buffer
         if !use_gpu_encode {
@@ -569,7 +696,9 @@ impl EncoderPipeline {
             }
         }
 
-        // Batched 3-plane rANS encode: single submit + single poll for all planes
+        // Batched 3-plane rANS encode: single submit + single poll for all planes.
+        // GPU queue guarantees sequential execution: wavelet+quantize finishes before
+        // entropy starts reading quantized buffers. No intermediate poll needed.
         if use_gpu_encode {
             // Y quantized in mc_out, Co in ref_upload, Cg in plane_b
             let (mut rt, mut st) = self.gpu_encoder.encode_3planes_to_tiles(
@@ -581,6 +710,56 @@ impl EncoderPipeline {
             );
             rans_tiles.append(&mut rt);
             subband_tiles.append(&mut st);
+        }
+
+        let t_entropy = t_start.elapsed();
+
+        // Deferred weight map readback (data was copied to staging in cmd2, already
+        // submitted and completed as part of the wavelet+quantize + entropy GPU work)
+        let weight_map = if aq_active && wm_total_blocks > 0 {
+            let bufs = self.cached.as_ref().unwrap();
+            let wm_bytes = (wm_total_blocks * std::mem::size_of::<f32>()) as u64;
+            let (tx, rx) = std::sync::mpsc::channel();
+            let tx_c = tx.clone();
+            bufs.weight_map_staging
+                .slice(..wm_bytes)
+                .map_async(wgpu::MapMode::Read, move |result| {
+                    tx_c.send(result).unwrap();
+                });
+            drop(tx);
+            ctx.device.poll(wgpu::Maintain::Wait);
+            rx.recv().unwrap().unwrap();
+            let view = bufs.weight_map_staging.slice(..wm_bytes).get_mapped_range();
+            let wm: Vec<f32> = bytemuck::cast_slice(&view).to_vec();
+            drop(view);
+            bufs.weight_map_staging.unmap();
+            Some(wm)
+        } else {
+            None
+        };
+
+        // Deferred CfL alpha readback
+        if config.cfl_enabled {
+            let (tx, rx) = std::sync::mpsc::channel();
+            for stg in &alpha_staging {
+                let tx_c = tx.clone();
+                stg.slice(..).map_async(wgpu::MapMode::Read, move |result| {
+                    tx_c.send(result).unwrap();
+                });
+            }
+            drop(tx);
+            ctx.device.poll(wgpu::Maintain::Wait);
+            for _ in 0..2 {
+                rx.recv().unwrap().unwrap();
+            }
+            for stg in &alpha_staging {
+                let view = stg.slice(..).get_mapped_range();
+                let raw_alphas: &[i32] = bytemuck::cast_slice(&view);
+                let q_alphas: Vec<i16> = raw_alphas.iter().map(|&a| a as i16).collect();
+                cfl_alphas_all.extend_from_slice(&q_alphas);
+                drop(view);
+                stg.unmap();
+            }
         }
 
         let cfl_alphas = if config.cfl_enabled {
@@ -599,6 +778,20 @@ impl EncoderPipeline {
             }
             EntropyMode::Rans => EntropyData::Rans(rans_tiles),
         };
+
+        if profile {
+            let t_total = t_start.elapsed();
+            eprintln!(
+                "[encode profile] setup={:.2}ms pad={:.2}ms preprocess={:.2}ms wq_cmd={:.2}ms wq_submit={:.2}ms entropy={:.2}ms total={:.2}ms",
+                t_setup.as_secs_f64() * 1000.0,
+                (t_pad - t_setup).as_secs_f64() * 1000.0,
+                (t_preprocess - t_pad).as_secs_f64() * 1000.0,
+                (t_wavelet_quant - t_preprocess).as_secs_f64() * 1000.0,
+                (t_submit_wq - t_wavelet_quant).as_secs_f64() * 1000.0,
+                (t_entropy - t_submit_wq).as_secs_f64() * 1000.0,
+                t_total.as_secs_f64() * 1000.0,
+            );
+        }
 
         CompressedFrame {
             info,

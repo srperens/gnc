@@ -8,6 +8,11 @@ pub(super) struct CachedEncodeBuffers {
     // Resolution these buffers were allocated for
     pub(super) padded_w: u32,
     pub(super) padded_h: u32,
+    pub(super) orig_w: u32,
+    pub(super) orig_h: u32,
+
+    // Raw (unpadded) input buffer for GPU padding (size = orig_w * orig_h * 3 * f32)
+    pub(super) raw_input_buf: wgpu::Buffer,
 
     // 3-channel buffers (size = 3 * plane_size)
     pub(super) input_buf: wgpu::Buffer,
@@ -25,6 +30,9 @@ pub(super) struct CachedEncodeBuffers {
     pub(super) variance_buf: wgpu::Buffer,
     pub(super) wm_scratch: wgpu::Buffer,
     pub(super) weight_map_buf: wgpu::Buffer,
+
+    // Weight map staging for deferred readback (avoid intermediate GPU poll)
+    pub(super) weight_map_staging: wgpu::Buffer,
 
     // CfL alpha buffers (variable size, 2x growth, separate caps)
     pub(super) raw_alpha: wgpu::Buffer,
@@ -46,10 +54,18 @@ pub(super) struct CachedEncodeBuffers {
 
 impl CachedEncodeBuffers {
     /// Allocate all buffers for the given padded resolution.
-    pub(super) fn new(ctx: &GpuContext, padded_w: u32, padded_h: u32) -> Self {
+    pub(super) fn new(
+        ctx: &GpuContext,
+        padded_w: u32,
+        padded_h: u32,
+        orig_w: u32,
+        orig_h: u32,
+    ) -> Self {
         let padded_pixels = (padded_w * padded_h) as usize;
         let plane_size = (padded_pixels * std::mem::size_of::<f32>()) as u64;
         let buf_size_3 = (padded_pixels * 3 * std::mem::size_of::<f32>()) as u64;
+        let raw_pixels = (orig_w * orig_h) as usize;
+        let raw_buf_size = (raw_pixels * 3 * std::mem::size_of::<f32>()) as u64;
 
         // Upper bound on weight map blocks: assumes worst case (fewest wavelet levels).
         // With tile_size=256, num_levels=3: 4x4=16 blocks per tile (common case).
@@ -69,6 +85,15 @@ impl CachedEncodeBuffers {
         Self {
             padded_w,
             padded_h,
+            orig_w,
+            orig_h,
+
+            raw_input_buf: ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("enc_raw_input"),
+                size: raw_buf_size,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
 
             input_buf: ctx.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("enc_input"),
@@ -141,6 +166,12 @@ impl CachedEncodeBuffers {
                 mapped_at_creation: false,
             }),
 
+            weight_map_staging: ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("enc_wm_staging"),
+                size: wm_buf_size.max(4),
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
             raw_alpha: ctx.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("enc_raw_alpha"),
                 size: alpha_init_cap,

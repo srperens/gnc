@@ -37,7 +37,7 @@ struct Params {
     tiles_x: u32,
     per_subband: u32,            // 0 = single table, 1 = per-subband
     num_levels: u32,
-    _pad: u32,
+    flags: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;

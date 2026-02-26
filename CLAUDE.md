@@ -7,10 +7,10 @@ Research project exploring GPU-native video compression. The core question: what
 ## Build & Run
 
 ```bash
-cd gpu-codec
 cargo build --release
-cargo run --release -- encode --input test.raw --output test.gpuc --benchmark
-cargo test
+cargo run --release -- benchmark -i test_material/frames/bbb_1080p.png -q 75
+cargo run --release -- rd-curve -i test_material/frames/bbb_1080p.png --compare-codecs
+cargo test --release
 ```
 
 ## Key Constraints
@@ -23,12 +23,12 @@ cargo test
 ## Architecture
 
 Modular pipeline with swappable stages:
-1. Color space conversion (YCoCg-R baseline)
-2. Transform (LeGall 5/3 wavelet baseline)
-3. Quantization (uniform scalar baseline)
-4. Entropy coding (rANS baseline)
+1. Color space conversion (YCoCg-R, integer-exact lossless path available)
+2. Transform (CDF 9/7 wavelet for lossy q=1-99, LeGall 5/3 for lossless q=100; 3-4 levels adaptive)
+3. Quantization (adaptive with perceptual subband weights, CfL chroma prediction at q=50-85, fused quantize+histogram shader)
+4. Entropy coding (GPU rANS per-subband, 32 interleaved streams per tile)
 
-Shader source is in `gpu-codec/src/shaders/*.wgsl`. Rust host code is in `gpu-codec/src/encoder/` and `gpu-codec/src/decoder/`.
+Shader source is in `src/shaders/*.wgsl`. Rust host code is in `src/encoder/` and `src/decoder/`.
 
 ## Platform Notes
 

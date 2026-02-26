@@ -649,18 +649,19 @@ fn main() {
                 encoder.encode_sequence_with_fps(&ctx, &frame_refs, w, h, &config_ip, fps);
             let elapsed_ip = start.elapsed();
 
-            println!("\n=== I+P (keyframe_interval={}) ===", keyframe_interval);
+            println!("\n=== I+P+B (keyframe_interval={}) ===", keyframe_interval);
+            // Decode with B-frame reordering support
+            let decoded_all = decoder.decode_sequence(&ctx, &compressed_ip);
             let mut total_bytes_ip: usize = 0;
             let mut frame_metrics_ip: Vec<FrameMetrics> = Vec::new();
             for (i, cf) in compressed_ip.iter().enumerate() {
-                let ft = if cf.frame_type == gnc::FrameType::Intra {
-                    "I"
-                } else {
-                    "P"
+                let ft = match cf.frame_type {
+                    gnc::FrameType::Intra => "I",
+                    gnc::FrameType::Predicted => "P",
+                    gnc::FrameType::Bidirectional => "B",
                 };
-                let decoded = decoder.decode(&ctx, cf);
-                let psnr = quality::psnr(&frames_data[i], &decoded, 255.0);
-                let ssim = quality::ssim_approx(&frames_data[i], &decoded, 255.0);
+                let psnr = quality::psnr(&frames_data[i], &decoded_all[i], 255.0);
+                let ssim = quality::ssim_approx(&frames_data[i], &decoded_all[i], 255.0);
                 total_bytes_ip += cf.byte_size();
                 println!(
                     "  Frame {:2} [{}]: {:6} bytes, {:.2} bpp, PSNR {:.2} dB, SSIM {:.4}",
@@ -687,15 +688,24 @@ fn main() {
                 .iter()
                 .filter(|f| f.frame_type == gnc::FrameType::Intra)
                 .count();
+            let p_count = compressed_ip
+                .iter()
+                .filter(|f| f.frame_type == gnc::FrameType::Predicted)
+                .count();
+            let b_count = compressed_ip
+                .iter()
+                .filter(|f| f.frame_type == gnc::FrameType::Bidirectional)
+                .count();
 
             println!(
-                "  Total: {} bytes, avg {:.2} bpp, {:.1}ms ({:.1} fps), {}I+{}P",
+                "  Total: {} bytes, avg {:.2} bpp, {:.1}ms ({:.1} fps), {}I+{}P+{}B",
                 total_bytes_ip,
                 avg_bpp_ip,
                 elapsed_ip.as_secs_f64() * 1000.0,
                 compressed_ip.len() as f64 / elapsed_ip.as_secs_f64(),
                 i_count,
-                compressed_ip.len() - i_count,
+                p_count,
+                b_count,
             );
 
             // Compute and display I+P sequence summary

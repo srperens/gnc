@@ -144,6 +144,26 @@ impl DecoderPipeline {
                     }
                 }
             }
+            EntropyData::Rice(_) => {
+                // Rice: CPU decode path — decode tiles and write f32 coefficients directly
+                bufs.ctx_adaptive_decode = true; // reuse CPU decode flag
+                let padded_w = info.padded_width() as usize;
+                let tile_size = info.tile_size as usize;
+                for p in 0..3 {
+                    let plane_data = entropy_helpers::entropy_decode_plane(
+                        &frame.entropy,
+                        p,
+                        tiles_per_plane,
+                        tile_size,
+                        padded_w,
+                    );
+                    ctx.queue.write_buffer(
+                        &bufs.cpu_decoded_planes[p],
+                        0,
+                        bytemuck::cast_slice(&plane_data),
+                    );
+                }
+            }
             EntropyData::Bitplane(tiles) => {
                 for p in 0..3 {
                     let plane_tiles = &tiles[p * tiles_per_plane..(p + 1) * tiles_per_plane];

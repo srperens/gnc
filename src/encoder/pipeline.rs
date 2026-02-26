@@ -12,6 +12,7 @@ use super::quantize::Quantizer;
 use super::quantize_histogram_fused::FusedQuantizeHistogram;
 use super::rans;
 use super::rans_gpu_encode::GpuRansEncoder;
+use super::rice;
 use super::transform::WaveletTransform;
 use crate::gpu_util::ensure_var_buf;
 use crate::{
@@ -280,12 +281,14 @@ impl EncoderPipeline {
         let mut rans_tiles: Vec<rans::InterleavedRansTile> = Vec::new();
         let mut subband_tiles: Vec<rans::SubbandRansTile> = Vec::new();
         let mut bp_tiles: Vec<bitplane::BitplaneTile> = Vec::new();
+        let mut rice_tiles: Vec<rice::RiceTile> = Vec::new();
         let entropy_mode = EntropyMode::from_config(config);
         let tile_size = config.tile_size as usize;
         let tiles_x = info.tiles_x() as usize;
         let tiles_y = info.tiles_y() as usize;
         let use_gpu_encode = config.gpu_entropy_encode
             && config.entropy_coder != EntropyCoder::Bitplane
+            && config.entropy_coder != EntropyCoder::Rice
             && !config.context_adaptive;
 
         // Fused quantize+histogram: saves one full buffer read+write per plane.
@@ -773,6 +776,7 @@ impl EncoderPipeline {
                     &mut rans_tiles,
                     &mut subband_tiles,
                     &mut bp_tiles,
+                    &mut rice_tiles,
                 );
             }
         }
@@ -872,6 +876,7 @@ impl EncoderPipeline {
                 EntropyData::SubbandRans(subband_tiles)
             }
             EntropyMode::Rans => EntropyData::Rans(rans_tiles),
+            EntropyMode::Rice => EntropyData::Rice(rice_tiles),
         };
 
         if profile {

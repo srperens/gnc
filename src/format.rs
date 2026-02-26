@@ -1,4 +1,4 @@
-use crate::encoder::{bitplane, rans};
+use crate::encoder::{bitplane, rans, rice};
 use crate::FrameType;
 
 // ---- CRC-32 (ISO 3309 / ITU-T V.42, same as zlib/gzip/PNG) ----
@@ -357,6 +357,9 @@ fn serialize_tile_blobs(entropy: &crate::EntropyData) -> Vec<Vec<u8>> {
         crate::EntropyData::Bitplane(tiles) => {
             tiles.iter().map(bitplane::serialize_tile_bitplane).collect()
         }
+        crate::EntropyData::Rice(tiles) => {
+            tiles.iter().map(rice::serialize_tile_rice).collect()
+        }
     }
 }
 
@@ -406,6 +409,7 @@ pub fn serialize_compressed(frame: &crate::CompressedFrame) -> Vec<u8> {
         crate::EntropyData::Rans(_) => 0,
         crate::EntropyData::SubbandRans(_) => 2,
         crate::EntropyData::Bitplane(_) => 1,
+        crate::EntropyData::Rice(_) => 3,
     };
     out.extend_from_slice(&entropy_type.to_le_bytes());
     // Serialize each tile to bytes, compute CRC-32
@@ -505,6 +509,20 @@ pub fn substitute_tiles(frame: &mut crate::CompressedFrame, tile_indices: &[usiz
                         tile_size: t.tile_size,
                         block_offsets: vec![0; t.block_offsets.len()],
                         block_data: Vec::new(),
+                    };
+                }
+            }
+            crate::EntropyData::Rice(ref mut tiles) => {
+                if idx < tiles.len() {
+                    let t = &tiles[idx];
+                    tiles[idx] = crate::encoder::rice::RiceTile {
+                        num_coefficients: t.num_coefficients,
+                        tile_size: t.tile_size,
+                        num_levels: t.num_levels,
+                        num_groups: t.num_groups,
+                        k_values: vec![0; t.num_groups as usize],
+                        stream_lengths: vec![0; rice::RICE_STREAMS_PER_TILE],
+                        stream_data: Vec::new(),
                     };
                 }
             }
@@ -810,6 +828,24 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
                 crate::EntropyCoder::Rans,
                 crate::EntropyData::SubbandRans(tiles),
                 true,
+            )
+        }
+        3 => {
+            let mut tiles = Vec::with_capacity(num_tiles);
+            for i in 0..num_tiles {
+                let slice = if let Some(ref sizes) = tile_sizes {
+                    &data[pos..pos + sizes[i] as usize]
+                } else {
+                    &data[pos..]
+                };
+                let (tile, consumed) = rice::deserialize_tile_rice(slice);
+                tiles.push(tile);
+                pos += consumed;
+            }
+            (
+                crate::EntropyCoder::Rice,
+                crate::EntropyData::Rice(tiles),
+                false,
             )
         }
         _ => panic!("Unknown entropy coder type: {entropy_type}"),

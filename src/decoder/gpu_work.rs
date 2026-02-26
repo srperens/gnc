@@ -60,6 +60,10 @@ impl DecoderPipeline {
                 );
             } else {
                 match &frame.entropy {
+                    EntropyData::Rice(_) => {
+                        // Rice uses CPU decode path; data already in cpu_decoded_planes
+                        unreachable!("Rice frames use ctx_adaptive_decode path");
+                    }
                     EntropyData::Rans(_) | EntropyData::SubbandRans(_) => {
                         self.rans_decoder.dispatch_decode(
                             ctx,

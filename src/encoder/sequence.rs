@@ -8,6 +8,7 @@ use super::entropy_helpers::{encode_entropy, entropy_decode_plane, EntropyMode};
 use super::motion::{MotionEstimator, ME_BLOCK_SIZE};
 use super::pipeline::EncoderPipeline;
 use super::rans;
+use super::rice;
 use super::rate_control::RateController;
 use crate::{
     CodecConfig, CompressedFrame, EntropyCoder, EntropyData, FrameInfo, FrameType, GpuContext,
@@ -482,6 +483,7 @@ impl EncoderPipeline {
         let mut rans_tiles: Vec<rans::InterleavedRansTile> = Vec::new();
         let mut subband_tiles: Vec<rans::SubbandRansTile> = Vec::new();
         let mut bp_tiles: Vec<bitplane::BitplaneTile> = Vec::new();
+        let mut rice_tiles: Vec<rice::RiceTile> = Vec::new();
 
         // === Batched GPU pipeline: preprocess + ME + forward encode ===
         // MV buffer stays on GPU — used directly by MC without readback/re-upload.
@@ -708,6 +710,7 @@ impl EncoderPipeline {
                     &mut rans_tiles,
                     &mut subband_tiles,
                     &mut bp_tiles,
+                    &mut rice_tiles,
                 );
             }
         }
@@ -718,6 +721,7 @@ impl EncoderPipeline {
                 EntropyData::SubbandRans(subband_tiles)
             }
             EntropyMode::Rans => EntropyData::Rans(rans_tiles),
+            EntropyMode::Rice => EntropyData::Rice(rice_tiles),
         };
 
         // === Batched local decode: all 3 planes in one command encoder ===
@@ -849,6 +853,7 @@ impl EncoderPipeline {
         let mut rans_tiles: Vec<rans::InterleavedRansTile> = Vec::new();
         let mut subband_tiles: Vec<rans::SubbandRansTile> = Vec::new();
         let mut bp_tiles: Vec<bitplane::BitplaneTile> = Vec::new();
+        let mut rice_tiles: Vec<rice::RiceTile> = Vec::new();
 
         // === Batched GPU pipeline: preprocess + bidir ME + forward encode ===
         // MV/mode buffers stay on GPU — used directly by bidir MC.
@@ -1089,6 +1094,7 @@ impl EncoderPipeline {
                     &mut rans_tiles,
                     &mut subband_tiles,
                     &mut bp_tiles,
+                    &mut rice_tiles,
                 );
             }
         }
@@ -1099,6 +1105,7 @@ impl EncoderPipeline {
                 EntropyData::SubbandRans(subband_tiles)
             }
             EntropyMode::Rans => EntropyData::Rans(rans_tiles),
+            EntropyMode::Rice => EntropyData::Rice(rice_tiles),
         };
 
         // === Deferred batched readback: single submit + poll for all bidir data ===

@@ -177,6 +177,9 @@ pub enum EntropyCoder {
     /// Bitplane coding: sign + magnitude bitplanes per 32x32 block (CPU encode, GPU decode).
     /// Fully parallel on decode, no serial state machines.
     Bitplane,
+    /// Significance map + Golomb-Rice: fully parallel, 256 streams per tile.
+    /// Every coefficient encodes independently — no serial state chain.
+    Rice,
 }
 
 /// Codec configuration
@@ -438,6 +441,7 @@ pub enum EntropyData {
     Rans(Vec<encoder::rans::InterleavedRansTile>),
     SubbandRans(Vec<encoder::rans::SubbandRansTile>),
     Bitplane(Vec<encoder::bitplane::BitplaneTile>),
+    Rice(Vec<encoder::rice::RiceTile>),
 }
 
 impl EntropyData {
@@ -446,6 +450,7 @@ impl EntropyData {
             EntropyData::Rans(tiles) => tiles.iter().map(|t| t.byte_size()).sum(),
             EntropyData::SubbandRans(tiles) => tiles.iter().map(|t| t.byte_size()).sum(),
             EntropyData::Bitplane(tiles) => tiles.iter().map(|t| t.byte_size()).sum(),
+            EntropyData::Rice(tiles) => tiles.iter().map(|t| t.byte_size()).sum(),
         }
     }
 }

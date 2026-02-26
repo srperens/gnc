@@ -55,6 +55,10 @@ enum Command {
         #[arg(long)]
         bitplane: bool,
 
+        /// Use Rice (significance map + Golomb-Rice) entropy coder
+        #[arg(long)]
+        rice: bool,
+
         /// Wavelet type: 97 (CDF 9/7) or 53 (LeGall 5/3). Overrides quality preset if specified.
         #[arg(long)]
         wavelet: Option<String>,
@@ -100,6 +104,10 @@ enum Command {
         /// Use bitplane entropy coder instead of rANS
         #[arg(long)]
         bitplane: bool,
+
+        /// Use Rice (significance map + Golomb-Rice) entropy coder
+        #[arg(long)]
+        rice: bool,
 
         /// Use CPU entropy encoding instead of GPU
         #[arg(long)]
@@ -298,6 +306,7 @@ fn main() {
             tile_size,
             no_cfl,
             bitplane,
+            rice,
             wavelet,
             no_per_subband,
             cpu_encode,
@@ -335,6 +344,9 @@ fn main() {
             }
             if bitplane {
                 config.entropy_coder = gnc::EntropyCoder::Bitplane;
+            }
+            if rice {
+                config.entropy_coder = gnc::EntropyCoder::Rice;
             }
             if no_per_subband {
                 config.per_subband_entropy = false;
@@ -387,6 +399,7 @@ fn main() {
             csv,
             quality,
             bitplane,
+            rice,
             cpu_encode,
         } => {
             let (rgb_data, w, h) = load_image_rgb_f32(&input);
@@ -399,6 +412,9 @@ fn main() {
             if bitplane {
                 config.entropy_coder = gnc::EntropyCoder::Bitplane;
             }
+            if rice {
+                config.entropy_coder = gnc::EntropyCoder::Rice;
+            }
             if cpu_encode {
                 config.gpu_entropy_encode = false;
             }
@@ -407,6 +423,7 @@ fn main() {
                 gnc::EntropyCoder::Bitplane => "bitplane".to_string(),
                 gnc::EntropyCoder::Rans if config.per_subband_entropy => "rANS subband".to_string(),
                 gnc::EntropyCoder::Rans => "rANS single-table".to_string(),
+                gnc::EntropyCoder::Rice => "Rice (sig+Golomb)".to_string(),
             };
             let encode_mode = if config.gpu_entropy_encode {
                 "GPU"

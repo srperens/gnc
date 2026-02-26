@@ -1,6 +1,7 @@
 use super::bitplane;
 use super::rans;
 use super::rans_gpu_encode::GpuRansEncoder;
+use super::rice;
 use crate::gpu_util::read_buffer_f32;
 use crate::{CodecConfig, EntropyCoder, EntropyData, FrameInfo, GpuContext};
 
@@ -11,11 +12,14 @@ pub(super) enum EntropyMode {
     /// Context-adaptive per-subband rANS (2 tables per detail group)
     SubbandRansCtx,
     Bitplane,
+    Rice,
 }
 
 impl EntropyMode {
     pub(super) fn from_config(config: &CodecConfig) -> Self {
-        if config.entropy_coder == EntropyCoder::Bitplane {
+        if config.entropy_coder == EntropyCoder::Rice {
+            EntropyMode::Rice
+        } else if config.entropy_coder == EntropyCoder::Bitplane {
             EntropyMode::Bitplane
         } else if config.per_subband_entropy && config.context_adaptive {
             EntropyMode::SubbandRansCtx
@@ -45,8 +49,9 @@ pub(super) fn encode_entropy(
     rans_tiles: &mut Vec<rans::InterleavedRansTile>,
     subband_tiles: &mut Vec<rans::SubbandRansTile>,
     bp_tiles: &mut Vec<bitplane::BitplaneTile>,
+    rice_tiles: &mut Vec<rice::RiceTile>,
 ) {
-    if use_gpu_encode {
+    if use_gpu_encode && !matches!(entropy_mode, EntropyMode::Rice) {
         let (mut rt, mut st) = gpu_encoder.encode_plane_to_tiles(
             ctx,
             quantized_buf,
@@ -70,6 +75,7 @@ pub(super) fn encode_entropy(
             rans_tiles,
             subband_tiles,
             bp_tiles,
+            rice_tiles,
         );
     }
 }
@@ -106,6 +112,7 @@ pub(crate) fn entropy_decode_plane(
                 }
             }
             EntropyData::Bitplane(tiles) => bitplane::bitplane_decode_tile(&tiles[tile_start + t]),
+            EntropyData::Rice(tiles) => rice::rice_decode_tile(&tiles[tile_start + t]),
         };
 
         // Scatter tile coefficients back into flat plane
@@ -135,6 +142,7 @@ pub(super) fn entropy_encode_tiles(
     rans_tiles: &mut Vec<rans::InterleavedRansTile>,
     subband_tiles: &mut Vec<rans::SubbandRansTile>,
     bp_tiles: &mut Vec<bitplane::BitplaneTile>,
+    rice_tiles: &mut Vec<rice::RiceTile>,
 ) {
     for ty in 0..tiles_y {
         for tx in 0..tiles_x {
@@ -159,6 +167,13 @@ pub(super) fn entropy_encode_tiles(
                 }
                 EntropyMode::Rans => {
                     rans_tiles.push(rans::rans_encode_tile_interleaved_zrl(&coeffs));
+                }
+                EntropyMode::Rice => {
+                    rice_tiles.push(rice::rice_encode_tile(
+                        &coeffs,
+                        tile_size_u32,
+                        num_levels,
+                    ));
                 }
             }
         }

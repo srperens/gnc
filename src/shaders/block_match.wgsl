@@ -1,9 +1,15 @@
-// Block matching motion estimation shader with half-pel refinement.
+// Hierarchical block matching motion estimation shader.
 // One workgroup (256 threads) per 16×16 block.
-// Phase 1: Full-pel search ±search_range pixels, SAD on Y (luma) plane.
-// Phase 2: Half-pel refinement around integer winner using bilinear interpolation.
-// Output MVs are in half-pel units (integer MV * 2, then refined by ±1 half-pel).
-// Parallel min-reduction across workgroup to find best MV.
+//
+// Three-phase coarse-to-fine search:
+//   Phase 1: Coarse search over full ±search_range using subsampled 4×4 SAD
+//            (every 4th pixel in each dimension = 16 samples per candidate).
+//            14.8x fewer memory reads than full-resolution search.
+//   Phase 2: Fine search ±4 around coarse winner with full 16×16 SAD.
+//   Phase 3: Half-pel refinement around fine winner using bilinear interpolation.
+//
+// Output MVs are in half-pel units.
+// Parallel min-reduction across workgroup to find best MV in each phase.
 
 struct Params {
     width: u32,
@@ -22,31 +28,56 @@ struct Params {
 @group(0) @binding(3) var<storage, read_write> motion_vectors: array<i32>;
 @group(0) @binding(4) var<storage, read_write> sad_values: array<u32>;
 
-// Shared memory for parallel min-reduction
 var<workgroup> shared_sad: array<u32, 256>;
-// Pack (dx, dy) as (dx+32768) << 16 | (dy+32768) for atomic-free reduction
 var<workgroup> shared_mv: array<u32, 256>;
 
+// Subsample stride for coarse search phase
+const COARSE_STRIDE: u32 = 4u;
+// Fine search range (±FINE_RANGE pixels around coarse winner)
+const FINE_RANGE: i32 = 4;
+
+// Pack (dx, dy) as (dx+32768) << 16 | (dy+32768)
+fn pack_mv(dx: i32, dy: i32) -> u32 {
+    return (u32(dx + 32768) << 16u) | u32(dy + 32768);
+}
+
+fn unpack_dx(packed: u32) -> i32 {
+    return i32(packed >> 16u) - 32768;
+}
+
+fn unpack_dy(packed: u32) -> i32 {
+    return i32(packed & 0xFFFFu) - 32768;
+}
+
+// Parallel min-reduction over shared_sad/shared_mv (256 entries, log2 = 8 steps)
+fn min_reduce(tid: u32) {
+    for (var stride = 128u; stride > 0u; stride >>= 1u) {
+        if tid < stride {
+            if shared_sad[tid + stride] < shared_sad[tid] {
+                shared_sad[tid] = shared_sad[tid + stride];
+                shared_mv[tid] = shared_mv[tid + stride];
+            }
+        }
+        workgroupBarrier();
+    }
+}
+
 // Bilinear sample at half-pel position (hx, hy are in half-pel units).
-// Returns interpolated value or clamped-edge value for out-of-bounds.
 fn bilinear_sample(hx: i32, hy: i32) -> f32 {
     let w = i32(params.width);
     let h = i32(params.height);
 
-    // Integer pixel coordinates (floor of half-pel / 2)
     let ix = hx >> 1;
     let iy = hy >> 1;
-    let fx = hx & 1; // 0 = on grid, 1 = half-pel offset
+    let fx = hx & 1;
     let fy = hy & 1;
 
     if fx == 0 && fy == 0 {
-        // On integer grid — direct lookup
         let cx = clamp(ix, 0, w - 1);
         let cy = clamp(iy, 0, h - 1);
         return reference_y[u32(cy) * params.width + u32(cx)];
     }
 
-    // Bilinear interpolation from 4 neighbors
     let x0 = clamp(ix, 0, w - 1);
     let x1 = clamp(ix + 1, 0, w - 1);
     let y0 = clamp(iy, 0, h - 1);
@@ -84,8 +115,12 @@ fn main(
     let sr = i32(params.search_range);
     let search_side = 2u * params.search_range + 1u;
     let total_candidates = search_side * search_side;
+    let bs = i32(params.block_size);
+    let w = i32(params.width);
+    let h = i32(params.height);
 
-    // ========== Phase 1: Integer-pel full search ==========
+    // ========== Phase 1: Coarse search with subsampled SAD ==========
+    // Every COARSE_STRIDE-th pixel in each dimension: 4×4 = 16 samples from 16×16 block.
     var best_sad: u32 = 0xFFFFFFFFu;
     var best_dx: i32 = 0;
     var best_dy: i32 = 0;
@@ -98,23 +133,17 @@ fn main(
 
         let cand_dy = i32(cand_idx / search_side) - sr;
         let cand_dx = i32(cand_idx % search_side) - sr;
-
-        // Reference block origin
         let ref_x = i32(block_origin_x) + cand_dx;
         let ref_y = i32(block_origin_y) + cand_dy;
 
-        // Check if entire reference block is within bounds
         if ref_x >= 0 && ref_y >= 0 &&
-           ref_x + i32(params.block_size) <= i32(params.width) &&
-           ref_y + i32(params.block_size) <= i32(params.height) {
-
+           ref_x + bs <= w && ref_y + bs <= h {
             var sad: u32 = 0u;
-            for (var py = 0u; py < params.block_size; py++) {
-                for (var px = 0u; px < params.block_size; px++) {
+            for (var py = 0u; py < params.block_size; py += COARSE_STRIDE) {
+                for (var px = 0u; px < params.block_size; px += COARSE_STRIDE) {
                     let cur_idx = (block_origin_y + py) * params.width + block_origin_x + px;
                     let r_idx = u32(ref_y + i32(py)) * params.width + u32(ref_x + i32(px));
-                    let diff = current_y[cur_idx] - reference_y[r_idx];
-                    sad += u32(abs(diff));
+                    sad += u32(abs(current_y[cur_idx] - reference_y[r_idx]));
                 }
             }
 
@@ -128,51 +157,81 @@ fn main(
         cand_idx += 256u;
     }
 
-    // Store in shared memory for min-reduction
+    // Min-reduction for coarse winner
     shared_sad[tid] = best_sad;
-    shared_mv[tid] = (u32(best_dx + 32768) << 16u) | u32(best_dy + 32768);
+    shared_mv[tid] = pack_mv(best_dx, best_dy);
+    workgroupBarrier();
+    min_reduce(tid);
+
+    // ========== Phase 2: Fine search with full 16×16 SAD ==========
+    // ±FINE_RANGE around coarse winner.
+    let coarse_packed = shared_mv[0];
+    let coarse_dx = unpack_dx(coarse_packed);
+    let coarse_dy = unpack_dy(coarse_packed);
     workgroupBarrier();
 
-    // Parallel min-reduction (log2(256) = 8 steps)
-    for (var stride = 128u; stride > 0u; stride >>= 1u) {
-        if tid < stride {
-            if shared_sad[tid + stride] < shared_sad[tid] {
-                shared_sad[tid] = shared_sad[tid + stride];
-                shared_mv[tid] = shared_mv[tid + stride];
+    let fine_side = u32(2 * FINE_RANGE + 1);
+    let fine_total = fine_side * fine_side;
+
+    var fine_best_sad: u32 = 0xFFFFFFFFu;
+    var fine_best_dx: i32 = coarse_dx;
+    var fine_best_dy: i32 = coarse_dy;
+
+    var fine_idx = tid;
+    loop {
+        if fine_idx >= fine_total {
+            break;
+        }
+
+        let dy_off = i32(fine_idx / fine_side) - FINE_RANGE;
+        let dx_off = i32(fine_idx % fine_side) - FINE_RANGE;
+        let test_dx = coarse_dx + dx_off;
+        let test_dy = coarse_dy + dy_off;
+        let ref_x = i32(block_origin_x) + test_dx;
+        let ref_y = i32(block_origin_y) + test_dy;
+
+        if ref_x >= 0 && ref_y >= 0 &&
+           ref_x + bs <= w && ref_y + bs <= h {
+            var sad: u32 = 0u;
+            for (var py = 0u; py < params.block_size; py++) {
+                for (var px = 0u; px < params.block_size; px++) {
+                    let cur_idx = (block_origin_y + py) * params.width + block_origin_x + px;
+                    let r_idx = u32(ref_y + i32(py)) * params.width + u32(ref_x + i32(px));
+                    sad += u32(abs(current_y[cur_idx] - reference_y[r_idx]));
+                }
+            }
+            if sad < fine_best_sad {
+                fine_best_sad = sad;
+                fine_best_dx = test_dx;
+                fine_best_dy = test_dy;
             }
         }
-        workgroupBarrier();
+
+        fine_idx += 256u;
     }
 
-    // ========== Phase 2: Half-pel refinement ==========
-    // Thread 0 reads integer winner, then first 8 threads each test one half-pel offset.
-    // Half-pel offsets around the integer winner (8 neighbors):
-    //   (-1,-1) (0,-1) (1,-1)
-    //   (-1, 0)        (1, 0)
-    //   (-1, 1) (0, 1) (1, 1)
-    // These are in half-pel units, so the integer winner is at (dx*2, dy*2).
+    // Min-reduction for fine winner
+    shared_sad[tid] = fine_best_sad;
+    shared_mv[tid] = pack_mv(fine_best_dx, fine_best_dy);
+    workgroupBarrier();
+    min_reduce(tid);
 
-    // Broadcast integer winner to all threads via shared memory
+    // ========== Phase 3: Half-pel refinement ==========
+    // 8 half-pel offsets around the fine winner (same as before).
+    let fine_packed = shared_mv[0];
+    let fine_sad = shared_sad[0];
+    let int_dx = unpack_dx(fine_packed);
+    let int_dy = unpack_dy(fine_packed);
     workgroupBarrier();
 
-    // Read the integer-pel winner from reduction result
-    let int_packed = shared_mv[0];
-    let int_sad = shared_sad[0];
-    let int_dx = i32(int_packed >> 16u) - 32768;
-    let int_dy = i32(int_packed & 0xFFFFu) - 32768;
-
-    // Half-pel center in half-pel units
     let center_hx = int_dx * 2;
     let center_hy = int_dy * 2;
 
-    // 8 half-pel offsets (thread 0..7 each tests one)
-    // offset_table: dx_hp, dy_hp for each of 8 neighbors
     var hp_sad: u32 = 0xFFFFFFFFu;
     var hp_dx: i32 = center_hx;
     var hp_dy: i32 = center_hy;
 
     if tid < 8u {
-        // Map tid to half-pel offset
         var off_x: i32 = 0;
         var off_y: i32 = 0;
         switch tid {
@@ -190,16 +249,14 @@ fn main(
         let test_hx = center_hx + off_x;
         let test_hy = center_hy + off_y;
 
-        // Compute SAD with bilinear interpolation at half-pel position
         var sad: u32 = 0u;
         var valid = true;
 
-        // Quick bounds check: reference block center must be roughly in frame
         let ref_base_hx = i32(block_origin_x) * 2 + test_hx;
         let ref_base_hy = i32(block_origin_y) * 2 + test_hy;
         if ref_base_hx < -1 || ref_base_hy < -1 ||
-           ref_base_hx + i32(params.block_size) * 2 > i32(params.width) * 2 + 1 ||
-           ref_base_hy + i32(params.block_size) * 2 > i32(params.height) * 2 + 1 {
+           ref_base_hx + bs * 2 > w * 2 + 1 ||
+           ref_base_hy + bs * 2 > h * 2 + 1 {
             valid = false;
         }
 
@@ -209,7 +266,6 @@ fn main(
                     let cur_idx = (block_origin_y + py) * params.width + block_origin_x + px;
                     let cur_val = current_y[cur_idx];
 
-                    // Half-pel reference position for this pixel
                     let rhx = i32(block_origin_x + px) * 2 + test_hx;
                     let rhy = i32(block_origin_y + py) * 2 + test_hy;
                     let ref_val = bilinear_sample(rhx, rhy);
@@ -224,38 +280,26 @@ fn main(
         }
     }
 
-    // Write half-pel results + integer winner into shared for final reduction
-    // Thread 8 holds the integer result (already at center_hx, center_hy)
+    // Thread 8 holds the integer result
     if tid == 8u {
-        hp_sad = int_sad;
+        hp_sad = fine_sad;
         hp_dx = center_hx;
         hp_dy = center_hy;
     }
     if tid <= 8u {
         shared_sad[tid] = hp_sad;
-        shared_mv[tid] = (u32(hp_dx + 32768) << 16u) | u32(hp_dy + 32768);
+        shared_mv[tid] = pack_mv(hp_dx, hp_dy);
     } else {
         shared_sad[tid] = 0xFFFFFFFFu;
     }
     workgroupBarrier();
-
-    // Min-reduction over first 16 slots (more than enough for 9 candidates)
-    for (var stride = 128u; stride > 0u; stride >>= 1u) {
-        if tid < stride {
-            if shared_sad[tid + stride] < shared_sad[tid] {
-                shared_sad[tid] = shared_sad[tid + stride];
-                shared_mv[tid] = shared_mv[tid + stride];
-            }
-        }
-        workgroupBarrier();
-    }
+    min_reduce(tid);
 
     // Thread 0 writes the final half-pel MV result
     if tid == 0u {
         let packed_mv = shared_mv[0];
-        let final_dx = i32(packed_mv >> 16u) - 32768;
-        let final_dy = i32(packed_mv & 0xFFFFu) - 32768;
-        // Output is in half-pel units
+        let final_dx = unpack_dx(packed_mv);
+        let final_dy = unpack_dy(packed_mv);
         motion_vectors[block_idx * 2u] = final_dx;
         motion_vectors[block_idx * 2u + 1u] = final_dy;
         sad_values[block_idx] = shared_sad[0];

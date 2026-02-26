@@ -720,6 +720,103 @@ impl MotionEstimator {
         mvs
     }
 
+    /// Batched readback of bidirectional MVs and block modes in a single GPU submit + poll.
+    /// Returns (fwd_mvs, bwd_mvs, block_modes) with only 1 blocking wait instead of 3.
+    pub fn read_bidir_data(
+        ctx: &GpuContext,
+        fwd_mv_buf: &wgpu::Buffer,
+        bwd_mv_buf: &wgpu::Buffer,
+        block_modes_buf: &wgpu::Buffer,
+        total_blocks: u32,
+    ) -> (Vec<[i16; 2]>, Vec<[i16; 2]>, Vec<u8>) {
+        let mv_count = total_blocks as usize * 2;
+        let mv_size = (mv_count * std::mem::size_of::<i32>()) as u64;
+        let modes_size = (total_blocks as usize * std::mem::size_of::<u32>()) as u64;
+
+        let staging_fwd = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fwd_mv_staging"),
+            size: mv_size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let staging_bwd = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("bwd_mv_staging"),
+            size: mv_size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let staging_modes = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("modes_staging"),
+            size: modes_size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // Single command encoder for all 3 copies
+        let mut cmd = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("copy_bidir_data"),
+            });
+        cmd.copy_buffer_to_buffer(fwd_mv_buf, 0, &staging_fwd, 0, mv_size);
+        cmd.copy_buffer_to_buffer(bwd_mv_buf, 0, &staging_bwd, 0, mv_size);
+        cmd.copy_buffer_to_buffer(block_modes_buf, 0, &staging_modes, 0, modes_size);
+        ctx.queue.submit(Some(cmd.finish()));
+
+        // Map all 3 staging buffers, then single poll
+        let (tx1, rx1) = std::sync::mpsc::channel();
+        let (tx2, rx2) = std::sync::mpsc::channel();
+        let (tx3, rx3) = std::sync::mpsc::channel();
+        staging_fwd
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |r| {
+                tx1.send(r).unwrap();
+            });
+        staging_bwd
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |r| {
+                tx2.send(r).unwrap();
+            });
+        staging_modes
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |r| {
+                tx3.send(r).unwrap();
+            });
+        ctx.device.poll(wgpu::Maintain::Wait);
+        rx1.recv().unwrap().unwrap();
+        rx2.recv().unwrap().unwrap();
+        rx3.recv().unwrap().unwrap();
+
+        // Read forward MVs
+        let fwd_data = staging_fwd.slice(..).get_mapped_range();
+        let fwd_i32: &[i32] = bytemuck::cast_slice(&fwd_data);
+        let mut fwd_mvs = Vec::with_capacity(total_blocks as usize);
+        for i in 0..total_blocks as usize {
+            fwd_mvs.push([fwd_i32[i * 2] as i16, fwd_i32[i * 2 + 1] as i16]);
+        }
+        drop(fwd_data);
+        staging_fwd.unmap();
+
+        // Read backward MVs
+        let bwd_data = staging_bwd.slice(..).get_mapped_range();
+        let bwd_i32: &[i32] = bytemuck::cast_slice(&bwd_data);
+        let mut bwd_mvs = Vec::with_capacity(total_blocks as usize);
+        for i in 0..total_blocks as usize {
+            bwd_mvs.push([bwd_i32[i * 2] as i16, bwd_i32[i * 2 + 1] as i16]);
+        }
+        drop(bwd_data);
+        staging_bwd.unmap();
+
+        // Read block modes
+        let modes_data = staging_modes.slice(..).get_mapped_range();
+        let u32_modes: &[u32] = bytemuck::cast_slice(&modes_data);
+        let block_modes: Vec<u8> = u32_modes.iter().map(|&v| v as u8).collect();
+        drop(modes_data);
+        staging_modes.unmap();
+
+        (fwd_mvs, bwd_mvs, block_modes)
+    }
+
     /// Read SAD values from GPU buffer back to CPU.
     pub fn read_sad_values(
         ctx: &GpuContext,

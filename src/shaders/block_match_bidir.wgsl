@@ -1,7 +1,10 @@
-// Bidirectional block matching motion estimation shader.
+// Bidirectional hierarchical block matching motion estimation shader.
 // One workgroup (256 threads) per 16x16 block.
-// Tests forward-only, backward-only, and average (bidir) prediction.
-// Picks whichever mode gives lowest SAD, with half-pel refinement for the winner.
+//
+// Uses coarse-to-fine search for both forward and backward references:
+//   Phase 1: Coarse forward search with subsampled 4×4 SAD, then fine ±4 refinement.
+//   Phase 2: Coarse backward search with subsampled 4×4 SAD, then fine ±4 refinement.
+//   Phase 3: Thread 0 picks best mode (fwd/bwd/bidir) and does half-pel refinement.
 //
 // Note: WGSL does not allow passing storage pointers as function parameters,
 // so reference accesses are inlined where needed.
@@ -26,12 +29,38 @@ struct Params {
 @group(0) @binding(6) var<storage, read_write> block_modes: array<u32>;
 @group(0) @binding(7) var<storage, read_write> sad_values: array<u32>;
 
-// Shared memory for parallel min-reduction
 var<workgroup> shared_sad: array<u32, 256>;
-// Pack (dx, dy) as (dx+32768) << 16 | (dy+32768)
 var<workgroup> shared_mv: array<u32, 256>;
 
-// Half-pel sample from forward reference (inlined because WGSL cannot pass storage ptrs)
+// Subsample stride for coarse search
+const COARSE_STRIDE: u32 = 4u;
+// Fine search range (±FINE_RANGE pixels around coarse winner)
+const FINE_RANGE: i32 = 4;
+
+fn pack_mv(dx: i32, dy: i32) -> u32 {
+    return (u32(dx + 32768) << 16u) | u32(dy + 32768);
+}
+
+fn unpack_dx(packed: u32) -> i32 {
+    return i32(packed >> 16u) - 32768;
+}
+
+fn unpack_dy(packed: u32) -> i32 {
+    return i32(packed & 0xFFFFu) - 32768;
+}
+
+fn min_reduce(tid: u32) {
+    for (var stride = 128u; stride > 0u; stride >>= 1u) {
+        if tid < stride {
+            if shared_sad[tid + stride] < shared_sad[tid] {
+                shared_sad[tid] = shared_sad[tid + stride];
+                shared_mv[tid] = shared_mv[tid + stride];
+            }
+        }
+        workgroupBarrier();
+    }
+}
+
 fn sample_hp_fwd(x2: i32, y2: i32, w: u32, h: u32) -> f32 {
     let fx = x2 >> 1;
     let fy = y2 >> 1;
@@ -56,7 +85,6 @@ fn sample_hp_fwd(x2: i32, y2: i32, w: u32, h: u32) -> f32 {
     }
 }
 
-// Half-pel sample from backward reference
 fn sample_hp_bwd(x2: i32, y2: i32, w: u32, h: u32) -> f32 {
     let fx = x2 >> 1;
     let fy = y2 >> 1;
@@ -100,135 +128,190 @@ fn main(
     let sr = i32(params.search_range);
     let search_side = 2u * params.search_range + 1u;
     let total_candidates = search_side * search_side;
+    let bs = i32(params.block_size);
+    let w = i32(params.width);
+    let h = i32(params.height);
 
-    // Phase 1: Find best forward MV (against forward reference)
-    var best_fwd_sad: u32 = 0xFFFFFFFFu;
-    var best_fwd_dx: i32 = 0;
-    var best_fwd_dy: i32 = 0;
+    // ========== Phase 1a: Coarse forward search (subsampled SAD) ==========
+    var best_sad: u32 = 0xFFFFFFFFu;
+    var best_dx: i32 = 0;
+    var best_dy: i32 = 0;
 
     var cand_idx = tid;
     loop {
-        if cand_idx >= total_candidates {
-            break;
-        }
+        if cand_idx >= total_candidates { break; }
         let cand_dy = i32(cand_idx / search_side) - sr;
         let cand_dx = i32(cand_idx % search_side) - sr;
-
         let ref_x = i32(block_origin_x) + cand_dx;
         let ref_y = i32(block_origin_y) + cand_dy;
 
-        if ref_x >= 0 && ref_y >= 0 &&
-           ref_x + i32(params.block_size) <= i32(params.width) &&
-           ref_y + i32(params.block_size) <= i32(params.height) {
-
+        if ref_x >= 0 && ref_y >= 0 && ref_x + bs <= w && ref_y + bs <= h {
             var sad: u32 = 0u;
-            for (var py = 0u; py < params.block_size; py++) {
-                for (var px = 0u; px < params.block_size; px++) {
+            for (var py = 0u; py < params.block_size; py += COARSE_STRIDE) {
+                for (var px = 0u; px < params.block_size; px += COARSE_STRIDE) {
                     let cur_idx = (block_origin_y + py) * params.width + block_origin_x + px;
                     let r_idx = u32(ref_y + i32(py)) * params.width + u32(ref_x + i32(px));
-                    let diff = current_y[cur_idx] - reference_fwd_y[r_idx];
-                    sad += u32(abs(diff));
+                    sad += u32(abs(current_y[cur_idx] - reference_fwd_y[r_idx]));
                 }
             }
-            if sad < best_fwd_sad {
-                best_fwd_sad = sad;
-                best_fwd_dx = cand_dx;
-                best_fwd_dy = cand_dy;
+            if sad < best_sad {
+                best_sad = sad;
+                best_dx = cand_dx;
+                best_dy = cand_dy;
             }
         }
         cand_idx += 256u;
     }
 
-    // Parallel reduction for forward MV
-    shared_sad[tid] = best_fwd_sad;
-    shared_mv[tid] = (u32(best_fwd_dx + 32768) << 16u) | u32(best_fwd_dy + 32768);
+    shared_sad[tid] = best_sad;
+    shared_mv[tid] = pack_mv(best_dx, best_dy);
+    workgroupBarrier();
+    min_reduce(tid);
+
+    // ========== Phase 1b: Fine forward search (full SAD) ==========
+    let coarse_fwd_packed = shared_mv[0];
+    let coarse_fwd_dx = unpack_dx(coarse_fwd_packed);
+    let coarse_fwd_dy = unpack_dy(coarse_fwd_packed);
     workgroupBarrier();
 
-    for (var stride = 128u; stride > 0u; stride >>= 1u) {
-        if tid < stride {
-            if shared_sad[tid + stride] < shared_sad[tid] {
-                shared_sad[tid] = shared_sad[tid + stride];
-                shared_mv[tid] = shared_mv[tid + stride];
+    let fine_side = u32(2 * FINE_RANGE + 1);
+    let fine_total = fine_side * fine_side;
+
+    var fine_best_sad: u32 = 0xFFFFFFFFu;
+    var fine_best_dx: i32 = coarse_fwd_dx;
+    var fine_best_dy: i32 = coarse_fwd_dy;
+
+    var fine_idx = tid;
+    loop {
+        if fine_idx >= fine_total { break; }
+        let dy_off = i32(fine_idx / fine_side) - FINE_RANGE;
+        let dx_off = i32(fine_idx % fine_side) - FINE_RANGE;
+        let test_dx = coarse_fwd_dx + dx_off;
+        let test_dy = coarse_fwd_dy + dy_off;
+        let ref_x = i32(block_origin_x) + test_dx;
+        let ref_y = i32(block_origin_y) + test_dy;
+
+        if ref_x >= 0 && ref_y >= 0 && ref_x + bs <= w && ref_y + bs <= h {
+            var sad: u32 = 0u;
+            for (var py = 0u; py < params.block_size; py++) {
+                for (var px = 0u; px < params.block_size; px++) {
+                    let cur_idx = (block_origin_y + py) * params.width + block_origin_x + px;
+                    let r_idx = u32(ref_y + i32(py)) * params.width + u32(ref_x + i32(px));
+                    sad += u32(abs(current_y[cur_idx] - reference_fwd_y[r_idx]));
+                }
+            }
+            if sad < fine_best_sad {
+                fine_best_sad = sad;
+                fine_best_dx = test_dx;
+                fine_best_dy = test_dy;
             }
         }
-        workgroupBarrier();
+        fine_idx += 256u;
     }
 
-    // Broadcast forward winner via shared memory
+    shared_sad[tid] = fine_best_sad;
+    shared_mv[tid] = pack_mv(fine_best_dx, fine_best_dy);
+    workgroupBarrier();
+    min_reduce(tid);
+
     var final_fwd_dx: i32;
     var final_fwd_dy: i32;
     var final_fwd_sad: u32;
-    // shared_mv[0] and shared_sad[0] already have the winner after reduction
-    workgroupBarrier();
     let fwd_packed = shared_mv[0];
-    final_fwd_dx = i32(fwd_packed >> 16u) - 32768;
-    final_fwd_dy = i32(fwd_packed & 0xFFFFu) - 32768;
+    final_fwd_dx = unpack_dx(fwd_packed);
+    final_fwd_dy = unpack_dy(fwd_packed);
     final_fwd_sad = shared_sad[0];
     workgroupBarrier();
 
-    // Phase 2: Find best backward MV (against backward reference)
-    var best_bwd_sad: u32 = 0xFFFFFFFFu;
-    var best_bwd_dx: i32 = 0;
-    var best_bwd_dy: i32 = 0;
+    // ========== Phase 2a: Coarse backward search (subsampled SAD) ==========
+    best_sad = 0xFFFFFFFFu;
+    best_dx = 0;
+    best_dy = 0;
 
     cand_idx = tid;
     loop {
-        if cand_idx >= total_candidates {
-            break;
-        }
+        if cand_idx >= total_candidates { break; }
         let cand_dy = i32(cand_idx / search_side) - sr;
         let cand_dx = i32(cand_idx % search_side) - sr;
-
         let ref_x = i32(block_origin_x) + cand_dx;
         let ref_y = i32(block_origin_y) + cand_dy;
 
-        if ref_x >= 0 && ref_y >= 0 &&
-           ref_x + i32(params.block_size) <= i32(params.width) &&
-           ref_y + i32(params.block_size) <= i32(params.height) {
-
+        if ref_x >= 0 && ref_y >= 0 && ref_x + bs <= w && ref_y + bs <= h {
             var sad: u32 = 0u;
-            for (var py = 0u; py < params.block_size; py++) {
-                for (var px = 0u; px < params.block_size; px++) {
+            for (var py = 0u; py < params.block_size; py += COARSE_STRIDE) {
+                for (var px = 0u; px < params.block_size; px += COARSE_STRIDE) {
                     let cur_idx = (block_origin_y + py) * params.width + block_origin_x + px;
                     let r_idx = u32(ref_y + i32(py)) * params.width + u32(ref_x + i32(px));
-                    let diff = current_y[cur_idx] - reference_bwd_y[r_idx];
-                    sad += u32(abs(diff));
+                    sad += u32(abs(current_y[cur_idx] - reference_bwd_y[r_idx]));
                 }
             }
-            if sad < best_bwd_sad {
-                best_bwd_sad = sad;
-                best_bwd_dx = cand_dx;
-                best_bwd_dy = cand_dy;
+            if sad < best_sad {
+                best_sad = sad;
+                best_dx = cand_dx;
+                best_dy = cand_dy;
             }
         }
         cand_idx += 256u;
     }
 
-    // Parallel reduction for backward MV
-    shared_sad[tid] = best_bwd_sad;
-    shared_mv[tid] = (u32(best_bwd_dx + 32768) << 16u) | u32(best_bwd_dy + 32768);
+    shared_sad[tid] = best_sad;
+    shared_mv[tid] = pack_mv(best_dx, best_dy);
+    workgroupBarrier();
+    min_reduce(tid);
+
+    // ========== Phase 2b: Fine backward search (full SAD) ==========
+    let coarse_bwd_packed = shared_mv[0];
+    let coarse_bwd_dx = unpack_dx(coarse_bwd_packed);
+    let coarse_bwd_dy = unpack_dy(coarse_bwd_packed);
     workgroupBarrier();
 
-    for (var stride = 128u; stride > 0u; stride >>= 1u) {
-        if tid < stride {
-            if shared_sad[tid + stride] < shared_sad[tid] {
-                shared_sad[tid] = shared_sad[tid + stride];
-                shared_mv[tid] = shared_mv[tid + stride];
+    fine_best_sad = 0xFFFFFFFFu;
+    fine_best_dx = coarse_bwd_dx;
+    fine_best_dy = coarse_bwd_dy;
+
+    fine_idx = tid;
+    loop {
+        if fine_idx >= fine_total { break; }
+        let dy_off = i32(fine_idx / fine_side) - FINE_RANGE;
+        let dx_off = i32(fine_idx % fine_side) - FINE_RANGE;
+        let test_dx = coarse_bwd_dx + dx_off;
+        let test_dy = coarse_bwd_dy + dy_off;
+        let ref_x = i32(block_origin_x) + test_dx;
+        let ref_y = i32(block_origin_y) + test_dy;
+
+        if ref_x >= 0 && ref_y >= 0 && ref_x + bs <= w && ref_y + bs <= h {
+            var sad: u32 = 0u;
+            for (var py = 0u; py < params.block_size; py++) {
+                for (var px = 0u; px < params.block_size; px++) {
+                    let cur_idx = (block_origin_y + py) * params.width + block_origin_x + px;
+                    let r_idx = u32(ref_y + i32(py)) * params.width + u32(ref_x + i32(px));
+                    sad += u32(abs(current_y[cur_idx] - reference_bwd_y[r_idx]));
+                }
+            }
+            if sad < fine_best_sad {
+                fine_best_sad = sad;
+                fine_best_dx = test_dx;
+                fine_best_dy = test_dy;
             }
         }
-        workgroupBarrier();
+        fine_idx += 256u;
     }
+
+    shared_sad[tid] = fine_best_sad;
+    shared_mv[tid] = pack_mv(fine_best_dx, fine_best_dy);
+    workgroupBarrier();
+    min_reduce(tid);
 
     var final_bwd_dx: i32;
     var final_bwd_dy: i32;
     var final_bwd_sad: u32;
     let bwd_packed = shared_mv[0];
-    final_bwd_dx = i32(bwd_packed >> 16u) - 32768;
-    final_bwd_dy = i32(bwd_packed & 0xFFFFu) - 32768;
+    final_bwd_dx = unpack_dx(bwd_packed);
+    final_bwd_dy = unpack_dy(bwd_packed);
     final_bwd_sad = shared_sad[0];
     workgroupBarrier();
 
-    // Phase 3: Thread 0 computes bidir SAD and picks best mode
+    // ========== Phase 3: Mode selection + half-pel refinement (thread 0 only) ==========
     if tid == 0u {
         // Compute bidirectional SAD: current - (fwd + bwd) / 2
         var bidir_sad: u32 = 0xFFFFFFFFu;
@@ -237,8 +320,8 @@ fn main(
         let bwd_x = i32(block_origin_x) + final_bwd_dx;
         let bwd_y = i32(block_origin_y) + final_bwd_dy;
 
-        if fwd_x >= 0 && fwd_y >= 0 && fwd_x + i32(params.block_size) <= i32(params.width) && fwd_y + i32(params.block_size) <= i32(params.height) &&
-           bwd_x >= 0 && bwd_y >= 0 && bwd_x + i32(params.block_size) <= i32(params.width) && bwd_y + i32(params.block_size) <= i32(params.height) {
+        if fwd_x >= 0 && fwd_y >= 0 && fwd_x + bs <= w && fwd_y + bs <= h &&
+           bwd_x >= 0 && bwd_y >= 0 && bwd_x + bs <= w && bwd_y + bs <= h {
             bidir_sad = 0u;
             for (var py = 0u; py < params.block_size; py++) {
                 for (var px = 0u; px < params.block_size; px++) {
@@ -255,7 +338,6 @@ fn main(
         // Pick best mode: 0=fwd, 1=bwd, 2=bidir
         var best_mode: u32 = 0u;
         var best_total_sad = final_fwd_sad;
-
         if final_bwd_sad < best_total_sad {
             best_total_sad = final_bwd_sad;
             best_mode = 1u;
@@ -265,13 +347,13 @@ fn main(
             best_mode = 2u;
         }
 
-        // Convert winning integer MVs to half-pel units (multiply by 2)
+        // Convert winning integer MVs to half-pel units
         var hp_fwd_dx = final_fwd_dx * 2;
         var hp_fwd_dy = final_fwd_dy * 2;
         var hp_bwd_dx = final_bwd_dx * 2;
         var hp_bwd_dy = final_bwd_dy * 2;
 
-        // Half-pel refinement for forward MV (if used by winning mode)
+        // Half-pel refinement for forward MV
         if best_mode == 0u || best_mode == 2u {
             var hp_best_sad = best_total_sad;
             let base_fx2 = final_fwd_dx * 2;
@@ -313,7 +395,7 @@ fn main(
             best_total_sad = hp_best_sad;
         }
 
-        // Half-pel refinement for backward MV (if used by winning mode)
+        // Half-pel refinement for backward MV
         if best_mode == 1u || best_mode == 2u {
             var hp_best_sad = best_total_sad;
             let base_bx2 = final_bwd_dx * 2;
@@ -354,7 +436,7 @@ fn main(
             }
         }
 
-        // Write results: half-pel MVs
+        // Write results
         fwd_motion_vectors[block_idx * 2u] = hp_fwd_dx;
         fwd_motion_vectors[block_idx * 2u + 1u] = hp_fwd_dy;
         bwd_motion_vectors[block_idx * 2u] = hp_bwd_dx;

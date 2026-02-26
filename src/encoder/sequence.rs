@@ -440,6 +440,10 @@ impl EncoderPipeline {
 
     /// Encode a P-frame: ME -> MC -> encode residual -> local decode loop.
     /// Reference planes are read from and written to `gpu_ref_planes` — no CPU roundtrip.
+    ///
+    /// Optimized pipeline: MV buffer stays on GPU for MC (no readback/re-upload roundtrip).
+    /// GPU work is batched into minimal command encoder submits. MV readback is deferred
+    /// to the end for bitstream serialization only.
     #[allow(clippy::too_many_arguments)]
     fn encode_pframe(
         &mut self,
@@ -455,66 +459,13 @@ impl EncoderPipeline {
     ) -> CompressedFrame {
         let plane_size = (padded_pixels * std::mem::size_of::<f32>()) as u64;
 
-        // Ensure cached buffers exist for this resolution
         self.ensure_cached(ctx, padded_w, padded_h);
         let bufs = self.cached.as_ref().unwrap();
 
-        // Color convert + deinterleave on GPU
         let padded_rgb = pad_frame(rgb_data, width, height, padded_w, padded_h);
         ctx.queue
             .write_buffer(&bufs.input_buf, 0, bytemuck::cast_slice(&padded_rgb));
 
-        let mut cmd = ctx
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("pf_preprocess"),
-            });
-        self.color.dispatch(
-            ctx,
-            &mut cmd,
-            &bufs.input_buf,
-            &bufs.color_out,
-            padded_w,
-            padded_h,
-            true,
-        );
-        self.deinterleaver.dispatch(
-            ctx,
-            &mut cmd,
-            &bufs.color_out,
-            &bufs.plane_a,
-            &bufs.co_plane,
-            &bufs.cg_plane,
-            padded_pixels as u32,
-        );
-        ctx.queue.submit(Some(cmd.finish()));
-
-        // Block matching on Y plane — reference Y is already on GPU in gpu_ref_planes[0]
-        let mut cmd = ctx
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("pf_me"),
-            });
-        let (mv_buf, _sad_buf) = self.motion.estimate(
-            ctx,
-            &mut cmd,
-            &bufs.plane_a,
-            &bufs.gpu_ref_planes[0],
-            padded_w,
-            padded_h,
-        );
-        ctx.queue.submit(Some(cmd.finish()));
-
-        // Read back MVs for bitstream serialization (small: ~64KB at 1080p)
-        let me_blocks_x = padded_w / ME_BLOCK_SIZE;
-        let me_blocks_y = padded_h / ME_BLOCK_SIZE;
-        let me_total_blocks = me_blocks_x * me_blocks_y;
-        let mvs = MotionEstimator::read_motion_vectors(ctx, &mv_buf, me_total_blocks);
-
-        // Re-upload MVs as read-only buffer for MC dispatches
-        let mv_buf_ro = MotionEstimator::upload_motion_vectors(ctx, &mvs);
-
-        // MC + wavelet + quantize per plane, keeping data on GPU
         let entropy_mode = EntropyMode::from_config(config);
         let tile_size = config.tile_size as usize;
         let tiles_x = info.tiles_x() as usize;
@@ -524,93 +475,221 @@ impl EncoderPipeline {
         let use_gpu_encode =
             config.gpu_entropy_encode && config.entropy_coder != EntropyCoder::Bitplane;
 
+        let me_blocks_x = padded_w / ME_BLOCK_SIZE;
+        let me_blocks_y = padded_h / ME_BLOCK_SIZE;
+        let me_total_blocks = me_blocks_x * me_blocks_y;
+
         let mut rans_tiles: Vec<rans::InterleavedRansTile> = Vec::new();
         let mut subband_tiles: Vec<rans::SubbandRansTile> = Vec::new();
         let mut bp_tiles: Vec<bitplane::BitplaneTile> = Vec::new();
 
-        // Forward encode: MC + wavelet + quantize per plane.
-        // Always save quantized data to separate buffers for both entropy encode AND
-        // local decode (avoids entropy decode round-trip in local decode loop).
-        //   Y quantized → recon_y
-        //   Co quantized → co_plane (overwrites original)
-        //   Cg quantized stays in plane_b
-        for p in 0..3 {
-            let weights = if p == 0 {
-                &weights_luma
-            } else {
-                &weights_chroma
-            };
+        // === Batched GPU pipeline: preprocess + ME + forward encode ===
+        // MV buffer stays on GPU — used directly by MC without readback/re-upload.
+        let mv_buf;
 
-            let cur_plane = if p == 0 {
-                &bufs.plane_a
-            } else if p == 1 {
-                &bufs.co_plane
-            } else {
-                &bufs.cg_plane
-            };
-
+        if use_gpu_encode {
+            // GPU entropy path: batch preprocess + ME + all 3 planes into one submit
             let mut cmd = ctx
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("pf_enc"),
+                    label: Some("pf_batch_fwd"),
                 });
 
-            // MC: current - gpu_ref → mc_out (residual) — reference already on GPU
-            self.motion.compensate(
+            self.color.dispatch(
                 ctx,
                 &mut cmd,
-                cur_plane,
-                &bufs.gpu_ref_planes[p],
-                &mv_buf_ro,
-                &bufs.mc_out,
+                &bufs.input_buf,
+                &bufs.color_out,
                 padded_w,
                 padded_h,
                 true,
             );
+            self.deinterleaver.dispatch(
+                ctx,
+                &mut cmd,
+                &bufs.color_out,
+                &bufs.plane_a,
+                &bufs.co_plane,
+                &bufs.cg_plane,
+                padded_pixels as u32,
+            );
 
-            // Copy residual to plane_a for wavelet input
-            cmd.copy_buffer_to_buffer(&bufs.mc_out, 0, &bufs.plane_a, 0, plane_size);
-
-            // Wavelet forward: plane_a -> plane_b(scratch) -> plane_c
-            self.transform.forward(
+            let (mb, _sad) = self.motion.estimate(
                 ctx,
                 &mut cmd,
                 &bufs.plane_a,
-                &bufs.plane_b,
-                &bufs.plane_c,
-                info,
-                config.wavelet_levels,
-                config.wavelet_type,
-            );
-
-            // Quantize: plane_c -> plane_b
-            self.quantize.dispatch(
-                ctx,
-                &mut cmd,
-                &bufs.plane_c,
-                &bufs.plane_b,
-                padded_pixels as u32,
-                config.quantization_step,
-                config.dead_zone,
-                true,
+                &bufs.gpu_ref_planes[0],
                 padded_w,
                 padded_h,
-                config.tile_size,
-                config.wavelet_levels,
-                weights,
             );
+            mv_buf = mb;
 
-            // Persist quantized data to separate buffers (always, not just for GPU encode).
-            // These buffers are reused by: (1) batched GPU rANS, (2) local decode loop below.
-            if p == 0 {
-                cmd.copy_buffer_to_buffer(&bufs.plane_b, 0, &bufs.recon_y, 0, plane_size);
-            } else if p == 1 {
-                cmd.copy_buffer_to_buffer(&bufs.plane_b, 0, &bufs.co_plane, 0, plane_size);
+            for p in 0..3 {
+                let weights = if p == 0 {
+                    &weights_luma
+                } else {
+                    &weights_chroma
+                };
+                let cur_plane = match p {
+                    0 => &bufs.plane_a,
+                    1 => &bufs.co_plane,
+                    _ => &bufs.cg_plane,
+                };
+
+                self.motion.compensate(
+                    ctx,
+                    &mut cmd,
+                    cur_plane,
+                    &bufs.gpu_ref_planes[p],
+                    &mv_buf,
+                    &bufs.mc_out,
+                    padded_w,
+                    padded_h,
+                    true,
+                );
+                cmd.copy_buffer_to_buffer(&bufs.mc_out, 0, &bufs.plane_a, 0, plane_size);
+
+                self.transform.forward(
+                    ctx,
+                    &mut cmd,
+                    &bufs.plane_a,
+                    &bufs.plane_b,
+                    &bufs.plane_c,
+                    info,
+                    config.wavelet_levels,
+                    config.wavelet_type,
+                );
+                self.quantize.dispatch(
+                    ctx,
+                    &mut cmd,
+                    &bufs.plane_c,
+                    &bufs.plane_b,
+                    padded_pixels as u32,
+                    config.quantization_step,
+                    config.dead_zone,
+                    true,
+                    padded_w,
+                    padded_h,
+                    config.tile_size,
+                    config.wavelet_levels,
+                    weights,
+                );
+
+                if p == 0 {
+                    cmd.copy_buffer_to_buffer(&bufs.plane_b, 0, &bufs.recon_y, 0, plane_size);
+                } else if p == 1 {
+                    cmd.copy_buffer_to_buffer(&bufs.plane_b, 0, &bufs.co_plane, 0, plane_size);
+                }
             }
 
             ctx.queue.submit(Some(cmd.finish()));
 
-            if !use_gpu_encode {
+            let (mut rt, mut st) = self.gpu_encoder.encode_3planes_to_tiles(
+                ctx,
+                [&bufs.recon_y, &bufs.co_plane, &bufs.plane_b],
+                info,
+                config.per_subband_entropy,
+                config.wavelet_levels,
+            );
+            rans_tiles.append(&mut rt);
+            subband_tiles.append(&mut st);
+        } else {
+            // CPU entropy path: preprocess + ME batched, then per-plane submits
+            let mut cmd = ctx
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("pf_preprocess_me"),
+                });
+            self.color.dispatch(
+                ctx,
+                &mut cmd,
+                &bufs.input_buf,
+                &bufs.color_out,
+                padded_w,
+                padded_h,
+                true,
+            );
+            self.deinterleaver.dispatch(
+                ctx,
+                &mut cmd,
+                &bufs.color_out,
+                &bufs.plane_a,
+                &bufs.co_plane,
+                &bufs.cg_plane,
+                padded_pixels as u32,
+            );
+            let (mb, _sad) = self.motion.estimate(
+                ctx,
+                &mut cmd,
+                &bufs.plane_a,
+                &bufs.gpu_ref_planes[0],
+                padded_w,
+                padded_h,
+            );
+            mv_buf = mb;
+            ctx.queue.submit(Some(cmd.finish()));
+
+            for p in 0..3 {
+                let weights = if p == 0 {
+                    &weights_luma
+                } else {
+                    &weights_chroma
+                };
+                let cur_plane = match p {
+                    0 => &bufs.plane_a,
+                    1 => &bufs.co_plane,
+                    _ => &bufs.cg_plane,
+                };
+
+                let mut cmd = ctx
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("pf_enc"),
+                    });
+                self.motion.compensate(
+                    ctx,
+                    &mut cmd,
+                    cur_plane,
+                    &bufs.gpu_ref_planes[p],
+                    &mv_buf,
+                    &bufs.mc_out,
+                    padded_w,
+                    padded_h,
+                    true,
+                );
+                cmd.copy_buffer_to_buffer(&bufs.mc_out, 0, &bufs.plane_a, 0, plane_size);
+                self.transform.forward(
+                    ctx,
+                    &mut cmd,
+                    &bufs.plane_a,
+                    &bufs.plane_b,
+                    &bufs.plane_c,
+                    info,
+                    config.wavelet_levels,
+                    config.wavelet_type,
+                );
+                self.quantize.dispatch(
+                    ctx,
+                    &mut cmd,
+                    &bufs.plane_c,
+                    &bufs.plane_b,
+                    padded_pixels as u32,
+                    config.quantization_step,
+                    config.dead_zone,
+                    true,
+                    padded_w,
+                    padded_h,
+                    config.tile_size,
+                    config.wavelet_levels,
+                    weights,
+                );
+                if p == 0 {
+                    cmd.copy_buffer_to_buffer(&bufs.plane_b, 0, &bufs.recon_y, 0, plane_size);
+                } else if p == 1 {
+                    cmd.copy_buffer_to_buffer(&bufs.plane_b, 0, &bufs.co_plane, 0, plane_size);
+                }
+                ctx.queue.submit(Some(cmd.finish()));
+
                 encode_entropy(
                     &mut self.gpu_encoder,
                     ctx,
@@ -631,19 +710,6 @@ impl EncoderPipeline {
             }
         }
 
-        // Batched 3-plane rANS encode for P-frame
-        if use_gpu_encode {
-            let (mut rt, mut st) = self.gpu_encoder.encode_3planes_to_tiles(
-                ctx,
-                [&bufs.recon_y, &bufs.co_plane, &bufs.plane_b],
-                info,
-                config.per_subband_entropy,
-                config.wavelet_levels,
-            );
-            rans_tiles.append(&mut rt);
-            subband_tiles.append(&mut st);
-        }
-
         let entropy = match entropy_mode {
             EntropyMode::Bitplane => EntropyData::Bitplane(bp_tiles),
             EntropyMode::SubbandRans | EntropyMode::SubbandRansCtx => {
@@ -652,7 +718,76 @@ impl EncoderPipeline {
             EntropyMode::Rans => EntropyData::Rans(rans_tiles),
         };
 
-        let compressed = CompressedFrame {
+        // === Batched local decode: all 3 planes in one command encoder ===
+        // Quantized data on GPU: Y in recon_y, Co in co_plane, Cg in plane_b.
+        // Uses cg_plane as scratch (original Cg spatial data no longer needed).
+        let quant_bufs: [&wgpu::Buffer; 3] = [&bufs.recon_y, &bufs.co_plane, &bufs.plane_b];
+        {
+            let mut cmd = ctx
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("pf_local_decode"),
+                });
+
+            for p in 0..3 {
+                let weights = if p == 0 {
+                    &weights_luma
+                } else {
+                    &weights_chroma
+                };
+
+                self.quantize.dispatch(
+                    ctx,
+                    &mut cmd,
+                    quant_bufs[p],
+                    &bufs.cg_plane,
+                    padded_pixels as u32,
+                    config.quantization_step,
+                    config.dead_zone,
+                    false,
+                    padded_w,
+                    padded_h,
+                    config.tile_size,
+                    config.wavelet_levels,
+                    weights,
+                );
+                self.transform.inverse(
+                    ctx,
+                    &mut cmd,
+                    &bufs.cg_plane,
+                    &bufs.plane_c,
+                    &bufs.plane_a,
+                    info,
+                    config.wavelet_levels,
+                    config.wavelet_type,
+                );
+                self.motion.compensate(
+                    ctx,
+                    &mut cmd,
+                    &bufs.plane_a,
+                    &bufs.gpu_ref_planes[p],
+                    &mv_buf,
+                    &bufs.recon_out,
+                    padded_w,
+                    padded_h,
+                    false,
+                );
+                cmd.copy_buffer_to_buffer(
+                    &bufs.recon_out,
+                    0,
+                    &bufs.gpu_ref_planes[p],
+                    0,
+                    plane_size,
+                );
+            }
+
+            ctx.queue.submit(Some(cmd.finish()));
+        }
+
+        // === Deferred MV readback for bitstream serialization ===
+        let mvs = MotionEstimator::read_motion_vectors(ctx, &mv_buf, me_total_blocks);
+
+        CompressedFrame {
             info: *info,
             config: config.clone(),
             entropy,
@@ -665,81 +800,15 @@ impl EncoderPipeline {
                 backward_vectors: None,
                 block_modes: None,
             }),
-        };
-
-        // Local decode loop — entirely on GPU, no entropy round-trip.
-        // Quantized data is already on GPU from the forward encode:
-        //   Y in recon_y, Co in co_plane, Cg in plane_b.
-        // Use cg_plane as scratch (original Cg spatial data is no longer needed).
-        // For each plane: dequantize → inverse wavelet → inverse MC → update gpu_ref.
-        let quant_bufs: [&wgpu::Buffer; 3] = [&bufs.recon_y, &bufs.co_plane, &bufs.plane_b];
-
-        for p in 0..3 {
-            let weights = if p == 0 {
-                &weights_luma
-            } else {
-                &weights_chroma
-            };
-
-            let mut cmd = ctx
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("pf_ld"),
-                });
-
-            // Dequantize: quant_buf[p] → cg_plane (scratch)
-            self.quantize.dispatch(
-                ctx,
-                &mut cmd,
-                quant_bufs[p],
-                &bufs.cg_plane,
-                padded_pixels as u32,
-                config.quantization_step,
-                config.dead_zone,
-                false,
-                padded_w,
-                padded_h,
-                config.tile_size,
-                config.wavelet_levels,
-                weights,
-            );
-
-            // Inverse wavelet: cg_plane → plane_c(scratch) → plane_a
-            self.transform.inverse(
-                ctx,
-                &mut cmd,
-                &bufs.cg_plane,
-                &bufs.plane_c,
-                &bufs.plane_a,
-                info,
-                config.wavelet_levels,
-                config.wavelet_type,
-            );
-
-            // Inverse MC: recon = decoded_residual(plane_a) + gpu_ref(p) → recon_out
-            self.motion.compensate(
-                ctx,
-                &mut cmd,
-                &bufs.plane_a,
-                &bufs.gpu_ref_planes[p],
-                &mv_buf_ro,
-                &bufs.recon_out,
-                padded_w,
-                padded_h,
-                false,
-            );
-
-            // Update persistent GPU reference for next frame
-            cmd.copy_buffer_to_buffer(&bufs.recon_out, 0, &bufs.gpu_ref_planes[p], 0, plane_size);
-            ctx.queue.submit(Some(cmd.finish()));
         }
-
-        compressed
     }
 
     /// Encode a B-frame with bidirectional prediction.
     /// Forward reference in `gpu_ref_planes`, backward reference in `gpu_bwd_ref_planes`.
     /// B-frames do NOT update gpu_ref_planes (they are non-reference frames).
+    ///
+    /// Optimized: GPU buffers used directly for MC (no readback/re-upload roundtrip).
+    /// Bidir data (fwd MVs, bwd MVs, block modes) read back in single batched poll.
     #[allow(clippy::too_many_arguments)]
     fn encode_bframe(
         &mut self,
@@ -758,67 +827,10 @@ impl EncoderPipeline {
         self.ensure_cached(ctx, padded_w, padded_h);
         let bufs = self.cached.as_ref().unwrap();
 
-        // Color convert + deinterleave on GPU
         let padded_rgb = pad_frame(rgb_data, width, height, padded_w, padded_h);
         ctx.queue
             .write_buffer(&bufs.input_buf, 0, bytemuck::cast_slice(&padded_rgb));
 
-        let mut cmd = ctx
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("bf_preprocess"),
-            });
-        self.color.dispatch(
-            ctx,
-            &mut cmd,
-            &bufs.input_buf,
-            &bufs.color_out,
-            padded_w,
-            padded_h,
-            true,
-        );
-        self.deinterleaver.dispatch(
-            ctx,
-            &mut cmd,
-            &bufs.color_out,
-            &bufs.plane_a,
-            &bufs.co_plane,
-            &bufs.cg_plane,
-            padded_pixels as u32,
-        );
-        ctx.queue.submit(Some(cmd.finish()));
-
-        // Bidir block matching: current Y vs forward ref + backward ref
-        let mut cmd = ctx
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("bf_me"),
-            });
-        let (fwd_mv_buf, bwd_mv_buf, modes_buf, _sad_buf) = self.motion.estimate_bidir(
-            ctx,
-            &mut cmd,
-            &bufs.plane_a,
-            &bufs.gpu_ref_planes[0],
-            &bufs.gpu_bwd_ref_planes[0],
-            padded_w,
-            padded_h,
-        );
-        ctx.queue.submit(Some(cmd.finish()));
-
-        // Read back MVs and modes for bitstream serialization (small)
-        let me_blocks_x = padded_w / ME_BLOCK_SIZE;
-        let me_blocks_y = padded_h / ME_BLOCK_SIZE;
-        let me_total_blocks = me_blocks_x * me_blocks_y;
-        let fwd_mvs = MotionEstimator::read_motion_vectors(ctx, &fwd_mv_buf, me_total_blocks);
-        let bwd_mvs = MotionEstimator::read_motion_vectors(ctx, &bwd_mv_buf, me_total_blocks);
-        let block_modes = MotionEstimator::read_block_modes(ctx, &modes_buf, me_total_blocks);
-
-        // Re-upload for MC dispatches
-        let fwd_mv_ro = MotionEstimator::upload_motion_vectors(ctx, &fwd_mvs);
-        let bwd_mv_ro = MotionEstimator::upload_motion_vectors(ctx, &bwd_mvs);
-        let modes_ro = MotionEstimator::upload_block_modes(ctx, &block_modes);
-
-        // Forward encode: bidir MC + wavelet + quantize per plane
         let entropy_mode = EntropyMode::from_config(config);
         let tile_size = config.tile_size as usize;
         let tiles_x = info.tiles_x() as usize;
@@ -828,86 +840,235 @@ impl EncoderPipeline {
         let use_gpu_encode =
             config.gpu_entropy_encode && config.entropy_coder != EntropyCoder::Bitplane;
 
+        let me_blocks_x = padded_w / ME_BLOCK_SIZE;
+        let me_blocks_y = padded_h / ME_BLOCK_SIZE;
+        let me_total_blocks = me_blocks_x * me_blocks_y;
+
         let mut rans_tiles: Vec<rans::InterleavedRansTile> = Vec::new();
         let mut subband_tiles: Vec<rans::SubbandRansTile> = Vec::new();
         let mut bp_tiles: Vec<bitplane::BitplaneTile> = Vec::new();
 
-        for p in 0..3 {
-            let weights = if p == 0 {
-                &weights_luma
-            } else {
-                &weights_chroma
-            };
+        // === Batched GPU pipeline: preprocess + bidir ME + forward encode ===
+        // MV/mode buffers stay on GPU — used directly by bidir MC.
+        let fwd_mv_buf;
+        let bwd_mv_buf;
+        let modes_buf;
 
-            let cur_plane = if p == 0 {
-                &bufs.plane_a
-            } else if p == 1 {
-                &bufs.co_plane
-            } else {
-                &bufs.cg_plane
-            };
-
+        if use_gpu_encode {
+            // GPU entropy: batch everything into one submit
             let mut cmd = ctx
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("bf_enc"),
+                    label: Some("bf_batch_fwd"),
                 });
 
-            // Bidir MC: current - pred(fwd, bwd) → mc_out
-            self.motion.compensate_bidir(
+            self.color.dispatch(
                 ctx,
                 &mut cmd,
-                cur_plane,
-                &bufs.gpu_ref_planes[p],
-                &bufs.gpu_bwd_ref_planes[p],
-                &fwd_mv_ro,
-                &bwd_mv_ro,
-                &modes_ro,
-                &bufs.mc_out,
+                &bufs.input_buf,
+                &bufs.color_out,
                 padded_w,
                 padded_h,
-                true, // forward: residual
+                true,
+            );
+            self.deinterleaver.dispatch(
+                ctx,
+                &mut cmd,
+                &bufs.color_out,
+                &bufs.plane_a,
+                &bufs.co_plane,
+                &bufs.cg_plane,
+                padded_pixels as u32,
             );
 
-            cmd.copy_buffer_to_buffer(&bufs.mc_out, 0, &bufs.plane_a, 0, plane_size);
-
-            self.transform.forward(
+            let (fmb, bmb, mmb, _sad) = self.motion.estimate_bidir(
                 ctx,
                 &mut cmd,
                 &bufs.plane_a,
-                &bufs.plane_b,
-                &bufs.plane_c,
-                info,
-                config.wavelet_levels,
-                config.wavelet_type,
-            );
-
-            self.quantize.dispatch(
-                ctx,
-                &mut cmd,
-                &bufs.plane_c,
-                &bufs.plane_b,
-                padded_pixels as u32,
-                config.quantization_step,
-                config.dead_zone,
-                true,
+                &bufs.gpu_ref_planes[0],
+                &bufs.gpu_bwd_ref_planes[0],
                 padded_w,
                 padded_h,
-                config.tile_size,
-                config.wavelet_levels,
-                weights,
             );
+            fwd_mv_buf = fmb;
+            bwd_mv_buf = bmb;
+            modes_buf = mmb;
 
-            // Persist quantized data
-            if p == 0 {
-                cmd.copy_buffer_to_buffer(&bufs.plane_b, 0, &bufs.recon_y, 0, plane_size);
-            } else if p == 1 {
-                cmd.copy_buffer_to_buffer(&bufs.plane_b, 0, &bufs.co_plane, 0, plane_size);
+            for p in 0..3 {
+                let weights = if p == 0 {
+                    &weights_luma
+                } else {
+                    &weights_chroma
+                };
+                let cur_plane = match p {
+                    0 => &bufs.plane_a,
+                    1 => &bufs.co_plane,
+                    _ => &bufs.cg_plane,
+                };
+
+                self.motion.compensate_bidir(
+                    ctx,
+                    &mut cmd,
+                    cur_plane,
+                    &bufs.gpu_ref_planes[p],
+                    &bufs.gpu_bwd_ref_planes[p],
+                    &fwd_mv_buf,
+                    &bwd_mv_buf,
+                    &modes_buf,
+                    &bufs.mc_out,
+                    padded_w,
+                    padded_h,
+                    true,
+                );
+                cmd.copy_buffer_to_buffer(&bufs.mc_out, 0, &bufs.plane_a, 0, plane_size);
+
+                self.transform.forward(
+                    ctx,
+                    &mut cmd,
+                    &bufs.plane_a,
+                    &bufs.plane_b,
+                    &bufs.plane_c,
+                    info,
+                    config.wavelet_levels,
+                    config.wavelet_type,
+                );
+                self.quantize.dispatch(
+                    ctx,
+                    &mut cmd,
+                    &bufs.plane_c,
+                    &bufs.plane_b,
+                    padded_pixels as u32,
+                    config.quantization_step,
+                    config.dead_zone,
+                    true,
+                    padded_w,
+                    padded_h,
+                    config.tile_size,
+                    config.wavelet_levels,
+                    weights,
+                );
+
+                if p == 0 {
+                    cmd.copy_buffer_to_buffer(&bufs.plane_b, 0, &bufs.recon_y, 0, plane_size);
+                } else if p == 1 {
+                    cmd.copy_buffer_to_buffer(&bufs.plane_b, 0, &bufs.co_plane, 0, plane_size);
+                }
             }
 
             ctx.queue.submit(Some(cmd.finish()));
 
-            if !use_gpu_encode {
+            let (mut rt, mut st) = self.gpu_encoder.encode_3planes_to_tiles(
+                ctx,
+                [&bufs.recon_y, &bufs.co_plane, &bufs.plane_b],
+                info,
+                config.per_subband_entropy,
+                config.wavelet_levels,
+            );
+            rans_tiles.append(&mut rt);
+            subband_tiles.append(&mut st);
+        } else {
+            // CPU entropy path: preprocess + bidir ME batched, then per-plane submits
+            let mut cmd = ctx
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("bf_preprocess_me"),
+                });
+            self.color.dispatch(
+                ctx,
+                &mut cmd,
+                &bufs.input_buf,
+                &bufs.color_out,
+                padded_w,
+                padded_h,
+                true,
+            );
+            self.deinterleaver.dispatch(
+                ctx,
+                &mut cmd,
+                &bufs.color_out,
+                &bufs.plane_a,
+                &bufs.co_plane,
+                &bufs.cg_plane,
+                padded_pixels as u32,
+            );
+            let (fmb, bmb, mmb, _sad) = self.motion.estimate_bidir(
+                ctx,
+                &mut cmd,
+                &bufs.plane_a,
+                &bufs.gpu_ref_planes[0],
+                &bufs.gpu_bwd_ref_planes[0],
+                padded_w,
+                padded_h,
+            );
+            fwd_mv_buf = fmb;
+            bwd_mv_buf = bmb;
+            modes_buf = mmb;
+            ctx.queue.submit(Some(cmd.finish()));
+
+            for p in 0..3 {
+                let weights = if p == 0 {
+                    &weights_luma
+                } else {
+                    &weights_chroma
+                };
+                let cur_plane = match p {
+                    0 => &bufs.plane_a,
+                    1 => &bufs.co_plane,
+                    _ => &bufs.cg_plane,
+                };
+
+                let mut cmd = ctx
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("bf_enc"),
+                    });
+                self.motion.compensate_bidir(
+                    ctx,
+                    &mut cmd,
+                    cur_plane,
+                    &bufs.gpu_ref_planes[p],
+                    &bufs.gpu_bwd_ref_planes[p],
+                    &fwd_mv_buf,
+                    &bwd_mv_buf,
+                    &modes_buf,
+                    &bufs.mc_out,
+                    padded_w,
+                    padded_h,
+                    true,
+                );
+                cmd.copy_buffer_to_buffer(&bufs.mc_out, 0, &bufs.plane_a, 0, plane_size);
+                self.transform.forward(
+                    ctx,
+                    &mut cmd,
+                    &bufs.plane_a,
+                    &bufs.plane_b,
+                    &bufs.plane_c,
+                    info,
+                    config.wavelet_levels,
+                    config.wavelet_type,
+                );
+                self.quantize.dispatch(
+                    ctx,
+                    &mut cmd,
+                    &bufs.plane_c,
+                    &bufs.plane_b,
+                    padded_pixels as u32,
+                    config.quantization_step,
+                    config.dead_zone,
+                    true,
+                    padded_w,
+                    padded_h,
+                    config.tile_size,
+                    config.wavelet_levels,
+                    weights,
+                );
+                if p == 0 {
+                    cmd.copy_buffer_to_buffer(&bufs.plane_b, 0, &bufs.recon_y, 0, plane_size);
+                } else if p == 1 {
+                    cmd.copy_buffer_to_buffer(&bufs.plane_b, 0, &bufs.co_plane, 0, plane_size);
+                }
+                ctx.queue.submit(Some(cmd.finish()));
+
                 encode_entropy(
                     &mut self.gpu_encoder,
                     ctx,
@@ -928,18 +1089,6 @@ impl EncoderPipeline {
             }
         }
 
-        if use_gpu_encode {
-            let (mut rt, mut st) = self.gpu_encoder.encode_3planes_to_tiles(
-                ctx,
-                [&bufs.recon_y, &bufs.co_plane, &bufs.plane_b],
-                info,
-                config.per_subband_entropy,
-                config.wavelet_levels,
-            );
-            rans_tiles.append(&mut rt);
-            subband_tiles.append(&mut st);
-        }
-
         let entropy = match entropy_mode {
             EntropyMode::Bitplane => EntropyData::Bitplane(bp_tiles),
             EntropyMode::SubbandRans | EntropyMode::SubbandRansCtx => {
@@ -948,7 +1097,15 @@ impl EncoderPipeline {
             EntropyMode::Rans => EntropyData::Rans(rans_tiles),
         };
 
-        // B-frames: no local decode loop needed (they don't serve as references)
+        // === Deferred batched readback: single submit + poll for all bidir data ===
+        let (fwd_mvs, bwd_mvs, block_modes) = MotionEstimator::read_bidir_data(
+            ctx,
+            &fwd_mv_buf,
+            &bwd_mv_buf,
+            &modes_buf,
+            me_total_blocks,
+        );
+
         CompressedFrame {
             info: *info,
             config: config.clone(),

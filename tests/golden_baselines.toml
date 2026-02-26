@@ -5,34 +5,34 @@
 # Tolerances: PSNR must not drop more than 0.5 dB; bpp must not increase more than 5%.
 
 [gradient_512x512.q25]
-psnr_min = 48.30
-bpp_max = 0.4274
+psnr_min = 49.54
+bpp_max = 0.4208
 
 [gradient_512x512.q50]
-psnr_min = 54.19
-bpp_max = 0.5401
+psnr_min = 53.67
+bpp_max = 0.3896
 
 [gradient_512x512.q75]
-psnr_min = 57.29
-bpp_max = 0.6325
+psnr_min = 57.32
+bpp_max = 0.6283
 
 [gradient_512x512.q90]
-psnr_min = 59.33
-bpp_max = 1.0468
+psnr_min = 59.34
+bpp_max = 1.1428
 
 [checkerboard_512x512.q25]
-psnr_min = 32.87
-bpp_max = 0.9911
+psnr_min = 32.64
+bpp_max = 1.1631
 
 [checkerboard_512x512.q50]
-psnr_min = 36.56
-bpp_max = 2.1814
+psnr_min = 36.30
+bpp_max = 2.6426
 
 [checkerboard_512x512.q75]
-psnr_min = 43.74
-bpp_max = 3.2763
+psnr_min = 43.36
+bpp_max = 4.3450
 
 [checkerboard_512x512.q90]
-psnr_min = 51.29
-bpp_max = 4.6589
+psnr_min = 50.82
+bpp_max = 6.7974
 

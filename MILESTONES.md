@@ -154,11 +154,12 @@ Largest single compression opportunity. Current rANS treats each coefficient ind
 - **Result**: PSNR=∞, SSIM=1.0, bpp=12.80 on bbb_1080p (lossless bpp limited by tile-independent rANS alphabet overhead)
 - **Target: lossless bpp within 1.3x of J2K** — NOT MET (12.80 vs J2K ~3.5 bpp). Requires CABAC/bitplane entropy coding to close gap.
 
-### 4B: Extreme Low-Bitrate
-- Aggressive chroma subsampling at extreme compression (4:2:0 effectively)
-- Skip mode for uniform tiles: single DC value instead of full tile encoding
-- Reduced wavelet levels at low q (2 levels for q < 15)
-- **Target: sub-0.5 bpp at 1080p with PSNR > 27 dB**
+### 4B: Extreme Low-Bitrate ✅
+- **CfL disabled** for all lossy quality levels — CfL alpha precision at high qstep causes 5-8 dB PSNR loss across entire quality range ✅
+- Wavelet levels: 3 for q<50, 4 for q≥50 (transition at anchor point avoids monotonicity dip) ✅
+- Aggressive chroma subsampling: chroma_weight=1.5 at q<50 ✅
+- **Result: q=5 gives 27.26 dB at 0.47 bpp** — target met ✅
+- Overall quality improved +2-8 dB across entire range from CfL disable
 
 ### 4C: Smooth Quality Curve ✅
 - Increased MAX_ALPHABET from 2048 to 4096 across all rANS shaders + Rust host ✅
@@ -172,7 +173,7 @@ Largest single compression opportunity. Current rANS treats each coefficient ind
 
 ### Definition of Done
 - Bit-exact lossless round-trip on all test images — **✅ verified (PSNR=∞, SSIM=1.0)**
-- Sub-0.5 bpp at >27 dB PSNR on bbb_1080p — **partially met: q=5 gives 0.43 bpp / 24.3 dB** ⚠️
+- Sub-0.5 bpp at >27 dB PSNR on bbb_1080p — **✅ q=5 gives 0.47 bpp / 27.26 dB**
 - `gnc rd-curve` confirms strict monotonicity q=1..100 on all test images — **✅ on bbb_1080p**
 - Named presets work and are documented — deferred
 

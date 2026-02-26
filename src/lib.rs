@@ -282,13 +282,14 @@ pub fn quality_preset(q: u32) -> CodecConfig {
     }
 
     let anchors: &[Anchor] = &[
+        // CfL disabled at extreme compression: alpha precision hurts more than
+        // chroma prediction helps at high qstep
         Anchor {
             q: 1,
             qstep: 64.0,
             dead_zone: 1.0,
             perceptual: true,
-
-            cfl: true,
+            cfl: false,
             per_subband: true,
         },
         Anchor {
@@ -296,8 +297,7 @@ pub fn quality_preset(q: u32) -> CodecConfig {
             qstep: 32.0,
             dead_zone: 0.75,
             perceptual: true,
-
-            cfl: true,
+            cfl: false, // CfL alpha precision too coarse at high qstep
             per_subband: true,
         },
         Anchor {
@@ -305,8 +305,7 @@ pub fn quality_preset(q: u32) -> CodecConfig {
             qstep: 16.0,
             dead_zone: 0.75,
             perceptual: true,
-
-            cfl: true,
+            cfl: false, // CfL alpha precision still hurts at qstep=16
             per_subband: true,
         },
         Anchor {
@@ -314,8 +313,7 @@ pub fn quality_preset(q: u32) -> CodecConfig {
             qstep: 8.0,
             dead_zone: 0.75,
             perceptual: true,
-
-            cfl: true,
+            cfl: false,
             per_subband: true,
         },
         Anchor {
@@ -323,8 +321,7 @@ pub fn quality_preset(q: u32) -> CodecConfig {
             qstep: 4.0,
             dead_zone: 0.5,
             perceptual: true,
-
-            cfl: true,
+            cfl: false,
             per_subband: true,
         },
         Anchor {
@@ -332,7 +329,7 @@ pub fn quality_preset(q: u32) -> CodecConfig {
             qstep: 2.8,
             dead_zone: 0.25,
             perceptual: false,
-            cfl: true,
+            cfl: false,
             per_subband: true,
         },
         // CDF 9/7 at qstep >= 2.0 keeps rANS alphabet within GPU limits
@@ -341,7 +338,7 @@ pub fn quality_preset(q: u32) -> CodecConfig {
             qstep: 2.05,
             dead_zone: 0.05,
             perceptual: false,
-            cfl: true,
+            cfl: false,
             per_subband: true,
         },
         // Slow quality ramp at safe qstep floor — dead_zone→0 squeezes out last dB
@@ -350,7 +347,7 @@ pub fn quality_preset(q: u32) -> CodecConfig {
             qstep: 2.0,
             dead_zone: 0.0,
             perceptual: false,
-            cfl: true,
+            cfl: false,
             per_subband: true,
         },
         // Lossless: LeGall 5/3 with integer-exact lifting
@@ -390,7 +387,7 @@ pub fn quality_preset(q: u32) -> CodecConfig {
     // Discrete settings: use lower-quality anchor until midpoint
     let disc = if t < 0.5 { lo } else { hi };
 
-    let wavelet_levels = if q >= 60 { 4 } else { 3 };
+    let wavelet_levels = if q >= 50 { 4 } else { 3 };
     let aq_enabled = q <= 80; // AQ helps in lossy range; variance computed on LL subband
     let aq_strength = if q >= 70 { 0.4 } else { 0.3 };
     let mut weights = if disc.perceptual {

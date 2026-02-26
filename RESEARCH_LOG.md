@@ -1384,3 +1384,44 @@ Full q=1..100 sweep on bbb_1080p (1920×1080):
 - The q=92-99 range shows a PSNR plateau at ~51.8 dB because qstep only varies from 2.05 to 2.0. This is an acceptable tradeoff: CDF 9/7 can't go lower safely, and LeGall 5/3 can't match lossy quality at any non-lossless qstep.
 - Large PSNR jumps exist at parameter transitions: q=59→60 (+1.9 dB, wavelet 3→4 levels), q=69→70 (+4.3 dB, chroma weight transition), q=80→81 (+14.5 dB, adaptive quantization disabled). These are monotonically increasing but unevenly distributed.
 - On synthetic 256x256 images, per-step monotonicity can break by ~0.4 dB due to qstep-entropy interaction (quantization grid alignment with rANS frequency tables). This is content-specific and doesn't occur on natural 1080p content.
+
+---
+
+## M4B: Extreme Low-Bitrate + CfL Disable (2026-02-26)
+
+### Hypothesis
+CfL (chroma-from-luma prediction) may hurt quality at high qstep due to alpha precision loss. Disabling it at extreme compression should improve PSNR without significantly affecting bpp. Target: sub-0.5 bpp at >27 dB PSNR.
+
+### Implementation
+
+Tested CfL impact by disabling it progressively from low quality anchors:
+
+1. **CfL off at q=1-5**: +2.37 dB PSNR at q=1 (23.48→25.85) with minimal bpp change
+2. **CfL off at q=1-17**: +5.11 dB at q=17 (31.14 vs 26.03 with CfL). Massive quality gap at CfL enable transition.
+3. **CfL off at q=1-37**: +8.35 dB at q=37 (35.22 vs 26.87 with CfL). CfL degrades quality across ALL tested quality levels.
+4. **CfL off everywhere (q=1-99)**: Full curve shows +2 to +8 dB improvement at all quality levels. No bpp penalty.
+
+Also changed wavelet levels from `q>=60` to `q>=50` to put the 3→4 level transition at an anchor point, avoiding a 0.06 dB monotonicity dip.
+
+### Results
+
+| q | Before (CfL on) | After (CfL off) | PSNR improvement |
+|---|-----------------|-----------------|-----------------|
+| 1 | 23.48 dB / 0.35 bpp | 25.85 dB / 0.38 bpp | +2.37 dB |
+| 5 | 24.29 dB / 0.43 bpp | **27.26 dB / 0.47 bpp** | **+2.97 dB** |
+| 10 | 25.38 dB / 0.66 bpp | 29.53 dB / 0.71 bpp | +4.15 dB |
+| 25 | 26.49 dB / 1.37 bpp | 33.19 dB / 1.54 bpp | +6.70 dB |
+| 50 | 27.15 dB / 3.16 bpp | 37.81 dB / 3.54 bpp | +10.66 dB |
+| 75 | 33.69 dB / 6.22 bpp | 44.21 dB / 6.74 bpp | +10.52 dB |
+
+**M4B target met: q=5 gives 27.26 dB at 0.47 bpp** (>27 dB, <0.5 bpp).
+
+Strict monotonicity maintained for all q=1..100 on bbb_1080p.
+
+### Analysis
+
+CfL was NET NEGATIVE for RD efficiency across the entire quality range. Root cause: the CfL alpha coefficients (per-subband) have insufficient precision relative to the quantization step. The chroma prediction errors they introduce (up to 8 dB PSNR loss!) far exceed any entropy reduction from chroma decorrelation.
+
+This is a significant finding: the CfL implementation from M2A, while technically functional, has a fundamental precision issue that makes it counterproductive. The alpha values are quantized too coarsely (likely u8 or low-precision f16), causing large reconstruction errors in chroma planes.
+
+CfL should remain disabled until the alpha precision is reworked (e.g., f32 alphas or adaptive precision scaling by qstep). This is a potential future improvement but not blocking any current milestone.

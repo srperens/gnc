@@ -427,6 +427,7 @@ impl GpuRansDecoder {
 
     /// Dispatch GPU rANS decode for one plane. Output is written directly
     /// to `output_buf` as f32 coefficients at the correct plane positions.
+    #[allow(clippy::too_many_arguments)]
     pub fn dispatch_decode(
         &self,
         ctx: &GpuContext,

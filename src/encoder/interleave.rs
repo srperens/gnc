@@ -113,6 +113,7 @@ impl PlaneInterleaver {
     }
 
     /// Dispatch interleave: 3 plane buffers -> 1 interleaved output buffer.
+    #[allow(clippy::too_many_arguments)]
     pub fn dispatch(
         &self,
         ctx: &GpuContext,
@@ -279,6 +280,7 @@ impl PlaneDeinterleaver {
     }
 
     /// Dispatch deinterleave: 1 interleaved buffer -> 3 separate plane buffers.
+    #[allow(clippy::too_many_arguments)]
     pub fn dispatch(
         &self,
         ctx: &GpuContext,

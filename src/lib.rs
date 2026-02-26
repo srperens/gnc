@@ -6,8 +6,6 @@ pub mod format;
 pub mod gpu_util;
 pub mod image_util;
 
-use wgpu;
-
 /// Frame dimensions and format info
 #[derive(Debug, Clone, Copy)]
 pub struct FrameInfo {
@@ -19,11 +17,11 @@ pub struct FrameInfo {
 
 impl FrameInfo {
     pub fn tiles_x(&self) -> u32 {
-        (self.width + self.tile_size - 1) / self.tile_size
+        self.width.div_ceil(self.tile_size)
     }
 
     pub fn tiles_y(&self) -> u32 {
-        (self.height + self.tile_size - 1) / self.tile_size
+        self.height.div_ceil(self.tile_size)
     }
 
     pub fn total_tiles(&self) -> u32 {
@@ -319,7 +317,7 @@ pub fn quality_preset(q: u32) -> CodecConfig {
         Anchor {
             q: 75,
             qstep: 4.0,
-            dead_zone: 0.5,
+            dead_zone: 0.75,
             perceptual: true,
             cfl: false,
             per_subband: true,
@@ -327,8 +325,8 @@ pub fn quality_preset(q: u32) -> CodecConfig {
         Anchor {
             q: 85,
             qstep: 2.8,
-            dead_zone: 0.25,
-            perceptual: false,
+            dead_zone: 0.5,
+            perceptual: true,
             cfl: false,
             per_subband: true,
         },
@@ -395,10 +393,14 @@ pub fn quality_preset(q: u32) -> CodecConfig {
     } else {
         SubbandWeights::uniform(wavelet_levels)
     };
-    if q < 50 {
+    // Chroma weighting: HVS is less sensitive to chroma detail.
+    // More aggressive at low quality where bitrate savings matter most.
+    if q < 40 {
         weights.chroma_weight = 1.5;
-    } else if q < 70 {
-        weights.chroma_weight = 1.1;
+    } else if q < 60 {
+        weights.chroma_weight = 1.3;
+    } else if q < 85 {
+        weights.chroma_weight = 1.2;
     }
     CodecConfig {
         quantization_step: qstep,
@@ -526,6 +528,13 @@ pub fn decode_order(frames: &[CompressedFrame]) -> Vec<usize> {
 pub struct GpuContext {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Default for GpuContext {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl GpuContext {

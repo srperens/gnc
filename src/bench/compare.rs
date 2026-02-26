@@ -44,7 +44,7 @@ pub fn write_csv(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut wtr = csv::Writer::from_path(path)?;
 
-    wtr.write_record(&[
+    wtr.write_record([
         "name",
         "input",
         "width",
@@ -67,7 +67,7 @@ pub fn write_csv(
 
     for r in results {
         let tp = r.throughput.as_ref();
-        wtr.write_record(&[
+        wtr.write_record([
             &r.name,
             &r.config.input_file,
             &r.config.width.to_string(),

@@ -95,6 +95,7 @@ impl ColorConverter {
     /// Dispatch the color conversion.
     /// `input_buf` must contain width*height*3 f32 values (RGB or YCoCg interleaved).
     /// When `lossless=true`, uses floor() in lifting steps for integer-exact reversibility.
+    #[allow(clippy::too_many_arguments)]
     pub fn dispatch(
         &self,
         ctx: &GpuContext,

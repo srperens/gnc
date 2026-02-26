@@ -677,7 +677,7 @@ impl GpuRansEncoder {
             });
 
         // Dispatch all 3 planes sequentially in one command encoder
-        for p in 0..3 {
+        for (p, quantized_buf) in quantized_bufs.iter().enumerate() {
             // Build bind groups for this plane's quantized buffer
             let hist_bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("rans_hist_bg"),
@@ -689,7 +689,7 @@ impl GpuRansEncoder {
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: quantized_bufs[p].as_entire_binding(),
+                        resource: quantized_buf.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
@@ -731,7 +731,7 @@ impl GpuRansEncoder {
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: quantized_bufs[p].as_entire_binding(),
+                        resource: quantized_buf.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
@@ -905,6 +905,7 @@ impl GpuRansEncoder {
 
     /// Reconstruct TileFreqs from GPU-computed cumfreq and tile_info readbacks.
     /// Frequencies are derived as freq[i] = cumfreq[i+1] - cumfreq[i].
+    #[allow(clippy::needless_range_loop)]
     fn reconstruct_tile_freqs(
         cumfreq_data: &[u32],
         tile_info_data: &[u32],
@@ -986,7 +987,7 @@ impl GpuRansEncoder {
         let mut subband_tiles = Vec::new();
         let coefficients_per_tile = (info.tile_size * info.tile_size) as usize;
 
-        for t in 0..num_tiles {
+        for (t, tile_freq) in tile_freqs.iter().enumerate().take(num_tiles) {
             let mut per_stream_data: Vec<Vec<u8>> = Vec::with_capacity(STREAMS_PER_TILE);
             let mut per_stream_state: Vec<u32> = Vec::with_capacity(STREAMS_PER_TILE);
 
@@ -1007,7 +1008,7 @@ impl GpuRansEncoder {
             }
 
             if per_subband {
-                match &tile_freqs[t] {
+                match tile_freq {
                     TileFreqs::Subband(sb) => {
                         let groups: Vec<SubbandGroupFreqs> = sb
                             .groups
@@ -1034,7 +1035,7 @@ impl GpuRansEncoder {
                     _ => unreachable!("Expected subband tile freqs"),
                 }
             } else {
-                match &tile_freqs[t] {
+                match tile_freq {
                     TileFreqs::Single(s) => {
                         rans_tiles.push(InterleavedRansTile {
                             min_val: s.min_val,

@@ -129,7 +129,7 @@ impl EntropyCoder {
 
     /// Number of u32 words needed to pack `count` f32 coefficients as i16 pairs
     pub fn packed_size(count: u32) -> u32 {
-        (count + 1) / 2
+        count.div_ceil(2)
     }
 
     /// Encode: quantized f32 -> packed u32 (i16 pairs)
@@ -181,7 +181,7 @@ impl EntropyCoder {
         });
 
         let pairs = Self::packed_size(total_count);
-        let workgroups = (pairs + 255) / 256;
+        let workgroups = pairs.div_ceil(256);
 
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("entropy_encode_pass"),
@@ -241,7 +241,7 @@ impl EntropyCoder {
         });
 
         let pairs = Self::packed_size(total_count);
-        let workgroups = (pairs + 255) / 256;
+        let workgroups = pairs.div_ceil(256);
 
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("entropy_decode_pass"),

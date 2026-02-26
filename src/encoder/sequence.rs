@@ -303,7 +303,7 @@ impl EncoderPipeline {
         let bufs = self.cached.as_ref().unwrap();
 
         // Build weight-map parameter (matching decoder's dispatch_adaptive call)
-        let wm_param = if frame.weight_map.is_some() {
+        let wm_param = if let Some(wm) = &frame.weight_map {
             let (_, ll_bx, _, tx) = adaptive::weight_map_dims(
                 padded_w,
                 padded_h,
@@ -316,7 +316,7 @@ impl EncoderPipeline {
             ctx.queue.write_buffer(
                 &bufs.weight_map_buf,
                 0,
-                bytemuck::cast_slice(frame.weight_map.as_ref().unwrap()),
+                bytemuck::cast_slice(wm),
             );
             Some((&bufs.weight_map_buf, ll_block_size, ll_bx, tx))
         } else {
@@ -731,7 +731,7 @@ impl EncoderPipeline {
                     label: Some("pf_local_decode"),
                 });
 
-            for p in 0..3 {
+            for (p, quant_buf) in quant_bufs.iter().enumerate() {
                 let weights = if p == 0 {
                     &weights_luma
                 } else {
@@ -741,7 +741,7 @@ impl EncoderPipeline {
                 self.quantize.dispatch(
                     ctx,
                     &mut cmd,
-                    quant_bufs[p],
+                    quant_buf,
                     &bufs.cg_plane,
                     padded_pixels as u32,
                     config.quantization_step,

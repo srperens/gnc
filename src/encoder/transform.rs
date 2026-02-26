@@ -121,6 +121,7 @@ impl WaveletTransform {
     /// Dispatch one pass of the wavelet transform for a single plane.
     /// `pass_mode`: 0 = rows, 1 = columns
     /// `region_size`: the sub-region width/height for this decomposition level.
+    #[allow(clippy::too_many_arguments)]
     fn dispatch_pass(
         &self,
         ctx: &GpuContext,
@@ -191,6 +192,7 @@ impl WaveletTransform {
 
     /// Run multi-level 2D forward wavelet transform.
     /// Level 0 transforms the full tile, level 1 transforms the LL subband, etc.
+    #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
         ctx: &GpuContext,
@@ -241,6 +243,7 @@ impl WaveletTransform {
 
     /// Run multi-level 2D inverse wavelet transform.
     /// Levels are processed in reverse order (smallest region first).
+    #[allow(clippy::too_many_arguments)]
     pub fn inverse(
         &self,
         ctx: &GpuContext,

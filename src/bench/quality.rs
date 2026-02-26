@@ -1,5 +1,5 @@
 /// Quality metrics: PSNR, SSIM
-
+///
 /// Compute Peak Signal-to-Noise Ratio between original and reconstructed frames.
 /// Both inputs are f32 slices in [0, peak_val] range, same length (W*H*3 interleaved).
 pub fn psnr(original: &[f32], reconstructed: &[f32], peak_val: f32) -> f64 {

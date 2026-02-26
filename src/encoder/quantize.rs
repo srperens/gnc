@@ -241,7 +241,7 @@ impl Quantizer {
             ],
         });
 
-        let workgroups = (total_count + 255) / 256;
+        let workgroups = total_count.div_ceil(256);
 
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("quantize_pass"),

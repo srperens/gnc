@@ -505,7 +505,7 @@ impl GpuBitplaneDecoder {
         }
 
         // Pad to u32 boundary and pack
-        while all_bitplane_bytes.len() % 4 != 0 {
+        while !all_bitplane_bytes.len().is_multiple_of(4) {
             all_bitplane_bytes.push(0);
         }
         let bitplane_data_u32: Vec<u32> = all_bitplane_bytes
@@ -572,6 +572,7 @@ impl GpuBitplaneDecoder {
 
     /// Dispatch GPU bitplane decode for one plane.
     /// Uses one workgroup per block (not per tile), since each 32x32 block is independent.
+    #[allow(clippy::too_many_arguments)]
     pub fn dispatch_decode(
         &self,
         ctx: &GpuContext,

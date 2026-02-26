@@ -24,18 +24,19 @@ pub fn bd_rate(reference: &[RdPoint], test: &[RdPoint]) -> Option<f64> {
 
     let mut ref_sorted: Vec<RdPoint> = reference.to_vec();
     let mut test_sorted: Vec<RdPoint> = test.to_vec();
-    ref_sorted.sort_by(|a, b| a.psnr.partial_cmp(&b.psnr).unwrap());
-    test_sorted.sort_by(|a, b| a.psnr.partial_cmp(&b.psnr).unwrap());
+    ref_sorted.sort_by(|a, b| a.psnr.partial_cmp(&b.psnr).unwrap_or(std::cmp::Ordering::Equal));
+    test_sorted.sort_by(|a, b| a.psnr.partial_cmp(&b.psnr).unwrap_or(std::cmp::Ordering::Equal));
 
     // Use log(bpp) for integration (standard BD-rate practice)
+    // Filter out inf/NaN PSNR (lossless points) and zero/negative bpp
     let ref_log: Vec<(f64, f64)> = ref_sorted
         .iter()
-        .filter(|p| p.bpp > 0.0)
+        .filter(|p| p.bpp > 0.0 && p.psnr.is_finite())
         .map(|p| (p.psnr, p.bpp.ln()))
         .collect();
     let test_log: Vec<(f64, f64)> = test_sorted
         .iter()
-        .filter(|p| p.bpp > 0.0)
+        .filter(|p| p.bpp > 0.0 && p.psnr.is_finite())
         .map(|p| (p.psnr, p.bpp.ln()))
         .collect();
 
@@ -58,6 +59,9 @@ pub fn bd_rate(reference: &[RdPoint], test: &[RdPoint]) -> Option<f64> {
     let test_integral = integrate_piecewise_cubic(&test_log, psnr_min, psnr_max);
 
     let avg_diff = (test_integral - ref_integral) / (psnr_max - psnr_min);
+    if !avg_diff.is_finite() {
+        return None;
+    }
 
     // Convert from log-domain difference to percentage
     Some((avg_diff.exp() - 1.0) * 100.0)
@@ -74,18 +78,18 @@ pub fn bd_psnr(reference: &[RdPoint], test: &[RdPoint]) -> Option<f64> {
 
     let mut ref_sorted: Vec<RdPoint> = reference.to_vec();
     let mut test_sorted: Vec<RdPoint> = test.to_vec();
-    ref_sorted.sort_by(|a, b| a.bpp.partial_cmp(&b.bpp).unwrap());
-    test_sorted.sort_by(|a, b| a.bpp.partial_cmp(&b.bpp).unwrap());
+    ref_sorted.sort_by(|a, b| a.bpp.partial_cmp(&b.bpp).unwrap_or(std::cmp::Ordering::Equal));
+    test_sorted.sort_by(|a, b| a.bpp.partial_cmp(&b.bpp).unwrap_or(std::cmp::Ordering::Equal));
 
-    // Use log(bpp) as x-axis
+    // Use log(bpp) as x-axis — filter out inf/NaN PSNR and zero/negative bpp
     let ref_pts: Vec<(f64, f64)> = ref_sorted
         .iter()
-        .filter(|p| p.bpp > 0.0)
+        .filter(|p| p.bpp > 0.0 && p.psnr.is_finite())
         .map(|p| (p.bpp.ln(), p.psnr))
         .collect();
     let test_pts: Vec<(f64, f64)> = test_sorted
         .iter()
-        .filter(|p| p.bpp > 0.0)
+        .filter(|p| p.bpp > 0.0 && p.psnr.is_finite())
         .map(|p| (p.bpp.ln(), p.psnr))
         .collect();
 
@@ -278,7 +282,7 @@ pub fn load_rd_curve(path: &str) -> Result<Vec<RdPoint>, Box<dyn std::error::Err
         points.push(RdPoint { bpp, psnr });
     }
 
-    points.sort_by(|a, b| a.psnr.partial_cmp(&b.psnr).unwrap());
+    points.sort_by(|a, b| a.psnr.partial_cmp(&b.psnr).unwrap_or(std::cmp::Ordering::Equal));
     Ok(points)
 }
 

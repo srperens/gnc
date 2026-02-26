@@ -6,7 +6,6 @@
 ///
 /// Based on Fabian Giesen's ryg_rans implementation.
 /// Patent-free — ANS was placed in the public domain by Jarek Duda.
-
 const RANS_BYTE_L: u32 = 1 << 23;
 const RANS_PRECISION: u32 = 12;
 const RANS_M: u32 = 1 << RANS_PRECISION;
@@ -129,8 +128,8 @@ pub fn rans_decode_tile(tile: &RansTile) -> Vec<i32> {
 
     // Build decode lookup table: slot -> symbol
     let mut slot_to_sym = vec![0u16; RANS_M as usize];
-    for sym in 0..alphabet_size {
-        for j in cum_freqs[sym]..cum_freqs[sym] + tile.freqs[sym] {
+    for (sym, cum_freq) in cum_freqs.iter().enumerate().take(alphabet_size) {
+        for j in *cum_freq..*cum_freq + tile.freqs[sym] {
             slot_to_sym[j as usize] = sym as u16;
         }
     }

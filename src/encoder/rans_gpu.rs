@@ -165,8 +165,8 @@ impl GpuRansDecoder {
 
         for (t, tile) in tiles.iter().enumerate() {
             assert!(
-                tile.alphabet_size <= 2048,
-                "Alphabet size {} exceeds GPU max 2048",
+                tile.alphabet_size <= 4096,
+                "Alphabet size {} exceeds GPU max 4096",
                 tile.alphabet_size
             );
 
@@ -316,8 +316,8 @@ impl GpuRansDecoder {
             //   [1+g*4+2]: cumfreq_offset, [1+g*4+3]: zrun_base
             for (g, group) in tile.groups.iter().enumerate() {
                 assert!(
-                    group.alphabet_size <= 2048,
-                    "Group {} alphabet size {} exceeds GPU max 2048",
+                    group.alphabet_size <= 4096,
+                    "Group {} alphabet size {} exceeds GPU max 4096",
                     g,
                     group.alphabet_size
                 );

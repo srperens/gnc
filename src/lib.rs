@@ -277,7 +277,6 @@ pub fn quality_preset(q: u32) -> CodecConfig {
         qstep: f32,
         dead_zone: f32,
         perceptual: bool,
-        cdf97: bool,
         cfl: bool,
         per_subband: bool,
     }
@@ -288,7 +287,7 @@ pub fn quality_preset(q: u32) -> CodecConfig {
             qstep: 64.0,
             dead_zone: 1.0,
             perceptual: true,
-            cdf97: true,
+
             cfl: true,
             per_subband: true,
         },
@@ -297,7 +296,7 @@ pub fn quality_preset(q: u32) -> CodecConfig {
             qstep: 32.0,
             dead_zone: 0.75,
             perceptual: true,
-            cdf97: true,
+
             cfl: true,
             per_subband: true,
         },
@@ -306,7 +305,7 @@ pub fn quality_preset(q: u32) -> CodecConfig {
             qstep: 16.0,
             dead_zone: 0.75,
             perceptual: true,
-            cdf97: true,
+
             cfl: true,
             per_subband: true,
         },
@@ -315,7 +314,7 @@ pub fn quality_preset(q: u32) -> CodecConfig {
             qstep: 8.0,
             dead_zone: 0.75,
             perceptual: true,
-            cdf97: true,
+
             cfl: true,
             per_subband: true,
         },
@@ -324,25 +323,42 @@ pub fn quality_preset(q: u32) -> CodecConfig {
             qstep: 4.0,
             dead_zone: 0.5,
             perceptual: true,
-            cdf97: true,
+
             cfl: true,
             per_subband: true,
         },
         Anchor {
-            q: 90,
-            qstep: 2.0,
-            dead_zone: 0.0,
+            q: 85,
+            qstep: 2.8,
+            dead_zone: 0.25,
             perceptual: false,
-            cdf97: true,
             cfl: true,
             per_subband: true,
         },
+        // CDF 9/7 at qstep >= 2.0 keeps rANS alphabet within GPU limits
+        Anchor {
+            q: 92,
+            qstep: 2.05,
+            dead_zone: 0.05,
+            perceptual: false,
+            cfl: true,
+            per_subband: true,
+        },
+        // Slow quality ramp at safe qstep floor — dead_zone→0 squeezes out last dB
+        Anchor {
+            q: 99,
+            qstep: 2.0,
+            dead_zone: 0.0,
+            perceptual: false,
+            cfl: true,
+            per_subband: true,
+        },
+        // Lossless: LeGall 5/3 with integer-exact lifting
         Anchor {
             q: 100,
             qstep: 1.0,
             dead_zone: 0.0,
             perceptual: false,
-            cdf97: false,
             cfl: false,
             per_subband: true,
         },
@@ -392,11 +408,14 @@ pub fn quality_preset(q: u32) -> CodecConfig {
         dead_zone,
         wavelet_levels,
         subband_weights: weights,
+        // CfL: use anchor's setting (disabled at q>=99 to avoid chroma artifacts near lossless)
         cfl_enabled: disc.cfl,
-        wavelet_type: if disc.cdf97 {
-            WaveletType::CDF97
-        } else {
+        // LeGall 5/3 only for lossless (q=100); CDF 9/7 for all lossy
+        // (CDF 9/7 qstep clamped >= 2.0 to keep rANS alphabet within GPU limits)
+        wavelet_type: if q == 100 {
             WaveletType::LeGall53
+        } else {
+            WaveletType::CDF97
         },
         per_subband_entropy: disc.per_subband,
         adaptive_quantization: aq_enabled,

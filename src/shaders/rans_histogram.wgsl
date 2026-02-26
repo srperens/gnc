@@ -15,8 +15,8 @@
 //   1 = Per-subband histograms (one per wavelet level group, with per-group ZRL)
 
 const WG_SIZE: u32 = 256u;
-const MAX_ALPHABET: u32 = 2048u;
-const MAX_GROUP_ALPHABET: u32 = 2048u;
+const MAX_ALPHABET: u32 = 4096u;
+const MAX_GROUP_ALPHABET: u32 = 4096u;
 const MAX_GROUPS: u32 = 8u;
 const MAX_ZERO_RUN: u32 = 256u;
 const STREAMS_PER_TILE: u32 = 32u;
@@ -24,7 +24,7 @@ const STREAMS_PER_TILE: u32 = 32u;
 // Output stride per tile in u32s.
 // Single-table: [min_val, alphabet_size, zrun_base, hist[0..MAX_ALPHABET]]
 // Per-subband:  [num_groups, {min_val, alphabet_size, zrun_base, hist[0..MAX_GROUP_ALPHABET]} x groups]
-const HIST_TILE_STRIDE: u32 = 16409u;  // 1 + MAX_GROUPS*(3+MAX_GROUP_ALPHABET)
+const HIST_TILE_STRIDE: u32 = 32793u;  // 1 + MAX_GROUPS*(3+MAX_GROUP_ALPHABET)
 
 struct Params {
     num_tiles: u32,

@@ -10,10 +10,10 @@
 
 const WG_SIZE: u32 = 256u;
 const RANS_M: u32 = 4096u;           // 1 << 12, must match RANS_PRECISION
-const MAX_ALPHABET: u32 = 2048u;
-const MAX_GROUP_ALPHABET: u32 = 2048u;
+const MAX_ALPHABET: u32 = 4096u;
+const MAX_GROUP_ALPHABET: u32 = 4096u;
 const MAX_GROUPS: u32 = 8u;
-const HIST_TILE_STRIDE: u32 = 16409u;  // 1 + MAX_GROUPS*(3+MAX_GROUP_ALPHABET)
+const HIST_TILE_STRIDE: u32 = 32793u;  // 1 + MAX_GROUPS*(3+MAX_GROUP_ALPHABET)
 const ENCODE_TILE_INFO_STRIDE: u32 = 32u;
 
 struct Params {
@@ -33,7 +33,7 @@ struct Params {
 @group(0) @binding(3) var<storage, read_write> tile_info_out: array<u32>;
 
 // Shared memory for normalization
-var<workgroup> shared_freq: array<u32, 2048>;
+var<workgroup> shared_freq: array<u32, 4096>;
 var<workgroup> shared_sum: array<u32, 256>;
 var<workgroup> w_total: u32;
 var<workgroup> w_assigned: u32;

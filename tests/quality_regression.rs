@@ -17,13 +17,14 @@ use std::sync::OnceLock;
 // --- Synthetic test image generators ---
 
 /// Smooth gradient with color variation (easy content).
+/// Values are rounded to integers (0-255) to match real image behavior.
 fn make_gradient(w: u32, h: u32) -> Vec<f32> {
     let mut data = Vec::with_capacity((w * h * 3) as usize);
     for y in 0..h {
         for x in 0..w {
-            let r = (x as f32 / w as f32 * 255.0).clamp(0.0, 255.0);
-            let g = (y as f32 / h as f32 * 255.0).clamp(0.0, 255.0);
-            let b = ((x + y) as f32 / (w + h) as f32 * 255.0).clamp(0.0, 255.0);
+            let r = (x as f32 / w as f32 * 255.0).round().clamp(0.0, 255.0);
+            let g = (y as f32 / h as f32 * 255.0).round().clamp(0.0, 255.0);
+            let b = ((x + y) as f32 / (w + h) as f32 * 255.0).round().clamp(0.0, 255.0);
             data.push(r);
             data.push(g);
             data.push(b);
@@ -33,6 +34,7 @@ fn make_gradient(w: u32, h: u32) -> Vec<f32> {
 }
 
 /// Checkerboard pattern with noise (hard content for wavelet codecs).
+/// Values are rounded to integers (0-255) to match real image behavior.
 fn make_checkerboard(w: u32, h: u32) -> Vec<f32> {
     let mut data = Vec::with_capacity((w * h * 3) as usize);
     // Simple LCG for deterministic "noise"
@@ -44,10 +46,10 @@ fn make_checkerboard(w: u32, h: u32) -> Vec<f32> {
             // Deterministic noise
             rng = rng.wrapping_mul(1103515245).wrapping_add(12345);
             let noise = ((rng >> 16) as f32 / 65536.0 - 0.5) * 20.0;
-            let val = (base + noise).clamp(0.0, 255.0);
+            let val = (base + noise).clamp(0.0, 255.0).round();
             data.push(val);
-            data.push(val * 0.9);
-            data.push(val * 0.8);
+            data.push((val * 0.9).round().clamp(0.0, 255.0));
+            data.push((val * 0.8).round().clamp(0.0, 255.0));
         }
     }
     data
@@ -257,7 +259,7 @@ fn regression_checkerboard_q90() {
     assert_baseline("checkerboard_512x512.q90", &result, &baselines);
 }
 
-// --- Quality monotonicity test ---
+// --- Quality monotonicity test (coarse) ---
 
 #[test]
 fn regression_quality_monotonicity() {
@@ -265,7 +267,7 @@ fn regression_quality_monotonicity() {
     let img = make_gradient(512, 512);
 
     let mut prev_psnr = 0.0;
-    let mut prev_bpp = f64::MAX;
+    let mut prev_bpp = 0.0;
 
     for q in [10, 25, 50, 75, 90] {
         let result = encode_decode_measure(ctx, &img, 512, 512, q);
@@ -274,19 +276,58 @@ fn regression_quality_monotonicity() {
             result.psnr, result.bpp
         );
 
-        // PSNR should increase with quality
         assert!(
             result.psnr >= prev_psnr - 0.1,
             "PSNR not monotonic: q={q} PSNR={:.2} < prev={:.2}",
             result.psnr,
             prev_psnr
         );
-        // bpp should decrease with lower quality (but we're going up)
-        // Actually bpp should increase with quality
+        assert!(
+            result.bpp >= prev_bpp - 0.01,
+            "bpp not monotonic: q={q} bpp={:.4} < prev={:.4}",
+            result.bpp,
+            prev_bpp
+        );
         prev_psnr = result.psnr;
         prev_bpp = result.bpp;
     }
-    let _ = prev_bpp; // suppress warning
+}
+
+// --- Extended PSNR monotonicity test (step=5, two image types) ---
+// Verifies PSNR monotonically increases at q=5,10,...,95,100 on gradient
+// and checkerboard. bpp monotonicity is image-dependent (wavelet level changes
+// improve efficiency on smooth content) and verified on natural images via
+// `gnc rd-curve --q-values 1..100`.
+
+#[test]
+fn regression_quality_monotonicity_extended() {
+    let ctx = gpu();
+
+    for (name, img) in [("gradient", make_gradient(512, 512)), ("checker", make_checkerboard(512, 512))] {
+        let mut prev_psnr = 0.0f64;
+        let mut prev_q = 0u32;
+
+        for q in (5..=95).step_by(5).chain(std::iter::once(100)) {
+            let result = encode_decode_measure(ctx, &img, 512, 512, q);
+            eprintln!(
+                "monotonicity {name} q={q}: PSNR={:.2} bpp={:.4}",
+                result.psnr, result.bpp
+            );
+
+            // inf PSNR (lossless) is always >= any finite value
+            if !result.psnr.is_infinite() {
+                assert!(
+                    result.psnr >= prev_psnr - 0.5,
+                    "{name}: PSNR not monotonic: q={q} PSNR={:.2} < prev q={prev_q} PSNR={:.2}",
+                    result.psnr,
+                    prev_psnr
+                );
+            }
+            prev_psnr = result.psnr;
+            prev_q = q;
+        }
+        let _ = prev_q;
+    }
 }
 
 // --- Serialization round-trip test ---

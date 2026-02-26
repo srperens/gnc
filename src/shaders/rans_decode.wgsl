@@ -12,7 +12,7 @@ const RANS_BYTE_L: u32 = 8388608u;  // 1 << 23
 const RANS_PRECISION: u32 = 12u;
 const RANS_MASK: u32 = 4095u;       // (1 << 12) - 1
 const STREAMS_PER_TILE: u32 = 32u;
-const MAX_ALPHABET: u32 = 2048u;
+const MAX_ALPHABET: u32 = 4096u;
 const MAX_GROUPS: u32 = 8u;
 
 // Per-tile info stride in u32s (must match host TILE_INFO_STRIDE)
@@ -37,7 +37,7 @@ struct Params {
 
 // Shared cumfreq table for the current tile (loaded cooperatively)
 // Per-subband: up to MAX_GROUPS * (MAX_GROUP_ALPHABET + 1) entries
-// Single-table: up to MAX_ALPHABET + 1 = 2049 entries
+// Single-table: up to MAX_ALPHABET + 1 = 4097 entries
 var<workgroup> shared_cumfreq: array<u32, 4096>;
 
 // Read one byte from the packed u32 stream data array.
@@ -53,8 +53,8 @@ fn read_byte(byte_offset: u32) -> u32 {
 fn binary_search(slot: u32, alphabet_size: u32) -> u32 {
     var lo = 0u;
     var hi = alphabet_size;
-    // Max 11 iterations covers alphabet up to 2048
-    for (var iter = 0u; iter < 11u; iter++) {
+    // Max 12 iterations covers alphabet up to 4096
+    for (var iter = 0u; iter < 12u; iter++) {
         if (lo >= hi) { break; }
         let mid = (lo + hi) >> 1u;
         if (shared_cumfreq[mid + 1u] <= slot) {
@@ -71,7 +71,7 @@ fn binary_search(slot: u32, alphabet_size: u32) -> u32 {
 fn binary_search_at(slot: u32, start: u32, alphabet_size: u32) -> u32 {
     var lo = 0u;
     var hi = alphabet_size;
-    for (var iter = 0u; iter < 11u; iter++) {
+    for (var iter = 0u; iter < 12u; iter++) {
         if (lo >= hi) { break; }
         let mid = (lo + hi) >> 1u;
         if (shared_cumfreq[start + mid + 1u] <= slot) {

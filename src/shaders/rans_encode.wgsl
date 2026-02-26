@@ -15,7 +15,7 @@
 const RANS_BYTE_L: u32 = 8388608u;  // 1 << 23
 const RANS_PRECISION: u32 = 12u;
 const STREAMS_PER_TILE: u32 = 32u;
-const MAX_ALPHABET: u32 = 2048u;
+const MAX_ALPHABET: u32 = 4096u;
 const MAX_STREAM_BYTES: u32 = 4096u;
 const MAX_ZERO_RUN: u32 = 256u;
 

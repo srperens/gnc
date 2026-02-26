@@ -17,10 +17,10 @@ use super::rans::{InterleavedRansTile, SubbandGroupFreqs, SubbandRansTile, STREA
 use crate::{FrameInfo, GpuContext};
 
 const MAX_STREAM_BYTES: usize = 4096;
-const HIST_TILE_STRIDE: usize = 16409; // 1 + MAX_GROUPS*(3+MAX_GROUP_ALPHABET)
+const HIST_TILE_STRIDE: usize = 32793; // 1 + MAX_GROUPS*(3+MAX_GROUP_ALPHABET)
 const ENCODE_TILE_INFO_STRIDE: usize = 32;
-const MAX_ALPHABET: usize = 2048;
-const MAX_GROUP_ALPHABET: usize = 2048;
+const MAX_ALPHABET: usize = 4096;
+const MAX_GROUP_ALPHABET: usize = 4096;
 const MAX_GROUPS: usize = 8;
 
 fn cumfreq_stride(per_subband: bool) -> usize {

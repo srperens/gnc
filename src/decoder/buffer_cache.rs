@@ -215,7 +215,7 @@ impl CachedBuffers {
         let tiles_per_plane = ((padded_w / tile_size) * (padded_h / tile_size)) as usize;
         // rANS TILE_INFO_STRIDE (100) > bitplane (8), so use rANS stride for max
         let tile_info_size = (tiles_per_plane * rans_gpu::TILE_INFO_STRIDE * 4).max(4) as u64;
-        let var_a_init_cap = (tiles_per_plane * 2048 * 4).max(4) as u64;
+        let var_a_init_cap = (tiles_per_plane * 4096 * 4).max(4) as u64;
         let var_b_init_cap = plane_size.max(4);
 
         let storage_dst = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;

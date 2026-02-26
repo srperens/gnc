@@ -1330,3 +1330,57 @@ Encode throughput at lossless: 89 ms (11.2 fps) encode, 39 ms (25.4 fps) decode 
 - **ZRL (zero-run-length) doesn't activate** at qstep=1 because only ~40% of wavelet coefficients are zero (threshold is 60%). Lowering the threshold to 30% was tested but made bpp slightly worse due to the 256 extra ZRL symbols inflating the alphabet.
 - **Closing the lossless bpp gap requires** fundamentally different entropy coding: context-adaptive arithmetic coding (CABAC), bitplane/magnitude refinement coding, or zero-tree approaches. These are architectural changes beyond the current tile-independent rANS framework.
 - **No lossy quality regression**: the wavelet floor() change is applied to all modes but doesn't affect golden baselines because for even integer sums, `floor(x*0.5) == x*0.5`, and for odd sums, the sub-0.5 difference is below quantization resolution. The color conversion floor() is conditional, only active in lossless mode.
+
+---
+
+## M4C: Smooth Quality Curve — Monotonicity (2026-02-26)
+
+### Hypothesis
+Quality presets should produce strictly monotonic PSNR and bpp across q=1..100. Known issues: CDF 9/7 → LeGall 5/3 wavelet transition causes PSNR cliff; rANS alphabet overflow at low qstep with CDF 9/7 causes reconstruction errors.
+
+### Implementation
+
+**Problem 1: CDF 9/7 alphabet overflow at low qstep**
+At qstep < 2.0, CDF 9/7 wavelet coefficients exceed the GPU rANS MAX_ALPHABET limit. The histogram shader silently clamps alphabets, corrupting frequency tables and causing catastrophic quality drops (51 dB → 24 dB at qstep=1.4).
+
+Fix: Increased MAX_ALPHABET from 2048 to 4096 across all rANS shaders (histogram, normalize, encode, decode) and Rust host assertions. Also increased decoder buffer pre-allocation to match.
+
+**Problem 2: CDF 9/7 → LeGall 5/3 wavelet transition**
+LeGall 5/3 (integer wavelet) can't match CDF 9/7's lossy quality at any non-lossless qstep:
+- CDF 9/7 at qstep=2.05: 51.77 dB
+- LeGall 5/3 at qstep=1.02: 46.24 dB (integer coefficients quantized by non-integer qstep → large error)
+- LeGall 5/3 at qstep=1.0: ∞ dB (lossless, exact integer round-trip)
+
+The ~5 dB gap is fundamental: CDF 9/7 has 4 vanishing moments vs LeGall 5/3's 2, giving better frequency separation.
+
+Fix: Keep CDF 9/7 for all lossy quality levels (q=1-99) with qstep floored at 2.0 to stay within alphabet limits. LeGall 5/3 only at q=100 (lossless). New anchor structure:
+- q=92: qstep=2.05, dead_zone=0.05 (last CDF 9/7 anchor at safe alphabet boundary)
+- q=99: qstep=2.0, dead_zone=0.0 (slow quality ramp, minimal qstep change)
+- q=100: qstep=1.0, LeGall 5/3 (lossless)
+
+**Problem 3: GPU workgroup memory limits**
+shared_hist in rans_histogram.wgsl is 5120 entries (20KB). With MAX_ALPHABET=4096 in per-subband mode (8 groups), total histogram could exceed 5120. CDF 9/7 at qstep < 2.0 would overflow. The qstep floor at 2.0 keeps per-group alphabets small enough to fit.
+
+### Results
+
+Full q=1..100 sweep on bbb_1080p (1920×1080):
+
+| q | qstep | PSNR (dB) | bpp |
+|---|-------|-----------|-----|
+| 1 | 64.0 | 23.48 | 0.35 |
+| 10 | 32.0 | 25.38 | 0.66 |
+| 25 | 16.0 | 26.49 | 1.37 |
+| 50 | 8.0 | 27.15 | 3.16 |
+| 75 | 4.0 | 33.69 | 6.22 |
+| 85 | 2.8 | 49.48 | 8.48 |
+| 92 | 2.05 | 51.77 | 10.04 |
+| 99 | 2.0 | 51.95 | 10.16 |
+| 100 | 1.0 | ∞ | 12.79 |
+
+**Strict monotonicity confirmed**: both PSNR and bpp monotonically increasing for all 100 quality levels on bbb_1080p. Extended regression test passes on gradient and checkerboard at q=5,10,...,95,100.
+
+### Analysis
+
+- The q=92-99 range shows a PSNR plateau at ~51.8 dB because qstep only varies from 2.05 to 2.0. This is an acceptable tradeoff: CDF 9/7 can't go lower safely, and LeGall 5/3 can't match lossy quality at any non-lossless qstep.
+- Large PSNR jumps exist at parameter transitions: q=59→60 (+1.9 dB, wavelet 3→4 levels), q=69→70 (+4.3 dB, chroma weight transition), q=80→81 (+14.5 dB, adaptive quantization disabled). These are monotonically increasing but unevenly distributed.
+- On synthetic 256x256 images, per-step monotonicity can break by ~0.4 dB due to qstep-entropy interaction (quantization grid alignment with rANS frequency tables). This is content-specific and doesn't occur on natural 1080p content.

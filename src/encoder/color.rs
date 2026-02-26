@@ -10,7 +10,7 @@ struct ColorParams {
     width: u32,
     height: u32,
     direction: u32, // 0 = forward, 1 = inverse
-    _pad: u32,
+    lossless: u32,  // 0 = lossy (fractional f32), 1 = lossless (integer-exact)
 }
 
 pub struct ColorConverter {
@@ -34,7 +34,6 @@ impl ColorConverter {
                 .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                     label: Some("color_convert_bgl"),
                     entries: &[
-                        // params uniform
                         wgpu::BindGroupLayoutEntry {
                             binding: 0,
                             visibility: wgpu::ShaderStages::COMPUTE,
@@ -45,7 +44,6 @@ impl ColorConverter {
                             },
                             count: None,
                         },
-                        // input storage
                         wgpu::BindGroupLayoutEntry {
                             binding: 1,
                             visibility: wgpu::ShaderStages::COMPUTE,
@@ -56,7 +54,6 @@ impl ColorConverter {
                             },
                             count: None,
                         },
-                        // output storage
                         wgpu::BindGroupLayoutEntry {
                             binding: 2,
                             visibility: wgpu::ShaderStages::COMPUTE,
@@ -95,8 +92,9 @@ impl ColorConverter {
         }
     }
 
-    /// Dispatch the color conversion. Returns the output buffer.
+    /// Dispatch the color conversion.
     /// `input_buf` must contain width*height*3 f32 values (RGB or YCoCg interleaved).
+    /// When `lossless=true`, uses floor() in lifting steps for integer-exact reversibility.
     pub fn dispatch(
         &self,
         ctx: &GpuContext,
@@ -106,12 +104,13 @@ impl ColorConverter {
         width: u32,
         height: u32,
         forward: bool,
+        lossless: bool,
     ) {
         let params = ColorParams {
             width,
             height,
             direction: if forward { 0 } else { 1 },
-            _pad: 0,
+            lossless: u32::from(lossless),
         };
 
         let params_buf = ctx
@@ -142,7 +141,7 @@ impl ColorConverter {
         });
 
         let total_pixels = width * height;
-        let workgroups = (total_pixels + 255) / 256;
+        let workgroups = total_pixels.div_ceil(256);
 
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("color_convert_pass"),

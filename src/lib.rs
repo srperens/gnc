@@ -224,6 +224,16 @@ pub struct CodecConfig {
     pub rate_mode: RateMode,
 }
 
+impl CodecConfig {
+    /// Returns true when the configuration implies bit-exact lossless coding.
+    /// This activates integer-exact color conversion and wavelet lifting.
+    pub fn is_lossless(&self) -> bool {
+        self.quantization_step <= 1.0
+            && self.dead_zone == 0.0
+            && self.wavelet_type == WaveletType::LeGall53
+    }
+}
+
 impl Default for CodecConfig {
     fn default() -> Self {
         Self {
@@ -334,7 +344,7 @@ pub fn quality_preset(q: u32) -> CodecConfig {
             perceptual: false,
             cdf97: false,
             cfl: false,
-            per_subband: false,
+            per_subband: true,
         },
     ];
 

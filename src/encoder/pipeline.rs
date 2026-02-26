@@ -116,6 +116,7 @@ impl EncoderPipeline {
             padded_w,
             padded_h,
             true,
+            config.is_lossless(),
         );
 
         // GPU deinterleave: color_out -> plane_a(Y), co_plane(Co), cg_plane(Cg)

@@ -264,6 +264,7 @@ impl DecoderPipeline {
             padded_w,
             padded_h,
             false,
+            config.is_lossless(),
         );
 
         // GPU crop: padded RGB → compact cropped output

@@ -285,3 +285,60 @@ fn test_bframe_sequence_roundtrip() {
         );
     }
 }
+
+/// Generate a test image with integer RGB pixel values spanning a wide range.
+fn make_integer_test_image(w: u32, h: u32) -> Vec<f32> {
+    let mut data = Vec::with_capacity((w * h * 3) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            // Mix of gradients, constants, and patterns to exercise edge cases
+            let r = ((x * 255) / (w - 1)).min(255) as f32;
+            let g = ((y * 255) / (h - 1)).min(255) as f32;
+            let b = (((x + y) * 255) / (w + h - 2)).min(255) as f32;
+            data.push(r);
+            data.push(g);
+            data.push(b);
+        }
+    }
+    data
+}
+
+#[test]
+fn test_lossless_roundtrip_bit_exact() {
+    let ctx = GpuContext::new();
+    let mut enc = EncoderPipeline::new(&ctx);
+    let dec = DecoderPipeline::new(&ctx);
+
+    let config = crate::quality_preset(100);
+    assert!(config.is_lossless(), "q=100 should be lossless config");
+
+    // Test on multiple image sizes to cover tile boundary cases
+    for &(w, h) in &[(256, 256), (512, 512), (100, 100), (300, 200)] {
+        let input = make_integer_test_image(w, h);
+        let compressed = enc.encode(&ctx, &input, w, h, &config);
+        let decoded = dec.decode(&ctx, &compressed);
+
+        let total_pixels = (w * h * 3) as usize;
+        assert_eq!(decoded.len(), total_pixels);
+
+        let mut max_err: f32 = 0.0;
+        let mut err_count = 0usize;
+        for i in 0..total_pixels {
+            let diff = (input[i] - decoded[i]).abs();
+            if diff > 0.0 {
+                err_count += 1;
+                max_err = max_err.max(diff);
+            }
+        }
+
+        let bpp = compressed.bpp();
+        eprintln!(
+            "Lossless {w}x{h}: bpp={bpp:.3}, max_err={max_err}, err_pixels={err_count}/{}",
+            w * h
+        );
+        assert_eq!(
+            err_count, 0,
+            "Lossless round-trip NOT bit-exact for {w}x{h}: {err_count} pixels differ, max_err={max_err}"
+        );
+    }
+}

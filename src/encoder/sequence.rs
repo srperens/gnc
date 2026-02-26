@@ -503,6 +503,7 @@ impl EncoderPipeline {
                 padded_w,
                 padded_h,
                 true,
+                config.is_lossless(),
             );
             self.deinterleaver.dispatch(
                 ctx,
@@ -608,6 +609,7 @@ impl EncoderPipeline {
                 padded_w,
                 padded_h,
                 true,
+                config.is_lossless(),
             );
             self.deinterleaver.dispatch(
                 ctx,
@@ -870,6 +872,7 @@ impl EncoderPipeline {
                 padded_w,
                 padded_h,
                 true,
+                config.is_lossless(),
             );
             self.deinterleaver.dispatch(
                 ctx,
@@ -981,6 +984,7 @@ impl EncoderPipeline {
                 padded_w,
                 padded_h,
                 true,
+                config.is_lossless(),
             );
             self.deinterleaver.dispatch(
                 ctx,

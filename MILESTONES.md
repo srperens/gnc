@@ -145,10 +145,14 @@ Largest single compression opportunity. Current rANS treats each coefficient ind
 
 **Why:** A real codec must cover lossless through extreme compression with smooth, monotonic quality scaling.
 
-### 4A: True Lossless
-- Verify bit-exact round-trip: qstep=1, LeGall 5/3, no dead zone, no CfL, no AQ
-- Fix any f32 rounding in GPU pipeline (may need integer-path color conversion)
-- **Target: lossless bpp within 1.3x of JPEG 2000 lossless** (currently ~5-6 bpp vs J2K's ~3-4 bpp)
+### 4A: True Lossless ✅
+- Integer-exact YCoCg-R color conversion: conditional `floor()` in lifting steps via `lossless` shader param ✅
+- Integer-exact LeGall 5/3 wavelet: `floor()` in predict/update steps (all modes) ✅
+- `CodecConfig::is_lossless()` → activates integer color path when qstep≤1, dead_zone=0, LeGall53 ✅
+- Bit-exact round-trip verified on 4 image sizes (256², 512², 100², 300×200) ✅
+- Per-subband entropy enabled at q=100 for better lossless coding ✅
+- **Result**: PSNR=∞, SSIM=1.0, bpp=12.80 on bbb_1080p (lossless bpp limited by tile-independent rANS alphabet overhead)
+- **Target: lossless bpp within 1.3x of J2K** — NOT MET (12.80 vs J2K ~3.5 bpp). Requires CABAC/bitplane entropy coding to close gap.
 
 ### 4B: Extreme Low-Bitrate
 - Aggressive chroma subsampling at extreme compression (4:2:0 effectively)
@@ -163,7 +167,7 @@ Largest single compression opportunity. Current rANS treats each coefficient ind
 - Named presets: `--preset lossless`, `--preset production`, `--preset distribution`, `--preset preview`
 
 ### Definition of Done
-- Bit-exact lossless round-trip on all test images
+- Bit-exact lossless round-trip on all test images — **✅ verified (PSNR=∞, SSIM=1.0)**
 - Sub-0.5 bpp at >27 dB PSNR on bbb_1080p
 - `gnc rd-curve` confirms strict monotonicity q=1..100 on all test images
 - Named presets work and are documented

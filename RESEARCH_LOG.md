@@ -1278,3 +1278,55 @@ Blue sky (ki=8, q=50): 4.6 fps, 0% savings (camera pan — coarse search hurts u
 - Sequence round-trip: ✅
 - Sequence encode ≥10 fps: ⚠️ 5.0 fps (up from 0.8)
 - Regression tests: ✅ all 93 pass
+
+---
+
+## 2026-02-26: M4A — True Lossless Mode (Bit-Exact Round-Trip)
+
+### Hypothesis
+The current codec pipeline uses f32 arithmetic throughout, including `* 0.5` divisions in the YCoCg-R color conversion and LeGall 5/3 wavelet lifting steps. These produce fractional intermediate values that are not exactly invertible. Adding `floor()` to these operations should produce integer-exact outputs at every stage, enabling bit-exact lossless round-trip when combined with qstep=1 (identity quantization) and lossless rANS entropy coding.
+
+### Implementation
+
+**Integer-exact LeGall 5/3 wavelet** (`transform.wgsl`):
+- Forward predict: `high -= floor((left + right) * 0.5)` (was `high -= (left + right) * 0.5`)
+- Forward update: `low += floor((left_h + right_h + 2.0) * 0.25)` (was without floor)
+- Inverse update/predict: matching floor() operations
+- Applied to ALL modes (lossy+lossless) — this is the correct definition of LeGall 5/3 integer lifting
+- No impact on golden baseline tests (lossy path: integer inputs → same f32 division results for even sums; fractional differences only at odd sums which are below quantization resolution)
+
+**Conditional integer YCoCg-R color conversion** (`color_convert.wgsl`):
+- Added `lossless: u32` parameter to shader Params struct
+- `half(x)` helper: returns `floor(x * 0.5)` when lossless=1, `x * 0.5` otherwise
+- Forward: `t = b + half(co)`, `y = t + half(cg)` — produces integers when lossless
+- Inverse: `t = y - half(cg)`, `b = t - half(co)` — exactly inverts forward
+- Lossless flag is conditional because applying floor() to lossy color conversion would regress quality by up to 14 dB at high-quality settings (q≥90)
+
+**Host code changes** (`color.rs`, `pipeline.rs`, `sequence.rs`, `gpu_work.rs`):
+- `ColorConverter::dispatch()` now takes `lossless: bool` parameter
+- `CodecConfig::is_lossless()` method: true when qstep≤1.0, dead_zone=0.0, wavelet=LeGall53
+- All encoder/decoder color dispatch calls pass `config.is_lossless()`
+
+**Quality preset** (`lib.rs`):
+- q=100 anchor: enabled per_subband_entropy for better lossless coding efficiency
+- `is_lossless()` automatically detected from config values
+
+### Results — Lossless Round-Trip
+
+| Image | Size | bpp | PSNR | SSIM | Bit-exact? |
+|-------|------|-----|------|------|------------|
+| bbb_1080p | 1920×1080 | 12.80 | ∞ | 1.0000 | ✅ |
+| blue_sky_1080p | 1920×1080 | 10.95 | ∞ | 1.0000 | ✅ |
+| touchdown_1080p | 1920×1080 | 11.67 | ∞ | 1.0000 | ✅ |
+| test_512 | 512×512 | 4.46 | ∞ | 1.0000 | ✅ |
+| gradient_256 | 256×256 | 3.97 | ∞ | 1.0000 | ✅ |
+
+Encode throughput at lossless: 89 ms (11.2 fps) encode, 39 ms (25.4 fps) decode on bbb_1080p.
+
+### Analysis
+
+- **Bit-exact lossless round-trip confirmed** across all test images and sizes. The integer lifting steps in both color conversion and wavelet transform ensure every intermediate value is an exact integer representable in f32.
+- **Lossless bpp is high** (10-13 for 1080p natural images vs J2K's ~3.5 bpp). Root cause: tile-independent rANS with per-tile frequency tables over large coefficient alphabets (~200-400 unique values at qstep=1). The frequency tables alone cost ~0.7 bpp, and the per-symbol coding is inefficient due to low average frequencies in the 12-bit normalization.
+- **ZRL (zero-run-length) doesn't activate** at qstep=1 because only ~40% of wavelet coefficients are zero (threshold is 60%). Lowering the threshold to 30% was tested but made bpp slightly worse due to the 256 extra ZRL symbols inflating the alphabet.
+- **Closing the lossless bpp gap requires** fundamentally different entropy coding: context-adaptive arithmetic coding (CABAC), bitplane/magnitude refinement coding, or zero-tree approaches. These are architectural changes beyond the current tile-independent rANS framework.
+- **No lossy quality regression**: the wavelet floor() change is applied to all modes but doesn't affect golden baselines because for even integer sums, `floor(x*0.5) == x*0.5`, and for odd sums, the sub-0.5 difference is below quantization resolution. The color conversion floor() is conditional, only active in lossless mode.

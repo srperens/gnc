@@ -75,7 +75,7 @@ fn main(
             }
             workgroupBarrier();
 
-            // Predict step: high[n] -= (low[n] + low[n+1]) / 2
+            // Predict step: high[n] -= floor((low[n] + low[n+1]) / 2)
             if thread_id < half {
                 let left = shared_low[thread_id];
                 var right: f32;
@@ -84,11 +84,11 @@ fn main(
                 } else {
                     right = shared_low[thread_id]; // mirror at boundary
                 }
-                shared_high[thread_id] = shared_high[thread_id] - (left + right) * 0.5;
+                shared_high[thread_id] = shared_high[thread_id] - floor((left + right) * 0.5);
             }
             workgroupBarrier();
 
-            // Update step: low[n] += (high[n-1] + high[n] + 2) / 4
+            // Update step: low[n] += floor((high[n-1] + high[n] + 2) / 4)
             if thread_id < half {
                 var left_h: f32;
                 if thread_id > 0u {
@@ -97,7 +97,7 @@ fn main(
                     left_h = shared_high[0u]; // mirror at boundary
                 }
                 let right_h = shared_high[thread_id];
-                shared_low[thread_id] = shared_low[thread_id] + (left_h + right_h + 2.0) * 0.25;
+                shared_low[thread_id] = shared_low[thread_id] + floor((left_h + right_h + 2.0) * 0.25);
             }
             workgroupBarrier();
 
@@ -138,7 +138,7 @@ fn main(
             }
             workgroupBarrier();
 
-            // Predict
+            // Predict: high[n] -= floor((low[n] + low[n+1]) / 2)
             if thread_id < half {
                 let left = shared_low[thread_id];
                 var right: f32;
@@ -147,11 +147,11 @@ fn main(
                 } else {
                     right = shared_low[thread_id];
                 }
-                shared_high[thread_id] = shared_high[thread_id] - (left + right) * 0.5;
+                shared_high[thread_id] = shared_high[thread_id] - floor((left + right) * 0.5);
             }
             workgroupBarrier();
 
-            // Update
+            // Update: low[n] += floor((high[n-1] + high[n] + 2) / 4)
             if thread_id < half {
                 var left_h: f32;
                 if thread_id > 0u {
@@ -160,7 +160,7 @@ fn main(
                     left_h = shared_high[0u];
                 }
                 let right_h = shared_high[thread_id];
-                shared_low[thread_id] = shared_low[thread_id] + (left_h + right_h + 2.0) * 0.25;
+                shared_low[thread_id] = shared_low[thread_id] + floor((left_h + right_h + 2.0) * 0.25);
             }
             workgroupBarrier();
 
@@ -196,7 +196,7 @@ fn main(
             }
             workgroupBarrier();
 
-            // Inverse update: low[n] -= (high[n-1] + high[n] + 2) / 4
+            // Inverse update: low[n] -= floor((high[n-1] + high[n] + 2) / 4)
             if thread_id < half {
                 var left_h: f32;
                 if thread_id > 0u {
@@ -205,11 +205,11 @@ fn main(
                     left_h = shared_high[0u];
                 }
                 let right_h = shared_high[thread_id];
-                shared_low[thread_id] = shared_low[thread_id] - (left_h + right_h + 2.0) * 0.25;
+                shared_low[thread_id] = shared_low[thread_id] - floor((left_h + right_h + 2.0) * 0.25);
             }
             workgroupBarrier();
 
-            // Inverse predict: high[n] += (low[n] + low[n+1]) / 2
+            // Inverse predict: high[n] += floor((low[n] + low[n+1]) / 2)
             if thread_id < half {
                 let left = shared_low[thread_id];
                 var right: f32;
@@ -218,7 +218,7 @@ fn main(
                 } else {
                     right = shared_low[thread_id];
                 }
-                shared_high[thread_id] = shared_high[thread_id] + (left + right) * 0.5;
+                shared_high[thread_id] = shared_high[thread_id] + floor((left + right) * 0.5);
             }
             workgroupBarrier();
 
@@ -251,7 +251,7 @@ fn main(
             }
             workgroupBarrier();
 
-            // Inverse update
+            // Inverse update: low[n] -= floor((high[n-1] + high[n] + 2) / 4)
             if thread_id < half {
                 var left_h: f32;
                 if thread_id > 0u {
@@ -260,11 +260,11 @@ fn main(
                     left_h = shared_high[0u];
                 }
                 let right_h = shared_high[thread_id];
-                shared_low[thread_id] = shared_low[thread_id] - (left_h + right_h + 2.0) * 0.25;
+                shared_low[thread_id] = shared_low[thread_id] - floor((left_h + right_h + 2.0) * 0.25);
             }
             workgroupBarrier();
 
-            // Inverse predict
+            // Inverse predict: high[n] += floor((low[n] + low[n+1]) / 2)
             if thread_id < half {
                 let left = shared_low[thread_id];
                 var right: f32;
@@ -273,7 +273,7 @@ fn main(
                 } else {
                     right = shared_low[thread_id];
                 }
-                shared_high[thread_id] = shared_high[thread_id] + (left + right) * 0.5;
+                shared_high[thread_id] = shared_high[thread_id] + floor((left + right) * 0.5);
             }
             workgroupBarrier();
 

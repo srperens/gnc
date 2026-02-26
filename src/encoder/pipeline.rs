@@ -13,6 +13,7 @@ use super::quantize_histogram_fused::FusedQuantizeHistogram;
 use super::rans;
 use super::rans_gpu_encode::GpuRansEncoder;
 use super::rice;
+use super::rice_gpu::GpuRiceEncoder;
 use super::transform::WaveletTransform;
 use crate::gpu_util::ensure_var_buf;
 use crate::{
@@ -31,6 +32,7 @@ pub struct EncoderPipeline {
     pub(super) variance: VarianceAnalyzer,
     pub(super) motion: super::motion::MotionEstimator,
     pub(super) gpu_encoder: GpuRansEncoder,
+    pub(super) gpu_rice_encoder: GpuRiceEncoder,
     pub(super) deinterleaver: PlaneDeinterleaver,
     pub(super) weight_normalizer: WeightMapNormalizer,
     pub(super) cfl_alpha: CflAlphaComputer,
@@ -115,6 +117,7 @@ impl EncoderPipeline {
             variance: VarianceAnalyzer::new(ctx),
             motion: super::motion::MotionEstimator::new(ctx),
             gpu_encoder: GpuRansEncoder::new(ctx),
+            gpu_rice_encoder: GpuRiceEncoder::new(ctx),
             deinterleaver: PlaneDeinterleaver::new(ctx),
             weight_normalizer: WeightMapNormalizer::new(ctx),
             cfl_alpha: CflAlphaComputer::new(ctx),
@@ -288,8 +291,8 @@ impl EncoderPipeline {
         let tiles_y = info.tiles_y() as usize;
         let use_gpu_encode = config.gpu_entropy_encode
             && config.entropy_coder != EntropyCoder::Bitplane
-            && config.entropy_coder != EntropyCoder::Rice
             && !config.context_adaptive;
+        let use_gpu_rice = use_gpu_encode && config.entropy_coder == EntropyCoder::Rice;
 
         // Fused quantize+histogram: saves one full buffer read+write per plane.
         // Only applicable when GPU entropy encoding is active and CfL is off
@@ -781,10 +784,19 @@ impl EncoderPipeline {
             }
         }
 
-        // Batched 3-plane rANS encode: single submit + single poll for all planes.
+        // Batched 3-plane GPU entropy encode: single submit + single poll for all planes.
         // GPU queue guarantees sequential execution: wavelet+quantize finishes before
         // entropy starts reading quantized buffers. No intermediate poll needed.
-        if use_gpu_encode && use_fused_qh {
+        if use_gpu_rice {
+            // GPU Rice encode: single-pass, 256 streams per tile
+            let mut rt = self.gpu_rice_encoder.encode_3planes_to_tiles(
+                ctx,
+                [&bufs.mc_out, &bufs.ref_upload, &bufs.plane_b],
+                &info,
+                config.wavelet_levels,
+            );
+            rice_tiles.append(&mut rt);
+        } else if use_gpu_encode && use_fused_qh {
             // Fused path: histograms already computed by fused quantize+histogram shader.
             // Skip histogram pass, go straight to normalize + encode.
             let hist_bufs = bufs.fused_hist_bufs.as_ref().unwrap();

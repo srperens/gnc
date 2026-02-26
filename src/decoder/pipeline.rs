@@ -9,6 +9,7 @@ use crate::encoder::interleave::PlaneInterleaver;
 use crate::encoder::motion::MotionEstimator;
 use crate::encoder::quantize::Quantizer;
 use crate::encoder::rans_gpu::GpuRansDecoder;
+use crate::encoder::rice_gpu::GpuRiceDecoder;
 use crate::encoder::transform::WaveletTransform;
 use crate::{CompressedFrame, FrameType, GpuContext};
 
@@ -29,6 +30,7 @@ pub struct DecoderPipeline {
     pub(super) quantize: Quantizer,
     pub(super) rans_decoder: GpuRansDecoder,
     pub(super) bitplane_decoder: GpuBitplaneDecoder,
+    pub(super) rice_decoder: GpuRiceDecoder,
     pub(super) interleaver: PlaneInterleaver,
     pub(super) cfl_predictor: CflPredictor,
     pub(super) motion: MotionEstimator,
@@ -247,6 +249,7 @@ impl DecoderPipeline {
             quantize: Quantizer::new(ctx),
             rans_decoder: GpuRansDecoder::new(ctx),
             bitplane_decoder: GpuBitplaneDecoder::new(ctx),
+            rice_decoder: GpuRiceDecoder::new(ctx),
             interleaver: PlaneInterleaver::new(ctx),
             cfl_predictor: CflPredictor::new(ctx),
             motion: MotionEstimator::new(ctx),

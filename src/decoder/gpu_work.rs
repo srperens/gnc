@@ -61,8 +61,17 @@ impl DecoderPipeline {
             } else {
                 match &frame.entropy {
                     EntropyData::Rice(_) => {
-                        // Rice uses CPU decode path; data already in cpu_decoded_planes
-                        unreachable!("Rice frames use ctx_adaptive_decode path");
+                        // GPU Rice decode: 256 parallel streams per tile
+                        self.rice_decoder.dispatch_decode(
+                            ctx,
+                            &mut cmd,
+                            &bufs.entropy_params[p],
+                            &bufs.entropy_tile_info[p],
+                            &bufs.entropy_var_a[p],
+                            &bufs.entropy_var_b[p],
+                            &bufs.scratch_a,
+                            tiles_per_plane as u32,
+                        );
                     }
                     EntropyData::Rans(_) | EntropyData::SubbandRans(_) => {
                         self.rans_decoder.dispatch_decode(

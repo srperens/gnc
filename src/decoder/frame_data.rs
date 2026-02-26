@@ -259,5 +259,36 @@ impl DecoderPipeline {
             );
             MotionEstimator::write_motion_vectors_into(ctx, &mf.vectors, &bufs.mv_buf);
         }
+
+        // --- Backward motion vectors + block modes (B-frames) ---
+        if let Some(mf) = &frame.motion_field {
+            if let Some(ref bwd_vecs) = mf.backward_vectors {
+                let bwd_mv_size = (bwd_vecs.len() * 2 * 4) as u64;
+                ensure_var_buf(
+                    ctx,
+                    &mut bufs.bwd_mv_buf,
+                    &mut bufs.bwd_mv_cap,
+                    bwd_mv_size,
+                    "dec_bwd_mv",
+                    storage_dst,
+                );
+                MotionEstimator::write_motion_vectors_into(ctx, bwd_vecs, &bufs.bwd_mv_buf);
+            }
+            if let Some(ref modes) = mf.block_modes {
+                let modes_size = (modes.len() * 4) as u64; // u8 → u32 on GPU
+                ensure_var_buf(
+                    ctx,
+                    &mut bufs.block_modes_buf,
+                    &mut bufs.block_modes_cap,
+                    modes_size,
+                    "dec_block_modes",
+                    storage_dst,
+                );
+                // Upload as u32 for shader compatibility
+                let modes_u32: Vec<u32> = modes.iter().map(|&m| m as u32).collect();
+                ctx.queue
+                    .write_buffer(&bufs.block_modes_buf, 0, bytemuck::cast_slice(&modes_u32));
+            }
+        }
     }
 }

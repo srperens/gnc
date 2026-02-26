@@ -135,15 +135,22 @@ pub enum FrameType {
     Intra,
     /// P-frame: encoded as residual from previous frame
     Predicted,
+    /// B-frame: bidirectional prediction from forward + backward references
+    Bidirectional,
 }
 
 /// Per-tile motion vectors: one (dx, dy) per ME_BLOCK_SIZE block.
 #[derive(Debug, Clone)]
 pub struct MotionField {
-    /// (dx, dy) per block, row-major within tile, tiles ordered raster
+    /// Forward (dx, dy) per block, row-major within tile, tiles ordered raster.
+    /// Half-pel units.
     pub vectors: Vec<[i16; 2]>,
     /// Block size used for motion estimation (typically 16)
     pub block_size: u32,
+    /// Backward motion vectors (B-frames only). Same layout as `vectors`.
+    pub backward_vectors: Option<Vec<[i16; 2]>>,
+    /// Per-block prediction mode (B-frames only): 0=fwd, 1=bwd, 2=bidir
+    pub block_modes: Option<Vec<u8>>,
 }
 
 /// Which wavelet transform to use.
@@ -439,10 +446,12 @@ impl CompressedFrame {
             .weight_map
             .as_ref()
             .map_or(0, |wm| wm.len() * std::mem::size_of::<f32>());
-        let mv_bytes = self
-            .motion_field
-            .as_ref()
-            .map_or(0, |mf| mf.vectors.len() * 4); // 2 × i16 per block
+        let mv_bytes = self.motion_field.as_ref().map_or(0, |mf| {
+            let fwd = mf.vectors.len() * 4; // 2 × i16 per block
+            let bwd = mf.backward_vectors.as_ref().map_or(0, |v| v.len() * 4);
+            let modes = mf.block_modes.as_ref().map_or(0, |m| m.len());
+            fwd + bwd + modes
+        });
         tile_bytes + cfl_bytes + wm_bytes + mv_bytes
     }
 
@@ -450,6 +459,41 @@ impl CompressedFrame {
     pub fn bpp(&self) -> f64 {
         (self.byte_size() as f64 * 8.0) / (self.info.width as f64 * self.info.height as f64)
     }
+}
+
+/// Compute decode order for a display-ordered sequence with B-frames.
+///
+/// B-frames require their forward and backward reference frames to be decoded first.
+/// This function returns indices into the display-order slice such that decoding
+/// in the returned order ensures references are always available.
+///
+/// For I/P-only sequences (no B-frames), returns identity order `[0, 1, 2, ...]`.
+pub fn decode_order(frames: &[CompressedFrame]) -> Vec<usize> {
+    let mut order = Vec::with_capacity(frames.len());
+    let mut i = 0;
+    while i < frames.len() {
+        if frames[i].frame_type != FrameType::Bidirectional {
+            order.push(i);
+            i += 1;
+        } else {
+            // Collect consecutive B-frames
+            let b_start = i;
+            while i < frames.len() && frames[i].frame_type == FrameType::Bidirectional {
+                i += 1;
+            }
+            let b_end = i;
+            // The next non-B frame (anchor) must be decoded first
+            if i < frames.len() {
+                order.push(i);
+                i += 1;
+            }
+            // Then decode B-frames (they reference both past and future anchors)
+            for b in b_start..b_end {
+                order.push(b);
+            }
+        }
+    }
+    order
 }
 
 /// GPU context shared across encoder/decoder

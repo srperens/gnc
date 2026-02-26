@@ -87,6 +87,13 @@ pub(super) struct CachedBuffers {
     pub(super) mv_buf: wgpu::Buffer,
     pub(super) mv_cap: u64,
 
+    // B-frame buffers
+    pub(super) bwd_mv_buf: wgpu::Buffer,
+    pub(super) bwd_mv_cap: u64,
+    pub(super) block_modes_buf: wgpu::Buffer,
+    pub(super) block_modes_cap: u64,
+    pub(super) bwd_reference_planes: [wgpu::Buffer; 3],
+
     // Output texture for zero-readback decode path
     #[allow(dead_code)]
     pub(super) output_texture: wgpu::Texture,
@@ -321,6 +328,34 @@ impl CachedBuffers {
             mapped_at_creation: false,
         });
 
+        // B-frame: backward motion vector buffer (small initial capacity)
+        let bwd_mv_cap = 256u64;
+        let bwd_mv_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dec_bwd_mv"),
+            size: bwd_mv_cap,
+            usage: storage_dst,
+            mapped_at_creation: false,
+        });
+
+        // B-frame: block modes buffer (small initial capacity)
+        let block_modes_cap = 256u64;
+        let block_modes_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dec_block_modes"),
+            size: block_modes_cap,
+            usage: storage_dst,
+            mapped_at_creation: false,
+        });
+
+        // B-frame: backward reference planes (same size/usage as forward reference planes)
+        let bwd_reference_planes = std::array::from_fn(|p| {
+            ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(&format!("dec_bwd_reference_{p}")),
+                size: plane_size,
+                usage: scratch_usage,
+                mapped_at_creation: false,
+            })
+        });
+
         // Output texture for zero-readback decode path
         let output_texture = ctx.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("dec_output_texture"),
@@ -421,6 +456,11 @@ impl CachedBuffers {
             weight_map_cap,
             mv_buf,
             mv_cap,
+            bwd_mv_buf,
+            bwd_mv_cap,
+            block_modes_buf,
+            block_modes_cap,
+            bwd_reference_planes,
             output_texture,
             output_texture_view,
             buf_to_tex_bind_group,

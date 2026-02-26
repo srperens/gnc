@@ -190,7 +190,24 @@ impl DecoderPipeline {
                 );
             }
 
-            if is_pframe {
+            let is_bframe = frame.frame_type == FrameType::Bidirectional;
+            if is_bframe {
+                // B-frame: use bidirectional compensation with both references
+                self.motion.compensate_bidir(
+                    ctx,
+                    &mut cmd,
+                    &bufs.scratch_a,               // decoded residual
+                    &bufs.reference_planes[p],     // forward ref
+                    &bufs.bwd_reference_planes[p], // backward ref
+                    &bufs.mv_buf,
+                    &bufs.bwd_mv_buf,
+                    &bufs.block_modes_buf,
+                    &bufs.plane_results[p],
+                    padded_w,
+                    padded_h,
+                    false, // inverse: recon = residual + predicted
+                );
+            } else if is_pframe {
                 // P-frame: scratch_a has residual, add MC prediction from reference
                 self.motion.compensate(
                     ctx,
@@ -214,14 +231,17 @@ impl DecoderPipeline {
                 );
             }
 
-            // Copy reconstructed plane to reference buffer for next frame
-            cmd.copy_buffer_to_buffer(
-                &bufs.plane_results[p],
-                0,
-                &bufs.reference_planes[p],
-                0,
-                plane_size,
-            );
+            // Copy reconstructed plane to reference buffer for next frame.
+            // B-frames don't update references (they are non-reference frames).
+            if !is_bframe {
+                cmd.copy_buffer_to_buffer(
+                    &bufs.plane_results[p],
+                    0,
+                    &bufs.reference_planes[p],
+                    0,
+                    plane_size,
+                );
+            }
         }
 
         // GPU interleave: 3 planes → interleaved YCoCg

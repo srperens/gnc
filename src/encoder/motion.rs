@@ -39,6 +39,10 @@ pub struct MotionEstimator {
     match_bgl: wgpu::BindGroupLayout,
     compensate_pipeline: wgpu::ComputePipeline,
     compensate_bgl: wgpu::BindGroupLayout,
+    match_bidir_pipeline: wgpu::ComputePipeline,
+    match_bidir_bgl: wgpu::BindGroupLayout,
+    compensate_bidir_pipeline: wgpu::ComputePipeline,
+    compensate_bidir_bgl: wgpu::BindGroupLayout,
 }
 
 impl MotionEstimator {
@@ -127,11 +131,109 @@ impl MotionEstimator {
                     cache: None,
                 });
 
+        // --- Bidirectional block match ---
+        let match_bidir_shader = ctx
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("block_match_bidir"),
+                source: wgpu::ShaderSource::Wgsl(
+                    include_str!("../shaders/block_match_bidir.wgsl").into(),
+                ),
+            });
+
+        // 8 bindings: uniform, current_y(ro), ref_fwd_y(ro), ref_bwd_y(ro),
+        //             fwd_mvs(rw), bwd_mvs(rw), block_modes(rw), sads(rw)
+        let match_bidir_bgl =
+            ctx.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("block_match_bidir_bgl"),
+                    entries: &[
+                        bgl_uniform(0),
+                        bgl_storage_ro(1),
+                        bgl_storage_ro(2),
+                        bgl_storage_ro(3),
+                        bgl_storage_rw(4),
+                        bgl_storage_rw(5),
+                        bgl_storage_rw(6),
+                        bgl_storage_rw(7),
+                    ],
+                });
+
+        let match_bidir_pl = ctx
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("block_match_bidir_pl"),
+                bind_group_layouts: &[&match_bidir_bgl],
+                push_constant_ranges: &[],
+            });
+
+        let match_bidir_pipeline =
+            ctx.device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("block_match_bidir_pipeline"),
+                    layout: Some(&match_bidir_pl),
+                    module: &match_bidir_shader,
+                    entry_point: Some("main"),
+                    compilation_options: Default::default(),
+                    cache: None,
+                });
+
+        // --- Bidirectional motion compensation ---
+        let compensate_bidir_shader =
+            ctx.device
+                .create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("motion_compensate_bidir"),
+                    source: wgpu::ShaderSource::Wgsl(
+                        include_str!("../shaders/motion_compensate_bidir.wgsl").into(),
+                    ),
+                });
+
+        // 8 bindings: uniform, input(ro), fwd_ref(ro), bwd_ref(ro),
+        //             fwd_mvs(ro), bwd_mvs(ro), block_modes(ro), output(rw)
+        let compensate_bidir_bgl =
+            ctx.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("motion_compensate_bidir_bgl"),
+                    entries: &[
+                        bgl_uniform(0),
+                        bgl_storage_ro(1),
+                        bgl_storage_ro(2),
+                        bgl_storage_ro(3),
+                        bgl_storage_ro(4),
+                        bgl_storage_ro(5),
+                        bgl_storage_ro(6),
+                        bgl_storage_rw(7),
+                    ],
+                });
+
+        let compensate_bidir_pl =
+            ctx.device
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("motion_compensate_bidir_pl"),
+                    bind_group_layouts: &[&compensate_bidir_bgl],
+                    push_constant_ranges: &[],
+                });
+
+        let compensate_bidir_pipeline =
+            ctx.device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("motion_compensate_bidir_pipeline"),
+                    layout: Some(&compensate_bidir_pl),
+                    module: &compensate_bidir_shader,
+                    entry_point: Some("main"),
+                    compilation_options: Default::default(),
+                    cache: None,
+                });
+
         Self {
             match_pipeline,
             match_bgl,
             compensate_pipeline,
             compensate_bgl,
+            match_bidir_pipeline,
+            match_bidir_bgl,
+            compensate_bidir_pipeline,
+            compensate_bidir_bgl,
         }
     }
 
@@ -300,6 +402,277 @@ impl MotionEstimator {
             pass.set_bind_group(0, &bg, &[]);
             pass.dispatch_workgroups(workgroups, 1, 1);
         }
+    }
+
+    /// Dispatch bidirectional block matching motion estimation on GPU.
+    /// Tests forward-only, backward-only, and bidir average, picking the lowest SAD.
+    /// Returns (fwd_mv_buf, bwd_mv_buf, block_modes_buf, sad_buf).
+    /// MVs are stored as i32 pairs (dx, dy) in half-pel units.
+    /// block_modes: 0 = forward, 1 = backward, 2 = bidirectional.
+    #[allow(clippy::too_many_arguments)]
+    pub fn estimate_bidir(
+        &self,
+        ctx: &GpuContext,
+        cmd: &mut wgpu::CommandEncoder,
+        current_y: &wgpu::Buffer,
+        ref_fwd_y: &wgpu::Buffer,
+        ref_bwd_y: &wgpu::Buffer,
+        width: u32,
+        height: u32,
+    ) -> (wgpu::Buffer, wgpu::Buffer, wgpu::Buffer, wgpu::Buffer) {
+        let blocks_x = width / ME_BLOCK_SIZE;
+        let blocks_y = height / ME_BLOCK_SIZE;
+        let total_blocks = blocks_x * blocks_y;
+
+        let params = BlockMatchParams {
+            width,
+            height,
+            block_size: ME_BLOCK_SIZE,
+            search_range: ME_SEARCH_RANGE,
+            blocks_x,
+            total_blocks,
+            _pad0: 0,
+            _pad1: 0,
+        };
+
+        let params_buf = ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("block_match_bidir_params"),
+                contents: bytemuck::bytes_of(&params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+
+        let mv_size = (total_blocks as usize * 2 * std::mem::size_of::<i32>()) as u64;
+        let scalar_size = (total_blocks as usize * std::mem::size_of::<u32>()) as u64;
+
+        let fwd_mv_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fwd_motion_vectors"),
+            size: mv_size,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let bwd_mv_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("bwd_motion_vectors"),
+            size: mv_size,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let block_modes_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("block_modes"),
+            size: scalar_size,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let sad_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("bidir_sad_values"),
+            size: scalar_size,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("block_match_bidir_bg"),
+            layout: &self.match_bidir_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: current_y.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: ref_fwd_y.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: ref_bwd_y.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: fwd_mv_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: bwd_mv_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: block_modes_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: sad_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        {
+            let mut pass = cmd.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("block_match_bidir_pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.match_bidir_pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            // One workgroup per block
+            pass.dispatch_workgroups(total_blocks, 1, 1);
+        }
+
+        (fwd_mv_buf, bwd_mv_buf, block_modes_buf, sad_buf)
+    }
+
+    /// Dispatch bidirectional motion compensation on GPU for a single plane.
+    ///
+    /// Uses per-block modes (0=fwd, 1=bwd, 2=bidir) to select prediction.
+    /// `forward=true`:  residual = current - predicted (encoder)
+    /// `forward=false`: reconstructed = residual + predicted (decoder)
+    #[allow(clippy::too_many_arguments)]
+    pub fn compensate_bidir(
+        &self,
+        ctx: &GpuContext,
+        cmd: &mut wgpu::CommandEncoder,
+        input_plane: &wgpu::Buffer,
+        fwd_reference: &wgpu::Buffer,
+        bwd_reference: &wgpu::Buffer,
+        fwd_mv_buf: &wgpu::Buffer,
+        bwd_mv_buf: &wgpu::Buffer,
+        block_modes_buf: &wgpu::Buffer,
+        output_plane: &wgpu::Buffer,
+        width: u32,
+        height: u32,
+        forward: bool,
+    ) {
+        let blocks_x = width / ME_BLOCK_SIZE;
+        let total_pixels = width * height;
+
+        let params = MotionCompensateParams {
+            width,
+            height,
+            block_size: ME_BLOCK_SIZE,
+            mode: if forward { 0 } else { 1 },
+            blocks_x,
+            total_pixels,
+            _pad0: 0,
+            _pad1: 0,
+        };
+
+        let params_buf = ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("mc_bidir_params"),
+                contents: bytemuck::bytes_of(&params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+
+        let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("mc_bidir_bg"),
+            layout: &self.compensate_bidir_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: input_plane.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: fwd_reference.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: bwd_reference.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: fwd_mv_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: bwd_mv_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: block_modes_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: output_plane.as_entire_binding(),
+                },
+            ],
+        });
+
+        let workgroups = total_pixels.div_ceil(256);
+        {
+            let mut pass = cmd.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("mc_bidir_pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.compensate_bidir_pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(workgroups, 1, 1);
+        }
+    }
+
+    /// Read block modes from GPU buffer back to CPU.
+    /// Block modes are stored as u32 in the shader (0=fwd, 1=bwd, 2=bidir),
+    /// returned as Vec<u8> for compact storage.
+    pub fn read_block_modes(
+        ctx: &GpuContext,
+        block_modes_buf: &wgpu::Buffer,
+        total_blocks: u32,
+    ) -> Vec<u8> {
+        let count = total_blocks as usize;
+        let size = (count * std::mem::size_of::<u32>()) as u64;
+
+        let staging = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("block_modes_staging"),
+            size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let mut cmd = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("copy_block_modes"),
+            });
+        cmd.copy_buffer_to_buffer(block_modes_buf, 0, &staging, 0, size);
+        ctx.queue.submit(Some(cmd.finish()));
+
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            tx.send(result).unwrap();
+        });
+        ctx.device.poll(wgpu::Maintain::Wait);
+        rx.recv().unwrap().unwrap();
+
+        let data = slice.get_mapped_range();
+        let u32_data: &[u32] = bytemuck::cast_slice(&data);
+        let result: Vec<u8> = u32_data.iter().map(|&v| v as u8).collect();
+        drop(data);
+        staging.unmap();
+        result
+    }
+
+    /// Upload block modes from CPU (Vec<u8>) to GPU buffer (u32 per mode).
+    pub fn upload_block_modes(ctx: &GpuContext, modes: &[u8]) -> wgpu::Buffer {
+        let u32_data: Vec<u32> = modes.iter().map(|&m| m as u32).collect();
+
+        ctx.device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("block_modes_upload"),
+                contents: bytemuck::cast_slice(&u32_data),
+                usage: wgpu::BufferUsages::STORAGE,
+            })
     }
 
     /// Read motion vectors from GPU buffer back to CPU.

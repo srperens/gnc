@@ -40,6 +40,8 @@ pub(super) struct CachedEncodeBuffers {
     // Persistent GPU reference planes for sequence encoding (3 planes, size = plane_size each).
     // Eliminates CPU readback/re-upload of reference data between frames.
     pub(super) gpu_ref_planes: [wgpu::Buffer; 3],
+    // Backward (future) reference planes for B-frame encoding.
+    pub(super) gpu_bwd_ref_planes: [wgpu::Buffer; 3],
 }
 
 impl CachedEncodeBuffers {
@@ -180,6 +182,20 @@ impl CachedEncodeBuffers {
             gpu_ref_planes: std::array::from_fn(|i| {
                 ctx.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some(["enc_gpu_ref_y", "enc_gpu_ref_co", "enc_gpu_ref_cg"][i]),
+                    size: plane_size,
+                    usage: plane_usage,
+                    mapped_at_creation: false,
+                })
+            }),
+            gpu_bwd_ref_planes: std::array::from_fn(|i| {
+                ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(
+                        [
+                            "enc_gpu_bwd_ref_y",
+                            "enc_gpu_bwd_ref_co",
+                            "enc_gpu_bwd_ref_cg",
+                        ][i],
+                    ),
                     size: plane_size,
                     usage: plane_usage,
                     mapped_at_creation: false,

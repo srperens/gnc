@@ -10,7 +10,7 @@ use crate::encoder::motion::MotionEstimator;
 use crate::encoder::quantize::Quantizer;
 use crate::encoder::rans_gpu::GpuRansDecoder;
 use crate::encoder::transform::WaveletTransform;
-use crate::{CompressedFrame, GpuContext};
+use crate::{CompressedFrame, FrameType, GpuContext};
 
 /// Handle returned by `decode_to_texture` with metadata about the decoded frame.
 /// The actual texture view is accessible via `DecoderPipeline::output_texture_view()`.
@@ -522,6 +522,93 @@ impl DecoderPipeline {
             width: w,
             height: h,
         }
+    }
+
+    /// Decode a sequence of compressed frames, handling B-frame reordering.
+    ///
+    /// Input frames must be in **display order**. Returns decoded RGB data in display order.
+    /// Internally, anchor (I/P) frames are decoded before their dependent B-frames
+    /// so that forward and backward references are available.
+    pub fn decode_sequence(&self, ctx: &GpuContext, frames: &[CompressedFrame]) -> Vec<Vec<f32>> {
+        let order = crate::decode_order(frames);
+        let mut results: Vec<Option<Vec<f32>>> = (0..frames.len()).map(|_| None).collect();
+
+        let mut i = 0;
+        while i < order.len() {
+            let idx = order[i];
+            let frame = &frames[idx];
+
+            // Check if this anchor is followed by B-frames in decode order
+            let b_frames_follow =
+                i + 1 < order.len() && frames[order[i + 1]].frame_type == FrameType::Bidirectional;
+
+            if frame.frame_type == FrameType::Bidirectional {
+                // B-frame: references already set up by preceding anchor decode
+                results[idx] = Some(self.decode(ctx, frame));
+                i += 1;
+            } else if b_frames_follow {
+                // Anchor before B-frames: save past ref, decode anchor, swap for B decode
+                self.swap_forward_to_backward_ref(ctx); // bwd = past anchor
+                results[idx] = Some(self.decode(ctx, frame)); // ref = decoded anchor (future)
+                self.swap_references(); // ref=past, bwd=future
+
+                i += 1;
+
+                // Decode all following B-frames
+                while i < order.len() && frames[order[i]].frame_type == FrameType::Bidirectional {
+                    results[order[i]] = Some(self.decode(ctx, &frames[order[i]]));
+                    i += 1;
+                }
+
+                // Swap back: ref=future anchor (for next group's forward ref)
+                self.swap_references();
+            } else {
+                // Regular I/P frame, no B-frames follow
+                results[idx] = Some(self.decode(ctx, frame));
+                i += 1;
+            }
+        }
+
+        results.into_iter().map(|o| o.unwrap()).collect()
+    }
+
+    /// Swap reference_planes ↔ bwd_reference_planes at the Rust level (zero GPU cost).
+    /// Used during B-frame decode to toggle between past/future references.
+    pub fn swap_references(&self) {
+        let mut cached = self.cached.borrow_mut();
+        let bufs = cached
+            .as_mut()
+            .expect("swap_references called before any frame was decoded");
+        std::mem::swap(&mut bufs.reference_planes, &mut bufs.bwd_reference_planes);
+    }
+
+    /// Copy current forward reference planes into backward reference planes.
+    /// Call this before decoding B-frames so that the future reference is available
+    /// in `bwd_reference_planes`. Typical usage during sequence decode:
+    ///   1. Decode future I/P frame (updates `reference_planes`)
+    ///   2. Call `swap_forward_to_backward_ref()` to snapshot into `bwd_reference_planes`
+    ///   3. Restore the past reference into `reference_planes` (if needed)
+    ///   4. Decode B-frames that sit between past and future references
+    pub fn swap_forward_to_backward_ref(&self, ctx: &GpuContext) {
+        let cached = self.cached.borrow();
+        let bufs = cached
+            .as_ref()
+            .expect("swap_forward_to_backward_ref called before any frame was decoded");
+        let mut cmd = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("swap_fwd_to_bwd_ref"),
+            });
+        for p in 0..3 {
+            cmd.copy_buffer_to_buffer(
+                &bufs.reference_planes[p],
+                0,
+                &bufs.bwd_reference_planes[p],
+                0,
+                bufs.reference_planes[p].size(),
+            );
+        }
+        ctx.queue.submit(Some(cmd.finish()));
     }
 
     /// Get a reference to the output texture view from the most recent decode_to_texture call.

@@ -114,6 +114,7 @@ pub fn serialize_sequence(frames: &[crate::CompressedFrame], framerate: (u32, u3
         let ft: u8 = match frames[i].frame_type {
             FrameType::Intra => 0,
             FrameType::Predicted => 1,
+            FrameType::Bidirectional => 2,
         };
         out.push(ft);
         // PTS = frame number
@@ -316,10 +317,11 @@ pub fn serialize_compressed(frame: &crate::CompressedFrame) -> Vec<u8> {
     } else {
         out.extend_from_slice(&0u32.to_le_bytes());
     }
-    // Frame type: 0 = Intra, 1 = Predicted (GP10)
+    // Frame type: 0 = Intra, 1 = Predicted, 2 = Bidirectional
     let frame_type_byte: u8 = match frame.frame_type {
         crate::FrameType::Intra => 0,
         crate::FrameType::Predicted => 1,
+        crate::FrameType::Bidirectional => 2,
     };
     out.push(frame_type_byte);
     // Motion field (only for P-frames)
@@ -477,10 +479,11 @@ pub fn deserialize_compressed(data: &[u8]) -> crate::CompressedFrame {
         let ft = match data[pos] {
             0 => crate::FrameType::Intra,
             1 => crate::FrameType::Predicted,
+            2 => crate::FrameType::Bidirectional,
             f => panic!("Unknown frame type: {}", f),
         };
         pos += 1;
-        let mf = if ft == crate::FrameType::Predicted {
+        let mf = if ft == crate::FrameType::Predicted || ft == crate::FrameType::Bidirectional {
             let block_size = u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap()) as u32;
             pos += 2;
             let num_blocks = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
@@ -495,6 +498,8 @@ pub fn deserialize_compressed(data: &[u8]) -> crate::CompressedFrame {
             Some(crate::MotionField {
                 vectors,
                 block_size,
+                backward_vectors: None,
+                block_modes: None,
             })
         } else {
             None

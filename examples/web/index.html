@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>GNC WebGPU Decoder Demo</title>
+    <style>
+        body { font-family: system-ui, sans-serif; max-width: 800px; margin: 40px auto; padding: 0 20px; }
+        h1 { color: #333; }
+        #status { padding: 10px; margin: 10px 0; border-radius: 4px; }
+        .info { background: #e8f4fd; color: #1a5276; }
+        .error { background: #fde8e8; color: #761a1a; }
+        .success { background: #e8fde8; color: #1a761a; }
+        canvas { border: 1px solid #ccc; max-width: 100%; image-rendering: pixelated; }
+        input[type="file"] { margin: 10px 0; }
+        #meta { font-size: 0.9em; color: #666; margin-top: 8px; }
+    </style>
+</head>
+<body>
+    <h1>GNC WebGPU Decoder</h1>
+    <p>Select a <code>.gnc</code> file to decode and display using WebGPU.</p>
+    <input type="file" id="fileInput" accept=".gnc">
+    <div id="status" class="info">Ready. Select a .gnc file to decode.</div>
+    <div id="meta"></div>
+    <br>
+    <canvas id="canvas" width="0" height="0"></canvas>
+
+    <script type="module">
+        // This demo requires wasm-pack to build the gnc crate:
+        //   wasm-pack build --target web --release
+        // Then serve this directory with a local HTTP server.
+
+        import init, { decode_gnc, gnc_width, gnc_height } from '../../pkg/gnc.js';
+
+        const status = document.getElementById('status');
+        const meta = document.getElementById('meta');
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+        const fileInput = document.getElementById('fileInput');
+
+        async function initialize() {
+            try {
+                status.textContent = 'Initializing WASM module...';
+                status.className = 'info';
+                await init();
+                status.textContent = 'Ready. Select a .gnc file to decode.';
+                status.className = 'success';
+            } catch (e) {
+                status.textContent = 'Failed to initialize: ' + e.message;
+                status.className = 'error';
+                console.error(e);
+            }
+        }
+
+        fileInput.addEventListener('change', async (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+
+            try {
+                status.textContent = 'Reading file...';
+                status.className = 'info';
+
+                const buffer = await file.arrayBuffer();
+                const data = new Uint8Array(buffer);
+
+                // Get dimensions
+                const w = gnc_width(data);
+                const h = gnc_height(data);
+                meta.textContent = `${file.name}: ${w}x${h}, ${data.length} bytes`;
+
+                // Decode
+                status.textContent = `Decoding ${w}x${h} frame...`;
+                const t0 = performance.now();
+                const rgba = await decode_gnc(data);
+                const dt = performance.now() - t0;
+
+                // Display on canvas
+                canvas.width = w;
+                canvas.height = h;
+                const imageData = new ImageData(new Uint8ClampedArray(rgba), w, h);
+                ctx.putImageData(imageData, 0, 0);
+
+                status.textContent = `Decoded ${w}x${h} in ${dt.toFixed(1)} ms`;
+                status.className = 'success';
+            } catch (e) {
+                status.textContent = 'Decode error: ' + e.message;
+                status.className = 'error';
+                console.error(e);
+            }
+        });
+
+        initialize();
+    </script>
+</body>
+</html>

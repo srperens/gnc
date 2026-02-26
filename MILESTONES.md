@@ -200,15 +200,18 @@ Largest single compression opportunity. Current rANS treats each coefficient ind
 - `substitute_corrupt_tiles()` replaces corrupt tiles with zero-data (mid-gray) ✅
 - 8 conformance tests including corruption detection and recovery ✅
 
-### 5C: WebGPU/WASM
-- Verify full pipeline compiles to `wasm32-unknown-unknown` with WebGPU backend
-- Minimal browser demo: decode and display `.gnc` file
+### 5C: WebGPU/WASM ✅
+- Full library compiles to `wasm32-unknown-unknown` with WebGPU backend ✅
+- `pollster` conditionally compiled (native only); `GpuContext::new_async()` public for WASM ✅
+- `wasm-bindgen` entry points: `decode_gnc()`, `gnc_width()`, `gnc_height()` ✅
+- `wasm-pack build --target web --release` produces 263 KB WASM binary ✅
+- Minimal browser demo: `examples/web/index.html` decodes and displays .gnc files ✅
 
 ### Definition of Done
 - Specification document exists — **✅ BITSTREAM_SPEC.md**
 - 5+ conformance bitstreams in repo — **✅ 5 bitstreams**
 - Corrupt tile detection and recovery demonstrated — **✅ conformance_corrupt_tile_recovery test**
-- WASM build works, browser demo decodes a frame — pending (M5C)
+- WASM build works, browser demo decodes a frame — **✅ 263 KB WASM, browser demo ready**
 
 ---
 

@@ -529,11 +529,14 @@ pub struct GpuContext {
 }
 
 impl GpuContext {
+    /// Create a new GPU context (blocking). Not available on WASM — use `new_async()`.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn new() -> Self {
         pollster::block_on(Self::new_async())
     }
 
-    async fn new_async() -> Self {
+    /// Create a new GPU context asynchronously. Required on WASM where blocking is unavailable.
+    pub async fn new_async() -> Self {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
             ..Default::default()
@@ -564,5 +567,51 @@ impl GpuContext {
             .expect("Failed to create device");
 
         Self { device, queue }
+    }
+}
+
+// ---- WASM/WebGPU entry points ----
+
+#[cfg(target_arch = "wasm32")]
+pub mod wasm {
+    use wasm_bindgen::prelude::*;
+
+    /// Initialize the codec and decode a .gnc file, returning RGBA pixel data.
+    /// Called from JavaScript via wasm-bindgen.
+    #[wasm_bindgen]
+    pub async fn decode_gnc(data: &[u8]) -> Result<Vec<u8>, JsValue> {
+        let ctx = crate::GpuContext::new_async().await;
+        let decoder = crate::decoder::pipeline::DecoderPipeline::new(&ctx);
+        let frame = crate::format::deserialize_compressed(data);
+        let rgb = decoder.decode(&ctx, &frame);
+        let w = frame.info.width as usize;
+        let h = frame.info.height as usize;
+
+        // Convert RGB f32 to RGBA u8 for canvas ImageData
+        let mut rgba = Vec::with_capacity(w * h * 4);
+        for i in 0..w * h {
+            let r = (rgb[i * 3].clamp(0.0, 255.0)) as u8;
+            let g = (rgb[i * 3 + 1].clamp(0.0, 255.0)) as u8;
+            let b = (rgb[i * 3 + 2].clamp(0.0, 255.0)) as u8;
+            rgba.push(r);
+            rgba.push(g);
+            rgba.push(b);
+            rgba.push(255); // alpha
+        }
+        Ok(rgba)
+    }
+
+    /// Get the width of a .gnc file without decoding.
+    #[wasm_bindgen]
+    pub fn gnc_width(data: &[u8]) -> u32 {
+        let frame = crate::format::deserialize_compressed(data);
+        frame.info.width
+    }
+
+    /// Get the height of a .gnc file without decoding.
+    #[wasm_bindgen]
+    pub fn gnc_height(data: &[u8]) -> u32 {
+        let frame = crate::format::deserialize_compressed(data);
+        frame.info.height
     }
 }

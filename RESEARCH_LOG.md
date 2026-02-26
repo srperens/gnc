@@ -1475,3 +1475,33 @@ Adding per-tile CRC-32 checksums and a tile index table to the bitstream format 
 - `tests/conformance.rs` — 8 conformance tests
 - `tests/conformance/` — 5 reference bitstreams + manifest
 - `BITSTREAM_SPEC.md` — format specification document
+
+---
+
+## M5C: WASM/WebGPU Build (2026-02-26)
+
+### Hypothesis
+The codec's GPU-first architecture (wgpu + WGSL shaders embedded via `include_str!`) should compile to WASM with minimal changes, requiring only conditional compilation for the blocking `pollster` executor.
+
+### Implementation
+- Made `pollster` dependency conditional: `[target.'cfg(not(target_arch = "wasm32"))'.dependencies]`
+- `GpuContext::new()` (blocking) available only on native; `GpuContext::new_async()` public for WASM
+- Added `wasm-bindgen`, `wasm-bindgen-futures`, `web-sys`, `js-sys` as WASM-only dependencies
+- Created `wasm` module in lib.rs with 3 entry points: `decode_gnc()`, `gnc_width()`, `gnc_height()`
+- Added `crate-type = ["cdylib", "rlib"]` for WASM compatibility
+- Created browser demo: `examples/web/index.html` loads .gnc file, decodes via WebGPU, renders to canvas
+
+### Results
+- `cargo build --target wasm32-unknown-unknown --lib --release` succeeds
+- `wasm-pack build --target web --release` produces 263 KB WASM binary
+- All 103 native tests still pass (no regression from conditional compilation)
+- Browser demo HTML + JS ready for local testing with `wasm-pack` output
+
+### Analysis
+The codec was ~95% WASM-ready out of the box due to:
+1. All 24 WGSL shaders embedded via `include_str!` (no file I/O)
+2. wgpu v24 has full WebGPU backend support
+3. Core codec uses no platform-specific APIs (std::fs, threads, etc.)
+4. The only blocking call was `pollster::block_on()` for GPU context initialization
+
+The 263 KB WASM binary is compact — it includes the full encode/decode pipeline, all shaders (compiled by naga at runtime), three entropy coders, wavelet transforms, color conversion, and motion estimation.

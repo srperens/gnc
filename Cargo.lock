@@ -782,11 +782,15 @@ dependencies = [
  "csv",
  "env_logger",
  "image",
+ "js-sys",
  "log",
  "pollster",
  "serde",
  "serde_json",
  "toml",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
  "wgpu",
 ]
 

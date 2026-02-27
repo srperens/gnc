@@ -4,6 +4,42 @@
 
 ---
 
+## 2026-02-27: Sequence encode GPU pipeline optimization
+
+### Hypothesis
+Video encode bottleneck is pipeline stalls and CPU roundtrips in the per-frame encode loop. Eliminating CPU entropy decode from I-frame local decode and batching GPU work into single submits should improve fps significantly toward the 30 fps target.
+
+### Implementation
+Four optimizations applied to `sequence.rs`:
+
+1. **I-frame GPU local decode** (`local_decode_iframe_gpu`): After `encode()`, quantized planes persist on GPU in `mc_out` (Y), `ref_upload` (Co), `plane_b` (Cg). New method reads directly from these buffers for dequantize → inverse wavelet → reference frame update, completely eliminating CPU entropy decode + 30MB re-upload per I-frame.
+
+2. **Split-phase rANS encode API**: Added `dispatch_3planes_to_cmd` (dispatches histogram + normalize + encode to external command encoder) and `finish_3planes_readback` (map + poll + pack tiles) to `GpuRansEncoder`. Enables batching entropy encode with other GPU work in a single submit.
+
+3. **P-frame batched pipeline**: Single command encoder for forward pass + entropy encode dispatches + local decode + MV staging copy → single submit → single poll. Eliminates inter-phase GPU pipeline stalls.
+
+4. **B-frame batched pipeline**: Same pattern as P-frame. Added `BidirStaging` struct and split-phase bidir MV/modes readback to `MotionEstimator`.
+
+Also removed dead `local_decode_iframe` method (replaced by GPU version).
+
+### Results — Sequence encode (bbb_1080p, q=50, ki=8)
+
+| Metric | Baseline | Optimized | Change |
+|--------|----------|-----------|--------|
+| 10 frames | 6.5 fps | 7.2 fps | +11% |
+| 30 frames | 6.3 fps | 6.9 fps | +10% |
+| I-only (10f) | 25.7 fps | 25.7 fps | — |
+
+Per-frame timing (30 frames, q=50): I-frame ~39ms, P-frame ~126ms, B-frame ~193ms.
+
+### Analysis
+1. The I-frame GPU local decode eliminates ~30MB CPU readback per I-frame — measurable improvement for I-heavy sequences.
+2. Batching GPU work into single submits removes small pipeline stalls but the improvement is modest because **GPU compute time dominates**, not pipeline overhead.
+3. The fundamental bottleneck is the rANS GPU encode readback (~30MB per frame). At ~140ms/frame for P/B frames, reaching 30 fps (33ms/frame) requires either faster entropy coding or deferred/async readback across frames.
+4. Possible next steps: use Rice entropy for sequence encode (faster GPU path), GPU kernel fusion for ME+MC+transform, or multi-frame async readback pipeline.
+
+---
+
 ## 2026-02-27: Rice per-subband k_zrl + quotient overflow fix
 
 ### Hypothesis

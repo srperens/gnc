@@ -42,6 +42,16 @@ struct MotionCompensateParams {
     _pad1: u32,
 }
 
+/// Staging buffers for deferred bidir data readback.
+pub struct BidirStaging {
+    pub fwd: wgpu::Buffer,
+    pub bwd: wgpu::Buffer,
+    pub modes: wgpu::Buffer,
+    pub mv_size: u64,
+    pub modes_size: u64,
+    pub total_blocks: u32,
+}
+
 /// GPU-based motion estimation and compensation.
 pub struct MotionEstimator {
     match_pipeline: wgpu::ComputePipeline,
@@ -751,6 +761,87 @@ impl MotionEstimator {
         drop(data);
         staging.buffer.unmap();
         mvs
+    }
+
+    /// Create bidir staging buffers for deferred copy.
+    /// The caller adds copy_buffer_to_buffer commands to their own command encoder.
+    pub fn create_bidir_staging(
+        ctx: &GpuContext,
+        total_blocks: u32,
+    ) -> BidirStaging {
+        let mv_count = total_blocks as usize * 2;
+        let mv_size = (mv_count * std::mem::size_of::<i32>()) as u64;
+        let modes_size = (total_blocks as usize * std::mem::size_of::<u32>()) as u64;
+        let mr = wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST;
+
+        BidirStaging {
+            fwd: ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("fwd_mv_staging"),
+                size: mv_size,
+                usage: mr,
+                mapped_at_creation: false,
+            }),
+            bwd: ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("bwd_mv_staging"),
+                size: mv_size,
+                usage: mr,
+                mapped_at_creation: false,
+            }),
+            modes: ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("modes_staging"),
+                size: modes_size,
+                usage: mr,
+                mapped_at_creation: false,
+            }),
+            mv_size,
+            modes_size,
+            total_blocks,
+        }
+    }
+
+    /// Read bidir data from staging buffers after GPU work is complete.
+    pub fn finish_bidir_readback(
+        ctx: &GpuContext,
+        staging: &BidirStaging,
+    ) -> (Vec<[i16; 2]>, Vec<[i16; 2]>, Vec<u8>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        for buf in [&staging.fwd, &staging.bwd, &staging.modes] {
+            let tx_clone = tx.clone();
+            buf.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+                tx_clone.send(r).unwrap();
+            });
+        }
+        drop(tx);
+        ctx.device.poll(wgpu::Maintain::Wait);
+        for _ in 0..3 {
+            rx.recv().unwrap().unwrap();
+        }
+
+        let fwd_data = staging.fwd.slice(..).get_mapped_range();
+        let fwd_i32: &[i32] = bytemuck::cast_slice(&fwd_data);
+        let mut fwd_mvs = Vec::with_capacity(staging.total_blocks as usize);
+        for i in 0..staging.total_blocks as usize {
+            fwd_mvs.push([fwd_i32[i * 2] as i16, fwd_i32[i * 2 + 1] as i16]);
+        }
+        drop(fwd_data);
+        staging.fwd.unmap();
+
+        let bwd_data = staging.bwd.slice(..).get_mapped_range();
+        let bwd_i32: &[i32] = bytemuck::cast_slice(&bwd_data);
+        let mut bwd_mvs = Vec::with_capacity(staging.total_blocks as usize);
+        for i in 0..staging.total_blocks as usize {
+            bwd_mvs.push([bwd_i32[i * 2] as i16, bwd_i32[i * 2 + 1] as i16]);
+        }
+        drop(bwd_data);
+        staging.bwd.unmap();
+
+        let modes_data = staging.modes.slice(..).get_mapped_range();
+        let u32_modes: &[u32] = bytemuck::cast_slice(&modes_data);
+        let block_modes: Vec<u8> = u32_modes.iter().map(|&v| v as u8).collect();
+        drop(modes_data);
+        staging.modes.unmap();
+
+        (fwd_mvs, bwd_mvs, block_modes)
     }
 
     /// Batched readback of bidirectional MVs and block modes in a single GPU submit + poll.

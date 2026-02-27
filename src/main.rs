@@ -51,13 +51,13 @@ enum Command {
         #[arg(long)]
         no_cfl: bool,
 
-        /// Use bitplane entropy coder instead of rANS
+        /// Use bitplane entropy coder instead of Rice (default)
         #[arg(long)]
         bitplane: bool,
 
-        /// Use Rice (significance map + Golomb-Rice) entropy coder
+        /// Use rANS entropy coder instead of Rice (default)
         #[arg(long)]
-        rice: bool,
+        rans: bool,
 
         /// Wavelet type: 97 (CDF 9/7) or 53 (LeGall 5/3). Overrides quality preset if specified.
         #[arg(long)]
@@ -101,13 +101,13 @@ enum Command {
         #[arg(short = 'q', long, default_value = "75")]
         quality: u32,
 
-        /// Use bitplane entropy coder instead of rANS
+        /// Use bitplane entropy coder instead of Rice (default)
         #[arg(long)]
         bitplane: bool,
 
-        /// Use Rice (significance map + Golomb-Rice) entropy coder
+        /// Use rANS entropy coder instead of Rice (default)
         #[arg(long)]
-        rice: bool,
+        rans: bool,
 
         /// Use CPU entropy encoding instead of GPU
         #[arg(long)]
@@ -155,9 +155,9 @@ enum Command {
         #[arg(long, default_value = "30")]
         fps: f64,
 
-        /// Use Rice entropy coder instead of rANS
+        /// Use rANS entropy coder instead of Rice (default)
         #[arg(long)]
-        rice: bool,
+        rans: bool,
     },
 
     /// Encode a sequence of image frames into a .gnv container
@@ -203,6 +203,10 @@ enum Command {
         /// Only used when --bitrate is set. Default: vbr.
         #[arg(long, default_value = "vbr")]
         rate_mode: String,
+
+        /// Use rANS entropy coder instead of Rice (default)
+        #[arg(long)]
+        rans: bool,
     },
 
     /// Decode a .gnv container back to image frames
@@ -310,7 +314,7 @@ fn main() {
             tile_size,
             no_cfl,
             bitplane,
-            rice,
+            rans,
             wavelet,
             no_per_subband,
             cpu_encode,
@@ -349,8 +353,8 @@ fn main() {
             if bitplane {
                 config.entropy_coder = gnc::EntropyCoder::Bitplane;
             }
-            if rice {
-                config.entropy_coder = gnc::EntropyCoder::Rice;
+            if rans {
+                config.entropy_coder = gnc::EntropyCoder::Rans;
             }
             if no_per_subband {
                 config.per_subband_entropy = false;
@@ -403,7 +407,7 @@ fn main() {
             csv,
             quality,
             bitplane,
-            rice,
+            rans,
             cpu_encode,
         } => {
             let (rgb_data, w, h) = load_image_rgb_f32(&input);
@@ -416,8 +420,8 @@ fn main() {
             if bitplane {
                 config.entropy_coder = gnc::EntropyCoder::Bitplane;
             }
-            if rice {
-                config.entropy_coder = gnc::EntropyCoder::Rice;
+            if rans {
+                config.entropy_coder = gnc::EntropyCoder::Rans;
             }
             if cpu_encode {
                 config.gpu_entropy_encode = false;
@@ -612,7 +616,7 @@ fn main() {
             bitrate,
             rate_mode,
             fps,
-            rice,
+            rans,
         } => {
             let qstep_display = qstep
                 .map(|q| format!("{}", q))
@@ -659,8 +663,8 @@ fn main() {
                 config_ip.quantization_step = qs;
             }
             config_ip.keyframe_interval = keyframe_interval;
-            if rice {
-                config_ip.entropy_coder = gnc::EntropyCoder::Rice;
+            if rans {
+                config_ip.entropy_coder = gnc::EntropyCoder::Rans;
             }
 
             // Apply rate control settings
@@ -821,6 +825,7 @@ fn main() {
             fps_den,
             bitrate,
             rate_mode,
+            rans,
         } => {
             // Auto-detect frame count if not specified
             let frame_count = if let Some(n) = num_frames {
@@ -891,6 +896,9 @@ fn main() {
                 config.quantization_step = qs;
             }
             config.keyframe_interval = keyframe_interval;
+            if rans {
+                config.entropy_coder = gnc::EntropyCoder::Rans;
+            }
 
             // Apply rate control settings
             if let Some(ref br) = bitrate {

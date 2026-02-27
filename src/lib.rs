@@ -249,7 +249,7 @@ impl Default for CodecConfig {
             wavelet_levels: 3,
             subband_weights: SubbandWeights::uniform(3),
             cfl_enabled: false,
-            entropy_coder: EntropyCoder::Rans,
+            entropy_coder: EntropyCoder::Rice,
             wavelet_type: WaveletType::LeGall53,
             adaptive_quantization: false,
             aq_strength: 0.0,
@@ -419,11 +419,16 @@ pub fn quality_preset(q: u32) -> CodecConfig {
         // CfL: use anchor's setting (disabled at q>=99 to avoid chroma artifacts near lossless)
         cfl_enabled: disc.cfl,
         // LeGall 5/3 only for lossless (q=100); CDF 9/7 for all lossy
-        // (CDF 9/7 qstep clamped >= 2.0 to keep rANS alphabet within GPU limits)
         wavelet_type: if q == 100 {
             WaveletType::LeGall53
         } else {
             WaveletType::CDF97
+        },
+        // Rice is default (patent-free, fast). rANS only for q=100 lossless (bit-exact roundtrip).
+        entropy_coder: if q == 100 {
+            EntropyCoder::Rans
+        } else {
+            EntropyCoder::Rice
         },
         per_subband_entropy: disc.per_subband,
         adaptive_quantization: aq_enabled,

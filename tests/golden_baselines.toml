@@ -6,33 +6,33 @@
 
 [gradient_512x512.q25]
 psnr_min = 49.54
-bpp_max = 0.4311
+bpp_max = 0.7620
 
 [gradient_512x512.q50]
 psnr_min = 54.03
-bpp_max = 0.3980
+bpp_max = 0.5102
 
 [gradient_512x512.q75]
 psnr_min = 56.48
-bpp_max = 0.5909
+bpp_max = 0.5230
 
 [gradient_512x512.q90]
 psnr_min = 59.34
-bpp_max = 1.0289
+bpp_max = 0.6020
 
 [checkerboard_512x512.q25]
 psnr_min = 32.64
-bpp_max = 1.0647
+bpp_max = 1.5150
 
 [checkerboard_512x512.q50]
 psnr_min = 36.48
-bpp_max = 1.8023
+bpp_max = 2.3313
 
 [checkerboard_512x512.q75]
 psnr_min = 42.35
-bpp_max = 3.0520
+bpp_max = 3.7160
 
 [checkerboard_512x512.q90]
-psnr_min = 50.82
-bpp_max = 6.7801
+psnr_min = 50.76
+bpp_max = 7.9995
 

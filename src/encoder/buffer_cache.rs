@@ -1,6 +1,9 @@
+use bytemuck::{Pod, Zeroable};
 use wgpu;
+use wgpu::util::DeviceExt;
 
 use super::adaptive;
+use super::motion::{ME_BIDIR_SEARCH_RANGE, ME_BLOCK_SIZE, ME_PRED_FINE_RANGE, ME_SEARCH_RANGE};
 use crate::GpuContext;
 
 /// Cached GPU buffers reused across encode() calls to avoid per-frame allocation.
@@ -55,6 +58,37 @@ pub(super) struct CachedEncodeBuffers {
     // Each buffer holds HIST_TILE_STRIDE * num_tiles u32s.
     // Only allocated when fused path is used (lazily via ensure_fused_hist_bufs).
     pub(super) fused_hist_bufs: Option<[wgpu::Buffer; 3]>,
+
+    // Cached pad params buffer (constant for given resolution)
+    pub(super) pad_params_buf: wgpu::Buffer,
+
+    // --- Cached ME/MC buffers (avoid per-frame allocation) ---
+
+    // ME params (constant for given resolution, 2 variants per ME type)
+    pub(super) me_params_nopred: wgpu::Buffer,
+    pub(super) me_params_pred: wgpu::Buffer,
+    pub(super) bidir_params_nopred: wgpu::Buffer,
+    pub(super) bidir_params_pred: wgpu::Buffer,
+
+    // ME scratch (overwritten each frame, not returned to caller)
+    pub(super) me_sad_buf: wgpu::Buffer,
+    pub(super) me_dummy_pred: wgpu::Buffer,
+    pub(super) bidir_sad_buf: wgpu::Buffer,
+    pub(super) bidir_modes_scratch: wgpu::Buffer,
+
+    // MC params (2 mode variants × 2 MC types = 4 buffers)
+    pub(super) mc_fwd_params: wgpu::Buffer,
+    pub(super) mc_inv_params: wgpu::Buffer,
+    pub(super) mc_bidir_fwd_params: wgpu::Buffer,
+    pub(super) mc_bidir_inv_params: wgpu::Buffer,
+
+    // Staging buffers for deferred MV/bidir readback (reused across frames)
+    pub(super) mv_staging_buf: wgpu::Buffer,
+    pub(super) mv_staging_size: u64,
+    pub(super) me_total_blocks: u32,
+    pub(super) bidir_fwd_staging: wgpu::Buffer,
+    pub(super) bidir_bwd_staging: wgpu::Buffer,
+    pub(super) bidir_modes_staging: wgpu::Buffer,
 }
 
 impl CachedEncodeBuffers {
@@ -79,6 +113,12 @@ impl CachedEncodeBuffers {
         let max_wm_blocks =
             padded_pixels / (adaptive::AQ_LL_BLOCK_SIZE * adaptive::AQ_LL_BLOCK_SIZE) as usize;
         let wm_buf_size = (max_wm_blocks.max(1) * std::mem::size_of::<f32>()) as u64;
+
+        // ME block grid dimensions
+        let me_blocks_x = padded_w / ME_BLOCK_SIZE;
+        let me_blocks_y = padded_h / ME_BLOCK_SIZE;
+        let me_total_blocks = me_blocks_x * me_blocks_y;
+        let mv_staging_size = (me_total_blocks as u64) * 2 * 4; // i32 pairs
 
         // Initial alpha capacity: generous default
         let alpha_init_cap = 4096u64;
@@ -239,7 +279,164 @@ impl CachedEncodeBuffers {
             }),
 
             fused_hist_bufs: None,
+
+            pad_params_buf: {
+                #[repr(C)]
+                #[derive(Copy, Clone, Pod, Zeroable)]
+                struct PadParams {
+                    width: u32,
+                    height: u32,
+                    padded_w: u32,
+                    padded_h: u32,
+                }
+                let p = PadParams {
+                    width: orig_w,
+                    height: orig_h,
+                    padded_w,
+                    padded_h,
+                };
+                ctx.device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("enc_pad_params"),
+                        contents: bytemuck::bytes_of(&p),
+                        usage: wgpu::BufferUsages::UNIFORM,
+                    })
+            },
+
+            // --- Cached ME/MC buffers ---
+            me_params_nopred: Self::make_block_match_params(ctx, padded_w, padded_h, ME_SEARCH_RANGE, false),
+            me_params_pred: Self::make_block_match_params(ctx, padded_w, padded_h, ME_SEARCH_RANGE, true),
+            bidir_params_nopred: Self::make_block_match_params(ctx, padded_w, padded_h, ME_BIDIR_SEARCH_RANGE, false),
+            bidir_params_pred: Self::make_block_match_params(ctx, padded_w, padded_h, ME_BIDIR_SEARCH_RANGE, true),
+
+            me_sad_buf: ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("enc_me_sad"),
+                size: (me_total_blocks as u64) * 4,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            }),
+            me_dummy_pred: ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("enc_me_dummy_pred"),
+                size: 8,
+                usage: wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            }),
+            bidir_sad_buf: ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("enc_bidir_sad"),
+                size: (me_total_blocks as u64) * 4,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            }),
+            bidir_modes_scratch: ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("enc_bidir_modes_scratch"),
+                size: (me_total_blocks as u64) * 4,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            }),
+
+            mc_fwd_params: Self::make_mc_params(ctx, padded_w, padded_h, true),
+            mc_inv_params: Self::make_mc_params(ctx, padded_w, padded_h, false),
+            mc_bidir_fwd_params: Self::make_mc_params(ctx, padded_w, padded_h, true),
+            mc_bidir_inv_params: Self::make_mc_params(ctx, padded_w, padded_h, false),
+
+            mv_staging_buf: ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("enc_mv_staging"),
+                size: mv_staging_size,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            mv_staging_size,
+            me_total_blocks,
+            bidir_fwd_staging: ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("enc_bidir_fwd_staging"),
+                size: mv_staging_size,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            bidir_bwd_staging: ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("enc_bidir_bwd_staging"),
+                size: mv_staging_size,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            bidir_modes_staging: ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("enc_bidir_modes_staging"),
+                size: (me_total_blocks as u64) * 4,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
         }
+    }
+
+    fn make_block_match_params(
+        ctx: &GpuContext,
+        padded_w: u32,
+        padded_h: u32,
+        search_range: u32,
+        use_predictor: bool,
+    ) -> wgpu::Buffer {
+        #[repr(C)]
+        #[derive(Copy, Clone, Pod, Zeroable)]
+        struct BlockMatchParams {
+            width: u32,
+            height: u32,
+            block_size: u32,
+            search_range: u32,
+            blocks_x: u32,
+            total_blocks: u32,
+            use_predictor: u32,
+            pred_fine_range: u32,
+        }
+        let blocks_x = padded_w / ME_BLOCK_SIZE;
+        let blocks_y = padded_h / ME_BLOCK_SIZE;
+        let total_blocks = blocks_x * blocks_y;
+        let params = BlockMatchParams {
+            width: padded_w,
+            height: padded_h,
+            block_size: ME_BLOCK_SIZE,
+            search_range,
+            blocks_x,
+            total_blocks,
+            use_predictor: u32::from(use_predictor),
+            pred_fine_range: if use_predictor { ME_PRED_FINE_RANGE } else { 0 },
+        };
+        ctx.device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("enc_me_params"),
+                contents: bytemuck::bytes_of(&params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            })
+    }
+
+    fn make_mc_params(ctx: &GpuContext, padded_w: u32, padded_h: u32, forward: bool) -> wgpu::Buffer {
+        #[repr(C)]
+        #[derive(Copy, Clone, Pod, Zeroable)]
+        struct MotionCompensateParams {
+            width: u32,
+            height: u32,
+            block_size: u32,
+            mode: u32,
+            blocks_x: u32,
+            total_pixels: u32,
+            _pad0: u32,
+            _pad1: u32,
+        }
+        let params = MotionCompensateParams {
+            width: padded_w,
+            height: padded_h,
+            block_size: ME_BLOCK_SIZE,
+            mode: if forward { 0 } else { 1 },
+            blocks_x: padded_w / ME_BLOCK_SIZE,
+            total_pixels: padded_w * padded_h,
+            _pad0: 0,
+            _pad1: 0,
+        };
+        ctx.device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("enc_mc_params"),
+                contents: bytemuck::bytes_of(&params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            })
     }
 
     /// Ensure per-plane histogram buffers are allocated for the fused quantize+histogram path.

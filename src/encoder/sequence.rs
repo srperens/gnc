@@ -1,4 +1,5 @@
 use wgpu;
+use wgpu::util::DeviceExt;
 
 use super::adaptive::{self, AQ_LL_BLOCK_SIZE};
 use super::bitplane;
@@ -88,7 +89,19 @@ impl EncoderPipeline {
 
         // Previous P-frame MV buffer for temporal prediction. When available, the ME
         // shader skips the expensive coarse search and only does fine refinement around
-        // the predicted MV. Reset on keyframes (new GOP, prediction chain breaks).
+        // the predicted MV. Initialized to zero-MVs so even the first P-frame uses
+        // fast predicted mode (fine ±4 search around (0,0)).
+        let me_blocks_x = padded_w / super::motion::ME_BLOCK_SIZE;
+        let me_blocks_y = padded_h / super::motion::ME_BLOCK_SIZE;
+        let me_total_blocks = me_blocks_x * me_blocks_y;
+        let zero_mv_data = vec![0i32; (me_total_blocks * 2) as usize];
+        let zero_mv_buf = ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("zero_mvs"),
+                contents: bytemuck::cast_slice(&zero_mv_data),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            });
         let mut prev_mv_buf: Option<wgpu::Buffer> = None;
 
         let mut display_idx = 0;
@@ -121,7 +134,9 @@ impl EncoderPipeline {
                     eprintln!("  I-frame total: {:.1}ms", _t_iframe.elapsed().as_secs_f64() * 1000.0);
                 }
                 has_reference = true;
-                prev_mv_buf = None; // Reset MV predictor on keyframe
+                // Keep prev_mv_buf across keyframes: motion patterns are usually
+                // similar across GOP boundaries (no scene-change detection).
+                // This avoids a full ±32 ME search on the first P after each I-frame.
                 results[display_idx] = Some(compressed);
                 display_idx += 1;
                 continue;
@@ -139,7 +154,7 @@ impl EncoderPipeline {
                     padded_pixels,
                     &info,
                     &frame_config,
-                    prev_mv_buf.as_ref(),
+                    prev_mv_buf.as_ref().or(Some(&zero_mv_buf)),
                 );
                 prev_mv_buf = Some(new_mv_buf);
                 if let Some(ref mut rc) = rate_ctrl {
@@ -182,7 +197,7 @@ impl EncoderPipeline {
                     padded_pixels,
                     &info,
                     &p_config,
-                    prev_mv_buf.as_ref(),
+                    prev_mv_buf.as_ref().or(Some(&zero_mv_buf)),
                 );
                 prev_mv_buf = Some(new_mv_buf);
                 if let Some(ref mut rc) = rate_ctrl {
@@ -194,7 +209,8 @@ impl EncoderPipeline {
                 self.swap_ref_planes();
 
                 // 4. Encode B-frames between past and future anchors.
-                // Track previous B-frame MVs for temporal prediction within the group.
+                // First B-frame uses zero MVs as predictor (fast ±4 search around (0,0)).
+                // Subsequent B-frames use previous B's MVs for temporal prediction.
                 let mut prev_bidir_fwd_mv: Option<wgpu::Buffer> = None;
                 let mut prev_bidir_bwd_mv: Option<wgpu::Buffer> = None;
                 for b in 0..b_count {
@@ -206,6 +222,9 @@ impl EncoderPipeline {
                     } else {
                         config.clone()
                     };
+                    // Use zero_mv_buf as fallback predictor for the first B-frame
+                    let fwd_pred = prev_bidir_fwd_mv.as_ref().or(Some(&zero_mv_buf));
+                    let bwd_pred = prev_bidir_bwd_mv.as_ref().or(Some(&zero_mv_buf));
                     let (compressed, new_fwd_mv, new_bwd_mv) = self.encode_bframe(
                         ctx,
                         frames[b_display],
@@ -216,8 +235,8 @@ impl EncoderPipeline {
                         padded_pixels,
                         &info,
                         &b_config,
-                        prev_bidir_fwd_mv.as_ref(),
-                        prev_bidir_bwd_mv.as_ref(),
+                        fwd_pred,
+                        bwd_pred,
                     );
                     prev_bidir_fwd_mv = Some(new_fwd_mv);
                     prev_bidir_bwd_mv = Some(new_bwd_mv);
@@ -251,7 +270,7 @@ impl EncoderPipeline {
                     padded_pixels,
                     &info,
                     &p_config,
-                    prev_mv_buf.as_ref(),
+                    prev_mv_buf.as_ref().or(Some(&zero_mv_buf)),
                 );
                 prev_mv_buf = Some(new_mv_buf);
                 if let Some(ref mut rc) = rate_ctrl {
@@ -517,7 +536,7 @@ impl EncoderPipeline {
                 });
 
             // Phase 0: GPU padding (raw → padded, edge-replicate)
-            self.dispatch_gpu_pad(ctx, &mut cmd, width, height, padded_w, padded_h);
+            self.dispatch_gpu_pad_cached(ctx, &mut cmd, padded_w, padded_h);
 
             // Phase 1: Preprocess + ME + MC + transform + quantize (all 3 planes)
             self.color.dispatch(
@@ -540,7 +559,12 @@ impl EncoderPipeline {
                 padded_pixels as u32,
             );
 
-            let (mb, _sad) = self.motion.estimate(
+            let me_params = if predictor_mvs.is_some() {
+                &bufs.me_params_pred
+            } else {
+                &bufs.me_params_nopred
+            };
+            mv_buf = self.motion.estimate_cached(
                 ctx,
                 &mut cmd,
                 &bufs.plane_a,
@@ -548,8 +572,10 @@ impl EncoderPipeline {
                 padded_w,
                 padded_h,
                 predictor_mvs,
+                me_params,
+                &bufs.me_sad_buf,
+                &bufs.me_dummy_pred,
             );
-            mv_buf = mb;
 
             for p in 0..3 {
                 let weights = if p == 0 {
@@ -563,7 +589,7 @@ impl EncoderPipeline {
                     _ => &bufs.cg_plane,
                 };
 
-                self.motion.compensate(
+                self.motion.compensate_cached(
                     ctx,
                     &mut cmd,
                     cur_plane,
@@ -572,7 +598,7 @@ impl EncoderPipeline {
                     &bufs.mc_out,
                     padded_w,
                     padded_h,
-                    true,
+                    &bufs.mc_fwd_params,
                 );
                 cmd.copy_buffer_to_buffer(&bufs.mc_out, 0, &bufs.plane_a, 0, plane_size);
 
@@ -665,7 +691,7 @@ impl EncoderPipeline {
                     config.wavelet_levels,
                     config.wavelet_type,
                 );
-                self.motion.compensate(
+                self.motion.compensate_cached(
                     ctx,
                     &mut cmd,
                     &bufs.plane_a,
@@ -674,7 +700,7 @@ impl EncoderPipeline {
                     &bufs.recon_out,
                     padded_w,
                     padded_h,
-                    false,
+                    &bufs.mc_inv_params,
                 );
                 cmd.copy_buffer_to_buffer(
                     &bufs.recon_out,
@@ -685,10 +711,8 @@ impl EncoderPipeline {
                 );
             }
 
-            // MV staging copy in same batch
-            let mv_staging =
-                MotionEstimator::create_mv_staging(ctx, &mv_buf, me_total_blocks);
-            cmd.copy_buffer_to_buffer(&mv_buf, 0, &mv_staging.buffer, 0, mv_staging.size);
+            // MV staging copy using cached staging buffer
+            cmd.copy_buffer_to_buffer(&mv_buf, 0, &bufs.mv_staging_buf, 0, bufs.mv_staging_size);
 
             // === Single submit for everything ===
             let _t_submit = std::time::Instant::now();
@@ -715,7 +739,7 @@ impl EncoderPipeline {
                 eprintln!("  P-frame GPU+readback: {:.1}ms", _t_submit.elapsed().as_secs_f64() * 1000.0);
             }
 
-            let mvs = MotionEstimator::finish_mv_readback(ctx, &mv_staging);
+            let mvs = MotionEstimator::finish_mv_readback_cached(ctx, &bufs.mv_staging_buf, bufs.mv_staging_size, bufs.me_total_blocks);
 
             let entropy = match entropy_mode {
                 EntropyMode::Bitplane => EntropyData::Bitplane(bp_tiles),
@@ -747,7 +771,7 @@ impl EncoderPipeline {
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("pf_preprocess_me"),
                 });
-            self.dispatch_gpu_pad(ctx, &mut cmd, width, height, padded_w, padded_h);
+            self.dispatch_gpu_pad_cached(ctx, &mut cmd, padded_w, padded_h);
             self.color.dispatch(
                 ctx,
                 &mut cmd,
@@ -1013,7 +1037,7 @@ impl EncoderPipeline {
         // MV/mode buffers stay on GPU — used directly by bidir MC.
         let fwd_mv_buf;
         let bwd_mv_buf;
-        let modes_buf;
+        let modes_buf_owned: wgpu::Buffer; // only used in CPU fallback path
 
         if use_gpu_encode {
             // === Fully batched B-frame: forward + entropy + bidir staging ===
@@ -1025,7 +1049,7 @@ impl EncoderPipeline {
                 });
 
             // Phase 0: GPU padding (raw → padded, edge-replicate)
-            self.dispatch_gpu_pad(ctx, &mut cmd, width, height, padded_w, padded_h);
+            self.dispatch_gpu_pad_cached(ctx, &mut cmd, padded_w, padded_h);
 
             // Phase 1: Preprocess + bidir ME + MC + transform + quantize
             self.color.dispatch(
@@ -1048,7 +1072,13 @@ impl EncoderPipeline {
                 padded_pixels as u32,
             );
 
-            let (fmb, bmb, mmb, _sad) = self.motion.estimate_bidir(
+            let have_bidir_pred = predictor_fwd_mvs.is_some() && predictor_bwd_mvs.is_some();
+            let bidir_params = if have_bidir_pred {
+                &bufs.bidir_params_pred
+            } else {
+                &bufs.bidir_params_nopred
+            };
+            let (fmb, bmb) = self.motion.estimate_bidir_cached(
                 ctx,
                 &mut cmd,
                 &bufs.plane_a,
@@ -1058,10 +1088,13 @@ impl EncoderPipeline {
                 padded_h,
                 predictor_fwd_mvs,
                 predictor_bwd_mvs,
+                bidir_params,
+                &bufs.bidir_sad_buf,
+                &bufs.bidir_modes_scratch,
+                &bufs.me_dummy_pred,
             );
             fwd_mv_buf = fmb;
             bwd_mv_buf = bmb;
-            modes_buf = mmb;
 
             for p in 0..3 {
                 let weights = if p == 0 {
@@ -1075,7 +1108,7 @@ impl EncoderPipeline {
                     _ => &bufs.cg_plane,
                 };
 
-                self.motion.compensate_bidir(
+                self.motion.compensate_bidir_cached(
                     ctx,
                     &mut cmd,
                     cur_plane,
@@ -1083,11 +1116,11 @@ impl EncoderPipeline {
                     &bufs.gpu_bwd_ref_planes[p],
                     &fwd_mv_buf,
                     &bwd_mv_buf,
-                    &modes_buf,
+                    &bufs.bidir_modes_scratch,
                     &bufs.mc_out,
                     padded_w,
                     padded_h,
-                    true,
+                    &bufs.mc_bidir_fwd_params,
                 );
                 cmd.copy_buffer_to_buffer(&bufs.mc_out, 0, &bufs.plane_a, 0, plane_size);
 
@@ -1145,17 +1178,16 @@ impl EncoderPipeline {
                 );
             }
 
-            // Phase 3: Bidir MV + modes staging copies (same cmd)
-            let bidir_staging =
-                MotionEstimator::create_bidir_staging(ctx, me_total_blocks);
+            // Phase 3: Bidir MV + modes staging copies using cached staging buffers
+            let modes_size = (bufs.me_total_blocks as u64) * 4;
             cmd.copy_buffer_to_buffer(
-                &fwd_mv_buf, 0, &bidir_staging.fwd, 0, bidir_staging.mv_size,
+                &fwd_mv_buf, 0, &bufs.bidir_fwd_staging, 0, bufs.mv_staging_size,
             );
             cmd.copy_buffer_to_buffer(
-                &bwd_mv_buf, 0, &bidir_staging.bwd, 0, bidir_staging.mv_size,
+                &bwd_mv_buf, 0, &bufs.bidir_bwd_staging, 0, bufs.mv_staging_size,
             );
             cmd.copy_buffer_to_buffer(
-                &modes_buf, 0, &bidir_staging.modes, 0, bidir_staging.modes_size,
+                &bufs.bidir_modes_scratch, 0, &bufs.bidir_modes_staging, 0, modes_size,
             );
 
             // Single submit
@@ -1184,7 +1216,15 @@ impl EncoderPipeline {
             }
 
             let (fwd_mvs, bwd_mvs, block_modes) =
-                MotionEstimator::finish_bidir_readback(ctx, &bidir_staging);
+                MotionEstimator::finish_bidir_readback_cached(
+                    ctx,
+                    &bufs.bidir_fwd_staging,
+                    &bufs.bidir_bwd_staging,
+                    &bufs.bidir_modes_staging,
+                    bufs.mv_staging_size,
+                    modes_size,
+                    bufs.me_total_blocks,
+                );
 
             let entropy = match entropy_mode {
                 EntropyMode::Bitplane => EntropyData::Bitplane(bp_tiles),
@@ -1216,7 +1256,7 @@ impl EncoderPipeline {
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("bf_preprocess_me"),
                 });
-            self.dispatch_gpu_pad(ctx, &mut cmd, width, height, padded_w, padded_h);
+            self.dispatch_gpu_pad_cached(ctx, &mut cmd, padded_w, padded_h);
             self.color.dispatch(
                 ctx,
                 &mut cmd,
@@ -1249,7 +1289,7 @@ impl EncoderPipeline {
             );
             fwd_mv_buf = fmb;
             bwd_mv_buf = bmb;
-            modes_buf = mmb;
+            modes_buf_owned = mmb;
             ctx.queue.submit(Some(cmd.finish()));
 
             for p in 0..3 {
@@ -1277,7 +1317,7 @@ impl EncoderPipeline {
                     &bufs.gpu_bwd_ref_planes[p],
                     &fwd_mv_buf,
                     &bwd_mv_buf,
-                    &modes_buf,
+                    &modes_buf_owned,
                     &bufs.mc_out,
                     padded_w,
                     padded_h,
@@ -1351,7 +1391,7 @@ impl EncoderPipeline {
             ctx,
             &fwd_mv_buf,
             &bwd_mv_buf,
-            &modes_buf,
+            &modes_buf_owned,
             me_total_blocks,
         );
 

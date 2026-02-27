@@ -697,6 +697,388 @@ impl MotionEstimator {
         }
     }
 
+    // --- Cached variants: use pre-allocated buffers from CachedEncodeBuffers ---
+
+    /// Like `estimate` but uses pre-allocated params/sad/dummy buffers.
+    /// Still creates MV buffer per call (needed for temporal prediction ping-pong).
+    #[allow(clippy::too_many_arguments)]
+    pub fn estimate_cached(
+        &self,
+        ctx: &GpuContext,
+        cmd: &mut wgpu::CommandEncoder,
+        current_y: &wgpu::Buffer,
+        reference_y: &wgpu::Buffer,
+        width: u32,
+        height: u32,
+        predictor_mvs: Option<&wgpu::Buffer>,
+        params_buf: &wgpu::Buffer,
+        sad_buf: &wgpu::Buffer,
+        dummy_pred: &wgpu::Buffer,
+    ) -> wgpu::Buffer {
+        let blocks_x = width / ME_BLOCK_SIZE;
+        let blocks_y = height / ME_BLOCK_SIZE;
+        let total_blocks = blocks_x * blocks_y;
+
+        let mv_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("motion_vectors"),
+            size: (total_blocks as usize * 2 * std::mem::size_of::<i32>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let pred_buf = predictor_mvs.unwrap_or(dummy_pred);
+
+        let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("block_match_bg"),
+            layout: &self.match_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: current_y.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: reference_y.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: mv_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: sad_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: pred_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        {
+            let mut pass = cmd.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("block_match_pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.match_pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(total_blocks, 1, 1);
+        }
+
+        mv_buf
+    }
+
+    /// Like `compensate` but uses a pre-allocated params buffer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn compensate_cached(
+        &self,
+        ctx: &GpuContext,
+        cmd: &mut wgpu::CommandEncoder,
+        input_plane: &wgpu::Buffer,
+        reference_plane: &wgpu::Buffer,
+        mv_buf: &wgpu::Buffer,
+        output_plane: &wgpu::Buffer,
+        width: u32,
+        height: u32,
+        params_buf: &wgpu::Buffer,
+    ) {
+        let total_pixels = width * height;
+
+        let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("mc_bg"),
+            layout: &self.compensate_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: input_plane.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: reference_plane.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: mv_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: output_plane.as_entire_binding(),
+                },
+            ],
+        });
+
+        let workgroups = total_pixels.div_ceil(256);
+        {
+            let mut pass = cmd.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("mc_pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.compensate_pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(workgroups, 1, 1);
+        }
+    }
+
+    /// Like `estimate_bidir` but uses pre-allocated params/sad/dummy/modes buffers.
+    /// Still creates fwd/bwd MV buffers per call (needed for temporal prediction).
+    /// Returns `(fwd_mv_buf, bwd_mv_buf)`. Block modes are written to `modes_buf`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn estimate_bidir_cached(
+        &self,
+        ctx: &GpuContext,
+        cmd: &mut wgpu::CommandEncoder,
+        current_y: &wgpu::Buffer,
+        ref_fwd_y: &wgpu::Buffer,
+        ref_bwd_y: &wgpu::Buffer,
+        width: u32,
+        height: u32,
+        predictor_fwd_mvs: Option<&wgpu::Buffer>,
+        predictor_bwd_mvs: Option<&wgpu::Buffer>,
+        params_buf: &wgpu::Buffer,
+        sad_buf: &wgpu::Buffer,
+        modes_buf: &wgpu::Buffer,
+        dummy_pred: &wgpu::Buffer,
+    ) -> (wgpu::Buffer, wgpu::Buffer) {
+        let blocks_x = width / ME_BLOCK_SIZE;
+        let blocks_y = height / ME_BLOCK_SIZE;
+        let total_blocks = blocks_x * blocks_y;
+
+        let mv_size = (total_blocks as usize * 2 * std::mem::size_of::<i32>()) as u64;
+
+        let fwd_mv_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fwd_motion_vectors"),
+            size: mv_size,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let bwd_mv_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("bwd_motion_vectors"),
+            size: mv_size,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let pred_fwd = predictor_fwd_mvs.unwrap_or(dummy_pred);
+        let pred_bwd = predictor_bwd_mvs.unwrap_or(dummy_pred);
+
+        let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("block_match_bidir_bg"),
+            layout: &self.match_bidir_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: current_y.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: ref_fwd_y.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: ref_bwd_y.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: fwd_mv_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: bwd_mv_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: modes_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: sad_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: pred_fwd.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: pred_bwd.as_entire_binding(),
+                },
+            ],
+        });
+
+        {
+            let mut pass = cmd.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("block_match_bidir_pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.match_bidir_pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(total_blocks, 1, 1);
+        }
+
+        (fwd_mv_buf, bwd_mv_buf)
+    }
+
+    /// Like `compensate_bidir` but uses a pre-allocated params buffer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn compensate_bidir_cached(
+        &self,
+        ctx: &GpuContext,
+        cmd: &mut wgpu::CommandEncoder,
+        input_plane: &wgpu::Buffer,
+        fwd_reference: &wgpu::Buffer,
+        bwd_reference: &wgpu::Buffer,
+        fwd_mv_buf: &wgpu::Buffer,
+        bwd_mv_buf: &wgpu::Buffer,
+        block_modes_buf: &wgpu::Buffer,
+        output_plane: &wgpu::Buffer,
+        width: u32,
+        height: u32,
+        params_buf: &wgpu::Buffer,
+    ) {
+        let total_pixels = width * height;
+
+        let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("mc_bidir_bg"),
+            layout: &self.compensate_bidir_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: input_plane.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: fwd_reference.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: bwd_reference.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: fwd_mv_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: bwd_mv_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: block_modes_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: output_plane.as_entire_binding(),
+                },
+            ],
+        });
+
+        let workgroups = total_pixels.div_ceil(256);
+        {
+            let mut pass = cmd.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("mc_bidir_pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.compensate_bidir_pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(workgroups, 1, 1);
+        }
+    }
+
+    /// Finish MV readback from a cached staging buffer.
+    /// Unlike `finish_mv_readback`, this uses a pre-allocated staging buffer that
+    /// must be unmapped before reuse (this function handles unmapping).
+    pub fn finish_mv_readback_cached(ctx: &GpuContext, staging: &wgpu::Buffer, mv_size: u64, total_blocks: u32) -> Vec<[i16; 2]> {
+        let slice = staging.slice(..mv_size);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            tx.send(result).unwrap();
+        });
+        ctx.device.poll(wgpu::Maintain::Wait);
+        rx.recv().unwrap().unwrap();
+
+        let data = slice.get_mapped_range();
+        let i32_data: &[i32] = bytemuck::cast_slice(&data);
+
+        let mut mvs = Vec::with_capacity(total_blocks as usize);
+        for i in 0..total_blocks as usize {
+            mvs.push([i32_data[i * 2] as i16, i32_data[i * 2 + 1] as i16]);
+        }
+
+        drop(data);
+        staging.unmap();
+        mvs
+    }
+
+    /// Finish bidir readback from cached staging buffers.
+    pub fn finish_bidir_readback_cached(
+        ctx: &GpuContext,
+        fwd_staging: &wgpu::Buffer,
+        bwd_staging: &wgpu::Buffer,
+        modes_staging: &wgpu::Buffer,
+        mv_size: u64,
+        modes_size: u64,
+        total_blocks: u32,
+    ) -> (Vec<[i16; 2]>, Vec<[i16; 2]>, Vec<u8>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        for (buf, size) in [
+            (fwd_staging, mv_size),
+            (bwd_staging, mv_size),
+            (modes_staging, modes_size),
+        ] {
+            let tx_clone = tx.clone();
+            buf.slice(..size).map_async(wgpu::MapMode::Read, move |r| {
+                tx_clone.send(r).unwrap();
+            });
+        }
+        drop(tx);
+        ctx.device.poll(wgpu::Maintain::Wait);
+        for _ in 0..3 {
+            rx.recv().unwrap().unwrap();
+        }
+
+        let fwd_data = fwd_staging.slice(..mv_size).get_mapped_range();
+        let fwd_i32: &[i32] = bytemuck::cast_slice(&fwd_data);
+        let mut fwd_mvs = Vec::with_capacity(total_blocks as usize);
+        for i in 0..total_blocks as usize {
+            fwd_mvs.push([fwd_i32[i * 2] as i16, fwd_i32[i * 2 + 1] as i16]);
+        }
+        drop(fwd_data);
+        fwd_staging.unmap();
+
+        let bwd_data = bwd_staging.slice(..mv_size).get_mapped_range();
+        let bwd_i32: &[i32] = bytemuck::cast_slice(&bwd_data);
+        let mut bwd_mvs = Vec::with_capacity(total_blocks as usize);
+        for i in 0..total_blocks as usize {
+            bwd_mvs.push([bwd_i32[i * 2] as i16, bwd_i32[i * 2 + 1] as i16]);
+        }
+        drop(bwd_data);
+        bwd_staging.unmap();
+
+        let modes_data = modes_staging.slice(..modes_size).get_mapped_range();
+        let u32_modes: &[u32] = bytemuck::cast_slice(&modes_data);
+        let block_modes: Vec<u8> = u32_modes.iter().map(|&v| v as u8).collect();
+        drop(modes_data);
+        modes_staging.unmap();
+
+        (fwd_mvs, bwd_mvs, block_modes)
+    }
+
     /// Read block modes from GPU buffer back to CPU.
     /// Block modes are stored as u32 in the shader (0=fwd, 1=bwd, 2=bidir),
     /// returned as Vec<u8> for compact storage.

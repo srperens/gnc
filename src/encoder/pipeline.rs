@@ -8,6 +8,7 @@ use super::cfl::{self, CflAlphaComputer, CflForwardPredictor, CflPredictor};
 use super::color::ColorConverter;
 use super::entropy_helpers::{encode_entropy, EntropyMode};
 use super::huffman;
+use super::huffman_gpu::GpuHuffmanEncoder;
 use super::interleave::PlaneDeinterleaver;
 use super::quantize::Quantizer;
 use super::quantize_histogram_fused::FusedQuantizeHistogram;
@@ -34,6 +35,7 @@ pub struct EncoderPipeline {
     pub(super) motion: super::motion::MotionEstimator,
     pub(super) gpu_encoder: GpuRansEncoder,
     pub(super) gpu_rice_encoder: GpuRiceEncoder,
+    pub(super) gpu_huffman_encoder: GpuHuffmanEncoder,
     pub(super) deinterleaver: PlaneDeinterleaver,
     pub(super) weight_normalizer: WeightMapNormalizer,
     pub(super) cfl_alpha: CflAlphaComputer,
@@ -119,6 +121,7 @@ impl EncoderPipeline {
             motion: super::motion::MotionEstimator::new(ctx),
             gpu_encoder: GpuRansEncoder::new(ctx),
             gpu_rice_encoder: GpuRiceEncoder::new(ctx),
+            gpu_huffman_encoder: GpuHuffmanEncoder::new(ctx),
             deinterleaver: PlaneDeinterleaver::new(ctx),
             weight_normalizer: WeightMapNormalizer::new(ctx),
             cfl_alpha: CflAlphaComputer::new(ctx),
@@ -393,9 +396,9 @@ impl EncoderPipeline {
         let tiles_y = info.tiles_y() as usize;
         let use_gpu_encode = config.gpu_entropy_encode
             && config.entropy_coder != EntropyCoder::Bitplane
-            && config.entropy_coder != EntropyCoder::Huffman
             && !config.context_adaptive;
         let use_gpu_rice = use_gpu_encode && config.entropy_coder == EntropyCoder::Rice;
+        let use_gpu_huffman = use_gpu_encode && config.entropy_coder == EntropyCoder::Huffman;
 
         // Fused quantize+histogram: saves one full buffer read+write per plane.
         // Only applicable when GPU entropy encoding is active and CfL is off
@@ -891,7 +894,16 @@ impl EncoderPipeline {
         // Batched 3-plane GPU entropy encode: single submit + single poll for all planes.
         // GPU queue guarantees sequential execution: wavelet+quantize finishes before
         // entropy starts reading quantized buffers. No intermediate poll needed.
-        if use_gpu_rice {
+        if use_gpu_huffman {
+            // GPU Huffman encode: 2-pass (histogram → codebook → encode)
+            let mut ht = self.gpu_huffman_encoder.encode_3planes_to_tiles(
+                ctx,
+                [&bufs.mc_out, &bufs.ref_upload, &bufs.plane_b],
+                &info,
+                config.wavelet_levels,
+            );
+            huffman_tiles.append(&mut ht);
+        } else if use_gpu_rice {
             // GPU Rice encode: single-pass, 256 streams per tile
             let mut rt = self.gpu_rice_encoder.encode_3planes_to_tiles(
                 ctx,

@@ -77,6 +77,13 @@ struct Codebook {
     codewords: Vec<u32>,
 }
 
+/// Public wrapper: build codebook from frequency array, return (code_lengths, codewords).
+/// Used by GPU host code to build codebooks from GPU histogram readback.
+pub fn build_canonical_codebook_from_freq(freq: &[u32]) -> (Vec<u8>, Vec<u32>) {
+    let cb = build_canonical_codebook(freq);
+    (cb.code_lengths, cb.codewords)
+}
+
 /// Build a canonical Huffman codebook from frequency counts.
 ///
 /// Steps:

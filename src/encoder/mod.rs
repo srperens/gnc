@@ -6,6 +6,7 @@ pub mod color;
 pub mod entropy;
 pub(crate) mod entropy_helpers;
 pub mod huffman;
+pub mod huffman_gpu;
 pub mod interleave;
 pub mod motion;
 pub mod pipeline;

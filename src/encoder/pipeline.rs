@@ -156,6 +156,68 @@ impl EncoderPipeline {
         ));
     }
 
+    /// Dispatch GPU padding shader: raw_input_buf → input_buf (edge-replicate).
+    /// Must be called after writing raw data to `raw_input_buf`.
+    pub(super) fn dispatch_gpu_pad(
+        &self,
+        ctx: &GpuContext,
+        cmd: &mut wgpu::CommandEncoder,
+        width: u32,
+        height: u32,
+        padded_w: u32,
+        padded_h: u32,
+    ) {
+        let bufs = self.cached.as_ref().expect("cached buffers must exist");
+        #[repr(C)]
+        #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+        struct PadParams {
+            width: u32,
+            height: u32,
+            padded_w: u32,
+            padded_h: u32,
+        }
+        let pad_params = PadParams {
+            width,
+            height,
+            padded_w,
+            padded_h,
+        };
+        let pad_params_buf =
+            ctx.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("pad_params"),
+                    contents: bytemuck::bytes_of(&pad_params),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                });
+        let pad_bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("pad_bg"),
+            layout: &self.pad_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: pad_params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: bufs.raw_input_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: bufs.input_buf.as_entire_binding(),
+                },
+            ],
+        });
+        let total_padded_pixels = padded_w * padded_h;
+        let workgroups = total_padded_pixels.div_ceil(256);
+        let mut pass = cmd.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("pad_pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.pad_pipeline);
+        pass.set_bind_group(0, &pad_bg, &[]);
+        pass.dispatch_workgroups(workgroups, 1, 1);
+    }
+
     /// Encode an RGB frame.
     /// Input: &[f32] of length width * height * 3 (interleaved R,G,B).
     /// Values in [0, 255] for 8-bit or [0, 1023] for 10-bit.

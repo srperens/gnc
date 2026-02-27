@@ -2,7 +2,6 @@ use wgpu;
 
 use super::adaptive::{self, AQ_LL_BLOCK_SIZE};
 use super::bitplane;
-use super::buffer_cache::pad_frame;
 use super::cfl;
 use super::entropy_helpers::{encode_entropy, EntropyMode};
 use super::motion::{MotionEstimator, ME_BLOCK_SIZE};
@@ -481,9 +480,9 @@ impl EncoderPipeline {
         self.ensure_cached(ctx, padded_w, padded_h, width, height);
         let bufs = self.cached.as_ref().unwrap();
 
-        let padded_rgb = pad_frame(rgb_data, width, height, padded_w, padded_h);
+        // Upload raw (unpadded) frame — GPU shader handles padding
         ctx.queue
-            .write_buffer(&bufs.input_buf, 0, bytemuck::cast_slice(&padded_rgb));
+            .write_buffer(&bufs.raw_input_buf, 0, bytemuck::cast_slice(rgb_data));
 
         let entropy_mode = EntropyMode::from_config(config);
         let tile_size = config.tile_size as usize;
@@ -516,6 +515,9 @@ impl EncoderPipeline {
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("pf_batch_all"),
                 });
+
+            // Phase 0: GPU padding (raw → padded, edge-replicate)
+            self.dispatch_gpu_pad(ctx, &mut cmd, width, height, padded_w, padded_h);
 
             // Phase 1: Preprocess + ME + MC + transform + quantize (all 3 planes)
             self.color.dispatch(
@@ -745,6 +747,7 @@ impl EncoderPipeline {
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("pf_preprocess_me"),
                 });
+            self.dispatch_gpu_pad(ctx, &mut cmd, width, height, padded_w, padded_h);
             self.color.dispatch(
                 ctx,
                 &mut cmd,
@@ -984,9 +987,9 @@ impl EncoderPipeline {
         self.ensure_cached(ctx, padded_w, padded_h, width, height);
         let bufs = self.cached.as_ref().unwrap();
 
-        let padded_rgb = pad_frame(rgb_data, width, height, padded_w, padded_h);
+        // Upload raw (unpadded) frame — GPU shader handles padding
         ctx.queue
-            .write_buffer(&bufs.input_buf, 0, bytemuck::cast_slice(&padded_rgb));
+            .write_buffer(&bufs.raw_input_buf, 0, bytemuck::cast_slice(rgb_data));
 
         let entropy_mode = EntropyMode::from_config(config);
         let tile_size = config.tile_size as usize;
@@ -1020,6 +1023,9 @@ impl EncoderPipeline {
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("bf_batch_all"),
                 });
+
+            // Phase 0: GPU padding (raw → padded, edge-replicate)
+            self.dispatch_gpu_pad(ctx, &mut cmd, width, height, padded_w, padded_h);
 
             // Phase 1: Preprocess + bidir ME + MC + transform + quantize
             self.color.dispatch(
@@ -1210,6 +1216,7 @@ impl EncoderPipeline {
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("bf_preprocess_me"),
                 });
+            self.dispatch_gpu_pad(ctx, &mut cmd, width, height, padded_w, padded_h);
             self.color.dispatch(
                 ctx,
                 &mut cmd,

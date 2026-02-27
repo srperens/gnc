@@ -261,25 +261,3 @@ impl CachedEncodeBuffers {
         }));
     }
 }
-
-/// Pad frame to tile-aligned dimensions by edge extension.
-pub(super) fn pad_frame(data: &[f32], w: u32, h: u32, pw: u32, ph: u32) -> Vec<f32> {
-    let w = w as usize;
-    let h = h as usize;
-    let pw = pw as usize;
-    let ph = ph as usize;
-
-    let mut padded = vec![0.0f32; pw * ph * 3];
-    for y in 0..ph {
-        let sy = y.min(h - 1);
-        for x in 0..pw {
-            let sx = x.min(w - 1);
-            let src = (sy * w + sx) * 3;
-            let dst = (y * pw + x) * 3;
-            padded[dst] = data[src];
-            padded[dst + 1] = data[src + 1];
-            padded[dst + 2] = data[src + 2];
-        }
-    }
-    padded
-}

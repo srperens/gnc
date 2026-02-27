@@ -76,3 +76,74 @@
   └──────────────┴────────────────┴───────────────────────┘
 
   Och — vi slipper Microsofts rANS-patent.
+
+---
+
+## Resultat: Rice GPU (2026-02-27)
+
+  Implementerade #1 (Significance map + Golomb-Rice) med GPU-shader.
+  256 interleaved streams per tile, fullt parallella.
+
+  ┌──────────────┬──────────┬──────────┬──────────┐
+  │              │  rANS    │ Rice GPU │ Diff     │
+  ├──────────────┼──────────┼──────────┼──────────┤
+  │ Encode 1080p │ 34ms     │ 21ms     │ 1.6x     │
+  │              │ 29 fps   │ 46 fps   │ snabbare │
+  ├──────────────┼──────────┼──────────┼──────────┤
+  │ Decode 1080p │ 29ms     │ 14ms     │ 2.0x     │
+  │              │ 34 fps   │ 69 fps   │ snabbare │
+  ├──────────────┼──────────┼──────────┼──────────┤
+  │ BPP q=75     │ 4.22     │ 6.04     │ +43%     │
+  ├──────────────┼──────────┼──────────┼──────────┤
+  │ BPP q=90     │          │ ~match   │ ~0%      │
+  └──────────────┴──────────┴──────────┴──────────┘
+
+  Slutsats: Hastighetsförbättringen validerar tesen — att ta
+  bort rANS sekventiella state chain (2048 steg → 256 steg
+  per tråd) ger massiva GPU-parallellism-vinster.
+
+  Kompressionsgapet vid låga bitrates beror på per-koefficient
+  significance bits. ZRL (zero-run-length) skulle minska detta,
+  men bättre approach: Canonical Huffman som anpassar sig till
+  verklig fördelning istället för att anta geometrisk.
+
+## Analys: Nästa steg — Canonical Huffman
+
+  Av de 8 alternativen sticker Canonical Huffman ut:
+
+  ┌─────────────────┬────────┬─────────┬──────────┐
+  │                 │ Rice   │ Huffman │ rANS     │
+  ├─────────────────┼────────┼─────────┼──────────┤
+  │ BPP overhead    │ 3-7%   │ 1-5%   │ baseline │
+  ├─────────────────┼────────┼─────────┼──────────┤
+  │ Parallellism    │ 10 000 │ 12 000 │ 32       │
+  ├─────────────────┼────────┼─────────┼──────────┤
+  │ State chain     │ Ingen  │ Ingen  │ 2048/trd │
+  ├─────────────────┼────────┼─────────┼──────────┤
+  │ Patentrisk      │ Ingen  │ Ingen  │ Medel-Hög│
+  ├─────────────────┼────────┼─────────┼──────────┤
+  │ Shared mem      │ <1KB   │ 8KB    │ 16KB+    │
+  ├─────────────────┼────────┼─────────┼──────────┤
+  │ GPU dispatches  │ 1      │ 2      │ 3        │
+  └─────────────────┴────────┴─────────┴──────────┘
+
+  Varför Huffman vinner:
+  - Bättre kompression: variabel kodlängd anpassar sig till
+    verklig symbolfördelning, inte bara geometrisk (Rice)
+  - Maximal parallellism: varje symbol → fast codeword lookup
+  - Snabb decode: 8-bit prefix table lookup (O(1) per symbol)
+  - Ingen patentrisk (public domain sedan 1952)
+  - 8KB shared mem → full M1 occupancy (2 WG/core)
+
+  Nackdel vs Rice:
+  - 2 GPU dispatches istället för 1 (histogram + encode)
+  - CPU codebook-bygge mellan dispatches (~<1ms)
+  - Mer komplex decoder (prefix table vs enkel Rice formula)
+
+  Förväntat resultat:
+  - Hastighet: ~samma som Rice (kanske 10-20% långsammare pga
+    extra dispatch + codebook roundtrip)
+  - Kompression: ~1-5% overhead vs rANS (vs Rice 43% vid q=75)
+  - Netto: dramatiskt bättre speed/compression tradeoff
+
+  Implementation plan: se huffman_plan.md

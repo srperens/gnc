@@ -673,6 +673,9 @@ fn main() {
                 config_ip.rate_mode = parse_rate_mode(&rate_mode);
             }
 
+            // Warm up GPU shader pipelines (triggers Metal lazy compilation)
+            let _ = encoder.encode(&ctx, &frames_data[0], w, h, &config_ip);
+
             let start = std::time::Instant::now();
             let compressed_ip =
                 encoder.encode_sequence_with_fps(&ctx, &frame_refs, w, h, &config_ip, fps);

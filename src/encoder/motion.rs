@@ -7,11 +7,17 @@ use crate::GpuContext;
 pub const ME_BLOCK_SIZE: u32 = 16;
 pub const ME_SEARCH_RANGE: u32 = 32;
 /// Fine search range when using temporal MV predictor (±pixels).
-/// Same as FINE_RANGE since consecutive P-frames have highly correlated MVs.
-pub const ME_PRED_FINE_RANGE: u32 = 4;
+/// Temporal predictors are typically accurate within ~1 pixel, so ±2
+/// provides sufficient refinement while saving ~67% of fine search work
+/// (25 vs 81 candidates, fitting in 1 SIMD group instead of 3).
+pub const ME_PRED_FINE_RANGE: u32 = 2;
 /// Search range for bidirectional ME (B-frames). B-frames interpolate between
 /// two references, so motion per direction is typically smaller than P-frames.
 pub const ME_BIDIR_SEARCH_RANGE: u32 = 16;
+/// Fine search range for bidir ME with temporal predictor (±pixels).
+/// Smaller than P-frame (±4) because B-frame MVs between consecutive groups
+/// are highly correlated and the temporal predictor is very accurate.
+pub const ME_BIDIR_PRED_FINE_RANGE: u32 = 2;
 
 /// Staging buffer for deferred MV readback. Created by `create_mv_staging`,
 /// consumed by `finish_mv_readback`. Allows the GPU copy to piggyback on
@@ -490,7 +496,7 @@ impl MotionEstimator {
             blocks_x,
             total_blocks,
             use_predictor: if have_predictor { 1 } else { 0 },
-            pred_fine_range: if have_predictor { ME_PRED_FINE_RANGE } else { 0 },
+            pred_fine_range: if have_predictor { ME_BIDIR_PRED_FINE_RANGE } else { 0 },
         };
 
         let params_buf = ctx

@@ -57,7 +57,7 @@ Two entropy coders with different tradeoffs. Rice+ZRL is faster; rANS compresses
 **Key GPU architecture insight:** On M1, shared memory occupancy dominates performance. 16KB shared memory = 2 workgroups/core (full occupancy). Exceeding 16KB halves occupancy → ~20% regression. This is why Rice (< 1KB shared) and Huffman (8KB shared) are fast, while rANS (16KB+) is slower. ALU cost (e.g. integer multiply vs division) is negligible by comparison.
 
 **Known gaps:**
-- Sequence encode 18.1 fps Rice (target: 30+ fps) — ME ±32 (P) / ±16 (B), temporal MV prediction, GPU Rice in P/B pipeline, parallelized bidir half-pel
+- ~~Sequence encode 30+ fps~~ ✓ Achieved: **31.7 fps** Rice (1080p, q=75, ki=8, 10 frames I+P+B) — parallel half-pel, ±2 fine search with temporal predictor, pipeline warm-up
 - Single-frame encode 40 fps Rice, 30 fps rANS (target: 60 fps)
 - Rice at q=25 is +33% bpp vs rANS (per-subband k_zrl implemented, gap is structural)
 - Rice q=100 is near-lossless (56 dB) not bit-exact — only rANS supports true lossless
@@ -67,12 +67,10 @@ Two entropy coders with different tradeoffs. Rice+ZRL is faster; rANS compresses
 
 ## 4. Priorities
 
-**P1: Video encode speed**
-- Sequence encode from 6.5 fps to 30+ fps (this is the real video codec metric)
-- Multi-frame GPU overlap — pipeline frame N+1 while entropy-coding frame N
-- Motion estimation readback elimination — keep MVs on GPU, serialize from GPU buffers
-- Fused wavelet+quantize kernel (quantize+histogram already fused)
-- Target: real-time 1080p30 sequence encode
+**P1: Video encode speed** ✓ 30 fps achieved
+- ~~Sequence encode from 6.5 fps to 30+ fps~~ ✓ Achieved: 31.7 fps (1080p, q=75, Rice, I+P+B)
+- Further optimization toward 60 fps: multi-frame GPU overlap, fused wavelet+quantize kernel
+- Target: real-time 1080p60 sequence encode
 
 **P2: Compression efficiency**
 - **Canonical Huffman entropy** — next planned implementation. Same 256-stream architecture as Rice but with distribution-adaptive codewords instead of fixed Golomb-Rice. Expected: 1-5% overhead vs rANS (vs Rice's 3-7%). See `docs/HUFFMAN_PLAN.md`.

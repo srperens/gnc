@@ -3,7 +3,7 @@ use wgpu;
 use wgpu::util::DeviceExt;
 
 use super::adaptive;
-use super::motion::{ME_BIDIR_SEARCH_RANGE, ME_BLOCK_SIZE, ME_PRED_FINE_RANGE, ME_SEARCH_RANGE};
+use super::motion::{ME_BIDIR_PRED_FINE_RANGE, ME_BIDIR_SEARCH_RANGE, ME_BLOCK_SIZE, ME_PRED_FINE_RANGE, ME_SEARCH_RANGE};
 use crate::GpuContext;
 
 /// Cached GPU buffers reused across encode() calls to avoid per-frame allocation.
@@ -304,10 +304,10 @@ impl CachedEncodeBuffers {
             },
 
             // --- Cached ME/MC buffers ---
-            me_params_nopred: Self::make_block_match_params(ctx, padded_w, padded_h, ME_SEARCH_RANGE, false),
-            me_params_pred: Self::make_block_match_params(ctx, padded_w, padded_h, ME_SEARCH_RANGE, true),
-            bidir_params_nopred: Self::make_block_match_params(ctx, padded_w, padded_h, ME_BIDIR_SEARCH_RANGE, false),
-            bidir_params_pred: Self::make_block_match_params(ctx, padded_w, padded_h, ME_BIDIR_SEARCH_RANGE, true),
+            me_params_nopred: Self::make_block_match_params(ctx, padded_w, padded_h, ME_SEARCH_RANGE, false, 0),
+            me_params_pred: Self::make_block_match_params(ctx, padded_w, padded_h, ME_SEARCH_RANGE, true, ME_PRED_FINE_RANGE),
+            bidir_params_nopred: Self::make_block_match_params(ctx, padded_w, padded_h, ME_BIDIR_SEARCH_RANGE, false, 0),
+            bidir_params_pred: Self::make_block_match_params(ctx, padded_w, padded_h, ME_BIDIR_SEARCH_RANGE, true, ME_BIDIR_PRED_FINE_RANGE),
 
             me_sad_buf: ctx.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("enc_me_sad"),
@@ -374,6 +374,7 @@ impl CachedEncodeBuffers {
         padded_h: u32,
         search_range: u32,
         use_predictor: bool,
+        pred_fine_range: u32,
     ) -> wgpu::Buffer {
         #[repr(C)]
         #[derive(Copy, Clone, Pod, Zeroable)]
@@ -398,7 +399,7 @@ impl CachedEncodeBuffers {
             blocks_x,
             total_blocks,
             use_predictor: u32::from(use_predictor),
-            pred_fine_range: if use_predictor { ME_PRED_FINE_RANGE } else { 0 },
+            pred_fine_range: if use_predictor { pred_fine_range } else { 0 },
         };
         ctx.device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {

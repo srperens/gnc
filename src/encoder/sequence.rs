@@ -194,7 +194,10 @@ impl EncoderPipeline {
                 // 3. Swap: gpu_ref_planes = past anchor, gpu_bwd_ref_planes = future P
                 self.swap_ref_planes();
 
-                // 4. Encode B-frames between past and future anchors
+                // 4. Encode B-frames between past and future anchors.
+                // Track previous B-frame MVs for temporal prediction within the group.
+                let mut prev_bidir_fwd_mv: Option<wgpu::Buffer> = None;
+                let mut prev_bidir_bwd_mv: Option<wgpu::Buffer> = None;
                 for b in 0..b_count {
                     let b_display = group_start + b;
                     let b_config = if let Some(ref rc) = rate_ctrl {
@@ -204,7 +207,7 @@ impl EncoderPipeline {
                     } else {
                         config.clone()
                     };
-                    let compressed = self.encode_bframe(
+                    let (compressed, new_fwd_mv, new_bwd_mv) = self.encode_bframe(
                         ctx,
                         frames[b_display],
                         width,
@@ -214,7 +217,11 @@ impl EncoderPipeline {
                         padded_pixels,
                         &info,
                         &b_config,
+                        prev_bidir_fwd_mv.as_ref(),
+                        prev_bidir_bwd_mv.as_ref(),
                     );
+                    prev_bidir_fwd_mv = Some(new_fwd_mv);
+                    prev_bidir_bwd_mv = Some(new_bwd_mv);
                     if let Some(ref mut rc) = rate_ctrl {
                         rc.update(b_config.quantization_step, compressed.bpp());
                     }
@@ -950,7 +957,9 @@ impl EncoderPipeline {
         padded_pixels: usize,
         info: &FrameInfo,
         config: &CodecConfig,
-    ) -> CompressedFrame {
+        predictor_fwd_mvs: Option<&wgpu::Buffer>,
+        predictor_bwd_mvs: Option<&wgpu::Buffer>,
+    ) -> (CompressedFrame, wgpu::Buffer, wgpu::Buffer) {
         let plane_size = (padded_pixels * std::mem::size_of::<f32>()) as u64;
 
         self.ensure_cached(ctx, padded_w, padded_h, width, height);
@@ -1022,6 +1031,8 @@ impl EncoderPipeline {
                 &bufs.gpu_bwd_ref_planes[0],
                 padded_w,
                 padded_h,
+                predictor_fwd_mvs,
+                predictor_bwd_mvs,
             );
             fwd_mv_buf = fmb;
             bwd_mv_buf = bmb;
@@ -1140,7 +1151,7 @@ impl EncoderPipeline {
                 EntropyMode::Rice => EntropyData::Rice(rice_tiles),
             };
 
-            return CompressedFrame {
+            return (CompressedFrame {
                 info: *info,
                 config: config.clone(),
                 entropy,
@@ -1153,7 +1164,7 @@ impl EncoderPipeline {
                     backward_vectors: Some(bwd_mvs),
                     block_modes: Some(block_modes),
                 }),
-            };
+            }, fwd_mv_buf, bwd_mv_buf);
         } else {
             // CPU entropy path: preprocess + bidir ME batched, then per-plane submits
             let mut cmd = ctx
@@ -1188,6 +1199,8 @@ impl EncoderPipeline {
                 &bufs.gpu_bwd_ref_planes[0],
                 padded_w,
                 padded_h,
+                predictor_fwd_mvs,
+                predictor_bwd_mvs,
             );
             fwd_mv_buf = fmb;
             bwd_mv_buf = bmb;
@@ -1297,7 +1310,7 @@ impl EncoderPipeline {
             me_total_blocks,
         );
 
-        CompressedFrame {
+        (CompressedFrame {
             info: *info,
             config: config.clone(),
             entropy,
@@ -1310,7 +1323,7 @@ impl EncoderPipeline {
                 backward_vectors: Some(bwd_mvs),
                 block_modes: Some(block_modes),
             }),
-        }
+        }, fwd_mv_buf, bwd_mv_buf)
     }
 
     /// Copy gpu_ref_planes → gpu_bwd_ref_planes (used before encoding B-frames).

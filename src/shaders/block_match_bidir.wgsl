@@ -28,6 +28,8 @@ struct Params {
 @group(0) @binding(5) var<storage, read_write> bwd_motion_vectors: array<i32>;
 @group(0) @binding(6) var<storage, read_write> block_modes: array<u32>;
 @group(0) @binding(7) var<storage, read_write> sad_values: array<u32>;
+@group(0) @binding(8) var<storage, read> predictor_fwd_mvs: array<i32>;
+@group(0) @binding(9) var<storage, read> predictor_bwd_mvs: array<i32>;
 
 var<workgroup> shared_sad: array<u32, 256>;
 var<workgroup> shared_mv: array<u32, 256>;
@@ -132,49 +134,71 @@ fn main(
     let w = i32(params.width);
     let h = i32(params.height);
 
-    // ========== Phase 1a: Coarse forward search (subsampled SAD) ==========
-    var best_sad: u32 = 0xFFFFFFFFu;
-    var best_dx: i32 = 0;
-    var best_dy: i32 = 0;
+    // ========== Phase 1: Forward search (coarse or predicted) ==========
+    var coarse_fwd_dx: i32 = 0;
+    var coarse_fwd_dy: i32 = 0;
+    var fine_range: i32 = FINE_RANGE;
 
-    var cand_idx = tid;
-    loop {
-        if cand_idx >= total_candidates { break; }
-        let cand_dy = i32(cand_idx / search_side) - sr;
-        let cand_dx = i32(cand_idx % search_side) - sr;
-        let ref_x = i32(block_origin_x) + cand_dx;
-        let ref_y = i32(block_origin_y) + cand_dy;
+    if params.use_predictor != 0u {
+        // Temporal MV prediction: use previous B-frame's forward MV as starting point.
+        // Predictor MVs are in half-pel units — convert to integer-pel.
+        if tid == 0u {
+            let pred_hx = predictor_fwd_mvs[block_idx * 2u];
+            let pred_hy = predictor_fwd_mvs[block_idx * 2u + 1u];
+            coarse_fwd_dx = (pred_hx + select(0, 1, pred_hx > 0)) / 2;
+            coarse_fwd_dy = (pred_hy + select(0, 1, pred_hy > 0)) / 2;
+        }
+        shared_mv[0] = pack_mv(coarse_fwd_dx, coarse_fwd_dy);
+        workgroupBarrier();
+        let pred_packed = shared_mv[0];
+        coarse_fwd_dx = unpack_dx(pred_packed);
+        coarse_fwd_dy = unpack_dy(pred_packed);
+        workgroupBarrier();
+        fine_range = i32(params.pred_fine_range);
+    } else {
+        // Full coarse search with subsampled SAD
+        var best_sad: u32 = 0xFFFFFFFFu;
+        var best_dx: i32 = 0;
+        var best_dy: i32 = 0;
 
-        if ref_x >= 0 && ref_y >= 0 && ref_x + bs <= w && ref_y + bs <= h {
-            var sad: u32 = 0u;
-            for (var py = 0u; py < params.block_size; py += COARSE_STRIDE) {
-                for (var px = 0u; px < params.block_size; px += COARSE_STRIDE) {
-                    let cur_idx = (block_origin_y + py) * params.width + block_origin_x + px;
-                    let r_idx = u32(ref_y + i32(py)) * params.width + u32(ref_x + i32(px));
-                    sad += u32(abs(current_y[cur_idx] - reference_fwd_y[r_idx]));
+        var cand_idx = tid;
+        loop {
+            if cand_idx >= total_candidates { break; }
+            let cand_dy = i32(cand_idx / search_side) - sr;
+            let cand_dx = i32(cand_idx % search_side) - sr;
+            let ref_x = i32(block_origin_x) + cand_dx;
+            let ref_y = i32(block_origin_y) + cand_dy;
+
+            if ref_x >= 0 && ref_y >= 0 && ref_x + bs <= w && ref_y + bs <= h {
+                var sad: u32 = 0u;
+                for (var py = 0u; py < params.block_size; py += COARSE_STRIDE) {
+                    for (var px = 0u; px < params.block_size; px += COARSE_STRIDE) {
+                        let cur_idx = (block_origin_y + py) * params.width + block_origin_x + px;
+                        let r_idx = u32(ref_y + i32(py)) * params.width + u32(ref_x + i32(px));
+                        sad += u32(abs(current_y[cur_idx] - reference_fwd_y[r_idx]));
+                    }
+                }
+                if sad < best_sad {
+                    best_sad = sad;
+                    best_dx = cand_dx;
+                    best_dy = cand_dy;
                 }
             }
-            if sad < best_sad {
-                best_sad = sad;
-                best_dx = cand_dx;
-                best_dy = cand_dy;
-            }
+            cand_idx += 256u;
         }
-        cand_idx += 256u;
+
+        shared_sad[tid] = best_sad;
+        shared_mv[tid] = pack_mv(best_dx, best_dy);
+        workgroupBarrier();
+        min_reduce(tid);
+
+        coarse_fwd_dx = unpack_dx(shared_mv[0]);
+        coarse_fwd_dy = unpack_dy(shared_mv[0]);
+        workgroupBarrier();
     }
 
-    shared_sad[tid] = best_sad;
-    shared_mv[tid] = pack_mv(best_dx, best_dy);
-    workgroupBarrier();
-    min_reduce(tid);
-
     // ========== Phase 1b: Fine forward search (full SAD) ==========
-    let coarse_fwd_packed = shared_mv[0];
-    let coarse_fwd_dx = unpack_dx(coarse_fwd_packed);
-    let coarse_fwd_dy = unpack_dy(coarse_fwd_packed);
-    workgroupBarrier();
-
-    let fine_side = u32(2 * FINE_RANGE + 1);
+    let fine_side = u32(2 * fine_range + 1);
     let fine_total = fine_side * fine_side;
 
     var fine_best_sad: u32 = 0xFFFFFFFFu;
@@ -184,8 +208,8 @@ fn main(
     var fine_idx = tid;
     loop {
         if fine_idx >= fine_total { break; }
-        let dy_off = i32(fine_idx / fine_side) - FINE_RANGE;
-        let dx_off = i32(fine_idx % fine_side) - FINE_RANGE;
+        let dy_off = i32(fine_idx / fine_side) - fine_range;
+        let dx_off = i32(fine_idx % fine_side) - fine_range;
         let test_dx = coarse_fwd_dx + dx_off;
         let test_dy = coarse_fwd_dy + dy_off;
         let ref_x = i32(block_origin_x) + test_dx;
@@ -223,48 +247,66 @@ fn main(
     final_fwd_sad = shared_sad[0];
     workgroupBarrier();
 
-    // ========== Phase 2a: Coarse backward search (subsampled SAD) ==========
-    best_sad = 0xFFFFFFFFu;
-    best_dx = 0;
-    best_dy = 0;
+    // ========== Phase 2: Backward search (coarse or predicted) ==========
+    var coarse_bwd_dx: i32 = 0;
+    var coarse_bwd_dy: i32 = 0;
 
-    cand_idx = tid;
-    loop {
-        if cand_idx >= total_candidates { break; }
-        let cand_dy = i32(cand_idx / search_side) - sr;
-        let cand_dx = i32(cand_idx % search_side) - sr;
-        let ref_x = i32(block_origin_x) + cand_dx;
-        let ref_y = i32(block_origin_y) + cand_dy;
+    if params.use_predictor != 0u {
+        // Temporal MV prediction: use previous B-frame's backward MV as starting point.
+        if tid == 0u {
+            let pred_hx = predictor_bwd_mvs[block_idx * 2u];
+            let pred_hy = predictor_bwd_mvs[block_idx * 2u + 1u];
+            coarse_bwd_dx = (pred_hx + select(0, 1, pred_hx > 0)) / 2;
+            coarse_bwd_dy = (pred_hy + select(0, 1, pred_hy > 0)) / 2;
+        }
+        shared_mv[0] = pack_mv(coarse_bwd_dx, coarse_bwd_dy);
+        workgroupBarrier();
+        let pred_packed = shared_mv[0];
+        coarse_bwd_dx = unpack_dx(pred_packed);
+        coarse_bwd_dy = unpack_dy(pred_packed);
+        workgroupBarrier();
+    } else {
+        var best_sad: u32 = 0xFFFFFFFFu;
+        var best_dx: i32 = 0;
+        var best_dy: i32 = 0;
 
-        if ref_x >= 0 && ref_y >= 0 && ref_x + bs <= w && ref_y + bs <= h {
-            var sad: u32 = 0u;
-            for (var py = 0u; py < params.block_size; py += COARSE_STRIDE) {
-                for (var px = 0u; px < params.block_size; px += COARSE_STRIDE) {
-                    let cur_idx = (block_origin_y + py) * params.width + block_origin_x + px;
-                    let r_idx = u32(ref_y + i32(py)) * params.width + u32(ref_x + i32(px));
-                    sad += u32(abs(current_y[cur_idx] - reference_bwd_y[r_idx]));
+        var cand_idx = tid;
+        loop {
+            if cand_idx >= total_candidates { break; }
+            let cand_dy = i32(cand_idx / search_side) - sr;
+            let cand_dx = i32(cand_idx % search_side) - sr;
+            let ref_x = i32(block_origin_x) + cand_dx;
+            let ref_y = i32(block_origin_y) + cand_dy;
+
+            if ref_x >= 0 && ref_y >= 0 && ref_x + bs <= w && ref_y + bs <= h {
+                var sad: u32 = 0u;
+                for (var py = 0u; py < params.block_size; py += COARSE_STRIDE) {
+                    for (var px = 0u; px < params.block_size; px += COARSE_STRIDE) {
+                        let cur_idx = (block_origin_y + py) * params.width + block_origin_x + px;
+                        let r_idx = u32(ref_y + i32(py)) * params.width + u32(ref_x + i32(px));
+                        sad += u32(abs(current_y[cur_idx] - reference_bwd_y[r_idx]));
+                    }
+                }
+                if sad < best_sad {
+                    best_sad = sad;
+                    best_dx = cand_dx;
+                    best_dy = cand_dy;
                 }
             }
-            if sad < best_sad {
-                best_sad = sad;
-                best_dx = cand_dx;
-                best_dy = cand_dy;
-            }
+            cand_idx += 256u;
         }
-        cand_idx += 256u;
+
+        shared_sad[tid] = best_sad;
+        shared_mv[tid] = pack_mv(best_dx, best_dy);
+        workgroupBarrier();
+        min_reduce(tid);
+
+        coarse_bwd_dx = unpack_dx(shared_mv[0]);
+        coarse_bwd_dy = unpack_dy(shared_mv[0]);
+        workgroupBarrier();
     }
 
-    shared_sad[tid] = best_sad;
-    shared_mv[tid] = pack_mv(best_dx, best_dy);
-    workgroupBarrier();
-    min_reduce(tid);
-
     // ========== Phase 2b: Fine backward search (full SAD) ==========
-    let coarse_bwd_packed = shared_mv[0];
-    let coarse_bwd_dx = unpack_dx(coarse_bwd_packed);
-    let coarse_bwd_dy = unpack_dy(coarse_bwd_packed);
-    workgroupBarrier();
-
     fine_best_sad = 0xFFFFFFFFu;
     fine_best_dx = coarse_bwd_dx;
     fine_best_dy = coarse_bwd_dy;
@@ -272,8 +314,8 @@ fn main(
     fine_idx = tid;
     loop {
         if fine_idx >= fine_total { break; }
-        let dy_off = i32(fine_idx / fine_side) - FINE_RANGE;
-        let dx_off = i32(fine_idx % fine_side) - FINE_RANGE;
+        let dy_off = i32(fine_idx / fine_side) - fine_range;
+        let dx_off = i32(fine_idx % fine_side) - fine_range;
         let test_dx = coarse_bwd_dx + dx_off;
         let test_dy = coarse_bwd_dy + dy_off;
         let ref_x = i32(block_origin_x) + test_dx;

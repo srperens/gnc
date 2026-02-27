@@ -4,6 +4,35 @@
 
 ---
 
+## 2026-02-27: Temporal MV prediction for bidir ME (B-frames)
+
+### Hypothesis
+Consecutive B-frames sharing the same reference pair have correlated forward/backward MVs. Using the first B-frame's MVs as predictors for the second should skip coarse search on both directions.
+
+### Implementation
+- Added `@group(0) @binding(8)` (predictor_fwd_mvs) and `@binding(9)` (predictor_bwd_mvs) to `block_match_bidir.wgsl`
+- When `use_predictor != 0`, both forward and backward coarse searches are skipped; predictor MVs converted from half-pel to integer-pel as fine search starting point
+- Modified `estimate_bidir()` to accept optional predictor buffers
+- Modified `encode_bframe()` to accept predictors and return MV buffers
+- Tracked `prev_bidir_fwd_mv`/`prev_bidir_bwd_mv` in B-frame group loop, reset per group
+- Increased `max_storage_buffers_per_shader_stage` from 8 to 10
+
+### Results (bbb_1080p, q=50, ki=8)
+
+| B-frame | No predictor | With predictor | Change |
+|---------|-------------|----------------|--------|
+| Time | ~87ms | ~82ms | **-6%** |
+| Quality | 37.89 dB | 37.89 dB | identical |
+
+30-frame benchmark: 13.2 → 13.4 fps (+1.5%).
+
+### Analysis
+1. Modest improvement on identical-frame benchmark because all-zero MVs make coarse search trivially fast.
+2. Real video with motion diversity should see larger gains (coarse search is the expensive part, ~30ms per direction at ±16).
+3. Within each B-frame group (2 B-frames between anchors), only the second B-frame benefits from prediction. With B_FRAMES_PER_GROUP=2, that's 50% of B-frames.
+
+---
+
 ## 2026-02-27: Bidir ME search range reduction — ±32 → ±16
 
 ### Hypothesis

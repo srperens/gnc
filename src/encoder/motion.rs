@@ -169,8 +169,9 @@ impl MotionEstimator {
                 ),
             });
 
-        // 8 bindings: uniform, current_y(ro), ref_fwd_y(ro), ref_bwd_y(ro),
-        //             fwd_mvs(rw), bwd_mvs(rw), block_modes(rw), sads(rw)
+        // 10 bindings: uniform, current_y(ro), ref_fwd_y(ro), ref_bwd_y(ro),
+        //              fwd_mvs(rw), bwd_mvs(rw), block_modes(rw), sads(rw),
+        //              predictor_fwd_mvs(ro), predictor_bwd_mvs(ro)
         let match_bidir_bgl =
             ctx.device
                 .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -184,6 +185,8 @@ impl MotionEstimator {
                         bgl_storage_rw(5),
                         bgl_storage_rw(6),
                         bgl_storage_rw(7),
+                        bgl_storage_ro(8),
+                        bgl_storage_ro(9),
                     ],
                 });
 
@@ -471,11 +474,14 @@ impl MotionEstimator {
         ref_bwd_y: &wgpu::Buffer,
         width: u32,
         height: u32,
+        predictor_fwd_mvs: Option<&wgpu::Buffer>,
+        predictor_bwd_mvs: Option<&wgpu::Buffer>,
     ) -> (wgpu::Buffer, wgpu::Buffer, wgpu::Buffer, wgpu::Buffer) {
         let blocks_x = width / ME_BLOCK_SIZE;
         let blocks_y = height / ME_BLOCK_SIZE;
         let total_blocks = blocks_x * blocks_y;
 
+        let have_predictor = predictor_fwd_mvs.is_some() && predictor_bwd_mvs.is_some();
         let params = BlockMatchParams {
             width,
             height,
@@ -483,8 +489,8 @@ impl MotionEstimator {
             search_range: ME_BIDIR_SEARCH_RANGE,
             blocks_x,
             total_blocks,
-            use_predictor: 0,
-            pred_fine_range: 0,
+            use_predictor: if have_predictor { 1 } else { 0 },
+            pred_fine_range: if have_predictor { ME_PRED_FINE_RANGE } else { 0 },
         };
 
         let params_buf = ctx
@@ -526,6 +532,16 @@ impl MotionEstimator {
             mapped_at_creation: false,
         });
 
+        // Dummy 8-byte predictor buffers when no temporal predictor is available.
+        let dummy_pred = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("bidir_dummy_predictor"),
+            size: 8,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let pred_fwd = predictor_fwd_mvs.unwrap_or(&dummy_pred);
+        let pred_bwd = predictor_bwd_mvs.unwrap_or(&dummy_pred);
+
         let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("block_match_bidir_bg"),
             layout: &self.match_bidir_bgl,
@@ -561,6 +577,14 @@ impl MotionEstimator {
                 wgpu::BindGroupEntry {
                     binding: 7,
                     resource: sad_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: pred_fwd.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: pred_bwd.as_entire_binding(),
                 },
             ],
         });

@@ -17,15 +17,17 @@ pub const RICE_STREAMS_PER_TILE: usize = 256;
 /// Max output bytes per stream (generous; typically much less).
 pub const RICE_MAX_STREAM_BYTES: usize = 4096;
 
-/// Encoded tile using significance map + Golomb-Rice coding.
+/// Encoded tile using significance map + Golomb-Rice coding with zero-run-length.
 #[derive(Debug, Clone)]
 pub struct RiceTile {
     pub num_coefficients: u32,
     pub tile_size: u32,
     pub num_levels: u32,
     pub num_groups: u32,
-    /// Per-subband Rice parameter k (0..15).
+    /// Per-subband Rice parameter k for magnitudes (0..15).
     pub k_values: Vec<u8>,
+    /// Rice parameter k for zero-run lengths.
+    pub k_zrl: u8,
     /// Bytes used by each of the 256 streams.
     pub stream_lengths: Vec<u32>,
     /// Concatenated stream data (all 256 streams).
@@ -34,8 +36,8 @@ pub struct RiceTile {
 
 impl RiceTile {
     pub fn byte_size(&self) -> usize {
-        // Header: num_coefficients + tile_size + num_levels + num_groups + k_values + stream_lengths
-        4 + 4 + 4 + 4 + self.k_values.len() + self.stream_lengths.len() * 2 + self.stream_data.len()
+        // Header: num_coefficients + tile_size + num_levels + num_groups + k_zrl + k_values + stream_lengths
+        4 + 4 + 4 + 4 + 1 + self.k_values.len() + self.stream_lengths.len() * 2 + self.stream_data.len()
     }
 }
 
@@ -168,15 +170,19 @@ fn optimal_k(values: &[u32]) -> u8 {
     (63 - mean.leading_zeros()).min(15) as u8
 }
 
-/// Encode a tile of quantized coefficients using significance map + Golomb-Rice.
+/// Encode a tile of quantized coefficients using Golomb-Rice with zero-run-length.
 ///
-/// Coefficients are in raster order within the tile (row-major, tile_size × tile_size).
-/// Uses 256 interleaved streams for maximum parallelism.
+/// Token encoding (per stream):
+///   bit=1 → non-zero coefficient: sign bit + Rice(|val|-1, k_mag)
+///   bit=0 → zero run: Rice(run_length-1, k_zrl)
+///
+/// Uses 256 interleaved streams for maximum GPU parallelism.
 pub fn rice_encode_tile(coefficients: &[i32], tile_size: u32, num_levels: u32) -> RiceTile {
     let num_coefficients = coefficients.len();
     let num_groups = (num_levels * 2) as usize;
+    let symbols_per_stream = num_coefficients / RICE_STREAMS_PER_TILE;
 
-    // Phase 1: Compute per-subband statistics for optimal k
+    // Phase 1: Compute per-subband k for magnitudes
     let mut group_abs_values: Vec<Vec<u32>> = vec![Vec::new(); num_groups];
     for (idx, &coeff) in coefficients.iter().enumerate() {
         let y = (idx / tile_size as usize) as u32;
@@ -186,31 +192,63 @@ pub fn rice_encode_tile(coefficients: &[i32], tile_size: u32, num_levels: u32) -
             group_abs_values[g].push(coeff.unsigned_abs() - 1);
         }
     }
-
     let k_values: Vec<u8> = group_abs_values.iter().map(|v| optimal_k(v)).collect();
 
-    // Phase 2: Encode 256 interleaved streams
-    let symbols_per_stream = num_coefficients / RICE_STREAMS_PER_TILE;
+    // Phase 1b: Compute k_zrl from zero-run statistics across all streams
+    let mut run_lengths: Vec<u32> = Vec::new();
+    for stream_id in 0..RICE_STREAMS_PER_TILE {
+        let mut run = 0u32;
+        for s in 0..symbols_per_stream {
+            let coeff_idx = stream_id + s * RICE_STREAMS_PER_TILE;
+            if coefficients[coeff_idx] == 0 {
+                run += 1;
+            } else {
+                if run > 0 {
+                    run_lengths.push(run - 1);
+                    run = 0;
+                }
+            }
+        }
+        if run > 0 {
+            run_lengths.push(run - 1);
+        }
+    }
+    let k_zrl = optimal_k(&run_lengths);
+
+    // Phase 2: Encode 256 interleaved streams with ZRL
     let mut all_stream_data = Vec::new();
     let mut stream_lengths = Vec::with_capacity(RICE_STREAMS_PER_TILE);
 
     for stream_id in 0..RICE_STREAMS_PER_TILE {
         let mut writer = BitWriter::new();
+        let mut s = 0;
 
-        for s in 0..symbols_per_stream {
+        while s < symbols_per_stream {
             let coeff_idx = stream_id + s * RICE_STREAMS_PER_TILE;
             let coeff = coefficients[coeff_idx];
-            let y = (coeff_idx / tile_size as usize) as u32;
-            let x = (coeff_idx % tile_size as usize) as u32;
 
             if coeff == 0 {
-                writer.write_bit(0); // significance: zero
+                // Count zero run length
+                let mut run = 1u32;
+                while s + (run as usize) < symbols_per_stream {
+                    let next_idx = stream_id + (s + run as usize) * RICE_STREAMS_PER_TILE;
+                    if coefficients[next_idx] != 0 {
+                        break;
+                    }
+                    run += 1;
+                }
+                writer.write_bit(0); // token: zero run
+                writer.write_rice(run - 1, k_zrl);
+                s += run as usize;
             } else {
-                writer.write_bit(1); // significance: non-zero
-                writer.write_bit(if coeff < 0 { 1 } else { 0 }); // sign
+                writer.write_bit(1); // token: non-zero
+                writer.write_bit(if coeff < 0 { 1 } else { 0 });
                 let magnitude = coeff.unsigned_abs() - 1;
+                let y = (coeff_idx / tile_size as usize) as u32;
+                let x = (coeff_idx % tile_size as usize) as u32;
                 let g = compute_subband_group(x, y, tile_size, num_levels);
                 writer.write_rice(magnitude, k_values[g]);
+                s += 1;
             }
         }
 
@@ -225,12 +263,13 @@ pub fn rice_encode_tile(coefficients: &[i32], tile_size: u32, num_levels: u32) -
         num_levels,
         num_groups: num_groups as u32,
         k_values,
+        k_zrl,
         stream_lengths,
         stream_data: all_stream_data,
     }
 }
 
-/// Decode a Rice-coded tile back to quantized coefficients.
+/// Decode a Rice-coded tile (with ZRL) back to quantized coefficients.
 pub fn rice_decode_tile(tile: &RiceTile) -> Vec<i32> {
     let num_coefficients = tile.num_coefficients as usize;
     let symbols_per_stream = num_coefficients / RICE_STREAMS_PER_TILE;
@@ -242,12 +281,20 @@ pub fn rice_decode_tile(tile: &RiceTile) -> Vec<i32> {
         let stream_data = &tile.stream_data[data_offset..data_offset + stream_len];
         let mut reader = BitReader::new(stream_data);
 
-        for s in 0..symbols_per_stream {
-            let coeff_idx = stream_id + s * RICE_STREAMS_PER_TILE;
-            let significance = reader.read_bit();
-            if significance == 0 {
-                coefficients[coeff_idx] = 0;
+        let mut s = 0usize;
+        while s < symbols_per_stream {
+            let token = reader.read_bit();
+            if token == 0 {
+                // Zero run
+                let run = reader.read_rice(tile.k_zrl) + 1;
+                for j in 0..run as usize {
+                    let coeff_idx = stream_id + (s + j) * RICE_STREAMS_PER_TILE;
+                    coefficients[coeff_idx] = 0;
+                }
+                s += run as usize;
             } else {
+                // Non-zero coefficient
+                let coeff_idx = stream_id + s * RICE_STREAMS_PER_TILE;
                 let sign = reader.read_bit();
                 let y = (coeff_idx / tile.tile_size as usize) as u32;
                 let x = (coeff_idx % tile.tile_size as usize) as u32;
@@ -259,6 +306,7 @@ pub fn rice_decode_tile(tile: &RiceTile) -> Vec<i32> {
                 } else {
                     magnitude as i32
                 };
+                s += 1;
             }
         }
 
@@ -276,7 +324,8 @@ pub fn serialize_tile_rice(tile: &RiceTile) -> Vec<u8> {
     out.extend_from_slice(&tile.num_levels.to_le_bytes());
     out.extend_from_slice(&tile.num_groups.to_le_bytes());
 
-    // k values (one byte per group)
+    // k_zrl + k values (one byte each)
+    out.push(tile.k_zrl);
     out.extend_from_slice(&tile.k_values);
 
     // Stream lengths as u16 (max 4096 bytes per stream fits in u16)
@@ -302,6 +351,9 @@ pub fn deserialize_tile_rice(data: &[u8]) -> (RiceTile, usize) {
     let num_groups = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
     pos += 4;
 
+    let k_zrl = data[pos];
+    pos += 1;
+
     let k_values = data[pos..pos + num_groups as usize].to_vec();
     pos += num_groups as usize;
 
@@ -323,6 +375,7 @@ pub fn deserialize_tile_rice(data: &[u8]) -> (RiceTile, usize) {
             num_levels,
             num_groups,
             k_values,
+            k_zrl,
             stream_lengths,
             stream_data,
         },

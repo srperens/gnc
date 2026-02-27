@@ -9,6 +9,7 @@
 
 const STREAMS_PER_TILE: u32 = 256u;
 const MAX_GROUPS: u32 = 8u;
+const K_STRIDE: u32 = 9u;  // MAX_GROUPS + 1: stride per tile in k_values (room for k_zrl)
 
 struct Params {
     num_tiles: u32,
@@ -29,6 +30,7 @@ struct Params {
 
 // Shared k values for this tile
 var<workgroup> shared_k: array<u32, 8>;
+var<workgroup> shared_k_zrl: u32;
 
 // Per-thread bit-reader state
 var<private> p_current_byte: u32;
@@ -126,11 +128,16 @@ fn main(
     let symbols_per_stream = params.coefficients_per_tile / STREAMS_PER_TILE;
     let num_groups = params.num_levels * 2u;
 
-    // Cooperatively load k values into shared memory
+    // Cooperatively load k values + k_zrl into shared memory (stride K_STRIDE)
     if (thread_id < num_groups) {
-        shared_k[thread_id] = k_values[tile_id * MAX_GROUPS + thread_id];
+        shared_k[thread_id] = k_values[tile_id * K_STRIDE + thread_id];
+    }
+    if (thread_id == 0u) {
+        shared_k_zrl = k_values[tile_id * K_STRIDE + num_groups];
     }
     workgroupBarrier();
+
+    let k_zrl = shared_k_zrl;
 
     // Initialize bit reader with this stream's byte offset
     let stream_idx = tile_id * STREAMS_PER_TILE + thread_id;
@@ -138,24 +145,36 @@ fn main(
     p_bit_pos = 8u;  // force load on first read_bit()
     p_current_byte = 0u;
 
-    // Decode coefficients
-    for (var s = 0u; s < symbols_per_stream; s++) {
-        let coeff_idx = thread_id + s * STREAMS_PER_TILE;
-        let tile_row = coeff_idx / params.tile_size;
-        let tile_col = coeff_idx % params.tile_size;
-        let plane_idx = (tile_origin_y + tile_row) * params.plane_width
-                      + (tile_origin_x + tile_col);
-
-        let significance = read_bit();
-        if (significance == 0u) {
-            output[plane_idx] = 0.0;
+    // Decode tokens with ZRL
+    var s = 0u;
+    while (s < symbols_per_stream) {
+        let token = read_bit();
+        if (token == 0u) {
+            // Zero run: Rice-decode run length
+            let run = read_rice(k_zrl) + 1u;
+            for (var j = 0u; j < run; j++) {
+                let ci = thread_id + (s + j) * STREAMS_PER_TILE;
+                let cr = ci / params.tile_size;
+                let cc = ci % params.tile_size;
+                let pi = (tile_origin_y + cr) * params.plane_width + (tile_origin_x + cc);
+                output[pi] = 0.0;
+            }
+            s += run;
         } else {
+            // Non-zero coefficient
+            let coeff_idx = thread_id + s * STREAMS_PER_TILE;
+            let tile_row = coeff_idx / params.tile_size;
+            let tile_col = coeff_idx % params.tile_size;
+            let plane_idx = (tile_origin_y + tile_row) * params.plane_width
+                          + (tile_origin_x + tile_col);
+
             let sign = read_bit();
             let g = compute_subband_group(tile_col, tile_row);
             let k = shared_k[g];
             let magnitude = read_rice(k) + 1u;
             let value = select(i32(magnitude), -i32(magnitude), sign == 1u);
             output[plane_idx] = f32(value);
+            s += 1u;
         }
     }
 }

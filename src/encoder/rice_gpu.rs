@@ -16,6 +16,7 @@ use crate::{FrameInfo, GpuContext};
 
 const MAX_STREAM_BYTES: usize = 2048;
 const MAX_GROUPS: usize = 8;
+const K_STRIDE: usize = MAX_GROUPS + 1; // stride per tile in k_output (room for k_zrl)
 
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
@@ -47,7 +48,7 @@ impl CachedRiceEncodeBuffers {
         let total_streams = num_tiles * RICE_STREAMS_PER_TILE;
         let stream_size = (total_streams * MAX_STREAM_BYTES) as u64;
         let lengths_size = (total_streams * 4) as u64;
-        let k_size = (num_tiles * MAX_GROUPS * 4) as u64;
+        let k_size = (num_tiles * K_STRIDE * 4) as u64;
 
         let sc = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC;
         let mr = wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST;
@@ -238,7 +239,7 @@ impl GpuRiceEncoder {
 
         let stream_size = (total_streams * MAX_STREAM_BYTES) as u64;
         let lengths_size = (total_streams * 4) as u64;
-        let k_size = (num_tiles * MAX_GROUPS * 4) as u64;
+        let k_size = (num_tiles * K_STRIDE * 4) as u64;
 
         let params = RiceParams {
             num_tiles: num_tiles as u32,
@@ -371,8 +372,9 @@ impl GpuRiceEncoder {
 
             for tile_idx in 0..num_tiles {
                 let k_values: Vec<u8> = (0..num_groups)
-                    .map(|g| k_data[tile_idx * MAX_GROUPS + g] as u8)
+                    .map(|g| k_data[tile_idx * K_STRIDE + g] as u8)
                     .collect();
+                let k_zrl = k_data[tile_idx * K_STRIDE + num_groups] as u8;
 
                 let stream_lengths: Vec<u32> = (0..RICE_STREAMS_PER_TILE)
                     .map(|s| lengths_data[tile_idx * RICE_STREAMS_PER_TILE + s])
@@ -394,6 +396,7 @@ impl GpuRiceEncoder {
                     num_levels,
                     num_groups: num_groups as u32,
                     k_values,
+                    k_zrl,
                     stream_lengths,
                     stream_data: packed_data,
                 });
@@ -517,12 +520,14 @@ impl GpuRiceDecoder {
         let num_tiles = tiles.len();
         let total_streams = num_tiles * RICE_STREAMS_PER_TILE;
 
-        // k values: flat array indexed by tile_id * MAX_GROUPS + group
-        let mut k_values = vec![0u32; num_tiles * MAX_GROUPS];
+        // k values: flat array indexed by tile_id * K_STRIDE + group
+        // k_zrl stored at tile_id * K_STRIDE + num_groups
+        let mut k_values = vec![0u32; num_tiles * K_STRIDE];
         for (t, tile) in tiles.iter().enumerate() {
             for (g, &k) in tile.k_values.iter().enumerate() {
-                k_values[t * MAX_GROUPS + g] = k as u32;
+                k_values[t * K_STRIDE + g] = k as u32;
             }
+            k_values[t * K_STRIDE + tile.num_groups as usize] = tile.k_zrl as u32;
         }
 
         // Compute total stream data size and stream offsets

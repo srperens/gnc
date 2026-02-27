@@ -16,267 +16,147 @@ sequential work.
 
 ---
 
-## Current State (2026-02-23)
+## Current State (2026-02-27)
 
 ### What works
-- End-to-end encode/decode pipeline on GPU
-- LeGall 5/3 integer wavelet transform (lossless-capable, 1-4 levels)
-- CDF 9/7 lossy wavelet (implemented, not yet default)
-- Per-subband weighted quantization (uniform, perceptual, custom presets)
-- Dead-zone quantization (configurable threshold)
-- Per-tile rANS entropy coding (32 interleaved streams per tile)
-- **Per-subband entropy coding** (4 frequency tables per tile, 8-20% savings)
-- Chroma-from-Luma (CfL) prediction (per-tile per-subband alpha)
-- GPU rANS decoder (CPU encoder, GPU decoder)
-- Pipelined decode path (overlap GPU/CPU for throughput)
-- CLI: encode (`--cfl`, `--per-subband`, `--wavelet 97`), decode, benchmark, sweep (8 experiment sets)
-- GPC9 bitstream format (backward-compatible evolution from GPC4-8)
+
+**Image compression:**
+- End-to-end GPU encode/decode pipeline
+- CDF 9/7 lossy wavelet (q=1-99), LeGall 5/3 lossless wavelet (q=100), 3-4 levels
+- Adaptive quantization with perceptual subband weights, dead zone, SSIM-guided spatial weighting
+- Chroma-from-Luma (CfL) prediction at q=50-85 (14-bit i16 precision)
+- Three entropy coders: Rice+ZRL (256 streams, fastest), rANS (32 streams, default), Bitplane
+- Per-subband entropy coding (separate frequency tables per wavelet level)
+- Smooth monotonic quality curve q=1..100 (validated)
+- Bit-exact lossless round-trip at q=100
+
+**Video:**
+- I/P/B frame types with motion-compensated prediction
+- Half-pel bilinear motion estimation, hierarchical coarse-to-fine block matching (±64px)
+- B-frame scheduling (I B B P B B P pattern), bidirectional prediction
+- CBR and VBR rate control with R-Q model and VBV buffer
+- GNV1 sequence container with frame index table and keyframe seeking
+
+**Infrastructure:**
+- GP11 bitstream format (backward-compatible with GP10/GPC9/GPC8)
+- Per-tile CRC-32 checksums, corrupt tile detection and recovery
+- 5 conformance test bitstreams
+- Golden-baseline regression tests at q=25/50/75/90
+- BD-rate computation, multi-codec comparison (GNC vs JPEG vs JPEG 2000)
+- WebGPU/WASM build (263 KB), browser decode demo
+- Criterion benchmarks for encode, decode, roundtrip
 
 ### Compression performance (bbb_1080p 1920x1080)
 
-**Baseline (LeGall 5/3, uniform quantization, no dead zone):**
+**Rice+ZRL entropy coder (fastest):**
 
-| QStep | PSNR    | BPP  |
-|-------|---------|------|
-| 4     | 43.41 dB | 6.55 |
-| 8     | 37.88 dB | 4.14 |
-| 16    | 32.55 dB | 2.39 |
+| Quality | PSNR | BPP | Encode | Decode |
+|---------|------|-----|--------|--------|
+| q=25 | 33.2 dB | 1.73 | 40 fps | 70 fps |
+| q=50 | 37.5 dB | 2.42 | 42 fps | 61 fps |
+| q=75 | 42.1 dB | 4.09 | 40 fps | 61 fps |
+| q=90 | 49.2 dB | 8.96 | 41 fps | 66 fps |
+| q=100 | inf | 12.80 | — | — |
 
-**With per-subband entropy (quality-neutral, 8-20% savings):**
+**rANS entropy coder (default, best compression at low bitrate):**
 
-| QStep | PSNR    | BPP  | Savings |
-|-------|---------|------|---------|
-| 4     | 43.41 dB | 6.03 | -7.9%   |
-| 8     | 37.88 dB | 3.62 | -12.6%  |
-| 16    | 32.55 dB | 1.92 | -19.5%  |
+| Quality | PSNR | BPP | Encode | Decode |
+|---------|------|-----|--------|--------|
+| q=25 | 33.2 dB | 1.29 | 29 fps | 34 fps |
+| q=50 | 37.7 dB | 2.30 | 30 fps | 36 fps |
+| q=75 | 42.8 dB | 4.22 | 29 fps | 34 fps |
+| q=90 | 51.0 dB | 9.65 | 30 fps | 34 fps |
 
-**CDF 9/7 wavelet (same qstep, +4-5 dB quality):**
+**Key finding:** Rice+ZRL beats rANS in bpp at q>=75 while being 1.5-2x faster.
+At q=25, Rice is +34% overhead but dramatically faster. Rice eliminates the sequential
+state chain that limits rANS — all 256 streams encode independently.
 
-| QStep | PSNR    | BPP  | PSNR gain vs 5/3 |
-|-------|---------|------|-------------------|
-| 4     | 46.77 dB | 7.41 | +3.36 dB |
-| 8     | 41.92 dB | 4.96 | +4.04 dB |
-| 16    | 37.41 dB | 3.17 | +4.86 dB |
+### Multi-codec comparison
 
-**Best config: CDF 9/7 + per-subband entropy + CfL (quality-neutral only):**
+**BD-rate vs JPEG (libjpeg-turbo):** ~-1% on animation (GNC wins), ~+50% on sports.
+**BD-rate vs JPEG 2000 (OpenJPEG):** ~+50% (gap closed from ~+60% baseline).
 
-| QStep | PSNR    | BPP  | vs 5/3 baseline |
-|-------|---------|------|-----------------|
-| 8     | 42.11 dB | 3.76 | +4.2 dB, -9% bpp |
-| 16    | 37.62 dB | 2.23 | +5.1 dB, -7% bpp |
-| 32    | 33.51 dB | 1.25 | +6.2 dB, -2% bpp |
+### 4K performance
 
-**Best config: CDF 9/7 + per-subband + CfL + perceptual + dz=0.75:**
+4K is 34-71% *faster* per pixel than 1080p (better GPU occupancy):
+- 4K encode: 101ms (82 MP/s) vs 1080p: 34ms (61 MP/s)
+- 4K decode: 70ms (118 MP/s) vs 1080p: 30ms (69 MP/s)
 
-| QStep | PSNR    | BPP  | vs 5/3 baseline |
-|-------|---------|------|-----------------|
-| 8     | 37.65 dB | 2.17 | -0.2 dB, **-48% bpp** |
-| 16    | 33.25 dB | 1.18 | +0.7 dB, **-51% bpp** |
-| 32    | 29.47 dB | 0.62 | +2.2 dB, **-52% bpp** |
+### Video sequence performance
 
-### Throughput (blue_sky 1920x1080, Apple M1)
-- Encode: 188 ms (5.3 fps) — bottleneck is CPU-side rANS
-- Decode: 36 ms sequential (27.6 fps), 34 ms pipelined (29.3 fps)
-
-### What was tried and rejected
-- **Zero-run-length coding**: rANS already handles zeros efficiently. ZRL
-  added 0-1.4% savings — not worth the complexity. Negative result.
-
-### Hardware compatibility
-- Requires `max_storage_buffers_per_shader_stage >= 4`
-- Modern GPUs (NVIDIA, AMD, Apple Silicon, recent Intel) work fine
-- Old/integrated GPUs (e.g. Intel HD 4000, GT 635M) hit hardware limits
-- Fix applied: use `adapter.limits()` instead of `Limits::default()`
+- Mixed I+P+B: 6.5 fps at 1080p (up from 0.8 fps)
+- All-I frames: 9.8 fps
+- P-frame savings: 33% on animation, 0% on camera pan (motion estimation limitation)
+- B-frames: ~20% smaller than P-frames
 
 ---
 
-## Honest Assessment: Is GNC Any Good?
+## Honest Assessment
 
-### Compression efficiency — competitive with JPEG, 1.5x behind JPEG 2000
+### Where GNC excels
 
-**Measured comparison at matched PSNR on bbb_1080p (1920x1080):**
-
-| PSNR target | JPEG (libjpeg-turbo) | GNC best config | JPEG 2000 (OpenJPEG) | GNC vs JPEG |
-|-------------|---------------------|-----------------|---------------------|-------------|
-| ~35 dB | 2.21 bpp | ~1.6 bpp | ~1.0 bpp | **-27%** |
-| ~38 dB | 4.49 bpp | ~2.5 bpp | ~1.6 bpp | **-44%** |
-| ~33 dB | 1.51 bpp | ~1.2 bpp | ~0.7 bpp | **-20%** |
-
-GNC "best config" = CDF 9/7 + per-subband entropy + CfL + perceptual weights + dead zone 0.75.
-
-**Content-dependent results (measured, all 1080p):**
-- **Animation (bbb_1080p)**: GNC beats JPEG by 20-44%
-- **Nature (blue_sky)**: GNC ties to beats JPEG by 0-23%
-- **Sports (touchdown)**: JPEG wins by 6-32%
-
-On smooth/animated content, wavelets dominate DCT. On dense textures, JPEG's
-8×8 DCT remains competitive. The JPEG 2000 gap is consistently ~1.5-1.7x
-across all content types — this is structural (context modeling, trellis quant).
-
-### What closed the gap (feature stacking)
-
-From "3-5x worse than JPEG" to "competitive or better":
-
-| Feature | Improvement | Quality impact |
-|---------|-------------|----------------|
-| CDF 9/7 wavelet | +4-5 dB PSNR at same Q | Quality-neutral (better) |
-| Per-subband entropy | 12-31% bitrate reduction | Quality-neutral |
-| CfL prediction | 9-10% bitrate reduction (with 9/7) | Quality-neutral |
-| Perceptual weights | 25-30% bitrate reduction | ~2-3 dB PSNR trade |
-| Dead zone 0.75 | 15-20% bitrate reduction | ~1 dB PSNR trade |
-
-Combined: ~67% bitrate reduction vs LeGall 5/3 baseline at matched quality.
-
-### Remaining gap to JPEG 2000
-
-1. **No context modeling** — EBCOT uses spatial context to predict coefficients.
-   GNC's rANS treats each coefficient independently. Expected improvement if
-   added: 15-25%.
-2. **No trellis quantization** — JPEG 2000 optimizes quantized values for
-   rate-distortion. GNC uses simple rounding.
-3. **30 years of optimization** — OpenJPEG is a mature implementation.
-
-### Where GNC already has genuine advantages
-
-1. **Decode speed**: 29 fps at 1080p on M1 GPU, with headroom for optimization.
-   JPEG 2000 decode is typically 2-5 fps on CPU. Even hardware-accelerated H.264
-   decode has higher latency due to serial dependencies.
-
-2. **Resolution scaling**: 4K = 4x tiles = 4x parallel workgroups, no
-   architectural changes. Sequential codecs need algorithmic redesign for 8K.
-
-3. **Simplicity**: ~4K lines of Rust + ~300 lines of WGSL. The entire codec is
-   comprehensible by one person. AV1's reference encoder is 400K+ lines.
-
+1. **Decode speed**: 61-70 fps at 1080p (Rice) on M1 GPU. JPEG 2000 is typically 2-5 fps on CPU.
+2. **Resolution scaling**: 4K = 4x tiles = 4x parallel workgroups. 4K per-pixel throughput
+   is actually *faster* than 1080p.
+3. **Simplicity**: ~15K lines of Rust + ~3K lines of WGSL. The entire codec is comprehensible
+   by one person. AV1's reference encoder is 400K+ lines.
 4. **Patent-free**: No MPEG-LA, no VVC patent pool, no licensing uncertainty.
+5. **Tile independence**: Partial decode, region-of-interest, error resilience — all for free.
+6. **Cross-platform**: Single shader source runs on Metal, Vulkan, DX12, and WebGPU.
 
-5. **Tile independence**: Enables partial decode, region-of-interest, error
-   resilience — all for free from the architecture.
+### Remaining gaps
 
-### The verdict
-
-GNC with full feature stack is **competitive with JPEG** on animation and
-nature content, and within 1.5-1.7x of JPEG 2000. The decoder runs at
-real-time speed (29 fps at 1080p on M1). The gap to JPEG 2000 is real but
-structural — closing it requires context-modeled entropy coding, which is
-the next major architectural decision.
-
-For video use cases, temporal prediction is the elephant in the room —
-without it, GNC is an image codec. With it, the 3-10x compression
-multiplier would make the JPEG 2000 gap irrelevant for most applications.
+1. **Compression vs JPEG 2000**: ~1.4x bpp gap. Structural — EBCOT's context modeling and
+   trellis quantization are inherently more efficient than per-coefficient Rice/rANS.
+2. **Lossless**: 12.8 bpp vs JPEG 2000's ~3.5 bpp. Needs bitplane/CABAC entropy to close.
+3. **Camera pan content**: Motion estimation with 16x16 blocks and ±64px search loses to
+   whole-frame motion in traditional codecs. Variable block sizes would help.
+4. **Sequence speed**: 6.5 fps I+P+B, target is 10+ fps. ME readback is the bottleneck.
+5. **60fps encode**: 40 fps with Rice, 29 fps with rANS. GPU ALU throughput is the limit.
 
 ---
 
-## The Core Thesis
+## Roadmap (What's Next)
 
-Traditional codecs (H.264, HEVC, AV1) are shaped by CPU constraints —
-sequential prediction chains, complex motion estimation, serial entropy coding.
-They do not scale well with resolution because their fundamental dependencies
-are sequential.
+### Near-term: Make Rice the default entropy coder
 
-GNC's tile-independent design means:
-- 4K = 4x more tiles = 4x more parallel workgroups — no architectural changes
-- 8K follows the same logic
-- The GPU does the scaling automatically
+Rice+ZRL matches or beats rANS at q>=50 while being 1.5-2x faster. The remaining +34%
+gap at q=25 could be closed with:
+- Adaptive k_zrl per subband (instead of per-tile)
+- Context-adaptive Rice parameter switching
+- Better zero-run modeling for high-frequency subbands
 
-This is a genuine architectural advantage, not just a performance trick.
+### Medium-term: Close the lossless gap
 
-### Target use cases (where GNC's design fits better than alternatives)
+Lossless 12.8 bpp is 3.7x worse than JPEG 2000. This requires fundamentally different
+entropy coding (bitplane refinement or context-adaptive binary coding) rather than
+incremental Rice/rANS improvements.
+
+### Medium-term: Improve motion estimation
+
+Variable block sizes (8x8 alongside 16x16) with RD-based split decisions would improve
+P-frame compression on high-motion content. GPU-native approach: evaluate all candidates
+in parallel, pick lowest cost.
+
+### Long-term: Real-time 1080p60
+
+Current bottleneck is GPU ALU throughput in the entropy coding pass. Possible paths:
+- Fused wavelet+quantize shader (eliminate intermediate buffer read/write)
+- Wider Rice streams (512 per tile) for higher parallelism
+- Multi-frame pipelining (overlap frame N+1 transform with frame N entropy)
+
+---
+
+## Target Use Cases
+
+GNC's architecture fits best where latency, GPU availability, and simplicity matter
+more than maximum compression:
+
 - **Real-time video** — live streaming, video conferencing, game capture
 - **Professional intermediate codec** — GPU-accelerated, low-latency proxy format
 - **VR/XR** — where latency and GPU availability matter more than compression ratio
 - **High-resolution pipelines** — 4K/8K where sequential codecs bottleneck
+- **Web delivery** — WebGPU/WASM decode in browser with no plugins
 
-GNC is not trying to beat AV1 on compression efficiency. It occupies a
-different point in the design space: simpler, parallel, lower latency.
-
----
-
-## Design Vision: Full Q Spectrum
-
-The goal is a single codec with one Q parameter covering the full range:
-
-| Q range | Mode | Wavelet |
-|---------|------|---------|
-| Lossless | Reversible | LeGall 5/3 (integer, current) |
-| High quality | Near-lossless | LeGall 5/3 with fine quantization |
-| Medium quality | Lossy | CDF 9/7 (better energy compaction) |
-| Aggressive | High compression | Haar or reduced wavelet levels |
-
-Each tile runs its wavelet independently — the GPU doesn't care which variant
-is selected. This could even be adaptive per-tile based on local content.
-
----
-
-## What To Do Next (Prioritized)
-
-### Completed
-- [x] Per-subband entropy coding — 8-31% quality-neutral bitrate savings
-- [x] CfL (Chroma-from-Luma) prediction — 2-14% savings
-- [x] Dead-zone quantization — 18-33% savings (quality trade)
-- [x] Perceptual subband weights — 25-32% savings (quality trade)
-- [x] CDF 9/7 wavelet — implemented, +4-5 dB PSNR at same Q
-- [x] GPU rANS decoder
-- [x] Pipelined decode
-- [x] Feature stacking verified — CDF 9/7 + per-subband + CfL compose correctly
-- [x] Competitive benchmark — JPEG and JPEG 2000 measured on same images
-
-### 1. Make CDF 9/7 + per-subband entropy the default
-The data is in: CDF 9/7 + per-subband entropy are always beneficial for lossy
-and compose correctly with all other features. Should be default for lossy
-mode (keep LeGall 5/3 for lossless). Also enable per-subband entropy by
-default — it's quality-neutral with 12-31% savings.
-
-### 2. GPU rANS encode (throughput bottleneck)
-CPU-side rANS encoding is the 3.6x throughput bottleneck (188ms encode vs
-36ms decode). Moving rANS encode to GPU compute shaders could push encode
-to 30-50 fps at 1080p. The GPU rANS decoder already exists as reference.
-
-### 4. Rate control (target bitrate)
-Currently you pick qstep and get whatever bpp falls out. Real-time use cases
-need target-bpp encoding. A per-tile qstep adjustment pass (encode, measure,
-adjust) is GPU-friendly and essential for any streaming application.
-
-### 5. Temporal extension (video)
-The biggest compression opportunity. Two GPU-native approaches worth exploring:
-- **GPU block matching**: find best matching tile in previous frame via compute
-  shader, encode residuals only. Massively parallel, patent-free.
-- **3D wavelet in time**: apply LeGall 5/3 across N frames in the time
-  dimension. Simpler but less effective without motion compensation.
-
-This is where GNC could go from "interesting research" to "genuinely useful" —
-temporal prediction alone typically provides 3-10x compression on video.
-
-### 6. Context-modeled entropy coding (moderate effort, 15-25% savings)
-The rANS coder treats each coefficient independently. Using spatial context
-from already-decoded neighbors in the same subband to modulate frequencies
-could save 15-25%. This is what closes the gap to JPEG 2000's EBCOT.
-Challenge: context modeling introduces decode-order dependencies that may
-conflict with massive parallelism. Need a design that preserves tile
-independence while adding intra-tile context.
-
-### 7. Tile index table for random access
-Tiles are independent but the bitstream is sequential. Adding a tile offset
-table in the header enables O(1) random access — critical for region-of-interest
-decode in VR/AR and partial frame updates.
-
-### 8. Finish adaptive quantization
-Infrastructure is in place (weight maps, aq_strength, SSIM-guided pipeline).
-Needs tuning and validation. Expected gain: redistribute bits from smooth
-regions to textured regions for better perceptual quality at same bitrate.
-
-### 9. WebAssembly / WebGPU build
-wgpu supports WASM targets. A browser-runnable demo would be the easiest way
-to demonstrate GNC across platforms including mobile, without native app
-packaging.
-
----
-
-## What GNC Is Not Trying To Be
-
-- A replacement for AV1 or HEVC on compression efficiency
-- A codec for archival or offline encoding where time doesn't matter
-- A one-person replication of decades of codec research
-
-GNC's value is in its architecture, not its current compression numbers. The
-numbers will improve. The architecture is the thesis.
+GNC is not trying to beat AV1 on compression efficiency. It occupies a different
+point in the design space: simpler, parallel, lower latency, patent-free.

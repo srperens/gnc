@@ -26,9 +26,14 @@ Modular pipeline with swappable stages:
 1. Color space conversion (YCoCg-R, integer-exact lossless path available)
 2. Transform (CDF 9/7 wavelet for lossy q=1-99, LeGall 5/3 for lossless q=100; 3-4 levels adaptive)
 3. Quantization (adaptive with perceptual subband weights, CfL chroma prediction at q=50-85, fused quantize+histogram shader)
-4. Entropy coding (GPU rANS per-subband, 32 interleaved streams per tile)
+4. Entropy coding — three backends:
+   - **Rice+ZRL** (fastest): 256 fully independent streams per tile, significance map + Golomb-Rice + zero-run-length
+   - **rANS** (default): 32 interleaved streams per tile, per-subband frequency tables
+   - **Bitplane**: block-based, fully parallel decode
+5. Video: I/P/B frames, half-pel motion estimation, hierarchical block matching, CBR/VBR rate control
+6. Container: GNV1 sequence format with frame index, keyframe seeking, error resilience (per-tile CRC-32)
 
-Shader source is in `src/shaders/*.wgsl`. Rust host code is in `src/encoder/` and `src/decoder/`.
+Shader source is in `src/shaders/*.wgsl` (32 shaders). Rust host code is in `src/encoder/` and `src/decoder/`.
 
 ## Platform Notes
 

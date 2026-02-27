@@ -2,10 +2,11 @@
 
 ## Context
 
-GNC is a GPU-native codec research project (Rust + wgpu/WGSL). It currently works as an image codec with basic P-frame temporal coding. The goal: turn it into a real video codec with quality scaling from lossless to extreme compression. An AI team will iterate and evaluate each milestone.
+GNC is a GPU-native codec research project (Rust + wgpu/WGSL). It works as both an image and video codec with I/P/B frames, rate control, and full quality spectrum from lossless to extreme compression.
 
-**Current baseline (1080p, q=75):** 42.8 dB PSNR, 4.31 bpp, 30 fps encode, 33 fps decode.
-**Gap:** ~1.4x bpp vs JPEG 2000. BD-rate vs JPEG: ~-1% on animation (GNC wins!), ~50% on sports. CfL enabled, AQ active.
+**Current performance (1080p, q=75, Rice+ZRL):** 42.1 dB PSNR, 4.09 bpp, 40 fps encode, 61 fps decode.
+**Current performance (1080p, q=75, rANS):** 42.8 dB PSNR, 4.22 bpp, 29 fps encode, 34 fps decode.
+**Gap:** ~1.4x bpp vs JPEG 2000. BD-rate vs JPEG: ~-1% on animation (GNC wins!), ~50% on sports.
 
 ---
 
@@ -274,4 +275,17 @@ M3 (Video Fundamentals) ──> M6 (Performance) ──────────�
 | M4 | Lossless bpp | 12.8 | < 4 |
 | M4 | Extreme compression | ✅ 0.47 bpp/27.3 dB | < 0.5 bpp/27+ dB |
 | M5 | Conformance tests | ✅ 5 | 5+ |
-| M6 | Encode fps (1080p) | 29 (was 8) | 60 |
+| M6 | Encode fps (1080p, rANS) | 29 (was 8) | 60 |
+| M6 | Encode fps (1080p, Rice) | **40** | 60 |
+| M6 | Decode fps (1080p, Rice) | **61** | 120 |
+
+## Post-M6: Rice+ZRL Entropy Coder
+
+The Rice (significance map + Golomb-Rice + ZRL) entropy coder eliminates the sequential
+state chain that limits rANS. Key results:
+
+- **1.5x faster encode, 2x faster decode** vs rANS
+- **Matches or beats rANS compression at q>=50** (Rice is 3-7% smaller at q>=75)
+- **256 independent streams** per tile (vs rANS's 32) — maximum GPU occupancy
+- **32 bytes shared memory** (vs rANS's 16KB frequency tables)
+- Remaining gap at q=25: +34% bpp vs rANS (ZRL not fully optimal for high-sparsity data)

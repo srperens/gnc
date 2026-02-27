@@ -2,43 +2,101 @@
 
 Research project exploring what video compression looks like when designed from scratch for GPU parallelism, rather than adapting CPU-era algorithms.
 
+**Rust + wgpu compute shaders (WGSL). Cross-platform: Metal, Vulkan, DX12, WebGPU/WASM. Patent-free.**
+
 ## Why
 
-Traditional codecs (H.264, HEVC, AV1) are shaped by decades of CPU constraints — sequential processing, complex prediction modes, intricate entropy coding. GPUs offer thousands of parallel threads but these codecs can't fully exploit them.
+Traditional codecs (H.264, HEVC, AV1) are shaped by decades of CPU constraints — sequential processing, complex prediction modes, intricate entropy coding with state chains. GPUs offer thousands of parallel threads, but these codecs can't exploit them.
 
-This project asks: if you start from zero with a GPU-first mindset, what do you end up with? Can brute-force parallelism and simpler per-thread logic compete with sophisticated sequential algorithms?
+GNC asks: if you start from zero with a GPU-first mindset, what do you end up with?
 
-## How
+The answer so far: tile-independent processing, fully parallel entropy coding (256 independent streams per tile), and wavelet transforms that map naturally to GPU workgroups. The result competes with JPEG on compression while encoding/decoding at 40-70 fps at 1080p.
 
-Everything runs as wgpu compute shaders (WGSL), targeting all backends — Metal, Vulkan, DX12, and WebGPU (WASM).
+## Current Results (1080p, bbb reference)
 
-The codec is a modular pipeline of swappable stages:
+| Quality | PSNR | BPP | Encode | Decode |
+|---------|------|-----|--------|--------|
+| q=25 (high compression) | 33.2 dB | 1.73 | 40 fps | 70 fps |
+| q=50 (balanced) | 37.5 dB | 2.42 | 42 fps | 61 fps |
+| q=75 (good quality) | 42.1 dB | 4.09 | 40 fps | 61 fps |
+| q=90 (high quality) | 49.2 dB | 8.96 | 41 fps | 66 fps |
+| q=100 (lossless) | inf | 12.8 | — | — |
 
-1. **Color space conversion** — RGB to YCoCg-R (lossless, integer-only)
-2. **Wavelet transform** — LeGall 5/3 lifting scheme, multi-level, tile-independent
-3. **Quantization** — Uniform scalar with optional dead zone
-4. **Entropy coding** — Per-tile rANS
+BD-rate vs JPEG: **~-1%** on animation content (GNC wins). ~+50% on high-motion sports content.
 
-Each tile is fully independent — no cross-tile dependencies. This gives parallelism and random access for free.
+## Architecture
 
-## Status
+Everything runs as wgpu compute shaders. The pipeline:
 
-Early research. The baseline pipeline works end-to-end with benchmarks.
+```
+RGB → YCoCg-R → Wavelet → Quantize → Entropy Code → Bitstream
+         ↕          ↕          ↕            ↕
+     (lossless   (CDF 9/7   (adaptive,   (Rice: 256
+      integer)   or 5/3)     CfL, AQ)    parallel streams)
+```
 
-| QStep | PSNR | BPP (3-level wavelet + rANS) |
-|---|---|---|
-| 4 | 46.2 dB | 2.70 |
-| 8 | 40.4 dB | 2.32 |
-| 16 | 34.5 dB | 1.93 |
+Each tile (256x256) is fully independent — no cross-tile dependencies. This gives parallelism, random access, and error resilience for free.
+
+### Pipeline stages
+
+1. **Color space** — YCoCg-R (integer-exact, lossless-capable)
+2. **Wavelet transform** — CDF 9/7 for lossy (q=1-99), LeGall 5/3 for lossless (q=100). 3-4 decomposition levels.
+3. **Quantization** — Uniform scalar with perceptual subband weights, dead zone, adaptive spatial weighting (SSIM-guided), and Chroma-from-Luma prediction (14-bit precision)
+4. **Entropy coding** — Rice (significance map + Golomb-Rice + ZRL), 256 independent streams per tile. Also: rANS (32 streams), bitplane coding.
+
+### Video features
+
+- **I/P/B frames** — motion-compensated prediction with half-pel bilinear interpolation
+- **Motion estimation** — hierarchical coarse-to-fine block matching (16x16, ±64px search)
+- **Rate control** — CBR and VBR modes with R-Q model
+- **Container** — GNV1 format with frame index table, keyframe seeking
+- **Error resilience** — per-tile CRC-32 checksums, corrupt tile detection and recovery
 
 ## Build & Run
 
 ```bash
 cargo build --release
-cargo run --release -- encode -i input.png -o output.gpuc
-cargo run --release -- decode -i output.gpuc -o output.png
-cargo run --release -- benchmark -i input.png
-cargo run --release -- sweep -i input.png
+```
+
+### Encode / decode a single image
+
+```bash
+gnc encode -i input.png -o output.gpuc -q 75
+gnc decode -i output.gpuc -o output.png
+```
+
+### Benchmark
+
+```bash
+gnc benchmark -i input.png -q 75              # default rANS entropy
+gnc benchmark -i input.png -q 75 --rice       # Rice entropy (faster)
+```
+
+### Rate-distortion curve
+
+```bash
+gnc rd-curve -i input.png                     # sweep q=10..100, output CSV
+gnc rd-curve -i input.png --compare-codecs    # also compare vs JPEG, JPEG 2000
+```
+
+### Encode / decode video sequence
+
+```bash
+gnc encode-sequence -i "frames/%04d.png" -o video.gnv -q 75 --keyframe-interval 8
+gnc decode-sequence -i video.gnv -o "output/%04d.png"
+gnc decode-sequence -i video.gnv -o "output/%04d.png" --seek 5.0  # seek to 5s
+```
+
+### Rate-controlled encoding
+
+```bash
+gnc encode-sequence -i "frames/%04d.png" -o video.gnv --bitrate 10M --rate-mode vbr
+```
+
+### Run tests
+
+```bash
+cargo test --release    # 112 tests: unit, regression, conformance
 ```
 
 ## Test Material
@@ -48,6 +106,84 @@ cd test_material && bash fetch_test_frames.sh
 ```
 
 Downloads representative broadcast frames from [Xiph.org](https://media.xiph.org/) (requires ffmpeg and curl).
+
+## Entropy Coders
+
+GNC has three entropy coding backends, all running as GPU compute shaders:
+
+| Coder | Streams/tile | Compression | Speed | Patent risk |
+|-------|-------------|-------------|-------|-------------|
+| **Rice+ZRL** (`--rice`) | 256 | Competitive with rANS | **1.5-2x faster** | None |
+| rANS (default) | 32 | Best at low bitrate | Baseline | Possible (MS patent) |
+| Bitplane (`--bitplane`) | Per-block | Moderate | Fast decode | None |
+
+Rice is the fastest because it eliminates the sequential state chain that limits rANS. Each of the 256 streams encodes independently — no shared state, no synchronization, minimal shared memory (32 bytes vs rANS's 16KB frequency tables).
+
+## Quality Spectrum
+
+Smooth, monotonic quality scaling from lossless to extreme compression:
+
+```
+q=100  Lossless     — bit-exact round-trip (LeGall 5/3 integer wavelet)
+q=90   High quality — 49 dB PSNR, near-transparent
+q=75   Production   — 42 dB PSNR, good general-purpose quality
+q=50   Balanced     — 37 dB PSNR, CfL + adaptive quantization
+q=25   Compressed   — 33 dB PSNR, broadcast-suitable
+q=5    Extreme      — 27 dB PSNR, 0.47 bpp (preview/thumbnail)
+```
+
+## WebGPU / WASM
+
+The full decoder compiles to WebAssembly (263 KB) and runs in browsers via WebGPU:
+
+```bash
+wasm-pack build --target web --release
+```
+
+Browser demo in `examples/web/index.html`.
+
+## Project Structure
+
+```
+src/
+├── lib.rs              Core types, quality_preset(), codec config
+├── main.rs             CLI (encode, decode, benchmark, rd-curve, ...)
+├── format.rs           Bitstream serialization (GP11 frame, GNV1 sequence)
+├── encoder/
+│   ├── pipeline.rs     Encoder orchestration
+│   ├── sequence.rs     Video sequence, B-frames, rate control
+│   ├── rice.rs         CPU Rice encoder/decoder (reference)
+│   ├── rice_gpu.rs     GPU Rice encoder/decoder
+│   ├── rans.rs         CPU rANS encoder/decoder
+│   ├── rans_gpu_encode.rs  GPU rANS encoder
+│   ├── motion.rs       Motion estimation and compensation
+│   ├── cfl.rs          Chroma-from-Luma prediction
+│   ├── adaptive.rs     Adaptive quantization
+│   └── ...
+├── decoder/
+│   ├── pipeline.rs     Decoder orchestration
+│   ├── frame_data.rs   Frame data upload
+│   └── gpu_work.rs     GPU dispatch
+├── shaders/            32 WGSL compute shaders
+│   ├── rice_encode.wgsl, rice_decode.wgsl
+│   ├── rans_encode.wgsl, rans_decode.wgsl
+│   ├── transform_97.wgsl, transform_53.wgsl
+│   ├── block_match.wgsl, motion_compensate.wgsl
+│   └── ...
+├── bench/              BD-rate, codec comparison, quality metrics
+└── experiments/        Experimental features
+
+tests/
+├── quality_regression.rs   Golden-baseline regression (q=25/50/75/90)
+├── conformance.rs          5 conformance bitstreams + corruption tests
+└── golden_baselines.toml   Reference PSNR/SSIM/bpp values
+```
+
+## Documentation
+
+- [`BITSTREAM_SPEC.md`](BITSTREAM_SPEC.md) — Complete bitstream format specification (GP11 frame, GNV1 sequence)
+- [`MILESTONES.md`](MILESTONES.md) — Development milestones and status (M1-M6)
+- [`RESEARCH_LOG.md`](RESEARCH_LOG.md) — Experiment log with hypotheses, results, analysis
 
 ## License
 

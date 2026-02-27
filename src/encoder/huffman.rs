@@ -19,9 +19,14 @@ pub const HUFFMAN_STREAMS_PER_TILE: usize = 256;
 /// Max output bytes per stream.
 pub const HUFFMAN_MAX_STREAM_BYTES: usize = 4096;
 
-/// Maximum Huffman alphabet size. Symbols 0..254 are magnitudes (|val|-1).
-/// Symbol 255 is an escape code — followed by raw 12-bit magnitude.
-pub const HUFFMAN_MAX_ALPHABET: usize = 256;
+/// Huffman alphabet size. Symbols 0..(N-2) are direct magnitudes (|val|-1).
+/// Symbol (N-1) is an escape code — followed by raw 12-bit magnitude.
+/// 32 symbols covers >95% of wavelet magnitudes directly while keeping
+/// codebook headers small (32 bytes/group vs 256 bytes/group).
+pub const HUFFMAN_ALPHABET_SIZE: usize = 32;
+
+/// The escape symbol index (last symbol in alphabet).
+pub const HUFFMAN_ESCAPE_SYM: usize = HUFFMAN_ALPHABET_SIZE - 1;
 
 /// Maximum code length in bits. Prevents pathological codebooks.
 pub const HUFFMAN_MAX_CODE_LEN: u8 = 15;
@@ -486,14 +491,19 @@ pub fn huffman_encode_tile(coefficients: &[i32], tile_size: u32, num_levels: u32
     let symbols_per_stream = num_coefficients / HUFFMAN_STREAMS_PER_TILE;
 
     // Phase 1: Build magnitude histograms per subband group
-    let mut group_freqs: Vec<Vec<u32>> = vec![vec![0u32; HUFFMAN_MAX_ALPHABET]; num_groups];
+    let max_direct = HUFFMAN_ESCAPE_SYM; // magnitudes 0..max_direct-1 are direct, rest use escape
+    let mut group_freqs: Vec<Vec<u32>> = vec![vec![0u32; HUFFMAN_ALPHABET_SIZE]; num_groups];
     for (idx, &coeff) in coefficients.iter().enumerate() {
         if coeff != 0 {
             let y = (idx / tile_size as usize) as u32;
             let x = (idx % tile_size as usize) as u32;
             let g = compute_subband_group(x, y, tile_size, num_levels);
-            let mag = (coeff.unsigned_abs() - 1).min(255) as usize;
-            group_freqs[g][mag] += 1;
+            let mag = (coeff.unsigned_abs() - 1) as usize;
+            if mag < max_direct {
+                group_freqs[g][mag] += 1;
+            } else {
+                group_freqs[g][HUFFMAN_ESCAPE_SYM] += 1;
+            }
         }
     }
 
@@ -571,22 +581,18 @@ pub fn huffman_encode_tile(coefficients: &[i32], tile_size: u32, num_levels: u32
                 let x = (coeff_idx % tile_size as usize) as u32;
                 let g = compute_subband_group(x, y, tile_size, num_levels);
 
-                let sym = magnitude.min(255) as usize;
+                let sym = if (magnitude as usize) < HUFFMAN_ESCAPE_SYM {
+                    magnitude as usize
+                } else {
+                    HUFFMAN_ESCAPE_SYM
+                };
                 let cb = &codebooks[g];
 
-                if cb.code_lengths[sym] > 0 {
-                    writer.write_bits(cb.codewords[sym], cb.code_lengths[sym]);
-                } else {
-                    // Symbol not in codebook (shouldn't happen with proper histogram)
-                    // Fall back to escape
-                    if cb.code_lengths.len() > 255 && cb.code_lengths[255] > 0 {
-                        writer.write_bits(cb.codewords[255], cb.code_lengths[255]);
-                    }
-                    writer.write_bits(magnitude.min(4095), 12);
-                }
+                // Write Huffman code for symbol
+                writer.write_bits(cb.codewords[sym], cb.code_lengths[sym]);
 
-                // Escape: if original magnitude >= 255, emit raw 12-bit value
-                if magnitude >= 255 {
+                // Escape: append raw 12-bit magnitude for large values
+                if sym == HUFFMAN_ESCAPE_SYM {
                     writer.write_bits(magnitude.min(4095), 12);
                 }
 
@@ -679,7 +685,7 @@ pub fn huffman_decode_tile(tile: &HuffmanTile) -> Vec<i32> {
                     sym = decode_slow(&mut reader, code_lengths_g, &codebooks[g].0);
                 }
 
-                let magnitude = if sym >= 255 {
+                let magnitude = if sym >= HUFFMAN_ESCAPE_SYM as u32 {
                     // Escape code: read raw 12-bit magnitude
                     reader.read_bits(12)
                 } else {
@@ -762,7 +768,7 @@ pub fn deserialize_tile_huffman(data: &[u8]) -> (HuffmanTile, usize) {
     for _ in 0..num_groups {
         let effective_len = data[pos] as usize;
         pos += 1;
-        let mut cl = vec![0u8; HUFFMAN_MAX_ALPHABET];
+        let mut cl = vec![0u8; HUFFMAN_ALPHABET_SIZE];
         cl[..effective_len].copy_from_slice(&data[pos..pos + effective_len]);
         pos += effective_len;
         code_lengths.push(cl);

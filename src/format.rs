@@ -539,7 +539,7 @@ pub fn substitute_tiles(frame: &mut crate::CompressedFrame, tile_indices: &[usiz
                         tile_size: t.tile_size,
                         num_levels: t.num_levels,
                         num_groups: t.num_groups,
-                        code_lengths: vec![vec![0u8; huffman::HUFFMAN_MAX_ALPHABET]; t.num_groups as usize],
+                        code_lengths: vec![vec![0u8; huffman::HUFFMAN_ALPHABET_SIZE]; t.num_groups as usize],
                         k_zrl_values: vec![0; t.num_groups as usize],
                         stream_lengths: vec![0; huffman::HUFFMAN_STREAMS_PER_TILE],
                         stream_data: Vec::new(),

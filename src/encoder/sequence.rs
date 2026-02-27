@@ -77,7 +77,6 @@ impl EncoderPipeline {
         let padded_w = info.padded_width();
         let padded_h = info.padded_height();
         let padded_pixels = (padded_w * padded_h) as usize;
-        let plane_size = (padded_pixels * std::mem::size_of::<f32>()) as u64;
 
         // Ensure cached buffers (including gpu_ref_planes) exist for this resolution
         self.ensure_cached(ctx, padded_w, padded_h, width, height);
@@ -155,6 +154,7 @@ impl EncoderPipeline {
                     &info,
                     &frame_config,
                     prev_mv_buf.as_ref().or(Some(&zero_mv_buf)),
+                    false,
                 );
                 prev_mv_buf = Some(new_mv_buf);
                 if let Some(ref mut rc) = rate_ctrl {
@@ -176,10 +176,10 @@ impl EncoderPipeline {
                 let group_start = display_idx + g * group_size;
                 let p_display = group_start + b_count; // P-frame is last in display order
 
-                // 1. Save current reference as past anchor
-                self.copy_ref_to_bwd_ref(ctx, plane_size);
-
-                // 2. Encode P-frame anchor (updates gpu_ref_planes to decoded P)
+                // 1+2. Encode P-frame anchor with save_bwd_ref=true: copies
+                // current ref → bwd_ref at the START of the same command encoder,
+                // then does ME/MC/encode/local-decode. This eliminates a separate
+                // GPU submit for the reference copy.
                 let p_config = if let Some(ref rc) = rate_ctrl {
                     let mut cfg = config.clone();
                     cfg.quantization_step = rc.estimate_qstep();
@@ -198,6 +198,7 @@ impl EncoderPipeline {
                     &info,
                     &p_config,
                     prev_mv_buf.as_ref().or(Some(&zero_mv_buf)),
+                    true,
                 );
                 prev_mv_buf = Some(new_mv_buf);
                 if let Some(ref mut rc) = rate_ctrl {
@@ -271,6 +272,7 @@ impl EncoderPipeline {
                     &info,
                     &p_config,
                     prev_mv_buf.as_ref().or(Some(&zero_mv_buf)),
+                    false,
                 );
                 prev_mv_buf = Some(new_mv_buf);
                 if let Some(ref mut rc) = rate_ctrl {
@@ -481,6 +483,12 @@ impl EncoderPipeline {
     /// The `mv_buffer` can be passed as `predictor_mvs` to the next P-frame for temporal
     /// MV prediction (skip coarse search, only fine-refine around the predicted MV).
     #[allow(clippy::too_many_arguments)]
+    /// Encode a P-frame.
+    ///
+    /// `save_bwd_ref`: when true, copies gpu_ref_planes → gpu_bwd_ref_planes at
+    /// the start of the command encoder (before ME overwrites anything). This folds
+    /// the reference copy into the same GPU submission, eliminating a separate submit.
+    #[allow(clippy::too_many_arguments)]
     fn encode_pframe(
         &mut self,
         ctx: &GpuContext,
@@ -493,6 +501,7 @@ impl EncoderPipeline {
         info: &FrameInfo,
         config: &CodecConfig,
         predictor_mvs: Option<&wgpu::Buffer>,
+        save_bwd_ref: bool,
     ) -> (CompressedFrame, wgpu::Buffer) {
         let plane_size = (padded_pixels * std::mem::size_of::<f32>()) as u64;
 
@@ -535,7 +544,20 @@ impl EncoderPipeline {
                     label: Some("pf_batch_all"),
                 });
 
-            // Phase 0: GPU padding (raw → padded, edge-replicate)
+            // Phase 0a: Copy ref planes to bwd_ref if requested (for B-frame group)
+            if save_bwd_ref {
+                for p in 0..3 {
+                    cmd.copy_buffer_to_buffer(
+                        &bufs.gpu_ref_planes[p],
+                        0,
+                        &bufs.gpu_bwd_ref_planes[p],
+                        0,
+                        plane_size,
+                    );
+                }
+            }
+
+            // Phase 0b: GPU padding (raw → padded, edge-replicate)
             self.dispatch_gpu_pad_cached(ctx, &mut cmd, padded_w, padded_h);
 
             // Phase 1: Preprocess + ME + MC + transform + quantize (all 3 planes)
@@ -771,6 +793,17 @@ impl EncoderPipeline {
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("pf_preprocess_me"),
                 });
+            if save_bwd_ref {
+                for p in 0..3 {
+                    cmd.copy_buffer_to_buffer(
+                        &bufs.gpu_ref_planes[p],
+                        0,
+                        &bufs.gpu_bwd_ref_planes[p],
+                        0,
+                        plane_size,
+                    );
+                }
+            }
             self.dispatch_gpu_pad_cached(ctx, &mut cmd, padded_w, padded_h);
             self.color.dispatch(
                 ctx,
@@ -991,6 +1024,7 @@ impl EncoderPipeline {
     ///
     /// Optimized: GPU buffers used directly for MC (no readback/re-upload roundtrip).
     /// Bidir data (fwd MVs, bwd MVs, block modes) read back in single batched poll.
+    ///
     #[allow(clippy::too_many_arguments)]
     fn encode_bframe(
         &mut self,
@@ -1409,26 +1443,6 @@ impl EncoderPipeline {
                 block_modes: Some(block_modes),
             }),
         }, fwd_mv_buf, bwd_mv_buf)
-    }
-
-    /// Copy gpu_ref_planes → gpu_bwd_ref_planes (used before encoding B-frames).
-    fn copy_ref_to_bwd_ref(&self, ctx: &GpuContext, plane_size: u64) {
-        let bufs = self.cached.as_ref().unwrap();
-        let mut cmd = ctx
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("copy_ref_to_bwd"),
-            });
-        for p in 0..3 {
-            cmd.copy_buffer_to_buffer(
-                &bufs.gpu_ref_planes[p],
-                0,
-                &bufs.gpu_bwd_ref_planes[p],
-                0,
-                plane_size,
-            );
-        }
-        ctx.queue.submit(Some(cmd.finish()));
     }
 
     /// Swap gpu_ref_planes ↔ gpu_bwd_ref_planes at the Rust level (zero GPU cost).

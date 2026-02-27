@@ -2,9 +2,13 @@
 // One workgroup (256 threads) per 16x16 block.
 //
 // Uses coarse-to-fine search for both forward and backward references:
-//   Phase 1: Coarse forward search with subsampled 4×4 SAD, then fine ±4 refinement.
-//   Phase 2: Coarse backward search with subsampled 4×4 SAD, then fine ±4 refinement.
-//   Phase 3: Thread 0 picks best mode (fwd/bwd/bidir) and does half-pel refinement.
+//   Phase 1:  Coarse forward search with subsampled 4×4 SAD, then fine ±4 refinement.
+//   Phase 2:  Coarse backward search with subsampled 4×4 SAD, then fine ±4 refinement.
+//   Phase 3a: Parallel bidir SAD — all 256 threads, 1 pixel each, sum-reduced.
+//   Phase 3b: Thread 0 picks best mode (fwd/bwd/bidir), broadcasts via shared memory.
+//   Phase 3c: 8 threads do forward half-pel refinement (modes 0,2).
+//   Phase 3d: 8 threads do backward half-pel refinement (modes 1,2; uses refined fwd MV).
+//   Phase 3e: Thread 0 writes results.
 //
 // Note: WGSL does not allow passing storage pointers as function parameters,
 // so reference accesses are inlined where needed.
@@ -353,31 +357,56 @@ fn main(
     final_bwd_sad = shared_sad[0];
     workgroupBarrier();
 
-    // ========== Phase 3: Mode selection + half-pel refinement (thread 0 only) ==========
-    if tid == 0u {
-        // Compute bidirectional SAD: current - (fwd + bwd) / 2
-        var bidir_sad: u32 = 0xFFFFFFFFu;
-        let fwd_x = i32(block_origin_x) + final_fwd_dx;
-        let fwd_y = i32(block_origin_y) + final_fwd_dy;
-        let bwd_x = i32(block_origin_x) + final_bwd_dx;
-        let bwd_y = i32(block_origin_y) + final_bwd_dy;
+    // ========== Phase 3a: Parallel bidir SAD computation (all 256 threads) ==========
+    // 16x16 = 256 pixels; thread tid handles pixel (tid % 16, tid / 16).
+    // This replaces the old serial loop on thread 0 (256 iterations -> 1 per thread).
+    {
+        let px = tid % params.block_size;
+        let py = tid / params.block_size;
 
-        if fwd_x >= 0 && fwd_y >= 0 && fwd_x + bs <= w && fwd_y + bs <= h &&
-           bwd_x >= 0 && bwd_y >= 0 && bwd_x + bs <= w && bwd_y + bs <= h {
-            bidir_sad = 0u;
-            for (var py = 0u; py < params.block_size; py++) {
-                for (var px = 0u; px < params.block_size; px++) {
-                    let cur_idx = (block_origin_y + py) * params.width + block_origin_x + px;
-                    let f_idx = u32(fwd_y + i32(py)) * params.width + u32(fwd_x + i32(px));
-                    let b_idx = u32(bwd_y + i32(py)) * params.width + u32(bwd_x + i32(px));
-                    let pred = (reference_fwd_y[f_idx] + reference_bwd_y[b_idx]) * 0.5;
-                    let diff = current_y[cur_idx] - pred;
-                    bidir_sad += u32(abs(diff));
-                }
+        var pixel_diff: u32 = 0u;
+        if px < params.block_size && py < params.block_size {
+            let fwd_ref_x = i32(block_origin_x) + final_fwd_dx;
+            let fwd_ref_y = i32(block_origin_y) + final_fwd_dy;
+            let bwd_ref_x = i32(block_origin_x) + final_bwd_dx;
+            let bwd_ref_y = i32(block_origin_y) + final_bwd_dy;
+
+            // Both references must be fully in-bounds for bidir to be valid
+            if fwd_ref_x >= 0 && fwd_ref_y >= 0 &&
+               fwd_ref_x + bs <= w && fwd_ref_y + bs <= h &&
+               bwd_ref_x >= 0 && bwd_ref_y >= 0 &&
+               bwd_ref_x + bs <= w && bwd_ref_y + bs <= h {
+                let cur_idx = (block_origin_y + py) * params.width + block_origin_x + px;
+                let f_idx = u32(fwd_ref_y + i32(py)) * params.width + u32(fwd_ref_x + i32(px));
+                let b_idx = u32(bwd_ref_y + i32(py)) * params.width + u32(bwd_ref_x + i32(px));
+                let pred = (reference_fwd_y[f_idx] + reference_bwd_y[b_idx]) * 0.5;
+                let diff = current_y[cur_idx] - pred;
+                pixel_diff = u32(abs(diff));
+            } else {
+                // Out of bounds: poison with large per-pixel value so bidir loses
+                pixel_diff = 0xFFFFu;
             }
         }
 
-        // Pick best mode: 0=fwd, 1=bwd, 2=bidir
+        shared_sad[tid] = pixel_diff;
+        workgroupBarrier();
+
+        // Sum reduction across 256 threads -> shared_sad[0] = bidir_sad
+        for (var stride = 128u; stride > 0u; stride >>= 1u) {
+            if tid < stride {
+                shared_sad[tid] += shared_sad[tid + stride];
+            }
+            workgroupBarrier();
+        }
+    }
+
+    let bidir_sad = shared_sad[0];
+    workgroupBarrier();
+
+    // ========== Phase 3b: Mode selection (thread 0), broadcast to all ==========
+    // Layout: shared_mv[0]=mode, shared_mv[1]=packed fwd MV, shared_mv[2]=packed bwd MV
+    //         shared_sad[0]=best_total_sad
+    if tid == 0u {
         var best_mode: u32 = 0u;
         var best_total_sad = final_fwd_sad;
         if final_bwd_sad < best_total_sad {
@@ -389,101 +418,227 @@ fn main(
             best_mode = 2u;
         }
 
-        // Convert winning integer MVs to half-pel units
-        var hp_fwd_dx = final_fwd_dx * 2;
-        var hp_fwd_dy = final_fwd_dy * 2;
-        var hp_bwd_dx = final_bwd_dx * 2;
-        var hp_bwd_dy = final_bwd_dy * 2;
+        shared_mv[0] = best_mode;
+        shared_mv[1] = pack_mv(final_fwd_dx, final_fwd_dy);
+        shared_mv[2] = pack_mv(final_bwd_dx, final_bwd_dy);
+        shared_sad[0] = best_total_sad;
+    }
+    workgroupBarrier();
 
-        // Half-pel refinement for forward MV
-        if best_mode == 0u || best_mode == 2u {
-            var hp_best_sad = best_total_sad;
-            let base_fx2 = final_fwd_dx * 2;
-            let base_fy2 = final_fwd_dy * 2;
-            for (var offy = -1; offy <= 1; offy++) {
-                for (var offx = -1; offx <= 1; offx++) {
-                    if offx == 0 && offy == 0 { continue; }
-                    let test_fx2 = base_fx2 + offx;
-                    let test_fy2 = base_fy2 + offy;
+    let best_mode = shared_mv[0];
+    let mode_fwd_dx = unpack_dx(shared_mv[1]);
+    let mode_fwd_dy = unpack_dy(shared_mv[1]);
+    let mode_bwd_dx = unpack_dx(shared_mv[2]);
+    let mode_bwd_dy = unpack_dy(shared_mv[2]);
+    let mode_sad = shared_sad[0];
+    workgroupBarrier();
 
-                    var test_sad: u32 = 0u;
-                    for (var py = 0u; py < params.block_size; py++) {
-                        for (var px = 0u; px < params.block_size; px++) {
-                            let cur_idx = (block_origin_y + py) * params.width + block_origin_x + px;
-                            let rx2 = i32(block_origin_x + px) * 2 + test_fx2;
-                            let ry2 = i32(block_origin_y + py) * 2 + test_fy2;
-                            let fwd_val = sample_hp_fwd(rx2, ry2, params.width, params.height);
+    // Integer MVs in half-pel units (starting points for refinement)
+    let center_fwd_hx = mode_fwd_dx * 2;
+    let center_fwd_hy = mode_fwd_dy * 2;
+    let center_bwd_hx = mode_bwd_dx * 2;
+    let center_bwd_hy = mode_bwd_dy * 2;
 
-                            var pred: f32;
-                            if best_mode == 0u {
-                                pred = fwd_val;
-                            } else {
-                                let bx2 = i32(block_origin_x + px) * 2 + hp_bwd_dx;
-                                let by2 = i32(block_origin_y + py) * 2 + hp_bwd_dy;
-                                let bwd_val = sample_hp_bwd(bx2, by2, params.width, params.height);
-                                pred = (fwd_val + bwd_val) * 0.5;
-                            }
-                            let diff = current_y[cur_idx] - pred;
-                            test_sad += u32(abs(diff));
+    // ========== Phase 3c: Forward half-pel refinement (8 threads + center) ==========
+    // Active for mode 0 (fwd-only) and mode 2 (bidir).
+    // For bidir, predictor = (hp_fwd_sample + integer_bwd_sample) / 2.
+
+    var hp_fwd_dx = center_fwd_hx;
+    var hp_fwd_dy = center_fwd_hy;
+    var hp_fwd_sad = mode_sad;
+
+    if best_mode == 0u || best_mode == 2u {
+        var my_hp_sad: u32 = 0xFFFFFFFFu;
+        var my_hp_dx: i32 = center_fwd_hx;
+        var my_hp_dy: i32 = center_fwd_hy;
+
+        if tid < 8u {
+            // 8 half-pel neighbours (exclude center)
+            var off_x: i32 = 0;
+            var off_y: i32 = 0;
+            switch tid {
+                case 0u: { off_x = -1; off_y = -1; }
+                case 1u: { off_x =  0; off_y = -1; }
+                case 2u: { off_x =  1; off_y = -1; }
+                case 3u: { off_x = -1; off_y =  0; }
+                case 4u: { off_x =  1; off_y =  0; }
+                case 5u: { off_x = -1; off_y =  1; }
+                case 6u: { off_x =  0; off_y =  1; }
+                case 7u: { off_x =  1; off_y =  1; }
+                default: {}
+            }
+
+            let test_hx = center_fwd_hx + off_x;
+            let test_hy = center_fwd_hy + off_y;
+
+            // Bounds check in half-pel coordinate space
+            let ref_base_hx = i32(block_origin_x) * 2 + test_hx;
+            let ref_base_hy = i32(block_origin_y) * 2 + test_hy;
+            var valid = true;
+            if ref_base_hx < -1 || ref_base_hy < -1 ||
+               ref_base_hx + bs * 2 > w * 2 + 1 ||
+               ref_base_hy + bs * 2 > h * 2 + 1 {
+                valid = false;
+            }
+
+            if valid {
+                var sad: u32 = 0u;
+                for (var py = 0u; py < params.block_size; py++) {
+                    for (var px = 0u; px < params.block_size; px++) {
+                        let cur_idx = (block_origin_y + py) * params.width + block_origin_x + px;
+                        let rhx = i32(block_origin_x + px) * 2 + test_hx;
+                        let rhy = i32(block_origin_y + py) * 2 + test_hy;
+                        let fwd_val = sample_hp_fwd(rhx, rhy, params.width, params.height);
+
+                        var pred: f32;
+                        if best_mode == 0u {
+                            pred = fwd_val;
+                        } else {
+                            // Bidir: pair with integer-pel backward reference
+                            let bx2 = i32(block_origin_x + px) * 2 + center_bwd_hx;
+                            let by2 = i32(block_origin_y + py) * 2 + center_bwd_hy;
+                            let bwd_val = sample_hp_bwd(bx2, by2, params.width, params.height);
+                            pred = (fwd_val + bwd_val) * 0.5;
                         }
-                    }
-                    if test_sad < hp_best_sad {
-                        hp_best_sad = test_sad;
-                        hp_fwd_dx = test_fx2;
-                        hp_fwd_dy = test_fy2;
+                        let diff = current_y[cur_idx] - pred;
+                        sad += u32(abs(diff));
                     }
                 }
+                my_hp_sad = sad;
+                my_hp_dx = test_hx;
+                my_hp_dy = test_hy;
             }
-            best_total_sad = hp_best_sad;
         }
 
-        // Half-pel refinement for backward MV
-        if best_mode == 1u || best_mode == 2u {
-            var hp_best_sad = best_total_sad;
-            let base_bx2 = final_bwd_dx * 2;
-            let base_by2 = final_bwd_dy * 2;
-            for (var offy = -1; offy <= 1; offy++) {
-                for (var offx = -1; offx <= 1; offx++) {
-                    if offx == 0 && offy == 0 { continue; }
-                    let test_bx2 = base_bx2 + offx;
-                    let test_by2 = base_by2 + offy;
+        // Thread 8: integer-pel center (the "no half-pel refinement" baseline)
+        if tid == 8u {
+            my_hp_sad = mode_sad;
+            my_hp_dx = center_fwd_hx;
+            my_hp_dy = center_fwd_hy;
+        }
 
-                    var test_sad: u32 = 0u;
-                    for (var py = 0u; py < params.block_size; py++) {
-                        for (var px = 0u; px < params.block_size; px++) {
-                            let cur_idx = (block_origin_y + py) * params.width + block_origin_x + px;
-                            let rx2 = i32(block_origin_x + px) * 2 + test_bx2;
-                            let ry2 = i32(block_origin_y + py) * 2 + test_by2;
-                            let bwd_val = sample_hp_bwd(rx2, ry2, params.width, params.height);
+        // Slots 0-8 hold candidates; rest set to MAX so reduction works correctly
+        if tid <= 8u {
+            shared_sad[tid] = my_hp_sad;
+            shared_mv[tid] = pack_mv(my_hp_dx, my_hp_dy);
+        } else {
+            shared_sad[tid] = 0xFFFFFFFFu;
+        }
+        workgroupBarrier();
+        min_reduce(tid);
 
-                            var pred: f32;
-                            if best_mode == 1u {
-                                pred = bwd_val;
-                            } else {
-                                let fx2 = i32(block_origin_x + px) * 2 + hp_fwd_dx;
-                                let fy2 = i32(block_origin_y + py) * 2 + hp_fwd_dy;
-                                let fwd_val = sample_hp_fwd(fx2, fy2, params.width, params.height);
-                                pred = (fwd_val + bwd_val) * 0.5;
-                            }
-                            let diff = current_y[cur_idx] - pred;
-                            test_sad += u32(abs(diff));
+        hp_fwd_dx = unpack_dx(shared_mv[0]);
+        hp_fwd_dy = unpack_dy(shared_mv[0]);
+        hp_fwd_sad = shared_sad[0];
+    }
+    workgroupBarrier();
+
+    // ========== Phase 3d: Backward half-pel refinement (8 threads + center) ==========
+    // Active for mode 1 (bwd-only) and mode 2 (bidir).
+    // For bidir, predictor = (refined_fwd_hp_sample + hp_bwd_sample) / 2.
+
+    var hp_bwd_dx = center_bwd_hx;
+    var hp_bwd_dy = center_bwd_hy;
+
+    if best_mode == 1u || best_mode == 2u {
+        var my_hp_sad: u32 = 0xFFFFFFFFu;
+        var my_hp_dx: i32 = center_bwd_hx;
+        var my_hp_dy: i32 = center_bwd_hy;
+
+        // Baseline SAD for center (bwd offset=0): for bwd-only it's mode_sad;
+        // for bidir it's hp_fwd_sad (refined fwd + integer bwd = same predictor).
+        var center_sad_for_bwd: u32;
+        if best_mode == 1u {
+            center_sad_for_bwd = mode_sad;
+        } else {
+            center_sad_for_bwd = hp_fwd_sad;
+        }
+
+        if tid < 8u {
+            var off_x: i32 = 0;
+            var off_y: i32 = 0;
+            switch tid {
+                case 0u: { off_x = -1; off_y = -1; }
+                case 1u: { off_x =  0; off_y = -1; }
+                case 2u: { off_x =  1; off_y = -1; }
+                case 3u: { off_x = -1; off_y =  0; }
+                case 4u: { off_x =  1; off_y =  0; }
+                case 5u: { off_x = -1; off_y =  1; }
+                case 6u: { off_x =  0; off_y =  1; }
+                case 7u: { off_x =  1; off_y =  1; }
+                default: {}
+            }
+
+            let test_hx = center_bwd_hx + off_x;
+            let test_hy = center_bwd_hy + off_y;
+
+            // Bounds check in half-pel coordinate space
+            let ref_base_hx = i32(block_origin_x) * 2 + test_hx;
+            let ref_base_hy = i32(block_origin_y) * 2 + test_hy;
+            var valid = true;
+            if ref_base_hx < -1 || ref_base_hy < -1 ||
+               ref_base_hx + bs * 2 > w * 2 + 1 ||
+               ref_base_hy + bs * 2 > h * 2 + 1 {
+                valid = false;
+            }
+
+            if valid {
+                var sad: u32 = 0u;
+                for (var py = 0u; py < params.block_size; py++) {
+                    for (var px = 0u; px < params.block_size; px++) {
+                        let cur_idx = (block_origin_y + py) * params.width + block_origin_x + px;
+                        let rx2 = i32(block_origin_x + px) * 2 + test_hx;
+                        let ry2 = i32(block_origin_y + py) * 2 + test_hy;
+                        let bwd_val = sample_hp_bwd(rx2, ry2, params.width, params.height);
+
+                        var pred: f32;
+                        if best_mode == 1u {
+                            pred = bwd_val;
+                        } else {
+                            // Bidir: pair with the REFINED forward half-pel MV
+                            let fx2 = i32(block_origin_x + px) * 2 + hp_fwd_dx;
+                            let fy2 = i32(block_origin_y + py) * 2 + hp_fwd_dy;
+                            let fwd_val = sample_hp_fwd(fx2, fy2, params.width, params.height);
+                            pred = (fwd_val + bwd_val) * 0.5;
                         }
-                    }
-                    if test_sad < hp_best_sad {
-                        hp_best_sad = test_sad;
-                        hp_bwd_dx = test_bx2;
-                        hp_bwd_dy = test_by2;
+                        let diff = current_y[cur_idx] - pred;
+                        sad += u32(abs(diff));
                     }
                 }
+                my_hp_sad = sad;
+                my_hp_dx = test_hx;
+                my_hp_dy = test_hy;
             }
         }
 
-        // Write results
+        // Thread 8: center (no backward half-pel refinement)
+        if tid == 8u {
+            my_hp_sad = center_sad_for_bwd;
+            my_hp_dx = center_bwd_hx;
+            my_hp_dy = center_bwd_hy;
+        }
+
+        if tid <= 8u {
+            shared_sad[tid] = my_hp_sad;
+            shared_mv[tid] = pack_mv(my_hp_dx, my_hp_dy);
+        } else {
+            shared_sad[tid] = 0xFFFFFFFFu;
+        }
+        workgroupBarrier();
+        min_reduce(tid);
+
+        hp_bwd_dx = unpack_dx(shared_mv[0]);
+        hp_bwd_dy = unpack_dy(shared_mv[0]);
+    }
+    workgroupBarrier();
+
+    // ========== Phase 3e: Write final results (thread 0) ==========
+    if tid == 0u {
         fwd_motion_vectors[block_idx * 2u] = hp_fwd_dx;
         fwd_motion_vectors[block_idx * 2u + 1u] = hp_fwd_dy;
         bwd_motion_vectors[block_idx * 2u] = hp_bwd_dx;
         bwd_motion_vectors[block_idx * 2u + 1u] = hp_bwd_dy;
         block_modes[block_idx] = best_mode;
-        sad_values[block_idx] = best_total_sad;
+        sad_values[block_idx] = shared_sad[0];
     }
 }

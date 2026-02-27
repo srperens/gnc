@@ -57,7 +57,7 @@ Two entropy coders with different tradeoffs. Rice+ZRL is faster; rANS compresses
 **Key GPU architecture insight:** On M1, shared memory occupancy dominates performance. 16KB shared memory = 2 workgroups/core (full occupancy). Exceeding 16KB halves occupancy → ~20% regression. This is why Rice (< 1KB shared) and Huffman (8KB shared) are fast, while rANS (16KB+) is slower. ALU cost (e.g. integer multiply vs division) is negligible by comparison.
 
 **Known gaps:**
-- Sequence encode 15.8 fps Rice / 13.4 fps rANS (target: 30+ fps) — ME ±32 (P) / ±16 (B), temporal MV prediction, GPU Rice in P/B pipeline
+- Sequence encode 18.1 fps Rice (target: 30+ fps) — ME ±32 (P) / ±16 (B), temporal MV prediction, GPU Rice in P/B pipeline, parallelized bidir half-pel
 - Single-frame encode 40 fps Rice, 30 fps rANS (target: 60 fps)
 - Rice at q=25 is +33% bpp vs rANS (per-subband k_zrl implemented, gap is structural)
 - Rice q=100 is near-lossless (56 dB) not bit-exact — only rANS supports true lossless

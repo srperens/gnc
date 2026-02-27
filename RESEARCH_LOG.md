@@ -4,6 +4,44 @@
 
 ---
 
+## 2026-02-27: Parallelize bidir ME half-pel refinement
+
+### Hypothesis
+B-frame ME takes 87ms vs P-frame ME 17ms (5x slower). Profiling reveals Phase 3 (mode selection + half-pel refinement) runs entirely on thread 0 — 4352 serial memory reads per block while 255 threads sit idle. Parallelizing this should dramatically reduce B-frame ME time.
+
+### Implementation
+Rewrote Phase 3 of `block_match_bidir.wgsl` into 5 sub-phases:
+- **3a**: Parallel bidir SAD — all 256 threads compute 1 pixel each, sum-reduce
+- **3b**: Mode selection on thread 0, broadcast via shared memory
+- **3c**: Forward half-pel — 8 threads test 8 half-pel candidates (matches P-frame pattern)
+- **3d**: Backward half-pel — 8 threads, uses refined forward MV for bidir mode
+- **3e**: Thread 0 writes results
+
+### Results (bbb_1080p, q=50, ki=8)
+
+| Component | Before | After | Change |
+|-----------|--------|-------|--------|
+| B ME (no predictor) | 91ms | 44ms | **-52%** |
+| B ME (w/ predictor) | 83ms | 36ms | **-57%** |
+| 10-frame I+P+B fps | 13.2 | 18.1 | **+37%** |
+
+Quality identical: 37.79 dB, 1.58 bpp.
+
+### Analysis
+1. Serial thread-0 phase was the dominant cost. Parallelizing bidir SAD (256→1 read per thread) and half-pel (thread-0-serial → 8-thread parallel) eliminates the bottleneck.
+2. With predictor, B ME is now 36ms — 2.1x P-frame ME (17ms), close to the 2x theoretical minimum for bidirectional search.
+3. Non-ME B-frame work (17ms) unchanged — correctly identified as non-bottleneck.
+
+---
+
+## 2026-02-27: Make Rice the default entropy coder
+
+Rice is now the default entropy coder for all quality presets (q=1-99). rANS only used for q=100 (lossless, bit-exact roundtrip). CLI flags flipped: `--rice` removed, `--rans` added as opt-in.
+
+Rationale: Rice is patent-free (rANS has exposure to US11234023B2), faster (256 independent streams vs 32 with state chain), and competitive compression at q≥50. Golden baselines updated.
+
+---
+
 ## 2026-02-27: GPU Rice entropy for P/B frame sequence encode
 
 ### Hypothesis

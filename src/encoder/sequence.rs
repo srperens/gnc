@@ -101,6 +101,7 @@ impl EncoderPipeline {
             };
 
             if is_keyframe {
+                let _t_iframe = std::time::Instant::now();
                 let mut compressed =
                     self.encode(ctx, frames[display_idx], width, height, &frame_config);
                 compressed.frame_type = FrameType::Intra;
@@ -112,6 +113,9 @@ impl EncoderPipeline {
                 // GPU local decode: quantized data is on GPU from encode()
                 // (Y→mc_out, Co→ref_upload, Cg→plane_b). No CPU entropy decode needed.
                 self.local_decode_iframe_gpu(ctx, &compressed, padded_w, padded_h, padded_pixels);
+                if std::env::var("GNC_PROFILE").is_ok() {
+                    eprintln!("  I-frame total: {:.1}ms", _t_iframe.elapsed().as_secs_f64() * 1000.0);
+                }
                 has_reference = true;
                 results[display_idx] = Some(compressed);
                 display_idx += 1;
@@ -650,6 +654,7 @@ impl EncoderPipeline {
             cmd.copy_buffer_to_buffer(&mv_buf, 0, &mv_staging.buffer, 0, mv_staging.size);
 
             // === Single submit for everything ===
+            let _t_submit = std::time::Instant::now();
             ctx.queue.submit(Some(cmd.finish()));
 
             // Single poll drains forward + entropy + local decode + MV copy
@@ -659,6 +664,9 @@ impl EncoderPipeline {
                 config.per_subband_entropy,
                 config.wavelet_levels,
             );
+            if std::env::var("GNC_PROFILE").is_ok() {
+                eprintln!("  P-frame GPU+readback: {:.1}ms", _t_submit.elapsed().as_secs_f64() * 1000.0);
+            }
             rans_tiles.append(&mut rt);
             subband_tiles.append(&mut st);
 
@@ -1086,6 +1094,7 @@ impl EncoderPipeline {
             );
 
             // Single submit
+            let _t_submit = std::time::Instant::now();
             ctx.queue.submit(Some(cmd.finish()));
 
             // Single poll drains everything
@@ -1095,6 +1104,9 @@ impl EncoderPipeline {
                 config.per_subband_entropy,
                 config.wavelet_levels,
             );
+            if std::env::var("GNC_PROFILE").is_ok() {
+                eprintln!("  B-frame GPU+readback: {:.1}ms", _t_submit.elapsed().as_secs_f64() * 1000.0);
+            }
             rans_tiles.append(&mut rt);
             subband_tiles.append(&mut st);
 

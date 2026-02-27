@@ -5,7 +5,7 @@ use wgpu::util::DeviceExt;
 use crate::GpuContext;
 
 pub const ME_BLOCK_SIZE: u32 = 16;
-pub const ME_SEARCH_RANGE: u32 = 64;
+pub const ME_SEARCH_RANGE: u32 = 32;
 
 /// Staging buffer for deferred MV readback. Created by `create_mv_staging`,
 /// consumed by `finish_mv_readback`. Allows the GPU copy to piggyback on

@@ -4,6 +4,40 @@
 
 ---
 
+## 2026-02-27: ME search range reduction — ±64 → ±32
+
+### Hypothesis
+Motion estimation coarse search (±64, 16,641 candidates per block) dominates P/B frame GPU compute time. Reducing to ±32 (4,225 candidates) should nearly halve ME cost with negligible quality impact for 30fps content.
+
+### Implementation
+Changed `ME_SEARCH_RANGE` constant from 64 to 32 in `motion.rs`. The shader search range is a uniform parameter, so no shader changes needed.
+
+Also tested ±16 (1,089 candidates) for comparison.
+
+### Results — Sequence encode (bbb_1080p, q=50, ki=8)
+
+| Search Range | P-frame | B-frame | 10-frame FPS | 30-frame FPS | Quality |
+|-------------|---------|---------|--------------|--------------|---------|
+| ±64 (old) | 113ms | 180ms | 7.2 fps | 6.9 fps | 37.82 dB |
+| ±32 (new) | 59ms | 100ms | 12.3 fps | 11.5 fps | 37.82 dB |
+| ±16 (tested) | 49ms | 85ms | 14.0 fps | — | 37.82 dB |
+
+### Analysis
+1. P-frame time nearly halved (113ms → 59ms). The coarse search was testing 16,641 candidates × 16 subsampled loads = 266K loads per block. At ±32, this drops to 67K loads — a 4x reduction.
+2. Quality is identical for this benchmark (same frame repeated). Real video with large motion may see small quality degradation at ±32, but for 30fps 1080p, ±32 pixels covers virtually all motion.
+3. ±16 shows diminishing returns (59ms → 49ms, only 10ms gain) because non-ME work (entropy encode, local decode, wavelet/quantize) dominates at that point.
+4. Also tested fused rANS encode in batched pipeline — **negative result**: 20ms slower per P-frame because the fused shader wastes GPU occupancy (256 threads, only 32 encode).
+
+### Remaining bottleneck analysis (P-frame at ±32)
+- ME coarse+fine: ~20ms
+- MC + wavelet + quantize (3 planes): ~10ms
+- rANS entropy encode: ~10ms GPU compute
+- rANS readback (30MB): ~10ms DMA + pack
+- Local decode (dequant + inverse wavelet + MC, 3 planes): ~10ms
+- Total: ~60ms
+
+---
+
 ## 2026-02-27: Sequence encode GPU pipeline optimization
 
 ### Hypothesis

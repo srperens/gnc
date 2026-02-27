@@ -37,6 +37,9 @@ struct Params {
 
 var<workgroup> shared_sad: array<u32, 256>;
 var<workgroup> shared_mv: array<u32, 256>;
+// Tracking best half-pel candidate across iterations (parallel half-pel)
+var<workgroup> hp_track_sad: u32;
+var<workgroup> hp_track_mv: u32;
 
 // Subsample stride for coarse search
 const COARSE_STRIDE: u32 = 4u;
@@ -439,24 +442,39 @@ fn main(
     let center_bwd_hx = mode_bwd_dx * 2;
     let center_bwd_hy = mode_bwd_dy * 2;
 
-    // ========== Phase 3c: Forward half-pel refinement (8 threads + center) ==========
+    // ========== Phase 3c: Forward half-pel refinement (all 256 threads, parallel) ==========
     // Active for mode 0 (fwd-only) and mode 2 (bidir).
-    // For bidir, predictor = (hp_fwd_sample + integer_bwd_sample) / 2.
+    // Test 9 candidates (center + 8 neighbors). Each candidate evaluated in parallel:
+    // all 256 threads compute one pixel's SAD, then sum-reduce.
 
     var hp_fwd_dx = center_fwd_hx;
     var hp_fwd_dy = center_fwd_hy;
     var hp_fwd_sad = mode_sad;
 
     if best_mode == 0u || best_mode == 2u {
-        var my_hp_sad: u32 = 0xFFFFFFFFu;
-        var my_hp_dx: i32 = center_fwd_hx;
-        var my_hp_dy: i32 = center_fwd_hy;
+        // Center is the baseline — neighbors must be strictly better to win.
+        if tid == 0u {
+            hp_track_sad = mode_sad;
+            hp_track_mv = pack_mv(center_fwd_hx, center_fwd_hy);
+        }
+        workgroupBarrier();
 
-        if tid < 8u {
-            // 8 half-pel neighbours (exclude center)
+        let hp_px = tid % params.block_size;
+        let hp_py = tid / params.block_size;
+        let hp_cur_val = current_y[(block_origin_y + hp_py) * params.width + block_origin_x + hp_px];
+
+        // For bidir, precompute backward sample (constant across forward candidates)
+        var hp_bwd_sample: f32 = 0.0;
+        if best_mode == 2u {
+            let bx2 = i32(block_origin_x + hp_px) * 2 + center_bwd_hx;
+            let by2 = i32(block_origin_y + hp_py) * 2 + center_bwd_hy;
+            hp_bwd_sample = sample_hp_bwd(bx2, by2, params.width, params.height);
+        }
+
+        for (var cand = 0u; cand < 8u; cand++) {
             var off_x: i32 = 0;
             var off_y: i32 = 0;
-            switch tid {
+            switch cand {
                 case 0u: { off_x = -1; off_y = -1; }
                 case 1u: { off_x =  0; off_y = -1; }
                 case 2u: { off_x =  1; off_y = -1; }
@@ -471,69 +489,54 @@ fn main(
             let test_hx = center_fwd_hx + off_x;
             let test_hy = center_fwd_hy + off_y;
 
-            // Bounds check in half-pel coordinate space
+            // Bounds check (uniform across workgroup — depends only on block origin + offset)
             let ref_base_hx = i32(block_origin_x) * 2 + test_hx;
             let ref_base_hy = i32(block_origin_y) * 2 + test_hy;
-            var valid = true;
-            if ref_base_hx < -1 || ref_base_hy < -1 ||
-               ref_base_hx + bs * 2 > w * 2 + 1 ||
-               ref_base_hy + bs * 2 > h * 2 + 1 {
-                valid = false;
-            }
+            let valid = ref_base_hx >= -1 && ref_base_hy >= -1 &&
+                        ref_base_hx + bs * 2 <= w * 2 + 1 &&
+                        ref_base_hy + bs * 2 <= h * 2 + 1;
 
+            var pixel_diff: u32 = 0u;
             if valid {
-                var sad: u32 = 0u;
-                for (var py = 0u; py < params.block_size; py++) {
-                    for (var px = 0u; px < params.block_size; px++) {
-                        let cur_idx = (block_origin_y + py) * params.width + block_origin_x + px;
-                        let rhx = i32(block_origin_x + px) * 2 + test_hx;
-                        let rhy = i32(block_origin_y + py) * 2 + test_hy;
-                        let fwd_val = sample_hp_fwd(rhx, rhy, params.width, params.height);
+                let rhx = i32(block_origin_x + hp_px) * 2 + test_hx;
+                let rhy = i32(block_origin_y + hp_py) * 2 + test_hy;
+                let fwd_val = sample_hp_fwd(rhx, rhy, params.width, params.height);
 
-                        var pred: f32;
-                        if best_mode == 0u {
-                            pred = fwd_val;
-                        } else {
-                            // Bidir: pair with integer-pel backward reference
-                            let bx2 = i32(block_origin_x + px) * 2 + center_bwd_hx;
-                            let by2 = i32(block_origin_y + py) * 2 + center_bwd_hy;
-                            let bwd_val = sample_hp_bwd(bx2, by2, params.width, params.height);
-                            pred = (fwd_val + bwd_val) * 0.5;
-                        }
-                        let diff = current_y[cur_idx] - pred;
-                        sad += u32(abs(diff));
-                    }
+                var pred: f32;
+                if best_mode == 0u {
+                    pred = fwd_val;
+                } else {
+                    pred = (fwd_val + hp_bwd_sample) * 0.5;
                 }
-                my_hp_sad = sad;
-                my_hp_dx = test_hx;
-                my_hp_dy = test_hy;
+                pixel_diff = u32(abs(hp_cur_val - pred));
             }
+
+            shared_sad[tid] = pixel_diff;
+            workgroupBarrier();
+
+            for (var stride = 128u; stride > 0u; stride >>= 1u) {
+                if tid < stride {
+                    shared_sad[tid] += shared_sad[tid + stride];
+                }
+                workgroupBarrier();
+            }
+
+            if tid == 0u && valid {
+                if shared_sad[0] < hp_track_sad {
+                    hp_track_sad = shared_sad[0];
+                    hp_track_mv = pack_mv(test_hx, test_hy);
+                }
+            }
+            workgroupBarrier();
         }
 
-        // Thread 8: integer-pel center (the "no half-pel refinement" baseline)
-        if tid == 8u {
-            my_hp_sad = mode_sad;
-            my_hp_dx = center_fwd_hx;
-            my_hp_dy = center_fwd_hy;
-        }
-
-        // Slots 0-8 hold candidates; rest set to MAX so reduction works correctly
-        if tid <= 8u {
-            shared_sad[tid] = my_hp_sad;
-            shared_mv[tid] = pack_mv(my_hp_dx, my_hp_dy);
-        } else {
-            shared_sad[tid] = 0xFFFFFFFFu;
-        }
-        workgroupBarrier();
-        min_reduce(tid);
-
-        hp_fwd_dx = unpack_dx(shared_mv[0]);
-        hp_fwd_dy = unpack_dy(shared_mv[0]);
-        hp_fwd_sad = shared_sad[0];
+        hp_fwd_dx = unpack_dx(hp_track_mv);
+        hp_fwd_dy = unpack_dy(hp_track_mv);
+        hp_fwd_sad = hp_track_sad;
     }
     workgroupBarrier();
 
-    // ========== Phase 3d: Backward half-pel refinement (8 threads + center) ==========
+    // ========== Phase 3d: Backward half-pel refinement (all 256 threads, parallel) ==========
     // Active for mode 1 (bwd-only) and mode 2 (bidir).
     // For bidir, predictor = (refined_fwd_hp_sample + hp_bwd_sample) / 2.
 
@@ -541,12 +544,15 @@ fn main(
     var hp_bwd_dy = center_bwd_hy;
 
     if best_mode == 1u || best_mode == 2u {
-        var my_hp_sad: u32 = 0xFFFFFFFFu;
-        var my_hp_dx: i32 = center_bwd_hx;
-        var my_hp_dy: i32 = center_bwd_hy;
+        // Broadcast refined forward MV from thread 0 to all threads
+        if tid == 0u {
+            shared_mv[0] = pack_mv(hp_fwd_dx, hp_fwd_dy);
+        }
+        workgroupBarrier();
+        let refined_fwd_hx = unpack_dx(shared_mv[0]);
+        let refined_fwd_hy = unpack_dy(shared_mv[0]);
 
-        // Baseline SAD for center (bwd offset=0): for bwd-only it's mode_sad;
-        // for bidir it's hp_fwd_sad (refined fwd + integer bwd = same predictor).
+        // Center is the baseline — neighbors must be strictly better to win.
         var center_sad_for_bwd: u32;
         if best_mode == 1u {
             center_sad_for_bwd = mode_sad;
@@ -554,10 +560,28 @@ fn main(
             center_sad_for_bwd = hp_fwd_sad;
         }
 
-        if tid < 8u {
+        if tid == 0u {
+            hp_track_sad = center_sad_for_bwd;
+            hp_track_mv = pack_mv(center_bwd_hx, center_bwd_hy);
+        }
+        workgroupBarrier();
+
+        let hp2_px = tid % params.block_size;
+        let hp2_py = tid / params.block_size;
+        let hp2_cur_val = current_y[(block_origin_y + hp2_py) * params.width + block_origin_x + hp2_px];
+
+        // For bidir, precompute refined forward sample (constant across backward candidates)
+        var hp_fwd_sample: f32 = 0.0;
+        if best_mode == 2u {
+            let fx2 = i32(block_origin_x + hp2_px) * 2 + refined_fwd_hx;
+            let fy2 = i32(block_origin_y + hp2_py) * 2 + refined_fwd_hy;
+            hp_fwd_sample = sample_hp_fwd(fx2, fy2, params.width, params.height);
+        }
+
+        for (var cand = 0u; cand < 8u; cand++) {
             var off_x: i32 = 0;
             var off_y: i32 = 0;
-            switch tid {
+            switch cand {
                 case 0u: { off_x = -1; off_y = -1; }
                 case 1u: { off_x =  0; off_y = -1; }
                 case 2u: { off_x =  1; off_y = -1; }
@@ -572,63 +596,48 @@ fn main(
             let test_hx = center_bwd_hx + off_x;
             let test_hy = center_bwd_hy + off_y;
 
-            // Bounds check in half-pel coordinate space
             let ref_base_hx = i32(block_origin_x) * 2 + test_hx;
             let ref_base_hy = i32(block_origin_y) * 2 + test_hy;
-            var valid = true;
-            if ref_base_hx < -1 || ref_base_hy < -1 ||
-               ref_base_hx + bs * 2 > w * 2 + 1 ||
-               ref_base_hy + bs * 2 > h * 2 + 1 {
-                valid = false;
-            }
+            let valid = ref_base_hx >= -1 && ref_base_hy >= -1 &&
+                        ref_base_hx + bs * 2 <= w * 2 + 1 &&
+                        ref_base_hy + bs * 2 <= h * 2 + 1;
 
+            var pixel_diff: u32 = 0u;
             if valid {
-                var sad: u32 = 0u;
-                for (var py = 0u; py < params.block_size; py++) {
-                    for (var px = 0u; px < params.block_size; px++) {
-                        let cur_idx = (block_origin_y + py) * params.width + block_origin_x + px;
-                        let rx2 = i32(block_origin_x + px) * 2 + test_hx;
-                        let ry2 = i32(block_origin_y + py) * 2 + test_hy;
-                        let bwd_val = sample_hp_bwd(rx2, ry2, params.width, params.height);
+                let rx2 = i32(block_origin_x + hp2_px) * 2 + test_hx;
+                let ry2 = i32(block_origin_y + hp2_py) * 2 + test_hy;
+                let bwd_val = sample_hp_bwd(rx2, ry2, params.width, params.height);
 
-                        var pred: f32;
-                        if best_mode == 1u {
-                            pred = bwd_val;
-                        } else {
-                            // Bidir: pair with the REFINED forward half-pel MV
-                            let fx2 = i32(block_origin_x + px) * 2 + hp_fwd_dx;
-                            let fy2 = i32(block_origin_y + py) * 2 + hp_fwd_dy;
-                            let fwd_val = sample_hp_fwd(fx2, fy2, params.width, params.height);
-                            pred = (fwd_val + bwd_val) * 0.5;
-                        }
-                        let diff = current_y[cur_idx] - pred;
-                        sad += u32(abs(diff));
-                    }
+                var pred: f32;
+                if best_mode == 1u {
+                    pred = bwd_val;
+                } else {
+                    pred = (hp_fwd_sample + bwd_val) * 0.5;
                 }
-                my_hp_sad = sad;
-                my_hp_dx = test_hx;
-                my_hp_dy = test_hy;
+                pixel_diff = u32(abs(hp2_cur_val - pred));
             }
+
+            shared_sad[tid] = pixel_diff;
+            workgroupBarrier();
+
+            for (var stride = 128u; stride > 0u; stride >>= 1u) {
+                if tid < stride {
+                    shared_sad[tid] += shared_sad[tid + stride];
+                }
+                workgroupBarrier();
+            }
+
+            if tid == 0u && valid {
+                if shared_sad[0] < hp_track_sad {
+                    hp_track_sad = shared_sad[0];
+                    hp_track_mv = pack_mv(test_hx, test_hy);
+                }
+            }
+            workgroupBarrier();
         }
 
-        // Thread 8: center (no backward half-pel refinement)
-        if tid == 8u {
-            my_hp_sad = center_sad_for_bwd;
-            my_hp_dx = center_bwd_hx;
-            my_hp_dy = center_bwd_hy;
-        }
-
-        if tid <= 8u {
-            shared_sad[tid] = my_hp_sad;
-            shared_mv[tid] = pack_mv(my_hp_dx, my_hp_dy);
-        } else {
-            shared_sad[tid] = 0xFFFFFFFFu;
-        }
-        workgroupBarrier();
-        min_reduce(tid);
-
-        hp_bwd_dx = unpack_dx(shared_mv[0]);
-        hp_bwd_dy = unpack_dy(shared_mv[0]);
+        hp_bwd_dx = unpack_dx(hp_track_mv);
+        hp_bwd_dy = unpack_dy(hp_track_mv);
     }
     workgroupBarrier();
 

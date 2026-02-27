@@ -33,6 +33,9 @@ struct Params {
 
 var<workgroup> shared_sad: array<u32, 256>;
 var<workgroup> shared_mv: array<u32, 256>;
+// Tracking best half-pel candidate across iterations (parallel half-pel)
+var<workgroup> hp_track_sad: u32;
+var<workgroup> hp_track_mv: u32;
 
 // Subsample stride for coarse search phase
 const COARSE_STRIDE: u32 = 4u;
@@ -243,8 +246,9 @@ fn main(
     workgroupBarrier();
     min_reduce(tid);
 
-    // ========== Phase 3: Half-pel refinement ==========
-    // 8 half-pel offsets around the fine winner (same as before).
+    // ========== Phase 3: Half-pel refinement (all 256 threads, parallel) ==========
+    // Test 9 candidates (center + 8 neighbors). Each candidate evaluated in parallel:
+    // all 256 threads compute one pixel's SAD, then sum-reduce.
     let fine_packed = shared_mv[0];
     let fine_sad = shared_sad[0];
     let int_dx = unpack_dx(fine_packed);
@@ -254,14 +258,23 @@ fn main(
     let center_hx = int_dx * 2;
     let center_hy = int_dy * 2;
 
-    var hp_sad: u32 = 0xFFFFFFFFu;
-    var hp_dx: i32 = center_hx;
-    var hp_dy: i32 = center_hy;
+    // Center is the baseline — neighbors must be strictly better to win.
+    // This matches the original min_reduce tree where center (slot 8) enters slot 0
+    // at stride=8 and tied neighbors can't displace it.
+    if tid == 0u {
+        hp_track_sad = fine_sad;
+        hp_track_mv = pack_mv(center_hx, center_hy);
+    }
+    workgroupBarrier();
 
-    if tid < 8u {
+    let hp_px = tid % params.block_size;
+    let hp_py = tid / params.block_size;
+    let hp_cur_val = current_y[(block_origin_y + hp_py) * params.width + block_origin_x + hp_px];
+
+    for (var cand = 0u; cand < 8u; cand++) {
         var off_x: i32 = 0;
         var off_y: i32 = 0;
-        switch tid {
+        switch cand {
             case 0u: { off_x = -1; off_y = -1; }
             case 1u: { off_x =  0; off_y = -1; }
             case 2u: { off_x =  1; off_y = -1; }
@@ -276,59 +289,45 @@ fn main(
         let test_hx = center_hx + off_x;
         let test_hy = center_hy + off_y;
 
-        var sad: u32 = 0u;
-        var valid = true;
-
         let ref_base_hx = i32(block_origin_x) * 2 + test_hx;
         let ref_base_hy = i32(block_origin_y) * 2 + test_hy;
-        if ref_base_hx < -1 || ref_base_hy < -1 ||
-           ref_base_hx + bs * 2 > w * 2 + 1 ||
-           ref_base_hy + bs * 2 > h * 2 + 1 {
-            valid = false;
-        }
+        let valid = ref_base_hx >= -1 && ref_base_hy >= -1 &&
+                    ref_base_hx + bs * 2 <= w * 2 + 1 &&
+                    ref_base_hy + bs * 2 <= h * 2 + 1;
 
+        var pixel_diff: u32 = 0u;
         if valid {
-            for (var py = 0u; py < params.block_size; py++) {
-                for (var px = 0u; px < params.block_size; px++) {
-                    let cur_idx = (block_origin_y + py) * params.width + block_origin_x + px;
-                    let cur_val = current_y[cur_idx];
-
-                    let rhx = i32(block_origin_x + px) * 2 + test_hx;
-                    let rhy = i32(block_origin_y + py) * 2 + test_hy;
-                    let ref_val = bilinear_sample(rhx, rhy);
-
-                    let diff = cur_val - ref_val;
-                    sad += u32(abs(diff));
-                }
-            }
-            hp_sad = sad;
-            hp_dx = test_hx;
-            hp_dy = test_hy;
+            let rhx = i32(block_origin_x + hp_px) * 2 + test_hx;
+            let rhy = i32(block_origin_y + hp_py) * 2 + test_hy;
+            let ref_val = bilinear_sample(rhx, rhy);
+            pixel_diff = u32(abs(hp_cur_val - ref_val));
         }
-    }
 
-    // Thread 8 holds the integer result
-    if tid == 8u {
-        hp_sad = fine_sad;
-        hp_dx = center_hx;
-        hp_dy = center_hy;
+        shared_sad[tid] = pixel_diff;
+        workgroupBarrier();
+
+        for (var stride = 128u; stride > 0u; stride >>= 1u) {
+            if tid < stride {
+                shared_sad[tid] += shared_sad[tid + stride];
+            }
+            workgroupBarrier();
+        }
+
+        if tid == 0u && valid {
+            if shared_sad[0] < hp_track_sad {
+                hp_track_sad = shared_sad[0];
+                hp_track_mv = pack_mv(test_hx, test_hy);
+            }
+        }
+        workgroupBarrier();
     }
-    if tid <= 8u {
-        shared_sad[tid] = hp_sad;
-        shared_mv[tid] = pack_mv(hp_dx, hp_dy);
-    } else {
-        shared_sad[tid] = 0xFFFFFFFFu;
-    }
-    workgroupBarrier();
-    min_reduce(tid);
 
     // Thread 0 writes the final half-pel MV result
     if tid == 0u {
-        let packed_mv = shared_mv[0];
-        let final_dx = unpack_dx(packed_mv);
-        let final_dy = unpack_dy(packed_mv);
+        let final_dx = unpack_dx(hp_track_mv);
+        let final_dy = unpack_dy(hp_track_mv);
         motion_vectors[block_idx * 2u] = final_dx;
         motion_vectors[block_idx * 2u + 1u] = final_dy;
-        sad_values[block_idx] = shared_sad[0];
+        sad_values[block_idx] = hp_track_sad;
     }
 }

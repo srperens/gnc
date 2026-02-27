@@ -1,4 +1,6 @@
-# GPU-Native Broadcast Codec — Claude Code Project Instructions
+# GPU-Native Broadcast Codec — Original Project Brief
+
+> **Historical document** (2026-02-22). This was the initial project brief. Current AI instructions are in CLAUDE.md. Current project status is in README.md and STATUS_ROADMAP.md. All Phase 1-3 items below have been completed.
 
 ## Vision
 

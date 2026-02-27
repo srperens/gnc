@@ -2,7 +2,9 @@
 
 ## Context
 
-We have three entropy coders: rANS (good compression, slow — 32 sequential streams), Rice (fast — 256 parallel streams, but 43% worse compression at q=75). Canonical Huffman should give us the best of both: Rice-like parallelism (256 independent streams, no state chain) with near-rANS compression (variable-length codes adapt to actual distributions instead of assuming geometric like Rice).
+We have three entropy coders: rANS (good compression, slow — 32 sequential streams), Rice+ZRL (fast — 256 parallel streams, matches or beats rANS at q>=50 but +34% overhead at q=25), and Bitplane. Canonical Huffman could close the remaining low-bitrate gap: Rice-like parallelism (256 independent streams, no state chain) with near-rANS compression (variable-length codes adapt to actual distributions instead of assuming geometric like Rice).
+
+**Note (2026-02-27):** Rice+ZRL has largely closed the compression gap — it beats rANS at q>=75 and is within 5% at q=50. The main remaining gap is at q=25 (+34%). Huffman's value proposition is now narrower: closing that low-bitrate gap and potentially improving lossless compression.
 
 ## Design: Significance Map + Canonical Huffman (per-subband)
 

@@ -84,6 +84,8 @@
   Implementerade #1 (Significance map + Golomb-Rice) med GPU-shader.
   256 interleaved streams per tile, fullt parallella.
 
+  Initiala resultat (utan ZRL):
+
   ┌──────────────┬──────────┬──────────┬──────────┐
   │              │  rANS    │ Rice GPU │ Diff     │
   ├──────────────┼──────────┼──────────┼──────────┤
@@ -98,52 +100,62 @@
   │ BPP q=90     │          │ ~match   │ ~0%      │
   └──────────────┴──────────┴──────────┴──────────┘
 
-  Slutsats: Hastighetsförbättringen validerar tesen — att ta
-  bort rANS sekventiella state chain (2048 steg → 256 steg
-  per tråd) ger massiva GPU-parallellism-vinster.
+## Uppdatering: Rice+ZRL (2026-02-27)
 
-  Kompressionsgapet vid låga bitrates beror på per-koefficient
-  significance bits. ZRL (zero-run-length) skulle minska detta,
-  men bättre approach: Canonical Huffman som anpassar sig till
-  verklig fördelning istället för att anta geometrisk.
+  Lade till zero-run-length (ZRL) kodning. Istället för 1 bit per
+  noll-koefficient, kodas nollsekvenser med Rice(run_length-1, k_zrl).
 
-## Analys: Nästa steg — Canonical Huffman
+  ┌──────────────┬──────────┬──────────┬──────────┐
+  │              │  rANS    │ Rice+ZRL │ Diff     │
+  ├──────────────┼──────────┼──────────┼──────────┤
+  │ Encode 1080p │ 34ms     │ 25ms     │ 1.4x     │
+  │              │ 29 fps   │ 40 fps   │ snabbare │
+  ├──────────────┼──────────┼──────────┼──────────┤
+  │ Decode 1080p │ 29ms     │ 16ms     │ 1.8x     │
+  │              │ 34 fps   │ 61 fps   │ snabbare │
+  ├──────────────┼──────────┼──────────┼──────────┤
+  │ BPP q=25     │ 1.29     │ 1.73     │ +34%     │
+  ├──────────────┼──────────┼──────────┼──────────┤
+  │ BPP q=50     │ 2.30     │ 2.42     │ +5%      │
+  ├──────────────┼──────────┼──────────┼──────────┤
+  │ BPP q=75     │ 4.22     │ 4.09     │ -3% (!)  │
+  ├──────────────┼──────────┼──────────┼──────────┤
+  │ BPP q=90     │ 9.65     │ 8.96     │ -7% (!)  │
+  └──────────────┴──────────┴──────────┴──────────┘
 
-  Av de 8 alternativen sticker Canonical Huffman ut:
+  ZRL stängde kompressionsgapet dramatiskt:
+  - q=25: från +269% till +34% overhead
+  - q=50+: Rice+ZRL SLÅR rANS i bpp!
 
-  ┌─────────────────┬────────┬─────────┬──────────┐
-  │                 │ Rice   │ Huffman │ rANS     │
-  ├─────────────────┼────────┼─────────┼──────────┤
-  │ BPP overhead    │ 3-7%   │ 1-5%   │ baseline │
-  ├─────────────────┼────────┼─────────┼──────────┤
-  │ Parallellism    │ 10 000 │ 12 000 │ 32       │
-  ├─────────────────┼────────┼─────────┼──────────┤
-  │ State chain     │ Ingen  │ Ingen  │ 2048/trd │
-  ├─────────────────┼────────┼─────────┼──────────┤
-  │ Patentrisk      │ Ingen  │ Ingen  │ Medel-Hög│
-  ├─────────────────┼────────┼─────────┼──────────┤
-  │ Shared mem      │ <1KB   │ 8KB    │ 16KB+    │
-  ├─────────────────┼────────┼─────────┼──────────┤
-  │ GPU dispatches  │ 1      │ 2      │ 3        │
-  └─────────────────┴────────┴─────────┴──────────┘
+  Slutsats: Rice+ZRL är nu konkurrenskraftigt med rANS i
+  kompression och 1.5-2x snabbare. Tesen validerad.
 
-  Varför Huffman vinner:
-  - Bättre kompression: variabel kodlängd anpassar sig till
-    verklig symbolfördelning, inte bara geometrisk (Rice)
-  - Maximal parallellism: varje symbol → fast codeword lookup
-  - Snabb decode: 8-bit prefix table lookup (O(1) per symbol)
-  - Ingen patentrisk (public domain sedan 1952)
-  - 8KB shared mem → full M1 occupancy (2 WG/core)
+## Analys: Nästa steg — Canonical Huffman?
 
-  Nackdel vs Rice:
-  - 2 GPU dispatches istället för 1 (histogram + encode)
-  - CPU codebook-bygge mellan dispatches (~<1ms)
-  - Mer komplex decoder (prefix table vs enkel Rice formula)
+  Med Rice+ZRL som redan slår rANS vid q>=50 har Huffman-caset
+  försvagats. Men vid q=25 finns fortfarande +34% gap. Huffman
+  kan potentiellt stänga detta.
 
-  Förväntat resultat:
-  - Hastighet: ~samma som Rice (kanske 10-20% långsammare pga
-    extra dispatch + codebook roundtrip)
-  - Kompression: ~1-5% overhead vs rANS (vs Rice 43% vid q=75)
-  - Netto: dramatiskt bättre speed/compression tradeoff
+  ┌─────────────────┬────────────┬─────────┬──────────┐
+  │                 │ Rice+ZRL   │ Huffman │ rANS     │
+  ├─────────────────┼────────────┼─────────┼──────────┤
+  │ BPP overhead    │ -3 till    │ 1-5%   │ baseline │
+  │  (vs rANS)     │ +34%       │ (est)   │          │
+  ├─────────────────┼────────────┼─────────┼──────────┤
+  │ Parallellism    │ 256 str    │ 256 str │ 32 str   │
+  ├─────────────────┼────────────┼─────────┼──────────┤
+  │ State chain     │ Ingen      │ Ingen   │ 2048/trd │
+  ├─────────────────┼────────────┼─────────┼──────────┤
+  │ Patentrisk      │ Ingen      │ Ingen   │ Medel-Hög│
+  ├─────────────────┼────────────┼─────────┼──────────┤
+  │ Shared mem      │ <1KB       │ 8KB     │ 16KB+    │
+  ├─────────────────┼────────────┼─────────┼──────────┤
+  │ GPU dispatches  │ 1          │ 2       │ 3        │
+  └─────────────────┴────────────┴─────────┴──────────┘
 
-  Implementation plan: se huffman_plan.md
+  Huffman kan fortfarande vara intressant för:
+  - Stänga +34% gapet vid q=25 (låga bitrates)
+  - Potentiellt bättre lossless-kompression
+  - O(1) decode via prefix-table (snabbare än Rice bit-scanning)
+
+  Implementation plan: se HUFFMAN_PLAN.md

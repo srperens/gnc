@@ -1,8 +1,11 @@
 # GNC — GPU-Native Codec: Research Notes on Interesting Techniques
 
-## Current GNC Architecture
-- RGB → YCoCg-R → LeGall 5/3 wavelet (tile-independent) → Uniform scalar quantization (dead zone) → Per-tile rANS
-- Best result: 46.2 dB @ 2.70 BPP (QStep=4)
+> **Historical document** (originally written 2026-02-22). Many recommendations below have since been implemented. Current architecture and results are in README.md and STATUS_ROADMAP.md.
+
+## GNC Architecture (as of 2026-02-27)
+- RGB → YCoCg-R → CDF 9/7 / LeGall 5/3 wavelet → Adaptive quantization (CfL, AQ, perceptual weights) → Rice+ZRL / rANS / Bitplane entropy
+- I/P/B frames, half-pel motion estimation, CBR/VBR rate control, GNV1 container
+- Best result: 42.1 dB @ 4.09 BPP (q=75, Rice+ZRL), 40 fps encode, 61 fps decode
 
 ---
 
@@ -171,22 +174,22 @@ For maximum throughput:
 ## 7. Prioritized Recommendations
 
 ### Quick Wins (high impact, low effort)
-1. **Per-subband quantization weights** — CSF-based, huge PSNR gain
-2. **Optimize dead zone** — set δ=1/3 for all intra, properly zero small coefficients
-3. **Tile index table** in bitstream for random access
-4. **Interleaved rANS** within tiles (one stream per subband)
+1. ~~**Per-subband quantization weights**~~ — **DONE** (perceptual SubbandWeights)
+2. ~~**Optimize dead zone**~~ — **DONE** (configurable dead zone in quality_preset)
+3. ~~**Tile index table**~~ — **DONE** (GP11 tile index with CRC-32)
+4. ~~**Interleaved rANS**~~ — **DONE** (32 streams per tile; also Rice with 256 streams)
 
 ### Medium-Term (high impact, moderate effort)
-5. **Non-separable fused wavelet kernel** — halve memory passes
-6. **Chroma-from-Luma prediction** — 5-15% chroma savings
-7. **Rate control** — per-tile QStep adjustment to hit target BPP
-8. **Shared memory lifting** — load tile → shared mem → all lifting steps → write back
+5. **Non-separable fused wavelet kernel** — halve memory passes (not yet done)
+6. ~~**Chroma-from-Luma prediction**~~ — **DONE** (14-bit i16 precision, q=50-85)
+7. ~~**Rate control**~~ — **DONE** (CBR/VBR with R-Q model)
+8. ~~**Shared memory lifting**~~ — **DONE** (workgroup shared memory in wavelet shaders)
 
 ### Research/Experimental
-9. **PVQ (Perceptual Vector Quantization)** — Daala-style gain/shape separation
-10. **Learned lifting operators** — small NN additions to base wavelet
-11. **Recoil-style adaptive parallel rANS** — single-stream with sync points
-12. **MANS-style multi-byte ANS** — better entropy coding for wavelet coefficients
+9. **PVQ (Perceptual Vector Quantization)** — Daala-style gain/shape separation (not yet done)
+10. **Learned lifting operators** — small NN additions to base wavelet (not yet done)
+11. **Recoil-style adaptive parallel rANS** — superseded by Rice+ZRL (no state chain)
+12. **MANS-style multi-byte ANS** — superseded by Rice+ZRL
 
 ---
 

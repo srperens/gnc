@@ -253,6 +253,27 @@ impl DecoderPipeline {
                     );
                 }
             }
+            EntropyData::Huffman(_) => {
+                // Huffman: CPU decode path — write decoded f32 coefficients
+                // directly into cpu_decoded_planes buffers for each plane.
+                bufs.ctx_adaptive_decode = true; // reuse CPU-decoded path
+                let padded_w = info.padded_width() as usize;
+                let tile_size = info.tile_size as usize;
+                for p in 0..3 {
+                    let plane_data = entropy_helpers::entropy_decode_plane(
+                        &frame.entropy,
+                        p,
+                        tiles_per_plane,
+                        tile_size,
+                        padded_w,
+                    );
+                    ctx.queue.write_buffer(
+                        &bufs.cpu_decoded_planes[p],
+                        0,
+                        bytemuck::cast_slice(&plane_data),
+                    );
+                }
+            }
         }
 
         // --- CfL alphas ---

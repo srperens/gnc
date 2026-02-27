@@ -1,4 +1,5 @@
 use super::bitplane;
+use super::huffman;
 use super::rans;
 use super::rans_gpu_encode::GpuRansEncoder;
 use super::rice;
@@ -13,11 +14,14 @@ pub(super) enum EntropyMode {
     SubbandRansCtx,
     Bitplane,
     Rice,
+    Huffman,
 }
 
 impl EntropyMode {
     pub(super) fn from_config(config: &CodecConfig) -> Self {
-        if config.entropy_coder == EntropyCoder::Rice {
+        if config.entropy_coder == EntropyCoder::Huffman {
+            EntropyMode::Huffman
+        } else if config.entropy_coder == EntropyCoder::Rice {
             EntropyMode::Rice
         } else if config.entropy_coder == EntropyCoder::Bitplane {
             EntropyMode::Bitplane
@@ -50,8 +54,9 @@ pub(super) fn encode_entropy(
     subband_tiles: &mut Vec<rans::SubbandRansTile>,
     bp_tiles: &mut Vec<bitplane::BitplaneTile>,
     rice_tiles: &mut Vec<rice::RiceTile>,
+    huffman_tiles: &mut Vec<huffman::HuffmanTile>,
 ) {
-    if use_gpu_encode && !matches!(entropy_mode, EntropyMode::Rice) {
+    if use_gpu_encode && !matches!(entropy_mode, EntropyMode::Rice | EntropyMode::Huffman) {
         let (mut rt, mut st) = gpu_encoder.encode_plane_to_tiles(
             ctx,
             quantized_buf,
@@ -76,6 +81,7 @@ pub(super) fn encode_entropy(
             subband_tiles,
             bp_tiles,
             rice_tiles,
+            huffman_tiles,
         );
     }
 }
@@ -113,6 +119,7 @@ pub(crate) fn entropy_decode_plane(
             }
             EntropyData::Bitplane(tiles) => bitplane::bitplane_decode_tile(&tiles[tile_start + t]),
             EntropyData::Rice(tiles) => rice::rice_decode_tile(&tiles[tile_start + t]),
+            EntropyData::Huffman(tiles) => huffman::huffman_decode_tile(&tiles[tile_start + t]),
         };
 
         // Scatter tile coefficients back into flat plane
@@ -143,6 +150,7 @@ pub(super) fn entropy_encode_tiles(
     subband_tiles: &mut Vec<rans::SubbandRansTile>,
     bp_tiles: &mut Vec<bitplane::BitplaneTile>,
     rice_tiles: &mut Vec<rice::RiceTile>,
+    huffman_tiles: &mut Vec<huffman::HuffmanTile>,
 ) {
     for ty in 0..tiles_y {
         for tx in 0..tiles_x {
@@ -170,6 +178,13 @@ pub(super) fn entropy_encode_tiles(
                 }
                 EntropyMode::Rice => {
                     rice_tiles.push(rice::rice_encode_tile(
+                        &coeffs,
+                        tile_size_u32,
+                        num_levels,
+                    ));
+                }
+                EntropyMode::Huffman => {
+                    huffman_tiles.push(huffman::huffman_encode_tile(
                         &coeffs,
                         tile_size_u32,
                         num_levels,

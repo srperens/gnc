@@ -180,6 +180,10 @@ pub enum EntropyCoder {
     /// Significance map + Golomb-Rice: fully parallel, 256 streams per tile.
     /// Every coefficient encodes independently — no serial state chain.
     Rice,
+    /// Significance map + canonical Huffman: 256 parallel streams per tile.
+    /// Distribution-adaptive codes (vs Rice's fixed Golomb-Rice), closing the
+    /// low-bitrate gap. Same ZRL scheme as Rice for zero runs.
+    Huffman,
 }
 
 /// Codec configuration
@@ -447,6 +451,7 @@ pub enum EntropyData {
     SubbandRans(Vec<encoder::rans::SubbandRansTile>),
     Bitplane(Vec<encoder::bitplane::BitplaneTile>),
     Rice(Vec<encoder::rice::RiceTile>),
+    Huffman(Vec<encoder::huffman::HuffmanTile>),
 }
 
 impl EntropyData {
@@ -456,6 +461,7 @@ impl EntropyData {
             EntropyData::SubbandRans(tiles) => tiles.iter().map(|t| t.byte_size()).sum(),
             EntropyData::Bitplane(tiles) => tiles.iter().map(|t| t.byte_size()).sum(),
             EntropyData::Rice(tiles) => tiles.iter().map(|t| t.byte_size()).sum(),
+            EntropyData::Huffman(tiles) => tiles.iter().map(|t| t.byte_size()).sum(),
         }
     }
 }

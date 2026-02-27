@@ -9,6 +9,7 @@ use super::motion::{MotionEstimator, ME_BLOCK_SIZE};
 use super::pipeline::EncoderPipeline;
 use super::rans;
 use super::rice;
+use super::huffman;
 use super::rate_control::RateController;
 use crate::{
     CodecConfig, CompressedFrame, EntropyCoder, EntropyData, FrameInfo, FrameType, GpuContext,
@@ -540,6 +541,7 @@ impl EncoderPipeline {
         let mut subband_tiles: Vec<rans::SubbandRansTile> = Vec::new();
         let mut bp_tiles: Vec<bitplane::BitplaneTile> = Vec::new();
         let mut rice_tiles: Vec<rice::RiceTile> = Vec::new();
+        let mut huffman_tiles: Vec<huffman::HuffmanTile> = Vec::new();
 
         // === Batched GPU pipeline: preprocess + ME + forward encode ===
         // MV buffer stays on GPU — used directly by MC without readback/re-upload.
@@ -785,6 +787,7 @@ impl EncoderPipeline {
                 }
                 EntropyMode::Rans => EntropyData::Rans(rans_tiles),
                 EntropyMode::Rice => EntropyData::Rice(rice_tiles),
+                EntropyMode::Huffman => EntropyData::Huffman(huffman_tiles),
             };
 
             return (CompressedFrame {
@@ -929,6 +932,7 @@ impl EncoderPipeline {
                     &mut subband_tiles,
                     &mut bp_tiles,
                     &mut rice_tiles,
+                    &mut huffman_tiles,
                 );
             }
         }
@@ -940,6 +944,7 @@ impl EncoderPipeline {
             }
             EntropyMode::Rans => EntropyData::Rans(rans_tiles),
             EntropyMode::Rice => EntropyData::Rice(rice_tiles),
+            EntropyMode::Huffman => EntropyData::Huffman(huffman_tiles),
         };
 
         // === Batched local decode + MV copy: single command encoder ===
@@ -1081,6 +1086,7 @@ impl EncoderPipeline {
         let mut subband_tiles: Vec<rans::SubbandRansTile> = Vec::new();
         let mut bp_tiles: Vec<bitplane::BitplaneTile> = Vec::new();
         let mut rice_tiles: Vec<rice::RiceTile> = Vec::new();
+        let mut huffman_tiles: Vec<huffman::HuffmanTile> = Vec::new();
 
         // === Batched GPU pipeline: preprocess + bidir ME + forward encode ===
         // MV/mode buffers stay on GPU — used directly by bidir MC.
@@ -1282,6 +1288,7 @@ impl EncoderPipeline {
                 }
                 EntropyMode::Rans => EntropyData::Rans(rans_tiles),
                 EntropyMode::Rice => EntropyData::Rice(rice_tiles),
+                EntropyMode::Huffman => EntropyData::Huffman(huffman_tiles),
             };
 
             return (CompressedFrame {
@@ -1422,6 +1429,7 @@ impl EncoderPipeline {
                     &mut subband_tiles,
                     &mut bp_tiles,
                     &mut rice_tiles,
+                    &mut huffman_tiles,
                 );
             }
         }
@@ -1433,6 +1441,7 @@ impl EncoderPipeline {
             }
             EntropyMode::Rans => EntropyData::Rans(rans_tiles),
             EntropyMode::Rice => EntropyData::Rice(rice_tiles),
+            EntropyMode::Huffman => EntropyData::Huffman(huffman_tiles),
         };
 
         // === Deferred batched readback: single submit + poll for all bidir data ===

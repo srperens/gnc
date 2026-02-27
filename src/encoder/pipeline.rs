@@ -7,6 +7,7 @@ use super::buffer_cache::CachedEncodeBuffers;
 use super::cfl::{self, CflAlphaComputer, CflForwardPredictor, CflPredictor};
 use super::color::ColorConverter;
 use super::entropy_helpers::{encode_entropy, EntropyMode};
+use super::huffman;
 use super::interleave::PlaneDeinterleaver;
 use super::quantize::Quantizer;
 use super::quantize_histogram_fused::FusedQuantizeHistogram;
@@ -385,12 +386,14 @@ impl EncoderPipeline {
         let mut subband_tiles: Vec<rans::SubbandRansTile> = Vec::new();
         let mut bp_tiles: Vec<bitplane::BitplaneTile> = Vec::new();
         let mut rice_tiles: Vec<rice::RiceTile> = Vec::new();
+        let mut huffman_tiles: Vec<huffman::HuffmanTile> = Vec::new();
         let entropy_mode = EntropyMode::from_config(config);
         let tile_size = config.tile_size as usize;
         let tiles_x = info.tiles_x() as usize;
         let tiles_y = info.tiles_y() as usize;
         let use_gpu_encode = config.gpu_entropy_encode
             && config.entropy_coder != EntropyCoder::Bitplane
+            && config.entropy_coder != EntropyCoder::Huffman
             && !config.context_adaptive;
         let use_gpu_rice = use_gpu_encode && config.entropy_coder == EntropyCoder::Rice;
 
@@ -880,6 +883,7 @@ impl EncoderPipeline {
                     &mut subband_tiles,
                     &mut bp_tiles,
                     &mut rice_tiles,
+                    &mut huffman_tiles,
                 );
             }
         }
@@ -989,6 +993,7 @@ impl EncoderPipeline {
             }
             EntropyMode::Rans => EntropyData::Rans(rans_tiles),
             EntropyMode::Rice => EntropyData::Rice(rice_tiles),
+            EntropyMode::Huffman => EntropyData::Huffman(huffman_tiles),
         };
 
         if profile {

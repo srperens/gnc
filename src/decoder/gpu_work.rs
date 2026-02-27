@@ -98,6 +98,11 @@ impl DecoderPipeline {
                             total_blocks,
                         );
                     }
+                    EntropyData::Huffman(_) => {
+                        // Huffman uses CPU decode via ctx_adaptive_decode path;
+                        // this branch should never be reached.
+                        unreachable!("Huffman entropy should use CPU decode path");
+                    }
                 }
             }
 

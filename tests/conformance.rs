@@ -258,6 +258,7 @@ fn conformance_crc_validates_all_tiles() {
         gnc::EntropyData::SubbandRans(t) => t.len(),
         gnc::EntropyData::Bitplane(t) => t.len(),
         gnc::EntropyData::Rice(t) => t.len(),
+        gnc::EntropyData::Huffman(t) => t.len(),
     };
     assert_eq!(
         result.tile_crcs.len(),

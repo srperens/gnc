@@ -59,6 +59,10 @@ enum Command {
         #[arg(long)]
         rans: bool,
 
+        /// Use canonical Huffman entropy coder instead of Rice (default)
+        #[arg(long)]
+        huffman: bool,
+
         /// Wavelet type: 97 (CDF 9/7) or 53 (LeGall 5/3). Overrides quality preset if specified.
         #[arg(long)]
         wavelet: Option<String>,
@@ -108,6 +112,10 @@ enum Command {
         /// Use rANS entropy coder instead of Rice (default)
         #[arg(long)]
         rans: bool,
+
+        /// Use canonical Huffman entropy coder instead of Rice (default)
+        #[arg(long)]
+        huffman: bool,
 
         /// Use CPU entropy encoding instead of GPU
         #[arg(long)]
@@ -315,6 +323,7 @@ fn main() {
             no_cfl,
             bitplane,
             rans,
+            huffman,
             wavelet,
             no_per_subband,
             cpu_encode,
@@ -355,6 +364,9 @@ fn main() {
             }
             if rans {
                 config.entropy_coder = gnc::EntropyCoder::Rans;
+            }
+            if huffman {
+                config.entropy_coder = gnc::EntropyCoder::Huffman;
             }
             if no_per_subband {
                 config.per_subband_entropy = false;
@@ -408,6 +420,7 @@ fn main() {
             quality,
             bitplane,
             rans,
+            huffman,
             cpu_encode,
         } => {
             let (rgb_data, w, h) = load_image_rgb_f32(&input);
@@ -423,6 +436,9 @@ fn main() {
             if rans {
                 config.entropy_coder = gnc::EntropyCoder::Rans;
             }
+            if huffman {
+                config.entropy_coder = gnc::EntropyCoder::Huffman;
+            }
             if cpu_encode {
                 config.gpu_entropy_encode = false;
             }
@@ -432,6 +448,7 @@ fn main() {
                 gnc::EntropyCoder::Rans if config.per_subband_entropy => "rANS subband".to_string(),
                 gnc::EntropyCoder::Rans => "rANS single-table".to_string(),
                 gnc::EntropyCoder::Rice => "Rice (sig+Golomb)".to_string(),
+                gnc::EntropyCoder::Huffman => "Huffman (sig+canonical)".to_string(),
             };
             let encode_mode = if config.gpu_entropy_encode {
                 "GPU"

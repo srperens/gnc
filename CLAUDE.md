@@ -59,7 +59,7 @@ Claude operates as **team lead** for this project:
 ## Key Documents
 
 - **[GOALS.md](GOALS.md)** — Rules, priorities, current state, non-goals
-- **[BITSTREAM_SPEC.md](BITSTREAM_SPEC.md)** — Bitstream format specification
+- **[docs/BITSTREAM_SPEC.md](docs/BITSTREAM_SPEC.md)** — Bitstream format specification
 - **[RESEARCH_LOG.md](RESEARCH_LOG.md)** — Experiment log
 - **[README.md](README.md)** — Public project description
 - **[docs/archive/](docs/archive/)** — Historical documents (MILESTONES.md, INSTRUCTION.md, etc.)

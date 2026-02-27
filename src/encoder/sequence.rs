@@ -142,7 +142,9 @@ impl EncoderPipeline {
             }
 
             if !use_bframes {
-                // P-frame only mode
+                // P-frame only mode — skip local decode if next frame is keyframe or EOSequence
+                let next_is_key_or_end = display_idx + 1 >= n
+                    || (ki > 1 && (display_idx + 1) % ki == 0);
                 let (compressed, new_mv_buf) = self.encode_pframe(
                     ctx,
                     frames[display_idx],
@@ -155,6 +157,7 @@ impl EncoderPipeline {
                     &frame_config,
                     prev_mv_buf.as_ref().or(Some(&zero_mv_buf)),
                     false,
+                    !next_is_key_or_end,
                 );
                 prev_mv_buf = Some(new_mv_buf);
                 if let Some(ref mut rc) = rate_ctrl {
@@ -199,6 +202,7 @@ impl EncoderPipeline {
                     &p_config,
                     prev_mv_buf.as_ref().or(Some(&zero_mv_buf)),
                     true,
+                    true, // anchor P always needs decode (bwd ref for B-frames)
                 );
                 prev_mv_buf = Some(new_mv_buf);
                 if let Some(ref mut rc) = rate_ctrl {
@@ -261,6 +265,8 @@ impl EncoderPipeline {
                 } else {
                     config.clone()
                 };
+                // Skip decode if next frame is keyframe or end of sequence
+                let rem_needs_decode = j + 1 < next_key && j + 1 < n;
                 let (compressed, new_mv_buf) = self.encode_pframe(
                     ctx,
                     frames[j],
@@ -273,6 +279,7 @@ impl EncoderPipeline {
                     &p_config,
                     prev_mv_buf.as_ref().or(Some(&zero_mv_buf)),
                     false,
+                    rem_needs_decode,
                 );
                 prev_mv_buf = Some(new_mv_buf);
                 if let Some(ref mut rc) = rate_ctrl {
@@ -482,12 +489,15 @@ impl EncoderPipeline {
     /// Encode a P-frame. Returns `(compressed_frame, mv_buffer)`.
     /// The `mv_buffer` can be passed as `predictor_mvs` to the next P-frame for temporal
     /// MV prediction (skip coarse search, only fine-refine around the predicted MV).
-    #[allow(clippy::too_many_arguments)]
     /// Encode a P-frame.
     ///
     /// `save_bwd_ref`: when true, copies gpu_ref_planes → gpu_bwd_ref_planes at
-    /// the start of the command encoder (before ME overwrites anything). This folds
-    /// the reference copy into the same GPU submission, eliminating a separate submit.
+    /// the start of the command encoder (before ME overwrites anything).
+    ///
+    /// `needs_decode`: when false, skips the local decode loop (dequant + inverse
+    /// wavelet + inverse MC). Use false when this P-frame's decoded output won't
+    /// be used as a reference (e.g. last P before a keyframe or end of sequence).
+    /// Saves ~42 GPU dispatches per skipped frame.
     #[allow(clippy::too_many_arguments)]
     fn encode_pframe(
         &mut self,
@@ -502,6 +512,7 @@ impl EncoderPipeline {
         config: &CodecConfig,
         predictor_mvs: Option<&wgpu::Buffer>,
         save_bwd_ref: bool,
+        needs_decode: bool,
     ) -> (CompressedFrame, wgpu::Buffer) {
         let plane_size = (padded_pixels * std::mem::size_of::<f32>()) as u64;
 
@@ -679,58 +690,62 @@ impl EncoderPipeline {
             }
 
             // Phase 3: Local decode dispatches (same cmd encoder)
-            let quant_bufs: [&wgpu::Buffer; 3] =
-                [&bufs.recon_y, &bufs.co_plane, &bufs.plane_b];
-            for (p, quant_buf) in quant_bufs.iter().enumerate() {
-                let weights = if p == 0 {
-                    &weights_luma
-                } else {
-                    &weights_chroma
-                };
+            // Skipped when this P-frame won't be used as a reference
+            // (saves ~42 GPU dispatches = ~6-8ms per frame).
+            if needs_decode {
+                let quant_bufs: [&wgpu::Buffer; 3] =
+                    [&bufs.recon_y, &bufs.co_plane, &bufs.plane_b];
+                for (p, quant_buf) in quant_bufs.iter().enumerate() {
+                    let weights = if p == 0 {
+                        &weights_luma
+                    } else {
+                        &weights_chroma
+                    };
 
-                self.quantize.dispatch(
-                    ctx,
-                    &mut cmd,
-                    quant_buf,
-                    &bufs.cg_plane,
-                    padded_pixels as u32,
-                    config.quantization_step,
-                    config.dead_zone,
-                    false,
-                    padded_w,
-                    padded_h,
-                    config.tile_size,
-                    config.wavelet_levels,
-                    weights,
-                );
-                self.transform.inverse(
-                    ctx,
-                    &mut cmd,
-                    &bufs.cg_plane,
-                    &bufs.plane_c,
-                    &bufs.plane_a,
-                    info,
-                    config.wavelet_levels,
-                    config.wavelet_type,
-                );
-                self.motion.compensate_cached(
-                    ctx,
-                    &mut cmd,
-                    &bufs.plane_a,
-                    &bufs.gpu_ref_planes[p],
-                    &mv_buf,
-                    &bufs.recon_out,
-                    padded_w,
-                    padded_h,
-                    &bufs.mc_inv_params,
-                );
-                cmd.copy_buffer_to_buffer(
-                    &bufs.recon_out,
-                    0,
-                    &bufs.gpu_ref_planes[p],
-                    0,
-                    plane_size,
-                );
+                    self.quantize.dispatch(
+                        ctx,
+                        &mut cmd,
+                        quant_buf,
+                        &bufs.cg_plane,
+                        padded_pixels as u32,
+                        config.quantization_step,
+                        config.dead_zone,
+                        false,
+                        padded_w,
+                        padded_h,
+                        config.tile_size,
+                        config.wavelet_levels,
+                        weights,
+                    );
+                    self.transform.inverse(
+                        ctx,
+                        &mut cmd,
+                        &bufs.cg_plane,
+                        &bufs.plane_c,
+                        &bufs.plane_a,
+                        info,
+                        config.wavelet_levels,
+                        config.wavelet_type,
+                    );
+                    self.motion.compensate_cached(
+                        ctx,
+                        &mut cmd,
+                        &bufs.plane_a,
+                        &bufs.gpu_ref_planes[p],
+                        &mv_buf,
+                        &bufs.recon_out,
+                        padded_w,
+                        padded_h,
+                        &bufs.mc_inv_params,
+                    );
+                    cmd.copy_buffer_to_buffer(
+                        &bufs.recon_out,
+                        0,
+                        &bufs.gpu_ref_planes[p],
+                        0,
+                        plane_size,
+                    );
+                }
             }
 
             // MV staging copy using cached staging buffer
@@ -928,12 +943,8 @@ impl EncoderPipeline {
         };
 
         // === Batched local decode + MV copy: single command encoder ===
-        // Quantized data on GPU: Y in recon_y, Co in co_plane, Cg in plane_b.
-        // Uses cg_plane as scratch (original Cg spatial data no longer needed).
-        // MV staging copy piggybacks on this batch to avoid an extra submit.
         let mv_staging =
             MotionEstimator::create_mv_staging(ctx, &mv_buf, me_total_blocks);
-        let quant_bufs: [&wgpu::Buffer; 3] = [&bufs.recon_y, &bufs.co_plane, &bufs.plane_b];
         {
             let mut cmd = ctx
                 .device
@@ -941,56 +952,60 @@ impl EncoderPipeline {
                     label: Some("pf_local_decode"),
                 });
 
-            for (p, quant_buf) in quant_bufs.iter().enumerate() {
-                let weights = if p == 0 {
-                    &weights_luma
-                } else {
-                    &weights_chroma
-                };
+            if needs_decode {
+                let quant_bufs: [&wgpu::Buffer; 3] =
+                    [&bufs.recon_y, &bufs.co_plane, &bufs.plane_b];
+                for (p, quant_buf) in quant_bufs.iter().enumerate() {
+                    let weights = if p == 0 {
+                        &weights_luma
+                    } else {
+                        &weights_chroma
+                    };
 
-                self.quantize.dispatch(
-                    ctx,
-                    &mut cmd,
-                    quant_buf,
-                    &bufs.cg_plane,
-                    padded_pixels as u32,
-                    config.quantization_step,
-                    config.dead_zone,
-                    false,
-                    padded_w,
-                    padded_h,
-                    config.tile_size,
-                    config.wavelet_levels,
-                    weights,
-                );
-                self.transform.inverse(
-                    ctx,
-                    &mut cmd,
-                    &bufs.cg_plane,
-                    &bufs.plane_c,
-                    &bufs.plane_a,
-                    info,
-                    config.wavelet_levels,
-                    config.wavelet_type,
-                );
-                self.motion.compensate(
-                    ctx,
-                    &mut cmd,
-                    &bufs.plane_a,
-                    &bufs.gpu_ref_planes[p],
-                    &mv_buf,
-                    &bufs.recon_out,
-                    padded_w,
-                    padded_h,
-                    false,
-                );
-                cmd.copy_buffer_to_buffer(
-                    &bufs.recon_out,
-                    0,
-                    &bufs.gpu_ref_planes[p],
-                    0,
-                    plane_size,
-                );
+                    self.quantize.dispatch(
+                        ctx,
+                        &mut cmd,
+                        quant_buf,
+                        &bufs.cg_plane,
+                        padded_pixels as u32,
+                        config.quantization_step,
+                        config.dead_zone,
+                        false,
+                        padded_w,
+                        padded_h,
+                        config.tile_size,
+                        config.wavelet_levels,
+                        weights,
+                    );
+                    self.transform.inverse(
+                        ctx,
+                        &mut cmd,
+                        &bufs.cg_plane,
+                        &bufs.plane_c,
+                        &bufs.plane_a,
+                        info,
+                        config.wavelet_levels,
+                        config.wavelet_type,
+                    );
+                    self.motion.compensate(
+                        ctx,
+                        &mut cmd,
+                        &bufs.plane_a,
+                        &bufs.gpu_ref_planes[p],
+                        &mv_buf,
+                        &bufs.recon_out,
+                        padded_w,
+                        padded_h,
+                        false,
+                    );
+                    cmd.copy_buffer_to_buffer(
+                        &bufs.recon_out,
+                        0,
+                        &bufs.gpu_ref_planes[p],
+                        0,
+                        plane_size,
+                    );
+                }
             }
 
             // MV copy in same batch — no extra submit round-trip

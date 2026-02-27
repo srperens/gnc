@@ -7,6 +7,15 @@ use crate::GpuContext;
 pub const ME_BLOCK_SIZE: u32 = 16;
 pub const ME_SEARCH_RANGE: u32 = 64;
 
+/// Staging buffer for deferred MV readback. Created by `create_mv_staging`,
+/// consumed by `finish_mv_readback`. Allows the GPU copy to piggyback on
+/// another command encoder (e.g. local decode batch) instead of a separate submit.
+pub struct MvStaging {
+    pub buffer: wgpu::Buffer,
+    pub size: u64,
+    pub total_blocks: u32,
+}
+
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 struct BlockMatchParams {
@@ -675,31 +684,55 @@ impl MotionEstimator {
             })
     }
 
-    /// Read motion vectors from GPU buffer back to CPU.
+    /// Read motion vectors from GPU buffer back to CPU (self-contained, creates its own submit).
     pub fn read_motion_vectors(
         ctx: &GpuContext,
         mv_buf: &wgpu::Buffer,
         total_blocks: u32,
     ) -> Vec<[i16; 2]> {
-        let count = total_blocks as usize * 2;
-        let size = (count * std::mem::size_of::<i32>()) as u64;
-
-        let staging = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("mv_staging"),
-            size,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let staging = Self::create_mv_staging(ctx, mv_buf, total_blocks);
 
         let mut cmd = ctx
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("copy_mv"),
             });
-        cmd.copy_buffer_to_buffer(mv_buf, 0, &staging, 0, size);
+        cmd.copy_buffer_to_buffer(mv_buf, 0, &staging.buffer, 0, staging.size);
         ctx.queue.submit(Some(cmd.finish()));
 
-        let slice = staging.slice(..);
+        Self::finish_mv_readback(ctx, &staging)
+    }
+
+    /// Create MV staging buffer and return it for deferred copy.
+    /// The caller adds `copy_buffer_to_buffer(mv_buf, 0, staging.buffer, 0, staging.size)`
+    /// to their own command encoder, allowing the copy to piggyback on other GPU work.
+    pub fn create_mv_staging(
+        ctx: &GpuContext,
+        _mv_buf: &wgpu::Buffer,
+        total_blocks: u32,
+    ) -> MvStaging {
+        let count = total_blocks as usize * 2;
+        let size = (count * std::mem::size_of::<i32>()) as u64;
+
+        let buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mv_staging"),
+            size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        MvStaging {
+            buffer,
+            size,
+            total_blocks,
+        }
+    }
+
+    /// Map and read MV data from a staging buffer. Call after the command encoder
+    /// containing the copy has been submitted and the GPU work is complete (or will
+    /// be drained by poll).
+    pub fn finish_mv_readback(ctx: &GpuContext, staging: &MvStaging) -> Vec<[i16; 2]> {
+        let slice = staging.buffer.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |result| {
             tx.send(result).unwrap();
@@ -710,13 +743,13 @@ impl MotionEstimator {
         let data = slice.get_mapped_range();
         let i32_data: &[i32] = bytemuck::cast_slice(&data);
 
-        let mut mvs = Vec::with_capacity(total_blocks as usize);
-        for i in 0..total_blocks as usize {
+        let mut mvs = Vec::with_capacity(staging.total_blocks as usize);
+        for i in 0..staging.total_blocks as usize {
             mvs.push([i32_data[i * 2] as i16, i32_data[i * 2 + 1] as i16]);
         }
 
         drop(data);
-        staging.unmap();
+        staging.buffer.unmap();
         mvs
     }
 

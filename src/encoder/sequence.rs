@@ -724,9 +724,12 @@ impl EncoderPipeline {
             EntropyMode::Rice => EntropyData::Rice(rice_tiles),
         };
 
-        // === Batched local decode: all 3 planes in one command encoder ===
+        // === Batched local decode + MV copy: single command encoder ===
         // Quantized data on GPU: Y in recon_y, Co in co_plane, Cg in plane_b.
         // Uses cg_plane as scratch (original Cg spatial data no longer needed).
+        // MV staging copy piggybacks on this batch to avoid an extra submit.
+        let mv_staging =
+            MotionEstimator::create_mv_staging(ctx, &mv_buf, me_total_blocks);
         let quant_bufs: [&wgpu::Buffer; 3] = [&bufs.recon_y, &bufs.co_plane, &bufs.plane_b];
         {
             let mut cmd = ctx
@@ -787,11 +790,14 @@ impl EncoderPipeline {
                 );
             }
 
+            // MV copy in same batch — no extra submit round-trip
+            cmd.copy_buffer_to_buffer(&mv_buf, 0, &mv_staging.buffer, 0, mv_staging.size);
+
             ctx.queue.submit(Some(cmd.finish()));
         }
 
-        // === Deferred MV readback for bitstream serialization ===
-        let mvs = MotionEstimator::read_motion_vectors(ctx, &mv_buf, me_total_blocks);
+        // Single poll drains local decode + MV copy together
+        let mvs = MotionEstimator::finish_mv_readback(ctx, &mv_staging);
 
         CompressedFrame {
             info: *info,

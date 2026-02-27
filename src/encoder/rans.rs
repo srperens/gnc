@@ -829,7 +829,7 @@ pub struct SubbandGroupFreqs {
 
 /// A compressed tile using per-subband frequency tables + 32 interleaved rANS streams.
 ///
-/// Each of the `num_groups` (= 1 + num_levels) subband groups gets its own frequency table.
+/// Each of the `num_groups` (= num_levels * 2) subband groups gets its own frequency table.
 /// During encoding/decoding, the table selection for each coefficient is determined by its
 /// 2D position within the tile (which subband group it falls in).
 ///

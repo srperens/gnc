@@ -103,8 +103,8 @@ pub(crate) fn entropy_decode_plane(
             EntropyData::Rans(tiles) => rans::rans_decode_tile_interleaved(&tiles[tile_start + t]),
             EntropyData::SubbandRans(tiles) => {
                 let tile = &tiles[tile_start + t];
-                // Detect context-adaptive mode: expanded group count > 1 + num_levels
-                let expected_plain = 1 + tile.num_levels;
+                // Detect context-adaptive mode: plain subbands have num_levels*2 groups
+                let expected_plain = tile.num_levels * 2;
                 if tile.num_groups > expected_plain {
                     rans::rans_decode_tile_interleaved_subband_ctx(tile)
                 } else {

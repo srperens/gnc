@@ -4,6 +4,36 @@
 
 ---
 
+## 2026-02-27: Temporal MV prediction for P-frames
+
+### Hypothesis
+Consecutive P-frames have highly correlated motion vectors. Using the previous P-frame's MVs as predictors can skip the expensive coarse search (4,225 candidates) and only do fine refinement (81 candidates at ±4), reducing ME cost by ~4x for predicted frames.
+
+### Implementation
+- Modified `block_match.wgsl` to accept a `predictor_mvs` buffer and `use_predictor` flag
+- When predictor is available: skip Phase 1 (coarse search), convert half-pel MV to integer-pel, use as starting point for Phase 2 (fine search) with configurable range
+- Added `predictor_mvs: Option<&wgpu::Buffer>` parameter to `MotionEstimator::estimate()`
+- In sequence loop: track `prev_mv_buf`, pass to next P-frame, reset on keyframe
+- `encode_pframe` returns `(CompressedFrame, wgpu::Buffer)` to propagate MV buffer
+
+### Results (bbb_1080p, q=50, ki=3 P-only)
+
+| P-frame type | Time | Loads/block |
+|-------------|------|-------------|
+| First P (no predictor) | 60ms | 88K (coarse+fine) |
+| Predicted P (±4 fine) | 45ms | 21K (fine only) |
+| Improvement | **-25%** | **-76%** |
+
+Quality identical: 37.83-37.84 dB for both paths.
+
+### Analysis
+1. 15ms savings per predicted P-frame. The coarse search (4,225 × 16 = 67.6K loads) is entirely eliminated for predicted frames.
+2. Tested ±8 predictor fine range (74K loads) — only 5-6ms savings because full-resolution SAD is expensive even with fewer candidates.
+3. ±4 is optimal for same-content frames. For real video with large inter-frame motion changes, ±8 may be needed (configurable via ME_PRED_FINE_RANGE).
+4. B-frames don't benefit yet (they use bidir ME which doesn't have temporal prediction).
+
+---
+
 ## 2026-02-27: ME search range reduction — ±64 → ±32
 
 ### Hypothesis

@@ -18,8 +18,10 @@ struct Params {
     search_range: u32,
     blocks_x: u32,
     total_blocks: u32,
-    _pad0: u32,
-    _pad1: u32,
+    // Non-zero: skip coarse search, use predictor_mvs as starting point
+    use_predictor: u32,
+    // Fine search range when using predictor (in pixels)
+    pred_fine_range: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -27,6 +29,7 @@ struct Params {
 @group(0) @binding(2) var<storage, read> reference_y: array<f32>;
 @group(0) @binding(3) var<storage, read_write> motion_vectors: array<i32>;
 @group(0) @binding(4) var<storage, read_write> sad_values: array<u32>;
+@group(0) @binding(5) var<storage, read> predictor_mvs: array<i32>;
 
 var<workgroup> shared_sad: array<u32, 256>;
 var<workgroup> shared_mv: array<u32, 256>;
@@ -119,58 +122,82 @@ fn main(
     let w = i32(params.width);
     let h = i32(params.height);
 
-    // ========== Phase 1: Coarse search with subsampled SAD ==========
-    // Every COARSE_STRIDE-th pixel in each dimension: 4×4 = 16 samples from 16×16 block.
-    var best_sad: u32 = 0xFFFFFFFFu;
-    var best_dx: i32 = 0;
-    var best_dy: i32 = 0;
+    // ========== Phase 1: Coarse search or temporal predictor ==========
+    var coarse_dx: i32 = 0;
+    var coarse_dy: i32 = 0;
+    var fine_range: i32 = FINE_RANGE;
 
-    var cand_idx = tid;
-    loop {
-        if cand_idx >= total_candidates {
-            break;
+    if params.use_predictor != 0u {
+        // Temporal MV prediction: use previous frame's MV as starting point.
+        // Predictor MVs are in half-pel units — convert to integer-pel.
+        if tid == 0u {
+            let pred_hx = predictor_mvs[block_idx * 2u];
+            let pred_hy = predictor_mvs[block_idx * 2u + 1u];
+            // Round half-pel to nearest integer-pel
+            coarse_dx = (pred_hx + select(0, 1, pred_hx > 0)) / 2;
+            coarse_dy = (pred_hy + select(0, 1, pred_hy > 0)) / 2;
         }
+        shared_mv[0] = pack_mv(coarse_dx, coarse_dy);
+        workgroupBarrier();
+        let pred_packed = shared_mv[0];
+        coarse_dx = unpack_dx(pred_packed);
+        coarse_dy = unpack_dy(pred_packed);
+        workgroupBarrier();
+        fine_range = i32(params.pred_fine_range);
+    } else {
+        // Full coarse search with subsampled SAD
+        // Every COARSE_STRIDE-th pixel in each dimension: 4×4 = 16 samples from 16×16 block.
+        var best_sad: u32 = 0xFFFFFFFFu;
+        var best_dx: i32 = 0;
+        var best_dy: i32 = 0;
 
-        let cand_dy = i32(cand_idx / search_side) - sr;
-        let cand_dx = i32(cand_idx % search_side) - sr;
-        let ref_x = i32(block_origin_x) + cand_dx;
-        let ref_y = i32(block_origin_y) + cand_dy;
+        var cand_idx = tid;
+        loop {
+            if cand_idx >= total_candidates {
+                break;
+            }
 
-        if ref_x >= 0 && ref_y >= 0 &&
-           ref_x + bs <= w && ref_y + bs <= h {
-            var sad: u32 = 0u;
-            for (var py = 0u; py < params.block_size; py += COARSE_STRIDE) {
-                for (var px = 0u; px < params.block_size; px += COARSE_STRIDE) {
-                    let cur_idx = (block_origin_y + py) * params.width + block_origin_x + px;
-                    let r_idx = u32(ref_y + i32(py)) * params.width + u32(ref_x + i32(px));
-                    sad += u32(abs(current_y[cur_idx] - reference_y[r_idx]));
+            let cand_dy = i32(cand_idx / search_side) - sr;
+            let cand_dx = i32(cand_idx % search_side) - sr;
+            let ref_x = i32(block_origin_x) + cand_dx;
+            let ref_y = i32(block_origin_y) + cand_dy;
+
+            if ref_x >= 0 && ref_y >= 0 &&
+               ref_x + bs <= w && ref_y + bs <= h {
+                var sad: u32 = 0u;
+                for (var py = 0u; py < params.block_size; py += COARSE_STRIDE) {
+                    for (var px = 0u; px < params.block_size; px += COARSE_STRIDE) {
+                        let cur_idx = (block_origin_y + py) * params.width + block_origin_x + px;
+                        let r_idx = u32(ref_y + i32(py)) * params.width + u32(ref_x + i32(px));
+                        sad += u32(abs(current_y[cur_idx] - reference_y[r_idx]));
+                    }
+                }
+
+                if sad < best_sad {
+                    best_sad = sad;
+                    best_dx = cand_dx;
+                    best_dy = cand_dy;
                 }
             }
 
-            if sad < best_sad {
-                best_sad = sad;
-                best_dx = cand_dx;
-                best_dy = cand_dy;
-            }
+            cand_idx += 256u;
         }
 
-        cand_idx += 256u;
+        // Min-reduction for coarse winner
+        shared_sad[tid] = best_sad;
+        shared_mv[tid] = pack_mv(best_dx, best_dy);
+        workgroupBarrier();
+        min_reduce(tid);
+
+        let coarse_packed = shared_mv[0];
+        coarse_dx = unpack_dx(coarse_packed);
+        coarse_dy = unpack_dy(coarse_packed);
+        workgroupBarrier();
     }
 
-    // Min-reduction for coarse winner
-    shared_sad[tid] = best_sad;
-    shared_mv[tid] = pack_mv(best_dx, best_dy);
-    workgroupBarrier();
-    min_reduce(tid);
-
     // ========== Phase 2: Fine search with full 16×16 SAD ==========
-    // ±FINE_RANGE around coarse winner.
-    let coarse_packed = shared_mv[0];
-    let coarse_dx = unpack_dx(coarse_packed);
-    let coarse_dy = unpack_dy(coarse_packed);
-    workgroupBarrier();
-
-    let fine_side = u32(2 * FINE_RANGE + 1);
+    // ±fine_range around coarse winner (or predicted MV).
+    let fine_side = u32(2 * fine_range + 1);
     let fine_total = fine_side * fine_side;
 
     var fine_best_sad: u32 = 0xFFFFFFFFu;
@@ -183,8 +210,8 @@ fn main(
             break;
         }
 
-        let dy_off = i32(fine_idx / fine_side) - FINE_RANGE;
-        let dx_off = i32(fine_idx % fine_side) - FINE_RANGE;
+        let dy_off = i32(fine_idx / fine_side) - fine_range;
+        let dx_off = i32(fine_idx % fine_side) - fine_range;
         let test_dx = coarse_dx + dx_off;
         let test_dy = coarse_dy + dy_off;
         let ref_x = i32(block_origin_x) + test_dx;

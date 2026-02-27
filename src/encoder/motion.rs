@@ -6,6 +6,9 @@ use crate::GpuContext;
 
 pub const ME_BLOCK_SIZE: u32 = 16;
 pub const ME_SEARCH_RANGE: u32 = 32;
+/// Fine search range when using temporal MV predictor (±pixels).
+/// Same as FINE_RANGE since consecutive P-frames have highly correlated MVs.
+pub const ME_PRED_FINE_RANGE: u32 = 4;
 
 /// Staging buffer for deferred MV readback. Created by `create_mv_staging`,
 /// consumed by `finish_mv_readback`. Allows the GPU copy to piggyback on
@@ -25,8 +28,10 @@ struct BlockMatchParams {
     search_range: u32,
     blocks_x: u32,
     total_blocks: u32,
-    _pad0: u32,
-    _pad1: u32,
+    /// Non-zero: skip coarse search, use predictor_mvs as starting point for fine search.
+    use_predictor: u32,
+    /// Fine search range when using predictor (in pixels, e.g. 8 for ±8).
+    pred_fine_range: u32,
 }
 
 #[repr(C)]
@@ -84,7 +89,7 @@ impl MotionEstimator {
                 ),
             });
 
-        // Block match bind group layout: uniform, current_y, reference_y, mvs, sads
+        // Block match bind group layout: uniform, current_y, reference_y, mvs, sads, predictor_mvs
         let match_bgl = ctx
             .device
             .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -95,6 +100,7 @@ impl MotionEstimator {
                     bgl_storage_ro(2),
                     bgl_storage_rw(3),
                     bgl_storage_rw(4),
+                    bgl_storage_ro(5),
                 ],
             });
 
@@ -257,7 +263,11 @@ impl MotionEstimator {
     }
 
     /// Dispatch block matching motion estimation on GPU.
-    /// Returns (mv_buffer, sad_buffer). MVs are stored as i32 pairs (dx, dy).
+    /// Returns (mv_buffer, sad_buffer). MVs are stored as i32 pairs (dx, dy) in half-pel units.
+    ///
+    /// When `predictor_mvs` is provided (from previous P-frame), the shader skips the
+    /// expensive coarse search and uses the predicted MV as the starting point for a fine
+    /// search with ±`ME_PRED_FINE_RANGE` pixels. This typically reduces ME cost by ~4x.
     pub fn estimate(
         &self,
         ctx: &GpuContext,
@@ -266,11 +276,13 @@ impl MotionEstimator {
         reference_y: &wgpu::Buffer,
         width: u32,
         height: u32,
+        predictor_mvs: Option<&wgpu::Buffer>,
     ) -> (wgpu::Buffer, wgpu::Buffer) {
         let blocks_x = width / ME_BLOCK_SIZE;
         let blocks_y = height / ME_BLOCK_SIZE;
         let total_blocks = blocks_x * blocks_y;
 
+        let has_predictor = predictor_mvs.is_some();
         let params = BlockMatchParams {
             width,
             height,
@@ -278,8 +290,8 @@ impl MotionEstimator {
             search_range: ME_SEARCH_RANGE,
             blocks_x,
             total_blocks,
-            _pad0: 0,
-            _pad1: 0,
+            use_predictor: u32::from(has_predictor),
+            pred_fine_range: ME_PRED_FINE_RANGE,
         };
 
         let params_buf = ctx
@@ -304,6 +316,20 @@ impl MotionEstimator {
             mapped_at_creation: false,
         });
 
+        // Dummy predictor buffer when none provided (shader won't read it)
+        let dummy_pred;
+        let pred_buf = if let Some(pred) = predictor_mvs {
+            pred
+        } else {
+            dummy_pred = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("dummy_pred_mvs"),
+                size: 8, // minimum valid size
+                usage: wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            });
+            &dummy_pred
+        };
+
         let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("block_match_bg"),
             layout: &self.match_bgl,
@@ -327,6 +353,10 @@ impl MotionEstimator {
                 wgpu::BindGroupEntry {
                     binding: 4,
                     resource: sad_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: pred_buf.as_entire_binding(),
                 },
             ],
         });
@@ -450,8 +480,8 @@ impl MotionEstimator {
             search_range: ME_SEARCH_RANGE,
             blocks_x,
             total_blocks,
-            _pad0: 0,
-            _pad1: 0,
+            use_predictor: 0,
+            pred_fine_range: 0,
         };
 
         let params_buf = ctx
@@ -1083,7 +1113,7 @@ mod tests {
                 label: Some("test_me"),
             });
         let (mv_buf, _sad_buf) =
-            me.estimate(&ctx, &mut cmd, &current_buf, &reference_buf, width, height);
+            me.estimate(&ctx, &mut cmd, &current_buf, &reference_buf, width, height, None);
         ctx.queue.submit(Some(cmd.finish()));
 
         let blocks_x = width / ME_BLOCK_SIZE;
@@ -1150,7 +1180,7 @@ mod tests {
                 label: Some("test_me_shift"),
             });
         let (mv_buf, _sad_buf) =
-            me.estimate(&ctx, &mut cmd, &current_buf, &reference_buf, width, height);
+            me.estimate(&ctx, &mut cmd, &current_buf, &reference_buf, width, height, None);
         ctx.queue.submit(Some(cmd.finish()));
 
         let blocks_x = width / ME_BLOCK_SIZE;

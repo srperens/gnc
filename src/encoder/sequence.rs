@@ -87,6 +87,11 @@ impl EncoderPipeline {
             .target_bitrate
             .map(|bitrate| RateController::new(bitrate, fps, width, height, config.rate_mode));
 
+        // Previous P-frame MV buffer for temporal prediction. When available, the ME
+        // shader skips the expensive coarse search and only does fine refinement around
+        // the predicted MV. Reset on keyframes (new GOP, prediction chain breaks).
+        let mut prev_mv_buf: Option<wgpu::Buffer> = None;
+
         let mut display_idx = 0;
         while display_idx < n {
             let is_keyframe = ki <= 1 || display_idx % ki == 0 || !has_reference;
@@ -117,6 +122,7 @@ impl EncoderPipeline {
                     eprintln!("  I-frame total: {:.1}ms", _t_iframe.elapsed().as_secs_f64() * 1000.0);
                 }
                 has_reference = true;
+                prev_mv_buf = None; // Reset MV predictor on keyframe
                 results[display_idx] = Some(compressed);
                 display_idx += 1;
                 continue;
@@ -124,7 +130,7 @@ impl EncoderPipeline {
 
             if !use_bframes {
                 // P-frame only mode
-                let compressed = self.encode_pframe(
+                let (compressed, new_mv_buf) = self.encode_pframe(
                     ctx,
                     frames[display_idx],
                     width,
@@ -134,7 +140,9 @@ impl EncoderPipeline {
                     padded_pixels,
                     &info,
                     &frame_config,
+                    prev_mv_buf.as_ref(),
                 );
+                prev_mv_buf = Some(new_mv_buf);
                 if let Some(ref mut rc) = rate_ctrl {
                     rc.update(frame_config.quantization_step, compressed.bpp());
                 }
@@ -165,7 +173,7 @@ impl EncoderPipeline {
                 } else {
                     config.clone()
                 };
-                let compressed = self.encode_pframe(
+                let (compressed, new_mv_buf) = self.encode_pframe(
                     ctx,
                     frames[p_display],
                     width,
@@ -175,7 +183,9 @@ impl EncoderPipeline {
                     padded_pixels,
                     &info,
                     &p_config,
+                    prev_mv_buf.as_ref(),
                 );
+                prev_mv_buf = Some(new_mv_buf);
                 if let Some(ref mut rc) = rate_ctrl {
                     rc.update(p_config.quantization_step, compressed.bpp());
                 }
@@ -225,7 +235,7 @@ impl EncoderPipeline {
                 } else {
                     config.clone()
                 };
-                let compressed = self.encode_pframe(
+                let (compressed, new_mv_buf) = self.encode_pframe(
                     ctx,
                     frames[j],
                     width,
@@ -235,7 +245,9 @@ impl EncoderPipeline {
                     padded_pixels,
                     &info,
                     &p_config,
+                    prev_mv_buf.as_ref(),
                 );
+                prev_mv_buf = Some(new_mv_buf);
                 if let Some(ref mut rc) = rate_ctrl {
                     rc.update(p_config.quantization_step, compressed.bpp());
                 }
@@ -440,6 +452,9 @@ impl EncoderPipeline {
     /// Optimized pipeline: MV buffer stays on GPU for MC (no readback/re-upload roundtrip).
     /// GPU work is batched into minimal command encoder submits. MV readback is deferred
     /// to the end for bitstream serialization only.
+    /// Encode a P-frame. Returns `(compressed_frame, mv_buffer)`.
+    /// The `mv_buffer` can be passed as `predictor_mvs` to the next P-frame for temporal
+    /// MV prediction (skip coarse search, only fine-refine around the predicted MV).
     #[allow(clippy::too_many_arguments)]
     fn encode_pframe(
         &mut self,
@@ -452,7 +467,8 @@ impl EncoderPipeline {
         padded_pixels: usize,
         info: &FrameInfo,
         config: &CodecConfig,
-    ) -> CompressedFrame {
+        predictor_mvs: Option<&wgpu::Buffer>,
+    ) -> (CompressedFrame, wgpu::Buffer) {
         let plane_size = (padded_pixels * std::mem::size_of::<f32>()) as u64;
 
         self.ensure_cached(ctx, padded_w, padded_h, width, height);
@@ -522,6 +538,7 @@ impl EncoderPipeline {
                 &bufs.gpu_ref_planes[0],
                 padded_w,
                 padded_h,
+                predictor_mvs,
             );
             mv_buf = mb;
 
@@ -681,7 +698,7 @@ impl EncoderPipeline {
                 EntropyMode::Rice => EntropyData::Rice(rice_tiles),
             };
 
-            return CompressedFrame {
+            return (CompressedFrame {
                 info: *info,
                 config: config.clone(),
                 entropy,
@@ -694,7 +711,7 @@ impl EncoderPipeline {
                     backward_vectors: None,
                     block_modes: None,
                 }),
-            };
+            }, mv_buf);
         } else {
             // CPU entropy path: preprocess + ME batched, then per-plane submits
             let mut cmd = ctx
@@ -728,6 +745,7 @@ impl EncoderPipeline {
                 &bufs.gpu_ref_planes[0],
                 padded_w,
                 padded_h,
+                predictor_mvs,
             );
             mv_buf = mb;
             ctx.queue.submit(Some(cmd.finish()));
@@ -898,7 +916,7 @@ impl EncoderPipeline {
         // Single poll drains local decode + MV copy together
         let mvs = MotionEstimator::finish_mv_readback(ctx, &mv_staging);
 
-        CompressedFrame {
+        (CompressedFrame {
             info: *info,
             config: config.clone(),
             entropy,
@@ -911,7 +929,7 @@ impl EncoderPipeline {
                 backward_vectors: None,
                 block_modes: None,
             }),
-        }
+        }, mv_buf)
     }
 
     /// Encode a B-frame with bidirectional prediction.

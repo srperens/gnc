@@ -154,6 +154,10 @@ enum Command {
         /// Default: 30.
         #[arg(long, default_value = "30")]
         fps: f64,
+
+        /// Use Rice entropy coder instead of rANS
+        #[arg(long)]
+        rice: bool,
     },
 
     /// Encode a sequence of image frames into a .gnv container
@@ -608,6 +612,7 @@ fn main() {
             bitrate,
             rate_mode,
             fps,
+            rice,
         } => {
             let qstep_display = qstep
                 .map(|q| format!("{}", q))
@@ -654,6 +659,9 @@ fn main() {
                 config_ip.quantization_step = qs;
             }
             config_ip.keyframe_interval = keyframe_interval;
+            if rice {
+                config_ip.entropy_coder = gnc::EntropyCoder::Rice;
+            }
 
             // Apply rate control settings
             if let Some(ref br) = bitrate {

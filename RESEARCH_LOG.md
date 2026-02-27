@@ -4,6 +4,38 @@
 
 ---
 
+## 2026-02-27: GPU Rice entropy for P/B frame sequence encode
+
+### Hypothesis
+rANS requires 3 dispatches per plane (histogram + normalize + encode) while Rice uses 1 dispatch per plane with 256 independent streams. Integrating GPU Rice into the P/B batched pipeline should reduce per-frame encode time.
+
+### Implementation
+- Added split-phase API to `GpuRiceEncoder`: `dispatch_3planes_to_cmd` (dispatches into external command encoder) + `finish_3planes_readback` (map + poll + pack).
+- Modified P-frame and B-frame GPU paths in `sequence.rs` to dispatch Rice when `entropy_mode == Rice`.
+- Added `--rice` flag to `benchmark-sequence` CLI.
+
+### Results (bbb_1080p, q=50, ki=8)
+
+| Frame type | rANS | Rice | Change |
+|-----------|------|------|--------|
+| I-frame | 38ms | 26ms | **-32%** |
+| First P | 61ms | 52ms | **-15%** |
+| Predicted P | 47ms | 35ms | **-26%** |
+| First B | 90ms | 78ms | **-13%** |
+| Predicted B | 86ms | 72ms | **-16%** |
+| 30-frame fps | 13.4 | 15.8 | **+18%** |
+| I-only fps | 25.8 | 34.4 | **+33%** |
+
+Quality identical (37.68–37.90 dB). BPP: 0.99 (Rice) vs 0.72 (rANS) — +38% at q=50.
+
+### Analysis
+1. Rice uses 1 dispatch per plane vs rANS's 3 (histogram + normalize + encode). Eliminating 6 dispatches per frame reduces GPU pipeline overhead.
+2. Rice's 256 independent streams have no state chain, enabling maximum GPU parallelism.
+3. BPP overhead at q=50 (+38%) is acceptable for speed-critical use cases. At q≥75, Rice compresses better than rANS.
+4. Negative result: split-submit optimization (local decode overlap with readback) was slower on M1 unified memory — extra submit overhead > overlap benefit.
+
+---
+
 ## 2026-02-27: Temporal MV prediction for bidir ME (B-frames)
 
 ### Hypothesis

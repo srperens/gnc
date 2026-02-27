@@ -608,14 +608,25 @@ impl EncoderPipeline {
             }
 
             // Phase 2: GPU entropy encode dispatches + staging copies (same cmd encoder)
-            self.gpu_encoder.dispatch_3planes_to_cmd(
-                ctx,
-                &mut cmd,
-                [&bufs.recon_y, &bufs.co_plane, &bufs.plane_b],
-                info,
-                config.per_subband_entropy,
-                config.wavelet_levels,
-            );
+            let use_rice = matches!(entropy_mode, EntropyMode::Rice);
+            if use_rice {
+                self.gpu_rice_encoder.dispatch_3planes_to_cmd(
+                    ctx,
+                    &mut cmd,
+                    [&bufs.recon_y, &bufs.co_plane, &bufs.plane_b],
+                    info,
+                    config.wavelet_levels,
+                );
+            } else {
+                self.gpu_encoder.dispatch_3planes_to_cmd(
+                    ctx,
+                    &mut cmd,
+                    [&bufs.recon_y, &bufs.co_plane, &bufs.plane_b],
+                    info,
+                    config.per_subband_entropy,
+                    config.wavelet_levels,
+                );
+            }
 
             // Phase 3: Local decode dispatches (same cmd encoder)
             let quant_bufs: [&wgpu::Buffer; 3] =
@@ -682,17 +693,25 @@ impl EncoderPipeline {
             ctx.queue.submit(Some(cmd.finish()));
 
             // Single poll drains forward + entropy + local decode + MV copy
-            let (mut rt, mut st) = self.gpu_encoder.finish_3planes_readback(
-                ctx,
-                info,
-                config.per_subband_entropy,
-                config.wavelet_levels,
-            );
+            if use_rice {
+                rice_tiles = self.gpu_rice_encoder.finish_3planes_readback(
+                    ctx,
+                    info,
+                    config.wavelet_levels,
+                );
+            } else {
+                let (mut rt, mut st) = self.gpu_encoder.finish_3planes_readback(
+                    ctx,
+                    info,
+                    config.per_subband_entropy,
+                    config.wavelet_levels,
+                );
+                rans_tiles.append(&mut rt);
+                subband_tiles.append(&mut st);
+            }
             if std::env::var("GNC_PROFILE").is_ok() {
                 eprintln!("  P-frame GPU+readback: {:.1}ms", _t_submit.elapsed().as_secs_f64() * 1000.0);
             }
-            rans_tiles.append(&mut rt);
-            subband_tiles.append(&mut st);
 
             let mvs = MotionEstimator::finish_mv_readback(ctx, &mv_staging);
 
@@ -1100,14 +1119,25 @@ impl EncoderPipeline {
             }
 
             // Phase 2: GPU entropy encode dispatches (same cmd)
-            self.gpu_encoder.dispatch_3planes_to_cmd(
-                ctx,
-                &mut cmd,
-                [&bufs.recon_y, &bufs.co_plane, &bufs.plane_b],
-                info,
-                config.per_subband_entropy,
-                config.wavelet_levels,
-            );
+            let use_rice = matches!(entropy_mode, EntropyMode::Rice);
+            if use_rice {
+                self.gpu_rice_encoder.dispatch_3planes_to_cmd(
+                    ctx,
+                    &mut cmd,
+                    [&bufs.recon_y, &bufs.co_plane, &bufs.plane_b],
+                    info,
+                    config.wavelet_levels,
+                );
+            } else {
+                self.gpu_encoder.dispatch_3planes_to_cmd(
+                    ctx,
+                    &mut cmd,
+                    [&bufs.recon_y, &bufs.co_plane, &bufs.plane_b],
+                    info,
+                    config.per_subband_entropy,
+                    config.wavelet_levels,
+                );
+            }
 
             // Phase 3: Bidir MV + modes staging copies (same cmd)
             let bidir_staging =
@@ -1127,17 +1157,25 @@ impl EncoderPipeline {
             ctx.queue.submit(Some(cmd.finish()));
 
             // Single poll drains everything
-            let (mut rt, mut st) = self.gpu_encoder.finish_3planes_readback(
-                ctx,
-                info,
-                config.per_subband_entropy,
-                config.wavelet_levels,
-            );
+            if use_rice {
+                rice_tiles = self.gpu_rice_encoder.finish_3planes_readback(
+                    ctx,
+                    info,
+                    config.wavelet_levels,
+                );
+            } else {
+                let (mut rt, mut st) = self.gpu_encoder.finish_3planes_readback(
+                    ctx,
+                    info,
+                    config.per_subband_entropy,
+                    config.wavelet_levels,
+                );
+                rans_tiles.append(&mut rt);
+                subband_tiles.append(&mut st);
+            }
             if std::env::var("GNC_PROFILE").is_ok() {
                 eprintln!("  B-frame GPU+readback: {:.1}ms", _t_submit.elapsed().as_secs_f64() * 1000.0);
             }
-            rans_tiles.append(&mut rt);
-            subband_tiles.append(&mut st);
 
             let (fwd_mvs, bwd_mvs, block_modes) =
                 MotionEstimator::finish_bidir_readback(ctx, &bidir_staging);

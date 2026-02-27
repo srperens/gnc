@@ -9,7 +9,7 @@
 
 const STREAMS_PER_TILE: u32 = 256u;
 const MAX_GROUPS: u32 = 8u;
-const K_STRIDE: u32 = 9u;  // MAX_GROUPS + 1: stride per tile in k_values (room for k_zrl)
+const K_STRIDE: u32 = 16u;  // MAX_GROUPS * 2: stride per tile in k_values (mag k + zrl k per group)
 
 struct Params {
     num_tiles: u32,
@@ -28,9 +28,9 @@ struct Params {
 @group(0) @binding(3) var<storage, read> stream_offsets: array<u32>;
 @group(0) @binding(4) var<storage, read_write> output: array<f32>;
 
-// Shared k values for this tile
+// Shared k values for this tile (magnitude k per group + zrl k per group)
 var<workgroup> shared_k: array<u32, 8>;
-var<workgroup> shared_k_zrl: u32;
+var<workgroup> shared_k_zrl: array<u32, 8>;
 
 // Per-thread bit-reader state
 var<private> p_current_byte: u32;
@@ -128,16 +128,12 @@ fn main(
     let symbols_per_stream = params.coefficients_per_tile / STREAMS_PER_TILE;
     let num_groups = params.num_levels * 2u;
 
-    // Cooperatively load k values + k_zrl into shared memory (stride K_STRIDE)
+    // Cooperatively load k values + per-subband k_zrl into shared memory (stride K_STRIDE)
     if (thread_id < num_groups) {
         shared_k[thread_id] = k_values[tile_id * K_STRIDE + thread_id];
-    }
-    if (thread_id == 0u) {
-        shared_k_zrl = k_values[tile_id * K_STRIDE + num_groups];
+        shared_k_zrl[thread_id] = k_values[tile_id * K_STRIDE + MAX_GROUPS + thread_id];
     }
     workgroupBarrier();
-
-    let k_zrl = shared_k_zrl;
 
     // Initialize bit reader with this stream's byte offset
     let stream_idx = tile_id * STREAMS_PER_TILE + thread_id;
@@ -150,8 +146,12 @@ fn main(
     while (s < symbols_per_stream) {
         let token = read_bit();
         if (token == 0u) {
-            // Zero run: Rice-decode run length
-            let run = read_rice(k_zrl) + 1u;
+            // Zero run: use subband of first zero for k_zrl
+            let zi = thread_id + s * STREAMS_PER_TILE;
+            let zr = zi / params.tile_size;
+            let zc = zi % params.tile_size;
+            let g_zrl = compute_subband_group(zc, zr);
+            let run = read_rice(shared_k_zrl[g_zrl]) + 1u;
             for (var j = 0u; j < run; j++) {
                 let ci = thread_id + (s + j) * STREAMS_PER_TILE;
                 let cr = ci / params.tile_size;

@@ -521,7 +521,7 @@ pub fn substitute_tiles(frame: &mut crate::CompressedFrame, tile_indices: &[usiz
                         num_levels: t.num_levels,
                         num_groups: t.num_groups,
                         k_values: vec![0; t.num_groups as usize],
-                        k_zrl: 0,
+                        k_zrl_values: vec![0; t.num_groups as usize],
                         stream_lengths: vec![0; rice::RICE_STREAMS_PER_TILE],
                         stream_data: Vec::new(),
                     };

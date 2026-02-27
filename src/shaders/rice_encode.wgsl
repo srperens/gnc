@@ -15,7 +15,7 @@ const STREAMS_PER_TILE: u32 = 256u;
 const MAX_STREAM_BYTES: u32 = 2048u;
 const MAX_STREAM_WORDS: u32 = 512u;  // MAX_STREAM_BYTES / 4
 const MAX_GROUPS: u32 = 8u;
-const K_STRIDE: u32 = 9u;  // MAX_GROUPS + 1: stride per tile in k_output (room for k_zrl)
+const K_STRIDE: u32 = 16u;  // MAX_GROUPS * 2: stride per tile in k_output (mag k + zrl k per group)
 
 struct Params {
     num_tiles: u32,
@@ -38,10 +38,10 @@ struct Params {
 var<workgroup> group_sum: array<atomic<u32>, 8>;
 var<workgroup> group_count: array<atomic<u32>, 8>;
 var<workgroup> shared_k: array<u32, 8>;
-// ZRL stats
-var<workgroup> zrl_sum: atomic<u32>;
-var<workgroup> zrl_count: atomic<u32>;
-var<workgroup> shared_k_zrl: u32;
+// Per-subband ZRL stats
+var<workgroup> zrl_sum: array<atomic<u32>, 8>;
+var<workgroup> zrl_count: array<atomic<u32>, 8>;
+var<workgroup> shared_k_zrl: array<u32, 8>;
 
 // Per-thread bit-packing state
 var<private> p_bit_buffer: u32;
@@ -150,15 +150,16 @@ fn main(
         atomicStore(&group_sum[thread_id], 0u);
         atomicStore(&group_count[thread_id], 0u);
     }
-    if (thread_id == 0u) {
-        atomicStore(&zrl_sum, 0u);
-        atomicStore(&zrl_count, 0u);
+    if (thread_id < MAX_GROUPS) {
+        atomicStore(&zrl_sum[thread_id], 0u);
+        atomicStore(&zrl_count[thread_id], 0u);
     }
     workgroupBarrier();
 
-    // Each thread scans its stream: accumulate magnitude stats + zero-run stats
+    // Each thread scans its stream: accumulate magnitude stats + per-subband zero-run stats
     {
         var zero_run = 0u;
+        var zrl_group = 0u;  // subband group of first zero in current run
         for (var s = 0u; s < symbols_per_stream; s++) {
             let coeff_idx = thread_id + s * STREAMS_PER_TILE;
             let tile_row = coeff_idx / params.tile_size;
@@ -173,17 +174,21 @@ fn main(
                 atomicAdd(&group_sum[g], min(abs_val, 65535u));
                 atomicAdd(&group_count[g], 1u);
                 if (zero_run > 0u) {
-                    atomicAdd(&zrl_sum, min(zero_run - 1u, 65535u));
-                    atomicAdd(&zrl_count, 1u);
+                    atomicAdd(&zrl_sum[zrl_group], min(zero_run - 1u, 65535u));
+                    atomicAdd(&zrl_count[zrl_group], 1u);
                     zero_run = 0u;
                 }
             } else {
+                if (zero_run == 0u) {
+                    // First zero in a new run — record its subband
+                    zrl_group = compute_subband_group(tile_col, tile_row);
+                }
                 zero_run += 1u;
             }
         }
         if (zero_run > 0u) {
-            atomicAdd(&zrl_sum, min(zero_run - 1u, 65535u));
-            atomicAdd(&zrl_count, 1u);
+            atomicAdd(&zrl_sum[zrl_group], min(zero_run - 1u, 65535u));
+            atomicAdd(&zrl_count[zrl_group], 1u);
         }
     }
     workgroupBarrier();
@@ -202,33 +207,29 @@ fn main(
             shared_k[thread_id] = 0u;
         }
     }
-    if (thread_id == 0u) {
-        let zc = atomicLoad(&zrl_count);
+    // Compute per-subband k_zrl values
+    if (thread_id < num_groups) {
+        let zc = atomicLoad(&zrl_count[thread_id]);
         if (zc > 0u) {
-            let zmean = atomicLoad(&zrl_sum) / zc;
+            let zmean = atomicLoad(&zrl_sum[thread_id]) / zc;
             if (zmean == 0u) {
-                shared_k_zrl = 0u;
+                shared_k_zrl[thread_id] = 0u;
             } else {
-                shared_k_zrl = min(31u - countLeadingZeros(zmean), 15u);
+                shared_k_zrl[thread_id] = min(31u - countLeadingZeros(zmean), 15u);
             }
         } else {
-            shared_k_zrl = 0u;
+            shared_k_zrl[thread_id] = 0u;
         }
     }
     workgroupBarrier();
 
-    // Write k values + k_zrl to output (stride K_STRIDE to avoid overlap)
+    // Write k values (mag + zrl) to output (stride K_STRIDE = MAX_GROUPS * 2)
     if (thread_id < num_groups) {
         k_output[tile_id * K_STRIDE + thread_id] = shared_k[thread_id];
-    }
-    if (thread_id == num_groups) {
-        // Store k_zrl right after k_values for this tile
-        k_output[tile_id * K_STRIDE + num_groups] = shared_k_zrl;
+        k_output[tile_id * K_STRIDE + MAX_GROUPS + thread_id] = shared_k_zrl[thread_id];
     }
 
-    // === Phase 2: Encode stream with ZRL ===
-
-    let k_zrl = shared_k_zrl;
+    // === Phase 2: Encode stream with per-subband ZRL ===
 
     // Initialize per-thread state
     p_stream_word_base = (tile_id * STREAMS_PER_TILE + thread_id) * MAX_STREAM_WORDS;
@@ -249,10 +250,15 @@ fn main(
         let coeff = i32(round(input[plane_idx]));
 
         if (coeff == 0) {
-            // Count zero run
+            // Use subband of first zero for k_zrl selection
+            let g_zrl = compute_subband_group(tile_col, tile_row);
+            let k_zrl = shared_k_zrl[g_zrl];
+
+            // Count zero run (cap at max encodable for this k_zrl to avoid desync)
+            let max_run = 32u << k_zrl;
             var run = 1u;
             var ns = s + 1u;
-            while (ns < symbols_per_stream) {
+            while (ns < symbols_per_stream && run < max_run) {
                 let ni = thread_id + ns * STREAMS_PER_TILE;
                 let nr = ni / params.tile_size;
                 let nc = ni % params.tile_size;
@@ -266,9 +272,9 @@ fn main(
 
             // Token: zero run
             emit_bit(0u);
-            // Rice-code the run length - 1
+            // Rice-code the run length - 1 (always fits since run <= max_run)
             let run_val = run - 1u;
-            let rq = min(run_val >> k_zrl, 31u);
+            let rq = run_val >> k_zrl;
             var rq_rem = rq;
             while (rq_rem > 0u) {
                 let chunk = min(rq_rem, 15u);

@@ -26,10 +26,10 @@ Two entropy coders with different tradeoffs. Rice+ZRL is faster; rANS compresses
 
 | Quality | PSNR | BPP | Encode | Decode |
 |---------|------|-----|--------|--------|
-| q=25 | 33.2 dB | 1.73 | 40 fps | 74 fps |
-| q=50 | 37.5 dB | 2.42 | 42 fps | 62 fps |
-| q=75 | 42.1 dB | 4.09 | 40 fps | 60 fps |
-| q=90 | 49.2 dB | 8.96 | 40 fps | 64 fps |
+| q=25 | 33.2 dB | 1.71 | 39 fps | 72 fps |
+| q=50 | 37.7 dB | 2.37 | 40 fps | 60 fps |
+| q=75 | 42.8 dB | 4.01 | 40 fps | 59 fps |
+| q=90 | 50.5 dB | 8.90 | 40 fps | 63 fps |
 
 **rANS — compression path (32 interleaved streams/tile):**
 
@@ -59,7 +59,7 @@ Two entropy coders with different tradeoffs. Rice+ZRL is faster; rANS compresses
 **Known gaps:**
 - Sequence encode 6.5 fps (target: 30+ fps) — no multi-frame GPU overlap yet
 - Single-frame encode 40 fps Rice, 30 fps rANS (target: 60 fps)
-- Rice at q=25 is +34% bpp vs rANS (needs adaptive k_zrl per subband)
+- Rice at q=25 is +33% bpp vs rANS (per-subband k_zrl implemented, gap is structural)
 - Rice q=100 is near-lossless (56 dB) not bit-exact — only rANS supports true lossless
 - Lossless: 13.06 bpp vs JPEG 2000's ~3.5 bpp (structural context-modeling gap)
 - 8-bit only (10-bit not implemented)
@@ -76,7 +76,7 @@ Two entropy coders with different tradeoffs. Rice+ZRL is faster; rANS compresses
 
 **P2: Compression efficiency**
 - **Canonical Huffman entropy** — next planned implementation. Same 256-stream architecture as Rice but with distribution-adaptive codewords instead of fixed Golomb-Rice. Expected: 1-5% overhead vs rANS (vs Rice's 3-7%). See `docs/HUFFMAN_PLAN.md`.
-- Adaptive Rice k parameter per subband (close the +34% gap at q=25)
+- ~~Adaptive Rice k parameter per subband~~ ✓ Done (1-2% bpp gain, gap is structural not parametric)
 - Fix Rice lossless — currently near-lossless (56 dB), should be bit-exact like rANS
 - Improve lossless (13 bpp to <5 bpp — context modeling is the structural gap)
 - Improve low-quality compression (q<25 range)

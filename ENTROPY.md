@@ -1,118 +1,119 @@
-8 alternativ, rankade
+# Entropy Coder Alternatives — Analysis & Results
+
+8 alternatives, ranked:
 
   ┌──────────────┬──────────┬──────────┬─────────┬─────────┐
-  │              │ bpp-over │ Parallel │ Komplex │ Patent- │
-  │    Metod     │ head vs  │ lism per │  itet   │  risk   │
+  │              │ bpp-over │ Parallel │ Complex │ Patent  │
+  │    Method    │ head vs  │ ism per  │  ity    │  risk   │
   │              │   rANS   │   tile   │         │         │
   ├──────────────┼──────────┼──────────┼─────────┼─────────┤
   │ Significance │          │ ~10 000  │         │         │
-  │  map +       │ 3-7%     │ (max)    │ Låg     │ Ingen   │
+  │  map +       │ 3-7%     │ (max)    │ Low     │ None    │
   │ Golomb-Rice  │          │          │         │         │
   ├──────────────┼──────────┼──────────┼─────────┼─────────┤
   │ Canonical    │          │ ~12 000  │         │         │
-  │ Huffman (per │ 1-5%     │ (max)    │ Medel   │ Ingen   │
+  │ Huffman (per │ 1-5%     │ (max)    │ Medium  │ None    │
   │ -subband)    │          │          │         │         │
   ├──────────────┼──────────┼──────────┼─────────┼─────────┤
   │ Zero-run +   │          │          │         │         │
-  │ Huffman      │ 2-5%     │ ~6 000   │ Medel   │ Ingen   │
+  │ Huffman      │ 2-5%     │ ~6 000   │ Medium  │ None    │
   │ hybrid       │          │          │         │         │
   ├──────────────┼──────────┼──────────┼─────────┼─────────┤
   │ Huffman +    │          │          │         │         │
-  │ raw          │ 5-10%    │ ~12 000  │ Låg     │ Ingen   │
+  │ raw          │ 5-10%    │ ~12 000  │ Low     │ None    │
   │ refinement   │          │          │         │         │
   │ bits         │          │          │         │         │
   ├──────────────┼──────────┼──────────┼─────────┼─────────┤
-  │ Vektor-kvant │ 10-20%   │ ~3 000   │ Medel   │ Låg     │
-  │ isering      │          │          │         │         │
+  │ Vector       │ 10-20%   │ ~3 000   │ Medium  │ Low     │
+  │ quantization │          │          │         │         │
   ├──────────────┼──────────┼──────────┼─────────┼─────────┤
-  │ ANS 256      │ 8-15%    │ 256      │ Låg     │ Medel-H │
-  │ strömmar     │          │          │         │ ög      │
+  │ ANS 256      │ 8-15%    │ 256      │ Low     │ Med-    │
+  │ streams      │          │          │         │ High    │
   ├──────────────┼──────────┼──────────┼─────────┼─────────┤
-  │ Neural       │ -10%     │ ~12 000  │ Extrem  │ Medel   │
-  │ entropy      │ till +5% │          │         │         │
+  │ Neural       │ -10%     │ ~12 000  │ Extreme │ Medium  │
+  │ entropy      │ to +5%   │          │         │         │
   ├──────────────┼──────────┼──────────┼─────────┼─────────┤
-  │ ANS prefix   │ 0% (iden │ ~12 000  │ Extrem  │ Medel-H │
-  │ scan         │ tisk)    │ (teori)  │         │ ög      │
+  │ ANS prefix   │ 0%       │ ~12 000  │ Extreme │ Med-    │
+  │ scan         │(identical│ (theory) │         │ High    │
   ├──────────────┼──────────┼──────────┼─────────┼─────────┤
-  │ Bitplane     │ 0-5%     │ ~30-300  │ Hög     │ Medel   │
-  │ (EBCOT)      │          │ (dålig)  │         │         │
+  │ Bitplane     │ 0-5%     │ ~30-300  │ High    │ Medium  │
+  │ (EBCOT)      │          │ (poor)   │         │         │
   └──────────────┴──────────┴──────────┴─────────┴─────────┘
 
-  Överraskning: Microsoft har patent (US11234023B2) på
-  rANS-modifikationer. Vår nuvarande kodare har potentiell
-  patentrisk.
+  Surprise: Microsoft holds a patent (US11234023B2) on rANS
+  modifications. Our current rANS coder has potential patent risk.
 
-  Topp 3
+  Top 3:
 
-  1. Significance map + Golomb-Rice — Enklast. Separerar
-  zero/non-zero (binär map) från magnituder (Golomb-Rice). Varje
-   koefficient kodas oberoende. ~20 rader shader-kod. Perfekt
-  match för wavelet-data (geometrisk fördelning).
+  1. Significance map + Golomb-Rice — Simplest. Separates
+  zero/non-zero (binary map) from magnitudes (Golomb-Rice). Each
+  coefficient encodes independently. ~20 lines of shader code. Perfect
+  match for wavelet data (geometric distribution).
 
-  2. Canonical Huffman — Mest forskat på GPU. Fast codeword per
-  symbol, ingen state-dependency. Prefix-sum för bit-packing.
-  Bäst känd prestanda på GPU (multi-GB/s i papers).
+  2. Canonical Huffman — Most researched on GPU. Fixed codeword per
+  symbol, no state dependency. Prefix-sum for bit-packing. Best
+  known GPU performance (multi-GB/s in papers).
 
-  3. Zero-run + Huffman — Närmast rANS i kvalitet (2-5%). Kodar
-  (run-length, värde)-par med Huffman. Rader oberoende →
-  parallella.
+  3. Zero-run + Huffman — Closest to rANS quality (2-5%). Encodes
+  (run-length, value) pairs with Huffman. Rows independent →
+  parallel.
 
-  Vad det betyder för prestanda
+  Performance implications:
 
-  Om entropy coding tar 85% av 50ms = 42.5ms, och vi ersätter
-  med en fullt parallell kodare:
+  If entropy coding takes 85% of 50ms = 42.5ms, and we replace
+  with a fully parallel coder:
 
-  Parallell entropy borde ta ungefär samma tid som
-  wavelet+kvantisering (~7ms), inte 6x mer. Konservativt:
+  Parallel entropy should take roughly the same time as
+  wavelet+quantization (~7ms), not 6x more. Conservative estimate:
 
-  ┌──────────────┬────────────────┬───────────────────────┐
-  │              │      Idag      │ Med parallell entropy │
-  ├──────────────┼────────────────┼───────────────────────┤
-  │ 1080p encode │ 50ms / 20 fps  │ ~15ms / 67 fps        │
-  ├──────────────┼────────────────┼───────────────────────┤
-  │ 4K encode    │ 144ms / 7 fps  │ ~40ms / 25 fps        │
-  ├──────────────┼────────────────┼───────────────────────┤
-  │ iPhone 720p  │ ~35ms / 28 fps │ ~10ms / 100 fps       │
-  └──────────────┴────────────────┴───────────────────────┘
+  ┌──────────────┬────────────────┬───────────────────────────┐
+  │              │    Current     │ With parallel entropy     │
+  ├──────────────┼────────────────┼───────────────────────────┤
+  │ 1080p encode │ 50ms / 20 fps  │ ~15ms / 67 fps            │
+  ├──────────────┼────────────────┼───────────────────────────┤
+  │ 4K encode    │ 144ms / 7 fps  │ ~40ms / 25 fps            │
+  ├──────────────┼────────────────┼───────────────────────────┤
+  │ iPhone 720p  │ ~35ms / 28 fps │ ~10ms / 100 fps           │
+  └──────────────┴────────────────┴───────────────────────────┘
 
-  Och — vi slipper Microsofts rANS-patent.
+  And — we avoid Microsoft's rANS patent.
 
 ---
 
-## Resultat: Rice GPU (2026-02-27)
+## Results: Rice GPU (2026-02-27)
 
-  Implementerade #1 (Significance map + Golomb-Rice) med GPU-shader.
-  256 interleaved streams per tile, fullt parallella.
+  Implemented #1 (Significance map + Golomb-Rice) as GPU shader.
+  256 interleaved streams per tile, fully parallel.
 
-  Initiala resultat (utan ZRL):
+  Initial results (without ZRL):
 
   ┌──────────────┬──────────┬──────────┬──────────┐
   │              │  rANS    │ Rice GPU │ Diff     │
   ├──────────────┼──────────┼──────────┼──────────┤
   │ Encode 1080p │ 34ms     │ 21ms     │ 1.6x     │
-  │              │ 29 fps   │ 46 fps   │ snabbare │
+  │              │ 29 fps   │ 46 fps   │ faster   │
   ├──────────────┼──────────┼──────────┼──────────┤
   │ Decode 1080p │ 29ms     │ 14ms     │ 2.0x     │
-  │              │ 34 fps   │ 69 fps   │ snabbare │
+  │              │ 34 fps   │ 69 fps   │ faster   │
   ├──────────────┼──────────┼──────────┼──────────┤
   │ BPP q=75     │ 4.22     │ 6.04     │ +43%     │
   ├──────────────┼──────────┼──────────┼──────────┤
   │ BPP q=90     │          │ ~match   │ ~0%      │
   └──────────────┴──────────┴──────────┴──────────┘
 
-## Uppdatering: Rice+ZRL (2026-02-27)
+## Update: Rice+ZRL (2026-02-27)
 
-  Lade till zero-run-length (ZRL) kodning. Istället för 1 bit per
-  noll-koefficient, kodas nollsekvenser med Rice(run_length-1, k_zrl).
+  Added zero-run-length (ZRL) coding. Instead of 1 bit per zero
+  coefficient, zero runs are encoded with Rice(run_length-1, k_zrl).
 
   ┌──────────────┬──────────┬──────────┬──────────┐
   │              │  rANS    │ Rice+ZRL │ Diff     │
   ├──────────────┼──────────┼──────────┼──────────┤
   │ Encode 1080p │ 34ms     │ 25ms     │ 1.4x     │
-  │              │ 29 fps   │ 40 fps   │ snabbare │
+  │              │ 29 fps   │ 40 fps   │ faster   │
   ├──────────────┼──────────┼──────────┼──────────┤
   │ Decode 1080p │ 29ms     │ 16ms     │ 1.8x     │
-  │              │ 34 fps   │ 61 fps   │ snabbare │
+  │              │ 34 fps   │ 61 fps   │ faster   │
   ├──────────────┼──────────┼──────────┼──────────┤
   │ BPP q=25     │ 1.29     │ 1.73     │ +34%     │
   ├──────────────┼──────────┼──────────┼──────────┤
@@ -123,39 +124,39 @@
   │ BPP q=90     │ 9.65     │ 8.96     │ -7% (!)  │
   └──────────────┴──────────┴──────────┴──────────┘
 
-  ZRL stängde kompressionsgapet dramatiskt:
-  - q=25: från +269% till +34% overhead
-  - q=50+: Rice+ZRL SLÅR rANS i bpp!
+  ZRL closed the compression gap dramatically:
+  - q=25: from +269% to +34% overhead
+  - q=50+: Rice+ZRL BEATS rANS in bpp!
 
-  Slutsats: Rice+ZRL är nu konkurrenskraftigt med rANS i
-  kompression och 1.5-2x snabbare. Tesen validerad.
+  Conclusion: Rice+ZRL is now competitive with rANS in compression
+  and 1.5-2x faster. Thesis validated.
 
-## Analys: Nästa steg — Canonical Huffman?
+## Analysis: Next step — Canonical Huffman?
 
-  Med Rice+ZRL som redan slår rANS vid q>=50 har Huffman-caset
-  försvagats. Men vid q=25 finns fortfarande +34% gap. Huffman
-  kan potentiellt stänga detta.
+  With Rice+ZRL already beating rANS at q>=50, the Huffman case
+  has weakened. But at q=25 there's still a +34% gap. Huffman
+  could potentially close this.
 
   ┌─────────────────┬────────────┬─────────┬──────────┐
   │                 │ Rice+ZRL   │ Huffman │ rANS     │
   ├─────────────────┼────────────┼─────────┼──────────┤
-  │ BPP overhead    │ -3 till    │ 1-5%   │ baseline │
+  │ BPP overhead    │ -3% to     │ 1-5%   │ baseline │
   │  (vs rANS)     │ +34%       │ (est)   │          │
   ├─────────────────┼────────────┼─────────┼──────────┤
-  │ Parallellism    │ 256 str    │ 256 str │ 32 str   │
+  │ Parallelism     │ 256 str    │ 256 str │ 32 str   │
   ├─────────────────┼────────────┼─────────┼──────────┤
-  │ State chain     │ Ingen      │ Ingen   │ 2048/trd │
+  │ State chain     │ None       │ None    │ 2048/thr │
   ├─────────────────┼────────────┼─────────┼──────────┤
-  │ Patentrisk      │ Ingen      │ Ingen   │ Medel-Hög│
+  │ Patent risk     │ None       │ None    │ Med-High │
   ├─────────────────┼────────────┼─────────┼──────────┤
   │ Shared mem      │ <1KB       │ 8KB     │ 16KB+    │
   ├─────────────────┼────────────┼─────────┼──────────┤
   │ GPU dispatches  │ 1          │ 2       │ 3        │
   └─────────────────┴────────────┴─────────┴──────────┘
 
-  Huffman kan fortfarande vara intressant för:
-  - Stänga +34% gapet vid q=25 (låga bitrates)
-  - Potentiellt bättre lossless-kompression
-  - O(1) decode via prefix-table (snabbare än Rice bit-scanning)
+  Huffman could still be interesting for:
+  - Closing the +34% gap at q=25 (low bitrates)
+  - Potentially better lossless compression
+  - O(1) decode via prefix table (faster than Rice bit-scanning)
 
-  Implementation plan: se HUFFMAN_PLAN.md
+  Implementation plan: see HUFFMAN_PLAN.md

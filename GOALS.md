@@ -20,43 +20,66 @@ GNC is a patent-free **video codec** designed from scratch for GPU parallelism. 
 
 ## 3. Current State
 
-**Current results (1080p, bbb reference frame, Rice+ZRL entropy):**
+Two entropy coders with different tradeoffs. Rice+ZRL is faster; rANS compresses better at low quality.
+
+**Rice+ZRL — fast path (256 independent streams/tile):**
 
 | Quality | PSNR | BPP | Encode | Decode |
 |---------|------|-----|--------|--------|
-| q=25 | 33.2 dB | 1.73 | 40 fps | 70 fps |
-| q=50 | 37.5 dB | 2.42 | 42 fps | 61 fps |
-| q=75 | 42.1 dB | 4.09 | 40 fps | 61 fps |
-| q=90 | 49.2 dB | 8.96 | 41 fps | 66 fps |
-| q=100 | lossless | 12.8 | — | — |
+| q=25 | 33.2 dB | 1.73 | 40 fps | 74 fps |
+| q=50 | 37.5 dB | 2.42 | 42 fps | 62 fps |
+| q=75 | 42.1 dB | 4.09 | 40 fps | 60 fps |
+| q=90 | 49.2 dB | 8.96 | 40 fps | 64 fps |
+
+**rANS — compression path (32 interleaved streams/tile):**
+
+| Quality | PSNR | BPP | Encode | Decode |
+|---------|------|-----|--------|--------|
+| q=25 | 33.2 dB | 1.29 | 31 fps | 42 fps |
+| q=50 | 37.7 dB | 2.30 | 30 fps | 36 fps |
+| q=75 | 42.8 dB | 4.22 | 29 fps | 34 fps |
+| q=90 | 51.0 dB | 9.65 | 31 fps | 33 fps |
+| q=100 | lossless | 13.06 | 31 fps | 32 fps |
+
+*(All: 1080p bbb reference frame, M1 GPU, 2026-02-27)*
 
 **What works:**
 - Full I/P/B frame video pipeline with motion estimation, rate control, GNV1 container
 - 3 entropy backends (Rice+ZRL, rANS, Bitplane), all GPU compute shaders
-- Quality spectrum from lossless to extreme compression (q=1-100)
-- 112 tests, golden-baseline regression, 5 conformance bitstreams
+- Fused quantize+histogram shader, fused rANS normalize+encode shader
+- True lossless encode/decode (rANS, q=100, bit-exact roundtrip)
+- 114+ tests, golden-baseline regression, 5 conformance bitstreams
+- 30 WGSL compute shaders (6,348 lines)
 - WASM/WebGPU decoder builds (263 KB)
 
+**Patent risk note:** Microsoft holds patent US11234023B2 on rANS modifications. Our rANS implementation has potential exposure. Rice and Huffman are patent-free — strategic reason to migrate away from rANS as the primary entropy coder.
+
+**Key GPU architecture insight:** On M1, shared memory occupancy dominates performance. 16KB shared memory = 2 workgroups/core (full occupancy). Exceeding 16KB halves occupancy → ~20% regression. This is why Rice (< 1KB shared) and Huffman (8KB shared) are fast, while rANS (16KB+) is slower. ALU cost (e.g. integer multiply vs division) is negligible by comparison.
+
 **Known gaps:**
-- Compression ~1.4x behind JPEG 2000 (structural — context modeling gap)
-- Lossless: 12.8 bpp vs JPEG 2000's ~3.5 bpp
+- Sequence encode 6.5 fps (target: 30+ fps) — no multi-frame GPU overlap yet
+- Single-frame encode 40 fps Rice, 30 fps rANS (target: 60 fps)
+- Rice at q=25 is +34% bpp vs rANS (needs adaptive k_zrl per subband)
+- Rice q=100 is near-lossless (56 dB) not bit-exact — only rANS supports true lossless
+- Lossless: 13.06 bpp vs JPEG 2000's ~3.5 bpp (structural context-modeling gap)
 - 8-bit only (10-bit not implemented)
 - 4:4:4 only (4:2:2 not implemented)
-- Sequence encode 6.5 fps (target: 30+ fps)
-- Single-frame encode 40 fps (target: 60 fps)
 
 ## 4. Priorities
 
 **P1: Video encode speed**
 - Sequence encode from 6.5 fps to 30+ fps (this is the real video codec metric)
-- Motion estimation readback is the bottleneck — needs GPU-side pipelining
-- Fused GPU kernels (wavelet+quantize, quantize+histogram)
+- Multi-frame GPU overlap — pipeline frame N+1 while entropy-coding frame N
+- Motion estimation readback elimination — keep MVs on GPU, serialize from GPU buffers
+- Fused wavelet+quantize kernel (quantize+histogram already fused)
 - Target: real-time 1080p30 sequence encode
 
 **P2: Compression efficiency**
-- Context-adaptive entropy (15-25% bpp reduction)
-- Improve lossless (12.8 bpp to <5 bpp)
-- Fix remaining CfL/AQ edge cases
+- **Canonical Huffman entropy** — next planned implementation. Same 256-stream architecture as Rice but with distribution-adaptive codewords instead of fixed Golomb-Rice. Expected: 1-5% overhead vs rANS (vs Rice's 3-7%). See `docs/HUFFMAN_PLAN.md`.
+- Adaptive Rice k parameter per subband (close the +34% gap at q=25)
+- Fix Rice lossless — currently near-lossless (56 dB), should be bit-exact like rANS
+- Improve lossless (13 bpp to <5 bpp — context modeling is the structural gap)
+- Improve low-quality compression (q<25 range)
 
 **P3: Broadcast features**
 - 10-bit content support
@@ -66,7 +89,7 @@ GNC is a patent-free **video codec** designed from scratch for GPU parallelism. 
 - DCT, hybrid wavelet/DCT, Haar
 
 **P5: Research/experimental**
-- PVQ, learned lifting, Huffman entropy, non-separable fused wavelet
+- PVQ, learned lifting, non-separable fused wavelet
 
 ## 5. Non-Goals
 

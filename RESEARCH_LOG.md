@@ -4,6 +4,30 @@
 
 ---
 
+## 2026-02-27: Bidir ME search range reduction — ±32 → ±16
+
+### Hypothesis
+B-frames interpolate between two references (forward and backward), so each direction's motion is typically half the total scene motion. A ±16 search range should be sufficient for B-frame ME while reducing coarse candidates from 4,225 to 1,089 (4x reduction).
+
+### Implementation
+Added `ME_BIDIR_SEARCH_RANGE: u32 = 16` constant in `motion.rs`, used in `estimate_bidir` instead of `ME_SEARCH_RANGE`.
+
+### Results (bbb_1080p, q=50, ki=8)
+
+| Metric | ±32 | ±16 | Change |
+|--------|-----|-----|--------|
+| B-frame time | 100ms | 87ms | **-13%** |
+| 10-frame fps | 12.3 | 13.4 | +9% |
+| 30-frame fps | 11.5 | 13.2 | +15% |
+| Quality | 37.82 dB | 37.82 dB | identical |
+
+### Analysis
+1. B-frames are ~60% of inter-frames at ki=8 (pattern: I B B P B B P B B P...), so this 13ms savings per B-frame compounds across the sequence.
+2. Quality is identical because at 30fps the inter-frame motion is small enough that ±16 covers virtually all real motion per direction.
+3. For content with extreme motion, `ME_BIDIR_SEARCH_RANGE` can be increased independently of `ME_SEARCH_RANGE`.
+
+---
+
 ## 2026-02-27: Temporal MV prediction for P-frames
 
 ### Hypothesis

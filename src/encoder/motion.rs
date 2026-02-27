@@ -9,6 +9,9 @@ pub const ME_SEARCH_RANGE: u32 = 32;
 /// Fine search range when using temporal MV predictor (±pixels).
 /// Same as FINE_RANGE since consecutive P-frames have highly correlated MVs.
 pub const ME_PRED_FINE_RANGE: u32 = 4;
+/// Search range for bidirectional ME (B-frames). B-frames interpolate between
+/// two references, so motion per direction is typically smaller than P-frames.
+pub const ME_BIDIR_SEARCH_RANGE: u32 = 16;
 
 /// Staging buffer for deferred MV readback. Created by `create_mv_staging`,
 /// consumed by `finish_mv_readback`. Allows the GPU copy to piggyback on
@@ -477,7 +480,7 @@ impl MotionEstimator {
             width,
             height,
             block_size: ME_BLOCK_SIZE,
-            search_range: ME_SEARCH_RANGE,
+            search_range: ME_BIDIR_SEARCH_RANGE,
             blocks_x,
             total_blocks,
             use_predictor: 0,

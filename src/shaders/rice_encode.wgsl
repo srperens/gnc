@@ -12,8 +12,8 @@
 //   where quotient = (|val|-1) >> k, remainder = (|val|-1) & ((1<<k)-1)
 
 const STREAMS_PER_TILE: u32 = 256u;
-const MAX_STREAM_BYTES: u32 = 2048u;
-const MAX_STREAM_WORDS: u32 = 512u;  // MAX_STREAM_BYTES / 4
+const MAX_STREAM_BYTES: u32 = 512u;
+const MAX_STREAM_WORDS: u32 = 128u;  // MAX_STREAM_BYTES / 4
 const MAX_GROUPS: u32 = 8u;
 const K_STRIDE: u32 = 16u;  // MAX_GROUPS * 2: stride per tile in k_output (mag k + zrl k per group)
 
@@ -77,7 +77,9 @@ fn emit_byte(byte_val: u32) {
     p_bytes_in_word += 1u;
     p_total_bytes += 1u;
     if (p_bytes_in_word == 4u) {
-        stream_output[p_stream_word_base + p_word_pos] = p_word_buffer;
+        if (p_word_pos < MAX_STREAM_WORDS) {
+            stream_output[p_stream_word_base + p_word_pos] = p_word_buffer;
+        }
         p_word_pos += 1u;
         p_word_buffer = 0u;
         p_bytes_in_word = 0u;
@@ -118,7 +120,7 @@ fn flush_remaining() {
         let byte_val = (p_bit_buffer << (8u - p_bits_in_buffer)) & 0xFFu;
         emit_byte(byte_val);
     }
-    if (p_bytes_in_word > 0u) {
+    if (p_bytes_in_word > 0u && p_word_pos < MAX_STREAM_WORDS) {
         stream_output[p_stream_word_base + p_word_pos] = p_word_buffer;
     }
 }

@@ -9,8 +9,8 @@
 //   k_zrl[tile_id * MAX_GROUPS + group] = Rice k parameter for ZRL
 
 const STREAMS_PER_TILE: u32 = 256u;
-const MAX_STREAM_BYTES: u32 = 2048u;
-const MAX_STREAM_WORDS: u32 = 512u;
+const MAX_STREAM_BYTES: u32 = 512u;
+const MAX_STREAM_WORDS: u32 = 128u;
 const ALPHABET_SIZE: u32 = 32u;
 const ESCAPE_SYM: u32 = 31u;
 const MAX_GROUPS: u32 = 8u;

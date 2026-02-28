@@ -13,7 +13,7 @@ use super::huffman::{
 };
 use crate::{FrameInfo, GpuContext};
 
-const MAX_STREAM_BYTES: usize = 2048;
+const MAX_STREAM_BYTES: usize = 512;
 const _MAX_STREAM_WORDS: usize = MAX_STREAM_BYTES / 4;
 const MAX_GROUPS: usize = 8;
 const HIST_STRIDE: usize = MAX_GROUPS * HUFFMAN_ALPHABET_SIZE; // 256

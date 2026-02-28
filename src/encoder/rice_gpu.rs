@@ -14,7 +14,7 @@ use wgpu::util::DeviceExt;
 use super::rice::{RiceTile, RICE_STREAMS_PER_TILE};
 use crate::{FrameInfo, GpuContext};
 
-const MAX_STREAM_BYTES: usize = 2048;
+const MAX_STREAM_BYTES: usize = 512;
 const MAX_GROUPS: usize = 8;
 const K_STRIDE: usize = MAX_GROUPS * 2; // stride per tile in k_output (mag k + zrl k per group)
 

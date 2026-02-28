@@ -60,12 +60,28 @@ impl EncoderPipeline {
         config: &CodecConfig,
         fps: f64,
     ) -> Vec<CompressedFrame> {
+        self.encode_sequence_streaming(ctx, frames.len(), |i| frames[i].to_vec(), width, height, config, fps)
+    }
+
+    /// Streaming variant that loads frames on-demand via a closure.
+    /// Only keeps a small window of frames in memory at any time,
+    /// enabling encoding of long sequences without OOM.
+    pub fn encode_sequence_streaming(
+        &mut self,
+        ctx: &GpuContext,
+        frame_count: usize,
+        mut load_frame: impl FnMut(usize) -> Vec<f32>,
+        width: u32,
+        height: u32,
+        config: &CodecConfig,
+        fps: f64,
+    ) -> Vec<CompressedFrame> {
         let ki = config.keyframe_interval as usize;
         let use_bframes = ki >= 4;
         let b_count = if use_bframes { B_FRAMES_PER_GROUP } else { 0 };
         let group_size = b_count + 1;
 
-        let n = frames.len();
+        let n = frame_count;
         let mut results: Vec<Option<CompressedFrame>> = (0..n).map(|_| None).collect();
         let mut has_reference = false;
 
@@ -119,8 +135,9 @@ impl EncoderPipeline {
 
             if is_keyframe {
                 let _t_iframe = std::time::Instant::now();
+                let frame_data = load_frame(display_idx);
                 let mut compressed =
-                    self.encode(ctx, frames[display_idx], width, height, &frame_config);
+                    self.encode(ctx, &frame_data, width, height, &frame_config);
                 compressed.frame_type = FrameType::Intra;
 
                 if let Some(ref mut rc) = rate_ctrl {
@@ -146,9 +163,10 @@ impl EncoderPipeline {
                 // P-frame only mode — skip local decode if next frame is keyframe or EOSequence
                 let next_is_key_or_end = display_idx + 1 >= n
                     || (ki > 1 && (display_idx + 1) % ki == 0);
+                let frame_data = load_frame(display_idx);
                 let (compressed, new_mv_buf) = self.encode_pframe(
                     ctx,
-                    frames[display_idx],
+                    &frame_data,
                     width,
                     height,
                     padded_w,
@@ -191,9 +209,10 @@ impl EncoderPipeline {
                 } else {
                     config.clone()
                 };
+                let p_frame_data = load_frame(p_display);
                 let (compressed, new_mv_buf) = self.encode_pframe(
                     ctx,
-                    frames[p_display],
+                    &p_frame_data,
                     width,
                     height,
                     padded_w,
@@ -231,9 +250,10 @@ impl EncoderPipeline {
                     // Use zero_mv_buf as fallback predictor for the first B-frame
                     let fwd_pred = prev_bidir_fwd_mv.as_ref().or(Some(&zero_mv_buf));
                     let bwd_pred = prev_bidir_bwd_mv.as_ref().or(Some(&zero_mv_buf));
+                    let b_frame_data = load_frame(b_display);
                     let (compressed, new_fwd_mv, new_bwd_mv) = self.encode_bframe(
                         ctx,
-                        frames[b_display],
+                        &b_frame_data,
                         width,
                         height,
                         padded_w,
@@ -268,9 +288,10 @@ impl EncoderPipeline {
                 };
                 // Skip decode if next frame is keyframe or end of sequence
                 let rem_needs_decode = j + 1 < next_key && j + 1 < n;
+                let rem_frame_data = load_frame(j);
                 let (compressed, new_mv_buf) = self.encode_pframe(
                     ctx,
-                    frames[j],
+                    &rem_frame_data,
                     width,
                     height,
                     padded_w,

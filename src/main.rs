@@ -912,31 +912,9 @@ fn main() {
                 }
             );
 
-            // Load all frames
-            let mut frames_data: Vec<Vec<f32>> = Vec::with_capacity(frame_count);
-            let mut w = 0u32;
-            let mut h = 0u32;
-            for i in 0..frame_count {
-                let path = input.replace("%04d", &format!("{:04}", i));
-                let (rgb, fw, fh) = load_image_rgb_f32(&path);
-                if i == 0 {
-                    w = fw;
-                    h = fh;
-                } else {
-                    assert!(
-                        fw == w && fh == h,
-                        "Frame {} has different dimensions ({}x{} vs {}x{})",
-                        i,
-                        fw,
-                        fh,
-                        w,
-                        h
-                    );
-                }
-                frames_data.push(rgb);
-            }
-
-            let frame_refs: Vec<&[f32]> = frames_data.iter().map(|f| f.as_slice()).collect();
+            // Probe first frame for dimensions
+            let first_path = input.replace("%04d", &format!("{:04}", 0));
+            let (_, w, h) = load_image_rgb_f32(&first_path);
 
             let ctx = GpuContext::new();
             let mut encoder = EncoderPipeline::new(&ctx);
@@ -957,9 +935,26 @@ fn main() {
             }
 
             let actual_fps = fps_num as f64 / fps_den as f64;
+            let input_pattern = input.clone();
             let start = std::time::Instant::now();
-            let compressed =
-                encoder.encode_sequence_with_fps(&ctx, &frame_refs, w, h, &config, actual_fps);
+            let compressed = encoder.encode_sequence_streaming(
+                &ctx,
+                frame_count,
+                |i| {
+                    let path = input_pattern.replace("%04d", &format!("{:04}", i));
+                    let (rgb, fw, fh) = load_image_rgb_f32(&path);
+                    assert!(
+                        fw == w && fh == h,
+                        "Frame {} has different dimensions ({}x{} vs {}x{})",
+                        i, fw, fh, w, h
+                    );
+                    rgb
+                },
+                w,
+                h,
+                &config,
+                actual_fps,
+            );
             let encode_time = start.elapsed();
 
             // Print per-frame summary

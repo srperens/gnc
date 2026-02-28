@@ -37,6 +37,8 @@ struct CachedRiceEncodeBuffers {
     stream_buf: wgpu::Buffer,
     lengths_buf: wgpu::Buffer,
     k_buf: wgpu::Buffer,
+    /// Cached uniform params buffer — updated via write_buffer, avoids per-frame create_buffer_init.
+    params_buf: wgpu::Buffer,
     // Per-plane staging for batched 3-plane encode
     stream_staging: [wgpu::Buffer; 3],
     lengths_staging: [wgpu::Buffer; 3],
@@ -71,6 +73,12 @@ impl CachedRiceEncodeBuffers {
                 label: Some("rice_k"),
                 size: k_size.max(4),
                 usage: sc,
+                mapped_at_creation: false,
+            }),
+            params_buf: ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("rice_params_cached"),
+                size: std::mem::size_of::<RiceParams>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }),
             stream_staging: std::array::from_fn(|i| {
@@ -251,13 +259,8 @@ impl GpuRiceEncoder {
             _pad0: 0,
             _pad1: 0,
         };
-        let params_buf =
-            ctx.device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("rice_params"),
-                    contents: bytemuck::bytes_of(&params),
-                    usage: wgpu::BufferUsages::UNIFORM,
-                });
+        ctx.queue
+            .write_buffer(&bufs.params_buf, 0, bytemuck::bytes_of(&params));
 
         let mut cmd = ctx
             .device
@@ -273,7 +276,7 @@ impl GpuRiceEncoder {
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: params_buf.as_entire_binding(),
+                        resource: bufs.params_buf.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
@@ -349,7 +352,7 @@ impl GpuRiceEncoder {
         // Read back and pack into RiceTile structs — read directly from mapped views
         // to avoid 192MB of unnecessary to_vec() allocation+memcpy
         let mut all_tiles = Vec::with_capacity(num_tiles * 3);
-        let num_groups = (num_levels * 2) as usize;
+        let num_groups = (num_levels * 2).max(1) as usize;
 
         for p in 0..3 {
             let stream_view = bufs.stream_staging[p].slice(..).get_mapped_range();
@@ -435,13 +438,8 @@ impl GpuRiceEncoder {
             _pad0: 0,
             _pad1: 0,
         };
-        let params_buf =
-            ctx.device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("rice_params"),
-                    contents: bytemuck::bytes_of(&params),
-                    usage: wgpu::BufferUsages::UNIFORM,
-                });
+        ctx.queue
+            .write_buffer(&bufs.params_buf, 0, bytemuck::bytes_of(&params));
 
         for (p, quantized_buf) in quantized_bufs.iter().enumerate() {
 
@@ -451,7 +449,7 @@ impl GpuRiceEncoder {
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: params_buf.as_entire_binding(),
+                        resource: bufs.params_buf.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
@@ -511,7 +509,7 @@ impl GpuRiceEncoder {
     ) -> Vec<RiceTile> {
         let num_tiles = (info.tiles_x() * info.tiles_y()) as usize;
         let bufs = self.cached.as_ref().unwrap();
-        let num_groups = (num_levels * 2) as usize;
+        let num_groups = (num_levels * 2).max(1) as usize;
         let profile = std::env::var("GNC_PROFILE").is_ok();
         let _t0 = std::time::Instant::now();
 

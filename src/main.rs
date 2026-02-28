@@ -120,6 +120,10 @@ enum Command {
         /// Use CPU entropy encoding instead of GPU
         #[arg(long)]
         cpu_encode: bool,
+
+        /// Use block DCT-8×8 transform instead of wavelet (fewer dispatches, faster)
+        #[arg(long)]
+        dct: bool,
     },
 
     /// Benchmark temporal (I+P frame) encoding on a sequence of frames
@@ -433,6 +437,7 @@ fn main() {
             rans,
             huffman,
             cpu_encode,
+            dct,
         } => {
             let (rgb_data, w, h) = load_image_rgb_f32(&input);
 
@@ -452,6 +457,12 @@ fn main() {
             }
             if cpu_encode {
                 config.gpu_entropy_encode = false;
+            }
+            if dct {
+                config.transform_type = gnc::TransformType::BlockDCT8;
+                config.cfl_enabled = false;
+                config.adaptive_quantization = false;
+                config.use_fused_quantize_histogram = false;
             }
 
             let coder_name = match config.entropy_coder {

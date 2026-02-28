@@ -149,7 +149,7 @@ fn main(
     let tile_origin_y = tile_y * params.tile_size;
 
     let symbols_per_stream = params.coefficients_per_tile / STREAMS_PER_TILE;
-    let num_groups = params.num_levels * 2u;
+    let num_groups = max(1u, params.num_levels * 2u);
 
     // === Phase 1: Compute optimal k per subband group + k_zrl ===
 

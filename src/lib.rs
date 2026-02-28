@@ -160,6 +160,17 @@ pub enum WaveletType {
     CDF97,
 }
 
+/// Top-level transform selection: wavelet (multi-level, multi-dispatch) or
+/// block-based (single-dispatch, fused with quantize).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransformType {
+    /// Multi-level wavelet (CDF 9/7 or LeGall 5/3). Current default.
+    Wavelet,
+    /// Block DCT-8×8: single dispatch per plane, fuseable with quantize.
+    /// Replaces 24+ wavelet dispatches with 1 per plane.
+    BlockDCT8,
+}
+
 /// Rate control mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RateMode {
@@ -232,6 +243,8 @@ pub struct CodecConfig {
     /// saving ~24MB bandwidth at 1080p. Requires gpu_entropy_encode = true and
     /// non-CfL path (CfL needs separate quantize + dequantize for reconstruction).
     pub use_fused_quantize_histogram: bool,
+    /// Transform type: Wavelet (default) or BlockDCT8 (fewer dispatches, faster).
+    pub transform_type: TransformType,
 }
 
 impl CodecConfig {
@@ -241,6 +254,7 @@ impl CodecConfig {
         self.quantization_step <= 1.0
             && self.dead_zone == 0.0
             && self.wavelet_type == WaveletType::LeGall53
+            && self.transform_type == TransformType::Wavelet
     }
 }
 
@@ -264,6 +278,7 @@ impl Default for CodecConfig {
             target_bitrate: None,
             rate_mode: RateMode::VBR,
             use_fused_quantize_histogram: false,
+            transform_type: TransformType::Wavelet,
         }
     }
 }
@@ -439,6 +454,7 @@ pub fn quality_preset(q: u32) -> CodecConfig {
         aq_strength,
         context_adaptive: false, // CPU-only; enable explicitly when GPU implementation exists
         use_fused_quantize_histogram: true, // auto-disabled when CfL is active
+        transform_type: TransformType::Wavelet, // block DCT opt-in via config override
         ..Default::default()
     }
 }

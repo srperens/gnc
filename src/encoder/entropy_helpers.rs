@@ -50,6 +50,7 @@ pub(super) fn encode_entropy(
     config: &CodecConfig,
     use_gpu_encode: bool,
     info: &FrameInfo,
+    entropy_levels: u32,
     rans_tiles: &mut Vec<rans::InterleavedRansTile>,
     subband_tiles: &mut Vec<rans::SubbandRansTile>,
     bp_tiles: &mut Vec<bitplane::BitplaneTile>,
@@ -62,7 +63,7 @@ pub(super) fn encode_entropy(
             quantized_buf,
             info,
             config.per_subband_entropy,
-            config.wavelet_levels,
+            entropy_levels,
         );
         rans_tiles.append(&mut rt);
         subband_tiles.append(&mut st);
@@ -76,7 +77,7 @@ pub(super) fn encode_entropy(
             tile_size,
             entropy_mode,
             config.tile_size,
-            config.wavelet_levels,
+            entropy_levels,
             rans_tiles,
             subband_tiles,
             bp_tiles,

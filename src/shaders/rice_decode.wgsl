@@ -126,7 +126,7 @@ fn main(
     let tile_origin_y = tile_y * params.tile_size;
 
     let symbols_per_stream = params.coefficients_per_tile / STREAMS_PER_TILE;
-    let num_groups = params.num_levels * 2u;
+    let num_groups = max(1u, params.num_levels * 2u);
 
     // Cooperatively load k values + per-subband k_zrl into shared memory (stride K_STRIDE)
     if (thread_id < num_groups) {

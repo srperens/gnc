@@ -297,6 +297,12 @@ fn serialize_frame_header(frame: &crate::CompressedFrame, out: &mut Vec<u8>) {
         crate::WaveletType::CDF97 => 1,
     };
     out.push(wavelet_byte);
+    // Transform type: 0 = Wavelet, 1 = BlockDCT8
+    let transform_byte: u8 = match frame.config.transform_type {
+        crate::TransformType::Wavelet => 0,
+        crate::TransformType::BlockDCT8 => 1,
+    };
+    out.push(transform_byte);
     // Per-subband entropy: 0 = off, 1 = on
     out.push(u8::from(frame.config.per_subband_entropy));
     // Subband weights: ll, num_detail_levels, per-level [LH, HL, HH], chroma_weight
@@ -626,11 +632,18 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
         w => panic!("Unknown wavelet type: {w}"),
     };
 
+    // Transform type byte (added alongside wavelet_type)
+    let transform_type = match data[33] {
+        0 => crate::TransformType::Wavelet,
+        1 => crate::TransformType::BlockDCT8,
+        t => panic!("Unknown transform type: {t}"),
+    };
+
     // Per-subband entropy flag (GPC9/GP10/GP11 only)
     let (per_subband_entropy, mut pos) = if is_gpc9 || is_gp10 || is_gp11 {
-        (data[33] != 0, 34)
+        (data[34] != 0, 35)
     } else {
-        (false, 33)
+        (false, 34)
     };
 
     // --- Subband weights ---
@@ -910,6 +923,7 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
                 cfl_enabled,
                 entropy_coder,
                 wavelet_type,
+                transform_type,
                 adaptive_quantization,
                 aq_strength,
                 per_subband_entropy: per_subband_entropy || per_subband,

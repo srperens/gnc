@@ -3,7 +3,8 @@ use wgpu;
 use super::buffer_cache::CachedBuffers;
 use super::pipeline::DecoderPipeline;
 use crate::encoder::adaptive::{self, AQ_LL_BLOCK_SIZE};
-use crate::{CompressedFrame, EntropyData, FrameType, GpuContext};
+use crate::encoder::block_transform::BlockTransformType;
+use crate::{CompressedFrame, EntropyData, FrameType, GpuContext, TransformType};
 
 impl DecoderPipeline {
     /// Encode GPU commands for the full decode pipeline up to and including crop.
@@ -106,6 +107,41 @@ impl DecoderPipeline {
                 }
             }
 
+            if config.transform_type == TransformType::BlockDCT8 {
+                // ---- Block DCT decode path ----
+                // scratch_a has quantized DCT coefficients from entropy decode.
+                // Dequantize (flat, no subband weights) → inverse DCT-8×8 → spatial pixels.
+                let uniform_weights = [1.0f32; 16];
+                self.quantize.dispatch_adaptive(
+                    ctx,
+                    &mut cmd,
+                    &bufs.scratch_a,
+                    &bufs.scratch_b,
+                    padded_pixels as u32,
+                    config.quantization_step,
+                    config.dead_zone,
+                    false, // dequantize
+                    padded_w,
+                    padded_h,
+                    config.tile_size,
+                    0, // wavelet_levels=0 for flat data
+                    &uniform_weights,
+                    None, // no AQ weight map
+                );
+
+                // Inverse DCT-8×8: scratch_b (dequantized coefficients) → scratch_a (spatial pixels)
+                self.block_transform.dispatch(
+                    ctx,
+                    &mut cmd,
+                    &bufs.scratch_b,
+                    &bufs.scratch_a,
+                    padded_w,
+                    padded_h,
+                    false, // inverse
+                    BlockTransformType::DCT8,
+                );
+            } else {
+                // ---- Wavelet decode path (existing) ----
             let weights = if p == 0 {
                 &weights_luma
             } else {
@@ -142,7 +178,6 @@ impl DecoderPipeline {
             );
 
             if p == 0 && has_cfl {
-                // Save dequantized Y wavelet for CfL chroma prediction
                 cmd.copy_buffer_to_buffer(
                     &bufs.scratch_b,
                     0,
@@ -153,14 +188,12 @@ impl DecoderPipeline {
             }
 
             if p > 0 && has_cfl {
-                // CfL inverse prediction: scratch_b (dequantized residual) + alpha * y_ref → scratch_c
                 let plane_alpha_offset = (p - 1) * cfl_alphas_per_plane;
                 let plane_alpha_byte_offset =
                     (plane_alpha_offset * std::mem::size_of::<f32>()) as u64;
                 let plane_alpha_byte_size =
                     (cfl_alphas_per_plane * std::mem::size_of::<f32>()) as u64;
 
-                // Copy this plane's alphas from the full alpha buffer to the per-plane buffer
                 cmd.copy_buffer_to_buffer(
                     &bufs.cfl_alpha_buf,
                     plane_alpha_byte_offset,
@@ -172,10 +205,10 @@ impl DecoderPipeline {
                 self.cfl_predictor.dispatch_inverse(
                     ctx,
                     &mut cmd,
-                    &bufs.scratch_b,               // dequantized residual
-                    &bufs.y_ref_wavelet_buf,       // reconstructed Y wavelet
-                    &bufs.plane_alpha_bufs[p - 1], // per-tile per-subband alphas
-                    &bufs.scratch_c,               // output: reconstructed chroma wavelet
+                    &bufs.scratch_b,
+                    &bufs.y_ref_wavelet_buf,
+                    &bufs.plane_alpha_bufs[p - 1],
+                    &bufs.scratch_c,
                     padded_pixels as u32,
                     padded_w,
                     padded_h,
@@ -183,7 +216,6 @@ impl DecoderPipeline {
                     config.wavelet_levels,
                 );
 
-                // Inverse wavelet: scratch_c → (temp scratch_b) → scratch_a
                 self.transform.inverse(
                     ctx,
                     &mut cmd,
@@ -195,7 +227,6 @@ impl DecoderPipeline {
                     config.wavelet_type,
                 );
             } else {
-                // Standard path: inverse wavelet from scratch_b
                 self.transform.inverse(
                     ctx,
                     &mut cmd,
@@ -207,6 +238,7 @@ impl DecoderPipeline {
                     config.wavelet_type,
                 );
             }
+            } // end wavelet decode path
 
             let is_bframe = frame.frame_type == FrameType::Bidirectional;
             if is_bframe {

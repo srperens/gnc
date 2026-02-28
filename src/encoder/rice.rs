@@ -179,7 +179,7 @@ fn optimal_k(values: &[u32]) -> u8 {
 /// Uses 256 interleaved streams for maximum GPU parallelism.
 pub fn rice_encode_tile(coefficients: &[i32], tile_size: u32, num_levels: u32) -> RiceTile {
     let num_coefficients = coefficients.len();
-    let num_groups = (num_levels * 2) as usize;
+    let num_groups = (num_levels * 2).max(1) as usize;
     let symbols_per_stream = num_coefficients / RICE_STREAMS_PER_TILE;
 
     // Phase 1: Compute per-subband k for magnitudes

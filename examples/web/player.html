@@ -311,7 +311,14 @@
                 playbackStartFrame = 0;
             }
 
-            animId = requestAnimationFrame(playLoop);
+            // If behind schedule, skip rAF vsync wait and decode immediately
+            const nowAfter = performance.now();
+            const nextTarget = Math.floor((nowAfter - playbackStartTime) / 1000 * cachedFps) + playbackStartFrame;
+            if (jsCurrentFrame <= nextTarget) {
+                setTimeout(playLoop, 0);
+            } else {
+                animId = requestAnimationFrame(playLoop);
+            }
         }
 
         function play() {

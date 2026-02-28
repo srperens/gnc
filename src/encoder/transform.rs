@@ -1,6 +1,5 @@
 use bytemuck::{Pod, Zeroable};
 use wgpu;
-use wgpu::util::DeviceExt;
 
 use crate::{FrameInfo, GpuContext, WaveletType};
 
@@ -17,10 +16,20 @@ struct TransformParams {
     _pad0: u32,
 }
 
+/// Maximum wavelet decomposition levels supported
+const MAX_LEVELS: usize = 8;
+/// Slots: MAX_LEVELS * 2 (row+col) * 2 (fwd+inv)
+const MAX_PARAM_SLOTS: usize = MAX_LEVELS * 2 * 2;
+/// GPU uniform buffer offset alignment (256 bytes covers all backends)
+const UBO_ALIGN: usize = 256;
+
 pub struct WaveletTransform {
     pipeline_53: wgpu::ComputePipeline,
     pipeline_97: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
+    /// Pre-allocated params buffer with dynamic offsets.
+    /// Holds all param configurations for forward+inverse, avoiding per-dispatch allocation.
+    dyn_params_buf: wgpu::Buffer,
 }
 
 impl WaveletTransform {
@@ -35,8 +44,10 @@ impl WaveletTransform {
                             visibility: wgpu::ShaderStages::COMPUTE,
                             ty: wgpu::BindingType::Buffer {
                                 ty: wgpu::BufferBindingType::Uniform,
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
+                                has_dynamic_offset: true,
+                                min_binding_size: wgpu::BufferSize::new(
+                                    std::mem::size_of::<TransformParams>() as u64,
+                                ),
                             },
                             count: None,
                         },
@@ -111,55 +122,49 @@ impl WaveletTransform {
                 cache: None,
             });
 
+        // Pre-allocate dynamic params buffer
+        let dyn_params_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("transform_dyn_params"),
+            size: (MAX_PARAM_SLOTS * UBO_ALIGN) as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         Self {
             pipeline_53,
             pipeline_97,
             bind_group_layout,
+            dyn_params_buf,
         }
     }
 
-    /// Dispatch one pass of the wavelet transform for a single plane.
-    /// `pass_mode`: 0 = rows, 1 = columns
-    /// `region_size`: the sub-region width/height for this decomposition level.
-    #[allow(clippy::too_many_arguments)]
-    fn dispatch_pass(
+    /// Write params at a given slot in the dynamic params buffer.
+    fn write_params_slot(&self, ctx: &GpuContext, slot: usize, params: &TransformParams) {
+        let offset = (slot * UBO_ALIGN) as u64;
+        ctx.queue
+            .write_buffer(&self.dyn_params_buf, offset, bytemuck::bytes_of(params));
+    }
+
+    /// Create a bind group with dynamic offset support for the params buffer.
+    fn create_bind_group(
         &self,
         ctx: &GpuContext,
-        encoder: &mut wgpu::CommandEncoder,
         input_buf: &wgpu::Buffer,
         output_buf: &wgpu::Buffer,
-        info: &FrameInfo,
-        forward: bool,
-        pass_mode: u32,
-        region_size: u32,
-        wavelet_type: WaveletType,
-    ) {
-        let params = TransformParams {
-            width: info.padded_width(),
-            height: info.padded_height(),
-            tile_size: info.tile_size,
-            direction: if forward { 0 } else { 1 },
-            pass_mode,
-            tiles_x: info.tiles_x(),
-            region_size,
-            _pad0: 0,
-        };
-
-        let params_buf = ctx
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("transform_params"),
-                contents: bytemuck::bytes_of(&params),
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
-
-        let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+    ) -> wgpu::BindGroup {
+        ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("transform_bg"),
             layout: &self.bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: params_buf.as_entire_binding(),
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &self.dyn_params_buf,
+                        offset: 0,
+                        size: wgpu::BufferSize::new(
+                            std::mem::size_of::<TransformParams>() as u64,
+                        ),
+                    }),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -170,28 +175,11 @@ impl WaveletTransform {
                     resource: output_buf.as_entire_binding(),
                 },
             ],
-        });
-
-        let pipeline = match wavelet_type {
-            WaveletType::LeGall53 => &self.pipeline_53,
-            WaveletType::CDF97 => &self.pipeline_97,
-        };
-
-        // Dispatch: one workgroup per line (row or column) per tile
-        let lines_per_tile = region_size;
-        let total_tiles = info.total_tiles();
-
-        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("transform_pass"),
-            timestamp_writes: None,
-        });
-        cpass.set_pipeline(pipeline);
-        cpass.set_bind_group(0, &bind_group, &[]);
-        cpass.dispatch_workgroups(lines_per_tile, total_tiles, 1);
+        })
     }
 
     /// Run multi-level 2D forward wavelet transform.
-    /// Level 0 transforms the full tile, level 1 transforms the LL subband, etc.
+    /// Uses dynamic uniform buffer to avoid per-dispatch buffer allocation.
     #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
@@ -204,45 +192,86 @@ impl WaveletTransform {
         levels: u32,
         wavelet_type: WaveletType,
     ) {
+        // Pre-fill all param slots for this forward transform
         let mut region = info.tile_size;
+        for level in 0..levels as usize {
+            let row_slot = level * 2;
+            let col_slot = level * 2 + 1;
+            let params_row = TransformParams {
+                width: info.padded_width(),
+                height: info.padded_height(),
+                tile_size: info.tile_size,
+                direction: 0,
+                pass_mode: 0,
+                tiles_x: info.tiles_x(),
+                region_size: region,
+                _pad0: 0,
+            };
+            let params_col = TransformParams {
+                width: info.padded_width(),
+                height: info.padded_height(),
+                tile_size: info.tile_size,
+                direction: 0,
+                pass_mode: 1,
+                tiles_x: info.tiles_x(),
+                region_size: region,
+                _pad0: 0,
+            };
+            self.write_params_slot(ctx, row_slot, &params_row);
+            self.write_params_slot(ctx, col_slot, &params_col);
+            region /= 2;
+        }
 
-        for level in 0..levels {
-            // Each level reads from output_buf (or input_buf for level 0),
-            // does rows into temp_buf, then columns into output_buf.
-            let src = if level == 0 { input_buf } else { output_buf };
+        // Create bind groups for the 3 unique (input, output) combos:
+        // BG_A: (input_buf, temp_buf) — level 0 row pass only
+        // BG_B: (temp_buf, output_buf) — all column passes
+        // BG_C: (output_buf, temp_buf) — row passes for levels 1+
+        let bg_a = self.create_bind_group(ctx, input_buf, temp_buf);
+        let bg_b = self.create_bind_group(ctx, temp_buf, output_buf);
+        let bg_c = self.create_bind_group(ctx, output_buf, temp_buf);
 
-            // Row pass: src -> temp_buf
-            self.dispatch_pass(
-                ctx,
-                encoder,
-                src,
-                temp_buf,
-                info,
-                true,
-                0,
-                region,
-                wavelet_type,
-            );
+        let pipeline = match wavelet_type {
+            WaveletType::LeGall53 => &self.pipeline_53,
+            WaveletType::CDF97 => &self.pipeline_97,
+        };
 
-            // Column pass: temp_buf -> output_buf
-            self.dispatch_pass(
-                ctx,
-                encoder,
-                temp_buf,
-                output_buf,
-                info,
-                true,
-                1,
-                region,
-                wavelet_type,
-            );
+        let total_tiles = info.total_tiles();
+        region = info.tile_size;
+
+        for level in 0..levels as usize {
+            let row_offset = (level * 2 * UBO_ALIGN) as u32;
+            let col_offset = ((level * 2 + 1) * UBO_ALIGN) as u32;
+
+            let bg_row = if level == 0 { &bg_a } else { &bg_c };
+
+            // Row pass
+            {
+                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("transform_fwd_row"),
+                    timestamp_writes: None,
+                });
+                cpass.set_pipeline(pipeline);
+                cpass.set_bind_group(0, bg_row, &[row_offset]);
+                cpass.dispatch_workgroups(region, total_tiles, 1);
+            }
+
+            // Column pass
+            {
+                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("transform_fwd_col"),
+                    timestamp_writes: None,
+                });
+                cpass.set_pipeline(pipeline);
+                cpass.set_bind_group(0, &bg_b, &[col_offset]);
+                cpass.dispatch_workgroups(region, total_tiles, 1);
+            }
 
             region /= 2;
         }
     }
 
     /// Run multi-level 2D inverse wavelet transform.
-    /// Levels are processed in reverse order (smallest region first).
+    /// Uses dynamic uniform buffer to avoid per-dispatch buffer allocation.
     #[allow(clippy::too_many_arguments)]
     pub fn inverse(
         &self,
@@ -258,39 +287,80 @@ impl WaveletTransform {
         let buf_size = (info.padded_width() * info.padded_height()) as u64 * 4;
 
         // Copy input_buf -> output_buf first so we have all subbands in output_buf.
-        // Each inverse level reads from output_buf and writes back to output_buf,
-        // preserving the detail subbands from higher levels.
         encoder.copy_buffer_to_buffer(input_buf, 0, output_buf, 0, buf_size);
 
+        // Pre-fill param slots for inverse (use slots starting at MAX_LEVELS*2 to avoid
+        // conflict with forward slots)
+        let base_slot = MAX_LEVELS * 2;
         let min_region = info.tile_size >> (levels - 1);
         let mut region = min_region;
+        for level in 0..levels as usize {
+            let col_slot = base_slot + level * 2;
+            let row_slot = base_slot + level * 2 + 1;
+            let params_col = TransformParams {
+                width: info.padded_width(),
+                height: info.padded_height(),
+                tile_size: info.tile_size,
+                direction: 1,
+                pass_mode: 1,
+                tiles_x: info.tiles_x(),
+                region_size: region,
+                _pad0: 0,
+            };
+            let params_row = TransformParams {
+                width: info.padded_width(),
+                height: info.padded_height(),
+                tile_size: info.tile_size,
+                direction: 1,
+                pass_mode: 0,
+                tiles_x: info.tiles_x(),
+                region_size: region,
+                _pad0: 0,
+            };
+            self.write_params_slot(ctx, col_slot, &params_col);
+            self.write_params_slot(ctx, row_slot, &params_row);
+            region *= 2;
+        }
 
-        for _level in 0..levels {
+        // Bind groups for inverse:
+        // BG_D: (output_buf, temp_buf) — all inverse column passes
+        // BG_E: (temp_buf, output_buf) — all inverse row passes
+        let bg_d = self.create_bind_group(ctx, output_buf, temp_buf);
+        let bg_e = self.create_bind_group(ctx, temp_buf, output_buf);
+
+        let pipeline = match wavelet_type {
+            WaveletType::LeGall53 => &self.pipeline_53,
+            WaveletType::CDF97 => &self.pipeline_97,
+        };
+
+        let total_tiles = info.total_tiles();
+        region = min_region;
+
+        for level in 0..levels as usize {
+            let col_offset = ((base_slot + level * 2) * UBO_ALIGN) as u32;
+            let row_offset = ((base_slot + level * 2 + 1) * UBO_ALIGN) as u32;
+
             // Inverse column pass: output_buf -> temp_buf
-            self.dispatch_pass(
-                ctx,
-                encoder,
-                output_buf,
-                temp_buf,
-                info,
-                false,
-                1,
-                region,
-                wavelet_type,
-            );
+            {
+                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("transform_inv_col"),
+                    timestamp_writes: None,
+                });
+                cpass.set_pipeline(pipeline);
+                cpass.set_bind_group(0, &bg_d, &[col_offset]);
+                cpass.dispatch_workgroups(region, total_tiles, 1);
+            }
 
             // Inverse row pass: temp_buf -> output_buf
-            self.dispatch_pass(
-                ctx,
-                encoder,
-                temp_buf,
-                output_buf,
-                info,
-                false,
-                0,
-                region,
-                wavelet_type,
-            );
+            {
+                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("transform_inv_row"),
+                    timestamp_writes: None,
+                });
+                cpass.set_pipeline(pipeline);
+                cpass.set_bind_group(0, &bg_e, &[row_offset]);
+                cpass.dispatch_workgroups(region, total_tiles, 1);
+            }
 
             region *= 2;
         }

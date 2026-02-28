@@ -43,6 +43,12 @@ var<workgroup> zrl_sum: array<atomic<u32>, 8>;
 var<workgroup> zrl_count: array<atomic<u32>, 8>;
 var<workgroup> shared_k_zrl: array<u32, 8>;
 
+// Per-thread local accumulators for Phase 1 (reduces atomic contention 32×)
+var<private> p_local_sum: array<u32, 8>;
+var<private> p_local_count: array<u32, 8>;
+var<private> p_local_zrl_sum: array<u32, 8>;
+var<private> p_local_zrl_count: array<u32, 8>;
+
 // Per-thread bit-packing state
 var<private> p_bit_buffer: u32;
 var<private> p_bits_in_buffer: u32;
@@ -151,17 +157,23 @@ fn main(
     if (thread_id < MAX_GROUPS) {
         atomicStore(&group_sum[thread_id], 0u);
         atomicStore(&group_count[thread_id], 0u);
-    }
-    if (thread_id < MAX_GROUPS) {
         atomicStore(&zrl_sum[thread_id], 0u);
         atomicStore(&zrl_count[thread_id], 0u);
     }
+
+    // Initialize per-thread local accumulators
+    for (var g = 0u; g < MAX_GROUPS; g++) {
+        p_local_sum[g] = 0u;
+        p_local_count[g] = 0u;
+        p_local_zrl_sum[g] = 0u;
+        p_local_zrl_count[g] = 0u;
+    }
     workgroupBarrier();
 
-    // Each thread scans its stream: accumulate magnitude stats + per-subband zero-run stats
+    // Each thread scans its stream using LOCAL accumulators (no atomic contention)
     {
         var zero_run = 0u;
-        var zrl_group = 0u;  // subband group of first zero in current run
+        var zrl_group = 0u;
         for (var s = 0u; s < symbols_per_stream; s++) {
             let coeff_idx = thread_id + s * STREAMS_PER_TILE;
             let tile_row = coeff_idx / params.tile_size;
@@ -173,24 +185,35 @@ fn main(
             if (coeff != 0) {
                 let abs_val = u32(abs(coeff)) - 1u;
                 let g = compute_subband_group(tile_col, tile_row);
-                atomicAdd(&group_sum[g], min(abs_val, 65535u));
-                atomicAdd(&group_count[g], 1u);
+                p_local_sum[g] += min(abs_val, 65535u);
+                p_local_count[g] += 1u;
                 if (zero_run > 0u) {
-                    atomicAdd(&zrl_sum[zrl_group], min(zero_run - 1u, 65535u));
-                    atomicAdd(&zrl_count[zrl_group], 1u);
+                    p_local_zrl_sum[zrl_group] += min(zero_run - 1u, 65535u);
+                    p_local_zrl_count[zrl_group] += 1u;
                     zero_run = 0u;
                 }
             } else {
                 if (zero_run == 0u) {
-                    // First zero in a new run — record its subband
                     zrl_group = compute_subband_group(tile_col, tile_row);
                 }
                 zero_run += 1u;
             }
         }
         if (zero_run > 0u) {
-            atomicAdd(&zrl_sum[zrl_group], min(zero_run - 1u, 65535u));
-            atomicAdd(&zrl_count[zrl_group], 1u);
+            p_local_zrl_sum[zrl_group] += min(zero_run - 1u, 65535u);
+            p_local_zrl_count[zrl_group] += 1u;
+        }
+    }
+
+    // Reduce per-thread locals to shared memory (one atomicAdd per group per thread)
+    for (var g = 0u; g < MAX_GROUPS; g++) {
+        if (p_local_count[g] > 0u) {
+            atomicAdd(&group_sum[g], p_local_sum[g]);
+            atomicAdd(&group_count[g], p_local_count[g]);
+        }
+        if (p_local_zrl_count[g] > 0u) {
+            atomicAdd(&zrl_sum[g], p_local_zrl_sum[g]);
+            atomicAdd(&zrl_count[g], p_local_zrl_count[g]);
         }
     }
     workgroupBarrier();
@@ -252,11 +275,10 @@ fn main(
         let coeff = i32(round(input[plane_idx]));
 
         if (coeff == 0) {
-            // Use subband of first zero for k_zrl selection
             let g_zrl = compute_subband_group(tile_col, tile_row);
             let k_zrl = shared_k_zrl[g_zrl];
 
-            // Count zero run (cap at max encodable for this k_zrl to avoid desync)
+            // Count zero run
             let max_run = 32u << k_zrl;
             var run = 1u;
             var ns = s + 1u;
@@ -272,44 +294,66 @@ fn main(
                 ns += 1u;
             }
 
-            // Token: zero run
-            emit_bit(0u);
-            // Rice-code the run length - 1 (always fits since run <= max_run)
+            // Encode zero run: [0] [unary(rq)] [0] [remainder, k_zrl bits]
             let run_val = run - 1u;
             let rq = run_val >> k_zrl;
-            var rq_rem = rq;
-            while (rq_rem > 0u) {
-                let chunk = min(rq_rem, 15u);
-                emit_bits((1u << chunk) - 1u, chunk);
-                rq_rem -= chunk;
-            }
-            emit_bit(0u);
-            if (k_zrl > 0u) {
-                emit_bits(run_val & ((1u << k_zrl) - 1u), k_zrl);
+            let run_remainder = run_val & ((1u << k_zrl) - 1u);
+
+            // Batch emit when total bits fit in 15 (rq <= 12 with k_zrl <= 2)
+            let total_zrl_bits = 2u + rq + k_zrl;
+            if (total_zrl_bits <= 15u) {
+                // Combined: [0] [rq 1-bits] [0] [k_zrl remainder bits]
+                var combined = ((1u << rq) - 1u) << (k_zrl + 1u);
+                combined |= run_remainder;
+                emit_bits(combined, total_zrl_bits);
+            } else {
+                // Fallback for large quotients
+                emit_bit(0u);
+                var rq_rem = rq;
+                while (rq_rem > 0u) {
+                    let chunk = min(rq_rem, 15u);
+                    emit_bits((1u << chunk) - 1u, chunk);
+                    rq_rem -= chunk;
+                }
+                emit_bit(0u);
+                if (k_zrl > 0u) {
+                    emit_bits(run_remainder, k_zrl);
+                }
             }
 
             s += run;
         } else {
-            // Token: non-zero coefficient
-            emit_bit(1u);
-            emit_bit(select(0u, 1u, coeff < 0));
-
+            let sign_bit = select(0u, 1u, coeff < 0);
             let magnitude = u32(abs(coeff)) - 1u;
             let g = compute_subband_group(tile_col, tile_row);
             let k = shared_k[g];
-
             let quotient = min(magnitude >> k, 31u);
-            var q_remaining = quotient;
-            while (q_remaining > 0u) {
-                let chunk = min(q_remaining, 15u);
-                emit_bits((1u << chunk) - 1u, chunk);
-                q_remaining -= chunk;
-            }
-            emit_bit(0u);
+            let remainder = magnitude & ((1u << k) - 1u);
 
-            if (k > 0u) {
-                let remainder = magnitude & ((1u << k) - 1u);
-                emit_bits(remainder, k);
+            // Batch emit when total bits fit in 15
+            let total_bits = 3u + quotient + k;
+            if (total_bits <= 15u) {
+                // Combined: [1] [sign] [quotient 1-bits] [0] [k remainder bits]
+                var combined = 1u << (2u + quotient + k); // significance bit
+                combined |= sign_bit << (1u + quotient + k);
+                combined |= ((1u << quotient) - 1u) << (k + 1u); // unary
+                // stop bit at position k is 0 (implicit)
+                combined |= remainder;
+                emit_bits(combined, total_bits);
+            } else {
+                // Fallback for large quotients
+                emit_bit(1u);
+                emit_bit(sign_bit);
+                var q_remaining = quotient;
+                while (q_remaining > 0u) {
+                    let chunk = min(q_remaining, 15u);
+                    emit_bits((1u << chunk) - 1u, chunk);
+                    q_remaining -= chunk;
+                }
+                emit_bit(0u);
+                if (k > 0u) {
+                    emit_bits(remainder, k);
+                }
             }
 
             s += 1u;

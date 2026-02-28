@@ -58,7 +58,7 @@ impl CachedRiceEncodeBuffers {
             stream_buf: ctx.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("rice_stream"),
                 size: stream_size.max(4),
-                usage: sc | wgpu::BufferUsages::COPY_DST,
+                usage: sc,
                 mapped_at_creation: false,
             }),
             lengths_buf: ctx.device.create_buffer(&wgpu::BufferDescriptor {
@@ -266,8 +266,6 @@ impl GpuRiceEncoder {
             });
 
         for (p, quantized_buf) in quantized_bufs.iter().enumerate() {
-            // Clear stream buffer (encode uses OR-packing within words)
-            cmd.clear_buffer(&bufs.stream_buf, 0, None);
 
             let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("rice_encode_bg"),
@@ -446,8 +444,6 @@ impl GpuRiceEncoder {
                 });
 
         for (p, quantized_buf) in quantized_bufs.iter().enumerate() {
-            // Clear stream buffer (encode uses OR-packing within words)
-            cmd.clear_buffer(&bufs.stream_buf, 0, None);
 
             let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("rice_encode_bg"),

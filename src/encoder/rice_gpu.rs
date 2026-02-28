@@ -348,27 +348,17 @@ impl GpuRiceEncoder {
             rx.recv().unwrap().unwrap();
         }
 
-        // Read back and pack into RiceTile structs
-        let mut all_tiles = Vec::new();
+        // Read back and pack into RiceTile structs — read directly from mapped views
+        // to avoid 192MB of unnecessary to_vec() allocation+memcpy
+        let mut all_tiles = Vec::with_capacity(num_tiles * 3);
         let num_groups = (num_levels * 2) as usize;
 
         for p in 0..3 {
-            let stream_data: Vec<u8> = {
-                let view = bufs.stream_staging[p].slice(..).get_mapped_range();
-                view.to_vec()
-            };
-            let lengths_data: Vec<u32> = {
-                let view = bufs.lengths_staging[p].slice(..).get_mapped_range();
-                bytemuck::cast_slice(&view).to_vec()
-            };
-            let k_data: Vec<u32> = {
-                let view = bufs.k_staging[p].slice(..).get_mapped_range();
-                bytemuck::cast_slice(&view).to_vec()
-            };
-
-            bufs.stream_staging[p].unmap();
-            bufs.lengths_staging[p].unmap();
-            bufs.k_staging[p].unmap();
+            let stream_view = bufs.stream_staging[p].slice(..).get_mapped_range();
+            let lengths_view = bufs.lengths_staging[p].slice(..).get_mapped_range();
+            let k_view = bufs.k_staging[p].slice(..).get_mapped_range();
+            let lengths_data: &[u32] = bytemuck::cast_slice(&lengths_view);
+            let k_data: &[u32] = bytemuck::cast_slice(&k_view);
 
             for tile_idx in 0..num_tiles {
                 let k_values: Vec<u8> = (0..num_groups)
@@ -382,14 +372,15 @@ impl GpuRiceEncoder {
                     .map(|s| lengths_data[tile_idx * RICE_STREAMS_PER_TILE + s])
                     .collect();
 
-                // Pack variable-length streams from fixed-size GPU slots
-                let mut packed_data = Vec::new();
+                // Pre-compute total packed size for allocation
+                let total_packed: usize = stream_lengths.iter().map(|&l| l as usize).sum();
+                let mut packed_data = Vec::with_capacity(total_packed);
                 for s in 0..RICE_STREAMS_PER_TILE {
                     let slot_byte_offset =
                         (tile_idx * RICE_STREAMS_PER_TILE + s) * MAX_STREAM_BYTES;
                     let len = stream_lengths[s] as usize;
                     packed_data
-                        .extend_from_slice(&stream_data[slot_byte_offset..slot_byte_offset + len]);
+                        .extend_from_slice(&stream_view[slot_byte_offset..slot_byte_offset + len]);
                 }
 
                 all_tiles.push(RiceTile {
@@ -403,6 +394,13 @@ impl GpuRiceEncoder {
                     stream_data: packed_data,
                 });
             }
+
+            drop(stream_view);
+            drop(lengths_view);
+            drop(k_view);
+            bufs.stream_staging[p].unmap();
+            bufs.lengths_staging[p].unmap();
+            bufs.k_staging[p].unmap();
         }
 
         all_tiles
@@ -518,6 +516,8 @@ impl GpuRiceEncoder {
         let num_tiles = (info.tiles_x() * info.tiles_y()) as usize;
         let bufs = self.cached.as_ref().unwrap();
         let num_groups = (num_levels * 2) as usize;
+        let profile = std::env::var("GNC_PROFILE").is_ok();
+        let _t0 = std::time::Instant::now();
 
         let (tx, rx) = std::sync::mpsc::channel();
         for p in 0..3 {
@@ -539,26 +539,19 @@ impl GpuRiceEncoder {
         for _ in 0..9 {
             rx.recv().unwrap().unwrap();
         }
+        if profile {
+            eprintln!("    Rice map+poll: {:.1}ms", _t0.elapsed().as_secs_f64() * 1000.0);
+        }
+        let _t1 = std::time::Instant::now();
 
-        let mut all_tiles = Vec::new();
+        let mut all_tiles = Vec::with_capacity(num_tiles * 3);
 
         for p in 0..3 {
-            let stream_data: Vec<u8> = {
-                let view = bufs.stream_staging[p].slice(..).get_mapped_range();
-                view.to_vec()
-            };
-            let lengths_data: Vec<u32> = {
-                let view = bufs.lengths_staging[p].slice(..).get_mapped_range();
-                bytemuck::cast_slice(&view).to_vec()
-            };
-            let k_data: Vec<u32> = {
-                let view = bufs.k_staging[p].slice(..).get_mapped_range();
-                bytemuck::cast_slice(&view).to_vec()
-            };
-
-            bufs.stream_staging[p].unmap();
-            bufs.lengths_staging[p].unmap();
-            bufs.k_staging[p].unmap();
+            let stream_view = bufs.stream_staging[p].slice(..).get_mapped_range();
+            let lengths_view = bufs.lengths_staging[p].slice(..).get_mapped_range();
+            let k_view = bufs.k_staging[p].slice(..).get_mapped_range();
+            let lengths_data: &[u32] = bytemuck::cast_slice(&lengths_view);
+            let k_data: &[u32] = bytemuck::cast_slice(&k_view);
 
             for tile_idx in 0..num_tiles {
                 let k_values: Vec<u8> = (0..num_groups)
@@ -572,13 +565,14 @@ impl GpuRiceEncoder {
                     .map(|s| lengths_data[tile_idx * RICE_STREAMS_PER_TILE + s])
                     .collect();
 
-                let mut packed_data = Vec::new();
+                let total_packed: usize = stream_lengths.iter().map(|&l| l as usize).sum();
+                let mut packed_data = Vec::with_capacity(total_packed);
                 for s in 0..RICE_STREAMS_PER_TILE {
                     let slot_byte_offset =
                         (tile_idx * RICE_STREAMS_PER_TILE + s) * MAX_STREAM_BYTES;
                     let len = stream_lengths[s] as usize;
                     packed_data
-                        .extend_from_slice(&stream_data[slot_byte_offset..slot_byte_offset + len]);
+                        .extend_from_slice(&stream_view[slot_byte_offset..slot_byte_offset + len]);
                 }
 
                 all_tiles.push(RiceTile {
@@ -592,6 +586,23 @@ impl GpuRiceEncoder {
                     stream_data: packed_data,
                 });
             }
+
+            drop(stream_view);
+            drop(lengths_view);
+            drop(k_view);
+            bufs.stream_staging[p].unmap();
+            bufs.lengths_staging[p].unmap();
+            bufs.k_staging[p].unmap();
+        }
+
+        if profile {
+            let actual_bytes: usize = all_tiles.iter().map(|t| t.stream_data.len()).sum();
+            let staging_bytes = num_tiles * RICE_STREAMS_PER_TILE * MAX_STREAM_BYTES * 3;
+            eprintln!("    Rice pack: {:.1}ms (actual {:.1}MB / staging {:.1}MB = {:.1}% utilization)",
+                _t1.elapsed().as_secs_f64() * 1000.0,
+                actual_bytes as f64 / 1_048_576.0,
+                staging_bytes as f64 / 1_048_576.0,
+                actual_bytes as f64 / staging_bytes as f64 * 100.0);
         }
 
         all_tiles

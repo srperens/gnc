@@ -856,7 +856,19 @@ impl EncoderPipeline {
 
         let t_wavelet_quant = t_start.elapsed();
 
-        // Single submit for all 3 planes + weight map copy (no blocking poll!)
+        // For GPU Rice: batch entropy encode + staging copies into the same command
+        // encoder as wavelet+quantize — saves one submit overhead
+        if use_gpu_rice {
+            self.gpu_rice_encoder.dispatch_3planes_to_cmd(
+                ctx,
+                &mut cmd,
+                [&bufs.mc_out, &bufs.ref_upload, &bufs.plane_b],
+                &info,
+                config.wavelet_levels,
+            );
+        }
+
+        // Single submit for all GPU work (wavelet+quant + entropy if Rice)
         ctx.queue.submit(Some(cmd.finish()));
 
         let t_submit_wq = t_start.elapsed();
@@ -891,10 +903,16 @@ impl EncoderPipeline {
             }
         }
 
-        // Batched 3-plane GPU entropy encode: single submit + single poll for all planes.
-        // GPU queue guarantees sequential execution: wavelet+quantize finishes before
-        // entropy starts reading quantized buffers. No intermediate poll needed.
-        if use_gpu_huffman {
+        // GPU entropy: Rice already dispatched above, others create their own cmds
+        if use_gpu_rice {
+            // Readback from staging (GPU work already submitted above)
+            let mut rt = self.gpu_rice_encoder.finish_3planes_readback(
+                ctx,
+                &info,
+                config.wavelet_levels,
+            );
+            rice_tiles.append(&mut rt);
+        } else if use_gpu_huffman {
             // GPU Huffman encode: 2-pass (histogram → codebook → encode)
             let mut ht = self.gpu_huffman_encoder.encode_3planes_to_tiles(
                 ctx,
@@ -903,15 +921,6 @@ impl EncoderPipeline {
                 config.wavelet_levels,
             );
             huffman_tiles.append(&mut ht);
-        } else if use_gpu_rice {
-            // GPU Rice encode: single-pass, 256 streams per tile
-            let mut rt = self.gpu_rice_encoder.encode_3planes_to_tiles(
-                ctx,
-                [&bufs.mc_out, &bufs.ref_upload, &bufs.plane_b],
-                &info,
-                config.wavelet_levels,
-            );
-            rice_tiles.append(&mut rt);
         } else if use_gpu_encode && use_fused_qh {
             // Fused path: histograms already computed by fused quantize+histogram shader.
             // Skip histogram pass, go straight to normalize + encode.

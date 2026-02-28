@@ -158,6 +158,7 @@
         <span id="statFps"></span>
         <span id="statDecode"></span>
         <span id="statPlayFps"></span>
+        <span id="statPath"></span>
     </div>
 
     <script type="module">
@@ -167,8 +168,7 @@
         const dropZone = $('dropZone');
         const fileInput = $('fileInput');
         const status = $('status');
-        const canvas = $('canvas');
-        const ctx2d = canvas.getContext('2d');
+        let canvas = $('canvas');
         const playBtn = $('playBtn');
         const seekBar = $('seekBar');
         const frameLabel = $('frameLabel');
@@ -176,9 +176,14 @@
         const controlsBar = $('controlsBar');
         const statsBar = $('statsBar');
 
+        // Defer 2D context creation — canvas can only have one context type.
+        // If zero-copy WebGPU rendering works, we never create a 2D context.
+        let ctx2d = null;
+
         let wasmReady = false;
         let player = null;
         let playing = false;
+        let zeroCopy = false;  // true when using GPU surface blit path
         let animId = null;
         let playbackStartTime = 0;  // wall clock ms when Play was pressed
         let playbackStartFrame = 0; // frame index at play start
@@ -322,6 +327,17 @@
         }
 
         async function loadBuffer(buf, name) {
+            zeroCopy = false;
+
+            // Replace canvas element to clear any previous context (2D or WebGPU).
+            // A canvas can only have one context type, so we need a fresh element.
+            const oldCanvas = canvas;
+            const newCanvas = document.createElement('canvas');
+            newCanvas.id = 'canvas';
+            oldCanvas.parentNode.replaceChild(newCanvas, oldCanvas);
+            canvas = newCanvas;
+            ctx2d = null;
+
             player = await new GnvPlayer(buf);
 
             const w = player.width;
@@ -351,12 +367,28 @@
             playBtn.disabled = false;
             playBtn.textContent = fc > 1 ? 'Play' : 'Decode';
 
+            // Try zero-copy GPU surface rendering
+            try {
+                player.set_canvas(canvas);
+                zeroCopy = true;
+                console.log('Zero-copy GPU canvas rendering enabled');
+                $('statPath').textContent = 'GPU blit';
+            } catch (e) {
+                console.warn('Zero-copy not available, using readback path:', e);
+                zeroCopy = false;
+                $('statPath').textContent = 'readback';
+            }
+
             // Decode first frame
             setStatus('Decoding frame 0...');
             const t0 = performance.now();
-            const rgba = await player.decode_next_frame();
+            if (zeroCopy) {
+                player.decode_and_present();
+            } else {
+                const rgba = await player.decode_next_frame();
+                paintFrame(rgba, w, h);
+            }
             const dt = performance.now() - t0;
-            paintFrame(rgba, w, h);
             seekBar.value = 0;
             updateFrameLabel(0);
             $('statDecode').textContent = `Decode: ${dt.toFixed(1)} ms`;
@@ -367,8 +399,9 @@
             jsCurrentFrame = 0;
         }
 
-        // --- Paint ---
+        // --- Paint (readback fallback path) ---
         function paintFrame(rgba, w, h) {
+            if (!ctx2d) ctx2d = canvas.getContext('2d');
             const clamped = new Uint8ClampedArray(rgba.buffer, rgba.byteOffset, rgba.byteLength);
             const img = new ImageData(clamped, w, h);
             ctx2d.putImageData(img, 0, 0);
@@ -396,14 +429,18 @@
 
             // Decode exactly one frame per tick — never skip-decode
             const t0 = performance.now();
-            const rgba = await player.decode_next_frame();
+            if (zeroCopy) {
+                player.decode_and_present();
+            } else {
+                const rgba = await player.decode_next_frame();
+                if (!playing) return;
+                paintFrame(rgba, cachedWidth, cachedHeight);
+            }
             const dt = performance.now() - t0;
             jsCurrentFrame++;
             if (jsCurrentFrame >= cachedFc) jsCurrentFrame = 0;
 
             if (!playing) return;
-
-            paintFrame(rgba, cachedWidth, cachedHeight);
 
             const displayFrame = (jsCurrentFrame + cachedFc - 1) % cachedFc;
             seekBar.value = displayFrame;
@@ -473,9 +510,13 @@
                 // Single-frame: just re-decode
                 player.reset();
                 jsCurrentFrame = 0;
-                player.decode_next_frame().then(rgba => {
-                    paintFrame(rgba, cachedWidth, cachedHeight);
-                });
+                if (zeroCopy) {
+                    player.decode_and_present();
+                } else {
+                    player.decode_next_frame().then(rgba => {
+                        paintFrame(rgba, cachedWidth, cachedHeight);
+                    });
+                }
                 return;
             }
             if (playing) pause(); else play();
@@ -488,9 +529,13 @@
             const target = parseInt(seekBar.value, 10);
             setStatus(`Seeking to frame ${target}...`);
             const t0 = performance.now();
-            const rgba = await player.seek(target);
+            if (zeroCopy) {
+                player.seek_and_present(target);
+            } else {
+                const rgba = await player.seek(target);
+                paintFrame(rgba, cachedWidth, cachedHeight);
+            }
             const dt = performance.now() - t0;
-            paintFrame(rgba, cachedWidth, cachedHeight);
             jsCurrentFrame = target + 1;
             updateFrameLabel(target);
             $('statDecode').textContent = `Seek+decode: ${dt.toFixed(1)} ms`;

@@ -572,6 +572,8 @@ pub fn decode_order(frames: &[CompressedFrame]) -> Vec<usize> {
 
 /// GPU context shared across encoder/decoder
 pub struct GpuContext {
+    pub instance: wgpu::Instance,
+    pub adapter: wgpu::Adapter,
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
 }
@@ -635,7 +637,12 @@ impl GpuContext {
             .await
             .map_err(|e| format!("Failed to create GPU device: {e}"))?;
 
-        Ok(Self { device, queue })
+        Ok(Self {
+            instance,
+            adapter,
+            device,
+            queue,
+        })
     }
 }
 
@@ -676,6 +683,62 @@ pub mod wasm {
 
     /// Stateful player for .gnc (single frame) and .gnv (GNV1 video sequence) files.
     /// Holds GPU context and decoder across frames for zero-reinit playback.
+    /// Blit a source texture view to a WebGPU surface using a fullscreen triangle.
+    fn blit_to_surface(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        surface: &wgpu::Surface<'static>,
+        pipeline: &wgpu::RenderPipeline,
+        bgl: &wgpu::BindGroupLayout,
+        sampler: &wgpu::Sampler,
+        src_view: &wgpu::TextureView,
+    ) -> Result<(), JsValue> {
+        let frame = surface
+            .get_current_texture()
+            .map_err(|e| JsValue::from_str(&format!("Surface error: {e}")))?;
+        let target_view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+
+        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("blit_bg"),
+            layout: bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(src_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(sampler),
+                },
+            ],
+        });
+
+        let mut cmd =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut pass = cmd.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("blit_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &target_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        queue.submit(Some(cmd.finish()));
+        frame.present();
+        Ok(())
+    }
+
     #[wasm_bindgen]
     pub struct GnvPlayer {
         ctx: crate::GpuContext,
@@ -687,10 +750,15 @@ pub mod wasm {
         frame_count: u32,
         fps: f64,
         current_frame: usize,
-        /// Pre-decoded RGBA frames for B-frame group buffering.
-        /// When we hit a B-frame group, we decode the anchor P first, then all
-        /// B-frames, and buffer results in display order for sequential retrieval.
+        /// Pre-decoded RGBA frames for B-frame group buffering (readback path).
         buffered_frames: std::collections::BTreeMap<usize, Vec<u8>>,
+        // Zero-copy canvas rendering (set by set_canvas)
+        surface: Option<wgpu::Surface<'static>>,
+        blit_pipeline: Option<wgpu::RenderPipeline>,
+        blit_bgl: Option<wgpu::BindGroupLayout>,
+        blit_sampler: Option<wgpu::Sampler>,
+        /// Pre-decoded GPU textures for B-frame group buffering (zero-copy path).
+        buffered_textures: std::collections::BTreeMap<usize, wgpu::Texture>,
     }
 
     #[wasm_bindgen]
@@ -723,6 +791,11 @@ pub mod wasm {
                     fps,
                     current_frame: 0,
                     buffered_frames: std::collections::BTreeMap::new(),
+                    surface: None,
+                    blit_pipeline: None,
+                    blit_bgl: None,
+                    blit_sampler: None,
+                    buffered_textures: std::collections::BTreeMap::new(),
                 })
             } else {
                 // Single-frame .gnc
@@ -740,6 +813,11 @@ pub mod wasm {
                     fps: 1.0,
                     current_frame: 0,
                     buffered_frames: std::collections::BTreeMap::new(),
+                    surface: None,
+                    blit_pipeline: None,
+                    blit_bgl: None,
+                    blit_sampler: None,
+                    buffered_textures: std::collections::BTreeMap::new(),
                 })
             }
         }
@@ -923,10 +1001,384 @@ pub mod wasm {
             Err(JsValue::from_str("Seek failed"))
         }
 
+        /// Returns true if zero-copy canvas rendering is configured.
+        #[wasm_bindgen(getter)]
+        pub fn has_surface(&self) -> bool {
+            self.surface.is_some()
+        }
+
+        /// Configure zero-copy rendering to a canvas element.
+        /// After this, use `decode_and_present()` instead of `decode_next_frame()`.
+        /// The canvas must NOT have a 2D context — WebGPU and 2D contexts are mutually exclusive.
+        pub fn set_canvas(
+            &mut self,
+            canvas: web_sys::HtmlCanvasElement,
+        ) -> Result<(), JsValue> {
+            let surface = self
+                .ctx
+                .instance
+                .create_surface(wgpu::SurfaceTarget::Canvas(canvas))
+                .map_err(|e| JsValue::from_str(&format!("Failed to create surface: {e}")))?;
+
+            let config = surface
+                .get_default_config(&self.ctx.adapter, self.width, self.height)
+                .ok_or_else(|| {
+                    JsValue::from_str("Surface format not compatible with adapter")
+                })?;
+            surface.configure(&self.ctx.device, &config);
+
+            let shader =
+                self.ctx
+                    .device
+                    .create_shader_module(wgpu::ShaderModuleDescriptor {
+                        label: Some("blit"),
+                        source: wgpu::ShaderSource::Wgsl(
+                            include_str!("shaders/blit.wgsl").into(),
+                        ),
+                    });
+
+            let bgl =
+                self.ctx
+                    .device
+                    .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                        label: Some("blit_bgl"),
+                        entries: &[
+                            wgpu::BindGroupLayoutEntry {
+                                binding: 0,
+                                visibility: wgpu::ShaderStages::FRAGMENT,
+                                ty: wgpu::BindingType::Texture {
+                                    sample_type: wgpu::TextureSampleType::Float {
+                                        filterable: true,
+                                    },
+                                    view_dimension: wgpu::TextureViewDimension::D2,
+                                    multisampled: false,
+                                },
+                                count: None,
+                            },
+                            wgpu::BindGroupLayoutEntry {
+                                binding: 1,
+                                visibility: wgpu::ShaderStages::FRAGMENT,
+                                ty: wgpu::BindingType::Sampler(
+                                    wgpu::SamplerBindingType::Filtering,
+                                ),
+                                count: None,
+                            },
+                        ],
+                    });
+
+            let pl =
+                self.ctx
+                    .device
+                    .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                        label: Some("blit_pl"),
+                        bind_group_layouts: &[&bgl],
+                        push_constant_ranges: &[],
+                    });
+
+            let pipeline =
+                self.ctx
+                    .device
+                    .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                        label: Some("blit_pipeline"),
+                        layout: Some(&pl),
+                        vertex: wgpu::VertexState {
+                            module: &shader,
+                            entry_point: Some("vs_main"),
+                            buffers: &[],
+                            compilation_options: Default::default(),
+                        },
+                        fragment: Some(wgpu::FragmentState {
+                            module: &shader,
+                            entry_point: Some("fs_main"),
+                            targets: &[Some(wgpu::ColorTargetState {
+                                format: config.format,
+                                blend: None,
+                                write_mask: wgpu::ColorWrites::ALL,
+                            })],
+                            compilation_options: Default::default(),
+                        }),
+                        primitive: wgpu::PrimitiveState {
+                            topology: wgpu::PrimitiveTopology::TriangleList,
+                            ..Default::default()
+                        },
+                        depth_stencil: None,
+                        multisample: wgpu::MultisampleState::default(),
+                        multiview: None,
+                        cache: None,
+                    });
+
+            let sampler = self.ctx.device.create_sampler(&wgpu::SamplerDescriptor {
+                label: Some("blit_sampler"),
+                mag_filter: wgpu::FilterMode::Nearest,
+                min_filter: wgpu::FilterMode::Nearest,
+                ..Default::default()
+            });
+
+            self.surface = Some(surface);
+            self.blit_pipeline = Some(pipeline);
+            self.blit_bgl = Some(bgl);
+            self.blit_sampler = Some(sampler);
+            Ok(())
+        }
+
+        /// Decode the next frame and present it directly to the canvas (zero-copy).
+        /// No data is returned to JS. Advances the frame counter.
+        /// Handles B-frame reordering with GPU texture buffering.
+        pub fn decode_and_present(&mut self) -> Result<(), JsValue> {
+            if self.current_frame >= self.frame_count as usize {
+                self.current_frame = 0;
+                self.buffered_textures.clear();
+                self.buffered_frames.clear();
+            }
+
+            // Return buffered texture if available (from a previous B-frame group decode)
+            if let Some(texture) = self.buffered_textures.remove(&self.current_frame) {
+                let view =
+                    texture.create_view(&wgpu::TextureViewDescriptor::default());
+                blit_to_surface(
+                    &self.ctx.device,
+                    &self.ctx.queue,
+                    self.surface.as_ref().unwrap(),
+                    self.blit_pipeline.as_ref().unwrap(),
+                    self.blit_bgl.as_ref().unwrap(),
+                    self.blit_sampler.as_ref().unwrap(),
+                    &view,
+                )?;
+                self.current_frame += 1;
+                return Ok(());
+            }
+
+            if self.header.is_none() {
+                // Single-frame .gnc
+                let frame = crate::format::deserialize_compressed(&self.data);
+                self.decoder.decode_to_texture(&self.ctx, &frame);
+                let view = self.decoder.output_texture_view().unwrap();
+                blit_to_surface(
+                    &self.ctx.device,
+                    &self.ctx.queue,
+                    self.surface.as_ref().unwrap(),
+                    self.blit_pipeline.as_ref().unwrap(),
+                    self.blit_bgl.as_ref().unwrap(),
+                    self.blit_sampler.as_ref().unwrap(),
+                    &view,
+                )?;
+                self.current_frame += 1;
+                return Ok(());
+            }
+
+            let header = self.header.as_ref().unwrap();
+            let idx = self.current_frame;
+            let ft = header.index[idx].frame_type;
+
+            if ft == 2 {
+                // B-frame group: decode anchor + all B-frames to owned textures
+                let b_start = idx;
+                let mut b_end = idx;
+                while b_end < self.frame_count as usize
+                    && header.index[b_end].frame_type == 2
+                {
+                    b_end += 1;
+                }
+
+                if b_end < self.frame_count as usize {
+                    self.decoder.swap_forward_to_backward_ref(&self.ctx);
+                    let anchor_frame = crate::format::deserialize_sequence_frame(
+                        &self.data, header, b_end,
+                    );
+                    let (anchor_tex, _) = self.decoder.decode_to_owned_texture(
+                        &self.ctx,
+                        &anchor_frame,
+                    );
+                    self.decoder.swap_references();
+
+                    for b_idx in b_start..b_end {
+                        let b_frame = crate::format::deserialize_sequence_frame(
+                            &self.data, header, b_idx,
+                        );
+                        let (b_tex, _) = self.decoder.decode_to_owned_texture(
+                            &self.ctx, &b_frame,
+                        );
+                        self.buffered_textures.insert(b_idx, b_tex);
+                    }
+
+                    self.decoder.swap_references();
+                    self.buffered_textures.insert(b_end, anchor_tex);
+
+                    let texture =
+                        self.buffered_textures.remove(&idx).unwrap();
+                    let view = texture
+                        .create_view(&wgpu::TextureViewDescriptor::default());
+                    blit_to_surface(
+                        &self.ctx.device,
+                        &self.ctx.queue,
+                        self.surface.as_ref().unwrap(),
+                        self.blit_pipeline.as_ref().unwrap(),
+                        self.blit_bgl.as_ref().unwrap(),
+                        self.blit_sampler.as_ref().unwrap(),
+                        &view,
+                    )?;
+                    self.current_frame = idx + 1;
+                    return Ok(());
+                } else {
+                    // No anchor available — decode as-is
+                    let frame = crate::format::deserialize_sequence_frame(
+                        &self.data, header, idx,
+                    );
+                    self.decoder.decode_to_texture(&self.ctx, &frame);
+                    let view = self.decoder.output_texture_view().unwrap();
+                    blit_to_surface(
+                        &self.ctx.device,
+                        &self.ctx.queue,
+                        self.surface.as_ref().unwrap(),
+                        self.blit_pipeline.as_ref().unwrap(),
+                        self.blit_bgl.as_ref().unwrap(),
+                        self.blit_sampler.as_ref().unwrap(),
+                        &view,
+                    )?;
+                    self.current_frame += 1;
+                    return Ok(());
+                }
+            }
+
+            // I/P frame: decode to cached texture and present
+            let frame =
+                crate::format::deserialize_sequence_frame(&self.data, header, idx);
+            self.decoder.decode_to_texture(&self.ctx, &frame);
+            let view = self.decoder.output_texture_view().unwrap();
+            blit_to_surface(
+                &self.ctx.device,
+                &self.ctx.queue,
+                self.surface.as_ref().unwrap(),
+                self.blit_pipeline.as_ref().unwrap(),
+                self.blit_bgl.as_ref().unwrap(),
+                self.blit_sampler.as_ref().unwrap(),
+                &view,
+            )?;
+            self.current_frame += 1;
+            Ok(())
+        }
+
+        /// Seek to a target frame and present it (zero-copy).
+        /// Decodes from nearest keyframe to target without presenting intermediate frames.
+        pub fn seek_and_present(&mut self, target_frame: u32) -> Result<(), JsValue> {
+            if self.header.is_none() {
+                self.current_frame = 0;
+                self.buffered_textures.clear();
+                return self.decode_and_present();
+            }
+
+            let target =
+                (target_frame as usize).min(self.frame_count as usize - 1);
+            let keyframe_idx = {
+                let header = self.header.as_ref().unwrap();
+                crate::format::seek_to_keyframe(header, target as u64)
+            };
+
+            self.buffered_frames.clear();
+            self.buffered_textures.clear();
+            self.current_frame = keyframe_idx;
+
+            // Decode forward from keyframe, discarding intermediate frames
+            while self.current_frame < target
+                && !self.buffered_textures.contains_key(&target)
+            {
+                self.gpu_advance_one();
+            }
+
+            // Present the target
+            if let Some(texture) = self.buffered_textures.remove(&target) {
+                let view =
+                    texture.create_view(&wgpu::TextureViewDescriptor::default());
+                blit_to_surface(
+                    &self.ctx.device,
+                    &self.ctx.queue,
+                    self.surface.as_ref().unwrap(),
+                    self.blit_pipeline.as_ref().unwrap(),
+                    self.blit_bgl.as_ref().unwrap(),
+                    self.blit_sampler.as_ref().unwrap(),
+                    &view,
+                )?;
+            } else {
+                self.current_frame = target;
+                self.decode_and_present()?;
+            }
+
+            self.current_frame = target + 1;
+            self.buffered_textures.retain(|&k, _| k > target);
+            Ok(())
+        }
+
         /// Reset playback to frame 0.
         pub fn reset(&mut self) {
             self.current_frame = 0;
             self.buffered_frames.clear();
+            self.buffered_textures.clear();
+        }
+    }
+
+    // Private methods (not exported to JS)
+    impl GnvPlayer {
+        /// Decode one frame to GPU texture without presenting. Handles B-frame groups.
+        /// Used by seek_and_present to skip intermediate frames.
+        fn gpu_advance_one(&mut self) {
+            // Return buffered texture if available (drop it — we don't present)
+            if self.buffered_textures.remove(&self.current_frame).is_some() {
+                self.current_frame += 1;
+                return;
+            }
+
+            let header = self.header.as_ref().unwrap();
+            let idx = self.current_frame;
+            let ft = header.index[idx].frame_type;
+
+            if ft == 2 {
+                let b_start = idx;
+                let mut b_end = idx;
+                while b_end < self.frame_count as usize
+                    && header.index[b_end].frame_type == 2
+                {
+                    b_end += 1;
+                }
+
+                if b_end < self.frame_count as usize {
+                    self.decoder.swap_forward_to_backward_ref(&self.ctx);
+                    let anchor = crate::format::deserialize_sequence_frame(
+                        &self.data, header, b_end,
+                    );
+                    let (anchor_tex, _) =
+                        self.decoder.decode_to_owned_texture(&self.ctx, &anchor);
+                    self.decoder.swap_references();
+
+                    for b_idx in b_start..b_end {
+                        let b_frame = crate::format::deserialize_sequence_frame(
+                            &self.data, header, b_idx,
+                        );
+                        let (b_tex, _) = self
+                            .decoder
+                            .decode_to_owned_texture(&self.ctx, &b_frame);
+                        self.buffered_textures.insert(b_idx, b_tex);
+                    }
+
+                    self.decoder.swap_references();
+                    self.buffered_textures.insert(b_end, anchor_tex);
+
+                    // Drop current frame's texture (not presenting)
+                    self.buffered_textures.remove(&idx);
+                    self.current_frame = idx + 1;
+                } else {
+                    let frame = crate::format::deserialize_sequence_frame(
+                        &self.data, header, idx,
+                    );
+                    self.decoder.decode_to_texture(&self.ctx, &frame);
+                    self.current_frame += 1;
+                }
+            } else {
+                let frame = crate::format::deserialize_sequence_frame(
+                    &self.data, header, idx,
+                );
+                self.decoder.decode_to_texture(&self.ctx, &frame);
+                self.current_frame += 1;
+            }
         }
     }
 }

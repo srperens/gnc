@@ -530,6 +530,65 @@ impl DecoderPipeline {
         }
     }
 
+    /// Decode a compressed frame to a new owned GPU texture.
+    /// Unlike `decode_to_texture()` which reuses a cached texture (overwritten on next decode),
+    /// this allocates a fresh texture and copies the result into it via GPU-side
+    /// `copy_texture_to_texture` (~0.1ms). Used for B-frame buffering where multiple
+    /// decoded frames must coexist on the GPU simultaneously.
+    pub fn decode_to_owned_texture(
+        &self,
+        ctx: &GpuContext,
+        frame: &CompressedFrame,
+    ) -> (wgpu::Texture, TextureHandle) {
+        let handle = self.decode_to_texture(ctx, frame);
+
+        let owned = ctx.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("owned_decode_texture"),
+            size: wgpu::Extent3d {
+                width: handle.width,
+                height: handle.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+
+        let cached = self.cached.borrow();
+        let bufs = cached.as_ref().unwrap();
+        let mut cmd = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("copy_to_owned_texture"),
+            });
+        cmd.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &bufs.output_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: &owned,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d {
+                width: handle.width,
+                height: handle.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        ctx.queue.submit(Some(cmd.finish()));
+        drop(cached);
+
+        (owned, handle)
+    }
+
     /// Decode a sequence of compressed frames, handling B-frame reordering.
     ///
     /// Input frames must be in **display order**. Returns decoded RGB data in display order.

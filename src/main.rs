@@ -270,6 +270,17 @@ enum Command {
         #[arg(long)]
         compare_codecs: bool,
     },
+
+    /// Compare block-based transforms (DCT, Hadamard, Haar) against wavelet baseline
+    TransformShootout {
+        /// Input image file
+        #[arg(short, long)]
+        input: String,
+
+        /// Number of timing iterations per transform
+        #[arg(short = 'n', long, default_value = "20")]
+        iterations: u32,
+    },
 }
 
 /// Parse a bitrate string like "10M", "500K", "1.5M", or raw number "10000000".
@@ -1335,6 +1346,24 @@ fn main() {
                 eprintln!("Error: provide --input for RD sweep, --compare for BD-rate, or both.");
                 std::process::exit(1);
             }
+        }
+
+        Command::TransformShootout { input, iterations } => {
+            let ctx = GpuContext::new();
+
+            // Run Haar diagnostic first
+            experiments::transform_shootout::diagnose_haar(&ctx);
+
+            let (rgb_data, w, h) = load_image_rgb_f32(&input);
+            println!(
+                "\nTransform shootout: {}x{} image, {} iterations",
+                w, h, iterations
+            );
+
+            let results = experiments::transform_shootout::run_shootout(
+                &ctx, &rgb_data, w, h, iterations,
+            );
+            experiments::transform_shootout::print_results(&results);
         }
     }
 }

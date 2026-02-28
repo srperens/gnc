@@ -4,6 +4,58 @@
 
 ---
 
+## 2026-02-28: Transform Shootout — Phase 1 (Mega-Kernel Plan)
+
+### Hypothesis
+The current CDF-9/7 wavelet uses 8 dispatches per level × 4 levels = ~24 dispatches for 3 planes, contributing significant dispatch overhead (~0.1-0.2ms each on M1). Block-based transforms that operate in a single dispatch should be faster while providing competitive RD performance. Goal: find the best transform candidate for the mega-kernel pipeline.
+
+### Implementation
+Built 4 block-transform WGSL shaders + Rust host code + benchmark harness:
+- **DCT-8×8** (`dct8.wgsl`): Separable DCT-II/III, 64 threads/WG, cos() basis
+- **DCT-16×16** (`dct16.wgsl`): Separable DCT-II/III, 256 threads/WG
+- **WHT-4×4** (`hadamard4.wgsl`): Walsh-Hadamard, 256 threads/WG (16 blocks), multiply-free
+- **Haar-16×16** (`haar_block.wgsl`): 2-level block-local Haar wavelet, 256 threads/WG
+
+Files: `src/shaders/{dct8,dct16,hadamard4,haar_block}.wgsl`, `src/encoder/block_transform.rs`, `src/experiments/transform_shootout.rs`
+
+### Bugs Found & Fixed
+1. **WGSL reserved keyword**: `shared` → `smem` in all shaders
+2. **Hadamard butterfly ordering**: H4 matrix rows weren't symmetric — swapped case 1/2 outputs to make W=W^T (self-inverse). PSNR went from 24.79 → 99.00 dB.
+3. **Haar inverse barrier bug**: Barriers inside divergent if/else branches (matching barriers in both arms) caused incorrect execution on M1/Metal. Fix: moved ALL `workgroupBarrier()` calls to unconditional top-level. PSNR went from 8.87 → 142.51 dB.
+
+**Barrier lesson**: On Metal/M1 via naga, never put `workgroupBarrier()` inside divergent branches, even with matching barriers in both arms. Always place barriers unconditionally.
+
+### Results (bbb_1080p, 1920×1080, median of 5)
+
+**Speed:**
+| Transform | Forward(ms) | Inv(ms) | Dispatches | vs CDF-9/7 |
+|---|---|---|---|---|
+| WHT-4×4 | 1.32 | 1.31 | 1 | **3.95x faster** |
+| Haar-16×16 | 1.31 | 1.31 | 1 | **3.98x faster** |
+| DCT-8×8 | 2.61 | 2.59 | 1 | **2.00x faster** |
+| DCT-16×16 | 5.12 | 3.87 | 1 | ~same |
+| CDF-9/7 (4L) | 5.22 | 5.20 | 8 | baseline |
+
+**RD (PSNR dB / BPP estimate at qstep):**
+| Transform | q=1 | q=4 | q=8 | q=16 | q=32 |
+|---|---|---|---|---|---|
+| DCT-8×8 | 59.0/4.5 | 48.1/2.2 | 43.1/1.4 | 38.4/0.9 | 34.1/0.5 |
+| DCT-16×16 | 59.0/4.1 | 48.0/1.9 | 43.0/1.2 | 38.4/0.7 | 34.2/0.4 |
+| WHT-4×4 | 59.0/5.7 | 47.6/3.1 | 42.1/2.1 | 37.1/1.3 | 32.7/0.8 |
+| Haar-16×16 | 58.9/5.8 | 47.6/3.2 | 42.1/2.1 | 37.0/1.3 | 32.6/0.8 |
+| CDF-9/7 | 58.8/4.1 | 48.0/1.9 | 43.0/1.1 | 38.4/0.7 | 34.2/0.4 |
+
+### Analysis
+- **DCT-8×8 is the winner** for mega-kernel: 2x faster than CDF-9/7 with nearly identical RD performance (<0.15 dB delta at all quality levels). Best speed/quality tradeoff.
+- **DCT-16×16** matches CDF-9/7 RD exactly but is no faster — the 256 cos() calls per thread dominate.
+- **WHT-4×4 and Haar-16×16** are fastest (4x!) but ~1-1.5 dB worse RD with ~50% higher BPP. Good candidates for speed-first modes or as residual transforms in video.
+- All block transforms use 1 dispatch vs 8 for CDF-9/7, critical for mega-kernel fusion.
+
+### Next Steps
+Phase 2 of mega-kernel plan: fuse DCT-8×8 + quantize into a single kernel, then add entropy coding candidates.
+
+---
+
 ## 2026-02-28: Rice readback optimization + I-frame batching
 
 ### Hypothesis

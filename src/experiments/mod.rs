@@ -1,5 +1,7 @@
 /// Experiment configurations.
 /// Each experiment is a named set of codec parameters.
+pub mod transform_shootout;
+
 use crate::{CodecConfig, SubbandWeights, WaveletType};
 
 pub struct Experiment {

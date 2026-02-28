@@ -217,6 +217,12 @@
                 setStatus('Initializing WebGPU + WASM...');
                 await init();
                 wasmReady = true;
+                // Log GPU adapter info
+                const adapter = await navigator.gpu.requestAdapter();
+                if (adapter) {
+                    const info = adapter.info || await adapter.requestAdapterInfo?.() || {};
+                    console.log('WebGPU adapter:', info.device || info.description || 'unknown', '| vendor:', info.vendor, '| arch:', info.architecture);
+                }
                 setStatus('Ready', 'ok');
             } catch (e) {
                 const msg = String(e.message || e);

@@ -4,6 +4,63 @@
 
 ---
 
+## 2026-02-28: Debug Motion Compensation — ME Search Range Fix
+
+### Hypothesis
+P-frames may not be significantly smaller than I-frames because motion estimation
+is not finding correct MVs, leading to large residuals that compress poorly.
+
+### Investigation
+Full code review of the ME/MC pipeline (block_match.wgsl, motion_compensate.wgsl,
+sequence.rs, motion.rs, decoder gpu_work.rs). The pipeline is structurally correct:
+- Residuals are properly computed (current - predicted) in forward MC
+- Reconstruction is correct (residuals + predicted) in inverse MC
+- Reference frames are updated from locally-decoded frames (encoder-decoder match)
+- Bilinear half-pel interpolation handles edge cases correctly
+
+### Bug Found
+**First P-frame and first B-frame per GOP had severely limited ME search range.**
+
+The encoder initialized `prev_mv_buf` with zero-MVs and always passed `Some(&zero_mv_buf)`
+as the temporal predictor, even for the first P-frame after a keyframe. This triggered
+the temporal prediction path in the ME shader, which:
+1. **Skips coarse search entirely** (no ±32 pixel full search)
+2. Only searches ±2 pixels around the predictor (ME_PRED_FINE_RANGE=2)
+
+For the first P-frame with zero predictor, the effective search range was only ±2 pixels
+instead of the intended ±32. Any real motion >2 pixels per frame was missed, producing
+poor predictions and large residuals. Since subsequent frames used the previous frame's
+(incorrect) MVs as predictors, the error cascaded through the GOP.
+
+**Root cause**: `prev_mv_buf.as_ref().or(Some(&zero_mv_buf))` always returned `Some`,
+triggering the predictor path. The comment also incorrectly claimed ±4 range when the
+actual `ME_PRED_FINE_RANGE` constant is 2.
+
+### Fix
+1. Pass `None` (not `Some(&zero_mv_buf)`) when no real predictor exists:
+   - First P-frame: `prev_mv_buf.as_ref()` (None → full coarse search)
+   - First B-frame per group: `prev_bidir_fwd_mv.as_ref()` (None → full search)
+   - Remainder P-frames: same fix
+2. Reset `prev_mv_buf = None` after each keyframe (reference changed completely)
+3. Removed now-unused `zero_mv_buf` allocation
+
+This means first P/B frames do full ±32/±16 coarse search (slightly slower) but get
+correct MVs. Subsequent frames still use fast temporal prediction (±2 refinement).
+
+### Diagnostics Added
+- **GNC_DUMP_RESIDUALS=1**: dumps Y-plane residual statistics (MAE, max, nonzero%) and
+  MV statistics after MC. Also writes raw f32 file for visualization.
+- **3 new tests**: `test_motion_comp_effectiveness` (spatial shift),
+  `test_motion_comp_identical_frames_small_pframe` (identical frames P/I ratio),
+  `test_motion_comp_quality_scaling` (multi-quality comparison)
+
+### Expected Impact
+- First P-frame after each keyframe: correct MVs → much smaller residuals → smaller P-frames
+- Content with >2px motion per frame: massive improvement in P-frame compression
+- Overall video compression: potentially 2-5x better P/I ratio for real content
+
+---
+
 ## 2026-02-28: Transform Shootout — Phase 1 (Mega-Kernel Plan)
 
 ### Hypothesis

@@ -1479,3 +1479,190 @@ fn test_block_dct_color_debug() {
 
     assert!(psnr_all > 35.0, "DCT color q=99 should be >35 dB, got {psnr_all:.2}");
 }
+
+/// Generate a textured frame with spatial patterns that make motion estimation meaningful.
+/// The pattern is a checkerboard + gradients that shift spatially with `shift_x`/`shift_y`.
+fn make_textured_frame(w: u32, h: u32, shift_x: i32, shift_y: i32) -> Vec<f32> {
+    let mut data = Vec::with_capacity((w * h * 3) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            // Source coordinates with shift (wrap around)
+            let sx = ((x as i32 - shift_x).rem_euclid(w as i32)) as f32;
+            let sy = ((y as i32 - shift_y).rem_euclid(h as i32)) as f32;
+
+            // Checkerboard (32px blocks) + smooth gradient overlay
+            let checker = if ((sx as u32 / 32) + (sy as u32 / 32)) % 2 == 0 {
+                200.0
+            } else {
+                55.0
+            };
+            let grad_r = sx / w as f32 * 100.0;
+            let grad_g = sy / h as f32 * 100.0;
+            let grad_b = ((sx + sy) / (w + h) as f32) * 80.0;
+
+            let r = (checker * 0.5 + grad_r).clamp(0.0, 255.0);
+            let g = (checker * 0.3 + grad_g + 30.0).clamp(0.0, 255.0);
+            let b = (checker * 0.4 + grad_b + 20.0).clamp(0.0, 255.0);
+            data.push(r);
+            data.push(g);
+            data.push(b);
+        }
+    }
+    data
+}
+
+/// Diagnostic test: verify P-frames are significantly smaller than I-frames
+/// when encoding content with known spatial motion.
+///
+/// This test generates frames with a horizontal shift (real spatial translation)
+/// and checks that motion compensation produces smaller P-frames and accurate MVs.
+#[test]
+fn test_motion_comp_effectiveness() {
+    let ctx = GpuContext::new();
+    let mut enc = EncoderPipeline::new(&ctx);
+    let dec = DecoderPipeline::new(&ctx);
+
+    let w = 256;
+    let h = 256;
+    let shift_px = 4; // 4 pixel horizontal shift per frame
+
+    // Frame 0: base, Frame 1: shifted 4px right, Frame 2: shifted 8px right
+    let f0 = make_textured_frame(w, h, 0, 0);
+    let f1 = make_textured_frame(w, h, shift_px, 0);
+    let f2 = make_textured_frame(w, h, shift_px * 2, 0);
+
+    let mut config = CodecConfig::default();
+    config.tile_size = 256;
+    config.keyframe_interval = 10;
+
+    let frames: Vec<&[f32]> = vec![&f0, &f1, &f2];
+    let compressed = enc.encode_sequence(&ctx, &frames, w, h, &config);
+
+    assert_eq!(compressed[0].frame_type, FrameType::Intra);
+    assert_eq!(compressed[1].frame_type, FrameType::Predicted);
+    assert_eq!(compressed[2].frame_type, FrameType::Predicted);
+
+    let i_size = compressed[0].byte_size();
+    let p1_size = compressed[1].byte_size();
+    let p2_size = compressed[2].byte_size();
+
+    eprintln!("\n=== Motion Compensation Effectiveness ===");
+    eprintln!("  Frame 0 [I]: {} bytes, {:.3} bpp", i_size, compressed[0].bpp());
+    eprintln!("  Frame 1 [P]: {} bytes, {:.3} bpp (shift={}px)", p1_size, compressed[1].bpp(), shift_px);
+    eprintln!("  Frame 2 [P]: {} bytes, {:.3} bpp (shift={}px)", p2_size, compressed[2].bpp(), shift_px * 2);
+    eprintln!("  P1/I ratio: {:.2}x", p1_size as f64 / i_size as f64);
+    eprintln!("  P2/I ratio: {:.2}x", p2_size as f64 / i_size as f64);
+
+    // Check motion vectors
+    let mf1 = compressed[1].motion_field.as_ref().unwrap();
+    let mut mv_sum_x: i64 = 0;
+    let mut mv_sum_y: i64 = 0;
+    let mv_count = mf1.vectors.len();
+    for mv in &mf1.vectors {
+        mv_sum_x += mv[0] as i64;
+        mv_sum_y += mv[1] as i64;
+    }
+    let avg_mvx = mv_sum_x as f64 / mv_count as f64;
+    let avg_mvy = mv_sum_y as f64 / mv_count as f64;
+    // MVs are in half-pel, so expected ~shift_px*2 half-pels for horizontal shift
+    let expected_hpel = (shift_px * 2) as f64;
+    eprintln!("  Avg MV: ({:.1}, {:.1}) half-pels (expected ~({:.0}, 0))", avg_mvx, avg_mvy, expected_hpel);
+
+    // Decode and check quality
+    let decoded = dec.decode_sequence(&ctx, &compressed);
+    for (i, dec_frame) in decoded.iter().enumerate() {
+        let psnr = compute_psnr(&frames[i], dec_frame);
+        eprintln!("  Frame {i}: PSNR={psnr:.2} dB");
+        assert!(psnr > 25.0, "Frame {i} PSNR too low: {psnr:.2} dB");
+    }
+
+    // Key assertion: P-frames should be significantly smaller than I-frames
+    // With good MC, we expect at least 2x reduction
+    let ratio = p1_size as f64 / i_size as f64;
+    assert!(
+        ratio < 0.8,
+        "P-frame should be significantly smaller than I-frame with 4px shift. \
+         Got P/I ratio={ratio:.2} (P={p1_size} bytes, I={i_size} bytes). \
+         Motion compensation may not be working effectively."
+    );
+}
+
+/// Diagnostic test: identical frames should produce near-zero P-frame sizes.
+#[test]
+fn test_motion_comp_identical_frames_small_pframe() {
+    let ctx = GpuContext::new();
+    let mut enc = EncoderPipeline::new(&ctx);
+
+    let w = 256;
+    let h = 256;
+    let frame = make_textured_frame(w, h, 0, 0);
+
+    let mut config = CodecConfig::default();
+    config.tile_size = 256;
+    config.keyframe_interval = 10;
+
+    // 3 identical frames
+    let frames: Vec<&[f32]> = vec![&frame, &frame, &frame];
+    let compressed = enc.encode_sequence(&ctx, &frames, w, h, &config);
+
+    let i_size = compressed[0].byte_size();
+    let p1_size = compressed[1].byte_size();
+    let p2_size = compressed[2].byte_size();
+
+    eprintln!("\n=== Identical Frames P-frame Size ===");
+    eprintln!("  Frame 0 [I]: {} bytes, {:.3} bpp", i_size, compressed[0].bpp());
+    eprintln!("  Frame 1 [P]: {} bytes, {:.3} bpp", p1_size, compressed[1].bpp());
+    eprintln!("  Frame 2 [P]: {} bytes, {:.3} bpp", p2_size, compressed[2].bpp());
+    eprintln!("  P1/I ratio: {:.3}", p1_size as f64 / i_size as f64);
+
+    // For identical frames, P-frame should be MUCH smaller (mostly quantization noise)
+    let ratio = p1_size as f64 / i_size as f64;
+    assert!(
+        ratio < 0.5,
+        "Identical frame P-frame should be much smaller than I-frame. \
+         Got P/I ratio={ratio:.3} (P={p1_size}, I={i_size}). \
+         MC residuals should be near-zero for identical content."
+    );
+
+    // MVs should be near-zero
+    let mf = compressed[1].motion_field.as_ref().unwrap();
+    let max_mv: i16 = mf.vectors.iter().flat_map(|v| v.iter()).map(|v| v.abs()).max().unwrap_or(0);
+    eprintln!("  Max MV magnitude: {} half-pels", max_mv);
+    assert!(max_mv <= 2, "Identical frames should have near-zero MVs, got max={max_mv}");
+}
+
+/// Diagnostic test: compare compression ratios at different quality levels
+/// to ensure inter-prediction benefit scales correctly.
+#[test]
+fn test_motion_comp_quality_scaling() {
+    let ctx = GpuContext::new();
+    let mut enc = EncoderPipeline::new(&ctx);
+
+    let w = 256;
+    let h = 256;
+    let f0 = make_textured_frame(w, h, 0, 0);
+    let f1 = make_textured_frame(w, h, 2, 0); // small shift
+
+    for q in [50, 75, 90] {
+        let config = crate::quality_preset(q);
+        let mut config_ip = config.clone();
+        config_ip.keyframe_interval = 10;
+
+        let frames: Vec<&[f32]> = vec![&f0, &f1];
+        let compressed = enc.encode_sequence(&ctx, &frames, w, h, &config_ip);
+
+        let i_size = compressed[0].byte_size();
+        let p_size = compressed[1].byte_size();
+        let ratio = p_size as f64 / i_size as f64;
+
+        eprintln!(
+            "  q={q}: I={i_size} bytes, P={p_size} bytes, P/I={ratio:.3}"
+        );
+
+        // At all quality levels, P should be smaller than I for translated content
+        assert!(
+            ratio < 0.9,
+            "q={q}: P-frame should be smaller than I-frame (ratio={ratio:.3})"
+        );
+    }
+}

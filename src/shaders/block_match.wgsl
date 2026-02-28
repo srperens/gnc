@@ -130,6 +130,9 @@ fn main(
     var coarse_dy: i32 = 0;
     var fine_range: i32 = FINE_RANGE;
 
+    // Phase 1 uses either temporal prediction or full coarse search.
+    // Both paths write to shared_sad/shared_mv and need barriers, so we
+    // keep all barriers at the top level for uniform control flow (WebGPU/Metal).
     if params.use_predictor != 0u {
         // Temporal MV prediction: use previous frame's MV as starting point.
         // Predictor MVs are in half-pel units — convert to integer-pel.
@@ -139,14 +142,10 @@ fn main(
             // Round half-pel to nearest integer-pel
             coarse_dx = (pred_hx + select(0, 1, pred_hx > 0)) / 2;
             coarse_dy = (pred_hy + select(0, 1, pred_hy > 0)) / 2;
+            shared_mv[0] = pack_mv(coarse_dx, coarse_dy);
         }
-        shared_mv[0] = pack_mv(coarse_dx, coarse_dy);
-        workgroupBarrier();
-        let pred_packed = shared_mv[0];
-        coarse_dx = unpack_dx(pred_packed);
-        coarse_dy = unpack_dy(pred_packed);
-        workgroupBarrier();
-        fine_range = i32(params.pred_fine_range);
+        // Dummy writes for the else-path shared arrays (compiler may optimize away)
+        shared_sad[tid] = 0u;
     } else {
         // Full coarse search with subsampled SAD
         // Every COARSE_STRIDE-th pixel in each dimension: 4×4 = 16 samples from 16×16 block.
@@ -186,17 +185,22 @@ fn main(
             cand_idx += 256u;
         }
 
-        // Min-reduction for coarse winner
         shared_sad[tid] = best_sad;
         shared_mv[tid] = pack_mv(best_dx, best_dy);
-        workgroupBarrier();
-        min_reduce(tid);
-
-        let coarse_packed = shared_mv[0];
-        coarse_dx = unpack_dx(coarse_packed);
-        coarse_dy = unpack_dy(coarse_packed);
-        workgroupBarrier();
     }
+    // Barriers unconditionally at top level (WebGPU/Metal require uniform control flow)
+    workgroupBarrier();
+    min_reduce(tid);
+    // For predictor path: shared_sad is all zeros so min_reduce is a no-op,
+    // shared_mv[0] keeps the predictor value set by thread 0.
+
+    let coarse_result = shared_mv[0];
+    coarse_dx = unpack_dx(coarse_result);
+    coarse_dy = unpack_dy(coarse_result);
+    if params.use_predictor != 0u {
+        fine_range = i32(params.pred_fine_range);
+    }
+    workgroupBarrier();
 
     // ========== Phase 2: Fine search with full 16×16 SAD ==========
     // ±fine_range around coarse winner (or predicted MV).
@@ -266,59 +270,61 @@ fn main(
     }
     workgroupBarrier();
 
-    // Early termination: skip half-pel if integer match is perfect
-    if fine_sad > 0u {
-        let hp_px = tid % params.block_size;
-        let hp_py = tid / params.block_size;
-        let hp_cur_val = current_y[(block_origin_y + hp_py) * params.width + block_origin_x + hp_px];
+    // Half-pel refinement: all threads participate unconditionally to keep
+    // workgroupBarrier() in uniform control flow (required by WebGPU/Metal).
+    // When fine_sad == 0 (perfect match), pixel diffs are zeroed so barriers
+    // still execute but the result is a no-op.
+    let do_halfpel = fine_sad > 0u;
+    let hp_px = tid % params.block_size;
+    let hp_py = tid / params.block_size;
+    let hp_cur_val = select(0.0, current_y[(block_origin_y + hp_py) * params.width + block_origin_x + hp_px], do_halfpel);
 
-        // 4 cardinal directions only (cross pattern, no diagonals)
-        for (var cand = 0u; cand < 4u; cand++) {
-            var off_x: i32 = 0;
-            var off_y: i32 = 0;
-            switch cand {
-                case 0u: { off_x =  0; off_y = -1; }
-                case 1u: { off_x = -1; off_y =  0; }
-                case 2u: { off_x =  1; off_y =  0; }
-                case 3u: { off_x =  0; off_y =  1; }
-                default: {}
-            }
+    // 4 cardinal directions only (cross pattern, no diagonals)
+    for (var cand = 0u; cand < 4u; cand++) {
+        var off_x: i32 = 0;
+        var off_y: i32 = 0;
+        switch cand {
+            case 0u: { off_x =  0; off_y = -1; }
+            case 1u: { off_x = -1; off_y =  0; }
+            case 2u: { off_x =  1; off_y =  0; }
+            case 3u: { off_x =  0; off_y =  1; }
+            default: {}
+        }
 
-            let test_hx = center_hx + off_x;
-            let test_hy = center_hy + off_y;
+        let test_hx = center_hx + off_x;
+        let test_hy = center_hy + off_y;
 
-            let ref_base_hx = i32(block_origin_x) * 2 + test_hx;
-            let ref_base_hy = i32(block_origin_y) * 2 + test_hy;
-            let valid = ref_base_hx >= -1 && ref_base_hy >= -1 &&
-                        ref_base_hx + bs * 2 <= w * 2 + 1 &&
-                        ref_base_hy + bs * 2 <= h * 2 + 1;
+        let ref_base_hx = i32(block_origin_x) * 2 + test_hx;
+        let ref_base_hy = i32(block_origin_y) * 2 + test_hy;
+        let valid = do_halfpel && ref_base_hx >= -1 && ref_base_hy >= -1 &&
+                    ref_base_hx + bs * 2 <= w * 2 + 1 &&
+                    ref_base_hy + bs * 2 <= h * 2 + 1;
 
-            var pixel_diff: u32 = 0u;
-            if valid {
-                let rhx = i32(block_origin_x + hp_px) * 2 + test_hx;
-                let rhy = i32(block_origin_y + hp_py) * 2 + test_hy;
-                let ref_val = bilinear_sample(rhx, rhy);
-                pixel_diff = u32(abs(hp_cur_val - ref_val));
-            }
+        var pixel_diff: u32 = 0u;
+        if valid {
+            let rhx = i32(block_origin_x + hp_px) * 2 + test_hx;
+            let rhy = i32(block_origin_y + hp_py) * 2 + test_hy;
+            let ref_val = bilinear_sample(rhx, rhy);
+            pixel_diff = u32(abs(hp_cur_val - ref_val));
+        }
 
-            shared_sad[tid] = pixel_diff;
-            workgroupBarrier();
+        shared_sad[tid] = pixel_diff;
+        workgroupBarrier();
 
-            for (var stride = 128u; stride > 0u; stride >>= 1u) {
-                if tid < stride {
-                    shared_sad[tid] += shared_sad[tid + stride];
-                }
-                workgroupBarrier();
-            }
-
-            if tid == 0u && valid {
-                if shared_sad[0] < hp_track_sad {
-                    hp_track_sad = shared_sad[0];
-                    hp_track_mv = pack_mv(test_hx, test_hy);
-                }
+        for (var stride = 128u; stride > 0u; stride >>= 1u) {
+            if tid < stride {
+                shared_sad[tid] += shared_sad[tid + stride];
             }
             workgroupBarrier();
         }
+
+        if tid == 0u && valid {
+            if shared_sad[0] < hp_track_sad {
+                hp_track_sad = shared_sad[0];
+                hp_track_mv = pack_mv(test_hx, test_hy);
+            }
+        }
+        workgroupBarrier();
     }
 
     // Thread 0 writes the final half-pel MV result

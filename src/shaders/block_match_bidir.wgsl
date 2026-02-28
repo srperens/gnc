@@ -451,80 +451,82 @@ fn main(
     var hp_fwd_dy = center_fwd_hy;
     var hp_fwd_sad = mode_sad;
 
-    if (best_mode == 0u || best_mode == 2u) && mode_sad > 0u {
-        if tid == 0u {
-            hp_track_sad = mode_sad;
-            hp_track_mv = pack_mv(center_fwd_hx, center_fwd_hy);
+    // Forward half-pel: all threads participate unconditionally for uniform
+    // control flow (WebGPU/Metal). When inactive, pixel diffs are zero → no-op.
+    let do_fwd_hp = (best_mode == 0u || best_mode == 2u) && mode_sad > 0u;
+    if tid == 0u {
+        hp_track_sad = mode_sad;
+        hp_track_mv = pack_mv(center_fwd_hx, center_fwd_hy);
+    }
+    workgroupBarrier();
+
+    let hp_px = tid % params.block_size;
+    let hp_py = tid / params.block_size;
+    let hp_cur_val = select(0.0, current_y[(block_origin_y + hp_py) * params.width + block_origin_x + hp_px], do_fwd_hp);
+
+    // For bidir, precompute backward sample (constant across forward candidates)
+    var hp_bwd_sample: f32 = 0.0;
+    if do_fwd_hp && best_mode == 2u {
+        let bx2 = i32(block_origin_x + hp_px) * 2 + center_bwd_hx;
+        let by2 = i32(block_origin_y + hp_py) * 2 + center_bwd_hy;
+        hp_bwd_sample = sample_hp_bwd(bx2, by2, params.width, params.height);
+    }
+
+    for (var cand = 0u; cand < 4u; cand++) {
+        var off_x: i32 = 0;
+        var off_y: i32 = 0;
+        switch cand {
+            case 0u: { off_x =  0; off_y = -1; }
+            case 1u: { off_x = -1; off_y =  0; }
+            case 2u: { off_x =  1; off_y =  0; }
+            case 3u: { off_x =  0; off_y =  1; }
+            default: {}
         }
+
+        let test_hx = center_fwd_hx + off_x;
+        let test_hy = center_fwd_hy + off_y;
+
+        let ref_base_hx = i32(block_origin_x) * 2 + test_hx;
+        let ref_base_hy = i32(block_origin_y) * 2 + test_hy;
+        let valid = do_fwd_hp && ref_base_hx >= -1 && ref_base_hy >= -1 &&
+                    ref_base_hx + bs * 2 <= w * 2 + 1 &&
+                    ref_base_hy + bs * 2 <= h * 2 + 1;
+
+        var pixel_diff: u32 = 0u;
+        if valid {
+            let rhx = i32(block_origin_x + hp_px) * 2 + test_hx;
+            let rhy = i32(block_origin_y + hp_py) * 2 + test_hy;
+            let fwd_val = sample_hp_fwd(rhx, rhy, params.width, params.height);
+
+            var pred: f32;
+            if best_mode == 0u {
+                pred = fwd_val;
+            } else {
+                pred = (fwd_val + hp_bwd_sample) * 0.5;
+            }
+            pixel_diff = u32(abs(hp_cur_val - pred));
+        }
+
+        shared_sad[tid] = pixel_diff;
         workgroupBarrier();
 
-        let hp_px = tid % params.block_size;
-        let hp_py = tid / params.block_size;
-        let hp_cur_val = current_y[(block_origin_y + hp_py) * params.width + block_origin_x + hp_px];
-
-        // For bidir, precompute backward sample (constant across forward candidates)
-        var hp_bwd_sample: f32 = 0.0;
-        if best_mode == 2u {
-            let bx2 = i32(block_origin_x + hp_px) * 2 + center_bwd_hx;
-            let by2 = i32(block_origin_y + hp_py) * 2 + center_bwd_hy;
-            hp_bwd_sample = sample_hp_bwd(bx2, by2, params.width, params.height);
-        }
-
-        // 4 cardinal directions only (cross pattern, no diagonals)
-        for (var cand = 0u; cand < 4u; cand++) {
-            var off_x: i32 = 0;
-            var off_y: i32 = 0;
-            switch cand {
-                case 0u: { off_x =  0; off_y = -1; }
-                case 1u: { off_x = -1; off_y =  0; }
-                case 2u: { off_x =  1; off_y =  0; }
-                case 3u: { off_x =  0; off_y =  1; }
-                default: {}
-            }
-
-            let test_hx = center_fwd_hx + off_x;
-            let test_hy = center_fwd_hy + off_y;
-
-            let ref_base_hx = i32(block_origin_x) * 2 + test_hx;
-            let ref_base_hy = i32(block_origin_y) * 2 + test_hy;
-            let valid = ref_base_hx >= -1 && ref_base_hy >= -1 &&
-                        ref_base_hx + bs * 2 <= w * 2 + 1 &&
-                        ref_base_hy + bs * 2 <= h * 2 + 1;
-
-            var pixel_diff: u32 = 0u;
-            if valid {
-                let rhx = i32(block_origin_x + hp_px) * 2 + test_hx;
-                let rhy = i32(block_origin_y + hp_py) * 2 + test_hy;
-                let fwd_val = sample_hp_fwd(rhx, rhy, params.width, params.height);
-
-                var pred: f32;
-                if best_mode == 0u {
-                    pred = fwd_val;
-                } else {
-                    pred = (fwd_val + hp_bwd_sample) * 0.5;
-                }
-                pixel_diff = u32(abs(hp_cur_val - pred));
-            }
-
-            shared_sad[tid] = pixel_diff;
-            workgroupBarrier();
-
-            for (var stride = 128u; stride > 0u; stride >>= 1u) {
-                if tid < stride {
-                    shared_sad[tid] += shared_sad[tid + stride];
-                }
-                workgroupBarrier();
-            }
-
-            if tid == 0u && valid {
-                if shared_sad[0] < hp_track_sad {
-                    hp_track_sad = shared_sad[0];
-                    hp_track_mv = pack_mv(test_hx, test_hy);
-                }
+        for (var stride = 128u; stride > 0u; stride >>= 1u) {
+            if tid < stride {
+                shared_sad[tid] += shared_sad[tid + stride];
             }
             workgroupBarrier();
         }
 
+        if tid == 0u && valid {
+            if shared_sad[0] < hp_track_sad {
+                hp_track_sad = shared_sad[0];
+                hp_track_mv = pack_mv(test_hx, test_hy);
+            }
+        }
+        workgroupBarrier();
+    }
+
+    if do_fwd_hp {
         hp_fwd_dx = unpack_dx(hp_track_mv);
         hp_fwd_dy = unpack_dy(hp_track_mv);
         hp_fwd_sad = hp_track_sad;
@@ -538,95 +540,95 @@ fn main(
     var hp_bwd_dx = center_bwd_hx;
     var hp_bwd_dy = center_bwd_hy;
 
-    if (best_mode == 1u || best_mode == 2u) && mode_sad > 0u {
-        // Broadcast refined forward MV from thread 0 to all threads
-        if tid == 0u {
-            shared_mv[0] = pack_mv(hp_fwd_dx, hp_fwd_dy);
+    // Backward half-pel: all threads participate unconditionally.
+    let do_bwd_hp = (best_mode == 1u || best_mode == 2u) && mode_sad > 0u;
+
+    // Broadcast refined forward MV from thread 0 to all threads
+    if tid == 0u {
+        shared_mv[0] = pack_mv(hp_fwd_dx, hp_fwd_dy);
+    }
+    workgroupBarrier();
+    let refined_fwd_hx = unpack_dx(shared_mv[0]);
+    let refined_fwd_hy = unpack_dy(shared_mv[0]);
+
+    var center_sad_for_bwd: u32 = mode_sad;
+    if best_mode == 2u {
+        center_sad_for_bwd = hp_fwd_sad;
+    }
+
+    if tid == 0u {
+        hp_track_sad = center_sad_for_bwd;
+        hp_track_mv = pack_mv(center_bwd_hx, center_bwd_hy);
+    }
+    workgroupBarrier();
+
+    let hp2_px = tid % params.block_size;
+    let hp2_py = tid / params.block_size;
+    let hp2_cur_val = select(0.0, current_y[(block_origin_y + hp2_py) * params.width + block_origin_x + hp2_px], do_bwd_hp);
+
+    // For bidir, precompute refined forward sample (constant across backward candidates)
+    var hp_fwd_sample: f32 = 0.0;
+    if do_bwd_hp && best_mode == 2u {
+        let fx2 = i32(block_origin_x + hp2_px) * 2 + refined_fwd_hx;
+        let fy2 = i32(block_origin_y + hp2_py) * 2 + refined_fwd_hy;
+        hp_fwd_sample = sample_hp_fwd(fx2, fy2, params.width, params.height);
+    }
+
+    for (var cand = 0u; cand < 4u; cand++) {
+        var off_x: i32 = 0;
+        var off_y: i32 = 0;
+        switch cand {
+            case 0u: { off_x =  0; off_y = -1; }
+            case 1u: { off_x = -1; off_y =  0; }
+            case 2u: { off_x =  1; off_y =  0; }
+            case 3u: { off_x =  0; off_y =  1; }
+            default: {}
         }
+
+        let test_hx = center_bwd_hx + off_x;
+        let test_hy = center_bwd_hy + off_y;
+
+        let ref_base_hx = i32(block_origin_x) * 2 + test_hx;
+        let ref_base_hy = i32(block_origin_y) * 2 + test_hy;
+        let valid = do_bwd_hp && ref_base_hx >= -1 && ref_base_hy >= -1 &&
+                    ref_base_hx + bs * 2 <= w * 2 + 1 &&
+                    ref_base_hy + bs * 2 <= h * 2 + 1;
+
+        var pixel_diff: u32 = 0u;
+        if valid {
+            let rx2 = i32(block_origin_x + hp2_px) * 2 + test_hx;
+            let ry2 = i32(block_origin_y + hp2_py) * 2 + test_hy;
+            let bwd_val = sample_hp_bwd(rx2, ry2, params.width, params.height);
+
+            var pred: f32;
+            if best_mode == 1u {
+                pred = bwd_val;
+            } else {
+                pred = (hp_fwd_sample + bwd_val) * 0.5;
+            }
+            pixel_diff = u32(abs(hp2_cur_val - pred));
+        }
+
+        shared_sad[tid] = pixel_diff;
         workgroupBarrier();
-        let refined_fwd_hx = unpack_dx(shared_mv[0]);
-        let refined_fwd_hy = unpack_dy(shared_mv[0]);
 
-        var center_sad_for_bwd: u32;
-        if best_mode == 1u {
-            center_sad_for_bwd = mode_sad;
-        } else {
-            center_sad_for_bwd = hp_fwd_sad;
-        }
-
-        if tid == 0u {
-            hp_track_sad = center_sad_for_bwd;
-            hp_track_mv = pack_mv(center_bwd_hx, center_bwd_hy);
-        }
-        workgroupBarrier();
-
-        let hp2_px = tid % params.block_size;
-        let hp2_py = tid / params.block_size;
-        let hp2_cur_val = current_y[(block_origin_y + hp2_py) * params.width + block_origin_x + hp2_px];
-
-        // For bidir, precompute refined forward sample (constant across backward candidates)
-        var hp_fwd_sample: f32 = 0.0;
-        if best_mode == 2u {
-            let fx2 = i32(block_origin_x + hp2_px) * 2 + refined_fwd_hx;
-            let fy2 = i32(block_origin_y + hp2_py) * 2 + refined_fwd_hy;
-            hp_fwd_sample = sample_hp_fwd(fx2, fy2, params.width, params.height);
-        }
-
-        // 4 cardinal directions only (cross pattern, no diagonals)
-        for (var cand = 0u; cand < 4u; cand++) {
-            var off_x: i32 = 0;
-            var off_y: i32 = 0;
-            switch cand {
-                case 0u: { off_x =  0; off_y = -1; }
-                case 1u: { off_x = -1; off_y =  0; }
-                case 2u: { off_x =  1; off_y =  0; }
-                case 3u: { off_x =  0; off_y =  1; }
-                default: {}
-            }
-
-            let test_hx = center_bwd_hx + off_x;
-            let test_hy = center_bwd_hy + off_y;
-
-            let ref_base_hx = i32(block_origin_x) * 2 + test_hx;
-            let ref_base_hy = i32(block_origin_y) * 2 + test_hy;
-            let valid = ref_base_hx >= -1 && ref_base_hy >= -1 &&
-                        ref_base_hx + bs * 2 <= w * 2 + 1 &&
-                        ref_base_hy + bs * 2 <= h * 2 + 1;
-
-            var pixel_diff: u32 = 0u;
-            if valid {
-                let rx2 = i32(block_origin_x + hp2_px) * 2 + test_hx;
-                let ry2 = i32(block_origin_y + hp2_py) * 2 + test_hy;
-                let bwd_val = sample_hp_bwd(rx2, ry2, params.width, params.height);
-
-                var pred: f32;
-                if best_mode == 1u {
-                    pred = bwd_val;
-                } else {
-                    pred = (hp_fwd_sample + bwd_val) * 0.5;
-                }
-                pixel_diff = u32(abs(hp2_cur_val - pred));
-            }
-
-            shared_sad[tid] = pixel_diff;
-            workgroupBarrier();
-
-            for (var stride = 128u; stride > 0u; stride >>= 1u) {
-                if tid < stride {
-                    shared_sad[tid] += shared_sad[tid + stride];
-                }
-                workgroupBarrier();
-            }
-
-            if tid == 0u && valid {
-                if shared_sad[0] < hp_track_sad {
-                    hp_track_sad = shared_sad[0];
-                    hp_track_mv = pack_mv(test_hx, test_hy);
-                }
+        for (var stride = 128u; stride > 0u; stride >>= 1u) {
+            if tid < stride {
+                shared_sad[tid] += shared_sad[tid + stride];
             }
             workgroupBarrier();
         }
 
+        if tid == 0u && valid {
+            if shared_sad[0] < hp_track_sad {
+                hp_track_sad = shared_sad[0];
+                hp_track_mv = pack_mv(test_hx, test_hy);
+            }
+        }
+        workgroupBarrier();
+    }
+
+    if do_bwd_hp {
         hp_bwd_dx = unpack_dx(hp_track_mv);
         hp_bwd_dy = unpack_dy(hp_track_mv);
     }

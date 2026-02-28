@@ -151,9 +151,15 @@
         let player = null;
         let playing = false;
         let animId = null;
-        let lastFrameTime = 0;
+        let playbackStartTime = 0;  // wall clock ms when Play was pressed
+        let playbackStartFrame = 0; // frame index at play start
         let framesSinceLastStat = 0;
         let statAccumMs = 0;
+        // Cached metadata — avoids accessing player (mutable borrow) during async playback
+        let cachedWidth = 0;
+        let cachedHeight = 0;
+        let cachedFc = 0;
+        let cachedFps = 0;
 
         // --- Status helpers ---
         function setStatus(msg, type = 'info') {
@@ -197,6 +203,10 @@
                 const h = player.height;
                 const fc = player.frame_count;
                 const fps = player.fps;
+                cachedWidth = w;
+                cachedHeight = h;
+                cachedFc = fc;
+                cachedFps = fps;
 
                 canvas.width = w;
                 canvas.height = h;
@@ -229,6 +239,7 @@
 
                 // Reset to frame 0 so Play starts from the beginning
                 player.reset();
+                jsCurrentFrame = 0;
             } catch (e) {
                 setStatus('Error: ' + e.message || e, 'error');
                 console.error(e);
@@ -243,27 +254,46 @@
         }
 
         // --- Playback ---
+        // Track current frame in JS to avoid accessing player during async borrow
+        let jsCurrentFrame = 0;
+
         function updateFrameLabel(idx) {
-            frameLabel.textContent = `${idx} / ${player ? player.frame_count - 1 : 0}`;
+            frameLabel.textContent = `${idx} / ${cachedFc > 0 ? cachedFc - 1 : 0}`;
         }
 
-        async function playLoop(timestamp) {
+        async function playLoop() {
             if (!playing || !player) return;
 
-            const fc = player.frame_count;
+            const now = performance.now();
+            const targetFrame = Math.floor((now - playbackStartTime) / 1000 * cachedFps) + playbackStartFrame;
 
+            if (jsCurrentFrame > targetFrame) {
+                // Ahead of schedule — wait for next rAF
+                animId = requestAnimationFrame(playLoop);
+                return;
+            }
+
+            // Decode exactly one frame per tick — never skip-decode
             const t0 = performance.now();
             const rgba = await player.decode_next_frame();
             const dt = performance.now() - t0;
+            jsCurrentFrame++;
+            if (jsCurrentFrame >= cachedFc) jsCurrentFrame = 0;
 
-            // Check again after async decode — user may have paused during await
             if (!playing) return;
 
-            paintFrame(rgba, player.width, player.height);
+            paintFrame(rgba, cachedWidth, cachedHeight);
 
-            const curFrame = (player.current_frame + fc - 1) % fc;
-            seekBar.value = curFrame;
-            updateFrameLabel(curFrame);
+            const displayFrame = (jsCurrentFrame + cachedFc - 1) % cachedFc;
+            seekBar.value = displayFrame;
+            updateFrameLabel(displayFrame);
+
+            // If we fell too far behind, reset the clock to prevent drift
+            const behind = targetFrame - displayFrame;
+            if (behind > 3) {
+                playbackStartTime = performance.now();
+                playbackStartFrame = jsCurrentFrame;
+            }
 
             framesSinceLastStat++;
             statAccumMs += dt;
@@ -275,7 +305,11 @@
                 statAccumMs = 0;
             }
 
-            if (player.current_frame >= fc) player.reset();
+            if (jsCurrentFrame === 0) {
+                player.reset();
+                playbackStartTime = performance.now();
+                playbackStartFrame = 0;
+            }
 
             animId = requestAnimationFrame(playLoop);
         }
@@ -284,7 +318,8 @@
             if (!player) return;
             playing = true;
             playBtn.textContent = 'Pause';
-            lastFrameTime = 0;
+            playbackStartTime = performance.now();
+            playbackStartFrame = jsCurrentFrame;
             framesSinceLastStat = 0;
             statAccumMs = 0;
             animId = requestAnimationFrame(playLoop);
@@ -298,16 +333,20 @@
 
         function stop() {
             pause();
-            if (player) { player.reset(); }
+            if (player) {
+                player.reset();
+                jsCurrentFrame = 0;
+            }
         }
 
         playBtn.addEventListener('click', () => {
             if (!player) return;
-            if (player.frame_count === 1) {
+            if (cachedFc === 1) {
                 // Single-frame: just re-decode
                 player.reset();
+                jsCurrentFrame = 0;
                 player.decode_next_frame().then(rgba => {
-                    paintFrame(rgba, player.width, player.height);
+                    paintFrame(rgba, cachedWidth, cachedHeight);
                 });
                 return;
             }
@@ -316,14 +355,15 @@
 
         // --- Seek ---
         seekBar.addEventListener('input', async () => {
-            if (!player || player.frame_count <= 1) return;
+            if (!player || cachedFc <= 1) return;
             pause();
             const target = parseInt(seekBar.value, 10);
             setStatus(`Seeking to frame ${target}...`);
             const t0 = performance.now();
             const rgba = await player.seek(target);
             const dt = performance.now() - t0;
-            paintFrame(rgba, player.width, player.height);
+            paintFrame(rgba, cachedWidth, cachedHeight);
+            jsCurrentFrame = target + 1;
             updateFrameLabel(target);
             $('statDecode').textContent = `Seek+decode: ${dt.toFixed(1)} ms`;
             setStatus(`Frame ${target}`, 'ok');

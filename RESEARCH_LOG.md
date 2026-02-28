@@ -4,6 +4,51 @@
 
 ---
 
+## 2026-02-28: Rice readback optimization + I-frame batching
+
+### Hypothesis
+Profiling shows I-frame entropy at 18-21ms is the dominant cost. Three potential improvements:
+1. Eliminate 192MB of `to_vec()` copies in Rice staging readback (CPU-side)
+2. Batch I-frame wavelet+quant+Rice into single GPU submit (split-phase API)
+3. Pre-allocate packed_data vectors from stream_lengths
+
+### Implementation
+- Changed `finish_3planes_readback` and `encode_3planes_to_tiles` to read directly from mapped `BufferView` references instead of copying to Vec first
+- Used `dispatch_3planes_to_cmd` for I-frame Rice (batches with wavelet+quant cmd)
+- Pre-allocate packed_data using computed total from stream_lengths
+
+### Profiling (bbb_1080p, q=75, GNC_PROFILE=1)
+Granular Rice readback breakdown:
+- **Rice map+poll: 19ms** (GPU compute time — wavelet+quant+Rice all in one submit)
+- **Rice pack: 0.6ms** (was ~4ms with to_vec() — **85% reduction**)
+- **Actual data: 0.9MB / Staging: 15MB = 6.2% utilization** (tile_size=256 → only 40 tiles)
+
+GPU time split (measured by splitting submit):
+- **Wavelet+quant GPU: 12.3ms** (dominant — 24 dispatches per 3-plane forward transform)
+- **Rice encode GPU: 9.1ms** (3 dispatches, 40 tiles × 256 threads each)
+
+### Results
+| Metric | Before | After | Change |
+|--------|--------|-------|--------|
+| I-frame encode | ~28ms | 25ms | **-12%** |
+| I-frame fps | ~36 | 40 | **+11%** |
+| Sequence I-only (10fr) | ~33 fps | 34.1 fps | +3% |
+| Sequence I+P+B (10fr) | ~31 fps | 31.4 fps | +1% |
+
+### Analysis
+1. to_vec() elimination is the main win: 3.4ms per frame saved on CPU readback.
+2. Split-phase I-frame batching saves ~0.5ms submit overhead (minor).
+3. GPU compute (wavelet 12ms + Rice 9ms = 21ms) is now the clear bottleneck. No amount of CPU-side optimization can reduce below 21ms.
+4. Sequence improvement is smaller than single-frame because P/B frames (which dominate the sequence) already used split-phase and didn't benefit from to_vec() as much (different code path).
+5. Staging utilization at 6.2% suggests GPU-side compaction could save ~2ms on staging copies, but with only 15MB total, the staging copy time is negligible.
+
+### Next targets
+- Wavelet shader optimization: fused row+column passes, multi-level fusion
+- Rice k precomputation: skip Phase 1 scan, halving Rice encode time
+- Frame pipelining for sequence encoder
+
+---
+
 ## 2026-02-27: Sequence encode reaches 30+ fps target
 
 ### Hypothesis

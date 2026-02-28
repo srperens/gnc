@@ -551,6 +551,8 @@ impl EncoderPipeline {
             // === Fully batched GPU pipeline: forward + entropy + local decode ===
             // Single command encoder, single submit, single poll.
             // Eliminates GPU pipeline stalls between forward/entropy/decode phases.
+            let _t_pf = std::time::Instant::now();
+            let profile = std::env::var("GNC_PROFILE").is_ok();
             let mut cmd = ctx
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -670,6 +672,16 @@ impl EncoderPipeline {
                 }
             }
 
+            // Profiling: flush forward phase to measure GPU time
+            if profile {
+                ctx.queue.submit(Some(cmd.finish()));
+                ctx.device.poll(wgpu::Maintain::Wait);
+                eprintln!("    P fwd+ME: {:.1}ms", _t_pf.elapsed().as_secs_f64() * 1000.0);
+                cmd = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("pf_entropy"),
+                });
+            }
+
             // Phase 2: GPU entropy encode dispatches + staging copies (same cmd encoder)
             let use_rice = matches!(entropy_mode, EntropyMode::Rice);
             if use_rice {
@@ -689,6 +701,20 @@ impl EncoderPipeline {
                     config.per_subband_entropy,
                     config.wavelet_levels,
                 );
+            }
+
+            // Profiling: flush entropy phase
+            let _t_after_entropy;
+            if profile {
+                ctx.queue.submit(Some(cmd.finish()));
+                ctx.device.poll(wgpu::Maintain::Wait);
+                _t_after_entropy = _t_pf.elapsed();
+                eprintln!("    P entropy+stg: {:.1}ms", _t_after_entropy.as_secs_f64() * 1000.0);
+                cmd = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("pf_local_decode"),
+                });
+            } else {
+                _t_after_entropy = std::time::Duration::ZERO;
             }
 
             // Phase 3: Local decode dispatches (same cmd encoder)

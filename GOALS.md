@@ -20,9 +20,8 @@ GNC is a patent-free **video codec** designed from scratch for GPU parallelism. 
 
 ## 3. Current State
 
-Two entropy coders with different tradeoffs. Rice+ZRL is faster; rANS compresses better at low quality.
-
-**Rice+ZRL — fast path (256 independent streams/tile):**
+**Entropy coder: Rice+ZRL** (256 independent streams/tile, fully GPU-parallel, patent-free).
+rANS and Huffman exist in the codebase but are parked — Rice is the default for all paths.
 
 | Quality | PSNR | BPP | Encode | Decode |
 |---------|------|-----|--------|--------|
@@ -31,57 +30,41 @@ Two entropy coders with different tradeoffs. Rice+ZRL is faster; rANS compresses
 | q=75 | 42.8 dB | 4.01 | 40 fps | 59 fps |
 | q=90 | 50.5 dB | 8.90 | 40 fps | 63 fps |
 
-**rANS — compression path (32 interleaved streams/tile):**
+*(Single-frame, 1080p bbb reference, M1 GPU, 2026-02-27)*
 
-| Quality | PSNR | BPP | Encode | Decode |
-|---------|------|-----|--------|--------|
-| q=25 | 33.2 dB | 1.29 | 31 fps | 42 fps |
-| q=50 | 37.7 dB | 2.30 | 30 fps | 36 fps |
-| q=75 | 42.8 dB | 4.22 | 29 fps | 34 fps |
-| q=90 | 51.0 dB | 9.65 | 31 fps | 33 fps |
-| q=100 | lossless | 13.06 | 31 fps | 32 fps |
-
-*(All: 1080p bbb reference frame, M1 GPU, 2026-02-27)*
+**Sequence encode: 31.7 fps** (1080p, q=75, Rice, ki=8, 10 frames I+P+B)
 
 **What works:**
 - Full I/P/B frame video pipeline with motion estimation, rate control, GNV1 container
-- 3 entropy backends (Rice+ZRL, rANS, Bitplane), all GPU compute shaders
-- Fused quantize+histogram shader, fused rANS normalize+encode shader
-- True lossless encode/decode (rANS, q=100, bit-exact roundtrip)
-- 114+ tests, golden-baseline regression, 5 conformance bitstreams
-- 30 WGSL compute shaders (6,348 lines)
+- Rice+ZRL entropy (GPU encode + decode), rANS and Huffman available but parked
+- Fused quantize+histogram shader
+- 128+ tests, golden-baseline regression, 5 conformance bitstreams
+- 33 WGSL compute shaders
 - WASM/WebGPU decoder builds (263 KB)
 
-**Patent risk note:** Microsoft holds patent US11234023B2 on rANS modifications. Our rANS implementation has potential exposure. Rice and Huffman are patent-free — strategic reason to migrate away from rANS as the primary entropy coder.
-
-**Key GPU architecture insight:** On M1, shared memory occupancy dominates performance. 16KB shared memory = 2 workgroups/core (full occupancy). Exceeding 16KB halves occupancy → ~20% regression. This is why Rice (< 1KB shared) and Huffman (8KB shared) are fast, while rANS (16KB+) is slower. ALU cost (e.g. integer multiply vs division) is negligible by comparison.
+**Key GPU architecture insight:** On M1, shared memory occupancy dominates performance. 16KB shared memory = 2 workgroups/core (full occupancy). Rice uses < 1KB shared → excellent occupancy.
 
 **Known gaps:**
-- ~~Sequence encode 30+ fps~~ ✓ Achieved: **31.7 fps** Rice (1080p, q=75, ki=8, 10 frames I+P+B) — parallel half-pel, ±2 fine search with temporal predictor, pipeline warm-up
-- Single-frame encode 40 fps Rice, 30 fps rANS (target: 60 fps)
-- Rice at q=25 is +33% bpp vs rANS (per-subband k_zrl implemented, gap is structural)
-- Rice q=100 is near-lossless (56 dB) not bit-exact — only rANS supports true lossless
-- Lossless: 13.06 bpp vs JPEG 2000's ~3.5 bpp (structural context-modeling gap)
+- Sequence encode 31.7 fps → target 60 fps
+- Single-frame encode 40 fps → target 60 fps
 - 8-bit only (10-bit not implemented)
 - 4:4:4 only (4:2:2 not implemented)
+- No true lossless with Rice (near-lossless 56 dB at q=100)
 
 ## 4. Priorities
 
-**P1: Video encode speed** ✓ 30 fps achieved
-- ~~Sequence encode from 6.5 fps to 30+ fps~~ ✓ Achieved: 31.7 fps (1080p, q=75, Rice, I+P+B)
-- Further optimization toward 60 fps: multi-frame GPU overlap, fused wavelet+quantize kernel
+**P1: Video encode speed → 60 fps**
+- ✓ 30 fps achieved (31.7 fps, 1080p, q=75, Rice, I+P+B)
+- Next: multi-frame GPU overlap, fused wavelet+quantize kernel, reduce ME cost
 - Target: real-time 1080p60 sequence encode
 
-**P2: Compression efficiency**
-- **Canonical Huffman entropy** — next planned implementation. Same 256-stream architecture as Rice but with distribution-adaptive codewords instead of fixed Golomb-Rice. Expected: 1-5% overhead vs rANS (vs Rice's 3-7%). See `docs/HUFFMAN_PLAN.md`.
-- ~~Adaptive Rice k parameter per subband~~ ✓ Done (1-2% bpp gain, gap is structural not parametric)
-- Fix Rice lossless — currently near-lossless (56 dB), should be bit-exact like rANS
-- Improve lossless (13 bpp to <5 bpp — context modeling is the structural gap)
-- Improve low-quality compression (q<25 range)
-
-**P3: Broadcast features**
+**P2: Broadcast features**
 - 10-bit content support
 - 4:2:2 chroma subsampling
+
+**P3: Compression efficiency** (parked)
+- rANS and Huffman are implemented but parked — revisit when speed targets are met
+- Fix Rice lossless, improve low-quality compression
 
 **P4: Transform exploration**
 - DCT, hybrid wavelet/DCT, Haar

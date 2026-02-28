@@ -444,15 +444,14 @@ fn main(
 
     // ========== Phase 3c: Forward half-pel refinement (all 256 threads, parallel) ==========
     // Active for mode 0 (fwd-only) and mode 2 (bidir).
-    // Test 9 candidates (center + 8 neighbors). Each candidate evaluated in parallel:
-    // all 256 threads compute one pixel's SAD, then sum-reduce.
+    // Cross-pattern: test 4 cardinal neighbors (skip diagonals for speed).
+    // Skipped entirely if SAD is zero (static block).
 
     var hp_fwd_dx = center_fwd_hx;
     var hp_fwd_dy = center_fwd_hy;
     var hp_fwd_sad = mode_sad;
 
-    if best_mode == 0u || best_mode == 2u {
-        // Center is the baseline — neighbors must be strictly better to win.
+    if (best_mode == 0u || best_mode == 2u) && mode_sad > 0u {
         if tid == 0u {
             hp_track_sad = mode_sad;
             hp_track_mv = pack_mv(center_fwd_hx, center_fwd_hy);
@@ -471,25 +470,21 @@ fn main(
             hp_bwd_sample = sample_hp_bwd(bx2, by2, params.width, params.height);
         }
 
-        for (var cand = 0u; cand < 8u; cand++) {
+        // 4 cardinal directions only (cross pattern, no diagonals)
+        for (var cand = 0u; cand < 4u; cand++) {
             var off_x: i32 = 0;
             var off_y: i32 = 0;
             switch cand {
-                case 0u: { off_x = -1; off_y = -1; }
-                case 1u: { off_x =  0; off_y = -1; }
-                case 2u: { off_x =  1; off_y = -1; }
-                case 3u: { off_x = -1; off_y =  0; }
-                case 4u: { off_x =  1; off_y =  0; }
-                case 5u: { off_x = -1; off_y =  1; }
-                case 6u: { off_x =  0; off_y =  1; }
-                case 7u: { off_x =  1; off_y =  1; }
+                case 0u: { off_x =  0; off_y = -1; }
+                case 1u: { off_x = -1; off_y =  0; }
+                case 2u: { off_x =  1; off_y =  0; }
+                case 3u: { off_x =  0; off_y =  1; }
                 default: {}
             }
 
             let test_hx = center_fwd_hx + off_x;
             let test_hy = center_fwd_hy + off_y;
 
-            // Bounds check (uniform across workgroup — depends only on block origin + offset)
             let ref_base_hx = i32(block_origin_x) * 2 + test_hx;
             let ref_base_hy = i32(block_origin_y) * 2 + test_hy;
             let valid = ref_base_hx >= -1 && ref_base_hy >= -1 &&
@@ -538,12 +533,12 @@ fn main(
 
     // ========== Phase 3d: Backward half-pel refinement (all 256 threads, parallel) ==========
     // Active for mode 1 (bwd-only) and mode 2 (bidir).
-    // For bidir, predictor = (refined_fwd_hp_sample + hp_bwd_sample) / 2.
+    // Cross-pattern: 4 cardinal neighbors. Skipped if SAD is zero.
 
     var hp_bwd_dx = center_bwd_hx;
     var hp_bwd_dy = center_bwd_hy;
 
-    if best_mode == 1u || best_mode == 2u {
+    if (best_mode == 1u || best_mode == 2u) && mode_sad > 0u {
         // Broadcast refined forward MV from thread 0 to all threads
         if tid == 0u {
             shared_mv[0] = pack_mv(hp_fwd_dx, hp_fwd_dy);
@@ -552,7 +547,6 @@ fn main(
         let refined_fwd_hx = unpack_dx(shared_mv[0]);
         let refined_fwd_hy = unpack_dy(shared_mv[0]);
 
-        // Center is the baseline — neighbors must be strictly better to win.
         var center_sad_for_bwd: u32;
         if best_mode == 1u {
             center_sad_for_bwd = mode_sad;
@@ -578,18 +572,15 @@ fn main(
             hp_fwd_sample = sample_hp_fwd(fx2, fy2, params.width, params.height);
         }
 
-        for (var cand = 0u; cand < 8u; cand++) {
+        // 4 cardinal directions only (cross pattern, no diagonals)
+        for (var cand = 0u; cand < 4u; cand++) {
             var off_x: i32 = 0;
             var off_y: i32 = 0;
             switch cand {
-                case 0u: { off_x = -1; off_y = -1; }
-                case 1u: { off_x =  0; off_y = -1; }
-                case 2u: { off_x =  1; off_y = -1; }
-                case 3u: { off_x = -1; off_y =  0; }
-                case 4u: { off_x =  1; off_y =  0; }
-                case 5u: { off_x = -1; off_y =  1; }
-                case 6u: { off_x =  0; off_y =  1; }
-                case 7u: { off_x =  1; off_y =  1; }
+                case 0u: { off_x =  0; off_y = -1; }
+                case 1u: { off_x = -1; off_y =  0; }
+                case 2u: { off_x =  1; off_y =  0; }
+                case 3u: { off_x =  0; off_y =  1; }
                 default: {}
             }
 

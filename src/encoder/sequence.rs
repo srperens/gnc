@@ -596,6 +596,17 @@ impl EncoderPipeline {
                 padded_pixels as u32,
             );
 
+            // Profiling: flush preprocess to isolate ME timing
+            if profile {
+                ctx.queue.submit(Some(cmd.finish()));
+                ctx.device.poll(wgpu::Maintain::Wait);
+                eprintln!("    P preprocess: {:.1}ms", _t_pf.elapsed().as_secs_f64() * 1000.0);
+                cmd = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("pf_me"),
+                });
+            }
+
+            let _t_me = std::time::Instant::now();
             let me_params = if predictor_mvs.is_some() {
                 &bufs.me_params_pred
             } else {
@@ -614,6 +625,17 @@ impl EncoderPipeline {
                 &bufs.me_dummy_pred,
             );
 
+            // Profiling: flush ME to isolate MC+wavelet+quantize timing
+            if profile {
+                ctx.queue.submit(Some(cmd.finish()));
+                ctx.device.poll(wgpu::Maintain::Wait);
+                eprintln!("    P ME: {:.1}ms", _t_me.elapsed().as_secs_f64() * 1000.0);
+                cmd = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("pf_mcwq"),
+                });
+            }
+
+            let _t_mcwq = std::time::Instant::now();
             for p in 0..3 {
                 let weights = if p == 0 {
                     &weights_luma
@@ -624,6 +646,12 @@ impl EncoderPipeline {
                     0 => &bufs.plane_a,
                     1 => &bufs.co_plane,
                     _ => &bufs.cg_plane,
+                };
+                // Quantize output: Y→recon_y, Co→co_plane, Cg→plane_b (no copy needed)
+                let quant_out = match p {
+                    0 => &bufs.recon_y,
+                    1 => &bufs.co_plane,
+                    _ => &bufs.plane_b,
                 };
 
                 self.motion.compensate_cached(
@@ -637,12 +665,11 @@ impl EncoderPipeline {
                     padded_h,
                     &bufs.mc_fwd_params,
                 );
-                cmd.copy_buffer_to_buffer(&bufs.mc_out, 0, &bufs.plane_a, 0, plane_size);
-
+                // mc_out feeds directly into wavelet (read-only at level 0)
                 self.transform.forward(
                     ctx,
                     &mut cmd,
-                    &bufs.plane_a,
+                    &bufs.mc_out,
                     &bufs.plane_b,
                     &bufs.plane_c,
                     info,
@@ -653,7 +680,7 @@ impl EncoderPipeline {
                     ctx,
                     &mut cmd,
                     &bufs.plane_c,
-                    &bufs.plane_b,
+                    quant_out,
                     padded_pixels as u32,
                     config.quantization_step,
                     config.dead_zone,
@@ -664,19 +691,14 @@ impl EncoderPipeline {
                     config.wavelet_levels,
                     weights,
                 );
-
-                if p == 0 {
-                    cmd.copy_buffer_to_buffer(&bufs.plane_b, 0, &bufs.recon_y, 0, plane_size);
-                } else if p == 1 {
-                    cmd.copy_buffer_to_buffer(&bufs.plane_b, 0, &bufs.co_plane, 0, plane_size);
-                }
             }
 
             // Profiling: flush forward phase to measure GPU time
             if profile {
                 ctx.queue.submit(Some(cmd.finish()));
                 ctx.device.poll(wgpu::Maintain::Wait);
-                eprintln!("    P fwd+ME: {:.1}ms", _t_pf.elapsed().as_secs_f64() * 1000.0);
+                eprintln!("    P MC+wavelet+quant: {:.1}ms", _t_mcwq.elapsed().as_secs_f64() * 1000.0);
+                eprintln!("    P fwd total: {:.1}ms", _t_pf.elapsed().as_secs_f64() * 1000.0);
                 cmd = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("pf_entropy"),
                 });
@@ -897,6 +919,13 @@ impl EncoderPipeline {
                     .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                         label: Some("pf_enc"),
                     });
+                // Quantize output: Y→recon_y, Co→co_plane, Cg→plane_b
+                let quant_out = match p {
+                    0 => &bufs.recon_y,
+                    1 => &bufs.co_plane,
+                    _ => &bufs.plane_b,
+                };
+
                 self.motion.compensate(
                     ctx,
                     &mut cmd,
@@ -908,11 +937,11 @@ impl EncoderPipeline {
                     padded_h,
                     true,
                 );
-                cmd.copy_buffer_to_buffer(&bufs.mc_out, 0, &bufs.plane_a, 0, plane_size);
+                // mc_out feeds directly into wavelet (read-only at level 0)
                 self.transform.forward(
                     ctx,
                     &mut cmd,
-                    &bufs.plane_a,
+                    &bufs.mc_out,
                     &bufs.plane_b,
                     &bufs.plane_c,
                     info,
@@ -923,7 +952,7 @@ impl EncoderPipeline {
                     ctx,
                     &mut cmd,
                     &bufs.plane_c,
-                    &bufs.plane_b,
+                    quant_out,
                     padded_pixels as u32,
                     config.quantization_step,
                     config.dead_zone,
@@ -934,17 +963,12 @@ impl EncoderPipeline {
                     config.wavelet_levels,
                     weights,
                 );
-                if p == 0 {
-                    cmd.copy_buffer_to_buffer(&bufs.plane_b, 0, &bufs.recon_y, 0, plane_size);
-                } else if p == 1 {
-                    cmd.copy_buffer_to_buffer(&bufs.plane_b, 0, &bufs.co_plane, 0, plane_size);
-                }
                 ctx.queue.submit(Some(cmd.finish()));
 
                 encode_entropy(
                     &mut self.gpu_encoder,
                     ctx,
-                    &bufs.plane_b,
+                    quant_out,
                     padded_pixels,
                     padded_w as usize,
                     tiles_x,
@@ -1188,6 +1212,12 @@ impl EncoderPipeline {
                     1 => &bufs.co_plane,
                     _ => &bufs.cg_plane,
                 };
+                // Quantize output: Y→recon_y, Co→co_plane, Cg→plane_b (no copy needed)
+                let quant_out = match p {
+                    0 => &bufs.recon_y,
+                    1 => &bufs.co_plane,
+                    _ => &bufs.plane_b,
+                };
 
                 self.motion.compensate_bidir_cached(
                     ctx,
@@ -1203,12 +1233,11 @@ impl EncoderPipeline {
                     padded_h,
                     &bufs.mc_bidir_fwd_params,
                 );
-                cmd.copy_buffer_to_buffer(&bufs.mc_out, 0, &bufs.plane_a, 0, plane_size);
-
+                // mc_out feeds directly into wavelet (read-only at level 0)
                 self.transform.forward(
                     ctx,
                     &mut cmd,
-                    &bufs.plane_a,
+                    &bufs.mc_out,
                     &bufs.plane_b,
                     &bufs.plane_c,
                     info,
@@ -1219,7 +1248,7 @@ impl EncoderPipeline {
                     ctx,
                     &mut cmd,
                     &bufs.plane_c,
-                    &bufs.plane_b,
+                    quant_out,
                     padded_pixels as u32,
                     config.quantization_step,
                     config.dead_zone,
@@ -1230,12 +1259,6 @@ impl EncoderPipeline {
                     config.wavelet_levels,
                     weights,
                 );
-
-                if p == 0 {
-                    cmd.copy_buffer_to_buffer(&bufs.plane_b, 0, &bufs.recon_y, 0, plane_size);
-                } else if p == 1 {
-                    cmd.copy_buffer_to_buffer(&bufs.plane_b, 0, &bufs.co_plane, 0, plane_size);
-                }
             }
 
             // Phase 2: GPU entropy encode dispatches (same cmd)
@@ -1391,6 +1414,13 @@ impl EncoderPipeline {
                     .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                         label: Some("bf_enc"),
                     });
+                // Quantize output: Y→recon_y, Co→co_plane, Cg→plane_b
+                let quant_out = match p {
+                    0 => &bufs.recon_y,
+                    1 => &bufs.co_plane,
+                    _ => &bufs.plane_b,
+                };
+
                 self.motion.compensate_bidir(
                     ctx,
                     &mut cmd,
@@ -1405,11 +1435,11 @@ impl EncoderPipeline {
                     padded_h,
                     true,
                 );
-                cmd.copy_buffer_to_buffer(&bufs.mc_out, 0, &bufs.plane_a, 0, plane_size);
+                // mc_out feeds directly into wavelet (read-only at level 0)
                 self.transform.forward(
                     ctx,
                     &mut cmd,
-                    &bufs.plane_a,
+                    &bufs.mc_out,
                     &bufs.plane_b,
                     &bufs.plane_c,
                     info,
@@ -1420,7 +1450,7 @@ impl EncoderPipeline {
                     ctx,
                     &mut cmd,
                     &bufs.plane_c,
-                    &bufs.plane_b,
+                    quant_out,
                     padded_pixels as u32,
                     config.quantization_step,
                     config.dead_zone,
@@ -1431,17 +1461,12 @@ impl EncoderPipeline {
                     config.wavelet_levels,
                     weights,
                 );
-                if p == 0 {
-                    cmd.copy_buffer_to_buffer(&bufs.plane_b, 0, &bufs.recon_y, 0, plane_size);
-                } else if p == 1 {
-                    cmd.copy_buffer_to_buffer(&bufs.plane_b, 0, &bufs.co_plane, 0, plane_size);
-                }
                 ctx.queue.submit(Some(cmd.finish()));
 
                 encode_entropy(
                     &mut self.gpu_encoder,
                     ctx,
-                    &bufs.plane_b,
+                    quant_out,
                     padded_pixels,
                     padded_w as usize,
                     tiles_x,

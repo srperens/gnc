@@ -251,41 +251,31 @@
             if (!playing || !player) return;
 
             const fc = player.frame_count;
-            const targetFps = player.fps;
-            const frameDuration = 1000 / targetFps;
 
-            // Time-based: decode as many frames as needed to stay on schedule
-            if (timestamp - lastFrameTime >= frameDuration) {
-                const t0 = performance.now();
-                const rgba = await player.decode_next_frame();
-                const dt = performance.now() - t0;
+            const t0 = performance.now();
+            const rgba = await player.decode_next_frame();
+            const dt = performance.now() - t0;
 
-                const w = player.width;
-                const h = player.height;
-                paintFrame(rgba, w, h);
+            // Check again after async decode — user may have paused during await
+            if (!playing) return;
 
-                const curFrame = (player.current_frame + fc - 1) % fc;
-                seekBar.value = curFrame;
-                updateFrameLabel(curFrame);
+            paintFrame(rgba, player.width, player.height);
 
-                framesSinceLastStat++;
-                statAccumMs += dt;
-                if (framesSinceLastStat >= 10) {
-                    const avg = statAccumMs / framesSinceLastStat;
-                    $('statDecode').textContent = `Decode: ${avg.toFixed(1)} ms`;
-                    const wallElapsed = timestamp - lastFrameTime + frameDuration * (framesSinceLastStat - 1);
-                    $('statPlayFps').textContent = `Play: ${(framesSinceLastStat / wallElapsed * 1000).toFixed(1)} fps`;
-                    framesSinceLastStat = 0;
-                    statAccumMs = 0;
-                }
+            const curFrame = (player.current_frame + fc - 1) % fc;
+            seekBar.value = curFrame;
+            updateFrameLabel(curFrame);
 
-                lastFrameTime = timestamp;
-
-                // Loop at end
-                if (player.current_frame >= fc) {
-                    player.reset();
-                }
+            framesSinceLastStat++;
+            statAccumMs += dt;
+            if (framesSinceLastStat >= 10) {
+                const avg = statAccumMs / framesSinceLastStat;
+                $('statDecode').textContent = `Decode: ${avg.toFixed(1)} ms`;
+                $('statPlayFps').textContent = `Play: ${(1000 / avg).toFixed(1)} fps`;
+                framesSinceLastStat = 0;
+                statAccumMs = 0;
             }
+
+            if (player.current_frame >= fc) player.reset();
 
             animId = requestAnimationFrame(playLoop);
         }

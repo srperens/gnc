@@ -6,6 +6,7 @@
 use std::time::Instant;
 
 use crate::encoder::block_transform::{BlockTransform, BlockTransformType};
+use crate::encoder::fused_block::FusedBlock;
 use crate::encoder::transform::WaveletTransform;
 use crate::{FrameInfo, GpuContext, WaveletType};
 
@@ -495,6 +496,115 @@ pub fn print_results(results: &[TransformResult]) {
                 }
             }
         }
+    }
+
+    println!("\n{}", "=".repeat(90));
+}
+
+/// Benchmark the fused DCT-8×8 + quantize + local decode pipeline
+/// against the separate-dispatch baseline (DCT-8×8 → quantize → IDCT).
+pub fn run_fused_benchmark(
+    ctx: &GpuContext,
+    rgb_data: &[f32],
+    width: u32,
+    height: u32,
+    iterations: u32,
+) {
+    let y_orig = extract_y_plane(rgb_data, width, height);
+    let pad_w = ((width + 7) / 8) * 8; // Only need 8-alignment for DCT-8×8
+    let pad_h = ((height + 7) / 8) * 8;
+    let y_padded = pad_plane(&y_orig, width, height, pad_w, pad_h);
+    let pixel_count = (pad_w * pad_h) as usize;
+    let total_px = width * height;
+
+    let input_buf = create_storage_buf(ctx, &y_padded);
+    let quant_buf = create_empty_buf(ctx, pixel_count);
+    let recon_buf = create_empty_buf(ctx, pixel_count);
+    let temp_buf = create_empty_buf(ctx, pixel_count);
+
+    let fused = FusedBlock::new(ctx);
+    let block_transform = BlockTransform::new(ctx);
+
+    let qsteps: &[f32] = &[1.0, 2.0, 4.0, 8.0, 16.0, 32.0];
+
+    println!("\n{}", "=".repeat(90));
+    println!("FUSED MEGA-KERNEL BENCHMARK (DCT-8×8 + Quantize + Local Decode)");
+    println!("{}", "=".repeat(90));
+
+    // ---- Fused: 1 dispatch for all 3 stages ----
+    println!("\n--- Fused pipeline (1 dispatch) ---");
+
+    let fused_time = measure_gpu_time(ctx, iterations, || {
+        let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("fused"),
+        });
+        fused.dispatch(ctx, &mut enc, &input_buf, &quant_buf, &recon_buf,
+            pad_w, pad_h, 4.0, 0.5);
+        ctx.queue.submit(Some(enc.finish()));
+    });
+    println!("  Fused time: {:.3} ms (1 dispatch)", fused_time);
+
+    // ---- Separate: 3 dispatches (DCT fwd + quantize-on-CPU + DCT inv) ----
+    // Note: we simulate the separate pipeline using existing block_transform
+    println!("\n--- Separate pipeline (3 dispatches) ---");
+
+    let separate_time = measure_gpu_time(ctx, iterations, || {
+        let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("separate"),
+        });
+        // Forward DCT
+        block_transform.dispatch(ctx, &mut enc, &input_buf, &quant_buf,
+            pad_w, pad_h, true, BlockTransformType::DCT8);
+        // Note: in the real pipeline, quantize is another GPU dispatch.
+        // Here we just show 2 dispatches (fwd + inv) as a lower bound.
+        // The fused kernel also does quantize + dequantize + IDCT in one.
+        block_transform.dispatch(ctx, &mut enc, &quant_buf, &recon_buf,
+            pad_w, pad_h, false, BlockTransformType::DCT8);
+        ctx.queue.submit(Some(enc.finish()));
+    });
+    println!("  Separate time: {:.3} ms (2 dispatches, no quant)", separate_time);
+    println!("  Speedup: {:.2}x", separate_time / fused_time);
+
+    // ---- RD comparison ----
+    println!("\n--- RD Performance ---\n");
+    println!("{:<10} {:>10} {:>10} {:>12}", "qstep", "PSNR(dB)", "NZ(%)", "BPP(est)");
+    println!("{}", "-".repeat(46));
+
+    for &qs in qsteps {
+        // Run fused
+        {
+            let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("fused_rd"),
+            });
+            fused.dispatch(ctx, &mut enc, &input_buf, &quant_buf, &recon_buf,
+                pad_w, pad_h, qs, 0.5);
+            ctx.queue.submit(Some(enc.finish()));
+            ctx.device.poll(wgpu::Maintain::Wait);
+        }
+
+        let recon_pixels = readback(ctx, &recon_buf, pixel_count);
+        let psnr = compute_psnr(&y_orig, &recon_pixels, width, height, pad_w);
+
+        let quant_vals = readback(ctx, &quant_buf, pixel_count);
+        let indices: Vec<i32> = quant_vals.iter().map(|&v| v as i32).collect();
+        let (bpp, nz_frac) = estimate_bpp(&indices, total_px);
+
+        println!("{:<10.1} {:>10.2} {:>9.1}% {:>12.3}", qs, psnr, nz_frac * 100.0, bpp);
+    }
+
+    // Verify roundtrip with near-lossless qstep
+    {
+        let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("fused_rt"),
+        });
+        fused.dispatch(ctx, &mut enc, &input_buf, &quant_buf, &recon_buf,
+            pad_w, pad_h, 0.001, 0.0);
+        ctx.queue.submit(Some(enc.finish()));
+        ctx.device.poll(wgpu::Maintain::Wait);
+
+        let recon_pixels = readback(ctx, &recon_buf, pixel_count);
+        let psnr = compute_psnr(&y_orig, &recon_pixels, width, height, pad_w);
+        println!("\n  Near-lossless roundtrip PSNR: {:.2} dB", psnr);
     }
 
     println!("\n{}", "=".repeat(90));

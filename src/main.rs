@@ -1364,6 +1364,11 @@ fn main() {
                 &ctx, &rgb_data, w, h, iterations,
             );
             experiments::transform_shootout::print_results(&results);
+
+            // Fused mega-kernel benchmark
+            experiments::transform_shootout::run_fused_benchmark(
+                &ctx, &rgb_data, w, h, iterations,
+            );
         }
     }
 }

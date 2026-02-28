@@ -674,6 +674,10 @@ pub mod wasm {
         frame_count: u32,
         fps: f64,
         current_frame: usize,
+        /// Pre-decoded RGBA frames for B-frame group buffering.
+        /// When we hit a B-frame group, we decode the anchor P first, then all
+        /// B-frames, and buffer results in display order for sequential retrieval.
+        buffered_frames: std::collections::BTreeMap<usize, Vec<u8>>,
     }
 
     #[wasm_bindgen]
@@ -703,6 +707,7 @@ pub mod wasm {
                     frame_count,
                     fps,
                     current_frame: 0,
+                    buffered_frames: std::collections::BTreeMap::new(),
                 })
             } else {
                 // Single-frame .gnc
@@ -719,6 +724,7 @@ pub mod wasm {
                     frame_count: 1,
                     fps: 1.0,
                     current_frame: 0,
+                    buffered_frames: std::collections::BTreeMap::new(),
                 })
             }
         }
@@ -755,17 +761,87 @@ pub mod wasm {
 
         /// Decode the next frame and return RGBA u8 data.
         /// Advances the frame counter. Wraps to frame 0 at end.
+        /// Handles B-frame reordering: when encountering a B-frame group,
+        /// decodes the anchor P first, then B-frames, buffering results.
         pub async fn decode_next_frame(&mut self) -> Result<Vec<u8>, JsValue> {
             if self.current_frame >= self.frame_count as usize {
                 self.current_frame = 0;
+                self.buffered_frames.clear();
             }
 
-            let frame = if let Some(ref header) = self.header {
-                crate::format::deserialize_sequence_frame(&self.data, header, self.current_frame)
-            } else {
-                crate::format::deserialize_compressed(&self.data)
-            };
+            // Return buffered frame if available (from a previous B-frame group decode)
+            if let Some(rgba) = self.buffered_frames.remove(&self.current_frame) {
+                self.current_frame += 1;
+                return Ok(rgba);
+            }
 
+            if self.header.is_none() {
+                // Single-frame .gnc
+                let frame = crate::format::deserialize_compressed(&self.data);
+                let rgba = self.decoder.decode_rgba_wasm(&self.ctx, &frame).await;
+                self.current_frame += 1;
+                return Ok(rgba);
+            }
+
+            let header = self.header.as_ref().unwrap();
+            let idx = self.current_frame;
+            let ft = header.index[idx].frame_type;
+
+            if ft == 2 {
+                // B-frame encountered directly. The current reference planes
+                // hold the past anchor. Find the future anchor P, decode it
+                // first, then decode the B-frame group.
+                let b_start = idx;
+                let mut b_end = idx;
+                while b_end < self.frame_count as usize
+                    && header.index[b_end].frame_type == 2
+                {
+                    b_end += 1;
+                }
+
+                if b_end < self.frame_count as usize {
+                    // Save past ref, decode future anchor P, swap for B-frames
+                    self.decoder.swap_forward_to_backward_ref(&self.ctx);
+                    let anchor_frame = crate::format::deserialize_sequence_frame(
+                        &self.data, header, b_end,
+                    );
+                    let anchor_rgba =
+                        self.decoder.decode_rgba_wasm(&self.ctx, &anchor_frame).await;
+                    self.decoder.swap_references(); // ref=past, bwd=future
+
+                    // Decode all B-frames in this group
+                    for b_idx in b_start..b_end {
+                        let b_frame = crate::format::deserialize_sequence_frame(
+                            &self.data, header, b_idx,
+                        );
+                        let b_rgba =
+                            self.decoder.decode_rgba_wasm(&self.ctx, &b_frame).await;
+                        self.buffered_frames.insert(b_idx, b_rgba);
+                    }
+
+                    self.decoder.swap_references(); // ref=future anchor P
+                    self.buffered_frames.insert(b_end, anchor_rgba);
+
+                    // Return the first B-frame from buffer
+                    let rgba = self.buffered_frames.remove(&idx).unwrap();
+                    self.current_frame = idx + 1;
+                    return Ok(rgba);
+                } else {
+                    // No anchor available (end of sequence), fallback
+                    let frame = crate::format::deserialize_sequence_frame(
+                        &self.data, header, idx,
+                    );
+                    let rgba = self.decoder.decode_rgba_wasm(&self.ctx, &frame).await;
+                    self.current_frame += 1;
+                    return Ok(rgba);
+                }
+            }
+
+            // I/P frame: just decode it. If B-frames follow, they'll be
+            // handled when current_frame advances to them.
+            let frame = crate::format::deserialize_sequence_frame(
+                &self.data, header, idx,
+            );
             let rgba = self.decoder.decode_rgba_wasm(&self.ctx, &frame).await;
             self.current_frame += 1;
             Ok(rgba)
@@ -773,10 +849,12 @@ pub mod wasm {
 
         /// Seek to a specific frame number. For GNV1, seeks to the nearest
         /// preceding keyframe and decodes forward to the target frame.
+        /// Handles B-frame reordering during the decode-forward pass.
         pub async fn seek(&mut self, target_frame: u32) -> Result<Vec<u8>, JsValue> {
             if self.header.is_none() {
                 // Single frame — just decode it
                 self.current_frame = 0;
+                self.buffered_frames.clear();
                 return self.decode_next_frame().await;
             }
 
@@ -786,15 +864,43 @@ pub mod wasm {
             // Find nearest preceding keyframe
             let keyframe_idx = crate::format::seek_to_keyframe(header, target as u64);
 
-            // Decode from keyframe up to target (P-frames need reference chain)
-            for i in keyframe_idx..=target {
-                let frame =
-                    crate::format::deserialize_sequence_frame(&self.data, header, i);
-                let rgba = self.decoder.decode_rgba_wasm(&self.ctx, &frame).await;
-                if i == target {
-                    self.current_frame = target + 1;
-                    return Ok(rgba);
+            // Clear any buffered frames from previous playback position
+            self.buffered_frames.clear();
+
+            // Decode from keyframe to target using B-frame-aware ordering.
+            // We reset current_frame and use decode_next_frame which handles
+            // B-frame groups automatically.
+            self.current_frame = keyframe_idx;
+            let mut last_rgba = None;
+
+            while self.current_frame <= target {
+                let rgba = self.decode_next_frame().await?;
+                // decode_next_frame advances current_frame, so the frame we just
+                // decoded is at current_frame - 1
+                let decoded_idx = self.current_frame - 1;
+                if decoded_idx == target {
+                    last_rgba = Some(rgba);
+                    break;
                 }
+                // Check if the target is in the buffered frames (from a B-group)
+                if let Some(buffered) = self.buffered_frames.get(&target) {
+                    last_rgba = Some(buffered.clone());
+                    break;
+                }
+                // If we overshot past target (can happen with B-frame group buffering)
+                if self.current_frame > target + 1 {
+                    if let Some(buffered) = self.buffered_frames.remove(&target) {
+                        last_rgba = Some(buffered);
+                    }
+                    break;
+                }
+            }
+
+            if let Some(rgba) = last_rgba {
+                self.current_frame = target + 1;
+                // Keep only frames after target in buffer (useful for next decode_next_frame)
+                self.buffered_frames.retain(|&k, _| k > target);
+                return Ok(rgba);
             }
 
             // Fallback (shouldn't reach here)
@@ -805,6 +911,7 @@ pub mod wasm {
         /// Reset playback to frame 0.
         pub fn reset(&mut self) {
             self.current_frame = 0;
+            self.buffered_frames.clear();
         }
     }
 }

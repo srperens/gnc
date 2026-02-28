@@ -12,3 +12,7 @@ test_material/*.exr
 test_material/*.dpx
 test_material/*.raw
 test_material/frames/
+
+# Web demo media (too large for git)
+examples/web/*.gnv
+examples/web/*.gnc

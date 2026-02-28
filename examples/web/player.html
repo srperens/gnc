@@ -176,6 +176,7 @@
         const controlsBar = $('controlsBar');
         const statsBar = $('statsBar');
 
+        let wasmReady = false;
         let player = null;
         let playing = false;
         let animId = null;
@@ -215,6 +216,7 @@
             try {
                 setStatus('Initializing WebGPU + WASM...');
                 await init();
+                wasmReady = true;
                 setStatus('Ready', 'ok');
             } catch (e) {
                 const msg = String(e.message || e);
@@ -259,6 +261,7 @@
         }
 
         async function loadUrl(filename) {
+            if (!wasmReady) { setStatus('WASM still loading, please wait...', 'info'); return; }
             stop();
             try {
                 const url = filename;
@@ -299,6 +302,7 @@
 
         // --- Load file ---
         async function loadFile(file) {
+            if (!wasmReady) { setStatus('WASM still loading, please wait...', 'info'); return; }
             stop();
             try {
                 setStatus('Loading ' + file.name + '...');

@@ -102,6 +102,29 @@
         .status-info { background: #1e3a5f; color: #7cb3d8; }
         .status-error { background: #5f1e1e; color: #d87c7c; }
         .status-ok { background: #1e5f2e; color: #7cd88b; }
+
+        .demos {
+            width: 100%;
+            max-width: 720px;
+            margin-bottom: 16px;
+        }
+        .demos summary {
+            cursor: pointer;
+            color: #888;
+            font-size: 0.9em;
+            margin-bottom: 8px;
+        }
+        .demo-grid {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+        .demo-grid button {
+            background: #2a2a4a;
+            font-size: 0.82em;
+            padding: 6px 14px;
+        }
+        .demo-grid button:hover { background: #3a3a5a; }
     </style>
 </head>
 <body>
@@ -112,6 +135,11 @@
         <input type="file" id="fileInput" accept=".gnc,.gnv">
         <p>Click or drop file here</p>
     </div>
+
+    <details class="demos" open>
+        <summary>Demo files</summary>
+        <div class="demo-grid" id="demoGrid"></div>
+    </details>
 
     <div id="status" class="status-info">Ready</div>
 
@@ -180,12 +208,91 @@
 
         // --- Init WASM ---
         async function boot() {
+            if (!navigator.gpu) {
+                setStatus('WebGPU is not supported in this browser. Try Chrome 113+ or Edge 113+.', 'error');
+                return;
+            }
             try {
                 setStatus('Initializing WebGPU + WASM...');
                 await init();
                 setStatus('Ready', 'ok');
             } catch (e) {
-                setStatus('Init failed: ' + e.message, 'error');
+                const msg = String(e.message || e);
+                if (msg.includes('No suitable GPU adapter') || msg.includes('blocklisted')) {
+                    setStatus('WebGPU: no adapter available. All GPUs may be blocklisted. Try chrome://flags/#enable-unsafe-webgpu', 'error');
+                } else {
+                    setStatus('Init failed: ' + msg, 'error');
+                }
+                console.error(e);
+            }
+        }
+
+        // --- Demo files ---
+        const demoFiles = [
+            { name: 'ducks_q25.gnv', label: 'Ducks q25 (315 MB)', desc: '500f 50fps 1080p' },
+            { name: 'ducks.gnv', label: 'Ducks q75 (109 MB)', desc: '50f 50fps 1080p' },
+            { name: 'test_pan.gnv', label: 'BBB Pan (8 MB)', desc: '10f 30fps 1080p' },
+            { name: 'test.gnv', label: 'BBB I-only (10 MB)', desc: '10f 10fps 1080p' },
+            { name: 'test.gnc', label: 'BBB Still', desc: 'single frame' },
+        ];
+        const demoGrid = $('demoGrid');
+        for (const d of demoFiles) {
+            const wrap = document.createElement('span');
+            wrap.style.display = 'inline-flex'; wrap.style.gap = '0';
+
+            const btn = document.createElement('button');
+            btn.textContent = d.label;
+            btn.title = d.desc;
+            btn.style.borderRadius = '6px 0 0 6px';
+            btn.addEventListener('click', () => loadUrl(d.name));
+
+            const dl = document.createElement('a');
+            dl.href = d.name;
+            dl.download = d.name;
+            dl.textContent = '\u2B07';
+            dl.title = 'Download ' + d.name;
+            dl.style.cssText = 'background:#222;color:#888;border-radius:0 6px 6px 0;padding:6px 8px;font-size:0.82em;text-decoration:none;display:flex;align-items:center;border-left:1px solid #333;';
+
+            wrap.appendChild(btn);
+            wrap.appendChild(dl);
+            demoGrid.appendChild(wrap);
+        }
+
+        async function loadUrl(filename) {
+            stop();
+            try {
+                const url = filename;
+                setStatus(`Fetching ${filename}...`);
+                const resp = await fetch(url);
+                if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+                const total = parseInt(resp.headers.get('content-length') || '0', 10);
+
+                // Stream with progress
+                const reader = resp.body.getReader();
+                const chunks = [];
+                let received = 0;
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    chunks.push(value);
+                    received += value.length;
+                    if (total > 0) {
+                        const pct = (received / total * 100).toFixed(0);
+                        const mb = (received / 1e6).toFixed(1);
+                        setStatus(`Fetching ${filename}... ${mb} MB (${pct}%)`);
+                    }
+                }
+                const buf = new Uint8Array(received);
+                let offset = 0;
+                for (const chunk of chunks) {
+                    buf.set(chunk, offset);
+                    offset += chunk.length;
+                }
+
+                setStatus('Creating player...');
+                await loadBuffer(buf, filename);
+            } catch (e) {
+                setStatus('Error: ' + (e.message || e), 'error');
                 console.error(e);
             }
         }
@@ -197,53 +304,57 @@
                 setStatus('Loading ' + file.name + '...');
                 const buf = new Uint8Array(await file.arrayBuffer());
                 setStatus('Creating player...');
-                player = await new GnvPlayer(buf);
-
-                const w = player.width;
-                const h = player.height;
-                const fc = player.frame_count;
-                const fps = player.fps;
-                cachedWidth = w;
-                cachedHeight = h;
-                cachedFc = fc;
-                cachedFps = fps;
-
-                canvas.width = w;
-                canvas.height = h;
-                canvasWrap.style.display = '';
-                controlsBar.style.display = 'flex';
-                statsBar.style.display = 'flex';
-
-                seekBar.max = Math.max(0, fc - 1);
-                seekBar.value = 0;
-                updateFrameLabel(0);
-
-                $('statRes').textContent = `${w}x${h}`;
-                $('statFps').textContent = `${fps.toFixed(1)} fps`;
-                $('statDecode').textContent = '';
-                $('statPlayFps').textContent = '';
-
-                playBtn.disabled = false;
-                playBtn.textContent = fc > 1 ? 'Play' : 'Decode';
-
-                // Decode first frame
-                setStatus('Decoding frame 0...');
-                const t0 = performance.now();
-                const rgba = await player.decode_next_frame();
-                const dt = performance.now() - t0;
-                paintFrame(rgba, w, h);
-                seekBar.value = 0;
-                updateFrameLabel(0);
-                $('statDecode').textContent = `Decode: ${dt.toFixed(1)} ms`;
-                setStatus(`${file.name} loaded (${fc} frame${fc > 1 ? 's' : ''})`, 'ok');
-
-                // Reset to frame 0 so Play starts from the beginning
-                player.reset();
-                jsCurrentFrame = 0;
+                await loadBuffer(buf, file.name);
             } catch (e) {
-                setStatus('Error: ' + e.message || e, 'error');
+                setStatus('Error: ' + (e.message || e), 'error');
                 console.error(e);
             }
+        }
+
+        async function loadBuffer(buf, name) {
+            player = await new GnvPlayer(buf);
+
+            const w = player.width;
+            const h = player.height;
+            const fc = player.frame_count;
+            const fps = player.fps;
+            cachedWidth = w;
+            cachedHeight = h;
+            cachedFc = fc;
+            cachedFps = fps;
+
+            canvas.width = w;
+            canvas.height = h;
+            canvasWrap.style.display = '';
+            controlsBar.style.display = 'flex';
+            statsBar.style.display = 'flex';
+
+            seekBar.max = Math.max(0, fc - 1);
+            seekBar.value = 0;
+            updateFrameLabel(0);
+
+            $('statRes').textContent = `${w}x${h}`;
+            $('statFps').textContent = `${fps.toFixed(1)} fps`;
+            $('statDecode').textContent = '';
+            $('statPlayFps').textContent = '';
+
+            playBtn.disabled = false;
+            playBtn.textContent = fc > 1 ? 'Play' : 'Decode';
+
+            // Decode first frame
+            setStatus('Decoding frame 0...');
+            const t0 = performance.now();
+            const rgba = await player.decode_next_frame();
+            const dt = performance.now() - t0;
+            paintFrame(rgba, w, h);
+            seekBar.value = 0;
+            updateFrameLabel(0);
+            $('statDecode').textContent = `Decode: ${dt.toFixed(1)} ms`;
+            setStatus(`${name} loaded (${fc} frame${fc > 1 ? 's' : ''})`, 'ok');
+
+            // Reset to frame 0 so Play starts from the beginning
+            player.reset();
+            jsCurrentFrame = 0;
         }
 
         // --- Paint ---

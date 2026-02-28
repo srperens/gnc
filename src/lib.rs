@@ -592,6 +592,13 @@ impl GpuContext {
 
     /// Create a new GPU context asynchronously. Required on WASM where blocking is unavailable.
     pub async fn new_async() -> Self {
+        Self::try_new_async()
+            .await
+            .expect("Failed to create GPU context")
+    }
+
+    /// Fallible version of `new_async()`. Returns an error string if GPU is unavailable.
+    pub async fn try_new_async() -> Result<Self, String> {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
             ..Default::default()
@@ -604,7 +611,11 @@ impl GpuContext {
                 force_fallback_adapter: false,
             })
             .await
-            .expect("Failed to find a suitable GPU adapter");
+            .ok_or_else(|| {
+                "No suitable GPU adapter found. WebGPU may be unavailable or all adapters \
+                 are blocklisted by your browser. Try enabling chrome://flags/#enable-unsafe-webgpu"
+                    .to_string()
+            })?;
 
         log::info!("Using GPU: {}", adapter.get_info().name);
 
@@ -622,9 +633,9 @@ impl GpuContext {
                 None,
             )
             .await
-            .expect("Failed to create device");
+            .map_err(|e| format!("Failed to create GPU device: {e}"))?;
 
-        Self { device, queue }
+        Ok(Self { device, queue })
     }
 }
 
@@ -638,7 +649,9 @@ pub mod wasm {
     /// Called from JavaScript via wasm-bindgen.
     #[wasm_bindgen]
     pub async fn decode_gnc(data: &[u8]) -> Result<Vec<u8>, JsValue> {
-        let ctx = crate::GpuContext::new_async().await;
+        let ctx = crate::GpuContext::try_new_async()
+            .await
+            .map_err(|e| JsValue::from_str(&e))?;
         let decoder = crate::decoder::pipeline::DecoderPipeline::new(&ctx);
         let frame = crate::format::deserialize_compressed(data);
         let rgba = decoder.decode_rgba_wasm(&ctx, &frame).await;
@@ -686,7 +699,9 @@ pub mod wasm {
         /// Auto-detects format by checking for GNV1 magic bytes.
         #[wasm_bindgen(constructor)]
         pub async fn new(data: Vec<u8>) -> Result<GnvPlayer, JsValue> {
-            let ctx = crate::GpuContext::new_async().await;
+            let ctx = crate::GpuContext::try_new_async()
+                .await
+                .map_err(|e| JsValue::from_str(&e))?;
             let decoder = crate::decoder::pipeline::DecoderPipeline::new(&ctx);
 
             let is_gnv = data.len() >= 4 && &data[0..4] == b"GNV1";

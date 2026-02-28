@@ -12,8 +12,9 @@
 //   where quotient = (|val|-1) >> k, remainder = (|val|-1) & ((1<<k)-1)
 
 const STREAMS_PER_TILE: u32 = 256u;
-const MAX_STREAM_BYTES: u32 = 512u;
-const MAX_STREAM_WORDS: u32 = 128u;  // MAX_STREAM_BYTES / 4
+// Must match encoder/rice_gpu.rs MAX_STREAM_BYTES.
+const MAX_STREAM_BYTES: u32 = 4096u;
+const MAX_STREAM_WORDS: u32 = 1024u;  // MAX_STREAM_BYTES / 4
 const MAX_GROUPS: u32 = 8u;
 const K_STRIDE: u32 = 16u;  // MAX_GROUPS * 2: stride per tile in k_output (mag k + zrl k per group)
 
@@ -327,7 +328,7 @@ fn main(
             let magnitude = u32(abs(coeff)) - 1u;
             let g = compute_subband_group(tile_col, tile_row);
             let k = shared_k[g];
-            let quotient = min(magnitude >> k, 31u);
+            let quotient = magnitude >> k;
             let remainder = magnitude & ((1u << k) - 1u);
 
             // Batch emit when total bits fit in 15

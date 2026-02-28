@@ -101,7 +101,7 @@ fn read_bits(count: u32) -> u32 {
 // Read a Golomb-Rice coded value: unary quotient + k-bit remainder.
 fn read_rice(k: u32) -> u32 {
     var quotient = 0u;
-    while (read_bit() == 1u && quotient < 31u) {
+    while (read_bit() == 1u) {
         quotient += 1u;
     }
     let remainder = select(0u, read_bits(k), k > 0u);

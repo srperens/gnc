@@ -81,9 +81,8 @@ impl BitWriter {
         let quotient = value >> k;
         let remainder = value & ((1u32 << k) - 1);
 
-        // Unary: quotient 1-bits + one 0-bit. Cap quotient to avoid pathological cases.
-        let q = quotient.min(31);
-        for _ in 0..q {
+        // Unary: quotient 1-bits + one 0-bit.
+        for _ in 0..quotient {
             self.write_bit(1);
         }
         self.write_bit(0);
@@ -147,7 +146,7 @@ impl<'a> BitReader<'a> {
     fn read_rice(&mut self, k: u8) -> u32 {
         // Unary: count 1-bits until 0-bit
         let mut quotient = 0u32;
-        while self.read_bit() == 1 && quotient < 31 {
+        while self.read_bit() == 1 {
             quotient += 1;
         }
         let remainder = if k > 0 { self.read_bits(k) } else { 0 };

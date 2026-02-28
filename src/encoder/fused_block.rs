@@ -169,8 +169,9 @@ impl FusedBlock {
             ],
         });
 
-        let wg_x = width / 8;
-        let wg_y = height / 8;
+        // Use ceil-div to cover non-8-aligned dimensions (shader bounds-checks).
+        let wg_x = (width + 7) / 8;
+        let wg_y = (height + 7) / 8;
 
         let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("fused_block"),

@@ -13,6 +13,10 @@ struct Params {
     height: u32,
     step_size: f32,
     dead_zone: f32,  // dead zone as fraction of step_size (0.0 = no dead zone)
+    freq_strength: f32,  // frequency-dependent quantization strength (0=flat, 3-4=typical)
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -66,13 +70,19 @@ fn main(
     }
     // sum now holds the DCT coefficient for this (row, col) frequency
 
-    // ---- Step 4: Quantize ----
-    let threshold = params.dead_zone * params.step_size;
+    // ---- Step 4: Frequency-dependent quantization ----
+    // Higher frequencies (larger row²+col²) get coarser quantization.
+    // Squared distance preserves mid-frequencies better than linear.
+    //   DC (0,0) → 1.0, highest (7,7) → 1.0 + freq_strength
+    let freq_weight = 1.0 + params.freq_strength * f32(row * row + col * col) / 98.0;
+    let effective_step = params.step_size * freq_weight;
+
+    let threshold = params.dead_zone * effective_step;
     var quant_idx: f32;
     if abs(sum) < threshold {
         quant_idx = 0.0;
     } else {
-        quant_idx = sign(sum) * floor(abs(sum) / params.step_size + 0.5);
+        quant_idx = sign(sum) * floor(abs(sum) / effective_step + 0.5);
     }
 
     // Write quantized index to output
@@ -81,7 +91,7 @@ fn main(
     }
 
     // ---- Step 5: Dequantize ----
-    let recon_coeff = quant_idx * params.step_size;
+    let recon_coeff = quant_idx * effective_step;
 
     // ---- Step 6: Inverse DCT (row pass, from dequantized coefficients) ----
     // Load dequantized coefficients into shared memory

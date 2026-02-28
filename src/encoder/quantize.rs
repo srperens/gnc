@@ -24,6 +24,11 @@ struct QuantizeParams {
     aq_ll_block_size: u32,
     aq_ll_blocks_per_tile_x: u32,
     aq_tiles_x: u32,
+    // DCT frequency-dependent quantization strength (0.0 = off)
+    dct_freq_strength: f32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 pub struct Quantizer {
@@ -159,6 +164,7 @@ impl Quantizer {
             num_levels,
             weights,
             None,
+            0.0,
         );
     }
 
@@ -182,6 +188,7 @@ impl Quantizer {
         num_levels: u32,
         weights: &[f32; 16],
         weight_map: Option<(&wgpu::Buffer, u32, u32, u32)>,
+        dct_freq_strength: f32,
     ) {
         let (aq_enabled, aq_ll_block_size, aq_ll_blocks_per_tile_x, aq_tiles_x, wm_buf) =
             match weight_map {
@@ -208,6 +215,10 @@ impl Quantizer {
             aq_ll_block_size,
             aq_ll_blocks_per_tile_x,
             aq_tiles_x,
+            dct_freq_strength,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
         };
 
         let params_buf = ctx

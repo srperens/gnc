@@ -45,6 +45,11 @@ struct Params {
     aq_ll_blocks_per_tile_x: u32,
     // Number of tiles in x direction
     aq_tiles_x: u32,
+    // DCT frequency-dependent quantization strength (0.0 = off, used only when num_levels == 0)
+    dct_freq_strength: f32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -176,9 +181,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let lx = x % params.tile_size;
     let ly = y % params.tile_size;
 
-    let subband_weight = get_weight(compute_subband_index(lx, ly));
-    let spatial_weight = get_spatial_weight(x, y);
-    let effective_step = params.step_size * subband_weight * spatial_weight;
+    // DCT mode: frequency-dependent weighting based on block-local position
+    // Wavelet mode: subband + spatial weighting
+    var coeff_weight: f32;
+    if params.num_levels == 0u && params.dct_freq_strength > 0.0 {
+        // DCT-8×8: position within 8×8 block determines frequency
+        let block_row = ly % 8u;
+        let block_col = lx % 8u;
+        coeff_weight = 1.0 + params.dct_freq_strength * f32(block_row * block_row + block_col * block_col) / 98.0;
+    } else {
+        coeff_weight = get_weight(compute_subband_index(lx, ly)) * get_spatial_weight(x, y);
+    }
+    let effective_step = params.step_size * coeff_weight;
 
     let val = input[idx];
 

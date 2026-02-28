@@ -539,7 +539,7 @@ pub fn run_fused_benchmark(
             label: Some("fused"),
         });
         fused.dispatch(ctx, &mut enc, &input_buf, &quant_buf, &recon_buf,
-            pad_w, pad_h, 4.0, 0.5);
+            pad_w, pad_h, 4.0, 0.5, 7.0);
         ctx.queue.submit(Some(enc.finish()));
     });
     println!("  Fused time: {:.3} ms (1 dispatch)", fused_time);
@@ -577,7 +577,7 @@ pub fn run_fused_benchmark(
                 label: Some("fused_rd"),
             });
             fused.dispatch(ctx, &mut enc, &input_buf, &quant_buf, &recon_buf,
-                pad_w, pad_h, qs, 0.5);
+                pad_w, pad_h, qs, 0.5, 7.0);
             ctx.queue.submit(Some(enc.finish()));
             ctx.device.poll(wgpu::Maintain::Wait);
         }
@@ -598,7 +598,7 @@ pub fn run_fused_benchmark(
             label: Some("fused_rt"),
         });
         fused.dispatch(ctx, &mut enc, &input_buf, &quant_buf, &recon_buf,
-            pad_w, pad_h, 0.001, 0.0);
+            pad_w, pad_h, 0.001, 0.0, 0.0);
         ctx.queue.submit(Some(enc.finish()));
         ctx.device.poll(wgpu::Maintain::Wait);
 

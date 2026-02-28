@@ -411,6 +411,7 @@ impl EncoderPipeline {
                 config.wavelet_levels,
                 weights,
                 wm_param,
+                0.0,
             );
 
             if p == 0 && has_cfl {

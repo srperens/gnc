@@ -11,6 +11,10 @@ struct FusedBlockParams {
     height: u32,
     step_size: f32,
     dead_zone: f32,
+    freq_strength: f32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 /// Fused DCT-8×8 + quantize + local decode pipeline.
@@ -130,12 +134,17 @@ impl FusedBlock {
         height: u32,
         step_size: f32,
         dead_zone: f32,
+        freq_strength: f32,
     ) {
         let params = FusedBlockParams {
             width,
             height,
             step_size,
             dead_zone,
+            freq_strength,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
         };
 
         let params_buf = ctx

@@ -489,6 +489,7 @@ impl EncoderPipeline {
                 &bufs.plane_a, &bufs.mc_out, &bufs.plane_c,
                 padded_w, padded_h,
                 config.quantization_step, config.dead_zone,
+                config.dct_freq_strength,
             );
 
             // Co plane
@@ -497,6 +498,7 @@ impl EncoderPipeline {
                 &bufs.co_plane, &bufs.ref_upload, &bufs.plane_c,
                 padded_w, padded_h,
                 config.quantization_step, config.dead_zone,
+                config.dct_freq_strength,
             );
 
             // Cg plane
@@ -505,6 +507,7 @@ impl EncoderPipeline {
                 &bufs.cg_plane, &bufs.plane_b, &bufs.plane_c,
                 padded_w, padded_h,
                 config.quantization_step, config.dead_zone,
+                config.dct_freq_strength,
             );
 
             wm_total_blocks = 0;
@@ -596,6 +599,7 @@ impl EncoderPipeline {
                 config.wavelet_levels,
                 &weights_luma,
                 wm_param,
+                0.0,
             );
             self.quantize.dispatch_adaptive(
                 ctx,
@@ -612,6 +616,7 @@ impl EncoderPipeline {
                 config.wavelet_levels,
                 &weights_luma,
                 wm_param,
+                0.0,
             );
             cmd.copy_buffer_to_buffer(&bufs.plane_a, 0, &bufs.recon_y, 0, plane_size);
         } else if use_fused_qh {
@@ -649,6 +654,7 @@ impl EncoderPipeline {
                 config.wavelet_levels,
                 &weights_luma,
                 wm_param,
+                0.0,
             );
         }
         cmd.copy_buffer_to_buffer(&bufs.plane_b, 0, &bufs.mc_out, 0, plane_size);
@@ -706,6 +712,7 @@ impl EncoderPipeline {
                 config.wavelet_levels,
                 &weights_chroma,
                 wm_param,
+                0.0,
             );
             cmd.copy_buffer_to_buffer(&bufs.raw_alpha, 0, &alpha_staging[0], 0, alpha_bytes);
         } else if use_fused_qh {
@@ -743,6 +750,7 @@ impl EncoderPipeline {
                 config.wavelet_levels,
                 &weights_chroma,
                 wm_param,
+                0.0,
             );
         }
         cmd.copy_buffer_to_buffer(&bufs.plane_b, 0, &bufs.ref_upload, 0, plane_size);
@@ -800,6 +808,7 @@ impl EncoderPipeline {
                 config.wavelet_levels,
                 &weights_chroma,
                 wm_param,
+                0.0,
             );
             cmd.copy_buffer_to_buffer(&bufs.raw_alpha, 0, &alpha_staging[1], 0, alpha_bytes);
         } else if use_fused_qh {
@@ -837,6 +846,7 @@ impl EncoderPipeline {
                 config.wavelet_levels,
                 &weights_chroma,
                 wm_param,
+                0.0,
             );
         }
 

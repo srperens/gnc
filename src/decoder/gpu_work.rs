@@ -127,6 +127,7 @@ impl DecoderPipeline {
                     0, // wavelet_levels=0 for flat data
                     &uniform_weights,
                     None, // no AQ weight map
+                    config.dct_freq_strength,
                 );
 
                 // Inverse DCT-8×8: scratch_b (dequantized coefficients) → scratch_a (spatial pixels)
@@ -175,6 +176,7 @@ impl DecoderPipeline {
                 config.wavelet_levels,
                 weights,
                 wm_param,
+                0.0, // no DCT freq weighting for wavelet path
             );
 
             if p == 0 && has_cfl {

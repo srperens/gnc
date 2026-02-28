@@ -124,6 +124,10 @@ enum Command {
         /// Use block DCT-8×8 transform instead of wavelet (fewer dispatches, faster)
         #[arg(long)]
         dct: bool,
+
+        /// DCT frequency-dependent quantization strength (default: 3.0, 0=flat)
+        #[arg(long)]
+        dct_freq_strength: Option<f32>,
     },
 
     /// Benchmark temporal (I+P frame) encoding on a sequence of frames
@@ -438,6 +442,7 @@ fn main() {
             huffman,
             cpu_encode,
             dct,
+            dct_freq_strength,
         } => {
             let (rgb_data, w, h) = load_image_rgb_f32(&input);
 
@@ -463,6 +468,9 @@ fn main() {
                 config.cfl_enabled = false;
                 config.adaptive_quantization = false;
                 config.use_fused_quantize_histogram = false;
+            }
+            if let Some(fs) = dct_freq_strength {
+                config.dct_freq_strength = fs;
             }
 
             let coder_name = match config.entropy_coder {

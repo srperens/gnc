@@ -245,6 +245,11 @@ pub struct CodecConfig {
     pub use_fused_quantize_histogram: bool,
     /// Transform type: Wavelet (default) or BlockDCT8 (fewer dispatches, faster).
     pub transform_type: TransformType,
+    /// DCT frequency-dependent quantization strength.
+    /// Controls how aggressively high-frequency DCT coefficients are quantized.
+    /// 0.0 = flat (all frequencies equal), 3.0 = typical (highest freq gets 4× coarser step).
+    /// Only used when transform_type == BlockDCT8.
+    pub dct_freq_strength: f32,
 }
 
 impl CodecConfig {
@@ -279,6 +284,7 @@ impl Default for CodecConfig {
             rate_mode: RateMode::VBR,
             use_fused_quantize_histogram: false,
             transform_type: TransformType::Wavelet,
+            dct_freq_strength: 7.0,
         }
     }
 }
@@ -455,6 +461,7 @@ pub fn quality_preset(q: u32) -> CodecConfig {
         context_adaptive: false, // CPU-only; enable explicitly when GPU implementation exists
         use_fused_quantize_histogram: true, // auto-disabled when CfL is active
         transform_type: TransformType::Wavelet, // block DCT opt-in via config override
+        dct_freq_strength: 7.0,
         ..Default::default()
     }
 }

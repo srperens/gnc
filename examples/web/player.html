@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>GNC/GNV WebGPU Player</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: system-ui, -apple-system, sans-serif;
+            background: #1a1a2e;
+            color: #e0e0e0;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 24px;
+        }
+        h1 { color: #fff; margin-bottom: 8px; font-size: 1.4em; }
+        .subtitle { color: #888; margin-bottom: 16px; font-size: 0.9em; }
+
+        .drop-zone {
+            border: 2px dashed #444;
+            border-radius: 8px;
+            padding: 32px;
+            text-align: center;
+            cursor: pointer;
+            transition: border-color 0.2s, background 0.2s;
+            margin-bottom: 16px;
+            width: 100%;
+            max-width: 720px;
+        }
+        .drop-zone:hover, .drop-zone.dragover {
+            border-color: #6c63ff;
+            background: rgba(108, 99, 255, 0.08);
+        }
+        .drop-zone input { display: none; }
+
+        .canvas-wrap {
+            background: #111;
+            border-radius: 8px;
+            overflow: hidden;
+            margin-bottom: 12px;
+            line-height: 0;
+        }
+        canvas {
+            max-width: 100%;
+            height: auto;
+            image-rendering: pixelated;
+        }
+
+        .controls {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            width: 100%;
+            max-width: 720px;
+            margin-bottom: 8px;
+        }
+        button {
+            background: #6c63ff;
+            color: #fff;
+            border: none;
+            border-radius: 6px;
+            padding: 8px 18px;
+            font-size: 0.95em;
+            cursor: pointer;
+            white-space: nowrap;
+        }
+        button:hover { background: #5a52d5; }
+        button:disabled { background: #444; cursor: default; }
+        input[type="range"] {
+            flex: 1;
+            accent-color: #6c63ff;
+        }
+        .frame-label {
+            font-variant-numeric: tabular-nums;
+            font-size: 0.85em;
+            min-width: 80px;
+            text-align: right;
+        }
+
+        .stats {
+            font-size: 0.82em;
+            color: #888;
+            width: 100%;
+            max-width: 720px;
+            display: flex;
+            gap: 16px;
+            flex-wrap: wrap;
+        }
+        .stats span { white-space: nowrap; }
+
+        #status {
+            margin-bottom: 12px;
+            padding: 8px 16px;
+            border-radius: 6px;
+            font-size: 0.9em;
+            width: 100%;
+            max-width: 720px;
+            text-align: center;
+        }
+        .status-info { background: #1e3a5f; color: #7cb3d8; }
+        .status-error { background: #5f1e1e; color: #d87c7c; }
+        .status-ok { background: #1e5f2e; color: #7cd88b; }
+    </style>
+</head>
+<body>
+    <h1>GNC/GNV WebGPU Player</h1>
+    <p class="subtitle">Drag & drop or select a <code>.gnc</code> (image) or <code>.gnv</code> (video) file</p>
+
+    <div class="drop-zone" id="dropZone">
+        <input type="file" id="fileInput" accept=".gnc,.gnv">
+        <p>Click or drop file here</p>
+    </div>
+
+    <div id="status" class="status-info">Ready</div>
+
+    <div class="canvas-wrap" id="canvasWrap" style="display:none">
+        <canvas id="canvas"></canvas>
+    </div>
+
+    <div class="controls" id="controlsBar" style="display:none">
+        <button id="playBtn" disabled>Play</button>
+        <input type="range" id="seekBar" min="0" max="0" value="0" step="1">
+        <span class="frame-label" id="frameLabel">0 / 0</span>
+    </div>
+
+    <div class="stats" id="statsBar" style="display:none">
+        <span id="statRes"></span>
+        <span id="statFps"></span>
+        <span id="statDecode"></span>
+        <span id="statPlayFps"></span>
+    </div>
+
+    <script type="module">
+        import init, { GnvPlayer } from '../../pkg/gnc.js';
+
+        const $ = id => document.getElementById(id);
+        const dropZone = $('dropZone');
+        const fileInput = $('fileInput');
+        const status = $('status');
+        const canvas = $('canvas');
+        const ctx2d = canvas.getContext('2d');
+        const playBtn = $('playBtn');
+        const seekBar = $('seekBar');
+        const frameLabel = $('frameLabel');
+        const canvasWrap = $('canvasWrap');
+        const controlsBar = $('controlsBar');
+        const statsBar = $('statsBar');
+
+        let player = null;
+        let playing = false;
+        let animId = null;
+        let lastFrameTime = 0;
+        let framesSinceLastStat = 0;
+        let statAccumMs = 0;
+
+        // --- Status helpers ---
+        function setStatus(msg, type = 'info') {
+            status.textContent = msg;
+            status.className = `status-${type}`;
+        }
+
+        // --- Drop zone ---
+        dropZone.addEventListener('click', () => fileInput.click());
+        dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('dragover'); });
+        dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
+        dropZone.addEventListener('drop', e => {
+            e.preventDefault();
+            dropZone.classList.remove('dragover');
+            if (e.dataTransfer.files.length) loadFile(e.dataTransfer.files[0]);
+        });
+        fileInput.addEventListener('change', () => { if (fileInput.files[0]) loadFile(fileInput.files[0]); });
+
+        // --- Init WASM ---
+        async function boot() {
+            try {
+                setStatus('Initializing WebGPU + WASM...');
+                await init();
+                setStatus('Ready', 'ok');
+            } catch (e) {
+                setStatus('Init failed: ' + e.message, 'error');
+                console.error(e);
+            }
+        }
+
+        // --- Load file ---
+        async function loadFile(file) {
+            stop();
+            try {
+                setStatus('Loading ' + file.name + '...');
+                const buf = new Uint8Array(await file.arrayBuffer());
+                setStatus('Creating player...');
+                player = await new GnvPlayer(buf);
+
+                const w = player.width;
+                const h = player.height;
+                const fc = player.frame_count;
+                const fps = player.fps;
+
+                canvas.width = w;
+                canvas.height = h;
+                canvasWrap.style.display = '';
+                controlsBar.style.display = 'flex';
+                statsBar.style.display = 'flex';
+
+                seekBar.max = Math.max(0, fc - 1);
+                seekBar.value = 0;
+                updateFrameLabel(0);
+
+                $('statRes').textContent = `${w}x${h}`;
+                $('statFps').textContent = `${fps.toFixed(1)} fps`;
+                $('statDecode').textContent = '';
+                $('statPlayFps').textContent = '';
+
+                playBtn.disabled = false;
+                playBtn.textContent = fc > 1 ? 'Play' : 'Decode';
+
+                // Decode first frame
+                setStatus('Decoding frame 0...');
+                const t0 = performance.now();
+                const rgba = await player.decode_next_frame();
+                const dt = performance.now() - t0;
+                paintFrame(rgba, w, h);
+                seekBar.value = 0;
+                updateFrameLabel(0);
+                $('statDecode').textContent = `Decode: ${dt.toFixed(1)} ms`;
+                setStatus(`${file.name} loaded (${fc} frame${fc > 1 ? 's' : ''})`, 'ok');
+
+                // Reset to frame 0 so Play starts from the beginning
+                player.reset();
+            } catch (e) {
+                setStatus('Error: ' + e.message || e, 'error');
+                console.error(e);
+            }
+        }
+
+        // --- Paint ---
+        function paintFrame(rgba, w, h) {
+            const clamped = new Uint8ClampedArray(rgba.buffer, rgba.byteOffset, rgba.byteLength);
+            const img = new ImageData(clamped, w, h);
+            ctx2d.putImageData(img, 0, 0);
+        }
+
+        // --- Playback ---
+        function updateFrameLabel(idx) {
+            frameLabel.textContent = `${idx} / ${player ? player.frame_count - 1 : 0}`;
+        }
+
+        async function playLoop(timestamp) {
+            if (!playing || !player) return;
+
+            const fc = player.frame_count;
+            const targetFps = player.fps;
+            const frameDuration = 1000 / targetFps;
+
+            // Time-based: decode as many frames as needed to stay on schedule
+            if (timestamp - lastFrameTime >= frameDuration) {
+                const t0 = performance.now();
+                const rgba = await player.decode_next_frame();
+                const dt = performance.now() - t0;
+
+                const w = player.width;
+                const h = player.height;
+                paintFrame(rgba, w, h);
+
+                const curFrame = (player.current_frame + fc - 1) % fc;
+                seekBar.value = curFrame;
+                updateFrameLabel(curFrame);
+
+                framesSinceLastStat++;
+                statAccumMs += dt;
+                if (framesSinceLastStat >= 10) {
+                    const avg = statAccumMs / framesSinceLastStat;
+                    $('statDecode').textContent = `Decode: ${avg.toFixed(1)} ms`;
+                    const wallElapsed = timestamp - lastFrameTime + frameDuration * (framesSinceLastStat - 1);
+                    $('statPlayFps').textContent = `Play: ${(framesSinceLastStat / wallElapsed * 1000).toFixed(1)} fps`;
+                    framesSinceLastStat = 0;
+                    statAccumMs = 0;
+                }
+
+                lastFrameTime = timestamp;
+
+                // Loop at end
+                if (player.current_frame >= fc) {
+                    player.reset();
+                }
+            }
+
+            animId = requestAnimationFrame(playLoop);
+        }
+
+        function play() {
+            if (!player) return;
+            playing = true;
+            playBtn.textContent = 'Pause';
+            lastFrameTime = 0;
+            framesSinceLastStat = 0;
+            statAccumMs = 0;
+            animId = requestAnimationFrame(playLoop);
+        }
+
+        function pause() {
+            playing = false;
+            playBtn.textContent = 'Play';
+            if (animId) { cancelAnimationFrame(animId); animId = null; }
+        }
+
+        function stop() {
+            pause();
+            if (player) { player.reset(); }
+        }
+
+        playBtn.addEventListener('click', () => {
+            if (!player) return;
+            if (player.frame_count === 1) {
+                // Single-frame: just re-decode
+                player.reset();
+                player.decode_next_frame().then(rgba => {
+                    paintFrame(rgba, player.width, player.height);
+                });
+                return;
+            }
+            if (playing) pause(); else play();
+        });
+
+        // --- Seek ---
+        seekBar.addEventListener('input', async () => {
+            if (!player || player.frame_count <= 1) return;
+            pause();
+            const target = parseInt(seekBar.value, 10);
+            setStatus(`Seeking to frame ${target}...`);
+            const t0 = performance.now();
+            const rgba = await player.seek(target);
+            const dt = performance.now() - t0;
+            paintFrame(rgba, player.width, player.height);
+            updateFrameLabel(target);
+            $('statDecode').textContent = `Seek+decode: ${dt.toFixed(1)} ms`;
+            setStatus(`Frame ${target}`, 'ok');
+        });
+
+        boot();
+    </script>
+</body>
+</html>

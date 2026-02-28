@@ -740,6 +740,113 @@ impl DecoderPipeline {
     }
 }
 
+// ---- WASM-compatible async decode (avoids Instant, mpsc, Maintain::Wait) ----
+#[cfg(target_arch = "wasm32")]
+impl DecoderPipeline {
+    /// Decode a compressed frame to RGBA u8 data asynchronously.
+    /// WASM-compatible: uses async map_async + JS microtask yield instead of
+    /// blocking poll(Wait) or std::sync::mpsc.
+    /// Returns Vec<u8> of length width * height * 4 (RGBA).
+    pub async fn decode_rgba_wasm(&self, ctx: &GpuContext, frame: &CompressedFrame) -> Vec<u8> {
+        let info = &frame.info;
+        let w = info.width;
+        let h = info.height;
+        let total_rgb = (w * h * 3) as usize;
+        let packed_u32s = (w * h * 3).div_ceil(4);
+        let packed_byte_size = (packed_u32s as u64) * 4;
+
+        self.ensure_cached(
+            ctx,
+            info.padded_width(),
+            info.padded_height(),
+            w,
+            h,
+            info.tile_size,
+        );
+
+        self.prepare_frame_data(ctx, frame);
+
+        let cached = self.cached.borrow();
+        let bufs = cached.as_ref().unwrap();
+
+        let mut cmd = self.encode_gpu_work(ctx, frame, bufs);
+
+        // GPU pack: f32 → packed u8
+        {
+            let pack_bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("pack_bg"),
+                layout: &self.pack_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: bufs.pack_params_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: bufs.cropped_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: bufs.packed_u8_buf.as_entire_binding(),
+                    },
+                ],
+            });
+
+            let workgroups = packed_u32s.div_ceil(256);
+            let mut pass = cmd.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("pack_pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pack_pipeline);
+            pass.set_bind_group(0, &pack_bg, &[]);
+            pass.dispatch_workgroups(workgroups, 1, 1);
+        }
+
+        // Copy packed u8 to staging
+        cmd.copy_buffer_to_buffer(
+            &bufs.packed_u8_buf,
+            0,
+            &bufs.staging_u8,
+            0,
+            packed_byte_size,
+        );
+
+        ctx.queue.submit(Some(cmd.finish()));
+
+        // WASM-compatible async readback: map_async + yield to browser event loop
+        let slice = bufs.staging_u8.slice(..);
+        let (sender, receiver) = futures_channel::oneshot::channel();
+        let mut sender = Some(sender);
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            if let Some(tx) = sender.take() {
+                let _ = tx.send(result);
+            }
+        });
+        ctx.device.poll(wgpu::Maintain::Poll);
+        // Yield to browser so the GPU can finish work, then get the result
+        receiver.await.unwrap().unwrap();
+
+        let data = slice.get_mapped_range();
+        let bytes: &[u8] = &data;
+        let rgb = &bytes[..total_rgb];
+
+        // Convert RGB → RGBA (add alpha = 255)
+        let pixel_count = (w * h) as usize;
+        let mut rgba = Vec::with_capacity(pixel_count * 4);
+        for i in 0..pixel_count {
+            rgba.push(rgb[i * 3]);
+            rgba.push(rgb[i * 3 + 1]);
+            rgba.push(rgb[i * 3 + 2]);
+            rgba.push(255);
+        }
+        drop(data);
+        bufs.staging_u8.unmap();
+        drop(cached);
+
+        rgba
+    }
+}
+
 #[cfg(test)]
 #[path = "pipeline_tests.rs"]
 mod tests;

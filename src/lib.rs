@@ -641,21 +641,7 @@ pub mod wasm {
         let ctx = crate::GpuContext::new_async().await;
         let decoder = crate::decoder::pipeline::DecoderPipeline::new(&ctx);
         let frame = crate::format::deserialize_compressed(data);
-        let rgb = decoder.decode(&ctx, &frame);
-        let w = frame.info.width as usize;
-        let h = frame.info.height as usize;
-
-        // Convert RGB f32 to RGBA u8 for canvas ImageData
-        let mut rgba = Vec::with_capacity(w * h * 4);
-        for i in 0..w * h {
-            let r = (rgb[i * 3].clamp(0.0, 255.0)) as u8;
-            let g = (rgb[i * 3 + 1].clamp(0.0, 255.0)) as u8;
-            let b = (rgb[i * 3 + 2].clamp(0.0, 255.0)) as u8;
-            rgba.push(r);
-            rgba.push(g);
-            rgba.push(b);
-            rgba.push(255); // alpha
-        }
+        let rgba = decoder.decode_rgba_wasm(&ctx, &frame).await;
         Ok(rgba)
     }
 
@@ -671,5 +657,154 @@ pub mod wasm {
     pub fn gnc_height(data: &[u8]) -> u32 {
         let frame = crate::format::deserialize_compressed(data);
         frame.info.height
+    }
+
+    // ---- Stateful GNV/GNC Player ----
+
+    /// Stateful player for .gnc (single frame) and .gnv (GNV1 video sequence) files.
+    /// Holds GPU context and decoder across frames for zero-reinit playback.
+    #[wasm_bindgen]
+    pub struct GnvPlayer {
+        ctx: crate::GpuContext,
+        decoder: crate::decoder::pipeline::DecoderPipeline,
+        data: Vec<u8>,
+        header: Option<crate::format::SequenceHeader>,
+        width: u32,
+        height: u32,
+        frame_count: u32,
+        fps: f64,
+        current_frame: usize,
+    }
+
+    #[wasm_bindgen]
+    impl GnvPlayer {
+        /// Create a new player from raw file data (.gnc or .gnv).
+        /// Auto-detects format by checking for GNV1 magic bytes.
+        #[wasm_bindgen(constructor)]
+        pub async fn new(data: Vec<u8>) -> Result<GnvPlayer, JsValue> {
+            let ctx = crate::GpuContext::new_async().await;
+            let decoder = crate::decoder::pipeline::DecoderPipeline::new(&ctx);
+
+            let is_gnv = data.len() >= 4 && &data[0..4] == b"GNV1";
+
+            if is_gnv {
+                let header = crate::format::deserialize_sequence_header(&data);
+                let width = header.width;
+                let height = header.height;
+                let frame_count = header.frame_count;
+                let fps = header.fps();
+                Ok(GnvPlayer {
+                    ctx,
+                    decoder,
+                    data,
+                    header: Some(header),
+                    width,
+                    height,
+                    frame_count,
+                    fps,
+                    current_frame: 0,
+                })
+            } else {
+                // Single-frame .gnc
+                let frame = crate::format::deserialize_compressed(&data);
+                let width = frame.info.width;
+                let height = frame.info.height;
+                Ok(GnvPlayer {
+                    ctx,
+                    decoder,
+                    data,
+                    header: None,
+                    width,
+                    height,
+                    frame_count: 1,
+                    fps: 1.0,
+                    current_frame: 0,
+                })
+            }
+        }
+
+        /// Image/video width in pixels.
+        #[wasm_bindgen(getter)]
+        pub fn width(&self) -> u32 {
+            self.width
+        }
+
+        /// Image/video height in pixels.
+        #[wasm_bindgen(getter)]
+        pub fn height(&self) -> u32 {
+            self.height
+        }
+
+        /// Total number of frames (1 for single .gnc).
+        #[wasm_bindgen(getter)]
+        pub fn frame_count(&self) -> u32 {
+            self.frame_count
+        }
+
+        /// Frames per second (from GNV1 header, or 1.0 for single .gnc).
+        #[wasm_bindgen(getter)]
+        pub fn fps(&self) -> f64 {
+            self.fps
+        }
+
+        /// Current frame index (0-based).
+        #[wasm_bindgen(getter)]
+        pub fn current_frame(&self) -> u32 {
+            self.current_frame as u32
+        }
+
+        /// Decode the next frame and return RGBA u8 data.
+        /// Advances the frame counter. Wraps to frame 0 at end.
+        pub async fn decode_next_frame(&mut self) -> Result<Vec<u8>, JsValue> {
+            if self.current_frame >= self.frame_count as usize {
+                self.current_frame = 0;
+            }
+
+            let frame = if let Some(ref header) = self.header {
+                crate::format::deserialize_sequence_frame(&self.data, header, self.current_frame)
+            } else {
+                crate::format::deserialize_compressed(&self.data)
+            };
+
+            let rgba = self.decoder.decode_rgba_wasm(&self.ctx, &frame).await;
+            self.current_frame += 1;
+            Ok(rgba)
+        }
+
+        /// Seek to a specific frame number. For GNV1, seeks to the nearest
+        /// preceding keyframe and decodes forward to the target frame.
+        pub async fn seek(&mut self, target_frame: u32) -> Result<Vec<u8>, JsValue> {
+            if self.header.is_none() {
+                // Single frame — just decode it
+                self.current_frame = 0;
+                return self.decode_next_frame().await;
+            }
+
+            let header = self.header.as_ref().unwrap();
+            let target = (target_frame as usize).min(header.frame_count as usize - 1);
+
+            // Find nearest preceding keyframe
+            let keyframe_idx = crate::format::seek_to_keyframe(header, target as u64);
+
+            // Decode from keyframe up to target (P-frames need reference chain)
+            for i in keyframe_idx..=target {
+                let frame =
+                    crate::format::deserialize_sequence_frame(&self.data, header, i);
+                let rgba = self.decoder.decode_rgba_wasm(&self.ctx, &frame).await;
+                if i == target {
+                    self.current_frame = target + 1;
+                    return Ok(rgba);
+                }
+            }
+
+            // Fallback (shouldn't reach here)
+            self.current_frame = target + 1;
+            Err(JsValue::from_str("Seek failed"))
+        }
+
+        /// Reset playback to frame 0.
+        pub fn reset(&mut self) {
+            self.current_frame = 0;
+        }
     }
 }

@@ -84,7 +84,7 @@ fn drop_bits(n: u32) {
 }
 
 // Read n bits: ensure + peek + drop.
-fn read(n: u32) -> u32 {
+fn read_bits(n: u32) -> u32 {
     ensure_bits(n);
     let v = peek(n);
     drop_bits(n);
@@ -112,7 +112,7 @@ fn read_unary() -> u32 {
 // Read Golomb-Rice coded value: unary quotient + k-bit remainder.
 fn read_rice(k: u32) -> u32 {
     let quotient = read_unary();
-    let remainder = select(0u, read(k), k > 0u);
+    let remainder = select(0u, read_bits(k), k > 0u);
     return (quotient << k) | remainder;
 }
 
@@ -133,7 +133,7 @@ fn read_exp_golomb() -> u32 {
     if (leading_zeros == 0u) {
         return 0u;
     }
-    let rest = read(leading_zeros);
+    let rest = read_bits(leading_zeros);
     return (1u << leading_zeros) - 1u + rest;
 }
 
@@ -174,7 +174,7 @@ fn main(
     // Decode loop
     var s = 0u;
     while (s < symbols_per_stream) {
-        let token = read(1u);
+        let token = read_bits(1u);
         if (token == 0u) {
             // Zero run
             let zi = thread_id + s * STREAMS_PER_TILE;
@@ -198,7 +198,7 @@ fn main(
             let plane_idx = (tile_origin_y + tile_row) * params.plane_width
                           + (tile_origin_x + tile_col);
 
-            let sign = read(1u);
+            let sign = read_bits(1u);
             let g = compute_subband_group(tile_col, tile_row);
 
             // Fast Huffman decode via 8-bit prefix table

@@ -16,7 +16,7 @@ const STREAMS_PER_TILE: u32 = 256u;
 const MAX_STREAM_BYTES: u32 = 4096u;
 const MAX_STREAM_WORDS: u32 = 1024u;  // MAX_STREAM_BYTES / 4
 const MAX_GROUPS: u32 = 8u;
-const K_STRIDE: u32 = 16u;  // MAX_GROUPS * 2: stride per tile in k_output (mag k + zrl k per group)
+const K_STRIDE: u32 = 17u;  // MAX_GROUPS * 2 + 1: stride per tile in k_output (mag k + zrl k per group + skip bitmap)
 
 struct Params {
     num_tiles: u32,
@@ -43,6 +43,8 @@ var<workgroup> shared_k: array<u32, 8>;
 var<workgroup> zrl_sum: array<atomic<u32>, 8>;
 var<workgroup> zrl_count: array<atomic<u32>, 8>;
 var<workgroup> shared_k_zrl: array<u32, 8>;
+// Subband skip bitmap: bit g = 1 means all coefficients in group g are zero
+var<workgroup> shared_skip_bitmap: u32;
 
 // Per-thread local accumulators for Phase 1 (reduces atomic contention 32×)
 var<private> p_local_sum: array<u32, 8>;
@@ -252,11 +254,26 @@ fn main(
     }
     workgroupBarrier();
 
-    // Write k values (mag + zrl) to output (stride K_STRIDE = MAX_GROUPS * 2)
+    // Compute subband skip bitmap: bit g = 1 → all coefficients in group g are zero
+    if (thread_id == 0u) {
+        var bitmap = 0u;
+        for (var g = 0u; g < num_groups; g++) {
+            if (atomicLoad(&group_count[g]) == 0u) {
+                bitmap |= (1u << g);
+            }
+        }
+        shared_skip_bitmap = bitmap;
+    }
+
+    // Write k values (mag + zrl + skip bitmap) to output (stride K_STRIDE = MAX_GROUPS * 2 + 1)
     if (thread_id < num_groups) {
         k_output[tile_id * K_STRIDE + thread_id] = shared_k[thread_id];
         k_output[tile_id * K_STRIDE + MAX_GROUPS + thread_id] = shared_k_zrl[thread_id];
     }
+    if (thread_id == 0u) {
+        k_output[tile_id * K_STRIDE + K_STRIDE - 1u] = shared_skip_bitmap;
+    }
+    workgroupBarrier();
 
     // === Phase 2: Encode stream with per-subband ZRL ===
 
@@ -279,22 +296,35 @@ fn main(
         let coeff_idx = thread_id + s * STREAMS_PER_TILE;
         let tile_row = coeff_idx / params.tile_size;
         let tile_col = coeff_idx % params.tile_size;
+
+        // Skip bitmap: if this position's group is fully zero, advance without encoding
+        let skip_g = compute_subband_group(tile_col, tile_row);
+        if ((shared_skip_bitmap >> skip_g) & 1u) == 1u {
+            s += 1u;
+            continue;
+        }
+
         let plane_idx = (tile_origin_y + tile_row) * params.plane_width
                       + (tile_origin_x + tile_col);
         let coeff = i32(round(input[plane_idx]));
 
         if (coeff == 0) {
-            let g_zrl = compute_subband_group(tile_col, tile_row);
+            let g_zrl = skip_g;
             let k_zrl = shared_k_zrl[g_zrl];
 
-            // Count zero run
-            let max_run = 32u << k_zrl;
+            // Count zero run (only count non-skipped positions)
             var run = 1u;
             var ns = s + 1u;
-            while (ns < symbols_per_stream && run < max_run) {
+            while (ns < symbols_per_stream) {
                 let ni = thread_id + ns * STREAMS_PER_TILE;
                 let nr = ni / params.tile_size;
                 let nc = ni % params.tile_size;
+                // Skip past bitmap-skipped positions
+                let ns_g = compute_subband_group(nc, nr);
+                if ((shared_skip_bitmap >> ns_g) & 1u) == 1u {
+                    ns += 1u;
+                    continue;
+                }
                 let np = (tile_origin_y + nr) * params.plane_width + (tile_origin_x + nc);
                 if (i32(round(input[np])) != 0) {
                     break;
@@ -330,11 +360,11 @@ fn main(
                 }
             }
 
-            s += run;
+            s = ns;
         } else {
             let sign_bit = select(0u, 1u, coeff < 0);
             let magnitude = u32(abs(coeff)) - 1u;
-            let g = compute_subband_group(tile_col, tile_row);
+            let g = skip_g;
 
             // Derive adaptive k from EMA (context-adaptive Rice parameter)
             let ema_mean = p_ema[g] >> 4u;

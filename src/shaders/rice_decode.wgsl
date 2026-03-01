@@ -9,7 +9,7 @@
 
 const STREAMS_PER_TILE: u32 = 256u;
 const MAX_GROUPS: u32 = 8u;
-const K_STRIDE: u32 = 16u;  // MAX_GROUPS * 2: stride per tile in k_values (mag k + zrl k per group)
+const K_STRIDE: u32 = 17u;  // MAX_GROUPS * 2 + 1: stride per tile in k_values (mag k + zrl k per group + skip bitmap)
 
 struct Params {
     num_tiles: u32,
@@ -31,6 +31,8 @@ struct Params {
 // Shared k values for this tile (magnitude k per group + zrl k per group)
 var<workgroup> shared_k: array<u32, 8>;
 var<workgroup> shared_k_zrl: array<u32, 8>;
+// Subband skip bitmap: bit g = 1 means all coefficients in group g are zero
+var<workgroup> shared_skip_bitmap: u32;
 
 // Per-thread bit-reader state
 var<private> p_current_byte: u32;
@@ -131,10 +133,13 @@ fn main(
     let symbols_per_stream = params.coefficients_per_tile / STREAMS_PER_TILE;
     let num_groups = max(1u, params.num_levels * 2u);
 
-    // Cooperatively load k values + per-subband k_zrl into shared memory (stride K_STRIDE)
+    // Cooperatively load k values + per-subband k_zrl + skip bitmap into shared memory (stride K_STRIDE)
     if (thread_id < num_groups) {
         shared_k[thread_id] = k_values[tile_id * K_STRIDE + thread_id];
         shared_k_zrl[thread_id] = k_values[tile_id * K_STRIDE + MAX_GROUPS + thread_id];
+    }
+    if (thread_id == 0u) {
+        shared_skip_bitmap = k_values[tile_id * K_STRIDE + K_STRIDE - 1u];
     }
     workgroupBarrier();
 
@@ -152,32 +157,54 @@ fn main(
     // Decode tokens with ZRL
     var s = 0u;
     while (s < symbols_per_stream) {
+        let ci0 = thread_id + s * STREAMS_PER_TILE;
+        let cr0 = ci0 / params.tile_size;
+        let cc0 = ci0 % params.tile_size;
+
+        // Skip bitmap: if this position's group is fully zero, write 0 and advance
+        let skip_g = compute_subband_group(cc0, cr0);
+        if ((shared_skip_bitmap >> skip_g) & 1u) == 1u {
+            let pi0 = (tile_origin_y + cr0) * params.plane_width + (tile_origin_x + cc0);
+            output[pi0] = 0.0;
+            s += 1u;
+            continue;
+        }
+
         let token = read_bit();
         if (token == 0u) {
             // Zero run: use subband of first zero for k_zrl
-            let zi = thread_id + s * STREAMS_PER_TILE;
-            let zr = zi / params.tile_size;
-            let zc = zi % params.tile_size;
-            let g_zrl = compute_subband_group(zc, zr);
+            let g_zrl = skip_g;
             let run = read_rice(shared_k_zrl[g_zrl]) + 1u;
-            for (var j = 0u; j < run; j++) {
-                let ci = thread_id + (s + j) * STREAMS_PER_TILE;
+            // Write zeros, skipping past bitmap-skipped positions
+            var written = 0u;
+            var ws = s;
+            while (written < run && ws < symbols_per_stream) {
+                let ci = thread_id + ws * STREAMS_PER_TILE;
                 let cr = ci / params.tile_size;
                 let cc = ci % params.tile_size;
                 let pi = (tile_origin_y + cr) * params.plane_width + (tile_origin_x + cc);
+                let ws_g = compute_subband_group(cc, cr);
+                if ((shared_skip_bitmap >> ws_g) & 1u) == 1u {
+                    // Bitmap-skipped position: write zero but don't count toward run
+                    output[pi] = 0.0;
+                    ws += 1u;
+                    continue;
+                }
                 output[pi] = 0.0;
+                written += 1u;
+                ws += 1u;
             }
-            s += run;
+            s = ws;
         } else {
             // Non-zero coefficient
-            let coeff_idx = thread_id + s * STREAMS_PER_TILE;
-            let tile_row = coeff_idx / params.tile_size;
-            let tile_col = coeff_idx % params.tile_size;
+            let coeff_idx = ci0;
+            let tile_row = cr0;
+            let tile_col = cc0;
             let plane_idx = (tile_origin_y + tile_row) * params.plane_width
                           + (tile_origin_x + tile_col);
 
             let sign = read_bit();
-            let g = compute_subband_group(tile_col, tile_row);
+            let g = skip_g;
 
             // Derive adaptive k from EMA (context-adaptive Rice parameter)
             let ema_mean = p_ema[g] >> 4u;

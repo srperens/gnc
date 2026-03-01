@@ -17,7 +17,7 @@ use crate::{FrameInfo, GpuContext};
 // Must match shaders/rice_encode.wgsl. Keep in sync with CPU RICE_MAX_STREAM_BYTES for safety.
 const MAX_STREAM_BYTES: usize = 4096;
 const MAX_GROUPS: usize = 8;
-const K_STRIDE: usize = MAX_GROUPS * 2; // stride per tile in k_output (mag k + zrl k per group)
+const K_STRIDE: usize = MAX_GROUPS * 2 + 1; // stride per tile in k_output (mag k + zrl k per group + skip bitmap)
 
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
@@ -369,6 +369,7 @@ impl GpuRiceEncoder {
                 let k_zrl_values: Vec<u8> = (0..num_groups)
                     .map(|g| k_data[tile_idx * K_STRIDE + MAX_GROUPS + g] as u8)
                     .collect();
+                let skip_bitmap = k_data[tile_idx * K_STRIDE + K_STRIDE - 1] as u8;
 
                 let stream_lengths: Vec<u32> = (0..RICE_STREAMS_PER_TILE)
                     .map(|s| lengths_data[tile_idx * RICE_STREAMS_PER_TILE + s])
@@ -392,6 +393,7 @@ impl GpuRiceEncoder {
                     num_groups: num_groups as u32,
                     k_values,
                     k_zrl_values,
+                    skip_bitmap,
                     stream_lengths,
                     stream_data: packed_data,
                 });
@@ -555,6 +557,7 @@ impl GpuRiceEncoder {
                 let k_zrl_values: Vec<u8> = (0..num_groups)
                     .map(|g| k_data[tile_idx * K_STRIDE + MAX_GROUPS + g] as u8)
                     .collect();
+                let skip_bitmap = k_data[tile_idx * K_STRIDE + K_STRIDE - 1] as u8;
 
                 let stream_lengths: Vec<u32> = (0..RICE_STREAMS_PER_TILE)
                     .map(|s| lengths_data[tile_idx * RICE_STREAMS_PER_TILE + s])
@@ -577,6 +580,7 @@ impl GpuRiceEncoder {
                     num_groups: num_groups as u32,
                     k_values,
                     k_zrl_values,
+                    skip_bitmap,
                     stream_lengths,
                     stream_data: packed_data,
                 });
@@ -727,6 +731,7 @@ impl GpuRiceDecoder {
             for (g, &k) in tile.k_zrl_values.iter().enumerate() {
                 k_values[t * K_STRIDE + MAX_GROUPS + g] = k as u32;
             }
+            k_values[t * K_STRIDE + K_STRIDE - 1] = tile.skip_bitmap as u32;
         }
 
         // Compute total stream data size and stream offsets
@@ -739,14 +744,17 @@ impl GpuRiceDecoder {
             }
         }
 
-        // Pack stream data (pad to u32 alignment)
-        let padded_bytes = ((total_bytes as usize + 3) / 4) * 4;
-        let mut stream_data = vec![0u8; padded_bytes];
-        let mut write_pos = 0usize;
-        for tile in tiles {
-            stream_data[write_pos..write_pos + tile.stream_data.len()]
-                .copy_from_slice(&tile.stream_data);
-            write_pos += tile.stream_data.len();
+        // Pack stream data (allocate as u32 for alignment, then copy bytes in)
+        let padded_words = (total_bytes as usize + 3) / 4;
+        let mut stream_data_u32 = vec![0u32; padded_words];
+        {
+            let stream_data_bytes: &mut [u8] = bytemuck::cast_slice_mut(&mut stream_data_u32);
+            let mut write_pos = 0usize;
+            for tile in tiles {
+                stream_data_bytes[write_pos..write_pos + tile.stream_data.len()]
+                    .copy_from_slice(&tile.stream_data);
+                write_pos += tile.stream_data.len();
+            }
         }
 
         RiceDecodeData {
@@ -761,7 +769,7 @@ impl GpuRiceDecoder {
                 _pad1: 0,
             },
             k_values,
-            stream_data: bytemuck::cast_slice(&stream_data).to_vec(),
+            stream_data: stream_data_u32,
             stream_offsets,
         }
     }

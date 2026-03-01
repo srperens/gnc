@@ -6,43 +6,43 @@ file = "gradient_q25.gnc"
 width = 512
 height = 512
 quality = 25
-bytes = 25170
-psnr = 49.54
-hash = "0x4dbce3e0bf2740ba"
+bytes = 19141
+psnr = 49.51
+hash = "0x13c489f453e24776"
 
 [gradient_q75]
 file = "gradient_q75.gnc"
 width = 512
 height = 512
 quality = 75
-bytes = 17357
-psnr = 56.48
-hash = "0xf62a9287afb68d56"
+bytes = 11487
+psnr = 56.46
+hash = "0xece07c711e6b4137"
 
 [checkerboard_q50]
 file = "checkerboard_q50.gnc"
 width = 512
 height = 512
 quality = 50
-bytes = 76611
+bytes = 70325
 psnr = 36.48
-hash = "0x4c3fc603cfb6796f"
+hash = "0x43036671683c2c51"
 
 [checkerboard_q90]
 file = "checkerboard_q90.gnc"
 width = 512
 height = 512
 quality = 90
-bytes = 262339
-psnr = 50.76
-hash = "0x12c274ebeb36be03"
+bytes = 253432
+psnr = 50.82
+hash = "0x41747d7354f76125"
 
 [lossless_q100]
 file = "lossless_q100.gnc"
 width = 512
 height = 512
 quality = 100
-bytes = 106164
+bytes = 106166
 psnr = inf
 hash = "0xc05b5afed4e759c9"
 

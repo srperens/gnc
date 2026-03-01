@@ -28,6 +28,8 @@ pub struct RiceTile {
     pub k_values: Vec<u8>,
     /// Per-subband Rice parameter k for zero-run lengths (0..15).
     pub k_zrl_values: Vec<u8>,
+    /// Skip bitmap: bit g = 1 means all coefficients in group g are zero.
+    pub skip_bitmap: u8,
     /// Bytes used by each of the 256 streams.
     pub stream_lengths: Vec<u32>,
     /// Concatenated stream data (all 256 streams).
@@ -36,8 +38,8 @@ pub struct RiceTile {
 
 impl RiceTile {
     pub fn byte_size(&self) -> usize {
-        // Header: num_coefficients + tile_size + num_levels + num_groups + k_values + k_zrl_values + stream_lengths
-        4 + 4 + 4 + 4 + self.k_values.len() + self.k_zrl_values.len() + self.stream_lengths.len() * 2 + self.stream_data.len()
+        // Header: num_coefficients + tile_size + num_levels + num_groups + k_values + k_zrl_values + skip_bitmap + stream_lengths
+        4 + 4 + 4 + 4 + self.k_values.len() + self.k_zrl_values.len() + 1 + self.stream_lengths.len() * 2 + self.stream_data.len()
     }
 }
 
@@ -221,6 +223,14 @@ pub fn rice_encode_tile(coefficients: &[i32], tile_size: u32, num_levels: u32) -
     }
     let k_zrl_values: Vec<u8> = group_run_lengths.iter().map(|v| optimal_k(v)).collect();
 
+    // Compute skip bitmap: bit g = 1 means all coefficients in group g are zero
+    let mut skip_bitmap: u8 = 0;
+    for g in 0..num_groups {
+        if group_abs_values[g].is_empty() {
+            skip_bitmap |= 1 << g;
+        }
+    }
+
     // Phase 2: Encode 256 interleaved streams with ZRL
     let mut all_stream_data = Vec::new();
     let mut stream_lengths = Vec::with_capacity(RICE_STREAMS_PER_TILE);
@@ -237,35 +247,46 @@ pub fn rice_encode_tile(coefficients: &[i32], tile_size: u32, num_levels: u32) -
 
         while s < symbols_per_stream {
             let coeff_idx = stream_id + s * RICE_STREAMS_PER_TILE;
+            let y = (coeff_idx / tile_size as usize) as u32;
+            let x = (coeff_idx % tile_size as usize) as u32;
+            let g = compute_subband_group(x, y, tile_size, num_levels);
+
+            // Skip bitmap: if this position's group is fully zero, advance without encoding
+            if (skip_bitmap >> g) & 1 == 1 {
+                s += 1;
+                continue;
+            }
+
             let coeff = coefficients[coeff_idx];
 
             if coeff == 0 {
-                // Use subband of first zero for k_zrl selection
-                let y0 = (coeff_idx / tile_size as usize) as u32;
-                let x0 = (coeff_idx % tile_size as usize) as u32;
-                let g_zrl = compute_subband_group(x0, y0, tile_size, num_levels);
-
-                // Count zero run length (cap at max encodable to stay in sync)
-                let k = k_zrl_values[g_zrl];
-                let max_run = 32u32 << k;
+                // Count zero run (only count non-skipped positions)
+                let k = k_zrl_values[g];
                 let mut run = 1u32;
-                while s + (run as usize) < symbols_per_stream && run < max_run {
-                    let next_idx = stream_id + (s + run as usize) * RICE_STREAMS_PER_TILE;
+                let mut ns = s + 1;
+                while ns < symbols_per_stream {
+                    let next_idx = stream_id + ns * RICE_STREAMS_PER_TILE;
+                    let ny = (next_idx / tile_size as usize) as u32;
+                    let nx = (next_idx % tile_size as usize) as u32;
+                    let ng = compute_subband_group(nx, ny, tile_size, num_levels);
+                    // Skip past bitmap-skipped positions
+                    if (skip_bitmap >> ng) & 1 == 1 {
+                        ns += 1;
+                        continue;
+                    }
                     if coefficients[next_idx] != 0 {
                         break;
                     }
                     run += 1;
+                    ns += 1;
                 }
                 writer.write_bit(0); // token: zero run
                 writer.write_rice(run - 1, k);
-                s += run as usize;
+                s = ns;
             } else {
                 writer.write_bit(1); // token: non-zero
                 writer.write_bit(if coeff < 0 { 1 } else { 0 });
                 let magnitude = coeff.unsigned_abs() - 1;
-                let y = (coeff_idx / tile_size as usize) as u32;
-                let x = (coeff_idx % tile_size as usize) as u32;
-                let g = compute_subband_group(x, y, tile_size, num_levels);
 
                 // Derive adaptive k from EMA
                 let ema_mean = ema[g] >> 4;
@@ -294,6 +315,7 @@ pub fn rice_encode_tile(coefficients: &[i32], tile_size: u32, num_levels: u32) -
         num_groups: num_groups as u32,
         k_values,
         k_zrl_values,
+        skip_bitmap,
         stream_lengths,
         stream_data: all_stream_data,
     }
@@ -319,27 +341,47 @@ pub fn rice_decode_tile(tile: &RiceTile) -> Vec<i32> {
         }
 
         let mut s = 0usize;
+        let skip_bitmap = tile.skip_bitmap;
         while s < symbols_per_stream {
+            let coeff_idx = stream_id + s * RICE_STREAMS_PER_TILE;
+            let cy = (coeff_idx / tile.tile_size as usize) as u32;
+            let cx = (coeff_idx % tile.tile_size as usize) as u32;
+            let cur_g = compute_subband_group(cx, cy, tile.tile_size, tile.num_levels);
+
+            // Skip bitmap: if this position's group is fully zero, write 0 and advance
+            if (skip_bitmap >> cur_g) & 1 == 1 {
+                coefficients[coeff_idx] = 0;
+                s += 1;
+                continue;
+            }
+
             let token = reader.read_bit();
             if token == 0 {
-                // Zero run: use subband of first zero for k_zrl
-                let first_idx = stream_id + s * RICE_STREAMS_PER_TILE;
-                let zy = (first_idx / tile.tile_size as usize) as u32;
-                let zx = (first_idx % tile.tile_size as usize) as u32;
-                let g_zrl = compute_subband_group(zx, zy, tile.tile_size, tile.num_levels);
-                let run = reader.read_rice(tile.k_zrl_values[g_zrl]) + 1;
-                for j in 0..run as usize {
-                    let coeff_idx = stream_id + (s + j) * RICE_STREAMS_PER_TILE;
-                    coefficients[coeff_idx] = 0;
+                // Zero run
+                let run = reader.read_rice(tile.k_zrl_values[cur_g]) + 1;
+                // Write zeros, skipping past bitmap-skipped positions
+                let mut written = 0u32;
+                let mut ws = s;
+                while written < run && ws < symbols_per_stream {
+                    let wi = stream_id + ws * RICE_STREAMS_PER_TILE;
+                    let wy = (wi / tile.tile_size as usize) as u32;
+                    let wx = (wi % tile.tile_size as usize) as u32;
+                    let wg = compute_subband_group(wx, wy, tile.tile_size, tile.num_levels);
+                    if (skip_bitmap >> wg) & 1 == 1 {
+                        // Bitmap-skipped: write zero but don't count toward run
+                        coefficients[wi] = 0;
+                        ws += 1;
+                        continue;
+                    }
+                    coefficients[wi] = 0;
+                    written += 1;
+                    ws += 1;
                 }
-                s += run as usize;
+                s = ws;
             } else {
                 // Non-zero coefficient
-                let coeff_idx = stream_id + s * RICE_STREAMS_PER_TILE;
                 let sign = reader.read_bit();
-                let y = (coeff_idx / tile.tile_size as usize) as u32;
-                let x = (coeff_idx % tile.tile_size as usize) as u32;
-                let g = compute_subband_group(x, y, tile.tile_size, tile.num_levels);
+                let g = cur_g;
 
                 // Derive adaptive k from EMA
                 let ema_mean = ema[g] >> 4;
@@ -377,9 +419,10 @@ pub fn serialize_tile_rice(tile: &RiceTile) -> Vec<u8> {
     out.extend_from_slice(&tile.num_levels.to_le_bytes());
     out.extend_from_slice(&tile.num_groups.to_le_bytes());
 
-    // k values + k_zrl values (one byte each, num_groups of each)
+    // k values + k_zrl values (one byte each, num_groups of each) + skip_bitmap
     out.extend_from_slice(&tile.k_values);
     out.extend_from_slice(&tile.k_zrl_values);
+    out.push(tile.skip_bitmap);
 
     // Stream lengths as u16 (max 4096 bytes per stream fits in u16)
     for &len in &tile.stream_lengths {
@@ -410,6 +453,9 @@ pub fn deserialize_tile_rice(data: &[u8]) -> (RiceTile, usize) {
     let k_zrl_values = data[pos..pos + num_groups as usize].to_vec();
     pos += num_groups as usize;
 
+    let skip_bitmap = data[pos];
+    pos += 1;
+
     let mut stream_lengths = Vec::with_capacity(RICE_STREAMS_PER_TILE);
     for _ in 0..RICE_STREAMS_PER_TILE {
         let len = u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap()) as u32;
@@ -429,6 +475,7 @@ pub fn deserialize_tile_rice(data: &[u8]) -> (RiceTile, usize) {
             num_groups,
             k_values,
             k_zrl_values,
+            skip_bitmap,
             stream_lengths,
             stream_data,
         },

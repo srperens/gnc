@@ -4,6 +4,32 @@
 
 ---
 
+## 2026-03-01: Rice+ZRL Zero Optimization — Subband Skip Bitmap + Uncapped Runs
+
+### Hypothesis
+P-frame residuals are 80-95%+ zero after quantization. Detail subbands (groups 2-5, 75% of tile coefficients) are often entirely zero. The Rice+ZRL encoder still emits bits for every zero — at least 2 bits per zero run. Two optimizations:
+1. Subband skip bitmap: signal all-zero groups with 1 bit each, skip encoding/decoding entirely
+2. Remove max_run cap: allow single ZRL token to cover entire stream (was capped at `32 << k_zrl`)
+
+### Implementation
+- Added `skip_bitmap: u8` to `RiceTile` — 1 bit per subband group, set when `group_count[g] == 0`
+- Bumped `K_STRIDE` from 16 to 17 (avoids new GPU buffer binding — bitmap rides in existing k_output buffer)
+- GPU encoder (`rice_encode.wgsl`): computes bitmap from Phase 1 stats, skips coefficients in Phase 2
+- GPU decoder (`rice_decode.wgsl`): loads bitmap, skips positions and writes zeros without reading bits
+- CPU encoder/decoder (`rice.rs`): mirror skip logic, including run counting across skipped positions
+- Serialization: 1 extra byte per tile after k_zrl_values
+- Error resilience (`format.rs`): zero-tile sets `skip_bitmap: 0xFF`
+- Fixed latent bytemuck alignment bug in `pack_decode_data` (Vec<u8> → &[u32] cast)
+
+### Results
+All 141 tests pass (122 lib + 8 conformance + 11 regression). Conformance bitstreams regenerated.
+No PSNR regression (identical quality — lossless transform of the encoding).
+
+### Analysis
+The skip bitmap is a pure win: 1 byte overhead per tile (8 groups × 1 bit) saves potentially thousands of bits when detail subbands are all-zero. The uncapped max_run allows a single ZRL token to cover an entire stream, eliminating the previous `32 << k_zrl` cap that forced multiple tokens for long zero runs. Both changes are particularly impactful for P-frame residuals where motion compensation leaves most coefficients zero.
+
+---
+
 ## 2026-03-01: Fix Variable Block Size ME — Lambda Tuning + Delta MV Coding (GP12)
 
 ### Problem

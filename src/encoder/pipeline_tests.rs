@@ -1479,3 +1479,177 @@ fn test_block_dct_color_debug() {
 
     assert!(psnr_all > 35.0, "DCT color q=99 should be >35 dB, got {psnr_all:.2}");
 }
+
+/// Generate a textured frame with non-repeating, high-detail spatial patterns
+/// suitable for motion estimation. Uses a pseudo-random hash-based texture
+/// that has strong per-pixel variation (making every 16×16 block unique)
+/// combined with smooth gradients (for realistic spatial correlation).
+fn make_textured_frame(w: u32, h: u32, shift_x: i32, shift_y: i32) -> Vec<f32> {
+    let mut data = Vec::with_capacity((w * h * 3) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            // Source coordinates with shift (wrap around)
+            let sx = (x as i32 - shift_x).rem_euclid(w as i32) as u32;
+            let sy = (y as i32 - shift_y).rem_euclid(h as i32) as u32;
+
+            // Simple hash for pseudo-random per-pixel variation (non-repeating)
+            let hash = sx.wrapping_mul(73856093) ^ sy.wrapping_mul(19349663);
+            let noise = ((hash & 0xFF) as f32) / 255.0; // 0..1
+
+            // Smooth gradients for spatial correlation
+            let grad_x = sx as f32 / w as f32;
+            let grad_y = sy as f32 / h as f32;
+
+            // Mix: 60% gradient + 40% noise → high detail but spatially correlated
+            let r = (grad_x * 180.0 + noise * 75.0).clamp(0.0, 255.0);
+            let g = (grad_y * 180.0 + noise * 60.0 + 30.0).clamp(0.0, 255.0);
+            let b = ((grad_x + grad_y) * 90.0 + noise * 50.0 + 20.0).clamp(0.0, 255.0);
+            data.push(r);
+            data.push(g);
+            data.push(b);
+        }
+    }
+    data
+}
+
+/// Test that motion compensation produces reasonable decode quality for shifted content.
+/// Verifies the full P-frame encode/decode pipeline works correctly with spatial motion.
+#[test]
+fn test_motion_comp_effectiveness() {
+    let ctx = GpuContext::new();
+    let mut enc = EncoderPipeline::new(&ctx);
+    let dec = DecoderPipeline::new(&ctx);
+
+    let w = 256;
+    let h = 256;
+    let shift_px = 4;
+
+    let f0 = make_textured_frame(w, h, 0, 0);
+    let f1 = make_textured_frame(w, h, shift_px, 0);
+    let f2 = make_textured_frame(w, h, shift_px * 2, 0);
+
+    let mut config = CodecConfig::default();
+    config.tile_size = 256;
+    config.keyframe_interval = 10;
+
+    let frames: Vec<&[f32]> = vec![&f0, &f1, &f2];
+    let compressed = enc.encode_sequence(&ctx, &frames, w, h, &config);
+
+    assert_eq!(compressed[0].frame_type, FrameType::Intra);
+    assert_eq!(compressed[1].frame_type, FrameType::Predicted);
+    assert_eq!(compressed[2].frame_type, FrameType::Predicted);
+
+    let i_size = compressed[0].byte_size();
+    let p1_size = compressed[1].byte_size();
+
+    eprintln!("\n=== Motion Compensation Effectiveness ===");
+    eprintln!("  Frame 0 [I]: {} bytes, {:.3} bpp", i_size, compressed[0].bpp());
+    eprintln!("  Frame 1 [P]: {} bytes, {:.3} bpp (shift={}px)", p1_size, compressed[1].bpp(), shift_px);
+    eprintln!("  P1/I ratio: {:.2}x", p1_size as f64 / i_size as f64);
+
+    // Decode and verify quality — all frames should decode cleanly
+    let decoded = dec.decode_sequence(&ctx, &compressed);
+    for (i, dec_frame) in decoded.iter().enumerate() {
+        let psnr = compute_psnr(&frames[i], dec_frame);
+        eprintln!("  Frame {i}: PSNR={psnr:.2} dB");
+        assert!(psnr > 25.0, "Frame {i} PSNR too low: {psnr:.2} dB");
+    }
+
+    // P-frame should not be drastically larger than I-frame.
+    // At default quality with biorthogonal wavelet residuals, P/I can be close to 1.0
+    // but should not exceed it significantly.
+    let ratio = p1_size as f64 / i_size as f64;
+    assert!(
+        ratio < 1.2,
+        "P-frame much larger than I-frame with small shift (ratio={ratio:.2}). \
+         MC may not be working."
+    );
+}
+
+/// Test that identical frames produce P-frames smaller than I-frames.
+/// With the biorthogonal wavelet, requantized residuals aren't all zero,
+/// so P/I ratio at default quality is ~0.6-0.8 (not near-zero).
+#[test]
+fn test_motion_comp_identical_frames_small_pframe() {
+    let ctx = GpuContext::new();
+    let mut enc = EncoderPipeline::new(&ctx);
+
+    let w = 256;
+    let h = 256;
+    let frame = make_textured_frame(w, h, 0, 0);
+
+    let mut config = CodecConfig::default();
+    config.tile_size = 256;
+    config.keyframe_interval = 10;
+
+    // 3 identical frames
+    let frames: Vec<&[f32]> = vec![&frame, &frame, &frame];
+    let compressed = enc.encode_sequence(&ctx, &frames, w, h, &config);
+
+    let i_size = compressed[0].byte_size();
+    let p1_size = compressed[1].byte_size();
+
+    eprintln!("\n=== Identical Frames P-frame Size ===");
+    eprintln!("  Frame 0 [I]: {} bytes, {:.3} bpp", i_size, compressed[0].bpp());
+    eprintln!("  Frame 1 [P]: {} bytes, {:.3} bpp", p1_size, compressed[1].bpp());
+    eprintln!("  P1/I ratio: {:.3}", p1_size as f64 / i_size as f64);
+
+    // Identical frames P-frame should be notably smaller than I-frame.
+    // The biorthogonal wavelet means residuals don't fully vanish after
+    // requantization, so P/I ~0.6-0.8 at default quality (qstep=4.0).
+    let ratio = p1_size as f64 / i_size as f64;
+    assert!(
+        ratio < 0.85,
+        "Identical frame P-frame should be smaller than I-frame. \
+         Got P/I ratio={ratio:.3} (P={p1_size}, I={i_size})."
+    );
+
+    // MVs should be near-zero for identical content
+    let mf = compressed[1].motion_field.as_ref().unwrap();
+    let max_mv: i16 = mf.vectors.iter().flat_map(|v| v.iter()).map(|v| v.abs()).max().unwrap_or(0);
+    eprintln!("  Max MV magnitude: {} half-pels", max_mv);
+    assert!(max_mv <= 4, "Identical frames should have near-zero MVs, got max={max_mv}");
+}
+
+/// Test that P-frames decode correctly across multiple quality levels.
+#[test]
+fn test_motion_comp_quality_scaling() {
+    let ctx = GpuContext::new();
+    let mut enc = EncoderPipeline::new(&ctx);
+    let dec = DecoderPipeline::new(&ctx);
+
+    let w = 256;
+    let h = 256;
+    let f0 = make_textured_frame(w, h, 0, 0);
+    let f1 = make_textured_frame(w, h, 2, 0); // small shift
+
+    for q in [50, 75, 90] {
+        let config = crate::quality_preset(q);
+        let mut config_ip = config.clone();
+        config_ip.keyframe_interval = 10;
+
+        let frames: Vec<&[f32]> = vec![&f0, &f1];
+        let compressed = enc.encode_sequence(&ctx, &frames, w, h, &config_ip);
+
+        let i_size = compressed[0].byte_size();
+        let p_size = compressed[1].byte_size();
+        let ratio = p_size as f64 / i_size as f64;
+
+        // Decode and verify round-trip quality
+        let decoded = dec.decode_sequence(&ctx, &compressed);
+        let psnr = compute_psnr(&f1, &decoded[1]);
+
+        eprintln!(
+            "  q={q}: I={i_size} bytes, P={p_size} bytes, P/I={ratio:.3}, PSNR={psnr:.1} dB"
+        );
+
+        // P-frame should decode with reasonable quality
+        assert!(psnr > 20.0, "q={q}: P-frame PSNR too low ({psnr:.1} dB)");
+
+        // P-frame shouldn't be drastically larger than I-frame
+        assert!(
+            ratio < 1.3,
+            "q={q}: P-frame much larger than I-frame (ratio={ratio:.3})"
+        );
+    }
+}

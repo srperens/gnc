@@ -1109,8 +1109,8 @@ pub mod wasm {
 
             let sampler = self.ctx.device.create_sampler(&wgpu::SamplerDescriptor {
                 label: Some("blit_sampler"),
-                mag_filter: wgpu::FilterMode::Nearest,
-                min_filter: wgpu::FilterMode::Nearest,
+                mag_filter: wgpu::FilterMode::Linear,
+                min_filter: wgpu::FilterMode::Linear,
                 ..Default::default()
             });
 

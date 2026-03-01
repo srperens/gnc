@@ -1,5 +1,4 @@
 use wgpu;
-use wgpu::util::DeviceExt;
 
 use super::adaptive::{self, AQ_LL_BLOCK_SIZE};
 use super::bitplane;
@@ -105,19 +104,9 @@ impl EncoderPipeline {
 
         // Previous P-frame MV buffer for temporal prediction. When available, the ME
         // shader skips the expensive coarse search and only does fine refinement around
-        // the predicted MV. Initialized to zero-MVs so even the first P-frame uses
-        // fast predicted mode (fine ±4 search around (0,0)).
-        let me_blocks_x = padded_w / super::motion::ME_BLOCK_SIZE;
-        let me_blocks_y = padded_h / super::motion::ME_BLOCK_SIZE;
-        let me_total_blocks = me_blocks_x * me_blocks_y;
-        let zero_mv_data = vec![0i32; (me_total_blocks * 2) as usize];
-        let zero_mv_buf = ctx
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("zero_mvs"),
-                contents: bytemuck::cast_slice(&zero_mv_data),
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            });
+        // the predicted MV. First P-frame after a keyframe uses None (full ±32 coarse
+        // search) since there's no reliable predictor — using zero-MVs with the
+        // predictor path would limit search to ±2 pixels and miss real motion.
         let mut prev_mv_buf: Option<wgpu::Buffer> = None;
 
         let mut display_idx = 0;
@@ -151,9 +140,11 @@ impl EncoderPipeline {
                     eprintln!("  I-frame total: {:.1}ms", _t_iframe.elapsed().as_secs_f64() * 1000.0);
                 }
                 has_reference = true;
-                // Keep prev_mv_buf across keyframes: motion patterns are usually
-                // similar across GOP boundaries (no scene-change detection).
-                // This avoids a full ±32 ME search on the first P after each I-frame.
+                // Reset MV predictor after keyframe: the first P-frame after a
+                // keyframe should use full ±32 coarse search (no predictor), since
+                // the reference frame changed completely. Without this, the predictor
+                // path limits search to ±2 pixels and misses real motion.
+                prev_mv_buf = None;
                 results[display_idx] = Some(compressed);
                 display_idx += 1;
                 continue;
@@ -174,7 +165,7 @@ impl EncoderPipeline {
                     padded_pixels,
                     &info,
                     &frame_config,
-                    prev_mv_buf.as_ref().or(Some(&zero_mv_buf)),
+                    prev_mv_buf.as_ref(),
                     false,
                     !next_is_key_or_end,
                 );
@@ -220,7 +211,7 @@ impl EncoderPipeline {
                     padded_pixels,
                     &info,
                     &p_config,
-                    prev_mv_buf.as_ref().or(Some(&zero_mv_buf)),
+                    prev_mv_buf.as_ref(),
                     true,
                     true, // anchor P always needs decode (bwd ref for B-frames)
                 );
@@ -234,7 +225,7 @@ impl EncoderPipeline {
                 self.swap_ref_planes();
 
                 // 4. Encode B-frames between past and future anchors.
-                // First B-frame uses zero MVs as predictor (fast ±4 search around (0,0)).
+                // First B-frame uses None predictor (full coarse search).
                 // Subsequent B-frames use previous B's MVs for temporal prediction.
                 let mut prev_bidir_fwd_mv: Option<wgpu::Buffer> = None;
                 let mut prev_bidir_bwd_mv: Option<wgpu::Buffer> = None;
@@ -247,9 +238,8 @@ impl EncoderPipeline {
                     } else {
                         config.clone()
                     };
-                    // Use zero_mv_buf as fallback predictor for the first B-frame
-                    let fwd_pred = prev_bidir_fwd_mv.as_ref().or(Some(&zero_mv_buf));
-                    let bwd_pred = prev_bidir_bwd_mv.as_ref().or(Some(&zero_mv_buf));
+                    let fwd_pred = prev_bidir_fwd_mv.as_ref();
+                    let bwd_pred = prev_bidir_bwd_mv.as_ref();
                     let b_frame_data = load_frame(b_display);
                     let (compressed, new_fwd_mv, new_bwd_mv) = self.encode_bframe(
                         ctx,
@@ -299,7 +289,7 @@ impl EncoderPipeline {
                     padded_pixels,
                     &info,
                     &p_config,
-                    prev_mv_buf.as_ref().or(Some(&zero_mv_buf)),
+                    prev_mv_buf.as_ref(),
                     false,
                     rem_needs_decode,
                 );
@@ -687,6 +677,7 @@ impl EncoderPipeline {
                     padded_h,
                     &bufs.mc_fwd_params,
                 );
+
                 // mc_out feeds directly into wavelet (read-only at level 0)
                 self.transform.forward(
                     ctx,

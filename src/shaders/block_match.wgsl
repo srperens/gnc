@@ -250,6 +250,57 @@ fn main(
     workgroupBarrier();
     min_reduce(tid);
 
+    // ========== Phase 2b: Zero-MV competition (skip mode) ==========
+    // Evaluate (0,0) at full precision and compare against the fine winner.
+    // The coarse search uses subsampled SAD (16 samples) which can pick wrong
+    // winners for low-texture/static content. Re-evaluate both candidates with
+    // full 16×16 SAD at 8× fixed-point precision to properly distinguish small
+    // differences, with a small bias toward zero-MV (lower MV coding cost).
+    let fine_packed_pre = shared_mv[0];
+    let fine_dx_pre = unpack_dx(fine_packed_pre);
+    let fine_dy_pre = unpack_dy(fine_packed_pre);
+    workgroupBarrier();
+
+    let need_zero_check = (fine_dx_pre != 0 || fine_dy_pre != 0);
+    let zpx = tid % params.block_size;
+    let zpy = tid / params.block_size;
+    let zcur_idx = (block_origin_y + zpy) * params.width + block_origin_x + zpx;
+    let zcur_val = current_y[zcur_idx];
+
+    // Zero-MV SAD at 8× precision
+    shared_sad[tid] = select(0u, u32(abs(zcur_val - reference_y[zcur_idx]) * 8.0), need_zero_check);
+    workgroupBarrier();
+    for (var zs = 128u; zs > 0u; zs >>= 1u) {
+        if tid < zs { shared_sad[tid] += shared_sad[tid + zs]; }
+        workgroupBarrier();
+    }
+    let zero_sad_8x = shared_sad[0];
+
+    // Fine winner SAD at same 8× precision
+    let fref_x = clamp(i32(block_origin_x + zpx) + fine_dx_pre, 0, w - 1);
+    let fref_y = clamp(i32(block_origin_y + zpy) + fine_dy_pre, 0, h - 1);
+    shared_sad[tid] = select(0u, u32(abs(zcur_val - reference_y[u32(fref_y) * params.width + u32(fref_x)]) * 8.0), need_zero_check);
+    workgroupBarrier();
+    for (var zs = 128u; zs > 0u; zs >>= 1u) {
+        if tid < zs { shared_sad[tid] += shared_sad[tid + zs]; }
+        workgroupBarrier();
+    }
+    let fine_sad_8x = shared_sad[0];
+
+    // Prefer zero-MV unless fine winner is meaningfully better.
+    // Bias of ~0.25 per pixel (2 at 8× scale) prevents random MVs in
+    // low-texture regions while allowing real motion (which typically has
+    // SAD deltas of 10+ per pixel).
+    let zero_bias = params.block_size * params.block_size * 2u;
+    if tid == 0u && need_zero_check && zero_sad_8x <= fine_sad_8x + zero_bias {
+        shared_sad[0] = zero_sad_8x / 8u;
+        shared_mv[0] = pack_mv(0, 0);
+    } else if tid == 0u {
+        shared_sad[0] = fine_sad_8x / 8u;
+        shared_mv[0] = fine_packed_pre;
+    }
+    workgroupBarrier();
+
     // ========== Phase 3: Half-pel refinement (all 256 threads, parallel) ==========
     // Cross-pattern: test 4 cardinal neighbors (skip diagonals for speed).
     // Each candidate evaluated in parallel: all 256 threads compute one pixel's

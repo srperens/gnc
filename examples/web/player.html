@@ -15,19 +15,41 @@
             align-items: center;
             padding: 24px;
         }
-        h1 { color: #fff; margin-bottom: 8px; font-size: 1.4em; }
+        h1 { color: #fff; margin-bottom: 4px; font-size: 1.4em; }
         .subtitle { color: #888; margin-bottom: 16px; font-size: 0.9em; }
+
+        /* --- Top section: two columns above the video --- */
+        .top-section {
+            display: flex;
+            gap: 20px;
+            width: 100%;
+            max-width: 1100px;
+            margin-bottom: 16px;
+            align-items: flex-start;
+        }
+        .top-left {
+            flex: 1;
+            min-width: 0;
+        }
+        .top-right {
+            flex: 1;
+            min-width: 0;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+        @media (max-width: 720px) {
+            .top-section { flex-direction: column; }
+        }
 
         .drop-zone {
             border: 2px dashed #444;
             border-radius: 8px;
-            padding: 32px;
+            padding: 24px;
             text-align: center;
             cursor: pointer;
             transition: border-color 0.2s, background 0.2s;
-            margin-bottom: 16px;
-            width: 100%;
-            max-width: 720px;
+            margin-bottom: 12px;
         }
         .drop-zone:hover, .drop-zone.dragover {
             border-color: #6c63ff;
@@ -41,6 +63,8 @@
             overflow: hidden;
             margin-bottom: 12px;
             line-height: 0;
+            max-width: 1100px;
+            width: 100%;
         }
         canvas {
             max-width: 100%;
@@ -50,18 +74,15 @@
         .controls {
             display: flex;
             align-items: center;
-            gap: 10px;
-            width: 100%;
-            max-width: 720px;
-            margin-bottom: 8px;
+            gap: 8px;
         }
         button {
             background: #6c63ff;
             color: #fff;
             border: none;
             border-radius: 6px;
-            padding: 8px 18px;
-            font-size: 0.95em;
+            padding: 7px 16px;
+            font-size: 0.9em;
             cursor: pointer;
             white-space: nowrap;
         }
@@ -73,45 +94,38 @@
         }
         .frame-label {
             font-variant-numeric: tabular-nums;
-            font-size: 0.85em;
-            min-width: 80px;
+            font-size: 0.82em;
+            min-width: 72px;
             text-align: right;
         }
 
         .stats {
-            font-size: 0.82em;
+            font-size: 0.78em;
             color: #888;
-            width: 100%;
-            max-width: 720px;
             display: flex;
-            gap: 16px;
+            gap: 12px;
             flex-wrap: wrap;
         }
         .stats span { white-space: nowrap; }
 
         .diag-panel {
-            width: 100%;
-            max-width: 720px;
-            margin-top: 8px;
+            margin-top: 4px;
         }
         .diag-panel summary {
             cursor: pointer;
             color: #888;
-            font-size: 0.9em;
+            font-size: 0.85em;
             margin-bottom: 4px;
         }
         .diag-content {
             background: #111;
             border-radius: 6px;
-            padding: 10px 14px;
+            padding: 8px 12px;
             font-family: 'SF Mono', 'Menlo', 'Consolas', monospace;
-            font-size: 0.78em;
-            line-height: 1.5;
+            font-size: 0.72em;
+            line-height: 1.45;
             color: #bbb;
             white-space: pre;
-            overflow-x: auto;
-            max-height: 300px;
-            overflow-y: auto;
         }
         .diag-content .diag-warn { color: #d87c7c; }
         .diag-content .diag-type-I { color: #7cd88b; }
@@ -119,12 +133,10 @@
         .diag-content .diag-type-B { color: #d8c87c; }
 
         #status {
-            margin-bottom: 12px;
-            padding: 8px 16px;
+            margin-bottom: 8px;
+            padding: 6px 14px;
             border-radius: 6px;
-            font-size: 0.9em;
-            width: 100%;
-            max-width: 720px;
+            font-size: 0.85em;
             text-align: center;
         }
         .status-info { background: #1e3a5f; color: #7cb3d8; }
@@ -132,67 +144,82 @@
         .status-ok { background: #1e5f2e; color: #7cd88b; }
 
         .demos {
-            width: 100%;
-            max-width: 720px;
-            margin-bottom: 16px;
+            margin-bottom: 8px;
         }
         .demos summary {
             cursor: pointer;
             color: #888;
             font-size: 0.9em;
-            margin-bottom: 8px;
+            margin-bottom: 6px;
         }
         .demo-grid {
             display: flex;
             flex-wrap: wrap;
-            gap: 8px;
+            gap: 6px;
         }
         .demo-grid button {
             background: #2a2a4a;
-            font-size: 0.82em;
-            padding: 6px 14px;
+            font-size: 0.78em;
+            padding: 5px 12px;
         }
         .demo-grid button:hover { background: #3a3a5a; }
+
+        .right-label {
+            font-size: 0.78em;
+            color: #666;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            margin-bottom: 2px;
+        }
     </style>
 </head>
 <body>
     <h1>GNC/GNV WebGPU Player</h1>
-    <p class="subtitle">Drag & drop or select a <code>.gnc</code> (image) or <code>.gnv</code> (video) file</p>
+    <p class="subtitle">Drag & drop or select a <code>.gnc</code> / <code>.gnv</code> file</p>
 
-    <div class="drop-zone" id="dropZone">
-        <input type="file" id="fileInput" accept=".gnc,.gnv">
-        <p>Click or drop file here</p>
+    <div class="top-section">
+        <!-- Left column: file input + demos + status -->
+        <div class="top-left">
+            <div class="drop-zone" id="dropZone">
+                <input type="file" id="fileInput" accept=".gnc,.gnv">
+                <p>Click or drop file here</p>
+            </div>
+
+            <details class="demos" open>
+                <summary>Demo files</summary>
+                <div class="demo-grid" id="demoGrid"></div>
+            </details>
+
+            <div id="status" class="status-info">Ready</div>
+        </div>
+
+        <!-- Right column: controls + stats + diagnostics -->
+        <div class="top-right" id="rightPanel" style="display:none">
+            <div class="controls" id="controlsBar">
+                <button id="playBtn" disabled>Play</button>
+                <button id="stopBtn" disabled title="Stop and reset to frame 0">Stop</button>
+                <input type="range" id="seekBar" min="0" max="0" value="0" step="1">
+                <span class="frame-label" id="frameLabel">0 / 0</span>
+            </div>
+
+            <div class="stats" id="statsBar">
+                <span id="statRes"></span>
+                <span id="statFps"></span>
+                <span id="statDecode"></span>
+                <span id="statPlayFps"></span>
+                <span id="statPath"></span>
+            </div>
+
+            <details class="diag-panel" id="diagPanel" style="display:none">
+                <summary>Frame diagnostics <a id="diagFullLink" href="#" target="_blank" style="color:#6c63ff;font-size:0.85em;margin-left:8px;text-decoration:none;display:none">open full .diag</a></summary>
+                <div class="diag-content" id="diagContent">No diagnostics available</div>
+            </details>
+        </div>
     </div>
-
-    <details class="demos" open>
-        <summary>Demo files</summary>
-        <div class="demo-grid" id="demoGrid"></div>
-    </details>
-
-    <div id="status" class="status-info">Ready</div>
 
     <div class="canvas-wrap" id="canvasWrap" style="display:none">
         <canvas id="canvas"></canvas>
     </div>
-
-    <div class="controls" id="controlsBar" style="display:none">
-        <button id="playBtn" disabled>Play</button>
-        <input type="range" id="seekBar" min="0" max="0" value="0" step="1">
-        <span class="frame-label" id="frameLabel">0 / 0</span>
-    </div>
-
-    <div class="stats" id="statsBar" style="display:none">
-        <span id="statRes"></span>
-        <span id="statFps"></span>
-        <span id="statDecode"></span>
-        <span id="statPlayFps"></span>
-        <span id="statPath"></span>
-    </div>
-
-    <details class="diag-panel" id="diagPanel" style="display:none">
-        <summary>Frame diagnostics <a id="diagFullLink" href="#" target="_blank" style="color:#6c63ff;font-size:0.85em;margin-left:8px;text-decoration:none;display:none">open full .diag</a></summary>
-        <div class="diag-content" id="diagContent">No diagnostics available</div>
-    </details>
 
     <script type="module">
         import init, { GnvPlayer } from '../../pkg/gnc.js';
@@ -203,30 +230,28 @@
         const status = $('status');
         let canvas = $('canvas');
         const playBtn = $('playBtn');
+        const stopBtn = $('stopBtn');
         const seekBar = $('seekBar');
         const frameLabel = $('frameLabel');
         const canvasWrap = $('canvasWrap');
-        const controlsBar = $('controlsBar');
+        const rightPanel = $('rightPanel');
         const statsBar = $('statsBar');
 
         const diagPanel = $('diagPanel');
         const diagContent = $('diagContent');
 
-        // Defer 2D context creation — canvas can only have one context type.
-        // If zero-copy WebGPU rendering works, we never create a 2D context.
         let ctx2d = null;
 
         let wasmReady = false;
-        let diagData = null;  // Map<frameIndex, string> parsed from .diag file
+        let diagData = null;
         let player = null;
         let playing = false;
-        let zeroCopy = false;  // true when using GPU surface blit path
+        let zeroCopy = false;
         let animId = null;
-        let playbackStartTime = 0;  // wall clock ms when Play was pressed
-        let playbackStartFrame = 0; // frame index at play start
+        let playbackStartTime = 0;
+        let playbackStartFrame = 0;
         let framesSinceLastStat = 0;
         let statAccumMs = 0;
-        // Cached metadata — avoids accessing player (mutable borrow) during async playback
         let cachedWidth = 0;
         let cachedHeight = 0;
         let cachedFc = 0;
@@ -261,7 +286,6 @@
                 diagContent.innerHTML = `<span style="color:#666">No diagnostics for frame ${frameIdx}</span>`;
                 return;
             }
-            // Highlight frame type and warnings
             const escaped = raw.replace(/&/g, '&amp;').replace(/</g, '&lt;');
             const html = escaped
                 .replace(/^(Frame \d+ \[I\].*)$/m, '<span class="diag-type-I">$1</span>')
@@ -284,7 +308,7 @@
                 diagFullLink.href = diagName;
                 diagFullLink.style.display = '';
             } catch (_) {
-                // No diagnostics available — that's fine
+                // No diagnostics available
             }
         }
 
@@ -309,7 +333,6 @@
                 setStatus('Initializing WebGPU + WASM...');
                 await init();
                 wasmReady = true;
-                // Log GPU adapter info
                 const adapter = await navigator.gpu.requestAdapter();
                 if (adapter) {
                     const info = adapter.info || await adapter.requestAdapterInfo?.() || {};
@@ -336,7 +359,8 @@
             { name: 'ducks_q25.gnv', label: 'Ducks q25 (190 MB)', desc: '300f 50fps 1080p q=25 ki=8' },
             { name: 'ducks_q50.gnv', label: 'Ducks q50 (418 MB)', desc: '300f 50fps 1080p q=50 ki=8' },
             { name: 'ducks_q75.gnv', label: 'Ducks q75 (698 MB)', desc: '300f 50fps 1080p q=75 ki=8' },
-            { name: 'bbb_2min.gnv', label: 'BBB 2min (895 MB)', desc: '1800f 30fps 1080p q=75 ki=24' },
+            { name: 'bbb_2min_q5.gnv', label: 'BBB 2min q5', desc: '1800f 30fps 1080p q=5 ki=24' },
+            { name: 'bbb_2min.gnv', label: 'BBB 2min q75', desc: '1800f 30fps 1080p q=75 ki=24' },
         ];
         const demoGrid = $('demoGrid');
         for (const d of demoFiles) {
@@ -354,7 +378,7 @@
             dl.download = d.name;
             dl.textContent = '\u2B07';
             dl.title = 'Download ' + d.name;
-            dl.style.cssText = 'background:#222;color:#888;border-radius:0 0 0 0;padding:6px 8px;font-size:0.82em;text-decoration:none;display:flex;align-items:center;border-left:1px solid #333;';
+            dl.style.cssText = 'background:#222;color:#888;border-radius:0 0 0 0;padding:5px 7px;font-size:0.82em;text-decoration:none;display:flex;align-items:center;border-left:1px solid #333;';
 
             const diagLink = document.createElement('a');
             const diagName = d.name.replace(/\.gnv$/, '.diag');
@@ -362,7 +386,7 @@
             diagLink.target = '_blank';
             diagLink.textContent = 'diag';
             diagLink.title = 'Open ' + diagName + ' in new tab';
-            diagLink.style.cssText = 'background:#222;color:#888;border-radius:0 6px 6px 0;padding:6px 8px;font-size:0.72em;text-decoration:none;display:flex;align-items:center;border-left:1px solid #333;';
+            diagLink.style.cssText = 'background:#222;color:#888;border-radius:0 6px 6px 0;padding:5px 7px;font-size:0.72em;text-decoration:none;display:flex;align-items:center;border-left:1px solid #333;';
 
             wrap.appendChild(btn);
             wrap.appendChild(dl);
@@ -380,7 +404,6 @@
                 if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
                 const total = parseInt(resp.headers.get('content-length') || '0', 10);
 
-                // Stream with progress
                 const reader = resp.body.getReader();
                 const chunks = [];
                 let received = 0;
@@ -403,7 +426,6 @@
                 }
 
                 setStatus('Creating player...');
-                // Fetch diagnostics in parallel with player creation
                 const diagPromise = fetchDiag(filename);
                 await loadBuffer(buf, filename);
                 await diagPromise;
@@ -434,8 +456,6 @@
         async function loadBuffer(buf, name) {
             zeroCopy = false;
 
-            // Replace canvas element to clear any previous context (2D or WebGPU).
-            // A canvas can only have one context type, so we need a fresh element.
             const oldCanvas = canvas;
             const newCanvas = document.createElement('canvas');
             newCanvas.id = 'canvas';
@@ -457,8 +477,7 @@
             canvas.width = w;
             canvas.height = h;
             canvasWrap.style.display = '';
-            controlsBar.style.display = 'flex';
-            statsBar.style.display = 'flex';
+            rightPanel.style.display = 'flex';
 
             seekBar.max = Math.max(0, fc - 1);
             seekBar.value = 0;
@@ -470,6 +489,7 @@
             $('statPlayFps').textContent = '';
 
             playBtn.disabled = false;
+            stopBtn.disabled = false;
             playBtn.textContent = fc > 1 ? 'Play' : 'Decode';
 
             // Try zero-copy GPU surface rendering
@@ -499,7 +519,6 @@
             $('statDecode').textContent = `Decode: ${dt.toFixed(1)} ms`;
             setStatus(`${name} loaded (${fc} frame${fc > 1 ? 's' : ''})`, 'ok');
 
-            // Reset to frame 0 so Play starts from the beginning
             player.reset();
             jsCurrentFrame = 0;
         }
@@ -513,7 +532,6 @@
         }
 
         // --- Playback ---
-        // Track current frame in JS to avoid accessing player during async borrow
         let jsCurrentFrame = 0;
 
         function updateFrameLabel(idx) {
@@ -527,12 +545,10 @@
             const targetFrame = Math.floor((now - playbackStartTime) / 1000 * cachedFps) + playbackStartFrame;
 
             if (jsCurrentFrame > targetFrame) {
-                // Ahead of schedule — wait for next rAF
                 animId = requestAnimationFrame(playLoop);
                 return;
             }
 
-            // Decode exactly one frame per tick — never skip-decode
             const t0 = performance.now();
             if (zeroCopy) {
                 player.decode_and_present();
@@ -551,7 +567,6 @@
             seekBar.value = displayFrame;
             updateFrameLabel(displayFrame);
 
-            // If we fell too far behind, reset the clock to prevent drift
             const behind = targetFrame - displayFrame;
             if (behind > 3) {
                 playbackStartTime = performance.now();
@@ -575,7 +590,6 @@
                 playbackStartFrame = 0;
             }
 
-            // If behind schedule, skip rAF vsync wait and decode immediately
             const nowAfter = performance.now();
             const nextTarget = Math.floor((nowAfter - playbackStartTime) / 1000 * cachedFps) + playbackStartFrame;
             if (jsCurrentFrame <= nextTarget) {
@@ -598,7 +612,7 @@
 
         function pause() {
             playing = false;
-            playBtn.textContent = 'Play';
+            if (cachedFc > 1) playBtn.textContent = 'Play';
             if (animId) { cancelAnimationFrame(animId); animId = null; }
         }
 
@@ -607,13 +621,15 @@
             if (player) {
                 player.reset();
                 jsCurrentFrame = 0;
+                seekBar.value = 0;
+                updateFrameLabel(0);
+                $('statPlayFps').textContent = '';
             }
         }
 
         playBtn.addEventListener('click', () => {
             if (!player) return;
             if (cachedFc === 1) {
-                // Single-frame: just re-decode
                 player.reset();
                 jsCurrentFrame = 0;
                 if (zeroCopy) {
@@ -626,6 +642,23 @@
                 return;
             }
             if (playing) pause(); else play();
+        });
+
+        stopBtn.addEventListener('click', () => {
+            if (!player) return;
+            stop();
+            // Re-decode frame 0
+            if (zeroCopy) {
+                player.decode_and_present();
+            } else {
+                player.decode_next_frame().then(rgba => {
+                    paintFrame(rgba, cachedWidth, cachedHeight);
+                    player.reset();
+                    jsCurrentFrame = 0;
+                });
+            }
+            showDiag(0);
+            setStatus('Stopped', 'ok');
         });
 
         // --- Seek ---

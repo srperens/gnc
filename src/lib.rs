@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 pub mod bench;
 pub mod decoder;
 pub mod encoder;

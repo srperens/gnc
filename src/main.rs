@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use clap::{Parser, Subcommand};
 use gnc::bench::bdrate;
 use gnc::bench::codec_compare;

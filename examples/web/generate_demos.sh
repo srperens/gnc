@@ -100,7 +100,12 @@ encode "ducks_q75" \
     -q 75 -n 300 --keyframe-interval 8 \
     --fps-num 50 --fps-den 1
 
-# --- Long-form demo ---
+# --- Long-form demos ---
+
+encode "bbb_2min_q5" \
+    "$SEQ/bbb_2min/frame_%04d.png" \
+    -q 5 -n 1800 --keyframe-interval 24 \
+    --fps-num 30 --fps-den 1
 
 encode "bbb_2min" \
     "$SEQ/bbb_2min/frame_%04d.png" \

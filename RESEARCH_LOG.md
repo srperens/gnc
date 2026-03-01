@@ -4,6 +4,76 @@
 
 ---
 
+## 2026-03-01: Subband Zero-Coefficient Distribution Analysis
+
+### Motivation
+Understand where Rice bytes are spent across wavelet subbands to identify whether better zero-coding (zerotree/significance maps) or better magnitude-coding (context-adaptive k) has more potential.
+
+### Method
+Full encode of bbb_1080p.png at q=50 and q=75 with Rice+ZRL. Per-subband zero counting + per-entropy-group Rice byte estimation via exact bit model.
+
+### Results — q=50 (2.33 bpp total Rice)
+
+**Per subband (all 3 planes summed):**
+
+| Subband | Coefficients | Zeros | Zero% |
+|---------|-------------|-------|-------|
+| LL | 30,720 | 809 | 2.6% |
+| LH_L3 | 30,720 | 15,136 | 49.3% |
+| HL_L3 | 30,720 | 13,385 | 43.6% |
+| HH_L3 | 30,720 | 22,244 | 72.4% |
+| LH_L2 | 122,880 | 88,402 | 71.9% |
+| HL_L2 | 122,880 | 75,094 | 61.1% |
+| HH_L2 | 122,880 | 100,632 | 81.9% |
+| LH_L1 | 491,520 | 424,746 | 86.4% |
+| HL_L1 | 491,520 | 389,384 | 79.2% |
+| HH_L1 | 491,520 | 464,167 | 94.4% |
+| LH_L0 | 1,966,080 | 1,883,890 | 95.8% |
+| HL_L0 | 1,966,080 | 1,836,718 | 93.4% |
+| HH_L0 | 1,966,080 | 1,957,635 | 99.6% |
+
+**Per entropy group → Rice byte attribution:**
+
+| Group | Coefficients | Zeros | Zero% | Est.Bytes | Bpp |
+|-------|-------------|-------|-------|-----------|-----|
+| LL | 30,720 | 809 | 2.6% | 33,391 | 0.129 |
+| LH+HL+HH_L3 | 92,160 | 50,765 | 55.1% | 31,783 | 0.123 |
+| LH+HL_L2 | 245,760 | 163,496 | 66.5% | 63,910 | 0.247 |
+| HH_L2 | 122,880 | 100,632 | 81.9% | 17,090 | 0.066 |
+| LH+HL_L1 | 983,040 | 814,230 | 82.8% | 135,054 | 0.521 |
+| HH_L1 | 491,520 | 464,167 | 94.4% | 26,414 | 0.102 |
+| **LH+HL_L0** | **3,932,160** | **3,720,107** | **94.6%** | **185,713** | **0.716** |
+| HH_L0 | 1,966,080 | 1,957,635 | 99.6% | 62,847 | 0.242 |
+
+### Results — q=75 (3.97 bpp total Rice)
+
+**Per entropy group → Rice byte attribution:**
+
+| Group | Coefficients | Zeros | Zero% | Est.Bytes | Bpp |
+|-------|-------------|-------|-------|-----------|-----|
+| LL | 30,720 | 396 | 1.3% | 37,673 | 0.145 |
+| LH+HL+HH_L3 | 92,160 | 36,039 | 39.1% | 44,528 | 0.172 |
+| LH+HL_L2 | 245,760 | 122,435 | 49.8% | 95,954 | 0.370 |
+| HH_L2 | 122,880 | 83,762 | 68.2% | 29,632 | 0.114 |
+| LH+HL_L1 | 983,040 | 683,126 | 69.5% | 234,694 | 0.905 |
+| HH_L1 | 491,520 | 425,408 | 86.5% | 52,847 | 0.204 |
+| **LH+HL_L0** | **3,932,160** | **3,435,436** | **87.4%** | **405,269** | **1.564** |
+| HH_L0 | 1,966,080 | 1,928,982 | 98.1% | 53,154 | 0.205 |
+
+### Key Findings
+
+1. **LH+HL_L0 dominates**: 0.72 bpp at q=50 (31%), 1.56 bpp at q=75 (39%). Despite 87-95% zeros, the sheer volume (3.9M coefficients) means the non-zero magnitudes cost a lot.
+
+2. **HH subbands are extremely sparse**: 94-99% zeros. HH_L0 at 99.6% zeros (q=50) costs only 0.24 bpp — already efficient with ZRL.
+
+3. **Zeros are well-handled by ZRL**: The big cost driver is **magnitude coding of non-zero coefficients**, not zero representation.
+
+4. **Zerotree/EZW potential is limited**: Cross-subband correlations exist (HH_L0 zeros predict HH_L1 zeros) but the savings would be small since HH is already <0.35 bpp combined, and zerotrees destroy tile-independence.
+
+5. **Better magnitude coding is the high-value target**: The rANS advantage (43% better compression at q=75) comes from adaptive distribution modeling of magnitudes, not from better zero handling. A context-adaptive Rice k-parameter that adapts per-stream based on local magnitude statistics could close much of this gap while keeping Rice's parallel decode advantage.
+
+---
+
 ## 2026-03-01: Spatial Intra Prediction — Infrastructure + Architectural Analysis
 
 ### Hypothesis

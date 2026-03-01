@@ -647,19 +647,6 @@ impl EncoderPipeline {
                 });
             }
 
-            let dump_residuals = std::env::var("GNC_DUMP_RESIDUALS").is_ok();
-            let residual_staging = if dump_residuals {
-                // Allocate staging buffer for Y-plane residual readback
-                Some(ctx.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("residual_staging"),
-                    size: plane_size,
-                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                }))
-            } else {
-                None
-            };
-
             let _t_mcwq = std::time::Instant::now();
             for p in 0..3 {
                 let weights = if p == 0 {
@@ -690,13 +677,6 @@ impl EncoderPipeline {
                     padded_h,
                     &bufs.mc_fwd_params,
                 );
-
-                // Snapshot Y-plane residuals for diagnostic dump
-                if p == 0 {
-                    if let Some(ref stg) = residual_staging {
-                        cmd.copy_buffer_to_buffer(&bufs.mc_out, 0, stg, 0, plane_size);
-                    }
-                }
 
                 // mc_out feeds directly into wavelet (read-only at level 0)
                 self.transform.forward(
@@ -860,53 +840,6 @@ impl EncoderPipeline {
             }
 
             let mvs = MotionEstimator::finish_mv_readback_cached(ctx, &bufs.mv_staging_buf, bufs.mv_staging_size, bufs.me_total_blocks);
-
-            // Dump Y-plane residuals for motion compensation diagnostics
-            if let Some(ref stg) = residual_staging {
-                let slice = stg.slice(..);
-                let (tx, rx) = std::sync::mpsc::channel();
-                slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
-                ctx.device.poll(wgpu::Maintain::Wait);
-                if rx.recv().ok().and_then(|r| r.ok()).is_some() {
-                    let data = slice.get_mapped_range();
-                    let residuals: &[f32] = bytemuck::cast_slice(&data);
-                    let count = (padded_w * padded_h) as usize;
-                    let abs_sum: f64 = residuals[..count].iter().map(|&v| v.abs() as f64).sum();
-                    let max_abs: f32 = residuals[..count].iter().map(|v| v.abs()).fold(0.0f32, f32::max);
-                    let nonzero = residuals[..count].iter().filter(|&&v| v.abs() > 0.5).count();
-                    let mae = abs_sum / count as f64;
-                    eprintln!("  [RESIDUAL DUMP] Y-plane {}x{}: MAE={:.2}, max={:.1}, nonzero={}/{} ({:.1}%)",
-                        padded_w, padded_h, mae, max_abs, nonzero, count,
-                        nonzero as f64 / count as f64 * 100.0);
-
-                    // Also dump MV statistics
-                    let mv_count = mvs.len();
-                    let mut mv_nonzero = 0;
-                    let mut mv_abs_sum: i64 = 0;
-                    let mut mv_max: i16 = 0;
-                    for mv in &mvs {
-                        let dx = mv[0];
-                        let dy = mv[1];
-                        if dx != 0 || dy != 0 { mv_nonzero += 1; }
-                        mv_abs_sum += dx.abs() as i64 + dy.abs() as i64;
-                        mv_max = mv_max.max(dx.abs()).max(dy.abs());
-                    }
-                    eprintln!("  [RESIDUAL DUMP] MVs: {} blocks, {} nonzero ({:.1}%), avg_mag={:.1} hp, max={} hp",
-                        mv_count, mv_nonzero, mv_nonzero as f64 / mv_count as f64 * 100.0,
-                        mv_abs_sum as f64 / mv_count as f64, mv_max);
-
-                    // Write raw residual to file for visualization
-                    let path = format!("pframe_residual_y_{}x{}.raw", padded_w, padded_h);
-                    if let Ok(mut f) = std::fs::File::create(&path) {
-                        use std::io::Write;
-                        let _ = f.write_all(bytemuck::cast_slice(&residuals[..count]));
-                        eprintln!("  [RESIDUAL DUMP] Written to {} (f32, visualize with: python3 -c \"import numpy as np; import matplotlib.pyplot as plt; d=np.fromfile('{}', dtype=np.float32).reshape({},{}); plt.imshow(d, cmap='RdBu', vmin=-50, vmax=50); plt.colorbar(); plt.savefig('residual.png'); print('saved residual.png')\")",
-                            path, path, padded_h, padded_w);
-                    }
-                    drop(data);
-                }
-                stg.unmap();
-            }
 
             let entropy = match entropy_mode {
                 EntropyMode::Bitplane => EntropyData::Bitplane(bp_tiles),

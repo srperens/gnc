@@ -4,6 +4,85 @@
 
 ---
 
+## 2026-03-01: Compact Tile Header Format (Varint Stream Lengths)
+
+### Hypothesis
+Diagnostics revealed tile headers were 43-65% of P-frame size. The dominant cost: 256 × u16 stream_lengths = 512 bytes per tile, even when most streams are short or empty. Replacing fixed u16 with varint encoding should dramatically reduce header overhead, especially for P-frames where many streams are zero or very short after residual-adapted quantization.
+
+### Implementation
+- Added tile format flags byte: `TILE_FLAG_COMPACT_STREAMS` (0x01), `TILE_FLAG_ALL_SKIP` (0x02)
+- **All-skip shortcut**: Tiles where all 256 streams are empty AND all subbands skipped serialize as just 18 bytes (16-byte header + flags + skip_bitmap). Was 545 bytes.
+- **Varint stream lengths**: Each of 256 stream lengths encoded as 7-bit continuation varint (1 byte for lengths ≤127, 2 bytes for ≤16383). Most P-frame stream lengths fit in 1 byte.
+- Fixed `all_skip` overflow bug: `1u8 << 8` wraps in release mode when num_groups=8, causing all tiles to be falsely all-skipped. Fixed with proper mask: `if ng >= 8 { 0xFF } else { (1u8 << ng) - 1 }`
+- Backward-compatible: deserializer detects legacy format (no flags byte) and falls back
+- GPU decode unaffected: reads from in-memory RiceTile struct, not serialized bytes
+
+### Results (bbb_1080p, 8 frames, q=75)
+| Metric | Before | After | Change |
+|--------|--------|-------|--------|
+| I-frame tile headers | 64 KB | 34 KB | **-47%** |
+| P-frame 1 tile headers | 64 KB | 34 KB | **-47%** |
+| P-frame 2 tile headers | 64 KB | 17 KB | **-74%** |
+| P-frame 2 headers % of frame | ~55% | 8.6% | **meets <10% target** |
+| P-frame 1 headers % of frame | ~43% | 12.6% | close to target |
+
+### Analysis
+Varint encoding is the sweet spot: simpler than bitmap+packed approach (which was tried first and regressed I-frames), and effective because stream lengths cluster near zero for P-frames. The all-skip shortcut is valuable for P-frame tiles where MC residuals are near-zero everywhere. I-frames benefit less (most streams are active) but still save ~47% from varint vs u16. The overflow bug in all_skip detection (`1u8 << 8` wrapping) was a subtle release-mode-only issue — would have caused incorrect tile sizes in serialized output.
+
+---
+
+## 2026-03-01: Extended Per-Frame Encode Diagnostics
+
+### Hypothesis
+The basic Y-plane residual stats were insufficient to diagnose why P-frames were large. Need full pipeline visibility: per-channel residuals (Y/Co/Cg), bit budget breakdown, Rice entropy efficiency metrics, and actionable warnings.
+
+### Implementation
+- Per-channel residual stats: separate GPU readback buffers for Y, Co, Cg planes
+- `BitBudget` struct: mv_bytes, tile_header_bytes, coefficient_bytes, cfl_bytes, weight_map_bytes, total_bytes with percentage breakdown
+- `RiceEfficiency` struct: total_stream_bits, total_coeffs, avg_k_mag/k_zrl, tiles_all_skipped/total_tiles
+- `estimate_mv_delta_size()`: accurate delta-coded zigzag varint MV size estimation (raw i16 × 4 was 10× overestimate)
+- Extended `print()` with all new sections and `collect_warnings()` with coefficient ratio, near-zero %, k-param magnitude thresholds
+- All diagnostics gated behind existing `GNC_DIAGNOSTICS=1` / `--diagnostics` flag
+
+### Results
+Key diagnostic insight that drove the residual-adapted quantization fix: P-frame residuals had mean_abs ~2-5 (MC working correctly) but 0.97 bits/coeff (entropy coding not benefiting from small residuals). Led to identifying perceptual weights as the root cause. Bit budget breakdown then revealed tile headers as next bottleneck (43-65% of P-frames), driving the compact tile format work.
+
+### Analysis
+Full-pipeline diagnostics proved essential for systematic optimization. Each diagnostic category pointed to the next bottleneck: residual stats → quantization fix → bit budget → tile header format. The warning system (coefficient ratio > 0.8×, mean_abs > 20, near-zero < 40%) provides actionable thresholds for future experiments.
+
+---
+
+## 2026-03-01: Residual-Adapted Quantization for P/B Frames
+
+### Hypothesis
+P-frames were ~83% of I-frame size despite MC residuals being small (mean_abs ~2-5). Root cause: quantization parameters designed for natural images are counterproductive for MC residuals. Specifically:
+1. **Perceptual subband weights** (1.0→3.5) preserve high-frequency noise in outer subbands while over-quantizing inner subbands where the actual prediction error lives
+2. **Dead_zone too low** for residuals: threshold of 3.0 (outer) preserves noise coefficients that don't contribute to quality
+
+### Implementation
+- P/B frames now compute uniform subband weights (all 1.0) instead of using config's perceptual weights
+- Dead_zone doubled for P/B frames (`res_dead_zone = config.dead_zone * 2.0`)
+- Modified config stored in CompressedFrame ensures decoder uses matching dequantization
+- Changed in both GPU and CPU paths for `encode_pframe` and `encode_bframe`
+- AQ was already disabled for P/B frames (uses `dispatch` not `dispatch_adaptive`)
+
+### Results (bbb_1080p, 8 frames, q=75)
+| Frame Type | Before | After | Change |
+|-----------|--------|-------|--------|
+| P-frame/I-frame ratio | ~0.83× | 0.19-0.27× | **4× better** |
+| B-frame/I-frame ratio | ~0.83× | 0.14-0.18× | **5× better** |
+| Total bitrate savings vs all-I | ~17% | **71.3%** | +54pp |
+| P-frame PSNR | ~42.7 dB | 43.08 dB | +0.3 dB |
+| Subbands skipped (P) | ~9% | 47-92% | massive |
+| bits/coeff (P) | ~0.97 | 0.01-0.07 | ~50× better |
+
+All 141 tests pass. No quality regression.
+
+### Analysis
+The key insight: MC residuals are noise-like with energy spread uniformly across wavelet subbands. Perceptual weights that work well for natural images (quantize inner detail harder, preserve outer detail) are exactly wrong for residuals. Uniform weights + higher dead_zone aggressively zeros the small noise coefficients across all subbands, letting Rice+ZRL and the subband skip bitmap eliminate them entirely. The combination of this fix with the skip bitmap from the previous experiment creates a powerful synergy: uniform weights + 2× dead_zone → more zeros → more skipped subbands → dramatic compression improvement.
+
+---
+
 ## 2026-03-01: Rice+ZRL Zero Optimization — Subband Skip Bitmap + Uncapped Runs
 
 ### Hypothesis

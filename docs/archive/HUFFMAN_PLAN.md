@@ -1,5 +1,18 @@
 # Canonical Huffman GPU Entropy Coder — Implementation Plan
 
+> **Status: IMPLEMENTED (2026-03)**
+>
+> This plan has been fully implemented. The final design diverged from the
+> original plan in several significant ways — see [Implementation Notes](#implementation-notes-vs-original-plan)
+> at the bottom of this document.
+>
+> Relevant source files:
+> - `src/encoder/huffman.rs` — CPU codebook builder, encode/decode, serialization
+> - `src/encoder/huffman_gpu.rs` — GPU host code (histogram, encode, decode)
+> - `src/shaders/huffman_histogram.wgsl` — GPU histogram shader
+> - `src/shaders/huffman_encode.wgsl` — GPU encode shader
+> - `src/shaders/huffman_decode.wgsl` — GPU decode shader
+
 ## Context
 
 We have three entropy coders: rANS (good compression, slow — 32 sequential streams), Rice+ZRL (fast — 256 parallel streams, matches or beats rANS at q>=50 but +34% overhead at q=25), and Bitplane. Canonical Huffman could close the remaining low-bitrate gap: Rice-like parallelism (256 independent streams, no state chain) with near-rANS compression (variable-length codes adapt to actual distributions instead of assuming geometric like Rice).
@@ -285,3 +298,69 @@ The histogram GPU→CPU→codebook→GPU roundtrip adds latency. Mitigation:
 3. `cargo run --release -- benchmark -i test_material/frames/bbb_1080p.png -q 75 --entropy huffman`
 4. Compare bpp/PSNR/fps against Rice and rANS
 5. `cargo clippy` — zero warnings
+
+---
+
+## Implementation Notes vs Original Plan
+
+The following changes were made during implementation. The plan above reflects
+the **original** design; the actual code differs as noted below.
+
+### Alphabet: 64 symbols (not 255)
+
+The plan specified 255 symbols with escape at symbol 255. The implementation
+uses **64 symbols** (`HUFFMAN_ALPHABET_SIZE = 64`) with escape at symbol 63.
+64 covers >99% of wavelet magnitudes directly and cuts shared memory from 8KB
+to 2KB for the encoder codebook (512 entries × 4B).
+
+### Max code length: 8 bits (not 15)
+
+Clamped to 8 bits (`HUFFMAN_MAX_CODE_LEN = 8`) so the 8-bit prefix decode
+table resolves **every** code in a single lookup. The slow-path bit-by-bit
+fallback exists in the CPU decoder but is never hit. The GPU decoder has no
+slow path at all.
+
+### Escape coding: exp-Golomb (not raw 12-bit)
+
+Instead of a fixed 12-bit raw magnitude after the escape symbol, the
+implementation uses **exp-Golomb** coding for the excess magnitude
+(`magnitude - ESCAPE_SYM`). This adapts to the actual distribution of large
+values rather than wasting bits on a fixed-width field.
+
+### Zero-run-length coding added
+
+The plan described a simple significance bit (0=zero, 1=non-zero). The
+implementation uses **Rice-coded zero-run-length** (identical to the Rice
+entropy coder): bit=0 signals a zero run, followed by Rice(run_length-1, k_zrl)
+with per-subband k_zrl parameters. The GPU histogram shader also computes
+ZRL statistics (sum + count per group) for optimal k_zrl selection.
+
+### HuffmanTile struct simplified
+
+The plan's `SubbandCodebook` struct (with `min_symbol`, `alphabet_size`,
+`codewords`) was not implemented. Instead, `HuffmanTile` stores:
+- `code_lengths: Vec<Vec<u8>>` — per-group code lengths only
+- `k_zrl_values: Vec<u8>` — per-group Rice k for zero runs
+
+Canonical codewords are reconstructed from code lengths at decode time (which
+is the whole point of canonical Huffman — only lengths need to be transmitted).
+
+### Shared memory usage (actual)
+
+| Stage | Plan | Actual |
+|---|---|---|
+| Histogram | 8KB (2048 entries) | **2KB** (512 entries) + 64B ZRL stats |
+| Encoder codebook | 8KB | **2KB** (512 entries) + 32B k_zrl |
+| Decoder table | 8KB | **8KB** (2048 entries) + 32B k_zrl |
+
+Smaller encoder/histogram footprint improves workgroup occupancy on M1.
+
+### GPU stream buffer: 512 bytes (not 4096)
+
+The GPU path uses `MAX_STREAM_BYTES = 512` per stream (vs 4096 in the CPU
+fallback path), reducing GPU buffer allocation by 8x.
+
+### Tests: inline (not separate file)
+
+Tests are in `huffman.rs` as `#[cfg(test)] mod tests` (8 tests) rather than
+a separate `tests/huffman_tests.rs` file.

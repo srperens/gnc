@@ -1109,6 +1109,8 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
             motion_field,
             intra_modes,
             residual_stats: None,
+            residual_stats_co: None,
+            residual_stats_cg: None,
         },
         tile_crcs,
     }

@@ -557,12 +557,26 @@ impl EncoderPipeline {
         ctx.queue
             .write_buffer(&bufs.raw_input_buf, 0, bytemuck::cast_slice(rgb_data));
 
+        // --- Residual-adapted quantization for P-frames ---
+        // MC residuals are noise-like: energy spread uniformly across wavelet subbands.
+        // Perceptual weights (designed for natural images) are counterproductive here.
+        // Use uniform weights so all subbands get equal treatment, and increase dead_zone
+        // to aggressively zero small coefficients that don't contribute to quality.
+        let uniform_weights = crate::SubbandWeights::uniform(config.wavelet_levels);
+        let weights_luma = uniform_weights.pack_weights();
+        let weights_chroma = uniform_weights.pack_weights_chroma();
+        let res_dead_zone = config.dead_zone * 2.0;
+
+        // Config stored in CompressedFrame must match encoder parameters so decoder
+        // uses the same dequantization.
+        let mut res_config = config.clone();
+        res_config.subband_weights = uniform_weights;
+        res_config.dead_zone = res_dead_zone;
+
         let entropy_mode = EntropyMode::from_config(config);
         let tile_size = config.tile_size as usize;
         let tiles_x = info.tiles_x() as usize;
         let tiles_y = info.tiles_y() as usize;
-        let weights_luma = config.subband_weights.pack_weights();
-        let weights_chroma = config.subband_weights.pack_weights_chroma();
         let use_gpu_encode =
             config.gpu_entropy_encode && config.entropy_coder != EntropyCoder::Bitplane;
 
@@ -576,15 +590,29 @@ impl EncoderPipeline {
         let mut rice_tiles: Vec<rice::RiceTile> = Vec::new();
         let mut huffman_tiles: Vec<huffman::HuffmanTile> = Vec::new();
 
-        // Diagnostics: staging buffer for Y-plane residual readback
+        // Diagnostics: staging buffers for per-channel residual readback
         let diag_enabled = diagnostics::enabled();
         let diag_residual_staging = if diag_enabled {
-            Some(ctx.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("diag_residual_staging"),
-                size: plane_size as u64,
-                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            }))
+            Some([
+                ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("diag_residual_y_staging"),
+                    size: plane_size as u64,
+                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }),
+                ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("diag_residual_co_staging"),
+                    size: plane_size as u64,
+                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }),
+                ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("diag_residual_cg_staging"),
+                    size: plane_size as u64,
+                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }),
+            ])
         } else {
             None
         };
@@ -730,11 +758,9 @@ impl EncoderPipeline {
                     &bufs.mc_fwd_params_8,
                 );
 
-                // Diagnostics: copy Y residual before wavelet overwrites mc_out
-                if p == 0 {
-                    if let Some(ref stg) = diag_residual_staging {
-                        cmd.copy_buffer_to_buffer(&bufs.mc_out, 0, stg, 0, plane_size as u64);
-                    }
+                // Diagnostics: copy per-channel residual before wavelet overwrites mc_out
+                if let Some(ref stg) = diag_residual_staging {
+                    cmd.copy_buffer_to_buffer(&bufs.mc_out, 0, &stg[p], 0, plane_size as u64);
                 }
 
                 // mc_out feeds directly into wavelet (read-only at level 0)
@@ -755,7 +781,7 @@ impl EncoderPipeline {
                     quant_out,
                     padded_pixels as u32,
                     config.quantization_step,
-                    config.dead_zone,
+                    res_dead_zone,
                     true,
                     padded_w,
                     padded_h,
@@ -831,7 +857,7 @@ impl EncoderPipeline {
                         &bufs.cg_plane,
                         padded_pixels as u32,
                         config.quantization_step,
-                        config.dead_zone,
+                        res_dead_zone,
                         false,
                         padded_w,
                         padded_h,
@@ -901,12 +927,17 @@ impl EncoderPipeline {
             // Read back 8x8-resolution MVs from split staging
             let mvs = MotionEstimator::finish_mv_readback_cached(ctx, &bufs.split_mv_staging_buf, bufs.split_mv_staging_size, bufs.split_total_blocks);
 
-            // Diagnostics: read back Y residual and compute stats
-            let residual_stats = if let Some(ref stg) = diag_residual_staging {
-                Some(diagnostics::compute_residual_stats(ctx, stg, plane_size as u64, padded_pixels))
-            } else {
-                None
-            };
+            // Diagnostics: read back per-channel residual and compute stats
+            let (residual_stats, residual_stats_co, residual_stats_cg) =
+                if let Some(ref stg) = diag_residual_staging {
+                    (
+                        Some(diagnostics::compute_residual_stats(ctx, &stg[0], plane_size as u64, padded_pixels)),
+                        Some(diagnostics::compute_residual_stats(ctx, &stg[1], plane_size as u64, padded_pixels)),
+                        Some(diagnostics::compute_residual_stats(ctx, &stg[2], plane_size as u64, padded_pixels)),
+                    )
+                } else {
+                    (None, None, None)
+                };
 
             let entropy = match entropy_mode {
                 EntropyMode::Bitplane => EntropyData::Bitplane(bp_tiles),
@@ -920,7 +951,7 @@ impl EncoderPipeline {
 
             return (CompressedFrame {
                 info: *info,
-                config: config.clone(),
+                config: res_config.clone(),
                 entropy,
                 cfl_alphas: None,
                 weight_map: None,
@@ -933,6 +964,8 @@ impl EncoderPipeline {
                 }),
                 intra_modes: None,
                 residual_stats,
+                residual_stats_co,
+                residual_stats_cg,
             }, mv_buf); // Return 16x16 mv_buf as temporal predictor for next frame
         } else {
             // CPU entropy path: preprocess + ME batched, then per-plane submits
@@ -1052,7 +1085,7 @@ impl EncoderPipeline {
                     quant_out,
                     padded_pixels as u32,
                     config.quantization_step,
-                    config.dead_zone,
+                    res_dead_zone,
                     true,
                     padded_w,
                     padded_h,
@@ -1123,7 +1156,7 @@ impl EncoderPipeline {
                         &bufs.cg_plane,
                         padded_pixels as u32,
                         config.quantization_step,
-                        config.dead_zone,
+                        res_dead_zone,
                         false,
                         padded_w,
                         padded_h,
@@ -1173,7 +1206,7 @@ impl EncoderPipeline {
 
         (CompressedFrame {
             info: *info,
-            config: config.clone(),
+            config: res_config,
             entropy,
             cfl_alphas: None,
             weight_map: None,
@@ -1186,6 +1219,8 @@ impl EncoderPipeline {
             }),
             intra_modes: None,
             residual_stats: None,
+            residual_stats_co: None,
+            residual_stats_cg: None,
         }, mv_buf)
     }
 
@@ -1220,12 +1255,21 @@ impl EncoderPipeline {
         ctx.queue
             .write_buffer(&bufs.raw_input_buf, 0, bytemuck::cast_slice(rgb_data));
 
+        // --- Residual-adapted quantization for B-frames ---
+        // Same rationale as P-frames: MC residuals need uniform weights + higher dead_zone.
+        let uniform_weights = crate::SubbandWeights::uniform(config.wavelet_levels);
+        let weights_luma = uniform_weights.pack_weights();
+        let weights_chroma = uniform_weights.pack_weights_chroma();
+        let res_dead_zone = config.dead_zone * 2.0;
+
+        let mut res_config = config.clone();
+        res_config.subband_weights = uniform_weights;
+        res_config.dead_zone = res_dead_zone;
+
         let entropy_mode = EntropyMode::from_config(config);
         let tile_size = config.tile_size as usize;
         let tiles_x = info.tiles_x() as usize;
         let tiles_y = info.tiles_y() as usize;
-        let weights_luma = config.subband_weights.pack_weights();
-        let weights_chroma = config.subband_weights.pack_weights_chroma();
         let use_gpu_encode =
             config.gpu_entropy_encode && config.entropy_coder != EntropyCoder::Bitplane;
 
@@ -1239,15 +1283,29 @@ impl EncoderPipeline {
         let mut rice_tiles: Vec<rice::RiceTile> = Vec::new();
         let mut huffman_tiles: Vec<huffman::HuffmanTile> = Vec::new();
 
-        // Diagnostics: staging buffer for Y-plane residual readback
+        // Diagnostics: staging buffers for per-channel residual readback
         let diag_enabled = diagnostics::enabled();
         let diag_residual_staging = if diag_enabled {
-            Some(ctx.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("diag_bframe_residual_staging"),
-                size: plane_size as u64,
-                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            }))
+            Some([
+                ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("diag_bframe_residual_y_staging"),
+                    size: plane_size as u64,
+                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }),
+                ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("diag_bframe_residual_co_staging"),
+                    size: plane_size as u64,
+                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }),
+                ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("diag_bframe_residual_cg_staging"),
+                    size: plane_size as u64,
+                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }),
+            ])
         } else {
             None
         };
@@ -1348,11 +1406,9 @@ impl EncoderPipeline {
                     &bufs.mc_bidir_fwd_params,
                 );
 
-                // Diagnostics: copy Y residual before wavelet overwrites mc_out
-                if p == 0 {
-                    if let Some(ref stg) = diag_residual_staging {
-                        cmd.copy_buffer_to_buffer(&bufs.mc_out, 0, stg, 0, plane_size as u64);
-                    }
+                // Diagnostics: copy per-channel residual before wavelet overwrites mc_out
+                if let Some(ref stg) = diag_residual_staging {
+                    cmd.copy_buffer_to_buffer(&bufs.mc_out, 0, &stg[p], 0, plane_size as u64);
                 }
 
                 // mc_out feeds directly into wavelet (read-only at level 0)
@@ -1373,7 +1429,7 @@ impl EncoderPipeline {
                     quant_out,
                     padded_pixels as u32,
                     config.quantization_step,
-                    config.dead_zone,
+                    res_dead_zone,
                     true,
                     padded_w,
                     padded_h,
@@ -1452,12 +1508,17 @@ impl EncoderPipeline {
                     bufs.me_total_blocks,
                 );
 
-            // Diagnostics: read back Y residual and compute stats
-            let residual_stats = if let Some(ref stg) = diag_residual_staging {
-                Some(diagnostics::compute_residual_stats(ctx, stg, plane_size as u64, padded_pixels))
-            } else {
-                None
-            };
+            // Diagnostics: read back per-channel residual and compute stats
+            let (residual_stats, residual_stats_co, residual_stats_cg) =
+                if let Some(ref stg) = diag_residual_staging {
+                    (
+                        Some(diagnostics::compute_residual_stats(ctx, &stg[0], plane_size as u64, padded_pixels)),
+                        Some(diagnostics::compute_residual_stats(ctx, &stg[1], plane_size as u64, padded_pixels)),
+                        Some(diagnostics::compute_residual_stats(ctx, &stg[2], plane_size as u64, padded_pixels)),
+                    )
+                } else {
+                    (None, None, None)
+                };
 
             let entropy = match entropy_mode {
                 EntropyMode::Bitplane => EntropyData::Bitplane(bp_tiles),
@@ -1471,7 +1532,7 @@ impl EncoderPipeline {
 
             return (CompressedFrame {
                 info: *info,
-                config: config.clone(),
+                config: res_config.clone(),
                 entropy,
                 cfl_alphas: None,
                 weight_map: None,
@@ -1484,6 +1545,8 @@ impl EncoderPipeline {
                 }),
                 intra_modes: None,
                 residual_stats,
+                residual_stats_co,
+                residual_stats_cg,
             }, fwd_mv_buf, bwd_mv_buf);
         } else {
             // CPU entropy path: preprocess + bidir ME batched, then per-plane submits
@@ -1585,7 +1648,7 @@ impl EncoderPipeline {
                     quant_out,
                     padded_pixels as u32,
                     config.quantization_step,
-                    config.dead_zone,
+                    res_dead_zone,
                     true,
                     padded_w,
                     padded_h,
@@ -1639,7 +1702,7 @@ impl EncoderPipeline {
 
         (CompressedFrame {
             info: *info,
-            config: config.clone(),
+            config: res_config,
             entropy,
             cfl_alphas: None,
             weight_map: None,
@@ -1652,6 +1715,8 @@ impl EncoderPipeline {
             }),
             intra_modes: None,
             residual_stats: None,
+            residual_stats_co: None,
+            residual_stats_cg: None,
         }, fwd_mv_buf, bwd_mv_buf)
     }
 

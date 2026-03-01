@@ -5,6 +5,44 @@
 
 use crate::{CompressedFrame, EntropyData, FrameType, GpuContext, MotionField, ResidualStats};
 
+/// Bit budget breakdown: where the bytes go in a compressed frame.
+#[derive(Debug, Default)]
+pub struct BitBudget {
+    /// Motion vector data (delta-coded varint MVs + skip bitmap)
+    pub mv_bytes: usize,
+    /// Tile overhead: headers, Rice k-params, skip bitmaps, stream lengths
+    pub tile_header_bytes: usize,
+    /// Actual coefficient bitstream data (Rice/rANS/Huffman streams)
+    pub coefficient_bytes: usize,
+    /// CfL alpha side information
+    pub cfl_bytes: usize,
+    /// Adaptive quantization weight map
+    pub weight_map_bytes: usize,
+    /// Intra prediction modes
+    pub intra_bytes: usize,
+    /// Total frame size in bytes
+    pub total_bytes: usize,
+}
+
+/// Rice-specific entropy coding efficiency statistics.
+#[derive(Debug, Default)]
+pub struct RiceEfficiency {
+    /// Total bits across all tile streams
+    pub total_stream_bits: u64,
+    /// Total non-zero coefficients (estimated from tile data)
+    pub total_nonzero_coeffs: u64,
+    /// Total coefficients across all tiles
+    pub total_coeffs: u64,
+    /// Average Rice k parameter for magnitudes
+    pub avg_k_mag: f64,
+    /// Average Rice k parameter for zero-run lengths
+    pub avg_k_zrl: f64,
+    /// Number of tiles where all 256 streams are empty (skip_bitmap == 0xFF)
+    pub tiles_all_skipped: usize,
+    /// Total tiles
+    pub total_tiles: usize,
+}
+
 /// Check if diagnostics are enabled (cached after first call).
 pub fn enabled() -> bool {
     use std::sync::OnceLock;
@@ -110,8 +148,16 @@ pub struct FrameDiagnostics {
     pub subbands_skipped: usize,
     pub subbands_total: usize,
 
-    // Residual statistics (Y plane, spatial domain, after MC before wavelet)
+    // Residual statistics (spatial domain, after MC before wavelet)
     pub residual: Option<ResidualStats>,
+    pub residual_co: Option<ResidualStats>,
+    pub residual_cg: Option<ResidualStats>,
+
+    // Bit budget breakdown
+    pub bit_budget: Option<BitBudget>,
+
+    // Rice entropy efficiency
+    pub rice_efficiency: Option<RiceEfficiency>,
 
     // Warnings
     pub warnings: Vec<String>,
@@ -192,6 +238,10 @@ pub fn collect(
         subbands_skipped: 0,
         subbands_total: 0,
         residual: compressed.residual_stats,
+        residual_co: compressed.residual_stats_co,
+        residual_cg: compressed.residual_stats_cg,
+        bit_budget: None,
+        rice_efficiency: None,
         warnings: Vec::new(),
     };
 
@@ -202,6 +252,12 @@ pub fn collect(
 
     // Entropy stats
     collect_entropy_stats(&mut diag, &compressed.entropy);
+
+    // Bit budget breakdown
+    diag.bit_budget = Some(collect_bit_budget(compressed));
+
+    // Rice efficiency
+    diag.rice_efficiency = collect_rice_efficiency(&compressed.entropy);
 
     // Sanity warnings
     collect_warnings(&mut diag);
@@ -259,6 +315,154 @@ fn collect_entropy_stats(diag: &mut FrameDiagnostics, entropy: &EntropyData) {
     }
 }
 
+/// Estimate the serialized size of delta-coded zigzag varint MVs with skip bitmap.
+/// This matches the GP12 encoding in format.rs (but avoids full serialization).
+fn estimate_mv_delta_size(vectors: &[[i16; 2]], block_size: u32, width: u32, tile_size: u32) -> usize {
+    let n = vectors.len();
+    if n == 0 {
+        return 0;
+    }
+    // Skip bitmap: ceil(N/8) bytes
+    let bitmap_bytes = (n + 7) / 8;
+    // Count non-skip blocks and estimate varint sizes
+    let padded_w = ((width + tile_size - 1) / tile_size) * tile_size;
+    let blocks_x = (padded_w / block_size) as usize;
+    let blocks_y = if blocks_x > 0 { n / blocks_x } else { 0 };
+    let mut varint_bytes = 0usize;
+    for by in 0..blocks_y {
+        for bx in 0..blocks_x {
+            let idx = by * blocks_x + bx;
+            if idx >= n {
+                break;
+            }
+            if vectors[idx][0] == 0 && vectors[idx][1] == 0 {
+                continue; // skip — no bytes
+            }
+            // Estimate: each varint is 1-3 bytes. For small deltas (most cases), 1 byte.
+            // Median predictor makes deltas small. Assume ~2 bytes per non-skip MV.
+            varint_bytes += 2;
+        }
+    }
+    bitmap_bytes + varint_bytes
+}
+
+/// Compute bit budget breakdown from the compressed frame.
+fn collect_bit_budget(frame: &CompressedFrame) -> BitBudget {
+    let mv_bytes = frame.motion_field.as_ref().map_or(0, |mf| {
+        let w = frame.info.width;
+        let ts = frame.info.tile_size;
+        let fwd = estimate_mv_delta_size(&mf.vectors, mf.block_size, w, ts);
+        let bwd = mf.backward_vectors.as_ref().map_or(0, |v| {
+            estimate_mv_delta_size(v, 16, w, ts)
+        });
+        let modes = mf.block_modes.as_ref().map_or(0, |m| m.len());
+        // Also include block_size(u16) + num_blocks(u32) header = 6 bytes
+        6 + fwd + bwd + modes
+    });
+    let cfl_bytes = frame
+        .cfl_alphas
+        .as_ref()
+        .map_or(0, |a| a.alphas.len() * std::mem::size_of::<i16>());
+    let weight_map_bytes = frame
+        .weight_map
+        .as_ref()
+        .map_or(0, |wm| wm.len() * std::mem::size_of::<f32>());
+    let intra_bytes = frame.intra_modes.as_ref().map_or(0, |m| m.len());
+
+    // Break down tile data into header overhead vs coefficient data
+    let (tile_header_bytes, coefficient_bytes) = match &frame.entropy {
+        EntropyData::Rice(tiles) => {
+            let mut header = 0usize;
+            let mut coeff = 0usize;
+            for tile in tiles {
+                // Total tile size minus stream data = header overhead
+                let tile_total = tile.byte_size();
+                let data_bytes = tile.stream_data.len();
+                header += tile_total - data_bytes;
+                coeff += data_bytes;
+            }
+            (header, coeff)
+        }
+        _ => {
+            // For non-Rice: report all tile data as coefficient data
+            (0, frame.entropy.byte_size())
+        }
+    };
+
+    let total_bytes = mv_bytes + tile_header_bytes + coefficient_bytes + cfl_bytes + weight_map_bytes + intra_bytes;
+
+    BitBudget {
+        mv_bytes,
+        tile_header_bytes,
+        coefficient_bytes,
+        cfl_bytes,
+        weight_map_bytes,
+        intra_bytes,
+        total_bytes,
+    }
+}
+
+/// Compute Rice-specific entropy efficiency stats.
+fn collect_rice_efficiency(entropy: &EntropyData) -> Option<RiceEfficiency> {
+    let tiles = match entropy {
+        EntropyData::Rice(tiles) => tiles,
+        _ => return None,
+    };
+    if tiles.is_empty() {
+        return None;
+    }
+
+    let mut total_stream_bits = 0u64;
+    let mut total_coeffs = 0u64;
+    let mut k_mag_sum = 0f64;
+    let mut k_zrl_sum = 0f64;
+    let mut k_count = 0usize;
+    let mut tiles_all_skipped = 0usize;
+
+    for tile in tiles {
+        // Stream data bits
+        let tile_stream_bytes: u64 = tile.stream_lengths.iter().map(|&l| l as u64).sum();
+        total_stream_bits += tile_stream_bytes * 8;
+        total_coeffs += tile.num_coefficients as u64;
+
+        // K parameter averages (only for non-skipped subbands)
+        for g in 0..tile.num_groups as usize {
+            let skipped = (tile.skip_bitmap >> g) & 1 != 0;
+            if !skipped {
+                k_mag_sum += tile.k_values[g] as f64;
+                k_zrl_sum += tile.k_zrl_values[g] as f64;
+                k_count += 1;
+            }
+        }
+
+        // All-skipped tiles: skip_bitmap has all num_groups bits set
+        let ng = tile.num_groups.min(8) as u32;
+        let all_mask = if ng >= 8 { 0xFFu8 } else { (1u8 << ng) - 1 };
+        if all_mask != 0 && tile.skip_bitmap & all_mask == all_mask {
+            tiles_all_skipped += 1;
+        }
+    }
+
+    // Estimate non-zero coefficients: total_coeffs minus those in skipped subbands.
+    // For a rough estimate: each tile has num_coefficients total. Skipped subbands
+    // contribute proportionally. The stream data encodes only non-zero info.
+    // A more precise estimate: stream bits / avg_bits_per_coeff, but we compute it
+    // from the total bits and total coefficients for an upper bound.
+    let total_tiles = tiles.len();
+    let avg_k_mag = if k_count > 0 { k_mag_sum / k_count as f64 } else { 0.0 };
+    let avg_k_zrl = if k_count > 0 { k_zrl_sum / k_count as f64 } else { 0.0 };
+
+    Some(RiceEfficiency {
+        total_stream_bits,
+        total_nonzero_coeffs: 0, // Not precisely known without coefficient readback
+        total_coeffs,
+        avg_k_mag,
+        avg_k_zrl,
+        tiles_all_skipped,
+        total_tiles,
+    })
+}
+
 fn collect_warnings(diag: &mut FrameDiagnostics) {
     match diag.frame_type {
         FrameType::Predicted | FrameType::Bidirectional => {
@@ -300,10 +504,41 @@ fn collect_warnings(diag: &mut FrameDiagnostics) {
 
             // Residual energy
             if let Some(ref r) = diag.residual {
-                if r.mean_abs > 20.0 {
+                if r.mean_abs > 15.0 {
                     diag.warnings.push(format!(
-                        "WARN: {}-frame residual mean_abs={:.1} (>20) — MC not reducing signal effectively",
+                        "WARN: {}-frame Y residual mean_abs={:.1} (>15) — MC not reducing signal effectively",
                         ft, r.mean_abs
+                    ));
+                }
+                if r.near_zero_pct < 50.0 {
+                    diag.warnings.push(format!(
+                        "WARN: {}-frame Y near_zero={:.0}% (<50%) — most pixels have significant residual",
+                        ft, r.near_zero_pct
+                    ));
+                }
+            }
+
+            // Bit budget: P-frame coefficient data vs I-frame
+            if let (Some(ref bb), Some(iframe_bytes)) =
+                (&diag.bit_budget, diag.last_iframe_bytes)
+            {
+                if iframe_bytes > 0 && bb.coefficient_bytes > 0 {
+                    let coeff_ratio = bb.coefficient_bytes as f64 / iframe_bytes as f64;
+                    if coeff_ratio > 0.9 {
+                        diag.warnings.push(format!(
+                            "WARN: {}-frame coefficient data {:.0}% of I-frame total — residuals not significantly smaller",
+                            ft, coeff_ratio * 100.0
+                        ));
+                    }
+                }
+            }
+
+            // Rice efficiency
+            if let Some(ref re) = diag.rice_efficiency {
+                if re.avg_k_mag > 5.0 {
+                    diag.warnings.push(format!(
+                        "WARN: {}-frame Rice avg_k_mag={:.1} (>5) — magnitudes large, quantization may be too gentle",
+                        ft, re.avg_k_mag
                     ));
                 }
             }
@@ -404,11 +639,92 @@ pub fn print(diag: &FrameDiagnostics) {
         }
     }
 
-    // Residual statistics
+    // Residual statistics (per-channel)
     if let Some(ref r) = diag.residual {
         eprintln!(
-            "  Residual Y: mean_abs={:.2} stddev={:.2} near_zero={:.0}%",
+            "  Residual Y:  mean_abs={:.2} stddev={:.2} near_zero={:.0}%",
             r.mean_abs, r.stddev, r.near_zero_pct
+        );
+    }
+    if let Some(ref r) = diag.residual_co {
+        eprintln!(
+            "  Residual Co: mean_abs={:.2} stddev={:.2} near_zero={:.0}%",
+            r.mean_abs, r.stddev, r.near_zero_pct
+        );
+    }
+    if let Some(ref r) = diag.residual_cg {
+        eprintln!(
+            "  Residual Cg: mean_abs={:.2} stddev={:.2} near_zero={:.0}%",
+            r.mean_abs, r.stddev, r.near_zero_pct
+        );
+    }
+
+    // Bit budget breakdown
+    if let Some(ref bb) = diag.bit_budget {
+        if bb.total_bytes > 0 {
+            eprintln!("  Bit budget:");
+            let pct = |b: usize| b as f64 / bb.total_bytes as f64 * 100.0;
+            if bb.mv_bytes > 0 {
+                eprintln!(
+                    "    MV data:         {:>7.1} KB  ({:.1}%)",
+                    bb.mv_bytes as f64 / 1024.0,
+                    pct(bb.mv_bytes)
+                );
+            }
+            if bb.tile_header_bytes > 0 {
+                eprintln!(
+                    "    Tile headers:    {:>7.1} KB  ({:.1}%)",
+                    bb.tile_header_bytes as f64 / 1024.0,
+                    pct(bb.tile_header_bytes)
+                );
+            }
+            eprintln!(
+                "    Coefficient data:{:>7.1} KB  ({:.1}%)",
+                bb.coefficient_bytes as f64 / 1024.0,
+                pct(bb.coefficient_bytes)
+            );
+            if bb.cfl_bytes > 0 {
+                eprintln!(
+                    "    CfL alphas:      {:>7.1} KB  ({:.1}%)",
+                    bb.cfl_bytes as f64 / 1024.0,
+                    pct(bb.cfl_bytes)
+                );
+            }
+            if bb.weight_map_bytes > 0 {
+                eprintln!(
+                    "    AQ weight map:   {:>7.1} KB  ({:.1}%)",
+                    bb.weight_map_bytes as f64 / 1024.0,
+                    pct(bb.weight_map_bytes)
+                );
+            }
+            if bb.intra_bytes > 0 {
+                eprintln!(
+                    "    Intra modes:     {:>7.1} KB  ({:.1}%)",
+                    bb.intra_bytes as f64 / 1024.0,
+                    pct(bb.intra_bytes)
+                );
+            }
+            eprintln!(
+                "    Total:           {:>7.1} KB",
+                bb.total_bytes as f64 / 1024.0,
+            );
+        }
+    }
+
+    // Rice efficiency
+    if let Some(ref re) = diag.rice_efficiency {
+        let bits_per_coeff = if re.total_coeffs > 0 {
+            re.total_stream_bits as f64 / re.total_coeffs as f64
+        } else {
+            0.0
+        };
+        eprintln!(
+            "  Rice: bits/coeff={:.2} avg_k_mag={:.1} avg_k_zrl={:.1} all_skip_tiles={}/{}",
+            bits_per_coeff,
+            re.avg_k_mag,
+            re.avg_k_zrl,
+            re.tiles_all_skipped,
+            re.total_tiles,
         );
     }
 

@@ -516,6 +516,10 @@ pub struct CompressedFrame {
     pub intra_modes: Option<Vec<u8>>,
     /// Y-plane residual statistics (after MC, before wavelet). Diagnostics only.
     pub residual_stats: Option<ResidualStats>,
+    /// Co-plane residual statistics (after MC, before wavelet). Diagnostics only.
+    pub residual_stats_co: Option<ResidualStats>,
+    /// Cg-plane residual statistics (after MC, before wavelet). Diagnostics only.
+    pub residual_stats_cg: Option<ResidualStats>,
 }
 
 /// Statistics of the spatial-domain residual (current - predicted) for one plane.

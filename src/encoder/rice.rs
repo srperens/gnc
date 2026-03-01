@@ -38,8 +38,26 @@ pub struct RiceTile {
 
 impl RiceTile {
     pub fn byte_size(&self) -> usize {
-        // Header: num_coefficients + tile_size + num_levels + num_groups + k_values + k_zrl_values + skip_bitmap + stream_lengths
-        4 + 4 + 4 + 4 + self.k_values.len() + self.k_zrl_values.len() + 1 + self.stream_lengths.len() * 2 + self.stream_data.len()
+        let fixed_header = 4 + 4 + 4 + 4; // num_coefficients, tile_size, num_levels, num_groups
+        let flags = 1; // flags byte
+
+        // Check if all-skip
+        let all_empty = self.stream_data.is_empty()
+            && self.stream_lengths.iter().all(|&l| l == 0);
+        let ng = self.num_groups.min(8) as u32;
+        let all_mask = if ng >= 8 { 0xFFu8 } else { (1u8 << ng) - 1 };
+        let all_skip = all_empty && (self.skip_bitmap & all_mask == all_mask);
+
+        if all_skip {
+            // flags + skip_bitmap
+            fixed_header + flags + 1
+        } else {
+            let k_params = self.k_values.len() + self.k_zrl_values.len() + 1;
+            let stream_len_bytes: usize = self.stream_lengths.iter()
+                .map(|&l| varint_size(l as u16))
+                .sum();
+            fixed_header + flags + k_params + stream_len_bytes + self.stream_data.len()
+        }
     }
 }
 
@@ -412,25 +430,77 @@ pub fn rice_decode_tile(tile: &RiceTile) -> Vec<i32> {
 }
 
 /// Serialize a RiceTile to bytes.
+/// Tile format flags byte (after fixed 16-byte header).
+const TILE_FLAG_COMPACT_STREAMS: u8 = 0x01; // varint-encoded stream lengths
+const TILE_FLAG_ALL_SKIP: u8 = 0x02; // all subbands zero, no stream data
+
+/// Write unsigned varint (u16 range: max 3 bytes).
+fn write_tile_varint(out: &mut Vec<u8>, val: u16) {
+    let mut v = val as u32;
+    while v >= 0x80 {
+        out.push((v & 0x7F) as u8 | 0x80);
+        v >>= 7;
+    }
+    out.push(v as u8);
+}
+
+/// Read unsigned varint → u16.
+fn read_tile_varint(data: &[u8], pos: &mut usize) -> u16 {
+    let mut result = 0u32;
+    let mut shift = 0;
+    loop {
+        let b = data[*pos] as u32;
+        *pos += 1;
+        result |= (b & 0x7F) << shift;
+        if b < 0x80 {
+            break;
+        }
+        shift += 7;
+    }
+    result as u16
+}
+
+/// Compute varint byte size for a u16 value.
+fn varint_size(val: u16) -> usize {
+    if val < 0x80 { 1 } else if val < 0x4000 { 2 } else { 3 }
+}
+
 pub fn serialize_tile_rice(tile: &RiceTile) -> Vec<u8> {
     let mut out = Vec::with_capacity(tile.byte_size());
+    // Fixed header (16 bytes)
     out.extend_from_slice(&tile.num_coefficients.to_le_bytes());
     out.extend_from_slice(&tile.tile_size.to_le_bytes());
     out.extend_from_slice(&tile.num_levels.to_le_bytes());
     out.extend_from_slice(&tile.num_groups.to_le_bytes());
 
-    // k values + k_zrl values (one byte each, num_groups of each) + skip_bitmap
-    out.extend_from_slice(&tile.k_values);
-    out.extend_from_slice(&tile.k_zrl_values);
-    out.push(tile.skip_bitmap);
+    // Check if tile is all-skip (all streams empty)
+    let all_empty = tile.stream_data.is_empty()
+        && tile.stream_lengths.iter().all(|&l| l == 0);
+    let ng = tile.num_groups.min(8) as u32;
+    let all_mask = if ng >= 8 { 0xFFu8 } else { (1u8 << ng) - 1 };
+    let all_skip = all_empty && (tile.skip_bitmap & all_mask == all_mask);
 
-    // Stream lengths as u16 (max 4096 bytes per stream fits in u16)
-    for &len in &tile.stream_lengths {
-        out.extend_from_slice(&(len as u16).to_le_bytes());
+    if all_skip {
+        // Compact all-skip: flags + skip_bitmap only (2 bytes)
+        out.push(TILE_FLAG_ALL_SKIP | TILE_FLAG_COMPACT_STREAMS);
+        out.push(tile.skip_bitmap);
+    } else {
+        // Flags byte: always use varint stream lengths
+        out.push(TILE_FLAG_COMPACT_STREAMS);
+
+        // k values + k_zrl values + skip_bitmap
+        out.extend_from_slice(&tile.k_values);
+        out.extend_from_slice(&tile.k_zrl_values);
+        out.push(tile.skip_bitmap);
+
+        // Varint stream lengths (256 entries, 1-3 bytes each)
+        for &len in &tile.stream_lengths {
+            write_tile_varint(&mut out, len as u16);
+        }
+
+        // Stream data
+        out.extend_from_slice(&tile.stream_data);
     }
-
-    // Stream data
-    out.extend_from_slice(&tile.stream_data);
     out
 }
 
@@ -438,6 +508,7 @@ pub fn serialize_tile_rice(tile: &RiceTile) -> Vec<u8> {
 pub fn deserialize_tile_rice(data: &[u8]) -> (RiceTile, usize) {
     let mut pos = 0;
 
+    // Fixed header (16 bytes)
     let num_coefficients = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
     pos += 4;
     let tile_size = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
@@ -447,20 +518,54 @@ pub fn deserialize_tile_rice(data: &[u8]) -> (RiceTile, usize) {
     let num_groups = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
     pos += 4;
 
+    // Flags byte
+    let flags = data[pos];
+    pos += 1;
+    let compact_streams = flags & TILE_FLAG_COMPACT_STREAMS != 0;
+    let all_skip = flags & TILE_FLAG_ALL_SKIP != 0;
+
+    if all_skip {
+        // All-skip tile: just skip_bitmap, everything else is zero
+        let skip_bitmap = data[pos];
+        pos += 1;
+        return (
+            RiceTile {
+                num_coefficients,
+                tile_size,
+                num_levels,
+                num_groups,
+                k_values: vec![0; num_groups as usize],
+                k_zrl_values: vec![0; num_groups as usize],
+                skip_bitmap,
+                stream_lengths: vec![0; RICE_STREAMS_PER_TILE],
+                stream_data: Vec::new(),
+            },
+            pos,
+        );
+    }
+
+    // k_values + k_zrl_values + skip_bitmap
     let k_values = data[pos..pos + num_groups as usize].to_vec();
     pos += num_groups as usize;
-
     let k_zrl_values = data[pos..pos + num_groups as usize].to_vec();
     pos += num_groups as usize;
-
     let skip_bitmap = data[pos];
     pos += 1;
 
-    let mut stream_lengths = Vec::with_capacity(RICE_STREAMS_PER_TILE);
-    for _ in 0..RICE_STREAMS_PER_TILE {
-        let len = u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap()) as u32;
-        stream_lengths.push(len);
-        pos += 2;
+    // Stream lengths
+    let mut stream_lengths = vec![0u32; RICE_STREAMS_PER_TILE];
+    if compact_streams {
+        // Varint stream lengths (256 entries)
+        for i in 0..RICE_STREAMS_PER_TILE {
+            stream_lengths[i] = read_tile_varint(data, &mut pos) as u32;
+        }
+    } else {
+        // Legacy: fixed 256 × u16
+        for i in 0..RICE_STREAMS_PER_TILE {
+            stream_lengths[i] =
+                u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap()) as u32;
+            pos += 2;
+        }
     }
 
     let total_data: usize = stream_lengths.iter().map(|&l| l as usize).sum();

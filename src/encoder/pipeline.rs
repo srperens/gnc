@@ -1122,6 +1122,8 @@ impl EncoderPipeline {
             motion_field: None,
             intra_modes,
             residual_stats: None,
+            residual_stats_co: None,
+            residual_stats_cg: None,
         }
     }
 }

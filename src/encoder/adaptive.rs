@@ -247,8 +247,8 @@ impl VarianceAnalyzer {
 /// Low variance (smooth regions) -> weight > 1.0 (coarser quantization, save bits)
 /// High variance (textured regions) -> weight < 1.0 (finer quantization, preserve detail)
 ///
-/// The weights are normalized so their average across the frame is 1.0,
-/// preserving the target bitrate.
+/// The weights are normalized so their geometric mean is 1.0,
+/// which preserves total bitrate (since bits ∝ -log₂(step) and step ∝ weight).
 ///
 /// Finally, a simple 3x3 averaging is applied to smooth block boundaries.
 pub fn compute_weight_map(
@@ -283,17 +283,13 @@ pub fn compute_weight_map(
         })
         .collect();
 
-    // Normalize weights to average 1.0
-    let mean: f32 = weights.iter().sum::<f32>() / total as f32;
-    if mean > 0.0 {
-        for w in &mut weights {
-            *w /= mean;
-        }
-    }
-
-    // Re-clamp after normalization
+    // Normalize by geometric mean so E[log(w)] = 0.
+    // This preserves total bitrate since bits ∝ -log₂(step) and step ∝ weight.
+    let log_mean: f32 =
+        weights.iter().map(|w| w.max(0.001).ln()).sum::<f32>() / total as f32;
+    let geo_factor = (-log_mean).exp();
     for w in &mut weights {
-        *w = w.clamp(min_weight, max_weight);
+        *w = (*w * geo_factor).clamp(min_weight, max_weight);
     }
 
     // Smooth the weight map with a 3x3 box filter to reduce block boundary artifacts.
@@ -509,13 +505,12 @@ fn smooth_weight_map(weights: &[f32], blocks_x: u32, blocks_y: u32) -> Vec<f32> 
         }
     }
 
-    // Re-normalize after smoothing to maintain average ~1.0
-    let total = smoothed.len() as f32;
-    let mean: f32 = smoothed.iter().sum::<f32>() / total;
-    if mean > 0.0 {
-        for w in &mut smoothed {
-            *w /= mean;
-        }
+    // Re-normalize after smoothing using geometric mean (iso-bitrate)
+    let n = smoothed.len() as f32;
+    let log_mean: f32 = smoothed.iter().map(|w| w.max(0.001).ln()).sum::<f32>() / n;
+    let geo_factor = (-log_mean).exp();
+    for w in &mut smoothed {
+        *w *= geo_factor;
     }
 
     smoothed

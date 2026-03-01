@@ -426,7 +426,7 @@ pub fn quality_preset(q: u32) -> CodecConfig {
 
     let wavelet_levels = if q >= 50 { 4 } else { 3 };
     let aq_enabled = q <= 80; // AQ helps in lossy range; variance computed on LL subband
-    let aq_strength = if q >= 70 { 0.4 } else { 0.3 };
+    let aq_strength = if q >= 70 { 0.2 } else { 0.15 };
     let mut weights = if disc.perceptual {
         SubbandWeights::perceptual(wavelet_levels)
     } else {

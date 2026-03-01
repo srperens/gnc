@@ -5,10 +5,10 @@
 //
 // 5 phases with barriers:
 //   1. Map variance -> raw weights via clamp(1 + scale*(8 - log2(1+v)), 0.5, 2.0)
-//   2. Reduce sum for mean
-//   3. Normalize in-place, re-clamp
+//   2. Reduce sum of log(w) for geometric mean
+//   3. Normalize by geometric mean, clamp
 //   4. 3x3 box filter smooth -> weight_map output
-//   5. Re-normalize after smoothing
+//   5. Re-normalize by geometric mean (bits ∝ -log₂(step), so geo-mean=1 ≈ iso-bitrate)
 
 struct Params {
     blocks_x: u32,
@@ -42,12 +42,12 @@ fn main(@builtin(local_invocation_index) lid: u32) {
     }
     storageBarrier();
 
-    // Phase 2: Reduce sum for mean
-    var local_sum = 0.0;
+    // Phase 2: Reduce sum of log(w) for geometric mean
+    var local_log_sum = 0.0;
     for (var i = start; i < end; i++) {
-        local_sum += scratch[i];
+        local_log_sum += log(max(scratch[i], 0.001));
     }
-    shared_sum[lid] = local_sum;
+    shared_sum[lid] = local_log_sum;
     workgroupBarrier();
 
     for (var stride = 128u; stride > 0u; stride >>= 1u) {
@@ -57,13 +57,12 @@ fn main(@builtin(local_invocation_index) lid: u32) {
         workgroupBarrier();
     }
 
-    let mean = shared_sum[0] / f32(params.total_blocks);
+    let log_mean = shared_sum[0] / f32(params.total_blocks);
+    let geo_factor = exp(-log_mean);
 
-    // Phase 3: Normalize in-place, re-clamp
-    if mean > 0.0 {
-        for (var i = start; i < end; i++) {
-            scratch[i] = clamp(scratch[i] / mean, MIN_WEIGHT, MAX_WEIGHT);
-        }
+    // Phase 3: Normalize by geometric mean, clamp
+    for (var i = start; i < end; i++) {
+        scratch[i] = clamp(scratch[i] * geo_factor, MIN_WEIGHT, MAX_WEIGHT);
     }
     storageBarrier();
 
@@ -94,12 +93,14 @@ fn main(@builtin(local_invocation_index) lid: u32) {
     }
     storageBarrier();
 
-    // Phase 5: Re-normalize after smoothing
-    var local_sum2 = 0.0;
+    // Phase 5: Re-normalize after smoothing using geometric mean.
+    // Geometric mean = 1.0 ensures E[log(w)] = 0, which preserves total
+    // bitrate since bits ∝ -log2(step) and step ∝ weight.
+    var local_log_sum2 = 0.0;
     for (var i = start; i < end; i++) {
-        local_sum2 += weight_map[i];
+        local_log_sum2 += log(max(weight_map[i], 0.001));
     }
-    shared_sum[lid] = local_sum2;
+    shared_sum[lid] = local_log_sum2;
     workgroupBarrier();
 
     for (var stride = 128u; stride > 0u; stride >>= 1u) {
@@ -109,10 +110,9 @@ fn main(@builtin(local_invocation_index) lid: u32) {
         workgroupBarrier();
     }
 
-    let mean2 = shared_sum[0] / f32(params.total_blocks);
-    if mean2 > 0.0 {
-        for (var i = start; i < end; i++) {
-            weight_map[i] /= mean2;
-        }
+    let log_mean2 = shared_sum[0] / f32(params.total_blocks);
+    let geo_factor2 = exp(-log_mean2);
+    for (var i = start; i < end; i++) {
+        weight_map[i] *= geo_factor2;
     }
 }

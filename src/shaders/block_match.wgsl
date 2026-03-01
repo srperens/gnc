@@ -330,15 +330,19 @@ fn main(
     let hp_py = tid / params.block_size;
     let hp_cur_val = select(0.0, current_y[(block_origin_y + hp_py) * params.width + block_origin_x + hp_px], do_halfpel);
 
-    // 4 cardinal directions only (cross pattern, no diagonals)
-    for (var cand = 0u; cand < 4u; cand++) {
+    // 8-point diamond: 4 cardinal + 4 diagonal directions
+    for (var cand = 0u; cand < 8u; cand++) {
         var off_x: i32 = 0;
         var off_y: i32 = 0;
         switch cand {
-            case 0u: { off_x =  0; off_y = -1; }
-            case 1u: { off_x = -1; off_y =  0; }
-            case 2u: { off_x =  1; off_y =  0; }
-            case 3u: { off_x =  0; off_y =  1; }
+            case 0u: { off_x =  0; off_y = -1; }  // N
+            case 1u: { off_x = -1; off_y =  0; }  // W
+            case 2u: { off_x =  1; off_y =  0; }  // E
+            case 3u: { off_x =  0; off_y =  1; }  // S
+            case 4u: { off_x = -1; off_y = -1; }  // NW
+            case 5u: { off_x =  1; off_y = -1; }  // NE
+            case 6u: { off_x = -1; off_y =  1; }  // SW
+            case 7u: { off_x =  1; off_y =  1; }  // SE
             default: {}
         }
 

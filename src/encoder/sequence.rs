@@ -4,7 +4,7 @@ use super::adaptive::{self, AQ_LL_BLOCK_SIZE};
 use super::bitplane;
 use super::cfl;
 use super::entropy_helpers::{encode_entropy, EntropyMode};
-use super::motion::{MotionEstimator, ME_BLOCK_SIZE};
+use super::motion::{MotionEstimator, ME_BLOCK_SIZE, ME_SPLIT_BLOCK_SIZE};
 use super::pipeline::EncoderPipeline;
 use super::rans;
 use super::rice;
@@ -558,6 +558,7 @@ impl EncoderPipeline {
         // === Batched GPU pipeline: preprocess + ME + forward encode ===
         // MV buffer stays on GPU — used directly by MC without readback/re-upload.
         let mv_buf;
+        let split_mv_buf;
 
         if use_gpu_encode {
             // === Fully batched GPU pipeline: forward + entropy + local decode ===
@@ -637,11 +638,26 @@ impl EncoderPipeline {
                 &bufs.me_dummy_pred,
             );
 
+            // Variable block size: 8x8 split decision
+            let lambda_sad = (config.quantization_step * 3.0).round().max(1.0) as u32;
+            split_mv_buf = self.motion.estimate_split(
+                ctx,
+                &mut cmd,
+                &bufs.plane_a,
+                &bufs.gpu_ref_planes[0],
+                &mv_buf,
+                &bufs.me_sad_buf,
+                None, // 8x8 temporal predictor (future enhancement)
+                padded_w,
+                padded_h,
+                lambda_sad,
+            );
+
             // Profiling: flush ME to isolate MC+wavelet+quantize timing
             if profile {
                 ctx.queue.submit(Some(cmd.finish()));
                 ctx.device.poll(wgpu::Maintain::Wait);
-                eprintln!("    P ME: {:.1}ms", _t_me.elapsed().as_secs_f64() * 1000.0);
+                eprintln!("    P ME+split: {:.1}ms", _t_me.elapsed().as_secs_f64() * 1000.0);
                 cmd = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("pf_mcwq"),
                 });
@@ -671,11 +687,11 @@ impl EncoderPipeline {
                     &mut cmd,
                     cur_plane,
                     &bufs.gpu_ref_planes[p],
-                    &mv_buf,
+                    &split_mv_buf,
                     &bufs.mc_out,
                     padded_w,
                     padded_h,
-                    &bufs.mc_fwd_params,
+                    &bufs.mc_fwd_params_8,
                 );
 
                 // mc_out feeds directly into wavelet (read-only at level 0)
@@ -795,11 +811,11 @@ impl EncoderPipeline {
                         &mut cmd,
                         &bufs.plane_a,
                         &bufs.gpu_ref_planes[p],
-                        &mv_buf,
+                        &split_mv_buf,
                         &bufs.recon_out,
                         padded_w,
                         padded_h,
-                        &bufs.mc_inv_params,
+                        &bufs.mc_inv_params_8,
                     );
                     cmd.copy_buffer_to_buffer(
                         &bufs.recon_out,
@@ -811,8 +827,8 @@ impl EncoderPipeline {
                 }
             }
 
-            // MV staging copy using cached staging buffer
-            cmd.copy_buffer_to_buffer(&mv_buf, 0, &bufs.mv_staging_buf, 0, bufs.mv_staging_size);
+            // MV staging copy: 8x8 split MVs
+            cmd.copy_buffer_to_buffer(&split_mv_buf, 0, &bufs.split_mv_staging_buf, 0, bufs.split_mv_staging_size);
 
             // === Single submit for everything ===
             let _t_submit = std::time::Instant::now();
@@ -839,7 +855,8 @@ impl EncoderPipeline {
                 eprintln!("  P-frame GPU+readback: {:.1}ms", _t_submit.elapsed().as_secs_f64() * 1000.0);
             }
 
-            let mvs = MotionEstimator::finish_mv_readback_cached(ctx, &bufs.mv_staging_buf, bufs.mv_staging_size, bufs.me_total_blocks);
+            // Read back 8x8-resolution MVs from split staging
+            let mvs = MotionEstimator::finish_mv_readback_cached(ctx, &bufs.split_mv_staging_buf, bufs.split_mv_staging_size, bufs.split_total_blocks);
 
             let entropy = match entropy_mode {
                 EntropyMode::Bitplane => EntropyData::Bitplane(bp_tiles),
@@ -860,12 +877,12 @@ impl EncoderPipeline {
                 frame_type: FrameType::Predicted,
                 motion_field: Some(MotionField {
                     vectors: mvs,
-                    block_size: ME_BLOCK_SIZE,
+                    block_size: ME_SPLIT_BLOCK_SIZE,
                     backward_vectors: None,
                     block_modes: None,
                 }),
                 intra_modes: None,
-            }, mv_buf);
+            }, mv_buf); // Return 16x16 mv_buf as temporal predictor for next frame
         } else {
             // CPU entropy path: preprocess + ME batched, then per-plane submits
             let mut cmd = ctx
@@ -904,7 +921,7 @@ impl EncoderPipeline {
                 &bufs.cg_plane,
                 padded_pixels as u32,
             );
-            let (mb, _sad) = self.motion.estimate(
+            let (mb, sad_buf) = self.motion.estimate(
                 ctx,
                 &mut cmd,
                 &bufs.plane_a,
@@ -914,6 +931,21 @@ impl EncoderPipeline {
                 predictor_mvs,
             );
             mv_buf = mb;
+
+            // Variable block size: 8x8 split decision
+            let lambda_sad = (config.quantization_step * 3.0).round().max(1.0) as u32;
+            split_mv_buf = self.motion.estimate_split(
+                ctx,
+                &mut cmd,
+                &bufs.plane_a,
+                &bufs.gpu_ref_planes[0],
+                &mv_buf,
+                &sad_buf,
+                None,
+                padded_w,
+                padded_h,
+                lambda_sad,
+            );
             ctx.queue.submit(Some(cmd.finish()));
 
             for p in 0..3 {
@@ -940,16 +972,16 @@ impl EncoderPipeline {
                     _ => &bufs.plane_b,
                 };
 
-                self.motion.compensate(
+                self.motion.compensate_cached(
                     ctx,
                     &mut cmd,
                     cur_plane,
                     &bufs.gpu_ref_planes[p],
-                    &mv_buf,
+                    &split_mv_buf,
                     &bufs.mc_out,
                     padded_w,
                     padded_h,
-                    true,
+                    &bufs.mc_fwd_params_8,
                 );
                 // mc_out feeds directly into wavelet (read-only at level 0)
                 self.transform.forward(
@@ -1013,8 +1045,9 @@ impl EncoderPipeline {
         };
 
         // === Batched local decode + MV copy: single command encoder ===
+        let split_blocks_8 = (padded_w / ME_SPLIT_BLOCK_SIZE) * (padded_h / ME_SPLIT_BLOCK_SIZE);
         let mv_staging =
-            MotionEstimator::create_mv_staging(ctx, &mv_buf, me_total_blocks);
+            MotionEstimator::create_mv_staging(ctx, &split_mv_buf, split_blocks_8);
         {
             let mut cmd = ctx
                 .device
@@ -1057,16 +1090,16 @@ impl EncoderPipeline {
                         config.wavelet_levels,
                         config.wavelet_type,
                     );
-                    self.motion.compensate(
+                    self.motion.compensate_cached(
                         ctx,
                         &mut cmd,
                         &bufs.plane_a,
                         &bufs.gpu_ref_planes[p],
-                        &mv_buf,
+                        &split_mv_buf,
                         &bufs.recon_out,
                         padded_w,
                         padded_h,
-                        false,
+                        &bufs.mc_inv_params_8,
                     );
                     cmd.copy_buffer_to_buffer(
                         &bufs.recon_out,
@@ -1078,8 +1111,8 @@ impl EncoderPipeline {
                 }
             }
 
-            // MV copy in same batch — no extra submit round-trip
-            cmd.copy_buffer_to_buffer(&mv_buf, 0, &mv_staging.buffer, 0, mv_staging.size);
+            // MV copy in same batch — 8x8 split MVs
+            cmd.copy_buffer_to_buffer(&split_mv_buf, 0, &mv_staging.buffer, 0, mv_staging.size);
 
             ctx.queue.submit(Some(cmd.finish()));
         }
@@ -1096,7 +1129,7 @@ impl EncoderPipeline {
             frame_type: FrameType::Predicted,
             motion_field: Some(MotionField {
                 vectors: mvs,
-                block_size: ME_BLOCK_SIZE,
+                block_size: ME_SPLIT_BLOCK_SIZE,
                 backward_vectors: None,
                 block_modes: None,
             }),
@@ -1451,6 +1484,7 @@ impl EncoderPipeline {
                     padded_w,
                     padded_h,
                     true,
+                    ME_BLOCK_SIZE, // B-frames still use 16x16 blocks
                 );
                 // mc_out feeds directly into wavelet (read-only at level 0)
                 self.transform.forward(

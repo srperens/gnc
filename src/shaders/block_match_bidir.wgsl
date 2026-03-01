@@ -472,14 +472,18 @@ fn main(
         hp_bwd_sample = sample_hp_bwd(bx2, by2, params.width, params.height);
     }
 
-    for (var cand = 0u; cand < 4u; cand++) {
+    for (var cand = 0u; cand < 8u; cand++) {
         var off_x: i32 = 0;
         var off_y: i32 = 0;
         switch cand {
-            case 0u: { off_x =  0; off_y = -1; }
-            case 1u: { off_x = -1; off_y =  0; }
-            case 2u: { off_x =  1; off_y =  0; }
-            case 3u: { off_x =  0; off_y =  1; }
+            case 0u: { off_x =  0; off_y = -1; }  // N
+            case 1u: { off_x = -1; off_y =  0; }  // W
+            case 2u: { off_x =  1; off_y =  0; }  // E
+            case 3u: { off_x =  0; off_y =  1; }  // S
+            case 4u: { off_x = -1; off_y = -1; }  // NW
+            case 5u: { off_x =  1; off_y = -1; }  // NE
+            case 6u: { off_x = -1; off_y =  1; }  // SW
+            case 7u: { off_x =  1; off_y =  1; }  // SE
             default: {}
         }
 
@@ -574,14 +578,18 @@ fn main(
         hp_fwd_sample = sample_hp_fwd(fx2, fy2, params.width, params.height);
     }
 
-    for (var cand = 0u; cand < 4u; cand++) {
+    for (var cand = 0u; cand < 8u; cand++) {
         var off_x: i32 = 0;
         var off_y: i32 = 0;
         switch cand {
-            case 0u: { off_x =  0; off_y = -1; }
-            case 1u: { off_x = -1; off_y =  0; }
-            case 2u: { off_x =  1; off_y =  0; }
-            case 3u: { off_x =  0; off_y =  1; }
+            case 0u: { off_x =  0; off_y = -1; }  // N
+            case 1u: { off_x = -1; off_y =  0; }  // W
+            case 2u: { off_x =  1; off_y =  0; }  // E
+            case 3u: { off_x =  0; off_y =  1; }  // S
+            case 4u: { off_x = -1; off_y = -1; }  // NW
+            case 5u: { off_x =  1; off_y = -1; }  // NE
+            case 6u: { off_x = -1; off_y =  1; }  // SW
+            case 7u: { off_x =  1; off_y =  1; }  // SE
             default: {}
         }
 

@@ -284,6 +284,7 @@ impl DecoderPipeline {
                     padded_w,
                     padded_h,
                     false, // inverse: recon = residual + predicted
+                    bufs.mc_block_size,
                 );
             } else if is_pframe {
                 // P-frame: scratch_a has residual, add MC prediction from reference
@@ -297,6 +298,7 @@ impl DecoderPipeline {
                     padded_w,
                     padded_h,
                     false, // inverse: recon = residual + predicted
+                    bufs.mc_block_size,
                 );
             } else {
                 // I-frame: scratch_a has reconstructed spatial data

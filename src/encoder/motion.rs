@@ -66,6 +66,22 @@ pub struct BidirStaging {
     pub total_blocks: u32,
 }
 
+/// Block size for 8x8 sub-blocks used by split decision.
+pub const ME_SPLIT_BLOCK_SIZE: u32 = 8;
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct BlockMatchSplitParams {
+    width: u32,
+    height: u32,
+    blocks_x: u32,
+    blocks_y: u32,
+    total_macroblocks: u32,
+    lambda_sad: u32,
+    use_predictor: u32,
+    _pad: u32,
+}
+
 /// GPU-based motion estimation and compensation.
 pub struct MotionEstimator {
     match_pipeline: wgpu::ComputePipeline,
@@ -76,6 +92,8 @@ pub struct MotionEstimator {
     match_bidir_bgl: wgpu::BindGroupLayout,
     compensate_bidir_pipeline: wgpu::ComputePipeline,
     compensate_bidir_bgl: wgpu::BindGroupLayout,
+    split_pipeline: wgpu::ComputePipeline,
+    split_bgl: wgpu::BindGroupLayout,
 }
 
 impl MotionEstimator {
@@ -262,6 +280,52 @@ impl MotionEstimator {
                     cache: None,
                 });
 
+        // --- Split (variable block size) pipeline ---
+        let split_shader = ctx
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("block_match_split"),
+                source: wgpu::ShaderSource::Wgsl(
+                    include_str!("../shaders/block_match_split.wgsl").into(),
+                ),
+            });
+
+        // 7 bindings: uniform, current_y(ro), reference_y(ro), parent_mvs(ro),
+        //             parent_sads(ro), predictor_mvs(ro), output_mvs(rw)
+        let split_bgl = ctx
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("block_match_split_bgl"),
+                entries: &[
+                    bgl_uniform(0),
+                    bgl_storage_ro(1),
+                    bgl_storage_ro(2),
+                    bgl_storage_ro(3),
+                    bgl_storage_ro(4),
+                    bgl_storage_ro(5),
+                    bgl_storage_rw(6),
+                ],
+            });
+
+        let split_pl = ctx
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("block_match_split_pl"),
+                bind_group_layouts: &[&split_bgl],
+                push_constant_ranges: &[],
+            });
+
+        let split_pipeline = ctx
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("block_match_split_pipeline"),
+                layout: Some(&split_pl),
+                module: &split_shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+
         Self {
             match_pipeline,
             match_bgl,
@@ -271,6 +335,8 @@ impl MotionEstimator {
             match_bidir_bgl,
             compensate_bidir_pipeline,
             compensate_bidir_bgl,
+            split_pipeline,
+            split_bgl,
         }
     }
 
@@ -391,6 +457,7 @@ impl MotionEstimator {
     ///
     /// `forward=true`:  residual = current - predicted (encoder)
     /// `forward=false`: reconstructed = residual + predicted (decoder)
+    /// `block_size`: block size for MV grid (8 or 16)
     #[allow(clippy::too_many_arguments)]
     pub fn compensate(
         &self,
@@ -403,14 +470,15 @@ impl MotionEstimator {
         width: u32,
         height: u32,
         forward: bool,
+        block_size: u32,
     ) {
-        let blocks_x = width / ME_BLOCK_SIZE;
+        let blocks_x = width / block_size;
         let total_pixels = width * height;
 
         let params = MotionCompensateParams {
             width,
             height,
-            block_size: ME_BLOCK_SIZE,
+            block_size,
             mode: if forward { 0 } else { 1 },
             blocks_x,
             total_pixels,
@@ -629,14 +697,15 @@ impl MotionEstimator {
         width: u32,
         height: u32,
         forward: bool,
+        block_size: u32,
     ) {
-        let blocks_x = width / ME_BLOCK_SIZE;
+        let blocks_x = width / block_size;
         let total_pixels = width * height;
 
         let params = MotionCompensateParams {
             width,
             height,
-            block_size: ME_BLOCK_SIZE,
+            block_size,
             mode: if forward { 0 } else { 1 },
             blocks_x,
             total_pixels,
@@ -831,6 +900,136 @@ impl MotionEstimator {
             pass.set_bind_group(0, &bg, &[]);
             pass.dispatch_workgroups(workgroups, 1, 1);
         }
+    }
+
+    /// Dispatch 8x8 split decision shader.
+    /// Takes 16x16 parent MVs + SADs, runs 4× 8x8 sub-block refinement with
+    /// RD split decision. Returns 8x8-resolution MV buffer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn estimate_split(
+        &self,
+        ctx: &GpuContext,
+        cmd: &mut wgpu::CommandEncoder,
+        current_y: &wgpu::Buffer,
+        reference_y: &wgpu::Buffer,
+        parent_mvs: &wgpu::Buffer,
+        parent_sads: &wgpu::Buffer,
+        predictor_8x8_mvs: Option<&wgpu::Buffer>,
+        width: u32,
+        height: u32,
+        lambda_sad: u32,
+    ) -> wgpu::Buffer {
+        let blocks_x = width / ME_BLOCK_SIZE;
+        let blocks_y = height / ME_BLOCK_SIZE;
+        let total_macroblocks = blocks_x * blocks_y;
+
+        // Output at 8x8 resolution: 4x more blocks
+        let blocks_x_8 = width / ME_SPLIT_BLOCK_SIZE;
+        let blocks_y_8 = height / ME_SPLIT_BLOCK_SIZE;
+        let total_blocks_8 = blocks_x_8 * blocks_y_8;
+
+        let params = BlockMatchSplitParams {
+            width,
+            height,
+            blocks_x,
+            blocks_y,
+            total_macroblocks,
+            lambda_sad,
+            use_predictor: u32::from(predictor_8x8_mvs.is_some()),
+            _pad: 0,
+        };
+
+        let params_buf = ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("split_params"),
+                contents: bytemuck::bytes_of(&params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+
+        let output_mv_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("split_output_mvs"),
+            size: (total_blocks_8 as usize * 2 * std::mem::size_of::<i32>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        // Dummy predictor buffer when none provided
+        let dummy_pred;
+        let pred_buf = if let Some(pred) = predictor_8x8_mvs {
+            pred
+        } else {
+            dummy_pred = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("split_dummy_pred"),
+                size: 8,
+                usage: wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            });
+            &dummy_pred
+        };
+
+        let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("split_bg"),
+            layout: &self.split_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: current_y.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: reference_y.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: parent_mvs.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: parent_sads.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: pred_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: output_mv_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        {
+            let mut pass = cmd.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("block_match_split_pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.split_pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(total_macroblocks, 1, 1);
+        }
+
+        output_mv_buf
+    }
+
+    /// Downsample 8x8-resolution MVs to 16x16 by taking the top-left sub-block MV
+    /// of each macroblock. Used for temporal predictor input to block_match.wgsl.
+    pub fn downsample_8x8_to_16x16(mvs_8x8: &[[i16; 2]], blocks_x_8: u32, blocks_y_8: u32) -> Vec<[i16; 2]> {
+        let blocks_x_16 = blocks_x_8 / 2;
+        let blocks_y_16 = blocks_y_8 / 2;
+        let mut mvs_16 = Vec::with_capacity((blocks_x_16 * blocks_y_16) as usize);
+        for by in 0..blocks_y_16 {
+            for bx in 0..blocks_x_16 {
+                // Top-left sub-block of this macroblock
+                let idx_8 = (by * 2) * blocks_x_8 + (bx * 2);
+                mvs_16.push(mvs_8x8[idx_8 as usize]);
+            }
+        }
+        mvs_16
     }
 
     /// Like `estimate_bidir` but uses pre-allocated params/sad/dummy/modes buffers.
@@ -1700,6 +1899,7 @@ mod tests {
             width,
             height,
             true,
+            ME_BLOCK_SIZE,
         );
         ctx.queue.submit(Some(cmd.finish()));
 
@@ -1719,6 +1919,7 @@ mod tests {
             width,
             height,
             false,
+            ME_BLOCK_SIZE,
         );
         ctx.queue.submit(Some(cmd.finish()));
 

@@ -406,6 +406,7 @@ impl DecoderPipeline {
 
         // --- Motion vectors ---
         if let Some(mf) = &frame.motion_field {
+            bufs.mc_block_size = mf.block_size;
             let mv_size = (mf.vectors.len() * 2 * 4) as u64;
             ensure_var_buf(
                 ctx,

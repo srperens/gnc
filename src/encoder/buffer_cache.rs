@@ -3,7 +3,7 @@ use wgpu;
 use wgpu::util::DeviceExt;
 
 use super::adaptive;
-use super::motion::{ME_BIDIR_PRED_FINE_RANGE, ME_BIDIR_SEARCH_RANGE, ME_BLOCK_SIZE, ME_PRED_FINE_RANGE, ME_SEARCH_RANGE};
+use super::motion::{ME_BIDIR_PRED_FINE_RANGE, ME_BIDIR_SEARCH_RANGE, ME_BLOCK_SIZE, ME_PRED_FINE_RANGE, ME_SEARCH_RANGE, ME_SPLIT_BLOCK_SIZE};
 use crate::GpuContext;
 
 /// Cached GPU buffers reused across encode() calls to avoid per-frame allocation.
@@ -87,10 +87,18 @@ pub(super) struct CachedEncodeBuffers {
     pub(super) mc_bidir_fwd_params: wgpu::Buffer,
     pub(super) mc_bidir_inv_params: wgpu::Buffer,
 
+    // MC params for block_size=8 (split decision output)
+    pub(super) mc_fwd_params_8: wgpu::Buffer,
+    pub(super) mc_inv_params_8: wgpu::Buffer,
+
     // Staging buffers for deferred MV/bidir readback (reused across frames)
     pub(super) mv_staging_buf: wgpu::Buffer,
     pub(super) mv_staging_size: u64,
+    // Staging buffer for 8x8-resolution split MVs (4x larger than 16x16)
+    pub(super) split_mv_staging_buf: wgpu::Buffer,
+    pub(super) split_mv_staging_size: u64,
     pub(super) me_total_blocks: u32,
+    pub(super) split_total_blocks: u32,
     pub(super) bidir_fwd_staging: wgpu::Buffer,
     pub(super) bidir_bwd_staging: wgpu::Buffer,
     pub(super) bidir_modes_staging: wgpu::Buffer,
@@ -343,10 +351,12 @@ impl CachedEncodeBuffers {
                 mapped_at_creation: false,
             }),
 
-            mc_fwd_params: Self::make_mc_params(ctx, padded_w, padded_h, true),
-            mc_inv_params: Self::make_mc_params(ctx, padded_w, padded_h, false),
-            mc_bidir_fwd_params: Self::make_mc_params(ctx, padded_w, padded_h, true),
-            mc_bidir_inv_params: Self::make_mc_params(ctx, padded_w, padded_h, false),
+            mc_fwd_params: Self::make_mc_params_bs(ctx, padded_w, padded_h, true, ME_BLOCK_SIZE),
+            mc_inv_params: Self::make_mc_params_bs(ctx, padded_w, padded_h, false, ME_BLOCK_SIZE),
+            mc_bidir_fwd_params: Self::make_mc_params_bs(ctx, padded_w, padded_h, true, ME_BLOCK_SIZE),
+            mc_bidir_inv_params: Self::make_mc_params_bs(ctx, padded_w, padded_h, false, ME_BLOCK_SIZE),
+            mc_fwd_params_8: Self::make_mc_params_bs(ctx, padded_w, padded_h, true, ME_SPLIT_BLOCK_SIZE),
+            mc_inv_params_8: Self::make_mc_params_bs(ctx, padded_w, padded_h, false, ME_SPLIT_BLOCK_SIZE),
 
             mv_staging_buf: ctx.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("enc_mv_staging"),
@@ -355,7 +365,30 @@ impl CachedEncodeBuffers {
                 mapped_at_creation: false,
             }),
             mv_staging_size,
+            split_mv_staging_buf: {
+                let split_blocks_x = padded_w / ME_SPLIT_BLOCK_SIZE;
+                let split_blocks_y = padded_h / ME_SPLIT_BLOCK_SIZE;
+                let split_total = split_blocks_x * split_blocks_y;
+                let split_staging_size = (split_total as u64) * 2 * 4;
+                ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("enc_split_mv_staging"),
+                    size: split_staging_size,
+                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                })
+            },
+            split_mv_staging_size: {
+                let split_blocks_x = padded_w / ME_SPLIT_BLOCK_SIZE;
+                let split_blocks_y = padded_h / ME_SPLIT_BLOCK_SIZE;
+                let split_total = split_blocks_x * split_blocks_y;
+                (split_total as u64) * 2 * 4
+            },
             me_total_blocks,
+            split_total_blocks: {
+                let split_blocks_x = padded_w / ME_SPLIT_BLOCK_SIZE;
+                let split_blocks_y = padded_h / ME_SPLIT_BLOCK_SIZE;
+                split_blocks_x * split_blocks_y
+            },
             bidir_fwd_staging: ctx.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("enc_bidir_fwd_staging"),
                 size: mv_staging_size,
@@ -418,7 +451,7 @@ impl CachedEncodeBuffers {
             })
     }
 
-    fn make_mc_params(ctx: &GpuContext, padded_w: u32, padded_h: u32, forward: bool) -> wgpu::Buffer {
+    fn make_mc_params_bs(ctx: &GpuContext, padded_w: u32, padded_h: u32, forward: bool, block_size: u32) -> wgpu::Buffer {
         #[repr(C)]
         #[derive(Copy, Clone, Pod, Zeroable)]
         struct MotionCompensateParams {
@@ -434,9 +467,9 @@ impl CachedEncodeBuffers {
         let params = MotionCompensateParams {
             width: padded_w,
             height: padded_h,
-            block_size: ME_BLOCK_SIZE,
+            block_size,
             mode: if forward { 0 } else { 1 },
-            blocks_x: padded_w / ME_BLOCK_SIZE,
+            blocks_x: padded_w / block_size,
             total_pixels: padded_w * padded_h,
             _pad0: 0,
             _pad1: 0,

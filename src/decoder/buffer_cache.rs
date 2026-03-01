@@ -99,6 +99,9 @@ pub(super) struct CachedBuffers {
     pub(super) block_modes_cap: u64,
     pub(super) bwd_reference_planes: [wgpu::Buffer; 3],
 
+    // Motion compensation block size from MotionField (8 or 16)
+    pub(super) mc_block_size: u32,
+
     // Output texture for zero-readback decode path
     #[allow(dead_code)]
     pub(super) output_texture: wgpu::Texture,
@@ -481,6 +484,7 @@ impl CachedBuffers {
             block_modes_buf,
             block_modes_cap,
             bwd_reference_planes,
+            mc_block_size: ME_BLOCK_SIZE, // default, overwritten per-frame in prepare_frame_data
             output_texture,
             output_texture_view,
             buf_to_tex_bind_group,

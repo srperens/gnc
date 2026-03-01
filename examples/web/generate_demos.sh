@@ -35,6 +35,7 @@ encode() {
     shift 2
 
     local outfile="$OUT/${name}.gnv"
+    local diagfile="$OUT/${name}.diag"
     echo ""
     echo "=== ${name}.gnv ==="
     echo "  input: ${input}"
@@ -44,12 +45,14 @@ encode() {
     ensure_zero_indexed "$(dirname "$input")"
 
     local start=$SECONDS
-    "$GNC" encode-sequence -i "$input" -o "$outfile" "$@"
+    "$GNC" encode-sequence -i "$input" -o "$outfile" --diagnostics "$@" 2>"$diagfile"
     local elapsed=$(( SECONDS - start ))
 
     local size
     size=$(ls -lh "$outfile" | awk '{print $5}')
-    echo "  done: ${size} in ${elapsed}s"
+    local diag_frames
+    diag_frames=$(grep -c '^Frame ' "$diagfile" 2>/dev/null || echo 0)
+    echo "  done: ${size} in ${elapsed}s (${diag_frames} frames diagnosed → ${name}.diag)"
 }
 
 # Clean old demo files
@@ -57,8 +60,8 @@ echo "GNC demo file generator"
 echo "======================="
 echo "output: $OUT"
 echo ""
-echo "Removing old .gnv files..."
-rm -f "$OUT"/*.gnv
+echo "Removing old .gnv and .diag files..."
+rm -f "$OUT"/*.gnv "$OUT"/*.diag
 
 # --- Quick test files (small, fast to encode) ---
 
@@ -108,5 +111,8 @@ echo ""
 echo "=== Summary ==="
 echo ""
 ls -lhS "$OUT"/*.gnv 2>/dev/null || echo "No files generated"
+echo ""
+echo "Diagnostics files:"
+ls -lhS "$OUT"/*.diag 2>/dev/null || echo "No diagnostics generated"
 echo ""
 echo "Serve with: cd examples/web && bash serve.sh"

@@ -174,6 +174,10 @@ enum Command {
         /// Use rANS entropy coder instead of Rice (default)
         #[arg(long)]
         rans: bool,
+
+        /// Enable per-frame encode diagnostics (also via GNC_DIAGNOSTICS=1)
+        #[arg(long)]
+        diagnostics: bool,
     },
 
     /// Encode a sequence of image frames into a .gnv container
@@ -223,6 +227,10 @@ enum Command {
         /// Use rANS entropy coder instead of Rice (default)
         #[arg(long)]
         rans: bool,
+
+        /// Enable per-frame encode diagnostics (also via GNC_DIAGNOSTICS=1)
+        #[arg(long)]
+        diagnostics: bool,
     },
 
     /// Decode a .gnv container back to image frames
@@ -664,7 +672,11 @@ fn main() {
             rate_mode,
             fps,
             rans,
+            diagnostics,
         } => {
+            if diagnostics {
+                gnc::encoder::diagnostics::enable();
+            }
             let qstep_display = qstep
                 .map(|q| format!("{}", q))
                 .or_else(|| quality.map(|q| format!("q={}", q)))
@@ -876,7 +888,11 @@ fn main() {
             bitrate,
             rate_mode,
             rans,
+            diagnostics,
         } => {
+            if diagnostics {
+                gnc::encoder::diagnostics::enable();
+            }
             // Auto-detect frame count if not specified
             let frame_count = if let Some(n) = num_frames {
                 n

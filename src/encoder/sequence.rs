@@ -9,6 +9,7 @@ use super::pipeline::EncoderPipeline;
 use super::rans;
 use super::rice;
 use super::huffman;
+use super::diagnostics;
 use super::rate_control::RateController;
 use crate::{
     CodecConfig, CompressedFrame, EntropyCoder, EntropyData, FrameInfo, FrameType, GpuContext,
@@ -109,6 +110,9 @@ impl EncoderPipeline {
         // predictor path would limit search to ±2 pixels and miss real motion.
         let mut prev_mv_buf: Option<wgpu::Buffer> = None;
 
+        let diag_enabled = diagnostics::enabled();
+        let mut last_iframe_bytes: Option<usize> = None;
+
         let mut display_idx = 0;
         while display_idx < n {
             let is_keyframe = ki <= 1 || display_idx % ki == 0 || !has_reference;
@@ -140,11 +144,12 @@ impl EncoderPipeline {
                     eprintln!("  I-frame total: {:.1}ms", _t_iframe.elapsed().as_secs_f64() * 1000.0);
                 }
                 has_reference = true;
-                // Reset MV predictor after keyframe: the first P-frame after a
-                // keyframe should use full ±32 coarse search (no predictor), since
-                // the reference frame changed completely. Without this, the predictor
-                // path limits search to ±2 pixels and misses real motion.
                 prev_mv_buf = None;
+                if diag_enabled {
+                    last_iframe_bytes = Some(compressed.byte_size());
+                    let d = diagnostics::collect(display_idx, &compressed, frame_config.quantization_step, last_iframe_bytes);
+                    diagnostics::print(&d);
+                }
                 results[display_idx] = Some(compressed);
                 display_idx += 1;
                 continue;
@@ -172,6 +177,10 @@ impl EncoderPipeline {
                 prev_mv_buf = Some(new_mv_buf);
                 if let Some(ref mut rc) = rate_ctrl {
                     rc.update(frame_config.quantization_step, compressed.bpp());
+                }
+                if diag_enabled {
+                    let d = diagnostics::collect(display_idx, &compressed, frame_config.quantization_step, last_iframe_bytes);
+                    diagnostics::print(&d);
                 }
                 results[display_idx] = Some(compressed);
                 display_idx += 1;
@@ -219,6 +228,10 @@ impl EncoderPipeline {
                 if let Some(ref mut rc) = rate_ctrl {
                     rc.update(p_config.quantization_step, compressed.bpp());
                 }
+                if diag_enabled {
+                    let d = diagnostics::collect(p_display, &compressed, p_config.quantization_step, last_iframe_bytes);
+                    diagnostics::print(&d);
+                }
                 results[p_display] = Some(compressed);
 
                 // 3. Swap: gpu_ref_planes = past anchor, gpu_bwd_ref_planes = future P
@@ -259,6 +272,10 @@ impl EncoderPipeline {
                     if let Some(ref mut rc) = rate_ctrl {
                         rc.update(b_config.quantization_step, compressed.bpp());
                     }
+                    if diag_enabled {
+                        let d = diagnostics::collect(b_display, &compressed, b_config.quantization_step, last_iframe_bytes);
+                        diagnostics::print(&d);
+                    }
                     results[b_display] = Some(compressed);
                 }
 
@@ -296,6 +313,10 @@ impl EncoderPipeline {
                 prev_mv_buf = Some(new_mv_buf);
                 if let Some(ref mut rc) = rate_ctrl {
                     rc.update(p_config.quantization_step, compressed.bpp());
+                }
+                if diag_enabled {
+                    let d = diagnostics::collect(j, &compressed, p_config.quantization_step, last_iframe_bytes);
+                    diagnostics::print(&d);
                 }
                 results[j] = Some(compressed);
             }

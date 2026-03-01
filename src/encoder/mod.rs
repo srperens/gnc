@@ -4,6 +4,7 @@ pub mod block_transform;
 mod buffer_cache;
 pub mod fused_block;
 pub mod cfl;
+pub mod diagnostics;
 pub mod color;
 pub mod entropy;
 pub(crate) mod entropy_helpers;

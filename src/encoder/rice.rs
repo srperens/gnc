@@ -229,6 +229,12 @@ pub fn rice_encode_tile(coefficients: &[i32], tile_size: u32, num_levels: u32) -
         let mut writer = BitWriter::new();
         let mut s = 0;
 
+        // Initialize EMA from static k seeds (per-stream, 8 groups)
+        let mut ema = [0u32; 8];
+        for g in 0..num_groups {
+            ema[g] = (1u32 << k_values[g]).max(1) << 4;
+        }
+
         while s < symbols_per_stream {
             let coeff_idx = stream_id + s * RICE_STREAMS_PER_TILE;
             let coeff = coefficients[coeff_idx];
@@ -260,7 +266,18 @@ pub fn rice_encode_tile(coefficients: &[i32], tile_size: u32, num_levels: u32) -
                 let y = (coeff_idx / tile_size as usize) as u32;
                 let x = (coeff_idx % tile_size as usize) as u32;
                 let g = compute_subband_group(x, y, tile_size, num_levels);
-                writer.write_rice(magnitude, k_values[g]);
+
+                // Derive adaptive k from EMA
+                let ema_mean = ema[g] >> 4;
+                let k = if ema_mean > 0 {
+                    (31 - ema_mean.leading_zeros()).min(15) as u8
+                } else {
+                    0
+                };
+                writer.write_rice(magnitude, k);
+
+                // Update EMA
+                ema[g] = ema[g] - (ema[g] >> 3) + (magnitude << 1);
                 s += 1;
             }
         }
@@ -288,11 +305,18 @@ pub fn rice_decode_tile(tile: &RiceTile) -> Vec<i32> {
     let symbols_per_stream = num_coefficients / RICE_STREAMS_PER_TILE;
     let mut coefficients = vec![0i32; num_coefficients];
 
+    let num_groups = tile.num_groups as usize;
     let mut data_offset = 0usize;
     for stream_id in 0..RICE_STREAMS_PER_TILE {
         let stream_len = tile.stream_lengths[stream_id] as usize;
         let stream_data = &tile.stream_data[data_offset..data_offset + stream_len];
         let mut reader = BitReader::new(stream_data);
+
+        // Initialize EMA from static k seeds (per-stream, 8 groups)
+        let mut ema = [0u32; 8];
+        for g in 0..num_groups {
+            ema[g] = (1u32 << tile.k_values[g]).max(1) << 4;
+        }
 
         let mut s = 0usize;
         while s < symbols_per_stream {
@@ -316,13 +340,25 @@ pub fn rice_decode_tile(tile: &RiceTile) -> Vec<i32> {
                 let y = (coeff_idx / tile.tile_size as usize) as u32;
                 let x = (coeff_idx % tile.tile_size as usize) as u32;
                 let g = compute_subband_group(x, y, tile.tile_size, tile.num_levels);
-                let k = tile.k_values[g];
-                let magnitude = reader.read_rice(k) + 1;
+
+                // Derive adaptive k from EMA
+                let ema_mean = ema[g] >> 4;
+                let k = if ema_mean > 0 {
+                    (31 - ema_mean.leading_zeros()).min(15) as u8
+                } else {
+                    0
+                };
+                let rice_val = reader.read_rice(k);
+                let magnitude = rice_val + 1;
+
                 coefficients[coeff_idx] = if sign == 1 {
                     -(magnitude as i32)
                 } else {
                     magnitude as i32
                 };
+
+                // Update EMA
+                ema[g] = ema[g] - (ema[g] >> 3) + (rice_val << 1);
                 s += 1;
             }
         }

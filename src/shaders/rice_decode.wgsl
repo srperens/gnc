@@ -37,6 +37,9 @@ var<private> p_current_byte: u32;
 var<private> p_bit_pos: u32;     // 0..8, position within current byte
 var<private> p_byte_offset: u32; // absolute byte offset in stream_data
 
+// Per-thread EMA state for adaptive k (fixed-point ×16, window ≈ 8 coefficients)
+var<private> p_ema: array<u32, 8>;
+
 // Directional subband grouping — must match encoder exactly.
 fn compute_subband_group(lx: u32, ly: u32) -> u32 {
     var region = params.tile_size;
@@ -135,6 +138,11 @@ fn main(
     }
     workgroupBarrier();
 
+    // Initialize EMA from static k seeds (per-thread private, 8 groups)
+    for (var gi = 0u; gi < MAX_GROUPS; gi++) {
+        p_ema[gi] = max(1u, 1u << shared_k[gi]) << 4u;
+    }
+
     // Initialize bit reader with this stream's byte offset
     let stream_idx = tile_id * STREAMS_PER_TILE + thread_id;
     p_byte_offset = stream_offsets[stream_idx];
@@ -170,10 +178,19 @@ fn main(
 
             let sign = read_bit();
             let g = compute_subband_group(tile_col, tile_row);
-            let k = shared_k[g];
-            let magnitude = read_rice(k) + 1u;
+
+            // Derive adaptive k from EMA (context-adaptive Rice parameter)
+            let ema_mean = p_ema[g] >> 4u;
+            let k = select(min(31u - countLeadingZeros(ema_mean), 15u), 0u, ema_mean == 0u);
+
+            let rice_val = read_rice(k);
+            let magnitude = rice_val + 1u;
             let value = select(i32(magnitude), -i32(magnitude), sign == 1u);
             output[plane_idx] = f32(value);
+
+            // Update EMA with decoded magnitude
+            p_ema[g] = p_ema[g] - (p_ema[g] >> 3u) + (rice_val << 1u);
+
             s += 1u;
         }
     }

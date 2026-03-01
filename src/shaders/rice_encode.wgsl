@@ -59,6 +59,9 @@ var<private> p_word_pos: u32;
 var<private> p_stream_word_base: u32;
 var<private> p_total_bytes: u32;
 
+// Per-thread EMA state for adaptive k (fixed-point ×16, window ≈ 8 coefficients)
+var<private> p_ema: array<u32, 8>;
+
 // Directional subband grouping — matches CPU compute_subband_group exactly.
 fn compute_subband_group(lx: u32, ly: u32) -> u32 {
     var region = params.tile_size;
@@ -266,6 +269,11 @@ fn main(
     p_word_pos = 0u;
     p_total_bytes = 0u;
 
+    // Initialize EMA from static k seeds (per-thread private, 8 groups)
+    for (var gi = 0u; gi < MAX_GROUPS; gi++) {
+        p_ema[gi] = max(1u, 1u << shared_k[gi]) << 4u;
+    }
+
     var s = 0u;
     while (s < symbols_per_stream) {
         let coeff_idx = thread_id + s * STREAMS_PER_TILE;
@@ -327,7 +335,11 @@ fn main(
             let sign_bit = select(0u, 1u, coeff < 0);
             let magnitude = u32(abs(coeff)) - 1u;
             let g = compute_subband_group(tile_col, tile_row);
-            let k = shared_k[g];
+
+            // Derive adaptive k from EMA (context-adaptive Rice parameter)
+            let ema_mean = p_ema[g] >> 4u;
+            let k = select(min(31u - countLeadingZeros(ema_mean), 15u), 0u, ema_mean == 0u);
+
             let quotient = magnitude >> k;
             let remainder = magnitude & ((1u << k) - 1u);
 
@@ -356,6 +368,9 @@ fn main(
                     emit_bits(remainder, k);
                 }
             }
+
+            // Update EMA with encoded magnitude
+            p_ema[g] = p_ema[g] - (p_ema[g] >> 3u) + (magnitude << 1u);
 
             s += 1u;
         }

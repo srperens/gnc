@@ -346,6 +346,7 @@ impl MotionEstimator {
     /// When `predictor_mvs` is provided (from previous P-frame), the shader skips the
     /// expensive coarse search and uses the predicted MV as the starting point for a fine
     /// search with ±`ME_PRED_FINE_RANGE` pixels. This typically reduces ME cost by ~4x.
+    #[allow(clippy::too_many_arguments)] // motion estimation needs current/reference frames + dimensions
     pub fn estimate(
         &self,
         ctx: &GpuContext,

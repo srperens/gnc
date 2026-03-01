@@ -272,10 +272,7 @@ impl GpuHuffmanEncoder {
     }
 
     fn ensure_buffers(&mut self, ctx: &GpuContext, num_tiles: usize) {
-        let needs_realloc = self
-            .cached
-            .as_ref()
-            .map_or(true, |c| c.num_tiles != num_tiles);
+        let needs_realloc = self.cached.as_ref().is_none_or(|c| c.num_tiles != num_tiles);
         if needs_realloc {
             self.cached = Some(CachedHuffmanEncodeBuffers::new(ctx, num_tiles));
         }
@@ -570,10 +567,10 @@ impl GpuHuffmanEncoder {
                     .collect();
 
                 let mut packed_data = Vec::new();
-                for s in 0..HUFFMAN_STREAMS_PER_TILE {
+                for (s, &len) in stream_lengths.iter().enumerate() {
                     let slot_offset =
                         (t * HUFFMAN_STREAMS_PER_TILE + s) * MAX_STREAM_BYTES;
-                    let len = stream_lengths[s] as usize;
+                    let len = len as usize;
                     packed_data
                         .extend_from_slice(&stream_data[slot_offset..slot_offset + len]);
                 }
@@ -683,7 +680,7 @@ impl GpuHuffmanDecoder {
             }
         }
 
-        let padded_bytes = ((total_bytes as usize + 3) / 4) * 4;
+        let padded_bytes = (total_bytes as usize).div_ceil(4) * 4;
         let mut stream_data = vec![0u8; padded_bytes];
         let mut write_pos = 0usize;
         for tile in tiles {
@@ -711,6 +708,7 @@ impl GpuHuffmanDecoder {
     }
 
     /// Dispatch GPU Huffman decode for one plane.
+    #[allow(clippy::too_many_arguments)] // GPU dispatch requires separate buffer bindings
     pub fn dispatch_decode(
         &self,
         ctx: &GpuContext,

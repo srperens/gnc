@@ -1156,6 +1156,7 @@ fn main() {
             }
 
             // Output frames in display order
+            #[allow(clippy::needless_range_loop)] // local_idx used for both results[] and abs_idx
             for local_idx in 0..frame_types.len() {
                 let abs_idx = start_frame + local_idx;
                 let should_output = if seek.is_some() {

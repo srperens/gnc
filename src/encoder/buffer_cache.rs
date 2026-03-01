@@ -81,18 +81,14 @@ pub(super) struct CachedEncodeBuffers {
     pub(super) bidir_sad_buf: wgpu::Buffer,
     pub(super) bidir_modes_scratch: wgpu::Buffer,
 
-    // MC params (2 mode variants × 2 MC types = 4 buffers)
-    pub(super) mc_fwd_params: wgpu::Buffer,
-    pub(super) mc_inv_params: wgpu::Buffer,
+    // MC params (used by bidir + split-decision 8×8)
     pub(super) mc_bidir_fwd_params: wgpu::Buffer,
-    pub(super) mc_bidir_inv_params: wgpu::Buffer,
 
     // MC params for block_size=8 (split decision output)
     pub(super) mc_fwd_params_8: wgpu::Buffer,
     pub(super) mc_inv_params_8: wgpu::Buffer,
 
     // Staging buffers for deferred MV/bidir readback (reused across frames)
-    pub(super) mv_staging_buf: wgpu::Buffer,
     pub(super) mv_staging_size: u64,
     // Staging buffer for 8x8-resolution split MVs (4x larger than 16x16)
     pub(super) split_mv_staging_buf: wgpu::Buffer,
@@ -351,19 +347,10 @@ impl CachedEncodeBuffers {
                 mapped_at_creation: false,
             }),
 
-            mc_fwd_params: Self::make_mc_params_bs(ctx, padded_w, padded_h, true, ME_BLOCK_SIZE),
-            mc_inv_params: Self::make_mc_params_bs(ctx, padded_w, padded_h, false, ME_BLOCK_SIZE),
             mc_bidir_fwd_params: Self::make_mc_params_bs(ctx, padded_w, padded_h, true, ME_BLOCK_SIZE),
-            mc_bidir_inv_params: Self::make_mc_params_bs(ctx, padded_w, padded_h, false, ME_BLOCK_SIZE),
             mc_fwd_params_8: Self::make_mc_params_bs(ctx, padded_w, padded_h, true, ME_SPLIT_BLOCK_SIZE),
             mc_inv_params_8: Self::make_mc_params_bs(ctx, padded_w, padded_h, false, ME_SPLIT_BLOCK_SIZE),
 
-            mv_staging_buf: ctx.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("enc_mv_staging"),
-                size: mv_staging_size,
-                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            }),
             mv_staging_size,
             split_mv_staging_buf: {
                 let split_blocks_x = padded_w / ME_SPLIT_BLOCK_SIZE;

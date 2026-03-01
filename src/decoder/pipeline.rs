@@ -831,66 +831,75 @@ impl DecoderPipeline {
 
         self.prepare_frame_data(ctx, frame);
 
-        let cached = self.cached.borrow();
-        let bufs = cached.as_ref().unwrap();
+        // Scope the RefCell borrow so it's dropped before the await point
+        let receiver = {
+            let cached = self.cached.borrow();
+            let bufs = cached.as_ref().unwrap();
 
-        let mut cmd = self.encode_gpu_work(ctx, frame, bufs);
+            let mut cmd = self.encode_gpu_work(ctx, frame, bufs);
 
-        // GPU pack: f32 → packed u8
-        {
-            let pack_bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("pack_bg"),
-                layout: &self.pack_bgl,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: bufs.pack_params_buf.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: bufs.cropped_buf.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: bufs.packed_u8_buf.as_entire_binding(),
-                    },
-                ],
-            });
+            // GPU pack: f32 → packed u8
+            {
+                let pack_bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("pack_bg"),
+                    layout: &self.pack_bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: bufs.pack_params_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: bufs.cropped_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: bufs.packed_u8_buf.as_entire_binding(),
+                        },
+                    ],
+                });
 
-            let workgroups = packed_u32s.div_ceil(256);
-            let mut pass = cmd.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("pack_pass"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.pack_pipeline);
-            pass.set_bind_group(0, &pack_bg, &[]);
-            pass.dispatch_workgroups(workgroups, 1, 1);
-        }
-
-        // Copy packed u8 to staging
-        cmd.copy_buffer_to_buffer(
-            &bufs.packed_u8_buf,
-            0,
-            &bufs.staging_u8,
-            0,
-            packed_byte_size,
-        );
-
-        ctx.queue.submit(Some(cmd.finish()));
-
-        // WASM-compatible async readback: map_async + yield to browser event loop
-        let slice = bufs.staging_u8.slice(..);
-        let (sender, receiver) = futures_channel::oneshot::channel();
-        let mut sender = Some(sender);
-        slice.map_async(wgpu::MapMode::Read, move |result| {
-            if let Some(tx) = sender.take() {
-                let _ = tx.send(result);
+                let workgroups = packed_u32s.div_ceil(256);
+                let mut pass = cmd.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("pack_pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.pack_pipeline);
+                pass.set_bind_group(0, &pack_bg, &[]);
+                pass.dispatch_workgroups(workgroups, 1, 1);
             }
-        });
-        ctx.device.poll(wgpu::Maintain::Poll);
+
+            // Copy packed u8 to staging
+            cmd.copy_buffer_to_buffer(
+                &bufs.packed_u8_buf,
+                0,
+                &bufs.staging_u8,
+                0,
+                packed_byte_size,
+            );
+
+            ctx.queue.submit(Some(cmd.finish()));
+
+            // WASM-compatible async readback: map_async + yield to browser event loop
+            let slice = bufs.staging_u8.slice(..);
+            let (sender, receiver) = futures_channel::oneshot::channel();
+            let mut sender = Some(sender);
+            slice.map_async(wgpu::MapMode::Read, move |result| {
+                if let Some(tx) = sender.take() {
+                    let _ = tx.send(result);
+                }
+            });
+            ctx.device.poll(wgpu::Maintain::Poll);
+            receiver
+        }; // cached borrow dropped here, before await
+
         // Yield to browser so the GPU can finish work, then get the result
         receiver.await.unwrap().unwrap();
 
+        // Re-borrow to read back the mapped data
+        let cached = self.cached.borrow();
+        let bufs = cached.as_ref().unwrap();
+        let slice = bufs.staging_u8.slice(..);
         let data = slice.get_mapped_range();
         let bytes: &[u8] = &data;
         let rgb = &bytes[..total_rgb];

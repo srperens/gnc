@@ -204,8 +204,8 @@ pub fn run_shootout(
     let y_orig = extract_y_plane(rgb_data, width, height);
 
     // Pad to multiple of 256 (tile size) so wavelet baseline works too.
-    let pad_w = ((width + 255) / 256) * 256;
-    let pad_h = ((height + 255) / 256) * 256;
+    let pad_w = width.div_ceil(256) * 256;
+    let pad_h = height.div_ceil(256) * 256;
     let y_padded = pad_plane(&y_orig, width, height, pad_w, pad_h);
     let pixel_count = (pad_w * pad_h) as usize;
 
@@ -511,8 +511,8 @@ pub fn run_fused_benchmark(
     iterations: u32,
 ) {
     let y_orig = extract_y_plane(rgb_data, width, height);
-    let pad_w = ((width + 7) / 8) * 8; // Only need 8-alignment for DCT-8×8
-    let pad_h = ((height + 7) / 8) * 8;
+    let pad_w = width.div_ceil(8) * 8; // Only need 8-alignment for DCT-8×8
+    let pad_h = height.div_ceil(8) * 8;
     let y_padded = pad_plane(&y_orig, width, height, pad_w, pad_h);
     let pixel_count = (pad_w * pad_h) as usize;
     let total_px = width * height;
@@ -520,7 +520,7 @@ pub fn run_fused_benchmark(
     let input_buf = create_storage_buf(ctx, &y_padded);
     let quant_buf = create_empty_buf(ctx, pixel_count);
     let recon_buf = create_empty_buf(ctx, pixel_count);
-    let temp_buf = create_empty_buf(ctx, pixel_count);
+    let _temp_buf = create_empty_buf(ctx, pixel_count);
 
     let fused = FusedBlock::new(ctx);
     let block_transform = BlockTransform::new(ctx);
@@ -612,7 +612,7 @@ pub fn run_fused_benchmark(
 
 // ---- CPU Haar reference for debugging ----
 
-const INV_SQRT2: f32 = 0.707106781187;
+const INV_SQRT2: f32 = std::f32::consts::FRAC_1_SQRT_2;
 
 /// CPU reference: 1-level Haar forward on a 16×16 block (in-place, stride=16 within buffer).
 fn cpu_haar_forward_level(data: &mut [f32], stride: u32, size: u32) {
@@ -844,16 +844,16 @@ pub fn diagnose_haar(ctx: &GpuContext) {
     // Print first row of 2L results for visual inspection
     println!("\n  First row comparison (2-level):");
     print!("    Input:   ");
-    for c in 0..16 { print!("{:7.2} ", test_input[c]); }
+    for val in test_input.iter().take(16) { print!("{:7.2} ", val); }
     println!();
     print!("    GPU fwd: ");
-    for c in 0..16 { print!("{:7.2} ", gpu_fwd_2l[c]); }
+    for val in gpu_fwd_2l.iter().take(16) { print!("{:7.2} ", val); }
     println!();
     print!("    CPU fwd: ");
-    for c in 0..16 { print!("{:7.2} ", cpu_fwd_2l[c]); }
+    for val in cpu_fwd_2l.iter().take(16) { print!("{:7.2} ", val); }
     println!();
     print!("    GPU inv: ");
-    for c in 0..16 { print!("{:7.2} ", gpu_rt_2l[c]); }
+    for val in gpu_rt_2l.iter().take(16) { print!("{:7.2} ", val); }
     println!();
 
     // CPU roundtrip sanity check

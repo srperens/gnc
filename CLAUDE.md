@@ -35,6 +35,8 @@ Shader source is in `src/shaders/*.wgsl` (32 shaders). Rust host code is in `src
 ## Code Style
 
 - Rust, edition 2021. Keep shader code (WGSL) simple and readable — comment non-obvious GPU-specific tricks.
+- **Zero clippy warnings** — `cargo clippy --release` and `cargo clippy --release --target wasm32-unknown-unknown` must both be clean. Fix warnings before committing. Prefer fixing the code over suppressing; `#[allow(clippy::…)]` is OK on individual items with justification but **blanket allows** (module-level `#![allow(…)]`, `dead_code` on entire impls, etc.) are **not acceptable**.
+- **No `unsafe`** unless absolutely unavoidable. Prefer safe abstractions.
 - Each pipeline stage is a separate module; new experiments go in `src/experiments/`.
 - Don't commit test material to git (it's in `.gitignore`).
 

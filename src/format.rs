@@ -459,7 +459,7 @@ fn mv_predictor(vectors: &[[i16; 2]], bx: usize, by: usize, blocks_x: usize) -> 
 fn serialize_mvs_delta(out: &mut Vec<u8>, vectors: &[[i16; 2]], blocks_x: usize) {
     let n = vectors.len();
     // Build skip bitmap: bit=1 for MV=(0,0) blocks
-    let bitmap_bytes = (n + 7) / 8;
+    let bitmap_bytes = n.div_ceil(8);
     let bitmap_start = out.len();
     out.resize(bitmap_start + bitmap_bytes, 0);
     for (i, mv) in vectors.iter().enumerate() {
@@ -492,7 +492,7 @@ fn deserialize_mvs_delta(
     blocks_x: usize,
 ) -> Vec<[i16; 2]> {
     // Read skip bitmap
-    let bitmap_bytes = (num_blocks + 7) / 8;
+    let bitmap_bytes = num_blocks.div_ceil(8);
     let bitmap = &data[*pos..*pos + bitmap_bytes];
     *pos += bitmap_bytes;
     let mut vectors = Vec::with_capacity(num_blocks);

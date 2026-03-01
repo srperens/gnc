@@ -9,7 +9,6 @@
 
 use bytemuck::{Pod, Zeroable};
 use wgpu;
-use wgpu::util::DeviceExt;
 
 use super::rice::{RiceTile, RICE_STREAMS_PER_TILE};
 use crate::{FrameInfo, GpuContext};
@@ -222,10 +221,7 @@ impl GpuRiceEncoder {
     }
 
     fn ensure_buffers(&mut self, ctx: &GpuContext, num_tiles: usize) {
-        let needs_realloc = self
-            .cached
-            .as_ref()
-            .map_or(true, |c| c.num_tiles != num_tiles);
+        let needs_realloc = self.cached.as_ref().is_none_or(|c| c.num_tiles != num_tiles);
         if needs_realloc {
             self.cached = Some(CachedRiceEncodeBuffers::new(ctx, num_tiles));
         }
@@ -378,10 +374,10 @@ impl GpuRiceEncoder {
                 // Pre-compute total packed size for allocation
                 let total_packed: usize = stream_lengths.iter().map(|&l| l as usize).sum();
                 let mut packed_data = Vec::with_capacity(total_packed);
-                for s in 0..RICE_STREAMS_PER_TILE {
+                for (s, &len) in stream_lengths.iter().enumerate() {
                     let slot_byte_offset =
                         (tile_idx * RICE_STREAMS_PER_TILE + s) * MAX_STREAM_BYTES;
-                    let len = stream_lengths[s] as usize;
+                    let len = len as usize;
                     packed_data
                         .extend_from_slice(&stream_view[slot_byte_offset..slot_byte_offset + len]);
                 }
@@ -565,10 +561,10 @@ impl GpuRiceEncoder {
 
                 let total_packed: usize = stream_lengths.iter().map(|&l| l as usize).sum();
                 let mut packed_data = Vec::with_capacity(total_packed);
-                for s in 0..RICE_STREAMS_PER_TILE {
+                for (s, &len) in stream_lengths.iter().enumerate() {
                     let slot_byte_offset =
                         (tile_idx * RICE_STREAMS_PER_TILE + s) * MAX_STREAM_BYTES;
-                    let len = stream_lengths[s] as usize;
+                    let len = len as usize;
                     packed_data
                         .extend_from_slice(&stream_view[slot_byte_offset..slot_byte_offset + len]);
                 }
@@ -745,7 +741,7 @@ impl GpuRiceDecoder {
         }
 
         // Pack stream data (allocate as u32 for alignment, then copy bytes in)
-        let padded_words = (total_bytes as usize + 3) / 4;
+        let padded_words = (total_bytes as usize).div_ceil(4);
         let mut stream_data_u32 = vec![0u32; padded_words];
         {
             let stream_data_bytes: &mut [u8] = bytemuck::cast_slice_mut(&mut stream_data_u32);
@@ -775,6 +771,7 @@ impl GpuRiceDecoder {
     }
 
     /// Dispatch GPU Rice decode for one plane.
+    #[allow(clippy::too_many_arguments)] // GPU dispatch requires separate buffer bindings
     pub fn dispatch_decode(
         &self,
         ctx: &GpuContext,
@@ -835,6 +832,7 @@ pub struct RiceDecodeData {
 mod tests {
     use super::*;
     use crate::encoder::rice;
+    use wgpu::util::DeviceExt;
 
     /// Test GPU Rice decode against CPU decode for a known tile.
     #[test]

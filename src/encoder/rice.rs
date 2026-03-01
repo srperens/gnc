@@ -44,7 +44,7 @@ impl RiceTile {
         // Check if all-skip
         let all_empty = self.stream_data.is_empty()
             && self.stream_lengths.iter().all(|&l| l == 0);
-        let ng = self.num_groups.min(8) as u32;
+        let ng = self.num_groups.min(8);
         let all_mask = if ng >= 8 { 0xFFu8 } else { (1u8 << ng) - 1 };
         let all_skip = all_empty && (self.skip_bitmap & all_mask == all_mask);
 
@@ -228,11 +228,9 @@ pub fn rice_encode_tile(coefficients: &[i32], tile_size: u32, num_levels: u32) -
                     zrl_group = compute_subband_group(x, y, tile_size, num_levels);
                 }
                 run += 1;
-            } else {
-                if run > 0 {
-                    group_run_lengths[zrl_group].push(run - 1);
-                    run = 0;
-                }
+            } else if run > 0 {
+                group_run_lengths[zrl_group].push(run - 1);
+                run = 0;
             }
         }
         if run > 0 {
@@ -243,8 +241,8 @@ pub fn rice_encode_tile(coefficients: &[i32], tile_size: u32, num_levels: u32) -
 
     // Compute skip bitmap: bit g = 1 means all coefficients in group g are zero
     let mut skip_bitmap: u8 = 0;
-    for g in 0..num_groups {
-        if group_abs_values[g].is_empty() {
+    for (g, group) in group_abs_values.iter().enumerate().take(num_groups) {
+        if group.is_empty() {
             skip_bitmap |= 1 << g;
         }
     }
@@ -354,8 +352,8 @@ pub fn rice_decode_tile(tile: &RiceTile) -> Vec<i32> {
 
         // Initialize EMA from static k seeds (per-stream, 8 groups)
         let mut ema = [0u32; 8];
-        for g in 0..num_groups {
-            ema[g] = (1u32 << tile.k_values[g]).max(1) << 4;
+        for (g, ema_val) in ema.iter_mut().enumerate().take(num_groups) {
+            *ema_val = (1u32 << tile.k_values[g]).max(1) << 4;
         }
 
         let mut s = 0usize;
@@ -476,7 +474,7 @@ pub fn serialize_tile_rice(tile: &RiceTile) -> Vec<u8> {
     // Check if tile is all-skip (all streams empty)
     let all_empty = tile.stream_data.is_empty()
         && tile.stream_lengths.iter().all(|&l| l == 0);
-    let ng = tile.num_groups.min(8) as u32;
+    let ng = tile.num_groups.min(8);
     let all_mask = if ng >= 8 { 0xFFu8 } else { (1u8 << ng) - 1 };
     let all_skip = all_empty && (tile.skip_bitmap & all_mask == all_mask);
 
@@ -556,14 +554,13 @@ pub fn deserialize_tile_rice(data: &[u8]) -> (RiceTile, usize) {
     let mut stream_lengths = vec![0u32; RICE_STREAMS_PER_TILE];
     if compact_streams {
         // Varint stream lengths (256 entries)
-        for i in 0..RICE_STREAMS_PER_TILE {
-            stream_lengths[i] = read_tile_varint(data, &mut pos) as u32;
+        for sl in stream_lengths.iter_mut() {
+            *sl = read_tile_varint(data, &mut pos) as u32;
         }
     } else {
         // Legacy: fixed 256 × u16
-        for i in 0..RICE_STREAMS_PER_TILE {
-            stream_lengths[i] =
-                u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap()) as u32;
+        for sl in stream_lengths.iter_mut() {
+            *sl = u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap()) as u32;
             pos += 2;
         }
     }

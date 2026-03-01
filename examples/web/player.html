@@ -89,6 +89,35 @@
         }
         .stats span { white-space: nowrap; }
 
+        .diag-panel {
+            width: 100%;
+            max-width: 720px;
+            margin-top: 8px;
+        }
+        .diag-panel summary {
+            cursor: pointer;
+            color: #888;
+            font-size: 0.9em;
+            margin-bottom: 4px;
+        }
+        .diag-content {
+            background: #111;
+            border-radius: 6px;
+            padding: 10px 14px;
+            font-family: 'SF Mono', 'Menlo', 'Consolas', monospace;
+            font-size: 0.78em;
+            line-height: 1.5;
+            color: #bbb;
+            white-space: pre;
+            overflow-x: auto;
+            max-height: 300px;
+            overflow-y: auto;
+        }
+        .diag-content .diag-warn { color: #d87c7c; }
+        .diag-content .diag-type-I { color: #7cd88b; }
+        .diag-content .diag-type-P { color: #7cb3d8; }
+        .diag-content .diag-type-B { color: #d8c87c; }
+
         #status {
             margin-bottom: 12px;
             padding: 8px 16px;
@@ -160,6 +189,11 @@
         <span id="statPath"></span>
     </div>
 
+    <details class="diag-panel" id="diagPanel" style="display:none">
+        <summary>Frame diagnostics <a id="diagFullLink" href="#" target="_blank" style="color:#6c63ff;font-size:0.85em;margin-left:8px;text-decoration:none;display:none">open full .diag</a></summary>
+        <div class="diag-content" id="diagContent">No diagnostics available</div>
+    </details>
+
     <script type="module">
         import init, { GnvPlayer } from '../../pkg/gnc.js';
 
@@ -175,11 +209,15 @@
         const controlsBar = $('controlsBar');
         const statsBar = $('statsBar');
 
+        const diagPanel = $('diagPanel');
+        const diagContent = $('diagContent');
+
         // Defer 2D context creation — canvas can only have one context type.
         // If zero-copy WebGPU rendering works, we never create a 2D context.
         let ctx2d = null;
 
         let wasmReady = false;
+        let diagData = null;  // Map<frameIndex, string> parsed from .diag file
         let player = null;
         let playing = false;
         let zeroCopy = false;  // true when using GPU surface blit path
@@ -198,6 +236,56 @@
         function setStatus(msg, type = 'info') {
             status.textContent = msg;
             status.className = `status-${type}`;
+        }
+
+        // --- Diagnostics ---
+        function parseDiag(text) {
+            const frames = new Map();
+            const blocks = text.split(/\n(?=Frame \d+)/);
+            for (const block of blocks) {
+                const m = block.match(/^Frame (\d+)/);
+                if (!m) continue;
+                frames.set(parseInt(m[1], 10), block.trim());
+            }
+            return frames;
+        }
+
+        function showDiag(frameIdx) {
+            if (!diagData || diagData.size === 0) {
+                diagPanel.style.display = 'none';
+                return;
+            }
+            diagPanel.style.display = '';
+            const raw = diagData.get(frameIdx);
+            if (!raw) {
+                diagContent.innerHTML = `<span style="color:#666">No diagnostics for frame ${frameIdx}</span>`;
+                return;
+            }
+            // Highlight frame type and warnings
+            const escaped = raw.replace(/&/g, '&amp;').replace(/</g, '&lt;');
+            const html = escaped
+                .replace(/^(Frame \d+ \[I\].*)$/m, '<span class="diag-type-I">$1</span>')
+                .replace(/^(Frame \d+ \[P\].*)$/m, '<span class="diag-type-P">$1</span>')
+                .replace(/^(Frame \d+ \[B\].*)$/m, '<span class="diag-type-B">$1</span>')
+                .replace(/^(  WARN:.*)$/gm, '<span class="diag-warn">$1</span>');
+            diagContent.innerHTML = html;
+        }
+
+        async function fetchDiag(gnvName) {
+            diagData = null;
+            const diagFullLink = $('diagFullLink');
+            diagFullLink.style.display = 'none';
+            const diagName = gnvName.replace(/\.gnv$/, '.diag');
+            try {
+                const resp = await fetch(diagName);
+                if (!resp.ok) return;
+                const text = await resp.text();
+                diagData = parseDiag(text);
+                diagFullLink.href = diagName;
+                diagFullLink.style.display = '';
+            } catch (_) {
+                // No diagnostics available — that's fine
+            }
         }
 
         // --- Drop zone ---
@@ -266,10 +354,19 @@
             dl.download = d.name;
             dl.textContent = '\u2B07';
             dl.title = 'Download ' + d.name;
-            dl.style.cssText = 'background:#222;color:#888;border-radius:0 6px 6px 0;padding:6px 8px;font-size:0.82em;text-decoration:none;display:flex;align-items:center;border-left:1px solid #333;';
+            dl.style.cssText = 'background:#222;color:#888;border-radius:0 0 0 0;padding:6px 8px;font-size:0.82em;text-decoration:none;display:flex;align-items:center;border-left:1px solid #333;';
+
+            const diagLink = document.createElement('a');
+            const diagName = d.name.replace(/\.gnv$/, '.diag');
+            diagLink.href = diagName;
+            diagLink.target = '_blank';
+            diagLink.textContent = 'diag';
+            diagLink.title = 'Open ' + diagName + ' in new tab';
+            diagLink.style.cssText = 'background:#222;color:#888;border-radius:0 6px 6px 0;padding:6px 8px;font-size:0.72em;text-decoration:none;display:flex;align-items:center;border-left:1px solid #333;';
 
             wrap.appendChild(btn);
             wrap.appendChild(dl);
+            wrap.appendChild(diagLink);
             demoGrid.appendChild(wrap);
         }
 
@@ -306,7 +403,11 @@
                 }
 
                 setStatus('Creating player...');
+                // Fetch diagnostics in parallel with player creation
+                const diagPromise = fetchDiag(filename);
                 await loadBuffer(buf, filename);
+                await diagPromise;
+                showDiag(0);
             } catch (e) {
                 setStatus('Error: ' + (e.message || e), 'error');
                 console.error(e);
@@ -321,7 +422,9 @@
                 setStatus('Loading ' + file.name + '...');
                 const buf = new Uint8Array(await file.arrayBuffer());
                 setStatus('Creating player...');
+                diagData = null;
                 await loadBuffer(buf, file.name);
+                showDiag(0);
             } catch (e) {
                 setStatus('Error: ' + (e.message || e), 'error');
                 console.error(e);
@@ -340,7 +443,7 @@
             canvas = newCanvas;
             ctx2d = null;
 
-            player = await new GnvPlayer(buf);
+            player = await GnvPlayer.create(buf);
 
             const w = player.width;
             const h = player.height;
@@ -463,6 +566,7 @@
                 $('statPlayFps').textContent = `Play: ${(1000 / avg).toFixed(1)} fps`;
                 framesSinceLastStat = 0;
                 statAccumMs = 0;
+                showDiag(displayFrame);
             }
 
             if (jsCurrentFrame === 0) {
@@ -542,6 +646,7 @@
             updateFrameLabel(target);
             $('statDecode').textContent = `Seek+decode: ${dt.toFixed(1)} ms`;
             setStatus(`Frame ${target}`, 'ok');
+            showDiag(target);
         });
 
         boot();

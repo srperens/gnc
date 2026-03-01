@@ -323,9 +323,9 @@ fn estimate_mv_delta_size(vectors: &[[i16; 2]], block_size: u32, width: u32, til
         return 0;
     }
     // Skip bitmap: ceil(N/8) bytes
-    let bitmap_bytes = (n + 7) / 8;
+    let bitmap_bytes = n.div_ceil(8);
     // Count non-skip blocks and estimate varint sizes
-    let padded_w = ((width + tile_size - 1) / tile_size) * tile_size;
+    let padded_w = width.div_ceil(tile_size) * tile_size;
     let blocks_x = (padded_w / block_size) as usize;
     let blocks_y = if blocks_x > 0 { n / blocks_x } else { 0 };
     let mut varint_bytes = 0usize;
@@ -436,7 +436,7 @@ fn collect_rice_efficiency(entropy: &EntropyData) -> Option<RiceEfficiency> {
         }
 
         // All-skipped tiles: skip_bitmap has all num_groups bits set
-        let ng = tile.num_groups.min(8) as u32;
+        let ng = tile.num_groups.min(8);
         let all_mask = if ng >= 8 { 0xFFu8 } else { (1u8 << ng) - 1 };
         if all_mask != 0 && tile.skip_bitmap & all_mask == all_mask {
             tiles_all_skipped += 1;

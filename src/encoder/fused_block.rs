@@ -123,6 +123,7 @@ impl FusedBlock {
     ///   - `recon_out`: reconstructed pixels after quantize → dequantize → IDCT
     ///
     /// `width` and `height` must be multiples of 8.
+    #[allow(clippy::too_many_arguments)] // GPU dispatch with quantization params
     pub fn dispatch(
         &self,
         ctx: &GpuContext,
@@ -179,8 +180,8 @@ impl FusedBlock {
         });
 
         // Use ceil-div to cover non-8-aligned dimensions (shader bounds-checks).
-        let wg_x = (width + 7) / 8;
-        let wg_y = (height + 7) / 8;
+        let wg_x = width.div_ceil(8);
+        let wg_y = height.div_ceil(8);
 
         let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("fused_block"),

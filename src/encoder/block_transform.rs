@@ -160,6 +160,7 @@ impl BlockTransform {
 
     /// Dispatch a block transform (forward or inverse) into an existing command encoder.
     /// `width` and `height` must be aligned to the transform's dispatch_block_size.
+    #[allow(clippy::too_many_arguments)] // GPU dispatch with transform configuration
     pub fn dispatch(
         &self,
         ctx: &GpuContext,
@@ -175,6 +176,7 @@ impl BlockTransform {
     }
 
     /// Dispatch with explicit level count (only meaningful for HaarBlock).
+    #[allow(clippy::too_many_arguments)] // GPU dispatch with transform configuration
     pub fn dispatch_with_levels(
         &self,
         ctx: &GpuContext,

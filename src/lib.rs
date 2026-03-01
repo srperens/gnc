@@ -794,8 +794,7 @@ pub mod wasm {
     impl GnvPlayer {
         /// Create a new player from raw file data (.gnc or .gnv).
         /// Auto-detects format by checking for GNV1 magic bytes.
-        #[wasm_bindgen(constructor)]
-        pub async fn new(data: Vec<u8>) -> Result<GnvPlayer, JsValue> {
+        pub async fn create(data: Vec<u8>) -> Result<GnvPlayer, JsValue> {
             let ctx = crate::GpuContext::try_new_async()
                 .await
                 .map_err(|e| JsValue::from_str(&e))?;

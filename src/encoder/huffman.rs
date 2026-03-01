@@ -129,8 +129,8 @@ fn build_canonical_codebook(freq: &[u32]) -> Codebook {
     let mut children: Vec<(usize, usize)> = Vec::with_capacity(n);
 
     // Initialize leaf nodes with their frequencies
-    for i in 0..n {
-        node_freq.push(freq[i] as u64);
+    for &f in freq.iter().take(n) {
+        node_freq.push(f as u64);
     }
 
     // Min-heap of (freq, node_id) — use BinaryHeap with Reverse for min
@@ -250,8 +250,8 @@ fn clamp_code_lengths(lengths: &mut [u8], _freq: &[u32]) {
 
     // Assign new lengths from len_count
     let mut sym_idx = 0;
-    for l in 1..=max_len as usize {
-        for _ in 0..len_count[l] {
+    for (l, &count) in len_count.iter().enumerate().take(max_len as usize + 1).skip(1) {
+        for _ in 0..count {
             if sym_idx < syms.len() {
                 lengths[syms[sym_idx]] = l as u8;
                 sym_idx += 1;
@@ -561,11 +561,9 @@ pub fn huffman_encode_tile(coefficients: &[i32], tile_size: u32, num_levels: u32
                     zrl_group = compute_subband_group(x, y, tile_size, num_levels);
                 }
                 run += 1;
-            } else {
-                if run > 0 {
-                    group_run_lengths[zrl_group].push(run - 1);
-                    run = 0;
-                }
+            } else if run > 0 {
+                group_run_lengths[zrl_group].push(run - 1);
+                run = 0;
             }
         }
         if run > 0 {
@@ -712,7 +710,7 @@ pub fn huffman_decode_tile(tile: &HuffmanTile) -> Vec<i32> {
 
                 if code_len > 0 {
                     // Fast path: code is <= 8 bits
-                    sym = (entry >> 16) as u32;
+                    sym = entry >> 16;
                     reader.consume_bits(code_len);
                 } else {
                     // Slow path: code > 8 bits, bit-by-bit scan

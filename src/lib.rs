@@ -514,6 +514,22 @@ pub struct CompressedFrame {
     /// Packed 2-bit intra prediction modes (4 modes per byte, Y plane only).
     /// Present when intra_prediction is enabled.
     pub intra_modes: Option<Vec<u8>>,
+    /// Y-plane residual statistics (after MC, before wavelet). Diagnostics only.
+    pub residual_stats: Option<ResidualStats>,
+}
+
+/// Statistics of the spatial-domain residual (current - predicted) for one plane.
+/// Only populated when GNC_DIAGNOSTICS is enabled.
+#[derive(Debug, Clone, Copy)]
+pub struct ResidualStats {
+    /// Mean of |residual| across all pixels (in [0,255] scale)
+    pub mean_abs: f64,
+    /// Standard deviation of residual values
+    pub stddev: f64,
+    /// Percentage of pixels with |residual| < 1.0
+    pub near_zero_pct: f64,
+    /// Total pixels measured
+    pub pixel_count: usize,
 }
 
 impl CompressedFrame {

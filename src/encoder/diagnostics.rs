@@ -3,7 +3,7 @@
 //! Gated behind `GNC_DIAGNOSTICS=1` env var or `--diagnostics` CLI flag.
 //! Zero overhead when disabled — all collection is behind runtime checks.
 
-use crate::{CompressedFrame, EntropyData, FrameType, MotionField};
+use crate::{CompressedFrame, EntropyData, FrameType, GpuContext, MotionField, ResidualStats};
 
 /// Check if diagnostics are enabled (cached after first call).
 pub fn enabled() -> bool {
@@ -15,6 +15,55 @@ pub fn enabled() -> bool {
 /// Enable diagnostics programmatically (e.g. from CLI flag).
 pub fn enable() {
     std::env::set_var("GNC_DIAGNOSTICS", "1");
+}
+
+/// Read back a GPU staging buffer containing f32 residual values and compute statistics.
+/// The residual is in YCoCg-R Y-plane space (roughly [0,255] range for the original signal).
+pub fn compute_residual_stats(
+    ctx: &GpuContext,
+    staging_buf: &wgpu::Buffer,
+    buf_size: u64,
+    pixel_count: usize,
+) -> ResidualStats {
+    let buf_slice = staging_buf.slice(..buf_size);
+    let (tx, rx) = std::sync::mpsc::channel();
+    buf_slice.map_async(wgpu::MapMode::Read, move |result| {
+        tx.send(result).ok();
+    });
+    ctx.device.poll(wgpu::Maintain::Wait);
+    rx.recv().unwrap().unwrap();
+
+    let data = buf_slice.get_mapped_range();
+    let floats: &[f32] = bytemuck::cast_slice(&data);
+
+    let n = pixel_count.min(floats.len());
+    let mut sum_abs = 0.0f64;
+    let mut sum_sq = 0.0f64;
+    let mut near_zero = 0usize;
+
+    for &v in &floats[..n] {
+        let abs_v = v.abs() as f64;
+        sum_abs += abs_v;
+        sum_sq += abs_v * abs_v;
+        if abs_v < 1.0 {
+            near_zero += 1;
+        }
+    }
+
+    let mean_abs = sum_abs / n as f64;
+    let variance = sum_sq / n as f64 - (sum_abs / n as f64).powi(2);
+    let stddev = if variance > 0.0 { variance.sqrt() } else { 0.0 };
+    let near_zero_pct = near_zero as f64 / n as f64 * 100.0;
+
+    drop(data);
+    staging_buf.unmap();
+
+    ResidualStats {
+        mean_abs,
+        stddev,
+        near_zero_pct,
+        pixel_count: n,
+    }
 }
 
 /// MV statistics for a single direction.
@@ -60,6 +109,9 @@ pub struct FrameDiagnostics {
     pub total_tiles: usize,
     pub subbands_skipped: usize,
     pub subbands_total: usize,
+
+    // Residual statistics (Y plane, spatial domain, after MC before wavelet)
+    pub residual: Option<ResidualStats>,
 
     // Warnings
     pub warnings: Vec<String>,
@@ -139,6 +191,7 @@ pub fn collect(
         total_tiles: 0,
         subbands_skipped: 0,
         subbands_total: 0,
+        residual: compressed.residual_stats,
         warnings: Vec::new(),
     };
 
@@ -244,6 +297,16 @@ fn collect_warnings(diag: &mut FrameDiagnostics) {
                     ft
                 ));
             }
+
+            // Residual energy
+            if let Some(ref r) = diag.residual {
+                if r.mean_abs > 20.0 {
+                    diag.warnings.push(format!(
+                        "WARN: {}-frame residual mean_abs={:.1} (>20) — MC not reducing signal effectively",
+                        ft, r.mean_abs
+                    ));
+                }
+            }
         }
         FrameType::Intra => {}
     }
@@ -339,6 +402,14 @@ pub fn print(diag: &FrameDiagnostics) {
                 diag.subbands_skipped as f64 / diag.subbands_total as f64 * 100.0
             );
         }
+    }
+
+    // Residual statistics
+    if let Some(ref r) = diag.residual {
+        eprintln!(
+            "  Residual Y: mean_abs={:.2} stddev={:.2} near_zero={:.0}%",
+            r.mean_abs, r.stddev, r.near_zero_pct
+        );
     }
 
     // Warnings

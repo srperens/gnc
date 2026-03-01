@@ -576,6 +576,19 @@ impl EncoderPipeline {
         let mut rice_tiles: Vec<rice::RiceTile> = Vec::new();
         let mut huffman_tiles: Vec<huffman::HuffmanTile> = Vec::new();
 
+        // Diagnostics: staging buffer for Y-plane residual readback
+        let diag_enabled = diagnostics::enabled();
+        let diag_residual_staging = if diag_enabled {
+            Some(ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("diag_residual_staging"),
+                size: plane_size as u64,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }))
+        } else {
+            None
+        };
+
         // === Batched GPU pipeline: preprocess + ME + forward encode ===
         // MV buffer stays on GPU — used directly by MC without readback/re-upload.
         let mv_buf;
@@ -716,6 +729,13 @@ impl EncoderPipeline {
                     padded_h,
                     &bufs.mc_fwd_params_8,
                 );
+
+                // Diagnostics: copy Y residual before wavelet overwrites mc_out
+                if p == 0 {
+                    if let Some(ref stg) = diag_residual_staging {
+                        cmd.copy_buffer_to_buffer(&bufs.mc_out, 0, stg, 0, plane_size as u64);
+                    }
+                }
 
                 // mc_out feeds directly into wavelet (read-only at level 0)
                 self.transform.forward(
@@ -881,6 +901,13 @@ impl EncoderPipeline {
             // Read back 8x8-resolution MVs from split staging
             let mvs = MotionEstimator::finish_mv_readback_cached(ctx, &bufs.split_mv_staging_buf, bufs.split_mv_staging_size, bufs.split_total_blocks);
 
+            // Diagnostics: read back Y residual and compute stats
+            let residual_stats = if let Some(ref stg) = diag_residual_staging {
+                Some(diagnostics::compute_residual_stats(ctx, stg, plane_size as u64, padded_pixels))
+            } else {
+                None
+            };
+
             let entropy = match entropy_mode {
                 EntropyMode::Bitplane => EntropyData::Bitplane(bp_tiles),
                 EntropyMode::SubbandRans | EntropyMode::SubbandRansCtx => {
@@ -905,6 +932,7 @@ impl EncoderPipeline {
                     block_modes: None,
                 }),
                 intra_modes: None,
+                residual_stats,
             }, mv_buf); // Return 16x16 mv_buf as temporal predictor for next frame
         } else {
             // CPU entropy path: preprocess + ME batched, then per-plane submits
@@ -1157,6 +1185,7 @@ impl EncoderPipeline {
                 block_modes: None,
             }),
             intra_modes: None,
+            residual_stats: None,
         }, mv_buf)
     }
 
@@ -1209,6 +1238,19 @@ impl EncoderPipeline {
         let mut bp_tiles: Vec<bitplane::BitplaneTile> = Vec::new();
         let mut rice_tiles: Vec<rice::RiceTile> = Vec::new();
         let mut huffman_tiles: Vec<huffman::HuffmanTile> = Vec::new();
+
+        // Diagnostics: staging buffer for Y-plane residual readback
+        let diag_enabled = diagnostics::enabled();
+        let diag_residual_staging = if diag_enabled {
+            Some(ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("diag_bframe_residual_staging"),
+                size: plane_size as u64,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }))
+        } else {
+            None
+        };
 
         // === Batched GPU pipeline: preprocess + bidir ME + forward encode ===
         // MV/mode buffers stay on GPU — used directly by bidir MC.
@@ -1305,6 +1347,14 @@ impl EncoderPipeline {
                     padded_h,
                     &bufs.mc_bidir_fwd_params,
                 );
+
+                // Diagnostics: copy Y residual before wavelet overwrites mc_out
+                if p == 0 {
+                    if let Some(ref stg) = diag_residual_staging {
+                        cmd.copy_buffer_to_buffer(&bufs.mc_out, 0, stg, 0, plane_size as u64);
+                    }
+                }
+
                 // mc_out feeds directly into wavelet (read-only at level 0)
                 self.transform.forward(
                     ctx,
@@ -1402,6 +1452,13 @@ impl EncoderPipeline {
                     bufs.me_total_blocks,
                 );
 
+            // Diagnostics: read back Y residual and compute stats
+            let residual_stats = if let Some(ref stg) = diag_residual_staging {
+                Some(diagnostics::compute_residual_stats(ctx, stg, plane_size as u64, padded_pixels))
+            } else {
+                None
+            };
+
             let entropy = match entropy_mode {
                 EntropyMode::Bitplane => EntropyData::Bitplane(bp_tiles),
                 EntropyMode::SubbandRans | EntropyMode::SubbandRansCtx => {
@@ -1426,6 +1483,7 @@ impl EncoderPipeline {
                     block_modes: Some(block_modes),
                 }),
                 intra_modes: None,
+                residual_stats,
             }, fwd_mv_buf, bwd_mv_buf);
         } else {
             // CPU entropy path: preprocess + bidir ME batched, then per-plane submits
@@ -1593,6 +1651,7 @@ impl EncoderPipeline {
                 block_modes: Some(block_modes),
             }),
             intra_modes: None,
+            residual_stats: None,
         }, fwd_mv_buf, bwd_mv_buf)
     }
 

@@ -1121,6 +1121,7 @@ impl EncoderPipeline {
             frame_type: FrameType::Intra,
             motion_field: None,
             intra_modes,
+            residual_stats: None,
         }
     }
 }

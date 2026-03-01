@@ -20,16 +20,16 @@ pub const HUFFMAN_STREAMS_PER_TILE: usize = 256;
 pub const HUFFMAN_MAX_STREAM_BYTES: usize = 4096;
 
 /// Huffman alphabet size. Symbols 0..(N-2) are direct magnitudes (|val|-1).
-/// Symbol (N-1) is an escape code — followed by raw 12-bit magnitude.
-/// 32 symbols covers >95% of wavelet magnitudes directly while keeping
-/// codebook headers small (32 bytes/group vs 256 bytes/group).
-pub const HUFFMAN_ALPHABET_SIZE: usize = 32;
+/// Symbol (N-1) is an escape code — followed by exp-Golomb coded excess magnitude.
+/// 64 symbols covers >99% of wavelet magnitudes directly.
+pub const HUFFMAN_ALPHABET_SIZE: usize = 64;
 
 /// The escape symbol index (last symbol in alphabet).
 pub const HUFFMAN_ESCAPE_SYM: usize = HUFFMAN_ALPHABET_SIZE - 1;
 
-/// Maximum code length in bits. Prevents pathological codebooks.
-pub const HUFFMAN_MAX_CODE_LEN: u8 = 15;
+/// Maximum code length in bits. Capped at 8 so the GPU decoder's
+/// 8-bit prefix table handles all codes in a single lookup (no slow path).
+pub const HUFFMAN_MAX_CODE_LEN: u8 = 8;
 
 /// Encoded tile using significance map + canonical Huffman coding with zero-run-length.
 #[derive(Debug, Clone)]
@@ -385,6 +385,20 @@ impl BitWriter {
         }
     }
 
+    #[inline]
+    fn write_exp_golomb(&mut self, value: u32) {
+        if value == 0 {
+            self.write_bit(1);
+            return;
+        }
+        let v = value + 1;
+        let bits = 31 - v.leading_zeros() as u8;
+        for _ in 0..bits {
+            self.write_bit(0);
+        }
+        self.write_bits(v, bits + 1);
+    }
+
     fn flush(mut self) -> Vec<u8> {
         if self.bits_in_byte > 0 {
             self.current_byte <<= 8 - self.bits_in_byte;
@@ -471,6 +485,19 @@ impl<'a> BitReader<'a> {
             let _ = self.read_bit();
         }
     }
+
+    #[inline]
+    fn read_exp_golomb(&mut self) -> u32 {
+        let mut leading_zeros = 0u32;
+        while self.read_bit() == 0 && leading_zeros < 20 {
+            leading_zeros += 1;
+        }
+        if leading_zeros == 0 {
+            return 0;
+        }
+        let rest = self.read_bits(leading_zeros as u8);
+        (1u32 << leading_zeros) - 1 + rest
+    }
 }
 
 /// Compute optimal Rice parameter k for zero-run lengths.
@@ -490,8 +517,8 @@ fn optimal_k_zrl(values: &[u32]) -> u8 {
 ///
 /// Token encoding (per stream):
 ///   bit=0 → zero run: Rice(run_length-1, k_zrl)
-///   bit=1 → non-zero: sign bit + Huffman(min(|val|-1, 255))
-///            if |val|-1 >= 255: followed by raw 12-bit magnitude
+///   bit=1 → non-zero: sign bit + Huffman(min(|val|-1, ESCAPE_SYM))
+///            if |val|-1 >= ESCAPE_SYM: followed by exp-Golomb(excess)
 pub fn huffman_encode_tile(coefficients: &[i32], tile_size: u32, num_levels: u32) -> HuffmanTile {
     let num_coefficients = coefficients.len();
     let num_groups = (num_levels * 2) as usize;
@@ -598,9 +625,9 @@ pub fn huffman_encode_tile(coefficients: &[i32], tile_size: u32, num_levels: u32
                 // Write Huffman code for symbol
                 writer.write_bits(cb.codewords[sym], cb.code_lengths[sym]);
 
-                // Escape: append raw 12-bit magnitude for large values
+                // Escape: append exp-Golomb coded excess magnitude
                 if sym == HUFFMAN_ESCAPE_SYM {
-                    writer.write_bits(magnitude.min(4095), 12);
+                    writer.write_exp_golomb(magnitude - HUFFMAN_ESCAPE_SYM as u32);
                 }
 
                 s += 1;
@@ -693,8 +720,8 @@ pub fn huffman_decode_tile(tile: &HuffmanTile) -> Vec<i32> {
                 }
 
                 let magnitude = if sym >= HUFFMAN_ESCAPE_SYM as u32 {
-                    // Escape code: read raw 12-bit magnitude
-                    reader.read_bits(12)
+                    // Escape code: read exp-Golomb coded excess magnitude
+                    HUFFMAN_ESCAPE_SYM as u32 + reader.read_exp_golomb()
                 } else {
                     sym
                 };

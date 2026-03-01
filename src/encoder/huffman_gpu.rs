@@ -16,9 +16,9 @@ use crate::{FrameInfo, GpuContext};
 const MAX_STREAM_BYTES: usize = 512;
 const _MAX_STREAM_WORDS: usize = MAX_STREAM_BYTES / 4;
 const MAX_GROUPS: usize = 8;
-const HIST_STRIDE: usize = MAX_GROUPS * HUFFMAN_ALPHABET_SIZE; // 256
+const HIST_STRIDE: usize = MAX_GROUPS * HUFFMAN_ALPHABET_SIZE; // 512
 const ZRL_STRIDE: usize = MAX_GROUPS * 2; // 16
-const CB_STRIDE: usize = MAX_GROUPS * HUFFMAN_ALPHABET_SIZE; // 256
+const CB_STRIDE: usize = MAX_GROUPS * HUFFMAN_ALPHABET_SIZE; // 512
 const DT_STRIDE: usize = MAX_GROUPS * 256; // 2048 (8-bit prefix table)
 
 #[repr(C)]

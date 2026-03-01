@@ -3,17 +3,14 @@
 // Inverse of huffman_encode.wgsl. Each thread decodes one independent bit stream.
 // Uses 8-bit prefix decode table for fast Huffman symbol lookup.
 //
-// Decode table layout in buffer (per tile):
-//   decode_table[tile_id * DT_STRIDE + group * 256 + peek_8bits] = (symbol << 16) | code_length
-//   k_zrl[tile_id * MAX_GROUPS + group] = Rice k parameter for ZRL
-//
-// For codes > 8 bits (rare with 32-symbol alphabet): code_length=0 flags fallback.
+// Optimized bit reader: 32-bit accumulator refilled in bulk.
+// Single table lookup + advance (no peek/restore/consume).
 
 const STREAMS_PER_TILE: u32 = 256u;
-const ESCAPE_SYM: u32 = 31u;
+const ESCAPE_SYM: u32 = 63u;
 const MAX_GROUPS: u32 = 8u;
 const DT_STRIDE: u32 = 2048u;  // MAX_GROUPS * 256 (8-bit prefix table)
-const MAX_CODE_LEN: u32 = 15u;
+const MAX_CODE_LEN: u32 = 8u;
 
 struct Params {
     num_tiles: u32,
@@ -38,10 +35,10 @@ var<workgroup> shared_decode: array<u32, 2048>;
 // Shared k_zrl: MAX_GROUPS = 8 entries
 var<workgroup> shared_k_zrl: array<u32, 8>;
 
-// Per-thread bit-reader state
-var<private> p_current_byte: u32;
-var<private> p_bit_pos: u32;
-var<private> p_byte_offset: u32;
+// Per-thread 32-bit accumulator bit reader
+var<private> p_acc: u32;       // accumulator — valid bits are at the top
+var<private> p_bits: u32;      // number of valid bits in accumulator
+var<private> p_byte_off: u32;  // next byte offset to load from stream_data
 
 fn compute_subband_group(lx: u32, ly: u32) -> u32 {
     var region = params.tile_size;
@@ -67,68 +64,77 @@ fn load_byte(byte_off: u32) -> u32 {
     return (stream_data[word_idx] >> (byte_pos * 8u)) & 0xFFu;
 }
 
-fn read_bit() -> u32 {
-    if (p_bit_pos == 8u) {
-        p_current_byte = load_byte(p_byte_offset);
-        p_byte_offset += 1u;
-        p_bit_pos = 0u;
+// Ensure accumulator has at least n valid bits.
+fn ensure_bits(n: u32) {
+    while (p_bits < n) {
+        p_acc = (p_acc << 8u) | load_byte(p_byte_off);
+        p_byte_off += 1u;
+        p_bits += 8u;
     }
-    let bit = (p_current_byte >> (7u - p_bit_pos)) & 1u;
-    p_bit_pos += 1u;
-    return bit;
 }
 
-fn read_bits(count: u32) -> u32 {
-    var value = 0u;
-    var remaining = count;
-    while (remaining > 0u) {
-        if (p_bit_pos == 8u) {
-            p_current_byte = load_byte(p_byte_offset);
-            p_byte_offset += 1u;
-            p_bit_pos = 0u;
+// Peek at top n bits of accumulator without consuming.
+fn peek(n: u32) -> u32 {
+    return (p_acc >> (p_bits - n)) & ((1u << n) - 1u);
+}
+
+// Consume n bits from accumulator.
+fn drop_bits(n: u32) {
+    p_bits -= n;
+}
+
+// Read n bits: ensure + peek + drop.
+fn read(n: u32) -> u32 {
+    ensure_bits(n);
+    let v = peek(n);
+    drop_bits(n);
+    return v;
+}
+
+// Read unary code: count 1-bits until 0-bit.
+fn read_unary() -> u32 {
+    var count = 0u;
+    while (count < 31u) {
+        ensure_bits(1u);
+        if (peek(1u) == 0u) {
+            drop_bits(1u);
+            return count;
         }
-        let avail = 8u - p_bit_pos;
-        let take = min(remaining, avail);
-        let shift = avail - take;
-        let bits = (p_current_byte >> shift) & ((1u << take) - 1u);
-        value = (value << take) | bits;
-        p_bit_pos += take;
-        remaining -= take;
+        drop_bits(1u);
+        count += 1u;
     }
-    return value;
+    // Safety: consume the terminator
+    ensure_bits(1u);
+    drop_bits(1u);
+    return count;
 }
 
-// Peek at next 8 bits without consuming them.
-fn peek_bits_8() -> u32 {
-    // Save state
-    let saved_byte = p_current_byte;
-    let saved_bit_pos = p_bit_pos;
-    let saved_byte_offset = p_byte_offset;
-
-    let value = read_bits(8u);
-
-    // Restore state
-    p_current_byte = saved_byte;
-    p_bit_pos = saved_bit_pos;
-    p_byte_offset = saved_byte_offset;
-
-    return value;
-}
-
-// Consume n bits (advance reader).
-fn consume_bits(count: u32) {
-    for (var i = 0u; i < count; i++) {
-        let _ = read_bit();
-    }
-}
-
+// Read Golomb-Rice coded value: unary quotient + k-bit remainder.
 fn read_rice(k: u32) -> u32 {
-    var quotient = 0u;
-    while (read_bit() == 1u && quotient < 31u) {
-        quotient += 1u;
-    }
-    let remainder = select(0u, read_bits(k), k > 0u);
+    let quotient = read_unary();
+    let remainder = select(0u, read(k), k > 0u);
     return (quotient << k) | remainder;
+}
+
+// Read exp-Golomb coded value.
+fn read_exp_golomb() -> u32 {
+    // Count leading zeros
+    var leading_zeros = 0u;
+    while (leading_zeros < 20u) {
+        ensure_bits(1u);
+        if (peek(1u) == 1u) {
+            drop_bits(1u);
+            break;
+        }
+        drop_bits(1u);
+        leading_zeros += 1u;
+    }
+    // Read remaining bits
+    if (leading_zeros == 0u) {
+        return 0u;
+    }
+    let rest = read(leading_zeros);
+    return (1u << leading_zeros) - 1u + rest;
 }
 
 @compute @workgroup_size(256)
@@ -149,10 +155,8 @@ fn main(
     let tile_origin_y = tile_y * params.tile_size;
 
     let symbols_per_stream = params.coefficients_per_tile / STREAMS_PER_TILE;
-    let num_groups = params.num_levels * 2u;
 
     // Load decode table into shared memory cooperatively
-    // 2048 entries, 256 threads → 8 loads per thread
     for (var i = thread_id; i < DT_STRIDE; i += STREAMS_PER_TILE) {
         shared_decode[i] = decode_table[tile_id * DT_STRIDE + i];
     }
@@ -161,16 +165,16 @@ fn main(
     }
     workgroupBarrier();
 
-    // Initialize bit reader
+    // Initialize accumulator bit reader
     let stream_idx = tile_id * STREAMS_PER_TILE + thread_id;
-    p_byte_offset = stream_offsets[stream_idx];
-    p_bit_pos = 8u;
-    p_current_byte = 0u;
+    p_byte_off = stream_offsets[stream_idx];
+    p_acc = 0u;
+    p_bits = 0u;
 
     // Decode loop
     var s = 0u;
     while (s < symbols_per_stream) {
-        let token = read_bit();
+        let token = read(1u);
         if (token == 0u) {
             // Zero run
             let zi = thread_id + s * STREAMS_PER_TILE;
@@ -194,41 +198,24 @@ fn main(
             let plane_idx = (tile_origin_y + tile_row) * params.plane_width
                           + (tile_origin_x + tile_col);
 
-            let sign = read_bit();
+            let sign = read(1u);
             let g = compute_subband_group(tile_col, tile_row);
 
             // Fast Huffman decode via 8-bit prefix table
-            let peek = peek_bits_8();
-            let entry = shared_decode[g * 256u + peek];
+            ensure_bits(8u);
+            let peek8 = peek(8u);
+            let entry = shared_decode[g * 256u + peek8];
             let sym = entry >> 16u;
             let code_len = entry & 0xFFFFu;
 
-            var magnitude: u32;
-            if (code_len > 0u) {
-                // Fast path: code <= 8 bits, table lookup succeeded
-                consume_bits(code_len);
-                magnitude = sym;
-            } else {
-                // Slow path: code > 8 bits, bit-by-bit decode
-                // With 32-symbol alphabet this is essentially unreachable
-                magnitude = 0u;
-                var code = 0u;
-                for (var bits_read = 1u; bits_read <= MAX_CODE_LEN; bits_read++) {
-                    code = (code << 1u) | read_bit();
-                    // Check all entries in this group for matching code
-                    // (brute force — acceptable since this path is rarely taken)
-                    for (var check_sym = 0u; check_sym < 32u; check_sym++) {
-                        let check_entry = shared_decode[g * 256u + check_sym];
-                        // We need original code_lengths — not available in decode table
-                        // With 32-symbol alphabet and max code len 15, codes rarely exceed 8 bits
-                        // Skip this slow path — if we reach here, output 0
-                    }
-                }
-            }
+            // All codes are <= 8 bits (HUFFMAN_MAX_CODE_LEN=8), so a single
+            // 8-bit prefix table lookup always resolves the symbol.
+            drop_bits(code_len);
+            var magnitude: u32 = sym;
 
-            // Escape: read raw 12-bit magnitude
+            // Escape: read exp-Golomb magnitude for large values
             if (magnitude >= ESCAPE_SYM) {
-                magnitude = read_bits(12u);
+                magnitude = ESCAPE_SYM + read_exp_golomb();
             }
 
             let value = select(i32(magnitude + 1u), -i32(magnitude + 1u), sign == 1u);

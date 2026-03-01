@@ -11,10 +11,10 @@
 const STREAMS_PER_TILE: u32 = 256u;
 const MAX_STREAM_BYTES: u32 = 512u;
 const MAX_STREAM_WORDS: u32 = 128u;
-const ALPHABET_SIZE: u32 = 32u;
-const ESCAPE_SYM: u32 = 31u;
+const ALPHABET_SIZE: u32 = 64u;
+const ESCAPE_SYM: u32 = 63u;
 const MAX_GROUPS: u32 = 8u;
-const CB_STRIDE: u32 = 256u;  // MAX_GROUPS * ALPHABET_SIZE
+const CB_STRIDE: u32 = 512u;  // MAX_GROUPS * ALPHABET_SIZE
 
 struct Params {
     num_tiles: u32,
@@ -34,12 +34,12 @@ struct Params {
 @group(0) @binding(4) var<storage, read_write> stream_output: array<u32>;
 @group(0) @binding(5) var<storage, read_write> stream_lengths: array<u32>;
 
-// Shared codebook: MAX_GROUPS * ALPHABET_SIZE = 256 entries = 1KB
-var<workgroup> shared_code: array<u32, 256>;
+// Shared codebook: MAX_GROUPS * ALPHABET_SIZE = 512 entries = 2KB
+var<workgroup> shared_code: array<u32, 512>;
 // Shared k_zrl: MAX_GROUPS = 8 entries
 var<workgroup> shared_k_zrl: array<u32, 8>;
 
-// Per-thread bit-packing state (identical to Rice)
+// Per-thread bit-packing state
 var<private> p_bit_buffer: u32;
 var<private> p_bits_in_buffer: u32;
 var<private> p_word_buffer: u32;
@@ -78,16 +78,6 @@ fn emit_byte(byte_val: u32) {
     }
 }
 
-fn emit_bit(bit: u32) {
-    p_bit_buffer = (p_bit_buffer << 1u) | (bit & 1u);
-    p_bits_in_buffer += 1u;
-    if (p_bits_in_buffer == 8u) {
-        emit_byte(p_bit_buffer);
-        p_bits_in_buffer = 0u;
-        p_bit_buffer = 0u;
-    }
-}
-
 fn emit_bits(value: u32, count: u32) {
     p_bit_buffer = (p_bit_buffer << count) | (value & ((1u << count) - 1u));
     p_bits_in_buffer += count;
@@ -101,6 +91,25 @@ fn emit_bits(value: u32, count: u32) {
     } else {
         p_bit_buffer = 0u;
     }
+}
+
+fn emit_bit(bit: u32) {
+    emit_bits(bit, 1u);
+}
+
+// Write exp-Golomb coded value.
+fn emit_exp_golomb(value: u32) {
+    if (value == 0u) {
+        emit_bit(1u);
+        return;
+    }
+    let v = value + 1u;
+    let bits = 31u - countLeadingZeros(v);
+    // Write 'bits' zeros then the binary representation of v
+    for (var i = 0u; i < bits; i++) {
+        emit_bit(0u);
+    }
+    emit_bits(v, bits + 1u);
 }
 
 fn flush_remaining() {
@@ -131,11 +140,13 @@ fn main(
     let tile_origin_y = tile_y * params.tile_size;
 
     let symbols_per_stream = params.coefficients_per_tile / STREAMS_PER_TILE;
-    let num_groups = params.num_levels * 2u;
 
     // Phase 1: Load codebook + k_zrl into shared memory
-    // 256 threads, 256 codebook entries — one per thread
+    // 256 threads, 512 codebook entries — 2 loads per thread
     shared_code[thread_id] = codebook[tile_id * CB_STRIDE + thread_id];
+    if (thread_id + 256u < CB_STRIDE) {
+        shared_code[thread_id + 256u] = codebook[tile_id * CB_STRIDE + thread_id + 256u];
+    }
     if (thread_id < MAX_GROUPS) {
         shared_k_zrl[thread_id] = k_zrl_buf[tile_id * MAX_GROUPS + thread_id];
     }
@@ -210,9 +221,9 @@ fn main(
                 emit_bits(codeword, code_len);
             }
 
-            // Escape: append raw 12-bit magnitude for large values
+            // Escape: append exp-Golomb for large magnitudes
             if (sym == ESCAPE_SYM) {
-                emit_bits(min(magnitude, 4095u), 12u);
+                emit_exp_golomb(magnitude - ESCAPE_SYM);
             }
 
             s += 1u;

@@ -9,11 +9,11 @@
 //   zrl_output[tile * ZRL_STRIDE + group * 2 + 1] = count of runs
 
 const STREAMS_PER_TILE: u32 = 256u;
-const ALPHABET_SIZE: u32 = 32u;
-const ESCAPE_SYM: u32 = 31u;
+const ALPHABET_SIZE: u32 = 64u;
+const ESCAPE_SYM: u32 = 63u;
 const MAX_GROUPS: u32 = 8u;
-const HIST_STRIDE: u32 = 256u;  // MAX_GROUPS * ALPHABET_SIZE
-const ZRL_STRIDE: u32 = 16u;   // MAX_GROUPS * 2
+const HIST_STRIDE: u32 = 512u;  // MAX_GROUPS * ALPHABET_SIZE
+const ZRL_STRIDE: u32 = 16u;    // MAX_GROUPS * 2
 
 struct Params {
     num_tiles: u32,
@@ -31,8 +31,8 @@ struct Params {
 @group(0) @binding(2) var<storage, read_write> hist_output: array<u32>;
 @group(0) @binding(3) var<storage, read_write> zrl_output: array<u32>;
 
-// Shared histogram: MAX_GROUPS * ALPHABET_SIZE = 256 entries = 1KB
-var<workgroup> shared_hist: array<atomic<u32>, 256>;  // [group * ALPHABET_SIZE + sym]
+// Shared histogram: MAX_GROUPS * ALPHABET_SIZE = 512 entries = 2KB
+var<workgroup> shared_hist: array<atomic<u32>, 512>;
 // Shared ZRL stats: MAX_GROUPS * 2 = 16 entries = 64B
 var<workgroup> zrl_sum: array<atomic<u32>, 8>;
 var<workgroup> zrl_count: array<atomic<u32>, 8>;
@@ -74,9 +74,9 @@ fn main(
 
     let symbols_per_stream = params.coefficients_per_tile / STREAMS_PER_TILE;
 
-    // Clear shared memory cooperatively
-    // 256 threads, 256 histogram entries + 16 ZRL entries
+    // Clear shared memory cooperatively: 512 entries, 256 threads → 2 per thread
     atomicStore(&shared_hist[thread_id], 0u);
+    atomicStore(&shared_hist[thread_id + 256u], 0u);
     if (thread_id < MAX_GROUPS) {
         atomicStore(&zrl_sum[thread_id], 0u);
         atomicStore(&zrl_count[thread_id], 0u);
@@ -118,12 +118,11 @@ fn main(
     }
     workgroupBarrier();
 
-    // Write histograms to output buffer cooperatively
-    // 256 entries = one per thread (HIST_STRIDE = MAX_GROUPS * ALPHABET_SIZE = 256)
-    let hist_val = atomicLoad(&shared_hist[thread_id]);
-    hist_output[tile_id * HIST_STRIDE + thread_id] = hist_val;
+    // Write histograms to output buffer cooperatively: 512 entries, 256 threads → 2 per thread
+    hist_output[tile_id * HIST_STRIDE + thread_id] = atomicLoad(&shared_hist[thread_id]);
+    hist_output[tile_id * HIST_STRIDE + thread_id + 256u] = atomicLoad(&shared_hist[thread_id + 256u]);
 
-    // Write ZRL stats (first 16 threads)
+    // Write ZRL stats (first 8 threads)
     if (thread_id < MAX_GROUPS) {
         zrl_output[tile_id * ZRL_STRIDE + thread_id * 2u] = atomicLoad(&zrl_sum[thread_id]);
         zrl_output[tile_id * ZRL_STRIDE + thread_id * 2u + 1u] = atomicLoad(&zrl_count[thread_id]);

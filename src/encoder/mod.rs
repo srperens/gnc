@@ -10,6 +10,7 @@ pub(crate) mod entropy_helpers;
 pub mod huffman;
 pub mod huffman_gpu;
 pub mod interleave;
+pub mod intra;
 pub mod motion;
 pub mod pipeline;
 pub mod quantize;

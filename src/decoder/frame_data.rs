@@ -7,6 +7,7 @@ use crate::encoder::entropy_helpers;
 use crate::encoder::motion::MotionEstimator;
 use crate::encoder::rans_gpu::GpuRansDecoder;
 use crate::encoder::rice_gpu::GpuRiceDecoder;
+use crate::encoder::huffman_gpu::GpuHuffmanDecoder;
 use crate::gpu_util::ensure_var_buf;
 use crate::{CompressedFrame, EntropyData, GpuContext};
 
@@ -253,27 +254,100 @@ impl DecoderPipeline {
                     );
                 }
             }
-            EntropyData::Huffman(_) => {
-                // Huffman: CPU decode path — write decoded f32 coefficients
-                // directly into cpu_decoded_planes buffers for each plane.
-                bufs.ctx_adaptive_decode = true; // reuse CPU-decoded path
-                let padded_w = info.padded_width() as usize;
-                let tile_size = info.tile_size as usize;
+            EntropyData::Huffman(tiles) => {
+                // Huffman: GPU decode path — upload packed stream data for GPU decoder
                 for p in 0..3 {
-                    let plane_data = entropy_helpers::entropy_decode_plane(
-                        &frame.entropy,
-                        p,
-                        tiles_per_plane,
-                        tile_size,
-                        padded_w,
+                    let plane_tiles = &tiles[p * tiles_per_plane..(p + 1) * tiles_per_plane];
+                    let packed = GpuHuffmanDecoder::pack_decode_data(plane_tiles, info);
+
+                    // Params → entropy_params
+                    ctx.queue.write_buffer(
+                        &bufs.entropy_params[p],
+                        0,
+                        bytemuck::bytes_of(&packed.params),
                     );
+
+                    // decode_table → entropy_tile_info
+                    let dt_size = (packed.decode_table.len() * 4) as u64;
+                    ensure_var_buf(
+                        ctx,
+                        &mut bufs.entropy_tile_info[p],
+                        &mut bufs.entropy_tile_info_cap[p],
+                        dt_size,
+                        "dec_huff_dt",
+                        storage_dst,
+                    );
+                    ctx.queue.write_buffer(
+                        &bufs.entropy_tile_info[p],
+                        0,
+                        bytemuck::cast_slice(&packed.decode_table),
+                    );
+
+                    // k_zrl → cpu_decoded_planes[p] (repurposed as small storage buffer)
                     ctx.queue.write_buffer(
                         &bufs.cpu_decoded_planes[p],
                         0,
-                        bytemuck::cast_slice(&plane_data),
+                        bytemuck::cast_slice(&packed.k_zrl_data),
+                    );
+
+                    // stream_data → entropy_var_a
+                    let stream_size = (packed.stream_data.len() * 4) as u64;
+                    ensure_var_buf(
+                        ctx,
+                        &mut bufs.entropy_var_a[p],
+                        &mut bufs.entropy_var_a_cap[p],
+                        stream_size.max(4),
+                        "dec_huff_stream",
+                        storage_dst,
+                    );
+                    ctx.queue.write_buffer(
+                        &bufs.entropy_var_a[p],
+                        0,
+                        bytemuck::cast_slice(&packed.stream_data),
+                    );
+
+                    // stream_offsets → entropy_var_b
+                    let offsets_size = (packed.stream_offsets.len() * 4) as u64;
+                    ensure_var_buf(
+                        ctx,
+                        &mut bufs.entropy_var_b[p],
+                        &mut bufs.entropy_var_b_cap[p],
+                        offsets_size,
+                        "dec_huff_offsets",
+                        storage_dst,
+                    );
+                    ctx.queue.write_buffer(
+                        &bufs.entropy_var_b[p],
+                        0,
+                        bytemuck::cast_slice(&packed.stream_offsets),
                     );
                 }
             }
+        }
+
+        // --- Intra prediction modes ---
+        if let Some(ref packed_modes) = frame.intra_modes {
+            let padded_w = info.padded_width();
+            let padded_h = info.padded_height();
+            let num_blocks = (padded_w / 8) * (padded_h / 8);
+            let modes_u32 = crate::encoder::intra::IntraPredictor::unpack_modes(
+                packed_modes,
+                num_blocks as usize,
+            );
+            let modes_size = (modes_u32.len() * 4) as u64;
+            ensure_var_buf(
+                ctx,
+                &mut bufs.intra_modes_buf,
+                &mut bufs.intra_modes_cap,
+                modes_size,
+                "dec_intra_modes",
+                storage_dst,
+            );
+            ctx.queue.write_buffer(
+                &bufs.intra_modes_buf,
+                0,
+                bytemuck::cast_slice(&modes_u32),
+            );
         }
 
         // --- CfL alphas ---

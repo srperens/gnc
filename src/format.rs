@@ -342,6 +342,21 @@ fn serialize_frame_header(frame: &crate::CompressedFrame, out: &mut Vec<u8>) {
     } else {
         out.extend_from_slice(&0u32.to_le_bytes());
     }
+    // Intra prediction modes (packed 2-bit, 4 modes per byte)
+    if let Some(ref modes) = frame.intra_modes {
+        out.push(1u8); // intra_flag
+        let num_blocks = modes.len() as u32 * 4; // approximate: 4 modes per byte
+        // Store exact block count from dimensions
+        let blocks_x = frame.info.padded_width() / 8;
+        let blocks_y = frame.info.padded_height() / 8;
+        let exact_blocks = blocks_x * blocks_y;
+        out.extend_from_slice(&exact_blocks.to_le_bytes());
+        let _ = num_blocks; // suppress warning
+        out.extend_from_slice(&(modes.len() as u32).to_le_bytes());
+        out.extend_from_slice(modes);
+    } else {
+        out.push(0u8); // intra_flag = 0
+    }
     // Frame type: 0 = Intra, 1 = Predicted, 2 = Bidirectional
     let frame_type_byte: u8 = match frame.frame_type {
         crate::FrameType::Intra => 0,
@@ -706,6 +721,23 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
         None
     };
 
+    // --- Intra prediction modes (GP11 only) ---
+    let intra_modes = if is_gp11 && data[pos] != 0 {
+        pos += 1; // skip intra_flag
+        let _num_blocks = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
+        pos += 4;
+        let packed_len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+        let modes = data[pos..pos + packed_len].to_vec();
+        pos += packed_len;
+        Some(modes)
+    } else if is_gp11 {
+        pos += 1; // skip intra_flag = 0
+        None
+    } else {
+        None
+    };
+
     // --- Frame type + motion field (GP10/GP11 only) ---
     let (frame_type, motion_field) = if is_gp10 || is_gp11 {
         let ft = match data[pos] {
@@ -934,6 +966,7 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
             weight_map,
             frame_type,
             motion_field,
+            intra_modes,
         },
         tile_crcs,
     }

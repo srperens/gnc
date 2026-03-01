@@ -250,6 +250,10 @@ pub struct CodecConfig {
     /// 0.0 = flat (all frequencies equal), 3.0 = typical (highest freq gets 4× coarser step).
     /// Only used when transform_type == BlockDCT8.
     pub dct_freq_strength: f32,
+    /// Enable spatial intra prediction before wavelet transform (Y plane only).
+    /// Predicts each 8×8 block from left/top neighbors, encodes residual.
+    /// 4 modes: DC, Horizontal, Vertical, Diagonal. 2 bits/block overhead.
+    pub intra_prediction: bool,
 }
 
 impl CodecConfig {
@@ -285,6 +289,7 @@ impl Default for CodecConfig {
             use_fused_quantize_histogram: false,
             transform_type: TransformType::Wavelet,
             dct_freq_strength: 7.0,
+            intra_prediction: false,
         }
     }
 }
@@ -506,6 +511,9 @@ pub struct CompressedFrame {
     pub frame_type: FrameType,
     /// Motion field for P-frames (None for I-frames)
     pub motion_field: Option<MotionField>,
+    /// Packed 2-bit intra prediction modes (4 modes per byte, Y plane only).
+    /// Present when intra_prediction is enabled.
+    pub intra_modes: Option<Vec<u8>>,
 }
 
 impl CompressedFrame {
@@ -526,7 +534,8 @@ impl CompressedFrame {
             let modes = mf.block_modes.as_ref().map_or(0, |m| m.len());
             fwd + bwd + modes
         });
-        tile_bytes + cfl_bytes + wm_bytes + mv_bytes
+        let intra_bytes = self.intra_modes.as_ref().map_or(0, |m| m.len());
+        tile_bytes + cfl_bytes + wm_bytes + mv_bytes + intra_bytes
     }
 
     /// Bits per pixel

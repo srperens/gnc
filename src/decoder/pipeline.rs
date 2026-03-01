@@ -10,7 +10,9 @@ use crate::encoder::motion::MotionEstimator;
 use crate::encoder::quantize::Quantizer;
 use crate::encoder::rans_gpu::GpuRansDecoder;
 use crate::encoder::rice_gpu::GpuRiceDecoder;
+use crate::encoder::huffman_gpu::GpuHuffmanDecoder;
 use crate::encoder::block_transform::BlockTransform;
+use crate::encoder::intra::IntraPredictor;
 use crate::encoder::transform::WaveletTransform;
 use crate::{CompressedFrame, FrameType, GpuContext};
 
@@ -32,10 +34,12 @@ pub struct DecoderPipeline {
     pub(super) rans_decoder: GpuRansDecoder,
     pub(super) bitplane_decoder: GpuBitplaneDecoder,
     pub(super) rice_decoder: GpuRiceDecoder,
+    pub(super) huffman_decoder: GpuHuffmanDecoder,
     pub(super) interleaver: PlaneInterleaver,
     pub(super) cfl_predictor: CflPredictor,
     pub(super) motion: MotionEstimator,
     pub(super) block_transform: BlockTransform,
+    pub(super) intra: IntraPredictor,
     pub(super) crop_pipeline: wgpu::ComputePipeline,
     pub(super) crop_bgl: wgpu::BindGroupLayout,
     pub(super) pack_pipeline: wgpu::ComputePipeline,
@@ -252,10 +256,12 @@ impl DecoderPipeline {
             rans_decoder: GpuRansDecoder::new(ctx),
             bitplane_decoder: GpuBitplaneDecoder::new(ctx),
             rice_decoder: GpuRiceDecoder::new(ctx),
+            huffman_decoder: GpuHuffmanDecoder::new(ctx),
             interleaver: PlaneInterleaver::new(ctx),
             cfl_predictor: CflPredictor::new(ctx),
             motion: MotionEstimator::new(ctx),
             block_transform: BlockTransform::new(ctx),
+            intra: IntraPredictor::new(ctx),
             crop_pipeline,
             crop_bgl,
             pack_pipeline,

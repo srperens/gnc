@@ -100,9 +100,20 @@ impl DecoderPipeline {
                         );
                     }
                     EntropyData::Huffman(_) => {
-                        // Huffman uses CPU decode via ctx_adaptive_decode path;
-                        // this branch should never be reached.
-                        unreachable!("Huffman entropy should use CPU decode path");
+                        // GPU Huffman decode: 256 parallel streams per tile
+                        // Bindings: params, decode_table (tile_info), k_zrl (cpu_decoded_planes),
+                        //           stream_data (var_a), stream_offsets (var_b), output (scratch_a)
+                        self.huffman_decoder.dispatch_decode(
+                            ctx,
+                            &mut cmd,
+                            &bufs.entropy_params[p],
+                            &bufs.entropy_tile_info[p],  // decode_table
+                            &bufs.cpu_decoded_planes[p],  // k_zrl
+                            &bufs.entropy_var_a[p],       // stream_data
+                            &bufs.entropy_var_b[p],       // stream_offsets
+                            &bufs.scratch_a,
+                            tiles_per_plane as u32,
+                        );
                     }
                 }
             }
@@ -241,6 +252,21 @@ impl DecoderPipeline {
                 );
             }
             } // end wavelet decode path
+
+            // Intra reconstruction: Y plane only (p==0), after inverse wavelet
+            if p == 0 && frame.intra_modes.is_some() {
+                // scratch_a has wavelet-decoded residual; reconstruct spatial pixels
+                let intra_ts = crate::encoder::intra::INTRA_TILE_SIZE;
+                self.intra.inverse(
+                    ctx, &mut cmd,
+                    &bufs.scratch_a,    // residual in
+                    &bufs.scratch_b,    // reconstructed out
+                    &bufs.intra_modes_buf,
+                    padded_w, padded_h, intra_ts,
+                );
+                // Copy reconstructed back to scratch_a for I/P/B branching
+                cmd.copy_buffer_to_buffer(&bufs.scratch_b, 0, &bufs.scratch_a, 0, plane_size);
+            }
 
             let is_bframe = frame.frame_type == FrameType::Bidirectional;
             if is_bframe {

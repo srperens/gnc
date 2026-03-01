@@ -59,6 +59,11 @@ pub(super) struct CachedEncodeBuffers {
     // Only allocated when fused path is used (lazily via ensure_fused_hist_bufs).
     pub(super) fused_hist_bufs: Option<[wgpu::Buffer; 3]>,
 
+    // Intra prediction buffers (Y plane only, allocated when intra_prediction enabled)
+    pub(super) intra_residual: Option<wgpu::Buffer>,
+    pub(super) intra_modes_buf: Option<wgpu::Buffer>,
+    pub(super) intra_modes_staging: Option<wgpu::Buffer>,
+
     // Cached pad params buffer (constant for given resolution)
     pub(super) pad_params_buf: wgpu::Buffer,
 
@@ -280,6 +285,10 @@ impl CachedEncodeBuffers {
 
             fused_hist_bufs: None,
 
+            intra_residual: None,
+            intra_modes_buf: None,
+            intra_modes_staging: None,
+
             pad_params_buf: {
                 #[repr(C)]
                 #[derive(Copy, Clone, Pod, Zeroable)]
@@ -438,6 +447,40 @@ impl CachedEncodeBuffers {
                 contents: bytemuck::bytes_of(&params),
                 usage: wgpu::BufferUsages::UNIFORM,
             })
+    }
+
+    /// Ensure intra prediction buffers are allocated (Y plane only).
+    /// Allocates lazily on first use.
+    pub(super) fn ensure_intra_bufs(&mut self, ctx: &GpuContext) {
+        if self.intra_residual.is_some() {
+            return;
+        }
+        let plane_size = (self.padded_w as u64) * (self.padded_h as u64) * 4;
+        let num_blocks = (self.padded_w / 8) * (self.padded_h / 8);
+        let modes_size = (num_blocks as u64) * 4; // u32 per block
+
+        let plane_usage = wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC;
+
+        self.intra_residual = Some(ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("enc_intra_residual"),
+            size: plane_size,
+            usage: plane_usage,
+            mapped_at_creation: false,
+        }));
+        self.intra_modes_buf = Some(ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("enc_intra_modes"),
+            size: modes_size,
+            usage: plane_usage,
+            mapped_at_creation: false,
+        }));
+        self.intra_modes_staging = Some(ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("enc_intra_modes_staging"),
+            size: modes_size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        }));
     }
 
     /// Ensure per-plane histogram buffers are allocated for the fused quantize+histogram path.

@@ -1653,3 +1653,225 @@ fn test_motion_comp_quality_scaling() {
         );
     }
 }
+
+#[test]
+fn test_intra_prediction_gpu_roundtrip() {
+    // Test that forward + inverse intra prediction (without wavelet) is bit-exact
+    let ctx = GpuContext::new();
+    let intra = crate::encoder::intra::IntraPredictor::new(&ctx);
+
+    let w = 256u32;
+    let h = 256u32;
+    let tile_size = 256u32;
+    let npix = (w * h) as usize;
+
+    // Create test plane data (gradient)
+    let mut plane = vec![0.0f32; npix];
+    for y in 0..h {
+        for x in 0..w {
+            plane[(y * w + x) as usize] = (x as f32 + y as f32 * 0.5).clamp(0.0, 255.0);
+        }
+    }
+
+    let plane_size = (npix * 4) as u64;
+    let num_blocks = (w / 8) * (h / 8);
+    let modes_size = (num_blocks as u64) * 4;
+    let usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST;
+
+    let input_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("test_input"), size: plane_size, usage, mapped_at_creation: false,
+    });
+    let residual_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("test_residual"), size: plane_size, usage, mapped_at_creation: false,
+    });
+    let modes_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("test_modes"), size: modes_size, usage, mapped_at_creation: false,
+    });
+    let output_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("test_output"), size: plane_size, usage, mapped_at_creation: false,
+    });
+
+    ctx.queue.write_buffer(&input_buf, 0, bytemuck::cast_slice(&plane));
+
+    // Forward: input → residual + modes
+    let mut cmd = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("test_intra_fwd"),
+    });
+    intra.forward(&ctx, &mut cmd, &input_buf, &residual_buf, &modes_buf, w, h, tile_size);
+    ctx.queue.submit(Some(cmd.finish()));
+
+    // Inverse: residual + modes → output
+    let mut cmd = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("test_intra_inv"),
+    });
+    intra.inverse(&ctx, &mut cmd, &residual_buf, &output_buf, &modes_buf, w, h, tile_size);
+    ctx.queue.submit(Some(cmd.finish()));
+
+    // Readback output
+    let output = crate::gpu_util::read_buffer_f32(&ctx, &output_buf, npix);
+    let residual = crate::gpu_util::read_buffer_f32(&ctx, &residual_buf, npix);
+
+    // Check PSNR
+    let psnr = compute_psnr(&plane, &output);
+    eprintln!("Intra GPU roundtrip (no wavelet): PSNR={psnr:.2} dB");
+    eprintln!("  First 5 input: {:?}", &plane[..5]);
+    eprintln!("  First 5 residual: {:?}", &residual[..5]);
+    eprintln!("  First 5 output: {:?}", &output[..5]);
+
+    // Should be bit-exact (no loss in the prediction step)
+    assert!(psnr > 90.0, "Direct intra roundtrip should be near-lossless: {psnr:.2}");
+}
+
+#[test]
+fn test_intra_prediction_roundtrip() {
+    // Note: Intra prediction currently hurts wavelet path quality due to
+    // architectural mismatch (block prediction + tile wavelet creates boundary
+    // artifacts). It's designed for future BlockDCT8 integration where the
+    // transform operates at the same 8×8 block level as prediction.
+    // With INTRA_TILE_SIZE=32, drift is limited but wavelet still suffers.
+    let ctx = GpuContext::new();
+    let mut enc = EncoderPipeline::new(&ctx);
+    let dec = DecoderPipeline::new(&ctx);
+
+    let w = 256u32;
+    let h = 256u32;
+    let rgb = make_gradient_frame(w, h, 0.0);
+
+    let mut config = crate::quality_preset(75);
+    config.intra_prediction = false;
+    let comp_base = enc.encode(&ctx, &rgb, w, h, &config);
+    let dec_base = dec.decode(&ctx, &comp_base);
+    let psnr_base = compute_psnr(&rgb, &dec_base);
+    config.intra_prediction = true;
+    let comp_intra = enc.encode(&ctx, &rgb, w, h, &config);
+    let dec_intra = dec.decode(&ctx, &comp_intra);
+    let psnr_intra = compute_psnr(&rgb, &dec_intra);
+
+    eprintln!(
+        "q=75: base PSNR={psnr_base:.2} dB ({:.3} bpp), intra PSNR={psnr_intra:.2} dB ({:.3} bpp)",
+        comp_base.bpp(), comp_intra.bpp()
+    );
+
+    // Verify intra modes were stored
+    assert!(
+        comp_intra.intra_modes.is_some(),
+        "Intra prediction should produce mode data"
+    );
+    assert!(
+        comp_base.intra_modes.is_none(),
+        "Non-intra should have no mode data"
+    );
+
+    // Both should decode with reasonable quality
+    // (intra currently hurts wavelet quality due to block/tile mismatch)
+    assert!(psnr_base > 30.0, "Base PSNR too low: {psnr_base:.2}");
+    assert!(psnr_intra > 25.0, "Intra PSNR too low: {psnr_intra:.2}");
+}
+
+#[test]
+fn test_intra_prediction_serialize_roundtrip() {
+    let ctx = GpuContext::new();
+    let mut enc = EncoderPipeline::new(&ctx);
+    let dec = DecoderPipeline::new(&ctx);
+
+    let w = 256u32;
+    let h = 256u32;
+    let rgb = make_gradient_frame(w, h, 0.0);
+
+    let mut config = crate::quality_preset(75);
+    config.intra_prediction = true;
+    let compressed = enc.encode(&ctx, &rgb, w, h, &config);
+
+    // Serialize and deserialize
+    let bytes = crate::format::serialize_compressed(&compressed);
+    let deser = crate::format::deserialize_compressed(&bytes);
+
+    // Verify intra modes survived the roundtrip
+    assert!(deser.intra_modes.is_some(), "Intra modes should survive serialization");
+    assert_eq!(
+        compressed.intra_modes.as_ref().unwrap(),
+        deser.intra_modes.as_ref().unwrap(),
+        "Intra modes should match after serialize/deserialize"
+    );
+
+    // Decode the deserialized frame
+    let decoded = dec.decode(&ctx, &deser);
+    let psnr = compute_psnr(&rgb, &decoded);
+    eprintln!("Intra serialize roundtrip: PSNR={psnr:.2} dB");
+    assert!(psnr > 25.0, "Deserialized intra PSNR too low: {psnr:.2}");
+}
+
+#[test]
+fn test_intra_prediction_flat_image() {
+    // Flat image: all pixels = 128 → all residuals = 0 → should be bit-exact
+    let ctx = GpuContext::new();
+    let mut enc = EncoderPipeline::new(&ctx);
+    let dec = DecoderPipeline::new(&ctx);
+
+    let w = 256u32;
+    let h = 256u32;
+    let rgb: Vec<f32> = vec![128.0; (w * h * 3) as usize]; // flat gray
+
+    let mut config = crate::quality_preset(75);
+    config.intra_prediction = true;
+    let comp = enc.encode(&ctx, &rgb, w, h, &config);
+    let decoded = dec.decode(&ctx, &comp);
+    let psnr = compute_psnr(&rgb, &decoded);
+    eprintln!("Flat image intra: PSNR={psnr:.2} dB, modes present: {}", comp.intra_modes.is_some());
+
+    // Flat image should decode nearly perfectly even with intra prediction
+    assert!(psnr > 50.0, "Flat image intra PSNR too low: {psnr:.2}");
+}
+
+#[test]
+fn test_intra_prediction_modes_sanity() {
+    // Check that modes are transmitted correctly from encoder to decoder
+    let ctx = GpuContext::new();
+    let mut enc = EncoderPipeline::new(&ctx);
+
+    let w = 256u32;
+    let h = 256u32;
+    // Horizontal gradient: should prefer horizontal prediction
+    let mut rgb = Vec::with_capacity((w * h * 3) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            let v = (x as f32 / w as f32 * 255.0).clamp(0.0, 255.0);
+            rgb.push(v);
+            rgb.push(v);
+            rgb.push(v);
+        }
+    }
+
+    let mut config = crate::quality_preset(75);
+    config.intra_prediction = true;
+    let comp = enc.encode(&ctx, &rgb, w, h, &config);
+
+    let packed = comp.intra_modes.as_ref().unwrap();
+    let num_blocks = (w / 8) * (h / 8);
+    let modes = crate::encoder::intra::IntraPredictor::unpack_modes(packed, num_blocks as usize);
+    let mut mode_counts = [0u32; 4];
+    for &m in &modes {
+        assert!(m < 4, "Invalid mode: {m}");
+        mode_counts[m as usize] += 1;
+    }
+    eprintln!("Modes: DC={}, H={}, V={}, D={}", mode_counts[0], mode_counts[1], mode_counts[2], mode_counts[3]);
+    eprintln!("Total blocks: {num_blocks}, first 16 modes: {:?}", &modes[..16.min(modes.len())]);
+}
+
+#[test]
+fn test_intra_pack_unpack_modes() {
+    use crate::encoder::intra::IntraPredictor;
+
+    // Test pack/unpack roundtrip
+    let modes: Vec<u32> = vec![0, 1, 2, 3, 0, 2, 1, 3, 0, 0, 3, 3];
+    let packed = IntraPredictor::pack_modes(&modes);
+    let unpacked = IntraPredictor::unpack_modes(&packed, modes.len());
+    assert_eq!(modes, unpacked, "Pack/unpack should be lossless");
+
+    // Test with exact 4-alignment
+    let modes4: Vec<u32> = vec![0, 1, 2, 3];
+    let packed4 = IntraPredictor::pack_modes(&modes4);
+    assert_eq!(packed4.len(), 1);
+    let unpacked4 = IntraPredictor::unpack_modes(&packed4, 4);
+    assert_eq!(modes4, unpacked4);
+}

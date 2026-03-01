@@ -864,6 +864,7 @@ impl EncoderPipeline {
                     backward_vectors: None,
                     block_modes: None,
                 }),
+                intra_modes: None,
             }, mv_buf);
         } else {
             // CPU entropy path: preprocess + ME batched, then per-plane submits
@@ -1099,6 +1100,7 @@ impl EncoderPipeline {
                 backward_vectors: None,
                 block_modes: None,
             }),
+            intra_modes: None,
         }, mv_buf)
     }
 
@@ -1367,6 +1369,7 @@ impl EncoderPipeline {
                     backward_vectors: Some(bwd_mvs),
                     block_modes: Some(block_modes),
                 }),
+                intra_modes: None,
             }, fwd_mv_buf, bwd_mv_buf);
         } else {
             // CPU entropy path: preprocess + bidir ME batched, then per-plane submits
@@ -1532,6 +1535,7 @@ impl EncoderPipeline {
                 backward_vectors: Some(bwd_mvs),
                 block_modes: Some(block_modes),
             }),
+            intra_modes: None,
         }, fwd_mv_buf, bwd_mv_buf)
     }
 

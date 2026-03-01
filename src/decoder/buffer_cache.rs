@@ -60,6 +60,7 @@ pub(super) struct CachedBuffers {
     // Per-plane entropy decode buffers (reused across frames)
     pub(super) entropy_params: [wgpu::Buffer; 3],
     pub(super) entropy_tile_info: [wgpu::Buffer; 3],
+    pub(super) entropy_tile_info_cap: [u64; 3],
     pub(super) entropy_var_a: [wgpu::Buffer; 3],
     pub(super) entropy_var_b: [wgpu::Buffer; 3],
     pub(super) entropy_var_a_cap: [u64; 3],
@@ -86,6 +87,10 @@ pub(super) struct CachedBuffers {
     pub(super) weight_map_cap: u64,
     pub(super) mv_buf: wgpu::Buffer,
     pub(super) mv_cap: u64,
+
+    // Intra prediction modes buffer (u32 per 8×8 block)
+    pub(super) intra_modes_buf: wgpu::Buffer,
+    pub(super) intra_modes_cap: u64,
 
     // B-frame buffers
     pub(super) bwd_mv_buf: wgpu::Buffer,
@@ -328,6 +333,16 @@ impl CachedBuffers {
             mapped_at_creation: false,
         });
 
+        // Intra prediction modes buffer
+        let intra_blocks = (padded_w / 8) * (padded_h / 8);
+        let intra_modes_cap = (intra_blocks.max(1) * 4) as u64;
+        let intra_modes_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dec_intra_modes"),
+            size: intra_modes_cap,
+            usage: storage_dst,
+            mapped_at_creation: false,
+        });
+
         // B-frame: backward motion vector buffer (small initial capacity)
         let bwd_mv_cap = 256u64;
         let bwd_mv_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
@@ -433,6 +448,7 @@ impl CachedBuffers {
             reference_planes,
             entropy_params,
             entropy_tile_info,
+            entropy_tile_info_cap: [tile_info_size; 3],
             entropy_var_a,
             entropy_var_b,
             entropy_var_a_cap: [var_a_init_cap; 3],
@@ -458,6 +474,8 @@ impl CachedBuffers {
             weight_map_cap,
             mv_buf,
             mv_cap,
+            intra_modes_buf,
+            intra_modes_cap,
             bwd_mv_buf,
             bwd_mv_cap,
             block_modes_buf,

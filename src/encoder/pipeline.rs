@@ -11,6 +11,7 @@ use super::entropy_helpers::{encode_entropy, EntropyMode};
 use super::huffman;
 use super::huffman_gpu::GpuHuffmanEncoder;
 use super::interleave::PlaneDeinterleaver;
+use super::intra::IntraPredictor;
 use super::quantize::Quantizer;
 use super::quantize_histogram_fused::FusedQuantizeHistogram;
 use super::rans;
@@ -44,6 +45,7 @@ pub struct EncoderPipeline {
     pub(super) cfl_inverse: CflPredictor,
     pub(super) fused_qh: FusedQuantizeHistogram,
     pub(super) fused_block: FusedBlock,
+    pub(super) intra: IntraPredictor,
     pad_pipeline: wgpu::ComputePipeline,
     pad_bgl: wgpu::BindGroupLayout,
     pub(super) cached: Option<CachedEncodeBuffers>,
@@ -131,6 +133,7 @@ impl EncoderPipeline {
             cfl_inverse: CflPredictor::new(ctx),
             fused_qh: FusedQuantizeHistogram::new(ctx),
             fused_block: FusedBlock::new(ctx),
+            intra: IntraPredictor::new(ctx),
             pad_pipeline,
             pad_bgl,
             cached: None,
@@ -429,6 +432,12 @@ impl EncoderPipeline {
             bufs.ensure_fused_hist_bufs(ctx, total_tiles_for_hist);
         }
 
+        // Ensure intra prediction buffers (Y plane only)
+        if config.intra_prediction {
+            let bufs = self.cached.as_mut().unwrap();
+            bufs.ensure_intra_bufs(ctx);
+        }
+
         let bufs = self.cached.as_ref().unwrap();
 
         // ---- Single command encoder for all 3 planes: wavelet + AQ + quantize ----
@@ -515,6 +524,20 @@ impl EncoderPipeline {
             // ====================================================================
             // Wavelet path (existing): multi-level wavelet + AQ + quantize
             // ====================================================================
+
+        // --- Intra prediction (Y plane only, before wavelet) ---
+        if config.intra_prediction {
+            let intra_res = bufs.intra_residual.as_ref().unwrap();
+            let intra_modes = bufs.intra_modes_buf.as_ref().unwrap();
+            let intra_ts = super::intra::INTRA_TILE_SIZE;
+            self.intra.forward(
+                ctx, &mut cmd,
+                &bufs.plane_a, intra_res, intra_modes,
+                padded_w, padded_h, intra_ts,
+            );
+            // Copy residual back to plane_a for wavelet transform
+            cmd.copy_buffer_to_buffer(intra_res, 0, &bufs.plane_a, 0, plane_size);
+        }
 
         // --- Y plane: wavelet transform ---
         self.transform.forward(
@@ -871,6 +894,15 @@ impl EncoderPipeline {
             0
         };
 
+        // Intra modes copy to staging for deferred readback
+        if config.intra_prediction {
+            let intra_modes = bufs.intra_modes_buf.as_ref().unwrap();
+            let intra_staging = bufs.intra_modes_staging.as_ref().unwrap();
+            let num_blocks = IntraPredictor::num_blocks(padded_w, padded_h);
+            let modes_bytes = (num_blocks as u64) * 4;
+            cmd.copy_buffer_to_buffer(intra_modes, 0, intra_staging, 0, modes_bytes);
+        }
+
         } // end wavelet path
 
         let t_wavelet_quant = t_start.elapsed();
@@ -1031,6 +1063,31 @@ impl EncoderPipeline {
             None
         };
 
+        // Deferred intra modes readback
+        let intra_modes = if config.intra_prediction {
+            let bufs = self.cached.as_ref().unwrap();
+            let intra_staging = bufs.intra_modes_staging.as_ref().unwrap();
+            let num_blocks = IntraPredictor::num_blocks(padded_w, padded_h);
+            let modes_bytes = (num_blocks as u64) * 4;
+            let (tx, rx) = std::sync::mpsc::channel();
+            let tx_c = tx.clone();
+            intra_staging
+                .slice(..modes_bytes)
+                .map_async(wgpu::MapMode::Read, move |result| {
+                    tx_c.send(result).unwrap();
+                });
+            drop(tx);
+            ctx.device.poll(wgpu::Maintain::Wait);
+            rx.recv().unwrap().unwrap();
+            let view = intra_staging.slice(..modes_bytes).get_mapped_range();
+            let modes_u32: Vec<u32> = bytemuck::cast_slice(&view).to_vec();
+            drop(view);
+            intra_staging.unmap();
+            Some(IntraPredictor::pack_modes(&modes_u32))
+        } else {
+            None
+        };
+
         let entropy = match entropy_mode {
             EntropyMode::Bitplane => EntropyData::Bitplane(bp_tiles),
             EntropyMode::SubbandRans | EntropyMode::SubbandRansCtx => {
@@ -1063,6 +1120,7 @@ impl EncoderPipeline {
             weight_map,
             frame_type: FrameType::Intra,
             motion_field: None,
+            intra_modes,
         }
     }
 }

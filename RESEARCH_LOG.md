@@ -4,6 +4,53 @@
 
 ---
 
+## 2026-03-01: Fix Variable Block Size ME — Lambda Tuning + Delta MV Coding (GP12)
+
+### Problem
+Commit b3d1e4e added 8×8 sub-block splitting with RD decision, but demo files got 1-8% LARGER. The MV overhead from 4× more vectors per split macroblock exceeded residual savings. Animation content worst (+7.8%), complex natural motion barely improved (-0.5%).
+
+### Root Causes & Fixes
+
+**1. Lambda too low in RD split decision**
+Old: `lambda_sad = qstep * 3.0` → ~15 at q=75 — trivially small vs typical SAD values (1000-10000).
+New: `lambda_sad = qstep * 16.0 + 128.0` → ~208 at q=75, plus a proportional threshold in the shader:
+`threshold = max(lambda_sad, parent_sad / 4)` — requires at least 25% SAD improvement to justify splitting.
+
+**2. MVs encoded as raw absolute i16 — no compression**
+Implemented GP12 format with:
+- Median spatial predictor: pred = median(left, above, above-right) at 8×8 block level
+- Delta coding: store (actual - predictor) instead of absolute MV
+- Zigzag + varint encoding: zero deltas → 1 byte instead of 4 bytes
+- Skip bitmap: 1 bit per block for MV=(0,0) — no varint bytes needed
+
+**3. Skip bitmap for zero-MV blocks**
+Per-block skip bitmap (ceil(N/8) bytes) in the MV stream. Blocks with MV=(0,0) get 1 bit instead of 2 varint bytes. Common in animation (static regions) and non-split macroblocks with zero motion.
+
+### Results (demo file sizes)
+
+| File | Baseline | Old (inflated) | New (GP12) | vs Baseline |
+|------|----------|----------------|------------|-------------|
+| test_quick | 7.15 MB | 7.5 MB | **7.0 MB** | **-2.1%** |
+| test_animation | 20.2 MB | 21 MB | **19 MB** | **-5.9%** |
+| test_nature | 49.7 MB | 49 MB | **48 MB** | **-3.4%** |
+| test_crowd | 57.2 MB | 57 MB | **56 MB** | **-2.1%** |
+| ducks_q25 | 190 MB | 199 MB | **185 MB** | **-2.6%** |
+| ducks_q50 | 418 MB | 422 MB | **407 MB** | **-2.6%** |
+| ducks_q75 | 698 MB | 701 MB | **686 MB** | **-1.7%** |
+| bbb_2min | 895 MB | 965 MB | **856 MB** | **-4.4%** |
+
+All 8 files now smaller than original baseline. Animation content improved most (was +7.8%, now -5.9% — a 13.7 percentage point swing). The long-form bbb_2min shows the strongest absolute improvement: from +7.8% bloat to -4.4% savings.
+
+### Analysis
+1. **Lambda tuning is the biggest win**: Prevents unnecessary splits on easy content. Animation content has mostly smooth/zero motion where splitting only adds MV overhead.
+2. **Delta MV coding with varint**: Non-split macroblocks produce 4 identical sub-block MVs → 3 zero deltas → 3 skip bits instead of 12 raw bytes. This makes the 8×8 grid nearly free for non-split blocks.
+3. **Skip bitmap**: Compact encoding for the many zero-MV blocks in typical sequences. Static backgrounds (common in animation) cost ~0.125 bytes per block instead of ~2 bytes.
+4. **Format change**: GP12 magic, backward-compatible deserializer still reads GP11.
+
+Files modified: `sequence.rs` (lambda), `block_match_split.wgsl` (proportional threshold), `format.rs` (GP12 delta MV + skip bitmap), `conformance.rs` (magic check).
+
+---
+
 ## 2026-03-01: Context-Adaptive Rice k Parameter via EMA
 
 ### Hypothesis

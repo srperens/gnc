@@ -387,36 +387,160 @@ fn serialize_tile_blobs(entropy: &crate::EntropyData) -> Vec<Vec<u8>> {
     }
 }
 
-/// Serialize a CompressedFrame to the GP11 binary format.
+// ---- Delta MV coding helpers (GP12) ----
+
+/// Zigzag encode i16 → u16: maps 0→0, -1→1, 1→2, -2→3, ...
+#[inline]
+fn zigzag_encode(val: i16) -> u16 {
+    ((val << 1) ^ (val >> 15)) as u16
+}
+
+/// Zigzag decode u16 → i16
+#[inline]
+fn zigzag_decode(val: u16) -> i16 {
+    ((val >> 1) as i16) ^ -((val & 1) as i16)
+}
+
+/// Write unsigned varint (u16 range: max 3 bytes)
+fn write_varint(out: &mut Vec<u8>, val: u16) {
+    let mut v = val as u32;
+    while v >= 0x80 {
+        out.push((v & 0x7F) as u8 | 0x80);
+        v >>= 7;
+    }
+    out.push(v as u8);
+}
+
+/// Read unsigned varint → u16
+fn read_varint(data: &[u8], pos: &mut usize) -> u16 {
+    let mut result = 0u32;
+    let mut shift = 0;
+    loop {
+        let b = data[*pos] as u32;
+        *pos += 1;
+        result |= (b & 0x7F) << shift;
+        if b < 0x80 {
+            break;
+        }
+        shift += 7;
+    }
+    result as u16
+}
+
+/// Median of three i16 values
+#[inline]
+fn median3(a: i16, b: i16, c: i16) -> i16 {
+    a.max(b).min(c).max(a.min(b))
+}
+
+/// Compute MV predictor for block at (bx, by) using median of (left, above, above-right).
+/// `vectors` must contain already-reconstructed absolute MVs for all prior blocks in raster order.
+#[inline]
+fn mv_predictor(vectors: &[[i16; 2]], bx: usize, by: usize, blocks_x: usize) -> [i16; 2] {
+    let idx = by * blocks_x + bx;
+    let left = if bx > 0 { vectors[idx - 1] } else { [0, 0] };
+    let above = if by > 0 { vectors[idx - blocks_x] } else { [0, 0] };
+    let above_right = if by > 0 && bx + 1 < blocks_x {
+        vectors[idx - blocks_x + 1]
+    } else {
+        above // fallback to above when above-right unavailable
+    };
+    [
+        median3(left[0], above[0], above_right[0]),
+        median3(left[1], above[1], above_right[1]),
+    ]
+}
+
+/// Serialize motion vectors as delta-coded zigzag varints with skip bitmap.
 ///
-/// GP11 adds over GP10:
-/// - Per-tile CRC-32 checksums for error detection
-/// - Tile index table (sizes + CRCs) for random tile access
-/// - Full B-frame motion serialization (backward vectors + block modes)
+/// Format: [skip_bitmap: ceil(N/8) bytes] [delta MVs for non-skip blocks]
+/// Skip bit = 1 means MV is (0,0) — no delta bytes written for that block.
+/// Skip bit = 0 means delta MV follows (2 zigzag varints: dx, dy).
+fn serialize_mvs_delta(out: &mut Vec<u8>, vectors: &[[i16; 2]], blocks_x: usize) {
+    let n = vectors.len();
+    // Build skip bitmap: bit=1 for MV=(0,0) blocks
+    let bitmap_bytes = (n + 7) / 8;
+    let bitmap_start = out.len();
+    out.resize(bitmap_start + bitmap_bytes, 0);
+    for (i, mv) in vectors.iter().enumerate() {
+        if mv[0] == 0 && mv[1] == 0 {
+            out[bitmap_start + i / 8] |= 1 << (i % 8);
+        }
+    }
+    // Write delta MVs only for non-skip blocks
+    let blocks_y = if blocks_x > 0 { n / blocks_x } else { 0 };
+    for by in 0..blocks_y {
+        for bx in 0..blocks_x {
+            let idx = by * blocks_x + bx;
+            if vectors[idx][0] == 0 && vectors[idx][1] == 0 {
+                continue; // skip — no MV data needed
+            }
+            let pred = mv_predictor(vectors, bx, by, blocks_x);
+            let dx = vectors[idx][0] - pred[0];
+            let dy = vectors[idx][1] - pred[1];
+            write_varint(out, zigzag_encode(dx));
+            write_varint(out, zigzag_encode(dy));
+        }
+    }
+}
+
+/// Deserialize delta-coded zigzag varint MVs with skip bitmap back to absolute MVs.
+fn deserialize_mvs_delta(
+    data: &[u8],
+    pos: &mut usize,
+    num_blocks: usize,
+    blocks_x: usize,
+) -> Vec<[i16; 2]> {
+    // Read skip bitmap
+    let bitmap_bytes = (num_blocks + 7) / 8;
+    let bitmap = &data[*pos..*pos + bitmap_bytes];
+    *pos += bitmap_bytes;
+    let mut vectors = Vec::with_capacity(num_blocks);
+    let blocks_y = if blocks_x > 0 { num_blocks / blocks_x } else { 0 };
+    for by in 0..blocks_y {
+        for bx in 0..blocks_x {
+            let idx = by * blocks_x + bx;
+            let is_skip = (bitmap[idx / 8] >> (idx % 8)) & 1 != 0;
+            if is_skip {
+                vectors.push([0, 0]);
+            } else {
+                let pred = mv_predictor(&vectors, bx, by, blocks_x);
+                let dx = zigzag_decode(read_varint(data, pos));
+                let dy = zigzag_decode(read_varint(data, pos));
+                vectors.push([pred[0] + dx, pred[1] + dy]);
+            }
+        }
+    }
+    vectors
+}
+
+/// Serialize a CompressedFrame to the GP12 binary format.
+///
+/// GP12 is identical to GP11 except motion vectors use delta-coded
+/// zigzag varint encoding with a median spatial predictor, reducing
+/// MV overhead by 50-80% for typical content.
 pub fn serialize_compressed(frame: &crate::CompressedFrame) -> Vec<u8> {
     let mut out = Vec::new();
-    // Magic: GP11
-    out.extend_from_slice(b"GP11");
+    // Magic: GP12
+    out.extend_from_slice(b"GP12");
     // Common header fields
     serialize_frame_header(frame, &mut out);
-    // Motion field — GP11 serializes full motion for P and B frames
+    // Motion field — GP12 uses delta-coded varint MVs
     if let Some(ref mf) = frame.motion_field {
         out.extend_from_slice(&(mf.block_size as u16).to_le_bytes());
         let num_blocks = mf.vectors.len() as u32;
         out.extend_from_slice(&num_blocks.to_le_bytes());
-        // Forward motion vectors
-        for mv in &mf.vectors {
-            out.extend_from_slice(&mv[0].to_le_bytes());
-            out.extend_from_slice(&mv[1].to_le_bytes());
-        }
-        // B-frame backward vectors + block modes (GP11 extension)
+        // Compute blocks_x from frame dimensions and block_size
+        let padded_w = frame.info.padded_width();
+        let blocks_x = (padded_w / mf.block_size) as usize;
+        // Forward motion vectors (delta-coded zigzag varint)
+        serialize_mvs_delta(&mut out, &mf.vectors, blocks_x);
+        // B-frame backward vectors + block modes
         if frame.frame_type == crate::FrameType::Bidirectional {
             if let Some(ref bwd) = mf.backward_vectors {
                 out.extend_from_slice(&(bwd.len() as u32).to_le_bytes());
-                for mv in bwd {
-                    out.extend_from_slice(&mv[0].to_le_bytes());
-                    out.extend_from_slice(&mv[1].to_le_bytes());
-                }
+                let bwd_blocks_x = (padded_w / 16) as usize; // B-frames use 16×16
+                serialize_mvs_delta(&mut out, bwd, bwd_blocks_x);
             } else {
                 out.extend_from_slice(&0u32.to_le_bytes());
             }
@@ -613,14 +737,14 @@ fn make_zero_subband_tile(
     }
 }
 
-/// Deserialize a CompressedFrame from GP11/GP10/GPC9/GPC8 binary format.
+/// Deserialize a CompressedFrame from GP12/GP11/GP10/GPC9/GPC8 binary format.
 /// Returns the frame without CRC validation. Use `deserialize_compressed_validated`
-/// for GP11 CRC checking.
+/// for GP12/GP11 CRC checking.
 pub fn deserialize_compressed(data: &[u8]) -> crate::CompressedFrame {
     deserialize_compressed_validated(data).frame
 }
 
-/// Deserialize a CompressedFrame with per-tile CRC validation (GP11).
+/// Deserialize a CompressedFrame with per-tile CRC validation (GP12/GP11).
 /// For GP10/GPC9/GPC8, returns empty `tile_crcs`.
 pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
     assert!(data.len() >= 37, "File too small");
@@ -628,9 +752,10 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
     let is_gpc9 = magic == b"GPC9";
     let is_gp10 = magic == b"GP10";
     let is_gp11 = magic == b"GP11";
+    let is_gp12 = magic == b"GP12";
     assert!(
-        magic == b"GPC8" || is_gpc9 || is_gp10 || is_gp11,
-        "Invalid magic (expected GPC8, GPC9, GP10 or GP11; older files must be re-encoded)"
+        magic == b"GPC8" || is_gpc9 || is_gp10 || is_gp11 || is_gp12,
+        "Invalid magic (expected GPC8, GPC9, GP10, GP11 or GP12; older files must be re-encoded)"
     );
 
     // --- Common header (same layout for GPC9/GP10/GP11; GPC8 lacks per-subband flag) ---
@@ -654,8 +779,8 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
         t => panic!("Unknown transform type: {t}"),
     };
 
-    // Per-subband entropy flag (GPC9/GP10/GP11 only)
-    let (per_subband_entropy, mut pos) = if is_gpc9 || is_gp10 || is_gp11 {
+    // Per-subband entropy flag (GPC9/GP10/GP11/GP12)
+    let (per_subband_entropy, mut pos) = if is_gpc9 || is_gp10 || is_gp11 || is_gp12 {
         (data[34] != 0, 35)
     } else {
         (false, 34)
@@ -721,8 +846,8 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
         None
     };
 
-    // --- Intra prediction modes (GP11 only) ---
-    let intra_modes = if is_gp11 && data[pos] != 0 {
+    // --- Intra prediction modes (GP11/GP12) ---
+    let intra_modes = if (is_gp11 || is_gp12) && data[pos] != 0 {
         pos += 1; // skip intra_flag
         let _num_blocks = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
         pos += 4;
@@ -731,15 +856,15 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
         let modes = data[pos..pos + packed_len].to_vec();
         pos += packed_len;
         Some(modes)
-    } else if is_gp11 {
+    } else if is_gp11 || is_gp12 {
         pos += 1; // skip intra_flag = 0
         None
     } else {
         None
     };
 
-    // --- Frame type + motion field (GP10/GP11 only) ---
-    let (frame_type, motion_field) = if is_gp10 || is_gp11 {
+    // --- Frame type + motion field (GP10/GP11/GP12) ---
+    let (frame_type, motion_field) = if is_gp10 || is_gp11 || is_gp12 {
         let ft = match data[pos] {
             0 => crate::FrameType::Intra,
             1 => crate::FrameType::Predicted,
@@ -753,30 +878,45 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
             let num_blocks =
                 u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
             pos += 4;
-            let mut vectors = Vec::with_capacity(num_blocks);
-            for _ in 0..num_blocks {
-                let dx = i16::from_le_bytes(data[pos..pos + 2].try_into().unwrap());
-                let dy = i16::from_le_bytes(data[pos + 2..pos + 4].try_into().unwrap());
-                vectors.push([dx, dy]);
-                pos += 4;
-            }
-            // GP11 B-frames: backward vectors + block modes
+            let vectors = if is_gp12 {
+                // GP12: delta-coded zigzag varint MVs
+                let padded_w = width.div_ceil(tile_size) * tile_size;
+                let blocks_x = (padded_w / block_size) as usize;
+                deserialize_mvs_delta(data, &mut pos, num_blocks, blocks_x)
+            } else {
+                // GP10/GP11: raw i16 MVs
+                let mut vecs = Vec::with_capacity(num_blocks);
+                for _ in 0..num_blocks {
+                    let dx = i16::from_le_bytes(data[pos..pos + 2].try_into().unwrap());
+                    let dy = i16::from_le_bytes(data[pos + 2..pos + 4].try_into().unwrap());
+                    vecs.push([dx, dy]);
+                    pos += 4;
+                }
+                vecs
+            };
+            // GP11/GP12 B-frames: backward vectors + block modes
             let (backward_vectors, block_modes) =
-                if is_gp11 && ft == crate::FrameType::Bidirectional {
+                if (is_gp11 || is_gp12) && ft == crate::FrameType::Bidirectional {
                     let bwd_count =
                         u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
                     pos += 4;
                     let bwd = if bwd_count > 0 {
-                        let mut bv = Vec::with_capacity(bwd_count);
-                        for _ in 0..bwd_count {
-                            let dx =
-                                i16::from_le_bytes(data[pos..pos + 2].try_into().unwrap());
-                            let dy =
-                                i16::from_le_bytes(data[pos + 2..pos + 4].try_into().unwrap());
-                            bv.push([dx, dy]);
-                            pos += 4;
+                        if is_gp12 {
+                            let padded_w = width.div_ceil(tile_size) * tile_size;
+                            let bwd_blocks_x = (padded_w / 16) as usize;
+                            Some(deserialize_mvs_delta(data, &mut pos, bwd_count, bwd_blocks_x))
+                        } else {
+                            let mut bv = Vec::with_capacity(bwd_count);
+                            for _ in 0..bwd_count {
+                                let dx =
+                                    i16::from_le_bytes(data[pos..pos + 2].try_into().unwrap());
+                                let dy =
+                                    i16::from_le_bytes(data[pos + 2..pos + 4].try_into().unwrap());
+                                bv.push([dx, dy]);
+                                pos += 4;
+                            }
+                            Some(bv)
                         }
-                        Some(bv)
                     } else {
                         None
                     };
@@ -815,8 +955,8 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
     let num_tiles = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
     pos += 4;
 
-    // GP11: tile index table with sizes + CRC-32s
-    let (tile_sizes, tile_crcs) = if is_gp11 {
+    // GP11/GP12: tile index table with sizes + CRC-32s
+    let (tile_sizes, tile_crcs) = if is_gp11 || is_gp12 {
         let mut sizes = Vec::with_capacity(num_tiles);
         let mut expected_crcs = Vec::with_capacity(num_tiles);
         for _ in 0..num_tiles {

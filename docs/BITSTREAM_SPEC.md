@@ -1,7 +1,7 @@
 # GNC Bitstream Specification
 
-**Version:** GP11 (frame codec), GNV1 (sequence container)
-**Date:** 2026-02-26
+**Version:** GP12 (frame codec), GNV1 (sequence container)
+**Date:** 2026-03-01
 
 This document specifies the GNC bitstream format at a level of detail sufficient for an independent implementation.
 
@@ -83,16 +83,32 @@ Present only when `frame_type != 0`:
 
 | Size | Type | Field | Description |
 |------|------|-------|-------------|
-| 2 | u16 | block_size | Motion estimation block size (typically 16) |
-| 4 | u32 | num_blocks | Number of motion blocks |
-| num_blocks * 4 | i16[2] | forward_vectors | Per-block [dx, dy] in half-pel units |
+| 2 | u16 | block_size | Motion estimation block size (8 for variable block) |
+| 4 | u32 | num_blocks | Number of motion blocks in the 2D grid |
+
+**GP12 delta-coded motion vectors (forward):**
+
+Motion vectors are delta-coded using a median spatial predictor and encoded with zigzag varint, preceded by a skip bitmap:
+
+1. **Skip bitmap**: `ceil(num_blocks / 8)` bytes. Bit *i* = 1 means block *i* has MV = (0,0); no delta bytes follow.
+2. **Delta MVs**: For each non-skip block (in raster order), two zigzag-encoded unsigned varints (dx_delta, dy_delta).
+
+The **median predictor** for block at grid position (bx, by):
+- `left` = MV at (bx-1, by), or (0,0) if at left edge
+- `above` = MV at (bx, by-1), or (0,0) if at top edge
+- `above_right` = MV at (bx+1, by-1), or `above` if unavailable
+- `predictor = (median(left.dx, above.dx, above_right.dx), median(left.dy, above.dy, above_right.dy))`
+- `delta = actual_MV - predictor`
+
+**Zigzag encoding**: `zigzag(x) = (x << 1) ^ (x >> 15)` maps signed i16 to unsigned u16 (0→0, -1→1, 1→2, ...).
+**Varint encoding**: Standard unsigned varint (7 bits per byte, MSB continuation flag). Max 3 bytes for u16 range.
 
 For B-frames (`frame_type == 2`), additionally:
 
 | Size | Type | Field | Description |
 |------|------|-------|-------------|
 | 4 | u32 | bwd_count | Number of backward vectors (0 if none) |
-| bwd_count * 4 | i16[2] | backward_vectors | Per-block [dx, dy] in half-pel units |
+| var | delta-coded | backward_vectors | Same delta+varint format as forward vectors |
 | 4 | u32 | modes_count | Number of block mode bytes (0 if none) |
 | modes_count | u8[] | block_modes | Per-block: 0=forward, 1=backward, 2=bidirectional |
 
@@ -282,7 +298,8 @@ Tiles are strictly independent: no cross-tile dependencies at any stage. Each ti
 
 | Magic | Readable | Notes |
 |-------|----------|-------|
-| GP11 | Yes | Current version with CRC-32 and tile index |
+| GP12 | Yes | Current version: delta-coded varint MVs with skip bitmap |
+| GP11 | Yes | CRC-32 and tile index, raw i16 MVs |
 | GP10 | Yes | Temporal coding, no CRC, no tile index |
 | GPC9 | Yes | Per-subband entropy, no temporal |
 | GPC8 | Yes | Baseline, no per-subband flag |

@@ -639,7 +639,9 @@ impl EncoderPipeline {
             );
 
             // Variable block size: 8x8 split decision
-            let lambda_sad = (config.quantization_step * 3.0).round().max(1.0) as u32;
+            // Lambda must be high enough to prevent unnecessary splits on easy content.
+            // Each split adds 3 extra MVs (12 bytes raw); must outweigh residual savings.
+            let lambda_sad = (config.quantization_step * 16.0 + 128.0).round() as u32;
             split_mv_buf = self.motion.estimate_split(
                 ctx,
                 &mut cmd,
@@ -933,7 +935,7 @@ impl EncoderPipeline {
             mv_buf = mb;
 
             // Variable block size: 8x8 split decision
-            let lambda_sad = (config.quantization_step * 3.0).round().max(1.0) as u32;
+            let lambda_sad = (config.quantization_step * 16.0 + 128.0).round() as u32;
             split_mv_buf = self.motion.estimate_split(
                 ctx,
                 &mut cmd,

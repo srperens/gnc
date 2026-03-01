@@ -318,8 +318,11 @@ fn main(
         let sum_sub = sub_sads[0] + sub_sads[1] + sub_sads[2] + sub_sads[3];
         let parent_sad = parent_sads[mb_idx];
 
-        // Split if sub-block SADs + lambda penalty < parent SAD
-        let do_split = (sum_sub + params.lambda_sad) < parent_sad;
+        // Split only if sub-blocks save enough to justify 3 extra MVs.
+        // Use max(base_lambda, 25% of parent_sad) — prevents splits on easy blocks
+        // where tiny SAD improvements don't outweigh MV overhead.
+        let threshold = max(params.lambda_sad, parent_sad / 4u);
+        let do_split = (sum_sub + threshold) < parent_sad;
 
         if do_split {
             // Write 4 individual sub-block MVs

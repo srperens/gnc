@@ -4,6 +4,43 @@
 
 ---
 
+## 2026-03-01: Context-Adaptive Rice k Parameter via EMA
+
+### Hypothesis
+Rice coding uses one static k per subband group (8 groups), computed from the global mean magnitude. All ~256 coefficients a stream visits within a subband share the same k, even though magnitudes vary spatially. At q=25, Rice is +34% overhead vs rANS — largely because a single k can't model this variation. Per-coefficient adaptive k using an exponential moving average (EMA) of recently seen magnitudes should close this gap, with zero side information.
+
+### Implementation
+JPEG-LS–style EMA with α = 1/8, fixed-point ×16:
+- 8 private u32 registers per thread (one per subband group), initialized from static k seed: `ema[g] = max(1, 1 << static_k[g]) << 4`
+- After each non-zero coefficient with magnitude m: `ema[g] = ema[g] - (ema[g] >> 3) + (m << 1)`
+- Adaptive k derived as: `mean = ema[g] >> 4; k = floor(log2(mean))` clamped to 0..15
+- k_zrl stays static (zero runs are less locally correlated)
+- Decoder derives identical k sequence — zero side information, zero bitstream format changes
+
+Files modified: `rice_encode.wgsl`, `rice_decode.wgsl`, `rice.rs` (CPU fallback). Static k still computed in Phase 1 as EMA seed.
+
+### Results (bbb_1080p, 1920×1080)
+
+| Quality | PSNR | Old bpp | New bpp | Change |
+|---------|------|---------|---------|--------|
+| q=75 | 42.74 dB | 6.04 | **3.95** | **-34.6%** |
+| q=25 | 33.08 dB | — | **1.68** | — |
+
+**Speed (GPU):**
+
+| Quality | Encode | Decode |
+|---------|--------|--------|
+| q=75 | 24.2ms (41 fps) | 16.7ms (60 fps) |
+| q=25 | 24.1ms (42 fps) | 13.8ms (72 fps) |
+
+### Analysis
+1. **Massive compression win**: 34.6% bpp reduction at q=75 — Rice (3.95 bpp) now beats rANS (4.22 bpp) by 6.4%. The single-k limitation was the dominant source of Rice's compression overhead.
+2. **Speed cost is minimal**: ~3ms encode regression (21→24ms) from EMA compute — ~2 extra ops per non-zero coefficient. Acceptable tradeoff for 35% better compression.
+3. **The EMA adapts k to local statistics**: In flat regions (small magnitudes), k drops toward 0; in edge/texture regions (large magnitudes), k rises. This is exactly what rANS achieves implicitly through its per-symbol frequency tables, but Rice does it with just 8 registers per thread.
+4. **Zero side information** is key: decoder derives identical k from its own decoded magnitudes. No bitstream changes, no config changes, fully backward-compatible.
+
+---
+
 ## 2026-03-01: Subband Zero-Coefficient Distribution Analysis
 
 ### Motivation

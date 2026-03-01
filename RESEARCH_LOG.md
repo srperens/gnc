@@ -4,6 +4,54 @@
 
 ---
 
+## 2026-03-01: Spatial Intra Prediction — Infrastructure + Architectural Analysis
+
+### Hypothesis
+Predicting each 8×8 block from spatial neighbors (left column, top row) before the wavelet transform should reduce residual energy, yielding 0.3–1.0 dB gain at mid-quality.
+
+### Implementation
+Complete spatial intra prediction pipeline:
+- 2 WGSL shaders: `intra_predict.wgsl` (encoder, sequential raster scan), `intra_reconstruct.wgsl` (decoder, sequential reconstruction from decoded residuals)
+- Rust module: `encoder/intra.rs` with `IntraPredictor` (forward/inverse pipelines, mode pack/unpack)
+- 4 modes: DC (0), Horizontal (1), Vertical (2), Diagonal-down-left (3)
+- 2-bit packed mode storage, Y plane only
+- Bitstream: intra_flag + packed modes in GP11 format
+- Full encoder/decoder integration, 8 new tests
+
+### Results — Architectural Mismatch with Wavelet
+
+**Direct GPU roundtrip (forward→inverse, no wavelet): 100 dB (bit-exact).** Shaders are correct.
+
+**Full pipeline (wavelet path) consistently hurts quality and bitrate:**
+
+| INTRA_TILE_SIZE | q=99 PSNR | q=75 PSNR | q=75 bpp |
+|---|---|---|---|
+| 8 (pred=128 only) | 69.17 (=base) | 56.49 (=base) | 0.564 |
+| 16 | 26.07 | 25.93 | 2.277 |
+| 32 | 46.60 | 35.54 | 1.174 |
+| 64 | 39.32 | 30.33 | 0.801 |
+| 256 | 21.87 | 14.97 | 0.857 |
+| **base (no intra)** | **69.17** | **56.49** | **0.538** |
+
+Real image (bbb_1080p): q=75 base 42.83 dB / 4.01 bpp → intra 31.07 dB / 5.16 bpp (-11.76 dB, +29% bitrate).
+
+### Root Cause Analysis
+
+Two compounding issues:
+
+1. **Block boundary artifacts**: Block-level prediction creates discontinuities at 8×8 block edges in the residual. The tile-level CDF 9/7 wavelet (256×256) represents these discontinuities poorly, spreading energy into high-frequency subbands.
+
+2. **Prediction drift**: Encoder predicts from original input pixels (open-loop). Decoder predicts from its own lossy reconstruction. Since reconstruction includes wavelet quantization error, predictions diverge. Drift accumulates linearly across blocks within each intra tile.
+
+At INTRA_TILE_SIZE=8, all predictions use 128.0 (no neighbors), producing a trivial constant shift that the wavelet handles perfectly — confirming that the degradation is entirely from neighbor-dependent prediction.
+
+### Conclusion
+**Block-level spatial intra prediction is architecturally incompatible with tile-level wavelet transform.** In H.264/HEVC, intra prediction works because the DCT operates at the same block size as prediction (closed-loop per-block). Our wavelet operates on entire tiles, making closed-loop per-block prediction prohibitively expensive.
+
+Feature is committed but disabled by default (`intra_prediction: false`). The infrastructure is correct and ready for BlockDCT8 integration, where transform and prediction operate at the same 8×8 block scale.
+
+---
+
 ## 2026-02-28: Debug Motion Compensation — ME Search Range Fix
 
 ### Hypothesis

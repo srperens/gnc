@@ -47,13 +47,12 @@ Each tile (256x256) is fully independent — no cross-tile dependencies. This gi
 3. **Adaptive quantization** — Per-block variance analysis on LL subband, geometric mean normalization, 3×3 spatial smoothing
 4. **Quantization** — Uniform scalar with perceptual subband weights, dead zone, adaptive QP from AQ weight map. Fused quantize+histogram kernel when CfL is off.
 5. **Chroma-from-Luma (CfL)** — Per-tile per-subband least-squares alpha (14-bit), active at q=50–85. Encodes chroma residuals instead of raw coefficients.
-6. **Entropy coding** — Rice+ZRL (default): significance map + Golomb-Rice + zero-run-length, 256 independent streams per tile. rANS (32 streams) and Huffman (64-symbol) available but parked.
+6. **Entropy coding** — Rice+ZRL (default): significance map + Golomb-Rice + zero-run-length, 256 independent streams per tile. rANS (32 streams), Huffman (64-symbol), and Bitplane also available but parked.
 
 ### Video features
 
 - **I/P/B frames** — motion-compensated prediction with half-pel bilinear interpolation
-- **Motion estimation** — hierarchical coarse-to-fine block matching (16x16, ±64px search)
-- **Rate control** — CBR and VBR modes with R-Q model
+- **Motion estimation** — hierarchical coarse-to-fine block matching (16x16, ±32px search)
 - **Container** — GNV1 format with frame index table, keyframe seeking
 - **Error resilience** — per-tile CRC-32 checksums, corrupt tile detection and recovery
 
@@ -92,16 +91,10 @@ gnc decode-sequence -i video.gnv -o "output/%04d.png"
 gnc decode-sequence -i video.gnv -o "output/%04d.png" --seek 5.0  # seek to 5s
 ```
 
-### Rate-controlled encoding
-
-```bash
-gnc encode-sequence -i "frames/%04d.png" -o video.gnv --bitrate 10M --rate-mode vbr
-```
-
 ### Run tests
 
 ```bash
-cargo test --release    # 141 tests: unit, regression, conformance
+cargo test --release    # 142 tests: unit, regression, conformance
 ```
 
 ## Test Material
@@ -114,15 +107,16 @@ Downloads representative broadcast frames from [Xiph.org](https://media.xiph.org
 
 ## Entropy Coders
 
-GNC has three entropy coding backends, all running as GPU compute shaders:
+GNC has four entropy coding backends, all running as GPU compute shaders:
 
 | Coder | Streams/tile | Compression | Speed | Patent risk |
 |-------|-------------|-------------|-------|-------------|
 | **Rice+ZRL** (default) | 256 | 4.01 bpp @ q=75 | **1.5–2× faster** | None |
 | rANS (`--rans`) | 32 | 4.22 bpp @ q=75 | Baseline | Possible (MS patent) |
-| Huffman | Per-tile | 64-symbol + escape | Moderate | None |
+| Huffman (parked) | 256 | 64-symbol + escape | Moderate | None |
+| Bitplane (parked) | Per-block | Sign + magnitude bitplanes | Moderate | None |
 
-Rice is the default because it eliminates the sequential state chain that limits rANS. Each of the 256 streams encodes independently — no shared state, no synchronization, minimal shared memory (< 1 KB vs rANS's 16 KB frequency tables). rANS and Huffman are available but parked — they'll be revisited once speed targets are met.
+Rice is the default because it eliminates the sequential state chain that limits rANS. Each of the 256 streams encodes independently — no shared state, no synchronization, minimal shared memory (< 1 KB vs rANS's 16 KB frequency tables). rANS, Huffman, and Bitplane are available but parked — they'll be revisited once speed targets are met.
 
 ## Quality Spectrum
 
@@ -171,7 +165,7 @@ src/
 │   ├── pipeline.rs     Decoder orchestration
 │   ├── frame_data.rs   Frame data upload
 │   └── gpu_work.rs     GPU dispatch
-├── shaders/            33 WGSL compute shaders
+├── shaders/            42 WGSL compute shaders
 │   ├── rice_encode.wgsl, rice_decode.wgsl
 │   ├── rans_encode.wgsl, rans_decode.wgsl
 │   ├── transform_97.wgsl, transform_53.wgsl

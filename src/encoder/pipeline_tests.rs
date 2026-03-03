@@ -393,7 +393,11 @@ fn test_fused_quantize_histogram_matches_separate() {
     let decoded_fused = dec.decode(&ctx, &compressed_fused);
 
     // Compare decoded pixels: must be identical (same quantization, same entropy)
-    assert_eq!(decoded_sep.len(), decoded_fused.len(), "decoded length mismatch");
+    assert_eq!(
+        decoded_sep.len(),
+        decoded_fused.len(),
+        "decoded length mismatch"
+    );
     let mut max_diff: f32 = 0.0;
     let mut diff_count = 0usize;
     for (i, (a, b)) in decoded_sep.iter().zip(decoded_fused.iter()).enumerate() {
@@ -456,7 +460,11 @@ fn test_fused_quantize_histogram_with_aq() {
     let decoded_fused = dec.decode(&ctx, &compressed_fused);
 
     // Compare decoded pixels
-    assert_eq!(decoded_sep.len(), decoded_fused.len(), "decoded length mismatch");
+    assert_eq!(
+        decoded_sep.len(),
+        decoded_fused.len(),
+        "decoded length mismatch"
+    );
     let mut max_diff: f32 = 0.0;
     let mut diff_count = 0usize;
     for (i, (a, b)) in decoded_sep.iter().zip(decoded_fused.iter()).enumerate() {
@@ -538,8 +546,12 @@ fn test_block_dct_roundtrip() {
     for i in 0..10 {
         eprintln!(
             "  px[{i}]: ({:.1}, {:.1}, {:.1}) vs ({:.1}, {:.1}, {:.1})",
-            rgb[i * 3], rgb[i * 3 + 1], rgb[i * 3 + 2],
-            decoded[i * 3], decoded[i * 3 + 1], decoded[i * 3 + 2],
+            rgb[i * 3],
+            rgb[i * 3 + 1],
+            rgb[i * 3 + 2],
+            decoded[i * 3],
+            decoded[i * 3 + 1],
+            decoded[i * 3 + 2],
         );
     }
 
@@ -575,12 +587,16 @@ fn test_block_dct_multitile() {
     eprintln!("DCT multitile (512x512, 4 tiles) PSNR: {psnr:.2} dB");
 
     // Check a pixel from tile 0 and tile 1
-    for i in [0, 256, 512, 256*512] {
+    for i in [0, 256, 512, 256 * 512] {
         if i * 3 + 2 < rgb.len() {
             eprintln!(
                 "  px[{i}]: ({:.1}, {:.1}, {:.1}) vs ({:.1}, {:.1}, {:.1})",
-                rgb[i * 3], rgb[i * 3 + 1], rgb[i * 3 + 2],
-                decoded[i * 3], decoded[i * 3 + 1], decoded[i * 3 + 2],
+                rgb[i * 3],
+                rgb[i * 3 + 1],
+                rgb[i * 3 + 2],
+                decoded[i * 3],
+                decoded[i * 3 + 1],
+                decoded[i * 3 + 2],
             );
         }
     }
@@ -614,8 +630,10 @@ fn test_block_dct_nonaligned() {
     let compressed = enc.encode(&ctx, &rgb, w, h, &config);
     eprintln!(
         "DCT nonaligned: orig {}x{}, padded {}x{}, bpp={:.3}",
-        w, h,
-        compressed.info.padded_width(), compressed.info.padded_height(),
+        w,
+        h,
+        compressed.info.padded_width(),
+        compressed.info.padded_height(),
         compressed.bpp(),
     );
 
@@ -630,8 +648,12 @@ fn test_block_dct_nonaligned() {
         if i * 3 + 2 < rgb.len() {
             eprintln!(
                 "  px[{i}]: ({:.1}, {:.1}, {:.1}) vs ({:.1}, {:.1}, {:.1})",
-                rgb[i * 3], rgb[i * 3 + 1], rgb[i * 3 + 2],
-                decoded[i * 3], decoded[i * 3 + 1], decoded[i * 3 + 2],
+                rgb[i * 3],
+                rgb[i * 3 + 1],
+                rgb[i * 3 + 2],
+                decoded[i * 3],
+                decoded[i * 3 + 1],
+                decoded[i * 3 + 2],
             );
         }
     }
@@ -665,7 +687,10 @@ fn test_block_dct_quality_preset() {
         let psnr = compute_psnr(&rgb, &decoded);
         eprintln!(
             "q={q}: qstep={:.2}, dz={:.2}, levels={}, psnr={psnr:.2} dB, bpp={:.3}",
-            config.quantization_step, config.dead_zone, config.wavelet_levels, compressed.bpp(),
+            config.quantization_step,
+            config.dead_zone,
+            config.wavelet_levels,
+            compressed.bpp(),
         );
 
         assert!(
@@ -690,11 +715,17 @@ fn test_block_dct_noisy_content() {
         for x in 0..w {
             let idx = ((y * w + x) * 3) as usize;
             // Pseudo-random content with full 0-255 range
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let r = ((seed >> 33) % 256) as f32;
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let g = ((seed >> 33) % 256) as f32;
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let b = ((seed >> 33) % 256) as f32;
             rgb[idx] = r;
             rgb[idx + 1] = g;
@@ -711,7 +742,10 @@ fn test_block_dct_noisy_content() {
     let compressed = enc.encode(&ctx, &rgb, w, h, &config);
     let decoded = dec.decode(&ctx, &compressed);
     let psnr = compute_psnr(&rgb, &decoded);
-    eprintln!("DCT noisy q=75: psnr={psnr:.2} dB, bpp={:.3}", compressed.bpp());
+    eprintln!(
+        "DCT noisy q=75: psnr={psnr:.2} dB, bpp={:.3}",
+        compressed.bpp()
+    );
 
     // Now with q=99
     let mut config99 = crate::quality_preset(99);
@@ -723,7 +757,10 @@ fn test_block_dct_noisy_content() {
     let compressed99 = enc.encode(&ctx, &rgb, w, h, &config99);
     let decoded99 = dec.decode(&ctx, &compressed99);
     let psnr99 = compute_psnr(&rgb, &decoded99);
-    eprintln!("DCT noisy q=99: psnr={psnr99:.2} dB, bpp={:.3}", compressed99.bpp());
+    eprintln!(
+        "DCT noisy q=99: psnr={psnr99:.2} dB, bpp={:.3}",
+        compressed99.bpp()
+    );
 
     // Verify the compressed config is correct
     eprintln!(
@@ -737,8 +774,8 @@ fn test_block_dct_noisy_content() {
     // by encoding and reading back the quantized buffer
     // Use the fused block directly for a single-plane test
     {
-        use crate::encoder::fused_block::FusedBlock;
         use crate::encoder::block_transform::{BlockTransform, BlockTransformType};
+        use crate::encoder::fused_block::FusedBlock;
         use crate::encoder::quantize::Quantizer;
 
         let fused = FusedBlock::new(&ctx);
@@ -750,12 +787,16 @@ fn test_block_dct_noisy_content() {
         let plane_data: Vec<f32> = (0..sz).map(|i| rgb[i * 3]).collect();
         let plane_bytes = (sz * 4) as u64;
 
-        let usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST;
-        let input_buf = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("test_input"),
-            contents: bytemuck::cast_slice(&plane_data),
-            usage,
-        });
+        let usage = wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_SRC
+            | wgpu::BufferUsages::COPY_DST;
+        let input_buf = ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("test_input"),
+                contents: bytemuck::cast_slice(&plane_data),
+                usage,
+            });
         let quant_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("test_quant"),
             size: plane_bytes,
@@ -781,23 +822,48 @@ fn test_block_dct_noisy_content() {
             mapped_at_creation: false,
         });
 
-        let mut cmd = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("test_dct_roundtrip"),
-        });
+        let mut cmd = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("test_dct_roundtrip"),
+            });
 
         // Forward DCT + quantize
-        fused.dispatch(&ctx, &mut cmd, &input_buf, &quant_buf, &recon_buf, w, h, 2.0, 0.0, 7.0);
+        fused.dispatch(
+            &ctx, &mut cmd, &input_buf, &quant_buf, &recon_buf, w, h, 2.0, 0.0, 7.0,
+        );
 
         // Dequantize (mimicking decoder path)
         let uniform_weights = [1.0f32; 16];
         quant.dispatch_adaptive(
-            &ctx, &mut cmd, &quant_buf, &dequant_buf,
-            sz as u32, 2.0, 0.0, false, // dequantize
-            w, h, 256, 0, &uniform_weights, None, 3.0,
+            &ctx,
+            &mut cmd,
+            &quant_buf,
+            &dequant_buf,
+            sz as u32,
+            2.0,
+            0.0,
+            false, // dequantize
+            w,
+            h,
+            256,
+            0,
+            &uniform_weights,
+            None,
+            3.0,
         );
 
         // Inverse DCT
-        bt.dispatch(&ctx, &mut cmd, &dequant_buf, &idct_buf, w, h, false, BlockTransformType::DCT8);
+        bt.dispatch(
+            &ctx,
+            &mut cmd,
+            &dequant_buf,
+            &idct_buf,
+            w,
+            h,
+            false,
+            BlockTransformType::DCT8,
+        );
 
         ctx.queue.submit(Some(cmd.finish()));
 
@@ -824,7 +890,9 @@ fn test_block_dct_noisy_content() {
             let expected_dq = q * 2.0; // step_size=2.0
             if (dq - expected_dq).abs() > 0.01 {
                 dq_match = false;
-                eprintln!("  dequant mismatch at {i}: quant={q}, dequant={dq}, expected={expected_dq}");
+                eprintln!(
+                    "  dequant mismatch at {i}: quant={q}, dequant={dq}, expected={expected_dq}"
+                );
             }
         }
         if dq_match {
@@ -887,7 +955,12 @@ fn test_block_dct_noisy_content() {
         // CPU-decode the Rice tiles from the compressed frame and compare to the direct quant data
         if let EntropyData::Rice(ref tiles) = compressed99.entropy {
             let tiles_per_plane = (tiles_x as usize) * (tiles_y as usize);
-            eprintln!("Rice tiles: {} total, {} per plane, num_levels={}", tiles.len(), tiles_per_plane, tiles[0].num_levels);
+            eprintln!(
+                "Rice tiles: {} total, {} per plane, num_levels={}",
+                tiles.len(),
+                tiles_per_plane,
+                tiles[0].num_levels
+            );
 
             // Decode plane 0 (Y) from the compressed frame's Rice tiles
             let mut cpu_decoded_plane = vec![0.0f32; sz];
@@ -957,13 +1030,20 @@ fn test_block_dct_noisy_content() {
     let compressed_flat = enc.encode(&ctx, &flat_rgb, w, h, &config99);
     let decoded_flat = dec.decode(&ctx, &compressed_flat);
     let psnr_flat = compute_psnr(&flat_rgb, &decoded_flat);
-    eprintln!("DCT flat q=99: psnr={psnr_flat:.2} dB, bpp={:.3}", compressed_flat.bpp());
+    eprintln!(
+        "DCT flat q=99: psnr={psnr_flat:.2} dB, bpp={:.3}",
+        compressed_flat.bpp()
+    );
 
     // Test with checker pattern (sharp edges = high frequency)
     let mut checker_rgb = vec![0.0f32; (w * h * 3) as usize];
     for y in 0..h {
         for x in 0..w {
-            let val = if (x / 4 + y / 4) % 2 == 0 { 200.0 } else { 50.0 };
+            let val = if (x / 4 + y / 4) % 2 == 0 {
+                200.0
+            } else {
+                50.0
+            };
             let idx = ((y * w + x) * 3) as usize;
             checker_rgb[idx] = val;
             checker_rgb[idx + 1] = val;
@@ -973,13 +1053,18 @@ fn test_block_dct_noisy_content() {
     let compressed_checker = enc.encode(&ctx, &checker_rgb, w, h, &config99);
     let decoded_checker = dec.decode(&ctx, &compressed_checker);
     let psnr_checker = compute_psnr(&checker_rgb, &decoded_checker);
-    eprintln!("DCT checker q=99: psnr={psnr_checker:.2} dB, bpp={:.3}", compressed_checker.bpp());
+    eprintln!(
+        "DCT checker q=99: psnr={psnr_checker:.2} dB, bpp={:.3}",
+        compressed_checker.bpp()
+    );
 
     // Test with grayscale noisy data (R=G=B) — trivial color conversion
     let mut gray_rgb = vec![0.0f32; (w * h * 3) as usize];
     let mut seed2 = 42u64;
     for i in 0..(w * h) as usize {
-        seed2 = seed2.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        seed2 = seed2
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let val = ((seed2 >> 33) % 256) as f32;
         gray_rgb[i * 3] = val;
         gray_rgb[i * 3 + 1] = val;
@@ -988,9 +1073,15 @@ fn test_block_dct_noisy_content() {
     let compressed_gray = enc.encode(&ctx, &gray_rgb, w, h, &config99);
     let decoded_gray = dec.decode(&ctx, &compressed_gray);
     let psnr_gray = compute_psnr(&gray_rgb, &decoded_gray);
-    eprintln!("DCT gray-noisy q=99: psnr={psnr_gray:.2} dB, bpp={:.3}", compressed_gray.bpp());
+    eprintln!(
+        "DCT gray-noisy q=99: psnr={psnr_gray:.2} dB, bpp={:.3}",
+        compressed_gray.bpp()
+    );
 
-    assert!(psnr_flat > 50.0, "Block DCT flat should be nearly lossless: {psnr_flat:.2}");
+    assert!(
+        psnr_flat > 50.0,
+        "Block DCT flat should be nearly lossless: {psnr_flat:.2}"
+    );
     assert!(psnr > 20.0, "Block DCT noisy q=75 PSNR too low: {psnr:.2}");
 }
 
@@ -1009,7 +1100,9 @@ fn test_block_dct_color_debug() {
     let mut seed = 42u64;
     for i in 0..npix {
         for c in 0..3 {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             rgb[i * 3 + c] = ((seed >> 33) % 256) as f32;
         }
     }
@@ -1025,10 +1118,14 @@ fn test_block_dct_color_debug() {
     let dec_dct = dec.decode(&ctx, &comp_dct);
 
     // Immediately read back encoder buffers BEFORE any other encode
-    let enc_mc_out = crate::gpu_util::read_buffer_f32(&ctx, &enc.cached.as_ref().unwrap().mc_out, npix);
-    let enc_plane_a = crate::gpu_util::read_buffer_f32(&ctx, &enc.cached.as_ref().unwrap().plane_a, npix);
-    let enc_ref_upload = crate::gpu_util::read_buffer_f32(&ctx, &enc.cached.as_ref().unwrap().ref_upload, npix);
-    let enc_plane_b = crate::gpu_util::read_buffer_f32(&ctx, &enc.cached.as_ref().unwrap().plane_b, npix);
+    let enc_mc_out =
+        crate::gpu_util::read_buffer_f32(&ctx, &enc.cached.as_ref().unwrap().mc_out, npix);
+    let enc_plane_a =
+        crate::gpu_util::read_buffer_f32(&ctx, &enc.cached.as_ref().unwrap().plane_a, npix);
+    let enc_ref_upload =
+        crate::gpu_util::read_buffer_f32(&ctx, &enc.cached.as_ref().unwrap().ref_upload, npix);
+    let enc_plane_b =
+        crate::gpu_util::read_buffer_f32(&ctx, &enc.cached.as_ref().unwrap().plane_b, npix);
 
     // Per-channel PSNR for DCT
     let mut r_orig = vec![0.0f32; npix];
@@ -1054,8 +1151,12 @@ fn test_block_dct_color_debug() {
     // Print first 8 pixel errors
     eprintln!("First 8 pixels (orig → decoded → error):");
     for i in 0..8 {
-        let ro = rgb[i*3]; let go = rgb[i*3+1]; let bo = rgb[i*3+2];
-        let rd = dec_dct[i*3]; let gd = dec_dct[i*3+1]; let bd = dec_dct[i*3+2];
+        let ro = rgb[i * 3];
+        let go = rgb[i * 3 + 1];
+        let bo = rgb[i * 3 + 2];
+        let rd = dec_dct[i * 3];
+        let gd = dec_dct[i * 3 + 1];
+        let bd = dec_dct[i * 3 + 2];
         eprintln!("  px{i}: R({ro:.0}→{rd:.1} Δ{:.1}) G({go:.0}→{gd:.1} Δ{:.1}) B({bo:.0}→{bd:.1} Δ{:.1})",
             rd-ro, gd-go, bd-bo);
     }
@@ -1067,22 +1168,29 @@ fn test_block_dct_color_debug() {
     for i in 0..npix {
         let mut px_mse = 0.0f32;
         for c in 0..3 {
-            let err = (dec_dct[i*3+c] - rgb[i*3+c]).abs();
-            if err > max_err { max_err = err; }
+            let err = (dec_dct[i * 3 + c] - rgb[i * 3 + c]).abs();
+            if err > max_err {
+                max_err = err;
+            }
             sum_abs_err += err as f64;
             px_mse += err * err;
         }
-        if px_mse > 50.0 { // significant per-pixel error
+        if px_mse > 50.0 {
+            // significant per-pixel error
             worst_pixels.push((i, px_mse));
         }
     }
     worst_pixels.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
     let avg_err = sum_abs_err / (npix * 3) as f64;
-    eprintln!("DCT error: max={max_err:.2}, avg={avg_err:.2}, large_error_pixels={}", worst_pixels.len());
+    eprintln!(
+        "DCT error: max={max_err:.2}, avg={avg_err:.2}, large_error_pixels={}",
+        worst_pixels.len()
+    );
     for &(idx, mse) in worst_pixels.iter().take(10) {
         let px = idx % w as usize;
         let py = idx / w as usize;
-        let bx = px / 8; let by = py / 8;
+        let bx = px / 8;
+        let by = py / 8;
         eprintln!("  worst px({px},{py}) block({bx},{by}): mse={mse:.1} orig=[{:.0},{:.0},{:.0}] dec=[{:.1},{:.1},{:.1}]",
             rgb[idx*3], rgb[idx*3+1], rgb[idx*3+2],
             dec_dct[idx*3], dec_dct[idx*3+1], dec_dct[idx*3+2]);
@@ -1108,7 +1216,9 @@ fn test_block_dct_color_debug() {
     let mut rgb_ronly = vec![128.0f32; npix * 3];
     seed = 42;
     for i in 0..npix {
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         rgb_ronly[i * 3] = ((seed >> 33) % 256) as f32;
     }
     config.transform_type = TransformType::BlockDCT8;
@@ -1121,7 +1231,9 @@ fn test_block_dct_color_debug() {
     let mut rgb_gonly = vec![128.0f32; npix * 3];
     seed = 42;
     for i in 0..npix {
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         rgb_gonly[i * 3 + 1] = ((seed >> 33) % 256) as f32;
     }
     let comp_gonly = enc.encode(&ctx, &rgb_gonly, w, h, &config);
@@ -1133,7 +1245,9 @@ fn test_block_dct_color_debug() {
     let mut rgb_bonly = vec![128.0f32; npix * 3];
     seed = 42;
     for i in 0..npix {
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         rgb_bonly[i * 3 + 2] = ((seed >> 33) % 256) as f32;
     }
     let comp_bonly = enc.encode(&ctx, &rgb_bonly, w, h, &config);
@@ -1155,11 +1269,13 @@ fn test_block_dct_color_debug() {
     let mut rgb_neg = vec![128.0f32; npix * 3];
     seed = 42;
     for i in 0..npix {
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        let noise = ((seed >> 33) % 128) as f32;  // [0, 127]
-        rgb_neg[i * 3] = 128.0 + noise;      // R = [128, 255]
-        rgb_neg[i * 3 + 2] = 128.0 - noise;  // B = [1, 128]
-        // G stays 128
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let noise = ((seed >> 33) % 128) as f32; // [0, 127]
+        rgb_neg[i * 3] = 128.0 + noise; // R = [128, 255]
+        rgb_neg[i * 3 + 2] = 128.0 - noise; // B = [1, 128]
+                                            // G stays 128
     }
     let comp_neg = enc.encode(&ctx, &rgb_neg, w, h, &config);
     let dec_neg = dec.decode(&ctx, &comp_neg);
@@ -1172,7 +1288,9 @@ fn test_block_dct_color_debug() {
         let mut max_stream_len = 0u32;
         for (i, tile) in tiles.iter().enumerate() {
             for (s, &len) in tile.stream_lengths.iter().enumerate() {
-                if len > max_stream_len { max_stream_len = len; }
+                if len > max_stream_len {
+                    max_stream_len = len;
+                }
                 if len >= 512 {
                     overflow_count += 1;
                     if overflow_count <= 5 {
@@ -1202,30 +1320,56 @@ fn test_block_dct_color_debug() {
         let color = ColorConverter::new(&ctx);
         let deinterleaver = PlaneDeinterleaver::new(&ctx);
 
-        let usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST;
-        let rgb_buf = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("test_rgb"),
-            contents: bytemuck::cast_slice(&rgb),
-            usage,
-        });
+        let usage = wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_SRC
+            | wgpu::BufferUsages::COPY_DST;
+        let rgb_buf = ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("test_rgb"),
+                contents: bytemuck::cast_slice(&rgb),
+                usage,
+            });
         let ycocg_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("test_ycocg"), size: (npix * 3 * 4) as u64, usage, mapped_at_creation: false,
+            label: Some("test_ycocg"),
+            size: (npix * 3 * 4) as u64,
+            usage,
+            mapped_at_creation: false,
         });
         let p0_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("p0"), size: (npix * 4) as u64, usage, mapped_at_creation: false,
+            label: Some("p0"),
+            size: (npix * 4) as u64,
+            usage,
+            mapped_at_creation: false,
         });
         let p1_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("p1"), size: (npix * 4) as u64, usage, mapped_at_creation: false,
+            label: Some("p1"),
+            size: (npix * 4) as u64,
+            usage,
+            mapped_at_creation: false,
         });
         let p2_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("p2"), size: (npix * 4) as u64, usage, mapped_at_creation: false,
+            label: Some("p2"),
+            size: (npix * 4) as u64,
+            usage,
+            mapped_at_creation: false,
         });
 
-        let mut cmd = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("test_color"),
-        });
+        let mut cmd = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("test_color"),
+            });
         color.dispatch(&ctx, &mut cmd, &rgb_buf, &ycocg_buf, w, h, true, false);
-        deinterleaver.dispatch(&ctx, &mut cmd, &ycocg_buf, &p0_buf, &p1_buf, &p2_buf, npix as u32);
+        deinterleaver.dispatch(
+            &ctx,
+            &mut cmd,
+            &ycocg_buf,
+            &p0_buf,
+            &p1_buf,
+            &p2_buf,
+            npix as u32,
+        );
         ctx.queue.submit(Some(cmd.finish()));
 
         let gpu_y = crate::gpu_util::read_buffer_f32(&ctx, &p0_buf, npix);
@@ -1237,7 +1381,9 @@ fn test_block_dct_color_debug() {
         let mut cpu_co = vec![0.0f32; npix];
         let mut cpu_cg = vec![0.0f32; npix];
         for i in 0..npix {
-            let r = rgb[i * 3]; let g = rgb[i * 3 + 1]; let b = rgb[i * 3 + 2];
+            let r = rgb[i * 3];
+            let g = rgb[i * 3 + 1];
+            let b = rgb[i * 3 + 2];
             let co = r - b;
             let t = b + co * 0.5;
             let cg = g - t;
@@ -1262,8 +1408,8 @@ fn test_block_dct_color_debug() {
     // ---- Critical test: manual YCoCg + per-plane DCT roundtrip + inverse YCoCg ----
     // This bypasses the encoder/decoder pipeline entirely
     {
-        use crate::encoder::fused_block::FusedBlock;
         use crate::encoder::block_transform::{BlockTransform, BlockTransformType};
+        use crate::encoder::fused_block::FusedBlock;
         use crate::encoder::quantize::Quantizer;
 
         let fused = FusedBlock::new(&ctx);
@@ -1290,38 +1436,82 @@ fn test_block_dct_color_debug() {
             cg_plane[i] = cg;
         }
 
-        let usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST;
+        let usage = wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_SRC
+            | wgpu::BufferUsages::COPY_DST;
         let plane_bytes = (sz * 4) as u64;
 
         // Per-plane DCT roundtrip for all 3 planes
         let mut decoded_planes: Vec<Vec<f32>> = Vec::new();
         for (name, plane_data) in [("Y", &y_plane), ("Co", &co_plane), ("Cg", &cg_plane)] {
-            let input_buf = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("test_input"),
-                contents: bytemuck::cast_slice(plane_data),
-                usage,
-            });
+            let input_buf = ctx
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("test_input"),
+                    contents: bytemuck::cast_slice(plane_data),
+                    usage,
+                });
             let quant_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("test_quant"), size: plane_bytes, usage, mapped_at_creation: false,
+                label: Some("test_quant"),
+                size: plane_bytes,
+                usage,
+                mapped_at_creation: false,
             });
             let recon_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("test_recon"), size: plane_bytes, usage, mapped_at_creation: false,
+                label: Some("test_recon"),
+                size: plane_bytes,
+                usage,
+                mapped_at_creation: false,
             });
             let dequant_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("test_dequant"), size: plane_bytes, usage, mapped_at_creation: false,
+                label: Some("test_dequant"),
+                size: plane_bytes,
+                usage,
+                mapped_at_creation: false,
             });
             let idct_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("test_idct"), size: plane_bytes, usage, mapped_at_creation: false,
+                label: Some("test_idct"),
+                size: plane_bytes,
+                usage,
+                mapped_at_creation: false,
             });
 
-            let mut cmd = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("manual_roundtrip"),
-            });
-            fused.dispatch(&ctx, &mut cmd, &input_buf, &quant_buf, &recon_buf, w, h, step, 0.0, 7.0);
+            let mut cmd = ctx
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("manual_roundtrip"),
+                });
+            fused.dispatch(
+                &ctx, &mut cmd, &input_buf, &quant_buf, &recon_buf, w, h, step, 0.0, 7.0,
+            );
             let uniform_weights = [1.0f32; 16];
-            quant.dispatch_adaptive(&ctx, &mut cmd, &quant_buf, &dequant_buf,
-                sz as u32, step, 0.0, false, w, h, 256, 0, &uniform_weights, None, 7.0);
-            bt.dispatch(&ctx, &mut cmd, &dequant_buf, &idct_buf, w, h, false, BlockTransformType::DCT8);
+            quant.dispatch_adaptive(
+                &ctx,
+                &mut cmd,
+                &quant_buf,
+                &dequant_buf,
+                sz as u32,
+                step,
+                0.0,
+                false,
+                w,
+                h,
+                256,
+                0,
+                &uniform_weights,
+                None,
+                7.0,
+            );
+            bt.dispatch(
+                &ctx,
+                &mut cmd,
+                &dequant_buf,
+                &idct_buf,
+                w,
+                h,
+                false,
+                BlockTransformType::DCT8,
+            );
             ctx.queue.submit(Some(cmd.finish()));
 
             let result = crate::gpu_util::read_buffer_f32(&ctx, &idct_buf, sz);
@@ -1360,7 +1550,9 @@ fn test_block_dct_color_debug() {
             let mut cpu_co = vec![0.0f32; sz];
             let mut cpu_cg = vec![0.0f32; sz];
             for i in 0..sz {
-                let r = rgb[i*3]; let g = rgb[i*3+1]; let b = rgb[i*3+2];
+                let r = rgb[i * 3];
+                let g = rgb[i * 3 + 1];
+                let b = rgb[i * 3 + 2];
                 let co = r - b;
                 let t = b + co * 0.5;
                 let cg = g - t;
@@ -1372,33 +1564,53 @@ fn test_block_dct_color_debug() {
             eprintln!("Early plane_a vs CPU Y: {pa_psnr:.2} dB");
             if pa_psnr < 90.0 {
                 for i in 0..4 {
-                    eprintln!("  plane_a[{i}]={:.4} cpu_y={:.4} diff={:.4}",
-                        enc_plane_a[i], cpu_y[i], enc_plane_a[i]-cpu_y[i]);
+                    eprintln!(
+                        "  plane_a[{i}]={:.4} cpu_y={:.4} diff={:.4}",
+                        enc_plane_a[i],
+                        cpu_y[i],
+                        enc_plane_a[i] - cpu_y[i]
+                    );
                 }
             }
 
             // Do fresh DCT on the early plane_a data and compare with early mc_out
             let fused = crate::encoder::fused_block::FusedBlock::new(&ctx);
-            let usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST;
-            let chk_in = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("chk_in"), contents: bytemuck::cast_slice(&enc_plane_a), usage,
-            });
+            let usage = wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST;
+            let chk_in = ctx
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("chk_in"),
+                    contents: bytemuck::cast_slice(&enc_plane_a),
+                    usage,
+                });
             let chk_out = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("chk_out"), size: (sz*4) as u64, usage, mapped_at_creation: false,
+                label: Some("chk_out"),
+                size: (sz * 4) as u64,
+                usage,
+                mapped_at_creation: false,
             });
             let chk_recon = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("chk_recon"), size: (sz*4) as u64, usage, mapped_at_creation: false,
+                label: Some("chk_recon"),
+                size: (sz * 4) as u64,
+                usage,
+                mapped_at_creation: false,
             });
-            let mut cmd = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("chk"),
-            });
-            fused.dispatch(&ctx, &mut cmd, &chk_in, &chk_out, &chk_recon, w, h, 2.0, 0.0, 7.0);
+            let mut cmd = ctx
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("chk") });
+            fused.dispatch(
+                &ctx, &mut cmd, &chk_in, &chk_out, &chk_recon, w, h, 2.0, 0.0, 7.0,
+            );
             ctx.queue.submit(Some(cmd.finish()));
             let chk_quant = crate::gpu_util::read_buffer_f32(&ctx, &chk_out, sz);
 
             let mut mc_mismatch = 0;
             for i in 0..sz {
-                if (enc_mc_out[i] - chk_quant[i]).abs() > 0.5 { mc_mismatch += 1; }
+                if (enc_mc_out[i] - chk_quant[i]).abs() > 0.5 {
+                    mc_mismatch += 1;
+                }
             }
             eprintln!("Early mc_out vs fresh DCT on early plane_a: {mc_mismatch} mismatches");
         }
@@ -1415,21 +1627,31 @@ fn test_block_dct_color_debug() {
             // Also get the manual quantized data for each plane
             let mut manual_quant: Vec<Vec<f32>> = Vec::new();
             for plane_data in [&y_plane, &co_plane, &cg_plane] {
-                let input_buf = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("mq_input"),
-                    contents: bytemuck::cast_slice(plane_data),
-                    usage,
-                });
+                let input_buf = ctx
+                    .device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("mq_input"),
+                        contents: bytemuck::cast_slice(plane_data),
+                        usage,
+                    });
                 let quant_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("mq_quant"), size: plane_bytes, usage, mapped_at_creation: false,
+                    label: Some("mq_quant"),
+                    size: plane_bytes,
+                    usage,
+                    mapped_at_creation: false,
                 });
                 let recon_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("mq_recon"), size: plane_bytes, usage, mapped_at_creation: false,
+                    label: Some("mq_recon"),
+                    size: plane_bytes,
+                    usage,
+                    mapped_at_creation: false,
                 });
-                let mut cmd = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("mq"),
-                });
-                fused.dispatch(&ctx, &mut cmd, &input_buf, &quant_buf, &recon_buf, w, h, step, 0.0, 7.0);
+                let mut cmd = ctx
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("mq") });
+                fused.dispatch(
+                    &ctx, &mut cmd, &input_buf, &quant_buf, &recon_buf, w, h, step, 0.0, 7.0,
+                );
                 ctx.queue.submit(Some(cmd.finish()));
                 manual_quant.push(crate::gpu_util::read_buffer_f32(&ctx, &quant_buf, sz));
             }
@@ -1463,7 +1685,9 @@ fn test_block_dct_color_debug() {
                     let diff = (rice_decoded[i] - manual_quant[p][i]).abs();
                     if diff > 0.5 {
                         mismatch_count += 1;
-                        if diff > max_diff { max_diff = diff; }
+                        if diff > max_diff {
+                            max_diff = diff;
+                        }
                         if mismatch_count <= 3 {
                             let px_coord = i % w as usize;
                             let py_coord = i / w as usize;
@@ -1477,7 +1701,10 @@ fn test_block_dct_color_debug() {
         }
     }
 
-    assert!(psnr_all > 35.0, "DCT color q=99 should be >35 dB, got {psnr_all:.2}");
+    assert!(
+        psnr_all > 35.0,
+        "DCT color q=99 should be >35 dB, got {psnr_all:.2}"
+    );
 }
 
 /// Generate a textured frame with non-repeating, high-detail spatial patterns
@@ -1543,8 +1770,17 @@ fn test_motion_comp_effectiveness() {
     let p1_size = compressed[1].byte_size();
 
     eprintln!("\n=== Motion Compensation Effectiveness ===");
-    eprintln!("  Frame 0 [I]: {} bytes, {:.3} bpp", i_size, compressed[0].bpp());
-    eprintln!("  Frame 1 [P]: {} bytes, {:.3} bpp (shift={}px)", p1_size, compressed[1].bpp(), shift_px);
+    eprintln!(
+        "  Frame 0 [I]: {} bytes, {:.3} bpp",
+        i_size,
+        compressed[0].bpp()
+    );
+    eprintln!(
+        "  Frame 1 [P]: {} bytes, {:.3} bpp (shift={}px)",
+        p1_size,
+        compressed[1].bpp(),
+        shift_px
+    );
     eprintln!("  P1/I ratio: {:.2}x", p1_size as f64 / i_size as f64);
 
     // Decode and verify quality — all frames should decode cleanly
@@ -1590,8 +1826,16 @@ fn test_motion_comp_identical_frames_small_pframe() {
     let p1_size = compressed[1].byte_size();
 
     eprintln!("\n=== Identical Frames P-frame Size ===");
-    eprintln!("  Frame 0 [I]: {} bytes, {:.3} bpp", i_size, compressed[0].bpp());
-    eprintln!("  Frame 1 [P]: {} bytes, {:.3} bpp", p1_size, compressed[1].bpp());
+    eprintln!(
+        "  Frame 0 [I]: {} bytes, {:.3} bpp",
+        i_size,
+        compressed[0].bpp()
+    );
+    eprintln!(
+        "  Frame 1 [P]: {} bytes, {:.3} bpp",
+        p1_size,
+        compressed[1].bpp()
+    );
     eprintln!("  P1/I ratio: {:.3}", p1_size as f64 / i_size as f64);
 
     // Identical frames P-frame should be notably smaller than I-frame.
@@ -1606,9 +1850,18 @@ fn test_motion_comp_identical_frames_small_pframe() {
 
     // MVs should be near-zero for identical content
     let mf = compressed[1].motion_field.as_ref().unwrap();
-    let max_mv: i16 = mf.vectors.iter().flat_map(|v| v.iter()).map(|v| v.abs()).max().unwrap_or(0);
+    let max_mv: i16 = mf
+        .vectors
+        .iter()
+        .flat_map(|v| v.iter())
+        .map(|v| v.abs())
+        .max()
+        .unwrap_or(0);
     eprintln!("  Max MV magnitude: {} half-pels", max_mv);
-    assert!(max_mv <= 4, "Identical frames should have near-zero MVs, got max={max_mv}");
+    assert!(
+        max_mv <= 4,
+        "Identical frames should have near-zero MVs, got max={max_mv}"
+    );
 }
 
 /// Test that P-frames decode correctly across multiple quality levels.
@@ -1639,9 +1892,7 @@ fn test_motion_comp_quality_scaling() {
         let decoded = dec.decode_sequence(&ctx, &compressed);
         let psnr = compute_psnr(&f1, &decoded[1]);
 
-        eprintln!(
-            "  q={q}: I={i_size} bytes, P={p_size} bytes, P/I={ratio:.3}, PSNR={psnr:.1} dB"
-        );
+        eprintln!("  q={q}: I={i_size} bytes, P={p_size} bytes, P/I={ratio:.3}, PSNR={psnr:.1} dB");
 
         // P-frame should decode with reasonable quality
         assert!(psnr > 20.0, "q={q}: P-frame PSNR too low ({psnr:.1} dB)");
@@ -1676,35 +1927,71 @@ fn test_intra_prediction_gpu_roundtrip() {
     let plane_size = (npix * 4) as u64;
     let num_blocks = (w / 8) * (h / 8);
     let modes_size = (num_blocks as u64) * 4;
-    let usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST;
+    let usage =
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST;
 
     let input_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("test_input"), size: plane_size, usage, mapped_at_creation: false,
+        label: Some("test_input"),
+        size: plane_size,
+        usage,
+        mapped_at_creation: false,
     });
     let residual_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("test_residual"), size: plane_size, usage, mapped_at_creation: false,
+        label: Some("test_residual"),
+        size: plane_size,
+        usage,
+        mapped_at_creation: false,
     });
     let modes_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("test_modes"), size: modes_size, usage, mapped_at_creation: false,
+        label: Some("test_modes"),
+        size: modes_size,
+        usage,
+        mapped_at_creation: false,
     });
     let output_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("test_output"), size: plane_size, usage, mapped_at_creation: false,
+        label: Some("test_output"),
+        size: plane_size,
+        usage,
+        mapped_at_creation: false,
     });
 
-    ctx.queue.write_buffer(&input_buf, 0, bytemuck::cast_slice(&plane));
+    ctx.queue
+        .write_buffer(&input_buf, 0, bytemuck::cast_slice(&plane));
 
     // Forward: input → residual + modes
-    let mut cmd = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("test_intra_fwd"),
-    });
-    intra.forward(&ctx, &mut cmd, &input_buf, &residual_buf, &modes_buf, w, h, tile_size);
+    let mut cmd = ctx
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("test_intra_fwd"),
+        });
+    intra.forward(
+        &ctx,
+        &mut cmd,
+        &input_buf,
+        &residual_buf,
+        &modes_buf,
+        w,
+        h,
+        tile_size,
+    );
     ctx.queue.submit(Some(cmd.finish()));
 
     // Inverse: residual + modes → output
-    let mut cmd = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("test_intra_inv"),
-    });
-    intra.inverse(&ctx, &mut cmd, &residual_buf, &output_buf, &modes_buf, w, h, tile_size);
+    let mut cmd = ctx
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("test_intra_inv"),
+        });
+    intra.inverse(
+        &ctx,
+        &mut cmd,
+        &residual_buf,
+        &output_buf,
+        &modes_buf,
+        w,
+        h,
+        tile_size,
+    );
     ctx.queue.submit(Some(cmd.finish()));
 
     // Readback output
@@ -1719,7 +2006,10 @@ fn test_intra_prediction_gpu_roundtrip() {
     eprintln!("  First 5 output: {:?}", &output[..5]);
 
     // Should be bit-exact (no loss in the prediction step)
-    assert!(psnr > 90.0, "Direct intra roundtrip should be near-lossless: {psnr:.2}");
+    assert!(
+        psnr > 90.0,
+        "Direct intra roundtrip should be near-lossless: {psnr:.2}"
+    );
 }
 
 #[test]
@@ -1749,7 +2039,8 @@ fn test_intra_prediction_roundtrip() {
 
     eprintln!(
         "q=75: base PSNR={psnr_base:.2} dB ({:.3} bpp), intra PSNR={psnr_intra:.2} dB ({:.3} bpp)",
-        comp_base.bpp(), comp_intra.bpp()
+        comp_base.bpp(),
+        comp_intra.bpp()
     );
 
     // Verify intra modes were stored
@@ -1787,7 +2078,10 @@ fn test_intra_prediction_serialize_roundtrip() {
     let deser = crate::format::deserialize_compressed(&bytes);
 
     // Verify intra modes survived the roundtrip
-    assert!(deser.intra_modes.is_some(), "Intra modes should survive serialization");
+    assert!(
+        deser.intra_modes.is_some(),
+        "Intra modes should survive serialization"
+    );
     assert_eq!(
         compressed.intra_modes.as_ref().unwrap(),
         deser.intra_modes.as_ref().unwrap(),
@@ -1817,7 +2111,10 @@ fn test_intra_prediction_flat_image() {
     let comp = enc.encode(&ctx, &rgb, w, h, &config);
     let decoded = dec.decode(&ctx, &comp);
     let psnr = compute_psnr(&rgb, &decoded);
-    eprintln!("Flat image intra: PSNR={psnr:.2} dB, modes present: {}", comp.intra_modes.is_some());
+    eprintln!(
+        "Flat image intra: PSNR={psnr:.2} dB, modes present: {}",
+        comp.intra_modes.is_some()
+    );
 
     // Flat image should decode nearly perfectly even with intra prediction
     assert!(psnr > 50.0, "Flat image intra PSNR too low: {psnr:.2}");
@@ -1854,8 +2151,14 @@ fn test_intra_prediction_modes_sanity() {
         assert!(m < 4, "Invalid mode: {m}");
         mode_counts[m as usize] += 1;
     }
-    eprintln!("Modes: DC={}, H={}, V={}, D={}", mode_counts[0], mode_counts[1], mode_counts[2], mode_counts[3]);
-    eprintln!("Total blocks: {num_blocks}, first 16 modes: {:?}", &modes[..16.min(modes.len())]);
+    eprintln!(
+        "Modes: DC={}, H={}, V={}, D={}",
+        mode_counts[0], mode_counts[1], mode_counts[2], mode_counts[3]
+    );
+    eprintln!(
+        "Total blocks: {num_blocks}, first 16 modes: {:?}",
+        &modes[..16.min(modes.len())]
+    );
 }
 
 #[test]
@@ -1874,4 +2177,543 @@ fn test_intra_pack_unpack_modes() {
     assert_eq!(packed4.len(), 1);
     let unpacked4 = IntraPredictor::unpack_modes(&packed4, 4);
     assert_eq!(modes4, unpacked4);
+}
+
+/// Diagnostic test: encode I+P pair, then decode P-frame step by step with
+/// GPU readbacks at 6 checkpoints to find where encoder/decoder diverge.
+///
+/// Checkpoints:
+/// 1. MC prediction (derived: reconstructed - residual)
+/// 2. DWT of residual (≈ dequantized wavelet, encoder-only)
+/// 3. Quantized coefficients (entropy decoded vs encoder's quantized Y)
+/// 4. Dequantized wavelet coefficients
+/// 5. Spatial residual after IDWT
+/// 6. Reconstructed pixels after MC inverse
+///
+/// Run: cargo test --release test_pframe_divergence_checkpoints -- --nocapture
+#[test]
+fn test_pframe_divergence_checkpoints() {
+    use crate::decoder::checkpoint::{compute_diff, PFrameCheckpoints};
+    use crate::decoder::pipeline::DecoderPipeline;
+    use crate::image_util::load_image_rgb_f32;
+
+    let ctx = GpuContext::new();
+
+    // Load real BBB frames 816-817 if available, else use synthetic
+    let seq_dir = "test_material/frames/sequences/bbb_2min";
+    let (f0, f1, w, h) = if std::path::Path::new(&format!("{seq_dir}/frame_0816.png")).exists() {
+        let (d0, w0, h0) = load_image_rgb_f32(&format!("{seq_dir}/frame_0816.png"));
+        let (d1, w1, h1) = load_image_rgb_f32(&format!("{seq_dir}/frame_0817.png"));
+        assert_eq!((w0, h0), (w1, h1));
+        eprintln!("Using BBB frames 816-817 ({}x{})", w0, h0);
+        (d0, d1, w0, h0)
+    } else {
+        eprintln!("BBB 2min not found, using synthetic 256x256 frames");
+        let w = 256u32;
+        let h = 256u32;
+        let f0 = make_gradient_frame(w, h, 0.0);
+        // Slight horizontal shift for motion
+        let f1 = make_gradient_frame(w, h, 3.0);
+        (f0, f1, w, h)
+    };
+
+    let padded_w = (w + 255) & !255;
+    let padded_h = (h + 255) & !255;
+    let padded_pixels = (padded_w * padded_h) as usize;
+
+    // === Encode I+P+P ===
+    // Must encode 3+ frames so the first P-frame (frame 1) has needs_decode=true.
+    // With only 2 frames, the encoder skips local decode for the last P-frame
+    // (an optimization since the reference won't be used again), which means
+    // gpu_ref_planes would still contain the I-frame reference.
+    let mut enc = EncoderPipeline::new(&ctx);
+    let mut config = CodecConfig::default();
+    config.tile_size = 256;
+    config.keyframe_interval = 30; // P-frame for frame 1+
+    config.gpu_entropy_encode = true;
+
+    // Use f1 as both frame 1 and frame 2 (content doesn't matter for frame 2)
+    let frames: Vec<&[f32]> = vec![&f0, &f1, &f1];
+    let compressed = enc.encode_sequence(&ctx, &frames, w, h, &config);
+    assert_eq!(compressed.len(), 3);
+    assert_eq!(compressed[0].frame_type, FrameType::Intra);
+    assert_eq!(compressed[1].frame_type, FrameType::Predicted);
+    assert_eq!(compressed[2].frame_type, FrameType::Predicted);
+    eprintln!(
+        "Encoded: I={} bytes, P1={} bytes (ratio={:.3}), P2={} bytes",
+        compressed[0].byte_size(),
+        compressed[1].byte_size(),
+        compressed[1].byte_size() as f64 / compressed[0].byte_size() as f64,
+        compressed[2].byte_size(),
+    );
+
+    // === Read back encoder's reference Y ===
+    // After encoding 3 frames: gpu_ref_planes[0] contains frame 1's (first P-frame)
+    // local-decoded Y because frame 2's local decode was skipped (last frame optimization).
+    let enc_ref = enc
+        .read_reference_planes(&ctx, w, h)
+        .expect("encoder should have reference planes");
+    let enc_ref_y = &enc_ref[..padded_pixels]; // Y plane only
+
+    // === Decode I-frame normally ===
+    let dec = DecoderPipeline::new(&ctx);
+    let _iframe_rgb = dec.decode(&ctx, &compressed[0]);
+
+    // Verify I-frame references match
+    let dec_ref_after_iframe = dec
+        .read_reference_planes(&ctx, w, h)
+        .expect("decoder should have reference planes");
+    let dec_ref_y_iframe = &dec_ref_after_iframe[..padded_pixels];
+    // Encoder's ref after I-frame was overwritten by P-frame, so read from a fresh encode
+    // Instead, check encoder ref after I-frame by re-encoding just frame 0
+    {
+        let mut enc2 = EncoderPipeline::new(&ctx);
+        let mut config_i = config.clone();
+        config_i.keyframe_interval = 1;
+        let _ = enc2.encode_sequence(&ctx, &[&f0], w, h, &config_i);
+        let enc_ref_iframe = enc2
+            .read_reference_planes(&ctx, w, h)
+            .expect("enc2 ref");
+        let enc_ref_y_iframe = &enc_ref_iframe[..padded_pixels];
+        let iframe_diff = compute_diff(enc_ref_y_iframe, dec_ref_y_iframe, padded_pixels);
+        eprintln!(
+            "\n=== I-frame reference check ===\n  max={:.4} mean={:.6} nonzero={}/{}",
+            iframe_diff.max_diff,
+            iframe_diff.mean_diff,
+            iframe_diff.nonzero_count,
+            iframe_diff.total_count,
+        );
+        assert!(
+            iframe_diff.max_diff < 0.01,
+            "I-frame references must match (max_diff={:.4})",
+            iframe_diff.max_diff
+        );
+    }
+
+    // === Decode P-frame with checkpoints ===
+    eprintln!("\n=== P-frame checkpoint decode ===");
+    let checkpoints: PFrameCheckpoints = dec.decode_pframe_checkpoints(&ctx, &compressed[1]);
+
+    // Read back decoder's final reference Y (after checkpoint decode updated it)
+    let dec_ref_after_pframe = dec
+        .read_reference_planes(&ctx, w, h)
+        .expect("decoder should have reference planes after P");
+    let dec_ref_y_pframe = &dec_ref_after_pframe[..padded_pixels];
+
+    // === Compare at each checkpoint ===
+
+    // Checkpoint 1: MC prediction (derived: reconstructed - spatial_residual)
+    // Compare encoder's MC prediction (enc_reconstructed - enc_residual) vs decoder's
+    // Since we don't have encoder's residual separately, compare predictions indirectly:
+    // Both should produce same prediction from same reference + same MVs
+    // We'll check by comparing final results and working backwards
+    eprintln!("\nCheckpoint 1: MC prediction");
+    eprintln!(
+        "  (derived from recon - residual, {} pixels)",
+        padded_pixels
+    );
+    // We can't directly compare encoder's MC prediction, but we can check if the
+    // decoder's prediction is reasonable (should be close to I-frame reference)
+    let pred_stats = {
+        let mut max_val: f32 = 0.0;
+        let mut sum: f64 = 0.0;
+        for &v in checkpoints.mc_prediction.iter().take(padded_pixels) {
+            max_val = max_val.max(v.abs());
+            sum += v.abs() as f64;
+        }
+        (max_val, sum / padded_pixels as f64)
+    };
+    eprintln!(
+        "  prediction range: max_abs={:.1} mean_abs={:.2}",
+        pred_stats.0, pred_stats.1
+    );
+
+    // Checkpoint 2: DWT of residual (encoder-only, ≈ dequantized wavelet)
+    eprintln!("\nCheckpoint 2: DWT of residual (encoder-only, skipped)");
+
+    // Checkpoint 3: Quantized coefficients — verify by CPU entropy decode roundtrip
+    // (encoder's recon_y buffer is overwritten by later frames, so we can't compare directly)
+    let quant_diff = {
+        // CPU-decode the P-frame's entropy data for Y plane and compare with GPU decode
+        let tiles_per_plane = compressed[1].info.tiles_x() as usize * compressed[1].info.tiles_y() as usize;
+        let cpu_decoded = crate::encoder::entropy_helpers::entropy_decode_plane(
+            &compressed[1].entropy,
+            0, // Y plane
+            tiles_per_plane,
+            compressed[1].info.tile_size as usize,
+            padded_w as usize,
+        );
+        compute_diff(&cpu_decoded, &checkpoints.quantized, padded_pixels)
+    };
+    let status3 = if quant_diff.max_diff > 0.001 {
+        "DIVERGED"
+    } else {
+        "OK"
+    };
+    eprintln!(
+        "\nCheckpoint 3: After quantization [{}]\n  max={:.4} mean={:.6} nonzero={}/{}",
+        status3,
+        quant_diff.max_diff,
+        quant_diff.mean_diff,
+        quant_diff.nonzero_count,
+        quant_diff.total_count,
+    );
+
+    // Checkpoint 4: Dequantized wavelet (recompute from CPU-decoded coefficients)
+    // Run the quantized coefficients through dequantize and compare with decoder's dequant output
+    eprintln!("\nCheckpoint 4: After dequantization");
+    {
+        // Re-decode quantized Y from entropy data for replay
+        let tiles_per_plane = compressed[1].info.tiles_x() as usize * compressed[1].info.tiles_y() as usize;
+        let cpu_quant_y = crate::encoder::entropy_helpers::entropy_decode_plane(
+            &compressed[1].entropy,
+            0,
+            tiles_per_plane,
+            compressed[1].info.tile_size as usize,
+            padded_w as usize,
+        );
+        let enc_quant_buf = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("enc_quant_y_upload"),
+            contents: bytemuck::cast_slice(&cpu_quant_y),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        });
+        let enc_dequant_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("enc_dequant_y"),
+            size: (padded_pixels * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let p_config = &compressed[1].config;
+        let weights_luma = p_config.subband_weights.pack_weights();
+        let mut cmd = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("enc_dequant_replay"),
+            });
+        // Use encoder's quantize module to dequantize
+        enc.quantize.dispatch_adaptive(
+            &ctx,
+            &mut cmd,
+            &enc_quant_buf,
+            &enc_dequant_buf,
+            padded_pixels as u32,
+            p_config.quantization_step,
+            p_config.dead_zone,
+            false, // dequantize
+            padded_w,
+            padded_h,
+            p_config.tile_size,
+            p_config.wavelet_levels,
+            &weights_luma,
+            None,
+            0.0,
+        );
+        ctx.queue.submit(Some(cmd.finish()));
+        ctx.device.poll(wgpu::Maintain::Wait);
+        let enc_dequantized =
+            crate::gpu_util::read_buffer_f32(&ctx, &enc_dequant_buf, padded_pixels);
+        let dequant_diff = compute_diff(&enc_dequantized, &checkpoints.dequantized, padded_pixels);
+        let status4 = if dequant_diff.max_diff > 0.001 {
+            "DIVERGED"
+        } else {
+            "OK"
+        };
+        eprintln!(
+            "  [{}] max={:.4} mean={:.6} nonzero={}/{}",
+            status4,
+            dequant_diff.max_diff,
+            dequant_diff.mean_diff,
+            dequant_diff.nonzero_count,
+            dequant_diff.total_count,
+        );
+    }
+
+    // Checkpoint 5: Spatial residual after IDWT
+    eprintln!("\nCheckpoint 5: After IDWT");
+    {
+        // Re-decode quantized Y from entropy data for replay
+        let tiles_per_plane = compressed[1].info.tiles_x() as usize * compressed[1].info.tiles_y() as usize;
+        let cpu_quant_y = crate::encoder::entropy_helpers::entropy_decode_plane(
+            &compressed[1].entropy,
+            0,
+            tiles_per_plane,
+            compressed[1].info.tile_size as usize,
+            padded_w as usize,
+        );
+        let enc_quant_buf = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("enc_quant_y_upload2"),
+            contents: bytemuck::cast_slice(&cpu_quant_y),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        });
+        let buf_usage = wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_SRC
+            | wgpu::BufferUsages::COPY_DST;
+        let scratch1 = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("enc_scratch1"),
+            size: (padded_pixels * 4) as u64,
+            usage: buf_usage,
+            mapped_at_creation: false,
+        });
+        let scratch2 = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("enc_scratch2"),
+            size: (padded_pixels * 4) as u64,
+            usage: buf_usage,
+            mapped_at_creation: false,
+        });
+        let enc_residual_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("enc_residual"),
+            size: (padded_pixels * 4) as u64,
+            usage: buf_usage,
+            mapped_at_creation: false,
+        });
+        let p_config = &compressed[1].config;
+        let weights_luma = p_config.subband_weights.pack_weights();
+        let info = &compressed[1].info;
+        let mut cmd = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("enc_idwt_replay"),
+            });
+        // Dequantize
+        enc.quantize.dispatch_adaptive(
+            &ctx,
+            &mut cmd,
+            &enc_quant_buf,
+            &scratch1, // dequantized wavelet
+            padded_pixels as u32,
+            p_config.quantization_step,
+            p_config.dead_zone,
+            false,
+            padded_w,
+            padded_h,
+            p_config.tile_size,
+            p_config.wavelet_levels,
+            &weights_luma,
+            None,
+            0.0,
+        );
+        // IDWT: scratch1 → scratch2 → enc_residual_buf
+        enc.transform.inverse(
+            &ctx,
+            &mut cmd,
+            &scratch1,
+            &scratch2,
+            &enc_residual_buf,
+            info,
+            p_config.wavelet_levels,
+            p_config.wavelet_type,
+        );
+        ctx.queue.submit(Some(cmd.finish()));
+        ctx.device.poll(wgpu::Maintain::Wait);
+        let enc_residual =
+            crate::gpu_util::read_buffer_f32(&ctx, &enc_residual_buf, padded_pixels);
+        let idwt_diff = compute_diff(&enc_residual, &checkpoints.spatial_residual, padded_pixels);
+        let status5 = if idwt_diff.max_diff > 0.001 {
+            "DIVERGED"
+        } else {
+            "OK"
+        };
+        eprintln!(
+            "  [{}] max={:.4} mean={:.6} nonzero={}/{}",
+            status5,
+            idwt_diff.max_diff,
+            idwt_diff.mean_diff,
+            idwt_diff.nonzero_count,
+            idwt_diff.total_count,
+        );
+    }
+
+    // Checkpoint 6: Reconstructed pixels (final comparison)
+    let recon_diff = compute_diff(enc_ref_y, &checkpoints.reconstructed, padded_pixels);
+    let status6 = if recon_diff.max_diff > 0.001 {
+        "DIVERGED"
+    } else {
+        "OK"
+    };
+    eprintln!(
+        "\nCheckpoint 6: After adding residual to prediction [{}]\n  max={:.4} mean={:.6} nonzero={}/{}",
+        status6,
+        recon_diff.max_diff,
+        recon_diff.mean_diff,
+        recon_diff.nonzero_count,
+        recon_diff.total_count,
+    );
+
+    // Also check decoder's reference matches its reconstructed
+    let dec_ref_vs_recon =
+        compute_diff(dec_ref_y_pframe, &checkpoints.reconstructed, padded_pixels);
+    eprintln!(
+        "\n  Decoder ref vs checkpoint recon: max={:.4} mean={:.6}",
+        dec_ref_vs_recon.max_diff, dec_ref_vs_recon.mean_diff,
+    );
+
+    // === MV analysis: run MC with the compressed frame's MVs vs encoder ===
+    // Upload the compressed MVs to a fresh buffer, run MC on the I-frame reference,
+    // and compare the prediction with the encoder's prediction
+    eprintln!("\n=== MV analysis ===");
+    {
+        let mf = compressed[1].motion_field.as_ref().unwrap();
+        eprintln!(
+            "  block_size={} num_mvs={} ({}x{})",
+            mf.block_size,
+            mf.vectors.len(),
+            padded_w / mf.block_size,
+            padded_h / mf.block_size,
+        );
+
+        // Re-derive encoder's prediction from enc_ref_y - residual
+        // Since: enc_recon = residual + enc_pred → enc_pred = enc_recon - residual
+        // And residual matches decoder's (checkpoint 5 OK)
+        // And: dec_recon = residual + dec_pred → dec_pred = dec_recon - residual
+        let enc_pred: Vec<f32> = enc_ref_y
+            .iter()
+            .zip(checkpoints.spatial_residual.iter())
+            .map(|(&r, &res)| r - res)
+            .collect();
+        let dec_pred = &checkpoints.mc_prediction;
+        let pred_diff = compute_diff(&enc_pred, dec_pred, padded_pixels);
+        eprintln!(
+            "  MC prediction diff: max={:.4} mean={:.6} nonzero={}/{}",
+            pred_diff.max_diff, pred_diff.mean_diff, pred_diff.nonzero_count, pred_diff.total_count,
+        );
+
+        // Run MC inverse with a ZERO residual to isolate pure prediction
+        // This tests: reference_planes + decoder_MVs → prediction signal
+        let zero_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("zero_residual"),
+            size: (padded_pixels * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: true,
+        });
+        // zero-initialized buffer (mapped_at_creation with no write = zeros)
+        zero_buf.unmap();
+
+        // Get decoder's I-frame reference
+        // The decoder decoded the I-frame already, then decode_pframe_checkpoints updated
+        // reference_planes[0] with the P-frame result. We need the I-frame ref.
+        // Actually, let's re-decode the I-frame on a fresh decoder to get clean ref.
+        let dec2 = DecoderPipeline::new(&ctx);
+        let _ = dec2.decode(&ctx, &compressed[0]); // decode I-frame
+        let dec2_ref = dec2
+            .read_reference_planes(&ctx, w, h)
+            .expect("dec2 should have ref");
+        let dec2_ref_y = &dec2_ref[..padded_pixels];
+
+        // Upload compressed MVs to a fresh buffer
+        let mv_buf = {
+            let i32_data: Vec<i32> = mf
+                .vectors
+                .iter()
+                .flat_map(|mv| [mv[0] as i32, mv[1] as i32])
+                .collect();
+            ctx.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("test_mv_buf"),
+                    contents: bytemuck::cast_slice(&i32_data),
+                    usage: wgpu::BufferUsages::STORAGE,
+                })
+        };
+
+        // Upload I-frame ref to a fresh buffer
+        let ref_buf = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("test_ref_buf"),
+            contents: bytemuck::cast_slice(dec2_ref_y),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let pred_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("test_pred_buf"),
+            size: (padded_pixels * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // Run MC inverse: pred = 0 + bilinear_ref(ref, MVs)
+        let mut cmd = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("test_mc_pred"),
+            });
+        enc.motion.compensate(
+            &ctx,
+            &mut cmd,
+            &zero_buf,
+            &ref_buf,
+            &mv_buf,
+            &pred_buf,
+            padded_w,
+            padded_h,
+            false, // inverse: output = zero + prediction = prediction
+            mf.block_size,
+        );
+        ctx.queue.submit(Some(cmd.finish()));
+        ctx.device.poll(wgpu::Maintain::Wait);
+        let test_pred = crate::gpu_util::read_buffer_f32(&ctx, &pred_buf, padded_pixels);
+
+        // Compare this fresh MC prediction with encoder's prediction
+        let test_pred_diff = compute_diff(&enc_pred, &test_pred, padded_pixels);
+        eprintln!(
+            "  Fresh MC pred (from compressed MVs + I-ref) vs encoder pred:");
+        eprintln!(
+            "    max={:.4} mean={:.6} nonzero={}/{}",
+            test_pred_diff.max_diff,
+            test_pred_diff.mean_diff,
+            test_pred_diff.nonzero_count,
+            test_pred_diff.total_count,
+        );
+        if test_pred_diff.max_diff > 0.001 {
+            eprintln!("    → CONFIRMED: Compressed MVs produce different prediction than encoder's MVs");
+            eprintln!("    → i32→i16 truncation or MV readback bug in encoder");
+        } else {
+            eprintln!("    → Compressed MVs match encoder's prediction exactly");
+            eprintln!("    → Bug is in decoder's MV upload or MC dispatch");
+        }
+    }
+
+    // Direct i32 vs i16 roundtrip comparison: read raw GPU MVs and compare
+    // Note: staging buffer contains the LAST frame's MVs (frame 2), not frame 1's.
+    eprintln!("\n=== MV i32 vs i16 roundtrip check (last P-frame) ===");
+    {
+        let mf = compressed[2].motion_field.as_ref().unwrap();
+        let raw_i32 = enc
+            .read_raw_split_mvs_i32(&ctx)
+            .expect("should have raw split MVs");
+        eprintln!("  raw_i32.len()={} compressed_mvs.len()={}", raw_i32.len() / 2, mf.vectors.len());
+
+        let mut mismatches = 0usize;
+        let mut max_i32_abs: i32 = 0;
+        let mut first_mismatch = None;
+        for (i, &[dx16, dy16]) in mf.vectors.iter().enumerate() {
+            let gpu_dx = raw_i32[i * 2];
+            let gpu_dy = raw_i32[i * 2 + 1];
+            let rt_dx = dx16 as i32;
+            let rt_dy = dy16 as i32;
+            max_i32_abs = max_i32_abs.max(gpu_dx.abs()).max(gpu_dy.abs());
+            if gpu_dx != rt_dx || gpu_dy != rt_dy {
+                mismatches += 1;
+                if first_mismatch.is_none() {
+                    first_mismatch = Some((i, gpu_dx, gpu_dy, rt_dx, rt_dy));
+                }
+            }
+        }
+        eprintln!("  Max absolute MV (raw i32): {max_i32_abs} half-pels ({:.1} pixels)", max_i32_abs as f32 / 2.0);
+        eprintln!("  Mismatches after i32→i16→i32 roundtrip: {mismatches}/{}", mf.vectors.len());
+        if let Some((idx, gdx, gdy, rdx, rdy)) = first_mismatch {
+            let bx = idx % (padded_w as usize / mf.block_size as usize);
+            let by = idx / (padded_w as usize / mf.block_size as usize);
+            eprintln!("  First mismatch at block {idx} (bx={bx}, by={by}): GPU=({gdx},{gdy}) roundtrip=({rdx},{rdy})");
+        }
+    }
+
+    eprintln!("\n=== Summary ===");
+    eprintln!("First checkpoint with diff > 0 identifies the bug source.");
+    if quant_diff.max_diff > 0.001 {
+        eprintln!("BUG: Entropy coding is LOSSY (quantized coefficients differ)");
+    } else if recon_diff.max_diff > 0.001 {
+        eprintln!("BUG: MC inverse divergence (same coefficients → different reconstruction)");
+        eprintln!("     Likely cause: MV format mismatch or reference plane difference");
+    } else {
+        eprintln!("All checkpoints match — no divergence detected");
+    }
 }

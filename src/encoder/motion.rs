@@ -565,7 +565,11 @@ impl MotionEstimator {
             blocks_x,
             total_blocks,
             use_predictor: if have_predictor { 1 } else { 0 },
-            pred_fine_range: if have_predictor { ME_BIDIR_PRED_FINE_RANGE } else { 0 },
+            pred_fine_range: if have_predictor {
+                ME_BIDIR_PRED_FINE_RANGE
+            } else {
+                0
+            },
         };
 
         let params_buf = ctx
@@ -1019,7 +1023,11 @@ impl MotionEstimator {
 
     /// Downsample 8x8-resolution MVs to 16x16 by taking the top-left sub-block MV
     /// of each macroblock. Used for temporal predictor input to block_match.wgsl.
-    pub fn downsample_8x8_to_16x16(mvs_8x8: &[[i16; 2]], blocks_x_8: u32, blocks_y_8: u32) -> Vec<[i16; 2]> {
+    pub fn downsample_8x8_to_16x16(
+        mvs_8x8: &[[i16; 2]],
+        blocks_x_8: u32,
+        blocks_y_8: u32,
+    ) -> Vec<[i16; 2]> {
         let blocks_x_16 = blocks_x_8 / 2;
         let blocks_y_16 = blocks_y_8 / 2;
         let mut mvs_16 = Vec::with_capacity((blocks_x_16 * blocks_y_16) as usize);
@@ -1209,7 +1217,12 @@ impl MotionEstimator {
     /// Finish MV readback from a cached staging buffer.
     /// Unlike `finish_mv_readback`, this uses a pre-allocated staging buffer that
     /// must be unmapped before reuse (this function handles unmapping).
-    pub fn finish_mv_readback_cached(ctx: &GpuContext, staging: &wgpu::Buffer, mv_size: u64, total_blocks: u32) -> Vec<[i16; 2]> {
+    pub fn finish_mv_readback_cached(
+        ctx: &GpuContext,
+        staging: &wgpu::Buffer,
+        mv_size: u64,
+        total_blocks: u32,
+    ) -> Vec<[i16; 2]> {
         let slice = staging.slice(..mv_size);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |result| {
@@ -1410,10 +1423,7 @@ impl MotionEstimator {
 
     /// Create bidir staging buffers for deferred copy.
     /// The caller adds copy_buffer_to_buffer commands to their own command encoder.
-    pub fn create_bidir_staging(
-        ctx: &GpuContext,
-        total_blocks: u32,
-    ) -> BidirStaging {
+    pub fn create_bidir_staging(ctx: &GpuContext, total_blocks: u32) -> BidirStaging {
         let mv_count = total_blocks as usize * 2;
         let mv_size = (mv_count * std::mem::size_of::<i32>()) as u64;
         let modes_size = (total_blocks as usize * std::mem::size_of::<u32>()) as u64;
@@ -1727,8 +1737,15 @@ mod tests {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("test_me"),
             });
-        let (mv_buf, _sad_buf) =
-            me.estimate(&ctx, &mut cmd, &current_buf, &reference_buf, width, height, None);
+        let (mv_buf, _sad_buf) = me.estimate(
+            &ctx,
+            &mut cmd,
+            &current_buf,
+            &reference_buf,
+            width,
+            height,
+            None,
+        );
         ctx.queue.submit(Some(cmd.finish()));
 
         let blocks_x = width / ME_BLOCK_SIZE;
@@ -1794,8 +1811,15 @@ mod tests {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("test_me_shift"),
             });
-        let (mv_buf, _sad_buf) =
-            me.estimate(&ctx, &mut cmd, &current_buf, &reference_buf, width, height, None);
+        let (mv_buf, _sad_buf) = me.estimate(
+            &ctx,
+            &mut cmd,
+            &current_buf,
+            &reference_buf,
+            width,
+            height,
+            None,
+        );
         ctx.queue.submit(Some(cmd.finish()));
 
         let blocks_x = width / ME_BLOCK_SIZE;

@@ -803,6 +803,41 @@ impl DecoderPipeline {
 
         result
     }
+
+    /// Read back reference planes for debugging.
+    pub fn read_reference_planes(&self, ctx: &GpuContext, width: u32, height: u32) -> Option<Vec<f32>> {
+        let cached = self.cached.borrow();
+        let bufs = cached.as_ref()?;
+        let padded_w = (width + 255) & !255;
+        let padded_h = (height + 255) & !255;
+        let padded_pixels = (padded_w * padded_h) as usize;
+        let plane_size = padded_pixels * std::mem::size_of::<f32>();
+
+        let mut result: Vec<f32> = Vec::with_capacity(padded_pixels * 3);
+        for p in 0..3 {
+            let buf = &bufs.reference_planes[p];
+            let staging = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("ref_staging"),
+                size: plane_size as u64,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let mut cmd = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("copy_ref") });
+            cmd.copy_buffer_to_buffer(buf, 0, &staging, 0, plane_size as u64);
+            ctx.queue.submit(Some(cmd.finish()));
+            let slice = staging.slice(..);
+            let (tx, rx) = std::sync::mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).ok(); });
+            ctx.device.poll(wgpu::Maintain::Wait);
+            rx.recv().unwrap().unwrap();
+            let data = slice.get_mapped_range();
+            // Correct: cast from f32 bytes to f32
+            result.extend(bytemuck::cast_slice::<u8, f32>(&data).to_vec());
+            drop(data);
+            staging.unmap();
+        }
+        Some(result)
+    }
 }
 
 // ---- WASM-compatible async decode (avoids Instant, mpsc, Maintain::Wait) ----

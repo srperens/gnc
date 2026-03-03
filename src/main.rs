@@ -745,6 +745,29 @@ fn main() {
             println!("\n=== I+P+B (keyframe_interval={}) ===", keyframe_interval);
             // Decode with B-frame reordering support
             let decoded_all = decoder.decode_sequence(&ctx, &compressed_ip);
+
+            // DIVERGENCE TEST: Compare encoder vs decoder decoded output (RGB)
+            // Note: cannot compare reference planes directly because the encoder
+            // skips local decode for the last P-frame in a sequence (optimization:
+            // the reference won't be used again). This means encoder gpu_ref_planes
+            // may be stale. Instead, compare decoded RGB output from both sides.
+            if diagnostics {
+                println!("\n=== ENCODE/DECODE QUALITY CHECK ===");
+                for (i, cf) in compressed_ip.iter().enumerate() {
+                    let ft = match cf.frame_type {
+                        gnc::FrameType::Intra => "I",
+                        gnc::FrameType::Predicted => "P",
+                        gnc::FrameType::Bidirectional => "B",
+                    };
+                    let psnr = quality::psnr(&frames_data[i], &decoded_all[i], 255.0);
+                    let status = if psnr > 25.0 { "✓ OK" } else { "⚠ LOW" };
+                    eprintln!(
+                        "  Frame {:2} [{}] {}: PSNR={:.2} dB, {} bytes",
+                        i, ft, status, psnr, cf.byte_size()
+                    );
+                }
+            }
+
             let mut total_bytes_ip: usize = 0;
             let mut frame_metrics_ip: Vec<FrameMetrics> = Vec::new();
             for (i, cf) in compressed_ip.iter().enumerate() {
@@ -964,7 +987,11 @@ fn main() {
                     assert!(
                         fw == w && fh == h,
                         "Frame {} has different dimensions ({}x{} vs {}x{})",
-                        i, fw, fh, w, h
+                        i,
+                        fw,
+                        fh,
+                        w,
+                        h
                     );
                     rgb
                 },
@@ -1090,9 +1117,7 @@ fn main() {
                     } else {
                         // Collect consecutive B-frames
                         let b_start = i;
-                        while i < frame_types.len()
-                            && frame_types[i] == FrameType::Bidirectional
-                        {
+                        while i < frame_types.len() && frame_types[i] == FrameType::Bidirectional {
                             i += 1;
                         }
                         let b_end = i;
@@ -1110,8 +1135,7 @@ fn main() {
                 order
             };
 
-            let mut results: Vec<Option<Vec<f32>>> =
-                (0..frame_types.len()).map(|_| None).collect();
+            let mut results: Vec<Option<Vec<f32>>> = (0..frame_types.len()).map(|_| None).collect();
             let mut output_count = 0usize;
 
             let mut di = 0;
@@ -1142,8 +1166,7 @@ fn main() {
                     {
                         let b_local = decode_order[di];
                         let b_abs = start_frame + b_local;
-                        let b_compressed =
-                            deserialize_sequence_frame(&gnv_data, &header, b_abs);
+                        let b_compressed = deserialize_sequence_frame(&gnv_data, &header, b_abs);
                         results[b_local] = Some(decoder.decode(&ctx, &b_compressed));
                         di += 1;
                     }
@@ -1476,15 +1499,12 @@ fn main() {
                 w, h, iterations
             );
 
-            let results = experiments::transform_shootout::run_shootout(
-                &ctx, &rgb_data, w, h, iterations,
-            );
+            let results =
+                experiments::transform_shootout::run_shootout(&ctx, &rgb_data, w, h, iterations);
             experiments::transform_shootout::print_results(&results);
 
             // Fused mega-kernel benchmark
-            experiments::transform_shootout::run_fused_benchmark(
-                &ctx, &rgb_data, w, h, iterations,
-            );
+            experiments::transform_shootout::run_fused_benchmark(&ctx, &rgb_data, w, h, iterations);
         }
     }
 }

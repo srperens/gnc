@@ -4,6 +4,42 @@
 
 ---
 
+## 2026-03-02: P-frame Divergence Investigation — False Alarm
+
+### Hypothesis
+Reported P-frame encoder/decoder reference divergence (Y max=13, mean=1.78). Previous session added `read_reference_planes()` diagnostics and started 6-checkpoint instrumentation. Goal: identify which pipeline stage introduces the divergence.
+
+### Investigation
+Built comprehensive checkpoint decode infrastructure (`decoder/checkpoint.rs`) with step-by-step GPU readbacks at 6 stages:
+1. MC prediction
+2. DWT of residual (encoder-only)
+3. Quantized coefficients (entropy decode output)
+4. Dequantized wavelet coefficients
+5. Spatial residual (after IDWT)
+6. Reconstructed pixels (after MC inverse)
+
+Initial results (2-frame I+P test): Checkpoints 3-5 all matched perfectly (max=0.000), but checkpoint 6 showed max=123.5 divergence. MV roundtrip verified lossless (0/40960 mismatches), I-frame references verified identical.
+
+### Root Cause
+**Measurement bug, not codec bug.** The encoder's `encode_pframe()` has a `needs_decode` parameter that skips local decode for the last P-frame in a sequence (optimization — the reference won't be used by subsequent frames). With only 2 frames (I+P), the P-frame's local decode was skipped, so `read_reference_planes()` returned the stale I-frame reference instead of the P-frame decoded output.
+
+The original `main.rs` divergence diagnostic had the same bug: it encoded all frames, then compared the encoder's (stale) reference planes against the decoder's (fully decoded) reference planes — effectively comparing different frames.
+
+### Fix
+- Test: encode 3+ frames (I+P+P) so the first P-frame runs local decode
+- main.rs diagnostic: replaced reference plane comparison with decoded RGB quality check
+- Result: **all 6 checkpoints match with max=0.000** — encoder and decoder are bit-exact
+
+### Key Finding
+The P-frame encode/decode pipeline is perfectly bit-exact:
+- Entropy coding: lossless (quantized coefficients match exactly)
+- Dequantization: bit-exact (even though encoder uses 2× dead_zone for forward quantize, dead_zone doesn't affect dequant path — shader simply does `output = val * step`)
+- IDWT: bit-exact
+- MC inverse: bit-exact (i32→i16→i32 MV roundtrip is lossless for half-pel MVs ≤77)
+- MV buffer format: consistent between split shader output layout and linear readback
+
+---
+
 ## 2026-03-01: Compact Tile Header Format (Varint Stream Lengths)
 
 ### Hypothesis

@@ -17,3 +17,4 @@ test_material/frames/
 examples/web/*.gnv
 examples/web/*.gnc
 examples/web/*.diag
+.aider*

@@ -4,9 +4,9 @@ use super::adaptive::{self, VarianceAnalyzer, WeightMapNormalizer, AQ_LL_BLOCK_S
 use super::bitplane;
 use super::buffer_cache::CachedEncodeBuffers;
 use super::cfl::{self, CflAlphaComputer, CflForwardPredictor, CflPredictor};
-use super::fused_block::FusedBlock;
 use super::color::ColorConverter;
 use super::entropy_helpers::{encode_entropy, EntropyMode};
+use super::fused_block::FusedBlock;
 use super::huffman;
 use super::huffman_gpu::GpuHuffmanEncoder;
 use super::interleave::PlaneDeinterleaver;
@@ -57,64 +57,62 @@ impl EncoderPipeline {
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("pad"),
-                source: wgpu::ShaderSource::Wgsl(
-                    include_str!("../shaders/pad.wgsl").into(),
-                ),
+                source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/pad.wgsl").into()),
             });
-        let pad_bgl =
-            ctx.device
-                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                    label: Some("pad_bgl"),
-                    entries: &[
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 0,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Uniform,
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
+        let pad_bgl = ctx
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("pad_bgl"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
                         },
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 1,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Storage { read_only: true },
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
                         },
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 2,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Storage { read_only: false },
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
                         },
-                    ],
-                });
-        let pad_pl =
-            ctx.device
-                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("pad_pl"),
-                    bind_group_layouts: &[&pad_bgl],
-                    push_constant_ranges: &[],
-                });
-        let pad_pipeline =
-            ctx.device
-                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some("pad_pipeline"),
-                    layout: Some(&pad_pl),
-                    module: &pad_shader,
-                    entry_point: Some("main"),
-                    compilation_options: Default::default(),
-                    cache: None,
-                });
+                        count: None,
+                    },
+                ],
+            });
+        let pad_pl = ctx
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("pad_pl"),
+                bind_group_layouts: &[&pad_bgl],
+                push_constant_ranges: &[],
+            });
+        let pad_pipeline = ctx
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("pad_pipeline"),
+                layout: Some(&pad_pl),
+                module: &pad_shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
 
         Self {
             color: ColorConverter::new(ctx),
@@ -325,9 +323,8 @@ impl EncoderPipeline {
         // Fused quantize+histogram: saves one full buffer read+write per plane.
         // Only applicable when GPU entropy encoding is active and CfL is off
         // (CfL needs separate quantize+dequantize for Y reconstruction).
-        let use_fused_qh = config.use_fused_quantize_histogram
-            && use_gpu_encode
-            && !config.cfl_enabled;
+        let use_fused_qh =
+            config.use_fused_quantize_histogram && use_gpu_encode && !config.cfl_enabled;
 
         let weights_luma = config.subband_weights.pack_weights();
         let weights_chroma = config.subband_weights.pack_weights_chroma();
@@ -431,28 +428,43 @@ impl EncoderPipeline {
 
             // Y plane: spatial pixels → quantized DCT coefficients + reconstructed pixels
             self.fused_block.dispatch(
-                ctx, &mut cmd,
-                &bufs.plane_a, &bufs.mc_out, &bufs.plane_c,
-                padded_w, padded_h,
-                config.quantization_step, config.dead_zone,
+                ctx,
+                &mut cmd,
+                &bufs.plane_a,
+                &bufs.mc_out,
+                &bufs.plane_c,
+                padded_w,
+                padded_h,
+                config.quantization_step,
+                config.dead_zone,
                 config.dct_freq_strength,
             );
 
             // Co plane
             self.fused_block.dispatch(
-                ctx, &mut cmd,
-                &bufs.co_plane, &bufs.ref_upload, &bufs.plane_c,
-                padded_w, padded_h,
-                config.quantization_step, config.dead_zone,
+                ctx,
+                &mut cmd,
+                &bufs.co_plane,
+                &bufs.ref_upload,
+                &bufs.plane_c,
+                padded_w,
+                padded_h,
+                config.quantization_step,
+                config.dead_zone,
                 config.dct_freq_strength,
             );
 
             // Cg plane
             self.fused_block.dispatch(
-                ctx, &mut cmd,
-                &bufs.cg_plane, &bufs.plane_b, &bufs.plane_c,
-                padded_w, padded_h,
-                config.quantization_step, config.dead_zone,
+                ctx,
+                &mut cmd,
+                &bufs.cg_plane,
+                &bufs.plane_b,
+                &bufs.plane_c,
+                padded_w,
+                padded_h,
+                config.quantization_step,
+                config.dead_zone,
                 config.dct_freq_strength,
             );
 
@@ -462,384 +474,389 @@ impl EncoderPipeline {
             // Wavelet path (existing): multi-level wavelet + AQ + quantize
             // ====================================================================
 
-        // --- Intra prediction (Y plane only, before wavelet) ---
-        if config.intra_prediction {
-            let intra_res = bufs.intra_residual.as_ref().unwrap();
-            let intra_modes = bufs.intra_modes_buf.as_ref().unwrap();
-            let intra_ts = super::intra::INTRA_TILE_SIZE;
-            self.intra.forward(
-                ctx, &mut cmd,
-                &bufs.plane_a, intra_res, intra_modes,
-                padded_w, padded_h, intra_ts,
-            );
-            // Copy residual back to plane_a for wavelet transform
-            cmd.copy_buffer_to_buffer(intra_res, 0, &bufs.plane_a, 0, plane_size);
-        }
+            // --- Intra prediction (Y plane only, before wavelet) ---
+            if config.intra_prediction {
+                let intra_res = bufs.intra_residual.as_ref().unwrap();
+                let intra_modes = bufs.intra_modes_buf.as_ref().unwrap();
+                let intra_ts = super::intra::INTRA_TILE_SIZE;
+                self.intra.forward(
+                    ctx,
+                    &mut cmd,
+                    &bufs.plane_a,
+                    intra_res,
+                    intra_modes,
+                    padded_w,
+                    padded_h,
+                    intra_ts,
+                );
+                // Copy residual back to plane_a for wavelet transform
+                cmd.copy_buffer_to_buffer(intra_res, 0, &bufs.plane_a, 0, plane_size);
+            }
 
-        // --- Y plane: wavelet transform ---
-        self.transform.forward(
-            ctx,
-            &mut cmd,
-            &bufs.plane_a,
-            &bufs.plane_b,
-            &bufs.plane_c,
-            &info,
-            config.wavelet_levels,
-            config.wavelet_type,
-        );
-        // After wavelet: plane_c has Y wavelet coefficients
-
-        // --- Adaptive quantization: variance analysis on Y's LL subband ---
-        if aq_active {
-            // Variance analysis reads from Y wavelet buffer (plane_c)
-            self.variance.dispatch(
-                ctx,
-                &mut cmd,
-                &bufs.plane_c,
-                &bufs.variance_buf,
-                padded_w,
-                padded_h,
-                config.tile_size,
-                config.wavelet_levels,
-            );
-
-            let (ll_bx, ll_by, total_blocks, _, tiles_x_u32, tiles_y_u32) = adaptive::ll_block_dims(
-                padded_w,
-                padded_h,
-                config.tile_size,
-                config.wavelet_levels,
-            );
-            let global_bx = ll_bx * tiles_x_u32;
-            let global_by = ll_by * tiles_y_u32;
-            self.weight_normalizer.dispatch(
-                ctx,
-                &mut cmd,
-                &bufs.variance_buf,
-                &bufs.wm_scratch,
-                &bufs.weight_map_buf,
-                global_bx,
-                global_by,
-                total_blocks,
-                config.aq_strength,
-            );
-        }
-
-        // --- Y plane: quantize ---
-        let aq_dims = if aq_active {
-            let (_, ll_bx, _, tx) = adaptive::weight_map_dims(
-                padded_w,
-                padded_h,
-                config.tile_size,
-                config.wavelet_levels,
-            );
-            let ll_size = config.tile_size >> config.wavelet_levels;
-            let ll_block_size = AQ_LL_BLOCK_SIZE.min(ll_size);
-            Some((ll_block_size, ll_bx, tx))
-        } else {
-            None
-        };
-
-        let wm_param = aq_dims
-            .as_ref()
-            .map(|&(ll_bs, ll_bx, tx)| (&bufs.weight_map_buf, ll_bs, ll_bx, tx));
-
-        if config.cfl_enabled {
-            self.quantize.dispatch_adaptive(
-                ctx,
-                &mut cmd,
-                &bufs.plane_c,
-                &bufs.plane_b,
-                padded_pixels as u32,
-                config.quantization_step,
-                config.dead_zone,
-                true,
-                padded_w,
-                padded_h,
-                config.tile_size,
-                config.wavelet_levels,
-                &weights_luma,
-                wm_param,
-                0.0,
-            );
-            self.quantize.dispatch_adaptive(
-                ctx,
-                &mut cmd,
-                &bufs.plane_b,
-                &bufs.plane_a,
-                padded_pixels as u32,
-                config.quantization_step,
-                config.dead_zone,
-                false,
-                padded_w,
-                padded_h,
-                config.tile_size,
-                config.wavelet_levels,
-                &weights_luma,
-                wm_param,
-                0.0,
-            );
-            cmd.copy_buffer_to_buffer(&bufs.plane_a, 0, &bufs.recon_y, 0, plane_size);
-        } else if use_fused_qh {
-            let hist_bufs = bufs.fused_hist_bufs.as_ref().unwrap();
-            self.fused_qh.dispatch(
-                ctx,
-                &mut cmd,
-                &bufs.plane_c,
-                &bufs.plane_b,
-                &hist_bufs[0],
-                padded_w,
-                padded_h,
-                config.tile_size,
-                config.wavelet_levels,
-                config.quantization_step,
-                config.dead_zone,
-                &weights_luma,
-                config.per_subband_entropy,
-                1,
-                wm_param,
-            );
-        } else {
-            self.quantize.dispatch_adaptive(
-                ctx,
-                &mut cmd,
-                &bufs.plane_c,
-                &bufs.plane_b,
-                padded_pixels as u32,
-                config.quantization_step,
-                config.dead_zone,
-                true,
-                padded_w,
-                padded_h,
-                config.tile_size,
-                config.wavelet_levels,
-                &weights_luma,
-                wm_param,
-                0.0,
-            );
-        }
-        cmd.copy_buffer_to_buffer(&bufs.plane_b, 0, &bufs.mc_out, 0, plane_size);
-
-        // --- Co plane: wavelet + (CfL) + quantize ---
-        self.transform.forward(
-            ctx,
-            &mut cmd,
-            &bufs.co_plane,
-            &bufs.plane_b,
-            &bufs.plane_c,
-            &info,
-            config.wavelet_levels,
-            config.wavelet_type,
-        );
-
-        if config.cfl_enabled {
-            self.cfl_alpha.dispatch(
-                ctx,
-                &mut cmd,
-                &bufs.recon_y,
-                &bufs.plane_c,
-                &bufs.raw_alpha,
-                &bufs.dq_alpha,
-                padded_w,
-                padded_h,
-                config.tile_size,
-                config.wavelet_levels,
-            );
-            self.cfl_forward.dispatch(
-                ctx,
-                &mut cmd,
-                &bufs.plane_c,
-                &bufs.recon_y,
-                &bufs.dq_alpha,
-                &bufs.plane_a,
-                padded_pixels as u32,
-                padded_w,
-                padded_h,
-                config.tile_size,
-                config.wavelet_levels,
-            );
-            self.quantize.dispatch_adaptive(
+            // --- Y plane: wavelet transform ---
+            self.transform.forward(
                 ctx,
                 &mut cmd,
                 &bufs.plane_a,
                 &bufs.plane_b,
-                padded_pixels as u32,
-                config.quantization_step,
-                config.dead_zone,
-                true,
-                padded_w,
-                padded_h,
-                config.tile_size,
-                config.wavelet_levels,
-                &weights_chroma,
-                wm_param,
-                0.0,
-            );
-            cmd.copy_buffer_to_buffer(&bufs.raw_alpha, 0, &alpha_staging[0], 0, alpha_bytes);
-        } else if use_fused_qh {
-            let hist_bufs = bufs.fused_hist_bufs.as_ref().unwrap();
-            self.fused_qh.dispatch(
-                ctx,
-                &mut cmd,
                 &bufs.plane_c,
-                &bufs.plane_b,
-                &hist_bufs[1],
-                padded_w,
-                padded_h,
-                config.tile_size,
+                &info,
                 config.wavelet_levels,
-                config.quantization_step,
-                config.dead_zone,
-                &weights_chroma,
-                config.per_subband_entropy,
-                1,
-                wm_param,
+                config.wavelet_type,
             );
-        } else {
-            self.quantize.dispatch_adaptive(
-                ctx,
-                &mut cmd,
-                &bufs.plane_c,
-                &bufs.plane_b,
-                padded_pixels as u32,
-                config.quantization_step,
-                config.dead_zone,
-                true,
-                padded_w,
-                padded_h,
-                config.tile_size,
-                config.wavelet_levels,
-                &weights_chroma,
-                wm_param,
-                0.0,
-            );
-        }
-        cmd.copy_buffer_to_buffer(&bufs.plane_b, 0, &bufs.ref_upload, 0, plane_size);
+            // After wavelet: plane_c has Y wavelet coefficients
 
-        // --- Cg plane: wavelet + (CfL) + quantize ---
-        self.transform.forward(
-            ctx,
-            &mut cmd,
-            &bufs.cg_plane,
-            &bufs.plane_b,
-            &bufs.plane_c,
-            &info,
-            config.wavelet_levels,
-            config.wavelet_type,
-        );
+            // --- Adaptive quantization: variance analysis on Y's LL subband ---
+            if aq_active {
+                // Variance analysis reads from Y wavelet buffer (plane_c)
+                self.variance.dispatch(
+                    ctx,
+                    &mut cmd,
+                    &bufs.plane_c,
+                    &bufs.variance_buf,
+                    padded_w,
+                    padded_h,
+                    config.tile_size,
+                    config.wavelet_levels,
+                );
 
-        if config.cfl_enabled {
-            self.cfl_alpha.dispatch(
+                let (ll_bx, ll_by, total_blocks, _, tiles_x_u32, tiles_y_u32) =
+                    adaptive::ll_block_dims(
+                        padded_w,
+                        padded_h,
+                        config.tile_size,
+                        config.wavelet_levels,
+                    );
+                let global_bx = ll_bx * tiles_x_u32;
+                let global_by = ll_by * tiles_y_u32;
+                self.weight_normalizer.dispatch(
+                    ctx,
+                    &mut cmd,
+                    &bufs.variance_buf,
+                    &bufs.wm_scratch,
+                    &bufs.weight_map_buf,
+                    global_bx,
+                    global_by,
+                    total_blocks,
+                    config.aq_strength,
+                );
+            }
+
+            // --- Y plane: quantize ---
+            let aq_dims = if aq_active {
+                let (_, ll_bx, _, tx) = adaptive::weight_map_dims(
+                    padded_w,
+                    padded_h,
+                    config.tile_size,
+                    config.wavelet_levels,
+                );
+                let ll_size = config.tile_size >> config.wavelet_levels;
+                let ll_block_size = AQ_LL_BLOCK_SIZE.min(ll_size);
+                Some((ll_block_size, ll_bx, tx))
+            } else {
+                None
+            };
+
+            let wm_param = aq_dims
+                .as_ref()
+                .map(|&(ll_bs, ll_bx, tx)| (&bufs.weight_map_buf, ll_bs, ll_bx, tx));
+
+            if config.cfl_enabled {
+                self.quantize.dispatch_adaptive(
+                    ctx,
+                    &mut cmd,
+                    &bufs.plane_c,
+                    &bufs.plane_b,
+                    padded_pixels as u32,
+                    config.quantization_step,
+                    config.dead_zone,
+                    true,
+                    padded_w,
+                    padded_h,
+                    config.tile_size,
+                    config.wavelet_levels,
+                    &weights_luma,
+                    wm_param,
+                    0.0,
+                );
+                self.quantize.dispatch_adaptive(
+                    ctx,
+                    &mut cmd,
+                    &bufs.plane_b,
+                    &bufs.plane_a,
+                    padded_pixels as u32,
+                    config.quantization_step,
+                    config.dead_zone,
+                    false,
+                    padded_w,
+                    padded_h,
+                    config.tile_size,
+                    config.wavelet_levels,
+                    &weights_luma,
+                    wm_param,
+                    0.0,
+                );
+                cmd.copy_buffer_to_buffer(&bufs.plane_a, 0, &bufs.recon_y, 0, plane_size);
+            } else if use_fused_qh {
+                let hist_bufs = bufs.fused_hist_bufs.as_ref().unwrap();
+                self.fused_qh.dispatch(
+                    ctx,
+                    &mut cmd,
+                    &bufs.plane_c,
+                    &bufs.plane_b,
+                    &hist_bufs[0],
+                    padded_w,
+                    padded_h,
+                    config.tile_size,
+                    config.wavelet_levels,
+                    config.quantization_step,
+                    config.dead_zone,
+                    &weights_luma,
+                    config.per_subband_entropy,
+                    1,
+                    wm_param,
+                );
+            } else {
+                self.quantize.dispatch_adaptive(
+                    ctx,
+                    &mut cmd,
+                    &bufs.plane_c,
+                    &bufs.plane_b,
+                    padded_pixels as u32,
+                    config.quantization_step,
+                    config.dead_zone,
+                    true,
+                    padded_w,
+                    padded_h,
+                    config.tile_size,
+                    config.wavelet_levels,
+                    &weights_luma,
+                    wm_param,
+                    0.0,
+                );
+            }
+            cmd.copy_buffer_to_buffer(&bufs.plane_b, 0, &bufs.mc_out, 0, plane_size);
+
+            // --- Co plane: wavelet + (CfL) + quantize ---
+            self.transform.forward(
                 ctx,
                 &mut cmd,
-                &bufs.recon_y,
-                &bufs.plane_c,
-                &bufs.raw_alpha,
-                &bufs.dq_alpha,
-                padded_w,
-                padded_h,
-                config.tile_size,
-                config.wavelet_levels,
-            );
-            self.cfl_forward.dispatch(
-                ctx,
-                &mut cmd,
-                &bufs.plane_c,
-                &bufs.recon_y,
-                &bufs.dq_alpha,
-                &bufs.plane_a,
-                padded_pixels as u32,
-                padded_w,
-                padded_h,
-                config.tile_size,
-                config.wavelet_levels,
-            );
-            self.quantize.dispatch_adaptive(
-                ctx,
-                &mut cmd,
-                &bufs.plane_a,
+                &bufs.co_plane,
                 &bufs.plane_b,
-                padded_pixels as u32,
-                config.quantization_step,
-                config.dead_zone,
-                true,
-                padded_w,
-                padded_h,
-                config.tile_size,
+                &bufs.plane_c,
+                &info,
                 config.wavelet_levels,
-                &weights_chroma,
-                wm_param,
-                0.0,
+                config.wavelet_type,
             );
-            cmd.copy_buffer_to_buffer(&bufs.raw_alpha, 0, &alpha_staging[1], 0, alpha_bytes);
-        } else if use_fused_qh {
-            let hist_bufs = bufs.fused_hist_bufs.as_ref().unwrap();
-            self.fused_qh.dispatch(
+
+            if config.cfl_enabled {
+                self.cfl_alpha.dispatch(
+                    ctx,
+                    &mut cmd,
+                    &bufs.recon_y,
+                    &bufs.plane_c,
+                    &bufs.raw_alpha,
+                    &bufs.dq_alpha,
+                    padded_w,
+                    padded_h,
+                    config.tile_size,
+                    config.wavelet_levels,
+                );
+                self.cfl_forward.dispatch(
+                    ctx,
+                    &mut cmd,
+                    &bufs.plane_c,
+                    &bufs.recon_y,
+                    &bufs.dq_alpha,
+                    &bufs.plane_a,
+                    padded_pixels as u32,
+                    padded_w,
+                    padded_h,
+                    config.tile_size,
+                    config.wavelet_levels,
+                );
+                self.quantize.dispatch_adaptive(
+                    ctx,
+                    &mut cmd,
+                    &bufs.plane_a,
+                    &bufs.plane_b,
+                    padded_pixels as u32,
+                    config.quantization_step,
+                    config.dead_zone,
+                    true,
+                    padded_w,
+                    padded_h,
+                    config.tile_size,
+                    config.wavelet_levels,
+                    &weights_chroma,
+                    wm_param,
+                    0.0,
+                );
+                cmd.copy_buffer_to_buffer(&bufs.raw_alpha, 0, &alpha_staging[0], 0, alpha_bytes);
+            } else if use_fused_qh {
+                let hist_bufs = bufs.fused_hist_bufs.as_ref().unwrap();
+                self.fused_qh.dispatch(
+                    ctx,
+                    &mut cmd,
+                    &bufs.plane_c,
+                    &bufs.plane_b,
+                    &hist_bufs[1],
+                    padded_w,
+                    padded_h,
+                    config.tile_size,
+                    config.wavelet_levels,
+                    config.quantization_step,
+                    config.dead_zone,
+                    &weights_chroma,
+                    config.per_subband_entropy,
+                    1,
+                    wm_param,
+                );
+            } else {
+                self.quantize.dispatch_adaptive(
+                    ctx,
+                    &mut cmd,
+                    &bufs.plane_c,
+                    &bufs.plane_b,
+                    padded_pixels as u32,
+                    config.quantization_step,
+                    config.dead_zone,
+                    true,
+                    padded_w,
+                    padded_h,
+                    config.tile_size,
+                    config.wavelet_levels,
+                    &weights_chroma,
+                    wm_param,
+                    0.0,
+                );
+            }
+            cmd.copy_buffer_to_buffer(&bufs.plane_b, 0, &bufs.ref_upload, 0, plane_size);
+
+            // --- Cg plane: wavelet + (CfL) + quantize ---
+            self.transform.forward(
                 ctx,
                 &mut cmd,
-                &bufs.plane_c,
+                &bufs.cg_plane,
                 &bufs.plane_b,
-                &hist_bufs[2],
-                padded_w,
-                padded_h,
-                config.tile_size,
-                config.wavelet_levels,
-                config.quantization_step,
-                config.dead_zone,
-                &weights_chroma,
-                config.per_subband_entropy,
-                1,
-                wm_param,
-            );
-        } else {
-            self.quantize.dispatch_adaptive(
-                ctx,
-                &mut cmd,
                 &bufs.plane_c,
-                &bufs.plane_b,
-                padded_pixels as u32,
-                config.quantization_step,
-                config.dead_zone,
-                true,
-                padded_w,
-                padded_h,
-                config.tile_size,
+                &info,
                 config.wavelet_levels,
-                &weights_chroma,
-                wm_param,
-                0.0,
+                config.wavelet_type,
             );
-        }
 
-        // Weight map copy to staging for deferred readback
-        wm_total_blocks = if aq_active {
-            let (total_blocks, _, _, _) = adaptive::weight_map_dims(
-                padded_w,
-                padded_h,
-                config.tile_size,
-                config.wavelet_levels,
-            );
-            let wm_bytes = (total_blocks as u64) * std::mem::size_of::<f32>() as u64;
-            cmd.copy_buffer_to_buffer(
-                &bufs.weight_map_buf,
-                0,
-                &bufs.weight_map_staging,
-                0,
-                wm_bytes,
-            );
-            total_blocks as usize
-        } else {
-            0
-        };
+            if config.cfl_enabled {
+                self.cfl_alpha.dispatch(
+                    ctx,
+                    &mut cmd,
+                    &bufs.recon_y,
+                    &bufs.plane_c,
+                    &bufs.raw_alpha,
+                    &bufs.dq_alpha,
+                    padded_w,
+                    padded_h,
+                    config.tile_size,
+                    config.wavelet_levels,
+                );
+                self.cfl_forward.dispatch(
+                    ctx,
+                    &mut cmd,
+                    &bufs.plane_c,
+                    &bufs.recon_y,
+                    &bufs.dq_alpha,
+                    &bufs.plane_a,
+                    padded_pixels as u32,
+                    padded_w,
+                    padded_h,
+                    config.tile_size,
+                    config.wavelet_levels,
+                );
+                self.quantize.dispatch_adaptive(
+                    ctx,
+                    &mut cmd,
+                    &bufs.plane_a,
+                    &bufs.plane_b,
+                    padded_pixels as u32,
+                    config.quantization_step,
+                    config.dead_zone,
+                    true,
+                    padded_w,
+                    padded_h,
+                    config.tile_size,
+                    config.wavelet_levels,
+                    &weights_chroma,
+                    wm_param,
+                    0.0,
+                );
+                cmd.copy_buffer_to_buffer(&bufs.raw_alpha, 0, &alpha_staging[1], 0, alpha_bytes);
+            } else if use_fused_qh {
+                let hist_bufs = bufs.fused_hist_bufs.as_ref().unwrap();
+                self.fused_qh.dispatch(
+                    ctx,
+                    &mut cmd,
+                    &bufs.plane_c,
+                    &bufs.plane_b,
+                    &hist_bufs[2],
+                    padded_w,
+                    padded_h,
+                    config.tile_size,
+                    config.wavelet_levels,
+                    config.quantization_step,
+                    config.dead_zone,
+                    &weights_chroma,
+                    config.per_subband_entropy,
+                    1,
+                    wm_param,
+                );
+            } else {
+                self.quantize.dispatch_adaptive(
+                    ctx,
+                    &mut cmd,
+                    &bufs.plane_c,
+                    &bufs.plane_b,
+                    padded_pixels as u32,
+                    config.quantization_step,
+                    config.dead_zone,
+                    true,
+                    padded_w,
+                    padded_h,
+                    config.tile_size,
+                    config.wavelet_levels,
+                    &weights_chroma,
+                    wm_param,
+                    0.0,
+                );
+            }
 
-        // Intra modes copy to staging for deferred readback
-        if config.intra_prediction {
-            let intra_modes = bufs.intra_modes_buf.as_ref().unwrap();
-            let intra_staging = bufs.intra_modes_staging.as_ref().unwrap();
-            let num_blocks = IntraPredictor::num_blocks(padded_w, padded_h);
-            let modes_bytes = (num_blocks as u64) * 4;
-            cmd.copy_buffer_to_buffer(intra_modes, 0, intra_staging, 0, modes_bytes);
-        }
+            // Weight map copy to staging for deferred readback
+            wm_total_blocks = if aq_active {
+                let (total_blocks, _, _, _) = adaptive::weight_map_dims(
+                    padded_w,
+                    padded_h,
+                    config.tile_size,
+                    config.wavelet_levels,
+                );
+                let wm_bytes = (total_blocks as u64) * std::mem::size_of::<f32>() as u64;
+                cmd.copy_buffer_to_buffer(
+                    &bufs.weight_map_buf,
+                    0,
+                    &bufs.weight_map_staging,
+                    0,
+                    wm_bytes,
+                );
+                total_blocks as usize
+            } else {
+                0
+            };
 
+            // Intra modes copy to staging for deferred readback
+            if config.intra_prediction {
+                let intra_modes = bufs.intra_modes_buf.as_ref().unwrap();
+                let intra_staging = bufs.intra_modes_staging.as_ref().unwrap();
+                let num_blocks = IntraPredictor::num_blocks(padded_w, padded_h);
+                let modes_bytes = (num_blocks as u64) * 4;
+                cmd.copy_buffer_to_buffer(intra_modes, 0, intra_staging, 0, modes_bytes);
+            }
         } // end wavelet path
 
         let t_wavelet_quant = t_start.elapsed();
@@ -901,11 +918,9 @@ impl EncoderPipeline {
         // GPU entropy: Rice already dispatched above, others create their own cmds
         if use_gpu_rice {
             // Readback from staging (GPU work already submitted above)
-            let mut rt = self.gpu_rice_encoder.finish_3planes_readback(
-                ctx,
-                &info,
-                entropy_levels,
-            );
+            let mut rt = self
+                .gpu_rice_encoder
+                .finish_3planes_readback(ctx, &info, entropy_levels);
             rice_tiles.append(&mut rt);
         } else if use_gpu_huffman {
             // GPU Huffman encode: 2-pass (histogram → codebook → encode)
@@ -950,11 +965,12 @@ impl EncoderPipeline {
             let wm_bytes = (wm_total_blocks * std::mem::size_of::<f32>()) as u64;
             let (tx, rx) = std::sync::mpsc::channel();
             let tx_c = tx.clone();
-            bufs.weight_map_staging
-                .slice(..wm_bytes)
-                .map_async(wgpu::MapMode::Read, move |result| {
+            bufs.weight_map_staging.slice(..wm_bytes).map_async(
+                wgpu::MapMode::Read,
+                move |result| {
                     tx_c.send(result).unwrap();
-                });
+                },
+            );
             drop(tx);
             ctx.device.poll(wgpu::Maintain::Wait);
             rx.recv().unwrap().unwrap();
@@ -1062,6 +1078,68 @@ impl EncoderPipeline {
             residual_stats_co: None,
             residual_stats_cg: None,
         }
+    }
+
+    /// Read back reference planes for debugging.
+    pub fn read_reference_planes(
+        &self,
+        ctx: &GpuContext,
+        width: u32,
+        height: u32,
+    ) -> Option<Vec<f32>> {
+        let cached = self.cached.as_ref()?;
+        let padded_w = (width + 255) & !255;
+        let padded_h = (height + 255) & !255;
+        let padded_pixels = (padded_w * padded_h) as usize;
+
+        let mut result: Vec<f32> = Vec::with_capacity(padded_pixels * 3);
+        for p in 0..3 {
+            result.extend(crate::gpu_util::read_buffer_f32(
+                ctx,
+                &cached.gpu_ref_planes[p],
+                padded_pixels,
+            ));
+        }
+        Some(result)
+    }
+
+    /// Read back the encoder's quantized Y-plane coefficients (after last P-frame encode).
+    /// Returns None if no frames have been encoded yet.
+    pub fn read_quantized_y(&self, ctx: &GpuContext, width: u32, height: u32) -> Option<Vec<f32>> {
+        let cached = self.cached.as_ref()?;
+        let padded_w = (width + 255) & !255;
+        let padded_h = (height + 255) & !255;
+        let padded_pixels = (padded_w * padded_h) as usize;
+        Some(crate::gpu_util::read_buffer_f32(
+            ctx,
+            &cached.recon_y,
+            padded_pixels,
+        ))
+    }
+
+    /// Read back the raw i32 motion vectors from the encoder's split MV staging buffer.
+    /// Returns the values exactly as they were on the GPU before i32→i16 conversion.
+    /// Used for diagnostics to verify the MV readback roundtrip.
+    pub fn read_raw_split_mvs_i32(&self, ctx: &GpuContext) -> Option<Vec<i32>> {
+        let cached = self.cached.as_ref()?;
+        let total = cached.split_total_blocks as usize;
+        let mv_count = total * 2; // 2 i32s per MV
+        let byte_size = cached.split_mv_staging_size;
+
+        let slice = cached.split_mv_staging_buf.slice(..byte_size);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            tx.send(result).unwrap();
+        });
+        ctx.device.poll(wgpu::Maintain::Wait);
+        rx.recv().unwrap().unwrap();
+
+        let data = slice.get_mapped_range();
+        let i32_data: &[i32] = bytemuck::cast_slice(&data);
+        let result = i32_data[..mv_count].to_vec();
+        drop(data);
+        cached.split_mv_staging_buf.unmap();
+        Some(result)
     }
 }
 

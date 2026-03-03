@@ -21,6 +21,8 @@
 6. ✅ **Frame ordering in container** — lowpass first, then highpass deepest-to-finest (L2→L1→L0). Each frame serialized as GP12 blob.
 7. ✅ **Keyframe seeking** — `seek_to_temporal_keyframe()` finds GOP by PTS. Lowpass frames marked as seekable (frame_role=0).
 8. ✅ **CLI integration** — `benchmark-sequence --temporal-wavelet haar -o file.gnv2` writes GNV2 container. Full roundtrip via `serialize_temporal_sequence` / `deserialize_temporal_sequence`.
+9. ✅ **CLI decode** — `decode-sequence` auto-detects GNV2 magic, decodes temporal wavelet GOPs, writes output PNGs.
+10. ✅ **WASM player** — `GnvPlayer` detects GNV2, decodes GOPs on demand via async `decode_temporal_group_rgba_wasm()` with per-frame GPU temporal Haar inverse + spatial inverse + pack u8 + async readback.
 
 ## Phase 3 — Temporal 5/3 lifting
 8. **WGSL temporal 5/3 shader** — predict + update over 4 frames. Reuse spatial 5/3 lifting pattern temporally.

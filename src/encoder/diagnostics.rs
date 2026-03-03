@@ -4,6 +4,7 @@
 //! Zero overhead when disabled — all collection is behind runtime checks.
 
 use crate::{CompressedFrame, EntropyData, FrameType, GpuContext, MotionField, ResidualStats};
+use super::cfl;
 
 /// Bit budget breakdown: where the bytes go in a compressed frame.
 #[derive(Debug, Default)]
@@ -731,5 +732,165 @@ pub fn print(diag: &FrameDiagnostics) {
     // Warnings
     for w in &diag.warnings {
         eprintln!("  {}", w);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Temporal wavelet potential diagnostic
+// ---------------------------------------------------------------------------
+
+/// Per-subband temporal redundancy statistics.
+pub struct TemporalSubbandStats {
+    /// Subband name: "LL", "LH", "HL", "HH"
+    pub name: &'static str,
+    /// % of coefficients where current == previous (exact match)
+    pub identical_pct: f64,
+    /// % of coefficients where |current - previous| <= dead_zone threshold
+    pub within_dz_pct: f64,
+    /// Mean of |current - previous| across all coefficients
+    pub mean_abs_diff: f64,
+}
+
+/// Temporal wavelet diagnostic for one frame (all 3 color planes).
+pub struct TemporalWaveletDiag {
+    pub y: Vec<TemporalSubbandStats>,
+    pub co: Vec<TemporalSubbandStats>,
+    pub cg: Vec<TemporalSubbandStats>,
+}
+
+/// Read a GPU staging buffer and return its contents as Vec<f32>.
+///
+/// The buffer must have been copied to with MAP_READ usage. After reading,
+/// the buffer is unmapped.
+pub fn read_plane_f32(
+    ctx: &GpuContext,
+    staging_buf: &wgpu::Buffer,
+    buf_size: u64,
+    pixel_count: usize,
+) -> Vec<f32> {
+    let buf_slice = staging_buf.slice(..buf_size);
+    let (tx, rx) = std::sync::mpsc::channel();
+    buf_slice.map_async(wgpu::MapMode::Read, move |result| {
+        tx.send(result).ok();
+    });
+    ctx.device.poll(wgpu::Maintain::Wait);
+    rx.recv().unwrap().unwrap();
+
+    let data = buf_slice.get_mapped_range();
+    let floats: &[f32] = bytemuck::cast_slice(&data);
+    let result = floats[..pixel_count.min(floats.len())].to_vec();
+    drop(data);
+    staging_buf.unmap();
+    result
+}
+
+/// Compare quantized wavelet coefficients of the original signal between
+/// consecutive frames. This measures temporal redundancy in the spatial
+/// wavelet domain — the quantity a temporal Haar wavelet would exploit.
+///
+/// Both `current` and `previous` must be quantized wavelet coefficients
+/// of the **original** (uncompensated) frame, not MC residuals.
+pub fn compute_temporal_wavelet(
+    current: &[f32],
+    previous: &[f32],
+    padded_w: u32,
+    padded_h: u32,
+    tile_size: u32,
+    num_levels: u32,
+    qstep: f32,
+) -> Vec<TemporalSubbandStats> {
+    // Aggregate into 4 groups: LL, LH, HL, HH
+    // Each accumulates across all levels and tiles.
+    struct Accum {
+        count: u64,
+        identical: u64,
+        within_dz: u64,
+        sum_abs_diff: f64,
+    }
+    let mut groups = [
+        Accum { count: 0, identical: 0, within_dz: 0, sum_abs_diff: 0.0 },
+        Accum { count: 0, identical: 0, within_dz: 0, sum_abs_diff: 0.0 },
+        Accum { count: 0, identical: 0, within_dz: 0, sum_abs_diff: 0.0 },
+        Accum { count: 0, identical: 0, within_dz: 0, sum_abs_diff: 0.0 },
+    ];
+
+    let dz_threshold = (qstep / 2.0) as f64;
+    let tiles_x = padded_w / tile_size;
+    let tiles_y = padded_h / tile_size;
+    let n = current.len().min(previous.len());
+
+    for i in 0..n {
+        let px = (i as u32) % padded_w;
+        let py = (i as u32) / padded_w;
+        let tx = px / tile_size;
+        let ty = py / tile_size;
+        if tx >= tiles_x || ty >= tiles_y {
+            continue;
+        }
+        let lx = px % tile_size;
+        let ly = py % tile_size;
+
+        let sb_idx = cfl::compute_subband_index(lx, ly, tile_size, num_levels);
+
+        // Map subband index to group: 0=LL, LH=1+level*3+0, HL=1+level*3+1, HH=1+level*3+2
+        let group = if sb_idx == 0 {
+            0 // LL
+        } else {
+            match (sb_idx - 1) % 3 {
+                0 => 1, // LH
+                1 => 2, // HL
+                _ => 3, // HH
+            }
+        };
+
+        let diff = (current[i] - previous[i]).abs() as f64;
+        let g = &mut groups[group];
+        g.count += 1;
+        if diff == 0.0 {
+            g.identical += 1;
+        }
+        if diff <= dz_threshold {
+            g.within_dz += 1;
+        }
+        g.sum_abs_diff += diff;
+    }
+
+    let names = ["LL", "LH", "HL", "HH"];
+    groups
+        .iter()
+        .enumerate()
+        .map(|(i, g)| {
+            let c = g.count.max(1) as f64;
+            TemporalSubbandStats {
+                name: names[i],
+                identical_pct: g.identical as f64 / c * 100.0,
+                within_dz_pct: g.within_dz as f64 / c * 100.0,
+                mean_abs_diff: g.sum_abs_diff / c,
+            }
+        })
+        .collect()
+}
+
+/// Print temporal wavelet potential diagnostic.
+pub fn print_temporal_wavelet(
+    frame_idx: usize,
+    frame_type: FrameType,
+    y_stats: &[TemporalSubbandStats],
+    co_stats: &[TemporalSubbandStats],
+    cg_stats: &[TemporalSubbandStats],
+) {
+    let ft = match frame_type {
+        FrameType::Intra => "I",
+        FrameType::Predicted => "P",
+        FrameType::Bidirectional => "B",
+    };
+    eprintln!("  Frame {} [{}] temporal_wavelet_potential:", frame_idx, ft);
+    for (label, stats) in [("Y", y_stats), ("Co", co_stats), ("Cg", cg_stats)] {
+        for s in stats {
+            eprintln!(
+                "    {:<2} {}: identical={:.1}%  within_dz={:.1}%  mean_abs_diff={:.2}",
+                label, s.name, s.identical_pct, s.within_dz_pct, s.mean_abs_diff,
+            );
+        }
     }
 }

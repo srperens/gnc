@@ -114,6 +114,23 @@ impl EncoderPipeline {
         let diag_enabled = diagnostics::enabled();
         let mut last_iframe_bytes: Option<usize> = None;
 
+        // Temporal wavelet diagnostic: staging buffers + previous frame state
+        let diag_twav_staging: Option<[wgpu::Buffer; 3]> = if diag_enabled {
+            Some(std::array::from_fn(|i| {
+                ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(
+                        ["diag_twav_y", "diag_twav_co", "diag_twav_cg"][i],
+                    ),
+                    size: (padded_pixels * std::mem::size_of::<f32>()) as u64,
+                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                })
+            }))
+        } else {
+            None
+        };
+        let mut prev_twav_coeffs: Option<[Vec<f32>; 3]> = None;
+
         let mut display_idx = 0;
         while display_idx < n {
             let is_keyframe = ki <= 1 || display_idx % ki == 0 || !has_reference;
@@ -150,6 +167,32 @@ impl EncoderPipeline {
                     last_iframe_bytes = Some(compressed.byte_size());
                     let d = diagnostics::collect(display_idx, &compressed, frame_config.quantization_step, last_iframe_bytes);
                     diagnostics::print(&d);
+
+                    // Temporal wavelet diagnostic: capture original-signal coefficients
+                    if let Some(ref stg) = diag_twav_staging {
+                        let coeffs = self.diag_original_wavelet_coefficients(
+                            ctx, &frame_data, padded_w, padded_h, padded_pixels,
+                            &info, &frame_config, stg,
+                        );
+                        if let Some(ref prev) = prev_twav_coeffs {
+                            let y_stats = diagnostics::compute_temporal_wavelet(
+                                &coeffs[0], &prev[0], padded_w, padded_h,
+                                config.tile_size, config.wavelet_levels, frame_config.quantization_step,
+                            );
+                            let co_stats = diagnostics::compute_temporal_wavelet(
+                                &coeffs[1], &prev[1], padded_w, padded_h,
+                                config.tile_size, config.wavelet_levels, frame_config.quantization_step,
+                            );
+                            let cg_stats = diagnostics::compute_temporal_wavelet(
+                                &coeffs[2], &prev[2], padded_w, padded_h,
+                                config.tile_size, config.wavelet_levels, frame_config.quantization_step,
+                            );
+                            diagnostics::print_temporal_wavelet(
+                                display_idx, FrameType::Intra, &y_stats, &co_stats, &cg_stats,
+                            );
+                        }
+                        prev_twav_coeffs = Some(coeffs);
+                    }
                 }
                 results[display_idx] = Some(compressed);
                 display_idx += 1;
@@ -182,6 +225,31 @@ impl EncoderPipeline {
                 if diag_enabled {
                     let d = diagnostics::collect(display_idx, &compressed, frame_config.quantization_step, last_iframe_bytes);
                     diagnostics::print(&d);
+
+                    if let Some(ref stg) = diag_twav_staging {
+                        let coeffs = self.diag_original_wavelet_coefficients(
+                            ctx, &frame_data, padded_w, padded_h, padded_pixels,
+                            &info, config, stg,
+                        );
+                        if let Some(ref prev) = prev_twav_coeffs {
+                            let y_stats = diagnostics::compute_temporal_wavelet(
+                                &coeffs[0], &prev[0], padded_w, padded_h,
+                                config.tile_size, config.wavelet_levels, config.quantization_step,
+                            );
+                            let co_stats = diagnostics::compute_temporal_wavelet(
+                                &coeffs[1], &prev[1], padded_w, padded_h,
+                                config.tile_size, config.wavelet_levels, config.quantization_step,
+                            );
+                            let cg_stats = diagnostics::compute_temporal_wavelet(
+                                &coeffs[2], &prev[2], padded_w, padded_h,
+                                config.tile_size, config.wavelet_levels, config.quantization_step,
+                            );
+                            diagnostics::print_temporal_wavelet(
+                                display_idx, FrameType::Predicted, &y_stats, &co_stats, &cg_stats,
+                            );
+                        }
+                        prev_twav_coeffs = Some(coeffs);
+                    }
                 }
                 results[display_idx] = Some(compressed);
                 display_idx += 1;
@@ -232,6 +300,31 @@ impl EncoderPipeline {
                 if diag_enabled {
                     let d = diagnostics::collect(p_display, &compressed, p_config.quantization_step, last_iframe_bytes);
                     diagnostics::print(&d);
+
+                    if let Some(ref stg) = diag_twav_staging {
+                        let coeffs = self.diag_original_wavelet_coefficients(
+                            ctx, &p_frame_data, padded_w, padded_h, padded_pixels,
+                            &info, config, stg,
+                        );
+                        if let Some(ref prev) = prev_twav_coeffs {
+                            let y_stats = diagnostics::compute_temporal_wavelet(
+                                &coeffs[0], &prev[0], padded_w, padded_h,
+                                config.tile_size, config.wavelet_levels, config.quantization_step,
+                            );
+                            let co_stats = diagnostics::compute_temporal_wavelet(
+                                &coeffs[1], &prev[1], padded_w, padded_h,
+                                config.tile_size, config.wavelet_levels, config.quantization_step,
+                            );
+                            let cg_stats = diagnostics::compute_temporal_wavelet(
+                                &coeffs[2], &prev[2], padded_w, padded_h,
+                                config.tile_size, config.wavelet_levels, config.quantization_step,
+                            );
+                            diagnostics::print_temporal_wavelet(
+                                p_display, FrameType::Predicted, &y_stats, &co_stats, &cg_stats,
+                            );
+                        }
+                        prev_twav_coeffs = Some(coeffs);
+                    }
                 }
                 results[p_display] = Some(compressed);
 
@@ -276,6 +369,31 @@ impl EncoderPipeline {
                     if diag_enabled {
                         let d = diagnostics::collect(b_display, &compressed, b_config.quantization_step, last_iframe_bytes);
                         diagnostics::print(&d);
+
+                        if let Some(ref stg) = diag_twav_staging {
+                            let coeffs = self.diag_original_wavelet_coefficients(
+                                ctx, &b_frame_data, padded_w, padded_h, padded_pixels,
+                                &info, config, stg,
+                            );
+                            if let Some(ref prev) = prev_twav_coeffs {
+                                let y_stats = diagnostics::compute_temporal_wavelet(
+                                    &coeffs[0], &prev[0], padded_w, padded_h,
+                                    config.tile_size, config.wavelet_levels, config.quantization_step,
+                                );
+                                let co_stats = diagnostics::compute_temporal_wavelet(
+                                    &coeffs[1], &prev[1], padded_w, padded_h,
+                                    config.tile_size, config.wavelet_levels, config.quantization_step,
+                                );
+                                let cg_stats = diagnostics::compute_temporal_wavelet(
+                                    &coeffs[2], &prev[2], padded_w, padded_h,
+                                    config.tile_size, config.wavelet_levels, config.quantization_step,
+                                );
+                                diagnostics::print_temporal_wavelet(
+                                    b_display, FrameType::Bidirectional, &y_stats, &co_stats, &cg_stats,
+                                );
+                            }
+                            prev_twav_coeffs = Some(coeffs);
+                        }
                     }
                     results[b_display] = Some(compressed);
                 }
@@ -319,6 +437,31 @@ impl EncoderPipeline {
                 if diag_enabled {
                     let d = diagnostics::collect(j, &compressed, p_config.quantization_step, last_iframe_bytes);
                     diagnostics::print(&d);
+
+                    if let Some(ref stg) = diag_twav_staging {
+                        let coeffs = self.diag_original_wavelet_coefficients(
+                            ctx, &rem_frame_data, padded_w, padded_h, padded_pixels,
+                            &info, config, stg,
+                        );
+                        if let Some(ref prev) = prev_twav_coeffs {
+                            let y_stats = diagnostics::compute_temporal_wavelet(
+                                &coeffs[0], &prev[0], padded_w, padded_h,
+                                config.tile_size, config.wavelet_levels, config.quantization_step,
+                            );
+                            let co_stats = diagnostics::compute_temporal_wavelet(
+                                &coeffs[1], &prev[1], padded_w, padded_h,
+                                config.tile_size, config.wavelet_levels, config.quantization_step,
+                            );
+                            let cg_stats = diagnostics::compute_temporal_wavelet(
+                                &coeffs[2], &prev[2], padded_w, padded_h,
+                                config.tile_size, config.wavelet_levels, config.quantization_step,
+                            );
+                            diagnostics::print_temporal_wavelet(
+                                j, FrameType::Predicted, &y_stats, &co_stats, &cg_stats,
+                            );
+                        }
+                        prev_twav_coeffs = Some(coeffs);
+                    }
                 }
                 results[j] = Some(compressed);
             }
@@ -1721,5 +1864,110 @@ impl EncoderPipeline {
     fn swap_ref_planes(&mut self) {
         let bufs = self.cached.as_mut().unwrap();
         std::mem::swap(&mut bufs.gpu_ref_planes, &mut bufs.gpu_bwd_ref_planes);
+    }
+
+    /// Diagnostic: compute quantized wavelet coefficients of the original signal.
+    ///
+    /// Runs a separate GPU pass: pad → color → deinterleave → wavelet → quantize
+    /// → staging copy for all 3 planes. Returns [Y, Co, Cg] quantized coefficients.
+    ///
+    /// Uses I-frame quantization parameters (perceptual weights, normal dead_zone)
+    /// for consistent frame-to-frame comparison regardless of frame type.
+    #[allow(clippy::too_many_arguments)]
+    fn diag_original_wavelet_coefficients(
+        &mut self,
+        ctx: &GpuContext,
+        rgb_data: &[f32],
+        padded_w: u32,
+        padded_h: u32,
+        padded_pixels: usize,
+        info: &FrameInfo,
+        config: &CodecConfig,
+        staging: &[wgpu::Buffer; 3],
+    ) -> [Vec<f32>; 3] {
+        let plane_size = (padded_pixels * std::mem::size_of::<f32>()) as u64;
+        let bufs = self.cached.as_ref().unwrap();
+
+        ctx.queue
+            .write_buffer(&bufs.raw_input_buf, 0, bytemuck::cast_slice(rgb_data));
+
+        let mut cmd = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("diag_temporal_wavelet"),
+            });
+
+        self.dispatch_gpu_pad_cached(ctx, &mut cmd, padded_w, padded_h);
+        self.color.dispatch(
+            ctx,
+            &mut cmd,
+            &bufs.input_buf,
+            &bufs.color_out,
+            padded_w,
+            padded_h,
+            true,
+            config.is_lossless(),
+        );
+        self.deinterleaver.dispatch(
+            ctx,
+            &mut cmd,
+            &bufs.color_out,
+            &bufs.plane_a,
+            &bufs.co_plane,
+            &bufs.cg_plane,
+            padded_pixels as u32,
+        );
+
+        let weights_luma = config.subband_weights.pack_weights();
+        let weights_chroma = config.subband_weights.pack_weights_chroma();
+
+        let planes: [&wgpu::Buffer; 3] = [&bufs.plane_a, &bufs.co_plane, &bufs.cg_plane];
+        for (p, &cur_plane) in planes.iter().enumerate() {
+            let weights = if p == 0 {
+                &weights_luma
+            } else {
+                &weights_chroma
+            };
+
+            // wavelet forward: cur_plane(read-only) → plane_b(scratch) → plane_c(output)
+            self.transform.forward(
+                ctx,
+                &mut cmd,
+                cur_plane,
+                &bufs.plane_b,
+                &bufs.plane_c,
+                info,
+                config.wavelet_levels,
+                config.wavelet_type,
+            );
+
+            // quantize: plane_c → recon_y
+            self.quantize.dispatch(
+                ctx,
+                &mut cmd,
+                &bufs.plane_c,
+                &bufs.recon_y,
+                padded_pixels as u32,
+                config.quantization_step,
+                config.dead_zone,
+                true,
+                padded_w,
+                padded_h,
+                config.tile_size,
+                config.wavelet_levels,
+                weights,
+            );
+
+            // copy to staging
+            cmd.copy_buffer_to_buffer(&bufs.recon_y, 0, &staging[p], 0, plane_size);
+        }
+
+        ctx.queue.submit(Some(cmd.finish()));
+
+        [
+            diagnostics::read_plane_f32(ctx, &staging[0], plane_size, padded_pixels),
+            diagnostics::read_plane_f32(ctx, &staging[1], plane_size, padded_pixels),
+            diagnostics::read_plane_f32(ctx, &staging[2], plane_size, padded_pixels),
+        ]
     }
 }

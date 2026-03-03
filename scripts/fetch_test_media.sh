@@ -30,9 +30,14 @@ BASE_URL="https://media.xiph.org/video/derf/y4m"
 # Each entry: name|y4m_filename|frames|description
 # frames=0 means use FRAME_COUNT default (30)
 
-CATALOG="ducks_take_off|ducks_take_off_1080p50.y4m|0|High motion + fine detail (classic stress test)
-crowd_run|crowd_run_1080p50.y4m|0|Complex crowd scene, many moving objects
-park_joy|park_joy_1080p50.y4m|0|Foliage texture + motion (hard to compress)
+CATALOG="ducks_take_off|ducks_take_off_1080p50.y4m|500|High motion + fine detail (classic stress test)
+crowd_run|crowd_run_1080p50.y4m|500|Complex crowd scene, many moving objects — torture test
+park_joy|park_joy_1080p50.y4m|500|Foliage texture + camera pan (hard to compress)
+old_town_cross|old_town_cross_1080p50.y4m|500|Pedestrians crossing street, urban scene
+rush_hour|rush_hour_1080p25.y4m|500|City traffic, moderate motion, broadcast-typical
+pedestrian_area|pedestrian_area_1080p25.y4m|375|Pedestrians walking, complex motion, urban
+station2|station2_1080p25.y4m|300|Train station, people and structure
+stockholm|720p5994_stockholm_ter.y4m|600|SVT Stockholm cityscape, camera pan, 720p60
 sintel_trailer|sintel_trailer_2k_1080p24.y4m|0|CGI, mixed dark/bright scenes
 big_buck_bunny|big_buck_bunny_1080p24.y4m.xz|2880|BBB 2 min @ 24fps — animation reference (xz-compressed)"
 

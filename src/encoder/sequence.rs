@@ -2536,6 +2536,12 @@ impl EncoderPipeline {
     /// Like `encode_from_wavelet_coeffs` but takes GPU buffers instead of CPU slices.
     /// This avoids the CPU readback + re-upload roundtrip for temporal wavelet.
     #[allow(clippy::too_many_arguments)]
+    /// Encode wavelet coefficients from GPU buffers using the fast GPU entropy path.
+    ///
+    /// All 3 planes are quantized in a single command encoder (using mc_out, ref_upload,
+    /// plane_b as per-plane output buffers — matching the normal encode() layout), then
+    /// GPU Rice encode is dispatched in the same submit. This gives ~1 submit per frame
+    /// instead of 3 submits + 3 full-plane readbacks for CPU entropy.
     fn encode_from_gpu_wavelet_planes(
         &mut self,
         ctx: &GpuContext,
@@ -2547,49 +2553,31 @@ impl EncoderPipeline {
         padded_pixels: usize,
     ) -> CompressedFrame {
         let plane_size = (padded_pixels * std::mem::size_of::<f32>()) as u64;
-        let tiles_x = info.tiles_x() as usize;
-        let tiles_y = info.tiles_y() as usize;
-        let tile_size = config.tile_size as usize;
-        let entropy_mode = EntropyMode::from_config(config);
         let weights_luma = config.subband_weights.pack_weights();
         let weights_chroma = config.subband_weights.pack_weights_chroma();
 
-        let mut rans_tiles: Vec<rans::InterleavedRansTile> = Vec::new();
-        let mut subband_tiles: Vec<rans::SubbandRansTile> = Vec::new();
-        let mut bp_tiles: Vec<bitplane::BitplaneTile> = Vec::new();
-        let mut rice_tiles: Vec<rice::RiceTile> = Vec::new();
-        let mut huffman_tiles: Vec<huffman::HuffmanTile> = Vec::new();
+        let bufs = self.cached.as_ref().unwrap();
+        // Quantized output destinations (same layout as normal encode):
+        // Y → mc_out, Co → ref_upload, Cg → plane_b
+        let quant_dests: [&wgpu::Buffer; 3] = [&bufs.mc_out, &bufs.ref_upload, &bufs.plane_b];
 
-        let staging: [wgpu::Buffer; 3] = std::array::from_fn(|idx| {
-            ctx.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(
-                    ["tw_gpu_quant_y", "tw_gpu_quant_co", "tw_gpu_quant_cg"][idx],
-                ),
-                size: plane_size,
-                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            })
-        });
+        let mut cmd = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("tw_gpu_quant_entropy"),
+            });
 
+        // Quantize all 3 planes sequentially in one command encoder.
+        // plane_c is reused as input scratch — each copy overwrites it, but the
+        // previous quantize output is already in its destination buffer.
         for p in 0..3 {
-            let weights = if p == 0 {
-                &weights_luma
-            } else {
-                &weights_chroma
-            };
-            let bufs = self.cached.as_ref().unwrap();
-            let mut cmd = ctx
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("tw_gpu_quantize"),
-                });
-            // Copy from GPU frame buffer to plane_c (quantizer input)
+            let weights = if p == 0 { &weights_luma } else { &weights_chroma };
             cmd.copy_buffer_to_buffer(plane_bufs[p], 0, &bufs.plane_c, 0, plane_size);
             self.quantize.dispatch(
                 ctx,
                 &mut cmd,
                 &bufs.plane_c,
-                &bufs.recon_y,
+                quant_dests[p],
                 padded_pixels as u32,
                 config.quantization_step,
                 config.dead_zone,
@@ -2600,44 +2588,30 @@ impl EncoderPipeline {
                 config.wavelet_levels,
                 weights,
             );
-            cmd.copy_buffer_to_buffer(&bufs.recon_y, 0, &staging[p], 0, plane_size);
-            ctx.queue.submit(Some(cmd.finish()));
         }
 
-        for stg in &staging {
-            let quantized =
-                diagnostics::read_plane_f32(ctx, stg, plane_size, padded_pixels);
-            entropy_helpers::entropy_encode_tiles(
-                &quantized,
-                padded_w as usize,
-                tiles_x,
-                tiles_y,
-                tile_size,
-                &entropy_mode,
-                config.tile_size,
-                config.wavelet_levels,
-                &mut rans_tiles,
-                &mut subband_tiles,
-                &mut bp_tiles,
-                &mut rice_tiles,
-                &mut huffman_tiles,
-            );
-        }
+        // GPU Rice encode — dispatched into the same command encoder
+        self.gpu_rice_encoder.dispatch_3planes_to_cmd(
+            ctx,
+            &mut cmd,
+            quant_dests,
+            info,
+            config.wavelet_levels,
+        );
 
-        let entropy = match entropy_mode {
-            EntropyMode::Bitplane => EntropyData::Bitplane(bp_tiles),
-            EntropyMode::SubbandRans | EntropyMode::SubbandRansCtx => {
-                EntropyData::SubbandRans(subband_tiles)
-            }
-            EntropyMode::Rans => EntropyData::Rans(rans_tiles),
-            EntropyMode::Rice => EntropyData::Rice(rice_tiles),
-            EntropyMode::Huffman => EntropyData::Huffman(huffman_tiles),
-        };
+        ctx.queue.submit(Some(cmd.finish()));
+
+        // Readback compressed Rice tiles (small — KB not MB)
+        let mut rice_tiles = self.gpu_rice_encoder.finish_3planes_readback(
+            ctx,
+            info,
+            config.wavelet_levels,
+        );
 
         CompressedFrame {
             info: *info,
             config: config.clone(),
-            entropy,
+            entropy: EntropyData::Rice(rice_tiles),
             cfl_alphas: None,
             weight_map: None,
             frame_type: FrameType::Intra,

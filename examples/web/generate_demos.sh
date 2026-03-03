@@ -100,6 +100,28 @@ encode "ducks_q75" \
     -q 75 -n 300 --keyframe-interval 8 \
     --fps-num 50 --fps-den 1
 
+# --- Broadcast test sequences ---
+
+encode "rush_hour" \
+    "$SEQ/rush_hour/frame_%04d.png" \
+    -q 75 -n 200 --keyframe-interval 8 \
+    --fps-num 25 --fps-den 1
+
+encode "old_town_cross" \
+    "$SEQ/old_town_cross/frame_%04d.png" \
+    -q 75 -n 200 --keyframe-interval 8 \
+    --fps-num 50 --fps-den 1
+
+encode "stockholm" \
+    "$SEQ/stockholm/frame_%04d.png" \
+    -q 75 -n 200 --keyframe-interval 8 \
+    --fps-num 60000 --fps-den 1001
+
+encode "pedestrian_area" \
+    "$SEQ/pedestrian_area/frame_%04d.png" \
+    -q 75 -n 200 --keyframe-interval 8 \
+    --fps-num 25 --fps-den 1
+
 # --- Long-form demos ---
 
 encode "bbb_2min_q5" \

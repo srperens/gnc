@@ -4,6 +4,47 @@
 
 ---
 
+## 2026-03-03: GPU Temporal Haar Wavelet — Phase 1 Complete
+
+### Hypothesis
+Moving temporal Haar from CPU to GPU should eliminate the coefficient readback/re-upload roundtrip, improving encode throughput while maintaining quality.
+
+### Implementation
+- **WGSL shader** (`temporal_haar.wgsl`): Per-element Haar lifting (forward/inverse), @workgroup_size(256)
+- **Rust host** (`encoder/temporal_haar.rs`): Pipeline + dispatch wrapper
+- **Encoder**: Spatial wavelet output → per-frame GPU buffers → GPU multilevel Haar → GPU quantize → CPU entropy
+- **Decoder**: CPU entropy → GPU dequant → GPU inverse Haar → GPU inverse wavelet → RGB
+
+### Critical Bug Found: Buffer Aliasing in Multilevel Haar
+In multilevel decomposition (gop_size > 2), pair 0's output was writing to buffer positions needed by pair 1 as input within the same level. Example for gop=8, level 0:
+- pair 0: forward(buf[0], buf[1]) → writes low to buf[0], high to buf[4]
+- pair 2: forward(buf[4], buf[5]) — buf[4] already overwritten!
+
+**Fix**: Snapshot all inputs to separate buffers before processing each level. Read from snapshot, write to original positions. Cost: ~15 buffer copies (DMA only, ~0.2ms).
+
+### Results (crowd_run 8 frames, q=75, mul=2.0)
+
+| Metric | All-I | I+P+B | Temporal Haar GPU |
+|---|---|---|---|
+| Bitrate | 7.72 bpp | 6.40 bpp | **3.91 bpp** |
+| PSNR | 40.69 dB | 39.02 dB | 35.82 dB |
+| Temporal consistency | 0.02 dB drop | 2.55 dB drop | **0.62 dB drop** |
+| Bitrate savings vs I | baseline | -17% | **-49%** |
+
+### Analysis
+- 49% bitrate reduction vs all-I with ~5 dB PSNR cost — matches CPU-staging benchmarks from roadmap
+- Temporal consistency (0.62 dB max drop) far better than I+P+B (2.55 dB)
+- SSIM remains excellent: 0.9984 avg
+- GPU Haar roundtrip verified bit-exact: mean_abs_diff 0.000001 (floating point noise)
+
+### Files Changed
+- `src/shaders/temporal_haar.wgsl` (new)
+- `src/encoder/temporal_haar.rs` (new)
+- `src/encoder/{mod,pipeline,sequence}.rs`
+- `src/decoder/pipeline.rs`
+
+---
+
 ## 2026-03-02: P-frame Divergence Investigation — False Alarm
 
 ### Hypothesis

@@ -1574,6 +1574,289 @@ impl DecoderPipeline {
 
         rgba
     }
+
+    /// Decode a temporal wavelet group (GOP) to RGBA u8 frames, asynchronously.
+    /// WASM-compatible: uses async readback instead of Maintain::Wait.
+    pub async fn decode_temporal_group_rgba_wasm(
+        &self,
+        ctx: &GpuContext,
+        group: &crate::TemporalGroup,
+        mode: crate::TemporalTransform,
+        gop_size: usize,
+    ) -> Vec<Vec<u8>> {
+        let _ = mode; // currently only Haar is supported
+        let info = &group.low_frame.info;
+        let config = &group.low_frame.config;
+        let padded_w = info.padded_width();
+        let padded_h = info.padded_height();
+        let padded_pixels = (padded_w * padded_h) as usize;
+        let plane_size = (padded_pixels * std::mem::size_of::<f32>()) as u64;
+        let plane_usage = wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC;
+
+        let num_levels = group.high_frames.len();
+
+        // Allocate per-frame GPU buffers [frame][plane]
+        let tw_frame_bufs: Vec<[wgpu::Buffer; 3]> = (0..gop_size)
+            .map(|j| {
+                std::array::from_fn(|p| {
+                    ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some(&format!("tw_wasm_{}_{}", j, p)),
+                        size: plane_size,
+                        usage: plane_usage,
+                        mapped_at_creation: false,
+                    })
+                })
+            })
+            .collect();
+        // Snapshot buffers to avoid read-after-write aliasing in multilevel inverse
+        let tw_snapshot: Vec<wgpu::Buffer> = (0..gop_size)
+            .map(|s| {
+                ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(&format!("tw_wasm_snap_{}", s)),
+                    size: plane_size,
+                    usage: plane_usage,
+                    mapped_at_creation: false,
+                })
+            })
+            .collect();
+
+        // Decode low frame -> buf[0]
+        self.decode_wavelet_coeffs_to_gpu(
+            ctx,
+            &group.low_frame,
+            [
+                &tw_frame_bufs[0][0],
+                &tw_frame_bufs[0][1],
+                &tw_frame_bufs[0][2],
+            ],
+        );
+
+        // Decode high frames -> appropriate buffer positions
+        for lvl in 0..num_levels {
+            let count = gop_size >> (lvl + 1);
+            let start = gop_size >> (lvl + 1);
+            for idx in 0..count {
+                let buf_idx = start + idx;
+                self.decode_wavelet_coeffs_to_gpu(
+                    ctx,
+                    &group.high_frames[lvl][idx],
+                    [
+                        &tw_frame_bufs[buf_idx][0],
+                        &tw_frame_bufs[buf_idx][1],
+                        &tw_frame_bufs[buf_idx][2],
+                    ],
+                );
+            }
+        }
+
+        // GPU temporal Haar inverse, per plane
+        #[allow(clippy::needless_range_loop)]
+        for p in 0..3 {
+            let mut cmd = ctx
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("tw_wasm_temporal_haar"),
+                });
+            let mut current_count = 1usize;
+            for _level in (0..num_levels).rev() {
+                let pairs = current_count;
+                // Snapshot lows + highs for this level
+                for j in 0..(2 * current_count) {
+                    cmd.copy_buffer_to_buffer(
+                        &tw_frame_bufs[j][p], 0, &tw_snapshot[j], 0, plane_size,
+                    );
+                }
+                // Read from snapshot, write directly to tw_frame_bufs
+                for pair in 0..pairs {
+                    self.temporal_haar.dispatch(
+                        ctx,
+                        &mut cmd,
+                        &tw_snapshot[pair],
+                        &tw_snapshot[pairs + pair],
+                        &tw_frame_bufs[pair * 2][p],
+                        &tw_frame_bufs[pair * 2 + 1][p],
+                        padded_pixels as u32,
+                        false, // inverse
+                    );
+                }
+                current_count *= 2;
+            }
+            ctx.queue.submit(Some(cmd.finish()));
+        }
+
+        // Per-frame: GPU inverse wavelet + color + pack + async readback
+        let w = info.width;
+        let h = info.height;
+        let output_pixels = w * h;
+        let packed_u32s = (w * h * 3).div_ceil(4);
+        let packed_byte_size = (packed_u32s as u64) * 4;
+        let total_rgb = (w * h * 3) as usize;
+
+        let mut results: Vec<Vec<u8>> = Vec::with_capacity(gop_size);
+
+        #[allow(clippy::needless_range_loop)]
+        for fi in 0..gop_size {
+            self.ensure_cached(ctx, padded_w, padded_h, w, h, info.tile_size);
+
+            let receiver = {
+                let cached = self.cached.borrow();
+                let bufs = cached.as_ref().unwrap();
+
+                // Inverse wavelet per plane
+                for p in 0..3 {
+                    let mut cmd = ctx.device.create_command_encoder(
+                        &wgpu::CommandEncoderDescriptor {
+                            label: Some("tw_wasm_inv_wavelet"),
+                        },
+                    );
+                    cmd.copy_buffer_to_buffer(
+                        &tw_frame_bufs[fi][p], 0, &bufs.scratch_b, 0, plane_size,
+                    );
+                    self.transform.inverse(
+                        ctx,
+                        &mut cmd,
+                        &bufs.scratch_b,
+                        &bufs.scratch_c,
+                        &bufs.scratch_a,
+                        info,
+                        config.wavelet_levels,
+                        config.wavelet_type,
+                    );
+                    cmd.copy_buffer_to_buffer(
+                        &bufs.scratch_a, 0, &bufs.plane_results[p], 0, plane_size,
+                    );
+                    ctx.queue.submit(Some(cmd.finish()));
+                }
+
+                // Interleave + inverse color + crop + pack
+                let mut cmd = ctx.device.create_command_encoder(
+                    &wgpu::CommandEncoderDescriptor {
+                        label: Some("tw_wasm_postprocess"),
+                    },
+                );
+                self.interleaver.dispatch(
+                    ctx,
+                    &mut cmd,
+                    &bufs.plane_results[0],
+                    &bufs.plane_results[1],
+                    &bufs.plane_results[2],
+                    &bufs.ycocg_buf,
+                    padded_pixels as u32,
+                );
+                self.color.dispatch(
+                    ctx,
+                    &mut cmd,
+                    &bufs.ycocg_buf,
+                    &bufs.rgb_out_buf,
+                    padded_w,
+                    padded_h,
+                    false,
+                    config.is_lossless(),
+                );
+                // Crop
+                {
+                    let crop_bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("crop_bg_tw_wasm"),
+                        layout: &self.crop_bgl,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: bufs.crop_params_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: bufs.rgb_out_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: bufs.cropped_buf.as_entire_binding(),
+                            },
+                        ],
+                    });
+                    let workgroups = output_pixels.div_ceil(256);
+                    let mut pass = cmd.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("crop_tw_wasm"),
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(&self.crop_pipeline);
+                    pass.set_bind_group(0, &crop_bg, &[]);
+                    pass.dispatch_workgroups(workgroups, 1, 1);
+                }
+                // Pack f32 -> u8
+                {
+                    let pack_bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("pack_bg_tw_wasm"),
+                        layout: &self.pack_bgl,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: bufs.pack_params_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: bufs.cropped_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: bufs.packed_u8_buf.as_entire_binding(),
+                            },
+                        ],
+                    });
+                    let workgroups = packed_u32s.div_ceil(256);
+                    let mut pass = cmd.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("pack_tw_wasm"),
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(&self.pack_pipeline);
+                    pass.set_bind_group(0, &pack_bg, &[]);
+                    pass.dispatch_workgroups(workgroups, 1, 1);
+                }
+                cmd.copy_buffer_to_buffer(
+                    &bufs.packed_u8_buf, 0, &bufs.staging_u8, 0, packed_byte_size,
+                );
+                ctx.queue.submit(Some(cmd.finish()));
+
+                // Async readback
+                let slice = bufs.staging_u8.slice(..);
+                let (sender, receiver) = futures_channel::oneshot::channel();
+                let mut sender = Some(sender);
+                slice.map_async(wgpu::MapMode::Read, move |result| {
+                    if let Some(tx) = sender.take() {
+                        let _ = tx.send(result);
+                    }
+                });
+                ctx.device.poll(wgpu::Maintain::Poll);
+                receiver
+            }; // cached borrow dropped before await
+
+            receiver.await.unwrap().unwrap();
+
+            let cached = self.cached.borrow();
+            let bufs = cached.as_ref().unwrap();
+            let slice = bufs.staging_u8.slice(..);
+            let data = slice.get_mapped_range();
+            let bytes: &[u8] = &data;
+            let rgb = &bytes[..total_rgb];
+
+            let pixel_count = (w * h) as usize;
+            let mut rgba = Vec::with_capacity(pixel_count * 4);
+            for i in 0..pixel_count {
+                rgba.push(rgb[i * 3]);
+                rgba.push(rgb[i * 3 + 1]);
+                rgba.push(rgb[i * 3 + 2]);
+                rgba.push(255);
+            }
+            drop(data);
+            bufs.staging_u8.unmap();
+            drop(cached);
+
+            results.push(rgba);
+        }
+
+        results
+    }
 }
 
 #[cfg(test)]

@@ -813,6 +813,7 @@ pub mod wasm {
         decoder: crate::decoder::pipeline::DecoderPipeline,
         data: Vec<u8>,
         header: Option<crate::format::SequenceHeader>,
+        temporal_header: Option<crate::format::TemporalSequenceHeader>,
         width: u32,
         height: u32,
         frame_count: u32,
@@ -839,9 +840,34 @@ pub mod wasm {
                 .map_err(|e| JsValue::from_str(&e))?;
             let decoder = crate::decoder::pipeline::DecoderPipeline::new(&ctx);
 
+            let is_gnv2 = data.len() >= 4 && &data[0..4] == b"GNV2";
             let is_gnv = data.len() >= 4 && &data[0..4] == b"GNV1";
 
-            if is_gnv {
+            if is_gnv2 {
+                let header = crate::format::deserialize_temporal_sequence_header(&data);
+                let width = header.width;
+                let height = header.height;
+                let frame_count = header.frame_count;
+                let fps = header.fps();
+                Ok(GnvPlayer {
+                    ctx,
+                    decoder,
+                    data,
+                    header: None,
+                    temporal_header: Some(header),
+                    width,
+                    height,
+                    frame_count,
+                    fps,
+                    current_frame: 0,
+                    buffered_frames: std::collections::BTreeMap::new(),
+                    surface: None,
+                    blit_pipeline: None,
+                    blit_bgl: None,
+                    blit_sampler: None,
+                    buffered_textures: std::collections::BTreeMap::new(),
+                })
+            } else if is_gnv {
                 let header = crate::format::deserialize_sequence_header(&data);
                 let width = header.width;
                 let height = header.height;
@@ -852,6 +878,7 @@ pub mod wasm {
                     decoder,
                     data,
                     header: Some(header),
+                    temporal_header: None,
                     width,
                     height,
                     frame_count,
@@ -874,6 +901,7 @@ pub mod wasm {
                     decoder,
                     data,
                     header: None,
+                    temporal_header: None,
                     width,
                     height,
                     frame_count: 1,
@@ -933,6 +961,58 @@ pub mod wasm {
             if let Some(rgba) = self.buffered_frames.remove(&self.current_frame) {
                 self.current_frame += 1;
                 return Ok(rgba);
+            }
+
+            // GNV2 temporal wavelet
+            if let Some(ref th) = self.temporal_header {
+                // Check buffer first
+                if let Some(rgba) = self.buffered_frames.remove(&self.current_frame) {
+                    self.current_frame += 1;
+                    return Ok(rgba);
+                }
+
+                let gop_size = th.gop_size as usize;
+                let num_groups = th.num_groups();
+                let gop_idx = self.current_frame / gop_size;
+
+                if gop_idx < num_groups {
+                    let group = crate::format::deserialize_temporal_group(
+                        &self.data, th, gop_idx,
+                    );
+                    let frames = self.decoder.decode_temporal_group_rgba_wasm(
+                        &self.ctx, &group, th.temporal_transform, gop_size,
+                    ).await;
+
+                    let base = gop_idx * gop_size;
+                    for (i, rgba) in frames.into_iter().enumerate() {
+                        self.buffered_frames.insert(base + i, rgba);
+                    }
+                    let rgba = self.buffered_frames.remove(&self.current_frame).unwrap();
+                    self.current_frame += 1;
+                    return Ok(rgba);
+                } else {
+                    // Tail I-frames
+                    let tail_entries: Vec<_> = th.index.iter()
+                        .filter(|e| e.frame_role == 2)
+                        .collect();
+                    let tail_idx = self.current_frame - num_groups * gop_size;
+                    if tail_idx < tail_entries.len() {
+                        let entry = &tail_entries[tail_idx];
+                        let start = entry.offset as usize;
+                        let end = start + entry.size as usize;
+                        let frame = crate::format::deserialize_compressed(
+                            &self.data[start..end],
+                        );
+                        let rgba = self.decoder.decode_rgba_wasm(&self.ctx, &frame).await;
+                        self.current_frame += 1;
+                        return Ok(rgba);
+                    }
+                    // Past end of all frames — wrap to start. The next call
+                    // to decode_next_frame will decode from frame 0.
+                    self.current_frame = 0;
+                    self.buffered_frames.clear();
+                    return Err(JsValue::from_str("End of GNV2 sequence, rewound to frame 0"));
+                }
             }
 
             if self.header.is_none() {

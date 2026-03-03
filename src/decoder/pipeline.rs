@@ -2293,24 +2293,18 @@ impl DecoderPipeline {
         let cached = self.cached.borrow();
         let bufs = cached.as_ref().unwrap();
 
-        // Inverse wavelet per plane
+        // Inverse wavelet per plane + postprocess — single submit
+        let mut cmd = ctx.device.create_command_encoder(
+            &wgpu::CommandEncoderDescriptor { label: Some("tw_pres") },
+        );
         for (p, plane_buf) in plane_bufs.iter().enumerate() {
-            let mut cmd = ctx.device.create_command_encoder(
-                &wgpu::CommandEncoderDescriptor { label: Some("tw_pres_inv_wavelet") },
-            );
             cmd.copy_buffer_to_buffer(plane_buf, 0, &bufs.scratch_b, 0, plane_size);
             self.transform.inverse(
                 ctx, &mut cmd, &bufs.scratch_b, &bufs.scratch_c, &bufs.scratch_a,
                 info, config.wavelet_levels, config.wavelet_type,
             );
             cmd.copy_buffer_to_buffer(&bufs.scratch_a, 0, &bufs.plane_results[p], 0, plane_size);
-            ctx.queue.submit(Some(cmd.finish()));
         }
-
-        // Interleave + inverse color + crop + buf_to_tex
-        let mut cmd = ctx.device.create_command_encoder(
-            &wgpu::CommandEncoderDescriptor { label: Some("tw_pres_postprocess") },
-        );
         self.interleaver.dispatch(
             ctx, &mut cmd,
             &bufs.plane_results[0], &bufs.plane_results[1], &bufs.plane_results[2],

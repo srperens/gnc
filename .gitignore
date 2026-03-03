@@ -18,4 +18,5 @@ examples/web/*.gnv
 examples/web/*.gnv2
 examples/web/*.gnc
 examples/web/*.diag
+examples/web/*.pem
 .aider*

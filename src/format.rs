@@ -1115,3 +1115,803 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
         tile_crcs,
     }
 }
+
+// ---- GNV2 Temporal Wavelet Sequence Container Format ----
+//
+// File layout:
+//   File Header (34 bytes, fixed):
+//     magic: "GNV2" (4 bytes)
+//     version: u32 LE           (currently 1)
+//     width: u32 LE
+//     height: u32 LE
+//     frame_count: u32 LE       (total original frames)
+//     framerate_num: u32 LE
+//     framerate_den: u32 LE
+//     temporal_transform: u8    (0=none, 1=haar, 2=legall53)
+//     gop_size: u8              (2, 4, 8)
+//     highpass_qstep_mul: f32   (e.g. 2.0)
+//
+//   Frame Index Table (N entries, 22 bytes each):
+//     offset: u64 LE            (byte offset from file start)
+//     size: u32 LE              (frame data size)
+//     frame_role: u8            (0=lowpass/seekable, 1=highpass, 2=tail-iframe)
+//     temporal_level: u8        (for highpass: which level; for lowpass/tail: 0)
+//     gop_index: u16 LE         (which GOP, 0-based)
+//     frame_index_in_gop: u16 LE (position within GOP)
+//     pts: u32 LE               (presentation timestamp, display-order frame number)
+//
+//   Frame Data:
+//     [GP12 frame blobs in index order]
+//
+// Frame ordering per GOP: lowpass first, then highpass from deepest level to finest.
+// After all GOPs: tail I-frames.
+
+const GNV2_MAGIC: &[u8; 4] = b"GNV2";
+const GNV2_VERSION: u32 = 1;
+const GNV2_HEADER_SIZE: usize = 34;
+const GNV2_INDEX_ENTRY_SIZE: usize = 22; // 8 + 4 + 1 + 1 + 2 + 2 + 4
+
+/// Entry in the GNV2 frame index table.
+#[derive(Debug, Clone, Copy)]
+pub struct TemporalFrameIndexEntry {
+    /// Byte offset from start of file to frame data
+    pub offset: u64,
+    /// Size of this frame's serialized data in bytes
+    pub size: u32,
+    /// Frame role: 0 = lowpass (seekable keyframe), 1 = highpass, 2 = tail I-frame
+    pub frame_role: u8,
+    /// Temporal wavelet level (0 = finest). 0 for lowpass and tail frames.
+    pub temporal_level: u8,
+    /// GOP index (0-based)
+    pub gop_index: u16,
+    /// Frame position within its GOP
+    pub frame_index_in_gop: u16,
+    /// Presentation timestamp (display-order frame number)
+    pub pts: u32,
+}
+
+/// Parsed GNV2 temporal sequence header with frame index.
+#[derive(Debug, Clone)]
+pub struct TemporalSequenceHeader {
+    pub version: u32,
+    pub width: u32,
+    pub height: u32,
+    pub frame_count: u32,
+    pub framerate_num: u32,
+    pub framerate_den: u32,
+    pub temporal_transform: crate::TemporalTransform,
+    pub gop_size: u8,
+    pub highpass_qstep_mul: f32,
+    /// Frame index table for random access
+    pub index: Vec<TemporalFrameIndexEntry>,
+}
+
+impl TemporalSequenceHeader {
+    /// Duration in seconds
+    pub fn duration_secs(&self) -> f64 {
+        if self.framerate_num == 0 {
+            return 0.0;
+        }
+        self.frame_count as f64 * self.framerate_den as f64 / self.framerate_num as f64
+    }
+
+    /// Frames per second
+    pub fn fps(&self) -> f64 {
+        if self.framerate_den == 0 {
+            return 0.0;
+        }
+        self.framerate_num as f64 / self.framerate_den as f64
+    }
+
+    /// Number of GOPs in the sequence
+    pub fn num_groups(&self) -> usize {
+        // Count distinct gop_index values with frame_role != 2 (tail)
+        let max_gop = self
+            .index
+            .iter()
+            .filter(|e| e.frame_role != 2)
+            .map(|e| e.gop_index)
+            .max();
+        match max_gop {
+            Some(g) => g as usize + 1,
+            None => 0,
+        }
+    }
+
+    /// Number of tail I-frames
+    pub fn num_tail_iframes(&self) -> usize {
+        self.index.iter().filter(|e| e.frame_role == 2).count()
+    }
+}
+
+/// Encode temporal transform enum to byte.
+fn temporal_transform_to_byte(t: crate::TemporalTransform) -> u8 {
+    match t {
+        crate::TemporalTransform::None => 0,
+        crate::TemporalTransform::Haar => 1,
+        crate::TemporalTransform::LeGall53 => 2,
+    }
+}
+
+/// Decode byte to temporal transform enum.
+fn byte_to_temporal_transform(b: u8) -> crate::TemporalTransform {
+    match b {
+        0 => crate::TemporalTransform::None,
+        1 => crate::TemporalTransform::Haar,
+        2 => crate::TemporalTransform::LeGall53,
+        _ => panic!("Unknown temporal transform byte: {b}"),
+    }
+}
+
+/// Serialize a `TemporalEncodedSequence` into the GNV2 container format.
+///
+/// Frame ordering within each GOP: lowpass first, then highpass from deepest
+/// level to finest. After all GOPs: tail I-frames.
+pub fn serialize_temporal_sequence(
+    seq: &crate::TemporalEncodedSequence,
+    framerate: (u32, u32),
+) -> Vec<u8> {
+    // Get width/height from first available frame
+    let first_frame = if !seq.groups.is_empty() {
+        &seq.groups[0].low_frame
+    } else if !seq.tail_iframes.is_empty() {
+        &seq.tail_iframes[0]
+    } else {
+        panic!("Cannot serialize empty temporal sequence");
+    };
+    let width = first_frame.info.width;
+    let height = first_frame.info.height;
+
+    // Compute highpass_qstep_mul from first frame's config
+    let highpass_qstep_mul = first_frame.config.temporal_highpass_qstep_mul;
+
+    // --- Serialize all GP12 frame blobs and build index entries ---
+    let mut frame_blobs: Vec<Vec<u8>> = Vec::new();
+    let mut index_entries: Vec<TemporalFrameIndexEntry> = Vec::new();
+
+    // PTS assignment: within each GOP, the lowpass represents the temporal
+    // average, and highpass frames represent detail. For display order,
+    // GOP g covers frames [g*gop_size .. (g+1)*gop_size).
+    let gop_size = seq.gop_size;
+
+    for (gop_idx, group) in seq.groups.iter().enumerate() {
+        let gop_base_pts = (gop_idx * gop_size) as u32;
+        let mut frame_pos_in_gop: u16 = 0;
+
+        // Lowpass frame (seekable keyframe)
+        let blob = serialize_compressed(&group.low_frame);
+        frame_blobs.push(blob);
+        index_entries.push(TemporalFrameIndexEntry {
+            offset: 0, // filled in later
+            size: 0,   // filled in later
+            frame_role: 0,
+            temporal_level: 0,
+            gop_index: gop_idx as u16,
+            frame_index_in_gop: frame_pos_in_gop,
+            pts: gop_base_pts,
+        });
+        frame_pos_in_gop += 1;
+
+        // Highpass frames: deepest level first (last in high_frames vec),
+        // then progressively finer levels
+        // high_frames[0] = finest (level 0), high_frames[last] = deepest
+        let num_levels = group.high_frames.len();
+        for level_rev in 0..num_levels {
+            // level_rev=0 → deepest level, level_rev=num_levels-1 → finest
+            let level_idx = num_levels - 1 - level_rev;
+            let temporal_level = level_idx as u8;
+            for (fi, hp_frame) in group.high_frames[level_idx].iter().enumerate() {
+                let blob = serialize_compressed(hp_frame);
+                frame_blobs.push(blob);
+                index_entries.push(TemporalFrameIndexEntry {
+                    offset: 0,
+                    size: 0,
+                    frame_role: 1,
+                    temporal_level,
+                    gop_index: gop_idx as u16,
+                    frame_index_in_gop: frame_pos_in_gop,
+                    pts: gop_base_pts + frame_pos_in_gop as u32,
+                });
+                let _ = fi; // suppress unused warning
+                frame_pos_in_gop += 1;
+            }
+        }
+    }
+
+    // Tail I-frames
+    let tail_base_pts = (seq.groups.len() * gop_size) as u32;
+    for (ti, tail_frame) in seq.tail_iframes.iter().enumerate() {
+        let blob = serialize_compressed(tail_frame);
+        frame_blobs.push(blob);
+        index_entries.push(TemporalFrameIndexEntry {
+            offset: 0,
+            size: 0,
+            frame_role: 2,
+            temporal_level: 0,
+            gop_index: 0, // not part of any GOP
+            frame_index_in_gop: 0,
+            pts: tail_base_pts + ti as u32,
+        });
+    }
+
+    // --- Compute byte offsets ---
+    let total_index_entries = index_entries.len();
+    let index_table_size = total_index_entries * GNV2_INDEX_ENTRY_SIZE;
+    let data_start = GNV2_HEADER_SIZE + index_table_size;
+
+    let mut current_offset = data_start as u64;
+    for (i, blob) in frame_blobs.iter().enumerate() {
+        index_entries[i].offset = current_offset;
+        index_entries[i].size = blob.len() as u32;
+        current_offset += blob.len() as u64;
+    }
+    let total_size = current_offset as usize;
+
+    // --- Write output ---
+    let mut out = Vec::with_capacity(total_size);
+
+    // File header (40 bytes)
+    out.extend_from_slice(GNV2_MAGIC);
+    out.extend_from_slice(&GNV2_VERSION.to_le_bytes());
+    out.extend_from_slice(&width.to_le_bytes());
+    out.extend_from_slice(&height.to_le_bytes());
+    out.extend_from_slice(&(seq.frame_count as u32).to_le_bytes());
+    out.extend_from_slice(&framerate.0.to_le_bytes());
+    out.extend_from_slice(&framerate.1.to_le_bytes());
+    out.push(temporal_transform_to_byte(seq.mode));
+    out.push(seq.gop_size as u8);
+    out.extend_from_slice(&highpass_qstep_mul.to_le_bytes());
+    debug_assert_eq!(out.len(), GNV2_HEADER_SIZE);
+
+    // Frame index table
+    for entry in &index_entries {
+        out.extend_from_slice(&entry.offset.to_le_bytes());
+        out.extend_from_slice(&entry.size.to_le_bytes());
+        out.push(entry.frame_role);
+        out.push(entry.temporal_level);
+        out.extend_from_slice(&entry.gop_index.to_le_bytes());
+        out.extend_from_slice(&entry.frame_index_in_gop.to_le_bytes());
+        out.extend_from_slice(&entry.pts.to_le_bytes());
+    }
+
+    // Frame data
+    for blob in &frame_blobs {
+        out.extend_from_slice(blob);
+    }
+
+    debug_assert_eq!(out.len(), total_size);
+    out
+}
+
+/// Parse the GNV2 file header and frame index table from raw bytes.
+///
+/// Returns a `TemporalSequenceHeader` for random access to groups and frames.
+pub fn deserialize_temporal_sequence_header(data: &[u8]) -> TemporalSequenceHeader {
+    assert!(
+        data.len() >= GNV2_HEADER_SIZE,
+        "GNV2 data too small for header ({} bytes, need at least {})",
+        data.len(),
+        GNV2_HEADER_SIZE
+    );
+    assert!(
+        &data[0..4] == GNV2_MAGIC,
+        "Invalid GNV2 magic (expected GNV2, got {:?})",
+        &data[0..4]
+    );
+
+    let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
+    let width = u32::from_le_bytes(data[8..12].try_into().unwrap());
+    let height = u32::from_le_bytes(data[12..16].try_into().unwrap());
+    let frame_count = u32::from_le_bytes(data[16..20].try_into().unwrap());
+    let framerate_num = u32::from_le_bytes(data[20..24].try_into().unwrap());
+    let framerate_den = u32::from_le_bytes(data[24..28].try_into().unwrap());
+    let temporal_transform = byte_to_temporal_transform(data[28]);
+    let gop_size = data[29];
+    let highpass_qstep_mul = f32::from_le_bytes(data[30..34].try_into().unwrap());
+
+    // Determine number of index entries by scanning ahead.
+    // We know each entry is GNV2_INDEX_ENTRY_SIZE bytes, and the index table
+    // immediately follows the header. We need to figure out how many entries
+    // there are. We can compute this from the first entry's offset (which
+    // tells us where data starts, hence the size of header + index table).
+    //
+    // But we need at least one entry to read the first offset. Handle the
+    // edge case of zero frames.
+    if frame_count == 0 {
+        return TemporalSequenceHeader {
+            version,
+            width,
+            height,
+            frame_count,
+            framerate_num,
+            framerate_den,
+            temporal_transform,
+            gop_size,
+            highpass_qstep_mul,
+            index: Vec::new(),
+        };
+    }
+
+    // Read the first entry's offset to determine total index entries
+    assert!(
+        data.len() >= GNV2_HEADER_SIZE + 8,
+        "GNV2 data too small to read first index entry offset"
+    );
+    let first_offset = u64::from_le_bytes(
+        data[GNV2_HEADER_SIZE..GNV2_HEADER_SIZE + 8]
+            .try_into()
+            .unwrap(),
+    );
+    let index_table_total_size = first_offset as usize - GNV2_HEADER_SIZE;
+    let num_entries = index_table_total_size / GNV2_INDEX_ENTRY_SIZE;
+
+    assert!(
+        data.len() >= GNV2_HEADER_SIZE + num_entries * GNV2_INDEX_ENTRY_SIZE,
+        "GNV2 data too small for index table"
+    );
+
+    let mut index = Vec::with_capacity(num_entries);
+    let mut pos = GNV2_HEADER_SIZE;
+    for _ in 0..num_entries {
+        let offset = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+        pos += 8;
+        let size = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
+        pos += 4;
+        let frame_role = data[pos];
+        pos += 1;
+        let temporal_level = data[pos];
+        pos += 1;
+        let gop_index = u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap());
+        pos += 2;
+        let frame_index_in_gop = u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap());
+        pos += 2;
+        let pts = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
+        pos += 4;
+        index.push(TemporalFrameIndexEntry {
+            offset,
+            size,
+            frame_role,
+            temporal_level,
+            gop_index,
+            frame_index_in_gop,
+            pts,
+        });
+    }
+
+    TemporalSequenceHeader {
+        version,
+        width,
+        height,
+        frame_count,
+        framerate_num,
+        framerate_den,
+        temporal_transform,
+        gop_size,
+        highpass_qstep_mul,
+        index,
+    }
+}
+
+/// Deserialize a single temporal group (GOP) from a GNV2 container.
+///
+/// Uses the frame index for O(1) access to the correct byte ranges.
+pub fn deserialize_temporal_group(
+    data: &[u8],
+    header: &TemporalSequenceHeader,
+    group_idx: usize,
+) -> crate::TemporalGroup {
+    // Collect all index entries belonging to this GOP (exclude tail I-frames)
+    let gop_entries: Vec<&TemporalFrameIndexEntry> = header
+        .index
+        .iter()
+        .filter(|e| e.gop_index == group_idx as u16 && e.frame_role != 2)
+        .collect();
+
+    assert!(
+        !gop_entries.is_empty(),
+        "No frames found for GOP index {group_idx}"
+    );
+
+    // The first entry must be the lowpass (frame_role=0)
+    assert_eq!(
+        gop_entries[0].frame_role, 0,
+        "First frame in GOP must be lowpass (frame_role=0)"
+    );
+
+    // Deserialize lowpass frame
+    let lp_entry = gop_entries[0];
+    let lp_start = lp_entry.offset as usize;
+    let lp_end = lp_start + lp_entry.size as usize;
+    assert!(
+        lp_end <= data.len(),
+        "Lowpass frame data extends beyond file"
+    );
+    let low_frame = deserialize_compressed(&data[lp_start..lp_end]);
+
+    // Collect highpass entries (frame_role=1), grouped by temporal_level
+    // Entries are stored deepest-first in the file, but high_frames vec
+    // is indexed [0] = finest level, so we need to reconstruct that ordering.
+    let hp_entries: Vec<&TemporalFrameIndexEntry> =
+        gop_entries.iter().filter(|e| e.frame_role == 1).copied().collect();
+
+    if hp_entries.is_empty() {
+        return crate::TemporalGroup {
+            low_frame,
+            high_frames: Vec::new(),
+        };
+    }
+
+    // Find the number of temporal levels
+    let max_level = hp_entries.iter().map(|e| e.temporal_level).max().unwrap();
+    let num_levels = max_level as usize + 1;
+
+    // Build high_frames: Vec<Vec<CompressedFrame>> indexed by level (0=finest)
+    let mut high_frames: Vec<Vec<crate::CompressedFrame>> = vec![Vec::new(); num_levels];
+
+    for entry in &hp_entries {
+        let start = entry.offset as usize;
+        let end = start + entry.size as usize;
+        assert!(
+            end <= data.len(),
+            "Highpass frame data extends beyond file (GOP {}, level {}, offset {}..{})",
+            group_idx,
+            entry.temporal_level,
+            start,
+            end
+        );
+        let frame = deserialize_compressed(&data[start..end]);
+        high_frames[entry.temporal_level as usize].push(frame);
+    }
+
+    crate::TemporalGroup {
+        low_frame,
+        high_frames,
+    }
+}
+
+/// Convenience: deserialize an entire GNV2 container into a `TemporalEncodedSequence`.
+///
+/// Reads all GOPs and tail I-frames.
+pub fn deserialize_temporal_sequence(data: &[u8]) -> crate::TemporalEncodedSequence {
+    let header = deserialize_temporal_sequence_header(data);
+
+    let num_groups = header.num_groups();
+    let mut groups = Vec::with_capacity(num_groups);
+    for g in 0..num_groups {
+        groups.push(deserialize_temporal_group(data, &header, g));
+    }
+
+    // Deserialize tail I-frames
+    let mut tail_iframes = Vec::new();
+    for entry in &header.index {
+        if entry.frame_role == 2 {
+            let start = entry.offset as usize;
+            let end = start + entry.size as usize;
+            assert!(
+                end <= data.len(),
+                "Tail I-frame data extends beyond file"
+            );
+            tail_iframes.push(deserialize_compressed(&data[start..end]));
+        }
+    }
+
+    crate::TemporalEncodedSequence {
+        mode: header.temporal_transform,
+        groups,
+        tail_iframes,
+        frame_count: header.frame_count as usize,
+        gop_size: header.gop_size as usize,
+    }
+}
+
+/// Find the GOP containing a target PTS for keyframe seeking.
+///
+/// Returns the GOP index. The lowpass frame of that GOP is the seekable entry point.
+/// To decode frame at target_pts, decode the entire GOP and extract the frame.
+pub fn seek_to_temporal_keyframe(header: &TemporalSequenceHeader, target_pts: u32) -> usize {
+    // Each GOP covers gop_size frames: GOP g covers PTS [g*gop_size, (g+1)*gop_size)
+    let gop_size = header.gop_size as u32;
+    if gop_size == 0 {
+        return 0;
+    }
+    let num_groups = header.num_groups();
+    let gop_idx = (target_pts / gop_size) as usize;
+    gop_idx.min(num_groups.saturating_sub(1))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::encoder::rice;
+
+    /// Create a minimal CompressedFrame with trivial Rice entropy data.
+    /// The frame is small (16x16) with a single tile containing all-zero coefficients.
+    fn make_test_frame(width: u32, height: u32) -> crate::CompressedFrame {
+        let tile_size = 256u32;
+        let num_levels = 3u32;
+        let num_groups = num_levels * 2; // directional subband splitting: 2 groups/level
+        let tiles_x = width.div_ceil(tile_size);
+        let tiles_y = height.div_ceil(tile_size);
+        let num_tiles = (tiles_x * tiles_y * 3) as usize; // 3 planes
+
+        let tile = rice::RiceTile {
+            num_coefficients: tile_size * tile_size,
+            tile_size,
+            num_levels,
+            num_groups,
+            k_values: vec![0; num_groups as usize],
+            k_zrl_values: vec![0; num_groups as usize],
+            skip_bitmap: 0xFF, // all groups skipped (all zeros)
+            stream_lengths: vec![0; rice::RICE_STREAMS_PER_TILE],
+            stream_data: Vec::new(),
+        };
+
+        let tiles = vec![tile; num_tiles];
+
+        crate::CompressedFrame {
+            info: crate::FrameInfo {
+                width,
+                height,
+                bit_depth: 8,
+                tile_size,
+            },
+            config: crate::CodecConfig {
+                tile_size,
+                quantization_step: 4.0,
+                dead_zone: 0.5,
+                wavelet_levels: num_levels,
+                subband_weights: crate::SubbandWeights::uniform(num_levels),
+                entropy_coder: crate::EntropyCoder::Rice,
+                temporal_highpass_qstep_mul: 2.0,
+                ..Default::default()
+            },
+            entropy: crate::EntropyData::Rice(tiles),
+            cfl_alphas: None,
+            weight_map: None,
+            frame_type: crate::FrameType::Intra,
+            motion_field: None,
+            intra_modes: None,
+            residual_stats: None,
+            residual_stats_co: None,
+            residual_stats_cg: None,
+        }
+    }
+
+    /// Test GNV2 roundtrip: serialize a TemporalEncodedSequence, deserialize it,
+    /// and verify all structure and frame data matches.
+    #[test]
+    fn test_gnv2_roundtrip() {
+        let width = 64;
+        let height = 64;
+        let gop_size = 4; // 2 levels: level 0 has 2 HP frames, level 1 has 1 HP frame
+
+        // Build a TemporalEncodedSequence with 2 GOPs + 1 tail I-frame
+        // GOP layout for gop_size=4:
+        //   1 lowpass + 1 highpass(level 1) + 2 highpass(level 0) = 4 frames/GOP
+        let make_group = || crate::TemporalGroup {
+            low_frame: make_test_frame(width, height),
+            high_frames: vec![
+                // level 0 (finest): 2 frames
+                vec![make_test_frame(width, height), make_test_frame(width, height)],
+                // level 1 (deepest): 1 frame
+                vec![make_test_frame(width, height)],
+            ],
+        };
+
+        let seq = crate::TemporalEncodedSequence {
+            mode: crate::TemporalTransform::Haar,
+            groups: vec![make_group(), make_group()],
+            tail_iframes: vec![make_test_frame(width, height)],
+            frame_count: 9, // 2 GOPs × 4 + 1 tail
+            gop_size,
+        };
+
+        let framerate = (30000u32, 1001u32);
+
+        // Serialize
+        let data = serialize_temporal_sequence(&seq, framerate);
+
+        // Verify magic
+        assert_eq!(&data[0..4], b"GNV2");
+
+        // Deserialize header
+        let header = deserialize_temporal_sequence_header(&data);
+        assert_eq!(header.version, 1);
+        assert_eq!(header.width, width);
+        assert_eq!(header.height, height);
+        assert_eq!(header.frame_count, 9);
+        assert_eq!(header.framerate_num, 30000);
+        assert_eq!(header.framerate_den, 1001);
+        assert_eq!(header.temporal_transform, crate::TemporalTransform::Haar);
+        assert_eq!(header.gop_size, 4);
+        assert!((header.highpass_qstep_mul - 2.0).abs() < f32::EPSILON);
+        assert_eq!(header.num_groups(), 2);
+        assert_eq!(header.num_tail_iframes(), 1);
+
+        // Verify index table structure
+        // Each GOP: 1 lowpass + 1 hp(L1) + 2 hp(L0) = 4 entries
+        // 2 GOPs + 1 tail = 9 entries total
+        assert_eq!(header.index.len(), 9);
+
+        // Check GOP 0 entries
+        let gop0: Vec<_> = header
+            .index
+            .iter()
+            .filter(|e| e.gop_index == 0 && e.frame_role != 2)
+            .collect();
+        assert_eq!(gop0.len(), 4);
+        assert_eq!(gop0[0].frame_role, 0); // lowpass
+        assert_eq!(gop0[1].frame_role, 1); // highpass
+        assert_eq!(gop0[1].temporal_level, 1); // deepest level first in file
+        assert_eq!(gop0[2].frame_role, 1);
+        assert_eq!(gop0[2].temporal_level, 0); // finest level
+        assert_eq!(gop0[3].frame_role, 1);
+        assert_eq!(gop0[3].temporal_level, 0);
+
+        // Check tail entry
+        let tail: Vec<_> = header.index.iter().filter(|e| e.frame_role == 2).collect();
+        assert_eq!(tail.len(), 1);
+
+        // Deserialize individual group
+        let group0 = deserialize_temporal_group(&data, &header, 0);
+        assert_eq!(group0.low_frame.info.width, width);
+        assert_eq!(group0.low_frame.info.height, height);
+        assert_eq!(group0.high_frames.len(), 2); // 2 levels
+        assert_eq!(group0.high_frames[0].len(), 2); // level 0: 2 frames
+        assert_eq!(group0.high_frames[1].len(), 1); // level 1: 1 frame
+
+        // Deserialize full sequence
+        let decoded = deserialize_temporal_sequence(&data);
+        assert_eq!(decoded.mode, crate::TemporalTransform::Haar);
+        assert_eq!(decoded.groups.len(), 2);
+        assert_eq!(decoded.tail_iframes.len(), 1);
+        assert_eq!(decoded.frame_count, 9);
+        assert_eq!(decoded.gop_size, 4);
+
+        // Verify all frames roundtrip: re-serialize each frame and compare bytes
+        for (gi, group) in decoded.groups.iter().enumerate() {
+            let orig_group = &seq.groups[gi];
+            let lp_bytes = serialize_compressed(&group.low_frame);
+            let orig_lp_bytes = serialize_compressed(&orig_group.low_frame);
+            assert_eq!(
+                lp_bytes, orig_lp_bytes,
+                "Lowpass frame mismatch in GOP {gi}"
+            );
+
+            for (li, level_frames) in group.high_frames.iter().enumerate() {
+                for (fi, frame) in level_frames.iter().enumerate() {
+                    let hp_bytes = serialize_compressed(frame);
+                    let orig_hp_bytes =
+                        serialize_compressed(&orig_group.high_frames[li][fi]);
+                    assert_eq!(
+                        hp_bytes, orig_hp_bytes,
+                        "Highpass frame mismatch in GOP {gi}, level {li}, frame {fi}"
+                    );
+                }
+            }
+        }
+
+        // Verify tail I-frame roundtrip
+        for (ti, tail_frame) in decoded.tail_iframes.iter().enumerate() {
+            let t_bytes = serialize_compressed(tail_frame);
+            let orig_t_bytes = serialize_compressed(&seq.tail_iframes[ti]);
+            assert_eq!(t_bytes, orig_t_bytes, "Tail I-frame {ti} mismatch");
+        }
+    }
+
+    /// Test GNV2 with a single GOP of size 2 (simplest case: 1 level).
+    #[test]
+    fn test_gnv2_gop2_roundtrip() {
+        let width = 32;
+        let height = 32;
+
+        let seq = crate::TemporalEncodedSequence {
+            mode: crate::TemporalTransform::Haar,
+            groups: vec![crate::TemporalGroup {
+                low_frame: make_test_frame(width, height),
+                high_frames: vec![
+                    // level 0: 1 frame
+                    vec![make_test_frame(width, height)],
+                ],
+            }],
+            tail_iframes: Vec::new(),
+            frame_count: 2,
+            gop_size: 2,
+        };
+
+        let data = serialize_temporal_sequence(&seq, (24, 1));
+        let header = deserialize_temporal_sequence_header(&data);
+        assert_eq!(header.gop_size, 2);
+        assert_eq!(header.index.len(), 2); // 1 lowpass + 1 highpass
+        assert_eq!(header.num_groups(), 1);
+        assert_eq!(header.num_tail_iframes(), 0);
+
+        let decoded = deserialize_temporal_sequence(&data);
+        assert_eq!(decoded.groups.len(), 1);
+        assert_eq!(decoded.groups[0].high_frames.len(), 1);
+        assert_eq!(decoded.groups[0].high_frames[0].len(), 1);
+        assert!(decoded.tail_iframes.is_empty());
+    }
+
+    /// Test GNV2 with GOP size 8 (3 levels).
+    #[test]
+    fn test_gnv2_gop8_roundtrip() {
+        let width = 64;
+        let height = 64;
+
+        // GOP size 8: 3 levels
+        // level 2 (deepest): 1 HP frame
+        // level 1: 2 HP frames
+        // level 0 (finest): 4 HP frames
+        // total: 1 LP + 1 + 2 + 4 = 8
+        let seq = crate::TemporalEncodedSequence {
+            mode: crate::TemporalTransform::Haar,
+            groups: vec![crate::TemporalGroup {
+                low_frame: make_test_frame(width, height),
+                high_frames: vec![
+                    // level 0: 4 frames
+                    vec![
+                        make_test_frame(width, height),
+                        make_test_frame(width, height),
+                        make_test_frame(width, height),
+                        make_test_frame(width, height),
+                    ],
+                    // level 1: 2 frames
+                    vec![
+                        make_test_frame(width, height),
+                        make_test_frame(width, height),
+                    ],
+                    // level 2: 1 frame
+                    vec![make_test_frame(width, height)],
+                ],
+            }],
+            tail_iframes: Vec::new(),
+            frame_count: 8,
+            gop_size: 8,
+        };
+
+        let data = serialize_temporal_sequence(&seq, (30, 1));
+        let header = deserialize_temporal_sequence_header(&data);
+        assert_eq!(header.gop_size, 8);
+        assert_eq!(header.index.len(), 8); // 1 + 1 + 2 + 4
+
+        // Verify ordering: LP, then L2, then L1×2, then L0×4
+        assert_eq!(header.index[0].frame_role, 0); // lowpass
+        assert_eq!(header.index[1].frame_role, 1);
+        assert_eq!(header.index[1].temporal_level, 2); // deepest first
+        assert_eq!(header.index[2].frame_role, 1);
+        assert_eq!(header.index[2].temporal_level, 1);
+        assert_eq!(header.index[3].frame_role, 1);
+        assert_eq!(header.index[3].temporal_level, 1);
+        assert_eq!(header.index[4].frame_role, 1);
+        assert_eq!(header.index[4].temporal_level, 0); // finest last
+        assert_eq!(header.index[7].temporal_level, 0);
+
+        let decoded = deserialize_temporal_sequence(&data);
+        assert_eq!(decoded.groups[0].high_frames.len(), 3);
+        assert_eq!(decoded.groups[0].high_frames[0].len(), 4); // level 0
+        assert_eq!(decoded.groups[0].high_frames[1].len(), 2); // level 1
+        assert_eq!(decoded.groups[0].high_frames[2].len(), 1); // level 2
+    }
+
+    /// Test GNV2 header helper methods.
+    #[test]
+    fn test_gnv2_header_helpers() {
+        let header = TemporalSequenceHeader {
+            version: 1,
+            width: 1920,
+            height: 1080,
+            frame_count: 240,
+            framerate_num: 30000,
+            framerate_den: 1001,
+            temporal_transform: crate::TemporalTransform::Haar,
+            gop_size: 8,
+            highpass_qstep_mul: 2.0,
+            index: Vec::new(),
+        };
+        let fps = header.fps();
+        assert!((fps - 29.97).abs() < 0.01);
+        let dur = header.duration_secs();
+        assert!((dur - 8.008).abs() < 0.01);
+    }
+}

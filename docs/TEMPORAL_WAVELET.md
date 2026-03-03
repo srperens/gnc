@@ -16,10 +16,11 @@
 
 **Results**: crowd_run 8 frames q=75 mul=2.0: 3.91 bpp / 35.82 dB, 40 fps encode+decode. -49% bitrate vs all-I, 0.62 dB temporal consistency.
 
-## Phase 2 — Bitstream format
-5. **GNV2 or GP12 extension** — new frame type for temporal wavelet GOP. Header fields: temporal_transform (none/haar/53), gop_levels, highpass_qstep_mul.
-6. **Frame ordering in container** — lowpass first, then highpass L2→L1→L0 (decoder needs lowpass before inverse).
-7. **Keyframe seeking** — lowpass frame = seekable entry point per GOP.
+## Phase 2 — Bitstream format ✅ (2026-03-03)
+5. ✅ **GNV2 container format** — 34-byte header (magic, temporal_transform, gop_size, highpass_qstep_mul), 22-byte per-frame index entries with frame_role (lowpass/highpass/tail), temporal_level, gop_index, PTS.
+6. ✅ **Frame ordering in container** — lowpass first, then highpass deepest-to-finest (L2→L1→L0). Each frame serialized as GP12 blob.
+7. ✅ **Keyframe seeking** — `seek_to_temporal_keyframe()` finds GOP by PTS. Lowpass frames marked as seekable (frame_role=0).
+8. ✅ **CLI integration** — `benchmark-sequence --temporal-wavelet haar -o file.gnv2` writes GNV2 container. Full roundtrip via `serialize_temporal_sequence` / `deserialize_temporal_sequence`.
 
 ## Phase 3 — Temporal 5/3 lifting
 8. **WGSL temporal 5/3 shader** — predict + update over 4 frames. Reuse spatial 5/3 lifting pattern temporally.

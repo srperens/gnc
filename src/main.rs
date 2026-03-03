@@ -12,7 +12,7 @@ use gnc::encoder::pipeline::EncoderPipeline;
 use gnc::experiments;
 use gnc::format::{
     deserialize_compressed, deserialize_sequence_frame, deserialize_sequence_header,
-    seek_to_keyframe, serialize_compressed, serialize_sequence,
+    seek_to_keyframe, serialize_compressed, serialize_sequence, serialize_temporal_sequence,
 };
 use gnc::image_util::{load_image_rgb_f32, parse_wavelet_type, save_image_rgb_f32};
 use gnc::{
@@ -194,6 +194,10 @@ enum Command {
         /// Run A/B comparison against baseline I+P (+ I-only)
         #[arg(long)]
         ab: bool,
+
+        /// Output file path for GNV2 container (temporal wavelet mode only)
+        #[arg(short, long)]
+        output: Option<String>,
     },
 
     /// Encode a sequence of image frames into a .gnv container
@@ -715,6 +719,7 @@ fn main() {
             temporal_wavelet,
             tw_highpass_mul,
             ab,
+            output,
         } => {
             if diagnostics {
                 gnc::encoder::diagnostics::enable();
@@ -1423,6 +1428,19 @@ fn main() {
                     sequence_metrics::write_sequence_csv(&out_path, &frame_metrics_tw, &summary_tw)
                         .expect("Failed to write sequence CSV");
                     println!("\nSequence metrics written to {}", out_path);
+                }
+
+                // Write GNV2 if output path provided
+                if let Some(ref output_path) = output {
+                    let fps_num = fps.round() as u32;
+                    let fps_den = 1u32;
+                    let gnv2_data = serialize_temporal_sequence(&encoded_tw, (fps_num, fps_den));
+                    std::fs::write(output_path, &gnv2_data).expect("Failed to write GNV2 output");
+                    println!(
+                        "Wrote GNV2: {} bytes ({:.2} MB)",
+                        gnv2_data.len(),
+                        gnv2_data.len() as f64 / 1_048_576.0
+                    );
                 }
             }
         }

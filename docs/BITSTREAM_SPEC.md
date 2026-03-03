@@ -254,9 +254,58 @@ Starts at offset `28 + frame_count * 21`. Concatenated GP11 frame bitstreams. Ea
 
 ---
 
-## 4. Codec Pipeline
+## 4. Temporal Wavelet Container (GNV2)
 
-### 4.1 Color Space
+Wraps temporal wavelet-encoded video as a sequence of GP12 frames organized into GOPs.
+
+### 4.1 File Header (34 bytes)
+
+| Offset | Size | Type | Field | Description |
+|--------|------|------|-------|-------------|
+| 0 | 4 | char[4] | magic | `"GNV2"` |
+| 4 | 4 | u32 | version | 1 |
+| 8 | 4 | u32 | width | Frame width |
+| 12 | 4 | u32 | height | Frame height |
+| 16 | 4 | u32 | frame_count | Total original frames |
+| 20 | 4 | u32 | framerate_num | Framerate numerator |
+| 24 | 4 | u32 | framerate_den | Framerate denominator |
+| 28 | 1 | u8 | temporal_transform | 0 = none, 1 = Haar, 2 = LeGall 5/3 |
+| 29 | 1 | u8 | gop_size | GOP size (2, 4, or 8) |
+| 30 | 4 | f32 | highpass_qstep_mul | Highpass quantization multiplier |
+
+### 4.2 Frame Index Table
+
+Starts at offset 34. One entry per serialized frame (22 bytes each):
+
+| Size | Type | Field | Description |
+|------|------|-------|-------------|
+| 8 | u64 | offset | Byte offset from file start to frame data |
+| 4 | u32 | size | Frame data size in bytes |
+| 1 | u8 | frame_role | 0 = lowpass (seekable), 1 = highpass, 2 = tail I-frame |
+| 1 | u8 | temporal_level | Wavelet level (0 = finest). 0 for lowpass/tail. |
+| 2 | u16 | gop_index | GOP index (0-based) |
+| 2 | u16 | frame_index_in_gop | Position within GOP |
+| 4 | u32 | pts | Presentation timestamp (display-order frame number) |
+
+### 4.3 Frame Ordering
+
+Within each GOP, frames are ordered: **lowpass first**, then highpass from deepest temporal level to finest (L2→L1→L0). Within each level, frames in order. After all GOPs: tail I-frames.
+
+Example for GOP size 8 (3 temporal levels):
+- Frame 0: lowpass (1 frame, frame_role=0)
+- Frame 1: level 2 highpass (1 frame, frame_role=1, temporal_level=2)
+- Frames 2–3: level 1 highpass (2 frames, temporal_level=1)
+- Frames 4–7: level 0 highpass (4 frames, temporal_level=0)
+
+### 4.4 Random Access
+
+To seek to time T: compute `gop_index = T / gop_size`, find the lowpass frame (frame_role=0) of that GOP. Decode the entire GOP to reconstruct individual frames via inverse temporal wavelet.
+
+---
+
+## 5. Codec Pipeline
+
+### 5.1 Color Space
 
 **Forward (encode):** RGB -> YCoCg-R (reversible integer lifting for lossless mode)
 - Y  = (R + 2G + B) >> 2
@@ -266,7 +315,7 @@ Starts at offset `28 + frame_count * 21`. Concatenated GP11 frame bitstreams. Ea
 
 **Inverse (decode):** YCoCg-R -> RGB
 
-### 4.2 Wavelet Transform
+### 5.2 Wavelet Transform
 
 **LeGall 5/3** (lossless mode, q=100):
 - Integer-exact lifting steps with `floor()` division
@@ -276,7 +325,7 @@ Starts at offset `28 + frame_count * 21`. Concatenated GP11 frame bitstreams. Ea
 - Floating-point lifting steps
 - 4 vanishing moments, better energy compaction
 
-### 4.3 Quantization
+### 5.3 Quantization
 
 Uniform scalar quantization with dead zone:
 ```
@@ -288,13 +337,13 @@ Adaptive quantization modulates `qstep` per-tile using the weight map:
 effective_qstep = qstep * (1.0 + aq_strength * (weight - 1.0))
 ```
 
-### 4.4 Tile Independence
+### 5.4 Tile Independence
 
 Tiles are strictly independent: no cross-tile dependencies at any stage. Each tile can be encoded, decoded, and error-recovered independently. This is a fundamental design constraint enabling GPU parallelism.
 
 ---
 
-## 5. Backward Compatibility
+## 6. Backward Compatibility
 
 | Magic | Readable | Notes |
 |-------|----------|-------|
@@ -313,7 +362,7 @@ When reading older formats, missing features are defaulted:
 
 ---
 
-## 6. Error Resilience
+## 7. Error Resilience
 
 GP11 provides per-tile CRC-32 checksums. A decoder should:
 

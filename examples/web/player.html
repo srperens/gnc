@@ -175,13 +175,13 @@
 </head>
 <body>
     <h1>GNC/GNV WebGPU Player</h1>
-    <p class="subtitle">Drag & drop or select a <code>.gnc</code> / <code>.gnv</code> file</p>
+    <p class="subtitle">Drag & drop or select a <code>.gnc</code> / <code>.gnv</code> / <code>.gnv2</code> file</p>
 
     <div class="top-section">
         <!-- Left column: file input + demos + status -->
         <div class="top-left">
             <div class="drop-zone" id="dropZone">
-                <input type="file" id="fileInput" accept=".gnc,.gnv">
+                <input type="file" id="fileInput" accept=".gnc,.gnv,.gnv2">
                 <p>Click or drop file here</p>
             </div>
 
@@ -299,7 +299,7 @@
             diagData = null;
             const diagFullLink = $('diagFullLink');
             diagFullLink.style.display = 'none';
-            const diagName = gnvName.replace(/\.gnv$/, '.diag');
+            const diagName = gnvName.replace(/\.gnv2?$/, '.diag');
             try {
                 const resp = await fetch(diagName);
                 if (!resp.ok) return;
@@ -365,6 +365,11 @@
             { name: 'ducks_q75.gnv', label: 'Ducks q75 (698 MB)', desc: '300f 50fps 1080p q=75 ki=8' },
             { name: 'bbb_2min_q5.gnv', label: 'BBB 2min q5', desc: '1800f 30fps 1080p q=5 ki=24' },
             { name: 'bbb_2min.gnv', label: 'BBB 2min q75', desc: '1800f 30fps 1080p q=75 ki=24' },
+            // Temporal wavelet (GNV2) demos
+            { name: 'tw_crowd_run.gnv2', label: 'TW Crowd Run', desc: '32f 50fps 1080p q=75 Haar temporal wavelet' },
+            { name: 'tw_park_joy.gnv2', label: 'TW Park Joy', desc: '32f 50fps 1080p q=75 Haar temporal wavelet' },
+            { name: 'tw_ducks.gnv2', label: 'TW Ducks', desc: '64f 50fps 1080p q=75 Haar temporal wavelet' },
+            { name: 'tw_rush_hour.gnv2', label: 'TW Rush Hour', desc: '64f 25fps 1080p q=75 Haar temporal wavelet' },
         ];
         const demoGrid = $('demoGrid');
         for (const d of demoFiles) {
@@ -385,7 +390,7 @@
             dl.style.cssText = 'background:#222;color:#888;border-radius:0 0 0 0;padding:5px 7px;font-size:0.82em;text-decoration:none;display:flex;align-items:center;border-left:1px solid #333;';
 
             const diagLink = document.createElement('a');
-            const diagName = d.name.replace(/\.gnv$/, '.diag');
+            const diagName = d.name.replace(/\.gnv2?$/, '.diag');
             diagLink.href = diagName;
             diagLink.target = '_blank';
             diagLink.textContent = 'diag';

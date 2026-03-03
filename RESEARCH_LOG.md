@@ -871,3 +871,57 @@ The k_zrl parameter was stored at `k_output[tile_id * MAX_GROUPS + num_groups]`,
 4. **Remaining gap at q=25 (+34%)** could be closed with adaptive k_zrl per subband.
 
 ---
+
+## Experiment: Temporal Wavelet Potential Diagnostic (2026-03-03)
+
+### Hypothesis
+Temporal Haar wavelet operating on spatial wavelet coefficients could replace motion-estimation-based P-frames. If frame-to-frame differences in quantized wavelet detail subbands are mostly zero or within the dead zone, temporal Haar would effectively compress temporal redundancy without ME.
+
+### Implementation
+Added `compute_temporal_wavelet()` diagnostic that compares original-signal (not ME residual) spatial wavelet coefficients between consecutive frames. For P/B-frames, runs a separate GPU wavelet+quantize pass on the uncompensated frame using I-frame config for consistent comparison. Reports per-subband per-component: identical%, within_dz%, mean_abs_diff.
+
+### Results — Broadcast Content Analysis (q=75, 200 frames each)
+
+**Y detail subbands** (LH+HL+HH = 99.6% of all coefficients, weighted: LH=25%, HL=25%, HH=50%):
+
+| Sequence | FPS | Y identical | Y within_dz | Content |
+|---|---|---|---|---|
+| rush_hour | 25 | **88.5%** | **99.3%** | City traffic, moderate motion |
+| BBB (animation) | 24 | **88.3%** | **95.1%** | CGI animation reference |
+| park_joy | 50 | 62.2% | 85.6% | Foliage + camera pan |
+| crowd_run | 50 | 53.5% | 83.8% | Complex crowd (torture test) |
+| old_town_cross | 50 | 52.8% | 90.5% | Urban pedestrians |
+| ducks_take_off | 50 | 46.8% | 84.6% | High motion + fine detail |
+
+**Y LL subband** (DC, 0.4% of coefficients):
+
+| Sequence | LL identical | LL within_dz | LL mean_abs_diff |
+|---|---|---|---|
+| BBB | 14.9% | 36.9% | 21.8 |
+| old_town_cross | 10.2% | 42.7% | 9.9 |
+| rush_hour | 7.6% | 31.4% | 23.9 |
+| crowd_run | 5.9% | 24.8% | 33.7 |
+| ducks_take_off | 2.3% | 11.5% | 22.5 |
+| park_joy | 1.8% | 8.9% | 58.3 |
+
+### Analysis
+
+1. **Frame rate is the dominant variable**: 25fps content (rush_hour) has nearly identical temporal redundancy to animation. All 50fps sequences cluster at 47-62% identical.
+
+2. **within_dz is the actionable metric**: Even on 50fps torture tests, 84-90% of detail coefficients fall within the dead zone. Temporal Haar would zero these differences, yielding significant compression.
+
+3. **LL subband is always problematic**: Only 2-15% identical across all content. DC needs explicit coding regardless of temporal scheme — separate LL treatment is mandatory.
+
+4. **HH subband is highly temporal**: 57-98% identical, consistently the most temporally redundant. HH alone accounts for ~50% of detail coefficients.
+
+5. **Chroma is even more temporal**: Co/Cg consistently show 10-20 percentage points higher redundancy than Y across all sequences.
+
+### Conclusions
+
+- Temporal Haar is **clearly viable for 24-30fps broadcast** (88%+ identical detail coefficients)
+- For 50fps content, temporal Haar alone gives 47-62% identical, but 84-90% within_dz — viable with dead-zone-aware coding
+- **LL subband needs separate ME or explicit coding** — temporal Haar alone won't work for DC
+- Stockholm (720p 59.94fps) test still pending — will be the ultimate high-frame-rate test
+- Recommended next step: prototype temporal Haar on detail subbands only, keep ME for LL or code LL with larger quantization step
+
+---

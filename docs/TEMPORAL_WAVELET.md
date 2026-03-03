@@ -7,11 +7,14 @@
 - No motion estimation, fully tile-independent, fully parallelizable
 - Estimated potential at full GPU implementation: 30-45% lower bitrate than ME at matched quality
 
-## Phase 1 — GPU pipeline (Opus)
-1. **WGSL temporal Haar shader** — per-coefficient subtract/add, subband by subband, tile by tile. Operates between spatial wavelet and quantization.
-2. **Multi-level GOP on GPU** — dyadic decomposition (ki=8 → 3 levels), buffer management for lowpass/highpass between levels.
-3. **Highpass qstep multiplier** — already in CodecConfig, wire it through GPU quantize path. Default mul=1.5–2.0.
-4. **Decoder GPU path** — inverse temporal Haar after dequant, before inverse spatial wavelet.
+## Phase 1 — GPU pipeline ✅ (2026-03-03)
+1. ✅ **WGSL temporal Haar shader** — `shaders/temporal_haar.wgsl`, per-element Haar lifting, @workgroup_size(256). 1.2ms for 8-frame GOP.
+2. ✅ **Multi-level GOP on GPU** — dyadic decomposition with snapshot buffers to prevent read-after-write aliasing between pairs within a level.
+3. ✅ **Highpass qstep multiplier** — wired through GPU quantize path via `encode_from_gpu_wavelet_planes`.
+4. ✅ **Decoder GPU path** — inverse temporal Haar on GPU, snapshot-based multilevel reconstruction.
+5. ✅ **GPU Rice entropy** — temporal frames use GPU Rice encoder (1 submit per frame), 4× speedup over CPU entropy path.
+
+**Results**: crowd_run 8 frames q=75 mul=2.0: 3.91 bpp / 35.82 dB, 40 fps encode+decode. -49% bitrate vs all-I, 0.62 dB temporal consistency.
 
 ## Phase 2 — Bitstream format
 5. **GNV2 or GP12 extension** — new frame type for temporal wavelet GOP. Header fields: temporal_transform (none/haar/53), gop_levels, highpass_qstep_mul.

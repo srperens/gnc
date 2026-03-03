@@ -33,24 +33,32 @@
 
 **Results**: 1080p 50fps: 3.9ms decode, 260fps presentation rate. GPU blit zero-copy. No requestAnimationFrame violations.
 
+## Phase 2.6 — GOP decode optimization + player diagnostics ✅ (2026-03-03)
+16. ✅ **GPU buffer caching** — `ensure_tw_bufs()` allocates frame/snapshot buffers once, reuses across GOPs. Eliminates 32 `create_buffer` calls (~256MB allocation) per GOP.
+17. ✅ **Batched temporal Haar inverse** — all 3 planes in single `queue.submit()` (was 3 separate submits).
+18. ✅ **Double-buffered GOP prefetch** — two `TwBufSet`s, next GOP decoded at midpoint of current GOP. Hides GOP-boundary latency during playback.
+19. ✅ **Sub-ms timing** — `performance.now()` via web-sys replaces `Date.now()` (1ms resolution) for accurate per-frame seek/decode measurement.
+20. ✅ **Timing log panel** — per-frame table (Frame, Seek ms, Decode ms, Total ms, FPS) with Clear/Copy CSV, summary stats (avg/min/max).
+21. ✅ **Dropdown file selector** — grouped `<select>` (GNV1/GNV2 optgroups) replaces button grid.
+
 ## Phase 3 — Temporal 5/3 lifting
-16. **WGSL temporal 5/3 shader** — predict + update over 4 frames. Reuse spatial 5/3 lifting pattern temporally.
-17. **Adaptive temporal transform selection** — mirrors spatial wavelet strategy (CDF 9/7 lossy, 5/3 lossless):
+22. **WGSL temporal 5/3 shader** — predict + update over 4 frames. Reuse spatial 5/3 lifting pattern temporally.
+23. **Adaptive temporal transform selection** — mirrors spatial wavelet strategy (CDF 9/7 lossy, 5/3 lossless):
    - **No temporal transform**: ultra-low latency / pure I-frame mode (JPEG XS-like)
    - **Haar**: low latency / 25fps / high q
    - **5/3**: 50-60fps / moderate q / higher compression
    - Selectable per config or auto based on framerate + q target.
 
 ## Phase 4 — Optimization
-18. **Re-enable CfL in temporal mode** — CfL on temporal wavelet coefficients (both lowpass and highpass).
-19. **Adaptive highpass quantization per tile** — static tiles get higher mul, motion tiles get lower. Based on temporal variance.
-20. **LL subband handling** — explore simple prediction for LL (small, 0.39% of coefficients but high energy).
-21. **Benchmark suite** — automated A/B across all Xiph sequences (rush_hour, crowd_run, stockholm, old_town_cross, ducks_take_off, park_joy) with CSV output.
+24. **Re-enable CfL in temporal mode** — CfL on temporal wavelet coefficients (both lowpass and highpass).
+25. **Adaptive highpass quantization per tile** — static tiles get higher mul, motion tiles get lower. Based on temporal variance.
+26. **LL subband handling** — explore simple prediction for LL (small, 0.39% of coefficients but high energy).
+27. **Benchmark suite** — automated A/B across all Xiph sequences (rush_hour, crowd_run, stockholm, old_town_cross, ducks_take_off, park_joy) with CSV output.
 
 ## Phase 5 — Validation
-22. **Full 200-frame benchmarks** on all sequences, compare bitrate/PSNR/temporal consistency vs ME pipeline.
-23. **Rate control** for temporal wavelet mode (CBR/VBR with temporal GOP structure).
-24. **Broadcast demo** — encode real broadcast content, validate on production-representative material.
+28. **Full 200-frame benchmarks** on all sequences, compare bitrate/PSNR/temporal consistency vs ME pipeline.
+29. **Rate control** for temporal wavelet mode (CBR/VBR with temporal GOP structure).
+30. **Broadcast demo** — encode real broadcast content, validate on production-representative material.
 
 ## Token budget estimate
 - Phase 1-2: ~70% of effort (GPU + bitstream, needs Opus) ✅

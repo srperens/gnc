@@ -1,5 +1,6 @@
 use super::*;
 use crate::decoder::pipeline::DecoderPipeline;
+use crate::TemporalTransform;
 use wgpu::util::DeviceExt;
 
 fn compute_psnr_single(a: &[f32], b: &[f32]) -> f64 {
@@ -2716,4 +2717,108 @@ fn test_pframe_divergence_checkpoints() {
     } else {
         eprintln!("All checkpoints match — no divergence detected");
     }
+}
+
+/// Regression test for temporal wavelet encode/decode pipeline.
+///
+/// The bug: `encode_from_wavelet_coeffs` used a single CommandEncoder for all
+/// three planes, with `write_buffer` calls to the same GPU buffer before a
+/// single `submit()`. wgpu flushes pending writes at submit-time, so only the
+/// last plane's data (Cg) survived — all three quantize dispatches saw Cg.
+#[test]
+fn test_temporal_wavelet_roundtrip_per_plane() {
+    let ctx = GpuContext::new();
+    let mut enc = EncoderPipeline::new(&ctx);
+    let dec = DecoderPipeline::new(&ctx);
+
+    let w = 256u32;
+    let h = 256u32;
+
+    // Two frames with distinct content so Haar high band is non-trivial.
+    let f0 = make_gradient_frame(w, h, 0.0);
+    let f1 = make_gradient_frame(w, h, 30.0);
+
+    let mut config = CodecConfig::default();
+    config.tile_size = 256;
+    config.quantization_step = 4.0;
+    config.keyframe_interval = 1;
+    config.temporal_transform = TemporalTransform::Haar;
+    config.cfl_enabled = false;
+
+    let frames: Vec<&[f32]> = vec![&f0, &f1];
+    let seq = enc.encode_sequence_temporal_wavelet(&ctx, &frames, w, h, &config, TemporalTransform::Haar, 2);
+    let decoded = dec.decode_temporal_sequence(&ctx, &seq);
+
+    assert_eq!(decoded.len(), 2, "should decode 2 frames");
+
+    // Check PSNR for each frame — should be > 30 dB for q=75 on smooth gradients.
+    for (i, (orig, recon)) in frames.iter().zip(decoded.iter()).enumerate() {
+        let psnr = compute_psnr(orig, recon);
+        eprintln!("temporal wavelet frame {i}: PSNR = {psnr:.2} dB");
+        assert!(
+            psnr > 30.0,
+            "frame {i} PSNR {psnr:.2} dB is too low (expected > 30 dB)"
+        );
+    }
+}
+
+/// Verify that the three planes (Y, Co, Cg) produce distinct quantized data
+/// when encoded through `encode_from_wavelet_coeffs`.
+///
+/// Before the fix, all three planes were identical because only the last
+/// `write_buffer` was visible at `submit()` time.
+#[test]
+fn test_temporal_wavelet_planes_are_distinct() {
+    let ctx = GpuContext::new();
+    let mut enc = EncoderPipeline::new(&ctx);
+
+    let w = 256u32;
+    let h = 256u32;
+
+    // Build spatial wavelet coefficients for one frame.
+    let frame = make_gradient_frame(w, h, 0.0);
+
+    let mut config = CodecConfig::default();
+    config.tile_size = 256;
+    config.quantization_step = 4.0;
+    config.keyframe_interval = 1;
+    config.temporal_transform = TemporalTransform::None;
+    config.cfl_enabled = false;
+
+    let info = FrameInfo { width: w, height: h, bit_depth: 8, tile_size: config.tile_size };
+    let prequant = enc.debug_wavelet_prequant(&ctx, &frame, &info, &config);
+
+    // Y and Co should differ for a gradient frame.
+    let y_co_diff: f64 = prequant[0]
+        .iter()
+        .zip(prequant[1].iter())
+        .map(|(a, b)| (*a as f64 - *b as f64).abs())
+        .sum::<f64>()
+        / prequant[0].len() as f64;
+    assert!(
+        y_co_diff > 0.1,
+        "test prerequisite: Y and Co should differ (mean_abs_diff={y_co_diff:.4})"
+    );
+
+    // Now quantize+entropy-encode these coefficients as a temporal frame would.
+    let quantized = enc.debug_quantize_wavelet_coeffs(
+        &ctx,
+        [&prequant[0], &prequant[1], &prequant[2]],
+        &info,
+        &config,
+    );
+
+    // After the fix, Y and Co quantized planes must differ.
+    let q_y_co_diff: f64 = quantized[0]
+        .iter()
+        .zip(quantized[1].iter())
+        .map(|(a, b)| (*a as f64 - *b as f64).abs())
+        .sum::<f64>()
+        / quantized[0].len() as f64;
+    eprintln!("quantized Y vs Co mean_abs_diff = {q_y_co_diff:.4}");
+    assert!(
+        q_y_co_diff > 0.01,
+        "Y and Co quantized planes should differ but mean_abs_diff={q_y_co_diff:.6} — \
+         likely all planes see only the last write_buffer"
+    );
 }

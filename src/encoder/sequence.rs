@@ -3,7 +3,7 @@ use wgpu;
 use super::adaptive::{self, AQ_LL_BLOCK_SIZE};
 use super::bitplane;
 use super::cfl;
-use super::entropy_helpers::{encode_entropy, EntropyMode};
+use super::entropy_helpers::{self, encode_entropy, EntropyMode};
 use super::motion::{MotionEstimator, ME_BLOCK_SIZE, ME_SPLIT_BLOCK_SIZE};
 use super::pipeline::EncoderPipeline;
 use super::rans;
@@ -13,8 +13,9 @@ use super::diagnostics;
 use super::rate_control::RateController;
 use crate::{
     CodecConfig, CompressedFrame, EntropyCoder, EntropyData, FrameInfo, FrameType, GpuContext,
-    MotionField,
+    MotionField, TemporalEncodedSequence, TemporalGroup, TemporalTransform,
 };
+use crate::temporal;
 
 /// Default frame rate assumed when rate control is active but no explicit fps is set.
 const DEFAULT_FPS: f64 = 30.0;
@@ -470,6 +471,175 @@ impl EncoderPipeline {
         }
 
         results.into_iter().map(|o| o.unwrap()).collect()
+    }
+
+    /// Encode a sequence using a temporal wavelet transform (in-memory only).
+    /// This bypasses ME/MC entirely: temporal transform → spatial encode for each coeff frame.
+    pub fn encode_sequence_temporal_wavelet(
+        &mut self,
+        ctx: &GpuContext,
+        frames: &[&[f32]],
+        width: u32,
+        height: u32,
+        config: &CodecConfig,
+        mode: TemporalTransform,
+        gop_size: usize,
+    ) -> TemporalEncodedSequence {
+        assert!(
+            mode != TemporalTransform::None,
+            "temporal wavelet encode requires a non-None mode"
+        );
+        let group_size = match mode {
+            TemporalTransform::Haar => gop_size,
+            _ => temporal::group_size(mode),
+        };
+        if mode == TemporalTransform::Haar {
+            assert!(
+                temporal::is_power_of_two(group_size),
+                "temporal Haar requires GOP size to be a power of two"
+            );
+        }
+        let mut groups: Vec<TemporalGroup> = Vec::new();
+        let mut tail_iframes: Vec<CompressedFrame> = Vec::new();
+
+        let mut cfg = config.clone();
+        cfg.keyframe_interval = 1;
+        cfg.temporal_transform = TemporalTransform::None;
+        cfg.cfl_enabled = false;
+
+        let mut i = 0usize;
+        let info = FrameInfo {
+            width,
+            height,
+            bit_depth: 8,
+            tile_size: cfg.tile_size,
+        };
+        let padded_w = info.padded_width();
+        let padded_h = info.padded_height();
+        let padded_pixels = (padded_w * padded_h) as usize;
+        self.ensure_cached(ctx, padded_w, padded_h, width, height);
+        let staging_prequant: [wgpu::Buffer; 3] = std::array::from_fn(|idx| {
+            ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(["tw_prequant_y", "tw_prequant_co", "tw_prequant_cg"][idx]),
+                size: (padded_pixels * std::mem::size_of::<f32>()) as u64,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        });
+        while i + group_size <= frames.len() {
+            match mode {
+                TemporalTransform::Haar => {
+                    // 1) Spatial wavelet per frame (pre-quantized coeffs)
+                    let mut per_plane_coeffs: [Vec<Vec<f32>>; 3] =
+                        [Vec::new(), Vec::new(), Vec::new()];
+                    for j in 0..group_size {
+                        let coeffs = self.diag_original_wavelet_prequant(
+                            ctx,
+                            frames[i + j],
+                            padded_w,
+                            padded_h,
+                            padded_pixels,
+                            &info,
+                            &cfg,
+                            &staging_prequant,
+                        );
+                        for p in 0..3 {
+                            per_plane_coeffs[p].push(coeffs[p].clone());
+                        }
+                    }
+
+                    // 2) Temporal Haar in wavelet domain, per plane
+                    let (low_y, highs_y) = temporal::haar_multilevel_forward(
+                        &per_plane_coeffs[0].iter().map(|v| v.as_slice()).collect::<Vec<_>>(),
+                    );
+                    let (low_co, highs_co) = temporal::haar_multilevel_forward(
+                        &per_plane_coeffs[1].iter().map(|v| v.as_slice()).collect::<Vec<_>>(),
+                    );
+                    let (low_cg, highs_cg) = temporal::haar_multilevel_forward(
+                        &per_plane_coeffs[2].iter().map(|v| v.as_slice()).collect::<Vec<_>>(),
+                    );
+
+                    if diagnostics::enabled() {
+                        let group_idx = groups.len();
+                        let base = i;
+                        let end = base + group_size - 1;
+                        eprintln!(
+                            "TW ENC group {} frames [{}..{}]",
+                            group_idx, base, end
+                        );
+                        eprintln!("  low -> [{}..{}]", base, end);
+                        for lvl in 0..highs_y.len() {
+                            let span = 1usize << (lvl + 1);
+                            for idx in 0..highs_y[lvl].len() {
+                                let s = base + idx * span;
+                                let e = s + span - 1;
+                                eprintln!("  high L{}[{}] -> [{}..{}]", lvl, idx, s, e);
+                            }
+                        }
+                    }
+
+                    // 3) Encode low frame
+                    let low_cf = self.encode_from_wavelet_coeffs(
+                        ctx,
+                        [&low_y, &low_co, &low_cg],
+                        &cfg,
+                        &info,
+                        padded_w,
+                        padded_h,
+                        padded_pixels,
+                    );
+
+                    // 4) Encode high frames per level (coarser qstep)
+                    let mut high_cfg = cfg.clone();
+                    high_cfg.quantization_step *= config.temporal_highpass_qstep_mul;
+                    let mut high_cfs: Vec<Vec<CompressedFrame>> = Vec::new();
+                    for lvl in 0..highs_y.len() {
+                        let mut lvl_frames: Vec<CompressedFrame> = Vec::new();
+                        for idx in 0..highs_y[lvl].len() {
+                            let cf = self.encode_from_wavelet_coeffs(
+                                ctx,
+                                [
+                                    &highs_y[lvl][idx],
+                                    &highs_co[lvl][idx],
+                                    &highs_cg[lvl][idx],
+                                ],
+                                &high_cfg,
+                                &info,
+                                padded_w,
+                                padded_h,
+                                padded_pixels,
+                            );
+                            lvl_frames.push(cf);
+                        }
+                        high_cfs.push(lvl_frames);
+                    }
+                    groups.push(TemporalGroup {
+                        low_frame: low_cf,
+                        high_frames: high_cfs,
+                    });
+                }
+                TemporalTransform::LeGall53 => {
+                    panic!("temporal LeGall53 not supported in multilevel mode yet");
+                }
+                TemporalTransform::None => unreachable!(),
+            }
+            i += group_size;
+        }
+
+        // Tail: encode remaining frames as I-frames (no temporal transform)
+        while i < frames.len() {
+            let cf = self.encode(ctx, frames[i], width, height, &cfg);
+            tail_iframes.push(cf);
+            i += 1;
+        }
+
+        TemporalEncodedSequence {
+            mode,
+            groups,
+            tail_iframes,
+            frame_count: frames.len(),
+            gop_size: group_size,
+        }
     }
 
     /// I-frame local decode using quantized data already on GPU.
@@ -1969,5 +2139,301 @@ impl EncoderPipeline {
             diagnostics::read_plane_f32(ctx, &staging[1], plane_size, padded_pixels),
             diagnostics::read_plane_f32(ctx, &staging[2], plane_size, padded_pixels),
         ]
+    }
+
+    /// Diagnostic: compute pre-quantized wavelet coefficients of the original signal.
+    ///
+    /// Runs a separate GPU pass: pad → color → deinterleave → wavelet → staging copy.
+    /// Returns [Y, Co, Cg] wavelet coefficients (pre-quantize).
+    #[allow(clippy::too_many_arguments)]
+    fn diag_original_wavelet_prequant(
+        &mut self,
+        ctx: &GpuContext,
+        rgb_data: &[f32],
+        padded_w: u32,
+        padded_h: u32,
+        padded_pixels: usize,
+        info: &FrameInfo,
+        config: &CodecConfig,
+        staging: &[wgpu::Buffer; 3],
+    ) -> [Vec<f32>; 3] {
+        let plane_size = (padded_pixels * std::mem::size_of::<f32>()) as u64;
+        let bufs = self.cached.as_ref().unwrap();
+
+        ctx.queue
+            .write_buffer(&bufs.raw_input_buf, 0, bytemuck::cast_slice(rgb_data));
+
+        let mut cmd = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("diag_temporal_wavelet_prequant"),
+            });
+
+        self.dispatch_gpu_pad_cached(ctx, &mut cmd, padded_w, padded_h);
+        self.color.dispatch(
+            ctx,
+            &mut cmd,
+            &bufs.input_buf,
+            &bufs.color_out,
+            padded_w,
+            padded_h,
+            true,
+            config.is_lossless(),
+        );
+        self.deinterleaver.dispatch(
+            ctx,
+            &mut cmd,
+            &bufs.color_out,
+            &bufs.plane_a,
+            &bufs.co_plane,
+            &bufs.cg_plane,
+            padded_pixels as u32,
+        );
+
+        let planes: [&wgpu::Buffer; 3] = [&bufs.plane_a, &bufs.co_plane, &bufs.cg_plane];
+        for (p, &cur_plane) in planes.iter().enumerate() {
+            // wavelet forward: cur_plane(read-only) → plane_b(scratch) → plane_c(output)
+            self.transform.forward(
+                ctx,
+                &mut cmd,
+                cur_plane,
+                &bufs.plane_b,
+                &bufs.plane_c,
+                info,
+                config.wavelet_levels,
+                config.wavelet_type,
+            );
+
+            // copy wavelet coeffs to staging
+            cmd.copy_buffer_to_buffer(&bufs.plane_c, 0, &staging[p], 0, plane_size);
+        }
+
+        ctx.queue.submit(Some(cmd.finish()));
+
+        [
+            diagnostics::read_plane_f32(ctx, &staging[0], plane_size, padded_pixels),
+            diagnostics::read_plane_f32(ctx, &staging[1], plane_size, padded_pixels),
+            diagnostics::read_plane_f32(ctx, &staging[2], plane_size, padded_pixels),
+        ]
+    }
+
+    /// Expose pre-quantized wavelet coeffs for diagnostics from main.
+    pub fn debug_wavelet_prequant(
+        &mut self,
+        ctx: &GpuContext,
+        rgb_data: &[f32],
+        info: &FrameInfo,
+        config: &CodecConfig,
+    ) -> [Vec<f32>; 3] {
+        let padded_w = info.padded_width();
+        let padded_h = info.padded_height();
+        let padded_pixels = (padded_w * padded_h) as usize;
+        self.ensure_cached(ctx, padded_w, padded_h, info.width, info.height);
+        let staging: [wgpu::Buffer; 3] = std::array::from_fn(|idx| {
+            ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(["tw_dbg_prequant_y", "tw_dbg_prequant_co", "tw_dbg_prequant_cg"][idx]),
+                size: (padded_pixels * std::mem::size_of::<f32>()) as u64,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        });
+        self.diag_original_wavelet_prequant(
+            ctx,
+            rgb_data,
+            padded_w,
+            padded_h,
+            padded_pixels,
+            info,
+            config,
+            &staging,
+        )
+    }
+
+    /// Diagnostic: quantize precomputed wavelet coefficients and return quantized planes.
+    pub fn debug_quantize_wavelet_coeffs(
+        &mut self,
+        ctx: &GpuContext,
+        coeffs: [&[f32]; 3],
+        info: &FrameInfo,
+        config: &CodecConfig,
+    ) -> [Vec<f32>; 3] {
+        let padded_w = info.padded_width();
+        let padded_h = info.padded_height();
+        let padded_pixels = (padded_w * padded_h) as usize;
+        self.ensure_cached(ctx, padded_w, padded_h, info.width, info.height);
+
+        let plane_size = (padded_pixels * std::mem::size_of::<f32>()) as u64;
+        let bufs = self.cached.as_ref().unwrap();
+        let staging: [wgpu::Buffer; 3] = std::array::from_fn(|idx| {
+            ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(["tw_dbg_quant_y", "tw_dbg_quant_co", "tw_dbg_quant_cg"][idx]),
+                size: plane_size,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        });
+
+        let weights_luma = config.subband_weights.pack_weights();
+        let weights_chroma = config.subband_weights.pack_weights_chroma();
+
+        // Submit per-plane: write_buffer data is only flushed at submit-time,
+        // so reusing the same buffer across planes requires separate submits.
+        for p in 0..3 {
+            let weights = if p == 0 {
+                &weights_luma
+            } else {
+                &weights_chroma
+            };
+            ctx.queue
+                .write_buffer(&bufs.plane_c, 0, bytemuck::cast_slice(coeffs[p]));
+            let mut cmd = ctx
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("tw_dbg_quantize"),
+                });
+            self.quantize.dispatch(
+                ctx,
+                &mut cmd,
+                &bufs.plane_c,
+                &bufs.recon_y,
+                padded_pixels as u32,
+                config.quantization_step,
+                config.dead_zone,
+                true,
+                padded_w,
+                padded_h,
+                config.tile_size,
+                config.wavelet_levels,
+                weights,
+            );
+            cmd.copy_buffer_to_buffer(&bufs.recon_y, 0, &staging[p], 0, plane_size);
+            ctx.queue.submit(Some(cmd.finish()));
+        }
+
+        std::array::from_fn(|p| {
+            diagnostics::read_plane_f32(ctx, &staging[p], plane_size, padded_pixels)
+        })
+    }
+
+    /// Encode a frame from pre-quantized wavelet coefficients (CPU entropy path).
+    #[allow(clippy::too_many_arguments)]
+    fn encode_from_wavelet_coeffs(
+        &mut self,
+        ctx: &GpuContext,
+        coeffs: [&[f32]; 3],
+        config: &CodecConfig,
+        info: &FrameInfo,
+        padded_w: u32,
+        padded_h: u32,
+        padded_pixels: usize,
+    ) -> CompressedFrame {
+        let plane_size = (padded_pixels * std::mem::size_of::<f32>()) as u64;
+        let tiles_x = info.tiles_x() as usize;
+        let tiles_y = info.tiles_y() as usize;
+        let tile_size = config.tile_size as usize;
+        let entropy_mode = EntropyMode::from_config(config);
+        let weights_luma = config.subband_weights.pack_weights();
+        let weights_chroma = config.subband_weights.pack_weights_chroma();
+
+        let mut rans_tiles: Vec<rans::InterleavedRansTile> = Vec::new();
+        let mut subband_tiles: Vec<rans::SubbandRansTile> = Vec::new();
+        let mut bp_tiles: Vec<bitplane::BitplaneTile> = Vec::new();
+        let mut rice_tiles: Vec<rice::RiceTile> = Vec::new();
+        let mut huffman_tiles: Vec<huffman::HuffmanTile> = Vec::new();
+
+        let bufs = self.cached.as_ref().unwrap();
+        let staging: [wgpu::Buffer; 3] = std::array::from_fn(|idx| {
+            ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(["tw_quant_y", "tw_quant_co", "tw_quant_cg"][idx]),
+                size: plane_size,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        });
+
+        // Submit per-plane to ensure each write_buffer is flushed before its
+        // dispatch.  A single submit would only see the last write_buffer to
+        // plane_c (wgpu flushes all pending writes at the start of submit).
+        for p in 0..3 {
+            let weights = if p == 0 {
+                &weights_luma
+            } else {
+                &weights_chroma
+            };
+            // Upload coefficients to plane_c
+            ctx.queue
+                .write_buffer(&bufs.plane_c, 0, bytemuck::cast_slice(coeffs[p]));
+
+            let mut cmd = ctx
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("tw_quantize"),
+                });
+
+            // Quantize: plane_c → recon_y (quantized coeffs)
+            self.quantize.dispatch(
+                ctx,
+                &mut cmd,
+                &bufs.plane_c,
+                &bufs.recon_y,
+                padded_pixels as u32,
+                config.quantization_step,
+                config.dead_zone,
+                true,
+                padded_w,
+                padded_h,
+                config.tile_size,
+                config.wavelet_levels,
+                weights,
+            );
+
+            cmd.copy_buffer_to_buffer(&bufs.recon_y, 0, &staging[p], 0, plane_size);
+            ctx.queue.submit(Some(cmd.finish()));
+        }
+
+        // Read back quantized coeffs per plane and CPU-encode tiles
+        for p in 0..3 {
+            let quantized =
+                diagnostics::read_plane_f32(ctx, &staging[p], plane_size, padded_pixels);
+            entropy_helpers::entropy_encode_tiles(
+                &quantized,
+                padded_w as usize,
+                tiles_x,
+                tiles_y,
+                tile_size,
+                &entropy_mode,
+                config.tile_size,
+                config.wavelet_levels,
+                &mut rans_tiles,
+                &mut subband_tiles,
+                &mut bp_tiles,
+                &mut rice_tiles,
+                &mut huffman_tiles,
+            );
+        }
+
+        let entropy = match entropy_mode {
+            EntropyMode::Bitplane => EntropyData::Bitplane(bp_tiles),
+            EntropyMode::SubbandRans | EntropyMode::SubbandRansCtx => {
+                EntropyData::SubbandRans(subband_tiles)
+            }
+            EntropyMode::Rans => EntropyData::Rans(rans_tiles),
+            EntropyMode::Rice => EntropyData::Rice(rice_tiles),
+            EntropyMode::Huffman => EntropyData::Huffman(huffman_tiles),
+        };
+
+        CompressedFrame {
+            info: *info,
+            config: config.clone(),
+            entropy,
+            cfl_alphas: None,
+            weight_map: None,
+            frame_type: FrameType::Intra,
+            motion_field: None,
+            intra_modes: None,
+            residual_stats: None,
+            residual_stats_co: None,
+            residual_stats_cg: None,
+        }
     }
 }

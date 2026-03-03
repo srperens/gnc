@@ -14,7 +14,9 @@ use crate::encoder::huffman_gpu::GpuHuffmanDecoder;
 use crate::encoder::block_transform::BlockTransform;
 use crate::encoder::intra::IntraPredictor;
 use crate::encoder::transform::WaveletTransform;
-use crate::{CompressedFrame, FrameType, GpuContext};
+use crate::encoder::{diagnostics, entropy_helpers};
+use crate::temporal;
+use crate::{CompressedFrame, FrameInfo, FrameType, GpuContext, TemporalEncodedSequence, TemporalTransform};
 
 /// Handle returned by `decode_to_texture` with metadata about the decoded frame.
 /// The actual texture view is accessible via `DecoderPipeline::output_texture_view()`.
@@ -641,6 +643,373 @@ impl DecoderPipeline {
         }
 
         results.into_iter().map(|o| o.unwrap()).collect()
+    }
+
+    /// Decode a temporal-wavelet encoded sequence (in-memory only).
+    pub fn decode_temporal_sequence(
+        &self,
+        ctx: &GpuContext,
+        seq: &TemporalEncodedSequence,
+    ) -> Vec<Vec<f32>> {
+        let mut out: Vec<Vec<f32>> = Vec::with_capacity(seq.frame_count);
+
+        for (group_idx, group) in seq.groups.iter().enumerate() {
+            match seq.mode {
+                TemporalTransform::Haar => {
+                    // Decode low/high frames into dequantized wavelet coeffs
+                    let info = &group.low_frame.info;
+                    let config = &group.low_frame.config;
+                    let low_coeffs = self.decode_wavelet_coeffs(ctx, &group.low_frame);
+
+                    let mut highs_per_level: [Vec<Vec<Vec<f32>>>; 3] = [
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                    ];
+                    if diagnostics::enabled() {
+                        let base = group_idx * seq.gop_size;
+                        let end = base + seq.gop_size - 1;
+                        eprintln!(
+                            "TW DEC group {} frames [{}..{}]",
+                            group_idx, base, end
+                        );
+                        eprintln!("  low <- [{}..{}]", base, end);
+                    }
+                    for lvl in &group.high_frames {
+                        highs_per_level[0].push(Vec::new());
+                        highs_per_level[1].push(Vec::new());
+                        highs_per_level[2].push(Vec::new());
+                        let level_idx = highs_per_level[0].len() - 1;
+                        if diagnostics::enabled() {
+                            let base = group_idx * seq.gop_size;
+                            let span = 1usize << (level_idx + 1);
+                            for idx in 0..lvl.len() {
+                                let s = base + idx * span;
+                                let e = s + span - 1;
+                                eprintln!("  high L{}[{}] <- [{}..{}]", level_idx, idx, s, e);
+                            }
+                        }
+                        for hf in lvl {
+                            let coeffs = self.decode_wavelet_coeffs(ctx, hf);
+                            highs_per_level[0][level_idx].push(coeffs[0].clone());
+                            highs_per_level[1][level_idx].push(coeffs[1].clone());
+                            highs_per_level[2][level_idx].push(coeffs[2].clone());
+                        }
+                    }
+
+                    let y_frames = temporal::haar_multilevel_inverse(
+                        &low_coeffs[0],
+                        &highs_per_level[0],
+                    );
+                    let co_frames = temporal::haar_multilevel_inverse(
+                        &low_coeffs[1],
+                        &highs_per_level[1],
+                    );
+                    let cg_frames = temporal::haar_multilevel_inverse(
+                        &low_coeffs[2],
+                        &highs_per_level[2],
+                    );
+
+                    for i in 0..y_frames.len() {
+                        let rgb = self.decode_from_wavelet_coeffs(
+                            ctx,
+                            info,
+                            config,
+                            [&y_frames[i], &co_frames[i], &cg_frames[i]],
+                        );
+                        out.push(rgb);
+                    }
+                }
+                TemporalTransform::LeGall53 => {
+                    panic!("temporal LeGall53 not supported in multilevel mode yet");
+                }
+                TemporalTransform::None => {}
+            }
+        }
+
+        // Tail I-frames
+        for cf in &seq.tail_iframes {
+            out.push(self.decode(ctx, cf));
+        }
+
+        // If tail was used, out may exceed expected length; trim if needed.
+        if out.len() > seq.frame_count {
+            out.truncate(seq.frame_count);
+        }
+        debug_assert!(
+            out.len() == seq.frame_count || seq.mode == TemporalTransform::None,
+            "decoded temporal sequence length mismatch: got {}, expected {} (gop_size={})",
+            out.len(),
+            seq.frame_count,
+            seq.gop_size
+        );
+        out
+    }
+
+    /// Decode a temporal sequence to dequantized wavelet coefficients per frame.
+    pub fn decode_temporal_wavelet_coeffs(
+        &self,
+        ctx: &GpuContext,
+        seq: &TemporalEncodedSequence,
+    ) -> Vec<[Vec<f32>; 3]> {
+        let mut out: Vec<[Vec<f32>; 3]> = Vec::with_capacity(seq.frame_count);
+
+        for group in &seq.groups {
+            match seq.mode {
+                TemporalTransform::Haar => {
+                    let low_coeffs = self.decode_wavelet_coeffs(ctx, &group.low_frame);
+
+                    let mut highs_per_level: [Vec<Vec<Vec<f32>>>; 3] =
+                        [Vec::new(), Vec::new(), Vec::new()];
+                    for lvl in &group.high_frames {
+                        highs_per_level[0].push(Vec::new());
+                        highs_per_level[1].push(Vec::new());
+                        highs_per_level[2].push(Vec::new());
+                        let level_idx = highs_per_level[0].len() - 1;
+                        for hf in lvl {
+                            let coeffs = self.decode_wavelet_coeffs(ctx, hf);
+                            highs_per_level[0][level_idx].push(coeffs[0].clone());
+                            highs_per_level[1][level_idx].push(coeffs[1].clone());
+                            highs_per_level[2][level_idx].push(coeffs[2].clone());
+                        }
+                    }
+
+                    let y_frames = temporal::haar_multilevel_inverse(
+                        &low_coeffs[0],
+                        &highs_per_level[0],
+                    );
+                    let co_frames = temporal::haar_multilevel_inverse(
+                        &low_coeffs[1],
+                        &highs_per_level[1],
+                    );
+                    let cg_frames = temporal::haar_multilevel_inverse(
+                        &low_coeffs[2],
+                        &highs_per_level[2],
+                    );
+
+                    for i in 0..y_frames.len() {
+                        out.push([y_frames[i].clone(), co_frames[i].clone(), cg_frames[i].clone()]);
+                    }
+                }
+                TemporalTransform::LeGall53 => {
+                    panic!("temporal LeGall53 not supported in multilevel mode yet");
+                }
+                TemporalTransform::None => {}
+            }
+        }
+
+        for cf in &seq.tail_iframes {
+            out.push(self.decode_wavelet_coeffs(ctx, cf));
+        }
+
+        if out.len() > seq.frame_count {
+            out.truncate(seq.frame_count);
+        }
+        out
+    }
+
+    /// Decode a frame to dequantized wavelet coefficients (Y, Co, Cg).
+    fn decode_wavelet_coeffs(&self, ctx: &GpuContext, frame: &CompressedFrame) -> [Vec<f32>; 3] {
+        let info = &frame.info;
+        let config = &frame.config;
+        let padded_w = info.padded_width();
+        let padded_h = info.padded_height();
+        let padded_pixels = (padded_w * padded_h) as usize;
+        let tiles_per_plane = (info.tiles_x() * info.tiles_y()) as usize;
+
+        self.ensure_cached(ctx, padded_w, padded_h, info.width, info.height, info.tile_size);
+        let cached = self.cached.borrow();
+        let bufs = cached.as_ref().unwrap();
+
+        let weights_luma = config.subband_weights.pack_weights();
+        let weights_chroma = config.subband_weights.pack_weights_chroma();
+
+        let mut results: [Vec<f32>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        for p in 0..3 {
+            let quantized = entropy_helpers::entropy_decode_plane(
+                &frame.entropy,
+                p,
+                tiles_per_plane,
+                info.tile_size as usize,
+                padded_w as usize,
+            );
+            ctx.queue
+                .write_buffer(&bufs.scratch_a, 0, bytemuck::cast_slice(&quantized));
+
+            let mut cmd = ctx
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("tw_dequantize"),
+                });
+            let weights = if p == 0 { &weights_luma } else { &weights_chroma };
+            self.quantize.dispatch_adaptive(
+                ctx,
+                &mut cmd,
+                &bufs.scratch_a,
+                &bufs.scratch_b,
+                padded_pixels as u32,
+                config.quantization_step,
+                config.dead_zone,
+                false, // dequantize
+                padded_w,
+                padded_h,
+                config.tile_size,
+                config.wavelet_levels,
+                weights,
+                None,
+                0.0,
+            );
+            let staging = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("tw_dequant_staging"),
+                size: (padded_pixels * std::mem::size_of::<f32>()) as u64,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            cmd.copy_buffer_to_buffer(
+                &bufs.scratch_b,
+                0,
+                &staging,
+                0,
+                (padded_pixels * std::mem::size_of::<f32>()) as u64,
+            );
+            ctx.queue.submit(Some(cmd.finish()));
+
+            // Read back dequantized coeffs
+            let slice = staging.slice(..);
+            let (tx, rx) = std::sync::mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |result| {
+                tx.send(result).unwrap();
+            });
+            ctx.device.poll(wgpu::Maintain::Wait);
+            rx.recv().unwrap().unwrap();
+            let data = slice.get_mapped_range();
+            let coeffs: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
+            drop(data);
+            staging.unmap();
+            results[p] = coeffs;
+        }
+
+        results
+    }
+
+    /// Reconstruct RGB from dequantized wavelet coefficients (Y, Co, Cg).
+    fn decode_from_wavelet_coeffs(
+        &self,
+        ctx: &GpuContext,
+        info: &FrameInfo,
+        config: &crate::CodecConfig,
+        coeffs: [&[f32]; 3],
+    ) -> Vec<f32> {
+        let padded_w = info.padded_width();
+        let padded_h = info.padded_height();
+        let padded_pixels = (padded_w * padded_h) as usize;
+        let plane_size = (padded_pixels * std::mem::size_of::<f32>()) as u64;
+        let output_pixels = info.width * info.height;
+        let output_size = (output_pixels as u64) * 3 * 4;
+
+        self.ensure_cached(ctx, padded_w, padded_h, info.width, info.height, info.tile_size);
+        let cached = self.cached.borrow();
+        let bufs = cached.as_ref().unwrap();
+
+        // Upload coeffs to scratch_b and inverse wavelet per plane
+        for p in 0..3 {
+            ctx.queue
+                .write_buffer(&bufs.scratch_b, 0, bytemuck::cast_slice(coeffs[p]));
+            let mut cmd = ctx
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("tw_inverse_wavelet_plane"),
+                });
+            self.transform.inverse(
+                ctx,
+                &mut cmd,
+                &bufs.scratch_b,
+                &bufs.scratch_c,
+                &bufs.scratch_a,
+                info,
+                config.wavelet_levels,
+                config.wavelet_type,
+            );
+            cmd.copy_buffer_to_buffer(
+                &bufs.scratch_a,
+                0,
+                &bufs.plane_results[p],
+                0,
+                plane_size,
+            );
+            ctx.queue.submit(Some(cmd.finish()));
+        }
+
+        // Interleave + inverse color + crop
+        let mut cmd = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("tw_postprocess"),
+            });
+        self.interleaver.dispatch(
+            ctx,
+            &mut cmd,
+            &bufs.plane_results[0],
+            &bufs.plane_results[1],
+            &bufs.plane_results[2],
+            &bufs.ycocg_buf,
+            padded_pixels as u32,
+        );
+        self.color.dispatch(
+            ctx,
+            &mut cmd,
+            &bufs.ycocg_buf,
+            &bufs.rgb_out_buf,
+            padded_w,
+            padded_h,
+            false,
+            config.is_lossless(),
+        );
+        {
+            let crop_bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("crop_bg_tw"),
+                layout: &self.crop_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: bufs.crop_params_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: bufs.rgb_out_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: bufs.cropped_buf.as_entire_binding(),
+                    },
+                ],
+            });
+            let workgroups = output_pixels.div_ceil(256);
+            let mut pass = cmd.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("crop_pass_tw"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.crop_pipeline);
+            pass.set_bind_group(0, &crop_bg, &[]);
+            pass.dispatch_workgroups(workgroups, 1, 1);
+        }
+
+        cmd.copy_buffer_to_buffer(&bufs.cropped_buf, 0, &bufs.staging, 0, output_size);
+        ctx.queue.submit(Some(cmd.finish()));
+
+        let slice = bufs.staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            tx.send(result).unwrap();
+        });
+        ctx.device.poll(wgpu::Maintain::Wait);
+        rx.recv().unwrap().unwrap();
+        let data = slice.get_mapped_range();
+        let result: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
+        drop(data);
+        bufs.staging.unmap();
+        drop(cached);
+        result
     }
 
     /// Swap reference_planes ↔ bwd_reference_planes at the Rust level (zero GPU cost).

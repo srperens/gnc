@@ -94,6 +94,27 @@ if [ "${1:-}" = "--list" ] || [ "${1:-}" = "-l" ]; then
     exit 0
 fi
 
+# Optional: override frame count
+if [ "${1:-}" = "--frames" ] || [ "${1:-}" = "-n" ]; then
+    if [ -z "${2:-}" ]; then
+        echo "Error: --frames requires a value"
+        exit 1
+    fi
+    FRAME_COUNT="$2"
+    FRAME_COUNT_OVERRIDE=1
+    shift 2
+fi
+
+# Optional: override frame count
+if [ "${1:-}" = "--frames" ] || [ "${1:-}" = "-n" ]; then
+    if [ -z "${2:-}" ]; then
+        echo "Error: --frames requires a value"
+        exit 1
+    fi
+    FRAME_COUNT="$2"
+    shift 2
+fi
+
 if [ $# -gt 0 ]; then
     TARGETS="$*"
 else
@@ -144,6 +165,11 @@ for name in $TARGETS; do
     # Stream y4m directly from URL → ffmpeg, extract only target_frames.
     # curl streams the data; ffmpeg reads only what it needs and both exit early.
     # For .xz files, decompress on the fly via xz -d.
+    # If FRAME_COUNT was explicitly set, honor it even if catalog has a higher count.
+    if [ -n "${FRAME_COUNT_OVERRIDE:-}" ] && [ "$FRAME_COUNT" -lt "$target_frames" ]; then
+        target_frames="$FRAME_COUNT"
+    fi
+
     echo "    Streaming $y4m_file → extracting $target_frames frames ..."
     set +e
     if [[ "$y4m_file" == *.xz ]]; then

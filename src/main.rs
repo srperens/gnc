@@ -15,7 +15,9 @@ use gnc::format::{
     seek_to_keyframe, serialize_compressed, serialize_sequence,
 };
 use gnc::image_util::{load_image_rgb_f32, parse_wavelet_type, save_image_rgb_f32};
-use gnc::{CodecConfig, FrameType, GpuContext, RateMode};
+use gnc::{
+    CodecConfig, CompressedFrame, EntropyData, FrameType, GpuContext, RateMode, TemporalTransform,
+};
 
 #[derive(Parser)]
 #[command(name = "gnc", about = "GPU-native broadcast video codec")]
@@ -180,6 +182,18 @@ enum Command {
         /// Enable per-frame encode diagnostics (also via GNC_DIAGNOSTICS=1)
         #[arg(long)]
         diagnostics: bool,
+
+        /// Temporal wavelet mode: none, haar, 53 (LeGall 5/3)
+        #[arg(long, default_value = "none")]
+        temporal_wavelet: String,
+
+        /// Temporal highpass qstep multiplier (e.g. 2.0 = double qstep for highpass)
+        #[arg(long)]
+        tw_highpass_mul: Option<f32>,
+
+        /// Run A/B comparison against baseline I+P (+ I-only)
+        #[arg(long)]
+        ab: bool,
     },
 
     /// Encode a sequence of image frames into a .gnv container
@@ -335,6 +349,29 @@ fn parse_rate_mode(s: &str) -> RateMode {
             );
             RateMode::VBR
         }
+    }
+}
+
+fn parse_temporal_transform(s: &str) -> TemporalTransform {
+    match s.to_lowercase().as_str() {
+        "none" => TemporalTransform::None,
+        "haar" => TemporalTransform::Haar,
+        "53" | "5/3" | "legall53" | "legall" => TemporalTransform::LeGall53,
+        other => {
+            eprintln!(
+                "Unknown temporal wavelet '{}'. Use 'none', 'haar', or '53'. Defaulting to none.",
+                other
+            );
+            TemporalTransform::None
+        }
+    }
+}
+
+fn csv_with_suffix(path: &str, suffix: &str) -> String {
+    if let Some((base, ext)) = path.rsplit_once('.') {
+        format!("{}_{}.{}", base, suffix, ext)
+    } else {
+        format!("{}_{}", path, suffix)
     }
 }
 
@@ -675,6 +712,9 @@ fn main() {
             fps,
             rans,
             diagnostics,
+            temporal_wavelet,
+            tw_highpass_mul,
+            ab,
         } => {
             if diagnostics {
                 gnc::encoder::diagnostics::enable();
@@ -697,6 +737,19 @@ fn main() {
             let mut encoder = EncoderPipeline::new(&ctx);
             let decoder = DecoderPipeline::new(&ctx);
 
+            let temporal_mode = parse_temporal_transform(&temporal_wavelet);
+            let run_temporal = temporal_mode != TemporalTransform::None;
+            let run_baseline = !run_temporal || ab;
+            if run_temporal && temporal_mode == TemporalTransform::Haar {
+                if !gnc::temporal::is_power_of_two(keyframe_interval as usize) {
+                    eprintln!(
+                        "Temporal Haar requires keyframe_interval to be power of two (got {}).",
+                        keyframe_interval
+                    );
+                    std::process::exit(1);
+                }
+            }
+
             // Load frames from pattern (e.g., "frames/frame_%04d.png")
             let mut frames_data: Vec<Vec<f32>> = Vec::new();
             let mut w = 0u32;
@@ -711,6 +764,16 @@ fn main() {
 
             let frame_refs: Vec<&[f32]> = frames_data.iter().map(|f| f.as_slice()).collect();
 
+            let mut summary_ip: Option<sequence_metrics::SequenceSummary> = None;
+            let mut summary_i: Option<sequence_metrics::SequenceSummary> = None;
+            let mut total_bytes_ip: usize = 0;
+            let mut total_bytes_i: usize = 0;
+            let mut avg_bpp_ip: f64 = 0.0;
+            let mut avg_bpp_i: f64 = 0.0;
+            let mut frame_metrics_ip: Vec<FrameMetrics> = Vec::new();
+            let mut frame_metrics_i: Vec<FrameMetrics> = Vec::new();
+
+            if run_baseline {
             // --- I+P encoding ---
             let mut config_ip = if let Some(q) = quality {
                 gnc::quality_preset(q)
@@ -768,8 +831,8 @@ fn main() {
                 }
             }
 
-            let mut total_bytes_ip: usize = 0;
-            let mut frame_metrics_ip: Vec<FrameMetrics> = Vec::new();
+            total_bytes_ip = 0;
+            frame_metrics_ip.clear();
             for (i, cf) in compressed_ip.iter().enumerate() {
                 let ft = match cf.frame_type {
                     gnc::FrameType::Intra => "I",
@@ -798,7 +861,7 @@ fn main() {
                 });
             }
 
-            let avg_bpp_ip =
+            avg_bpp_ip =
                 compressed_ip.iter().map(|f| f.bpp()).sum::<f64>() / compressed_ip.len() as f64;
             let i_count = compressed_ip
                 .iter()
@@ -825,8 +888,9 @@ fn main() {
             );
 
             // Compute and display I+P sequence summary
-            let summary_ip = sequence_metrics::compute_sequence_metrics(&frame_metrics_ip);
-            println!("\n{}", summary_ip);
+            let summary_ip_local = sequence_metrics::compute_sequence_metrics(&frame_metrics_ip);
+            summary_ip = Some(summary_ip_local.clone());
+            println!("\n{}", summary_ip_local);
 
             // --- All I-frame baseline ---
             let mut config_i = config_ip.clone();
@@ -837,8 +901,8 @@ fn main() {
             let elapsed_i = start.elapsed();
 
             println!("=== All I-frames (baseline) ===");
-            let mut total_bytes_i: usize = 0;
-            let mut frame_metrics_i: Vec<FrameMetrics> = Vec::new();
+            total_bytes_i = 0;
+            frame_metrics_i.clear();
             for (i, cf) in compressed_i.iter().enumerate() {
                 let decoded = decoder.decode(&ctx, cf);
                 let psnr = quality::psnr(&frames_data[i], &decoded, 255.0);
@@ -862,7 +926,7 @@ fn main() {
                 });
             }
 
-            let avg_bpp_i =
+            avg_bpp_i =
                 compressed_i.iter().map(|f| f.bpp()).sum::<f64>() / compressed_i.len() as f64;
 
             println!(
@@ -874,8 +938,9 @@ fn main() {
             );
 
             // Compute and display I-only sequence summary
-            let summary_i = sequence_metrics::compute_sequence_metrics(&frame_metrics_i);
-            println!("\n{}", summary_i);
+            let summary_i_local = sequence_metrics::compute_sequence_metrics(&frame_metrics_i);
+            summary_i = Some(summary_i_local.clone());
+            println!("\n{}", summary_i_local);
 
             // --- Comparison ---
             let saving_pct = (1.0 - total_bytes_ip as f64 / total_bytes_i as f64) * 100.0;
@@ -887,17 +952,478 @@ fn main() {
             // Temporal consistency comparison
             println!(
                 "\n=== Temporal Consistency ===\n  I+P:    max PSNR drop {:.2} dB, consistency {:.2} dB\n  I-only: max PSNR drop {:.2} dB, consistency {:.2} dB",
-                summary_ip.max_psnr_drop,
-                summary_ip.temporal_consistency,
-                summary_i.max_psnr_drop,
-                summary_i.temporal_consistency,
+                summary_ip.as_ref().unwrap().max_psnr_drop,
+                summary_ip.as_ref().unwrap().temporal_consistency,
+                summary_i.as_ref().unwrap().max_psnr_drop,
+                summary_i.as_ref().unwrap().temporal_consistency,
             );
 
             // Write CSV if requested (I+P metrics — the primary encoding mode)
-            if let Some(csv_path) = csv {
-                sequence_metrics::write_sequence_csv(&csv_path, &frame_metrics_ip, &summary_ip)
+            if let Some(ref csv_path) = csv {
+                let out_path = if run_temporal {
+                    csv_with_suffix(csv_path, "ip")
+                } else {
+                    csv_path.clone()
+                };
+                sequence_metrics::write_sequence_csv(
+                    &out_path,
+                    &frame_metrics_ip,
+                    summary_ip.as_ref().unwrap(),
+                )
                     .expect("Failed to write sequence CSV");
-                println!("\nSequence metrics written to {}", csv_path);
+                println!("\nSequence metrics written to {}", out_path);
+            }
+            }
+
+            if run_temporal {
+                // --- Temporal wavelet encoding (in-memory) ---
+                let mut config_tw = if let Some(q) = quality {
+                    gnc::quality_preset(q)
+                } else {
+                    CodecConfig {
+                        quantization_step: qstep.unwrap_or(4.0),
+                        ..Default::default()
+                    }
+                };
+                if let Some(qs) = qstep {
+                    config_tw.quantization_step = qs;
+                }
+                config_tw.keyframe_interval = keyframe_interval;
+                config_tw.temporal_transform = temporal_mode;
+                config_tw.target_bitrate = None; // rate control is sequence-based; disable for temporal mode
+                if let Some(mul) = tw_highpass_mul {
+                    config_tw.temporal_highpass_qstep_mul = mul;
+                }
+                if rans {
+                    config_tw.entropy_coder = gnc::EntropyCoder::Rans;
+                }
+                println!(
+                    "Temporal config: qstep {:.3}, dead_zone {:.3}, entropy {:?}",
+                    config_tw.quantization_step, config_tw.dead_zone, config_tw.entropy_coder
+                );
+
+                let start = std::time::Instant::now();
+                let encoded_tw = encoder.encode_sequence_temporal_wavelet(
+                    &ctx,
+                    &frame_refs,
+                    w,
+                    h,
+                    &config_tw,
+                    temporal_mode,
+                    keyframe_interval as usize,
+                );
+                let elapsed_tw = start.elapsed();
+
+                if let Some(group0) = encoded_tw.groups.first() {
+                    let enc_cfg = &group0.low_frame.config;
+                    println!(
+                        "  Temporal encode cfg (low): qstep {:.3}, dead_zone {:.3}, wavelet_levels {}, subband_weights {:?}",
+                        enc_cfg.quantization_step,
+                        enc_cfg.dead_zone,
+                        enc_cfg.wavelet_levels,
+                        enc_cfg.subband_weights
+                    );
+                    println!(
+                        "  Temporal decode cfg (low): qstep {:.3}, dead_zone {:.3}, wavelet_levels {}, subband_weights {:?}",
+                        enc_cfg.quantization_step,
+                        enc_cfg.dead_zone,
+                        enc_cfg.wavelet_levels,
+                        enc_cfg.subband_weights
+                    );
+                    if let Some(first_lvl) = group0.high_frames.first() {
+                        if let Some(first_high) = first_lvl.first() {
+                            let high_cfg = &first_high.config;
+                            println!(
+                                "  Temporal encode cfg (high L0[0]): qstep {:.3}, dead_zone {:.3}, wavelet_levels {}, subband_weights {:?}",
+                                high_cfg.quantization_step,
+                                high_cfg.dead_zone,
+                                high_cfg.wavelet_levels,
+                                high_cfg.subband_weights
+                            );
+                            println!(
+                                "  Temporal decode cfg (high L0[0]): qstep {:.3}, dead_zone {:.3}, wavelet_levels {}, subband_weights {:?}",
+                                high_cfg.quantization_step,
+                                high_cfg.dead_zone,
+                                high_cfg.wavelet_levels,
+                                high_cfg.subband_weights
+                            );
+                        }
+                    }
+                }
+
+                // Sanity: compare wavelet coeff roundtrip for first GOP
+                let gop = encoded_tw.gop_size.min(frames_data.len());
+                if gop >= 2 {
+                    let info = gnc::FrameInfo {
+                        width: w,
+                        height: h,
+                        bit_depth: 8,
+                        tile_size: config_tw.tile_size,
+                    };
+                    let mut originals: Vec<[Vec<f32>; 3]> = Vec::new();
+                    for i in 0..gop {
+                        originals.push(encoder.debug_wavelet_prequant(
+                            &ctx,
+                            &frames_data[i],
+                            &info,
+                            &config_tw,
+                        ));
+                    }
+                    // Pure temporal Haar roundtrip on wavelet coeffs (no quant/entropy)
+                    if temporal_mode == TemporalTransform::Haar {
+                        let y_in: Vec<&[f32]> = originals.iter().map(|v| v[0].as_slice()).collect();
+                        let co_in: Vec<&[f32]> =
+                            originals.iter().map(|v| v[1].as_slice()).collect();
+                        let cg_in: Vec<&[f32]> =
+                            originals.iter().map(|v| v[2].as_slice()).collect();
+                        let (low_y, highs_y) = gnc::temporal::haar_multilevel_forward(&y_in);
+                        let (low_co, highs_co) = gnc::temporal::haar_multilevel_forward(&co_in);
+                        let (low_cg, highs_cg) = gnc::temporal::haar_multilevel_forward(&cg_in);
+                        let y_rt = gnc::temporal::haar_multilevel_inverse(&low_y, &highs_y);
+                        let co_rt = gnc::temporal::haar_multilevel_inverse(&low_co, &highs_co);
+                        let cg_rt = gnc::temporal::haar_multilevel_inverse(&low_cg, &highs_cg);
+
+                        let mut mean_abs = [0.0f64; 3];
+                        let mut count = 0usize;
+                        for i in 0..gop.min(y_rt.len()) {
+                            for (p, (orig, rt)) in [
+                                (&originals[i][0], &y_rt[i]),
+                                (&originals[i][1], &co_rt[i]),
+                                (&originals[i][2], &cg_rt[i]),
+                            ]
+                            .iter()
+                            .enumerate()
+                            {
+                                let n = orig.len().min(rt.len());
+                                let mut sum = 0.0f64;
+                                for j in 0..n {
+                                    sum += (orig[j] - rt[j]).abs() as f64;
+                                }
+                                mean_abs[p] += sum / n as f64;
+                            }
+                            count += 1;
+                        }
+                        if count > 0 {
+                            println!(
+                                "  Temporal Haar coeff roundtrip (no quant/entropy): mean_abs_diff Y {:.6}, Co {:.6}, Cg {:.6}",
+                                mean_abs[0] / count as f64,
+                                mean_abs[1] / count as f64,
+                                mean_abs[2] / count as f64
+                            );
+                        }
+
+                        // Entropy roundtrip check: quantize vs entropy decode
+                        if !encoded_tw.groups.is_empty() {
+                            let group = &encoded_tw.groups[0];
+                            let tiles_x = info.tiles_x() as usize;
+                            let tiles_y = info.tiles_y() as usize;
+                            let tiles_per_plane = tiles_x * tiles_y;
+                            let padded_w = info.padded_width() as usize;
+                            let tile_size = config_tw.tile_size as usize;
+
+                            let low_quant = encoder.debug_quantize_wavelet_coeffs(
+                                &ctx,
+                                [&low_y, &low_co, &low_cg],
+                                &info,
+                                &config_tw,
+                            );
+
+                            let mut mean_abs_q = [0.0f64; 3];
+                            let mut max_abs_q = [0.0f64; 3];
+                            for p in 0..3 {
+                                let dec = encoder.debug_entropy_decode_plane(
+                                    &group.low_frame.entropy,
+                                    p,
+                                    tiles_per_plane,
+                                    tile_size,
+                                    padded_w,
+                                );
+                                let a = &low_quant[p];
+                                let n = a.len().min(dec.len());
+                                let mut sum = 0.0f64;
+                                let mut maxv = 0.0f64;
+                                for j in 0..n {
+                                    let d = (a[j] - dec[j]).abs() as f64;
+                                    sum += d;
+                                    if d > maxv {
+                                        maxv = d;
+                                    }
+                                }
+                                mean_abs_q[p] = sum / n as f64;
+                                max_abs_q[p] = maxv;
+                            }
+                            println!(
+                                "  Entropy roundtrip (low frame) mean_abs_diff Y {:.6}, Co {:.6}, Cg {:.6} | max_abs Y {:.3}, Co {:.3}, Cg {:.3}",
+                                mean_abs_q[0],
+                                mean_abs_q[1],
+                                mean_abs_q[2],
+                                max_abs_q[0],
+                                max_abs_q[1],
+                                max_abs_q[2]
+                            );
+
+                            if let Some(first_lvl) = group.high_frames.get(0) {
+                                if let Some(first_high) = first_lvl.get(0) {
+                                    let high_y = &highs_y[0][0];
+                                    let high_co = &highs_co[0][0];
+                                    let high_cg = &highs_cg[0][0];
+                                    let high_quant = encoder.debug_quantize_wavelet_coeffs(
+                                        &ctx,
+                                        [high_y, high_co, high_cg],
+                                        &info,
+                                        &config_tw,
+                                    );
+                                    let mut mean_abs_h = [0.0f64; 3];
+                                    let mut max_abs_h = [0.0f64; 3];
+                                    for p in 0..3 {
+                                        let dec = encoder.debug_entropy_decode_plane(
+                                            &first_high.entropy,
+                                            p,
+                                            tiles_per_plane,
+                                            tile_size,
+                                            padded_w,
+                                        );
+                                        let a = &high_quant[p];
+                                        let n = a.len().min(dec.len());
+                                        let mut sum = 0.0f64;
+                                        let mut maxv = 0.0f64;
+                                        for j in 0..n {
+                                            let d = (a[j] - dec[j]).abs() as f64;
+                                            sum += d;
+                                            if d > maxv {
+                                                maxv = d;
+                                            }
+                                        }
+                                        mean_abs_h[p] = sum / n as f64;
+                                        max_abs_h[p] = maxv;
+                                    }
+                                    println!(
+                                        "  Entropy roundtrip (high L0[0]) mean_abs_diff Y {:.6}, Co {:.6}, Cg {:.6} | max_abs Y {:.3}, Co {:.3}, Cg {:.3}",
+                                        mean_abs_h[0],
+                                        mean_abs_h[1],
+                                        mean_abs_h[2],
+                                        max_abs_h[0],
+                                        max_abs_h[1],
+                                        max_abs_h[2]
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    let recon_coeffs = decoder.decode_temporal_wavelet_coeffs(&ctx, &encoded_tw);
+                    let mut mean_abs = [0.0f64; 3];
+                    let mut count = 0usize;
+                    for i in 0..gop.min(recon_coeffs.len()) {
+                        for p in 0..3 {
+                            let a = &originals[i][p];
+                            let b = &recon_coeffs[i][p];
+                            let n = a.len().min(b.len());
+                            let mut sum = 0.0f64;
+                            for j in 0..n {
+                                sum += (a[j] - b[j]).abs() as f64;
+                            }
+                            mean_abs[p] += sum / n as f64;
+                        }
+                        count += 1;
+                    }
+                    if count > 0 {
+                        println!(
+                            "  Temporal coeff roundtrip (first GOP): mean_abs_diff Y {:.4}, Co {:.4}, Cg {:.4}",
+                            mean_abs[0] / count as f64,
+                            mean_abs[1] / count as f64,
+                            mean_abs[2] / count as f64
+                        );
+                    }
+                }
+
+                println!(
+                    "\n=== Temporal wavelet ({:?}) ===",
+                    temporal_mode
+                );
+                let decoded_tw = decoder.decode_temporal_sequence(&ctx, &encoded_tw);
+
+                // Bytes per output frame: distribute group bytes evenly across frames
+                let mut per_frame_bytes: Vec<f64> = vec![0.0; frames_data.len()];
+                let mut idx = 0usize;
+                let group_size = encoded_tw.gop_size.max(1);
+                let mut total_bytes_tw: usize = 0;
+                let mut total_low_bytes: usize = 0;
+                let mut total_high_bytes: usize = 0;
+                let mut high_frame_sizes: Vec<usize> = Vec::new();
+                let mut low_frame_sizes: Vec<usize> = Vec::new();
+                let mut low_frame_ptrs: Vec<&CompressedFrame> = Vec::new();
+                let mut high_level_ptrs: Vec<Vec<&CompressedFrame>> = Vec::new();
+                for group in &encoded_tw.groups {
+                    let low_bytes = group.low_frame.byte_size();
+                    while high_level_ptrs.len() < group.high_frames.len() {
+                        high_level_ptrs.push(Vec::new());
+                    }
+                    let mut high_bytes: usize = 0;
+                    for (level_idx, lvl) in group.high_frames.iter().enumerate() {
+                        for f in lvl {
+                            high_frame_sizes.push(f.byte_size());
+                            high_level_ptrs[level_idx].push(f);
+                            high_bytes += f.byte_size();
+                        }
+                    }
+                    let group_bytes = low_bytes + high_bytes;
+                    total_bytes_tw += group_bytes;
+                    total_low_bytes += low_bytes;
+                    total_high_bytes += high_bytes;
+                    low_frame_sizes.push(low_bytes);
+                    low_frame_ptrs.push(&group.low_frame);
+                    let per = group_bytes as f64 / group_size as f64;
+                    for _ in 0..group_size {
+                        if idx < per_frame_bytes.len() {
+                            per_frame_bytes[idx] = per;
+                            idx += 1;
+                        }
+                    }
+                }
+                for cf in &encoded_tw.tail_iframes {
+                    if idx < per_frame_bytes.len() {
+                        per_frame_bytes[idx] = cf.byte_size() as f64;
+                        idx += 1;
+                    }
+                    total_bytes_tw += cf.byte_size();
+                    total_low_bytes += cf.byte_size();
+                    low_frame_sizes.push(cf.byte_size());
+                    low_frame_ptrs.push(cf);
+                }
+
+                let mut frame_metrics_tw: Vec<FrameMetrics> = Vec::new();
+                for i in 0..frames_data.len() {
+                    let psnr = quality::psnr(&frames_data[i], &decoded_tw[i], 255.0);
+                    let ssim = quality::ssim_approx(&frames_data[i], &decoded_tw[i], 255.0);
+                    let bytes = per_frame_bytes[i];
+                    let bpp = (bytes * 8.0) / (w as f64 * h as f64);
+                    let frame_type = if i >= frames_data.len() - encoded_tw.tail_iframes.len() {
+                        "I"
+                    } else {
+                        "T"
+                    };
+                    println!(
+                        "  Frame {:2} [{}]: {:6.0} bytes, {:.2} bpp, PSNR {:.2} dB, SSIM {:.4}",
+                        i,
+                        frame_type,
+                        bytes,
+                        bpp,
+                        psnr,
+                        ssim,
+                    );
+                    frame_metrics_tw.push(FrameMetrics {
+                        frame_idx: i,
+                        frame_type: frame_type.to_string(),
+                        psnr,
+                        ssim,
+                        bpp,
+                        encoded_bytes: bytes.round() as usize,
+                    });
+                }
+
+                let avg_bpp_tw =
+                    per_frame_bytes.iter().sum::<f64>() * 8.0 / (w as f64 * h as f64) / frames_data.len() as f64;
+                println!(
+                    "  Total: {} bytes, avg {:.2} bpp, {:.1}ms ({:.1} fps)",
+                    total_bytes_tw,
+                    avg_bpp_tw,
+                    elapsed_tw.as_secs_f64() * 1000.0,
+                    frames_data.len() as f64 / elapsed_tw.as_secs_f64(),
+                );
+                if total_bytes_tw > 0 {
+                    let low_pct = (total_low_bytes as f64 / total_bytes_tw as f64) * 100.0;
+                    let high_pct = (total_high_bytes as f64 / total_bytes_tw as f64) * 100.0;
+                    println!(
+                        "  Temporal budget: lowpass {} bytes ({:.1}%), highpass {} bytes ({:.1}%)",
+                        total_low_bytes, low_pct, total_high_bytes, high_pct
+                    );
+                    if !low_frame_sizes.is_empty() {
+                        let low_avg =
+                            low_frame_sizes.iter().sum::<usize>() as f64 / low_frame_sizes.len() as f64;
+                        println!(
+                            "  Temporal lowpass frames: {} (avg {:.0} bytes)",
+                            low_frame_sizes.len(),
+                            low_avg
+                        );
+                    }
+                    if !high_frame_sizes.is_empty() {
+                        let high_avg =
+                            high_frame_sizes.iter().sum::<usize>() as f64 / high_frame_sizes.len() as f64;
+                        println!(
+                            "  Temporal highpass frames: {} (avg {:.0} bytes)",
+                            high_frame_sizes.len(),
+                            high_avg
+                        );
+                    }
+                }
+
+                // --- Temporal stats: mean_abs + percent_zero after quantize per level ---
+                if !low_frame_ptrs.is_empty() && !high_level_ptrs.is_empty() {
+                    let mut accumulate_stats = |frames: &[&CompressedFrame]| -> (f64, f64) {
+                        let mut sum_abs: i64 = 0;
+                        let mut zeros: i64 = 0;
+                        let mut total: i64 = 0;
+                        for cf in frames {
+                            if let EntropyData::Rice(ref tiles) = cf.entropy {
+                                for t in tiles {
+                                    let coeffs = gnc::encoder::rice::rice_decode_tile(t);
+                                    for v in coeffs {
+                                        if v == 0 {
+                                            zeros += 1;
+                                        } else {
+                                            sum_abs += v.abs() as i64;
+                                        }
+                                        total += 1;
+                                    }
+                                }
+                            }
+                        }
+                        if total == 0 {
+                            return (0.0, 0.0);
+                        }
+                        let mean_abs = sum_abs as f64 / total as f64;
+                        let pct_zero = (zeros as f64 / total as f64) * 100.0;
+                        (mean_abs, pct_zero)
+                    };
+
+                    let (low_mean, low_zero) = accumulate_stats(&low_frame_ptrs);
+                    println!(
+                        "  Temporal lowpass quantized: mean_abs {:.3}, zero {:.1}%",
+                        low_mean, low_zero
+                    );
+
+                    for (lvl, frames_lvl) in high_level_ptrs.iter().enumerate() {
+                        let (hi_mean, hi_zero) = accumulate_stats(frames_lvl);
+                        println!(
+                            "  Temporal highpass L{} quantized: mean_abs {:.3}, zero {:.1}%",
+                            lvl, hi_mean, hi_zero
+                        );
+                    }
+                }
+
+                let summary_tw = sequence_metrics::compute_sequence_metrics(&frame_metrics_tw);
+                println!("\n{}", summary_tw);
+
+                if run_baseline {
+                    println!(
+                        "\n=== A/B Comparison ===\n  Baseline I+P: {} bytes ({:.2} bpp)\n  Temporal:     {} bytes ({:.2} bpp)",
+                        total_bytes_ip,
+                        avg_bpp_ip,
+                        total_bytes_tw,
+                        avg_bpp_tw,
+                    );
+                }
+
+                if let Some(ref csv_path) = csv {
+                    let out_path = if run_baseline {
+                        csv_with_suffix(csv_path, "tw")
+                    } else {
+                        csv_path.clone()
+                    };
+                    sequence_metrics::write_sequence_csv(&out_path, &frame_metrics_tw, &summary_tw)
+                        .expect("Failed to write sequence CSV");
+                    println!("\nSequence metrics written to {}", out_path);
+                }
             }
         }
 

@@ -7,6 +7,7 @@ pub mod experiments;
 pub mod format;
 pub mod gpu_util;
 pub mod image_util;
+pub mod temporal;
 
 /// Frame dimensions and format info
 #[derive(Debug, Clone, Copy)]
@@ -173,6 +174,17 @@ pub enum TransformType {
     BlockDCT8,
 }
 
+/// Temporal transform mode (in-memory only for now; not serialized).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TemporalTransform {
+    /// No temporal transform; use normal I/P/B coding.
+    None,
+    /// Haar wavelet across 2 frames (low latency).
+    Haar,
+    /// LeGall 5/3 wavelet across 4 frames (better energy compaction).
+    LeGall53,
+}
+
 /// Rate control mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RateMode {
@@ -256,6 +268,12 @@ pub struct CodecConfig {
     /// Predicts each 8×8 block from left/top neighbors, encodes residual.
     /// 4 modes: DC, Horizontal, Vertical, Diagonal. 2 bits/block overhead.
     pub intra_prediction: bool,
+    /// Temporal transform mode (in-memory only; not serialized yet).
+    pub temporal_transform: TemporalTransform,
+    /// Quantization step multiplier for temporal highpass bands.
+    /// Higher values = coarser quantization of temporal detail = smaller files.
+    /// 1.0 = same as lowpass, 2.0 = double qstep for highpass (good default).
+    pub temporal_highpass_qstep_mul: f32,
 }
 
 impl CodecConfig {
@@ -292,6 +310,8 @@ impl Default for CodecConfig {
             transform_type: TransformType::Wavelet,
             dct_freq_strength: 7.0,
             intra_prediction: false,
+            temporal_transform: TemporalTransform::None,
+            temporal_highpass_qstep_mul: 2.0,
         }
     }
 }
@@ -522,6 +542,23 @@ pub struct CompressedFrame {
     pub residual_stats_co: Option<ResidualStats>,
     /// Cg-plane residual statistics (after MC, before wavelet). Diagnostics only.
     pub residual_stats_cg: Option<ResidualStats>,
+}
+
+/// In-memory temporal wavelet encoding result (not yet serializable).
+#[derive(Debug, Clone)]
+pub struct TemporalEncodedSequence {
+    pub mode: TemporalTransform,
+    pub groups: Vec<TemporalGroup>,
+    pub tail_iframes: Vec<CompressedFrame>,
+    pub frame_count: usize,
+    pub gop_size: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct TemporalGroup {
+    pub low_frame: CompressedFrame,
+    /// Highpass frames grouped by level (level 0 = finest / first split).
+    pub high_frames: Vec<Vec<CompressedFrame>>,
 }
 
 /// Statistics of the spatial-domain residual (current - predicted) for one plane.

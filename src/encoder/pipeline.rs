@@ -5,6 +5,7 @@ use super::bitplane;
 use super::buffer_cache::CachedEncodeBuffers;
 use super::cfl::{self, CflAlphaComputer, CflForwardPredictor, CflPredictor};
 use super::color::ColorConverter;
+use super::entropy_helpers;
 use super::entropy_helpers::{encode_entropy, EntropyMode};
 use super::fused_block::FusedBlock;
 use super::huffman;
@@ -1115,6 +1116,18 @@ impl EncoderPipeline {
             &cached.recon_y,
             padded_pixels,
         ))
+    }
+
+    /// Diagnostic: CPU entropy decode for a single plane.
+    pub fn debug_entropy_decode_plane(
+        &self,
+        entropy: &EntropyData,
+        plane_idx: usize,
+        tiles_per_plane: usize,
+        tile_size: usize,
+        padded_w: usize,
+    ) -> Vec<f32> {
+        entropy_helpers::entropy_decode_plane(entropy, plane_idx, tiles_per_plane, tile_size, padded_w)
     }
 
     /// Read back the raw i32 motion vectors from the encoder's split MV staging buffer.

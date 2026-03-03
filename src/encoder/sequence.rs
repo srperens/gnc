@@ -475,6 +475,7 @@ impl EncoderPipeline {
 
     /// Encode a sequence using a temporal wavelet transform (in-memory only).
     /// This bypasses ME/MC entirely: temporal transform → spatial encode for each coeff frame.
+    #[allow(clippy::too_many_arguments)]
     pub fn encode_sequence_temporal_wavelet(
         &mut self,
         ctx: &GpuContext,
@@ -517,48 +518,143 @@ impl EncoderPipeline {
         let padded_w = info.padded_width();
         let padded_h = info.padded_height();
         let padded_pixels = (padded_w * padded_h) as usize;
+        let plane_size = (padded_pixels * std::mem::size_of::<f32>()) as u64;
         self.ensure_cached(ctx, padded_w, padded_h, width, height);
-        let staging_prequant: [wgpu::Buffer; 3] = std::array::from_fn(|idx| {
-            ctx.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(["tw_prequant_y", "tw_prequant_co", "tw_prequant_cg"][idx]),
-                size: (padded_pixels * std::mem::size_of::<f32>()) as u64,
-                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            })
-        });
         while i + group_size <= frames.len() {
             match mode {
                 TemporalTransform::Haar => {
-                    // 1) Spatial wavelet per frame (pre-quantized coeffs)
-                    let mut per_plane_coeffs: [Vec<Vec<f32>>; 3] =
-                        [Vec::new(), Vec::new(), Vec::new()];
+                    // Allocate per-frame GPU buffers for wavelet coefficients: [frame][plane]
+                    let tw_frame_bufs: Vec<[wgpu::Buffer; 3]> = (0..group_size)
+                        .map(|j| {
+                            std::array::from_fn(|p| {
+                                ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                                    label: Some(&format!("tw_frame_{}_{}", j, p)),
+                                    size: plane_size,
+                                    usage: wgpu::BufferUsages::STORAGE
+                                        | wgpu::BufferUsages::COPY_DST
+                                        | wgpu::BufferUsages::COPY_SRC,
+                                    mapped_at_creation: false,
+                                })
+                            })
+                        })
+                        .collect();
+                    // Snapshot buffers to avoid read-after-write aliasing in multilevel Haar.
+                    // Each level snapshots its inputs before processing, so output writes
+                    // don't corrupt inputs needed by later pairs within the same level.
+                    let tw_snapshot: Vec<wgpu::Buffer> = (0..group_size)
+                        .map(|s| {
+                            ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                                label: Some(&format!("tw_snap_{}", s)),
+                                size: plane_size,
+                                usage: wgpu::BufferUsages::STORAGE
+                                    | wgpu::BufferUsages::COPY_DST
+                                    | wgpu::BufferUsages::COPY_SRC,
+                                mapped_at_creation: false,
+                            })
+                        })
+                        .collect();
+
+                    // 1) Spatial wavelet per frame, keep results on GPU
                     for j in 0..group_size {
-                        let coeffs = self.diag_original_wavelet_prequant(
+                        let bufs = self.cached.as_ref().unwrap();
+                        ctx.queue.write_buffer(
+                            &bufs.raw_input_buf,
+                            0,
+                            bytemuck::cast_slice(frames[i + j]),
+                        );
+                        let mut cmd = ctx
+                            .device
+                            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                label: Some("tw_spatial"),
+                            });
+                        self.dispatch_gpu_pad_cached(ctx, &mut cmd, padded_w, padded_h);
+                        let bufs = self.cached.as_ref().unwrap();
+                        self.color.dispatch(
                             ctx,
-                            frames[i + j],
+                            &mut cmd,
+                            &bufs.input_buf,
+                            &bufs.color_out,
                             padded_w,
                             padded_h,
-                            padded_pixels,
-                            &info,
-                            &cfg,
-                            &staging_prequant,
+                            true,
+                            cfg.is_lossless(),
                         );
-                        for p in 0..3 {
-                            per_plane_coeffs[p].push(coeffs[p].clone());
+                        self.deinterleaver.dispatch(
+                            ctx,
+                            &mut cmd,
+                            &bufs.color_out,
+                            &bufs.plane_a,
+                            &bufs.co_plane,
+                            &bufs.cg_plane,
+                            padded_pixels as u32,
+                        );
+
+                        let planes: [&wgpu::Buffer; 3] =
+                            [&bufs.plane_a, &bufs.co_plane, &bufs.cg_plane];
+                        for (p, &cur_plane) in planes.iter().enumerate() {
+                            self.transform.forward(
+                                ctx,
+                                &mut cmd,
+                                cur_plane,
+                                &bufs.plane_b,
+                                &bufs.plane_c,
+                                &info,
+                                cfg.wavelet_levels,
+                                cfg.wavelet_type,
+                            );
+                            cmd.copy_buffer_to_buffer(
+                                &bufs.plane_c,
+                                0,
+                                &tw_frame_bufs[j][p],
+                                0,
+                                plane_size,
+                            );
                         }
+                        ctx.queue.submit(Some(cmd.finish()));
                     }
 
-                    // 2) Temporal Haar in wavelet domain, per plane
-                    let (low_y, highs_y) = temporal::haar_multilevel_forward(
-                        &per_plane_coeffs[0].iter().map(|v| v.as_slice()).collect::<Vec<_>>(),
-                    );
-                    let (low_co, highs_co) = temporal::haar_multilevel_forward(
-                        &per_plane_coeffs[1].iter().map(|v| v.as_slice()).collect::<Vec<_>>(),
-                    );
-                    let (low_cg, highs_cg) = temporal::haar_multilevel_forward(
-                        &per_plane_coeffs[2].iter().map(|v| v.as_slice()).collect::<Vec<_>>(),
-                    );
+                    // 2) Temporal Haar on GPU, per plane — multilevel dyadic decomposition
+                    // After completion, buffer layout is:
+                    //   buf[0] = final lowpass
+                    //   buf[1] = high L(num_levels-1) (coarsest)
+                    //   buf[2..4] = high L(num_levels-2)
+                    //   buf[gop/2..gop] = high L0 (finest)
+                    let num_levels = (group_size as f64).log2() as usize;
+                    #[allow(clippy::needless_range_loop)] // p indexes 2nd dim of tw_frame_bufs[frame][p]
+                    for p in 0..3 {
+                        let mut current_count = group_size;
+                        let mut cmd = ctx
+                            .device
+                            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                label: Some("tw_temporal_haar"),
+                            });
+                        for _level in 0..num_levels {
+                            let pairs = current_count / 2;
+                            // Snapshot inputs to avoid read-after-write aliasing
+                            for j in 0..current_count {
+                                cmd.copy_buffer_to_buffer(
+                                    &tw_frame_bufs[j][p], 0, &tw_snapshot[j], 0, plane_size,
+                                );
+                            }
+                            // Read from snapshot, write directly to tw_frame_bufs
+                            for pair in 0..pairs {
+                                self.temporal_haar.dispatch(
+                                    ctx,
+                                    &mut cmd,
+                                    &tw_snapshot[pair * 2],
+                                    &tw_snapshot[pair * 2 + 1],
+                                    &tw_frame_bufs[pair][p],
+                                    &tw_frame_bufs[pairs + pair][p],
+                                    padded_pixels as u32,
+                                    true,
+                                );
+                            }
+                            current_count = pairs;
+                        }
+                        ctx.queue.submit(Some(cmd.finish()));
+                    }
 
+                    // Debug logging
                     if diagnostics::enabled() {
                         let group_idx = groups.len();
                         let base = i;
@@ -567,21 +663,16 @@ impl EncoderPipeline {
                             "TW ENC group {} frames [{}..{}]",
                             group_idx, base, end
                         );
-                        eprintln!("  low -> [{}..{}]", base, end);
-                        for lvl in 0..highs_y.len() {
-                            let span = 1usize << (lvl + 1);
-                            for idx in 0..highs_y[lvl].len() {
-                                let s = base + idx * span;
-                                let e = s + span - 1;
-                                eprintln!("  high L{}[{}] -> [{}..{}]", lvl, idx, s, e);
-                            }
-                        }
                     }
 
-                    // 3) Encode low frame
-                    let low_cf = self.encode_from_wavelet_coeffs(
+                    // 3) Encode low frame from GPU buffer
+                    let low_cf = self.encode_from_gpu_wavelet_planes(
                         ctx,
-                        [&low_y, &low_co, &low_cg],
+                        [
+                            &tw_frame_bufs[0][0],
+                            &tw_frame_bufs[0][1],
+                            &tw_frame_bufs[0][2],
+                        ],
                         &cfg,
                         &info,
                         padded_w,
@@ -593,15 +684,18 @@ impl EncoderPipeline {
                     let mut high_cfg = cfg.clone();
                     high_cfg.quantization_step *= config.temporal_highpass_qstep_mul;
                     let mut high_cfs: Vec<Vec<CompressedFrame>> = Vec::new();
-                    for lvl in 0..highs_y.len() {
+                    for lvl in 0..num_levels {
+                        let count = group_size >> (lvl + 1);
+                        let start = group_size >> (lvl + 1);
                         let mut lvl_frames: Vec<CompressedFrame> = Vec::new();
-                        for idx in 0..highs_y[lvl].len() {
-                            let cf = self.encode_from_wavelet_coeffs(
+                        for idx in 0..count {
+                            let buf_idx = start + idx;
+                            let cf = self.encode_from_gpu_wavelet_planes(
                                 ctx,
                                 [
-                                    &highs_y[lvl][idx],
-                                    &highs_co[lvl][idx],
-                                    &highs_cg[lvl][idx],
+                                    &tw_frame_bufs[buf_idx][0],
+                                    &tw_frame_bufs[buf_idx][1],
+                                    &tw_frame_bufs[buf_idx][2],
                                 ],
                                 &high_cfg,
                                 &info,
@@ -2316,6 +2410,8 @@ impl EncoderPipeline {
     }
 
     /// Encode a frame from pre-quantized wavelet coefficients (CPU entropy path).
+    /// Kept for potential future use (e.g. LeGall53 temporal transform).
+    #[allow(dead_code)]
     #[allow(clippy::too_many_arguments)]
     fn encode_from_wavelet_coeffs(
         &mut self,
@@ -2392,9 +2488,125 @@ impl EncoderPipeline {
         }
 
         // Read back quantized coeffs per plane and CPU-encode tiles
-        for p in 0..3 {
+        for stg in &staging {
             let quantized =
-                diagnostics::read_plane_f32(ctx, &staging[p], plane_size, padded_pixels);
+                diagnostics::read_plane_f32(ctx, stg, plane_size, padded_pixels);
+            entropy_helpers::entropy_encode_tiles(
+                &quantized,
+                padded_w as usize,
+                tiles_x,
+                tiles_y,
+                tile_size,
+                &entropy_mode,
+                config.tile_size,
+                config.wavelet_levels,
+                &mut rans_tiles,
+                &mut subband_tiles,
+                &mut bp_tiles,
+                &mut rice_tiles,
+                &mut huffman_tiles,
+            );
+        }
+
+        let entropy = match entropy_mode {
+            EntropyMode::Bitplane => EntropyData::Bitplane(bp_tiles),
+            EntropyMode::SubbandRans | EntropyMode::SubbandRansCtx => {
+                EntropyData::SubbandRans(subband_tiles)
+            }
+            EntropyMode::Rans => EntropyData::Rans(rans_tiles),
+            EntropyMode::Rice => EntropyData::Rice(rice_tiles),
+            EntropyMode::Huffman => EntropyData::Huffman(huffman_tiles),
+        };
+
+        CompressedFrame {
+            info: *info,
+            config: config.clone(),
+            entropy,
+            cfl_alphas: None,
+            weight_map: None,
+            frame_type: FrameType::Intra,
+            motion_field: None,
+            intra_modes: None,
+            residual_stats: None,
+            residual_stats_co: None,
+            residual_stats_cg: None,
+        }
+    }
+
+    /// Like `encode_from_wavelet_coeffs` but takes GPU buffers instead of CPU slices.
+    /// This avoids the CPU readback + re-upload roundtrip for temporal wavelet.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_from_gpu_wavelet_planes(
+        &mut self,
+        ctx: &GpuContext,
+        plane_bufs: [&wgpu::Buffer; 3],
+        config: &CodecConfig,
+        info: &FrameInfo,
+        padded_w: u32,
+        padded_h: u32,
+        padded_pixels: usize,
+    ) -> CompressedFrame {
+        let plane_size = (padded_pixels * std::mem::size_of::<f32>()) as u64;
+        let tiles_x = info.tiles_x() as usize;
+        let tiles_y = info.tiles_y() as usize;
+        let tile_size = config.tile_size as usize;
+        let entropy_mode = EntropyMode::from_config(config);
+        let weights_luma = config.subband_weights.pack_weights();
+        let weights_chroma = config.subband_weights.pack_weights_chroma();
+
+        let mut rans_tiles: Vec<rans::InterleavedRansTile> = Vec::new();
+        let mut subband_tiles: Vec<rans::SubbandRansTile> = Vec::new();
+        let mut bp_tiles: Vec<bitplane::BitplaneTile> = Vec::new();
+        let mut rice_tiles: Vec<rice::RiceTile> = Vec::new();
+        let mut huffman_tiles: Vec<huffman::HuffmanTile> = Vec::new();
+
+        let staging: [wgpu::Buffer; 3] = std::array::from_fn(|idx| {
+            ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(
+                    ["tw_gpu_quant_y", "tw_gpu_quant_co", "tw_gpu_quant_cg"][idx],
+                ),
+                size: plane_size,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        });
+
+        for p in 0..3 {
+            let weights = if p == 0 {
+                &weights_luma
+            } else {
+                &weights_chroma
+            };
+            let bufs = self.cached.as_ref().unwrap();
+            let mut cmd = ctx
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("tw_gpu_quantize"),
+                });
+            // Copy from GPU frame buffer to plane_c (quantizer input)
+            cmd.copy_buffer_to_buffer(plane_bufs[p], 0, &bufs.plane_c, 0, plane_size);
+            self.quantize.dispatch(
+                ctx,
+                &mut cmd,
+                &bufs.plane_c,
+                &bufs.recon_y,
+                padded_pixels as u32,
+                config.quantization_step,
+                config.dead_zone,
+                true,
+                padded_w,
+                padded_h,
+                config.tile_size,
+                config.wavelet_levels,
+                weights,
+            );
+            cmd.copy_buffer_to_buffer(&bufs.recon_y, 0, &staging[p], 0, plane_size);
+            ctx.queue.submit(Some(cmd.finish()));
+        }
+
+        for stg in &staging {
+            let quantized =
+                diagnostics::read_plane_f32(ctx, stg, plane_size, padded_pixels);
             entropy_helpers::entropy_encode_tiles(
                 &quantized,
                 padded_w as usize,

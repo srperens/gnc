@@ -12,6 +12,7 @@ use super::huffman;
 use super::huffman_gpu::GpuHuffmanEncoder;
 use super::interleave::PlaneDeinterleaver;
 use super::intra::IntraPredictor;
+use super::temporal_haar::TemporalHaarGpu;
 use super::quantize::Quantizer;
 use super::quantize_histogram_fused::FusedQuantizeHistogram;
 use super::rans;
@@ -46,6 +47,7 @@ pub struct EncoderPipeline {
     pub(super) fused_qh: FusedQuantizeHistogram,
     pub(super) fused_block: FusedBlock,
     pub(super) intra: IntraPredictor,
+    pub(super) temporal_haar: TemporalHaarGpu,
     pad_pipeline: wgpu::ComputePipeline,
     pad_bgl: wgpu::BindGroupLayout,
     pub(super) cached: Option<CachedEncodeBuffers>,
@@ -132,6 +134,7 @@ impl EncoderPipeline {
             fused_qh: FusedQuantizeHistogram::new(ctx),
             fused_block: FusedBlock::new(ctx),
             intra: IntraPredictor::new(ctx),
+            temporal_haar: TemporalHaarGpu::new(ctx),
             pad_pipeline,
             pad_bgl,
             cached: None,

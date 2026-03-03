@@ -13,6 +13,7 @@ use crate::encoder::rice_gpu::GpuRiceDecoder;
 use crate::encoder::huffman_gpu::GpuHuffmanDecoder;
 use crate::encoder::block_transform::BlockTransform;
 use crate::encoder::intra::IntraPredictor;
+use crate::encoder::temporal_haar::TemporalHaarGpu;
 use crate::encoder::transform::WaveletTransform;
 use crate::encoder::{diagnostics, entropy_helpers};
 use crate::temporal;
@@ -42,6 +43,7 @@ pub struct DecoderPipeline {
     pub(super) motion: MotionEstimator,
     pub(super) block_transform: BlockTransform,
     pub(super) intra: IntraPredictor,
+    pub(super) temporal_haar: TemporalHaarGpu,
     pub(super) crop_pipeline: wgpu::ComputePipeline,
     pub(super) crop_bgl: wgpu::BindGroupLayout,
     pub(super) pack_pipeline: wgpu::ComputePipeline,
@@ -264,6 +266,7 @@ impl DecoderPipeline {
             motion: MotionEstimator::new(ctx),
             block_transform: BlockTransform::new(ctx),
             intra: IntraPredictor::new(ctx),
+            temporal_haar: TemporalHaarGpu::new(ctx),
             crop_pipeline,
             crop_bgl,
             pack_pipeline,
@@ -656,66 +659,127 @@ impl DecoderPipeline {
         for (group_idx, group) in seq.groups.iter().enumerate() {
             match seq.mode {
                 TemporalTransform::Haar => {
-                    // Decode low/high frames into dequantized wavelet coeffs
                     let info = &group.low_frame.info;
                     let config = &group.low_frame.config;
-                    let low_coeffs = self.decode_wavelet_coeffs(ctx, &group.low_frame);
+                    let padded_w = info.padded_width();
+                    let padded_h = info.padded_height();
+                    let padded_pixels = (padded_w * padded_h) as usize;
+                    let plane_size = (padded_pixels * std::mem::size_of::<f32>()) as u64;
+                    let plane_usage = wgpu::BufferUsages::STORAGE
+                        | wgpu::BufferUsages::COPY_DST
+                        | wgpu::BufferUsages::COPY_SRC;
 
-                    let mut highs_per_level: [Vec<Vec<Vec<f32>>>; 3] = [
-                        Vec::new(),
-                        Vec::new(),
-                        Vec::new(),
-                    ];
+                    let num_levels = group.high_frames.len();
+                    let gop_size = 1usize << num_levels;
+
                     if diagnostics::enabled() {
                         let base = group_idx * seq.gop_size;
                         let end = base + seq.gop_size - 1;
                         eprintln!(
-                            "TW DEC group {} frames [{}..{}]",
+                            "TW DEC group {} frames [{}..{}] (GPU Haar inverse)",
                             group_idx, base, end
                         );
-                        eprintln!("  low <- [{}..{}]", base, end);
                     }
-                    for lvl in &group.high_frames {
-                        highs_per_level[0].push(Vec::new());
-                        highs_per_level[1].push(Vec::new());
-                        highs_per_level[2].push(Vec::new());
-                        let level_idx = highs_per_level[0].len() - 1;
-                        if diagnostics::enabled() {
-                            let base = group_idx * seq.gop_size;
-                            let span = 1usize << (level_idx + 1);
-                            for idx in 0..lvl.len() {
-                                let s = base + idx * span;
-                                let e = s + span - 1;
-                                eprintln!("  high L{}[{}] <- [{}..{}]", level_idx, idx, s, e);
+
+                    // Allocate per-frame GPU buffers [frame][plane]
+                    let tw_frame_bufs: Vec<[wgpu::Buffer; 3]> = (0..gop_size)
+                        .map(|j| {
+                            std::array::from_fn(|p| {
+                                ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                                    label: Some(&format!("tw_dec_{}_{}", j, p)),
+                                    size: plane_size,
+                                    usage: plane_usage,
+                                    mapped_at_creation: false,
+                                })
+                            })
+                        })
+                        .collect();
+                    // Snapshot buffers to avoid read-after-write aliasing in multilevel inverse
+                    let tw_snapshot: Vec<wgpu::Buffer> = (0..gop_size)
+                        .map(|s| {
+                            ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                                label: Some(&format!("tw_dec_snap_{}", s)),
+                                size: plane_size,
+                                usage: plane_usage,
+                                mapped_at_creation: false,
+                            })
+                        })
+                        .collect();
+
+                    // Decode low frame -> buf[0]
+                    self.decode_wavelet_coeffs_to_gpu(
+                        ctx,
+                        &group.low_frame,
+                        [
+                            &tw_frame_bufs[0][0],
+                            &tw_frame_bufs[0][1],
+                            &tw_frame_bufs[0][2],
+                        ],
+                    );
+
+                    // Decode high frames -> appropriate buffer positions
+                    // Layout matches encoder: level l highs at buf[(gop >> (l+1))..(gop >> l)]
+                    for lvl in 0..num_levels {
+                        let count = gop_size >> (lvl + 1);
+                        let start = gop_size >> (lvl + 1);
+                        for idx in 0..count {
+                            let buf_idx = start + idx;
+                            self.decode_wavelet_coeffs_to_gpu(
+                                ctx,
+                                &group.high_frames[lvl][idx],
+                                [
+                                    &tw_frame_bufs[buf_idx][0],
+                                    &tw_frame_bufs[buf_idx][1],
+                                    &tw_frame_bufs[buf_idx][2],
+                                ],
+                            );
+                        }
+                    }
+
+                    // GPU temporal Haar inverse, per plane
+                    // Inverse is the reverse of forward: process from coarsest level to finest
+                    // Snapshot inputs before each level to avoid read-after-write aliasing
+                    #[allow(clippy::needless_range_loop)]
+                    for p in 0..3 {
+                        let mut cmd = ctx
+                            .device
+                            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                label: Some("tw_dec_temporal_haar"),
+                            });
+                        let mut current_count = 1usize;
+                        for _level in (0..num_levels).rev() {
+                            let pairs = current_count;
+                            // Snapshot lows + highs for this level
+                            for j in 0..(2 * current_count) {
+                                cmd.copy_buffer_to_buffer(
+                                    &tw_frame_bufs[j][p], 0, &tw_snapshot[j], 0, plane_size,
+                                );
                             }
+                            // Read from snapshot, write directly to tw_frame_bufs
+                            for pair in 0..pairs {
+                                self.temporal_haar.dispatch(
+                                    ctx,
+                                    &mut cmd,
+                                    &tw_snapshot[pair],
+                                    &tw_snapshot[pairs + pair],
+                                    &tw_frame_bufs[pair * 2][p],
+                                    &tw_frame_bufs[pair * 2 + 1][p],
+                                    padded_pixels as u32,
+                                    false, // inverse
+                                );
+                            }
+                            current_count *= 2;
                         }
-                        for hf in lvl {
-                            let coeffs = self.decode_wavelet_coeffs(ctx, hf);
-                            highs_per_level[0][level_idx].push(coeffs[0].clone());
-                            highs_per_level[1][level_idx].push(coeffs[1].clone());
-                            highs_per_level[2][level_idx].push(coeffs[2].clone());
-                        }
+                        ctx.queue.submit(Some(cmd.finish()));
                     }
 
-                    let y_frames = temporal::haar_multilevel_inverse(
-                        &low_coeffs[0],
-                        &highs_per_level[0],
-                    );
-                    let co_frames = temporal::haar_multilevel_inverse(
-                        &low_coeffs[1],
-                        &highs_per_level[1],
-                    );
-                    let cg_frames = temporal::haar_multilevel_inverse(
-                        &low_coeffs[2],
-                        &highs_per_level[2],
-                    );
-
-                    for i in 0..y_frames.len() {
-                        let rgb = self.decode_from_wavelet_coeffs(
+                    // Decode each reconstructed frame from GPU buffers
+                    for frame_bufs in tw_frame_bufs.iter().take(gop_size) {
+                        let rgb = self.decode_from_gpu_wavelet_planes(
                             ctx,
                             info,
                             config,
-                            [&y_frames[i], &co_frames[i], &cg_frames[i]],
+                            [&frame_bufs[0], &frame_bufs[1], &frame_bufs[2]],
                         );
                         out.push(rgb);
                     }
@@ -892,7 +956,75 @@ impl DecoderPipeline {
         results
     }
 
+    /// Decode a frame to dequantized wavelet coefficients and copy directly to GPU buffers.
+    /// Like `decode_wavelet_coeffs` but avoids CPU readback — coefficients stay on GPU.
+    fn decode_wavelet_coeffs_to_gpu(
+        &self,
+        ctx: &GpuContext,
+        frame: &CompressedFrame,
+        dest_bufs: [&wgpu::Buffer; 3],
+    ) {
+        let info = &frame.info;
+        let config = &frame.config;
+        let padded_w = info.padded_width();
+        let padded_h = info.padded_height();
+        let padded_pixels = (padded_w * padded_h) as usize;
+        let plane_size = (padded_pixels * std::mem::size_of::<f32>()) as u64;
+        let tiles_per_plane = (info.tiles_x() * info.tiles_y()) as usize;
+
+        self.ensure_cached(ctx, padded_w, padded_h, info.width, info.height, info.tile_size);
+        let cached = self.cached.borrow();
+        let bufs = cached.as_ref().unwrap();
+
+        let weights_luma = config.subband_weights.pack_weights();
+        let weights_chroma = config.subband_weights.pack_weights_chroma();
+
+        for (p, dest_buf) in dest_bufs.iter().enumerate() {
+            let quantized = entropy_helpers::entropy_decode_plane(
+                &frame.entropy,
+                p,
+                tiles_per_plane,
+                info.tile_size as usize,
+                padded_w as usize,
+            );
+            ctx.queue
+                .write_buffer(&bufs.scratch_a, 0, bytemuck::cast_slice(&quantized));
+
+            let mut cmd = ctx
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("tw_gpu_dequantize"),
+                });
+            let weights = if p == 0 {
+                &weights_luma
+            } else {
+                &weights_chroma
+            };
+            self.quantize.dispatch_adaptive(
+                ctx,
+                &mut cmd,
+                &bufs.scratch_a,
+                &bufs.scratch_b,
+                padded_pixels as u32,
+                config.quantization_step,
+                config.dead_zone,
+                false,
+                padded_w,
+                padded_h,
+                config.tile_size,
+                config.wavelet_levels,
+                weights,
+                None,
+                0.0,
+            );
+            // Copy dequantized coefficients to destination GPU buffer
+            cmd.copy_buffer_to_buffer(&bufs.scratch_b, 0, dest_buf, 0, plane_size);
+            ctx.queue.submit(Some(cmd.finish()));
+        }
+    }
+
     /// Reconstruct RGB from dequantized wavelet coefficients (Y, Co, Cg).
+    #[allow(dead_code)] // Kept for potential future use (CPU-path fallback)
     fn decode_from_wavelet_coeffs(
         &self,
         ctx: &GpuContext,
@@ -994,6 +1126,125 @@ impl DecoderPipeline {
             pass.dispatch_workgroups(workgroups, 1, 1);
         }
 
+        cmd.copy_buffer_to_buffer(&bufs.cropped_buf, 0, &bufs.staging, 0, output_size);
+        ctx.queue.submit(Some(cmd.finish()));
+
+        let slice = bufs.staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            tx.send(result).unwrap();
+        });
+        ctx.device.poll(wgpu::Maintain::Wait);
+        rx.recv().unwrap().unwrap();
+        let data = slice.get_mapped_range();
+        let result: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
+        drop(data);
+        bufs.staging.unmap();
+        drop(cached);
+        result
+    }
+
+    /// Reconstruct RGB from wavelet coefficients that are already on the GPU.
+    /// Like `decode_from_wavelet_coeffs` but uses `copy_buffer_to_buffer` instead of `write_buffer`.
+    fn decode_from_gpu_wavelet_planes(
+        &self,
+        ctx: &GpuContext,
+        info: &FrameInfo,
+        config: &crate::CodecConfig,
+        plane_bufs: [&wgpu::Buffer; 3],
+    ) -> Vec<f32> {
+        let padded_w = info.padded_width();
+        let padded_h = info.padded_height();
+        let padded_pixels = (padded_w * padded_h) as usize;
+        let plane_size = (padded_pixels * std::mem::size_of::<f32>()) as u64;
+        let output_pixels = info.width * info.height;
+        let output_size = (output_pixels as u64) * 3 * 4;
+
+        self.ensure_cached(ctx, padded_w, padded_h, info.width, info.height, info.tile_size);
+        let cached = self.cached.borrow();
+        let bufs = cached.as_ref().unwrap();
+
+        for (p, plane_buf) in plane_bufs.iter().enumerate() {
+            let mut cmd = ctx
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("tw_gpu_inverse_wavelet"),
+                });
+            // Copy from GPU frame buffer to scratch_b (wavelet inverse input)
+            cmd.copy_buffer_to_buffer(plane_buf, 0, &bufs.scratch_b, 0, plane_size);
+            self.transform.inverse(
+                ctx,
+                &mut cmd,
+                &bufs.scratch_b,
+                &bufs.scratch_c,
+                &bufs.scratch_a,
+                info,
+                config.wavelet_levels,
+                config.wavelet_type,
+            );
+            cmd.copy_buffer_to_buffer(
+                &bufs.scratch_a,
+                0,
+                &bufs.plane_results[p],
+                0,
+                plane_size,
+            );
+            ctx.queue.submit(Some(cmd.finish()));
+        }
+
+        // Interleave + inverse color + crop (same as decode_from_wavelet_coeffs)
+        let mut cmd = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("tw_gpu_postprocess"),
+            });
+        self.interleaver.dispatch(
+            ctx,
+            &mut cmd,
+            &bufs.plane_results[0],
+            &bufs.plane_results[1],
+            &bufs.plane_results[2],
+            &bufs.ycocg_buf,
+            padded_pixels as u32,
+        );
+        self.color.dispatch(
+            ctx,
+            &mut cmd,
+            &bufs.ycocg_buf,
+            &bufs.rgb_out_buf,
+            padded_w,
+            padded_h,
+            false,
+            config.is_lossless(),
+        );
+        {
+            let crop_bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("crop_bg_tw_gpu"),
+                layout: &self.crop_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: bufs.crop_params_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: bufs.rgb_out_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: bufs.cropped_buf.as_entire_binding(),
+                    },
+                ],
+            });
+            let workgroups = output_pixels.div_ceil(256);
+            let mut pass = cmd.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("crop_pass_tw_gpu"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.crop_pipeline);
+            pass.set_bind_group(0, &crop_bg, &[]);
+            pass.dispatch_workgroups(workgroups, 1, 1);
+        }
         cmd.copy_buffer_to_buffer(&bufs.cropped_buf, 0, &bufs.staging, 0, output_size);
         ctx.queue.submit(Some(cmd.finish()));
 

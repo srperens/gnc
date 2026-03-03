@@ -23,4 +23,5 @@ pub mod rate_control;
 pub mod rice;
 pub mod rice_gpu;
 mod sequence;
+pub mod temporal_haar;
 pub mod transform;

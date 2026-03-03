@@ -57,6 +57,45 @@
         }
         .drop-zone input { display: none; }
 
+        .file-selector {
+            margin-bottom: 12px;
+        }
+        .file-selector label {
+            display: block;
+            font-size: 0.82em;
+            color: #888;
+            margin-bottom: 4px;
+        }
+        .file-row {
+            display: flex;
+            gap: 6px;
+            align-items: center;
+        }
+        .file-row select {
+            flex: 1;
+            background: #222;
+            color: #e0e0e0;
+            border: 1px solid #444;
+            border-radius: 6px;
+            padding: 7px 10px;
+            font-size: 0.88em;
+            font-family: inherit;
+            cursor: pointer;
+        }
+        .file-row select:hover { border-color: #6c63ff; }
+        .file-row select option { background: #222; }
+        .file-row select optgroup { color: #6c63ff; font-weight: bold; }
+        .file-row button {
+            padding: 7px 14px;
+            font-size: 0.88em;
+        }
+        .file-desc {
+            font-size: 0.75em;
+            color: #666;
+            margin-top: 3px;
+            min-height: 1.2em;
+        }
+
         .canvas-wrap {
             background: #111;
             border-radius: 8px;
@@ -108,6 +147,18 @@
         }
         .stats span { white-space: nowrap; }
 
+        .timing-bar {
+            display: flex;
+            gap: 12px;
+            font-size: 0.78em;
+            color: #888;
+            font-variant-numeric: tabular-nums;
+        }
+        .timing-bar .t-seek { color: #d8c87c; }
+        .timing-bar .t-decode { color: #7cd88b; }
+        .timing-bar .t-total { color: #7cb3d8; }
+        .timing-bar .t-fps { color: #c87cd8; }
+
         .diag-panel {
             margin-top: 4px;
         }
@@ -143,27 +194,6 @@
         .status-error { background: #5f1e1e; color: #d87c7c; }
         .status-ok { background: #1e5f2e; color: #7cd88b; }
 
-        .demos {
-            margin-bottom: 8px;
-        }
-        .demos summary {
-            cursor: pointer;
-            color: #888;
-            font-size: 0.9em;
-            margin-bottom: 6px;
-        }
-        .demo-grid {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 6px;
-        }
-        .demo-grid button {
-            background: #2a2a4a;
-            font-size: 0.78em;
-            padding: 5px 12px;
-        }
-        .demo-grid button:hover { background: #3a3a5a; }
-
         .right-label {
             font-size: 0.78em;
             color: #666;
@@ -171,29 +201,104 @@
             letter-spacing: 0.05em;
             margin-bottom: 2px;
         }
+
+        .log-panel { margin-top: 4px; }
+        .log-panel summary {
+            cursor: pointer;
+            color: #888;
+            font-size: 0.85em;
+            margin-bottom: 4px;
+        }
+        .log-panel summary .log-count {
+            color: #6c63ff;
+            font-variant-numeric: tabular-nums;
+        }
+        .log-toolbar {
+            display: flex;
+            gap: 6px;
+            margin-bottom: 6px;
+            align-items: center;
+        }
+        .log-toolbar button {
+            background: #2a2a4a;
+            font-size: 0.75em;
+            padding: 4px 10px;
+        }
+        .log-toolbar button:hover { background: #3a3a5a; }
+        .log-summary {
+            font-size: 0.72em;
+            color: #888;
+            font-variant-numeric: tabular-nums;
+            margin-left: auto;
+        }
+        .log-wrap {
+            max-height: 300px;
+            overflow-y: auto;
+            border-radius: 6px;
+            background: #111;
+        }
+        .log-wrap table {
+            width: 100%;
+            border-collapse: collapse;
+            font-family: 'SF Mono', 'Menlo', 'Consolas', monospace;
+            font-size: 0.7em;
+            font-variant-numeric: tabular-nums;
+        }
+        .log-wrap th {
+            position: sticky;
+            top: 0;
+            background: #1a1a2e;
+            color: #888;
+            text-align: right;
+            padding: 4px 8px;
+            font-weight: 500;
+            border-bottom: 1px solid #333;
+        }
+        .log-wrap th:first-child { text-align: left; }
+        .log-wrap td {
+            padding: 2px 8px;
+            text-align: right;
+            color: #bbb;
+            border-bottom: 1px solid #1a1a2e;
+        }
+        .log-wrap td:first-child { text-align: left; color: #888; }
+        .log-wrap tr:hover td { background: #1a1a3e; }
+        .log-wrap .col-seek { color: #d8c87c; }
+        .log-wrap .col-decode { color: #7cd88b; }
+        .log-wrap .col-total { color: #7cb3d8; }
+        .log-wrap .col-fps { color: #c87cd8; }
+        .log-wrap .row-gop td { background: #1a1a28; border-top: 1px solid #333; }
     </style>
 </head>
 <body>
     <h1>GNC/GNV WebGPU Player</h1>
-    <p class="subtitle">Drag & drop or select a <code>.gnc</code> / <code>.gnv</code> / <code>.gnv2</code> file</p>
+    <p class="subtitle">Drag & drop, select, or choose a demo file below</p>
 
     <div class="top-section">
-        <!-- Left column: file input + demos + status -->
+        <!-- Left column: file input + file selector + status -->
         <div class="top-left">
             <div class="drop-zone" id="dropZone">
                 <input type="file" id="fileInput" accept=".gnc,.gnv,.gnv2">
-                <p>Click or drop file here</p>
+                <p>Click or drop <code>.gnc</code> / <code>.gnv</code> / <code>.gnv2</code> file here</p>
             </div>
 
-            <details class="demos" open>
-                <summary>Demo files</summary>
-                <div class="demo-grid" id="demoGrid"></div>
-            </details>
+            <div class="file-selector">
+                <label>Demo files</label>
+                <div class="file-row">
+                    <select id="demoSelect">
+                        <option value="">-- Select a demo --</option>
+                    </select>
+                    <button id="loadDemoBtn">Load</button>
+                    <a id="demoDlLink" style="display:none" title="Download"><button type="button" style="background:#2a2a4a;padding:7px 10px;font-size:0.82em;">&#x2B07;</button></a>
+                    <a id="demoDiagLink" style="display:none" target="_blank" title="Open .diag"><button type="button" style="background:#2a2a4a;padding:7px 10px;font-size:0.72em;">diag</button></a>
+                </div>
+                <div class="file-desc" id="demoDesc"></div>
+            </div>
 
             <div id="status" class="status-info">Ready</div>
         </div>
 
-        <!-- Right column: controls + stats + diagnostics -->
+        <!-- Right column: controls + stats + timing + diagnostics -->
         <div class="top-right" id="rightPanel" style="display:none">
             <div class="controls" id="controlsBar">
                 <button id="playBtn" disabled>Play</button>
@@ -206,14 +311,40 @@
                 <span id="statRes"></span>
                 <span id="statFps"></span>
                 <span id="statSize"></span>
-                <span id="statDecode"></span>
-                <span id="statPlayFps"></span>
                 <span id="statPath"></span>
+            </div>
+
+            <div class="timing-bar" id="timingBar">
+                <span class="t-seek" id="timSeek">Seek: --</span>
+                <span class="t-decode" id="timDecode">Decode: --</span>
+                <span class="t-total" id="timTotal">Total: --</span>
+                <span class="t-fps" id="timPlayFps"></span>
             </div>
 
             <details class="diag-panel" id="diagPanel" style="display:none">
                 <summary>Frame diagnostics <a id="diagFullLink" href="#" target="_blank" style="color:#6c63ff;font-size:0.85em;margin-left:8px;text-decoration:none;display:none">open full .diag</a></summary>
                 <div class="diag-content" id="diagContent">No diagnostics available</div>
+            </details>
+
+            <details class="log-panel" id="logPanel">
+                <summary>Timing log <span class="log-count" id="logCount">(0 frames)</span></summary>
+                <div class="log-toolbar">
+                    <button id="logClearBtn">Clear</button>
+                    <button id="logCopyBtn">Copy CSV</button>
+                    <span class="log-summary" id="logSummary"></span>
+                </div>
+                <div class="log-wrap" id="logWrap">
+                    <table>
+                        <thead><tr>
+                            <th>Frame</th>
+                            <th>Seek ms</th>
+                            <th>Decode ms</th>
+                            <th>Total ms</th>
+                            <th>FPS</th>
+                        </tr></thead>
+                        <tbody id="logBody"></tbody>
+                    </table>
+                </div>
             </details>
         </div>
     </div>
@@ -236,7 +367,11 @@
         const frameLabel = $('frameLabel');
         const canvasWrap = $('canvasWrap');
         const rightPanel = $('rightPanel');
-        const statsBar = $('statsBar');
+        const demoSelect = $('demoSelect');
+        const loadDemoBtn = $('loadDemoBtn');
+        const demoDesc = $('demoDesc');
+        const demoDlLink = $('demoDlLink');
+        const demoDiagLink = $('demoDiagLink');
 
         const diagPanel = $('diagPanel');
         const diagContent = $('diagContent');
@@ -252,7 +387,8 @@
         let playbackStartTime = 0;
         let playbackStartFrame = 0;
         let framesSinceLastStat = 0;
-        let statAccumMs = 0;
+        let statSeekAccum = 0;
+        let statDecodeAccum = 0;
         let cachedWidth = 0;
         let cachedHeight = 0;
         let cachedFc = 0;
@@ -262,6 +398,90 @@
         function setStatus(msg, type = 'info') {
             status.textContent = msg;
             status.className = `status-${type}`;
+        }
+
+        // --- Timing log ---
+        let timingLog = []; // { frame, seek, decode, total, fps }
+
+        function fmtMs(v) { return v < 10 ? v.toFixed(2) : v.toFixed(1); }
+
+        function logTiming(frame, seekMs, decodeMs) {
+            const total = seekMs + decodeMs;
+            const fps = total > 0 ? 1000 / total : 0;
+            timingLog.push({ frame, seek: seekMs, decode: decodeMs, total, fps });
+            // Append row to table
+            const body = $('logBody');
+            const tr = document.createElement('tr');
+            tr.innerHTML =
+                `<td>${frame}</td>` +
+                `<td class="col-seek">${fmtMs(seekMs)}</td>` +
+                `<td class="col-decode">${fmtMs(decodeMs)}</td>` +
+                `<td class="col-total">${fmtMs(total)}</td>` +
+                `<td class="col-fps">${fps.toFixed(1)}</td>`;
+            body.appendChild(tr);
+            // Auto-scroll to bottom
+            const wrap = $('logWrap');
+            wrap.scrollTop = wrap.scrollHeight;
+            // Update count + summary
+            updateLogSummary();
+        }
+
+        function updateLogSummary() {
+            const n = timingLog.length;
+            $('logCount').textContent = `(${n} frame${n !== 1 ? 's' : ''})`;
+            if (n === 0) { $('logSummary').textContent = ''; return; }
+            const seeks = timingLog.map(e => e.seek);
+            const decs = timingLog.map(e => e.decode);
+            const tots = timingLog.map(e => e.total);
+            const avg = arr => arr.reduce((a, b) => a + b, 0) / arr.length;
+            const max = arr => Math.max(...arr);
+            const min = arr => Math.min(...arr);
+            const avgTotal = avg(tots);
+            const avgFps = avgTotal > 0 ? (1000 / avgTotal).toFixed(1) : '--';
+            $('logSummary').textContent =
+                `Avg: ${fmtMs(avgTotal)} ms (seek ${fmtMs(avg(seeks))} + dec ${fmtMs(avg(decs))}) ${avgFps} fps` +
+                ` | Min: ${fmtMs(min(tots))} | Max: ${fmtMs(max(tots))}`;
+        }
+
+        function clearTimingLog() {
+            timingLog = [];
+            $('logBody').innerHTML = '';
+            updateLogSummary();
+        }
+
+        function copyTimingCsv() {
+            if (timingLog.length === 0) return;
+            const lines = ['frame,seek_ms,decode_ms,total_ms,fps'];
+            for (const e of timingLog) {
+                lines.push(`${e.frame},${e.seek.toFixed(2)},${e.decode.toFixed(2)},${e.total.toFixed(2)},${e.fps.toFixed(2)}`);
+            }
+            navigator.clipboard.writeText(lines.join('\n')).then(() => {
+                setStatus(`Copied ${timingLog.length} rows to clipboard`, 'ok');
+            });
+        }
+
+        $('logClearBtn').addEventListener('click', clearTimingLog);
+        $('logCopyBtn').addEventListener('click', copyTimingCsv);
+
+        // --- Timing display ---
+        function showTiming(seekMs, decodeMs) {
+            const total = seekMs + decodeMs;
+            $('timSeek').textContent = `Seek: ${fmtMs(seekMs)} ms`;
+            $('timDecode').textContent = `Decode: ${fmtMs(decodeMs)} ms`;
+            $('timTotal').textContent = `Total: ${fmtMs(total)} ms`;
+        }
+        function showTimingAvg(avgSeek, avgDecode) {
+            const total = avgSeek + avgDecode;
+            $('timSeek').textContent = `Seek: ${fmtMs(avgSeek)} ms`;
+            $('timDecode').textContent = `Decode: ${fmtMs(avgDecode)} ms`;
+            $('timTotal').textContent = `Total: ${fmtMs(total)} ms`;
+            $('timPlayFps').textContent = `Play: ${(1000 / total).toFixed(1)} fps`;
+        }
+        function resetTiming() {
+            $('timSeek').textContent = 'Seek: --';
+            $('timDecode').textContent = 'Decode: --';
+            $('timTotal').textContent = 'Total: --';
+            $('timPlayFps').textContent = '';
         }
 
         // --- Diagnostics ---
@@ -373,34 +593,36 @@
 
         // --- Demo files ---
         const demoFiles = [
-            { name: 'test_quick.gnv', label: 'BBB Quick (7 MB)', desc: '10f 30fps 1080p q=75 ki=4' },
-            { name: 'test_animation.gnv', label: 'BBB Short (20 MB)', desc: '30f 30fps 1080p q=75 ki=8' },
-            { name: 'test_nature.gnv', label: 'Park Joy (50 MB)', desc: '30f 50fps 1080p q=75 ki=8' },
-            { name: 'test_crowd.gnv', label: 'Crowd Run (57 MB)', desc: '30f 50fps 1080p q=75 ki=8' },
-            { name: 'rush_hour.gnv', label: 'Rush Hour', desc: '200f 25fps 1080p q=75 ki=8 — city traffic' },
-            { name: 'old_town_cross.gnv', label: 'Old Town Cross', desc: '200f 50fps 1080p q=75 ki=8 — urban pedestrians' },
-            { name: 'stockholm.gnv', label: 'Stockholm', desc: '200f 60fps 720p q=75 ki=8 — cityscape pan' },
-            { name: 'pedestrian_area.gnv', label: 'Pedestrian Area', desc: '200f 25fps 1080p q=75 ki=8 — walking crowd' },
-            { name: 'ducks_q25.gnv', label: 'Ducks q25 (190 MB)', desc: '300f 50fps 1080p q=25 ki=8' },
-            { name: 'ducks_q50.gnv', label: 'Ducks q50 (418 MB)', desc: '300f 50fps 1080p q=50 ki=8' },
-            { name: 'ducks_q75.gnv', label: 'Ducks q75 (698 MB)', desc: '300f 50fps 1080p q=75 ki=8' },
-            { name: 'bbb_2min_q5.gnv', label: 'BBB 2min q5', desc: '1800f 30fps 1080p q=5 ki=24' },
-            { name: 'bbb_2min.gnv', label: 'BBB 2min q75', desc: '1800f 30fps 1080p q=75 ki=24' },
-            // Temporal wavelet (GNV2) demos — mirrors GNV1 set above
-            { name: 'tw_test_quick.gnv2', label: 'TW BBB Quick', desc: '8f 30fps 1080p q=75 Haar' },
-            { name: 'tw_test_animation.gnv2', label: 'TW BBB Short', desc: '24f 30fps 1080p q=75 Haar' },
-            { name: 'tw_test_nature.gnv2', label: 'TW Park Joy', desc: '32f 50fps 1080p q=75 Haar' },
-            { name: 'tw_test_crowd.gnv2', label: 'TW Crowd Run', desc: '32f 50fps 1080p q=75 Haar' },
-            { name: 'tw_rush_hour.gnv2', label: 'TW Rush Hour', desc: '200f 25fps 1080p q=75 Haar' },
-            { name: 'tw_old_town_cross.gnv2', label: 'TW Old Town', desc: '200f 50fps 1080p q=75 Haar' },
-            { name: 'tw_stockholm.gnv2', label: 'TW Stockholm', desc: '200f 60fps 720p q=75 Haar' },
-            { name: 'tw_pedestrian_area.gnv2', label: 'TW Ped. Area', desc: '200f 25fps 1080p q=75 Haar' },
-            { name: 'tw_ducks_q25.gnv2', label: 'TW Ducks q25', desc: '300f 50fps 1080p q=25 Haar' },
-            { name: 'tw_ducks_q50.gnv2', label: 'TW Ducks q50', desc: '300f 50fps 1080p q=50 Haar' },
-            { name: 'tw_ducks_q75.gnv2', label: 'TW Ducks q75', desc: '300f 50fps 1080p q=75 Haar' },
-            { name: 'tw_bbb_2min_q5.gnv2', label: 'TW BBB 2min q5', desc: '1800f 30fps 1080p q=5 Haar' },
-            { name: 'tw_bbb_2min.gnv2', label: 'TW BBB 2min q75', desc: '1800f 30fps 1080p q=75 Haar' },
+            // GNV1 files
+            { name: 'test_quick.gnv', label: 'BBB Quick', desc: '10f 30fps 1080p q=75 ki=4', group: 'GNV1' },
+            { name: 'test_animation.gnv', label: 'BBB Short', desc: '30f 30fps 1080p q=75 ki=8', group: 'GNV1' },
+            { name: 'test_nature.gnv', label: 'Park Joy', desc: '30f 50fps 1080p q=75 ki=8', group: 'GNV1' },
+            { name: 'test_crowd.gnv', label: 'Crowd Run', desc: '30f 50fps 1080p q=75 ki=8', group: 'GNV1' },
+            { name: 'rush_hour.gnv', label: 'Rush Hour', desc: '200f 25fps 1080p q=75 ki=8 -- city traffic', group: 'GNV1' },
+            { name: 'old_town_cross.gnv', label: 'Old Town Cross', desc: '200f 50fps 1080p q=75 ki=8 -- urban pedestrians', group: 'GNV1' },
+            { name: 'stockholm.gnv', label: 'Stockholm', desc: '200f 60fps 720p q=75 ki=8 -- cityscape pan', group: 'GNV1' },
+            { name: 'pedestrian_area.gnv', label: 'Pedestrian Area', desc: '200f 25fps 1080p q=75 ki=8 -- walking crowd', group: 'GNV1' },
+            { name: 'ducks_q25.gnv', label: 'Ducks q25', desc: '300f 50fps 1080p q=25 ki=8', group: 'GNV1' },
+            { name: 'ducks_q50.gnv', label: 'Ducks q50', desc: '300f 50fps 1080p q=50 ki=8', group: 'GNV1' },
+            { name: 'ducks_q75.gnv', label: 'Ducks q75', desc: '300f 50fps 1080p q=75 ki=8', group: 'GNV1' },
+            { name: 'bbb_2min_q5.gnv', label: 'BBB 2min q5', desc: '1800f 30fps 1080p q=5 ki=24', group: 'GNV1' },
+            { name: 'bbb_2min.gnv', label: 'BBB 2min q75', desc: '1800f 30fps 1080p q=75 ki=24', group: 'GNV1' },
+            // GNV2 temporal wavelet files
+            { name: 'tw_test_quick.gnv2', label: 'BBB Quick', desc: '8f 30fps 1080p q=75 Haar', group: 'GNV2 (Temporal Wavelet)' },
+            { name: 'tw_test_animation.gnv2', label: 'BBB Short', desc: '24f 30fps 1080p q=75 Haar', group: 'GNV2 (Temporal Wavelet)' },
+            { name: 'tw_test_nature.gnv2', label: 'Park Joy', desc: '32f 50fps 1080p q=75 Haar', group: 'GNV2 (Temporal Wavelet)' },
+            { name: 'tw_test_crowd.gnv2', label: 'Crowd Run', desc: '32f 50fps 1080p q=75 Haar', group: 'GNV2 (Temporal Wavelet)' },
+            { name: 'tw_rush_hour.gnv2', label: 'Rush Hour', desc: '200f 25fps 1080p q=75 Haar', group: 'GNV2 (Temporal Wavelet)' },
+            { name: 'tw_old_town_cross.gnv2', label: 'Old Town', desc: '200f 50fps 1080p q=75 Haar', group: 'GNV2 (Temporal Wavelet)' },
+            { name: 'tw_stockholm.gnv2', label: 'Stockholm', desc: '200f 60fps 720p q=75 Haar', group: 'GNV2 (Temporal Wavelet)' },
+            { name: 'tw_pedestrian_area.gnv2', label: 'Ped. Area', desc: '200f 25fps 1080p q=75 Haar', group: 'GNV2 (Temporal Wavelet)' },
+            { name: 'tw_ducks_q25.gnv2', label: 'Ducks q25', desc: '300f 50fps 1080p q=25 Haar', group: 'GNV2 (Temporal Wavelet)' },
+            { name: 'tw_ducks_q50.gnv2', label: 'Ducks q50', desc: '300f 50fps 1080p q=50 Haar', group: 'GNV2 (Temporal Wavelet)' },
+            { name: 'tw_ducks_q75.gnv2', label: 'Ducks q75', desc: '300f 50fps 1080p q=75 Haar', group: 'GNV2 (Temporal Wavelet)' },
+            { name: 'tw_bbb_2min_q5.gnv2', label: 'BBB 2min q5', desc: '1800f 30fps 1080p q=5 Haar', group: 'GNV2 (Temporal Wavelet)' },
+            { name: 'tw_bbb_2min.gnv2', label: 'BBB 2min q75', desc: '1800f 30fps 1080p q=75 Haar', group: 'GNV2 (Temporal Wavelet)' },
         ];
+
         function formatSize(bytes) {
             if (bytes >= 1e9) return (bytes / 1e9).toFixed(1) + ' GB';
             if (bytes >= 1e6) return (bytes / 1e6).toFixed(0) + ' MB';
@@ -408,46 +630,62 @@
             return bytes + ' B';
         }
 
-        const demoGrid = $('demoGrid');
+        // Build grouped <optgroup> dropdown
+        const groups = {};
         for (const d of demoFiles) {
-            const wrap = document.createElement('span');
-            wrap.style.display = 'inline-flex'; wrap.style.gap = '0';
-
-            const btn = document.createElement('button');
-            btn.textContent = d.label;
-            btn.title = d.desc;
-            btn.style.borderRadius = '6px 0 0 6px';
-            btn.addEventListener('click', () => loadUrl(d.name));
-
-            // Probe file size via HEAD and append to button label
-            fetch(d.name, { method: 'HEAD' }).then(r => {
-                const cl = r.headers.get('content-length');
-                if (cl && r.ok) {
-                    const sz = parseInt(cl, 10);
-                    btn.textContent = `${d.label} (${formatSize(sz)})`;
-                }
-            }).catch(() => {});
-
-            const dl = document.createElement('a');
-            dl.href = d.name;
-            dl.download = d.name;
-            dl.textContent = '\u2B07';
-            dl.title = 'Download ' + d.name;
-            dl.style.cssText = 'background:#222;color:#888;border-radius:0 0 0 0;padding:5px 7px;font-size:0.82em;text-decoration:none;display:flex;align-items:center;border-left:1px solid #333;';
-
-            const diagLink = document.createElement('a');
-            const diagName = d.name.replace(/\.gnv2?$/, '.diag');
-            diagLink.href = diagName;
-            diagLink.target = '_blank';
-            diagLink.textContent = 'diag';
-            diagLink.title = 'Open ' + diagName + ' in new tab';
-            diagLink.style.cssText = 'background:#222;color:#888;border-radius:0 6px 6px 0;padding:5px 7px;font-size:0.72em;text-decoration:none;display:flex;align-items:center;border-left:1px solid #333;';
-
-            wrap.appendChild(btn);
-            wrap.appendChild(dl);
-            wrap.appendChild(diagLink);
-            demoGrid.appendChild(wrap);
+            if (!groups[d.group]) groups[d.group] = [];
+            groups[d.group].push(d);
         }
+        for (const [groupName, files] of Object.entries(groups)) {
+            const optgroup = document.createElement('optgroup');
+            optgroup.label = groupName;
+            for (const f of files) {
+                const opt = document.createElement('option');
+                opt.value = f.name;
+                opt.textContent = f.label;
+                opt.dataset.desc = f.desc;
+                optgroup.appendChild(opt);
+
+                // Probe file size via HEAD
+                fetch(f.name, { method: 'HEAD' }).then(r => {
+                    const cl = r.headers.get('content-length');
+                    if (cl && r.ok) {
+                        opt.textContent = `${f.label} (${formatSize(parseInt(cl, 10))})`;
+                    }
+                }).catch(() => {});
+            }
+            demoSelect.appendChild(optgroup);
+        }
+
+        // Show description + links when selection changes
+        demoSelect.addEventListener('change', () => {
+            const sel = demoSelect.selectedOptions[0];
+            if (!sel || !sel.value) {
+                demoDesc.textContent = '';
+                demoDlLink.style.display = 'none';
+                demoDiagLink.style.display = 'none';
+                return;
+            }
+            demoDesc.textContent = sel.dataset.desc || '';
+            demoDlLink.href = sel.value;
+            demoDlLink.download = sel.value;
+            demoDlLink.style.display = '';
+            const diagName = sel.value.replace(/\.gnv2?$/, '.diag');
+            demoDiagLink.href = diagName;
+            demoDiagLink.title = 'Open ' + diagName;
+            demoDiagLink.style.display = '';
+        });
+
+        loadDemoBtn.addEventListener('click', () => {
+            const val = demoSelect.value;
+            if (val) loadUrl(val);
+        });
+
+        // Double-click on select to load immediately
+        demoSelect.addEventListener('dblclick', () => {
+            const val = demoSelect.value;
+            if (val) loadUrl(val);
+        });
 
         async function loadUrl(filename) {
             if (!wasmReady) { setStatus('WASM still loading, please wait...', 'info'); return; }
@@ -541,8 +779,8 @@
             $('statRes').textContent = `${w}x${h}`;
             $('statFps').textContent = `${fps.toFixed(1)} fps`;
             $('statSize').textContent = formatSize(buf.byteLength);
-            $('statDecode').textContent = '';
-            $('statPlayFps').textContent = '';
+            resetTiming();
+            clearTimingLog();
 
             playBtn.disabled = false;
             stopBtn.disabled = false;
@@ -562,17 +800,21 @@
 
             // Decode first frame
             setStatus('Decoding frame 0...');
-            const t0 = performance.now();
             if (zeroCopy) {
                 player.decode_and_present();
+                const sk = player.last_seek_ms, dk = player.last_decode_ms;
+                showTiming(sk, dk);
+                logTiming(0, sk, dk);
             } else {
+                const t0 = performance.now();
                 const rgba = await player.decode_next_frame();
                 paintFrame(rgba, w, h);
+                const dt = performance.now() - t0;
+                showTiming(0, dt);
+                logTiming(0, 0, dt);
             }
-            const dt = performance.now() - t0;
             seekBar.value = 0;
             updateFrameLabel(0);
-            $('statDecode').textContent = `Decode: ${dt.toFixed(1)} ms`;
             setStatus(`${name} loaded (${fc} frame${fc > 1 ? 's' : ''})`, 'ok');
 
             player.reset();
@@ -605,7 +847,6 @@
                 return;
             }
 
-            const t0 = performance.now();
             if (zeroCopy) {
                 player.decode_and_present();
             } else {
@@ -613,7 +854,10 @@
                 if (!playing) return;
                 paintFrame(rgba, cachedWidth, cachedHeight);
             }
-            const dt = performance.now() - t0;
+
+            const seekMs = zeroCopy ? player.last_seek_ms : 0;
+            const decodeMs = zeroCopy ? player.last_decode_ms : 0;
+
             jsCurrentFrame++;
             if (jsCurrentFrame >= cachedFc) jsCurrentFrame = 0;
 
@@ -623,6 +867,9 @@
             seekBar.value = displayFrame;
             updateFrameLabel(displayFrame);
 
+            // Log per-frame timing
+            logTiming(displayFrame, seekMs, decodeMs);
+
             const behind = targetFrame - displayFrame;
             if (behind > 3) {
                 playbackStartTime = performance.now();
@@ -630,13 +877,15 @@
             }
 
             framesSinceLastStat++;
-            statAccumMs += dt;
+            statSeekAccum += seekMs;
+            statDecodeAccum += decodeMs;
             if (framesSinceLastStat >= 10) {
-                const avg = statAccumMs / framesSinceLastStat;
-                $('statDecode').textContent = `Decode: ${avg.toFixed(1)} ms`;
-                $('statPlayFps').textContent = `Play: ${(1000 / avg).toFixed(1)} fps`;
+                const avgSeek = statSeekAccum / framesSinceLastStat;
+                const avgDecode = statDecodeAccum / framesSinceLastStat;
+                showTimingAvg(avgSeek, avgDecode);
                 framesSinceLastStat = 0;
-                statAccumMs = 0;
+                statSeekAccum = 0;
+                statDecodeAccum = 0;
                 showDiag(displayFrame);
             }
 
@@ -662,7 +911,8 @@
             playbackStartTime = performance.now();
             playbackStartFrame = jsCurrentFrame;
             framesSinceLastStat = 0;
-            statAccumMs = 0;
+            statSeekAccum = 0;
+            statDecodeAccum = 0;
             animId = requestAnimationFrame(playLoop);
         }
 
@@ -679,7 +929,7 @@
                 jsCurrentFrame = 0;
                 seekBar.value = 0;
                 updateFrameLabel(0);
-                $('statPlayFps').textContent = '';
+                $('timPlayFps').textContent = '';
             }
         }
 
@@ -690,9 +940,16 @@
                 jsCurrentFrame = 0;
                 if (zeroCopy) {
                     player.decode_and_present();
+                    const sk = player.last_seek_ms, dk = player.last_decode_ms;
+                    showTiming(sk, dk);
+                    logTiming(0, sk, dk);
                 } else {
+                    const t0 = performance.now();
                     player.decode_next_frame().then(rgba => {
                         paintFrame(rgba, cachedWidth, cachedHeight);
+                        const dt = performance.now() - t0;
+                        showTiming(0, dt);
+                        logTiming(0, 0, dt);
                     });
                 }
                 return;
@@ -706,6 +963,9 @@
             // Re-decode frame 0
             if (zeroCopy) {
                 player.decode_and_present();
+                const sk = player.last_seek_ms, dk = player.last_decode_ms;
+                showTiming(sk, dk);
+                logTiming(0, sk, dk);
             } else {
                 player.decode_next_frame().then(rgba => {
                     paintFrame(rgba, cachedWidth, cachedHeight);
@@ -723,17 +983,21 @@
             pause();
             const target = parseInt(seekBar.value, 10);
             setStatus(`Seeking to frame ${target}...`);
-            const t0 = performance.now();
             if (zeroCopy) {
                 player.seek_and_present(target);
+                const sk = player.last_seek_ms, dk = player.last_decode_ms;
+                showTiming(sk, dk);
+                logTiming(target, sk, dk);
             } else {
+                const t0 = performance.now();
                 const rgba = await player.seek(target);
                 paintFrame(rgba, cachedWidth, cachedHeight);
+                const dt = performance.now() - t0;
+                showTiming(0, dt);
+                logTiming(target, 0, dt);
             }
-            const dt = performance.now() - t0;
             jsCurrentFrame = target + 1;
             updateFrameLabel(target);
-            $('statDecode').textContent = `Seek+decode: ${dt.toFixed(1)} ms`;
             setStatus(`Frame ${target}`, 'ok');
             showDiag(target);
         });

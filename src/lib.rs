@@ -807,6 +807,18 @@ pub mod wasm {
         Ok(())
     }
 
+    /// Pre-allocated GPU buffers for one GOP's temporal wavelet decode.
+    struct TwBufSet {
+        frame_bufs: Vec<[wgpu::Buffer; 3]>,
+        snapshot_bufs: Vec<wgpu::Buffer>,
+    }
+
+    impl Default for TwBufSet {
+        fn default() -> Self {
+            Self { frame_bufs: Vec::new(), snapshot_bufs: Vec::new() }
+        }
+    }
+
     #[wasm_bindgen]
     pub struct GnvPlayer {
         ctx: crate::GpuContext,
@@ -828,13 +840,25 @@ pub mod wasm {
         blit_sampler: Option<wgpu::Sampler>,
         /// Pre-decoded GPU textures for B-frame group buffering (zero-copy path).
         buffered_textures: std::collections::BTreeMap<usize, wgpu::Texture>,
-        /// GNV2: pre-decoded wavelet-domain GPU buffers (per frame, 3 planes).
-        /// Phase 1 (entropy + temporal Haar) done once per GOP.
-        /// Phase 2 (inverse wavelet + color) done per frame in decode_and_present.
-        tw_wavelet_bufs: Vec<[wgpu::Buffer; 3]>,
+        /// GNV2: base index of the currently-decoded GOP (usize::MAX = none).
         tw_gop_base: usize,
         tw_gop_info: Option<crate::FrameInfo>,
         tw_gop_config: Option<crate::CodecConfig>,
+        /// Timing: last seek phase (keyframe→target or GOP Phase 1) in ms.
+        last_seek_ms: f64,
+        /// Timing: last decode phase (single-frame decode+present) in ms.
+        last_decode_ms: f64,
+        /// Double-buffered GOP decode: two sets of frame/snapshot buffers.
+        /// Set 0 = active (current GOP), Set 1 = prefetch (next GOP).
+        tw_buf_sets: [TwBufSet; 2],
+        /// Which buffer set (0 or 1) holds the current GOP.
+        tw_active: usize,
+        /// GOP base of the prefetched set (usize::MAX = none).
+        tw_prefetch_base: usize,
+        /// Plane size of cached buffers (to detect when re-allocation is needed).
+        tw_cached_plane_size: u64,
+        /// GOP size of cached buffers.
+        tw_cached_gop_size: usize,
     }
 
     #[wasm_bindgen]
@@ -873,10 +897,16 @@ pub mod wasm {
                     blit_bgl: None,
                     blit_sampler: None,
                     buffered_textures: std::collections::BTreeMap::new(),
-                    tw_wavelet_bufs: Vec::new(),
-                    tw_gop_base: 0,
+                    tw_gop_base: usize::MAX,
                     tw_gop_info: None,
                     tw_gop_config: None,
+                    last_seek_ms: 0.0,
+                    last_decode_ms: 0.0,
+                    tw_buf_sets: [TwBufSet::default(), TwBufSet::default()],
+                    tw_active: 0,
+                    tw_prefetch_base: usize::MAX,
+                    tw_cached_plane_size: 0,
+                    tw_cached_gop_size: 0,
                 })
             } else if is_gnv {
                 let header = crate::format::deserialize_sequence_header(&data);
@@ -901,10 +931,16 @@ pub mod wasm {
                     blit_bgl: None,
                     blit_sampler: None,
                     buffered_textures: std::collections::BTreeMap::new(),
-                    tw_wavelet_bufs: Vec::new(),
-                    tw_gop_base: 0,
+                    tw_gop_base: usize::MAX,
                     tw_gop_info: None,
                     tw_gop_config: None,
+                    last_seek_ms: 0.0,
+                    last_decode_ms: 0.0,
+                    tw_buf_sets: [TwBufSet::default(), TwBufSet::default()],
+                    tw_active: 0,
+                    tw_prefetch_base: usize::MAX,
+                    tw_cached_plane_size: 0,
+                    tw_cached_gop_size: 0,
                 })
             } else {
                 // Single-frame .gnc
@@ -928,10 +964,16 @@ pub mod wasm {
                     blit_bgl: None,
                     blit_sampler: None,
                     buffered_textures: std::collections::BTreeMap::new(),
-                    tw_wavelet_bufs: Vec::new(),
-                    tw_gop_base: 0,
+                    tw_gop_base: usize::MAX,
                     tw_gop_info: None,
                     tw_gop_config: None,
+                    last_seek_ms: 0.0,
+                    last_decode_ms: 0.0,
+                    tw_buf_sets: [TwBufSet::default(), TwBufSet::default()],
+                    tw_active: 0,
+                    tw_prefetch_base: usize::MAX,
+                    tw_cached_plane_size: 0,
+                    tw_cached_gop_size: 0,
                 })
             }
         }
@@ -964,6 +1006,18 @@ pub mod wasm {
         #[wasm_bindgen(getter)]
         pub fn current_frame(&self) -> u32 {
             self.current_frame as u32
+        }
+
+        /// Time spent in seek phase (keyframe→target or GOP Phase 1) in ms.
+        #[wasm_bindgen(getter)]
+        pub fn last_seek_ms(&self) -> f64 {
+            self.last_seek_ms
+        }
+
+        /// Time spent in decode phase (single-frame decode+present) in ms.
+        #[wasm_bindgen(getter)]
+        pub fn last_decode_ms(&self) -> f64 {
+            self.last_decode_ms
         }
 
         /// Decode the next frame and return RGBA u8 data.
@@ -1290,16 +1344,19 @@ pub mod wasm {
         /// Decode the next frame and present it directly to the canvas (zero-copy).
         /// No data is returned to JS. Advances the frame counter.
         /// Handles B-frame reordering with GPU texture buffering.
+        /// Updates `last_seek_ms` and `last_decode_ms` timing fields.
         pub fn decode_and_present(&mut self) -> Result<(), JsValue> {
             if self.current_frame >= self.frame_count as usize {
                 self.current_frame = 0;
                 self.buffered_textures.clear();
                 self.buffered_frames.clear();
-                self.tw_wavelet_bufs.clear();
+                self.tw_gop_base = usize::MAX;
             }
 
             // Return buffered texture if available (from a previous B-frame group decode)
             if let Some(texture) = self.buffered_textures.remove(&self.current_frame) {
+                self.last_seek_ms = 0.0;
+                let t_dec = Self::now_ms();
                 let view =
                     texture.create_view(&wgpu::TextureViewDescriptor::default());
                 blit_to_surface(
@@ -1311,6 +1368,7 @@ pub mod wasm {
                     self.blit_sampler.as_ref().unwrap(),
                     &view,
                 )?;
+                self.last_decode_ms = Self::now_ms() - t_dec;
                 self.current_frame += 1;
                 return Ok(());
             }
@@ -1325,42 +1383,77 @@ pub mod wasm {
 
                 if gop_idx < num_groups {
                     let frame_in_gop = self.current_frame - gop_idx * gop_size;
+                    let gop_base = gop_idx * gop_size;
 
-                    // Phase 1: decode GOP wavelet bufs if not already cached
-                    if self.tw_wavelet_bufs.is_empty() || self.tw_gop_base != gop_idx * gop_size {
-                        let group = crate::format::deserialize_temporal_group(
-                            &self.data, th, gop_idx,
-                        );
-                        self.tw_gop_info = Some(group.low_frame.info.clone());
-                        self.tw_gop_config = Some(group.low_frame.config.clone());
-                        self.tw_wavelet_bufs = self.decoder.decode_temporal_gop_to_wavelet_bufs(
-                            &self.ctx, &group, gop_size,
-                        );
-                        self.tw_gop_base = gop_idx * gop_size;
+                    // Phase 1: decode GOP wavelet bufs if not cached
+                    if self.tw_gop_base != gop_base {
+                        // Check if prefetch already decoded this GOP
+                        if self.tw_prefetch_base == gop_base {
+                            // Swap: prefetched set becomes active
+                            self.tw_active = 1 - self.tw_active;
+                            self.tw_gop_base = gop_base;
+                            self.tw_prefetch_base = usize::MAX;
+                            self.last_seek_ms = 0.0;
+                        } else {
+                            let t_seek = Self::now_ms();
+                            let group = crate::format::deserialize_temporal_group(
+                                &self.data, th, gop_idx,
+                            );
+                            self.tw_gop_info = Some(group.low_frame.info.clone());
+                            self.tw_gop_config = Some(group.low_frame.config.clone());
+                            let padded_w = group.low_frame.info.padded_width();
+                            let padded_h = group.low_frame.info.padded_height();
+                            self.ensure_tw_bufs(padded_w, padded_h, gop_size);
+                            let set = &self.tw_buf_sets[self.tw_active];
+                            self.decoder.decode_temporal_gop_into(
+                                &self.ctx, &group, gop_size,
+                                &set.frame_bufs, &set.snapshot_bufs,
+                            );
+                            self.tw_gop_base = gop_base;
+                            self.tw_prefetch_base = usize::MAX;
+                            self.last_seek_ms = Self::now_ms() - t_seek;
+                        }
+                    } else {
+                        self.last_seek_ms = 0.0;
                     }
 
                     // Phase 2: inverse wavelet + color for this frame → cached texture → blit
-                    let bufs = &self.tw_wavelet_bufs[frame_in_gop];
-                    self.decoder.present_wavelet_frame_to_texture(
-                        &self.ctx,
-                        self.tw_gop_info.as_ref().unwrap(),
-                        self.tw_gop_config.as_ref().unwrap(),
-                        [&bufs[0], &bufs[1], &bufs[2]],
-                    );
-                    let view = self.decoder.output_texture_view().unwrap();
-                    blit_to_surface(
-                        &self.ctx.device,
-                        &self.ctx.queue,
-                        self.surface.as_ref().unwrap(),
-                        self.blit_pipeline.as_ref().unwrap(),
-                        self.blit_bgl.as_ref().unwrap(),
-                        self.blit_sampler.as_ref().unwrap(),
-                        &view,
-                    )?;
+                    let t_dec = Self::now_ms();
+                    {
+                        let bufs = &self.tw_buf_sets[self.tw_active].frame_bufs[frame_in_gop];
+                        self.decoder.present_wavelet_frame_to_texture(
+                            &self.ctx,
+                            self.tw_gop_info.as_ref().unwrap(),
+                            self.tw_gop_config.as_ref().unwrap(),
+                            [&bufs[0], &bufs[1], &bufs[2]],
+                        );
+                        let view = self.decoder.output_texture_view().unwrap();
+                        blit_to_surface(
+                            &self.ctx.device,
+                            &self.ctx.queue,
+                            self.surface.as_ref().unwrap(),
+                            self.blit_pipeline.as_ref().unwrap(),
+                            self.blit_bgl.as_ref().unwrap(),
+                            self.blit_sampler.as_ref().unwrap(),
+                            &view,
+                        )?;
+                    }
+                    self.last_decode_ms = Self::now_ms() - t_dec;
                     self.current_frame += 1;
+
+                    // Prefetch next GOP at the midpoint of current GOP
+                    if frame_in_gop == gop_size / 2
+                        && gop_idx + 1 < num_groups
+                        && self.tw_prefetch_base != gop_base + gop_size
+                    {
+                        self.prefetch_next_gop(gop_idx + 1, gop_size);
+                    }
+
                     return Ok(());
                 } else {
                     // Tail I-frames: decode individually
+                    self.last_seek_ms = 0.0;
+                    let t_dec = Self::now_ms();
                     let tail_entries: Vec<_> = th.index.iter()
                         .filter(|e| e.frame_role == 2)
                         .collect();
@@ -1383,18 +1476,21 @@ pub mod wasm {
                             self.blit_sampler.as_ref().unwrap(),
                             &view,
                         )?;
+                        self.last_decode_ms = Self::now_ms() - t_dec;
                         self.current_frame += 1;
                         return Ok(());
                     }
                     // Past end — wrap
                     self.current_frame = 0;
-                    self.tw_wavelet_bufs.clear();
+                    self.tw_gop_base = usize::MAX;
                     return Ok(());
                 }
             }
 
             if self.header.is_none() {
                 // Single-frame .gnc
+                self.last_seek_ms = 0.0;
+                let t_dec = Self::now_ms();
                 let frame = crate::format::deserialize_compressed(&self.data);
                 self.decoder.decode_to_texture(&self.ctx, &frame);
                 let view = self.decoder.output_texture_view().unwrap();
@@ -1407,6 +1503,7 @@ pub mod wasm {
                     self.blit_sampler.as_ref().unwrap(),
                     &view,
                 )?;
+                self.last_decode_ms = Self::now_ms() - t_dec;
                 self.current_frame += 1;
                 return Ok(());
             }
@@ -1417,6 +1514,7 @@ pub mod wasm {
 
             if ft == 2 {
                 // B-frame group: decode anchor + all B-frames to owned textures
+                let t_seek = Self::now_ms();
                 let b_start = idx;
                 let mut b_end = idx;
                 while b_end < self.frame_count as usize
@@ -1448,7 +1546,9 @@ pub mod wasm {
 
                     self.decoder.swap_references();
                     self.buffered_textures.insert(b_end, anchor_tex);
+                    self.last_seek_ms = Self::now_ms() - t_seek;
 
+                    let t_dec = Self::now_ms();
                     let texture =
                         self.buffered_textures.remove(&idx).unwrap();
                     let view = texture
@@ -1462,10 +1562,13 @@ pub mod wasm {
                         self.blit_sampler.as_ref().unwrap(),
                         &view,
                     )?;
+                    self.last_decode_ms = Self::now_ms() - t_dec;
                     self.current_frame = idx + 1;
                     return Ok(());
                 } else {
                     // No anchor available — decode as-is
+                    self.last_seek_ms = 0.0;
+                    let t_dec = Self::now_ms();
                     let frame = crate::format::deserialize_sequence_frame(
                         &self.data, header, idx,
                     );
@@ -1480,12 +1583,15 @@ pub mod wasm {
                         self.blit_sampler.as_ref().unwrap(),
                         &view,
                     )?;
+                    self.last_decode_ms = Self::now_ms() - t_dec;
                     self.current_frame += 1;
                     return Ok(());
                 }
             }
 
             // I/P frame: decode to cached texture and present
+            self.last_seek_ms = 0.0;
+            let t_dec = Self::now_ms();
             let frame =
                 crate::format::deserialize_sequence_frame(&self.data, header, idx);
             self.decoder.decode_to_texture(&self.ctx, &frame);
@@ -1499,12 +1605,14 @@ pub mod wasm {
                 self.blit_sampler.as_ref().unwrap(),
                 &view,
             )?;
+            self.last_decode_ms = Self::now_ms() - t_dec;
             self.current_frame += 1;
             Ok(())
         }
 
         /// Seek to a target frame and present it (zero-copy).
         /// Decodes from nearest keyframe to target without presenting intermediate frames.
+        /// Updates `last_seek_ms` and `last_decode_ms` timing fields.
         pub fn seek_and_present(&mut self, target_frame: u32) -> Result<(), JsValue> {
             // GNV2: decode GOP wavelet bufs, present target frame
             if let Some(ref th) = self.temporal_header {
@@ -1517,20 +1625,30 @@ pub mod wasm {
                 self.buffered_frames.clear();
 
                 if gop_idx < num_groups {
+                    let gop_base = gop_idx * gop_size;
                     // Phase 1: decode GOP wavelet bufs
+                    let t_seek = Self::now_ms();
                     let group = crate::format::deserialize_temporal_group(
                         &self.data, th, gop_idx,
                     );
                     self.tw_gop_info = Some(group.low_frame.info.clone());
                     self.tw_gop_config = Some(group.low_frame.config.clone());
-                    self.tw_wavelet_bufs = self.decoder.decode_temporal_gop_to_wavelet_bufs(
+                    let padded_w = group.low_frame.info.padded_width();
+                    let padded_h = group.low_frame.info.padded_height();
+                    self.ensure_tw_bufs(padded_w, padded_h, gop_size);
+                    let set = &self.tw_buf_sets[self.tw_active];
+                    self.decoder.decode_temporal_gop_into(
                         &self.ctx, &group, gop_size,
+                        &set.frame_bufs, &set.snapshot_bufs,
                     );
-                    self.tw_gop_base = gop_idx * gop_size;
+                    self.tw_gop_base = gop_base;
+                    self.tw_prefetch_base = usize::MAX;
+                    self.last_seek_ms = Self::now_ms() - t_seek;
 
                     // Phase 2: present target frame
+                    let t_dec = Self::now_ms();
                     let frame_in_gop = target - gop_idx * gop_size;
-                    let bufs = &self.tw_wavelet_bufs[frame_in_gop];
+                    let bufs = &self.tw_buf_sets[self.tw_active].frame_bufs[frame_in_gop];
                     self.decoder.present_wavelet_frame_to_texture(
                         &self.ctx,
                         self.tw_gop_info.as_ref().unwrap(),
@@ -1547,6 +1665,7 @@ pub mod wasm {
                         self.blit_sampler.as_ref().unwrap(),
                         &view,
                     )?;
+                    self.last_decode_ms = Self::now_ms() - t_dec;
                 } else {
                     // Tail I-frame — just decode directly
                     self.current_frame = target;
@@ -1575,13 +1694,16 @@ pub mod wasm {
             self.current_frame = keyframe_idx;
 
             // Decode forward from keyframe, discarding intermediate frames
+            let t_seek = Self::now_ms();
             while self.current_frame < target
                 && !self.buffered_textures.contains_key(&target)
             {
                 self.gpu_advance_one();
             }
+            self.last_seek_ms = Self::now_ms() - t_seek;
 
             // Present the target
+            let t_dec = Self::now_ms();
             if let Some(texture) = self.buffered_textures.remove(&target) {
                 let view =
                     texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -1598,6 +1720,7 @@ pub mod wasm {
                 self.current_frame = target;
                 self.decode_and_present()?;
             }
+            self.last_decode_ms = Self::now_ms() - t_dec;
 
             self.current_frame = target + 1;
             self.buffered_textures.retain(|&k, _| k > target);
@@ -1609,12 +1732,74 @@ pub mod wasm {
             self.current_frame = 0;
             self.buffered_frames.clear();
             self.buffered_textures.clear();
-            self.tw_wavelet_bufs.clear();
+            self.tw_gop_base = usize::MAX;
         }
     }
 
     // Private methods (not exported to JS)
     impl GnvPlayer {
+        /// Ensure both double-buffered GOP buffer sets are allocated for the given resolution.
+        fn ensure_tw_bufs(&mut self, padded_w: u32, padded_h: u32, gop_size: usize) {
+            let padded_pixels = (padded_w as u64) * (padded_h as u64);
+            let plane_size = padded_pixels * std::mem::size_of::<f32>() as u64;
+            if self.tw_cached_gop_size == gop_size && self.tw_cached_plane_size == plane_size {
+                return;
+            }
+            let usage = wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC;
+            for (set_idx, set) in self.tw_buf_sets.iter_mut().enumerate() {
+                set.frame_bufs = (0..gop_size)
+                    .map(|j| {
+                        std::array::from_fn(|p| {
+                            self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                                label: Some(&format!("tw_s{}_{}_{}", set_idx, j, p)),
+                                size: plane_size,
+                                usage,
+                                mapped_at_creation: false,
+                            })
+                        })
+                    })
+                    .collect();
+                set.snapshot_bufs = (0..gop_size)
+                    .map(|s| {
+                        self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                            label: Some(&format!("tw_s{}_snap_{}", set_idx, s)),
+                            size: plane_size,
+                            usage,
+                            mapped_at_creation: false,
+                        })
+                    })
+                    .collect();
+            }
+            self.tw_cached_plane_size = plane_size;
+            self.tw_cached_gop_size = gop_size;
+        }
+
+        /// Prefetch a GOP into the inactive buffer set.
+        fn prefetch_next_gop(&mut self, gop_idx: usize, gop_size: usize) {
+            let th = self.temporal_header.as_ref().unwrap();
+            let group = crate::format::deserialize_temporal_group(
+                &self.data, th, gop_idx,
+            );
+            self.tw_gop_info = Some(group.low_frame.info.clone());
+            self.tw_gop_config = Some(group.low_frame.config.clone());
+            let prefetch_set = 1 - self.tw_active;
+            let set = &self.tw_buf_sets[prefetch_set];
+            self.decoder.decode_temporal_gop_into(
+                &self.ctx, &group, gop_size,
+                &set.frame_bufs, &set.snapshot_bufs,
+            );
+            self.tw_prefetch_base = gop_idx * gop_size;
+        }
+
+        /// High-resolution timestamp in milliseconds (sub-ms precision via performance.now()).
+        fn now_ms() -> f64 {
+            web_sys::window()
+                .and_then(|w| w.performance())
+                .map_or_else(js_sys::Date::now, |p| p.now())
+        }
+
         /// Decode one frame to GPU texture without presenting. Handles B-frame groups.
         /// Used by seek_and_present to skip intermediate frames.
         fn gpu_advance_one(&mut self) {

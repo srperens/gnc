@@ -2170,8 +2170,6 @@ impl DecoderPipeline {
             | wgpu::BufferUsages::COPY_DST
             | wgpu::BufferUsages::COPY_SRC;
 
-        let num_levels = group.high_frames.len();
-
         // Allocate per-frame GPU buffers [frame][plane]
         let tw_frame_bufs: Vec<[wgpu::Buffer; 3]> = (0..gop_size)
             .map(|j| {
@@ -2196,11 +2194,33 @@ impl DecoderPipeline {
             })
             .collect();
 
+        self.decode_temporal_gop_into(ctx, group, gop_size, &tw_frame_bufs, &tw_snapshot);
+        tw_frame_bufs
+    }
+
+    /// Phase 1 of temporal wavelet decode using pre-allocated buffers.
+    /// `frame_bufs` must have `gop_size` entries (3 planes each, size = padded_pixels * 4).
+    /// `snapshot_bufs` must have `gop_size` entries (same size per buffer).
+    pub fn decode_temporal_gop_into(
+        &self,
+        ctx: &GpuContext,
+        group: &crate::TemporalGroup,
+        gop_size: usize,
+        frame_bufs: &[[wgpu::Buffer; 3]],
+        snapshot_bufs: &[wgpu::Buffer],
+    ) {
+        let info = &group.low_frame.info;
+        let padded_w = info.padded_width();
+        let padded_h = info.padded_height();
+        let padded_pixels = (padded_w * padded_h) as usize;
+        let plane_size = (padded_pixels * std::mem::size_of::<f32>()) as u64;
+        let num_levels = group.high_frames.len();
+
         // Entropy decode + dequantize for all frames
         self.decode_wavelet_coeffs_to_gpu(
             ctx,
             &group.low_frame,
-            [&tw_frame_bufs[0][0], &tw_frame_bufs[0][1], &tw_frame_bufs[0][2]],
+            [&frame_bufs[0][0], &frame_bufs[0][1], &frame_bufs[0][2]],
         );
         for lvl in 0..num_levels {
             let count = gop_size >> (lvl + 1);
@@ -2211,46 +2231,44 @@ impl DecoderPipeline {
                     ctx,
                     &group.high_frames[lvl][idx],
                     [
-                        &tw_frame_bufs[buf_idx][0],
-                        &tw_frame_bufs[buf_idx][1],
-                        &tw_frame_bufs[buf_idx][2],
+                        &frame_bufs[buf_idx][0],
+                        &frame_bufs[buf_idx][1],
+                        &frame_bufs[buf_idx][2],
                     ],
                 );
             }
         }
 
-        // Temporal Haar inverse per plane
+        // Temporal Haar inverse — all 3 planes in a single submit
+        let mut cmd = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("tw_wb_temporal_haar"),
+        });
         #[allow(clippy::needless_range_loop)]
         for p in 0..3 {
-            let mut cmd = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("tw_wb_temporal_haar"),
-            });
             let mut current_count = 1usize;
             for _level in (0..num_levels).rev() {
                 let pairs = current_count;
                 for j in 0..(2 * current_count) {
                     cmd.copy_buffer_to_buffer(
-                        &tw_frame_bufs[j][p], 0, &tw_snapshot[j], 0, plane_size,
+                        &frame_bufs[j][p], 0, &snapshot_bufs[j], 0, plane_size,
                     );
                 }
                 for pair in 0..pairs {
                     self.temporal_haar.dispatch(
                         ctx,
                         &mut cmd,
-                        &tw_snapshot[pair],
-                        &tw_snapshot[pairs + pair],
-                        &tw_frame_bufs[pair * 2][p],
-                        &tw_frame_bufs[pair * 2 + 1][p],
+                        &snapshot_bufs[pair],
+                        &snapshot_bufs[pairs + pair],
+                        &frame_bufs[pair * 2][p],
+                        &frame_bufs[pair * 2 + 1][p],
                         padded_pixels as u32,
                         false,
                     );
                 }
                 current_count *= 2;
             }
-            ctx.queue.submit(Some(cmd.finish()));
         }
-
-        tw_frame_bufs
+        ctx.queue.submit(Some(cmd.finish()));
     }
 
     /// Phase 2 of temporal wavelet decode: inverse spatial wavelet + color + crop + buf_to_tex.

@@ -205,6 +205,7 @@
             <div class="stats" id="statsBar">
                 <span id="statRes"></span>
                 <span id="statFps"></span>
+                <span id="statSize"></span>
                 <span id="statDecode"></span>
                 <span id="statPlayFps"></span>
                 <span id="statPath"></span>
@@ -266,11 +267,28 @@
         // --- Diagnostics ---
         function parseDiag(text) {
             const frames = new Map();
-            const blocks = text.split(/\n(?=Frame \d+)/);
-            for (const block of blocks) {
-                const m = block.match(/^Frame (\d+)/);
-                if (!m) continue;
-                frames.set(parseInt(m[1], 10), block.trim());
+            // GNV2 temporal wavelet: GOP-based diag
+            if (/^GOP \d+/m.test(text)) {
+                const gops = text.split(/\n(?=GOP \d+)/);
+                for (const block of gops) {
+                    const m = block.match(/^GOP (\d+) \[(\d+) frames\]/);
+                    if (!m) continue;
+                    const gopIdx = parseInt(m[1], 10);
+                    const gopSize = parseInt(m[2], 10);
+                    const base = gopIdx * gopSize;
+                    // Map every frame in this GOP to the full GOP diag block
+                    for (let i = 0; i < gopSize; i++) {
+                        frames.set(base + i, block.trim());
+                    }
+                }
+            } else {
+                // GNV1: per-frame diag
+                const blocks = text.split(/\n(?=Frame \d+)/);
+                for (const block of blocks) {
+                    const m = block.match(/^Frame (\d+)/);
+                    if (!m) continue;
+                    frames.set(parseInt(m[1], 10), block.trim());
+                }
             }
             return frames;
         }
@@ -291,6 +309,9 @@
                 .replace(/^(Frame \d+ \[I\].*)$/m, '<span class="diag-type-I">$1</span>')
                 .replace(/^(Frame \d+ \[P\].*)$/m, '<span class="diag-type-P">$1</span>')
                 .replace(/^(Frame \d+ \[B\].*)$/m, '<span class="diag-type-B">$1</span>')
+                .replace(/^(Frame \d+ \[L\].*)$/gm, '<span class="diag-type-I">$1</span>')
+                .replace(/^(Frame \d+ \[H\d+\].*)$/gm, '<span class="diag-type-P">$1</span>')
+                .replace(/^(GOP \d+.*)$/m, '<b>$1</b>')
                 .replace(/^(  WARN:.*)$/gm, '<span class="diag-warn">$1</span>');
             diagContent.innerHTML = html;
         }
@@ -365,12 +386,28 @@
             { name: 'ducks_q75.gnv', label: 'Ducks q75 (698 MB)', desc: '300f 50fps 1080p q=75 ki=8' },
             { name: 'bbb_2min_q5.gnv', label: 'BBB 2min q5', desc: '1800f 30fps 1080p q=5 ki=24' },
             { name: 'bbb_2min.gnv', label: 'BBB 2min q75', desc: '1800f 30fps 1080p q=75 ki=24' },
-            // Temporal wavelet (GNV2) demos
-            { name: 'tw_crowd_run.gnv2', label: 'TW Crowd Run', desc: '32f 50fps 1080p q=75 Haar temporal wavelet' },
-            { name: 'tw_park_joy.gnv2', label: 'TW Park Joy', desc: '32f 50fps 1080p q=75 Haar temporal wavelet' },
-            { name: 'tw_ducks.gnv2', label: 'TW Ducks', desc: '64f 50fps 1080p q=75 Haar temporal wavelet' },
-            { name: 'tw_rush_hour.gnv2', label: 'TW Rush Hour', desc: '64f 25fps 1080p q=75 Haar temporal wavelet' },
+            // Temporal wavelet (GNV2) demos — mirrors GNV1 set above
+            { name: 'tw_test_quick.gnv2', label: 'TW BBB Quick', desc: '8f 30fps 1080p q=75 Haar' },
+            { name: 'tw_test_animation.gnv2', label: 'TW BBB Short', desc: '24f 30fps 1080p q=75 Haar' },
+            { name: 'tw_test_nature.gnv2', label: 'TW Park Joy', desc: '32f 50fps 1080p q=75 Haar' },
+            { name: 'tw_test_crowd.gnv2', label: 'TW Crowd Run', desc: '32f 50fps 1080p q=75 Haar' },
+            { name: 'tw_rush_hour.gnv2', label: 'TW Rush Hour', desc: '200f 25fps 1080p q=75 Haar' },
+            { name: 'tw_old_town_cross.gnv2', label: 'TW Old Town', desc: '200f 50fps 1080p q=75 Haar' },
+            { name: 'tw_stockholm.gnv2', label: 'TW Stockholm', desc: '200f 60fps 720p q=75 Haar' },
+            { name: 'tw_pedestrian_area.gnv2', label: 'TW Ped. Area', desc: '200f 25fps 1080p q=75 Haar' },
+            { name: 'tw_ducks_q25.gnv2', label: 'TW Ducks q25', desc: '300f 50fps 1080p q=25 Haar' },
+            { name: 'tw_ducks_q50.gnv2', label: 'TW Ducks q50', desc: '300f 50fps 1080p q=50 Haar' },
+            { name: 'tw_ducks_q75.gnv2', label: 'TW Ducks q75', desc: '300f 50fps 1080p q=75 Haar' },
+            { name: 'tw_bbb_2min_q5.gnv2', label: 'TW BBB 2min q5', desc: '1800f 30fps 1080p q=5 Haar' },
+            { name: 'tw_bbb_2min.gnv2', label: 'TW BBB 2min q75', desc: '1800f 30fps 1080p q=75 Haar' },
         ];
+        function formatSize(bytes) {
+            if (bytes >= 1e9) return (bytes / 1e9).toFixed(1) + ' GB';
+            if (bytes >= 1e6) return (bytes / 1e6).toFixed(0) + ' MB';
+            if (bytes >= 1e3) return (bytes / 1e3).toFixed(0) + ' KB';
+            return bytes + ' B';
+        }
+
         const demoGrid = $('demoGrid');
         for (const d of demoFiles) {
             const wrap = document.createElement('span');
@@ -381,6 +418,15 @@
             btn.title = d.desc;
             btn.style.borderRadius = '6px 0 0 6px';
             btn.addEventListener('click', () => loadUrl(d.name));
+
+            // Probe file size via HEAD and append to button label
+            fetch(d.name, { method: 'HEAD' }).then(r => {
+                const cl = r.headers.get('content-length');
+                if (cl && r.ok) {
+                    const sz = parseInt(cl, 10);
+                    btn.textContent = `${d.label} (${formatSize(sz)})`;
+                }
+            }).catch(() => {});
 
             const dl = document.createElement('a');
             dl.href = d.name;
@@ -494,6 +540,7 @@
 
             $('statRes').textContent = `${w}x${h}`;
             $('statFps').textContent = `${fps.toFixed(1)} fps`;
+            $('statSize').textContent = formatSize(buf.byteLength);
             $('statDecode').textContent = '';
             $('statPlayFps').textContent = '';
 
@@ -501,7 +548,7 @@
             stopBtn.disabled = false;
             playBtn.textContent = fc > 1 ? 'Play' : 'Decode';
 
-            // Try zero-copy GPU surface rendering
+            // Try zero-copy GPU surface rendering (works for both GNV1 and GNV2)
             try {
                 player.set_canvas(canvas);
                 zeroCopy = true;

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Generate demo .gnv files for the web player.
+# Generate demo .gnv files (I+P+B) for the web player.
 # Re-run this whenever the bitstream format changes.
 #
 # Requires: cargo build --release (gnc binary)
@@ -55,37 +55,15 @@ encode() {
     echo "  done: ${size} in ${elapsed}s (${diag_frames} frames diagnosed → ${name}.diag)"
 }
 
-# Temporal wavelet encode (GNV2 container)
-encode_tw() {
-    local name="$1"
-    local input="$2"
-    shift 2
-
-    local outfile="$OUT/${name}.gnv2"
-    echo ""
-    echo "=== ${name}.gnv2 ==="
-    echo "  input: ${input}"
-    echo "  args:  $*"
-
-    # Ensure source directory is zero-indexed
-    ensure_zero_indexed "$(dirname "$input")"
-
-    local start=$SECONDS
-    "$GNC" benchmark-sequence -i "$input" -o "$outfile" "$@"
-    local elapsed=$(( SECONDS - start ))
-
-    local size
-    size=$(ls -lh "$outfile" | awk '{print $5}')
-    echo "  done: ${size} in ${elapsed}s"
-}
-
-# Clean old demo files
-echo "GNC demo file generator"
-echo "======================="
+# Clean old GNV1 demo files
+echo "GNC demo file generator (GNV1 — I+P+B)"
+echo "========================================"
 echo "output: $OUT"
 echo ""
-echo "Removing old .gnv, .gnv2 and .diag files..."
-rm -f "$OUT"/*.gnv "$OUT"/*.gnv2 "$OUT"/*.diag
+echo "Removing old .gnv files..."
+rm -f "$OUT"/*.gnv
+# Remove only GNV1 diag files (not tw_*.diag from generate_demos_tw.sh)
+find "$OUT" -maxdepth 1 -name '*.diag' ! -name 'tw_*.diag' -delete
 
 # --- Quick test files (small, fast to encode) ---
 
@@ -158,36 +136,11 @@ encode "bbb_2min" \
     -q 75 -n 1800 --keyframe-interval 24 \
     --fps-num 30 --fps-den 1
 
-# --- Temporal wavelet demos (GNV2) ---
-
-encode_tw "tw_crowd_run" \
-    "$SEQ/crowd_run/frame_%04d.png" \
-    -q 75 -n 32 -k 8 --temporal-wavelet haar \
-    --fps 50
-
-encode_tw "tw_park_joy" \
-    "$SEQ/park_joy/frame_%04d.png" \
-    -q 75 -n 32 -k 8 --temporal-wavelet haar \
-    --fps 50
-
-encode_tw "tw_ducks" \
-    "$SEQ/ducks_take_off/frame_%04d.png" \
-    -q 75 -n 64 -k 8 --temporal-wavelet haar \
-    --fps 50
-
-encode_tw "tw_rush_hour" \
-    "$SEQ/rush_hour/frame_%04d.png" \
-    -q 75 -n 64 -k 8 --temporal-wavelet haar \
-    --fps 25
-
 echo ""
 echo "=== Summary ==="
 echo ""
 echo "GNV1 (I+P+B) files:"
 ls -lhS "$OUT"/*.gnv 2>/dev/null || echo "  (none)"
-echo ""
-echo "GNV2 (temporal wavelet) files:"
-ls -lhS "$OUT"/*.gnv2 2>/dev/null || echo "  (none)"
 echo ""
 echo "Diagnostics files:"
 ls -lhS "$OUT"/*.diag 2>/dev/null || echo "  (none)"

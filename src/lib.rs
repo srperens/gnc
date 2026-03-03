@@ -828,6 +828,13 @@ pub mod wasm {
         blit_sampler: Option<wgpu::Sampler>,
         /// Pre-decoded GPU textures for B-frame group buffering (zero-copy path).
         buffered_textures: std::collections::BTreeMap<usize, wgpu::Texture>,
+        /// GNV2: pre-decoded wavelet-domain GPU buffers (per frame, 3 planes).
+        /// Phase 1 (entropy + temporal Haar) done once per GOP.
+        /// Phase 2 (inverse wavelet + color) done per frame in decode_and_present.
+        tw_wavelet_bufs: Vec<[wgpu::Buffer; 3]>,
+        tw_gop_base: usize,
+        tw_gop_info: Option<crate::FrameInfo>,
+        tw_gop_config: Option<crate::CodecConfig>,
     }
 
     #[wasm_bindgen]
@@ -866,6 +873,10 @@ pub mod wasm {
                     blit_bgl: None,
                     blit_sampler: None,
                     buffered_textures: std::collections::BTreeMap::new(),
+                    tw_wavelet_bufs: Vec::new(),
+                    tw_gop_base: 0,
+                    tw_gop_info: None,
+                    tw_gop_config: None,
                 })
             } else if is_gnv {
                 let header = crate::format::deserialize_sequence_header(&data);
@@ -890,6 +901,10 @@ pub mod wasm {
                     blit_bgl: None,
                     blit_sampler: None,
                     buffered_textures: std::collections::BTreeMap::new(),
+                    tw_wavelet_bufs: Vec::new(),
+                    tw_gop_base: 0,
+                    tw_gop_info: None,
+                    tw_gop_config: None,
                 })
             } else {
                 // Single-frame .gnc
@@ -913,6 +928,10 @@ pub mod wasm {
                     blit_bgl: None,
                     blit_sampler: None,
                     buffered_textures: std::collections::BTreeMap::new(),
+                    tw_wavelet_bufs: Vec::new(),
+                    tw_gop_base: 0,
+                    tw_gop_info: None,
+                    tw_gop_config: None,
                 })
             }
         }
@@ -1276,6 +1295,7 @@ pub mod wasm {
                 self.current_frame = 0;
                 self.buffered_textures.clear();
                 self.buffered_frames.clear();
+                self.tw_wavelet_bufs.clear();
             }
 
             // Return buffered texture if available (from a previous B-frame group decode)
@@ -1293,6 +1313,84 @@ pub mod wasm {
                 )?;
                 self.current_frame += 1;
                 return Ok(());
+            }
+
+            // GNV2 temporal wavelet: two-phase decode.
+            // Phase 1 (once per GOP): entropy decode + temporal Haar → wavelet-domain GPU bufs.
+            // Phase 2 (per frame): inverse spatial wavelet + color → blit.
+            if let Some(ref th) = self.temporal_header {
+                let gop_size = th.gop_size as usize;
+                let num_groups = th.num_groups();
+                let gop_idx = self.current_frame / gop_size;
+
+                if gop_idx < num_groups {
+                    let frame_in_gop = self.current_frame - gop_idx * gop_size;
+
+                    // Phase 1: decode GOP wavelet bufs if not already cached
+                    if self.tw_wavelet_bufs.is_empty() || self.tw_gop_base != gop_idx * gop_size {
+                        let group = crate::format::deserialize_temporal_group(
+                            &self.data, th, gop_idx,
+                        );
+                        self.tw_gop_info = Some(group.low_frame.info.clone());
+                        self.tw_gop_config = Some(group.low_frame.config.clone());
+                        self.tw_wavelet_bufs = self.decoder.decode_temporal_gop_to_wavelet_bufs(
+                            &self.ctx, &group, gop_size,
+                        );
+                        self.tw_gop_base = gop_idx * gop_size;
+                    }
+
+                    // Phase 2: inverse wavelet + color for this frame → cached texture → blit
+                    let bufs = &self.tw_wavelet_bufs[frame_in_gop];
+                    self.decoder.present_wavelet_frame_to_texture(
+                        &self.ctx,
+                        self.tw_gop_info.as_ref().unwrap(),
+                        self.tw_gop_config.as_ref().unwrap(),
+                        [&bufs[0], &bufs[1], &bufs[2]],
+                    );
+                    let view = self.decoder.output_texture_view().unwrap();
+                    blit_to_surface(
+                        &self.ctx.device,
+                        &self.ctx.queue,
+                        self.surface.as_ref().unwrap(),
+                        self.blit_pipeline.as_ref().unwrap(),
+                        self.blit_bgl.as_ref().unwrap(),
+                        self.blit_sampler.as_ref().unwrap(),
+                        &view,
+                    )?;
+                    self.current_frame += 1;
+                    return Ok(());
+                } else {
+                    // Tail I-frames: decode individually
+                    let tail_entries: Vec<_> = th.index.iter()
+                        .filter(|e| e.frame_role == 2)
+                        .collect();
+                    let tail_idx = self.current_frame - num_groups * gop_size;
+                    if tail_idx < tail_entries.len() {
+                        let entry = &tail_entries[tail_idx];
+                        let start = entry.offset as usize;
+                        let end = start + entry.size as usize;
+                        let frame = crate::format::deserialize_compressed(
+                            &self.data[start..end],
+                        );
+                        self.decoder.decode_to_texture(&self.ctx, &frame);
+                        let view = self.decoder.output_texture_view().unwrap();
+                        blit_to_surface(
+                            &self.ctx.device,
+                            &self.ctx.queue,
+                            self.surface.as_ref().unwrap(),
+                            self.blit_pipeline.as_ref().unwrap(),
+                            self.blit_bgl.as_ref().unwrap(),
+                            self.blit_sampler.as_ref().unwrap(),
+                            &view,
+                        )?;
+                        self.current_frame += 1;
+                        return Ok(());
+                    }
+                    // Past end — wrap
+                    self.current_frame = 0;
+                    self.tw_wavelet_bufs.clear();
+                    return Ok(());
+                }
             }
 
             if self.header.is_none() {
@@ -1408,6 +1506,57 @@ pub mod wasm {
         /// Seek to a target frame and present it (zero-copy).
         /// Decodes from nearest keyframe to target without presenting intermediate frames.
         pub fn seek_and_present(&mut self, target_frame: u32) -> Result<(), JsValue> {
+            // GNV2: decode GOP wavelet bufs, present target frame
+            if let Some(ref th) = self.temporal_header {
+                let target = (target_frame as usize).min(self.frame_count as usize - 1);
+                let gop_size = th.gop_size as usize;
+                let num_groups = th.num_groups();
+                let gop_idx = target / gop_size;
+
+                self.buffered_textures.clear();
+                self.buffered_frames.clear();
+
+                if gop_idx < num_groups {
+                    // Phase 1: decode GOP wavelet bufs
+                    let group = crate::format::deserialize_temporal_group(
+                        &self.data, th, gop_idx,
+                    );
+                    self.tw_gop_info = Some(group.low_frame.info.clone());
+                    self.tw_gop_config = Some(group.low_frame.config.clone());
+                    self.tw_wavelet_bufs = self.decoder.decode_temporal_gop_to_wavelet_bufs(
+                        &self.ctx, &group, gop_size,
+                    );
+                    self.tw_gop_base = gop_idx * gop_size;
+
+                    // Phase 2: present target frame
+                    let frame_in_gop = target - gop_idx * gop_size;
+                    let bufs = &self.tw_wavelet_bufs[frame_in_gop];
+                    self.decoder.present_wavelet_frame_to_texture(
+                        &self.ctx,
+                        self.tw_gop_info.as_ref().unwrap(),
+                        self.tw_gop_config.as_ref().unwrap(),
+                        [&bufs[0], &bufs[1], &bufs[2]],
+                    );
+                    let view = self.decoder.output_texture_view().unwrap();
+                    blit_to_surface(
+                        &self.ctx.device,
+                        &self.ctx.queue,
+                        self.surface.as_ref().unwrap(),
+                        self.blit_pipeline.as_ref().unwrap(),
+                        self.blit_bgl.as_ref().unwrap(),
+                        self.blit_sampler.as_ref().unwrap(),
+                        &view,
+                    )?;
+                } else {
+                    // Tail I-frame — just decode directly
+                    self.current_frame = target;
+                    self.decode_and_present()?;
+                    return Ok(());
+                }
+                self.current_frame = target + 1;
+                return Ok(());
+            }
+
             if self.header.is_none() {
                 self.current_frame = 0;
                 self.buffered_textures.clear();
@@ -1460,6 +1609,7 @@ pub mod wasm {
             self.current_frame = 0;
             self.buffered_frames.clear();
             self.buffered_textures.clear();
+            self.tw_wavelet_bufs.clear();
         }
     }
 

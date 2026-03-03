@@ -24,26 +24,36 @@
 9. ✅ **CLI decode** — `decode-sequence` auto-detects GNV2 magic, decodes temporal wavelet GOPs, writes output PNGs.
 10. ✅ **WASM player** — `GnvPlayer` detects GNV2, decodes GOPs on demand via async `decode_temporal_group_rgba_wasm()` with per-frame GPU temporal Haar inverse + spatial inverse + pack u8 + async readback.
 
+## Phase 2.5 — Full GPU decode + zero-copy player ✅ (2026-03-03)
+11. ✅ **GPU entropy decode in temporal path** — replaced CPU `entropy_helpers::entropy_decode_plane()` with `prepare_frame_data()` + GPU Rice/rANS/Bitplane/Huffman dispatch. Zero CPU compute in decode pipeline. Shared `dispatch_entropy_decode()` helper for all 5 entropy backends.
+12. ✅ **Zero-copy GNV2 playback** — `decode_and_present()` now handles GNV2 with GPU blit to canvas surface, same as GNV1. No more readback fallback.
+13. ✅ **Two-phase GOP decode** — Phase 1 (once per GOP): entropy decode + dequantize + temporal Haar inverse → per-frame wavelet-domain GPU buffers. Phase 2 (per frame): inverse spatial wavelet + color convert + crop + blit. Eliminates GOP-boundary stutter.
+14. ✅ **Per-GOP diagnostics** — `print_temporal_gop_diagnostics()` in `encoder/diagnostics.rs`: temporal decomposition breakdown, per-frame Rice stats, coefficient analysis, bit budget, reconstructed quality, content-aware warnings. Output to `.diag` files, displayed in web player.
+15. ✅ **Demo parity** — `generate_demos_tw.sh` mirrors all GNV1 demos with matching content, quality, frame count, fps for direct comparison.
+
+**Results**: 1080p 50fps: 3.9ms decode, 260fps presentation rate. GPU blit zero-copy. No requestAnimationFrame violations.
+
 ## Phase 3 — Temporal 5/3 lifting
-8. **WGSL temporal 5/3 shader** — predict + update over 4 frames. Reuse spatial 5/3 lifting pattern temporally.
-9. **Adaptive temporal transform selection** — mirrors spatial wavelet strategy (CDF 9/7 lossy, 5/3 lossless):
+16. **WGSL temporal 5/3 shader** — predict + update over 4 frames. Reuse spatial 5/3 lifting pattern temporally.
+17. **Adaptive temporal transform selection** — mirrors spatial wavelet strategy (CDF 9/7 lossy, 5/3 lossless):
    - **No temporal transform**: ultra-low latency / pure I-frame mode (JPEG XS-like)
    - **Haar**: low latency / 25fps / high q
    - **5/3**: 50-60fps / moderate q / higher compression
    - Selectable per config or auto based on framerate + q target.
 
 ## Phase 4 — Optimization
-10. **Re-enable CfL in temporal mode** — CfL on temporal wavelet coefficients (both lowpass and highpass).
-11. **Adaptive highpass quantization per tile** — static tiles get higher mul, motion tiles get lower. Based on temporal variance.
-12. **LL subband handling** — explore simple prediction for LL (small, 0.39% of coefficients but high energy).
-13. **Benchmark suite** — automated A/B across all Xiph sequences (rush_hour, crowd_run, stockholm, old_town_cross, ducks_take_off, park_joy) with CSV output.
+18. **Re-enable CfL in temporal mode** — CfL on temporal wavelet coefficients (both lowpass and highpass).
+19. **Adaptive highpass quantization per tile** — static tiles get higher mul, motion tiles get lower. Based on temporal variance.
+20. **LL subband handling** — explore simple prediction for LL (small, 0.39% of coefficients but high energy).
+21. **Benchmark suite** — automated A/B across all Xiph sequences (rush_hour, crowd_run, stockholm, old_town_cross, ducks_take_off, park_joy) with CSV output.
 
 ## Phase 5 — Validation
-14. **Full 200-frame benchmarks** on all sequences, compare bitrate/PSNR/temporal consistency vs ME pipeline.
-15. **Rate control** for temporal wavelet mode (CBR/VBR with temporal GOP structure).
-16. **Broadcast demo** — encode real broadcast content, validate on production-representative material.
+22. **Full 200-frame benchmarks** on all sequences, compare bitrate/PSNR/temporal consistency vs ME pipeline.
+23. **Rate control** for temporal wavelet mode (CBR/VBR with temporal GOP structure).
+24. **Broadcast demo** — encode real broadcast content, validate on production-representative material.
 
 ## Token budget estimate
-- Phase 1-2: ~70% of effort (GPU + bitstream, needs Opus)
-- Phase 3-4: ~20% (can partly use Sonnet for tests/benchmarks)
+- Phase 1-2: ~70% of effort (GPU + bitstream, needs Opus) ✅
+- Phase 2.5: ~5% (GPU decode + zero-copy player) ✅
+- Phase 3-4: ~15% (can partly use Sonnet for tests/benchmarks)
 - Phase 5: ~10% (mostly running tests)

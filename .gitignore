@@ -15,6 +15,7 @@ test_material/frames/
 
 # Web demo media (too large for git)
 examples/web/*.gnv
+examples/web/*.gnv2
 examples/web/*.gnc
 examples/web/*.diag
 .aider*

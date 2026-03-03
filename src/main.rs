@@ -1407,6 +1407,43 @@ fn main() {
                     }
                 }
 
+                // --- Per-GOP diagnostics (to stderr, gated on --diagnostics) ---
+                if gnc::encoder::diagnostics::enabled() {
+                    let q = quality.unwrap_or(75);
+                    let mul = tw_highpass_mul.unwrap_or(config_tw.temporal_highpass_qstep_mul);
+                    // Compute all-I baseline bpp from first I-frame if available
+                    let all_i_bpp = if !low_frame_ptrs.is_empty() {
+                        // Use the lowpass frame bpp as a rough all-I reference
+                        // (the lowpass is essentially the I-frame quality signal)
+                        Some(low_frame_ptrs[0].bpp())
+                    } else {
+                        None
+                    };
+
+                    let mut frame_offset = 0usize;
+                    for (gi, group) in encoded_tw.groups.iter().enumerate() {
+                        let gs = encoded_tw.gop_size;
+                        let end = (frame_offset + gs).min(frame_metrics_tw.len());
+                        let per_frame_q: Vec<(f64, f64)> = frame_metrics_tw[frame_offset..end]
+                            .iter()
+                            .map(|m| (m.psnr, m.ssim))
+                            .collect();
+                        gnc::encoder::diagnostics::print_temporal_gop_diagnostics(
+                            gi,
+                            gs,
+                            temporal_mode,
+                            q,
+                            mul,
+                            group,
+                            &per_frame_q,
+                            all_i_bpp,
+                            w,
+                            h,
+                        );
+                        frame_offset += gs;
+                    }
+                }
+
                 let summary_tw = sequence_metrics::compute_sequence_metrics(&frame_metrics_tw);
                 println!("\n{}", summary_tw);
 

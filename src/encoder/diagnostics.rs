@@ -871,6 +871,343 @@ pub fn compute_temporal_wavelet(
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// Temporal wavelet GOP diagnostics
+// ---------------------------------------------------------------------------
+
+/// Per-frame quality pair (PSNR dB, SSIM).
+pub type FrameQuality = (f64, f64);
+
+/// Coefficient statistics computed from entropy-decoded quantized coefficients.
+#[derive(Debug, Default)]
+pub struct CoeffStats {
+    pub mean_abs: f64,
+    pub stddev: f64,
+    /// Percentage of coefficients that are exactly zero.
+    pub zero_pct: f64,
+    pub total: usize,
+}
+
+fn compute_coeff_stats_from_frame(frame: &CompressedFrame) -> CoeffStats {
+    if let EntropyData::Rice(ref tiles) = frame.entropy {
+        let mut sum_abs: i64 = 0;
+        let mut sum_sq: f64 = 0.0;
+        let mut zeros: i64 = 0;
+        let mut total: i64 = 0;
+        for t in tiles {
+            let coeffs = super::rice::rice_decode_tile(t);
+            for v in coeffs {
+                let abs_v = v.unsigned_abs() as i64;
+                sum_abs += abs_v;
+                sum_sq += (abs_v as f64) * (abs_v as f64);
+                if v == 0 {
+                    zeros += 1;
+                }
+                total += 1;
+            }
+        }
+        if total == 0 {
+            return CoeffStats::default();
+        }
+        let mean_abs = sum_abs as f64 / total as f64;
+        let variance = sum_sq / total as f64 - mean_abs * mean_abs;
+        let stddev = if variance > 0.0 { variance.sqrt() } else { 0.0 };
+        CoeffStats {
+            mean_abs,
+            stddev,
+            zero_pct: zeros as f64 / total as f64 * 100.0,
+            total: total as usize,
+        }
+    } else {
+        CoeffStats::default()
+    }
+}
+
+/// Print temporal wavelet GOP diagnostics to stderr.
+///
+/// Called per GOP after encoding + decoding. Matches the existing per-frame
+/// diagnostics style but adapted for the temporal wavelet decomposition.
+#[allow(clippy::too_many_arguments)]
+pub fn print_temporal_gop_diagnostics(
+    gop_idx: usize,
+    gop_size: usize,
+    mode: crate::TemporalTransform,
+    quality: u32,
+    highpass_mul: f32,
+    group: &crate::TemporalGroup,
+    per_frame_quality: &[FrameQuality],
+    all_i_bpp: Option<f64>,
+    width: u32,
+    height: u32,
+) {
+    let pixels = width as f64 * height as f64;
+    let mode_str = match mode {
+        crate::TemporalTransform::Haar => "haar",
+        crate::TemporalTransform::LeGall53 => "5/3",
+        crate::TemporalTransform::None => "none",
+    };
+    let num_levels = group.high_frames.len();
+
+    // Compute total GOP size
+    let low_bytes = group.low_frame.byte_size();
+    let mut high_bytes_per_level: Vec<usize> = Vec::new();
+    let mut high_count_per_level: Vec<usize> = Vec::new();
+    let mut total_high_bytes: usize = 0;
+    for lvl in &group.high_frames {
+        let lvl_bytes: usize = lvl.iter().map(|f| f.byte_size()).sum();
+        high_bytes_per_level.push(lvl_bytes);
+        high_count_per_level.push(lvl.len());
+        total_high_bytes += lvl_bytes;
+    }
+    let total_bytes = low_bytes + total_high_bytes;
+    let total_kb = total_bytes as f64 / 1024.0;
+    let total_bpp = total_bytes as f64 * 8.0 / pixels / gop_size as f64;
+
+    // Per-frame quality stats
+    let (avg_psnr, avg_ssim, temporal_consistency) = if !per_frame_quality.is_empty() {
+        let n = per_frame_quality.len() as f64;
+        let avg_p = per_frame_quality.iter().map(|q| q.0).sum::<f64>() / n;
+        let avg_s = per_frame_quality.iter().map(|q| q.1).sum::<f64>() / n;
+        let consistency = if per_frame_quality.len() >= 2 {
+            let max_p = per_frame_quality.iter().map(|q| q.0).fold(f64::NEG_INFINITY, f64::max);
+            let min_p = per_frame_quality.iter().map(|q| q.0).fold(f64::INFINITY, f64::min);
+            max_p - min_p
+        } else {
+            0.0
+        };
+        (avg_p, avg_s, consistency)
+    } else {
+        (0.0, 0.0, 0.0)
+    };
+
+    // --- Header ---
+    eprintln!();
+    eprintln!(
+        "GOP {} [{} frames] temporal={} levels={} q={} mul={:.1}",
+        gop_idx, gop_size, mode_str, num_levels, quality, highpass_mul
+    );
+    eprintln!(
+        "  Total: {:.1} KB  bpp={:.2}  psnr_avg={:.2} dB  temporal_consistency={:.2} dB",
+        total_kb, total_bpp, avg_psnr, temporal_consistency
+    );
+
+    if let Some(baseline_bpp) = all_i_bpp {
+        if baseline_bpp > 0.0 {
+            let ratio = total_bpp / baseline_bpp;
+            let saving_pct = (1.0 - ratio) * 100.0;
+            eprintln!(
+                "  Ratio vs all-I: {:.2} ({:+.0}%)",
+                ratio, -saving_pct
+            );
+        }
+    }
+
+    // --- Temporal decomposition ---
+    eprintln!();
+    eprintln!("  Temporal decomposition:");
+    let low_pct = if total_bytes > 0 { low_bytes as f64 / total_bytes as f64 * 100.0 } else { 0.0 };
+    let low_bpp = low_bytes as f64 * 8.0 / pixels;
+    eprintln!(
+        "    Lowpass (L):   1 frame   {:>7.1} KB  ({:.1}%)  bpp={:.2}",
+        low_bytes as f64 / 1024.0, low_pct, low_bpp
+    );
+    for (lvl, (bytes, count)) in high_bytes_per_level.iter().zip(high_count_per_level.iter()).enumerate() {
+        let pct = if total_bytes > 0 { *bytes as f64 / total_bytes as f64 * 100.0 } else { 0.0 };
+        let avg_bpp = if *count > 0 { *bytes as f64 * 8.0 / pixels / *count as f64 } else { 0.0 };
+        eprintln!(
+            "    Highpass L{}:   {} frame{} {:>7.1} KB  ({:.1}%)  avg_bpp={:.2}",
+            lvl,
+            count,
+            if *count != 1 { "s" } else { " " },
+            *bytes as f64 / 1024.0,
+            pct,
+            avg_bpp,
+        );
+    }
+
+    // --- Per-frame details ---
+    eprintln!();
+
+    // Lowpass frame
+    print_temporal_frame_detail("L", 0, &group.low_frame, width, height);
+
+    // Highpass frames by level
+    for (lvl, frames) in group.high_frames.iter().enumerate() {
+        for (fi, frame) in frames.iter().enumerate() {
+            let label = format!("H{}", lvl);
+            let idx = fi;
+            print_temporal_frame_detail(&label, idx, frame, width, height);
+        }
+    }
+
+    // --- Reconstructed quality ---
+    if !per_frame_quality.is_empty() {
+        eprintln!();
+        eprintln!("  Reconstructed quality:");
+        for (i, (psnr, ssim)) in per_frame_quality.iter().enumerate() {
+            eprintln!(
+                "    frame {}: psnr={:.2} dB  ssim={:.4}",
+                i, psnr, ssim
+            );
+        }
+        eprintln!(
+            "    avg:     psnr={:.2} dB  ssim={:.4}",
+            avg_psnr, avg_ssim
+        );
+    }
+
+    // --- Warnings ---
+    let mut warnings: Vec<String> = Vec::new();
+
+    // Lowpass dominance
+    if total_bytes > 0 && low_pct > 60.0 {
+        warnings.push(format!(
+            "WARN: lowpass = {:.0}% of GOP (>60%) — temporal decorrelation may be weak",
+            low_pct
+        ));
+    }
+
+    // Highpass not sparse enough
+    let coeff_stats = compute_coeff_stats_from_frame(&group.low_frame);
+    if coeff_stats.total > 0 && coeff_stats.zero_pct < 30.0 {
+        warnings.push(format!(
+            "WARN: lowpass zero_pct={:.0}% (<30%) — signal has high energy after temporal transform",
+            coeff_stats.zero_pct
+        ));
+    }
+
+    // Check first highpass level sparsity
+    if let Some(h0_frames) = group.high_frames.first() {
+        for (fi, hf) in h0_frames.iter().enumerate() {
+            let hs = compute_coeff_stats_from_frame(hf);
+            if hs.total > 0 && hs.zero_pct < 50.0 {
+                warnings.push(format!(
+                    "WARN: highpass L0[{}] zero_pct={:.0}% (<50%) — temporal difference has high energy",
+                    fi, hs.zero_pct
+                ));
+            }
+        }
+    }
+
+    // Temporal consistency
+    if temporal_consistency > 3.0 {
+        warnings.push(format!(
+            "WARN: temporal_consistency={:.2} dB (>3.0 dB) — quality varies significantly across frames",
+            temporal_consistency
+        ));
+    }
+
+    if !warnings.is_empty() {
+        eprintln!();
+        for w in &warnings {
+            eprintln!("  {}", w);
+        }
+    }
+}
+
+/// Print detail for a single temporal wavelet frame (lowpass or highpass).
+fn print_temporal_frame_detail(
+    label: &str,
+    idx: usize,
+    frame: &CompressedFrame,
+    width: u32,
+    height: u32,
+) {
+    let pixels = width as f64 * height as f64;
+    let bytes = frame.byte_size();
+    let bpp = bytes as f64 * 8.0 / pixels;
+    let q = frame.config.quantization_step;
+
+    eprintln!(
+        "  Frame {} [{}] size={} bpp={:.2} q={:.1}",
+        idx, label, bytes, bpp, q
+    );
+
+    // Rice stats
+    if let EntropyData::Rice(ref tiles) = frame.entropy {
+        let total_tiles = tiles.len();
+        let mut tiles_with_skip = 0usize;
+        let mut subbands_skipped = 0usize;
+        let mut subbands_total = 0usize;
+        for tile in tiles {
+            if tile.skip_bitmap != 0 {
+                tiles_with_skip += 1;
+            }
+            subbands_skipped += tile.skip_bitmap.count_ones() as usize;
+            subbands_total += tile.num_groups as usize;
+        }
+        if total_tiles > 0 {
+            eprintln!(
+                "    Rice: tiles_with_skipped_subbands={}/{} ({:.0}%)  subbands_skipped={}/{}",
+                tiles_with_skip,
+                total_tiles,
+                tiles_with_skip as f64 / total_tiles as f64 * 100.0,
+                subbands_skipped,
+                subbands_total
+            );
+        }
+    }
+
+    // Coefficient stats
+    let cs = compute_coeff_stats_from_frame(frame);
+    if cs.total > 0 {
+        eprintln!(
+            "    Coefficients: mean_abs={:.2} stddev={:.2} zero={:.0}%",
+            cs.mean_abs, cs.stddev, cs.zero_pct
+        );
+    }
+
+    // Bit budget
+    let bb = collect_bit_budget(frame);
+    if bb.total_bytes > 0 {
+        let pct = |b: usize| b as f64 / bb.total_bytes as f64 * 100.0;
+        eprintln!("    Bit budget:");
+        if bb.tile_header_bytes > 0 {
+            eprintln!(
+                "      Tile headers:    {:>7.1} KB  ({:.1}%)",
+                bb.tile_header_bytes as f64 / 1024.0,
+                pct(bb.tile_header_bytes)
+            );
+        }
+        eprintln!(
+            "      Coefficient data:{:>7.1} KB  ({:.1}%)",
+            bb.coefficient_bytes as f64 / 1024.0,
+            pct(bb.coefficient_bytes)
+        );
+        if bb.cfl_bytes > 0 {
+            eprintln!(
+                "      CfL alphas:      {:>7.1} KB  ({:.1}%)",
+                bb.cfl_bytes as f64 / 1024.0,
+                pct(bb.cfl_bytes)
+            );
+        }
+        if bb.weight_map_bytes > 0 {
+            eprintln!(
+                "      AQ weight map:   {:>7.1} KB  ({:.1}%)",
+                bb.weight_map_bytes as f64 / 1024.0,
+                pct(bb.weight_map_bytes)
+            );
+        }
+    }
+
+    // Rice efficiency
+    if let Some(re) = collect_rice_efficiency(&frame.entropy) {
+        let bits_per_coeff = if re.total_coeffs > 0 {
+            re.total_stream_bits as f64 / re.total_coeffs as f64
+        } else {
+            0.0
+        };
+        eprintln!(
+            "    Rice: bits/coeff={:.2} avg_k_mag={:.1} avg_k_zrl={:.1} all_skip_tiles={}/{}",
+            bits_per_coeff,
+            re.avg_k_mag,
+            re.avg_k_zrl,
+            re.tiles_all_skipped,
+            re.total_tiles,
+        );
+    }
+}
+
 /// Print temporal wavelet potential diagnostic.
 pub fn print_temporal_wavelet(
     frame_idx: usize,

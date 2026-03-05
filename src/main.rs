@@ -313,6 +313,33 @@ enum Command {
         compare_codecs: bool,
     },
 
+    /// Automated benchmark across multiple Xiph sequences. Outputs CSV.
+    BenchmarkSuite {
+        /// Sequence base directory (default: test_material/frames/sequences)
+        #[arg(long, default_value = "test_material/frames/sequences")]
+        dir: String,
+
+        /// Comma-separated sequence names (default: rush_hour,crowd_run,stockholm,park_joy,bbb_2min)
+        #[arg(long, default_value = "rush_hour,crowd_run,stockholm,park_joy,bbb_2min")]
+        sequences: String,
+
+        /// Max frames per sequence (0 = all)
+        #[arg(short = 'n', long, default_value = "120")]
+        max_frames: usize,
+
+        /// Quality preset (1-100)
+        #[arg(short = 'q', long, default_value = "75")]
+        quality: u32,
+
+        /// Output CSV file
+        #[arg(long, default_value = "results/benchmark_suite.csv")]
+        csv: String,
+
+        /// Temporal wavelet mode: auto, haar, none
+        #[arg(long, default_value = "auto")]
+        temporal_wavelet: String,
+    },
+
     /// Compare block-based transforms (DCT, Hadamard, Haar) against wavelet baseline
     TransformShootout {
         /// Input image file
@@ -2375,6 +2402,213 @@ fn main() {
                 eprintln!("Error: provide --input for RD sweep, --compare for BD-rate, or both.");
                 std::process::exit(1);
             }
+        }
+
+        Command::BenchmarkSuite {
+            dir,
+            sequences,
+            max_frames,
+            quality,
+            csv,
+            temporal_wavelet,
+        } => {
+            let ctx = GpuContext::new();
+            let mut encoder = gnc::encoder::pipeline::EncoderPipeline::new(&ctx);
+            let decoder = gnc::decoder::pipeline::DecoderPipeline::new(&ctx);
+
+            let temporal_mode = match temporal_wavelet.as_str() {
+                "haar" => TemporalTransform::Haar,
+                "53" => TemporalTransform::LeGall53,
+                "none" => TemporalTransform::None,
+                _ => TemporalTransform::Haar, // auto defaults to Haar
+            };
+
+            let seq_names: Vec<&str> = sequences.split(',').map(|s| s.trim()).collect();
+
+            // CSV header
+            let mut csv_rows: Vec<String> = vec![
+                "sequence,frames,quality,temporal_mode,bpp,psnr_avg,psnr_min,fps_enc,fps_dec,total_bytes".to_string(),
+            ];
+
+            println!("=== GNC Benchmark Suite ===");
+            println!(
+                "Sequences: {:?}, quality={}, temporal={:?}",
+                seq_names, quality, temporal_mode
+            );
+            println!();
+
+            for seq_name in &seq_names {
+                let seq_dir = format!("{}/{}", dir, seq_name);
+                // Count available frames
+                let mut frame_count = 0usize;
+                loop {
+                    let path = format!("{}/frame_{:04}.png", seq_dir, frame_count);
+                    if !std::path::Path::new(&path).exists() {
+                        break;
+                    }
+                    frame_count += 1;
+                }
+                if frame_count == 0 {
+                    eprintln!("  {} — no frames found in {}, skipping", seq_name, seq_dir);
+                    continue;
+                }
+                let num_frames = if max_frames > 0 && max_frames < frame_count {
+                    max_frames
+                } else {
+                    frame_count
+                };
+
+                let gop_size = match temporal_mode {
+                    TemporalTransform::Haar => 4,
+                    TemporalTransform::LeGall53 => 4,
+                    TemporalTransform::None => 1,
+                };
+
+                // Load first frame for dimensions + warmup
+                let first_path = format!("{}/frame_0000.png", seq_dir);
+                let (first_rgb, w, h) = load_image_rgb_f32(&first_path);
+                let mut config_tw = gnc::quality_preset(quality);
+                config_tw.temporal_transform = temporal_mode;
+                config_tw.target_bitrate = None;
+                let _ = encoder.encode(&ctx, &first_rgb, w, h, &config_tw);
+                drop(first_rgb);
+
+                let mut total_bytes = 0usize;
+                let mut psnr_vals: Vec<f64> = Vec::new();
+                let mut enc_time = std::time::Duration::ZERO;
+                let mut dec_time = std::time::Duration::ZERO;
+
+                if temporal_mode == TemporalTransform::None {
+                    // All-I mode: encode each frame independently
+                    for i in 0..num_frames {
+                        let path = format!("{}/frame_{:04}.png", seq_dir, i);
+                        let (rgb, _, _) = load_image_rgb_f32(&path);
+                        let t0 = std::time::Instant::now();
+                        let cf = encoder.encode(&ctx, &rgb, w, h, &config_tw);
+                        enc_time += t0.elapsed();
+                        total_bytes += cf.byte_size();
+                        let t1 = std::time::Instant::now();
+                        let dec = decoder.decode(&ctx, &cf);
+                        dec_time += t1.elapsed();
+                        let psnr = quality::psnr(&rgb, &dec, 255.0);
+                        psnr_vals.push(psnr);
+                    }
+                } else {
+                    // Temporal wavelet mode: encode GOPs, then decode
+                    let num_gops = num_frames / gop_size;
+                    let tail_start = num_gops * gop_size;
+                    let mut groups: Vec<gnc::TemporalGroup> = Vec::new();
+
+                    // Encode pass
+                    for gop_idx in 0..num_gops {
+                        let base = gop_idx * gop_size;
+                        let mut gop_frames: Vec<Vec<f32>> = Vec::with_capacity(gop_size);
+                        for j in 0..gop_size {
+                            let path = format!("{}/frame_{:04}.png", seq_dir, base + j);
+                            let (rgb, _, _) = load_image_rgb_f32(&path);
+                            gop_frames.push(rgb);
+                        }
+                        let gop_refs: Vec<&[f32]> =
+                            gop_frames.iter().map(|f| f.as_slice()).collect();
+                        let t0 = std::time::Instant::now();
+                        let group = encoder.encode_temporal_wavelet_gop(
+                            &ctx, &gop_refs, w, h, &config_tw, temporal_mode,
+                        );
+                        enc_time += t0.elapsed();
+                        let group_bytes: usize = group.low_frame.byte_size()
+                            + group
+                                .high_frames
+                                .iter()
+                                .flat_map(|lvl| lvl.iter())
+                                .map(|f| f.byte_size())
+                                .sum::<usize>();
+                        total_bytes += group_bytes;
+                        groups.push(group);
+                    }
+
+                    // Tail I-frames encode
+                    let mut tail_iframes: Vec<CompressedFrame> = Vec::new();
+                    for i in tail_start..num_frames {
+                        let path = format!("{}/frame_{:04}.png", seq_dir, i);
+                        let (rgb, _, _) = load_image_rgb_f32(&path);
+                        let t0 = std::time::Instant::now();
+                        let cf = encoder.encode(&ctx, &rgb, w, h, &config_tw);
+                        enc_time += t0.elapsed();
+                        total_bytes += cf.byte_size();
+                        tail_iframes.push(cf);
+                    }
+
+                    // Decode pass + PSNR
+                    for (gop_idx, group) in groups.iter().enumerate() {
+                        let t0 = std::time::Instant::now();
+                        let decoded = decoder.decode_temporal_sequence(
+                            &ctx,
+                            &gnc::TemporalEncodedSequence {
+                                mode: temporal_mode,
+                                groups: vec![group.clone()],
+                                tail_iframes: vec![],
+                                frame_count: gop_size,
+                                gop_size,
+                            },
+                        );
+                        dec_time += t0.elapsed();
+                        let base = gop_idx * gop_size;
+                        for (j, dec_frame) in decoded.iter().enumerate() {
+                            let path = format!("{}/frame_{:04}.png", seq_dir, base + j);
+                            let (orig_rgb, _, _) = load_image_rgb_f32(&path);
+                            let psnr = quality::psnr(&orig_rgb, dec_frame, 255.0);
+                            psnr_vals.push(psnr);
+                        }
+                    }
+
+                    // Decode tail I-frames
+                    for (i, cf) in tail_iframes.iter().enumerate() {
+                        let t0 = std::time::Instant::now();
+                        let dec = decoder.decode(&ctx, cf);
+                        dec_time += t0.elapsed();
+                        let path = format!("{}/frame_{:04}.png", seq_dir, tail_start + i);
+                        let (orig_rgb, _, _) = load_image_rgb_f32(&path);
+                        let psnr = quality::psnr(&orig_rgb, &dec, 255.0);
+                        psnr_vals.push(psnr);
+                    }
+                }
+
+                let fps_enc = num_frames as f64 / enc_time.as_secs_f64();
+                let fps_dec = num_frames as f64 / dec_time.as_secs_f64();
+                let avg_bpp =
+                    (total_bytes as f64 * 8.0) / (w as f64 * h as f64) / num_frames as f64;
+
+                // Cap infinite PSNR (identical frames) at 99 dB for averaging
+                let psnr_avg = if psnr_vals.is_empty() {
+                    0.0
+                } else {
+                    let capped: Vec<f64> = psnr_vals.iter().map(|&v| v.min(99.0)).collect();
+                    capped.iter().sum::<f64>() / capped.len() as f64
+                };
+                let psnr_min = psnr_vals.iter().cloned().fold(f64::INFINITY, f64::min);
+
+                println!(
+                    "  {:20} {:4} frames  {:.2} bpp  {:.2} dB avg  {:.2} dB min  {:.1} fps enc  {:.1} fps dec",
+                    seq_name, num_frames, avg_bpp, psnr_avg,
+                    if psnr_min.is_infinite() { 0.0 } else { psnr_min },
+                    fps_enc, fps_dec,
+                );
+
+                csv_rows.push(format!(
+                    "{},{},{},{:?},{:.4},{:.2},{:.2},{:.1},{:.1},{}",
+                    seq_name, num_frames, quality, temporal_mode, avg_bpp, psnr_avg,
+                    if psnr_min.is_infinite() { 0.0 } else { psnr_min },
+                    fps_enc, fps_dec, total_bytes,
+                ));
+            }
+
+            // Write CSV
+            if let Some(parent) = std::path::Path::new(&csv).parent() {
+                std::fs::create_dir_all(parent).ok();
+            }
+            std::fs::write(&csv, csv_rows.join("\n") + "\n")
+                .unwrap_or_else(|e| eprintln!("Failed to write CSV: {}", e));
+            println!("\nCSV written to: {}", csv);
         }
 
         Command::TransformShootout { input, iterations } => {

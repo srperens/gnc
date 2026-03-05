@@ -184,8 +184,8 @@ enum Command {
         #[arg(long)]
         diagnostics: bool,
 
-        /// Temporal wavelet mode: auto (default, Haar with adaptive GOP), haar, 53 (experimental), none (I+P+B motion vectors)
-        #[arg(long, default_value = "auto")]
+        /// Temporal wavelet mode: none (default, I+P+B motion vectors), auto (Haar with adaptive GOP), haar, 53 (experimental)
+        #[arg(long, default_value = "none")]
         temporal_wavelet: String,
 
         /// Temporal highpass qstep multiplier (e.g. 2.0 = double qstep for highpass)
@@ -335,8 +335,8 @@ enum Command {
         #[arg(long, default_value = "results/benchmark_suite.csv")]
         csv: String,
 
-        /// Temporal wavelet mode: auto, haar, none
-        #[arg(long, default_value = "auto")]
+        /// Temporal wavelet mode: none (default), auto, haar
+        #[arg(long, default_value = "none")]
         temporal_wavelet: String,
     },
 

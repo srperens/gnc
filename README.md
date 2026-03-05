@@ -12,6 +12,12 @@ GNC asks: if you start from zero with a GPU-first mindset, what do you end up wi
 
 The answer so far: tile-independent processing, fully parallel entropy coding (256 independent streams per tile), and wavelet transforms that map naturally to GPU workgroups. The result competes with JPEG on compression while encoding/decoding at 40–70 fps at 1080p — including a full I/P/B video pipeline.
 
+## Status
+
+**Spatial codec (I+P+B) is production-ready** — 40 dB PSNR at 2–8 bpp, 20–60 fps encode/decode at 1080p, lossless mode, full video pipeline with motion estimation.
+Temporal wavelet mode (`--temporal-wavelet haar`) is **experimental** — works for low-motion content but loses 2–5 dB on high-motion sequences; off by default.
+See [`RESEARCH_LOG.md`](RESEARCH_LOG.md) for detailed benchmarks and analysis.
+
 ## Current Results (1080p, bbb reference, M1 GPU)
 
 ### Single-frame (Rice+ZRL entropy)
@@ -94,7 +100,7 @@ gnc decode-sequence -i video.gnv -o "output/%04d.png" --seek 5.0  # seek to 5s
 ### Run tests
 
 ```bash
-cargo test --release    # 142 tests: unit, regression, conformance
+cargo test --release    # 148 tests: unit, regression, conformance
 ```
 
 ## Test Material

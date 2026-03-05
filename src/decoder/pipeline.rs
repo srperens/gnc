@@ -13,6 +13,7 @@ use crate::encoder::rice_gpu::GpuRiceDecoder;
 use crate::encoder::huffman_gpu::GpuHuffmanDecoder;
 use crate::encoder::block_transform::BlockTransform;
 use crate::encoder::intra::IntraPredictor;
+use crate::encoder::temporal_53::Temporal53Gpu;
 use crate::encoder::temporal_haar::TemporalHaarGpu;
 use crate::encoder::transform::WaveletTransform;
 use crate::encoder::diagnostics;
@@ -44,6 +45,7 @@ pub struct DecoderPipeline {
     pub(super) block_transform: BlockTransform,
     pub(super) intra: IntraPredictor,
     pub(super) temporal_haar: TemporalHaarGpu,
+    pub(super) temporal_53: Temporal53Gpu,
     pub(super) crop_pipeline: wgpu::ComputePipeline,
     pub(super) crop_bgl: wgpu::BindGroupLayout,
     pub(super) pack_pipeline: wgpu::ComputePipeline,
@@ -267,6 +269,7 @@ impl DecoderPipeline {
             block_transform: BlockTransform::new(ctx),
             intra: IntraPredictor::new(ctx),
             temporal_haar: TemporalHaarGpu::new(ctx),
+            temporal_53: Temporal53Gpu::new(ctx),
             crop_pipeline,
             crop_bgl,
             pack_pipeline,
@@ -785,7 +788,100 @@ impl DecoderPipeline {
                     }
                 }
                 TemporalTransform::LeGall53 => {
-                    panic!("temporal LeGall53 not supported in multilevel mode yet");
+                    let info = &group.low_frame.info;
+                    let config = &group.low_frame.config;
+                    let padded_w = info.padded_width();
+                    let padded_h = info.padded_height();
+                    let padded_pixels = (padded_w * padded_h) as usize;
+                    let plane_size = (padded_pixels * std::mem::size_of::<f32>()) as u64;
+                    let plane_usage = wgpu::BufferUsages::STORAGE
+                        | wgpu::BufferUsages::COPY_DST
+                        | wgpu::BufferUsages::COPY_SRC;
+
+                    if diagnostics::enabled() {
+                        let base = group_idx * seq.gop_size;
+                        let end = base + 3;
+                        eprintln!(
+                            "TW53 DEC group {} frames [{}..{}] (GPU 5/3 inverse)",
+                            group_idx, base, end
+                        );
+                    }
+
+                    // Allocate coefficient buffers: s0, s1, d0, d1 per plane
+                    let tw_coeff_bufs: Vec<[wgpu::Buffer; 3]> = (0..4)
+                        .map(|j| {
+                            std::array::from_fn(|p| {
+                                ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                                    label: Some(&format!("tw53_dec_{}_{}", j, p)),
+                                    size: plane_size,
+                                    usage: plane_usage,
+                                    mapped_at_creation: false,
+                                })
+                            })
+                        })
+                        .collect();
+
+                    // Reconstruct frame buffers (f0..f3 per plane)
+                    let tw_frame_bufs: Vec<[wgpu::Buffer; 3]> = (0..4)
+                        .map(|j| {
+                            std::array::from_fn(|p| {
+                                ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                                    label: Some(&format!("tw53_dec_out_{}_{}", j, p)),
+                                    size: plane_size,
+                                    usage: plane_usage,
+                                    mapped_at_creation: false,
+                                })
+                            })
+                        })
+                        .collect();
+
+                    // Decode s0 (low_frame) -> coeff_bufs[0]
+                    self.decode_wavelet_coeffs_to_gpu(
+                        ctx,
+                        &group.low_frame,
+                        [&tw_coeff_bufs[0][0], &tw_coeff_bufs[0][1], &tw_coeff_bufs[0][2]],
+                    );
+
+                    // Decode s1, d0, d1 from high_frames[0][0..2]
+                    for (idx, cf) in group.high_frames[0].iter().enumerate() {
+                        self.decode_wavelet_coeffs_to_gpu(
+                            ctx,
+                            cf,
+                            [
+                                &tw_coeff_bufs[1 + idx][0],
+                                &tw_coeff_bufs[1 + idx][1],
+                                &tw_coeff_bufs[1 + idx][2],
+                            ],
+                        );
+                    }
+
+                    // GPU temporal 5/3 inverse, per plane
+                    #[allow(clippy::needless_range_loop)]
+                    for p in 0..3 {
+                        self.temporal_53.inverse_4(
+                            ctx,
+                            &tw_coeff_bufs[0][p], // s0
+                            &tw_coeff_bufs[1][p], // s1
+                            &tw_coeff_bufs[2][p], // d0
+                            &tw_coeff_bufs[3][p], // d1
+                            &tw_frame_bufs[0][p], // f0
+                            &tw_frame_bufs[1][p], // f1
+                            &tw_frame_bufs[2][p], // f2
+                            &tw_frame_bufs[3][p], // f3
+                            padded_pixels as u32,
+                        );
+                    }
+
+                    // Decode each reconstructed frame from GPU buffers
+                    for frame_bufs in tw_frame_bufs.iter().take(4) {
+                        let rgb = self.decode_from_gpu_wavelet_planes(
+                            ctx,
+                            info,
+                            config,
+                            [&frame_bufs[0], &frame_bufs[1], &frame_bufs[2]],
+                        );
+                        out.push(rgb);
+                    }
                 }
                 TemporalTransform::None => {}
             }
@@ -856,7 +952,33 @@ impl DecoderPipeline {
                     }
                 }
                 TemporalTransform::LeGall53 => {
-                    panic!("temporal LeGall53 not supported in multilevel mode yet");
+                    // CPU path for wavelet coefficient extraction
+                    let s0_coeffs = self.decode_wavelet_coeffs(ctx, &group.low_frame);
+                    let s1_coeffs = self.decode_wavelet_coeffs(ctx, &group.high_frames[0][0]);
+                    let d0_coeffs = self.decode_wavelet_coeffs(ctx, &group.high_frames[0][1]);
+                    let d1_coeffs = self.decode_wavelet_coeffs(ctx, &group.high_frames[0][2]);
+
+                    for p in 0..3 {
+                        let (f0, f1, f2, f3) = temporal::legall53_inverse_4(
+                            &s0_coeffs[p],
+                            &s1_coeffs[p],
+                            &d0_coeffs[p],
+                            &d1_coeffs[p],
+                        );
+                        // Store in temp arrays, assemble after all planes
+                        if p == 0 {
+                            out.push([f0, Vec::new(), Vec::new()]);
+                            out.push([f1, Vec::new(), Vec::new()]);
+                            out.push([f2, Vec::new(), Vec::new()]);
+                            out.push([f3, Vec::new(), Vec::new()]);
+                        } else {
+                            let base = out.len() - 4;
+                            out[base][p] = f0;
+                            out[base + 1][p] = f1;
+                            out[base + 2][p] = f2;
+                            out[base + 3][p] = f3;
+                        }
+                    }
                 }
                 TemporalTransform::None => {}
             }
@@ -1665,7 +1787,6 @@ impl DecoderPipeline {
         mode: crate::TemporalTransform,
         gop_size: usize,
     ) -> Vec<Vec<u8>> {
-        let _ = mode; // currently only Haar is supported
         let info = &group.low_frame.info;
         let config = &group.low_frame.config;
         let padded_w = info.padded_width();
@@ -1691,80 +1812,132 @@ impl DecoderPipeline {
                 })
             })
             .collect();
-        // Snapshot buffers to avoid read-after-write aliasing in multilevel inverse
-        let tw_snapshot: Vec<wgpu::Buffer> = (0..gop_size)
-            .map(|s| {
-                ctx.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some(&format!("tw_wasm_snap_{}", s)),
-                    size: plane_size,
-                    usage: plane_usage,
-                    mapped_at_creation: false,
-                })
-            })
-            .collect();
 
-        // Decode low frame -> buf[0]
-        self.decode_wavelet_coeffs_to_gpu(
-            ctx,
-            &group.low_frame,
-            [
-                &tw_frame_bufs[0][0],
-                &tw_frame_bufs[0][1],
-                &tw_frame_bufs[0][2],
-            ],
-        );
+        match mode {
+            TemporalTransform::Haar => {
+                // Snapshot buffers to avoid read-after-write aliasing in multilevel inverse
+                let tw_snapshot: Vec<wgpu::Buffer> = (0..gop_size)
+                    .map(|s| {
+                        ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                            label: Some(&format!("tw_wasm_snap_{}", s)),
+                            size: plane_size,
+                            usage: plane_usage,
+                            mapped_at_creation: false,
+                        })
+                    })
+                    .collect();
 
-        // Decode high frames -> appropriate buffer positions
-        for lvl in 0..num_levels {
-            let count = gop_size >> (lvl + 1);
-            let start = gop_size >> (lvl + 1);
-            for idx in 0..count {
-                let buf_idx = start + idx;
+                // Decode low frame -> buf[0]
                 self.decode_wavelet_coeffs_to_gpu(
                     ctx,
-                    &group.high_frames[lvl][idx],
-                    [
-                        &tw_frame_bufs[buf_idx][0],
-                        &tw_frame_bufs[buf_idx][1],
-                        &tw_frame_bufs[buf_idx][2],
-                    ],
+                    &group.low_frame,
+                    [&tw_frame_bufs[0][0], &tw_frame_bufs[0][1], &tw_frame_bufs[0][2]],
                 );
-            }
-        }
 
-        // GPU temporal Haar inverse, per plane
-        #[allow(clippy::needless_range_loop)]
-        for p in 0..3 {
-            let mut cmd = ctx
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("tw_wasm_temporal_haar"),
-                });
-            let mut current_count = 1usize;
-            for _level in (0..num_levels).rev() {
-                let pairs = current_count;
-                // Snapshot lows + highs for this level
-                for j in 0..(2 * current_count) {
-                    cmd.copy_buffer_to_buffer(
-                        &tw_frame_bufs[j][p], 0, &tw_snapshot[j], 0, plane_size,
-                    );
+                // Decode high frames -> appropriate buffer positions
+                for lvl in 0..num_levels {
+                    let count = gop_size >> (lvl + 1);
+                    let start = gop_size >> (lvl + 1);
+                    for idx in 0..count {
+                        let buf_idx = start + idx;
+                        self.decode_wavelet_coeffs_to_gpu(
+                            ctx,
+                            &group.high_frames[lvl][idx],
+                            [
+                                &tw_frame_bufs[buf_idx][0],
+                                &tw_frame_bufs[buf_idx][1],
+                                &tw_frame_bufs[buf_idx][2],
+                            ],
+                        );
+                    }
                 }
-                // Read from snapshot, write directly to tw_frame_bufs
-                for pair in 0..pairs {
-                    self.temporal_haar.dispatch(
-                        ctx,
-                        &mut cmd,
-                        &tw_snapshot[pair],
-                        &tw_snapshot[pairs + pair],
-                        &tw_frame_bufs[pair * 2][p],
-                        &tw_frame_bufs[pair * 2 + 1][p],
-                        padded_pixels as u32,
-                        false, // inverse
-                    );
+
+                // GPU temporal Haar inverse, per plane
+                #[allow(clippy::needless_range_loop)]
+                for p in 0..3 {
+                    let mut cmd = ctx
+                        .device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("tw_wasm_temporal_haar"),
+                        });
+                    let mut current_count = 1usize;
+                    for _level in (0..num_levels).rev() {
+                        let pairs = current_count;
+                        for j in 0..(2 * current_count) {
+                            cmd.copy_buffer_to_buffer(
+                                &tw_frame_bufs[j][p], 0, &tw_snapshot[j], 0, plane_size,
+                            );
+                        }
+                        for pair in 0..pairs {
+                            self.temporal_haar.dispatch(
+                                ctx,
+                                &mut cmd,
+                                &tw_snapshot[pair],
+                                &tw_snapshot[pairs + pair],
+                                &tw_frame_bufs[pair * 2][p],
+                                &tw_frame_bufs[pair * 2 + 1][p],
+                                padded_pixels as u32,
+                                false,
+                            );
+                        }
+                        current_count *= 2;
+                    }
+                    ctx.queue.submit(Some(cmd.finish()));
                 }
-                current_count *= 2;
             }
-            ctx.queue.submit(Some(cmd.finish()));
+            TemporalTransform::LeGall53 => {
+                // Allocate coefficient buffers: s0, s1, d0, d1 per plane
+                let tw_coeff_bufs: Vec<[wgpu::Buffer; 3]> = (0..4)
+                    .map(|j| {
+                        std::array::from_fn(|p| {
+                            ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                                label: Some(&format!("tw53_wasm_coeff_{}_{}", j, p)),
+                                size: plane_size,
+                                usage: plane_usage,
+                                mapped_at_creation: false,
+                            })
+                        })
+                    })
+                    .collect();
+
+                // Decode s0 (low_frame) -> coeff_bufs[0]
+                self.decode_wavelet_coeffs_to_gpu(
+                    ctx,
+                    &group.low_frame,
+                    [&tw_coeff_bufs[0][0], &tw_coeff_bufs[0][1], &tw_coeff_bufs[0][2]],
+                );
+
+                // Decode s1, d0, d1 from high_frames[0][0..2]
+                for (idx, cf) in group.high_frames[0].iter().enumerate() {
+                    self.decode_wavelet_coeffs_to_gpu(
+                        ctx,
+                        cf,
+                        [
+                            &tw_coeff_bufs[1 + idx][0],
+                            &tw_coeff_bufs[1 + idx][1],
+                            &tw_coeff_bufs[1 + idx][2],
+                        ],
+                    );
+                }
+
+                // GPU temporal 5/3 inverse, per plane
+                #[allow(clippy::needless_range_loop)]
+                for p in 0..3 {
+                    self.temporal_53.inverse_4(
+                        ctx,
+                        &tw_coeff_bufs[0][p],
+                        &tw_coeff_bufs[1][p],
+                        &tw_coeff_bufs[2][p],
+                        &tw_coeff_bufs[3][p],
+                        &tw_frame_bufs[0][p],
+                        &tw_frame_bufs[1][p],
+                        &tw_frame_bufs[2][p],
+                        &tw_frame_bufs[3][p],
+                        padded_pixels as u32,
+                    );
+                }
+            }
+            TemporalTransform::None => {}
         }
 
         // Per-frame: GPU inverse wavelet + color + pack + async readback
@@ -1948,7 +2121,6 @@ impl DecoderPipeline {
         mode: crate::TemporalTransform,
         gop_size: usize,
     ) -> Vec<wgpu::Texture> {
-        let _ = mode; // currently only Haar is supported
         let info = &group.low_frame.info;
         let config = &group.low_frame.config;
         let padded_w = info.padded_width();
@@ -1959,7 +2131,6 @@ impl DecoderPipeline {
             | wgpu::BufferUsages::COPY_DST
             | wgpu::BufferUsages::COPY_SRC;
 
-        let num_levels = group.high_frames.len();
         let w = info.width;
         let h = info.height;
         let output_pixels = w * h;
@@ -1977,72 +2148,26 @@ impl DecoderPipeline {
                 })
             })
             .collect();
-        // Snapshot buffers for multilevel inverse
-        let tw_snapshot: Vec<wgpu::Buffer> = (0..gop_size)
-            .map(|s| {
-                ctx.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some(&format!("tw_tex_snap_{}", s)),
-                    size: plane_size,
-                    usage: plane_usage,
-                    mapped_at_creation: false,
-                })
-            })
-            .collect();
 
-        // Decode low frame -> buf[0]
-        self.decode_wavelet_coeffs_to_gpu(
-            ctx,
-            &group.low_frame,
-            [&tw_frame_bufs[0][0], &tw_frame_bufs[0][1], &tw_frame_bufs[0][2]],
-        );
-
-        // Decode high frames -> appropriate buffer positions
-        for lvl in 0..num_levels {
-            let count = gop_size >> (lvl + 1);
-            let start = gop_size >> (lvl + 1);
-            for idx in 0..count {
-                let buf_idx = start + idx;
-                self.decode_wavelet_coeffs_to_gpu(
-                    ctx,
-                    &group.high_frames[lvl][idx],
-                    [
-                        &tw_frame_bufs[buf_idx][0],
-                        &tw_frame_bufs[buf_idx][1],
-                        &tw_frame_bufs[buf_idx][2],
-                    ],
-                );
+        match mode {
+            TemporalTransform::Haar => {
+                let tw_snapshot: Vec<wgpu::Buffer> = (0..gop_size)
+                    .map(|s| {
+                        ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                            label: Some(&format!("tw_tex_snap_{}", s)),
+                            size: plane_size,
+                            usage: plane_usage,
+                            mapped_at_creation: false,
+                        })
+                    })
+                    .collect();
+                self.decode_temporal_gop_into(ctx, group, mode, gop_size, &tw_frame_bufs, &tw_snapshot);
             }
-        }
-
-        // GPU temporal Haar inverse, per plane
-        #[allow(clippy::needless_range_loop)]
-        for p in 0..3 {
-            let mut cmd = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("tw_tex_temporal_haar"),
-            });
-            let mut current_count = 1usize;
-            for _level in (0..num_levels).rev() {
-                let pairs = current_count;
-                for j in 0..(2 * current_count) {
-                    cmd.copy_buffer_to_buffer(
-                        &tw_frame_bufs[j][p], 0, &tw_snapshot[j], 0, plane_size,
-                    );
-                }
-                for pair in 0..pairs {
-                    self.temporal_haar.dispatch(
-                        ctx,
-                        &mut cmd,
-                        &tw_snapshot[pair],
-                        &tw_snapshot[pairs + pair],
-                        &tw_frame_bufs[pair * 2][p],
-                        &tw_frame_bufs[pair * 2 + 1][p],
-                        padded_pixels as u32,
-                        false,
-                    );
-                }
-                current_count *= 2;
+            TemporalTransform::LeGall53 => {
+                let empty: Vec<wgpu::Buffer> = Vec::new();
+                self.decode_temporal_gop_into(ctx, group, mode, gop_size, &tw_frame_bufs, &empty);
             }
-            ctx.queue.submit(Some(cmd.finish()));
+            TemporalTransform::None => {}
         }
 
         // Per-frame: inverse wavelet → color → crop → buf_to_tex → copy to owned texture
@@ -2159,6 +2284,7 @@ impl DecoderPipeline {
         &self,
         ctx: &GpuContext,
         group: &crate::TemporalGroup,
+        mode: crate::TemporalTransform,
         gop_size: usize,
     ) -> Vec<[wgpu::Buffer; 3]> {
         let info = &group.low_frame.info;
@@ -2194,17 +2320,18 @@ impl DecoderPipeline {
             })
             .collect();
 
-        self.decode_temporal_gop_into(ctx, group, gop_size, &tw_frame_bufs, &tw_snapshot);
+        self.decode_temporal_gop_into(ctx, group, mode, gop_size, &tw_frame_bufs, &tw_snapshot);
         tw_frame_bufs
     }
 
     /// Phase 1 of temporal wavelet decode using pre-allocated buffers.
     /// `frame_bufs` must have `gop_size` entries (3 planes each, size = padded_pixels * 4).
-    /// `snapshot_bufs` must have `gop_size` entries (same size per buffer).
+    /// `snapshot_bufs` must have `gop_size` entries for Haar (same size per buffer); unused for 5/3.
     pub fn decode_temporal_gop_into(
         &self,
         ctx: &GpuContext,
         group: &crate::TemporalGroup,
+        mode: crate::TemporalTransform,
         gop_size: usize,
         frame_bufs: &[[wgpu::Buffer; 3]],
         snapshot_bufs: &[wgpu::Buffer],
@@ -2216,59 +2343,113 @@ impl DecoderPipeline {
         let plane_size = (padded_pixels * std::mem::size_of::<f32>()) as u64;
         let num_levels = group.high_frames.len();
 
-        // Entropy decode + dequantize for all frames
-        self.decode_wavelet_coeffs_to_gpu(
-            ctx,
-            &group.low_frame,
-            [&frame_bufs[0][0], &frame_bufs[0][1], &frame_bufs[0][2]],
-        );
-        for lvl in 0..num_levels {
-            let count = gop_size >> (lvl + 1);
-            let start = gop_size >> (lvl + 1);
-            for idx in 0..count {
-                let buf_idx = start + idx;
+        match mode {
+            TemporalTransform::Haar => {
+                // Entropy decode + dequantize for all frames
                 self.decode_wavelet_coeffs_to_gpu(
                     ctx,
-                    &group.high_frames[lvl][idx],
-                    [
-                        &frame_bufs[buf_idx][0],
-                        &frame_bufs[buf_idx][1],
-                        &frame_bufs[buf_idx][2],
-                    ],
+                    &group.low_frame,
+                    [&frame_bufs[0][0], &frame_bufs[0][1], &frame_bufs[0][2]],
                 );
-            }
-        }
+                for lvl in 0..num_levels {
+                    let count = gop_size >> (lvl + 1);
+                    let start = gop_size >> (lvl + 1);
+                    for idx in 0..count {
+                        let buf_idx = start + idx;
+                        self.decode_wavelet_coeffs_to_gpu(
+                            ctx,
+                            &group.high_frames[lvl][idx],
+                            [
+                                &frame_bufs[buf_idx][0],
+                                &frame_bufs[buf_idx][1],
+                                &frame_bufs[buf_idx][2],
+                            ],
+                        );
+                    }
+                }
 
-        // Temporal Haar inverse — all 3 planes in a single submit
-        let mut cmd = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("tw_wb_temporal_haar"),
-        });
-        #[allow(clippy::needless_range_loop)]
-        for p in 0..3 {
-            let mut current_count = 1usize;
-            for _level in (0..num_levels).rev() {
-                let pairs = current_count;
-                for j in 0..(2 * current_count) {
-                    cmd.copy_buffer_to_buffer(
-                        &frame_bufs[j][p], 0, &snapshot_bufs[j], 0, plane_size,
-                    );
+                // Temporal Haar inverse — all 3 planes in a single submit
+                let mut cmd = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("tw_wb_temporal_haar"),
+                });
+                #[allow(clippy::needless_range_loop)]
+                for p in 0..3 {
+                    let mut current_count = 1usize;
+                    for _level in (0..num_levels).rev() {
+                        let pairs = current_count;
+                        for j in 0..(2 * current_count) {
+                            cmd.copy_buffer_to_buffer(
+                                &frame_bufs[j][p], 0, &snapshot_bufs[j], 0, plane_size,
+                            );
+                        }
+                        for pair in 0..pairs {
+                            self.temporal_haar.dispatch(
+                                ctx,
+                                &mut cmd,
+                                &snapshot_bufs[pair],
+                                &snapshot_bufs[pairs + pair],
+                                &frame_bufs[pair * 2][p],
+                                &frame_bufs[pair * 2 + 1][p],
+                                padded_pixels as u32,
+                                false,
+                            );
+                        }
+                        current_count *= 2;
+                    }
                 }
-                for pair in 0..pairs {
-                    self.temporal_haar.dispatch(
-                        ctx,
-                        &mut cmd,
-                        &snapshot_bufs[pair],
-                        &snapshot_bufs[pairs + pair],
-                        &frame_bufs[pair * 2][p],
-                        &frame_bufs[pair * 2 + 1][p],
-                        padded_pixels as u32,
-                        false,
-                    );
-                }
-                current_count *= 2;
+                ctx.queue.submit(Some(cmd.finish()));
             }
+            TemporalTransform::LeGall53 => {
+                // Allocate temp coefficient buffers (s0, s1, d0, d1 per plane)
+                let coeff_bufs: Vec<[wgpu::Buffer; 3]> = (0..4)
+                    .map(|j| {
+                        std::array::from_fn(|p| {
+                            ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                                label: Some(&format!("tw53_gop_coeff_{}_{}", j, p)),
+                                size: plane_size,
+                                usage: wgpu::BufferUsages::STORAGE
+                                    | wgpu::BufferUsages::COPY_DST
+                                    | wgpu::BufferUsages::COPY_SRC,
+                                mapped_at_creation: false,
+                            })
+                        })
+                    })
+                    .collect();
+
+                // Decode s0
+                self.decode_wavelet_coeffs_to_gpu(
+                    ctx,
+                    &group.low_frame,
+                    [&coeff_bufs[0][0], &coeff_bufs[0][1], &coeff_bufs[0][2]],
+                );
+                // Decode s1, d0, d1
+                for (idx, cf) in group.high_frames[0].iter().enumerate() {
+                    self.decode_wavelet_coeffs_to_gpu(
+                        ctx,
+                        cf,
+                        [&coeff_bufs[1 + idx][0], &coeff_bufs[1 + idx][1], &coeff_bufs[1 + idx][2]],
+                    );
+                }
+
+                // GPU temporal 5/3 inverse, per plane → frame_bufs[0..3]
+                #[allow(clippy::needless_range_loop)]
+                for p in 0..3 {
+                    self.temporal_53.inverse_4(
+                        ctx,
+                        &coeff_bufs[0][p],
+                        &coeff_bufs[1][p],
+                        &coeff_bufs[2][p],
+                        &coeff_bufs[3][p],
+                        &frame_bufs[0][p],
+                        &frame_bufs[1][p],
+                        &frame_bufs[2][p],
+                        &frame_bufs[3][p],
+                        padded_pixels as u32,
+                    );
+                }
+            }
+            TemporalTransform::None => {}
         }
-        ctx.queue.submit(Some(cmd.finish()));
     }
 
     /// Phase 2 of temporal wavelet decode: inverse spatial wavelet + color + crop + buf_to_tex.

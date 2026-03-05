@@ -713,7 +713,180 @@ impl EncoderPipeline {
                     });
                 }
                 TemporalTransform::LeGall53 => {
-                    panic!("temporal LeGall53 not supported in multilevel mode yet");
+                    // LeGall 5/3 operates on groups of exactly 4 frames.
+                    // Output: 2 lowpass (s0, s1) + 2 highpass (d0, d1).
+                    assert_eq!(group_size, 4, "LeGall53 requires group_size=4");
+
+                    // Allocate per-frame GPU buffers [frame][plane]
+                    let tw_frame_bufs: Vec<[wgpu::Buffer; 3]> = (0..4)
+                        .map(|j| {
+                            std::array::from_fn(|p| {
+                                ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                                    label: Some(&format!("tw53_frame_{}_{}", j, p)),
+                                    size: plane_size,
+                                    usage: wgpu::BufferUsages::STORAGE
+                                        | wgpu::BufferUsages::COPY_DST
+                                        | wgpu::BufferUsages::COPY_SRC,
+                                    mapped_at_creation: false,
+                                })
+                            })
+                        })
+                        .collect();
+
+                    // Output buffers: s0, s1, d0, d1 — separate per plane
+                    let tw_out_bufs: Vec<[wgpu::Buffer; 3]> = (0..4)
+                        .map(|j| {
+                            std::array::from_fn(|p| {
+                                ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                                    label: Some(&format!("tw53_out_{}_{}", j, p)),
+                                    size: plane_size,
+                                    usage: wgpu::BufferUsages::STORAGE
+                                        | wgpu::BufferUsages::COPY_DST
+                                        | wgpu::BufferUsages::COPY_SRC,
+                                    mapped_at_creation: false,
+                                })
+                            })
+                        })
+                        .collect();
+
+                    // 1) Spatial wavelet per frame (same as Haar path)
+                    for j in 0..4 {
+                        let bufs = self.cached.as_ref().unwrap();
+                        ctx.queue.write_buffer(
+                            &bufs.raw_input_buf,
+                            0,
+                            bytemuck::cast_slice(frames[i + j]),
+                        );
+                        let mut cmd = ctx
+                            .device
+                            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                label: Some("tw53_spatial"),
+                            });
+                        self.dispatch_gpu_pad_cached(ctx, &mut cmd, padded_w, padded_h);
+                        let bufs = self.cached.as_ref().unwrap();
+                        self.color.dispatch(
+                            ctx,
+                            &mut cmd,
+                            &bufs.input_buf,
+                            &bufs.color_out,
+                            padded_w,
+                            padded_h,
+                            true,
+                            cfg.is_lossless(),
+                        );
+                        self.deinterleaver.dispatch(
+                            ctx,
+                            &mut cmd,
+                            &bufs.color_out,
+                            &bufs.plane_a,
+                            &bufs.co_plane,
+                            &bufs.cg_plane,
+                            padded_pixels as u32,
+                        );
+
+                        let planes: [&wgpu::Buffer; 3] =
+                            [&bufs.plane_a, &bufs.co_plane, &bufs.cg_plane];
+                        for (p, &cur_plane) in planes.iter().enumerate() {
+                            self.transform.forward(
+                                ctx,
+                                &mut cmd,
+                                cur_plane,
+                                &bufs.plane_b,
+                                &bufs.plane_c,
+                                &info,
+                                cfg.wavelet_levels,
+                                cfg.wavelet_type,
+                            );
+                            cmd.copy_buffer_to_buffer(
+                                &bufs.plane_c,
+                                0,
+                                &tw_frame_bufs[j][p],
+                                0,
+                                plane_size,
+                            );
+                        }
+                        ctx.queue.submit(Some(cmd.finish()));
+                    }
+
+                    // 2) Temporal 5/3 on GPU, per plane — two passes (predict then update)
+                    #[allow(clippy::needless_range_loop)]
+                    for p in 0..3 {
+                        self.temporal_53.forward_4(
+                            ctx,
+                            &tw_frame_bufs[0][p], // f0
+                            &tw_frame_bufs[1][p], // f1
+                            &tw_frame_bufs[2][p], // f2
+                            &tw_frame_bufs[3][p], // f3
+                            &tw_out_bufs[0][p],   // s0
+                            &tw_out_bufs[1][p],   // s1
+                            &tw_out_bufs[2][p],   // d0
+                            &tw_out_bufs[3][p],   // d1
+                            padded_pixels as u32,
+                        );
+                    }
+
+                    if diagnostics::enabled() {
+                        let group_idx = groups.len();
+                        let base = i;
+                        let end = base + group_size - 1;
+                        eprintln!(
+                            "TW53 ENC group {} frames [{}..{}]",
+                            group_idx, base, end
+                        );
+                    }
+
+                    // 3) Encode lowpass frames (s0, s1) with base qstep
+                    let low_s0 = self.encode_from_gpu_wavelet_planes(
+                        ctx,
+                        [&tw_out_bufs[0][0], &tw_out_bufs[0][1], &tw_out_bufs[0][2]],
+                        &cfg,
+                        &info,
+                        padded_w,
+                        padded_h,
+                        padded_pixels,
+                    );
+
+                    // 4) Encode highpass frames (d0, d1) with coarser qstep
+                    let mut high_cfg = cfg.clone();
+                    high_cfg.quantization_step *= config.temporal_highpass_qstep_mul;
+
+                    // TemporalGroup format: low_frame + high_frames[level][idx]
+                    // For 5/3 with 4 frames: 1 level, with s1 as second lowpass
+                    // We store: low_frame = s0, high_frames = [[s1, d0, d1]]
+                    // This way the decoder knows: first frame of highpass level is actually
+                    // the second lowpass, remaining are true highpass.
+                    let s1_cf = self.encode_from_gpu_wavelet_planes(
+                        ctx,
+                        [&tw_out_bufs[1][0], &tw_out_bufs[1][1], &tw_out_bufs[1][2]],
+                        &cfg,
+                        &info,
+                        padded_w,
+                        padded_h,
+                        padded_pixels,
+                    );
+                    let d0_cf = self.encode_from_gpu_wavelet_planes(
+                        ctx,
+                        [&tw_out_bufs[2][0], &tw_out_bufs[2][1], &tw_out_bufs[2][2]],
+                        &high_cfg,
+                        &info,
+                        padded_w,
+                        padded_h,
+                        padded_pixels,
+                    );
+                    let d1_cf = self.encode_from_gpu_wavelet_planes(
+                        ctx,
+                        [&tw_out_bufs[3][0], &tw_out_bufs[3][1], &tw_out_bufs[3][2]],
+                        &high_cfg,
+                        &info,
+                        padded_w,
+                        padded_h,
+                        padded_pixels,
+                    );
+
+                    groups.push(TemporalGroup {
+                        low_frame: low_s0,
+                        high_frames: vec![vec![s1_cf, d0_cf, d1_cf]],
+                    });
                 }
                 TemporalTransform::None => unreachable!(),
             }
@@ -733,6 +906,214 @@ impl EncoderPipeline {
             tail_iframes,
             frame_count: frames.len(),
             gop_size: group_size,
+        }
+    }
+
+    /// Encode a single GOP of frames using temporal Haar wavelet.
+    ///
+    /// This is the streaming-friendly version: pass in exactly `gop_size` frames,
+    /// get back one `TemporalGroup`. Call repeatedly for each GOP, then use
+    /// `encode()` for any tail frames.
+    pub fn encode_temporal_wavelet_gop_haar(
+        &mut self,
+        ctx: &GpuContext,
+        gop_frames: &[&[f32]],
+        width: u32,
+        height: u32,
+        config: &CodecConfig,
+    ) -> TemporalGroup {
+        let group_size = gop_frames.len();
+        assert!(
+            temporal::is_power_of_two(group_size) && group_size >= 2,
+            "temporal Haar requires GOP size to be a power of two >= 2, got {}",
+            group_size
+        );
+
+        let mut cfg = config.clone();
+        cfg.keyframe_interval = 1;
+        cfg.temporal_transform = TemporalTransform::None;
+        cfg.cfl_enabled = false;
+
+        let info = FrameInfo {
+            width,
+            height,
+            bit_depth: 8,
+            tile_size: cfg.tile_size,
+        };
+        let padded_w = info.padded_width();
+        let padded_h = info.padded_height();
+        let padded_pixels = (padded_w * padded_h) as usize;
+        let plane_size = (padded_pixels * std::mem::size_of::<f32>()) as u64;
+        self.ensure_cached(ctx, padded_w, padded_h, width, height);
+
+        // Allocate per-frame GPU buffers for wavelet coefficients: [frame][plane]
+        let tw_frame_bufs: Vec<[wgpu::Buffer; 3]> = (0..group_size)
+            .map(|j| {
+                std::array::from_fn(|p| {
+                    ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some(&format!("tw_frame_{}_{}", j, p)),
+                        size: plane_size,
+                        usage: wgpu::BufferUsages::STORAGE
+                            | wgpu::BufferUsages::COPY_DST
+                            | wgpu::BufferUsages::COPY_SRC,
+                        mapped_at_creation: false,
+                    })
+                })
+            })
+            .collect();
+        // Snapshot buffers to avoid read-after-write aliasing in multilevel Haar.
+        let tw_snapshot: Vec<wgpu::Buffer> = (0..group_size)
+            .map(|s| {
+                ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(&format!("tw_snap_{}", s)),
+                    size: plane_size,
+                    usage: wgpu::BufferUsages::STORAGE
+                        | wgpu::BufferUsages::COPY_DST
+                        | wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: false,
+                })
+            })
+            .collect();
+
+        // 1) Spatial wavelet per frame, keep results on GPU
+        for j in 0..group_size {
+            let bufs = self.cached.as_ref().unwrap();
+            ctx.queue.write_buffer(
+                &bufs.raw_input_buf,
+                0,
+                bytemuck::cast_slice(gop_frames[j]),
+            );
+            let mut cmd = ctx
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("tw_spatial"),
+                });
+            self.dispatch_gpu_pad_cached(ctx, &mut cmd, padded_w, padded_h);
+            let bufs = self.cached.as_ref().unwrap();
+            self.color.dispatch(
+                ctx,
+                &mut cmd,
+                &bufs.input_buf,
+                &bufs.color_out,
+                padded_w,
+                padded_h,
+                true,
+                cfg.is_lossless(),
+            );
+            self.deinterleaver.dispatch(
+                ctx,
+                &mut cmd,
+                &bufs.color_out,
+                &bufs.plane_a,
+                &bufs.co_plane,
+                &bufs.cg_plane,
+                padded_pixels as u32,
+            );
+
+            let planes: [&wgpu::Buffer; 3] =
+                [&bufs.plane_a, &bufs.co_plane, &bufs.cg_plane];
+            for (p, &cur_plane) in planes.iter().enumerate() {
+                self.transform.forward(
+                    ctx,
+                    &mut cmd,
+                    cur_plane,
+                    &bufs.plane_b,
+                    &bufs.plane_c,
+                    &info,
+                    cfg.wavelet_levels,
+                    cfg.wavelet_type,
+                );
+                cmd.copy_buffer_to_buffer(
+                    &bufs.plane_c,
+                    0,
+                    &tw_frame_bufs[j][p],
+                    0,
+                    plane_size,
+                );
+            }
+            ctx.queue.submit(Some(cmd.finish()));
+        }
+
+        // 2) Temporal Haar on GPU, per plane — multilevel dyadic decomposition
+        let num_levels = (group_size as f64).log2() as usize;
+        #[allow(clippy::needless_range_loop)]
+        for p in 0..3 {
+            let mut current_count = group_size;
+            let mut cmd = ctx
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("tw_temporal_haar"),
+                });
+            for _level in 0..num_levels {
+                let pairs = current_count / 2;
+                for j in 0..current_count {
+                    cmd.copy_buffer_to_buffer(
+                        &tw_frame_bufs[j][p], 0, &tw_snapshot[j], 0, plane_size,
+                    );
+                }
+                for pair in 0..pairs {
+                    self.temporal_haar.dispatch(
+                        ctx,
+                        &mut cmd,
+                        &tw_snapshot[pair * 2],
+                        &tw_snapshot[pair * 2 + 1],
+                        &tw_frame_bufs[pair][p],
+                        &tw_frame_bufs[pairs + pair][p],
+                        padded_pixels as u32,
+                        true,
+                    );
+                }
+                current_count = pairs;
+            }
+            ctx.queue.submit(Some(cmd.finish()));
+        }
+
+        // 3) Encode low frame from GPU buffer
+        let low_cf = self.encode_from_gpu_wavelet_planes(
+            ctx,
+            [
+                &tw_frame_bufs[0][0],
+                &tw_frame_bufs[0][1],
+                &tw_frame_bufs[0][2],
+            ],
+            &cfg,
+            &info,
+            padded_w,
+            padded_h,
+            padded_pixels,
+        );
+
+        // 4) Encode high frames per level (coarser qstep)
+        let mut high_cfg = cfg.clone();
+        high_cfg.quantization_step *= config.temporal_highpass_qstep_mul;
+        let mut high_cfs: Vec<Vec<CompressedFrame>> = Vec::new();
+        for lvl in 0..num_levels {
+            let count = group_size >> (lvl + 1);
+            let start = group_size >> (lvl + 1);
+            let mut lvl_frames: Vec<CompressedFrame> = Vec::new();
+            for idx in 0..count {
+                let buf_idx = start + idx;
+                let cf = self.encode_from_gpu_wavelet_planes(
+                    ctx,
+                    [
+                        &tw_frame_bufs[buf_idx][0],
+                        &tw_frame_bufs[buf_idx][1],
+                        &tw_frame_bufs[buf_idx][2],
+                    ],
+                    &high_cfg,
+                    &info,
+                    padded_w,
+                    padded_h,
+                    padded_pixels,
+                );
+                lvl_frames.push(cf);
+            }
+            high_cfs.push(lvl_frames);
+        }
+
+        TemporalGroup {
+            low_frame: low_cf,
+            high_frames: high_cfs,
         }
     }
 

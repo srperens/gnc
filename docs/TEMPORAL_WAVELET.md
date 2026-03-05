@@ -41,13 +41,15 @@
 20. ✅ **Timing log panel** — per-frame table (Frame, Seek ms, Decode ms, Total ms, FPS) with Clear/Copy CSV, summary stats (avg/min/max).
 21. ✅ **Dropdown file selector** — grouped `<select>` (GNV1/GNV2 optgroups) replaces button grid.
 
-## Phase 3 — Temporal 5/3 lifting
-22. **WGSL temporal 5/3 shader** — predict + update over 4 frames. Reuse spatial 5/3 lifting pattern temporally.
-23. **Adaptive temporal transform selection** — mirrors spatial wavelet strategy (CDF 9/7 lossy, 5/3 lossless):
+## Phase 3 — Temporal 5/3 lifting ✅ (2026-03-05)
+22. ✅ **WGSL temporal 5/3 shader** — `shaders/temporal_53.wgsl`, two-pass predict+update lifting over 4 frames, per-element @workgroup_size(256). Forward: d0 = f1 - 0.5*(f0+f2), d1 = f3 - f2, s0 = f0 + 0.5*d0, s1 = f2 + 0.25*(d0+d1). Inverse: undo-update then undo-predict. Two queue.submit() calls (pass barrier).
+23. ✅ **Adaptive temporal transform selection** — `--temporal-wavelet auto`:
    - **No temporal transform**: ultra-low latency / pure I-frame mode (JPEG XS-like)
-   - **Haar**: low latency / 25fps / high q
-   - **5/3**: 50-60fps / moderate q / higher compression
-   - Selectable per config or auto based on framerate + q target.
+   - **Haar**: low latency / fps ≤ 25 / q ≥ 90
+   - **5/3**: fps > 25 / q < 90 / higher compression
+   - `select_temporal_mode()` auto-selects based on framerate + quality target.
+
+**Results**: bbb_1080p q=75: 2.13 bpp / 42.60 dB, GNV2 roundtrip verified, decode 50.5 fps.
 
 ## Phase 4 — Optimization
 24. **Re-enable CfL in temporal mode** — CfL on temporal wavelet coefficients (both lowpass and highpass).

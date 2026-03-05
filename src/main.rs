@@ -362,13 +362,30 @@ fn parse_temporal_transform(s: &str) -> TemporalTransform {
         "none" => TemporalTransform::None,
         "haar" => TemporalTransform::Haar,
         "53" | "5/3" | "legall53" | "legall" => TemporalTransform::LeGall53,
+        "auto" => TemporalTransform::LeGall53, // placeholder — use select_temporal_mode() instead
         other => {
             eprintln!(
-                "Unknown temporal wavelet '{}'. Use 'none', 'haar', or '53'. Defaulting to none.",
+                "Unknown temporal wavelet '{}'. Use 'none', 'haar', '53', or 'auto'. Defaulting to none.",
                 other
             );
             TemporalTransform::None
         }
+    }
+}
+
+/// Auto-select temporal transform based on framerate and quality target.
+/// - fps <= 25 or q >= 90: Haar (low latency, fewer frames needed)
+/// - fps > 25 and q < 90: LeGall 5/3 (better compression, 4-frame groups)
+fn select_temporal_mode(explicit: &str, fps: f64, quality: u32) -> TemporalTransform {
+    if explicit.to_lowercase() != "auto" {
+        return parse_temporal_transform(explicit);
+    }
+    if fps <= 25.0 || quality >= 90 {
+        eprintln!("Auto temporal: Haar (fps={fps}, q={quality})");
+        TemporalTransform::Haar
+    } else {
+        eprintln!("Auto temporal: LeGall 5/3 (fps={fps}, q={quality})");
+        TemporalTransform::LeGall53
     }
 }
 
@@ -743,7 +760,7 @@ fn main() {
             let mut encoder = EncoderPipeline::new(&ctx);
             let decoder = DecoderPipeline::new(&ctx);
 
-            let temporal_mode = parse_temporal_transform(&temporal_wavelet);
+            let temporal_mode = select_temporal_mode(&temporal_wavelet, fps, quality.unwrap_or(75));
             let run_temporal = temporal_mode != TemporalTransform::None;
             let run_baseline = !run_temporal || ab;
             if run_temporal && temporal_mode == TemporalTransform::Haar {
@@ -756,7 +773,169 @@ fn main() {
                 }
             }
 
-            // Load frames from pattern (e.g., "frames/frame_%04d.png")
+            // Streaming path: when using temporal wavelet without A/B comparison,
+            // load frames per-GOP to avoid holding all frames in memory.
+            // For 1800 frames at 1080p, loading all = ~44 GB; per-GOP (8) = ~192 MB.
+            if run_temporal && !run_baseline && temporal_mode == TemporalTransform::Haar {
+                // Peek at first frame for dimensions
+                let first_path = input.replace("%04d", &format!("{:04}", 0));
+                let (first_rgb, w, h) = load_image_rgb_f32(&first_path);
+                let gop_size = keyframe_interval as usize;
+
+                let mut config_tw = if let Some(q) = quality {
+                    gnc::quality_preset(q)
+                } else {
+                    CodecConfig {
+                        quantization_step: qstep.unwrap_or(4.0),
+                        ..Default::default()
+                    }
+                };
+                if let Some(qs) = qstep {
+                    config_tw.quantization_step = qs;
+                }
+                config_tw.keyframe_interval = keyframe_interval;
+                config_tw.temporal_transform = temporal_mode;
+                config_tw.target_bitrate = None;
+                if let Some(mul) = tw_highpass_mul {
+                    config_tw.temporal_highpass_qstep_mul = mul;
+                }
+                if rans {
+                    config_tw.entropy_coder = gnc::EntropyCoder::Rans;
+                }
+                println!(
+                    "\n=== Temporal wavelet ({:?}, streaming) ===",
+                    temporal_mode
+                );
+                println!(
+                    "Temporal config: qstep {:.3}, dead_zone {:.3}, entropy {:?}",
+                    config_tw.quantization_step, config_tw.dead_zone, config_tw.entropy_coder
+                );
+
+                // Warm up GPU pipelines with first frame
+                let warmup_cfg = if let Some(q) = quality {
+                    gnc::quality_preset(q)
+                } else {
+                    CodecConfig {
+                        quantization_step: qstep.unwrap_or(4.0),
+                        ..Default::default()
+                    }
+                };
+                let _ = encoder.encode(&ctx, &first_rgb, w, h, &warmup_cfg);
+                drop(first_rgb);
+
+                let mut groups: Vec<gnc::TemporalGroup> = Vec::new();
+                let mut tail_iframes: Vec<CompressedFrame> = Vec::new();
+                let mut total_bytes: usize = 0;
+                let num_gops = num_frames / gop_size;
+                let tail_start = num_gops * gop_size;
+
+                let start = std::time::Instant::now();
+
+                for gop_idx in 0..num_gops {
+                    let base = gop_idx * gop_size;
+                    // Load this GOP's frames
+                    let mut gop_frames: Vec<Vec<f32>> = Vec::with_capacity(gop_size);
+                    for j in 0..gop_size {
+                        let path = input.replace("%04d", &format!("{:04}", base + j));
+                        let (rgb, _, _) = load_image_rgb_f32(&path);
+                        gop_frames.push(rgb);
+                    }
+                    let gop_refs: Vec<&[f32]> = gop_frames.iter().map(|f| f.as_slice()).collect();
+
+                    let group = encoder.encode_temporal_wavelet_gop_haar(
+                        &ctx,
+                        &gop_refs,
+                        w,
+                        h,
+                        &config_tw,
+                    );
+
+                    let low_bytes = group.low_frame.byte_size();
+                    let high_bytes: usize = group.high_frames.iter()
+                        .flat_map(|lvl| lvl.iter())
+                        .map(|f| f.byte_size())
+                        .sum();
+                    let group_bytes = low_bytes + high_bytes;
+                    total_bytes += group_bytes;
+
+                    if diagnostics || gop_idx % 10 == 0 || gop_idx == num_gops - 1 {
+                        let elapsed = start.elapsed();
+                        let frames_done = (gop_idx + 1) * gop_size;
+                        let fps_enc = frames_done as f64 / elapsed.as_secs_f64();
+                        eprintln!(
+                            "  GOP {:3}/{}: {:6} bytes (low {:5}, high {:5}), {}/{} frames, {:.1} fps",
+                            gop_idx + 1,
+                            num_gops,
+                            group_bytes,
+                            low_bytes,
+                            high_bytes,
+                            frames_done,
+                            num_frames,
+                            fps_enc,
+                        );
+                    }
+
+                    groups.push(group);
+                    // gop_frames dropped here — memory freed
+                }
+
+                // Tail frames (not enough for a full GOP)
+                let mut tail_cfg = config_tw.clone();
+                tail_cfg.keyframe_interval = 1;
+                tail_cfg.temporal_transform = TemporalTransform::None;
+                tail_cfg.cfl_enabled = false;
+                for i in tail_start..num_frames {
+                    let path = input.replace("%04d", &format!("{:04}", i));
+                    let (rgb, _, _) = load_image_rgb_f32(&path);
+                    let cf = encoder.encode(&ctx, &rgb, w, h, &tail_cfg);
+                    total_bytes += cf.byte_size();
+                    tail_iframes.push(cf);
+                }
+
+                let elapsed = start.elapsed();
+                let avg_bpp = (total_bytes as f64 * 8.0) / (w as f64 * h as f64) / num_frames as f64;
+                println!(
+                    "  Total: {} bytes ({:.2} MB), avg {:.2} bpp, {:.1}ms ({:.1} fps)",
+                    total_bytes,
+                    total_bytes as f64 / (1024.0 * 1024.0),
+                    avg_bpp,
+                    elapsed.as_secs_f64() * 1000.0,
+                    num_frames as f64 / elapsed.as_secs_f64(),
+                );
+                println!(
+                    "  {} GOPs + {} tail I-frames",
+                    groups.len(),
+                    tail_iframes.len(),
+                );
+
+                let encoded_tw = gnc::TemporalEncodedSequence {
+                    mode: temporal_mode,
+                    groups,
+                    tail_iframes,
+                    frame_count: num_frames,
+                    gop_size,
+                };
+
+                // Write GNV2 if output path provided
+                if let Some(ref output_path) = output {
+                    let fps_num = fps.round() as u32;
+                    let fps_den = 1u32;
+                    let gnv2_data = serialize_temporal_sequence(&encoded_tw, (fps_num, fps_den));
+                    std::fs::write(output_path, &gnv2_data).expect("Failed to write GNV2 output");
+                    println!(
+                        "Wrote GNV2: {} bytes ({:.2} MB) → {}",
+                        gnv2_data.len(),
+                        gnv2_data.len() as f64 / (1024.0 * 1024.0),
+                        output_path,
+                    );
+                }
+
+                // Skip per-frame PSNR in streaming mode (would require reloading all frames)
+                // Diagnostics GOPs are printed inline above
+                return;
+            }
+
+            // Non-streaming path: load all frames into memory
             let mut frames_data: Vec<Vec<f32>> = Vec::new();
             let mut w = 0u32;
             let mut h = 0u32;

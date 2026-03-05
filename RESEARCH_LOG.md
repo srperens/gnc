@@ -4,6 +4,51 @@
 
 ---
 
+## 2026-03-05: Temporal LeGall 5/3 — Phase 3 Complete
+
+### Hypothesis
+Adding temporal 5/3 lifting alongside Haar provides better energy compaction for higher-framerate content (50-60fps), while Haar remains optimal for low-latency / low-fps use cases.
+
+### Implementation
+- **WGSL shader** (`temporal_53.wgsl`): Two-pass lifting (predict then update), per-element, @workgroup_size(256)
+  - Forward: d0 = f1 - 0.5*(f0+f2), d1 = f3 - f2, s0 = f0 + 0.5*d0, s1 = f2 + 0.25*(d0+d1)
+  - Inverse: undo update then undo predict (reverse order)
+  - Key: `pass` is a WGSL reserved keyword → renamed to `pass_idx`
+- **Rust host** (`encoder/temporal_53.rs`): `Temporal53Gpu` with `forward_4()` / `inverse_4()` helpers that manage the two-pass dispatch with `queue.submit()` barrier between passes
+- **Encoder/decoder integration**: Full GPU path, separate buffers per plane, GNV2 container support
+- **Adaptive selection**: `--temporal-wavelet auto` picks Haar (fps≤25 or q≥90) vs 5/3 (fps>25 and q<90)
+- **WASM player**: Updated `decode_temporal_group_rgba_wasm`, `decode_temporal_group_to_textures`, and `decode_temporal_gop_into` with mode dispatch
+
+### Design: 5/3 vs Haar buffer layout
+- Haar: multilevel dyadic (2^N frames → N levels), snapshot buffers prevent aliasing
+- 5/3: fixed 4-frame groups, 2 lowpass + 2 highpass output, no snapshot buffers needed
+- TemporalGroup format: low_frame=s0, high_frames=[[s1, d0, d1]] (s1 at base qstep, d0/d1 at highpass qstep)
+
+### Results (bbb_1080p, static content, same frame ×8)
+
+| Mode | q | BPP | PSNR | FPS |
+|------|---|-----|------|-----|
+| 5/3 | 75 | 2.13 | 42.60 dB | 19.3 |
+| 5/3 | 50 | 1.23 | 37.40 dB | — |
+| 5/3 | 25 | 0.76 | 33.02 dB | — |
+| 5/3 | 92 | 4.53 | 51.69 dB | — |
+
+Note: On static content, Haar with large GOPs (8 frames) compresses better (0.54 bpp) because all highpass is near-zero. 5/3 with 4-frame groups produces 2 lowpass + 2 highpass, more overhead. The 5/3 advantage appears with real video (temporal variation within 4-frame groups).
+
+### GNV2 roundtrip verified
+- Encode → GNV2 serialize → deserialize → decode: bit-exact
+- Decode at 50.5 fps (1080p, q=75)
+
+### Files Changed
+- `src/shaders/temporal_53.wgsl` (new)
+- `src/encoder/temporal_53.rs` (new)
+- `src/encoder/{mod,pipeline,sequence}.rs`
+- `src/decoder/pipeline.rs`
+- `src/lib.rs` (WASM player mode dispatch)
+- `src/main.rs` (auto mode selection)
+
+---
+
 ## 2026-03-03: GPU Temporal Haar Wavelet — Phase 1 Complete
 
 ### Hypothesis

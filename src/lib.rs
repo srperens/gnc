@@ -1379,6 +1379,7 @@ pub mod wasm {
             if let Some(ref th) = self.temporal_header {
                 let gop_size = th.gop_size as usize;
                 let num_groups = th.num_groups();
+                let temporal_transform = th.temporal_transform;
                 let gop_idx = self.current_frame / gop_size;
 
                 if gop_idx < num_groups {
@@ -1396,6 +1397,7 @@ pub mod wasm {
                             self.last_seek_ms = 0.0;
                         } else {
                             let t_seek = Self::now_ms();
+                            let th = self.temporal_header.as_ref().unwrap();
                             let group = crate::format::deserialize_temporal_group(
                                 &self.data, th, gop_idx,
                             );
@@ -1406,7 +1408,7 @@ pub mod wasm {
                             self.ensure_tw_bufs(padded_w, padded_h, gop_size);
                             let set = &self.tw_buf_sets[self.tw_active];
                             self.decoder.decode_temporal_gop_into(
-                                &self.ctx, &group, gop_size,
+                                &self.ctx, &group, temporal_transform, gop_size,
                                 &set.frame_bufs, &set.snapshot_bufs,
                             );
                             self.tw_gop_base = gop_base;
@@ -1619,6 +1621,7 @@ pub mod wasm {
                 let target = (target_frame as usize).min(self.frame_count as usize - 1);
                 let gop_size = th.gop_size as usize;
                 let num_groups = th.num_groups();
+                let temporal_transform = th.temporal_transform;
                 let gop_idx = target / gop_size;
 
                 self.buffered_textures.clear();
@@ -1628,6 +1631,7 @@ pub mod wasm {
                     let gop_base = gop_idx * gop_size;
                     // Phase 1: decode GOP wavelet bufs
                     let t_seek = Self::now_ms();
+                    let th = self.temporal_header.as_ref().unwrap();
                     let group = crate::format::deserialize_temporal_group(
                         &self.data, th, gop_idx,
                     );
@@ -1638,7 +1642,7 @@ pub mod wasm {
                     self.ensure_tw_bufs(padded_w, padded_h, gop_size);
                     let set = &self.tw_buf_sets[self.tw_active];
                     self.decoder.decode_temporal_gop_into(
-                        &self.ctx, &group, gop_size,
+                        &self.ctx, &group, temporal_transform, gop_size,
                         &set.frame_bufs, &set.snapshot_bufs,
                     );
                     self.tw_gop_base = gop_base;
@@ -1787,7 +1791,7 @@ pub mod wasm {
             let prefetch_set = 1 - self.tw_active;
             let set = &self.tw_buf_sets[prefetch_set];
             self.decoder.decode_temporal_gop_into(
-                &self.ctx, &group, gop_size,
+                &self.ctx, &group, th.temporal_transform, gop_size,
                 &set.frame_bufs, &set.snapshot_bufs,
             );
             self.tw_prefetch_base = gop_idx * gop_size;

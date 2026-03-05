@@ -184,8 +184,8 @@ enum Command {
         #[arg(long)]
         diagnostics: bool,
 
-        /// Temporal wavelet mode: none, haar, 53 (LeGall 5/3)
-        #[arg(long, default_value = "none")]
+        /// Temporal wavelet mode: auto (default, selects by fps/quality), haar, 53, none (I+P+B motion vectors)
+        #[arg(long, default_value = "auto")]
         temporal_wavelet: String,
 
         /// Temporal highpass qstep multiplier (e.g. 2.0 = double qstep for highpass)
@@ -196,7 +196,7 @@ enum Command {
         #[arg(long)]
         ab: bool,
 
-        /// Output file path for GNV2 container (temporal wavelet mode only)
+        /// Output file path for GNV2 container
         #[arg(short, long)]
         output: Option<String>,
     },
@@ -252,9 +252,14 @@ enum Command {
         /// Enable per-frame encode diagnostics (also via GNC_DIAGNOSTICS=1)
         #[arg(long)]
         diagnostics: bool,
+
+        /// Temporal wavelet mode: only "none" supported here (I+P+B motion vectors).
+        /// For temporal wavelet encoding, use benchmark-sequence instead.
+        #[arg(long, default_value = "none")]
+        temporal_wavelet: String,
     },
 
-    /// Decode a .gnv container back to image frames
+    /// Decode a .gnv or .gnv2 container back to image frames
     DecodeSequence {
         /// Input .gnv file
         #[arg(short, long)]
@@ -377,14 +382,17 @@ fn parse_temporal_transform(s: &str) -> TemporalTransform {
 /// - fps <= 25 or q >= 90: Haar (low latency, fewer frames needed)
 /// - fps > 25 and q < 90: LeGall 5/3 (better compression, 4-frame groups)
 fn select_temporal_mode(explicit: &str, fps: f64, quality: u32) -> TemporalTransform {
-    if explicit.to_lowercase() != "auto" {
-        return parse_temporal_transform(explicit);
+    let lower = explicit.to_lowercase();
+    if lower != "auto" {
+        let mode = parse_temporal_transform(explicit);
+        eprintln!("Temporal mode: {:?} (explicit)", mode);
+        return mode;
     }
     if fps <= 25.0 || quality >= 90 {
-        eprintln!("Auto temporal: Haar (fps={fps}, q={quality})");
+        eprintln!("Temporal mode: Haar (auto, fps={fps}, q={quality})");
         TemporalTransform::Haar
     } else {
-        eprintln!("Auto temporal: LeGall 5/3 (fps={fps}, q={quality})");
+        eprintln!("Temporal mode: LeGall 5/3 (auto, fps={fps}, q={quality})");
         TemporalTransform::LeGall53
     }
 }
@@ -763,24 +771,31 @@ fn main() {
             let temporal_mode = select_temporal_mode(&temporal_wavelet, fps, quality.unwrap_or(75));
             let run_temporal = temporal_mode != TemporalTransform::None;
             let run_baseline = !run_temporal || ab;
-            if run_temporal && temporal_mode == TemporalTransform::Haar {
-                if !gnc::temporal::is_power_of_two(keyframe_interval as usize) {
-                    eprintln!(
-                        "Temporal Haar requires keyframe_interval to be power of two (got {}).",
-                        keyframe_interval
-                    );
-                    std::process::exit(1);
-                }
+            if run_temporal
+                && temporal_mode == TemporalTransform::Haar
+                && !gnc::temporal::is_power_of_two(keyframe_interval as usize)
+            {
+                eprintln!(
+                    "Temporal Haar requires keyframe_interval to be power of two (got {}).",
+                    keyframe_interval
+                );
+                std::process::exit(1);
             }
+            // 5/3 fixed GOP size = 4
+            let temporal_gop_size = if temporal_mode == TemporalTransform::LeGall53 {
+                4usize
+            } else {
+                keyframe_interval as usize
+            };
 
             // Streaming path: when using temporal wavelet without A/B comparison,
             // load frames per-GOP to avoid holding all frames in memory.
             // For 1800 frames at 1080p, loading all = ~44 GB; per-GOP (8) = ~192 MB.
-            if run_temporal && !run_baseline && temporal_mode == TemporalTransform::Haar {
+            if run_temporal && !run_baseline {
                 // Peek at first frame for dimensions
                 let first_path = input.replace("%04d", &format!("{:04}", 0));
                 let (first_rgb, w, h) = load_image_rgb_f32(&first_path);
-                let gop_size = keyframe_interval as usize;
+                let gop_size = temporal_gop_size;
 
                 let mut config_tw = if let Some(q) = quality {
                     gnc::quality_preset(q)
@@ -842,12 +857,13 @@ fn main() {
                     }
                     let gop_refs: Vec<&[f32]> = gop_frames.iter().map(|f| f.as_slice()).collect();
 
-                    let group = encoder.encode_temporal_wavelet_gop_haar(
+                    let group = encoder.encode_temporal_wavelet_gop(
                         &ctx,
                         &gop_refs,
                         w,
                         h,
                         &config_tw,
+                        temporal_mode,
                     );
 
                     let low_bytes = group.low_frame.byte_size();
@@ -858,10 +874,11 @@ fn main() {
                     let group_bytes = low_bytes + high_bytes;
                     total_bytes += group_bytes;
 
+                    let elapsed = start.elapsed();
+                    let frames_done = (gop_idx + 1) * gop_size;
+                    let fps_enc = frames_done as f64 / elapsed.as_secs_f64();
+
                     if diagnostics || gop_idx % 10 == 0 || gop_idx == num_gops - 1 {
-                        let elapsed = start.elapsed();
-                        let frames_done = (gop_idx + 1) * gop_size;
-                        let fps_enc = frames_done as f64 / elapsed.as_secs_f64();
                         eprintln!(
                             "  GOP {:3}/{}: {:6} bytes (low {:5}, high {:5}), {}/{} frames, {:.1} fps",
                             gop_idx + 1,
@@ -872,6 +889,24 @@ fn main() {
                             frames_done,
                             num_frames,
                             fps_enc,
+                        );
+                    }
+
+                    // Full per-GOP diagnostics (decomposition, coefficients, warnings)
+                    if gnc::encoder::diagnostics::enabled() {
+                        let q = quality.unwrap_or(75);
+                        let mul = tw_highpass_mul.unwrap_or(config_tw.temporal_highpass_qstep_mul);
+                        gnc::encoder::diagnostics::print_temporal_gop_diagnostics(
+                            gop_idx,
+                            gop_size,
+                            temporal_mode,
+                            q,
+                            mul,
+                            &group,
+                            &[], // no per-frame PSNR in streaming mode
+                            None,
+                            w,
+                            h,
                         );
                     }
 
@@ -1675,7 +1710,21 @@ fn main() {
             rate_mode,
             rans,
             diagnostics,
+            temporal_wavelet,
         } => {
+            // encode-sequence is the I+P (motion vector) production encoder → GNV1.
+            // For temporal wavelet encoding → GNV2, use benchmark-sequence instead
+            // (it has streaming per-GOP encoding that doesn't accumulate all groups in memory).
+            if temporal_wavelet.to_lowercase() != "none" {
+                eprintln!(
+                    "encode-sequence only supports I+P (motion vector) mode (--temporal-wavelet none)."
+                );
+                eprintln!(
+                    "For temporal wavelet encoding, use: benchmark-sequence -o output.gnv2"
+                );
+                std::process::exit(1);
+            }
+
             if diagnostics {
                 gnc::encoder::diagnostics::enable();
             }
@@ -1701,8 +1750,10 @@ fn main() {
                 n
             };
 
+            let actual_fps = fps_num as f64 / fps_den as f64;
+
             println!(
-                "Encoding sequence: {} frames from '{}', ki={}, q={}, {}fps",
+                "Encoding sequence: {} frames from '{}', ki={}, q={}, {}fps, mode=I+P (motion vectors)",
                 frame_count,
                 input,
                 keyframe_interval,
@@ -1710,8 +1761,8 @@ fn main() {
                 if fps_den == 1 {
                     format!("{}", fps_num)
                 } else {
-                    format!("{:.3}", fps_num as f64 / fps_den as f64)
-                }
+                    format!("{:.3}", actual_fps)
+                },
             );
 
             // Probe first frame for dimensions
@@ -1736,7 +1787,6 @@ fn main() {
                 config.rate_mode = parse_rate_mode(&rate_mode);
             }
 
-            let actual_fps = fps_num as f64 / fps_den as f64;
             let input_pattern = input.clone();
             let start = std::time::Instant::now();
             let compressed = encoder.encode_sequence_streaming(
@@ -1763,7 +1813,6 @@ fn main() {
             );
             let encode_time = start.elapsed();
 
-            // Print per-frame summary
             for (i, cf) in compressed.iter().enumerate() {
                 let ft = if cf.frame_type == gnc::FrameType::Intra {
                     "I"
@@ -1779,16 +1828,15 @@ fn main() {
                 );
             }
 
-            // Serialize to GNV1 container
             let gnv_data = serialize_sequence(&compressed, (fps_num, fps_den));
-            std::fs::write(&output, &gnv_data).expect("Failed to write output file");
+            std::fs::write(&output, &gnv_data).expect("Failed to write GNV1 output");
 
-            let avg_bpp = compressed.iter().map(|f| f.bpp()).sum::<f64>() / compressed.len() as f64;
+            let avg_bpp =
+                compressed.iter().map(|f| f.bpp()).sum::<f64>() / compressed.len() as f64;
             let i_count = compressed
                 .iter()
                 .filter(|f| f.frame_type == gnc::FrameType::Intra)
                 .count();
-            let fps = compressed.len() as f64 / encode_time.as_secs_f64();
 
             println!(
                 "\nEncoded {} frames ({}I + {}P) in {:.1}ms ({:.1} fps)",
@@ -1796,14 +1844,14 @@ fn main() {
                 i_count,
                 compressed.len() - i_count,
                 encode_time.as_secs_f64() * 1000.0,
-                fps,
+                compressed.len() as f64 / encode_time.as_secs_f64(),
             );
             println!(
-                "Container: {} bytes, avg {:.2} bpp",
+                "Container: {} bytes, avg {:.2} bpp → {}",
                 gnv_data.len(),
-                avg_bpp
+                avg_bpp,
+                output,
             );
-            println!("Written to {}", output);
         }
 
         Command::DecodeSequence {

@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 #
-# Generate demo .gnv files (I+P+B) for the web player.
+# Generate demo .gnv files (I+P+B motion vectors) for the web player.
+# Uses encode-sequence which is the I+P motion vector encoder (GNV1 format).
+# For temporal wavelet demos (GNV2), see generate_demos_tw.sh.
 # Re-run this whenever the bitstream format changes.
 #
 # Requires: cargo build --release (gnc binary)

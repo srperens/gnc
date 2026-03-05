@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 #
 # Generate demo .gnv2 files (temporal wavelet) for the web player.
-# Re-run this whenever the bitstream format changes.
-#
-# Mirrors generate_demos.sh with matching content, quality, length, and fps
-# so GNV1 (I+P+B) and GNV2 (temporal wavelet) can be directly compared.
+# Uses benchmark-sequence with default temporal wavelet (auto-selects Haar or 5/3
+# based on fps and quality: fps<=25 or q>=90 → Haar, otherwise → 5/3).
+# Mirrors generate_demos.sh with matching content for direct GNV1 vs GNV2 comparison.
 #
 # Requires: cargo build --release (gnc binary)
 # Source material: test_material/frames/sequences/ (run fetch_test_frames.sh first)
@@ -63,81 +62,78 @@ echo "GNC demo file generator (GNV2 — temporal wavelet)"
 echo "==================================================="
 echo "output: $OUT"
 echo ""
-echo "Removing old .gnv2 and tw_*.diag files..."
-rm -f "$OUT"/*.gnv2 "$OUT"/tw_*.diag
+echo "Removing old tw_*.gnv2 and tw_*.diag files (excluding tw_bbb_2min*)..."
+for f in "$OUT"/tw_*.gnv2 "$OUT"/tw_*.diag; do
+    [ -f "$f" ] || continue
+    case "$(basename "$f")" in
+        tw_bbb_2min*) ;; # skip — managed by generate_demos_tw_bbb2min.sh
+        *) rm -f "$f" ;;
+    esac
+done
 
 # --- Quick test files (matching generate_demos.sh) ---
 
 encode_tw "tw_test_quick" \
     "$SEQ/bbb/frame_%04d.png" \
-    -q 75 -n 8 -k 8 --temporal-wavelet haar \
+    -q 75 -n 8 -k 8 \
     --fps 30
 
 encode_tw "tw_test_animation" \
     "$SEQ/bbb_extended/frame_%04d.png" \
-    -q 75 -n 24 -k 8 --temporal-wavelet haar \
+    -q 75 -n 24 -k 8 \
     --fps 30
 
 encode_tw "tw_test_nature" \
     "$SEQ/park_joy/frame_%04d.png" \
-    -q 75 -n 32 -k 8 --temporal-wavelet haar \
+    -q 75 -n 32 -k 8 \
     --fps 50
 
 encode_tw "tw_test_crowd" \
     "$SEQ/crowd_run/frame_%04d.png" \
-    -q 75 -n 32 -k 8 --temporal-wavelet haar \
+    -q 75 -n 32 -k 8 \
     --fps 50
 
 # --- Quality comparison (same content, different q) ---
 
 encode_tw "tw_ducks_q25" \
     "$SEQ/ducks_take_off/frame_%04d.png" \
-    -q 25 -n 300 -k 8 --temporal-wavelet haar \
+    -q 25 -n 300 -k 8 \
     --fps 50
 
 encode_tw "tw_ducks_q50" \
     "$SEQ/ducks_take_off/frame_%04d.png" \
-    -q 50 -n 300 -k 8 --temporal-wavelet haar \
+    -q 50 -n 300 -k 8 \
     --fps 50
 
 encode_tw "tw_ducks_q75" \
     "$SEQ/ducks_take_off/frame_%04d.png" \
-    -q 75 -n 300 -k 8 --temporal-wavelet haar \
+    -q 75 -n 300 -k 8 \
     --fps 50
 
 # --- Broadcast test sequences ---
 
 encode_tw "tw_rush_hour" \
     "$SEQ/rush_hour/frame_%04d.png" \
-    -q 75 -n 200 -k 8 --temporal-wavelet haar \
+    -q 75 -n 200 -k 8 \
     --fps 25
 
 encode_tw "tw_old_town_cross" \
     "$SEQ/old_town_cross/frame_%04d.png" \
-    -q 75 -n 200 -k 8 --temporal-wavelet haar \
+    -q 75 -n 200 -k 8 \
     --fps 50
 
 encode_tw "tw_stockholm" \
     "$SEQ/stockholm/frame_%04d.png" \
-    -q 75 -n 200 -k 8 --temporal-wavelet haar \
+    -q 75 -n 200 -k 8 \
     --fps 60
 
 encode_tw "tw_pedestrian_area" \
     "$SEQ/pedestrian_area/frame_%04d.png" \
-    -q 75 -n 200 -k 8 --temporal-wavelet haar \
+    -q 75 -n 200 -k 8 \
     --fps 25
 
 # --- Long-form demos ---
-
-encode_tw "tw_bbb_2min_q5" \
-    "$SEQ/bbb_2min/frame_%04d.png" \
-    -q 5 -n 1800 -k 8 --temporal-wavelet haar \
-    --fps 30
-
-encode_tw "tw_bbb_2min" \
-    "$SEQ/bbb_2min/frame_%04d.png" \
-    -q 75 -n 1800 -k 8 --temporal-wavelet haar \
-    --fps 30
+# bbb_2min is in generate_demos_tw_bbb2min.sh (separate due to memory/time)
 
 echo ""
 echo "=== Summary ==="

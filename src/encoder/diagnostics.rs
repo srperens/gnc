@@ -942,8 +942,8 @@ pub fn print_temporal_gop_diagnostics(
 ) {
     let pixels = width as f64 * height as f64;
     let mode_str = match mode {
-        crate::TemporalTransform::Haar => "haar",
-        crate::TemporalTransform::LeGall53 => "5/3",
+        crate::TemporalTransform::Haar => "Haar",
+        crate::TemporalTransform::LeGall53 => "LeGall-5/3",
         crate::TemporalTransform::None => "none",
     };
     let num_levels = group.high_frames.len();
@@ -983,7 +983,7 @@ pub fn print_temporal_gop_diagnostics(
     // --- Header ---
     eprintln!();
     eprintln!(
-        "GOP {} [{} frames] temporal={} levels={} q={} mul={:.1}",
+        "GOP {} [{} frames] temporal_wavelet={} levels={} q={} mul={:.1}",
         gop_idx, gop_size, mode_str, num_levels, quality, highpass_mul
     );
     eprintln!(

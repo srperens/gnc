@@ -94,42 +94,6 @@ pub fn haar_multilevel_inverse(
     current
 }
 
-/// Forward LeGall 5/3 wavelet across 4 frames.
-/// Produces two low frames (s0, s1) and two high frames (d0, d1).
-pub(crate) fn legall53_forward_4(
-    f0: &[f32],
-    f1: &[f32],
-    f2: &[f32],
-    f3: &[f32],
-) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
-    let n = f0.len();
-    assert_eq!(n, f1.len(), "5/3 forward: frame size mismatch");
-    assert_eq!(n, f2.len(), "5/3 forward: frame size mismatch");
-    assert_eq!(n, f3.len(), "5/3 forward: frame size mismatch");
-    let mut s0 = vec![0.0f32; n];
-    let mut s1 = vec![0.0f32; n];
-    let mut d0 = vec![0.0f32; n];
-    let mut d1 = vec![0.0f32; n];
-    for i in 0..n {
-        // Predict odd samples
-        let x0 = f0[i];
-        let x1 = f1[i];
-        let x2 = f2[i];
-        let x3 = f3[i];
-        let d0i = x1 - 0.5 * (x0 + x2);
-        // Symmetric extension at end: x4 = x2
-        let d1i = x3 - x2;
-        // Update even samples (s0 uses symmetric d_{-1} = d0)
-        let s0i = x0 + 0.5 * d0i;
-        let s1i = x2 + 0.25 * (d0i + d1i);
-        s0[i] = s0i;
-        s1[i] = s1i;
-        d0[i] = d0i;
-        d1[i] = d1i;
-    }
-    (s0, s1, d0, d1)
-}
-
 /// Inverse LeGall 5/3 wavelet across 4 frames.
 pub(crate) fn legall53_inverse_4(
     s0: &[f32],

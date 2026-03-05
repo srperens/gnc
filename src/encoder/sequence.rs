@@ -1117,6 +1117,34 @@ impl EncoderPipeline {
         }
     }
 
+    /// Encode a single GOP using temporal wavelet (Haar or LeGall 5/3).
+    /// Streaming-friendly: pass exactly `gop_size` frames, get one `TemporalGroup`.
+    pub fn encode_temporal_wavelet_gop(
+        &mut self,
+        ctx: &GpuContext,
+        gop_frames: &[&[f32]],
+        width: u32,
+        height: u32,
+        config: &CodecConfig,
+        mode: TemporalTransform,
+    ) -> TemporalGroup {
+        match mode {
+            TemporalTransform::Haar => {
+                self.encode_temporal_wavelet_gop_haar(ctx, gop_frames, width, height, config)
+            }
+            TemporalTransform::LeGall53 => {
+                assert_eq!(gop_frames.len(), 4, "LeGall53 requires exactly 4 frames per GOP");
+                // Use encode_sequence_temporal_wavelet with a 4-frame slice
+                let seq = self.encode_sequence_temporal_wavelet(
+                    ctx, gop_frames, width, height, config, mode, 4,
+                );
+                assert_eq!(seq.groups.len(), 1);
+                seq.groups.into_iter().next().unwrap()
+            }
+            TemporalTransform::None => unreachable!("None mode in temporal wavelet GOP encode"),
+        }
+    }
+
     /// I-frame local decode using quantized data already on GPU.
     ///
     /// After `encode()`, quantized planes are persisted in:
@@ -2983,7 +3011,7 @@ impl EncoderPipeline {
         ctx.queue.submit(Some(cmd.finish()));
 
         // Readback compressed Rice tiles (small — KB not MB)
-        let mut rice_tiles = self.gpu_rice_encoder.finish_3planes_readback(
+        let rice_tiles = self.gpu_rice_encoder.finish_3planes_readback(
             ctx,
             info,
             config.wavelet_levels,

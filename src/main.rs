@@ -1034,16 +1034,14 @@ fn main() {
 
             let frame_refs: Vec<&[f32]> = frames_data.iter().map(|f| f.as_slice()).collect();
 
+            #[allow(unused_assignments)]
             let mut summary_ip: Option<sequence_metrics::SequenceSummary> = None;
-            let mut summary_i: Option<sequence_metrics::SequenceSummary> = None;
             let mut total_bytes_ip: usize = 0;
-            let mut total_bytes_i: usize = 0;
             let mut avg_bpp_ip: f64 = 0.0;
-            let mut avg_bpp_i: f64 = 0.0;
             let mut frame_metrics_ip: Vec<FrameMetrics> = Vec::new();
-            let mut frame_metrics_i: Vec<FrameMetrics> = Vec::new();
 
             if run_baseline {
+            let mut frame_metrics_i: Vec<FrameMetrics> = Vec::new();
             // --- I+P encoding ---
             let mut config_ip = if let Some(q) = quality {
                 gnc::quality_preset(q)
@@ -1171,7 +1169,7 @@ fn main() {
             let elapsed_i = start.elapsed();
 
             println!("=== All I-frames (baseline) ===");
-            total_bytes_i = 0;
+            let mut total_bytes_i: usize = 0;
             frame_metrics_i.clear();
             for (i, cf) in compressed_i.iter().enumerate() {
                 let decoded = decoder.decode(&ctx, cf);
@@ -1196,7 +1194,7 @@ fn main() {
                 });
             }
 
-            avg_bpp_i =
+            let avg_bpp_i =
                 compressed_i.iter().map(|f| f.bpp()).sum::<f64>() / compressed_i.len() as f64;
 
             println!(
@@ -1208,9 +1206,8 @@ fn main() {
             );
 
             // Compute and display I-only sequence summary
-            let summary_i_local = sequence_metrics::compute_sequence_metrics(&frame_metrics_i);
-            summary_i = Some(summary_i_local.clone());
-            println!("\n{}", summary_i_local);
+            let summary_i = sequence_metrics::compute_sequence_metrics(&frame_metrics_i);
+            println!("\n{}", summary_i);
 
             // --- Comparison ---
             let saving_pct = (1.0 - total_bytes_ip as f64 / total_bytes_i as f64) * 100.0;
@@ -1224,8 +1221,8 @@ fn main() {
                 "\n=== Temporal Consistency ===\n  I+P:    max PSNR drop {:.2} dB, consistency {:.2} dB\n  I-only: max PSNR drop {:.2} dB, consistency {:.2} dB",
                 summary_ip.as_ref().unwrap().max_psnr_drop,
                 summary_ip.as_ref().unwrap().temporal_consistency,
-                summary_i.as_ref().unwrap().max_psnr_drop,
-                summary_i.as_ref().unwrap().temporal_consistency,
+                summary_i.max_psnr_drop,
+                summary_i.temporal_consistency,
             );
 
             // Write CSV if requested (I+P metrics — the primary encoding mode)
@@ -1331,10 +1328,10 @@ fn main() {
                         tile_size: config_tw.tile_size,
                     };
                     let mut originals: Vec<[Vec<f32>; 3]> = Vec::new();
-                    for i in 0..gop {
+                    for fd in &frames_data[..gop] {
                         originals.push(encoder.debug_wavelet_prequant(
                             &ctx,
-                            &frames_data[i],
+                            fd,
                             &info,
                             &config_tw,
                         ));
@@ -1432,8 +1429,8 @@ fn main() {
                                 max_abs_q[2]
                             );
 
-                            if let Some(first_lvl) = group.high_frames.get(0) {
-                                if let Some(first_high) = first_lvl.get(0) {
+                            if let Some(first_lvl) = group.high_frames.first() {
+                                if let Some(first_high) = first_lvl.first() {
                                     let high_y = &highs_y[0][0];
                                     let high_co = &highs_co[0][0];
                                     let high_cg = &highs_cg[0][0];
@@ -1629,7 +1626,7 @@ fn main() {
 
                 // --- Temporal stats: mean_abs + percent_zero after quantize per level ---
                 if !low_frame_ptrs.is_empty() && !high_level_ptrs.is_empty() {
-                    let mut accumulate_stats = |frames: &[&CompressedFrame]| -> (f64, f64) {
+                    let accumulate_stats = |frames: &[&CompressedFrame]| -> (f64, f64) {
                         let mut sum_abs: i64 = 0;
                         let mut zeros: i64 = 0;
                         let mut total: i64 = 0;
@@ -2427,7 +2424,7 @@ fn main() {
 
             // CSV header
             let mut csv_rows: Vec<String> = vec![
-                "sequence,frames,quality,temporal_mode,bpp,psnr_avg,psnr_min,fps_enc,fps_dec,total_bytes".to_string(),
+                "sequence,frames,quality,temporal_mode,bpp,psnr_avg,psnr_min,psnr_lowpass_avg,psnr_lowpass_min,fps_enc,fps_dec,total_bytes".to_string(),
             ];
 
             println!("=== GNC Benchmark Suite ===");
@@ -2475,6 +2472,7 @@ fn main() {
 
                 let mut total_bytes = 0usize;
                 let mut psnr_vals: Vec<f64> = Vec::new();
+                let mut psnr_lowpass_vals: Vec<f64> = Vec::new();
                 let mut enc_time = std::time::Duration::ZERO;
                 let mut dec_time = std::time::Duration::ZERO;
 
@@ -2538,7 +2536,7 @@ fn main() {
                         tail_iframes.push(cf);
                     }
 
-                    // Decode pass + PSNR
+                    // Decode pass + PSNR (full and lowpass-only)
                     for (gop_idx, group) in groups.iter().enumerate() {
                         let t0 = std::time::Instant::now();
                         let decoded = decoder.decode_temporal_sequence(
@@ -2552,12 +2550,18 @@ fn main() {
                             },
                         );
                         dec_time += t0.elapsed();
+
+                        // Lowpass-only: decode just the lowpass frame as I-frame
+                        let lowpass_rgb = decoder.decode(&ctx, &group.low_frame);
+
                         let base = gop_idx * gop_size;
                         for (j, dec_frame) in decoded.iter().enumerate() {
                             let path = format!("{}/frame_{:04}.png", seq_dir, base + j);
                             let (orig_rgb, _, _) = load_image_rgb_f32(&path);
                             let psnr = quality::psnr(&orig_rgb, dec_frame, 255.0);
                             psnr_vals.push(psnr);
+                            let psnr_lp = quality::psnr(&orig_rgb, &lowpass_rgb, 255.0);
+                            psnr_lowpass_vals.push(psnr_lp);
                         }
                     }
 
@@ -2579,26 +2583,35 @@ fn main() {
                     (total_bytes as f64 * 8.0) / (w as f64 * h as f64) / num_frames as f64;
 
                 // Cap infinite PSNR (identical frames) at 99 dB for averaging
-                let psnr_avg = if psnr_vals.is_empty() {
-                    0.0
-                } else {
-                    let capped: Vec<f64> = psnr_vals.iter().map(|&v| v.min(99.0)).collect();
-                    capped.iter().sum::<f64>() / capped.len() as f64
+                let cap = |vals: &[f64]| -> (f64, f64) {
+                    if vals.is_empty() {
+                        return (0.0, 0.0);
+                    }
+                    let capped: Vec<f64> = vals.iter().map(|&v| v.min(99.0)).collect();
+                    let avg = capped.iter().sum::<f64>() / capped.len() as f64;
+                    let min = vals.iter().cloned().fold(f64::INFINITY, f64::min);
+                    (avg, if min.is_infinite() { 0.0 } else { min })
                 };
-                let psnr_min = psnr_vals.iter().cloned().fold(f64::INFINITY, f64::min);
+                let (psnr_avg, psnr_min) = cap(&psnr_vals);
+                let (psnr_lp_avg, psnr_lp_min) = cap(&psnr_lowpass_vals);
 
-                println!(
-                    "  {:20} {:4} frames  {:.2} bpp  {:.2} dB avg  {:.2} dB min  {:.1} fps enc  {:.1} fps dec",
-                    seq_name, num_frames, avg_bpp, psnr_avg,
-                    if psnr_min.is_infinite() { 0.0 } else { psnr_min },
-                    fps_enc, fps_dec,
-                );
+                if psnr_lowpass_vals.is_empty() {
+                    println!(
+                        "  {:20} {:4} frames  {:.2} bpp  {:.2}/{:.2} dB  {:.1}/{:.1} fps",
+                        seq_name, num_frames, avg_bpp, psnr_avg, psnr_min, fps_enc, fps_dec,
+                    );
+                } else {
+                    println!(
+                        "  {:20} {:4} frames  {:.2} bpp  full {:.2}/{:.2} dB  lowpass {:.2}/{:.2} dB  {:.1}/{:.1} fps",
+                        seq_name, num_frames, avg_bpp, psnr_avg, psnr_min,
+                        psnr_lp_avg, psnr_lp_min, fps_enc, fps_dec,
+                    );
+                }
 
                 csv_rows.push(format!(
-                    "{},{},{},{:?},{:.4},{:.2},{:.2},{:.1},{:.1},{}",
-                    seq_name, num_frames, quality, temporal_mode, avg_bpp, psnr_avg,
-                    if psnr_min.is_infinite() { 0.0 } else { psnr_min },
-                    fps_enc, fps_dec, total_bytes,
+                    "{},{},{},{:?},{:.4},{:.2},{:.2},{:.2},{:.2},{:.1},{:.1},{}",
+                    seq_name, num_frames, quality, temporal_mode, avg_bpp, psnr_avg, psnr_min,
+                    psnr_lp_avg, psnr_lp_min, fps_enc, fps_dec, total_bytes,
                 ));
             }
 

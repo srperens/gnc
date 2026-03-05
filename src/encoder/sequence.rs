@@ -553,61 +553,85 @@ impl EncoderPipeline {
                         })
                         .collect();
 
-                    // 1) Spatial wavelet per frame, keep results on GPU
-                    for j in 0..group_size {
+                    // 1) Upload all GOP frames to per-frame GPU buffers (avoids write_buffer race)
+                    let raw_input_size = std::mem::size_of_val(frames[i]) as u64;
+                    let per_frame_input: Vec<wgpu::Buffer> = (0..group_size)
+                        .map(|j| {
+                            let buf = ctx
+                                .device
+                                .create_buffer(&wgpu::BufferDescriptor {
+                                    label: Some(&format!("tw_raw_input_{}", j)),
+                                    size: raw_input_size,
+                                    usage: wgpu::BufferUsages::COPY_SRC
+                                        | wgpu::BufferUsages::COPY_DST,
+                                    mapped_at_creation: false,
+                                });
+                            ctx.queue
+                                .write_buffer(&buf, 0, bytemuck::cast_slice(frames[i + j]));
+                            buf
+                        })
+                        .collect();
+
+                    // Spatial wavelet per frame — single command encoder to prevent
+                    // intermediate buffer races (separate submits can overlap on GPU)
+                    {
                         let bufs = self.cached.as_ref().unwrap();
-                        ctx.queue.write_buffer(
-                            &bufs.raw_input_buf,
-                            0,
-                            bytemuck::cast_slice(frames[i + j]),
-                        );
                         let mut cmd = ctx
                             .device
                             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                                label: Some("tw_spatial"),
+                                label: Some("tw_spatial_all"),
                             });
-                        self.dispatch_gpu_pad_cached(ctx, &mut cmd, padded_w, padded_h);
-                        let bufs = self.cached.as_ref().unwrap();
-                        self.color.dispatch(
-                            ctx,
-                            &mut cmd,
-                            &bufs.input_buf,
-                            &bufs.color_out,
-                            padded_w,
-                            padded_h,
-                            true,
-                            cfg.is_lossless(),
-                        );
-                        self.deinterleaver.dispatch(
-                            ctx,
-                            &mut cmd,
-                            &bufs.color_out,
-                            &bufs.plane_a,
-                            &bufs.co_plane,
-                            &bufs.cg_plane,
-                            padded_pixels as u32,
-                        );
-
-                        let planes: [&wgpu::Buffer; 3] =
-                            [&bufs.plane_a, &bufs.co_plane, &bufs.cg_plane];
-                        for (p, &cur_plane) in planes.iter().enumerate() {
-                            self.transform.forward(
+                        for j in 0..group_size {
+                            cmd.copy_buffer_to_buffer(
+                                &per_frame_input[j],
+                                0,
+                                &bufs.raw_input_buf,
+                                0,
+                                raw_input_size,
+                            );
+                            self.dispatch_gpu_pad_cached(ctx, &mut cmd, padded_w, padded_h);
+                            let bufs = self.cached.as_ref().unwrap();
+                            self.color.dispatch(
                                 ctx,
                                 &mut cmd,
-                                cur_plane,
-                                &bufs.plane_b,
-                                &bufs.plane_c,
-                                &info,
-                                cfg.wavelet_levels,
-                                cfg.wavelet_type,
+                                &bufs.input_buf,
+                                &bufs.color_out,
+                                padded_w,
+                                padded_h,
+                                true,
+                                cfg.is_lossless(),
                             );
-                            cmd.copy_buffer_to_buffer(
-                                &bufs.plane_c,
-                                0,
-                                &tw_frame_bufs[j][p],
-                                0,
-                                plane_size,
+                            self.deinterleaver.dispatch(
+                                ctx,
+                                &mut cmd,
+                                &bufs.color_out,
+                                &bufs.plane_a,
+                                &bufs.co_plane,
+                                &bufs.cg_plane,
+                                padded_pixels as u32,
                             );
+
+                            let planes: [&wgpu::Buffer; 3] =
+                                [&bufs.plane_a, &bufs.co_plane, &bufs.cg_plane];
+                            for (p, &cur_plane) in planes.iter().enumerate() {
+                                self.transform.forward(
+                                    ctx,
+                                    &mut cmd,
+                                    cur_plane,
+                                    &bufs.plane_b,
+                                    &bufs.plane_c,
+                                    &info,
+                                    cfg.wavelet_levels,
+                                    cfg.wavelet_type,
+                                );
+                                cmd.copy_buffer_to_buffer(
+                                    &bufs.plane_c,
+                                    0,
+                                    &tw_frame_bufs[j][p],
+                                    0,
+                                    plane_size,
+                                );
+                            }
                         }
                         ctx.queue.submit(Some(cmd.finish()));
                     }
@@ -696,6 +720,21 @@ impl EncoderPipeline {
                                 padded_h,
                                 cfg.tile_size,
                             );
+                            if std::env::var("GNC_TW_DIAG").is_ok() {
+                                let mut sorted = tile_weights.clone();
+                                sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                                let n = sorted.len();
+                                let pct = |p: usize| sorted[(p * n / 100).min(n - 1)];
+                                let below1 = sorted.iter().filter(|&&w| w < 1.0).count();
+                                let above2 = sorted.iter().filter(|&&w| w > 2.0).count();
+                                eprintln!(
+                                    "  TW_AQ L{} H{}: {} tiles  p10={:.3} p25={:.3} p50={:.3} p75={:.3} p90={:.3}  below_1.0={}/{}  above_2.0={}/{}  eff_qstep=[{:.2}..{:.2}]",
+                                    lvl, idx, n, pct(10), pct(25), pct(50), pct(75), pct(90),
+                                    below1, n, above2, n,
+                                    high_cfg.quantization_step * sorted[0],
+                                    high_cfg.quantization_step * sorted[n - 1],
+                                );
+                            }
                             let cf = self.encode_from_gpu_wavelet_planes_weighted(
                                 ctx,
                                 [
@@ -981,61 +1020,83 @@ impl EncoderPipeline {
             })
             .collect();
 
-        // 1) Spatial wavelet per frame, keep results on GPU
-        for j in 0..group_size {
+        // 1) Upload all frames to per-frame GPU buffers (avoids write_buffer race)
+        let raw_input_size = std::mem::size_of_val(gop_frames[0]) as u64;
+        let per_frame_input: Vec<wgpu::Buffer> = (0..group_size)
+            .map(|j| {
+                let buf = ctx
+                    .device
+                    .create_buffer(&wgpu::BufferDescriptor {
+                        label: Some(&format!("tw_raw_input_{}", j)),
+                        size: raw_input_size,
+                        usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    });
+                ctx.queue.write_buffer(&buf, 0, bytemuck::cast_slice(gop_frames[j]));
+                buf
+            })
+            .collect();
+
+        // Spatial wavelet per frame — single command encoder to prevent
+        // intermediate buffer races (separate submits can overlap on GPU)
+        {
             let bufs = self.cached.as_ref().unwrap();
-            ctx.queue.write_buffer(
-                &bufs.raw_input_buf,
-                0,
-                bytemuck::cast_slice(gop_frames[j]),
-            );
             let mut cmd = ctx
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("tw_spatial"),
+                    label: Some("tw_spatial_all"),
                 });
-            self.dispatch_gpu_pad_cached(ctx, &mut cmd, padded_w, padded_h);
-            let bufs = self.cached.as_ref().unwrap();
-            self.color.dispatch(
-                ctx,
-                &mut cmd,
-                &bufs.input_buf,
-                &bufs.color_out,
-                padded_w,
-                padded_h,
-                true,
-                cfg.is_lossless(),
-            );
-            self.deinterleaver.dispatch(
-                ctx,
-                &mut cmd,
-                &bufs.color_out,
-                &bufs.plane_a,
-                &bufs.co_plane,
-                &bufs.cg_plane,
-                padded_pixels as u32,
-            );
-
-            let planes: [&wgpu::Buffer; 3] =
-                [&bufs.plane_a, &bufs.co_plane, &bufs.cg_plane];
-            for (p, &cur_plane) in planes.iter().enumerate() {
-                self.transform.forward(
+            for j in 0..group_size {
+                cmd.copy_buffer_to_buffer(
+                    &per_frame_input[j],
+                    0,
+                    &bufs.raw_input_buf,
+                    0,
+                    raw_input_size,
+                );
+                self.dispatch_gpu_pad_cached(ctx, &mut cmd, padded_w, padded_h);
+                let bufs = self.cached.as_ref().unwrap();
+                self.color.dispatch(
                     ctx,
                     &mut cmd,
-                    cur_plane,
-                    &bufs.plane_b,
-                    &bufs.plane_c,
-                    &info,
-                    cfg.wavelet_levels,
-                    cfg.wavelet_type,
+                    &bufs.input_buf,
+                    &bufs.color_out,
+                    padded_w,
+                    padded_h,
+                    true,
+                    cfg.is_lossless(),
                 );
-                cmd.copy_buffer_to_buffer(
-                    &bufs.plane_c,
-                    0,
-                    &tw_frame_bufs[j][p],
-                    0,
-                    plane_size,
+                self.deinterleaver.dispatch(
+                    ctx,
+                    &mut cmd,
+                    &bufs.color_out,
+                    &bufs.plane_a,
+                    &bufs.co_plane,
+                    &bufs.cg_plane,
+                    padded_pixels as u32,
                 );
+
+                let planes: [&wgpu::Buffer; 3] =
+                    [&bufs.plane_a, &bufs.co_plane, &bufs.cg_plane];
+                for (p, &cur_plane) in planes.iter().enumerate() {
+                    self.transform.forward(
+                        ctx,
+                        &mut cmd,
+                        cur_plane,
+                        &bufs.plane_b,
+                        &bufs.plane_c,
+                        &info,
+                        cfg.wavelet_levels,
+                        cfg.wavelet_type,
+                    );
+                    cmd.copy_buffer_to_buffer(
+                        &bufs.plane_c,
+                        0,
+                        &tw_frame_bufs[j][p],
+                        0,
+                        plane_size,
+                    );
+                }
             }
             ctx.queue.submit(Some(cmd.finish()));
         }
@@ -1107,6 +1168,21 @@ impl EncoderPipeline {
                     padded_h,
                     cfg.tile_size,
                 );
+                if std::env::var("GNC_TW_DIAG").is_ok() {
+                    let mut sorted = tile_weights.clone();
+                    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    let n = sorted.len();
+                    let pct = |p: usize| sorted[(p * n / 100).min(n - 1)];
+                    let below1 = sorted.iter().filter(|&&w| w < 1.0).count();
+                    let above2 = sorted.iter().filter(|&&w| w > 2.0).count();
+                    eprintln!(
+                        "  TW_AQ L{} H{}: {} tiles  p10={:.3} p25={:.3} p50={:.3} p75={:.3} p90={:.3}  below_1.0={}/{}  above_2.0={}/{}  eff_qstep=[{:.2}..{:.2}]",
+                        lvl, idx, n, pct(10), pct(25), pct(50), pct(75), pct(90),
+                        below1, n, above2, n,
+                        high_cfg.quantization_step * sorted[0],
+                        high_cfg.quantization_step * sorted[n - 1],
+                    );
+                }
                 let cf = self.encode_from_gpu_wavelet_planes_weighted(
                     ctx,
                     [
@@ -3324,6 +3400,18 @@ impl EncoderPipeline {
 
         drop(data);
         staging.unmap();
+
+        if std::env::var("GNC_TW_DIAG").is_ok() {
+            let mut sorted_ma: Vec<f64> = tile_mean_abs.clone();
+            sorted_ma.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let n = sorted_ma.len();
+            let pct = |p: usize| sorted_ma[(p * n / 100).min(n - 1)];
+            eprintln!(
+                "    tile_mean_abs: min={:.4} p25={:.4} p50={:.4} p75={:.4} max={:.4} spread={:.2}x",
+                sorted_ma[0], pct(25), pct(50), pct(75), sorted_ma[n - 1],
+                if sorted_ma[0] > 1e-8 { sorted_ma[n - 1] / sorted_ma[0] } else { 0.0 },
+            );
+        }
 
         // Compute frame-level mean
         let frame_mean: f64 = tile_mean_abs.iter().sum::<f64>() / num_tiles as f64;

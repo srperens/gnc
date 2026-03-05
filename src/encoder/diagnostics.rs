@@ -1013,7 +1013,7 @@ pub fn print_temporal_gop_diagnostics(
         low_bytes
     };
     let effective_low_count = if is_53 { 2 } else { 1 };
-    let effective_high_bytes = total_bytes - effective_low_bytes;
+    let _effective_high_bytes = total_bytes - effective_low_bytes;
 
     let low_pct = if total_bytes > 0 { effective_low_bytes as f64 / total_bytes as f64 * 100.0 } else { 0.0 };
     let low_bpp = effective_low_bytes as f64 * 8.0 / pixels / effective_low_count as f64;

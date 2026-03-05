@@ -1020,7 +1020,7 @@ impl DecoderPipeline {
         let weights_chroma = config.subband_weights.pack_weights_chroma();
 
         let mut results: [Vec<f32>; 3] = [Vec::new(), Vec::new(), Vec::new()];
-        for p in 0..3 {
+        for (p, result) in results.iter_mut().enumerate() {
             let mut cmd = ctx
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -1071,7 +1071,7 @@ impl DecoderPipeline {
             let coeffs: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
             drop(data);
             staging.unmap();
-            results[p] = coeffs;
+            *result = coeffs;
         }
 
         results
@@ -1311,9 +1311,9 @@ impl DecoderPipeline {
         let bufs = cached.as_ref().unwrap();
 
         // Upload coeffs to scratch_b and inverse wavelet per plane
-        for p in 0..3 {
+        for (p, coeff) in coeffs.iter().enumerate() {
             ctx.queue
-                .write_buffer(&bufs.scratch_b, 0, bytemuck::cast_slice(coeffs[p]));
+                .write_buffer(&bufs.scratch_b, 0, bytemuck::cast_slice(coeff));
             let mut cmd = ctx
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {

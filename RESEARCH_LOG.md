@@ -4,6 +4,58 @@
 
 ---
 
+## 2026-03-05: GPU Buffer Race Fix + Phase 4 Optimization
+
+### Bug: GPU spatial wavelet buffer race in temporal encoding
+
+**Root cause**: Each GOP frame's spatial wavelet pipeline was submitted as a separate `queue.submit()`. Per WebGPU spec, commands from different command buffers may overlap or execute out of order. Shared intermediate buffers (`plane_a`, `plane_b`, `plane_c`, `input_buf`, `color_out`) raced between frames, causing frame N+1's data to overwrite frame N's intermediate results.
+
+**Symptoms**: First highpass frame (L0 H0) had all-zero coefficients even for different input frames. Pre-Haar readback showed frames 0 and 1 had identical spatial wavelet coefficients.
+
+**Fix**: Single command encoder for all frames' spatial wavelet processing within a GOP. Within one encoder, operations are strictly ordered. Also per-frame `raw_input_buf` to prevent `write_buffer` upload races. Applied to both streaming and in-memory encode paths.
+
+**Verification**: Static content (duplicated frame) now gives 0.14 dB gap vs All-I (previously 2-4 dB). The 0.14 dB residual is from CfL chroma prediction path differences (`Entropy roundtrip (low frame) max_abs Co 273, Cg 308`).
+
+### Phase 4 items completed
+
+1. **Adaptive per-tile highpass quantization** — `compute_temporal_tile_weights()`: weight = frame_mean / tile_mean, clamped [0.5, 4.0], geometric mean normalized to 1.0. Static tiles get higher weight (coarser quant), motion tiles get lower weight (finer quant). `GNC_TW_DIAG=1` enables tile weight distribution diagnostics.
+
+2. **CfL in temporal wavelet mode** — Chroma-from-Luma prediction enabled for both lowpass and highpass temporal frames. Uses same `weight_map` mechanism as spatial CfL.
+
+3. **Automated benchmark suite** — `benchmark-suite` CLI command: multi-sequence CSV output with bpp, PSNR, fps. `benchmark-sequence --ab` runs A/B comparison (I+P+B, All-I, Temporal Haar) on real multi-frame sequences.
+
+### Results: Real video sequences (120 frames, 1080p50, q=75)
+
+**crowd_run** (high uniform motion):
+
+| Mode | bpp | PSNR avg | Gap vs All-I |
+|------|-----|----------|--------------|
+| All-I | 7.55 | 40.72 dB | — |
+| I+P+B | 6.99 | 38.78 dB | -1.94 dB |
+| Haar mul=2.0 | 4.91 | 36.21 dB | -4.51 dB |
+| Haar mul=1.0 | 7.68 | 38.92 dB | -1.80 dB |
+| Haar mul=0.5 | 10.93 | 40.75 dB | -0.03 dB |
+
+**park_joy** (complex motion, foliage):
+
+| Mode | bpp | PSNR avg | Gap vs All-I |
+|------|-----|----------|--------------|
+| All-I | 7.98 | 40.95 dB | — |
+| I+P+B | 7.76 | 39.15 dB | -1.80 dB |
+| Haar mul=2.0 | 6.02 | 36.04 dB | -4.91 dB |
+| Haar mul=1.0 | 8.67 | 38.80 dB | -2.15 dB |
+
+### Analysis
+
+- Quality loss is **entirely from highpass quantization** (mul=0.5 recovers all quality)
+- Default mul=2.0 too aggressive for high-motion 50fps content: 4.5-5 dB PSNR cost
+- At mul=1.0 Haar is within 1.8-2.2 dB of All-I but costs ~same or more bpp
+- I+P+B motion estimation wins on high-motion content (better RD than temporal wavelet)
+- Temporal wavelet advantage is for static/slow content and parallelism (no inter-frame dependencies)
+- **Key GPU lesson**: Separate `queue.submit()` calls CAN overlap — always use single command encoder when operations share intermediate buffers
+
+---
+
 ## 2026-03-05: Temporal LeGall 5/3 — Phase 3 Complete
 
 ### Hypothesis

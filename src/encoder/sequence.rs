@@ -680,7 +680,7 @@ impl EncoderPipeline {
                         padded_pixels,
                     );
 
-                    // 4) Encode high frames per level (coarser qstep)
+                    // 4) Encode high frames per level (coarser qstep + per-tile adaptive weights)
                     let mut high_cfg = cfg.clone();
                     high_cfg.quantization_step *= config.temporal_highpass_qstep_mul;
                     let mut high_cfs: Vec<Vec<CompressedFrame>> = Vec::new();
@@ -690,7 +690,14 @@ impl EncoderPipeline {
                         let mut lvl_frames: Vec<CompressedFrame> = Vec::new();
                         for idx in 0..count {
                             let buf_idx = start + idx;
-                            let cf = self.encode_from_gpu_wavelet_planes(
+                            let tile_weights = Self::compute_temporal_tile_weights(
+                                ctx,
+                                &tw_frame_bufs[buf_idx][0],
+                                padded_w,
+                                padded_h,
+                                cfg.tile_size,
+                            );
+                            let cf = self.encode_from_gpu_wavelet_planes_weighted(
                                 ctx,
                                 [
                                     &tw_frame_bufs[buf_idx][0],
@@ -702,6 +709,7 @@ impl EncoderPipeline {
                                 padded_w,
                                 padded_h,
                                 padded_pixels,
+                                Some(&tile_weights),
                             );
                             lvl_frames.push(cf);
                         }
@@ -1083,7 +1091,7 @@ impl EncoderPipeline {
             padded_pixels,
         );
 
-        // 4) Encode high frames per level (coarser qstep)
+        // 4) Encode high frames per level (coarser qstep + per-tile adaptive weights)
         let mut high_cfg = cfg.clone();
         high_cfg.quantization_step *= config.temporal_highpass_qstep_mul;
         let mut high_cfs: Vec<Vec<CompressedFrame>> = Vec::new();
@@ -1093,7 +1101,15 @@ impl EncoderPipeline {
             let mut lvl_frames: Vec<CompressedFrame> = Vec::new();
             for idx in 0..count {
                 let buf_idx = start + idx;
-                let cf = self.encode_from_gpu_wavelet_planes(
+                // Compute per-tile adaptive weights from Y plane temporal activity
+                let tile_weights = Self::compute_temporal_tile_weights(
+                    ctx,
+                    &tw_frame_bufs[buf_idx][0],
+                    padded_w,
+                    padded_h,
+                    cfg.tile_size,
+                );
+                let cf = self.encode_from_gpu_wavelet_planes_weighted(
                     ctx,
                     [
                         &tw_frame_bufs[buf_idx][0],
@@ -1105,6 +1121,7 @@ impl EncoderPipeline {
                     padded_w,
                     padded_h,
                     padded_pixels,
+                    Some(&tile_weights),
                 );
                 lvl_frames.push(cf);
             }
@@ -2961,6 +2978,30 @@ impl EncoderPipeline {
         padded_h: u32,
         padded_pixels: usize,
     ) -> CompressedFrame {
+        self.encode_from_gpu_wavelet_planes_weighted(
+            ctx, plane_bufs, config, info, padded_w, padded_h, padded_pixels, None,
+        )
+    }
+
+    /// Encode wavelet planes with optional per-tile adaptive weights for temporal highpass.
+    ///
+    /// When `tile_weights` is provided, it contains one weight per tile (tiles_x * tiles_y).
+    /// Higher weight → coarser quantization (for static tiles where temporal highpass is near zero).
+    /// Lower weight → finer quantization (for motion tiles with significant temporal detail).
+    /// The weights are expanded to per-LL-block format for the existing AQ mechanism.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_from_gpu_wavelet_planes_weighted(
+        &mut self,
+        ctx: &GpuContext,
+        plane_bufs: [&wgpu::Buffer; 3],
+        config: &CodecConfig,
+        info: &FrameInfo,
+        padded_w: u32,
+        padded_h: u32,
+        padded_pixels: usize,
+        tile_weights: Option<&[f32]>,
+    ) -> CompressedFrame {
+        use wgpu::util::DeviceExt;
         let plane_size = (padded_pixels * std::mem::size_of::<f32>()) as u64;
         let weights_luma = config.subband_weights.pack_weights();
         let weights_chroma = config.subband_weights.pack_weights_chroma();
@@ -2969,6 +3010,56 @@ impl EncoderPipeline {
         // Quantized output destinations (same layout as normal encode):
         // Y → mc_out, Co → ref_upload, Cg → plane_b
         let quant_dests: [&wgpu::Buffer; 3] = [&bufs.mc_out, &bufs.ref_upload, &bufs.plane_b];
+
+        // Expand per-tile weights to per-LL-block format if provided
+        let (wm_buf_storage, wm_data) = if let Some(tw) = tile_weights {
+            let tiles_x = padded_w / config.tile_size;
+            let tiles_y = padded_h / config.tile_size;
+            let ll_size = config.tile_size >> config.wavelet_levels;
+            let ll_block_size = AQ_LL_BLOCK_SIZE.min(ll_size);
+            let ll_bx = ll_size.div_ceil(ll_block_size);
+            let ll_by = ll_bx;
+            let blocks_per_tile = (ll_bx * ll_by) as usize;
+            let total_blocks = (tiles_x * tiles_y) as usize * blocks_per_tile;
+
+            // Expand: all LL-blocks within a tile share the tile's weight
+            let mut expanded = vec![1.0f32; total_blocks];
+            for ty in 0..tiles_y as usize {
+                for tx in 0..tiles_x as usize {
+                    let tile_idx = ty * tiles_x as usize + tx;
+                    let w = tw[tile_idx];
+                    for by in 0..ll_by as usize {
+                        for bx in 0..ll_bx as usize {
+                            let global_bx = tx * ll_bx as usize + bx;
+                            let global_by = ty * ll_bx as usize + by;
+                            let global_blocks_x = ll_bx as usize * tiles_x as usize;
+                            expanded[global_by * global_blocks_x + global_bx] = w;
+                        }
+                    }
+                }
+            }
+
+            let buf = ctx
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("tw_aq_weight_map"),
+                    contents: bytemuck::cast_slice(&expanded),
+                    usage: wgpu::BufferUsages::STORAGE,
+                });
+            (Some(buf), Some(expanded))
+        } else {
+            (None, None)
+        };
+
+        let wm_param = if let Some(ref wm_buf) = wm_buf_storage {
+            let ll_size = config.tile_size >> config.wavelet_levels;
+            let ll_block_size = AQ_LL_BLOCK_SIZE.min(ll_size);
+            let ll_bx = ll_size.div_ceil(ll_block_size);
+            let tiles_x = padded_w / config.tile_size;
+            Some((wm_buf as &wgpu::Buffer, ll_block_size, ll_bx, tiles_x))
+        } else {
+            None
+        };
 
         let mut cmd = ctx
             .device
@@ -2982,7 +3073,7 @@ impl EncoderPipeline {
         for p in 0..3 {
             let weights = if p == 0 { &weights_luma } else { &weights_chroma };
             cmd.copy_buffer_to_buffer(plane_bufs[p], 0, &bufs.plane_c, 0, plane_size);
-            self.quantize.dispatch(
+            self.quantize.dispatch_adaptive(
                 ctx,
                 &mut cmd,
                 &bufs.plane_c,
@@ -2996,6 +3087,8 @@ impl EncoderPipeline {
                 config.tile_size,
                 config.wavelet_levels,
                 weights,
+                wm_param,
+                0.0,
             );
         }
 
@@ -3022,7 +3115,7 @@ impl EncoderPipeline {
             config: config.clone(),
             entropy: EntropyData::Rice(rice_tiles),
             cfl_alphas: None,
-            weight_map: None,
+            weight_map: wm_data,
             frame_type: FrameType::Intra,
             motion_field: None,
             intra_modes: None,
@@ -3030,5 +3123,93 @@ impl EncoderPipeline {
             residual_stats_co: None,
             residual_stats_cg: None,
         }
+    }
+
+    /// Compute per-tile adaptive weights for temporal highpass quantization.
+    ///
+    /// Reads back the Y plane from GPU, computes per-tile mean_abs of wavelet
+    /// coefficients. Static tiles (low temporal activity) get higher weights
+    /// (coarser quantization), motion tiles get lower weights (finer quantization).
+    /// Normalized so the geometric mean is 1.0 (bitrate-neutral on average).
+    fn compute_temporal_tile_weights(
+        ctx: &GpuContext,
+        y_plane_buf: &wgpu::Buffer,
+        padded_w: u32,
+        padded_h: u32,
+        tile_size: u32,
+    ) -> Vec<f32> {
+        let padded_pixels = (padded_w * padded_h) as usize;
+        let plane_size = (padded_pixels * std::mem::size_of::<f32>()) as u64;
+
+        // Read back Y plane
+        let staging = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("tw_aq_staging"),
+            size: plane_size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut cmd = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("tw_aq_readback"),
+            });
+        cmd.copy_buffer_to_buffer(y_plane_buf, 0, &staging, 0, plane_size);
+        ctx.queue.submit(Some(cmd.finish()));
+
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            tx.send(result).unwrap();
+        });
+        ctx.device.poll(wgpu::Maintain::Wait);
+        rx.recv().unwrap().unwrap();
+        let data = slice.get_mapped_range();
+        let coeffs: &[f32] = bytemuck::cast_slice(&data);
+
+        let tiles_x = padded_w / tile_size;
+        let tiles_y = padded_h / tile_size;
+        let num_tiles = (tiles_x * tiles_y) as usize;
+        let ts = tile_size as usize;
+        let tile_pixel_count = (ts * ts) as f64;
+
+        // Compute per-tile mean_abs
+        let mut tile_mean_abs = vec![0.0f64; num_tiles];
+        for ty in 0..tiles_y as usize {
+            for tx_idx in 0..tiles_x as usize {
+                let tile_idx = ty * tiles_x as usize + tx_idx;
+                let mut sum_abs = 0.0f64;
+                for row in 0..ts {
+                    let y_pos = ty * ts + row;
+                    let x_base = tx_idx * ts;
+                    for col in 0..ts {
+                        let idx = y_pos * padded_w as usize + x_base + col;
+                        sum_abs += coeffs[idx].abs() as f64;
+                    }
+                }
+                tile_mean_abs[tile_idx] = sum_abs / tile_pixel_count;
+            }
+        }
+
+        drop(data);
+        staging.unmap();
+
+        // Compute frame-level mean
+        let frame_mean: f64 = tile_mean_abs.iter().sum::<f64>() / num_tiles as f64;
+        let eps = 1e-6;
+
+        // Map: static tiles (low activity) → high weight, motion tiles → low weight
+        let mut weights: Vec<f32> = tile_mean_abs
+            .iter()
+            .map(|&ma| ((frame_mean + eps) / (ma + eps)).clamp(0.5, 4.0) as f32)
+            .collect();
+
+        // Normalize so geometric mean = 1.0 (bitrate-neutral on average)
+        let log_sum: f64 = weights.iter().map(|&w| (w as f64).ln()).sum::<f64>();
+        let geo_mean = (log_sum / num_tiles as f64).exp();
+        for w in &mut weights {
+            *w = (*w as f64 / geo_mean).clamp(0.5, 4.0) as f32;
+        }
+
+        weights
     }
 }

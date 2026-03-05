@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use wgpu;
 
 use super::buffer_cache::CachedBuffers;
+use crate::encoder::adaptive::{self, AQ_LL_BLOCK_SIZE};
 use crate::encoder::bitplane::GpuBitplaneDecoder;
 use crate::encoder::cfl::CflPredictor;
 use crate::encoder::color::ColorConverter;
@@ -1111,6 +1112,18 @@ impl DecoderPipeline {
                 label: Some("tw_gpu_decode"),
             });
 
+        // Set up weight map for adaptive dequantization (temporal highpass per-tile weights)
+        let wm_param = if frame.weight_map.is_some() {
+            let (_, ll_bx, _, tx) = adaptive::weight_map_dims(
+                padded_w, padded_h, config.tile_size, config.wavelet_levels,
+            );
+            let ll_size = config.tile_size >> config.wavelet_levels;
+            let ll_block_size = AQ_LL_BLOCK_SIZE.min(ll_size);
+            Some((&bufs.weight_map_buf, ll_block_size, ll_bx, tx))
+        } else {
+            None
+        };
+
         for (p, dest_buf) in dest_bufs.iter().enumerate() {
             // GPU entropy decode → scratch_a
             self.dispatch_entropy_decode(
@@ -1137,7 +1150,7 @@ impl DecoderPipeline {
                 config.tile_size,
                 config.wavelet_levels,
                 weights,
-                None,
+                wm_param,
                 0.0,
             );
             // Copy dequantized coefficients to destination GPU buffer

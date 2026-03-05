@@ -1124,6 +1124,15 @@ impl DecoderPipeline {
             None
         };
 
+        // CfL metadata
+        let has_cfl = frame.cfl_alphas.is_some();
+        let cfl_alphas_per_plane = if has_cfl {
+            let cfl_data = frame.cfl_alphas.as_ref().unwrap();
+            tiles_per_plane * cfl_data.num_subbands as usize
+        } else {
+            0
+        };
+
         for (p, dest_buf) in dest_bufs.iter().enumerate() {
             // GPU entropy decode → scratch_a
             self.dispatch_entropy_decode(
@@ -1153,8 +1162,50 @@ impl DecoderPipeline {
                 wm_param,
                 0.0,
             );
-            // Copy dequantized coefficients to destination GPU buffer
-            cmd.copy_buffer_to_buffer(&bufs.scratch_b, 0, dest_buf, 0, plane_size);
+
+            // CfL handling: save Y reference, apply inverse prediction for chroma
+            if p == 0 && has_cfl {
+                // Save dequantized Y as reference for chroma prediction
+                cmd.copy_buffer_to_buffer(&bufs.scratch_b, 0, &bufs.y_ref_wavelet_buf, 0, plane_size);
+            }
+
+            if p > 0 && has_cfl {
+                // Copy per-plane CfL alphas to plane-specific buffer
+                let plane_alpha_offset = (p - 1) * cfl_alphas_per_plane;
+                let plane_alpha_byte_offset =
+                    (plane_alpha_offset * std::mem::size_of::<f32>()) as u64;
+                let plane_alpha_byte_size =
+                    (cfl_alphas_per_plane * std::mem::size_of::<f32>()) as u64;
+
+                cmd.copy_buffer_to_buffer(
+                    &bufs.cfl_alpha_buf,
+                    plane_alpha_byte_offset,
+                    &bufs.plane_alpha_bufs[p - 1],
+                    0,
+                    plane_alpha_byte_size,
+                );
+
+                // CfL inverse: chroma = residual + alpha * luma_ref → scratch_c
+                self.cfl_predictor.dispatch_inverse(
+                    ctx,
+                    &mut cmd,
+                    &bufs.scratch_b,
+                    &bufs.y_ref_wavelet_buf,
+                    &bufs.plane_alpha_bufs[p - 1],
+                    &bufs.scratch_c,
+                    padded_pixels as u32,
+                    padded_w,
+                    padded_h,
+                    config.tile_size,
+                    config.wavelet_levels,
+                );
+
+                // Copy CfL-reconstructed chroma to destination
+                cmd.copy_buffer_to_buffer(&bufs.scratch_c, 0, dest_buf, 0, plane_size);
+            } else {
+                // Copy dequantized coefficients to destination GPU buffer
+                cmd.copy_buffer_to_buffer(&bufs.scratch_b, 0, dest_buf, 0, plane_size);
+            }
         }
         ctx.queue.submit(Some(cmd.finish()));
     }

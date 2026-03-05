@@ -506,7 +506,6 @@ impl EncoderPipeline {
         let mut cfg = config.clone();
         cfg.keyframe_interval = 1;
         cfg.temporal_transform = TemporalTransform::None;
-        cfg.cfl_enabled = false;
 
         let mut i = 0usize;
         let info = FrameInfo {
@@ -940,7 +939,6 @@ impl EncoderPipeline {
         let mut cfg = config.clone();
         cfg.keyframe_interval = 1;
         cfg.temporal_transform = TemporalTransform::None;
-        cfg.cfl_enabled = false;
 
         let info = FrameInfo {
             width,
@@ -2989,6 +2987,10 @@ impl EncoderPipeline {
     /// Higher weight → coarser quantization (for static tiles where temporal highpass is near zero).
     /// Lower weight → finer quantization (for motion tiles with significant temporal detail).
     /// The weights are expanded to per-LL-block format for the existing AQ mechanism.
+    ///
+    /// When `config.cfl_enabled` is true, CfL prediction is applied to chroma planes:
+    /// Y is quantized+dequantized to produce a reconstructed reference, then chroma planes
+    /// are predicted from it. The residual (chroma - alpha * luma) is quantized instead.
     #[allow(clippy::too_many_arguments)]
     fn encode_from_gpu_wavelet_planes_weighted(
         &mut self,
@@ -3001,10 +3003,43 @@ impl EncoderPipeline {
         padded_pixels: usize,
         tile_weights: Option<&[f32]>,
     ) -> CompressedFrame {
+        use crate::CflAlphas;
         use wgpu::util::DeviceExt;
         let plane_size = (padded_pixels * std::mem::size_of::<f32>()) as u64;
         let weights_luma = config.subband_weights.pack_weights();
         let weights_chroma = config.subband_weights.pack_weights_chroma();
+
+        let tiles_x = padded_w / config.tile_size;
+        let tiles_y = padded_h / config.tile_size;
+        let nsb = cfl::num_subbands(config.wavelet_levels);
+
+        // Ensure CfL alpha buffers are large enough
+        if config.cfl_enabled {
+            let total_tiles = tiles_x * tiles_y;
+            let alpha_buf_size =
+                (total_tiles * nsb) as u64 * std::mem::size_of::<f32>() as u64;
+            let bufs = self.cached.as_mut().unwrap();
+            crate::gpu_util::ensure_var_buf(
+                ctx,
+                &mut bufs.raw_alpha,
+                &mut bufs.raw_alpha_cap,
+                alpha_buf_size,
+                "enc_raw_alpha",
+                wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
+            );
+            crate::gpu_util::ensure_var_buf(
+                ctx,
+                &mut bufs.dq_alpha,
+                &mut bufs.dq_alpha_cap,
+                alpha_buf_size,
+                "enc_dq_alpha",
+                wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
+            );
+        }
 
         let bufs = self.cached.as_ref().unwrap();
         // Quantized output destinations (same layout as normal encode):
@@ -3013,8 +3048,6 @@ impl EncoderPipeline {
 
         // Expand per-tile weights to per-LL-block format if provided
         let (wm_buf_storage, wm_data) = if let Some(tw) = tile_weights {
-            let tiles_x = padded_w / config.tile_size;
-            let tiles_y = padded_h / config.tile_size;
             let ll_size = config.tile_size >> config.wavelet_levels;
             let ll_block_size = AQ_LL_BLOCK_SIZE.min(ll_size);
             let ll_bx = ll_size.div_ceil(ll_block_size);
@@ -3024,14 +3057,14 @@ impl EncoderPipeline {
 
             // Expand: all LL-blocks within a tile share the tile's weight
             let mut expanded = vec![1.0f32; total_blocks];
-            for ty in 0..tiles_y as usize {
-                for tx in 0..tiles_x as usize {
-                    let tile_idx = ty * tiles_x as usize + tx;
+            for ty_idx in 0..tiles_y as usize {
+                for tx_idx in 0..tiles_x as usize {
+                    let tile_idx = ty_idx * tiles_x as usize + tx_idx;
                     let w = tw[tile_idx];
                     for by in 0..ll_by as usize {
                         for bx in 0..ll_bx as usize {
-                            let global_bx = tx * ll_bx as usize + bx;
-                            let global_by = ty * ll_bx as usize + by;
+                            let global_bx = tx_idx * ll_bx as usize + bx;
+                            let global_by = ty_idx * ll_bx as usize + by;
                             let global_blocks_x = ll_bx as usize * tiles_x as usize;
                             expanded[global_by * global_blocks_x + global_bx] = w;
                         }
@@ -3055,10 +3088,32 @@ impl EncoderPipeline {
             let ll_size = config.tile_size >> config.wavelet_levels;
             let ll_block_size = AQ_LL_BLOCK_SIZE.min(ll_size);
             let ll_bx = ll_size.div_ceil(ll_block_size);
-            let tiles_x = padded_w / config.tile_size;
             Some((wm_buf as &wgpu::Buffer, ll_block_size, ll_bx, tiles_x))
         } else {
             None
+        };
+
+        // CfL alpha staging buffers (for readback)
+        let alpha_count = (tiles_x * tiles_y * nsb) as usize;
+        let alpha_bytes = (alpha_count * std::mem::size_of::<f32>()) as u64;
+        let alpha_staging: [wgpu::Buffer; 2] = if config.cfl_enabled {
+            std::array::from_fn(|i| {
+                ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(["tw_alpha_stg_co", "tw_alpha_stg_cg"][i]),
+                    size: alpha_bytes,
+                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                })
+            })
+        } else {
+            std::array::from_fn(|_| {
+                ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("tw_alpha_stg_dummy"),
+                    size: 4,
+                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                })
+            })
         };
 
         let mut cmd = ctx
@@ -3067,29 +3122,75 @@ impl EncoderPipeline {
                 label: Some("tw_gpu_quant_entropy"),
             });
 
-        // Quantize all 3 planes sequentially in one command encoder.
-        // plane_c is reused as input scratch — each copy overwrites it, but the
-        // previous quantize output is already in its destination buffer.
-        for p in 0..3 {
-            let weights = if p == 0 { &weights_luma } else { &weights_chroma };
-            cmd.copy_buffer_to_buffer(plane_bufs[p], 0, &bufs.plane_c, 0, plane_size);
+        if config.cfl_enabled {
+            // CfL path: Y must be quantized+dequantized first to produce recon_y reference
+
+            // Y plane: quantize → dequantize → recon_y
+            cmd.copy_buffer_to_buffer(plane_bufs[0], 0, &bufs.plane_c, 0, plane_size);
             self.quantize.dispatch_adaptive(
-                ctx,
-                &mut cmd,
-                &bufs.plane_c,
-                quant_dests[p],
-                padded_pixels as u32,
-                config.quantization_step,
-                config.dead_zone,
-                true,
-                padded_w,
-                padded_h,
-                config.tile_size,
-                config.wavelet_levels,
-                weights,
-                wm_param,
-                0.0,
+                ctx, &mut cmd, &bufs.plane_c, quant_dests[0],
+                padded_pixels as u32, config.quantization_step, config.dead_zone,
+                true, padded_w, padded_h, config.tile_size, config.wavelet_levels,
+                &weights_luma, wm_param, 0.0,
             );
+            // Dequantize Y to get reconstructed luma (matching what decoder will produce)
+            self.quantize.dispatch_adaptive(
+                ctx, &mut cmd, quant_dests[0], &bufs.plane_a,
+                padded_pixels as u32, config.quantization_step, config.dead_zone,
+                false, padded_w, padded_h, config.tile_size, config.wavelet_levels,
+                &weights_luma, wm_param, 0.0,
+            );
+            cmd.copy_buffer_to_buffer(&bufs.plane_a, 0, &bufs.recon_y, 0, plane_size);
+
+            // Co plane: CfL alpha → forward predict → quantize
+            cmd.copy_buffer_to_buffer(plane_bufs[1], 0, &bufs.plane_c, 0, plane_size);
+            self.cfl_alpha.dispatch(
+                ctx, &mut cmd, &bufs.recon_y, &bufs.plane_c,
+                &bufs.raw_alpha, &bufs.dq_alpha,
+                padded_w, padded_h, config.tile_size, config.wavelet_levels,
+            );
+            self.cfl_forward.dispatch(
+                ctx, &mut cmd, &bufs.plane_c, &bufs.recon_y, &bufs.dq_alpha, &bufs.plane_a,
+                padded_pixels as u32, padded_w, padded_h, config.tile_size, config.wavelet_levels,
+            );
+            self.quantize.dispatch_adaptive(
+                ctx, &mut cmd, &bufs.plane_a, quant_dests[1],
+                padded_pixels as u32, config.quantization_step, config.dead_zone,
+                true, padded_w, padded_h, config.tile_size, config.wavelet_levels,
+                &weights_chroma, wm_param, 0.0,
+            );
+            cmd.copy_buffer_to_buffer(&bufs.raw_alpha, 0, &alpha_staging[0], 0, alpha_bytes);
+
+            // Cg plane: CfL alpha → forward predict → quantize
+            cmd.copy_buffer_to_buffer(plane_bufs[2], 0, &bufs.plane_c, 0, plane_size);
+            self.cfl_alpha.dispatch(
+                ctx, &mut cmd, &bufs.recon_y, &bufs.plane_c,
+                &bufs.raw_alpha, &bufs.dq_alpha,
+                padded_w, padded_h, config.tile_size, config.wavelet_levels,
+            );
+            self.cfl_forward.dispatch(
+                ctx, &mut cmd, &bufs.plane_c, &bufs.recon_y, &bufs.dq_alpha, &bufs.plane_a,
+                padded_pixels as u32, padded_w, padded_h, config.tile_size, config.wavelet_levels,
+            );
+            self.quantize.dispatch_adaptive(
+                ctx, &mut cmd, &bufs.plane_a, quant_dests[2],
+                padded_pixels as u32, config.quantization_step, config.dead_zone,
+                true, padded_w, padded_h, config.tile_size, config.wavelet_levels,
+                &weights_chroma, wm_param, 0.0,
+            );
+            cmd.copy_buffer_to_buffer(&bufs.raw_alpha, 0, &alpha_staging[1], 0, alpha_bytes);
+        } else {
+            // Non-CfL path: quantize all 3 planes directly
+            for p in 0..3 {
+                let weights = if p == 0 { &weights_luma } else { &weights_chroma };
+                cmd.copy_buffer_to_buffer(plane_bufs[p], 0, &bufs.plane_c, 0, plane_size);
+                self.quantize.dispatch_adaptive(
+                    ctx, &mut cmd, &bufs.plane_c, quant_dests[p],
+                    padded_pixels as u32, config.quantization_step, config.dead_zone,
+                    true, padded_w, padded_h, config.tile_size, config.wavelet_levels,
+                    weights, wm_param, 0.0,
+                );
+            }
         }
 
         // GPU Rice encode — dispatched into the same command encoder
@@ -3110,11 +3211,42 @@ impl EncoderPipeline {
             config.wavelet_levels,
         );
 
+        // Readback CfL alphas
+        let cfl_alphas = if config.cfl_enabled {
+            let mut cfl_alphas_all: Vec<i16> = Vec::new();
+            let (tx, rx) = std::sync::mpsc::channel();
+            for stg in &alpha_staging {
+                let tx = tx.clone();
+                stg.slice(..).map_async(wgpu::MapMode::Read, move |result| {
+                    tx.send(result).unwrap();
+                });
+            }
+            drop(tx);
+            ctx.device.poll(wgpu::Maintain::Wait);
+            for _ in 0..2 {
+                rx.recv().unwrap().unwrap();
+            }
+            for stg in &alpha_staging {
+                let view = stg.slice(..).get_mapped_range();
+                let raw_alphas: &[i32] = bytemuck::cast_slice(&view);
+                let q_alphas: Vec<i16> = raw_alphas.iter().map(|&a| a as i16).collect();
+                cfl_alphas_all.extend_from_slice(&q_alphas);
+                drop(view);
+                stg.unmap();
+            }
+            Some(CflAlphas {
+                alphas: cfl_alphas_all,
+                num_subbands: nsb,
+            })
+        } else {
+            None
+        };
+
         CompressedFrame {
             info: *info,
             config: config.clone(),
             entropy: EntropyData::Rice(rice_tiles),
-            cfl_alphas: None,
+            cfl_alphas,
             weight_map: wm_data,
             frame_type: FrameType::Intra,
             motion_field: None,

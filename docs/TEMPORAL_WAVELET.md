@@ -41,15 +41,16 @@
 20. ✅ **Timing log panel** — per-frame table (Frame, Seek ms, Decode ms, Total ms, FPS) with Clear/Copy CSV, summary stats (avg/min/max).
 21. ✅ **Dropdown file selector** — grouped `<select>` (GNV1/GNV2 optgroups) replaces button grid.
 
-## Phase 3 — Temporal 5/3 lifting ✅ (2026-03-05)
-22. ✅ **WGSL temporal 5/3 shader** — `shaders/temporal_53.wgsl`, two-pass predict+update lifting over 4 frames, per-element @workgroup_size(256). Forward: d0 = f1 - 0.5*(f0+f2), d1 = f3 - f2, s0 = f0 + 0.5*d0, s1 = f2 + 0.25*(d0+d1). Inverse: undo-update then undo-predict. Two queue.submit() calls (pass barrier).
-23. ✅ **Adaptive temporal transform selection** — `--temporal-wavelet auto`:
-   - **No temporal transform**: ultra-low latency / pure I-frame mode (JPEG XS-like)
-   - **Haar**: low latency / fps ≤ 25 / q ≥ 90
-   - **5/3**: fps > 25 / q < 90 / higher compression
-   - `select_temporal_mode()` auto-selects based on framerate + quality target.
+## Phase 3 — Adaptive Haar + temporal 5/3 (experimental) ✅ (2026-03-05)
+22. ✅ **WGSL temporal 5/3 shader** — `shaders/temporal_53.wgsl`, two-pass predict+update lifting. Available via `--temporal-wavelet 53` but not auto-selected (4-frame 5/3 produces 2 lowpass + 2 highpass, worse energy compaction than Haar's 1+3 split).
+23. ✅ **Adaptive temporal transform selection** — `--temporal-wavelet auto` (default):
+   - **fps < 1**: None (still image / slideshow)
+   - **fps ≤ 25 or q ≥ 90**: Haar gop=2 (1 level, minimal latency)
+   - **fps > 25**: Haar gop=4 (2 levels, 1 lowpass + 3 highpass, best compression)
+   - Temporal wavelet is now the **default** encoding mode. MV (I+P+B) requires explicit `--temporal-wavelet none`.
+24. ✅ **Diagnostics fix** — 5/3 mode now labels s1 as `[L1]` (second lowpass) instead of `[H0]`. Summary correctly separates lowpass and highpass byte counts.
 
-**Results**: bbb_1080p q=75: 2.13 bpp / 42.60 dB, GNV2 roundtrip verified, decode 50.5 fps.
+**Results**: bbb 8 frames q=75 Haar gop=4: 1.77 bpp (vs 2.48 bpp for 5/3, vs 4.30 bpp all-I). Haar gop=4 = 59% bitrate reduction vs all-I.
 
 ## Phase 4 — Optimization
 24. **Re-enable CfL in temporal mode** — CfL on temporal wavelet coefficients (both lowpass and highpass).

@@ -184,7 +184,7 @@ enum Command {
         #[arg(long)]
         diagnostics: bool,
 
-        /// Temporal wavelet mode: auto (default, selects by fps/quality), haar, 53, none (I+P+B motion vectors)
+        /// Temporal wavelet mode: auto (default, Haar with adaptive GOP), haar, 53 (experimental), none (I+P+B motion vectors)
         #[arg(long, default_value = "auto")]
         temporal_wavelet: String,
 
@@ -367,7 +367,7 @@ fn parse_temporal_transform(s: &str) -> TemporalTransform {
         "none" => TemporalTransform::None,
         "haar" => TemporalTransform::Haar,
         "53" | "5/3" | "legall53" | "legall" => TemporalTransform::LeGall53,
-        "auto" => TemporalTransform::LeGall53, // placeholder — use select_temporal_mode() instead
+        "auto" => TemporalTransform::Haar, // placeholder — use select_temporal_mode() for proper auto
         other => {
             eprintln!(
                 "Unknown temporal wavelet '{}'. Use 'none', 'haar', '53', or 'auto'. Defaulting to none.",
@@ -378,22 +378,40 @@ fn parse_temporal_transform(s: &str) -> TemporalTransform {
     }
 }
 
-/// Auto-select temporal transform based on framerate and quality target.
-/// - fps <= 25 or q >= 90: Haar (low latency, fewer frames needed)
-/// - fps > 25 and q < 90: LeGall 5/3 (better compression, 4-frame groups)
-fn select_temporal_mode(explicit: &str, fps: f64, quality: u32) -> TemporalTransform {
+/// Auto-select temporal transform and GOP size.
+/// Always Haar — multilevel dyadic decomposition gives optimal energy compaction.
+/// LeGall 5/3 is available via explicit --temporal-wavelet 53 but not auto-selected
+/// (4-frame 5/3 produces 2 lowpass + 2 highpass, worse than Haar's 1+3 split).
+///
+/// Returns (TemporalTransform, gop_size).
+fn select_temporal_mode(explicit: &str, fps: f64, quality: u32) -> (TemporalTransform, usize) {
     let lower = explicit.to_lowercase();
     if lower != "auto" {
         let mode = parse_temporal_transform(explicit);
+        let gop = match mode {
+            TemporalTransform::LeGall53 => 4,
+            TemporalTransform::None => 0,
+            TemporalTransform::Haar => {
+                // Explicit Haar: use keyframe_interval (caller handles)
+                0 // sentinel — caller uses keyframe_interval
+            }
+        };
         eprintln!("Temporal mode: {:?} (explicit)", mode);
-        return mode;
+        return (mode, gop);
     }
-    if fps <= 25.0 || quality >= 90 {
-        eprintln!("Temporal mode: Haar (auto, fps={fps}, q={quality})");
-        TemporalTransform::Haar
+    // Auto: Haar with adaptive GOP size
+    //   fps < 1:              None (still image / slideshow)
+    //   fps <= 25 or q >= 90: Haar gop=2 (minimal latency, 1 level)
+    //   fps > 25:             Haar gop=4 (2 levels, better compression)
+    if fps < 1.0 {
+        eprintln!("Temporal mode: None (auto, fps={fps} < 1)");
+        (TemporalTransform::None, 0)
+    } else if fps <= 25.0 || quality >= 90 {
+        eprintln!("Temporal mode: Haar gop=2 (auto, fps={fps}, q={quality})");
+        (TemporalTransform::Haar, 2)
     } else {
-        eprintln!("Temporal mode: LeGall 5/3 (auto, fps={fps}, q={quality})");
-        TemporalTransform::LeGall53
+        eprintln!("Temporal mode: Haar gop=4 (auto, fps={fps}, q={quality})");
+        (TemporalTransform::Haar, 4)
     }
 }
 
@@ -768,25 +786,30 @@ fn main() {
             let mut encoder = EncoderPipeline::new(&ctx);
             let decoder = DecoderPipeline::new(&ctx);
 
-            let temporal_mode = select_temporal_mode(&temporal_wavelet, fps, quality.unwrap_or(75));
+            let (temporal_mode, auto_gop) =
+                select_temporal_mode(&temporal_wavelet, fps, quality.unwrap_or(75));
             let run_temporal = temporal_mode != TemporalTransform::None;
             let run_baseline = !run_temporal || ab;
-            if run_temporal
-                && temporal_mode == TemporalTransform::Haar
-                && !gnc::temporal::is_power_of_two(keyframe_interval as usize)
-            {
-                eprintln!(
-                    "Temporal Haar requires keyframe_interval to be power of two (got {}).",
-                    keyframe_interval
-                );
-                std::process::exit(1);
-            }
-            // 5/3 fixed GOP size = 4
+
+            // Determine GOP size: auto_gop from select_temporal_mode, or keyframe_interval for explicit Haar
             let temporal_gop_size = if temporal_mode == TemporalTransform::LeGall53 {
                 4usize
+            } else if auto_gop > 0 {
+                auto_gop
             } else {
                 keyframe_interval as usize
             };
+
+            if run_temporal
+                && temporal_mode == TemporalTransform::Haar
+                && !gnc::temporal::is_power_of_two(temporal_gop_size)
+            {
+                eprintln!(
+                    "Temporal Haar requires GOP size to be power of two (got {}).",
+                    temporal_gop_size
+                );
+                std::process::exit(1);
+            }
 
             // Streaming path: when using temporal wavelet without A/B comparison,
             // load frames per-GOP to avoid holding all frames in memory.
@@ -1230,7 +1253,7 @@ fn main() {
                     h,
                     &config_tw,
                     temporal_mode,
-                    keyframe_interval as usize,
+                    temporal_gop_size,
                 );
                 let elapsed_tw = start.elapsed();
 

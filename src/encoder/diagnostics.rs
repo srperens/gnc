@@ -1003,23 +1003,45 @@ pub fn print_temporal_gop_diagnostics(
     }
 
     // --- Temporal decomposition ---
+    let is_53 = mode == crate::TemporalTransform::LeGall53;
     eprintln!();
     eprintln!("  Temporal decomposition:");
-    let low_pct = if total_bytes > 0 { low_bytes as f64 / total_bytes as f64 * 100.0 } else { 0.0 };
-    let low_bpp = low_bytes as f64 * 8.0 / pixels;
+    // For 5/3: high_frames[0][0] is s1 (second lowpass), not highpass
+    let effective_low_bytes = if is_53 && !group.high_frames.is_empty() && !group.high_frames[0].is_empty() {
+        low_bytes + group.high_frames[0][0].byte_size()
+    } else {
+        low_bytes
+    };
+    let effective_low_count = if is_53 { 2 } else { 1 };
+    let effective_high_bytes = total_bytes - effective_low_bytes;
+
+    let low_pct = if total_bytes > 0 { effective_low_bytes as f64 / total_bytes as f64 * 100.0 } else { 0.0 };
+    let low_bpp = effective_low_bytes as f64 * 8.0 / pixels / effective_low_count as f64;
     eprintln!(
-        "    Lowpass (L):   1 frame   {:>7.1} KB  ({:.1}%)  bpp={:.2}",
-        low_bytes as f64 / 1024.0, low_pct, low_bpp
+        "    Lowpass (L):   {} frame{} {:>7.1} KB  ({:.1}%)  avg_bpp={:.2}",
+        effective_low_count,
+        if effective_low_count != 1 { "s" } else { " " },
+        effective_low_bytes as f64 / 1024.0, low_pct, low_bpp
     );
+
+    // Highpass levels (skip s1 from level 0 for 5/3)
     for (lvl, (bytes, count)) in high_bytes_per_level.iter().zip(high_count_per_level.iter()).enumerate() {
-        let pct = if total_bytes > 0 { *bytes as f64 / total_bytes as f64 * 100.0 } else { 0.0 };
-        let avg_bpp = if *count > 0 { *bytes as f64 * 8.0 / pixels / *count as f64 } else { 0.0 };
+        let (adj_bytes, adj_count) = if is_53 && lvl == 0 && *count > 1 {
+            // Subtract s1 (first frame in level 0) from highpass stats
+            let s1_bytes = group.high_frames[0][0].byte_size();
+            (*bytes - s1_bytes, *count - 1)
+        } else {
+            (*bytes, *count)
+        };
+        if adj_count == 0 { continue; }
+        let pct = if total_bytes > 0 { adj_bytes as f64 / total_bytes as f64 * 100.0 } else { 0.0 };
+        let avg_bpp = if adj_count > 0 { adj_bytes as f64 * 8.0 / pixels / adj_count as f64 } else { 0.0 };
         eprintln!(
             "    Highpass L{}:   {} frame{} {:>7.1} KB  ({:.1}%)  avg_bpp={:.2}",
             lvl,
-            count,
-            if *count != 1 { "s" } else { " " },
-            *bytes as f64 / 1024.0,
+            adj_count,
+            if adj_count != 1 { "s" } else { " " },
+            adj_bytes as f64 / 1024.0,
             pct,
             avg_bpp,
         );
@@ -1032,10 +1054,16 @@ pub fn print_temporal_gop_diagnostics(
     print_temporal_frame_detail("L", 0, &group.low_frame, width, height);
 
     // Highpass frames by level
+    // For 5/3 mode: high_frames[0] = [s1, d0, d1] — first frame is actually second lowpass
+    let is_53 = mode == crate::TemporalTransform::LeGall53;
     for (lvl, frames) in group.high_frames.iter().enumerate() {
         for (fi, frame) in frames.iter().enumerate() {
-            let label = format!("H{}", lvl);
-            let idx = fi;
+            let label = if is_53 && lvl == 0 && fi == 0 {
+                "L1".to_string() // s1 is a lowpass, not highpass
+            } else {
+                format!("H{}", lvl)
+            };
+            let idx = if is_53 && lvl == 0 && fi > 0 { fi - 1 } else { fi };
             print_temporal_frame_detail(&label, idx, frame, width, height);
         }
     }
@@ -1076,9 +1104,10 @@ pub fn print_temporal_gop_diagnostics(
         ));
     }
 
-    // Check first highpass level sparsity
+    // Check first highpass level sparsity (skip s1 for 5/3 — it's lowpass)
     if let Some(h0_frames) = group.high_frames.first() {
-        for (fi, hf) in h0_frames.iter().enumerate() {
+        let skip = if is_53 { 1 } else { 0 };
+        for (fi, hf) in h0_frames.iter().enumerate().skip(skip) {
             let hs = compute_coeff_stats_from_frame(hf);
             if hs.total > 0 && hs.zero_pct < 50.0 {
                 warnings.push(format!(

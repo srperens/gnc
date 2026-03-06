@@ -561,6 +561,10 @@ enum Command {
         /// For temporal wavelet encoding, use benchmark-sequence instead.
         #[arg(long, default_value = "none")]
         temporal_wavelet: String,
+
+        /// Chroma subsampling format: 444, 422, or 420 [default: 444]
+        #[arg(long, default_value = "444")]
+        chroma_format: String,
     },
 
     /// Decode a .gnv or .gnv2 container back to image frames
@@ -2458,6 +2462,7 @@ fn main() {
             rice,
             diagnostics,
             temporal_wavelet,
+            chroma_format,
         } => {
             // encode-sequence is the I+P (motion vector) production encoder → GNV1.
             // For temporal wavelet encoding → GNV2, use benchmark-sequence instead
@@ -2469,6 +2474,18 @@ fn main() {
                 eprintln!(
                     "For temporal wavelet encoding, use: benchmark-sequence -o output.gnv2"
                 );
+                std::process::exit(1);
+            }
+
+            let cf = parse_chroma_format(&chroma_format);
+            if cf != gnc::ChromaFormat::Yuv444 {
+                eprintln!(
+                    "encode-sequence does not yet support non-444 chroma (--chroma-format 422/420)."
+                );
+                eprintln!(
+                    "The I-frame local-decode reference path needs updating for subsampled chroma."
+                );
+                eprintln!("Use --chroma-format 444 (default) for encode-sequence.");
                 std::process::exit(1);
             }
 
@@ -2530,6 +2547,8 @@ fn main() {
             if rice {
                 config.entropy_coder = gnc::EntropyCoder::Rice;
             }
+
+            config.chroma_format = parse_chroma_format(&chroma_format);
 
             // Apply rate control settings
             if let Some(ref br) = bitrate {

@@ -1012,6 +1012,11 @@ impl EncoderPipeline {
     /// This is the streaming-friendly version: pass in exactly `gop_size` frames,
     /// get back one `TemporalGroup`. Call repeatedly for each GOP, then use
     /// `encode()` for any tail frames.
+    ///
+    /// `next_gop_frames`: optional slice of the NEXT GOP's raw frames. When provided,
+    /// these are written to the GPU staging buffers WHILE the GPU runs the high-frame
+    /// Rice encode (~100ms), hiding the ~22ms upload cost. The following GOP's encode
+    /// call detects the pre-upload and skips its write_buffer step.
     pub fn encode_temporal_wavelet_gop_haar(
         &mut self,
         ctx: &GpuContext,
@@ -1019,6 +1024,7 @@ impl EncoderPipeline {
         width: u32,
         height: u32,
         config: &CodecConfig,
+        next_gop_frames: Option<&[&[f32]]>,
     ) -> TemporalGroup {
         let group_size = gop_frames.len();
         assert!(
@@ -1048,15 +1054,20 @@ impl EncoderPipeline {
         // while calling &mut self methods (encode_from_gpu_wavelet_planes etc.).
         let raw_input_size = std::mem::size_of_val(gop_frames[0]) as u64;
         self.ensure_tw_cached(ctx, padded_w, padded_h, group_size, raw_input_size);
-        let tw = self.tw_cached.take().unwrap();
+        let mut tw = self.tw_cached.take().unwrap();
 
         // Per-stage wall-clock profiling (gated behind GNC_HAAR_PROFILE env var).
         let prof = std::env::var("GNC_HAAR_PROFILE").is_ok();
         let t_start = if prof { Some(std::time::Instant::now()) } else { None };
 
-        // Upload all frames to per-frame GPU buffers (avoids write_buffer race)
-        for (input_buf, frame_data) in tw.per_frame_input.iter().zip(gop_frames.iter()) {
-            ctx.queue.write_buffer(input_buf, 0, bytemuck::cast_slice(frame_data));
+        // Upload all frames to per-frame GPU buffers (avoids write_buffer race).
+        // Skip if the previous GOP pre-uploaded these frames during its high_enc phase.
+        if tw.next_gop_pre_uploaded {
+            tw.next_gop_pre_uploaded = false; // consume the pre-upload flag
+        } else {
+            for (input_buf, frame_data) in tw.per_frame_input.iter().zip(gop_frames.iter()) {
+                ctx.queue.write_buffer(input_buf, 0, bytemuck::cast_slice(frame_data));
+            }
         }
 
         let t_after_upload = if prof { Some(std::time::Instant::now()) } else { None };
@@ -1451,6 +1462,18 @@ impl EncoderPipeline {
             // Single submit + single poll for ALL high frames
             ctx.queue.submit(Some(cmd.finish()));
 
+            // Async pre-upload: write next GOP's raw frames while the GPU runs high_enc (~100ms).
+            // write_buffer is a CPU memcpy (~22ms) that completes well before the GPU finishes.
+            // The staged data is applied to the NEXT queue.submit() (next GOP's spatial_wl).
+            // Per-frame_input is safe to overwrite here: the current GOP's spatial_wl already
+            // consumed it, and no remaining GPU commands in this GOP touch per_frame_input.
+            if let Some(next_frames) = next_gop_frames {
+                for (input_buf, frame_data) in tw.per_frame_input.iter().zip(next_frames.iter()) {
+                    ctx.queue.write_buffer(input_buf, 0, bytemuck::cast_slice(*frame_data));
+                }
+                tw.next_gop_pre_uploaded = true;
+            }
+
             let all_frame_tiles = self.gpu_rice_encoder.finish_batch_readback(
                 ctx,
                 &info,
@@ -1548,6 +1571,9 @@ impl EncoderPipeline {
 
     /// Encode a single GOP using temporal wavelet (Haar or LeGall 5/3).
     /// Streaming-friendly: pass exactly `gop_size` frames, get one `TemporalGroup`.
+    ///
+    /// `next_gop_frames`: optional next GOP's frames for async pre-upload (Haar only).
+    /// When provided, they are written to GPU staging during high_enc, hiding ~22ms upload cost.
     pub fn encode_temporal_wavelet_gop(
         &mut self,
         ctx: &GpuContext,
@@ -1556,10 +1582,11 @@ impl EncoderPipeline {
         height: u32,
         config: &CodecConfig,
         mode: TemporalTransform,
+        next_gop_frames: Option<&[&[f32]]>,
     ) -> TemporalGroup {
         match mode {
             TemporalTransform::Haar => {
-                self.encode_temporal_wavelet_gop_haar(ctx, gop_frames, width, height, config)
+                self.encode_temporal_wavelet_gop_haar(ctx, gop_frames, width, height, config, next_gop_frames)
             }
             TemporalTransform::LeGall53 => {
                 assert_eq!(gop_frames.len(), 4, "LeGall53 requires exactly 4 frames per GOP");

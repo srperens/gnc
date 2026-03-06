@@ -126,6 +126,10 @@ pub(super) struct CachedTemporalWaveletBuffers {
     pub(super) max_abs_staging_bufs: Vec<wgpu::Buffer>,
     /// Shared uniform params buffer for tile_energy_reduce dispatches (32 bytes).
     pub(super) ter_params_buf: wgpu::Buffer,
+    /// True if the next GOP's raw frames have already been written to `per_frame_input`
+    /// via async pre-upload at the end of the previous GOP's encode. When set, the next
+    /// `encode_temporal_wavelet_gop_haar` call skips its write_buffer upload step (saving ~22ms).
+    pub(super) next_gop_pre_uploaded: bool,
 }
 
 impl CachedTemporalWaveletBuffers {
@@ -205,7 +209,8 @@ impl CachedTemporalWaveletBuffers {
                 ctx.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some(&format!("tw_max_abs_{}", j)),
                     size: 4,
-                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                    // COPY_DST needed for write_buffer pre-clear before each GOP
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false,
                 })
             })
@@ -242,6 +247,7 @@ impl CachedTemporalWaveletBuffers {
             max_abs_bufs,
             max_abs_staging_bufs,
             ter_params_buf,
+            next_gop_pre_uploaded: false,
         }
     }
 

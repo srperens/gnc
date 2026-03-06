@@ -1127,6 +1127,7 @@ fn main() {
                         h,
                         &warmup_cfg,
                         temporal_mode,
+                        None,
                     );
                 }
                 drop(warmup_frames);
@@ -1151,25 +1152,36 @@ fn main() {
                     None
                 };
 
+                // Lookahead buffer for async upload pipelining (Haar only).
+                // Holds next GOP's frames pre-loaded during the current GOP's encode.
+                // The encoder writes these to GPU staging during high_enc (~100ms),
+                // hiding the ~22ms write_buffer cost for the subsequent GOP.
+                let mut lookahead_frames: Option<Vec<Vec<f32>>> = None;
+
                 for gop_idx in 0..num_gops {
                     let base = gop_idx * gop_size;
-                    // Load this GOP's frames
+                    // Load this GOP's frames (or use pre-loaded lookahead from previous iteration)
                     let t_io_start = std::time::Instant::now();
-                    let mut gop_frames: Vec<Vec<f32>> = Vec::with_capacity(gop_size);
-                    if let Some(ref mut y4m) = y4m_stream {
-                        for _ in 0..gop_size {
-                            match y4m.read_frame_rgb() {
-                                Some(rgb) => gop_frames.push(rgb),
-                                None => break,
+                    let gop_frames: Vec<Vec<f32>> = if let Some(preloaded) = lookahead_frames.take() {
+                        preloaded // skip I/O; already loaded in previous iteration's lookahead
+                    } else {
+                        let mut frames = Vec::with_capacity(gop_size);
+                        if let Some(ref mut y4m) = y4m_stream {
+                            for _ in 0..gop_size {
+                                match y4m.read_frame_rgb() {
+                                    Some(rgb) => frames.push(rgb),
+                                    None => break,
+                                }
+                            }
+                        } else {
+                            for j in 0..gop_size {
+                                let path = input.replace("%04d", &format!("{:04}", base + j));
+                                let (rgb, _, _) = load_image_rgb_f32(&path);
+                                frames.push(rgb);
                             }
                         }
-                    } else {
-                        for j in 0..gop_size {
-                            let path = input.replace("%04d", &format!("{:04}", base + j));
-                            let (rgb, _, _) = load_image_rgb_f32(&path);
-                            gop_frames.push(rgb);
-                        }
-                    }
+                        frames
+                    };
                     let gop_io_ms = t_io_start.elapsed().as_secs_f64() * 1000.0;
                     total_io_ms += gop_io_ms;
 
@@ -1181,7 +1193,35 @@ fn main() {
                         break;
                     }
 
+                    // Pre-load next GOP for async upload (Haar mode only).
+                    // Reads are added to IO time but overlap with encode time via GPU pre-staging.
+                    if matches!(temporal_mode, TemporalTransform::Haar) && gop_idx + 1 < num_gops {
+                        let t_la_start = std::time::Instant::now();
+                        let next_base = (gop_idx + 1) * gop_size;
+                        let mut next_frames = Vec::with_capacity(gop_size);
+                        if let Some(ref mut y4m) = y4m_stream {
+                            for _ in 0..gop_size {
+                                match y4m.read_frame_rgb() {
+                                    Some(rgb) => next_frames.push(rgb),
+                                    None => break,
+                                }
+                            }
+                        } else {
+                            for j in 0..gop_size {
+                                let path = input.replace("%04d", &format!("{:04}", next_base + j));
+                                let (rgb, _, _) = load_image_rgb_f32(&path);
+                                next_frames.push(rgb);
+                            }
+                        }
+                        total_io_ms += t_la_start.elapsed().as_secs_f64() * 1000.0;
+                        if next_frames.len() == gop_size {
+                            lookahead_frames = Some(next_frames);
+                        }
+                    }
+
                     let gop_refs: Vec<&[f32]> = gop_frames.iter().map(|f| f.as_slice()).collect();
+                    let next_refs: Option<Vec<&[f32]>> = lookahead_frames.as_ref()
+                        .map(|v| v.iter().map(|f| f.as_slice()).collect());
 
                     let t_enc_start = std::time::Instant::now();
                     let group = encoder.encode_temporal_wavelet_gop(
@@ -1191,6 +1231,7 @@ fn main() {
                         h,
                         &config_tw,
                         temporal_mode,
+                        next_refs.as_deref(),
                     );
                     let gop_enc_ms = t_enc_start.elapsed().as_secs_f64() * 1000.0;
                     total_enc_ms += gop_enc_ms;
@@ -2838,7 +2879,7 @@ fn main() {
                             gop_frames.iter().map(|f| f.as_slice()).collect();
                         let t0 = std::time::Instant::now();
                         let group = encoder.encode_temporal_wavelet_gop(
-                            &ctx, &gop_refs, w, h, &config_tw, temporal_mode,
+                            &ctx, &gop_refs, w, h, &config_tw, temporal_mode, None,
                         );
                         enc_time += t0.elapsed();
                         let group_bytes: usize = group.low_frame.byte_size()

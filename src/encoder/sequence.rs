@@ -29,7 +29,6 @@ const B_FRAMES_PER_GROUP: usize = 2;
 /// (batched GPU quantize + Rice encode).
 struct HighFrameInfo {
     tile_muls: Vec<f32>,
-    tile_energies: Vec<f32>,
     buf_idx: usize,
     is_zero: bool,
     wm_data: Option<Vec<f32>>,
@@ -1243,14 +1242,11 @@ impl EncoderPipeline {
         }
         let total_high_frames = hframe_buf_indices.len();
 
-        // Tiles with raw mean_abs energy above this threshold are zeroed in the highpass
-        // (weight set to TILE_ZERO_MUL). These tiles are too chaotic to benefit from
-        // temporal wavelet coding; zeroing saves bits with minimal perceptual impact
-        // since the decoder falls back to LL (temporal average) for those tiles.
-        const TILE_ENERGY_ZERO_THRESH: f32 = 17.0;
-        // Quantizer weight that guarantees all highpass coefficients in a tile fall
-        // inside the dead zone (eff_threshold = qstep * dead_zone * TILE_ZERO_MUL > 255).
-        const TILE_ZERO_MUL: f32 = 1000.0;
+        // Note: hard-zeroing of high-energy tiles (TILE_ENERGY_ZERO_THRESH) was removed.
+        // The adaptive mul system (tile_energy_reduce.wgsl, MIN_MUL=1.2) already handles
+        // high-motion tiles gracefully by quantizing them coarser. Zeroing at 17.0
+        // mean_abs (6.7% of peak) is too aggressive and causes ghosting artifacts
+        // (decoder falls back to LL-only = temporal average) in affected tiles.
 
         let mul_results: Vec<(Vec<f32>, Vec<f32>, f32)> = if config.adaptive_temporal_mul {
             // GPU-side per-tile energy reduction — eliminates 58MB CPU readback.
@@ -1389,21 +1385,20 @@ impl EncoderPipeline {
                 let n = sorted.len();
                 let pct = |p: usize| sorted[(p * n / 100).min(n - 1)];
                 let all_zero = max_abs < high_cfg.dead_zone * high_cfg.quantization_step;
-                let zeroed_tiles = tile_energies.iter().filter(|&&e| e > TILE_ENERGY_ZERO_THRESH).count();
                 let mut esorted = tile_energies.clone();
                 esorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
                 let en = esorted.len();
                 let epct = |p: usize| esorted[(p * en / 100).min(en - 1)];
                 eprintln!(
-                    "  TW L{} H{}: {} tiles  mul p10={:.3} p50={:.3} p90={:.3}  eff_qstep=[{:.2}..{:.2}]  skip={}  zeroed={}  energy p50={:.1} p90={:.1} p99={:.1}",
+                    "  TW L{} H{}: {} tiles  mul p10={:.3} p50={:.3} p90={:.3}  eff_qstep=[{:.2}..{:.2}]  skip={}  energy p50={:.1} p90={:.1} p99={:.1}",
                     lvl, idx, n, pct(10), pct(50), pct(90),
                     high_cfg.quantization_step * sorted[0],
                     high_cfg.quantization_step * sorted[n - 1],
-                    all_zero, zeroed_tiles, epct(50), epct(90), epct(99),
+                    all_zero, epct(50), epct(90), epct(99),
                 );
             }
             let is_zero = max_abs < high_cfg.dead_zone * high_cfg.quantization_step;
-            hframe_infos.push(HighFrameInfo { tile_muls, tile_energies, buf_idx, is_zero, wm_data: None });
+            hframe_infos.push(HighFrameInfo { tile_muls, buf_idx, is_zero, wm_data: None });
         }
 
         // --- Pass B: Expand weight maps for non-zero frames (CPU work, no GPU sync) ---
@@ -1424,15 +1419,10 @@ impl EncoderPipeline {
             for ty_idx in 0..tiles_y as usize {
                 for tx_idx in 0..tiles_x as usize {
                     let tile_idx = ty_idx * tiles_x as usize + tx_idx;
-                    // Tiles with very high motion energy are effectively incompressible in
-                    // the temporal highpass. Zero them out (TILE_ZERO_MUL drives all
-                    // coefficients below the quantizer dead zone) so the decoder falls
-                    // back to LL-only reconstruction for those tiles.
-                    let w = if hf.tile_energies[tile_idx] > TILE_ENERGY_ZERO_THRESH {
-                        TILE_ZERO_MUL
-                    } else {
-                        hf.tile_muls[tile_idx]
-                    };
+                    // Use the adaptive mul directly. High-energy tiles already get
+                    // MIN_MUL=1.2 (minimal quantization) from tile_energy_reduce.wgsl,
+                    // which is far preferable to hard-zeroing (which causes decoder ghosting).
+                    let w = hf.tile_muls[tile_idx];
                     for by in 0..ll_by as usize {
                         for bx in 0..ll_bx as usize {
                             let global_bx = tx_idx * ll_bx as usize + bx;

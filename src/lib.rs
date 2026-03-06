@@ -1654,14 +1654,54 @@ pub mod wasm {
             if let Some(ref th) = self.temporal_header {
                 let target = (target_frame as usize).min(self.frame_count as usize - 1);
                 let gop_size = th.gop_size as usize;
-                let num_groups = th.num_groups();
                 let temporal_transform = th.temporal_transform;
                 let gop_idx = target / gop_size;
+
+                // Pre-extract index info to avoid borrow checker conflicts below.
+                // (offset, size) for scene-cut I-frame at this PTS, if any.
+                let iframe_offsets: Option<(usize, usize)> = th
+                    .index
+                    .iter()
+                    .find(|e| e.frame_role == 2 && e.pts == target as u32)
+                    .map(|e| (e.offset as usize, e.offset as usize + e.size as usize));
+                // Highest GOP index present in the index (among temporal groups).
+                let max_gop_idx: Option<usize> = th
+                    .index
+                    .iter()
+                    .filter(|e| e.frame_role != 2)
+                    .map(|e| e.gop_index as usize)
+                    .max();
 
                 self.buffered_textures.clear();
                 self.buffered_frames.clear();
 
-                if gop_idx < num_groups {
+                if let Some((start, end)) = iframe_offsets {
+                    // Scene-cut I-frame: decode inline to avoid async reentrancy.
+                    let t_dec = Self::now_ms();
+                    let frame = crate::format::deserialize_compressed(&self.data[start..end]);
+                    self.decoder.decode_to_texture(&self.ctx, &frame);
+                    let view = self.decoder.output_texture_view().unwrap();
+                    blit_to_surface(
+                        &self.ctx.device,
+                        &self.ctx.queue,
+                        self.surface.as_ref().unwrap(),
+                        self.blit_pipeline.as_ref().unwrap(),
+                        self.blit_bgl.as_ref().unwrap(),
+                        self.blit_sampler.as_ref().unwrap(),
+                        &view,
+                    )?;
+                    self.last_seek_ms = 0.0;
+                    self.last_decode_ms = Self::now_ms() - t_dec;
+                    self.current_frame = target + 1;
+                    return Ok(());
+                }
+
+                // Check whether this GOP index exists in the temporal groups.
+                // Use max_gop_idx rather than num_groups to handle gaps from scene cuts:
+                // some gop_idx values may be missing because their frames were stored as
+                // scene-cut I-frames rather than temporal GOPs.
+                let in_temporal = max_gop_idx.is_some_and(|m| gop_idx <= m);
+                if in_temporal {
                     let gop_base = gop_idx * gop_size;
                     // Phase 1: decode GOP wavelet bufs
                     let t_seek = Self::now_ms();
@@ -1705,10 +1745,34 @@ pub mod wasm {
                     )?;
                     self.last_decode_ms = Self::now_ms() - t_dec;
                 } else {
-                    // Tail I-frame — just decode directly
-                    self.current_frame = target;
-                    self.decode_and_present()?;
-                    return Ok(());
+                    // Tail I-frame (end-of-file, not scene cut): decode inline.
+                    let tail_entries: Vec<_> = {
+                        let th = self.temporal_header.as_ref().unwrap();
+                        th.index
+                            .iter()
+                            .filter(|e| e.frame_role == 2)
+                            .map(|e| (e.offset as usize, e.offset as usize + e.size as usize))
+                            .collect()
+                    };
+                    let num_groups = self.temporal_header.as_ref().unwrap().num_groups();
+                    let tail_idx = target.saturating_sub(num_groups * gop_size);
+                    let t_dec = Self::now_ms();
+                    if let Some((start, end)) = tail_entries.get(tail_idx).copied() {
+                        let frame = crate::format::deserialize_compressed(&self.data[start..end]);
+                        self.decoder.decode_to_texture(&self.ctx, &frame);
+                        let view = self.decoder.output_texture_view().unwrap();
+                        blit_to_surface(
+                            &self.ctx.device,
+                            &self.ctx.queue,
+                            self.surface.as_ref().unwrap(),
+                            self.blit_pipeline.as_ref().unwrap(),
+                            self.blit_bgl.as_ref().unwrap(),
+                            self.blit_sampler.as_ref().unwrap(),
+                            &view,
+                        )?;
+                    }
+                    self.last_seek_ms = 0.0;
+                    self.last_decode_ms = Self::now_ms() - t_dec;
                 }
                 self.current_frame = target + 1;
                 return Ok(());

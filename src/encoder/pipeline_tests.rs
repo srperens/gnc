@@ -511,6 +511,8 @@ fn test_block_dct_roundtrip() {
     config.use_fused_quantize_histogram = false;
     config.quantization_step = 2.0;
     config.dead_zone = 0.0;
+    // DCT path uses Rice: GPU rANS encoder requires wavelet levels > 0
+    config.entropy_coder = crate::EntropyCoder::Rice;
 
     let compressed = enc.encode(&ctx, &rgb, w, h, &config);
     eprintln!(
@@ -581,6 +583,8 @@ fn test_block_dct_multitile() {
     config.use_fused_quantize_histogram = false;
     config.quantization_step = 2.0;
     config.dead_zone = 0.0;
+    // DCT path uses Rice: GPU rANS encoder requires wavelet levels > 0
+    config.entropy_coder = crate::EntropyCoder::Rice;
 
     let compressed = enc.encode(&ctx, &rgb, w, h, &config);
     let decoded = dec.decode(&ctx, &compressed);
@@ -627,6 +631,8 @@ fn test_block_dct_nonaligned() {
     config.use_fused_quantize_histogram = false;
     config.quantization_step = 2.0;
     config.dead_zone = 0.0;
+    // DCT path uses Rice: GPU rANS encoder requires wavelet levels > 0
+    config.entropy_coder = crate::EntropyCoder::Rice;
 
     let compressed = enc.encode(&ctx, &rgb, w, h, &config);
     eprintln!(
@@ -682,6 +688,8 @@ fn test_block_dct_quality_preset() {
         config.cfl_enabled = false;
         config.adaptive_quantization = false;
         config.use_fused_quantize_histogram = false;
+        // DCT path uses Rice: GPU rANS encoder requires wavelet levels > 0
+        config.entropy_coder = crate::EntropyCoder::Rice;
 
         let compressed = enc.encode(&ctx, &rgb, w, h, &config);
         let decoded = dec.decode(&ctx, &compressed);
@@ -739,6 +747,8 @@ fn test_block_dct_noisy_content() {
     config.cfl_enabled = false;
     config.adaptive_quantization = false;
     config.use_fused_quantize_histogram = false;
+    // DCT path uses Rice: GPU rANS encoder requires wavelet levels > 0
+    config.entropy_coder = crate::EntropyCoder::Rice;
 
     let compressed = enc.encode(&ctx, &rgb, w, h, &config);
     let decoded = dec.decode(&ctx, &compressed);
@@ -754,6 +764,8 @@ fn test_block_dct_noisy_content() {
     config99.cfl_enabled = false;
     config99.adaptive_quantization = false;
     config99.use_fused_quantize_histogram = false;
+    // DCT path uses Rice: GPU rANS encoder requires wavelet levels > 0
+    config99.entropy_coder = crate::EntropyCoder::Rice;
 
     let compressed99 = enc.encode(&ctx, &rgb, w, h, &config99);
     let decoded99 = dec.decode(&ctx, &compressed99);
@@ -1112,6 +1124,8 @@ fn test_block_dct_color_debug() {
     config.cfl_enabled = false;
     config.adaptive_quantization = false;
     config.use_fused_quantize_histogram = false;
+    // DCT path uses Rice: GPU rANS encoder requires wavelet levels > 0
+    config.entropy_coder = crate::EntropyCoder::Rice;
 
     // --- DCT path ---
     config.transform_type = TransformType::BlockDCT8;

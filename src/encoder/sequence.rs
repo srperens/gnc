@@ -1676,7 +1676,7 @@ impl EncoderPipeline {
         // If we pre-computed next GOP's spatial+haar into tw_b, promote tw_b → tw_cached
         // (ready for next call) and recycle tw (done) → tw_cached_b (for next pre-compute).
         // If no pre-compute happened (last GOP or no next_gop_frames), keep tw as tw_cached.
-        if self.tw_cached_b.as_ref().map_or(false, |b| b.spatial_haar_precomputed) {
+        if self.tw_cached_b.as_ref().is_some_and(|b| b.spatial_haar_precomputed) {
             let tw_b = self.tw_cached_b.take().unwrap();
             self.tw_cached_b = Some(tw);      // recycle current A → becomes next B slot
             self.tw_cached = Some(tw_b);       // pre-computed B → becomes next A (current)

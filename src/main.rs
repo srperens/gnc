@@ -228,15 +228,19 @@ enum Command {
         #[arg(long)]
         no_cfl: bool,
 
-        /// Use bitplane entropy coder instead of Rice (default)
+        /// Use bitplane entropy coder instead of rANS (default)
         #[arg(long)]
         bitplane: bool,
 
-        /// Use rANS entropy coder instead of Rice (default)
+        /// Use rANS entropy coder (default; this flag is now a no-op kept for backward compat)
         #[arg(long)]
         rans: bool,
 
-        /// Use canonical Huffman entropy coder instead of Rice (default)
+        /// Use Rice+ZRL entropy coder instead of rANS (default) — faster but ~30% worse compression
+        #[arg(long)]
+        rice: bool,
+
+        /// Use canonical Huffman entropy coder instead of rANS (default)
         #[arg(long)]
         huffman: bool,
 
@@ -282,15 +286,19 @@ enum Command {
         #[arg(short = 'q', long, default_value = "75")]
         quality: u32,
 
-        /// Use bitplane entropy coder instead of Rice (default)
+        /// Use bitplane entropy coder instead of rANS (default)
         #[arg(long)]
         bitplane: bool,
 
-        /// Use rANS entropy coder instead of Rice (default)
+        /// Use rANS entropy coder (default; this flag is now a no-op kept for backward compat)
         #[arg(long)]
         rans: bool,
 
-        /// Use canonical Huffman entropy coder instead of Rice (default)
+        /// Use Rice+ZRL entropy coder instead of rANS (default) — faster but ~30% worse compression
+        #[arg(long)]
+        rice: bool,
+
+        /// Use canonical Huffman entropy coder instead of rANS (default)
         #[arg(long)]
         huffman: bool,
 
@@ -349,9 +357,13 @@ enum Command {
         #[arg(long, default_value = "30")]
         fps: f64,
 
-        /// Use rANS entropy coder instead of Rice (default)
+        /// Use rANS entropy coder (default; this flag is now a no-op kept for backward compat)
         #[arg(long)]
         rans: bool,
+
+        /// Use Rice+ZRL entropy coder instead of rANS (default) — faster but ~30% worse compression
+        #[arg(long)]
+        rice: bool,
 
         /// Enable per-frame encode diagnostics (also via GNC_DIAGNOSTICS=1)
         #[arg(long)]
@@ -418,9 +430,13 @@ enum Command {
         #[arg(long, default_value = "vbr")]
         rate_mode: String,
 
-        /// Use rANS entropy coder instead of Rice (default)
+        /// Use rANS entropy coder (default; this flag is now a no-op kept for backward compat)
         #[arg(long)]
         rans: bool,
+
+        /// Use Rice+ZRL entropy coder instead of rANS (default) — faster but ~30% worse compression
+        #[arg(long)]
+        rice: bool,
 
         /// Enable per-frame encode diagnostics (also via GNC_DIAGNOSTICS=1)
         #[arg(long)]
@@ -669,6 +685,7 @@ fn main() {
             no_cfl,
             bitplane,
             rans,
+            rice,
             huffman,
             wavelet,
             no_per_subband,
@@ -710,6 +727,9 @@ fn main() {
             }
             if rans {
                 config.entropy_coder = gnc::EntropyCoder::Rans;
+            }
+            if rice {
+                config.entropy_coder = gnc::EntropyCoder::Rice;
             }
             if huffman {
                 config.entropy_coder = gnc::EntropyCoder::Huffman;
@@ -766,6 +786,7 @@ fn main() {
             quality,
             bitplane,
             rans,
+            rice,
             huffman,
             cpu_encode,
             dct,
@@ -783,6 +804,9 @@ fn main() {
             }
             if rans {
                 config.entropy_coder = gnc::EntropyCoder::Rans;
+            }
+            if rice {
+                config.entropy_coder = gnc::EntropyCoder::Rice;
             }
             if huffman {
                 config.entropy_coder = gnc::EntropyCoder::Huffman;
@@ -991,6 +1015,7 @@ fn main() {
             rate_mode,
             fps,
             rans,
+            rice,
             diagnostics,
             temporal_wavelet,
             tw_highpass_mul,
@@ -1090,6 +1115,9 @@ fn main() {
                 }
                 if rans {
                     config_tw.entropy_coder = gnc::EntropyCoder::Rans;
+                }
+                if rice {
+                    config_tw.entropy_coder = gnc::EntropyCoder::Rice;
                 }
                 println!(
                     "\n=== Temporal wavelet ({:?}, streaming, {}) ===",
@@ -1547,6 +1575,9 @@ fn main() {
             if rans {
                 config_ip.entropy_coder = gnc::EntropyCoder::Rans;
             }
+            if rice {
+                config_ip.entropy_coder = gnc::EntropyCoder::Rice;
+            }
 
             // Apply rate control settings
             if let Some(ref br) = bitrate {
@@ -1753,6 +1784,9 @@ fn main() {
                 }
                 if rans {
                     config_tw.entropy_coder = gnc::EntropyCoder::Rans;
+                }
+                if rice {
+                    config_tw.entropy_coder = gnc::EntropyCoder::Rice;
                 }
                 println!(
                     "Temporal config: qstep {:.3}, dead_zone {:.3}, entropy {:?}, adaptive_mul {}",
@@ -2247,6 +2281,7 @@ fn main() {
             bitrate,
             rate_mode,
             rans,
+            rice,
             diagnostics,
             temporal_wavelet,
         } => {
@@ -2317,6 +2352,9 @@ fn main() {
             config.keyframe_interval = keyframe_interval;
             if rans {
                 config.entropy_coder = gnc::EntropyCoder::Rans;
+            }
+            if rice {
+                config.entropy_coder = gnc::EntropyCoder::Rice;
             }
 
             // Apply rate control settings

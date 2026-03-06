@@ -220,7 +220,7 @@ pub struct CodecConfig {
     pub wavelet_levels: u32,
     pub subband_weights: SubbandWeights,
     pub cfl_enabled: bool,
-    /// Which entropy coder to use (default: Rans for backward compatibility)
+    /// Which entropy coder to use (default: Rans — best compression; Rice is faster but ~30% worse)
     pub entropy_coder: EntropyCoder,
     /// Which wavelet transform to use (default: LeGall53 for backward compatibility)
     pub wavelet_type: WaveletType,
@@ -300,7 +300,7 @@ impl Default for CodecConfig {
             wavelet_levels: 3,
             subband_weights: SubbandWeights::uniform(3),
             cfl_enabled: false,
-            entropy_coder: EntropyCoder::Rice,
+            entropy_coder: EntropyCoder::Rans,
             wavelet_type: WaveletType::LeGall53,
             adaptive_quantization: false,
             aq_strength: 0.0,
@@ -481,12 +481,9 @@ pub fn quality_preset(q: u32) -> CodecConfig {
         } else {
             WaveletType::CDF97
         },
-        // Rice is default (patent-free, fast). rANS only for q=100 lossless (bit-exact roundtrip).
-        entropy_coder: if q == 100 {
-            EntropyCoder::Rans
-        } else {
-            EntropyCoder::Rice
-        },
+        // rANS is default: ~30% better compression than Rice across all lossy quality levels.
+        // Rice remains available via --rice flag for lower-latency use cases.
+        entropy_coder: EntropyCoder::Rans,
         per_subband_entropy: disc.per_subband,
         adaptive_quantization: aq_enabled,
         aq_strength,
@@ -820,15 +817,10 @@ pub mod wasm {
     }
 
     /// Pre-allocated GPU buffers for one GOP's temporal wavelet decode.
+    #[derive(Default)]
     struct TwBufSet {
         frame_bufs: Vec<[wgpu::Buffer; 3]>,
         snapshot_bufs: Vec<wgpu::Buffer>,
-    }
-
-    impl Default for TwBufSet {
-        fn default() -> Self {
-            Self { frame_bufs: Vec::new(), snapshot_bufs: Vec::new() }
-        }
     }
 
     #[wasm_bindgen]
@@ -1453,7 +1445,7 @@ pub mod wasm {
                             );
                             let padded_w = group.low_frame.info.padded_width();
                             let padded_h = group.low_frame.info.padded_height();
-                            let gop_info = group.low_frame.info.clone();
+                            let gop_info = group.low_frame.info;
                             let gop_config = group.low_frame.config.clone();
                             self.ensure_tw_bufs(padded_w, padded_h, gop_size);
                             self.tw_gop_info = Some(gop_info);
@@ -1709,7 +1701,7 @@ pub mod wasm {
                     let group = crate::format::deserialize_temporal_group(
                         &self.data, th, gop_idx,
                     );
-                    self.tw_gop_info = Some(group.low_frame.info.clone());
+                    self.tw_gop_info = Some(group.low_frame.info);
                     self.tw_gop_config = Some(group.low_frame.config.clone());
                     let padded_w = group.low_frame.info.padded_width();
                     let padded_h = group.low_frame.info.padded_height();
@@ -1884,7 +1876,7 @@ pub mod wasm {
             let group = crate::format::deserialize_temporal_group(
                 &self.data, th, gop_idx,
             );
-            self.tw_gop_info = Some(group.low_frame.info.clone());
+            self.tw_gop_info = Some(group.low_frame.info);
             self.tw_gop_config = Some(group.low_frame.config.clone());
             let prefetch_set = 1 - self.tw_active;
             let set = &self.tw_buf_sets[prefetch_set];

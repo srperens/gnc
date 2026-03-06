@@ -100,6 +100,99 @@ pub(super) struct CachedEncodeBuffers {
     pub(super) bidir_modes_staging: wgpu::Buffer,
 }
 
+/// Cached GPU buffers for temporal wavelet GOP encoding.
+/// Reused across GOPs to avoid per-GOP allocation overhead (~22ms saved).
+pub(super) struct CachedTemporalWaveletBuffers {
+    /// Padded dimensions these buffers were allocated for.
+    pub(super) padded_w: u32,
+    pub(super) padded_h: u32,
+    /// Number of frames in the group (must be power of two).
+    pub(super) group_size: usize,
+    /// Raw input size (unpadded, 3-channel f32).
+    pub(super) raw_input_size: u64,
+    /// Per-frame wavelet coefficient buffers: [frame][plane Y/Co/Cg].
+    pub(super) frame_bufs: Vec<[wgpu::Buffer; 3]>,
+    /// Snapshot buffers for multilevel Haar aliasing avoidance.
+    pub(super) snapshot: Vec<wgpu::Buffer>,
+    /// Per-frame raw input staging buffers.
+    pub(super) per_frame_input: Vec<wgpu::Buffer>,
+}
+
+impl CachedTemporalWaveletBuffers {
+    pub(super) fn new(
+        ctx: &GpuContext,
+        padded_w: u32,
+        padded_h: u32,
+        group_size: usize,
+        raw_input_size: u64,
+    ) -> Self {
+        let padded_pixels = (padded_w * padded_h) as usize;
+        let plane_size = (padded_pixels * std::mem::size_of::<f32>()) as u64;
+        let storage_usage = wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC;
+
+        let frame_bufs: Vec<[wgpu::Buffer; 3]> = (0..group_size)
+            .map(|j| {
+                std::array::from_fn(|p| {
+                    ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some(&format!("tw_frame_{}_{}", j, p)),
+                        size: plane_size,
+                        usage: storage_usage,
+                        mapped_at_creation: false,
+                    })
+                })
+            })
+            .collect();
+
+        let snapshot: Vec<wgpu::Buffer> = (0..group_size)
+            .map(|s| {
+                ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(&format!("tw_snap_{}", s)),
+                    size: plane_size,
+                    usage: storage_usage,
+                    mapped_at_creation: false,
+                })
+            })
+            .collect();
+
+        let per_frame_input: Vec<wgpu::Buffer> = (0..group_size)
+            .map(|j| {
+                ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(&format!("tw_raw_input_{}", j)),
+                    size: raw_input_size,
+                    usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                })
+            })
+            .collect();
+
+        Self {
+            padded_w,
+            padded_h,
+            group_size,
+            raw_input_size,
+            frame_bufs,
+            snapshot,
+            per_frame_input,
+        }
+    }
+
+    /// Check if these cached buffers are compatible with the given parameters.
+    pub(super) fn is_compatible(
+        &self,
+        padded_w: u32,
+        padded_h: u32,
+        group_size: usize,
+        raw_input_size: u64,
+    ) -> bool {
+        self.padded_w == padded_w
+            && self.padded_h == padded_h
+            && self.group_size == group_size
+            && self.raw_input_size == raw_input_size
+    }
+}
+
 impl CachedEncodeBuffers {
     /// Allocate all buffers for the given padded resolution.
     pub(super) fn new(

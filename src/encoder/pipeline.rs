@@ -2,7 +2,7 @@ use wgpu;
 
 use super::adaptive::{self, VarianceAnalyzer, WeightMapNormalizer, AQ_LL_BLOCK_SIZE};
 use super::bitplane;
-use super::buffer_cache::CachedEncodeBuffers;
+use super::buffer_cache::{CachedEncodeBuffers, CachedTemporalWaveletBuffers};
 use super::cfl::{self, CflAlphaComputer, CflForwardPredictor, CflPredictor};
 use super::color::ColorConverter;
 use super::entropy_helpers;
@@ -53,6 +53,7 @@ pub struct EncoderPipeline {
     pad_pipeline: wgpu::ComputePipeline,
     pad_bgl: wgpu::BindGroupLayout,
     pub(super) cached: Option<CachedEncodeBuffers>,
+    pub(super) tw_cached: Option<CachedTemporalWaveletBuffers>,
 }
 
 impl EncoderPipeline {
@@ -141,6 +142,27 @@ impl EncoderPipeline {
             pad_pipeline,
             pad_bgl,
             cached: None,
+            tw_cached: None,
+        }
+    }
+
+    /// Ensure temporal wavelet buffers are cached and compatible.
+    pub(super) fn ensure_tw_cached(
+        &mut self,
+        ctx: &GpuContext,
+        padded_w: u32,
+        padded_h: u32,
+        group_size: usize,
+        raw_input_size: u64,
+    ) {
+        let needs_alloc = match &self.tw_cached {
+            Some(c) => !c.is_compatible(padded_w, padded_h, group_size, raw_input_size),
+            None => true,
+        };
+        if needs_alloc {
+            self.tw_cached = Some(CachedTemporalWaveletBuffers::new(
+                ctx, padded_w, padded_h, group_size, raw_input_size,
+            ));
         }
     }
 

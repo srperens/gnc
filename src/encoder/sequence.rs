@@ -1016,53 +1016,19 @@ impl EncoderPipeline {
         let plane_size = (padded_pixels * std::mem::size_of::<f32>()) as u64;
         self.ensure_cached(ctx, padded_w, padded_h, width, height);
 
-        // Allocate per-frame GPU buffers for wavelet coefficients: [frame][plane]
-        let tw_frame_bufs: Vec<[wgpu::Buffer; 3]> = (0..group_size)
-            .map(|j| {
-                std::array::from_fn(|p| {
-                    ctx.device.create_buffer(&wgpu::BufferDescriptor {
-                        label: Some(&format!("tw_frame_{}_{}", j, p)),
-                        size: plane_size,
-                        usage: wgpu::BufferUsages::STORAGE
-                            | wgpu::BufferUsages::COPY_DST
-                            | wgpu::BufferUsages::COPY_SRC,
-                        mapped_at_creation: false,
-                    })
-                })
-            })
-            .collect();
-        // Snapshot buffers to avoid read-after-write aliasing in multilevel Haar.
-        let tw_snapshot: Vec<wgpu::Buffer> = (0..group_size)
-            .map(|s| {
-                ctx.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some(&format!("tw_snap_{}", s)),
-                    size: plane_size,
-                    usage: wgpu::BufferUsages::STORAGE
-                        | wgpu::BufferUsages::COPY_DST
-                        | wgpu::BufferUsages::COPY_SRC,
-                    mapped_at_creation: false,
-                })
-            })
-            .collect();
-
-        // 1) Upload all frames to per-frame GPU buffers (avoids write_buffer race)
+        // Reuse cached temporal wavelet buffers across GOPs (avoids ~22ms per-GOP allocation).
+        // We take() the cache out of self to avoid holding an immutable borrow on self
+        // while calling &mut self methods (encode_from_gpu_wavelet_planes etc.).
         let raw_input_size = std::mem::size_of_val(gop_frames[0]) as u64;
-        let per_frame_input: Vec<wgpu::Buffer> = (0..group_size)
-            .map(|j| {
-                let buf = ctx
-                    .device
-                    .create_buffer(&wgpu::BufferDescriptor {
-                        label: Some(&format!("tw_raw_input_{}", j)),
-                        size: raw_input_size,
-                        usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
-                        mapped_at_creation: false,
-                    });
-                ctx.queue.write_buffer(&buf, 0, bytemuck::cast_slice(gop_frames[j]));
-                buf
-            })
-            .collect();
+        self.ensure_tw_cached(ctx, padded_w, padded_h, group_size, raw_input_size);
+        let tw = self.tw_cached.take().unwrap();
 
-        // Spatial wavelet per frame — single command encoder to prevent
+        // Upload all frames to per-frame GPU buffers (avoids write_buffer race)
+        for (input_buf, frame_data) in tw.per_frame_input.iter().zip(gop_frames.iter()) {
+            ctx.queue.write_buffer(input_buf, 0, bytemuck::cast_slice(frame_data));
+        }
+
+                // Spatial wavelet per frame — single command encoder to prevent
         // intermediate buffer races (separate submits can overlap on GPU)
         {
             let bufs = self.cached.as_ref().unwrap();
@@ -1073,7 +1039,7 @@ impl EncoderPipeline {
                 });
             for j in 0..group_size {
                 cmd.copy_buffer_to_buffer(
-                    &per_frame_input[j],
+                    &tw.per_frame_input[j],
                     0,
                     &bufs.raw_input_buf,
                     0,
@@ -1117,7 +1083,7 @@ impl EncoderPipeline {
                     cmd.copy_buffer_to_buffer(
                         &bufs.plane_c,
                         0,
-                        &tw_frame_bufs[j][p],
+                        &tw.frame_bufs[j][p],
                         0,
                         plane_size,
                     );
@@ -1140,17 +1106,17 @@ impl EncoderPipeline {
                 let pairs = current_count / 2;
                 for j in 0..current_count {
                     cmd.copy_buffer_to_buffer(
-                        &tw_frame_bufs[j][p], 0, &tw_snapshot[j], 0, plane_size,
+                        &tw.frame_bufs[j][p], 0, &tw.snapshot[j], 0, plane_size,
                     );
                 }
                 for pair in 0..pairs {
                     self.temporal_haar.dispatch(
                         ctx,
                         &mut cmd,
-                        &tw_snapshot[pair * 2],
-                        &tw_snapshot[pair * 2 + 1],
-                        &tw_frame_bufs[pair][p],
-                        &tw_frame_bufs[pairs + pair][p],
+                        &tw.snapshot[pair * 2],
+                        &tw.snapshot[pair * 2 + 1],
+                        &tw.frame_bufs[pair][p],
+                        &tw.frame_bufs[pairs + pair][p],
                         padded_pixels as u32,
                         true,
                     );
@@ -1164,9 +1130,9 @@ impl EncoderPipeline {
         let low_cf = self.encode_from_gpu_wavelet_planes(
             ctx,
             [
-                &tw_frame_bufs[0][0],
-                &tw_frame_bufs[0][1],
-                &tw_frame_bufs[0][2],
+                &tw.frame_bufs[0][0],
+                &tw.frame_bufs[0][1],
+                &tw.frame_bufs[0][2],
             ],
             &cfg,
             &info,
@@ -1188,7 +1154,7 @@ impl EncoderPipeline {
                 let tile_muls = if config.adaptive_temporal_mul {
                     Self::compute_temporal_tile_muls(
                         ctx,
-                        &tw_frame_bufs[buf_idx][0],
+                        &tw.frame_bufs[buf_idx][0],
                         padded_w,
                         padded_h,
                         cfg.tile_size,
@@ -1215,9 +1181,9 @@ impl EncoderPipeline {
                 let cf = self.encode_from_gpu_wavelet_planes_weighted(
                     ctx,
                     [
-                        &tw_frame_bufs[buf_idx][0],
-                        &tw_frame_bufs[buf_idx][1],
-                        &tw_frame_bufs[buf_idx][2],
+                        &tw.frame_bufs[buf_idx][0],
+                        &tw.frame_bufs[buf_idx][1],
+                        &tw.frame_bufs[buf_idx][2],
                     ],
                     &high_cfg,
                     &info,
@@ -1230,6 +1196,9 @@ impl EncoderPipeline {
             }
             high_cfs.push(lvl_frames);
         }
+
+        // Return cached buffers to self for reuse in next GOP
+        self.tw_cached = Some(tw);
 
         TemporalGroup {
             low_frame: low_cf,
@@ -3110,6 +3079,8 @@ impl EncoderPipeline {
     ) -> CompressedFrame {
         use crate::CflAlphas;
         use wgpu::util::DeviceExt;
+        let tw_profile = std::env::var("GNC_TW_PROFILE").is_ok();
+        let _prof_t0 = std::time::Instant::now();
         let plane_size = (padded_pixels * std::mem::size_of::<f32>()) as u64;
         let weights_luma = config.subband_weights.pack_weights();
         let weights_chroma = config.subband_weights.pack_weights_chroma();
@@ -3197,6 +3168,8 @@ impl EncoderPipeline {
         } else {
             None
         };
+
+        let _prof_t_setup = std::time::Instant::now();
 
         // CfL alpha staging buffers (for readback)
         let alpha_count = (tiles_x * tiles_y * nsb) as usize;
@@ -3298,7 +3271,91 @@ impl EncoderPipeline {
             }
         }
 
-        // GPU Rice encode — dispatched into the same command encoder
+        let _prof_t_quant_recorded = std::time::Instant::now();
+
+        // --- Profiling path (GNC_TW_PROFILE): separate submits to isolate GPU stages ---
+        if tw_profile {
+            ctx.queue.submit(Some(cmd.finish()));
+            ctx.device.poll(wgpu::Maintain::Wait);
+            let _prof_t_quant_gpu = std::time::Instant::now();
+
+            let mut cmd2 = ctx
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("tw_prof_rice"),
+                });
+            self.gpu_rice_encoder.dispatch_3planes_to_cmd(
+                ctx, &mut cmd2, quant_dests, info, config.wavelet_levels,
+            );
+            let _prof_t_rice_recorded = std::time::Instant::now();
+            ctx.queue.submit(Some(cmd2.finish()));
+            ctx.device.poll(wgpu::Maintain::Wait);
+            let _prof_t_rice_gpu = std::time::Instant::now();
+
+            let rice_tiles = self.gpu_rice_encoder.finish_3planes_readback(
+                ctx, info, config.wavelet_levels,
+            );
+            let _prof_t_rice_readback = std::time::Instant::now();
+
+            let cfl_alphas = if config.cfl_enabled {
+                let mut cfl_alphas_all: Vec<i16> = Vec::new();
+                let (tx, rx) = std::sync::mpsc::channel();
+                for stg in &alpha_staging {
+                    let tx = tx.clone();
+                    stg.slice(..).map_async(wgpu::MapMode::Read, move |result| {
+                        tx.send(result).unwrap();
+                    });
+                }
+                drop(tx);
+                ctx.device.poll(wgpu::Maintain::Wait);
+                for _ in 0..2 {
+                    rx.recv().unwrap().unwrap();
+                }
+                for stg in &alpha_staging {
+                    let view = stg.slice(..).get_mapped_range();
+                    let raw_alphas: &[i32] = bytemuck::cast_slice(&view);
+                    let q_alphas: Vec<i16> = raw_alphas.iter().map(|&a| a as i16).collect();
+                    cfl_alphas_all.extend_from_slice(&q_alphas);
+                    drop(view);
+                    stg.unmap();
+                }
+                Some(CflAlphas {
+                    alphas: cfl_alphas_all,
+                    num_subbands: nsb,
+                })
+            } else {
+                None
+            };
+            let _prof_t_cfl_readback = std::time::Instant::now();
+
+            eprintln!(
+                "  [TW_PROFILE] setup={:.2}ms quant_record={:.2}ms quant_gpu={:.2}ms rice_record={:.2}ms rice_gpu={:.2}ms rice_readback={:.2}ms cfl_readback={:.2}ms TOTAL={:.2}ms",
+                (_prof_t_setup - _prof_t0).as_secs_f64() * 1000.0,
+                (_prof_t_quant_recorded - _prof_t_setup).as_secs_f64() * 1000.0,
+                (_prof_t_quant_gpu - _prof_t_quant_recorded).as_secs_f64() * 1000.0,
+                (_prof_t_rice_recorded - _prof_t_quant_gpu).as_secs_f64() * 1000.0,
+                (_prof_t_rice_gpu - _prof_t_rice_recorded).as_secs_f64() * 1000.0,
+                (_prof_t_rice_readback - _prof_t_rice_gpu).as_secs_f64() * 1000.0,
+                (_prof_t_cfl_readback - _prof_t_rice_readback).as_secs_f64() * 1000.0,
+                (_prof_t_cfl_readback - _prof_t0).as_secs_f64() * 1000.0,
+            );
+
+            return CompressedFrame {
+                info: *info,
+                config: config.clone(),
+                entropy: EntropyData::Rice(rice_tiles),
+                cfl_alphas,
+                weight_map: wm_data,
+                frame_type: FrameType::Intra,
+                motion_field: None,
+                intra_modes: None,
+                residual_stats: None,
+                residual_stats_co: None,
+                residual_stats_cg: None,
+            };
+        }
+
+        // --- Normal (non-profiling) path: single submit ---
         self.gpu_rice_encoder.dispatch_3planes_to_cmd(
             ctx,
             &mut cmd,
@@ -3309,14 +3366,12 @@ impl EncoderPipeline {
 
         ctx.queue.submit(Some(cmd.finish()));
 
-        // Readback compressed Rice tiles (small — KB not MB)
         let rice_tiles = self.gpu_rice_encoder.finish_3planes_readback(
             ctx,
             info,
             config.wavelet_levels,
         );
 
-        // Readback CfL alphas
         let cfl_alphas = if config.cfl_enabled {
             let mut cfl_alphas_all: Vec<i16> = Vec::new();
             let (tx, rx) = std::sync::mpsc::channel();

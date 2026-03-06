@@ -29,10 +29,10 @@ See [BASELINE.md](BASELINE.md) for current benchmark numbers.
 - **Success criteria:** >= 40 fps pure encode on crowd_run 1080p q=75 (stretch: 60 fps)
 
 ### 4. Tile size experiment
-- **Status:** todo (4a done, unblocked)
-- **Problem:** M1 GPU underutilized at 40 tiles/plane with 256x256 tiles; 128x128 gives 4× more workgroups
-- **Hypothesis:** 128×128 tiles reduce GPU idle time in light temporal kernels, saving 15-30% per-GOP encode time. Counter-hypothesis: 4× more dispatch calls add CPU overhead, making it neutral.
-- **Success criteria:** ≥15% reduction in pure encode time/GOP, no bpp/PSNR change. Failure: <5% change.
+- **Status:** done (2026-03-06) — hypothesis invalidated by architecture constraint
+- **Result:** 128×128 tiles FAIL at runtime. GPU buffer binding limit: Rice encoder allocates `num_tiles × 256 streams × 4096 B` upfront. At 1080p: 135 tiles × 256 × 4096 = 134MB > WebGPU 128MB max_storage_buffer_binding_size. Not viable without Rice buffer refactor.
+- **Learning:** Minimum viable tile size at 1080p with current Rice architecture is ~160×160 (84 tiles, ~88MB). Power-of-2 constraint and wavelet level requirements may prevent non-256 sizes anyway.
+- **Next:** See #4b if smaller tiles are still desired after re-evaluating the Rice buffer strategy.
 
 ### 4a. Fix benchmark input: PNG → Y4M/YUV (prerequisite for #4)
 - **Status:** done (2026-03-06)

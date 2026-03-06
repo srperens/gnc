@@ -20,6 +20,178 @@ use gnc::{
     CodecConfig, CompressedFrame, EntropyData, FrameType, GpuContext, RateMode, TemporalTransform,
 };
 
+// ---------------------------------------------------------------------------
+// Minimal Y4M parser — no external dependency, streaming frame-by-frame.
+//
+// Y4M spec (YUV4MPEG2):
+//   Header:  "YUV4MPEG2 W<w> H<h> F<fps_n>:<fps_d> Ip A0:0 C<chroma>\n"
+//   Frame:   "FRAME\n" followed by raw planar YUV data
+//
+// Supported chroma formats: 420 (default), 444.
+// Pixel values are in the range 0-255 (8-bit).
+// BT.601 limited-range (studio-swing) Y 16-235, Cb/Cr 16-240 is the Xiph
+// convention for 8-bit Y4M sequences.  We convert to full-range RGB f32
+// (0.0-255.0 interleaved) as expected by EncoderPipeline::encode*.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Y4mChroma {
+    C420,
+    C444,
+}
+
+struct Y4mReader {
+    reader: std::io::BufReader<std::fs::File>,
+    pub width: u32,
+    pub height: u32,
+    /// Frames-per-second numerator / denominator from the header.
+    pub fps_num: u32,
+    pub fps_den: u32,
+    chroma: Y4mChroma,
+}
+
+impl Y4mReader {
+    fn open(path: &str) -> Self {
+        use std::io::BufRead;
+        let file = std::fs::File::open(path)
+            .unwrap_or_else(|e| panic!("Failed to open Y4M file '{}': {}", path, e));
+        let mut reader = std::io::BufReader::new(file);
+
+        // Read header line (terminated by '\n')
+        let mut header = String::new();
+        reader
+            .read_line(&mut header)
+            .expect("Failed to read Y4M header");
+        let header = header.trim_end_matches('\n').trim_end_matches('\r');
+        if !header.starts_with("YUV4MPEG2") {
+            panic!("Not a Y4M file (missing YUV4MPEG2 magic): {}", path);
+        }
+
+        let mut width = 0u32;
+        let mut height = 0u32;
+        let mut fps_num = 30u32;
+        let mut fps_den = 1u32;
+        let mut chroma = Y4mChroma::C420;
+
+        for token in header.split_ascii_whitespace().skip(1) {
+            match token.chars().next() {
+                Some('W') => width = token[1..].parse().expect("Bad Y4M width"),
+                Some('H') => height = token[1..].parse().expect("Bad Y4M height"),
+                Some('F') => {
+                    let parts: Vec<&str> = token[1..].splitn(2, ':').collect();
+                    if parts.len() == 2 {
+                        fps_num = parts[0].parse().unwrap_or(30);
+                        fps_den = parts[1].parse().unwrap_or(1);
+                    }
+                }
+                Some('C') => {
+                    let fmt = &token[1..];
+                    // Strip optional bit-depth suffix (e.g. "420p10" → "420")
+                    let fmt_base = fmt.trim_start_matches(|c: char| !c.is_ascii_digit());
+                    chroma = if fmt_base.starts_with("444") {
+                        Y4mChroma::C444
+                    } else {
+                        Y4mChroma::C420 // default; 420jpeg / 420mpeg2 / plain 420
+                    };
+                }
+                _ => {}
+            }
+        }
+        assert!(width > 0 && height > 0, "Y4M header missing W/H");
+        Y4mReader { reader, width, height, fps_num, fps_den, chroma }
+    }
+
+    /// Read one frame and return interleaved RGB f32 (0-255), or None at EOF.
+    fn read_frame_rgb(&mut self) -> Option<Vec<f32>> {
+        use std::io::BufRead;
+        use std::io::Read;
+
+        // Read "FRAME..." line
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let n = self.reader.read_line(&mut line).expect("Y4M read error");
+            if n == 0 {
+                return None; // EOF
+            }
+            let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
+            if trimmed.starts_with("FRAME") {
+                break;
+            }
+            // Ignore unexpected lines (e.g. extra headers)
+        }
+
+        let w = self.width as usize;
+        let h = self.height as usize;
+
+        // Read luma plane (Y): w*h bytes
+        let y_size = w * h;
+        let mut y_plane = vec![0u8; y_size];
+        self.reader
+            .read_exact(&mut y_plane)
+            .expect("Y4M: truncated Y plane");
+
+        // Read chroma planes (Cb, Cr)
+        let (cb_plane, cr_plane) = match self.chroma {
+            Y4mChroma::C420 => {
+                let uv_w = w.div_ceil(2);
+                let uv_h = h.div_ceil(2);
+                let uv_size = uv_w * uv_h;
+                let mut cb = vec![0u8; uv_size];
+                let mut cr = vec![0u8; uv_size];
+                self.reader.read_exact(&mut cb).expect("Y4M: truncated Cb plane");
+                self.reader.read_exact(&mut cr).expect("Y4M: truncated Cr plane");
+                (cb, cr)
+            }
+            Y4mChroma::C444 => {
+                let mut cb = vec![0u8; y_size];
+                let mut cr = vec![0u8; y_size];
+                self.reader.read_exact(&mut cb).expect("Y4M: truncated Cb plane");
+                self.reader.read_exact(&mut cr).expect("Y4M: truncated Cr plane");
+                (cb, cr)
+            }
+        };
+
+        // Convert YCbCr → RGB f32 (0-255), BT.601 limited-range (studio swing).
+        //   Y:  16-235 (luma)
+        //   Cb/Cr: 16-240 (chroma, centre at 128)
+        //
+        //   R = clip(1.164*(Y-16)                   + 1.596*(Cr-128), 0, 255)
+        //   G = clip(1.164*(Y-16) - 0.392*(Cb-128)  - 0.813*(Cr-128), 0, 255)
+        //   B = clip(1.164*(Y-16) + 2.017*(Cb-128),                    0, 255)
+        let mut rgb = vec![0.0f32; w * h * 3];
+        for row in 0..h {
+            for col in 0..w {
+                let y_val = y_plane[row * w + col] as f32;
+                let (cb_val, cr_val) = match self.chroma {
+                    Y4mChroma::C444 => {
+                        let idx = row * w + col;
+                        (cb_plane[idx] as f32, cr_plane[idx] as f32)
+                    }
+                    Y4mChroma::C420 => {
+                        let uv_w = w.div_ceil(2);
+                        let uv_row = row / 2;
+                        let uv_col = col / 2;
+                        let idx = uv_row * uv_w + uv_col;
+                        (cb_plane[idx] as f32, cr_plane[idx] as f32)
+                    }
+                };
+                let yy = 1.164_f32 * (y_val - 16.0);
+                let pb = cb_val - 128.0;
+                let pr = cr_val - 128.0;
+                let r = (yy + 1.596 * pr).clamp(0.0, 255.0);
+                let g = (yy - 0.392 * pb - 0.813 * pr).clamp(0.0, 255.0);
+                let b = (yy + 2.017 * pb).clamp(0.0, 255.0);
+                let base = (row * w + col) * 3;
+                rgb[base] = r;
+                rgb[base + 1] = g;
+                rgb[base + 2] = b;
+            }
+        }
+        Some(rgb)
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "gnc", about = "GPU-native broadcast video codec")]
 struct Cli {
@@ -137,7 +309,8 @@ enum Command {
 
     /// Benchmark temporal (I+P frame) encoding on a sequence of frames
     BenchmarkSequence {
-        /// Input frame pattern (e.g., "frames/frame_%04d.png")
+        /// Input source: PNG frame pattern (e.g., "frames/frame_%04d.png") or a Y4M file (e.g., "video.y4m").
+        /// Y4M input avoids PNG decode overhead and measures actual GNC encoder throughput.
         #[arg(short, long)]
         input: String,
 
@@ -845,10 +1018,26 @@ fn main() {
             // Streaming path: when using temporal wavelet without A/B comparison,
             // load frames per-GOP to avoid holding all frames in memory.
             // For 1800 frames at 1080p, loading all = ~44 GB; per-GOP (8) = ~192 MB.
+            // Supports both PNG frame patterns (%04d) and Y4M files (.y4m).
             if run_temporal && !run_baseline {
-                // Peek at first frame for dimensions
-                let first_path = input.replace("%04d", &format!("{:04}", 0));
-                let (first_rgb, w, h) = load_image_rgb_f32(&first_path);
+                // Detect input format: Y4M if path ends with ".y4m"
+                let use_y4m = input.ends_with(".y4m");
+
+                // Obtain dimensions (and, for Y4M, fps from the header)
+                let (w, h, y4m_fps) = if use_y4m {
+                    let probe = Y4mReader::open(&input);
+                    let fw = probe.width;
+                    let fh = probe.height;
+                    let y4m_fps_val =
+                        probe.fps_num as f64 / probe.fps_den.max(1) as f64;
+                    (fw, fh, Some(y4m_fps_val))
+                } else {
+                    let first_path = input.replace("%04d", &format!("{:04}", 0));
+                    let (_, fw, fh) = load_image_rgb_f32(&first_path);
+                    (fw, fh, None)
+                };
+                // Use fps from Y4M header when available; otherwise keep CLI --fps value.
+                let effective_fps = y4m_fps.unwrap_or(fps);
                 let gop_size = temporal_gop_size;
 
                 let mut config_tw = if let Some(q) = quality {
@@ -873,16 +1062,26 @@ fn main() {
                     config_tw.entropy_coder = gnc::EntropyCoder::Rans;
                 }
                 println!(
-                    "\n=== Temporal wavelet ({:?}, streaming) ===",
-                    temporal_mode
+                    "\n=== Temporal wavelet ({:?}, streaming, {}) ===",
+                    temporal_mode,
+                    if use_y4m { "Y4M" } else { "PNG" },
                 );
+                if let Some(y4m_fps_val) = y4m_fps {
+                    println!("  Y4M fps from header: {:.3}", y4m_fps_val);
+                }
                 println!(
                     "Temporal config: qstep {:.3}, dead_zone {:.3}, entropy {:?}, adaptive_mul {}",
                     config_tw.quantization_step, config_tw.dead_zone, config_tw.entropy_coder,
                     if config_tw.adaptive_temporal_mul { "on" } else { "off" },
                 );
 
-                // Warm up GPU pipelines with first frame
+                // ---------------------------------------------------------------------------
+                // GPU warmup — triggers Metal JIT shader compilation for BOTH pipelines
+                // so that GOP 0 timing is not inflated by lazy compilation.
+                //
+                // Step 1: warm up I-frame path (encoder.encode)
+                // Step 2: warm up temporal Haar path (encode_temporal_wavelet_gop)
+                // ---------------------------------------------------------------------------
                 let warmup_cfg = if let Some(q) = quality {
                     gnc::quality_preset(q)
                 } else {
@@ -891,8 +1090,41 @@ fn main() {
                         ..Default::default()
                     }
                 };
-                let _ = encoder.encode(&ctx, &first_rgb, w, h, &warmup_cfg);
-                drop(first_rgb);
+
+                // Read enough frames for warmup (gop_size frames for temporal warmup)
+                // without counting them in the benchmark.
+                let warmup_frames: Vec<Vec<f32>> = if use_y4m {
+                    let mut y4m_warmup = Y4mReader::open(&input);
+                    (0..gop_size)
+                        .filter_map(|_| y4m_warmup.read_frame_rgb())
+                        .collect()
+                } else {
+                    (0..gop_size)
+                        .map(|j| {
+                            let path = input.replace("%04d", &format!("{:04}", j));
+                            let (rgb, _, _) = load_image_rgb_f32(&path);
+                            rgb
+                        })
+                        .collect()
+                };
+
+                // Step 1: I-frame warmup
+                let _ = encoder.encode(&ctx, &warmup_frames[0], w, h, &warmup_cfg);
+
+                // Step 2: temporal Haar warmup (warms shaders used in encode_temporal_wavelet_gop)
+                if warmup_frames.len() >= gop_size {
+                    let wf_refs: Vec<&[f32]> =
+                        warmup_frames.iter().map(|f| f.as_slice()).collect();
+                    let _ = encoder.encode_temporal_wavelet_gop(
+                        &ctx,
+                        &wf_refs,
+                        w,
+                        h,
+                        &warmup_cfg,
+                        temporal_mode,
+                    );
+                }
+                drop(warmup_frames);
 
                 let mut groups: Vec<gnc::TemporalGroup> = Vec::new();
                 let mut tail_iframes: Vec<CompressedFrame> = Vec::new();
@@ -901,22 +1133,48 @@ fn main() {
                 let tail_start = num_gops * gop_size;
 
                 let profile_split = std::env::var("GNC_PROFILE_SPLIT").is_ok();
+                let io_label = if use_y4m { "y4m_read" } else { "png_decode" };
                 let start = std::time::Instant::now();
-                let mut total_png_ms: f64 = 0.0;
+                let mut total_io_ms: f64 = 0.0;
                 let mut total_enc_ms: f64 = 0.0;
+
+                // For Y4M: open the file once and stream frames sequentially.
+                // For PNG: re-derive paths from the pattern per-GOP.
+                let mut y4m_stream: Option<Y4mReader> = if use_y4m {
+                    Some(Y4mReader::open(&input))
+                } else {
+                    None
+                };
 
                 for gop_idx in 0..num_gops {
                     let base = gop_idx * gop_size;
                     // Load this GOP's frames
-                    let t_png_start = std::time::Instant::now();
+                    let t_io_start = std::time::Instant::now();
                     let mut gop_frames: Vec<Vec<f32>> = Vec::with_capacity(gop_size);
-                    for j in 0..gop_size {
-                        let path = input.replace("%04d", &format!("{:04}", base + j));
-                        let (rgb, _, _) = load_image_rgb_f32(&path);
-                        gop_frames.push(rgb);
+                    if let Some(ref mut y4m) = y4m_stream {
+                        for _ in 0..gop_size {
+                            match y4m.read_frame_rgb() {
+                                Some(rgb) => gop_frames.push(rgb),
+                                None => break,
+                            }
+                        }
+                    } else {
+                        for j in 0..gop_size {
+                            let path = input.replace("%04d", &format!("{:04}", base + j));
+                            let (rgb, _, _) = load_image_rgb_f32(&path);
+                            gop_frames.push(rgb);
+                        }
                     }
-                    let gop_png_ms = t_png_start.elapsed().as_secs_f64() * 1000.0;
-                    total_png_ms += gop_png_ms;
+                    let gop_io_ms = t_io_start.elapsed().as_secs_f64() * 1000.0;
+                    total_io_ms += gop_io_ms;
+
+                    if gop_frames.len() < gop_size {
+                        eprintln!(
+                            "  Warning: Y4M EOF at GOP {}, only {} frames (expected {}). Stopping.",
+                            gop_idx, gop_frames.len(), gop_size
+                        );
+                        break;
+                    }
 
                     let gop_refs: Vec<&[f32]> = gop_frames.iter().map(|f| f.as_slice()).collect();
 
@@ -959,12 +1217,12 @@ fn main() {
                     }
 
                     if profile_split {
-                        let gop_total_ms = gop_png_ms + gop_enc_ms;
-                        let png_pct = gop_png_ms / gop_total_ms * 100.0;
+                        let gop_total_ms = gop_io_ms + gop_enc_ms;
+                        let io_pct = gop_io_ms / gop_total_ms * 100.0;
                         let enc_pct = gop_enc_ms / gop_total_ms * 100.0;
                         eprintln!(
-                            "SPLIT GOP {:3}: png_decode={:.1}ms ({:.0}%), gnc_encode={:.1}ms ({:.0}%), gop_total={:.1}ms",
-                            gop_idx, gop_png_ms, png_pct, gop_enc_ms, enc_pct, gop_total_ms,
+                            "SPLIT GOP {:3}: {}={:.1}ms ({:.0}%), gnc_encode={:.1}ms ({:.0}%), gop_total={:.1}ms",
+                            gop_idx, io_label, gop_io_ms, io_pct, gop_enc_ms, enc_pct, gop_total_ms,
                         );
                     }
 
@@ -990,16 +1248,25 @@ fn main() {
                     // gop_frames dropped here — memory freed
                 }
 
-                // Tail frames (not enough for a full GOP)
+                // Tail frames (not enough for a full GOP): encode as I-frames.
+                // For Y4M the stream is already positioned at tail_start; for PNG derive paths.
                 let mut tail_cfg = config_tw.clone();
                 tail_cfg.keyframe_interval = 1;
                 tail_cfg.temporal_transform = TemporalTransform::None;
                 tail_cfg.cfl_enabled = false;
                 for i in tail_start..num_frames {
-                    let path = input.replace("%04d", &format!("{:04}", i));
-                    let t_png_start = std::time::Instant::now();
-                    let (rgb, _, _) = load_image_rgb_f32(&path);
-                    total_png_ms += t_png_start.elapsed().as_secs_f64() * 1000.0;
+                    let t_io_start = std::time::Instant::now();
+                    let rgb = if let Some(ref mut y4m) = y4m_stream {
+                        match y4m.read_frame_rgb() {
+                            Some(f) => f,
+                            None => break,
+                        }
+                    } else {
+                        let path = input.replace("%04d", &format!("{:04}", i));
+                        let (f, _, _) = load_image_rgb_f32(&path);
+                        f
+                    };
+                    total_io_ms += t_io_start.elapsed().as_secs_f64() * 1000.0;
                     let t_enc_start = std::time::Instant::now();
                     let cf = encoder.encode(&ctx, &rgb, w, h, &tail_cfg);
                     total_enc_ms += t_enc_start.elapsed().as_secs_f64() * 1000.0;
@@ -1009,14 +1276,14 @@ fn main() {
 
                 let elapsed = start.elapsed();
                 if profile_split {
-                    let total_measured_ms = total_png_ms + total_enc_ms;
+                    let total_measured_ms = total_io_ms + total_enc_ms;
                     let wall_ms = elapsed.as_secs_f64() * 1000.0;
                     let other_ms = wall_ms - total_measured_ms;
                     let enc_fps = (num_frames as f64) / (total_enc_ms / 1000.0);
                     eprintln!(
-                        "SPLIT Total: wall={:.1}ms, png_decode={:.1}ms ({:.0}%), gnc_encode={:.1}ms ({:.0}%), other={:.1}ms ({:.0}%)",
+                        "SPLIT Total: wall={:.1}ms, {}={:.1}ms ({:.0}%), gnc_encode={:.1}ms ({:.0}%), other={:.1}ms ({:.0}%)",
                         wall_ms,
-                        total_png_ms, total_png_ms / wall_ms * 100.0,
+                        io_label, total_io_ms, total_io_ms / wall_ms * 100.0,
                         total_enc_ms, total_enc_ms / wall_ms * 100.0,
                         other_ms, other_ms / wall_ms * 100.0,
                     );
@@ -1025,6 +1292,8 @@ fn main() {
                         enc_fps, num_frames, total_enc_ms,
                     );
                 }
+                // suppress unused warning when effective_fps is not otherwise consumed
+                let _ = effective_fps;
                 let avg_bpp = (total_bytes as f64 * 8.0) / (w as f64 * h as f64) / num_frames as f64;
                 println!(
                     "  Total: {} bytes ({:.2} MB), avg {:.2} bpp, {:.1}ms ({:.1} fps)",

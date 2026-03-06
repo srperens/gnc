@@ -300,7 +300,7 @@ impl Default for CodecConfig {
             wavelet_levels: 3,
             subband_weights: SubbandWeights::uniform(3),
             cfl_enabled: false,
-            entropy_coder: EntropyCoder::Rans,
+            entropy_coder: EntropyCoder::Rice,
             wavelet_type: WaveletType::LeGall53,
             adaptive_quantization: false,
             aq_strength: 0.0,
@@ -481,10 +481,10 @@ pub fn quality_preset(q: u32) -> CodecConfig {
         } else {
             WaveletType::CDF97
         },
-        // rANS default: wins at low quality (q≤40, up to -18% bits); near-parity at q=50;
-        // Rice wins slightly at q≥75 (+9-12% bits but ~30% faster). rANS is better for
-        // the H.264-comparison range (low-mid bitrate). Rice available via --rice flag.
-        entropy_coder: EntropyCoder::Rans,
+        // Rice: 256 fully independent GPU-parallel streams per tile — matches our architecture.
+        // rANS is sequential (2048 ops/thread) and conflicts with GPU-parallel design.
+        // rANS available via --rans flag; wins at q≤40 but wrong default for this codec.
+        entropy_coder: EntropyCoder::Rice,
         per_subband_entropy: disc.per_subband,
         adaptive_quantization: aq_enabled,
         aq_strength,

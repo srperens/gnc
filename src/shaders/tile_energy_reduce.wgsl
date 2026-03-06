@@ -4,7 +4,7 @@
 //   mean_abs = sum(|coeff|) / tile_pixel_count
 // then maps this energy to a qstep multiplier via log-space interpolation:
 //   energy <= low_thresh  → max_mul (aggressive quantization, near-static tile)
-//   energy >= high_thresh → 1.0     (preserve detail, high-motion tile)
+//   energy >= high_thresh → MIN_MUL (1.2, preserve detail; always coarser than lowpass)
 //   between              → log-linear interpolation
 //
 // Also maintains a global max_abs across all pixels via atomicMax on a u32
@@ -38,18 +38,21 @@ struct Params {
 var<workgroup> shared_sum: array<f32, 256>;
 var<workgroup> shared_max: array<f32, 256>;
 
-// Log-space interpolation between max_mul and 1.0.
+// Log-space interpolation between max_mul and MIN_MUL.
 // Mirrors EncoderPipeline::map_energy_to_mul on the CPU side.
+// MIN_MUL ensures temporal highpass is always at least slightly coarser
+// than lowpass quantisation, even for high-motion tiles.
+const MIN_MUL: f32 = 1.2;
 fn map_energy_to_mul(energy: f32) -> f32 {
     if energy <= params.low_thresh {
         return params.max_mul;
     }
     if energy >= params.high_thresh {
-        return 1.0;
+        return MIN_MUL;
     }
-    // log-linear: t = log(energy/low) / log(high/low), result = max_mul + t*(1-max_mul)
+    // log-linear: t = log(energy/low) / log(high/low), result = max_mul + t*(MIN_MUL-max_mul)
     let t = log(energy / params.low_thresh) / log(params.high_thresh / params.low_thresh);
-    return params.max_mul + t * (1.0 - params.max_mul);
+    return params.max_mul + t * (MIN_MUL - params.max_mul);
 }
 
 @compute @workgroup_size(256)

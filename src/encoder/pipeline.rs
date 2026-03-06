@@ -352,6 +352,7 @@ impl EncoderPipeline {
 
     /// Dispatch GPU padding with explicit buffer references.
     /// Used by the spatial-wavelet pre-compute path which has its own buffer set.
+    #[allow(clippy::too_many_arguments)] // GPU dispatch requires separate ctx, encoder, buffers, and dimensions
     pub(super) fn dispatch_gpu_pad_with(
         &self,
         ctx: &GpuContext,

@@ -813,15 +813,10 @@ pub mod wasm {
     }
 
     /// Pre-allocated GPU buffers for one GOP's temporal wavelet decode.
+    #[derive(Default)]
     struct TwBufSet {
         frame_bufs: Vec<[wgpu::Buffer; 3]>,
         snapshot_bufs: Vec<wgpu::Buffer>,
-    }
-
-    impl Default for TwBufSet {
-        fn default() -> Self {
-            Self { frame_bufs: Vec::new(), snapshot_bufs: Vec::new() }
-        }
     }
 
     #[wasm_bindgen]
@@ -1406,7 +1401,7 @@ pub mod wasm {
                             let group = crate::format::deserialize_temporal_group(
                                 &self.data, th, gop_idx,
                             );
-                            self.tw_gop_info = Some(group.low_frame.info.clone());
+                            self.tw_gop_info = Some(group.low_frame.info);
                             self.tw_gop_config = Some(group.low_frame.config.clone());
                             let padded_w = group.low_frame.info.padded_width();
                             let padded_h = group.low_frame.info.padded_height();
@@ -1640,7 +1635,7 @@ pub mod wasm {
                     let group = crate::format::deserialize_temporal_group(
                         &self.data, th, gop_idx,
                     );
-                    self.tw_gop_info = Some(group.low_frame.info.clone());
+                    self.tw_gop_info = Some(group.low_frame.info);
                     self.tw_gop_config = Some(group.low_frame.config.clone());
                     let padded_w = group.low_frame.info.padded_width();
                     let padded_h = group.low_frame.info.padded_height();
@@ -1791,7 +1786,7 @@ pub mod wasm {
             let group = crate::format::deserialize_temporal_group(
                 &self.data, th, gop_idx,
             );
-            self.tw_gop_info = Some(group.low_frame.info.clone());
+            self.tw_gop_info = Some(group.low_frame.info);
             self.tw_gop_config = Some(group.low_frame.config.clone());
             let prefetch_set = 1 - self.tw_active;
             let set = &self.tw_buf_sets[prefetch_set];

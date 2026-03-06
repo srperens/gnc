@@ -117,8 +117,8 @@ SEQ_DIR="${FRAMES_DIR}/sequences"
 mkdir -p "${SEQ_DIR}/bbb" "${SEQ_DIR}/blue_sky"
 
 # BBB: 10 consecutive frames (350-359)
-echo "[seq 1/2] Big Buck Bunny sequence (10 frames, 1080p)"
-for i in $(seq 0 9); do
+echo "[seq 1/2] Big Buck Bunny sequence (8 frames, 1080p)"
+for i in $(seq 0 7); do
     frame_num=$((350 + i))
     out_png="${SEQ_DIR}/bbb/frame_$(printf '%04d' $i).png"
     if [ -f "$out_png" ]; then
@@ -129,17 +129,27 @@ for i in $(seq 0 9); do
     curl -# -L -o "$out_png" \
         "https://media.xiph.org/BBB/BBB-1080-png/big_buck_bunny_$(printf '%05d' $frame_num).png"
 done
+# Generate Y4M for fast encoder input (avoids PNG decode overhead)
+if [ ! -f "${SEQ_DIR}/bbb/bbb.y4m" ] && [ -f "${SEQ_DIR}/bbb/frame_0000.png" ]; then
+    echo "  Generating bbb.y4m..."
+    ffmpeg -nostdin -y -loglevel error \
+        -framerate 30 -start_number 0 \
+        -i "${SEQ_DIR}/bbb/frame_%04d.png" \
+        -pix_fmt yuv420p -f yuv4mpegpipe \
+        "${SEQ_DIR}/bbb/bbb.y4m"
+    echo "  [done] bbb.y4m"
+fi
 
-# blue_sky: extract 10 consecutive frames (50-59)
-echo "[seq 2/2] blue_sky sequence (10 frames, 1080p)"
+# blue_sky: extract 8 consecutive frames (50-57)
+echo "[seq 2/2] blue_sky sequence (8 frames, 1080p)"
 first_frame="${SEQ_DIR}/blue_sky/frame_0000.png"
 if [ -f "$first_frame" ]; then
     echo "  [skip] blue_sky sequence already exists"
 else
-    echo "  Extracting 10 frames from blue_sky y4m..."
+    echo "  Extracting 8 frames from blue_sky y4m..."
     ffmpeg -nostdin -y -loglevel error \
         -i "${XIPH}/y4m/blue_sky_1080p25.y4m" \
-        -vf "select=between(n\\,50\\,59)" \
+        -vf "select=between(n\\,50\\,57)" \
         -vsync vfr \
         -start_number 0 \
         "${SEQ_DIR}/blue_sky/frame_%04d.png" </dev/null 2>&1 || true
@@ -148,6 +158,16 @@ else
     else
         echo "  [FAIL] Could not extract blue_sky sequence"
     fi
+fi
+# Generate Y4M for fast encoder input
+if [ ! -f "${SEQ_DIR}/blue_sky/blue_sky.y4m" ] && [ -f "${SEQ_DIR}/blue_sky/frame_0000.png" ]; then
+    echo "  Generating blue_sky.y4m..."
+    ffmpeg -nostdin -y -loglevel error \
+        -framerate 25 -start_number 0 \
+        -i "${SEQ_DIR}/blue_sky/frame_%04d.png" \
+        -pix_fmt yuv420p -f yuv4mpegpipe \
+        "${SEQ_DIR}/blue_sky/blue_sky.y4m"
+    echo "  [done] blue_sky.y4m"
 fi
 
 echo ""
@@ -158,9 +178,13 @@ echo ""
 ls "${SEQ_DIR}/bbb/" 2>/dev/null | head -3 && echo "  ... (bbb sequence)" || true
 ls "${SEQ_DIR}/blue_sky/" 2>/dev/null | head -3 && echo "  ... (blue_sky sequence)" || true
 echo ""
+echo "NOTE: Full broadcast sequences (crowd_run, rush_hour, stockholm, etc.) are not"
+echo "      fetched here (multi-GB). To generate Y4M files for existing PNG sequences:"
+echo "        ffmpeg -framerate 50 -i 'seq/frame_%04d.png' -pix_fmt yuv420p seq/seq.y4m"
+echo ""
 echo "Run benchmarks:"
 echo "  cargo run --release -- benchmark -i test_material/frames/bbb_1080p.png"
 echo "  cargo run --release -- sweep -i test_material/frames/blue_sky_1080p.png"
 echo ""
-echo "Run temporal benchmark:"
-echo "  cargo run --release -- benchmark-sequence -i test_material/frames/sequences/bbb/frame_%04d.png -n 10 -k 8"
+echo "Run temporal benchmark (Y4M — fast, no PNG decode overhead):"
+echo "  cargo run --release -- benchmark-sequence -i test_material/frames/sequences/bbb/bbb.y4m -n 8 -k 8 --temporal-wavelet haar"

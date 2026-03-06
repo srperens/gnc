@@ -73,61 +73,61 @@ done
 # --- Quick test files (matching generate_demos.sh) ---
 
 encode_tw "tw_test_quick" \
-    "$SEQ/bbb/frame_%04d.png" \
+    "$SEQ/bbb/bbb.y4m" \
     -q 75 -n 8 -k 8 --temporal-wavelet haar \
     --fps 30
 
 encode_tw "tw_test_animation" \
-    "$SEQ/bbb_extended/frame_%04d.png" \
+    "$SEQ/bbb_extended/bbb_extended.y4m" \
     -q 75 -n 24 -k 8 --temporal-wavelet haar \
     --fps 30
 
 encode_tw "tw_test_nature" \
-    "$SEQ/park_joy/frame_%04d.png" \
+    "$SEQ/park_joy/park_joy.y4m" \
     -q 75 -n 32 -k 8 --temporal-wavelet haar \
     --fps 50
 
 encode_tw "tw_test_crowd" \
-    "$SEQ/crowd_run/frame_%04d.png" \
+    "$SEQ/crowd_run/crowd_run.y4m" \
     -q 75 -n 32 -k 8 --temporal-wavelet haar \
     --fps 50
 
 # --- Quality comparison (same content, different q) ---
 
 encode_tw "tw_ducks_q25" \
-    "$SEQ/ducks_take_off/frame_%04d.png" \
+    "$SEQ/ducks_take_off/ducks_take_off.y4m" \
     -q 25 -n 300 -k 8 --temporal-wavelet haar \
     --fps 50
 
 encode_tw "tw_ducks_q50" \
-    "$SEQ/ducks_take_off/frame_%04d.png" \
+    "$SEQ/ducks_take_off/ducks_take_off.y4m" \
     -q 50 -n 300 -k 8 --temporal-wavelet haar \
     --fps 50
 
 encode_tw "tw_ducks_q75" \
-    "$SEQ/ducks_take_off/frame_%04d.png" \
+    "$SEQ/ducks_take_off/ducks_take_off.y4m" \
     -q 75 -n 300 -k 8 --temporal-wavelet haar \
     --fps 50
 
 # --- Broadcast test sequences ---
 
 encode_tw "tw_rush_hour" \
-    "$SEQ/rush_hour/frame_%04d.png" \
+    "$SEQ/rush_hour/rush_hour.y4m" \
     -q 75 -n 200 -k 8 --temporal-wavelet haar \
     --fps 25
 
 encode_tw "tw_old_town_cross" \
-    "$SEQ/old_town_cross/frame_%04d.png" \
+    "$SEQ/old_town_cross/old_town_cross.y4m" \
     -q 75 -n 200 -k 8 --temporal-wavelet haar \
     --fps 50
 
 encode_tw "tw_stockholm" \
-    "$SEQ/stockholm/frame_%04d.png" \
+    "$SEQ/stockholm/stockholm.y4m" \
     -q 75 -n 200 -k 8 --temporal-wavelet haar \
     --fps 60
 
 encode_tw "tw_pedestrian_area" \
-    "$SEQ/pedestrian_area/frame_%04d.png" \
+    "$SEQ/pedestrian_area/pedestrian_area.y4m" \
     -q 75 -n 200 -k 8 --temporal-wavelet haar \
     --fps 25
 

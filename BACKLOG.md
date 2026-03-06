@@ -21,15 +21,18 @@ See [BASELINE.md](BASELINE.md) for current benchmark numbers.
 - **Depends on:** #1
 
 ### 3. Encode performance -> 60 fps
-- **Status:** todo
-- **Problem:** 20 fps on crowd_run/park_joy is too slow
-- **Success criteria:** >= 40 fps on crowd_run 1080p q=75 (stretch: 60 fps)
-- **Approach:** Profile spatial wavelet, Rice entropy, GPU dispatch overhead
+- **Status:** active (partial — 2026-03-06)
+- **Problem:** 15-16 fps temporal Haar end-to-end; PNG decode dominates benchmark
+- **Progress:** Batch GPU syncs: 15 → 3 blocking polls/GOP. Pure encode: ~306ms → ~252ms/GOP (~31.7fps). CfL disabled for temporal highpass (unreliable on residuals).
+- **Remaining bottleneck:** Unknown — need per-stage profiling of `encode_temporal_wavelet_gop_haar` before next optimization
+- **Next step:** Add per-stage Instant timers (spatial wavelet, temporal Haar, Rice, readback) then tackle #4
+- **Success criteria:** >= 40 fps pure encode on crowd_run 1080p q=75 (stretch: 60 fps)
 
 ### 4. Tile size experiment
-- **Status:** todo
-- **Problem:** M1 GPU underutilized at 40 tiles/plane with 256x256 tiles
-- **Success criteria:** Benchmark 128x128 vs 256x256 on all sequences; data-driven decision
+- **Status:** todo (next after per-stage profiling)
+- **Problem:** M1 GPU underutilized at 40 tiles/plane with 256x256 tiles; 128x128 gives 4× more workgroups
+- **Hypothesis:** 128×128 tiles reduce GPU idle time in light temporal kernels, saving 15-30% per-GOP encode time. Counter-hypothesis: 4× more dispatch calls add CPU overhead, making it neutral.
+- **Success criteria:** ≥15% reduction in pure encode time/GOP, no bpp/PSNR change. Failure: <5% change.
 
 ### 5. 4:2:0 + 10-bit
 - **Status:** todo

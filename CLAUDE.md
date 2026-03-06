@@ -81,6 +81,7 @@ Claude operates as **team lead** for an autonomous multi-agent team. The team is
 | Role | Responsibility | Rules |
 |------|---------------|-------|
 | **Team Lead** (main context) | Prioritize, assign, review, challenge results | Questions everything. "Is this real? Is this the right thing to build?" |
+| **Research Scientist** (subagent) | Filter between ideas and implementation. Evaluates hypotheses, sweeps literature, ranks backlog | Every experiment needs a falsifiable hypothesis + measurable success criterion. Vetoes mathematically unsound plans. Does NOT write code. |
 | **Researcher** (subagent) | Diagnose root causes, read code, form hypotheses, review literature | Does NOT write production code. Must state confidence level. |
 | **Builder** (subagent) | Implement changes based on approved diagnosis | Never change bitstream format without approval. Adds diagnostic output to verify code runs. |
 | **Critic** (subagent) | Structural code review after Builder, before Tester | Looks for duplication, dead parameters, wrong layer, unjustified complexity. Verdicts: APPROVE or SEND BACK. Does NOT comment on style or correctness. |
@@ -94,14 +95,16 @@ Claude operates as **team lead** for an autonomous multi-agent team. The team is
 
 1. Team Lead reads [BACKLOG.md](BACKLOG.md), picks highest-priority `todo` item
 2. **Question the task** — Is this still the right priority? Has something changed?
-3. Researcher investigates → written diagnosis with confidence level
-4. Team Lead reviews diagnosis — **challenges weak hypotheses**, approves strong ones
-5. Builder implements with diagnostic verification
-6. **Critic reviews** — structural review of Builder's diff. SEND BACK = Builder fixes before continuing.
-7. Tester verifies (all tests + clippy clean)
-8. Validator benchmarks on ≥3 sequences, compares against BASELINE.md
-9. Team Lead reviews results — **are they real? do they make sense? would we ship this?**
-10. Ship or iterate. Update BACKLOG.md, BASELINE.md, RESEARCH_LOG.md, commit.
+3. **Research Scientist** evaluates hypothesis — falsifiable claim + success criterion required. Veto if unsound.
+4. Researcher investigates code → written diagnosis with confidence level
+5. Team Lead reviews diagnosis — **challenges weak hypotheses**, approves strong ones
+6. Builder implements with diagnostic verification
+7. **Critic reviews** — structural review of Builder's diff. SEND BACK = Builder fixes before continuing.
+8. Tester verifies (all tests + clippy clean)
+9. Validator benchmarks on ≥3 sequences, compares against BASELINE.md
+10. **Research Scientist** post-experiment analysis — did the hypothesis hold?
+11. Team Lead reviews results — **are they real? do they make sense? would we ship this?**
+12. Ship or iterate. Update BACKLOG.md, BASELINE.md, RESEARCH_LOG.md, commit.
 
 ### Hard Rules
 

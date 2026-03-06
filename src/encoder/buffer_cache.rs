@@ -135,6 +135,10 @@ pub(super) struct CachedTemporalWaveletBuffers {
     /// via async pre-upload at the end of the previous GOP's encode. When set, the next
     /// `encode_temporal_wavelet_gop_haar` call skips its write_buffer upload step (saving ~22ms).
     pub(super) next_gop_pre_uploaded: bool,
+    /// True if spatial wavelet + temporal Haar have already been computed for this buffer set,
+    /// overlapping with the previous GOP's high_enc. When set, the encode call skips those
+    /// phases and goes directly to low_enc (saving ~72ms/GOP).
+    pub(super) spatial_haar_precomputed: bool,
 }
 
 impl CachedTemporalWaveletBuffers {
@@ -277,6 +281,7 @@ impl CachedTemporalWaveletBuffers {
             max_abs_staging_bufs,
             ter_params_buf,
             next_gop_pre_uploaded: false,
+            spatial_haar_precomputed: false,
         }
     }
 
@@ -715,5 +720,70 @@ impl CachedEncodeBuffers {
                 mapped_at_creation: false,
             })
         }));
+    }
+}
+
+/// Minimal intermediate GPU buffers needed to run the spatial wavelet pipeline
+/// (pad → color_convert → deinterleave → transform) for temporal wavelet GOP pipelining.
+///
+/// A second instance (`sp_cached_b`) allows the next GOP's spatial wavelet to run
+/// concurrently with the current GOP's high_enc (Rice encoding), overlapping ~64ms
+/// of GPU compute per GOP.
+pub(super) struct SpatialPrecomputeBuffers {
+    pub(super) padded_w: u32,
+    pub(super) padded_h: u32,
+    /// Raw (unpadded) input staging for GPU pad — COPY_DST.
+    pub(super) raw_input_buf: wgpu::Buffer,
+    /// 3-channel padded input buffer — STORAGE | COPY_DST.
+    pub(super) input_buf: wgpu::Buffer,
+    /// Color-converted output buffer — STORAGE | COPY_DST.
+    pub(super) color_out: wgpu::Buffer,
+    /// Per-plane buffers: Y, Co, Cg after deinterleave; input to transform.
+    pub(super) plane_a: wgpu::Buffer,
+    pub(super) co_plane: wgpu::Buffer,
+    pub(super) cg_plane: wgpu::Buffer,
+    /// Transform scratch buffer.
+    pub(super) plane_b: wgpu::Buffer,
+    /// Transform output buffer — STORAGE | COPY_SRC (copied to tw_b.frame_bufs).
+    pub(super) plane_c: wgpu::Buffer,
+}
+
+impl SpatialPrecomputeBuffers {
+    pub(super) fn new(ctx: &GpuContext, padded_w: u32, padded_h: u32, orig_w: u32, orig_h: u32) -> Self {
+        let padded_pixels = (padded_w * padded_h) as usize;
+        let plane_size = (padded_pixels * std::mem::size_of::<f32>()) as u64;
+        let buf_3ch = (padded_pixels * 3 * std::mem::size_of::<f32>()) as u64;
+        let raw_size = (orig_w * orig_h * 3) as u64 * std::mem::size_of::<f32>() as u64;
+
+        let mk = |label: &str, size: u64, usage: wgpu::BufferUsages| {
+            ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: size.max(4),
+                usage,
+                mapped_at_creation: false,
+            })
+        };
+        let storage = wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC;
+        // raw_input_buf: pad shader reads it as STORAGE binding (not just COPY_DST)
+        let raw_storage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
+
+        Self {
+            padded_w,
+            padded_h,
+            raw_input_buf: mk("sp_b_raw_input", raw_size, raw_storage),
+            input_buf:     mk("sp_b_input",     buf_3ch,  storage),
+            color_out:     mk("sp_b_color_out", buf_3ch,  storage),
+            plane_a:       mk("sp_b_plane_a",   plane_size, storage),
+            co_plane:      mk("sp_b_co_plane",  plane_size, storage),
+            cg_plane:      mk("sp_b_cg_plane",  plane_size, storage),
+            plane_b:       mk("sp_b_plane_b",   plane_size, storage),
+            plane_c:       mk("sp_b_plane_c",   plane_size, storage),
+        }
+    }
+
+    pub(super) fn is_compatible(&self, padded_w: u32, padded_h: u32) -> bool {
+        self.padded_w == padded_w && self.padded_h == padded_h
     }
 }

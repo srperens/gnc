@@ -1055,127 +1055,147 @@ impl EncoderPipeline {
         // while calling &mut self methods (encode_from_gpu_wavelet_planes etc.).
         let raw_input_size = std::mem::size_of_val(gop_frames[0]) as u64;
         self.ensure_tw_cached(ctx, padded_w, padded_h, group_size, raw_input_size);
+        // Ensure second buffer set for GOP pipelining (pre-compute next GOP during high_enc).
+        self.ensure_tw_cached_b(ctx, padded_w, padded_h, group_size, raw_input_size);
+        self.ensure_sp_cached_b(ctx, padded_w, padded_h, width, height);
         let mut tw = self.tw_cached.take().unwrap();
 
         // Per-stage wall-clock profiling (gated behind GNC_HAAR_PROFILE env var).
         let prof = std::env::var("GNC_HAAR_PROFILE").is_ok();
         let t_start = if prof { Some(std::time::Instant::now()) } else { None };
 
-        // Upload all frames to per-frame GPU buffers (avoids write_buffer race).
-        // Skip if the previous GOP pre-uploaded these frames during its high_enc phase.
-        if tw.next_gop_pre_uploaded {
-            tw.next_gop_pre_uploaded = false; // consume the pre-upload flag
-        } else {
-            for (input_buf, frame_data) in tw.per_frame_input.iter().zip(gop_frames.iter()) {
-                ctx.queue.write_buffer(input_buf, 0, bytemuck::cast_slice(frame_data));
-            }
-        }
+        // Skip spatial wavelet + temporal Haar if pre-computed during previous GOP's high_enc.
+        // This overlaps ~72ms of GPU compute with the previous GOP's Rice encoding (~100ms),
+        // saving those phases from the critical path and pushing throughput toward 60 fps.
+        let skip_spatial_haar = tw.spatial_haar_precomputed;
+        tw.spatial_haar_precomputed = false; // consume flag
 
-        let t_after_upload = if prof { Some(std::time::Instant::now()) } else { None };
-
-        // Spatial wavelet per frame — single command encoder to prevent
-        // intermediate buffer races (separate submits can overlap on GPU)
-        {
-            let bufs = self.cached.as_ref().unwrap();
-            let mut cmd = ctx
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("tw_spatial_all"),
-                });
-            for j in 0..group_size {
-                cmd.copy_buffer_to_buffer(
-                    &tw.per_frame_input[j],
-                    0,
-                    &bufs.raw_input_buf,
-                    0,
-                    raw_input_size,
-                );
-                self.dispatch_gpu_pad_cached(ctx, &mut cmd, padded_w, padded_h);
-                let bufs = self.cached.as_ref().unwrap();
-                self.color.dispatch(
-                    ctx,
-                    &mut cmd,
-                    &bufs.input_buf,
-                    &bufs.color_out,
-                    padded_w,
-                    padded_h,
-                    true,
-                    cfg.is_lossless(),
-                );
-                self.deinterleaver.dispatch(
-                    ctx,
-                    &mut cmd,
-                    &bufs.color_out,
-                    &bufs.plane_a,
-                    &bufs.co_plane,
-                    &bufs.cg_plane,
-                    padded_pixels as u32,
-                );
-
-                let planes: [&wgpu::Buffer; 3] =
-                    [&bufs.plane_a, &bufs.co_plane, &bufs.cg_plane];
-                for (p, &cur_plane) in planes.iter().enumerate() {
-                    self.transform.forward(
-                        ctx,
-                        &mut cmd,
-                        cur_plane,
-                        &bufs.plane_b,
-                        &bufs.plane_c,
-                        &info,
-                        cfg.wavelet_levels,
-                        cfg.wavelet_type,
-                    );
-                    cmd.copy_buffer_to_buffer(
-                        &bufs.plane_c,
-                        0,
-                        &tw.frame_bufs[j][p],
-                        0,
-                        plane_size,
-                    );
-                }
-            }
-            ctx.queue.submit(Some(cmd.finish()));
-            if prof { ctx.device.poll(wgpu::Maintain::Wait); }
-        }
-
-        let t_after_spatial = if prof { Some(std::time::Instant::now()) } else { None };
-
-        // 2) Temporal Haar on GPU, per plane — multilevel dyadic decomposition
+        // Skip upload + spatial wavelet + temporal Haar when pre-computed during previous GOP.
+        // When skip_spatial_haar is true, tw.frame_bufs already contains the post-spatial+Haar
+        // wavelet data for all group_size frames (computed concurrently with prev GOP's high_enc).
         let num_levels = (group_size as f64).log2() as usize;
-        #[allow(clippy::needless_range_loop)]
-        for p in 0..3 {
-            let mut current_count = group_size;
-            let mut cmd = ctx
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("tw_temporal_haar"),
-                });
-            for _level in 0..num_levels {
-                let pairs = current_count / 2;
-                for j in 0..current_count {
-                    cmd.copy_buffer_to_buffer(
-                        &tw.frame_bufs[j][p], 0, &tw.snapshot[j], 0, plane_size,
-                    );
+        let (t_after_upload, t_after_spatial, t_after_haar);
+        if skip_spatial_haar {
+            let t = if prof { Some(std::time::Instant::now()) } else { None };
+            t_after_upload = t;
+            t_after_spatial = t;
+            t_after_haar = t;
+        } else {
+            // Upload all frames to per-frame GPU buffers (avoids write_buffer race).
+            // Skip if the previous GOP pre-uploaded these frames during its high_enc phase.
+            if tw.next_gop_pre_uploaded {
+                tw.next_gop_pre_uploaded = false; // consume the pre-upload flag
+            } else {
+                for (input_buf, frame_data) in tw.per_frame_input.iter().zip(gop_frames.iter()) {
+                    ctx.queue.write_buffer(input_buf, 0, bytemuck::cast_slice(frame_data));
                 }
-                for pair in 0..pairs {
-                    self.temporal_haar.dispatch(
+            }
+
+            t_after_upload = if prof { Some(std::time::Instant::now()) } else { None };
+
+            // 1) Spatial wavelet per frame — single command encoder to prevent
+            // intermediate buffer races (separate submits can overlap on GPU)
+            {
+                let bufs = self.cached.as_ref().unwrap();
+                let mut cmd = ctx
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("tw_spatial_all"),
+                    });
+                for j in 0..group_size {
+                    cmd.copy_buffer_to_buffer(
+                        &tw.per_frame_input[j],
+                        0,
+                        &bufs.raw_input_buf,
+                        0,
+                        raw_input_size,
+                    );
+                    self.dispatch_gpu_pad_cached(ctx, &mut cmd, padded_w, padded_h);
+                    let bufs = self.cached.as_ref().unwrap();
+                    self.color.dispatch(
                         ctx,
                         &mut cmd,
-                        &tw.snapshot[pair * 2],
-                        &tw.snapshot[pair * 2 + 1],
-                        &tw.frame_bufs[pair][p],
-                        &tw.frame_bufs[pairs + pair][p],
-                        padded_pixels as u32,
+                        &bufs.input_buf,
+                        &bufs.color_out,
+                        padded_w,
+                        padded_h,
                         true,
+                        cfg.is_lossless(),
                     );
-                }
-                current_count = pairs;
-            }
-            ctx.queue.submit(Some(cmd.finish()));
-            if prof { ctx.device.poll(wgpu::Maintain::Wait); }
-        }
+                    self.deinterleaver.dispatch(
+                        ctx,
+                        &mut cmd,
+                        &bufs.color_out,
+                        &bufs.plane_a,
+                        &bufs.co_plane,
+                        &bufs.cg_plane,
+                        padded_pixels as u32,
+                    );
 
-        let t_after_haar = if prof { Some(std::time::Instant::now()) } else { None };
+                    let planes: [&wgpu::Buffer; 3] =
+                        [&bufs.plane_a, &bufs.co_plane, &bufs.cg_plane];
+                    for (p, &cur_plane) in planes.iter().enumerate() {
+                        self.transform.forward(
+                            ctx,
+                            &mut cmd,
+                            cur_plane,
+                            &bufs.plane_b,
+                            &bufs.plane_c,
+                            &info,
+                            cfg.wavelet_levels,
+                            cfg.wavelet_type,
+                        );
+                        cmd.copy_buffer_to_buffer(
+                            &bufs.plane_c,
+                            0,
+                            &tw.frame_bufs[j][p],
+                            0,
+                            plane_size,
+                        );
+                    }
+                }
+                ctx.queue.submit(Some(cmd.finish()));
+                if prof { ctx.device.poll(wgpu::Maintain::Wait); }
+            }
+
+            t_after_spatial = if prof { Some(std::time::Instant::now()) } else { None };
+
+            // 2) Temporal Haar on GPU, per plane — multilevel dyadic decomposition
+            #[allow(clippy::needless_range_loop)]
+            for p in 0..3 {
+                let mut current_count = group_size;
+                let mut cmd = ctx
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("tw_temporal_haar"),
+                    });
+                for _level in 0..num_levels {
+                    let pairs = current_count / 2;
+                    for j in 0..current_count {
+                        cmd.copy_buffer_to_buffer(
+                            &tw.frame_bufs[j][p], 0, &tw.snapshot[j], 0, plane_size,
+                        );
+                    }
+                    for pair in 0..pairs {
+                        self.temporal_haar.dispatch(
+                            ctx,
+                            &mut cmd,
+                            &tw.snapshot[pair * 2],
+                            &tw.snapshot[pair * 2 + 1],
+                            &tw.frame_bufs[pair][p],
+                            &tw.frame_bufs[pairs + pair][p],
+                            padded_pixels as u32,
+                            true,
+                        );
+                    }
+                    current_count = pairs;
+                }
+                ctx.queue.submit(Some(cmd.finish()));
+                if prof { ctx.device.poll(wgpu::Maintain::Wait); }
+            }
+
+            t_after_haar = if prof { Some(std::time::Instant::now()) } else { None };
+        } // end if !skip_spatial_haar
 
         // 3) Encode low frame from GPU buffer
         let low_cf = self.encode_from_gpu_wavelet_planes(
@@ -1503,16 +1523,89 @@ impl EncoderPipeline {
             // Single submit + single poll for ALL high frames
             ctx.queue.submit(Some(cmd.finish()));
 
-            // Async pre-upload: write next GOP's raw frames while the GPU runs high_enc (~100ms).
-            // write_buffer is a CPU memcpy (~22ms) that completes well before the GPU finishes.
-            // The staged data is applied to the NEXT queue.submit() (next GOP's spatial_wl).
-            // Per-frame_input is safe to overwrite here: the current GOP's spatial_wl already
-            // consumed it, and no remaining GPU commands in this GOP touch per_frame_input.
+            // GOP pipelining: pre-compute next GOP's spatial wavelet + temporal Haar into the B
+            // buffer set while the current GOP's Rice encoding runs on GPU (~100ms window).
+            // The spatial+haar pre-compute takes ~72ms, fitting within the high_enc window.
+            // device.poll(Wait) in finish_batch_readback waits for ALL submitted GPU work,
+            // so both high_enc (A set) and spatial+haar (B set) complete before we proceed.
+            //
+            // Buffer isolation: high_enc reads tw.frame_bufs[A]; spatial+haar writes
+            // tw_b.frame_bufs[B] and uses sp_cached_b intermediate buffers — no conflicts.
             if let Some(next_frames) = next_gop_frames {
-                for (input_buf, frame_data) in tw.per_frame_input.iter().zip(next_frames.iter()) {
+                let mut tw_b = self.tw_cached_b.take().unwrap();
+                // Write next GOP's frames to tw_b.per_frame_input (staged; consumed at submit).
+                for (input_buf, frame_data) in tw_b.per_frame_input.iter().zip(next_frames.iter()) {
                     ctx.queue.write_buffer(input_buf, 0, bytemuck::cast_slice(frame_data));
                 }
-                tw.next_gop_pre_uploaded = true;
+                // Build single command encoder: spatial_wl + temporal_haar for next GOP.
+                // Both stages share intermediate sp_b buffers and write to tw_b.frame_bufs.
+                {
+                    let sp_b = self.sp_cached_b.as_ref().unwrap();
+                    let pad_params = &self.cached.as_ref().unwrap().pad_params_buf;
+                    let mut cmd_pre = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("tw_precompute_spatial_haar"),
+                    });
+                    // Spatial wavelet for all frames into tw_b.frame_bufs
+                    for j in 0..group_size {
+                        cmd_pre.copy_buffer_to_buffer(
+                            &tw_b.per_frame_input[j], 0, &sp_b.raw_input_buf, 0, raw_input_size,
+                        );
+                        self.dispatch_gpu_pad_with(
+                            ctx, &mut cmd_pre,
+                            pad_params, &sp_b.raw_input_buf, &sp_b.input_buf,
+                            padded_w, padded_h,
+                        );
+                        self.color.dispatch(
+                            ctx, &mut cmd_pre,
+                            &sp_b.input_buf, &sp_b.color_out,
+                            padded_w, padded_h, true, cfg.is_lossless(),
+                        );
+                        self.deinterleaver.dispatch(
+                            ctx, &mut cmd_pre,
+                            &sp_b.color_out, &sp_b.plane_a, &sp_b.co_plane, &sp_b.cg_plane,
+                            padded_pixels as u32,
+                        );
+                        let planes_b: [&wgpu::Buffer; 3] =
+                            [&sp_b.plane_a, &sp_b.co_plane, &sp_b.cg_plane];
+                        for (p, &cur_plane) in planes_b.iter().enumerate() {
+                            self.transform.forward(
+                                ctx, &mut cmd_pre,
+                                cur_plane, &sp_b.plane_b, &sp_b.plane_c,
+                                &info, cfg.wavelet_levels, cfg.wavelet_type,
+                            );
+                            cmd_pre.copy_buffer_to_buffer(
+                                &sp_b.plane_c, 0, &tw_b.frame_bufs[j][p], 0, plane_size,
+                            );
+                        }
+                    }
+                    // Temporal Haar for all 3 planes on tw_b.frame_bufs
+                    #[allow(clippy::needless_range_loop)]
+                    for p in 0..3 {
+                        let mut current_count = group_size;
+                        for _level in 0..num_levels {
+                            let pairs = current_count / 2;
+                            for j in 0..current_count {
+                                cmd_pre.copy_buffer_to_buffer(
+                                    &tw_b.frame_bufs[j][p], 0, &tw_b.snapshot[j], 0, plane_size,
+                                );
+                            }
+                            for pair in 0..pairs {
+                                self.temporal_haar.dispatch(
+                                    ctx, &mut cmd_pre,
+                                    &tw_b.snapshot[pair * 2], &tw_b.snapshot[pair * 2 + 1],
+                                    &tw_b.frame_bufs[pair][p], &tw_b.frame_bufs[pairs + pair][p],
+                                    padded_pixels as u32, true,
+                                );
+                            }
+                            current_count = pairs;
+                        }
+                    }
+                    // Submit pre-compute: runs concurrently with the current GOP's Rice encoding.
+                    // No memory hazards — uses entirely separate buffers (tw_b + sp_b vs tw + cached).
+                    ctx.queue.submit(Some(cmd_pre.finish()));
+                }
+                tw_b.spatial_haar_precomputed = true;
+                self.tw_cached_b = Some(tw_b);
             }
 
             let all_frame_tiles = self.gpu_rice_encoder.finish_batch_readback(
@@ -1571,8 +1664,17 @@ impl EncoderPipeline {
 
         let t_after_high_enc = if prof { Some(std::time::Instant::now()) } else { None };
 
-        // Return cached buffers to self for reuse in next GOP
-        self.tw_cached = Some(tw);
+        // Ping-pong buffer swap for GOP pipelining:
+        // If we pre-computed next GOP's spatial+haar into tw_b, promote tw_b → tw_cached
+        // (ready for next call) and recycle tw (done) → tw_cached_b (for next pre-compute).
+        // If no pre-compute happened (last GOP or no next_gop_frames), keep tw as tw_cached.
+        if self.tw_cached_b.as_ref().map_or(false, |b| b.spatial_haar_precomputed) {
+            let tw_b = self.tw_cached_b.take().unwrap();
+            self.tw_cached_b = Some(tw);      // recycle current A → becomes next B slot
+            self.tw_cached = Some(tw_b);       // pre-computed B → becomes next A (current)
+        } else {
+            self.tw_cached = Some(tw);
+        }
 
         // Print per-stage profiling summary if GNC_HAAR_PROFILE is set.
         if prof {

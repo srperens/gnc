@@ -56,6 +56,13 @@ pub struct EncoderPipeline {
     tile_energy_reduce_bgl: wgpu::BindGroupLayout,
     pub(super) cached: Option<CachedEncodeBuffers>,
     pub(super) tw_cached: Option<CachedTemporalWaveletBuffers>,
+    /// Second temporal wavelet buffer set for GOP pipelining (B set).
+    /// While the current GOP's high_enc runs on GPU, the next GOP's
+    /// spatial wavelet + temporal Haar are pre-computed into this set.
+    pub(super) tw_cached_b: Option<CachedTemporalWaveletBuffers>,
+    /// Minimal intermediate buffers for spatial wavelet pre-compute (B set).
+    /// Allows next GOP's spatial wavelet to run concurrently with current GOP's high_enc.
+    pub(super) sp_cached_b: Option<super::buffer_cache::SpatialPrecomputeBuffers>,
 }
 
 impl EncoderPipeline {
@@ -236,6 +243,8 @@ impl EncoderPipeline {
             tile_energy_reduce_bgl,
             cached: None,
             tw_cached: None,
+            tw_cached_b: None,
+            sp_cached_b: None,
         }
     }
 
@@ -255,6 +264,46 @@ impl EncoderPipeline {
         if needs_alloc {
             self.tw_cached = Some(CachedTemporalWaveletBuffers::new(
                 ctx, padded_w, padded_h, group_size, raw_input_size,
+            ));
+        }
+    }
+
+    /// Ensure the second temporal wavelet buffer set (B) is allocated and compatible.
+    pub(super) fn ensure_tw_cached_b(
+        &mut self,
+        ctx: &GpuContext,
+        padded_w: u32,
+        padded_h: u32,
+        group_size: usize,
+        raw_input_size: u64,
+    ) {
+        let needs_alloc = match &self.tw_cached_b {
+            Some(c) => !c.is_compatible(padded_w, padded_h, group_size, raw_input_size),
+            None => true,
+        };
+        if needs_alloc {
+            self.tw_cached_b = Some(CachedTemporalWaveletBuffers::new(
+                ctx, padded_w, padded_h, group_size, raw_input_size,
+            ));
+        }
+    }
+
+    /// Ensure the spatial pre-compute buffer set (B) is allocated and compatible.
+    pub(super) fn ensure_sp_cached_b(
+        &mut self,
+        ctx: &GpuContext,
+        padded_w: u32,
+        padded_h: u32,
+        orig_w: u32,
+        orig_h: u32,
+    ) {
+        let needs_alloc = match &self.sp_cached_b {
+            Some(b) => !b.is_compatible(padded_w, padded_h),
+            None => true,
+        };
+        if needs_alloc {
+            self.sp_cached_b = Some(super::buffer_cache::SpatialPrecomputeBuffers::new(
+                ctx, padded_w, padded_h, orig_w, orig_h,
             ));
         }
     }
@@ -294,21 +343,40 @@ impl EncoderPipeline {
         padded_h: u32,
     ) {
         let bufs = self.cached.as_ref().expect("cached buffers must exist");
+        self.dispatch_gpu_pad_with(
+            ctx, cmd,
+            &bufs.pad_params_buf, &bufs.raw_input_buf, &bufs.input_buf,
+            padded_w, padded_h,
+        );
+    }
+
+    /// Dispatch GPU padding with explicit buffer references.
+    /// Used by the spatial-wavelet pre-compute path which has its own buffer set.
+    pub(super) fn dispatch_gpu_pad_with(
+        &self,
+        ctx: &GpuContext,
+        cmd: &mut wgpu::CommandEncoder,
+        pad_params_buf: &wgpu::Buffer,
+        raw_input_buf: &wgpu::Buffer,
+        input_buf: &wgpu::Buffer,
+        padded_w: u32,
+        padded_h: u32,
+    ) {
         let pad_bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("pad_bg"),
             layout: &self.pad_bgl,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: bufs.pad_params_buf.as_entire_binding(),
+                    resource: pad_params_buf.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: bufs.raw_input_buf.as_entire_binding(),
+                    resource: raw_input_buf.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: bufs.input_buf.as_entire_binding(),
+                    resource: input_buf.as_entire_binding(),
                 },
             ],
         });

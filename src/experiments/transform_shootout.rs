@@ -355,6 +355,7 @@ pub fn run_shootout(
                 &info,
                 levels,
                 wtype,
+                0,
             );
             ctx.queue.submit(Some(enc.finish()));
         });
@@ -374,6 +375,7 @@ pub fn run_shootout(
                 &info,
                 levels,
                 wtype,
+                0,
             );
             ctx.queue.submit(Some(enc.finish()));
         });
@@ -393,6 +395,7 @@ pub fn run_shootout(
             &info,
             levels,
             wtype,
+            0,
         );
         ctx.queue.submit(Some(enc.finish()));
         ctx.device.poll(wgpu::Maintain::Wait);
@@ -421,6 +424,7 @@ pub fn run_shootout(
                 &info,
                 levels,
                 wtype,
+                0,
             );
             ctx.queue.submit(Some(enc.finish()));
             ctx.device.poll(wgpu::Maintain::Wait);

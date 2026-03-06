@@ -520,13 +520,7 @@ impl EncoderPipeline {
         let chroma_padded_w = info.chroma_padded_width();
         let chroma_padded_h = info.chroma_padded_height();
         let chroma_pixels = (chroma_padded_w * chroma_padded_h) as usize;
-        let chroma_info = FrameInfo {
-            width: info.chroma_width(),
-            height: info.chroma_height(),
-            bit_depth: 8,
-            tile_size: config.tile_size,
-            chroma_format: ChromaFormat::Yuv444, // wavelet sees it as full-res within chroma dims
-        };
+        let chroma_info = info.make_chroma_info(); // subsampled dims; Yuv444 so wavelet sees full-res within chroma plane
 
         // Ensure cached buffers exist for this resolution
         self.ensure_cached(ctx, padded_w, padded_h, width, height);
@@ -605,18 +599,18 @@ impl EncoderPipeline {
         if chroma_format != ChromaFormat::Yuv444 {
             let shift_x = chroma_format.horiz_shift();
             let shift_y = chroma_format.vert_shift();
-            // dst_stride = chroma_padded_w so the downsampled data is written in padded
-            // row layout (row y starts at y * chroma_padded_w), matching what the wavelet
-            // shaders expect when they read the buffer using active_chroma_info.padded_width().
+            // Pass chroma_padded_w as dst_stride and chroma_padded_h as dst_height_padded
+            // so the shader fills the entire padded buffer (valid region + padding zone)
+            // with edge-replicated values before the wavelet transform runs.
             self.chroma_down.dispatch(
                 ctx, &mut cmd,
                 &bufs.co_plane, &bufs.co_plane_ds,
-                padded_w, padded_h, shift_x, shift_y, chroma_padded_w,
+                padded_w, padded_h, shift_x, shift_y, chroma_padded_w, chroma_padded_h,
             );
             self.chroma_down.dispatch(
                 ctx, &mut cmd,
                 &bufs.cg_plane, &bufs.cg_plane_ds,
-                padded_w, padded_h, shift_x, shift_y, chroma_padded_w,
+                padded_w, padded_h, shift_x, shift_y, chroma_padded_w, chroma_padded_h,
             );
             log::debug!(
                 "chroma_downsample: {:?} {}x{} -> {}x{} shift=({},{})",
@@ -644,6 +638,20 @@ impl EncoderPipeline {
             && !config.context_adaptive;
         let use_gpu_rice = use_gpu_encode && config.entropy_coder == EntropyCoder::Rice;
         let use_gpu_huffman = use_gpu_encode && config.entropy_coder == EntropyCoder::Huffman;
+
+        // GPU batch entropy paths (rANS, Huffman) assume all 3 planes share the same tile
+        // layout (luma tile count) and pass &info for all planes.  With non-444 chroma the
+        // chroma planes have fewer tiles, so those batch dispatches would silently produce a
+        // corrupt bitstream.  The per-plane Rice path already handles non-444 correctly.
+        // Catch any misconfiguration early rather than encoding silently corrupt output.
+        if chroma_format != ChromaFormat::Yuv444 {
+            assert!(
+                config.entropy_coder == EntropyCoder::Rice,
+                "non-444 chroma subsampling requires Rice entropy coder; \
+                 got {:?} which lacks a per-plane GPU dispatch path",
+                config.entropy_coder,
+            );
+        }
 
         // CfL requires 4:4:4 — spatial luma-chroma prediction is unreliable on
         // subsampled chroma coefficients.
@@ -843,6 +851,7 @@ impl EncoderPipeline {
                 &info,
                 config.wavelet_levels,
                 config.wavelet_type,
+                0, // plane_idx: Y
             );
             // After wavelet: plane_c has Y wavelet coefficients
 
@@ -996,6 +1005,7 @@ impl EncoderPipeline {
                 active_chroma_info,
                 config.wavelet_levels,
                 config.wavelet_type,
+                1, // plane_idx: Co
             );
 
             if use_cfl {
@@ -1097,6 +1107,7 @@ impl EncoderPipeline {
                 active_chroma_info,
                 config.wavelet_levels,
                 config.wavelet_type,
+                2, // plane_idx: Cg
             );
 
             if use_cfl {

@@ -2515,6 +2515,7 @@ fn test_pframe_divergence_checkpoints() {
             info,
             p_config.wavelet_levels,
             p_config.wavelet_type,
+            0,
         );
         ctx.queue.submit(Some(cmd.finish()));
         ctx.device.poll(wgpu::Maintain::Wait);
@@ -2876,16 +2877,55 @@ fn test_yuv444_encode_decode_roundtrip() {
 fn test_yuv422_encode_decode_roundtrip() {
     let psnr = chroma_roundtrip(crate::ChromaFormat::Yuv422);
     eprintln!("YUV 4:2:2 PSNR = {psnr:.2} dB");
-    // 4:2:2 halves horizontal chroma resolution; expect some quality loss but still reasonable
-    assert!(psnr > 25.0, "4:2:2 PSNR too low: {psnr:.2} dB");
+    // 4:2:2 halves horizontal chroma resolution.  With correct padding the wavelet
+    // transform sees valid data everywhere; PSNR should be close to 4:4:4.
+    assert!(psnr > 35.0, "4:2:2 PSNR too low: {psnr:.2} dB (chroma padding bug?)");
 }
 
 #[test]
 fn test_yuv420_encode_decode_roundtrip() {
     let psnr = chroma_roundtrip(crate::ChromaFormat::Yuv420);
     eprintln!("YUV 4:2:0 PSNR = {psnr:.2} dB");
-    // 4:2:0 quarters chroma resolution; expect further quality loss
-    assert!(psnr > 22.0, "4:2:0 PSNR too low: {psnr:.2} dB");
+    // 4:2:0 quarters chroma resolution; slightly more loss than 4:2:2.
+    assert!(psnr > 34.0, "4:2:0 PSNR too low: {psnr:.2} dB (chroma padding bug?)");
+}
+
+#[test]
+fn test_yuv420_encode_decode_roundtrip_512() {
+    // 512×512 uses 2×2 luma tiles and 1×1 chroma tiles for 4:2:0.
+    // This exposes bugs that only appear when luma tile count > chroma tile count.
+    let ctx = crate::GpuContext::new();
+    let mut encoder = EncoderPipeline::new(&ctx);
+    let decoder = DecoderPipeline::new(&ctx);
+
+    let w = 512u32;
+    let h = 512u32;
+    // Use solid gray (R=G=B=128) — with 4:2:0 chroma is flat, roundtrip should be ~inf dB
+    let rgb: Vec<f32> = vec![128.0f32; (w * h * 3) as usize];
+
+    let mut config = crate::CodecConfig::default();
+    config.chroma_format = crate::ChromaFormat::Yuv420;
+    config.quantization_step = 4.0;
+    config.cfl_enabled = false;
+
+    let compressed = encoder.encode(&ctx, &rgb, w, h, &config);
+    let decoded = decoder.decode(&ctx, &compressed);
+    let psnr = compute_psnr(&rgb, &decoded);
+    eprintln!("YUV 4:2:0 512×512 PSNR = {psnr:.2} dB chroma_format={:?}", compressed.info.chroma_format);
+
+    // Also test 4:4:4 at same settings to verify encoder/decoder work
+    let mut config2 = crate::CodecConfig::default();
+    config2.chroma_format = crate::ChromaFormat::Yuv444;
+    config2.quantization_step = 4.0;
+    config2.cfl_enabled = false;
+    let mut encoder2 = EncoderPipeline::new(&ctx);
+    let decoder2 = crate::decoder::pipeline::DecoderPipeline::new(&ctx);
+    let compressed2 = encoder2.encode(&ctx, &rgb, w, h, &config2);
+    let decoded2 = decoder2.decode(&ctx, &compressed2);
+    let psnr2 = compute_psnr(&rgb, &decoded2);
+    eprintln!("YUV 4:4:4 512×512 PSNR = {psnr2:.2} dB (control)");
+
+    assert!(psnr > 35.0, "4:2:0 512×512 PSNR too low: {psnr:.2} dB");
 }
 
 #[test]

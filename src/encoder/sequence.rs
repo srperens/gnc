@@ -638,6 +638,7 @@ impl EncoderPipeline {
                                     &info,
                                     cfg.wavelet_levels,
                                     cfg.wavelet_type,
+                                    p,
                                 );
                                 cmd.copy_buffer_to_buffer(
                                     &bufs.plane_c,
@@ -871,6 +872,7 @@ impl EncoderPipeline {
                                 &info,
                                 cfg.wavelet_levels,
                                 cfg.wavelet_type,
+                                p,
                             );
                             cmd.copy_buffer_to_buffer(
                                 &bufs.plane_c,
@@ -1154,6 +1156,7 @@ impl EncoderPipeline {
                             &info,
                             cfg.wavelet_levels,
                             cfg.wavelet_type,
+                            p,
                         );
                         cmd.copy_buffer_to_buffer(
                             &bufs.plane_c,
@@ -1573,6 +1576,7 @@ impl EncoderPipeline {
                                 ctx, &mut cmd_pre,
                                 cur_plane, &sp_b.plane_b, &sp_b.plane_c,
                                 &info, cfg.wavelet_levels, cfg.wavelet_type,
+                                p,
                             );
                             cmd_pre.copy_buffer_to_buffer(
                                 &sp_b.plane_c, 0, &tw_b.frame_bufs[j][p], 0, plane_size,
@@ -1911,6 +1915,7 @@ impl EncoderPipeline {
                     info,
                     config.wavelet_levels,
                     config.wavelet_type,
+                    p,
                 );
             } else {
                 // Standard path: cg_plane → plane_c(scratch) → plane_a
@@ -1923,6 +1928,7 @@ impl EncoderPipeline {
                     info,
                     config.wavelet_levels,
                     config.wavelet_type,
+                    p,
                 );
             }
 
@@ -2188,6 +2194,7 @@ impl EncoderPipeline {
                     info,
                     config.wavelet_levels,
                     config.wavelet_type,
+                    p,
                 );
                 self.quantize.dispatch(
                     ctx,
@@ -2289,6 +2296,7 @@ impl EncoderPipeline {
                         info,
                         config.wavelet_levels,
                         config.wavelet_type,
+                        p,
                     );
                     self.motion.compensate_cached(
                         ctx,
@@ -2492,6 +2500,7 @@ impl EncoderPipeline {
                     info,
                     config.wavelet_levels,
                     config.wavelet_type,
+                    p,
                 );
                 self.quantize.dispatch(
                     ctx,
@@ -2588,6 +2597,7 @@ impl EncoderPipeline {
                         info,
                         config.wavelet_levels,
                         config.wavelet_type,
+                        p,
                     );
                     self.motion.compensate_cached(
                         ctx,
@@ -2834,6 +2844,7 @@ impl EncoderPipeline {
                     info,
                     config.wavelet_levels,
                     config.wavelet_type,
+                    p,
                 );
                 self.quantize.dispatch(
                     ctx,
@@ -3053,6 +3064,7 @@ impl EncoderPipeline {
                     info,
                     config.wavelet_levels,
                     config.wavelet_type,
+                    p,
                 );
                 self.quantize.dispatch(
                     ctx,
@@ -3213,6 +3225,7 @@ impl EncoderPipeline {
                 info,
                 config.wavelet_levels,
                 config.wavelet_type,
+                p,
             );
 
             // quantize: plane_c → recon_y
@@ -3306,6 +3319,7 @@ impl EncoderPipeline {
                 info,
                 config.wavelet_levels,
                 config.wavelet_type,
+                p,
             );
 
             // copy wavelet coeffs to staging

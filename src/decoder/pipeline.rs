@@ -1331,6 +1331,7 @@ impl DecoderPipeline {
                 info,
                 config.wavelet_levels,
                 config.wavelet_type,
+                0, // single-plane cmd encoder, no slot collision
             );
             cmd.copy_buffer_to_buffer(
                 &bufs.scratch_a,
@@ -1451,6 +1452,7 @@ impl DecoderPipeline {
                 info,
                 config.wavelet_levels,
                 config.wavelet_type,
+                0, // single-plane cmd encoder, no slot collision
             );
             cmd.copy_buffer_to_buffer(
                 &bufs.scratch_a,

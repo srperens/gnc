@@ -215,6 +215,7 @@ impl DecoderPipeline {
                 info,
                 config.wavelet_levels,
                 config.wavelet_type,
+                0, // single-plane cmd encoder
             );
 
             ctx.queue.submit(Some(cmd.finish()));

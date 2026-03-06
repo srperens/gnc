@@ -130,6 +130,21 @@ impl FrameInfo {
     pub fn luma_tiles_per_plane(&self) -> usize {
         (self.tiles_x() * self.tiles_y()) as usize
     }
+
+    /// Build a FrameInfo describing the chroma plane in its own coordinate space.
+    ///
+    /// For 4:4:4 this is identical to `*self`.
+    /// For 4:2:2 / 4:2:0 the width/height are the subsampled chroma dimensions, and
+    /// `chroma_format` is set to `Yuv444` so that `tiles_x()`/`tiles_y()` return the
+    /// correct tile count for the (smaller) chroma plane rather than luma tile count.
+    pub fn make_chroma_info(&self) -> FrameInfo {
+        FrameInfo {
+            width: self.chroma_width(),
+            height: self.chroma_height(),
+            chroma_format: ChromaFormat::Yuv444,
+            ..*self
+        }
+    }
 }
 
 /// Per-subband quantization weight multipliers.

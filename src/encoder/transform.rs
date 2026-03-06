@@ -18,8 +18,12 @@ struct TransformParams {
 
 /// Maximum wavelet decomposition levels supported
 const MAX_LEVELS: usize = 8;
-/// Slots: MAX_LEVELS * 2 (row+col) * 2 (fwd+inv)
-const MAX_PARAM_SLOTS: usize = MAX_LEVELS * 2 * 2;
+/// Maximum number of planes encoded in one command encoder (Y + Co + Cg = 3)
+const MAX_PLANES: usize = 3;
+/// Slots per plane: MAX_LEVELS * 2 (row+col pass per level)
+const SLOTS_PER_PLANE: usize = MAX_LEVELS * 2;
+/// Total slots: 2 directions (fwd+inv) × MAX_PLANES × SLOTS_PER_PLANE
+const MAX_PARAM_SLOTS: usize = 2 * MAX_PLANES * SLOTS_PER_PLANE;
 /// GPU uniform buffer offset alignment (256 bytes covers all backends)
 const UBO_ALIGN: usize = 256;
 
@@ -180,6 +184,10 @@ impl WaveletTransform {
 
     /// Run multi-level 2D forward wavelet transform.
     /// Uses dynamic uniform buffer to avoid per-dispatch buffer allocation.
+    ///
+    /// `plane_idx` (0, 1 or 2) selects an independent set of param slots so that
+    /// Y, Co and Cg transforms can share the same command encoder without their
+    /// params overwriting each other.
     #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
@@ -191,12 +199,15 @@ impl WaveletTransform {
         info: &FrameInfo,
         levels: u32,
         wavelet_type: WaveletType,
+        plane_idx: usize,
     ) {
+        // Each plane gets its own SLOTS_PER_PLANE-wide range in the forward half.
+        let plane_slot_base = plane_idx * SLOTS_PER_PLANE;
         // Pre-fill all param slots for this forward transform
         let mut region = info.tile_size;
         for level in 0..levels as usize {
-            let row_slot = level * 2;
-            let col_slot = level * 2 + 1;
+            let row_slot = plane_slot_base + level * 2;
+            let col_slot = plane_slot_base + level * 2 + 1;
             let params_row = TransformParams {
                 width: info.padded_width(),
                 height: info.padded_height(),
@@ -239,8 +250,8 @@ impl WaveletTransform {
         region = info.tile_size;
 
         for level in 0..levels as usize {
-            let row_offset = (level * 2 * UBO_ALIGN) as u32;
-            let col_offset = ((level * 2 + 1) * UBO_ALIGN) as u32;
+            let row_offset = ((plane_slot_base + level * 2) * UBO_ALIGN) as u32;
+            let col_offset = ((plane_slot_base + level * 2 + 1) * UBO_ALIGN) as u32;
 
             let bg_row = if level == 0 { &bg_a } else { &bg_c };
 
@@ -272,6 +283,10 @@ impl WaveletTransform {
 
     /// Run multi-level 2D inverse wavelet transform.
     /// Uses dynamic uniform buffer to avoid per-dispatch buffer allocation.
+    ///
+    /// `plane_idx` (0, 1 or 2) selects an independent set of param slots so that
+    /// Y, Co and Cg transforms can share the same command encoder without their
+    /// params overwriting each other.
     #[allow(clippy::too_many_arguments)]
     pub fn inverse(
         &self,
@@ -283,15 +298,16 @@ impl WaveletTransform {
         info: &FrameInfo,
         levels: u32,
         wavelet_type: WaveletType,
+        plane_idx: usize,
     ) {
         let buf_size = (info.padded_width() * info.padded_height()) as u64 * 4;
 
         // Copy input_buf -> output_buf first so we have all subbands in output_buf.
         encoder.copy_buffer_to_buffer(input_buf, 0, output_buf, 0, buf_size);
 
-        // Pre-fill param slots for inverse (use slots starting at MAX_LEVELS*2 to avoid
-        // conflict with forward slots)
-        let base_slot = MAX_LEVELS * 2;
+        // Inverse slots occupy the second half of the param buffer (after forward slots).
+        // Each plane gets its own SLOTS_PER_PLANE-wide range within the inverse half.
+        let base_slot = MAX_PLANES * SLOTS_PER_PLANE + plane_idx * SLOTS_PER_PLANE;
         let min_region = info.tile_size >> (levels - 1);
         let mut region = min_region;
         for level in 0..levels as usize {
@@ -339,6 +355,7 @@ impl WaveletTransform {
         for level in 0..levels as usize {
             let col_offset = ((base_slot + level * 2) * UBO_ALIGN) as u32;
             let row_offset = ((base_slot + level * 2 + 1) * UBO_ALIGN) as u32;
+            // Note: base_slot already includes the inverse-half offset and plane_idx offset.
 
             // Inverse column pass: output_buf -> temp_buf
             {

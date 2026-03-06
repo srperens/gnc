@@ -1,20 +1,22 @@
-// Chroma downsampling: box-filter average for 4:2:2 (2:1 horiz) and 4:2:0 (2:2 box).
+// Chroma downsampling: box-filter average for 4:2:2 (2:1 horiz) and 4:2:0 (2-2 box).
 // shift_x and shift_y control the subsampling ratio (0 = no change, 1 = half).
 //
-// dst_stride is the row stride used when writing output — may differ from dst_width
-// when the destination buffer uses a padded layout (e.g. chroma data in a padded plane).
-// Set dst_stride = dst_width for compact layout, or dst_stride = padded_dst_width for
-// padded layout (so the output is compatible with shaders that read using padded_width).
+// The shader processes the full dst_stride × dst_height_padded region (tile-aligned).
+// For pixels in the valid chroma region (col < dst_width && row < dst_height) it
+// computes a box-filter average from the source.  For pixels in the padding zone
+// (col >= dst_width or row >= dst_height) it replicates the nearest valid edge pixel.
+// This ensures the entire padded buffer is initialised before the wavelet transform
+// runs, eliminating the garbage-data corruption that caused 28-36 dB PSNR loss.
 
 struct Params {
-    src_width:  u32,
-    src_height: u32,
-    dst_width:  u32,
-    dst_height: u32,
-    shift_x:    u32,
-    shift_y:    u32,
-    dst_stride: u32,  // row stride for dst writes; use dst_width for compact layout
-    _pad1:      u32,
+    src_width:         u32,
+    src_height:        u32,
+    dst_width:         u32,   // valid chroma width  (before tile rounding)
+    dst_height:        u32,   // valid chroma height (before tile rounding)
+    dst_stride:        u32,   // = chroma_padded_width  (tile-aligned row stride)
+    dst_height_padded: u32,   // = chroma_padded_height (tile-aligned)
+    shift_x:           u32,
+    shift_y:           u32,
 }
 
 @group(0) @binding(0) var<uniform>             params: Params;
@@ -24,29 +26,33 @@ struct Params {
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
-    if idx >= params.dst_width * params.dst_height { return; }
+    let total = params.dst_stride * params.dst_height_padded;
+    if idx >= total { return; }
 
-    let dx = idx % params.dst_width;
-    let dy = idx / params.dst_width;
+    let col = idx % params.dst_stride;
+    let row = idx / params.dst_stride;
 
-    let sx_start = dx << params.shift_x;
-    let sy_start = dy << params.shift_y;
+    // Clamp to the valid chroma region for edge replication in the padding zone.
+    let clamped_col = min(col, params.dst_width  - 1u);
+    let clamped_row = min(row, params.dst_height - 1u);
 
+    // Map clamped dst pixel back to the top-left source pixel of its block.
+    let sx_start = clamped_col << params.shift_x;
+    let sy_start = clamped_row << params.shift_y;
+
+    // Box-filter average over the source block (clamped to source bounds).
     var sum   = 0.0f;
     var count = 0u;
     let kx = 1u << params.shift_x;
     let ky = 1u << params.shift_y;
     for (var oy = 0u; oy < ky; oy++) {
         for (var ox = 0u; ox < kx; ox++) {
-            let px = sx_start + ox;
-            let py = sy_start + oy;
-            if px < params.src_width && py < params.src_height {
-                sum   += src[py * params.src_width + px];
-                count += 1u;
-            }
+            let px = min(sx_start + ox, params.src_width  - 1u);
+            let py = min(sy_start + oy, params.src_height - 1u);
+            sum   += src[py * params.src_width + px];
+            count += 1u;
         }
     }
-    // Write using dst_stride (padded row width) so output layout matches
-    // the padded plane format expected by subsequent wavelet shaders.
-    dst[dy * params.dst_stride + dx] = sum / f32(count);
+    // idx == row * dst_stride + col, which is the correct padded-layout offset.
+    dst[idx] = sum / f32(count);
 }

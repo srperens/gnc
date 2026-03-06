@@ -13,14 +13,14 @@ use crate::GpuContext;
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 struct ChromaResampleParams {
-    src_width:  u32,
-    src_height: u32,
-    dst_width:  u32,
-    dst_height: u32,
-    shift_x:    u32,
-    shift_y:    u32,
-    dst_stride: u32,  // row stride for dst writes (downsample only; equals dst_width in upsample)
-    _pad1:      u32,
+    src_width:         u32,
+    src_height:        u32,
+    dst_width:         u32,
+    dst_height:        u32,
+    dst_stride:        u32,  // tile-aligned row stride (= chroma_padded_width for downsample)
+    dst_height_padded: u32,  // tile-aligned height     (= chroma_padded_height for downsample)
+    shift_x:           u32,
+    shift_y:           u32,
 }
 
 /// GPU pipeline for chroma resampling (either downsample or upsample).
@@ -124,10 +124,12 @@ impl ChromaResampler {
     /// - `src_buf` / `dst_buf` must be `STORAGE` f32 buffers.
     /// - `src_w` / `src_h` are the source (luma padded) dimensions.
     /// - `shift_x` / `shift_y` are the log2 scale factors.
-    /// - `dst_stride` is the row stride for writing into `dst_buf`.
-    ///   Pass the padded chroma width (e.g. `info.chroma_padded_width()`) so the output
-    ///   layout matches what subsequent wavelet shaders expect (padded row layout).
-    ///   Pass `src_w >> shift_x` for compact/flat layout.
+    /// - `dst_stride` is the tile-aligned chroma row stride (= `chroma_padded_width`).
+    /// - `dst_height_padded` is the tile-aligned chroma height (= `chroma_padded_height`).
+    ///
+    /// The shader writes the full `dst_stride × dst_height_padded` region, padding
+    /// columns/rows beyond the valid chroma area with edge-replicated values so the
+    /// wavelet transform finds no uninitialised garbage in the buffer.
     #[allow(clippy::too_many_arguments)]
     pub fn dispatch(
         &self,
@@ -140,11 +142,12 @@ impl ChromaResampler {
         shift_x: u32,
         shift_y: u32,
         dst_stride: u32,
+        dst_height_padded: u32,
     ) {
-        // Downsample: dst_w = src_w >> shift_x, dst_h = src_h >> shift_y
-        let dst_w = src_w >> shift_x;
-        let dst_h = src_h >> shift_y;
-        self.dispatch_raw(ctx, cmd, src_buf, dst_buf, src_w, src_h, dst_w, dst_h, shift_x, shift_y, dst_stride);
+        // Valid dst dims are derived from the source dims and shift factors.
+        self.dispatch_raw(ctx, cmd, src_buf, dst_buf, src_w, src_h,
+            src_w >> shift_x, src_h >> shift_y, shift_x, shift_y,
+            dst_stride, dst_height_padded);
     }
 
     /// Dispatch upsample: src is chroma-sized (padded), dst is luma-sized.
@@ -163,8 +166,8 @@ impl ChromaResampler {
         shift_x: u32,
         shift_y: u32,
     ) {
-        // Upsample always writes to dst_w * dst_h contiguous pixels; dst_stride = dst_w.
-        self.dispatch_raw(ctx, cmd, src_buf, dst_buf, src_w, src_h, dst_w, dst_h, shift_x, shift_y, dst_w);
+        // Upsample writes to dst_w * dst_h pixels; dst_stride = dst_w, dst_height_padded = dst_h.
+        self.dispatch_raw(ctx, cmd, src_buf, dst_buf, src_w, src_h, dst_w, dst_h, shift_x, shift_y, dst_w, dst_h);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -181,16 +184,17 @@ impl ChromaResampler {
         shift_x: u32,
         shift_y: u32,
         dst_stride: u32,
+        dst_height_padded: u32,
     ) {
         let params = ChromaResampleParams {
             src_width:  src_w,
             src_height: src_h,
             dst_width:  dst_w,
             dst_height: dst_h,
+            dst_stride,
+            dst_height_padded,
             shift_x,
             shift_y,
-            dst_stride,
-            _pad1: 0,
         };
 
         let params_buf =
@@ -220,7 +224,9 @@ impl ChromaResampler {
             ],
         });
 
-        let total_dst = dst_w * dst_h;
+        // Dispatch over the full padded output region (dst_stride × dst_height_padded)
+        // so every element — including padding — is written before the wavelet runs.
+        let total_dst = dst_stride * dst_height_padded;
         let workgroups = total_dst.div_ceil(256);
 
         let mut pass = cmd.begin_compute_pass(&wgpu::ComputePassDescriptor {

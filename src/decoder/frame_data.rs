@@ -35,13 +35,7 @@ impl DecoderPipeline {
         let plane_info: [&FrameInfo; 3] = if info.chroma_format == ChromaFormat::Yuv444 {
             [info, info, info]
         } else {
-            chroma_info_storage = FrameInfo {
-                width: info.chroma_width(),
-                height: info.chroma_height(),
-                bit_depth: info.bit_depth,
-                tile_size: info.tile_size,
-                chroma_format: ChromaFormat::Yuv444,
-            };
+            chroma_info_storage = info.make_chroma_info();
             [info, &chroma_info_storage, &chroma_info_storage]
         };
 

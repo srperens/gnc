@@ -32,13 +32,7 @@ impl DecoderPipeline {
             if info.chroma_format == ChromaFormat::Yuv444 {
                 (luma_tiles_per_plane, [info, info, info])
             } else {
-                chroma_info_storage = FrameInfo {
-                    width: info.chroma_width(),
-                    height: info.chroma_height(),
-                    bit_depth: info.bit_depth,
-                    tile_size: info.tile_size,
-                    chroma_format: ChromaFormat::Yuv444,
-                };
+                chroma_info_storage = info.make_chroma_info();
                 (
                     info.chroma_tiles_per_plane(),
                     [info, &chroma_info_storage, &chroma_info_storage],
@@ -272,6 +266,7 @@ impl DecoderPipeline {
                         p_info,
                         config.wavelet_levels,
                         config.wavelet_type,
+                        p, // plane_idx: avoids param slot collision in non-444 mode
                     );
                 } else {
                     self.transform.inverse(
@@ -283,6 +278,7 @@ impl DecoderPipeline {
                         p_info,
                         config.wavelet_levels,
                         config.wavelet_type,
+                        p, // plane_idx: avoids param slot collision in non-444 mode
                     );
                 }
             } // end wavelet decode path

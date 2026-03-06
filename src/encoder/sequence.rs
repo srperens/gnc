@@ -704,7 +704,8 @@ impl EncoderPipeline {
                     );
 
                     // 4) Encode high frames per level with per-tile adaptive muls
-                    let high_cfg = cfg.clone();
+                    let mut high_cfg = cfg.clone();
+                    high_cfg.cfl_enabled = false; // temporal highpass: CfL alpha regression is unreliable on temporal residuals
                     let max_mul = config.temporal_highpass_qstep_mul;
                     let mut high_cfs: Vec<Vec<CompressedFrame>> = Vec::new();
                     for lvl in 0..num_levels {
@@ -905,7 +906,8 @@ impl EncoderPipeline {
                     );
 
                     // 4) Encode highpass frames (d0, d1) with per-tile adaptive muls
-                    let high_cfg = cfg.clone();
+                    let mut high_cfg = cfg.clone();
+                    high_cfg.cfl_enabled = false; // temporal highpass: CfL alpha regression is unreliable on temporal residuals
                     let max_mul = config.temporal_highpass_qstep_mul;
 
                     // TemporalGroup format: low_frame + high_frames[level][idx]
@@ -1156,67 +1158,239 @@ impl EncoderPipeline {
             padded_pixels,
         );
 
-        // 4) Encode high frames per level with per-tile adaptive muls
-        let high_cfg = cfg.clone();
+        // 4) Encode high frames per level with per-tile adaptive muls.
+        //    CfL is disabled for highpass frames (alpha regression unreliable on residuals).
+        //    Batched: all non-zero frames are quantized+rice-encoded in ONE command encoder
+        //    (single submit+poll) to eliminate per-frame CPU-GPU sync overhead.
+        let mut high_cfg = cfg.clone();
+        high_cfg.cfl_enabled = false; // temporal highpass: CfL alpha regression is unreliable on temporal residuals
         let max_mul = config.temporal_highpass_qstep_mul;
-        let mut high_cfs: Vec<Vec<CompressedFrame>> = Vec::new();
+
+        // --- Pass A: Compute adaptive muls for all high frames in ONE batched readback ---
+        // Build the ordered list of (buf_idx, lvl, idx) for all high frames
+        struct HighFrameInfo {
+            tile_muls: Vec<f32>,
+            buf_idx: usize,
+            is_zero: bool,
+            wm_data: Option<Vec<f32>>,
+        }
+
+        // Collect buf_idx order (matches level/idx nested loop order)
+        let mut hframe_buf_indices: Vec<(usize, usize, usize)> = Vec::new(); // (buf_idx, lvl, idx)
         for lvl in 0..num_levels {
             let count = group_size >> (lvl + 1);
             let start = group_size >> (lvl + 1);
-            let mut lvl_frames: Vec<CompressedFrame> = Vec::new();
             for idx in 0..count {
-                let buf_idx = start + idx;
-                let (tile_muls, max_abs) = if config.adaptive_temporal_mul {
-                    Self::compute_temporal_tile_muls(
-                        ctx,
-                        &tw.frame_bufs[buf_idx][0],
-                        padded_w,
-                        padded_h,
-                        cfg.tile_size,
-                        max_mul,
-                    )
-                } else {
-                    // Fixed mul: uniform weight for all tiles
-                    let tiles_x = padded_w / cfg.tile_size;
-                    let tiles_y = padded_h / cfg.tile_size;
-                    (vec![max_mul; (tiles_x * tiles_y) as usize], f32::MAX)
-                };
-                if std::env::var("GNC_TW_DIAG").is_ok() {
-                    let mut sorted = tile_muls.clone();
-                    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                    let n = sorted.len();
-                    let pct = |p: usize| sorted[(p * n / 100).min(n - 1)];
-                    let all_zero = max_abs < high_cfg.dead_zone * high_cfg.quantization_step;
-                    eprintln!(
-                        "  TW L{} H{}: {} tiles  mul p10={:.3} p50={:.3} p90={:.3}  eff_qstep=[{:.2}..{:.2}]  skip={}",
-                        lvl, idx, n, pct(10), pct(50), pct(90),
-                        high_cfg.quantization_step * sorted[0],
-                        high_cfg.quantization_step * sorted[n - 1],
-                        all_zero,
+                hframe_buf_indices.push((start + idx, lvl, idx));
+            }
+        }
+        let total_high_frames = hframe_buf_indices.len();
+
+        let mul_results: Vec<(Vec<f32>, f32)> = if config.adaptive_temporal_mul {
+            // Batch all Y-plane readbacks into a single submit+poll (eliminates N-1 extra syncs)
+            let y_bufs: Vec<&wgpu::Buffer> = hframe_buf_indices
+                .iter()
+                .map(|&(buf_idx, _, _)| &tw.frame_bufs[buf_idx][0])
+                .collect();
+            Self::compute_temporal_tile_muls_batch(
+                ctx,
+                &y_bufs,
+                padded_w,
+                padded_h,
+                cfg.tile_size,
+                max_mul,
+            )
+        } else {
+            let tiles_x = padded_w / cfg.tile_size;
+            let tiles_y = padded_h / cfg.tile_size;
+            vec![(vec![max_mul; (tiles_x * tiles_y) as usize], f32::MAX); total_high_frames]
+        };
+
+        let mut hframe_infos: Vec<HighFrameInfo> = Vec::with_capacity(total_high_frames);
+        for (i, &(buf_idx, lvl, idx)) in hframe_buf_indices.iter().enumerate() {
+            let (tile_muls, max_abs) = mul_results[i].clone();
+            if std::env::var("GNC_TW_DIAG").is_ok() {
+                let mut sorted = tile_muls.clone();
+                sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let n = sorted.len();
+                let pct = |p: usize| sorted[(p * n / 100).min(n - 1)];
+                let all_zero = max_abs < high_cfg.dead_zone * high_cfg.quantization_step;
+                eprintln!(
+                    "  TW L{} H{}: {} tiles  mul p10={:.3} p50={:.3} p90={:.3}  eff_qstep=[{:.2}..{:.2}]  skip={}",
+                    lvl, idx, n, pct(10), pct(50), pct(90),
+                    high_cfg.quantization_step * sorted[0],
+                    high_cfg.quantization_step * sorted[n - 1],
+                    all_zero,
+                );
+            }
+            let is_zero = max_abs < high_cfg.dead_zone * high_cfg.quantization_step;
+            hframe_infos.push(HighFrameInfo { tile_muls, buf_idx, is_zero, wm_data: None });
+        }
+
+        // --- Pass B: Expand weight maps for non-zero frames (CPU work, no GPU sync) ---
+        let tiles_x = padded_w / cfg.tile_size;
+        let tiles_y = padded_h / cfg.tile_size;
+        let ll_size = high_cfg.tile_size >> high_cfg.wavelet_levels;
+        let ll_block_size = AQ_LL_BLOCK_SIZE.min(ll_size);
+        let ll_bx = ll_size.div_ceil(ll_block_size);
+        let ll_by = ll_bx;
+        let blocks_per_tile = (ll_bx * ll_by) as usize;
+        let total_blocks = (tiles_x * tiles_y) as usize * blocks_per_tile;
+
+        for hf in &mut hframe_infos {
+            if hf.is_zero {
+                continue;
+            }
+            let mut expanded = vec![1.0f32; total_blocks];
+            for ty_idx in 0..tiles_y as usize {
+                for tx_idx in 0..tiles_x as usize {
+                    let tile_idx = ty_idx * tiles_x as usize + tx_idx;
+                    let w = hf.tile_muls[tile_idx];
+                    for by in 0..ll_by as usize {
+                        for bx in 0..ll_bx as usize {
+                            let global_bx = tx_idx * ll_bx as usize + bx;
+                            let global_by = ty_idx * ll_bx as usize + by;
+                            let global_blocks_x = ll_bx as usize * tiles_x as usize;
+                            expanded[global_by * global_blocks_x + global_bx] = w;
+                        }
+                    }
+                }
+            }
+            hf.wm_data = Some(expanded);
+        }
+
+        // Count non-zero frames for batch sizing
+        let non_zero_frames: Vec<usize> = hframe_infos
+            .iter()
+            .enumerate()
+            .filter(|(_, hf)| !hf.is_zero)
+            .map(|(i, _)| i)
+            .collect();
+        let batch_size = non_zero_frames.len();
+
+        // --- Pass C: Batch encode all non-zero high frames in one command encoder ---
+        let mut high_cfs: Vec<Vec<CompressedFrame>> = Vec::new();
+
+        if batch_size > 0 {
+            use wgpu::util::DeviceExt;
+
+            let num_tiles = (info.tiles_x() * info.tiles_y()) as usize;
+            self.gpu_rice_encoder.prepare_batch_staging(ctx, num_tiles, batch_size);
+
+            let weights_luma = high_cfg.subband_weights.pack_weights();
+            let weights_chroma = high_cfg.subband_weights.pack_weights_chroma();
+            let bufs = self.cached.as_ref().unwrap();
+            let quant_dests: [&wgpu::Buffer; 3] = [&bufs.mc_out, &bufs.ref_upload, &bufs.plane_b];
+
+            // Build weight-map GPU buffers (created per-frame, owned here)
+            let mut wm_bufs: Vec<wgpu::Buffer> = Vec::with_capacity(batch_size);
+            for &fi in &non_zero_frames {
+                let expanded = hframe_infos[fi].wm_data.as_ref().unwrap();
+                wm_bufs.push(ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("tw_aq_weight_map_batch"),
+                    contents: bytemuck::cast_slice(expanded),
+                    usage: wgpu::BufferUsages::STORAGE,
+                }));
+            }
+
+            let mut cmd = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("tw_high_frames_batch"),
+            });
+
+            for (slot, &fi) in non_zero_frames.iter().enumerate() {
+                let hf = &hframe_infos[fi];
+                let plane_bufs: [&wgpu::Buffer; 3] = [
+                    &tw.frame_bufs[hf.buf_idx][0],
+                    &tw.frame_bufs[hf.buf_idx][1],
+                    &tw.frame_bufs[hf.buf_idx][2],
+                ];
+
+                let wm_buf = &wm_bufs[slot];
+                let wm_param = Some((
+                    wm_buf as &wgpu::Buffer,
+                    ll_block_size,
+                    ll_bx,
+                    tiles_x,
+                ));
+
+                // Quantize 3 planes (non-CfL path: just dispatch_adaptive for each)
+                for p in 0..3 {
+                    let weights = if p == 0 { &weights_luma } else { &weights_chroma };
+                    cmd.copy_buffer_to_buffer(plane_bufs[p], 0, &bufs.plane_c, 0, plane_size);
+                    self.quantize.dispatch_adaptive(
+                        ctx, &mut cmd, &bufs.plane_c, quant_dests[p],
+                        padded_pixels as u32, high_cfg.quantization_step, high_cfg.dead_zone,
+                        true, padded_w, padded_h, high_cfg.tile_size, high_cfg.wavelet_levels,
+                        weights, wm_param, 0.0,
                     );
                 }
-                if max_abs < high_cfg.dead_zone * high_cfg.quantization_step {
-                    // Frame is all-zero after quantization — push synthetic zero frame
-                    lvl_frames.push(Self::make_zero_compressed_frame(&high_cfg, &info));
-                    continue;
-                }
-                let cf = self.encode_from_gpu_wavelet_planes_weighted(
+
+                // Rice-encode 3 quantized planes, copying to per-frame batch staging slot
+                self.gpu_rice_encoder.dispatch_3planes_to_cmd_batch(
                     ctx,
-                    [
-                        &tw.frame_bufs[buf_idx][0],
-                        &tw.frame_bufs[buf_idx][1],
-                        &tw.frame_bufs[buf_idx][2],
-                    ],
-                    &high_cfg,
+                    &mut cmd,
+                    quant_dests,
                     &info,
-                    padded_w,
-                    padded_h,
-                    padded_pixels,
-                    Some(&tile_muls),
+                    high_cfg.wavelet_levels,
+                    slot,
                 );
-                lvl_frames.push(cf);
             }
-            high_cfs.push(lvl_frames);
+
+            // Single submit + single poll for ALL high frames
+            ctx.queue.submit(Some(cmd.finish()));
+
+            let all_frame_tiles = self.gpu_rice_encoder.finish_batch_readback(
+                ctx,
+                &info,
+                high_cfg.wavelet_levels,
+                batch_size,
+            );
+
+            // Assemble CompressedFrames for all frames (zero and non-zero) per level
+            let mut slot_iter = all_frame_tiles.into_iter();
+            let mut per_frame_tiles: Vec<Option<Vec<rice::RiceTile>>> =
+                vec![None; hframe_infos.len()];
+            for &fi in &non_zero_frames {
+                per_frame_tiles[fi] = Some(slot_iter.next().unwrap());
+            }
+
+            let mut frame_idx = 0;
+            for lvl in 0..num_levels {
+                let count = group_size >> (lvl + 1);
+                let mut lvl_frames: Vec<CompressedFrame> = Vec::new();
+                for _idx in 0..count {
+                    let hf = &hframe_infos[frame_idx];
+                    if hf.is_zero {
+                        lvl_frames.push(Self::make_zero_compressed_frame(&high_cfg, &info));
+                    } else {
+                        let rice_tiles = per_frame_tiles[frame_idx].take().unwrap();
+                        lvl_frames.push(CompressedFrame {
+                            info,
+                            config: high_cfg.clone(),
+                            entropy: EntropyData::Rice(rice_tiles),
+                            cfl_alphas: None,
+                            weight_map: hframe_infos[frame_idx].wm_data.clone(),
+                            frame_type: FrameType::Intra,
+                            motion_field: None,
+                            intra_modes: None,
+                            residual_stats: None,
+                            residual_stats_co: None,
+                            residual_stats_cg: None,
+                        });
+                    }
+                    frame_idx += 1;
+                }
+                high_cfs.push(lvl_frames);
+            }
+        } else {
+            // All high frames are zero — just push synthetic zero frames
+            for lvl in 0..num_levels {
+                let count = group_size >> (lvl + 1);
+                let lvl_frames: Vec<CompressedFrame> = (0..count)
+                    .map(|_| Self::make_zero_compressed_frame(&high_cfg, &info))
+                    .collect();
+                high_cfs.push(lvl_frames);
+            }
         }
 
         // Return cached buffers to self for reuse in next GOP
@@ -3526,6 +3700,112 @@ impl EncoderPipeline {
         }
 
         (muls, global_max_abs)
+    }
+
+    /// Batch version of `compute_temporal_tile_muls`.
+    ///
+    /// Copies all Y planes in a single command encoder (one submit+poll), eliminating
+    /// per-frame CPU-GPU sync overhead. Returns one `(muls, global_max_abs)` per input plane.
+    fn compute_temporal_tile_muls_batch(
+        ctx: &GpuContext,
+        y_plane_bufs: &[&wgpu::Buffer],
+        padded_w: u32,
+        padded_h: u32,
+        tile_size: u32,
+        max_mul: f32,
+    ) -> Vec<(Vec<f32>, f32)> {
+        if y_plane_bufs.is_empty() {
+            return Vec::new();
+        }
+        let padded_pixels = (padded_w * padded_h) as usize;
+        let plane_size = (padded_pixels * std::mem::size_of::<f32>()) as u64;
+        let n = y_plane_bufs.len();
+
+        // Allocate one staging buffer per plane
+        let staging_bufs: Vec<wgpu::Buffer> = (0..n)
+            .map(|i| {
+                ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(&format!("tw_aq_staging_batch_{}", i)),
+                    size: plane_size,
+                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                })
+            })
+            .collect();
+
+        // Single command encoder — all copies batched, prevents overlap between submits
+        let mut cmd = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("tw_aq_readback_batch"),
+        });
+        for (y_buf, stg) in y_plane_bufs.iter().zip(staging_bufs.iter()) {
+            cmd.copy_buffer_to_buffer(y_buf, 0, stg, 0, plane_size);
+        }
+        ctx.queue.submit(Some(cmd.finish()));
+
+        // Map all staging buffers, then single poll
+        let (tx, rx) = std::sync::mpsc::channel();
+        for stg in &staging_bufs {
+            let tx_clone = tx.clone();
+            stg.slice(..).map_async(wgpu::MapMode::Read, move |result| {
+                tx_clone.send(result).unwrap();
+            });
+        }
+        drop(tx);
+        ctx.device.poll(wgpu::Maintain::Wait);
+        for _ in 0..n {
+            rx.recv().unwrap().unwrap();
+        }
+
+        let tiles_x = padded_w / tile_size;
+        let tiles_y = padded_h / tile_size;
+        let num_tiles = (tiles_x * tiles_y) as usize;
+        let ts = tile_size as usize;
+        let tile_pixel_count = (ts * ts) as f64;
+
+        let mut results: Vec<(Vec<f32>, f32)> = Vec::with_capacity(n);
+
+        for stg in &staging_bufs {
+            let data = stg.slice(..).get_mapped_range();
+            let coeffs: &[f32] = bytemuck::cast_slice(&data);
+
+            let mut tile_mean_abs = vec![0.0f64; num_tiles];
+            let mut global_max_abs = 0.0f32;
+            for ty in 0..tiles_y as usize {
+                for tx_idx in 0..tiles_x as usize {
+                    let tile_idx = ty * tiles_x as usize + tx_idx;
+                    let mut sum_abs = 0.0f64;
+                    for row in 0..ts {
+                        let y_pos = ty * ts + row;
+                        let x_base = tx_idx * ts;
+                        for col in 0..ts {
+                            let idx = y_pos * padded_w as usize + x_base + col;
+                            let abs_val = coeffs[idx].abs();
+                            sum_abs += abs_val as f64;
+                            if abs_val > global_max_abs {
+                                global_max_abs = abs_val;
+                            }
+                        }
+                    }
+                    tile_mean_abs[tile_idx] = sum_abs / tile_pixel_count;
+                }
+            }
+
+            drop(data);
+
+            let muls: Vec<f32> = tile_mean_abs
+                .iter()
+                .map(|&energy| Self::map_energy_to_mul(energy, max_mul))
+                .collect();
+
+            results.push((muls, global_max_abs));
+        }
+
+        // Unmap after all processing to avoid holding mapped regions
+        for stg in &staging_bufs {
+            stg.unmap();
+        }
+
+        results
     }
 }
 

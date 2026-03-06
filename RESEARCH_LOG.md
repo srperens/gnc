@@ -4,6 +4,51 @@
 
 ---
 
+## 2026-03-06: Fix temporal Haar adaptive per-tile multiplier
+
+### Hypothesis
+Per-tile adaptive highpass mul was suspected to not apply correctly — all highpass frames showed same effective quantization regardless of motion energy.
+
+### Root cause (TWO bugs found)
+
+1. **`map_energy_to_mul` calibration**: Threshold was 0.5, but real temporal highpass energy for 1080p content is 3-15+. All tiles with energy >1.0 got clamped to the floor value. Zero per-tile variation.
+
+2. **Floor value 0.8 meant highpass was quantized FINER than lowpass**: The weight_map multiplies step_size in the shader. mul=0.8 → eff_qstep = 4.0 × 0.8 = 3.2, which is finer than lowpass qstep=4.0. We were spending MORE bits on temporal detail than the base image — exactly backwards.
+
+### Fix
+- Recalibrated `map_energy_to_mul` with log-linear interpolation between low_thresh=0.5 and high_thresh=10.0
+- Changed range from [0.8, max_mul] to [1.0, max_mul] — highpass never finer than lowpass
+- energy ≈ 0 → mul=max_mul (static → aggressive quantization)
+- energy ≥ 10 → mul=1.0 (motion → same precision as lowpass)
+
+### Verification
+Diagnostic output now shows per-tile variation:
+- Before: `tile mul: min=0.800 p50=0.800 max=0.800` (all identical)
+- After: `tile mul: min=1.000 p50=1.061 max=1.384` (varies with motion)
+
+### Results (8 frames, GOP=4, q=75, Haar)
+
+| Sequence | Method | bpp | PSNR avg | Consistency |
+|----------|--------|-----|----------|-------------|
+| crowd_run | All-I | 7.72 | 40.69 dB | 0.01 dB |
+| crowd_run | I+P+B | 6.46 | 39.31 dB | 1.52 dB |
+| crowd_run | **TW Haar** | **6.20** | **39.24 dB** | **0.22 dB** |
+| rush_hour | All-I | 1.96 | 42.39 dB | 0.01 dB |
+| rush_hour | I+P+B | 1.84 | 41.52 dB | 0.88 dB |
+| rush_hour | **TW Haar** | **1.16** | **40.97 dB** | **0.06 dB** |
+| stockholm | All-I | 4.42 | 40.98 dB | 0.04 dB |
+| stockholm | I+P+B | 3.59 | 39.62 dB | 1.54 dB |
+| stockholm | **TW Haar** | **3.85** | **39.56 dB** | **0.42 dB** |
+
+### Analysis
+- rush_hour (low motion): -37% bpp vs I+P+B — biggest win, as expected for static content
+- crowd_run (high motion): -4% bpp vs I+P+B — modest but positive
+- stockholm (mixed): +7% bpp — regression on bpp, but 4× better temporal consistency
+- Stockholm regression suggests per-tile mode selection (backlog #2) is needed for mixed content
+- Temporal Haar gives 4-15× better temporal consistency than I+P+B across all sequences
+
+---
+
 ## 2026-03-05: GPU Buffer Race Fix + Phase 4 Optimization
 
 ### Bug: GPU spatial wavelet buffer race in temporal encoding

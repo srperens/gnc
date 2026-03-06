@@ -338,6 +338,10 @@ enum Command {
         /// Temporal wavelet mode: none (default), auto, haar
         #[arg(long, default_value = "none")]
         temporal_wavelet: String,
+
+        /// Temporal highpass qstep multiplier (overrides adaptive mul when set)
+        #[arg(long)]
+        tw_highpass_mul: Option<f32>,
     },
 
     /// Compare block-based transforms (DCT, Hadamard, Haar) against wavelet baseline
@@ -863,6 +867,7 @@ fn main() {
                 config_tw.target_bitrate = None;
                 if let Some(mul) = tw_highpass_mul {
                     config_tw.temporal_highpass_qstep_mul = mul;
+                    config_tw.adaptive_temporal_mul = false;
                 }
                 if rans {
                     config_tw.entropy_coder = gnc::EntropyCoder::Rans;
@@ -872,8 +877,9 @@ fn main() {
                     temporal_mode
                 );
                 println!(
-                    "Temporal config: qstep {:.3}, dead_zone {:.3}, entropy {:?}",
-                    config_tw.quantization_step, config_tw.dead_zone, config_tw.entropy_coder
+                    "Temporal config: qstep {:.3}, dead_zone {:.3}, entropy {:?}, adaptive_mul {}",
+                    config_tw.quantization_step, config_tw.dead_zone, config_tw.entropy_coder,
+                    if config_tw.adaptive_temporal_mul { "on" } else { "off" },
                 );
 
                 // Warm up GPU pipelines with first frame
@@ -1260,13 +1266,15 @@ fn main() {
                 config_tw.target_bitrate = None; // rate control is sequence-based; disable for temporal mode
                 if let Some(mul) = tw_highpass_mul {
                     config_tw.temporal_highpass_qstep_mul = mul;
+                    config_tw.adaptive_temporal_mul = false;
                 }
                 if rans {
                     config_tw.entropy_coder = gnc::EntropyCoder::Rans;
                 }
                 println!(
-                    "Temporal config: qstep {:.3}, dead_zone {:.3}, entropy {:?}",
-                    config_tw.quantization_step, config_tw.dead_zone, config_tw.entropy_coder
+                    "Temporal config: qstep {:.3}, dead_zone {:.3}, entropy {:?}, adaptive_mul {}",
+                    config_tw.quantization_step, config_tw.dead_zone, config_tw.entropy_coder,
+                    if config_tw.adaptive_temporal_mul { "on" } else { "off" },
                 );
 
                 let start = std::time::Instant::now();
@@ -2408,6 +2416,7 @@ fn main() {
             quality,
             csv,
             temporal_wavelet,
+            tw_highpass_mul,
         } => {
             let ctx = GpuContext::new();
             let mut encoder = gnc::encoder::pipeline::EncoderPipeline::new(&ctx);
@@ -2467,6 +2476,10 @@ fn main() {
                 let mut config_tw = gnc::quality_preset(quality);
                 config_tw.temporal_transform = temporal_mode;
                 config_tw.target_bitrate = None;
+                if let Some(mul) = tw_highpass_mul {
+                    config_tw.temporal_highpass_qstep_mul = mul;
+                    config_tw.adaptive_temporal_mul = false;
+                }
                 let _ = encoder.encode(&ctx, &first_rgb, w, h, &config_tw);
                 drop(first_rgb);
 

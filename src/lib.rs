@@ -273,7 +273,11 @@ pub struct CodecConfig {
     /// Quantization step multiplier for temporal highpass bands.
     /// Higher values = coarser quantization of temporal detail = smaller files.
     /// 1.0 = same as lowpass, 2.0 = double qstep for highpass (good default).
+    /// When `adaptive_temporal_mul` is true, this serves as the max_mul ceiling.
     pub temporal_highpass_qstep_mul: f32,
+    /// When true, dynamically compute highpass mul from GOP energy.
+    /// When false, use `temporal_highpass_qstep_mul` as a fixed multiplier.
+    pub adaptive_temporal_mul: bool,
 }
 
 impl CodecConfig {
@@ -312,6 +316,7 @@ impl Default for CodecConfig {
             intra_prediction: false,
             temporal_transform: TemporalTransform::None,
             temporal_highpass_qstep_mul: 2.0,
+            adaptive_temporal_mul: true,
         }
     }
 }

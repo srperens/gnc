@@ -703,9 +703,9 @@ impl EncoderPipeline {
                         padded_pixels,
                     );
 
-                    // 4) Encode high frames per level (coarser qstep + per-tile adaptive weights)
-                    let mut high_cfg = cfg.clone();
-                    high_cfg.quantization_step *= config.temporal_highpass_qstep_mul;
+                    // 4) Encode high frames per level with per-tile adaptive muls
+                    let high_cfg = cfg.clone();
+                    let max_mul = config.temporal_highpass_qstep_mul;
                     let mut high_cfs: Vec<Vec<CompressedFrame>> = Vec::new();
                     for lvl in 0..num_levels {
                         let count = group_size >> (lvl + 1);
@@ -713,24 +713,29 @@ impl EncoderPipeline {
                         let mut lvl_frames: Vec<CompressedFrame> = Vec::new();
                         for idx in 0..count {
                             let buf_idx = start + idx;
-                            let tile_weights = Self::compute_temporal_tile_weights(
-                                ctx,
-                                &tw_frame_bufs[buf_idx][0],
-                                padded_w,
-                                padded_h,
-                                cfg.tile_size,
-                            );
+                            let tile_muls = if config.adaptive_temporal_mul {
+                                Self::compute_temporal_tile_muls(
+                                    ctx,
+                                    &tw_frame_bufs[buf_idx][0],
+                                    padded_w,
+                                    padded_h,
+                                    cfg.tile_size,
+                                    max_mul,
+                                )
+                            } else {
+                                // Fixed mul: uniform weight for all tiles
+                                let tiles_x = padded_w / cfg.tile_size;
+                                let tiles_y = padded_h / cfg.tile_size;
+                                vec![max_mul; (tiles_x * tiles_y) as usize]
+                            };
                             if std::env::var("GNC_TW_DIAG").is_ok() {
-                                let mut sorted = tile_weights.clone();
+                                let mut sorted = tile_muls.clone();
                                 sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
                                 let n = sorted.len();
                                 let pct = |p: usize| sorted[(p * n / 100).min(n - 1)];
-                                let below1 = sorted.iter().filter(|&&w| w < 1.0).count();
-                                let above2 = sorted.iter().filter(|&&w| w > 2.0).count();
                                 eprintln!(
-                                    "  TW_AQ L{} H{}: {} tiles  p10={:.3} p25={:.3} p50={:.3} p75={:.3} p90={:.3}  below_1.0={}/{}  above_2.0={}/{}  eff_qstep=[{:.2}..{:.2}]",
-                                    lvl, idx, n, pct(10), pct(25), pct(50), pct(75), pct(90),
-                                    below1, n, above2, n,
+                                    "  TW L{} H{}: {} tiles  mul p10={:.3} p50={:.3} p90={:.3}  eff_qstep=[{:.2}..{:.2}]",
+                                    lvl, idx, n, pct(10), pct(50), pct(90),
                                     high_cfg.quantization_step * sorted[0],
                                     high_cfg.quantization_step * sorted[n - 1],
                                 );
@@ -747,7 +752,7 @@ impl EncoderPipeline {
                                 padded_w,
                                 padded_h,
                                 padded_pixels,
-                                Some(&tile_weights),
+                                Some(&tile_muls),
                             );
                             lvl_frames.push(cf);
                         }
@@ -892,9 +897,9 @@ impl EncoderPipeline {
                         padded_pixels,
                     );
 
-                    // 4) Encode highpass frames (d0, d1) with coarser qstep
-                    let mut high_cfg = cfg.clone();
-                    high_cfg.quantization_step *= config.temporal_highpass_qstep_mul;
+                    // 4) Encode highpass frames (d0, d1) with per-tile adaptive muls
+                    let high_cfg = cfg.clone();
+                    let max_mul = config.temporal_highpass_qstep_mul;
 
                     // TemporalGroup format: low_frame + high_frames[level][idx]
                     // For 5/3 with 4 frames: 1 level, with s1 as second lowpass
@@ -910,7 +915,16 @@ impl EncoderPipeline {
                         padded_h,
                         padded_pixels,
                     );
-                    let d0_cf = self.encode_from_gpu_wavelet_planes(
+                    let d0_muls = if config.adaptive_temporal_mul {
+                        Self::compute_temporal_tile_muls(
+                            ctx, &tw_out_bufs[2][0], padded_w, padded_h, cfg.tile_size, max_mul,
+                        )
+                    } else {
+                        let tiles_x = padded_w / cfg.tile_size;
+                        let tiles_y = padded_h / cfg.tile_size;
+                        vec![max_mul; (tiles_x * tiles_y) as usize]
+                    };
+                    let d0_cf = self.encode_from_gpu_wavelet_planes_weighted(
                         ctx,
                         [&tw_out_bufs[2][0], &tw_out_bufs[2][1], &tw_out_bufs[2][2]],
                         &high_cfg,
@@ -918,8 +932,18 @@ impl EncoderPipeline {
                         padded_w,
                         padded_h,
                         padded_pixels,
+                        Some(&d0_muls),
                     );
-                    let d1_cf = self.encode_from_gpu_wavelet_planes(
+                    let d1_muls = if config.adaptive_temporal_mul {
+                        Self::compute_temporal_tile_muls(
+                            ctx, &tw_out_bufs[3][0], padded_w, padded_h, cfg.tile_size, max_mul,
+                        )
+                    } else {
+                        let tiles_x = padded_w / cfg.tile_size;
+                        let tiles_y = padded_h / cfg.tile_size;
+                        vec![max_mul; (tiles_x * tiles_y) as usize]
+                    };
+                    let d1_cf = self.encode_from_gpu_wavelet_planes_weighted(
                         ctx,
                         [&tw_out_bufs[3][0], &tw_out_bufs[3][1], &tw_out_bufs[3][2]],
                         &high_cfg,
@@ -927,6 +951,7 @@ impl EncoderPipeline {
                         padded_w,
                         padded_h,
                         padded_pixels,
+                        Some(&d1_muls),
                     );
 
                     groups.push(TemporalGroup {
@@ -1150,9 +1175,9 @@ impl EncoderPipeline {
             padded_pixels,
         );
 
-        // 4) Encode high frames per level (coarser qstep + per-tile adaptive weights)
-        let mut high_cfg = cfg.clone();
-        high_cfg.quantization_step *= config.temporal_highpass_qstep_mul;
+        // 4) Encode high frames per level with per-tile adaptive muls
+        let high_cfg = cfg.clone();
+        let max_mul = config.temporal_highpass_qstep_mul;
         let mut high_cfs: Vec<Vec<CompressedFrame>> = Vec::new();
         for lvl in 0..num_levels {
             let count = group_size >> (lvl + 1);
@@ -1160,25 +1185,29 @@ impl EncoderPipeline {
             let mut lvl_frames: Vec<CompressedFrame> = Vec::new();
             for idx in 0..count {
                 let buf_idx = start + idx;
-                // Compute per-tile adaptive weights from Y plane temporal activity
-                let tile_weights = Self::compute_temporal_tile_weights(
-                    ctx,
-                    &tw_frame_bufs[buf_idx][0],
-                    padded_w,
-                    padded_h,
-                    cfg.tile_size,
-                );
+                let tile_muls = if config.adaptive_temporal_mul {
+                    Self::compute_temporal_tile_muls(
+                        ctx,
+                        &tw_frame_bufs[buf_idx][0],
+                        padded_w,
+                        padded_h,
+                        cfg.tile_size,
+                        max_mul,
+                    )
+                } else {
+                    // Fixed mul: uniform weight for all tiles
+                    let tiles_x = padded_w / cfg.tile_size;
+                    let tiles_y = padded_h / cfg.tile_size;
+                    vec![max_mul; (tiles_x * tiles_y) as usize]
+                };
                 if std::env::var("GNC_TW_DIAG").is_ok() {
-                    let mut sorted = tile_weights.clone();
+                    let mut sorted = tile_muls.clone();
                     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
                     let n = sorted.len();
                     let pct = |p: usize| sorted[(p * n / 100).min(n - 1)];
-                    let below1 = sorted.iter().filter(|&&w| w < 1.0).count();
-                    let above2 = sorted.iter().filter(|&&w| w > 2.0).count();
                     eprintln!(
-                        "  TW_AQ L{} H{}: {} tiles  p10={:.3} p25={:.3} p50={:.3} p75={:.3} p90={:.3}  below_1.0={}/{}  above_2.0={}/{}  eff_qstep=[{:.2}..{:.2}]",
-                        lvl, idx, n, pct(10), pct(25), pct(50), pct(75), pct(90),
-                        below1, n, above2, n,
+                        "  TW L{} H{}: {} tiles  mul p10={:.3} p50={:.3} p90={:.3}  eff_qstep=[{:.2}..{:.2}]",
+                        lvl, idx, n, pct(10), pct(50), pct(90),
                         high_cfg.quantization_step * sorted[0],
                         high_cfg.quantization_step * sorted[n - 1],
                     );
@@ -1195,7 +1224,7 @@ impl EncoderPipeline {
                     padded_w,
                     padded_h,
                     padded_pixels,
-                    Some(&tile_weights),
+                    Some(&tile_muls),
                 );
                 lvl_frames.push(cf);
             }
@@ -3333,18 +3362,53 @@ impl EncoderPipeline {
         }
     }
 
-    /// Compute per-tile adaptive weights for temporal highpass quantization.
+    /// Map temporal highpass energy to an adaptive qstep multiplier.
     ///
-    /// Reads back the Y plane from GPU, computes per-tile mean_abs of wavelet
-    /// coefficients. Static tiles (low temporal activity) get higher weights
-    /// (coarser quantization), motion tiles get lower weights (finer quantization).
-    /// Normalized so the geometric mean is 1.0 (bitrate-neutral on average).
-    fn compute_temporal_tile_weights(
+    /// Low energy (static content) → high mul (aggressive quantization, tiny highpass).
+    /// High energy (motion) → low mul (preserve temporal detail).
+    /// Returns a value in `[1.0, max_mul]`.
+    ///
+    /// The weight_map in the quantize shader multiplies step_size, so mul > 1.0
+    /// means coarser quantization (fewer bits). We never go below 1.0 because
+    /// highpass should never be finer than lowpass.
+    ///
+    /// Calibrated for real temporal highpass energy values (typically 0-20 for
+    /// 1080p content at q=75). Uses log-space interpolation between thresholds.
+    fn map_energy_to_mul(energy: f64, max_mul: f32) -> f32 {
+        // Below low_thresh: near-zero energy → max_mul (aggressive)
+        // Above high_thresh: high energy → 1.0 (preserve detail)
+        // Between: log-linear interpolation
+        let low_thresh: f64 = 0.5;
+        let high_thresh: f64 = 10.0;
+
+        if energy <= low_thresh {
+            return max_mul;
+        }
+        if energy >= high_thresh {
+            return 1.0;
+        }
+
+        // Log-linear interpolation: t=0 at low_thresh, t=1 at high_thresh
+        let t = ((energy / low_thresh).ln() / (high_thresh / low_thresh).ln()) as f32;
+        max_mul + t * (1.0 - max_mul)
+    }
+
+    /// Compute per-tile adaptive qstep multipliers for temporal highpass.
+    ///
+    /// Reads back the Y plane from GPU, computes per-tile mean_abs of temporal
+    /// highpass coefficients. Maps each tile's energy to a qstep multiplier via
+    /// `map_energy_to_mul`: low energy (static) → high mul (coarse quant),
+    /// high energy (motion) → low mul (preserve detail). Range: [0.8, max_mul].
+    ///
+    /// These per-tile muls replace both the old global highpass mul and the
+    /// relative tile weighting — a single value per tile drives quantization.
+    fn compute_temporal_tile_muls(
         ctx: &GpuContext,
         y_plane_buf: &wgpu::Buffer,
         padded_w: u32,
         padded_h: u32,
         tile_size: u32,
+        max_mul: f32,
     ) -> Vec<f32> {
         let padded_pixels = (padded_w * padded_h) as usize;
         let plane_size = (padded_pixels * std::mem::size_of::<f32>()) as u64;
@@ -3401,35 +3465,98 @@ impl EncoderPipeline {
         drop(data);
         staging.unmap();
 
+        // Map per-tile energy → qstep multiplier
+        let muls: Vec<f32> = tile_mean_abs
+            .iter()
+            .map(|&energy| Self::map_energy_to_mul(energy, max_mul))
+            .collect();
+
         if std::env::var("GNC_TW_DIAG").is_ok() {
-            let mut sorted_ma: Vec<f64> = tile_mean_abs.clone();
-            sorted_ma.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            let n = sorted_ma.len();
-            let pct = |p: usize| sorted_ma[(p * n / 100).min(n - 1)];
+            let mut sorted_e: Vec<f64> = tile_mean_abs.clone();
+            sorted_e.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let n = sorted_e.len();
+            let pct_e = |p: usize| sorted_e[(p * n / 100).min(n - 1)];
+            let mut sorted_m: Vec<f32> = muls.clone();
+            sorted_m.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let pct_m = |p: usize| sorted_m[(p * n / 100).min(n - 1)];
             eprintln!(
-                "    tile_mean_abs: min={:.4} p25={:.4} p50={:.4} p75={:.4} max={:.4} spread={:.2}x",
-                sorted_ma[0], pct(25), pct(50), pct(75), sorted_ma[n - 1],
-                if sorted_ma[0] > 1e-8 { sorted_ma[n - 1] / sorted_ma[0] } else { 0.0 },
+                "    tile energy: min={:.4} p25={:.4} p50={:.4} p75={:.4} max={:.4}",
+                sorted_e[0], pct_e(25), pct_e(50), pct_e(75), sorted_e[n - 1],
+            );
+            eprintln!(
+                "    tile mul:    min={:.3} p25={:.3} p50={:.3} p75={:.3} max={:.3}  (max_mul={:.2})",
+                sorted_m[0], pct_m(25), pct_m(50), pct_m(75), sorted_m[n - 1], max_mul,
             );
         }
 
-        // Compute frame-level mean
-        let frame_mean: f64 = tile_mean_abs.iter().sum::<f64>() / num_tiles as f64;
-        let eps = 1e-6;
+        muls
+    }
+}
 
-        // Map: static tiles (low activity) → high weight, motion tiles → low weight
-        let mut weights: Vec<f32> = tile_mean_abs
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_map_energy_to_mul_bounds() {
+        let max_mul = 2.0f32;
+        // Very low energy → max_mul (aggressive quantization)
+        let low = EncoderPipeline::map_energy_to_mul(0.001, max_mul);
+        assert!((low - max_mul).abs() < 0.01, "low energy mul={low}");
+        // Very high energy → 1.0 (preserve detail, never finer than lowpass)
+        let high = EncoderPipeline::map_energy_to_mul(100.0, max_mul);
+        assert!((high - 1.0).abs() < 0.01, "high energy mul={high}");
+        // Medium energy → between 1.0 and max_mul
+        let mid = EncoderPipeline::map_energy_to_mul(2.0, max_mul);
+        assert!(mid > 1.0 && mid < max_mul, "mid energy mul={mid}");
+    }
+
+    #[test]
+    fn test_map_energy_to_mul_monotonic() {
+        let max_mul = 2.0f32;
+        let energies = [0.01, 0.1, 0.5, 1.0, 5.0, 50.0];
+        let muls: Vec<f32> = energies
             .iter()
-            .map(|&ma| ((frame_mean + eps) / (ma + eps)).clamp(0.5, 4.0) as f32)
+            .map(|&e| EncoderPipeline::map_energy_to_mul(e, max_mul))
             .collect();
-
-        // Normalize so geometric mean = 1.0 (bitrate-neutral on average)
-        let log_sum: f64 = weights.iter().map(|&w| (w as f64).ln()).sum::<f64>();
-        let geo_mean = (log_sum / num_tiles as f64).exp();
-        for w in &mut weights {
-            *w = (*w as f64 / geo_mean).clamp(0.5, 4.0) as f32;
+        // Higher energy → lower mul (monotonically decreasing)
+        for i in 1..muls.len() {
+            assert!(
+                muls[i] <= muls[i - 1],
+                "not monotonic: energy {:.2} → {:.3}, energy {:.2} → {:.3}",
+                energies[i - 1], muls[i - 1], energies[i], muls[i],
+            );
         }
+    }
 
-        weights
+    #[test]
+    fn test_map_energy_to_mul_respects_max() {
+        // Different max_mul ceilings
+        for max in [1.5f32, 2.0, 3.0] {
+            let mul = EncoderPipeline::map_energy_to_mul(0.0, max);
+            assert!(
+                (mul - max).abs() < 0.01,
+                "zero energy should give max_mul={max}, got {mul}"
+            );
+            let mul_high = EncoderPipeline::map_energy_to_mul(1000.0, max);
+            assert!(
+                (mul_high - 1.0).abs() < 0.01,
+                "high energy should floor at 1.0, got {mul_high}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_map_energy_to_mul_never_below_one() {
+        // Mul should never go below 1.0 — highpass should never be finer than lowpass
+        for max in [1.5f32, 2.0, 3.0, 5.0] {
+            for e in [0.0, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 50.0, 100.0] {
+                let mul = EncoderPipeline::map_energy_to_mul(e, max);
+                assert!(
+                    mul >= 1.0 - 0.001,
+                    "mul={mul} < 1.0 at energy={e}, max_mul={max}"
+                );
+            }
+        }
     }
 }

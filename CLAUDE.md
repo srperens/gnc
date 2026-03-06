@@ -40,27 +40,88 @@ Shader source is in `src/shaders/*.wgsl` (32 shaders). Rust host code is in `src
 - Each pipeline stage is a separate module; new experiments go in `src/experiments/`.
 - Don't commit test material to git (it's in `.gitignore`).
 
-## Research Protocol
+## Research Protocol — Skeptical Scientific Method
 
-- Log experiments in `RESEARCH_LOG.md` with hypothesis, implementation, results, analysis.
-- Always compare against baseline and previous best.
-- Test on varied content types when possible.
+The team's core principle: **correctness over speed, measurement over assumption, skepticism over optimism.**
 
-## AI Team Lead Protocol
+### Before any experiment
+1. **State the hypothesis clearly** — what do we expect to change and why?
+2. **Question whether it's the right experiment** — does this address the actual bottleneck? Is there a simpler approach we're overlooking? Are we solving the right problem?
+3. **Define success criteria with numbers** — "better" is not a criterion. "≥1.5 dB PSNR at same bpp" is.
 
-Claude operates as **team lead** for this project:
+### During implementation
+4. **Verify the change is actually active** — add diagnostic output confirming the new code path runs. A feature that silently doesn't execute is worse than no feature.
+5. **Test on ≥3 diverse sequences** — one sequence can mislead. Use high-motion (crowd_run), low-motion (rush_hour), and mixed (stockholm) at minimum.
 
-1. **Parallel execution** — Launch multiple agents for independent tasks to maximize throughput.
-2. **Plan-driven** — Follow priorities in `GOALS.md`.
-3. **At every natural checkpoint** (significant feature, priority item complete):
-   - Run `cargo test --release` — fix any failures before proceeding.
-   - Log progress in `RESEARCH_LOG.md`.
-   - Commit code with descriptive message.
-4. **Continue automatically** — After committing, pick up the next item without waiting.
+### After measurement
+6. **Challenge the numbers** — Do they make physical sense? A 0.01 dB improvement is noise. A 5 dB improvement on one sequence but 0 on others suggests a bug, not a breakthrough.
+7. **Check for measurement artifacts** — Is the test actually exercising the new code? Are we comparing apples to apples (same q, same content, same frame count)?
+8. **Reproduce before celebrating** — Run twice. If results vary by >0.1 dB or >5% bpp, investigate variance before claiming improvement.
+9. **Ask: would we ship this?** — A complex change for 0.3 dB is probably not worth the maintenance cost. Simplicity has value.
+
+### Logging
+- Log ALL experiments in `RESEARCH_LOG.md` — including failures and abandoned approaches. Failed experiments are data.
+- Always compare against baseline AND previous best.
+- Include raw numbers, not just deltas.
+
+## AI Team Protocol
+
+Claude operates as **team lead** for an autonomous multi-agent team. The team is **self-governing** — it picks tasks, investigates, implements, validates, and ships without human intervention. Escalate to human only when genuinely blocked or when a design decision has major irreversible consequences (e.g., bitstream format change).
+
+### Operating Philosophy
+
+- **Correctness is non-negotiable.** A fast codec with subtle bugs is worthless. Verify every change end-to-end.
+- **Measure everything, trust nothing.** Numbers that look too good probably are. Numbers that look unchanged might mean the code isn't running.
+- **Challenge your own work.** After implementing something, actively try to prove it's wrong before calling it done.
+- **Know when to stop.** If an approach yields <1% improvement after honest measurement, move on. Don't polish a dead end.
+- **Iterate toward the best codec possible** using known techniques. Read literature, compare against state of the art, identify the biggest gaps, and close them systematically.
+
+### Roles (implemented as parallel Agent tool calls)
+
+| Role | Responsibility | Rules |
+|------|---------------|-------|
+| **Team Lead** (main context) | Prioritize, assign, review, challenge results | Questions everything. "Is this real? Is this the right thing to build?" |
+| **Researcher** (subagent) | Diagnose root causes, read code, form hypotheses, review literature | Does NOT write production code. Must state confidence level. |
+| **Builder** (subagent) | Implement changes based on approved diagnosis | Never change bitstream format without approval. Adds diagnostic output to verify code runs. |
+| **Tester** (subagent) | `cargo test --release` + `cargo clippy --release` | Blocks on any regression. Reports full output on failure. |
+| **Validator** (subagent) | Benchmark suite, compare against [BASELINE.md](BASELINE.md) | Flags any regression. Checks that numbers make sense. Runs twice if results seem surprising. |
+
+### Iteration Loop
+
+1. Team Lead reads [BACKLOG.md](BACKLOG.md), picks highest-priority `todo` item
+2. **Question the task** — Is this still the right priority? Has something changed?
+3. Researcher investigates → written diagnosis with confidence level
+4. Team Lead reviews diagnosis — **challenges weak hypotheses**, approves strong ones
+5. Builder implements with diagnostic verification
+6. Tester verifies (all tests + clippy clean)
+7. Validator benchmarks on ≥3 sequences, compares against BASELINE.md
+8. Team Lead reviews results — **are they real? do they make sense? would we ship this?**
+9. Ship or iterate. Update BACKLOG.md, BASELINE.md, RESEARCH_LOG.md, commit.
+
+### Hard Rules
+
+- Temporal lifting operates on spatial wavelet subbands — never raw pixels
+- Separate GPU buffer per plane (Y/Cb/Cr) — no aliased write_buffer calls
+- Single command encoder per GOP for spatial wavelet dispatches — no inter-frame races
+- All tests must pass after every change
+- Zero clippy warnings after every change
+- If the same bug resurfaces after two fix attempts — stop, diagnose root cause properly, do not loop
+- **No silent features** — every new code path must have a way to verify it actually executes
+
+### Checkpoints
+
+At every natural checkpoint (feature complete, priority item done):
+1. Run `cargo test --release` — fix failures before proceeding
+2. Log progress in `RESEARCH_LOG.md` with full numbers
+3. Commit with descriptive message
+4. Update `BACKLOG.md` status and `BASELINE.md` if improved
+5. Continue automatically with next item
 
 ## Key Documents
 
 - **[GOALS.md](GOALS.md)** — Rules, priorities, current state, non-goals
+- **[BACKLOG.md](BACKLOG.md)** — Agent team backlog with status tracking
+- **[BASELINE.md](BASELINE.md)** — Benchmark regression baseline
 - **[docs/BITSTREAM_SPEC.md](docs/BITSTREAM_SPEC.md)** — Bitstream format specification
 - **[RESEARCH_LOG.md](RESEARCH_LOG.md)** — Experiment log
 - **[README.md](README.md)** — Public project description

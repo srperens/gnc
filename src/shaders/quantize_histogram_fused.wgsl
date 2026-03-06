@@ -89,6 +89,12 @@ var<workgroup> shared_group_zrun: array<i32, 8>;
 var<workgroup> shared_num_groups: u32;
 var<workgroup> shared_any_zrl: u32;
 
+// ---- Content-adaptive per-subband dead zone ----
+// Per-group dead zone multiplier (computed from post-quantization zero fraction).
+// 1.0 = normal dead zone; >1.0 = expanded dead zone for sparse subbands.
+// Written by thread 0 after Phase-1 reduction; read in Phase 1.5 re-quantization.
+var<workgroup> shared_group_dz_mul: array<f32, 8>;
+
 // ---- Quantization helpers (from quantize.wgsl) ----
 
 fn get_weight(index: u32) -> f32 {
@@ -385,6 +391,78 @@ fn main(
             }
             workgroupBarrier();
         }
+
+        // Phase 1.5: Content-adaptive dead zone expansion.
+        //
+        // After Phase 1, we know the post-quantization zero fraction per group.
+        // For non-LL groups where ≥ 95% of coefficients are already zero, the
+        // subband is sparse: the few remaining ±1 values are tiny relative to
+        // the quantizer step and contribute more to entropy cost than to quality.
+        // Re-quantize them to 0 (equivalent to using a larger dead zone).
+        //
+        // Conservative parameters: ≥ 95% threshold, max 1.25× dead zone expansion.
+        // Only ±1 values are re-zeroed (values ≥ 2 are always preserved).
+        // LL (group 0) is never expanded.
+        //
+        // Thread 0 sets shared_group_dz_mul[g]; all threads read it.
+        if (lid == 0u) {
+            for (var g = 0u; g < num_groups; g++) {
+                shared_group_dz_mul[g] = 1.0;
+            }
+            // Reuse shared_reduce_u[0] as a broadcast flag: 0 = no sparse groups.
+            shared_reduce_u[0] = 0u;
+        }
+        workgroupBarrier();
+
+        for (var g = 0u; g < num_groups; g++) {
+            // Re-reduce zero counts (local arrays still hold per-thread values).
+            let tot_z = reduce_sum(lid, local_zero_count[g]);
+            let tot_c = reduce_sum(lid, local_total_count[g]);
+            if (lid == 0u) {
+                if (g > 0u && tot_c > 0u) {
+                    let zero_frac_x100 = tot_z * 100u / tot_c;
+                    if (zero_frac_x100 >= 95u) {
+                        let t = f32(zero_frac_x100 - 95u) / 5.0;
+                        shared_group_dz_mul[g] = 1.0 + 0.25 * clamp(t, 0.0, 1.0);
+                        shared_reduce_u[0] = 1u;  // at least one sparse group
+                    }
+                }
+            }
+            workgroupBarrier();
+        }
+
+        // Re-quantize only if at least one group has expanded dead zone.
+        // shared_reduce_u[0] == 1 when any group is sparse.
+        if (shared_reduce_u[0] != 0u) {
+            for (var j = 0u; j < coeffs_per_thread; j++) {
+                let local_idx = lid + j * WG_SIZE;
+                let tile_col = local_idx % params.tile_size;
+                let tile_row = local_idx / params.tile_size;
+                let g = compute_subband_group(tile_col, tile_row);
+                let dz_mul = shared_group_dz_mul[g];
+                if (dz_mul > 1.0) {
+                    let x = tile_origin_x + tile_col;
+                    let y = tile_origin_y + tile_row;
+                    let plane_idx = y * params.plane_width + x;
+                    let q = i32(round(output[plane_idx]));
+                    // Only re-examine the smallest non-zero values (|q| == 1).
+                    // Values |q| >= 2 are safely above any expanded threshold.
+                    if (abs(q) == 1) {
+                        let orig = input[plane_idx];
+                        let subband_weight = get_weight(
+                            compute_subband_index(tile_col, tile_row),
+                        );
+                        let spatial_weight = get_spatial_weight(x, y);
+                        let eff_step = params.step_size * subband_weight * spatial_weight;
+                        if (abs(orig) < params.dead_zone * dz_mul * eff_step) {
+                            output[plane_idx] = 0.0;
+                        }
+                    }
+                }
+            }
+        }
+        // Barrier: ensure all Phase 1.5 output writes are visible to Phase 2.
+        workgroupBarrier();
 
         // Compute histogram offsets, check any_zrl
         if (lid == 0u) {

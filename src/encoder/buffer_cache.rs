@@ -119,6 +119,11 @@ pub(super) struct CachedTemporalWaveletBuffers {
     /// Per-tile energy multiplier output buffers (one per high frame, num_tiles × f32).
     /// GPU-computed by tile_energy_reduce shader; used directly as quantize weight maps.
     pub(super) tile_muls_bufs: Vec<wgpu::Buffer>,
+    /// Per-tile raw mean_abs energy (pre-mapping). Used by CPU to identify tiles that
+    /// are too energetic to benefit from temporal wavelet coding (zeroed in highpass).
+    pub(super) tile_energies_bufs: Vec<wgpu::Buffer>,
+    /// Staging buffers for tile_energies readback (MAP_READ | COPY_DST, num_tiles × f32).
+    pub(super) tile_energies_staging_bufs: Vec<wgpu::Buffer>,
     /// Per-frame global-max-abs output buffers (1 × u32 each, atomicMax bitcast f32).
     /// STORAGE | COPY_SRC so we can copy to staging for CPU readback.
     pub(super) max_abs_bufs: Vec<wgpu::Buffer>,
@@ -204,6 +209,28 @@ impl CachedTemporalWaveletBuffers {
             })
             .collect();
 
+        let tile_energies_bufs: Vec<wgpu::Buffer> = (0..num_high_frames)
+            .map(|j| {
+                ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(&format!("tw_tile_energies_{}", j)),
+                    size: tile_muls_size.max(4),
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: false,
+                })
+            })
+            .collect();
+
+        let tile_energies_staging_bufs: Vec<wgpu::Buffer> = (0..num_high_frames)
+            .map(|j| {
+                ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(&format!("tw_tile_energies_stg_{}", j)),
+                    size: tile_muls_size.max(4),
+                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                })
+            })
+            .collect();
+
         let max_abs_bufs: Vec<wgpu::Buffer> = (0..num_high_frames)
             .map(|j| {
                 ctx.device.create_buffer(&wgpu::BufferDescriptor {
@@ -244,6 +271,8 @@ impl CachedTemporalWaveletBuffers {
             snapshot,
             per_frame_input,
             tile_muls_bufs,
+            tile_energies_bufs,
+            tile_energies_staging_bufs,
             max_abs_bufs,
             max_abs_staging_bufs,
             ter_params_buf,

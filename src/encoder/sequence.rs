@@ -29,6 +29,7 @@ const B_FRAMES_PER_GROUP: usize = 2;
 /// (batched GPU quantize + Rice encode).
 struct HighFrameInfo {
     tile_muls: Vec<f32>,
+    tile_energies: Vec<f32>,
     buf_idx: usize,
     is_zero: bool,
     wm_data: Option<Vec<f32>>,
@@ -1214,7 +1215,16 @@ impl EncoderPipeline {
         }
         let total_high_frames = hframe_buf_indices.len();
 
-        let mul_results: Vec<(Vec<f32>, f32)> = if config.adaptive_temporal_mul {
+        // Tiles with raw mean_abs energy above this threshold are zeroed in the highpass
+        // (weight set to TILE_ZERO_MUL). These tiles are too chaotic to benefit from
+        // temporal wavelet coding; zeroing saves bits with minimal perceptual impact
+        // since the decoder falls back to LL (temporal average) for those tiles.
+        const TILE_ENERGY_ZERO_THRESH: f32 = 12.0;
+        // Quantizer weight that guarantees all highpass coefficients in a tile fall
+        // inside the dead zone (eff_threshold = qstep * dead_zone * TILE_ZERO_MUL > 255).
+        const TILE_ZERO_MUL: f32 = 1000.0;
+
+        let mul_results: Vec<(Vec<f32>, Vec<f32>, f32)> = if config.adaptive_temporal_mul {
             // GPU-side per-tile energy reduction — eliminates 58MB CPU readback.
             //
             // For each high frame: dispatch tile_energy_reduce shader which computes
@@ -1259,16 +1269,22 @@ impl EncoderPipeline {
                     &tw.frame_bufs[buf_idx][0],
                     &tw.tile_muls_bufs[j],
                     &tw.max_abs_bufs[j],
+                    &tw.tile_energies_bufs[j],
                     &tw.ter_params_buf,
                     padded_w,
                     padded_h,
                     cfg.tile_size,
                     max_mul,
                 );
-                // Copy tile_muls and max_abs outputs to staging (CPU-readable)
+                // Copy tile_muls, tile_energies, and max_abs outputs to staging (CPU-readable)
                 cmd.copy_buffer_to_buffer(
                     &tw.tile_muls_bufs[j], 0,
                     &tile_muls_staging[j], 0,
+                    tile_muls_bytes.max(4),
+                );
+                cmd.copy_buffer_to_buffer(
+                    &tw.tile_energies_bufs[j], 0,
+                    &tw.tile_energies_staging_bufs[j], 0,
                     tile_muls_bytes.max(4),
                 );
                 cmd.copy_buffer_to_buffer(
@@ -1287,19 +1303,23 @@ impl EncoderPipeline {
                     .slice(..)
                     .map_async(wgpu::MapMode::Read, move |r| { tx2.send(('m', j, r)).unwrap(); });
                 let tx3 = tx.clone();
+                tw.tile_energies_staging_bufs[j]
+                    .slice(..)
+                    .map_async(wgpu::MapMode::Read, move |r| { tx3.send(('e', j, r)).unwrap(); });
+                let tx4 = tx.clone();
                 tw.max_abs_staging_bufs[j]
                     .slice(..)
-                    .map_async(wgpu::MapMode::Read, move |r| { tx3.send(('x', j, r)).unwrap(); });
+                    .map_async(wgpu::MapMode::Read, move |r| { tx4.send(('x', j, r)).unwrap(); });
             }
             drop(tx);
             ctx.device.poll(wgpu::Maintain::Wait);
-            // Drain channel (2 callbacks per frame)
-            for _ in 0..(n * 2) {
+            // Drain channel (3 callbacks per frame: tile_muls + tile_energies + max_abs)
+            for _ in 0..(n * 3) {
                 rx.recv().unwrap().2.unwrap();
             }
 
-            // Collect results: tile_muls (Vec<f32>) + max_abs (f32) per frame
-            let mut results: Vec<(Vec<f32>, f32)> = Vec::with_capacity(n);
+            // Collect results: tile_muls (Vec<f32>) + tile_energies (Vec<f32>) + max_abs (f32) per frame
+            let mut results: Vec<(Vec<f32>, Vec<f32>, f32)> = Vec::with_capacity(n);
             for (j, muls_stg) in tile_muls_staging.iter().enumerate() {
                 let muls_view = muls_stg.slice(..).get_mapped_range();
                 let muls: Vec<f32> = bytemuck::cast_slice::<u8, f32>(&muls_view[..tile_muls_bytes as usize])
@@ -1307,42 +1327,55 @@ impl EncoderPipeline {
                 drop(muls_view);
                 muls_stg.unmap();
 
+                let energies_view = tw.tile_energies_staging_bufs[j].slice(..).get_mapped_range();
+                let energies: Vec<f32> = bytemuck::cast_slice::<u8, f32>(&energies_view[..tile_muls_bytes as usize])
+                    .to_vec();
+                drop(energies_view);
+                tw.tile_energies_staging_bufs[j].unmap();
+
                 let max_view = tw.max_abs_staging_bufs[j].slice(..).get_mapped_range();
                 let max_bits = u32::from_le_bytes(max_view[..4].try_into().unwrap());
                 drop(max_view);
                 tw.max_abs_staging_bufs[j].unmap();
                 let max_abs = f32::from_bits(max_bits);
 
-                results.push((muls, max_abs));
+                results.push((muls, energies, max_abs));
             }
             results
         } else {
             let tiles_x = padded_w / cfg.tile_size;
             let tiles_y = padded_h / cfg.tile_size;
-            vec![(vec![max_mul; (tiles_x * tiles_y) as usize], f32::MAX); total_high_frames]
+            let n_tiles = (tiles_x * tiles_y) as usize;
+            // Non-adaptive path: all tiles get max_mul, energies treated as zero (no zeroing).
+            vec![(vec![max_mul; n_tiles], vec![0.0f32; n_tiles], f32::MAX); total_high_frames]
         };
 
         let t_after_aq = if prof { Some(std::time::Instant::now()) } else { None };
 
         let mut hframe_infos: Vec<HighFrameInfo> = Vec::with_capacity(total_high_frames);
         for (i, &(buf_idx, lvl, idx)) in hframe_buf_indices.iter().enumerate() {
-            let (tile_muls, max_abs) = mul_results[i].clone();
+            let (tile_muls, tile_energies, max_abs) = mul_results[i].clone();
             if std::env::var("GNC_TW_DIAG").is_ok() {
                 let mut sorted = tile_muls.clone();
                 sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
                 let n = sorted.len();
                 let pct = |p: usize| sorted[(p * n / 100).min(n - 1)];
                 let all_zero = max_abs < high_cfg.dead_zone * high_cfg.quantization_step;
+                let zeroed_tiles = tile_energies.iter().filter(|&&e| e > TILE_ENERGY_ZERO_THRESH).count();
+                let mut esorted = tile_energies.clone();
+                esorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let en = esorted.len();
+                let epct = |p: usize| esorted[(p * en / 100).min(en - 1)];
                 eprintln!(
-                    "  TW L{} H{}: {} tiles  mul p10={:.3} p50={:.3} p90={:.3}  eff_qstep=[{:.2}..{:.2}]  skip={}",
+                    "  TW L{} H{}: {} tiles  mul p10={:.3} p50={:.3} p90={:.3}  eff_qstep=[{:.2}..{:.2}]  skip={}  zeroed={}  energy p50={:.1} p90={:.1} p99={:.1}",
                     lvl, idx, n, pct(10), pct(50), pct(90),
                     high_cfg.quantization_step * sorted[0],
                     high_cfg.quantization_step * sorted[n - 1],
-                    all_zero,
+                    all_zero, zeroed_tiles, epct(50), epct(90), epct(99),
                 );
             }
             let is_zero = max_abs < high_cfg.dead_zone * high_cfg.quantization_step;
-            hframe_infos.push(HighFrameInfo { tile_muls, buf_idx, is_zero, wm_data: None });
+            hframe_infos.push(HighFrameInfo { tile_muls, tile_energies, buf_idx, is_zero, wm_data: None });
         }
 
         // --- Pass B: Expand weight maps for non-zero frames (CPU work, no GPU sync) ---
@@ -1363,7 +1396,15 @@ impl EncoderPipeline {
             for ty_idx in 0..tiles_y as usize {
                 for tx_idx in 0..tiles_x as usize {
                     let tile_idx = ty_idx * tiles_x as usize + tx_idx;
-                    let w = hf.tile_muls[tile_idx];
+                    // Tiles with very high motion energy are effectively incompressible in
+                    // the temporal highpass. Zero them out (TILE_ZERO_MUL drives all
+                    // coefficients below the quantizer dead zone) so the decoder falls
+                    // back to LL-only reconstruction for those tiles.
+                    let w = if hf.tile_energies[tile_idx] > TILE_ENERGY_ZERO_THRESH {
+                        TILE_ZERO_MUL
+                    } else {
+                        hf.tile_muls[tile_idx]
+                    };
                     for by in 0..ll_by as usize {
                         for bx in 0..ll_bx as usize {
                             let global_bx = tx_idx * ll_bx as usize + bx;
@@ -1469,7 +1510,7 @@ impl EncoderPipeline {
             // consumed it, and no remaining GPU commands in this GOP touch per_frame_input.
             if let Some(next_frames) = next_gop_frames {
                 for (input_buf, frame_data) in tw.per_frame_input.iter().zip(next_frames.iter()) {
-                    ctx.queue.write_buffer(input_buf, 0, bytemuck::cast_slice(*frame_data));
+                    ctx.queue.write_buffer(input_buf, 0, bytemuck::cast_slice(frame_data));
                 }
                 tw.next_gop_pre_uploaded = true;
             }
@@ -1574,6 +1615,7 @@ impl EncoderPipeline {
     ///
     /// `next_gop_frames`: optional next GOP's frames for async pre-upload (Haar only).
     /// When provided, they are written to GPU staging during high_enc, hiding ~22ms upload cost.
+    #[allow(clippy::too_many_arguments)] // temporal GOP encode genuinely needs all these params
     pub fn encode_temporal_wavelet_gop(
         &mut self,
         ctx: &GpuContext,

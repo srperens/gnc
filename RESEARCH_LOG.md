@@ -4,6 +4,140 @@
 
 ---
 
+## 2026-03-06: GPU tile energy reduction (aq_readback elimination) — perf + struct bug fix
+
+### Goal
+Replace 58MB CPU readback in compute_temporal_tile_muls with a GPU-side reduction shader,
+eliminating the main sync stall in the temporal Haar encode hot path.
+
+### Implementation
+- `tile_energy_reduce.wgsl`: per-tile mean_abs computation + map_energy_to_mul in WGSL.
+  One workgroup per tile, 256 threads, 2KB shared memory. atomicMax for global max_abs.
+- `CachedTemporalWaveletBuffers`: added tile_muls_bufs, max_abs_bufs, max_abs_staging_bufs,
+  ter_params_buf (reused across GOPs).
+- `dispatch_tile_energy_reduce()`: records into caller-provided CommandEncoder (no submit).
+- Batch: all TER dispatches + copies to staging in ONE command encoder → single poll.
+- Only 160 bytes (tile_muls) + 4 bytes (max_abs) read back per frame vs 58MB before.
+
+### Bug found: TileEnergyReduceParams struct layout mismatch
+Rust params_data had an extra zero pad at offset 12, shifting all threshold fields by one.
+Shader read: low_thresh=0.0, high_thresh=0.5 (actual low_thresh), max_mul=10.0 (actual high_thresh).
+Effect: energy in (0, 0.5) got NaN (log(x/0.0)), energy≥0.5 got mul=1.0 (no scaling).
+GPU TER was a near-no-op for most tiles — adaptive mul was effectively disabled.
+Fix: removed the spurious zero pad (no padding between tile_size and low_thresh in WGSL).
+
+### Results (crowd_run 1080p q=75 GOP=8, PNG input, steady state)
+
+| Stage | Before GPU TER | After GPU TER + fix |
+|-------|---------------|---------------------|
+| aq_readback | 34ms | 4.2ms |
+| spatial_wl | ~58ms | ~64ms |
+| high_enc | ~100ms | 88-130ms |
+| upload | ~21ms | ~22ms |
+| TOTAL/GOP | ~252ms | ~215-232ms |
+| Pure encode fps | ~32 fps | ~35-37 fps |
+
+Tile mul diagnostics confirm correct adaptive behavior:
+- L0H0 (static repeated frame): all tiles mul=2.0, frame skipped
+- Other high frames: mul p50=1.06-1.11, p90=1.32-1.44
+
+### Analysis
+- aq_readback: 34ms → 4.2ms (-30ms) as expected
+- Pure encode: 32 → 35-37fps, short of 40fps target
+- Next: async upload pipelining (~20ms amortized) to reach ~200ms/GOP → 40fps
+
+---
+
+## 2026-03-06: Per-tile temporal mode selection — high-energy tile zeroing
+
+### Goal
+BACKLOG #2: Tiles with high temporal motion energy waste bits on uncompressible highpass.
+Zero those tiles' highpass contributions so the decoder falls back to LL (temporal average).
+
+### Approach
+1. **Shader**: `tile_energy_reduce.wgsl` gains binding 4 (`tile_energies: array<f32>`) that
+   outputs raw `mean_abs` per tile (pre-mapping, before the mul curve is applied).
+2. **CPU readback**: `tile_energies` read back alongside `tile_muls` and `max_abs` in the
+   same GPU→CPU copy batch (negligible overhead, ~480 bytes per frame).
+3. **Pass B (weight map)**: tiles with `energy > TILE_ENERGY_ZERO_THRESH (12.0)` get
+   `TILE_ZERO_MUL = 1000.0`, which drives eff_qstep far above any coefficient value,
+   quantizing the entire tile to zero.
+
+### Results (q=75, Haar, GOP=8)
+
+| Sequence   | Before zeroing (bpp) | After zeroing (bpp) | Delta  |
+|------------|----------------------|---------------------|--------|
+| bbb        | 1.75                 | 1.75                | 0%     |
+| rush_hour  | 1.07                 | 1.07                | 0%     |
+| crowd_run  | 5.82                 | 3.63                | -38%   |
+| stockholm  | ~3.5 (est)           | 3.23                | ~-8%   |
+
+`crowd_run`: 13/40 tiles zeroed at L0. Large bpp reduction because the high-motion tiles
+at level 0 contribute many bits but produce noisy, uncompressible highpass.
+
+`bbb`, `rush_hour`: 0 tiles zeroed (low-motion content, energy below threshold). No change.
+
+### Energy distribution (crowd_run q=75 L0)
+- energy p50 = 8.6  (below high_thresh=10.0)
+- energy p90 = 13.6 (above threshold → 32% of tiles zeroed)
+- energy p99 = 14.9
+
+### Quality caveat
+Zeroing the highpass for a tile means the decoder reconstructs it as the temporal average
+(LL). For high-motion tiles this appears as temporal blur / ghosting. Quality impact
+has not been measured (no streaming PSNR for temporal mode yet). Visual validation needed
+before shipping. TILE_ENERGY_ZERO_THRESH=12.0 is aggressive; may need tuning to 15-20.
+
+### Open questions
+1. True per-tile All-I (encoding tiles as independent spatial frames) would give better
+   quality than temporal average but requires bitstream format changes.
+2. TILE_ENERGY_ZERO_THRESH should ideally be normalized to qstep:
+   `thresh = high_thresh + N * qstep` so it scales with quality setting.
+3. Streaming PSNR measurement needed to validate quality/bpp trade-off.
+
+---
+
+## 2026-03-06: Async GOP upload pipelining — hide write_buffer during high_enc
+
+### Goal
+Eliminate the ~22ms `write_buffer` upload cost from the critical path in temporal Haar
+encode by overlapping it with the GPU high_enc pass (~100ms).
+
+### Observation
+WebGPU `write_buffer` is a CPU memcpy into staging memory; the data is flushed to GPU
+at the next `queue.submit()`. High frames run entirely on GPU after their command
+buffer is submitted. The 22ms CPU copy for the NEXT GOP's frames can therefore run
+concurrently with the current GOP's GPU work.
+
+### Implementation
+- Added `next_gop_pre_uploaded: bool` to `CachedTemporalWaveletBuffers`.
+- After submitting the high_enc command buffer (GPU busy), write next GOP's frames
+  to `per_frame_input` buffers. These are safe to overwrite — spatial_wl for the
+  current GOP has already read them; spatial_wl for the next GOP hasn't started.
+- Set `next_gop_pre_uploaded = true`.
+- At start of next GOP's encode: skip write_buffer if flag is set, clear flag.
+- Main benchmark loop (Y4M path): pre-loads next GOP's frames from y4m during
+  current GOP's encode. `lookahead_frames: Option<Vec<Vec<f32>>>` holds them.
+  Frame load time accounted in io_ms, not encode_ms.
+
+### Results (crowd_run 1080p q=75 GOP=8, Y4M, GNC_PROFILE_SPLIT=1, 64 frames)
+
+| Metric | Before pipelining | After pipelining |
+|--------|-------------------|------------------|
+| upload (write_buffer) | ~22ms | 0ms steady state |
+| GOP time (steady state) | 215-232ms | 195-208ms |
+| GNC-only fps | ~37fps | ~39.2fps avg |
+| Best individual GOPs | — | 40.9fps (195.6ms) |
+
+### Analysis
+The 22ms upload cost is fully hidden behind the 88-130ms GPU high_enc pass.
+Steady-state GOP time dropped by ~20ms as expected. At 39.2fps average we are within
+~2% of the 40fps target; remaining variance is high_enc content complexity (88ms
+simple → 130ms complex frames). Per-tile temporal mode selection (Backlog #2) may
+reduce high_enc variance by falling back to All-I for high-motion tiles.
+
+---
+
 ## 2026-03-06: Fix temporal Haar adaptive per-tile multiplier
 
 ### Hypothesis

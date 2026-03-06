@@ -27,10 +27,13 @@ struct Params {
     _pad:       u32,
 }
 
-@group(0) @binding(0) var<uniform>            params:         Params;
-@group(0) @binding(1) var<storage, read>      y_plane:        array<f32>;
-@group(0) @binding(2) var<storage, read_write> tile_muls:     array<f32>;
+@group(0) @binding(0) var<uniform>            params:           Params;
+@group(0) @binding(1) var<storage, read>      y_plane:          array<f32>;
+@group(0) @binding(2) var<storage, read_write> tile_muls:       array<f32>;
 @group(0) @binding(3) var<storage, read_write> global_max_bits: array<atomic<u32>>;
+/// Raw mean_abs energy per tile (pre-mapping). Used by CPU to identify tiles whose
+/// highpass is too energetic to benefit from temporal wavelet coding.
+@group(0) @binding(4) var<storage, read_write> tile_energies:  array<f32>;
 
 var<workgroup> shared_sum: array<f32, 256>;
 var<workgroup> shared_max: array<f32, 256>;
@@ -107,11 +110,12 @@ fn main(
         workgroupBarrier();
     }
 
-    // Thread 0: write tile multiplier and update global max
+    // Thread 0: write tile multiplier, raw energy, and update global max
     if lid == 0u {
         let tile_idx = tile_y * tiles_x + tile_x;
         let mean_abs = shared_sum[0] / f32(tile_pixels);
-        tile_muls[tile_idx] = map_energy_to_mul(mean_abs);
+        tile_muls[tile_idx]    = map_energy_to_mul(mean_abs);
+        tile_energies[tile_idx] = mean_abs;
 
         // Update global max using atomic on u32 reinterpretation.
         // IEEE 754 positive floats preserve order under integer comparison.

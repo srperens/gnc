@@ -15,23 +15,26 @@ See [BASELINE.md](BASELINE.md) for current benchmark numbers.
 - **Result:** rush_hour -37% bpp, crowd_run -4% bpp, stockholm +7% bpp (needs per-tile mode)
 
 ### 2. Per-tile temporal mode selection
-- **Status:** todo
+- **Status:** active (2026-03-06) — partial implementation, quality validation pending
 - **Problem:** Entire frame uses same temporal mode; static tiles waste bits with full spatial encode
 - **Success criteria:** Tiles with low motion energy use Haar, high motion use All-I; measurable bpp improvement on mixed-motion content
 - **Depends on:** #1
+- **Done:** GPU tile_energies readback (raw mean_abs per tile, binding 4 in TER shader). Per-tile zeroing in Pass B weight map: tiles with energy > 12.0 → TILE_ZERO_MUL=1000 → all coefficients quantized to zero.
+- **Result:** crowd_run -38% bpp, bbb/rush_hour 0% change (no hot tiles). Quality not validated — zeroing = temporal blur (LL average only), not true All-I.
+- **Next:** Visual quality validation. True All-I per tile requires bitstream format change (per-tile mode flag). Consider TILE_ENERGY_ZERO_THRESH tuning (12.0 is aggressive; 15-20 might be better). See ADR for struct layout verification lesson (0003).
 
 ### 3. Encode performance -> 60 fps
 - **Status:** active (2026-03-06)
-- **Per-stage breakdown** (crowd_run 1080p q=75 GOP=8, steady-state):
-  - high_enc (7 high frames, batch Rice): ~100ms (40%) — mostly GPU compute
-  - spatial_wl (8 frames CDF 9/7): ~58ms (23%)
-  - aq_readback (adaptive-mul GPU readback): ~34ms (14%) — 33ms is sync overhead, only 0.86ms is actual DMA
-  - upload (write_buffer 8 frames): ~21ms (8%)
-  - low_enc: ~18ms (7%), temporal_haar: ~16ms (6%)
-- **Next: GPU-side tile energy reduction** (Opportunity 1)
-  - Replace 58MB CPU readback with GPU per-tile reduction shader + 28-byte max_abs readback
-  - Expected: 30-34ms savings, aq_readback ≤2ms, no quality regression (muls not transmitted to decoder)
-- **After that: async upload** (Opportunity 3) — +15ms amortized → ~200ms/GOP target
+- **Per-stage breakdown** (crowd_run 1080p q=75 GOP=8, steady-state, after GPU TER):
+  - high_enc (7 high frames, batch Rice): 88-130ms (variable, ~45%) — mostly GPU compute
+  - spatial_wl (8 frames CDF 9/7): ~64ms (28%)
+  - upload (write_buffer 8 frames): ~22ms (10%)
+  - low_enc: ~18ms (8%), temporal_haar: ~15ms (7%), aq_readback: 4.2ms (2%)
+  - **TOTAL: ~215-232ms/GOP = 35-37 fps pure encode**
+- **Done: GPU-side tile energy reduction** — aq_readback 34ms → 4.2ms; struct layout bug fixed
+- **Done: async upload pipelining** — write next GOP's frames during high_enc (~100ms GPU); upload=0ms steady state
+  - Result: 195-208ms/GOP → 39.2fps average (SPLIT total), some GOPs at 40+fps
+- **Status:** ~done — averaging 39.2fps vs 40fps target. Remaining variance driven by high_enc content complexity.
 - **Success criteria:** >= 40 fps pure encode on crowd_run 1080p q=75
 
 ### 4. Tile size experiment

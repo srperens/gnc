@@ -180,6 +180,17 @@ impl EncoderPipeline {
                             },
                             count: None,
                         },
+                        // binding 4: tile_energies (read_write) — raw mean_abs per tile
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 4,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
                     ],
                 });
         let ter_pl = ctx
@@ -333,6 +344,7 @@ impl EncoderPipeline {
         y_plane_buf: &wgpu::Buffer,
         tile_muls_buf: &wgpu::Buffer,
         max_abs_buf: &wgpu::Buffer,
+        tile_energies_buf: &wgpu::Buffer,
         ter_params_buf: &wgpu::Buffer,
         padded_w: u32,
         padded_h: u32,
@@ -383,6 +395,10 @@ impl EncoderPipeline {
                 wgpu::BindGroupEntry {
                     binding: 3,
                     resource: max_abs_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: tile_energies_buf.as_entire_binding(),
                 },
             ],
         });

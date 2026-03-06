@@ -339,8 +339,15 @@ impl EncoderPipeline {
         tile_size: u32,
         max_mul: f32,
     ) {
-        // TileEnergyReduceParams layout (matches shader struct — 8 × 4 = 32 bytes):
-        //   padded_w, padded_h, tile_size, _pad,  low_thresh, high_thresh, max_mul, _pad
+        // TileEnergyReduceParams layout (matches shader struct exactly):
+        //   offset 0:  padded_w   u32
+        //   offset 4:  padded_h   u32
+        //   offset 8:  tile_size  u32
+        //   offset 12: low_thresh f32  (NO padding between tile_size and low_thresh)
+        //   offset 16: high_thresh f32
+        //   offset 20: max_mul    f32
+        //   offset 24: _pad       u32
+        //   offset 28: _pad2      u32  (to reach 32 bytes, uniform buffer alignment)
         // Match EncoderPipeline::map_energy_to_mul thresholds exactly.
         let low_thresh: f32 = 0.5;
         let high_thresh: f32 = 10.0;
@@ -348,11 +355,11 @@ impl EncoderPipeline {
             padded_w,
             padded_h,
             tile_size,
-            0, // _pad (between tile_size and low_thresh)
             low_thresh.to_bits(),
             high_thresh.to_bits(),
             max_mul.to_bits(),
             0, // _pad
+            0, // _pad2 (alignment)
         ];
         ctx.queue
             .write_buffer(ter_params_buf, 0, bytemuck::cast_slice(&params_data));

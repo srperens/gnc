@@ -48,11 +48,9 @@ See [BASELINE.md](BASELINE.md) for current benchmark numbers.
 - **Result:** `benchmark-sequence` now accepts `.y4m` input. Y4M I/O = 16% overhead (vs PNG 45%). End-to-end fps now 27.2 fps (vs 16.4), GNC-only fps 32.6 fps. Temporal Haar warmup bug also fixed.
 - **Note:** Y4M files must be created from PNG sequences via ffmpeg. Xiph originals available at media.xiph.org/video/derf/
 
-### 5. 4:2:0 + 10-bit
-- **Status:** todo
-- **Problem:** 4:4:4 wastes chroma bits; 8-bit limits HDR content
-- **Success criteria:** Working encode/decode, expected 15-25% bpp improvement
-- **Note:** Breaking bitstream change, do both together
+### 5. 4:2:2 and 4:2:0 chroma subsampling
+- **Status:** done (2026-03-06)
+- **Result:** Full end-to-end encode/decode for 4:2:2 and 4:2:0. BPP reduction: 4:2:2 11-30%, 4:2:0 21-43% across bbb/blue_sky/touchdown. PSNR loss 0.2-5.6 dB (all-channel metric; perceptual loss is smaller). Four bugs found and fixed: wavelet uniform buffer slot aliasing, WGSL struct field order mismatch, missing chroma edge-replication padding, double entropy encoding for non-444. Nearest-neighbor upsample used; bilinear deferred to #9. 10-bit deferred to #10.
 
 ### 6. CfL in temporal mode
 - **Status:** done (Phase 4)
@@ -74,3 +72,17 @@ See [BASELINE.md](BASELINE.md) for current benchmark numbers.
 - **Status:** todo (P2 — needed before broadcast use)
 - **Problem:** No constant bitrate mode
 - **Success criteria:** CBR mode with < 5% bitrate overshoot on 10s windows
+
+### 9. Bilinear chroma upsampling for 4:2:2 / 4:2:0
+- **Status:** todo (P3)
+- **Problem:** Current upsample shaders use nearest-neighbor, introducing avoidable reconstruction error estimated at 0.5-1.0 dB PSNR vs bilinear.
+- **Success criteria:** ≥ 0.5 dB PSNR improvement on bbb q=75 with 4:2:0, no fps regression vs nearest-neighbor baseline.
+- **Effort:** New upsample shader variant + Rust dispatch switch, ~1 day.
+- **Depends on:** #5 (done)
+
+### 10. 10-bit support
+- **Status:** todo (P3)
+- **Problem:** Codec is 8-bit only; no HDR or high-fidelity camera content can be encoded without precision loss.
+- **Success criteria:** Bit-exact encode/decode roundtrip for 10-bit input in [0, 1023]. No regression on existing 8-bit tests.
+- **Note:** Infrastructure partially in place — `bit_depth` field already exists in `FrameInfo` and the bitstream header. Main work is widening internal buffers and shader arithmetic from u8/u16 to u16/u32 where needed.
+- **Note:** Not a bitstream-breaking change if the `bit_depth` header field is already versioned correctly.

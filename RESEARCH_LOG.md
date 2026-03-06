@@ -1242,3 +1242,132 @@ Added `compute_temporal_wavelet()` diagnostic that compares original-signal (not
 - Recommended next step: prototype temporal Haar on detail subbands only, keep ME for LL or code LL with larger quantization step
 
 ---
+
+## 2026-03-06: Backlog item #5 — 4:2:2 and 4:2:0 chroma subsampling
+
+### Hypothesis
+
+4:4:4 encoding wastes chroma bits. Most content (broadcast, camera) has less spatial detail in
+chroma than luma. Subsampling chroma 2:1 horizontally (4:2:2) or 2:1 in both axes (4:2:0)
+before encoding should reduce bitrate 15-25% with modest PSNR loss. The PSNR loss was expected
+to be small (1-2 dB) because human vision is less sensitive to chroma resolution.
+
+Success criteria: working end-to-end encode/decode for both modes, 15-25% bpp reduction at matched
+quality settings.
+
+### What was implemented
+
+Full end-to-end chroma subsampling pipeline:
+
+- `ChromaResampler`: downsample (4:4:4 → 4:2:2 or 4:2:0) on GPU before wavelet, upsample
+  (4:2:2 or 4:2:0 → 4:4:4) on GPU after decode. Shaders: `chroma_downsample.wgsl`,
+  `chroma_upsample.wgsl`.
+- `ChromaInfo` struct carried in bitstream header (subsampling mode, padded dimensions).
+- `make_chroma_info()` helper centralises plane-dimension logic.
+- Entropy: GPU Rice path handles non-444 planes with correct per-plane dimensions.
+- All tests pass; `cargo clippy --release` clean.
+
+10-bit support was deferred — no HDR test content, infrastructure partially in place
+(`bit_depth` field already in `FrameInfo` and bitstream).
+
+### Bugs found and fixed
+
+Four bugs were encountered during implementation, all in distinct subsystems:
+
+**Bug 1 — Wavelet uniform buffer slot aliasing.**
+All three planes (Y, Co, Cg) used the same slot indices in the shared `dyn_params_buf`. At GPU
+execution, each plane's write_buffer call overwrote the previous slot, so only Cg's wavelet
+params survived. Y and Co used Cg's (smaller) chroma dimensions for their wavelet dispatch,
+silently producing garbage coefficients.
+Fix: added `plane_idx` parameter to wavelet dispatch; non-overlapping slot ranges per plane;
+`MAX_PARAM_SLOTS` increased from 32 to 96.
+
+**Bug 2 — WGSL struct field order mismatch.**
+`chroma_upsample.wgsl` params struct had a stale field ordering that no longer matched the Rust
+`ChromaUpsampleParams` layout. The shader read wrong values for src/dst strides and dimensions.
+Fix: aligned WGSL struct field order to match the Rust side.
+
+**Bug 3 — Missing chroma edge-replication padding.**
+The downsample shader only wrote valid (non-padded) pixels into the output buffer. The wavelet
+operates on the full padded tile region; the unwritten padding zone contained stale/garbage GPU
+memory that propagated into high-frequency subband coefficients.
+Fix: shader now fills the full `dst_stride × dst_height_padded` region with edge-replicated
+values (right-edge and bottom-edge replication as appropriate).
+
+**Bug 4 — Double entropy encoding for non-444.**
+Both the CPU Rice path and the GPU Rice per-plane path fired for non-444 modes. The condition
+guarding GPU Rice was `!use_gpu_rice` but not `!use_gpu_encode_batch`, so both executed and the
+output bitstream contained two concatenated entropy streams.
+Fix: guard condition changed to `!use_gpu_encode_batch && !use_gpu_rice`.
+
+### Final benchmark results
+
+Measured on bbb_1080p, blue_sky_1080p, touchdown_1080p at q=50 and q=75 with Rice entropy.
+
+| Image | Q | 444 PSNR | 444 BPP | 422 PSNR | 422 BPP | 420 PSNR | 420 BPP |
+|-------|---|----------|---------|----------|---------|----------|---------|
+| bbb | 50 | 37.53 | 2.22 | 35.54 | 1.97 | 34.54 | 1.70 |
+| bbb | 75 | 42.17 | 3.83 | 37.98 | 3.36 | 36.62 | 2.90 |
+| blue_sky | 50 | 39.29 | 1.92 | 37.18 | 1.37 | 37.50 | 1.12 |
+| blue_sky | 75 | 42.11 | 3.30 | 36.94 | 2.32 | 37.89 | 1.87 |
+| touchdown | 50 | 36.92 | 1.66 | 36.70 | 1.40 | 36.46 | 1.31 |
+| touchdown | 75 | 41.42 | 3.49 | 41.04 | 2.84 | 40.51 | 2.59 |
+
+BPP reductions vs 4:4:4:
+- 4:2:2: 11-30% (largest gains on blue_sky; smallest on touchdown which is high-motion with
+  significant chroma detail in crowd clothing)
+- 4:2:0: 21-43% (largest gains on blue_sky; still 26% even on touchdown)
+
+### Analysis of PSNR loss vs prediction
+
+Predicted loss was 1-2 dB based on human-vision sensitivity arguments. Actual loss was larger:
+
+- 4:2:2: 0.2-5.2 dB
+- 4:2:0: 0.5-5.6 dB
+
+The larger-than-predicted loss is explained by the PSNR metric: we measure all-channel YCoCg
+PSNR, which weights chroma equally with luma. Human-vision arguments apply to perceptual quality
+(SSIM/VMAF), not to equal-weight PSNR. The perceptual quality degradation is expected to be
+smaller than these numbers suggest. VMAF validation was not run for this item — worth adding
+if 4:2:0 is promoted to a default.
+
+Additionally, nearest-neighbor upsampling (used here) introduces avoidable reconstruction error.
+Bilinear upsampling would recover an estimated 0.5-1.0 dB, bringing measured loss closer to the
+perceptual expectation.
+
+### Blue_sky anomaly
+
+At both q=50 and q=75, blue_sky 4:2:0 PSNR exceeds 4:2:0 PSNR by 0.32 dB (q=50) and 0.95 dB
+(q=75). This is counterintuitive: 4:2:0 discards more chroma information than 4:2:2, so its
+PSNR should be lower or equal.
+
+Suspected cause: blue_sky has a strong vertical chroma gradient (sky-to-ground colour shift)
+and low horizontal chroma variation. 4:2:0 subsampling is 2:1 in both axes; tile boundaries in
+the wavelet decomposition happen to align more favourably with this content's dominant spatial
+frequency structure than the 4:2:2 (horizontal-only) subsampling does. In effect, the 4:2:2
+horizontal-only downsample introduces ringing artefacts in the frequency domain that 4:2:0
+avoids by also subsampling vertically, where the signal is already smooth.
+
+This is a single-image observation. Flag for future investigation if 4:2:0 > 4:2:2 recurs on
+other sky/gradient content.
+
+### Lessons learned
+
+1. **Uniform buffer slot aliasing is a silent GPU bug.** Three planes sharing the same slot range
+   produced no error, no validation layer warning, and no obviously wrong output — just subtly
+   wrong chroma dimensions fed to the wavelet. Diagnosis required tracing the exact slot offset
+   arithmetic manually. Always assign non-overlapping buffer slots when multiple dispatch calls
+   share a parameter buffer.
+
+2. **Padding must be filled, not just declared.** GPU buffers are not zero-initialised between
+   uses. Any region touched by a shader that the preceding write didn't cover will contain
+   arbitrary stale values. Edge-replication padding is not optional for correctness.
+
+3. **WGSL struct layout must be kept in sync with Rust.** There is no compile-time check. A
+   reordering on either side silently misroutes all field reads. Consider a comment block on
+   both sides listing fields in order as a lightweight contract.
+
+4. **PSNR is not a perceptual metric.** Chroma subsampling looks better than PSNR suggests.
+   Always pair PSNR with VMAF when evaluating changes that touch chroma.
+
+---

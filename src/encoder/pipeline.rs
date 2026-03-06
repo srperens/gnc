@@ -1269,8 +1269,9 @@ impl EncoderPipeline {
         let plane_tiles_x = [tiles_x, info.chroma_tiles_x() as usize, info.chroma_tiles_x() as usize];
         let plane_tiles_y = [tiles_y, info.chroma_tiles_y() as usize, info.chroma_tiles_y() as usize];
 
-        // CPU entropy encode path: each plane reads from its persisted buffer
-        if !use_gpu_encode_batch {
+        // CPU entropy encode path: each plane reads from its persisted buffer.
+        // Must not run when GPU Rice per-plane path will handle encoding (non-444 + GPU Rice).
+        if !use_gpu_encode_batch && !use_gpu_rice {
             // Y from mc_out, Co from ref_upload, Cg from plane_b
             let qbufs = [&bufs.mc_out, &bufs.ref_upload, &bufs.plane_b];
             for p in 0..3 {

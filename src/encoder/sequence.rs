@@ -1050,10 +1050,16 @@ impl EncoderPipeline {
         self.ensure_tw_cached(ctx, padded_w, padded_h, group_size, raw_input_size);
         let tw = self.tw_cached.take().unwrap();
 
+        // Per-stage wall-clock profiling (gated behind GNC_HAAR_PROFILE env var).
+        let prof = std::env::var("GNC_HAAR_PROFILE").is_ok();
+        let t_start = if prof { Some(std::time::Instant::now()) } else { None };
+
         // Upload all frames to per-frame GPU buffers (avoids write_buffer race)
         for (input_buf, frame_data) in tw.per_frame_input.iter().zip(gop_frames.iter()) {
             ctx.queue.write_buffer(input_buf, 0, bytemuck::cast_slice(frame_data));
         }
+
+        let t_after_upload = if prof { Some(std::time::Instant::now()) } else { None };
 
         // Spatial wavelet per frame — single command encoder to prevent
         // intermediate buffer races (separate submits can overlap on GPU)
@@ -1117,7 +1123,10 @@ impl EncoderPipeline {
                 }
             }
             ctx.queue.submit(Some(cmd.finish()));
+            if prof { ctx.device.poll(wgpu::Maintain::Wait); }
         }
+
+        let t_after_spatial = if prof { Some(std::time::Instant::now()) } else { None };
 
         // 2) Temporal Haar on GPU, per plane — multilevel dyadic decomposition
         let num_levels = (group_size as f64).log2() as usize;
@@ -1151,7 +1160,10 @@ impl EncoderPipeline {
                 current_count = pairs;
             }
             ctx.queue.submit(Some(cmd.finish()));
+            if prof { ctx.device.poll(wgpu::Maintain::Wait); }
         }
+
+        let t_after_haar = if prof { Some(std::time::Instant::now()) } else { None };
 
         // 3) Encode low frame from GPU buffer
         let low_cf = self.encode_from_gpu_wavelet_planes(
@@ -1167,6 +1179,8 @@ impl EncoderPipeline {
             padded_h,
             padded_pixels,
         );
+
+        let t_after_low_enc = if prof { Some(std::time::Instant::now()) } else { None };
 
         // 4) Encode high frames per level with per-tile adaptive muls.
         //    CfL is disabled for highpass frames (alpha regression unreliable on residuals).
@@ -1208,6 +1222,8 @@ impl EncoderPipeline {
             let tiles_y = padded_h / cfg.tile_size;
             vec![(vec![max_mul; (tiles_x * tiles_y) as usize], f32::MAX); total_high_frames]
         };
+
+        let t_after_aq = if prof { Some(std::time::Instant::now()) } else { None };
 
         let mut hframe_infos: Vec<HighFrameInfo> = Vec::with_capacity(total_high_frames);
         for (i, &(buf_idx, lvl, idx)) in hframe_buf_indices.iter().enumerate() {
@@ -1401,8 +1417,40 @@ impl EncoderPipeline {
             }
         }
 
+        let t_after_high_enc = if prof { Some(std::time::Instant::now()) } else { None };
+
         // Return cached buffers to self for reuse in next GOP
         self.tw_cached = Some(tw);
+
+        // Print per-stage profiling summary if GNC_HAAR_PROFILE is set.
+        if prof {
+            let t0 = t_start.unwrap();
+            let t1 = t_after_upload.unwrap();
+            let t2 = t_after_spatial.unwrap();
+            let t3 = t_after_haar.unwrap();
+            let t4 = t_after_low_enc.unwrap();
+            let t5 = t_after_aq.unwrap();
+            let t6 = t_after_high_enc.unwrap();
+            let ms = |a: std::time::Instant, b: std::time::Instant| -> f64 {
+                b.duration_since(a).as_secs_f64() * 1000.0
+            };
+            let upload_ms    = ms(t0, t1);
+            let spatial_ms   = ms(t1, t2);
+            let haar_ms      = ms(t2, t3);
+            let low_enc_ms   = ms(t3, t4);
+            let aq_ms        = ms(t4, t5);
+            let high_enc_ms  = ms(t5, t6);
+            let total_ms     = ms(t0, t6);
+            let other_ms     = total_ms - upload_ms - spatial_ms - haar_ms
+                               - low_enc_ms - aq_ms - high_enc_ms;
+            eprintln!(
+                "[HAAR_PROF] upload={:.1}ms spatial_wl={:.1}ms temporal_haar={:.1}ms \
+                 low_enc={:.1}ms aq_readback={:.1}ms high_enc={:.1}ms \
+                 other={:.1}ms TOTAL={:.1}ms",
+                upload_ms, spatial_ms, haar_ms, low_enc_ms, aq_ms, high_enc_ms,
+                other_ms, total_ms,
+            );
+        }
 
         TemporalGroup {
             low_frame: low_cf,

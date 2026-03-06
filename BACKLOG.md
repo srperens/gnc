@@ -29,16 +29,15 @@ See [BASELINE.md](BASELINE.md) for current benchmark numbers.
 - **Success criteria:** >= 40 fps pure encode on crowd_run 1080p q=75 (stretch: 60 fps)
 
 ### 4. Tile size experiment
-- **Status:** blocked on #4a
+- **Status:** todo (4a done, unblocked)
 - **Problem:** M1 GPU underutilized at 40 tiles/plane with 256x256 tiles; 128x128 gives 4× more workgroups
 - **Hypothesis:** 128×128 tiles reduce GPU idle time in light temporal kernels, saving 15-30% per-GOP encode time. Counter-hypothesis: 4× more dispatch calls add CPU overhead, making it neutral.
 - **Success criteria:** ≥15% reduction in pure encode time/GOP, no bpp/PSNR change. Failure: <5% change.
 
 ### 4a. Fix benchmark input: PNG → Y4M/YUV (prerequisite for #4)
-- **Status:** todo
-- **Problem:** `benchmark-sequence` reads PNG files. PNG decode (~220ms/GOP at 1080p) dominates end-to-end timing, making fps measurements a PNG benchmark not a GNC benchmark. Tile-size and other performance experiments will be equally misleading without this fix.
-- **Success criteria:** `benchmark-sequence` accepts Y4M or raw YUV420 input; fps numbers reflect GNC encode time only
-- **Note:** Broadcast test sequences (Xiph) are available as PNG frames — Y4M originals may need to be fetched or the PNG decode must be excluded from timing
+- **Status:** done (2026-03-06)
+- **Result:** `benchmark-sequence` now accepts `.y4m` input. Y4M I/O = 16% overhead (vs PNG 45%). End-to-end fps now 27.2 fps (vs 16.4), GNC-only fps 32.6 fps. Temporal Haar warmup bug also fixed.
+- **Note:** Y4M files must be created from PNG sequences via ffmpeg. Xiph originals available at media.xiph.org/video/derf/
 
 ### 5. 4:2:0 + 10-bit
 - **Status:** todo

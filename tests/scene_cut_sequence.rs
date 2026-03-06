@@ -357,7 +357,11 @@ fn test_bbb_scene_cuts_250_600() {
     let seq = gnc::TemporalEncodedSequence {
         mode: TemporalTransform::Haar,
         groups: groups.clone(),
+        group_gop_indices: (0..groups.len()).collect(),
         tail_iframes: tail_iframes.clone(),
+        tail_iframe_pts: (0..tail_iframes.len())
+            .map(|i| (groups.len() * GOP_SIZE + i) as u32)
+            .collect(),
         frame_count: TOTAL_FRAMES,
         gop_size: GOP_SIZE,
     };

@@ -900,19 +900,27 @@ fn main() {
                 let num_gops = num_frames / gop_size;
                 let tail_start = num_gops * gop_size;
 
+                let profile_split = std::env::var("GNC_PROFILE_SPLIT").is_ok();
                 let start = std::time::Instant::now();
+                let mut total_png_ms: f64 = 0.0;
+                let mut total_enc_ms: f64 = 0.0;
 
                 for gop_idx in 0..num_gops {
                     let base = gop_idx * gop_size;
                     // Load this GOP's frames
+                    let t_png_start = std::time::Instant::now();
                     let mut gop_frames: Vec<Vec<f32>> = Vec::with_capacity(gop_size);
                     for j in 0..gop_size {
                         let path = input.replace("%04d", &format!("{:04}", base + j));
                         let (rgb, _, _) = load_image_rgb_f32(&path);
                         gop_frames.push(rgb);
                     }
+                    let gop_png_ms = t_png_start.elapsed().as_secs_f64() * 1000.0;
+                    total_png_ms += gop_png_ms;
+
                     let gop_refs: Vec<&[f32]> = gop_frames.iter().map(|f| f.as_slice()).collect();
 
+                    let t_enc_start = std::time::Instant::now();
                     let group = encoder.encode_temporal_wavelet_gop(
                         &ctx,
                         &gop_refs,
@@ -921,6 +929,8 @@ fn main() {
                         &config_tw,
                         temporal_mode,
                     );
+                    let gop_enc_ms = t_enc_start.elapsed().as_secs_f64() * 1000.0;
+                    total_enc_ms += gop_enc_ms;
 
                     let low_bytes = group.low_frame.byte_size();
                     let high_bytes: usize = group.high_frames.iter()
@@ -945,6 +955,16 @@ fn main() {
                             frames_done,
                             num_frames,
                             fps_enc,
+                        );
+                    }
+
+                    if profile_split {
+                        let gop_total_ms = gop_png_ms + gop_enc_ms;
+                        let png_pct = gop_png_ms / gop_total_ms * 100.0;
+                        let enc_pct = gop_enc_ms / gop_total_ms * 100.0;
+                        eprintln!(
+                            "SPLIT GOP {:3}: png_decode={:.1}ms ({:.0}%), gnc_encode={:.1}ms ({:.0}%), gop_total={:.1}ms",
+                            gop_idx, gop_png_ms, png_pct, gop_enc_ms, enc_pct, gop_total_ms,
                         );
                     }
 
@@ -977,13 +997,34 @@ fn main() {
                 tail_cfg.cfl_enabled = false;
                 for i in tail_start..num_frames {
                     let path = input.replace("%04d", &format!("{:04}", i));
+                    let t_png_start = std::time::Instant::now();
                     let (rgb, _, _) = load_image_rgb_f32(&path);
+                    total_png_ms += t_png_start.elapsed().as_secs_f64() * 1000.0;
+                    let t_enc_start = std::time::Instant::now();
                     let cf = encoder.encode(&ctx, &rgb, w, h, &tail_cfg);
+                    total_enc_ms += t_enc_start.elapsed().as_secs_f64() * 1000.0;
                     total_bytes += cf.byte_size();
                     tail_iframes.push(cf);
                 }
 
                 let elapsed = start.elapsed();
+                if profile_split {
+                    let total_measured_ms = total_png_ms + total_enc_ms;
+                    let wall_ms = elapsed.as_secs_f64() * 1000.0;
+                    let other_ms = wall_ms - total_measured_ms;
+                    let enc_fps = (num_frames as f64) / (total_enc_ms / 1000.0);
+                    eprintln!(
+                        "SPLIT Total: wall={:.1}ms, png_decode={:.1}ms ({:.0}%), gnc_encode={:.1}ms ({:.0}%), other={:.1}ms ({:.0}%)",
+                        wall_ms,
+                        total_png_ms, total_png_ms / wall_ms * 100.0,
+                        total_enc_ms, total_enc_ms / wall_ms * 100.0,
+                        other_ms, other_ms / wall_ms * 100.0,
+                    );
+                    eprintln!(
+                        "SPLIT GNC-only fps: {:.1} fps ({} frames / {:.1}ms gnc_encode time)",
+                        enc_fps, num_frames, total_enc_ms,
+                    );
+                }
                 let avg_bpp = (total_bytes as f64 * 8.0) / (w as f64 * h as f64) / num_frames as f64;
                 println!(
                     "  Total: {} bytes ({:.2} MB), avg {:.2} bpp, {:.1}ms ({:.1} fps)",

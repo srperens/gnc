@@ -29,10 +29,16 @@ See [BASELINE.md](BASELINE.md) for current benchmark numbers.
 - **Success criteria:** >= 40 fps pure encode on crowd_run 1080p q=75 (stretch: 60 fps)
 
 ### 4. Tile size experiment
-- **Status:** todo (next after per-stage profiling)
+- **Status:** blocked on #4a
 - **Problem:** M1 GPU underutilized at 40 tiles/plane with 256x256 tiles; 128x128 gives 4× more workgroups
 - **Hypothesis:** 128×128 tiles reduce GPU idle time in light temporal kernels, saving 15-30% per-GOP encode time. Counter-hypothesis: 4× more dispatch calls add CPU overhead, making it neutral.
 - **Success criteria:** ≥15% reduction in pure encode time/GOP, no bpp/PSNR change. Failure: <5% change.
+
+### 4a. Fix benchmark input: PNG → Y4M/YUV (prerequisite for #4)
+- **Status:** todo
+- **Problem:** `benchmark-sequence` reads PNG files. PNG decode (~220ms/GOP at 1080p) dominates end-to-end timing, making fps measurements a PNG benchmark not a GNC benchmark. Tile-size and other performance experiments will be equally misleading without this fix.
+- **Success criteria:** `benchmark-sequence` accepts Y4M or raw YUV420 input; fps numbers reflect GNC encode time only
+- **Note:** Broadcast test sequences (Xiph) are available as PNG frames — Y4M originals may need to be fetched or the PNG decode must be excluded from timing
 
 ### 5. 4:2:0 + 10-bit
 - **Status:** todo

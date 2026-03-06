@@ -2046,6 +2046,7 @@ impl DecoderPipeline {
                         info,
                         config.wavelet_levels,
                         config.wavelet_type,
+                        p,
                     );
                     cmd.copy_buffer_to_buffer(
                         &bufs.scratch_a, 0, &bufs.plane_results[p], 0, plane_size,
@@ -2257,7 +2258,7 @@ impl DecoderPipeline {
                 cmd.copy_buffer_to_buffer(&tw_frame_bufs[fi][p], 0, &bufs.scratch_b, 0, plane_size);
                 self.transform.inverse(
                     ctx, &mut cmd, &bufs.scratch_b, &bufs.scratch_c, &bufs.scratch_a,
-                    info, config.wavelet_levels, config.wavelet_type,
+                    info, config.wavelet_levels, config.wavelet_type, p,
                 );
                 cmd.copy_buffer_to_buffer(&bufs.scratch_a, 0, &bufs.plane_results[p], 0, plane_size);
                 ctx.queue.submit(Some(cmd.finish()));
@@ -2551,7 +2552,7 @@ impl DecoderPipeline {
             cmd.copy_buffer_to_buffer(plane_buf, 0, &bufs.scratch_b, 0, plane_size);
             self.transform.inverse(
                 ctx, &mut cmd, &bufs.scratch_b, &bufs.scratch_c, &bufs.scratch_a,
-                info, config.wavelet_levels, config.wavelet_type,
+                info, config.wavelet_levels, config.wavelet_type, p,
             );
             cmd.copy_buffer_to_buffer(&bufs.scratch_a, 0, &bufs.plane_results[p], 0, plane_size);
         }

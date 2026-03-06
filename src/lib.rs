@@ -481,8 +481,9 @@ pub fn quality_preset(q: u32) -> CodecConfig {
         } else {
             WaveletType::CDF97
         },
-        // rANS is default: ~30% better compression than Rice across all lossy quality levels.
-        // Rice remains available via --rice flag for lower-latency use cases.
+        // rANS default: wins at low quality (q≤40, up to -18% bits); near-parity at q=50;
+        // Rice wins slightly at q≥75 (+9-12% bits but ~30% faster). rANS is better for
+        // the H.264-comparison range (low-mid bitrate). Rice available via --rice flag.
         entropy_coder: EntropyCoder::Rans,
         per_subband_entropy: disc.per_subband,
         adaptive_quantization: aq_enabled,

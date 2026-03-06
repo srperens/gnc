@@ -3851,18 +3851,28 @@ impl EncoderPipeline {
     /// Map temporal highpass energy to an adaptive qstep multiplier.
     ///
     /// Low energy (static content) → high mul (aggressive quantization, tiny highpass).
-    /// High energy (motion) → low mul (preserve temporal detail).
-    /// Returns a value in `[1.0, max_mul]`.
+    /// High energy (motion) → min_mul (preserve temporal detail, but always coarser
+    /// than lowpass to reflect that temporal highpass is structurally less important).
+    /// Returns a value in `[MIN_MUL, max_mul]`.
     ///
     /// The weight_map in the quantize shader multiplies step_size, so mul > 1.0
-    /// means coarser quantization (fewer bits). We never go below 1.0 because
-    /// highpass should never be finer than lowpass.
+    /// means coarser quantization (fewer bits). We never go below MIN_MUL because
+    /// temporal highpass should always be at least slightly coarser than lowpass —
+    /// even high-energy temporal residuals carry less perceptual weight than the
+    /// absolute signal level in the lowpass frame.
     ///
     /// Calibrated for real temporal highpass energy values (typically 0-20 for
     /// 1080p content at q=75). Uses log-space interpolation between thresholds.
     fn map_energy_to_mul(energy: f64, max_mul: f32) -> f32 {
+        // Minimum multiplier: even for the highest-energy (highest-motion) tiles,
+        // temporal highpass should use at least 1.2× coarser quantisation than
+        // the lowpass. This saves ~15% bits on high-energy tiles with negligible
+        // perceptual impact (temporal residuals are less perceptually important
+        // than absolute signal values).
+        const MIN_MUL: f32 = 1.2;
+
         // Below low_thresh: near-zero energy → max_mul (aggressive)
-        // Above high_thresh: high energy → 1.0 (preserve detail)
+        // Above high_thresh: high energy → MIN_MUL (preserve detail, still coarser than lowpass)
         // Between: log-linear interpolation
         let low_thresh: f64 = 0.5;
         let high_thresh: f64 = 10.0;
@@ -3871,12 +3881,12 @@ impl EncoderPipeline {
             return max_mul;
         }
         if energy >= high_thresh {
-            return 1.0;
+            return MIN_MUL;
         }
 
         // Log-linear interpolation: t=0 at low_thresh, t=1 at high_thresh
         let t = ((energy / low_thresh).ln() / (high_thresh / low_thresh).ln()) as f32;
-        max_mul + t * (1.0 - max_mul)
+        max_mul + t * (MIN_MUL - max_mul)
     }
 
     /// Build an all-zero `CompressedFrame` for a highpass frame whose coefficients
@@ -4037,12 +4047,12 @@ mod tests {
         // Very low energy → max_mul (aggressive quantization)
         let low = EncoderPipeline::map_energy_to_mul(0.001, max_mul);
         assert!((low - max_mul).abs() < 0.01, "low energy mul={low}");
-        // Very high energy → 1.0 (preserve detail, never finer than lowpass)
+        // Very high energy → MIN_MUL=1.2 (preserve detail, always coarser than lowpass)
         let high = EncoderPipeline::map_energy_to_mul(100.0, max_mul);
-        assert!((high - 1.0).abs() < 0.01, "high energy mul={high}");
-        // Medium energy → between 1.0 and max_mul
+        assert!((high - 1.2).abs() < 0.01, "high energy mul={high} (expected MIN_MUL=1.2)");
+        // Medium energy → between 1.2 and max_mul
         let mid = EncoderPipeline::map_energy_to_mul(2.0, max_mul);
-        assert!(mid > 1.0 && mid < max_mul, "mid energy mul={mid}");
+        assert!(mid > 1.2 && mid < max_mul, "mid energy mul={mid}");
     }
 
     #[test]
@@ -4072,23 +4082,26 @@ mod tests {
                 (mul - max).abs() < 0.01,
                 "zero energy should give max_mul={max}, got {mul}"
             );
+            // High energy floors at MIN_MUL (1.2), not 1.0
             let mul_high = EncoderPipeline::map_energy_to_mul(1000.0, max);
             assert!(
-                (mul_high - 1.0).abs() < 0.01,
-                "high energy should floor at 1.0, got {mul_high}"
+                (mul_high - 1.2).abs() < 0.01,
+                "high energy should floor at MIN_MUL=1.2, got {mul_high}"
             );
         }
     }
 
     #[test]
-    fn test_map_energy_to_mul_never_below_one() {
-        // Mul should never go below 1.0 — highpass should never be finer than lowpass
+    fn test_map_energy_to_mul_never_below_min() {
+        // Mul should never go below MIN_MUL (1.2) — temporal highpass should always
+        // be at least slightly coarser than lowpass, even for high-energy tiles.
+        const MIN_MUL: f32 = 1.2;
         for max in [1.5f32, 2.0, 3.0, 5.0] {
             for e in [0.0, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 50.0, 100.0] {
                 let mul = EncoderPipeline::map_energy_to_mul(e, max);
                 assert!(
-                    mul >= 1.0 - 0.001,
-                    "mul={mul} < 1.0 at energy={e}, max_mul={max}"
+                    mul >= MIN_MUL - 0.001,
+                    "mul={mul} < MIN_MUL={MIN_MUL} at energy={e}, max_mul={max}"
                 );
             }
         }

@@ -88,6 +88,28 @@ VC-2 (Dirac) demonstrates that a patent-free wavelet codec can reach H.264-class
 
 **Challenge your own work.** After implementing something, actively try to prove it is wrong before calling it done. Reproduce results before celebrating. If the same bug resurfaces twice — stop and diagnose the root cause properly.
 
+## 5b. Hard Architecture Rules (agents must not violate these)
+
+These rules encode mistakes that were made and reverted. They are non-negotiable.
+
+**Entropy coder: Rice is the default, always.**
+rANS is disqualified as default entropy. rANS is sequential (2048 ops/thread, 32 interleaved streams) — it conflicts with GPU-parallel tile-independent design. Rice has 256 fully independent streams per tile and scales with GPU threads. rANS may be kept in the codebase for experimentation at q≤40, but must never be the default.
+
+**No spatial block prediction on the wavelet path.**
+Intra prediction (DC, planar, angular) operates at block scale. Wavelet operates at tile scale. Combining them creates block-boundary discontinuities that the wavelet handles poorly. This was implemented, measured, and found to always hurt quality. It is disabled and must stay disabled on the wavelet path.
+
+**bpp reduction is not proof of correctness.**
+If a change reduces bpp but quality (PSNR/VMAF) is not validated, the change is not done. Reduced bpp from throwing away coefficients (zeroing tiles, aggressive dead zone) looks identical to reduced bpp from better coding — until you decode and see ghosting or blocking. Validate quality before committing.
+
+**Temporal highpass coefficients must not be zeroed based on motion energy.**
+High-motion tiles need highpass coefficients most — they capture the temporal difference that distinguishes frames. Zeroing highpass for high-energy tiles forces the decoder to use the temporal average (LL only), producing ghosting. This was implemented (TILE_ENERGY_ZERO_THRESH), calibrated across 3 commits, and then removed entirely for +4.22 dB.
+
+**WASM must be tested after every change to lib.rs or the decoder.**
+WASM crashes are silent until a user opens a browser. Scene cut handling and WASM borrow checker issues were found by the user, not by tests. After any change touching `src/lib.rs`, run `wasm-pack build --target web` and do a smoke test.
+
+**Read diagnostics directly; don't delegate diagnostic interpretation.**
+When a diagnostic output exists (--diagnostics, per-frame PSNR, tile energy logs), read it directly and reason about it. Delegating diagnostic interpretation to a new agent loses context and adds latency. If the output is too large, grep for the key numbers.
+
 ## 6. Non-Goals
 
 - **Beating AV1/H.265 on compression ratio** — We occupy a different design point: parallel, low-latency, patent-free. We compete on speed and simplicity, not maximum compression.

@@ -9,6 +9,52 @@ pub mod gpu_util;
 pub mod image_util;
 pub mod temporal;
 
+/// Chroma subsampling format
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ChromaFormat {
+    /// 4:4:4 — Co and Cg at full luma resolution (current default)
+    #[default]
+    Yuv444,
+    /// 4:2:2 — Co and Cg halved horizontally only
+    Yuv422,
+    /// 4:2:0 — Co and Cg halved in both horizontal and vertical
+    Yuv420,
+}
+
+impl ChromaFormat {
+    /// Horizontal log2 scale factor for chroma (0 = no reduction, 1 = half width)
+    pub fn horiz_shift(self) -> u32 {
+        match self {
+            ChromaFormat::Yuv444 => 0,
+            ChromaFormat::Yuv422 | ChromaFormat::Yuv420 => 1,
+        }
+    }
+    /// Vertical log2 scale factor for chroma (0 = no reduction, 1 = half height)
+    pub fn vert_shift(self) -> u32 {
+        match self {
+            ChromaFormat::Yuv444 | ChromaFormat::Yuv422 => 0,
+            ChromaFormat::Yuv420 => 1,
+        }
+    }
+    /// Encode to u8 for bitstream
+    pub fn to_u8(self) -> u8 {
+        match self {
+            ChromaFormat::Yuv444 => 0,
+            ChromaFormat::Yuv422 => 1,
+            ChromaFormat::Yuv420 => 2,
+        }
+    }
+    /// Decode from u8
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(ChromaFormat::Yuv444),
+            1 => Some(ChromaFormat::Yuv422),
+            2 => Some(ChromaFormat::Yuv420),
+            _ => None,
+        }
+    }
+}
+
 /// Frame dimensions and format info
 #[derive(Debug, Clone, Copy)]
 pub struct FrameInfo {
@@ -16,6 +62,7 @@ pub struct FrameInfo {
     pub height: u32,
     pub bit_depth: u32, // 8 or 10
     pub tile_size: u32, // e.g., 256
+    pub chroma_format: ChromaFormat,
 }
 
 impl FrameInfo {
@@ -42,6 +89,46 @@ impl FrameInfo {
 
     pub fn padded_height(&self) -> u32 {
         self.tiles_y() * self.tile_size
+    }
+
+    /// Chroma plane width (after subsampling)
+    pub fn chroma_width(&self) -> u32 {
+        self.width >> self.chroma_format.horiz_shift()
+    }
+
+    /// Chroma plane height (after subsampling)
+    pub fn chroma_height(&self) -> u32 {
+        self.height >> self.chroma_format.vert_shift()
+    }
+
+    /// Chroma padded width (rounded up to tile_size)
+    pub fn chroma_padded_width(&self) -> u32 {
+        self.chroma_width().div_ceil(self.tile_size) * self.tile_size
+    }
+
+    /// Chroma padded height (rounded up to tile_size)
+    pub fn chroma_padded_height(&self) -> u32 {
+        self.chroma_height().div_ceil(self.tile_size) * self.tile_size
+    }
+
+    /// Number of chroma tiles in X direction
+    pub fn chroma_tiles_x(&self) -> u32 {
+        self.chroma_width().div_ceil(self.tile_size)
+    }
+
+    /// Number of chroma tiles in Y direction
+    pub fn chroma_tiles_y(&self) -> u32 {
+        self.chroma_height().div_ceil(self.tile_size)
+    }
+
+    /// Total chroma tiles per plane
+    pub fn chroma_tiles_per_plane(&self) -> usize {
+        (self.chroma_tiles_x() * self.chroma_tiles_y()) as usize
+    }
+
+    /// Total luma tiles per plane
+    pub fn luma_tiles_per_plane(&self) -> usize {
+        (self.tiles_x() * self.tiles_y()) as usize
     }
 }
 
@@ -278,6 +365,8 @@ pub struct CodecConfig {
     /// When true, dynamically compute highpass mul from GOP energy.
     /// When false, use `temporal_highpass_qstep_mul` as a fixed multiplier.
     pub adaptive_temporal_mul: bool,
+    /// Chroma subsampling format (default: Yuv444 = no subsampling).
+    pub chroma_format: ChromaFormat,
 }
 
 impl CodecConfig {
@@ -317,6 +406,7 @@ impl Default for CodecConfig {
             temporal_transform: TemporalTransform::None,
             temporal_highpass_qstep_mul: 2.0,
             adaptive_temporal_mul: true,
+            chroma_format: ChromaFormat::Yuv444,
         }
     }
 }

@@ -305,6 +305,8 @@ fn serialize_frame_header(frame: &crate::CompressedFrame, out: &mut Vec<u8>) {
     out.push(transform_byte);
     // Per-subband entropy: 0 = off, 1 = on
     out.push(u8::from(frame.config.per_subband_entropy));
+    // Chroma format byte (GP13 — always written here to maintain correct byte alignment)
+    out.push(frame.info.chroma_format.to_u8());
     // Subband weights: ll, num_detail_levels, per-level [LH, HL, HH], chroma_weight
     let sw = &frame.config.subband_weights;
     out.extend_from_slice(&sw.ll.to_le_bytes());
@@ -521,9 +523,9 @@ fn deserialize_mvs_delta(
 /// MV overhead by 50-80% for typical content.
 pub fn serialize_compressed(frame: &crate::CompressedFrame) -> Vec<u8> {
     let mut out = Vec::new();
-    // Magic: GP12
-    out.extend_from_slice(b"GP12");
-    // Common header fields
+    // Magic: GP13 (adds chroma_format byte after per_subband_entropy, inside header)
+    out.extend_from_slice(b"GP13");
+    // Common header fields (includes chroma_format byte for GP13)
     serialize_frame_header(frame, &mut out);
     // Motion field — GP12 uses delta-coded varint MVs
     if let Some(ref mf) = frame.motion_field {
@@ -754,9 +756,10 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
     let is_gp10 = magic == b"GP10";
     let is_gp11 = magic == b"GP11";
     let is_gp12 = magic == b"GP12";
+    let is_gp13 = magic == b"GP13";
     assert!(
-        magic == b"GPC8" || is_gpc9 || is_gp10 || is_gp11 || is_gp12,
-        "Invalid magic (expected GPC8, GPC9, GP10, GP11 or GP12; older files must be re-encoded)"
+        magic == b"GPC8" || is_gpc9 || is_gp10 || is_gp11 || is_gp12 || is_gp13,
+        "Invalid magic (expected GPC8, GPC9, GP10, GP11, GP12 or GP13; older files must be re-encoded)"
     );
 
     // --- Common header (same layout for GPC9/GP10/GP11; GPC8 lacks per-subband flag) ---
@@ -780,11 +783,21 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
         t => panic!("Unknown transform type: {t}"),
     };
 
-    // Per-subband entropy flag (GPC9/GP10/GP11/GP12)
-    let (per_subband_entropy, mut pos) = if is_gpc9 || is_gp10 || is_gp11 || is_gp12 {
+    // Per-subband entropy flag (GPC9/GP10/GP11/GP12/GP13)
+    let (per_subband_entropy, mut pos) = if is_gpc9 || is_gp10 || is_gp11 || is_gp12 || is_gp13 {
         (data[34] != 0, 35)
     } else {
         (false, 34)
+    };
+
+    // Chroma format byte (GP13 only; older formats default to 4:4:4)
+    let chroma_format_decoded = if is_gp13 {
+        let cf = crate::ChromaFormat::from_u8(data[pos])
+            .unwrap_or(crate::ChromaFormat::Yuv444);
+        pos += 1;
+        cf
+    } else {
+        crate::ChromaFormat::Yuv444
     };
 
     // --- Subband weights ---
@@ -847,8 +860,8 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
         None
     };
 
-    // --- Intra prediction modes (GP11/GP12) ---
-    let intra_modes = if (is_gp11 || is_gp12) && data[pos] != 0 {
+    // --- Intra prediction modes (GP11/GP12/GP13) ---
+    let intra_modes = if (is_gp11 || is_gp12 || is_gp13) && data[pos] != 0 {
         pos += 1; // skip intra_flag
         let _num_blocks = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
         pos += 4;
@@ -857,15 +870,15 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
         let modes = data[pos..pos + packed_len].to_vec();
         pos += packed_len;
         Some(modes)
-    } else if is_gp11 || is_gp12 {
+    } else if is_gp11 || is_gp12 || is_gp13 {
         pos += 1; // skip intra_flag = 0
         None
     } else {
         None
     };
 
-    // --- Frame type + motion field (GP10/GP11/GP12) ---
-    let (frame_type, motion_field) = if is_gp10 || is_gp11 || is_gp12 {
+    // --- Frame type + motion field (GP10/GP11/GP12/GP13) ---
+    let (frame_type, motion_field) = if is_gp10 || is_gp11 || is_gp12 || is_gp13 {
         let ft = match data[pos] {
             0 => crate::FrameType::Intra,
             1 => crate::FrameType::Predicted,
@@ -879,8 +892,8 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
             let num_blocks =
                 u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
             pos += 4;
-            let vectors = if is_gp12 {
-                // GP12: delta-coded zigzag varint MVs
+            let vectors = if is_gp12 || is_gp13 {
+                // GP12/GP13: delta-coded zigzag varint MVs
                 let padded_w = width.div_ceil(tile_size) * tile_size;
                 let blocks_x = (padded_w / block_size) as usize;
                 deserialize_mvs_delta(data, &mut pos, num_blocks, blocks_x)
@@ -895,14 +908,14 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
                 }
                 vecs
             };
-            // GP11/GP12 B-frames: backward vectors + block modes
+            // GP11/GP12/GP13 B-frames: backward vectors + block modes
             let (backward_vectors, block_modes) =
-                if (is_gp11 || is_gp12) && ft == crate::FrameType::Bidirectional {
+                if (is_gp11 || is_gp12 || is_gp13) && ft == crate::FrameType::Bidirectional {
                     let bwd_count =
                         u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
                     pos += 4;
                     let bwd = if bwd_count > 0 {
-                        if is_gp12 {
+                        if is_gp12 || is_gp13 {
                             let padded_w = width.div_ceil(tile_size) * tile_size;
                             let bwd_blocks_x = (padded_w / 16) as usize;
                             Some(deserialize_mvs_delta(data, &mut pos, bwd_count, bwd_blocks_x))
@@ -956,8 +969,8 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
     let num_tiles = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
     pos += 4;
 
-    // GP11/GP12: tile index table with sizes + CRC-32s
-    let (tile_sizes, tile_crcs) = if is_gp11 || is_gp12 {
+    // GP11/GP12/GP13: tile index table with sizes + CRC-32s
+    let (tile_sizes, tile_crcs) = if is_gp11 || is_gp12 || is_gp13 {
         let mut sizes = Vec::with_capacity(num_tiles);
         let mut expected_crcs = Vec::with_capacity(num_tiles);
         for _ in 0..num_tiles {
@@ -1082,6 +1095,7 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
                 height,
                 bit_depth,
                 tile_size,
+                chroma_format: chroma_format_decoded,
             },
             config: crate::CodecConfig {
                 tile_size,
@@ -1688,6 +1702,7 @@ mod tests {
                 height,
                 bit_depth: 8,
                 tile_size,
+                chroma_format: crate::ChromaFormat::Yuv444,
             },
             config: crate::CodecConfig {
                 tile_size,

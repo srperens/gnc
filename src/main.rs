@@ -15,7 +15,7 @@ use gnc::format::{
     deserialize_temporal_sequence, seek_to_keyframe, serialize_compressed, serialize_sequence,
     serialize_temporal_sequence,
 };
-use gnc::image_util::{load_image_rgb_f32, parse_wavelet_type, save_image_rgb_f32};
+use gnc::image_util::{load_image_rgb_f32, parse_chroma_format, parse_wavelet_type, save_image_rgb_f32};
 use gnc::{
     CodecConfig, CompressedFrame, EntropyData, FrameType, GpuContext, RateMode, TemporalTransform,
 };
@@ -192,6 +192,108 @@ impl Y4mReader {
     }
 }
 
+/// Writes raw RGB f32 (0-255) frames as YUV4MPEG2 (4:2:0, BT.601 full-range) to a file.
+/// Used for VMAF scoring: write reference and distorted streams, then invoke vmaf CLI.
+struct Y4mWriter {
+    writer: std::io::BufWriter<std::fs::File>,
+    width: usize,
+    height: usize,
+}
+
+impl Y4mWriter {
+    fn create(path: &str, width: usize, height: usize, fps_num: u32, fps_den: u32) -> Self {
+        use std::io::Write;
+        let file = std::fs::File::create(path)
+            .unwrap_or_else(|e| panic!("Failed to create Y4M file '{}': {}", path, e));
+        let mut writer = std::io::BufWriter::new(file);
+        // Write Y4M header (full-range flag 'F' in C param not universally supported; omit)
+        writeln!(
+            writer,
+            "YUV4MPEG2 W{} H{} F{}:{} Ip A0:0 C420",
+            width, height, fps_num, fps_den
+        )
+        .expect("Y4M header write failed");
+        Self { writer, width, height }
+    }
+
+    /// Write one frame. `rgb` is interleaved R,G,B f32 values in [0,255].
+    fn write_frame(&mut self, rgb: &[f32]) {
+        use std::io::Write;
+        let w = self.width;
+        let h = self.height;
+        assert_eq!(rgb.len(), w * h * 3);
+
+        // BT.601 full-range RGB→YCbCr
+        let mut y_plane = vec![0u8; w * h];
+        let uv_w = w.div_ceil(2);
+        let uv_h = h.div_ceil(2);
+        let mut cb_plane = vec![128u8; uv_w * uv_h];
+        let mut cr_plane = vec![128u8; uv_w * uv_h];
+
+        for row in 0..h {
+            for col in 0..w {
+                let base = (row * w + col) * 3;
+                let r = rgb[base];
+                let g = rgb[base + 1];
+                let b = rgb[base + 2];
+                let y = (0.299 * r + 0.587 * g + 0.114 * b).clamp(0.0, 255.0) as u8;
+                y_plane[row * w + col] = y;
+                // Subsample chroma: average 2×2 block top-left pixel (fast approximation)
+                if row % 2 == 0 && col % 2 == 0 {
+                    let cb = (-0.168736 * r - 0.331264 * g + 0.5 * b + 128.0).clamp(0.0, 255.0) as u8;
+                    let cr = (0.5 * r - 0.418688 * g - 0.081312 * b + 128.0).clamp(0.0, 255.0) as u8;
+                    let uv_idx = (row / 2) * uv_w + (col / 2);
+                    cb_plane[uv_idx] = cb;
+                    cr_plane[uv_idx] = cr;
+                }
+            }
+        }
+
+        writeln!(self.writer, "FRAME").expect("Y4M FRAME write failed");
+        self.writer.write_all(&y_plane).expect("Y4M Y write failed");
+        self.writer.write_all(&cb_plane).expect("Y4M Cb write failed");
+        self.writer.write_all(&cr_plane).expect("Y4M Cr write failed");
+    }
+
+    fn flush(&mut self) {
+        use std::io::Write;
+        self.writer.flush().expect("Y4M flush failed");
+    }
+}
+
+/// Run the `vmaf` CLI on two Y4M files and return (mean, min, max) VMAF scores.
+fn run_vmaf(reference: &str, distorted: &str) -> Option<(f64, f64, f64)> {
+    let tmp_json = format!("{}.json", distorted);
+    let status = std::process::Command::new("vmaf")
+        .args([
+            "--reference", reference,
+            "--distorted", distorted,
+            "--json",
+            "--output", &tmp_json,
+            "--quiet",
+        ])
+        .status();
+    match status {
+        Ok(s) if s.success() => {}
+        Ok(s) => {
+            eprintln!("vmaf exited with status {}", s);
+            return None;
+        }
+        Err(e) => {
+            eprintln!("vmaf not found or failed to launch: {}", e);
+            return None;
+        }
+    }
+    // Parse JSON: look for "VMAF score" mean under pooled_metrics
+    let json_str = std::fs::read_to_string(&tmp_json).ok()?;
+    let _ = std::fs::remove_file(&tmp_json);
+    let json: serde_json::Value = serde_json::from_str(&json_str).ok()?;
+    let mean = json["pooled_metrics"]["vmaf"]["mean"].as_f64()?;
+    let min  = json["pooled_metrics"]["vmaf"]["min"].as_f64()?;
+    let max  = json["pooled_metrics"]["vmaf"]["max"].as_f64()?;
+    Some((mean, min, max))
+}
+
 #[derive(Parser)]
 #[command(name = "gnc", about = "GPU-native broadcast video codec")]
 struct Cli {
@@ -255,6 +357,10 @@ enum Command {
         /// Use CPU entropy encoding instead of GPU (for testing/debugging)
         #[arg(long)]
         cpu_encode: bool,
+
+        /// Chroma subsampling format: 444 (default, full resolution), 422, or 420
+        #[arg(long, default_value = "444")]
+        chroma_format: String,
     },
 
     /// Decode a compressed file back to an image
@@ -313,6 +419,10 @@ enum Command {
         /// DCT frequency-dependent quantization strength (default: 3.0, 0=flat)
         #[arg(long)]
         dct_freq_strength: Option<f32>,
+
+        /// Chroma subsampling format: 444 (default, full resolution), 422, or 420
+        #[arg(long, default_value = "444")]
+        chroma_format: String,
     },
 
     /// Benchmark temporal (I+P frame) encoding on a sequence of frames
@@ -384,6 +494,11 @@ enum Command {
         /// Output file path for GNV2 container
         #[arg(short, long)]
         output: Option<String>,
+
+        /// Compute VMAF perceptual quality score (requires vmaf CLI in PATH).
+        /// Decodes each frame and scores distorted vs reference using Netflix VMAF.
+        #[arg(long)]
+        vmaf: bool,
     },
 
     /// Encode a sequence of image frames into a .gnv container
@@ -690,6 +805,7 @@ fn main() {
             wavelet,
             no_per_subband,
             cpu_encode,
+            chroma_format,
         } => {
             let (rgb_data, w, h) = load_image_rgb_f32(&input);
             println!("Input: {}x{} ({} pixels)", w, h, w * h);
@@ -740,6 +856,7 @@ fn main() {
             if cpu_encode {
                 config.gpu_entropy_encode = false;
             }
+            config.chroma_format = parse_chroma_format(&chroma_format);
 
             let compressed = encoder.encode(&ctx, &rgb_data, w, h, &config);
             println!(
@@ -791,6 +908,7 @@ fn main() {
             cpu_encode,
             dct,
             dct_freq_strength,
+            chroma_format,
         } => {
             let (rgb_data, w, h) = load_image_rgb_f32(&input);
 
@@ -823,6 +941,7 @@ fn main() {
             if let Some(fs) = dct_freq_strength {
                 config.dct_freq_strength = fs;
             }
+            config.chroma_format = parse_chroma_format(&chroma_format);
 
             let coder_name = match config.entropy_coder {
                 gnc::EntropyCoder::Bitplane => "bitplane".to_string(),
@@ -1021,6 +1140,7 @@ fn main() {
             tw_highpass_mul,
             ab,
             output,
+            vmaf,
         } => {
             if diagnostics {
                 gnc::encoder::diagnostics::enable();
@@ -1217,14 +1337,35 @@ fn main() {
                 let mut lookahead_frames: Option<Vec<Vec<f32>>> = None;
 
                 // Decoder for per-GOP PSNR in diagnostics mode. Instantiated once and reused.
-                // Only active when --diagnostics is set; adds decode overhead per GOP.
-                let diag_decoder = if diagnostics {
+                // Also used for VMAF: we need decoded frames to write to Y4M.
+                let need_decode = diagnostics || vmaf;
+                let diag_decoder = if need_decode {
                     Some(DecoderPipeline::new(&ctx))
                 } else {
                     None
                 };
                 let mut diag_psnr_vals: Vec<f64> = Vec::new();
                 let mut diag_steady_fps: Vec<f64> = Vec::new(); // per-GOP fps, excl GOP 0 warmup
+
+                // VMAF Y4M writers: reference and distorted streams.
+                let tmp_ref  = std::env::temp_dir().join("gnc_vmaf_ref.y4m");
+                let tmp_dist = std::env::temp_dir().join("gnc_vmaf_dist.y4m");
+                let mut vmaf_ref_writer: Option<Y4mWriter> = if vmaf {
+                    Some(Y4mWriter::create(
+                        tmp_ref.to_str().unwrap(), w as usize, h as usize,
+                        (effective_fps * 1000.0) as u32, 1000,
+                    ))
+                } else {
+                    None
+                };
+                let mut vmaf_dist_writer: Option<Y4mWriter> = if vmaf {
+                    Some(Y4mWriter::create(
+                        tmp_dist.to_str().unwrap(), w as usize, h as usize,
+                        (effective_fps * 1000.0) as u32, 1000,
+                    ))
+                } else {
+                    None
+                };
 
                 for gop_idx in 0..num_gops {
                     let base = gop_idx * gop_size;
@@ -1381,14 +1522,9 @@ fn main() {
                         );
                     }
 
-                    // Full per-GOP diagnostics (decomposition, coefficients, warnings)
-                    if gnc::encoder::diagnostics::enabled() {
-                        let q = quality.unwrap_or(75);
-                        let mul = tw_highpass_mul.unwrap_or(config_tw.temporal_highpass_qstep_mul);
-
-                        // Decode the GOP to compute per-frame PSNR.
-                        // gop_frames is still in scope (owned, not moved).
-                        let per_frame_q: Vec<(f64, f64)> = if let Some(ref dec) = diag_decoder {
+                    // Decode GOP for diagnostics and/or VMAF scoring.
+                    if need_decode {
+                        let decoded_frames: Vec<Vec<f32>> = if let Some(ref dec) = diag_decoder {
                             let single_seq = gnc::TemporalEncodedSequence {
                                 mode: temporal_mode,
                                 groups: vec![group.clone()],
@@ -1398,33 +1534,51 @@ fn main() {
                                 frame_count: gop_size,
                                 gop_size,
                             };
-                            let decoded = dec.decode_temporal_sequence(&ctx, &single_seq);
-                            gop_frames.iter().zip(decoded.iter())
+                            dec.decode_temporal_sequence(&ctx, &single_seq)
+                        } else {
+                            vec![]
+                        };
+
+                        // Write reference and distorted frames for VMAF.
+                        if vmaf {
+                            for (orig, dec_frame) in gop_frames.iter().zip(decoded_frames.iter()) {
+                                if let Some(ref mut wr) = vmaf_ref_writer {
+                                    wr.write_frame(orig);
+                                }
+                                if let Some(ref mut wr) = vmaf_dist_writer {
+                                    wr.write_frame(dec_frame);
+                                }
+                            }
+                        }
+
+                        // Full per-GOP diagnostics (decomposition, coefficients, warnings).
+                        if gnc::encoder::diagnostics::enabled() {
+                            let q = quality.unwrap_or(75);
+                            let mul = tw_highpass_mul.unwrap_or(config_tw.temporal_highpass_qstep_mul);
+                            let per_frame_q: Vec<(f64, f64)> = gop_frames.iter()
+                                .zip(decoded_frames.iter())
                                 .map(|(orig, dec_frame)| {
                                     let psnr = quality::psnr(orig, dec_frame, 255.0);
                                     let ssim = quality::ssim_approx(orig, dec_frame, 255.0);
                                     (psnr, ssim)
                                 })
-                                .collect()
-                        } else {
-                            vec![]
-                        };
-                        for &(psnr, _) in &per_frame_q {
-                            if psnr.is_finite() { diag_psnr_vals.push(psnr); }
+                                .collect();
+                            for &(psnr, _) in &per_frame_q {
+                                if psnr.is_finite() { diag_psnr_vals.push(psnr); }
+                            }
+                            gnc::encoder::diagnostics::print_temporal_gop_diagnostics(
+                                gop_idx,
+                                gop_size,
+                                temporal_mode,
+                                q,
+                                mul,
+                                &group,
+                                &per_frame_q,
+                                None,
+                                w,
+                                h,
+                            );
                         }
-
-                        gnc::encoder::diagnostics::print_temporal_gop_diagnostics(
-                            gop_idx,
-                            gop_size,
-                            temporal_mode,
-                            q,
-                            mul,
-                            &group,
-                            &per_frame_q,
-                            None,
-                            w,
-                            h,
-                        );
                     }
 
                     groups.push(group);
@@ -1516,6 +1670,25 @@ fn main() {
                         gnv2_data.len() as f64 / (1024.0 * 1024.0),
                         output_path,
                     );
+                }
+
+                // VMAF scoring: flush Y4M streams, invoke vmaf CLI, report results.
+                if vmaf {
+                    if let Some(mut wr) = vmaf_ref_writer.take() { wr.flush(); }
+                    if let Some(mut wr) = vmaf_dist_writer.take() { wr.flush(); }
+                    print!("  VMAF: computing... ");
+                    use std::io::Write as _;
+                    std::io::stdout().flush().ok();
+                    match run_vmaf(tmp_ref.to_str().unwrap(), tmp_dist.to_str().unwrap()) {
+                        Some((mean, min, max)) => {
+                            println!("mean={:.2}  min={:.2}  max={:.2}", mean, min, max);
+                        }
+                        None => {
+                            println!("failed (is vmaf in PATH?)");
+                        }
+                    }
+                    let _ = std::fs::remove_file(&tmp_ref);
+                    let _ = std::fs::remove_file(&tmp_dist);
                 }
 
                 // Diagnostics summary block — printed after all GOPs when --diagnostics is set
@@ -1851,6 +2024,7 @@ fn main() {
                         height: h,
                         bit_depth: 8,
                         tile_size: config_tw.tile_size,
+                        chroma_format: gnc::ChromaFormat::Yuv444,
                     };
                     let mut originals: Vec<[Vec<f32>; 3]> = Vec::new();
                     for fd in &frames_data[..gop] {

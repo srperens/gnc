@@ -12,8 +12,8 @@ use super::huffman;
 use super::diagnostics;
 use super::rate_control::RateController;
 use crate::{
-    CodecConfig, CompressedFrame, EntropyCoder, EntropyData, FrameInfo, FrameType, GpuContext,
-    MotionField, TemporalEncodedSequence, TemporalGroup, TemporalTransform,
+    ChromaFormat, CodecConfig, CompressedFrame, EntropyCoder, EntropyData, FrameInfo, FrameType,
+    GpuContext, MotionField, TemporalEncodedSequence, TemporalGroup, TemporalTransform,
 };
 use crate::temporal;
 
@@ -102,6 +102,7 @@ impl EncoderPipeline {
             height,
             bit_depth: 8,
             tile_size: config.tile_size,
+            chroma_format: ChromaFormat::Yuv444,
         };
         let padded_w = info.padded_width();
         let padded_h = info.padded_height();
@@ -525,6 +526,7 @@ impl EncoderPipeline {
             height,
             bit_depth: 8,
             tile_size: cfg.tile_size,
+            chroma_format: ChromaFormat::Yuv444,
         };
         let padded_w = info.padded_width();
         let padded_h = info.padded_height();
@@ -1050,6 +1052,7 @@ impl EncoderPipeline {
             height,
             bit_depth: 8,
             tile_size: cfg.tile_size,
+            chroma_format: ChromaFormat::Yuv444,
         };
         let padded_w = info.padded_width();
         let padded_h = info.padded_height();

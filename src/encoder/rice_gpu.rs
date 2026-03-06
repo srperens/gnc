@@ -452,6 +452,158 @@ impl GpuRiceEncoder {
         all_tiles
     }
 
+    /// Encode a single plane of quantized coefficients using GPU Rice.
+    /// Returns a Vec<RiceTile> with tiles for that one plane.
+    /// Uses staging slot 0 — do not mix with encode_3planes_to_tiles calls.
+    pub fn encode_1plane_to_tiles(
+        &mut self,
+        ctx: &GpuContext,
+        quantized_buf: &wgpu::Buffer,
+        info: &FrameInfo,
+        num_levels: u32,
+    ) -> Vec<RiceTile> {
+        let num_tiles = (info.tiles_x() * info.tiles_y()) as usize;
+        let total_streams = num_tiles * RICE_STREAMS_PER_TILE;
+
+        self.ensure_buffers(ctx, num_tiles);
+        let bufs = self.cached.as_ref().unwrap();
+
+        let stream_size = (total_streams * MAX_STREAM_BYTES) as u64;
+        let lengths_size = (total_streams * 4) as u64;
+        let k_size = (num_tiles * K_STRIDE * 4) as u64;
+
+        let params = RiceParams {
+            num_tiles: num_tiles as u32,
+            coefficients_per_tile: info.tile_size * info.tile_size,
+            plane_width: info.padded_width(),
+            tile_size: info.tile_size,
+            tiles_x: info.tiles_x(),
+            num_levels,
+            _pad0: 0,
+            _pad1: 0,
+        };
+        ctx.queue
+            .write_buffer(&bufs.params_buf, 0, bytemuck::bytes_of(&params));
+
+        let mut cmd = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("rice_1plane_cmd"),
+            });
+
+        let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("rice_encode_bg"),
+            layout: &self.encode_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: bufs.params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: quantized_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: bufs.stream_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: bufs.lengths_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: bufs.k_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        {
+            let mut pass = cmd.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("rice_encode_pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.encode_pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(num_tiles as u32, 1, 1);
+        }
+
+        // Copy to staging slot 0
+        cmd.copy_buffer_to_buffer(&bufs.stream_buf, 0, &bufs.stream_staging[0], 0, stream_size);
+        cmd.copy_buffer_to_buffer(&bufs.lengths_buf, 0, &bufs.lengths_staging[0], 0, lengths_size);
+        cmd.copy_buffer_to_buffer(&bufs.k_buf, 0, &bufs.k_staging[0], 0, k_size);
+
+        ctx.queue.submit(Some(cmd.finish()));
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        for staging in [
+            &bufs.stream_staging[0],
+            &bufs.lengths_staging[0],
+            &bufs.k_staging[0],
+        ] {
+            let tx_clone = tx.clone();
+            staging
+                .slice(..)
+                .map_async(wgpu::MapMode::Read, move |result| {
+                    tx_clone.send(result).unwrap();
+                });
+        }
+        drop(tx);
+        ctx.device.poll(wgpu::Maintain::Wait);
+        for _ in 0..3 {
+            rx.recv().unwrap().unwrap();
+        }
+
+        let stream_view = bufs.stream_staging[0].slice(..).get_mapped_range();
+        let lengths_view = bufs.lengths_staging[0].slice(..).get_mapped_range();
+        let k_view = bufs.k_staging[0].slice(..).get_mapped_range();
+        let lengths_data: &[u32] = bytemuck::cast_slice(&lengths_view);
+        let k_data: &[u32] = bytemuck::cast_slice(&k_view);
+        let num_groups = (num_levels * 2).max(1) as usize;
+
+        let mut tiles = Vec::with_capacity(num_tiles);
+        for tile_idx in 0..num_tiles {
+            let k_values: Vec<u8> = (0..num_groups)
+                .map(|g| k_data[tile_idx * K_STRIDE + g] as u8)
+                .collect();
+            let k_zrl_values: Vec<u8> = (0..num_groups)
+                .map(|g| k_data[tile_idx * K_STRIDE + MAX_GROUPS + g] as u8)
+                .collect();
+            let skip_bitmap = k_data[tile_idx * K_STRIDE + K_STRIDE - 1] as u8;
+            let stream_lengths: Vec<u32> = (0..RICE_STREAMS_PER_TILE)
+                .map(|s| lengths_data[tile_idx * RICE_STREAMS_PER_TILE + s])
+                .collect();
+            let total_packed: usize = stream_lengths.iter().map(|&l| l as usize).sum();
+            let mut packed_data = Vec::with_capacity(total_packed);
+            for (s, &len) in stream_lengths.iter().enumerate() {
+                let slot_byte_offset = (tile_idx * RICE_STREAMS_PER_TILE + s) * MAX_STREAM_BYTES;
+                let len = len as usize;
+                packed_data
+                    .extend_from_slice(&stream_view[slot_byte_offset..slot_byte_offset + len]);
+            }
+            tiles.push(RiceTile {
+                num_coefficients: info.tile_size * info.tile_size,
+                tile_size: info.tile_size,
+                num_levels,
+                num_groups: num_groups as u32,
+                k_values,
+                k_zrl_values,
+                skip_bitmap,
+                stream_lengths,
+                stream_data: packed_data,
+            });
+        }
+
+        drop(stream_view);
+        drop(lengths_view);
+        drop(k_view);
+        bufs.stream_staging[0].unmap();
+        bufs.lengths_staging[0].unmap();
+        bufs.k_staging[0].unmap();
+
+        tiles
+    }
+
     /// Dispatch Rice encode for 3 planes into an external command encoder.
     /// Call `finish_3planes_readback` after submit to read back the results.
     /// This is the split-phase API for batched P/B frame pipeline.
@@ -1144,6 +1296,7 @@ mod tests {
             height: tile_size,
             bit_depth: 8,
             tile_size,
+            chroma_format: crate::ChromaFormat::Yuv444,
         };
         let packed = GpuRiceDecoder::pack_decode_data(&[tile], &info);
 
@@ -1575,6 +1728,7 @@ mod tests {
             height: padded_h,
             bit_depth: 8,
             tile_size,
+            chroma_format: crate::ChromaFormat::Yuv444,
         };
         let packed = GpuRiceDecoder::pack_decode_data(&all_tiles, &info);
 

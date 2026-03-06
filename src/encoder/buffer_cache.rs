@@ -27,6 +27,10 @@ pub(super) struct CachedEncodeBuffers {
     pub(super) plane_c: wgpu::Buffer,
     pub(super) co_plane: wgpu::Buffer,
     pub(super) cg_plane: wgpu::Buffer,
+    /// Downsampled Co plane for 4:2:2 / 4:2:0 encode path (sized at worst-case 4:2:0).
+    pub(super) co_plane_ds: wgpu::Buffer,
+    /// Downsampled Cg plane for 4:2:2 / 4:2:0 encode path (sized at worst-case 4:2:0).
+    pub(super) cg_plane_ds: wgpu::Buffer,
     pub(super) recon_y: wgpu::Buffer,
 
     // Adaptive quantization (size = wm_buf_size, fixed for given resolution)
@@ -388,6 +392,22 @@ impl CachedEncodeBuffers {
             }),
             cg_plane: ctx.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("enc_cg_plane"),
+                size: plane_size,
+                usage: plane_usage,
+                mapped_at_creation: false,
+            }),
+            // Downsampled chroma buffers: sized at plane_size (padded_w * padded_h) to
+            // handle worst-case padded layout. For 4:2:2 with small images, chroma_padded_w
+            // can equal padded_w (e.g. 128×256 chroma padded to 256×256 for tile_size=256),
+            // so the padded downsampled buffer can require up to plane_size bytes.
+            co_plane_ds: ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("enc_co_plane_ds"),
+                size: plane_size,
+                usage: plane_usage,
+                mapped_at_creation: false,
+            }),
+            cg_plane_ds: ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("enc_cg_plane_ds"),
                 size: plane_size,
                 usage: plane_usage,
                 mapped_at_creation: false,

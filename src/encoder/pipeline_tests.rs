@@ -2797,7 +2797,7 @@ fn test_temporal_wavelet_planes_are_distinct() {
     config.temporal_transform = TemporalTransform::None;
     config.cfl_enabled = false;
 
-    let info = FrameInfo { width: w, height: h, bit_depth: 8, tile_size: config.tile_size };
+    let info = FrameInfo { width: w, height: h, bit_depth: 8, tile_size: config.tile_size, chroma_format: crate::ChromaFormat::Yuv444 };
     let prequant = enc.debug_wavelet_prequant(&ctx, &frame, &info, &config);
 
     // Y and Co should differ for a gradient frame.
@@ -2833,4 +2833,88 @@ fn test_temporal_wavelet_planes_are_distinct() {
         "Y and Co quantized planes should differ but mean_abs_diff={q_y_co_diff:.6} — \
          likely all planes see only the last write_buffer"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Chroma subsampling roundtrip tests (4:4:4, 4:2:2, 4:2:0)
+// ---------------------------------------------------------------------------
+
+fn chroma_roundtrip(chroma_fmt: crate::ChromaFormat) -> f64 {
+    let ctx = crate::GpuContext::new();
+    let mut encoder = EncoderPipeline::new(&ctx);
+    let decoder = DecoderPipeline::new(&ctx);
+
+    let w = 256u32;
+    let h = 256u32;
+    let rgb = make_gradient_frame(w, h, 0.0);
+
+    let mut config = crate::CodecConfig::default();
+    config.chroma_format = chroma_fmt;
+    config.quantization_step = 4.0;
+    config.cfl_enabled = false; // CfL requires 444
+
+    let compressed = encoder.encode(&ctx, &rgb, w, h, &config);
+    let decoded = decoder.decode(&ctx, &compressed);
+
+    assert_eq!(
+        decoded.len(),
+        (w * h * 3) as usize,
+        "decoded output size wrong for {:?}",
+        chroma_fmt
+    );
+    compute_psnr(&rgb, &decoded)
+}
+
+#[test]
+fn test_yuv444_encode_decode_roundtrip() {
+    let psnr = chroma_roundtrip(crate::ChromaFormat::Yuv444);
+    eprintln!("YUV 4:4:4 PSNR = {psnr:.2} dB");
+    assert!(psnr > 30.0, "4:4:4 PSNR too low: {psnr:.2} dB");
+}
+
+#[test]
+fn test_yuv422_encode_decode_roundtrip() {
+    let psnr = chroma_roundtrip(crate::ChromaFormat::Yuv422);
+    eprintln!("YUV 4:2:2 PSNR = {psnr:.2} dB");
+    // 4:2:2 halves horizontal chroma resolution; expect some quality loss but still reasonable
+    assert!(psnr > 25.0, "4:2:2 PSNR too low: {psnr:.2} dB");
+}
+
+#[test]
+fn test_yuv420_encode_decode_roundtrip() {
+    let psnr = chroma_roundtrip(crate::ChromaFormat::Yuv420);
+    eprintln!("YUV 4:2:0 PSNR = {psnr:.2} dB");
+    // 4:2:0 quarters chroma resolution; expect further quality loss
+    assert!(psnr > 22.0, "4:2:0 PSNR too low: {psnr:.2} dB");
+}
+
+#[test]
+fn test_chroma_format_bitstream_roundtrip() {
+    // Verify that the chroma format survives serialize → deserialize.
+    let ctx = crate::GpuContext::new();
+    let mut encoder = EncoderPipeline::new(&ctx);
+
+    let w = 256u32;
+    let h = 256u32;
+    let rgb = make_gradient_frame(w, h, 0.0);
+
+    for fmt in [
+        crate::ChromaFormat::Yuv444,
+        crate::ChromaFormat::Yuv422,
+        crate::ChromaFormat::Yuv420,
+    ] {
+        let mut config = crate::CodecConfig::default();
+        config.chroma_format = fmt;
+        config.cfl_enabled = false;
+
+        let compressed = encoder.encode(&ctx, &rgb, w, h, &config);
+        let serialized = crate::format::serialize_compressed(&compressed);
+        let deserialized = crate::format::deserialize_compressed(&serialized);
+
+        assert_eq!(
+            deserialized.info.chroma_format, fmt,
+            "chroma_format not preserved in bitstream for {:?}",
+            fmt
+        );
+    }
 }

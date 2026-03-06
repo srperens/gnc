@@ -4,6 +4,7 @@ use super::adaptive::{self, VarianceAnalyzer, WeightMapNormalizer, AQ_LL_BLOCK_S
 use super::bitplane;
 use super::buffer_cache::{CachedEncodeBuffers, CachedTemporalWaveletBuffers};
 use super::cfl::{self, CflAlphaComputer, CflForwardPredictor, CflPredictor};
+use super::chroma_resample::ChromaResampler;
 use super::color::ColorConverter;
 use super::entropy_helpers;
 use super::entropy_helpers::{encode_entropy, EntropyMode};
@@ -23,8 +24,8 @@ use super::rice_gpu::GpuRiceEncoder;
 use super::transform::WaveletTransform;
 use crate::gpu_util::ensure_var_buf;
 use crate::{
-    CflAlphas, CodecConfig, CompressedFrame, EntropyCoder, EntropyData, FrameInfo, FrameType,
-    GpuContext, TransformType,
+    CflAlphas, ChromaFormat, CodecConfig, CompressedFrame, EntropyCoder, EntropyData, FrameInfo,
+    FrameType, GpuContext, TransformType,
 };
 
 // Temporal coding (encode_sequence, encode_pframe, local_decode_iframe)
@@ -50,6 +51,7 @@ pub struct EncoderPipeline {
     pub(super) intra: IntraPredictor,
     pub(super) temporal_haar: TemporalHaarGpu,
     pub(super) temporal_53: Temporal53Gpu,
+    pub(super) chroma_down: ChromaResampler,
     pad_pipeline: wgpu::ComputePipeline,
     pad_bgl: wgpu::BindGroupLayout,
     tile_energy_reduce_pipeline: wgpu::ComputePipeline,
@@ -237,6 +239,7 @@ impl EncoderPipeline {
             intra: IntraPredictor::new(ctx),
             temporal_haar: TemporalHaarGpu::new(ctx),
             temporal_53: Temporal53Gpu::new(ctx),
+            chroma_down: ChromaResampler::new_downsample(ctx),
             pad_pipeline,
             pad_bgl,
             tile_energy_reduce_pipeline,
@@ -499,17 +502,31 @@ impl EncoderPipeline {
         let profile = std::env::var("GNC_PROFILE").is_ok();
         let t_start = std::time::Instant::now();
 
+        let chroma_format = config.chroma_format;
         let info = FrameInfo {
             width,
             height,
             bit_depth: 8,
             tile_size: config.tile_size,
+            chroma_format,
         };
 
         let padded_w = info.padded_width();
         let padded_h = info.padded_height();
         let padded_pixels = (padded_w * padded_h) as usize;
         let plane_size = (padded_pixels * std::mem::size_of::<f32>()) as u64;
+
+        // Chroma plane info (may have smaller dims for 4:2:2 / 4:2:0)
+        let chroma_padded_w = info.chroma_padded_width();
+        let chroma_padded_h = info.chroma_padded_height();
+        let chroma_pixels = (chroma_padded_w * chroma_padded_h) as usize;
+        let chroma_info = FrameInfo {
+            width: info.chroma_width(),
+            height: info.chroma_height(),
+            bit_depth: 8,
+            tile_size: config.tile_size,
+            chroma_format: ChromaFormat::Yuv444, // wavelet sees it as full-res within chroma dims
+        };
 
         // Ensure cached buffers exist for this resolution
         self.ensure_cached(ctx, padded_w, padded_h, width, height);
@@ -584,6 +601,30 @@ impl EncoderPipeline {
             padded_pixels as u32,
         );
 
+        // Chroma downsampling for 4:2:2 / 4:2:0
+        if chroma_format != ChromaFormat::Yuv444 {
+            let shift_x = chroma_format.horiz_shift();
+            let shift_y = chroma_format.vert_shift();
+            // dst_stride = chroma_padded_w so the downsampled data is written in padded
+            // row layout (row y starts at y * chroma_padded_w), matching what the wavelet
+            // shaders expect when they read the buffer using active_chroma_info.padded_width().
+            self.chroma_down.dispatch(
+                ctx, &mut cmd,
+                &bufs.co_plane, &bufs.co_plane_ds,
+                padded_w, padded_h, shift_x, shift_y, chroma_padded_w,
+            );
+            self.chroma_down.dispatch(
+                ctx, &mut cmd,
+                &bufs.cg_plane, &bufs.cg_plane_ds,
+                padded_w, padded_h, shift_x, shift_y, chroma_padded_w,
+            );
+            log::debug!(
+                "chroma_downsample: {:?} {}x{} -> {}x{} shift=({},{})",
+                chroma_format, padded_w, padded_h,
+                chroma_padded_w, chroma_padded_h, shift_x, shift_y
+            );
+        }
+
         ctx.queue.submit(Some(cmd.finish()));
 
         let t_preprocess = t_start.elapsed();
@@ -604,11 +645,15 @@ impl EncoderPipeline {
         let use_gpu_rice = use_gpu_encode && config.entropy_coder == EntropyCoder::Rice;
         let use_gpu_huffman = use_gpu_encode && config.entropy_coder == EntropyCoder::Huffman;
 
+        // CfL requires 4:4:4 — spatial luma-chroma prediction is unreliable on
+        // subsampled chroma coefficients.
+        let use_cfl = config.cfl_enabled && chroma_format == ChromaFormat::Yuv444;
+
         // Fused quantize+histogram: saves one full buffer read+write per plane.
         // Only applicable when GPU entropy encoding is active and CfL is off
         // (CfL needs separate quantize+dequantize for Y reconstruction).
         let use_fused_qh =
-            config.use_fused_quantize_histogram && use_gpu_encode && !config.cfl_enabled;
+            config.use_fused_quantize_histogram && use_gpu_encode && !use_cfl;
 
         let weights_luma = config.subband_weights.pack_weights();
         let weights_chroma = config.subband_weights.pack_weights_chroma();
@@ -617,7 +662,7 @@ impl EncoderPipeline {
         let mut cfl_alphas_all: Vec<i16> = Vec::new();
 
         // Ensure CfL alpha buffers are large enough
-        if config.cfl_enabled {
+        if use_cfl {
             let total_tiles = (tiles_x * tiles_y) as u32;
             let alpha_buf_size = (total_tiles * nsb) as u64 * std::mem::size_of::<f32>() as u64;
             let bufs = self.cached.as_mut().unwrap();
@@ -669,14 +714,14 @@ impl EncoderPipeline {
 
         // CfL alpha staging buffers (created on demand, tiny ~2KB each)
         let total_tiles_u32 = (tiles_x * tiles_y) as u32;
-        let alpha_count = if config.cfl_enabled {
+        let alpha_count = if use_cfl {
             (total_tiles_u32 * nsb) as usize
         } else {
             0
         };
         let alpha_bytes = (alpha_count * std::mem::size_of::<f32>()) as u64;
         let mr = wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST;
-        let alpha_staging: [wgpu::Buffer; 2] = if config.cfl_enabled {
+        let alpha_staging: [wgpu::Buffer; 2] = if use_cfl {
             std::array::from_fn(|i| {
                 ctx.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some(["alpha_stg_co", "alpha_stg_cg"][i]),
@@ -701,6 +746,17 @@ impl EncoderPipeline {
         let aq_active = config.adaptive_quantization
             && config.aq_strength > 0.0
             && config.transform_type == TransformType::Wavelet;
+
+        // Chroma plane active dimensions: 444 uses luma dims; non-444 uses subsampled dims.
+        // These are needed in both the wavelet block and the entropy section below.
+        // active_chroma_info_storage holds the non-444 FrameInfo so the reference lives long enough.
+        let active_chroma_info_storage = chroma_info;
+        let (active_chroma_info, active_chroma_w, active_chroma_h, active_chroma_px): (&FrameInfo, u32, u32, usize) =
+            if chroma_format == ChromaFormat::Yuv444 {
+                (&info, padded_w, padded_h, padded_pixels)
+            } else {
+                (&active_chroma_info_storage, chroma_padded_w, chroma_padded_h, chroma_pixels)
+            };
 
         let wm_total_blocks;
 
@@ -845,7 +901,7 @@ impl EncoderPipeline {
                 .as_ref()
                 .map(|&(ll_bs, ll_bx, tx)| (&bufs.weight_map_buf, ll_bs, ll_bx, tx));
 
-            if config.cfl_enabled {
+            if use_cfl {
                 self.quantize.dispatch_adaptive(
                     ctx,
                     &mut cmd,
@@ -922,18 +978,27 @@ impl EncoderPipeline {
             cmd.copy_buffer_to_buffer(&bufs.plane_b, 0, &bufs.mc_out, 0, plane_size);
 
             // --- Co plane: wavelet + (CfL) + quantize ---
+            // For non-444: use co_plane_ds (downsampled) and chroma_info dimensions.
+            let co_input = if chroma_format == ChromaFormat::Yuv444 {
+                &bufs.co_plane
+            } else {
+                &bufs.co_plane_ds
+            };
+            // active_chroma_info / active_chroma_w/h/px are defined at outer scope (hoisted above)
+            let chroma_plane_bytes = (active_chroma_px * std::mem::size_of::<f32>()) as u64;
+
             self.transform.forward(
                 ctx,
                 &mut cmd,
-                &bufs.co_plane,
+                co_input,
                 &bufs.plane_b,
                 &bufs.plane_c,
-                &info,
+                active_chroma_info,
                 config.wavelet_levels,
                 config.wavelet_type,
             );
 
-            if config.cfl_enabled {
+            if use_cfl {
                 self.cfl_alpha.dispatch(
                     ctx,
                     &mut cmd,
@@ -985,8 +1050,8 @@ impl EncoderPipeline {
                     &bufs.plane_c,
                     &bufs.plane_b,
                     &hist_bufs[1],
-                    padded_w,
-                    padded_h,
+                    active_chroma_w,
+                    active_chroma_h,
                     config.tile_size,
                     config.wavelet_levels,
                     config.quantization_step,
@@ -1002,12 +1067,12 @@ impl EncoderPipeline {
                     &mut cmd,
                     &bufs.plane_c,
                     &bufs.plane_b,
-                    padded_pixels as u32,
+                    active_chroma_px as u32,
                     config.quantization_step,
                     config.dead_zone,
                     true,
-                    padded_w,
-                    padded_h,
+                    active_chroma_w,
+                    active_chroma_h,
                     config.tile_size,
                     config.wavelet_levels,
                     &weights_chroma,
@@ -1015,21 +1080,26 @@ impl EncoderPipeline {
                     0.0,
                 );
             }
-            cmd.copy_buffer_to_buffer(&bufs.plane_b, 0, &bufs.ref_upload, 0, plane_size);
+            cmd.copy_buffer_to_buffer(&bufs.plane_b, 0, &bufs.ref_upload, 0, chroma_plane_bytes);
 
             // --- Cg plane: wavelet + (CfL) + quantize ---
+            let cg_input = if chroma_format == ChromaFormat::Yuv444 {
+                &bufs.cg_plane
+            } else {
+                &bufs.cg_plane_ds
+            };
             self.transform.forward(
                 ctx,
                 &mut cmd,
-                &bufs.cg_plane,
+                cg_input,
                 &bufs.plane_b,
                 &bufs.plane_c,
-                &info,
+                active_chroma_info,
                 config.wavelet_levels,
                 config.wavelet_type,
             );
 
-            if config.cfl_enabled {
+            if use_cfl {
                 self.cfl_alpha.dispatch(
                     ctx,
                     &mut cmd,
@@ -1081,8 +1151,8 @@ impl EncoderPipeline {
                     &bufs.plane_c,
                     &bufs.plane_b,
                     &hist_bufs[2],
-                    padded_w,
-                    padded_h,
+                    active_chroma_w,
+                    active_chroma_h,
                     config.tile_size,
                     config.wavelet_levels,
                     config.quantization_step,
@@ -1098,12 +1168,12 @@ impl EncoderPipeline {
                     &mut cmd,
                     &bufs.plane_c,
                     &bufs.plane_b,
-                    padded_pixels as u32,
+                    active_chroma_px as u32,
                     config.quantization_step,
                     config.dead_zone,
                     true,
-                    padded_w,
-                    padded_h,
+                    active_chroma_w,
+                    active_chroma_h,
                     config.tile_size,
                     config.wavelet_levels,
                     &weights_chroma,
@@ -1151,9 +1221,18 @@ impl EncoderPipeline {
             TransformType::Wavelet => config.wavelet_levels,
         };
 
+        // For non-444: GPU batch entropy encoding uses per-plane infos.
+        // For 444 (default): batch GPU Rice dispatch for efficiency.
+        // For non-444 with GPU Rice: encode Y and Co/Cg separately using
+        // per-plane FrameInfo so tile counts are correct.
+        let use_gpu_rice_batch = use_gpu_rice && chroma_format == ChromaFormat::Yuv444;
+        let use_gpu_huffman_batch = use_gpu_huffman && chroma_format == ChromaFormat::Yuv444;
+        let use_gpu_encode_batch = use_gpu_encode && chroma_format == ChromaFormat::Yuv444;
+        let use_fused_qh_batch = use_fused_qh && chroma_format == ChromaFormat::Yuv444;
+
         // For GPU Rice: batch entropy encode + staging copies into the same command
         // encoder as wavelet+quantize — saves one submit overhead
-        if use_gpu_rice {
+        if use_gpu_rice_batch {
             self.gpu_rice_encoder.dispatch_3planes_to_cmd(
                 ctx,
                 &mut cmd,
@@ -1168,27 +1247,35 @@ impl EncoderPipeline {
 
         let t_submit_wq = t_start.elapsed();
 
+        // Per-plane infos for entropy encoding — chroma planes differ when non-444
+        let plane_infos: [&FrameInfo; 3] = [
+            &info,
+            active_chroma_info,
+            active_chroma_info,
+        ];
+        let plane_pixels = [padded_pixels, active_chroma_px, active_chroma_px];
+        let plane_w = [padded_w as usize, active_chroma_w as usize, active_chroma_w as usize];
+        let plane_tiles_x = [tiles_x, info.chroma_tiles_x() as usize, info.chroma_tiles_x() as usize];
+        let plane_tiles_y = [tiles_y, info.chroma_tiles_y() as usize, info.chroma_tiles_y() as usize];
+
         // CPU entropy encode path: each plane reads from its persisted buffer
-        if !use_gpu_encode {
+        if !use_gpu_encode_batch {
             // Y from mc_out, Co from ref_upload, Cg from plane_b
-            for (p, qbuf) in [&bufs.mc_out, &bufs.ref_upload, &bufs.plane_b]
-                .iter()
-                .enumerate()
-            {
-                let _ = p;
+            let qbufs = [&bufs.mc_out, &bufs.ref_upload, &bufs.plane_b];
+            for p in 0..3 {
                 encode_entropy(
                     &mut self.gpu_encoder,
                     ctx,
-                    qbuf,
-                    padded_pixels,
-                    padded_w as usize,
-                    tiles_x,
-                    tiles_y,
+                    qbufs[p],
+                    plane_pixels[p],
+                    plane_w[p],
+                    plane_tiles_x[p],
+                    plane_tiles_y[p],
                     tile_size,
                     &entropy_mode,
                     config,
                     use_gpu_encode,
-                    &info,
+                    plane_infos[p],
                     entropy_levels,
                     &mut rans_tiles,
                     &mut subband_tiles,
@@ -1200,13 +1287,26 @@ impl EncoderPipeline {
         }
 
         // GPU entropy: Rice already dispatched above, others create their own cmds
-        if use_gpu_rice {
+        if use_gpu_rice_batch {
             // Readback from staging (GPU work already submitted above)
             let mut rt = self
                 .gpu_rice_encoder
                 .finish_3planes_readback(ctx, &info, entropy_levels);
             rice_tiles.append(&mut rt);
-        } else if use_gpu_huffman {
+        } else if use_gpu_rice && !use_gpu_rice_batch {
+            // Non-444: each plane may have different tile counts — encode one at a time.
+            // Y is in mc_out (luma info), Co in ref_upload, Cg in plane_b (chroma info).
+            let qbufs: [&wgpu::Buffer; 3] = [&bufs.mc_out, &bufs.ref_upload, &bufs.plane_b];
+            for p in 0..3 {
+                let mut rt = self.gpu_rice_encoder.encode_1plane_to_tiles(
+                    ctx,
+                    qbufs[p],
+                    plane_infos[p],
+                    entropy_levels,
+                );
+                rice_tiles.append(&mut rt);
+            }
+        } else if use_gpu_huffman_batch {
             // GPU Huffman encode: 2-pass (histogram → codebook → encode)
             let mut ht = self.gpu_huffman_encoder.encode_3planes_to_tiles(
                 ctx,
@@ -1215,7 +1315,7 @@ impl EncoderPipeline {
                 entropy_levels,
             );
             huffman_tiles.append(&mut ht);
-        } else if use_gpu_encode && use_fused_qh {
+        } else if use_gpu_encode_batch && use_fused_qh_batch {
             // Fused path: histograms already computed by fused quantize+histogram shader.
             let hist_bufs = bufs.fused_hist_bufs.as_ref().unwrap();
             let (mut rt, mut st) = self.gpu_encoder.encode_3planes_skip_histogram(
@@ -1228,7 +1328,7 @@ impl EncoderPipeline {
             );
             rans_tiles.append(&mut rt);
             subband_tiles.append(&mut st);
-        } else if use_gpu_encode {
+        } else if use_gpu_encode_batch {
             let (mut rt, mut st) = self.gpu_encoder.encode_3planes_to_tiles(
                 ctx,
                 [&bufs.mc_out, &bufs.ref_upload, &bufs.plane_b],
@@ -1410,7 +1510,7 @@ impl EncoderPipeline {
         tile_size: usize,
         padded_w: usize,
     ) -> Vec<f32> {
-        entropy_helpers::entropy_decode_plane(entropy, plane_idx, tiles_per_plane, tile_size, padded_w)
+        entropy_helpers::entropy_decode_plane(entropy, plane_idx * tiles_per_plane, tiles_per_plane, tile_size, padded_w)
     }
 
     /// Read back the raw i32 motion vectors from the encoder's split MV staging buffer.

@@ -2,6 +2,7 @@ pub mod adaptive;
 pub mod bitplane;
 pub mod block_transform;
 mod buffer_cache;
+pub mod chroma_resample;
 pub mod fused_block;
 pub mod cfl;
 pub mod diagnostics;

@@ -88,14 +88,17 @@ pub(super) fn encode_entropy(
 }
 
 /// CPU entropy decode for a single plane: reconstruct quantized f32 coefficients from tiles.
+///
+/// `tile_offset` is the index of the first tile for this plane in the flat tile vector.
+/// For 4:4:4 this equals `plane_idx * tiles_per_plane`; for non-444 use the explicit offset.
 pub(crate) fn entropy_decode_plane(
     entropy: &EntropyData,
-    plane_idx: usize,
+    tile_offset: usize,
     tiles_per_plane: usize,
     tile_size: usize,
     padded_w: usize,
 ) -> Vec<f32> {
-    let tile_start = plane_idx * tiles_per_plane;
+    let tile_start = tile_offset;
     let tiles_x = padded_w / tile_size;
     let padded_h_tiles = tiles_per_plane / tiles_x;
     let padded_h = padded_h_tiles * tile_size;

@@ -4,7 +4,7 @@ use super::buffer_cache::CachedBuffers;
 use super::pipeline::DecoderPipeline;
 use crate::encoder::adaptive::{self, AQ_LL_BLOCK_SIZE};
 use crate::encoder::block_transform::BlockTransformType;
-use crate::{CompressedFrame, EntropyData, FrameType, GpuContext, TransformType};
+use crate::{ChromaFormat, CompressedFrame, EntropyData, FrameInfo, FrameType, GpuContext, TransformType};
 
 impl DecoderPipeline {
     /// Encode GPU commands for the full decode pipeline up to and including crop.
@@ -21,9 +21,31 @@ impl DecoderPipeline {
         let padded_h = info.padded_height();
         let padded_pixels = (padded_w * padded_h) as usize;
         let is_pframe = frame.frame_type == FrameType::Predicted;
-        let tiles_per_plane = info.tiles_x() as usize * info.tiles_y() as usize;
+        let luma_tiles_per_plane = info.luma_tiles_per_plane();
         let blocks_per_tile_side = info.tile_size as usize / 32;
         let blocks_per_tile = blocks_per_tile_side * blocks_per_tile_side;
+
+        // Per-plane info for non-444 chroma decode. chroma_info uses Yuv444 so the
+        // wavelet sees it as full-resolution within the subsampled dimensions.
+        let chroma_info_storage;
+        let (chroma_tiles_per_plane, plane_info_arr): (usize, [&FrameInfo; 3]) =
+            if info.chroma_format == ChromaFormat::Yuv444 {
+                (luma_tiles_per_plane, [info, info, info])
+            } else {
+                chroma_info_storage = FrameInfo {
+                    width: info.chroma_width(),
+                    height: info.chroma_height(),
+                    bit_depth: info.bit_depth,
+                    tile_size: info.tile_size,
+                    chroma_format: ChromaFormat::Yuv444,
+                };
+                (
+                    info.chroma_tiles_per_plane(),
+                    [info, &chroma_info_storage, &chroma_info_storage],
+                )
+            };
+        // tiles_per_plane used for luma (p==0) and in the for loop via plane_tiles_per_plane(p)
+        let tiles_per_plane = luma_tiles_per_plane;
 
         let weights_luma = config.subband_weights.pack_weights();
         let weights_chroma = config.subband_weights.pack_weights_chroma();
@@ -48,7 +70,17 @@ impl DecoderPipeline {
         };
 
         // Per-plane: entropy decode → dequantize → (CfL inverse predict) → inverse wavelet → copy to result buffer
+        // p is used for many array accesses beyond plane_info_arr — keep the index loop.
+        #[allow(clippy::needless_range_loop)]
         for p in 0..3 {
+            // Per-plane dimensions: chroma planes are smaller for non-444 formats.
+            let p_info = plane_info_arr[p];
+            let p_tiles = if p == 0 { luma_tiles_per_plane } else { chroma_tiles_per_plane };
+            let p_padded_w = p_info.padded_width();
+            let p_padded_h = p_info.padded_height();
+            let p_padded_pixels = (p_padded_w * p_padded_h) as usize;
+            let p_plane_size = (p_padded_pixels * std::mem::size_of::<f32>()) as u64;
+
             if bufs.ctx_adaptive_decode {
                 // Context-adaptive tiles were CPU-decoded in prepare_frame_data;
                 // copy the already-decoded coefficients into scratch_a.
@@ -57,7 +89,7 @@ impl DecoderPipeline {
                     0,
                     &bufs.scratch_a,
                     0,
-                    plane_size,
+                    p_plane_size,
                 );
             } else {
                 match &frame.entropy {
@@ -71,7 +103,7 @@ impl DecoderPipeline {
                             &bufs.entropy_var_a[p],
                             &bufs.entropy_var_b[p],
                             &bufs.scratch_a,
-                            tiles_per_plane as u32,
+                            p_tiles as u32,
                         );
                     }
                     EntropyData::Rans(_) | EntropyData::SubbandRans(_) => {
@@ -83,11 +115,11 @@ impl DecoderPipeline {
                             &bufs.entropy_var_a[p],
                             &bufs.entropy_var_b[p],
                             &bufs.scratch_a,
-                            tiles_per_plane as u32,
+                            p_tiles as u32,
                         );
                     }
                     EntropyData::Bitplane(_) => {
-                        let total_blocks = (tiles_per_plane * blocks_per_tile) as u32;
+                        let total_blocks = (p_tiles * blocks_per_tile) as u32;
                         self.bitplane_decoder.dispatch_decode(
                             ctx,
                             &mut cmd,
@@ -112,7 +144,7 @@ impl DecoderPipeline {
                             &bufs.entropy_var_a[p],       // stream_data
                             &bufs.entropy_var_b[p],       // stream_offsets
                             &bufs.scratch_a,
-                            tiles_per_plane as u32,
+                            p_tiles as u32,
                         );
                     }
                 }
@@ -153,104 +185,106 @@ impl DecoderPipeline {
                     BlockTransformType::DCT8,
                 );
             } else {
-                // ---- Wavelet decode path (existing) ----
-            let weights = if p == 0 {
-                &weights_luma
-            } else {
-                &weights_chroma
-            };
-            let wm_param = if frame.weight_map.is_some() {
-                let (_, ll_bx, _, tx) = adaptive::weight_map_dims(
-                    padded_w,
-                    padded_h,
+                // ---- Wavelet decode path ----
+                let weights = if p == 0 {
+                    &weights_luma
+                } else {
+                    &weights_chroma
+                };
+                // AQ weight map: only applies to luma (chroma uses no AQ weight map)
+                let wm_param = if frame.weight_map.is_some() && p == 0 {
+                    let (_, ll_bx, _, tx) = adaptive::weight_map_dims(
+                        padded_w,
+                        padded_h,
+                        config.tile_size,
+                        config.wavelet_levels,
+                    );
+                    let ll_size = config.tile_size >> config.wavelet_levels;
+                    let ll_block_size = AQ_LL_BLOCK_SIZE.min(ll_size);
+                    Some((&bufs.weight_map_buf, ll_block_size, ll_bx, tx))
+                } else {
+                    None
+                };
+                self.quantize.dispatch_adaptive(
+                    ctx,
+                    &mut cmd,
+                    &bufs.scratch_a,
+                    &bufs.scratch_b,
+                    p_padded_pixels as u32,
+                    config.quantization_step,
+                    config.dead_zone,
+                    false,
+                    p_padded_w,
+                    p_padded_h,
                     config.tile_size,
                     config.wavelet_levels,
-                );
-                let ll_size = config.tile_size >> config.wavelet_levels;
-                let ll_block_size = AQ_LL_BLOCK_SIZE.min(ll_size);
-                Some((&bufs.weight_map_buf, ll_block_size, ll_bx, tx))
-            } else {
-                None
-            };
-            self.quantize.dispatch_adaptive(
-                ctx,
-                &mut cmd,
-                &bufs.scratch_a,
-                &bufs.scratch_b,
-                padded_pixels as u32,
-                config.quantization_step,
-                config.dead_zone,
-                false,
-                padded_w,
-                padded_h,
-                config.tile_size,
-                config.wavelet_levels,
-                weights,
-                wm_param,
-                0.0, // no DCT freq weighting for wavelet path
-            );
-
-            if p == 0 && has_cfl {
-                cmd.copy_buffer_to_buffer(
-                    &bufs.scratch_b,
-                    0,
-                    &bufs.y_ref_wavelet_buf,
-                    0,
-                    plane_size,
-                );
-            }
-
-            if p > 0 && has_cfl {
-                let plane_alpha_offset = (p - 1) * cfl_alphas_per_plane;
-                let plane_alpha_byte_offset =
-                    (plane_alpha_offset * std::mem::size_of::<f32>()) as u64;
-                let plane_alpha_byte_size =
-                    (cfl_alphas_per_plane * std::mem::size_of::<f32>()) as u64;
-
-                cmd.copy_buffer_to_buffer(
-                    &bufs.cfl_alpha_buf,
-                    plane_alpha_byte_offset,
-                    &bufs.plane_alpha_bufs[p - 1],
-                    0,
-                    plane_alpha_byte_size,
+                    weights,
+                    wm_param,
+                    0.0, // no DCT freq weighting for wavelet path
                 );
 
-                self.cfl_predictor.dispatch_inverse(
-                    ctx,
-                    &mut cmd,
-                    &bufs.scratch_b,
-                    &bufs.y_ref_wavelet_buf,
-                    &bufs.plane_alpha_bufs[p - 1],
-                    &bufs.scratch_c,
-                    padded_pixels as u32,
-                    padded_w,
-                    padded_h,
-                    config.tile_size,
-                    config.wavelet_levels,
-                );
+                if p == 0 && has_cfl {
+                    cmd.copy_buffer_to_buffer(
+                        &bufs.scratch_b,
+                        0,
+                        &bufs.y_ref_wavelet_buf,
+                        0,
+                        plane_size, // CfL always 444 — luma plane size
+                    );
+                }
 
-                self.transform.inverse(
-                    ctx,
-                    &mut cmd,
-                    &bufs.scratch_c,
-                    &bufs.scratch_b,
-                    &bufs.scratch_a,
-                    info,
-                    config.wavelet_levels,
-                    config.wavelet_type,
-                );
-            } else {
-                self.transform.inverse(
-                    ctx,
-                    &mut cmd,
-                    &bufs.scratch_b,
-                    &bufs.scratch_c,
-                    &bufs.scratch_a,
-                    info,
-                    config.wavelet_levels,
-                    config.wavelet_type,
-                );
-            }
+                if p > 0 && has_cfl {
+                    // CfL only runs in 444 mode, so padded_w/h == p_padded_w/h here.
+                    let plane_alpha_offset = (p - 1) * cfl_alphas_per_plane;
+                    let plane_alpha_byte_offset =
+                        (plane_alpha_offset * std::mem::size_of::<f32>()) as u64;
+                    let plane_alpha_byte_size =
+                        (cfl_alphas_per_plane * std::mem::size_of::<f32>()) as u64;
+
+                    cmd.copy_buffer_to_buffer(
+                        &bufs.cfl_alpha_buf,
+                        plane_alpha_byte_offset,
+                        &bufs.plane_alpha_bufs[p - 1],
+                        0,
+                        plane_alpha_byte_size,
+                    );
+
+                    self.cfl_predictor.dispatch_inverse(
+                        ctx,
+                        &mut cmd,
+                        &bufs.scratch_b,
+                        &bufs.y_ref_wavelet_buf,
+                        &bufs.plane_alpha_bufs[p - 1],
+                        &bufs.scratch_c,
+                        padded_pixels as u32,
+                        padded_w,
+                        padded_h,
+                        config.tile_size,
+                        config.wavelet_levels,
+                    );
+
+                    self.transform.inverse(
+                        ctx,
+                        &mut cmd,
+                        &bufs.scratch_c,
+                        &bufs.scratch_b,
+                        &bufs.scratch_a,
+                        p_info,
+                        config.wavelet_levels,
+                        config.wavelet_type,
+                    );
+                } else {
+                    self.transform.inverse(
+                        ctx,
+                        &mut cmd,
+                        &bufs.scratch_b,
+                        &bufs.scratch_c,
+                        &bufs.scratch_a,
+                        p_info,
+                        config.wavelet_levels,
+                        config.wavelet_type,
+                    );
+                }
             } // end wavelet decode path
 
             // Intra reconstruction: Y plane only (p==0), after inverse wavelet
@@ -266,6 +300,29 @@ impl DecoderPipeline {
                 );
                 // Copy reconstructed back to scratch_a for I/P/B branching
                 cmd.copy_buffer_to_buffer(&bufs.scratch_b, 0, &bufs.scratch_a, 0, plane_size);
+            }
+
+            // For non-444 chroma (p>0): upsample scratch_a from chroma size to luma size.
+            // For 444: scratch_a is already at luma size.
+            let is_non444_chroma =
+                p > 0 && info.chroma_format != ChromaFormat::Yuv444;
+            if is_non444_chroma {
+                let up_buf = if p == 1 { &bufs.co_plane_up } else { &bufs.cg_plane_up };
+                self.chroma_up.dispatch_upsample(
+                    ctx,
+                    &mut cmd,
+                    &bufs.scratch_a,
+                    up_buf,
+                    p_padded_w,
+                    p_padded_h,
+                    padded_w,
+                    padded_h,
+                    info.chroma_format.horiz_shift(),
+                    info.chroma_format.vert_shift(),
+                );
+                // After upsample, up_buf has luma-sized chroma data.
+                // Copy to scratch_a so the I/P/B path below works uniformly.
+                cmd.copy_buffer_to_buffer(up_buf, 0, &bufs.scratch_a, 0, plane_size);
             }
 
             let is_bframe = frame.frame_type == FrameType::Bidirectional;
@@ -301,7 +358,7 @@ impl DecoderPipeline {
                     bufs.mc_block_size,
                 );
             } else {
-                // I-frame: scratch_a has reconstructed spatial data
+                // I-frame: scratch_a has reconstructed spatial data (luma-sized after any upsample)
                 cmd.copy_buffer_to_buffer(
                     &bufs.scratch_a,
                     0,

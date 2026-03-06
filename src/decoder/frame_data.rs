@@ -9,7 +9,7 @@ use crate::encoder::rans_gpu::GpuRansDecoder;
 use crate::encoder::rice_gpu::GpuRiceDecoder;
 use crate::encoder::huffman_gpu::GpuHuffmanDecoder;
 use crate::gpu_util::ensure_var_buf;
-use crate::{CompressedFrame, EntropyData, GpuContext};
+use crate::{ChromaFormat, CompressedFrame, EntropyData, FrameInfo, GpuContext};
 
 impl DecoderPipeline {
     /// Write per-frame data into pre-allocated cached buffers.
@@ -18,7 +18,35 @@ impl DecoderPipeline {
         let mut cached = self.cached.borrow_mut();
         let bufs = cached.as_mut().unwrap();
         let info = &frame.info;
-        let tiles_per_plane = info.tiles_x() as usize * info.tiles_y() as usize;
+        let luma_tiles = info.luma_tiles_per_plane();
+        // For non-444 chroma, the tile count differs from luma.
+        // chroma_info uses Yuv444 so that tiles_x/y reflects the subsampled dimensions.
+        let chroma_tiles = if info.chroma_format == ChromaFormat::Yuv444 {
+            luma_tiles
+        } else {
+            info.chroma_tiles_per_plane()
+        };
+        // plane_tiles[p] gives the correct tile count for each plane
+        let plane_tiles = [luma_tiles, chroma_tiles, chroma_tiles];
+        // Legacy variable name kept for code that still uses it (444 only paths)
+        let tiles_per_plane = luma_tiles;
+        // Per-plane FrameInfo for entropy decoders that need it
+        let chroma_info_storage;
+        let plane_info: [&FrameInfo; 3] = if info.chroma_format == ChromaFormat::Yuv444 {
+            [info, info, info]
+        } else {
+            chroma_info_storage = FrameInfo {
+                width: info.chroma_width(),
+                height: info.chroma_height(),
+                bit_depth: info.bit_depth,
+                tile_size: info.tile_size,
+                chroma_format: ChromaFormat::Yuv444,
+            };
+            [info, &chroma_info_storage, &chroma_info_storage]
+        };
+
+        // Cumulative tile offsets: plane_offset[p] = start index into flat tile vec for plane p
+        let plane_offset = [0, plane_tiles[0], plane_tiles[0] + plane_tiles[1]];
 
         let storage_dst = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
 
@@ -29,8 +57,9 @@ impl DecoderPipeline {
         match &frame.entropy {
             EntropyData::Rans(tiles) => {
                 for p in 0..3 {
-                    let plane_tiles = &tiles[p * tiles_per_plane..(p + 1) * tiles_per_plane];
-                    let packed = GpuRansDecoder::pack_decode_data(plane_tiles, info);
+                    let start = plane_offset[p];
+                    let plane_tiles = &tiles[start..start + plane_tiles[p]];
+                    let packed = GpuRansDecoder::pack_decode_data(plane_tiles, plane_info[p]);
                     let a_size = (packed.cumfreq.len() * 4) as u64;
                     let b_size = (packed.stream_data.len() * 4) as u64;
 
@@ -83,13 +112,13 @@ impl DecoderPipeline {
                 if is_ctx_adaptive {
                     // CPU decode for context-adaptive tiles; write decoded f32 coefficients
                     // directly into cpu_decoded_planes buffers for each plane.
-                    let padded_w = info.padded_width() as usize;
                     let tile_size = info.tile_size as usize;
                     for p in 0..3 {
+                        let padded_w = plane_info[p].padded_width() as usize;
                         let plane_data = entropy_helpers::entropy_decode_plane(
                             &frame.entropy,
-                            p,
-                            tiles_per_plane,
+                            plane_offset[p],
+                            plane_tiles[p],
                             tile_size,
                             padded_w,
                         );
@@ -101,8 +130,9 @@ impl DecoderPipeline {
                     }
                 } else {
                     for p in 0..3 {
-                        let plane_tiles = &tiles[p * tiles_per_plane..(p + 1) * tiles_per_plane];
-                        let packed = GpuRansDecoder::pack_decode_data_subband(plane_tiles, info);
+                        let start = plane_offset[p];
+                        let plane_tiles = &tiles[start..start + plane_tiles[p]];
+                        let packed = GpuRansDecoder::pack_decode_data_subband(plane_tiles, plane_info[p]);
                         let a_size = (packed.cumfreq.len() * 4) as u64;
                         let b_size = (packed.stream_data.len() * 4) as u64;
 
@@ -149,8 +179,9 @@ impl DecoderPipeline {
             EntropyData::Rice(tiles) => {
                 // Rice: GPU decode path — upload packed stream data for GPU decoder
                 for p in 0..3 {
-                    let plane_tiles = &tiles[p * tiles_per_plane..(p + 1) * tiles_per_plane];
-                    let packed = GpuRiceDecoder::pack_decode_data(plane_tiles, info);
+                    let start = plane_offset[p];
+                    let p_tiles = &tiles[start..start + plane_tiles[p]];
+                    let packed = GpuRiceDecoder::pack_decode_data(p_tiles, plane_info[p]);
 
                     // Params → entropy_params (uniform-sized buffer, write directly)
                     ctx.queue.write_buffer(
@@ -210,8 +241,9 @@ impl DecoderPipeline {
             }
             EntropyData::Bitplane(tiles) => {
                 for p in 0..3 {
-                    let plane_tiles = &tiles[p * tiles_per_plane..(p + 1) * tiles_per_plane];
-                    let packed = GpuBitplaneDecoder::pack_decode_data(plane_tiles, info);
+                    let start = plane_offset[p];
+                    let p_tiles = &tiles[start..start + plane_tiles[p]];
+                    let packed = GpuBitplaneDecoder::pack_decode_data(p_tiles, plane_info[p]);
                     let a_size = (packed.block_info.len() * 4) as u64;
                     let b_size = (packed.bitplane_data.len() * 4) as u64;
 
@@ -257,8 +289,9 @@ impl DecoderPipeline {
             EntropyData::Huffman(tiles) => {
                 // Huffman: GPU decode path — upload packed stream data for GPU decoder
                 for p in 0..3 {
-                    let plane_tiles = &tiles[p * tiles_per_plane..(p + 1) * tiles_per_plane];
-                    let packed = GpuHuffmanDecoder::pack_decode_data(plane_tiles, info);
+                    let start = plane_offset[p];
+                    let p_tiles = &tiles[start..start + plane_tiles[p]];
+                    let packed = GpuHuffmanDecoder::pack_decode_data(p_tiles, plane_info[p]);
 
                     // Params → entropy_params
                     ctx.queue.write_buffer(

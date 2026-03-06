@@ -13,6 +13,7 @@ use crate::encoder::rans_gpu::GpuRansDecoder;
 use crate::encoder::rice_gpu::GpuRiceDecoder;
 use crate::encoder::huffman_gpu::GpuHuffmanDecoder;
 use crate::encoder::block_transform::BlockTransform;
+use crate::encoder::chroma_resample::ChromaResampler;
 use crate::encoder::intra::IntraPredictor;
 use crate::encoder::temporal_53::Temporal53Gpu;
 use crate::encoder::temporal_haar::TemporalHaarGpu;
@@ -47,6 +48,7 @@ pub struct DecoderPipeline {
     pub(super) intra: IntraPredictor,
     pub(super) temporal_haar: TemporalHaarGpu,
     pub(super) temporal_53: Temporal53Gpu,
+    pub(super) chroma_up: ChromaResampler,
     pub(super) crop_pipeline: wgpu::ComputePipeline,
     pub(super) crop_bgl: wgpu::BindGroupLayout,
     pub(super) pack_pipeline: wgpu::ComputePipeline,
@@ -271,6 +273,7 @@ impl DecoderPipeline {
             intra: IntraPredictor::new(ctx),
             temporal_haar: TemporalHaarGpu::new(ctx),
             temporal_53: Temporal53Gpu::new(ctx),
+            chroma_up: ChromaResampler::new_upsample(ctx),
             crop_pipeline,
             crop_bgl,
             pack_pipeline,

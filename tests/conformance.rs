@@ -124,7 +124,7 @@ fn conformance_gradient_q25() {
     assert!(serialized.len() > 100, "Bitstream too small");
 
     // Verify GP12 magic
-    assert_eq!(&serialized[0..4], b"GP12", "Expected GP12 magic");
+    assert_eq!(&serialized[0..4], b"GP13", "Expected GP13 magic");
 
     // Verify decode is deterministic (re-decode)
     let ctx = gpu();
@@ -184,7 +184,7 @@ fn conformance_lossless_q100() {
     assert!(psnr.is_infinite(), "Lossless mode should give infinite PSNR, got {psnr:.2}");
 
     // Verify GP12 magic
-    assert_eq!(&serialized[0..4], b"GP12");
+    assert_eq!(&serialized[0..4], b"GP13");
 
     // Verify bit-exact round-trip
     let ctx = gpu();

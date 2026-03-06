@@ -1,4 +1,4 @@
-use crate::WaveletType;
+use crate::{ChromaFormat, WaveletType};
 
 pub fn load_image_rgb_f32(path: &str) -> (Vec<f32>, u32, u32) {
     let img = image::open(path).expect("Failed to open image").to_rgb8();
@@ -22,6 +22,18 @@ pub fn parse_wavelet_type(s: &str) -> WaveletType {
         "97" => WaveletType::CDF97,
         other => {
             eprintln!("Unknown wavelet type: {}. Use: 53 or 97", other);
+            std::process::exit(1);
+        }
+    }
+}
+
+pub fn parse_chroma_format(s: &str) -> ChromaFormat {
+    match s {
+        "444" => ChromaFormat::Yuv444,
+        "422" => ChromaFormat::Yuv422,
+        "420" => ChromaFormat::Yuv420,
+        other => {
+            eprintln!("Unknown chroma format: {}. Use: 444, 422, or 420", other);
             std::process::exit(1);
         }
     }

@@ -335,6 +335,7 @@ pub fn run_shootout(
             height: pad_h,
             bit_depth: 8,
             tile_size: 256,
+            chroma_format: crate::ChromaFormat::Yuv444,
         };
 
         println!("  Testing CDF-9/7 wavelet (4 levels)...");

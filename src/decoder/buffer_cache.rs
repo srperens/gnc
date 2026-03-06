@@ -54,6 +54,10 @@ pub(super) struct CachedBuffers {
     pub(super) staging_u8: wgpu::Buffer,
     /// Dequantized Y wavelet coefficients for CfL prediction
     pub(super) y_ref_wavelet_buf: wgpu::Buffer,
+    /// Upsampled Co plane for 4:2:2 / 4:2:0 decode path (luma-sized).
+    pub(super) co_plane_up: wgpu::Buffer,
+    /// Upsampled Cg plane for 4:2:2 / 4:2:0 decode path (luma-sized).
+    pub(super) cg_plane_up: wgpu::Buffer,
     /// Reference planes from previous decoded frame (for temporal prediction)
     pub(super) reference_planes: [wgpu::Buffer; 3],
 
@@ -205,6 +209,20 @@ impl CachedBuffers {
 
         let y_ref_wavelet_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("dec_y_ref_wavelet"),
+            size: plane_size,
+            usage: scratch_usage,
+            mapped_at_creation: false,
+        });
+
+        // Upsample buffers for non-444 chroma: luma-sized, used when decoding 4:2:2 / 4:2:0.
+        let co_plane_up = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dec_co_plane_up"),
+            size: plane_size,
+            usage: scratch_usage,
+            mapped_at_creation: false,
+        });
+        let cg_plane_up = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dec_cg_plane_up"),
             size: plane_size,
             usage: scratch_usage,
             mapped_at_creation: false,
@@ -448,6 +466,8 @@ impl CachedBuffers {
             staging,
             staging_u8,
             y_ref_wavelet_buf,
+            co_plane_up,
+            cg_plane_up,
             reference_planes,
             entropy_params,
             entropy_tile_info,

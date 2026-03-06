@@ -45,6 +45,10 @@ path = "tests/quality_regression.rs"
 name = "conformance"
 path = "tests/conformance.rs"
 
+[[test]]
+name = "scene_cut_sequence"
+path = "tests/scene_cut_sequence.rs"
+
 [[bench]]
 name = "codec"
 harness = false

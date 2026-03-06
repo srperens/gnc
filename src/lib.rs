@@ -1060,18 +1060,10 @@ pub mod wasm {
                 let gop_size = th.gop_size as usize;
 
                 // Check for an I-frame at this exact PTS (scene-cut or tail I-frame).
-                // Scene-cut I-frames have frame_role=2 and a PTS within the temporal range.
-                let iframe_entry = th.index.iter()
-                    .find(|e| e.frame_role == 2 && e.pts == current_pts);
-
-                if let Some(entry) = iframe_entry {
-                    let start = entry.offset as usize;
-                    let end = start + entry.size as usize;
-                    let frame = crate::format::deserialize_compressed(&self.data[start..end]);
-                    let rgba = self.decoder.decode_rgba_wasm(&self.ctx, &frame).await;
-                    self.current_frame += 1;
-                    return Ok(rgba);
-                }
+                // Extract offset/size as copies so the borrow ends before mutable ops.
+                let iframe_offsets: Option<(usize, usize)> = th.index.iter()
+                    .find(|e| e.frame_role == 2 && e.pts == current_pts)
+                    .map(|e| (e.offset as usize, e.offset as usize + e.size as usize));
 
                 let gop_idx = self.current_frame / gop_size;
                 let max_gop_idx = th.index.iter()
@@ -1079,6 +1071,13 @@ pub mod wasm {
                     .map(|e| e.gop_index as usize)
                     .max()
                     .unwrap_or(0);
+
+                if let Some((start, end)) = iframe_offsets {
+                    let frame = crate::format::deserialize_compressed(&self.data[start..end]);
+                    let rgba = self.decoder.decode_rgba_wasm(&self.ctx, &frame).await;
+                    self.current_frame += 1;
+                    return Ok(rgba);
+                }
 
                 if gop_idx <= max_gop_idx {
                     let group = crate::format::deserialize_temporal_group(
@@ -1397,14 +1396,26 @@ pub mod wasm {
                 let temporal_transform = th.temporal_transform;
 
                 // Check for an I-frame at this exact PTS (scene-cut or tail I-frame).
-                let iframe_entry = th.index.iter()
-                    .find(|e| e.frame_role == 2 && e.pts == current_pts);
+                // Extract offset/size as copies so the borrow ends before mutable ops.
+                let iframe_offsets: Option<(usize, usize)> = th.index.iter()
+                    .find(|e| e.frame_role == 2 && e.pts == current_pts)
+                    .map(|e| (e.offset as usize, e.offset as usize + e.size as usize));
 
-                if let Some(entry) = iframe_entry {
+                let gop_idx = self.current_frame / gop_size;
+                let max_gop_idx = th.index.iter()
+                    .filter(|e| e.frame_role != 2)
+                    .map(|e| e.gop_index as usize)
+                    .max()
+                    .unwrap_or(0);
+                // Pre-extract index entries as owned tuples so the th borrow can end before
+                // the mutable self.ensure_tw_bufs() call; used for prefetch computation.
+                let index_entries: Vec<(u8, u32, u16)> = th.index.iter()
+                    .map(|e| (e.frame_role, e.pts, e.gop_index))
+                    .collect();
+
+                if let Some((start, end)) = iframe_offsets {
                     self.last_seek_ms = 0.0;
                     let t_dec = Self::now_ms();
-                    let start = entry.offset as usize;
-                    let end = start + entry.size as usize;
                     let frame = crate::format::deserialize_compressed(&self.data[start..end]);
                     self.decoder.decode_to_texture(&self.ctx, &frame);
                     let view = self.decoder.output_texture_view().unwrap();
@@ -1422,13 +1433,6 @@ pub mod wasm {
                     return Ok(());
                 }
 
-                let gop_idx = self.current_frame / gop_size;
-                let max_gop_idx = th.index.iter()
-                    .filter(|e| e.frame_role != 2)
-                    .map(|e| e.gop_index as usize)
-                    .max()
-                    .unwrap_or(0);
-
                 if gop_idx <= max_gop_idx {
                     let frame_in_gop = self.current_frame - gop_idx * gop_size;
                     let gop_base = gop_idx * gop_size;
@@ -1444,15 +1448,16 @@ pub mod wasm {
                             self.last_seek_ms = 0.0;
                         } else {
                             let t_seek = Self::now_ms();
-                            let th = self.temporal_header.as_ref().unwrap();
                             let group = crate::format::deserialize_temporal_group(
                                 &self.data, th, gop_idx,
                             );
-                            self.tw_gop_info = Some(group.low_frame.info.clone());
-                            self.tw_gop_config = Some(group.low_frame.config.clone());
                             let padded_w = group.low_frame.info.padded_width();
                             let padded_h = group.low_frame.info.padded_height();
+                            let gop_info = group.low_frame.info.clone();
+                            let gop_config = group.low_frame.config.clone();
                             self.ensure_tw_bufs(padded_w, padded_h, gop_size);
+                            self.tw_gop_info = Some(gop_info);
+                            self.tw_gop_config = Some(gop_config);
                             let set = &self.tw_buf_sets[self.tw_active];
                             self.decoder.decode_temporal_gop_into(
                                 &self.ctx, &group, temporal_transform, gop_size,
@@ -1488,21 +1493,25 @@ pub mod wasm {
                         )?;
                     }
                     self.last_decode_ms = Self::now_ms() - t_dec;
-                    self.current_frame += 1;
 
-                    // Prefetch next GOP (skip over any scene-cut I-frames that follow)
-                    if frame_in_gop == gop_size / 2 && gop_idx < max_gop_idx
+                    // Precompute prefetch target using pre-extracted index entries (no th borrow needed).
+                    let prefetch_target: Option<usize> = if frame_in_gop == gop_size / 2
+                        && gop_idx < max_gop_idx
                         && self.tw_prefetch_base != gop_base + gop_size
                     {
-                        // Find next temporal GOP after this one
                         let next_gop_base = (gop_idx + 1) * gop_size;
-                        let next_temporal_gop = th.index.iter()
-                            .filter(|e| e.frame_role == 0 && e.pts >= next_gop_base as u32)
-                            .map(|e| e.gop_index as usize)
-                            .min();
-                        if let Some(next_g) = next_temporal_gop {
-                            self.prefetch_next_gop(next_g, gop_size);
-                        }
+                        index_entries.iter()
+                            .filter(|(role, pts, _)| *role == 0 && *pts >= next_gop_base as u32)
+                            .map(|(_, _, gop_index)| *gop_index as usize)
+                            .min()
+
+                    } else {
+                        None
+                    };
+
+                    self.current_frame += 1;
+                    if let Some(next_g) = prefetch_target {
+                        self.prefetch_next_gop(next_g, gop_size);
                     }
 
                     return Ok(());

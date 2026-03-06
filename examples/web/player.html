@@ -303,6 +303,8 @@
             <div class="controls" id="controlsBar">
                 <button id="playBtn" disabled>Play</button>
                 <button id="stopBtn" disabled title="Stop and reset to frame 0">Stop</button>
+                <button id="prevBtn" disabled title="Previous frame">&lsaquo;</button>
+                <button id="nextBtn" disabled title="Next frame">&rsaquo;</button>
                 <input type="range" id="seekBar" min="0" max="0" value="0" step="1">
                 <span class="frame-label" id="frameLabel">0 / 0</span>
             </div>
@@ -363,6 +365,8 @@
         let canvas = $('canvas');
         const playBtn = $('playBtn');
         const stopBtn = $('stopBtn');
+        const prevBtn = $('prevBtn');
+        const nextBtn = $('nextBtn');
         const seekBar = $('seekBar');
         const frameLabel = $('frameLabel');
         const canvasWrap = $('canvasWrap');
@@ -784,6 +788,8 @@
 
             playBtn.disabled = false;
             stopBtn.disabled = false;
+            prevBtn.disabled = fc <= 1;
+            nextBtn.disabled = fc <= 1;
             playBtn.textContent = fc > 1 ? 'Play' : 'Decode';
 
             // Try zero-copy GPU surface rendering (works for both GNV1 and GNV2)
@@ -975,6 +981,42 @@
             }
             showDiag(0);
             setStatus('Stopped', 'ok');
+        });
+
+        // --- Step frame ---
+        async function stepFrame(delta) {
+            if (!player || cachedFc <= 1) return;
+            pause();
+            const target = Math.max(0, Math.min(cachedFc - 1, jsCurrentFrame + delta - 1));
+            seekBar.value = target;
+            setStatus(`Frame ${target}`, 'ok');
+            if (zeroCopy) {
+                player.seek_and_present(target);
+                const sk = player.last_seek_ms, dk = player.last_decode_ms;
+                showTiming(sk, dk);
+                logTiming(target, sk, dk);
+            } else {
+                const t0 = performance.now();
+                const rgba = await player.seek(target);
+                paintFrame(rgba, cachedWidth, cachedHeight);
+                const dt = performance.now() - t0;
+                showTiming(0, dt);
+                logTiming(target, 0, dt);
+            }
+            jsCurrentFrame = target + 1;
+            updateFrameLabel(target);
+            showDiag(target);
+        }
+
+        prevBtn.addEventListener('click', () => stepFrame(-1));
+        nextBtn.addEventListener('click', () => stepFrame(+1));
+
+        // Arrow key stepping
+        document.addEventListener('keydown', e => {
+            if (!player || cachedFc <= 1) return;
+            if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
+            if (e.key === 'ArrowLeft')  { e.preventDefault(); stepFrame(-1); }
+            if (e.key === 'ArrowRight') { e.preventDefault(); stepFrame(+1); }
         });
 
         // --- Seek ---

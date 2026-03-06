@@ -49,13 +49,19 @@ See [BASELINE.md](BASELINE.md) for current benchmark numbers.
 - **Status:** done (Phase 4)
 - **Note:** Completed in temporal wavelet Phase 4
 
+### 4b. Rice MAX_STREAM_BYTES reduction (enables future tile experiments)
+- **Status:** todo (P3 — do after speed target met)
+- **Problem:** 4096 bytes/stream is worst-case ceiling; at q=75 actual max is ~320 bytes/stream. Current value blocks 128×128 tiles at 1080p (134MB > 128MB WebGPU limit).
+- **Approach:** Measure actual stream byte distribution across benchmark suite, pick safe ceiling (e.g. 1024 bytes) with overflow guard. Validates/invalidates without touching encoding algorithm.
+- **Success criteria:** No encode/decode regression; 128×128 tiles no longer fail at runtime.
+
 ### 7. LL subband prediction
-- **Status:** todo
+- **Status:** todo (P3 — probably skip)
 - **Problem:** Delta prediction between adjacent LL tiles could reduce redundancy
 - **Success criteria:** Skip if < 2% bpp gain on benchmark suite
 - **Note:** Low priority, may not be worth the complexity
 
 ### 8. Rate control
-- **Status:** todo
+- **Status:** todo (P2 — needed before broadcast use)
 - **Problem:** No constant bitrate mode
 - **Success criteria:** CBR mode with < 5% bitrate overshoot on 10s windows

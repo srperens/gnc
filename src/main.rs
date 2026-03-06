@@ -1023,18 +1023,20 @@ fn main() {
                 // Detect input format: Y4M if path ends with ".y4m"
                 let use_y4m = input.ends_with(".y4m");
 
-                // Obtain dimensions (and, for Y4M, fps from the header)
-                let (w, h, y4m_fps) = if use_y4m {
+                // Obtain dimensions (and, for Y4M, fps from the header).
+                // For Y4M we keep the reader open so we can reuse it for warmup frames,
+                // avoiding a separate probe-only open.
+                let (w, h, y4m_fps, y4m_probe_reader) = if use_y4m {
                     let probe = Y4mReader::open(&input);
                     let fw = probe.width;
                     let fh = probe.height;
                     let y4m_fps_val =
                         probe.fps_num as f64 / probe.fps_den.max(1) as f64;
-                    (fw, fh, Some(y4m_fps_val))
+                    (fw, fh, Some(y4m_fps_val), Some(probe))
                 } else {
                     let first_path = input.replace("%04d", &format!("{:04}", 0));
                     let (_, fw, fh) = load_image_rgb_f32(&first_path);
-                    (fw, fh, None)
+                    (fw, fh, None, None)
                 };
                 // Use fps from Y4M header when available; otherwise keep CLI --fps value.
                 let effective_fps = y4m_fps.unwrap_or(fps);
@@ -1093,8 +1095,11 @@ fn main() {
 
                 // Read enough frames for warmup (gop_size frames for temporal warmup)
                 // without counting them in the benchmark.
-                let warmup_frames: Vec<Vec<f32>> = if use_y4m {
-                    let mut y4m_warmup = Y4mReader::open(&input);
+                //
+                // For Y4M: reuse the probe reader (already positioned at frame 0) so we
+                // avoid a third open of the same file.  The encode stream (y4m_stream below)
+                // is a separate, independent open that always restarts from frame 0.
+                let warmup_frames: Vec<Vec<f32>> = if let Some(mut y4m_warmup) = y4m_probe_reader {
                     (0..gop_size)
                         .filter_map(|_| y4m_warmup.read_frame_rgb())
                         .collect()
@@ -1292,8 +1297,6 @@ fn main() {
                         enc_fps, num_frames, total_enc_ms,
                     );
                 }
-                // suppress unused warning when effective_fps is not otherwise consumed
-                let _ = effective_fps;
                 let avg_bpp = (total_bytes as f64 * 8.0) / (w as f64 * h as f64) / num_frames as f64;
                 println!(
                     "  Total: {} bytes ({:.2} MB), avg {:.2} bpp, {:.1}ms ({:.1} fps)",
@@ -1319,7 +1322,9 @@ fn main() {
 
                 // Write GNV2 if output path provided
                 if let Some(ref output_path) = output {
-                    let fps_num = fps.round() as u32;
+                    // Use effective_fps (Y4M header fps when available, else CLI --fps)
+                    // so the bitstream reflects the true playback rate of the source.
+                    let fps_num = effective_fps.round() as u32;
                     let fps_den = 1u32;
                     let gnv2_data = serialize_temporal_sequence(&encoded_tw, (fps_num, fps_den));
                     std::fs::write(output_path, &gnv2_data).expect("Failed to write GNV2 output");

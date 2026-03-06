@@ -1790,6 +1790,13 @@ impl EncoderPipeline {
             [info, &chroma_info_storage, &chroma_info_storage]
         };
 
+        // For non-444: after inverse wavelet, chroma planes are at chroma size.
+        // We upsample back to luma size before storing in gpu_ref_planes so that
+        // encode_pframe can use luma-dimension MC for all planes consistently.
+        let is_non_444 = info.chroma_format != ChromaFormat::Yuv444;
+        let chroma_shift_x = info.chroma_format.horiz_shift();
+        let chroma_shift_y = info.chroma_format.vert_shift();
+
         let has_cfl = frame.cfl_alphas.is_some();
         let cfl_alphas_per_plane;
 
@@ -1872,7 +1879,6 @@ impl EncoderPipeline {
             let p_padded_w = p_info.padded_width();
             let p_padded_h = p_info.padded_height();
             let p_padded_pixels = (p_padded_w * p_padded_h) as usize;
-            let p_plane_size = (p_padded_pixels * std::mem::size_of::<f32>()) as u64;
 
             // Dequantize: quant_buf → cg_plane (scratch — preserves plane_b for Cg).
             // AQ weight map only applies to luma (p == 0).
@@ -1959,16 +1965,44 @@ impl EncoderPipeline {
                 );
             }
 
-            // Copy decoded plane to persistent GPU reference buffer.
-            // For non-444 chroma, p_plane_size < luma_plane_size — only copy the
-            // actual chroma data (the rest of gpu_ref_planes[p] is unused for chroma).
-            cmd.copy_buffer_to_buffer(
-                &bufs.plane_a,
-                0,
-                &bufs.gpu_ref_planes[p],
-                0,
-                p_plane_size,
-            );
+            // Copy decoded plane to persistent GPU reference buffer at luma size.
+            // For non-444 chroma: upsample plane_a (chroma-sized) to luma size,
+            // then copy at luma_plane_size. This ensures encode_pframe uses luma-dimension
+            // MC for all planes consistently, avoiding tile-count mismatches.
+            //
+            // Buffer assignment for upsample destination:
+            //   p=1 (Co): use mc_out — plane_b holds Cg quantized data (quant_bufs[2])
+            //              which must not be overwritten before p=2 processes it.
+            //   p=2 (Cg): use plane_b — Cg quantized data was already consumed by the
+            //              dequant dispatch above, so plane_b is safe to overwrite.
+            if p > 0 && is_non_444 {
+                let p_info = plane_info[p];
+                let c_padded_w = p_info.padded_width();
+                let c_padded_h = p_info.padded_height();
+                let up_dst = if p == 1 { &bufs.mc_out } else { &bufs.plane_b };
+                self.chroma_up.dispatch_upsample(
+                    ctx, &mut cmd,
+                    &bufs.plane_a, up_dst,
+                    c_padded_w, c_padded_h,
+                    padded_w, padded_h,
+                    chroma_shift_x, chroma_shift_y,
+                );
+                cmd.copy_buffer_to_buffer(
+                    up_dst,
+                    0,
+                    &bufs.gpu_ref_planes[p],
+                    0,
+                    luma_plane_size,
+                );
+            } else {
+                cmd.copy_buffer_to_buffer(
+                    &bufs.plane_a,
+                    0,
+                    &bufs.gpu_ref_planes[p],
+                    0,
+                    luma_plane_size,
+                );
+            }
         }
 
         ctx.queue.submit(Some(cmd.finish()));
@@ -2039,6 +2073,26 @@ impl EncoderPipeline {
         let tiles_y = info.tiles_y() as usize;
         let use_gpu_encode =
             config.gpu_entropy_encode && config.entropy_coder != EntropyCoder::Bitplane;
+
+        // Non-444 chroma subsampling: compute chroma-plane dimensions.
+        // gpu_ref_planes stores all planes at luma size (chroma was upsampled after I-frame
+        // local decode). Forward: MC at luma dims → downsample residual → encode at chroma dims.
+        // Local decode: dequant/inverse wavelet at chroma dims → upsample → inverse MC at luma dims.
+        let is_non_444 = info.chroma_format != ChromaFormat::Yuv444;
+        let chroma_info_pf: Option<FrameInfo> = if is_non_444 {
+            Some(info.make_chroma_info())
+        } else {
+            None
+        };
+        let chroma_shift_x = info.chroma_format.horiz_shift();
+        let chroma_shift_y = info.chroma_format.vert_shift();
+        let (chroma_padded_w, chroma_padded_h, chroma_pixels) = if let Some(ref ci) = chroma_info_pf {
+            let cpw = ci.padded_width();
+            let cph = ci.padded_height();
+            (cpw, cph, (cpw * cph) as usize)
+        } else {
+            (padded_w, padded_h, padded_pixels)
+        };
 
         let mut rans_tiles: Vec<rans::InterleavedRansTile> = Vec::new();
         let mut subband_tiles: Vec<rans::SubbandRansTile> = Vec::new();
@@ -2195,13 +2249,19 @@ impl EncoderPipeline {
                     1 => &bufs.co_plane,
                     _ => &bufs.cg_plane,
                 };
-                // Quantize output: Y→recon_y, Co→co_plane, Cg→plane_b (no copy needed)
+                // Quantize output: Y→recon_y, Co→ref_upload (non-444 chroma) or co_plane (444),
+                // Cg→plane_b (same for both since wavelet uses plane_b as temp for Co then overwrites).
+                // For non-444 Co, we can't reuse co_plane as output (it holds the luma-size input);
+                // use ref_upload (luma-sized, only chroma portion written). For 444, keep original.
                 let quant_out = match p {
                     0 => &bufs.recon_y,
+                    1 if is_non_444 => &bufs.ref_upload,
                     1 => &bufs.co_plane,
                     _ => &bufs.plane_b,
                 };
 
+                // MC always runs at luma dims: gpu_ref_planes[p] is luma-sized for all planes
+                // (I-frame local decode upsamples chroma before storing).
                 self.motion.compensate_cached(
                     ctx,
                     &mut cmd,
@@ -2219,33 +2279,75 @@ impl EncoderPipeline {
                     cmd.copy_buffer_to_buffer(&bufs.mc_out, 0, &stg[p], 0, plane_size);
                 }
 
-                // mc_out feeds directly into wavelet (read-only at level 0)
-                self.transform.forward(
-                    ctx,
-                    &mut cmd,
-                    &bufs.mc_out,
-                    &bufs.plane_b,
-                    &bufs.plane_c,
-                    info,
-                    config.wavelet_levels,
-                    config.wavelet_type,
-                    p,
-                );
-                self.quantize.dispatch(
-                    ctx,
-                    &mut cmd,
-                    &bufs.plane_c,
-                    quant_out,
-                    padded_pixels as u32,
-                    config.quantization_step,
-                    res_dead_zone,
-                    true,
-                    padded_w,
-                    padded_h,
-                    config.tile_size,
-                    config.wavelet_levels,
-                    weights,
-                );
+                if p > 0 && is_non_444 {
+                    // Non-444 chroma: downsample MC residual (luma-sized) to chroma size,
+                    // then wavelet/quantize at chroma dims so the encoder tile count matches
+                    // the decoder's chroma_tiles_per_plane().
+                    let chroma_ds_buf = if p == 1 { &bufs.co_plane_ds } else { &bufs.cg_plane_ds };
+                    let ci = chroma_info_pf.as_ref().unwrap();
+                    self.chroma_down.dispatch(
+                        ctx, &mut cmd,
+                        &bufs.mc_out, chroma_ds_buf,
+                        padded_w, padded_h,
+                        chroma_shift_x, chroma_shift_y,
+                        chroma_padded_w, chroma_padded_h,
+                    );
+                    // Wavelet at chroma dims: chroma_ds_buf → plane_b(temp) → plane_c(out)
+                    self.transform.forward(
+                        ctx,
+                        &mut cmd,
+                        chroma_ds_buf,
+                        &bufs.plane_b,
+                        &bufs.plane_c,
+                        ci,
+                        config.wavelet_levels,
+                        config.wavelet_type,
+                        p,
+                    );
+                    self.quantize.dispatch(
+                        ctx,
+                        &mut cmd,
+                        &bufs.plane_c,
+                        quant_out,
+                        chroma_pixels as u32,
+                        config.quantization_step,
+                        res_dead_zone,
+                        true,
+                        chroma_padded_w,
+                        chroma_padded_h,
+                        config.tile_size,
+                        config.wavelet_levels,
+                        weights,
+                    );
+                } else {
+                    // Luma (all modes) or 444 chroma: wavelet at luma dims
+                    self.transform.forward(
+                        ctx,
+                        &mut cmd,
+                        &bufs.mc_out,
+                        &bufs.plane_b,
+                        &bufs.plane_c,
+                        info,
+                        config.wavelet_levels,
+                        config.wavelet_type,
+                        p,
+                    );
+                    self.quantize.dispatch(
+                        ctx,
+                        &mut cmd,
+                        &bufs.plane_c,
+                        quant_out,
+                        padded_pixels as u32,
+                        config.quantization_step,
+                        res_dead_zone,
+                        true,
+                        padded_w,
+                        padded_h,
+                        config.tile_size,
+                        config.wavelet_levels,
+                        weights,
+                    );
+                }
             }
 
             // Profiling: flush forward phase to measure GPU time
@@ -2261,7 +2363,8 @@ impl EncoderPipeline {
 
             // Phase 2: GPU entropy encode dispatches + staging copies (same cmd encoder)
             let use_rice = matches!(entropy_mode, EntropyMode::Rice);
-            if use_rice {
+            if use_rice && !is_non_444 {
+                // 444 batch path: all 3 planes share the same tile count and info.
                 self.gpu_rice_encoder.dispatch_3planes_to_cmd(
                     ctx,
                     &mut cmd,
@@ -2269,7 +2372,7 @@ impl EncoderPipeline {
                     info,
                     config.wavelet_levels,
                 );
-            } else {
+            } else if !is_non_444 {
                 self.gpu_encoder.dispatch_3planes_to_cmd(
                     ctx,
                     &mut cmd,
@@ -2279,6 +2382,7 @@ impl EncoderPipeline {
                     config.wavelet_levels,
                 );
             }
+            // Non-444: chroma entropy done after submit below (needs separate FrameInfo per plane).
 
             // Profiling: flush entropy phase
             let _t_after_entropy;
@@ -2298,8 +2402,12 @@ impl EncoderPipeline {
             // Skipped when this P-frame won't be used as a reference
             // (saves ~42 GPU dispatches = ~6-8ms per frame).
             if needs_decode {
-                let quant_bufs: [&wgpu::Buffer; 3] =
-                    [&bufs.recon_y, &bufs.co_plane, &bufs.plane_b];
+                // Quantized buffer locations differ for non-444 Co (stored in ref_upload, not co_plane).
+                let quant_bufs: [&wgpu::Buffer; 3] = if is_non_444 {
+                    [&bufs.recon_y, &bufs.ref_upload, &bufs.plane_b]
+                } else {
+                    [&bufs.recon_y, &bufs.co_plane, &bufs.plane_b]
+                };
                 for (p, quant_buf) in quant_bufs.iter().enumerate() {
                     let weights = if p == 0 {
                         &weights_luma
@@ -2307,68 +2415,170 @@ impl EncoderPipeline {
                         &weights_chroma
                     };
 
-                    self.quantize.dispatch(
-                        ctx,
-                        &mut cmd,
-                        quant_buf,
-                        &bufs.cg_plane,
-                        padded_pixels as u32,
-                        config.quantization_step,
-                        res_dead_zone,
-                        false,
-                        padded_w,
-                        padded_h,
-                        config.tile_size,
-                        config.wavelet_levels,
-                        weights,
-                    );
-                    self.transform.inverse(
-                        ctx,
-                        &mut cmd,
-                        &bufs.cg_plane,
-                        &bufs.plane_c,
-                        &bufs.plane_a,
-                        info,
-                        config.wavelet_levels,
-                        config.wavelet_type,
-                        p,
-                    );
-                    self.motion.compensate_cached(
-                        ctx,
-                        &mut cmd,
-                        &bufs.plane_a,
-                        &bufs.gpu_ref_planes[p],
-                        &split_mv_buf,
-                        &bufs.recon_out,
-                        padded_w,
-                        padded_h,
-                        &bufs.mc_inv_params_8,
-                    );
-                    cmd.copy_buffer_to_buffer(
-                        &bufs.recon_out,
-                        0,
-                        &bufs.gpu_ref_planes[p],
-                        0,
-                        plane_size,
-                    );
+                    if p > 0 && is_non_444 {
+                        // Non-444 chroma local decode:
+                        // 1. Dequant at chroma dims → co_plane_ds / cg_plane_ds (scratch at chroma size)
+                        // 2. Inverse wavelet at chroma dims → plane_a (luma-sized buf, chroma portion)
+                        // 3. Upsample plane_a → mc_out (luma size; safe to overwrite — forward MC is done)
+                        //    NOTE: plane_b must NOT be used here because Cg quantized data (p=2)
+                        //    is stored in plane_b. Overwriting it with Co upsampled residual would
+                        //    corrupt the Cg dequant for the p=2 iteration.
+                        // 4. Inverse MC at luma dims: mc_out (residual) + gpu_ref_planes[p] → recon_out
+                        // 5. Store recon_out → gpu_ref_planes[p] at luma size
+                        let ci = chroma_info_pf.as_ref().unwrap();
+                        let chroma_scratch = if p == 1 { &bufs.co_plane_ds } else { &bufs.cg_plane_ds };
+                        self.quantize.dispatch(
+                            ctx,
+                            &mut cmd,
+                            quant_buf,
+                            chroma_scratch,
+                            chroma_pixels as u32,
+                            config.quantization_step,
+                            res_dead_zone,
+                            false,
+                            chroma_padded_w,
+                            chroma_padded_h,
+                            config.tile_size,
+                            config.wavelet_levels,
+                            weights,
+                        );
+                        // Inverse wavelet: chroma_scratch → cg_plane(temp) → plane_a
+                        // plane_a is luma-sized; only chroma_pixels portion is written.
+                        // cg_plane is also luma-sized; only chroma portion used as temp.
+                        self.transform.inverse(
+                            ctx,
+                            &mut cmd,
+                            chroma_scratch,
+                            &bufs.cg_plane,
+                            &bufs.plane_a,
+                            ci,
+                            config.wavelet_levels,
+                            config.wavelet_type,
+                            p,
+                        );
+                        // Upsample chroma-sized residual (plane_a) to mc_out (luma size).
+                        // mc_out is safe to reuse: forward MC writes have been submitted/completed.
+                        self.chroma_up.dispatch_upsample(
+                            ctx, &mut cmd,
+                            &bufs.plane_a, &bufs.mc_out,
+                            chroma_padded_w, chroma_padded_h,
+                            padded_w, padded_h,
+                            chroma_shift_x, chroma_shift_y,
+                        );
+                        // Inverse MC at luma dims: mc_out (residual) + gpu_ref_planes[p] (luma-sized ref)
+                        self.motion.compensate_cached(
+                            ctx,
+                            &mut cmd,
+                            &bufs.mc_out,
+                            &bufs.gpu_ref_planes[p],
+                            &split_mv_buf,
+                            &bufs.recon_out,
+                            padded_w,
+                            padded_h,
+                            &bufs.mc_inv_params_8,
+                        );
+                        cmd.copy_buffer_to_buffer(
+                            &bufs.recon_out,
+                            0,
+                            &bufs.gpu_ref_planes[p],
+                            0,
+                            plane_size,
+                        );
+                    } else {
+                        // Luma (all modes) or 444 chroma: all at luma dims
+                        self.quantize.dispatch(
+                            ctx,
+                            &mut cmd,
+                            quant_buf,
+                            &bufs.cg_plane,
+                            padded_pixels as u32,
+                            config.quantization_step,
+                            res_dead_zone,
+                            false,
+                            padded_w,
+                            padded_h,
+                            config.tile_size,
+                            config.wavelet_levels,
+                            weights,
+                        );
+                        self.transform.inverse(
+                            ctx,
+                            &mut cmd,
+                            &bufs.cg_plane,
+                            &bufs.plane_c,
+                            &bufs.plane_a,
+                            info,
+                            config.wavelet_levels,
+                            config.wavelet_type,
+                            p,
+                        );
+                        self.motion.compensate_cached(
+                            ctx,
+                            &mut cmd,
+                            &bufs.plane_a,
+                            &bufs.gpu_ref_planes[p],
+                            &split_mv_buf,
+                            &bufs.recon_out,
+                            padded_w,
+                            padded_h,
+                            &bufs.mc_inv_params_8,
+                        );
+                        cmd.copy_buffer_to_buffer(
+                            &bufs.recon_out,
+                            0,
+                            &bufs.gpu_ref_planes[p],
+                            0,
+                            plane_size,
+                        );
+                    }
                 }
             }
 
             // MV staging copy: 8x8 split MVs
             cmd.copy_buffer_to_buffer(&split_mv_buf, 0, &bufs.split_mv_staging_buf, 0, bufs.split_mv_staging_size);
 
-            // === Single submit for everything ===
+            // === Submit the batched command encoder ===
             let _t_submit = std::time::Instant::now();
             ctx.queue.submit(Some(cmd.finish()));
 
-            // Single poll drains forward + entropy + local decode + MV copy
-            if use_rice {
+            // Poll + readback entropy results
+            if use_rice && !is_non_444 {
+                // 444: all 3 planes encoded in the batch — single readback
                 rice_tiles = self.gpu_rice_encoder.finish_3planes_readback(
                     ctx,
                     info,
                     config.wavelet_levels,
                 );
-            } else {
+            } else if use_rice && is_non_444 {
+                // Non-444: luma was in the batch (dispatch_3planes_to_cmd only dispatched luma?).
+                // Actually for non-444 we skipped the batch entropy dispatch entirely.
+                // Do luma + each chroma plane separately with correct FrameInfo.
+                // encode_1plane_to_tiles does its own submit+poll internally.
+                // The batch above only contained forward+local_decode+MV — poll it first.
+                ctx.device.poll(wgpu::Maintain::Wait);
+                let mut luma_tiles = self.gpu_rice_encoder.encode_1plane_to_tiles(
+                    ctx,
+                    &bufs.recon_y,
+                    info,
+                    config.wavelet_levels,
+                );
+                let ci = chroma_info_pf.as_ref().unwrap();
+                let mut co_tiles = self.gpu_rice_encoder.encode_1plane_to_tiles(
+                    ctx,
+                    &bufs.ref_upload,
+                    ci,
+                    config.wavelet_levels,
+                );
+                let mut cg_tiles = self.gpu_rice_encoder.encode_1plane_to_tiles(
+                    ctx,
+                    &bufs.plane_b,
+                    ci,
+                    config.wavelet_levels,
+                );
+                rice_tiles.append(&mut luma_tiles);
+                rice_tiles.append(&mut co_tiles);
+                rice_tiles.append(&mut cg_tiles);
+            } else if !is_non_444 {
                 let (mut rt, mut st) = self.gpu_encoder.finish_3planes_readback(
                     ctx,
                     info,
@@ -2377,6 +2587,10 @@ impl EncoderPipeline {
                 );
                 rans_tiles.append(&mut rt);
                 subband_tiles.append(&mut st);
+            } else {
+                // Non-444 with non-Rice entropy: unsupported (asserted in I-frame encoder).
+                // Drain the GPU submit and fall through with empty tiles (will produce corrupt output).
+                ctx.device.poll(wgpu::Maintain::Wait);
             }
             if std::env::var("GNC_PROFILE").is_ok() {
                 eprintln!("  P-frame GPU+readback: {:.1}ms", _t_submit.elapsed().as_secs_f64() * 1000.0);
@@ -2507,13 +2721,23 @@ impl EncoderPipeline {
                     .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                         label: Some("pf_enc"),
                     });
-                // Quantize output: Y→recon_y, Co→co_plane, Cg→plane_b
-                let quant_out = match p {
-                    0 => &bufs.recon_y,
-                    1 => &bufs.co_plane,
-                    _ => &bufs.plane_b,
+
+                // Quantize output buffer selection:
+                //   Luma: recon_y (all modes)
+                //   444 Co: co_plane, 444 Cg: plane_b
+                //   non-444 Co: ref_upload (avoids alias with luma-sized co_plane input)
+                //   non-444 Cg: plane_b (consistent with I-frame encode)
+                let quant_out = if p == 0 {
+                    &bufs.recon_y
+                } else if p == 1 && is_non_444 {
+                    &bufs.ref_upload
+                } else if p == 1 {
+                    &bufs.co_plane
+                } else {
+                    &bufs.plane_b
                 };
 
+                // MC always at luma dims (ref is luma-sized for all planes)
                 self.motion.compensate_cached(
                     ctx,
                     &mut cmd,
@@ -2525,48 +2749,98 @@ impl EncoderPipeline {
                     padded_h,
                     &bufs.mc_fwd_params_8,
                 );
-                // mc_out feeds directly into wavelet (read-only at level 0)
-                self.transform.forward(
-                    ctx,
-                    &mut cmd,
-                    &bufs.mc_out,
-                    &bufs.plane_b,
-                    &bufs.plane_c,
-                    info,
-                    config.wavelet_levels,
-                    config.wavelet_type,
-                    p,
-                );
-                self.quantize.dispatch(
-                    ctx,
-                    &mut cmd,
-                    &bufs.plane_c,
-                    quant_out,
-                    padded_pixels as u32,
-                    config.quantization_step,
-                    res_dead_zone,
-                    true,
-                    padded_w,
-                    padded_h,
-                    config.tile_size,
-                    config.wavelet_levels,
-                    weights,
-                );
+
+                if p > 0 && is_non_444 {
+                    let ci = chroma_info_pf.as_ref().unwrap();
+                    let chroma_ds_buf = if p == 1 { &bufs.co_plane_ds } else { &bufs.cg_plane_ds };
+                    // Downsample MC residual to chroma size
+                    self.chroma_down.dispatch(
+                        ctx, &mut cmd,
+                        &bufs.mc_out, chroma_ds_buf,
+                        padded_w, padded_h,
+                        chroma_shift_x, chroma_shift_y,
+                        chroma_padded_w, chroma_padded_h,
+                    );
+                    // Wavelet at chroma dims
+                    self.transform.forward(
+                        ctx,
+                        &mut cmd,
+                        chroma_ds_buf,
+                        &bufs.plane_b,
+                        &bufs.plane_c,
+                        ci,
+                        config.wavelet_levels,
+                        config.wavelet_type,
+                        p,
+                    );
+                    self.quantize.dispatch(
+                        ctx,
+                        &mut cmd,
+                        &bufs.plane_c,
+                        quant_out,
+                        chroma_pixels as u32,
+                        config.quantization_step,
+                        res_dead_zone,
+                        true,
+                        chroma_padded_w,
+                        chroma_padded_h,
+                        config.tile_size,
+                        config.wavelet_levels,
+                        weights,
+                    );
+                } else {
+                    // mc_out feeds directly into wavelet (read-only at level 0)
+                    self.transform.forward(
+                        ctx,
+                        &mut cmd,
+                        &bufs.mc_out,
+                        &bufs.plane_b,
+                        &bufs.plane_c,
+                        info,
+                        config.wavelet_levels,
+                        config.wavelet_type,
+                        p,
+                    );
+                    self.quantize.dispatch(
+                        ctx,
+                        &mut cmd,
+                        &bufs.plane_c,
+                        quant_out,
+                        padded_pixels as u32,
+                        config.quantization_step,
+                        res_dead_zone,
+                        true,
+                        padded_w,
+                        padded_h,
+                        config.tile_size,
+                        config.wavelet_levels,
+                        weights,
+                    );
+                }
                 ctx.queue.submit(Some(cmd.finish()));
+
+                let (enc_pixels, enc_w, enc_tiles_x, enc_tiles_y, enc_info) =
+                    if p > 0 && is_non_444 {
+                        let ci = chroma_info_pf.as_ref().unwrap();
+                        (chroma_pixels, chroma_padded_w,
+                         ci.tiles_x() as usize, ci.tiles_y() as usize, ci as &FrameInfo)
+                    } else {
+                        (padded_pixels, padded_w, tiles_x, tiles_y, info)
+                    };
 
                 encode_entropy(
                     &mut self.gpu_encoder,
                     ctx,
                     quant_out,
-                    padded_pixels,
-                    padded_w as usize,
-                    tiles_x,
-                    tiles_y,
+                    enc_pixels,
+                    enc_w as usize,
+                    enc_tiles_x,
+                    enc_tiles_y,
                     tile_size,
                     &entropy_mode,
                     config,
                     use_gpu_encode,
-                    info,
+                    enc_info,
                     config.wavelet_levels,
                     &mut rans_tiles,
                     &mut subband_tiles,
@@ -2599,8 +2873,12 @@ impl EncoderPipeline {
                 });
 
             if needs_decode {
-                let quant_bufs: [&wgpu::Buffer; 3] =
-                    [&bufs.recon_y, &bufs.co_plane, &bufs.plane_b];
+                // Quantized buffer locations differ for non-444 Co (stored in ref_upload).
+                let quant_bufs: [&wgpu::Buffer; 3] = if is_non_444 {
+                    [&bufs.recon_y, &bufs.ref_upload, &bufs.plane_b]
+                } else {
+                    [&bufs.recon_y, &bufs.co_plane, &bufs.plane_b]
+                };
                 for (p, quant_buf) in quant_bufs.iter().enumerate() {
                     let weights = if p == 0 {
                         &weights_luma
@@ -2608,50 +2886,112 @@ impl EncoderPipeline {
                         &weights_chroma
                     };
 
-                    self.quantize.dispatch(
-                        ctx,
-                        &mut cmd,
-                        quant_buf,
-                        &bufs.cg_plane,
-                        padded_pixels as u32,
-                        config.quantization_step,
-                        res_dead_zone,
-                        false,
-                        padded_w,
-                        padded_h,
-                        config.tile_size,
-                        config.wavelet_levels,
-                        weights,
-                    );
-                    self.transform.inverse(
-                        ctx,
-                        &mut cmd,
-                        &bufs.cg_plane,
-                        &bufs.plane_c,
-                        &bufs.plane_a,
-                        info,
-                        config.wavelet_levels,
-                        config.wavelet_type,
-                        p,
-                    );
-                    self.motion.compensate_cached(
-                        ctx,
-                        &mut cmd,
-                        &bufs.plane_a,
-                        &bufs.gpu_ref_planes[p],
-                        &split_mv_buf,
-                        &bufs.recon_out,
-                        padded_w,
-                        padded_h,
-                        &bufs.mc_inv_params_8,
-                    );
-                    cmd.copy_buffer_to_buffer(
-                        &bufs.recon_out,
-                        0,
-                        &bufs.gpu_ref_planes[p],
-                        0,
-                        plane_size,
-                    );
+                    if p > 0 && is_non_444 {
+                        // Non-444 chroma local decode (mirrors GPU batch path logic):
+                        // dequant → inverse wavelet at chroma dims → upsample → inverse MC at luma dims
+                        let ci = chroma_info_pf.as_ref().unwrap();
+                        let chroma_scratch = if p == 1 { &bufs.co_plane_ds } else { &bufs.cg_plane_ds };
+                        self.quantize.dispatch(
+                            ctx,
+                            &mut cmd,
+                            quant_buf,
+                            chroma_scratch,
+                            chroma_pixels as u32,
+                            config.quantization_step,
+                            res_dead_zone,
+                            false,
+                            chroma_padded_w,
+                            chroma_padded_h,
+                            config.tile_size,
+                            config.wavelet_levels,
+                            weights,
+                        );
+                        self.transform.inverse(
+                            ctx,
+                            &mut cmd,
+                            chroma_scratch,
+                            &bufs.cg_plane,
+                            &bufs.plane_a,
+                            ci,
+                            config.wavelet_levels,
+                            config.wavelet_type,
+                            p,
+                        );
+                        // Upsample to mc_out (luma size) — NOT plane_b, which holds Cg quant
+                        // data (plane_b is quant_bufs[2]) and must not be overwritten here.
+                        self.chroma_up.dispatch_upsample(
+                            ctx, &mut cmd,
+                            &bufs.plane_a, &bufs.mc_out,
+                            chroma_padded_w, chroma_padded_h,
+                            padded_w, padded_h,
+                            chroma_shift_x, chroma_shift_y,
+                        );
+                        // Inverse MC: mc_out (upsampled chroma residual) + luma-sized ref → recon_out
+                        self.motion.compensate_cached(
+                            ctx,
+                            &mut cmd,
+                            &bufs.mc_out,
+                            &bufs.gpu_ref_planes[p],
+                            &split_mv_buf,
+                            &bufs.recon_out,
+                            padded_w,
+                            padded_h,
+                            &bufs.mc_inv_params_8,
+                        );
+                        cmd.copy_buffer_to_buffer(
+                            &bufs.recon_out,
+                            0,
+                            &bufs.gpu_ref_planes[p],
+                            0,
+                            plane_size,
+                        );
+                    } else {
+                        // Luma (all modes) or 444 chroma: all at luma dims
+                        self.quantize.dispatch(
+                            ctx,
+                            &mut cmd,
+                            quant_buf,
+                            &bufs.cg_plane,
+                            padded_pixels as u32,
+                            config.quantization_step,
+                            res_dead_zone,
+                            false,
+                            padded_w,
+                            padded_h,
+                            config.tile_size,
+                            config.wavelet_levels,
+                            weights,
+                        );
+                        self.transform.inverse(
+                            ctx,
+                            &mut cmd,
+                            &bufs.cg_plane,
+                            &bufs.plane_c,
+                            &bufs.plane_a,
+                            info,
+                            config.wavelet_levels,
+                            config.wavelet_type,
+                            p,
+                        );
+                        self.motion.compensate_cached(
+                            ctx,
+                            &mut cmd,
+                            &bufs.plane_a,
+                            &bufs.gpu_ref_planes[p],
+                            &split_mv_buf,
+                            &bufs.recon_out,
+                            padded_w,
+                            padded_h,
+                            &bufs.mc_inv_params_8,
+                        );
+                        cmd.copy_buffer_to_buffer(
+                            &bufs.recon_out,
+                            0,
+                            &bufs.gpu_ref_planes[p],
+                            0,
+                            plane_size,
+                        );
+                    }
                 }
             }
 

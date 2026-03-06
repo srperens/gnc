@@ -2958,3 +2958,62 @@ fn test_chroma_format_bitstream_roundtrip() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// P-frame + non-444 chroma roundtrip tests
+// Regression guard for the bug where encode_pframe used luma tile count for
+// chroma planes, causing tile-count mismatch and per-tile flickering.
+// ---------------------------------------------------------------------------
+
+fn pframe_chroma_sequence_psnr(chroma_fmt: crate::ChromaFormat) -> (f64, f64) {
+    let ctx = crate::GpuContext::new();
+    let mut encoder = EncoderPipeline::new(&ctx);
+    let decoder = crate::decoder::pipeline::DecoderPipeline::new(&ctx);
+
+    let w = 256u32;
+    let h = 256u32;
+    let f0 = make_gradient_frame(w, h, 0.0);
+    // Slightly shifted gradients so P-frames have non-zero residual
+    let f1 = make_gradient_frame(w, h, 10.0);
+    let f2 = make_gradient_frame(w, h, 20.0);
+
+    let mut config = crate::CodecConfig::default();
+    config.chroma_format = chroma_fmt;
+    config.quantization_step = 4.0;
+    config.cfl_enabled = false; // CfL requires 444
+    config.keyframe_interval = 10; // I P P …
+
+    let frames: Vec<&[f32]> = vec![&f0, &f1, &f2];
+    let compressed = encoder.encode_sequence(&ctx, &frames, w, h, &config);
+
+    assert_eq!(compressed.len(), 3, "{chroma_fmt:?}: expected 3 compressed frames");
+    assert_eq!(compressed[0].frame_type, crate::FrameType::Intra,     "{chroma_fmt:?}: frame 0 should be I");
+    assert_eq!(compressed[1].frame_type, crate::FrameType::Predicted, "{chroma_fmt:?}: frame 1 should be P");
+    assert_eq!(compressed[2].frame_type, crate::FrameType::Predicted, "{chroma_fmt:?}: frame 2 should be P");
+
+    // Decode and measure PSNR for the two P-frames
+    let _dec0 = decoder.decode(&ctx, &compressed[0]);
+    let dec1  = decoder.decode(&ctx, &compressed[1]);
+    let dec2  = decoder.decode(&ctx, &compressed[2]);
+
+    let psnr1 = compute_psnr(&f1, &dec1);
+    let psnr2 = compute_psnr(&f2, &dec2);
+    (psnr1, psnr2)
+}
+
+#[test]
+fn test_pframe_yuv422_sequence_roundtrip() {
+    let (psnr1, psnr2) = pframe_chroma_sequence_psnr(crate::ChromaFormat::Yuv422);
+    eprintln!("P-frame 4:2:2 PSNR: P1={psnr1:.2} dB  P2={psnr2:.2} dB");
+    // The flickering bug produced PSNR < 20 dB on P-frames; correct decode should be > 30 dB.
+    assert!(psnr1 > 30.0, "4:2:2 P-frame 1 PSNR too low ({psnr1:.2} dB) — chroma tile mismatch?");
+    assert!(psnr2 > 30.0, "4:2:2 P-frame 2 PSNR too low ({psnr2:.2} dB) — chroma tile mismatch?");
+}
+
+#[test]
+fn test_pframe_yuv420_sequence_roundtrip() {
+    let (psnr1, psnr2) = pframe_chroma_sequence_psnr(crate::ChromaFormat::Yuv420);
+    eprintln!("P-frame 4:2:0 PSNR: P1={psnr1:.2} dB  P2={psnr2:.2} dB");
+    assert!(psnr1 > 30.0, "4:2:0 P-frame 1 PSNR too low ({psnr1:.2} dB) — chroma tile mismatch?");
+    assert!(psnr2 > 30.0, "4:2:0 P-frame 2 PSNR too low ({psnr2:.2} dB) — chroma tile mismatch?");
+}

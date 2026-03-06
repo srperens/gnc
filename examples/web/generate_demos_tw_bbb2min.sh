@@ -60,12 +60,12 @@ echo "output: $OUT"
 
 encode_tw "tw_bbb_2min_q5" \
     "$SEQ/bbb_2min/bbb_2min.y4m" \
-    -q 5 -n 1800 -k 8 \
+    -q 5 -n 1800 -k 8 --temporal-wavelet haar \
     --fps 30
 
 encode_tw "tw_bbb_2min" \
     "$SEQ/bbb_2min/bbb_2min.y4m" \
-    -q 75 -n 1800 -k 8 \
+    -q 75 -n 1800 -k 8 --temporal-wavelet haar \
     --fps 30
 
 echo ""

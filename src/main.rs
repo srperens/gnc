@@ -1158,6 +1158,16 @@ fn main() {
                 // hiding the ~22ms write_buffer cost for the subsequent GOP.
                 let mut lookahead_frames: Option<Vec<Vec<f32>>> = None;
 
+                // Decoder for per-GOP PSNR in diagnostics mode. Instantiated once and reused.
+                // Only active when --diagnostics is set; adds decode overhead per GOP.
+                let diag_decoder = if diagnostics {
+                    Some(DecoderPipeline::new(&ctx))
+                } else {
+                    None
+                };
+                let mut diag_psnr_vals: Vec<f64> = Vec::new();
+                let mut diag_steady_fps: Vec<f64> = Vec::new(); // per-GOP fps, excl GOP 0 warmup
+
                 for gop_idx in 0..num_gops {
                     let base = gop_idx * gop_size;
                     // Load this GOP's frames (or use pre-loaded lookahead from previous iteration)
@@ -1250,7 +1260,7 @@ fn main() {
 
                     if diagnostics || gop_idx % 10 == 0 || gop_idx == num_gops - 1 {
                         eprintln!(
-                            "  GOP {:3}/{}: {:6} bytes (low {:5}, high {:5}), {}/{} frames, {:.1} fps",
+                            "  GOP {:3}/{}: {:6} bytes (low {:5}, high {:5}), {}/{} frames, {:.1} fps  [{:.0}ms enc]",
                             gop_idx + 1,
                             num_gops,
                             group_bytes,
@@ -1259,7 +1269,12 @@ fn main() {
                             frames_done,
                             num_frames,
                             fps_enc,
+                            gop_enc_ms,
                         );
+                    }
+                    if gop_idx > 0 {
+                        // Exclude GOP 0 (GPU JIT warmup skews fps high)
+                        diag_steady_fps.push(gop_size as f64 / (gop_enc_ms / 1000.0));
                     }
 
                     if profile_split {
@@ -1276,6 +1291,32 @@ fn main() {
                     if gnc::encoder::diagnostics::enabled() {
                         let q = quality.unwrap_or(75);
                         let mul = tw_highpass_mul.unwrap_or(config_tw.temporal_highpass_qstep_mul);
+
+                        // Decode the GOP to compute per-frame PSNR.
+                        // gop_frames is still in scope (owned, not moved).
+                        let per_frame_q: Vec<(f64, f64)> = if let Some(ref dec) = diag_decoder {
+                            let single_seq = gnc::TemporalEncodedSequence {
+                                mode: temporal_mode,
+                                groups: vec![group.clone()],
+                                tail_iframes: vec![],
+                                frame_count: gop_size,
+                                gop_size,
+                            };
+                            let decoded = dec.decode_temporal_sequence(&ctx, &single_seq);
+                            gop_frames.iter().zip(decoded.iter())
+                                .map(|(orig, dec_frame)| {
+                                    let psnr = quality::psnr(orig, dec_frame, 255.0);
+                                    let ssim = quality::ssim_approx(orig, dec_frame, 255.0);
+                                    (psnr, ssim)
+                                })
+                                .collect()
+                        } else {
+                            vec![]
+                        };
+                        for &(psnr, _) in &per_frame_q {
+                            if psnr.is_finite() { diag_psnr_vals.push(psnr); }
+                        }
+
                         gnc::encoder::diagnostics::print_temporal_gop_diagnostics(
                             gop_idx,
                             gop_size,
@@ -1283,7 +1324,7 @@ fn main() {
                             q,
                             mul,
                             &group,
-                            &[], // no per-frame PSNR in streaming mode
+                            &per_frame_q,
                             None,
                             w,
                             h,
@@ -1377,8 +1418,22 @@ fn main() {
                     );
                 }
 
-                // Skip per-frame PSNR in streaming mode (would require reloading all frames)
-                // Diagnostics GOPs are printed inline above
+                // Diagnostics summary block — printed after all GOPs when --diagnostics is set
+                if diagnostics && !diag_psnr_vals.is_empty() {
+                    let mean_psnr = diag_psnr_vals.iter().sum::<f64>() / diag_psnr_vals.len() as f64;
+                    let min_psnr = diag_psnr_vals.iter().cloned().fold(f64::INFINITY, f64::min);
+                    let max_psnr = diag_psnr_vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                    let mean_enc_fps = if !diag_steady_fps.is_empty() {
+                        diag_steady_fps.iter().sum::<f64>() / diag_steady_fps.len() as f64
+                    } else {
+                        0.0
+                    };
+                    let avg_bpp = (total_bytes as f64 * 8.0) / (w as f64 * h as f64) / num_frames as f64;
+                    eprintln!(
+                        "\n=== Diagnostics Summary ===\n  frames={} GOPs={} avg_bpp={:.2}\n  psnr_avg={:.2} dB  psnr_min={:.2} dB  psnr_max={:.2} dB\n  enc_fps_steady={:.1} fps (excl GOP 0 warmup)",
+                        num_frames, num_gops, avg_bpp, mean_psnr, min_psnr, max_psnr, mean_enc_fps,
+                    );
+                }
                 return;
             }
 

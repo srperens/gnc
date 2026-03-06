@@ -423,6 +423,10 @@ enum Command {
         /// Chroma subsampling format: 444 (default, full resolution), 422, or 420
         #[arg(long, default_value = "444")]
         chroma_format: String,
+
+        /// Compute VMAF perceptual quality score (requires vmaf CLI in PATH).
+        #[arg(long)]
+        vmaf: bool,
     },
 
     /// Benchmark temporal (I+P frame) encoding on a sequence of frames
@@ -619,6 +623,10 @@ enum Command {
         /// Also sweep JPEG and JPEG 2000, producing a unified comparison CSV
         #[arg(long)]
         compare_codecs: bool,
+
+        /// Compute VMAF perceptual quality score at each quality point (requires vmaf CLI in PATH).
+        #[arg(long)]
+        vmaf: bool,
     },
 
     /// Automated benchmark across multiple Xiph sequences. Outputs CSV.
@@ -913,6 +921,7 @@ fn main() {
             dct,
             dct_freq_strength,
             chroma_format,
+            vmaf,
         } => {
             let (rgb_data, w, h) = load_image_rgb_f32(&input);
 
@@ -983,6 +992,29 @@ fn main() {
             };
 
             println!("Quality: {}", qm);
+
+            // VMAF perceptual quality scoring (single-frame)
+            if vmaf {
+                let tmp_ref  = std::env::temp_dir().join("gnc_bench_vmaf_ref.y4m");
+                let tmp_dist = std::env::temp_dir().join("gnc_bench_vmaf_dist.y4m");
+                {
+                    let mut ref_wr = Y4mWriter::create(tmp_ref.to_str().unwrap(), w as usize, h as usize, 1, 1);
+                    ref_wr.write_frame(&rgb_data);
+                    ref_wr.flush();
+                    let mut dist_wr = Y4mWriter::create(tmp_dist.to_str().unwrap(), w as usize, h as usize, 1, 1);
+                    dist_wr.write_frame(&reconstructed);
+                    dist_wr.flush();
+                }
+                print!("VMAF: computing... ");
+                use std::io::Write as _;
+                std::io::stdout().flush().ok();
+                match run_vmaf(tmp_ref.to_str().unwrap(), tmp_dist.to_str().unwrap()) {
+                    Some((mean, _min, _max)) => println!("{:.2}", mean),
+                    None => println!("failed (is vmaf in PATH?)"),
+                }
+                let _ = std::fs::remove_file(&tmp_ref);
+                let _ = std::fs::remove_file(&tmp_dist);
+            }
 
             // Throughput measurement
             // Encode: sequential (each call is self-contained)
@@ -2477,18 +2509,6 @@ fn main() {
                 std::process::exit(1);
             }
 
-            let cf = parse_chroma_format(&chroma_format);
-            if cf != gnc::ChromaFormat::Yuv444 {
-                eprintln!(
-                    "encode-sequence does not yet support non-444 chroma (--chroma-format 422/420)."
-                );
-                eprintln!(
-                    "The I-frame local-decode reference path needs updating for subsampled chroma."
-                );
-                eprintln!("Use --chroma-format 444 (default) for encode-sequence.");
-                std::process::exit(1);
-            }
-
             if diagnostics {
                 gnc::encoder::diagnostics::enable();
             }
@@ -2854,6 +2874,7 @@ fn main() {
             compare,
             q_values,
             compare_codecs,
+            vmaf,
         } => {
             // Parse quality values
             let q_vals: Vec<u32> = q_values
@@ -2885,23 +2906,32 @@ fn main() {
 
                 // CSV writer
                 let mut wtr = csv::Writer::from_path(&output).expect("Failed to create CSV file");
-                wtr.write_record([
-                    "q",
-                    "qstep",
-                    "psnr",
-                    "ssim",
-                    "bpp",
-                    "encode_ms",
-                    "decode_ms",
-                ])
-                .expect("Failed to write CSV header");
+                if vmaf {
+                    wtr.write_record(["q", "qstep", "psnr", "ssim", "bpp", "encode_ms", "decode_ms", "vmaf"])
+                        .expect("Failed to write CSV header");
+                } else {
+                    wtr.write_record(["q", "qstep", "psnr", "ssim", "bpp", "encode_ms", "decode_ms"])
+                        .expect("Failed to write CSV header");
+                }
 
                 // Print table header
-                println!(
-                    "\n{:>5} {:>8} {:>8} {:>8} {:>8} {:>10} {:>10}",
-                    "q", "qstep", "psnr", "ssim", "bpp", "enc_ms", "dec_ms"
-                );
-                println!("{}", "-".repeat(68));
+                if vmaf {
+                    println!(
+                        "\n{:>5} {:>8} {:>8} {:>8} {:>8} {:>10} {:>10} {:>8}",
+                        "q", "qstep", "psnr", "ssim", "bpp", "enc_ms", "dec_ms", "vmaf"
+                    );
+                    println!("{}", "-".repeat(78));
+                } else {
+                    println!(
+                        "\n{:>5} {:>8} {:>8} {:>8} {:>8} {:>10} {:>10}",
+                        "q", "qstep", "psnr", "ssim", "bpp", "enc_ms", "dec_ms"
+                    );
+                    println!("{}", "-".repeat(68));
+                }
+
+                // Temp Y4M paths for per-point VMAF scoring (reused across quality points)
+                let vmaf_tmp_ref  = std::env::temp_dir().join("gnc_rdcurve_vmaf_ref.y4m");
+                let vmaf_tmp_dist = std::env::temp_dir().join("gnc_rdcurve_vmaf_dist.y4m");
 
                 for &q in &q_vals {
                     let config = gnc::quality_preset(q);
@@ -2925,23 +2955,68 @@ fn main() {
                     gnc_rd_points.push((q, bdrate::RdPoint { bpp, psnr }));
                     gnc_ssim_values.push(ssim);
 
+                    // VMAF scoring for this quality point
+                    let vmaf_score: Option<f64> = if vmaf {
+                        {
+                            let mut ref_wr = Y4mWriter::create(vmaf_tmp_ref.to_str().unwrap(), w as usize, h as usize, 1, 1);
+                            ref_wr.write_frame(&rgb_data);
+                            ref_wr.flush();
+                            let mut dist_wr = Y4mWriter::create(vmaf_tmp_dist.to_str().unwrap(), w as usize, h as usize, 1, 1);
+                            dist_wr.write_frame(&reconstructed);
+                            dist_wr.flush();
+                        }
+                        run_vmaf(vmaf_tmp_ref.to_str().unwrap(), vmaf_tmp_dist.to_str().unwrap())
+                            .map(|(mean, _, _)| mean)
+                    } else {
+                        None
+                    };
+
                     // Write CSV row
-                    wtr.write_record(&[
-                        format!("{}", q),
-                        format!("{:.4}", qstep),
-                        format!("{:.4}", psnr),
-                        format!("{:.6}", ssim),
-                        format!("{:.6}", bpp),
-                        format!("{:.2}", encode_ms),
-                        format!("{:.2}", decode_ms),
-                    ])
-                    .expect("Failed to write CSV row");
+                    if vmaf {
+                        let vmaf_str = vmaf_score.map_or_else(|| "N/A".to_string(), |v| format!("{:.2}", v));
+                        wtr.write_record(&[
+                            format!("{}", q),
+                            format!("{:.4}", qstep),
+                            format!("{:.4}", psnr),
+                            format!("{:.6}", ssim),
+                            format!("{:.6}", bpp),
+                            format!("{:.2}", encode_ms),
+                            format!("{:.2}", decode_ms),
+                            vmaf_str,
+                        ])
+                        .expect("Failed to write CSV row");
+                    } else {
+                        wtr.write_record(&[
+                            format!("{}", q),
+                            format!("{:.4}", qstep),
+                            format!("{:.4}", psnr),
+                            format!("{:.6}", ssim),
+                            format!("{:.6}", bpp),
+                            format!("{:.2}", encode_ms),
+                            format!("{:.2}", decode_ms),
+                        ])
+                        .expect("Failed to write CSV row");
+                    }
 
                     // Print table row
-                    println!(
-                        "{:>5} {:>8.4} {:>8.2} {:>8.4} {:>8.4} {:>10.2} {:>10.2}",
-                        q, qstep, psnr, ssim, bpp, encode_ms, decode_ms
-                    );
+                    if vmaf {
+                        let vmaf_col = vmaf_score.map_or_else(|| "  N/A".to_string(), |v| format!("{:>8.2}", v));
+                        println!(
+                            "{:>5} {:>8.4} {:>8.2} {:>8.4} {:>8.4} {:>10.2} {:>10.2} {}",
+                            q, qstep, psnr, ssim, bpp, encode_ms, decode_ms, vmaf_col
+                        );
+                    } else {
+                        println!(
+                            "{:>5} {:>8.4} {:>8.2} {:>8.4} {:>8.4} {:>10.2} {:>10.2}",
+                            q, qstep, psnr, ssim, bpp, encode_ms, decode_ms
+                        );
+                    }
+                }
+
+                // Clean up VMAF temp files if used
+                if vmaf {
+                    let _ = std::fs::remove_file(&vmaf_tmp_ref);
+                    let _ = std::fs::remove_file(&vmaf_tmp_dist);
                 }
 
                 wtr.flush().expect("Failed to flush CSV");

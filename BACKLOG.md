@@ -73,6 +73,17 @@ See [BASELINE.md](BASELINE.md) for current benchmark numbers.
 - **Problem:** No constant bitrate mode
 - **Success criteria:** CBR mode with < 5% bitrate overshoot on 10s windows
 
+### 11. VMAF integration — standard quality metric across all benchmarks
+- **Status:** done (2026-03-06)
+- **Problem:** VMAF is only available on `benchmark-sequence --vmaf`. Single-frame `benchmark` and `rd-curve` commands lack VMAF. Chroma subsampling (4:2:2/4:2:0) and future quality improvements cannot be properly validated without perceptual metrics. PSNR missed the TILE_ENERGY_ZERO_THRESH ghosting bug entirely; VMAF caught it.
+- **Approach:**
+  1. Add `--vmaf` flag to `benchmark` (single-frame): encode → decode to temp PNG → Y4M → vmaf CLI → report score
+  2. Add `--vmaf` flag to `rd-curve`: include VMAF column alongside PSNR and bpp
+  3. Run VMAF baseline on current chroma variants (444 vs 422 vs 420 at q=50/75) and log in RESEARCH_LOG.md
+  4. Document VMAF call convention in CLAUDE.md
+- **Success criteria:** `cargo run -- benchmark -i ... -q 75 --vmaf` prints VMAF score. `rd-curve --vmaf` outputs VMAF column. Chroma 422/420 VMAF baseline logged.
+- **Effort:** ~half day (libvmaf already at `/opt/homebrew/Cellar/libvmaf/3.0.0/bin/vmaf`; pattern exists in `benchmark-sequence`)
+
 ### 9. Bilinear chroma upsampling for 4:2:2 / 4:2:0
 - **Status:** todo (P3)
 - **Problem:** Current upsample shaders use nearest-neighbor, introducing avoidable reconstruction error estimated at 0.5-1.0 dB PSNR vs bilinear.

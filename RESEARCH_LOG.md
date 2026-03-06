@@ -1371,3 +1371,40 @@ other sky/gradient content.
    Always pair PSNR with VMAF when evaluating changes that touch chroma.
 
 ---
+
+## VMAF baseline — chroma variants (2026-03-06)
+
+### Goal
+Add `--vmaf` flag to `benchmark` and `rd-curve` commands (backlog item #11). Run baseline
+across two images and three chroma formats to establish a VMAF reference for future changes.
+
+### Implementation
+- Added `--vmaf` flag to `Benchmark` command: encode → decode → write 1-frame Y4M pair → run vmaf CLI → print score.
+- Added `--vmaf` flag to `RdCurve` command: per quality-point VMAF column in table and CSV.
+- Both reuse the existing `Y4mWriter` / `run_vmaf` helpers from `benchmark-sequence`.
+- Temp files: `/tmp/gnc_bench_vmaf_{ref,dist}.y4m` (benchmark), `/tmp/gnc_rdcurve_vmaf_{ref,dist}.y4m` (rd-curve).
+- All tests pass, zero clippy warnings.
+
+### Results — bbb_1080p q=75
+
+| chroma | PSNR (dB) | BPP  | VMAF  |
+|--------|-----------|------|-------|
+| 4:4:4  | 42.17     | 3.83 | 95.05 |
+| 4:2:2  | 37.98     | 3.36 | 94.21 |
+| 4:2:0  | 36.62     | 2.90 | 93.85 |
+
+### Results — blue_sky_1080p q=75
+
+| chroma | PSNR (dB) | BPP  | VMAF  |
+|--------|-----------|------|-------|
+| 4:4:4  | 42.11     | 3.30 | 96.02 |
+| 4:2:2  | 36.94     | 2.32 | 95.46 |
+| 4:2:0  | 37.89     | 1.87 | 95.48 |
+
+### Observations
+- VMAF is remarkably robust to chroma subsampling: 4:2:0 costs only ~0.5-1.2 VMAF points vs 4:4:4 at q=75, while saving 24-43% bpp.
+- PSNR drops 4-5 dB from 4:4:4 to 4:2:0 on bbb but VMAF only drops 1.2 — confirms PSNR overstates chroma cost.
+- Blue sky 4:2:0 PSNR is slightly higher than 4:2:2 (anomaly: blue content interacts with subsampling pattern). VMAF is identical at 95.46 vs 95.48 — within noise.
+- These numbers serve as baseline for the bilinear chroma upsampling experiment (backlog #9).
+
+---

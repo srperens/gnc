@@ -24,6 +24,16 @@ const DEFAULT_FPS: f64 = 30.0;
 /// A value of 2 gives groups of [B B P] — standard for moderate latency.
 const B_FRAMES_PER_GROUP: usize = 2;
 
+/// Per-frame metadata used when batching temporal highpass frame encoding.
+/// Collected during Pass A (adaptive-mul computation) and consumed in Pass C
+/// (batched GPU quantize + Rice encode).
+struct HighFrameInfo {
+    tile_muls: Vec<f32>,
+    buf_idx: usize,
+    is_zero: bool,
+    wm_data: Option<Vec<f32>>,
+}
+
 impl EncoderPipeline {
     /// Encode a sequence of RGB frames with temporal prediction.
     ///
@@ -1168,13 +1178,6 @@ impl EncoderPipeline {
 
         // --- Pass A: Compute adaptive muls for all high frames in ONE batched readback ---
         // Build the ordered list of (buf_idx, lvl, idx) for all high frames
-        struct HighFrameInfo {
-            tile_muls: Vec<f32>,
-            buf_idx: usize,
-            is_zero: bool,
-            wm_data: Option<Vec<f32>>,
-        }
-
         // Collect buf_idx order (matches level/idx nested loop order)
         let mut hframe_buf_indices: Vec<(usize, usize, usize)> = Vec::new(); // (buf_idx, lvl, idx)
         for lvl in 0..num_levels {
@@ -1276,6 +1279,12 @@ impl EncoderPipeline {
 
             let num_tiles = (info.tiles_x() * info.tiles_y()) as usize;
             self.gpu_rice_encoder.prepare_batch_staging(ctx, num_tiles, batch_size);
+            // Write params_buf ONCE before the batch loop.  On Metal/wgpu write_buffer is
+            // staged: only the last write before queue.submit takes effect.  All high frames
+            // in a GOP share the same FrameInfo (same tile layout, same wavelet_levels),
+            // so a single pre-write is both correct and sufficient.
+            self.gpu_rice_encoder
+                .write_params_buf_for_batch(ctx, &info, high_cfg.wavelet_levels);
 
             let weights_luma = high_cfg.subband_weights.pack_weights();
             let weights_chroma = high_cfg.subband_weights.pack_weights_chroma();
@@ -1331,7 +1340,6 @@ impl EncoderPipeline {
                     &mut cmd,
                     quant_dests,
                     &info,
-                    high_cfg.wavelet_levels,
                     slot,
                 );
             }

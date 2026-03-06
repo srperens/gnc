@@ -657,30 +657,27 @@ impl GpuRiceEncoder {
         bufs.ensure_batch_staging(ctx, batch_size);
     }
 
-    /// Dispatch Rice encode for 3 planes into an external command encoder,
-    /// copying results to per-frame staging slot `frame_slot`.
+    /// Write `params_buf` once before a batch of `dispatch_3planes_to_cmd_batch` calls.
     ///
-    /// Must call `prepare_batch_staging` first to ensure slots exist.
-    /// Call `finish_batch_readback` after submitting the command encoder.
-    #[allow(clippy::too_many_arguments)]
-    pub fn dispatch_3planes_to_cmd_batch(
-        &mut self,
+    /// On Metal/wgpu, `queue.write_buffer` is staged: only the last write before
+    /// `queue.submit` takes effect.  All high frames in a GOP share the same FrameInfo
+    /// (identical tile dimensions and num_levels), so one write covers the whole batch.
+    /// Call this after `prepare_batch_staging` and before building the command encoder.
+    ///
+    /// # Panics
+    /// Panics in debug builds if the derived `num_tiles` disagrees with the cached buffer size.
+    pub fn write_params_buf_for_batch(
+        &self,
         ctx: &GpuContext,
-        cmd: &mut wgpu::CommandEncoder,
-        quantized_bufs: [&wgpu::Buffer; 3],
         info: &FrameInfo,
         num_levels: u32,
-        frame_slot: usize,
     ) {
+        let bufs = self.cached.as_ref().expect("prepare_batch_staging must be called first");
         let num_tiles = (info.tiles_x() * info.tiles_y()) as usize;
-        let total_streams = num_tiles * RICE_STREAMS_PER_TILE;
-        let stream_size = (total_streams * MAX_STREAM_BYTES) as u64;
-        let lengths_size = (total_streams * 4) as u64;
-        let k_size = (num_tiles * K_STRIDE * 4) as u64;
-
-        // ensure_buffers already called by prepare_batch_staging
-        let bufs = self.cached.as_ref().unwrap();
-
+        debug_assert_eq!(
+            num_tiles, bufs.num_tiles,
+            "FrameInfo tile dimensions differ from cached buffer size — all batch frames must share the same FrameInfo"
+        );
         let params = RiceParams {
             num_tiles: num_tiles as u32,
             coefficients_per_tile: info.tile_size * info.tile_size,
@@ -691,8 +688,35 @@ impl GpuRiceEncoder {
             _pad0: 0,
             _pad1: 0,
         };
-        ctx.queue
-            .write_buffer(&bufs.params_buf, 0, bytemuck::bytes_of(&params));
+        ctx.queue.write_buffer(&bufs.params_buf, 0, bytemuck::bytes_of(&params));
+    }
+
+    /// Dispatch Rice encode for 3 planes into an external command encoder,
+    /// copying results to per-frame staging slot `frame_slot`.
+    ///
+    /// Must call `prepare_batch_staging` first to ensure slots exist.
+    /// Call `finish_batch_readback` after submitting the command encoder.
+    pub fn dispatch_3planes_to_cmd_batch(
+        &mut self,
+        ctx: &GpuContext,
+        cmd: &mut wgpu::CommandEncoder,
+        quantized_bufs: [&wgpu::Buffer; 3],
+        info: &FrameInfo,
+        frame_slot: usize,
+    ) {
+        let num_tiles = (info.tiles_x() * info.tiles_y()) as usize;
+        let total_streams = num_tiles * RICE_STREAMS_PER_TILE;
+        let stream_size = (total_streams * MAX_STREAM_BYTES) as u64;
+        let lengths_size = (total_streams * 4) as u64;
+        let k_size = (num_tiles * K_STRIDE * 4) as u64;
+
+        // ensure_buffers and write_params_buf_for_batch already called by the batch driver
+        // (prepare_batch_staging + write_params_buf_for_batch, once before the loop).
+        // DO NOT write params_buf here: on Metal/wgpu write_buffer is staged and only the
+        // last write before queue.submit takes effect, so writing N times in a loop would
+        // silently discard all but the last.  All high frames in a GOP share the same
+        // FrameInfo (identical tile layout), so one pre-write is correct for the whole batch.
+        let bufs = self.cached.as_ref().unwrap();
 
         for (p, quantized_buf) in quantized_bufs.iter().enumerate() {
             let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {

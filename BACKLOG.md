@@ -21,12 +21,18 @@ See [BASELINE.md](BASELINE.md) for current benchmark numbers.
 - **Depends on:** #1
 
 ### 3. Encode performance -> 60 fps
-- **Status:** active (partial — 2026-03-06)
-- **Problem:** 15-16 fps temporal Haar end-to-end; PNG decode dominates benchmark
-- **Progress:** Batch GPU syncs: 15 → 3 blocking polls/GOP. Pure encode: ~306ms → ~252ms/GOP (~31.7fps). CfL disabled for temporal highpass (unreliable on residuals).
-- **Remaining bottleneck:** Unknown — need per-stage profiling of `encode_temporal_wavelet_gop_haar` before next optimization
-- **Next step:** Add per-stage Instant timers (spatial wavelet, temporal Haar, Rice, readback) then tackle #4
-- **Success criteria:** >= 40 fps pure encode on crowd_run 1080p q=75 (stretch: 60 fps)
+- **Status:** active (2026-03-06)
+- **Per-stage breakdown** (crowd_run 1080p q=75 GOP=8, steady-state):
+  - high_enc (7 high frames, batch Rice): ~100ms (40%) — mostly GPU compute
+  - spatial_wl (8 frames CDF 9/7): ~58ms (23%)
+  - aq_readback (adaptive-mul GPU readback): ~34ms (14%) — 33ms is sync overhead, only 0.86ms is actual DMA
+  - upload (write_buffer 8 frames): ~21ms (8%)
+  - low_enc: ~18ms (7%), temporal_haar: ~16ms (6%)
+- **Next: GPU-side tile energy reduction** (Opportunity 1)
+  - Replace 58MB CPU readback with GPU per-tile reduction shader + 28-byte max_abs readback
+  - Expected: 30-34ms savings, aq_readback ≤2ms, no quality regression (muls not transmitted to decoder)
+- **After that: async upload** (Opportunity 3) — +15ms amortized → ~200ms/GOP target
+- **Success criteria:** >= 40 fps pure encode on crowd_run 1080p q=75
 
 ### 4. Tile size experiment
 - **Status:** done (2026-03-06) — hypothesis invalidated by architecture constraint

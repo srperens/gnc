@@ -1403,7 +1403,12 @@ impl EncoderPipeline {
             }
         }
 
-        let cfl_alphas = if config.cfl_enabled {
+        // Only store CfL alphas when CfL was actually computed (requires 4:4:4 chroma).
+        // use_cfl = config.cfl_enabled && chroma_format == ChromaFormat::Yuv444.
+        // If config.cfl_enabled is true but use_cfl is false (non-444), cfl_alphas_all is
+        // empty — writing Some(CflAlphas { alphas: [] }) would confuse the decoder which
+        // expects 2*tiles*nsb i16 values when cfl_flag=1.
+        let cfl_alphas = if use_cfl {
             Some(CflAlphas {
                 alphas: cfl_alphas_all,
                 num_subbands: nsb,

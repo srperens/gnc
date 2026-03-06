@@ -102,8 +102,9 @@ impl EncoderPipeline {
             height,
             bit_depth: 8,
             tile_size: config.tile_size,
-            chroma_format: ChromaFormat::Yuv444,
+            chroma_format: config.chroma_format,
         };
+        // padded_w/h are luma dimensions — chroma_format does not affect luma padding.
         let padded_w = info.padded_width();
         let padded_h = info.padded_height();
         let padded_pixels = (padded_w * padded_h) as usize;
@@ -1773,12 +1774,27 @@ impl EncoderPipeline {
         let tiles_x = info.tiles_x() as usize;
         let tiles_y = info.tiles_y() as usize;
         let tiles_per_plane = tiles_x * tiles_y;
-        let plane_size = (padded_pixels * std::mem::size_of::<f32>()) as u64;
+        // Luma plane size (bytes). Used for CfL Y-save and as the reference size for
+        // gpu_ref_planes[0]. For non-444 chroma, each chroma plane is smaller.
+        let luma_plane_size = (padded_pixels * std::mem::size_of::<f32>()) as u64;
+
+        // Per-plane FrameInfo: chroma planes use subsampled dimensions so that the
+        // inverse wavelet sees the correct tile count and padded size.
+        // make_chroma_info() returns a FrameInfo with chroma_format = Yuv444 so that
+        // tiles_x()/tiles_y() reflect the (smaller) chroma tile grid.
+        let chroma_info_storage;
+        let plane_info: [&FrameInfo; 3] = if info.chroma_format == ChromaFormat::Yuv444 {
+            [info, info, info]
+        } else {
+            chroma_info_storage = info.make_chroma_info();
+            [info, &chroma_info_storage, &chroma_info_storage]
+        };
 
         let has_cfl = frame.cfl_alphas.is_some();
         let cfl_alphas_per_plane;
 
-        // Upload CfL alphas if present (tiny: ~2KB, negligible vs 30MB entropy decode)
+        // Upload CfL alphas if present (tiny: ~2KB, negligible vs 30MB entropy decode).
+        // CfL is only enabled for 4:4:4, so this path is never taken for non-444.
         if has_cfl {
             let cfl_data = frame.cfl_alphas.as_ref().unwrap();
             cfl_alphas_per_plane = tiles_per_plane * cfl_data.num_subbands as usize;
@@ -1818,7 +1834,8 @@ impl EncoderPipeline {
 
         let bufs = self.cached.as_ref().unwrap();
 
-        // Weight map is already in weight_map_buf from encode()'s forward pass
+        // Weight map is already in weight_map_buf from encode()'s forward pass.
+        // AQ weight map is computed from luma dimensions only.
         let wm_param = if frame.weight_map.is_some() {
             let (_, ll_bx, _, tx) = adaptive::weight_map_dims(
                 padded_w,
@@ -1850,32 +1867,42 @@ impl EncoderPipeline {
                 &weights_chroma
             };
 
-            // Dequantize: quant_buf → cg_plane (scratch — preserves plane_b for Cg)
+            // Per-plane dimensions: chroma planes are smaller for non-444 formats.
+            let p_info = plane_info[p];
+            let p_padded_w = p_info.padded_width();
+            let p_padded_h = p_info.padded_height();
+            let p_padded_pixels = (p_padded_w * p_padded_h) as usize;
+            let p_plane_size = (p_padded_pixels * std::mem::size_of::<f32>()) as u64;
+
+            // Dequantize: quant_buf → cg_plane (scratch — preserves plane_b for Cg).
+            // AQ weight map only applies to luma (p == 0).
             self.quantize.dispatch_adaptive(
                 ctx,
                 &mut cmd,
                 quant_buf,
                 &bufs.cg_plane,
-                padded_pixels as u32,
+                p_padded_pixels as u32,
                 config.quantization_step,
                 config.dead_zone,
                 false,
-                padded_w,
-                padded_h,
+                p_padded_w,
+                p_padded_h,
                 config.tile_size,
                 config.wavelet_levels,
                 weights,
-                wm_param,
+                if p == 0 { wm_param } else { None },
                 0.0,
             );
 
             if p == 0 && has_cfl {
-                // Save dequantized Y wavelet for CfL chroma prediction
-                cmd.copy_buffer_to_buffer(&bufs.cg_plane, 0, &bufs.recon_y, 0, plane_size);
+                // Save dequantized Y wavelet for CfL chroma prediction.
+                // CfL only runs in 444 mode so luma_plane_size == p_plane_size here.
+                cmd.copy_buffer_to_buffer(&bufs.cg_plane, 0, &bufs.recon_y, 0, luma_plane_size);
             }
 
             if p > 0 && has_cfl {
-                // CfL inverse prediction: cg_plane (dequant residual) + alpha * Y → plane_c
+                // CfL inverse prediction: cg_plane (dequant residual) + alpha * Y → plane_c.
+                // CfL is 444-only, so p_padded_w/h == padded_w/h here.
                 let plane_alpha_offset = (p - 1) * cfl_alphas_per_plane;
                 let plane_alpha_byte_offset =
                     (plane_alpha_offset * std::mem::size_of::<f32>()) as u64;
@@ -1897,22 +1924,22 @@ impl EncoderPipeline {
                     &bufs.recon_y,
                     &bufs.raw_alpha,
                     &bufs.plane_c,
-                    padded_pixels as u32,
-                    padded_w,
-                    padded_h,
+                    p_padded_pixels as u32,
+                    p_padded_w,
+                    p_padded_h,
                     config.tile_size,
                     config.wavelet_levels,
                 );
 
-                // Inverse wavelet: plane_c → cg_plane(scratch) → plane_a
-                // Uses cg_plane as scratch (not plane_b) to preserve Cg quantized data
+                // Inverse wavelet: plane_c → cg_plane(scratch) → plane_a.
+                // Uses cg_plane as scratch (not plane_b) to preserve Cg quantized data.
                 self.transform.inverse(
                     ctx,
                     &mut cmd,
                     &bufs.plane_c,
                     &bufs.cg_plane,
                     &bufs.plane_a,
-                    info,
+                    p_info,
                     config.wavelet_levels,
                     config.wavelet_type,
                     p,
@@ -1925,15 +1952,23 @@ impl EncoderPipeline {
                     &bufs.cg_plane,
                     &bufs.plane_c,
                     &bufs.plane_a,
-                    info,
+                    p_info,
                     config.wavelet_levels,
                     config.wavelet_type,
                     p,
                 );
             }
 
-            // Copy decoded plane to persistent GPU reference buffer
-            cmd.copy_buffer_to_buffer(&bufs.plane_a, 0, &bufs.gpu_ref_planes[p], 0, plane_size);
+            // Copy decoded plane to persistent GPU reference buffer.
+            // For non-444 chroma, p_plane_size < luma_plane_size — only copy the
+            // actual chroma data (the rest of gpu_ref_planes[p] is unused for chroma).
+            cmd.copy_buffer_to_buffer(
+                &bufs.plane_a,
+                0,
+                &bufs.gpu_ref_planes[p],
+                0,
+                p_plane_size,
+            );
         }
 
         ctx.queue.submit(Some(cmd.finish()));

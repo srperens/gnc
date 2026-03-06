@@ -6,8 +6,8 @@ All project goals, design rules, and priorities are in **[GOALS.md](GOALS.md)** 
 
 ```bash
 cargo build --release
-cargo run --release -- benchmark -i test_material/frames/bbb_1080p.png -q 75
-cargo run --release -- rd-curve -i test_material/frames/bbb_1080p.png --compare-codecs
+cargo run --release -- benchmark -i test_material/frames/bbb_1080p.png -q 75 --vmaf
+cargo run --release -- rd-curve -i test_material/frames/bbb_1080p.png --compare-codecs --vmaf
 cargo test --release
 ```
 
@@ -44,10 +44,17 @@ Shader source is in `src/shaders/*.wgsl` (32 shaders). Rust host code is in `src
 
 The team's core principle: **correctness over speed, measurement over assumption, skepticism over optimism.**
 
+### Quality metrics
+**VMAF is the primary quality metric.** PSNR is a secondary cross-check only.
+- VMAF catches perceptual regressions that PSNR misses (proven: TILE_ENERGY_ZERO_THRESH ghosting bug, chroma subsampling penalty)
+- Always run `--vmaf` on `benchmark` and `rd-curve`. Success criteria must include VMAF.
+- VMAF binary: `/opt/homebrew/Cellar/libvmaf/3.0.0/bin/vmaf` (also in PATH as `vmaf`)
+- Tolerances: VMAF regression >0.5 points = BLOCK. PSNR regression >0.3 dB = flag but investigate.
+
 ### Before any experiment
 1. **State the hypothesis clearly** — what do we expect to change and why?
 2. **Question whether it's the right experiment** — does this address the actual bottleneck? Is there a simpler approach we're overlooking? Are we solving the right problem?
-3. **Define success criteria with numbers** — "better" is not a criterion. "≥1.5 dB PSNR at same bpp" is.
+3. **Define success criteria with numbers** — "better" is not a criterion. "≥1.5 dB PSNR and ≥0.5 VMAF at same bpp" is.
 
 ### During implementation
 4. **Verify the change is actually active** — add diagnostic output confirming the new code path runs. A feature that silently doesn't execute is worse than no feature.
@@ -86,10 +93,10 @@ Claude operates as **team lead** for an autonomous multi-agent team. The team is
 | **Builder** (subagent) | Implement changes based on approved diagnosis | Never change bitstream format without approval. Adds diagnostic output to verify code runs. |
 | **Critic** (subagent) | Structural code review after Builder, before Tester | Looks for duplication, dead parameters, wrong layer, unjustified complexity. Verdicts: APPROVE or SEND BACK. Does NOT comment on style or correctness. |
 | **Tester** (subagent) | `cargo test --release` + `cargo clippy --release` | Blocks on any regression. Reports full output on failure. |
-| **Validator** (subagent) | Benchmark suite, compare against [BASELINE.md](BASELINE.md) | Flags any regression. Checks that numbers make sense. Runs twice if results seem surprising. |
+| **Validator** (subagent) | Benchmark suite, compare against [BASELINE.md](BASELINE.md) | **Primary metric: VMAF.** Flags VMAF regression >0.5 pts or bpp +3%. PSNR is secondary cross-check. Runs twice if results seem surprising. |
 | **Documentation Agent** (subagent) | Writes decision records after each completed backlog item | Outputs `docs/decisions/NNNN-title.md`. Documents *why*, not *what*. Flags unexplained decisions to Team Lead. |
 | **Performance Profiler** (subagent) | Profiles encode/decode when fps is below target | Identifies top 3 hotspots, does NOT suggest fixes. Hands report to Researcher. |
-| **Regression Guard** (subagent) | Runs after every merge, compares against `docs/baseline.csv` | Tolerances: bpp +3%, psnr -0.3dB, fps ±10%. PASS or BLOCK output. Never updates baseline without Team Lead approval. |
+| **Regression Guard** (subagent) | Runs after every merge, compares against `docs/baseline.csv` | Tolerances: **vmaf -0.5pts** (BLOCK), bpp +3% (BLOCK), psnr -0.3dB (flag), fps ±10% (flag). PASS or BLOCK output. Never updates baseline without Team Lead approval. |
 
 ### Iteration Loop
 
@@ -101,7 +108,7 @@ Claude operates as **team lead** for an autonomous multi-agent team. The team is
 6. Builder implements with diagnostic verification
 7. **Critic reviews** — structural review of Builder's diff. SEND BACK = Builder fixes before continuing.
 8. Tester verifies (all tests + clippy clean)
-9. Validator benchmarks on ≥3 sequences, compares against BASELINE.md
+9. Validator benchmarks on ≥3 sequences with `--vmaf`, compares against BASELINE.md
 10. **Research Scientist** post-experiment analysis — did the hypothesis hold?
 11. Team Lead reviews results — **are they real? do they make sense? would we ship this?**
 12. Ship or iterate. Update BACKLOG.md, BASELINE.md, RESEARCH_LOG.md, commit.

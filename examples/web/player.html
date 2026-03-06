@@ -625,6 +625,21 @@
             { name: 'tw_ducks_q75.gnv2', label: 'Ducks q75', desc: '300f 50fps 1080p q=75 Haar', group: 'GNV2 (Temporal Wavelet)' },
             { name: 'tw_bbb_2min_q5.gnv2', label: 'BBB 2min q5', desc: '1800f 30fps 1080p q=5 Haar', group: 'GNV2 (Temporal Wavelet)' },
             { name: 'tw_bbb_2min.gnv2', label: 'BBB 2min q75', desc: '1800f 30fps 1080p q=75 Haar', group: 'GNV2 (Temporal Wavelet)' },
+            // Chroma subsampling comparison (single-frame, 1080p)
+            { name: 'chroma_bbb_444.gnv', label: 'BBB 4:4:4 q75', desc: '1f 1080p q=75 — full chroma (3.83 bpp)', group: 'Chroma (4:4:4 vs 4:2:2 vs 4:2:0)' },
+            { name: 'chroma_bbb_422.gnv', label: 'BBB 4:2:2 q75', desc: '1f 1080p q=75 — halved horiz chroma (3.36 bpp, −12%)', group: 'Chroma (4:4:4 vs 4:2:2 vs 4:2:0)' },
+            { name: 'chroma_bbb_420.gnv', label: 'BBB 4:2:0 q75', desc: '1f 1080p q=75 — quarter chroma (2.90 bpp, −24%)', group: 'Chroma (4:4:4 vs 4:2:2 vs 4:2:0)' },
+            { name: 'chroma_bbb_q50_444.gnv', label: 'BBB 4:4:4 q50', desc: '1f 1080p q=50 — full chroma (2.22 bpp)', group: 'Chroma (4:4:4 vs 4:2:2 vs 4:2:0)' },
+            { name: 'chroma_bbb_q50_422.gnv', label: 'BBB 4:2:2 q50', desc: '1f 1080p q=50 — halved horiz chroma (1.97 bpp, −11%)', group: 'Chroma (4:4:4 vs 4:2:2 vs 4:2:0)' },
+            { name: 'chroma_bbb_q50_420.gnv', label: 'BBB 4:2:0 q50', desc: '1f 1080p q=50 — quarter chroma (1.70 bpp, −23%)', group: 'Chroma (4:4:4 vs 4:2:2 vs 4:2:0)' },
+            { name: 'chroma_sky_444.gnv', label: 'BlueSky 4:4:4 q75', desc: '1f 1080p q=75 — full chroma (3.30 bpp)', group: 'Chroma (4:4:4 vs 4:2:2 vs 4:2:0)' },
+            { name: 'chroma_sky_422.gnv', label: 'BlueSky 4:2:2 q75', desc: '1f 1080p q=75 — halved horiz chroma (2.32 bpp, −30%)', group: 'Chroma (4:4:4 vs 4:2:2 vs 4:2:0)' },
+            { name: 'chroma_sky_420.gnv', label: 'BlueSky 4:2:0 q75', desc: '1f 1080p q=75 — quarter chroma (1.87 bpp, −43%)', group: 'Chroma (4:4:4 vs 4:2:2 vs 4:2:0)' },
+            // Chroma video sequences (8 frames, I+P, 1080p)
+            { name: 'seq_bbb_422_q75.gnv', label: 'BBB 4:2:2 q75', desc: '8f 30fps 1080p q=75 — I+P, halved horiz chroma (2.09 bpp avg)', group: 'Chroma Video (I+P)' },
+            { name: 'seq_bbb_420_q75.gnv', label: 'BBB 4:2:0 q75', desc: '8f 30fps 1080p q=75 — I+P, quarter chroma (1.96 bpp avg)', group: 'Chroma Video (I+P)' },
+            { name: 'seq_sky_422_q75.gnv', label: 'BlueSky 4:2:2 q75', desc: '8f 30fps 1080p q=75 — I+P, halved horiz chroma (1.92 bpp avg)', group: 'Chroma Video (I+P)' },
+            { name: 'seq_sky_420_q75.gnv', label: 'BlueSky 4:2:0 q75', desc: '8f 30fps 1080p q=75 — I+P, quarter chroma (1.77 bpp avg)', group: 'Chroma Video (I+P)' },
         ];
 
         function formatSize(bytes) {

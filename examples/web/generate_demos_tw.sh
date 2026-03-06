@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 #
-# Generate demo .gnv2 files (temporal wavelet) for the web player.
-# Uses benchmark-sequence with default temporal wavelet (auto-selects Haar or 5/3
-# based on fps and quality: fps<=25 or q>=90 → Haar, otherwise → 5/3).
+# Generate demo .gnv2 files (temporal wavelet Haar) for the web player.
+# Uses benchmark-sequence --temporal-wavelet haar (must be explicit; default is none/I+P+B).
 # Mirrors generate_demos.sh with matching content for direct GNV1 vs GNV2 comparison.
 #
 # Requires: cargo build --release (gnc binary)
@@ -75,61 +74,61 @@ done
 
 encode_tw "tw_test_quick" \
     "$SEQ/bbb/frame_%04d.png" \
-    -q 75 -n 8 -k 8 \
+    -q 75 -n 8 -k 8 --temporal-wavelet haar \
     --fps 30
 
 encode_tw "tw_test_animation" \
     "$SEQ/bbb_extended/frame_%04d.png" \
-    -q 75 -n 24 -k 8 \
+    -q 75 -n 24 -k 8 --temporal-wavelet haar \
     --fps 30
 
 encode_tw "tw_test_nature" \
     "$SEQ/park_joy/frame_%04d.png" \
-    -q 75 -n 32 -k 8 \
+    -q 75 -n 32 -k 8 --temporal-wavelet haar \
     --fps 50
 
 encode_tw "tw_test_crowd" \
     "$SEQ/crowd_run/frame_%04d.png" \
-    -q 75 -n 32 -k 8 \
+    -q 75 -n 32 -k 8 --temporal-wavelet haar \
     --fps 50
 
 # --- Quality comparison (same content, different q) ---
 
 encode_tw "tw_ducks_q25" \
     "$SEQ/ducks_take_off/frame_%04d.png" \
-    -q 25 -n 300 -k 8 \
+    -q 25 -n 300 -k 8 --temporal-wavelet haar \
     --fps 50
 
 encode_tw "tw_ducks_q50" \
     "$SEQ/ducks_take_off/frame_%04d.png" \
-    -q 50 -n 300 -k 8 \
+    -q 50 -n 300 -k 8 --temporal-wavelet haar \
     --fps 50
 
 encode_tw "tw_ducks_q75" \
     "$SEQ/ducks_take_off/frame_%04d.png" \
-    -q 75 -n 300 -k 8 \
+    -q 75 -n 300 -k 8 --temporal-wavelet haar \
     --fps 50
 
 # --- Broadcast test sequences ---
 
 encode_tw "tw_rush_hour" \
     "$SEQ/rush_hour/frame_%04d.png" \
-    -q 75 -n 200 -k 8 \
+    -q 75 -n 200 -k 8 --temporal-wavelet haar \
     --fps 25
 
 encode_tw "tw_old_town_cross" \
     "$SEQ/old_town_cross/frame_%04d.png" \
-    -q 75 -n 200 -k 8 \
+    -q 75 -n 200 -k 8 --temporal-wavelet haar \
     --fps 50
 
 encode_tw "tw_stockholm" \
     "$SEQ/stockholm/frame_%04d.png" \
-    -q 75 -n 200 -k 8 \
+    -q 75 -n 200 -k 8 --temporal-wavelet haar \
     --fps 60
 
 encode_tw "tw_pedestrian_area" \
     "$SEQ/pedestrian_area/frame_%04d.png" \
-    -q 75 -n 200 -k 8 \
+    -q 75 -n 200 -k 8 --temporal-wavelet haar \
     --fps 25
 
 # --- Long-form demos ---

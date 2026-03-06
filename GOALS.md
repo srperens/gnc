@@ -51,28 +51,44 @@ rANS and Huffman exist in the codebase but are parked — Rice is the default fo
 - 4:4:4 only (4:2:2 not implemented)
 - No true lossless with Rice (near-lossless 56 dB at q=100)
 
-## 4. Priorities
+## 4. Goals
 
-**P1: Video encode speed → 60 fps**
-- ✓ 30 fps achieved (31.7 fps, 1080p, q=75, Rice, I+P+B)
-- Next: multi-frame GPU overlap, fused wavelet+quantize kernel, reduce ME cost
-- Target: real-time 1080p60 sequence encode
+GNC should become a **good, robust codec** — not optimized along a single axis. We iterate across multiple dimensions simultaneously, looking for combinations of techniques that work well together. No single property is a hard blocker for the others.
 
-**P2: Broadcast features**
-- 10-bit content support
-- 4:2:2 chroma subsampling
+**Target properties (all of these, no strict order):**
 
-**P3: Compression efficiency** (parked)
-- rANS and Huffman are implemented but parked — revisit when speed targets are met
-- Fix Rice lossless, improve low-quality compression
+| Property | Current | Target |
+|----------|---------|--------|
+| Encode speed | 31.7 fps (seq, 1080p q=75) | 60 fps |
+| Compression | competitive vs MJPEG/JPEG XS | competitive with H.264 at matched bitrate |
+| Quality range | q=1–100 functional | smooth, predictable quality curve |
+| Robustness | basic test coverage | no artifacts, stable across q and content |
+| Bitstream | GNV1/GNV2 defined | well-specified, documented |
 
-**P4: Transform exploration**
-- DCT, hybrid wavelet/DCT, Haar
+VC-2 (Dirac) demonstrates that a patent-free wavelet codec can reach H.264-class compression. That is our compression reference point — not just intra codecs.
 
-**P5: Research/experimental**
-- PVQ, learned lifting, non-separable fused wavelet
+**How we iterate:**
 
-## 5. Non-Goals
+- Pick the next backlog item based on what provides the most overall value right now — not what happens to be listed as P1
+- Rotate between compression, speed, and robustness — progress in one area does not unlock another
+- Always measure on ≥3 sequences and multiple q levels — a codec that is only good over a narrow quality band is not a good codec
+- Technology choices are driven by: patent freedom, GPU parallelism, measurable improvement
+
+## 5. Design Philosophy
+
+**Correctness over speed.** A codec with subtle bugs is worthless. Verify every change end-to-end. A fast encoder that produces subtly wrong output is not a working encoder.
+
+**Measure before assuming.** Numbers that look too good probably are. Numbers that look unchanged might mean the code isn't running. Run twice. Test on diverse content. Compare against baseline.
+
+**Simplicity has value.** A complex change for 0.3 dB gain is probably not worth the maintenance cost. When two approaches produce similar results, prefer the simpler one. Clever code that nobody understands will break.
+
+**Low-latency by design.** Tile independence is not just about parallelism — it also enables low-latency decode and random seek without full GOP decode. Preserve this property in every pipeline stage.
+
+**Broad content coverage.** A codec that is only good on one type of content is not a good codec. Always validate on high-motion (crowd_run), low-motion (rush_hour), and mixed (stockholm) sequences. Synthetic tests are for correctness, not quality measurement.
+
+**Challenge your own work.** After implementing something, actively try to prove it is wrong before calling it done. Reproduce results before celebrating. If the same bug resurfaces twice — stop and diagnose the root cause properly.
+
+## 6. Non-Goals
 
 - **Beating AV1/H.265 on compression ratio** — We occupy a different design point: parallel, low-latency, patent-free. We compete on speed and simplicity, not maximum compression.
 - **CPU decode path** — GPU-only by design. No software fallback.

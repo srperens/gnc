@@ -1204,19 +1204,107 @@ impl EncoderPipeline {
         let total_high_frames = hframe_buf_indices.len();
 
         let mul_results: Vec<(Vec<f32>, f32)> = if config.adaptive_temporal_mul {
-            // Batch all Y-plane readbacks into a single submit+poll (eliminates N-1 extra syncs)
-            let y_bufs: Vec<&wgpu::Buffer> = hframe_buf_indices
-                .iter()
-                .map(|&(buf_idx, _, _)| &tw.frame_bufs[buf_idx][0])
+            // GPU-side per-tile energy reduction — eliminates 58MB CPU readback.
+            //
+            // For each high frame: dispatch tile_energy_reduce shader which computes
+            // mean_abs per tile and maps it to a mul via log-space interpolation.
+            // Only max_abs (4 bytes per frame) is read back to CPU for zero-skip detection.
+            // tile_muls (~160 bytes per frame) are read back as a small separate readback.
+
+            let tiles_x = padded_w / cfg.tile_size;
+            let tiles_y = padded_h / cfg.tile_size;
+            let num_tiles = (tiles_x * tiles_y) as usize;
+            let tile_muls_bytes = (num_tiles * std::mem::size_of::<f32>()) as u64;
+
+            // Allocate per-frame staging buffers for tile_muls and max_abs readback.
+            // These are small (~160 bytes + 4 bytes per frame) — negligible allocation cost.
+            let n = total_high_frames;
+            let tile_muls_staging: Vec<wgpu::Buffer> = (0..n)
+                .map(|j| {
+                    ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some(&format!("tw_ter_muls_stg_{}", j)),
+                        size: tile_muls_bytes.max(4),
+                        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    })
+                })
                 .collect();
-            Self::compute_temporal_tile_muls_batch(
-                ctx,
-                &y_bufs,
-                padded_w,
-                padded_h,
-                cfg.tile_size,
-                max_mul,
-            )
+
+            // Pre-clear max_abs_bufs to 0 (atomicMax requires 0 as identity).
+            // write_buffer is staged — these writes land before the GPU dispatch.
+            let zero_bytes: [u8; 4] = [0u8; 4];
+            for j in 0..n {
+                ctx.queue.write_buffer(&tw.max_abs_bufs[j], 0, &zero_bytes);
+            }
+
+            // Single command encoder: all tile_energy_reduce dispatches + copies to staging.
+            let mut cmd = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("tw_tile_energy_reduce_batch"),
+            });
+            for (j, &(buf_idx, _, _)) in hframe_buf_indices.iter().enumerate() {
+                self.dispatch_tile_energy_reduce(
+                    ctx,
+                    &mut cmd,
+                    &tw.frame_bufs[buf_idx][0],
+                    &tw.tile_muls_bufs[j],
+                    &tw.max_abs_bufs[j],
+                    &tw.ter_params_buf,
+                    padded_w,
+                    padded_h,
+                    cfg.tile_size,
+                    max_mul,
+                );
+                // Copy tile_muls and max_abs outputs to staging (CPU-readable)
+                cmd.copy_buffer_to_buffer(
+                    &tw.tile_muls_bufs[j], 0,
+                    &tile_muls_staging[j], 0,
+                    tile_muls_bytes.max(4),
+                );
+                cmd.copy_buffer_to_buffer(
+                    &tw.max_abs_bufs[j], 0,
+                    &tw.max_abs_staging_bufs[j], 0,
+                    4,
+                );
+            }
+            ctx.queue.submit(Some(cmd.finish()));
+
+            // Map all staging buffers, single poll.
+            let (tx, rx) = std::sync::mpsc::channel();
+            for (j, muls_stg) in tile_muls_staging.iter().enumerate() {
+                let tx2 = tx.clone();
+                muls_stg
+                    .slice(..)
+                    .map_async(wgpu::MapMode::Read, move |r| { tx2.send(('m', j, r)).unwrap(); });
+                let tx3 = tx.clone();
+                tw.max_abs_staging_bufs[j]
+                    .slice(..)
+                    .map_async(wgpu::MapMode::Read, move |r| { tx3.send(('x', j, r)).unwrap(); });
+            }
+            drop(tx);
+            ctx.device.poll(wgpu::Maintain::Wait);
+            // Drain channel (2 callbacks per frame)
+            for _ in 0..(n * 2) {
+                rx.recv().unwrap().2.unwrap();
+            }
+
+            // Collect results: tile_muls (Vec<f32>) + max_abs (f32) per frame
+            let mut results: Vec<(Vec<f32>, f32)> = Vec::with_capacity(n);
+            for (j, muls_stg) in tile_muls_staging.iter().enumerate() {
+                let muls_view = muls_stg.slice(..).get_mapped_range();
+                let muls: Vec<f32> = bytemuck::cast_slice::<u8, f32>(&muls_view[..tile_muls_bytes as usize])
+                    .to_vec();
+                drop(muls_view);
+                muls_stg.unmap();
+
+                let max_view = tw.max_abs_staging_bufs[j].slice(..).get_mapped_range();
+                let max_bits = u32::from_le_bytes(max_view[..4].try_into().unwrap());
+                drop(max_view);
+                tw.max_abs_staging_bufs[j].unmap();
+                let max_abs = f32::from_bits(max_bits);
+
+                results.push((muls, max_abs));
+            }
+            results
         } else {
             let tiles_x = padded_w / cfg.tile_size;
             let tiles_y = padded_h / cfg.tile_size;
@@ -3758,111 +3846,6 @@ impl EncoderPipeline {
         (muls, global_max_abs)
     }
 
-    /// Batch version of `compute_temporal_tile_muls`.
-    ///
-    /// Copies all Y planes in a single command encoder (one submit+poll), eliminating
-    /// per-frame CPU-GPU sync overhead. Returns one `(muls, global_max_abs)` per input plane.
-    fn compute_temporal_tile_muls_batch(
-        ctx: &GpuContext,
-        y_plane_bufs: &[&wgpu::Buffer],
-        padded_w: u32,
-        padded_h: u32,
-        tile_size: u32,
-        max_mul: f32,
-    ) -> Vec<(Vec<f32>, f32)> {
-        if y_plane_bufs.is_empty() {
-            return Vec::new();
-        }
-        let padded_pixels = (padded_w * padded_h) as usize;
-        let plane_size = (padded_pixels * std::mem::size_of::<f32>()) as u64;
-        let n = y_plane_bufs.len();
-
-        // Allocate one staging buffer per plane
-        let staging_bufs: Vec<wgpu::Buffer> = (0..n)
-            .map(|i| {
-                ctx.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some(&format!("tw_aq_staging_batch_{}", i)),
-                    size: plane_size,
-                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                })
-            })
-            .collect();
-
-        // Single command encoder — all copies batched, prevents overlap between submits
-        let mut cmd = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("tw_aq_readback_batch"),
-        });
-        for (y_buf, stg) in y_plane_bufs.iter().zip(staging_bufs.iter()) {
-            cmd.copy_buffer_to_buffer(y_buf, 0, stg, 0, plane_size);
-        }
-        ctx.queue.submit(Some(cmd.finish()));
-
-        // Map all staging buffers, then single poll
-        let (tx, rx) = std::sync::mpsc::channel();
-        for stg in &staging_bufs {
-            let tx_clone = tx.clone();
-            stg.slice(..).map_async(wgpu::MapMode::Read, move |result| {
-                tx_clone.send(result).unwrap();
-            });
-        }
-        drop(tx);
-        ctx.device.poll(wgpu::Maintain::Wait);
-        for _ in 0..n {
-            rx.recv().unwrap().unwrap();
-        }
-
-        let tiles_x = padded_w / tile_size;
-        let tiles_y = padded_h / tile_size;
-        let num_tiles = (tiles_x * tiles_y) as usize;
-        let ts = tile_size as usize;
-        let tile_pixel_count = (ts * ts) as f64;
-
-        let mut results: Vec<(Vec<f32>, f32)> = Vec::with_capacity(n);
-
-        for stg in &staging_bufs {
-            let data = stg.slice(..).get_mapped_range();
-            let coeffs: &[f32] = bytemuck::cast_slice(&data);
-
-            let mut tile_mean_abs = vec![0.0f64; num_tiles];
-            let mut global_max_abs = 0.0f32;
-            for ty in 0..tiles_y as usize {
-                for tx_idx in 0..tiles_x as usize {
-                    let tile_idx = ty * tiles_x as usize + tx_idx;
-                    let mut sum_abs = 0.0f64;
-                    for row in 0..ts {
-                        let y_pos = ty * ts + row;
-                        let x_base = tx_idx * ts;
-                        for col in 0..ts {
-                            let idx = y_pos * padded_w as usize + x_base + col;
-                            let abs_val = coeffs[idx].abs();
-                            sum_abs += abs_val as f64;
-                            if abs_val > global_max_abs {
-                                global_max_abs = abs_val;
-                            }
-                        }
-                    }
-                    tile_mean_abs[tile_idx] = sum_abs / tile_pixel_count;
-                }
-            }
-
-            drop(data);
-
-            let muls: Vec<f32> = tile_mean_abs
-                .iter()
-                .map(|&energy| Self::map_energy_to_mul(energy, max_mul))
-                .collect();
-
-            results.push((muls, global_max_abs));
-        }
-
-        // Unmap after all processing to avoid holding mapped regions
-        for stg in &staging_bufs {
-            stg.unmap();
-        }
-
-        results
-    }
 }
 
 #[cfg(test)]

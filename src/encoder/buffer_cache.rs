@@ -116,6 +116,16 @@ pub(super) struct CachedTemporalWaveletBuffers {
     pub(super) snapshot: Vec<wgpu::Buffer>,
     /// Per-frame raw input staging buffers.
     pub(super) per_frame_input: Vec<wgpu::Buffer>,
+    /// Per-tile energy multiplier output buffers (one per high frame, num_tiles × f32).
+    /// GPU-computed by tile_energy_reduce shader; used directly as quantize weight maps.
+    pub(super) tile_muls_bufs: Vec<wgpu::Buffer>,
+    /// Per-frame global-max-abs output buffers (1 × u32 each, atomicMax bitcast f32).
+    /// STORAGE | COPY_SRC so we can copy to staging for CPU readback.
+    pub(super) max_abs_bufs: Vec<wgpu::Buffer>,
+    /// Staging buffers for max_abs readback (MAP_READ | COPY_DST, 4 bytes each).
+    pub(super) max_abs_staging_bufs: Vec<wgpu::Buffer>,
+    /// Shared uniform params buffer for tile_energy_reduce dispatches (32 bytes).
+    pub(super) ter_params_buf: wgpu::Buffer,
 }
 
 impl CachedTemporalWaveletBuffers {
@@ -167,6 +177,59 @@ impl CachedTemporalWaveletBuffers {
             })
             .collect();
 
+        // Tile energy reduce buffers.
+        // The number of high frames per GOP = group_size - 1 (all except the lowpass frame).
+        // tile_size is always 256 at this codebase's defaults; we use the safe upper bound
+        // ceil(padded_w/256) * ceil(padded_h/256) for the tile count.
+        let tile_size: u32 = 256;
+        let tiles_x = padded_w.div_ceil(tile_size);
+        let tiles_y = padded_h.div_ceil(tile_size);
+        let num_tiles = (tiles_x * tiles_y) as usize;
+        let tile_muls_size = (num_tiles * std::mem::size_of::<f32>()) as u64;
+        let num_high_frames = group_size.saturating_sub(1).max(1);
+
+        let tile_muls_bufs: Vec<wgpu::Buffer> = (0..num_high_frames)
+            .map(|j| {
+                ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(&format!("tw_tile_muls_{}", j)),
+                    size: tile_muls_size.max(4),
+                    // STORAGE for shader write, COPY_SRC so we can read back for diagnostics
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: false,
+                })
+            })
+            .collect();
+
+        let max_abs_bufs: Vec<wgpu::Buffer> = (0..num_high_frames)
+            .map(|j| {
+                ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(&format!("tw_max_abs_{}", j)),
+                    size: 4,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: false,
+                })
+            })
+            .collect();
+
+        let max_abs_staging_bufs: Vec<wgpu::Buffer> = (0..num_high_frames)
+            .map(|j| {
+                ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(&format!("tw_max_abs_stg_{}", j)),
+                    size: 4,
+                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                })
+            })
+            .collect();
+
+        // Shared uniform params buffer for tile_energy_reduce (32 bytes, constant across frames)
+        let ter_params_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("tw_ter_params"),
+            size: 32,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         Self {
             padded_w,
             padded_h,
@@ -175,6 +238,10 @@ impl CachedTemporalWaveletBuffers {
             frame_bufs,
             snapshot,
             per_frame_input,
+            tile_muls_bufs,
+            max_abs_bufs,
+            max_abs_staging_bufs,
+            ter_params_buf,
         }
     }
 

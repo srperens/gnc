@@ -52,6 +52,8 @@ pub struct EncoderPipeline {
     pub(super) temporal_53: Temporal53Gpu,
     pad_pipeline: wgpu::ComputePipeline,
     pad_bgl: wgpu::BindGroupLayout,
+    tile_energy_reduce_pipeline: wgpu::ComputePipeline,
+    tile_energy_reduce_bgl: wgpu::BindGroupLayout,
     pub(super) cached: Option<CachedEncodeBuffers>,
     pub(super) tw_cached: Option<CachedTemporalWaveletBuffers>,
 }
@@ -120,6 +122,84 @@ impl EncoderPipeline {
                 cache: None,
             });
 
+        // GPU tile energy reduction pipeline (for temporal AQ — replaces CPU readback)
+        let ter_shader = ctx
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("tile_energy_reduce"),
+                source: wgpu::ShaderSource::Wgsl(
+                    include_str!("../shaders/tile_energy_reduce.wgsl").into(),
+                ),
+            });
+        let tile_energy_reduce_bgl =
+            ctx.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("ter_bgl"),
+                    entries: &[
+                        // binding 0: uniform params
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        // binding 1: y_plane (read-only storage)
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        // binding 2: tile_muls (read_write)
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 2,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        // binding 3: global_max_bits (read_write, atomic u32)
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 3,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                    ],
+                });
+        let ter_pl = ctx
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("ter_pl"),
+                bind_group_layouts: &[&tile_energy_reduce_bgl],
+                push_constant_ranges: &[],
+            });
+        let tile_energy_reduce_pipeline =
+            ctx.device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("tile_energy_reduce_pipeline"),
+                    layout: Some(&ter_pl),
+                    module: &ter_shader,
+                    entry_point: Some("main"),
+                    compilation_options: Default::default(),
+                    cache: None,
+                });
+
         Self {
             color: ColorConverter::new(ctx),
             transform: WaveletTransform::new(ctx),
@@ -141,6 +221,8 @@ impl EncoderPipeline {
             temporal_53: Temporal53Gpu::new(ctx),
             pad_pipeline,
             pad_bgl,
+            tile_energy_reduce_pipeline,
+            tile_energy_reduce_bgl,
             cached: None,
             tw_cached: None,
         }
@@ -228,6 +310,85 @@ impl EncoderPipeline {
         pass.set_pipeline(&self.pad_pipeline);
         pass.set_bind_group(0, &pad_bg, &[]);
         pass.dispatch_workgroups(workgroups, 1, 1);
+    }
+
+    /// Dispatch per-tile energy reduction for temporal highpass adaptive quantization.
+    ///
+    /// Records a compute dispatch into `cmd` (no submit — caller batches with other work).
+    /// One workgroup per tile; each workgroup computes mean_abs and maps it to a mul via
+    /// log-space interpolation matching `EncoderPipeline::map_energy_to_mul`.
+    ///
+    /// Outputs:
+    /// - `tile_muls_buf`: one f32 per tile, multiplier in [1.0, max_mul].
+    /// - `max_abs_buf`: one u32, the bitcast of the global max absolute value
+    ///   (atomicMax over all pixels).  Must be pre-cleared to 0 before this call.
+    ///
+    /// The `params_buf` is a pre-allocated uniform buffer (caller owns); this method
+    /// writes params into it via `ctx.queue.write_buffer` before recording the pass.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn dispatch_tile_energy_reduce(
+        &self,
+        ctx: &GpuContext,
+        cmd: &mut wgpu::CommandEncoder,
+        y_plane_buf: &wgpu::Buffer,
+        tile_muls_buf: &wgpu::Buffer,
+        max_abs_buf: &wgpu::Buffer,
+        ter_params_buf: &wgpu::Buffer,
+        padded_w: u32,
+        padded_h: u32,
+        tile_size: u32,
+        max_mul: f32,
+    ) {
+        // TileEnergyReduceParams layout (matches shader struct — 8 × 4 = 32 bytes):
+        //   padded_w, padded_h, tile_size, _pad,  low_thresh, high_thresh, max_mul, _pad
+        // Match EncoderPipeline::map_energy_to_mul thresholds exactly.
+        let low_thresh: f32 = 0.5;
+        let high_thresh: f32 = 10.0;
+        let params_data: [u32; 8] = [
+            padded_w,
+            padded_h,
+            tile_size,
+            0, // _pad (between tile_size and low_thresh)
+            low_thresh.to_bits(),
+            high_thresh.to_bits(),
+            max_mul.to_bits(),
+            0, // _pad
+        ];
+        ctx.queue
+            .write_buffer(ter_params_buf, 0, bytemuck::cast_slice(&params_data));
+
+        let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ter_bg"),
+            layout: &self.tile_energy_reduce_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: ter_params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: y_plane_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: tile_muls_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: max_abs_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        let tiles_x = padded_w / tile_size;
+        let tiles_y = padded_h / tile_size;
+        let mut pass = cmd.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("tile_energy_reduce_pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.tile_energy_reduce_pipeline);
+        pass.set_bind_group(0, &bg, &[]);
+        pass.dispatch_workgroups(tiles_x, tiles_y, 1);
     }
 
     /// Encode an RGB frame.

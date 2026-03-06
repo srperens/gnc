@@ -713,7 +713,7 @@ impl EncoderPipeline {
                         let mut lvl_frames: Vec<CompressedFrame> = Vec::new();
                         for idx in 0..count {
                             let buf_idx = start + idx;
-                            let tile_muls = if config.adaptive_temporal_mul {
+                            let (tile_muls, max_abs) = if config.adaptive_temporal_mul {
                                 Self::compute_temporal_tile_muls(
                                     ctx,
                                     &tw_frame_bufs[buf_idx][0],
@@ -726,19 +726,26 @@ impl EncoderPipeline {
                                 // Fixed mul: uniform weight for all tiles
                                 let tiles_x = padded_w / cfg.tile_size;
                                 let tiles_y = padded_h / cfg.tile_size;
-                                vec![max_mul; (tiles_x * tiles_y) as usize]
+                                (vec![max_mul; (tiles_x * tiles_y) as usize], f32::MAX)
                             };
                             if std::env::var("GNC_TW_DIAG").is_ok() {
                                 let mut sorted = tile_muls.clone();
                                 sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
                                 let n = sorted.len();
                                 let pct = |p: usize| sorted[(p * n / 100).min(n - 1)];
+                                let all_zero = max_abs < high_cfg.dead_zone * high_cfg.quantization_step;
                                 eprintln!(
-                                    "  TW L{} H{}: {} tiles  mul p10={:.3} p50={:.3} p90={:.3}  eff_qstep=[{:.2}..{:.2}]",
+                                    "  TW L{} H{}: {} tiles  mul p10={:.3} p50={:.3} p90={:.3}  eff_qstep=[{:.2}..{:.2}]  skip={}",
                                     lvl, idx, n, pct(10), pct(50), pct(90),
                                     high_cfg.quantization_step * sorted[0],
                                     high_cfg.quantization_step * sorted[n - 1],
+                                    all_zero,
                                 );
+                            }
+                            if max_abs < high_cfg.dead_zone * high_cfg.quantization_step {
+                                // Frame is all-zero after quantization — push synthetic zero frame
+                                lvl_frames.push(Self::make_zero_compressed_frame(&high_cfg, &info));
+                                continue;
                             }
                             let cf = self.encode_from_gpu_wavelet_planes_weighted(
                                 ctx,
@@ -915,44 +922,52 @@ impl EncoderPipeline {
                         padded_h,
                         padded_pixels,
                     );
-                    let d0_muls = if config.adaptive_temporal_mul {
+                    let (d0_muls, d0_max_abs) = if config.adaptive_temporal_mul {
                         Self::compute_temporal_tile_muls(
                             ctx, &tw_out_bufs[2][0], padded_w, padded_h, cfg.tile_size, max_mul,
                         )
                     } else {
                         let tiles_x = padded_w / cfg.tile_size;
                         let tiles_y = padded_h / cfg.tile_size;
-                        vec![max_mul; (tiles_x * tiles_y) as usize]
+                        (vec![max_mul; (tiles_x * tiles_y) as usize], f32::MAX)
                     };
-                    let d0_cf = self.encode_from_gpu_wavelet_planes_weighted(
-                        ctx,
-                        [&tw_out_bufs[2][0], &tw_out_bufs[2][1], &tw_out_bufs[2][2]],
-                        &high_cfg,
-                        &info,
-                        padded_w,
-                        padded_h,
-                        padded_pixels,
-                        Some(&d0_muls),
-                    );
-                    let d1_muls = if config.adaptive_temporal_mul {
+                    let d0_cf = if d0_max_abs < high_cfg.dead_zone * high_cfg.quantization_step {
+                        Self::make_zero_compressed_frame(&high_cfg, &info)
+                    } else {
+                        self.encode_from_gpu_wavelet_planes_weighted(
+                            ctx,
+                            [&tw_out_bufs[2][0], &tw_out_bufs[2][1], &tw_out_bufs[2][2]],
+                            &high_cfg,
+                            &info,
+                            padded_w,
+                            padded_h,
+                            padded_pixels,
+                            Some(&d0_muls),
+                        )
+                    };
+                    let (d1_muls, d1_max_abs) = if config.adaptive_temporal_mul {
                         Self::compute_temporal_tile_muls(
                             ctx, &tw_out_bufs[3][0], padded_w, padded_h, cfg.tile_size, max_mul,
                         )
                     } else {
                         let tiles_x = padded_w / cfg.tile_size;
                         let tiles_y = padded_h / cfg.tile_size;
-                        vec![max_mul; (tiles_x * tiles_y) as usize]
+                        (vec![max_mul; (tiles_x * tiles_y) as usize], f32::MAX)
                     };
-                    let d1_cf = self.encode_from_gpu_wavelet_planes_weighted(
-                        ctx,
-                        [&tw_out_bufs[3][0], &tw_out_bufs[3][1], &tw_out_bufs[3][2]],
-                        &high_cfg,
-                        &info,
-                        padded_w,
-                        padded_h,
-                        padded_pixels,
-                        Some(&d1_muls),
-                    );
+                    let d1_cf = if d1_max_abs < high_cfg.dead_zone * high_cfg.quantization_step {
+                        Self::make_zero_compressed_frame(&high_cfg, &info)
+                    } else {
+                        self.encode_from_gpu_wavelet_planes_weighted(
+                            ctx,
+                            [&tw_out_bufs[3][0], &tw_out_bufs[3][1], &tw_out_bufs[3][2]],
+                            &high_cfg,
+                            &info,
+                            padded_w,
+                            padded_h,
+                            padded_pixels,
+                            Some(&d1_muls),
+                        )
+                    };
 
                     groups.push(TemporalGroup {
                         low_frame: low_s0,
@@ -1028,7 +1043,7 @@ impl EncoderPipeline {
             ctx.queue.write_buffer(input_buf, 0, bytemuck::cast_slice(frame_data));
         }
 
-                // Spatial wavelet per frame — single command encoder to prevent
+        // Spatial wavelet per frame — single command encoder to prevent
         // intermediate buffer races (separate submits can overlap on GPU)
         {
             let bufs = self.cached.as_ref().unwrap();
@@ -1151,7 +1166,7 @@ impl EncoderPipeline {
             let mut lvl_frames: Vec<CompressedFrame> = Vec::new();
             for idx in 0..count {
                 let buf_idx = start + idx;
-                let tile_muls = if config.adaptive_temporal_mul {
+                let (tile_muls, max_abs) = if config.adaptive_temporal_mul {
                     Self::compute_temporal_tile_muls(
                         ctx,
                         &tw.frame_bufs[buf_idx][0],
@@ -1164,19 +1179,26 @@ impl EncoderPipeline {
                     // Fixed mul: uniform weight for all tiles
                     let tiles_x = padded_w / cfg.tile_size;
                     let tiles_y = padded_h / cfg.tile_size;
-                    vec![max_mul; (tiles_x * tiles_y) as usize]
+                    (vec![max_mul; (tiles_x * tiles_y) as usize], f32::MAX)
                 };
                 if std::env::var("GNC_TW_DIAG").is_ok() {
                     let mut sorted = tile_muls.clone();
                     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
                     let n = sorted.len();
                     let pct = |p: usize| sorted[(p * n / 100).min(n - 1)];
+                    let all_zero = max_abs < high_cfg.dead_zone * high_cfg.quantization_step;
                     eprintln!(
-                        "  TW L{} H{}: {} tiles  mul p10={:.3} p50={:.3} p90={:.3}  eff_qstep=[{:.2}..{:.2}]",
+                        "  TW L{} H{}: {} tiles  mul p10={:.3} p50={:.3} p90={:.3}  eff_qstep=[{:.2}..{:.2}]  skip={}",
                         lvl, idx, n, pct(10), pct(50), pct(90),
                         high_cfg.quantization_step * sorted[0],
                         high_cfg.quantization_step * sorted[n - 1],
+                        all_zero,
                     );
+                }
+                if max_abs < high_cfg.dead_zone * high_cfg.quantization_step {
+                    // Frame is all-zero after quantization — push synthetic zero frame
+                    lvl_frames.push(Self::make_zero_compressed_frame(&high_cfg, &info));
+                    continue;
                 }
                 let cf = self.encode_from_gpu_wavelet_planes_weighted(
                     ctx,
@@ -3065,7 +3087,7 @@ impl EncoderPipeline {
     /// When `config.cfl_enabled` is true, CfL prediction is applied to chroma planes:
     /// Y is quantized+dequantized to produce a reconstructed reference, then chroma planes
     /// are predicted from it. The residual (chroma - alpha * luma) is quantized instead.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)] // GPU+quant context genuinely needs all 9 params
     fn encode_from_gpu_wavelet_planes_weighted(
         &mut self,
         ctx: &GpuContext,
@@ -3079,8 +3101,7 @@ impl EncoderPipeline {
     ) -> CompressedFrame {
         use crate::CflAlphas;
         use wgpu::util::DeviceExt;
-        let tw_profile = std::env::var("GNC_TW_PROFILE").is_ok();
-        let _prof_t0 = std::time::Instant::now();
+
         let plane_size = (padded_pixels * std::mem::size_of::<f32>()) as u64;
         let weights_luma = config.subband_weights.pack_weights();
         let weights_chroma = config.subband_weights.pack_weights_chroma();
@@ -3168,8 +3189,6 @@ impl EncoderPipeline {
         } else {
             None
         };
-
-        let _prof_t_setup = std::time::Instant::now();
 
         // CfL alpha staging buffers (for readback)
         let alpha_count = (tiles_x * tiles_y * nsb) as usize;
@@ -3271,91 +3290,6 @@ impl EncoderPipeline {
             }
         }
 
-        let _prof_t_quant_recorded = std::time::Instant::now();
-
-        // --- Profiling path (GNC_TW_PROFILE): separate submits to isolate GPU stages ---
-        if tw_profile {
-            ctx.queue.submit(Some(cmd.finish()));
-            ctx.device.poll(wgpu::Maintain::Wait);
-            let _prof_t_quant_gpu = std::time::Instant::now();
-
-            let mut cmd2 = ctx
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("tw_prof_rice"),
-                });
-            self.gpu_rice_encoder.dispatch_3planes_to_cmd(
-                ctx, &mut cmd2, quant_dests, info, config.wavelet_levels,
-            );
-            let _prof_t_rice_recorded = std::time::Instant::now();
-            ctx.queue.submit(Some(cmd2.finish()));
-            ctx.device.poll(wgpu::Maintain::Wait);
-            let _prof_t_rice_gpu = std::time::Instant::now();
-
-            let rice_tiles = self.gpu_rice_encoder.finish_3planes_readback(
-                ctx, info, config.wavelet_levels,
-            );
-            let _prof_t_rice_readback = std::time::Instant::now();
-
-            let cfl_alphas = if config.cfl_enabled {
-                let mut cfl_alphas_all: Vec<i16> = Vec::new();
-                let (tx, rx) = std::sync::mpsc::channel();
-                for stg in &alpha_staging {
-                    let tx = tx.clone();
-                    stg.slice(..).map_async(wgpu::MapMode::Read, move |result| {
-                        tx.send(result).unwrap();
-                    });
-                }
-                drop(tx);
-                ctx.device.poll(wgpu::Maintain::Wait);
-                for _ in 0..2 {
-                    rx.recv().unwrap().unwrap();
-                }
-                for stg in &alpha_staging {
-                    let view = stg.slice(..).get_mapped_range();
-                    let raw_alphas: &[i32] = bytemuck::cast_slice(&view);
-                    let q_alphas: Vec<i16> = raw_alphas.iter().map(|&a| a as i16).collect();
-                    cfl_alphas_all.extend_from_slice(&q_alphas);
-                    drop(view);
-                    stg.unmap();
-                }
-                Some(CflAlphas {
-                    alphas: cfl_alphas_all,
-                    num_subbands: nsb,
-                })
-            } else {
-                None
-            };
-            let _prof_t_cfl_readback = std::time::Instant::now();
-
-            eprintln!(
-                "  [TW_PROFILE] setup={:.2}ms quant_record={:.2}ms quant_gpu={:.2}ms rice_record={:.2}ms rice_gpu={:.2}ms rice_readback={:.2}ms cfl_readback={:.2}ms TOTAL={:.2}ms",
-                (_prof_t_setup - _prof_t0).as_secs_f64() * 1000.0,
-                (_prof_t_quant_recorded - _prof_t_setup).as_secs_f64() * 1000.0,
-                (_prof_t_quant_gpu - _prof_t_quant_recorded).as_secs_f64() * 1000.0,
-                (_prof_t_rice_recorded - _prof_t_quant_gpu).as_secs_f64() * 1000.0,
-                (_prof_t_rice_gpu - _prof_t_rice_recorded).as_secs_f64() * 1000.0,
-                (_prof_t_rice_readback - _prof_t_rice_gpu).as_secs_f64() * 1000.0,
-                (_prof_t_cfl_readback - _prof_t_rice_readback).as_secs_f64() * 1000.0,
-                (_prof_t_cfl_readback - _prof_t0).as_secs_f64() * 1000.0,
-            );
-
-            return CompressedFrame {
-                info: *info,
-                config: config.clone(),
-                entropy: EntropyData::Rice(rice_tiles),
-                cfl_alphas,
-                weight_map: wm_data,
-                frame_type: FrameType::Intra,
-                motion_field: None,
-                intra_modes: None,
-                residual_stats: None,
-                residual_stats_co: None,
-                residual_stats_cg: None,
-            };
-        }
-
-        // --- Normal (non-profiling) path: single submit ---
         self.gpu_rice_encoder.dispatch_3planes_to_cmd(
             ctx,
             &mut cmd,
@@ -3448,15 +3382,55 @@ impl EncoderPipeline {
         max_mul + t * (1.0 - max_mul)
     }
 
+    /// Build an all-zero `CompressedFrame` for a highpass frame whose coefficients
+    /// all quantize to zero. Avoids dispatching any GPU work.
+    fn make_zero_compressed_frame(config: &CodecConfig, info: &FrameInfo) -> CompressedFrame {
+        let num_tiles = (info.tiles_x() * info.tiles_y()) as usize;
+        let num_groups = (config.wavelet_levels * 2).max(1) as usize;
+        let all_skip_mask = if num_groups >= 8 {
+            0xFFu8
+        } else {
+            (1u8 << num_groups) - 1
+        };
+        let rice_tiles: Vec<crate::encoder::rice::RiceTile> = (0..num_tiles * 3)
+            .map(|_| crate::encoder::rice::RiceTile {
+                num_coefficients: info.tile_size * info.tile_size,
+                tile_size: info.tile_size,
+                num_levels: config.wavelet_levels,
+                num_groups: num_groups as u32,
+                k_values: vec![0u8; num_groups],
+                k_zrl_values: vec![0u8; num_groups],
+                skip_bitmap: all_skip_mask,
+                stream_lengths: vec![0u32; crate::encoder::rice::RICE_STREAMS_PER_TILE],
+                stream_data: Vec::new(),
+            })
+            .collect();
+        CompressedFrame {
+            info: *info,
+            config: config.clone(),
+            entropy: EntropyData::Rice(rice_tiles),
+            cfl_alphas: None,
+            weight_map: None,
+            frame_type: FrameType::Intra,
+            motion_field: None,
+            intra_modes: None,
+            residual_stats: None,
+            residual_stats_co: None,
+            residual_stats_cg: None,
+        }
+    }
+
     /// Compute per-tile adaptive qstep multipliers for temporal highpass.
     ///
     /// Reads back the Y plane from GPU, computes per-tile mean_abs of temporal
     /// highpass coefficients. Maps each tile's energy to a qstep multiplier via
     /// `map_energy_to_mul`: low energy (static) → high mul (coarse quant),
-    /// high energy (motion) → low mul (preserve detail). Range: [0.8, max_mul].
+    /// high energy (motion) → low mul (preserve detail).
     ///
-    /// These per-tile muls replace both the old global highpass mul and the
-    /// relative tile weighting — a single value per tile drives quantization.
+    /// Returns `(muls, global_max_abs)`:
+    /// - `muls`: per-tile multipliers in `[1.0, max_mul]`.
+    /// - `global_max_abs`: maximum absolute Y coefficient. Compare against
+    ///   `dead_zone * qstep` to detect all-zero frames without a second readback.
     fn compute_temporal_tile_muls(
         ctx: &GpuContext,
         y_plane_buf: &wgpu::Buffer,
@@ -3464,7 +3438,7 @@ impl EncoderPipeline {
         padded_h: u32,
         tile_size: u32,
         max_mul: f32,
-    ) -> Vec<f32> {
+    ) -> (Vec<f32>, f32) {
         let padded_pixels = (padded_w * padded_h) as usize;
         let plane_size = (padded_pixels * std::mem::size_of::<f32>()) as u64;
 
@@ -3499,8 +3473,10 @@ impl EncoderPipeline {
         let ts = tile_size as usize;
         let tile_pixel_count = (ts * ts) as f64;
 
-        // Compute per-tile mean_abs
+        // Compute per-tile mean_abs and global max_abs in a single pass.
+        // max_abs is used to detect fully-quantized-to-zero frames without a second readback.
         let mut tile_mean_abs = vec![0.0f64; num_tiles];
+        let mut global_max_abs = 0.0f32;
         for ty in 0..tiles_y as usize {
             for tx_idx in 0..tiles_x as usize {
                 let tile_idx = ty * tiles_x as usize + tx_idx;
@@ -3510,7 +3486,11 @@ impl EncoderPipeline {
                     let x_base = tx_idx * ts;
                     for col in 0..ts {
                         let idx = y_pos * padded_w as usize + x_base + col;
-                        sum_abs += coeffs[idx].abs() as f64;
+                        let abs_val = coeffs[idx].abs();
+                        sum_abs += abs_val as f64;
+                        if abs_val > global_max_abs {
+                            global_max_abs = abs_val;
+                        }
                     }
                 }
                 tile_mean_abs[tile_idx] = sum_abs / tile_pixel_count;
@@ -3535,8 +3515,9 @@ impl EncoderPipeline {
             sorted_m.sort_by(|a, b| a.partial_cmp(b).unwrap());
             let pct_m = |p: usize| sorted_m[(p * n / 100).min(n - 1)];
             eprintln!(
-                "    tile energy: min={:.4} p25={:.4} p50={:.4} p75={:.4} max={:.4}",
+                "    tile energy: min={:.4} p25={:.4} p50={:.4} p75={:.4} max={:.4}  max_abs_y={:.4}",
                 sorted_e[0], pct_e(25), pct_e(50), pct_e(75), sorted_e[n - 1],
+                global_max_abs,
             );
             eprintln!(
                 "    tile mul:    min={:.3} p25={:.3} p50={:.3} p75={:.3} max={:.3}  (max_mul={:.2})",
@@ -3544,7 +3525,7 @@ impl EncoderPipeline {
             );
         }
 
-        muls
+        (muls, global_max_abs)
     }
 }
 

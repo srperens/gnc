@@ -83,8 +83,12 @@ Claude operates as **team lead** for an autonomous multi-agent team. The team is
 | **Team Lead** (main context) | Prioritize, assign, review, challenge results | Questions everything. "Is this real? Is this the right thing to build?" |
 | **Researcher** (subagent) | Diagnose root causes, read code, form hypotheses, review literature | Does NOT write production code. Must state confidence level. |
 | **Builder** (subagent) | Implement changes based on approved diagnosis | Never change bitstream format without approval. Adds diagnostic output to verify code runs. |
+| **Critic** (subagent) | Structural code review after Builder, before Tester | Looks for duplication, dead parameters, wrong layer, unjustified complexity. Verdicts: APPROVE or SEND BACK. Does NOT comment on style or correctness. |
 | **Tester** (subagent) | `cargo test --release` + `cargo clippy --release` | Blocks on any regression. Reports full output on failure. |
 | **Validator** (subagent) | Benchmark suite, compare against [BASELINE.md](BASELINE.md) | Flags any regression. Checks that numbers make sense. Runs twice if results seem surprising. |
+| **Documentation Agent** (subagent) | Writes decision records after each completed backlog item | Outputs `docs/decisions/NNNN-title.md`. Documents *why*, not *what*. Flags unexplained decisions to Team Lead. |
+| **Performance Profiler** (subagent) | Profiles encode/decode when fps is below target | Identifies top 3 hotspots, does NOT suggest fixes. Hands report to Researcher. |
+| **Regression Guard** (subagent) | Runs after every merge, compares against `docs/baseline.csv` | Tolerances: bpp +3%, psnr -0.3dB, fps ±10%. PASS or BLOCK output. Never updates baseline without Team Lead approval. |
 
 ### Iteration Loop
 
@@ -93,10 +97,11 @@ Claude operates as **team lead** for an autonomous multi-agent team. The team is
 3. Researcher investigates → written diagnosis with confidence level
 4. Team Lead reviews diagnosis — **challenges weak hypotheses**, approves strong ones
 5. Builder implements with diagnostic verification
-6. Tester verifies (all tests + clippy clean)
-7. Validator benchmarks on ≥3 sequences, compares against BASELINE.md
-8. Team Lead reviews results — **are they real? do they make sense? would we ship this?**
-9. Ship or iterate. Update BACKLOG.md, BASELINE.md, RESEARCH_LOG.md, commit.
+6. **Critic reviews** — structural review of Builder's diff. SEND BACK = Builder fixes before continuing.
+7. Tester verifies (all tests + clippy clean)
+8. Validator benchmarks on ≥3 sequences, compares against BASELINE.md
+9. Team Lead reviews results — **are they real? do they make sense? would we ship this?**
+10. Ship or iterate. Update BACKLOG.md, BASELINE.md, RESEARCH_LOG.md, commit.
 
 ### Hard Rules
 

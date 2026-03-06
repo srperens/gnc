@@ -619,6 +619,34 @@ fn select_temporal_mode(explicit: &str, fps: f64, quality: u32) -> (TemporalTran
     }
 }
 
+/// Compute mean absolute Y-channel difference between two RGB f32 frames (values in [0,255]).
+/// Uses 8× subsampling for speed. Returns a value in [0, 1] (normalized by 255).
+/// Scene cuts typically score > 0.15; in-scene motion typically < 0.05.
+fn scene_cut_score(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    let n = a.len() / 3;
+    if n == 0 {
+        return 0.0;
+    }
+    const STEP: usize = 8;
+    let mut sum = 0.0f32;
+    let mut count = 0usize;
+    let mut i = 0;
+    while i < n {
+        let y_a = 0.299 * a[i * 3] + 0.587 * a[i * 3 + 1] + 0.114 * a[i * 3 + 2];
+        let y_b = 0.299 * b[i * 3] + 0.587 * b[i * 3 + 1] + 0.114 * b[i * 3 + 2];
+        sum += (y_a - y_b).abs();
+        count += 1;
+        i += STEP;
+    }
+    sum / (count as f32 * 255.0)
+}
+
+/// Scene cut threshold for `scene_cut_score` (normalized to [0,1]).
+/// Hard cuts score > 0.40 (ffprobe equivalent). 0.15 catches most hard cuts
+/// without false positives from fast motion.
+const SCENE_CUT_THRESH: f32 = 0.15;
+
 fn csv_with_suffix(path: &str, suffix: &str) -> String {
     if let Some((base, ext)) = path.rsplit_once('.') {
         format!("{}_{}.{}", base, suffix, ext)
@@ -1133,7 +1161,9 @@ fn main() {
                 drop(warmup_frames);
 
                 let mut groups: Vec<gnc::TemporalGroup> = Vec::new();
+                let mut group_gop_indices: Vec<usize> = Vec::new();
                 let mut tail_iframes: Vec<CompressedFrame> = Vec::new();
+                let mut tail_iframe_pts: Vec<u32> = Vec::new();
                 let mut total_bytes: usize = 0;
                 let num_gops = num_frames / gop_size;
                 let tail_start = num_gops * gop_size;
@@ -1201,6 +1231,42 @@ fn main() {
                             gop_idx, gop_frames.len(), gop_size
                         );
                         break;
+                    }
+
+                    // Scene cut detection: if any adjacent pair in this GOP has a large
+                    // luma change, the temporal transform would blend content from two
+                    // incompatible scenes. Encode all frames as I-frames instead and let
+                    // the next GOP start fresh.
+                    if matches!(temporal_mode, TemporalTransform::Haar) {
+                        let cut_pos = gop_frames.windows(2).enumerate().find_map(|(i, pair)| {
+                            if scene_cut_score(&pair[0], &pair[1]) > SCENE_CUT_THRESH {
+                                Some(i + 1)
+                            } else {
+                                None
+                            }
+                        });
+                        if let Some(cut_at) = cut_pos {
+                            let mut i_cfg = config_tw.clone();
+                            i_cfg.temporal_transform = gnc::TemporalTransform::None;
+                            i_cfg.keyframe_interval = 1;
+                            i_cfg.cfl_enabled = false;
+                            let t_enc_start = std::time::Instant::now();
+                            for (fi, frame) in gop_frames.iter().enumerate() {
+                                let pts = (base + fi) as u32;
+                                let cf = encoder.encode(&ctx, frame, w, h, &i_cfg);
+                                total_bytes += cf.byte_size();
+                                tail_iframes.push(cf);
+                                tail_iframe_pts.push(pts);
+                            }
+                            total_enc_ms += t_enc_start.elapsed().as_secs_f64() * 1000.0;
+                            // Clear stale lookahead so next GOP loads fresh from y4m.
+                            lookahead_frames = None;
+                            eprintln!(
+                                "  [scene cut] GOP {:3}: cut at frame {} (pos {}/{}), {} frames → I-frames",
+                                gop_idx, base + cut_at, cut_at, gop_size, gop_size
+                            );
+                            continue;
+                        }
                     }
 
                     // Pre-load next GOP for async upload (Haar mode only).
@@ -1298,7 +1364,9 @@ fn main() {
                             let single_seq = gnc::TemporalEncodedSequence {
                                 mode: temporal_mode,
                                 groups: vec![group.clone()],
+                                group_gop_indices: vec![0],
                                 tail_iframes: vec![],
+                                tail_iframe_pts: vec![],
                                 frame_count: gop_size,
                                 gop_size,
                             };
@@ -1332,6 +1400,7 @@ fn main() {
                     }
 
                     groups.push(group);
+                    group_gop_indices.push(gop_idx);
                     // gop_frames dropped here — memory freed
                 }
 
@@ -1358,6 +1427,7 @@ fn main() {
                     let cf = encoder.encode(&ctx, &rgb, w, h, &tail_cfg);
                     total_enc_ms += t_enc_start.elapsed().as_secs_f64() * 1000.0;
                     total_bytes += cf.byte_size();
+                    tail_iframe_pts.push(i as u32);
                     tail_iframes.push(cf);
                 }
 
@@ -1397,7 +1467,9 @@ fn main() {
                 let encoded_tw = gnc::TemporalEncodedSequence {
                     mode: temporal_mode,
                     groups,
+                    group_gop_indices,
                     tail_iframes,
+                    tail_iframe_pts,
                     frame_count: num_frames,
                     gop_size,
                 };
@@ -2968,7 +3040,9 @@ fn main() {
                             &gnc::TemporalEncodedSequence {
                                 mode: temporal_mode,
                                 groups: vec![group.clone()],
+                                group_gop_indices: vec![0],
                                 tail_iframes: vec![],
+                                tail_iframe_pts: vec![],
                                 frame_count: gop_size,
                                 gop_size,
                             },

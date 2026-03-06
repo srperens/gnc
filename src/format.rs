@@ -1274,8 +1274,20 @@ pub fn serialize_temporal_sequence(
     // GOP g covers frames [g*gop_size .. (g+1)*gop_size).
     let gop_size = seq.gop_size;
 
-    for (gop_idx, group) in seq.groups.iter().enumerate() {
-        let gop_base_pts = (gop_idx * gop_size) as u32;
+    // Use group_gop_indices to map each group to its actual GOP index.
+    // This handles scene cuts: some GOP indices may be skipped (their frames are tail_iframes).
+    let fallback_gop_indices: Vec<usize>;
+    let group_gop_indices: &[usize] = if seq.group_gop_indices.len() == seq.groups.len() {
+        &seq.group_gop_indices
+    } else {
+        // Backwards-compat: no scene-cut support, groups[g] → GOP g
+        fallback_gop_indices = (0..seq.groups.len()).collect();
+        &fallback_gop_indices
+    };
+
+    for (g, group) in seq.groups.iter().enumerate() {
+        let actual_gop_idx = group_gop_indices[g];
+        let gop_base_pts = (actual_gop_idx * gop_size) as u32;
         let mut frame_pos_in_gop: u16 = 0;
 
         // Lowpass frame (seekable keyframe)
@@ -1286,7 +1298,7 @@ pub fn serialize_temporal_sequence(
             size: 0,   // filled in later
             frame_role: 0,
             temporal_level: 0,
-            gop_index: gop_idx as u16,
+            gop_index: actual_gop_idx as u16,
             frame_index_in_gop: frame_pos_in_gop,
             pts: gop_base_pts,
         });
@@ -1308,7 +1320,7 @@ pub fn serialize_temporal_sequence(
                     size: 0,
                     frame_role: 1,
                     temporal_level,
-                    gop_index: gop_idx as u16,
+                    gop_index: actual_gop_idx as u16,
                     frame_index_in_gop: frame_pos_in_gop,
                     pts: gop_base_pts + frame_pos_in_gop as u32,
                 });
@@ -1318,9 +1330,20 @@ pub fn serialize_temporal_sequence(
         }
     }
 
-    // Tail I-frames
-    let tail_base_pts = (seq.groups.len() * gop_size) as u32;
+    // Tail I-frames (includes scene-cut I-frames with arbitrary PTS).
+    // Use tail_iframe_pts if provided; otherwise fall back to sequential PTS after last group.
+    let last_group_gop = group_gop_indices.last().copied().unwrap_or(0);
+    let tail_base_pts_fallback = if seq.groups.is_empty() {
+        0u32
+    } else {
+        ((last_group_gop + 1) * gop_size) as u32
+    };
     for (ti, tail_frame) in seq.tail_iframes.iter().enumerate() {
+        let pts = if ti < seq.tail_iframe_pts.len() {
+            seq.tail_iframe_pts[ti]
+        } else {
+            tail_base_pts_fallback + ti as u32
+        };
         let blob = serialize_compressed(tail_frame);
         frame_blobs.push(blob);
         index_entries.push(TemporalFrameIndexEntry {
@@ -1328,9 +1351,9 @@ pub fn serialize_temporal_sequence(
             size: 0,
             frame_role: 2,
             temporal_level: 0,
-            gop_index: 0, // not part of any GOP
-            frame_index_in_gop: 0,
-            pts: tail_base_pts + ti as u32,
+            gop_index: (pts / gop_size as u32) as u16,
+            frame_index_in_gop: (pts % gop_size as u32) as u16,
+            pts,
         });
     }
 
@@ -1575,30 +1598,41 @@ pub fn deserialize_temporal_group(
 pub fn deserialize_temporal_sequence(data: &[u8]) -> crate::TemporalEncodedSequence {
     let header = deserialize_temporal_sequence_header(data);
 
-    let num_groups = header.num_groups();
-    let mut groups = Vec::with_capacity(num_groups);
-    for g in 0..num_groups {
-        groups.push(deserialize_temporal_group(data, &header, g));
+    // Collect actual temporal GOP indices from the index (lowpass entries, sorted).
+    let mut temporal_gop_set: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    for entry in &header.index {
+        if entry.frame_role == 0 {
+            temporal_gop_set.insert(entry.gop_index as usize);
+        }
+    }
+    let temporal_gop_indices: Vec<usize> = temporal_gop_set.into_iter().collect();
+
+    let mut groups = Vec::with_capacity(temporal_gop_indices.len());
+    let mut group_gop_indices = Vec::with_capacity(temporal_gop_indices.len());
+    for &gop_idx in &temporal_gop_indices {
+        groups.push(deserialize_temporal_group(data, &header, gop_idx));
+        group_gop_indices.push(gop_idx);
     }
 
-    // Deserialize tail I-frames
-    let mut tail_iframes = Vec::new();
-    for entry in &header.index {
-        if entry.frame_role == 2 {
-            let start = entry.offset as usize;
-            let end = start + entry.size as usize;
-            assert!(
-                end <= data.len(),
-                "Tail I-frame data extends beyond file"
-            );
-            tail_iframes.push(deserialize_compressed(&data[start..end]));
-        }
+    // Deserialize tail I-frames, sorted by PTS (handles scene-cut I-frames at arbitrary PTS).
+    let mut tail_entries: Vec<_> = header.index.iter().filter(|e| e.frame_role == 2).collect();
+    tail_entries.sort_by_key(|e| e.pts);
+    let mut tail_iframes = Vec::with_capacity(tail_entries.len());
+    let mut tail_iframe_pts = Vec::with_capacity(tail_entries.len());
+    for entry in &tail_entries {
+        let start = entry.offset as usize;
+        let end = start + entry.size as usize;
+        assert!(end <= data.len(), "Tail I-frame data extends beyond file");
+        tail_iframes.push(deserialize_compressed(&data[start..end]));
+        tail_iframe_pts.push(entry.pts);
     }
 
     crate::TemporalEncodedSequence {
         mode: header.temporal_transform,
         groups,
+        group_gop_indices,
         tail_iframes,
+        tail_iframe_pts,
         frame_count: header.frame_count as usize,
         gop_size: header.gop_size as usize,
     }
@@ -1701,7 +1735,9 @@ mod tests {
         let seq = crate::TemporalEncodedSequence {
             mode: crate::TemporalTransform::Haar,
             groups: vec![make_group(), make_group()],
+            group_gop_indices: vec![0, 1],
             tail_iframes: vec![make_test_frame(width, height)],
+            tail_iframe_pts: vec![8],
             frame_count: 9, // 2 GOPs × 4 + 1 tail
             gop_size,
         };
@@ -1814,7 +1850,9 @@ mod tests {
                     vec![make_test_frame(width, height)],
                 ],
             }],
+            group_gop_indices: vec![0],
             tail_iframes: Vec::new(),
+            tail_iframe_pts: Vec::new(),
             frame_count: 2,
             gop_size: 2,
         };
@@ -1865,7 +1903,9 @@ mod tests {
                     vec![make_test_frame(width, height)],
                 ],
             }],
+            group_gop_indices: vec![0],
             tail_iframes: Vec::new(),
+            tail_iframe_pts: Vec::new(),
             frame_count: 8,
             gop_size: 8,
         };

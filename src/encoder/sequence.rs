@@ -512,7 +512,9 @@ impl EncoderPipeline {
             );
         }
         let mut groups: Vec<TemporalGroup> = Vec::new();
+        let mut group_gop_indices: Vec<usize> = Vec::new();
         let mut tail_iframes: Vec<CompressedFrame> = Vec::new();
+        let mut tail_iframe_pts: Vec<u32> = Vec::new();
 
         let mut cfg = config.clone();
         cfg.keyframe_interval = 1;
@@ -531,6 +533,7 @@ impl EncoderPipeline {
         let plane_size = (padded_pixels * std::mem::size_of::<f32>()) as u64;
         self.ensure_cached(ctx, padded_w, padded_h, width, height);
         while i + group_size <= frames.len() {
+            let current_gop_idx = i / group_size;
             match mode {
                 TemporalTransform::Haar => {
                     // Allocate per-frame GPU buffers for wavelet coefficients: [frame][plane]
@@ -781,6 +784,7 @@ impl EncoderPipeline {
                         low_frame: low_cf,
                         high_frames: high_cfs,
                     });
+                    group_gop_indices.push(current_gop_idx);
                 }
                 TemporalTransform::LeGall53 => {
                     // LeGall 5/3 operates on groups of exactly 4 frames.
@@ -986,6 +990,7 @@ impl EncoderPipeline {
                         low_frame: low_s0,
                         high_frames: vec![vec![s1_cf, d0_cf, d1_cf]],
                     });
+                    group_gop_indices.push(current_gop_idx);
                 }
                 TemporalTransform::None => unreachable!(),
             }
@@ -995,6 +1000,7 @@ impl EncoderPipeline {
         // Tail: encode remaining frames as I-frames (no temporal transform)
         while i < frames.len() {
             let cf = self.encode(ctx, frames[i], width, height, &cfg);
+            tail_iframe_pts.push(i as u32);
             tail_iframes.push(cf);
             i += 1;
         }
@@ -1002,7 +1008,9 @@ impl EncoderPipeline {
         TemporalEncodedSequence {
             mode,
             groups,
+            group_gop_indices,
             tail_iframes,
+            tail_iframe_pts,
             frame_count: frames.len(),
             gop_size: group_size,
         }

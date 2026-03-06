@@ -554,7 +554,14 @@ pub struct CompressedFrame {
 pub struct TemporalEncodedSequence {
     pub mode: TemporalTransform,
     pub groups: Vec<TemporalGroup>,
+    /// For each group, which GOP index (0-based) it belongs to.
+    /// Normally `group_gop_indices[g] == g`, but when scene cuts cause some GOPs to be
+    /// encoded as individual I-frames, those GOP indices are skipped here.
+    pub group_gop_indices: Vec<usize>,
     pub tail_iframes: Vec<CompressedFrame>,
+    /// Presentation timestamp (frame index) for each entry in `tail_iframes`.
+    /// For scene-cut I-frames this may be < last temporal group's PTS.
+    pub tail_iframe_pts: Vec<u32>,
     pub frame_count: usize,
     pub gop_size: usize,
 }
@@ -1049,11 +1056,31 @@ pub mod wasm {
                     return Ok(rgba);
                 }
 
+                let current_pts = self.current_frame as u32;
                 let gop_size = th.gop_size as usize;
-                let num_groups = th.num_groups();
-                let gop_idx = self.current_frame / gop_size;
 
-                if gop_idx < num_groups {
+                // Check for an I-frame at this exact PTS (scene-cut or tail I-frame).
+                // Scene-cut I-frames have frame_role=2 and a PTS within the temporal range.
+                let iframe_entry = th.index.iter()
+                    .find(|e| e.frame_role == 2 && e.pts == current_pts);
+
+                if let Some(entry) = iframe_entry {
+                    let start = entry.offset as usize;
+                    let end = start + entry.size as usize;
+                    let frame = crate::format::deserialize_compressed(&self.data[start..end]);
+                    let rgba = self.decoder.decode_rgba_wasm(&self.ctx, &frame).await;
+                    self.current_frame += 1;
+                    return Ok(rgba);
+                }
+
+                let gop_idx = self.current_frame / gop_size;
+                let max_gop_idx = th.index.iter()
+                    .filter(|e| e.frame_role != 2)
+                    .map(|e| e.gop_index as usize)
+                    .max()
+                    .unwrap_or(0);
+
+                if gop_idx <= max_gop_idx {
                     let group = crate::format::deserialize_temporal_group(
                         &self.data, th, gop_idx,
                     );
@@ -1069,24 +1096,7 @@ pub mod wasm {
                     self.current_frame += 1;
                     return Ok(rgba);
                 } else {
-                    // Tail I-frames
-                    let tail_entries: Vec<_> = th.index.iter()
-                        .filter(|e| e.frame_role == 2)
-                        .collect();
-                    let tail_idx = self.current_frame - num_groups * gop_size;
-                    if tail_idx < tail_entries.len() {
-                        let entry = &tail_entries[tail_idx];
-                        let start = entry.offset as usize;
-                        let end = start + entry.size as usize;
-                        let frame = crate::format::deserialize_compressed(
-                            &self.data[start..end],
-                        );
-                        let rgba = self.decoder.decode_rgba_wasm(&self.ctx, &frame).await;
-                        self.current_frame += 1;
-                        return Ok(rgba);
-                    }
-                    // Past end of all frames — wrap to start. The next call
-                    // to decode_next_frame will decode from frame 0.
+                    // Past end of all frames — wrap to start.
                     self.current_frame = 0;
                     self.buffered_frames.clear();
                     return Err(JsValue::from_str("End of GNV2 sequence, rewound to frame 0"));
@@ -1382,12 +1392,44 @@ pub mod wasm {
             // Phase 1 (once per GOP): entropy decode + temporal Haar → wavelet-domain GPU bufs.
             // Phase 2 (per frame): inverse spatial wavelet + color → blit.
             if let Some(ref th) = self.temporal_header {
+                let current_pts = self.current_frame as u32;
                 let gop_size = th.gop_size as usize;
-                let num_groups = th.num_groups();
                 let temporal_transform = th.temporal_transform;
-                let gop_idx = self.current_frame / gop_size;
 
-                if gop_idx < num_groups {
+                // Check for an I-frame at this exact PTS (scene-cut or tail I-frame).
+                let iframe_entry = th.index.iter()
+                    .find(|e| e.frame_role == 2 && e.pts == current_pts);
+
+                if let Some(entry) = iframe_entry {
+                    self.last_seek_ms = 0.0;
+                    let t_dec = Self::now_ms();
+                    let start = entry.offset as usize;
+                    let end = start + entry.size as usize;
+                    let frame = crate::format::deserialize_compressed(&self.data[start..end]);
+                    self.decoder.decode_to_texture(&self.ctx, &frame);
+                    let view = self.decoder.output_texture_view().unwrap();
+                    blit_to_surface(
+                        &self.ctx.device,
+                        &self.ctx.queue,
+                        self.surface.as_ref().unwrap(),
+                        self.blit_pipeline.as_ref().unwrap(),
+                        self.blit_bgl.as_ref().unwrap(),
+                        self.blit_sampler.as_ref().unwrap(),
+                        &view,
+                    )?;
+                    self.last_decode_ms = Self::now_ms() - t_dec;
+                    self.current_frame += 1;
+                    return Ok(());
+                }
+
+                let gop_idx = self.current_frame / gop_size;
+                let max_gop_idx = th.index.iter()
+                    .filter(|e| e.frame_role != 2)
+                    .map(|e| e.gop_index as usize)
+                    .max()
+                    .unwrap_or(0);
+
+                if gop_idx <= max_gop_idx {
                     let frame_in_gop = self.current_frame - gop_idx * gop_size;
                     let gop_base = gop_idx * gop_size;
 
@@ -1448,45 +1490,23 @@ pub mod wasm {
                     self.last_decode_ms = Self::now_ms() - t_dec;
                     self.current_frame += 1;
 
-                    // Prefetch next GOP at the midpoint of current GOP
-                    if frame_in_gop == gop_size / 2
-                        && gop_idx + 1 < num_groups
+                    // Prefetch next GOP (skip over any scene-cut I-frames that follow)
+                    if frame_in_gop == gop_size / 2 && gop_idx < max_gop_idx
                         && self.tw_prefetch_base != gop_base + gop_size
                     {
-                        self.prefetch_next_gop(gop_idx + 1, gop_size);
+                        // Find next temporal GOP after this one
+                        let next_gop_base = (gop_idx + 1) * gop_size;
+                        let next_temporal_gop = th.index.iter()
+                            .filter(|e| e.frame_role == 0 && e.pts >= next_gop_base as u32)
+                            .map(|e| e.gop_index as usize)
+                            .min();
+                        if let Some(next_g) = next_temporal_gop {
+                            self.prefetch_next_gop(next_g, gop_size);
+                        }
                     }
 
                     return Ok(());
                 } else {
-                    // Tail I-frames: decode individually
-                    self.last_seek_ms = 0.0;
-                    let t_dec = Self::now_ms();
-                    let tail_entries: Vec<_> = th.index.iter()
-                        .filter(|e| e.frame_role == 2)
-                        .collect();
-                    let tail_idx = self.current_frame - num_groups * gop_size;
-                    if tail_idx < tail_entries.len() {
-                        let entry = &tail_entries[tail_idx];
-                        let start = entry.offset as usize;
-                        let end = start + entry.size as usize;
-                        let frame = crate::format::deserialize_compressed(
-                            &self.data[start..end],
-                        );
-                        self.decoder.decode_to_texture(&self.ctx, &frame);
-                        let view = self.decoder.output_texture_view().unwrap();
-                        blit_to_surface(
-                            &self.ctx.device,
-                            &self.ctx.queue,
-                            self.surface.as_ref().unwrap(),
-                            self.blit_pipeline.as_ref().unwrap(),
-                            self.blit_bgl.as_ref().unwrap(),
-                            self.blit_sampler.as_ref().unwrap(),
-                            &view,
-                        )?;
-                        self.last_decode_ms = Self::now_ms() - t_dec;
-                        self.current_frame += 1;
-                        return Ok(());
-                    }
                     // Past end — wrap
                     self.current_frame = 0;
                     self.tw_gop_base = usize::MAX;

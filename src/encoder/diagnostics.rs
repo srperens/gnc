@@ -1051,7 +1051,8 @@ pub fn print_temporal_gop_diagnostics(
     eprintln!();
 
     // Lowpass frame
-    print_temporal_frame_detail("L", 0, &group.low_frame, width, height);
+    let skip_coeff = !per_frame_quality.is_empty();
+    print_temporal_frame_detail("L", 0, &group.low_frame, width, height, skip_coeff);
 
     // Highpass frames by level
     // For 5/3 mode: high_frames[0] = [s1, d0, d1] — first frame is actually second lowpass
@@ -1064,7 +1065,7 @@ pub fn print_temporal_gop_diagnostics(
                 format!("H{}", lvl)
             };
             let idx = if is_53 && lvl == 0 && fi > 0 { fi - 1 } else { fi };
-            print_temporal_frame_detail(&label, idx, frame, width, height);
+            print_temporal_frame_detail(&label, idx, frame, width, height, skip_coeff);
         }
     }
 
@@ -1095,25 +1096,27 @@ pub fn print_temporal_gop_diagnostics(
         ));
     }
 
-    // Highpass not sparse enough
-    let coeff_stats = compute_coeff_stats_from_frame(&group.low_frame);
-    if coeff_stats.total > 0 && coeff_stats.zero_pct < 30.0 {
-        warnings.push(format!(
-            "WARN: lowpass zero_pct={:.0}% (<30%) — signal has high energy after temporal transform",
-            coeff_stats.zero_pct
-        ));
-    }
+    // Highpass not sparse enough — skip CPU Rice decode when PSNR is already available
+    if per_frame_quality.is_empty() {
+        let coeff_stats = compute_coeff_stats_from_frame(&group.low_frame);
+        if coeff_stats.total > 0 && coeff_stats.zero_pct < 30.0 {
+            warnings.push(format!(
+                "WARN: lowpass zero_pct={:.0}% (<30%) — signal has high energy after temporal transform",
+                coeff_stats.zero_pct
+            ));
+        }
 
-    // Check first highpass level sparsity (skip s1 for 5/3 — it's lowpass)
-    if let Some(h0_frames) = group.high_frames.first() {
-        let skip = if is_53 { 1 } else { 0 };
-        for (fi, hf) in h0_frames.iter().enumerate().skip(skip) {
-            let hs = compute_coeff_stats_from_frame(hf);
-            if hs.total > 0 && hs.zero_pct < 50.0 {
-                warnings.push(format!(
-                    "WARN: highpass L0[{}] zero_pct={:.0}% (<50%) — temporal difference has high energy",
-                    fi, hs.zero_pct
-                ));
+        // Check first highpass level sparsity (skip s1 for 5/3 — it's lowpass)
+        if let Some(h0_frames) = group.high_frames.first() {
+            let skip = if is_53 { 1 } else { 0 };
+            for (fi, hf) in h0_frames.iter().enumerate().skip(skip) {
+                let hs = compute_coeff_stats_from_frame(hf);
+                if hs.total > 0 && hs.zero_pct < 50.0 {
+                    warnings.push(format!(
+                        "WARN: highpass L0[{}] zero_pct={:.0}% (<50%) — temporal difference has high energy",
+                        fi, hs.zero_pct
+                    ));
+                }
             }
         }
     }
@@ -1135,12 +1138,15 @@ pub fn print_temporal_gop_diagnostics(
 }
 
 /// Print detail for a single temporal wavelet frame (lowpass or highpass).
+/// `skip_coeff_stats` suppresses the CPU Rice decode used to compute mean_abs/stddev/zero%
+/// when the caller already has PSNR from a GPU decode (avoids redundant full-frame decodes).
 fn print_temporal_frame_detail(
     label: &str,
     idx: usize,
     frame: &CompressedFrame,
     width: u32,
     height: u32,
+    skip_coeff_stats: bool,
 ) {
     let pixels = width as f64 * height as f64;
     let bytes = frame.byte_size();
@@ -1177,13 +1183,15 @@ fn print_temporal_frame_detail(
         }
     }
 
-    // Coefficient stats
-    let cs = compute_coeff_stats_from_frame(frame);
-    if cs.total > 0 {
-        eprintln!(
-            "    Coefficients: mean_abs={:.2} stddev={:.2} zero={:.0}%",
-            cs.mean_abs, cs.stddev, cs.zero_pct
-        );
+    // Coefficient stats — skipped when per_frame_quality is available (GPU decode already ran)
+    if !skip_coeff_stats {
+        let cs = compute_coeff_stats_from_frame(frame);
+        if cs.total > 0 {
+            eprintln!(
+                "    Coefficients: mean_abs={:.2} stddev={:.2} zero={:.0}%",
+                cs.mean_abs, cs.stddev, cs.zero_pct
+            );
+        }
     }
 
     // Bit budget

@@ -1219,7 +1219,7 @@ impl EncoderPipeline {
         // (weight set to TILE_ZERO_MUL). These tiles are too chaotic to benefit from
         // temporal wavelet coding; zeroing saves bits with minimal perceptual impact
         // since the decoder falls back to LL (temporal average) for those tiles.
-        const TILE_ENERGY_ZERO_THRESH: f32 = 12.0;
+        const TILE_ENERGY_ZERO_THRESH: f32 = 25.0;
         // Quantizer weight that guarantees all highpass coefficients in a tile fall
         // inside the dead zone (eff_threshold = qstep * dead_zone * TILE_ZERO_MUL > 255).
         const TILE_ZERO_MUL: f32 = 1000.0;

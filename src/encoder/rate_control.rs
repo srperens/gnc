@@ -206,6 +206,39 @@ impl RateController {
         self.vbv_fill = self.vbv_fill.clamp(0.0, self.vbv_capacity);
     }
 
+    /// Update rate controller after encoding a GOP of `n_frames` frames.
+    ///
+    /// `total_bits_bytes` = total encoded bytes for the GOP.
+    ///
+    /// Unlike calling `update()` n_frames times with identical avg_bpp (which would push
+    /// n_frames duplicate samples into history and cause degenerate log-space regression),
+    /// this method adds ONE representative sample and advances the VBV budget for all frames.
+    pub fn update_gop(&mut self, actual_qstep: f32, total_bits_bytes: usize, n_frames: u32) {
+        let pixels_per_frame = self.width as f64 * self.height as f64;
+        let total_bits = total_bits_bytes as f64 * 8.0;
+        let avg_bpp = total_bits / (pixels_per_frame * n_frames as f64);
+        let qstep = actual_qstep as f64;
+        self.frame_count += n_frames as u64;
+
+        // Add ONE representative sample to avoid degenerate R-Q regression.
+        let sample = RqSample { qstep, bpp: avg_bpp };
+        self.history.push(sample);
+        if self.history.len() > self.max_history {
+            self.history.remove(0);
+        }
+        self.fit_model();
+
+        // Advance VBV: n_frames of budget in, actual GOP bits out.
+        self.vbv_fill += self.bits_per_frame() * n_frames as f64;
+        self.vbv_fill -= total_bits;
+        self.vbv_fill = self.vbv_fill.clamp(0.0, self.vbv_capacity);
+    }
+
+    /// Return current VBV fill ratio (0.0 = empty, 1.0 = full).
+    pub fn vbv_fill_ratio(&self) -> f64 {
+        self.vbv_fill / self.vbv_capacity
+    }
+
     /// Fit the R-Q model to the sample history using log-space linear regression.
     /// Model: ln(bpp) = ln(c) - alpha * ln(qstep)
     fn fit_model(&mut self) {

@@ -1264,7 +1264,12 @@ fn main() {
                 }
                 config_tw.keyframe_interval = keyframe_interval;
                 config_tw.temporal_transform = temporal_mode;
-                config_tw.target_bitrate = None;
+                // Wire --bitrate / --rate-mode into temporal config.
+                // (Previously hardcoded to None; now respected for temporal path.)
+                if let Some(ref br) = bitrate {
+                    config_tw.target_bitrate = Some(parse_bitrate(br));
+                    config_tw.rate_mode = parse_rate_mode(&rate_mode);
+                }
                 if let Some(mul) = tw_highpass_mul {
                     config_tw.temporal_highpass_qstep_mul = mul;
                     config_tw.adaptive_temporal_mul = false;
@@ -1403,6 +1408,18 @@ fn main() {
                     None
                 };
 
+                // Rate controller for temporal path — only active when --bitrate is specified.
+                let mut rc_opt: Option<gnc::encoder::rate_control::RateController> =
+                    config_tw.target_bitrate.map(|bps| {
+                        gnc::encoder::rate_control::RateController::new(
+                            bps,
+                            effective_fps,
+                            w,
+                            h,
+                            config_tw.rate_mode,
+                        )
+                    });
+
                 for gop_idx in 0..num_gops {
                     let base = gop_idx * gop_size;
                     // Load this GOP's frames (or use pre-loaded lookahead from previous iteration)
@@ -1504,6 +1521,11 @@ fn main() {
                     let next_refs: Option<Vec<&[f32]>> = lookahead_frames.as_ref()
                         .map(|v| v.iter().map(|f| f.as_slice()).collect());
 
+                    // Rate control: set qstep from RC estimate if active.
+                    if let Some(rc) = &rc_opt {
+                        config_tw.quantization_step = rc.estimate_qstep();
+                    }
+
                     let t_enc_start = std::time::Instant::now();
                     let group = encoder.encode_temporal_wavelet_gop(
                         &ctx,
@@ -1524,6 +1546,19 @@ fn main() {
                         .sum();
                     let group_bytes = low_bytes + high_bytes;
                     total_bytes += group_bytes;
+
+                    // Rate control: update model with actual GOP size.
+                    if let Some(rc) = &mut rc_opt {
+                        let n_frames = (group.high_frames.iter().map(|l| l.len()).sum::<usize>() + 1) as u32;
+                        rc.update_gop(config_tw.quantization_step, group_bytes, n_frames);
+                        let target_bytes = (config_tw.target_bitrate.unwrap_or(0.0)
+                            / effective_fps * n_frames as f64 / 8.0) as usize;
+                        eprintln!(
+                            "[RC] gop={gop_idx} target={target_bytes}B actual={group_bytes}B fill={:.1}% q={:.2}",
+                            rc.vbv_fill_ratio() * 100.0,
+                            config_tw.quantization_step,
+                        );
+                    }
 
                     let elapsed = start.elapsed();
                     let frames_done = (gop_idx + 1) * gop_size;
@@ -1986,7 +2021,9 @@ fn main() {
                 }
                 config_tw.keyframe_interval = keyframe_interval;
                 config_tw.temporal_transform = temporal_mode;
-                config_tw.target_bitrate = None; // rate control is sequence-based; disable for temporal mode
+                // Rate control not wired for this subcommand (benchmark is single-sequence, not iterative).
+                // Use benchmark-sequence with --bitrate for rate-controlled encoding.
+                config_tw.target_bitrate = None;
                 if let Some(mul) = tw_highpass_mul {
                     config_tw.temporal_highpass_qstep_mul = mul;
                     config_tw.adaptive_temporal_mul = false;
@@ -3264,6 +3301,8 @@ fn main() {
                 let (first_rgb, w, h) = load_image_rgb_f32(&first_path);
                 let mut config_tw = gnc::quality_preset(quality);
                 config_tw.temporal_transform = temporal_mode;
+                // Rate control not wired for this subcommand (benchmark-sequence non-streaming path).
+                // Use benchmark-sequence with --bitrate for rate-controlled encoding.
                 config_tw.target_bitrate = None;
                 if let Some(mul) = tw_highpass_mul {
                     config_tw.temporal_highpass_qstep_mul = mul;

@@ -57,10 +57,11 @@ See [BASELINE.md](BASELINE.md) for current benchmark numbers.
 - **Note:** Completed in temporal wavelet Phase 4
 
 ### 4b. Rice MAX_STREAM_BYTES reduction (enables future tile experiments)
-- **Status:** todo (P3 — do after speed target met)
-- **Problem:** 4096 bytes/stream is worst-case ceiling; at q=75 actual max is ~320 bytes/stream. Current value blocks 128×128 tiles at 1080p (134MB > 128MB WebGPU limit).
-- **Approach:** Measure actual stream byte distribution across benchmark suite, pick safe ceiling (e.g. 1024 bytes) with overflow guard. Validates/invalidates without touching encoding algorithm.
-- **Success criteria:** No encode/decode regression; 128×128 tiles no longer fail at runtime.
+- **Status:** done (2026-03-08)
+- **Result:** MAX_STREAM_BYTES now tile-size-dependent: 1024 for ≤128px tiles (64 symbols/stream,
+  7× headroom), 4096 for 256px tiles (unchanged). Overflow guard fixed: was silent byte-drop,
+  now GPU atomicStore + CPU panic with message on overflow. 128×128 tiles at 1080p now work
+  (135 × 256 × 1024 = 33MB < 128MB WebGPU limit). New test: test_rice_128x128_tiles.
 
 ### 7. LL subband prediction
 - **Status:** todo (P3 — probably skip)
@@ -97,6 +98,15 @@ See [BASELINE.md](BASELINE.md) for current benchmark numbers.
   NN upsampling is correct for current architecture.
 - **Kept:** dispatch cleanup (no dummy sentinel values), multi-tile tests for 422/420.
 - **See:** RESEARCH_LOG.md 2026-03-08 entry for full analysis.
+
+### 12. CPU SIMD path (long-term, low priority)
+- **Status:** todo (P5 — far future, contingent on codec maturity)
+- **Motivation:** Broadcast contribution niche — same hole as VC-2/Dirac and JPEG XS: low latency, high quality, patent-free, low complexity. For broader adoption, a CPU-only path removes the GPU dependency and enables use on hardware without a capable GPU (servers, edge devices, FPGA/ASIC targets). Also enables WebAssembly decode on browsers without WebGPU (e.g. Firefox today).
+- **Approach:** Portable SIMD via `std::portable_simd` or `wide` crate — single code path that compiles to NEON (M1/ARM), AVX2 (x86), and WASM SIMD128. GPU path remains primary; SIMD path is a secondary fallback tier.
+- **WASM note:** WASM SIMD128 is well-supported (Chrome 91+, Firefox 89+, Safari 16.4+) and trivial to ship — just add `-C target-feature=+simd128` to the wasm-pack build.
+- **Prerequisite:** Codec must first reach competitive compression/latency/quality. No point optimizing a SIMD path for an algorithm that may still change fundamentally.
+- **Success criteria:** CPU SIMD decode of a 1080p frame within 2× real-time at target quality. No GPU required.
+- **Note:** Primary goal of this project is to explore whether AI-driven iteration can produce something competitive in this space. SIMD path is downstream of that question.
 
 ### 10. 10-bit support
 - **Status:** todo (P3)

@@ -10,14 +10,15 @@
 use bytemuck::{Pod, Zeroable};
 use wgpu;
 
-use super::rice::{RiceTile, RICE_STREAMS_PER_TILE};
+use super::rice::{max_stream_bytes_for_tile, RiceTile, RICE_STREAMS_PER_TILE};
 use crate::{FrameInfo, GpuContext};
 
-// Must match shaders/rice_encode.wgsl. Keep in sync with CPU RICE_MAX_STREAM_BYTES for safety.
-const MAX_STREAM_BYTES: usize = 4096;
 const MAX_GROUPS: usize = 8;
 const K_STRIDE: usize = MAX_GROUPS * 2 + 1; // stride per tile in k_output (mag k + zrl k per group + skip bitmap)
 
+// Field order must stay in sync with shaders/rice_encode.wgsl Params struct (bytemuck::Pod).
+// Fields in order: num_tiles, coefficients_per_tile, plane_width, tile_size, tiles_x,
+//                  num_levels, max_stream_bytes, _pad0.
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 pub struct RiceParams {
@@ -27,16 +28,22 @@ pub struct RiceParams {
     tile_size: u32,
     tiles_x: u32,
     num_levels: u32,
+    /// Per-stream byte ceiling passed to the shader; set via max_stream_bytes_for_tile().
+    max_stream_bytes: u32,
     _pad0: u32,
-    _pad1: u32,
 }
 
 /// Pre-allocated GPU buffers for Rice encode, reused across calls.
 struct CachedRiceEncodeBuffers {
     num_tiles: usize,
+    /// Per-stream byte ceiling used when this cache was allocated.
+    max_stream_bytes: usize,
     stream_buf: wgpu::Buffer,
     lengths_buf: wgpu::Buffer,
     k_buf: wgpu::Buffer,
+    /// One u32 per tile; shader sets to 1 on stream overflow.
+    overflow_buf: wgpu::Buffer,
+    overflow_staging: wgpu::Buffer,
     /// Cached uniform params buffer — updated via write_buffer, avoids per-frame create_buffer_init.
     params_buf: wgpu::Buffer,
     // Per-plane staging for single-frame 3-plane encode (batch_size=1)
@@ -51,17 +58,19 @@ struct CachedRiceEncodeBuffers {
 }
 
 impl CachedRiceEncodeBuffers {
-    fn new(ctx: &GpuContext, num_tiles: usize) -> Self {
+    fn new(ctx: &GpuContext, num_tiles: usize, max_stream_bytes: usize) -> Self {
         let total_streams = num_tiles * RICE_STREAMS_PER_TILE;
-        let stream_size = (total_streams * MAX_STREAM_BYTES) as u64;
+        let stream_size = (total_streams * max_stream_bytes) as u64;
         let lengths_size = (total_streams * 4) as u64;
         let k_size = (num_tiles * K_STRIDE * 4) as u64;
+        let overflow_size = (num_tiles * 4) as u64;
 
         let sc = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC;
         let mr = wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST;
 
         Self {
             num_tiles,
+            max_stream_bytes,
             stream_buf: ctx.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("rice_stream"),
                 size: stream_size.max(4),
@@ -78,6 +87,18 @@ impl CachedRiceEncodeBuffers {
                 label: Some("rice_k"),
                 size: k_size.max(4),
                 usage: sc,
+                mapped_at_creation: false,
+            }),
+            overflow_buf: ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("rice_overflow"),
+                size: overflow_size.max(4),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            overflow_staging: ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("rice_overflow_stg"),
+                size: overflow_size.max(4),
+                usage: mr,
                 mapped_at_creation: false,
             }),
             params_buf: ctx.device.create_buffer(&wgpu::BufferDescriptor {
@@ -124,7 +145,7 @@ impl CachedRiceEncodeBuffers {
     /// Called before batching multiple frames into one command encoder.
     fn ensure_batch_staging(&mut self, ctx: &GpuContext, batch_size: usize) {
         let total_streams = self.num_tiles * RICE_STREAMS_PER_TILE;
-        let stream_size = (total_streams * MAX_STREAM_BYTES) as u64;
+        let stream_size = (total_streams * self.max_stream_bytes) as u64;
         let lengths_size = (total_streams * 4) as u64;
         let k_size = (self.num_tiles * K_STRIDE * 4) as u64;
         let mr = wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST;
@@ -237,6 +258,17 @@ impl GpuRiceEncoder {
                             },
                             count: None,
                         },
+                        // binding 5: overflow_flags (read-write, atomic u32 per tile)
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 5,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
                     ],
                 });
 
@@ -266,10 +298,13 @@ impl GpuRiceEncoder {
         }
     }
 
-    fn ensure_buffers(&mut self, ctx: &GpuContext, num_tiles: usize) {
-        let needs_realloc = self.cached.as_ref().is_none_or(|c| c.num_tiles != num_tiles);
+    fn ensure_buffers(&mut self, ctx: &GpuContext, num_tiles: usize, tile_size: u32) {
+        let msb = max_stream_bytes_for_tile(tile_size);
+        let needs_realloc = self.cached.as_ref().is_none_or(|c| {
+            c.num_tiles != num_tiles || c.max_stream_bytes != msb
+        });
         if needs_realloc {
-            self.cached = Some(CachedRiceEncodeBuffers::new(ctx, num_tiles));
+            self.cached = Some(CachedRiceEncodeBuffers::new(ctx, num_tiles, msb));
         }
     }
 
@@ -284,13 +319,15 @@ impl GpuRiceEncoder {
     ) -> Vec<RiceTile> {
         let num_tiles = (info.tiles_x() * info.tiles_y()) as usize;
         let total_streams = num_tiles * RICE_STREAMS_PER_TILE;
+        let msb = max_stream_bytes_for_tile(info.tile_size);
 
-        self.ensure_buffers(ctx, num_tiles);
+        self.ensure_buffers(ctx, num_tiles, info.tile_size);
         let bufs = self.cached.as_ref().unwrap();
 
-        let stream_size = (total_streams * MAX_STREAM_BYTES) as u64;
+        let stream_size = (total_streams * msb) as u64;
         let lengths_size = (total_streams * 4) as u64;
         let k_size = (num_tiles * K_STRIDE * 4) as u64;
+        let overflow_size = (num_tiles * 4) as u64;
 
         let params = RiceParams {
             num_tiles: num_tiles as u32,
@@ -299,8 +336,8 @@ impl GpuRiceEncoder {
             tile_size: info.tile_size,
             tiles_x: info.tiles_x(),
             num_levels,
+            max_stream_bytes: msb as u32,
             _pad0: 0,
-            _pad1: 0,
         };
         ctx.queue
             .write_buffer(&bufs.params_buf, 0, bytemuck::bytes_of(&params));
@@ -310,6 +347,9 @@ impl GpuRiceEncoder {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("rice_3plane_cmd"),
             });
+
+        // Clear overflow flags before dispatch (reuse across planes)
+        cmd.clear_buffer(&bufs.overflow_buf, 0, Some(overflow_size));
 
         for (p, quantized_buf) in quantized_bufs.iter().enumerate() {
 
@@ -336,6 +376,10 @@ impl GpuRiceEncoder {
                     wgpu::BindGroupEntry {
                         binding: 4,
                         resource: bufs.k_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: bufs.overflow_buf.as_entire_binding(),
                     },
                 ],
             });
@@ -367,6 +411,14 @@ impl GpuRiceEncoder {
             );
             cmd.copy_buffer_to_buffer(&bufs.k_buf, 0, &bufs.k_staging[p], 0, k_size);
         }
+        // Copy overflow flags once (shared across planes)
+        cmd.copy_buffer_to_buffer(
+            &bufs.overflow_buf,
+            0,
+            &bufs.overflow_staging,
+            0,
+            overflow_size,
+        );
 
         // Submit and wait
         ctx.queue.submit(Some(cmd.finish()));
@@ -386,10 +438,38 @@ impl GpuRiceEncoder {
                     });
             }
         }
+        {
+            let tx_clone = tx.clone();
+            bufs.overflow_staging
+                .slice(..)
+                .map_async(wgpu::MapMode::Read, move |result| {
+                    tx_clone.send(result).unwrap();
+                });
+        }
         drop(tx);
         ctx.device.poll(wgpu::Maintain::Wait);
-        for _ in 0..9 {
+        // 9 data buffers + 1 overflow
+        for _ in 0..10 {
             rx.recv().unwrap().unwrap();
+        }
+
+        // Check overflow flags
+        {
+            let ov_view = bufs.overflow_staging.slice(..).get_mapped_range();
+            let ov_data: &[u32] = bytemuck::cast_slice(&ov_view);
+            for (tile_idx, &flag) in ov_data.iter().enumerate() {
+                if flag != 0 {
+                    drop(ov_view);
+                    bufs.overflow_staging.unmap();
+                    panic!(
+                        "Rice stream overflow in tile {tile_idx}: max_stream_bytes ({msb}) too small. \
+                         Increase max_stream_bytes_for_tile() for tile_size={}.",
+                        info.tile_size
+                    );
+                }
+            }
+            drop(ov_view);
+            bufs.overflow_staging.unmap();
         }
 
         // Read back and pack into RiceTile structs — read directly from mapped views
@@ -422,7 +502,7 @@ impl GpuRiceEncoder {
                 let mut packed_data = Vec::with_capacity(total_packed);
                 for (s, &len) in stream_lengths.iter().enumerate() {
                     let slot_byte_offset =
-                        (tile_idx * RICE_STREAMS_PER_TILE + s) * MAX_STREAM_BYTES;
+                        (tile_idx * RICE_STREAMS_PER_TILE + s) * msb;
                     let len = len as usize;
                     packed_data
                         .extend_from_slice(&stream_view[slot_byte_offset..slot_byte_offset + len]);
@@ -464,13 +544,15 @@ impl GpuRiceEncoder {
     ) -> Vec<RiceTile> {
         let num_tiles = (info.tiles_x() * info.tiles_y()) as usize;
         let total_streams = num_tiles * RICE_STREAMS_PER_TILE;
+        let msb = max_stream_bytes_for_tile(info.tile_size);
 
-        self.ensure_buffers(ctx, num_tiles);
+        self.ensure_buffers(ctx, num_tiles, info.tile_size);
         let bufs = self.cached.as_ref().unwrap();
 
-        let stream_size = (total_streams * MAX_STREAM_BYTES) as u64;
+        let stream_size = (total_streams * msb) as u64;
         let lengths_size = (total_streams * 4) as u64;
         let k_size = (num_tiles * K_STRIDE * 4) as u64;
+        let overflow_size = (num_tiles * 4) as u64;
 
         let params = RiceParams {
             num_tiles: num_tiles as u32,
@@ -479,8 +561,8 @@ impl GpuRiceEncoder {
             tile_size: info.tile_size,
             tiles_x: info.tiles_x(),
             num_levels,
+            max_stream_bytes: msb as u32,
             _pad0: 0,
-            _pad1: 0,
         };
         ctx.queue
             .write_buffer(&bufs.params_buf, 0, bytemuck::bytes_of(&params));
@@ -490,6 +572,8 @@ impl GpuRiceEncoder {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("rice_1plane_cmd"),
             });
+
+        cmd.clear_buffer(&bufs.overflow_buf, 0, Some(overflow_size));
 
         let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("rice_encode_bg"),
@@ -515,6 +599,10 @@ impl GpuRiceEncoder {
                     binding: 4,
                     resource: bufs.k_buf.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: bufs.overflow_buf.as_entire_binding(),
+                },
             ],
         });
 
@@ -532,6 +620,13 @@ impl GpuRiceEncoder {
         cmd.copy_buffer_to_buffer(&bufs.stream_buf, 0, &bufs.stream_staging[0], 0, stream_size);
         cmd.copy_buffer_to_buffer(&bufs.lengths_buf, 0, &bufs.lengths_staging[0], 0, lengths_size);
         cmd.copy_buffer_to_buffer(&bufs.k_buf, 0, &bufs.k_staging[0], 0, k_size);
+        cmd.copy_buffer_to_buffer(
+            &bufs.overflow_buf,
+            0,
+            &bufs.overflow_staging,
+            0,
+            overflow_size,
+        );
 
         ctx.queue.submit(Some(cmd.finish()));
 
@@ -548,10 +643,38 @@ impl GpuRiceEncoder {
                     tx_clone.send(result).unwrap();
                 });
         }
+        {
+            let tx_clone = tx.clone();
+            bufs.overflow_staging
+                .slice(..)
+                .map_async(wgpu::MapMode::Read, move |result| {
+                    tx_clone.send(result).unwrap();
+                });
+        }
         drop(tx);
         ctx.device.poll(wgpu::Maintain::Wait);
-        for _ in 0..3 {
+        // 3 data buffers + 1 overflow
+        for _ in 0..4 {
             rx.recv().unwrap().unwrap();
+        }
+
+        // Check overflow flags
+        {
+            let ov_view = bufs.overflow_staging.slice(..).get_mapped_range();
+            let ov_data: &[u32] = bytemuck::cast_slice(&ov_view);
+            for (tile_idx, &flag) in ov_data.iter().enumerate() {
+                if flag != 0 {
+                    drop(ov_view);
+                    bufs.overflow_staging.unmap();
+                    panic!(
+                        "Rice stream overflow in tile {tile_idx}: max_stream_bytes ({msb}) too small. \
+                         Increase max_stream_bytes_for_tile() for tile_size={}.",
+                        info.tile_size
+                    );
+                }
+            }
+            drop(ov_view);
+            bufs.overflow_staging.unmap();
         }
 
         let stream_view = bufs.stream_staging[0].slice(..).get_mapped_range();
@@ -576,7 +699,7 @@ impl GpuRiceEncoder {
             let total_packed: usize = stream_lengths.iter().map(|&l| l as usize).sum();
             let mut packed_data = Vec::with_capacity(total_packed);
             for (s, &len) in stream_lengths.iter().enumerate() {
-                let slot_byte_offset = (tile_idx * RICE_STREAMS_PER_TILE + s) * MAX_STREAM_BYTES;
+                let slot_byte_offset = (tile_idx * RICE_STREAMS_PER_TILE + s) * msb;
                 let len = len as usize;
                 packed_data
                     .extend_from_slice(&stream_view[slot_byte_offset..slot_byte_offset + len]);
@@ -617,13 +740,15 @@ impl GpuRiceEncoder {
     ) {
         let num_tiles = (info.tiles_x() * info.tiles_y()) as usize;
         let total_streams = num_tiles * RICE_STREAMS_PER_TILE;
+        let msb = max_stream_bytes_for_tile(info.tile_size);
 
-        self.ensure_buffers(ctx, num_tiles);
+        self.ensure_buffers(ctx, num_tiles, info.tile_size);
         let bufs = self.cached.as_ref().unwrap();
 
-        let stream_size = (total_streams * MAX_STREAM_BYTES) as u64;
+        let stream_size = (total_streams * msb) as u64;
         let lengths_size = (total_streams * 4) as u64;
         let k_size = (num_tiles * K_STRIDE * 4) as u64;
+        let overflow_size = (num_tiles * 4) as u64;
 
         let params = RiceParams {
             num_tiles: num_tiles as u32,
@@ -632,11 +757,13 @@ impl GpuRiceEncoder {
             tile_size: info.tile_size,
             tiles_x: info.tiles_x(),
             num_levels,
+            max_stream_bytes: msb as u32,
             _pad0: 0,
-            _pad1: 0,
         };
         ctx.queue
             .write_buffer(&bufs.params_buf, 0, bytemuck::bytes_of(&params));
+
+        cmd.clear_buffer(&bufs.overflow_buf, 0, Some(overflow_size));
 
         for (p, quantized_buf) in quantized_bufs.iter().enumerate() {
 
@@ -663,6 +790,10 @@ impl GpuRiceEncoder {
                     wgpu::BindGroupEntry {
                         binding: 4,
                         resource: bufs.k_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: bufs.overflow_buf.as_entire_binding(),
                     },
                 ],
             });
@@ -694,6 +825,14 @@ impl GpuRiceEncoder {
             );
             cmd.copy_buffer_to_buffer(&bufs.k_buf, 0, &bufs.k_staging[p], 0, k_size);
         }
+        // Copy overflow flags (shared across planes)
+        cmd.copy_buffer_to_buffer(
+            &bufs.overflow_buf,
+            0,
+            &bufs.overflow_staging,
+            0,
+            overflow_size,
+        );
     }
 
     /// Read back Rice-encoded data after submit. Must be called after
@@ -706,6 +845,7 @@ impl GpuRiceEncoder {
     ) -> Vec<RiceTile> {
         let num_tiles = (info.tiles_x() * info.tiles_y()) as usize;
         let bufs = self.cached.as_ref().unwrap();
+        let msb = bufs.max_stream_bytes;
         let num_groups = (num_levels * 2).max(1) as usize;
         let profile = std::env::var("GNC_PROFILE").is_ok();
         let _t0 = std::time::Instant::now();
@@ -725,11 +865,40 @@ impl GpuRiceEncoder {
                     });
             }
         }
+        {
+            let tx_clone = tx.clone();
+            bufs.overflow_staging
+                .slice(..)
+                .map_async(wgpu::MapMode::Read, move |result| {
+                    tx_clone.send(result).unwrap();
+                });
+        }
         drop(tx);
         ctx.device.poll(wgpu::Maintain::Wait);
-        for _ in 0..9 {
+        // 9 data buffers + 1 overflow
+        for _ in 0..10 {
             rx.recv().unwrap().unwrap();
         }
+
+        // Check overflow flags before unpacking
+        {
+            let ov_view = bufs.overflow_staging.slice(..).get_mapped_range();
+            let ov_data: &[u32] = bytemuck::cast_slice(&ov_view);
+            for (tile_idx, &flag) in ov_data.iter().enumerate() {
+                if flag != 0 {
+                    drop(ov_view);
+                    bufs.overflow_staging.unmap();
+                    panic!(
+                        "Rice stream overflow in tile {tile_idx}: max_stream_bytes ({msb}) too small. \
+                         Increase max_stream_bytes_for_tile() for tile_size={}.",
+                        info.tile_size
+                    );
+                }
+            }
+            drop(ov_view);
+            bufs.overflow_staging.unmap();
+        }
+
         if profile {
             eprintln!("    Rice map+poll: {:.1}ms", _t0.elapsed().as_secs_f64() * 1000.0);
         }
@@ -761,7 +930,7 @@ impl GpuRiceEncoder {
                 let mut packed_data = Vec::with_capacity(total_packed);
                 for (s, &len) in stream_lengths.iter().enumerate() {
                     let slot_byte_offset =
-                        (tile_idx * RICE_STREAMS_PER_TILE + s) * MAX_STREAM_BYTES;
+                        (tile_idx * RICE_STREAMS_PER_TILE + s) * msb;
                     let len = len as usize;
                     packed_data
                         .extend_from_slice(&stream_view[slot_byte_offset..slot_byte_offset + len]);
@@ -790,7 +959,7 @@ impl GpuRiceEncoder {
 
         if profile {
             let actual_bytes: usize = all_tiles.iter().map(|t| t.stream_data.len()).sum();
-            let staging_bytes = num_tiles * RICE_STREAMS_PER_TILE * MAX_STREAM_BYTES * 3;
+            let staging_bytes = num_tiles * RICE_STREAMS_PER_TILE * msb * 3;
             eprintln!("    Rice pack: {:.1}ms (actual {:.1}MB / staging {:.1}MB = {:.1}% utilization)",
                 _t1.elapsed().as_secs_f64() * 1000.0,
                 actual_bytes as f64 / 1_048_576.0,
@@ -803,8 +972,14 @@ impl GpuRiceEncoder {
 
     /// Ensure batch staging buffers are allocated for `batch_size` frames.
     /// Call before the first `dispatch_3planes_to_cmd_batch` in a GOP.
-    pub fn prepare_batch_staging(&mut self, ctx: &GpuContext, num_tiles: usize, batch_size: usize) {
-        self.ensure_buffers(ctx, num_tiles);
+    pub fn prepare_batch_staging(
+        &mut self,
+        ctx: &GpuContext,
+        num_tiles: usize,
+        tile_size: u32,
+        batch_size: usize,
+    ) {
+        self.ensure_buffers(ctx, num_tiles, tile_size);
         let bufs = self.cached.as_mut().unwrap();
         bufs.ensure_batch_staging(ctx, batch_size);
     }
@@ -830,6 +1005,7 @@ impl GpuRiceEncoder {
             num_tiles, bufs.num_tiles,
             "FrameInfo tile dimensions differ from cached buffer size — all batch frames must share the same FrameInfo"
         );
+        let msb = max_stream_bytes_for_tile(info.tile_size);
         let params = RiceParams {
             num_tiles: num_tiles as u32,
             coefficients_per_tile: info.tile_size * info.tile_size,
@@ -837,8 +1013,8 @@ impl GpuRiceEncoder {
             tile_size: info.tile_size,
             tiles_x: info.tiles_x(),
             num_levels,
+            max_stream_bytes: msb as u32,
             _pad0: 0,
-            _pad1: 0,
         };
         ctx.queue.write_buffer(&bufs.params_buf, 0, bytemuck::bytes_of(&params));
     }
@@ -858,9 +1034,11 @@ impl GpuRiceEncoder {
     ) {
         let num_tiles = (info.tiles_x() * info.tiles_y()) as usize;
         let total_streams = num_tiles * RICE_STREAMS_PER_TILE;
-        let stream_size = (total_streams * MAX_STREAM_BYTES) as u64;
+        let msb = self.cached.as_ref().unwrap().max_stream_bytes;
+        let stream_size = (total_streams * msb) as u64;
         let lengths_size = (total_streams * 4) as u64;
         let k_size = (num_tiles * K_STRIDE * 4) as u64;
+        let overflow_size = (num_tiles * 4) as u64;
 
         // ensure_buffers and write_params_buf_for_batch already called by the batch driver
         // (prepare_batch_staging + write_params_buf_for_batch, once before the loop).
@@ -869,6 +1047,9 @@ impl GpuRiceEncoder {
         // silently discard all but the last.  All high frames in a GOP share the same
         // FrameInfo (identical tile layout), so one pre-write is correct for the whole batch.
         let bufs = self.cached.as_ref().unwrap();
+
+        // Clear overflow flags for this frame slot (reused per frame)
+        cmd.clear_buffer(&bufs.overflow_buf, 0, Some(overflow_size));
 
         for (p, quantized_buf) in quantized_bufs.iter().enumerate() {
             let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -894,6 +1075,10 @@ impl GpuRiceEncoder {
                     wgpu::BindGroupEntry {
                         binding: 4,
                         resource: bufs.k_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: bufs.overflow_buf.as_entire_binding(),
                     },
                 ],
             });
@@ -945,9 +1130,11 @@ impl GpuRiceEncoder {
     ) -> Vec<Vec<RiceTile>> {
         let num_tiles = (info.tiles_x() * info.tiles_y()) as usize;
         let bufs = self.cached.as_ref().unwrap();
+        let msb = bufs.max_stream_bytes;
         let num_groups = (num_levels * 2).max(1) as usize;
 
-        // Map all staging buffers for all frames at once, then single poll
+        // Map all staging buffers for all frames at once, then single poll.
+        // Also map overflow_staging to catch any overflow from the last dispatched frame.
         let (tx, rx) = std::sync::mpsc::channel();
         for slot in 0..batch_size {
             for p in 0..3 {
@@ -965,11 +1152,38 @@ impl GpuRiceEncoder {
                 }
             }
         }
+        {
+            let tx_clone = tx.clone();
+            bufs.overflow_staging
+                .slice(..)
+                .map_async(wgpu::MapMode::Read, move |result| {
+                    tx_clone.send(result).unwrap();
+                });
+        }
         drop(tx);
         ctx.device.poll(wgpu::Maintain::Wait);
-        // Expect 9 callbacks per frame (3 planes × 3 buffers)
-        for _ in 0..batch_size * 9 {
+        // 9 data callbacks per frame + 1 overflow
+        for _ in 0..batch_size * 9 + 1 {
             rx.recv().unwrap().unwrap();
+        }
+
+        // Check overflow flags (reflects the last frame in the batch; overflow is rare)
+        {
+            let ov_view = bufs.overflow_staging.slice(..).get_mapped_range();
+            let ov_data: &[u32] = bytemuck::cast_slice(&ov_view);
+            for (tile_idx, &flag) in ov_data.iter().enumerate() {
+                if flag != 0 {
+                    drop(ov_view);
+                    bufs.overflow_staging.unmap();
+                    panic!(
+                        "Rice stream overflow in tile {tile_idx} (batch): max_stream_bytes ({msb}) too small. \
+                         Increase max_stream_bytes_for_tile() for tile_size={}.",
+                        info.tile_size
+                    );
+                }
+            }
+            drop(ov_view);
+            bufs.overflow_staging.unmap();
         }
 
         let mut all_frames: Vec<Vec<RiceTile>> = Vec::with_capacity(batch_size);
@@ -1000,7 +1214,7 @@ impl GpuRiceEncoder {
                     let mut packed_data = Vec::with_capacity(total_packed);
                     for (s, &len) in stream_lengths.iter().enumerate() {
                         let slot_byte_offset =
-                            (tile_idx * RICE_STREAMS_PER_TILE + s) * MAX_STREAM_BYTES;
+                            (tile_idx * RICE_STREAMS_PER_TILE + s) * msb;
                         let len = len as usize;
                         packed_data.extend_from_slice(
                             &stream_view[slot_byte_offset..slot_byte_offset + len],
@@ -1191,8 +1405,8 @@ impl GpuRiceDecoder {
                 tile_size: info.tile_size,
                 tiles_x: info.tiles_x(),
                 num_levels: tiles.first().map_or(3, |t| t.num_levels),
+                max_stream_bytes: max_stream_bytes_for_tile(info.tile_size) as u32,
                 _pad0: 0,
-                _pad1: 0,
             },
             k_values,
             stream_data: stream_data_u32,

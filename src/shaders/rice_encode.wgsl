@@ -12,12 +12,10 @@
 //   where quotient = (|val|-1) >> k, remainder = (|val|-1) & ((1<<k)-1)
 
 const STREAMS_PER_TILE: u32 = 256u;
-// Must match encoder/rice_gpu.rs MAX_STREAM_BYTES.
-const MAX_STREAM_BYTES: u32 = 4096u;
-const MAX_STREAM_WORDS: u32 = 1024u;  // MAX_STREAM_BYTES / 4
 const MAX_GROUPS: u32 = 8u;
 const K_STRIDE: u32 = 17u;  // MAX_GROUPS * 2 + 1: stride per tile in k_output (mag k + zrl k per group + skip bitmap)
 
+// Field order must stay in sync with rice_gpu.rs RiceParams (bytemuck::Pod).
 struct Params {
     num_tiles: u32,
     coefficients_per_tile: u32,
@@ -25,8 +23,10 @@ struct Params {
     tile_size: u32,
     tiles_x: u32,
     num_levels: u32,
+    // Per-stream byte ceiling; must be divisible by 4.
+    // Set by CPU via max_stream_bytes_for_tile(): 1024 for 128×128, 4096 for 256×256.
+    max_stream_bytes: u32,
     _pad0: u32,
-    _pad1: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -34,6 +34,8 @@ struct Params {
 @group(0) @binding(2) var<storage, read_write> stream_output: array<u32>;
 @group(0) @binding(3) var<storage, read_write> stream_lengths: array<u32>;
 @group(0) @binding(4) var<storage, read_write> k_output: array<u32>;
+// One u32 per tile; set to 1 if any stream in that tile overflows max_stream_bytes.
+@group(0) @binding(5) var<storage, read_write> overflow_flags: array<atomic<u32>>;
 
 // Shared memory for Phase 1: k computation
 var<workgroup> group_sum: array<atomic<u32>, 8>;
@@ -84,13 +86,20 @@ fn compute_subband_group(lx: u32, ly: u32) -> u32 {
 }
 
 // Emit a complete byte to the stream output buffer.
+// p_tile_id must be set before calling (used for overflow signaling).
+var<private> p_tile_id: u32;
+
 fn emit_byte(byte_val: u32) {
     p_word_buffer = p_word_buffer | ((byte_val & 0xFFu) << (p_bytes_in_word * 8u));
     p_bytes_in_word += 1u;
     p_total_bytes += 1u;
     if (p_bytes_in_word == 4u) {
-        if (p_word_pos < MAX_STREAM_WORDS) {
+        let max_words = params.max_stream_bytes / 4u;
+        if (p_word_pos < max_words) {
             stream_output[p_stream_word_base + p_word_pos] = p_word_buffer;
+        } else {
+            // Overflow: stream exceeded max_stream_bytes. Signal the tile.
+            atomicStore(&overflow_flags[p_tile_id], 1u);
         }
         p_word_pos += 1u;
         p_word_buffer = 0u;
@@ -132,7 +141,8 @@ fn flush_remaining() {
         let byte_val = (p_bit_buffer << (8u - p_bits_in_buffer)) & 0xFFu;
         emit_byte(byte_val);
     }
-    if (p_bytes_in_word > 0u && p_word_pos < MAX_STREAM_WORDS) {
+    let max_words = params.max_stream_bytes / 4u;
+    if (p_bytes_in_word > 0u && p_word_pos < max_words) {
         stream_output[p_stream_word_base + p_word_pos] = p_word_buffer;
     }
 }
@@ -278,7 +288,8 @@ fn main(
     // === Phase 2: Encode stream with per-subband ZRL ===
 
     // Initialize per-thread state
-    p_stream_word_base = (tile_id * STREAMS_PER_TILE + thread_id) * MAX_STREAM_WORDS;
+    p_tile_id = tile_id;
+    p_stream_word_base = (tile_id * STREAMS_PER_TILE + thread_id) * (params.max_stream_bytes / 4u);
     p_bit_buffer = 0u;
     p_bits_in_buffer = 0u;
     p_word_buffer = 0u;

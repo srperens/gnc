@@ -1459,7 +1459,7 @@ impl EncoderPipeline {
             use wgpu::util::DeviceExt;
 
             let num_tiles = (info.tiles_x() * info.tiles_y()) as usize;
-            self.gpu_rice_encoder.prepare_batch_staging(ctx, num_tiles, batch_size);
+            self.gpu_rice_encoder.prepare_batch_staging(ctx, num_tiles, info.tile_size, batch_size);
             // Write params_buf ONCE before the batch loop.  On Metal/wgpu write_buffer is
             // staged: only the last write before queue.submit takes effect.  All high frames
             // in a GOP share the same FrameInfo (same tile layout, same wavelet_levels),

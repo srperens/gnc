@@ -2970,9 +2970,7 @@ fn pframe_chroma_sequence_psnr(chroma_fmt: crate::ChromaFormat) -> (f64, f64) {
     let mut encoder = EncoderPipeline::new(&ctx);
     let decoder = crate::decoder::pipeline::DecoderPipeline::new(&ctx);
 
-    // 512×256: two 256-wide luma tiles → exercises tile boundaries that a
-    // 256×256 single-tile frame would not.  Chroma tile boundary falls at
-    // x=128 (4:2:2) or (x=128, y=128) (4:2:0).
+    // 512×256: exercises a tile boundary (chroma tile seam at x=128 for 4:2:2, (x=128,y=128) for 4:2:0)
     let w = 512u32;
     let h = 256u32;
     let f0 = make_gradient_frame(w, h, 0.0);
@@ -3021,85 +3019,99 @@ fn test_pframe_yuv420_sequence_roundtrip() {
     assert!(psnr2 > 30.0, "4:2:0 P-frame 2 PSNR too low ({psnr2:.2} dB) — chroma tile mismatch?");
 }
 
-// ---------------------------------------------------------------------------
-// Bilinear chroma upsample tile-boundary test
-//
-// Uses a wide (512×256) frame so each chroma format spans multiple 256-pixel
-// tiles horizontally (2 luma tiles wide → chroma tile boundary at x=128 for
-// 4:2:2 and 4:2:0).  The bilinear filter must correctly interpolate across
-// those boundaries without reading garbage from neighbouring tiles.
-// ---------------------------------------------------------------------------
-
+/// Verify that 128×128 tiles encode and decode correctly with the Rice encoder.
+///
+/// At 128×128 tiles: 64 symbols/stream, worst-case ~150 bytes. max_stream_bytes_for_tile(128)
+/// returns 1024 (7× headroom). This test verifies:
+///   1. No overflow flag is triggered (pipeline panics if overflow occurs).
+///   2. Decode quality is reasonable (PSNR > 35 dB at q=75).
 #[test]
-fn test_bilinear_chroma_upsample_tile_boundary_422() {
-    // 512×256: two 256-wide luma tiles → chroma is 256×256 for 4:2:2.
-    // A sharp horizontal ramp exercises the interpolation at tile seam (x=255/256).
-    let ctx = crate::GpuContext::new();
-    let mut encoder = EncoderPipeline::new(&ctx);
-    let decoder = crate::decoder::pipeline::DecoderPipeline::new(&ctx);
+fn test_rice_128x128_tiles() {
+    use crate::EntropyCoder;
 
-    let w = 512u32;
+    let ctx = GpuContext::new();
+    let mut enc = EncoderPipeline::new(&ctx);
+    let dec = DecoderPipeline::new(&ctx);
+
+    // 256×256 image → 4 tiles of 128×128
+    let w = 256u32;
     let h = 256u32;
-    // Horizontal ramp: R/G/B all equal to x*255/(w-1), producing a grayscale
-    // gradient.  After YCoCg-R, Co and Cg are zero everywhere → chroma is flat,
-    // so the roundtrip should be near-lossless for chroma.  Luma carries the
-    // gradient and exercises tile-crossing upsample at the tile seam.
-    let rgb: Vec<f32> = (0..h)
-        .flat_map(|_y| {
-            (0..w).flat_map(|x| {
-                let v = x as f32 * 255.0 / (w - 1) as f32;
-                [v, v, v]
-            })
-        })
-        .collect();
+    let frame = make_gradient_frame(w, h, 0.0);
 
-    let mut config = crate::CodecConfig::default();
-    config.chroma_format = crate::ChromaFormat::Yuv422;
-    config.quantization_step = 4.0;
-    config.cfl_enabled = false;
+    let mut config = CodecConfig::default();
+    config.tile_size = 128;
+    config.keyframe_interval = 1; // all I-frames
+    config.entropy_coder = EntropyCoder::Rice;
+    // q=75 default (quantization_step=1/75 equivalent via CodecConfig::default)
 
-    let compressed = encoder.encode(&ctx, &rgb, w, h, &config);
-    let decoded = decoder.decode(&ctx, &compressed);
+    let frames: Vec<&[f32]> = vec![&frame];
+    // This will panic if Rice overflow is detected in any tile
+    let compressed = enc.encode_sequence(&ctx, &frames, w, h, &config);
+    assert_eq!(compressed.len(), 1);
 
-    assert_eq!(decoded.len(), (w * h * 3) as usize, "decoded size wrong");
-    let psnr = compute_psnr(&rgb, &decoded);
-    eprintln!("bilinear 4:2:2 tile-boundary 512×256 PSNR = {psnr:.2} dB");
-    // With bilinear upsample, PSNR on a smooth gradient should be well above 35 dB.
-    assert!(psnr > 35.0, "4:2:2 tile-boundary PSNR too low ({psnr:.2} dB) — bilinear upsample bug?");
+    let decoded = dec.decode(&ctx, &compressed[0]);
+    let psnr = compute_psnr_single(&frame, &decoded);
+    eprintln!("Rice 128×128 tiles PSNR: {psnr:.2} dB (no overflow triggered)");
+    assert!(
+        psnr > 35.0,
+        "Rice 128×128 tile PSNR too low: {psnr:.2} dB — likely a tile offset bug"
+    );
 }
 
+// ---------------------------------------------------------------------------
+// Multi-tile chroma boundary tests (4:2:2 and 4:2:0)
+// 512×256 images cross a 256px tile boundary, exercising the chroma tile seam.
+// ---------------------------------------------------------------------------
+
+/// 4:2:2 encode/decode roundtrip crossing a tile boundary (x=256 luma / x=128 chroma).
+#[test]
+fn test_bilinear_chroma_upsample_tile_boundary_422() {
+    let ctx = GpuContext::new();
+    let mut enc = EncoderPipeline::new(&ctx);
+    let dec = DecoderPipeline::new(&ctx);
+
+    // Horizontal ramp across tile boundary
+    let w = 512u32;
+    let h = 256u32;
+    let frame = make_gradient_frame(w, h, 0.0);
+
+    let mut config = CodecConfig::default();
+    config.chroma_format = crate::ChromaFormat::Yuv422;
+    config.cfl_enabled = false;
+    config.keyframe_interval = 1;
+
+    let frames: Vec<&[f32]> = vec![&frame];
+    let compressed = enc.encode_sequence(&ctx, &frames, w, h, &config);
+    assert_eq!(compressed.len(), 1);
+
+    let decoded = dec.decode(&ctx, &compressed[0]);
+    let psnr = compute_psnr_single(&frame, &decoded);
+    eprintln!("4:2:2 tile boundary PSNR: {psnr:.2} dB");
+    assert!(psnr > 35.0, "4:2:2 tile boundary PSNR too low: {psnr:.2} dB");
+}
+
+/// 4:2:0 encode/decode roundtrip crossing tile boundaries (x=256, y=256).
 #[test]
 fn test_bilinear_chroma_upsample_tile_boundary_420() {
-    // 512×256: tile-boundary at x=256 for luma (x=128 for 4:2:0 chroma).
-    // Also exercises vertical bilinear interpolation (shift_y=1).
-    let ctx = crate::GpuContext::new();
-    let mut encoder = EncoderPipeline::new(&ctx);
-    let decoder = crate::decoder::pipeline::DecoderPipeline::new(&ctx);
+    let ctx = GpuContext::new();
+    let mut enc = EncoderPipeline::new(&ctx);
+    let dec = DecoderPipeline::new(&ctx);
 
     let w = 512u32;
     let h = 256u32;
-    // 2D ramp: R=x*255/(w-1), G=y*255/(h-1), B=0.  Non-trivial Co/Cg signal
-    // ensures the chroma path carries live data through the tile boundary.
-    let rgb: Vec<f32> = (0..h)
-        .flat_map(|y| {
-            (0..w).flat_map(move |x| {
-                let r = x as f32 * 255.0 / (w - 1) as f32;
-                let g = y as f32 * 255.0 / (h - 1) as f32;
-                [r, g, 0.0f32]
-            })
-        })
-        .collect();
+    let frame = make_gradient_frame(w, h, 15.0);
 
-    let mut config = crate::CodecConfig::default();
+    let mut config = CodecConfig::default();
     config.chroma_format = crate::ChromaFormat::Yuv420;
-    config.quantization_step = 4.0;
     config.cfl_enabled = false;
+    config.keyframe_interval = 1;
 
-    let compressed = encoder.encode(&ctx, &rgb, w, h, &config);
-    let decoded = decoder.decode(&ctx, &compressed);
+    let frames: Vec<&[f32]> = vec![&frame];
+    let compressed = enc.encode_sequence(&ctx, &frames, w, h, &config);
+    assert_eq!(compressed.len(), 1);
 
-    assert_eq!(decoded.len(), (w * h * 3) as usize, "decoded size wrong");
-    let psnr = compute_psnr(&rgb, &decoded);
-    eprintln!("bilinear 4:2:0 tile-boundary 512×256 PSNR = {psnr:.2} dB");
-    assert!(psnr > 34.0, "4:2:0 tile-boundary PSNR too low ({psnr:.2} dB) — bilinear upsample bug?");
+    let decoded = dec.decode(&ctx, &compressed[0]);
+    let psnr = compute_psnr_single(&frame, &decoded);
+    eprintln!("4:2:0 tile boundary PSNR: {psnr:.2} dB");
+    assert!(psnr > 34.0, "4:2:0 tile boundary PSNR too low: {psnr:.2} dB");
 }

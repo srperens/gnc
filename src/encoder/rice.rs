@@ -14,7 +14,20 @@ use super::rans::compute_subband_group;
 /// Number of interleaved streams per tile — 8x more than rANS for better GPU utilization.
 pub const RICE_STREAMS_PER_TILE: usize = 256;
 
+/// Max output bytes per stream for a given tile size.
+///
+/// At 256×256: 256 coefficients/stream → 4096 bytes (16 bytes/coeff headroom).
+/// At 128×128:  64 coefficients/stream → 1024 bytes (same 16 bytes/coeff headroom).
+/// Must be divisible by 4 (GPU stores u32 words) and kept in sync with the shader.
+pub fn max_stream_bytes_for_tile(tile_size: u32) -> usize {
+    match tile_size {
+        t if t <= 128 => 1024,
+        _ => 4096, // 256 and above
+    }
+}
+
 /// Max output bytes per stream (generous; typically much less).
+/// Kept for use by the CPU-only encode path (rice_encode_tile).
 pub const RICE_MAX_STREAM_BYTES: usize = 4096;
 
 /// Encoded tile using significance map + Golomb-Rice coding with zero-run-length.

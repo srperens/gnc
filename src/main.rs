@@ -518,6 +518,10 @@ enum Command {
         /// Decodes each frame and scores distorted vs reference using Netflix VMAF.
         #[arg(long)]
         vmaf: bool,
+
+        /// Chroma subsampling format: 444 (default, full resolution), 422, or 420
+        #[arg(long, default_value = "444")]
+        chroma_format: String,
     },
 
     /// Encode a sequence of image frames into a .gnv container
@@ -1198,6 +1202,7 @@ fn main() {
             ab,
             output,
             vmaf,
+            chroma_format,
         } => {
             if diagnostics {
                 gnc::encoder::diagnostics::enable();
@@ -1301,6 +1306,7 @@ fn main() {
                 if rice {
                     config_tw.entropy_coder = gnc::EntropyCoder::Rice;
                 }
+                config_tw.chroma_format = parse_chroma_format(&chroma_format);
                 println!(
                     "\n=== Temporal wavelet ({:?}, streaming, {}) ===",
                     temporal_mode,
@@ -1807,12 +1813,24 @@ fn main() {
             let mut frames_data: Vec<Vec<f32>> = Vec::new();
             let mut w = 0u32;
             let mut h = 0u32;
-            for i in 0..num_frames {
-                let path = input.replace("%04d", &format!("{:04}", i));
-                let (rgb, fw, fh) = load_image_rgb_f32(&path);
-                w = fw;
-                h = fh;
-                frames_data.push(rgb);
+            if input.ends_with(".y4m") {
+                let mut y4m = Y4mReader::open(&input);
+                w = y4m.width;
+                h = y4m.height;
+                for _ in 0..num_frames {
+                    match y4m.read_frame_rgb() {
+                        Some(rgb) => frames_data.push(rgb),
+                        None => break,
+                    }
+                }
+            } else {
+                for i in 0..num_frames {
+                    let path = input.replace("%04d", &format!("{:04}", i));
+                    let (rgb, fw, fh) = load_image_rgb_f32(&path);
+                    w = fw;
+                    h = fh;
+                    frames_data.push(rgb);
+                }
             }
 
             let frame_refs: Vec<&[f32]> = frames_data.iter().map(|f| f.as_slice()).collect();
@@ -1844,6 +1862,7 @@ fn main() {
             if rice {
                 config_ip.entropy_coder = gnc::EntropyCoder::Rice;
             }
+            config_ip.chroma_format = parse_chroma_format(&chroma_format);
 
             // Apply rate control settings
             if let Some(ref br) = bitrate {

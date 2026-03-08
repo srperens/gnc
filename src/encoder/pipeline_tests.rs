@@ -3,7 +3,8 @@ use crate::decoder::pipeline::DecoderPipeline;
 use crate::TemporalTransform;
 use wgpu::util::DeviceExt;
 
-fn compute_psnr_single(a: &[f32], b: &[f32]) -> f64 {
+/// Compute PSNR with a configurable peak value (base implementation).
+fn compute_psnr_peak(a: &[f32], b: &[f32], peak: f64) -> f64 {
     assert_eq!(a.len(), b.len());
     let mse: f64 = a
         .iter()
@@ -17,24 +18,17 @@ fn compute_psnr_single(a: &[f32], b: &[f32]) -> f64 {
     if mse < 1e-10 {
         return 100.0;
     }
-    10.0 * (255.0_f64 * 255.0 / mse).log10()
+    10.0 * (peak * peak / mse).log10()
 }
 
+/// Compute PSNR assuming 8-bit signal range [0, 255].
+fn compute_psnr_single(a: &[f32], b: &[f32]) -> f64 {
+    compute_psnr_peak(a, b, 255.0)
+}
+
+/// Compute PSNR assuming 8-bit signal range [0, 255].
 fn compute_psnr(a: &[f32], b: &[f32]) -> f64 {
-    assert_eq!(a.len(), b.len());
-    let mse: f64 = a
-        .iter()
-        .zip(b.iter())
-        .map(|(x, y)| {
-            let d = *x as f64 - *y as f64;
-            d * d
-        })
-        .sum::<f64>()
-        / a.len() as f64;
-    if mse < 1e-10 {
-        return 100.0;
-    }
-    10.0 * (255.0_f64 * 255.0 / mse).log10()
+    compute_psnr_peak(a, b, 255.0)
 }
 
 /// Generate a synthetic RGB frame: smooth gradient with some detail.
@@ -3114,4 +3108,70 @@ fn test_bilinear_chroma_upsample_tile_boundary_420() {
     let psnr = compute_psnr_single(&frame, &decoded);
     eprintln!("4:2:0 tile boundary PSNR: {psnr:.2} dB");
     assert!(psnr > 34.0, "4:2:0 tile boundary PSNR too low: {psnr:.2} dB");
+}
+
+#[test]
+fn test_10bit_roundtrip() {
+    let ctx = GpuContext::new();
+    let mut enc = EncoderPipeline::new(&ctx);
+    let dec = DecoderPipeline::new(&ctx);
+
+    let w = 256u32;
+    let h = 256u32;
+
+    // Generate a synthetic 10-bit frame: smooth gradient with values in [0, 1023].
+    let mut frame: Vec<f32> = Vec::with_capacity((w * h * 3) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            let r = (x as f32 / w as f32 * 1023.0).clamp(0.0, 1023.0);
+            let g = (y as f32 / h as f32 * 1023.0).clamp(0.0, 1023.0);
+            let b = ((x + y) as f32 / (w + h) as f32 * 1023.0).clamp(0.0, 1023.0);
+            frame.push(r);
+            frame.push(g);
+            frame.push(b);
+        }
+    }
+
+    let mut config = CodecConfig::default();
+    config.tile_size = 256;
+    config.quantization_step = 4.0;
+    config.keyframe_interval = 1;
+    config.temporal_transform = TemporalTransform::None;
+    config.cfl_enabled = false;
+    config.bit_depth = 10;
+
+    let compressed = enc.encode(&ctx, &frame, w, h, &config);
+
+    // Verify bit_depth was stored in the compressed frame header
+    assert_eq!(
+        compressed.info.bit_depth, 10,
+        "compressed frame should record bit_depth=10"
+    );
+
+    let decoded = dec.decode(&ctx, &compressed);
+
+    // Check output length matches
+    assert_eq!(
+        decoded.len(),
+        (w * h * 3) as usize,
+        "decoded length mismatch"
+    );
+
+    // Verify decoded values are in 10-bit range [0, 1023], NOT clipped to [0, 255]
+    let max_val = decoded
+        .iter()
+        .cloned()
+        .fold(f32::NEG_INFINITY, f32::max);
+    assert!(
+        max_val > 255.0,
+        "decoded max value {max_val:.1} is ≤ 255: values appear clipped to 8-bit range"
+    );
+
+    // Compute PSNR with 10-bit peak (1023)
+    let psnr = compute_psnr_peak(&frame, &decoded, 1023.0);
+    eprintln!("10-bit roundtrip PSNR: {psnr:.2} dB (peak=1023)");
+    assert!(
+        psnr > 30.0,
+        "10-bit roundtrip PSNR too low: {psnr:.2} dB (expected > 30 dB)"
+    );
 }

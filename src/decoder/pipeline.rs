@@ -418,6 +418,15 @@ impl DecoderPipeline {
 
         let t_prepare = t_start.elapsed();
 
+        // Update pack_params peak for correct bit-depth clamping
+        {
+            let peak: f32 = ((1u32 << frame.info.bit_depth) - 1) as f32;
+            let cached = self.cached.borrow();
+            let bufs = cached.as_ref().unwrap();
+            ctx.queue
+                .write_buffer(&bufs.pack_params_buf, 4, bytemuck::bytes_of(&peak));
+        }
+
         let cached = self.cached.borrow();
         let bufs = cached.as_ref().unwrap();
 
@@ -521,6 +530,16 @@ impl DecoderPipeline {
         );
 
         self.prepare_frame_data(ctx, frame);
+
+        // Update buf_to_tex scale uniform for correct bit-depth normalization
+        {
+            let scale: f32 = 1.0 / ((1u32 << frame.info.bit_depth) - 1) as f32;
+            let cached = self.cached.borrow();
+            let bufs = cached.as_ref().unwrap();
+            // Overwrite only the scale field (bytes 8..12 in the TextureParams struct)
+            ctx.queue
+                .write_buffer(&bufs.buf_to_tex_params_buf, 8, bytemuck::bytes_of(&scale));
+        }
 
         let cached = self.cached.borrow();
         let bufs = cached.as_ref().unwrap();
@@ -1609,6 +1628,15 @@ impl DecoderPipeline {
 
         self.prepare_frame_data(ctx, frame);
 
+        // Update pack_params peak for correct bit-depth clamping
+        {
+            let peak: f32 = ((1u32 << frame.info.bit_depth) - 1) as f32;
+            let cached = self.cached.borrow();
+            let bufs = cached.as_ref().unwrap();
+            ctx.queue
+                .write_buffer(&bufs.pack_params_buf, 4, bytemuck::bytes_of(&peak));
+        }
+
         let cached = self.cached.borrow();
         let bufs = cached.as_ref().unwrap();
 
@@ -1757,6 +1785,15 @@ impl DecoderPipeline {
         );
 
         self.prepare_frame_data(ctx, frame);
+
+        // Update pack_params peak for correct bit-depth clamping
+        {
+            let peak: f32 = ((1u32 << frame.info.bit_depth) - 1) as f32;
+            let cached = self.cached.borrow();
+            let bufs = cached.as_ref().unwrap();
+            ctx.queue
+                .write_buffer(&bufs.pack_params_buf, 4, bytemuck::bytes_of(&peak));
+        }
 
         // Scope the RefCell borrow so it's dropped before the await point
         let receiver = {
@@ -2019,9 +2056,19 @@ impl DecoderPipeline {
 
         let mut results: Vec<Vec<u8>> = Vec::with_capacity(gop_size);
 
+        let wasm_pack_peak: f32 = ((1u32 << info.bit_depth) - 1) as f32;
+
         #[allow(clippy::needless_range_loop)]
         for fi in 0..gop_size {
             self.ensure_cached(ctx, padded_w, padded_h, w, h, info.tile_size);
+
+            // Update pack_params peak for correct bit-depth clamping
+            {
+                let cached = self.cached.borrow();
+                let bufs = cached.as_ref().unwrap();
+                ctx.queue
+                    .write_buffer(&bufs.pack_params_buf, 4, bytemuck::bytes_of(&wasm_pack_peak));
+            }
 
             let receiver = {
                 let cached = self.cached.borrow();
@@ -2243,9 +2290,23 @@ impl DecoderPipeline {
         // Per-frame: inverse wavelet → color → crop → buf_to_tex → copy to owned texture
         let mut textures: Vec<wgpu::Texture> = Vec::with_capacity(gop_size);
 
+        // Compute scale for buf_to_tex (depends on bit_depth from FrameInfo)
+        let buf_to_tex_scale: f32 = 1.0 / ((1u32 << info.bit_depth) - 1) as f32;
+
         #[allow(clippy::needless_range_loop)]
         for fi in 0..gop_size {
             self.ensure_cached(ctx, padded_w, padded_h, w, h, info.tile_size);
+
+            // Update buf_to_tex scale uniform for correct bit-depth normalization
+            {
+                let cached = self.cached.borrow();
+                let bufs = cached.as_ref().unwrap();
+                ctx.queue.write_buffer(
+                    &bufs.buf_to_tex_params_buf,
+                    8,
+                    bytemuck::bytes_of(&buf_to_tex_scale),
+                );
+            }
 
             let cached = self.cached.borrow();
             let bufs = cached.as_ref().unwrap();
@@ -2541,6 +2602,16 @@ impl DecoderPipeline {
         let output_pixels = w * h;
 
         self.ensure_cached(ctx, padded_w, padded_h, w, h, info.tile_size);
+
+        // Update buf_to_tex scale uniform for correct bit-depth normalization
+        {
+            let scale: f32 = 1.0 / ((1u32 << info.bit_depth) - 1) as f32;
+            let cached = self.cached.borrow();
+            let bufs = cached.as_ref().unwrap();
+            ctx.queue
+                .write_buffer(&bufs.buf_to_tex_params_buf, 8, bytemuck::bytes_of(&scale));
+        }
+
         let cached = self.cached.borrow();
         let bufs = cached.as_ref().unwrap();
 

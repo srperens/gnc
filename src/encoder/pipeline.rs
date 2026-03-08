@@ -508,7 +508,7 @@ impl EncoderPipeline {
         let info = FrameInfo {
             width,
             height,
-            bit_depth: 8,
+            bit_depth: config.bit_depth,
             tile_size: config.tile_size,
             chroma_format,
         };

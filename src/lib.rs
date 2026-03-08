@@ -382,6 +382,9 @@ pub struct CodecConfig {
     pub adaptive_temporal_mul: bool,
     /// Chroma subsampling format (default: Yuv444 = no subsampling).
     pub chroma_format: ChromaFormat,
+    /// Bit depth of the input/output signal (8 or 10). Default: 8.
+    /// Affects FrameInfo.bit_depth, PSNR normalisation, and save/load helpers.
+    pub bit_depth: u32,
 }
 
 impl CodecConfig {
@@ -422,6 +425,7 @@ impl Default for CodecConfig {
             temporal_highpass_qstep_mul: 2.0,
             adaptive_temporal_mul: true,
             chroma_format: ChromaFormat::Yuv444,
+            bit_depth: 8,
         }
     }
 }

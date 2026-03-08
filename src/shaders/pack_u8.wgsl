@@ -3,7 +3,8 @@
 
 struct Params {
     total_f32s: u32, // total number of f32 values (width * height * 3)
-    _pad0: u32,
+    // peak: max signal value; 255.0 for 8-bit, 1023.0 for 10-bit
+    peak: f32,
     _pad1: u32,
     _pad2: u32,
 }
@@ -27,7 +28,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         var val: u32 = 0u;
         if (fi < params.total_f32s) {
             let f = input[fi];
-            val = u32(clamp(f + 0.5, 0.0, 255.0));
+            val = u32(clamp(f + 0.5, 0.0, params.peak));
         }
         packed = packed | (val << (i * 8u));
     }

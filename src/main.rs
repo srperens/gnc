@@ -15,10 +15,15 @@ use gnc::format::{
     deserialize_temporal_sequence, seek_to_keyframe, serialize_compressed, serialize_sequence,
     serialize_temporal_sequence,
 };
-use gnc::image_util::{load_image_rgb_f32, parse_chroma_format, parse_wavelet_type, save_image_rgb_f32};
+use gnc::image_util::{load_image_rgb_f32, load_image_rgb_f32_bits, parse_chroma_format, parse_wavelet_type, save_image_rgb_f32};
 use gnc::{
     CodecConfig, CompressedFrame, EntropyData, FrameType, GpuContext, RateMode, TemporalTransform,
 };
+
+/// Maximum signal value for a given bit depth: 255.0 for 8-bit, 1023.0 for 10-bit, etc.
+fn max_val_for_depth(bit_depth: u32) -> f64 {
+    ((1u32 << bit_depth) - 1) as f64
+}
 
 // ---------------------------------------------------------------------------
 // Minimal Y4M parser — no external dependency, streaming frame-by-frame.
@@ -361,6 +366,11 @@ enum Command {
         /// Chroma subsampling format: 444 (default, full resolution), 422, or 420
         #[arg(long, default_value = "444")]
         chroma_format: String,
+
+        /// Bit depth of the input image (8 or 10). Default: 8.
+        /// 10-bit PNGs must store 10-bit values in the high bits of 16-bit channels.
+        #[arg(long, default_value = "8")]
+        bit_depth: u32,
     },
 
     /// Decode a compressed file back to an image
@@ -427,6 +437,11 @@ enum Command {
         /// Compute VMAF perceptual quality score (requires vmaf CLI in PATH).
         #[arg(long)]
         vmaf: bool,
+
+        /// Bit depth of the input image (8 or 10). Default: 8.
+        /// 10-bit PNGs must store 10-bit values in the high bits of 16-bit channels.
+        #[arg(long, default_value = "8")]
+        bit_depth: u32,
     },
 
     /// Benchmark temporal (I+P frame) encoding on a sequence of frames
@@ -818,8 +833,9 @@ fn main() {
             no_per_subband,
             cpu_encode,
             chroma_format,
+            bit_depth,
         } => {
-            let (rgb_data, w, h) = load_image_rgb_f32(&input);
+            let (rgb_data, w, h) = load_image_rgb_f32_bits(&input, bit_depth);
             println!("Input: {}x{} ({} pixels)", w, h, w * h);
 
             let ctx = GpuContext::new();
@@ -869,6 +885,7 @@ fn main() {
                 config.gpu_entropy_encode = false;
             }
             config.chroma_format = parse_chroma_format(&chroma_format);
+            config.bit_depth = bit_depth;
 
             let compressed = encoder.encode(&ctx, &rgb_data, w, h, &config);
             println!(
@@ -922,8 +939,9 @@ fn main() {
             dct_freq_strength,
             chroma_format,
             vmaf,
+            bit_depth,
         } => {
-            let (rgb_data, w, h) = load_image_rgb_f32(&input);
+            let (rgb_data, w, h) = load_image_rgb_f32_bits(&input, bit_depth);
 
             let ctx = GpuContext::new();
             let mut encoder = EncoderPipeline::new(&ctx);
@@ -955,6 +973,7 @@ fn main() {
                 config.dct_freq_strength = fs;
             }
             config.chroma_format = parse_chroma_format(&chroma_format);
+            config.bit_depth = bit_depth;
 
             let coder_name = match config.entropy_coder {
                 gnc::EntropyCoder::Bitplane => "bitplane".to_string(),
@@ -977,9 +996,10 @@ fn main() {
             let compressed = encoder.encode(&ctx, &rgb_data, w, h, &config);
             let reconstructed = decoder.decode(&ctx, &compressed);
 
-            let psnr_all = quality::psnr(&rgb_data, &reconstructed, 255.0);
-            let (pr, pg, pb) = quality::psnr_per_channel(&rgb_data, &reconstructed, 255.0);
-            let ssim = quality::ssim_approx(&rgb_data, &reconstructed, 255.0);
+            let peak = max_val_for_depth(bit_depth) as f32;
+            let psnr_all = quality::psnr(&rgb_data, &reconstructed, peak);
+            let (pr, pg, pb) = quality::psnr_per_channel(&rgb_data, &reconstructed, peak);
+            let ssim = quality::ssim_approx(&rgb_data, &reconstructed, peak);
 
             let qm = QualityMetrics {
                 psnr_db: psnr_all,
@@ -1124,9 +1144,10 @@ fn main() {
                 let compressed = encoder.encode(&ctx, &rgb_data, w, h, &exp.config);
                 let reconstructed = decoder.decode(&ctx, &compressed);
 
-                let psnr_all = quality::psnr(&rgb_data, &reconstructed, 255.0);
-                let (pr, pg, pb) = quality::psnr_per_channel(&rgb_data, &reconstructed, 255.0);
-                let ssim = quality::ssim_approx(&rgb_data, &reconstructed, 255.0);
+                let peak = max_val_for_depth(exp.config.bit_depth) as f32;
+                let psnr_all = quality::psnr(&rgb_data, &reconstructed, peak);
+                let (pr, pg, pb) = quality::psnr_per_channel(&rgb_data, &reconstructed, peak);
+                let ssim = quality::ssim_approx(&rgb_data, &reconstructed, peak);
 
                 let qm = QualityMetrics {
                     psnr_db: psnr_all,
@@ -1626,11 +1647,12 @@ fn main() {
                         if gnc::encoder::diagnostics::enabled() {
                             let q = quality.unwrap_or(75);
                             let mul = tw_highpass_mul.unwrap_or(config_tw.temporal_highpass_qstep_mul);
+                            let tw_peak = max_val_for_depth(config_tw.bit_depth) as f32;
                             let per_frame_q: Vec<(f64, f64)> = gop_frames.iter()
                                 .zip(decoded_frames.iter())
                                 .map(|(orig, dec_frame)| {
-                                    let psnr = quality::psnr(orig, dec_frame, 255.0);
-                                    let ssim = quality::ssim_approx(orig, dec_frame, 255.0);
+                                    let psnr = quality::psnr(orig, dec_frame, tw_peak);
+                                    let ssim = quality::ssim_approx(orig, dec_frame, tw_peak);
                                     (psnr, ssim)
                                 })
                                 .collect();
@@ -1846,6 +1868,7 @@ fn main() {
             // skips local decode for the last P-frame in a sequence (optimization:
             // the reference won't be used again). This means encoder gpu_ref_planes
             // may be stale. Instead, compare decoded RGB output from both sides.
+            let ip_peak = max_val_for_depth(config_ip.bit_depth) as f32;
             if diagnostics {
                 println!("\n=== ENCODE/DECODE QUALITY CHECK ===");
                 for (i, cf) in compressed_ip.iter().enumerate() {
@@ -1854,7 +1877,7 @@ fn main() {
                         gnc::FrameType::Predicted => "P",
                         gnc::FrameType::Bidirectional => "B",
                     };
-                    let psnr = quality::psnr(&frames_data[i], &decoded_all[i], 255.0);
+                    let psnr = quality::psnr(&frames_data[i], &decoded_all[i], ip_peak);
                     let status = if psnr > 25.0 { "✓ OK" } else { "⚠ LOW" };
                     eprintln!(
                         "  Frame {:2} [{}] {}: PSNR={:.2} dB, {} bytes",
@@ -1871,8 +1894,8 @@ fn main() {
                     gnc::FrameType::Predicted => "P",
                     gnc::FrameType::Bidirectional => "B",
                 };
-                let psnr = quality::psnr(&frames_data[i], &decoded_all[i], 255.0);
-                let ssim = quality::ssim_approx(&frames_data[i], &decoded_all[i], 255.0);
+                let psnr = quality::psnr(&frames_data[i], &decoded_all[i], ip_peak);
+                let ssim = quality::ssim_approx(&frames_data[i], &decoded_all[i], ip_peak);
                 total_bytes_ip += cf.byte_size();
                 println!(
                     "  Frame {:2} [{}]: {:6} bytes, {:.2} bpp, PSNR {:.2} dB, SSIM {:.4}",
@@ -1935,10 +1958,11 @@ fn main() {
             println!("=== All I-frames (baseline) ===");
             let mut total_bytes_i: usize = 0;
             frame_metrics_i.clear();
+            let i_peak = max_val_for_depth(config_i.bit_depth) as f32;
             for (i, cf) in compressed_i.iter().enumerate() {
                 let decoded = decoder.decode(&ctx, cf);
-                let psnr = quality::psnr(&frames_data[i], &decoded, 255.0);
-                let ssim = quality::ssim_approx(&frames_data[i], &decoded, 255.0);
+                let psnr = quality::psnr(&frames_data[i], &decoded, i_peak);
+                let ssim = quality::ssim_approx(&frames_data[i], &decoded, i_peak);
                 total_bytes_i += cf.byte_size();
                 println!(
                     "  Frame {:2} [I]: {:6} bytes, {:.2} bpp, PSNR {:.2} dB, SSIM {:.4}",
@@ -2330,10 +2354,11 @@ fn main() {
                     low_frame_ptrs.push(cf);
                 }
 
+                let tw_ab_peak = max_val_for_depth(config_tw.bit_depth) as f32;
                 let mut frame_metrics_tw: Vec<FrameMetrics> = Vec::new();
                 for i in 0..frames_data.len() {
-                    let psnr = quality::psnr(&frames_data[i], &decoded_tw[i], 255.0);
-                    let ssim = quality::ssim_approx(&frames_data[i], &decoded_tw[i], 255.0);
+                    let psnr = quality::psnr(&frames_data[i], &decoded_tw[i], tw_ab_peak);
+                    let ssim = quality::ssim_approx(&frames_data[i], &decoded_tw[i], tw_ab_peak);
                     let bytes = per_frame_bytes[i];
                     let bpp = (bytes * 8.0) / (w as f64 * h as f64);
                     let frame_type = if i >= frames_data.len() - encoded_tw.tail_iframes.len() {
@@ -2984,8 +3009,9 @@ fn main() {
                     let reconstructed = decoder.decode(&ctx, &compressed);
                     let decode_ms = dec_start.elapsed().as_secs_f64() * 1000.0;
 
-                    let psnr = quality::psnr(&rgb_data, &reconstructed, 255.0);
-                    let ssim = quality::ssim_approx(&rgb_data, &reconstructed, 255.0);
+                    let rd_peak = max_val_for_depth(config.bit_depth) as f32;
+                    let psnr = quality::psnr(&rgb_data, &reconstructed, rd_peak);
+                    let ssim = quality::ssim_approx(&rgb_data, &reconstructed, rd_peak);
                     let bpp = compressed.bpp();
 
                     // Collect for codec comparison
@@ -3317,6 +3343,7 @@ fn main() {
                 let mut enc_time = std::time::Duration::ZERO;
                 let mut dec_time = std::time::Duration::ZERO;
 
+                let suite_peak = max_val_for_depth(config_tw.bit_depth) as f32;
                 if temporal_mode == TemporalTransform::None {
                     // All-I mode: encode each frame independently
                     for i in 0..num_frames {
@@ -3329,7 +3356,7 @@ fn main() {
                         let t1 = std::time::Instant::now();
                         let dec = decoder.decode(&ctx, &cf);
                         dec_time += t1.elapsed();
-                        let psnr = quality::psnr(&rgb, &dec, 255.0);
+                        let psnr = quality::psnr(&rgb, &dec, suite_peak);
                         psnr_vals.push(psnr);
                     }
                 } else {
@@ -3401,9 +3428,9 @@ fn main() {
                         for (j, dec_frame) in decoded.iter().enumerate() {
                             let path = format!("{}/frame_{:04}.png", seq_dir, base + j);
                             let (orig_rgb, _, _) = load_image_rgb_f32(&path);
-                            let psnr = quality::psnr(&orig_rgb, dec_frame, 255.0);
+                            let psnr = quality::psnr(&orig_rgb, dec_frame, suite_peak);
                             psnr_vals.push(psnr);
-                            let psnr_lp = quality::psnr(&orig_rgb, &lowpass_rgb, 255.0);
+                            let psnr_lp = quality::psnr(&orig_rgb, &lowpass_rgb, suite_peak);
                             psnr_lowpass_vals.push(psnr_lp);
                         }
                     }
@@ -3415,7 +3442,7 @@ fn main() {
                         dec_time += t0.elapsed();
                         let path = format!("{}/frame_{:04}.png", seq_dir, tail_start + i);
                         let (orig_rgb, _, _) = load_image_rgb_f32(&path);
-                        let psnr = quality::psnr(&orig_rgb, &dec, 255.0);
+                        let psnr = quality::psnr(&orig_rgb, &dec, suite_peak);
                         psnr_vals.push(psnr);
                     }
                 }

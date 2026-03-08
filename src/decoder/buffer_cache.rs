@@ -19,7 +19,8 @@ pub(super) struct CropParams {
 #[derive(Copy, Clone, Pod, Zeroable)]
 pub(super) struct PackParams {
     pub(super) total_f32s: u32,
-    pub(super) _pad0: u32,
+    /// Max signal value: 255.0 for 8-bit, 1023.0 for 10-bit.
+    pub(super) peak: f32,
     pub(super) _pad1: u32,
     pub(super) _pad2: u32,
 }
@@ -29,7 +30,8 @@ pub(super) struct PackParams {
 pub(super) struct TextureParams {
     pub(super) width: u32,
     pub(super) height: u32,
-    pub(super) _pad0: u32,
+    /// Scale factor: 1.0 / max_val (1/255 for 8-bit, 1/1023 for 10-bit)
+    pub(super) scale: f32,
     pub(super) _pad1: u32,
 }
 
@@ -299,7 +301,8 @@ impl CachedBuffers {
         // Pack params (constant per resolution)
         let pack_params = PackParams {
             total_f32s: total_f32s as u32,
-            _pad0: 0,
+            // Default 8-bit; overwritten per-frame via write_buffer when bit_depth != 8
+            peak: 255.0,
             _pad1: 0,
             _pad2: 0,
         };
@@ -415,7 +418,8 @@ impl CachedBuffers {
         let buf_to_tex_params = TextureParams {
             width,
             height,
-            _pad0: 0,
+            // Default 8-bit scale; overwritten per-frame via write_buffer when bit_depth != 8
+            scale: 1.0 / 255.0,
             _pad1: 0,
         };
         let buf_to_tex_params_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {

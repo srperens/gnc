@@ -2,7 +2,7 @@
 // upsample (422/420→444) using compute shaders.
 //
 // Both operations share the same Params uniform layout; the shader source
-// differs (box-filter average vs. nearest-neighbour).
+// differs (box-filter average for downsample vs. nearest-neighbour for upsample).
 
 use bytemuck::{Pod, Zeroable};
 use wgpu;
@@ -166,8 +166,21 @@ impl ChromaResampler {
         shift_x: u32,
         shift_y: u32,
     ) {
-        // Upsample writes to dst_w * dst_h pixels; dst_stride = dst_w, dst_height_padded = dst_h.
-        self.dispatch_raw(ctx, cmd, src_buf, dst_buf, src_w, src_h, dst_w, dst_h, shift_x, shift_y, dst_w, dst_h);
+        // Upsample shader guards on idx >= dst_width * dst_height and uses no
+        // stride/padded-height fields.  Pass them as 0 so there are no dummy
+        // sentinel values, and dispatch exactly dst_w * dst_h invocations.
+        let params = ChromaResampleParams {
+            src_width:         src_w,
+            src_height:        src_h,
+            dst_width:         dst_w,
+            dst_height:        dst_h,
+            dst_stride:        0, // unused by upsample shader
+            dst_height_padded: 0, // unused by upsample shader
+            shift_x,
+            shift_y,
+        };
+        let total_dst = dst_w * dst_h;
+        self.dispatch_with_params(ctx, cmd, src_buf, dst_buf, &params, total_dst);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -196,12 +209,28 @@ impl ChromaResampler {
             shift_x,
             shift_y,
         };
+        // Dispatch over the full padded output region (dst_stride × dst_height_padded)
+        // so every element — including padding — is written before the wavelet runs.
+        let total_dst = dst_stride * dst_height_padded;
+        self.dispatch_with_params(ctx, cmd, src_buf, dst_buf, &params, total_dst);
+    }
 
+    /// Create a uniform params buffer, bind group, and compute pass, then dispatch
+    /// `total_dst` invocations (rounded up to 256-thread workgroups).
+    fn dispatch_with_params(
+        &self,
+        ctx: &GpuContext,
+        cmd: &mut wgpu::CommandEncoder,
+        src_buf: &wgpu::Buffer,
+        dst_buf: &wgpu::Buffer,
+        params: &ChromaResampleParams,
+        total_dst: u32,
+    ) {
         let params_buf =
             ctx.device
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("chroma_resample_params"),
-                    contents: bytemuck::bytes_of(&params),
+                    contents: bytemuck::bytes_of(params),
                     usage: wgpu::BufferUsages::UNIFORM,
                 });
 
@@ -224,11 +253,7 @@ impl ChromaResampler {
             ],
         });
 
-        // Dispatch over the full padded output region (dst_stride × dst_height_padded)
-        // so every element — including padding — is written before the wavelet runs.
-        let total_dst = dst_stride * dst_height_padded;
         let workgroups = total_dst.div_ceil(256);
-
         let mut pass = cmd.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("chroma_resample_pass"),
             timestamp_writes: None,

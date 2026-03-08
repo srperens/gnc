@@ -85,11 +85,13 @@ See [BASELINE.md](BASELINE.md) for current benchmark numbers.
 - **Effort:** ~half day (libvmaf already at `/opt/homebrew/Cellar/libvmaf/3.0.0/bin/vmaf`; pattern exists in `benchmark-sequence`)
 
 ### 9. Bilinear chroma upsampling for 4:2:2 / 4:2:0
-- **Status:** todo (P3)
-- **Problem:** Current upsample shaders use nearest-neighbor, introducing avoidable reconstruction error estimated at 0.5-1.0 dB PSNR vs bilinear.
-- **Success criteria:** ≥ 0.5 dB PSNR improvement on bbb q=75 with 4:2:0, no fps regression vs nearest-neighbor baseline.
-- **Effort:** New upsample shader variant + Rust dispatch switch, ~1 day.
-- **Depends on:** #5 (done)
+- **Status:** invalidated (2026-03-08) — experiment run, hypothesis disproven
+- **Problem:** Current upsample shaders use nearest-neighbor.
+- **Outcome:** Bilinear caused VMAF −0.93 pts and PSNR −0.60 dB regression at q=75. Reverted.
+  Bilinear does NOT fix tile-edge artifacts (artifacts are inter-tile, not intra-tile).
+  NN upsampling is correct for current architecture.
+- **Kept:** dispatch cleanup (no dummy sentinel values), multi-tile tests for 422/420.
+- **See:** RESEARCH_LOG.md 2026-03-08 entry for full analysis.
 
 ### 10. 10-bit support
 - **Status:** todo (P3)

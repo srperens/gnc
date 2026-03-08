@@ -1408,3 +1408,57 @@ across two images and three chroma formats to establish a VMAF reference for fut
 - These numbers serve as baseline for the bilinear chroma upsampling experiment (backlog #9).
 
 ---
+
+## Bilinear chroma upsampling experiment — FAILED (2026-03-08)
+
+### Hypothesis
+Replacing NN with bilinear upsampling in `chroma_upsample.wgsl` would:
+- Reduce visible tile-edge artifacts in 422/420 video (smoothing discontinuities)
+- Improve VMAF ≥ +0.3 pts on 4:2:0 multi-tile sequences
+
+### Implementation
+- Added `fetch(cx, cy)` helper with edge-clamping in shader
+- 4:2:2: copy on even luma columns, average on odd columns
+- 4:2:0: H.264-style 4-sample bilinear blend weighted by (2-fx, fx) × (2-fy, fy)
+- Dispatch path cleaned up: `dispatch_upsample` no longer passes dummy sentinel values
+  for `dst_stride`/`dst_height_padded` (structural improvement, kept regardless)
+
+### Results — bbb_1080p q=75 4:2:0
+
+| Upsampler | PSNR (dB) | BPP  | VMAF  |
+|-----------|-----------|------|-------|
+| NN (baseline) | 36.62 | 2.90 | 93.85 |
+| Bilinear      | 36.02 | 2.90 | 92.92 |
+| Delta         | −0.60  | 0.00 | −0.93 |
+
+Both metrics regressed significantly:
+- VMAF −0.93 pts (BLOCK threshold: −0.5 pts) → **BLOCKED**
+- PSNR −0.60 dB (flag threshold: −0.3 dB) → **BLOCKED**
+
+Shader reverted. Structural dispatch cleanup and new multi-tile tests were kept.
+
+### Root cause analysis (why bilinear is worse)
+
+1. At q=75, wavelet-quantized chroma is a good reconstruction of the downsampled original.
+   NN upsampling preserves sharpness; bilinear adds low-pass blur on top of already-lossy
+   reconstruction — moves output further from original.
+2. VMAF is sensitive to blur. Bilinear makes chroma slightly soft everywhere.
+3. **Key insight**: bilinear does NOT fix tile-boundary artifacts. The shader runs
+   independently per tile. At the tile seam (col 256 luma / col 128 chroma for 4:2:2),
+   two separate dispatch outputs meet with no blending. Bilinear smooths WITHIN tiles
+   but has zero effect on the inter-tile discontinuity.
+
+### Open diagnosis: P-frame MC residual asymmetry (separate bug, medium confidence)
+Encoder computes MC residual against full-res chroma, but stores NN-upsampled chroma as
+P-frame reference. This creates systematic 2-pixel-period banding that accumulates over
+P-frame sequences. Separate investigation needed.
+
+### Next steps for tile-edge artifacts
+Bilinear is the wrong fix. Only these approaches can reduce inter-tile discontinuities:
+1. Post-reconstruction deblocking filter at tile boundaries (chroma decoder output)
+2. Overlapping tile windows (architectural change — breaks tile independence)
+3. Tighter per-tile rate control to keep quantization steps small
+
+Log as known limitation. No immediate action unless visually blocking.
+
+---

@@ -2970,7 +2970,10 @@ fn pframe_chroma_sequence_psnr(chroma_fmt: crate::ChromaFormat) -> (f64, f64) {
     let mut encoder = EncoderPipeline::new(&ctx);
     let decoder = crate::decoder::pipeline::DecoderPipeline::new(&ctx);
 
-    let w = 256u32;
+    // 512×256: two 256-wide luma tiles → exercises tile boundaries that a
+    // 256×256 single-tile frame would not.  Chroma tile boundary falls at
+    // x=128 (4:2:2) or (x=128, y=128) (4:2:0).
+    let w = 512u32;
     let h = 256u32;
     let f0 = make_gradient_frame(w, h, 0.0);
     // Slightly shifted gradients so P-frames have non-zero residual
@@ -3016,4 +3019,87 @@ fn test_pframe_yuv420_sequence_roundtrip() {
     eprintln!("P-frame 4:2:0 PSNR: P1={psnr1:.2} dB  P2={psnr2:.2} dB");
     assert!(psnr1 > 30.0, "4:2:0 P-frame 1 PSNR too low ({psnr1:.2} dB) — chroma tile mismatch?");
     assert!(psnr2 > 30.0, "4:2:0 P-frame 2 PSNR too low ({psnr2:.2} dB) — chroma tile mismatch?");
+}
+
+// ---------------------------------------------------------------------------
+// Bilinear chroma upsample tile-boundary test
+//
+// Uses a wide (512×256) frame so each chroma format spans multiple 256-pixel
+// tiles horizontally (2 luma tiles wide → chroma tile boundary at x=128 for
+// 4:2:2 and 4:2:0).  The bilinear filter must correctly interpolate across
+// those boundaries without reading garbage from neighbouring tiles.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_bilinear_chroma_upsample_tile_boundary_422() {
+    // 512×256: two 256-wide luma tiles → chroma is 256×256 for 4:2:2.
+    // A sharp horizontal ramp exercises the interpolation at tile seam (x=255/256).
+    let ctx = crate::GpuContext::new();
+    let mut encoder = EncoderPipeline::new(&ctx);
+    let decoder = crate::decoder::pipeline::DecoderPipeline::new(&ctx);
+
+    let w = 512u32;
+    let h = 256u32;
+    // Horizontal ramp: R/G/B all equal to x*255/(w-1), producing a grayscale
+    // gradient.  After YCoCg-R, Co and Cg are zero everywhere → chroma is flat,
+    // so the roundtrip should be near-lossless for chroma.  Luma carries the
+    // gradient and exercises tile-crossing upsample at the tile seam.
+    let rgb: Vec<f32> = (0..h)
+        .flat_map(|_y| {
+            (0..w).flat_map(|x| {
+                let v = x as f32 * 255.0 / (w - 1) as f32;
+                [v, v, v]
+            })
+        })
+        .collect();
+
+    let mut config = crate::CodecConfig::default();
+    config.chroma_format = crate::ChromaFormat::Yuv422;
+    config.quantization_step = 4.0;
+    config.cfl_enabled = false;
+
+    let compressed = encoder.encode(&ctx, &rgb, w, h, &config);
+    let decoded = decoder.decode(&ctx, &compressed);
+
+    assert_eq!(decoded.len(), (w * h * 3) as usize, "decoded size wrong");
+    let psnr = compute_psnr(&rgb, &decoded);
+    eprintln!("bilinear 4:2:2 tile-boundary 512×256 PSNR = {psnr:.2} dB");
+    // With bilinear upsample, PSNR on a smooth gradient should be well above 35 dB.
+    assert!(psnr > 35.0, "4:2:2 tile-boundary PSNR too low ({psnr:.2} dB) — bilinear upsample bug?");
+}
+
+#[test]
+fn test_bilinear_chroma_upsample_tile_boundary_420() {
+    // 512×256: tile-boundary at x=256 for luma (x=128 for 4:2:0 chroma).
+    // Also exercises vertical bilinear interpolation (shift_y=1).
+    let ctx = crate::GpuContext::new();
+    let mut encoder = EncoderPipeline::new(&ctx);
+    let decoder = crate::decoder::pipeline::DecoderPipeline::new(&ctx);
+
+    let w = 512u32;
+    let h = 256u32;
+    // 2D ramp: R=x*255/(w-1), G=y*255/(h-1), B=0.  Non-trivial Co/Cg signal
+    // ensures the chroma path carries live data through the tile boundary.
+    let rgb: Vec<f32> = (0..h)
+        .flat_map(|y| {
+            (0..w).flat_map(move |x| {
+                let r = x as f32 * 255.0 / (w - 1) as f32;
+                let g = y as f32 * 255.0 / (h - 1) as f32;
+                [r, g, 0.0f32]
+            })
+        })
+        .collect();
+
+    let mut config = crate::CodecConfig::default();
+    config.chroma_format = crate::ChromaFormat::Yuv420;
+    config.quantization_step = 4.0;
+    config.cfl_enabled = false;
+
+    let compressed = encoder.encode(&ctx, &rgb, w, h, &config);
+    let decoded = decoder.decode(&ctx, &compressed);
+
+    assert_eq!(decoded.len(), (w * h * 3) as usize, "decoded size wrong");
+    let psnr = compute_psnr(&rgb, &decoded);
+    eprintln!("bilinear 4:2:0 tile-boundary 512×256 PSNR = {psnr:.2} dB");
+    assert!(psnr > 34.0, "4:2:0 tile-boundary PSNR too low ({psnr:.2} dB) — bilinear upsample bug?");
 }

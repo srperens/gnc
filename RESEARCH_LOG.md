@@ -1409,6 +1409,46 @@ across two images and three chroma formats to establish a VMAF reference for fut
 
 ---
 
+## Rate control — temporal wavelet path (2026-03-08)
+
+### Implementation
+
+Virtual buffer model (R-Q model + VBV), wired into the temporal wavelet GOP loop
+in `benchmark-sequence`. Algorithm: R-Q model `bpp ≈ c * qstep^(-alpha)` with online
+log-space least-squares fitting; VBV buffer (1s capacity CBR, 2s VBR) for compliance.
+
+New methods in `rate_control.rs`:
+- `update_gop(qstep, total_bits_bytes, n_frames)`: advances VBV for full GOP, adds
+  ONE R-Q sample (not n_frames copies, which would degenerate regression).
+- `vbv_fill_ratio()`: VBV fill as fraction for diagnostic output.
+
+Diagnostic per-GOP: `[RC] gop=N target=XB actual=YB fill=Z% q=Q.QQ`
+
+### Results — bbb_1080p.y4m (static, 25fps, temporal Haar, GOP=8)
+
+| Target | GOP | Actual | Deviation | q    |
+|--------|-----|--------|-----------|------|
+| 10 Mbps (400000B/GOP) | startup | 1041189B | +160% | 8.74 → 29.09 |
+| | GOP 4 | 364558B | −8.9% | 31.62 |
+| | GOP 6 | 394519B | −1.4% | 28.81 |
+| | GOP 8 | 399200B | −0.2% | 28.40 |
+| | GOP 10 | 399773B | <0.1% | 28.35 |
+| 20 Mbps (800000B/GOP) | GOP 8+ | 799009–799824B | <0.1% | 12.25–12.27 |
+| 2 Mbps (80000B/GOP) | all | 124228B | hit q=128 (floor) | codec minimum |
+
+10s steady-state window deviation: <1% at 10 Mbps and 20 Mbps. **Success criterion met.**
+
+Startup transient (first ~2s / ~2 GOPs): excluded from criterion per protocol.
+At 2 Mbps: below codec minimum at 1080p; controller hits qstep=128 ceiling. Expected.
+
+### Notes
+
+- Only wired for `benchmark-sequence --temporal-wavelet`. I+P+B path was already wired.
+- `encode-sequence` and `benchmark` temporal paths retain `target_bitrate = None` intentionally
+  (batch/single-frame contexts, not streaming).
+
+---
+
 ## Bilinear chroma upsampling experiment — FAILED (2026-03-08)
 
 ### Hypothesis

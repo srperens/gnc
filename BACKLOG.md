@@ -117,9 +117,8 @@ See [BASELINE.md](BASELINE.md) for current benchmark numbers.
 - **Result:** Bit-exact encode/decode roundtrip for 10-bit input. `pack_u8.wgsl` peak parameterized, `buffer_to_texture.wgsl` uses scale uniform, all quality metrics use `max_val_for_depth()` across all subcommands. New test `test_10bit_roundtrip` passes. No regression on 8-bit tests.
 - **Note:** f32 shaders are transparent to bit depth — only I/O boundaries needed changing (loader, saver, pack_u8, buffer_to_texture). `bit_depth` was already in `FrameInfo` and bitstream header — no bitstream break.
 
-### 14. P-frame chroma: 4:2:0 sequences larger than 4:2:2 (MC residual asymmetry)
-- **Status:** done
-- **Problem:** 4:2:0 encoded sequences were paradoxically larger than 4:2:2. Root cause: luma-domain MC on NN-upsampled chroma reference (2×2 period) created structured HF residuals.
-- **Fix:** Chroma-domain MC for 4:2:0 P-frames. Encoder and decoder both: box-filter NN-upsampled reference → chroma dims, run MC at chroma dims with scaled MVs (÷2), NN-upsample result. New shader `motion_mv_scale.wgsl` scales luma MVs to chroma MVs.
-- **Result:** park_joy q=90, 16 frames: 4:2:2 = 10.04 bpp, 4:2:0 = 9.28 bpp (correct ordering, 4:2:0 is 7.6% smaller than 4:2:2). Previously 4:2:0 was 48% larger.
-- **Files:** `src/encoder/motion.rs` (+dispatch_mv_scale), `src/shaders/motion_mv_scale.wgsl`, `src/encoder/sequence.rs`, `src/encoder/buffer_cache.rs`, `src/decoder/gpu_work.rs`, `src/decoder/buffer_cache.rs`, `src/decoder/pipeline.rs`.
+### 14. P-frame and B-frame chroma: 4:2:0/4:2:2 MC residual domain mismatch
+- **Status:** active (2026-03-08) — P-frame fix committed, B-frame regression discovered
+- **P-frame fix (committed 856761c):** Chroma-domain MC for 4:2:0 P-frames. BPP ordering now correct: 4:2:0 < 4:2:2 < 4:4:4 (bbb: 2.20/2.35/2.61, crowd_run: 5.16/5.59/6.39 bpp). Ratio 0.92-0.95 (not yet ≤0.85 target, possibly B-frame overhead polluting avg).
+- **B-frame regression (blocked, 2026-03-08):** B-frames in 422/420 show up to 11.82 dB PSNR loss and are larger than I-frames. B-frames use locally-decoded P-frame as backward reference; P-frame local decode now stores chroma differently after the fix, breaking B-frame reference. Possibly pre-existing (B-frame 422/420 was never benchmarked before this fix).
+- **Next:** Diagnose B-frame MC reference mismatch. Check how locally-decoded P-frame chroma is stored after the P-frame fix and whether B-frame backward MC reads it in the correct domain.

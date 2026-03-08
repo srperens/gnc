@@ -94,6 +94,9 @@ pub struct MotionEstimator {
     compensate_bidir_bgl: wgpu::BindGroupLayout,
     split_pipeline: wgpu::ComputePipeline,
     split_bgl: wgpu::BindGroupLayout,
+    /// MV scaling pipeline — derives chroma MVs from luma MVs via arithmetic right-shift.
+    mv_scale_pipeline: wgpu::ComputePipeline,
+    mv_scale_bgl: wgpu::BindGroupLayout,
 }
 
 impl MotionEstimator {
@@ -326,6 +329,47 @@ impl MotionEstimator {
                 cache: None,
             });
 
+        // --- MV scaling pipeline (luma → chroma MVs for subsampled formats) ---
+        let mv_scale_shader = ctx
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("motion_mv_scale"),
+                source: wgpu::ShaderSource::Wgsl(
+                    include_str!("../shaders/motion_mv_scale.wgsl").into(),
+                ),
+            });
+
+        // 3 bindings: uniform params, src_mvs (ro), dst_mvs (rw)
+        let mv_scale_bgl = ctx
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("mv_scale_bgl"),
+                entries: &[
+                    bgl_uniform(0),
+                    bgl_storage_ro(1),
+                    bgl_storage_rw(2),
+                ],
+            });
+
+        let mv_scale_pl = ctx
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("mv_scale_pl"),
+                bind_group_layouts: &[&mv_scale_bgl],
+                push_constant_ranges: &[],
+            });
+
+        let mv_scale_pipeline =
+            ctx.device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("mv_scale_pipeline"),
+                    layout: Some(&mv_scale_pl),
+                    module: &mv_scale_shader,
+                    entry_point: Some("main"),
+                    compilation_options: Default::default(),
+                    cache: None,
+                });
+
         Self {
             match_pipeline,
             match_bgl,
@@ -337,6 +381,8 @@ impl MotionEstimator {
             compensate_bidir_bgl,
             split_pipeline,
             split_bgl,
+            mv_scale_pipeline,
+            mv_scale_bgl,
         }
     }
 
@@ -1659,6 +1705,65 @@ impl MotionEstimator {
         ctx.queue
             .write_buffer(buf, 0, bytemuck::cast_slice(&i32_data));
     }
+
+    /// Scale motion vectors for chroma subsampling by arithmetic right-shift.
+    ///
+    /// Luma MVs are in half-luma-pixel units.  For 4:2:0 chroma, the physical
+    /// displacement is half as large in each axis, so `shift_x = shift_y = 1`.
+    /// For 4:2:2 (horizontal only) `shift_x = 1, shift_y = 0`.
+    ///
+    /// The 8×8-luma-block and 4×4-chroma-block grids have the same block count
+    /// for 4:2:0, so the MV array is the same size — only values need scaling.
+    ///
+    /// Writes scaled MVs into `dst_buf` (must have STORAGE | COPY_DST usage
+    /// and be at least `total_blocks * 8` bytes).
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_mv_scale(
+        &self,
+        ctx: &GpuContext,
+        cmd: &mut wgpu::CommandEncoder,
+        src_mvs: &wgpu::Buffer,
+        dst_mvs: &wgpu::Buffer,
+        total_blocks: u32,
+        shift_x: u32,
+        shift_y: u32,
+    ) {
+        #[repr(C)]
+        #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+        struct MvScaleParams {
+            total_blocks: u32,
+            shift_x: u32,
+            shift_y: u32,
+            _pad: u32,
+        }
+        let params = MvScaleParams { total_blocks, shift_x, shift_y, _pad: 0 };
+        let params_buf = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("mv_scale_params"),
+            contents: bytemuck::bytes_of(&params),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+
+        let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("mv_scale_bg"),
+            layout: &self.mv_scale_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: params_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: src_mvs.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: dst_mvs.as_entire_binding() },
+            ],
+        });
+
+        let workgroups = total_blocks.div_ceil(256);
+        {
+            let mut pass = cmd.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("mv_scale_pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.mv_scale_pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(workgroups, 1, 1);
+        }
+    }
 }
 
 // Helper functions for bind group layout entries
@@ -1992,4 +2097,5 @@ mod tests {
         staging.unmap();
         result
     }
+
 }

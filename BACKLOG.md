@@ -15,13 +15,10 @@ See [BASELINE.md](BASELINE.md) for current benchmark numbers.
 - **Result:** rush_hour -37% bpp, crowd_run -4% bpp, stockholm +7% bpp (needs per-tile mode)
 
 ### 2. Per-tile temporal mode selection
-- **Status:** active (2026-03-06) — partial implementation, quality validation pending
-- **Problem:** Entire frame uses same temporal mode; static tiles waste bits with full spatial encode
-- **Success criteria:** Tiles with low motion energy use Haar, high motion use All-I; measurable bpp improvement on mixed-motion content
-- **Depends on:** #1
-- **Done:** GPU tile_energies readback (raw mean_abs per tile, binding 4 in TER shader). Per-tile zeroing in Pass B weight map: tiles with energy > 12.0 → TILE_ZERO_MUL=1000 → all coefficients quantized to zero.
-- **Result:** crowd_run -38% bpp, bbb/rush_hour 0% change (no hot tiles). Quality not validated — zeroing = temporal blur (LL average only), not true All-I.
-- **Next:** Visual quality validation. True All-I per tile requires bitstream format change (per-tile mode flag). Consider TILE_ENERGY_ZERO_THRESH tuning (12.0 is aggressive; 15-20 might be better). See ADR for struct layout verification lesson (0003).
+- **Status:** done (2026-03-08) — superseded by adaptive-mul system; zeroing approach removed
+- **Outcome:** The original zeroing approach (TILE_ZERO_MUL for energy > threshold) caused ghosting and was removed. The adaptive-mul curve (log-linear [MIN_MUL=1.2, MAX_MUL=2.0] over energy [0.5, 10.0]) already achieves per-tile adaptation: high-motion tiles (energy >10) get min_mul to preserve quality; truly static tiles (energy ≈0, as in crowd_run L0) hit max_mul and produce skip=true outputs.
+- **Diagnostic validation (2026-03-08):** bbb@q=75: tile energy p50=2.0 (real motion, correctly mid-curve). crowd_run@q=75: L0 tiles skip=true (energy 0.0), L1/L2 at min_mul (energy 7-15). System working as intended.
+- **Closed:** True All-I per tile would require bitstream format change for marginal gain (energy distribution shows no large population of tiles in the actionable zone). Not worth the complexity.
 
 ### 3. Encode performance -> 60 fps
 - **Status:** active (2026-03-06)
@@ -62,6 +59,13 @@ See [BASELINE.md](BASELINE.md) for current benchmark numbers.
   7× headroom), 4096 for 256px tiles (unchanged). Overflow guard fixed: was silent byte-drop,
   now GPU atomicStore + CPU panic with message on overflow. 128×128 tiles at 1080p now work
   (135 × 256 × 1024 = 33MB < 128MB WebGPU limit). New test: test_rice_128x128_tiles.
+
+### 13. Per-group k Rice optimization
+- **Status:** investigated (2026-03-08) — vetoed as formulated; EMA already provides this
+- **Finding:** Current Rice encoder uses per-coefficient EMA (window ~8) that already adapts k
+  continuously. Explicit per-group k would add 8 bytes/stream overhead (3-5× the estimated gain).
+  Implicit variant (EMA reset at group boundaries) is theoretically correct but implementation
+  risk (encoder/decoder desync) outweighs sub-0.08 bpp expected gain. Closed.
 
 ### 7. LL subband prediction
 - **Status:** todo (P3 — probably skip)
@@ -109,8 +113,13 @@ See [BASELINE.md](BASELINE.md) for current benchmark numbers.
 - **Note:** Primary goal of this project is to explore whether AI-driven iteration can produce something competitive in this space. SIMD path is downstream of that question.
 
 ### 10. 10-bit support
-- **Status:** todo (P3)
-- **Problem:** Codec is 8-bit only; no HDR or high-fidelity camera content can be encoded without precision loss.
-- **Success criteria:** Bit-exact encode/decode roundtrip for 10-bit input in [0, 1023]. No regression on existing 8-bit tests.
-- **Note:** Infrastructure partially in place — `bit_depth` field already exists in `FrameInfo` and the bitstream header. Main work is widening internal buffers and shader arithmetic from u8/u16 to u16/u32 where needed.
-- **Note:** Not a bitstream-breaking change if the `bit_depth` header field is already versioned correctly.
+- **Status:** done (2026-03-08)
+- **Result:** Bit-exact encode/decode roundtrip for 10-bit input. `pack_u8.wgsl` peak parameterized, `buffer_to_texture.wgsl` uses scale uniform, all quality metrics use `max_val_for_depth()` across all subcommands. New test `test_10bit_roundtrip` passes. No regression on 8-bit tests.
+- **Note:** f32 shaders are transparent to bit depth — only I/O boundaries needed changing (loader, saver, pack_u8, buffer_to_texture). `bit_depth` was already in `FrameInfo` and bitstream header — no bitstream break.
+
+### 14. P-frame chroma: 4:2:0 sequences larger than 4:2:2 (MC residual asymmetry)
+- **Status:** done
+- **Problem:** 4:2:0 encoded sequences were paradoxically larger than 4:2:2. Root cause: luma-domain MC on NN-upsampled chroma reference (2×2 period) created structured HF residuals.
+- **Fix:** Chroma-domain MC for 4:2:0 P-frames. Encoder and decoder both: box-filter NN-upsampled reference → chroma dims, run MC at chroma dims with scaled MVs (÷2), NN-upsample result. New shader `motion_mv_scale.wgsl` scales luma MVs to chroma MVs.
+- **Result:** park_joy q=90, 16 frames: 4:2:2 = 10.04 bpp, 4:2:0 = 9.28 bpp (correct ordering, 4:2:0 is 7.6% smaller than 4:2:2). Previously 4:2:0 was 48% larger.
+- **Files:** `src/encoder/motion.rs` (+dispatch_mv_scale), `src/shaders/motion_mv_scale.wgsl`, `src/encoder/sequence.rs`, `src/encoder/buffer_cache.rs`, `src/decoder/gpu_work.rs`, `src/decoder/buffer_cache.rs`, `src/decoder/pipeline.rs`.

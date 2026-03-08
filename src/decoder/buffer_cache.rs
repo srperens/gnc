@@ -108,6 +108,13 @@ pub(super) struct CachedBuffers {
     // Motion compensation block size from MotionField (8 or 16)
     pub(super) mc_block_size: u32,
 
+    // 4:2:0 chroma-domain MC: scaled MV buffer and chroma-recon scratch.
+    // mv_chroma_buf holds luma MVs scaled ÷2 (one per 8×8 luma block = one per 4×4 chroma block).
+    // chroma_recon_buf is a luma-sized scratch used to hold the chroma inverse-MC output before
+    // NN-upsampling; only the first chroma_pixels elements are written.
+    pub(super) mv_chroma_buf: wgpu::Buffer,
+    pub(super) chroma_recon_buf: wgpu::Buffer,
+
     // Output texture for zero-readback decode path
     #[allow(dead_code)]
     pub(super) output_texture: wgpu::Texture,
@@ -509,6 +516,30 @@ impl CachedBuffers {
             block_modes_cap,
             bwd_reference_planes,
             mc_block_size: ME_BLOCK_SIZE, // default, overwritten per-frame in prepare_frame_data
+
+            // 4:2:0 chroma-domain MC buffers.
+            // MV buffer: same block count as luma 8×8 grid, values halved for chroma.
+            // chroma_recon_buf: luma-sized; only first (padded_w/2 * padded_h/2) elements used.
+            mv_chroma_buf: {
+                let split_blocks_x = padded_w / crate::encoder::motion::ME_SPLIT_BLOCK_SIZE;
+                let split_blocks_y = padded_h / crate::encoder::motion::ME_SPLIT_BLOCK_SIZE;
+                let mv_size = (split_blocks_x * split_blocks_y) as u64 * 2 * 4;
+                ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("dec_mv_chroma"),
+                    size: mv_size.max(8),
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                })
+            },
+            chroma_recon_buf: ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("dec_chroma_recon"),
+                size: plane_size,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+
             output_texture,
             output_texture_view,
             buf_to_tex_bind_group,

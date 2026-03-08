@@ -92,6 +92,15 @@ pub(super) struct CachedEncodeBuffers {
     pub(super) mc_fwd_params_8: wgpu::Buffer,
     pub(super) mc_inv_params_8: wgpu::Buffer,
 
+    // MC params for 4:2:0 chroma (block_size=4, chroma dims).
+    // Used to run MC at chroma dims with scaled MVs, avoiding NN-upsample residual artifacts.
+    pub(super) mc_fwd_params_chroma420: wgpu::Buffer,
+    pub(super) mc_inv_params_chroma420: wgpu::Buffer,
+
+    // Scaled chroma MV buffer (same block count as split_mv, values halved for 4:2:0).
+    // Written by dispatch_mv_scale before chroma MC; reused across planes.
+    pub(super) mv_chroma_buf: wgpu::Buffer,
+
     // Staging buffers for deferred MV/bidir readback (reused across frames)
     pub(super) mv_staging_size: u64,
     // Staging buffer for 8x8-resolution split MVs (4x larger than 16x16)
@@ -570,6 +579,23 @@ impl CachedEncodeBuffers {
             mc_bidir_fwd_params: Self::make_mc_params_bs(ctx, padded_w, padded_h, true, ME_BLOCK_SIZE),
             mc_fwd_params_8: Self::make_mc_params_bs(ctx, padded_w, padded_h, true, ME_SPLIT_BLOCK_SIZE),
             mc_inv_params_8: Self::make_mc_params_bs(ctx, padded_w, padded_h, false, ME_SPLIT_BLOCK_SIZE),
+
+            // 4:2:0 chroma MC params: chroma dims = padded/2, block_size = ME_SPLIT_BLOCK_SIZE/2 = 4.
+            // The block grid is identical to luma (same count), only the spatial dims differ.
+            mc_fwd_params_chroma420: Self::make_mc_params_bs(ctx, padded_w / 2, padded_h / 2, true, ME_SPLIT_BLOCK_SIZE / 2),
+            mc_inv_params_chroma420: Self::make_mc_params_bs(ctx, padded_w / 2, padded_h / 2, false, ME_SPLIT_BLOCK_SIZE / 2),
+
+            mv_chroma_buf: {
+                let split_blocks_x = padded_w / ME_SPLIT_BLOCK_SIZE;
+                let split_blocks_y = padded_h / ME_SPLIT_BLOCK_SIZE;
+                let mv_size = (split_blocks_x * split_blocks_y) as u64 * 2 * 4;
+                ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("enc_mv_chroma"),
+                    size: mv_size.max(8),
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                })
+            },
 
             mv_staging_size,
             split_mv_staging_buf: {

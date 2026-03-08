@@ -49,6 +49,8 @@ pub struct DecoderPipeline {
     pub(super) temporal_haar: TemporalHaarGpu,
     pub(super) temporal_53: Temporal53Gpu,
     pub(super) chroma_up: ChromaResampler,
+    /// Box-filter downsampler for chroma ref extraction in 4:2:0 P-frame decode.
+    pub(super) chroma_down: ChromaResampler,
     pub(super) crop_pipeline: wgpu::ComputePipeline,
     pub(super) crop_bgl: wgpu::BindGroupLayout,
     pub(super) pack_pipeline: wgpu::ComputePipeline,
@@ -274,6 +276,7 @@ impl DecoderPipeline {
             temporal_haar: TemporalHaarGpu::new(ctx),
             temporal_53: Temporal53Gpu::new(ctx),
             chroma_up: ChromaResampler::new_upsample(ctx),
+            chroma_down: ChromaResampler::new_downsample(ctx),
             crop_pipeline,
             crop_bgl,
             pack_pipeline,

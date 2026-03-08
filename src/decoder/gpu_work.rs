@@ -20,7 +20,6 @@ impl DecoderPipeline {
         let padded_w = info.padded_width();
         let padded_h = info.padded_height();
         let padded_pixels = (padded_w * padded_h) as usize;
-        let is_pframe = frame.frame_type == FrameType::Predicted;
         let luma_tiles_per_plane = info.luma_tiles_per_plane();
         let blocks_per_tile_side = info.tile_size as usize / 32;
         let blocks_per_tile = blocks_per_tile_side * blocks_per_tile_side;
@@ -62,6 +61,23 @@ impl DecoderPipeline {
         } else {
             0
         };
+
+        // 4:2:0 chroma-domain MC: pre-scale luma MVs → chroma MVs (shared by both chroma planes).
+        // Must run once before the plane loop because both p=1 and p=2 use mv_chroma_buf.
+        let is_pframe = frame.frame_type == FrameType::Predicted;
+        let is_420 = info.chroma_format == ChromaFormat::Yuv420;
+        if is_pframe && is_420 {
+            let chroma_shift_x = info.chroma_format.horiz_shift();
+            let chroma_shift_y = info.chroma_format.vert_shift();
+            let split_blocks_x = padded_w / crate::encoder::motion::ME_SPLIT_BLOCK_SIZE;
+            let split_blocks_y = padded_h / crate::encoder::motion::ME_SPLIT_BLOCK_SIZE;
+            let total_blocks = split_blocks_x * split_blocks_y;
+            self.motion.dispatch_mv_scale(
+                ctx, &mut cmd,
+                &bufs.mv_buf, &bufs.mv_chroma_buf,
+                total_blocks, chroma_shift_x, chroma_shift_y,
+            );
+        }
 
         // Per-plane: entropy decode → dequantize → (CfL inverse predict) → inverse wavelet → copy to result buffer
         // p is used for many array accesses beyond plane_info_arr — keep the index loop.
@@ -299,10 +315,16 @@ impl DecoderPipeline {
             }
 
             // For non-444 chroma (p>0): upsample scratch_a from chroma size to luma size.
+            // Exception: 4:2:0 P-frame chroma uses chroma-domain MC (see below).
             // For 444: scratch_a is already at luma size.
             let is_non444_chroma =
                 p > 0 && info.chroma_format != ChromaFormat::Yuv444;
-            if is_non444_chroma {
+            // 4:2:0 P-frame chroma: perform MC at chroma dims to avoid NN-upsample HF artifacts.
+            // The encoder stores gpu_ref_planes[p] at luma dims (NN-upsampled), so
+            // box_filter(ref) recovers the correct chroma-resolution reference.
+            let is_420_pframe_chroma = is_420 && is_pframe && p > 0;
+            if is_non444_chroma && !is_420_pframe_chroma {
+                // 4:2:2 or I/B-frame non-444: upsample chroma residual to luma dims first.
                 let up_buf = if p == 1 { &bufs.co_plane_up } else { &bufs.cg_plane_up };
                 self.chroma_up.dispatch_upsample(
                     ctx,
@@ -322,7 +344,63 @@ impl DecoderPipeline {
             }
 
             let is_bframe = frame.frame_type == FrameType::Bidirectional;
-            if is_bframe {
+            if is_420_pframe_chroma {
+                // 4:2:0 P-frame chroma-domain MC:
+                //   scratch_a        = chroma-dims residual (from wavelet decode)
+                //   reference_planes[p] = luma-sized NN-upsampled reconstructed chroma
+                //   box_filter(reference_planes[p]) = chroma-dims reference (avoids HF artifacts)
+                //
+                // Step 1: box-filter luma-sized reference → chroma dims.
+                // Re-use co_plane_up/cg_plane_up as scratch for the chroma-dims reference.
+                let chroma_ref_scratch = if p == 1 { &bufs.co_plane_up } else { &bufs.cg_plane_up };
+                self.chroma_down.dispatch(
+                    ctx,
+                    &mut cmd,
+                    &bufs.reference_planes[p],
+                    chroma_ref_scratch,
+                    padded_w,
+                    padded_h,
+                    info.chroma_format.horiz_shift(),
+                    info.chroma_format.vert_shift(),
+                    p_padded_w,
+                    p_padded_h,
+                );
+                // Step 2: inverse MC at chroma dims: residual + warp(chroma_ref) → chroma_recon_buf.
+                // chroma_recon_buf is luma-sized; only the first chroma_pixels elements are written.
+                self.motion.compensate(
+                    ctx,
+                    &mut cmd,
+                    &bufs.scratch_a,
+                    chroma_ref_scratch,
+                    &bufs.mv_chroma_buf,
+                    &bufs.chroma_recon_buf,
+                    p_padded_w,
+                    p_padded_h,
+                    false, // inverse: recon = residual + predicted
+                    bufs.mc_block_size / 2,
+                );
+                // Step 3: NN-upsample chroma_recon_buf → plane_results[p] (luma dims).
+                self.chroma_up.dispatch_upsample(
+                    ctx,
+                    &mut cmd,
+                    &bufs.chroma_recon_buf,
+                    &bufs.plane_results[p],
+                    p_padded_w,
+                    p_padded_h,
+                    padded_w,
+                    padded_h,
+                    info.chroma_format.horiz_shift(),
+                    info.chroma_format.vert_shift(),
+                );
+                // Step 4: store reconstructed luma-sized chroma → reference_planes[p] for next frame.
+                cmd.copy_buffer_to_buffer(
+                    &bufs.plane_results[p],
+                    0,
+                    &bufs.reference_planes[p],
+                    0,
+                    plane_size,
+                );
+            } else if is_bframe {
                 // B-frame: use bidirectional compensation with both references
                 self.motion.compensate_bidir(
                     ctx,
@@ -340,7 +418,8 @@ impl DecoderPipeline {
                     bufs.mc_block_size,
                 );
             } else if is_pframe {
-                // P-frame: scratch_a has residual, add MC prediction from reference
+                // P-frame luma or 4:4:4/4:2:2 chroma: scratch_a has residual at luma dims,
+                // add MC prediction from reference.
                 self.motion.compensate(
                     ctx,
                     &mut cmd,
@@ -366,7 +445,8 @@ impl DecoderPipeline {
 
             // Copy reconstructed plane to reference buffer for next frame.
             // B-frames don't update references (they are non-reference frames).
-            if !is_bframe {
+            // 4:2:0 P-frame chroma already updated reference_planes[p] above (step 4).
+            if !is_bframe && !is_420_pframe_chroma {
                 cmd.copy_buffer_to_buffer(
                     &bufs.plane_results[p],
                     0,

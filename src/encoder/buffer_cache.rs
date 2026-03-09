@@ -81,6 +81,9 @@ pub(super) struct CachedEncodeBuffers {
     pub(super) me_params_pred: wgpu::Buffer,
     pub(super) bidir_params_nopred: wgpu::Buffer,
     pub(super) bidir_params_pred: wgpu::Buffer,
+    /// No predictor, no qpel: for B1 in modes where bidir qpel is too slow.
+    /// Uses integer-pel MVs only (skip Phase 3c+3d), saving ~30ms per B-frame.
+    pub(super) bidir_params_nopred_noqupel: wgpu::Buffer,
 
     // ME scratch (overwritten each frame, not returned to caller)
     pub(super) me_sad_buf: wgpu::Buffer,
@@ -587,7 +590,16 @@ impl CachedEncodeBuffers {
                 true,
                 ME_BIDIR_PRED_FINE_RANGE,
             ),
-
+            bidir_params_nopred_noqupel: Self::make_bidir_params_full(
+                ctx,
+                padded_w,
+                padded_h,
+                ME_BIDIR_SEARCH_RANGE,
+                false,
+                false,
+                0,
+                true, // skip_qpel: integer-pel only, saves ~30ms per B-frame
+            ),
 
             me_sad_buf: ctx.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("enc_me_sad"),
@@ -775,6 +787,23 @@ impl CachedEncodeBuffers {
         use_bwd_predictor: bool,
         pred_fine_range: u32,
     ) -> wgpu::Buffer {
+        Self::make_bidir_params_full(
+            ctx, padded_w, padded_h, search_range,
+            use_fwd_predictor, use_bwd_predictor, pred_fine_range, false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)] // 8 params: resolution + 5 config flags, no good grouping
+    fn make_bidir_params_full(
+        ctx: &GpuContext,
+        padded_w: u32,
+        padded_h: u32,
+        search_range: u32,
+        use_fwd_predictor: bool,
+        use_bwd_predictor: bool,
+        pred_fine_range: u32,
+        skip_qpel: bool,
+    ) -> wgpu::Buffer {
         #[repr(C)]
         #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
         struct BiDirMatchParams {
@@ -788,7 +817,7 @@ impl CachedEncodeBuffers {
             pred_fine_range: u32,
             use_fwd_predictor: u32,
             use_bwd_predictor: u32,
-            _pad0: u32,
+            skip_qpel: u32,          // 1 = skip Phase 3c+3d
             _pad1: u32,
         }
         let blocks_x = padded_w / ME_BLOCK_SIZE;
@@ -806,7 +835,7 @@ impl CachedEncodeBuffers {
             pred_fine_range: if have_either { pred_fine_range } else { 0 },
             use_fwd_predictor: u32::from(use_fwd_predictor),
             use_bwd_predictor: u32::from(use_bwd_predictor),
-            _pad0: 0,
+            skip_qpel: u32::from(skip_qpel),
             _pad1: 0,
         };
         ctx.device

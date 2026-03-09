@@ -1663,3 +1663,54 @@ The pipelining commits (#19) are real improvements:
 ### Verdict: SHIP PIPELINING, CLOSE WARM-START ATTEMPT
 Commits: 86ac25e (phase 1+2), 1d7f09f (P pipeline), eaa33af (B pipeline), f7f5da6 (infra).
 #19 marked done. #16 marked done. #18 closed. #20 added (bidir qpel optimization).
+
+---
+
+## 2026-03-09: Bidir ME qpel skip_qpel (#20)
+
+### Hypothesis
+Wrapping Phase 3c+3d in `if params.skip_qpel == 0u {}` uniform blocks eliminates
+~32 barrier loops per block when skip_qpel=1, dropping B1 from ~72ms to ~30ms.
+Predicted I+P+B fps gain: +20-30%. VMAF regression predicted <0.5 pts.
+
+### Implementation
+`block_match_bidir.wgsl`: Phase 3c and Phase 3d wrapped in uniform `if params.skip_qpel == 0u {}` blocks. Variable declarations (hp_fwd_dx/dy/sad, hp_bwd_dx/dy) moved before the guards. Unconditional workgroupBarrier() after each block for Phase 3e sync. All threads uniformly skip both phases when skip_qpel=1 — valid WGSL uniform control flow.
+
+### Results (3 sequences, q=75, 60 frames, GNC_BFRAME_NOQUPEL=1 vs default)
+
+| Sequence | qpel fps | noqupel fps | Δfps | qpel bpp | noqupel bpp | Δbpp | VMAF Δ |
+|---|---|---|---|---|---|---|---|
+| bbb | 19.6 | 20.8 | +6% | 2.54 | 2.57 | +1.2% | +0.10 (noise) |
+| crowd_run | 19.4 | 21.0 | +8% | 6.50 | 6.60 | +1.5% | 0.00 |
+| park_joy | 19.3 | 20.7 | +7% | 5.65 | 5.74 | +1.6% | 0.00 |
+
+### Analysis
+
+The predicted speedup (+20-30%) was not achieved (+6-8% actual). Why?
+
+The expected savings: 2 B-pairs per 8-frame GOP × 40ms/pair = 80ms per GOP.
+But measured savings: ~25ms per GOP (60-frame run: 1651ms → 1521ms crowd_run = 130ms for 4 GOPs = ~32ms/GOP).
+
+Root cause: The I-frame encode dominates. With keyframe_interval=8:
+- I-frame: ~250ms (3× a P-frame)
+- P-frames: 3× ~30ms = ~90ms per GOP
+- B-frames: 4× ~25ms (post-pipelining) = ~100ms per GOP
+- GOP total ≈ 440ms
+
+Skipping B-frame qpel saves ~40ms per GOP, which is only ~9% of 440ms. The 6-8%
+measured is consistent with this. The I-frame cannot be helped by skip_qpel (it uses
+unidirectional ME, already not the bottleneck).
+
+The bpp cost (+1.2-1.6%) is consistent with integer-pel MVs being less precise.
+VMAF is unchanged because B-frames are non-reference and the quality difference
+is below perceptual threshold at q=75.
+
+### Decision
+
+Success criterion (≥23fps) NOT met. Keep qpel ON as default. skip_qpel remains
+as `GNC_BFRAME_NOQUPEL=1` opt-in for speed-over-quality use cases.
+
+Key finding: To reach 25fps I+P+B, the I-frame encode must be faster. The current
+I-frame bottleneck is the wavelet transform + entropy coding, not ME.
+
+### Verdict: SHIP AS OPT-IN, DO NOT MAKE DEFAULT

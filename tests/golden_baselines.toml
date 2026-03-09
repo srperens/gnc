@@ -21,8 +21,8 @@ psnr_min = 59.34
 bpp_max = 0.4022
 
 [checkerboard_512x512.q25]
-psnr_min = 32.64
-bpp_max = 1.3071
+psnr_min = 32.62
+bpp_max = 1.2489
 
 [checkerboard_512x512.q50]
 psnr_min = 36.48

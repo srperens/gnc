@@ -4202,8 +4202,14 @@ impl EncoderPipeline {
                 bwd_mv_buf = pre_me.bwd_mv_buf;
             } else {
                 let have_bidir_pred = predictor_fwd_mvs.is_some() && predictor_bwd_mvs.is_some();
+                // GNC_BFRAME_NOQUPEL=1: skip bidir qpel refinement for B-frames.
+                // Saves ~30ms/B-frame by omitting Phase 3c+3d. Trade-off: integer-pel
+                // B-frame MVs (same as before QP-ME was added to B-frames).
+                let skip_qpel = std::env::var("GNC_BFRAME_NOQUPEL").is_ok();
                 let bidir_params = if have_bidir_pred {
                     &bufs.bidir_params_pred
+                } else if skip_qpel {
+                    &bufs.bidir_params_nopred_noqupel
                 } else {
                     &bufs.bidir_params_nopred
                 };

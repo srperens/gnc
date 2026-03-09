@@ -129,15 +129,21 @@ See [BASELINE.md](BASELINE.md) for current benchmark numbers.
 - **Lesson:** Metal sync latency (~18ms) is only the bottleneck when ME < 18ms (never true for bidir ME at ~60ms). For P-frames (ME ~41ms > 18ms), pipelining works well. For B-frames, the ME itself is the bottleneck.
 
 ### 20. Bidir ME qpel bottleneck: reduce Phase 3c/3d cost
-- **Status:** todo (P2)
-- **Root cause:** Bidir ME takes ~72ms for B1 (first B-frame, no predictor). Profiling shows Phase 3c+3d (quarter-pel refinement, two stages × 2 directions = 32 barrier loops per block) is the dominant cost — not the coarse search. P-frame ME (single direction qpel) takes 41ms. Bidir ≈ 1.75× P-frame, consistent with 2 qpel passes.
-- **Options investigated:**
-  1. P-anchor MV as B1 fwd predictor (eliminates fwd coarse) → zero fps gain (qpel dominates), bpp +0.9% regression. Reverted.
-  2. Independent fwd/bwd predictor flags in shader (infrastructure committed, not used).
-- **Hypothesis A:** Skip bidir qpel entirely (use half-pel only for B-frames). Expected: B1 drops from 72ms to ~20ms. Quality cost: unknown, needs measurement. Predicted: <0.5 VMAF pts at q=75 since B-frames are non-reference.
-- **Hypothesis B:** Reduce qpel search from 16 candidates (8 half-pel + 8 qpel) to 8 total (skip half-pel stage, go directly to qpel ±1 from integer). Half-pel stage is only needed to find the right neighborhood.
-- **Success criteria:** I+P+B fps ≥23fps (from 19.5fps); VMAF regression ≤0.3 pts; bpp regression ≤1%; all tests pass.
-- **Note:** The bidir_params_fwd_only variant (with use_fwd_predictor/use_bwd_predictor flags) is already in the codebase from the failed predictor experiment. Bidir qpel reduction is a 1-shader change.
+- **Status:** done (2026-03-09) — implemented as opt-in; NOT made default
+- **Root cause:** Bidir ME takes ~72ms for B1. Phase 3c+3d (32 barrier loops per block) is dominant. P-frame ME = 41ms; bidir ≈ 1.75× P-frame.
+- **Implementation:** Wrapped Phase 3c and Phase 3d in `if params.skip_qpel == 0u { }` uniform blocks in `block_match_bidir.wgsl`. All barriers inside are now in uniform control flow. `GNC_BFRAME_NOQUPEL=1` env var gates the skip. `bidir_params_nopred_noqupel` buffer in buffer_cache.rs.
+- **Measured results (3 sequences, q=75, 60 frames each):**
+
+  | Sequence | qpel fps | noqupel fps | Δfps | qpel bpp | noqupel bpp | Δbpp |
+  |---|---|---|---|---|---|---|
+  | bbb | 19.6 | 20.8 | +6% | 2.54 | 2.57 | +1.2% |
+  | crowd_run | 19.4 | 21.0 | +8% | 6.50 | 6.60 | +1.5% |
+  | park_joy | 19.3 | 20.7 | +7% | 5.65 | 5.74 | +1.6% |
+  VMAF: within noise on all sequences.
+
+- **Why success criterion (≥23fps) was not met:** I-frame encode (~250ms per GOP) dominates total time. B-frame qpel savings (~40ms per B-frame pair) are diluted by the I-frame overhead. The actual savings were +6-8% fps, not +20-30% as expected.
+- **Decision:** Keep qpel ON as default (better bpp at modest fps cost). `GNC_BFRAME_NOQUPEL=1` remains as opt-in for speed-over-quality use cases.
+- **Key finding:** The real bottleneck for reaching 25fps I+P+B is the I-frame encode speed, not B-frame ME qpel.
 
 ### 17. Scene cut detection + adaptive GOP
 - **Status:** todo (P3)

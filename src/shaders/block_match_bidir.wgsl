@@ -24,7 +24,7 @@ struct Params {
     pred_fine_range: u32,
     use_fwd_predictor: u32,  // 1 = skip forward coarse, use predictor_fwd_mvs + fine search
     use_bwd_predictor: u32,  // 1 = skip backward coarse, use predictor_bwd_mvs + fine search
-    _pad0: u32,
+    skip_qpel: u32,          // 1 = skip Phase 3c+3d (qpel refinement); use integer-pel MVs only
     _pad1: u32,
 }
 
@@ -450,275 +450,283 @@ fn main(
     // ========== Phase 3c: Forward quarter-pel refinement (two stages, all 256 threads) ==========
     // Stage A: half-pel positions (step ±2 QP units). Stage B: quarter-pel (step ±1).
     // Active for mode 0 (fwd-only) and mode 2 (bidir). Skipped if SAD is zero.
+    // skip_qpel=1: wrap the entire phase so all 256 threads uniformly skip the barrier-heavy loops.
 
     var hp_fwd_dx = center_fwd_qx;
     var hp_fwd_dy = center_fwd_qy;
     var hp_fwd_sad = mode_sad;
 
-    let do_fwd_hp = (best_mode == 0u || best_mode == 2u) && mode_sad > 0u;
-    if tid == 0u {
-        hp_track_sad = mode_sad;
-        hp_track_mv = pack_mv(center_fwd_qx, center_fwd_qy);
-    }
-    workgroupBarrier();
-
-    let hp_px = tid % params.block_size;
-    let hp_py = tid / params.block_size;
-    let hp_cur_val = select(0.0, current_y[(block_origin_y + hp_py) * params.width + block_origin_x + hp_px], do_fwd_hp);
-
-    // For bidir, precompute backward sample at integer bwd position (constant across fwd candidates).
-    var hp_bwd_sample: f32 = 0.0;
-    if do_fwd_hp && best_mode == 2u {
-        let bqx = i32(block_origin_x + hp_px) * 4 + center_bwd_qx;
-        let bqy = i32(block_origin_y + hp_py) * 4 + center_bwd_qy;
-        hp_bwd_sample = sample_hp_bwd(bqx, bqy, params.width, params.height);
-    }
-
-    // Stage A: half-pel (step 2) for forward.
-    for (var cand = 0u; cand < 8u; cand++) {
-        var off_x: i32 = 0;
-        var off_y: i32 = 0;
-        switch cand {
-            case 0u: { off_x =  0; off_y = -2; }
-            case 1u: { off_x = -2; off_y =  0; }
-            case 2u: { off_x =  2; off_y =  0; }
-            case 3u: { off_x =  0; off_y =  2; }
-            case 4u: { off_x = -2; off_y = -2; }
-            case 5u: { off_x =  2; off_y = -2; }
-            case 6u: { off_x = -2; off_y =  2; }
-            case 7u: { off_x =  2; off_y =  2; }
-            default: {}
+    if params.skip_qpel == 0u {
+        let do_fwd_hp = (best_mode == 0u || best_mode == 2u) && mode_sad > 0u;
+        if tid == 0u {
+            hp_track_sad = mode_sad;
+            hp_track_mv = pack_mv(center_fwd_qx, center_fwd_qy);
         }
-
-        let test_qx = center_fwd_qx + off_x;
-        let test_qy = center_fwd_qy + off_y;
-
-        let ref_base_qx = i32(block_origin_x) * 4 + test_qx;
-        let ref_base_qy = i32(block_origin_y) * 4 + test_qy;
-        let valid = do_fwd_hp && ref_base_qx >= -3 && ref_base_qy >= -3 &&
-                    ref_base_qx + bs * 4 <= w * 4 + 3 &&
-                    ref_base_qy + bs * 4 <= h * 4 + 3;
-
-        var pixel_diff: u32 = 0u;
-        if valid {
-            let rqx = i32(block_origin_x + hp_px) * 4 + test_qx;
-            let rqy = i32(block_origin_y + hp_py) * 4 + test_qy;
-            let fwd_val = sample_hp_fwd(rqx, rqy, params.width, params.height);
-            var pred: f32;
-            if best_mode == 0u { pred = fwd_val; } else { pred = (fwd_val + hp_bwd_sample) * 0.5; }
-            pixel_diff = u32(abs(hp_cur_val - pred));
-        }
-
-        shared_sad[tid] = pixel_diff;
         workgroupBarrier();
-        for (var stride = 128u; stride > 0u; stride >>= 1u) {
-            if tid < stride { shared_sad[tid] += shared_sad[tid + stride]; }
+
+        let hp_px = tid % params.block_size;
+        let hp_py = tid / params.block_size;
+        let hp_cur_val = select(0.0, current_y[(block_origin_y + hp_py) * params.width + block_origin_x + hp_px], do_fwd_hp);
+
+        // For bidir, precompute backward sample at integer bwd position (constant across fwd candidates).
+        var hp_bwd_sample: f32 = 0.0;
+        if do_fwd_hp && best_mode == 2u {
+            let bqx = i32(block_origin_x + hp_px) * 4 + center_bwd_qx;
+            let bqy = i32(block_origin_y + hp_py) * 4 + center_bwd_qy;
+            hp_bwd_sample = sample_hp_bwd(bqx, bqy, params.width, params.height);
+        }
+
+        // Stage A: half-pel (step 2) for forward.
+        for (var cand = 0u; cand < 8u; cand++) {
+            var off_x: i32 = 0;
+            var off_y: i32 = 0;
+            switch cand {
+                case 0u: { off_x =  0; off_y = -2; }
+                case 1u: { off_x = -2; off_y =  0; }
+                case 2u: { off_x =  2; off_y =  0; }
+                case 3u: { off_x =  0; off_y =  2; }
+                case 4u: { off_x = -2; off_y = -2; }
+                case 5u: { off_x =  2; off_y = -2; }
+                case 6u: { off_x = -2; off_y =  2; }
+                case 7u: { off_x =  2; off_y =  2; }
+                default: {}
+            }
+
+            let test_qx = center_fwd_qx + off_x;
+            let test_qy = center_fwd_qy + off_y;
+
+            let ref_base_qx = i32(block_origin_x) * 4 + test_qx;
+            let ref_base_qy = i32(block_origin_y) * 4 + test_qy;
+            let valid = do_fwd_hp && ref_base_qx >= -3 && ref_base_qy >= -3 &&
+                        ref_base_qx + bs * 4 <= w * 4 + 3 &&
+                        ref_base_qy + bs * 4 <= h * 4 + 3;
+
+            var pixel_diff: u32 = 0u;
+            if valid {
+                let rqx = i32(block_origin_x + hp_px) * 4 + test_qx;
+                let rqy = i32(block_origin_y + hp_py) * 4 + test_qy;
+                let fwd_val = sample_hp_fwd(rqx, rqy, params.width, params.height);
+                var pred: f32;
+                if best_mode == 0u { pred = fwd_val; } else { pred = (fwd_val + hp_bwd_sample) * 0.5; }
+                pixel_diff = u32(abs(hp_cur_val - pred));
+            }
+
+            shared_sad[tid] = pixel_diff;
+            workgroupBarrier();
+            for (var stride = 128u; stride > 0u; stride >>= 1u) {
+                if tid < stride { shared_sad[tid] += shared_sad[tid + stride]; }
+                workgroupBarrier();
+            }
+            if tid == 0u && valid {
+                if shared_sad[0] < hp_track_sad { hp_track_sad = shared_sad[0]; hp_track_mv = pack_mv(test_qx, test_qy); }
+            }
             workgroupBarrier();
         }
-        if tid == 0u && valid {
-            if shared_sad[0] < hp_track_sad { hp_track_sad = shared_sad[0]; hp_track_mv = pack_mv(test_qx, test_qy); }
-        }
-        workgroupBarrier();
-    }
 
-    // Stage B: quarter-pel (step 1) for forward.
-    let stageA_fwd_qx = unpack_dx(hp_track_mv);
-    let stageA_fwd_qy = unpack_dy(hp_track_mv);
+        // Stage B: quarter-pel (step 1) for forward.
+        let stageA_fwd_qx = unpack_dx(hp_track_mv);
+        let stageA_fwd_qy = unpack_dy(hp_track_mv);
 
-    for (var cand = 0u; cand < 8u; cand++) {
-        var off_x: i32 = 0;
-        var off_y: i32 = 0;
-        switch cand {
-            case 0u: { off_x =  0; off_y = -1; }
-            case 1u: { off_x = -1; off_y =  0; }
-            case 2u: { off_x =  1; off_y =  0; }
-            case 3u: { off_x =  0; off_y =  1; }
-            case 4u: { off_x = -1; off_y = -1; }
-            case 5u: { off_x =  1; off_y = -1; }
-            case 6u: { off_x = -1; off_y =  1; }
-            case 7u: { off_x =  1; off_y =  1; }
-            default: {}
-        }
+        for (var cand = 0u; cand < 8u; cand++) {
+            var off_x: i32 = 0;
+            var off_y: i32 = 0;
+            switch cand {
+                case 0u: { off_x =  0; off_y = -1; }
+                case 1u: { off_x = -1; off_y =  0; }
+                case 2u: { off_x =  1; off_y =  0; }
+                case 3u: { off_x =  0; off_y =  1; }
+                case 4u: { off_x = -1; off_y = -1; }
+                case 5u: { off_x =  1; off_y = -1; }
+                case 6u: { off_x = -1; off_y =  1; }
+                case 7u: { off_x =  1; off_y =  1; }
+                default: {}
+            }
 
-        let test_qx = stageA_fwd_qx + off_x;
-        let test_qy = stageA_fwd_qy + off_y;
+            let test_qx = stageA_fwd_qx + off_x;
+            let test_qy = stageA_fwd_qy + off_y;
 
-        let ref_base_qx = i32(block_origin_x) * 4 + test_qx;
-        let ref_base_qy = i32(block_origin_y) * 4 + test_qy;
-        let valid = do_fwd_hp && ref_base_qx >= -3 && ref_base_qy >= -3 &&
-                    ref_base_qx + bs * 4 <= w * 4 + 3 &&
-                    ref_base_qy + bs * 4 <= h * 4 + 3;
+            let ref_base_qx = i32(block_origin_x) * 4 + test_qx;
+            let ref_base_qy = i32(block_origin_y) * 4 + test_qy;
+            let valid = do_fwd_hp && ref_base_qx >= -3 && ref_base_qy >= -3 &&
+                        ref_base_qx + bs * 4 <= w * 4 + 3 &&
+                        ref_base_qy + bs * 4 <= h * 4 + 3;
 
-        var pixel_diff: u32 = 0u;
-        if valid {
-            let rqx = i32(block_origin_x + hp_px) * 4 + test_qx;
-            let rqy = i32(block_origin_y + hp_py) * 4 + test_qy;
-            let fwd_val = sample_hp_fwd(rqx, rqy, params.width, params.height);
-            var pred: f32;
-            if best_mode == 0u { pred = fwd_val; } else { pred = (fwd_val + hp_bwd_sample) * 0.5; }
-            pixel_diff = u32(abs(hp_cur_val - pred));
-        }
+            var pixel_diff: u32 = 0u;
+            if valid {
+                let rqx = i32(block_origin_x + hp_px) * 4 + test_qx;
+                let rqy = i32(block_origin_y + hp_py) * 4 + test_qy;
+                let fwd_val = sample_hp_fwd(rqx, rqy, params.width, params.height);
+                var pred: f32;
+                if best_mode == 0u { pred = fwd_val; } else { pred = (fwd_val + hp_bwd_sample) * 0.5; }
+                pixel_diff = u32(abs(hp_cur_val - pred));
+            }
 
-        shared_sad[tid] = pixel_diff;
-        workgroupBarrier();
-        for (var stride = 128u; stride > 0u; stride >>= 1u) {
-            if tid < stride { shared_sad[tid] += shared_sad[tid + stride]; }
+            shared_sad[tid] = pixel_diff;
+            workgroupBarrier();
+            for (var stride = 128u; stride > 0u; stride >>= 1u) {
+                if tid < stride { shared_sad[tid] += shared_sad[tid + stride]; }
+                workgroupBarrier();
+            }
+            if tid == 0u && valid {
+                if shared_sad[0] < hp_track_sad { hp_track_sad = shared_sad[0]; hp_track_mv = pack_mv(test_qx, test_qy); }
+            }
             workgroupBarrier();
         }
-        if tid == 0u && valid {
-            if shared_sad[0] < hp_track_sad { hp_track_sad = shared_sad[0]; hp_track_mv = pack_mv(test_qx, test_qy); }
-        }
-        workgroupBarrier();
-    }
 
-    if do_fwd_hp {
-        hp_fwd_dx = unpack_dx(hp_track_mv);
-        hp_fwd_dy = unpack_dy(hp_track_mv);
-        hp_fwd_sad = hp_track_sad;
+        if do_fwd_hp {
+            hp_fwd_dx = unpack_dx(hp_track_mv);
+            hp_fwd_dy = unpack_dy(hp_track_mv);
+            hp_fwd_sad = hp_track_sad;
+        }
     }
+    // Uniform barrier: sync hp_fwd_dx/dy for Phase 3d broadcast regardless of skip_qpel.
     workgroupBarrier();
 
     // ========== Phase 3d: Backward quarter-pel refinement (two stages, all 256 threads) ==========
     // Stage A: half-pel (step ±2). Stage B: quarter-pel (step ±1).
     // Active for mode 1 (bwd-only) and mode 2 (bidir).
+    // skip_qpel=1: all threads uniformly skip the barrier-heavy loops.
 
     var hp_bwd_dx = center_bwd_qx;
     var hp_bwd_dy = center_bwd_qy;
 
-    let do_bwd_hp = (best_mode == 1u || best_mode == 2u) && mode_sad > 0u;
+    if params.skip_qpel == 0u {
+        let do_bwd_hp = (best_mode == 1u || best_mode == 2u) && mode_sad > 0u;
 
-    // Broadcast refined forward QP MV to all threads.
-    if tid == 0u {
-        shared_mv[0] = pack_mv(hp_fwd_dx, hp_fwd_dy);
-    }
-    workgroupBarrier();
-    let refined_fwd_qx = unpack_dx(shared_mv[0]);
-    let refined_fwd_qy = unpack_dy(shared_mv[0]);
-
-    var center_sad_for_bwd: u32 = mode_sad;
-    if best_mode == 2u {
-        center_sad_for_bwd = hp_fwd_sad;
-    }
-
-    if tid == 0u {
-        hp_track_sad = center_sad_for_bwd;
-        hp_track_mv = pack_mv(center_bwd_qx, center_bwd_qy);
-    }
-    workgroupBarrier();
-
-    let hp2_px = tid % params.block_size;
-    let hp2_py = tid / params.block_size;
-    let hp2_cur_val = select(0.0, current_y[(block_origin_y + hp2_py) * params.width + block_origin_x + hp2_px], do_bwd_hp);
-
-    // For bidir, precompute refined forward sample (constant across bwd candidates).
-    var hp_fwd_sample: f32 = 0.0;
-    if do_bwd_hp && best_mode == 2u {
-        let fqx = i32(block_origin_x + hp2_px) * 4 + refined_fwd_qx;
-        let fqy = i32(block_origin_y + hp2_py) * 4 + refined_fwd_qy;
-        hp_fwd_sample = sample_hp_fwd(fqx, fqy, params.width, params.height);
-    }
-
-    // Stage A: half-pel (step 2) for backward.
-    for (var cand = 0u; cand < 8u; cand++) {
-        var off_x: i32 = 0;
-        var off_y: i32 = 0;
-        switch cand {
-            case 0u: { off_x =  0; off_y = -2; }
-            case 1u: { off_x = -2; off_y =  0; }
-            case 2u: { off_x =  2; off_y =  0; }
-            case 3u: { off_x =  0; off_y =  2; }
-            case 4u: { off_x = -2; off_y = -2; }
-            case 5u: { off_x =  2; off_y = -2; }
-            case 6u: { off_x = -2; off_y =  2; }
-            case 7u: { off_x =  2; off_y =  2; }
-            default: {}
+        // Broadcast refined forward QP MV to all threads.
+        if tid == 0u {
+            shared_mv[0] = pack_mv(hp_fwd_dx, hp_fwd_dy);
         }
-
-        let test_qx = center_bwd_qx + off_x;
-        let test_qy = center_bwd_qy + off_y;
-
-        let ref_base_qx = i32(block_origin_x) * 4 + test_qx;
-        let ref_base_qy = i32(block_origin_y) * 4 + test_qy;
-        let valid = do_bwd_hp && ref_base_qx >= -3 && ref_base_qy >= -3 &&
-                    ref_base_qx + bs * 4 <= w * 4 + 3 &&
-                    ref_base_qy + bs * 4 <= h * 4 + 3;
-
-        var pixel_diff: u32 = 0u;
-        if valid {
-            let rqx = i32(block_origin_x + hp2_px) * 4 + test_qx;
-            let rqy = i32(block_origin_y + hp2_py) * 4 + test_qy;
-            let bwd_val = sample_hp_bwd(rqx, rqy, params.width, params.height);
-            var pred: f32;
-            if best_mode == 1u { pred = bwd_val; } else { pred = (hp_fwd_sample + bwd_val) * 0.5; }
-            pixel_diff = u32(abs(hp2_cur_val - pred));
-        }
-
-        shared_sad[tid] = pixel_diff;
         workgroupBarrier();
-        for (var stride = 128u; stride > 0u; stride >>= 1u) {
-            if tid < stride { shared_sad[tid] += shared_sad[tid + stride]; }
+        let refined_fwd_qx = unpack_dx(shared_mv[0]);
+        let refined_fwd_qy = unpack_dy(shared_mv[0]);
+
+        var center_sad_for_bwd: u32 = mode_sad;
+        if best_mode == 2u {
+            center_sad_for_bwd = hp_fwd_sad;
+        }
+
+        if tid == 0u {
+            hp_track_sad = center_sad_for_bwd;
+            hp_track_mv = pack_mv(center_bwd_qx, center_bwd_qy);
+        }
+        workgroupBarrier();
+
+        let hp2_px = tid % params.block_size;
+        let hp2_py = tid / params.block_size;
+        let hp2_cur_val = select(0.0, current_y[(block_origin_y + hp2_py) * params.width + block_origin_x + hp2_px], do_bwd_hp);
+
+        // For bidir, precompute refined forward sample (constant across bwd candidates).
+        var hp_fwd_sample: f32 = 0.0;
+        if do_bwd_hp && best_mode == 2u {
+            let fqx = i32(block_origin_x + hp2_px) * 4 + refined_fwd_qx;
+            let fqy = i32(block_origin_y + hp2_py) * 4 + refined_fwd_qy;
+            hp_fwd_sample = sample_hp_fwd(fqx, fqy, params.width, params.height);
+        }
+
+        // Stage A: half-pel (step 2) for backward.
+        for (var cand = 0u; cand < 8u; cand++) {
+            var off_x: i32 = 0;
+            var off_y: i32 = 0;
+            switch cand {
+                case 0u: { off_x =  0; off_y = -2; }
+                case 1u: { off_x = -2; off_y =  0; }
+                case 2u: { off_x =  2; off_y =  0; }
+                case 3u: { off_x =  0; off_y =  2; }
+                case 4u: { off_x = -2; off_y = -2; }
+                case 5u: { off_x =  2; off_y = -2; }
+                case 6u: { off_x = -2; off_y =  2; }
+                case 7u: { off_x =  2; off_y =  2; }
+                default: {}
+            }
+
+            let test_qx = center_bwd_qx + off_x;
+            let test_qy = center_bwd_qy + off_y;
+
+            let ref_base_qx = i32(block_origin_x) * 4 + test_qx;
+            let ref_base_qy = i32(block_origin_y) * 4 + test_qy;
+            let valid = do_bwd_hp && ref_base_qx >= -3 && ref_base_qy >= -3 &&
+                        ref_base_qx + bs * 4 <= w * 4 + 3 &&
+                        ref_base_qy + bs * 4 <= h * 4 + 3;
+
+            var pixel_diff: u32 = 0u;
+            if valid {
+                let rqx = i32(block_origin_x + hp2_px) * 4 + test_qx;
+                let rqy = i32(block_origin_y + hp2_py) * 4 + test_qy;
+                let bwd_val = sample_hp_bwd(rqx, rqy, params.width, params.height);
+                var pred: f32;
+                if best_mode == 1u { pred = bwd_val; } else { pred = (hp_fwd_sample + bwd_val) * 0.5; }
+                pixel_diff = u32(abs(hp2_cur_val - pred));
+            }
+
+            shared_sad[tid] = pixel_diff;
+            workgroupBarrier();
+            for (var stride = 128u; stride > 0u; stride >>= 1u) {
+                if tid < stride { shared_sad[tid] += shared_sad[tid + stride]; }
+                workgroupBarrier();
+            }
+            if tid == 0u && valid {
+                if shared_sad[0] < hp_track_sad { hp_track_sad = shared_sad[0]; hp_track_mv = pack_mv(test_qx, test_qy); }
+            }
             workgroupBarrier();
         }
-        if tid == 0u && valid {
-            if shared_sad[0] < hp_track_sad { hp_track_sad = shared_sad[0]; hp_track_mv = pack_mv(test_qx, test_qy); }
-        }
-        workgroupBarrier();
-    }
 
-    // Stage B: quarter-pel (step 1) for backward.
-    let stageA_bwd_qx = unpack_dx(hp_track_mv);
-    let stageA_bwd_qy = unpack_dy(hp_track_mv);
+        // Stage B: quarter-pel (step 1) for backward.
+        let stageA_bwd_qx = unpack_dx(hp_track_mv);
+        let stageA_bwd_qy = unpack_dy(hp_track_mv);
 
-    for (var cand = 0u; cand < 8u; cand++) {
-        var off_x: i32 = 0;
-        var off_y: i32 = 0;
-        switch cand {
-            case 0u: { off_x =  0; off_y = -1; }
-            case 1u: { off_x = -1; off_y =  0; }
-            case 2u: { off_x =  1; off_y =  0; }
-            case 3u: { off_x =  0; off_y =  1; }
-            case 4u: { off_x = -1; off_y = -1; }
-            case 5u: { off_x =  1; off_y = -1; }
-            case 6u: { off_x = -1; off_y =  1; }
-            case 7u: { off_x =  1; off_y =  1; }
-            default: {}
-        }
+        for (var cand = 0u; cand < 8u; cand++) {
+            var off_x: i32 = 0;
+            var off_y: i32 = 0;
+            switch cand {
+                case 0u: { off_x =  0; off_y = -1; }
+                case 1u: { off_x = -1; off_y =  0; }
+                case 2u: { off_x =  1; off_y =  0; }
+                case 3u: { off_x =  0; off_y =  1; }
+                case 4u: { off_x = -1; off_y = -1; }
+                case 5u: { off_x =  1; off_y = -1; }
+                case 6u: { off_x = -1; off_y =  1; }
+                case 7u: { off_x =  1; off_y =  1; }
+                default: {}
+            }
 
-        let test_qx = stageA_bwd_qx + off_x;
-        let test_qy = stageA_bwd_qy + off_y;
+            let test_qx = stageA_bwd_qx + off_x;
+            let test_qy = stageA_bwd_qy + off_y;
 
-        let ref_base_qx = i32(block_origin_x) * 4 + test_qx;
-        let ref_base_qy = i32(block_origin_y) * 4 + test_qy;
-        let valid = do_bwd_hp && ref_base_qx >= -3 && ref_base_qy >= -3 &&
-                    ref_base_qx + bs * 4 <= w * 4 + 3 &&
-                    ref_base_qy + bs * 4 <= h * 4 + 3;
+            let ref_base_qx = i32(block_origin_x) * 4 + test_qx;
+            let ref_base_qy = i32(block_origin_y) * 4 + test_qy;
+            let valid = do_bwd_hp && ref_base_qx >= -3 && ref_base_qy >= -3 &&
+                        ref_base_qx + bs * 4 <= w * 4 + 3 &&
+                        ref_base_qy + bs * 4 <= h * 4 + 3;
 
-        var pixel_diff: u32 = 0u;
-        if valid {
-            let rqx = i32(block_origin_x + hp2_px) * 4 + test_qx;
-            let rqy = i32(block_origin_y + hp2_py) * 4 + test_qy;
-            let bwd_val = sample_hp_bwd(rqx, rqy, params.width, params.height);
-            var pred: f32;
-            if best_mode == 1u { pred = bwd_val; } else { pred = (hp_fwd_sample + bwd_val) * 0.5; }
-            pixel_diff = u32(abs(hp2_cur_val - pred));
-        }
+            var pixel_diff: u32 = 0u;
+            if valid {
+                let rqx = i32(block_origin_x + hp2_px) * 4 + test_qx;
+                let rqy = i32(block_origin_y + hp2_py) * 4 + test_qy;
+                let bwd_val = sample_hp_bwd(rqx, rqy, params.width, params.height);
+                var pred: f32;
+                if best_mode == 1u { pred = bwd_val; } else { pred = (hp_fwd_sample + bwd_val) * 0.5; }
+                pixel_diff = u32(abs(hp2_cur_val - pred));
+            }
 
-        shared_sad[tid] = pixel_diff;
-        workgroupBarrier();
-        for (var stride = 128u; stride > 0u; stride >>= 1u) {
-            if tid < stride { shared_sad[tid] += shared_sad[tid + stride]; }
+            shared_sad[tid] = pixel_diff;
+            workgroupBarrier();
+            for (var stride = 128u; stride > 0u; stride >>= 1u) {
+                if tid < stride { shared_sad[tid] += shared_sad[tid + stride]; }
+                workgroupBarrier();
+            }
+            if tid == 0u && valid {
+                if shared_sad[0] < hp_track_sad { hp_track_sad = shared_sad[0]; hp_track_mv = pack_mv(test_qx, test_qy); }
+            }
             workgroupBarrier();
         }
-        if tid == 0u && valid {
-            if shared_sad[0] < hp_track_sad { hp_track_sad = shared_sad[0]; hp_track_mv = pack_mv(test_qx, test_qy); }
-        }
-        workgroupBarrier();
-    }
 
-    if do_bwd_hp {
-        hp_bwd_dx = unpack_dx(hp_track_mv);
-        hp_bwd_dy = unpack_dy(hp_track_mv);
+        if do_bwd_hp {
+            hp_bwd_dx = unpack_dx(hp_track_mv);
+            hp_bwd_dy = unpack_dy(hp_track_mv);
+        }
     }
+    // Uniform barrier: sync hp_bwd_dx/dy for Phase 3e output regardless of skip_qpel.
     workgroupBarrier();
 
     // ========== Phase 3e: Write final results (thread 0) ==========

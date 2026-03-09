@@ -36,6 +36,18 @@ struct PrecomputedPFrameME {
     includes_preprocess: bool,
 }
 
+/// Precomputed bidir ME results for the *next* B-frame in the group.
+/// Built by encode_bframe when next_frame_pixels is Some, submitted before the Rice readback poll
+/// so the ~20ms bidir ME hides the ~18ms Metal sync latency.
+struct PrecomputedBFrameME {
+    fwd_mv_buf: wgpu::Buffer,
+    bwd_mv_buf: wgpu::Buffer,
+    /// Always true: the look-ahead ran pad+color+deinterleave, so plane_a/co_plane/cg_plane
+    /// already hold the next frame's preprocessed data. The next encode_bframe call can skip
+    /// those phases and jump straight to MC.
+    includes_preprocess: bool,
+}
+
 /// Per-frame metadata used when batching temporal highpass frame encoding.
 /// Collected during Pass A (adaptive-mul computation) and consumed in Pass C
 /// (batched GPU quantize + Rice encode).
@@ -496,8 +508,11 @@ impl EncoderPipeline {
                 // 4. Encode B-frames between past and future anchors.
                 // First B-frame uses None predictor (full coarse search).
                 // Subsequent B-frames use previous B's MVs for temporal prediction.
+                // B1→B2 pipelining: after submitting B_i's command, B_(i+1)'s preprocess+ME
+                // is submitted before the Rice readback poll, hiding the ~18ms Metal sync.
                 let mut prev_bidir_fwd_mv: Option<wgpu::Buffer> = None;
                 let mut prev_bidir_bwd_mv: Option<wgpu::Buffer> = None;
+                let mut pending_bframe_me: Option<PrecomputedBFrameME> = None;
                 for b in 0..b_count {
                     let b_display = group_start + b;
                     let b_config = if let Some(ref rc) = rate_ctrl {
@@ -510,7 +525,13 @@ impl EncoderPipeline {
                     let fwd_pred = prev_bidir_fwd_mv.as_ref();
                     let bwd_pred = prev_bidir_bwd_mv.as_ref();
                     let b_frame_data = load_frame(b_display);
-                    let (compressed, new_fwd_mv, new_bwd_mv) = self.encode_bframe(
+                    // Pre-load next B-frame pixels for look-ahead ME (B1→B2 pipelining).
+                    let next_b_pixels: Option<Vec<f32>> = if b + 1 < b_count {
+                        Some(load_frame(group_start + b + 1))
+                    } else {
+                        None
+                    };
+                    let (compressed, new_fwd_mv, new_bwd_mv, next_bframe_me) = self.encode_bframe(
                         ctx,
                         &b_frame_data,
                         width,
@@ -522,7 +543,10 @@ impl EncoderPipeline {
                         &b_config,
                         fwd_pred,
                         bwd_pred,
+                        pending_bframe_me.take(),
+                        next_b_pixels.as_deref(),
                     );
+                    pending_bframe_me = next_bframe_me;
                     prev_bidir_fwd_mv = Some(new_fwd_mv);
                     prev_bidir_bwd_mv = Some(new_bwd_mv);
                     if let Some(ref mut rc) = rate_ctrl {
@@ -4033,15 +4057,29 @@ impl EncoderPipeline {
         config: &CodecConfig,
         predictor_fwd_mvs: Option<&wgpu::Buffer>,
         predictor_bwd_mvs: Option<&wgpu::Buffer>,
-    ) -> (CompressedFrame, wgpu::Buffer, wgpu::Buffer) {
+        // Precomputed bidir ME from the look-ahead on the *previous* B-frame.
+        // When Some, skips upload + preprocess + bidir ME for the current frame.
+        precomputed_me: Option<PrecomputedBFrameME>,
+        // Pixel data for the *next* B-frame in the group (if any).
+        // When Some and use_rice+!is_non_444, submits look-ahead ME before Rice readback poll.
+        next_frame_pixels: Option<&[f32]>,
+    ) -> (CompressedFrame, wgpu::Buffer, wgpu::Buffer, Option<PrecomputedBFrameME>) {
         let plane_size = (padded_pixels * std::mem::size_of::<f32>()) as u64;
 
         self.ensure_cached(ctx, padded_w, padded_h, width, height);
         let bufs = self.cached.as_ref().unwrap();
 
-        // Upload raw (unpadded) frame — GPU shader handles padding
-        ctx.queue
-            .write_buffer(&bufs.raw_input_buf, 0, bytemuck::cast_slice(rgb_data));
+        let skip_preprocess = precomputed_me
+            .as_ref()
+            .map(|p| p.includes_preprocess)
+            .unwrap_or(false);
+
+        // Upload raw (unpadded) frame — GPU shader handles padding.
+        // Skip when look-ahead already uploaded + preprocessed this frame's pixels.
+        if !skip_preprocess {
+            ctx.queue
+                .write_buffer(&bufs.raw_input_buf, 0, bytemuck::cast_slice(rgb_data));
+        }
 
         // --- Residual-adapted quantization for B-frames ---
         // Same rationale as P-frames: MC residuals need uniform weights + higher dead_zone.
@@ -4131,53 +4169,62 @@ impl EncoderPipeline {
                     label: Some("bf_batch_all"),
                 });
 
-            // Phase 0: GPU padding (raw → padded, edge-replicate)
-            self.dispatch_gpu_pad_cached(ctx, &mut cmd, padded_w, padded_h);
+            if !skip_preprocess {
+                // Phase 0: GPU padding (raw → padded, edge-replicate)
+                self.dispatch_gpu_pad_cached(ctx, &mut cmd, padded_w, padded_h);
 
-            // Phase 1: Preprocess + bidir ME + MC + transform + quantize
-            self.color.dispatch(
-                ctx,
-                &mut cmd,
-                &bufs.input_buf,
-                &bufs.color_out,
-                padded_w,
-                padded_h,
-                true,
-                config.is_lossless(),
-            );
-            self.deinterleaver.dispatch(
-                ctx,
-                &mut cmd,
-                &bufs.color_out,
-                &bufs.plane_a,
-                &bufs.co_plane,
-                &bufs.cg_plane,
-                padded_pixels as u32,
-            );
+                // Phase 1a: Color conversion + deinterleave
+                self.color.dispatch(
+                    ctx,
+                    &mut cmd,
+                    &bufs.input_buf,
+                    &bufs.color_out,
+                    padded_w,
+                    padded_h,
+                    true,
+                    config.is_lossless(),
+                );
+                self.deinterleaver.dispatch(
+                    ctx,
+                    &mut cmd,
+                    &bufs.color_out,
+                    &bufs.plane_a,
+                    &bufs.co_plane,
+                    &bufs.cg_plane,
+                    padded_pixels as u32,
+                );
+            }
 
-            let have_bidir_pred = predictor_fwd_mvs.is_some() && predictor_bwd_mvs.is_some();
-            let bidir_params = if have_bidir_pred {
-                &bufs.bidir_params_pred
+            // Phase 1b: Bidir ME (skip when look-ahead already ran it)
+            if let Some(pre_me) = precomputed_me {
+                // Precomputed by look-ahead: use GPU buffers directly.
+                fwd_mv_buf = pre_me.fwd_mv_buf;
+                bwd_mv_buf = pre_me.bwd_mv_buf;
             } else {
-                &bufs.bidir_params_nopred
-            };
-            let (fmb, bmb) = self.motion.estimate_bidir_cached(
-                ctx,
-                &mut cmd,
-                &bufs.plane_a,
-                &bufs.gpu_ref_planes[0],
-                &bufs.gpu_bwd_ref_planes[0],
-                padded_w,
-                padded_h,
-                predictor_fwd_mvs,
-                predictor_bwd_mvs,
-                bidir_params,
-                &bufs.bidir_sad_buf,
-                &bufs.bidir_modes_scratch,
-                &bufs.me_dummy_pred,
-            );
-            fwd_mv_buf = fmb;
-            bwd_mv_buf = bmb;
+                let have_bidir_pred = predictor_fwd_mvs.is_some() && predictor_bwd_mvs.is_some();
+                let bidir_params = if have_bidir_pred {
+                    &bufs.bidir_params_pred
+                } else {
+                    &bufs.bidir_params_nopred
+                };
+                let (fmb, bmb) = self.motion.estimate_bidir_cached(
+                    ctx,
+                    &mut cmd,
+                    &bufs.plane_a,
+                    &bufs.gpu_ref_planes[0],
+                    &bufs.gpu_bwd_ref_planes[0],
+                    padded_w,
+                    padded_h,
+                    predictor_fwd_mvs,
+                    predictor_bwd_mvs,
+                    bidir_params,
+                    &bufs.bidir_sad_buf,
+                    &bufs.bidir_modes_scratch,
+                    &bufs.me_dummy_pred,
+                );
+                fwd_mv_buf = fmb;
+                bwd_mv_buf = bmb;
+            }
 
             // 4:2.0 chroma-domain MC for B-frames: pre-scale both fwd and bwd MVs to chroma dims.
             if is_420 {
@@ -4520,6 +4567,74 @@ impl EncoderPipeline {
             let _t_submit = std::time::Instant::now();
             ctx.queue.submit(Some(cmd.finish()));
 
+            // B1→B2 look-ahead: submit next B-frame's preprocess+bidir ME before polling,
+            // so the ~20ms GPU work hides the ~18ms Metal buffer-sync latency in readback.
+            // Only for 444 + Rice (non-444 path polls separately).
+            let next_bframe_precomputed = if let Some(next_pixels) = next_frame_pixels {
+                if use_rice && !is_non_444 {
+                    ctx.queue.write_buffer(
+                        &bufs.raw_input_buf,
+                        0,
+                        bytemuck::cast_slice(next_pixels),
+                    );
+                    let mut me_cmd =
+                        ctx.device
+                            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                label: Some("bf_lookahead_me"),
+                            });
+                    self.dispatch_gpu_pad_cached(ctx, &mut me_cmd, padded_w, padded_h);
+                    self.color.dispatch(
+                        ctx,
+                        &mut me_cmd,
+                        &bufs.input_buf,
+                        &bufs.color_out,
+                        padded_w,
+                        padded_h,
+                        true,
+                        config.is_lossless(),
+                    );
+                    self.deinterleaver.dispatch(
+                        ctx,
+                        &mut me_cmd,
+                        &bufs.color_out,
+                        &bufs.plane_a,
+                        &bufs.co_plane,
+                        &bufs.cg_plane,
+                        padded_pixels as u32,
+                    );
+                    // Use current frame's MVs as temporal predictor for the look-ahead.
+                    let bidir_params_la = &bufs.bidir_params_pred;
+                    let (la_fmb, la_bmb) = self.motion.estimate_bidir_cached(
+                        ctx,
+                        &mut me_cmd,
+                        &bufs.plane_a,
+                        &bufs.gpu_ref_planes[0],
+                        &bufs.gpu_bwd_ref_planes[0],
+                        padded_w,
+                        padded_h,
+                        Some(&fwd_mv_buf),
+                        Some(&bwd_mv_buf),
+                        bidir_params_la,
+                        &bufs.bidir_sad_buf,
+                        &bufs.bidir_modes_scratch,
+                        &bufs.me_dummy_pred,
+                    );
+                    ctx.queue.submit(Some(me_cmd.finish()));
+                    if std::env::var("GNC_PROFILE").is_ok() {
+                        eprintln!("[bf_pipeline] submitted look-ahead ME for next B-frame");
+                    }
+                    Some(PrecomputedBFrameME {
+                        fwd_mv_buf: la_fmb,
+                        bwd_mv_buf: la_bmb,
+                        includes_preprocess: true,
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
             // Poll + readback entropy results
             if !is_non_444 && use_rice {
                 rice_tiles =
@@ -4643,6 +4758,7 @@ impl EncoderPipeline {
                 },
                 fwd_mv_buf,
                 bwd_mv_buf,
+                next_bframe_precomputed,
             );
         } else {
             // CPU entropy path: preprocess + bidir ME batched, then per-plane submits
@@ -4818,6 +4934,7 @@ impl EncoderPipeline {
             },
             fwd_mv_buf,
             bwd_mv_buf,
+            None, // CPU entropy path: no look-ahead (not worth the complexity)
         )
     }
 

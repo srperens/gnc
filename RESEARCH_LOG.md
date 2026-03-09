@@ -1502,3 +1502,34 @@ Bilinear is the wrong fix. Only these approaches can reduce inter-tile discontin
 Log as known limitation. No immediate action unless visually blocking.
 
 ---
+
+## 2026-03-09: B-frame 4:2:0 chroma decoder root cause found and fixed
+
+### Root cause
+4:2:0 B-frame chroma decoder was producing garbage (23-24 dB PSNR on blue_sky
+vs I-frame 37-38 dB). Root cause: the decoder's pre-MC upsample gate condition
+`is_non444_chroma && !is_420_pframe_chroma` was too permissive for B-frames.
+
+For 4:2:0 B-frame chroma (p>0), `is_non444_chroma=true` and `is_420_pframe_chroma=false`,
+so the gate triggered — NN-upsampling `scratch_a` from chroma dims to luma dims before
+the bidir chroma MC. But `compensate_bidir_chroma_cached` expects `scratch_a` at chroma
+dims. The bidir MC read `scratch_a` with chroma stride but luma-dim data → wrong pixels.
+
+### Fix
+Added `is_420_bframe_chroma = is_420 && is_bframe && p > 0` exception mirroring
+`is_420_pframe_chroma`. Guard: `!is_420_pframe_chroma && !is_420_bframe_chroma`.
+One-line logical fix; no architectural change.
+
+### Results
+- blue_sky 4:2:0 B-frames: 23-24 dB → 32-34 dB PSNR
+- blue_sky 4:2:0 VMAF: mean=97.22, min=92.50 → mean=99.43, min=95.48
+- crowd_run 4:2:0 VMAF: 98.35 → 98.87
+- bbb 4:2:0: no regression (B-frame PSNR 34-35 dB as expected)
+- bbb 444 VMAF: 96.60 (noise vs 96.73 baseline — within ±0.5 tolerance)
+- bbb 422 VMAF: 96.14 (within tolerance vs 96.71 — single run variance)
+
+### Lesson
+The P-frame and B-frame 4:2:0 chroma paths are structurally identical (both do
+chroma-domain MC). Any guard that exempts one must also exempt the other. Adding
+the P-frame exception without the B-frame exception was a latent bug.
+

@@ -611,17 +611,17 @@
             { name: 'tw_pedestrian_area.gnv2',   label: 'Pedestrian Area',  desc: '200f 25fps 1080p q=75 Haar temporal wavelet', group: 'Temporal Wavelet (Haar)' },
             { name: 'tw_bbb_2min.gnv2',          label: 'BBB 2 min q=75',   desc: '1800f 30fps 1080p q=75 Haar temporal wavelet', group: 'Temporal Wavelet (Haar)' },
             { name: 'tw_bbb_2min_q5.gnv2',       label: 'BBB 2 min q=5',    desc: '1800f 30fps 1080p q=5 Haar — extreme compression', group: 'Temporal Wavelet (Haar)' },
-            // Chroma subsampling — video sequences, q=50
-            { name: 'crowd_444_q50.gnv', label: 'Crowd Run 4:4:4', desc: '100f 50fps 1080p q=50 — full chroma (3.65 bpp avg)', group: 'Chroma q=50 (Crowd Run)' },
-            { name: 'crowd_422_q50.gnv', label: 'Crowd Run 4:2:2', desc: '100f 50fps 1080p q=50 — half horiz chroma (2.73 bpp, −25%)', group: 'Chroma q=50 (Crowd Run)' },
-            { name: 'crowd_420_q50.gnv', label: 'Crowd Run 4:2:0', desc: '100f 50fps 1080p q=50 — quarter chroma (2.45 bpp, −33%)', group: 'Chroma q=50 (Crowd Run)' },
-            { name: 'park_joy_444_q50.gnv', label: 'Park Joy 4:4:4', desc: '100f 50fps 1080p q=50 — full chroma (4.29 bpp avg)', group: 'Chroma q=50 (Park Joy)' },
-            { name: 'park_joy_422_q50.gnv', label: 'Park Joy 4:2:2', desc: '100f 50fps 1080p q=50 — half horiz chroma (3.22 bpp, −25%)', group: 'Chroma q=50 (Park Joy)' },
-            { name: 'park_joy_420_q50.gnv', label: 'Park Joy 4:2:0', desc: '100f 50fps 1080p q=50 — quarter chroma (3.02 bpp, −30%)', group: 'Chroma q=50 (Park Joy)' },
-            // Chroma subsampling — same content, q=25 (more compression, differences more visible)
-            { name: 'crowd_444_q25.gnv', label: 'Crowd Run 4:4:4', desc: '100f 50fps 1080p q=25 — full chroma (1.91 bpp avg)', group: 'Chroma q=25 (Crowd Run)' },
-            { name: 'crowd_422_q25.gnv', label: 'Crowd Run 4:2:2', desc: '100f 50fps 1080p q=25 — half horiz chroma (1.51 bpp, −21%)', group: 'Chroma q=25 (Crowd Run)' },
-            { name: 'crowd_420_q25.gnv', label: 'Crowd Run 4:2:0', desc: '100f 50fps 1080p q=25 — quarter chroma (1.41 bpp, −26%)', group: 'Chroma q=25 (Crowd Run)' },
+            // Chroma subsampling — Crowd Run, two quality levels
+            { name: 'crowd_444_q50.gnv', label: '4:4:4  q=50', desc: '100f 50fps 1080p q=50 — full chroma (3.65 bpp avg)', group: 'Chroma: Crowd Run (4:4:4 vs 4:2:2 vs 4:2:0)' },
+            { name: 'crowd_422_q50.gnv', label: '4:2:2  q=50', desc: '100f 50fps 1080p q=50 — half horiz chroma (2.73 bpp, −25%)', group: 'Chroma: Crowd Run (4:4:4 vs 4:2:2 vs 4:2:0)' },
+            { name: 'crowd_420_q50.gnv', label: '4:2:0  q=50', desc: '100f 50fps 1080p q=50 — quarter chroma (2.45 bpp, −33%)', group: 'Chroma: Crowd Run (4:4:4 vs 4:2:2 vs 4:2:0)' },
+            { name: 'crowd_444_q25.gnv', label: '4:4:4  q=25', desc: '100f 50fps 1080p q=25 — full chroma (1.91 bpp avg)', group: 'Chroma: Crowd Run (4:4:4 vs 4:2:2 vs 4:2:0)' },
+            { name: 'crowd_422_q25.gnv', label: '4:2:2  q=25', desc: '100f 50fps 1080p q=25 — half horiz chroma (1.51 bpp, −21%)', group: 'Chroma: Crowd Run (4:4:4 vs 4:2:2 vs 4:2:0)' },
+            { name: 'crowd_420_q25.gnv', label: '4:2:0  q=25', desc: '100f 50fps 1080p q=25 — quarter chroma (1.41 bpp, −26%)', group: 'Chroma: Crowd Run (4:4:4 vs 4:2:2 vs 4:2:0)' },
+            // Chroma subsampling — Park Joy, q=50
+            { name: 'park_joy_444_q50.gnv', label: '4:4:4  q=50', desc: '100f 50fps 1080p q=50 — full chroma (4.29 bpp avg)', group: 'Chroma: Park Joy (4:4:4 vs 4:2:2 vs 4:2:0)' },
+            { name: 'park_joy_422_q50.gnv', label: '4:2:2  q=50', desc: '100f 50fps 1080p q=50 — half horiz chroma (3.22 bpp, −25%)', group: 'Chroma: Park Joy (4:4:4 vs 4:2:2 vs 4:2:0)' },
+            { name: 'park_joy_420_q50.gnv', label: '4:2:0  q=50', desc: '100f 50fps 1080p q=50 — quarter chroma (3.02 bpp, −30%)', group: 'Chroma: Park Joy (4:4:4 vs 4:2:2 vs 4:2:0)' },
         ];
 
         function formatSize(bytes) {

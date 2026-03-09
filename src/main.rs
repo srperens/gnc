@@ -2071,6 +2071,16 @@ fn main() {
                     .expect("Failed to write sequence CSV");
                 println!("\nSequence metrics written to {}", out_path);
             }
+
+            // Write GNV1 container if --output specified and not in temporal wavelet mode
+            if let Some(ref output_path) = output {
+                if !run_temporal {
+                    let fps_num = fps.round() as u32;
+                    let gnv1_data = serialize_sequence(&compressed_ip, (fps_num, 1));
+                    std::fs::write(output_path, &gnv1_data).expect("Failed to write GNV1 output");
+                    println!("\nGNV1 container written to {} ({} bytes)", output_path, gnv1_data.len());
+                }
+            }
             }
 
             if run_temporal {

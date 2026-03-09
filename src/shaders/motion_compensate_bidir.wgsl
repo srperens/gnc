@@ -8,7 +8,7 @@
 //   Forward (encoder): output = current - pred
 //   Inverse (decoder): output = residual + pred
 //
-// MVs are in half-pel units. Bilinear interpolation for half-pel samples.
+// MVs are in quarter-pel units (value 4 = 1 pixel). Bilinear interpolation for sub-pel samples.
 // One thread per pixel. Dispatch 3 times for Y, Co, Cg.
 
 struct Params {
@@ -31,12 +31,13 @@ struct Params {
 @group(0) @binding(6) var<storage, read> block_modes: array<u32>;
 @group(0) @binding(7) var<storage, read_write> output_plane: array<f32>;
 
-// Half-pel sample from forward reference (inlined because WGSL cannot pass storage ptrs)
-fn sample_hp_fwd(x2: i32, y2: i32, w: u32, h: u32) -> f32 {
-    let fx = x2 >> 1;
-    let fy = y2 >> 1;
-    let frac_x = x2 & 1;
-    let frac_y = y2 & 1;
+// Quarter-pel sample from forward reference (inlined because WGSL cannot pass storage ptrs).
+// x4, y4 are in quarter-pel units (pixel * 4 + subpel, range 0..3).
+fn sample_hp_fwd(x4: i32, y4: i32, w: u32, h: u32) -> f32 {
+    let fx = x4 >> 2;
+    let fy = y4 >> 2;
+    let frac_x = x4 & 3;
+    let frac_y = y4 & 3;
     let x0 = clamp(fx, 0, i32(w) - 1);
     let y0 = clamp(fy, 0, i32(h) - 1);
     let x1 = clamp(fx + 1, 0, i32(w) - 1);
@@ -47,21 +48,20 @@ fn sample_hp_fwd(x2: i32, y2: i32, w: u32, h: u32) -> f32 {
     let p11 = fwd_reference[u32(y1) * w + u32(x1)];
     if frac_x == 0 && frac_y == 0 {
         return p00;
-    } else if frac_x == 1 && frac_y == 0 {
-        return (p00 + p10) * 0.5;
-    } else if frac_x == 0 && frac_y == 1 {
-        return (p00 + p01) * 0.5;
-    } else {
-        return (p00 + p10 + p01 + p11) * 0.25;
     }
+    let ffx = f32(frac_x) * 0.25;
+    let ffy = f32(frac_y) * 0.25;
+    let top = p00 * (1.0 - ffx) + p10 * ffx;
+    let bot = p01 * (1.0 - ffx) + p11 * ffx;
+    return top * (1.0 - ffy) + bot * ffy;
 }
 
-// Half-pel sample from backward reference
-fn sample_hp_bwd(x2: i32, y2: i32, w: u32, h: u32) -> f32 {
-    let fx = x2 >> 1;
-    let fy = y2 >> 1;
-    let frac_x = x2 & 1;
-    let frac_y = y2 & 1;
+// Quarter-pel sample from backward reference.
+fn sample_hp_bwd(x4: i32, y4: i32, w: u32, h: u32) -> f32 {
+    let fx = x4 >> 2;
+    let fy = y4 >> 2;
+    let frac_x = x4 & 3;
+    let frac_y = y4 & 3;
     let x0 = clamp(fx, 0, i32(w) - 1);
     let y0 = clamp(fy, 0, i32(h) - 1);
     let x1 = clamp(fx + 1, 0, i32(w) - 1);
@@ -72,13 +72,12 @@ fn sample_hp_bwd(x2: i32, y2: i32, w: u32, h: u32) -> f32 {
     let p11 = bwd_reference[u32(y1) * w + u32(x1)];
     if frac_x == 0 && frac_y == 0 {
         return p00;
-    } else if frac_x == 1 && frac_y == 0 {
-        return (p00 + p10) * 0.5;
-    } else if frac_x == 0 && frac_y == 1 {
-        return (p00 + p01) * 0.5;
-    } else {
-        return (p00 + p10 + p01 + p11) * 0.25;
     }
+    let ffx = f32(frac_x) * 0.25;
+    let ffy = f32(frac_y) * 0.25;
+    let top = p00 * (1.0 - ffx) + p10 * ffx;
+    let bot = p01 * (1.0 - ffx) + p11 * ffx;
+    return top * (1.0 - ffy) + bot * ffy;
 }
 
 @compute @workgroup_size(256)
@@ -106,9 +105,9 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     // Compute prediction value based on mode
     var pred: f32 = 0.0;
 
-    // Half-pel coordinates: pixel_pos * 2 + mv_halfpel
-    let px2 = i32(x) * 2;
-    let py2 = i32(y) * 2;
+    // Quarter-pel coordinates: pixel_pos * 4 + mv_quarterpel
+    let px2 = i32(x) * 4;
+    let py2 = i32(y) * 4;
 
     if bmode == 0u {
         // Forward only

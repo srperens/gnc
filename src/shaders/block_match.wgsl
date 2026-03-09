@@ -6,9 +6,11 @@
 //            (every 4th pixel in each dimension = 16 samples per candidate).
 //            14.8x fewer memory reads than full-resolution search.
 //   Phase 2: Fine search ±4 around coarse winner with full 16×16 SAD.
-//   Phase 3: Half-pel refinement around fine winner using bilinear interpolation.
+//   Phase 3: Quarter-pel refinement in two stages:
+//            Stage A: 8-point diamond at ±2 QP units (= ±0.5 pixel, half-pel positions)
+//            Stage B: 8-point diamond at ±1 QP unit  (= ±0.25 pixel, quarter-pel positions)
 //
-// Output MVs are in half-pel units.
+// Output MVs are in quarter-pel units (value 4 = 1 pixel).
 // Parallel min-reduction across workgroup to find best MV in each phase.
 
 struct Params {
@@ -68,15 +70,16 @@ fn min_reduce(tid: u32) {
     }
 }
 
-// Bilinear sample at half-pel position (hx, hy are in half-pel units).
-fn bilinear_sample(hx: i32, hy: i32) -> f32 {
+// Bilinear sample at quarter-pel position (qx, qy in quarter-pel units).
+// Integer part = qx >> 2, fractional (0..3) = qx & 3, weight = frac * 0.25.
+fn bilinear_sample(qx: i32, qy: i32) -> f32 {
     let w = i32(params.width);
     let h = i32(params.height);
 
-    let ix = hx >> 1;
-    let iy = hy >> 1;
-    let fx = hx & 1;
-    let fy = hy & 1;
+    let ix = qx >> 2;
+    let iy = qy >> 2;
+    let fx = qx & 3;
+    let fy = qy & 3;
 
     if fx == 0 && fy == 0 {
         let cx = clamp(ix, 0, w - 1);
@@ -94,8 +97,8 @@ fn bilinear_sample(hx: i32, hy: i32) -> f32 {
     let p01 = reference_y[u32(y1) * params.width + u32(x0)];
     let p11 = reference_y[u32(y1) * params.width + u32(x1)];
 
-    let ffx = f32(fx) * 0.5;
-    let ffy = f32(fy) * 0.5;
+    let ffx = f32(fx) * 0.25;
+    let ffy = f32(fy) * 0.25;
 
     let top = p00 * (1.0 - ffx) + p10 * ffx;
     let bot = p01 * (1.0 - ffx) + p11 * ffx;
@@ -135,13 +138,13 @@ fn main(
     // keep all barriers at the top level for uniform control flow (WebGPU/Metal).
     if params.use_predictor != 0u {
         // Temporal MV prediction: use previous frame's MV as starting point.
-        // Predictor MVs are in half-pel units — convert to integer-pel.
+        // Predictor MVs are in quarter-pel units — convert to integer-pel.
         if tid == 0u {
             let pred_hx = predictor_mvs[block_idx * 2u];
             let pred_hy = predictor_mvs[block_idx * 2u + 1u];
-            // Round half-pel to nearest integer-pel
-            coarse_dx = (pred_hx + select(0, 1, pred_hx > 0)) / 2;
-            coarse_dy = (pred_hy + select(0, 1, pred_hy > 0)) / 2;
+            // Round quarter-pel to nearest integer-pel
+            coarse_dx = (pred_hx + select(0, 2, pred_hx > 0)) / 4;
+            coarse_dy = (pred_hy + select(0, 2, pred_hy > 0)) / 4;
             shared_mv[0] = pack_mv(coarse_dx, coarse_dy);
         }
         // Dummy writes for the else-path shared arrays (compiler may optimize away)
@@ -301,66 +304,63 @@ fn main(
     }
     workgroupBarrier();
 
-    // ========== Phase 3: Half-pel refinement (all 256 threads, parallel) ==========
-    // Cross-pattern: test 4 cardinal neighbors (skip diagonals for speed).
-    // Each candidate evaluated in parallel: all 256 threads compute one pixel's
-    // SAD, then sum-reduce. Skipped entirely if fine SAD is zero (static block).
+    // ========== Phase 3: Quarter-pel refinement (two stages, all 256 threads parallel) ==========
+    // Stage A: 8-point diamond at ±2 QP units (= ±0.5 pixel, half-pel positions).
+    // Stage B: 8-point diamond at ±1 QP unit  (= ±0.25 pixel, quarter-pel positions).
+    // All threads participate unconditionally to keep workgroupBarrier() in uniform
+    // control flow (required by WebGPU/Metal). Skipped when fine SAD is zero.
     let fine_packed = shared_mv[0];
     let fine_sad = shared_sad[0];
     let int_dx = unpack_dx(fine_packed);
     let int_dy = unpack_dy(fine_packed);
     workgroupBarrier();
 
-    let center_hx = int_dx * 2;
-    let center_hy = int_dy * 2;
+    // Integer MV scaled to quarter-pel units (value 4 = 1 pixel).
+    let center_qx = int_dx * 4;
+    let center_qy = int_dy * 4;
 
-    // Center is the baseline — neighbors must be strictly better to win.
     if tid == 0u {
         hp_track_sad = fine_sad;
-        hp_track_mv = pack_mv(center_hx, center_hy);
+        hp_track_mv = pack_mv(center_qx, center_qy);
     }
     workgroupBarrier();
 
-    // Half-pel refinement: all threads participate unconditionally to keep
-    // workgroupBarrier() in uniform control flow (required by WebGPU/Metal).
-    // When fine_sad == 0 (perfect match), pixel diffs are zeroed so barriers
-    // still execute but the result is a no-op.
-    let do_halfpel = fine_sad > 0u;
-    let hp_px = tid % params.block_size;
-    let hp_py = tid / params.block_size;
-    let hp_cur_val = select(0.0, current_y[(block_origin_y + hp_py) * params.width + block_origin_x + hp_px], do_halfpel);
+    let do_subpel = fine_sad > 0u;
+    let qp_px = tid % params.block_size;
+    let qp_py = tid / params.block_size;
+    let qp_cur_val = select(0.0, current_y[(block_origin_y + qp_py) * params.width + block_origin_x + qp_px], do_subpel);
 
-    // 8-point diamond: 4 cardinal + 4 diagonal directions
+    // Stage A: half-pel search (step = 2 QP units, 8-point diamond).
     for (var cand = 0u; cand < 8u; cand++) {
         var off_x: i32 = 0;
         var off_y: i32 = 0;
         switch cand {
-            case 0u: { off_x =  0; off_y = -1; }  // N
-            case 1u: { off_x = -1; off_y =  0; }  // W
-            case 2u: { off_x =  1; off_y =  0; }  // E
-            case 3u: { off_x =  0; off_y =  1; }  // S
-            case 4u: { off_x = -1; off_y = -1; }  // NW
-            case 5u: { off_x =  1; off_y = -1; }  // NE
-            case 6u: { off_x = -1; off_y =  1; }  // SW
-            case 7u: { off_x =  1; off_y =  1; }  // SE
+            case 0u: { off_x =  0; off_y = -2; }  // N
+            case 1u: { off_x = -2; off_y =  0; }  // W
+            case 2u: { off_x =  2; off_y =  0; }  // E
+            case 3u: { off_x =  0; off_y =  2; }  // S
+            case 4u: { off_x = -2; off_y = -2; }  // NW
+            case 5u: { off_x =  2; off_y = -2; }  // NE
+            case 6u: { off_x = -2; off_y =  2; }  // SW
+            case 7u: { off_x =  2; off_y =  2; }  // SE
             default: {}
         }
 
-        let test_hx = center_hx + off_x;
-        let test_hy = center_hy + off_y;
+        let test_qx = center_qx + off_x;
+        let test_qy = center_qy + off_y;
 
-        let ref_base_hx = i32(block_origin_x) * 2 + test_hx;
-        let ref_base_hy = i32(block_origin_y) * 2 + test_hy;
-        let valid = do_halfpel && ref_base_hx >= -1 && ref_base_hy >= -1 &&
-                    ref_base_hx + bs * 2 <= w * 2 + 1 &&
-                    ref_base_hy + bs * 2 <= h * 2 + 1;
+        let ref_base_qx = i32(block_origin_x) * 4 + test_qx;
+        let ref_base_qy = i32(block_origin_y) * 4 + test_qy;
+        let valid = do_subpel && ref_base_qx >= -3 && ref_base_qy >= -3 &&
+                    ref_base_qx + bs * 4 <= w * 4 + 3 &&
+                    ref_base_qy + bs * 4 <= h * 4 + 3;
 
         var pixel_diff: u32 = 0u;
         if valid {
-            let rhx = i32(block_origin_x + hp_px) * 2 + test_hx;
-            let rhy = i32(block_origin_y + hp_py) * 2 + test_hy;
-            let ref_val = bilinear_sample(rhx, rhy);
-            pixel_diff = u32(abs(hp_cur_val - ref_val));
+            let rqx = i32(block_origin_x + qp_px) * 4 + test_qx;
+            let rqy = i32(block_origin_y + qp_py) * 4 + test_qy;
+            let ref_val = bilinear_sample(rqx, rqy);
+            pixel_diff = u32(abs(qp_cur_val - ref_val));
         }
 
         shared_sad[tid] = pixel_diff;
@@ -376,13 +376,68 @@ fn main(
         if tid == 0u && valid {
             if shared_sad[0] < hp_track_sad {
                 hp_track_sad = shared_sad[0];
-                hp_track_mv = pack_mv(test_hx, test_hy);
+                hp_track_mv = pack_mv(test_qx, test_qy);
             }
         }
         workgroupBarrier();
     }
 
-    // Thread 0 writes the final half-pel MV result
+    // Stage B: quarter-pel search (step = 1 QP unit) around Stage A winner.
+    let stageA_qx = unpack_dx(hp_track_mv);
+    let stageA_qy = unpack_dy(hp_track_mv);
+
+    for (var cand = 0u; cand < 8u; cand++) {
+        var off_x: i32 = 0;
+        var off_y: i32 = 0;
+        switch cand {
+            case 0u: { off_x =  0; off_y = -1; }  // N
+            case 1u: { off_x = -1; off_y =  0; }  // W
+            case 2u: { off_x =  1; off_y =  0; }  // E
+            case 3u: { off_x =  0; off_y =  1; }  // S
+            case 4u: { off_x = -1; off_y = -1; }  // NW
+            case 5u: { off_x =  1; off_y = -1; }  // NE
+            case 6u: { off_x = -1; off_y =  1; }  // SW
+            case 7u: { off_x =  1; off_y =  1; }  // SE
+            default: {}
+        }
+
+        let test_qx = stageA_qx + off_x;
+        let test_qy = stageA_qy + off_y;
+
+        let ref_base_qx = i32(block_origin_x) * 4 + test_qx;
+        let ref_base_qy = i32(block_origin_y) * 4 + test_qy;
+        let valid = do_subpel && ref_base_qx >= -3 && ref_base_qy >= -3 &&
+                    ref_base_qx + bs * 4 <= w * 4 + 3 &&
+                    ref_base_qy + bs * 4 <= h * 4 + 3;
+
+        var pixel_diff: u32 = 0u;
+        if valid {
+            let rqx = i32(block_origin_x + qp_px) * 4 + test_qx;
+            let rqy = i32(block_origin_y + qp_py) * 4 + test_qy;
+            let ref_val = bilinear_sample(rqx, rqy);
+            pixel_diff = u32(abs(qp_cur_val - ref_val));
+        }
+
+        shared_sad[tid] = pixel_diff;
+        workgroupBarrier();
+
+        for (var stride = 128u; stride > 0u; stride >>= 1u) {
+            if tid < stride {
+                shared_sad[tid] += shared_sad[tid + stride];
+            }
+            workgroupBarrier();
+        }
+
+        if tid == 0u && valid {
+            if shared_sad[0] < hp_track_sad {
+                hp_track_sad = shared_sad[0];
+                hp_track_mv = pack_mv(test_qx, test_qy);
+            }
+        }
+        workgroupBarrier();
+    }
+
+    // Thread 0 writes the final quarter-pel MV result.
     if tid == 0u {
         let final_dx = unpack_dx(hp_track_mv);
         let final_dy = unpack_dy(hp_track_mv);

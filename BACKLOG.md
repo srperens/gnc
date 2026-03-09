@@ -122,3 +122,9 @@ See [BASELINE.md](BASELINE.md) for current benchmark numbers.
 - **P-frame fix (committed 856761c):** Chroma-domain MC for 4:2:0 P-frames. BPP ordering now correct: 4:2:0 < 4:2:2 < 4:4:4 (bbb: 2.20/2.35/2.61, crowd_run: 5.16/5.59/6.39 bpp). Ratio 0.92-0.95 (not yet ≤0.85 target, possibly B-frame overhead polluting avg).
 - **B-frame regression (diagnosed, 2026-03-08):** B-frames in 422/420 show up to 11.82 dB PSNR loss and are larger than I-frames. This is because B-frame backward MC for 4:2:0 chroma is currently performing MC in the luma domain, using luma-sized, NN-upsampled references directly, without the necessary box-filtering and MV scaling to operate in the chroma domain. This mirrors the original P-frame issue that caused structured HF residuals.
 - **Next:** Implement specialized chroma-domain MC for 4:2:0 B-frames in `src/decoder/gpu_work.rs`. This includes box-filtering references, scaling MVs, calling a chroma-domain `compensate_bidir` variant, and upsampling the result.
+
+### 15. Quarter-pel motion compensation
+- **Status:** active (2026-03-09)
+- **Hypothesis:** Half-pel ME leaves significant residual energy — P-frames cost 2-3× more than I-frames at q=25 on animated content (bbb). Quarter-pel interpolation reduces prediction error by ~25-50%, yielding ≥0.5 dB PSNR improvement on P/B-frames and ≥5% bpp reduction overall.
+- **Success criteria:** P-frame PSNR ≥ +0.5 dB on crowd_run q=75; bpp ≥ −5% on bbb+crowd_run without VMAF regression.
+- **Approach:** Add quarter-pel bilinear interpolation to motion_compensate.wgsl and motion_compensate_bidir.wgsl. Extend ME search to refine half-pel winners with ±1 quarter-pel offsets. MV storage: change i16 half-pel units → i16 quarter-pel units (doubles range/precision, no format break since no production bitstreams).

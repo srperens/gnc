@@ -433,7 +433,7 @@ impl MotionEstimator {
     }
 
     /// Dispatch block matching motion estimation on GPU.
-    /// Returns (mv_buffer, sad_buffer). MVs are stored as i32 pairs (dx, dy) in half-pel units.
+    /// Returns (mv_buffer, sad_buffer). MVs are stored as i32 pairs (dx, dy) in quarter-pel units.
     ///
     /// When `predictor_mvs` is provided (from previous P-frame), the shader skips the
     /// expensive coarse search and uses the predicted MV as the starting point for a fine
@@ -629,7 +629,7 @@ impl MotionEstimator {
     /// Dispatch bidirectional block matching motion estimation on GPU.
     /// Tests forward-only, backward-only, and bidir average, picking the lowest SAD.
     /// Returns (fwd_mv_buf, bwd_mv_buf, block_modes_buf, sad_buf).
-    /// MVs are stored as i32 pairs (dx, dy) in half-pel units.
+    /// MVs are stored as i32 pairs (dx, dy) in quarter-pel units.
     /// block_modes: 0 = forward, 1 = backward, 2 = bidirectional.
     #[allow(clippy::too_many_arguments)]
     pub fn estimate_bidir(
@@ -2085,9 +2085,9 @@ mod tests {
         let total_blocks = blocks_x * blocks_y;
         let mvs = MotionEstimator::read_motion_vectors(&ctx, &mv_buf, total_blocks);
 
-        // MVs are now in half-pel units, so expected values are shift * 2
-        let expected_dx = (shift_x * 2) as i16;
-        let expected_dy = (shift_y * 2) as i16;
+        // MVs are now in quarter-pel units, so expected values are shift * 4
+        let expected_dx = (shift_x * 4) as i16;
+        let expected_dy = (shift_y * 4) as i16;
 
         // Interior blocks (not near edges) should find the correct shift
         let mut correct_count = 0;
@@ -2103,7 +2103,7 @@ mod tests {
         }
         assert!(
             correct_count > total_interior / 2,
-            "Most interior blocks should find shift ({},{}) in half-pel units: {}/{} correct",
+            "Most interior blocks should find shift ({},{}) in quarter-pel units: {}/{} correct",
             expected_dx,
             expected_dy,
             correct_count,

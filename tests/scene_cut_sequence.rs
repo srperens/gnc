@@ -419,9 +419,12 @@ fn test_bbb_scene_cuts_250_600() {
 
     assert_eq!(
         decoded_frames.len(),
-        num_gops * GOP_SIZE,
-        "Decoded GOP frame count mismatch: expected {}, got {}",
-        num_gops * GOP_SIZE,
+        TOTAL_FRAMES,
+        "Decoded frame count mismatch: expected {} ({}×{}+{} tail), got {}",
+        TOTAL_FRAMES,
+        num_gops,
+        GOP_SIZE,
+        tail_count,
         decoded_frames.len()
     );
 

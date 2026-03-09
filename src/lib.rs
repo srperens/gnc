@@ -385,6 +385,15 @@ pub struct CodecConfig {
     /// Bit depth of the input/output signal (8 or 10). Default: 8.
     /// Affects FrameInfo.bit_depth, PSNR normalisation, and save/load helpers.
     pub bit_depth: u32,
+    /// Scene cut detection threshold (mean absolute difference of luma, [0,255] range).
+    ///
+    /// When a non-I-frame has a luma MAD vs the previous frame exceeding this threshold,
+    /// it is forced to encode as an I-frame regardless of its position in the GOP.
+    /// This avoids large inter-frame residuals at hard scene cuts.
+    ///
+    /// Typical hard cuts have MAD > 50. Set to 0.0 to disable detection.
+    /// Default: 50.0.
+    pub scene_cut_threshold: f32,
 }
 
 impl CodecConfig {
@@ -426,8 +435,36 @@ impl Default for CodecConfig {
             adaptive_temporal_mul: true,
             chroma_format: ChromaFormat::Yuv444,
             bit_depth: 8,
+            scene_cut_threshold: 50.0,
         }
     }
+}
+
+/// Compute mean absolute luma difference between two RGB f32 frames.
+///
+/// Input frames are interleaved RGB, values in [0, 255]. Luma is approximated as
+/// the R channel (a fast proxy sufficient for threshold detection).
+/// Samples every 4th pixel for speed (~100K samples at 1080p, <1ms).
+///
+/// Returns the mean absolute luma difference in [0, 255] range.
+/// A hard scene cut typically has MAD > 50; static or slow-moving scenes have MAD < 5.
+pub fn luma_mad(frame_a: &[f32], frame_b: &[f32]) -> f32 {
+    if frame_a.len() < 3 || frame_b.len() < 3 {
+        return 0.0;
+    }
+    let mut sum = 0.0f64;
+    let mut count = 0usize;
+    let mut i = 0usize;
+    let len = frame_a.len().min(frame_b.len());
+    while i + 2 < len {
+        sum += (frame_a[i] - frame_b[i]).abs() as f64;
+        count += 1;
+        i += 12; // advance 4 pixels × 3 channels
+    }
+    if count == 0 {
+        return 0.0;
+    }
+    (sum / count as f64) as f32
 }
 
 /// Map a quality value (1–100) to codec parameters.

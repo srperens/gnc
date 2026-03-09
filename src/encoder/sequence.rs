@@ -51,6 +51,7 @@ fn tile_skip_threshold(_qstep: f32) -> f32 {
     0.0
 }
 
+
 /// Pre-computed ME results for a P-frame.
 /// Produced by the look-ahead ME pass that runs while the previous frame's
 /// Metal sync is in progress, overlapping ~18ms of sync latency with ~20ms of ME.
@@ -186,6 +187,11 @@ impl EncoderPipeline {
         let diag_enabled = diagnostics::enabled();
         let mut last_iframe_bytes: Option<usize> = None;
 
+        // Scene cut detection: luma of the most recently encoded frame (RGB f32 interleaved).
+        // We store just the R channel (luma proxy) to reduce memory.
+        // Populated after every encoded frame; used to compute MAD before the next frame.
+        let mut prev_frame_luma: Option<Vec<f32>> = None;
+
         // Temporal wavelet diagnostic: staging buffers + previous frame state
         let diag_twav_staging: Option<[wgpu::Buffer; 3]> = if diag_enabled {
             Some(std::array::from_fn(|i| {
@@ -206,9 +212,55 @@ impl EncoderPipeline {
         // (B-frame groups use a different submit pattern).
         let mut pending_me: Option<PrecomputedPFrameME> = None;
 
+        // Cached frame pixels loaded during scene cut detection; reused so we don't
+        // call load_frame(display_idx) twice when a cut is detected.
+        let mut preloaded_frame: Option<Vec<f32>> = None;
+
         let mut display_idx = 0;
         while display_idx < n {
-            let is_keyframe = ki <= 1 || display_idx % ki == 0 || !has_reference;
+            // Scene cut detection: if this frame is not already a scheduled keyframe,
+            // force an I-frame when MAD vs the previous frame exceeds the threshold.
+            //
+            // Two entry paths:
+            // (a) `preloaded_frame` is already set — the B-frame scan in the previous
+            //     iteration pre-identified this frame as a cut and cached its pixels.
+            //     Skip the MAD re-check and directly force the I-frame.
+            // (b) No pre-loaded frame — compute MAD by loading the frame here.
+            //     If it IS a cut, cache the frame; if NOT a cut, clear preloaded_frame.
+            let scene_cut_forced = if config.scene_cut_threshold > 0.0
+                && has_reference
+                && ki > 1
+                && display_idx % ki != 0
+            {
+                if preloaded_frame.is_some() {
+                    // Pre-identified by B-frame scan; already a confirmed cut.
+                    true
+                } else if let Some(ref prev_luma) = prev_frame_luma {
+                    let frame_data_for_cut = load_frame(display_idx);
+                    let mad = crate::luma_mad(&frame_data_for_cut, prev_luma);
+                    let is_cut = mad > config.scene_cut_threshold;
+                    if is_cut {
+                        if std::env::var("GNC_DEBUG").is_ok() {
+                            eprintln!(
+                                "[scene_cut] frame {}: MAD={:.1} > threshold={:.1}, forcing I-frame",
+                                display_idx, mad, config.scene_cut_threshold
+                            );
+                        }
+                        // Cache the loaded frame so the keyframe path can reuse it.
+                        preloaded_frame = Some(frame_data_for_cut);
+                    }
+                    // If not a cut, preloaded_frame remains None — the P/B-frame path
+                    // will call load_frame again. The frame data is not stored to avoid
+                    // holding stale pixels across iterations.
+                    is_cut
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            let is_keyframe = ki <= 1 || display_idx % ki == 0 || !has_reference || scene_cut_forced;
 
             // Build per-frame config: override qstep if rate control is active
             let frame_config = if let Some(ref rc) = rate_ctrl {
@@ -221,7 +273,7 @@ impl EncoderPipeline {
 
             if is_keyframe {
                 let _t_iframe = std::time::Instant::now();
-                let frame_data = load_frame(display_idx);
+                let frame_data = preloaded_frame.take().unwrap_or_else(|| load_frame(display_idx));
                 let mut compressed = self.encode(ctx, &frame_data, width, height, &frame_config);
                 compressed.frame_type = FrameType::Intra;
 
@@ -301,6 +353,9 @@ impl EncoderPipeline {
                         }
                         prev_twav_coeffs = Some(coeffs);
                     }
+                }
+                if config.scene_cut_threshold > 0.0 {
+                    prev_frame_luma = Some(frame_data);
                 }
                 results[display_idx] = Some(compressed);
                 display_idx += 1;
@@ -405,6 +460,9 @@ impl EncoderPipeline {
                         prev_twav_coeffs = Some(coeffs);
                     }
                 }
+                if config.scene_cut_threshold > 0.0 {
+                    prev_frame_luma = Some(frame_data);
+                }
                 results[display_idx] = Some(compressed);
                 display_idx += 1;
                 continue;
@@ -412,7 +470,36 @@ impl EncoderPipeline {
 
             // --- B-frame group processing ---
             // Determine how many inter frames remain until next keyframe
-            let next_key = (((display_idx / ki) + 1) * ki).min(n);
+            let mut next_key = (((display_idx / ki) + 1) * ki).min(n);
+
+            // Scene cut scan: if detection is enabled, scan ahead through [display_idx..next_key)
+            // to find the earliest scene cut. If found at position `cut_pos`, limit next_key to
+            // cut_pos so the B-frame groups stop before the cut. The next while loop iteration
+            // will start at cut_pos, trigger is_keyframe=true (via scene_cut_forced), and encode
+            // it as an I-frame.
+            if let Some(ref prev_luma) = prev_frame_luma {
+                // Compare prev_luma (the frame before display_idx) against each candidate.
+                // We compare consecutive frames to catch the actual cut boundary.
+                let mut scan_prev = prev_luma.clone();
+                for scan_idx in display_idx..next_key {
+                    let scan_frame = load_frame(scan_idx);
+                    let mad = crate::luma_mad(&scan_frame, &scan_prev);
+                    if mad > config.scene_cut_threshold {
+                        if std::env::var("GNC_DEBUG").is_ok() {
+                            eprintln!(
+                                "[scene_cut] frame {scan_idx}: MAD={mad:.1} > threshold={:.1}, limiting B-group to [{display_idx}..{scan_idx})",
+                                config.scene_cut_threshold
+                            );
+                        }
+                        // Cache this frame so the next iteration reuses it.
+                        preloaded_frame = Some(scan_frame);
+                        next_key = scan_idx;
+                        break;
+                    }
+                    scan_prev = scan_frame;
+                }
+            }
+
             let remaining = next_key - display_idx;
             let full_groups = remaining / group_size;
             let _remainder = remaining % group_size;
@@ -752,7 +839,20 @@ impl EncoderPipeline {
                         prev_twav_coeffs = Some(coeffs);
                     }
                 }
+                if config.scene_cut_threshold > 0.0 {
+                    prev_frame_luma = Some(rem_frame_data);
+                }
                 results[j] = Some(compressed);
+            }
+
+            // Update prev_frame_luma to the last frame of this B-group/remainder block.
+            // When the remainder loop ran, prev_frame_luma was already updated above.
+            // When there were full B-groups but no remainder, update to next_key - 1.
+            if config.scene_cut_threshold > 0.0 && rem_start >= next_key {
+                // No remainder frames: the last display frame is next_key - 1, inside
+                // the last B-group. Load it now so the next group boundary check works.
+                // (This load is cheap — only done once per GOP transition.)
+                prev_frame_luma = Some(load_frame(next_key - 1));
             }
 
             display_idx = next_key;

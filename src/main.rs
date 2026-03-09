@@ -785,33 +785,11 @@ fn select_temporal_mode(explicit: &str, fps: f64, quality: u32) -> (TemporalTran
     }
 }
 
-/// Compute mean absolute Y-channel difference between two RGB f32 frames (values in [0,255]).
-/// Uses 8× subsampling for speed. Returns a value in [0, 1] (normalized by 255).
-/// Scene cuts typically score > 0.15; in-scene motion typically < 0.05.
-fn scene_cut_score(a: &[f32], b: &[f32]) -> f32 {
-    debug_assert_eq!(a.len(), b.len());
-    let n = a.len() / 3;
-    if n == 0 {
-        return 0.0;
-    }
-    const STEP: usize = 8;
-    let mut sum = 0.0f32;
-    let mut count = 0usize;
-    let mut i = 0;
-    while i < n {
-        let y_a = 0.299 * a[i * 3] + 0.587 * a[i * 3 + 1] + 0.114 * a[i * 3 + 2];
-        let y_b = 0.299 * b[i * 3] + 0.587 * b[i * 3 + 1] + 0.114 * b[i * 3 + 2];
-        sum += (y_a - y_b).abs();
-        count += 1;
-        i += STEP;
-    }
-    sum / (count as f32 * 255.0)
-}
-
-/// Scene cut threshold for `scene_cut_score` (normalized to [0,1]).
-/// Hard cuts score > 0.40 (ffprobe equivalent). 0.15 catches most hard cuts
-/// without false positives from fast motion.
-const SCENE_CUT_THRESH: f32 = 0.15;
+/// Scene cut threshold for `gnc::luma_mad` (0–255 scale).
+/// Hard cuts score > 40 (ffprobe equivalent). 38 catches most hard cuts
+/// without false positives from fast motion (equivalent to the previous
+/// 0.15 normalized threshold).
+const SCENE_CUT_THRESH: f32 = 38.0;
 
 fn csv_with_suffix(path: &str, suffix: &str) -> String {
     if let Some((base, ext)) = path.rsplit_once('.') {
@@ -1492,7 +1470,7 @@ fn main() {
                     // the next GOP start fresh.
                     if matches!(temporal_mode, TemporalTransform::Haar) {
                         let cut_pos = gop_frames.windows(2).enumerate().find_map(|(i, pair)| {
-                            if scene_cut_score(&pair[0], &pair[1]) > SCENE_CUT_THRESH {
+                            if gnc::luma_mad(&pair[0], &pair[1]) > SCENE_CUT_THRESH {
                                 Some(i + 1)
                             } else {
                                 None

@@ -3175,3 +3175,152 @@ fn test_10bit_roundtrip() {
         "10-bit roundtrip PSNR too low: {psnr:.2} dB (expected > 30 dB)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Scene cut detection tests
+// ---------------------------------------------------------------------------
+
+/// Unit test for compute_luma_mad: identical frames must yield MAD = 0.
+#[test]
+fn test_compute_luma_mad_identical() {
+    let frame: Vec<f32> = (0..256 * 3).map(|i| (i % 256) as f32).collect();
+    let mad = crate::luma_mad(&frame, &frame);
+    assert!(
+        mad < 1e-5,
+        "MAD of identical frames should be ~0, got {mad}"
+    );
+}
+
+/// Unit test for compute_luma_mad: black vs white must yield MAD ≈ 255.
+#[test]
+fn test_compute_luma_mad_hard_cut() {
+    // black frame: all zeros
+    let black: Vec<f32> = vec![0.0f32; 512 * 3];
+    // white frame: all 255
+    let white: Vec<f32> = vec![255.0f32; 512 * 3];
+    let mad = crate::luma_mad(&white, &black);
+    assert!(
+        mad > 200.0,
+        "MAD of black vs white should be ~255, got {mad}"
+    );
+}
+
+/// Unit test for compute_luma_mad: slight motion must yield small MAD.
+#[test]
+fn test_compute_luma_mad_slight_motion() {
+    let frame_a: Vec<f32> = (0..256 * 3).map(|i| (i % 128) as f32).collect();
+    // Shift by a small constant to simulate tiny per-pixel change (~2 values on average)
+    let frame_b: Vec<f32> = frame_a.iter().map(|v| (v + 2.0).min(255.0)).collect();
+    let mad = crate::luma_mad(&frame_b, &frame_a);
+    assert!(
+        mad < 10.0,
+        "MAD of slightly-shifted frames should be small, got {mad}"
+    );
+}
+
+/// Integration test: scene cut detection forces I-frame at a hard cut.
+///
+/// Creates a 5-frame sequence with keyframe_interval=4 and scene_cut_threshold=50.
+/// Frames 0-1 are black, frame 2 is white (hard cut). With detection enabled,
+/// frame 2 must be encoded as an I-frame even though it is not at a keyframe boundary.
+/// Without detection (threshold=0), frame 2 would be encoded as a P-frame.
+#[test]
+fn test_scene_cut_forced_keyframe() {
+    let ctx = GpuContext::new();
+    let mut enc = EncoderPipeline::new(&ctx);
+    let dec = DecoderPipeline::new(&ctx);
+
+    let w = 256u32;
+    let h = 256u32;
+
+    // frame 0: all black
+    let black: Vec<f32> = vec![0.0f32; (w * h * 3) as usize];
+    // frame 1: mostly black (slow motion, no cut)
+    let slow_motion: Vec<f32> = black.iter().map(|_| 5.0f32).collect();
+    // frame 2: all white — hard scene cut (MAD ~250)
+    let white: Vec<f32> = vec![255.0f32; (w * h * 3) as usize];
+    // frame 3: slight variation from white
+    let white2: Vec<f32> = white.iter().map(|v| v - 5.0).collect();
+    // frame 4: still white
+    let white3: Vec<f32> = white.iter().map(|v| v - 3.0).collect();
+
+    let frames: Vec<&[f32]> = vec![&black, &slow_motion, &white, &white2, &white3];
+
+    // With scene cut detection enabled (threshold=50), frame 2 should be forced I-frame.
+    let mut config = crate::CodecConfig::default();
+    config.tile_size = 256;
+    config.keyframe_interval = 8; // large interval so frame 2 would not be a natural keyframe
+    config.scene_cut_threshold = 50.0;
+    config.cfl_enabled = false;
+
+    let compressed = enc.encode_sequence(&ctx, &frames, w, h, &config);
+
+    assert_eq!(compressed.len(), 5, "expected 5 compressed frames");
+
+    // Frame 0 must be I-frame (always)
+    assert_eq!(
+        compressed[0].frame_type,
+        FrameType::Intra,
+        "frame 0 should always be I-frame"
+    );
+
+    // Frame 2 (white, hard cut) must be forced I-frame
+    assert_eq!(
+        compressed[2].frame_type,
+        FrameType::Intra,
+        "frame 2 (hard cut, MAD >> 50) should be forced to I-frame"
+    );
+
+    // Frame 1 (slow motion, MAD ~5) must NOT be forced I-frame
+    assert_ne!(
+        compressed[1].frame_type,
+        FrameType::Intra,
+        "frame 1 (slow motion) should remain a P-frame, not incorrectly forced to I-frame"
+    );
+
+    // Decode and verify quality — no garbage frames from cross-cut reference
+    for (i, cf) in compressed.iter().enumerate() {
+        let decoded = dec.decode(&ctx, cf);
+        let psnr = compute_psnr(&decoded, frames[i]);
+        assert!(
+            psnr > 25.0,
+            "frame {i} PSNR {psnr:.2} dB is too low — possible cross-cut residual corruption"
+        );
+    }
+    eprintln!("scene cut test: all 5 frames decoded with PSNR > 25 dB");
+}
+
+/// Verify that scene cut detection is disabled when threshold=0.
+/// Frame 2 (hard cut) should be encoded as P-frame with threshold=0.
+#[test]
+fn test_scene_cut_disabled_at_zero_threshold() {
+    let ctx = GpuContext::new();
+    let mut enc = EncoderPipeline::new(&ctx);
+
+    let w = 256u32;
+    let h = 256u32;
+
+    let black: Vec<f32> = vec![0.0f32; (w * h * 3) as usize];
+    let white: Vec<f32> = vec![255.0f32; (w * h * 3) as usize];
+    let white2: Vec<f32> = white.iter().map(|v| v - 5.0).collect();
+
+    let frames: Vec<&[f32]> = vec![&black, &white, &white2];
+
+    let mut config = crate::CodecConfig::default();
+    config.tile_size = 256;
+    config.keyframe_interval = 8;
+    config.scene_cut_threshold = 0.0; // disabled
+    config.cfl_enabled = false;
+
+    let compressed = enc.encode_sequence(&ctx, &frames, w, h, &config);
+    assert_eq!(compressed.len(), 3);
+
+    // Frame 0 is always I-frame
+    assert_eq!(compressed[0].frame_type, FrameType::Intra);
+    // Frame 1 must be P-frame (detection disabled)
+    assert_eq!(
+        compressed[1].frame_type,
+        FrameType::Predicted,
+        "frame 1 should be P-frame when scene_cut_threshold=0 (detection disabled)"
+    );
+}

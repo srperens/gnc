@@ -4139,8 +4139,69 @@ impl EncoderPipeline {
                         config.wavelet_levels,
                         weights,
                     );
+                } else if p > 0 && is_non_444 {
+                    // 4:2:2 chroma: bidir MC at luma dims, then box-filter → chroma dims,
+                    // wavelet + quantize at chroma dims. Mirrors P-frame non-444 path.
+                    self.motion.compensate_bidir_cached(
+                        ctx,
+                        &mut cmd,
+                        cur_plane,
+                        &bufs.gpu_ref_planes[p],
+                        &bufs.gpu_bwd_ref_planes[p],
+                        &fwd_mv_buf,
+                        &bwd_mv_buf,
+                        &bufs.bidir_modes_scratch,
+                        &bufs.mc_out,
+                        padded_w,
+                        padded_h,
+                        &bufs.mc_bidir_fwd_params,
+                    );
+                    let chroma_ds_buf = if p == 1 {
+                        &bufs.co_plane_ds
+                    } else {
+                        &bufs.cg_plane_ds
+                    };
+                    let ci = chroma_info_bf.as_ref().unwrap();
+                    self.chroma_down.dispatch(
+                        ctx,
+                        &mut cmd,
+                        &bufs.mc_out,
+                        chroma_ds_buf,
+                        padded_w,
+                        padded_h,
+                        chroma_shift_x,
+                        chroma_shift_y,
+                        chroma_padded_w,
+                        chroma_padded_h,
+                    );
+                    self.transform.forward(
+                        ctx,
+                        &mut cmd,
+                        chroma_ds_buf,
+                        &bufs.plane_b,
+                        &bufs.plane_c,
+                        ci,
+                        config.wavelet_levels,
+                        config.wavelet_type,
+                        p,
+                    );
+                    self.quantize.dispatch(
+                        ctx,
+                        &mut cmd,
+                        &bufs.plane_c,
+                        quant_out,
+                        chroma_pixels as u32,
+                        config.quantization_step,
+                        res_dead_zone,
+                        true,
+                        chroma_padded_w,
+                        chroma_padded_h,
+                        config.tile_size,
+                        config.wavelet_levels,
+                        weights,
+                    );
                 } else {
-                    // Luma or 4:2:2: use regular luma-dimension bidir MC
+                    // Luma (all formats) or 4:4:4 chroma: bidir MC + wavelet at luma dims.
                     self.motion.compensate_bidir_cached(
                         ctx,
                         &mut cmd,

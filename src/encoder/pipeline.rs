@@ -57,6 +57,8 @@ pub struct EncoderPipeline {
     pad_bgl: wgpu::BindGroupLayout,
     tile_energy_reduce_pipeline: wgpu::ComputePipeline,
     tile_energy_reduce_bgl: wgpu::BindGroupLayout,
+    tile_skip_pipeline: wgpu::ComputePipeline,
+    tile_skip_bgl: wgpu::BindGroupLayout,
     pub(super) cached: Option<CachedEncodeBuffers>,
     pub(super) tw_cached: Option<CachedTemporalWaveletBuffers>,
     /// Second temporal wavelet buffer set for GOP pipelining (B set).
@@ -221,6 +223,62 @@ impl EncoderPipeline {
                     cache: None,
                 });
 
+        // GPU tile skip pipeline (zeros low-energy inter-frame residual tiles before Rice encode)
+        let ts_shader = ctx
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("tile_skip"),
+                source: wgpu::ShaderSource::Wgsl(
+                    include_str!("../shaders/tile_skip.wgsl").into(),
+                ),
+            });
+        let tile_skip_bgl =
+            ctx.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("ts_bgl"),
+                    entries: &[
+                        // binding 0: uniform params
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        // binding 1: coeffs (read_write storage)
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                    ],
+                });
+        let ts_pl = ctx
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("ts_pl"),
+                bind_group_layouts: &[&tile_skip_bgl],
+                push_constant_ranges: &[],
+            });
+        let tile_skip_pipeline =
+            ctx.device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("tile_skip_pipeline"),
+                    layout: Some(&ts_pl),
+                    module: &ts_shader,
+                    entry_point: Some("main"),
+                    compilation_options: Default::default(),
+                    cache: None,
+                });
+
         Self {
             color: ColorConverter::new(ctx),
             transform: WaveletTransform::new(ctx),
@@ -246,6 +304,8 @@ impl EncoderPipeline {
             pad_bgl,
             tile_energy_reduce_pipeline,
             tile_energy_reduce_bgl,
+            tile_skip_pipeline,
+            tile_skip_bgl,
             cached: None,
             tw_cached: None,
             tw_cached_b: None,
@@ -486,6 +546,69 @@ impl EncoderPipeline {
             timestamp_writes: None,
         });
         pass.set_pipeline(&self.tile_energy_reduce_pipeline);
+        pass.set_bind_group(0, &bg, &[]);
+        pass.dispatch_workgroups(tiles_x, tiles_y, 1);
+    }
+
+    /// Dispatch tile skip for inter-frame residuals.
+    ///
+    /// Records a compute dispatch into `cmd` (no submit — caller batches with other work).
+    /// One workgroup per tile; if mean |coeff| < skip_threshold, the entire tile is zeroed.
+    /// Zeroed tiles produce compact all-skip RiceTiles at entropy encode time.
+    ///
+    /// Must be dispatched AFTER quantize and BEFORE entropy encode, in the SAME command encoder.
+    /// Local decode uses the same buffer, so zeroed tiles decode as MC prediction + 0 = MC. ✓
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn dispatch_tile_skip(
+        &self,
+        ctx: &GpuContext,
+        cmd: &mut wgpu::CommandEncoder,
+        coeff_buf: &wgpu::Buffer,
+        padded_w: u32,
+        padded_h: u32,
+        tile_size: u32,
+        skip_threshold: f32,
+    ) {
+        use wgpu::util::DeviceExt;
+        // Params layout (matches shader struct exactly):
+        //   offset 0:  padded_w       u32
+        //   offset 4:  padded_h       u32
+        //   offset 8:  tile_size      u32
+        //   offset 12: skip_threshold f32  (stored as bits in u32 array)
+        let params_data: [u32; 4] = [
+            padded_w,
+            padded_h,
+            tile_size,
+            skip_threshold.to_bits(),
+        ];
+        let params_buf = ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("tile_skip_params"),
+                contents: bytemuck::cast_slice(&params_data),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ts_bg"),
+            layout: &self.tile_skip_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: coeff_buf.as_entire_binding(),
+                },
+            ],
+        });
+        let tiles_x = padded_w / tile_size;
+        let tiles_y = padded_h / tile_size;
+        let mut pass = cmd.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("tile_skip_pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.tile_skip_pipeline);
         pass.set_bind_group(0, &bg, &[]);
         pass.dispatch_workgroups(tiles_x, tiles_y, 1);
     }

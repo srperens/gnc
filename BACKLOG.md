@@ -6,6 +6,23 @@ Status: `todo` | `active` | `done` | `blocked`
 
 See [BASELINE.md](BASELINE.md) for current benchmark numbers.
 
+## Current Focus (updated 2026-03-09)
+
+H.264 comparison (#22) established the north star: GNC needs **2–5× more bits** than H.264 at equal PSNR (BD-rate +171–216%, broadcast contribution, 4:2:2, I+P+B).
+
+**The gap is temporal prediction, not entropy.**
+- P/B frames save only ~3% bpp vs all-I on high-motion content — H.264's MC is far more efficient
+- Rice+ZRL vs arithmetic coding is only ~0.1–0.2 bpp — not the bottleneck
+- Entropy-improvement items (#21, #7) are deprioritized; focus shifts to temporal prediction
+
+**Priority order for compression gains:**
+1. **#23 Skip/merge modes** (P1) — Infrastructure done; needs skip-mode-aware ME (choose MVs to minimise skip cost, not residual cost)
+2. **#24 Larger ME search range** (P2) — Current block_match is range-limited; larger range reduces residual for fast-motion
+3. **#25 Multi-reference P-frames** (P2) — Use >1 reference frame for P-frames; improves repeated textures
+4. **#17 Scene cut detection** (P3) — Correctness/robustness, small bpp gain
+5. **#21 Parent-child Rice k** (CLOSED — empirically vetoed)
+6. **#7 LL subband prediction** (CLOSED — skip)
+
 ## Items
 
 ### 1. Fix temporal Haar per-tile adaptive mul
@@ -68,10 +85,8 @@ See [BASELINE.md](BASELINE.md) for current benchmark numbers.
   risk (encoder/decoder desync) outweighs sub-0.08 bpp expected gain. Closed.
 
 ### 7. LL subband prediction
-- **Status:** todo (P3 — probably skip)
-- **Problem:** Delta prediction between adjacent LL tiles could reduce redundancy
-- **Success criteria:** Skip if < 2% bpp gain on benchmark suite
-- **Note:** Low priority, may not be worth the complexity
+- **Status:** closed — skip (2026-03-09)
+- **Reason:** H.264 comparison shows temporal prediction is the dominant gap, not intra-tile entropy. Delta prediction across LL tiles is an entropy-side improvement; expected gain <2% bpp. Not worth the complexity given current priorities.
 
 ### 8. Rate control
 - **Status:** done (2026-03-08)
@@ -186,3 +201,61 @@ See [BASELINE.md](BASELINE.md) for current benchmark numbers.
 - **Result:** VMAF +1.14 pts at q=75 (95.05 vs 93.91 baseline). BPP reduced across all quality levels: -12.3% (q=25), -6.3% (q=50), -4.5% (q=75) on single-frame bbb. Sequence bpp: crowd_run q=75 6.93 vs 6.99 baseline (-0.9%), crowd_run q=25 1.90 vs All-I 2.17 (12.7% saving), rush_hour within noise (+1.0% bpp). All 164 tests pass, zero clippy warnings.
 - **Shaders changed:** motion_compensate.wgsl, motion_compensate_bidir.wgsl, motion_compensate_bidir_chroma.wgsl, block_match.wgsl, block_match_bidir.wgsl, block_match_split.wgsl. Two-stage QP refinement: Stage A = ±2 QP units (= half-pel), Stage B = ±1 QP unit (= quarter-pel) around Stage A winner.
 - **Note on success criteria:** PSNR hypothesis partially met — bpp reduction exceeds −5% at q=25 (12.7%). VMAF improvement (+1.14 pts) exceeds threshold. P-frame PSNR criterion vs All-I not directly measured but implied by improved VMAF.
+
+### 21. Parent-child context Rice k — LL subband guides detail-subband k selection
+- **Status:** closed — fully implemented, measured, reverted (2026-03-09)
+- **Hypothesis:** Large LL parent (magnitude ≥4) predicts larger detail-subband coefficients → bias k += 1 for detail subbands (g > 0). Expected 0.08–0.18 bpp gain.
+- **Step 0 measurement:** ZRL run length correlation with LL ancestor magnitude is ~1.0 across Q1–Q4. No usable signal in ZRL, but magnitude-k bias seemed worth testing.
+- **Full implementation (Phase 1):** Implemented in all 4 components: rice_encode.wgsl, rice_decode.wgsl, rice.rs encoder, rice.rs decoder. GPU decoder used Phase 0 pre-decode of LL streams into shared memory (1024×f32 workgroup array), then Phase 1 detail decode with parent k bias.
+- **Measured result:** bpp INCREASED across all tests. bbb_1080p q=75: 3.83 → 4.03 bpp (+5.2%). checkerboard q=50: 1.98 → 2.11 (+6.6%), q=75: 3.32 → 3.55 (+6.9%), q=90: 7.66 → 8.13 (+6.1%). Golden baseline regression tests failed.
+- **Root cause:** At q=75, quantization step ≈ 4–5, so virtually ALL LL values have magnitude ≥4. Parent context k+1 fires universally for all detail coefficients — it's not adaptive at all. EMA was already correctly calibrated to optimal k; forcing k+1 everywhere is strictly worse. The threshold "magnitude ≥4" was too low relative to typical LL magnitudes after quantization.
+- **Verdict:** Hypothesis was correct in theory (large parents do correlate with larger children) but the threshold choice and fixed +1 bias are too blunt. A soft, magnitude-proportional bias might work but EMA already handles within-stream adaptation. Abandoned.
+- **Reverted:** All changes to rice_encode.wgsl, rice_decode.wgsl, rice.rs reverted to pre-experiment state. All tests pass.
+- **Code left:** `ll_ancestor_coord()`, `collect_tile_entropy_samples()`, `compute_entropy_stats()` remain in rice.rs for future reference. GPU shaders unchanged from HEAD.
+
+### 22. H.264 BD-rate comparison — broadcast contribution context
+- **Status:** todo P3
+- **Goal:** Establish an honest, apples-to-apples BD-rate gap between GNC and H.264 for the broadcast contribution use case. Used as north star for compression improvement prioritization.
+- **Setup:**
+  - GNC: Rice+ZRL entropy, I+P+B frames, 4:2:2 chroma (`--chroma-format 422`), q-sweep 10-90
+  - H.264: `ffmpeg -c:v libx264 -profile:v high422 -pix_fmt yuv422p -preset veryslow`, q-sweep via `-crf 10..50`
+  - Sequences: bbb_1080p (mixed), crowd_run (high motion), rush_hour (low motion)
+  - Metric: PSNR-Y BD-rate (Bjøntegaard), and VMAF BD-rate as secondary
+  - 10-bit: H.264 10-bit via `high422 10` profile + `yuv422p10le` if encoder supports it; GNC is natively 10-bit transparent
+- **Success criterion:** Produce a table showing BD-rate gap (%) at each sequence, with clear statement of what encoder settings were used. Numbers must be reproducible.
+- **Notes:**
+  - `rd-curve` only sweeps single images (no video mode). For video comparison, run `benchmark-sequence` at multiple q values and collect bpp+PSNR, then feed two CSVs into `rd-curve --compare`.
+  - H.264 intra-only is NOT the right comparison (we have B-frames). Use `-g 250 -bf 7` or similar for H.264 video mode.
+  - Prior (incorrect) comparison used rANS + intra-only + 4:4:4 — discard those numbers.
+- **Result (2026-03-09, park_joy):** BD-rate +171–216%. GNC 2–5× bpp vs H.264 at same PSNR. See RESEARCH_LOG.md for full table.
+- **Key finding:** The gap is NOT entropy. Temporal prediction efficiency is the dominant bottleneck — P/B saves only ~3% vs all-I on high-motion content. Entropy improvements are secondary. Focus backlog on better motion compensation and temporal lifting.
+- **Status:** done (measurement complete; used as north star for compression priorities)
+
+### 23. Skip/merge modes — suppress residual for flat/matched regions
+- **Status:** partial — infrastructure in place, disabled by default (2026-03-09)
+- **Motivation:** GNC P/B-frames save only ~3% bpp vs all-I on high-motion content. A large fraction of P/B tiles have near-zero residual after motion compensation — but GNC still encodes and transmits that residual. H.264 skip mode transmits 0 bits for a matched block. This is likely the single biggest low-hanging gain in the temporal path.
+- **Hypothesis:** For tiles where SAD(residual) < threshold, transmit a 1-bit skip flag instead of the full residual. Decoder reconstructs from motion-compensated reference only. Expected gain: 5–15% bpp reduction on high-motion sequences, larger on low-motion.
+- **Success criteria:** bpp −5% on crowd_run q=75 with VMAF neutral (±0.3 pts). All tests pass.
+- **Implementation sketch:**
+  - After ME, compute residual energy per tile (already available from AQ path).
+  - If energy < skip_threshold(q): write 1-bit skip flag in tile header; skip residual coding.
+  - Decoder: on skip flag, copy MC output to output buffer without adding residual.
+  - Threshold must be q-dependent (higher q = tighter threshold).
+- **Risk:** Bitstream format change (tile header gains a skip bit). Needs backward-compat flag or version bump.
+- **What was built (2026-03-09):** GPU compute shader `tile_skip.wgsl` + `dispatch_tile_skip()` in pipeline.rs + insertion points in sequence.rs for P-frames (444 + non-444) and B-frames. Infrastructure compiles clean. Currently disabled: `tile_skip_threshold()` returns 0.0.
+- **Why disabled:** Zeroing quantized wavelet coefficients AFTER ME (with residual-minimising MVs) causes MV-mismatch distortion. The decoded tile uses `decoded_P = MC(ref, non-skip-MVs) + 0` which is worse quality than the expected skip tile `decoded_P = MC(ref, zero/co-located-MVs)`. Test failures at threshold=0.5: `test_pframe_identical_frames_correct_decode` PSNR dropped 28.76 dB (req. >30), `test_motion_comp_effectiveness` Frame 2 22.45 dB (req. >25).
+- **Required next step:** Skip-mode-aware ME: for each tile, compute skip cost (MC-only error) vs residual cost; choose skip when skip_cost < residual_cost + bits_saved_penalty. Encode as all-zero residual tile + skip flag if skip wins. The current zeroing approach (post-ME) cannot work because the MVs were not chosen to minimise skip cost.
+
+### 24. Larger ME search range
+- **Status:** todo (P2)
+- **Motivation:** Current block_match.wgsl uses a fixed hierarchical search range. On fast-motion content (crowd_run, park_joy), many blocks may have the true motion vector outside the current search window, forcing a large residual. H.264's full-pel search typically covers ±64–128 pixels with hierarchical refinement.
+- **Hypothesis:** Doubling the coarse search range reduces average residual energy on high-motion sequences by 5–10%, at the cost of ~2× ME compute time.
+- **Success criteria:** bpp −3% on crowd_run q=75; VMAF neutral; fps ≥17 (acceptable regression since quality gain is the goal).
+- **Note:** Profile ME time first. If ME is already <20% of total encode, range increase is free. If ME is 40%+, may need hierarchical shortcutting.
+
+### 25. Multi-reference P-frames
+- **Status:** todo (P2)
+- **Motivation:** GNC P-frames reference only the immediately preceding decoded frame. H.264 can reference up to 16 frames, which dramatically improves compression for repeated textures (scrolling text, panning shots) and periodic motion. Even 2-reference P-frames would cover the most common cases.
+- **Hypothesis:** Allowing P-frames to choose the best of 2 reference frames (prev and prev-prev) reduces bpp 3–8% on sequences with periodic motion or scene repetition.
+- **Success criteria:** bpp −3% on at least one test sequence; VMAF neutral; no regression on bbb/crowd_run.
+- **Complexity:** Medium. Requires decoder to track a reference buffer (already partially done for B-frames). ME shader needs a second reference input and cost comparison.

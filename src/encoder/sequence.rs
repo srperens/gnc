@@ -24,6 +24,20 @@ const DEFAULT_FPS: f64 = 30.0;
 /// A value of 2 gives groups of [B B P] — standard for moderate latency.
 const B_FRAMES_PER_GROUP: usize = 2;
 
+/// Skip threshold for inter-frame residual tiles (in quantized units, post-quantization).
+///
+/// Tiles whose mean |quantized coeff| is below this value are zeroed before Rice encode.
+/// Returns the tile skip threshold for the given quantization step.
+/// Tiles whose mean |coeff| is below this value are zeroed before Rice encoding.
+///
+/// Currently returns 0.0 (disabled): proper skip mode requires skip-mode-aware ME
+/// (MVs chosen to minimise skip cost, not residual cost). With residual-minimising MVs,
+/// zeroing the residual causes MV-mismatch distortion that hurts quality more than it
+/// saves bits. Infrastructure is in place; re-enable once skip-mode ME is implemented.
+fn tile_skip_threshold(_qstep: f32) -> f32 {
+    0.0
+}
+
 /// Pre-computed ME results for a P-frame.
 /// Produced by the look-ahead ME pass that runs while the previous frame's
 /// Metal sync is in progress, overlapping ~18ms of sync latency with ~20ms of ME.
@@ -2931,6 +2945,18 @@ impl EncoderPipeline {
                 }
             }
 
+            // Skip mode: zero low-energy residual tiles before entropy encode.
+            // Tiles zeroed here produce compact all-skip RiceTiles (saves bpp with minimal quality loss).
+            // Local decode reads the same buffers, so zeroed tiles reconstruct as MC+0=MC. ✓
+            // NOTE: currently disabled (threshold=0.0) — requires skip-mode-aware ME first.
+            let skip_thr_444 = tile_skip_threshold(config.quantization_step);
+            if matches!(entropy_mode, EntropyMode::Rice) && !is_non_444 && skip_thr_444 > 0.0 {
+                let quant_bufs_444 = [&bufs.recon_y, &bufs.co_plane, &bufs.plane_b];
+                for qb in &quant_bufs_444 {
+                    self.dispatch_tile_skip(ctx, &mut cmd, qb, padded_w, padded_h, config.tile_size, skip_thr_444);
+                }
+            }
+
             // Profiling: flush forward phase to measure GPU time
             if profile {
                 ctx.queue.submit(Some(cmd.finish()));
@@ -3737,6 +3763,19 @@ impl EncoderPipeline {
                         weights,
                     );
                 }
+
+                // Skip mode: zero low-energy residual tiles before entropy encode.
+                // NOTE: currently disabled (threshold=0.0) — requires skip-mode-aware ME first.
+                let skip_thr_nonref = tile_skip_threshold(config.quantization_step);
+                if matches!(entropy_mode, EntropyMode::Rice) && skip_thr_nonref > 0.0 {
+                    let (skip_w, skip_h) = if p > 0 && is_non_444 {
+                        (chroma_padded_w, chroma_padded_h)
+                    } else {
+                        (padded_w, padded_h)
+                    };
+                    self.dispatch_tile_skip(ctx, &mut cmd, quant_out, skip_w, skip_h, config.tile_size, skip_thr_nonref);
+                }
+
                 ctx.queue.submit(Some(cmd.finish()));
 
                 let (enc_pixels, enc_w, enc_tiles_x, enc_tiles_y, enc_info) = if p > 0 && is_non_444
@@ -4875,6 +4914,14 @@ impl EncoderPipeline {
                     config.wavelet_levels,
                     weights,
                 );
+
+                // Skip mode: zero low-energy residual tiles before entropy encode.
+                // NOTE: currently disabled (threshold=0.0) — requires skip-mode-aware ME first.
+                let skip_thr_b = tile_skip_threshold(config.quantization_step);
+                if matches!(entropy_mode, EntropyMode::Rice) && skip_thr_b > 0.0 {
+                    self.dispatch_tile_skip(ctx, &mut cmd, quant_out, padded_w, padded_h, config.tile_size, skip_thr_b);
+                }
+
                 ctx.queue.submit(Some(cmd.finish()));
 
                 encode_entropy(

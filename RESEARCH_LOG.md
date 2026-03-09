@@ -4,6 +4,138 @@
 
 ---
 
+## 2026-03-09: #23 Tile skip mode — infrastructure built, threshold calibration failed
+
+### Hypothesis
+GNC P/B frames waste bits encoding near-zero residuals where MC is already accurate.
+Zeroing low-energy tiles (mean |coeff| < threshold) before Rice encoding would let the
+Rice encoder produce compact all-skip tiles at near-zero bit cost.
+Expected: 5–15% bpp reduction on high-motion sequences with VMAF neutral.
+
+### Implementation
+- `tile_skip.wgsl`: GPU compute shader (workgroup_size=256, one workgroup per tile).
+  Computes mean |coeff| via parallel reduction; zeros tile if mean < threshold.
+  Dispatch: (tiles_x, tiles_y, 1). All barriers unconditional (Metal/M1 requirement).
+- `pipeline.rs`: `dispatch_tile_skip()` + `tile_skip_pipeline`/`tile_skip_bgl` fields.
+- `sequence.rs`: Insertion points in P-frame 444 path, P-frame non-444 path, and B-frame path.
+  All dispatches run in the same command encoder as quantize+Rice (no extra GPU sync).
+
+### Calibration attempt (threshold = 0.5)
+Two tests failed immediately:
+
+| Test | Expected | Got | Required |
+|------|----------|-----|----------|
+| test_pframe_identical_frames_correct_decode | ~46 dB | 28.76 dB | >30.0 dB |
+| test_motion_comp_effectiveness Frame 2 | ~35 dB | 22.45 dB | >25.0 dB |
+
+### Root cause: MV-mismatch distortion
+The fundamental problem: ME finds MVs that minimise residual energy (residual-optimal MVs).
+When `tile_skip` then zeros those coefficients, the decoder reconstructs:
+`decoded_P = MC(ref, residual-optimal-MVs) + 0`
+but residual-optimal MVs are NOT skip-optimal — they may be non-zero even when a zero-MV
+or co-located MV would give better prediction. The MC prediction with non-skip MVs is then
+the final output, which is worse quality than the original signal (no residual correction).
+
+For identical frames: ME finds small non-zero MVs (quantisation noise in reference).
+After skip zeroing: decoded_P = MC(noisy_ref, noise_MVs) → PSNR drops from ~46 dB to 28.76 dB.
+
+### Decision
+Disabled by default: `tile_skip_threshold()` returns 0.0. Infrastructure kept in place.
+Guard checks `skip_thr > 0.0` to avoid pointless GPU dispatches.
+
+Re-enable requires skip-mode-aware ME: for each tile, compare skip cost (MC-only error)
+vs residual cost + bits, and use skip-optimised MVs (zero or co-located) when skip wins.
+This is a fundamental ME architecture change, not a tuning problem.
+
+---
+
+## 2026-03-09: #21 Parent-child context Rice k — implemented, measured, reverted
+
+### Hypothesis
+Large LL parent coefficient (magnitude ≥4) predicts larger detail-subband coefficients → bias k += 1
+for detail subbands. Expected 0.08–0.18 bpp reduction (from literature estimates on wavelet context coding).
+
+### Implementation
+Full implementation in all 4 components:
+- `rice_encode.wgsl`: `ll_ancestor_coord()` function + parent k bias in Phase 2 (guarded by `tile_size == 256`)
+- `rice_decode.wgsl`: Phase 0 pre-decode of LL streams into shared workgroup memory (1024×f32), workgroupBarrier(), Phase 1 detail decode with parent k bias
+- `rice.rs encoder`: `ll_ancestor_coord()` lookup + `if parent_mag >= 4 { k += 1 }` for g > 0
+- `rice.rs decoder`: same structure as encoder (symmetric for bitstream compatibility)
+
+### Measured results
+
+| Test | Baseline bpp | With parent ctx | Δ |
+|------|-------------|-----------------|---|
+| bbb_1080p q=75 | 3.83 | 4.03 | +5.2% |
+| checkerboard q=50 | 1.98 | 2.11 | +6.6% |
+| checkerboard q=75 | 3.32 | 3.55 | +6.9% |
+| checkerboard q=90 | 7.66 | 8.13 | +6.1% |
+
+All golden baseline regression tests failed (bpp_max exceeded by 5–7%).
+
+### Root cause analysis
+At q=75, quantization step ≈ 4–5. Therefore virtually ALL LL values have magnitude ≥4.
+The parent context fires for ~100% of detail coefficients — it's not selective at all.
+EMA was already tracking optimal k; forcing k+1 universally is strictly worse (over-estimates
+average magnitude, wastes quotient bits for the typical small-magnitude distribution).
+
+The threshold `magnitude ≥4` is too low relative to typical post-quantization LL magnitudes.
+A threshold proportional to qstep (e.g., ≥2×qstep) would be needed, but that reintroduces
+the qstep-to-k calibration problem that EMA already solves implicitly.
+
+### Decision
+Hypothesis was directionally correct (parent magnitude does correlate with child magnitude) but
+the implementation is too blunt. Soft, magnitude-proportional bias might close the gap but EMA
+already handles intra-stream adaptation. The 0.1–0.2 bpp entropy gap (from #22 analysis) is not
+worth this complexity. Fully reverted. All tests pass.
+
+---
+
+## 2026-03-09: H.264 BD-rate baseline — broadcast contribution context
+
+### Setup
+- **Sequence:** park_joy 1920×1080, 32 frames, high-motion (inter-frame PSNR ≈13 dB)
+- **GNC:** Rice+ZRL, I+P+B, 4:2:2 chroma, keyframe interval 8
+- **H.264:** libx264 yuv422p, preset veryslow, P+B video mode (`-g 250 -bf 7`)
+- **Metric:** PSNR-Y matched, VMAF cross-check
+
+### Results
+
+| PSNR | GNC bpp | H.264 bpp | Ratio |
+|------|---------|-----------|-------|
+| 30.8 dB | 1.45 | 0.25 | 5.7× |
+| 34.5 dB | 2.42 | 0.87 | 2.8× |
+| 37.9 dB | 4.23 | 2.14 | 2.0× |
+
+**BD-rate (PSNR): +171% to +216%.** GNC needs 2–5× more bits than H.264 at equivalent PSNR.
+VMAF tells the same story: both reach VMAF 99.8 on park_joy, but H.264 at 3.7 bpp vs GNC at 8.5 bpp.
+
+### Root cause analysis
+
+The gap is **not** primarily from entropy coding. Rice+ZRL vs arithmetic coding is only ~0.1–0.2 bpp.
+The two dominant gaps are:
+
+1. **Temporal prediction efficiency** — GNC's P/B-frames save only ~3% bpp vs all-I on park_joy
+   (high motion). H.264's motion compensation is significantly more efficient. This is the single
+   largest gap and the clearest target for improvement.
+
+2. **Coefficient sparsity exploitation** — H.264's DCT + significance maps exploit coefficient
+   sparsity that GNC's wavelet + Rice doesn't capture as well. SPIHT/SPECK-style coding
+   in the wavelet domain addresses this but is hard to GPU-parallelize.
+
+### Implication for backlog priorities
+
+**Temporal prediction is the bottleneck, not entropy.** The next generation of compression
+improvements should focus on:
+- Better motion compensation (sub-pixel refinement already done with qpel; next: larger
+  search range, affine/deformable ME, or reference frame management)
+- Temporal wavelet (Haar lifting) which fuses motion estimation and coding more tightly
+- Skip/merge modes to exploit flat regions without transmitting residual
+
+Entropy improvements (parent-child context, SPIHT) are secondary — they won't close a 2–5× gap.
+
+---
+
 ## 2026-03-06: GPU tile energy reduction (aq_readback elimination) — perf + struct bug fix
 
 ### Goal
@@ -1714,3 +1846,4 @@ Key finding: To reach 25fps I+P+B, the I-frame encode must be faster. The curren
 I-frame bottleneck is the wavelet transform + entropy coding, not ME.
 
 ### Verdict: SHIP AS OPT-IN, DO NOT MAKE DEFAULT
+

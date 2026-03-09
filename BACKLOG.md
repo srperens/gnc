@@ -16,11 +16,11 @@ H.264 comparison (#22) established the north star: GNC needs **2–5× more bits
 - Entropy-improvement items (#21, #7) are deprioritized; focus shifts to temporal prediction
 
 **Priority order (updated 2026-03-09 — Research Scientist full literature review, see RESEARCH_LOG.md):**
-1. **#26 B-frame zero-MV skip** (P1) — extend #23 to B-frames; same infrastructure, est. −5% bpp bbb, 0.5 days
-2. **#27 Temporal Differential Coding (TDC)** (P1) — JPEG XS 3rd edition: subtract prev frame's wavelet coefficients before quantizing; no ME, GPU-trivial, est. −15% bpp bbb, 2–3 days
-3. **#17 Scene cut detection** (P3) — robustness, ~50 lines, no bitstream change
-4. **#28 OBMC** (P2) — Overlapped Block MC (Dirac/VC-2 technique); eliminate within-tile block-boundary residuals; est. −10% bpp crowd_run P-frames, 3–5 days
-5. **#29 Fused wavelet kernel** (P2, speed) — single dispatch for all wavelet levels; I-frame 250ms → <180ms; brings I+P+B to ~28–32 fps
+1. **#26 B-frame zero-MV skip** (DONE) — −3.6% bpp bbb B-frames, VMAF neutral
+2. **#27 TDC** (CLOSED — redundant with MC; ~0% gain, reverted)
+3. **#28 OBMC** (P1) — Overlapped Block MC (Dirac/VC-2 technique); eliminate within-tile block-boundary residuals; est. −10% bpp crowd_run P-frames, 3–5 days
+4. **#29 Fused wavelet kernel** (P2, speed) — single dispatch for all wavelet levels; I-frame 250ms → <180ms
+5. **#17 Scene cut detection** (P3) — robustness, ~50 lines, no bitstream change
 6. **#24 Larger ME search range** (DEFER — check MV histogram first; P-frame range may already cover content)
 7. **#25 Multi-reference P-frames** (DEFER — gate on MV histogram >15% non-adjacent refs)
 8. **#21 Parent-child Rice k** (CLOSED — proven negative)
@@ -164,10 +164,9 @@ H.264 comparison (#22) established the north star: GNC needs **2–5× more bits
 - **Key finding:** The real bottleneck for reaching 25fps I+P+B is the I-frame encode speed, not B-frame ME qpel.
 
 ### 17. Scene cut detection + adaptive GOP
-- **Status:** todo (P3)
-- **Hypothesis:** When a hard scene cut occurs mid-GOP, B-frames reference pre-cut frames, producing large residuals. SAD-threshold detection and forced I-frame placement at cuts would reduce wasted bits.
-- **Success criteria:** On a cut-heavy sequence, bpp reduces ≥2%; no regression on current test sequences (bbb/crowd_run/rush_hour have no cuts).
-- **Note:** Low complexity (~50 lines in sequence.rs, no shader changes). Needs a test sequence with cuts for validation. Pure correctness/robustness item.
+- **Status:** done (2026-03-09, commit 776df85)
+- **Implementation:** `pub fn luma_mad()` in lib.rs (shared with main.rs); `scene_cut_threshold: f32` in CodecConfig (default 50.0, 0=disabled). B-frame groups scan ahead to find earliest cut before committing. No shader changes, no bitstream changes.
+- **Tests:** 5 unit tests in pipeline_tests.rs. 168 tests pass.
 
 ### 18. Per-tile Lagrange RD optimization (prerequisite: AQ overlap experiment)
 - **Status:** closed (2026-03-09) — AQ experiment shows marginal gain potential

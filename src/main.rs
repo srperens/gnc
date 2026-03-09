@@ -646,6 +646,10 @@ enum Command {
         /// Compute VMAF perceptual quality score at each quality point (requires vmaf CLI in PATH).
         #[arg(long)]
         vmaf: bool,
+
+        /// Disable adaptive quantization (AQ). Useful for measuring AQ contribution to BD-rate.
+        #[arg(long)]
+        no_aq: bool,
     },
 
     /// Automated benchmark across multiple Xiph sequences. Outputs CSV.
@@ -2990,6 +2994,7 @@ fn main() {
             q_values,
             compare_codecs,
             vmaf,
+            no_aq,
         } => {
             // Parse quality values
             let q_vals: Vec<u32> = q_values
@@ -3049,7 +3054,10 @@ fn main() {
                 let vmaf_tmp_dist = std::env::temp_dir().join("gnc_rdcurve_vmaf_dist.y4m");
 
                 for &q in &q_vals {
-                    let config = gnc::quality_preset(q);
+                    let mut config = gnc::quality_preset(q);
+                    if no_aq {
+                        config.adaptive_quantization = false;
+                    }
                     let qstep = config.quantization_step;
 
                     // Time encode

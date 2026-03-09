@@ -20,8 +20,12 @@ struct Params {
     search_range: u32,
     blocks_x: u32,
     total_blocks: u32,
-    use_predictor: u32,
+    use_predictor: u32,      // legacy: 1 = both fwd+bwd have predictors
     pred_fine_range: u32,
+    use_fwd_predictor: u32,  // 1 = skip forward coarse, use predictor_fwd_mvs + fine search
+    use_bwd_predictor: u32,  // 1 = skip backward coarse, use predictor_bwd_mvs + fine search
+    _pad0: u32,
+    _pad1: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -145,8 +149,9 @@ fn main(
     var coarse_fwd_dy: i32 = 0;
     var fine_range: i32 = FINE_RANGE;
 
-    if params.use_predictor != 0u {
-        // Temporal MV prediction: use previous B-frame's forward MV as starting point.
+    if params.use_predictor != 0u || params.use_fwd_predictor != 0u {
+        // Temporal MV prediction: use forward predictor MV as starting point.
+        // Activated when use_predictor=1 (both directions) or use_fwd_predictor=1 (fwd only).
         // Predictor MVs are in quarter-pel units — convert to integer-pel.
         if tid == 0u {
             let pred_hx = predictor_fwd_mvs[block_idx * 2u];
@@ -257,8 +262,9 @@ fn main(
     var coarse_bwd_dx: i32 = 0;
     var coarse_bwd_dy: i32 = 0;
 
-    if params.use_predictor != 0u {
-        // Temporal MV prediction: use previous B-frame's backward MV as starting point.
+    if params.use_predictor != 0u || params.use_bwd_predictor != 0u {
+        // Temporal MV prediction: use backward predictor MV as starting point.
+        // Activated when use_predictor=1 (both directions) or use_bwd_predictor=1 (bwd only).
         if tid == 0u {
             let pred_hx = predictor_bwd_mvs[block_idx * 2u];
             let pred_hy = predictor_bwd_mvs[block_idx * 2u + 1u];

@@ -569,22 +569,25 @@ impl CachedEncodeBuffers {
                 true,
                 ME_PRED_FINE_RANGE,
             ),
-            bidir_params_nopred: Self::make_block_match_params(
+            bidir_params_nopred: Self::make_bidir_params(
                 ctx,
                 padded_w,
                 padded_h,
                 ME_BIDIR_SEARCH_RANGE,
                 false,
+                false,
                 0,
             ),
-            bidir_params_pred: Self::make_block_match_params(
+            bidir_params_pred: Self::make_bidir_params(
                 ctx,
                 padded_w,
                 padded_h,
                 ME_BIDIR_SEARCH_RANGE,
                 true,
+                true,
                 ME_BIDIR_PRED_FINE_RANGE,
             ),
+
 
             me_sad_buf: ctx.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("enc_me_sad"),
@@ -755,6 +758,60 @@ impl CachedEncodeBuffers {
         ctx.device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("enc_me_params"),
+                contents: bytemuck::bytes_of(&params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            })
+    }
+
+    /// Create params buffer for block_match_bidir.wgsl.
+    /// Supports independent fwd/bwd predictor flags (use_fwd_predictor, use_bwd_predictor).
+    /// use_predictor (legacy) = use_fwd && use_bwd.
+    fn make_bidir_params(
+        ctx: &GpuContext,
+        padded_w: u32,
+        padded_h: u32,
+        search_range: u32,
+        use_fwd_predictor: bool,
+        use_bwd_predictor: bool,
+        pred_fine_range: u32,
+    ) -> wgpu::Buffer {
+        #[repr(C)]
+        #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+        struct BiDirMatchParams {
+            width: u32,
+            height: u32,
+            block_size: u32,
+            search_range: u32,
+            blocks_x: u32,
+            total_blocks: u32,
+            use_predictor: u32,      // legacy: 1 = both fwd+bwd
+            pred_fine_range: u32,
+            use_fwd_predictor: u32,
+            use_bwd_predictor: u32,
+            _pad0: u32,
+            _pad1: u32,
+        }
+        let blocks_x = padded_w / ME_BLOCK_SIZE;
+        let blocks_y = padded_h / ME_BLOCK_SIZE;
+        let total_blocks = blocks_x * blocks_y;
+        let have_either = use_fwd_predictor || use_bwd_predictor;
+        let params = BiDirMatchParams {
+            width: padded_w,
+            height: padded_h,
+            block_size: ME_BLOCK_SIZE,
+            search_range,
+            blocks_x,
+            total_blocks,
+            use_predictor: u32::from(use_fwd_predictor && use_bwd_predictor),
+            pred_fine_range: if have_either { pred_fine_range } else { 0 },
+            use_fwd_predictor: u32::from(use_fwd_predictor),
+            use_bwd_predictor: u32::from(use_bwd_predictor),
+            _pad0: 0,
+            _pad1: 0,
+        };
+        ctx.device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("enc_bidir_me_params"),
                 contents: bytemuck::bytes_of(&params),
                 usage: wgpu::BufferUsages::UNIFORM,
             })

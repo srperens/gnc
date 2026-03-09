@@ -1600,3 +1600,66 @@ worsen this (was also present with half-pel ME).
 VMAF +1.14 pts, BPP −5 to −12% across quality range. No regressions. 164 tests pass.
 Zero clippy warnings on native and WASM targets. Commit: 114a2f9.
 
+
+---
+
+## Experiment: Encode Speed Optimization — Pipelining & Bidir ME (2026-03-09)
+
+### Hypothesis
+Hiding Metal buffer sync latency (~18ms) via ME look-ahead pipelining will improve
+I+P+B fps from 19.3 to ≥24fps. B-frame ME speed can be improved with warm-start
+predictors from the anchor P-frame.
+
+### Changes
+1. Adaptive Rice staging (`max_stream_bytes_for_tile` q-dependent): q=75 → 1024 bytes/stream
+2. Split shader FINE_RANGE: 4→2 (no quality impact, removes redundant search candidates)
+3. P-frame ME pipelining: submit next frame's ME before Rice readback poll
+4. B-frame B1→B2 pipelining: submit B2's ME before B1's Rice readback poll
+5. Investigation: P-anchor MV as B1 forward predictor for bidir warm-start
+
+### Results
+
+**crowd_run 1080p q=75, 32 frames I+P+B (ki=8):**
+
+| Config         | fps   | bpp  | VMAF  |
+|----------------|-------|------|-------|
+| Baseline       | 19.3  | 6.50 | 99.13 |
+| Phase 1+2      | 19.3  | 6.50 | 99.13 |
+| +P pipelining  | 19.1  | 6.50 | 99.73 |
+| +B pipelining  | 19.4  | 6.50 | 99.73 |
+
+**P-only mode (ki=3):** 19.3 → 20.8 fps (+8%). Metal sync fully hidden for P-frames.
+
+**B-frame profiling (GNC_PROFILE=1):**
+- B1 (no predictor): 72-77ms (bidir ME ~60ms GPU + readback ~13ms)
+- B2 (with pipelining): 18-19ms (Metal sync hidden by B2's bidir ME look-ahead)
+
+### Root Cause: Bidir ME qpel is the bottleneck
+
+B1 takes 72ms despite fwd coarse skip because Phase 3c/3d (quarter-pel refinement,
+two stages × 2 directions) does 16 barrier-heavy loops per block. This is the dominant
+cost for bidir ME. P-frame ME (single direction) takes 41ms. Bidir ≈ 1.75× P-frame.
+
+P-anchor MV warm-start for B1 forward predictor: REVERTED.
+- Speed: +0.6fps (marginal, qpel dominates)
+- Compression: +0.9% bpp regression (P-anchor MV is for future anchor position, not B1)
+
+AQ vs no-AQ experiment (prerequisite for #18):
+- VMAF gain from AQ: 0-0.55 pts (q=10-60 only; q=70-90 identical)
+- AQ PSNR BD-rate: -3.9% (redistributes bits perceptually, hurts PSNR)
+- Conclusion: Close #18 as low priority; AQ already provides per-tile adaptation
+
+### Analysis
+
+The 25fps target for I+P+B is not achievable with pipelining alone. The bottleneck is
+bidir ME qpel Phase 3c/3d: 2× the work of P-frame qpel. To reach 25fps, we need to
+reduce bidir qpel to single-pass or skip it entirely for B-frames (see #20).
+
+The pipelining commits (#19) are real improvements:
+- B2 readback drops 76% (77ms → 18ms)
+- P-only mode: +8% fps
+- Zero quality regression
+
+### Verdict: SHIP PIPELINING, CLOSE WARM-START ATTEMPT
+Commits: 86ac25e (phase 1+2), 1d7f09f (P pipeline), eaa33af (B pipeline), f7f5da6 (infra).
+#19 marked done. #16 marked done. #18 closed. #20 added (bidir qpel optimization).

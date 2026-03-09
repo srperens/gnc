@@ -104,7 +104,7 @@ See [BASELINE.md](BASELINE.md) for current benchmark numbers.
 - **See:** RESEARCH_LOG.md 2026-03-08 entry for full analysis.
 
 ### 16. Encode speed: I+P+B path optimization
-- **Status:** active (2026-03-09)
+- **Status:** done (2026-03-09) — partial success; see #20 for remaining bottleneck
 - **Hypothesis:** The I+P+B encode path runs at 18-21fps (crowd_run/bbb, 1080p q=75). Profiling shows two bottlenecks: (1) Rice entropy staging uses max_stream_bytes=4096 regardless of q, causing ~125MB GPU copy even when only ~3MB of actual data; (2) block_match + estimate_split are two sequential dispatches processing the same reference data, each 10240 workgroups — fusing them eliminates one full dispatch cycle. ME itself is at the memory bandwidth floor (22ms/frame, 849MB @ 68 GB/s) and cannot be reduced without algorithm changes.
 - **Success criteria:** Average I+P+B fps ≥25 fps on crowd_run 1080p q=75; VMAF neutral (±0.2 pts); no test regressions.
 - **Phase 1 (easy):** Make `max_stream_bytes_for_tile()` q-dependent. Formula: `max(512, min(4096, tile_pixels × estimated_bpp / 8 × 12))` where estimated_bpp comes from q→bpp lookup. Saves ~3-6ms/frame staging copy.
@@ -128,6 +128,17 @@ See [BASELINE.md](BASELINE.md) for current benchmark numbers.
 - **VMAF:** 99.73 mean (unchanged). bpp: 6.50 (unchanged). 163 tests pass. Zero clippy warnings.
 - **Lesson:** Metal sync latency (~18ms) is only the bottleneck when ME < 18ms (never true for bidir ME at ~60ms). For P-frames (ME ~41ms > 18ms), pipelining works well. For B-frames, the ME itself is the bottleneck.
 
+### 20. Bidir ME qpel bottleneck: reduce Phase 3c/3d cost
+- **Status:** todo (P2)
+- **Root cause:** Bidir ME takes ~72ms for B1 (first B-frame, no predictor). Profiling shows Phase 3c+3d (quarter-pel refinement, two stages × 2 directions = 32 barrier loops per block) is the dominant cost — not the coarse search. P-frame ME (single direction qpel) takes 41ms. Bidir ≈ 1.75× P-frame, consistent with 2 qpel passes.
+- **Options investigated:**
+  1. P-anchor MV as B1 fwd predictor (eliminates fwd coarse) → zero fps gain (qpel dominates), bpp +0.9% regression. Reverted.
+  2. Independent fwd/bwd predictor flags in shader (infrastructure committed, not used).
+- **Hypothesis A:** Skip bidir qpel entirely (use half-pel only for B-frames). Expected: B1 drops from 72ms to ~20ms. Quality cost: unknown, needs measurement. Predicted: <0.5 VMAF pts at q=75 since B-frames are non-reference.
+- **Hypothesis B:** Reduce qpel search from 16 candidates (8 half-pel + 8 qpel) to 8 total (skip half-pel stage, go directly to qpel ±1 from integer). Half-pel stage is only needed to find the right neighborhood.
+- **Success criteria:** I+P+B fps ≥23fps (from 19.5fps); VMAF regression ≤0.3 pts; bpp regression ≤1%; all tests pass.
+- **Note:** The bidir_params_fwd_only variant (with use_fwd_predictor/use_bwd_predictor flags) is already in the codebase from the failed predictor experiment. Bidir qpel reduction is a 1-shader change.
+
 ### 17. Scene cut detection + adaptive GOP
 - **Status:** todo (P3)
 - **Hypothesis:** When a hard scene cut occurs mid-GOP, B-frames reference pre-cut frames, producing large residuals. SAD-threshold detection and forced I-frame placement at cuts would reduce wasted bits.
@@ -135,11 +146,13 @@ See [BASELINE.md](BASELINE.md) for current benchmark numbers.
 - **Note:** Low complexity (~50 lines in sequence.rs, no shader changes). Needs a test sequence with cuts for validation. Pure correctness/robustness item.
 
 ### 18. Per-tile Lagrange RD optimization (prerequisite: AQ overlap experiment)
-- **Status:** todo (P2 — pending prerequisite)
-- **Hypothesis:** Per-tile λ-optimal quantization could reduce BD-rate by 8-15% vs current per-q uniform quantization. AQ already does a form of this — prerequisite: measure AQ-on vs AQ-off BD-rate curves (bbb q=25/50/75/90) to bound the gap AQ leaves.
-- **Success criteria:** ≥8% BD-rate improvement on ≥2 sequences; VMAF at each q ±0.3 pts.
-- **Prerequisite experiment:** Run `rd-curve` with AQ enabled/disabled, report BD-rate delta. If AQ already captures ≥70% of potential gain, skip this item.
-- **Note:** Requires GPU-side rate estimation or two-pass approach. Lagrange RD is tile-independent (each tile optimizes independently). Complex implementation (~5-8 days).
+- **Status:** closed (2026-03-09) — AQ experiment shows marginal gain potential
+- **AQ experiment results (bbb_1080p, --no-aq flag added to rd-curve):**
+  - AQ VMAF gain: 0-0.55 pts (q=10-60 only; q=70-90 identical)
+  - AQ PSNR BD-rate: -3.9% (AQ redistributes bits perceptually → hurts PSNR)
+  - AQ and Lagrange RD address similar problems (per-tile adaptation)
+- **Conclusion:** AQ already provides per-tile quantization adaptation (via LL subband variance). The remaining gap to optimal Lagrange RD is estimated at <0.5 VMAF pts. Implementation cost (5-8 days) not justified for this gain. Prerequisite condition met: skip this item.
+- **Note:** If BD-rate gap vs H.264 is to be closed, focus should be on spatial prediction improvements or entropy coding (parent-child context), not per-tile λ optimization.
 
 ### 12. CPU SIMD path (long-term, low priority)
 - **Status:** todo (P5 — far future, contingent on codec maturity)

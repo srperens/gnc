@@ -597,51 +597,31 @@
 
         // --- Demo files ---
         const demoFiles = [
-            // GNV1 files
-            { name: 'test_quick.gnv', label: 'BBB Quick', desc: '10f 30fps 1080p q=75 ki=4', group: 'GNV1' },
-            { name: 'test_animation.gnv', label: 'BBB Short', desc: '30f 30fps 1080p q=75 ki=8', group: 'GNV1' },
-            { name: 'test_nature.gnv', label: 'Park Joy', desc: '30f 50fps 1080p q=75 ki=8', group: 'GNV1' },
-            { name: 'test_crowd.gnv', label: 'Crowd Run', desc: '30f 50fps 1080p q=75 ki=8', group: 'GNV1' },
-            { name: 'rush_hour.gnv', label: 'Rush Hour', desc: '200f 25fps 1080p q=75 ki=8 -- city traffic', group: 'GNV1' },
-            { name: 'old_town_cross.gnv', label: 'Old Town Cross', desc: '200f 50fps 1080p q=75 ki=8 -- urban pedestrians', group: 'GNV1' },
-            { name: 'stockholm.gnv', label: 'Stockholm', desc: '200f 60fps 720p q=75 ki=8 -- cityscape pan', group: 'GNV1' },
-            { name: 'pedestrian_area.gnv', label: 'Pedestrian Area', desc: '200f 25fps 1080p q=75 ki=8 -- walking crowd', group: 'GNV1' },
-            { name: 'ducks_q25.gnv', label: 'Ducks q25', desc: '300f 50fps 1080p q=25 ki=8', group: 'GNV1' },
-            { name: 'ducks_q50.gnv', label: 'Ducks q50', desc: '300f 50fps 1080p q=50 ki=8', group: 'GNV1' },
-            { name: 'ducks_q75.gnv', label: 'Ducks q75', desc: '300f 50fps 1080p q=75 ki=8', group: 'GNV1' },
-            { name: 'bbb_2min_q5.gnv', label: 'BBB 2min q5', desc: '1800f 30fps 1080p q=5 ki=24', group: 'GNV1' },
-            { name: 'bbb_2min.gnv', label: 'BBB 2min q75', desc: '1800f 30fps 1080p q=75 ki=24', group: 'GNV1' },
-            // GNV2 temporal wavelet files
-            { name: 'tw_test_quick.gnv2', label: 'BBB Quick', desc: '8f 30fps 1080p q=75 Haar', group: 'GNV2 (Temporal Wavelet)' },
-            { name: 'tw_test_animation.gnv2', label: 'BBB Short', desc: '24f 30fps 1080p q=75 Haar', group: 'GNV2 (Temporal Wavelet)' },
-            { name: 'tw_test_nature.gnv2', label: 'Park Joy', desc: '32f 50fps 1080p q=75 Haar', group: 'GNV2 (Temporal Wavelet)' },
-            { name: 'tw_test_crowd.gnv2', label: 'Crowd Run', desc: '32f 50fps 1080p q=75 Haar', group: 'GNV2 (Temporal Wavelet)' },
-            { name: 'tw_rush_hour.gnv2', label: 'Rush Hour', desc: '200f 25fps 1080p q=75 Haar', group: 'GNV2 (Temporal Wavelet)' },
-            { name: 'tw_old_town_cross.gnv2', label: 'Old Town', desc: '200f 50fps 1080p q=75 Haar', group: 'GNV2 (Temporal Wavelet)' },
-            { name: 'tw_stockholm.gnv2', label: 'Stockholm', desc: '200f 60fps 720p q=75 Haar', group: 'GNV2 (Temporal Wavelet)' },
-            { name: 'tw_pedestrian_area.gnv2', label: 'Ped. Area', desc: '200f 25fps 1080p q=75 Haar', group: 'GNV2 (Temporal Wavelet)' },
-            { name: 'tw_ducks_q25.gnv2', label: 'Ducks q25', desc: '300f 50fps 1080p q=25 Haar', group: 'GNV2 (Temporal Wavelet)' },
-            { name: 'tw_ducks_q50.gnv2', label: 'Ducks q50', desc: '300f 50fps 1080p q=50 Haar', group: 'GNV2 (Temporal Wavelet)' },
-            { name: 'tw_ducks_q75.gnv2', label: 'Ducks q75', desc: '300f 50fps 1080p q=75 Haar', group: 'GNV2 (Temporal Wavelet)' },
-            { name: 'tw_bbb_2min_q5.gnv2', label: 'BBB 2min q5', desc: '1800f 30fps 1080p q=5 Haar', group: 'GNV2 (Temporal Wavelet)' },
-            { name: 'tw_bbb_2min.gnv2', label: 'BBB 2min q75', desc: '1800f 30fps 1080p q=75 Haar', group: 'GNV2 (Temporal Wavelet)' },
-            // Chroma subsampling comparison (single-frame, 1080p)
-            { name: 'chroma_bbb_444.gnv', label: 'BBB 4:4:4 q75', desc: '1f 1080p q=75 — full chroma (3.83 bpp)', group: 'Chroma (4:4:4 vs 4:2:2 vs 4:2:0)' },
-            { name: 'chroma_bbb_422.gnv', label: 'BBB 4:2:2 q75', desc: '1f 1080p q=75 — halved horiz chroma (3.36 bpp, −12%)', group: 'Chroma (4:4:4 vs 4:2:2 vs 4:2:0)' },
-            { name: 'chroma_bbb_420.gnv', label: 'BBB 4:2:0 q75', desc: '1f 1080p q=75 — quarter chroma (2.90 bpp, −24%)', group: 'Chroma (4:4:4 vs 4:2:2 vs 4:2:0)' },
-            { name: 'chroma_bbb_q50_444.gnv', label: 'BBB 4:4:4 q50', desc: '1f 1080p q=50 — full chroma (2.22 bpp)', group: 'Chroma (4:4:4 vs 4:2:2 vs 4:2:0)' },
-            { name: 'chroma_bbb_q50_422.gnv', label: 'BBB 4:2:2 q50', desc: '1f 1080p q=50 — halved horiz chroma (1.97 bpp, −11%)', group: 'Chroma (4:4:4 vs 4:2:2 vs 4:2:0)' },
-            { name: 'chroma_bbb_q50_420.gnv', label: 'BBB 4:2:0 q50', desc: '1f 1080p q=50 — quarter chroma (1.70 bpp, −23%)', group: 'Chroma (4:4:4 vs 4:2:2 vs 4:2:0)' },
-            { name: 'chroma_sky_444.gnv', label: 'BlueSky 4:4:4 q75', desc: '1f 1080p q=75 — full chroma (3.30 bpp)', group: 'Chroma (4:4:4 vs 4:2:2 vs 4:2:0)' },
-            { name: 'chroma_sky_422.gnv', label: 'BlueSky 4:2:2 q75', desc: '1f 1080p q=75 — halved horiz chroma (2.32 bpp, −30%)', group: 'Chroma (4:4:4 vs 4:2:2 vs 4:2:0)' },
-            { name: 'chroma_sky_420.gnv', label: 'BlueSky 4:2:0 q75', desc: '1f 1080p q=75 — quarter chroma (1.87 bpp, −43%)', group: 'Chroma (4:4:4 vs 4:2:2 vs 4:2:0)' },
-            // Chroma video sequences (8 frames, I+P, 1080p)
-            { name: 'seq_bbb_444_q75.gnv', label: 'BBB 4:4:4 q75', desc: '8f 30fps 1080p q=75 — I+P, full chroma (2.32 bpp avg)', group: 'Chroma Video (I+P)' },
-            { name: 'seq_bbb_422_q75.gnv', label: 'BBB 4:2:2 q75', desc: '8f 30fps 1080p q=75 — I+P, halved horiz chroma (1.87 bpp avg)', group: 'Chroma Video (I+P)' },
-            { name: 'seq_bbb_420_q75.gnv', label: 'BBB 4:2:0 q75', desc: '8f 30fps 1080p q=75 — I+P, quarter chroma (1.81 bpp avg)', group: 'Chroma Video (I+P)' },
-            { name: 'seq_sky_444_q75.gnv', label: 'BlueSky 4:4:4 q75', desc: '8f 30fps 1080p q=75 — I+P, full chroma (3.33 bpp avg)', group: 'Chroma Video (I+P)' },
-            { name: 'seq_sky_422_q75.gnv', label: 'BlueSky 4:2:2 q75', desc: '8f 30fps 1080p q=75 — I+P, halved horiz chroma (2.40 bpp avg)', group: 'Chroma Video (I+P)' },
-            { name: 'seq_sky_420_q75.gnv', label: 'BlueSky 4:2:0 q75', desc: '8f 30fps 1080p q=75 — I+P, quarter chroma (2.08 bpp avg)', group: 'Chroma Video (I+P)' },
+            // I+P motion vector codec — diverse real-world content
+            { name: 'ducks_q75.gnv',   label: 'Ducks Take Off',   desc: '300f 50fps 1080p q=75 — water, feathers, fast motion', group: 'I+P (motion vectors)' },
+            { name: 'rush_hour.gnv',   label: 'Rush Hour',        desc: '200f 25fps 1080p q=75 — city traffic, slow pan', group: 'I+P (motion vectors)' },
+            { name: 'old_town_cross.gnv', label: 'Old Town Cross', desc: '200f 50fps 1080p q=75 — urban pedestrians', group: 'I+P (motion vectors)' },
+            { name: 'pedestrian_area.gnv', label: 'Pedestrian Area', desc: '200f 25fps 1080p q=75 — walking crowd', group: 'I+P (motion vectors)' },
+            { name: 'bbb_2min.gnv',    label: 'BBB 2 min q=75',   desc: '1800f 30fps 1080p q=75 — animated film, varied scenes', group: 'I+P (motion vectors)' },
+            { name: 'bbb_2min_q5.gnv', label: 'BBB 2 min q=5',    desc: '1800f 30fps 1080p q=5 — extreme compression, visible artefacts', group: 'I+P (motion vectors)' },
+            // Temporal wavelet — same clips for direct comparison
+            { name: 'tw_ducks_q75.gnv2',        label: 'Ducks Take Off',   desc: '300f 50fps 1080p q=75 Haar temporal wavelet', group: 'Temporal Wavelet (Haar)' },
+            { name: 'tw_rush_hour.gnv2',         label: 'Rush Hour',        desc: '200f 25fps 1080p q=75 Haar temporal wavelet', group: 'Temporal Wavelet (Haar)' },
+            { name: 'tw_old_town_cross.gnv2',    label: 'Old Town Cross',   desc: '200f 50fps 1080p q=75 Haar temporal wavelet', group: 'Temporal Wavelet (Haar)' },
+            { name: 'tw_pedestrian_area.gnv2',   label: 'Pedestrian Area',  desc: '200f 25fps 1080p q=75 Haar temporal wavelet', group: 'Temporal Wavelet (Haar)' },
+            { name: 'tw_bbb_2min.gnv2',          label: 'BBB 2 min q=75',   desc: '1800f 30fps 1080p q=75 Haar temporal wavelet', group: 'Temporal Wavelet (Haar)' },
+            { name: 'tw_bbb_2min_q5.gnv2',       label: 'BBB 2 min q=5',    desc: '1800f 30fps 1080p q=5 Haar — extreme compression', group: 'Temporal Wavelet (Haar)' },
+            // Chroma subsampling — video sequences, q=50
+            { name: 'crowd_444_q50.gnv', label: 'Crowd Run 4:4:4', desc: '100f 50fps 1080p q=50 — full chroma (3.65 bpp avg)', group: 'Chroma q=50 (Crowd Run)' },
+            { name: 'crowd_422_q50.gnv', label: 'Crowd Run 4:2:2', desc: '100f 50fps 1080p q=50 — half horiz chroma (2.73 bpp, −25%)', group: 'Chroma q=50 (Crowd Run)' },
+            { name: 'crowd_420_q50.gnv', label: 'Crowd Run 4:2:0', desc: '100f 50fps 1080p q=50 — quarter chroma (2.45 bpp, −33%)', group: 'Chroma q=50 (Crowd Run)' },
+            { name: 'park_joy_444_q50.gnv', label: 'Park Joy 4:4:4', desc: '100f 50fps 1080p q=50 — full chroma (4.29 bpp avg)', group: 'Chroma q=50 (Park Joy)' },
+            { name: 'park_joy_422_q50.gnv', label: 'Park Joy 4:2:2', desc: '100f 50fps 1080p q=50 — half horiz chroma (3.22 bpp, −25%)', group: 'Chroma q=50 (Park Joy)' },
+            { name: 'park_joy_420_q50.gnv', label: 'Park Joy 4:2:0', desc: '100f 50fps 1080p q=50 — quarter chroma (3.02 bpp, −30%)', group: 'Chroma q=50 (Park Joy)' },
+            // Chroma subsampling — same content, q=25 (more compression, differences more visible)
+            { name: 'crowd_444_q25.gnv', label: 'Crowd Run 4:4:4', desc: '100f 50fps 1080p q=25 — full chroma (1.91 bpp avg)', group: 'Chroma q=25 (Crowd Run)' },
+            { name: 'crowd_422_q25.gnv', label: 'Crowd Run 4:2:2', desc: '100f 50fps 1080p q=25 — half horiz chroma (1.51 bpp, −21%)', group: 'Chroma q=25 (Crowd Run)' },
+            { name: 'crowd_420_q25.gnv', label: 'Crowd Run 4:2:0', desc: '100f 50fps 1080p q=25 — quarter chroma (1.41 bpp, −26%)', group: 'Chroma q=25 (Crowd Run)' },
         ];
 
         function formatSize(bytes) {

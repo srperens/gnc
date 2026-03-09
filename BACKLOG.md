@@ -266,18 +266,10 @@ H.264 comparison (#22) established the north star: GNC needs **2–5× more bits
 - **Result:** bbb −3.6% bpp (B-frames shrank 32–41% individually), VMAF −0.01 pts. No regression on crowd_run or park_joy. 163 tests pass, zero clippy warnings.
 
 ### 27. Temporal Differential Coding (TDC)
-- **Status:** todo (P1)
-- **Motivation:** JPEG XS 3rd edition (ISO/IEC 2024) standardized TDC as a way to exploit temporal redundancy without motion estimation. For static or slowly-moving tile regions, simply subtracting the previous frame's wavelet coefficients from the current frame's coefficients produces near-zero differences → Rice encodes them with minimal bits. Expected: −15% bpp on bbb (large static background regions), less on high-motion content.
-- **Hypothesis:** Subtracting prev_frame quantized coefficients (from the local decode buffer) from current frame pre-quantization produces a coefficient difference with lower energy than the absolute coefficients for static regions. Tile-conditional: only apply when tile_energy_delta < threshold (existing tile_energy_reduce.wgsl infrastructure). Expected −10 to −20% bpp on bbb, ~0% on crowd_run.
-- **GPU fit:** Excellent. Per-coefficient subtraction is embarrassingly parallel. No ME, no cross-tile deps.
-- **Implementation sketch:**
-  1. After spatial wavelet dispatch, before quantize dispatch: new shader `temporal_diff.wgsl` subtracts prev frame's coefficient buffer (from local decode) per-tile when skip flag not set.
-  2. Decoder: after Rice decode + dequantize, add prev frame's coefficient buffer back before inverse wavelet.
-  3. Per-frame flag in GNV1 header: `frame_temporal_diff = 1` means coefficients are delta, not absolute.
-  4. Tile-conditional: per-tile flag (1 bit) indicating whether that tile used TDC or absolute coding.
-- **Risks:** (a) Error propagation — dequantization noise accumulates across TDC frames; need periodic refresh (I-frames already provide this at ki=8). (b) High-motion tiles may INCREASE bpp if differences are larger than absolutes — tile-conditional logic prevents this. (c) Bitstream format change (new flags).
-- **Success criteria:** −10% bpp on bbb q=75; VMAF ±0.3 pts; crowd_run bpp ±2%; park_joy bpp ±2%. All tests pass.
-- **Note:** Pre-implementation question: can the existing temporal wavelet coefficient buffers (from Haar work) be reused for storing prev-frame coefficients, or does this need a new buffer?
+- **Status:** closed — implemented, measured, reverted (2026-03-09)
+- **Result:** ~0% bpp gain. Only 3/40 tiles activated on bbb (8%). bpp change: +0.03% (noise).
+- **Root cause:** TDC is fundamentally redundant with MC in an I+P+B codec. P-frame `plane_c` holds MC residuals (wavelet of `current − MC(reference)`), not absolute coefficients. For static tiles, MC residual ≈ 0 already — TDC on a near-zero residual adds no value. TDC is for intra-only codecs (like JPEG XS) where MC is absent. GNC with I+P+B already exploits temporal redundancy through MC.
+- **Lesson:** Before implementing temporal coding, verify whether MC already handles the redundancy being targeted.
 
 ### 28. Overlapped Block Motion Compensation (OBMC)
 - **Status:** todo (P2)

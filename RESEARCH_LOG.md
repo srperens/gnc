@@ -4,6 +4,34 @@
 
 ---
 
+## 2026-03-09: #27 TDC — implemented, measured, reverted (fundamentally redundant with MC)
+
+### Hypothesis
+Subtracting previous frame's dequantized wavelet coefficients (from local decode) from current frame's pre-quantization coefficients would reduce coefficient energy for static/slow tiles, yielding −10 to −20% bpp on bbb.
+
+### Implementation
+Full encoder+decoder TDC implementation: `temporal_diff.wgsl` (encoder: compute delta energy vs absolute energy, apply conditionally per tile), `temporal_undiff.wgsl` (decoder: add back prev coefficients for TDC tiles). Per-tile flag in bitstream. Tile-conditional gate: apply TDC only when sum(delta²) < sum(absolute²).
+
+### Measurement (bbb, crowd_run, park_joy at q=75, I+P+B)
+- bbb: 3/40 tiles activated (8%), bpp change: +0.03% (noise). VMAF: +0.01 pts.
+- crowd_run: 0/40 tiles activated (gate correct for high motion). bpp: +0.02%.
+- park_joy: 3/40 tiles on one frame. bpp: −0.01%.
+
+### Root cause of failure
+**P-frame `bufs.plane_c` holds MC residuals, not absolute frame coefficients.** P-frames apply the spatial wavelet to `mc_out = current − MC(reference)`. For static tiles, `mc_out ≈ 0` already — the MC step already exploits temporal redundancy. TDC on MC residuals is "differencing a difference": the residual-of-residual has no useful correlation structure. The gate fires on only 8% of tiles because the MC residual is already near-zero for static tiles, making `sum_delta ≈ sum_absolute ≈ small_noise`.
+
+**TDC is for intra-only codecs.** JPEG XS uses TDC because it has no inter-frame prediction (no MC). Frame differencing IS the temporal tool. In GNC with I+P+B, MC already handles temporal redundancy. TDC adds nothing on top.
+
+**I-frames cannot use TDC** (breaks random-access property). So TDC has no useful application in GNC's current I+P+B architecture.
+
+### Verdict: REVERTED
+Implementation correct, hypothesis wrong. Bitstream changes reverted. No production code changes remain.
+
+### Lesson
+Before implementing temporal prediction improvements, ask: "Does the encoder already exploit this redundancy through a different mechanism?" For GNC, MC already provides frame-to-frame prediction. Temporal coding on top of MC residuals has diminishing returns by definition.
+
+---
+
 ## 2026-03-09: Research Scientist — full literature review + priority recommendations
 
 ### Summary

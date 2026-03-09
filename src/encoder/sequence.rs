@@ -1685,13 +1685,13 @@ impl EncoderPipeline {
 
             let num_tiles = (info.tiles_x() * info.tiles_y()) as usize;
             self.gpu_rice_encoder
-                .prepare_batch_staging(ctx, num_tiles, info.tile_size, batch_size);
+                .prepare_batch_staging(ctx, num_tiles, info.tile_size, batch_size, high_cfg.quantization_step);
             // Write params_buf ONCE before the batch loop.  On Metal/wgpu write_buffer is
             // staged: only the last write before queue.submit takes effect.  All high frames
             // in a GOP share the same FrameInfo (same tile layout, same wavelet_levels),
             // so a single pre-write is both correct and sufficient.
             self.gpu_rice_encoder
-                .write_params_buf_for_batch(ctx, &info, high_cfg.wavelet_levels);
+                .write_params_buf_for_batch(ctx, &info, high_cfg.wavelet_levels, high_cfg.quantization_step);
 
             let weights_luma = high_cfg.subband_weights.pack_weights();
             let weights_chroma = high_cfg.subband_weights.pack_weights_chroma();
@@ -2823,6 +2823,7 @@ impl EncoderPipeline {
                     [&bufs.recon_y, &bufs.co_plane, &bufs.plane_b],
                     info,
                     config.wavelet_levels,
+                    config.quantization_step,
                 );
             } else if !is_non_444 {
                 self.gpu_encoder.dispatch_3planes_to_cmd(
@@ -3110,6 +3111,7 @@ impl EncoderPipeline {
                     &bufs.recon_y,
                     info,
                     config.wavelet_levels,
+                    config.quantization_step,
                 );
                 let ci = chroma_info_pf.as_ref().unwrap();
                 let mut co_tiles = self.gpu_rice_encoder.encode_1plane_to_tiles(
@@ -3117,12 +3119,14 @@ impl EncoderPipeline {
                     &bufs.ref_upload,
                     ci,
                     config.wavelet_levels,
+                    config.quantization_step,
                 );
                 let mut cg_tiles = self.gpu_rice_encoder.encode_1plane_to_tiles(
                     ctx,
                     &bufs.plane_b,
                     ci,
                     config.wavelet_levels,
+                    config.quantization_step,
                 );
                 rice_tiles.append(&mut luma_tiles);
                 rice_tiles.append(&mut co_tiles);
@@ -4265,6 +4269,7 @@ impl EncoderPipeline {
                         [&bufs.recon_y, &bufs.co_plane, &bufs.plane_b],
                         info,
                         config.wavelet_levels,
+                        config.quantization_step,
                     );
                 } else {
                     self.gpu_encoder.dispatch_3planes_to_cmd(
@@ -4331,18 +4336,21 @@ impl EncoderPipeline {
                     &bufs.recon_y,
                     info,
                     config.wavelet_levels,
+                    config.quantization_step,
                 );
                 let mut co_tiles = self.gpu_rice_encoder.encode_1plane_to_tiles(
                     ctx,
                     &bufs.ref_upload,
                     ci,
                     config.wavelet_levels,
+                    config.quantization_step,
                 );
                 let mut cg_tiles = self.gpu_rice_encoder.encode_1plane_to_tiles(
                     ctx,
                     &bufs.plane_b,
                     ci,
                     config.wavelet_levels,
+                    config.quantization_step,
                 );
                 rice_tiles.append(&mut luma_tiles);
                 rice_tiles.append(&mut co_tiles);
@@ -5361,6 +5369,7 @@ impl EncoderPipeline {
             quant_dests,
             info,
             config.wavelet_levels,
+            config.quantization_step,
         );
 
         ctx.queue.submit(Some(cmd.finish()));

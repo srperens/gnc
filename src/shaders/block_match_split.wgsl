@@ -42,7 +42,9 @@ var<workgroup> sub_sads: array<u32, 4>;
 var<workgroup> parent_int_dx: i32;
 var<workgroup> parent_int_dy: i32;
 
-const FINE_RANGE: i32 = 4;
+// ±2px around parent MV (parent 16×16 is already a good predictor for 8×8).
+// Equivalent to the predictor fine-range used in block_match.wgsl.
+const FINE_RANGE: i32 = 2;
 const SUB_BS: u32 = 8u;
 const SUB_PIXELS: u32 = 64u; // 8x8
 const ZERO_BIAS_8X8: u32 = 128u; // 8x8 equivalent of 512 for 16x16

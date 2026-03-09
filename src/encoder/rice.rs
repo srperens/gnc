@@ -14,16 +14,38 @@ use super::rans::compute_subband_group;
 /// Number of interleaved streams per tile — 8x more than rANS for better GPU utilization.
 pub const RICE_STREAMS_PER_TILE: usize = 256;
 
-/// Max output bytes per stream for a given tile size.
+/// Max output bytes per Rice stream for a given tile size and quantisation step.
 ///
-/// At 256×256: 256 coefficients/stream → 4096 bytes (16 bytes/coeff headroom).
-/// At 128×128:  64 coefficients/stream → 1024 bytes (same 16 bytes/coeff headroom).
+/// Adapts the staging buffer to actual data volume, reducing memcpy cost at higher quality
+/// settings where most coefficients are small.
+///
+/// Formula: estimate ~bpp based on qstep, convert to bytes/stream with 3× safety margin,
+/// round up to next power-of-two, then clamp to [256, size_cap] where size_cap is the
+/// tile-size-dependent ceiling (1024 for ≤128 px, 4096 for 256 px).
+///
+/// At q=75 (qstep≈4.0)  → 1024 bytes/stream vs. old fixed 4096 (4× saving)
+/// At q=25 (qstep≈16.0) → 256  bytes/stream vs. old fixed 4096 (16× saving)
+/// At q=95 (qstep≈2.0)  → 1024 bytes/stream vs. old fixed 4096 (4× saving)
+/// At qstep=1.0          → 2048 bytes/stream vs. old fixed 4096 (2× saving)
+///
 /// Must be divisible by 4 (GPU stores u32 words) and kept in sync with the shader.
-pub fn max_stream_bytes_for_tile(tile_size: u32) -> usize {
-    match tile_size {
+pub fn max_stream_bytes_for_tile(tile_size: u32, qstep: f32) -> usize {
+    // Tile-size-dependent hard cap (preserves existing ≤128 px behaviour).
+    let size_cap: usize = match tile_size {
         t if t <= 128 => 1024,
-        _ => 4096, // 256 and above
-    }
+        _ => 4096,
+    };
+
+    // Rough bpp model: high quality (qstep≈1) → ~15 bpp; low quality (qstep≈16) → ~1.5 bpp.
+    let qstep_clamped = qstep.clamp(0.5, 64.0);
+    let bpp_estimate = 15.0_f32 * (1.0 / (1.0 + 0.3 * qstep_clamped));
+    // Bytes per stream = bpp × tile_px / 8 × 3× safety margin, divided by 256 streams.
+    // (tile_size × tile_size pixels, 256 streams → tile_size²/256 coefficients per stream)
+    let tile_px = tile_size as f32;
+    let bytes_per_stream = (bpp_estimate * (tile_px * tile_px) / 8.0 * 3.0 / 256.0) as usize;
+
+    // Round up to next power-of-two, with a floor of 256 and the tile-size cap.
+    bytes_per_stream.next_power_of_two().max(256).min(size_cap)
 }
 
 /// Max output bytes per stream (generous; typically much less).

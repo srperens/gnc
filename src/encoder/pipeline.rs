@@ -1252,6 +1252,7 @@ impl EncoderPipeline {
                 [&bufs.mc_out, &bufs.ref_upload, &bufs.plane_b],
                 &info,
                 entropy_levels,
+                config.quantization_step,
             );
         }
 
@@ -1317,6 +1318,7 @@ impl EncoderPipeline {
                     qbufs[p],
                     plane_infos[p],
                     entropy_levels,
+                    config.quantization_step,
                 );
                 rice_tiles.append(&mut rt);
             }

@@ -103,6 +103,39 @@ See [BASELINE.md](BASELINE.md) for current benchmark numbers.
 - **Kept:** dispatch cleanup (no dummy sentinel values), multi-tile tests for 422/420.
 - **See:** RESEARCH_LOG.md 2026-03-08 entry for full analysis.
 
+### 16. Encode speed: I+P+B path optimization
+- **Status:** active (2026-03-09)
+- **Hypothesis:** The I+P+B encode path runs at 18-21fps (crowd_run/bbb, 1080p q=75). Profiling shows two bottlenecks: (1) Rice entropy staging uses max_stream_bytes=4096 regardless of q, causing ~125MB GPU copy even when only ~3MB of actual data; (2) block_match + estimate_split are two sequential dispatches processing the same reference data, each 10240 workgroups — fusing them eliminates one full dispatch cycle. ME itself is at the memory bandwidth floor (22ms/frame, 849MB @ 68 GB/s) and cannot be reduced without algorithm changes.
+- **Success criteria:** Average I+P+B fps ≥25 fps on crowd_run 1080p q=75; VMAF neutral (±0.2 pts); no test regressions.
+- **Phase 1 (easy):** Make `max_stream_bytes_for_tile()` q-dependent. Formula: `max(512, min(4096, tile_pixels × estimated_bpp / 8 × 12))` where estimated_bpp comes from q→bpp lookup. Saves ~3-6ms/frame staging copy.
+- **Phase 1 done (2026-03-09):** Adaptive max_stream_bytes: q=75 now uses 1024 bytes/stream (was 4096). Actual savings smaller than expected due to L3 cache effects: 18.4fps → 18.7fps.
+- **Phase 2 done (2026-03-09):** Reduced block_match_split.wgsl FINE_RANGE from 4 to 2 (always uses parent 16×16 MV as predictor; ±2 equivalent to predictor path in block_match.wgsl). Savings also smaller than bandwidth model predicted (L3 cache effects). 18.7fps → 19.3fps. bbb: 20.8fps → 21.8fps. VMAF unchanged (95.05). bpp unchanged.
+- **Result:** 18.4fps → 19.3fps (+5%). Success criterion (≥25fps) NOT yet met.
+- **Key finding:** Local decode round-trip is the next major bottleneck (~18ms/frame: Rice readback CPU→GPU for decode ref). See #19 for GPU-side local decode.
+- **Note on 60fps:** L3 cache analysis shows ME bandwidth savings don't translate 1:1 to wall-clock time. 60fps (17ms/frame) not achievable without fundamental ME algorithm change AND GPU-side local decode. Revised target: 25-30fps achievable with #19.
+- **Note:** GNC_PROFILE=1 profiling was used. Measurements: ME+split=20ms (forced barrier), entropy+stg=47ms, local decode readback=18-20ms per inter-frame.
+
+### 19. GPU-side local decode for P/B-frame reference
+- **Status:** todo (P1 — next priority after #16)
+- **Problem:** After encoding a P/B-frame, the encoder reads back Rice stream data from GPU to CPU (~18ms), re-uploads and runs the GPU decoder to produce the reference frame. This 18ms CPU round-trip happens for every inter-frame and is the biggest remaining bottleneck (currently 19.3fps → would reach ~27fps if eliminated).
+- **Hypothesis:** Keeping Rice streams on GPU and calling the decode shader directly on the already-encoded buffers eliminates the 18ms round-trip per inter-frame.
+- **Challenges:** Rice encode output format (stream_buf/lengths_buf/k_buf per-stream layout) differs from Rice decode input format (packed k_values array + stream data layout). Either: (a) add a GPU-side format conversion shader, or (b) restructure Rice encode output to match decode input format, or (c) encode the frame into a "local decode compatible" GPU buffer alongside the regular output.
+- **Success criteria:** I+P+B fps ≥25fps on crowd_run 1080p q=75; VMAF neutral; all tests pass.
+- **Note:** Must verify encoder/decoder produce identical output (no encoding mismatch).
+
+### 17. Scene cut detection + adaptive GOP
+- **Status:** todo (P3)
+- **Hypothesis:** When a hard scene cut occurs mid-GOP, B-frames reference pre-cut frames, producing large residuals. SAD-threshold detection and forced I-frame placement at cuts would reduce wasted bits.
+- **Success criteria:** On a cut-heavy sequence, bpp reduces ≥2%; no regression on current test sequences (bbb/crowd_run/rush_hour have no cuts).
+- **Note:** Low complexity (~50 lines in sequence.rs, no shader changes). Needs a test sequence with cuts for validation. Pure correctness/robustness item.
+
+### 18. Per-tile Lagrange RD optimization (prerequisite: AQ overlap experiment)
+- **Status:** todo (P2 — pending prerequisite)
+- **Hypothesis:** Per-tile λ-optimal quantization could reduce BD-rate by 8-15% vs current per-q uniform quantization. AQ already does a form of this — prerequisite: measure AQ-on vs AQ-off BD-rate curves (bbb q=25/50/75/90) to bound the gap AQ leaves.
+- **Success criteria:** ≥8% BD-rate improvement on ≥2 sequences; VMAF at each q ±0.3 pts.
+- **Prerequisite experiment:** Run `rd-curve` with AQ enabled/disabled, report BD-rate delta. If AQ already captures ≥70% of potential gain, skip this item.
+- **Note:** Requires GPU-side rate estimation or two-pass approach. Lagrange RD is tile-independent (each tile optimizes independently). Complex implementation (~5-8 days).
+
 ### 12. CPU SIMD path (long-term, low priority)
 - **Status:** todo (P5 — far future, contingent on codec maturity)
 - **Motivation:** Broadcast contribution niche — same hole as VC-2/Dirac and JPEG XS: low latency, high quality, patent-free, low complexity. For broader adoption, a CPU-only path removes the GPU dependency and enables use on hardware without a capable GPU (servers, edge devices, FPGA/ASIC targets). Also enables WebAssembly decode on browsers without WebGPU (e.g. Firefox today).

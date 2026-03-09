@@ -298,8 +298,8 @@ impl GpuRiceEncoder {
         }
     }
 
-    fn ensure_buffers(&mut self, ctx: &GpuContext, num_tiles: usize, tile_size: u32) {
-        let msb = max_stream_bytes_for_tile(tile_size);
+    fn ensure_buffers(&mut self, ctx: &GpuContext, num_tiles: usize, tile_size: u32, qstep: f32) {
+        let msb = max_stream_bytes_for_tile(tile_size, qstep);
         let needs_realloc = self.cached.as_ref().is_none_or(|c| {
             c.num_tiles != num_tiles || c.max_stream_bytes != msb
         });
@@ -316,12 +316,13 @@ impl GpuRiceEncoder {
         quantized_bufs: [&wgpu::Buffer; 3],
         info: &FrameInfo,
         num_levels: u32,
+        qstep: f32,
     ) -> Vec<RiceTile> {
         let num_tiles = (info.tiles_x() * info.tiles_y()) as usize;
         let total_streams = num_tiles * RICE_STREAMS_PER_TILE;
-        let msb = max_stream_bytes_for_tile(info.tile_size);
+        let msb = max_stream_bytes_for_tile(info.tile_size, qstep);
 
-        self.ensure_buffers(ctx, num_tiles, info.tile_size);
+        self.ensure_buffers(ctx, num_tiles, info.tile_size, qstep);
         let bufs = self.cached.as_ref().unwrap();
 
         let stream_size = (total_streams * msb) as u64;
@@ -541,12 +542,13 @@ impl GpuRiceEncoder {
         quantized_buf: &wgpu::Buffer,
         info: &FrameInfo,
         num_levels: u32,
+        qstep: f32,
     ) -> Vec<RiceTile> {
         let num_tiles = (info.tiles_x() * info.tiles_y()) as usize;
         let total_streams = num_tiles * RICE_STREAMS_PER_TILE;
-        let msb = max_stream_bytes_for_tile(info.tile_size);
+        let msb = max_stream_bytes_for_tile(info.tile_size, qstep);
 
-        self.ensure_buffers(ctx, num_tiles, info.tile_size);
+        self.ensure_buffers(ctx, num_tiles, info.tile_size, qstep);
         let bufs = self.cached.as_ref().unwrap();
 
         let stream_size = (total_streams * msb) as u64;
@@ -737,12 +739,13 @@ impl GpuRiceEncoder {
         quantized_bufs: [&wgpu::Buffer; 3],
         info: &FrameInfo,
         num_levels: u32,
+        qstep: f32,
     ) {
         let num_tiles = (info.tiles_x() * info.tiles_y()) as usize;
         let total_streams = num_tiles * RICE_STREAMS_PER_TILE;
-        let msb = max_stream_bytes_for_tile(info.tile_size);
+        let msb = max_stream_bytes_for_tile(info.tile_size, qstep);
 
-        self.ensure_buffers(ctx, num_tiles, info.tile_size);
+        self.ensure_buffers(ctx, num_tiles, info.tile_size, qstep);
         let bufs = self.cached.as_ref().unwrap();
 
         let stream_size = (total_streams * msb) as u64;
@@ -978,8 +981,9 @@ impl GpuRiceEncoder {
         num_tiles: usize,
         tile_size: u32,
         batch_size: usize,
+        qstep: f32,
     ) {
-        self.ensure_buffers(ctx, num_tiles, tile_size);
+        self.ensure_buffers(ctx, num_tiles, tile_size, qstep);
         let bufs = self.cached.as_mut().unwrap();
         bufs.ensure_batch_staging(ctx, batch_size);
     }
@@ -998,6 +1002,7 @@ impl GpuRiceEncoder {
         ctx: &GpuContext,
         info: &FrameInfo,
         num_levels: u32,
+        qstep: f32,
     ) {
         let bufs = self.cached.as_ref().expect("prepare_batch_staging must be called first");
         let num_tiles = (info.tiles_x() * info.tiles_y()) as usize;
@@ -1005,7 +1010,7 @@ impl GpuRiceEncoder {
             num_tiles, bufs.num_tiles,
             "FrameInfo tile dimensions differ from cached buffer size — all batch frames must share the same FrameInfo"
         );
-        let msb = max_stream_bytes_for_tile(info.tile_size);
+        let msb = max_stream_bytes_for_tile(info.tile_size, qstep);
         let params = RiceParams {
             num_tiles: num_tiles as u32,
             coefficients_per_tile: info.tile_size * info.tile_size,
@@ -1405,7 +1410,8 @@ impl GpuRiceDecoder {
                 tile_size: info.tile_size,
                 tiles_x: info.tiles_x(),
                 num_levels: tiles.first().map_or(3, |t| t.num_levels),
-                max_stream_bytes: max_stream_bytes_for_tile(info.tile_size) as u32,
+                // Decode shader maps this field to _pad0 (unused).
+                max_stream_bytes: 0,
                 _pad0: 0,
             },
             k_values,

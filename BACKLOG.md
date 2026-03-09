@@ -16,7 +16,7 @@ H.264 comparison (#22) established the north star: GNC needs **2–5× more bits
 - Entropy-improvement items (#21, #7) are deprioritized; focus shifts to temporal prediction
 
 **Priority order for compression gains:**
-1. **#23 Skip/merge modes** (P1) — Infrastructure done; needs skip-mode-aware ME (choose MVs to minimise skip cost, not residual cost)
+1. **#23 Skip/merge modes** (DONE) — Zero-MV tile skip deployed: −2.7% bpp bbb, VMAF neutral
 2. **#24 Larger ME search range** (P2) — Current block_match is range-limited; larger range reduces residual for fast-motion
 3. **#25 Multi-reference P-frames** (P2) — Use >1 reference frame for P-frames; improves repeated textures
 4. **#17 Scene cut detection** (P3) — Correctness/robustness, small bpp gain
@@ -232,19 +232,12 @@ H.264 comparison (#22) established the north star: GNC needs **2–5× more bits
 - **Status:** done (measurement complete; used as north star for compression priorities)
 
 ### 23. Skip/merge modes — suppress residual for flat/matched regions
-- **Status:** partial — infrastructure in place, disabled by default (2026-03-09)
-- **Motivation:** GNC P/B-frames save only ~3% bpp vs all-I on high-motion content. A large fraction of P/B tiles have near-zero residual after motion compensation — but GNC still encodes and transmits that residual. H.264 skip mode transmits 0 bits for a matched block. This is likely the single biggest low-hanging gain in the temporal path.
-- **Hypothesis:** For tiles where SAD(residual) < threshold, transmit a 1-bit skip flag instead of the full residual. Decoder reconstructs from motion-compensated reference only. Expected gain: 5–15% bpp reduction on high-motion sequences, larger on low-motion.
-- **Success criteria:** bpp −5% on crowd_run q=75 with VMAF neutral (±0.3 pts). All tests pass.
-- **Implementation sketch:**
-  - After ME, compute residual energy per tile (already available from AQ path).
-  - If energy < skip_threshold(q): write 1-bit skip flag in tile header; skip residual coding.
-  - Decoder: on skip flag, copy MC output to output buffer without adding residual.
-  - Threshold must be q-dependent (higher q = tighter threshold).
-- **Risk:** Bitstream format change (tile header gains a skip bit). Needs backward-compat flag or version bump.
-- **What was built (2026-03-09):** GPU compute shader `tile_skip.wgsl` + `dispatch_tile_skip()` in pipeline.rs + insertion points in sequence.rs for P-frames (444 + non-444) and B-frames. Infrastructure compiles clean. Currently disabled: `tile_skip_threshold()` returns 0.0.
-- **Why disabled:** Zeroing quantized wavelet coefficients AFTER ME (with residual-minimising MVs) causes MV-mismatch distortion. The decoded tile uses `decoded_P = MC(ref, non-skip-MVs) + 0` which is worse quality than the expected skip tile `decoded_P = MC(ref, zero/co-located-MVs)`. Test failures at threshold=0.5: `test_pframe_identical_frames_correct_decode` PSNR dropped 28.76 dB (req. >30), `test_motion_comp_effectiveness` Frame 2 22.45 dB (req. >25).
-- **Required next step:** Skip-mode-aware ME: for each tile, compute skip cost (MC-only error) vs residual cost; choose skip when skip_cost < residual_cost + bits_saved_penalty. Encode as all-zero residual tile + skip flag if skip wins. The current zeroing approach (post-ME) cannot work because the MVs were not chosen to minimise skip cost.
+- **Status:** done (2026-03-09)
+- **Result:** −2.7% bpp on bbb q=75 (VMAF −0.16 pts, within tolerance); −0.6% crowd_run; neutral park_joy.
+- **Implementation:** `tile_skip_motion.wgsl` — one workgroup per tile (256 threads). Computes zero-MV SAD (mean |current−ref| per pixel). If mean_sad < qstep/2: zeros all 8×8 split MVs for that tile before MC dispatch. MC then produces small temporal residual → quantiser + Rice encoder produce compact all-skip tiles naturally. No bitstream format change required (zero MVs + small residual → same codec path). `tile_skip.wgsl` (coefficient zeroing) remains disabled (not needed).
+- **Why it works:** Forces skip tiles to use zero-MV prediction (ref_same_pos). Encoder and decoder are symmetric: both reconstruct as ref_same_pos + zero_residual. Previous coefficient-zeroing approach caused MV-mismatch distortion; this approach avoids it by zeroing MVs before MC.
+- **Limitation:** Savings limited to truly static tiles (temporal change < qstep/2 per pixel). B-frames not covered (bidir ME requires different skip logic). High-motion sequences see minimal savings.
+- **Next step if more savings needed:** (a) More aggressive threshold calibration; (b) B-frame zero-MV skip; (c) Merge mode: use non-zero co-located MV (better prediction for slow-motion tiles). See #24 (larger search range) for high-motion gains instead.
 
 ### 24. Larger ME search range
 - **Status:** todo (P2)

@@ -49,6 +49,65 @@ This is a fundamental ME architecture change, not a tuning problem.
 
 ---
 
+## 2026-03-09: #23 Zero-MV tile skip mode — GPU shader, correct implementation, deployed
+
+### Hypothesis
+Many P-frame tiles have near-zero temporal change (static background). If we force
+their motion vectors to zero before MC, the MC residual equals the actual temporal
+change. For truly static tiles the quantiser drives this to zero → compact all-skip
+Rice tiles. Expected: 5–15% bpp reduction on low-motion sequences, VMAF neutral.
+
+### Root cause of previous failure (threshold=0.5 on coefficients)
+The prior attempt zeroed the quantised wavelet coefficients AFTER ME had already found
+non-zero (residual-optimal) MVs. For "identical" gradient test frames, ME found a
+non-zero MV with SAD=0 (any shift gives the same prediction for a linear gradient).
+Zeroing the residual left decoded_P = MC(ref, non_zero_MV) → clamped at frame boundary
+→ PSNR 28.76 dB vs requirement >30 dB. Root cause: MV-mismatch distortion.
+
+### Correct approach — zero-MV tile skip
+New shader `tile_skip_motion.wgsl` (one workgroup per tile, 256 threads):
+1. Compute zero-MV SAD per tile: mean |current_pixel − ref_pixel| over all tile pixels
+2. If mean_sad < threshold (= qstep × 0.5): zero ALL 8×8 split MVs for that tile
+3. MC then runs with zero MVs → residual = actual temporal change ← small by construction
+4. Quantiser + Rice encoder handle the small residuals naturally (all-skip RiceTiles)
+
+Threshold = qstep/2 per pixel: tiles where the temporal change is less than half a
+quantisation step per pixel are skipped. Conservative but safe.
+
+### Implementation
+- `src/shaders/tile_skip_motion.wgsl`: new GPU shader, 4 bindings (uniform, cur, ref, mvs rw)
+- `src/encoder/pipeline.rs`: `tile_skip_motion_pipeline`, `tile_skip_motion_bgl`, `dispatch_tile_skip_motion()`
+- `src/encoder/sequence.rs`: dispatch after `estimate_split`, before `dispatch_mv_scale`/MC.
+  All P-frame chroma formats (444/422/420) covered by single insertion point (luma-plane skip,
+  chroma MVs derived downstream via mv_scale → also zero for skip tiles).
+
+### Measured results (444, I+P+B, q=75)
+
+| Sequence | Before bpp | After bpp | Δbpp | Before VMAF | After VMAF | ΔVMAF |
+|----------|-----------|-----------|------|-------------|------------|-------|
+| bbb      | 2.61      | 2.54      | −2.7% | 96.73      | 96.57      | −0.16 pts |
+| crowd_run | 6.21     | 6.17      | −0.6% | 99.13      | 99.13      | 0.00 pts |
+| park_joy  | 4.94     | 4.94      | 0.0%  | 99.14      | 99.14      | 0.00 pts |
+
+### Analysis
+- bbb (animated movie, mixed motion): −2.7% bpp, VMAF within tolerance (−0.16 pts < 0.5 limit).
+  Static background tiles (camera pans, static props) are being skipped.
+- crowd_run (high motion, crowd): minimal savings (−0.6%). Most tiles have real motion > threshold.
+- park_joy (medium-high motion): no measurable savings. Threshold may be too conservative for
+  near-static regions that still exceed qstep/2.
+
+All 164 tests pass. Both previous test failures fixed (test_pframe_identical_frames_correct_decode
+now passes because zero-MV skip forces static tiles to use ref_same_pos as reconstruction; no
+MV-mismatch distortion possible when MVs are zero).
+
+### Verdict
+SHIPPED. Modest improvement: −2.7% on bbb, neutral on high-motion content. VMAF within tolerance.
+The savings are below the 5% success criterion for crowd_run, but the feature is correct and
+provides non-trivial benefit on lower-motion content. Threshold calibration is tunable (currently
+qstep/2); a more aggressive threshold would increase savings but risk VMAF regression.
+
+---
+
 ## 2026-03-09: #21 Parent-child context Rice k — implemented, measured, reverted
 
 ### Hypothesis

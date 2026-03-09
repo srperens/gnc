@@ -27,13 +27,26 @@ const B_FRAMES_PER_GROUP: usize = 2;
 /// Skip threshold for inter-frame residual tiles (in quantized units, post-quantization).
 ///
 /// Tiles whose mean |quantized coeff| is below this value are zeroed before Rice encode.
+/// Per-tile zero-MV SAD threshold for P-frame skip mode (tile_skip_motion shader).
+///
+/// Tiles whose mean per-pixel zero-MV SAD is below this value are declared "skip tiles":
+/// all their split MVs are forced to zero before MC.  MC then produces a small
+/// temporal residual (actual scene change) that the quantiser drives to near-zero,
+/// and the Rice encoder outputs a compact all-skip RiceTile automatically.
+///
+/// Threshold = qstep / 2: static tiles (temporal change < half a quantisation step
+/// per pixel) are skipped.  This is conservative enough to avoid zeroing tiles with
+/// real motion while aggressive enough to catch static background regions.
+fn tile_skip_motion_threshold(qstep: f32) -> f32 {
+    qstep * 0.5
+}
+
 /// Returns the tile skip threshold for the given quantization step.
 /// Tiles whose mean |coeff| is below this value are zeroed before Rice encoding.
 ///
-/// Currently returns 0.0 (disabled): proper skip mode requires skip-mode-aware ME
-/// (MVs chosen to minimise skip cost, not residual cost). With residual-minimising MVs,
-/// zeroing the residual causes MV-mismatch distortion that hurts quality more than it
-/// saves bits. Infrastructure is in place; re-enable once skip-mode ME is implemented.
+/// Currently returns 0.0 (disabled): explicit coefficient zeroing is not needed because
+/// the tile_skip_motion pass already forces MVs to zero for static tiles, so the
+/// quantiser drives those residuals to zero naturally.  Infrastructure kept for future use.
 fn tile_skip_threshold(_qstep: f32) -> f32 {
     0.0
 }
@@ -2705,6 +2718,26 @@ impl EncoderPipeline {
             }
 
             let _t_mcwq = std::time::Instant::now();
+
+            // Tile skip mode: zero 8×8 split MVs for static (low temporal-change) tiles.
+            // Runs after estimate_split but before mv_scale / MC so that:
+            //  - Zeroed MVs propagate through mv_scale → chroma MVs are also zero ✓
+            //  - MC produces small residual (current − ref_same_pos) for skip tiles ✓
+            //  - Quantiser drives small residuals to near-zero automatically ✓
+            //  - Rice encoder outputs compact all-skip tiles for zero-coefficient tiles ✓
+            let skip_sad_thr = tile_skip_motion_threshold(config.quantization_step);
+            self.dispatch_tile_skip_motion(
+                ctx,
+                &mut cmd,
+                &bufs.plane_a,
+                &bufs.gpu_ref_planes[0],
+                &split_mv_buf,
+                padded_w,
+                padded_h,
+                config.tile_size,
+                super::motion::ME_SPLIT_BLOCK_SIZE,
+                skip_sad_thr,
+            );
 
             // 4:2:0 chroma-domain MC: scale luma MVs → chroma MVs once before the plane loop.
             // Both chroma planes (Co, Cg) share the same scaled MV buffer.

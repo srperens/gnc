@@ -59,6 +59,8 @@ pub struct EncoderPipeline {
     tile_energy_reduce_bgl: wgpu::BindGroupLayout,
     tile_skip_pipeline: wgpu::ComputePipeline,
     tile_skip_bgl: wgpu::BindGroupLayout,
+    tile_skip_motion_pipeline: wgpu::ComputePipeline,
+    tile_skip_motion_bgl: wgpu::BindGroupLayout,
     pub(super) cached: Option<CachedEncodeBuffers>,
     pub(super) tw_cached: Option<CachedTemporalWaveletBuffers>,
     /// Second temporal wavelet buffer set for GOP pipelining (B set).
@@ -279,6 +281,85 @@ impl EncoderPipeline {
                     cache: None,
                 });
 
+        // GPU tile skip motion pipeline: zeros 8×8 split MVs for low-SAD (static) tiles.
+        // Runs after ME (estimate_cached + estimate_split) but before MC dispatch.
+        let tsm_shader = ctx
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("tile_skip_motion"),
+                source: wgpu::ShaderSource::Wgsl(
+                    include_str!("../shaders/tile_skip_motion.wgsl").into(),
+                ),
+            });
+        let tile_skip_motion_bgl =
+            ctx.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("tsm_bgl"),
+                    entries: &[
+                        // binding 0: uniform params
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        // binding 1: current_plane (read-only storage)
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        // binding 2: ref_plane (read-only storage)
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 2,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        // binding 3: motion_vectors (read_write storage — zeroed for skip tiles)
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 3,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                    ],
+                });
+        let tsm_pl = ctx
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("tsm_pl"),
+                bind_group_layouts: &[&tile_skip_motion_bgl],
+                push_constant_ranges: &[],
+            });
+        let tile_skip_motion_pipeline =
+            ctx.device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("tile_skip_motion_pipeline"),
+                    layout: Some(&tsm_pl),
+                    module: &tsm_shader,
+                    entry_point: Some("main"),
+                    compilation_options: Default::default(),
+                    cache: None,
+                });
+
         Self {
             color: ColorConverter::new(ctx),
             transform: WaveletTransform::new(ctx),
@@ -306,6 +387,8 @@ impl EncoderPipeline {
             tile_energy_reduce_bgl,
             tile_skip_pipeline,
             tile_skip_bgl,
+            tile_skip_motion_pipeline,
+            tile_skip_motion_bgl,
             cached: None,
             tw_cached: None,
             tw_cached_b: None,
@@ -609,6 +692,82 @@ impl EncoderPipeline {
             timestamp_writes: None,
         });
         pass.set_pipeline(&self.tile_skip_pipeline);
+        pass.set_bind_group(0, &bg, &[]);
+        pass.dispatch_workgroups(tiles_x, tiles_y, 1);
+    }
+
+    /// Dispatch tile skip motion pass: zeros 8×8 split MVs for P-frame tiles whose
+    /// zero-MV prediction error is below `skip_threshold` (mean per-pixel SAD).
+    ///
+    /// Must run AFTER estimate_split and BEFORE dispatch_mv_scale / compensate_cached.
+    /// MVs in split_mv_buf are zeroed in-place for skip tiles; downstream MC then
+    /// naturally produces a small residual for those tiles.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn dispatch_tile_skip_motion(
+        &self,
+        ctx: &GpuContext,
+        cmd: &mut wgpu::CommandEncoder,
+        current_plane: &wgpu::Buffer,
+        ref_plane: &wgpu::Buffer,
+        split_mv_buf: &wgpu::Buffer,
+        padded_w: u32,
+        padded_h: u32,
+        tile_size: u32,
+        block_size_8: u32,
+        skip_threshold: f32,
+    ) {
+        use wgpu::util::DeviceExt;
+        // Params layout (matches shader struct):
+        //   offset  0: padded_w      u32
+        //   offset  4: padded_h      u32
+        //   offset  8: tile_size     u32
+        //   offset 12: block_size_8  u32
+        //   offset 16: skip_threshold f32
+        //   (padded to 32 bytes by WGSL alignment rules — last 12 bytes unused)
+        let params_data: [u32; 8] = [
+            padded_w,
+            padded_h,
+            tile_size,
+            block_size_8,
+            skip_threshold.to_bits(),
+            0, 0, 0, // padding
+        ];
+        let params_buf = ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("tile_skip_motion_params"),
+                contents: bytemuck::cast_slice(&params_data),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("tsm_bg"),
+            layout: &self.tile_skip_motion_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: current_plane.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: ref_plane.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: split_mv_buf.as_entire_binding(),
+                },
+            ],
+        });
+        let tiles_x = padded_w / tile_size;
+        let tiles_y = padded_h / tile_size;
+        let mut pass = cmd.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("tile_skip_motion_pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.tile_skip_motion_pipeline);
         pass.set_bind_group(0, &bg, &[]);
         pass.dispatch_workgroups(tiles_x, tiles_y, 1);
     }

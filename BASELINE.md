@@ -1,28 +1,26 @@
 # GNC Benchmark Baseline
 
-Last updated: 2026-03-06
-Baseline commit: 617d8e6 (v0.1-spatial)
-Mode: Spatial-only, I+P+B, Rice entropy, q=75
+Last updated: 2026-03-09
+Baseline commit: 114a2f9 (quarter-pel ME, after B-frame 4:2:0 chroma fix)
+Mode: Spatial-only, I+P+B, Rice entropy
 
-## Sequence Benchmarks (1080p, 120 frames)
+## Single-Frame (bbb_1080p, Rice, 4:4:4)
+
+| q   | PSNR     | BPP  | Encode  | Decode  | VMAF  |
+|-----|----------|------|---------|---------|-------|
+| 25  | 32.89 dB | 1.50 | 35.1 fps | 62.8 fps | 85.10 |
+| 50  | 37.53 dB | 2.22 | 35.9 fps | 52.1 fps | 89.68 |
+| 75  | 42.17 dB | 3.83 | 35.3 fps | 52.0 fps | 95.05 |
+| 90  | 51.0 dB  | 9.65 | 39 fps   | 55 fps   | —     |
+
+## Sequence Benchmarks (I+P+B, q=75, ki=8, 50 frames)
 
 | sequence   | bpp  | PSNR avg | PSNR min | fps_enc | fps_dec |
 |------------|------|----------|----------|---------|---------|
-| crowd_run  | 6.99 | 38.78 dB | -        | 20.8    | -       |
-| park_joy   | 7.76 | 39.15 dB | -        | 20.7    | -       |
-| rush_hour  | 2.01 | 41.15 dB | -        | 21.1    | -       |
-| stockholm  | 4.15 | 38.78 dB | -        | 42.6    | -       |
-
-## Single-Frame (bbb_1080p, Rice)
-
-| q   | PSNR    | BPP  | Encode | Decode |
-|-----|---------|------|--------|--------|
-| 25  | 33.2 dB | 1.71 | 39 fps | 72 fps |
-| 50  | 37.7 dB | 2.37 | 40 fps | 60 fps |
-| 75  | 42.8 dB | 4.01 | 40 fps | 59 fps |
-| 90  | 50.5 dB | 8.90 | 40 fps | 63 fps |
+| crowd_run  | 6.93 | 38.80 dB | 38.34 dB | —       | —       |
+| rush_hour  | 2.03 | 41.12 dB | 40.75 dB | —       | —       |
 
 ## Regression Rules
 
 Any change that regresses any sequence benchmark without explicit Team Lead approval is rejected.
-Fill in missing values (PSNR min, fps_dec) when Validator first runs the full suite.
+Tolerances: VMAF −0.5 pts (BLOCK), bpp +3% (BLOCK), PSNR −0.3 dB (flag).

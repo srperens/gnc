@@ -3,7 +3,10 @@ use wgpu;
 use wgpu::util::DeviceExt;
 
 use super::adaptive;
-use super::motion::{ME_BIDIR_PRED_FINE_RANGE, ME_BIDIR_SEARCH_RANGE, ME_BLOCK_SIZE, ME_PRED_FINE_RANGE, ME_SEARCH_RANGE, ME_SPLIT_BLOCK_SIZE};
+use super::motion::{
+    ME_BIDIR_PRED_FINE_RANGE, ME_BIDIR_SEARCH_RANGE, ME_BLOCK_SIZE, ME_PRED_FINE_RANGE,
+    ME_SEARCH_RANGE, ME_SPLIT_BLOCK_SIZE,
+};
 use crate::GpuContext;
 
 /// Cached GPU buffers reused across encode() calls to avoid per-frame allocation.
@@ -99,7 +102,9 @@ pub(super) struct CachedEncodeBuffers {
 
     // Scaled chroma MV buffer (same block count as split_mv, values halved for 4:2:0).
     // Written by dispatch_mv_scale before chroma MC; reused across planes.
+    // mv_chroma_buf: forward MVs, mv_chroma_buf_bwd: backward MVs (for B-frame bidir).
     pub(super) mv_chroma_buf: wgpu::Buffer,
+    pub(super) mv_chroma_buf_bwd: wgpu::Buffer,
 
     // Staging buffers for deferred MV/bidir readback (reused across frames)
     pub(super) mv_staging_size: u64,
@@ -254,7 +259,9 @@ impl CachedTemporalWaveletBuffers {
                     label: Some(&format!("tw_max_abs_{}", j)),
                     size: 4,
                     // COPY_DST needed for write_buffer pre-clear before each GOP
-                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+                    usage: wgpu::BufferUsages::STORAGE
+                        | wgpu::BufferUsages::COPY_SRC
+                        | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false,
                 })
             })
@@ -546,10 +553,38 @@ impl CachedEncodeBuffers {
             },
 
             // --- Cached ME/MC buffers ---
-            me_params_nopred: Self::make_block_match_params(ctx, padded_w, padded_h, ME_SEARCH_RANGE, false, 0),
-            me_params_pred: Self::make_block_match_params(ctx, padded_w, padded_h, ME_SEARCH_RANGE, true, ME_PRED_FINE_RANGE),
-            bidir_params_nopred: Self::make_block_match_params(ctx, padded_w, padded_h, ME_BIDIR_SEARCH_RANGE, false, 0),
-            bidir_params_pred: Self::make_block_match_params(ctx, padded_w, padded_h, ME_BIDIR_SEARCH_RANGE, true, ME_BIDIR_PRED_FINE_RANGE),
+            me_params_nopred: Self::make_block_match_params(
+                ctx,
+                padded_w,
+                padded_h,
+                ME_SEARCH_RANGE,
+                false,
+                0,
+            ),
+            me_params_pred: Self::make_block_match_params(
+                ctx,
+                padded_w,
+                padded_h,
+                ME_SEARCH_RANGE,
+                true,
+                ME_PRED_FINE_RANGE,
+            ),
+            bidir_params_nopred: Self::make_block_match_params(
+                ctx,
+                padded_w,
+                padded_h,
+                ME_BIDIR_SEARCH_RANGE,
+                false,
+                0,
+            ),
+            bidir_params_pred: Self::make_block_match_params(
+                ctx,
+                padded_w,
+                padded_h,
+                ME_BIDIR_SEARCH_RANGE,
+                true,
+                ME_BIDIR_PRED_FINE_RANGE,
+            ),
 
             me_sad_buf: ctx.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("enc_me_sad"),
@@ -576,14 +611,44 @@ impl CachedEncodeBuffers {
                 mapped_at_creation: false,
             }),
 
-            mc_bidir_fwd_params: Self::make_mc_params_bs(ctx, padded_w, padded_h, true, ME_BLOCK_SIZE),
-            mc_fwd_params_8: Self::make_mc_params_bs(ctx, padded_w, padded_h, true, ME_SPLIT_BLOCK_SIZE),
-            mc_inv_params_8: Self::make_mc_params_bs(ctx, padded_w, padded_h, false, ME_SPLIT_BLOCK_SIZE),
+            mc_bidir_fwd_params: Self::make_mc_params_bs(
+                ctx,
+                padded_w,
+                padded_h,
+                true,
+                ME_BLOCK_SIZE,
+            ),
+            mc_fwd_params_8: Self::make_mc_params_bs(
+                ctx,
+                padded_w,
+                padded_h,
+                true,
+                ME_SPLIT_BLOCK_SIZE,
+            ),
+            mc_inv_params_8: Self::make_mc_params_bs(
+                ctx,
+                padded_w,
+                padded_h,
+                false,
+                ME_SPLIT_BLOCK_SIZE,
+            ),
 
             // 4:2:0 chroma MC params: chroma dims = padded/2, block_size = ME_SPLIT_BLOCK_SIZE/2 = 4.
             // The block grid is identical to luma (same count), only the spatial dims differ.
-            mc_fwd_params_chroma420: Self::make_mc_params_bs(ctx, padded_w / 2, padded_h / 2, true, ME_SPLIT_BLOCK_SIZE / 2),
-            mc_inv_params_chroma420: Self::make_mc_params_bs(ctx, padded_w / 2, padded_h / 2, false, ME_SPLIT_BLOCK_SIZE / 2),
+            mc_fwd_params_chroma420: Self::make_mc_params_bs(
+                ctx,
+                padded_w / 2,
+                padded_h / 2,
+                true,
+                ME_SPLIT_BLOCK_SIZE / 2,
+            ),
+            mc_inv_params_chroma420: Self::make_mc_params_bs(
+                ctx,
+                padded_w / 2,
+                padded_h / 2,
+                false,
+                ME_SPLIT_BLOCK_SIZE / 2,
+            ),
 
             mv_chroma_buf: {
                 let split_blocks_x = padded_w / ME_SPLIT_BLOCK_SIZE;
@@ -591,6 +656,17 @@ impl CachedEncodeBuffers {
                 let mv_size = (split_blocks_x * split_blocks_y) as u64 * 2 * 4;
                 ctx.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("enc_mv_chroma"),
+                    size: mv_size.max(8),
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                })
+            },
+            mv_chroma_buf_bwd: {
+                let split_blocks_x = padded_w / ME_SPLIT_BLOCK_SIZE;
+                let split_blocks_y = padded_h / ME_SPLIT_BLOCK_SIZE;
+                let mv_size = (split_blocks_x * split_blocks_y) as u64 * 2 * 4;
+                ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("enc_mv_chroma_bwd"),
                     size: mv_size.max(8),
                     usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false,
@@ -684,7 +760,13 @@ impl CachedEncodeBuffers {
             })
     }
 
-    fn make_mc_params_bs(ctx: &GpuContext, padded_w: u32, padded_h: u32, forward: bool, block_size: u32) -> wgpu::Buffer {
+    fn make_mc_params_bs(
+        ctx: &GpuContext,
+        padded_w: u32,
+        padded_h: u32,
+        forward: bool,
+        block_size: u32,
+    ) -> wgpu::Buffer {
         #[repr(C)]
         #[derive(Copy, Clone, Pod, Zeroable)]
         struct MotionCompensateParams {
@@ -795,7 +877,13 @@ pub(super) struct SpatialPrecomputeBuffers {
 }
 
 impl SpatialPrecomputeBuffers {
-    pub(super) fn new(ctx: &GpuContext, padded_w: u32, padded_h: u32, orig_w: u32, orig_h: u32) -> Self {
+    pub(super) fn new(
+        ctx: &GpuContext,
+        padded_w: u32,
+        padded_h: u32,
+        orig_w: u32,
+        orig_h: u32,
+    ) -> Self {
         let padded_pixels = (padded_w * padded_h) as usize;
         let plane_size = (padded_pixels * std::mem::size_of::<f32>()) as u64;
         let buf_3ch = (padded_pixels * 3 * std::mem::size_of::<f32>()) as u64;
@@ -819,13 +907,13 @@ impl SpatialPrecomputeBuffers {
             padded_w,
             padded_h,
             raw_input_buf: mk("sp_b_raw_input", raw_size, raw_storage),
-            input_buf:     mk("sp_b_input",     buf_3ch,  storage),
-            color_out:     mk("sp_b_color_out", buf_3ch,  storage),
-            plane_a:       mk("sp_b_plane_a",   plane_size, storage),
-            co_plane:      mk("sp_b_co_plane",  plane_size, storage),
-            cg_plane:      mk("sp_b_cg_plane",  plane_size, storage),
-            plane_b:       mk("sp_b_plane_b",   plane_size, storage),
-            plane_c:       mk("sp_b_plane_c",   plane_size, storage),
+            input_buf: mk("sp_b_input", buf_3ch, storage),
+            color_out: mk("sp_b_color_out", buf_3ch, storage),
+            plane_a: mk("sp_b_plane_a", plane_size, storage),
+            co_plane: mk("sp_b_co_plane", plane_size, storage),
+            cg_plane: mk("sp_b_cg_plane", plane_size, storage),
+            plane_b: mk("sp_b_plane_b", plane_size, storage),
+            plane_c: mk("sp_b_plane_c", plane_size, storage),
         }
     }
 

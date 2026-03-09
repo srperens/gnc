@@ -118,7 +118,7 @@ See [BASELINE.md](BASELINE.md) for current benchmark numbers.
 - **Note:** f32 shaders are transparent to bit depth — only I/O boundaries needed changing (loader, saver, pack_u8, buffer_to_texture). `bit_depth` was already in `FrameInfo` and bitstream header — no bitstream break.
 
 ### 14. P-frame and B-frame chroma: 4:2:0/4:2:2 MC residual domain mismatch
-- **Status:** active (2026-03-08) — P-frame fix committed, B-frame regression discovered
+- **Status:** active (2026-03-08) — P-frame fix committed, B-frame regression diagnosed
 - **P-frame fix (committed 856761c):** Chroma-domain MC for 4:2:0 P-frames. BPP ordering now correct: 4:2:0 < 4:2:2 < 4:4:4 (bbb: 2.20/2.35/2.61, crowd_run: 5.16/5.59/6.39 bpp). Ratio 0.92-0.95 (not yet ≤0.85 target, possibly B-frame overhead polluting avg).
-- **B-frame regression (blocked, 2026-03-08):** B-frames in 422/420 show up to 11.82 dB PSNR loss and are larger than I-frames. B-frames use locally-decoded P-frame as backward reference; P-frame local decode now stores chroma differently after the fix, breaking B-frame reference. Possibly pre-existing (B-frame 422/420 was never benchmarked before this fix).
-- **Next:** Diagnose B-frame MC reference mismatch. Check how locally-decoded P-frame chroma is stored after the P-frame fix and whether B-frame backward MC reads it in the correct domain.
+- **B-frame regression (diagnosed, 2026-03-08):** B-frames in 422/420 show up to 11.82 dB PSNR loss and are larger than I-frames. This is because B-frame backward MC for 4:2:0 chroma is currently performing MC in the luma domain, using luma-sized, NN-upsampled references directly, without the necessary box-filtering and MV scaling to operate in the chroma domain. This mirrors the original P-frame issue that caused structured HF residuals.
+- **Next:** Implement specialized chroma-domain MC for 4:2:0 B-frames in `src/decoder/gpu_work.rs`. This includes box-filtering references, scaling MVs, calling a chroma-domain `compensate_bidir` variant, and upsampling the result.

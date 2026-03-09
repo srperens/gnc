@@ -113,6 +113,7 @@ pub(super) struct CachedBuffers {
     // chroma_recon_buf is a luma-sized scratch used to hold the chroma inverse-MC output before
     // NN-upsampling; only the first chroma_pixels elements are written.
     pub(super) mv_chroma_buf: wgpu::Buffer,
+    pub(super) bwd_mv_chroma_buf: wgpu::Buffer,
     pub(super) chroma_recon_buf: wgpu::Buffer,
 
     // Output texture for zero-readback decode path
@@ -526,6 +527,17 @@ impl CachedBuffers {
                 let mv_size = (split_blocks_x * split_blocks_y) as u64 * 2 * 4;
                 ctx.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("dec_mv_chroma"),
+                    size: mv_size.max(8),
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                })
+            },
+            bwd_mv_chroma_buf: {
+                let split_blocks_x = padded_w / crate::encoder::motion::ME_SPLIT_BLOCK_SIZE;
+                let split_blocks_y = padded_h / crate::encoder::motion::ME_SPLIT_BLOCK_SIZE;
+                let mv_size = (split_blocks_x * split_blocks_y) as u64 * 2 * 4;
+                ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("dec_mv_chroma_bwd"),
                     size: mv_size.max(8),
                     usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false,

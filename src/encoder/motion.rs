@@ -92,6 +92,9 @@ pub struct MotionEstimator {
     match_bidir_bgl: wgpu::BindGroupLayout,
     compensate_bidir_pipeline: wgpu::ComputePipeline,
     compensate_bidir_bgl: wgpu::BindGroupLayout,
+    /// Chroma-dimension bidir MC pipeline (for 4:2:0 B-frame chroma planes).
+    compensate_bidir_chroma_pipeline: wgpu::ComputePipeline,
+    compensate_bidir_chroma_bgl: wgpu::BindGroupLayout,
     split_pipeline: wgpu::ComputePipeline,
     split_bgl: wgpu::BindGroupLayout,
     /// MV scaling pipeline — derives chroma MVs from luma MVs via arithmetic right-shift.
@@ -283,6 +286,51 @@ impl MotionEstimator {
                     cache: None,
                 });
 
+        // --- Chroma-dimension bidir MC pipeline (for 4:2:0 B-frame chroma) ---
+        let compensate_bidir_chroma_shader =
+            ctx.device
+                .create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("motion_compensate_bidir_chroma"),
+                    source: wgpu::ShaderSource::Wgsl(
+                        include_str!("../shaders/motion_compensate_bidir_chroma.wgsl").into(),
+                    ),
+                });
+
+        let compensate_bidir_chroma_bgl =
+            ctx.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("motion_compensate_bidir_chroma_bgl"),
+                    entries: &[
+                        bgl_uniform(0),
+                        bgl_storage_ro(1),
+                        bgl_storage_ro(2),
+                        bgl_storage_ro(3),
+                        bgl_storage_ro(4),
+                        bgl_storage_ro(5),
+                        bgl_storage_ro(6),
+                        bgl_storage_rw(7),
+                    ],
+                });
+
+        let compensate_bidir_chroma_pl =
+            ctx.device
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("motion_compensate_bidir_chroma_pl"),
+                    bind_group_layouts: &[&compensate_bidir_chroma_bgl],
+                    push_constant_ranges: &[],
+                });
+
+        let compensate_bidir_chroma_pipeline =
+            ctx.device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("motion_compensate_bidir_chroma_pipeline"),
+                    layout: Some(&compensate_bidir_chroma_pl),
+                    module: &compensate_bidir_chroma_shader,
+                    entry_point: Some("main"),
+                    compilation_options: Default::default(),
+                    cache: None,
+                });
+
         // --- Split (variable block size) pipeline ---
         let split_shader = ctx
             .device
@@ -344,11 +392,7 @@ impl MotionEstimator {
             .device
             .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("mv_scale_bgl"),
-                entries: &[
-                    bgl_uniform(0),
-                    bgl_storage_ro(1),
-                    bgl_storage_rw(2),
-                ],
+                entries: &[bgl_uniform(0), bgl_storage_ro(1), bgl_storage_rw(2)],
             });
 
         let mv_scale_pl = ctx
@@ -379,6 +423,8 @@ impl MotionEstimator {
             match_bidir_bgl,
             compensate_bidir_pipeline,
             compensate_bidir_bgl,
+            compensate_bidir_chroma_pipeline,
+            compensate_bidir_chroma_bgl,
             split_pipeline,
             split_bgl,
             mv_scale_pipeline,
@@ -1260,6 +1306,97 @@ impl MotionEstimator {
         }
     }
 
+    /// Bidirectional motion compensation at chroma dimensions (4:2:0).
+    /// Uses scaled chroma MVs and chroma-dimension reference buffers.
+    #[allow(clippy::too_many_arguments)] // GPU dispatch functions inherently need many buffer args
+    pub fn compensate_bidir_chroma_cached(
+        &self,
+        ctx: &GpuContext,
+        cmd: &mut wgpu::CommandEncoder,
+        input_plane: &wgpu::Buffer,
+        fwd_reference: &wgpu::Buffer,
+        bwd_reference: &wgpu::Buffer,
+        fwd_mv_buf: &wgpu::Buffer,
+        bwd_mv_buf: &wgpu::Buffer,
+        block_modes_buf: &wgpu::Buffer,
+        output_plane: &wgpu::Buffer,
+        width: u32,
+        height: u32,
+        forward: bool,
+    ) {
+        let total_pixels = width * height;
+        let blocks_x = width / 4; // chroma block size = 4 (half of luma 8)
+        let _blocks_y = height / 4;
+
+        let params = MotionCompensateParams {
+            width,
+            height,
+            block_size: 4,
+            mode: u32::from(!forward), // 0 = forward (residual), 1 = inverse (reconstruct)
+            blocks_x,
+            total_pixels,
+            _pad0: 0,
+            _pad1: 0,
+        };
+        let params_buf = ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("mc_bidir_chroma_params"),
+                contents: bytemuck::bytes_of(&params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+
+        let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("mc_bidir_chroma_bg"),
+            layout: &self.compensate_bidir_chroma_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: input_plane.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: fwd_reference.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: bwd_reference.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: fwd_mv_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: bwd_mv_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: block_modes_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: output_plane.as_entire_binding(),
+                },
+            ],
+        });
+
+        let workgroups = total_pixels.div_ceil(256);
+        {
+            let mut pass = cmd.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("mc_bidir_chroma_pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.compensate_bidir_chroma_pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(workgroups, 1, 1);
+        }
+    }
+
     /// Finish MV readback from a cached staging buffer.
     /// Unlike `finish_mv_readback`, this uses a pre-allocated staging buffer that
     /// must be unmapped before reuse (this function handles unmapping).
@@ -1736,20 +1873,36 @@ impl MotionEstimator {
             shift_y: u32,
             _pad: u32,
         }
-        let params = MvScaleParams { total_blocks, shift_x, shift_y, _pad: 0 };
-        let params_buf = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("mv_scale_params"),
-            contents: bytemuck::bytes_of(&params),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
+        let params = MvScaleParams {
+            total_blocks,
+            shift_x,
+            shift_y,
+            _pad: 0,
+        };
+        let params_buf = ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("mv_scale_params"),
+                contents: bytemuck::bytes_of(&params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
 
         let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("mv_scale_bg"),
             layout: &self.mv_scale_bgl,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: params_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: src_mvs.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: dst_mvs.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: src_mvs.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: dst_mvs.as_entire_binding(),
+                },
             ],
         });
 
@@ -2097,5 +2250,4 @@ mod tests {
         staging.unmap();
         result
     }
-
 }

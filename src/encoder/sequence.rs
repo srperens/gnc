@@ -3,19 +3,19 @@ use wgpu;
 use super::adaptive::{self, AQ_LL_BLOCK_SIZE};
 use super::bitplane;
 use super::cfl;
+use super::diagnostics;
 use super::entropy_helpers::{self, encode_entropy, EntropyMode};
+use super::huffman;
 use super::motion::{MotionEstimator, ME_BLOCK_SIZE, ME_SPLIT_BLOCK_SIZE};
 use super::pipeline::EncoderPipeline;
 use super::rans;
-use super::rice;
-use super::huffman;
-use super::diagnostics;
 use super::rate_control::RateController;
+use super::rice;
+use crate::temporal;
 use crate::{
     ChromaFormat, CodecConfig, CompressedFrame, EntropyCoder, EntropyData, FrameInfo, FrameType,
     GpuContext, MotionField, TemporalEncodedSequence, TemporalGroup, TemporalTransform,
 };
-use crate::temporal;
 
 /// Default frame rate assumed when rate control is active but no explicit fps is set.
 const DEFAULT_FPS: f64 = 30.0;
@@ -71,7 +71,15 @@ impl EncoderPipeline {
         config: &CodecConfig,
         fps: f64,
     ) -> Vec<CompressedFrame> {
-        self.encode_sequence_streaming(ctx, frames.len(), |i| frames[i].to_vec(), width, height, config, fps)
+        self.encode_sequence_streaming(
+            ctx,
+            frames.len(),
+            |i| frames[i].to_vec(),
+            width,
+            height,
+            config,
+            fps,
+        )
     }
 
     /// Streaming variant that loads frames on-demand via a closure.
@@ -131,9 +139,7 @@ impl EncoderPipeline {
         let diag_twav_staging: Option<[wgpu::Buffer; 3]> = if diag_enabled {
             Some(std::array::from_fn(|i| {
                 ctx.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some(
-                        ["diag_twav_y", "diag_twav_co", "diag_twav_cg"][i],
-                    ),
+                    label: Some(["diag_twav_y", "diag_twav_co", "diag_twav_cg"][i]),
                     size: (padded_pixels * std::mem::size_of::<f32>()) as u64,
                     usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false,
@@ -160,8 +166,7 @@ impl EncoderPipeline {
             if is_keyframe {
                 let _t_iframe = std::time::Instant::now();
                 let frame_data = load_frame(display_idx);
-                let mut compressed =
-                    self.encode(ctx, &frame_data, width, height, &frame_config);
+                let mut compressed = self.encode(ctx, &frame_data, width, height, &frame_config);
                 compressed.frame_type = FrameType::Intra;
 
                 if let Some(ref mut rc) = rate_ctrl {
@@ -172,36 +177,69 @@ impl EncoderPipeline {
                 // (Y→mc_out, Co→ref_upload, Cg→plane_b). No CPU entropy decode needed.
                 self.local_decode_iframe_gpu(ctx, &compressed, padded_w, padded_h, padded_pixels);
                 if std::env::var("GNC_PROFILE").is_ok() {
-                    eprintln!("  I-frame total: {:.1}ms", _t_iframe.elapsed().as_secs_f64() * 1000.0);
+                    eprintln!(
+                        "  I-frame total: {:.1}ms",
+                        _t_iframe.elapsed().as_secs_f64() * 1000.0
+                    );
                 }
                 has_reference = true;
                 prev_mv_buf = None;
                 if diag_enabled {
                     last_iframe_bytes = Some(compressed.byte_size());
-                    let d = diagnostics::collect(display_idx, &compressed, frame_config.quantization_step, last_iframe_bytes);
+                    let d = diagnostics::collect(
+                        display_idx,
+                        &compressed,
+                        frame_config.quantization_step,
+                        last_iframe_bytes,
+                    );
                     diagnostics::print(&d);
 
                     // Temporal wavelet diagnostic: capture original-signal coefficients
                     if let Some(ref stg) = diag_twav_staging {
                         let coeffs = self.diag_original_wavelet_coefficients(
-                            ctx, &frame_data, padded_w, padded_h, padded_pixels,
-                            &info, &frame_config, stg,
+                            ctx,
+                            &frame_data,
+                            padded_w,
+                            padded_h,
+                            padded_pixels,
+                            &info,
+                            &frame_config,
+                            stg,
                         );
                         if let Some(ref prev) = prev_twav_coeffs {
                             let y_stats = diagnostics::compute_temporal_wavelet(
-                                &coeffs[0], &prev[0], padded_w, padded_h,
-                                config.tile_size, config.wavelet_levels, frame_config.quantization_step,
+                                &coeffs[0],
+                                &prev[0],
+                                padded_w,
+                                padded_h,
+                                config.tile_size,
+                                config.wavelet_levels,
+                                frame_config.quantization_step,
                             );
                             let co_stats = diagnostics::compute_temporal_wavelet(
-                                &coeffs[1], &prev[1], padded_w, padded_h,
-                                config.tile_size, config.wavelet_levels, frame_config.quantization_step,
+                                &coeffs[1],
+                                &prev[1],
+                                padded_w,
+                                padded_h,
+                                config.tile_size,
+                                config.wavelet_levels,
+                                frame_config.quantization_step,
                             );
                             let cg_stats = diagnostics::compute_temporal_wavelet(
-                                &coeffs[2], &prev[2], padded_w, padded_h,
-                                config.tile_size, config.wavelet_levels, frame_config.quantization_step,
+                                &coeffs[2],
+                                &prev[2],
+                                padded_w,
+                                padded_h,
+                                config.tile_size,
+                                config.wavelet_levels,
+                                frame_config.quantization_step,
                             );
                             diagnostics::print_temporal_wavelet(
-                                display_idx, FrameType::Intra, &y_stats, &co_stats, &cg_stats,
+                                display_idx,
+                                FrameType::Intra,
+                                &y_stats,
+                                &co_stats,
+                                &cg_stats,
                             );
                         }
                         prev_twav_coeffs = Some(coeffs);
@@ -214,8 +252,8 @@ impl EncoderPipeline {
 
             if !use_bframes {
                 // P-frame only mode — skip local decode if next frame is keyframe or EOSequence
-                let next_is_key_or_end = display_idx + 1 >= n
-                    || (ki > 1 && (display_idx + 1) % ki == 0);
+                let next_is_key_or_end =
+                    display_idx + 1 >= n || (ki > 1 && (display_idx + 1) % ki == 0);
                 let frame_data = load_frame(display_idx);
                 let (compressed, new_mv_buf) = self.encode_pframe(
                     ctx,
@@ -236,29 +274,59 @@ impl EncoderPipeline {
                     rc.update(frame_config.quantization_step, compressed.bpp());
                 }
                 if diag_enabled {
-                    let d = diagnostics::collect(display_idx, &compressed, frame_config.quantization_step, last_iframe_bytes);
+                    let d = diagnostics::collect(
+                        display_idx,
+                        &compressed,
+                        frame_config.quantization_step,
+                        last_iframe_bytes,
+                    );
                     diagnostics::print(&d);
 
                     if let Some(ref stg) = diag_twav_staging {
                         let coeffs = self.diag_original_wavelet_coefficients(
-                            ctx, &frame_data, padded_w, padded_h, padded_pixels,
-                            &info, config, stg,
+                            ctx,
+                            &frame_data,
+                            padded_w,
+                            padded_h,
+                            padded_pixels,
+                            &info,
+                            config,
+                            stg,
                         );
                         if let Some(ref prev) = prev_twav_coeffs {
                             let y_stats = diagnostics::compute_temporal_wavelet(
-                                &coeffs[0], &prev[0], padded_w, padded_h,
-                                config.tile_size, config.wavelet_levels, config.quantization_step,
+                                &coeffs[0],
+                                &prev[0],
+                                padded_w,
+                                padded_h,
+                                config.tile_size,
+                                config.wavelet_levels,
+                                config.quantization_step,
                             );
                             let co_stats = diagnostics::compute_temporal_wavelet(
-                                &coeffs[1], &prev[1], padded_w, padded_h,
-                                config.tile_size, config.wavelet_levels, config.quantization_step,
+                                &coeffs[1],
+                                &prev[1],
+                                padded_w,
+                                padded_h,
+                                config.tile_size,
+                                config.wavelet_levels,
+                                config.quantization_step,
                             );
                             let cg_stats = diagnostics::compute_temporal_wavelet(
-                                &coeffs[2], &prev[2], padded_w, padded_h,
-                                config.tile_size, config.wavelet_levels, config.quantization_step,
+                                &coeffs[2],
+                                &prev[2],
+                                padded_w,
+                                padded_h,
+                                config.tile_size,
+                                config.wavelet_levels,
+                                config.quantization_step,
                             );
                             diagnostics::print_temporal_wavelet(
-                                display_idx, FrameType::Predicted, &y_stats, &co_stats, &cg_stats,
+                                display_idx,
+                                FrameType::Predicted,
+                                &y_stats,
+                                &co_stats,
+                                &cg_stats,
                             );
                         }
                         prev_twav_coeffs = Some(coeffs);
@@ -311,29 +379,59 @@ impl EncoderPipeline {
                     rc.update(p_config.quantization_step, compressed.bpp());
                 }
                 if diag_enabled {
-                    let d = diagnostics::collect(p_display, &compressed, p_config.quantization_step, last_iframe_bytes);
+                    let d = diagnostics::collect(
+                        p_display,
+                        &compressed,
+                        p_config.quantization_step,
+                        last_iframe_bytes,
+                    );
                     diagnostics::print(&d);
 
                     if let Some(ref stg) = diag_twav_staging {
                         let coeffs = self.diag_original_wavelet_coefficients(
-                            ctx, &p_frame_data, padded_w, padded_h, padded_pixels,
-                            &info, config, stg,
+                            ctx,
+                            &p_frame_data,
+                            padded_w,
+                            padded_h,
+                            padded_pixels,
+                            &info,
+                            config,
+                            stg,
                         );
                         if let Some(ref prev) = prev_twav_coeffs {
                             let y_stats = diagnostics::compute_temporal_wavelet(
-                                &coeffs[0], &prev[0], padded_w, padded_h,
-                                config.tile_size, config.wavelet_levels, config.quantization_step,
+                                &coeffs[0],
+                                &prev[0],
+                                padded_w,
+                                padded_h,
+                                config.tile_size,
+                                config.wavelet_levels,
+                                config.quantization_step,
                             );
                             let co_stats = diagnostics::compute_temporal_wavelet(
-                                &coeffs[1], &prev[1], padded_w, padded_h,
-                                config.tile_size, config.wavelet_levels, config.quantization_step,
+                                &coeffs[1],
+                                &prev[1],
+                                padded_w,
+                                padded_h,
+                                config.tile_size,
+                                config.wavelet_levels,
+                                config.quantization_step,
                             );
                             let cg_stats = diagnostics::compute_temporal_wavelet(
-                                &coeffs[2], &prev[2], padded_w, padded_h,
-                                config.tile_size, config.wavelet_levels, config.quantization_step,
+                                &coeffs[2],
+                                &prev[2],
+                                padded_w,
+                                padded_h,
+                                config.tile_size,
+                                config.wavelet_levels,
+                                config.quantization_step,
                             );
                             diagnostics::print_temporal_wavelet(
-                                p_display, FrameType::Predicted, &y_stats, &co_stats, &cg_stats,
+                                p_display,
+                                FrameType::Predicted,
+                                &y_stats,
+                                &co_stats,
+                                &cg_stats,
                             );
                         }
                         prev_twav_coeffs = Some(coeffs);
@@ -380,29 +478,59 @@ impl EncoderPipeline {
                         rc.update(b_config.quantization_step, compressed.bpp());
                     }
                     if diag_enabled {
-                        let d = diagnostics::collect(b_display, &compressed, b_config.quantization_step, last_iframe_bytes);
+                        let d = diagnostics::collect(
+                            b_display,
+                            &compressed,
+                            b_config.quantization_step,
+                            last_iframe_bytes,
+                        );
                         diagnostics::print(&d);
 
                         if let Some(ref stg) = diag_twav_staging {
                             let coeffs = self.diag_original_wavelet_coefficients(
-                                ctx, &b_frame_data, padded_w, padded_h, padded_pixels,
-                                &info, config, stg,
+                                ctx,
+                                &b_frame_data,
+                                padded_w,
+                                padded_h,
+                                padded_pixels,
+                                &info,
+                                config,
+                                stg,
                             );
                             if let Some(ref prev) = prev_twav_coeffs {
                                 let y_stats = diagnostics::compute_temporal_wavelet(
-                                    &coeffs[0], &prev[0], padded_w, padded_h,
-                                    config.tile_size, config.wavelet_levels, config.quantization_step,
+                                    &coeffs[0],
+                                    &prev[0],
+                                    padded_w,
+                                    padded_h,
+                                    config.tile_size,
+                                    config.wavelet_levels,
+                                    config.quantization_step,
                                 );
                                 let co_stats = diagnostics::compute_temporal_wavelet(
-                                    &coeffs[1], &prev[1], padded_w, padded_h,
-                                    config.tile_size, config.wavelet_levels, config.quantization_step,
+                                    &coeffs[1],
+                                    &prev[1],
+                                    padded_w,
+                                    padded_h,
+                                    config.tile_size,
+                                    config.wavelet_levels,
+                                    config.quantization_step,
                                 );
                                 let cg_stats = diagnostics::compute_temporal_wavelet(
-                                    &coeffs[2], &prev[2], padded_w, padded_h,
-                                    config.tile_size, config.wavelet_levels, config.quantization_step,
+                                    &coeffs[2],
+                                    &prev[2],
+                                    padded_w,
+                                    padded_h,
+                                    config.tile_size,
+                                    config.wavelet_levels,
+                                    config.quantization_step,
                                 );
                                 diagnostics::print_temporal_wavelet(
-                                    b_display, FrameType::Bidirectional, &y_stats, &co_stats, &cg_stats,
+                                    b_display,
+                                    FrameType::Bidirectional,
+                                    &y_stats,
+                                    &co_stats,
+                                    &cg_stats,
                                 );
                             }
                             prev_twav_coeffs = Some(coeffs);
@@ -417,7 +545,8 @@ impl EncoderPipeline {
 
             // Remainder frames (< group_size) encoded as P-frames
             let rem_start = display_idx + full_groups * group_size;
-            #[allow(clippy::needless_range_loop)] // j used as frame index for load_frame, results, and diagnostics
+            #[allow(clippy::needless_range_loop)]
+            // j used as frame index for load_frame, results, and diagnostics
             for j in rem_start..next_key {
                 let p_config = if let Some(ref rc) = rate_ctrl {
                     let mut cfg = config.clone();
@@ -448,29 +577,59 @@ impl EncoderPipeline {
                     rc.update(p_config.quantization_step, compressed.bpp());
                 }
                 if diag_enabled {
-                    let d = diagnostics::collect(j, &compressed, p_config.quantization_step, last_iframe_bytes);
+                    let d = diagnostics::collect(
+                        j,
+                        &compressed,
+                        p_config.quantization_step,
+                        last_iframe_bytes,
+                    );
                     diagnostics::print(&d);
 
                     if let Some(ref stg) = diag_twav_staging {
                         let coeffs = self.diag_original_wavelet_coefficients(
-                            ctx, &rem_frame_data, padded_w, padded_h, padded_pixels,
-                            &info, config, stg,
+                            ctx,
+                            &rem_frame_data,
+                            padded_w,
+                            padded_h,
+                            padded_pixels,
+                            &info,
+                            config,
+                            stg,
                         );
                         if let Some(ref prev) = prev_twav_coeffs {
                             let y_stats = diagnostics::compute_temporal_wavelet(
-                                &coeffs[0], &prev[0], padded_w, padded_h,
-                                config.tile_size, config.wavelet_levels, config.quantization_step,
+                                &coeffs[0],
+                                &prev[0],
+                                padded_w,
+                                padded_h,
+                                config.tile_size,
+                                config.wavelet_levels,
+                                config.quantization_step,
                             );
                             let co_stats = diagnostics::compute_temporal_wavelet(
-                                &coeffs[1], &prev[1], padded_w, padded_h,
-                                config.tile_size, config.wavelet_levels, config.quantization_step,
+                                &coeffs[1],
+                                &prev[1],
+                                padded_w,
+                                padded_h,
+                                config.tile_size,
+                                config.wavelet_levels,
+                                config.quantization_step,
                             );
                             let cg_stats = diagnostics::compute_temporal_wavelet(
-                                &coeffs[2], &prev[2], padded_w, padded_h,
-                                config.tile_size, config.wavelet_levels, config.quantization_step,
+                                &coeffs[2],
+                                &prev[2],
+                                padded_w,
+                                padded_h,
+                                config.tile_size,
+                                config.wavelet_levels,
+                                config.quantization_step,
                             );
                             diagnostics::print_temporal_wavelet(
-                                j, FrameType::Predicted, &y_stats, &co_stats, &cg_stats,
+                                j,
+                                FrameType::Predicted,
+                                &y_stats,
+                                &co_stats,
+                                &cg_stats,
                             );
                         }
                         prev_twav_coeffs = Some(coeffs);
@@ -573,15 +732,12 @@ impl EncoderPipeline {
                     let raw_input_size = std::mem::size_of_val(frames[i]) as u64;
                     let per_frame_input: Vec<wgpu::Buffer> = (0..group_size)
                         .map(|j| {
-                            let buf = ctx
-                                .device
-                                .create_buffer(&wgpu::BufferDescriptor {
-                                    label: Some(&format!("tw_raw_input_{}", j)),
-                                    size: raw_input_size,
-                                    usage: wgpu::BufferUsages::COPY_SRC
-                                        | wgpu::BufferUsages::COPY_DST,
-                                    mapped_at_creation: false,
-                                });
+                            let buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                                label: Some(&format!("tw_raw_input_{}", j)),
+                                size: raw_input_size,
+                                usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+                                mapped_at_creation: false,
+                            });
                             ctx.queue
                                 .write_buffer(&buf, 0, bytemuck::cast_slice(frames[i + j]));
                             buf
@@ -592,11 +748,11 @@ impl EncoderPipeline {
                     // intermediate buffer races (separate submits can overlap on GPU)
                     {
                         let bufs = self.cached.as_ref().unwrap();
-                        let mut cmd = ctx
-                            .device
-                            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                                label: Some("tw_spatial_all"),
-                            });
+                        let mut cmd =
+                            ctx.device
+                                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                    label: Some("tw_spatial_all"),
+                                });
                         for j in 0..group_size {
                             cmd.copy_buffer_to_buffer(
                                 &per_frame_input[j],
@@ -660,20 +816,25 @@ impl EncoderPipeline {
                     //   buf[2..4] = high L(num_levels-2)
                     //   buf[gop/2..gop] = high L0 (finest)
                     let num_levels = (group_size as f64).log2() as usize;
-                    #[allow(clippy::needless_range_loop)] // p indexes 2nd dim of tw_frame_bufs[frame][p]
+                    #[allow(clippy::needless_range_loop)]
+                    // p indexes 2nd dim of tw_frame_bufs[frame][p]
                     for p in 0..3 {
                         let mut current_count = group_size;
-                        let mut cmd = ctx
-                            .device
-                            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                                label: Some("tw_temporal_haar"),
-                            });
+                        let mut cmd =
+                            ctx.device
+                                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                    label: Some("tw_temporal_haar"),
+                                });
                         for _level in 0..num_levels {
                             let pairs = current_count / 2;
                             // Snapshot inputs to avoid read-after-write aliasing
                             for j in 0..current_count {
                                 cmd.copy_buffer_to_buffer(
-                                    &tw_frame_bufs[j][p], 0, &tw_snapshot[j], 0, plane_size,
+                                    &tw_frame_bufs[j][p],
+                                    0,
+                                    &tw_snapshot[j],
+                                    0,
+                                    plane_size,
                                 );
                             }
                             // Read from snapshot, write directly to tw_frame_bufs
@@ -699,10 +860,7 @@ impl EncoderPipeline {
                         let group_idx = groups.len();
                         let base = i;
                         let end = base + group_size - 1;
-                        eprintln!(
-                            "TW ENC group {} frames [{}..{}]",
-                            group_idx, base, end
-                        );
+                        eprintln!("TW ENC group {} frames [{}..{}]", group_idx, base, end);
                     }
 
                     // 3) Encode low frame from GPU buffer
@@ -751,7 +909,8 @@ impl EncoderPipeline {
                                 sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
                                 let n = sorted.len();
                                 let pct = |p: usize| sorted[(p * n / 100).min(n - 1)];
-                                let all_zero = max_abs < high_cfg.dead_zone * high_cfg.quantization_step;
+                                let all_zero =
+                                    max_abs < high_cfg.dead_zone * high_cfg.quantization_step;
                                 eprintln!(
                                     "  TW L{} H{}: {} tiles  mul p10={:.3} p50={:.3} p90={:.3}  eff_qstep=[{:.2}..{:.2}]  skip={}",
                                     lvl, idx, n, pct(10), pct(50), pct(90),
@@ -834,11 +993,11 @@ impl EncoderPipeline {
                             0,
                             bytemuck::cast_slice(frames[i + j]),
                         );
-                        let mut cmd = ctx
-                            .device
-                            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                                label: Some("tw53_spatial"),
-                            });
+                        let mut cmd =
+                            ctx.device
+                                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                    label: Some("tw53_spatial"),
+                                });
                         self.dispatch_gpu_pad_cached(ctx, &mut cmd, padded_w, padded_h);
                         let bufs = self.cached.as_ref().unwrap();
                         self.color.dispatch(
@@ -907,10 +1066,7 @@ impl EncoderPipeline {
                         let group_idx = groups.len();
                         let base = i;
                         let end = base + group_size - 1;
-                        eprintln!(
-                            "TW53 ENC group {} frames [{}..{}]",
-                            group_idx, base, end
-                        );
+                        eprintln!("TW53 ENC group {} frames [{}..{}]", group_idx, base, end);
                     }
 
                     // 3) Encode lowpass frames (s0, s1) with base qstep
@@ -945,7 +1101,12 @@ impl EncoderPipeline {
                     );
                     let (d0_muls, d0_max_abs) = if config.adaptive_temporal_mul {
                         Self::compute_temporal_tile_muls(
-                            ctx, &tw_out_bufs[2][0], padded_w, padded_h, cfg.tile_size, max_mul,
+                            ctx,
+                            &tw_out_bufs[2][0],
+                            padded_w,
+                            padded_h,
+                            cfg.tile_size,
+                            max_mul,
                         )
                     } else {
                         let tiles_x = padded_w / cfg.tile_size;
@@ -968,7 +1129,12 @@ impl EncoderPipeline {
                     };
                     let (d1_muls, d1_max_abs) = if config.adaptive_temporal_mul {
                         Self::compute_temporal_tile_muls(
-                            ctx, &tw_out_bufs[3][0], padded_w, padded_h, cfg.tile_size, max_mul,
+                            ctx,
+                            &tw_out_bufs[3][0],
+                            padded_w,
+                            padded_h,
+                            cfg.tile_size,
+                            max_mul,
                         )
                     } else {
                         let tiles_x = padded_w / cfg.tile_size;
@@ -1075,7 +1241,11 @@ impl EncoderPipeline {
 
         // Per-stage wall-clock profiling (gated behind GNC_HAAR_PROFILE env var).
         let prof = std::env::var("GNC_HAAR_PROFILE").is_ok();
-        let t_start = if prof { Some(std::time::Instant::now()) } else { None };
+        let t_start = if prof {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
 
         // Skip spatial wavelet + temporal Haar if pre-computed during previous GOP's high_enc.
         // This overlaps ~72ms of GPU compute with the previous GOP's Rice encoding (~100ms),
@@ -1089,7 +1259,11 @@ impl EncoderPipeline {
         let num_levels = (group_size as f64).log2() as usize;
         let (t_after_upload, t_after_spatial, t_after_haar);
         if skip_spatial_haar {
-            let t = if prof { Some(std::time::Instant::now()) } else { None };
+            let t = if prof {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             t_after_upload = t;
             t_after_spatial = t;
             t_after_haar = t;
@@ -1100,11 +1274,16 @@ impl EncoderPipeline {
                 tw.next_gop_pre_uploaded = false; // consume the pre-upload flag
             } else {
                 for (input_buf, frame_data) in tw.per_frame_input.iter().zip(gop_frames.iter()) {
-                    ctx.queue.write_buffer(input_buf, 0, bytemuck::cast_slice(frame_data));
+                    ctx.queue
+                        .write_buffer(input_buf, 0, bytemuck::cast_slice(frame_data));
                 }
             }
 
-            t_after_upload = if prof { Some(std::time::Instant::now()) } else { None };
+            t_after_upload = if prof {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
 
             // 1) Spatial wavelet per frame — single command encoder to prevent
             // intermediate buffer races (separate submits can overlap on GPU)
@@ -1169,10 +1348,16 @@ impl EncoderPipeline {
                     }
                 }
                 ctx.queue.submit(Some(cmd.finish()));
-                if prof { ctx.device.poll(wgpu::Maintain::Wait); }
+                if prof {
+                    ctx.device.poll(wgpu::Maintain::Wait);
+                }
             }
 
-            t_after_spatial = if prof { Some(std::time::Instant::now()) } else { None };
+            t_after_spatial = if prof {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
 
             // 2) Temporal Haar on GPU, per plane — multilevel dyadic decomposition
             #[allow(clippy::needless_range_loop)]
@@ -1187,7 +1372,11 @@ impl EncoderPipeline {
                     let pairs = current_count / 2;
                     for j in 0..current_count {
                         cmd.copy_buffer_to_buffer(
-                            &tw.frame_bufs[j][p], 0, &tw.snapshot[j], 0, plane_size,
+                            &tw.frame_bufs[j][p],
+                            0,
+                            &tw.snapshot[j],
+                            0,
+                            plane_size,
                         );
                     }
                     for pair in 0..pairs {
@@ -1205,10 +1394,16 @@ impl EncoderPipeline {
                     current_count = pairs;
                 }
                 ctx.queue.submit(Some(cmd.finish()));
-                if prof { ctx.device.poll(wgpu::Maintain::Wait); }
+                if prof {
+                    ctx.device.poll(wgpu::Maintain::Wait);
+                }
             }
 
-            t_after_haar = if prof { Some(std::time::Instant::now()) } else { None };
+            t_after_haar = if prof {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
         } // end if !skip_spatial_haar
 
         // 3) Encode low frame from GPU buffer
@@ -1226,7 +1421,11 @@ impl EncoderPipeline {
             padded_pixels,
         );
 
-        let t_after_low_enc = if prof { Some(std::time::Instant::now()) } else { None };
+        let t_after_low_enc = if prof {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
 
         // 4) Encode high frames per level with per-tile adaptive muls.
         //    CfL is disabled for highpass frames (alpha regression unreliable on residuals).
@@ -1290,9 +1489,11 @@ impl EncoderPipeline {
             }
 
             // Single command encoder: all tile_energy_reduce dispatches + copies to staging.
-            let mut cmd = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("tw_tile_energy_reduce_batch"),
-            });
+            let mut cmd = ctx
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("tw_tile_energy_reduce_batch"),
+                });
             for (j, &(buf_idx, _, _)) in hframe_buf_indices.iter().enumerate() {
                 self.dispatch_tile_energy_reduce(
                     ctx,
@@ -1309,18 +1510,24 @@ impl EncoderPipeline {
                 );
                 // Copy tile_muls, tile_energies, and max_abs outputs to staging (CPU-readable)
                 cmd.copy_buffer_to_buffer(
-                    &tw.tile_muls_bufs[j], 0,
-                    &tile_muls_staging[j], 0,
+                    &tw.tile_muls_bufs[j],
+                    0,
+                    &tile_muls_staging[j],
+                    0,
                     tile_muls_bytes.max(4),
                 );
                 cmd.copy_buffer_to_buffer(
-                    &tw.tile_energies_bufs[j], 0,
-                    &tw.tile_energies_staging_bufs[j], 0,
+                    &tw.tile_energies_bufs[j],
+                    0,
+                    &tw.tile_energies_staging_bufs[j],
+                    0,
                     tile_muls_bytes.max(4),
                 );
                 cmd.copy_buffer_to_buffer(
-                    &tw.max_abs_bufs[j], 0,
-                    &tw.max_abs_staging_bufs[j], 0,
+                    &tw.max_abs_bufs[j],
+                    0,
+                    &tw.max_abs_staging_bufs[j],
+                    0,
                     4,
                 );
             }
@@ -1330,17 +1537,22 @@ impl EncoderPipeline {
             let (tx, rx) = std::sync::mpsc::channel();
             for (j, muls_stg) in tile_muls_staging.iter().enumerate() {
                 let tx2 = tx.clone();
-                muls_stg
-                    .slice(..)
-                    .map_async(wgpu::MapMode::Read, move |r| { tx2.send(('m', j, r)).unwrap(); });
+                muls_stg.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+                    tx2.send(('m', j, r)).unwrap();
+                });
                 let tx3 = tx.clone();
-                tw.tile_energies_staging_bufs[j]
-                    .slice(..)
-                    .map_async(wgpu::MapMode::Read, move |r| { tx3.send(('e', j, r)).unwrap(); });
+                tw.tile_energies_staging_bufs[j].slice(..).map_async(
+                    wgpu::MapMode::Read,
+                    move |r| {
+                        tx3.send(('e', j, r)).unwrap();
+                    },
+                );
                 let tx4 = tx.clone();
                 tw.max_abs_staging_bufs[j]
                     .slice(..)
-                    .map_async(wgpu::MapMode::Read, move |r| { tx4.send(('x', j, r)).unwrap(); });
+                    .map_async(wgpu::MapMode::Read, move |r| {
+                        tx4.send(('x', j, r)).unwrap();
+                    });
             }
             drop(tx);
             ctx.device.poll(wgpu::Maintain::Wait);
@@ -1353,14 +1565,18 @@ impl EncoderPipeline {
             let mut results: Vec<(Vec<f32>, Vec<f32>, f32)> = Vec::with_capacity(n);
             for (j, muls_stg) in tile_muls_staging.iter().enumerate() {
                 let muls_view = muls_stg.slice(..).get_mapped_range();
-                let muls: Vec<f32> = bytemuck::cast_slice::<u8, f32>(&muls_view[..tile_muls_bytes as usize])
-                    .to_vec();
+                let muls: Vec<f32> =
+                    bytemuck::cast_slice::<u8, f32>(&muls_view[..tile_muls_bytes as usize])
+                        .to_vec();
                 drop(muls_view);
                 muls_stg.unmap();
 
-                let energies_view = tw.tile_energies_staging_bufs[j].slice(..).get_mapped_range();
-                let energies: Vec<f32> = bytemuck::cast_slice::<u8, f32>(&energies_view[..tile_muls_bytes as usize])
-                    .to_vec();
+                let energies_view = tw.tile_energies_staging_bufs[j]
+                    .slice(..)
+                    .get_mapped_range();
+                let energies: Vec<f32> =
+                    bytemuck::cast_slice::<u8, f32>(&energies_view[..tile_muls_bytes as usize])
+                        .to_vec();
                 drop(energies_view);
                 tw.tile_energies_staging_bufs[j].unmap();
 
@@ -1381,7 +1597,11 @@ impl EncoderPipeline {
             vec![(vec![max_mul; n_tiles], vec![0.0f32; n_tiles], f32::MAX); total_high_frames]
         };
 
-        let t_after_aq = if prof { Some(std::time::Instant::now()) } else { None };
+        let t_after_aq = if prof {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
 
         let mut hframe_infos: Vec<HighFrameInfo> = Vec::with_capacity(total_high_frames);
         for (i, &(buf_idx, lvl, idx)) in hframe_buf_indices.iter().enumerate() {
@@ -1405,7 +1625,12 @@ impl EncoderPipeline {
                 );
             }
             let is_zero = max_abs < high_cfg.dead_zone * high_cfg.quantization_step;
-            hframe_infos.push(HighFrameInfo { tile_muls, buf_idx, is_zero, wm_data: None });
+            hframe_infos.push(HighFrameInfo {
+                tile_muls,
+                buf_idx,
+                is_zero,
+                wm_data: None,
+            });
         }
 
         // --- Pass B: Expand weight maps for non-zero frames (CPU work, no GPU sync) ---
@@ -1459,7 +1684,8 @@ impl EncoderPipeline {
             use wgpu::util::DeviceExt;
 
             let num_tiles = (info.tiles_x() * info.tiles_y()) as usize;
-            self.gpu_rice_encoder.prepare_batch_staging(ctx, num_tiles, info.tile_size, batch_size);
+            self.gpu_rice_encoder
+                .prepare_batch_staging(ctx, num_tiles, info.tile_size, batch_size);
             // Write params_buf ONCE before the batch loop.  On Metal/wgpu write_buffer is
             // staged: only the last write before queue.submit takes effect.  All high frames
             // in a GOP share the same FrameInfo (same tile layout, same wavelet_levels),
@@ -1476,16 +1702,21 @@ impl EncoderPipeline {
             let mut wm_bufs: Vec<wgpu::Buffer> = Vec::with_capacity(batch_size);
             for &fi in &non_zero_frames {
                 let expanded = hframe_infos[fi].wm_data.as_ref().unwrap();
-                wm_bufs.push(ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("tw_aq_weight_map_batch"),
-                    contents: bytemuck::cast_slice(expanded),
-                    usage: wgpu::BufferUsages::STORAGE,
-                }));
+                wm_bufs.push(
+                    ctx.device
+                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("tw_aq_weight_map_batch"),
+                            contents: bytemuck::cast_slice(expanded),
+                            usage: wgpu::BufferUsages::STORAGE,
+                        }),
+                );
             }
 
-            let mut cmd = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("tw_high_frames_batch"),
-            });
+            let mut cmd = ctx
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("tw_high_frames_batch"),
+                });
 
             for (slot, &fi) in non_zero_frames.iter().enumerate() {
                 let hf = &hframe_infos[fi];
@@ -1496,22 +1727,32 @@ impl EncoderPipeline {
                 ];
 
                 let wm_buf = &wm_bufs[slot];
-                let wm_param = Some((
-                    wm_buf as &wgpu::Buffer,
-                    ll_block_size,
-                    ll_bx,
-                    tiles_x,
-                ));
+                let wm_param = Some((wm_buf as &wgpu::Buffer, ll_block_size, ll_bx, tiles_x));
 
                 // Quantize 3 planes (non-CfL path: just dispatch_adaptive for each)
                 for p in 0..3 {
-                    let weights = if p == 0 { &weights_luma } else { &weights_chroma };
+                    let weights = if p == 0 {
+                        &weights_luma
+                    } else {
+                        &weights_chroma
+                    };
                     cmd.copy_buffer_to_buffer(plane_bufs[p], 0, &bufs.plane_c, 0, plane_size);
                     self.quantize.dispatch_adaptive(
-                        ctx, &mut cmd, &bufs.plane_c, quant_dests[p],
-                        padded_pixels as u32, high_cfg.quantization_step, high_cfg.dead_zone,
-                        true, padded_w, padded_h, high_cfg.tile_size, high_cfg.wavelet_levels,
-                        weights, wm_param, 0.0,
+                        ctx,
+                        &mut cmd,
+                        &bufs.plane_c,
+                        quant_dests[p],
+                        padded_pixels as u32,
+                        high_cfg.quantization_step,
+                        high_cfg.dead_zone,
+                        true,
+                        padded_w,
+                        padded_h,
+                        high_cfg.tile_size,
+                        high_cfg.wavelet_levels,
+                        weights,
+                        wm_param,
+                        0.0,
                     );
                 }
 
@@ -1540,47 +1781,76 @@ impl EncoderPipeline {
                 let mut tw_b = self.tw_cached_b.take().unwrap();
                 // Write next GOP's frames to tw_b.per_frame_input (staged; consumed at submit).
                 for (input_buf, frame_data) in tw_b.per_frame_input.iter().zip(next_frames.iter()) {
-                    ctx.queue.write_buffer(input_buf, 0, bytemuck::cast_slice(frame_data));
+                    ctx.queue
+                        .write_buffer(input_buf, 0, bytemuck::cast_slice(frame_data));
                 }
                 // Build single command encoder: spatial_wl + temporal_haar for next GOP.
                 // Both stages share intermediate sp_b buffers and write to tw_b.frame_bufs.
                 {
                     let sp_b = self.sp_cached_b.as_ref().unwrap();
                     let pad_params = &self.cached.as_ref().unwrap().pad_params_buf;
-                    let mut cmd_pre = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                        label: Some("tw_precompute_spatial_haar"),
-                    });
+                    let mut cmd_pre =
+                        ctx.device
+                            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                label: Some("tw_precompute_spatial_haar"),
+                            });
                     // Spatial wavelet for all frames into tw_b.frame_bufs
                     for j in 0..group_size {
                         cmd_pre.copy_buffer_to_buffer(
-                            &tw_b.per_frame_input[j], 0, &sp_b.raw_input_buf, 0, raw_input_size,
+                            &tw_b.per_frame_input[j],
+                            0,
+                            &sp_b.raw_input_buf,
+                            0,
+                            raw_input_size,
                         );
                         self.dispatch_gpu_pad_with(
-                            ctx, &mut cmd_pre,
-                            pad_params, &sp_b.raw_input_buf, &sp_b.input_buf,
-                            padded_w, padded_h,
+                            ctx,
+                            &mut cmd_pre,
+                            pad_params,
+                            &sp_b.raw_input_buf,
+                            &sp_b.input_buf,
+                            padded_w,
+                            padded_h,
                         );
                         self.color.dispatch(
-                            ctx, &mut cmd_pre,
-                            &sp_b.input_buf, &sp_b.color_out,
-                            padded_w, padded_h, true, cfg.is_lossless(),
+                            ctx,
+                            &mut cmd_pre,
+                            &sp_b.input_buf,
+                            &sp_b.color_out,
+                            padded_w,
+                            padded_h,
+                            true,
+                            cfg.is_lossless(),
                         );
                         self.deinterleaver.dispatch(
-                            ctx, &mut cmd_pre,
-                            &sp_b.color_out, &sp_b.plane_a, &sp_b.co_plane, &sp_b.cg_plane,
+                            ctx,
+                            &mut cmd_pre,
+                            &sp_b.color_out,
+                            &sp_b.plane_a,
+                            &sp_b.co_plane,
+                            &sp_b.cg_plane,
                             padded_pixels as u32,
                         );
                         let planes_b: [&wgpu::Buffer; 3] =
                             [&sp_b.plane_a, &sp_b.co_plane, &sp_b.cg_plane];
                         for (p, &cur_plane) in planes_b.iter().enumerate() {
                             self.transform.forward(
-                                ctx, &mut cmd_pre,
-                                cur_plane, &sp_b.plane_b, &sp_b.plane_c,
-                                &info, cfg.wavelet_levels, cfg.wavelet_type,
+                                ctx,
+                                &mut cmd_pre,
+                                cur_plane,
+                                &sp_b.plane_b,
+                                &sp_b.plane_c,
+                                &info,
+                                cfg.wavelet_levels,
+                                cfg.wavelet_type,
                                 p,
                             );
                             cmd_pre.copy_buffer_to_buffer(
-                                &sp_b.plane_c, 0, &tw_b.frame_bufs[j][p], 0, plane_size,
+                                &sp_b.plane_c,
+                                0,
+                                &tw_b.frame_bufs[j][p],
+                                0,
+                                plane_size,
                             );
                         }
                     }
@@ -1592,15 +1862,23 @@ impl EncoderPipeline {
                             let pairs = current_count / 2;
                             for j in 0..current_count {
                                 cmd_pre.copy_buffer_to_buffer(
-                                    &tw_b.frame_bufs[j][p], 0, &tw_b.snapshot[j], 0, plane_size,
+                                    &tw_b.frame_bufs[j][p],
+                                    0,
+                                    &tw_b.snapshot[j],
+                                    0,
+                                    plane_size,
                                 );
                             }
                             for pair in 0..pairs {
                                 self.temporal_haar.dispatch(
-                                    ctx, &mut cmd_pre,
-                                    &tw_b.snapshot[pair * 2], &tw_b.snapshot[pair * 2 + 1],
-                                    &tw_b.frame_bufs[pair][p], &tw_b.frame_bufs[pairs + pair][p],
-                                    padded_pixels as u32, true,
+                                    ctx,
+                                    &mut cmd_pre,
+                                    &tw_b.snapshot[pair * 2],
+                                    &tw_b.snapshot[pair * 2 + 1],
+                                    &tw_b.frame_bufs[pair][p],
+                                    &tw_b.frame_bufs[pairs + pair][p],
+                                    padded_pixels as u32,
+                                    true,
                                 );
                             }
                             current_count = pairs;
@@ -1668,16 +1946,24 @@ impl EncoderPipeline {
             }
         }
 
-        let t_after_high_enc = if prof { Some(std::time::Instant::now()) } else { None };
+        let t_after_high_enc = if prof {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
 
         // Ping-pong buffer swap for GOP pipelining:
         // If we pre-computed next GOP's spatial+haar into tw_b, promote tw_b → tw_cached
         // (ready for next call) and recycle tw (done) → tw_cached_b (for next pre-compute).
         // If no pre-compute happened (last GOP or no next_gop_frames), keep tw as tw_cached.
-        if self.tw_cached_b.as_ref().is_some_and(|b| b.spatial_haar_precomputed) {
+        if self
+            .tw_cached_b
+            .as_ref()
+            .is_some_and(|b| b.spatial_haar_precomputed)
+        {
             let tw_b = self.tw_cached_b.take().unwrap();
-            self.tw_cached_b = Some(tw);      // recycle current A → becomes next B slot
-            self.tw_cached = Some(tw_b);       // pre-computed B → becomes next A (current)
+            self.tw_cached_b = Some(tw); // recycle current A → becomes next B slot
+            self.tw_cached = Some(tw_b); // pre-computed B → becomes next A (current)
         } else {
             self.tw_cached = Some(tw);
         }
@@ -1694,21 +1980,20 @@ impl EncoderPipeline {
             let ms = |a: std::time::Instant, b: std::time::Instant| -> f64 {
                 b.duration_since(a).as_secs_f64() * 1000.0
             };
-            let upload_ms    = ms(t0, t1);
-            let spatial_ms   = ms(t1, t2);
-            let haar_ms      = ms(t2, t3);
-            let low_enc_ms   = ms(t3, t4);
-            let aq_ms        = ms(t4, t5);
-            let high_enc_ms  = ms(t5, t6);
-            let total_ms     = ms(t0, t6);
-            let other_ms     = total_ms - upload_ms - spatial_ms - haar_ms
-                               - low_enc_ms - aq_ms - high_enc_ms;
+            let upload_ms = ms(t0, t1);
+            let spatial_ms = ms(t1, t2);
+            let haar_ms = ms(t2, t3);
+            let low_enc_ms = ms(t3, t4);
+            let aq_ms = ms(t4, t5);
+            let high_enc_ms = ms(t5, t6);
+            let total_ms = ms(t0, t6);
+            let other_ms =
+                total_ms - upload_ms - spatial_ms - haar_ms - low_enc_ms - aq_ms - high_enc_ms;
             eprintln!(
                 "[HAAR_PROF] upload={:.1}ms spatial_wl={:.1}ms temporal_haar={:.1}ms \
                  low_enc={:.1}ms aq_readback={:.1}ms high_enc={:.1}ms \
                  other={:.1}ms TOTAL={:.1}ms",
-                upload_ms, spatial_ms, haar_ms, low_enc_ms, aq_ms, high_enc_ms,
-                other_ms, total_ms,
+                upload_ms, spatial_ms, haar_ms, low_enc_ms, aq_ms, high_enc_ms, other_ms, total_ms,
             );
         }
 
@@ -1735,11 +2020,20 @@ impl EncoderPipeline {
         next_gop_frames: Option<&[&[f32]]>,
     ) -> TemporalGroup {
         match mode {
-            TemporalTransform::Haar => {
-                self.encode_temporal_wavelet_gop_haar(ctx, gop_frames, width, height, config, next_gop_frames)
-            }
+            TemporalTransform::Haar => self.encode_temporal_wavelet_gop_haar(
+                ctx,
+                gop_frames,
+                width,
+                height,
+                config,
+                next_gop_frames,
+            ),
             TemporalTransform::LeGall53 => {
-                assert_eq!(gop_frames.len(), 4, "LeGall53 requires exactly 4 frames per GOP");
+                assert_eq!(
+                    gop_frames.len(),
+                    4,
+                    "LeGall53 requires exactly 4 frames per GOP"
+                );
                 // Use encode_sequence_temporal_wavelet with a 4-frame slice
                 let seq = self.encode_sequence_temporal_wavelet(
                     ctx, gop_frames, width, height, config, mode, 4,
@@ -1981,19 +2275,18 @@ impl EncoderPipeline {
                 let c_padded_h = p_info.padded_height();
                 let up_dst = if p == 1 { &bufs.mc_out } else { &bufs.plane_b };
                 self.chroma_up.dispatch_upsample(
-                    ctx, &mut cmd,
-                    &bufs.plane_a, up_dst,
-                    c_padded_w, c_padded_h,
-                    padded_w, padded_h,
-                    chroma_shift_x, chroma_shift_y,
-                );
-                cmd.copy_buffer_to_buffer(
+                    ctx,
+                    &mut cmd,
+                    &bufs.plane_a,
                     up_dst,
-                    0,
-                    &bufs.gpu_ref_planes[p],
-                    0,
-                    luma_plane_size,
+                    c_padded_w,
+                    c_padded_h,
+                    padded_w,
+                    padded_h,
+                    chroma_shift_x,
+                    chroma_shift_y,
                 );
+                cmd.copy_buffer_to_buffer(up_dst, 0, &bufs.gpu_ref_planes[p], 0, luma_plane_size);
             } else {
                 cmd.copy_buffer_to_buffer(
                     &bufs.plane_a,
@@ -2098,7 +2391,8 @@ impl EncoderPipeline {
         };
         let chroma_shift_x = info.chroma_format.horiz_shift();
         let chroma_shift_y = info.chroma_format.vert_shift();
-        let (chroma_padded_w, chroma_padded_h, chroma_pixels) = if let Some(ref ci) = chroma_info_pf {
+        let (chroma_padded_w, chroma_padded_h, chroma_pixels) = if let Some(ref ci) = chroma_info_pf
+        {
             let cpw = ci.padded_width();
             let cph = ci.padded_height();
             (cpw, cph, (cpw * cph) as usize)
@@ -2197,10 +2491,15 @@ impl EncoderPipeline {
             if profile {
                 ctx.queue.submit(Some(cmd.finish()));
                 ctx.device.poll(wgpu::Maintain::Wait);
-                eprintln!("    P preprocess: {:.1}ms", _t_pf.elapsed().as_secs_f64() * 1000.0);
-                cmd = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("pf_me"),
-                });
+                eprintln!(
+                    "    P preprocess: {:.1}ms",
+                    _t_pf.elapsed().as_secs_f64() * 1000.0
+                );
+                cmd = ctx
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("pf_me"),
+                    });
             }
 
             let _t_me = std::time::Instant::now();
@@ -2243,10 +2542,15 @@ impl EncoderPipeline {
             if profile {
                 ctx.queue.submit(Some(cmd.finish()));
                 ctx.device.poll(wgpu::Maintain::Wait);
-                eprintln!("    P ME+split: {:.1}ms", _t_me.elapsed().as_secs_f64() * 1000.0);
-                cmd = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("pf_mcwq"),
-                });
+                eprintln!(
+                    "    P ME+split: {:.1}ms",
+                    _t_me.elapsed().as_secs_f64() * 1000.0
+                );
+                cmd = ctx
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("pf_mcwq"),
+                    });
             }
 
             let _t_mcwq = std::time::Instant::now();
@@ -2256,9 +2560,13 @@ impl EncoderPipeline {
             // For 4:2:2 and 4:4:4, this is skipped (luma-domain MC used instead).
             if is_420 {
                 self.motion.dispatch_mv_scale(
-                    ctx, &mut cmd,
-                    &split_mv_buf, &bufs.mv_chroma_buf,
-                    bufs.split_total_blocks, chroma_shift_x, chroma_shift_y,
+                    ctx,
+                    &mut cmd,
+                    &split_mv_buf,
+                    &bufs.mv_chroma_buf,
+                    bufs.split_total_blocks,
+                    chroma_shift_x,
+                    chroma_shift_y,
                 );
             }
 
@@ -2296,35 +2604,51 @@ impl EncoderPipeline {
                     // Property: box_filter(NN_upsample(ref_chroma)) = ref_chroma, so after
                     // local decode stores NN_upsample(recon_chroma) back to gpu_ref_planes[p],
                     // box_filter always recovers the correct chroma-resolution reference.
-                    let chroma_ds_buf = if p == 1 { &bufs.co_plane_ds } else { &bufs.cg_plane_ds };
+                    let chroma_ds_buf = if p == 1 {
+                        &bufs.co_plane_ds
+                    } else {
+                        &bufs.cg_plane_ds
+                    };
                     let ci = chroma_info_pf.as_ref().unwrap();
 
                     // Step 1: box-filter current luma-sized chroma plane → chroma dims
                     self.chroma_down.dispatch(
-                        ctx, &mut cmd,
-                        cur_plane, chroma_ds_buf,
-                        padded_w, padded_h,
-                        chroma_shift_x, chroma_shift_y,
-                        chroma_padded_w, chroma_padded_h,
+                        ctx,
+                        &mut cmd,
+                        cur_plane,
+                        chroma_ds_buf,
+                        padded_w,
+                        padded_h,
+                        chroma_shift_x,
+                        chroma_shift_y,
+                        chroma_padded_w,
+                        chroma_padded_h,
                     );
                     // Step 2: box-filter luma-sized reference → chroma dims → plane_c (scratch)
                     // plane_c is free here (wavelet hasn't run yet for this plane).
                     self.chroma_down.dispatch(
-                        ctx, &mut cmd,
-                        &bufs.gpu_ref_planes[p], &bufs.plane_c,
-                        padded_w, padded_h,
-                        chroma_shift_x, chroma_shift_y,
-                        chroma_padded_w, chroma_padded_h,
+                        ctx,
+                        &mut cmd,
+                        &bufs.gpu_ref_planes[p],
+                        &bufs.plane_c,
+                        padded_w,
+                        padded_h,
+                        chroma_shift_x,
+                        chroma_shift_y,
+                        chroma_padded_w,
+                        chroma_padded_h,
                     );
                     // Step 3: MC at chroma dims — residual = cur_chroma - warp(ref_chroma)
                     // Output goes to mc_out (luma-sized buf; first chroma_pixels elements used).
                     self.motion.compensate_cached(
-                        ctx, &mut cmd,
+                        ctx,
+                        &mut cmd,
                         chroma_ds_buf,       // current chroma (box-filtered)
                         &bufs.plane_c,       // reference chroma (box-filtered)
                         &bufs.mv_chroma_buf, // scaled chroma MVs
                         &bufs.mc_out,        // residual output (chroma-sized, luma buf reused)
-                        chroma_padded_w, chroma_padded_h,
+                        chroma_padded_w,
+                        chroma_padded_h,
                         &bufs.mc_fwd_params_chroma420,
                     );
 
@@ -2336,60 +2660,105 @@ impl EncoderPipeline {
 
                     // Step 4: wavelet at chroma dims: mc_out → plane_b(temp) → plane_c
                     self.transform.forward(
-                        ctx, &mut cmd,
-                        &bufs.mc_out, &bufs.plane_b, &bufs.plane_c,
-                        ci, config.wavelet_levels, config.wavelet_type, p,
+                        ctx,
+                        &mut cmd,
+                        &bufs.mc_out,
+                        &bufs.plane_b,
+                        &bufs.plane_c,
+                        ci,
+                        config.wavelet_levels,
+                        config.wavelet_type,
+                        p,
                     );
                     self.quantize.dispatch(
-                        ctx, &mut cmd,
-                        &bufs.plane_c, quant_out,
+                        ctx,
+                        &mut cmd,
+                        &bufs.plane_c,
+                        quant_out,
                         chroma_pixels as u32,
-                        config.quantization_step, res_dead_zone, true,
-                        chroma_padded_w, chroma_padded_h,
-                        config.tile_size, config.wavelet_levels, weights,
+                        config.quantization_step,
+                        res_dead_zone,
+                        true,
+                        chroma_padded_w,
+                        chroma_padded_h,
+                        config.tile_size,
+                        config.wavelet_levels,
+                        weights,
                     );
                 } else if p > 0 && is_non_444 {
                     // 4:2:2 chroma: keep luma-domain MC (non-square block grid makes
                     // chroma-domain MC harder; the 1D NN pattern is less severe).
                     self.motion.compensate_cached(
-                        ctx, &mut cmd,
-                        cur_plane, &bufs.gpu_ref_planes[p],
-                        &split_mv_buf, &bufs.mc_out,
-                        padded_w, padded_h, &bufs.mc_fwd_params_8,
+                        ctx,
+                        &mut cmd,
+                        cur_plane,
+                        &bufs.gpu_ref_planes[p],
+                        &split_mv_buf,
+                        &bufs.mc_out,
+                        padded_w,
+                        padded_h,
+                        &bufs.mc_fwd_params_8,
                     );
                     // Diagnostics
                     if let Some(ref stg) = diag_residual_staging {
                         cmd.copy_buffer_to_buffer(&bufs.mc_out, 0, &stg[p], 0, plane_size);
                     }
-                    let chroma_ds_buf = if p == 1 { &bufs.co_plane_ds } else { &bufs.cg_plane_ds };
+                    let chroma_ds_buf = if p == 1 {
+                        &bufs.co_plane_ds
+                    } else {
+                        &bufs.cg_plane_ds
+                    };
                     let ci = chroma_info_pf.as_ref().unwrap();
                     self.chroma_down.dispatch(
-                        ctx, &mut cmd,
-                        &bufs.mc_out, chroma_ds_buf,
-                        padded_w, padded_h,
-                        chroma_shift_x, chroma_shift_y,
-                        chroma_padded_w, chroma_padded_h,
+                        ctx,
+                        &mut cmd,
+                        &bufs.mc_out,
+                        chroma_ds_buf,
+                        padded_w,
+                        padded_h,
+                        chroma_shift_x,
+                        chroma_shift_y,
+                        chroma_padded_w,
+                        chroma_padded_h,
                     );
                     self.transform.forward(
-                        ctx, &mut cmd,
-                        chroma_ds_buf, &bufs.plane_b, &bufs.plane_c,
-                        ci, config.wavelet_levels, config.wavelet_type, p,
+                        ctx,
+                        &mut cmd,
+                        chroma_ds_buf,
+                        &bufs.plane_b,
+                        &bufs.plane_c,
+                        ci,
+                        config.wavelet_levels,
+                        config.wavelet_type,
+                        p,
                     );
                     self.quantize.dispatch(
-                        ctx, &mut cmd,
-                        &bufs.plane_c, quant_out,
+                        ctx,
+                        &mut cmd,
+                        &bufs.plane_c,
+                        quant_out,
                         chroma_pixels as u32,
-                        config.quantization_step, res_dead_zone, true,
-                        chroma_padded_w, chroma_padded_h,
-                        config.tile_size, config.wavelet_levels, weights,
+                        config.quantization_step,
+                        res_dead_zone,
+                        true,
+                        chroma_padded_w,
+                        chroma_padded_h,
+                        config.tile_size,
+                        config.wavelet_levels,
+                        weights,
                     );
                 } else {
                     // Luma (all modes) or 4:4:4 chroma: MC at luma dims
                     self.motion.compensate_cached(
-                        ctx, &mut cmd,
-                        cur_plane, &bufs.gpu_ref_planes[p],
-                        &split_mv_buf, &bufs.mc_out,
-                        padded_w, padded_h, &bufs.mc_fwd_params_8,
+                        ctx,
+                        &mut cmd,
+                        cur_plane,
+                        &bufs.gpu_ref_planes[p],
+                        &split_mv_buf,
+                        &bufs.mc_out,
+                        padded_w,
+                        padded_h,
+                        &bufs.mc_fwd_params_8,
                     );
                     // Diagnostics: copy per-channel residual before wavelet overwrites mc_out
                     if let Some(ref stg) = diag_residual_staging {
@@ -2397,17 +2766,30 @@ impl EncoderPipeline {
                     }
                     // Wavelet at luma dims
                     self.transform.forward(
-                        ctx, &mut cmd,
-                        &bufs.mc_out, &bufs.plane_b, &bufs.plane_c,
-                        info, config.wavelet_levels, config.wavelet_type, p,
+                        ctx,
+                        &mut cmd,
+                        &bufs.mc_out,
+                        &bufs.plane_b,
+                        &bufs.plane_c,
+                        info,
+                        config.wavelet_levels,
+                        config.wavelet_type,
+                        p,
                     );
                     self.quantize.dispatch(
-                        ctx, &mut cmd,
-                        &bufs.plane_c, quant_out,
+                        ctx,
+                        &mut cmd,
+                        &bufs.plane_c,
+                        quant_out,
                         padded_pixels as u32,
-                        config.quantization_step, res_dead_zone, true,
-                        padded_w, padded_h,
-                        config.tile_size, config.wavelet_levels, weights,
+                        config.quantization_step,
+                        res_dead_zone,
+                        true,
+                        padded_w,
+                        padded_h,
+                        config.tile_size,
+                        config.wavelet_levels,
+                        weights,
                     );
                 }
             }
@@ -2416,11 +2798,19 @@ impl EncoderPipeline {
             if profile {
                 ctx.queue.submit(Some(cmd.finish()));
                 ctx.device.poll(wgpu::Maintain::Wait);
-                eprintln!("    P MC+wavelet+quant: {:.1}ms", _t_mcwq.elapsed().as_secs_f64() * 1000.0);
-                eprintln!("    P fwd total: {:.1}ms", _t_pf.elapsed().as_secs_f64() * 1000.0);
-                cmd = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("pf_entropy"),
-                });
+                eprintln!(
+                    "    P MC+wavelet+quant: {:.1}ms",
+                    _t_mcwq.elapsed().as_secs_f64() * 1000.0
+                );
+                eprintln!(
+                    "    P fwd total: {:.1}ms",
+                    _t_pf.elapsed().as_secs_f64() * 1000.0
+                );
+                cmd = ctx
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("pf_entropy"),
+                    });
             }
 
             // Phase 2: GPU entropy encode dispatches + staging copies (same cmd encoder)
@@ -2452,10 +2842,15 @@ impl EncoderPipeline {
                 ctx.queue.submit(Some(cmd.finish()));
                 ctx.device.poll(wgpu::Maintain::Wait);
                 _t_after_entropy = _t_pf.elapsed();
-                eprintln!("    P entropy+stg: {:.1}ms", _t_after_entropy.as_secs_f64() * 1000.0);
-                cmd = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("pf_local_decode"),
-                });
+                eprintln!(
+                    "    P entropy+stg: {:.1}ms",
+                    _t_after_entropy.as_secs_f64() * 1000.0
+                );
+                cmd = ctx
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("pf_local_decode"),
+                    });
             } else {
                 _t_after_entropy = std::time::Duration::ZERO;
             }
@@ -2489,115 +2884,209 @@ impl EncoderPipeline {
                         // NOTE: plane_b must NOT be used as scratch when p=1, because Cg
                         // quantized data (quant_bufs[2]) is stored in plane_b.
                         let ci = chroma_info_pf.as_ref().unwrap();
-                        let chroma_scratch = if p == 1 { &bufs.co_plane_ds } else { &bufs.cg_plane_ds };
+                        let chroma_scratch = if p == 1 {
+                            &bufs.co_plane_ds
+                        } else {
+                            &bufs.cg_plane_ds
+                        };
                         // Step 1: dequant
                         self.quantize.dispatch(
-                            ctx, &mut cmd,
-                            quant_buf, chroma_scratch,
+                            ctx,
+                            &mut cmd,
+                            quant_buf,
+                            chroma_scratch,
                             chroma_pixels as u32,
-                            config.quantization_step, res_dead_zone, false,
-                            chroma_padded_w, chroma_padded_h,
-                            config.tile_size, config.wavelet_levels, weights,
+                            config.quantization_step,
+                            res_dead_zone,
+                            false,
+                            chroma_padded_w,
+                            chroma_padded_h,
+                            config.tile_size,
+                            config.wavelet_levels,
+                            weights,
                         );
                         // Step 2: inverse wavelet at chroma dims → plane_a
                         self.transform.inverse(
-                            ctx, &mut cmd,
-                            chroma_scratch, &bufs.cg_plane, &bufs.plane_a,
-                            ci, config.wavelet_levels, config.wavelet_type, p,
+                            ctx,
+                            &mut cmd,
+                            chroma_scratch,
+                            &bufs.cg_plane,
+                            &bufs.plane_a,
+                            ci,
+                            config.wavelet_levels,
+                            config.wavelet_type,
+                            p,
                         );
                         // Step 3: box-filter luma-sized reference → mc_out (chroma dims)
                         // mc_out is luma-sized; chroma_down writes only chroma_pixels elements.
                         self.chroma_down.dispatch(
-                            ctx, &mut cmd,
-                            &bufs.gpu_ref_planes[p], &bufs.mc_out,
-                            padded_w, padded_h,
-                            chroma_shift_x, chroma_shift_y,
-                            chroma_padded_w, chroma_padded_h,
+                            ctx,
+                            &mut cmd,
+                            &bufs.gpu_ref_planes[p],
+                            &bufs.mc_out,
+                            padded_w,
+                            padded_h,
+                            chroma_shift_x,
+                            chroma_shift_y,
+                            chroma_padded_w,
+                            chroma_padded_h,
                         );
                         // Step 4: inverse MC at chroma dims: plane_a (residual) + warp(mc_out) → chroma_scratch
                         // chroma_scratch is free: dequant (step 1) and inv-wavelet (step 2) already consumed it.
                         self.motion.compensate_cached(
-                            ctx, &mut cmd,
-                            &bufs.plane_a, &bufs.mc_out,
-                            &bufs.mv_chroma_buf, chroma_scratch,
-                            chroma_padded_w, chroma_padded_h,
+                            ctx,
+                            &mut cmd,
+                            &bufs.plane_a,
+                            &bufs.mc_out,
+                            &bufs.mv_chroma_buf,
+                            chroma_scratch,
+                            chroma_padded_w,
+                            chroma_padded_h,
                             &bufs.mc_inv_params_chroma420,
                         );
                         // Step 5: NN-upsample chroma reconstruction → recon_out (luma dims)
                         self.chroma_up.dispatch_upsample(
-                            ctx, &mut cmd,
-                            chroma_scratch, &bufs.recon_out,
-                            chroma_padded_w, chroma_padded_h,
-                            padded_w, padded_h,
-                            chroma_shift_x, chroma_shift_y,
+                            ctx,
+                            &mut cmd,
+                            chroma_scratch,
+                            &bufs.recon_out,
+                            chroma_padded_w,
+                            chroma_padded_h,
+                            padded_w,
+                            padded_h,
+                            chroma_shift_x,
+                            chroma_shift_y,
                         );
                         // Step 6: store luma-sized recon in gpu_ref_planes for next frame
                         cmd.copy_buffer_to_buffer(
-                            &bufs.recon_out, 0, &bufs.gpu_ref_planes[p], 0, plane_size,
+                            &bufs.recon_out,
+                            0,
+                            &bufs.gpu_ref_planes[p],
+                            0,
+                            plane_size,
                         );
                     } else if p > 0 && is_non_444 {
                         // 4:2:2 chroma local decode: luma-domain MC (unchanged from original).
                         let ci = chroma_info_pf.as_ref().unwrap();
-                        let chroma_scratch = if p == 1 { &bufs.co_plane_ds } else { &bufs.cg_plane_ds };
+                        let chroma_scratch = if p == 1 {
+                            &bufs.co_plane_ds
+                        } else {
+                            &bufs.cg_plane_ds
+                        };
                         self.quantize.dispatch(
-                            ctx, &mut cmd,
-                            quant_buf, chroma_scratch,
+                            ctx,
+                            &mut cmd,
+                            quant_buf,
+                            chroma_scratch,
                             chroma_pixels as u32,
-                            config.quantization_step, res_dead_zone, false,
-                            chroma_padded_w, chroma_padded_h,
-                            config.tile_size, config.wavelet_levels, weights,
+                            config.quantization_step,
+                            res_dead_zone,
+                            false,
+                            chroma_padded_w,
+                            chroma_padded_h,
+                            config.tile_size,
+                            config.wavelet_levels,
+                            weights,
                         );
                         self.transform.inverse(
-                            ctx, &mut cmd,
-                            chroma_scratch, &bufs.cg_plane, &bufs.plane_a,
-                            ci, config.wavelet_levels, config.wavelet_type, p,
+                            ctx,
+                            &mut cmd,
+                            chroma_scratch,
+                            &bufs.cg_plane,
+                            &bufs.plane_a,
+                            ci,
+                            config.wavelet_levels,
+                            config.wavelet_type,
+                            p,
                         );
                         self.chroma_up.dispatch_upsample(
-                            ctx, &mut cmd,
-                            &bufs.plane_a, &bufs.mc_out,
-                            chroma_padded_w, chroma_padded_h,
-                            padded_w, padded_h,
-                            chroma_shift_x, chroma_shift_y,
+                            ctx,
+                            &mut cmd,
+                            &bufs.plane_a,
+                            &bufs.mc_out,
+                            chroma_padded_w,
+                            chroma_padded_h,
+                            padded_w,
+                            padded_h,
+                            chroma_shift_x,
+                            chroma_shift_y,
                         );
                         self.motion.compensate_cached(
-                            ctx, &mut cmd,
-                            &bufs.mc_out, &bufs.gpu_ref_planes[p],
-                            &split_mv_buf, &bufs.recon_out,
-                            padded_w, padded_h, &bufs.mc_inv_params_8,
+                            ctx,
+                            &mut cmd,
+                            &bufs.mc_out,
+                            &bufs.gpu_ref_planes[p],
+                            &split_mv_buf,
+                            &bufs.recon_out,
+                            padded_w,
+                            padded_h,
+                            &bufs.mc_inv_params_8,
                         );
                         cmd.copy_buffer_to_buffer(
-                            &bufs.recon_out, 0, &bufs.gpu_ref_planes[p], 0, plane_size,
+                            &bufs.recon_out,
+                            0,
+                            &bufs.gpu_ref_planes[p],
+                            0,
+                            plane_size,
                         );
                     } else {
                         // Luma (all modes) or 4:4:4 chroma: all at luma dims
                         self.quantize.dispatch(
-                            ctx, &mut cmd,
-                            quant_buf, &bufs.cg_plane,
+                            ctx,
+                            &mut cmd,
+                            quant_buf,
+                            &bufs.cg_plane,
                             padded_pixels as u32,
-                            config.quantization_step, res_dead_zone, false,
-                            padded_w, padded_h,
-                            config.tile_size, config.wavelet_levels, weights,
+                            config.quantization_step,
+                            res_dead_zone,
+                            false,
+                            padded_w,
+                            padded_h,
+                            config.tile_size,
+                            config.wavelet_levels,
+                            weights,
                         );
                         self.transform.inverse(
-                            ctx, &mut cmd,
-                            &bufs.cg_plane, &bufs.plane_c, &bufs.plane_a,
-                            info, config.wavelet_levels, config.wavelet_type, p,
+                            ctx,
+                            &mut cmd,
+                            &bufs.cg_plane,
+                            &bufs.plane_c,
+                            &bufs.plane_a,
+                            info,
+                            config.wavelet_levels,
+                            config.wavelet_type,
+                            p,
                         );
                         self.motion.compensate_cached(
-                            ctx, &mut cmd,
-                            &bufs.plane_a, &bufs.gpu_ref_planes[p],
-                            &split_mv_buf, &bufs.recon_out,
-                            padded_w, padded_h, &bufs.mc_inv_params_8,
+                            ctx,
+                            &mut cmd,
+                            &bufs.plane_a,
+                            &bufs.gpu_ref_planes[p],
+                            &split_mv_buf,
+                            &bufs.recon_out,
+                            padded_w,
+                            padded_h,
+                            &bufs.mc_inv_params_8,
                         );
                         cmd.copy_buffer_to_buffer(
-                            &bufs.recon_out, 0, &bufs.gpu_ref_planes[p], 0, plane_size,
+                            &bufs.recon_out,
+                            0,
+                            &bufs.gpu_ref_planes[p],
+                            0,
+                            plane_size,
                         );
                     }
                 }
             }
 
             // MV staging copy: 8x8 split MVs
-            cmd.copy_buffer_to_buffer(&split_mv_buf, 0, &bufs.split_mv_staging_buf, 0, bufs.split_mv_staging_size);
+            cmd.copy_buffer_to_buffer(
+                &split_mv_buf,
+                0,
+                &bufs.split_mv_staging_buf,
+                0,
+                bufs.split_mv_staging_size,
+            );
 
             // === Submit the batched command encoder ===
             let _t_submit = std::time::Instant::now();
@@ -2606,11 +3095,9 @@ impl EncoderPipeline {
             // Poll + readback entropy results
             if use_rice && !is_non_444 {
                 // 444: all 3 planes encoded in the batch — single readback
-                rice_tiles = self.gpu_rice_encoder.finish_3planes_readback(
-                    ctx,
-                    info,
-                    config.wavelet_levels,
-                );
+                rice_tiles =
+                    self.gpu_rice_encoder
+                        .finish_3planes_readback(ctx, info, config.wavelet_levels);
             } else if use_rice && is_non_444 {
                 // Non-444: luma was in the batch (dispatch_3planes_to_cmd only dispatched luma?).
                 // Actually for non-444 we skipped the batch entropy dispatch entirely.
@@ -2655,19 +3142,42 @@ impl EncoderPipeline {
                 ctx.device.poll(wgpu::Maintain::Wait);
             }
             if std::env::var("GNC_PROFILE").is_ok() {
-                eprintln!("  P-frame GPU+readback: {:.1}ms", _t_submit.elapsed().as_secs_f64() * 1000.0);
+                eprintln!(
+                    "  P-frame GPU+readback: {:.1}ms",
+                    _t_submit.elapsed().as_secs_f64() * 1000.0
+                );
             }
 
             // Read back 8x8-resolution MVs from split staging
-            let mvs = MotionEstimator::finish_mv_readback_cached(ctx, &bufs.split_mv_staging_buf, bufs.split_mv_staging_size, bufs.split_total_blocks);
+            let mvs = MotionEstimator::finish_mv_readback_cached(
+                ctx,
+                &bufs.split_mv_staging_buf,
+                bufs.split_mv_staging_size,
+                bufs.split_total_blocks,
+            );
 
             // Diagnostics: read back per-channel residual and compute stats
             let (residual_stats, residual_stats_co, residual_stats_cg) =
                 if let Some(ref stg) = diag_residual_staging {
                     (
-                        Some(diagnostics::compute_residual_stats(ctx, &stg[0], plane_size, padded_pixels)),
-                        Some(diagnostics::compute_residual_stats(ctx, &stg[1], plane_size, padded_pixels)),
-                        Some(diagnostics::compute_residual_stats(ctx, &stg[2], plane_size, padded_pixels)),
+                        Some(diagnostics::compute_residual_stats(
+                            ctx,
+                            &stg[0],
+                            plane_size,
+                            padded_pixels,
+                        )),
+                        Some(diagnostics::compute_residual_stats(
+                            ctx,
+                            &stg[1],
+                            plane_size,
+                            padded_pixels,
+                        )),
+                        Some(diagnostics::compute_residual_stats(
+                            ctx,
+                            &stg[2],
+                            plane_size,
+                            padded_pixels,
+                        )),
                     )
                 } else {
                     (None, None, None)
@@ -2683,24 +3193,27 @@ impl EncoderPipeline {
                 EntropyMode::Huffman => EntropyData::Huffman(huffman_tiles),
             };
 
-            return (CompressedFrame {
-                info: *info,
-                config: res_config.clone(),
-                entropy,
-                cfl_alphas: None,
-                weight_map: None,
-                frame_type: FrameType::Predicted,
-                motion_field: Some(MotionField {
-                    vectors: mvs,
-                    block_size: ME_SPLIT_BLOCK_SIZE,
-                    backward_vectors: None,
-                    block_modes: None,
-                }),
-                intra_modes: None,
-                residual_stats,
-                residual_stats_co,
-                residual_stats_cg,
-            }, mv_buf); // Return 16x16 mv_buf as temporal predictor for next frame
+            return (
+                CompressedFrame {
+                    info: *info,
+                    config: res_config.clone(),
+                    entropy,
+                    cfl_alphas: None,
+                    weight_map: None,
+                    frame_type: FrameType::Predicted,
+                    motion_field: Some(MotionField {
+                        vectors: mvs,
+                        block_size: ME_SPLIT_BLOCK_SIZE,
+                        backward_vectors: None,
+                        block_modes: None,
+                    }),
+                    intra_modes: None,
+                    residual_stats,
+                    residual_stats_co,
+                    residual_stats_cg,
+                },
+                mv_buf,
+            ); // Return 16x16 mv_buf as temporal predictor for next frame
         } else {
             // CPU entropy path: preprocess + ME batched, then per-plane submits
             let mut cmd = ctx
@@ -2768,13 +3281,19 @@ impl EncoderPipeline {
 
             // 4:2:0 chroma-domain MC: pre-scale luma MVs → chroma MVs before plane loop.
             if is_420 {
-                let mut cmd_scale = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("pf_mv_scale"),
-                });
+                let mut cmd_scale =
+                    ctx.device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("pf_mv_scale"),
+                        });
                 self.motion.dispatch_mv_scale(
-                    ctx, &mut cmd_scale,
-                    &split_mv_buf, &bufs.mv_chroma_buf,
-                    bufs.split_total_blocks, chroma_shift_x, chroma_shift_y,
+                    ctx,
+                    &mut cmd_scale,
+                    &split_mv_buf,
+                    &bufs.mv_chroma_buf,
+                    bufs.split_total_blocks,
+                    chroma_shift_x,
+                    chroma_shift_y,
                 );
                 ctx.queue.submit(Some(cmd_scale.finish()));
             }
@@ -2814,106 +3333,189 @@ impl EncoderPipeline {
 
                 if p > 0 && is_420 {
                     // 4:2:0 chroma-domain MC (CPU-path mirror of GPU-path fix):
-                    let chroma_ds_buf = if p == 1 { &bufs.co_plane_ds } else { &bufs.cg_plane_ds };
+                    let chroma_ds_buf = if p == 1 {
+                        &bufs.co_plane_ds
+                    } else {
+                        &bufs.cg_plane_ds
+                    };
                     let ci = chroma_info_pf.as_ref().unwrap();
                     // box-filter cur → chroma_ds_buf
                     self.chroma_down.dispatch(
-                        ctx, &mut cmd,
-                        cur_plane, chroma_ds_buf,
-                        padded_w, padded_h,
-                        chroma_shift_x, chroma_shift_y,
-                        chroma_padded_w, chroma_padded_h,
+                        ctx,
+                        &mut cmd,
+                        cur_plane,
+                        chroma_ds_buf,
+                        padded_w,
+                        padded_h,
+                        chroma_shift_x,
+                        chroma_shift_y,
+                        chroma_padded_w,
+                        chroma_padded_h,
                     );
                     // box-filter ref → plane_c (chroma ref)
                     self.chroma_down.dispatch(
-                        ctx, &mut cmd,
-                        &bufs.gpu_ref_planes[p], &bufs.plane_c,
-                        padded_w, padded_h,
-                        chroma_shift_x, chroma_shift_y,
-                        chroma_padded_w, chroma_padded_h,
+                        ctx,
+                        &mut cmd,
+                        &bufs.gpu_ref_planes[p],
+                        &bufs.plane_c,
+                        padded_w,
+                        padded_h,
+                        chroma_shift_x,
+                        chroma_shift_y,
+                        chroma_padded_w,
+                        chroma_padded_h,
                     );
                     // MC at chroma dims
                     self.motion.compensate_cached(
-                        ctx, &mut cmd,
-                        chroma_ds_buf, &bufs.plane_c, &bufs.mv_chroma_buf, &bufs.mc_out,
-                        chroma_padded_w, chroma_padded_h, &bufs.mc_fwd_params_chroma420,
+                        ctx,
+                        &mut cmd,
+                        chroma_ds_buf,
+                        &bufs.plane_c,
+                        &bufs.mv_chroma_buf,
+                        &bufs.mc_out,
+                        chroma_padded_w,
+                        chroma_padded_h,
+                        &bufs.mc_fwd_params_chroma420,
                     );
                     // Wavelet at chroma dims
                     self.transform.forward(
-                        ctx, &mut cmd,
-                        &bufs.mc_out, &bufs.plane_b, &bufs.plane_c,
-                        ci, config.wavelet_levels, config.wavelet_type, p,
+                        ctx,
+                        &mut cmd,
+                        &bufs.mc_out,
+                        &bufs.plane_b,
+                        &bufs.plane_c,
+                        ci,
+                        config.wavelet_levels,
+                        config.wavelet_type,
+                        p,
                     );
                     self.quantize.dispatch(
-                        ctx, &mut cmd,
-                        &bufs.plane_c, quant_out,
+                        ctx,
+                        &mut cmd,
+                        &bufs.plane_c,
+                        quant_out,
                         chroma_pixels as u32,
-                        config.quantization_step, res_dead_zone, true,
-                        chroma_padded_w, chroma_padded_h,
-                        config.tile_size, config.wavelet_levels, weights,
+                        config.quantization_step,
+                        res_dead_zone,
+                        true,
+                        chroma_padded_w,
+                        chroma_padded_h,
+                        config.tile_size,
+                        config.wavelet_levels,
+                        weights,
                     );
                 } else if p > 0 && is_non_444 {
                     // 4:2:2 or non-420: luma-domain MC (unchanged)
                     self.motion.compensate_cached(
-                        ctx, &mut cmd,
-                        cur_plane, &bufs.gpu_ref_planes[p],
-                        &split_mv_buf, &bufs.mc_out,
-                        padded_w, padded_h, &bufs.mc_fwd_params_8,
+                        ctx,
+                        &mut cmd,
+                        cur_plane,
+                        &bufs.gpu_ref_planes[p],
+                        &split_mv_buf,
+                        &bufs.mc_out,
+                        padded_w,
+                        padded_h,
+                        &bufs.mc_fwd_params_8,
                     );
-                    let chroma_ds_buf = if p == 1 { &bufs.co_plane_ds } else { &bufs.cg_plane_ds };
+                    let chroma_ds_buf = if p == 1 {
+                        &bufs.co_plane_ds
+                    } else {
+                        &bufs.cg_plane_ds
+                    };
                     let ci = chroma_info_pf.as_ref().unwrap();
                     self.chroma_down.dispatch(
-                        ctx, &mut cmd,
-                        &bufs.mc_out, chroma_ds_buf,
-                        padded_w, padded_h,
-                        chroma_shift_x, chroma_shift_y,
-                        chroma_padded_w, chroma_padded_h,
+                        ctx,
+                        &mut cmd,
+                        &bufs.mc_out,
+                        chroma_ds_buf,
+                        padded_w,
+                        padded_h,
+                        chroma_shift_x,
+                        chroma_shift_y,
+                        chroma_padded_w,
+                        chroma_padded_h,
                     );
                     self.transform.forward(
-                        ctx, &mut cmd,
-                        chroma_ds_buf, &bufs.plane_b, &bufs.plane_c,
-                        ci, config.wavelet_levels, config.wavelet_type, p,
+                        ctx,
+                        &mut cmd,
+                        chroma_ds_buf,
+                        &bufs.plane_b,
+                        &bufs.plane_c,
+                        ci,
+                        config.wavelet_levels,
+                        config.wavelet_type,
+                        p,
                     );
                     self.quantize.dispatch(
-                        ctx, &mut cmd,
-                        &bufs.plane_c, quant_out,
+                        ctx,
+                        &mut cmd,
+                        &bufs.plane_c,
+                        quant_out,
                         chroma_pixels as u32,
-                        config.quantization_step, res_dead_zone, true,
-                        chroma_padded_w, chroma_padded_h,
-                        config.tile_size, config.wavelet_levels, weights,
+                        config.quantization_step,
+                        res_dead_zone,
+                        true,
+                        chroma_padded_w,
+                        chroma_padded_h,
+                        config.tile_size,
+                        config.wavelet_levels,
+                        weights,
                     );
                 } else {
                     // Luma or 4:4:4 chroma: MC at luma dims
                     self.motion.compensate_cached(
-                        ctx, &mut cmd,
-                        cur_plane, &bufs.gpu_ref_planes[p],
-                        &split_mv_buf, &bufs.mc_out,
-                        padded_w, padded_h, &bufs.mc_fwd_params_8,
+                        ctx,
+                        &mut cmd,
+                        cur_plane,
+                        &bufs.gpu_ref_planes[p],
+                        &split_mv_buf,
+                        &bufs.mc_out,
+                        padded_w,
+                        padded_h,
+                        &bufs.mc_fwd_params_8,
                     );
                     self.transform.forward(
-                        ctx, &mut cmd,
-                        &bufs.mc_out, &bufs.plane_b, &bufs.plane_c,
-                        info, config.wavelet_levels, config.wavelet_type, p,
+                        ctx,
+                        &mut cmd,
+                        &bufs.mc_out,
+                        &bufs.plane_b,
+                        &bufs.plane_c,
+                        info,
+                        config.wavelet_levels,
+                        config.wavelet_type,
+                        p,
                     );
                     self.quantize.dispatch(
-                        ctx, &mut cmd,
-                        &bufs.plane_c, quant_out,
+                        ctx,
+                        &mut cmd,
+                        &bufs.plane_c,
+                        quant_out,
                         padded_pixels as u32,
-                        config.quantization_step, res_dead_zone, true,
-                        padded_w, padded_h,
-                        config.tile_size, config.wavelet_levels, weights,
+                        config.quantization_step,
+                        res_dead_zone,
+                        true,
+                        padded_w,
+                        padded_h,
+                        config.tile_size,
+                        config.wavelet_levels,
+                        weights,
                     );
                 }
                 ctx.queue.submit(Some(cmd.finish()));
 
-                let (enc_pixels, enc_w, enc_tiles_x, enc_tiles_y, enc_info) =
-                    if p > 0 && is_non_444 {
-                        let ci = chroma_info_pf.as_ref().unwrap();
-                        (chroma_pixels, chroma_padded_w,
-                         ci.tiles_x() as usize, ci.tiles_y() as usize, ci as &FrameInfo)
-                    } else {
-                        (padded_pixels, padded_w, tiles_x, tiles_y, info)
-                    };
+                let (enc_pixels, enc_w, enc_tiles_x, enc_tiles_y, enc_info) = if p > 0 && is_non_444
+                {
+                    let ci = chroma_info_pf.as_ref().unwrap();
+                    (
+                        chroma_pixels,
+                        chroma_padded_w,
+                        ci.tiles_x() as usize,
+                        ci.tiles_y() as usize,
+                        ci as &FrameInfo,
+                    )
+                } else {
+                    (padded_pixels, padded_w, tiles_x, tiles_y, info)
+                };
 
                 encode_entropy(
                     &mut self.gpu_encoder,
@@ -2950,8 +3552,7 @@ impl EncoderPipeline {
 
         // === Batched local decode + MV copy: single command encoder ===
         let split_blocks_8 = (padded_w / ME_SPLIT_BLOCK_SIZE) * (padded_h / ME_SPLIT_BLOCK_SIZE);
-        let mv_staging =
-            MotionEstimator::create_mv_staging(ctx, &split_mv_buf, split_blocks_8);
+        let mv_staging = MotionEstimator::create_mv_staging(ctx, &split_mv_buf, split_blocks_8);
         {
             let mut cmd = ctx
                 .device
@@ -2976,101 +3577,191 @@ impl EncoderPipeline {
                     if p > 0 && is_420 {
                         // 4:2:0 chroma local decode (chroma-domain MC, mirrors forward pass):
                         let ci = chroma_info_pf.as_ref().unwrap();
-                        let chroma_scratch = if p == 1 { &bufs.co_plane_ds } else { &bufs.cg_plane_ds };
+                        let chroma_scratch = if p == 1 {
+                            &bufs.co_plane_ds
+                        } else {
+                            &bufs.cg_plane_ds
+                        };
                         self.quantize.dispatch(
-                            ctx, &mut cmd,
-                            quant_buf, chroma_scratch,
+                            ctx,
+                            &mut cmd,
+                            quant_buf,
+                            chroma_scratch,
                             chroma_pixels as u32,
-                            config.quantization_step, res_dead_zone, false,
-                            chroma_padded_w, chroma_padded_h,
-                            config.tile_size, config.wavelet_levels, weights,
+                            config.quantization_step,
+                            res_dead_zone,
+                            false,
+                            chroma_padded_w,
+                            chroma_padded_h,
+                            config.tile_size,
+                            config.wavelet_levels,
+                            weights,
                         );
                         self.transform.inverse(
-                            ctx, &mut cmd,
-                            chroma_scratch, &bufs.cg_plane, &bufs.plane_a,
-                            ci, config.wavelet_levels, config.wavelet_type, p,
+                            ctx,
+                            &mut cmd,
+                            chroma_scratch,
+                            &bufs.cg_plane,
+                            &bufs.plane_a,
+                            ci,
+                            config.wavelet_levels,
+                            config.wavelet_type,
+                            p,
                         );
                         // box-filter luma-sized ref → mc_out (chroma dims)
                         self.chroma_down.dispatch(
-                            ctx, &mut cmd,
-                            &bufs.gpu_ref_planes[p], &bufs.mc_out,
-                            padded_w, padded_h,
-                            chroma_shift_x, chroma_shift_y,
-                            chroma_padded_w, chroma_padded_h,
+                            ctx,
+                            &mut cmd,
+                            &bufs.gpu_ref_planes[p],
+                            &bufs.mc_out,
+                            padded_w,
+                            padded_h,
+                            chroma_shift_x,
+                            chroma_shift_y,
+                            chroma_padded_w,
+                            chroma_padded_h,
                         );
                         // Inverse MC at chroma dims
                         self.motion.compensate_cached(
-                            ctx, &mut cmd,
-                            &bufs.plane_a, &bufs.mc_out, &bufs.mv_chroma_buf, chroma_scratch,
-                            chroma_padded_w, chroma_padded_h, &bufs.mc_inv_params_chroma420,
+                            ctx,
+                            &mut cmd,
+                            &bufs.plane_a,
+                            &bufs.mc_out,
+                            &bufs.mv_chroma_buf,
+                            chroma_scratch,
+                            chroma_padded_w,
+                            chroma_padded_h,
+                            &bufs.mc_inv_params_chroma420,
                         );
                         // NN-upsample chroma recon → recon_out (luma dims)
                         self.chroma_up.dispatch_upsample(
-                            ctx, &mut cmd,
-                            chroma_scratch, &bufs.recon_out,
-                            chroma_padded_w, chroma_padded_h,
-                            padded_w, padded_h,
-                            chroma_shift_x, chroma_shift_y,
+                            ctx,
+                            &mut cmd,
+                            chroma_scratch,
+                            &bufs.recon_out,
+                            chroma_padded_w,
+                            chroma_padded_h,
+                            padded_w,
+                            padded_h,
+                            chroma_shift_x,
+                            chroma_shift_y,
                         );
                         cmd.copy_buffer_to_buffer(
-                            &bufs.recon_out, 0, &bufs.gpu_ref_planes[p], 0, plane_size,
+                            &bufs.recon_out,
+                            0,
+                            &bufs.gpu_ref_planes[p],
+                            0,
+                            plane_size,
                         );
                     } else if p > 0 && is_non_444 {
                         // 4:2:2 chroma local decode (luma-domain MC, unchanged):
                         let ci = chroma_info_pf.as_ref().unwrap();
-                        let chroma_scratch = if p == 1 { &bufs.co_plane_ds } else { &bufs.cg_plane_ds };
+                        let chroma_scratch = if p == 1 {
+                            &bufs.co_plane_ds
+                        } else {
+                            &bufs.cg_plane_ds
+                        };
                         self.quantize.dispatch(
-                            ctx, &mut cmd,
-                            quant_buf, chroma_scratch,
+                            ctx,
+                            &mut cmd,
+                            quant_buf,
+                            chroma_scratch,
                             chroma_pixels as u32,
-                            config.quantization_step, res_dead_zone, false,
-                            chroma_padded_w, chroma_padded_h,
-                            config.tile_size, config.wavelet_levels, weights,
+                            config.quantization_step,
+                            res_dead_zone,
+                            false,
+                            chroma_padded_w,
+                            chroma_padded_h,
+                            config.tile_size,
+                            config.wavelet_levels,
+                            weights,
                         );
                         self.transform.inverse(
-                            ctx, &mut cmd,
-                            chroma_scratch, &bufs.cg_plane, &bufs.plane_a,
-                            ci, config.wavelet_levels, config.wavelet_type, p,
+                            ctx,
+                            &mut cmd,
+                            chroma_scratch,
+                            &bufs.cg_plane,
+                            &bufs.plane_a,
+                            ci,
+                            config.wavelet_levels,
+                            config.wavelet_type,
+                            p,
                         );
                         self.chroma_up.dispatch_upsample(
-                            ctx, &mut cmd,
-                            &bufs.plane_a, &bufs.mc_out,
-                            chroma_padded_w, chroma_padded_h,
-                            padded_w, padded_h,
-                            chroma_shift_x, chroma_shift_y,
+                            ctx,
+                            &mut cmd,
+                            &bufs.plane_a,
+                            &bufs.mc_out,
+                            chroma_padded_w,
+                            chroma_padded_h,
+                            padded_w,
+                            padded_h,
+                            chroma_shift_x,
+                            chroma_shift_y,
                         );
                         self.motion.compensate_cached(
-                            ctx, &mut cmd,
-                            &bufs.mc_out, &bufs.gpu_ref_planes[p],
-                            &split_mv_buf, &bufs.recon_out,
-                            padded_w, padded_h, &bufs.mc_inv_params_8,
+                            ctx,
+                            &mut cmd,
+                            &bufs.mc_out,
+                            &bufs.gpu_ref_planes[p],
+                            &split_mv_buf,
+                            &bufs.recon_out,
+                            padded_w,
+                            padded_h,
+                            &bufs.mc_inv_params_8,
                         );
                         cmd.copy_buffer_to_buffer(
-                            &bufs.recon_out, 0, &bufs.gpu_ref_planes[p], 0, plane_size,
+                            &bufs.recon_out,
+                            0,
+                            &bufs.gpu_ref_planes[p],
+                            0,
+                            plane_size,
                         );
                     } else {
                         // Luma (all modes) or 4:4:4 chroma: all at luma dims
                         self.quantize.dispatch(
-                            ctx, &mut cmd,
-                            quant_buf, &bufs.cg_plane,
+                            ctx,
+                            &mut cmd,
+                            quant_buf,
+                            &bufs.cg_plane,
                             padded_pixels as u32,
-                            config.quantization_step, res_dead_zone, false,
-                            padded_w, padded_h,
-                            config.tile_size, config.wavelet_levels, weights,
+                            config.quantization_step,
+                            res_dead_zone,
+                            false,
+                            padded_w,
+                            padded_h,
+                            config.tile_size,
+                            config.wavelet_levels,
+                            weights,
                         );
                         self.transform.inverse(
-                            ctx, &mut cmd,
-                            &bufs.cg_plane, &bufs.plane_c, &bufs.plane_a,
-                            info, config.wavelet_levels, config.wavelet_type, p,
+                            ctx,
+                            &mut cmd,
+                            &bufs.cg_plane,
+                            &bufs.plane_c,
+                            &bufs.plane_a,
+                            info,
+                            config.wavelet_levels,
+                            config.wavelet_type,
+                            p,
                         );
                         self.motion.compensate_cached(
-                            ctx, &mut cmd,
-                            &bufs.plane_a, &bufs.gpu_ref_planes[p],
-                            &split_mv_buf, &bufs.recon_out,
-                            padded_w, padded_h, &bufs.mc_inv_params_8,
+                            ctx,
+                            &mut cmd,
+                            &bufs.plane_a,
+                            &bufs.gpu_ref_planes[p],
+                            &split_mv_buf,
+                            &bufs.recon_out,
+                            padded_w,
+                            padded_h,
+                            &bufs.mc_inv_params_8,
                         );
                         cmd.copy_buffer_to_buffer(
-                            &bufs.recon_out, 0, &bufs.gpu_ref_planes[p], 0, plane_size,
+                            &bufs.recon_out,
+                            0,
+                            &bufs.gpu_ref_planes[p],
+                            0,
+                            plane_size,
                         );
                     }
                 }
@@ -3085,24 +3776,27 @@ impl EncoderPipeline {
         // Single poll drains local decode + MV copy together
         let mvs = MotionEstimator::finish_mv_readback(ctx, &mv_staging);
 
-        (CompressedFrame {
-            info: *info,
-            config: res_config,
-            entropy,
-            cfl_alphas: None,
-            weight_map: None,
-            frame_type: FrameType::Predicted,
-            motion_field: Some(MotionField {
-                vectors: mvs,
-                block_size: ME_SPLIT_BLOCK_SIZE,
-                backward_vectors: None,
-                block_modes: None,
-            }),
-            intra_modes: None,
-            residual_stats: None,
-            residual_stats_co: None,
-            residual_stats_cg: None,
-        }, mv_buf)
+        (
+            CompressedFrame {
+                info: *info,
+                config: res_config,
+                entropy,
+                cfl_alphas: None,
+                weight_map: None,
+                frame_type: FrameType::Predicted,
+                motion_field: Some(MotionField {
+                    vectors: mvs,
+                    block_size: ME_SPLIT_BLOCK_SIZE,
+                    backward_vectors: None,
+                    block_modes: None,
+                }),
+                intra_modes: None,
+                residual_stats: None,
+                residual_stats_co: None,
+                residual_stats_cg: None,
+            },
+            mv_buf,
+        )
     }
 
     /// Encode a B-frame with bidirectional prediction.
@@ -3189,6 +3883,26 @@ impl EncoderPipeline {
             None
         };
 
+        // Non-444 chroma handling for B-frame (mirrors P-frame logic).
+        // See P-frame encode for detailed comments on chroma-domain MC.
+        let is_non_444 = info.chroma_format != ChromaFormat::Yuv444;
+        let is_420 = info.chroma_format == ChromaFormat::Yuv420;
+        let chroma_info_bf: Option<FrameInfo> = if is_non_444 {
+            Some(info.make_chroma_info())
+        } else {
+            None
+        };
+        let chroma_shift_x = info.chroma_format.horiz_shift();
+        let chroma_shift_y = info.chroma_format.vert_shift();
+        let (chroma_padded_w, chroma_padded_h, chroma_pixels) = if let Some(ref ci) = chroma_info_bf
+        {
+            let cpw = ci.padded_width();
+            let cph = ci.padded_height();
+            (cpw, cph, (cpw * cph) as usize)
+        } else {
+            (padded_w, padded_h, padded_pixels)
+        };
+
         // === Batched GPU pipeline: preprocess + bidir ME + forward encode ===
         // MV/mode buffers stay on GPU — used directly by bidir MC.
         let fwd_mv_buf;
@@ -3252,6 +3966,41 @@ impl EncoderPipeline {
             fwd_mv_buf = fmb;
             bwd_mv_buf = bmb;
 
+            // 4:2.0 chroma-domain MC for B-frames: pre-scale both fwd and bwd MVs to chroma dims.
+            if is_420 {
+                let mut cmd_scale =
+                    ctx.device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("bf_mv_scale_fwd"),
+                        });
+                self.motion.dispatch_mv_scale(
+                    ctx,
+                    &mut cmd_scale,
+                    &fwd_mv_buf,
+                    &bufs.mv_chroma_buf,
+                    bufs.me_total_blocks,
+                    chroma_shift_x,
+                    chroma_shift_y,
+                );
+                ctx.queue.submit(Some(cmd_scale.finish()));
+
+                let mut cmd_scale_bwd =
+                    ctx.device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("bf_mv_scale_bwd"),
+                        });
+                self.motion.dispatch_mv_scale(
+                    ctx,
+                    &mut cmd_scale_bwd,
+                    &bwd_mv_buf,
+                    &bufs.mv_chroma_buf_bwd,
+                    bufs.me_total_blocks,
+                    chroma_shift_x,
+                    chroma_shift_y,
+                );
+                ctx.queue.submit(Some(cmd_scale_bwd.finish()));
+            }
+
             for p in 0..3 {
                 let weights = if p == 0 {
                     &weights_luma
@@ -3263,107 +4012,245 @@ impl EncoderPipeline {
                     1 => &bufs.co_plane,
                     _ => &bufs.cg_plane,
                 };
-                // Quantize output: Y→recon_y, Co→co_plane, Cg→plane_b (no copy needed)
-                let quant_out = match p {
-                    0 => &bufs.recon_y,
-                    1 => &bufs.co_plane,
-                    _ => &bufs.plane_b,
+                // Quantize output buffer selection (mirrors P-frame logic for non-444):
+                //   Luma: recon_y (all modes)
+                //   444 Co: co_plane, 444 Cg: plane_b
+                //   non-444 Co: ref_upload (avoids alias with luma-sized co_plane input)
+                //   non-444 Cg: plane_b
+                let quant_out = if p == 0 {
+                    &bufs.recon_y
+                } else if p == 1 && is_non_444 {
+                    &bufs.ref_upload
+                } else if p == 1 {
+                    &bufs.co_plane
+                } else {
+                    &bufs.plane_b
                 };
 
-                self.motion.compensate_bidir_cached(
-                    ctx,
-                    &mut cmd,
-                    cur_plane,
-                    &bufs.gpu_ref_planes[p],
-                    &bufs.gpu_bwd_ref_planes[p],
-                    &fwd_mv_buf,
-                    &bwd_mv_buf,
-                    &bufs.bidir_modes_scratch,
-                    &bufs.mc_out,
-                    padded_w,
-                    padded_h,
-                    &bufs.mc_bidir_fwd_params,
-                );
+                if p > 0 && is_420 {
+                    // 4:2:0 B-frame chroma-domain bidir MC:
+                    //   box-filter current → chroma_ds_buf
+                    //   box-filter fwd/bwd refs → plane_c (scratch)
+                    //   bidir MC at chroma dims with scaled MVs → mc_out (chroma portion)
+                    //   wavelet(mc_out, chroma dims) → quant_out
+                    //   upsample to luma dims → gpu_ref_planes[p] for next frame
+                    let chroma_ds_buf = if p == 1 {
+                        &bufs.co_plane_ds
+                    } else {
+                        &bufs.cg_plane_ds
+                    };
+                    // Step 1: box-filter current luma-sized chroma plane → chroma dims
+                    self.chroma_down.dispatch(
+                        ctx,
+                        &mut cmd,
+                        cur_plane,
+                        chroma_ds_buf,
+                        padded_w,
+                        padded_h,
+                        chroma_shift_x,
+                        chroma_shift_y,
+                        chroma_padded_w,
+                        chroma_padded_h,
+                    );
+                    // Step 2: box-filter forward reference → chroma dims → plane_c (scratch)
+                    self.chroma_down.dispatch(
+                        ctx,
+                        &mut cmd,
+                        &bufs.gpu_ref_planes[p],
+                        &bufs.plane_c,
+                        padded_w,
+                        padded_h,
+                        chroma_shift_x,
+                        chroma_shift_y,
+                        chroma_padded_w,
+                        chroma_padded_h,
+                    );
+                    // Step 3: box-filter backward reference → chroma dims → plane_b (scratch)
+                    // Note: plane_b is free at this point (not yet used for this plane's wavelet output)
+                    self.chroma_down.dispatch(
+                        ctx,
+                        &mut cmd,
+                        &bufs.gpu_bwd_ref_planes[p],
+                        &bufs.plane_b,
+                        padded_w,
+                        padded_h,
+                        chroma_shift_x,
+                        chroma_shift_y,
+                        chroma_padded_w,
+                        chroma_padded_h,
+                    );
 
-                // Diagnostics: copy per-channel residual before wavelet overwrites mc_out
-                if let Some(ref stg) = diag_residual_staging {
-                    cmd.copy_buffer_to_buffer(&bufs.mc_out, 0, &stg[p], 0, plane_size);
+                    // Step 4: Bidir MC at chroma dims using scaled MVs and chroma-dim refs
+                    // - cur_plane is luma-sized, but we need to box-filter it first
+                    // - fwd ref: plane_c (chroma dims)
+                    // - bwd ref: plane_b (chroma dims, scratch)
+                    // - MVs: mv_chroma_buf, mv_chroma_buf_bwd (scaled ÷2)
+                    // The box-filter of cur_plane was done in Step 1 into chroma_ds_buf
+                    let chroma_ds_buf = if p == 1 {
+                        &bufs.co_plane_ds
+                    } else {
+                        &bufs.cg_plane_ds
+                    };
+                    self.motion.compensate_bidir_chroma_cached(
+                        ctx,
+                        &mut cmd,
+                        chroma_ds_buf,           // current at chroma dims
+                        &bufs.plane_c,           // fwd ref at chroma dims
+                        &bufs.plane_b,           // bwd ref at chroma dims (scratch)
+                        &bufs.mv_chroma_buf,     // scaled fwd MVs
+                        &bufs.mv_chroma_buf_bwd, // scaled bwd MVs
+                        &bufs.bidir_modes_scratch,
+                        &bufs.mc_out, // output (chroma dims, luma buf reused)
+                        chroma_padded_w,
+                        chroma_padded_h,
+                        true, // forward: compute residual
+                    );
+
+                    // Diagnostics
+                    if let Some(ref stg) = diag_residual_staging {
+                        let chroma_size = (chroma_pixels * std::mem::size_of::<f32>()) as u64;
+                        cmd.copy_buffer_to_buffer(&bufs.mc_out, 0, &stg[p], 0, chroma_size);
+                    }
+
+                    // Step 5: wavelet at chroma dims
+                    self.transform.forward(
+                        ctx,
+                        &mut cmd,
+                        &bufs.mc_out,
+                        &bufs.plane_b,
+                        &bufs.plane_c,
+                        chroma_info_bf.as_ref().unwrap(),
+                        config.wavelet_levels,
+                        config.wavelet_type,
+                        p,
+                    );
+                    self.quantize.dispatch(
+                        ctx,
+                        &mut cmd,
+                        &bufs.plane_c,
+                        quant_out,
+                        chroma_pixels as u32,
+                        config.quantization_step,
+                        res_dead_zone,
+                        true,
+                        chroma_padded_w,
+                        chroma_padded_h,
+                        config.tile_size,
+                        config.wavelet_levels,
+                        weights,
+                    );
+                } else {
+                    // Luma or 4:2:2: use regular luma-dimension bidir MC
+                    self.motion.compensate_bidir_cached(
+                        ctx,
+                        &mut cmd,
+                        cur_plane,
+                        &bufs.gpu_ref_planes[p],
+                        &bufs.gpu_bwd_ref_planes[p],
+                        &fwd_mv_buf,
+                        &bwd_mv_buf,
+                        &bufs.bidir_modes_scratch,
+                        &bufs.mc_out,
+                        padded_w,
+                        padded_h,
+                        &bufs.mc_bidir_fwd_params,
+                    );
+
+                    // Diagnostics: copy per-channel residual before wavelet overwrites mc_out
+                    if let Some(ref stg) = diag_residual_staging {
+                        cmd.copy_buffer_to_buffer(&bufs.mc_out, 0, &stg[p], 0, plane_size);
+                    }
+
+                    // mc_out feeds directly into wavelet (read-only at level 0)
+                    self.transform.forward(
+                        ctx,
+                        &mut cmd,
+                        &bufs.mc_out,
+                        &bufs.plane_b,
+                        &bufs.plane_c,
+                        info,
+                        config.wavelet_levels,
+                        config.wavelet_type,
+                        p,
+                    );
+                    self.quantize.dispatch(
+                        ctx,
+                        &mut cmd,
+                        &bufs.plane_c,
+                        quant_out,
+                        padded_pixels as u32,
+                        config.quantization_step,
+                        res_dead_zone,
+                        true,
+                        padded_w,
+                        padded_h,
+                        config.tile_size,
+                        config.wavelet_levels,
+                        weights,
+                    );
                 }
-
-                // mc_out feeds directly into wavelet (read-only at level 0)
-                self.transform.forward(
-                    ctx,
-                    &mut cmd,
-                    &bufs.mc_out,
-                    &bufs.plane_b,
-                    &bufs.plane_c,
-                    info,
-                    config.wavelet_levels,
-                    config.wavelet_type,
-                    p,
-                );
-                self.quantize.dispatch(
-                    ctx,
-                    &mut cmd,
-                    &bufs.plane_c,
-                    quant_out,
-                    padded_pixels as u32,
-                    config.quantization_step,
-                    res_dead_zone,
-                    true,
-                    padded_w,
-                    padded_h,
-                    config.tile_size,
-                    config.wavelet_levels,
-                    weights,
-                );
             }
 
-            // Phase 2: GPU entropy encode dispatches (same cmd)
+            // Phase 2: GPU entropy encode dispatches (same cmd).
+            // Non-444: skip batch entropy — each plane needs its own FrameInfo + correct buffer.
+            // (Co quantized output is in ref_upload, not co_plane; chroma dims differ from luma.)
+            // This mirrors the P-frame non-444 path.
             let use_rice = matches!(entropy_mode, EntropyMode::Rice);
-            if use_rice {
-                self.gpu_rice_encoder.dispatch_3planes_to_cmd(
-                    ctx,
-                    &mut cmd,
-                    [&bufs.recon_y, &bufs.co_plane, &bufs.plane_b],
-                    info,
-                    config.wavelet_levels,
-                );
-            } else {
-                self.gpu_encoder.dispatch_3planes_to_cmd(
-                    ctx,
-                    &mut cmd,
-                    [&bufs.recon_y, &bufs.co_plane, &bufs.plane_b],
-                    info,
-                    config.per_subband_entropy,
-                    config.wavelet_levels,
-                );
+            if !is_non_444 {
+                if use_rice {
+                    self.gpu_rice_encoder.dispatch_3planes_to_cmd(
+                        ctx,
+                        &mut cmd,
+                        [&bufs.recon_y, &bufs.co_plane, &bufs.plane_b],
+                        info,
+                        config.wavelet_levels,
+                    );
+                } else {
+                    self.gpu_encoder.dispatch_3planes_to_cmd(
+                        ctx,
+                        &mut cmd,
+                        [&bufs.recon_y, &bufs.co_plane, &bufs.plane_b],
+                        info,
+                        config.per_subband_entropy,
+                        config.wavelet_levels,
+                    );
+                }
             }
 
             // Phase 3: Bidir MV + modes staging copies using cached staging buffers
             let modes_size = (bufs.me_total_blocks as u64) * 4;
             cmd.copy_buffer_to_buffer(
-                &fwd_mv_buf, 0, &bufs.bidir_fwd_staging, 0, bufs.mv_staging_size,
+                &fwd_mv_buf,
+                0,
+                &bufs.bidir_fwd_staging,
+                0,
+                bufs.mv_staging_size,
             );
             cmd.copy_buffer_to_buffer(
-                &bwd_mv_buf, 0, &bufs.bidir_bwd_staging, 0, bufs.mv_staging_size,
+                &bwd_mv_buf,
+                0,
+                &bufs.bidir_bwd_staging,
+                0,
+                bufs.mv_staging_size,
             );
             cmd.copy_buffer_to_buffer(
-                &bufs.bidir_modes_scratch, 0, &bufs.bidir_modes_staging, 0, modes_size,
+                &bufs.bidir_modes_scratch,
+                0,
+                &bufs.bidir_modes_staging,
+                0,
+                modes_size,
             );
 
             // Single submit
             let _t_submit = std::time::Instant::now();
             ctx.queue.submit(Some(cmd.finish()));
 
-            // Single poll drains everything
-            if use_rice {
-                rice_tiles = self.gpu_rice_encoder.finish_3planes_readback(
-                    ctx,
-                    info,
-                    config.wavelet_levels,
-                );
-            } else {
+            // Poll + readback entropy results
+            if !is_non_444 && use_rice {
+                rice_tiles =
+                    self.gpu_rice_encoder
+                        .finish_3planes_readback(ctx, info, config.wavelet_levels);
+            } else if !is_non_444 {
                 let (mut rt, mut st) = self.gpu_encoder.finish_3planes_readback(
                     ctx,
                     info,
@@ -3372,29 +4259,76 @@ impl EncoderPipeline {
                 );
                 rans_tiles.append(&mut rt);
                 subband_tiles.append(&mut st);
+            } else if use_rice {
+                // Non-444: encode each plane separately with correct FrameInfo and buffer.
+                // encode_1plane_to_tiles does its own submit+poll internally.
+                // First drain the batch (MC + quant + MV copies).
+                ctx.device.poll(wgpu::Maintain::Wait);
+                let ci = chroma_info_bf.as_ref().unwrap();
+                let mut luma_tiles = self.gpu_rice_encoder.encode_1plane_to_tiles(
+                    ctx,
+                    &bufs.recon_y,
+                    info,
+                    config.wavelet_levels,
+                );
+                let mut co_tiles = self.gpu_rice_encoder.encode_1plane_to_tiles(
+                    ctx,
+                    &bufs.ref_upload,
+                    ci,
+                    config.wavelet_levels,
+                );
+                let mut cg_tiles = self.gpu_rice_encoder.encode_1plane_to_tiles(
+                    ctx,
+                    &bufs.plane_b,
+                    ci,
+                    config.wavelet_levels,
+                );
+                rice_tiles.append(&mut luma_tiles);
+                rice_tiles.append(&mut co_tiles);
+                rice_tiles.append(&mut cg_tiles);
+            } else {
+                // Non-444 with non-Rice entropy: unsupported. Drain and fall through.
+                ctx.device.poll(wgpu::Maintain::Wait);
             }
             if std::env::var("GNC_PROFILE").is_ok() {
-                eprintln!("  B-frame GPU+readback: {:.1}ms", _t_submit.elapsed().as_secs_f64() * 1000.0);
+                eprintln!(
+                    "  B-frame GPU+readback: {:.1}ms",
+                    _t_submit.elapsed().as_secs_f64() * 1000.0
+                );
             }
 
-            let (fwd_mvs, bwd_mvs, block_modes) =
-                MotionEstimator::finish_bidir_readback_cached(
-                    ctx,
-                    &bufs.bidir_fwd_staging,
-                    &bufs.bidir_bwd_staging,
-                    &bufs.bidir_modes_staging,
-                    bufs.mv_staging_size,
-                    modes_size,
-                    bufs.me_total_blocks,
-                );
+            let (fwd_mvs, bwd_mvs, block_modes) = MotionEstimator::finish_bidir_readback_cached(
+                ctx,
+                &bufs.bidir_fwd_staging,
+                &bufs.bidir_bwd_staging,
+                &bufs.bidir_modes_staging,
+                bufs.mv_staging_size,
+                modes_size,
+                bufs.me_total_blocks,
+            );
 
             // Diagnostics: read back per-channel residual and compute stats
             let (residual_stats, residual_stats_co, residual_stats_cg) =
                 if let Some(ref stg) = diag_residual_staging {
                     (
-                        Some(diagnostics::compute_residual_stats(ctx, &stg[0], plane_size, padded_pixels)),
-                        Some(diagnostics::compute_residual_stats(ctx, &stg[1], plane_size, padded_pixels)),
-                        Some(diagnostics::compute_residual_stats(ctx, &stg[2], plane_size, padded_pixels)),
+                        Some(diagnostics::compute_residual_stats(
+                            ctx,
+                            &stg[0],
+                            plane_size,
+                            padded_pixels,
+                        )),
+                        Some(diagnostics::compute_residual_stats(
+                            ctx,
+                            &stg[1],
+                            plane_size,
+                            padded_pixels,
+                        )),
+                        Some(diagnostics::compute_residual_stats(
+                            ctx,
+                            &stg[2],
+                            plane_size,
+                            padded_pixels,
+                        )),
                     )
                 } else {
                     (None, None, None)
@@ -3410,24 +4344,28 @@ impl EncoderPipeline {
                 EntropyMode::Huffman => EntropyData::Huffman(huffman_tiles),
             };
 
-            return (CompressedFrame {
-                info: *info,
-                config: res_config.clone(),
-                entropy,
-                cfl_alphas: None,
-                weight_map: None,
-                frame_type: FrameType::Bidirectional,
-                motion_field: Some(MotionField {
-                    vectors: fwd_mvs,
-                    block_size: ME_BLOCK_SIZE,
-                    backward_vectors: Some(bwd_mvs),
-                    block_modes: Some(block_modes),
-                }),
-                intra_modes: None,
-                residual_stats,
-                residual_stats_co,
-                residual_stats_cg,
-            }, fwd_mv_buf, bwd_mv_buf);
+            return (
+                CompressedFrame {
+                    info: *info,
+                    config: res_config.clone(),
+                    entropy,
+                    cfl_alphas: None,
+                    weight_map: None,
+                    frame_type: FrameType::Bidirectional,
+                    motion_field: Some(MotionField {
+                        vectors: fwd_mvs,
+                        block_size: ME_BLOCK_SIZE,
+                        backward_vectors: Some(bwd_mvs),
+                        block_modes: Some(block_modes),
+                    }),
+                    intra_modes: None,
+                    residual_stats,
+                    residual_stats_co,
+                    residual_stats_cg,
+                },
+                fwd_mv_buf,
+                bwd_mv_buf,
+            );
         } else {
             // CPU entropy path: preprocess + bidir ME batched, then per-plane submits
             let mut cmd = ctx
@@ -3581,24 +4519,28 @@ impl EncoderPipeline {
             me_total_blocks,
         );
 
-        (CompressedFrame {
-            info: *info,
-            config: res_config,
-            entropy,
-            cfl_alphas: None,
-            weight_map: None,
-            frame_type: FrameType::Bidirectional,
-            motion_field: Some(MotionField {
-                vectors: fwd_mvs,
-                block_size: ME_BLOCK_SIZE,
-                backward_vectors: Some(bwd_mvs),
-                block_modes: Some(block_modes),
-            }),
-            intra_modes: None,
-            residual_stats: None,
-            residual_stats_co: None,
-            residual_stats_cg: None,
-        }, fwd_mv_buf, bwd_mv_buf)
+        (
+            CompressedFrame {
+                info: *info,
+                config: res_config,
+                entropy,
+                cfl_alphas: None,
+                weight_map: None,
+                frame_type: FrameType::Bidirectional,
+                motion_field: Some(MotionField {
+                    vectors: fwd_mvs,
+                    block_size: ME_BLOCK_SIZE,
+                    backward_vectors: Some(bwd_mvs),
+                    block_modes: Some(block_modes),
+                }),
+                intra_modes: None,
+                residual_stats: None,
+                residual_stats_co: None,
+                residual_stats_cg: None,
+            },
+            fwd_mv_buf,
+            bwd_mv_buf,
+        )
     }
 
     /// Swap gpu_ref_planes ↔ gpu_bwd_ref_planes at the Rust level (zero GPU cost).
@@ -3805,7 +4747,13 @@ impl EncoderPipeline {
         self.ensure_cached(ctx, padded_w, padded_h, info.width, info.height);
         let staging: [wgpu::Buffer; 3] = std::array::from_fn(|idx| {
             ctx.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(["tw_dbg_prequant_y", "tw_dbg_prequant_co", "tw_dbg_prequant_cg"][idx]),
+                label: Some(
+                    [
+                        "tw_dbg_prequant_y",
+                        "tw_dbg_prequant_co",
+                        "tw_dbg_prequant_cg",
+                    ][idx],
+                ),
                 size: (padded_pixels * std::mem::size_of::<f32>()) as u64,
                 usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
@@ -3969,8 +4917,7 @@ impl EncoderPipeline {
 
         // Read back quantized coeffs per plane and CPU-encode tiles
         for stg in &staging {
-            let quantized =
-                diagnostics::read_plane_f32(ctx, stg, plane_size, padded_pixels);
+            let quantized = diagnostics::read_plane_f32(ctx, stg, plane_size, padded_pixels);
             entropy_helpers::entropy_encode_tiles(
                 &quantized,
                 padded_w as usize,
@@ -4033,7 +4980,14 @@ impl EncoderPipeline {
         padded_pixels: usize,
     ) -> CompressedFrame {
         self.encode_from_gpu_wavelet_planes_weighted(
-            ctx, plane_bufs, config, info, padded_w, padded_h, padded_pixels, None,
+            ctx,
+            plane_bufs,
+            config,
+            info,
+            padded_w,
+            padded_h,
+            padded_pixels,
+            None,
         )
     }
 
@@ -4073,8 +5027,7 @@ impl EncoderPipeline {
         // Ensure CfL alpha buffers are large enough
         if config.cfl_enabled {
             let total_tiles = tiles_x * tiles_y;
-            let alpha_buf_size =
-                (total_tiles * nsb) as u64 * std::mem::size_of::<f32>() as u64;
+            let alpha_buf_size = (total_tiles * nsb) as u64 * std::mem::size_of::<f32>() as u64;
             let bufs = self.cached.as_mut().unwrap();
             crate::gpu_util::ensure_var_buf(
                 ctx,
@@ -4185,67 +5138,158 @@ impl EncoderPipeline {
             // Y plane: quantize → dequantize → recon_y
             cmd.copy_buffer_to_buffer(plane_bufs[0], 0, &bufs.plane_c, 0, plane_size);
             self.quantize.dispatch_adaptive(
-                ctx, &mut cmd, &bufs.plane_c, quant_dests[0],
-                padded_pixels as u32, config.quantization_step, config.dead_zone,
-                true, padded_w, padded_h, config.tile_size, config.wavelet_levels,
-                &weights_luma, wm_param, 0.0,
+                ctx,
+                &mut cmd,
+                &bufs.plane_c,
+                quant_dests[0],
+                padded_pixels as u32,
+                config.quantization_step,
+                config.dead_zone,
+                true,
+                padded_w,
+                padded_h,
+                config.tile_size,
+                config.wavelet_levels,
+                &weights_luma,
+                wm_param,
+                0.0,
             );
             // Dequantize Y to get reconstructed luma (matching what decoder will produce)
             self.quantize.dispatch_adaptive(
-                ctx, &mut cmd, quant_dests[0], &bufs.plane_a,
-                padded_pixels as u32, config.quantization_step, config.dead_zone,
-                false, padded_w, padded_h, config.tile_size, config.wavelet_levels,
-                &weights_luma, wm_param, 0.0,
+                ctx,
+                &mut cmd,
+                quant_dests[0],
+                &bufs.plane_a,
+                padded_pixels as u32,
+                config.quantization_step,
+                config.dead_zone,
+                false,
+                padded_w,
+                padded_h,
+                config.tile_size,
+                config.wavelet_levels,
+                &weights_luma,
+                wm_param,
+                0.0,
             );
             cmd.copy_buffer_to_buffer(&bufs.plane_a, 0, &bufs.recon_y, 0, plane_size);
 
             // Co plane: CfL alpha → forward predict → quantize
             cmd.copy_buffer_to_buffer(plane_bufs[1], 0, &bufs.plane_c, 0, plane_size);
             self.cfl_alpha.dispatch(
-                ctx, &mut cmd, &bufs.recon_y, &bufs.plane_c,
-                &bufs.raw_alpha, &bufs.dq_alpha,
-                padded_w, padded_h, config.tile_size, config.wavelet_levels,
+                ctx,
+                &mut cmd,
+                &bufs.recon_y,
+                &bufs.plane_c,
+                &bufs.raw_alpha,
+                &bufs.dq_alpha,
+                padded_w,
+                padded_h,
+                config.tile_size,
+                config.wavelet_levels,
             );
             self.cfl_forward.dispatch(
-                ctx, &mut cmd, &bufs.plane_c, &bufs.recon_y, &bufs.dq_alpha, &bufs.plane_a,
-                padded_pixels as u32, padded_w, padded_h, config.tile_size, config.wavelet_levels,
+                ctx,
+                &mut cmd,
+                &bufs.plane_c,
+                &bufs.recon_y,
+                &bufs.dq_alpha,
+                &bufs.plane_a,
+                padded_pixels as u32,
+                padded_w,
+                padded_h,
+                config.tile_size,
+                config.wavelet_levels,
             );
             self.quantize.dispatch_adaptive(
-                ctx, &mut cmd, &bufs.plane_a, quant_dests[1],
-                padded_pixels as u32, config.quantization_step, config.dead_zone,
-                true, padded_w, padded_h, config.tile_size, config.wavelet_levels,
-                &weights_chroma, wm_param, 0.0,
+                ctx,
+                &mut cmd,
+                &bufs.plane_a,
+                quant_dests[1],
+                padded_pixels as u32,
+                config.quantization_step,
+                config.dead_zone,
+                true,
+                padded_w,
+                padded_h,
+                config.tile_size,
+                config.wavelet_levels,
+                &weights_chroma,
+                wm_param,
+                0.0,
             );
             cmd.copy_buffer_to_buffer(&bufs.raw_alpha, 0, &alpha_staging[0], 0, alpha_bytes);
 
             // Cg plane: CfL alpha → forward predict → quantize
             cmd.copy_buffer_to_buffer(plane_bufs[2], 0, &bufs.plane_c, 0, plane_size);
             self.cfl_alpha.dispatch(
-                ctx, &mut cmd, &bufs.recon_y, &bufs.plane_c,
-                &bufs.raw_alpha, &bufs.dq_alpha,
-                padded_w, padded_h, config.tile_size, config.wavelet_levels,
+                ctx,
+                &mut cmd,
+                &bufs.recon_y,
+                &bufs.plane_c,
+                &bufs.raw_alpha,
+                &bufs.dq_alpha,
+                padded_w,
+                padded_h,
+                config.tile_size,
+                config.wavelet_levels,
             );
             self.cfl_forward.dispatch(
-                ctx, &mut cmd, &bufs.plane_c, &bufs.recon_y, &bufs.dq_alpha, &bufs.plane_a,
-                padded_pixels as u32, padded_w, padded_h, config.tile_size, config.wavelet_levels,
+                ctx,
+                &mut cmd,
+                &bufs.plane_c,
+                &bufs.recon_y,
+                &bufs.dq_alpha,
+                &bufs.plane_a,
+                padded_pixels as u32,
+                padded_w,
+                padded_h,
+                config.tile_size,
+                config.wavelet_levels,
             );
             self.quantize.dispatch_adaptive(
-                ctx, &mut cmd, &bufs.plane_a, quant_dests[2],
-                padded_pixels as u32, config.quantization_step, config.dead_zone,
-                true, padded_w, padded_h, config.tile_size, config.wavelet_levels,
-                &weights_chroma, wm_param, 0.0,
+                ctx,
+                &mut cmd,
+                &bufs.plane_a,
+                quant_dests[2],
+                padded_pixels as u32,
+                config.quantization_step,
+                config.dead_zone,
+                true,
+                padded_w,
+                padded_h,
+                config.tile_size,
+                config.wavelet_levels,
+                &weights_chroma,
+                wm_param,
+                0.0,
             );
             cmd.copy_buffer_to_buffer(&bufs.raw_alpha, 0, &alpha_staging[1], 0, alpha_bytes);
         } else {
             // Non-CfL path: quantize all 3 planes directly
             for p in 0..3 {
-                let weights = if p == 0 { &weights_luma } else { &weights_chroma };
+                let weights = if p == 0 {
+                    &weights_luma
+                } else {
+                    &weights_chroma
+                };
                 cmd.copy_buffer_to_buffer(plane_bufs[p], 0, &bufs.plane_c, 0, plane_size);
                 self.quantize.dispatch_adaptive(
-                    ctx, &mut cmd, &bufs.plane_c, quant_dests[p],
-                    padded_pixels as u32, config.quantization_step, config.dead_zone,
-                    true, padded_w, padded_h, config.tile_size, config.wavelet_levels,
-                    weights, wm_param, 0.0,
+                    ctx,
+                    &mut cmd,
+                    &bufs.plane_c,
+                    quant_dests[p],
+                    padded_pixels as u32,
+                    config.quantization_step,
+                    config.dead_zone,
+                    true,
+                    padded_w,
+                    padded_h,
+                    config.tile_size,
+                    config.wavelet_levels,
+                    weights,
+                    wm_param,
+                    0.0,
                 );
             }
         }
@@ -4260,11 +5304,9 @@ impl EncoderPipeline {
 
         ctx.queue.submit(Some(cmd.finish()));
 
-        let rice_tiles = self.gpu_rice_encoder.finish_3planes_readback(
-            ctx,
-            info,
-            config.wavelet_levels,
-        );
+        let rice_tiles =
+            self.gpu_rice_encoder
+                .finish_3planes_readback(ctx, info, config.wavelet_levels);
 
         let cfl_alphas = if config.cfl_enabled {
             let mut cfl_alphas_all: Vec<i16> = Vec::new();
@@ -4497,7 +5539,6 @@ impl EncoderPipeline {
 
         (muls, global_max_abs)
     }
-
 }
 
 #[cfg(test)]
@@ -4512,7 +5553,10 @@ mod tests {
         assert!((low - max_mul).abs() < 0.01, "low energy mul={low}");
         // Very high energy → MIN_MUL=1.2 (preserve detail, always coarser than lowpass)
         let high = EncoderPipeline::map_energy_to_mul(100.0, max_mul);
-        assert!((high - 1.2).abs() < 0.01, "high energy mul={high} (expected MIN_MUL=1.2)");
+        assert!(
+            (high - 1.2).abs() < 0.01,
+            "high energy mul={high} (expected MIN_MUL=1.2)"
+        );
         // Medium energy → between 1.2 and max_mul
         let mid = EncoderPipeline::map_energy_to_mul(2.0, max_mul);
         assert!(mid > 1.2 && mid < max_mul, "mid energy mul={mid}");
@@ -4531,7 +5575,10 @@ mod tests {
             assert!(
                 muls[i] <= muls[i - 1],
                 "not monotonic: energy {:.2} → {:.3}, energy {:.2} → {:.3}",
-                energies[i - 1], muls[i - 1], energies[i], muls[i],
+                energies[i - 1],
+                muls[i - 1],
+                energies[i],
+                muls[i],
             );
         }
     }

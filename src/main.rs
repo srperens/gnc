@@ -1935,6 +1935,30 @@ fn main() {
                 });
             }
 
+            // VMAF scoring for I+P+B sequence.
+            if vmaf {
+                let tmp_ref  = std::env::temp_dir().join("gnc_ip_vmaf_ref.y4m");
+                let tmp_dist = std::env::temp_dir().join("gnc_ip_vmaf_dist.y4m");
+                let fps_int = fps.round() as u32;
+                let mut ref_wr = Y4mWriter::create(tmp_ref.to_str().unwrap(), w as usize, h as usize, fps_int, 1);
+                let mut dist_wr = Y4mWriter::create(tmp_dist.to_str().unwrap(), w as usize, h as usize, fps_int, 1);
+                for (orig, dec) in frames_data.iter().zip(decoded_all.iter()) {
+                    ref_wr.write_frame(orig);
+                    dist_wr.write_frame(dec);
+                }
+                ref_wr.flush();
+                dist_wr.flush();
+                print!("  VMAF: computing... ");
+                use std::io::Write as _;
+                std::io::stdout().flush().ok();
+                match run_vmaf(tmp_ref.to_str().unwrap(), tmp_dist.to_str().unwrap()) {
+                    Some((mean, min, max)) => println!("mean={:.2}  min={:.2}  max={:.2}", mean, min, max),
+                    None => println!("failed (is vmaf in PATH?)"),
+                }
+                let _ = std::fs::remove_file(&tmp_ref);
+                let _ = std::fs::remove_file(&tmp_dist);
+            }
+
             avg_bpp_ip =
                 compressed_ip.iter().map(|f| f.bpp()).sum::<f64>() / compressed_ip.len() as f64;
             let i_count = compressed_ip

@@ -4304,6 +4304,36 @@ impl EncoderPipeline {
                 bwd_mv_buf = bmb;
             }
 
+            // B-frame zero-MV tile skip: zero both MVs and force bidir mode for tiles
+            // whose bidir zero-MV SAD is below threshold.  Must run AFTER ME and BEFORE
+            // MV scaling + MC.  Submitted in a separate encoder so that the 4:2:0 MV
+            // scale (also a separate submit) sees the already-zeroed MVs for skip tiles.
+            // Y-plane drives the skip decision; chroma follows via the MV scaling path.
+            {
+                let skip_thr = tile_skip_motion_threshold(config.quantization_step);
+                let mut skip_cmd =
+                    ctx.device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("bf_skip_bidir"),
+                        });
+                self.dispatch_tile_skip_bidir(
+                    ctx,
+                    &mut skip_cmd,
+                    &bufs.plane_a,               // current Y plane
+                    &bufs.gpu_ref_planes[0],     // forward reference Y plane
+                    &bufs.gpu_bwd_ref_planes[0], // backward reference Y plane
+                    &fwd_mv_buf,
+                    &bwd_mv_buf,
+                    &bufs.bidir_modes_scratch,
+                    padded_w,
+                    padded_h,
+                    config.tile_size,
+                    ME_BLOCK_SIZE,
+                    skip_thr,
+                );
+                ctx.queue.submit(Some(skip_cmd.finish()));
+            }
+
             // 4:2.0 chroma-domain MC for B-frames: pre-scale both fwd and bwd MVs to chroma dims.
             if is_420 {
                 let mut cmd_scale =
@@ -4879,7 +4909,34 @@ impl EncoderPipeline {
             fwd_mv_buf = fmb;
             bwd_mv_buf = bmb;
             modes_buf_owned = mmb;
+
+            // B-frame zero-MV tile skip: submit ME first (ME outputs are in flight),
+            // then run skip pass on a separate cmd to zero MVs for static tiles.
             ctx.queue.submit(Some(cmd.finish()));
+            {
+                let skip_thr = tile_skip_motion_threshold(config.quantization_step);
+                let mut skip_cmd =
+                    ctx.device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("bf_skip_bidir"),
+                        });
+                self.dispatch_tile_skip_bidir(
+                    ctx,
+                    &mut skip_cmd,
+                    &bufs.plane_a,               // current Y plane
+                    &bufs.gpu_ref_planes[0],     // forward reference Y plane
+                    &bufs.gpu_bwd_ref_planes[0], // backward reference Y plane
+                    &fwd_mv_buf,
+                    &bwd_mv_buf,
+                    &modes_buf_owned,
+                    padded_w,
+                    padded_h,
+                    config.tile_size,
+                    ME_BLOCK_SIZE,
+                    skip_thr,
+                );
+                ctx.queue.submit(Some(skip_cmd.finish()));
+            }
 
             for p in 0..3 {
                 let weights = if p == 0 {

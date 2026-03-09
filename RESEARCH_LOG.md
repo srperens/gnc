@@ -4,6 +4,38 @@
 
 ---
 
+## 2026-03-09: Research Scientist — full literature review + priority recommendations
+
+### Summary
+Full review of all project docs + web literature search (VC-2/Dirac, JPEG XS, OBMC, MCTF).
+
+### Top 5 priorities
+
+1. **B-frame zero-MV skip** — B-frames not yet covered by skip logic. Est. −5% bpp bbb. Low complexity, no bitstream change. 0.5 days.
+2. **JPEG XS TDC (Temporal Differential Coding)** — subtract previous frame's wavelet coefficients in coefficient domain before quantizing. No ME needed, perfect GPU parallelism. JPEG XS 3rd edition (2024) validates industrially (up to 10 dB improvement, 20:1 on static content). Est. −15% bpp bbb. New per-frame flag only. 2–3 days.
+3. **Scene cut detection (#17)** — robustness item, prevents cross-cut B-frame quality bugs. ~50 lines, no bitstream change.
+4. **OBMC (Overlapped Block Motion Compensation)** — Dirac/VC-2's technique for smoothing within-tile block-boundary discontinuities in the residual. Est. −10% bpp crowd_run P-frames. Medium complexity. 3–5 days.
+5. **Fused wavelet kernel** — speed item. I-frame ~250ms dominates I+P+B fps. Fused single dispatch with shared memory. Est. I-frame <180ms, bringing total to ~28–32 fps.
+
+### Firm rejects
+- **MCTF** — architecturally incompatible with tile independence (temporal Haar already proved the tradeoff)
+- **SPIHT/SPECK** — entropy gap 0.1–0.2 bpp; BD-rate gap 2–5×. Wrong problem.
+- **Trellis quantization** — sequential Viterbi, GPU-hostile
+- **Intra prediction on wavelet** — hard prohibition backed by empirical evidence
+- **Affine ME** — poor complexity-to-gain for translational broadcast content
+- **Multi-reference P-frames (#25)** — defer until MV histogram confirms >15% non-adjacent references
+- **Parent-child Rice context (#21)** — proven negative (bpp increased)
+
+### Key new idea: TDC
+JPEG XS 3rd edition (2024) standardized Temporal Differential Coding: current frame's wavelet coefficients minus previous frame's coefficients. For static tiles, difference ≈ zero → compresses to near-nothing. Tile-independent, random-access friendly, trivially GPU-parallel. Distinct from temporal Haar (TDC = simple frame differencing; Haar = full lifting decomposition). Can be applied conditionally per tile using existing tile_energy_reduce infrastructure.
+
+### Questions to resolve before implementation
+1. Can TDC reuse existing temporal lifting infrastructure in sequence.rs, or does it need a new path?
+2. Does tile_skip_motion.wgsl need modification for B-frame bidir SAD?
+3. Profile I-frame wavelet dispatch pattern in pipeline.rs before committing to fused kernel.
+
+---
+
 ## 2026-03-09: #23 Tile skip mode — infrastructure built, threshold calibration failed
 
 ### Hypothesis

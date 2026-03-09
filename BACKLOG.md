@@ -15,13 +15,16 @@ H.264 comparison (#22) established the north star: GNC needs **2–5× more bits
 - Rice+ZRL vs arithmetic coding is only ~0.1–0.2 bpp — not the bottleneck
 - Entropy-improvement items (#21, #7) are deprioritized; focus shifts to temporal prediction
 
-**Priority order for compression gains:**
-1. **#23 Skip/merge modes** (DONE) — Zero-MV tile skip deployed: −2.7% bpp bbb, VMAF neutral
-2. **#24 Larger ME search range** (P2) — Current block_match is range-limited; larger range reduces residual for fast-motion
-3. **#25 Multi-reference P-frames** (P2) — Use >1 reference frame for P-frames; improves repeated textures
-4. **#17 Scene cut detection** (P3) — Correctness/robustness, small bpp gain
-5. **#21 Parent-child Rice k** (CLOSED — empirically vetoed)
-6. **#7 LL subband prediction** (CLOSED — skip)
+**Priority order (updated 2026-03-09 — Research Scientist full literature review, see RESEARCH_LOG.md):**
+1. **#26 B-frame zero-MV skip** (P1) — extend #23 to B-frames; same infrastructure, est. −5% bpp bbb, 0.5 days
+2. **#27 Temporal Differential Coding (TDC)** (P1) — JPEG XS 3rd edition: subtract prev frame's wavelet coefficients before quantizing; no ME, GPU-trivial, est. −15% bpp bbb, 2–3 days
+3. **#17 Scene cut detection** (P3) — robustness, ~50 lines, no bitstream change
+4. **#28 OBMC** (P2) — Overlapped Block MC (Dirac/VC-2 technique); eliminate within-tile block-boundary residuals; est. −10% bpp crowd_run P-frames, 3–5 days
+5. **#29 Fused wavelet kernel** (P2, speed) — single dispatch for all wavelet levels; I-frame 250ms → <180ms; brings I+P+B to ~28–32 fps
+6. **#24 Larger ME search range** (DEFER — check MV histogram first; P-frame range may already cover content)
+7. **#25 Multi-reference P-frames** (DEFER — gate on MV histogram >15% non-adjacent refs)
+8. **#21 Parent-child Rice k** (CLOSED — proven negative)
+9. **#7 LL subband prediction** (CLOSED — wrong problem)
 
 ## Items
 
@@ -240,11 +243,12 @@ H.264 comparison (#22) established the north star: GNC needs **2–5× more bits
 - **Next step if more savings needed:** (a) More aggressive threshold calibration; (b) B-frame zero-MV skip; (c) Merge mode: use non-zero co-located MV (better prediction for slow-motion tiles). See #24 (larger search range) for high-motion gains instead.
 
 ### 24. Larger ME search range
-- **Status:** todo (P2)
+- **Status:** investigated (2026-03-09) — precondition likely false; deprioritized
 - **Motivation:** Current block_match.wgsl uses a fixed hierarchical search range. On fast-motion content (crowd_run, park_joy), many blocks may have the true motion vector outside the current search window, forcing a large residual. H.264's full-pel search typically covers ±64–128 pixels with hierarchical refinement.
 - **Hypothesis:** Doubling the coarse search range reduces average residual energy on high-motion sequences by 5–10%, at the cost of ~2× ME compute time.
 - **Success criteria:** bpp −3% on crowd_run q=75; VMAF neutral; fps ≥17 (acceptable regression since quality gain is the goal).
-- **Note:** Profile ME time first. If ME is already <20% of total encode, range increase is free. If ME is 40%+, may need hierarchical shortcutting.
+- **Research Scientist verdict (2026-03-09):** MODIFY. P-frame already uses ±32 px; at 30fps this covers 960 px/sec — faster than broadcast content. The precondition (range-limited MVs) is likely false. Increasing range would quadruple coarse candidates (O(range²)) and push ME from 22ms to 80-100ms for likely zero bpp gain. Deprioritized in favor of #25. If revived, check MV histogram first — need >10% blocks with |MV| >28 px as gate.
+- **Note:** If any range issue exists, it is more likely in B-frames (±16 px) than P-frames (±32 px).
 
 ### 25. Multi-reference P-frames
 - **Status:** todo (P2)
@@ -252,3 +256,42 @@ H.264 comparison (#22) established the north star: GNC needs **2–5× more bits
 - **Hypothesis:** Allowing P-frames to choose the best of 2 reference frames (prev and prev-prev) reduces bpp 3–8% on sequences with periodic motion or scene repetition.
 - **Success criteria:** bpp −3% on at least one test sequence; VMAF neutral; no regression on bbb/crowd_run.
 - **Complexity:** Medium. Requires decoder to track a reference buffer (already partially done for B-frames). ME shader needs a second reference input and cost comparison.
+- **Research Scientist verdict (2026-03-09):** DEFER. Expected gain requires content with periodic motion; current test sequences (bbb, crowd_run, rush_hour, park_joy) don't exhibit this. Gate on adding a periodic-motion test sequence AND running MV histogram showing >15% non-adjacent references.
+
+### 26. B-frame zero-MV skip
+- **Status:** done (2026-03-09)
+- **Motivation:** #23 implemented P-frame zero-MV skip (−2.7% bpp bbb). B-frames are not covered. B-frames in bbb, rush_hour, and slow-pan content have many near-static tiles where the bidir prediction is already excellent and the residual is near-zero.
+- **Hypothesis:** For B-frames where bidir zero-MV SAD < qstep/2, zero both forward and backward MVs before MC dispatch. The residual collapses to near-zero and Rice encodes it cheaply. Expected: −5% bpp on bbb B-frames, VMAF neutral.
+- **Implementation:** New shader `tile_skip_bidir.wgsl`: per-tile bidir zero-MV SAD = |current − avg(fwd_ref, bwd_ref)|. If mean SAD < qstep/2: zeros both fwd+bwd MVs, forces block_modes=2 (bidir). Dispatched after estimate_bidir, before compensate_bidir. No bitstream format change.
+- **Result:** bbb −3.6% bpp (B-frames shrank 32–41% individually), VMAF −0.01 pts. No regression on crowd_run or park_joy. 163 tests pass, zero clippy warnings.
+
+### 27. Temporal Differential Coding (TDC)
+- **Status:** todo (P1)
+- **Motivation:** JPEG XS 3rd edition (ISO/IEC 2024) standardized TDC as a way to exploit temporal redundancy without motion estimation. For static or slowly-moving tile regions, simply subtracting the previous frame's wavelet coefficients from the current frame's coefficients produces near-zero differences → Rice encodes them with minimal bits. Expected: −15% bpp on bbb (large static background regions), less on high-motion content.
+- **Hypothesis:** Subtracting prev_frame quantized coefficients (from the local decode buffer) from current frame pre-quantization produces a coefficient difference with lower energy than the absolute coefficients for static regions. Tile-conditional: only apply when tile_energy_delta < threshold (existing tile_energy_reduce.wgsl infrastructure). Expected −10 to −20% bpp on bbb, ~0% on crowd_run.
+- **GPU fit:** Excellent. Per-coefficient subtraction is embarrassingly parallel. No ME, no cross-tile deps.
+- **Implementation sketch:**
+  1. After spatial wavelet dispatch, before quantize dispatch: new shader `temporal_diff.wgsl` subtracts prev frame's coefficient buffer (from local decode) per-tile when skip flag not set.
+  2. Decoder: after Rice decode + dequantize, add prev frame's coefficient buffer back before inverse wavelet.
+  3. Per-frame flag in GNV1 header: `frame_temporal_diff = 1` means coefficients are delta, not absolute.
+  4. Tile-conditional: per-tile flag (1 bit) indicating whether that tile used TDC or absolute coding.
+- **Risks:** (a) Error propagation — dequantization noise accumulates across TDC frames; need periodic refresh (I-frames already provide this at ki=8). (b) High-motion tiles may INCREASE bpp if differences are larger than absolutes — tile-conditional logic prevents this. (c) Bitstream format change (new flags).
+- **Success criteria:** −10% bpp on bbb q=75; VMAF ±0.3 pts; crowd_run bpp ±2%; park_joy bpp ±2%. All tests pass.
+- **Note:** Pre-implementation question: can the existing temporal wavelet coefficient buffers (from Haar work) be reused for storing prev-frame coefficients, or does this need a new buffer?
+
+### 28. Overlapped Block Motion Compensation (OBMC)
+- **Status:** todo (P2)
+- **Motivation:** Dirac/VC-2 uses OBMC to eliminate block-boundary discontinuities in the MC residual. GNC's current hard-boundary 16×16 block MC produces residuals with artificial discontinuities every 16 pixels — these are expensive for the wavelet to code (discontinuities spread energy across all wavelet levels). OBMC blends predictions from neighboring blocks using a raised-cosine (Hann) window, making the residual smooth.
+- **Hypothesis:** OBMC reduces P-frame residual energy by 0.8–2.2 dB (literature: Orchard & Sullivan 1994, Dirac spec), translating to ~10–20% bpp reduction on P/B-frames. Works within-tile only (tile independence preserved — no cross-tile blending).
+- **GPU fit:** Good. Each pixel's prediction is a weighted blend of predictions from its block and up to 3 neighboring blocks' MVs. All MVs for a tile are in GPU memory before MC dispatch. Per-pixel computation remains independent.
+- **Implementation:** Modify motion_compensate.wgsl. For each pixel, compute prediction as: w_self * pred(MV_self) + w_right * pred(MV_right) + w_below * pred(MV_below) + w_br * pred(MV_br), where w are raised-cosine weights. At tile boundary: only self-prediction (no cross-tile blending).
+- **Correctness gate:** Before GPU implementation, prototype blending weights on CPU and verify reconstruction identity. The decoder must apply identical blending to the MC reference.
+- **Success criteria:** P-frame bpp −10% on crowd_run q=75 (VMAF neutral ±0.3 pts); 3-sequence validation. Bitstream: OBMC enable flag per sequence (minor version bump).
+
+### 29. Fused multi-level wavelet kernel (speed)
+- **Status:** todo (P2, speed only)
+- **Motivation:** I-frame encode takes ~250ms at 1080p q=75, dominating I+P+B total fps (~20 fps). The spatial wavelet dispatches 3–4 levels sequentially (each level requires the previous to complete). Fusing levels into a single dispatch using workgroup shared memory for intermediate levels eliminates the GPU pipeline stalls between levels.
+- **Hypothesis:** Single-dispatch multi-level CDF 9/7 wavelet using 32KB shared memory (M1 limit) reduces I-frame wavelet time by 25–40%. With I-frame wavelet at ~64ms (28% of I-frame time), this saves 16–25ms per I-frame → I+P+B fps improves from ~20 to ~23–25 fps.
+- **Pre-condition:** Profile pipeline.rs to confirm sequential dispatch+poll between wavelet levels. If already fused in a single command encoder with no intermediate polls, gain is minimal.
+- **GPU fit:** Good. CDF 9/7 has a 9-tap filter; at 256×256 tile with 4-level decomposition, shared memory usage per workgroup is within 32KB M1 limit.
+- **Success criteria:** I-frame encode time <180ms at 1080p q=75 (from ~250ms); VMAF identical; all tests pass. Bitstream: no change.

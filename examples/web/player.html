@@ -602,8 +602,9 @@
             { name: 'rush_hour.gnv',   label: 'Rush Hour',        desc: '200f 25fps 1080p q=75 — city traffic, slow pan', group: 'I+P (motion vectors)' },
             { name: 'old_town_cross.gnv', label: 'Old Town Cross', desc: '200f 50fps 1080p q=75 — urban pedestrians', group: 'I+P (motion vectors)' },
             { name: 'pedestrian_area.gnv', label: 'Pedestrian Area', desc: '200f 25fps 1080p q=75 — walking crowd', group: 'I+P (motion vectors)' },
-            { name: 'bbb_2min.gnv',    label: 'BBB 2 min q=75',   desc: '1800f 30fps 1080p q=75 — animated film, varied scenes', group: 'I+P (motion vectors)' },
-            { name: 'bbb_2min_q5.gnv', label: 'BBB 2 min q=5',    desc: '1800f 30fps 1080p q=5 — extreme compression, visible artefacts', group: 'I+P (motion vectors)' },
+            { name: 'bbb_2min.gnv',         label: 'BBB 2 min q=75',       desc: '1800f 30fps 1080p q=75 4:4:4 — animated film, varied scenes', group: 'I+P (motion vectors)' },
+            { name: 'bbb_2min_420_q25.gnv', label: 'BBB 2 min q=25 4:2:0', desc: '1800f 30fps 1080p q=25 4:2:0 — same clip, lower bitrate', group: 'I+P (motion vectors)' },
+            { name: 'bbb_2min_q5.gnv',      label: 'BBB 2 min q=5',        desc: '1800f 30fps 1080p q=5 4:4:4 — extreme compression, visible artefacts', group: 'I+P (motion vectors)' },
             // Temporal wavelet — same clips for direct comparison
             { name: 'tw_ducks_q75.gnv2',        label: 'Ducks Take Off',   desc: '300f 50fps 1080p q=75 Haar temporal wavelet', group: 'Temporal Wavelet (Haar)' },
             { name: 'tw_rush_hour.gnv2',         label: 'Rush Hour',        desc: '200f 25fps 1080p q=75 Haar temporal wavelet', group: 'Temporal Wavelet (Haar)' },

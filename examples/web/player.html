@@ -636,10 +636,12 @@
             { name: 'chroma_sky_422.gnv', label: 'BlueSky 4:2:2 q75', desc: '1f 1080p q=75 — halved horiz chroma (2.32 bpp, −30%)', group: 'Chroma (4:4:4 vs 4:2:2 vs 4:2:0)' },
             { name: 'chroma_sky_420.gnv', label: 'BlueSky 4:2:0 q75', desc: '1f 1080p q=75 — quarter chroma (1.87 bpp, −43%)', group: 'Chroma (4:4:4 vs 4:2:2 vs 4:2:0)' },
             // Chroma video sequences (8 frames, I+P, 1080p)
-            { name: 'seq_bbb_422_q75.gnv', label: 'BBB 4:2:2 q75', desc: '8f 30fps 1080p q=75 — I+P, halved horiz chroma (2.09 bpp avg)', group: 'Chroma Video (I+P)' },
-            { name: 'seq_bbb_420_q75.gnv', label: 'BBB 4:2:0 q75', desc: '8f 30fps 1080p q=75 — I+P, quarter chroma (1.96 bpp avg)', group: 'Chroma Video (I+P)' },
-            { name: 'seq_sky_422_q75.gnv', label: 'BlueSky 4:2:2 q75', desc: '8f 30fps 1080p q=75 — I+P, halved horiz chroma (1.92 bpp avg)', group: 'Chroma Video (I+P)' },
-            { name: 'seq_sky_420_q75.gnv', label: 'BlueSky 4:2:0 q75', desc: '8f 30fps 1080p q=75 — I+P, quarter chroma (1.77 bpp avg)', group: 'Chroma Video (I+P)' },
+            { name: 'seq_bbb_444_q75.gnv', label: 'BBB 4:4:4 q75', desc: '8f 30fps 1080p q=75 — I+P, full chroma (2.32 bpp avg)', group: 'Chroma Video (I+P)' },
+            { name: 'seq_bbb_422_q75.gnv', label: 'BBB 4:2:2 q75', desc: '8f 30fps 1080p q=75 — I+P, halved horiz chroma (1.87 bpp avg)', group: 'Chroma Video (I+P)' },
+            { name: 'seq_bbb_420_q75.gnv', label: 'BBB 4:2:0 q75', desc: '8f 30fps 1080p q=75 — I+P, quarter chroma (1.81 bpp avg)', group: 'Chroma Video (I+P)' },
+            { name: 'seq_sky_444_q75.gnv', label: 'BlueSky 4:4:4 q75', desc: '8f 30fps 1080p q=75 — I+P, full chroma (3.33 bpp avg)', group: 'Chroma Video (I+P)' },
+            { name: 'seq_sky_422_q75.gnv', label: 'BlueSky 4:2:2 q75', desc: '8f 30fps 1080p q=75 — I+P, halved horiz chroma (2.40 bpp avg)', group: 'Chroma Video (I+P)' },
+            { name: 'seq_sky_420_q75.gnv', label: 'BlueSky 4:2:0 q75', desc: '8f 30fps 1080p q=75 — I+P, quarter chroma (2.08 bpp avg)', group: 'Chroma Video (I+P)' },
         ];
 
         function formatSize(bytes) {

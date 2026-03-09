@@ -344,15 +344,19 @@ impl DecoderPipeline {
             }
 
             // For non-444 chroma (p>0): upsample scratch_a from chroma size to luma size.
-            // Exception: 4:2:0 P-frame chroma uses chroma-domain MC (see below).
+            // Exceptions that skip the upsample here and handle MC at chroma dims directly:
+            //   - 4:2:0 P-frame: chroma-domain MC (box-filter ref + scaled MVs)
+            //   - 4:2:0 B-frame: chroma-domain bidir MC (same principle as P-frame)
             // For 444: scratch_a is already at luma size.
             let is_non444_chroma = p > 0 && info.chroma_format != ChromaFormat::Yuv444;
             // 4:2:0 P-frame chroma: perform MC at chroma dims to avoid NN-upsample HF artifacts.
             // The encoder stores gpu_ref_planes[p] at luma dims (NN-upsampled), so
             // box_filter(ref) recovers the correct chroma-resolution reference.
             let is_420_pframe_chroma = is_420 && is_pframe && p > 0;
-            if is_non444_chroma && !is_420_pframe_chroma {
-                // 4:2:2 or I/B-frame non-444: upsample chroma residual to luma dims first.
+            // 4:2:0 B-frame chroma: same chroma-domain bidir MC — scratch_a must stay at chroma dims.
+            let is_420_bframe_chroma = is_420 && is_bframe && p > 0;
+            if is_non444_chroma && !is_420_pframe_chroma && !is_420_bframe_chroma {
+                // 4:2:2 or I/B-frame non-444 (non-420 B-frame): upsample chroma residual to luma dims first.
                 let up_buf = if p == 1 {
                     &bufs.co_plane_up
                 } else {

@@ -24,6 +24,18 @@ const DEFAULT_FPS: f64 = 30.0;
 /// A value of 2 gives groups of [B B P] — standard for moderate latency.
 const B_FRAMES_PER_GROUP: usize = 2;
 
+/// Pre-computed ME results for a P-frame.
+/// Produced by the look-ahead ME pass that runs while the previous frame's
+/// Metal sync is in progress, overlapping ~18ms of sync latency with ~20ms of ME.
+struct PrecomputedPFrameME {
+    mv_buf: wgpu::Buffer,
+    split_mv_buf: wgpu::Buffer,
+    /// When true, the look-ahead also ran phases 0b+1a+1b (pad+color+deinterleave),
+    /// meaning plane_a/co_plane/cg_plane already hold this frame's preprocessed data.
+    /// Safe to set only when NO B-frames will run between the look-ahead and this frame.
+    includes_preprocess: bool,
+}
+
 /// Per-frame metadata used when batching temporal highpass frame encoding.
 /// Collected during Pass A (adaptive-mul computation) and consumed in Pass C
 /// (batched GPU quantize + Rice encode).
@@ -150,6 +162,11 @@ impl EncoderPipeline {
         };
         let mut prev_twav_coeffs: Option<[Vec<f32>; 3]> = None;
 
+        // Look-ahead ME pipelining: pre-compute ME for the next P-frame while the
+        // current frame's Metal sync is in progress. Only active in P-frame-only mode
+        // (B-frame groups use a different submit pattern).
+        let mut pending_me: Option<PrecomputedPFrameME> = None;
+
         let mut display_idx = 0;
         while display_idx < n {
             let is_keyframe = ki <= 1 || display_idx % ki == 0 || !has_reference;
@@ -184,6 +201,7 @@ impl EncoderPipeline {
                 }
                 has_reference = true;
                 prev_mv_buf = None;
+                pending_me = None; // discard look-ahead ME on keyframe boundary
                 if diag_enabled {
                     last_iframe_bytes = Some(compressed.byte_size());
                     let d = diagnostics::collect(
@@ -255,7 +273,17 @@ impl EncoderPipeline {
                 let next_is_key_or_end =
                     display_idx + 1 >= n || (ki > 1 && (display_idx + 1) % ki == 0);
                 let frame_data = load_frame(display_idx);
-                let (compressed, new_mv_buf) = self.encode_pframe(
+
+                // Look-ahead: load next frame's pixels now so encode_pframe can submit
+                // its ME-only command before the poll, hiding Metal sync latency.
+                // Only when next frame is a P-frame (not keyframe, not end of sequence).
+                let next_pframe_pixels: Option<Vec<f32>> = if !next_is_key_or_end {
+                    Some(load_frame(display_idx + 1))
+                } else {
+                    None
+                };
+
+                let (compressed, new_mv_buf, next_precomputed) = self.encode_pframe(
                     ctx,
                     &frame_data,
                     width,
@@ -268,7 +296,13 @@ impl EncoderPipeline {
                     prev_mv_buf.as_ref(),
                     false,
                     !next_is_key_or_end,
+                    pending_me.take(),
+                    next_pframe_pixels.as_deref(),
+                    // P-only mode: no B-frames between look-ahead and next P-frame,
+                    // so preprocess results are safe to cache.
+                    true,
                 );
+                pending_me = next_precomputed;
                 prev_mv_buf = Some(new_mv_buf);
                 if let Some(ref mut rc) = rate_ctrl {
                     rc.update(frame_config.quantization_step, compressed.bpp());
@@ -360,7 +394,18 @@ impl EncoderPipeline {
                     config.clone()
                 };
                 let p_frame_data = load_frame(p_display);
-                let (compressed, new_mv_buf) = self.encode_pframe(
+
+                // Look-ahead: pre-compute ME for the NEXT group's anchor P-frame
+                // so it overlaps with this frame's Metal sync latency.
+                let next_anchor_display = group_start + group_size + b_count;
+                let next_anchor_pixels: Option<Vec<f32>> =
+                    if g + 1 < full_groups && next_anchor_display < n {
+                        Some(load_frame(next_anchor_display))
+                    } else {
+                        None
+                    };
+
+                let (compressed, new_mv_buf, next_precomputed) = self.encode_pframe(
                     ctx,
                     &p_frame_data,
                     width,
@@ -373,7 +418,13 @@ impl EncoderPipeline {
                     prev_mv_buf.as_ref(),
                     true,
                     true, // anchor P always needs decode (bwd ref for B-frames)
+                    pending_me.take(),
+                    next_anchor_pixels.as_deref(),
+                    // B-frame mode: B-frames run between look-ahead and next anchor P,
+                    // so preprocess results would be overwritten — not safe to cache.
+                    false,
                 );
+                pending_me = next_precomputed;
                 prev_mv_buf = Some(new_mv_buf);
                 if let Some(ref mut rc) = rate_ctrl {
                     rc.update(p_config.quantization_step, compressed.bpp());
@@ -556,9 +607,18 @@ impl EncoderPipeline {
                     config.clone()
                 };
                 // Skip decode if next frame is keyframe or end of sequence
-                let rem_needs_decode = j + 1 < next_key && j + 1 < n;
+                let next_is_rem_pframe = j + 1 < next_key && j + 1 < n;
+                let rem_needs_decode = next_is_rem_pframe;
                 let rem_frame_data = load_frame(j);
-                let (compressed, new_mv_buf) = self.encode_pframe(
+
+                // Look-ahead: pre-compute ME for the next remainder P-frame if available.
+                let next_rem_pixels: Option<Vec<f32>> = if next_is_rem_pframe {
+                    Some(load_frame(j + 1))
+                } else {
+                    None
+                };
+
+                let (compressed, new_mv_buf, next_precomputed) = self.encode_pframe(
                     ctx,
                     &rem_frame_data,
                     width,
@@ -571,7 +631,13 @@ impl EncoderPipeline {
                     prev_mv_buf.as_ref(),
                     false,
                     rem_needs_decode,
+                    pending_me.take(),
+                    next_rem_pixels.as_deref(),
+                    // Consecutive remainder P-frames within the same GOP have no B-frames
+                    // between them, so preprocess results are safe to cache.
+                    next_is_rem_pframe,
                 );
+                pending_me = next_precomputed;
                 prev_mv_buf = Some(new_mv_buf);
                 if let Some(ref mut rc) = rate_ctrl {
                     rc.update(p_config.quantization_step, compressed.bpp());
@@ -2334,15 +2400,32 @@ impl EncoderPipeline {
         predictor_mvs: Option<&wgpu::Buffer>,
         save_bwd_ref: bool,
         needs_decode: bool,
-    ) -> (CompressedFrame, wgpu::Buffer) {
+        // Pre-computed ME from the previous frame's look-ahead. When Some, the
+        // preprocess + ME phases are skipped (the GPU already ran them).
+        precomputed_me: Option<PrecomputedPFrameME>,
+        // Pixel data for the *next* frame. When Some, encode_pframe will upload it
+        // and submit a ME-only command before the poll, hiding Metal sync latency.
+        next_frame_pixels: Option<&[f32]>,
+        // When true, the look-ahead command also runs phases 0b+1a+1b (pad+color+deinterleave),
+        // so the next frame can skip those too. Set true ONLY when no B-frames will run
+        // between this look-ahead and the next encode_pframe call (i.e. P-only mode).
+        lookahead_preprocess: bool,
+    ) -> (CompressedFrame, wgpu::Buffer, Option<PrecomputedPFrameME>) {
         let plane_size = (padded_pixels * std::mem::size_of::<f32>()) as u64;
 
         self.ensure_cached(ctx, padded_w, padded_h, width, height);
         let bufs = self.cached.as_ref().unwrap();
 
-        // Upload raw (unpadded) frame — GPU shader handles padding
-        ctx.queue
-            .write_buffer(&bufs.raw_input_buf, 0, bytemuck::cast_slice(rgb_data));
+        // Upload raw (unpadded) frame — GPU shader handles padding.
+        // Skip when precomputed_me includes preprocess: look-ahead already uploaded
+        // and processed this frame's pixels, and no intermediate B-frames corrupted them.
+        let skip_upload = precomputed_me
+            .as_ref()
+            .is_some_and(|p| p.includes_preprocess);
+        if !skip_upload {
+            ctx.queue
+                .write_buffer(&bufs.raw_input_buf, 0, bytemuck::cast_slice(rgb_data));
+        }
 
         // --- Residual-adapted quantization for P-frames ---
         // MC residuals are noise-like: energy spread uniformly across wavelet subbands.
@@ -2463,94 +2546,124 @@ impl EncoderPipeline {
                 }
             }
 
-            // Phase 0b: GPU padding (raw → padded, edge-replicate)
-            self.dispatch_gpu_pad_cached(ctx, &mut cmd, padded_w, padded_h);
+            // Determine whether phases 0b+1a+1b (preprocess) can be skipped.
+            // Safe only when the look-ahead also ran them AND no B-frames ran between
+            // the look-ahead and this call (which would have overwritten plane_a).
+            let skip_preprocess = precomputed_me
+                .as_ref()
+                .is_some_and(|p| p.includes_preprocess);
 
-            // Phase 1: Preprocess + ME + MC + transform + quantize (all 3 planes)
-            self.color.dispatch(
-                ctx,
-                &mut cmd,
-                &bufs.input_buf,
-                &bufs.color_out,
-                padded_w,
-                padded_h,
-                true,
-                config.is_lossless(),
-            );
-            self.deinterleaver.dispatch(
-                ctx,
-                &mut cmd,
-                &bufs.color_out,
-                &bufs.plane_a,
-                &bufs.co_plane,
-                &bufs.cg_plane,
-                padded_pixels as u32,
-            );
+            if !skip_preprocess {
+                // Phase 0b: GPU padding (raw → padded, edge-replicate)
+                self.dispatch_gpu_pad_cached(ctx, &mut cmd, padded_w, padded_h);
 
-            // Profiling: flush preprocess to isolate ME timing
-            if profile {
-                ctx.queue.submit(Some(cmd.finish()));
-                ctx.device.poll(wgpu::Maintain::Wait);
-                eprintln!(
-                    "    P preprocess: {:.1}ms",
-                    _t_pf.elapsed().as_secs_f64() * 1000.0
+                // Phase 1a/1b: Color conversion + deinterleave → plane_a/co_plane/cg_plane
+                self.color.dispatch(
+                    ctx,
+                    &mut cmd,
+                    &bufs.input_buf,
+                    &bufs.color_out,
+                    padded_w,
+                    padded_h,
+                    true,
+                    config.is_lossless(),
                 );
-                cmd = ctx
-                    .device
-                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                        label: Some("pf_me"),
-                    });
+                self.deinterleaver.dispatch(
+                    ctx,
+                    &mut cmd,
+                    &bufs.color_out,
+                    &bufs.plane_a,
+                    &bufs.co_plane,
+                    &bufs.cg_plane,
+                    padded_pixels as u32,
+                );
             }
 
-            let _t_me = std::time::Instant::now();
-            let me_params = if predictor_mvs.is_some() {
-                &bufs.me_params_pred
+            if let Some(pre_me) = precomputed_me {
+                // Phase 2 skipped: Look-ahead ME was pre-computed while the previous
+                // frame's Metal sync ran. Reuse the pre-computed MV buffers directly.
+                if profile {
+                    if skip_preprocess {
+                        eprintln!(
+                            "[me_pipeline] used precomputed ME (skipping phases 0b/1a/1b/2)"
+                        );
+                    } else {
+                        eprintln!("[me_pipeline] used precomputed ME (skipping phase 2 only)");
+                    }
+                }
+                mv_buf = pre_me.mv_buf;
+                split_mv_buf = pre_me.split_mv_buf;
             } else {
-                &bufs.me_params_nopred
-            };
-            mv_buf = self.motion.estimate_cached(
-                ctx,
-                &mut cmd,
-                &bufs.plane_a,
-                &bufs.gpu_ref_planes[0],
-                padded_w,
-                padded_h,
-                predictor_mvs,
-                me_params,
-                &bufs.me_sad_buf,
-                &bufs.me_dummy_pred,
-            );
+                // Standard path: run ME + split inline.
+                if profile {
+                    eprintln!("[me_pipeline] computing ME inline");
+                }
 
-            // Variable block size: 8x8 split decision
-            // Lambda must be high enough to prevent unnecessary splits on easy content.
-            // Each split adds 3 extra MVs (12 bytes raw); must outweigh residual savings.
-            let lambda_sad = (config.quantization_step * 16.0 + 128.0).round() as u32;
-            split_mv_buf = self.motion.estimate_split(
-                ctx,
-                &mut cmd,
-                &bufs.plane_a,
-                &bufs.gpu_ref_planes[0],
-                &mv_buf,
-                &bufs.me_sad_buf,
-                None, // 8x8 temporal predictor (future enhancement)
-                padded_w,
-                padded_h,
-                lambda_sad,
-            );
+                // Profiling: flush preprocess to isolate ME timing
+                if profile {
+                    ctx.queue.submit(Some(cmd.finish()));
+                    ctx.device.poll(wgpu::Maintain::Wait);
+                    eprintln!(
+                        "    P preprocess: {:.1}ms",
+                        _t_pf.elapsed().as_secs_f64() * 1000.0
+                    );
+                    cmd = ctx
+                        .device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("pf_me"),
+                        });
+                }
 
-            // Profiling: flush ME to isolate MC+wavelet+quantize timing
-            if profile {
-                ctx.queue.submit(Some(cmd.finish()));
-                ctx.device.poll(wgpu::Maintain::Wait);
-                eprintln!(
-                    "    P ME+split: {:.1}ms",
-                    _t_me.elapsed().as_secs_f64() * 1000.0
+                let _t_me = std::time::Instant::now();
+                let me_params = if predictor_mvs.is_some() {
+                    &bufs.me_params_pred
+                } else {
+                    &bufs.me_params_nopred
+                };
+                mv_buf = self.motion.estimate_cached(
+                    ctx,
+                    &mut cmd,
+                    &bufs.plane_a,
+                    &bufs.gpu_ref_planes[0],
+                    padded_w,
+                    padded_h,
+                    predictor_mvs,
+                    me_params,
+                    &bufs.me_sad_buf,
+                    &bufs.me_dummy_pred,
                 );
-                cmd = ctx
-                    .device
-                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                        label: Some("pf_mcwq"),
-                    });
+
+                // Variable block size: 8x8 split decision
+                // Lambda must be high enough to prevent unnecessary splits on easy content.
+                // Each split adds 3 extra MVs (12 bytes raw); must outweigh residual savings.
+                let lambda_sad = (config.quantization_step * 16.0 + 128.0).round() as u32;
+                split_mv_buf = self.motion.estimate_split(
+                    ctx,
+                    &mut cmd,
+                    &bufs.plane_a,
+                    &bufs.gpu_ref_planes[0],
+                    &mv_buf,
+                    &bufs.me_sad_buf,
+                    None, // 8x8 temporal predictor (future enhancement)
+                    padded_w,
+                    padded_h,
+                    lambda_sad,
+                );
+
+                // Profiling: flush ME to isolate MC+wavelet+quantize timing
+                if profile {
+                    ctx.queue.submit(Some(cmd.finish()));
+                    ctx.device.poll(wgpu::Maintain::Wait);
+                    eprintln!(
+                        "    P ME+split: {:.1}ms",
+                        _t_me.elapsed().as_secs_f64() * 1000.0
+                    );
+                    cmd = ctx
+                        .device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("pf_mcwq"),
+                        });
+                }
             }
 
             let _t_mcwq = std::time::Instant::now();
@@ -3093,6 +3206,100 @@ impl EncoderPipeline {
             let _t_submit = std::time::Instant::now();
             ctx.queue.submit(Some(cmd.finish()));
 
+            // === Look-ahead ME pipelining ===
+            // Submit next frame's preprocess + ME BEFORE the readback poll so ME runs
+            // in parallel with the Metal buffer-sync latency (~18ms).
+            // Only applies to 444 + Rice (non-444 path polls separately below).
+            let next_precomputed = if let Some(next_pixels) = next_frame_pixels {
+                if use_rice && !is_non_444 {
+                    // Upload next frame pixels immediately after submitting current frame's command.
+                    // wgpu queues this write before any subsequent submit, ensuring ordering:
+                    // CMD_N finishes → next_pixels written → CMD_N+1_ME runs.
+                    ctx.queue
+                        .write_buffer(&bufs.raw_input_buf, 0, bytemuck::cast_slice(next_pixels));
+
+                    // Build a ME-only command encoder: pad + color + deinterleave + ME + split.
+                    // Uses bufs.me_params_nopred (no temporal predictor for look-ahead;
+                    // the actual predictor from the current frame's mv_buf will be passed
+                    // as predictor_mvs when encode_pframe is called for the next frame,
+                    // but by then precomputed_me is Some so ME is skipped anyway).
+                    let mut me_cmd =
+                        ctx.device
+                            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                label: Some("pf_lookahead_me"),
+                            });
+                    self.dispatch_gpu_pad_cached(ctx, &mut me_cmd, padded_w, padded_h);
+                    self.color.dispatch(
+                        ctx,
+                        &mut me_cmd,
+                        &bufs.input_buf,
+                        &bufs.color_out,
+                        padded_w,
+                        padded_h,
+                        true,
+                        config.is_lossless(),
+                    );
+                    self.deinterleaver.dispatch(
+                        ctx,
+                        &mut me_cmd,
+                        &bufs.color_out,
+                        &bufs.plane_a,
+                        &bufs.co_plane,
+                        &bufs.cg_plane,
+                        padded_pixels as u32,
+                    );
+                    // ME: use predictor from current frame's mv_buf if available.
+                    // mv_buf holds the 16x16 MVs just computed for the current frame.
+                    let next_me_params = &bufs.me_params_pred;
+                    let next_mv = self.motion.estimate_cached(
+                        ctx,
+                        &mut me_cmd,
+                        &bufs.plane_a,
+                        &bufs.gpu_ref_planes[0],
+                        padded_w,
+                        padded_h,
+                        Some(&mv_buf), // temporal predictor from current frame
+                        next_me_params,
+                        &bufs.me_sad_buf,
+                        &bufs.me_dummy_pred,
+                    );
+                    let next_lambda_sad =
+                        (config.quantization_step * 16.0 + 128.0).round() as u32;
+                    let next_split_mv = self.motion.estimate_split(
+                        ctx,
+                        &mut me_cmd,
+                        &bufs.plane_a,
+                        &bufs.gpu_ref_planes[0],
+                        &next_mv,
+                        &bufs.me_sad_buf,
+                        None,
+                        padded_w,
+                        padded_h,
+                        next_lambda_sad,
+                    );
+                    // Submit ME-only command. GPU executes this after CMD_N finishes
+                    // (same queue, strict ordering). Metal sync for CMD_N's readback
+                    // now overlaps with this ME dispatch (~20ms > ~18ms sync).
+                    ctx.queue.submit(Some(me_cmd.finish()));
+                    if std::env::var("GNC_PROFILE").is_ok() {
+                        eprintln!(
+                            "[me_pipeline] submitted look-ahead ME for next frame (includes_preprocess={})",
+                            lookahead_preprocess
+                        );
+                    }
+                    Some(PrecomputedPFrameME {
+                        mv_buf: next_mv,
+                        split_mv_buf: next_split_mv,
+                        includes_preprocess: lookahead_preprocess,
+                    })
+                } else {
+                    // Non-444 or non-Rice: skip look-ahead (more complex poll ordering).
+                    None
+                }
+            } else {
+                None
+            };
+
             // Poll + readback entropy results
             if use_rice && !is_non_444 {
                 // 444: all 3 planes encoded in the batch — single readback
@@ -3217,6 +3424,7 @@ impl EncoderPipeline {
                     residual_stats_cg,
                 },
                 mv_buf,
+                next_precomputed,
             ); // Return 16x16 mv_buf as temporal predictor for next frame
         } else {
             // CPU entropy path: preprocess + ME batched, then per-plane submits
@@ -3800,6 +4008,7 @@ impl EncoderPipeline {
                 residual_stats_cg: None,
             },
             mv_buf,
+            None, // CPU entropy path: no look-ahead ME
         )
     }
 

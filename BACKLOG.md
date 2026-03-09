@@ -115,13 +115,21 @@ See [BASELINE.md](BASELINE.md) for current benchmark numbers.
 - **Note on 60fps:** L3 cache analysis shows ME bandwidth savings don't translate 1:1 to wall-clock time. 60fps (17ms/frame) not achievable without fundamental ME algorithm change AND GPU-side local decode. Revised target: 25-30fps achievable with #19.
 - **Note:** GNC_PROFILE=1 profiling was used. Measurements: ME+split=20ms (forced barrier), entropy+stg=47ms, local decode readback=18-20ms per inter-frame.
 
-### 19. GPU-side local decode for P/B-frame reference
-- **Status:** todo (P1 — next priority after #16)
-- **Problem:** After encoding a P/B-frame, the encoder reads back Rice stream data from GPU to CPU (~18ms), re-uploads and runs the GPU decoder to produce the reference frame. This 18ms CPU round-trip happens for every inter-frame and is the biggest remaining bottleneck (currently 19.3fps → would reach ~27fps if eliminated).
-- **Hypothesis:** Keeping Rice streams on GPU and calling the decode shader directly on the already-encoded buffers eliminates the 18ms round-trip per inter-frame.
-- **Challenges:** Rice encode output format (stream_buf/lengths_buf/k_buf per-stream layout) differs from Rice decode input format (packed k_values array + stream data layout). Either: (a) add a GPU-side format conversion shader, or (b) restructure Rice encode output to match decode input format, or (c) encode the frame into a "local decode compatible" GPU buffer alongside the regular output.
-- **Success criteria:** I+P+B fps ≥25fps on crowd_run 1080p q=75; VMAF neutral; all tests pass.
-- **Note:** Must verify encoder/decoder produce identical output (no encoding mismatch).
+### 19. Rice readback pipelining: submit next-frame ME before readback
+- **Status:** active (2026-03-09)
+- **Root cause diagnosed:** After each P-frame encode, the encoder blocks ~18ms waiting for Metal's buffer sync (managed buffer `synchronize()` on M1). Q=25 and q=75 take the same 18ms — confirming it's latency-bound, not bandwidth-bound. Local decode is already GPU-side (uses quantized buffers, not Rice streams). The 18ms is purely Metal sync overhead for Rice staging readback.
+- **Fix:** After submitting CMD_N (full encode including Rice staging), immediately write_buffer(frame_N+1) and submit CMD_N+1_ME (preprocess + ME dispatches ONLY) BEFORE polling. device.poll(Maintain::Wait) then waits for CMD_N+1_ME (20ms) AND CMD_N's Metal sync (18ms) concurrently. Since 20ms > 18ms, the 18ms sync is fully hidden. Rice readback for N is near-instant after poll.
+- **Implementation:** Split encode_pframe into two phases: (1) phase1_me: uploads frame, runs GPU pad/color/deinterleave/ME/split; (2) phase2_late: runs MC/wavelet/quantize/Rice/local_decode/staging. The outer encode loop carries phase1_me results across iterations:
+  ```
+  for each P-frame N:
+    if no pending_me: run phase1_me(N), submit CMD_N+1_ME
+    submit CMD_N_late, then submit CMD_N+1_ME
+    poll() → waits for both (max(20ms ME, 18ms sync) = 20ms overhead)
+    rice_N ready instantly → CompressedFrame_N
+  ```
+- **Success criteria:** crowd_run I+P+B fps ≥24fps (from 19.3fps); VMAF neutral; all 164 tests pass; zero clippy warnings.
+- **Expected gain:** 19.3fps → ~27fps (+40%). Steady-state per-frame: 33ms GPU (CMD_pf) + 20ms overlapped (ME for next) = ~35ms/frame = ~28fps.
+- **Note:** Phase 1 only for P-frames. B-frame pipelining deferred to later if needed.
 
 ### 17. Scene cut detection + adaptive GOP
 - **Status:** todo (P3)

@@ -18,19 +18,21 @@ H.264 comparison (#22) established the north star: GNC needs **2–5× more bits
 
 **Priority order (updated 2026-03-10):**
 1–14: (see previous items, all done/closed)
-15. **#35 DCT for inter-frame residuals** (deferred — RS gate: run residual subband energy experiment first) — see #35 entry
+15. **#35 DCT for inter-frame residuals** (CLOSED — gate: LL 88% of residual energy, detail <15%; premise falsified)
 16. **#40 4×4 sub-block ME** (CLOSED — bpp +15–26%; MV overhead dominates; hypothesis falsified)
-17. **#41 Adaptive intra tiles in P/B frames** (CLOSED — gate nominally passes but gain < 1% at q=75; LL-dominant residuals = camera motion, not tile misprediction; not worth bitstream format change)
-18. **#44 DC subband offset correction** (CLOSED — physics analysis: crowd_run LL residual from chaotic motion not DC shift; PSNR-implied DC shift ≈3 pixels → < 1% bpp gain)
-19. **#45 Adaptive GOP** (CLOSED — ki=2 crowd_run = 6.73 bpp > ki=8 6.45 bpp; shorter GOP increases bpp; MC futility detector cannot help)
-20. **#43 Multi-reference P-frames** (CLOSED — gate analysis: pyramid ME ±96px already closes search-range gap; constant-velocity crowd motion won't prefer N−2; Researcher confidence 2/5; gate experiment costs 2-3 days with likely failure)
-21. **#42 Hierarchical B-frame GOP** (done 2026-03-10) — RS hypothesis approved; coding order I₀P₈B₄B₂B₆B₁B₃B₅B₇; GP14 bitstream; validation pending
-19. **#36 Deblocking filter** (closed P2) — artifact is 1-2px incoherent boundary mismatch; deblocking would blur; correct fix requires overlapping tiles (bitstream change)
-20. **#37 Per-8×8-block skip** (closed P2) — 0% blocks qualify on bbb; pan motion prevents block-level static detection
-21. **#38 Lagrange RD quantization** (closed P3) — gate: AQ adds +0.5-1.4% bits (not saves bits); exploitable gap <1.5%; not worth 5-7 days
-22. **#39 32×32 coarse-block fallback** (closed P3) — analytical: max 0.7% savings (30% of 2.3% MV overhead); rush_hour unavailable; closed
-23. **#24 Larger ME search range** (done 2026-03-10) — pyramid ME implemented: ±96px range, −3.4% bpp park_joy, −0.3% crowd_run, VMAF neutral
-24. **#25 Multi-reference P-frames** (DEFER)
+17. **#41 Adaptive intra tiles in P/B frames** (CLOSED — gain < 1% at q=75; LL-dominant residuals = camera motion)
+18. **#44 DC subband offset correction** (CLOSED — DC shift < 1% bpp)
+19. **#45 Adaptive GOP** (CLOSED — ki=2 bpp worse than ki=8)
+20. **#43 Multi-reference P-frames** (CLOSED — pyramid ME ±96px already covers gap)
+21. **#42 Hierarchical B-frame GOP** (DONE 2026-03-10) — crowd_run −3.4% bpp, park_joy −3.9%, VMAF neutral
+22. **#24 Pyramid ME** (done 2026-03-10) — ±96px range, park_joy −3.4% bpp
+
+**Next items (RS-approved, 2026-03-10):**
+1. **#46 LL subband spatial prediction** — CLOSED (gate fail: crowd_run mean_ratio=1.536, park_joy 1.705 > 0.85)
+2. **#48 Chroma qpel for 4:2:0 B-frames** — CLOSED (gate fail: Co/Y=0.57, Cg/Y=0.43, both <1.2; chroma MC working correctly)
+3. **#50 Fast I-frame Rice skip** — CLOSED (gate fail: 0% qualifying tiles at q=75)
+4. **#49 P-frame reference from pyramid pool** — DONE (B₄-as-P forward-only; park_joy −0.2% bpp, crowd_run +0.3%, VMAF neutral)
+5. **#47 Overlapping tile windows** — next after #49 (bitstream change, VMAF-axis)
 
 ## Items
 
@@ -198,10 +200,13 @@ H.264 comparison (#22) established the north star: GNC needs **2–5× more bits
 - **Note:** f32 shaders are transparent to bit depth — only I/O boundaries needed changing (loader, saver, pack_u8, buffer_to_texture). `bit_depth` was already in `FrameInfo` and bitstream header — no bitstream break.
 
 ### 14. P-frame and B-frame chroma: 4:2:0/4:2:2 MC residual domain mismatch
-- **Status:** active (2026-03-08) — P-frame fix committed, B-frame regression diagnosed
-- **P-frame fix (committed 856761c):** Chroma-domain MC for 4:2:0 P-frames. BPP ordering now correct: 4:2:0 < 4:2:2 < 4:4:4 (bbb: 2.20/2.35/2.61, crowd_run: 5.16/5.59/6.39 bpp). Ratio 0.92-0.95 (not yet ≤0.85 target, possibly B-frame overhead polluting avg).
-- **B-frame regression (diagnosed, 2026-03-08):** B-frames in 422/420 show up to 11.82 dB PSNR loss and are larger than I-frames. This is because B-frame backward MC for 4:2:0 chroma is currently performing MC in the luma domain, using luma-sized, NN-upsampled references directly, without the necessary box-filtering and MV scaling to operate in the chroma domain. This mirrors the original P-frame issue that caused structured HF residuals.
-- **Next:** Implement specialized chroma-domain MC for 4:2:0 B-frames in `src/decoder/gpu_work.rs`. This includes box-filtering references, scaling MVs, calling a chroma-domain `compensate_bidir` variant, and upsampling the result.
+- **Status:** done (2026-03-10) — all chroma bugs fixed
+- **P-frame fix (committed 856761c):** Chroma-domain MC for 4:2:0 P-frames. BPP ordering now correct: 4:2:0 < 4:2:2 < 4:4:4 (bbb: 2.20/2.35/2.61, crowd_run: 5.16/5.59/6.39 bpp).
+- **B-frame fix (2026-03-10):** Three bugs fixed across two sessions:
+  1. `local_decode_bframe_to_pyramid_slot` used wrong buffer (co_plane vs ref_upload for Co) and luma dims for chroma. Fix: full 4:2:0 chroma-domain bidir inverse decode path.
+  2. Pyramid slot gating: `copy_pyramid_slot_to_*` calls were gated on Yuv444. Fix: removed gate.
+  3. **Root cause of B₂/B₃/B₅ garbage (25 dB):** `dispatch_mv_scale` in encode_bframe was called with `me_total_blocks` (8160) instead of `split_total_blocks` (32640). Encoder left entries 8160..32640 stale from previous B-frame; decoder zeroed them via OOB reads → mismatch. Fix: use `split_total_blocks` for both fwd and bwd MV scaling in B-frame 4:2:0 path (commit b9df1ec).
+- **Final result (bbb 4:2:0):** All B-frames 36.08–36.37 dB PSNR, consistent. bpp 0.39–0.58 per B-frame.
 
 ### 15. Quarter-pel motion compensation
 - **Status:** done (2026-03-09)
@@ -351,7 +356,7 @@ H.264 comparison (#22) established the north star: GNC needs **2–5× more bits
 - **Why closed:** The existing system (skip bitmap + delta coding with median spatial predictor) already captures temporal MV correlation efficiently. MVs for near-static blocks are already coded as 1-bit skip flags. Merge mode would save ~20% of the 2.3% MV overhead = ~0.2% bpp total. A bitstream format change (merge flag per block = minor version bump) is not justified for <0.2% bpp savings.
 
 ### 35. DCT transform for inter-frame residuals
-- **Status:** deferred — RS verdict 2026-03-10: OBMC gate falsifies premise; realistic gain 2-5%, not 10% criterion; run residual energy gate before reconsidering
+- **Status:** CLOSED (2026-03-10) — gate fails: LL carries 85–88% of residual energy; detail subbands <15% (gate required >40%); premise falsified
 - **Motivation:** The wavelet is the wrong transform for MC residuals. MC residuals have energy concentrated at 8×8 and 16×16 block boundaries (from the ME block structure). Wavelet spreads this boundary energy across ALL levels and subbands (worst case). DCT applied per-block localizes boundary discontinuities within individual blocks, allowing near-zero coding of adjacent blocks. Literature: H.264/HEVC/VVC all use DCT (integer transform) for inter residuals.
 - **Hypothesis:** Using DCT-16 on P/B-frame MC residuals (wavelet stays for I-frames) reduces inter-frame bpp ≥10% on bbb q=75, with VMAF neutral.
 - **Gate experiment result (2026-03-10):** Added `--dct` flag to `benchmark-sequence` to force `TransformType::BlockDCT8` for all frames. Result: PSNR = −6.44 dB, SSIM = 0.02 — catastrophically broken. Root cause: `BlockDCT8` is I-frame only; P-frame decoder path unconditionally assumes wavelet inverse transform. DCT reconstruction applied before MC add-back produces garbage.
@@ -459,4 +464,38 @@ H.264 comparison (#22) established the north star: GNC needs **2–5× more bits
 - **Gate (mandatory first):** Run crowd_run with ki=2 manually. If bpp at ki=2 > 6.45 (ki=8 current), I-frame overhead dominates and adaptive GOP can only make things worse → veto. If ki=2 < 6.45, proceed.
 - **Success criteria:** crowd_run bpp ≤ 6.00 (≥7% reduction); VMAF ≥ 98.8.
 - **Complexity:** 2-3 days. Reuse scene-cut detector logic; threshold on post-ME SAD ratio.
+
+### 46. LL subband spatial prediction (cross-tile delta coding)
+- **Status:** CLOSED (2026-03-10) — gate failed
+- **Gate result (2026-03-10):** crowd_run P-frame mean_ratio=1.536, max_ratio=1.821 (gate threshold > 0.85). park_joy mean_ratio=1.705, max_ratio=1.982. LL residual tiles are spatially anti-correlated — the inter-tile LL variation *exceeds* the per-tile magnitude. Delta coding would increase bitrate, not reduce it.
+- **Root cause analysis:** High-motion P-frame LL residuals reflect per-tile MC prediction error, which depends on local motion complexity. Adjacent tiles have independent motion → independent prediction errors → no spatial correlation in residual domain. The RS hypothesis "spatial signal continuity carries over to residual LL" is falsified: MC removes the spatial continuity, leaving spatially-decorrelated residuals.
+- **Diagnostic code:** `GNC_LL_SPATIAL=1` env var in `encode_pframe` (diagnostic only, no bitstream change).
+
+### 47. Overlapping tile windows (cross-tile wavelet lifting)
+- **Status:** todo (lower priority — bitstream format change required)
+- **Motivation:** Tile-edge artifacts (#36 gate) are 1–2px boundary mismatch from symmetric reflection at tile borders. Correct fix: each tile reads N px beyond its border during wavelet forward transform; decoder inverse uses overlap-add. Removes artifact entirely.
+- **Falsifiable claim:** 4px overlap eliminates tile-boundary PSNR gap (0.67 dB) to < 0.1 dB.
+- **Gate (1 day):** Simulate by encoding a test frame with 264px tiles (8px overlap) decoded to 256px. Compare VMAF vs current 256px tiles. Gate: proceed only if VMAF gain ≥ 0.3 pts.
+- **Success criteria:** VMAF +0.3–0.8 pts on bbb q=75; bpp neutral or slightly lower.
+- **Complexity:** 4–6 days. Requires bitstream version bump (overlap_pixels in sequence header). Encoder reads halo from neighboring tiles; decoder adds halo to inverse input.
+
+### 48. Quarter-pel chroma MC for 4:2:0 B-frames
+- **Status:** CLOSED (2026-03-10) — gate: chroma residual already below luma; MC working correctly
+- **Gate result (bbb_test.y4m, q=75, 4:2:0):** Co/Y mean_abs ratio = 0.57, Cg/Y = 0.43. Both well below 1.2 threshold. After fixing the stale mv_chroma_buf bug (#14), 4:2:0 B-frame chroma MC is functioning correctly — chroma residual is smaller than luma as expected. No evidence of chroma MC being the bottleneck.
+- **Note:** Also note that 4:2:0 B-frame chroma currently uses wrong MV spatial mapping (16×16 luma MV applied to 4×4 chroma blocks with stride mismatch), but it's consistent in encoder and decoder. Fixing mapping would improve quality but is a separate item.
+
+### 49. P-frame reference selection from pyramid pool
+- **Status:** todo
+- **RS hypothesis (2026-03-10):** P-frame currently references only the most recent I or P anchor. With the 5-slot pyramid pool from #42, the decoded B₄ (frame 4) is available as a closer reference for the P-frame (frame 8). Using B₄ instead of I₀ halves temporal distance from 8 to 4 frames on slow-motion content, reducing residual energy.
+- **Falsifiable claim:** On bbb (slow-motion), P-frame ME SAD against B₄ (closest decoded B) is < 80% of SAD against I₀. If SAD ratio > 0.9, temporal distance is not the bottleneck.
+- **Gate result (2026-03-10):** crowd_run: 52.5% tiles prefer B₄_src, mean_SAD_ratio=1.016 (PASS). park_joy: 85.0% tiles prefer B₄_src, mean_SAD_ratio=0.776 (PASS). Gate threshold was >20%.
+- **Architecture constraint discovered:** P₈ is encoded before B₄ in coding order (I₀→P₈→B₄→...). B₄ is not decoded when P₈ is encoded. Implementation requires coding order change to I₀→B₄→P₈→B₂→B₆→... (B₄ encoded as P-frame first, P₈ uses decoded B₄ as reference). Significant refactor.
+- **Gate (1 day):** Add diagnostic: compute SAD of P-frame tiles against both I₀ and B₄. Print fraction of tiles where B₄ wins and mean SAD ratio. Gate: proceed if > 20% of tiles prefer B₄.
+- **Success criteria:** bbb bpp −3% at q=75; VMAF neutral. crowd_run expected ~0% (chaotic motion).
+- **Fail criterion:** < 20% of tiles prefer B₄ → close (I-frame is better reference, B₄ has accumulated error).
+- **Complexity:** 3–4 days (revised up from 2–3 due to coding order refactor). Coding order: I₀→B₄→P₈→B₂→B₆→...; B₄ encodes as fwd-only P-frame; P₈ uses decoded B₄ from pyramid slot 0.
+
+### 50. Fast I-frame Rice skip for near-zero tiles
+- **Status:** CLOSED (2026-03-10) — gate failed: 0% qualifying tiles at q=75
+- **Gate result:** `Rice: all_skip_tiles=0/120` at q=75 on bbb_1080p. Zero tiles have >80% zeros at this quality level — quantization is aggressive enough that all tiles have non-trivial coefficient distributions. The speed axis gain is zero.
 

@@ -117,17 +117,26 @@ fn test_encode_sequence_ip_pattern() {
         );
     }
 
-    // B-frames should have backward vectors and block modes
+    // B₄ (display index 4) is encoded as forward-only via #49 — backward_vectors=None.
+    // All other B-frames are truly bidirectional.
     for i in 1..8 {
         let mf = compressed[i].motion_field.as_ref().unwrap();
-        assert!(
-            mf.backward_vectors.is_some(),
-            "B-frame {i} should have backward vectors"
-        );
-        assert!(
-            mf.block_modes.is_some(),
-            "B-frame {i} should have block modes"
-        );
+        if i == 4 {
+            // B₄-as-P: forward-only signal
+            assert!(
+                mf.backward_vectors.is_none(),
+                "B₄ (frame {i}) should be forward-only (no backward vectors)"
+            );
+        } else {
+            assert!(
+                mf.backward_vectors.is_some(),
+                "B-frame {i} should have backward vectors"
+            );
+            assert!(
+                mf.block_modes.is_some(),
+                "B-frame {i} should have block modes"
+            );
+        }
     }
 }
 

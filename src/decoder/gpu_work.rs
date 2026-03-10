@@ -66,8 +66,16 @@ impl DecoderPipeline {
 
         // 4:2:0 chroma-domain MC: pre-scale luma MVs → chroma MVs (shared by both chroma planes).
         // Must run once before the plane loop because both p=1 and p=2 use mv_chroma_buf.
-        let is_pframe = frame.frame_type == FrameType::Predicted;
-        let is_bframe = frame.frame_type == FrameType::Bidirectional;
+        // A Bidirectional frame with no backward_vectors is a forward-only reference frame
+        // used in #49 pyramid-base mode (B₄ encoded before P₈ for closer P₈ reference).
+        // Treat it identically to a P-frame for MC and reference-update purposes.
+        let is_fwd_only_bframe = frame.frame_type == FrameType::Bidirectional
+            && frame
+                .motion_field
+                .as_ref()
+                .is_some_and(|mf| mf.backward_vectors.is_none());
+        let is_pframe = frame.frame_type == FrameType::Predicted || is_fwd_only_bframe;
+        let is_bframe = frame.frame_type == FrameType::Bidirectional && !is_fwd_only_bframe;
         let is_420 = info.chroma_format == ChromaFormat::Yuv420;
         if (is_pframe || is_bframe) && is_420 {
             let chroma_shift_x = info.chroma_format.horiz_shift();

@@ -653,9 +653,53 @@ impl DecoderPipeline {
                 i += 1;
             } else if b_frames_follow {
                 // Anchor before B-frames: save past ref, decode anchor, swap for B decode.
-                self.swap_forward_to_backward_ref(ctx); // bwd = past anchor
-                results[idx] = Some(self.decode(ctx, frame)); // ref = decoded anchor (future)
-                self.swap_references(); // ref=past, bwd=future
+                //
+                // #49 pyramid-base mode detection: if the first B-frame in decode order (B₄)
+                // has backward_vectors=None, it is a forward-only reference frame that must be
+                // decoded BEFORE the anchor (P₈) so that P₈ can use B₄ as its reference.
+                // In this mode: save I₀ → slot 4, decode B₄ (ref=I₀) → slot 0, then
+                // decode P₈ normally (ref=B₄ now in reference_planes).
+                let b_start_i_peek = i + 1;
+                let mut j_peek = b_start_i_peek;
+                while j_peek < order.len()
+                    && frames[order[j_peek]].frame_type == FrameType::Bidirectional
+                {
+                    j_peek += 1;
+                }
+                let b_count_peek = j_peek - b_start_i_peek;
+                let is_pyramid_peek = b_count_peek == 7
+                    && (b_start_i_peek..j_peek).any(|k| {
+                        frames[order[k]]
+                            .motion_field
+                            .as_ref()
+                            .and_then(|mf| mf.fwd_ref_idx)
+                            .is_some()
+                    });
+                // In pyramid decode order the first B is always B₄ (display_off=3).
+                // If it has backward_vectors=None it was encoded as a forward-only frame (#49).
+                let pyramid_b4_first = is_pyramid_peek
+                    && frames[order[b_start_i_peek]]
+                        .motion_field
+                        .as_ref()
+                        .is_some_and(|mf| mf.backward_vectors.is_none());
+
+                if pyramid_b4_first {
+                    // Save I₀ (current reference_planes) to pyr[4] before it is overwritten.
+                    self.save_fwd_ref_to_pyramid_slot_dec(ctx, 4); // I₀ → pyr[4]
+                    // Decode B₄ as forward-only P-frame (reference_planes = I₀).
+                    // gpu_work treats backward_vectors=None Bidirectional as P-frame,
+                    // so reference_planes is updated to B₄ after this call.
+                    let b4_idx = order[b_start_i_peek];
+                    results[b4_idx] = Some(self.decode(ctx, &frames[b4_idx]));
+                    // Save B₄ (now in reference_planes) to pyr[0].
+                    self.save_fwd_ref_to_pyramid_slot_dec(ctx, 0); // B₄ → pyr[0]
+                    // reference_planes = B₄ → P₈ will use B₄ as its forward reference.
+                }
+
+                // Standard anchor decode (reference_planes = B₄ in #49 mode, I₀ otherwise).
+                self.swap_forward_to_backward_ref(ctx); // bwd = current fwd (B₄ or I₀)
+                results[idx] = Some(self.decode(ctx, frame)); // P₈ with ref = B₄ (or I₀)
+                self.swap_references(); // ref=B₄(or I₀), bwd=P₈
 
                 i += 1;
 
@@ -678,7 +722,7 @@ impl DecoderPipeline {
                     });
 
                 if is_pyramid {
-                    // Pyramid decode: state is ref=past_anchor, bwd=future_P.
+                    // Pyramid decode: state is ref=B₄(#49) or past_anchor, bwd=future_P.
                     // Pool slot → buffer mapping:
                     //   pool 0 = past anchor   → pyr[4] (saved, always loaded for fwd_pool=0)
                     //   pool 1 = future anchor → pyr[3] (saved, always loaded for bwd_pool=1)
@@ -686,9 +730,15 @@ impl DecoderPipeline {
                     //   pool 3 = B₂            → pyr[1]
                     //   pool 4 = B₆            → pyr[2]
                     //
-                    // Save both anchors permanently before any ref overwrite.
-                    self.save_fwd_ref_to_pyramid_slot_dec(ctx, 4); // past_anchor → pyr[4]
-                    self.save_bwd_ref_to_pyramid_slot_dec(ctx, 3); // future_P → pyr[3]
+                    // In standard mode: save past_anchor and future_P to pyr[4] and pyr[3].
+                    // In #49 mode: I₀ already in pyr[4] and B₄ already in pyr[0] from the
+                    // pre-anchor decode above; only save future_P (P₈ is in bwd_reference_planes).
+                    if pyramid_b4_first {
+                        self.save_bwd_ref_to_pyramid_slot_dec(ctx, 3); // P₈ → pyr[3]
+                    } else {
+                        self.save_fwd_ref_to_pyramid_slot_dec(ctx, 4); // past_anchor → pyr[4]
+                        self.save_bwd_ref_to_pyramid_slot_dec(ctx, 3); // future_P → pyr[3]
+                    }
 
                     // The group's first B-frame display index (B₁ = display offset 0):
                     let b_display_base = order[b_start_i..(b_start_i + b_count)]
@@ -701,6 +751,17 @@ impl DecoderPipeline {
 
                     for &b_idx in &order[b_start_i..j] {
                         let b_frame = &frames[b_idx];
+
+                        // In #49 mode, B₄ was already decoded before the anchor; skip it here.
+                        if pyramid_b4_first
+                            && b_idx - b_display_base == 3
+                        {
+                            if diag {
+                                eprintln!("[pyramid_dec] Frame {} (display+3) decoded as fwd-only ref (#49), skipping loop", b_idx);
+                            }
+                            continue;
+                        }
+
                         let mf = b_frame.motion_field.as_ref();
 
                         // Read pool indices from motion field (default: 0/1 for flat)

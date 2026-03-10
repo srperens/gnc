@@ -538,7 +538,7 @@ impl EncoderPipeline {
                     let i0_display = group_start.saturating_sub(1);
                     // B₄ proxy: midpoint between I₀ and P₈ in display order
                     // e.g. for b_count=7: I₀=0, P₈=8, B₄=4 = i0_display + (b_count+1)/2
-                    let b4_display = i0_display + (b_count + 1) / 2;
+                    let b4_display = i0_display + b_count.div_ceil(2);
 
                     if i0_display < n && b4_display < n {
                         let i0_data = load_frame(i0_display);
@@ -547,8 +547,8 @@ impl EncoderPipeline {
                         let tile_sz = config.tile_size as usize;
                         let w = width as usize;
                         let h = height as usize;
-                        let tiles_x = (w + tile_sz - 1) / tile_sz;
-                        let tiles_y = (h + tile_sz - 1) / tile_sz;
+                        let tiles_x = w.div_ceil(tile_sz);
+                        let tiles_y = h.div_ceil(tile_sz);
                         let n_pixels_per_channel = w * h;
 
                         // Determine channel stride: RGB interleaved (3 channels) vs planar.
@@ -613,6 +613,84 @@ impl EncoderPipeline {
                     }
                 }
 
+                // Hoist pyramid state: plane_size and pyramid_enabled needed before P₈ encode.
+                let plane_size = (padded_pixels * std::mem::size_of::<f32>()) as u64;
+                let pyramid_enabled = b_count == 7;
+
+                // ── #49 Pyramid-base: encode B₄ as forward-only P-frame before P₈ ──────────
+                // Coding order change: I₀ → B₄(as fwd-P) → P₈ → B₂ → B₆ → B₁ → B₃ → B₅ → B₇
+                // B₄ uses I₀ (current gpu_ref_planes) as its sole reference.
+                // After B₄ decode, gpu_ref_planes = decoded B₄.
+                // P₈ then uses B₄ as its reference (4 frames vs the previous 8 frames),
+                // halving temporal distance for slow/medium-motion content.
+                // B₄ is stored as FrameType::Bidirectional with backward_vectors=None so that
+                // decode_order() still counts 7 B-frames for pyramid detection, and the decoder
+                // gpu_work treats it as a P-frame (reference_planes updated, P-frame MC path).
+                let b4_display = group_start + 3;
+                if pyramid_enabled {
+                    // Save I₀ (current fwd ref) to pyramid slot 3 (past_anchor for layer-3 B-frames).
+                    // Must happen before B₄ encode overwrites gpu_ref_planes.
+                    self.copy_fwd_ref_to_pyramid_slot(ctx, 3, plane_size); // I₀ → slot 3
+
+                    let b4_config = if let Some(ref rc) = rate_ctrl {
+                        let mut cfg = config.clone();
+                        cfg.quantization_step = rc.estimate_qstep();
+                        cfg
+                    } else {
+                        config.clone()
+                    };
+                    let b4_frame_data = load_frame(b4_display);
+                    // Encode B₄ as P-frame (ref=I₀, no temporal MV predictor, no look-ahead).
+                    // save_bwd_ref=false: don't overwrite bwd yet (P₈ will do that).
+                    // needs_decode=true: update gpu_ref_planes with decoded B₄.
+                    let (mut b4_compressed, _b4_mv_buf, _) = self.encode_pframe(
+                        ctx,
+                        &b4_frame_data,
+                        width,
+                        height,
+                        padded_w,
+                        padded_h,
+                        padded_pixels,
+                        &info,
+                        &b4_config,
+                        None, // no temporal MV predictor for the new pyramid-base P-frame
+                        false, // save_bwd_ref: false — don't overwrite bwd_ref yet
+                        true,  // needs_decode: gpu_ref_planes ← decoded B₄
+                        None,  // no precomputed ME
+                        None,  // no look-ahead
+                        false,
+                    );
+                    // After encode: gpu_ref_planes = decoded B₄.
+                    // Save B₄ to pyramid slot 0 (used by B₂, B₆, and layer-3 B-frames).
+                    self.copy_fwd_ref_to_pyramid_slot(ctx, 0, plane_size); // B₄ → slot 0
+
+                    // Tag B₄ as a forward-only Bidirectional frame for the decoder:
+                    // - frame_type = Bidirectional → decode_order() keeps b_count=7 for pyramid detection
+                    // - backward_vectors = None → decoder gpu_work uses P-frame MC path
+                    // - fwd_ref_idx = Some(0) → pool 0 = past_anchor (I₀); informational only
+                    // - bwd_ref_idx = None → no backward pool reference
+                    b4_compressed.frame_type = crate::FrameType::Bidirectional;
+                    if let Some(ref mut mf) = b4_compressed.motion_field {
+                        mf.fwd_ref_idx = Some(0); // past_anchor (I₀)
+                        mf.bwd_ref_idx = None;
+                        // backward_vectors is already None (P-frame encode doesn't set it)
+                    }
+                    if let Some(ref mut rc) = rate_ctrl {
+                        rc.update(b4_config.quantization_step, b4_compressed.bpp());
+                    }
+                    if diag_enabled {
+                        let d = diagnostics::collect(
+                            b4_display,
+                            &b4_compressed,
+                            b4_config.quantization_step,
+                            last_iframe_bytes,
+                        );
+                        diagnostics::print(&d);
+                    }
+                    results[b4_display] = Some(b4_compressed);
+                    // gpu_ref_planes = B₄ → P₈ encode will use B₄ as its forward reference.
+                }
+
                 // Look-ahead: pre-compute ME for the NEXT group's anchor P-frame
                 // so it overlaps with this frame's Metal sync latency.
                 let next_anchor_display = group_start + group_size + b_count;
@@ -622,6 +700,11 @@ impl EncoderPipeline {
                     } else {
                         None
                     };
+
+                // In pyramid mode: P₈ now references B₄ (gpu_ref_planes = decoded B₄).
+                // Precomputed ME from the previous group was against the old I₀ reference,
+                // so it cannot be reused here. Pass None to force fresh ME against B₄.
+                let p8_pending_me = if pyramid_enabled { None } else { pending_me.take() };
 
                 let (compressed, new_mv_buf, next_precomputed) = self.encode_pframe(
                     ctx,
@@ -636,7 +719,7 @@ impl EncoderPipeline {
                     prev_mv_buf.as_ref(),
                     true,
                     true, // anchor P always needs decode (bwd ref for B-frames)
-                    pending_me.take(),
+                    p8_pending_me,
                     next_anchor_pixels.as_deref(),
                     // B-frame mode: B-frames run between look-ahead and next anchor P,
                     // so preprocess results would be overwritten — not safe to cache.
@@ -712,96 +795,32 @@ impl EncoderPipeline {
                 self.swap_ref_planes();
 
                 // 4. Hierarchical pyramid B-frame encoding (3-level dyadic).
-                // Coding order: B₄ → B₂ → B₆ → B₁ → B₃ → B₅ → B₀ → B₇
-                // (coarsest temporal scale first, finest last)
+                // Coding order (encoder): B₄(as fwd-P, already done above) → B₂ → B₆ → B₁B₃B₅B₇
                 // Display indices within group: B₁=+0, B₂=+1, B₃=+2, B₄=+3, B₅=+4, B₆=+5, B₇=+6
                 //
                 // Pyramid reference pool (matches decoder slot indices in fwd_ref_idx/bwd_ref_idx):
-                //   slot 0 = past anchor  (gpu_ref_planes)
-                //   slot 1 = future P     (gpu_bwd_ref_planes)
-                //   slot 2 = B₄           (gpu_pyramid_ref_planes[0])
-                //   slot 3 = B₂           (gpu_pyramid_ref_planes[1])
-                //   slot 4 = B₆           (gpu_pyramid_ref_planes[2])
-                let plane_size = (padded_pixels * std::mem::size_of::<f32>()) as u64;
-                let pyramid_enabled = b_count == 7;
-
-                // Helper to encode one B-frame and optionally decode to pyramid slot.
-                // Returns the CompressedFrame with ref indices set.
-                // This macro-like sequence is inlined for each pyramid tier.
-
-                // ── Layer 1: B₄ (display offset +3) ─────────────────────────────────────────
-                // refs: past_anchor(0) ↔ future_P(1)
-                // After encode: local-decode to pyramid slot 0 (B₄)
-                let b4_display = group_start + 3;
-                {
-                    let b_config = if let Some(ref rc) = rate_ctrl {
-                        let mut cfg = config.clone();
-                        cfg.quantization_step = rc.estimate_qstep();
-                        cfg
-                    } else {
-                        config.clone()
-                    };
-                    let b_frame_data = load_frame(b4_display);
-                    // fwd = past anchor (already in gpu_ref_planes), bwd = future P (gpu_bwd_ref_planes)
-                    let (mut compressed, fwd_mv, bwd_mv, _) = self.encode_bframe(
-                        ctx,
-                        &b_frame_data,
-                        width,
-                        height,
-                        padded_w,
-                        padded_h,
-                        padded_pixels,
-                        &info,
-                        &b_config,
-                        None,
-                        None,
-                        None,
-                        None,
-                    );
-                    if pyramid_enabled {
-                        if let Some(ref mut mf) = compressed.motion_field {
-                            mf.fwd_ref_idx = Some(0);
-                            mf.bwd_ref_idx = Some(1);
-                        }
-                        self.local_decode_bframe_to_pyramid_slot(
-                            ctx, &info, &b_config, &fwd_mv, &bwd_mv,
-                            padded_w, padded_h, padded_pixels, 0,
-                        );
-                        if std::env::var("GNC_BFRAME_PYRAMID").is_ok() {
-                            eprintln!(
-                                "[pyramid_b] Frame {} (display) layer=1 fwd_ref=0 bwd_ref=1",
-                                b4_display
-                            );
-                        }
-                    }
-                    if let Some(ref mut rc) = rate_ctrl {
-                        rc.update(b_config.quantization_step, compressed.bpp());
-                    }
-                    if diag_enabled {
-                        let d = diagnostics::collect(
-                            b4_display,
-                            &compressed,
-                            b_config.quantization_step,
-                            last_iframe_bytes,
-                        );
-                        diagnostics::print(&d);
-                    }
-                    results[b4_display] = Some(compressed);
-                    drop(fwd_mv);
-                    drop(bwd_mv);
-                }
+                //   pool 0 = past anchor (I₀)      → encoder pyramid slot 3
+                //   pool 1 = future P (P₈)          → encoder pyramid slot 4
+                //   pool 2 = B₄                    → encoder pyramid slot 0
+                //   pool 3 = B₂                    → encoder pyramid slot 1
+                //   pool 4 = B₆                    → encoder pyramid slot 2
+                //
+                // After swap_ref_planes() (#49 mode): fwd=B₄, bwd=P₈.
+                //   I₀ is in slot 3 (saved before B₄ encode).
+                //   B₄ is in slot 0 (saved after B₄ encode).
+                //   P₈ is in bwd_ref_planes (freshly decoded).
 
                 // ── Layer 2: B₂ (display offset +1) ─────────────────────────────────────────
-                // refs: past_anchor(0) ↔ B₄(2)
+                // refs: past_anchor/I₀(pool 0) ↔ B₄(pool 2)
                 //
-                // State management for B₂ and B₆:
-                //   After step 3 swap: fwd=past_anchor, bwd=decoded_P (future anchor)
-                //   Save decoded_P → slot 4 (permanent) before any bwd overwrites.
-                //   B₂ needs: fwd=past, bwd=B₄  → copy B₄(slot0) → bwd
-                //   B₆ needs: fwd=B₄, bwd=decoded_P  → save past(slot3), copy B₄(slot0)→fwd, copy slot4→bwd
+                // After swap: fwd=B₄, bwd=P₈.
+                // Save P₈ → slot 4 permanently before any bwd manipulation.
+                // For B₂: load I₀ from slot 3 → fwd, load B₄ from slot 0 → bwd.
                 if pyramid_enabled {
-                    // Save decoded_P permanently into slot 4 before any bwd manipulation
-                    self.copy_bwd_ref_to_pyramid_slot(ctx, 4, plane_size); // decoded_P → slot 4
+                    // Save P₈ permanently into slot 4 before any bwd manipulation
+                    self.copy_bwd_ref_to_pyramid_slot(ctx, 4, plane_size); // P₈ → slot 4
+                    // Load I₀ from slot 3 for B₂'s forward reference
+                    self.copy_pyramid_slot_to_fwd_ref(ctx, 3, plane_size); // I₀ → fwd
                     self.copy_pyramid_slot_to_bwd_ref(ctx, 0, plane_size); // B₄ → bwd
                 }
                 let b2_display = group_start + 1;
@@ -865,10 +884,9 @@ impl EncoderPipeline {
                 // ── Layer 2: B₆ (display offset +5) ─────────────────────────────────────────
                 // refs: B₄(2) ↔ decoded_P(1)
                 // State: fwd=past, bwd=B₄ (from B₂ setup).
-                // Save past_anchor to slot 3 before overwriting fwd.
-                // Then set fwd=B₄ (from slot 0), restore bwd=decoded_P (from slot 4).
+                // I₀ already saved to slot 3 before B₄-as-P encode.
+                // Set fwd=B₄ (from slot 0), restore bwd=decoded_P (from slot 4).
                 if pyramid_enabled {
-                    self.copy_fwd_ref_to_pyramid_slot(ctx, 3, plane_size); // past_anchor → slot 3
                     self.copy_pyramid_slot_to_fwd_ref(ctx, 0, plane_size); // B₄ → fwd
                     self.copy_pyramid_slot_to_bwd_ref(ctx, 4, plane_size); // decoded_P (perm) → bwd
                 }

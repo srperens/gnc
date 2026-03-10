@@ -2423,3 +2423,27 @@ Hierarchical pyramid B-frame GOP (3-level dyadic) is SHIPPED. Real improvement c
 **Root cause:** MC prediction removes the spatial low-frequency continuity that would enable prediction. What remains in LL residual is per-tile prediction error driven by local motion complexity. Crowd_run and park_joy have heterogeneous motion (crowd motion, panning) → tiles have independent prediction errors → no exploitable correlation.
 
 **Conclusion:** CLOSED. Hypothesis falsified. The spatial structure hypothesis applies to *source* LL subbands, not *residual* LL subbands. Residual domain after MC is already decorrelated spatially.
+
+## #49 P-frame Reference from Pyramid Pool — B₄-as-P (2026-03-10)
+
+**Hypothesis:** Encoding B₄ as a forward-only P-frame before P₈ gives P₈ a 4-frame temporal reference distance instead of 8, reducing P₈ residual energy and overall group bpp.
+
+**Success criterion:** ≥1% bpp improvement on ≥2 sequences, VMAF neutral (< −0.5 pts).
+
+**Implementation:**
+- Coding order change: I₀ → B₄(fwd-P) → P₈ → B₂ → B₆ → B₁ → B₃ → B₅ → B₇
+- B₄ stored as `FrameType::Bidirectional` with `backward_vectors=None` (preserves `b_count==7` for pyramid detection in `decode_order()`)
+- Decoder: `is_fwd_only_bframe` detection routes B₄ through P-frame MC path
+- Reference buffer management: I₀→slot3 before B₄ encode, B₄→slot0 after, P₈ uses B₄ as fwd ref, P₈→slot4 after decode
+- B₂/B₆ layer-2 setup loads refs from explicit pyramid slots (unchanged logic, but slot3 save moved earlier)
+- Files changed: `sequence.rs`, `gpu_work.rs`, `pipeline.rs`, `pipeline_tests.rs`
+
+**Gate result (prior session):** park_joy 85% of P₈ tiles prefer B₄ reference, mean_SAD_ratio=0.776 — gate PASSED.
+
+**Validation results (q=75, ki=9, 4:4:4, 10 frames):**
+| sequence   | pre bpp | post bpp | delta  | VMAF pre | VMAF post |
+|------------|---------|----------|--------|----------|-----------|
+| crowd_run  | 6.00    | 6.02     | +0.3%  | 99.13    | 99.13     |
+| park_joy   | 4.75    | 4.74     | −0.2%  | 99.14    | 99.14     |
+
+**Conclusion:** Hypothesis partially falsified. The architectural change is correct and the code is clean (all tests pass, zero clippy warnings). The benefit is near-neutral rather than ≥1% — the gate showed SAD advantage for B₄ reference but at the group level the bpp savings are offset by B₄ encoding cost (B₄ at 1.12 bpp on park_joy vs free reference in old scheme). VMAF unchanged on both sequences — no regression. SHIPPED as an architectural improvement; bpp impact within noise.

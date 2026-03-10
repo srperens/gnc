@@ -1,7 +1,7 @@
 # GNC Benchmark Baseline
 
 Last updated: 2026-03-10
-Baseline commit: 638b77a (hierarchical B-frame pyramid — #42 done)
+Baseline commit: (pyramid ME + B₄-as-P forward-only — #24 + #49 done)
 Mode: Spatial-only, I+P+B, Rice entropy, ki=9, 7B-per-group pyramid
 
 ## Single-Frame (bbb_1080p, Rice, 4:4:4)
@@ -17,8 +17,8 @@ Mode: Spatial-only, I+P+B, Rice entropy, ki=9, 7B-per-group pyramid
 
 | sequence   | bpp  | PSNR avg | VMAF  | notes                                  |
 |------------|------|----------|-------|----------------------------------------|
-| crowd_run  | 6.00 | 38.57 dB | 99.13 | hierarchical pyramid #42 (pre: 6.15)   |
-| park_joy   | 4.75 | ~39.3 dB | 99.14 | hierarchical pyramid #42 (pre: 4.77)   |
+| crowd_run  | 6.02 | 38.57 dB | 99.13 | B₄-as-P forward-only #49 (pre: 6.00)  |
+| park_joy   | 4.74 | ~39.3 dB | 99.14 | B₄-as-P forward-only #49 (pre: 4.75)  |
 | bbb        | —    | —        | —     | Y4M too short (8 frames) for ki=9      |
 
 ## Regression Rules

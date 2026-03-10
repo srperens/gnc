@@ -32,6 +32,48 @@ Before implementing temporal prediction improvements, ask: "Does the encoder alr
 
 ---
 
+## 2026-03-10: #28 OBMC gate — MV median smoothing (0% bpp gain; closed)
+
+### Hypothesis (gate experiment)
+If OBMC's benefit comes from eliminating MV discontinuities at block boundaries, a 3×3 median filter on the 8×8 split MV buffer should reduce bpp by smoothing boundary artifacts. If median filtering is neutral, the 3% bpp gap vs all-I reflects MC algorithm limits (not MV discontinuities), and OBMC is unlikely to help.
+
+### Implementation
+`mv_median_smooth.wgsl`: 3×3 median filter on 8×8 split MV buffer (256×160 block grid for 1080p). One workgroup per tile (256 threads). Reads from mvs_in, writes to mvs_out. `fn median9()` via bubble sort. Gated by `GNC_MV_SMOOTH=1` env var. Committed as opt-in diagnostic tool (f28568a).
+
+### Measurement (bbb_1080p, q=75, 444, I+P+B)
+| Config | BPP | VMAF |
+|--------|-----|------|
+| Baseline | 1.3465 | 95.31 |
+| GNC_MV_SMOOTH=1 | 1.3465 | 95.31 |
+
+**0% change — identical results.**
+
+### Root cause
+bbb (animated film, slow camera moves) has a smooth MV field. Adjacent 8×8 blocks have similar MVs. The median of 9 similar values equals the center value. No blocks were "smoothed" in any meaningful sense. The MV discontinuities that OBMC targets are present only on sequences with fast-moving objects crossing tile boundaries — not bbb.
+
+### Verdict: CLOSED
+The 3% bpp gap vs all-I on crowd_run reflects fundamental MC algorithm efficiency limits (motion compensation in the wavelet domain vs. DCT domain), not correctable MV discontinuities. OBMC implementation effort (~3–5 days) is not justified for uncertain gain. Item closed.
+
+---
+
+## 2026-03-10: #29 Fused wavelet kernel — pre-condition false; closed without implementation
+
+### Pre-condition check
+Code inspection of `transform.rs:252-281` and `pipeline.rs:1348-1892`:
+- All 24 wavelet dispatches (4 levels × 2 directions × 3 planes) are in **one command encoder**
+- Single `queue.submit()` at end — **zero intermediate CPU polls between wavelet levels**
+- Metal-internal barriers between passes cost ~10–30 µs each, totaling ~150 µs max across all planes
+
+### Why the hypothesis was wrong
+The hypothesized 25–40% speedup assumed CPU-side blocking polls between wavelet levels. Those don't exist. The actual overhead being "eliminated" is Metal-internal cache-flush barriers — measured in microseconds, not milliseconds.
+
+Shared memory analysis: fusing level 0 row+col passes within one workgroup requires 256×256 f32 = 256 KB of shared memory — 8× the M1 32 KB limit. Physically impossible. Partial LL-subband fusion (levels 2–4) saves ~150 µs, which is <<1% of 250 ms total I-frame time.
+
+### Verdict: CLOSED — pre-condition false
+No implementation. The wavelet dispatch is already as efficient as the current architecture allows. If speed improvement is needed, the correct next step is GPU timestamp queries to identify the actual I-frame bottleneck (entropy? quantize? CPU overhead?).
+
+---
+
 ## 2026-03-09: Research Scientist — full literature review + priority recommendations
 
 ### Summary
@@ -54,8 +96,8 @@ Full review of all project docs + web literature search (VC-2/Dirac, JPEG XS, OB
 - **Multi-reference P-frames (#25)** — defer until MV histogram confirms >15% non-adjacent references
 - **Parent-child Rice context (#21)** — proven negative (bpp increased)
 
-### Key new idea: TDC
-JPEG XS 3rd edition (2024) standardized Temporal Differential Coding: current frame's wavelet coefficients minus previous frame's coefficients. For static tiles, difference ≈ zero → compresses to near-nothing. Tile-independent, random-access friendly, trivially GPU-parallel. Distinct from temporal Haar (TDC = simple frame differencing; Haar = full lifting decomposition). Can be applied conditionally per tile using existing tile_energy_reduce infrastructure.
+### Key new idea: TDC — ⚠️ INVALIDATED after implementation
+TDC was prioritized as P1 but implemented, measured, and reverted. Result: ~0% bpp gain (only 3/40 tiles activated on bbb, +0.03% bpp noise). Root cause: TDC is fundamentally redundant with MC in an I+P+B codec — GNC's P-frame `plane_c` already holds MC residuals, not absolute coefficients. For static tiles, the residual is already ≈0. TDC is a tool for intra-only codecs (JPEG XS has no inter-frame MC). The Research Scientist report failed to account for this. **Lesson: before proposing any temporal coding idea, verify whether existing MC already handles the target redundancy.**
 
 ### Questions to resolve before implementation
 1. Can TDC reuse existing temporal lifting infrastructure in sequence.rs, or does it need a new path?

@@ -18,8 +18,8 @@ H.264 comparison (#22) established the north star: GNC needs **2–5× more bits
 **Priority order (updated 2026-03-09 — Research Scientist full literature review, see RESEARCH_LOG.md):**
 1. **#26 B-frame zero-MV skip** (DONE) — −3.6% bpp bbb B-frames, VMAF neutral
 2. **#27 TDC** (CLOSED — redundant with MC; ~0% gain, reverted)
-3. **#28 OBMC** (P1) — Overlapped Block MC (Dirac/VC-2 technique); eliminate within-tile block-boundary residuals; est. −10% bpp crowd_run P-frames, 3–5 days
-4. **#29 Fused wavelet kernel** (P2, speed) — single dispatch for all wavelet levels; I-frame 250ms → <180ms
+3. **#28 OBMC** (CLOSED) — Gate experiment (3×3 MV median smoothing) showed 0% bpp change on bbb; MV field already smooth → median = original. The 3% vs all-I gap reflects MC algorithm limits, not MV discontinuities. OBMC is disproportionate implementation effort for uncertain gain.
+4. **#29 Fused wavelet kernel** (CLOSED) — pre-condition false: levels already in single command encoder; barriers are µs not ms
 5. **#17 Scene cut detection** (P3) — robustness, ~50 lines, no bitstream change
 6. **#24 Larger ME search range** (DEFER — check MV histogram first; P-frame range may already cover content)
 7. **#25 Multi-reference P-frames** (DEFER — gate on MV histogram >15% non-adjacent refs)
@@ -271,18 +271,22 @@ H.264 comparison (#22) established the north star: GNC needs **2–5× more bits
 - **Lesson:** Before implementing temporal coding, verify whether MC already handles the redundancy being targeted.
 
 ### 28. Overlapped Block Motion Compensation (OBMC)
-- **Status:** todo (P2)
+- **Status:** closed (2026-03-10)
 - **Motivation:** Dirac/VC-2 uses OBMC to eliminate block-boundary discontinuities in the MC residual. GNC's current hard-boundary 16×16 block MC produces residuals with artificial discontinuities every 16 pixels — these are expensive for the wavelet to code (discontinuities spread energy across all wavelet levels). OBMC blends predictions from neighboring blocks using a raised-cosine (Hann) window, making the residual smooth.
 - **Hypothesis:** OBMC reduces P-frame residual energy by 0.8–2.2 dB (literature: Orchard & Sullivan 1994, Dirac spec), translating to ~10–20% bpp reduction on P/B-frames. Works within-tile only (tile independence preserved — no cross-tile blending).
 - **GPU fit:** Good. Each pixel's prediction is a weighted blend of predictions from its block and up to 3 neighboring blocks' MVs. All MVs for a tile are in GPU memory before MC dispatch. Per-pixel computation remains independent.
 - **Implementation:** Modify motion_compensate.wgsl. For each pixel, compute prediction as: w_self * pred(MV_self) + w_right * pred(MV_right) + w_below * pred(MV_below) + w_br * pred(MV_br), where w are raised-cosine weights. At tile boundary: only self-prediction (no cross-tile blending).
 - **Correctness gate:** Before GPU implementation, prototype blending weights on CPU and verify reconstruction identity. The decoder must apply identical blending to the MC reference.
 - **Success criteria:** P-frame bpp −10% on crowd_run q=75 (VMAF neutral ±0.3 pts); 3-sequence validation. Bitstream: OBMC enable flag per sequence (minor version bump).
+- **Gate experiment (2026-03-10):** 3×3 median filter on 8×8 split MV buffer (`GNC_MV_SMOOTH=1`, `mv_median_smooth.wgsl`). bbb q=75: 1.3465 bpp, VMAF 95.31 — IDENTICAL with and without smoothing. Root cause: bbb MV field is already smooth (animated film, slow camera moves); median of 9 similar values = original. Conclusion: MV discontinuities are not the bottleneck. Closing — OBMC implementation effort not justified.
+- **MV smoother committed:** f28568a (opt-in diagnostic tool, not used by default).
 
 ### 29. Fused multi-level wavelet kernel (speed)
-- **Status:** todo (P2, speed only)
+- **Status:** closed (2026-03-10) — pre-condition false
 - **Motivation:** I-frame encode takes ~250ms at 1080p q=75, dominating I+P+B total fps (~20 fps). The spatial wavelet dispatches 3–4 levels sequentially (each level requires the previous to complete). Fusing levels into a single dispatch using workgroup shared memory for intermediate levels eliminates the GPU pipeline stalls between levels.
 - **Hypothesis:** Single-dispatch multi-level CDF 9/7 wavelet using 32KB shared memory (M1 limit) reduces I-frame wavelet time by 25–40%. With I-frame wavelet at ~64ms (28% of I-frame time), this saves 16–25ms per I-frame → I+P+B fps improves from ~20 to ~23–25 fps.
-- **Pre-condition:** Profile pipeline.rs to confirm sequential dispatch+poll between wavelet levels. If already fused in a single command encoder with no intermediate polls, gain is minimal.
+- **Pre-condition check (2026-03-10):** Code inspection of `transform.rs` + `pipeline.rs` confirms the pre-condition is FALSE. All 4 wavelet levels × 2 passes × 3 planes = 24 dispatches are already inside a **single command encoder**, submitted once. No intermediate `device.poll()` or `queue.submit()` between levels. The only overhead between levels is Metal-internal memory barriers (~10–30 µs each), not CPU-blocking polls.
+- **Analysis:** Fusing levels would save ~150 µs total across all 3 planes — <<1% of 250ms I-frame time. Full tile fusion (level 0) would require 256×256 f32 = 256 KB shared memory per workgroup — 8× the M1 limit of 32 KB. Partial LL-subband fusion (levels 2–4) saves ~5 barriers × 30 µs = 150 µs max. Not worth implementing.
+- **Conclusion:** Closed. The hypothesized 25–40% speedup assumed CPU-side blocking polls — those don't exist. Real bottleneck is elsewhere (entropy, quantize, or CPU overhead). If speed improvement is needed, profile with GPU timestamp queries to identify the actual bottleneck.
 - **GPU fit:** Good. CDF 9/7 has a 9-tap filter; at 256×256 tile with 4-level decomposition, shared memory usage per workgroup is within 32KB M1 limit.
 - **Success criteria:** I-frame encode time <180ms at 1080p q=75 (from ~250ms); VMAF identical; all tests pass. Bitstream: no change.

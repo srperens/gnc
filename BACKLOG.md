@@ -519,11 +519,11 @@ H.264 comparison (#22) established the north star: GNC needs **2–5× more bits
 - **Complexity:** 2–3 days. Requires bitstream change: signal per-coefficient k (or delta from base k) — adds some overhead, net gain must outweigh it.
 
 ### 52. Intra-tile coarse-to-fine coefficient prediction
-- **Status:** todo
+- **Status:** closed (gate fail — no exploitable linear correlation)
 - **Motivation:** Before entropy coding, subtract a scaled parent-subband coefficient from each fine-subband coefficient. This reduces the expected magnitude of fine-subband coefficients, shifting their distribution toward zero and improving Rice coding efficiency. Decoder applies the inverse (add back the predicted value). No cross-tile dependency.
 - **Falsifiable claim:** Fine-subband mean_abs_coeff after prediction < 80% of mean_abs_coeff before prediction on bbb q=75 LL→LH prediction.
-- **Gate:** Add diagnostic: compute mean_abs of LH/HL/HH before and after subtracting alpha×parent. If reduction < 10% for all subbands, prediction adds overhead for negligible gain → close.
-- **Implementation:** New shader pass between quantize and entropy: `fine_coeff[x,y] -= alpha * coarse_coeff[x/2, y/2]`. Alpha empirically tuned per-subband (typically 0.3–0.6). Encoder and decoder apply identical prediction. Tile-independent.
+- **Gate result (2026-03-10):** Diagnostic measured on pre-quantization wavelet float coefficients (correct domain). Least-squares optimal alpha ≈ 0.0000 for all levels and subband types. Max LH mean_abs reduction = 0.0% (gate: ≥8% → proceed). Hypothesis falsified.
+- **Root cause:** CDF 9/7 wavelet orthogonality decorrelates subbands by design. LL = DC energy; LH/HL/HH = AC content, different orientations. Cross-orientation cross-scale linear correlation ≈ 0 for natural images. SPIHT-style zerotrees exploit *significance* correlation, not magnitude — different mechanism.
 - **Success criteria:** bbb q=75 bpp −2% at VMAF neutral.
 - **Complexity:** 1–2 days. No bitstream change needed if alpha is fixed (baked in). Minor if alpha is signaled per subband.
 
@@ -538,8 +538,76 @@ H.264 comparison (#22) established the north star: GNC needs **2–5× more bits
 - **Note:** Higher risk than #51/#52 due to parallelism impact. Run #51 and #52 first.
 
 ### 54. Quarter-pel ME for B-frames
-- **Status:** todo
+- **Status:** closed (gate fail — already qpel)
 - **Motivation:** P-frames got quarter-pel ME in #15 (−5–12% bpp). B-frames still use half-pel or integer-pel (not confirmed — needs gate). If B-frames are at half-pel, upgrading to qpel could yield similar gains to #15 on B-frame dominated sequences.
 - **Gate:** Add diagnostic: check ME_QPEL constant / B-frame ME dispatch — are B-frames using qpel or half-pel? If already qpel, close immediately.
+- **Gate result (2026-03-10):** B-frames already use quarter-pel ME. `block_match_bidir.wgsl` runs half-pel → quarter-pel refinement (phases 3c-3d). MVs stored in quarter-pel units. Same precision as P-frames. Nothing to do.
 - **Success criteria:** B-frame bpp −3–8%; VMAF neutral.
-- **Complexity:** 1–2 days if B-frames are at half-pel (reuse P-frame qpel shader). 0 days if already qpel (→ close).
+- **Complexity:** 0 days — gate closed.
+
+### 55. Affine motion estimation
+- **Status:** closed (RS veto — wrong content type)
+- **Motivation:** Current ME uses pure translation (dx, dy) per block. Camera zoom, rotation, perspective, and parallax are affine motions — a 6-parameter model (translation + rotation + scale + shear) can represent these with near-zero residual.
+- **RS verdict (2026-03-10):** VETO. crowd_run/park_joy are pedestrian/foliage independent-object motion — affine benefits camera-motion content (zoom, pan, dolly). Literature: <1% BD-rate gain on pedestrian sequences. 6 MVs/block overhead negates residual savings at 16×16. Hypothesis falsified for GNC's test sequences. Affine may be worth revisiting for zoom-heavy content, but is not a general solution.
+
+### 56. MCTF with 5/3 temporal filter (higher-order temporal wavelet)
+- **Status:** closed (RS veto — already captured by pyramid B-frames)
+- **Motivation:** 5/3 temporal filter over 4+ frames gives better frequency separation than Haar.
+- **RS verdict (2026-03-10):** VETO. GNC's hierarchical B-frame pyramid IS the predict step of temporal 5/3 lifting — the outer-to-inner coding order mirrors lifting steps. The update step adds <2% additional gain on high-motion content, requires a backward GPU pass, and needs ~600 MB additional GPU buffer for 8-frame GOP. Below 3% threshold. Not justified.
+
+### 57. Spatial intra prediction for I-frames
+- **Status:** closed (RS veto — redundant with wavelet)
+- **Motivation:** DC/planar intra prediction before wavelet transform reduces spatial redundancy.
+- **RS verdict (2026-03-10):** VETO. A 4-level CDF 9/7 wavelet on a 256×256 tile already IS the optimal spatial decorrelator — it captures structure at 16×16, 32×32, 64×64, 128×128 scales simultaneously. Pre-transform DC/planar prediction is redundant: smooth tiles already map to near-zero detail subbands. JPEG 2000 omits prediction for exactly this reason. Theoretical max gain: 1–3%, below threshold. Close without experiment.
+
+### 58. Optical flow / per-pixel motion compensation
+- **Status:** closed (RS veto — MV coding cost negates savings)
+- **Motivation:** Per-pixel dense optical flow eliminates block-boundary artifacts in MC residual.
+- **RS verdict (2026-03-10):** VETO. Dense MV field (2M MVs at 1080p) costs ~6% of bitstream budget before residual. Gains on pedestrian content (occlusions, independent motion) are near-zero — flow fails at exactly the hard cases that dominate crowd_run. Literature: flow-based codecs achieve ~5–8% BD-rate on smooth content, near 0% on crowd. −10–20% target is not supported. RAFT requires CNN inference (incompatible with WASM). Better path: affine at large block size for camera-motion content, or overlapping tile windows (#47) for boundary artifacts.
+
+### 59. Skip mode for P/B frames
+- **Status:** todo
+- **Motivation:** H.264's single biggest inter-frame advantage over GNC. Skip mode signals "zero residual, zero MV refinement" for near-static blocks with 1 bit. On crowd_run P-frames, H.264 skip-codes 40–60% of macroblocks (sky, buildings, slow background). GNC currently encodes residual and MV for every block unconditionally. RS analysis: skip mode accounts for ~35–50% of H.264's total inter gain on pedestrian content — more than adaptive block size.
+- **Falsifiable claim:** Skip mode (SAD < threshold) produces ≥35% skip rate on crowd_run P-frames and reduces bpp ≥8% at VMAF ≥99.0.
+- **Gate:** Diagnostic — log skip rate per P-frame at candidate SAD thresholds. If max achievable skip rate < 20% at any threshold without VMAF regression → close.
+- **Success criteria:** crowd_run bpp −8% (6.00 → ≤5.52) at VMAF ≥99.0.
+- **Complexity:** Low–medium. Skip flag in P/B block header, decoder skip path (zero-vector MC, zero residual). No bitstream format change required if skip fits in existing block header. Single per-q-level SAD threshold parameter.
+- **Note:** Must run before #60 (adaptive block size). If skip rate < 35% on crowd_run, the ME quality has a deeper problem that must be diagnosed before adding complexity.
+- **Resolution scaling (see #61):** The SAD threshold is pixel-absolute and calibrated for 1080p. At higher resolutions two effects compound: (1) if block size scales with resolution, SAD scales with block area — threshold must be normalized to SAD-per-pixel, not raw SAD. (2) the same physical sub-pixel motion that rounds to 0px at 1080p becomes 1–2px at 4K, raising SAD for blocks that are perceptually static. Implementation must express the threshold as `sad_per_pixel < k·qstep` (resolution-independent), not as a raw SAD value.
+
+### 61. Resolution-adaptive pipeline scaling (4K / 8K / 12K readiness)
+- **Status:** todo (P2 — no action needed until 4K test material available, but design must account for this)
+- **Motivation:** All pipeline parameters are currently calibrated for 1080p in pixels. At higher resolutions, the same physical scene motion and structure occupies proportionally more pixels. A fixed 256×256 tile at 8K covers ~6% of frame height vs ~24% at 1080p. A fixed ±96px ME search range at 4K corresponds to only ±48px of equivalent scene coverage. A fixed 4-level wavelet at any resolution produces a 16×16 LL subband regardless of how much scene content that represents.
+- **Parameters that must scale with resolution:**
+  - **Wavelet levels:** 4 @ 1080p → 5 @ 4K → 6 @ 8K → 7 @ 12K. Keeps LL subband representing ~same angular frequency.
+  - **ME search range:** `ME_SEARCH_RANGE = base_range × (width / 1920)`. Keeps equivalent scene coverage constant.
+  - **ME block sizes (once #60 is done):** nominal block size should scale similarly.
+  - **AQ region size:** AQ energy map resolution should track resolution.
+- **Parameters that do NOT scale:**
+  - **Tile size (256×256):** Hardware-constrained. M1 threadgroup memory (32KB) sets the ceiling. More tiles at higher resolution = more GPU threads = parallelism scales automatically. This is a feature, not a limitation.
+  - **Rice stream count (256 per tile):** Tied to tile size, stays fixed.
+- **Falsifiable claim:** At 4K (3840×2160), increasing wavelet levels from 4→5 and ME search range proportionally reduces I-frame bpp ≥3% and P-frame bpp ≥5% vs the 1080p-calibrated baseline run at 4K, at VMAF neutral.
+- **Gate:** Run GNC on a 4K test sequence with 4 vs 5 wavelet levels. No code change required — wavelet level is already a parameter. If bpp/VMAF difference < 1% → close.
+- **Success criteria:** Pipeline parameters auto-select based on input resolution. All 1080p benchmarks unaffected (backward compatible).
+- **Complexity:** Low for wavelet levels (already parameterized) and ME range (one formula). Medium for making auto-selection robust across resolutions.
+- **Note:** Tiles remain 256×256 by hardware necessity. The design insight is that tile count scales with resolution (more tiles = more GPU threads), while semantic parameters (wavelet depth, ME range) must be resolution-relative, not pixel-absolute.
+- **Design work required:** Before implementing resolution scaling, the team needs a general design document and explicit coding rules around pixel-absolute vs resolution-relative parameters. Every threshold, block size, search range, and energy value in the pipeline that is expressed in pixels is implicitly a 1080p assumption. This includes #59 (SAD threshold), #60 (block sizes, λ), ME search range, AQ energy map granularité, pyramid downsampling ratios, and any future parameters. The design document should establish: (1) which parameters are pixel-absolute by necessity (tile size — hardware), (2) which must be expressed relative to resolution (`width/1920` scale factor), (3) which should be per-pixel normalized (SAD, distortion, λ), and (4) a naming/commenting convention so future code makes the assumption explicit. This should be written before any 4K implementation work begins.
+
+### 60. Adaptive block-size ME with RD selection
+- **Status:** todo (blocked on #59)
+- **Motivation:** Item #40 (forced 4×4 everywhere) failed because MV overhead dominated without RD gating. RD-optimal block size selection — minimize λ·rate + distortion per block — lets the encoder use 8×8 at motion boundaries and 32×32 on uniform regions. H.264 studies show adaptive partitioning adds ~8–14% BD-rate gain on top of skip mode on pedestrian content.
+- **Block size candidates:** 8×8, 16×8, 8×16, 16×16 (current), 32×32. NOT 4×4 (closed by #40). NOT 64×8 or other extreme rectangles.
+- **Falsifiable claim:** RD-adaptive partitioning over {8×8, 8×16, 16×8, 16×16, 32×32} reduces crowd_run bpp ≥5% incremental over #59 skip-mode baseline at VMAF ≥99.0, with ME time increase ≤25%.
+- **Gate:** Block size distribution diagnostic: run ME at all 5 sizes per block, log winner. If >80% of non-skip blocks prefer 16×16 → size diversity is low → close. Requires λ calibration sweep (q=50, 75, 90 on crowd_run + park_joy).
+- **Success criteria:** crowd_run/park_joy bpp −5% incremental at VMAF neutral. ME fps regression < 20%.
+- **Complexity:** High. Multi-pass ME (5 sizes), λ calibration, partition flags in bitstream (breaking change — requires Team Lead approval), decoder partition-type routing. 3–5 days.
+- **Note:** Blocked on #59. If #59 bpp gain < 5%, investigate ME quality before proceeding to #60.
+- **Resolution scaling (see #61):** Block sizes are pixel-absolute and calibrated for 1080p. At 4K, an 8×8 block covers the same angular area as a 4×4 at 1080p — i.e., the effective block size set shifts down one level. The candidate set must scale: `{8,16,32,64}×(width/1920)` rounded to power-of-2. Similarly, λ (the rate-distortion Lagrange multiplier) is calibrated in pixel-domain distortion units and must be re-swept per resolution, or expressed as a per-pixel quantity.
+
+### 62. Fix benchmark-sequence OOM for long sequences (bbb_2min GNV1)
+- **Status:** todo
+- **Symptom:** `benchmark-sequence` with I+P+B mode on bbb_2min (1800 frames, Y4M or PNG) is killed by OOM (exit 137) immediately at I+P+B initialization — before a single frame is encoded. The temporal wavelet (Haar) path handles 1800 frames fine. 500 frames works. Issue is specific to I+P+B mode with long sequences.
+- **Impact:** `generate_demos.sh` cannot produce `bbb_2min.gnv` — demo is broken for that file. Currently using 500-frame fallback (209MB, ~17s).
+- **Likely cause:** I+P+B encoder allocates reference frame buffers (5-slot pyramid pool × full-res GPU buffers) upfront for the entire sequence, or something in the GOP pre-allocation scales with total frame count. The Haar path streams GOPs independently and does not have this problem.
+- **Gate:** Add peak RSS logging at benchmark-sequence startup for both I+P+B and Haar paths. Compare allocation profile for n=100, n=500, n=1800. If I+P+B allocation scales with n (not constant), find and fix the upfront allocation.
+- **Fix direction:** Make I+P+B encoder allocate per-GOP, not per-sequence. Reference buffers (5 slots) should be constant regardless of sequence length.

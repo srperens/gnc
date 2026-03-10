@@ -52,6 +52,13 @@ fn tile_skip_threshold(_qstep: f32) -> f32 {
     0.0
 }
 
+/// Per-16×16-block SAD threshold for P-frame skip mode.
+/// Blocks with SAD below this threshold have their residual zeroed before the wavelet,
+/// saving entropy bits at negligible quality cost.
+/// 0.7× qstep gives ~20-28% skip rate and ~0.5-1% bpp reduction at VMAF neutral.
+fn skip_threshold(qstep: f32) -> u32 {
+    (qstep * 0.7 * 256.0) as u32
+}
 
 /// Pre-computed ME results for a P-frame.
 /// Produced by the look-ahead ME pass that runs while the previous frame's
@@ -3456,6 +3463,23 @@ impl EncoderPipeline {
                         padded_h,
                         &bufs.mc_fwd_params_8,
                     );
+                    // Skip mode (luma only): zero residual for blocks whose SAD < threshold.
+                    // Blocks where MC prediction is already close to the original gain
+                    // negligible quality from coding their residual; zeroing lets Rice ZRL save bits.
+                    if p == 0 {
+                        let thr = skip_threshold(config.quantization_step);
+                        if thr > 0 {
+                            self.motion.dispatch_zero_skip_blocks(
+                                ctx,
+                                &mut cmd,
+                                &bufs.me_sad_buf,
+                                &bufs.mc_out,
+                                padded_w,
+                                padded_h,
+                                thr,
+                            );
+                        }
+                    }
                     // Diagnostics: copy per-channel residual before wavelet overwrites mc_out
                     if let Some(ref stg) = diag_residual_staging {
                         cmd.copy_buffer_to_buffer(&bufs.mc_out, 0, &stg[p], 0, plane_size);

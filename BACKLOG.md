@@ -14,14 +14,14 @@ H.264 comparison (#22) established the north star: GNC needs **2–5× more bits
 - P/B frames save only ~3% bpp vs all-I on high-motion content — H.264's MC is far more efficient
 - Rice+ZRL vs arithmetic coding is only ~0.1–0.2 bpp — not the bottleneck
 - #35 (DCT for inter residuals) deferred by RS: OBMC gate (0% bpp change from MV smoothing) falsifies the "block-boundary energy" premise; realistic gain 2-5%, not the 10% criterion
-- New focus: prediction quality improvements (#41 adaptive intra tiles, #42 hierarchical B-frames)
+- New focus: #42 hierarchical B-frames (RS hypothesis needed before implementation)
 
 **Priority order (updated 2026-03-10):**
 1–14: (see previous items, all done/closed)
 15. **#35 DCT for inter-frame residuals** (deferred — RS gate: run residual subband energy experiment first) — see #35 entry
 16. **#40 4×4 sub-block ME** (CLOSED — bpp +15–26%; MV overhead dominates; hypothesis falsified)
-17. **#41 Adaptive intra tiles in P/B frames** (todo P1) — intra fallback for poorly-predicted tiles
-18. **#42 Hierarchical B-frame GOP** (todo P2) — pyramid reference structure for tighter temporal distance
+17. **#41 Adaptive intra tiles in P/B frames** (CLOSED — gate nominally passes but gain < 1% at q=75; LL-dominant residuals = camera motion, not tile misprediction; not worth bitstream format change)
+18. **#42 Hierarchical B-frame GOP** (todo P1) — pyramid reference structure; cannot gate via ki=N (invalid proxy); needs RS hypothesis + full implementation
 19. **#36 Deblocking filter** (closed P2) — artifact is 1-2px incoherent boundary mismatch; deblocking would blur; correct fix requires overlapping tiles (bitstream change)
 20. **#37 Per-8×8-block skip** (closed P2) — 0% blocks qualify on bbb; pan motion prevents block-level static detection
 21. **#38 Lagrange RD quantization** (closed P3) — gate: AQ adds +0.5-1.4% bits (not saves bits); exploitable gap <1.5%; not worth 5-7 days
@@ -399,17 +399,16 @@ H.264 comparison (#22) established the north star: GNC needs **2–5× more bits
 - **Lesson:** Smaller blocks require per-block RD split decision (compare saved residual vs MV cost) to be net positive. H.264 does this per macroblock. Without this gate, 4×4 ME always increases total bits. A future #40b could add an RD gate, but estimated effort is high (need 8×8 SAD fed into 4×4 shader) and #41/#42 are better priority.
 
 ### 41. Adaptive intra tiles in P/B frames
-- **Status:** todo (P2)
-- **Motivation:** GNC forces all tiles in a P-frame to be inter-coded. Some tiles in every P-frame have poor MC match (large SAD even after ME). For those tiles, intra coding (spatial wavelet without MC residual) would use fewer bits than a large inter-frame residual. H.264 always tests intra coding for every macroblock in a P-frame and picks the cheaper option.
-- **Hypothesis:** For each P-frame tile, if estimated intra cost < estimated inter cost (using LL subband variance as proxy for intra complexity vs current MC residual SAD as proxy for inter cost), encode as intra tile. Expected: bpp −5% on crowd_run q=75 where many tiles have poor MC match.
-- **Gate:** For each P-frame tile, compute ratio: (LL subband variance of current tile) / (zero-MV SAD). If >10% of P-frame tiles have this ratio < 1.0 (intra would be cheaper), proceed. This is a 0.5-day measurement using existing diagnostics, no shader changes.
-- **Success criteria:** bpp −5% on crowd_run q=75; VMAF neutral ±0.3 pts; no regression on bbb. Bitstream: mode bit per tile (intra/inter) required — minor version bump.
-- **Complexity:** 3-5 days. Per-tile mode bit in bitstream header. Encoder: decision per tile, use existing I-frame path for intra tiles. Decoder: read mode bit, branch to intra or inter reconstruction.
+- **Status:** CLOSED (2026-03-10) — gain < 1% at q=75; not worth bitstream format change
+- **Gate result (2026-03-10):** Nominally passed: near_zero=11–17%, ratio vs I-frame = 0.98–1.00 on some P-frames on crowd_run. But LL residual mean_abs_diff=40.69 vs LH/HL=2.37/2.73 → LL-dominant. This is camera/crowd motion shifting DC-level across tiles, not tile misprediction. Switching those tiles to intra doesn't save bits because intra also costs ~I-frame rate for high-motion tiles.
+- **Gate gate:** max possible gain: tiles that switch save only the MV overhead (2.3% total). With ~10% of tiles qualifying, savings ≤0.23%. Revised upper bound: < 1% total bpp savings.
+- **Lesson:** Per-tile intra mode requires bitstream format change AND per-tile mode decision complexity. Only worthwhile if gain is reliably ≥3%. On crowd_run the MC fails globally (per-frame ratio = 0.98–1.0), not per-tile. Fix needs better global MC, not per-tile intra fallback.
 
 ### 42. Hierarchical B-frame GOP (pyramid reference structure)
-- **Status:** todo (P2)
-- **Motivation:** GNC uses flat B-frame referencing (all B-frames reference the same I and P anchors at distance ki/2 = 4 frames). A 2-level pyramid (e.g., I B4 B2 B3 B4 P B4 B6 B7 P) lets middle B-frames reference closer temporal neighbors (e.g., B2 references I and B4, not I and P), dramatically reducing residual energy for those frames. This is how H.264/H.265 achieve high efficiency on medium-motion content.
-- **Hypothesis:** A 2-level hierarchical GOP (ki=8, B-frames reference frames at distance ≤4 instead of ≤8) reduces bpp −8% on bbb q=75; VMAF neutral. The closer temporal references reduce B-frame residual energy proportionally to the temporal distance reduction.
-- **Gate:** Compare current GOP (ki=8, flat B-refs at distance ≤8) vs a 3-frame GOP (I B P) where B references I and P at distance ≤2. If 3-frame GOP has lower bpp than current 8-frame GOP normalized for GOP size, hierarchical referencing is worth implementing for longer GOPs.
-- **Success criteria:** bpp −8% on bbb q=75 (VMAF neutral ±0.3 pts); bpp neutral or better on crowd_run; latency increase ≤3 frames; no test regression.
-- **Complexity:** 4-6 days. Encoder: rearrange coding order vs display order (already partially handled). Decoder: maintain ≥2 decoded reference frames (partially done for B-frames). Bitstream: reference frame index per B-frame (currently implicit — both refs are I/P anchors; needs explicit per-frame ref indices).
+- **Status:** todo (P1) — RS hypothesis card needed before implementation
+- **Motivation:** GNC uses flat B-frame referencing (all B-frames reference the same I and P anchors). A pyramid structure (I B4 B2 B1 B3 B2 B1 P where B-frames at each level reference closer frames) reduces temporal distance for inner B-frames without adding I-frames. HEVC and VP9 both use this for high efficiency.
+- **Gate experiment result (2026-03-10 — INVALID PROXY):** ki=5 (B-frames at ≤2 frame distance) = 6.51 bpp vs ki=8 (≤4 frame distance) = 6.45 bpp on crowd_run. ki=5 is WORSE because it forces more I-frames. This is not a valid proxy for hierarchical B-frames within a fixed-length GOP.
+- **Conclusion:** Cannot gate via ki=N. Must implement partial hierarchical structure to measure benefit. RS hypothesis card needed.
+- **Hypothesis (draft, needs RS approval):** Within ki=8 GOP, encode layer-1 B (frame 4) first, then layer-2 B (frames 2,6) referencing I+layer-1 and layer-1+P respectively, then layer-3 (frames 1,3,5,7). Temporal distance for layer-3 = 1 frame; layer-2 = 2 frames; layer-1 = 4 frames. Expected bpp −8% on bbb, −4% on crowd_run; VMAF neutral.
+- **Success criteria (draft):** bpp −5% on bbb q=75; VMAF neutral ±0.3 pts; no regression on crowd_run or park_joy.
+- **Complexity:** 4-6 days. Encoding order ≠ display order (layers encoded outer-to-inner). Decoder must buffer decoded frames at each layer as reference. Bitstream: per-B-frame reference indices (currently implicit, both = I/P anchors). Minor version bump required.

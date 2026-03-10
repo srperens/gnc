@@ -4,6 +4,28 @@
 
 ---
 
+## 2026-03-10: #41 and #42 gate experiments — both closed/redesigned
+
+### #41 Adaptive intra tiles — CLOSED
+
+RS conditional approval. Gate metric passed (near_zero=11–17%, ratio vs I-frame = 0.98–1.00 on crowd_run P-frames). But critical finding from diagnostics: LL subband mean_abs_diff=40.69 vs LH/HL=2.37/2.73. LL-dominant residuals = camera/crowd motion shifting DC-level, not tile misprediction. Intra coding of those tiles costs ~I-frame rate = no savings. Upper bound < 1% bpp at q=75. Closed.
+
+### #42 Hierarchical B-frames — gate redesigned
+
+Gate experiment (ki=5 vs ki=8) shown to be an invalid proxy:
+
+| Config | crowd_run bpp | Frame mix |
+|---|---|---|
+| ki=4 | 6.52 bpp | I+P only (no B-frames) |
+| ki=5 | 6.51 bpp | I+P+B (B-frames at ≤2 frames) |
+| ki=8 | 6.45 bpp | I+P+B (B-frames at ≤4 frames) |
+
+Shorter ki increases I-frame frequency, which raises average bpp even if individual B-frames are cheaper. This is not a valid proxy for hierarchical B-frames (pyramid structure) which maintain the same I-frame frequency.
+
+Conclusion: #42 must be implemented to test. RS hypothesis card needed. Moving to RS evaluation before committing to 4-6 day implementation.
+
+---
+
 ## 2026-03-10: #40 4×4 sub-block ME — implementation FAILED; reverted
 
 ### Validator Results: BLOCK

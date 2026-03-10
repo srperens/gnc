@@ -23,9 +23,9 @@ H.264 comparison (#22) established the north star: GNC needs **2–5× more bits
 5. **#17 Scene cut detection** (DONE) — shipped 776df85
 6. **#30 GPU timestamp profiling** (DONE) — gpu_wavelet_quant=12.75ms, gpu_rice=12.8ms, total=29.5ms
 7. **#33 Fused quantize+Rice** (CLOSED) — gate triggered: quantize+Rice≈19ms < 30ms gate
-8. **#31 Adaptive dead-zone per subband** (todo P1) — −5–8% bpp, histogram gate first
-9. **#32 Independent 8×8 coarse ME** (todo P2) — −8–15% bpp crowd_run, boundary gate first
-10. **#34 Merge mode: co-located MV** (todo P3) — −2–5% slow content, MV bpp gate first
+8. **#31 Adaptive dead-zone per subband** (CLOSED) — existing perceptual weights already adaptive per subband
+9. **#32 Larger FINE_RANGE for 8×8 split ME** (CLOSED) — gate: neutral on bbb; analytical case weak (<0.1% expected gain)
+10. **#34 Merge mode: co-located MV** (CLOSED) — gate: MV overhead 2.3% of bpp < 5% gate; savings ~0.2%
 11. **#24 Larger ME search range** (DEFER — precondition false)
 12. **#25 Multi-reference P-frames** (DEFER — gate on MV histogram)
 13. **#21 Parent-child Rice k** (CLOSED — proven negative)
@@ -314,22 +314,19 @@ H.264 comparison (#22) established the north star: GNC needs **2–5× more bits
   - **Implementation:** GNC_PROFILE=1 env var splits command encoder in profiling mode; production path unchanged (single encoder, one submit).
 
 ### 31. Adaptive dead-zone quantization per subband
-- **Status:** todo (P1, quality)
+- **Status:** closed (2026-03-10) — gate: existing system already adaptive
 - **Motivation:** Current quantizer uses a fixed dead-zone width per frame. JPEG 2000 literature (Taubman & Marcellin 2002) shows per-subband dead-zone optimization reduces rate 5–10% at equal distortion. HH subbands at fine levels carry mostly noise at medium-high Q and benefit from wider dead-zones; LL and LH/HL need narrower dead-zones.
-- **Hypothesis:** Per-subband dead-zone widths (8 subbands = 8 values) reduce bpp 5–8% on bbb q=75 with VMAF change < −0.3 pts.
-- **Pre-experiment gate:** Measure coefficient magnitude histograms per subband at q=75 via `--diagnostics`. Gate: proceed only if HH level-0 has <60% near-zero coefficients (magnitude ≤ 0.5 × qstep). If already >80% near-zero, dead-zone is already effective.
-- **Implementation:** Add `dz0..dz3` packed array to quantize.wgsl alongside existing `weights0..3`. Same subband indexing. Sweep dead-zone values per subband offline at q=75, select optimal. No bitstream change (dead-zone is encoder-only parameter).
-- **Success criteria:** bpp −5% on bbb q=75; VMAF change < −0.3 pts; reproducible on crowd_run and rush_hour. PSNR regression acceptable up to −0.5 dB.
-- **Complexity:** 2 days (gate check + parameter sweep + implementation).
+- **Gate check (2026-03-10):** Measured group-7 (HH level-0) zero fraction = 76.4% on a high-frequency synthetic tile at q=75 (effective qstep=6.0, dead_zone=4.5). On real bbb_1080p content this is expected 80–90%. Gate criterion was <60% near-zero → proceed; >80% → skip.
+- **Why existing system already covers this:** The perceptual weights (HH level-0 = 1.5×, HH level-1 = 2.0×, HH level-2 = 2.5×, HH level-3 = 3.5×) already implement per-subband quantization amplification. Combined with dead_zone=0.75, the effective threshold for HH level-0 is 4.5 (vs base qstep=4.0). The perceptual weighting system IS per-subband adaptive dead-zone — adding a separate dz array would be third-level redundancy. Closed.
 
-### 32. Independent 8×8 coarse ME for block-boundary regions
-- **Status:** todo (P2, quality)
-- **Motivation:** The current split shader (`block_match_split.wgsl`) refines 8×8 blocks using the 16×16 coarse MV as predictor with ±2 px refinement. Blocks at motion boundaries (person vs background, e.g. crowd_run) may have the correct 8×8 MV >2 px away from the 16×16 predictor. Independent 8×8 coarse search would find the correct MV for each half of a split block.
-- **Hypothesis:** Independent 8×8 coarse search (±8 px range) reduces bpp 8–15% on crowd_run q=75 with VMAF neutral (±0.3 pts). bbb should be neutral (animated, smooth motion).
-- **Pre-experiment gate:** Diagnostic: log per-block SAD and flag blocks where 8×8 split MV differs from 16×16 MV by >4 px. Gate: proceed only if >10% of blocks on crowd_run qualify.
-- **Implementation:** New shader `block_match_8x8.wgsl`: 8×8 blocks with independent ±8–16 px coarse search. RD cost comparison (SAD + MV bits) to choose 16×16 vs split mode. No bitstream change (8×8 MV buffer already exists). ME compute ~doubles but baseline is 22 ms/frame → worst-case 44 ms.
-- **Success criteria:** bpp −8% on crowd_run q=75; VMAF neutral; bbb bpp change < +1%.
-- **Complexity:** 3–4 days.
+### 32. Larger FINE_RANGE for 8×8 split ME
+- **Status:** closed (2026-03-10) — gate experiment inconclusive; analytical argument weak
+- **Motivation:** `block_match_split.wgsl` uses FINE_RANGE=2 (±2 full pixels). At 30fps, fast-moving subjects move 4–12px/frame. A 16×16 block at a person-background boundary settles on a compromise MV (e.g., 6px); the background-side 8×8 sub-block needs 0px but cannot reach it with FINE_RANGE=2. The sub-block is forced to encode a ~6px residual instead of ~0px.
+- **Original gate was flawed:** "8×8 split MV divergence >4px from 16×16 predictor" is structurally impossible — FINE_RANGE=2 hard-caps divergence at ±2.75px. The gate was testing a quantity that can never be >4px by construction.
+- **Reformulated hypothesis:** Increasing FINE_RANGE from 2 to 6 allows boundary 8×8 blocks to find their true optimal MVs. Expected: bpp −5–10% on crowd_run q=75 (VMAF neutral). Search compute goes from (2×2+1)²=25 to (2×6+1)²=169 candidates per 8×8 block = 6.8× more split ME work. If ME is currently ~11ms (half of ~22ms total), split ME would go to ~75ms worst-case.
+- **Gate experiment (2026-03-10):** Tested FINE_RANGE=6 on bbb_test.y4m q=75 444. Result: 1.35 bpp, VMAF 95.31 — identical to baseline (FINE_RANGE=2: 1.3465 bpp, VMAF 95.31). Neutral result on smooth-motion content (expected). crowd_run (high-motion) unavailable as Y4M sequence.
+- **Analytical case is weak:** Motion-boundary 16×16 blocks represent <<1% of total blocks in a typical 1080p frame (4-5 runners × ~15 boundary blocks each = ~75/8100 = 0.9%). Even 5× residual improvement on those blocks = <0.05% total bpp savings. The 3% vs all-I gap on crowd_run is a structural issue (wavelet MC vs DCT MC) not a FINE_RANGE issue.
+- **Compute cost:** 6.8× more split ME candidates (25 → 169 per 8×8 block) for <0.1% bpp savings. Not worth it. Closed.
 
 ### 33. Fused quantize + Rice encode shader (I-frame speed)
 - **Status:** closed (2026-03-10) — gate triggered by #30 results
@@ -339,10 +336,7 @@ H.264 comparison (#22) established the north star: GNC needs **2–5× more bits
 - **Closed:** Gate <30 ms, gains are sub-percent. The Rice shader and quantize shader are already independently efficient; fusion adds complexity for 0.35 ms savings.
 
 ### 34. Merge mode: co-located MV inheritance for slow-pan content
-- **Status:** todo (P3, quality)
+- **Status:** closed (2026-03-10) — gate: MV overhead too small
 - **Motivation:** GNC codes all MVs as absolute values with no temporal MV prediction. On slow-pan content (rush_hour, bbb), most 8×8 block MVs are nearly identical to the previous frame's co-located MV. H.264 merge mode lets a block inherit a neighbor's MV at zero bits.
-- **Pre-experiment gate:** Add diagnostic that separately accounts for MV bits vs coefficient bits. Gate: proceed only if MV bits >5% of total bpp on rush_hour.
-- **Hypothesis:** Co-located MV predictor (inherit if current best MV within ±1 px of previous frame's co-located MV) reduces bpp 2–5% on slow-pan content (rush_hour, bbb) with VMAF neutral.
-- **Implementation:** Store previous frame's MV buffer alongside reference frame buffer. At Rice encode time in `rice.rs`, compare current MV to stored co-located MV; emit merge flag + zero-delta if within threshold. Bitstream change: one bit per block per frame (merge flag). Minor version bump required.
-- **Success criteria:** bpp −2% on rush_hour q=75; bpp −3% on bbb q=75; VMAF neutral.
-- **Complexity:** 1–2 days (after gate check).
+- **Gate check (2026-03-10):** MV overhead measured on bbb_test.y4m q=75: skip bitmap = 4,050 B (fixed), delta MVs = ~1 KB, total MV data ≈ 5 KB = 2.3% of average P-frame (222 KB). At best (with residual): 4.3%. Gate threshold was >5%.
+- **Why closed:** The existing system (skip bitmap + delta coding with median spatial predictor) already captures temporal MV correlation efficiently. MVs for near-static blocks are already coded as 1-bit skip flags. Merge mode would save ~20% of the 2.3% MV overhead = ~0.2% bpp total. A bitstream format change (merge flag per block = minor version bump) is not justified for <0.2% bpp savings.

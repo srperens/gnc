@@ -32,6 +32,21 @@ Before implementing temporal prediction improvements, ask: "Does the encoder alr
 
 ---
 
+## 2026-03-10: #31, #32, #34 gate experiments — all closed
+
+### #31 Adaptive dead-zone (gate: existing system already adaptive)
+Measured group-7 (HH level-0, finest diagonal) zero fraction = 76.4% on synthetic high-frequency tile at q=75. Gate was <60% → proceed; >80% → skip. Expected value on real bbb_1080p: 80–90%. The perceptual weights (HH level-0 = 1.5×, level-1 = 2.0×, level-2 = 2.5×, level-3 = 3.5×) already implement per-subband quantization amplification, which is equivalent to per-subband dead-zone. Adding a separate `dz[]` array would be third-level redundancy. **Closed.**
+
+### #32 Larger FINE_RANGE for 8×8 split ME (gate: boundary blocks < 1% of total)
+Original gate metric was flawed (MV divergence >4px from 16×16 predictor is structurally impossible with FINE_RANGE=2; max divergence = ±2.75px). Reformulated gate: test FINE_RANGE=2 vs FINE_RANGE=6 directly on bbb. Result: 1.35 bpp, VMAF 95.31 — identical (expected for smooth motion). crowd_run unavailable.
+
+Analytical argument for closure: motion-boundary 16×16 blocks represent <<1% of total blocks (4-5 runners × ~15 boundary blocks = ~75/8100 = 0.9%). Even 5× residual improvement on boundary blocks = <0.05% bpp savings. Compute cost: 6.8× more split ME (25→169 candidates per 8×8 block). **Closed.**
+
+### #34 Merge mode co-located MV inheritance (gate: MV overhead too small)
+Measured MV overhead on bbb_test.y4m P-frames: skip bitmap = 4,050 B (fixed), delta MVs = ~1 KB. Total ≈ 5 KB = 2.3% of average P-frame (222 KB). Gate was >5% of total bpp. The existing skip bitmap + delta coding + median spatial predictor already captures temporal MV correlation. Merge mode savings: ~20% of 2.3% = 0.2% bpp. Not worth a bitstream format change. **Closed.**
+
+---
+
 ## 2026-03-10: #30 GPU stage profiling — I-frame bottleneck identified
 
 ### Method

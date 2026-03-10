@@ -24,7 +24,7 @@ H.264 comparison (#22) established the north star: GNC needs **2–5× more bits
 18. **#44 DC subband offset correction** (CLOSED — physics analysis: crowd_run LL residual from chaotic motion not DC shift; PSNR-implied DC shift ≈3 pixels → < 1% bpp gain)
 19. **#45 Adaptive GOP** (CLOSED — ki=2 crowd_run = 6.73 bpp > ki=8 6.45 bpp; shorter GOP increases bpp; MC futility detector cannot help)
 20. **#43 Multi-reference P-frames** (CLOSED — gate analysis: pyramid ME ±96px already closes search-range gap; constant-velocity crowd motion won't prefer N−2; Researcher confidence 2/5; gate experiment costs 2-3 days with likely failure)
-21. **#42 Hierarchical B-frame GOP** (active) — RS hypothesis approved; bbb −5–10%; coding order I₀P₈B₄B₂B₆B₁B₃B₅B₇
+21. **#42 Hierarchical B-frame GOP** (done 2026-03-10) — RS hypothesis approved; coding order I₀P₈B₄B₂B₆B₁B₃B₅B₇; GP14 bitstream; validation pending
 19. **#36 Deblocking filter** (closed P2) — artifact is 1-2px incoherent boundary mismatch; deblocking would blur; correct fix requires overlapping tiles (bitstream change)
 20. **#37 Per-8×8-block skip** (closed P2) — 0% blocks qualify on bbb; pan motion prevents block-level static detection
 21. **#38 Lagrange RD quantization** (closed P3) — gate: AQ adds +0.5-1.4% bits (not saves bits); exploitable gap <1.5%; not worth 5-7 days
@@ -408,7 +408,7 @@ H.264 comparison (#22) established the north star: GNC needs **2–5× more bits
 - **Lesson:** Per-tile intra mode requires bitstream format change AND per-tile mode decision complexity. Only worthwhile if gain is reliably ≥3%. On crowd_run the MC fails globally (per-frame ratio = 0.98–1.0), not per-tile. Fix needs better global MC, not per-tile intra fallback.
 
 ### 42. Hierarchical B-frame GOP (pyramid reference structure)
-- **Status:** active (2026-03-10) — RS hypothesis approved; Builder phase
+- **Status:** done (2026-03-10) — commit 4bddc59
 - **Motivation:** GNC uses flat B-frame referencing (all B-frames reference the same I and P anchors). A pyramid structure (I B4 B2 B1 B3 B2 B1 P where B-frames at each level reference closer frames) reduces temporal distance for inner B-frames without adding I-frames. HEVC and VP9 both use this for high efficiency.
 - **Gate experiment result (2026-03-10 — INVALID PROXY):** ki=5 (B-frames at ≤2 frame distance) = 6.51 bpp vs ki=8 (≤4 frame distance) = 6.45 bpp on crowd_run. ki=5 is WORSE because it forces more I-frames. This is not a valid proxy for hierarchical B-frames within a fixed-length GOP.
 - **Conclusion:** Cannot gate via ki=N. Must implement partial hierarchical structure to measure benefit. RS hypothesis card needed.
@@ -422,8 +422,15 @@ H.264 comparison (#22) established the north star: GNC needs **2–5× more bits
   - Layer 3: B₁B₃B₅B₇ refs adjacent layer-2 frames (distance 1)
   - Expected: bbb −5–10%, crowd_run −1–4% (chaotic motion limits gain)
   - Fail criterion: bbb < 2% → flat structure still active; crowd_run = 0% expected (OK)
-  - Diagnostic required: print actual ref indices used per B-frame
+  - Diagnostic required: print actual ref indices used per B-frame (GNC_BFRAME_PYRAMID=1)
   - Risk: reference frame index mgmt silently using wrong frame
+- **Implementation summary (2026-03-10):** B_FRAMES_PER_GROUP changed 2→7 (group size 8).
+  GP14 bitstream: MotionField.fwd_ref_idx/bwd_ref_idx (Option<u8>) added. 5-slot reference
+  pool per encoder and decoder. Encoder local-decodes B₄/B₂/B₆ into pyramid slots using
+  mc_bidir_inv_params (mode=1 reconstruct) — critical: wrong params (mode=0) caused −0.11 dB
+  on all layer-3 B-frames. Decoder always loads refs from saved pool slots (never relies on
+  transient buffer state). All 163 tests pass; zero clippy warnings; WASM clean.
+- **Validation:** Pending benchmark run on bbb/crowd_run/park_joy sequences.
 
 ### 43. Multi-reference P-frames (2 references per tile)
 - **Status:** CLOSED (2026-03-10) — Researcher meta-gate analysis

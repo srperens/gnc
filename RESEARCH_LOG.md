@@ -4,6 +4,40 @@
 
 ---
 
+## 2026-03-10: #42 Hierarchical B-frame GOP — DONE (commit 4bddc59)
+
+### Implementation complete
+
+3-level dyadic pyramid GOP implemented. B_FRAMES_PER_GROUP changed from 2 to 7 (group size 8).
+Coding order: I₀ P₈ B₄ B₂ B₆ B₁ B₃ B₅ B₇.
+
+Bitstream format bumped GP13 → GP14: MotionField adds optional fwd_ref_idx/bwd_ref_idx (u8)
+fields encoding a 5-slot reference pool. GP13 streams decode unchanged (backwards compat via
+`Option::None` = flat refs 0/1).
+
+**Critical bug fixed during implementation:** `local_decode_bframe_to_pyramid_slot` was using
+`mc_bidir_fwd_params` (mode=0, compute residual = subtract prediction) instead of
+`mc_bidir_inv_params` (mode=1, reconstruct = add prediction). Root cause: the encoder's local
+decode of B₄/B₂/B₆ (needed to populate pyramid reference slots for later B-frames) must perform
+*reconstruction*, not *forward encoding*. The wrong mode produced −0.11 dB on all layer-3
+B-frames (B₃, B₅, B₇). Fix: add `mc_bidir_inv_params` (forward=false, mode=1) to encoder
+buffer_cache and use it in the local decode path.
+
+**Test results:** All 163 tests pass. Zero clippy warnings. WASM clean.
+
+**Validation:** Pending benchmark run. Expected: bbb −5–10% bpp, crowd_run −1–4%, VMAF neutral.
+
+### Key architecture details
+
+- Encoder: 5-slot `gpu_pyramid_ref_planes` [B₄, B₂, B₆, past_anchor_temp, decoded_P_permanent]
+- Decoder: 5-slot `pyramid_ref_planes` [B₄, B₂, B₆, future_P_save, past_anchor_save]
+- Both encoder and decoder load refs exclusively from saved pyramid slots (never rely on transient
+  buffer state — this was the root cause of earlier B₁ PSNR=31.35 dB bug in prior session)
+- Pool mapping: 0=past_anchor, 1=future_P, 2=B₄, 3=B₂, 4=B₆
+- `GNC_BFRAME_PYRAMID=1` env var prints per-frame ref indices for diagnostic verification
+
+---
+
 ## 2026-03-10: #42 architecture diagnosis — ready for Builder
 
 ### Researcher diagnosis (key findings)

@@ -4,6 +4,27 @@
 
 ---
 
+## 2026-03-10: #42 4:2:0 B-frame chroma MC bug — stale mv_chroma_buf (bugfix)
+
+### Root cause
+
+`dispatch_mv_scale` in `encode_bframe` was called with `me_total_blocks` (8160 for 1920×1088,
+16×16 luma blocks) instead of `split_total_blocks` (32640, 8×8 luma = 4×4 chroma blocks).
+The decoder always dispatches `split_total_blocks` entries, getting zeros for entries 8160..32640
+via out-of-bounds reads from `mv_buf`. The encoder only refreshed entries 0..8160, leaving
+8160..32640 stale with the previous B-frame's MVs. This mismatch caused encoder/decoder
+residuals to diverge for all B-frames encoded after B₄.
+
+**Symptoms:** B₂ = 25.33 dB, B₃ = 26.59 dB, B₅ = 25.38 dB vs B₄ = 35.77 dB (good).
+B₄ was fine because `mv_chroma_buf` was zero-initialized on buffer creation.
+After fix: all B-frames 36.08–36.37 dB (consistent). bpp dropped from 3.8-4.5 → 0.4-0.6.
+
+**Fix:** Change `bufs.me_total_blocks` → `bufs.split_total_blocks` in both
+`dispatch_mv_scale` calls for B-frame 4:2:0 fwd+bwd chroma MV scaling in `encode_bframe`.
+OOB reads now produce zeros matching the decoder.
+
+---
+
 ## 2026-03-10: #42 Hierarchical B-frame GOP — DONE (commit 4bddc59)
 
 ### Implementation complete
@@ -2383,3 +2404,22 @@ Note: crowd_run "old" baseline was also affected by the ki bug (was I+P only at 
 
 ### Conclusion
 Hierarchical pyramid B-frame GOP (3-level dyadic) is SHIPPED. Real improvement confirmed on 2 of 3 sequences. VMAF neutral on both. The bbb sequence test material is too short to measure.
+
+## #46 LL Subband Spatial Prediction — Gate Experiment (2026-03-10)
+
+**Hypothesis:** LL residual tiles in P-frames have spatial correlation (adjacent tiles similar), enabling delta-coding for 30–50% entropy reduction in LL stream.
+
+**Gate diagnostic:** `GNC_LL_SPATIAL=1` env var in `encode_pframe`. Reads back `bufs.recon_y` after GPU quantize, computes for horizontal tile pairs: ratio = mean_abs(LL[i] − LL[i−1]) / mean_abs(LL[i]).
+
+**Results:**
+| sequence   | tiles   | mean_ratio | max_ratio | gate     |
+|------------|---------|------------|-----------|----------|
+| crowd_run  | 35/40   | 1.536      | 1.821     | FAIL     |
+| park_joy   | 35/40   | 1.705      | 1.982     | FAIL     |
+| bbb        | 0/40    | n/a        | n/a       | n/a (static test seq) |
+
+**Interpretation:** ratio > 1.0 means inter-tile LL variation *exceeds* per-tile LL magnitude. The LL residual domain is spatially anti-correlated — delta coding from left tile would increase bitrate.
+
+**Root cause:** MC prediction removes the spatial low-frequency continuity that would enable prediction. What remains in LL residual is per-tile prediction error driven by local motion complexity. Crowd_run and park_joy have heterogeneous motion (crowd motion, panning) → tiles have independent prediction errors → no exploitable correlation.
+
+**Conclusion:** CLOSED. Hypothesis falsified. The spatial structure hypothesis applies to *source* LL subbands, not *residual* LL subbands. Residual domain after MC is already decorrelated spatially.

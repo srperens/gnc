@@ -524,6 +524,95 @@ impl EncoderPipeline {
                 };
                 let p_frame_data = load_frame(p_display);
 
+                // #49 gate diagnostic: compare per-tile SAD against I₀ (current ref) vs B₄ proxy.
+                // GNC_PYRAMID_REF=1 → load raw source frames for I₀ and B₄ midpoint, compute
+                // CPU-side per-tile |P − ref| sum, report fraction of tiles preferring B₄.
+                // Gate passes if > 20% of tiles prefer B₄ (B₄ is closer in time = less residual).
+                if std::env::var_os("GNC_PYRAMID_REF").is_some() {
+                    static PYRAMID_REF_PRINTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                    PYRAMID_REF_PRINTED.get_or_init(|| {
+                        eprintln!("[pyramid_ref] diagnostic active (GNC_PYRAMID_REF)");
+                    });
+
+                    // I₀ source: the keyframe just before this B-group (for g=0: display_idx-1)
+                    let i0_display = group_start.saturating_sub(1);
+                    // B₄ proxy: midpoint between I₀ and P₈ in display order
+                    // e.g. for b_count=7: I₀=0, P₈=8, B₄=4 = i0_display + (b_count+1)/2
+                    let b4_display = i0_display + (b_count + 1) / 2;
+
+                    if i0_display < n && b4_display < n {
+                        let i0_data = load_frame(i0_display);
+                        let b4_data = load_frame(b4_display);
+
+                        let tile_sz = config.tile_size as usize;
+                        let w = width as usize;
+                        let h = height as usize;
+                        let tiles_x = (w + tile_sz - 1) / tile_sz;
+                        let tiles_y = (h + tile_sz - 1) / tile_sz;
+                        let n_pixels_per_channel = w * h;
+
+                        // Determine channel stride: RGB interleaved (3 channels) vs planar.
+                        // load_frame returns interleaved RGB: stride = 3 per pixel.
+                        // Use R channel (index 0) as luma proxy.
+                        let ch_stride = if p_frame_data.len() == n_pixels_per_channel * 3 {
+                            3usize
+                        } else {
+                            // Planar: first plane is Y
+                            1usize
+                        };
+
+                        let mut b4_wins = 0usize;
+                        let mut total_tiles = 0usize;
+                        let mut total_sad_ratio = 0.0f64;
+
+                        for ty in 0..tiles_y {
+                            for tx in 0..tiles_x {
+                                let mut sad_i0 = 0.0f64;
+                                let mut sad_b4 = 0.0f64;
+                                let mut cnt = 0usize;
+                                for row in 0..tile_sz {
+                                    let y = ty * tile_sz + row;
+                                    if y >= h {
+                                        break;
+                                    }
+                                    for col in 0..tile_sz {
+                                        let x = tx * tile_sz + col;
+                                        if x >= w {
+                                            break;
+                                        }
+                                        let idx = (y * w + x) * ch_stride;
+                                        sad_i0 +=
+                                            (p_frame_data[idx] - i0_data[idx]).abs() as f64;
+                                        sad_b4 +=
+                                            (p_frame_data[idx] - b4_data[idx]).abs() as f64;
+                                        cnt += 1;
+                                    }
+                                }
+                                if cnt > 0 && sad_i0 > 0.0 {
+                                    if sad_b4 < sad_i0 {
+                                        b4_wins += 1;
+                                    }
+                                    total_sad_ratio += sad_b4 / sad_i0;
+                                    total_tiles += 1;
+                                }
+                            }
+                        }
+
+                        if total_tiles > 0 {
+                            let frac = b4_wins as f32 / total_tiles as f32;
+                            let mean_ratio =
+                                (total_sad_ratio / total_tiles as f64) as f32;
+                            eprintln!(
+                                "[pyramid_ref] P₈(frame {}) vs I₀(frame {}) / B₄_src(frame {}): {}/{} tiles prefer B₄ ({:.1}%) | mean_SAD_ratio={:.3} | gate: {}",
+                                p_display, i0_display, b4_display,
+                                b4_wins, total_tiles, frac * 100.0,
+                                mean_ratio,
+                                if frac > 0.20 { "PASS (proceed)" } else { "FAIL (close #49)" }
+                            );
+                        }
+                    }
+                }
+
                 // Look-ahead: pre-compute ME for the NEXT group's anchor P-frame
                 // so it overlaps with this frame's Metal sync latency.
                 let next_anchor_display = group_start + group_size + b_count;
@@ -674,12 +763,10 @@ impl EncoderPipeline {
                             mf.fwd_ref_idx = Some(0);
                             mf.bwd_ref_idx = Some(1);
                         }
-                        if info.chroma_format == ChromaFormat::Yuv444 {
-                            self.local_decode_bframe_to_pyramid_slot(
-                                ctx, &info, &b_config, &fwd_mv, &bwd_mv,
-                                padded_w, padded_h, padded_pixels, 0,
-                            );
-                        }
+                        self.local_decode_bframe_to_pyramid_slot(
+                            ctx, &info, &b_config, &fwd_mv, &bwd_mv,
+                            padded_w, padded_h, padded_pixels, 0,
+                        );
                         if std::env::var("GNC_BFRAME_PYRAMID").is_ok() {
                             eprintln!(
                                 "[pyramid_b] Frame {} (display) layer=1 fwd_ref=0 bwd_ref=1",
@@ -712,7 +799,7 @@ impl EncoderPipeline {
                 //   Save decoded_P → slot 4 (permanent) before any bwd overwrites.
                 //   B₂ needs: fwd=past, bwd=B₄  → copy B₄(slot0) → bwd
                 //   B₆ needs: fwd=B₄, bwd=decoded_P  → save past(slot3), copy B₄(slot0)→fwd, copy slot4→bwd
-                if pyramid_enabled && info.chroma_format == ChromaFormat::Yuv444 {
+                if pyramid_enabled {
                     // Save decoded_P permanently into slot 4 before any bwd manipulation
                     self.copy_bwd_ref_to_pyramid_slot(ctx, 4, plane_size); // decoded_P → slot 4
                     self.copy_pyramid_slot_to_bwd_ref(ctx, 0, plane_size); // B₄ → bwd
@@ -747,12 +834,10 @@ impl EncoderPipeline {
                             mf.fwd_ref_idx = Some(0);
                             mf.bwd_ref_idx = Some(2);
                         }
-                        if info.chroma_format == ChromaFormat::Yuv444 {
-                            self.local_decode_bframe_to_pyramid_slot(
-                                ctx, &info, &b_config, &fwd_mv, &bwd_mv,
-                                padded_w, padded_h, padded_pixels, 1,
-                            );
-                        }
+                        self.local_decode_bframe_to_pyramid_slot(
+                            ctx, &info, &b_config, &fwd_mv, &bwd_mv,
+                            padded_w, padded_h, padded_pixels, 1,
+                        );
                         if std::env::var("GNC_BFRAME_PYRAMID").is_ok() {
                             eprintln!(
                                 "[pyramid_b] Frame {} (display) layer=2 fwd_ref=0 bwd_ref=2",
@@ -782,7 +867,7 @@ impl EncoderPipeline {
                 // State: fwd=past, bwd=B₄ (from B₂ setup).
                 // Save past_anchor to slot 3 before overwriting fwd.
                 // Then set fwd=B₄ (from slot 0), restore bwd=decoded_P (from slot 4).
-                if pyramid_enabled && info.chroma_format == ChromaFormat::Yuv444 {
+                if pyramid_enabled {
                     self.copy_fwd_ref_to_pyramid_slot(ctx, 3, plane_size); // past_anchor → slot 3
                     self.copy_pyramid_slot_to_fwd_ref(ctx, 0, plane_size); // B₄ → fwd
                     self.copy_pyramid_slot_to_bwd_ref(ctx, 4, plane_size); // decoded_P (perm) → bwd
@@ -817,12 +902,10 @@ impl EncoderPipeline {
                             mf.fwd_ref_idx = Some(2);
                             mf.bwd_ref_idx = Some(1);
                         }
-                        if info.chroma_format == ChromaFormat::Yuv444 {
-                            self.local_decode_bframe_to_pyramid_slot(
-                                ctx, &info, &b_config, &fwd_mv, &bwd_mv,
-                                padded_w, padded_h, padded_pixels, 2,
-                            );
-                        }
+                        self.local_decode_bframe_to_pyramid_slot(
+                            ctx, &info, &b_config, &fwd_mv, &bwd_mv,
+                            padded_w, padded_h, padded_pixels, 2,
+                        );
                         if std::env::var("GNC_BFRAME_PYRAMID").is_ok() {
                             eprintln!(
                                 "[pyramid_b] Frame {} (display) layer=2 fwd_ref=2 bwd_ref=1",
@@ -864,7 +947,7 @@ impl EncoderPipeline {
                     // Set up refs: load appropriate buffers from pyramid slots.
                     // Slot-to-buffer mapping: pool slot 0=past, 1=future_P, 2=B₄, 3=B₂, 4=B₆.
                     // Encoder pyramid slots: 0=B₄, 1=B₂, 2=B₆, 3=past_anchor.
-                    if pyramid_enabled && info.chroma_format == ChromaFormat::Yuv444 {
+                    if pyramid_enabled {
                         match fwd_idx {
                             0 => self.copy_pyramid_slot_to_fwd_ref(ctx, 3, plane_size), // past_anchor
                             2 => self.copy_pyramid_slot_to_fwd_ref(ctx, 0, plane_size), // B₄
@@ -3414,6 +3497,122 @@ impl EncoderPipeline {
                     });
             }
 
+            // #46 gate diagnostic: LL spatial correlation between adjacent tiles.
+            // GNC_LL_SPATIAL=1 → submit cmd, readback recon_y, compute per-horizontal-pair ratio.
+            // Gate passes (→ proceed with spatial prediction) when mean ratio < 0.6.
+            // Gate fails (→ close #46) when mean ratio > 0.85.
+            if std::env::var_os("GNC_LL_SPATIAL").is_some() {
+                static LL_SPATIAL_PRINTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                LL_SPATIAL_PRINTED.get_or_init(|| {
+                    eprintln!("[ll_spatial] diagnostic active (GNC_LL_SPATIAL)");
+                });
+
+                // Flush GPU so recon_y has quantized LL coefficients.
+                let pw = padded_w as usize;
+                let ph = padded_h as usize;
+                let buf_bytes = (pw * ph * std::mem::size_of::<f32>()) as u64;
+                let staging = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("ll_spatial_staging"),
+                    size: buf_bytes,
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                });
+                cmd.copy_buffer_to_buffer(&bufs.recon_y, 0, &staging, 0, buf_bytes);
+                ctx.queue.submit(Some(cmd.finish()));
+                cmd = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("pf_after_ll_spatial"),
+                });
+
+                // Readback
+                {
+                    let slice = staging.slice(..);
+                    slice.map_async(wgpu::MapMode::Read, |_| {});
+                    ctx.device.poll(wgpu::Maintain::Wait);
+                    let data = slice.get_mapped_range();
+                    let coefs: &[f32] = bytemuck::cast_slice(&data);
+
+                    let ll_size = (config.tile_size >> config.wavelet_levels) as usize;
+                    let tile_size = config.tile_size as usize;
+                    let tiles_x = pw / tile_size;
+                    let tiles_y = ph / tile_size;
+
+                    // Collect per-tile LL mean-abs
+                    let mut tile_ll_mean: Vec<f32> = Vec::new();
+                    for ty in 0..tiles_y {
+                        for tx in 0..tiles_x {
+                            let mut sum = 0.0f64;
+                            let mut n = 0usize;
+                            for row in 0..ll_size {
+                                let y = ty * tile_size + row;
+                                for col in 0..ll_size {
+                                    let x = tx * tile_size + col;
+                                    sum += coefs[y * pw + x].abs() as f64;
+                                    n += 1;
+                                }
+                            }
+                            tile_ll_mean.push((sum / n as f64) as f32);
+                        }
+                    }
+
+                    // Horizontal-pair correlation: mean_abs(LL[i] − LL[i−1]) / mean_abs(LL[i])
+                    let mut ratios: Vec<f32> = Vec::new();
+                    for ty in 0..tiles_y {
+                        for tx in 1..tiles_x {
+                            let left_idx = ty * tiles_x + (tx - 1);
+                            let curr_idx = ty * tiles_x + tx;
+                            // Compute mean_abs(LL_curr - LL_left) using raw coefficients
+                            let mut diff_sum = 0.0f64;
+                            let mut n = 0usize;
+                            for row in 0..ll_size {
+                                let y = ty * tile_size + row;
+                                for col in 0..ll_size {
+                                    let x_curr = tx * tile_size + col;
+                                    let x_left = (tx - 1) * tile_size + col;
+                                    diff_sum +=
+                                        (coefs[y * pw + x_curr] - coefs[y * pw + x_left])
+                                            .abs() as f64;
+                                    n += 1;
+                                }
+                            }
+                            let diff_mean = (diff_sum / n as f64) as f32;
+                            let curr_mean = tile_ll_mean[curr_idx];
+                            let left_mean = tile_ll_mean[left_idx];
+                            let base_mean = (curr_mean + left_mean) / 2.0;
+                            if base_mean > 1e-6 {
+                                ratios.push(diff_mean / base_mean);
+                            }
+                        }
+                    }
+
+                    let n_nonzero_pairs = ratios.len();
+                    let n_zero_tiles = tile_ll_mean.iter().filter(|&&m| m <= 1e-6).count();
+                    let overall_ll_mean: f32 = if !tile_ll_mean.is_empty() {
+                        tile_ll_mean.iter().sum::<f32>() / tile_ll_mean.len() as f32
+                    } else {
+                        0.0
+                    };
+                    if !ratios.is_empty() {
+                        let mean_ratio: f32 = ratios.iter().sum::<f32>() / ratios.len() as f32;
+                        let max_ratio = ratios.iter().cloned().fold(0.0f32, f32::max);
+                        eprintln!(
+                            "[ll_spatial] P-frame residual: tiles={}×{} zero_tiles={} overall_ll_mean={:.3} | {}/{} pairs | mean_ratio={:.3} max_ratio={:.3} | gate: {}",
+                            tiles_x, tiles_y, n_zero_tiles, overall_ll_mean,
+                            n_nonzero_pairs,
+                            tiles_x * tiles_y,
+                            mean_ratio,
+                            max_ratio,
+                            if mean_ratio < 0.6 { "PASS (proceed)" } else if mean_ratio > 0.85 { "FAIL (close #46)" } else { "BORDERLINE" }
+                        );
+                    } else {
+                        eprintln!(
+                            "[ll_spatial] P-frame residual: tiles={}×{} zero_tiles={} overall_ll_mean={:.6} — all tiles near-zero LL (ratio undefined)",
+                            tiles_x, tiles_y, n_zero_tiles, overall_ll_mean
+                        );
+                    }
+                }
+                staging.unmap();
+            }
+
             // Phase 2: GPU entropy encode dispatches + staging copies (same cmd encoder)
             let use_rice = matches!(entropy_mode, EntropyMode::Rice);
             if use_rice && !is_non_444 {
@@ -4787,7 +4986,14 @@ impl EncoderPipeline {
                     &mut cmd_scale,
                     &fwd_mv_buf,
                     &bufs.mv_chroma_buf,
-                    bufs.me_total_blocks,
+                    // B-frame ME uses 16×16 blocks (me_total_blocks=8160), but mv_chroma_buf
+                    // holds one MV per 8×8 luma block (split_total_blocks=32640).  Pass the
+                    // full split count so entries beyond 8160 get zeroed via OOB reads — this
+                    // matches the decoder, which also dispatches split_total_blocks entries and
+                    // gets zeros for the out-of-bounds reads from mv_buf.
+                    // BUG: using me_total_blocks leaves entries 8160..32640 stale across
+                    // frames, causing encoder/decoder mismatch for all B-frames after B₄.
+                    bufs.split_total_blocks,
                     chroma_shift_x,
                     chroma_shift_y,
                 );
@@ -4803,7 +5009,7 @@ impl EncoderPipeline {
                     &mut cmd_scale_bwd,
                     &bwd_mv_buf,
                     &bufs.mv_chroma_buf_bwd,
-                    bufs.me_total_blocks,
+                    bufs.split_total_blocks, // same rationale as fwd
                     chroma_shift_x,
                     chroma_shift_y,
                 );
@@ -5649,11 +5855,30 @@ impl EncoderPipeline {
         let weights_chroma = uniform_weights.pack_weights_chroma();
         let res_dead_zone = config.dead_zone * 2.0;
 
+        let is_non_444 = info.chroma_format != ChromaFormat::Yuv444;
+        let is_420 = info.chroma_format == ChromaFormat::Yuv420;
+        let chroma_info_opt: Option<FrameInfo> =
+            if is_non_444 { Some(info.make_chroma_info()) } else { None };
+        let chroma_shift_x = info.chroma_format.horiz_shift();
+        let chroma_shift_y = info.chroma_format.vert_shift();
+        let (chroma_padded_w, chroma_padded_h, chroma_pixels) =
+            if let Some(ref ci) = chroma_info_opt {
+                let cpw = ci.padded_width();
+                let cph = ci.padded_height();
+                (cpw, cph, (cpw * cph) as usize)
+            } else {
+                (padded_w, padded_h, padded_pixels)
+            };
+
         self.ensure_cached(ctx, padded_w, padded_h, info.width, info.height);
         let bufs = self.cached.as_ref().unwrap();
 
-        // Quantized buffers: Y → recon_y, Co → co_plane (444), Cg → plane_b
-        let quant_bufs: [&wgpu::Buffer; 3] = [&bufs.recon_y, &bufs.co_plane, &bufs.plane_b];
+        // For non-444 Co quantized output was written to ref_upload (not co_plane).
+        let quant_bufs: [&wgpu::Buffer; 3] = if is_non_444 {
+            [&bufs.recon_y, &bufs.ref_upload, &bufs.plane_b]
+        } else {
+            [&bufs.recon_y, &bufs.co_plane, &bufs.plane_b]
+        };
 
         let mut cmd = ctx
             .device
@@ -5668,61 +5893,258 @@ impl EncoderPipeline {
                 &weights_chroma
             };
 
-            // Dequantize → cg_plane (scratch)
-            self.quantize.dispatch(
-                ctx,
-                &mut cmd,
-                quant_buf,
-                &bufs.cg_plane,
-                padded_pixels as u32,
-                config.quantization_step,
-                res_dead_zone,
-                false,
-                padded_w,
-                padded_h,
-                config.tile_size,
-                config.wavelet_levels,
-                weights,
-            );
+            if p > 0 && is_420 {
+                // 4:2:0 chroma-domain bidir inverse decode (mirrors P-frame 4:2:0 local decode):
+                // 1. Dequant at chroma dims → chroma_scratch
+                // 2. Inverse wavelet → plane_a (chroma dims)
+                // 3. Box-filter fwd ref → plane_c (chroma dims)
+                // 4. Box-filter bwd ref → bwd_ref_scratch (chroma dims)
+                // 5. Inverse bidir MC at chroma dims → chroma_scratch
+                // 6. NN-upsample → recon_out (luma dims)
+                // 7. Copy recon_out → pyramid slot [p]
+                //
+                // Scratch allocation: co_plane_ds / cg_plane_ds are free since both
+                // hold the downsampled chroma from the forward pass (already consumed).
+                // For p=1: chroma_scratch=co_plane_ds, bwd_ref_scratch=cg_plane_ds
+                // For p=2: chroma_scratch=cg_plane_ds, bwd_ref_scratch=co_plane_ds
+                let ci = chroma_info_opt.as_ref().unwrap();
+                let (chroma_scratch, bwd_ref_scratch) = if p == 1 {
+                    (&bufs.co_plane_ds, &bufs.cg_plane_ds)
+                } else {
+                    (&bufs.cg_plane_ds, &bufs.co_plane_ds)
+                };
 
-            // Inverse wavelet: cg_plane → plane_c(scratch) → plane_a (residual)
-            self.transform.inverse(
-                ctx,
-                &mut cmd,
-                &bufs.cg_plane,
-                &bufs.plane_c,
-                &bufs.plane_a,
-                info,
-                config.wavelet_levels,
-                config.wavelet_type,
-                p,
-            );
+                // Step 1: dequant at chroma dims → chroma_scratch
+                self.quantize.dispatch(
+                    ctx,
+                    &mut cmd,
+                    quant_buf,
+                    chroma_scratch,
+                    chroma_pixels as u32,
+                    config.quantization_step,
+                    res_dead_zone,
+                    false,
+                    chroma_padded_w,
+                    chroma_padded_h,
+                    config.tile_size,
+                    config.wavelet_levels,
+                    weights,
+                );
 
-            // Inverse bidir MC: plane_a (residual) + fwd_ref + bwd_ref → recon_out
-            // Use mc_bidir_inv_params (mode=1) for reconstruction: recon = residual + prediction.
-            self.motion.compensate_bidir_cached(
-                ctx,
-                &mut cmd,
-                &bufs.plane_a,
-                &bufs.gpu_ref_planes[p],
-                &bufs.gpu_bwd_ref_planes[p],
-                fwd_mv_buf,
-                bwd_mv_buf,
-                &bufs.bidir_modes_scratch,
-                &bufs.recon_out,
-                padded_w,
-                padded_h,
-                &bufs.mc_bidir_inv_params,
-            );
+                // Step 2: inverse wavelet chroma_scratch → (scratch: cg_plane) → plane_a
+                self.transform.inverse(
+                    ctx,
+                    &mut cmd,
+                    chroma_scratch,
+                    &bufs.cg_plane,
+                    &bufs.plane_a,
+                    ci,
+                    config.wavelet_levels,
+                    config.wavelet_type,
+                    p,
+                );
 
-            // Copy recon_out → pyramid ref slot [p]
-            cmd.copy_buffer_to_buffer(
-                &bufs.recon_out,
-                0,
-                &bufs.gpu_pyramid_ref_planes[slot][p],
-                0,
-                plane_size,
-            );
+                // Step 3: box-filter fwd ref (luma-sized) → plane_c (chroma dims)
+                self.chroma_down.dispatch(
+                    ctx,
+                    &mut cmd,
+                    &bufs.gpu_ref_planes[p],
+                    &bufs.plane_c,
+                    padded_w,
+                    padded_h,
+                    chroma_shift_x,
+                    chroma_shift_y,
+                    chroma_padded_w,
+                    chroma_padded_h,
+                );
+
+                // Step 4: box-filter bwd ref (luma-sized) → bwd_ref_scratch (chroma dims)
+                self.chroma_down.dispatch(
+                    ctx,
+                    &mut cmd,
+                    &bufs.gpu_bwd_ref_planes[p],
+                    bwd_ref_scratch,
+                    padded_w,
+                    padded_h,
+                    chroma_shift_x,
+                    chroma_shift_y,
+                    chroma_padded_w,
+                    chroma_padded_h,
+                );
+
+                // Step 5: inverse bidir MC at chroma dims using pre-scaled MVs
+                // mv_chroma_buf / mv_chroma_buf_bwd were filled during encode_bframe.
+                self.motion.compensate_bidir_chroma_cached(
+                    ctx,
+                    &mut cmd,
+                    &bufs.plane_a,           // residual at chroma dims
+                    &bufs.plane_c,           // fwd ref at chroma dims
+                    bwd_ref_scratch,         // bwd ref at chroma dims
+                    &bufs.mv_chroma_buf,     // scaled fwd MVs
+                    &bufs.mv_chroma_buf_bwd, // scaled bwd MVs
+                    &bufs.bidir_modes_scratch,
+                    chroma_scratch,          // output: reconstructed at chroma dims
+                    chroma_padded_w,
+                    chroma_padded_h,
+                    false, // inverse: recon = residual + prediction
+                );
+
+                // Step 6: NN-upsample → recon_out (luma dims)
+                self.chroma_up.dispatch_upsample(
+                    ctx,
+                    &mut cmd,
+                    chroma_scratch,
+                    &bufs.recon_out,
+                    chroma_padded_w,
+                    chroma_padded_h,
+                    padded_w,
+                    padded_h,
+                    chroma_shift_x,
+                    chroma_shift_y,
+                );
+
+                // Step 7: copy recon_out → pyramid ref slot [p]
+                cmd.copy_buffer_to_buffer(
+                    &bufs.recon_out,
+                    0,
+                    &bufs.gpu_pyramid_ref_planes[slot][p],
+                    0,
+                    plane_size,
+                );
+            } else if p > 0 && is_non_444 {
+                // 4:2:2 chroma: luma-domain bidir inverse decode.
+                // Residual is at chroma dims; upsample to luma dims before bidir MC.
+                let ci = chroma_info_opt.as_ref().unwrap();
+                let chroma_scratch = if p == 1 {
+                    &bufs.co_plane_ds
+                } else {
+                    &bufs.cg_plane_ds
+                };
+
+                // Dequant at chroma dims → chroma_scratch
+                self.quantize.dispatch(
+                    ctx,
+                    &mut cmd,
+                    quant_buf,
+                    chroma_scratch,
+                    chroma_pixels as u32,
+                    config.quantization_step,
+                    res_dead_zone,
+                    false,
+                    chroma_padded_w,
+                    chroma_padded_h,
+                    config.tile_size,
+                    config.wavelet_levels,
+                    weights,
+                );
+
+                // Inverse wavelet → plane_a (chroma dims)
+                self.transform.inverse(
+                    ctx,
+                    &mut cmd,
+                    chroma_scratch,
+                    &bufs.cg_plane,
+                    &bufs.plane_a,
+                    ci,
+                    config.wavelet_levels,
+                    config.wavelet_type,
+                    p,
+                );
+
+                // NN-upsample plane_a → mc_out (luma dims)
+                self.chroma_up.dispatch_upsample(
+                    ctx,
+                    &mut cmd,
+                    &bufs.plane_a,
+                    &bufs.mc_out,
+                    chroma_padded_w,
+                    chroma_padded_h,
+                    padded_w,
+                    padded_h,
+                    chroma_shift_x,
+                    chroma_shift_y,
+                );
+
+                // Inverse bidir MC at luma dims: mc_out (upsampled residual) + refs → recon_out
+                self.motion.compensate_bidir_cached(
+                    ctx,
+                    &mut cmd,
+                    &bufs.mc_out,
+                    &bufs.gpu_ref_planes[p],
+                    &bufs.gpu_bwd_ref_planes[p],
+                    fwd_mv_buf,
+                    bwd_mv_buf,
+                    &bufs.bidir_modes_scratch,
+                    &bufs.recon_out,
+                    padded_w,
+                    padded_h,
+                    &bufs.mc_bidir_inv_params,
+                );
+
+                cmd.copy_buffer_to_buffer(
+                    &bufs.recon_out,
+                    0,
+                    &bufs.gpu_pyramid_ref_planes[slot][p],
+                    0,
+                    plane_size,
+                );
+            } else {
+                // Luma (all formats) or 4:4:4 chroma: all at luma dims.
+                // Dequantize → cg_plane (scratch)
+                self.quantize.dispatch(
+                    ctx,
+                    &mut cmd,
+                    quant_buf,
+                    &bufs.cg_plane,
+                    padded_pixels as u32,
+                    config.quantization_step,
+                    res_dead_zone,
+                    false,
+                    padded_w,
+                    padded_h,
+                    config.tile_size,
+                    config.wavelet_levels,
+                    weights,
+                );
+
+                // Inverse wavelet: cg_plane → plane_c(scratch) → plane_a (residual)
+                self.transform.inverse(
+                    ctx,
+                    &mut cmd,
+                    &bufs.cg_plane,
+                    &bufs.plane_c,
+                    &bufs.plane_a,
+                    info,
+                    config.wavelet_levels,
+                    config.wavelet_type,
+                    p,
+                );
+
+                // Inverse bidir MC: plane_a (residual) + fwd_ref + bwd_ref → recon_out
+                self.motion.compensate_bidir_cached(
+                    ctx,
+                    &mut cmd,
+                    &bufs.plane_a,
+                    &bufs.gpu_ref_planes[p],
+                    &bufs.gpu_bwd_ref_planes[p],
+                    fwd_mv_buf,
+                    bwd_mv_buf,
+                    &bufs.bidir_modes_scratch,
+                    &bufs.recon_out,
+                    padded_w,
+                    padded_h,
+                    &bufs.mc_bidir_inv_params,
+                );
+
+                // Copy recon_out → pyramid ref slot [p]
+                cmd.copy_buffer_to_buffer(
+                    &bufs.recon_out,
+                    0,
+                    &bufs.gpu_pyramid_ref_planes[slot][p],
+                    0,
+                    plane_size,
+                );
+            }
         }
         ctx.queue.submit(Some(cmd.finish()));
         // Synchronize to ensure pyramid slot is ready before dependent B-frames use it

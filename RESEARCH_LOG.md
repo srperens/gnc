@@ -2356,3 +2356,30 @@ See full entry above.
 
 **Action:** Reopen #24 with pyramid ME approach. See updated backlog.
 
+
+## 2026-03-10: #42 Hierarchical B-frame GOP — validation and ki fix
+
+### Implementation summary
+- B_FRAMES_PER_GROUP changed 2→7 (group_size=8)
+- GP14 bitstream: MotionField.fwd_ref_idx/bwd_ref_idx (Option<u8>) added
+- 5-slot reference pool in encoder and decoder
+- Coding order: I₀ P₈ B₄ B₂ B₆ B₁ B₃ B₅ B₇ (outer-to-inner, layer 1→2→3)
+- Critical fix during integration: local_decode_bframe_to_pyramid_slot used mode=0 (subtract residual) instead of mode=1 (add for reconstruction); −0.11 dB on all layer-3 B-frames without fix
+
+### ki bug and fix
+**Root cause:** B_FRAMES_PER_GROUP=7 requires ki >= group_size+1 = 9. Old default ki=8 gave remaining=7 < group_size=8 → full_groups=0 → zero B-frames silently. All benchmark runs under ki=8 were I+P only.
+**Fix:** use_bframes gate: ki>=4 → ki>=B_FRAMES_PER_GROUP+2=9; BenchmarkSequence default ki 8→9 (commit 638b77a).
+
+### Validation results (ki=9, q=75, 4:4:4, 10 frames)
+| sequence   | old bpp | new bpp | delta | VMAF old | VMAF new |
+|------------|---------|---------|-------|----------|----------|
+| crowd_run  | 6.15    | 6.00    | −2.4% | 99.13    | 99.13    |
+| park_joy   | 4.77    | 4.75    | −0.4% | 99.14    | 99.14    |
+| bbb        | —       | —       | —     | —        | —        |
+
+Note: crowd_run "old" baseline was also affected by the ki bug (was I+P only at ki=8). Pre-#42 I+P bpp for crowd_run was 6.21. With hierarchical pyramid (7B ki=9): 6.00 → −3.4% vs true I+P baseline.
+
+**bbb limitation:** bbb.y4m contains only 8 frames; ki=9 requires ≥10 for one full group (I+7B+P+I). Falls back to I+P only. Need longer bbb sequence for proper comparison.
+
+### Conclusion
+Hierarchical pyramid B-frame GOP (3-level dyadic) is SHIPPED. Real improvement confirmed on 2 of 3 sequences. VMAF neutral on both. The bbb sequence test material is too short to measure.

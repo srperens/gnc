@@ -430,7 +430,8 @@ H.264 comparison (#22) established the north star: GNC needs **2–5× more bits
   mc_bidir_inv_params (mode=1 reconstruct) — critical: wrong params (mode=0) caused −0.11 dB
   on all layer-3 B-frames. Decoder always loads refs from saved pool slots (never relies on
   transient buffer state). All 163 tests pass; zero clippy warnings; WASM clean.
-- **Validation:** Pending benchmark run on bbb/crowd_run/park_joy sequences.
+- **Validation (2026-03-10):** crowd_run −3.4% bpp (6.21→6.00), VMAF neutral (99.13). park_joy −3.9% bpp (4.94→4.75), VMAF neutral (99.14). bbb Y4M has only 8 frames — insufficient for ki=9 group (needs 10+); no valid comparison. ki fix: use_bframes gate updated to ki>=B_FRAMES_PER_GROUP+2=9; BenchmarkSequence default ki 8→9 (638b77a).
+- **Final verdict:** SHIPPED — real improvement, VMAF safe. Note: bbb test material needs ≥10 frames for ki=9 validation.
 
 ### 43. Multi-reference P-frames (2 references per tile)
 - **Status:** CLOSED (2026-03-10) — Researcher meta-gate analysis

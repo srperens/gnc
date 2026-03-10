@@ -1047,7 +1047,10 @@ impl MotionEstimator {
         let output_mv_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("split_output_mvs"),
             size: (total_blocks_8 as usize * 2 * std::mem::size_of::<i32>()) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            // COPY_DST needed so GNC_MV_SMOOTH can copy smoothed MVs back into this buffer.
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 

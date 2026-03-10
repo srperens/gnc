@@ -2839,6 +2839,43 @@ impl EncoderPipeline {
                 skip_sad_thr,
             );
 
+            // MV median smoothing (GNC_MV_SMOOTH=1): 3×3 median filter on split MVs.
+            // Runs after tile_skip_motion, before mv_scale / MC.
+            // Smoothed MVs written to scratch buffer, then copied back into split_mv_buf
+            // so the rest of the pipeline (mv_scale, compensate) works unchanged.
+            if std::env::var_os("GNC_MV_SMOOTH").is_some() {
+                // Diagnostic: print once to confirm the code path is active.
+                static MV_SMOOTH_PRINTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                MV_SMOOTH_PRINTED.get_or_init(|| {
+                    eprintln!(
+                        "[mv_smooth] active: 3×3 median filter on {} 8×8 MV blocks ({}×{})",
+                        bufs.split_total_blocks,
+                        padded_w / super::motion::ME_SPLIT_BLOCK_SIZE,
+                        padded_h / super::motion::ME_SPLIT_BLOCK_SIZE,
+                    );
+                });
+                let smooth_scratch = &bufs.gpu_split_mv_smooth_scratch;
+                self.dispatch_mv_smooth(
+                    ctx,
+                    &mut cmd,
+                    &split_mv_buf,
+                    smooth_scratch,
+                    padded_w,
+                    padded_h,
+                    config.tile_size,
+                    super::motion::ME_SPLIT_BLOCK_SIZE,
+                );
+                // Copy smoothed MVs back into split_mv_buf so downstream MC uses them.
+                // split_mv_buf has COPY_DST (added to estimate_split output_mv_buf).
+                cmd.copy_buffer_to_buffer(
+                    smooth_scratch,
+                    0,
+                    &split_mv_buf,
+                    0,
+                    smooth_scratch.size(),
+                );
+            }
+
             // 4:2:0 chroma-domain MC: scale luma MVs → chroma MVs once before the plane loop.
             // Both chroma planes (Co, Cg) share the same scaled MV buffer.
             // For 4:2:2 and 4:4:4, this is skipped (luma-domain MC used instead).

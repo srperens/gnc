@@ -119,6 +119,11 @@ pub(super) struct CachedEncodeBuffers {
     pub(super) bidir_fwd_staging: wgpu::Buffer,
     pub(super) bidir_bwd_staging: wgpu::Buffer,
     pub(super) bidir_modes_staging: wgpu::Buffer,
+
+    // Scratch buffer for MV median smoothing (GNC_MV_SMOOTH=1).
+    // Same size/layout as split_mv_output_buf: total_blocks_8 × 2 × i32.
+    // Usage: STORAGE (shader writes smoothed MVs here) | COPY_SRC (copy back to split_mv_buf).
+    pub(super) gpu_split_mv_smooth_scratch: wgpu::Buffer,
 }
 
 /// Cached GPU buffers for temporal wavelet GOP encoding.
@@ -731,6 +736,19 @@ impl CachedEncodeBuffers {
                 usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }),
+            gpu_split_mv_smooth_scratch: {
+                let split_blocks_x = padded_w / ME_SPLIT_BLOCK_SIZE;
+                let split_blocks_y = padded_h / ME_SPLIT_BLOCK_SIZE;
+                let mv_size = (split_blocks_x * split_blocks_y) as u64 * 2 * 4;
+                ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("enc_split_mv_smooth_scratch"),
+                    size: mv_size.max(8),
+                    // STORAGE: written by mv_median_smooth shader
+                    // COPY_SRC: copied back into split_mv_buf (which must have COPY_DST)
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: false,
+                })
+            },
         }
     }
 

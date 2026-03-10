@@ -63,6 +63,8 @@ pub struct EncoderPipeline {
     tile_skip_motion_bgl: wgpu::BindGroupLayout,
     tile_skip_bidir_pipeline: wgpu::ComputePipeline,
     tile_skip_bidir_bgl: wgpu::BindGroupLayout,
+    mv_median_smooth_pipeline: wgpu::ComputePipeline,
+    mv_median_smooth_bgl: wgpu::BindGroupLayout,
     pub(super) cached: Option<CachedEncodeBuffers>,
     pub(super) tw_cached: Option<CachedTemporalWaveletBuffers>,
     /// Second temporal wavelet buffer set for GOP pipelining (B set).
@@ -475,6 +477,76 @@ impl EncoderPipeline {
                     cache: None,
                 });
 
+        // GPU MV median smoothing pipeline (GNC_MV_SMOOTH=1): applies a 3×3 median filter
+        // to the 8×8-resolution split MV buffer, reducing inter-block MV discontinuities
+        // before motion compensation.  Reads from split_mv_buf, writes to scratch buffer;
+        // caller copies scratch back into split_mv_buf if the feature is active.
+        let mms_shader = ctx
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("mv_median_smooth"),
+                source: wgpu::ShaderSource::Wgsl(
+                    include_str!("../shaders/mv_median_smooth.wgsl").into(),
+                ),
+            });
+        let mv_median_smooth_bgl =
+            ctx.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("mms_bgl"),
+                    entries: &[
+                        // binding 0: uniform params
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        // binding 1: mvs_in (read-only storage — original split MVs)
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        // binding 2: mvs_out (read_write storage — smoothed output)
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 2,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                    ],
+                });
+        let mms_pl = ctx
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("mms_pl"),
+                bind_group_layouts: &[&mv_median_smooth_bgl],
+                push_constant_ranges: &[],
+            });
+        let mv_median_smooth_pipeline =
+            ctx.device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("mv_median_smooth_pipeline"),
+                    layout: Some(&mms_pl),
+                    module: &mms_shader,
+                    entry_point: Some("main"),
+                    compilation_options: Default::default(),
+                    cache: None,
+                });
+
         Self {
             color: ColorConverter::new(ctx),
             transform: WaveletTransform::new(ctx),
@@ -506,6 +578,8 @@ impl EncoderPipeline {
             tile_skip_motion_bgl,
             tile_skip_bidir_pipeline,
             tile_skip_bidir_bgl,
+            mv_median_smooth_pipeline,
+            mv_median_smooth_bgl,
             cached: None,
             tw_cached: None,
             tw_cached_b: None,
@@ -885,6 +959,71 @@ impl EncoderPipeline {
             timestamp_writes: None,
         });
         pass.set_pipeline(&self.tile_skip_motion_pipeline);
+        pass.set_bind_group(0, &bg, &[]);
+        pass.dispatch_workgroups(tiles_x, tiles_y, 1);
+    }
+
+    /// Dispatch MV median smoothing pass (GNC_MV_SMOOTH=1).
+    ///
+    /// Applies a 3×3 component-wise median filter to the 8×8-resolution split MV buffer,
+    /// reducing sharp inter-block discontinuities before motion compensation.
+    ///
+    /// Reads from `mvs_in`, writes smoothed MVs to `mvs_out`.
+    /// Caller is responsible for copying `mvs_out` back into the live MV buffer if needed.
+    ///
+    /// Must be dispatched AFTER estimate_split (and after tile_skip_motion if both are active)
+    /// and BEFORE dispatch_mv_scale / compensate_cached.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn dispatch_mv_smooth(
+        &self,
+        ctx: &GpuContext,
+        cmd: &mut wgpu::CommandEncoder,
+        mvs_in: &wgpu::Buffer,
+        mvs_out: &wgpu::Buffer,
+        padded_w: u32,
+        padded_h: u32,
+        tile_size: u32,
+        block_size: u32,
+    ) {
+        use wgpu::util::DeviceExt;
+        // Params layout (matches shader struct Params exactly):
+        //   offset  0: padded_w   u32
+        //   offset  4: padded_h   u32
+        //   offset  8: tile_size  u32
+        //   offset 12: block_size u32
+        let params_data: [u32; 4] = [padded_w, padded_h, tile_size, block_size];
+        let params_buf = ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("mv_smooth_params"),
+                contents: bytemuck::cast_slice(&params_data),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("mms_bg"),
+            layout: &self.mv_median_smooth_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: mvs_in.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: mvs_out.as_entire_binding(),
+                },
+            ],
+        });
+        let tiles_x = padded_w / tile_size;
+        let tiles_y = padded_h / tile_size;
+        let mut pass = cmd.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("mv_median_smooth_pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.mv_median_smooth_pipeline);
         pass.set_bind_group(0, &bg, &[]);
         pass.dispatch_workgroups(tiles_x, tiles_y, 1);
     }

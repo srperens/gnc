@@ -455,8 +455,8 @@ enum Command {
         #[arg(short = 'n', long, default_value = "10")]
         num_frames: usize,
 
-        /// Keyframe interval (1 = all I-frames)
-        #[arg(short, long, default_value = "8")]
+        /// Keyframe interval (1 = all I-frames). Needs >= 9 (B_FRAMES_PER_GROUP+2) for B-frames.
+        #[arg(short, long, default_value = "9")]
         keyframe_interval: u32,
 
         /// Quality preset (1-100). Sets qstep, wavelet, dead zone, etc.
@@ -542,8 +542,8 @@ enum Command {
         #[arg(long)]
         qstep: Option<f32>,
 
-        /// Keyframe interval (1 = all I-frames)
-        #[arg(long, default_value = "8")]
+        /// Keyframe interval (1 = all I-frames). Must be >= B_FRAMES_PER_GROUP+2 (=9) for B-frames.
+        #[arg(long, default_value = "9")]
         keyframe_interval: u32,
 
         /// Number of frames to encode (auto-detect if not specified)

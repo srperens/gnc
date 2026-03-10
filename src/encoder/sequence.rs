@@ -150,7 +150,9 @@ impl EncoderPipeline {
         fps: f64,
     ) -> Vec<CompressedFrame> {
         let ki = config.keyframe_interval as usize;
-        let use_bframes = ki >= 4;
+        // Need ki > group_size = B_FRAMES_PER_GROUP + 1 so that at least one full group
+        // fits between I-frames (remaining = ki - 1 >= group_size requires ki >= group_size + 1).
+        let use_bframes = ki >= B_FRAMES_PER_GROUP + 2;
         let b_count = if use_bframes { B_FRAMES_PER_GROUP } else { 0 };
         let group_size = b_count + 1;
 

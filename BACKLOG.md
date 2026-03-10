@@ -15,21 +15,15 @@ H.264 comparison (#22) established the north star: GNC needs **2–5× more bits
 - Rice+ZRL vs arithmetic coding is only ~0.1–0.2 bpp — not the bottleneck
 - Entropy-improvement items (#21, #7) are deprioritized; focus shifts to temporal prediction
 
-**Priority order (updated 2026-03-10 — Research Scientist second review, see RESEARCH_LOG.md):**
-1. **#26 B-frame zero-MV skip** (DONE) — −3.6% bpp bbb B-frames, VMAF neutral
-2. **#27 TDC** (CLOSED — redundant with MC; ~0% gain, reverted)
-3. **#28 OBMC** (CLOSED) — gate experiment showed 0% bpp change; MV field smooth → median = original
-4. **#29 Fused wavelet kernel** (CLOSED) — pre-condition false; barriers are µs not ms
-5. **#17 Scene cut detection** (DONE) — shipped 776df85
-6. **#30 GPU timestamp profiling** (DONE) — gpu_wavelet_quant=12.75ms, gpu_rice=12.8ms, total=29.5ms
-7. **#33 Fused quantize+Rice** (CLOSED) — gate triggered: quantize+Rice≈19ms < 30ms gate
-8. **#31 Adaptive dead-zone per subband** (CLOSED) — existing perceptual weights already adaptive per subband
-9. **#32 Larger FINE_RANGE for 8×8 split ME** (CLOSED) — gate: neutral on bbb; analytical case weak (<0.1% expected gain)
-10. **#34 Merge mode: co-located MV** (CLOSED) — gate: MV overhead 2.3% of bpp < 5% gate; savings ~0.2%
-11. **#24 Larger ME search range** (DEFER — precondition false)
-12. **#25 Multi-reference P-frames** (DEFER — gate on MV histogram)
-13. **#21 Parent-child Rice k** (CLOSED — proven negative)
-14. **#7 LL subband prediction** (CLOSED — wrong problem)
+**Priority order (updated 2026-03-10):**
+1–14: (see previous items, all done/closed)
+15. **#35 DCT for inter-frame residuals** (blocked P1) — gate experiment showed BlockDCT8 I-frame only; full new code path 6-10 days; deferred
+16. **#36 Deblocking filter** (todo P2) — VMAF quality; no bitstream change; **NEXT**
+17. **#37 Per-8×8-block skip** (todo P2) — extend tile-skip to block level; gate first
+18. **#38 Lagrange RD quantization** (todo P3) — blocked on no-AQ gate
+19. **#39 32×32 coarse-block fallback** (todo P3) — blocked on MV variance gate; savings capped at 2.3%
+20. **#24 Larger ME search range** (DEFER)
+21. **#25 Multi-reference P-frames** (DEFER)
 
 ## Items
 
@@ -340,3 +334,46 @@ H.264 comparison (#22) established the north star: GNC needs **2–5× more bits
 - **Motivation:** GNC codes all MVs as absolute values with no temporal MV prediction. On slow-pan content (rush_hour, bbb), most 8×8 block MVs are nearly identical to the previous frame's co-located MV. H.264 merge mode lets a block inherit a neighbor's MV at zero bits.
 - **Gate check (2026-03-10):** MV overhead measured on bbb_test.y4m q=75: skip bitmap = 4,050 B (fixed), delta MVs = ~1 KB, total MV data ≈ 5 KB = 2.3% of average P-frame (222 KB). At best (with residual): 4.3%. Gate threshold was >5%.
 - **Why closed:** The existing system (skip bitmap + delta coding with median spatial predictor) already captures temporal MV correlation efficiently. MVs for near-static blocks are already coded as 1-bit skip flags. Merge mode would save ~20% of the 2.3% MV overhead = ~0.2% bpp total. A bitstream format change (merge flag per block = minor version bump) is not justified for <0.2% bpp savings.
+
+### 35. DCT transform for inter-frame residuals
+- **Status:** blocked (P1) — gate experiment failed; full new code path required; deferred
+- **Motivation:** The wavelet is the wrong transform for MC residuals. MC residuals have energy concentrated at 8×8 and 16×16 block boundaries (from the ME block structure). Wavelet spreads this boundary energy across ALL levels and subbands (worst case). DCT applied per-block localizes boundary discontinuities within individual blocks, allowing near-zero coding of adjacent blocks. Literature: H.264/HEVC/VVC all use DCT (integer transform) for inter residuals.
+- **Hypothesis:** Using DCT-16 on P/B-frame MC residuals (wavelet stays for I-frames) reduces inter-frame bpp ≥10% on bbb q=75, with VMAF neutral.
+- **Gate experiment result (2026-03-10):** Added `--dct` flag to `benchmark-sequence` to force `TransformType::BlockDCT8` for all frames. Result: PSNR = −6.44 dB, SSIM = 0.02 — catastrophically broken. Root cause: `BlockDCT8` is I-frame only; P-frame decoder path unconditionally assumes wavelet inverse transform. DCT reconstruction applied before MC add-back produces garbage.
+- **Conclusion:** Cannot gate-test cheaply. Requires full new inter-residual transform path: `residual_transform_type` field in CodecConfig, new P/B-frame encoder path (DCT residual), decoder reading per-frame flag and choosing IDCT vs IWAVELET. Bitstream format change (minor version bump). Complexity: 6-10 days. Deferred until #36/#37 done.
+- **Complexity:** 6-10 days (full implementation; no cheap gate available).
+### 36. Deblocking filter at tile boundaries
+- **Status:** todo (P2, VMAF quality)
+- **Motivation:** Tile-edge artifacts are documented as an architectural limitation. The 256×256 tile grid creates quantization discontinuities visible as blocking artifacts. These reduce VMAF even when PSNR is acceptable. A post-processing deblocking filter on the decoded output (not in the codec path) would smooth these boundaries. No bitstream change. This improves the VMAF axis without changing bpp.
+- **Hypothesis:** 4-8 tap adaptive deblocking filter at 256-pixel tile grid boundaries increases VMAF ≥0.5 pts on bbb q=75 (from 95.31) without PSNR degradation >0.1 dB.
+- **Correctness gate:** First inspect decoded output at tile boundaries with zoom. Characterize as Gibbs ringing (wavelet overshoot) vs hard block edges (quantization mismatch). Ringing → deblocking helps; hard edges → may blur without fixing. If artifact type is hard-edge quantization mismatch, deblocking won't help.
+- **Implementation:** New WGSL shader `deblock.wgsl`: applied at decoder output (after buffer_to_texture). Adaptive H-filter at every 256th column, V-filter at 256th row. Boundary strength based on local gradient (strong where gradient is low, no-op where gradient is high). Optional: extend to 16×16 MC block boundaries within tiles (weaker filter). Decoder-only change.
+- **Success criteria:** VMAF ≥+0.5 pts on bbb q=75; PSNR change < −0.1 dB; bpp unchanged (decoder post-processing).
+- **Complexity:** 2-3 days.
+
+### 37. Per-8×8-block skip decision
+- **Status:** todo (P2, quality)
+- **Motivation:** Current tile_skip_motion.wgsl zeroes MVs at tile granularity only when zero-MV SAD < qstep/2. Many 8×8 blocks within non-skip tiles have near-zero residuals but are not skipped because one or a few high-energy blocks in the tile push the tile-level SAD above threshold. Block-level skip decisions would zero those individual blocks' MVs independently.
+- **Hypothesis:** Per-8×8-block zero-MV skip (if block zero-MV SAD < qstep/2) reduces P-frame bpp ≥3% on content with spatially heterogeneous tiles (some bbb-like sequences with mixed static/moving regions). Low expected gain on crowd_run (few near-zero blocks in high-motion content).
+- **Gate:** Measure fraction of 8×8 blocks within non-skip tiles that have zero-MV SAD < qstep/2. Gate: proceed only if >15% of non-skip-tile blocks would qualify. Note: crowd_run tile-level skip gave only −0.6% → block-level on crowd_run will be even smaller.
+- **Integration note:** Block-level skip must set MVs BEFORE the ME assigns them (same as tile-skip — zero MVs before MC dispatch, not after). Must integrate into split ME pipeline, not as a post-ME pass.
+- **Success criteria:** P-frame bpp −3% on bbb q=75; VMAF neutral; no regression.
+- **Complexity:** 2-3 days (after gate confirms).
+
+### 38. Per-tile Lagrange RD quantization
+- **Status:** todo (P3, quality)
+- **Motivation:** AQ adapts quantization based on LL subband variance (texture heuristic). Lagrange-optimal allocation minimizes total distortion given a fixed bit budget by allocating bits to tiles with the highest marginal benefit. These are different optimization objectives. JPEG 2000 achieves 10-15% bpp reduction over fixed quantization via Lagrange allocation (Taubman & Marcellin, Ch. 8). GNC's AQ captures part of this but is not globally optimal.
+- **Gate (1 day):** Run benchmark-sequence with `--no-aq` flag vs AQ baseline. If AQ gain over no-AQ is <2% bpp (AQ already near-optimal), close this item. If AQ gain is >5%, Lagrange has headroom.
+- **Hypothesis:** Per-tile Lagrange-optimal quantizer reduces bpp ≥5% at equal VMAF on bbb q=75. The gap between AQ and Lagrange optimal captures real savings.
+- **Note:** Gain is primarily on I-frames. For inter frames, tiles with good MC match are already near-zero and don't benefit from Lagrange. Gate must measure I-frame contribution separately.
+- **Success criteria:** bpp −5% at VMAF ≥95.31 on bbb q=75; validated on crowd_run and rush_hour.
+- **Complexity:** 5-7 days (includes R-D curve estimation, bisection λ search, integration with VBR rate control).
+
+### 39. 32×32 coarse-block fallback for uniform-motion tiles
+- **Status:** todo (P3, quality)
+- **Motivation:** Current ME always runs 16×16 coarse → 8×8 split refinement. For tiles with uniform motion (all 16×16 blocks have similar MVs), the 8×8 split adds MV overhead with negligible residual benefit. A "coarse-only" mode for uniform-motion tiles would skip the split dispatch and use only the 16×16 MVs.
+- **Gate:** Measure per-tile MV variance on rush_hour P-frames. Gate: proceed only if >30% of P-frame tiles have all-identical split MVs (zero intra-tile MV variance). MV overhead established at 2.3% of bpp total — this caps maximum savings at 2.3%.
+- **Hypothesis:** Skipping 8×8 split for uniform-motion tiles reduces P-frame bpp ≥2% on rush_hour q=75 (predominantly uniform panning motion).
+- **Note:** Given MV overhead is only 2.3% of total bpp, savings ceiling is ~2%. Implementation complexity must be proportional. If gate confirms >30% uniform tiles, this is a 1-day addition to the ME pipeline.
+- **Success criteria:** bpp −2% on rush_hour q=75; VMAF neutral.
+- **Complexity:** 1-2 days (after gate confirms).

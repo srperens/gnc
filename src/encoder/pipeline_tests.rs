@@ -3324,3 +3324,4 @@ fn test_scene_cut_disabled_at_zero_threshold() {
         "frame 1 should be P-frame when scene_cut_threshold=0 (detection disabled)"
     );
 }
+

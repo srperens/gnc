@@ -18,9 +18,9 @@ H.264 comparison (#22) established the north star: GNC needs **2–5× more bits
 **Priority order (updated 2026-03-10):**
 1–14: (see previous items, all done/closed)
 15. **#35 DCT for inter-frame residuals** (blocked P1) — gate experiment showed BlockDCT8 I-frame only; full new code path 6-10 days; deferred
-16. **#36 Deblocking filter** (todo P2) — VMAF quality; no bitstream change; **NEXT**
-17. **#37 Per-8×8-block skip** (todo P2) — extend tile-skip to block level; gate first
-18. **#38 Lagrange RD quantization** (todo P3) — blocked on no-AQ gate
+16. **#36 Deblocking filter** (closed P2) — artifact is 1-2px incoherent boundary mismatch; deblocking would blur; correct fix requires overlapping tiles (bitstream change)
+17. **#37 Per-8×8-block skip** (closed P2) — 0% blocks qualify on bbb; pan motion prevents block-level static detection
+18. **#38 Lagrange RD quantization** (todo P3) — blocked on no-AQ gate; **NEXT**
 19. **#39 32×32 coarse-block fallback** (todo P3) — blocked on MV variance gate; savings capped at 2.3%
 20. **#24 Larger ME search range** (DEFER)
 21. **#25 Multi-reference P-frames** (DEFER)
@@ -343,7 +343,7 @@ H.264 comparison (#22) established the north star: GNC needs **2–5× more bits
 - **Conclusion:** Cannot gate-test cheaply. Requires full new inter-residual transform path: `residual_transform_type` field in CodecConfig, new P/B-frame encoder path (DCT residual), decoder reading per-frame flag and choosing IDCT vs IWAVELET. Bitstream format change (minor version bump). Complexity: 6-10 days. Deferred until #36/#37 done.
 - **Complexity:** 6-10 days (full implementation; no cheap gate available).
 ### 36. Deblocking filter at tile boundaries
-- **Status:** todo (P2, VMAF quality)
+- **Status:** closed (2026-03-10) — gate: artifact is 1-2px boundary-extension quantization mismatch (narrow, incoherent); deblocking would blur valid pixels; correct fix = overlapping tiles (bitstream change)
 - **Motivation:** Tile-edge artifacts are documented as an architectural limitation. The 256×256 tile grid creates quantization discontinuities visible as blocking artifacts. These reduce VMAF even when PSNR is acceptable. A post-processing deblocking filter on the decoded output (not in the codec path) would smooth these boundaries. No bitstream change. This improves the VMAF axis without changing bpp.
 - **Hypothesis:** 4-8 tap adaptive deblocking filter at 256-pixel tile grid boundaries increases VMAF ≥0.5 pts on bbb q=75 (from 95.31) without PSNR degradation >0.1 dB.
 - **Correctness gate:** First inspect decoded output at tile boundaries with zoom. Characterize as Gibbs ringing (wavelet overshoot) vs hard block edges (quantization mismatch). Ringing → deblocking helps; hard edges → may blur without fixing. If artifact type is hard-edge quantization mismatch, deblocking won't help.
@@ -352,7 +352,7 @@ H.264 comparison (#22) established the north star: GNC needs **2–5× more bits
 - **Complexity:** 2-3 days.
 
 ### 37. Per-8×8-block skip decision
-- **Status:** todo (P2, quality)
+- **Status:** closed (2026-03-10) — gate: 0% of non-skip-tile blocks qualify on bbb; pan motion means all blocks have zero-MV SAD >> threshold
 - **Motivation:** Current tile_skip_motion.wgsl zeroes MVs at tile granularity only when zero-MV SAD < qstep/2. Many 8×8 blocks within non-skip tiles have near-zero residuals but are not skipped because one or a few high-energy blocks in the tile push the tile-level SAD above threshold. Block-level skip decisions would zero those individual blocks' MVs independently.
 - **Hypothesis:** Per-8×8-block zero-MV skip (if block zero-MV SAD < qstep/2) reduces P-frame bpp ≥3% on content with spatially heterogeneous tiles (some bbb-like sequences with mixed static/moving regions). Low expected gain on crowd_run (few near-zero blocks in high-motion content).
 - **Gate:** Measure fraction of 8×8 blocks within non-skip tiles that have zero-MV SAD < qstep/2. Gate: proceed only if >15% of non-skip-tile blocks would qualify. Note: crowd_run tile-level skip gave only −0.6% → block-level on crowd_run will be even smaller.

@@ -906,22 +906,25 @@ impl EncoderPipeline {
         tile_size: u32,
         block_size_8: u32,
         skip_threshold: f32,
+        block_skip_enabled: bool,
     ) {
         use wgpu::util::DeviceExt;
         // Params layout (matches shader struct):
-        //   offset  0: padded_w      u32
-        //   offset  4: padded_h      u32
-        //   offset  8: tile_size     u32
-        //   offset 12: block_size_8  u32
-        //   offset 16: skip_threshold f32
-        //   (padded to 32 bytes by WGSL alignment rules — last 12 bytes unused)
+        //   offset  0: padded_w           u32
+        //   offset  4: padded_h           u32
+        //   offset  8: tile_size          u32
+        //   offset 12: block_size_8       u32
+        //   offset 16: skip_threshold     f32
+        //   offset 20: block_skip_enabled u32  (1 = per-8×8-block skip in non-skip tiles)
+        //   (padded to 32 bytes by WGSL alignment rules — last 8 bytes unused)
         let params_data: [u32; 8] = [
             padded_w,
             padded_h,
             tile_size,
             block_size_8,
             skip_threshold.to_bits(),
-            0, 0, 0, // padding
+            block_skip_enabled as u32,
+            0, 0, // padding
         ];
         let params_buf = ctx
             .device

@@ -2825,7 +2825,16 @@ impl EncoderPipeline {
             //  - MC produces small residual (current − ref_same_pos) for skip tiles ✓
             //  - Quantiser drives small residuals to near-zero automatically ✓
             //  - Rice encoder outputs compact all-skip tiles for zero-coefficient tiles ✓
+            // With block_skip_enabled: also zeroes individual 8×8 blocks within non-skip
+            // tiles when their zero-MV SAD < threshold (#37).
             let skip_sad_thr = tile_skip_motion_threshold(config.quantization_step);
+            let block_skip_enabled = std::env::var_os("GNC_BLOCK_SKIP").is_some();
+            if block_skip_enabled {
+                static BLOCK_SKIP_PRINTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                BLOCK_SKIP_PRINTED.get_or_init(|| {
+                    eprintln!("[block_skip] active: per-8×8-block zero-MV skip in non-skip tiles (threshold={:.2})", skip_sad_thr);
+                });
+            }
             self.dispatch_tile_skip_motion(
                 ctx,
                 &mut cmd,
@@ -2837,6 +2846,7 @@ impl EncoderPipeline {
                 config.tile_size,
                 super::motion::ME_SPLIT_BLOCK_SIZE,
                 skip_sad_thr,
+                block_skip_enabled,
             );
 
             // MV median smoothing (GNC_MV_SMOOTH=1): 3×3 median filter on split MVs.

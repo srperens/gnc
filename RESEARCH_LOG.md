@@ -2053,3 +2053,66 @@ I-frame bottleneck is the wavelet transform + entropy coding, not ME.
 
 ### Verdict: SHIP AS OPT-IN, DO NOT MAKE DEFAULT
 
+
+---
+
+## 2026-03-10: #36 Deblocking filter — gate: artifact type unsuitable; closed
+
+### Hypothesis (gate)
+Tile-boundary artifacts in GNC decoded output are Gibbs ringing (wavelet overshoot extending 10-30px from boundary) → adaptive deblocking filter at 256-pixel grid would increase VMAF ≥0.5 pts without PSNR degradation.
+
+### Artifact characterization (Researcher analysis)
+
+Decoded bbb_1080p.png at q=75 (PSNR 42.17 dB, BPP 3.83, VMAF 95.05). Analyzed luma residuals (|decoded − original|) in windows around tile boundaries (offsets −15 to +15 from every 256th column/row).
+
+**Key measurements:**
+- Global RMS residual near boundaries (±8px): **1.734** vs interior (>32px): **1.666** → ratio **1.04×**
+- PSNR near boundaries (±4px): **43.04 dB** vs interior: **43.71 dB** → gap **0.67 dB** (affects ~10% of pixels → global impact ~0.067 dB)
+- Sign correlation of residuals at offset −1 vs 0: **0.023** (essentially zero — random, not coherent)
+- Fraction of |residual| > 5 near boundary (±4px): **1.05%** vs interior: **0.51%** (2× in extreme tail)
+- Mean decoded pixel jump at tile boundary columns: **7.30** vs interior columns: **7.65** (ratio **0.95×** — boundary jumps are *smaller*, not larger)
+
+### Root cause of artifact
+The CDF 9/7 inverse transform uses **symmetric reflection** boundary extension at each tile edge. Each tile's 256-pixel row/column is transformed entirely within shared memory — zero cross-tile interaction. The artifact is:
+- **1-2 pixels wide** (concentrated at offset −1, +0 from boundary)
+- **Incoherent in sign** (random overshoot/undershoot, no ringing lobes)
+- Caused by symmetric reflection being a mismatch with the true signal (which extends beyond the tile boundary), creating slight reconstruction error at the last 1-2 coefficients of each tile's inverse transform
+
+This is **boundary-extension quantization mismatch**, not Gibbs ringing and not H.264-style hard block edges.
+
+### Gate verdict: CLOSED
+
+The gate criterion states: "hard-edge quantization mismatch → deblocking may blur without fixing." The artifact here is exactly this type — narrow (1-2px), incoherent, globally only 4% elevated. A deblocking filter smoothing ±4-8px at the grid would blur correctly-reconstructed interior pixels without fixing the 1-2px mismatch. The bilinear chroma upsampling precedent (VMAF −0.93 pts from over-smoothing at tile boundaries) confirms the danger.
+
+**Expected VMAF gain from deblocking: well under 0.5 pts.** The correct fix is overlapping tiles or cross-tile wavelet lifting — a bitstream format change, not post-processing.
+
+
+---
+
+## 2026-03-10: #36 and #37 gate experiments — both closed
+
+### #36 Deblocking filter at tile boundaries (closed — artifact type wrong for deblocking)
+See detailed entry in section "2026-03-10: #36 Deblocking filter" above.
+
+### #37 Per-8×8-block skip decision (closed — 0% blocks qualify)
+
+**Hypothesis:** Per-8×8-block zero-MV skip (block SAD < qstep/2) reduces P-frame bpp ≥3% on bbb.
+
+**Implementation:** Extended `tile_skip_motion.wgsl` with Phase 5: for non-skip tiles, each thread independently evaluates its 4 blocks (8×8 = 64 pixels each, no reduction needed) and zeroes blocks where mean_sad < skip_threshold. Added `block_skip_enabled: u32` to Params struct. Gated by `GNC_BLOCK_SKIP=1` env var. Diagnostic prints threshold value on first P-frame to confirm code runs.
+
+**Measurement (bbb, q=75, GNC_BLOCK_SKIP=1):**
+| Config | BPP | VMAF |
+|--------|-----|------|
+| Baseline | 1.3465 | 95.31 |
+| GNC_BLOCK_SKIP=1 | 1.3465 | 95.31 |
+
+**Diagnostic confirmed:** `[block_skip] active: per-8×8-block zero-MV skip in non-skip tiles (threshold=2.00)` — code path is running.
+
+**Result: 0% change — IDENTICAL to baseline.** Zero blocks qualify for block-level skip.
+
+**Root cause:** At q=75, qstep=4.0 → threshold=2.0 per pixel. bbb is a smooth-pan sequence: the pan moves every block by several pixels per frame. Even "background" blocks within non-skip tiles have zero-MV SAD = 4-8 per pixel (pan SAD). The ME assigns the correct pan MVs to these blocks (residual ≈ 0.5-1 per pixel), but zero-MV SAD is 4-8. Zeroing those MVs would dramatically increase residual — wrong direction. No blocks qualify because the per-tile SAD is already >> threshold (tile was not skipped because it moves with the pan).
+
+**Gate verdict: CLOSED.** Gate was >15% of non-skip-tile blocks qualify. Result: 0%. The implementation is structurally sound but the content (bbb smooth pan) has no suitable blocks. crowd_run (high-motion) would be even worse (more motion). This is the same failure mode as #28 (OBMC): bbb's MV field is smooth, making block-level refinements ineffective.
+
+**Lesson:** Block-level skip benefits "heterogeneous motion" content — tiles with one moving object and static background. bbb (animated film, uniform pan) and crowd_run (uniformly high motion) don't have this. Content like rush_hour (slow pan with occasional cars) or touchdown (fast-motion crowd + static grass) might benefit.
+

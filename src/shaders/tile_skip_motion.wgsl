@@ -22,14 +22,18 @@
 //   Phase 1  – each thread accumulates |cur−ref| for tile_pixels/256 pixels.
 //   Phase 2  – parallel reduction → total SAD in shared_sum[0].
 //   Phase 3  – skip decision (stored back in shared_sum[0] as 1.0 = skip).
-//   Phase 4  – each thread zeroes its 4 assigned 8×8 blocks if skip is set.
+//   Phase 4  – each thread zeroes its 4 assigned 8×8 blocks if tile is skip.
+//   Phase 5  – (if block_skip_enabled) for non-skip tiles: per-8×8-block SAD.
+//              Each thread independently evaluates its 4 blocks; zeroes any
+//              block where mean_sad < skip_threshold. No reduction needed.
 
 struct Params {
-    padded_w:       u32,  // image width in pixels
-    padded_h:       u32,  // image height in pixels
-    tile_size:      u32,  // 256
-    block_size_8:   u32,  // 8  (split-MV resolution)
-    skip_threshold: f32,  // mean per-pixel SAD below which tile is skipped
+    padded_w:          u32,  // image width in pixels
+    padded_h:          u32,  // image height in pixels
+    tile_size:         u32,  // 256
+    block_size_8:      u32,  // 8  (split-MV resolution)
+    skip_threshold:    f32,  // mean per-pixel SAD below which tile/block is skipped
+    block_skip_enabled: u32, // 1 = also apply per-8×8-block skip in non-skip tiles
 }
 
 @group(0) @binding(0) var<uniform>             params:         Params;
@@ -94,15 +98,13 @@ fn main(
     }
     workgroupBarrier();
 
-    // ── Phase 4: zero motion vectors for skip tiles ───────────────────────────
-    // A 256×256 tile at 8×8 resolution has 32×32 = 1024 blocks.
-    // With 256 threads: 4 blocks per thread.
-    if !out_of_bounds && shared_sum[0] > 0.5 {
-        let blocks_per_tile_row = params.tile_size / params.block_size_8;    // 32
-        let blocks_per_tile     = blocks_per_tile_row * blocks_per_tile_row; // 1024
-        let blocks_per_thread   = (blocks_per_tile + 255u) / 256u;           // 4
-        let blocks_total_x      = params.padded_w / params.block_size_8;
+    let blocks_per_tile_row = params.tile_size / params.block_size_8;    // 32
+    let blocks_per_tile     = blocks_per_tile_row * blocks_per_tile_row; // 1024
+    let blocks_per_thread   = (blocks_per_tile + 255u) / 256u;           // 4
+    let blocks_total_x      = params.padded_w / params.block_size_8;
 
+    // ── Phase 4: zero motion vectors for skip tiles ───────────────────────────
+    if !out_of_bounds && shared_sum[0] > 0.5 {
         for (var b = 0u; b < blocks_per_thread; b++) {
             let block_in_tile = lid * blocks_per_thread + b;
             if block_in_tile < blocks_per_tile {
@@ -113,6 +115,42 @@ fn main(
                 let block_idx  = block_gy * blocks_total_x + block_gx;
                 motion_vectors[block_idx * 2u     ] = 0;
                 motion_vectors[block_idx * 2u + 1u] = 0;
+            }
+        }
+    }
+
+    // ── Phase 5: per-8×8-block skip in non-skip tiles ────────────────────────
+    // For non-skip tiles, independently evaluate each 8×8 block.  Each thread
+    // handles 4 blocks (no reduction needed — each block's SAD is independent).
+    // Zeroes blocks whose zero-MV mean_sad < skip_threshold: the quantiser will
+    // drive their near-zero residuals to zero anyway, saving MV + residual bits.
+    if !out_of_bounds && shared_sum[0] < 0.5 && params.block_skip_enabled != 0u {
+        for (var b = 0u; b < blocks_per_thread; b++) {
+            let block_in_tile = lid * blocks_per_thread + b;
+            if block_in_tile < blocks_per_tile {
+                let bx_in_tile    = block_in_tile % blocks_per_tile_row;
+                let by_in_tile    = block_in_tile / blocks_per_tile_row;
+                let block_gx      = tile_x * blocks_per_tile_row + bx_in_tile;
+                let block_gy      = tile_y * blocks_per_tile_row + by_in_tile;
+                let block_orig_x  = block_gx * params.block_size_8;
+                let block_orig_y  = block_gy * params.block_size_8;
+
+                // Accumulate |current − ref| over all 64 pixels in this 8×8 block.
+                var block_sad: f32 = 0.0;
+                for (var dy = 0u; dy < params.block_size_8; dy++) {
+                    for (var dx = 0u; dx < params.block_size_8; dx++) {
+                        let px  = block_orig_x + dx;
+                        let py  = block_orig_y + dy;
+                        let idx = py * params.padded_w + px;
+                        block_sad += abs(current_plane[idx] - ref_plane[idx]);
+                    }
+                }
+                let mean_block_sad = block_sad / f32(params.block_size_8 * params.block_size_8);
+                if mean_block_sad < params.skip_threshold {
+                    let block_idx = block_gy * blocks_total_x + block_gx;
+                    motion_vectors[block_idx * 2u     ] = 0;
+                    motion_vectors[block_idx * 2u + 1u] = 0;
+                }
             }
         }
     }

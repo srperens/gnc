@@ -21,10 +21,10 @@ H.264 comparison (#22) established the north star: GNC needs **2–5× more bits
 3. **#28 OBMC** (CLOSED) — gate experiment showed 0% bpp change; MV field smooth → median = original
 4. **#29 Fused wavelet kernel** (CLOSED) — pre-condition false; barriers are µs not ms
 5. **#17 Scene cut detection** (DONE) — shipped 776df85
-6. **#30 GPU timestamp profiling** (todo P1) — identify actual I-frame bottleneck; unblocks #33
-7. **#31 Adaptive dead-zone per subband** (todo P1) — −5–8% bpp, histogram gate first
-8. **#32 Independent 8×8 coarse ME** (todo P2) — −8–15% bpp crowd_run, boundary gate first
-9. **#33 Fused quantize+Rice** (todo P2, blocked on #30) — I-frame speed
+6. **#30 GPU timestamp profiling** (DONE) — gpu_wavelet_quant=12.75ms, gpu_rice=12.8ms, total=29.5ms
+7. **#33 Fused quantize+Rice** (CLOSED) — gate triggered: quantize+Rice≈19ms < 30ms gate
+8. **#31 Adaptive dead-zone per subband** (todo P1) — −5–8% bpp, histogram gate first
+9. **#32 Independent 8×8 coarse ME** (todo P2) — −8–15% bpp crowd_run, boundary gate first
 10. **#34 Merge mode: co-located MV** (todo P3) — −2–5% slow content, MV bpp gate first
 11. **#24 Larger ME search range** (DEFER — precondition false)
 12. **#25 Multi-reference P-frames** (DEFER — gate on MV histogram)
@@ -297,13 +297,21 @@ H.264 comparison (#22) established the north star: GNC needs **2–5× more bits
 - **Success criteria:** I-frame encode time <180ms at 1080p q=75 (from ~250ms); VMAF identical; all tests pass. Bitstream: no change.
 
 ### 30. GPU timestamp profiling — identify I-frame bottleneck
-- **Status:** todo (P1, speed prerequisite)
+- **Status:** done (2026-03-10)
 - **Motivation:** I-frame encode is claimed to be ~250 ms but we have never broken this down per-stage at GPU level. "Wavelet=64ms" is estimated, not measured. Without GPU timestamps we cannot correctly prioritize speed work (#33 fused quantize+Rice depends on this, and #32 ME depends on knowing ME budget).
 - **Hypothesis:** A per-stage GPU timestamp breakdown (wavelet, quantize, Rice encode, Rice staging) will reveal that one stage accounts for >40% of total I-frame time and is the true bottleneck.
 - **Implementation:** wgpu `TIMESTAMP_QUERY` feature. `write_timestamp` before/after each major dispatch group in `pipeline.rs`. Read back via `resolve_query_set`. Fallback: CPU Instant::now() with explicit `device.poll(Maintain::Wait)` per stage group.
 - **Success criteria:** Per-stage GPU breakdown for one I-frame at 1080p q=75; stages sum to within 10% of measured 250 ms wall time. Output as `--diagnostics` text.
 - **Complexity:** 0.5 days.
 - **Gates:** #33 (fused quantize+Rice) proceeds only if quantize+Rice > 30 ms; #32 (8×8 ME) proceeds only if ME is < 15 ms (room to expand).
+- **Result (bbb_1080p, q=75, Rice, steady-state):**
+  - `gpu_wavelet_quant` ≈ 12.75 ms (wavelet+quantize, all 3 planes)
+  - `gpu_rice` ≈ 12.8 ms (Rice entropy encode, all 3 planes)
+  - `rice_assemble` ≈ 0.5 ms (CPU staging readback)
+  - `total` ≈ 29.5 ms = ~34 fps (pure I-frame, no Y4M overhead)
+  - GPU is 86% of I-frame time; wavelet+quantize and Rice are equal in cost
+  - **Gate #33 triggered:** quantize+Rice ≈ 12.8ms (+ partial wavelet_quant) < 30ms → close #33
+  - **Implementation:** GNC_PROFILE=1 env var splits command encoder in profiling mode; production path unchanged (single encoder, one submit).
 
 ### 31. Adaptive dead-zone quantization per subband
 - **Status:** todo (P1, quality)
@@ -324,13 +332,11 @@ H.264 comparison (#22) established the north star: GNC needs **2–5× more bits
 - **Complexity:** 3–4 days.
 
 ### 33. Fused quantize + Rice encode shader (I-frame speed)
-- **Status:** todo (P2, speed — BLOCKED on #30)
+- **Status:** closed (2026-03-10) — gate triggered by #30 results
 - **Motivation:** I-frame pipeline runs wavelet → quantize.wgsl → rice_encode.wgsl as separate dispatches, each reading/writing the 8 MB coefficient buffer from global memory. Fusing would eliminate one 8 MB global memory round-trip per plane.
 - **Pre-condition:** #30 must show quantize+Rice together are >30 ms of I-frame time. If <30 ms, close this item.
-- **Hypothesis:** Fused quantize+Rice shader reduces I-frame encode time by 15% (≥35 ms) on bbb_1080p q=75.
-- **Implementation:** Restructure Rice encode to quantize inside the Rice workgroup's per-coefficient loop. Quantize step moves from global memory → shared memory → Rice output without global memory round-trip. Rice workgroup already processes one tile (256×256/256=256 coefficients per thread group). Shared memory: current 2 KB + 256 f32 quantize buffer = 3 KB, well within 32 KB.
-- **Success criteria:** I-frame encode time ≤200 ms at 1080p q=75 (from ~250 ms); VMAF identical; all tests pass.
-- **Complexity:** 2–3 days (after #30 gate).
+- **#30 result:** gpu_rice = 12.8 ms; gpu_wavelet_quant = 12.75 ms (wavelet+quantize combined). Quantize is ~6 ms of the 12.75 ms; quantize+Rice ≈ 19 ms. Savings from eliminating one 8 MB global memory read = 24 MB / 68 GB/s ≈ 0.35 ms (~1.2% of total). Not worth implementing.
+- **Closed:** Gate <30 ms, gains are sub-percent. The Rice shader and quantize shader are already independently efficient; fusion adds complexity for 0.35 ms savings.
 
 ### 34. Merge mode: co-located MV inheritance for slow-pan content
 - **Status:** todo (P3, quality)

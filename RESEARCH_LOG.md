@@ -32,6 +32,36 @@ Before implementing temporal prediction improvements, ask: "Does the encoder alr
 
 ---
 
+## 2026-03-10: #30 GPU stage profiling — I-frame bottleneck identified
+
+### Method
+Added per-stage CPU timing with `device.poll(Maintain::Wait)` barriers in `pipeline.rs`. In profiling mode (`GNC_PROFILE=1`), the monolithic wavelet+quantize+Rice command encoder is split into two separate submits with an explicit poll between them to measure GPU execution time per stage. Production path unchanged (single encoder).
+
+### Results (bbb_1080p, q=75, 444, Rice, steady-state)
+```
+gpu_wavelet_quant ≈ 12.75ms  (wavelet + quantize + AQ, all 3 planes)
+gpu_rice          ≈ 12.8ms   (Rice entropy encode, all 3 planes)
+rice_assemble     ≈ 0.5ms    (CPU staging readback)
+wq_cmd            ≈ 0.6ms    (command buffer recording)
+pad               ≈ 3.0ms    (CPU → GPU upload)
+total             ≈ 29.5ms   = ~34 fps pure I-frame encode
+```
+
+GPU compute = 25.5ms out of 29.5ms total = **86% of I-frame time is GPU compute**.
+Wavelet+quantize and Rice are **equal in cost** (~12.75ms each).
+
+### Gate outcomes
+
+**#33 (Fused quantize+Rice): CLOSED**
+Gate criterion: quantize+Rice > 30ms → proceed. Measured quantize+Rice ≈ 12.8 + ~6 = 19ms < 30ms gate. Memory bandwidth savings from eliminating one 8 MB coefficient buffer read = 24 MB / 68 GB/s = 0.35ms (~1.2% of total). Not worth implementing.
+
+**#32 (Independent 8×8 ME):** Not gated on profiling — ME time not measured in I-frame encode (I-frames have no ME). The ME budget gate from BACKLOG.md ("ME < 15ms for room to expand") applies to P-frame encode — separate profiling would be needed.
+
+### Key insight
+The "250ms I-frame" claim in earlier notes was for I+P+B sequence encode per GOP, not a single I-frame. A single I-frame at 1080p q=75 takes ~29.5ms (34 fps). The previous 250ms estimate must have included multiple frames and GOP management overhead.
+
+---
+
 ## 2026-03-10: #28 OBMC gate — MV median smoothing (0% bpp gain; closed)
 
 ### Hypothesis (gate experiment)

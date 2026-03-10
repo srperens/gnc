@@ -1875,23 +1875,48 @@ impl EncoderPipeline {
         let use_gpu_encode_batch = use_gpu_encode && chroma_format == ChromaFormat::Yuv444;
         let use_fused_qh_batch = use_fused_qh && chroma_format == ChromaFormat::Yuv444;
 
-        // For GPU Rice: batch entropy encode + staging copies into the same command
-        // encoder as wavelet+quantize — saves one submit overhead
-        if use_gpu_rice_batch {
+        // In profiling mode: split wavelet+quantize and Rice into separate submits
+        // so we can time each stage. In production mode: keep both in one encoder
+        // to save one submit overhead.
+        let t_wq_end;
+        let t_rice_end;
+        if profile && use_gpu_rice_batch {
+            // Stage 1: submit wavelet+quantize
+            ctx.queue.submit(Some(cmd.finish()));
+            ctx.device.poll(wgpu::Maintain::Wait);
+            t_wq_end = t_start.elapsed();
+
+            // Stage 2: Rice encode in separate command encoder
+            let mut cmd_rice = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("encode_rice_profile"),
+            });
             self.gpu_rice_encoder.dispatch_3planes_to_cmd(
                 ctx,
-                &mut cmd,
+                &mut cmd_rice,
                 [&bufs.mc_out, &bufs.ref_upload, &bufs.plane_b],
                 &info,
                 entropy_levels,
                 config.quantization_step,
             );
+            ctx.queue.submit(Some(cmd_rice.finish()));
+            ctx.device.poll(wgpu::Maintain::Wait);
+            t_rice_end = t_start.elapsed();
+        } else {
+            // Production path: single submit for all GPU work (wavelet+quant + entropy if Rice)
+            if use_gpu_rice_batch {
+                self.gpu_rice_encoder.dispatch_3planes_to_cmd(
+                    ctx,
+                    &mut cmd,
+                    [&bufs.mc_out, &bufs.ref_upload, &bufs.plane_b],
+                    &info,
+                    entropy_levels,
+                    config.quantization_step,
+                );
+            }
+            ctx.queue.submit(Some(cmd.finish()));
+            t_wq_end = t_start.elapsed();
+            t_rice_end = t_wq_end;
         }
-
-        // Single submit for all GPU work (wavelet+quant + entropy if Rice)
-        ctx.queue.submit(Some(cmd.finish()));
-
-        let t_submit_wq = t_start.elapsed();
 
         // Per-plane infos for entropy encoding — chroma planes differ when non-444
         let plane_infos: [&FrameInfo; 3] = [
@@ -2090,14 +2115,17 @@ impl EncoderPipeline {
 
         if profile {
             let t_total = t_start.elapsed();
+            let gpu_wq_ms = (t_wq_end - t_wavelet_quant).as_secs_f64() * 1000.0;
+            let gpu_rice_ms = (t_rice_end - t_wq_end).as_secs_f64() * 1000.0;
             eprintln!(
-                "[encode profile] setup={:.2}ms pad={:.2}ms preprocess={:.2}ms wq_cmd={:.2}ms wq_submit={:.2}ms entropy={:.2}ms total={:.2}ms",
+                "[encode profile] setup={:.2}ms pad={:.2}ms preprocess={:.2}ms wq_cmd={:.2}ms gpu_wavelet_quant={:.2}ms gpu_rice={:.2}ms rice_assemble={:.2}ms total={:.2}ms",
                 t_setup.as_secs_f64() * 1000.0,
                 (t_pad - t_setup).as_secs_f64() * 1000.0,
                 (t_preprocess - t_pad).as_secs_f64() * 1000.0,
                 (t_wavelet_quant - t_preprocess).as_secs_f64() * 1000.0,
-                (t_submit_wq - t_wavelet_quant).as_secs_f64() * 1000.0,
-                (t_entropy - t_submit_wq).as_secs_f64() * 1000.0,
+                gpu_wq_ms,
+                gpu_rice_ms,
+                (t_entropy - t_rice_end).as_secs_f64() * 1000.0,
                 t_total.as_secs_f64() * 1000.0,
             );
         }

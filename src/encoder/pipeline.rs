@@ -1139,6 +1139,16 @@ impl EncoderPipeline {
         let profile = std::env::var("GNC_PROFILE").is_ok();
         let t_start = std::time::Instant::now();
 
+        // #47: overlap_pixels > 0 requires separate larger coefficient buffers and decoder
+        // crop step — the current encoder-only trim approach produces wrong output because
+        // the decoder can't invert coefficients computed with different boundary conditions.
+        // Correct implementation deferred. See BACKLOG #47 for design notes.
+        assert!(
+            config.overlap_pixels == 0,
+            "overlap_pixels > 0 is not yet fully implemented (requires separate coefficient \
+             buffer + decoder crop step; see BACKLOG #47)"
+        );
+
         let chroma_format = config.chroma_format;
         let info = FrameInfo {
             width,
@@ -1489,6 +1499,7 @@ impl EncoderPipeline {
                 config.wavelet_levels,
                 config.wavelet_type,
                 0, // plane_idx: Y
+                config.overlap_pixels, // overlap
             );
             // After wavelet: plane_c has Y wavelet coefficients
 
@@ -1643,6 +1654,7 @@ impl EncoderPipeline {
                 config.wavelet_levels,
                 config.wavelet_type,
                 1, // plane_idx: Co
+                config.overlap_pixels, // overlap
             );
 
             if use_cfl {
@@ -1745,6 +1757,7 @@ impl EncoderPipeline {
                 config.wavelet_levels,
                 config.wavelet_type,
                 2, // plane_idx: Cg
+                config.overlap_pixels, // overlap
             );
 
             if use_cfl {

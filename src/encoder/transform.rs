@@ -13,7 +13,10 @@ struct TransformParams {
     pass_mode: u32,
     tiles_x: u32,
     region_size: u32,
-    _pad0: u32,
+    /// Pixels of overlap per side for the forward transform (encoder-only).
+    /// At level 0: physical region = tile_size + 2*overlap. Higher levels: 0.
+    /// The shader reads an extended region but writes only the central tile_size coefficients.
+    overlap: u32,
 }
 
 /// Maximum wavelet decomposition levels supported
@@ -188,6 +191,10 @@ impl WaveletTransform {
     /// `plane_idx` (0, 1 or 2) selects an independent set of param slots so that
     /// Y, Co and Cg transforms can share the same command encoder without their
     /// params overwriting each other.
+    ///
+    /// `overlap` is the per-side pixel overlap for tile-boundary artifact reduction.
+    /// When `overlap > 0`, level-0 reads `tile_size + 2*overlap` pixels per row/column
+    /// but writes back only the central `tile_size` coefficients. Higher levels use overlap=0.
     #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
@@ -200,14 +207,22 @@ impl WaveletTransform {
         levels: u32,
         wavelet_type: WaveletType,
         plane_idx: usize,
+        overlap: u32,
     ) {
         // Each plane gets its own SLOTS_PER_PLANE-wide range in the forward half.
         let plane_slot_base = plane_idx * SLOTS_PER_PLANE;
-        // Pre-fill all param slots for this forward transform
+        // Pre-fill all param slots for this forward transform.
+        // At level 0: region_size = tile_size + 2*overlap (physical), overlap = overlap.
+        // At level 1+: region_size = tile_size>>level (standard), overlap = 0.
         let mut region = info.tile_size;
         for level in 0..levels as usize {
             let row_slot = plane_slot_base + level * 2;
             let col_slot = plane_slot_base + level * 2 + 1;
+            let level_overlap = if level == 0 { overlap } else { 0 };
+            // physical_region = standard region + 2*overlap; the shader reads this many
+            // elements but writes back only the central `tile_size` (at level 0) or `region`
+            // (at level 1+) coefficients.
+            let physical_region = region + 2 * level_overlap;
             let params_row = TransformParams {
                 width: info.padded_width(),
                 height: info.padded_height(),
@@ -215,8 +230,8 @@ impl WaveletTransform {
                 direction: 0,
                 pass_mode: 0,
                 tiles_x: info.tiles_x(),
-                region_size: region,
-                _pad0: 0,
+                region_size: physical_region,
+                overlap: level_overlap,
             };
             let params_col = TransformParams {
                 width: info.padded_width(),
@@ -225,8 +240,8 @@ impl WaveletTransform {
                 direction: 0,
                 pass_mode: 1,
                 tiles_x: info.tiles_x(),
-                region_size: region,
-                _pad0: 0,
+                region_size: physical_region,
+                overlap: level_overlap,
             };
             self.write_params_slot(ctx, row_slot, &params_row);
             self.write_params_slot(ctx, col_slot, &params_col);
@@ -321,7 +336,7 @@ impl WaveletTransform {
                 pass_mode: 1,
                 tiles_x: info.tiles_x(),
                 region_size: region,
-                _pad0: 0,
+                overlap: 0,
             };
             let params_row = TransformParams {
                 width: info.padded_width(),
@@ -331,7 +346,7 @@ impl WaveletTransform {
                 pass_mode: 0,
                 tiles_x: info.tiles_x(),
                 region_size: region,
-                _pad0: 0,
+                overlap: 0,
             };
             self.write_params_slot(ctx, col_slot, &params_col);
             self.write_params_slot(ctx, row_slot, &params_row);

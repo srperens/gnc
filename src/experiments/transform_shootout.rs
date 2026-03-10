@@ -356,6 +356,7 @@ pub fn run_shootout(
                 levels,
                 wtype,
                 0,
+                0, // overlap
             );
             ctx.queue.submit(Some(enc.finish()));
         });
@@ -396,6 +397,7 @@ pub fn run_shootout(
             levels,
             wtype,
             0,
+            0, // overlap
         );
         ctx.queue.submit(Some(enc.finish()));
         ctx.device.poll(wgpu::Maintain::Wait);

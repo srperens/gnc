@@ -2447,3 +2447,31 @@ Hierarchical pyramid B-frame GOP (3-level dyadic) is SHIPPED. Real improvement c
 | park_joy   | 4.75    | 4.74     | −0.2%  | 99.14    | 99.14     |
 
 **Conclusion:** Hypothesis partially falsified. The architectural change is correct and the code is clean (all tests pass, zero clippy warnings). The benefit is near-neutral rather than ≥1% — the gate showed SAD advantage for B₄ reference but at the group level the bpp savings are offset by B₄ encoding cost (B₄ at 1.12 bpp on park_joy vs free reference in old scheme). VMAF unchanged on both sequences — no regression. SHIPPED as an architectural improvement; bpp impact within noise.
+
+## #47 Overlapping Tile Windows — Gate Experiment (2026-03-10)
+
+### Gate diagnostic
+Added `GNC_TILE_BOUNDARY=1` env var to `benchmark` command. Computes PSNR for pixels within 4px of tile grid edges vs interior pixels separately.
+
+**Results (bbb_1080p, Rice, CDF 9/7):**
+| q   | boundary_psnr | interior_psnr | gap    | gate    |
+|-----|---------------|---------------|--------|---------|
+| 25  | 32.13 dB      | 32.94 dB      | 0.81 dB | PROCEED |
+| 50  | 36.77 dB      | 37.59 dB      | 0.82 dB | PROCEED |
+| 75  | 41.56 dB      | 42.21 dB      | 0.66 dB | PROCEED |
+
+Gate threshold 0.5 dB — all pass. The tile-boundary artifact is real, consistent (0.66–0.82 dB across q values), and affects ~6% of pixels (4px halo on 256px tiles).
+
+### Implementation attempt
+Attempted "encoder-only overlap with trimming": encoder reads 264px (with 4px halo from neighbors), computes extended wavelet, writes only central 256 coefficients. This is WRONG — the decoder can't correctly invert coefficients computed from a different input boundary condition. Result: boundary gap increased to 5.60 dB (worse than before).
+
+### Correct design (Approach A — full overlap)
+- Encoder writes ALL `physical_tile_size^2 = 264^2` coefficients per tile
+- Requires separate coefficient buffer (larger than padded image buffer)
+- Decoder allocates 264^2 per tile, inverse wavelet, crops to central 256^2
+- Bitstream: add `overlap_pixels: u8` to GP11 frame header
+- overlap=0 is a no-op (current default, all tests pass)
+- Structural changes present: `CodecConfig.overlap_pixels`, enlarged wavelet shader shared memory, encoder panics if overlap > 0 until full implementation
+
+### Conclusion
+Gate PASSED. Correct implementation identified (Approach A). Structural scaffolding in place. Full implementation deferred to next session (4-6 days: separate coefficient buffer sizing, all downstream shader params, decoder crop step, bitstream bump).

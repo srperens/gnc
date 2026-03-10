@@ -1331,6 +1331,7 @@ impl EncoderPipeline {
                                     cfg.wavelet_levels,
                                     cfg.wavelet_type,
                                     p,
+                                    cfg.overlap_pixels, // overlap
                                 );
                                 cmd.copy_buffer_to_buffer(
                                     &bufs.plane_c,
@@ -1568,6 +1569,7 @@ impl EncoderPipeline {
                                 cfg.wavelet_levels,
                                 cfg.wavelet_type,
                                 p,
+                                cfg.overlap_pixels, // overlap
                             );
                             cmd.copy_buffer_to_buffer(
                                 &bufs.plane_c,
@@ -1872,6 +1874,7 @@ impl EncoderPipeline {
                             cfg.wavelet_levels,
                             cfg.wavelet_type,
                             p,
+                            cfg.overlap_pixels, // overlap
                         );
                         cmd.copy_buffer_to_buffer(
                             &bufs.plane_c,
@@ -2379,6 +2382,7 @@ impl EncoderPipeline {
                                 cfg.wavelet_levels,
                                 cfg.wavelet_type,
                                 p,
+                                cfg.overlap_pixels, // overlap
                             );
                             cmd_pre.copy_buffer_to_buffer(
                                 &sp_b.plane_c,
@@ -3359,6 +3363,7 @@ impl EncoderPipeline {
                         config.wavelet_levels,
                         config.wavelet_type,
                         p,
+                        config.overlap_pixels, // overlap
                     );
                     self.quantize.dispatch(
                         ctx,
@@ -3421,6 +3426,7 @@ impl EncoderPipeline {
                         config.wavelet_levels,
                         config.wavelet_type,
                         p,
+                        config.overlap_pixels, // overlap
                     );
                     self.quantize.dispatch(
                         ctx,
@@ -3465,6 +3471,7 @@ impl EncoderPipeline {
                         config.wavelet_levels,
                         config.wavelet_type,
                         p,
+                        config.overlap_pixels, // overlap
                     );
                     self.quantize.dispatch(
                         ctx,
@@ -4339,6 +4346,7 @@ impl EncoderPipeline {
                         config.wavelet_levels,
                         config.wavelet_type,
                         p,
+                        config.overlap_pixels, // overlap
                     );
                     self.quantize.dispatch(
                         ctx,
@@ -4396,6 +4404,7 @@ impl EncoderPipeline {
                         config.wavelet_levels,
                         config.wavelet_type,
                         p,
+                        config.overlap_pixels, // overlap
                     );
                     self.quantize.dispatch(
                         ctx,
@@ -4435,6 +4444,7 @@ impl EncoderPipeline {
                         config.wavelet_levels,
                         config.wavelet_type,
                         p,
+                        config.overlap_pixels, // overlap
                     );
                     self.quantize.dispatch(
                         ctx,
@@ -5156,6 +5166,7 @@ impl EncoderPipeline {
                         config.wavelet_levels,
                         config.wavelet_type,
                         p,
+                        config.overlap_pixels, // overlap
                     );
                     self.quantize.dispatch(
                         ctx,
@@ -5217,6 +5228,7 @@ impl EncoderPipeline {
                         config.wavelet_levels,
                         config.wavelet_type,
                         p,
+                        config.overlap_pixels, // overlap
                     );
                     self.quantize.dispatch(
                         ctx,
@@ -5266,6 +5278,7 @@ impl EncoderPipeline {
                         config.wavelet_levels,
                         config.wavelet_type,
                         p,
+                        config.overlap_pixels, // overlap
                     );
                     self.quantize.dispatch(
                         ctx,
@@ -5655,6 +5668,7 @@ impl EncoderPipeline {
                     config.wavelet_levels,
                     config.wavelet_type,
                     p,
+                    config.overlap_pixels, // overlap
                 );
                 self.quantize.dispatch(
                     ctx,
@@ -6243,6 +6257,7 @@ impl EncoderPipeline {
                 config.wavelet_levels,
                 config.wavelet_type,
                 p,
+                config.overlap_pixels, // overlap
             );
 
             // quantize: plane_c → recon_y
@@ -6337,6 +6352,7 @@ impl EncoderPipeline {
                 config.wavelet_levels,
                 config.wavelet_type,
                 p,
+                config.overlap_pixels, // overlap
             );
 
             // copy wavelet coeffs to staging

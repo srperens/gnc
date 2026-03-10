@@ -442,6 +442,14 @@ enum Command {
         /// 10-bit PNGs must store 10-bit values in the high bits of 16-bit channels.
         #[arg(long, default_value = "8")]
         bit_depth: u32,
+
+        /// Tile size in pixels (default 256). Used for gate experiments (e.g. 512 for #47).
+        #[arg(long, default_value = "256")]
+        tile_size: u32,
+
+        /// Overlapping tile pixels per side (default 0 = off). Set to 4 for #47 experiment.
+        #[arg(long, default_value = "0")]
+        overlap_pixels: u32,
     },
 
     /// Benchmark temporal (I+P frame) encoding on a sequence of frames
@@ -926,6 +934,8 @@ fn main() {
             chroma_format,
             vmaf,
             bit_depth,
+            tile_size,
+            overlap_pixels,
         } => {
             let (rgb_data, w, h) = load_image_rgb_f32_bits(&input, bit_depth);
 
@@ -960,6 +970,8 @@ fn main() {
             }
             config.chroma_format = parse_chroma_format(&chroma_format);
             config.bit_depth = bit_depth;
+            config.tile_size = tile_size;
+            config.overlap_pixels = overlap_pixels;
 
             let coder_name = match config.entropy_coder {
                 gnc::EntropyCoder::Bitplane => "bitplane".to_string(),
@@ -998,6 +1010,34 @@ fn main() {
             };
 
             println!("Quality: {}", qm);
+
+            // #47 gate: tile-boundary PSNR diagnostic
+            // Enabled via GNC_TILE_BOUNDARY=1. Measures PSNR within 4px of tile edges vs interior.
+            // Gate criterion: if boundary PSNR < interior PSNR - 0.5 dB, artifact is significant.
+            if std::env::var("GNC_TILE_BOUNDARY").is_ok() {
+                let halo = 4usize;
+                let ts = config.tile_size as usize;
+                let (bnd_psnr, int_psnr) = quality::psnr_tile_boundary(
+                    &rgb_data,
+                    &reconstructed,
+                    peak,
+                    w as usize,
+                    h as usize,
+                    ts,
+                    halo,
+                );
+                let gap = int_psnr - bnd_psnr;
+                eprintln!(
+                    "[tile_boundary] boundary_psnr={:.2} dB  interior_psnr={:.2} dB  gap={:.2} dB  \
+                     tile_size={}  halo={}px  gate={} (threshold 0.5 dB)",
+                    bnd_psnr,
+                    int_psnr,
+                    gap,
+                    ts,
+                    halo,
+                    if gap >= 0.5 { "PROCEED" } else { "SKIP" }
+                );
+            }
 
             // VMAF perceptual quality scoring (single-frame)
             if vmaf {

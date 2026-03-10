@@ -16,20 +16,24 @@ struct Params {
     direction: u32,     // 0 = forward, 1 = inverse
     pass_mode: u32,     // 0 = row pass, 1 = column pass
     tiles_x: u32,       // number of tiles horizontally
-    region_size: u32,   // sub-region size for this level (tile_size >> level)
-    _pad0: u32,
+    region_size: u32,   // physical region size: tile_size + 2*overlap for level-0 forward;
+                        // tile_size >> level for higher levels; overlap=0 for inverse.
+    overlap: u32,       // per-side overlap pixels (encoder forward only; 0 for inverse)
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var<storage, read> input: array<f32>;
 @group(0) @binding(2) var<storage, read_write> output: array<f32>;
 
-// Shared memory for one row/column of a tile (max tile_size = 256)
-var<workgroup> shared_data: array<f32, 256>;
-var<workgroup> shared_low: array<f32, 128>;
-var<workgroup> shared_high: array<f32, 128>;
+// Shared memory — sized for max physical_tile_size = tile_size + 2*MAX_OVERLAP.
+// MAX_OVERLAP = tile_size/2 - 1 = 127; physical_tile_size_max = 510; half_max = 255.
+// Workgroup size 256 covers half_max=255 with one thread to spare.
+// For overlap=0 (standard path), only threads 0..half-1 do work; the rest are idle.
+var<workgroup> shared_data: array<f32, 512>;
+var<workgroup> shared_low: array<f32, 256>;
+var<workgroup> shared_high: array<f32, 256>;
 
-@compute @workgroup_size(128)
+@compute @workgroup_size(256)
 fn main(
     @builtin(workgroup_id) wg_id: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>,
@@ -46,7 +50,7 @@ fn main(
     let tile_origin_x = tile_x * params.tile_size;
     let tile_origin_y = tile_y * params.tile_size;
 
-    // Determine the length of this row/column (region_size for multi-level)
+    // Physical region size (= tile_size + 2*overlap for level-0 forward; tile_size>>level otherwise).
     let ts = params.region_size;
     let half = ts / 2u;
 
@@ -57,14 +61,18 @@ fn main(
             let row = tile_origin_y + line_in_tile;
             if row >= params.height { return; }
 
-            // Load row into shared memory (2 elements per thread)
-            let col0 = tile_origin_x + thread_id * 2u;
-            let col1 = col0 + 1u;
-            if col0 < params.width && col0 < tile_origin_x + ts {
-                shared_data[thread_id * 2u] = input[row * params.width + col0];
+            // Load physical_tile_size = ts elements into shared memory.
+            // With overlap > 0: read from [tile_origin_x - overlap, tile_origin_x + tile_size + overlap).
+            // Clamp to [0, width-1] to handle image edges (boundary replication).
+            let overlap = params.overlap;
+            let col_start = i32(tile_origin_x) - i32(overlap);
+            if thread_id * 2u < ts {
+                let c0 = u32(clamp(col_start + i32(thread_id * 2u), 0, i32(params.width) - 1));
+                shared_data[thread_id * 2u] = input[row * params.width + c0];
             }
-            if col1 < params.width && col1 < tile_origin_x + ts {
-                shared_data[thread_id * 2u + 1u] = input[row * params.width + col1];
+            if thread_id * 2u + 1u < ts {
+                let c1 = u32(clamp(col_start + i32(thread_id * 2u + 1u), 0, i32(params.width) - 1));
+                shared_data[thread_id * 2u + 1u] = input[row * params.width + c1];
             }
             workgroupBarrier();
 
@@ -101,16 +109,26 @@ fn main(
             }
             workgroupBarrier();
 
-            // Write output: low frequencies first, then high frequencies
-            // Layout: [L0 L1 ... L_{half-1} H0 H1 ... H_{half-1}]
-            if thread_id < half {
+            // Write output: the central (tile_size) coefficients, discarding the halo.
+            //
+            // skip = overlap/2: halo elements at start of each sub-band (low and high).
+            // out_cnt = half - overlap: number of output elements per sub-band.
+            //   - level 0 fwd: half = tile_size/2 + overlap, out_cnt = tile_size/2. ✓
+            //   - level 1+ fwd (overlap=0): half = ts/2, out_cnt = half. ✓ (same as original)
+            //
+            // Output layout in the image buffer: [low | high] within each tile region:
+            //   low  → tile_origin_x + 0 .. tile_origin_x + out_cnt - 1
+            //   high → tile_origin_x + out_cnt .. tile_origin_x + 2*out_cnt - 1
+            let skip = overlap / 2u;
+            let out_cnt = half - overlap;
+            if thread_id < out_cnt {
                 let out_col_l = tile_origin_x + thread_id;
-                let out_col_h = tile_origin_x + half + thread_id;
+                let out_col_h = tile_origin_x + out_cnt + thread_id;
                 if out_col_l < params.width {
-                    output[row * params.width + out_col_l] = shared_low[thread_id];
+                    output[row * params.width + out_col_l] = shared_low[skip + thread_id];
                 }
                 if out_col_h < params.width {
-                    output[row * params.width + out_col_h] = shared_high[thread_id];
+                    output[row * params.width + out_col_h] = shared_high[skip + thread_id];
                 }
             }
         } else {
@@ -118,16 +136,14 @@ fn main(
             let col = tile_origin_x + line_in_tile;
             if col >= params.width { return; }
 
-            // Load column into shared memory
+            // Load column into shared memory with vertical overlap.
+            let overlap = params.overlap;
+            let row_start = i32(tile_origin_y) - i32(overlap);
             if thread_id < half {
-                let row0 = tile_origin_y + thread_id * 2u;
-                let row1 = row0 + 1u;
-                if row0 < params.height {
-                    shared_data[thread_id * 2u] = input[row0 * params.width + col];
-                }
-                if row1 < params.height {
-                    shared_data[thread_id * 2u + 1u] = input[row1 * params.width + col];
-                }
+                let r0 = u32(clamp(row_start + i32(thread_id * 2u),     0, i32(params.height) - 1));
+                let r1 = u32(clamp(row_start + i32(thread_id * 2u + 1u), 0, i32(params.height) - 1));
+                shared_data[thread_id * 2u]     = input[r0 * params.width + col];
+                shared_data[thread_id * 2u + 1u] = input[r1 * params.width + col];
             }
             workgroupBarrier();
 
@@ -164,20 +180,22 @@ fn main(
             }
             workgroupBarrier();
 
-            // Write: low rows first, then high rows
-            if thread_id < half {
+            // Write: central tile_size rows (skip halo on each end of each sub-band)
+            let skip = overlap / 2u;
+            let out_cnt = half - overlap;
+            if thread_id < out_cnt {
                 let out_row_l = tile_origin_y + thread_id;
-                let out_row_h = tile_origin_y + half + thread_id;
+                let out_row_h = tile_origin_y + out_cnt + thread_id;
                 if out_row_l < params.height {
-                    output[out_row_l * params.width + col] = shared_low[thread_id];
+                    output[out_row_l * params.width + col] = shared_low[skip + thread_id];
                 }
                 if out_row_h < params.height {
-                    output[out_row_h * params.width + col] = shared_high[thread_id];
+                    output[out_row_h * params.width + col] = shared_high[skip + thread_id];
                 }
             }
         }
     } else {
-        // ---- INVERSE TRANSFORM ----
+        // ---- INVERSE TRANSFORM (overlap is always 0 on decode) ----
         if params.pass_mode == 1u {
             // Inverse column pass (run before inverse row pass)
             let col = tile_origin_x + line_in_tile;

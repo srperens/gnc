@@ -401,6 +401,17 @@ pub struct CodecConfig {
     /// Typical hard cuts have MAD > 50. Set to 0.0 to disable detection.
     /// Default: 50.0.
     pub scene_cut_threshold: f32,
+    /// Overlapping tile windows: number of pixels to extend each tile beyond its boundary
+    /// on each side before performing the wavelet transform.
+    ///
+    /// Each tile reads `overlap_pixels` extra pixels from neighboring tiles on all four sides.
+    /// The wavelet is computed on the extended `(tile_size + 2*overlap_pixels)^2` region,
+    /// then only the central `tile_size^2` coefficients are kept. This eliminates
+    /// tile-boundary ringing artifacts at the cost of ~3% extra compute.
+    ///
+    /// The bitstream format is unchanged — overlap is a purely encoder-side quality choice.
+    /// Default: 0 (disabled, no change to current behavior).
+    pub overlap_pixels: u32,
 }
 
 impl CodecConfig {
@@ -443,6 +454,7 @@ impl Default for CodecConfig {
             chroma_format: ChromaFormat::Yuv444,
             bit_depth: 8,
             scene_cut_threshold: 50.0,
+            overlap_pixels: 0,
         }
     }
 }

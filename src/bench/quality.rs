@@ -101,6 +101,60 @@ pub fn ssim_approx(original: &[f32], reconstructed: &[f32], peak_val: f32) -> f6
     numerator / denominator
 }
 
+/// Compute PSNR separately for pixels near tile boundaries vs interior pixels.
+///
+/// `halo` is the number of pixels on each side of a tile edge considered "boundary".
+/// Returns `(boundary_psnr, interior_psnr)`.  A large gap indicates tile-edge artifacts.
+/// Used as a gate experiment for #47 (overlapping tile windows).
+pub fn psnr_tile_boundary(
+    original: &[f32],
+    reconstructed: &[f32],
+    peak_val: f32,
+    width: usize,
+    height: usize,
+    tile_size: usize,
+    halo: usize,
+) -> (f64, f64) {
+    assert_eq!(original.len(), reconstructed.len());
+    assert_eq!(original.len(), width * height * 3);
+
+    let mut mse_boundary = 0.0f64;
+    let mut n_boundary = 0usize;
+    let mut mse_interior = 0.0f64;
+    let mut n_interior = 0usize;
+
+    for y in 0..height {
+        let near_y_edge = (y % tile_size) < halo || (tile_size - y % tile_size) <= halo;
+        for x in 0..width {
+            let near_x_edge = (x % tile_size) < halo || (tile_size - x % tile_size) <= halo;
+            let is_boundary = near_x_edge || near_y_edge;
+            let pixel_idx = (y * width + x) * 3;
+            let mut sq_err = 0.0f64;
+            for c in 0..3 {
+                let diff = (original[pixel_idx + c] as f64) - (reconstructed[pixel_idx + c] as f64);
+                sq_err += diff * diff;
+            }
+            if is_boundary {
+                mse_boundary += sq_err;
+                n_boundary += 3;
+            } else {
+                mse_interior += sq_err;
+                n_interior += 3;
+            }
+        }
+    }
+
+    let peak = peak_val as f64;
+    let peak_sq = peak * peak;
+    let to_psnr = |mse: f64, n: usize| -> f64 {
+        if n == 0 { return f64::NAN; }
+        let m = mse / n as f64;
+        if m < 1e-10 { f64::INFINITY } else { 10.0 * (peak_sq / m).log10() }
+    };
+
+    (to_psnr(mse_boundary, n_boundary), to_psnr(mse_interior, n_interior))
+}
+
 /// Result of quality measurement
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct QualityMetrics {

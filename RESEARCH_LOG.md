@@ -4,6 +4,35 @@
 
 ---
 
+## 2026-03-10: #42 architecture diagnosis — ready for Builder
+
+### Researcher diagnosis (key findings)
+
+Current B-frame structure is flat: all B-frames reference the same I and P anchors. Coding order: P first (gives backward ref), then all Bs in display order using the same two anchors.
+
+Architecture requires these changes for hierarchical pyramid:
+
+| Component | Change |
+|---|---|
+| Coding order | P₈ → B₄ → B₂/B₆ → B₁/B₃/B₅/B₇ (outer-to-inner) |
+| GPU ref slots | 2 fixed → 4-slot pool (past anchor, inner-B, inner-B, future anchor) |
+| Local decode | B₄ must be locally decoded and uploaded as reference for B₂/B₆ |
+| Bitstream | Add fwd_ref_idx + bwd_ref_idx per B-frame (format bump GP14) |
+| decode_order() | Needs complete rewrite — currently assumes all Bs have same two anchors |
+| Decoder ref pool | Decoded intermediate Bs must be buffered for use as references |
+
+Biggest risk: reference frame index management silently using wrong frame → plausible but wrong predictions. Required diagnostic: print actual ref indices used per B-frame during encode.
+
+Crowd_run P-frame data: near_zero=11–17%, ratio vs I-frame=0.98–1.00. MC barely helps. Hierarchical B-frames expected to gain only −1–4% on crowd_run (closer temporal refs still can't capture chaotic crowd motion). Main win on bbb: −5–10%.
+
+### Sessions closed today without implementation (#43-#45)
+
+- **#43 Multi-ref P-frames**: Researcher confidence 2/5 gate passes. Pyramid ME (±96px) already covers search-range gap. Gate itself costs 2-3 days. Closed.
+- **#44 DC offset correction**: Crowd_run LL residuals from chaotic motion not systematic DC shift. PSNR-implied DC ≈ 3px → < 1% gain. Closed.
+- **#45 Adaptive GOP**: ki=2 crowd_run = 6.73 bpp > ki=8 6.45 bpp. Shorter GOP increases bpp. Closed.
+
+---
+
 ## 2026-03-10: #41 and #42 gate experiments — both closed/redesigned
 
 ### #41 Adaptive intra tiles — CLOSED

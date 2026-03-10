@@ -4,6 +4,75 @@
 
 ---
 
+## 2026-03-10: #40 4×4 sub-block ME — implementation FAILED; reverted
+
+### Validator Results: BLOCK
+
+Full implementation built, passed 168 tests, Critic issues resolved. Validator ran benchmark-sequence on 3 sequences (32 frames, I+P+B, q=75, 444):
+
+| Sequence | Baseline bpp | Measured bpp | Δ bpp | Baseline VMAF | Measured VMAF | Δ VMAF |
+|---|---|---|---|---|---|---|
+| bbb_1080p | 2.61 | 3.27 | **+25.3%** | 96.73 | 96.60 | −0.13 pts |
+| crowd_run | 6.21 | 7.19 | **+15.8%** | 99.13 | 99.73 | +0.60 pts |
+| park_joy | 4.94 | 6.23 | **+26.1%** | 99.14 | 99.73 | +0.59 pts |
+
+All three sequences: bpp +15–26% (threshold: 3%). VMAF is acceptable but irrelevant when bitrate explodes.
+
+### Root Cause Analysis
+
+The hypothesis "4×4 MVs reduce residual energy → lower bpp" is **falsified**. What happened:
+- 4×4 MVs quadruple MV entries (240×135 → 480×270 blocks for 1080p) = 129,600 MVs/frame
+- At ~4 bytes/MV stored flat (delta-coded i16), MV data alone = ~518 KB/frame
+- vs baseline 8×8 MVs = ~130 KB/frame → +388 KB MV overhead/frame
+- For bbb at 2.61 bpp = ~661 KB/frame total → MV overhead is ~59% of current frame size
+- Residual savings from finer MVs nowhere near cover this
+
+VMAF is neutral-to-improved (residuals ARE smaller), but codec is spending 50–60% more bandwidth on MV storage alone.
+
+The "always output 4×4 MVs — no RD split decision" design is architecturally wrong. H.264 tests 4×4 blocks per macroblock and only uses them if RD cost is lower. Without this gate, 4×4 ME is unconditionally harmful regardless of SAD ratios.
+
+The gate experiment (SAD ratio >2×) was the wrong gate — it measured that finer blocks have lower SAD, not that finer blocks are net-positive after accounting for MV overhead.
+
+### Lesson
+
+A correct 4×4 ME gate would be: `Σ(4×4 SAD savings) > bits_cost(4×4 MVs) - bits_cost(8×8 MVs)`. This requires knowing the entropy cost of the extra MVs, which means the RD decision needs to happen in the shader (not just in the codec design). Future #40b: per-8×8-block RD gate comparing sum(4×4 SADs) vs 8×8 SAD penalized by MV overhead. Estimated effort: +2 days on top of existing #40 implementation.
+
+**Decision: close #40. Move to #41 (adaptive intra tiles).**
+
+---
+
+## 2026-03-10: #35 DCT inter residuals — deferred; #40 4×4 ME gate experiment
+
+### RS Verdict on #35: DEFER
+
+Research Scientist evaluation concluded that the OBMC gate experiment (0% bpp change from MV smoothing, item #28) directly falsifies the "block-boundary energy dominates inter residuals" premise. VC-2 achieves H.264-class compression with wavelet inter residuals. Realistic gain estimate for #35: 2-5% on bbb, ~0% on crowd_run. The 10% success criterion is likely unachievable.
+
+Mandatory gate before reconsideration: measure P-frame residual subband energy on crowd_run. If detail subbands carry >40% of residual energy → reconsider.
+
+New items proposed by RS: #40 (4×4 ME, P1), #41 (adaptive intra tiles, P2), #42 (hierarchical B-frame GOP, P2).
+
+### #40 Gate Experiment: 16×16 vs 8×8 SAD ratio
+
+**Diagnostic added**: `GNC_ME_STATS=1` env var → `print_me_sad_stats()` in sequence.rs. Reads back `me_sad_buf` (16×16 SADs) and `split_sub_sad_buf` (sum of 4 8×8 SADs from block_match_split.wgsl), prints p50/p90 percentiles and ratio.
+
+**Gate condition**: median 16×16 SAD > 2× median 8×8 avg SAD → proceed.
+
+**Results (q=75, I+P+B, 30 frames):**
+
+| Sequence | 16×16 p50 | 8×8 avg p50 | Ratio | Gate |
+|---|---|---|---|---|
+| crowd_run | 1680 | 339 | **4.96×** | PROCEED |
+| bbb | 325 | 73 | **4.45×** | PROCEED |
+| park_joy | 895 | 188 | **4.76×** | PROCEED |
+
+**Gate threshold**: 2.0×. **Gate PASSED** with 2-2.5× margin on all sequences.
+
+**Interpretation**: The 4-5× ratio means a single 16×16 MV leaves residual energy ~5× higher than what 4 independent 8×8 MVs achieve. If 4×4 ME similarly improves over 8×8 (even by 2-3×), the residual wavelet coefficients would collapse toward the dead-zone, reducing bpp substantially.
+
+**Important caveat**: The residual energy improvement does not translate 1:1 to bpp. At q=75 with qstep≈20 and dead-zone≈15, even the current 8×8 SAD (p50=339/64px = 5.3/px) is already close to the dead-zone threshold. If 4×4 reduces it further below the dead-zone, quantized coefficients → 0 and bpp saving is real. If the 8×8 SAD is already within the dead-zone for most blocks, 4×4 would produce marginal additional savings. **The bpp measurement from the full implementation will answer this definitively.**
+
+---
+
 ## 2026-03-10: #24 Pyramid ME — implemented, always-on
 
 ### Hypothesis

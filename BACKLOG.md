@@ -6,24 +6,28 @@ Status: `todo` | `active` | `done` | `blocked`
 
 See [BASELINE.md](BASELINE.md) for current benchmark numbers.
 
-## Current Focus (updated 2026-03-09)
+## Current Focus (updated 2026-03-10)
 
 H.264 comparison (#22) established the north star: GNC needs **2–5× more bits** than H.264 at equal PSNR (BD-rate +171–216%, broadcast contribution, 4:2:2, I+P+B).
 
-**The gap is temporal prediction, not entropy.**
+**The gap is temporal prediction quality, not entropy or transform mismatch.**
 - P/B frames save only ~3% bpp vs all-I on high-motion content — H.264's MC is far more efficient
 - Rice+ZRL vs arithmetic coding is only ~0.1–0.2 bpp — not the bottleneck
-- Entropy-improvement items (#21, #7) are deprioritized; focus shifts to temporal prediction
+- #35 (DCT for inter residuals) deferred by RS: OBMC gate (0% bpp change from MV smoothing) falsifies the "block-boundary energy" premise; realistic gain 2-5%, not the 10% criterion
+- New focus: prediction quality improvements (#41 adaptive intra tiles, #42 hierarchical B-frames)
 
 **Priority order (updated 2026-03-10):**
 1–14: (see previous items, all done/closed)
-15. **#35 DCT for inter-frame residuals** (blocked P1) — gate experiment showed BlockDCT8 I-frame only; full new code path 6-10 days; deferred
-16. **#36 Deblocking filter** (closed P2) — artifact is 1-2px incoherent boundary mismatch; deblocking would blur; correct fix requires overlapping tiles (bitstream change)
-17. **#37 Per-8×8-block skip** (closed P2) — 0% blocks qualify on bbb; pan motion prevents block-level static detection
-18. **#38 Lagrange RD quantization** (closed P3) — gate: AQ adds +0.5-1.4% bits (not saves bits); exploitable gap <1.5%; not worth 5-7 days
-19. **#39 32×32 coarse-block fallback** (closed P3) — analytical: max 0.7% savings (30% of 2.3% MV overhead); rush_hour unavailable; closed
-20. **#24 Larger ME search range** (done 2026-03-10) — pyramid ME implemented: ±96px range, −3.4% bpp park_joy, −0.3% crowd_run, VMAF neutral
-21. **#25 Multi-reference P-frames** (DEFER)
+15. **#35 DCT for inter-frame residuals** (deferred — RS gate: run residual subband energy experiment first) — see #35 entry
+16. **#40 4×4 sub-block ME** (CLOSED — bpp +15–26%; MV overhead dominates; hypothesis falsified)
+17. **#41 Adaptive intra tiles in P/B frames** (todo P1) — intra fallback for poorly-predicted tiles
+18. **#42 Hierarchical B-frame GOP** (todo P2) — pyramid reference structure for tighter temporal distance
+19. **#36 Deblocking filter** (closed P2) — artifact is 1-2px incoherent boundary mismatch; deblocking would blur; correct fix requires overlapping tiles (bitstream change)
+20. **#37 Per-8×8-block skip** (closed P2) — 0% blocks qualify on bbb; pan motion prevents block-level static detection
+21. **#38 Lagrange RD quantization** (closed P3) — gate: AQ adds +0.5-1.4% bits (not saves bits); exploitable gap <1.5%; not worth 5-7 days
+22. **#39 32×32 coarse-block fallback** (closed P3) — analytical: max 0.7% savings (30% of 2.3% MV overhead); rush_hour unavailable; closed
+23. **#24 Larger ME search range** (done 2026-03-10) — pyramid ME implemented: ±96px range, −3.4% bpp park_joy, −0.3% crowd_run, VMAF neutral
+24. **#25 Multi-reference P-frames** (DEFER)
 
 ## Items
 
@@ -344,12 +348,13 @@ H.264 comparison (#22) established the north star: GNC needs **2–5× more bits
 - **Why closed:** The existing system (skip bitmap + delta coding with median spatial predictor) already captures temporal MV correlation efficiently. MVs for near-static blocks are already coded as 1-bit skip flags. Merge mode would save ~20% of the 2.3% MV overhead = ~0.2% bpp total. A bitstream format change (merge flag per block = minor version bump) is not justified for <0.2% bpp savings.
 
 ### 35. DCT transform for inter-frame residuals
-- **Status:** blocked (P1) — gate experiment failed; full new code path required; deferred
+- **Status:** deferred — RS verdict 2026-03-10: OBMC gate falsifies premise; realistic gain 2-5%, not 10% criterion; run residual energy gate before reconsidering
 - **Motivation:** The wavelet is the wrong transform for MC residuals. MC residuals have energy concentrated at 8×8 and 16×16 block boundaries (from the ME block structure). Wavelet spreads this boundary energy across ALL levels and subbands (worst case). DCT applied per-block localizes boundary discontinuities within individual blocks, allowing near-zero coding of adjacent blocks. Literature: H.264/HEVC/VVC all use DCT (integer transform) for inter residuals.
 - **Hypothesis:** Using DCT-16 on P/B-frame MC residuals (wavelet stays for I-frames) reduces inter-frame bpp ≥10% on bbb q=75, with VMAF neutral.
 - **Gate experiment result (2026-03-10):** Added `--dct` flag to `benchmark-sequence` to force `TransformType::BlockDCT8` for all frames. Result: PSNR = −6.44 dB, SSIM = 0.02 — catastrophically broken. Root cause: `BlockDCT8` is I-frame only; P-frame decoder path unconditionally assumes wavelet inverse transform. DCT reconstruction applied before MC add-back produces garbage.
-- **Conclusion:** Cannot gate-test cheaply. Requires full new inter-residual transform path: `residual_transform_type` field in CodecConfig, new P/B-frame encoder path (DCT residual), decoder reading per-frame flag and choosing IDCT vs IWAVELET. Bitstream format change (minor version bump). Complexity: 6-10 days. Deferred until #36/#37 done.
-- **Complexity:** 6-10 days (full implementation; no cheap gate available).
+- **RS verdict (2026-03-10):** DEFER. The OBMC gate experiment (0% bpp change from MV smoothing) directly contradicts the premise that block-boundary energy dominates inter residuals. VC-2 achieves H.264-class compression with wavelet inter residuals — the gap is prediction quality, not transform mismatch. Realistic gain estimate: 2-5% on bbb (smooth MV field), ~0% on crowd_run (chaotic residual). The 10% criterion is likely unachievable without block-boundary structure that the OBMC evidence suggests is absent.
+- **Mandatory gate before reconsideration:** Measure P-frame residual subband energy distribution on crowd_run (1 day). If detail subbands carry >40% of residual energy, the hypothesis gains renewed support. If LL dominates, close.
+- **Complexity:** 6-10 days (full implementation; bitstream format change required).
 ### 36. Deblocking filter at tile boundaries
 - **Status:** closed (2026-03-10) — gate: artifact is 1-2px boundary-extension quantization mismatch (narrow, incoherent); deblocking would blur valid pixels; correct fix = overlapping tiles (bitstream change)
 - **Motivation:** Tile-edge artifacts are documented as an architectural limitation. The 256×256 tile grid creates quantization discontinuities visible as blocking artifacts. These reduce VMAF even when PSNR is acceptable. A post-processing deblocking filter on the decoded output (not in the codec path) would smooth these boundaries. No bitstream change. This improves the VMAF axis without changing bpp.
@@ -385,3 +390,26 @@ H.264 comparison (#22) established the north star: GNC needs **2–5× more bits
 - **Note:** Given MV overhead is only 2.3% of total bpp, savings ceiling is ~2%. Implementation complexity must be proportional. If gate confirms >30% uniform tiles, this is a 1-day addition to the ME pipeline.
 - **Success criteria:** bpp −2% on rush_hour q=75; VMAF neutral.
 - **Complexity:** 1-2 days (after gate confirms).
+
+### 40. 4×4 sub-block ME for high-energy tiles
+- **Status:** CLOSED (2026-03-10) — hypothesis falsified; reverted
+- **Gate result (2026-03-10):** SAD ratio 16×16 vs 8×8: 4.45–4.96× (all PROCEED). Gate was wrong premise — low SAD ratio ≠ low MV overhead.
+- **Validation result (2026-03-10):** bpp +15–26% on all 3 sequences (bbb +25%, crowd_run +16%, park_joy +26%). VMAF neutral (bbb −0.13 pts) or improved (+0.59/+0.60 pts). Clearly BLOCK.
+- **Root cause:** 4×4 MVs quadruple MV entries (32,400 → 129,600 per frame). At ~4 bytes/MV, that's ~390 KB extra MV data per 1080p frame — 50–60% of current compressed frame size. Residual savings from finer MVs are far smaller. Design flaw: "always output 4×4 MVs" without RD gate is unconditionally harmful.
+- **Lesson:** Smaller blocks require per-block RD split decision (compare saved residual vs MV cost) to be net positive. H.264 does this per macroblock. Without this gate, 4×4 ME always increases total bits. A future #40b could add an RD gate, but estimated effort is high (need 8×8 SAD fed into 4×4 shader) and #41/#42 are better priority.
+
+### 41. Adaptive intra tiles in P/B frames
+- **Status:** todo (P2)
+- **Motivation:** GNC forces all tiles in a P-frame to be inter-coded. Some tiles in every P-frame have poor MC match (large SAD even after ME). For those tiles, intra coding (spatial wavelet without MC residual) would use fewer bits than a large inter-frame residual. H.264 always tests intra coding for every macroblock in a P-frame and picks the cheaper option.
+- **Hypothesis:** For each P-frame tile, if estimated intra cost < estimated inter cost (using LL subband variance as proxy for intra complexity vs current MC residual SAD as proxy for inter cost), encode as intra tile. Expected: bpp −5% on crowd_run q=75 where many tiles have poor MC match.
+- **Gate:** For each P-frame tile, compute ratio: (LL subband variance of current tile) / (zero-MV SAD). If >10% of P-frame tiles have this ratio < 1.0 (intra would be cheaper), proceed. This is a 0.5-day measurement using existing diagnostics, no shader changes.
+- **Success criteria:** bpp −5% on crowd_run q=75; VMAF neutral ±0.3 pts; no regression on bbb. Bitstream: mode bit per tile (intra/inter) required — minor version bump.
+- **Complexity:** 3-5 days. Per-tile mode bit in bitstream header. Encoder: decision per tile, use existing I-frame path for intra tiles. Decoder: read mode bit, branch to intra or inter reconstruction.
+
+### 42. Hierarchical B-frame GOP (pyramid reference structure)
+- **Status:** todo (P2)
+- **Motivation:** GNC uses flat B-frame referencing (all B-frames reference the same I and P anchors at distance ki/2 = 4 frames). A 2-level pyramid (e.g., I B4 B2 B3 B4 P B4 B6 B7 P) lets middle B-frames reference closer temporal neighbors (e.g., B2 references I and B4, not I and P), dramatically reducing residual energy for those frames. This is how H.264/H.265 achieve high efficiency on medium-motion content.
+- **Hypothesis:** A 2-level hierarchical GOP (ki=8, B-frames reference frames at distance ≤4 instead of ≤8) reduces bpp −8% on bbb q=75; VMAF neutral. The closer temporal references reduce B-frame residual energy proportionally to the temporal distance reduction.
+- **Gate:** Compare current GOP (ki=8, flat B-refs at distance ≤8) vs a 3-frame GOP (I B P) where B references I and P at distance ≤2. If 3-frame GOP has lower bpp than current 8-frame GOP normalized for GOP size, hierarchical referencing is worth implementing for longer GOPs.
+- **Success criteria:** bpp −8% on bbb q=75 (VMAF neutral ±0.3 pts); bpp neutral or better on crowd_run; latency increase ≤3 frames; no test regression.
+- **Complexity:** 4-6 days. Encoder: rearrange coding order vs display order (already partially handled). Decoder: maintain ≥2 decoded reference frames (partially done for B-frames). Bitstream: reference frame index per B-frame (currently implicit — both refs are I/P anchors; needs explicit per-frame ref indices).

@@ -20,9 +20,9 @@ H.264 comparison (#22) established the north star: GNC needs **2–5× more bits
 15. **#35 DCT for inter-frame residuals** (blocked P1) — gate experiment showed BlockDCT8 I-frame only; full new code path 6-10 days; deferred
 16. **#36 Deblocking filter** (closed P2) — artifact is 1-2px incoherent boundary mismatch; deblocking would blur; correct fix requires overlapping tiles (bitstream change)
 17. **#37 Per-8×8-block skip** (closed P2) — 0% blocks qualify on bbb; pan motion prevents block-level static detection
-18. **#38 Lagrange RD quantization** (todo P3) — blocked on no-AQ gate; **NEXT**
-19. **#39 32×32 coarse-block fallback** (todo P3) — blocked on MV variance gate; savings capped at 2.3%
-20. **#24 Larger ME search range** (DEFER)
+18. **#38 Lagrange RD quantization** (closed P3) — gate: AQ adds +0.5-1.4% bits (not saves bits); exploitable gap <1.5%; not worth 5-7 days
+19. **#39 32×32 coarse-block fallback** (closed P3) — analytical: max 0.7% savings (30% of 2.3% MV overhead); rush_hour unavailable; closed
+20. **#24 Larger ME search range** (todo P1) — REOPENED: 40% of crowd_run blocks have |MV|>17px, max=167px; ±32px range misses them; pyramid ME covers ±96px at 2× compute cost; **ACTIVE**
 21. **#25 Multi-reference P-frames** (DEFER)
 
 ## Items
@@ -241,12 +241,20 @@ H.264 comparison (#22) established the north star: GNC needs **2–5× more bits
 - **Next step if more savings needed:** (a) More aggressive threshold calibration; (b) B-frame zero-MV skip; (c) Merge mode: use non-zero co-located MV (better prediction for slow-motion tiles). See #24 (larger search range) for high-motion gains instead.
 
 ### 24. Larger ME search range
-- **Status:** investigated (2026-03-09) — precondition likely false; deprioritized
+- **Status:** todo (P1) — REOPENED 2026-03-10; MV histogram proves search range is the bottleneck
 - **Motivation:** Current block_match.wgsl uses a fixed hierarchical search range. On fast-motion content (crowd_run, park_joy), many blocks may have the true motion vector outside the current search window, forcing a large residual. H.264's full-pel search typically covers ±64–128 pixels with hierarchical refinement.
 - **Hypothesis:** Doubling the coarse search range reduces average residual energy on high-motion sequences by 5–10%, at the cost of ~2× ME compute time.
 - **Success criteria:** bpp −3% on crowd_run q=75; VMAF neutral; fps ≥17 (acceptable regression since quality gain is the goal).
 - **Research Scientist verdict (2026-03-09):** MODIFY. P-frame already uses ±32 px; at 30fps this covers 960 px/sec — faster than broadcast content. The precondition (range-limited MVs) is likely false. Increasing range would quadruple coarse candidates (O(range²)) and push ME from 22ms to 80-100ms for likely zero bpp gain. Deprioritized in favor of #25. If revived, check MV histogram first — need >10% blocks with |MV| >28 px as gate.
 - **Note:** If any range issue exists, it is more likely in B-frames (±16 px) than P-frames (±32 px).
+- **2026-03-10 UPDATE — REOPENED:** crowd_run MV histogram shows 12-40% of P-frame blocks have |MV| > 17px, max_abs = 155-169px. ME_SEARCH_RANGE=32 cannot find these. P-frames cost 90-100% of I-frame on crowd_run. RS prior verdict was wrong (assumed 30fps, actual crowd_run MV is far larger than estimated).
+- **Revised implementation — pyramid ME:**
+  1. New `downsample_4x.wgsl` shader: 4× average downscale of current and reference Y-plane
+  2. Run block_match at 4× resolution with ±24px range → covers ±96px at full resolution
+  3. Scale pyramid MVs ×4 and use as initial predictor for full-res block_match (FINE_RANGE=4)
+  4. Net range: ±96px at full resolution. Net compute: ~2× current ME (vs 9× for naive range increase)
+- **Updated success criteria:** P-frame bpp −20% on crowd_run q=75; VMAF neutral; enc fps ≥15.
+- **Complexity:** 2-3 days (pyramid downscale shader + pipeline integration).
 
 ### 25. Multi-reference P-frames
 - **Status:** todo (P2)
@@ -361,7 +369,7 @@ H.264 comparison (#22) established the north star: GNC needs **2–5× more bits
 - **Complexity:** 2-3 days (after gate confirms).
 
 ### 38. Per-tile Lagrange RD quantization
-- **Status:** todo (P3, quality)
+- **Status:** closed (2026-03-10) — gate: AQ uses +0.5–1.4% MORE bits than no-AQ (not saving bits); Lagrange exploitable gap <1.5% bpp; 5-7 day impl not justified
 - **Motivation:** AQ adapts quantization based on LL subband variance (texture heuristic). Lagrange-optimal allocation minimizes total distortion given a fixed bit budget by allocating bits to tiles with the highest marginal benefit. These are different optimization objectives. JPEG 2000 achieves 10-15% bpp reduction over fixed quantization via Lagrange allocation (Taubman & Marcellin, Ch. 8). GNC's AQ captures part of this but is not globally optimal.
 - **Gate (1 day):** Run benchmark-sequence with `--no-aq` flag vs AQ baseline. If AQ gain over no-AQ is <2% bpp (AQ already near-optimal), close this item. If AQ gain is >5%, Lagrange has headroom.
 - **Hypothesis:** Per-tile Lagrange-optimal quantizer reduces bpp ≥5% at equal VMAF on bbb q=75. The gap between AQ and Lagrange optimal captures real savings.
@@ -370,7 +378,7 @@ H.264 comparison (#22) established the north star: GNC needs **2–5× more bits
 - **Complexity:** 5-7 days (includes R-D curve estimation, bisection λ search, integration with VBR rate control).
 
 ### 39. 32×32 coarse-block fallback for uniform-motion tiles
-- **Status:** todo (P3, quality)
+- **Status:** closed (2026-03-10) — analytical: max savings 2.3% (MV overhead cap); rush_hour unavailable; 30% of 2.3% = 0.7% savings ceiling; not worth 1-2 day impl
 - **Motivation:** Current ME always runs 16×16 coarse → 8×8 split refinement. For tiles with uniform motion (all 16×16 blocks have similar MVs), the 8×8 split adds MV overhead with negligible residual benefit. A "coarse-only" mode for uniform-motion tiles would skip the split dispatch and use only the 16×16 MVs.
 - **Gate:** Measure per-tile MV variance on rush_hour P-frames. Gate: proceed only if >30% of P-frame tiles have all-identical split MVs (zero intra-tile MV variance). MV overhead established at 2.3% of bpp total — this caps maximum savings at 2.3%.
 - **Hypothesis:** Skipping 8×8 split for uniform-motion tiles reduces P-frame bpp ≥2% on rush_hour q=75 (predominantly uniform panning motion).

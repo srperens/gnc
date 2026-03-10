@@ -2116,3 +2116,56 @@ See detailed entry in section "2026-03-10: #36 Deblocking filter" above.
 
 **Lesson:** Block-level skip benefits "heterogeneous motion" content — tiles with one moving object and static background. bbb (animated film, uniform pan) and crowd_run (uniformly high motion) don't have this. Content like rush_hour (slow pan with occasional cars) or touchdown (fast-motion crowd + static grass) might benefit.
 
+
+---
+
+## 2026-03-10: #38 Lagrange RD quantization gate — closed
+
+### Gate experiment
+AQ vs no-AQ on bbb_1080p at q=25, q=50, q=75 (rd-curve command).
+
+| q | AQ bpp | no-AQ bpp | Δbpp | AQ VMAF | no-AQ VMAF | ΔVMAF |
+|---|--------|-----------|------|---------|-----------|-------|
+| 25 | 1.5028 | 1.4822 | +1.4% | 85.10 | 84.73 | +0.37 |
+| 50 | 2.2169 | 2.2056 | +0.5% | 89.68 | 89.58 | +0.10 |
+| 75 | 3.8319 | 3.8135 | +0.5% | 95.05 | 94.92 | +0.13 |
+
+**Finding:** AQ uses SLIGHTLY MORE bits (+0.5-1.4%) for marginally better VMAF (+0.1-0.37 pts). Not saving bits — spending bits for quality.
+
+### Gate verdict: CLOSED
+Gate criterion: "AQ gain over no-AQ <2% bpp → close." Measured AQ gain: **negative** (AQ uses more bits, not fewer). The difference between AQ and no-AQ is tiny (<1.5% bpp both ways). Lagrange optimization would find an allocation closer to optimal, but the exploitable gap is <1.5% bpp — far below the 5-7 day implementation cost. Gate fails; item closed.
+
+**Note:** AQ is correctly doing quality-aware bit allocation (textured tiles get more bits → better VMAF). But the improvement in VMAF-per-bit ratio is marginal. Lagrange on top of AQ would save ≤1% bpp.
+
+
+---
+
+## 2026-03-10: #38 and #39 gate closures + crowd_run MV analysis
+
+### #38 closed (AQ contribution negligible)
+See full entry above.
+
+### #39 closed (analytical: 0.7% savings ceiling, rush_hour unavailable)
+
+### crowd_run ME bottleneck analysis (opens #24)
+
+**Context:** crowd_run P-frames are 90-100% of I-frame size at q=75. Diagnostics show:
+- P-frame 3: mean_abs residual = 8.39, near_zero = 15%, size = 1.86MB (98% of I-frame)
+- P-frame 6: mean_abs residual = 12.48, near_zero = 13%, size = 1.92MB (101%)
+- P-frame 7: mean_abs residual = 7.14, near_zero = 16%, size = 1.72MB (91%)
+
+**MV histogram analysis (crowd_run P-frames):**
+| Frame | MV zero | mean_abs | max_abs | [17+] |
+|-------|---------|----------|---------|-------|
+| P3 | 2% | 28.6 px | 155 px | 40% |
+| P6 | 12% | 21.7 px | 167 px | 31% |
+| P7 | 9% | 9.7 px | 169 px | 12% |
+
+**Finding:** 12-40% of blocks have |MV| > 17px, and max_abs = 155-169px. ME_SEARCH_RANGE=32 can find MVs up to ±32px but not ±155px. These large-MV blocks get stuck at their nearest valid match within ±32px, causing residual = current - MC(32px_match) which is much larger than the true residual at ±100+px.
+
+**Root cause of crowd_run P-frame failure:** search range is the bottleneck, not the transform choice (#35) or block size.
+
+**RS prior verdict was wrong:** "covers 960px/sec" assumed 30fps. crowd_run is 25fps. More importantly, the ACTUAL max MV is 155-169px (much larger than the ~38px estimated from runner speed). The camera may also pan.
+
+**Action:** Reopen #24 with pyramid ME approach. See updated backlog.
+

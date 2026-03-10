@@ -14,14 +14,17 @@ H.264 comparison (#22) established the north star: GNC needs **2–5× more bits
 - P/B frames save only ~3% bpp vs all-I on high-motion content — H.264's MC is far more efficient
 - Rice+ZRL vs arithmetic coding is only ~0.1–0.2 bpp — not the bottleneck
 - #35 (DCT for inter residuals) deferred by RS: OBMC gate (0% bpp change from MV smoothing) falsifies the "block-boundary energy" premise; realistic gain 2-5%, not the 10% criterion
-- New focus: #42 hierarchical B-frames (RS hypothesis needed before implementation)
+- New focus: #43 multi-reference P-frames (gate first), then #42 hierarchical B-frames
 
 **Priority order (updated 2026-03-10):**
 1–14: (see previous items, all done/closed)
 15. **#35 DCT for inter-frame residuals** (deferred — RS gate: run residual subband energy experiment first) — see #35 entry
 16. **#40 4×4 sub-block ME** (CLOSED — bpp +15–26%; MV overhead dominates; hypothesis falsified)
 17. **#41 Adaptive intra tiles in P/B frames** (CLOSED — gate nominally passes but gain < 1% at q=75; LL-dominant residuals = camera motion, not tile misprediction; not worth bitstream format change)
-18. **#42 Hierarchical B-frame GOP** (todo P1) — pyramid reference structure; cannot gate via ki=N (invalid proxy); needs RS hypothesis + full implementation
+18. **#44 DC subband offset correction** (CLOSED — physics analysis: crowd_run LL residual from chaotic motion not DC shift; PSNR-implied DC shift ≈3 pixels → < 1% bpp gain)
+19. **#45 Adaptive GOP** (CLOSED — ki=2 crowd_run = 6.73 bpp > ki=8 6.45 bpp; shorter GOP increases bpp; MC futility detector cannot help)
+20. **#43 Multi-reference P-frames** (todo P1) — gate first: measure fraction of tiles preferring ref[N−2]
+21. **#42 Hierarchical B-frame GOP** (todo P1) — RS hypothesis approved; bbb −5–10%; implement after #43
 19. **#36 Deblocking filter** (closed P2) — artifact is 1-2px incoherent boundary mismatch; deblocking would blur; correct fix requires overlapping tiles (bitstream change)
 20. **#37 Per-8×8-block skip** (closed P2) — 0% blocks qualify on bbb; pan motion prevents block-level static detection
 21. **#38 Lagrange RD quantization** (closed P3) — gate: AQ adds +0.5-1.4% bits (not saves bits); exploitable gap <1.5%; not worth 5-7 days
@@ -412,3 +415,40 @@ H.264 comparison (#22) established the north star: GNC needs **2–5× more bits
 - **Hypothesis (draft, needs RS approval):** Within ki=8 GOP, encode layer-1 B (frame 4) first, then layer-2 B (frames 2,6) referencing I+layer-1 and layer-1+P respectively, then layer-3 (frames 1,3,5,7). Temporal distance for layer-3 = 1 frame; layer-2 = 2 frames; layer-1 = 4 frames. Expected bpp −8% on bbb, −4% on crowd_run; VMAF neutral.
 - **Success criteria (draft):** bpp −5% on bbb q=75; VMAF neutral ±0.3 pts; no regression on crowd_run or park_joy.
 - **Complexity:** 4-6 days. Encoding order ≠ display order (layers encoded outer-to-inner). Decoder must buffer decoded frames at each layer as reference. Bitstream: per-B-frame reference indices (currently implicit, both = I/P anchors). Minor version bump required.
+- **RS Hypothesis (approved 2026-03-10):**
+  - Coding order: I₀ P₈ B₄ B₂ B₆ B₁ B₃ B₅ B₇ (outer-to-inner)
+  - Layer 1: B₄ refs I₀, P₈ (distance 4)
+  - Layer 2: B₂ refs I₀+B₄; B₆ refs B₄+P₈ (distance 2)
+  - Layer 3: B₁B₃B₅B₇ refs adjacent layer-2 frames (distance 1)
+  - Expected: bbb −5–10%, crowd_run −1–4% (chaotic motion limits gain)
+  - Fail criterion: bbb < 2% → flat structure still active; crowd_run = 0% expected (OK)
+  - Diagnostic required: print actual ref indices used per B-frame
+  - Risk: reference frame index mgmt silently using wrong frame
+
+### 43. Multi-reference P-frames (2 references per tile)
+- **Status:** todo (P1) — recommended by RS as highest leverage for crowd_run
+- **Motivation:** crowd_run fails MC because occlusion makes ref[N−1] wrong for many blocks. A tile at (x,y) in frame N may not exist in N−1 (occluded) but exists in N−2. H.264 allows up to 16 reference frames per macroblock. GNC currently supports only 1 reference per P-frame. Adding ref[N−2] as a second candidate and picking the lower SAD could address occlusion.
+- **Hypothesis:** Allowing each P-tile to choose from ref[N−1] or ref[N−2] (dual-reference) reduces bpp on crowd_run ≥5% at q=75, VMAF ≥ −0.3 pts. bbb gain ≈2–4%.
+- **Success criteria:** crowd_run bpp ≤ 6.10 (≥5% reduction from 6.45); VMAF ≥ 98.6; bbb bpp ≤ 2.56.
+- **Fail criterion:** crowd_run bpp change < 2% → dual reference not being used or occlusion not the bottleneck.
+- **Gate (before full implementation):** Add diagnostic: for each P-tile ME, compute SAD against both ref[N−1] and ref[N−2]. Print fraction of tiles where ref[N−2] wins. If < 5% of tiles prefer ref[N−2], close.
+- **Implementation:** Block match runs twice (against both refs), picks lower SAD. Store 1-bit ref_idx per tile. Decoder maintains 2-frame reference buffer (already partially true with B-frames). Minor bitstream format flag.
+- **Complexity:** 3-4 days.
+
+### 44. DC subband offset correction per P-frame
+- **Status:** CLOSED (2026-03-10) — physics analysis rules out meaningful DC shift
+- **Motivation:** LL mean_abs_diff=40.69 on crowd_run P-frames may indicate a systematic DC offset (global luminance drift, AGC, or scene luminance change). If so, subtracting the mean LL difference between current and reference frame before coding would reduce LL residual at near-zero bitstream cost (1 scalar per frame).
+- **Hypothesis:** crowd_run LL residual has non-zero signed mean (> ±5) per P-frame. Correcting it reduces bpp ≥3%.
+- **Gate (mandatory before implementation):** Print per-P-frame mean of signed LL residual coefficients. If mean is < 3 (symmetric around zero), close immediately — the energy is from random motion, not DC shift. This is a one-line diagnostic addition to `--diagnostics`.
+- **Success criteria:** crowd_run bpp ≤ 6.26 (≥3% reduction); LL residual mean drops to < 2 after correction.
+- **Fail criterion:** LL signed mean < 3 per frame → close without implementation.
+- **Complexity:** < 1 day if gate passes. One scalar per P-frame added to bitstream header.
+
+### 45. Adaptive GOP length (MC-futility detector)
+- **Status:** CLOSED (2026-03-10) — gate failed; ki=2 crowd_run = 6.73 bpp > ki=8 6.45 bpp
+- **Motivation:** crowd_run P/B frames cost 98–100% of I-frame cost. The GOP structure forces encoding B/P frames that provide no compression benefit. If an adaptive mode detected "MC futility" (post-ME SAD ≈ I-frame cost) and switched to short GOP or all-I for those segments, we'd eliminate the MV overhead + residual overhead for near-useless inter frames.
+- **Hypothesis:** crowd_run with adaptive ki (short GOP when MC SADs are high) reduces bpp ≥7% on crowd_run while maintaining VMAF.
+- **Gate (mandatory first):** Run crowd_run with ki=2 manually. If bpp at ki=2 > 6.45 (ki=8 current), I-frame overhead dominates and adaptive GOP can only make things worse → veto. If ki=2 < 6.45, proceed.
+- **Success criteria:** crowd_run bpp ≤ 6.00 (≥7% reduction); VMAF ≥ 98.8.
+- **Complexity:** 2-3 days. Reuse scene-cut detector logic; threshold on post-ME SAD ratio.
+

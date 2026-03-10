@@ -15,16 +15,21 @@ H.264 comparison (#22) established the north star: GNC needs **2–5× more bits
 - Rice+ZRL vs arithmetic coding is only ~0.1–0.2 bpp — not the bottleneck
 - Entropy-improvement items (#21, #7) are deprioritized; focus shifts to temporal prediction
 
-**Priority order (updated 2026-03-09 — Research Scientist full literature review, see RESEARCH_LOG.md):**
+**Priority order (updated 2026-03-10 — Research Scientist second review, see RESEARCH_LOG.md):**
 1. **#26 B-frame zero-MV skip** (DONE) — −3.6% bpp bbb B-frames, VMAF neutral
 2. **#27 TDC** (CLOSED — redundant with MC; ~0% gain, reverted)
-3. **#28 OBMC** (CLOSED) — Gate experiment (3×3 MV median smoothing) showed 0% bpp change on bbb; MV field already smooth → median = original. The 3% vs all-I gap reflects MC algorithm limits, not MV discontinuities. OBMC is disproportionate implementation effort for uncertain gain.
-4. **#29 Fused wavelet kernel** (CLOSED) — pre-condition false: levels already in single command encoder; barriers are µs not ms
-5. **#17 Scene cut detection** (P3) — robustness, ~50 lines, no bitstream change
-6. **#24 Larger ME search range** (DEFER — check MV histogram first; P-frame range may already cover content)
-7. **#25 Multi-reference P-frames** (DEFER — gate on MV histogram >15% non-adjacent refs)
-8. **#21 Parent-child Rice k** (CLOSED — proven negative)
-9. **#7 LL subband prediction** (CLOSED — wrong problem)
+3. **#28 OBMC** (CLOSED) — gate experiment showed 0% bpp change; MV field smooth → median = original
+4. **#29 Fused wavelet kernel** (CLOSED) — pre-condition false; barriers are µs not ms
+5. **#17 Scene cut detection** (DONE) — shipped 776df85
+6. **#30 GPU timestamp profiling** (todo P1) — identify actual I-frame bottleneck; unblocks #33
+7. **#31 Adaptive dead-zone per subband** (todo P1) — −5–8% bpp, histogram gate first
+8. **#32 Independent 8×8 coarse ME** (todo P2) — −8–15% bpp crowd_run, boundary gate first
+9. **#33 Fused quantize+Rice** (todo P2, blocked on #30) — I-frame speed
+10. **#34 Merge mode: co-located MV** (todo P3) — −2–5% slow content, MV bpp gate first
+11. **#24 Larger ME search range** (DEFER — precondition false)
+12. **#25 Multi-reference P-frames** (DEFER — gate on MV histogram)
+13. **#21 Parent-child Rice k** (CLOSED — proven negative)
+14. **#7 LL subband prediction** (CLOSED — wrong problem)
 
 ## Items
 
@@ -290,3 +295,48 @@ H.264 comparison (#22) established the north star: GNC needs **2–5× more bits
 - **Conclusion:** Closed. The hypothesized 25–40% speedup assumed CPU-side blocking polls — those don't exist. Real bottleneck is elsewhere (entropy, quantize, or CPU overhead). If speed improvement is needed, profile with GPU timestamp queries to identify the actual bottleneck.
 - **GPU fit:** Good. CDF 9/7 has a 9-tap filter; at 256×256 tile with 4-level decomposition, shared memory usage per workgroup is within 32KB M1 limit.
 - **Success criteria:** I-frame encode time <180ms at 1080p q=75 (from ~250ms); VMAF identical; all tests pass. Bitstream: no change.
+
+### 30. GPU timestamp profiling — identify I-frame bottleneck
+- **Status:** todo (P1, speed prerequisite)
+- **Motivation:** I-frame encode is claimed to be ~250 ms but we have never broken this down per-stage at GPU level. "Wavelet=64ms" is estimated, not measured. Without GPU timestamps we cannot correctly prioritize speed work (#33 fused quantize+Rice depends on this, and #32 ME depends on knowing ME budget).
+- **Hypothesis:** A per-stage GPU timestamp breakdown (wavelet, quantize, Rice encode, Rice staging) will reveal that one stage accounts for >40% of total I-frame time and is the true bottleneck.
+- **Implementation:** wgpu `TIMESTAMP_QUERY` feature. `write_timestamp` before/after each major dispatch group in `pipeline.rs`. Read back via `resolve_query_set`. Fallback: CPU Instant::now() with explicit `device.poll(Maintain::Wait)` per stage group.
+- **Success criteria:** Per-stage GPU breakdown for one I-frame at 1080p q=75; stages sum to within 10% of measured 250 ms wall time. Output as `--diagnostics` text.
+- **Complexity:** 0.5 days.
+- **Gates:** #33 (fused quantize+Rice) proceeds only if quantize+Rice > 30 ms; #32 (8×8 ME) proceeds only if ME is < 15 ms (room to expand).
+
+### 31. Adaptive dead-zone quantization per subband
+- **Status:** todo (P1, quality)
+- **Motivation:** Current quantizer uses a fixed dead-zone width per frame. JPEG 2000 literature (Taubman & Marcellin 2002) shows per-subband dead-zone optimization reduces rate 5–10% at equal distortion. HH subbands at fine levels carry mostly noise at medium-high Q and benefit from wider dead-zones; LL and LH/HL need narrower dead-zones.
+- **Hypothesis:** Per-subband dead-zone widths (8 subbands = 8 values) reduce bpp 5–8% on bbb q=75 with VMAF change < −0.3 pts.
+- **Pre-experiment gate:** Measure coefficient magnitude histograms per subband at q=75 via `--diagnostics`. Gate: proceed only if HH level-0 has <60% near-zero coefficients (magnitude ≤ 0.5 × qstep). If already >80% near-zero, dead-zone is already effective.
+- **Implementation:** Add `dz0..dz3` packed array to quantize.wgsl alongside existing `weights0..3`. Same subband indexing. Sweep dead-zone values per subband offline at q=75, select optimal. No bitstream change (dead-zone is encoder-only parameter).
+- **Success criteria:** bpp −5% on bbb q=75; VMAF change < −0.3 pts; reproducible on crowd_run and rush_hour. PSNR regression acceptable up to −0.5 dB.
+- **Complexity:** 2 days (gate check + parameter sweep + implementation).
+
+### 32. Independent 8×8 coarse ME for block-boundary regions
+- **Status:** todo (P2, quality)
+- **Motivation:** The current split shader (`block_match_split.wgsl`) refines 8×8 blocks using the 16×16 coarse MV as predictor with ±2 px refinement. Blocks at motion boundaries (person vs background, e.g. crowd_run) may have the correct 8×8 MV >2 px away from the 16×16 predictor. Independent 8×8 coarse search would find the correct MV for each half of a split block.
+- **Hypothesis:** Independent 8×8 coarse search (±8 px range) reduces bpp 8–15% on crowd_run q=75 with VMAF neutral (±0.3 pts). bbb should be neutral (animated, smooth motion).
+- **Pre-experiment gate:** Diagnostic: log per-block SAD and flag blocks where 8×8 split MV differs from 16×16 MV by >4 px. Gate: proceed only if >10% of blocks on crowd_run qualify.
+- **Implementation:** New shader `block_match_8x8.wgsl`: 8×8 blocks with independent ±8–16 px coarse search. RD cost comparison (SAD + MV bits) to choose 16×16 vs split mode. No bitstream change (8×8 MV buffer already exists). ME compute ~doubles but baseline is 22 ms/frame → worst-case 44 ms.
+- **Success criteria:** bpp −8% on crowd_run q=75; VMAF neutral; bbb bpp change < +1%.
+- **Complexity:** 3–4 days.
+
+### 33. Fused quantize + Rice encode shader (I-frame speed)
+- **Status:** todo (P2, speed — BLOCKED on #30)
+- **Motivation:** I-frame pipeline runs wavelet → quantize.wgsl → rice_encode.wgsl as separate dispatches, each reading/writing the 8 MB coefficient buffer from global memory. Fusing would eliminate one 8 MB global memory round-trip per plane.
+- **Pre-condition:** #30 must show quantize+Rice together are >30 ms of I-frame time. If <30 ms, close this item.
+- **Hypothesis:** Fused quantize+Rice shader reduces I-frame encode time by 15% (≥35 ms) on bbb_1080p q=75.
+- **Implementation:** Restructure Rice encode to quantize inside the Rice workgroup's per-coefficient loop. Quantize step moves from global memory → shared memory → Rice output without global memory round-trip. Rice workgroup already processes one tile (256×256/256=256 coefficients per thread group). Shared memory: current 2 KB + 256 f32 quantize buffer = 3 KB, well within 32 KB.
+- **Success criteria:** I-frame encode time ≤200 ms at 1080p q=75 (from ~250 ms); VMAF identical; all tests pass.
+- **Complexity:** 2–3 days (after #30 gate).
+
+### 34. Merge mode: co-located MV inheritance for slow-pan content
+- **Status:** todo (P3, quality)
+- **Motivation:** GNC codes all MVs as absolute values with no temporal MV prediction. On slow-pan content (rush_hour, bbb), most 8×8 block MVs are nearly identical to the previous frame's co-located MV. H.264 merge mode lets a block inherit a neighbor's MV at zero bits.
+- **Pre-experiment gate:** Add diagnostic that separately accounts for MV bits vs coefficient bits. Gate: proceed only if MV bits >5% of total bpp on rush_hour.
+- **Hypothesis:** Co-located MV predictor (inherit if current best MV within ±1 px of previous frame's co-located MV) reduces bpp 2–5% on slow-pan content (rush_hour, bbb) with VMAF neutral.
+- **Implementation:** Store previous frame's MV buffer alongside reference frame buffer. At Rice encode time in `rice.rs`, compare current MV to stored co-located MV; emit merge flag + zero-delta if within threshold. Bitstream change: one bit per block per frame (merge flag). Minor version bump required.
+- **Success criteria:** bpp −2% on rush_hour q=75; bpp −3% on bbb q=75; VMAF neutral.
+- **Complexity:** 1–2 days (after gate check).

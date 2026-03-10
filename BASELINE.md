@@ -1,7 +1,7 @@
 # GNC Benchmark Baseline
 
-Last updated: 2026-03-09
-Baseline commit: 114a2f9 (quarter-pel ME, after B-frame 4:2:0 chroma fix)
+Last updated: 2026-03-10
+Baseline commit: (pyramid ME — #24 done)
 Mode: Spatial-only, I+P+B, Rice entropy
 
 ## Single-Frame (bbb_1080p, Rice, 4:4:4)
@@ -13,12 +13,12 @@ Mode: Spatial-only, I+P+B, Rice entropy
 | 75  | 42.17 dB | 3.83 | 35.3 fps | 52.0 fps | 95.05 |
 | 90  | 51.0 dB  | 9.65 | 39 fps   | 55 fps   | —     |
 
-## Sequence Benchmarks (I+P+B, q=75, ki=8, 50 frames)
+## Sequence Benchmarks (I+P+B, q=75, ki=8, 10 frames)
 
-| sequence   | bpp  | PSNR avg | PSNR min | fps_enc | fps_dec |
-|------------|------|----------|----------|---------|---------|
-| crowd_run  | 6.93 | 38.80 dB | 38.34 dB | —       | —       |
-| rush_hour  | 2.03 | 41.12 dB | 40.75 dB | —       | —       |
+| sequence   | bpp  | PSNR avg | VMAF  | notes                          |
+|------------|------|----------|-------|--------------------------------|
+| crowd_run  | 6.15 | 38.57 dB | 99.13 | pyramid ME (pre: 6.17)         |
+| park_joy   | 4.77 | 40.85 dB | 99.14 | pyramid ME (pre: 4.94, −3.4%)  |
 
 ## Regression Rules
 

@@ -4,6 +4,39 @@
 
 ---
 
+## 2026-03-10: #24 Pyramid ME — implemented, always-on
+
+### Hypothesis
+Current ME_SEARCH_RANGE=32px misses large motions. crowd_run MV histogram shows 40% of blocks with |MV|>17px, max 167px. A 4× pyramid ME covers ±96px full-res at much lower compute cost than naive range expansion.
+
+### Implementation
+4-stage pyramid ME replacing the temporal predictor:
+1. `downsample_4x.wgsl`: 4×4 box-filter average downscale of current + reference Y-plane
+2. Block-match at pyramid resolution (480×272 from 1920×1088) with ±24px range → ±96px full-res
+3. `mv_spread_4x.wgsl`: scale pyramid MVs ×4 → full-res predictor buffer (4×4 tile spread)
+4. Fine full-res block-match ±4px using pyramid predictor
+
+Compute analysis:
+- Pyramid coarse: 510 blocks × 49×49 candidates ≈ 1.22M SAD
+- Full-res fine: 8160 blocks × 9×9 = 661K SAD
+- Total: ~1.88M SAD vs baseline 8160 × 65×65 = 34.5M SAD = **~18× fewer SAD evaluations**
+
+### Results (q=75, I+P+B, 10 frames)
+| Sequence | Baseline bpp | Pyramid bpp | Change | VMAF |
+|---|---|---|---|---|
+| crowd_run | 6.17 | 6.15 | −0.3% | 99.13 → 99.13 |
+| park_joy | 4.94 | 4.77 | −3.4% | 99.14 → 99.14 |
+
+### Analysis
+The improvement on park_joy (−3.4%) is larger because it has moderate high-amplitude motions that the pyramid catches. crowd_run has very chaotic motion — multiple runners at different velocities within each 64×64 pyramid block — limiting the pyramid's ability to predict an accurate MV for each 16×16 full-res block. The ±4px fine search from an imperfect pyramid predictor misses some blocks (vs ±32px full search), partially offsetting the benefit.
+
+Despite fewer SAD evaluations (18× less compute), fps is similar (19.6 vs 18.9 fps) because GPU occupancy and pipeline overhead dominate. The feature is still net positive: better range AND no quality regression AND not slower.
+
+### Verdict: SHIPPED — always-on
+`me_params_nopred` and `me_params_pred` removed from CachedEncodeBuffers (now unused). Look-ahead ME also updated to use pyramid. Two new shaders: `downsample_4x.wgsl`, `mv_spread_4x.wgsl`.
+
+---
+
 ## 2026-03-09: #27 TDC — implemented, measured, reverted (fundamentally redundant with MC)
 
 ### Hypothesis

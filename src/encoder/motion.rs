@@ -11,6 +11,11 @@ pub const ME_SEARCH_RANGE: u32 = 32;
 /// provides sufficient refinement while saving ~67% of fine search work
 /// (25 vs 81 candidates, fitting in 1 SIMD group instead of 3).
 pub const ME_PRED_FINE_RANGE: u32 = 2;
+/// Pyramid ME search range: ±24px at 4× downscaled = ±96px at full resolution.
+pub const ME_PYRAMID_SEARCH_RANGE: u32 = 24;
+/// Fine search range when using a pyramid MV predictor (±pixels).
+/// Larger than temporal predictor (±2) because pyramid has 4-pixel quantization.
+pub const ME_PYRAMID_PRED_FINE_RANGE: u32 = 4;
 /// Search range for bidirectional ME (B-frames). B-frames interpolate between
 /// two references, so motion per direction is typically smaller than P-frames.
 pub const ME_BIDIR_SEARCH_RANGE: u32 = 16;
@@ -100,6 +105,12 @@ pub struct MotionEstimator {
     /// MV scaling pipeline — derives chroma MVs from luma MVs via arithmetic right-shift.
     mv_scale_pipeline: wgpu::ComputePipeline,
     mv_scale_bgl: wgpu::BindGroupLayout,
+    /// Pyramid ME: 4× average downscale of a luma plane.
+    downsample_4x_pipeline: wgpu::ComputePipeline,
+    downsample_4x_bgl: wgpu::BindGroupLayout,
+    /// Pyramid ME: spread pyramid MVs (scaled ×4) to full-resolution predictor buffer.
+    mv_spread_4x_pipeline: wgpu::ComputePipeline,
+    mv_spread_4x_bgl: wgpu::BindGroupLayout,
 }
 
 impl MotionEstimator {
@@ -414,6 +425,80 @@ impl MotionEstimator {
                     cache: None,
                 });
 
+        // --- Pyramid ME: 4× downsample ---
+        let downsample_4x_shader =
+            ctx.device
+                .create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("downsample_4x"),
+                    source: wgpu::ShaderSource::Wgsl(
+                        include_str!("../shaders/downsample_4x.wgsl").into(),
+                    ),
+                });
+
+        // 3 bindings: uniform params, input (ro), output (rw)
+        let downsample_4x_bgl =
+            ctx.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("downsample_4x_bgl"),
+                    entries: &[bgl_uniform(0), bgl_storage_ro(1), bgl_storage_rw(2)],
+                });
+
+        let downsample_4x_pl =
+            ctx.device
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("downsample_4x_pl"),
+                    bind_group_layouts: &[&downsample_4x_bgl],
+                    push_constant_ranges: &[],
+                });
+
+        let downsample_4x_pipeline =
+            ctx.device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("downsample_4x_pipeline"),
+                    layout: Some(&downsample_4x_pl),
+                    module: &downsample_4x_shader,
+                    entry_point: Some("main"),
+                    compilation_options: Default::default(),
+                    cache: None,
+                });
+
+        // --- Pyramid ME: spread MVs ×4 to full-res predictor ---
+        let mv_spread_4x_shader =
+            ctx.device
+                .create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("mv_spread_4x"),
+                    source: wgpu::ShaderSource::Wgsl(
+                        include_str!("../shaders/mv_spread_4x.wgsl").into(),
+                    ),
+                });
+
+        // 3 bindings: uniform params, pyramid_mvs (ro), full_pred (rw)
+        let mv_spread_4x_bgl =
+            ctx.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("mv_spread_4x_bgl"),
+                    entries: &[bgl_uniform(0), bgl_storage_ro(1), bgl_storage_rw(2)],
+                });
+
+        let mv_spread_4x_pl =
+            ctx.device
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("mv_spread_4x_pl"),
+                    bind_group_layouts: &[&mv_spread_4x_bgl],
+                    push_constant_ranges: &[],
+                });
+
+        let mv_spread_4x_pipeline =
+            ctx.device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("mv_spread_4x_pipeline"),
+                    layout: Some(&mv_spread_4x_pl),
+                    module: &mv_spread_4x_shader,
+                    entry_point: Some("main"),
+                    compilation_options: Default::default(),
+                    cache: None,
+                });
+
         Self {
             match_pipeline,
             match_bgl,
@@ -429,6 +514,10 @@ impl MotionEstimator {
             split_bgl,
             mv_scale_pipeline,
             mv_scale_bgl,
+            downsample_4x_pipeline,
+            downsample_4x_bgl,
+            mv_spread_4x_pipeline,
+            mv_spread_4x_bgl,
         }
     }
 
@@ -1918,6 +2007,115 @@ impl MotionEstimator {
             pass.set_pipeline(&self.mv_scale_pipeline);
             pass.set_bind_group(0, &bg, &[]);
             pass.dispatch_workgroups(workgroups, 1, 1);
+        }
+    }
+
+    /// Dispatch 4× average downscale of a luma plane (pyramid ME stage 1).
+    /// Writes ceil(in_w/4) × ceil(in_h/4) f32 pixels into `output`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_downsample_4x(
+        &self,
+        ctx: &GpuContext,
+        cmd: &mut wgpu::CommandEncoder,
+        input: &wgpu::Buffer,
+        output: &wgpu::Buffer,
+        in_w: u32,
+        in_h: u32,
+    ) {
+        let out_w = in_w.div_ceil(4);
+        let out_h = in_h.div_ceil(4);
+
+        #[repr(C)]
+        #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+        struct Params {
+            in_w: u32,
+            in_h: u32,
+            out_w: u32,
+            out_h: u32,
+        }
+        let params = Params { in_w, in_h, out_w, out_h };
+        let params_buf = ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("downsample_4x_params"),
+                contents: bytemuck::bytes_of(&params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+
+        let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("downsample_4x_bg"),
+            layout: &self.downsample_4x_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: params_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: input.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: output.as_entire_binding() },
+            ],
+        });
+
+        let wg_x = out_w.div_ceil(8);
+        let wg_y = out_h.div_ceil(8);
+        {
+            let mut pass = cmd.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("downsample_4x_pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.downsample_4x_pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(wg_x, wg_y, 1);
+        }
+    }
+
+    /// Spread pyramid MVs (scaled ×4) into full-resolution predictor buffer.
+    /// Each pyramid block covers a 4×4 grid of full-res blocks.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_mv_spread_4x(
+        &self,
+        ctx: &GpuContext,
+        cmd: &mut wgpu::CommandEncoder,
+        pyramid_mvs: &wgpu::Buffer,
+        full_pred: &wgpu::Buffer,
+        pyr_blocks_x: u32,
+        pyr_blocks_y: u32,
+        full_blocks_x: u32,
+        full_blocks_y: u32,
+    ) {
+        #[repr(C)]
+        #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+        struct Params {
+            pyr_blocks_x: u32,
+            pyr_blocks_y: u32,
+            full_blocks_x: u32,
+            full_blocks_y: u32,
+        }
+        let params = Params { pyr_blocks_x, pyr_blocks_y, full_blocks_x, full_blocks_y };
+        let params_buf = ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("mv_spread_4x_params"),
+                contents: bytemuck::bytes_of(&params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+
+        let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("mv_spread_4x_bg"),
+            layout: &self.mv_spread_4x_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: params_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: pyramid_mvs.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: full_pred.as_entire_binding() },
+            ],
+        });
+
+        let wg_x = pyr_blocks_x.div_ceil(8);
+        let wg_y = pyr_blocks_y.div_ceil(8);
+        {
+            let mut pass = cmd.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("mv_spread_4x_pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.mv_spread_4x_pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(wg_x, wg_y, 1);
         }
     }
 }

@@ -22,7 +22,7 @@ H.264 comparison (#22) established the north star: GNC needs **2–5× more bits
 17. **#37 Per-8×8-block skip** (closed P2) — 0% blocks qualify on bbb; pan motion prevents block-level static detection
 18. **#38 Lagrange RD quantization** (closed P3) — gate: AQ adds +0.5-1.4% bits (not saves bits); exploitable gap <1.5%; not worth 5-7 days
 19. **#39 32×32 coarse-block fallback** (closed P3) — analytical: max 0.7% savings (30% of 2.3% MV overhead); rush_hour unavailable; closed
-20. **#24 Larger ME search range** (todo P1) — REOPENED: 40% of crowd_run blocks have |MV|>17px, max=167px; ±32px range misses them; pyramid ME covers ±96px at 2× compute cost; **ACTIVE**
+20. **#24 Larger ME search range** (done 2026-03-10) — pyramid ME implemented: ±96px range, −3.4% bpp park_joy, −0.3% crowd_run, VMAF neutral
 21. **#25 Multi-reference P-frames** (DEFER)
 
 ## Items
@@ -241,7 +241,7 @@ H.264 comparison (#22) established the north star: GNC needs **2–5× more bits
 - **Next step if more savings needed:** (a) More aggressive threshold calibration; (b) B-frame zero-MV skip; (c) Merge mode: use non-zero co-located MV (better prediction for slow-motion tiles). See #24 (larger search range) for high-motion gains instead.
 
 ### 24. Larger ME search range
-- **Status:** todo (P1) — REOPENED 2026-03-10; MV histogram proves search range is the bottleneck
+- **Status:** done (2026-03-10) — pyramid ME implemented and always-on
 - **Motivation:** Current block_match.wgsl uses a fixed hierarchical search range. On fast-motion content (crowd_run, park_joy), many blocks may have the true motion vector outside the current search window, forcing a large residual. H.264's full-pel search typically covers ±64–128 pixels with hierarchical refinement.
 - **Hypothesis:** Doubling the coarse search range reduces average residual energy on high-motion sequences by 5–10%, at the cost of ~2× ME compute time.
 - **Success criteria:** bpp −3% on crowd_run q=75; VMAF neutral; fps ≥17 (acceptable regression since quality gain is the goal).

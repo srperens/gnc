@@ -2766,11 +2766,52 @@ impl EncoderPipeline {
                 }
 
                 let _t_me = std::time::Instant::now();
-                let me_params = if predictor_mvs.is_some() {
-                    &bufs.me_params_pred
-                } else {
-                    &bufs.me_params_nopred
-                };
+
+                // Pyramid ME: coarse ±24px search at 4× downscaled (=±96px full-res),
+                // then full-res fine search with ME_PYRAMID_PRED_FINE_RANGE.
+                // Extends effective search range from ±32px to ±96px at ~5% of the
+                // compute cost of a naive ±96px full-res search.
+                let pyr_w = padded_w / 4;
+                let pyr_h = padded_h / 4;
+                // Stage 1: downsample current + reference Y to pyramid resolution.
+                self.motion.dispatch_downsample_4x(
+                    ctx, &mut cmd, &bufs.plane_a, &bufs.pyr_plane_a, padded_w, padded_h,
+                );
+                self.motion.dispatch_downsample_4x(
+                    ctx,
+                    &mut cmd,
+                    &bufs.gpu_ref_planes[0],
+                    &bufs.pyr_ref_plane,
+                    padded_w,
+                    padded_h,
+                );
+                // Stage 2: coarse block-match at pyramid resolution (±ME_PYRAMID_SEARCH_RANGE).
+                let pyr_mv = self.motion.estimate_cached(
+                    ctx,
+                    &mut cmd,
+                    &bufs.pyr_plane_a,
+                    &bufs.pyr_ref_plane,
+                    pyr_w,
+                    pyr_h,
+                    None,
+                    &bufs.me_params_pyr_nopred,
+                    &bufs.pyr_sad_buf,
+                    &bufs.me_dummy_pred,
+                );
+                // Stage 3: scale pyramid MVs ×4 → full-res predictor buffer.
+                let pyr_blocks_x = pyr_w / super::motion::ME_BLOCK_SIZE;
+                let pyr_blocks_y = pyr_h / super::motion::ME_BLOCK_SIZE;
+                self.motion.dispatch_mv_spread_4x(
+                    ctx,
+                    &mut cmd,
+                    &pyr_mv,
+                    &bufs.pyr_pred_buf,
+                    pyr_blocks_x,
+                    pyr_blocks_y,
+                    padded_w / super::motion::ME_BLOCK_SIZE,
+                    padded_h / super::motion::ME_BLOCK_SIZE,
+                );
+                // Stage 4: fine full-res ME using pyramid predictor.
                 mv_buf = self.motion.estimate_cached(
                     ctx,
                     &mut cmd,
@@ -2778,8 +2819,8 @@ impl EncoderPipeline {
                     &bufs.gpu_ref_planes[0],
                     padded_w,
                     padded_h,
-                    predictor_mvs,
-                    me_params,
+                    Some(&bufs.pyr_pred_buf),
+                    &bufs.me_params_pyramid_pred,
                     &bufs.me_sad_buf,
                     &bufs.me_dummy_pred,
                 );
@@ -3448,11 +3489,8 @@ impl EncoderPipeline {
                     ctx.queue
                         .write_buffer(&bufs.raw_input_buf, 0, bytemuck::cast_slice(next_pixels));
 
-                    // Build a ME-only command encoder: pad + color + deinterleave + ME + split.
-                    // Uses bufs.me_params_nopred (no temporal predictor for look-ahead;
-                    // the actual predictor from the current frame's mv_buf will be passed
-                    // as predictor_mvs when encode_pframe is called for the next frame,
-                    // but by then precomputed_me is Some so ME is skipped anyway).
+                    // Build a ME-only command encoder: pad + color + deinterleave + pyramid ME + split.
+                    // Uses pyramid ME (same as main path) — extends range to ±96px full-res.
                     let mut me_cmd =
                         ctx.device
                             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -3478,9 +3516,44 @@ impl EncoderPipeline {
                         &bufs.cg_plane,
                         padded_pixels as u32,
                     );
-                    // ME: use predictor from current frame's mv_buf if available.
-                    // mv_buf holds the 16x16 MVs just computed for the current frame.
-                    let next_me_params = &bufs.me_params_pred;
+                    // Pyramid ME for look-ahead: same 4-stage flow as main path.
+                    let la_pyr_w = padded_w / 4;
+                    let la_pyr_h = padded_h / 4;
+                    self.motion.dispatch_downsample_4x(
+                        ctx, &mut me_cmd, &bufs.plane_a, &bufs.pyr_plane_a, padded_w, padded_h,
+                    );
+                    self.motion.dispatch_downsample_4x(
+                        ctx,
+                        &mut me_cmd,
+                        &bufs.gpu_ref_planes[0],
+                        &bufs.pyr_ref_plane,
+                        padded_w,
+                        padded_h,
+                    );
+                    let la_pyr_mv = self.motion.estimate_cached(
+                        ctx,
+                        &mut me_cmd,
+                        &bufs.pyr_plane_a,
+                        &bufs.pyr_ref_plane,
+                        la_pyr_w,
+                        la_pyr_h,
+                        None,
+                        &bufs.me_params_pyr_nopred,
+                        &bufs.pyr_sad_buf,
+                        &bufs.me_dummy_pred,
+                    );
+                    let la_pyr_blocks_x = la_pyr_w / super::motion::ME_BLOCK_SIZE;
+                    let la_pyr_blocks_y = la_pyr_h / super::motion::ME_BLOCK_SIZE;
+                    self.motion.dispatch_mv_spread_4x(
+                        ctx,
+                        &mut me_cmd,
+                        &la_pyr_mv,
+                        &bufs.pyr_pred_buf,
+                        la_pyr_blocks_x,
+                        la_pyr_blocks_y,
+                        padded_w / super::motion::ME_BLOCK_SIZE,
+                        padded_h / super::motion::ME_BLOCK_SIZE,
+                    );
                     let next_mv = self.motion.estimate_cached(
                         ctx,
                         &mut me_cmd,
@@ -3488,8 +3561,8 @@ impl EncoderPipeline {
                         &bufs.gpu_ref_planes[0],
                         padded_w,
                         padded_h,
-                        Some(&mv_buf), // temporal predictor from current frame
-                        next_me_params,
+                        Some(&bufs.pyr_pred_buf),
+                        &bufs.me_params_pyramid_pred,
                         &bufs.me_sad_buf,
                         &bufs.me_dummy_pred,
                     );

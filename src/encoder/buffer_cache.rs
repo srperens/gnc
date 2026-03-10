@@ -4,8 +4,8 @@ use wgpu::util::DeviceExt;
 
 use super::adaptive;
 use super::motion::{
-    ME_BIDIR_PRED_FINE_RANGE, ME_BIDIR_SEARCH_RANGE, ME_BLOCK_SIZE, ME_PRED_FINE_RANGE,
-    ME_SEARCH_RANGE, ME_SPLIT_BLOCK_SIZE,
+    ME_BIDIR_PRED_FINE_RANGE, ME_BIDIR_SEARCH_RANGE, ME_BLOCK_SIZE, ME_PYRAMID_PRED_FINE_RANGE,
+    ME_PYRAMID_SEARCH_RANGE, ME_SEARCH_RANGE, ME_SPLIT_BLOCK_SIZE,
 };
 use crate::GpuContext;
 
@@ -76,9 +76,7 @@ pub(super) struct CachedEncodeBuffers {
 
     // --- Cached ME/MC buffers (avoid per-frame allocation) ---
 
-    // ME params (constant for given resolution, 2 variants per ME type)
-    pub(super) me_params_nopred: wgpu::Buffer,
-    pub(super) me_params_pred: wgpu::Buffer,
+    // ME params (constant for given resolution)
     pub(super) bidir_params_nopred: wgpu::Buffer,
     pub(super) bidir_params_pred: wgpu::Buffer,
     /// No predictor, no qpel: for B1 in modes where bidir qpel is too slow.
@@ -124,6 +122,20 @@ pub(super) struct CachedEncodeBuffers {
     // Same size/layout as split_mv_output_buf: total_blocks_8 × 2 × i32.
     // Usage: STORAGE (shader writes smoothed MVs here) | COPY_SRC (copy back to split_mv_buf).
     pub(super) gpu_split_mv_smooth_scratch: wgpu::Buffer,
+
+    // --- Pyramid ME buffers (coarse 4× downscaled search + full-res refinement) ---
+    /// Pyramid (4× downscaled) current luma plane (pyr_w × pyr_h × f32).
+    pub(super) pyr_plane_a: wgpu::Buffer,
+    /// Pyramid (4× downscaled) reference luma plane.
+    pub(super) pyr_ref_plane: wgpu::Buffer,
+    /// SAD scratch buffer for pyramid-res ME.
+    pub(super) pyr_sad_buf: wgpu::Buffer,
+    /// Full-res predictor buffer filled by mv_spread_4x (me_blocks_x × me_blocks_y × 2 × i32).
+    pub(super) pyr_pred_buf: wgpu::Buffer,
+    /// Params for pyramid-res block_match (PYRAMID_SEARCH_RANGE, no predictor).
+    pub(super) me_params_pyr_nopred: wgpu::Buffer,
+    /// Params for full-res fine search with pyramid predictor (PYRAMID_PRED_FINE_RANGE).
+    pub(super) me_params_pyramid_pred: wgpu::Buffer,
 }
 
 /// Cached GPU buffers for temporal wavelet GOP encoding.
@@ -561,22 +573,6 @@ impl CachedEncodeBuffers {
             },
 
             // --- Cached ME/MC buffers ---
-            me_params_nopred: Self::make_block_match_params(
-                ctx,
-                padded_w,
-                padded_h,
-                ME_SEARCH_RANGE,
-                false,
-                0,
-            ),
-            me_params_pred: Self::make_block_match_params(
-                ctx,
-                padded_w,
-                padded_h,
-                ME_SEARCH_RANGE,
-                true,
-                ME_PRED_FINE_RANGE,
-            ),
             bidir_params_nopred: Self::make_bidir_params(
                 ctx,
                 padded_w,
@@ -749,6 +745,78 @@ impl CachedEncodeBuffers {
                     mapped_at_creation: false,
                 })
             },
+
+            // --- Pyramid ME buffers ---
+            pyr_plane_a: {
+                let pyr_w = padded_w / 4;
+                let pyr_h = padded_h / 4;
+                let size = (pyr_w * pyr_h) as u64 * 4;
+                ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("enc_pyr_plane_a"),
+                    size: size.max(4),
+                    usage: wgpu::BufferUsages::STORAGE
+                        | wgpu::BufferUsages::COPY_DST
+                        | wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: false,
+                })
+            },
+            pyr_ref_plane: {
+                let pyr_w = padded_w / 4;
+                let pyr_h = padded_h / 4;
+                let size = (pyr_w * pyr_h) as u64 * 4;
+                ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("enc_pyr_ref_plane"),
+                    size: size.max(4),
+                    usage: wgpu::BufferUsages::STORAGE
+                        | wgpu::BufferUsages::COPY_DST
+                        | wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: false,
+                })
+            },
+            pyr_sad_buf: {
+                let pyr_w = padded_w / 4;
+                let pyr_h = padded_h / 4;
+                let pyr_blocks_x = pyr_w / ME_BLOCK_SIZE;
+                let pyr_blocks_y = pyr_h / ME_BLOCK_SIZE;
+                let size = (pyr_blocks_x * pyr_blocks_y) as u64 * 4;
+                ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("enc_pyr_sad_buf"),
+                    size: size.max(4),
+                    usage: wgpu::BufferUsages::STORAGE,
+                    mapped_at_creation: false,
+                })
+            },
+            pyr_pred_buf: {
+                // Full-res predictor: me_blocks_x × me_blocks_y × 2 × i32
+                let size = (me_total_blocks as u64) * 2 * 4;
+                ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("enc_pyr_pred_buf"),
+                    size: size.max(8),
+                    // STORAGE (spread shader writes) | COPY_DST (cleared between frames if needed)
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                })
+            },
+            me_params_pyr_nopred: {
+                let pyr_w = padded_w / 4;
+                let pyr_h = padded_h / 4;
+                Self::make_block_match_params(
+                    ctx,
+                    pyr_w,
+                    pyr_h,
+                    ME_PYRAMID_SEARCH_RANGE,
+                    false,
+                    0,
+                )
+            },
+            me_params_pyramid_pred: Self::make_block_match_params(
+                ctx,
+                padded_w,
+                padded_h,
+                ME_SEARCH_RANGE,
+                true,
+                ME_PYRAMID_PRED_FINE_RANGE,
+            ),
         }
     }
 

@@ -508,3 +508,38 @@ H.264 comparison (#22) established the north star: GNC needs **2–5× more bits
 - **Status:** CLOSED (2026-03-10) — gate failed: 0% qualifying tiles at q=75
 - **Gate result:** `Rice: all_skip_tiles=0/120` at q=75 on bbb_1080p. Zero tiles have >80% zeros at this quality level — quantization is aggressive enough that all tiles have non-trivial coefficient distributions. The speed axis gain is zero.
 
+
+### 51. Local parent-k Rice (inter-scale coefficient context)
+- **Status:** todo
+- **Motivation:** GNC uses a global EMA-based Rice parameter k per subband group. JPEG 2000 / SPIHT exploit that wavelet coefficients at fine scales are statistically correlated with their parent at the coarse scale — if the parent is large, the children are likely large too. Using the local parent magnitude to set k per spatial position (rather than per subband globally) should reduce entropy by fitting the local distribution better.
+- **Falsifiable claim:** Within-tile local parent-k reduces LH/HL/HH subband bits by ≥5% vs current EMA k on bbb q=75.
+- **Gate:** Add diagnostic: for each fine-subband coefficient, log actual Rice k used vs what local parent-k would give. If > 50% of coefficients would get a different k (|delta k| ≥ 1), the EMA k is a poor global fit → proceed.
+- **Implementation:** Extra shader pass: read coarse LL/subband → derive local k for each position → encode fine subbands with per-position k. Tile-independent. 256-stream model preserved.
+- **Success criteria:** bbb q=75 bpp −2% at VMAF neutral; validated on crowd_run + park_joy.
+- **Complexity:** 2–3 days. Requires bitstream change: signal per-coefficient k (or delta from base k) — adds some overhead, net gain must outweigh it.
+
+### 52. Intra-tile coarse-to-fine coefficient prediction
+- **Status:** todo
+- **Motivation:** Before entropy coding, subtract a scaled parent-subband coefficient from each fine-subband coefficient. This reduces the expected magnitude of fine-subband coefficients, shifting their distribution toward zero and improving Rice coding efficiency. Decoder applies the inverse (add back the predicted value). No cross-tile dependency.
+- **Falsifiable claim:** Fine-subband mean_abs_coeff after prediction < 80% of mean_abs_coeff before prediction on bbb q=75 LL→LH prediction.
+- **Gate:** Add diagnostic: compute mean_abs of LH/HL/HH before and after subtracting alpha×parent. If reduction < 10% for all subbands, prediction adds overhead for negligible gain → close.
+- **Implementation:** New shader pass between quantize and entropy: `fine_coeff[x,y] -= alpha * coarse_coeff[x/2, y/2]`. Alpha empirically tuned per-subband (typically 0.3–0.6). Encoder and decoder apply identical prediction. Tile-independent.
+- **Success criteria:** bbb q=75 bpp −2% at VMAF neutral.
+- **Complexity:** 1–2 days. No bitstream change needed if alpha is fixed (baked in). Minor if alpha is signaled per subband.
+
+### 53. Within-tile significance context coding
+- **Status:** todo
+- **Motivation:** GNC's Rice entropy codes the significance bit (zero or not) with a flat 1-bit cost per coefficient. JPEG 2000/EBCOT uses a 3×3 spatial neighborhood context within each subband to predict significance probability. Coefficients near other significant coefficients are more likely to be significant. Context-adaptive coding of the significance map can save ~0.2–0.5 bpp.
+- **Falsifiable claim:** A 3×3 significance context within each tile subband has conditional entropy < 0.85 bits/coefficient on bbb q=75 (vs current 1 bit flat). If conditional entropy ≥ 0.95 bits, context gives negligible benefit → close.
+- **Gate:** Add diagnostic: compute actual conditional entropy of significance bits given 3×3 neighborhood context on bbb/park_joy. Gate threshold: conditional entropy < 0.85 bits/sig bit → proceed.
+- **Implementation:** Change significance map encoder from flat 1-bit to context-adaptive (4–8 context states → lookup table). Requires sequential scan order within tile workgroup — breaks 256-stream parallel model. May need architecture change in Rice encoder.
+- **Success criteria:** bpp −3% at VMAF neutral on bbb q=75.
+- **Complexity:** 4–5 days. Possible architecture change in entropy core.
+- **Note:** Higher risk than #51/#52 due to parallelism impact. Run #51 and #52 first.
+
+### 54. Quarter-pel ME for B-frames
+- **Status:** todo
+- **Motivation:** P-frames got quarter-pel ME in #15 (−5–12% bpp). B-frames still use half-pel or integer-pel (not confirmed — needs gate). If B-frames are at half-pel, upgrading to qpel could yield similar gains to #15 on B-frame dominated sequences.
+- **Gate:** Add diagnostic: check ME_QPEL constant / B-frame ME dispatch — are B-frames using qpel or half-pel? If already qpel, close immediately.
+- **Success criteria:** B-frame bpp −3–8%; VMAF neutral.
+- **Complexity:** 1–2 days if B-frames are at half-pel (reuse P-frame qpel shader). 0 days if already qpel (→ close).

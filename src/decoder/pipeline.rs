@@ -652,21 +652,111 @@ impl DecoderPipeline {
                 results[idx] = Some(self.decode(ctx, frame));
                 i += 1;
             } else if b_frames_follow {
-                // Anchor before B-frames: save past ref, decode anchor, swap for B decode
+                // Anchor before B-frames: save past ref, decode anchor, swap for B decode.
                 self.swap_forward_to_backward_ref(ctx); // bwd = past anchor
                 results[idx] = Some(self.decode(ctx, frame)); // ref = decoded anchor (future)
                 self.swap_references(); // ref=past, bwd=future
 
                 i += 1;
 
-                // Decode all following B-frames
-                while i < order.len() && frames[order[i]].frame_type == FrameType::Bidirectional {
-                    results[order[i]] = Some(self.decode(ctx, &frames[order[i]]));
-                    i += 1;
+                // Collect the following B-frames (already in decode order from decode_order())
+                let b_start_i = i;
+                let mut j = i;
+                while j < order.len() && frames[order[j]].frame_type == FrameType::Bidirectional {
+                    j += 1;
+                }
+                let b_count = j - b_start_i;
+
+                // Detect pyramid group: 7 B-frames with fwd_ref_idx set on any of them
+                let is_pyramid = b_count == 7
+                    && (b_start_i..j).any(|k| {
+                        frames[order[k]]
+                            .motion_field
+                            .as_ref()
+                            .and_then(|mf| mf.fwd_ref_idx)
+                            .is_some()
+                    });
+
+                if is_pyramid {
+                    // Pyramid decode: state is ref=past_anchor, bwd=future_P.
+                    // Pool slot → buffer mapping:
+                    //   pool 0 = past anchor   → pyr[4] (saved, always loaded for fwd_pool=0)
+                    //   pool 1 = future anchor → pyr[3] (saved, always loaded for bwd_pool=1)
+                    //   pool 2 = B₄            → pyr[0]
+                    //   pool 3 = B₂            → pyr[1]
+                    //   pool 4 = B₆            → pyr[2]
+                    //
+                    // Save both anchors permanently before any ref overwrite.
+                    self.save_fwd_ref_to_pyramid_slot_dec(ctx, 4); // past_anchor → pyr[4]
+                    self.save_bwd_ref_to_pyramid_slot_dec(ctx, 3); // future_P → pyr[3]
+
+                    // The group's first B-frame display index (B₁ = display offset 0):
+                    let b_display_base = order[b_start_i..(b_start_i + b_count)]
+                        .iter()
+                        .copied()
+                        .min()
+                        .unwrap();
+
+                    let diag = std::env::var("GNC_BFRAME_PYRAMID").is_ok();
+
+                    for &b_idx in &order[b_start_i..j] {
+                        let b_frame = &frames[b_idx];
+                        let mf = b_frame.motion_field.as_ref();
+
+                        // Read pool indices from motion field (default: 0/1 for flat)
+                        let fwd_pool = mf.and_then(|m| m.fwd_ref_idx).unwrap_or(0);
+                        let bwd_pool = mf.and_then(|m| m.bwd_ref_idx).unwrap_or(1);
+
+                        // Always load refs from saved pool — never rely on buffer state.
+                        match fwd_pool {
+                            0 => self.copy_pyramid_slot_to_fwd_ref(ctx, 4), // past_anchor
+                            2 => self.copy_pyramid_slot_to_fwd_ref(ctx, 0), // B₄
+                            3 => self.copy_pyramid_slot_to_fwd_ref(ctx, 1), // B₂
+                            4 => self.copy_pyramid_slot_to_fwd_ref(ctx, 2), // B₆
+                            _ => {}
+                        }
+                        match bwd_pool {
+                            1 => self.copy_pyramid_slot_to_bwd_ref(ctx, 3), // future_P
+                            2 => self.copy_pyramid_slot_to_bwd_ref(ctx, 0), // B₄
+                            3 => self.copy_pyramid_slot_to_bwd_ref(ctx, 1), // B₂
+                            4 => self.copy_pyramid_slot_to_bwd_ref(ctx, 2), // B₆
+                            _ => {}
+                        }
+
+                        if diag {
+                            let off = b_idx - b_display_base;
+                            eprintln!(
+                                "[pyramid_dec] Frame {} (display+{}) fwd_pool={} bwd_pool={}",
+                                b_idx, off, fwd_pool, bwd_pool
+                            );
+                        }
+
+                        results[b_idx] = Some(self.decode(ctx, b_frame));
+
+                        // Save decoded output to pyramid slot for reference B-frames
+                        let display_off = b_idx - b_display_base;
+                        match display_off {
+                            3 => self.save_plane_results_to_pyramid_slot(ctx, 0), // B₄ → pyr[0]
+                            1 => self.save_plane_results_to_pyramid_slot(ctx, 1), // B₂ → pyr[1]
+                            5 => self.save_plane_results_to_pyramid_slot(ctx, 2), // B₆ → pyr[2]
+                            _ => {} // B₁ B₃ B₅ B₇ are non-reference
+                        }
+                    }
+
+                    // Restore future_P to bwd, then swap → ref=future, bwd=whatever.
+                    // This gives the next group's I/P encoder the correct forward ref.
+                    self.copy_pyramid_slot_to_bwd_ref(ctx, 3); // future_P → bwd
+                    self.swap_references(); // ref=future_P, bwd=last_fwd
+                } else {
+                    // Flat B-frames: decode in display order (already in order from decode_order)
+                    for k in b_start_i..j {
+                        results[order[k]] = Some(self.decode(ctx, &frames[order[k]]));
+                    }
+                    // Swap back: ref=future anchor (for next group's forward ref)
+                    self.swap_references();
                 }
 
-                // Swap back: ref=future anchor (for next group's forward ref)
-                self.swap_references();
+                i = j;
             } else {
                 // Regular I/P frame, no B-frames follow
                 results[idx] = Some(self.decode(ctx, frame));
@@ -1591,6 +1681,125 @@ impl DecoderPipeline {
                 &bufs.bwd_reference_planes[p],
                 0,
                 bufs.reference_planes[p].size(),
+            );
+        }
+        ctx.queue.submit(Some(cmd.finish()));
+    }
+
+    /// Copy plane_results (decoded output) to a pyramid reference slot.
+    /// Call immediately after `decode()` for reference B-frames (B₄, B₂, B₆).
+    /// Slot mapping: 0=B₄, 1=B₂, 2=B₆.
+    fn save_plane_results_to_pyramid_slot(&self, ctx: &GpuContext, slot: usize) {
+        let cached = self.cached.borrow();
+        let bufs = cached
+            .as_ref()
+            .expect("save_plane_results_to_pyramid_slot called before any frame was decoded");
+        let mut cmd = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("plane_results_to_pyr_slot"),
+            });
+        for p in 0..3 {
+            cmd.copy_buffer_to_buffer(
+                &bufs.plane_results[p],
+                0,
+                &bufs.pyramid_ref_planes[slot][p],
+                0,
+                bufs.plane_results[p].size(),
+            );
+        }
+        ctx.queue.submit(Some(cmd.finish()));
+    }
+
+    /// Copy a pyramid reference slot to reference_planes (forward ref for next B-frame).
+    fn copy_pyramid_slot_to_fwd_ref(&self, ctx: &GpuContext, slot: usize) {
+        let cached = self.cached.borrow();
+        let bufs = cached
+            .as_ref()
+            .expect("copy_pyramid_slot_to_fwd_ref called before any frame was decoded");
+        let mut cmd = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("pyr_slot_to_fwd_ref"),
+            });
+        for p in 0..3 {
+            cmd.copy_buffer_to_buffer(
+                &bufs.pyramid_ref_planes[slot][p],
+                0,
+                &bufs.reference_planes[p],
+                0,
+                bufs.reference_planes[p].size(),
+            );
+        }
+        ctx.queue.submit(Some(cmd.finish()));
+    }
+
+    /// Save current reference_planes (forward/past ref) into a pyramid reference slot.
+    /// Used to preserve past_anchor before reference_planes is overwritten during pyramid decode.
+    fn save_fwd_ref_to_pyramid_slot_dec(&self, ctx: &GpuContext, slot: usize) {
+        let cached = self.cached.borrow();
+        let bufs = cached
+            .as_ref()
+            .expect("save_fwd_ref_to_pyramid_slot_dec called before any frame was decoded");
+        let mut cmd = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("fwd_ref_to_pyr_slot_dec"),
+            });
+        for p in 0..3 {
+            cmd.copy_buffer_to_buffer(
+                &bufs.reference_planes[p],
+                0,
+                &bufs.pyramid_ref_planes[slot][p],
+                0,
+                bufs.reference_planes[p].size(),
+            );
+        }
+        ctx.queue.submit(Some(cmd.finish()));
+    }
+
+    /// Save current bwd_reference_planes into a pyramid reference slot.
+    /// Used to preserve future_P before it gets overwritten during pyramid B-frame decoding.
+    fn save_bwd_ref_to_pyramid_slot_dec(&self, ctx: &GpuContext, slot: usize) {
+        let cached = self.cached.borrow();
+        let bufs = cached
+            .as_ref()
+            .expect("save_bwd_ref_to_pyramid_slot_dec called before any frame was decoded");
+        let mut cmd = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("bwd_ref_to_pyr_slot_dec"),
+            });
+        for p in 0..3 {
+            cmd.copy_buffer_to_buffer(
+                &bufs.bwd_reference_planes[p],
+                0,
+                &bufs.pyramid_ref_planes[slot][p],
+                0,
+                bufs.bwd_reference_planes[p].size(),
+            );
+        }
+        ctx.queue.submit(Some(cmd.finish()));
+    }
+
+    /// Copy a pyramid reference slot to bwd_reference_planes (backward ref for next B-frame).
+    fn copy_pyramid_slot_to_bwd_ref(&self, ctx: &GpuContext, slot: usize) {
+        let cached = self.cached.borrow();
+        let bufs = cached
+            .as_ref()
+            .expect("copy_pyramid_slot_to_bwd_ref called before any frame was decoded");
+        let mut cmd = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("pyr_slot_to_bwd_ref"),
+            });
+        for p in 0..3 {
+            cmd.copy_buffer_to_buffer(
+                &bufs.pyramid_ref_planes[slot][p],
+                0,
+                &bufs.bwd_reference_planes[p],
+                0,
+                bufs.bwd_reference_planes[p].size(),
             );
         }
         ctx.queue.submit(Some(cmd.finish()));

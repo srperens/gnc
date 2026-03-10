@@ -104,6 +104,17 @@ pub(super) struct CachedBuffers {
     pub(super) block_modes_buf: wgpu::Buffer,
     pub(super) block_modes_cap: u64,
     pub(super) bwd_reference_planes: [wgpu::Buffer; 3],
+    // Pyramid B-frame intermediate reference pool (5 slots).
+    // Pool slot indices (fwd_ref_idx/bwd_ref_idx) → buffer:
+    //   pool slot 0 = past anchor   → reference_planes
+    //   pool slot 1 = future anchor → bwd_reference_planes
+    //   pool slot 2 = B₄ (layer-1) → pyramid_ref_planes[0]
+    //   pool slot 3 = B₂ (layer-2) → pyramid_ref_planes[1]
+    //   pool slot 4 = B₆ (layer-2) → pyramid_ref_planes[2]
+    // Additional temp saves (decoder-internal, not exposed as pool slots):
+    //   pyramid_ref_planes[3] = saved future_P (before bwd overwrite)
+    //   pyramid_ref_planes[4] = saved past_anchor (before fwd overwrite by B₆ setup)
+    pub(super) pyramid_ref_planes: [[wgpu::Buffer; 3]; 5],
 
     // Motion compensation block size from MotionField (8 or 16)
     pub(super) mc_block_size: u32,
@@ -402,6 +413,17 @@ impl CachedBuffers {
                 mapped_at_creation: false,
             })
         });
+        // Pyramid B-frame: 5 intermediate reference slots (B₄, B₂, B₆ + future_P temp + past temp)
+        let pyramid_ref_planes: [[wgpu::Buffer; 3]; 5] = std::array::from_fn::<_, 5, _>(|slot| {
+            std::array::from_fn(|p| {
+                ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(&format!("dec_pyr_ref_{}_{}", slot, ["y", "co", "cg"][p])),
+                    size: plane_size,
+                    usage: scratch_usage,
+                    mapped_at_creation: false,
+                })
+            })
+        });
 
         // Output texture for zero-readback decode path
         let output_texture = ctx.device.create_texture(&wgpu::TextureDescriptor {
@@ -516,6 +538,7 @@ impl CachedBuffers {
             block_modes_buf,
             block_modes_cap,
             bwd_reference_planes,
+            pyramid_ref_planes,
             mc_block_size: ME_BLOCK_SIZE, // default, overwritten per-frame in prepare_frame_data
 
             // 4:2:0 chroma-domain MC buffers.

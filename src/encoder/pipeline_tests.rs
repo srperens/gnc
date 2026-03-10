@@ -83,27 +83,34 @@ fn test_encode_sequence_ip_pattern() {
 
     let w = 256;
     let h = 256;
-    let f0 = make_gradient_frame(w, h, 0.0);
-    let f1 = make_gradient_frame(w, h, 7.0);
-    let f2 = make_gradient_frame(w, h, 6.0);
-    let f3 = make_gradient_frame(w, h, 9.0);
+    // 9 frames: I [B₁ B₂ B₃ B₄ B₅ B₆ B₇] P (one full 3-level pyramid group)
+    // B_FRAMES_PER_GROUP=7, group_size=8: needs ki>=8 and >=9 total frames.
+    let frames_rgb: Vec<Vec<f32>> = (0..9)
+        .map(|i| make_gradient_frame(w, h, i as f32 * 2.0))
+        .collect();
+    let frame_refs: Vec<&[f32]> = frames_rgb.iter().map(|f| f.as_slice()).collect();
 
     let mut config = CodecConfig::default();
     config.tile_size = 256;
-    config.keyframe_interval = 4; // I B B P (with B-frames at ki>=4)
+    config.keyframe_interval = 9; // I [B×7] P pattern
 
-    let frames: Vec<&[f32]> = vec![&f0, &f1, &f2, &f3];
-    let compressed = enc.encode_sequence(&ctx, &frames, w, h, &config);
+    let compressed = enc.encode_sequence(&ctx, &frame_refs, w, h, &config);
 
-    assert_eq!(compressed.len(), 4);
+    assert_eq!(compressed.len(), 9);
     assert_eq!(compressed[0].frame_type, FrameType::Intra);
-    // With B_FRAMES_PER_GROUP=2: display order is I B B P
-    assert_eq!(compressed[1].frame_type, FrameType::Bidirectional);
-    assert_eq!(compressed[2].frame_type, FrameType::Bidirectional);
-    assert_eq!(compressed[3].frame_type, FrameType::Predicted);
+    // Display order: I B B B B B B B P
+    // Frames 1-7 are B-frames, frame 8 is the P-frame anchor
+    for i in 1..8 {
+        assert_eq!(
+            compressed[i].frame_type,
+            FrameType::Bidirectional,
+            "Frame {i} should be Bidirectional"
+        );
+    }
+    assert_eq!(compressed[8].frame_type, FrameType::Predicted);
 
     // All inter frames must have motion fields
-    for i in 1..4 {
+    for i in 1..9 {
         assert!(
             compressed[i].motion_field.is_some(),
             "Inter frame {i} should have motion field"
@@ -111,7 +118,7 @@ fn test_encode_sequence_ip_pattern() {
     }
 
     // B-frames should have backward vectors and block modes
-    for i in 1..3 {
+    for i in 1..8 {
         let mf = compressed[i].motion_field.as_ref().unwrap();
         assert!(
             mf.backward_vectors.is_some(),
@@ -258,31 +265,34 @@ fn test_bframe_sequence_roundtrip() {
 
     let w = 256;
     let h = 256;
-    // 7 frames with ki=7: I B B P B B P
-    let frames_rgb: Vec<Vec<f32>> = (0..7)
+    // 9 frames with ki=9: I [B×7] P (one full 3-level pyramid group)
+    // B_FRAMES_PER_GROUP=7, group_size=8: ki=9 covers one full group.
+    let frames_rgb: Vec<Vec<f32>> = (0..9)
         .map(|i| make_gradient_frame(w, h, i as f32 * 2.0))
         .collect();
     let frame_refs: Vec<&[f32]> = frames_rgb.iter().map(|f| f.as_slice()).collect();
 
     let mut config = CodecConfig::default();
     config.tile_size = 256;
-    config.keyframe_interval = 7; // triggers B-frames (ki >= 4)
+    config.keyframe_interval = 9; // ki >= 8 triggers B-frames
 
     let compressed = enc.encode_sequence(&ctx, &frame_refs, w, h, &config);
-    assert_eq!(compressed.len(), 7);
+    assert_eq!(compressed.len(), 9);
 
-    // Verify frame types: I B B P B B P
+    // Verify frame types: I [B₁..B₇] P
     assert_eq!(compressed[0].frame_type, FrameType::Intra);
-    assert_eq!(compressed[1].frame_type, FrameType::Bidirectional);
-    assert_eq!(compressed[2].frame_type, FrameType::Bidirectional);
-    assert_eq!(compressed[3].frame_type, FrameType::Predicted);
-    assert_eq!(compressed[4].frame_type, FrameType::Bidirectional);
-    assert_eq!(compressed[5].frame_type, FrameType::Bidirectional);
-    assert_eq!(compressed[6].frame_type, FrameType::Predicted);
+    for i in 1..8 {
+        assert_eq!(
+            compressed[i].frame_type,
+            FrameType::Bidirectional,
+            "Frame {i} should be Bidirectional"
+        );
+    }
+    assert_eq!(compressed[8].frame_type, FrameType::Predicted);
 
     // Decode using B-frame aware sequence decoder
     let decoded = dec.decode_sequence(&ctx, &compressed);
-    assert_eq!(decoded.len(), 7);
+    assert_eq!(decoded.len(), 9);
 
     for (i, dec_frame) in decoded.iter().enumerate() {
         let psnr = compute_psnr(&frames_rgb[i], dec_frame);

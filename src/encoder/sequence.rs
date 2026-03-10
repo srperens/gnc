@@ -21,8 +21,9 @@ use crate::{
 const DEFAULT_FPS: f64 = 30.0;
 
 /// Number of consecutive B-frames between anchor frames in a GOP.
-/// A value of 2 gives groups of [B B P] — standard for moderate latency.
-const B_FRAMES_PER_GROUP: usize = 2;
+/// A value of 7 gives 8-frame groups of [B₀ B₁ B₂ B₃ B₄ B₅ B₆ P₇] — 3-level dyadic pyramid.
+/// Coding order: P₇ B₄ B₂ B₆ B₁ B₃ B₅ B₀ (hierarchical, from coarse to fine temporal scale).
+const B_FRAMES_PER_GROUP: usize = 7;
 
 /// Skip threshold for inter-frame residual tiles (in quantized units, post-quantization).
 ///
@@ -619,16 +620,29 @@ impl EncoderPipeline {
                 // 3. Swap: gpu_ref_planes = past anchor, gpu_bwd_ref_planes = future P
                 self.swap_ref_planes();
 
-                // 4. Encode B-frames between past and future anchors.
-                // First B-frame uses None predictor (full coarse search).
-                // Subsequent B-frames use previous B's MVs for temporal prediction.
-                // B1→B2 pipelining: after submitting B_i's command, B_(i+1)'s preprocess+ME
-                // is submitted before the Rice readback poll, hiding the ~18ms Metal sync.
-                let mut prev_bidir_fwd_mv: Option<wgpu::Buffer> = None;
-                let mut prev_bidir_bwd_mv: Option<wgpu::Buffer> = None;
-                let mut pending_bframe_me: Option<PrecomputedBFrameME> = None;
-                for b in 0..b_count {
-                    let b_display = group_start + b;
+                // 4. Hierarchical pyramid B-frame encoding (3-level dyadic).
+                // Coding order: B₄ → B₂ → B₆ → B₁ → B₃ → B₅ → B₀ → B₇
+                // (coarsest temporal scale first, finest last)
+                // Display indices within group: B₁=+0, B₂=+1, B₃=+2, B₄=+3, B₅=+4, B₆=+5, B₇=+6
+                //
+                // Pyramid reference pool (matches decoder slot indices in fwd_ref_idx/bwd_ref_idx):
+                //   slot 0 = past anchor  (gpu_ref_planes)
+                //   slot 1 = future P     (gpu_bwd_ref_planes)
+                //   slot 2 = B₄           (gpu_pyramid_ref_planes[0])
+                //   slot 3 = B₂           (gpu_pyramid_ref_planes[1])
+                //   slot 4 = B₆           (gpu_pyramid_ref_planes[2])
+                let plane_size = (padded_pixels * std::mem::size_of::<f32>()) as u64;
+                let pyramid_enabled = b_count == 7;
+
+                // Helper to encode one B-frame and optionally decode to pyramid slot.
+                // Returns the CompressedFrame with ref indices set.
+                // This macro-like sequence is inlined for each pyramid tier.
+
+                // ── Layer 1: B₄ (display offset +3) ─────────────────────────────────────────
+                // refs: past_anchor(0) ↔ future_P(1)
+                // After encode: local-decode to pyramid slot 0 (B₄)
+                let b4_display = group_start + 3;
+                {
                     let b_config = if let Some(ref rc) = rate_ctrl {
                         let mut cfg = config.clone();
                         cfg.quantization_step = rc.estimate_qstep();
@@ -636,16 +650,9 @@ impl EncoderPipeline {
                     } else {
                         config.clone()
                     };
-                    let fwd_pred = prev_bidir_fwd_mv.as_ref();
-                    let bwd_pred = prev_bidir_bwd_mv.as_ref();
-                    let b_frame_data = load_frame(b_display);
-                    // Pre-load next B-frame pixels for look-ahead ME (B1→B2 pipelining).
-                    let next_b_pixels: Option<Vec<f32>> = if b + 1 < b_count {
-                        Some(load_frame(group_start + b + 1))
-                    } else {
-                        None
-                    };
-                    let (compressed, new_fwd_mv, new_bwd_mv, next_bframe_me) = self.encode_bframe(
+                    let b_frame_data = load_frame(b4_display);
+                    // fwd = past anchor (already in gpu_ref_planes), bwd = future P (gpu_bwd_ref_planes)
+                    let (mut compressed, fwd_mv, bwd_mv, _) = self.encode_bframe(
                         ctx,
                         &b_frame_data,
                         width,
@@ -655,14 +662,257 @@ impl EncoderPipeline {
                         padded_pixels,
                         &info,
                         &b_config,
-                        fwd_pred,
-                        bwd_pred,
-                        pending_bframe_me.take(),
-                        next_b_pixels.as_deref(),
+                        None,
+                        None,
+                        None,
+                        None,
                     );
-                    pending_bframe_me = next_bframe_me;
-                    prev_bidir_fwd_mv = Some(new_fwd_mv);
-                    prev_bidir_bwd_mv = Some(new_bwd_mv);
+                    if pyramid_enabled {
+                        if let Some(ref mut mf) = compressed.motion_field {
+                            mf.fwd_ref_idx = Some(0);
+                            mf.bwd_ref_idx = Some(1);
+                        }
+                        if info.chroma_format == ChromaFormat::Yuv444 {
+                            self.local_decode_bframe_to_pyramid_slot(
+                                ctx, &info, &b_config, &fwd_mv, &bwd_mv,
+                                padded_w, padded_h, padded_pixels, 0,
+                            );
+                        }
+                        if std::env::var("GNC_BFRAME_PYRAMID").is_ok() {
+                            eprintln!(
+                                "[pyramid_b] Frame {} (display) layer=1 fwd_ref=0 bwd_ref=1",
+                                b4_display
+                            );
+                        }
+                    }
+                    if let Some(ref mut rc) = rate_ctrl {
+                        rc.update(b_config.quantization_step, compressed.bpp());
+                    }
+                    if diag_enabled {
+                        let d = diagnostics::collect(
+                            b4_display,
+                            &compressed,
+                            b_config.quantization_step,
+                            last_iframe_bytes,
+                        );
+                        diagnostics::print(&d);
+                    }
+                    results[b4_display] = Some(compressed);
+                    drop(fwd_mv);
+                    drop(bwd_mv);
+                }
+
+                // ── Layer 2: B₂ (display offset +1) ─────────────────────────────────────────
+                // refs: past_anchor(0) ↔ B₄(2)
+                //
+                // State management for B₂ and B₆:
+                //   After step 3 swap: fwd=past_anchor, bwd=decoded_P (future anchor)
+                //   Save decoded_P → slot 4 (permanent) before any bwd overwrites.
+                //   B₂ needs: fwd=past, bwd=B₄  → copy B₄(slot0) → bwd
+                //   B₆ needs: fwd=B₄, bwd=decoded_P  → save past(slot3), copy B₄(slot0)→fwd, copy slot4→bwd
+                if pyramid_enabled && info.chroma_format == ChromaFormat::Yuv444 {
+                    // Save decoded_P permanently into slot 4 before any bwd manipulation
+                    self.copy_bwd_ref_to_pyramid_slot(ctx, 4, plane_size); // decoded_P → slot 4
+                    self.copy_pyramid_slot_to_bwd_ref(ctx, 0, plane_size); // B₄ → bwd
+                }
+                let b2_display = group_start + 1;
+                {
+                    let b_config = if let Some(ref rc) = rate_ctrl {
+                        let mut cfg = config.clone();
+                        cfg.quantization_step = rc.estimate_qstep();
+                        cfg
+                    } else {
+                        config.clone()
+                    };
+                    let b_frame_data = load_frame(b2_display);
+                    let (mut compressed, fwd_mv, bwd_mv, _) = self.encode_bframe(
+                        ctx,
+                        &b_frame_data,
+                        width,
+                        height,
+                        padded_w,
+                        padded_h,
+                        padded_pixels,
+                        &info,
+                        &b_config,
+                        None,
+                        None,
+                        None,
+                        None,
+                    );
+                    if pyramid_enabled {
+                        if let Some(ref mut mf) = compressed.motion_field {
+                            mf.fwd_ref_idx = Some(0);
+                            mf.bwd_ref_idx = Some(2);
+                        }
+                        if info.chroma_format == ChromaFormat::Yuv444 {
+                            self.local_decode_bframe_to_pyramid_slot(
+                                ctx, &info, &b_config, &fwd_mv, &bwd_mv,
+                                padded_w, padded_h, padded_pixels, 1,
+                            );
+                        }
+                        if std::env::var("GNC_BFRAME_PYRAMID").is_ok() {
+                            eprintln!(
+                                "[pyramid_b] Frame {} (display) layer=2 fwd_ref=0 bwd_ref=2",
+                                b2_display
+                            );
+                        }
+                    }
+                    if let Some(ref mut rc) = rate_ctrl {
+                        rc.update(b_config.quantization_step, compressed.bpp());
+                    }
+                    if diag_enabled {
+                        let d = diagnostics::collect(
+                            b2_display,
+                            &compressed,
+                            b_config.quantization_step,
+                            last_iframe_bytes,
+                        );
+                        diagnostics::print(&d);
+                    }
+                    results[b2_display] = Some(compressed);
+                    drop(fwd_mv);
+                    drop(bwd_mv);
+                }
+
+                // ── Layer 2: B₆ (display offset +5) ─────────────────────────────────────────
+                // refs: B₄(2) ↔ decoded_P(1)
+                // State: fwd=past, bwd=B₄ (from B₂ setup).
+                // Save past_anchor to slot 3 before overwriting fwd.
+                // Then set fwd=B₄ (from slot 0), restore bwd=decoded_P (from slot 4).
+                if pyramid_enabled && info.chroma_format == ChromaFormat::Yuv444 {
+                    self.copy_fwd_ref_to_pyramid_slot(ctx, 3, plane_size); // past_anchor → slot 3
+                    self.copy_pyramid_slot_to_fwd_ref(ctx, 0, plane_size); // B₄ → fwd
+                    self.copy_pyramid_slot_to_bwd_ref(ctx, 4, plane_size); // decoded_P (perm) → bwd
+                }
+                let b6_display = group_start + 5;
+                {
+                    let b_config = if let Some(ref rc) = rate_ctrl {
+                        let mut cfg = config.clone();
+                        cfg.quantization_step = rc.estimate_qstep();
+                        cfg
+                    } else {
+                        config.clone()
+                    };
+                    let b_frame_data = load_frame(b6_display);
+                    let (mut compressed, fwd_mv, bwd_mv, _) = self.encode_bframe(
+                        ctx,
+                        &b_frame_data,
+                        width,
+                        height,
+                        padded_w,
+                        padded_h,
+                        padded_pixels,
+                        &info,
+                        &b_config,
+                        None,
+                        None,
+                        None,
+                        None,
+                    );
+                    if pyramid_enabled {
+                        if let Some(ref mut mf) = compressed.motion_field {
+                            mf.fwd_ref_idx = Some(2);
+                            mf.bwd_ref_idx = Some(1);
+                        }
+                        if info.chroma_format == ChromaFormat::Yuv444 {
+                            self.local_decode_bframe_to_pyramid_slot(
+                                ctx, &info, &b_config, &fwd_mv, &bwd_mv,
+                                padded_w, padded_h, padded_pixels, 2,
+                            );
+                        }
+                        if std::env::var("GNC_BFRAME_PYRAMID").is_ok() {
+                            eprintln!(
+                                "[pyramid_b] Frame {} (display) layer=2 fwd_ref=2 bwd_ref=1",
+                                b6_display
+                            );
+                        }
+                    }
+                    if let Some(ref mut rc) = rate_ctrl {
+                        rc.update(b_config.quantization_step, compressed.bpp());
+                    }
+                    if diag_enabled {
+                        let d = diagnostics::collect(
+                            b6_display,
+                            &compressed,
+                            b_config.quantization_step,
+                            last_iframe_bytes,
+                        );
+                        diagnostics::print(&d);
+                    }
+                    results[b6_display] = Some(compressed);
+                    drop(fwd_mv);
+                    drop(bwd_mv);
+                }
+
+                // ── Layer 3: B₁ B₃ B₅ B₇ (display +0 +2 +4 +6) ──────────────────────────
+                // After B₆: fwd=B₄, bwd=future_P.
+                // Pyramid slots: 0=B₄, 1=B₂, 2=B₆, 3=past_anchor.
+                // Each frame gets its refs loaded from pyramid slots or bwd.
+                //
+                // Layer 3 B-frames encoding
+                let layer3_order = [
+                    (group_start, 0u8, 3u8),     // B₁: fwd=0(past_anchor/slot3), bwd=3(B₂/slot1)
+                    (group_start + 2, 3, 2),      // B₃: fwd=3(B₂/slot1), bwd=2(B₄/slot0)
+                    (group_start + 4, 2, 4),      // B₅: fwd=2(B₄/slot0), bwd=4(B₆/slot2)
+                    (group_start + 6, 4, 1),      // B₇: fwd=4(B₆/slot2), bwd=1(future_P/bwd buf)
+                ];
+
+                for (b_display, fwd_idx, bwd_idx) in layer3_order {
+                    // Set up refs: load appropriate buffers from pyramid slots.
+                    // Slot-to-buffer mapping: pool slot 0=past, 1=future_P, 2=B₄, 3=B₂, 4=B₆.
+                    // Encoder pyramid slots: 0=B₄, 1=B₂, 2=B₆, 3=past_anchor.
+                    if pyramid_enabled && info.chroma_format == ChromaFormat::Yuv444 {
+                        match fwd_idx {
+                            0 => self.copy_pyramid_slot_to_fwd_ref(ctx, 3, plane_size), // past_anchor
+                            2 => self.copy_pyramid_slot_to_fwd_ref(ctx, 0, plane_size), // B₄
+                            3 => self.copy_pyramid_slot_to_fwd_ref(ctx, 1, plane_size), // B₂
+                            4 => self.copy_pyramid_slot_to_fwd_ref(ctx, 2, plane_size), // B₆
+                            _ => {}
+                        }
+                        match bwd_idx {
+                            1 => { /* future_P already in gpu_bwd_ref_planes (restored for B₆) */ }
+                            2 => self.copy_pyramid_slot_to_bwd_ref(ctx, 0, plane_size), // B₄
+                            3 => self.copy_pyramid_slot_to_bwd_ref(ctx, 1, plane_size), // B₂
+                            4 => self.copy_pyramid_slot_to_bwd_ref(ctx, 2, plane_size), // B₆
+                            _ => {}
+                        }
+                    }
+                    let b_config = if let Some(ref rc) = rate_ctrl {
+                        let mut cfg = config.clone();
+                        cfg.quantization_step = rc.estimate_qstep();
+                        cfg
+                    } else {
+                        config.clone()
+                    };
+                    let b_frame_data = load_frame(b_display);
+                    let (mut compressed, fwd_mv, bwd_mv, _) = self.encode_bframe(
+                        ctx,
+                        &b_frame_data,
+                        width,
+                        height,
+                        padded_w,
+                        padded_h,
+                        padded_pixels,
+                        &info,
+                        &b_config,
+                        None,
+                        None,
+                        None,
+                        None,
+                    );
+                    if pyramid_enabled {
+                        if let Some(ref mut mf) = compressed.motion_field {
+                            mf.fwd_ref_idx = Some(fwd_idx);
+                            mf.bwd_ref_idx = Some(bwd_idx);
+                        }
+                        if std::env::var("GNC_BFRAME_PYRAMID").is_ok() {
+                            eprintln!(
+                                "[pyramid_b] Frame {} (display) layer=3 fwd_ref={} bwd_ref={}",
+                                b_display, fwd_idx, bwd_idx
+                            );
+                        }
+                    }
                     if let Some(ref mut rc) = rate_ctrl {
                         rc.update(b_config.quantization_step, compressed.bpp());
                     }
@@ -674,62 +924,27 @@ impl EncoderPipeline {
                             last_iframe_bytes,
                         );
                         diagnostics::print(&d);
-
-                        if let Some(ref stg) = diag_twav_staging {
-                            let coeffs = self.diag_original_wavelet_coefficients(
-                                ctx,
-                                &b_frame_data,
-                                padded_w,
-                                padded_h,
-                                padded_pixels,
-                                &info,
-                                config,
-                                stg,
-                            );
-                            if let Some(ref prev) = prev_twav_coeffs {
-                                let y_stats = diagnostics::compute_temporal_wavelet(
-                                    &coeffs[0],
-                                    &prev[0],
-                                    padded_w,
-                                    padded_h,
-                                    config.tile_size,
-                                    config.wavelet_levels,
-                                    config.quantization_step,
-                                );
-                                let co_stats = diagnostics::compute_temporal_wavelet(
-                                    &coeffs[1],
-                                    &prev[1],
-                                    padded_w,
-                                    padded_h,
-                                    config.tile_size,
-                                    config.wavelet_levels,
-                                    config.quantization_step,
-                                );
-                                let cg_stats = diagnostics::compute_temporal_wavelet(
-                                    &coeffs[2],
-                                    &prev[2],
-                                    padded_w,
-                                    padded_h,
-                                    config.tile_size,
-                                    config.wavelet_levels,
-                                    config.quantization_step,
-                                );
-                                diagnostics::print_temporal_wavelet(
-                                    b_display,
-                                    FrameType::Bidirectional,
-                                    &y_stats,
-                                    &co_stats,
-                                    &cg_stats,
-                                );
-                            }
-                            prev_twav_coeffs = Some(coeffs);
-                        }
                     }
                     results[b_display] = Some(compressed);
+                    drop(fwd_mv);
+                    drop(bwd_mv);
                 }
 
-                // 5. Swap back: gpu_ref_planes = decoded P (for next group's forward ref)
-                self.swap_ref_planes();
+                // 5. Restore state: gpu_ref_planes = past_anchor, gpu_bwd_ref_planes = future P.
+                // For proper next-group setup we need to swap back to decoded_P in ref_planes.
+                // The swap at step 3 made: fwd=past_anchor, bwd=future_P.
+                // After all the pyramid manipulations, the state depends on what we did.
+                // We need gpu_ref_planes = decoded P for the next group's forward ref.
+                // 5. Restore state for next group: gpu_ref_planes = decoded_P (future anchor).
+                // For pyramid path: decoded_P was saved permanently into pyramid slot 4 before
+                // any bwd manipulation. Restore it to gpu_ref_planes so the next group's P/I
+                // encode uses it as the forward reference.
+                // For non-pyramid path: swap back (original behaviour).
+                if pyramid_enabled && info.chroma_format == ChromaFormat::Yuv444 {
+                    self.copy_pyramid_slot_to_fwd_ref(ctx, 4, plane_size); // decoded_P → fwd
+                } else {
+                    self.swap_ref_planes();
+                }
             }
 
             // Remainder frames (< group_size) encoded as P-frames
@@ -3720,6 +3935,8 @@ impl EncoderPipeline {
                         block_size: ME_SPLIT_BLOCK_SIZE,
                         backward_vectors: None,
                         block_modes: None,
+                        fwd_ref_idx: None,
+                        bwd_ref_idx: None,
                     }),
                     intra_modes: None,
                     residual_stats,
@@ -4317,6 +4534,8 @@ impl EncoderPipeline {
                     block_size: ME_SPLIT_BLOCK_SIZE,
                     backward_vectors: None,
                     block_modes: None,
+                    fwd_ref_idx: None,
+                    bwd_ref_idx: None,
                 }),
                 intra_modes: None,
                 residual_stats: None,
@@ -5078,6 +5297,8 @@ impl EncoderPipeline {
                         block_size: ME_BLOCK_SIZE,
                         backward_vectors: Some(bwd_mvs),
                         block_modes: Some(block_modes),
+                        fwd_ref_idx: None,
+                        bwd_ref_idx: None,
                     }),
                     intra_modes: None,
                     residual_stats,
@@ -5289,6 +5510,8 @@ impl EncoderPipeline {
                     block_size: ME_BLOCK_SIZE,
                     backward_vectors: Some(bwd_mvs),
                     block_modes: Some(block_modes),
+                    fwd_ref_idx: None,
+                    bwd_ref_idx: None,
                 }),
                 intra_modes: None,
                 residual_stats: None,
@@ -5306,6 +5529,202 @@ impl EncoderPipeline {
     fn swap_ref_planes(&mut self) {
         let bufs = self.cached.as_mut().unwrap();
         std::mem::swap(&mut bufs.gpu_ref_planes, &mut bufs.gpu_bwd_ref_planes);
+    }
+
+    /// Copy a pyramid ref slot into gpu_ref_planes (GPU copy, 3 planes).
+    /// Slot 0 = B₄, Slot 1 = B₂, Slot 2 = B₆.
+    fn copy_pyramid_slot_to_fwd_ref(&mut self, ctx: &GpuContext, slot: usize, plane_size: u64) {
+        let bufs = self.cached.as_ref().unwrap();
+        let mut cmd = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("pyr_slot_to_fwd"),
+            });
+        for p in 0..3 {
+            cmd.copy_buffer_to_buffer(
+                &bufs.gpu_pyramid_ref_planes[slot][p],
+                0,
+                &bufs.gpu_ref_planes[p],
+                0,
+                plane_size,
+            );
+        }
+        ctx.queue.submit(Some(cmd.finish()));
+    }
+
+    /// Copy a pyramid ref slot into gpu_bwd_ref_planes (GPU copy, 3 planes).
+    fn copy_pyramid_slot_to_bwd_ref(&mut self, ctx: &GpuContext, slot: usize, plane_size: u64) {
+        let bufs = self.cached.as_ref().unwrap();
+        let mut cmd = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("pyr_slot_to_bwd"),
+            });
+        for p in 0..3 {
+            cmd.copy_buffer_to_buffer(
+                &bufs.gpu_pyramid_ref_planes[slot][p],
+                0,
+                &bufs.gpu_bwd_ref_planes[p],
+                0,
+                plane_size,
+            );
+        }
+        ctx.queue.submit(Some(cmd.finish()));
+    }
+
+    /// Copy gpu_bwd_ref_planes into a pyramid ref slot (GPU copy, 3 planes).
+    /// Used to save the future P-frame anchor into the pyramid pool (slot index is informational).
+    fn copy_bwd_ref_to_pyramid_slot(&mut self, ctx: &GpuContext, slot: usize, plane_size: u64) {
+        let bufs = self.cached.as_ref().unwrap();
+        let mut cmd = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("bwd_ref_to_pyr_slot"),
+            });
+        for p in 0..3 {
+            cmd.copy_buffer_to_buffer(
+                &bufs.gpu_bwd_ref_planes[p],
+                0,
+                &bufs.gpu_pyramid_ref_planes[slot][p],
+                0,
+                plane_size,
+            );
+        }
+        ctx.queue.submit(Some(cmd.finish()));
+    }
+
+    /// Copy gpu_ref_planes (forward/past ref) into a pyramid ref slot (GPU copy, 3 planes).
+    /// Used to save the past anchor before it is overwritten during pyramid ref management.
+    fn copy_fwd_ref_to_pyramid_slot(&mut self, ctx: &GpuContext, slot: usize, plane_size: u64) {
+        let bufs = self.cached.as_ref().unwrap();
+        let mut cmd = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("fwd_ref_to_pyr_slot"),
+            });
+        for p in 0..3 {
+            cmd.copy_buffer_to_buffer(
+                &bufs.gpu_ref_planes[p],
+                0,
+                &bufs.gpu_pyramid_ref_planes[slot][p],
+                0,
+                plane_size,
+            );
+        }
+        ctx.queue.submit(Some(cmd.finish()));
+    }
+
+    /// Local decode of a B-frame residual to a pyramid reference slot.
+    ///
+    /// After `encode_bframe` completes, quantized data is in:
+    ///   Y → recon_y, Co → co_plane (444) or ref_upload (non-444), Cg → plane_b
+    ///
+    /// This function runs dequant + inverse wavelet + inverse bidir MC using the
+    /// fwd/bwd MV buffers, and stores the reconstructed frame into
+    /// `gpu_pyramid_ref_planes[slot]`. Only 4:4:4 (444) mode is supported for
+    /// reference B-frames; non-444 B-frames should not be used as references.
+    ///
+    /// The fwd and bwd reference buffers must already contain the correct references
+    /// (in gpu_ref_planes and gpu_bwd_ref_planes respectively).
+    #[allow(clippy::too_many_arguments)]
+    fn local_decode_bframe_to_pyramid_slot(
+        &mut self,
+        ctx: &GpuContext,
+        info: &FrameInfo,
+        config: &CodecConfig,
+        fwd_mv_buf: &wgpu::Buffer,
+        bwd_mv_buf: &wgpu::Buffer,
+        padded_w: u32,
+        padded_h: u32,
+        padded_pixels: usize,
+        slot: usize,
+    ) {
+        let plane_size = (padded_pixels * std::mem::size_of::<f32>()) as u64;
+
+        // B-frames use residual-adapted quantization (uniform weights, doubled dead_zone).
+        let uniform_weights = crate::SubbandWeights::uniform(config.wavelet_levels);
+        let weights_luma = uniform_weights.pack_weights();
+        let weights_chroma = uniform_weights.pack_weights_chroma();
+        let res_dead_zone = config.dead_zone * 2.0;
+
+        self.ensure_cached(ctx, padded_w, padded_h, info.width, info.height);
+        let bufs = self.cached.as_ref().unwrap();
+
+        // Quantized buffers: Y → recon_y, Co → co_plane (444), Cg → plane_b
+        let quant_bufs: [&wgpu::Buffer; 3] = [&bufs.recon_y, &bufs.co_plane, &bufs.plane_b];
+
+        let mut cmd = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("bframe_local_decode_to_pyr"),
+            });
+
+        for (p, quant_buf) in quant_bufs.iter().enumerate() {
+            let weights = if p == 0 {
+                &weights_luma
+            } else {
+                &weights_chroma
+            };
+
+            // Dequantize → cg_plane (scratch)
+            self.quantize.dispatch(
+                ctx,
+                &mut cmd,
+                quant_buf,
+                &bufs.cg_plane,
+                padded_pixels as u32,
+                config.quantization_step,
+                res_dead_zone,
+                false,
+                padded_w,
+                padded_h,
+                config.tile_size,
+                config.wavelet_levels,
+                weights,
+            );
+
+            // Inverse wavelet: cg_plane → plane_c(scratch) → plane_a (residual)
+            self.transform.inverse(
+                ctx,
+                &mut cmd,
+                &bufs.cg_plane,
+                &bufs.plane_c,
+                &bufs.plane_a,
+                info,
+                config.wavelet_levels,
+                config.wavelet_type,
+                p,
+            );
+
+            // Inverse bidir MC: plane_a (residual) + fwd_ref + bwd_ref → recon_out
+            // Use mc_bidir_inv_params (mode=1) for reconstruction: recon = residual + prediction.
+            self.motion.compensate_bidir_cached(
+                ctx,
+                &mut cmd,
+                &bufs.plane_a,
+                &bufs.gpu_ref_planes[p],
+                &bufs.gpu_bwd_ref_planes[p],
+                fwd_mv_buf,
+                bwd_mv_buf,
+                &bufs.bidir_modes_scratch,
+                &bufs.recon_out,
+                padded_w,
+                padded_h,
+                &bufs.mc_bidir_inv_params,
+            );
+
+            // Copy recon_out → pyramid ref slot [p]
+            cmd.copy_buffer_to_buffer(
+                &bufs.recon_out,
+                0,
+                &bufs.gpu_pyramid_ref_planes[slot][p],
+                0,
+                plane_size,
+            );
+        }
+        ctx.queue.submit(Some(cmd.finish()));
+        // Synchronize to ensure pyramid slot is ready before dependent B-frames use it
+        ctx.device.poll(wgpu::Maintain::Wait);
     }
 
     /// Diagnostic: compute quantized wavelet coefficients of the original signal.

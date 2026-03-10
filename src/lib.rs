@@ -254,6 +254,13 @@ pub struct MotionField {
     pub backward_vectors: Option<Vec<[i16; 2]>>,
     /// Per-block prediction mode (B-frames only): 0=fwd, 1=bwd, 2=bidir
     pub block_modes: Option<Vec<u8>>,
+    /// Index into the decoder's reference pool for the forward reference (B-frames).
+    /// 0 = past anchor (I/P), default. Set for hierarchical pyramid B-frames.
+    /// None means use default pool slot (0 for fwd, 1 for bwd) — backwards compatible.
+    pub fwd_ref_idx: Option<u8>,
+    /// Index into the decoder's reference pool for the backward reference (B-frames).
+    /// 1 = future anchor (I/P), default. Set for hierarchical pyramid B-frames.
+    pub bwd_ref_idx: Option<u8>,
 }
 
 /// Which wavelet transform to use.
@@ -780,14 +787,40 @@ pub fn decode_order(frames: &[CompressedFrame]) -> Vec<usize> {
                 i += 1;
             }
             let b_end = i;
+            let b_count = b_end - b_start;
+
             // The next non-B frame (anchor) must be decoded first
             if i < frames.len() {
                 order.push(i);
                 i += 1;
             }
-            // Then decode B-frames (they reference both past and future anchors)
-            for b in b_start..b_end {
-                order.push(b);
+
+            // Check if this is a pyramid B-frame group (fwd_ref_idx set on any B-frame)
+            let is_pyramid = b_count == 7
+                && (b_start..b_end).any(|j| {
+                    frames[j]
+                        .motion_field
+                        .as_ref()
+                        .and_then(|mf| mf.fwd_ref_idx)
+                        .is_some()
+                });
+
+            if is_pyramid {
+                // 3-level dyadic pyramid: decode order is coarse-to-fine within display positions.
+                // Display offsets within the group of 7 B-frames (b_start..b_end):
+                //   B₁=+0, B₂=+1, B₃=+2, B₄=+3, B₅=+4, B₆=+5, B₇=+6
+                // Coding (decode) order: B₄(+3), B₂(+1), B₆(+5), B₁(+0), B₃(+2), B₅(+4), B₇(+6)
+                let offsets = [3, 1, 5, 0, 2, 4, 6];
+                for &off in &offsets {
+                    if b_start + off < b_end {
+                        order.push(b_start + off);
+                    }
+                }
+            } else {
+                // Flat B-frames: decode in display order (both reference same past/future anchors)
+                for b in b_start..b_end {
+                    order.push(b);
+                }
             }
         }
     }

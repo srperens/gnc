@@ -60,6 +60,12 @@ pub(super) struct CachedEncodeBuffers {
     pub(super) gpu_ref_planes: [wgpu::Buffer; 3],
     // Backward (future) reference planes for B-frame encoding.
     pub(super) gpu_bwd_ref_planes: [wgpu::Buffer; 3],
+    // Pyramid B-frame intermediate reference buffers.
+    // Slot 0: B₄ (layer-1 midpoint), Slot 1: B₂ (layer-2 first), Slot 2: B₆ (layer-2 second).
+    // Slot 3: past_anchor temp (saved before fwd is overwritten for B₆ setup).
+    // Slot 4: decoded_P / future_anchor (saved permanently before bwd is overwritten for B₂).
+    // Populated by local decode of reference B-frames during pyramid encoding.
+    pub(super) gpu_pyramid_ref_planes: [[wgpu::Buffer; 3]; 5],
 
     // Per-plane histogram buffers for fused quantize+histogram path.
     // Each buffer holds HIST_TILE_STRIDE * num_tiles u32s.
@@ -91,6 +97,9 @@ pub(super) struct CachedEncodeBuffers {
 
     // MC params (used by bidir + split-decision 8×8)
     pub(super) mc_bidir_fwd_params: wgpu::Buffer,
+    /// Inverse (reconstruction) bidir MC params — mode=1, block_size=ME_BLOCK_SIZE.
+    /// Used by local_decode_bframe_to_pyramid_slot to reconstruct pyramid reference frames.
+    pub(super) mc_bidir_inv_params: wgpu::Buffer,
 
     // MC params for block_size=8 (split decision output)
     pub(super) mc_fwd_params_8: wgpu::Buffer,
@@ -542,6 +551,16 @@ impl CachedEncodeBuffers {
                     mapped_at_creation: false,
                 })
             }),
+            gpu_pyramid_ref_planes: std::array::from_fn::<_, 5, _>(|slot| {
+                std::array::from_fn(|p| {
+                    ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some(&format!("enc_pyr_ref_{}_{}", slot, ["y", "co", "cg"][p])),
+                        size: plane_size,
+                        usage: plane_usage,
+                        mapped_at_creation: false,
+                    })
+                })
+            }),
 
             fused_hist_bufs: None,
 
@@ -632,6 +651,13 @@ impl CachedEncodeBuffers {
                 padded_w,
                 padded_h,
                 true,
+                ME_BLOCK_SIZE,
+            ),
+            mc_bidir_inv_params: Self::make_mc_params_bs(
+                ctx,
+                padded_w,
+                padded_h,
+                false,
                 ME_BLOCK_SIZE,
             ),
             mc_fwd_params_8: Self::make_mc_params_bs(

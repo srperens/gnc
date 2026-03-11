@@ -67,6 +67,9 @@ pub struct EncoderPipeline {
     zero_skip_tiles_by_map_bgl: wgpu::BindGroupLayout,
     mv_median_smooth_pipeline: wgpu::ComputePipeline,
     mv_median_smooth_bgl: wgpu::BindGroupLayout,
+    deblock_ref_pipeline_h: wgpu::ComputePipeline,
+    deblock_ref_pipeline_v: wgpu::ComputePipeline,
+    deblock_ref_bgl: wgpu::BindGroupLayout,
     pub(super) cached: Option<CachedEncodeBuffers>,
     pub(super) tw_cached: Option<CachedTemporalWaveletBuffers>,
     /// Second temporal wavelet buffer set for GOP pipelining (B set).
@@ -632,6 +635,77 @@ impl EncoderPipeline {
                     cache: None,
                 });
 
+        // Encoder-internal reference frame deblocking pipeline.
+        // Applies a 4-tap boundary smoothing filter at tile boundaries in GPU reference
+        // buffers before they are used for motion estimation. This reduces the artifact
+        // edge gradient in the reference and lowers P/B-frame residual energy.
+        // No bitstream impact — decoder never sees this.
+        // Two entry points: main_h (horizontal boundaries), main_v (vertical boundaries).
+        let dbr_shader = ctx
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("deblock_reference"),
+                source: wgpu::ShaderSource::Wgsl(
+                    include_str!("../shaders/deblock_reference.wgsl").into(),
+                ),
+            });
+        let deblock_ref_bgl =
+            ctx.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("dbr_bgl"),
+                    entries: &[
+                        // binding 0: uniform params (padded_w, padded_h, tile_size, qstep)
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        // binding 1: plane (read_write f32 storage — in-place on gpu_ref)
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                    ],
+                });
+        let dbr_pl = ctx
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("dbr_pl"),
+                bind_group_layouts: &[&deblock_ref_bgl],
+                push_constant_ranges: &[],
+            });
+        let deblock_ref_pipeline_h =
+            ctx.device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("deblock_ref_h"),
+                    layout: Some(&dbr_pl),
+                    module: &dbr_shader,
+                    entry_point: Some("main_h"),
+                    compilation_options: Default::default(),
+                    cache: None,
+                });
+        let deblock_ref_pipeline_v =
+            ctx.device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("deblock_ref_v"),
+                    layout: Some(&dbr_pl),
+                    module: &dbr_shader,
+                    entry_point: Some("main_v"),
+                    compilation_options: Default::default(),
+                    cache: None,
+                });
+
         Self {
             color: ColorConverter::new(ctx),
             transform: WaveletTransform::new(ctx),
@@ -667,6 +741,9 @@ impl EncoderPipeline {
             zero_skip_tiles_by_map_bgl,
             mv_median_smooth_pipeline,
             mv_median_smooth_bgl,
+            deblock_ref_pipeline_h,
+            deblock_ref_pipeline_v,
+            deblock_ref_bgl,
             cached: None,
             tw_cached: None,
             tw_cached_b: None,
@@ -1284,6 +1361,136 @@ impl EncoderPipeline {
         pass.set_pipeline(&self.tile_skip_bidir_pipeline);
         pass.set_bind_group(0, &bg, &[]);
         pass.dispatch_workgroups(tiles_x, tiles_y, 1);
+    }
+
+    /// Dispatch the encoder-internal reference deblocking filter (in-place on `plane_buf`).
+    ///
+    /// Applies a mild 4-tap smoothing filter at every tile boundary in the given GPU
+    /// plane buffer.  Called on decoded reference frames before they are used for ME.
+    ///
+    /// Two passes are dispatched into `cmd`:
+    ///   - main_h: horizontal tile boundary rows (between row R-1 and row R, R = k*tile_size)
+    ///   - main_v: vertical tile boundary columns (between col C-1 and col C, C = k*tile_size)
+    ///
+    /// The feature is controlled by `GNC_REF_DEBLOCK`:
+    ///   - unset / "1" → enabled (default)
+    ///   - "0"         → disabled (for A/B testing)
+    ///
+    /// Returns the number of boundary segments dispatched (for canary diagnostic).
+    /// When the feature is disabled returns 0.
+    ///
+    /// H-pass and V-pass are submitted as two separate command encoders so that
+    /// the GPU processes all horizontal-boundary writes before any vertical-boundary
+    /// writes begin.  WebGPU does not guarantee ordering between compute passes
+    /// within a single encoder, so the intersection pixels (H∩V) would otherwise
+    /// have undefined values.  Two sequential `queue.submit` calls are ordered by
+    /// the queue: the second submit cannot start until the first is complete.
+    pub(super) fn dispatch_deblock_reference(
+        &self,
+        ctx: &GpuContext,
+        plane_buf: &wgpu::Buffer,
+        padded_w: u32,
+        padded_h: u32,
+        tile_size: u32,
+        qstep: f32,
+    ) -> u32 {
+        // Feature gate: GNC_REF_DEBLOCK=0 disables, anything else (or unset) enables.
+        if std::env::var("GNC_REF_DEBLOCK").as_deref() == Ok("0") {
+            return 0;
+        }
+
+        use wgpu::util::DeviceExt;
+
+        // DeblockParams layout (16 bytes, std140-compatible):
+        //   offset  0: padded_w  u32
+        //   offset  4: padded_h  u32
+        //   offset  8: tile_size u32
+        //   offset 12: qstep     f32
+        let params_data: [u32; 4] = [
+            padded_w,
+            padded_h,
+            tile_size,
+            qstep.to_bits(),
+        ];
+        let params_buf = ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("dbr_params"),
+                contents: bytemuck::cast_slice(&params_data),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+
+        let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("dbr_bg"),
+            layout: &self.deblock_ref_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: plane_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        let tiles_x = padded_w / tile_size;
+        let tiles_y = padded_h / tile_size;
+        // Number of interior tile boundaries (between adjacent tiles):
+        //   horizontal: tiles_y - 1 rows of boundaries
+        //   vertical:   tiles_x - 1 columns of boundaries
+        let horiz_boundaries = tiles_y.saturating_sub(1);
+        let vert_boundaries = tiles_x.saturating_sub(1);
+
+        if horiz_boundaries == 0 && vert_boundaries == 0 {
+            // Single-tile frame: no boundaries to filter.
+            return 0;
+        }
+
+        // Horizontal pass — own encoder, submitted before V-pass encoder.
+        // Two separate submits guarantee H completes before V starts: the GPU
+        // processes queue submits in order, so intersection pixels (H∩V corners)
+        // are always written by H first, then overwritten by V with correct input.
+        //
+        // main_h workgroup_size(256, 1, 1): 256 threads cover one 256-pixel column segment.
+        // dispatch_workgroups(tiles_x, horiz_boundaries, 1)
+        if horiz_boundaries > 0 {
+            let mut cmd_h = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("deblock_h"),
+            });
+            {
+                let mut pass = cmd_h.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("deblock_ref_h_pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.deblock_ref_pipeline_h);
+                pass.set_bind_group(0, &bg, &[]);
+                pass.dispatch_workgroups(tiles_x, horiz_boundaries, 1);
+            }
+            ctx.queue.submit(std::iter::once(cmd_h.finish()));
+        }
+
+        // Vertical pass — own encoder, submitted after H-pass encoder.
+        // main_v workgroup_size(1, 256, 1): 256 threads cover one 256-pixel row segment.
+        // dispatch_workgroups(vert_boundaries, tiles_y, 1)
+        if vert_boundaries > 0 {
+            let mut cmd_v = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("deblock_v"),
+            });
+            {
+                let mut pass = cmd_v.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("deblock_ref_v_pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.deblock_ref_pipeline_v);
+                pass.set_bind_group(0, &bg, &[]);
+                pass.dispatch_workgroups(vert_boundaries, tiles_y, 1);
+            }
+            ctx.queue.submit(std::iter::once(cmd_v.finish()));
+        }
+
+        horiz_boundaries * tiles_x + vert_boundaries * tiles_y
     }
 
     /// Encode an RGB frame.

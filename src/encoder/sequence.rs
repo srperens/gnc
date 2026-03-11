@@ -2834,6 +2834,38 @@ impl EncoderPipeline {
                     luma_plane_size,
                 );
             }
+
+            // Encoder-internal reference deblocking: smooth tile boundary artifacts
+            // in the freshly-written reference plane before ME uses it.
+            // All planes are at luma dims (chroma was NN-upsampled above).
+            self.dispatch_deblock_reference(
+                ctx,
+                &bufs.gpu_ref_planes[p],
+                padded_w,
+                padded_h,
+                config.tile_size,
+                config.quantization_step,
+            );
+        }
+
+        // Canary: log total boundary segments deblocked this I-frame (GNC_REF_DEBLOCK_DIAG=1).
+        if std::env::var_os("GNC_REF_DEBLOCK_DIAG").is_some() {
+            let tiles_x = padded_w / config.tile_size;
+            let tiles_y = padded_h / config.tile_size;
+            let horiz = tiles_y.saturating_sub(1);
+            let vert = tiles_x.saturating_sub(1);
+            let segs_per_plane = horiz * tiles_x + vert * tiles_y;
+            let enabled = std::env::var("GNC_REF_DEBLOCK").as_deref() != Ok("0");
+            if enabled {
+                eprintln!(
+                    "[deblock] I-frame: applied {} boundary segments ({} planes × {} segs/plane, {}×{} tile grid)",
+                    segs_per_plane * 3,
+                    3,
+                    segs_per_plane,
+                    tiles_x,
+                    tiles_y,
+                );
+            }
         }
 
         ctx.queue.submit(Some(cmd.finish()));
@@ -3842,6 +3874,15 @@ impl EncoderPipeline {
                             0,
                             plane_size,
                         );
+                        // Deblock the freshly-written reference plane (4:2:0 chroma at luma dims).
+                        self.dispatch_deblock_reference(
+                            ctx,
+                            &bufs.gpu_ref_planes[p],
+                            padded_w,
+                            padded_h,
+                            config.tile_size,
+                            config.quantization_step,
+                        );
                     } else if p > 0 && is_non_444 {
                         // 4:2:2 chroma local decode: luma-domain MC (unchanged from original).
                         let ci = chroma_info_pf.as_ref().unwrap();
@@ -3906,6 +3947,15 @@ impl EncoderPipeline {
                             0,
                             plane_size,
                         );
+                        // Deblock the freshly-written reference plane (4:2:2 chroma at luma dims).
+                        self.dispatch_deblock_reference(
+                            ctx,
+                            &bufs.gpu_ref_planes[p],
+                            padded_w,
+                            padded_h,
+                            config.tile_size,
+                            config.quantization_step,
+                        );
                     } else {
                         // Luma (all modes) or 4:4:4 chroma: all at luma dims
                         self.quantize.dispatch(
@@ -3952,7 +4002,36 @@ impl EncoderPipeline {
                             0,
                             plane_size,
                         );
+                        // Deblock the freshly-written reference plane (luma or 4:4:4 chroma).
+                        self.dispatch_deblock_reference(
+                            ctx,
+                            &bufs.gpu_ref_planes[p],
+                            padded_w,
+                            padded_h,
+                            config.tile_size,
+                            config.quantization_step,
+                        );
                     }
+                }
+            }
+
+            // Canary: log total boundary segments deblocked this P-frame (GNC_REF_DEBLOCK_DIAG=1).
+            if std::env::var_os("GNC_REF_DEBLOCK_DIAG").is_some() {
+                let tiles_x = padded_w / config.tile_size;
+                let tiles_y = padded_h / config.tile_size;
+                let horiz = tiles_y.saturating_sub(1);
+                let vert = tiles_x.saturating_sub(1);
+                let segs_per_plane = horiz * tiles_x + vert * tiles_y;
+                let enabled = std::env::var("GNC_REF_DEBLOCK").as_deref() != Ok("0");
+                if enabled {
+                    eprintln!(
+                        "[deblock] P-frame: applied {} boundary segments ({} planes × {} segs/plane, {}×{} tile grid)",
+                        segs_per_plane * 3,
+                        3,
+                        segs_per_plane,
+                        tiles_x,
+                        tiles_y,
+                    );
                 }
             }
 
@@ -4787,6 +4866,15 @@ impl EncoderPipeline {
                             0,
                             plane_size,
                         );
+                        // Deblock reference (4:2:0 chroma, second P-frame path).
+                        self.dispatch_deblock_reference(
+                            ctx,
+                            &bufs.gpu_ref_planes[p],
+                            padded_w,
+                            padded_h,
+                            config.tile_size,
+                            config.quantization_step,
+                        );
                     } else if p > 0 && is_non_444 {
                         // 4:2:2 chroma local decode (luma-domain MC, unchanged):
                         let ci = chroma_info_pf.as_ref().unwrap();
@@ -4851,6 +4939,15 @@ impl EncoderPipeline {
                             0,
                             plane_size,
                         );
+                        // Deblock reference (4:2:2 chroma, second P-frame path).
+                        self.dispatch_deblock_reference(
+                            ctx,
+                            &bufs.gpu_ref_planes[p],
+                            padded_w,
+                            padded_h,
+                            config.tile_size,
+                            config.quantization_step,
+                        );
                     } else {
                         // Luma (all modes) or 4:4:4 chroma: all at luma dims
                         self.quantize.dispatch(
@@ -4896,6 +4993,15 @@ impl EncoderPipeline {
                             &bufs.gpu_ref_planes[p],
                             0,
                             plane_size,
+                        );
+                        // Deblock reference (luma / 4:4:4 chroma, second P-frame path).
+                        self.dispatch_deblock_reference(
+                            ctx,
+                            &bufs.gpu_ref_planes[p],
+                            padded_w,
+                            padded_h,
+                            config.tile_size,
+                            config.quantization_step,
                         );
                     }
                 }
@@ -6203,6 +6309,15 @@ impl EncoderPipeline {
                     0,
                     plane_size,
                 );
+                // Deblock the freshly-written pyramid reference (4:2:0 chroma at luma dims).
+                self.dispatch_deblock_reference(
+                    ctx,
+                    &bufs.gpu_pyramid_ref_planes[slot][p],
+                    padded_w,
+                    padded_h,
+                    config.tile_size,
+                    config.quantization_step,
+                );
             } else if p > 0 && is_non_444 {
                 // 4:2:2 chroma: luma-domain bidir inverse decode.
                 // Residual is at chroma dims; upsample to luma dims before bidir MC.
@@ -6280,6 +6395,15 @@ impl EncoderPipeline {
                     0,
                     plane_size,
                 );
+                // Deblock the freshly-written pyramid reference (4:2:2 chroma at luma dims).
+                self.dispatch_deblock_reference(
+                    ctx,
+                    &bufs.gpu_pyramid_ref_planes[slot][p],
+                    padded_w,
+                    padded_h,
+                    config.tile_size,
+                    config.quantization_step,
+                );
             } else {
                 // Luma (all formats) or 4:4:4 chroma: all at luma dims.
                 // Dequantize → cg_plane (scratch)
@@ -6336,8 +6460,39 @@ impl EncoderPipeline {
                     0,
                     plane_size,
                 );
+                // Deblock the freshly-written pyramid reference (luma / 4:4:4 chroma).
+                self.dispatch_deblock_reference(
+                    ctx,
+                    &bufs.gpu_pyramid_ref_planes[slot][p],
+                    padded_w,
+                    padded_h,
+                    config.tile_size,
+                    config.quantization_step,
+                );
             }
         }
+
+        // Canary: log total boundary segments deblocked this B-frame (GNC_REF_DEBLOCK_DIAG=1).
+        if std::env::var_os("GNC_REF_DEBLOCK_DIAG").is_some() {
+            let tiles_x = padded_w / config.tile_size;
+            let tiles_y = padded_h / config.tile_size;
+            let horiz = tiles_y.saturating_sub(1);
+            let vert = tiles_x.saturating_sub(1);
+            let segs_per_plane = horiz * tiles_x + vert * tiles_y;
+            let enabled = std::env::var("GNC_REF_DEBLOCK").as_deref() != Ok("0");
+            if enabled {
+                eprintln!(
+                    "[deblock] B-frame pyramid slot {}: applied {} boundary segments ({} planes × {} segs/plane, {}×{} tile grid)",
+                    slot,
+                    segs_per_plane * 3,
+                    3,
+                    segs_per_plane,
+                    tiles_x,
+                    tiles_y,
+                );
+            }
+        }
+
         ctx.queue.submit(Some(cmd.finish()));
         // Synchronize to ensure pyramid slot is ready before dependent B-frames use it
         ctx.device.poll(wgpu::Maintain::Wait);

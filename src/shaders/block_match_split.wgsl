@@ -44,16 +44,11 @@ var<workgroup> sub_sads: array<u32, 4>;
 // Broadcast: parent MV in integer-pel
 var<workgroup> parent_int_dx: i32;
 var<workgroup> parent_int_dy: i32;
-// Merged-block SADs for 4-way RD decision (computed serially by thread 0)
-var<workgroup> merged_sad_hband_top: u32;
-var<workgroup> merged_sad_hband_bot: u32;
-var<workgroup> merged_sad_vband_left: u32;
-var<workgroup> merged_sad_vband_right: u32;
-// Best MV index for each merged partition (0 or 1 → which sub-block MV was chosen)
-var<workgroup> hband_top_mv_idx: u32;
-var<workgroup> hband_bot_mv_idx: u32;
-var<workgroup> vband_left_mv_idx: u32;
-var<workgroup> vband_right_mv_idx: u32;
+// Merged-partition SADs and best MVs for 4-way RD decision (computed in parallel in Phase 4b).
+// Indices: [0]=HBAND-top, [1]=HBAND-bot, [2]=VBAND-left, [3]=VBAND-right.
+// MVs are stored in quarter-pel units (same scale as hp_track_mv).
+var<workgroup> merged_track_sad: array<u32, 4>;
+var<workgroup> merged_track_mv:  array<u32, 4>;
 
 // ±2px around parent MV (parent 16×16 is already a good predictor for 8×8).
 // Equivalent to the predictor fine-range used in block_match.wgsl.
@@ -61,6 +56,9 @@ const FINE_RANGE: i32 = 2;
 const SUB_BS: u32 = 8u;
 const SUB_PIXELS: u32 = 64u; // 8x8
 const ZERO_BIAS_8X8: u32 = 128u; // 8x8 equivalent of 512 for 16x16
+// Search range for merged HBAND/VBAND partitions (±4px integer).
+// Uses 128 threads per half-workgroup; (2*4+1)^2 = 81 candidates fit within 128 slots.
+const MERGED_FINE_RANGE: i32 = 4;
 
 fn pack_mv(dx: i32, dy: i32) -> u32 {
     return (u32(dx + 32768) << 16u) | u32(dy + 32768);
@@ -127,6 +125,31 @@ fn sub_sum_reduce(tid: u32, base: u32) {
     for (var stride = 32u; stride > 0u; stride >>= 1u) {
         if tid < stride {
             shared_sad[base + tid] += shared_sad[base + tid + stride];
+        }
+        workgroupBarrier();
+    }
+}
+
+// 128-thread min-reduction within a half-workgroup arena [base..base+128).
+// ALL 256 threads must call this unconditionally (Metal uniform control flow).
+fn half_min_reduce(half_tid: u32, base: u32) {
+    for (var stride = 64u; stride > 0u; stride >>= 1u) {
+        if half_tid < stride {
+            if shared_sad[base + half_tid + stride] < shared_sad[base + half_tid] {
+                shared_sad[base + half_tid] = shared_sad[base + half_tid + stride];
+                shared_mv[base + half_tid]  = shared_mv[base + half_tid + stride];
+            }
+        }
+        workgroupBarrier();
+    }
+}
+
+// 128-thread sum-reduction within a half-workgroup arena [base..base+128).
+// ALL 256 threads must call this unconditionally.
+fn half_sum_reduce(half_tid: u32, base: u32) {
+    for (var stride = 64u; stride > 0u; stride >>= 1u) {
+        if half_tid < stride {
+            shared_sad[base + half_tid] += shared_sad[base + half_tid + stride];
         }
         workgroupBarrier();
     }
@@ -378,125 +401,301 @@ fn main(
     }
     workgroupBarrier();
 
-    // ========== Phase 5a: Merged-block SAD computation (thread 0, serial) ==========
-    // Computes SADs for HBAND and VBAND partitions over 128-pixel regions.
-    // For each merged partition, two sub-block MV candidates are tried and the
-    // better one is chosen.  Results written to workgroup vars for Phase 5b.
+    // ========== Phase 4b: Parallel merged-partition ME (HBAND + VBAND) ==========
     //
-    // Sub-block layout within macroblock (pixel coordinates relative to mb_origin):
-    //   sub[0]=TL  x:0-7,  y:0-7      sub[1]=TR  x:8-15, y:0-7
-    //   sub[2]=BL  x:0-7,  y:8-15     sub[3]=BR  x:8-15, y:8-15
+    // Replaces the old serial Phase 5a. Each of 4 merged partitions gets its own
+    // independent full integer+half-pel+quarter-pel search using all 256 threads:
     //
-    // HBAND-top  (16×8): pixels with y=0..7  (sub 0+1), two MV candidates: mv[0], mv[1]
-    // HBAND-bot  (16×8): pixels with y=8..15 (sub 2+3), two MV candidates: mv[2], mv[3]
-    // VBAND-left (8×16): pixels with x=0..7  (sub 0+2), two MV candidates: mv[0], mv[2]
-    // VBAND-right(8×16): pixels with x=8..15 (sub 1+3), two MV candidates: mv[1], mv[3]
-    if tid == 0u {
-        // --- HBAND-top ---
-        var sad0: u32 = 0u;
-        var sad1: u32 = 0u;
-        let mv0_qx = unpack_dx(hp_track_mv[0]);
-        let mv0_qy = unpack_dy(hp_track_mv[0]);
-        let mv1_qx = unpack_dx(hp_track_mv[1]);
-        let mv1_qy = unpack_dy(hp_track_mv[1]);
-        for (var ry = 0u; ry < 8u; ry++) {
-            for (var rx = 0u; rx < 16u; rx++) {
-                let cur_x = mb_origin_x + rx;
-                let cur_y = mb_origin_y + ry;
+    //   Threads 0..127   (half_id=0) always work on the "first"  partition of the round.
+    //   Threads 128..255 (half_id=1) always work on the "second" partition of the round.
+    //
+    // Round A: HBAND-top (half 0) || HBAND-bot (half 1)
+    // Round B: VBAND-left (half 0) || VBAND-right (half 1)
+    //
+    // Integer search: ±MERGED_FINE_RANGE (±4px) = 81 candidates.
+    // 128 threads per half; threads with cand_idx >= 81 write 0xFFFFFFFF (discarded by min).
+    // Sub-pel: each thread handles exactly 1 pixel, reductions collect total region SAD.
+    //
+    // CRITICAL (Metal/M1): workgroupBarrier() is always at top level, never inside a branch.
+    //
+    // Partition pixel layouts (relative to mb_origin):
+    //   HBAND-top   (16×8): x=0..15, y=0..7     pixel_idx -> x = pixel_idx%16, y = pixel_idx/16
+    //   HBAND-bot   (16×8): x=0..15, y=8..15    pixel_idx -> x = pixel_idx%16, y = pixel_idx/16+8
+    //   VBAND-left  (8×16): x=0..7,  y=0..15    pixel_idx -> x = pixel_idx%8,  y = pixel_idx/8
+    //   VBAND-right (8×16): x=8..15, y=0..15    pixel_idx -> x = pixel_idx%8+8, y = pixel_idx/8
+
+    let half_id  = tid / 128u;           // 0 or 1
+    let half_tid = tid % 128u;           // 0..127 within the half
+    let half_base = half_id * 128u;      // shared memory base for this half
+
+    // Starting predictor: parent integer MV (from Phase 1)
+    let pred_int_dx = parent_int_dx;
+    let pred_int_dy = parent_int_dy;
+
+    let merged_fine_side = u32(2 * MERGED_FINE_RANGE + 1); // 9
+    let merged_fine_total = merged_fine_side * merged_fine_side; // 81
+
+    // ---- Round A: HBAND-top (half 0) || HBAND-bot (half 1) integer search ----
+    // Each thread evaluates one candidate MV over the full 128-pixel (16×8) partition.
+    {
+        let cand_idx = half_tid; // each thread handles exactly one candidate
+        var cand_sad: u32 = 0xFFFFFFFFu;
+        var cand_dx: i32 = pred_int_dx;
+        var cand_dy: i32 = pred_int_dy;
+
+        if cand_idx < merged_fine_total {
+            let dx_off = i32(cand_idx % merged_fine_side) - MERGED_FINE_RANGE;
+            let dy_off = i32(cand_idx / merged_fine_side) - MERGED_FINE_RANGE;
+            let test_dx = pred_int_dx + dx_off;
+            let test_dy = pred_int_dy + dy_off;
+
+            var sad: u32 = 0u;
+            // Iterate over 128 pixels in the 16×8 partition.
+            // half_id=0 → HBAND-top (y offset 0), half_id=1 → HBAND-bot (y offset 8)
+            let y_base_offset = half_id * 8u; // 0 for top, 8 for bottom
+            for (var pix = 0u; pix < 128u; pix++) {
+                let px_ = pix % 16u;
+                let py_ = pix / 16u;
+                let cur_x = mb_origin_x + px_;
+                let cur_y = mb_origin_y + y_base_offset + py_;
+                let ref_x = clamp(i32(cur_x) + test_dx, 0, i32(params.width)  - 1);
+                let ref_y = clamp(i32(cur_y) + test_dy, 0, i32(params.height) - 1);
                 let cv = current_y[cur_y * params.width + cur_x];
-                let rqx0 = i32(cur_x) * 4 + mv0_qx;
-                let rqy0 = i32(cur_y) * 4 + mv0_qy;
-                let rqx1 = i32(cur_x) * 4 + mv1_qx;
-                let rqy1 = i32(cur_y) * 4 + mv1_qy;
-                sad0 += u32(abs(cv - bilinear_sample(rqx0, rqy0)));
-                sad1 += u32(abs(cv - bilinear_sample(rqx1, rqy1)));
+                let rv = reference_y[u32(ref_y) * params.width + u32(ref_x)];
+                sad += u32(abs(cv - rv));
             }
-        }
-        if sad0 <= sad1 {
-            merged_sad_hband_top = sad0;
-            hband_top_mv_idx = 0u;
-        } else {
-            merged_sad_hband_top = sad1;
-            hband_top_mv_idx = 1u;
+            cand_sad = sad;
+            cand_dx  = test_dx;
+            cand_dy  = test_dy;
         }
 
-        // --- HBAND-bot ---
-        var sad2: u32 = 0u;
-        var sad3: u32 = 0u;
-        let mv2_qx = unpack_dx(hp_track_mv[2]);
-        let mv2_qy = unpack_dy(hp_track_mv[2]);
-        let mv3_qx = unpack_dx(hp_track_mv[3]);
-        let mv3_qy = unpack_dy(hp_track_mv[3]);
-        for (var ry = 8u; ry < 16u; ry++) {
-            for (var rx = 0u; rx < 16u; rx++) {
-                let cur_x = mb_origin_x + rx;
-                let cur_y = mb_origin_y + ry;
-                let cv = current_y[cur_y * params.width + cur_x];
-                let rqx2 = i32(cur_x) * 4 + mv2_qx;
-                let rqy2 = i32(cur_y) * 4 + mv2_qy;
-                let rqx3 = i32(cur_x) * 4 + mv3_qx;
-                let rqy3 = i32(cur_y) * 4 + mv3_qy;
-                sad2 += u32(abs(cv - bilinear_sample(rqx2, rqy2)));
-                sad3 += u32(abs(cv - bilinear_sample(rqx3, rqy3)));
-            }
-        }
-        if sad2 <= sad3 {
-            merged_sad_hband_bot = sad2;
-            hband_bot_mv_idx = 2u;
-        } else {
-            merged_sad_hband_bot = sad3;
-            hband_bot_mv_idx = 3u;
-        }
-
-        // --- VBAND-left ---
-        var sadA: u32 = 0u;
-        var sadB: u32 = 0u;
-        for (var ry = 0u; ry < 16u; ry++) {
-            for (var rx = 0u; rx < 8u; rx++) {
-                let cur_x = mb_origin_x + rx;
-                let cur_y = mb_origin_y + ry;
-                let cv = current_y[cur_y * params.width + cur_x];
-                let rqxA = i32(cur_x) * 4 + mv0_qx;
-                let rqyA = i32(cur_y) * 4 + mv0_qy;
-                let rqxB = i32(cur_x) * 4 + mv2_qx;
-                let rqyB = i32(cur_y) * 4 + mv2_qy;
-                sadA += u32(abs(cv - bilinear_sample(rqxA, rqyA)));
-                sadB += u32(abs(cv - bilinear_sample(rqxB, rqyB)));
-            }
-        }
-        if sadA <= sadB {
-            merged_sad_vband_left = sadA;
-            vband_left_mv_idx = 0u;
-        } else {
-            merged_sad_vband_left = sadB;
-            vband_left_mv_idx = 2u;
-        }
-
-        // --- VBAND-right ---
-        var sadC: u32 = 0u;
-        var sadD: u32 = 0u;
-        for (var ry = 0u; ry < 16u; ry++) {
-            for (var rx = 8u; rx < 16u; rx++) {
-                let cur_x = mb_origin_x + rx;
-                let cur_y = mb_origin_y + ry;
-                let cv = current_y[cur_y * params.width + cur_x];
-                let rqxC = i32(cur_x) * 4 + mv1_qx;
-                let rqyC = i32(cur_y) * 4 + mv1_qy;
-                let rqxD = i32(cur_x) * 4 + mv3_qx;
-                let rqyD = i32(cur_y) * 4 + mv3_qy;
-                sadC += u32(abs(cv - bilinear_sample(rqxC, rqyC)));
-                sadD += u32(abs(cv - bilinear_sample(rqxD, rqyD)));
-            }
-        }
-        if sadC <= sadD {
-            merged_sad_vband_right = sadC;
-            vband_right_mv_idx = 1u;
-        } else {
-            merged_sad_vband_right = sadD;
-            vband_right_mv_idx = 3u;
-        }
+        shared_sad[tid] = cand_sad;
+        shared_mv[tid]  = pack_mv(cand_dx, cand_dy);
     }
     workgroupBarrier();
+    half_min_reduce(half_tid, half_base);
+
+    // thread 0 → HBAND-top winner, thread 128 → HBAND-bot winner (in integer-pel × 4 = QP)
+    if tid == 0u {
+        let int_dx_ = unpack_dx(shared_mv[0]);
+        let int_dy_ = unpack_dy(shared_mv[0]);
+        merged_track_sad[0] = shared_sad[0];
+        merged_track_mv[0]  = pack_mv(int_dx_ * 4, int_dy_ * 4);
+    }
+    if tid == 128u {
+        let int_dx_ = unpack_dx(shared_mv[128]);
+        let int_dy_ = unpack_dy(shared_mv[128]);
+        merged_track_sad[1] = shared_sad[128];
+        merged_track_mv[1]  = pack_mv(int_dx_ * 4, int_dy_ * 4);
+    }
+    workgroupBarrier();
+
+    // ---- Round B: VBAND-left (half 0) || VBAND-right (half 1) integer search ----
+    {
+        let cand_idx = half_tid;
+        var cand_sad: u32 = 0xFFFFFFFFu;
+        var cand_dx: i32 = pred_int_dx;
+        var cand_dy: i32 = pred_int_dy;
+
+        if cand_idx < merged_fine_total {
+            let dx_off = i32(cand_idx % merged_fine_side) - MERGED_FINE_RANGE;
+            let dy_off = i32(cand_idx / merged_fine_side) - MERGED_FINE_RANGE;
+            let test_dx = pred_int_dx + dx_off;
+            let test_dy = pred_int_dy + dy_off;
+
+            var sad: u32 = 0u;
+            // half_id=0 → VBAND-left (x offset 0), half_id=1 → VBAND-right (x offset 8)
+            let x_base_offset = half_id * 8u; // 0 for left, 8 for right
+            for (var pix = 0u; pix < 128u; pix++) {
+                let px_ = pix % 8u;
+                let py_ = pix / 8u;
+                let cur_x = mb_origin_x + x_base_offset + px_;
+                let cur_y = mb_origin_y + py_;
+                let ref_x = clamp(i32(cur_x) + test_dx, 0, i32(params.width)  - 1);
+                let ref_y = clamp(i32(cur_y) + test_dy, 0, i32(params.height) - 1);
+                let cv = current_y[cur_y * params.width + cur_x];
+                let rv = reference_y[u32(ref_y) * params.width + u32(ref_x)];
+                sad += u32(abs(cv - rv));
+            }
+            cand_sad = sad;
+            cand_dx  = test_dx;
+            cand_dy  = test_dy;
+        }
+
+        shared_sad[tid] = cand_sad;
+        shared_mv[tid]  = pack_mv(cand_dx, cand_dy);
+    }
+    workgroupBarrier();
+    half_min_reduce(half_tid, half_base);
+
+    if tid == 0u {
+        let int_dx_ = unpack_dx(shared_mv[0]);
+        let int_dy_ = unpack_dy(shared_mv[0]);
+        merged_track_sad[2] = shared_sad[0];
+        merged_track_mv[2]  = pack_mv(int_dx_ * 4, int_dy_ * 4);
+    }
+    if tid == 128u {
+        let int_dx_ = unpack_dx(shared_mv[128]);
+        let int_dy_ = unpack_dy(shared_mv[128]);
+        merged_track_sad[3] = shared_sad[128];
+        merged_track_mv[3]  = pack_mv(int_dx_ * 4, int_dy_ * 4);
+    }
+    workgroupBarrier();
+
+    // ---- Half-pel refinement: 8-point diamond (±2 QP units) for all 4 partitions ----
+    // Round A refines HBAND-top (via half 0) and HBAND-bot (via half 1) simultaneously.
+    // Round B refines VBAND-left and VBAND-right.
+    // Each thread handles exactly one pixel of the 128-pixel region; half_sum_reduce
+    // collects the total SAD. workgroupBarrier() is always at top level of each iteration.
+
+    // Half-pel offsets (dx, dy) in quarter-pel units (1 QP unit = 0.25px, so 2 = half-pel)
+    let hpel_dx = array<i32, 8>(0, 0, -2, 2, -2, 2, -2, 2);
+    let hpel_dy = array<i32, 8>(-2, 2, 0, 0, -2, -2, 2, 2);
+
+    // Round A: HBAND half-pel
+    for (var cand = 0u; cand < 8u; cand++) {
+        let off_x = hpel_dx[cand];
+        let off_y = hpel_dy[cand];
+
+        // Pixel within the 16×8 HBAND partition indexed by half_tid.
+        let px_ = half_tid % 16u;
+        let py_ = half_tid / 16u;
+        let y_base_offset = half_id * 8u; // 0=top, 8=bottom
+        let cur_x = mb_origin_x + px_;
+        let cur_y = mb_origin_y + y_base_offset + py_;
+        let cv = current_y[cur_y * params.width + cur_x];
+
+        // Track MV for this half's partition (index 0=HBAND-top, 1=HBAND-bot)
+        let part_idx = half_id; // 0 or 1
+        let base_qx = unpack_dx(merged_track_mv[part_idx]);
+        let base_qy = unpack_dy(merged_track_mv[part_idx]);
+        let test_qx = base_qx + off_x;
+        let test_qy = base_qy + off_y;
+        let rqx = i32(cur_x) * 4 + test_qx;
+        let rqy = i32(cur_y) * 4 + test_qy;
+        let rv = bilinear_sample(rqx, rqy);
+        shared_sad[tid] = u32(abs(cv - rv));
+
+        workgroupBarrier();
+        half_sum_reduce(half_tid, half_base);
+
+        if half_tid == 0u {
+            if shared_sad[half_base] < merged_track_sad[part_idx] {
+                merged_track_sad[part_idx] = shared_sad[half_base];
+                merged_track_mv[part_idx]  = pack_mv(test_qx, test_qy);
+            }
+        }
+        workgroupBarrier();
+    }
+
+    // Round B: VBAND half-pel
+    for (var cand = 0u; cand < 8u; cand++) {
+        let off_x = hpel_dx[cand];
+        let off_y = hpel_dy[cand];
+
+        // Pixel within the 8×16 VBAND partition indexed by half_tid.
+        let px_ = half_tid % 8u;
+        let py_ = half_tid / 8u;
+        let x_base_offset = half_id * 8u; // 0=left, 8=right
+        let cur_x = mb_origin_x + x_base_offset + px_;
+        let cur_y = mb_origin_y + py_;
+        let cv = current_y[cur_y * params.width + cur_x];
+
+        // VBAND partitions are at indices 2 and 3
+        let part_idx = half_id + 2u; // 2=VBAND-left, 3=VBAND-right
+        let base_qx = unpack_dx(merged_track_mv[part_idx]);
+        let base_qy = unpack_dy(merged_track_mv[part_idx]);
+        let test_qx = base_qx + off_x;
+        let test_qy = base_qy + off_y;
+        let rqx = i32(cur_x) * 4 + test_qx;
+        let rqy = i32(cur_y) * 4 + test_qy;
+        let rv = bilinear_sample(rqx, rqy);
+        shared_sad[tid] = u32(abs(cv - rv));
+
+        workgroupBarrier();
+        half_sum_reduce(half_tid, half_base);
+
+        if half_tid == 0u {
+            if shared_sad[half_base] < merged_track_sad[part_idx] {
+                merged_track_sad[part_idx] = shared_sad[half_base];
+                merged_track_mv[part_idx]  = pack_mv(test_qx, test_qy);
+            }
+        }
+        workgroupBarrier();
+    }
+
+    // ---- Quarter-pel refinement: 8-point diamond (±1 QP unit) for all 4 partitions ----
+    let qpel_dx = array<i32, 8>(0, 0, -1, 1, -1, 1, -1, 1);
+    let qpel_dy = array<i32, 8>(-1, 1, 0, 0, -1, -1, 1, 1);
+
+    // Round A: HBAND quarter-pel
+    for (var cand = 0u; cand < 8u; cand++) {
+        let off_x = qpel_dx[cand];
+        let off_y = qpel_dy[cand];
+
+        let px_ = half_tid % 16u;
+        let py_ = half_tid / 16u;
+        let y_base_offset = half_id * 8u;
+        let cur_x = mb_origin_x + px_;
+        let cur_y = mb_origin_y + y_base_offset + py_;
+        let cv = current_y[cur_y * params.width + cur_x];
+
+        let part_idx = half_id;
+        let base_qx = unpack_dx(merged_track_mv[part_idx]);
+        let base_qy = unpack_dy(merged_track_mv[part_idx]);
+        let test_qx = base_qx + off_x;
+        let test_qy = base_qy + off_y;
+        let rqx = i32(cur_x) * 4 + test_qx;
+        let rqy = i32(cur_y) * 4 + test_qy;
+        let rv = bilinear_sample(rqx, rqy);
+        shared_sad[tid] = u32(abs(cv - rv));
+
+        workgroupBarrier();
+        half_sum_reduce(half_tid, half_base);
+
+        if half_tid == 0u {
+            if shared_sad[half_base] < merged_track_sad[part_idx] {
+                merged_track_sad[part_idx] = shared_sad[half_base];
+                merged_track_mv[part_idx]  = pack_mv(test_qx, test_qy);
+            }
+        }
+        workgroupBarrier();
+    }
+
+    // Round B: VBAND quarter-pel
+    for (var cand = 0u; cand < 8u; cand++) {
+        let off_x = qpel_dx[cand];
+        let off_y = qpel_dy[cand];
+
+        let px_ = half_tid % 8u;
+        let py_ = half_tid / 8u;
+        let x_base_offset = half_id * 8u;
+        let cur_x = mb_origin_x + x_base_offset + px_;
+        let cur_y = mb_origin_y + py_;
+        let cv = current_y[cur_y * params.width + cur_x];
+
+        let part_idx = half_id + 2u;
+        let base_qx = unpack_dx(merged_track_mv[part_idx]);
+        let base_qy = unpack_dy(merged_track_mv[part_idx]);
+        let test_qx = base_qx + off_x;
+        let test_qy = base_qy + off_y;
+        let rqx = i32(cur_x) * 4 + test_qx;
+        let rqy = i32(cur_y) * 4 + test_qy;
+        let rv = bilinear_sample(rqx, rqy);
+        shared_sad[tid] = u32(abs(cv - rv));
+
+        workgroupBarrier();
+        half_sum_reduce(half_tid, half_base);
+
+        if half_tid == 0u {
+            if shared_sad[half_base] < merged_track_sad[part_idx] {
+                merged_track_sad[part_idx] = shared_sad[half_base];
+                merged_track_mv[part_idx]  = pack_mv(test_qx, test_qy);
+            }
+        }
+        workgroupBarrier();
+    }
+    // Phase 4b complete: merged_track_sad/mv[0..3] hold best QP MVs and SADs.
 
     // ========== Phase 5b: 4-way RD decision (thread 0) + output ==========
     // RD cost = SAD + mode-specific overhead term.
@@ -531,8 +730,8 @@ fn main(
         // (2 MVs each), which is intentionally on a different scale — they compete against
         // 16×16 and 8×8 but are not required to be dimensionally equivalent.
         let rd_8x8   = sum_sub + threshold;
-        let rd_hband = (merged_sad_hband_top + merged_sad_hband_bot) + params.lambda_sad * 4u;
-        let rd_vband = (merged_sad_vband_left + merged_sad_vband_right) + params.lambda_sad * 4u;
+        let rd_hband = (merged_track_sad[0] + merged_track_sad[1]) + params.lambda_sad * 4u;
+        let rd_vband = (merged_track_sad[2] + merged_track_sad[3]) + params.lambda_sad * 4u;
 
         // Find best mode: 0=16×16, 1=HBAND, 2=VBAND, 3=8×8
         var best_rd = rd_16x16;
@@ -552,9 +751,9 @@ fn main(
                 output_mvs[out_idx * 2u + 1u] = unpack_dy(mv);
             }
         } else if best_mode == 1u {
-            // HBAND: sub[0]+sub[1] share top MV; sub[2]+sub[3] share bottom MV
-            let top_mv = hp_track_mv[hband_top_mv_idx];
-            let bot_mv = hp_track_mv[hband_bot_mv_idx];
+            // HBAND: top half (y=0..7) uses merged_track_mv[0]; bottom half (y=8..15) uses [1]
+            let top_mv = merged_track_mv[0];
+            let bot_mv = merged_track_mv[1];
             // TL (sub 0, row 0, col 0)
             let out00 = (mb_y * 2u + 0u) * blocks_x_8 + (mb_x * 2u + 0u);
             output_mvs[out00 * 2u]      = unpack_dx(top_mv);
@@ -572,9 +771,9 @@ fn main(
             output_mvs[out11 * 2u]      = unpack_dx(bot_mv);
             output_mvs[out11 * 2u + 1u] = unpack_dy(bot_mv);
         } else if best_mode == 2u {
-            // VBAND: sub[0]+sub[2] share left MV; sub[1]+sub[3] share right MV
-            let left_mv  = hp_track_mv[vband_left_mv_idx];
-            let right_mv = hp_track_mv[vband_right_mv_idx];
+            // VBAND: left half (x=0..7) uses merged_track_mv[2]; right half (x=8..15) uses [3]
+            let left_mv  = merged_track_mv[2];
+            let right_mv = merged_track_mv[3];
             // TL (sub 0, row 0, col 0)
             let out00v = (mb_y * 2u + 0u) * blocks_x_8 + (mb_x * 2u + 0u);
             output_mvs[out00v * 2u]      = unpack_dx(left_mv);

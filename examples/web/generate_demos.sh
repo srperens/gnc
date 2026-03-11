@@ -15,6 +15,9 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 GNC="$ROOT/target/release/gnc"
 SEQ="$ROOT/test_material/frames/sequences"
+
+# Helper: resolve y4m path for a sequence directory
+y4m() { echo "$SEQ/$1/$1.y4m"; }
 OUT="$SCRIPT_DIR"
 
 if [ ! -x "$GNC" ]; then
@@ -22,17 +25,8 @@ if [ ! -x "$GNC" ]; then
     (cd "$ROOT" && cargo build --release)
 fi
 
-# Some sequences start at frame_0001 instead of frame_0000.
-ensure_zero_indexed() {
-    local dir="$1"
-    if [ -f "$dir/frame_0001.png" ] && [ ! -f "$dir/frame_0000.png" ]; then
-        ln -s frame_0001.png "$dir/frame_0000.png"
-        echo "  (symlinked frame_0000 → frame_0001 in $(basename "$dir"))"
-    fi
-}
-
 # Encode a demo using benchmark-sequence (gives per-frame PSNR/SSIM + saves GNV1).
-# Usage: bench_encode <output-name> <input-pattern> [benchmark-sequence flags...]
+# Usage: bench_encode <output-name> <y4m-path> [benchmark-sequence flags...]
 bench_encode() {
     local name="$1"
     local input="$2"
@@ -41,7 +35,6 @@ bench_encode() {
     local outfile="$OUT/${name}.gnv"
     echo ""
     echo "=== ${name}.gnv ==="
-    ensure_zero_indexed "$(dirname "$input")"
 
     "$GNC" benchmark-sequence -i "$input" -o "$outfile" "$@"
 
@@ -61,70 +54,70 @@ rm -f "$OUT"/*.gnv
 # --- Broadcast sequences (long, q=75) ---
 
 bench_encode "ducks_q75" \
-    "$SEQ/ducks_take_off/frame_%04d.png" \
-    -q 75 -n 300 --keyframe-interval 8 --fps 50
+    "$(y4m ducks_take_off)" \
+    -q 75 -n 300 --keyframe-interval 9 --chroma-format 444
 
 bench_encode "rush_hour" \
-    "$SEQ/rush_hour/frame_%04d.png" \
-    -q 75 -n 200 --keyframe-interval 8 --fps 25
+    "$(y4m rush_hour)" \
+    -q 75 -n 200 --keyframe-interval 9 --chroma-format 444
 
 bench_encode "old_town_cross" \
-    "$SEQ/old_town_cross/frame_%04d.png" \
-    -q 75 -n 200 --keyframe-interval 8 --fps 50
+    "$(y4m old_town_cross)" \
+    -q 75 -n 200 --keyframe-interval 9 --chroma-format 444
 
 bench_encode "pedestrian_area" \
-    "$SEQ/pedestrian_area/frame_%04d.png" \
-    -q 75 -n 200 --keyframe-interval 8 --fps 25
+    "$(y4m pedestrian_area)" \
+    -q 75 -n 200 --keyframe-interval 9 --chroma-format 444
 
 # --- Long-form ---
 
 bench_encode "bbb_2min" \
-    "$SEQ/bbb_2min/frame_%04d.png" \
-    -q 75 -n 1800 --keyframe-interval 24 --fps 30
+    "$(y4m bbb_2min)" \
+    -q 75 -n 1800 --keyframe-interval 27 --chroma-format 444
 
 bench_encode "bbb_2min_q5" \
-    "$SEQ/bbb_2min/frame_%04d.png" \
-    -q 5 -n 1800 --keyframe-interval 24 --fps 30
+    "$(y4m bbb_2min)" \
+    -q 5 -n 1800 --keyframe-interval 27 --chroma-format 444
 
 # --- Chroma subsampling: Crowd Run ---
 
 bench_encode "crowd_444_q50" \
-    "$SEQ/crowd_run/frame_%04d.png" \
-    -q 50 -n 100 --keyframe-interval 8 --fps 50 --chroma-format 444
+    "$(y4m crowd_run)" \
+    -q 50 -n 100 --keyframe-interval 9 --chroma-format 444
 
 bench_encode "crowd_422_q50" \
-    "$SEQ/crowd_run/frame_%04d.png" \
-    -q 50 -n 100 --keyframe-interval 8 --fps 50 --chroma-format 422
+    "$(y4m crowd_run)" \
+    -q 50 -n 100 --keyframe-interval 9 --chroma-format 422
 
 bench_encode "crowd_420_q50" \
-    "$SEQ/crowd_run/frame_%04d.png" \
-    -q 50 -n 100 --keyframe-interval 8 --fps 50 --chroma-format 420
+    "$(y4m crowd_run)" \
+    -q 50 -n 100 --keyframe-interval 9 --chroma-format 420
 
 bench_encode "crowd_444_q25" \
-    "$SEQ/crowd_run/frame_%04d.png" \
-    -q 25 -n 100 --keyframe-interval 8 --fps 50 --chroma-format 444
+    "$(y4m crowd_run)" \
+    -q 25 -n 100 --keyframe-interval 9 --chroma-format 444
 
 bench_encode "crowd_422_q25" \
-    "$SEQ/crowd_run/frame_%04d.png" \
-    -q 25 -n 100 --keyframe-interval 8 --fps 50 --chroma-format 422
+    "$(y4m crowd_run)" \
+    -q 25 -n 100 --keyframe-interval 9 --chroma-format 422
 
 bench_encode "crowd_420_q25" \
-    "$SEQ/crowd_run/frame_%04d.png" \
-    -q 25 -n 100 --keyframe-interval 8 --fps 50 --chroma-format 420
+    "$(y4m crowd_run)" \
+    -q 25 -n 100 --keyframe-interval 9 --chroma-format 420
 
 # --- Chroma subsampling: Park Joy ---
 
 bench_encode "park_joy_444_q50" \
-    "$SEQ/park_joy/frame_%04d.png" \
-    -q 50 -n 100 --keyframe-interval 8 --fps 50 --chroma-format 444
+    "$(y4m park_joy)" \
+    -q 50 -n 100 --keyframe-interval 9 --chroma-format 444
 
 bench_encode "park_joy_422_q50" \
-    "$SEQ/park_joy/frame_%04d.png" \
-    -q 50 -n 100 --keyframe-interval 8 --fps 50 --chroma-format 422
+    "$(y4m park_joy)" \
+    -q 50 -n 100 --keyframe-interval 9 --chroma-format 422
 
 bench_encode "park_joy_420_q50" \
-    "$SEQ/park_joy/frame_%04d.png" \
-    -q 50 -n 100 --keyframe-interval 8 --fps 50 --chroma-format 420
+    "$(y4m park_joy)" \
+    -q 50 -n 100 --keyframe-interval 9 --chroma-format 420
 
 echo ""
 echo "=== Summary ==="

@@ -8,46 +8,65 @@ See [BASELINE.md](BASELINE.md) for current benchmark numbers.
 
 ## Current Focus (updated 2026-03-11)
 
-**Mode: Mätning och buggfixning. Inga nya features.**
+**Mode: Measurement and bugfixing. No new features.**
 
-Mätkampanjen (del 8–13) har etablerat ny nollpunkt med uniforma vikter. Nu gäller:
-1. Fixa kända buggar
-2. Mät noggrant — sekvenser, chroma-format, video vs stillbild
-3. Toggling av funktionalitet för att hitta dead weight och felimplementationer
-4. Låt mätningarna peka ut nästa åtgärd
+Measurement campaign (parts 8–13) established a new baseline with uniform subband weights. Current priorities:
+1. Fix known bugs
+2. Measure carefully — sequences, chroma format, video vs still image
+3. Toggle features to identify dead weight and incorrect implementations
+4. Let measurements drive the next action
 
-**Kända fakta (2026-03-11, uniforma vikter):**
-- Spatial BD-rate vs H.264 all-I: **+13.9%** — rimligt för en wavelet-kodare
-- Spatial BD-rate vs JPEG 2000 (4:4:4): **+28.3%** — gap minskar till ~11% vid hög kvalitet
-- Temporal: GNC I+P+B sparar ~17–27% vs all-I. H.264 sparar ~60–70% → temporalt gap kvarstår.
-- Allt ovan är PSNR-baserat (RGB). VMAF-baserad videojämförelse mot H.264 saknas fortfarande.
+**Known facts (2026-03-11, uniform weights):**
+- Spatial BD-rate vs H.264 all-I: **+13.9%** — reasonable for a wavelet codec
+- Spatial BD-rate vs JPEG 2000 (4:4:4): **+28.3%** — gap narrows to ~11% at high quality
+- Temporal: GNC I+P+B saves ~17–27% vs all-I. H.264 saves ~60–70% → temporal gap remains.
+- All above is PSNR-based (RGB). VMAF-based video comparison vs H.264 still missing.
 
-**Aktiv prioritetslista:**
+**Active priority list:**
 
-### BUG-1 — 4:2:0 pyramid B-frame chroma-fel (PRIO 1, todo)
-B-frames på pyramid-lager 2–3 med 4:2:0 har ~22–26 dB PSNR trots 2–4 bpp. I-frames och P-frames
-är opåverkade (42 dB). B₄ (lager 1, direkt referens till I/P) fungerar (38 dB). Felet kaskaderar
-via chroma-referenskedjan: B₂/B₆ refererar B₄ som är 4:2:0-kodad, leaf-B refererar B₂/B₆.
-Root cause: troligt fel i 4:2:0 chroma-MC när referens är ett 4:2:0-kodat B-frame (inte I/P).
+### BUG-1 — 4:2:0 pyramid B-frame chroma bug (PRIO 1, todo)
+B-frames at pyramid layers 2–3 with 4:2:0 show ~22–26 dB PSNR despite 2–4 bpp. I-frames and P-frames
+are unaffected (42 dB). B₄ (layer 1, direct reference to I/P) works (38 dB). The error cascades
+through the chroma reference chain: B₂/B₆ reference B₄ which is 4:2:0-coded, leaf-B references B₂/B₆.
+Root cause: likely error in 4:2:0 chroma-MC when reference is a 4:2:0-coded B-frame (not I/P).
 
-### MEAS-1 — Korrekt videojämförelse GNC vs H.264 (todo)
-Kör H.264 (libx264, full inter, standard GOP) på crowd_run + park_joy, 10 frames, yuv420p.
-Mät PSNR och bpp per CRF-värde. Beräkna BD-rate mot GNC 4:2:0 I+P+B (efter BUG-1 fixad).
-Även GNC 4:4:4 vs H.264 yuv444p för rättvis jämförelse utan chroma-handicap.
+### MEAS-1 — Correct video comparison GNC vs H.264 (todo)
+Run H.264 (libx264, full inter, standard GOP) on crowd_run + park_joy, 10 frames, yuv420p.
+Measure PSNR and bpp per CRF value. Compute BD-rate against GNC 4:2:0 I+P+B (after BUG-1 fixed).
+Also GNC 4:4:4 vs H.264 yuv444p for fair comparison without chroma handicap.
 
-### MEAS-2 — Funktionalitetstoggling: vad bidrar och hur mycket? (todo)
-Systematisk toggle-mätning på crowd_run + park_joy, 10 frames, 4:4:4, q=75:
+### MEAS-2 — Feature toggling: what contributes and how much? (todo)
+Systematic toggle measurement on crowd_run + park_joy, 10 frames, 4:4:4, q=75:
 - AQ on/off (GNC_NO_AQ)
 - CfL on/off
 - Pyramid QP scale on/off (GNC_L3_QP_SCALE=1.0 vs 1.5)
 - Pyramid B-frames vs flat B-frames (pyramid_enabled=false)
 - B-frames vs P-only (ki=1)
 - Rice vs rANS
-Varje toggle: rapportera bpp + VMAF delta. Mål: identifiera dead weight och negativa features.
+Each toggle: report bpp + VMAF delta. Goal: identify dead weight and negative features.
 
-### MEAS-3 — RD-kurva sekvenser (todo)
-Kör rd-curve (q=25–90) på crowd_run och park_joy med 4:4:4, mät VMAF vid varje punkt.
-Nuvarande rd-curve saknar --chroma-format och --vmaf på sekvenser. Kanske räcker benchmark-loop.
+### MEAS-3 — RD-curve on sequences (todo)
+Run rd-curve (q=25–90) on crowd_run and park_joy with 4:4:4, measure VMAF at each point.
+Current rd-curve lacks --chroma-format and --vmaf on sequences. A benchmark loop may suffice.
+
+### ARCH-1 — Hybrid temporal: Haar for low motion, I+P+B for high motion (noted 2026-03-11)
+
+**Observation:** GNV1 (I+P+B) and GNV2 (temporal Haar) are currently two separate architectural
+tracks that are never combined. Measurements show B-frames beat Haar on motion-heavy content
+(ducks q=75: 531M vs 596M), but they are essentially equal on low-motion content (rush_hour: both 78M).
+
+**Hybrid idea:** Select temporal strategy per GOP based on motion energy:
+- High motion → I+P+B (ME-based)
+- Low motion → temporal Haar (pure temporal decorrelation)
+
+**Why it probably does not pay off:** IPB naturally degrades to near-zero residuals on low motion
+(MV≈0, skip-mode). Haar adds no measurable gain on top of that. Cost = dual decoder pipelines
++ per-GOP bitstream signaling.
+
+**More promising variant:** MCTF (motion-compensated temporal filtering) — Haar *with* ME, as used
+in Dirac/VC-2. Beats pure IPB in the literature but is a substantial project. Note for the future.
+
+**Status:** Noted, nothing to implement now. Revisit if temporal gap vs H.264 persists after other improvements.
 
 ---
 

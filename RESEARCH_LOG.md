@@ -3119,19 +3119,19 @@ Changed default in `quality_preset()` from `SubbandWeights::perceptual()` to `Su
 Golden baselines in `tests/golden_baselines.toml` updated via `update_golden_baselines` ignored test.
 All 168 tests pass, zero clippy warnings.
 
-## Mätkampanj del 13 — Nollmätning med uniforma vikter vs H.264 och JPEG 2000 (2026-03-11)
+## Measurement campaign part 13 — Baseline with uniform weights vs H.264 and JPEG 2000 (2026-03-11)
 
-### Syfte
-Med de nya uniforma subband-vikterna: var står GNC egentligen jämfört med state-of-the-art?
-Tidigare siffra (+171–216% vs H.264) var jämförelse GNC all-I vs H.264 med full inter-prediktion — inte rättvisande för spatial kodarjämförelse.
+### Purpose
+With the new uniform subband weights: where does GNC actually stand vs state-of-the-art?
+Prior figure (+171–216% vs H.264) compared GNC all-I against H.264 with full inter prediction — not a fair spatial encoder comparison.
 
-### Metodologi
-- **GNC 4:2:0**: `benchmark` med `--chroma-format 420`, q=20–90
-- **GNC 4:4:4**: `benchmark` med `--chroma-format 444`, q=20–90
+### Methodology
+- **GNC 4:2:0**: `benchmark` with `--chroma-format 420`, q=20–90
+- **GNC 4:4:4**: `benchmark` with `--chroma-format 444`, q=20–90
 - **H.264 all-I**: ffmpeg libx264 `-g 1 -crf X -pix_fmt yuv420p`, CRF=10–48
-- **JPEG 2000**: OpenJPEG 2.x `opj_compress`, RGB-läge (4:4:4), ratio=5–250
-- PSNR mätt som RGB PSNR (ffmpeg psnr-filter, average av R/G/B)
-- Testbild: bbb_1080p.png, 1920×1080
+- **JPEG 2000**: OpenJPEG 2.x `opj_compress`, RGB mode (4:4:4), ratio=5–250
+- PSNR measured as RGB PSNR (ffmpeg psnr filter, average of R/G/B)
+- Test image: bbb_1080p.png, 1920×1080
 
 ### RD-data bbb_1080p
 
@@ -3177,13 +3177,13 @@ Tidigare siffra (+171–216% vs H.264) var jämförelse GNC all-I vs H.264 med f
 
 ### BD-rate (bbb_1080p, spatial/I-frame)
 
-| Jämförelse                              | BD-rate |
+| Comparison                              | BD-rate |
 |-----------------------------------------|---------|
 | GNC 4:2:0 vs H.264 all-I 4:2:0         | **+13.9%** |
 | GNC 4:4:4 vs JPEG 2000 RGB             | **+28.3%** |
-| JPEG 2000 RGB vs H.264 all-I 4:2:0     | −24.0% (J2K 4:4:4 vs H264 4:2:0 = inte rättvist) |
+| JPEG 2000 RGB vs H.264 all-I 4:2:0     | −24.0% (J2K 4:4:4 vs H264 4:2:0 = not a fair comparison) |
 
-### Punkt-jämförelse (interpolerade BPP vid lika PSNR)
+### Point comparison (interpolated BPP at equal PSNR)
 
 | PSNR | GNC 4:2:0 | H.264 all-I | GNC 4:4:4 | J2K RGB | GNC420/H264 | GNC444/J2K |
 |------|-----------|-------------|-----------|---------|-------------|------------|
@@ -3197,21 +3197,21 @@ Tidigare siffra (+171–216% vs H.264) var jämförelse GNC all-I vs H.264 med f
 | 42 dB | — | — | 3.38 | 3.04 | — | **1.11×** |
 | 44 dB | — | — | 4.36 | 3.93 | — | **1.11×** |
 
-### Slutsatser
+### Conclusions
 
 **GNC vs H.264 all-I (4:2:0):**
-- BD-rate: +13.9% — inte +171%. Den gamla siffran jämförde all-I GNC mot H.264 MED inter-prediktion.
-- Korsningspunkt ~36 dB: under = H.264 vinner, över = GNC vinner.
-- Vid hög kvalitet (>36 dB) är GNC mer effektivt än H.264 all-I.
-- Det förblir gapet mot H.264 med full inter-prediktion (~5–17% bpp besparing från inter) = temporalt gap.
+- BD-rate: +13.9% — not +171%. The old figure compared all-I GNC against H.264 WITH inter prediction.
+- Crossover point ~36 dB: below = H.264 wins, above = GNC wins.
+- At high quality (>36 dB) GNC is more efficient than H.264 all-I.
+- Remaining gap vs H.264 with full inter prediction (~5–17% bpp saving from inter) = temporal gap.
 
-**GNC vs JPEG 2000 (4:4:4 rättvis jämförelse):**
-- BD-rate: +28.3% — inte +92%. Den höga siffran berodde på blandade chroma-format.
-- Vid hög kvalitet (42–44 dB) krymper gapet till ~11%.
-- Restgap 28% = EBCOT-kontextkodning (~5–8%) + PCRD-bitallokering (~10–15%) + överliggande subband-struktur.
-- PCRD ej tillgängligt med Rice (kräver trunkerbara aritmetiska koder).
+**GNC vs JPEG 2000 (4:4:4 fair comparison):**
+- BD-rate: +28.3% — not +92%. The high figure was caused by mixed chroma formats.
+- At high quality (42–44 dB) the gap narrows to ~11%.
+- Remaining gap 28% = EBCOT context coding (~5–8%) + PCRD bit allocation (~10–15%) + subband structure.
+- PCRD not accessible with Rice (requires truncatable arithmetic codes).
 
-**Vad är kvar att lösa för spatial-kompetens (närmast JPEG 2000):**
-1. Kontextkodning — förälder-barn-prediktering av k-parameter (estimerat +0.1–0.2 bpp) — redan implementerat (#53)
-2. Per-tile bitallokering (PCRD-proxy) — kräver mjukare komprimeringsmodell — svårt med Rice
-3. Bättre subband-energidekorrellation — beror på wavelet-filtrens design
+**What remains to close the spatial gap (towards JPEG 2000):**
+1. Context coding — parent-child k-parameter prediction (estimated +0.1–0.2 bpp) — already implemented (#53)
+2. Per-tile bit allocation (PCRD proxy) — requires softer compression model — hard with Rice
+3. Better subband energy decorrelation — depends on wavelet filter design

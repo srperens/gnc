@@ -44,6 +44,16 @@ var<workgroup> sub_sads: array<u32, 4>;
 // Broadcast: parent MV in integer-pel
 var<workgroup> parent_int_dx: i32;
 var<workgroup> parent_int_dy: i32;
+// Merged-block SADs for 4-way RD decision (computed serially by thread 0)
+var<workgroup> merged_sad_hband_top: u32;
+var<workgroup> merged_sad_hband_bot: u32;
+var<workgroup> merged_sad_vband_left: u32;
+var<workgroup> merged_sad_vband_right: u32;
+// Best MV index for each merged partition (0 or 1 → which sub-block MV was chosen)
+var<workgroup> hband_top_mv_idx: u32;
+var<workgroup> hband_bot_mv_idx: u32;
+var<workgroup> vband_left_mv_idx: u32;
+var<workgroup> vband_right_mv_idx: u32;
 
 // ±2px around parent MV (parent 16×16 is already a good predictor for 8×8).
 // Equivalent to the predictor fine-range used in block_match.wgsl.
@@ -368,7 +378,133 @@ fn main(
     }
     workgroupBarrier();
 
-    // ========== Phase 5: RD split decision (thread 0) + output ==========
+    // ========== Phase 5a: Merged-block SAD computation (thread 0, serial) ==========
+    // Computes SADs for HBAND and VBAND partitions over 128-pixel regions.
+    // For each merged partition, two sub-block MV candidates are tried and the
+    // better one is chosen.  Results written to workgroup vars for Phase 5b.
+    //
+    // Sub-block layout within macroblock (pixel coordinates relative to mb_origin):
+    //   sub[0]=TL  x:0-7,  y:0-7      sub[1]=TR  x:8-15, y:0-7
+    //   sub[2]=BL  x:0-7,  y:8-15     sub[3]=BR  x:8-15, y:8-15
+    //
+    // HBAND-top  (16×8): pixels with y=0..7  (sub 0+1), two MV candidates: mv[0], mv[1]
+    // HBAND-bot  (16×8): pixels with y=8..15 (sub 2+3), two MV candidates: mv[2], mv[3]
+    // VBAND-left (8×16): pixels with x=0..7  (sub 0+2), two MV candidates: mv[0], mv[2]
+    // VBAND-right(8×16): pixels with x=8..15 (sub 1+3), two MV candidates: mv[1], mv[3]
+    if tid == 0u {
+        // --- HBAND-top ---
+        var sad0: u32 = 0u;
+        var sad1: u32 = 0u;
+        let mv0_qx = unpack_dx(hp_track_mv[0]);
+        let mv0_qy = unpack_dy(hp_track_mv[0]);
+        let mv1_qx = unpack_dx(hp_track_mv[1]);
+        let mv1_qy = unpack_dy(hp_track_mv[1]);
+        for (var ry = 0u; ry < 8u; ry++) {
+            for (var rx = 0u; rx < 16u; rx++) {
+                let cur_x = mb_origin_x + rx;
+                let cur_y = mb_origin_y + ry;
+                let cv = current_y[cur_y * params.width + cur_x];
+                let rqx0 = i32(cur_x) * 4 + mv0_qx;
+                let rqy0 = i32(cur_y) * 4 + mv0_qy;
+                let rqx1 = i32(cur_x) * 4 + mv1_qx;
+                let rqy1 = i32(cur_y) * 4 + mv1_qy;
+                sad0 += u32(abs(cv - bilinear_sample(rqx0, rqy0)));
+                sad1 += u32(abs(cv - bilinear_sample(rqx1, rqy1)));
+            }
+        }
+        if sad0 <= sad1 {
+            merged_sad_hband_top = sad0;
+            hband_top_mv_idx = 0u;
+        } else {
+            merged_sad_hband_top = sad1;
+            hband_top_mv_idx = 1u;
+        }
+
+        // --- HBAND-bot ---
+        var sad2: u32 = 0u;
+        var sad3: u32 = 0u;
+        let mv2_qx = unpack_dx(hp_track_mv[2]);
+        let mv2_qy = unpack_dy(hp_track_mv[2]);
+        let mv3_qx = unpack_dx(hp_track_mv[3]);
+        let mv3_qy = unpack_dy(hp_track_mv[3]);
+        for (var ry = 8u; ry < 16u; ry++) {
+            for (var rx = 0u; rx < 16u; rx++) {
+                let cur_x = mb_origin_x + rx;
+                let cur_y = mb_origin_y + ry;
+                let cv = current_y[cur_y * params.width + cur_x];
+                let rqx2 = i32(cur_x) * 4 + mv2_qx;
+                let rqy2 = i32(cur_y) * 4 + mv2_qy;
+                let rqx3 = i32(cur_x) * 4 + mv3_qx;
+                let rqy3 = i32(cur_y) * 4 + mv3_qy;
+                sad2 += u32(abs(cv - bilinear_sample(rqx2, rqy2)));
+                sad3 += u32(abs(cv - bilinear_sample(rqx3, rqy3)));
+            }
+        }
+        if sad2 <= sad3 {
+            merged_sad_hband_bot = sad2;
+            hband_bot_mv_idx = 2u;
+        } else {
+            merged_sad_hband_bot = sad3;
+            hband_bot_mv_idx = 3u;
+        }
+
+        // --- VBAND-left ---
+        var sadA: u32 = 0u;
+        var sadB: u32 = 0u;
+        for (var ry = 0u; ry < 16u; ry++) {
+            for (var rx = 0u; rx < 8u; rx++) {
+                let cur_x = mb_origin_x + rx;
+                let cur_y = mb_origin_y + ry;
+                let cv = current_y[cur_y * params.width + cur_x];
+                let rqxA = i32(cur_x) * 4 + mv0_qx;
+                let rqyA = i32(cur_y) * 4 + mv0_qy;
+                let rqxB = i32(cur_x) * 4 + mv2_qx;
+                let rqyB = i32(cur_y) * 4 + mv2_qy;
+                sadA += u32(abs(cv - bilinear_sample(rqxA, rqyA)));
+                sadB += u32(abs(cv - bilinear_sample(rqxB, rqyB)));
+            }
+        }
+        if sadA <= sadB {
+            merged_sad_vband_left = sadA;
+            vband_left_mv_idx = 0u;
+        } else {
+            merged_sad_vband_left = sadB;
+            vband_left_mv_idx = 2u;
+        }
+
+        // --- VBAND-right ---
+        var sadC: u32 = 0u;
+        var sadD: u32 = 0u;
+        for (var ry = 0u; ry < 16u; ry++) {
+            for (var rx = 8u; rx < 16u; rx++) {
+                let cur_x = mb_origin_x + rx;
+                let cur_y = mb_origin_y + ry;
+                let cv = current_y[cur_y * params.width + cur_x];
+                let rqxC = i32(cur_x) * 4 + mv1_qx;
+                let rqyC = i32(cur_y) * 4 + mv1_qy;
+                let rqxD = i32(cur_x) * 4 + mv3_qx;
+                let rqyD = i32(cur_y) * 4 + mv3_qy;
+                sadC += u32(abs(cv - bilinear_sample(rqxC, rqyC)));
+                sadD += u32(abs(cv - bilinear_sample(rqxD, rqyD)));
+            }
+        }
+        if sadC <= sadD {
+            merged_sad_vband_right = sadC;
+            vband_right_mv_idx = 1u;
+        } else {
+            merged_sad_vband_right = sadD;
+            vband_right_mv_idx = 3u;
+        }
+    }
+    workgroupBarrier();
+
+    // ========== Phase 5b: 4-way RD decision (thread 0) + output ==========
+    // RD cost = SAD + mode-specific overhead term.
+    // Actual costs (see GP12-calibrated code below):
+    //   16×16: rd = parent_sad                   (zero extra cost; parent SAD already paid)
+    //   HBAND:  rd = hband_sad + lambda * 4       (2 MVs, flat lambda*4 overhead)
+    //   VBAND:  rd = vband_sad + lambda * 4       (2 MVs, flat lambda*4 overhead)
+    //   8×8:    rd = sum_sub + max(lambda, parent_sad/4)  (GP12-calibrated adaptive threshold)
     let blocks_x_8 = params.blocks_x * 2u;
 
     if tid == 0u {
@@ -380,34 +516,90 @@ fn main(
         sub_sad_out[diag_base + 2u] = sub_sads[2];
         sub_sad_out[diag_base + 3u] = sub_sads[3];
 
-        let sum_sub = sub_sads[0] + sub_sads[1] + sub_sads[2] + sub_sads[3];
+        let sum_sub  = sub_sads[0] + sub_sads[1] + sub_sads[2] + sub_sads[3];
         let parent_sad = parent_sads[mb_idx];
 
-        // Split only if sub-blocks save enough to justify 3 extra MVs.
-        // Use max(base_lambda, 25% of parent_sad) — prevents splits on easy blocks
-        // where tiny SAD improvements don't outweigh MV overhead.
+        // GP12-calibrated threshold: 8×8 must beat 16×16 by max(lambda, parent/4).
+        // This preserves the original split aggressiveness that was validated on crowd_run.
+        // HBAND/VBAND (2 MVs each) use lambda*4 overhead as additional RD candidates.
         let threshold = max(params.lambda_sad, parent_sad / 4u);
-        let do_split = (sum_sub + threshold) < parent_sad;
 
-        if do_split {
-            // Write 4 individual sub-block MVs
+        let rd_16x16 = parent_sad;
+        // 8×8 uses the GP12-calibrated adaptive threshold (not flat lambda*8) to preserve
+        // the split aggressiveness tuned empirically. At high parent_sad (fast motion),
+        // threshold = parent_sad/4 prevents over-splitting. HBAND/VBAND use flat lambda*4
+        // (2 MVs each), which is intentionally on a different scale — they compete against
+        // 16×16 and 8×8 but are not required to be dimensionally equivalent.
+        let rd_8x8   = sum_sub + threshold;
+        let rd_hband = (merged_sad_hband_top + merged_sad_hband_bot) + params.lambda_sad * 4u;
+        let rd_vband = (merged_sad_vband_left + merged_sad_vband_right) + params.lambda_sad * 4u;
+
+        // Find best mode: 0=16×16, 1=HBAND, 2=VBAND, 3=8×8
+        var best_rd = rd_16x16;
+        var best_mode = 0u;
+        if rd_hband < best_rd { best_rd = rd_hband; best_mode = 1u; }
+        if rd_vband < best_rd { best_rd = rd_vband; best_mode = 2u; }
+        if rd_8x8   < best_rd { best_rd = rd_8x8;  best_mode = 3u; }
+
+        if best_mode == 3u {
+            // 8×8: write all 4 independent sub-block MVs
             for (var s = 0u; s < 4u; s++) {
                 let sc = s % 2u;
                 let sr = s / 2u;
                 let out_idx = (mb_y * 2u + sr) * blocks_x_8 + (mb_x * 2u + sc);
                 let mv = hp_track_mv[s];
-                output_mvs[out_idx * 2u] = unpack_dx(mv);
+                output_mvs[out_idx * 2u]      = unpack_dx(mv);
                 output_mvs[out_idx * 2u + 1u] = unpack_dy(mv);
             }
+        } else if best_mode == 1u {
+            // HBAND: sub[0]+sub[1] share top MV; sub[2]+sub[3] share bottom MV
+            let top_mv = hp_track_mv[hband_top_mv_idx];
+            let bot_mv = hp_track_mv[hband_bot_mv_idx];
+            // TL (sub 0, row 0, col 0)
+            let out00 = (mb_y * 2u + 0u) * blocks_x_8 + (mb_x * 2u + 0u);
+            output_mvs[out00 * 2u]      = unpack_dx(top_mv);
+            output_mvs[out00 * 2u + 1u] = unpack_dy(top_mv);
+            // TR (sub 1, row 0, col 1)
+            let out01 = (mb_y * 2u + 0u) * blocks_x_8 + (mb_x * 2u + 1u);
+            output_mvs[out01 * 2u]      = unpack_dx(top_mv);
+            output_mvs[out01 * 2u + 1u] = unpack_dy(top_mv);
+            // BL (sub 2, row 1, col 0)
+            let out10 = (mb_y * 2u + 1u) * blocks_x_8 + (mb_x * 2u + 0u);
+            output_mvs[out10 * 2u]      = unpack_dx(bot_mv);
+            output_mvs[out10 * 2u + 1u] = unpack_dy(bot_mv);
+            // BR (sub 3, row 1, col 1)
+            let out11 = (mb_y * 2u + 1u) * blocks_x_8 + (mb_x * 2u + 1u);
+            output_mvs[out11 * 2u]      = unpack_dx(bot_mv);
+            output_mvs[out11 * 2u + 1u] = unpack_dy(bot_mv);
+        } else if best_mode == 2u {
+            // VBAND: sub[0]+sub[2] share left MV; sub[1]+sub[3] share right MV
+            let left_mv  = hp_track_mv[vband_left_mv_idx];
+            let right_mv = hp_track_mv[vband_right_mv_idx];
+            // TL (sub 0, row 0, col 0)
+            let out00v = (mb_y * 2u + 0u) * blocks_x_8 + (mb_x * 2u + 0u);
+            output_mvs[out00v * 2u]      = unpack_dx(left_mv);
+            output_mvs[out00v * 2u + 1u] = unpack_dy(left_mv);
+            // TR (sub 1, row 0, col 1)
+            let out01v = (mb_y * 2u + 0u) * blocks_x_8 + (mb_x * 2u + 1u);
+            output_mvs[out01v * 2u]      = unpack_dx(right_mv);
+            output_mvs[out01v * 2u + 1u] = unpack_dy(right_mv);
+            // BL (sub 2, row 1, col 0)
+            let out10v = (mb_y * 2u + 1u) * blocks_x_8 + (mb_x * 2u + 0u);
+            output_mvs[out10v * 2u]      = unpack_dx(left_mv);
+            output_mvs[out10v * 2u + 1u] = unpack_dy(left_mv);
+            // BR (sub 3, row 1, col 1)
+            let out11v = (mb_y * 2u + 1u) * blocks_x_8 + (mb_x * 2u + 1u);
+            output_mvs[out11v * 2u]      = unpack_dx(right_mv);
+            output_mvs[out11v * 2u + 1u] = unpack_dy(right_mv);
         } else {
-            // Replicate parent half-pel MV to all 4 output slots
+            // 16×16: replicate parent half-pel MV to all 4 output slots
             let pdx = parent_mvs[mb_idx * 2u];
             let pdy = parent_mvs[mb_idx * 2u + 1u];
             for (var s = 0u; s < 4u; s++) {
                 let sc = s % 2u;
                 let sr = s / 2u;
                 let out_idx = (mb_y * 2u + sr) * blocks_x_8 + (mb_x * 2u + sc);
-                output_mvs[out_idx * 2u] = pdx;
+                output_mvs[out_idx * 2u]      = pdx;
                 output_mvs[out_idx * 2u + 1u] = pdy;
             }
         }

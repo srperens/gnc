@@ -609,7 +609,7 @@ H.264 comparison (#22) established the north star: GNC needs **2–5× more bits
 - **Resolution scaling (see #61, implement LATER):** Block sizes are pixel-absolute and calibrated for 1080p. The same angular motion at 4K covers 4× more pixels — the optimal block size set shifts up one level ({16,32,64,128}). Design rule: express all block-size constants as `BASE_SIZE × (width / 1920)` rounded to power-of-2. λ (RD Lagrange multiplier) must be per-pixel normalized, not pixel-absolute. Do NOT implement resolution scaling now (no 4K test material), but: (1) use named constants for all block sizes and thresholds, (2) add a comment on every pixel-absolute constant marking it as `// 1080p-calibrated, see #61`, (3) design λ as per-pixel from the start so scaling is a 1-line change.
 
 ### 63. Fix broken 10-bit encode/decode support
-- **Status:** todo
+- **Status:** done (b99408a, 2026-03-11)
 - **Introduced by:** commit 571b0f0 (2026-03-08) "feat: 10-bit encode/decode support" — authored by Claude Sonnet 4.6
 - **Symptom:** 10-bit encode/decode silently corrupts output. A 10-bit roundtrip produces wrong pixel values despite `test_10bit_roundtrip` existing in pipeline_tests.
 - **Root cause:** `pack_u8.wgsl` packs 4 f32 values into a u32 as 8-bit slots (`val << (i * 8u)`). For 10-bit content, values up to 1023 need 10 bits — anything above 255 overflows into adjacent slots. The `peak` parameter was added correctly to the clamp but the packing stride was never changed. This is the wrong fix applied to the wrong layer.

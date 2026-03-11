@@ -1,0 +1,3 @@
+sequence,frames,quality,temporal_mode,bpp,psnr_avg,psnr_min,psnr_lowpass_avg,psnr_lowpass_min,fps_enc,fps_dec,total_bytes
+crowd_run,120,75,Haar,4.6824,36.61,36.41,22.39,20.22,26.6,27.9,145642781
+park_joy,120,75,Haar,5.5623,36.66,36.23,20.51,19.22,18.4,26.4,173009073

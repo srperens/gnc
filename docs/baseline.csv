@@ -1,0 +1,6 @@
+sequence,mode,bpp,psnr_avg,fps_enc,fps_dec,commit
+crowd_run,All-I,6.99,38.78,20.8,44.7,617d8e6
+park_joy,All-I,7.76,39.15,20.7,44.2,617d8e6
+rush_hour,All-I,2.01,41.15,21.1,51.3,617d8e6
+stockholm,All-I,4.15,38.78,42.6,82.0,617d8e6
+bbb_2min,All-I,1.47,51.49,41.3,54.2,617d8e6

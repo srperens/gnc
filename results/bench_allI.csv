@@ -1,0 +1,6 @@
+sequence,frames,quality,temporal_mode,bpp,psnr_avg,psnr_min,fps_enc,fps_dec,total_bytes
+rush_hour,120,75,None,1.9869,42.43,42.36,39.2,51.3,61801461
+crowd_run,120,75,None,7.5470,40.72,40.68,38.6,49.5,234741371
+stockholm,120,75,None,5.0925,40.95,40.92,67.6,83.8,70398036
+park_joy,120,75,None,7.9817,40.95,40.79,38.6,48.5,248264280
+bbb_2min,120,75,None,1.4734,51.49,47.02,41.3,54.2,45828600

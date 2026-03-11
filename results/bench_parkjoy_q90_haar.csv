@@ -1,0 +1,2 @@
+sequence,frames,quality,temporal_mode,bpp,psnr_avg,psnr_min,fps_enc,fps_dec,total_bytes
+park_joy,120,90,Haar,11.4702,44.76,44.46,35.6,47.1,356769075

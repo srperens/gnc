@@ -29,6 +29,9 @@ struct SplitParams {
 @group(0) @binding(4) var<storage, read> parent_sads: array<u32>;    // 16x16 SADs
 @group(0) @binding(5) var<storage, read> predictor_mvs: array<i32>;  // optional 8x8 predictors
 @group(0) @binding(6) var<storage, read_write> output_mvs: array<i32>; // 8x8 resolution output
+// Binding 7: 4 sub-block SADs per macroblock for diagnostic readback.
+// Always written (cheap: ~32 KB/frame at 1080p). CPU readback only when GNC_BLOCKSIZE_DIAG=1.
+@group(0) @binding(7) var<storage, read_write> sub_sad_out: array<u32>;
 
 // Shared memory: 256 entries for SAD/MV parallel operations
 var<workgroup> shared_sad: array<u32, 256>;
@@ -369,6 +372,14 @@ fn main(
     let blocks_x_8 = params.blocks_x * 2u;
 
     if tid == 0u {
+        // Write 4 sub-block SADs for diagnostic readback (GNC_BLOCKSIZE_DIAG).
+        // Always written; CPU readback only happens when env var is set.
+        let diag_base = mb_idx * 4u;
+        sub_sad_out[diag_base + 0u] = sub_sads[0];
+        sub_sad_out[diag_base + 1u] = sub_sads[1];
+        sub_sad_out[diag_base + 2u] = sub_sads[2];
+        sub_sad_out[diag_base + 3u] = sub_sads[3];
+
         let sum_sub = sub_sads[0] + sub_sads[1] + sub_sads[2] + sub_sads[3];
         let parent_sad = parent_sads[mb_idx];
 

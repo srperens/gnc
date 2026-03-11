@@ -3169,6 +3169,7 @@ impl EncoderPipeline {
                     padded_w,
                     padded_h,
                     lambda_sad,
+                    &bufs.sub_sad_buf,
                 );
 
                 // Profiling: flush ME to isolate MC+wavelet+quantize timing
@@ -3942,6 +3943,64 @@ impl EncoderPipeline {
             let _t_submit = std::time::Instant::now();
             ctx.queue.submit(Some(cmd.finish()));
 
+            // === Block-size diagnostic (GNC_BLOCKSIZE_DIAG=1) ===
+            // Reads sub_sad_buf + me_sad_buf written by the just-submitted estimate_split.
+            // Must run before the look-ahead ME overwrites these buffers for the next frame.
+            if std::env::var("GNC_BLOCKSIZE_DIAG").is_ok() {
+                let blocks_x = padded_w / super::motion::ME_BLOCK_SIZE;
+                let blocks_y = padded_h / super::motion::ME_BLOCK_SIZE;
+                let diag_lambda = (config.quantization_step * 16.0 + 128.0).round() as u32;
+                let diag_hist = super::motion::MotionEstimator::analyze_block_sizes(
+                    ctx,
+                    &bufs.sub_sad_buf,
+                    &bufs.me_sad_buf,
+                    bufs.me_total_blocks,
+                    blocks_x,
+                    blocks_y,
+                    diag_lambda,
+                    {
+                        static PFRAME_CTR: std::sync::atomic::AtomicU32 =
+                            std::sync::atomic::AtomicU32::new(0);
+                        PFRAME_CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    },
+                    "P-frame",
+                );
+                // Accumulate into GOP-level aggregate (static for simplicity).
+                {
+                    static AGG: std::sync::Mutex<([usize; 5], usize)> =
+                        std::sync::Mutex::new(([0; 5], 0));
+                    let mut guard = AGG.lock().unwrap();
+                    for (i, &h) in diag_hist.iter().enumerate() {
+                        guard.0[i] += h;
+                    }
+                    guard.1 += 1;
+                    // Print aggregate every 10 P-frames and at shutdown (best-effort).
+                    if guard.1.is_multiple_of(10) {
+                        let total: usize = guard.0.iter().sum();
+                        if total > 0 {
+                            let pct = |k: usize| guard.0[k] as f64 * 100.0 / total as f64;
+                            let frac_16x16 = pct(3);
+                            eprintln!(
+                                "[blocksize_diag] AGGREGATE ({} frames, {} mbs): 8x8={:.1}% 8x16={:.1}% 16x8={:.1}% 16x16={:.1}% 32x32={:.1}%",
+                                guard.1, total,
+                                pct(0), pct(1), pct(2), pct(3), pct(4),
+                            );
+                            let gate_result = if frac_16x16 < 80.0 {
+                                "PROCEED with #60"
+                            } else {
+                                "SKIP #60 (16x16 dominates)"
+                            };
+                            eprintln!(
+                                "[blocksize_diag] gate: 16x16_frac={:.1}% {} 80% → {}",
+                                frac_16x16,
+                                if frac_16x16 < 80.0 { "<" } else { "≥" },
+                                gate_result,
+                            );
+                        }
+                    }
+                }
+            }
+
             // === Look-ahead ME pipelining ===
             // Submit next frame's preprocess + ME BEFORE the readback poll so ME runs
             // in parallel with the Metal buffer-sync latency (~18ms).
@@ -4044,6 +4103,7 @@ impl EncoderPipeline {
                         padded_w,
                         padded_h,
                         next_lambda_sad,
+                        &bufs.sub_sad_buf,
                     );
                     // Submit ME-only command. GPU executes this after CMD_N finishes
                     // (same queue, strict ordering). Metal sync for CMD_N's readback
@@ -4258,8 +4318,30 @@ impl EncoderPipeline {
                 padded_w,
                 padded_h,
                 lambda_sad,
+                &bufs.sub_sad_buf,
             );
             ctx.queue.submit(Some(cmd.finish()));
+
+            // === Block-size diagnostic (GNC_BLOCKSIZE_DIAG=1) — CPU-entropy P-frame path ===
+            if std::env::var("GNC_BLOCKSIZE_DIAG").is_ok() {
+                let blocks_x = padded_w / super::motion::ME_BLOCK_SIZE;
+                let blocks_y = padded_h / super::motion::ME_BLOCK_SIZE;
+                super::motion::MotionEstimator::analyze_block_sizes(
+                    ctx,
+                    &bufs.sub_sad_buf,
+                    &sad_buf,
+                    bufs.me_total_blocks,
+                    blocks_x,
+                    blocks_y,
+                    lambda_sad,
+                    {
+                        static PFRAME_CPU_CTR: std::sync::atomic::AtomicU32 =
+                            std::sync::atomic::AtomicU32::new(0);
+                        PFRAME_CPU_CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    },
+                    "P-frame(cpu-entropy)",
+                );
+            }
 
             // 4:2:0 chroma-domain MC: pre-scale luma MVs → chroma MVs before plane loop.
             if is_420 {

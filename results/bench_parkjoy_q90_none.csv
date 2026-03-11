@@ -1,0 +1,2 @@
+sequence,frames,quality,temporal_mode,bpp,psnr_avg,psnr_min,fps_enc,fps_dec,total_bytes
+park_joy,120,90,None,13.8339,50.24,50.24,43.0,59.8,430289440

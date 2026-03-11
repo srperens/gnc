@@ -355,8 +355,8 @@ impl MotionEstimator {
                 ),
             });
 
-        // 7 bindings: uniform, current_y(ro), reference_y(ro), parent_mvs(ro),
-        //             parent_sads(ro), predictor_mvs(ro), output_mvs(rw)
+        // 8 bindings: uniform, current_y(ro), reference_y(ro), parent_mvs(ro),
+        //             parent_sads(ro), predictor_mvs(ro), output_mvs(rw), sub_sad_out(rw)
         let split_bgl = ctx
             .device
             .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -369,6 +369,7 @@ impl MotionEstimator {
                     bgl_storage_ro(4),
                     bgl_storage_ro(5),
                     bgl_storage_rw(6),
+                    bgl_storage_rw(7),
                 ],
             });
 
@@ -1132,6 +1133,9 @@ impl MotionEstimator {
     /// Dispatch 8x8 split decision shader.
     /// Takes 16x16 parent MVs + SADs, runs 4× 8x8 sub-block refinement with
     /// RD split decision. Returns 8x8-resolution MV buffer.
+    ///
+    /// `sub_sad_buf` receives 4 u32 per macroblock (sub-block SADs). Always written;
+    /// CPU readback only happens when `GNC_BLOCKSIZE_DIAG=1` is set.
     #[allow(clippy::too_many_arguments)]
     pub fn estimate_split(
         &self,
@@ -1145,6 +1149,7 @@ impl MotionEstimator {
         width: u32,
         height: u32,
         lambda_sad: u32,
+        sub_sad_buf: &wgpu::Buffer,
     ) -> wgpu::Buffer {
         let blocks_x = width / ME_BLOCK_SIZE;
         let blocks_y = height / ME_BLOCK_SIZE;
@@ -1229,6 +1234,10 @@ impl MotionEstimator {
                 wgpu::BindGroupEntry {
                     binding: 6,
                     resource: output_mv_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: sub_sad_buf.as_entire_binding(),
                 },
             ],
         });
@@ -1949,6 +1958,140 @@ impl MotionEstimator {
         drop(data);
         staging.unmap();
         result
+    }
+
+    /// Analyze block-size RD winners per frame (GNC_BLOCKSIZE_DIAG gate).
+    ///
+    /// Reads `sub_sad_buf` (4 u32 per macroblock) and `me_sad_buf` (1 u32 per macroblock),
+    /// then computes which block size wins per macroblock under an RD cost model.
+    ///
+    /// Block sizes: 0=8×8, 1=8×16, 2=16×8, 3=16×16, 4=32×32.
+    /// RD cost = sad + lambda_sad * mv_count * 2  (mv_count = {4,2,2,1,1} for each size).
+    ///
+    /// Prints per-frame summary to stderr. Returns per-size histogram counts for aggregation.
+    /// Only call when `GNC_BLOCKSIZE_DIAG=1`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn analyze_block_sizes(
+        ctx: &GpuContext,
+        sub_sad_buf: &wgpu::Buffer,
+        me_sad_buf: &wgpu::Buffer,
+        total_macroblocks: u32,
+        blocks_x: u32,
+        blocks_y: u32,
+        lambda_sad: u32,
+        frame_idx: u32,
+        frame_type: &str,
+    ) -> [usize; 5] {
+        let n = total_macroblocks as usize;
+        // Read sub-block SADs (4 per macroblock)
+        let sub_sads = {
+            let size = (n * 4 * std::mem::size_of::<u32>()) as u64;
+            let staging = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("sub_sad_staging"),
+                size,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let mut cmd = ctx
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("copy_sub_sad"),
+                });
+            cmd.copy_buffer_to_buffer(sub_sad_buf, 0, &staging, 0, size);
+            ctx.queue.submit(Some(cmd.finish()));
+            let slice = staging.slice(..);
+            let (tx, rx) = std::sync::mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |result| {
+                tx.send(result).unwrap();
+            });
+            ctx.device.poll(wgpu::Maintain::Wait);
+            rx.recv().unwrap().unwrap();
+            let data = slice.get_mapped_range();
+            let vals: Vec<u32> = bytemuck::cast_slice(&data).to_vec();
+            drop(data);
+            staging.unmap();
+            vals
+        };
+
+        // Read 16×16 SADs (1 per macroblock)
+        let me_sads = Self::read_sad_values(ctx, me_sad_buf, total_macroblocks);
+
+        let mut histogram = [0usize; 5];
+        let bx = blocks_x as usize;
+        let by = blocks_y as usize;
+
+        // MV counts per block size: 8×8→4 MVs, 8×16→2, 16×8→2, 16×16→1, 32×32→1
+        // RD cost = sad + lambda_sad * mv_count * 2  (factor 2 for x+y components)
+        let mv_costs: [u32; 5] = [
+            lambda_sad * 8, // 8×8:   4 MVs × 2 components
+            lambda_sad * 4, // 8×16:  2 MVs × 2 components
+            lambda_sad * 4, // 16×8:  2 MVs × 2 components
+            lambda_sad * 2, // 16×16: 1 MV  × 2 components
+            lambda_sad * 2, // 32×32: 1 MV  × 2 components
+        ];
+
+        for mb_idx in 0..n {
+            let sub = &sub_sads[mb_idx * 4..mb_idx * 4 + 4];
+            // sub[0]=TL, sub[1]=TR, sub[2]=BL, sub[3]=BR
+            let sad_8x8 = sub[0] + sub[1] + sub[2] + sub[3];
+            let sad_8x16 = (sub[0] + sub[1]) + (sub[2] + sub[3]); // top row + bottom row (2 MVs)
+            let sad_16x8 = (sub[0] + sub[2]) + (sub[1] + sub[3]); // left col + right col (2 MVs)
+            let sad_16x16 = me_sads[mb_idx];
+
+            let bx_mb = mb_idx % bx;
+            let by_mb = mb_idx / bx;
+
+            // 32×32 requires 2×2 macroblock group aligned to even (bx, by)
+            let sad_32x32 = if bx_mb.is_multiple_of(2) && by_mb.is_multiple_of(2) && bx_mb + 1 < bx && by_mb + 1 < by {
+                let i00 = by_mb * bx + bx_mb;
+                let i10 = by_mb * bx + bx_mb + 1;
+                let i01 = (by_mb + 1) * bx + bx_mb;
+                let i11 = (by_mb + 1) * bx + bx_mb + 1;
+                Some(me_sads[i00] + me_sads[i10] + me_sads[i01] + me_sads[i11])
+            } else {
+                None
+            };
+
+            let rd_8x8 = sad_8x8 + mv_costs[0];
+            let rd_8x16 = sad_8x16 + mv_costs[1];
+            let rd_16x8 = sad_16x8 + mv_costs[2];
+            let rd_16x16 = sad_16x16 + mv_costs[3];
+
+            let mut best_cost = rd_8x8;
+            let mut best_size = 0usize; // 8×8
+
+            if rd_8x16 < best_cost {
+                best_cost = rd_8x16;
+                best_size = 1;
+            }
+            if rd_16x8 < best_cost {
+                best_cost = rd_16x8;
+                best_size = 2;
+            }
+            if rd_16x16 < best_cost {
+                best_cost = rd_16x16;
+                best_size = 3;
+            }
+            if let Some(sad32) = sad_32x32 {
+                let rd_32x32 = sad32 + mv_costs[4];
+                if rd_32x32 < best_cost {
+                    best_size = 4;
+                }
+            }
+
+            histogram[best_size] += 1;
+        }
+
+        let total = n as f64;
+        let pct = |k: usize| histogram[k] as f64 * 100.0 / total;
+        eprintln!(
+            "[blocksize_diag] frame {} ({}): 8x8={:.1}% 8x16={:.1}% 16x8={:.1}% 16x16={:.1}% 32x32={:.1}% | lambda={} mbs={}x{}",
+            frame_idx, frame_type,
+            pct(0), pct(1), pct(2), pct(3), pct(4),
+            lambda_sad, bx, by,
+        );
+
+        histogram
     }
 
     /// Upload motion vectors from CPU (i16 pairs) to GPU buffer (i32 pairs).

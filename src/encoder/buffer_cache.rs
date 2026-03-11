@@ -91,6 +91,10 @@ pub(super) struct CachedEncodeBuffers {
 
     // ME scratch (overwritten each frame, not returned to caller)
     pub(super) me_sad_buf: wgpu::Buffer,
+    /// Sub-block SAD buffer for block-size diagnostic (GNC_BLOCKSIZE_DIAG).
+    /// 4 u32 per macroblock. Always written by block_match_split shader; CPU readback
+    /// only happens when the env var is set. Sized at 16×16 macroblock grid.
+    pub(super) sub_sad_buf: wgpu::Buffer,
     pub(super) me_dummy_pred: wgpu::Buffer,
     pub(super) bidir_sad_buf: wgpu::Buffer,
     pub(super) bidir_modes_scratch: wgpu::Buffer,
@@ -624,6 +628,13 @@ impl CachedEncodeBuffers {
             me_sad_buf: ctx.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("enc_me_sad"),
                 size: (me_total_blocks as u64) * 4,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            }),
+            // 4 u32 per macroblock (sub-block SADs for GNC_BLOCKSIZE_DIAG).
+            sub_sad_buf: ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("enc_sub_sad"),
+                size: (me_total_blocks as u64) * 4 * 4,
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
                 mapped_at_creation: false,
             }),

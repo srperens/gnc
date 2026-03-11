@@ -592,18 +592,22 @@ H.264 comparison (#22) established the north star: GNC needs **2–5× more bits
 - **Design work required:** Before implementing resolution scaling, the team needs a general design document and explicit coding rules around pixel-absolute vs resolution-relative parameters. Every threshold, block size, search range, and energy value in the pipeline that is expressed in pixels is implicitly a 1080p assumption. This includes #59 (SAD threshold), #60 (block sizes, λ), ME search range, AQ energy map granularité, pyramid downsampling ratios, and any future parameters. The design document should establish: (1) which parameters are pixel-absolute by necessity (tile size — hardware), (2) which must be expressed relative to resolution (`width/1920` scale factor), (3) which should be per-pixel normalized (SAD, distortion, λ), and (4) a naming/commenting convention so future code makes the assumption explicit. This should be written before any 4K implementation work begins.
 
 ### 60. Adaptive block-size ME with RD selection
-- **Status:** todo (blocked on #59)
+- **Status:** active (gate PASSED 2026-03-11 — implementation approved by Team Lead)
+- **Gate result (2026-03-11):** GNC_BLOCKSIZE_DIAG diagnostic on 100 P-frames at q=75:
+  - crowd_run 444: 16×16=67.1%, sub-16×16=32.9% → < 80% → PROCEED
+  - park_joy 444: 16×16=76.0%, sub-16×16=24.0% → < 80% → PROCEED
+  - Note: diagnostic uses RD proxy (sub-SADs summed; 8×8/16×8 approximation), but gate signal is valid — ~25–40% of high-motion blocks prefer finer partitioning.
+  - 32×32 = 0%: expected (summed-SAD proxy is pessimistic; 32×32 may still help on uniform-motion regions with a proper single-MV search).
+- **Team Lead approval:** Bitstream format change approved (partition type flag per macroblock). Implement {8×16, 16×16} at minimum; add {16×8, 32×32} if infrastructure allows without excessive complexity.
 - **Motivation:** Item #40 (forced 4×4 everywhere) failed because MV overhead dominated without RD gating. RD-optimal block size selection — minimize λ·rate + distortion per block — lets the encoder use 8×8 at motion boundaries and 32×32 on uniform regions. H.264 studies show adaptive partitioning adds ~8–14% BD-rate gain on top of skip mode on pedestrian content.
-- **Block size candidates:** 8×8, 16×8, 8×16, 16×16 (current), 32×32. NOT 4×4 (closed by #40). NOT 64×8 or other extreme rectangles.
-- **Falsifiable claim:** RD-adaptive partitioning over {8×8, 8×16, 16×8, 16×16, 32×32} reduces crowd_run bpp ≥5% incremental over #59 skip-mode baseline at VMAF ≥99.0, with ME time increase ≤25%.
-- **Gate:** Block size distribution diagnostic: run ME at all 5 sizes per block, log winner. If >80% of non-skip blocks prefer 16×16 → size diversity is low → close. Requires λ calibration sweep (q=50, 75, 90 on crowd_run + park_joy).
+- **Block size candidates:** 8×16, 16×16 (current) as minimum viable; 16×8, 32×32 as extensions. NOT 8×8 as standalone (subsumes into existing split ME).
+- **Falsifiable claim:** RD-adaptive partitioning over {8×16, 16×16, 32×32} reduces crowd_run bpp ≥5% incremental over #59 skip-mode baseline at VMAF ≥99.0, with ME time increase ≤25%.
 - **Success criteria:** crowd_run/park_joy bpp −5% incremental at VMAF neutral. ME fps regression < 20%.
-- **Complexity:** High. Multi-pass ME (5 sizes), λ calibration, partition flags in bitstream (breaking change — requires Team Lead approval), decoder partition-type routing. 3–5 days.
-- **Note:** Blocked on #59. If #59 bpp gain < 5%, investigate ME quality before proceeding to #60.
+- **Complexity:** High. 3–5 days. Partition flags in bitstream (already approved), decoder partition-type routing, new 8×16 ME shader or derived from split SADs.
 - **Resolution scaling (see #61):** Block sizes are pixel-absolute and calibrated for 1080p. At 4K, an 8×8 block covers the same angular area as a 4×4 at 1080p — i.e., the effective block size set shifts down one level. The candidate set must scale: `{8,16,32,64}×(width/1920)` rounded to power-of-2. Similarly, λ (the rate-distortion Lagrange multiplier) is calibrated in pixel-domain distortion units and must be re-swept per resolution, or expressed as a per-pixel quantity.
 
 ### 62. Fix benchmark-sequence OOM for long sequences (bbb_2min GNV1)
-- **Status:** todo
+- **Status:** done (b1614d6, 2026-03-11 — streaming Y4M path for >500-frame I+P+B sequences)
 - **Symptom:** `benchmark-sequence` with I+P+B mode on bbb_2min (1800 frames, Y4M or PNG) is killed by OOM (exit 137) immediately at I+P+B initialization — before a single frame is encoded. The temporal wavelet (Haar) path handles 1800 frames fine. 500 frames works. Issue is specific to I+P+B mode with long sequences.
 - **Impact:** `generate_demos.sh` cannot produce `bbb_2min.gnv` — demo is broken for that file. Currently using 500-frame fallback (209MB, ~17s).
 - **Likely cause:** I+P+B encoder allocates reference frame buffers (5-slot pyramid pool × full-res GPU buffers) upfront for the entire sequence, or something in the GOP pre-allocation scales with total frame count. The Haar path streams GOPs independently and does not have this problem.

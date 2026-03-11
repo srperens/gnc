@@ -662,6 +662,10 @@ enum Command {
         /// Disable adaptive quantization (AQ). Useful for measuring AQ contribution to BD-rate.
         #[arg(long)]
         no_aq: bool,
+
+        /// Use rANS entropy coder instead of Rice (default).
+        #[arg(long)]
+        rans: bool,
     },
 
     /// Automated benchmark across multiple Xiph sequences. Outputs CSV.
@@ -3220,6 +3224,7 @@ fn main() {
             compare_codecs,
             vmaf,
             no_aq,
+            rans,
         } => {
             // Parse quality values
             let q_vals: Vec<u32> = q_values
@@ -3282,6 +3287,9 @@ fn main() {
                     let mut config = gnc::quality_preset(q);
                     if no_aq {
                         config.adaptive_quantization = false;
+                    }
+                    if rans {
+                        config.entropy_coder = gnc::EntropyCoder::Rans;
                     }
                     let qstep = config.quantization_step;
 

@@ -530,6 +530,10 @@ enum Command {
         /// Chroma subsampling format: 444 (default, full resolution), 422, or 420
         #[arg(long, default_value = "444")]
         chroma_format: String,
+
+        /// Tile size in pixels (default 256).
+        #[arg(long, default_value = "256")]
+        tile_size: u32,
     },
 
     /// Encode a sequence of image frames into a .gnv container
@@ -1332,6 +1336,7 @@ fn main() {
             output,
             vmaf,
             chroma_format,
+            tile_size,
         } => {
             if diagnostics {
                 gnc::encoder::diagnostics::enable();
@@ -1953,7 +1958,7 @@ fn main() {
                 let effective_fps = if y4m_fps > 0.0 { y4m_fps } else { fps };
                 drop(y4m_probe);
 
-                let config_ip = build_ip_config(
+                let mut config_ip = build_ip_config(
                     quality,
                     qstep,
                     keyframe_interval,
@@ -1963,6 +1968,7 @@ fn main() {
                     &bitrate,
                     &rate_mode,
                 );
+                config_ip.tile_size = tile_size;
 
                 let ki_window = config_ip.keyframe_interval as usize + 4;
                 let frame_size_mb = w as f64 * h as f64 * 3.0 * 4.0 / 1_048_576.0;
@@ -2081,7 +2087,7 @@ fn main() {
             if run_baseline {
             let mut frame_metrics_i: Vec<FrameMetrics> = Vec::new();
             // --- I+P encoding ---
-            let config_ip = build_ip_config(
+            let mut config_ip = build_ip_config(
                 quality,
                 qstep,
                 keyframe_interval,
@@ -2091,6 +2097,7 @@ fn main() {
                 &bitrate,
                 &rate_mode,
             );
+            config_ip.tile_size = tile_size;
 
             // Warm up GPU shader pipelines (triggers Metal lazy compilation)
             let _ = encoder.encode(&ctx, &frames_data[0], w, h, &config_ip);

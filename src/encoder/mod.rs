@@ -7,6 +7,7 @@ pub mod fused_block;
 pub mod cfl;
 pub mod diagnostics;
 pub(crate) mod sig_context_diag;
+pub(crate) mod checkerboard_corr_diag;
 pub mod color;
 pub mod entropy;
 pub(crate) mod entropy_helpers;

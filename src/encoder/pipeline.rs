@@ -2333,6 +2333,31 @@ impl EncoderPipeline {
             });
         }
 
+        // === Checkerboard spatial-correlation diagnostic (GNC_CHECKER_CORR=1) ===
+        // Runs on the first I-frame only (same slot as sig_context_diag).
+        if config.transform_type == crate::TransformType::Wavelet
+            && std::env::var("GNC_CHECKER_CORR").is_ok()
+        {
+            use std::sync::OnceLock;
+            static CHECKER_CORR_DONE: OnceLock<()> = OnceLock::new();
+            ctx.device.poll(wgpu::Maintain::Wait);
+            CHECKER_CORR_DONE.get_or_init(|| {
+                let bufs = self.cached.as_ref().unwrap();
+                super::checkerboard_corr_diag::run_multi_plane(
+                    ctx,
+                    &bufs.mc_out,
+                    &bufs.ref_upload,
+                    &bufs.plane_b,
+                    padded_w,
+                    padded_h,
+                    active_chroma_w,
+                    active_chroma_h,
+                    config.tile_size,
+                    config.wavelet_levels,
+                );
+            });
+        }
+
         // Per-plane infos for entropy encoding — chroma planes differ when non-444
         let plane_infos: [&FrameInfo; 3] = [
             &info,

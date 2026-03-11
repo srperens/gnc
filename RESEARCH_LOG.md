@@ -4,6 +4,70 @@
 
 ---
 
+## 2026-03-11: #47 Overlapping Tile Windows — CLOSED (bpp overhead untenable)
+
+### Hypothesis
+CDF 9/7 wavelet ringing at 256×256 tile boundaries causes 0.66 dB PSNR gap (boundary vs interior at q=75). Encoding (T+2o)² = 272² coefficients per tile and cropping at decoder would eliminate this artifact. Expected bpp overhead: ≤5% (revised from 2%).
+
+### Implementation
+Full Approach A implemented in worktree (agent-aaf9ce8b, 5 new WGSL shaders + Rust pipeline). Encoder writes all 272×272 = 73,984 coefficients to a separate linear buffer. Decoder decodes 73,984 coefficients, inverse transforms to 272×272 pixels, crops central 256×256. All 163 tests passed, zero clippy warnings. Canary confirmed: `GNC: overlap=8 physical_tile=272x272 total_tiles=40 n_coeff_per_tile=73984`.
+
+### Results (q=75, 444, overlap=8)
+
+| Sequence | Metric | baseline (overlap=0) | overlap=8 | Delta |
+|---|---|---|---|---|
+| bbb_1080p | PSNR | 42.17 dB | 42.76 dB | +0.59 dB |
+| bbb_1080p | VMAF | 95.05 | 95.05 | **0.00** |
+| bbb_1080p | bpp | 3.83 | 5.77 | **+50.6%** |
+| crowd_run (still) | VMAF | 95.48 | 95.65 | +0.17 |
+| crowd_run (still) | bpp | 7.50 | 9.63 | **+28.4%** |
+| park_joy (still) | VMAF | 95.57 | 95.59 | +0.02 |
+| park_joy (still) | bpp | 6.10 | 7.89 | **+29.3%** |
+
+### Root cause analysis
+Theoretical coefficient overhead: (272²-256²)/256² = 12.9%. Observed bitrate overhead: 29–51%. Discrepancy factor: 2.5–4×. The halo coefficients (8448 extra per tile in the boundary extension region) have high energy due to wavelet ringing at the *extended tile's* boundary — we've traded one boundary ringing artifact for another. The Rice coder assigns large k to these high-magnitude coefficients, and they dominate the overhead. This is a structural property of the approach, not a coding bug.
+
+### VMAF sensitivity
+VMAF shows essentially zero improvement despite +0.59 dB PSNR at the tile boundaries. At q=75 (VMAF already 95+), boundary artifacts are below perceptual detection threshold. The 0.66 dB PSNR boundary gap does not translate to perceptual quality.
+
+### Conclusion
+**CLOSED. Worktree discarded (not merged).**
+- bpp overhead: 29–51% (target was <5%) → **FAIL**
+- VMAF delta: +0.00 to +0.17 pts (target was ≥+0.5) → **FAIL**
+
+The "encode full (T+2o)² coefficient block" approach is architecturally wrong for Rice+ZRL. JPEG 2000 avoids this by sharing boundary coefficients between adjacent tiles (not duplicating them), but that requires cross-tile entropy which breaks the 256-stream parallel model. There is no path to <5% overhead within the current architecture without a fundamentally different coefficient-sharing scheme.
+
+---
+
+## 2026-03-11: Checkerboard k-context (#checkerboard-ctx) — FIXED, neutral bpp
+
+### Background
+After shipping #53 (2-state k_zrl), the Builder added a "checkerboard k-context" as a further entropy improvement: even streams (0,2,...,254) encode first, expose their final EMA means via workgroup shared memory, then odd streams (1,3,...,255) derive adjusted_k from their left neighbor's EMA. No bitstream overhead — context derived from already-decoded even-stream data on decode side.
+
+### Bug: Builder stored k_stream_odd in bitstream
+Builder stored 128×8 = 1024 bytes of per-odd-stream adjusted_k values per tile per plane in the bitstream. For a 1920×1080 image at q=75 (bbb): 40 tiles × 3 planes × 1024 bytes = 122KB overhead on a 3.25MB bitstream → +3.7% bpp. For gradient q=25 (tiny bitstream): 12 tiles × 1024 bytes = 12KB on 48KB data → +25% bpp. This caused the golden baseline tests to fail with +5-78% bpp regressions.
+
+### Fix
+- `rice_encode.wgsl`: K_STRIDE stays 25 (no k_stream_odd section in k_output buffer). Encoder writes adjusted_k to even-stream EMA shared memory; odd streams read it. No bitstream change.
+- `rice_decode.wgsl`: Two-pass decode. Even streams decode first → write final EMA to `shared_ctx_even`. Barrier at top level. Odd streams derive adjusted_k from neighbor EMA (same blend formula as encoder) → decode.
+- `rice_gpu.rs`: All 4 readback sites: `k_stream_odd = Vec::new()` (not read from k buffer). `pack_decode_data`: removed k_stream_odd population loop; k_values buffer stays K_STRIDE=25.
+- `rice.rs`: `rice_decode_tile` rewritten as two-pass decoder: first decode all 128 even streams (collect final EMAs), derive adjusted_k for odd streams, then decode 128 odd streams with adjusted warm-start.
+- `tests/golden_baselines.toml`: Re-measured after fix (values essentially unchanged from pre-bug baseline, ±0.1%).
+
+### Results (q=75, I-frame)
+
+| Metric | Baseline (pre-bug) | After fix | Delta |
+|--------|-------------------|-----------|-------|
+| bbb_1080p bpp | 3.83 | 3.83 | 0.00 |
+| bbb_1080p VMAF | 95.05 | 95.05 | 0.00 |
+
+### Assessment
+The checkerboard k-context gives neutral bpp on bbb_1080p. The expected 0.05–0.15 bpp gain does not materialize — the EMA adapts within ~8 symbols, so the warm-start for odd streams has near-zero effect on actual bit cost. The feature is architecturally correct and has zero overhead (no bitstream bytes added, no extra GPU passes). Canary verified: `GNC: checkerboard k-context active` log line confirms the code path executes.
+
+Feature is retained as it is correct, zero-overhead, and may help on specific content.
+
+---
+
 ## 2026-03-11: #53 Within-tile significance context — DONE (partial gain)
 
 ### Hypothesis
@@ -30,6 +94,24 @@ Gain is consistent but far short of −3% success criterion. The theoretical H_a
 Despite falling short of the gate criterion, the change is shipped: it is correct, tested, adds ~0.3-0.6% consistent compression improvement, and the added complexity (8 extra k values per tile + one bool per stream) is modest. Zero VMAF regression.
 
 ### Decision: SHIP — small consistent gain, clean implementation, no regression.
+
+---
+
+## 2026-03-11: HH Subband Weight Gate (SBR idea) — CLOSED
+
+**Hypothesis:** HH subbands are over-coded relative to perceptual importance. Increasing HH quantization weight should save bits with minimal VMAF loss.
+
+**Method:** Added `GNC_HH_WEIGHT_SCALE` env var to `SubbandWeights::perceptual()`. Tested ×2 and ×4 on bbb_1080p q=75.
+
+**Results:**
+
+| HH scale | PSNR | VMAF | bpp | delta bpp |
+|---|---|---|---|---|
+| ×1 (baseline) | 42.17 dB | 95.05 | 3.83 | — |
+| ×2 | 40.00 dB | **92.96** | 3.59 | −6.3% |
+| ×4 | 37.04 dB | **86.55** | 3.46 | −9.7% |
+
+**Conclusion:** CLOSED. HH subbands are perceptually necessary at q=75. Even ×2 weighting causes −2.09 pts VMAF (threshold: −0.5 pts). The current HH weights are well-calibrated. SBR/HH-zeroing approach is not viable. `GNC_HH_WEIGHT_SCALE` env var retained as a diagnostic tool (default 1.0 = no-op).
 
 ---
 

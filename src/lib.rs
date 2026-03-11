@@ -174,11 +174,16 @@ impl SubbandWeights {
 
     /// Perceptual weights: quantize inner detail harder (less energy), preserve outer detail.
     pub fn perceptual(levels: u32) -> Self {
+        // HH weight scale: read from env for gate testing (default 1.0 = production)
+        let hh_scale: f32 = std::env::var("GNC_HH_WEIGHT_SCALE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1.0);
         let mut detail = Vec::with_capacity(levels as usize);
         for i in 0..levels as usize {
             let lh_hl = 1.0 + 0.5 * i as f32;
             let is_innermost = i == levels as usize - 1;
-            let hh = lh_hl + if is_innermost { 1.0 } else { 0.5 };
+            let hh = (lh_hl + if is_innermost { 1.0 } else { 0.5 }) * hh_scale;
             detail.push([lh_hl, lh_hl, hh]);
         }
         Self {

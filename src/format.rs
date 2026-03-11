@@ -683,6 +683,7 @@ pub fn substitute_tiles(frame: &mut crate::CompressedFrame, tile_indices: &[usiz
                         skip_bitmap: 0xFF, // all groups skipped
                         stream_lengths: vec![0; rice::RICE_STREAMS_PER_TILE],
                         stream_data: Vec::new(),
+                        k_stream_odd: vec![],
                     };
                 }
             }
@@ -1711,6 +1712,7 @@ mod tests {
             k_zrl_nz_values: vec![0; num_groups as usize],
             k_zrl_z_values: vec![0; num_groups as usize],
             skip_bitmap: 0xFF, // all groups skipped (all zeros)
+            k_stream_odd: Vec::new(), // no checkerboard ctx for all-skip tile
             stream_lengths: vec![0; rice::RICE_STREAMS_PER_TILE],
             stream_data: Vec::new(),
         };

@@ -189,7 +189,7 @@ impl DecoderPipeline {
                     ensure_var_buf(
                         ctx,
                         &mut bufs.entropy_tile_info[p],
-                        &mut bufs.entropy_var_a_cap[p], // reuse cap tracker
+                        &mut bufs.entropy_tile_info_cap[p],
                         k_size,
                         "dec_rice_k",
                         storage_dst,

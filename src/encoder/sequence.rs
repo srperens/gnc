@@ -7367,6 +7367,7 @@ impl EncoderPipeline {
                 skip_bitmap: all_skip_mask,
                 stream_lengths: vec![0u32; crate::encoder::rice::RICE_STREAMS_PER_TILE],
                 stream_data: Vec::new(),
+                k_stream_odd: vec![],
             })
             .collect();
         CompressedFrame {

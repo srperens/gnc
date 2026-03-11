@@ -57,6 +57,10 @@ pub const RICE_MAX_STREAM_BYTES: usize = 4096;
 /// #53: k_zrl is split into two context-dependent parameters:
 ///   k_zrl_nz — used for zero runs that follow a nonzero coefficient
 ///   k_zrl_z  — used for zero runs that follow another zero run or start-of-stream
+///
+/// #checkerboard-ctx: k_stream_odd holds the EMA warm-start k for the 128 odd streams
+/// (streams 1, 3, 5, ..., 255). Indexed by odd_idx = (stream_id - 1) / 2.
+/// Absent in legacy tiles (empty Vec → treat as global k).
 #[derive(Debug, Clone)]
 pub struct RiceTile {
     pub num_coefficients: u32,
@@ -71,6 +75,9 @@ pub struct RiceTile {
     pub k_zrl_z_values: Vec<u8>,
     /// Skip bitmap: bit g = 1 means all coefficients in group g are zero.
     pub skip_bitmap: u8,
+    /// Checkerboard-context EMA warm-start k for odd streams (128 entries).
+    /// Entry i → stream 2i+1. Empty when checkerboard context is not used.
+    pub k_stream_odd: Vec<u8>,
     /// Bytes used by each of the 256 streams.
     pub stream_lengths: Vec<u32>,
     /// Concatenated stream data (all 256 streams).
@@ -97,7 +104,9 @@ impl RiceTile {
             let stream_len_bytes: usize = self.stream_lengths.iter()
                 .map(|&l| varint_size(l as u16))
                 .sum();
-            fixed_header + flags + k_params + stream_len_bytes + self.stream_data.len()
+            // checkerboard ctx: 1024 bytes for odd-stream initial k (if present)
+            let ck_bytes = self.k_stream_odd.len(); // 0 or 1024
+            fixed_header + flags + k_params + ck_bytes + stream_len_bytes + self.stream_data.len()
         }
     }
 }
@@ -307,41 +316,43 @@ pub fn rice_encode_tile(coefficients: &[i32], tile_size: u32, num_levels: u32) -
         }
     }
 
-    // Phase 2: Encode 256 interleaved streams with ZRL
+    // Phase 2: Encode 256 interleaved streams with ZRL.
+    // Checkerboard k-context: even streams encode first, recording their final EMA means.
+    // Odd streams are then warm-started with a 50/50 blend of global k and neighbor k.
     let mut all_stream_data = Vec::new();
     let mut stream_lengths = Vec::with_capacity(RICE_STREAMS_PER_TILE);
 
-    for stream_id in 0..RICE_STREAMS_PER_TILE {
+    // Even streams encode first; store their final EMA means for odd-stream warm-start.
+    let mut even_final_ema = [[0u32; 8]; 128]; // indexed by stream_id / 2
+    let mut even_stream_data: Vec<Vec<u8>> = vec![Vec::new(); 128];
+    let mut even_stream_lengths: Vec<u32> = vec![0; 128];
+
+    // --- Step 2a: even streams ---
+    for even_id in (0..RICE_STREAMS_PER_TILE).step_by(2) {
+        let stream_id = even_id;
         let mut writer = BitWriter::new();
         let mut s = 0;
 
-        // Initialize EMA from static k seeds (per-stream, 8 groups)
         let mut ema = [0u32; 8];
         for g in 0..num_groups {
             ema[g] = (1u32 << k_values[g]).max(1) << 4;
         }
 
-        // Context state: was the preceding nonzero coefficient |coeff| >= 2?
         let mut last_mag_large = false;
-
         while s < symbols_per_stream {
             let coeff_idx = stream_id + s * RICE_STREAMS_PER_TILE;
             let y = (coeff_idx / tile_size as usize) as u32;
             let x = (coeff_idx % tile_size as usize) as u32;
             let g = compute_subband_group(x, y, tile_size, num_levels);
 
-            // Skip bitmap: if this position's group is fully zero, advance without encoding
             if (skip_bitmap >> g) & 1 == 1 {
                 s += 1;
                 continue;
             }
 
             let coeff = coefficients[coeff_idx];
-
             if coeff == 0 {
-                // Select k_zrl based on magnitude context of preceding nonzero
                 let k = if last_mag_large { k_zrl_nz_values[g] } else { k_zrl_z_values[g] };
-                // Count zero run (only count non-skipped positions)
                 let mut run = 1u32;
                 let mut ns = s + 1;
                 while ns < symbols_per_stream {
@@ -349,46 +360,135 @@ pub fn rice_encode_tile(coefficients: &[i32], tile_size: u32, num_levels: u32) -
                     let ny = (next_idx / tile_size as usize) as u32;
                     let nx = (next_idx % tile_size as usize) as u32;
                     let ng = compute_subband_group(nx, ny, tile_size, num_levels);
-                    // Skip past bitmap-skipped positions
-                    if (skip_bitmap >> ng) & 1 == 1 {
-                        ns += 1;
-                        continue;
-                    }
-                    if coefficients[next_idx] != 0 {
-                        break;
-                    }
+                    if (skip_bitmap >> ng) & 1 == 1 { ns += 1; continue; }
+                    if coefficients[next_idx] != 0 { break; }
                     run += 1;
                     ns += 1;
                 }
-                writer.write_bit(0); // token: zero run
+                writer.write_bit(0);
                 writer.write_rice(run - 1, k);
                 s = ns;
                 last_mag_large = false;
             } else {
-                writer.write_bit(1); // token: non-zero
+                writer.write_bit(1);
                 writer.write_bit(if coeff < 0 { 1 } else { 0 });
                 let magnitude = coeff.unsigned_abs() - 1;
-
-                // Derive adaptive k from EMA
                 let ema_mean = ema[g] >> 4;
-                let k = if ema_mean > 0 {
-                    (31 - ema_mean.leading_zeros()).min(15) as u8
-                } else {
-                    0
-                };
+                let k = if ema_mean > 0 { (31 - ema_mean.leading_zeros()).min(15) as u8 } else { 0 };
                 writer.write_rice(magnitude, k);
-
-                // Update EMA
                 ema[g] = ema[g] - (ema[g] >> 3) + (magnitude << 1);
                 s += 1;
-                // Large = |coeff| >= 2, i.e., magnitude = |coeff|-1 >= 1
                 last_mag_large = magnitude >= 1;
             }
         }
+        let even_idx = stream_id / 2;
+        even_final_ema[even_idx] = ema;
+        let bytes = writer.flush();
+        even_stream_lengths[even_idx] = bytes.len() as u32;
+        even_stream_data[even_idx] = bytes;
+    }
 
-        let stream_bytes = writer.flush();
-        stream_lengths.push(stream_bytes.len() as u32);
-        all_stream_data.extend_from_slice(&stream_bytes);
+    // Compute adjusted k for odd streams (50/50 blend of global k and neighbor k).
+    // Layout: k_stream_odd[odd_idx * 8 + g] = blended k for odd stream (2*odd_idx+1), group g.
+    // Always stores 128 * 8 = 1024 bytes; unused group slots (g >= num_groups) are 0.
+    let mut k_stream_odd = vec![0u8; 128 * 8];
+    for odd_idx in 0..128usize {
+        let even_idx = odd_idx; // neighbor even stream index
+        for g in 0..8usize {
+            let global_k = if g < num_groups { k_values[g] as u32 } else { 0 };
+            let neighbor_mean = even_final_ema[even_idx][g] >> 4;
+            let neighbor_k = if neighbor_mean > 0 {
+                (31 - neighbor_mean.leading_zeros()).min(15)
+            } else {
+                0
+            };
+            let adjusted = (global_k + neighbor_k).div_ceil(2).min(15);
+            k_stream_odd[odd_idx * 8 + g] = adjusted as u8;
+        }
+    }
+
+    // --- Step 2b: odd streams with per-group neighbor-context warm-start ---
+    let mut odd_stream_data: Vec<Vec<u8>> = vec![Vec::new(); 128];
+    let mut odd_stream_lengths: Vec<u32> = vec![0; 128];
+    for odd_rank in 0..128usize {
+        let stream_id = 2 * odd_rank + 1;
+        let even_idx = odd_rank; // neighbor even stream
+        let mut writer = BitWriter::new();
+        let mut s = 0;
+
+        // Per-group blend of global k and neighbor's final EMA k
+        let mut ema = [0u32; 8];
+        for g in 0..num_groups {
+            let neighbor_mean = even_final_ema[even_idx][g] >> 4;
+            let neighbor_k = if neighbor_mean > 0 {
+                (31 - neighbor_mean.leading_zeros()).min(15)
+            } else {
+                0
+            };
+            let global_k = k_values[g] as u32;
+            let adjusted_k = (global_k + neighbor_k).div_ceil(2).min(15);
+            ema[g] = (1u32 << adjusted_k).max(1) << 4;
+        }
+
+        let mut last_mag_large = false;
+        while s < symbols_per_stream {
+            let coeff_idx = stream_id + s * RICE_STREAMS_PER_TILE;
+            let y = (coeff_idx / tile_size as usize) as u32;
+            let x = (coeff_idx % tile_size as usize) as u32;
+            let g = compute_subband_group(x, y, tile_size, num_levels);
+
+            if (skip_bitmap >> g) & 1 == 1 {
+                s += 1;
+                continue;
+            }
+
+            let coeff = coefficients[coeff_idx];
+            if coeff == 0 {
+                let k = if last_mag_large { k_zrl_nz_values[g] } else { k_zrl_z_values[g] };
+                let mut run = 1u32;
+                let mut ns = s + 1;
+                while ns < symbols_per_stream {
+                    let next_idx = stream_id + ns * RICE_STREAMS_PER_TILE;
+                    let ny = (next_idx / tile_size as usize) as u32;
+                    let nx = (next_idx % tile_size as usize) as u32;
+                    let ng = compute_subband_group(nx, ny, tile_size, num_levels);
+                    if (skip_bitmap >> ng) & 1 == 1 { ns += 1; continue; }
+                    if coefficients[next_idx] != 0 { break; }
+                    run += 1;
+                    ns += 1;
+                }
+                writer.write_bit(0);
+                writer.write_rice(run - 1, k);
+                s = ns;
+                last_mag_large = false;
+            } else {
+                writer.write_bit(1);
+                writer.write_bit(if coeff < 0 { 1 } else { 0 });
+                let magnitude = coeff.unsigned_abs() - 1;
+                let ema_mean = ema[g] >> 4;
+                let k = if ema_mean > 0 { (31 - ema_mean.leading_zeros()).min(15) as u8 } else { 0 };
+                writer.write_rice(magnitude, k);
+                ema[g] = ema[g] - (ema[g] >> 3) + (magnitude << 1);
+                s += 1;
+                last_mag_large = magnitude >= 1;
+            }
+        }
+        let bytes = writer.flush();
+        odd_stream_lengths[odd_rank] = bytes.len() as u32;
+        odd_stream_data[odd_rank] = bytes;
+    }
+
+    // Interleave even and odd streams back into the canonical 0..255 order
+    for stream_id in 0..RICE_STREAMS_PER_TILE {
+        let (data, len) = if stream_id % 2 == 0 {
+            let idx = stream_id / 2;
+            (&even_stream_data[idx], even_stream_lengths[idx])
+        } else {
+            let idx = stream_id / 2;
+            (&odd_stream_data[idx], odd_stream_lengths[idx])
+        };
+        stream_lengths.push(len);
+        all_stream_data.extend_from_slice(data);
     }
 
     RiceTile {
@@ -400,65 +500,69 @@ pub fn rice_encode_tile(coefficients: &[i32], tile_size: u32, num_levels: u32) -
         k_zrl_nz_values,
         k_zrl_z_values,
         skip_bitmap,
+        k_stream_odd,
         stream_lengths,
         stream_data: all_stream_data,
     }
 }
 
 /// Decode a Rice-coded tile (with ZRL) back to quantized coefficients.
+///
+/// Uses two-pass checkerboard context:
+/// - Pass 1: decode even streams (0,2,...,254), collect final EMA states.
+/// - Derive adjusted_k per group for odd streams from even-stream neighbor EMA
+///   (same 50/50 blend formula as encoder). If k_stream_odd is non-empty (CPU-encoded
+///   tiles), those pre-computed values are used instead of re-deriving.
+/// - Pass 2: decode odd streams (1,3,...,255) with adjusted initial EMA.
 pub fn rice_decode_tile(tile: &RiceTile) -> Vec<i32> {
     let num_coefficients = tile.num_coefficients as usize;
     let symbols_per_stream = num_coefficients / RICE_STREAMS_PER_TILE;
     let mut coefficients = vec![0i32; num_coefficients];
-
     let num_groups = tile.num_groups as usize;
-    let mut data_offset = 0usize;
-    for stream_id in 0..RICE_STREAMS_PER_TILE {
-        let stream_len = tile.stream_lengths[stream_id] as usize;
-        let stream_data = &tile.stream_data[data_offset..data_offset + stream_len];
+    let skip_bitmap = tile.skip_bitmap;
+    let tile_size = tile.tile_size as usize;
+
+    // Pre-compute stream byte offsets for random access
+    let mut stream_offsets = vec![0usize; RICE_STREAMS_PER_TILE + 1];
+    for s in 0..RICE_STREAMS_PER_TILE {
+        stream_offsets[s + 1] = stream_offsets[s] + tile.stream_lengths[s] as usize;
+    }
+
+    // Decode one stream into coefficients[], return final EMA state.
+    let decode_stream = |stream_id: usize, initial_ema: [u32; 8], coefficients: &mut Vec<i32>| -> [u32; 8] {
+        let start = stream_offsets[stream_id];
+        let end = stream_offsets[stream_id + 1];
+        let stream_data = &tile.stream_data[start..end];
         let mut reader = BitReader::new(stream_data);
-
-        // Initialize EMA from static k seeds (per-stream, 8 groups)
-        let mut ema = [0u32; 8];
-        for (g, ema_val) in ema.iter_mut().enumerate().take(num_groups) {
-            *ema_val = (1u32 << tile.k_values[g]).max(1) << 4;
-        }
-
+        let mut ema = initial_ema;
         let mut s = 0usize;
-        let skip_bitmap = tile.skip_bitmap;
         let mut last_mag_large = false;
         while s < symbols_per_stream {
             let coeff_idx = stream_id + s * RICE_STREAMS_PER_TILE;
-            let cy = (coeff_idx / tile.tile_size as usize) as u32;
-            let cx = (coeff_idx % tile.tile_size as usize) as u32;
+            let cy = (coeff_idx / tile_size) as u32;
+            let cx = (coeff_idx % tile_size) as u32;
             let cur_g = compute_subband_group(cx, cy, tile.tile_size, tile.num_levels);
-
-            // Skip bitmap: if this position's group is fully zero, write 0 and advance
             if (skip_bitmap >> cur_g) & 1 == 1 {
                 coefficients[coeff_idx] = 0;
                 s += 1;
                 continue;
             }
-
             let token = reader.read_bit();
             if token == 0 {
-                // Zero run: select k_zrl based on magnitude context of preceding nonzero
                 let k = if last_mag_large {
                     tile.k_zrl_nz_values[cur_g]
                 } else {
                     tile.k_zrl_z_values[cur_g]
                 };
                 let run = reader.read_rice(k) + 1;
-                // Write zeros, skipping past bitmap-skipped positions
                 let mut written = 0u32;
                 let mut ws = s;
                 while written < run && ws < symbols_per_stream {
                     let wi = stream_id + ws * RICE_STREAMS_PER_TILE;
-                    let wy = (wi / tile.tile_size as usize) as u32;
-                    let wx = (wi % tile.tile_size as usize) as u32;
+                    let wy = (wi / tile_size) as u32;
+                    let wx = (wi % tile_size) as u32;
                     let wg = compute_subband_group(wx, wy, tile.tile_size, tile.num_levels);
                     if (skip_bitmap >> wg) & 1 == 1 {
-                        // Bitmap-skipped: write zero but don't count toward run
                         coefficients[wi] = 0;
                         ws += 1;
                         continue;
@@ -470,11 +574,8 @@ pub fn rice_decode_tile(tile: &RiceTile) -> Vec<i32> {
                 s = ws;
                 last_mag_large = false;
             } else {
-                // Non-zero coefficient
                 let sign = reader.read_bit();
                 let g = cur_g;
-
-                // Derive adaptive k from EMA
                 let ema_mean = ema[g] >> 4;
                 let k = if ema_mean > 0 {
                     (31 - ema_mean.leading_zeros()).min(15) as u8
@@ -483,22 +584,56 @@ pub fn rice_decode_tile(tile: &RiceTile) -> Vec<i32> {
                 };
                 let rice_val = reader.read_rice(k);
                 let magnitude = rice_val + 1;
-
-                coefficients[coeff_idx] = if sign == 1 {
-                    -(magnitude as i32)
-                } else {
-                    magnitude as i32
-                };
-
-                // Update EMA
+                coefficients[coeff_idx] = if sign == 1 { -(magnitude as i32) } else { magnitude as i32 };
                 ema[g] = ema[g] - (ema[g] >> 3) + (rice_val << 1);
                 s += 1;
-                // Mirror encoder: large = |coeff| >= 2, i.e., rice_val (= |coeff|-1) >= 1
                 last_mag_large = rice_val >= 1;
             }
         }
+        ema
+    };
 
-        data_offset += stream_len;
+    // Pass 1: decode even streams, collect final EMAs
+    let mut even_final_ema = [[0u32; 8]; 128];
+    for (even_rank, ema_slot) in even_final_ema.iter_mut().enumerate() {
+        let stream_id = even_rank * 2;
+        let mut initial_ema = [0u32; 8];
+        for (g, e) in initial_ema.iter_mut().enumerate().take(num_groups) {
+            let k = tile.k_values[g] as u32;
+            *e = (1u32 << k).max(1) << 4;
+        }
+        *ema_slot = decode_stream(stream_id, initial_ema, &mut coefficients);
+    }
+
+    // Derive adjusted_k for odd streams: 50/50 blend of global k and neighbor (even) k.
+    // If k_stream_odd is present (CPU-encoded tiles), use pre-computed values directly.
+    let mut adjusted_k_for_odd = [[0u32; 8]; 128];
+    for (odd_rank, adj) in adjusted_k_for_odd.iter_mut().enumerate() {
+        for g in 0..num_groups {
+            if !tile.k_stream_odd.is_empty() {
+                adj[g] = tile.k_stream_odd[odd_rank * 8 + g] as u32;
+            } else {
+                let global_k = tile.k_values[g] as u32;
+                let neighbor_mean = even_final_ema[odd_rank][g] >> 4;
+                let neighbor_k = if neighbor_mean > 0 {
+                    (31 - neighbor_mean.leading_zeros()).min(15)
+                } else {
+                    0
+                };
+                adj[g] = (global_k + neighbor_k).div_ceil(2);
+            }
+        }
+    }
+
+    // Pass 2: decode odd streams with adjusted initial EMA
+    for (odd_rank, adj) in adjusted_k_for_odd.iter().enumerate() {
+        let stream_id = odd_rank * 2 + 1;
+        let mut initial_ema = [0u32; 8];
+        for (g, e) in initial_ema.iter_mut().enumerate().take(num_groups) {
+            let k = adj[g];
+            *e = (1u32 << k).max(1) << 4;
+        }
+        decode_stream(stream_id, initial_ema, &mut coefficients);
     }
 
     coefficients
@@ -508,6 +643,7 @@ pub fn rice_decode_tile(tile: &RiceTile) -> Vec<i32> {
 /// Tile format flags byte (after fixed 16-byte header).
 const TILE_FLAG_COMPACT_STREAMS: u8 = 0x01; // varint-encoded stream lengths
 const TILE_FLAG_ALL_SKIP: u8 = 0x02; // all subbands zero, no stream data
+const TILE_FLAG_CHECKERBOARD_K: u8 = 0x04; // 128-byte per-odd-stream EMA warm-start k block present
 
 /// Write unsigned varint (u16 range: max 3 bytes).
 fn write_tile_varint(out: &mut Vec<u8>, val: u16) {
@@ -560,14 +696,25 @@ pub fn serialize_tile_rice(tile: &RiceTile) -> Vec<u8> {
         out.push(TILE_FLAG_ALL_SKIP | TILE_FLAG_COMPACT_STREAMS);
         out.push(tile.skip_bitmap);
     } else {
-        // Flags byte: always use varint stream lengths
-        out.push(TILE_FLAG_COMPACT_STREAMS);
+        let has_ck = !tile.k_stream_odd.is_empty();
+        // Flags byte: always use varint stream lengths; optionally checkerboard ctx
+        let flags_byte = TILE_FLAG_COMPACT_STREAMS
+            | if has_ck { TILE_FLAG_CHECKERBOARD_K } else { 0 };
+        out.push(flags_byte);
 
         // k values + k_zrl_nz + k_zrl_z + skip_bitmap
         out.extend_from_slice(&tile.k_values);
         out.extend_from_slice(&tile.k_zrl_nz_values);
         out.extend_from_slice(&tile.k_zrl_z_values);
         out.push(tile.skip_bitmap);
+
+        // Checkerboard per-odd-stream k (1024 bytes = 128 odd streams × 8 groups,
+        // only when TILE_FLAG_CHECKERBOARD_K set)
+        if has_ck {
+            debug_assert_eq!(tile.k_stream_odd.len(), 128 * 8,
+                "k_stream_odd must have exactly 1024 entries (128 odd streams × 8 groups)");
+            out.extend_from_slice(&tile.k_stream_odd);
+        }
 
         // Varint stream lengths (256 entries, 1-3 bytes each)
         for &len in &tile.stream_lengths {
@@ -599,6 +746,7 @@ pub fn deserialize_tile_rice(data: &[u8]) -> (RiceTile, usize) {
     pos += 1;
     let compact_streams = flags & TILE_FLAG_COMPACT_STREAMS != 0;
     let all_skip = flags & TILE_FLAG_ALL_SKIP != 0;
+    let has_ck = flags & TILE_FLAG_CHECKERBOARD_K != 0;
 
     if all_skip {
         // All-skip tile: just skip_bitmap, everything else is zero
@@ -614,6 +762,7 @@ pub fn deserialize_tile_rice(data: &[u8]) -> (RiceTile, usize) {
                 k_zrl_nz_values: vec![0; num_groups as usize],
                 k_zrl_z_values: vec![0; num_groups as usize],
                 skip_bitmap,
+                k_stream_odd: Vec::new(),
                 stream_lengths: vec![0; RICE_STREAMS_PER_TILE],
                 stream_data: Vec::new(),
             },
@@ -630,6 +779,16 @@ pub fn deserialize_tile_rice(data: &[u8]) -> (RiceTile, usize) {
     pos += num_groups as usize;
     let skip_bitmap = data[pos];
     pos += 1;
+
+    // Checkerboard per-odd-stream k (1024 bytes = 128 odd streams × 8 groups,
+    // present only when TILE_FLAG_CHECKERBOARD_K set)
+    let k_stream_odd = if has_ck {
+        let v = data[pos..pos + 1024].to_vec();
+        pos += 1024;
+        v
+    } else {
+        Vec::new()
+    };
 
     // Stream lengths
     let mut stream_lengths = vec![0u32; RICE_STREAMS_PER_TILE];
@@ -660,6 +819,7 @@ pub fn deserialize_tile_rice(data: &[u8]) -> (RiceTile, usize) {
             k_zrl_nz_values,
             k_zrl_z_values,
             skip_bitmap,
+            k_stream_odd,
             stream_lengths,
             stream_data,
         },

@@ -472,7 +472,7 @@ H.264 comparison (#22) established the north star: GNC needs **2–5× more bits
 - **Diagnostic code:** `GNC_LL_SPATIAL=1` env var in `encode_pframe` (diagnostic only, no bitstream change).
 
 ### 47. Overlapping tile windows (cross-tile wavelet lifting)
-- **Status:** blocked — gate PASSED but correct implementation deferred (design complexity)
+- **Status:** CLOSED (2026-03-11) — implemented and measured; bpp overhead structural and untenable
 - **Motivation:** Tile-edge artifacts (#36 gate) are 1–2px boundary mismatch from symmetric reflection at tile borders. Correct fix: each tile encodes `(tile_size + 2*overlap)^2` coefficients using actual neighbor pixels; decoder decodes the full extended block and crops to central tile_size×tile_size.
 - **Gate result (2026-03-10):** `GNC_TILE_BOUNDARY=1` diagnostic: boundary_psnr=41.56 dB, interior_psnr=42.21 dB, gap=**0.66 dB** at q=75 (threshold 0.5 dB). Also q=25: 0.81 dB, q=50: 0.82 dB. **PROCEED.**
 - **Design (Approach A — full overlap, correct):**
@@ -485,8 +485,10 @@ H.264 comparison (#22) established the north star: GNC needs **2–5× more bits
   - **overlap=0 is a no-op** (identical to current behavior, fully tested).
 - **What NOT to do:** Do NOT use a "trim to tile_size^2" approach. The decoder can't correctly invert encoder coefficients that were computed with different boundary conditions. This was attempted and caused 5.60 dB boundary gap (worse than before).
 - **Structural changes already present:** `CodecConfig.overlap_pixels` (default 0), `transform_97.wgsl` has `overlap` in Params and enlarged shared memory. Encoder panics if `overlap_pixels > 0` until decoder + bitstream are complete.
-- **Success criteria:** bbb q=75 boundary gap < 0.1 dB (was 0.66 dB); VMAF ≥ 95.55 (was 95.05); bpp overhead < 2%.
-- **Complexity:** 4–6 days. Requires bitstream version bump.
+- **Measured result (2026-03-11):** Full Approach A implemented (worktree agent-aaf9ce8b). overlap=8: bbb +0.59 dB PSNR but VMAF +0.00 pts, bpp **+50.6%** (3.83→5.77). crowd_run: VMAF +0.17 pts, bpp +29%. Root cause: halo coefficients (272²-256²=8448 extra per tile) cost ~5× interior rate due to wavelet ringing at the extended boundary — theoretical 12.9% area overhead becomes 29–51% bitrate overhead. VMAF insensitive to boundary artifacts at q=75 (already 95+ range).
+- **Conclusion:** The "encode full (T+2o)² coefficients" approach is architecturally wrong for a Rice+ZRL codec. JPEG 2000 avoids this by sharing boundary coefficients (not duplicating them). That approach requires cross-tile entropy, which breaks the 256-stream parallel model. There is no way to achieve <5% bpp overhead while encoding overlap coefficients independently. **Do not revisit without a fundamentally different coefficient sharing scheme.**
+- **Worktree discarded (not merged).** Structural scaffolding (CodecConfig.overlap_pixels, transform97 params) left in place but overlap>0 remains unusable (panic guard).
+- **Complexity:** 4–6 days implemented. Result: CLOSE.
 
 ### 48. Quarter-pel chroma MC for 4:2:0 B-frames
 - **Status:** CLOSED (2026-03-10) — gate: chroma residual already below luma; MC working correctly
@@ -605,6 +607,19 @@ H.264 comparison (#22) established the north star: GNC needs **2–5× more bits
 - **Success criteria:** crowd_run/park_joy bpp −5% incremental at VMAF neutral. ME fps regression < 20%.
 - **Complexity:** Medium. 2–3 days. Primarily RD decision logic in the split shader + proper 8×16/16×8 SAD computation from sub-block MVs.
 - **Resolution scaling (see #61, implement LATER):** Block sizes are pixel-absolute and calibrated for 1080p. The same angular motion at 4K covers 4× more pixels — the optimal block size set shifts up one level ({16,32,64,128}). Design rule: express all block-size constants as `BASE_SIZE × (width / 1920)` rounded to power-of-2. λ (RD Lagrange multiplier) must be per-pixel normalized, not pixel-absolute. Do NOT implement resolution scaling now (no 4K test material), but: (1) use named constants for all block sizes and thresholds, (2) add a comment on every pixel-absolute constant marking it as `// 1080p-calibrated, see #61`, (3) design λ as per-pixel from the start so scaling is a 1-line change.
+
+### 63. Fix broken 10-bit encode/decode support
+- **Status:** todo
+- **Introduced by:** commit 571b0f0 (2026-03-08) "feat: 10-bit encode/decode support" — authored by Claude Sonnet 4.6
+- **Symptom:** 10-bit encode/decode silently corrupts output. A 10-bit roundtrip produces wrong pixel values despite `test_10bit_roundtrip` existing in pipeline_tests.
+- **Root cause:** `pack_u8.wgsl` packs 4 f32 values into a u32 as 8-bit slots (`val << (i * 8u)`). For 10-bit content, values up to 1023 need 10 bits — anything above 255 overflows into adjacent slots. The `peak` parameter was added correctly to the clamp but the packing stride was never changed. This is the wrong fix applied to the wrong layer.
+- **Scope of the problem:**
+  1. `pack_u8.wgsl` — packing logic is fundamentally 8-bit-only, needs a separate 10-bit path or u16 packing
+  2. `main.rs:2397` — Y4M/video pipeline hardcodes `bit_depth: 8`, 10-bit video never reached
+  3. `test_10bit_roundtrip` — likely passes because it checks PSNR at a tolerance that masks the corruption, not pixel-exact values
+- **Before fixing:** Verify `test_10bit_roundtrip` actually fails with correct pixel-exact assertion. If it passes, the test itself is broken.
+- **Fix direction:** Add a `pack_u10.wgsl` that packs as u16 (2 bytes per component), wire it through the 10-bit decode path. Or generalize pack_u8 to handle both modes. Fix the Y4M path. Fix or replace the roundtrip test.
+- **Lesson:** Builder agents must not mark features as done without end-to-end validation at the pixel level. Critic must check that tests actually exercise the claimed behavior.
 
 ### 62. Fix benchmark-sequence OOM for long sequences (bbb_2min GNV1)
 - **Status:** done (b1614d6, 2026-03-11 — streaming Y4M path for >500-frame I+P+B sequences)

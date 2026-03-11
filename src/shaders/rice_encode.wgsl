@@ -59,6 +59,10 @@ var<workgroup> shared_k_zrl_nz: array<u32, 8>;
 var<workgroup> shared_k_zrl_z: array<u32, 8>;
 // Subband skip bitmap: bit g = 1 means all coefficients in group g are zero
 var<workgroup> shared_skip_bitmap: u32;
+// #checkerboard-ctx: even threads expose their final EMA mean to adjacent odd threads.
+// shared_ctx_even[even_idx][group] = EMA mean (p_ema[g] >> 4) after encoding.
+// Size: 128 × 8 × 4 = 4096 bytes. Total workgroup mem stays well below 32 KB.
+var<workgroup> shared_ctx_even: array<array<u32, 8>, 128>;
 
 // Per-thread local accumulators for Phase 1 (reduces atomic contention 32×)
 var<private> p_local_sum: array<u32, 8>;
@@ -327,8 +331,8 @@ fn main(
         shared_skip_bitmap = bitmap;
     }
 
-    // Write k values to output (stride K_STRIDE = MAX_GROUPS * 3 + 1)
-    // Layout: [k_mag ×8][k_zrl_nz ×8][k_zrl_z ×8][skip_bitmap]
+    // Write k values to output.
+    // Layout: [k_mag ×8][k_zrl_nz ×8][k_zrl_z ×8][skip_bitmap] = K_STRIDE=25
     if (thread_id < num_groups) {
         k_output[tile_id * K_STRIDE + thread_id] = shared_k[thread_id];
         k_output[tile_id * K_STRIDE + MAX_GROUPS + thread_id] = shared_k_zrl_nz[thread_id];
@@ -340,8 +344,20 @@ fn main(
     workgroupBarrier();
 
     // === Phase 2: Encode stream with 2-state per-subband ZRL ===
+    //
+    // Checkerboard k-context (#checkerboard-ctx):
+    //   Step 2a — even threads (0,2,...,254) encode first using the standard EMA init.
+    //             After encoding, they write their final EMA means to shared_ctx_even.
+    //   workgroupBarrier() — at top level (never inside a branch) per Metal/M1 rule.
+    //   Step 2b — odd threads (1,3,...,255) read their left-neighbor (even thread t-1)
+    //             EMA means and warm-start their own EMA with a 50/50 blend of the
+    //             global k (Phase 1) and the neighbor k (derived from neighbor mean).
+    //             This captures cross-stream spatial correlation without any extra dispatch.
+    //
+    // The barrier is always executed by ALL threads. Only the encoding work is guarded
+    // by the even/odd if-blocks so the barrier is unconditionally at the top level.
 
-    // Initialize per-thread state
+    // Initialize per-thread output state (both even and odd)
     p_tile_id = tile_id;
     p_stream_word_base = (tile_id * STREAMS_PER_TILE + thread_id) * (params.max_stream_bytes / 4u);
     p_bit_buffer = 0u;
@@ -351,137 +367,260 @@ fn main(
     p_word_pos = 0u;
     p_total_bytes = 0u;
 
-    // Initialize EMA from static k seeds (per-thread private, 8 groups)
-    for (var gi = 0u; gi < MAX_GROUPS; gi++) {
-        p_ema[gi] = max(1u, 1u << shared_k[gi]) << 4u;
-    }
-
-    // Context state: was the preceding nonzero coefficient |coeff| >= 2?
-    // "Large" nonzero → clustered signal → shorter runs expected → k_zrl_nz (smaller k).
-    var last_mag_large: bool = false;
-
-    var s = 0u;
-    while (s < symbols_per_stream) {
-        let coeff_idx = thread_id + s * STREAMS_PER_TILE;
-        let tile_row = coeff_idx / params.tile_size;
-        let tile_col = coeff_idx % params.tile_size;
-
-        // Skip bitmap: if this position's group is fully zero, advance without encoding
-        let skip_g = compute_subband_group(tile_col, tile_row);
-        if ((shared_skip_bitmap >> skip_g) & 1u) == 1u {
-            s += 1u;
-            continue;
+    // --- Step 2a: even threads encode ---
+    if (thread_id % 2u == 0u) {
+        // Initialize EMA from global k seeds (standard warm-start)
+        for (var gi = 0u; gi < MAX_GROUPS; gi++) {
+            p_ema[gi] = max(1u, 1u << shared_k[gi]) << 4u;
         }
 
-        let plane_idx = (tile_origin_y + tile_row) * params.plane_width
-                      + (tile_origin_x + tile_col);
-        let coeff = i32(round(input[plane_idx]));
+        var last_mag_large_e: bool = false;
+        var se = 0u;
+        while (se < symbols_per_stream) {
+            let coeff_idx_e = thread_id + se * STREAMS_PER_TILE;
+            let tile_row_e = coeff_idx_e / params.tile_size;
+            let tile_col_e = coeff_idx_e % params.tile_size;
 
-        if (coeff == 0) {
-            let g_zrl = skip_g;
-            // Select k_zrl based on magnitude context of preceding nonzero
-            let k_zrl = select(shared_k_zrl_z[g_zrl], shared_k_zrl_nz[g_zrl], last_mag_large);
-
-            // Count zero run (only count non-skipped positions)
-            var run = 1u;
-            var ns = s + 1u;
-            while (ns < symbols_per_stream) {
-                let ni = thread_id + ns * STREAMS_PER_TILE;
-                let nr = ni / params.tile_size;
-                let nc = ni % params.tile_size;
-                // Skip past bitmap-skipped positions
-                let ns_g = compute_subband_group(nc, nr);
-                if ((shared_skip_bitmap >> ns_g) & 1u) == 1u {
-                    ns += 1u;
-                    continue;
-                }
-                let np = (tile_origin_y + nr) * params.plane_width + (tile_origin_x + nc);
-                if (i32(round(input[np])) != 0) {
-                    break;
-                }
-                run += 1u;
-                ns += 1u;
+            let skip_ge = compute_subband_group(tile_col_e, tile_row_e);
+            if ((shared_skip_bitmap >> skip_ge) & 1u) == 1u {
+                se += 1u;
+                continue;
             }
 
-            // Encode zero run: [0] [unary(rq)] [0] [remainder, k_zrl bits]
-            let run_val = run - 1u;
-            let rq = run_val >> k_zrl;
-            let run_remainder = run_val & ((1u << k_zrl) - 1u);
+            let plane_idx_e = (tile_origin_y + tile_row_e) * params.plane_width
+                            + (tile_origin_x + tile_col_e);
+            let coeff_e = i32(round(input[plane_idx_e]));
 
-            // Batch emit when total bits fit in 15 (rq <= 12 with k_zrl <= 2)
-            let total_zrl_bits = 2u + rq + k_zrl;
-            if (total_zrl_bits <= 15u) {
-                // Combined: [0] [rq 1-bits] [0] [k_zrl remainder bits]
-                var combined = ((1u << rq) - 1u) << (k_zrl + 1u);
-                combined |= run_remainder;
-                emit_bits(combined, total_zrl_bits);
+            if (coeff_e == 0) {
+                let g_zrl_e = skip_ge;
+                let k_zrl_e = select(shared_k_zrl_z[g_zrl_e], shared_k_zrl_nz[g_zrl_e], last_mag_large_e);
+
+                var run_e = 1u;
+                var ns_e = se + 1u;
+                while (ns_e < symbols_per_stream) {
+                    let ni_e = thread_id + ns_e * STREAMS_PER_TILE;
+                    let nr_e = ni_e / params.tile_size;
+                    let nc_e = ni_e % params.tile_size;
+                    let ns_ge = compute_subband_group(nc_e, nr_e);
+                    if ((shared_skip_bitmap >> ns_ge) & 1u) == 1u {
+                        ns_e += 1u;
+                        continue;
+                    }
+                    let np_e = (tile_origin_y + nr_e) * params.plane_width + (tile_origin_x + nc_e);
+                    if (i32(round(input[np_e])) != 0) {
+                        break;
+                    }
+                    run_e += 1u;
+                    ns_e += 1u;
+                }
+
+                let run_val_e = run_e - 1u;
+                let rq_e = run_val_e >> k_zrl_e;
+                let run_rem_e = run_val_e & ((1u << k_zrl_e) - 1u);
+                let total_zrl_e = 2u + rq_e + k_zrl_e;
+                if (total_zrl_e <= 15u) {
+                    var combined_e = ((1u << rq_e) - 1u) << (k_zrl_e + 1u);
+                    combined_e |= run_rem_e;
+                    emit_bits(combined_e, total_zrl_e);
+                } else {
+                    emit_bit(0u);
+                    var rq_rem_e = rq_e;
+                    while (rq_rem_e > 0u) {
+                        let chunk_e = min(rq_rem_e, 15u);
+                        emit_bits((1u << chunk_e) - 1u, chunk_e);
+                        rq_rem_e -= chunk_e;
+                    }
+                    emit_bit(0u);
+                    if (k_zrl_e > 0u) {
+                        emit_bits(run_rem_e, k_zrl_e);
+                    }
+                }
+
+                se = ns_e;
+                last_mag_large_e = false;
             } else {
-                // Fallback for large quotients
-                emit_bit(0u);
-                var rq_rem = rq;
-                while (rq_rem > 0u) {
-                    let chunk = min(rq_rem, 15u);
-                    emit_bits((1u << chunk) - 1u, chunk);
-                    rq_rem -= chunk;
+                let sign_bit_e = select(0u, 1u, coeff_e < 0);
+                let magnitude_e = u32(abs(coeff_e)) - 1u;
+                let ge = skip_ge;
+
+                let ema_mean_e = p_ema[ge] >> 4u;
+                let k_e = select(min(31u - countLeadingZeros(ema_mean_e), 15u), 0u, ema_mean_e == 0u);
+                let quotient_e = magnitude_e >> k_e;
+                let remainder_e = magnitude_e & ((1u << k_e) - 1u);
+
+                let total_bits_e = 3u + quotient_e + k_e;
+                if (total_bits_e <= 15u) {
+                    var combined_e2 = 1u << (2u + quotient_e + k_e);
+                    combined_e2 |= sign_bit_e << (1u + quotient_e + k_e);
+                    combined_e2 |= ((1u << quotient_e) - 1u) << (k_e + 1u);
+                    combined_e2 |= remainder_e;
+                    emit_bits(combined_e2, total_bits_e);
+                } else {
+                    emit_bit(1u);
+                    emit_bit(sign_bit_e);
+                    var q_rem_e = quotient_e;
+                    while (q_rem_e > 0u) {
+                        let chunk_e2 = min(q_rem_e, 15u);
+                        emit_bits((1u << chunk_e2) - 1u, chunk_e2);
+                        q_rem_e -= chunk_e2;
+                    }
+                    emit_bit(0u);
+                    if (k_e > 0u) {
+                        emit_bits(remainder_e, k_e);
+                    }
                 }
-                emit_bit(0u);
-                if (k_zrl > 0u) {
-                    emit_bits(run_remainder, k_zrl);
-                }
+
+                p_ema[ge] = p_ema[ge] - (p_ema[ge] >> 3u) + (magnitude_e << 1u);
+                se += 1u;
+                last_mag_large_e = (magnitude_e >= 1u);
             }
+        }
 
-            s = ns;
-            // After a zero run: no nonzero preceding the next run yet
-            last_mag_large = false;
-        } else {
-            let sign_bit = select(0u, 1u, coeff < 0);
-            let magnitude = u32(abs(coeff)) - 1u;
-            let g = skip_g;
+        flush_remaining();
+        stream_lengths[tile_id * STREAMS_PER_TILE + thread_id] = p_total_bytes;
 
-            // Derive adaptive k from EMA (context-adaptive Rice parameter)
-            let ema_mean = p_ema[g] >> 4u;
-            let k = select(min(31u - countLeadingZeros(ema_mean), 15u), 0u, ema_mean == 0u);
-
-            let quotient = magnitude >> k;
-            let remainder = magnitude & ((1u << k) - 1u);
-
-            // Batch emit when total bits fit in 15
-            let total_bits = 3u + quotient + k;
-            if (total_bits <= 15u) {
-                // Combined: [1] [sign] [quotient 1-bits] [0] [k remainder bits]
-                var combined = 1u << (2u + quotient + k); // significance bit
-                combined |= sign_bit << (1u + quotient + k);
-                combined |= ((1u << quotient) - 1u) << (k + 1u); // unary
-                // stop bit at position k is 0 (implicit)
-                combined |= remainder;
-                emit_bits(combined, total_bits);
-            } else {
-                // Fallback for large quotients
-                emit_bit(1u);
-                emit_bit(sign_bit);
-                var q_remaining = quotient;
-                while (q_remaining > 0u) {
-                    let chunk = min(q_remaining, 15u);
-                    emit_bits((1u << chunk) - 1u, chunk);
-                    q_remaining -= chunk;
-                }
-                emit_bit(0u);
-                if (k > 0u) {
-                    emit_bits(remainder, k);
-                }
-            }
-
-            // Update EMA with encoded magnitude
-            p_ema[g] = p_ema[g] - (p_ema[g] >> 3u) + (magnitude << 1u);
-
-            s += 1u;
-            // Update context: large = |coeff| >= 2, i.e., magnitude >= 1
-            last_mag_large = (magnitude >= 1u);
+        // Expose final EMA means to odd neighbor threads via shared memory.
+        let even_idx = thread_id / 2u;
+        for (var gi2 = 0u; gi2 < MAX_GROUPS; gi2++) {
+            shared_ctx_even[even_idx][gi2] = p_ema[gi2] >> 4u;
         }
     }
 
-    flush_remaining();
+    // Barrier at workgroup top level — NEVER inside a branch (Metal/M1 requirement).
+    workgroupBarrier();
 
-    // Write stream byte count
-    stream_lengths[tile_id * STREAMS_PER_TILE + thread_id] = p_total_bytes;
+    // --- Step 2b: odd threads encode with neighbor-context warm-start ---
+    if (thread_id % 2u == 1u) {
+        // Read left-neighbor (even thread t-1) EMA means and blend with global k.
+        // Blending: adjusted_k = (global_k + neighbor_k + 1) / 2  (round-up 50/50).
+        // This biases odd streams toward the actual signal statistics of their
+        // immediately adjacent even stream, reducing initial EMA overshoot.
+        let even_idx_o = (thread_id - 1u) / 2u;
+        for (var gi3 = 0u; gi3 < MAX_GROUPS; gi3++) {
+            let neighbor_mean = shared_ctx_even[even_idx_o][gi3];
+            let global_k = shared_k[gi3];
+            let neighbor_k = select(
+                min(31u - countLeadingZeros(neighbor_mean), 15u),
+                0u,
+                neighbor_mean == 0u
+            );
+            let adjusted_k = clamp((global_k + neighbor_k + 1u) / 2u, 0u, 15u);
+            p_ema[gi3] = max(1u, 1u << adjusted_k) << 4u;
+            // Decoder derives the same adjusted_k from its decoded even-stream EMA states.
+            // No bitstream storage needed — context is reproduced from decoded data.
+        }
+
+        // Reset output state (was initialized above but p_ema is now adjusted)
+        p_bit_buffer = 0u;
+        p_bits_in_buffer = 0u;
+        p_word_buffer = 0u;
+        p_bytes_in_word = 0u;
+        p_word_pos = 0u;
+        p_total_bytes = 0u;
+
+        var last_mag_large_o: bool = false;
+        var so = 0u;
+        while (so < symbols_per_stream) {
+            let coeff_idx_o = thread_id + so * STREAMS_PER_TILE;
+            let tile_row_o = coeff_idx_o / params.tile_size;
+            let tile_col_o = coeff_idx_o % params.tile_size;
+
+            let skip_go = compute_subband_group(tile_col_o, tile_row_o);
+            if ((shared_skip_bitmap >> skip_go) & 1u) == 1u {
+                so += 1u;
+                continue;
+            }
+
+            let plane_idx_o = (tile_origin_y + tile_row_o) * params.plane_width
+                            + (tile_origin_x + tile_col_o);
+            let coeff_o = i32(round(input[plane_idx_o]));
+
+            if (coeff_o == 0) {
+                let g_zrl_o = skip_go;
+                let k_zrl_o = select(shared_k_zrl_z[g_zrl_o], shared_k_zrl_nz[g_zrl_o], last_mag_large_o);
+
+                var run_o = 1u;
+                var ns_o = so + 1u;
+                while (ns_o < symbols_per_stream) {
+                    let ni_o = thread_id + ns_o * STREAMS_PER_TILE;
+                    let nr_o = ni_o / params.tile_size;
+                    let nc_o = ni_o % params.tile_size;
+                    let ns_go = compute_subband_group(nc_o, nr_o);
+                    if ((shared_skip_bitmap >> ns_go) & 1u) == 1u {
+                        ns_o += 1u;
+                        continue;
+                    }
+                    let np_o = (tile_origin_y + nr_o) * params.plane_width + (tile_origin_x + nc_o);
+                    if (i32(round(input[np_o])) != 0) {
+                        break;
+                    }
+                    run_o += 1u;
+                    ns_o += 1u;
+                }
+
+                let run_val_o = run_o - 1u;
+                let rq_o = run_val_o >> k_zrl_o;
+                let run_rem_o = run_val_o & ((1u << k_zrl_o) - 1u);
+                let total_zrl_o = 2u + rq_o + k_zrl_o;
+                if (total_zrl_o <= 15u) {
+                    var combined_o = ((1u << rq_o) - 1u) << (k_zrl_o + 1u);
+                    combined_o |= run_rem_o;
+                    emit_bits(combined_o, total_zrl_o);
+                } else {
+                    emit_bit(0u);
+                    var rq_rem_o = rq_o;
+                    while (rq_rem_o > 0u) {
+                        let chunk_o = min(rq_rem_o, 15u);
+                        emit_bits((1u << chunk_o) - 1u, chunk_o);
+                        rq_rem_o -= chunk_o;
+                    }
+                    emit_bit(0u);
+                    if (k_zrl_o > 0u) {
+                        emit_bits(run_rem_o, k_zrl_o);
+                    }
+                }
+
+                so = ns_o;
+                last_mag_large_o = false;
+            } else {
+                let sign_bit_o = select(0u, 1u, coeff_o < 0);
+                let magnitude_o = u32(abs(coeff_o)) - 1u;
+                let go = skip_go;
+
+                let ema_mean_o = p_ema[go] >> 4u;
+                let k_o = select(min(31u - countLeadingZeros(ema_mean_o), 15u), 0u, ema_mean_o == 0u);
+                let quotient_o = magnitude_o >> k_o;
+                let remainder_o = magnitude_o & ((1u << k_o) - 1u);
+
+                let total_bits_o = 3u + quotient_o + k_o;
+                if (total_bits_o <= 15u) {
+                    var combined_o2 = 1u << (2u + quotient_o + k_o);
+                    combined_o2 |= sign_bit_o << (1u + quotient_o + k_o);
+                    combined_o2 |= ((1u << quotient_o) - 1u) << (k_o + 1u);
+                    combined_o2 |= remainder_o;
+                    emit_bits(combined_o2, total_bits_o);
+                } else {
+                    emit_bit(1u);
+                    emit_bit(sign_bit_o);
+                    var q_rem_o = quotient_o;
+                    while (q_rem_o > 0u) {
+                        let chunk_o2 = min(q_rem_o, 15u);
+                        emit_bits((1u << chunk_o2) - 1u, chunk_o2);
+                        q_rem_o -= chunk_o2;
+                    }
+                    emit_bit(0u);
+                    if (k_o > 0u) {
+                        emit_bits(remainder_o, k_o);
+                    }
+                }
+
+                p_ema[go] = p_ema[go] - (p_ema[go] >> 3u) + (magnitude_o << 1u);
+                so += 1u;
+                last_mag_large_o = (magnitude_o >= 1u);
+            }
+        }
+
+        flush_remaining();
+        stream_lengths[tile_id * STREAMS_PER_TILE + thread_id] = p_total_bytes;
+    }
 }

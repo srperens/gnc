@@ -10,6 +10,12 @@
 // #53: 2-state k_zrl context based on magnitude of the preceding nonzero coefficient.
 // k_zrl_nz is used after a "large" nonzero (|coeff| >= 2 → clustered signal, short runs);
 // k_zrl_z is used after a "small" nonzero (|coeff| == 1) or at start-of-stream.
+//
+// Checkerboard k-context (#checkerboard-ctx):
+// Even streams (0,2,...,254) decode first, write final EMA means to shared_ctx_even.
+// workgroupBarrier() — at top level (not inside branch) per Metal/M1 rule.
+// Odd streams (1,3,...,255) derive adjusted k from even neighbor's decoded EMA state,
+// then decode with that warm-start. No extra bitstream data — context from decoded data.
 
 const STREAMS_PER_TILE: u32 = 256u;
 const MAX_GROUPS: u32 = 8u;
@@ -39,6 +45,9 @@ var<workgroup> shared_k_zrl_nz: array<u32, 8>; // k_zrl after a large nonzero (|
 var<workgroup> shared_k_zrl_z: array<u32, 8>;  // k_zrl after a small nonzero (|coeff|==1) or start
 // Subband skip bitmap: bit g = 1 means all coefficients in group g are zero
 var<workgroup> shared_skip_bitmap: u32;
+// Checkerboard context: even threads write final EMA means here after decoding.
+// Odd threads read their left neighbor's EMA to derive adjusted k warm-start.
+var<workgroup> shared_ctx_even: array<array<u32, 8>, 128>;
 
 // Per-thread bit-reader state
 var<private> p_current_byte: u32;
@@ -119,54 +128,16 @@ fn read_rice(k: u32) -> u32 {
     return (quotient << k) | remainder;
 }
 
-@compute @workgroup_size(256)
-fn main(
-    @builtin(local_invocation_id) lid: vec3<u32>,
-    @builtin(workgroup_id) wid: vec3<u32>,
+// Decode all symbols for the current thread's stream into the output plane.
+// Uses per-thread private state: p_ema, p_byte_offset, p_bit_pos, p_current_byte.
+// Also reads shared: shared_k_zrl_nz, shared_k_zrl_z, shared_skip_bitmap.
+fn decode_stream_body(
+    thread_id: u32,
+    tile_origin_x: u32,
+    tile_origin_y: u32,
+    symbols_per_stream: u32,
 ) {
-    let thread_id = lid.x;
-    let tile_id = wid.x;
-
-    if (tile_id >= params.num_tiles) {
-        return;
-    }
-
-    let tile_x = tile_id % params.tiles_x;
-    let tile_y = tile_id / params.tiles_x;
-    let tile_origin_x = tile_x * params.tile_size;
-    let tile_origin_y = tile_y * params.tile_size;
-
-    let symbols_per_stream = params.coefficients_per_tile / STREAMS_PER_TILE;
-    let num_groups = max(1u, params.num_levels * 2u);
-
-    // Cooperatively load k values into shared memory (stride K_STRIDE = 25)
-    // Layout: [k_mag ×8][k_zrl_nz ×8][k_zrl_z ×8][skip_bitmap]
-    if (thread_id < num_groups) {
-        shared_k[thread_id]        = k_values[tile_id * K_STRIDE + thread_id];
-        shared_k_zrl_nz[thread_id] = k_values[tile_id * K_STRIDE + MAX_GROUPS + thread_id];
-        shared_k_zrl_z[thread_id]  = k_values[tile_id * K_STRIDE + MAX_GROUPS * 2u + thread_id];
-    }
-    if (thread_id == 0u) {
-        shared_skip_bitmap = k_values[tile_id * K_STRIDE + K_STRIDE - 1u];
-    }
-    workgroupBarrier();
-
-    // Initialize EMA from static k seeds (per-thread private, 8 groups)
-    for (var gi = 0u; gi < MAX_GROUPS; gi++) {
-        p_ema[gi] = max(1u, 1u << shared_k[gi]) << 4u;
-    }
-
-    // Initialize bit reader with this stream's byte offset
-    let stream_idx = tile_id * STREAMS_PER_TILE + thread_id;
-    p_byte_offset = stream_offsets[stream_idx];
-    p_bit_pos = 8u;  // force load on first read_bit()
-    p_current_byte = 0u;
-
-    // Context state: was the preceding nonzero coefficient |coeff| >= 2?
-    // Must mirror rice_encode.wgsl Phase 2 context tracking exactly.
     var last_mag_large: bool = false;
-
-    // Decode tokens with ZRL
     var s = 0u;
     while (s < symbols_per_stream) {
         let ci0 = thread_id + s * STREAMS_PER_TILE;
@@ -211,7 +182,6 @@ fn main(
             last_mag_large = false;
         } else {
             // Non-zero coefficient
-            let coeff_idx = ci0;
             let tile_row = cr0;
             let tile_col = cc0;
             let plane_idx = (tile_origin_y + tile_row) * params.plane_width
@@ -236,5 +206,87 @@ fn main(
             // Mirror encoder: large = |coeff| >= 2, i.e., rice_val (= |coeff|-1) >= 1
             last_mag_large = (rice_val >= 1u);
         }
+    }
+}
+
+@compute @workgroup_size(256)
+fn main(
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(workgroup_id) wid: vec3<u32>,
+) {
+    let thread_id = lid.x;
+    let tile_id = wid.x;
+
+    if (tile_id >= params.num_tiles) {
+        return;
+    }
+
+    let tile_x = tile_id % params.tiles_x;
+    let tile_y = tile_id / params.tiles_x;
+    let tile_origin_x = tile_x * params.tile_size;
+    let tile_origin_y = tile_y * params.tile_size;
+
+    let symbols_per_stream = params.coefficients_per_tile / STREAMS_PER_TILE;
+    let num_groups = max(1u, params.num_levels * 2u);
+
+    // Cooperatively load k values into shared memory.
+    // Layout: [k_mag ×8][k_zrl_nz ×8][k_zrl_z ×8][skip_bitmap @K_STRIDE-1] = 25 entries
+    if (thread_id < num_groups) {
+        shared_k[thread_id]        = k_values[tile_id * K_STRIDE + thread_id];
+        shared_k_zrl_nz[thread_id] = k_values[tile_id * K_STRIDE + MAX_GROUPS + thread_id];
+        shared_k_zrl_z[thread_id]  = k_values[tile_id * K_STRIDE + MAX_GROUPS * 2u + thread_id];
+    }
+    if (thread_id == 0u) {
+        shared_skip_bitmap = k_values[tile_id * K_STRIDE + K_STRIDE - 1u];
+    }
+    workgroupBarrier(); // top-level: all threads synchronize
+
+    // === Checkerboard two-pass decode ===
+    // Pass 1: even threads decode, write final EMA to shared_ctx_even.
+    // workgroupBarrier() — at workgroup top level (not inside any branch per Metal/M1 rule).
+    // Pass 2: odd threads derive adjusted k from neighbor EMA, then decode.
+
+    // --- Pass 1: even threads ---
+    if (thread_id % 2u == 0u) {
+        // Initialize EMA from global k seeds (standard warm-start)
+        for (var gi = 0u; gi < MAX_GROUPS; gi++) {
+            p_ema[gi] = max(1u, 1u << shared_k[gi]) << 4u;
+        }
+        // Initialize bit reader
+        p_byte_offset = stream_offsets[tile_id * STREAMS_PER_TILE + thread_id];
+        p_bit_pos = 8u;
+        p_current_byte = 0u;
+        // Decode this stream
+        decode_stream_body(thread_id, tile_origin_x, tile_origin_y, symbols_per_stream);
+        // Expose final EMA to odd neighbor
+        let even_idx = thread_id / 2u;
+        for (var gi2 = 0u; gi2 < MAX_GROUPS; gi2++) {
+            shared_ctx_even[even_idx][gi2] = p_ema[gi2] >> 4u;
+        }
+    }
+
+    workgroupBarrier(); // top-level: even done, barrier before odd reads context
+
+    // --- Pass 2: odd threads ---
+    if (thread_id % 2u == 1u) {
+        // Derive adjusted k from even neighbor's decoded EMA (same formula as encoder)
+        let even_idx_o = (thread_id - 1u) / 2u;
+        for (var gi3 = 0u; gi3 < MAX_GROUPS; gi3++) {
+            let neighbor_mean = shared_ctx_even[even_idx_o][gi3];
+            let global_k = shared_k[gi3];
+            let neighbor_k = select(
+                min(31u - countLeadingZeros(neighbor_mean), 15u),
+                0u,
+                neighbor_mean == 0u
+            );
+            let adjusted_k = clamp((global_k + neighbor_k + 1u) / 2u, 0u, 15u);
+            p_ema[gi3] = max(1u, 1u << adjusted_k) << 4u;
+        }
+        // Initialize bit reader
+        p_byte_offset = stream_offsets[tile_id * STREAMS_PER_TILE + thread_id];
+        p_bit_pos = 8u;
+        p_current_byte = 0u;
+        // Decode this stream
+        decode_stream_body(thread_id, tile_origin_x, tile_origin_y, symbols_per_stream);
     }
 }

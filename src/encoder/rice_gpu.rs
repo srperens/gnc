@@ -14,8 +14,8 @@ use super::rice::{max_stream_bytes_for_tile, RiceTile, RICE_STREAMS_PER_TILE};
 use crate::{FrameInfo, GpuContext};
 
 const MAX_GROUPS: usize = 8;
-// K_STRIDE per tile: [k_mag ×8][k_zrl_nz ×8][k_zrl_z ×8][skip_bitmap ×1] = 25 (#53)
-const K_STRIDE: usize = MAX_GROUPS * 3 + 1;
+// K_STRIDE per tile: [k_mag ×8][k_zrl_nz ×8][k_zrl_z ×8][skip_bitmap ×1] = 25
+const K_STRIDE: usize = MAX_GROUPS * 3 + 1; // 25
 
 // Field order must stay in sync with shaders/rice_encode.wgsl Params struct (bytemuck::Pod).
 // Fields in order: num_tiles, coefficients_per_tile, plane_width, tile_size, tiles_x,
@@ -190,6 +190,10 @@ pub struct GpuRiceEncoder {
 
 impl GpuRiceEncoder {
     pub fn new(ctx: &GpuContext) -> Self {
+        // Canary: checkerboard k-context is active (even streams encode first, odd streams
+        // warm-start EMA from left-neighbor mean). Expected gain: 0.05–0.15 bpp.
+        eprintln!("GNC: checkerboard k-context active (even→barrier→odd, expected −0.05–0.15 bpp)");
+
         let shader = ctx
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -522,6 +526,7 @@ impl GpuRiceEncoder {
                     k_zrl_nz_values,
                     k_zrl_z_values,
                     skip_bitmap,
+                    k_stream_odd: Vec::new(),
                     stream_lengths,
                     stream_data: packed_data,
                 });
@@ -723,6 +728,7 @@ impl GpuRiceEncoder {
                 k_zrl_nz_values,
                 k_zrl_z_values,
                 skip_bitmap,
+                k_stream_odd: Vec::new(),
                 stream_lengths,
                 stream_data: packed_data,
             });
@@ -960,6 +966,7 @@ impl GpuRiceEncoder {
                     k_zrl_nz_values,
                     k_zrl_z_values,
                     skip_bitmap,
+                    k_stream_odd: Vec::new(),
                     stream_lengths,
                     stream_data: packed_data,
                 });
@@ -1251,6 +1258,7 @@ impl GpuRiceEncoder {
                         k_zrl_nz_values,
                         k_zrl_z_values,
                         skip_bitmap,
+                        k_stream_odd: Vec::new(),
                         stream_lengths,
                         stream_data: packed_data,
                     });
@@ -1383,8 +1391,10 @@ impl GpuRiceDecoder {
         let num_tiles = tiles.len();
         let total_streams = num_tiles * RICE_STREAMS_PER_TILE;
 
-        // k values: flat array indexed by tile_id * K_STRIDE + group
-        // Layout: [k_mag ×8][k_zrl_nz ×8][k_zrl_z ×8][skip_bitmap] (#53)
+        // k values: flat array indexed by tile_id * K_STRIDE + offset
+        // Layout: [k_mag ×8][k_zrl_nz ×8][k_zrl_z ×8][skip_bitmap ×1] = 25 entries
+        // Checkerboard ctx: odd-stream k is derived by GPU decoder from decoded even-stream
+        // EMA via workgroup shared memory — no bitstream storage needed.
         let mut k_values = vec![0u32; num_tiles * K_STRIDE];
         for (t, tile) in tiles.iter().enumerate() {
             for (g, &k) in tile.k_values.iter().enumerate() {

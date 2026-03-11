@@ -173,17 +173,27 @@ impl SubbandWeights {
     }
 
     /// Perceptual weights: quantize inner detail harder (less energy), preserve outer detail.
+    ///
+    /// NOTE: "outer" = detail[0] = finest/highest-freq (most HVS-insensitive).
+    ///       "inner" = detail[levels-1] = coarsest (near-LL, most HVS-sensitive).
+    /// Current gradient (inner harder) is the production default.
+    /// GNC_PHYSICAL_WEIGHTS=1 reverses gradient (outer harder) per perceptual theory.
     pub fn perceptual(levels: u32) -> Self {
         // HH weight scale: read from env for gate testing (default 1.0 = production)
         let hh_scale: f32 = std::env::var("GNC_HH_WEIGHT_SCALE")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(1.0);
+        // GNC_PHYSICAL_WEIGHTS=1: reverse gradient — finest subbands get highest weight
+        // (quantized hardest) because HVS is least sensitive to high frequencies.
+        // This matches JPEG 2000 subband energy norms and standard perceptual theory.
+        let physical = std::env::var("GNC_PHYSICAL_WEIGHTS").is_ok();
         let mut detail = Vec::with_capacity(levels as usize);
         for i in 0..levels as usize {
-            let lh_hl = 1.0 + 0.5 * i as f32;
-            let is_innermost = i == levels as usize - 1;
-            let hh = (lh_hl + if is_innermost { 1.0 } else { 0.5 }) * hh_scale;
+            let j = if physical { levels as usize - 1 - i } else { i };
+            let lh_hl = 1.0 + 0.5 * j as f32;
+            let is_target = if physical { i == 0 } else { i == levels as usize - 1 };
+            let hh = (lh_hl + if is_target { 1.0 } else { 0.5 }) * hh_scale;
             detail.push([lh_hl, lh_hl, hh]);
         }
         Self {

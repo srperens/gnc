@@ -1154,6 +1154,58 @@ fn main() {
                 );
             }
 
+            // Per-tile bpp variance diagnostic — PCRD potential estimation
+            // GNC_TILE_BPP_DIAG=1 prints per-tile bpp stats for Y plane.
+            // CV (coefficient of variation = std/mean) indicates PCRD headroom:
+            //   CV < 0.3 → tiles are uniform, PCRD saves < 5%
+            //   CV 0.3–0.7 → moderate variance, PCRD could save 5–15%
+            //   CV > 0.7 → high variance, PCRD could save > 15%
+            if std::env::var("GNC_TILE_BPP_DIAG").is_ok() {
+                if let EntropyData::Rice(ref tiles) = compressed.entropy {
+                    let ts = config.tile_size as usize;
+                    let tile_pixels = (ts * ts) as f64;
+                    // Y tiles are first; identify by coefficient count
+                    let tiles_x_u = w.div_ceil(ts as u32) as usize;
+                    let tiles_y_u = h.div_ceil(ts as u32) as usize;
+                    let y_tile_count = tiles_x_u * tiles_y_u;
+                    let y_tiles = &tiles[..y_tile_count.min(tiles.len())];
+
+                    let tile_bpps: Vec<f64> = y_tiles
+                        .iter()
+                        .map(|t| (t.byte_size() as f64 * 8.0) / tile_pixels)
+                        .collect();
+
+                    let mean = tile_bpps.iter().sum::<f64>() / tile_bpps.len() as f64;
+                    let variance = tile_bpps.iter().map(|&b| (b - mean).powi(2)).sum::<f64>()
+                        / tile_bpps.len() as f64;
+                    let std_dev = variance.sqrt();
+                    let cv = std_dev / mean;
+                    let min_bpp = tile_bpps.iter().cloned().fold(f64::INFINITY, f64::min);
+                    let max_bpp = tile_bpps.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                    let ratio = max_bpp / min_bpp.max(0.001);
+
+                    // Rate-distortion theory: PCRD saves approximately
+                    //   0.5 * log2(1 + CV²) bits per coefficient (Laplacian assumption)
+                    // As fraction of mean bpp:
+                    let pcrd_estimate_frac = (1.0 + cv * cv).log2() * 0.5 / mean.log2();
+
+                    eprintln!("[tile_bpp] Y tiles={} tile_size={}",
+                        y_tile_count, ts);
+                    eprintln!("[tile_bpp] mean={:.3} std={:.3} CV={:.3}  min={:.3} max={:.3} max/min={:.1}×",
+                        mean, std_dev, cv, min_bpp, max_bpp, ratio);
+                    eprintln!("[tile_bpp] PCRD upper-bound estimate: {:.1}% bpp reduction",
+                        pcrd_estimate_frac * 100.0);
+
+                    // Print all per-tile bpp values
+                    for (i, &bpp) in tile_bpps.iter().enumerate() {
+                        let tx = i % tiles_x_u;
+                        let ty = i / tiles_x_u;
+                        eprintln!("[tile_bpp]   tile({:2},{:2}) = {:.3} bpp  ({:.0}%)",
+                            tx, ty, bpp, bpp / mean * 100.0);
+                    }
+                }
+            }
+
             // VMAF perceptual quality scoring (single-frame)
             if vmaf {
                 let tmp_ref  = std::env::temp_dir().join("gnc_bench_vmaf_ref.y4m");

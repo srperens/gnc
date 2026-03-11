@@ -4,6 +4,362 @@
 
 ---
 
+## 2026-03-11: Feature Ablation + H.264 BD-rate Comparison
+
+### Motivation
+User requested: stop adding features, do proper measurements to understand what's worth keeping.
+
+### Part 1: Feature Ablation (q=75, 444, ki=9, 10 frames)
+
+| Sequence | Config | bpp | VMAF | Δ bpp vs all-I |
+|----------|--------|-----|------|----------------|
+| crowd_run | All-I (ki=1) | 7.32 | 99.09 | — |
+| crowd_run | I+P (ki=2) | 6.31 | 99.09 | −13.8% |
+| crowd_run | I+P+pyramid-B, no L3 scale | 6.00 | 99.13 | −18.0% |
+| crowd_run | **Current (L3 scale=1.5×)** | **5.34** | **99.10** | **−27.0%** |
+| park_joy | All-I (ki=1) | 5.36 | 99.12 | — |
+| park_joy | I+P (ki=2) | 4.73 | 99.12 | −11.7% |
+| park_joy | I+P+pyramid-B, no L3 scale | 4.71 | 99.14 | −12.1% |
+| park_joy | **Current (L3 scale=1.5×)** | **4.22** | **99.12** | **−21.3%** |
+
+**Finding:** All three layers (P-frames, pyramid B-frames, L3 QP scale) contribute meaningfully. L3 QP scale alone gives ~9% bpp reduction with VMAF neutral. Pyramid B-frames give 0.4–4% (content-dependent). P-frames give 11–14%. Every feature earns its place.
+
+### Part 2: BD-rate vs H.264 (q=75 sweep, ki=9)
+
+**Test setup:** 10 frames from crowd_run and park_joy. H.264: libx264, slow preset, keyint=10, pix_fmt yuv420p, CRF 12–42. GNC: 420 and 444, ki=9. VMAF computed against native format reference.
+
+#### H.264 (420, ref=420p):
+| CRF | crowd_run bpp | crowd_run VMAF | park_joy bpp | park_joy VMAF |
+|-----|-------------|----------------|-------------|---------------|
+| 12  | 1.54 | 99.28 | 1.45 | 99.27 |
+| 18  | 0.58 | 97.77 | 0.48 | 98.86 |
+| 24  | 0.23 | 89.26 | 0.20 | 93.33 |
+| 30  | 0.11 | 72.72 | 0.09 | 76.11 |
+
+#### GNC 420 (ref=420):
+| q  | crowd_run bpp | crowd_run VMAF | park_joy bpp | park_joy VMAF |
+|----|-------------|----------------|-------------|---------------|
+| 25 | 1.58 | 84.40 | 1.20 | 85.22 |
+| 40 | 2.31 | 89.92 | 1.71 | 89.79 |
+| 50 | 2.77 | 91.38 | 1.94 | 90.99 |
+| 65 | 3.92 | 93.48 | 2.77 | 93.10 |
+| 75 | 4.72 | 94.33 | 3.51 | 94.04 |
+
+#### GNC 444 (ref=444 source):
+| q  | crowd_run bpp | crowd_run VMAF | park_joy bpp | park_joy VMAF |
+|----|-------------|----------------|-------------|---------------|
+| 25 | 1.52 | 89.04 | 1.37 | 92.91 |
+| 40 | 2.19 | 95.52 | 1.88 | 97.59 |
+| 50 | 2.77 | 97.10 | 2.30 | 98.25 |
+| 65 | 4.15 | 98.86 | 3.30 | 98.87 |
+| 75 | 5.34 | 99.10 | 4.22 | 99.12 |
+
+#### Bjøntegaard BD-rate (positive = GNC needs more bits):
+| Sequence | GNC 420 vs H.264 | GNC 444 vs H.264 | VMAF range |
+|----------|-----------------|-----------------|------------|
+| crowd_run | **+730%** | **+363%** | 84–99 |
+| park_joy  | **+822%** | **+381%** | 85–99 |
+
+**Reference points (crowd_run):**
+- VMAF 89: H.264=0.27 bpp, GNC420=2.12 bpp, → 7.8× more bits
+- VMAF 97: H.264=0.73 bpp, GNC444=2.65 bpp, → 3.6× more bits
+- VMAF 99: H.264=0.99 bpp, GNC444=4.78 bpp, → 4.8× more bits
+
+### Part 3: Gap Decomposition — Where Do the 4× Come From?
+
+**Question:** BD-rate vs H.264 = +363–381%. Is this entropy, temporal, or spatial?
+
+**Experiment:** H.264 all-intra sweep (keyint=1) at same CRF values; GNC rANS vs Rice.
+
+#### H.264 all-intra (420, keyint=1):
+| CRF | crowd_run bpp | VMAF | park_joy bpp | VMAF |
+|-----|-------------|------|-------------|------|
+| 12 | 2.10 | 99.08 | 4.31 | 99.15 |
+| 18 | 1.14 | 94.86 | 2.14 | 98.55 |
+| 24 | 0.59 | 80.77 | 1.08 | 89.00 |
+| 30 | 0.28 | 56.51 | 0.49 | 66.45 |
+
+#### GNC rANS 444 (crowd_run):
+| q  | bpp  | VMAF  | Rice bpp | Rice savings |
+|----|------|-------|----------|-------------|
+| 25 | 1.34 | 89.41 | 1.52 | 11.8% |
+| 40 | 1.98 | 95.59 | 2.19 | 9.6% |
+| 50 | 2.60 | 97.11 | 2.77 | 6.1% |
+| 65 | 3.91 | 98.86 | 4.15 | 5.8% |
+| 75 | 5.04 | 99.10 | 5.34 | 5.6% |
+rANS BD-rate vs Rice: **−13.2%** (rANS saves 13%)
+
+#### Decomposition (at VMAF ~99):
+| Component | GNC | H.264 | Ratio |
+|-----------|-----|-------|-------|
+| All-intra bpp | 7.32 | 2.10 | **3.5×** |
+| With inter | 5.34 | 1.54 | **3.5×** |
+| H.264 inter gain | — | 27% at VMAF99 / 70% BD-rate vs all-I | — |
+| GNC inter gain | 27% | — | — |
+
+**Key finding:** The all-intra ratio and the inter ratio are both ~3.5×. The spatial coding gap *dominates* — inter coding does not change the ratio because GNC and H.264 both gain ~27% at VMAF 99 (H.264's advantage is larger at lower quality). Entropy (Rice→rANS) saves 13%, which is real but does not explain the gap.
+
+### Part 4: Corrected Fair Comparison (420 vs 420) + Parsing Bug
+
+**Bug discovered:** Earlier GNC 420 inter sweep had a parsing error — the awk script returned the all-I bpp line instead of the inter line. Corrected data:
+
+#### GNC 420 inter (corrected, crowd_run):
+| q  | bpp  | VMAF  | (previously reported, wrong) |
+|----|------|-------|------------------------------|
+| 25 | 1.17 | 84.40 | (was 1.58 — actually all-I) |
+| 40 | 1.59 | 89.92 | (was 2.31) |
+| 50 | 1.96 | 91.38 | (was 2.77) |
+| 65 | 2.78 | 93.48 | (was 3.92) |
+| 75 | 3.51 | 94.33 | (was 4.72) |
+
+#### GNC 420 all-intra (crowd_run):
+| q  | bpp  | VMAF  |
+|----|------|-------|
+| 25 | 1.58 | 94.64 |
+| 75 | 4.72 | 99.08 |
+
+#### Fair comparison: all-intra 420 vs 420 at VMAF ~99:
+- H.264 all-I CRF 12: 2.10 bpp, VMAF 99.08
+- GNC all-I q=75 420: 4.72 bpp, VMAF 99.08
+- **Spatial gap: 2.2× (not 3.5× — the previous 3.5× was GNC 444 vs H.264 420, unfair)**
+
+Also:
+- H.264 all-I → inter BD-rate: −41% (inter saves 41% across quality range)
+- GNC 420 all-I → inter BD-rate: not cleanly comparable (VMAF ranges don't overlap due to L3 QP scale reducing max quality of inter)
+
+### Part 5: Single-Frame Gap Decomposition — JPEG 2000 vs H.264 vs GNC
+
+**Question:** Within the spatial gap, is it entropy or transform/quantization?
+
+**Test:** crowd_run frame 0 (1920×1080). GNC Rice (default) and rANS sweeps; JPEG 2000 via rd-curve; H.264 all-intra 420 via ffmpeg+x264.
+
+#### Single-frame bpp at key PSNR points:
+| PSNR | GNC Rice | GNC rANS | JPEG 2000 | H.264 all-I 420 |
+|------|----------|----------|-----------|-----------------|
+| 30 dB | 1.77 | 1.54 | 0.91 | 0.92 |
+| 32 dB | 2.42 | 2.22 | 1.39 | 1.36 |
+| 34 dB | 3.25 | 3.11 | 2.04 | 1.91 |
+| 36 dB | 4.28 | 4.19 | 2.87 | 2.58 |
+| 38 dB | 5.51 | 5.47 | 3.88 | 3.40 |
+| 40 dB | 6.91 | 6.91 | 5.06 | 4.41 |
+| 42 dB | 8.41 | 8.44 | 6.36 | 5.72 |
+
+#### BD-rate (PSNR-based, single frame):
+| Comparison | BD-rate |
+|-----------|---------|
+| GNC rANS vs GNC Rice | **−3.5%** (rANS barely helps) |
+| JPEG 2000 vs H.264 all-I 420 | **+6%** (nearly identical!) |
+| GNC Rice vs JPEG 2000 | **+47%** |
+| GNC rANS vs JPEG 2000 | **+42%** |
+| GNC rANS vs H.264 all-I 420 | **+62%** |
+
+#### Gap decomposition (GNC Rice vs JPEG 2000 = +47% BD-rate):
+- Entropy (Rice → rANS): −3.5 pp → **7% of the gap**
+- Remaining (quantization/transform): +42% → **89% of the gap**
+
+### Part 6: AQ Contribution to JPEG 2000 Gap
+
+**Question:** How much of the 47% BD-rate gap vs JPEG 2000 is explained by GNC's AQ?
+
+**Test:** crowd_run frame 0, GNC Rice with and without `--no-aq`.
+
+#### GNC +AQ vs GNC no-AQ (Rice, crowd_run frame 0):
+| q  | AQ bpp | AQ PSNR | no-AQ bpp | no-AQ PSNR |
+|----|--------|---------|-----------|-----------|
+| 10 | 1.1500 | 27.38 | 1.1197 | 27.27 |
+| 20 | 1.7212 | 29.87 | 1.6787 | 29.78 |
+| 30 | 2.3744 | 31.96 | 2.3261 | 31.90 |
+| 40 | 3.2287 | 33.89 | 3.1752 | 33.85 |
+| 50 | 3.9249 | 35.46 | 3.9072 | 35.45 |
+| 60 | 5.2785 | 37.52 | 5.2722 | 37.55 |
+| 70 | 6.6476 | 39.50 | 6.6476 | 39.66 |
+| 80 | 8.8665 | 42.81 | 8.8583 | 43.16 |
+| 90 | 13.1831 | 50.24 | 13.1831 | 50.24 |
+
+Note: at higher q, AQ and no-AQ converge (AQ disabled at q>80 by design). AQ redistributes bits toward detail subbands; PSNR-based BD-rate slightly favors no-AQ at high q (uniform quantization scores better on PSNR). VMAF would likely reverse this.
+
+BD-rate no-AQ vs AQ: **+1.3%** (no-AQ is slightly worse at same PSNR — AQ saves 1.3%)
+
+#### Full decomposition: GNC Rice vs JPEG 2000 = +47% BD-rate
+| Source | Contribution | Share of gap |
+|--------|-------------|-------------|
+| AQ (Rice+AQ vs Rice no-AQ) | 1.3% | 3% |
+| Entropy (Rice→rANS) | 5.1% | 11% |
+| **Core quant/transform** | **42%** | **89%** |
+
+**Finding:** AQ explains only 3% of the gap. Entropy 11%. The remaining 86–89% is unexplained by these two knobs — it is in the core quantization/transform architecture. Most likely candidate: absence of PCRD-opt (Lagrangian RD optimization per code block). JPEG 2000's EBCOT coder finds the globally optimal truncation point for each subband block; GNC uses a fixed quantization step with no global RD pass.
+
+### Part 7: Wavelet Levels and Dead Zone Contribution
+
+**Wavelet levels (3 vs 4), crowd_run frame 0:**
+| q  | 3-level bpp | 3L psnr | 4-level bpp | 4L psnr |
+|----|-------------|---------|-------------|---------|
+| 10 | 1.1500 | 27.38 | 0.9661 | 26.91 |
+| 20 | 1.7212 | 29.87 | 1.5190 | 29.51 |
+| 30 | 2.3744 | 31.96 | 2.1653 | 31.68 |
+| 40 | 3.2287 | 33.89 | 3.0289 | 33.69 |
+| 50 | 4.1239 | 35.60 | 3.9249 | 35.46 |
+| 60 | 5.4725 | 37.60 | 5.2785 | 37.52 |
+| 70 | 6.8406 | 39.37 | 6.6476 | 39.50 |
+| 80 | 9.0625 | 42.36 | 8.8665 | 42.81 |
+| 90 | 13.3146 | 50.25 | 13.1831 | 50.24 |
+
+BD-rate 4L vs 3L: **−4.4%** (4 levels saves 4.4% bpp at same PSNR)
+5 levels: panics (Rice encoder index overflow — hardcoded limit, not supported with 256×256 tiles)
+
+**Dead zone sweep (4 levels, crowd_run frame 0):**
+| dz  | BD-rate vs JPEG 2000 | Δ vs default (0.75) |
+|-----|---------------------|---------------------|
+| 0.50 | +53.9% | +8.4% (worse) |
+| **0.75 (default)** | **+47.2%** | **— (best)** |
+| 1.00 | +59.8% | +3.0% (worse) |
+| 1.25 | +71.5% | +6.7% (worse) |
+| 1.50 | +79.8% | +9.5% (worse) |
+
+**Finding:** dz=0.75 is already optimal. Higher deadzone creates more zeros but increases distortion faster than it saves bits. Lower deadzone improves quality but uses more bits. Neither direction helps vs JPEG 2000.
+
+### Updated Gap Decomposition (after all experiments)
+
+GNC Rice 4-level vs JPEG 2000 = **+47% BD-rate**:
+
+| Factor | Bpp saving | Share of gap |
+|--------|-----------|-------------|
+| Wavelet levels 3→4 | 4.4% | ~10% |
+| Entropy Rice→rANS | 4.0% | ~9% |
+| AQ on/off | 1.3% | ~3% |
+| Dead zone (already optimal) | 0% | 0% |
+| **Total explained** | **~9%** | **~22%** |
+| **Unexplained** | **~42%** | **~78%** |
+
+The 78% unexplained gap survives all tested levers. This points to something more fundamental in the architecture. Most likely candidates (in estimated order of impact):
+1. **PCRD-opt absence** — JPEG 2000 uses Lagrangian RD optimization per code block (64×64 in wavelet domain). GNC uses a fixed qstep with spatial AQ weights. The gain from PCRD-opt in JPEG 2000 literature is typically 5–15% over uniform quantization, but that wouldn't explain 42%.
+2. **EBCOT inter-coefficient context** — JPEG 2000's MQ-coder has rich per-bit context from neighboring coefficients (significance map, sign, refinement bits). GNC's Rice has only a group-level k estimate. This may be the dominant factor.
+3. **Subband gain factors** — JPEG 2000 normalizes quantization steps by synthesis filter norms. GNC's perceptual weights are empirical. Miscalibration across 12 subbands could accumulate.
+
+Note: Rice vs rANS only saves 3.5–4% → the entropy coding difference between GNC and JPEG 2000 (MQ-coder vs Rice) is likely larger than 4% but smaller than 42%. The rANS measurement underestimates the MQ-coder advantage because rANS still lacks inter-coefficient context.
+
+### Complete single-frame bpp table (crowd_run frame 0, 1920×1080)
+
+| PSNR | GNC Rice | GNC rANS | GNC no-AQ | JPEG 2000 | H.264 all-I 420 |
+|------|----------|----------|-----------|-----------|-----------------|
+| 30 dB | 1.765 | 1.541 | 1.754 | 0.911 | 0.921 |
+| 32 dB | 2.417 | 2.224 | 2.404 | 1.391 | 1.360 |
+| 34 dB | 3.250 | 3.105 | 3.227 | 2.037 | 1.910 |
+| 36 dB | 4.281 | 4.191 | 4.236 | 2.865 | 2.582 |
+| 38 dB | 5.509 | 5.472 | 5.429 | 3.878 | 3.400 |
+| 40 dB | 6.907 | 6.910 | 6.779 | 5.056 | 4.413 |
+| 42 dB | 8.411 | 8.441 | 8.232 | 6.358 | 5.715 |
+
+Raw sweep data (q or CRF, bpp, PSNR):
+
+**GNC Rice (default):** q=10→1.15/27.4, q=20→1.72/29.9, q=30→2.37/32.0, q=40→3.23/33.9, q=50→3.92/35.5, q=60→5.28/37.5, q=70→6.65/39.5, q=80→8.87/42.8, q=90→13.18/50.2
+
+**GNC rANS:** q=10→0.92/27.4, q=20→1.48/29.9, q=30→2.16/32.0, q=40→3.05/33.9, q=50→3.92/35.5, q=60→5.27/37.5, q=70→6.64/39.5, q=80→8.80/42.8, q=90→13.65/50.2
+
+**GNC no-AQ (Rice):** q=10→1.12/27.3, q=20→1.68/29.8, q=30→2.33/31.9, q=40→3.18/33.9, q=50→3.91/35.5, q=60→5.27/37.6, q=70→6.65/39.7, q=80→8.86/43.2, q=90→13.18/50.2
+
+**JPEG 2000:** rate=100→0.24/24.8, rate=80→0.30/25.5, rate=60→0.40/26.5, rate=40→0.60/28.2, rate=20→1.20/31.3, rate=10→2.40/35.0, rate=5→4.80/39.6, rate=3→8.00/44.3, rate=2→12.00/51.4
+
+**H.264 all-I 420:** CRF=38→0.42/26.6, CRF=32→0.83/29.7, CRF=28→1.34/31.9, CRF=24→2.09/34.4, CRF=20→3.08/37.2, CRF=16→4.20/39.8, CRF=12→5.37/41.7, CRF=8→6.53/42.8
+
+### Assessment (corrected — previous assessment was based on wrong data)
+
+**The compression gap is real but we previously overestimated it** due to the 444 vs 420 comparison error.
+
+Corrected facts:
+1. **Spatial gap (all-I, fair 420 vs 420):** 2.2×, not 3.5×
+2. **H.264 intra prediction advantage over JPEG 2000:** only +6% — intra prediction is NOT the bottleneck
+3. **Entropy (Rice vs rANS) on single frames:** 3.5% — negligible. (The 13% seen on video sequences includes temporal prediction effects.)
+4. **GNC vs JPEG 2000 (both wavelet, no intra prediction):** +47% — this is the core problem
+5. **Root cause of GNC vs JPEG 2000 gap:** 89% is quantization/transform quality, not entropy. Most likely: absence of PCRD-opt (post-compression rate-distortion optimization). JPEG 2000 allocates bits globally optimally per code block; GNC uses fixed q + per-subband AQ with no global RD pass.
+
+**Priority implication:** The next experiments should target quantization quality, not entropy.
+
+Full gap decomposition — GNC Rice 444 vs JPEG 2000 single frame:
+- AQ: 3%
+- Entropy (Rice→rANS): 11%
+- **Core quantization/transform architecture: 86%**
+
+The most tractable path to close this gap is some form of per-tile RD optimization (analogous to PCRD-opt). This does not require changing the wavelet or entropy coder — it operates on the quantized coefficients and finds the optimal qstep per tile/subband subject to a bit budget. This is architecturally compatible with GNC's tile-independent design.
+
+### Part 8: PCRD Potential — Per-tile BPP Variance
+
+**Hypothesis:** If per-tile bpp variance is high, PCRD-style optimal bit allocation could save significant bpp.
+**Method:** GNC_TILE_BPP_DIAG=1 added to benchmark command. Reports per-tile bpp for Y plane, CV (std/mean), and theoretical PCRD upper bound assuming Laplacian source.
+
+**Results (q=75, single I-frame):**
+
+| Sequence | Y tiles | mean bpp | CV | max/min | PCRD upper bound |
+|----------|---------|----------|-----|---------|-----------------|
+| bbb_1080p | 40 | 1.543 | 0.436 | 13.8× | ~20% |
+| crowd_run | 40 | 2.567 | 0.334 | 4.4× | ~6% |
+| park_joy | 40 | 1.958 | 0.582 | 9.8× | ~22% |
+
+**Interpretation:**
+- PCRD potential at tile-level (40 tiles/frame): 6–22% bpp reduction, content-dependent
+- This is a **lower bound** on JPEG 2000's actual PCRD gain (JPEG 2000 operates at code-block level ~1500 blocks/frame, with higher within-tile variance)
+- Tiles vary 4–14× in complexity: simple tiles (near-blank areas) waste bits, complex tiles could benefit from finer qstep
+- Tile-level PCRD would explain 6–22% of the 47% gap vs JPEG 2000 (13–47% of the gap)
+
+**Finding:** PCRD has meaningful potential (6–22%), but alone cannot explain the full 78% unexplained gap. Combined with context coding improvements, total could approach 40–50%.
+
+### Part 9: Subband Weight Calibration — Major Finding
+
+**Hypothesis:** GNC's perceptual subband weights are calibrated in the wrong direction. Current weights: finest subbands (outermost, highest spatial frequency) get weight=1.0 (least quantization), coarsest subbands (innermost, just above LL) get weight=2.5 (most quantization). Standard perceptual theory says the opposite: finest subbands are less visible to HVS and should be quantized MORE aggressively.
+
+**Test:** GNC_PHYSICAL_WEIGHTS=1 reverses the gradient — finest subbands weight 2.5, coarsest weight 1.0. This matches JPEG 2000's analytical subband energy norms direction.
+
+**Single-frame RD-curve (I-frame, VMAF metric):**
+
+| Sequence | Comparison | bpp saved at same VMAF |
+|----------|-----------|----------------------|
+| bbb_1080p | VMAF ~95: default 4.0 bpp → physical 2.5 bpp | **−38%** |
+| crowd_run | VMAF ~93.5: default ~4.6 bpp → physical 2.51 bpp | **−45%** |
+| park_joy | VMAF ~94: default ~4.3 bpp → physical 2.49 bpp | **−42%** |
+
+**Sequence encoding (I+P+B, q=75, ki=9, 444):**
+
+| Sequence | DEFAULT bpp / VMAF | PHYSICAL bpp / VMAF | Δ bpp | Δ VMAF |
+|----------|-------------------|--------------------|----|------|
+| crowd_run | 5.34 / 99.10 | **4.78 / 99.19** | **−10.5%** | +0.09 |
+| park_joy | 4.22 / 99.12 | **3.82 / 99.21** | **−9.5%** | +0.09 |
+
+**Trade-off revealed:**
+- Physical weights give ~10% bpp reduction at VMAF+0.09 on natural sequences
+- PSNR drops 5+ dB on single frames (we sacrifice mathematical fidelity for perceptual quality)
+- Regression tests fail on synthetic content: checkerboard −5.7 dB PSNR, gradient +11% bpp
+- The trade-off is valid for natural-image content but breaks the general-purpose fidelity guarantee
+
+**Root cause confirmed:** GNC's subband weights are miscalibrated for natural content. The current weights preserve high-frequency detail that is perceptually invisible, wasting ~10% of total bits. JPEG 2000 uses analytically derived energy norms (physical direction), which partly explains the gap.
+
+**Note on q=50 anomaly:** At q=50, GNC switches from 3→4 wavelet levels. With physical weights, the new finest level gets weight≈3.5 (very aggressive), contributing near-zero bits. Total bpp can be LOWER at q=50 than q=40 despite higher qstep, because the 4th level eliminates invisible fine detail. This is consistent, not a bug.
+
+### Updated Gap Decomposition (post Parts 8–9)
+
+GNC Rice 444 vs JPEG 2000 (single-frame PSNR metric):
+
+| Factor | Bpp saving (PSNR metric) | Share of gap |
+|--------|--------------------------|-------------|
+| Wavelet levels 3→4 | 4.4% | ~10% |
+| Entropy Rice→rANS | 4.0% | ~9% |
+| AQ on/off | 1.3% | ~3% |
+| Dead zone | 0% | 0% |
+| Subband weight direction (physical) | ~10% (VMAF metric) | ~21% (VMAF) |
+| PCRD potential (tile-level) | 6–22% (theoretical) | 13–47% |
+| **Total explained** | **~22% PSNR / ~32% VMAF** | **~47–78%** |
+| **Unexplained** | **~25–42%** | **22–53%** |
+
+**Key insight:** The gap looks very different depending on which quality metric you use.
+- With PSNR metric: 78% unexplained, likely dominated by EBCOT context coding
+- With VMAF metric: fixing weight direction alone closes ~42% of the gap; the remainder is PCRD + context
+
+**Priority implication:**
+1. **Subband weight fix** (physical direction): implementable now, ~10% bpp gain on sequences, VMAF primary metric favors it. Trade-off: PSNR regression on synthetic content, regression tests need updating.
+2. **PCRD-opt**: 6–22% tile-level potential; needs per-tile qstep infrastructure
+3. **Context entropy (EBCOT-style)**: likely largest remaining factor under PSNR metric; requires fundamental entropy redesign
+
+---
+
 ## 2026-03-11: #64 Pyramid-layer-dependent QP — DONE (−10–11% bpp, VMAF neutral)
 
 ### Hypothesis

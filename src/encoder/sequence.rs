@@ -822,14 +822,26 @@ impl EncoderPipeline {
                     self.copy_pyramid_slot_to_fwd_ref(ctx, 3, plane_size); // I₀ → fwd
                     self.copy_pyramid_slot_to_bwd_ref(ctx, 0, plane_size); // B₄ → bwd
                 }
+                // Layer-2 B-frames (B₂,B₆) are reference frames for layer-3.
+                // A mild QP scale reduces their bpp; propagation to layer-3 is buffered
+                // by the already-coarse layer-3 quantizer (l3_qp_scale=1.5).
+                // Default 1.0 (off) until validated; tune with GNC_PYRAMID_L2_QP_SCALE.
+                let l2_qp_scale: f32 = std::env::var("GNC_PYRAMID_L2_QP_SCALE")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(1.0_f32);
                 let b2_display = group_start + 1;
                 {
-                    let b_config = if let Some(ref rc) = rate_ctrl {
-                        let mut cfg = config.clone();
-                        cfg.quantization_step = rc.estimate_qstep();
+                    let b_config = {
+                        let mut cfg = if let Some(ref rc) = rate_ctrl {
+                            let mut c = config.clone();
+                            c.quantization_step = rc.estimate_qstep();
+                            c
+                        } else {
+                            config.clone()
+                        };
+                        cfg.quantization_step = (cfg.quantization_step * l2_qp_scale).min(64.0);
                         cfg
-                    } else {
-                        config.clone()
                     };
                     let b_frame_data = load_frame(b2_display);
                     let (mut compressed, fwd_mv, bwd_mv, _) = self.encode_bframe(
@@ -891,12 +903,16 @@ impl EncoderPipeline {
                 }
                 let b6_display = group_start + 5;
                 {
-                    let b_config = if let Some(ref rc) = rate_ctrl {
-                        let mut cfg = config.clone();
-                        cfg.quantization_step = rc.estimate_qstep();
+                    let b_config = {
+                        let mut cfg = if let Some(ref rc) = rate_ctrl {
+                            let mut c = config.clone();
+                            c.quantization_step = rc.estimate_qstep();
+                            c
+                        } else {
+                            config.clone()
+                        };
+                        cfg.quantization_step = (cfg.quantization_step * l2_qp_scale).min(64.0);
                         cfg
-                    } else {
-                        config.clone()
                     };
                     let b_frame_data = load_frame(b6_display);
                     let (mut compressed, fwd_mv, bwd_mv, _) = self.encode_bframe(

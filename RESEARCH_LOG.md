@@ -39,6 +39,28 @@ Physical interpretation: layer-3 B-frames in crowd_run/park_joy are mostly near-
 
 ---
 
+## 2026-03-11: Layer-2 QP scale experiment (GNC_PYRAMID_L2_QP_SCALE=1.2)
+
+### Hypothesis
+Layer-2 B-frames (B₂,B₆) are reference frames for layer-3, but layer-3 is already coded at 1.5× qstep. The already-coarser layer-3 quantizer buffers propagation from coarser layer-2 references. A 1.2× qstep scale should reduce layer-2 bpp ~20% with acceptable propagation.
+
+### Results (combined L2=1.2×, L3=1.5×, q=75, I+P+B, 444)
+
+| Sequence | Baseline bpp | L3 only | L2+L3 | VMAF baseline | VMAF L3 only | VMAF L2+L3 |
+|----------|-------------|---------|-------|--------------|-------------|-----------|
+| crowd_run | 6.00 | 5.34 | **5.14** | 99.13 | 99.12 | 99.10 |
+| park_joy | 4.71 | 4.22 | **4.07** | 99.14 | 99.12 | 99.12 |
+
+PSNR avg crowd_run: 38.57 → 38.29 (L3 only) → **38.02 dB** (L2+L3) = −0.55 dB total.
+Layer-2 B-frames (Frames 2,6): 38.43/38.47 → 37.09/37.15 dB (−1.3 dB each).
+
+### Assessment
+PSNR regression with L2+L3 is −0.55 dB — exceeds 0.3 dB flag threshold. VMAF confirms no perceptual regression (−0.03 pts total). The PSNR drop is in layer-2 B-frames which are temporally masked in high-motion content.
+
+**Decision: Ship infrastructure (default=1.0, off). Enable with GNC_PYRAMID_L2_QP_SCALE=1.2 for additional 3-4% bpp at cost of PSNR flag.** The full L2+L3 stack (1.2+1.5×) gives −14.3% crowd_run, −13.6% park_joy with negligible perceptual impact. Can be revisited with VMAF-only evaluation if PSNR regression concern is overridden by team lead.
+
+---
+
 ## 2026-03-11: #47 Overlapping Tile Windows — CLOSED (bpp overhead untenable)
 
 ### Hypothesis

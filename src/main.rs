@@ -807,6 +807,113 @@ fn csv_with_suffix(path: &str, suffix: &str) -> String {
     }
 }
 
+/// Build a `CodecConfig` from the common CLI parameters shared by both the
+/// streaming and non-streaming I+P+B encode paths.
+// All 8 parameters come directly from CLI args; a builder struct would be
+// heavier than the duplication it avoids.
+#[allow(clippy::too_many_arguments)]
+fn build_ip_config(
+    quality: Option<u32>,
+    qstep: Option<f32>,
+    keyframe_interval: u32,
+    rans: bool,
+    rice: bool,
+    chroma_format: &str,
+    bitrate: &Option<String>,
+    rate_mode: &str,
+) -> CodecConfig {
+    let mut config = if let Some(q) = quality {
+        gnc::quality_preset(q)
+    } else {
+        CodecConfig {
+            quantization_step: qstep.unwrap_or(4.0),
+            ..Default::default()
+        }
+    };
+    if let Some(qs) = qstep {
+        config.quantization_step = qs;
+    }
+    config.keyframe_interval = keyframe_interval;
+    if rans {
+        config.entropy_coder = gnc::EntropyCoder::Rans;
+    }
+    if rice {
+        config.entropy_coder = gnc::EntropyCoder::Rice;
+    }
+    config.chroma_format = parse_chroma_format(chroma_format);
+    if let Some(ref br) = bitrate {
+        config.target_bitrate = Some(parse_bitrate(br));
+        config.rate_mode = parse_rate_mode(rate_mode);
+    }
+    config
+}
+
+/// Streaming Y4M loader: reads frames sequentially from a Y4M file and keeps
+/// only a sliding window of `ki_window` frames in memory.  Frames behind the
+/// window are freed; frames past EOF repeat the last valid frame.
+struct StreamingY4m {
+    reader: Y4mReader,
+    cache: Vec<Option<Vec<f32>>>,
+    next_pos: usize,
+    released_up_to: usize,
+    ki_window: usize,
+    frame_count: usize,
+    /// Index of the first frame that could not be read (Y4M EOF), or
+    /// `frame_count` when the file has not yet hit EOF.
+    eof_frame: usize,
+}
+
+impl StreamingY4m {
+    fn load(&mut self, i: usize) -> Vec<f32> {
+        // Advance reader to cover frame i
+        while self.next_pos <= i && self.next_pos < self.frame_count {
+            if let Some(rgb) = self.reader.read_frame_rgb() {
+                self.cache[self.next_pos] = Some(rgb);
+                self.next_pos += 1;
+            } else {
+                // Y4M EOF: record where the file ended
+                self.eof_frame = self.next_pos;
+                break;
+            }
+        }
+        // Free frames well behind the current window
+        let release_to = i.saturating_sub(self.ki_window);
+        for j in self.released_up_to..release_to {
+            self.cache[j] = None;
+        }
+        self.released_up_to = self.released_up_to.max(release_to);
+
+        if let Some(frame) = self.cache[i].clone() {
+            return frame;
+        }
+
+        // Frame i is None — two possible causes:
+        if i >= self.eof_frame {
+            // Past EOF: repeat the last frame that was successfully decoded.
+            let last = self.eof_frame.saturating_sub(1);
+            if let Some(frame) = self.cache[last].clone() {
+                return frame;
+            }
+            panic!(
+                "frame {i} requested but Y4M EOF was at frame {eof} and last frame ({last}) \
+                 is no longer in the cache (released_up_to={released}): ki_window={ki}",
+                eof = self.eof_frame,
+                released = self.released_up_to,
+                ki = self.ki_window,
+            );
+        }
+
+        // Frame was evicted from the sliding window — caller bug.
+        panic!(
+            "frame {i} not in streaming window [{released}..{next}]: ki_window={ki} \
+             (frame was evicted; look-ahead exceeded window size)",
+            released = self.released_up_to,
+            next = self.next_pos,
+            ki = self.ki_window,
+        );
+    }
+}
+
 fn main() {
     env_logger::init();
     let cli = Cli::parse();
@@ -1831,6 +1938,114 @@ fn main() {
                 return;
             }
 
+            // ---------------------------------------------------------------
+            // Streaming path for long Y4M sequences in I+P+B mode.
+            // Pre-loading 1800 frames at 1080p f32 RGB costs ~42 GB; streaming
+            // keeps at most (ki + 4) frames in memory (~300 MB at ki=9).
+            // ---------------------------------------------------------------
+            const STREAMING_ENCODE_THRESHOLD: usize = 500;
+
+            if !run_temporal && input.ends_with(".y4m") && num_frames > STREAMING_ENCODE_THRESHOLD {
+                let y4m_probe = Y4mReader::open(&input);
+                let w = y4m_probe.width;
+                let h = y4m_probe.height;
+                let y4m_fps = y4m_probe.fps_num as f64 / y4m_probe.fps_den.max(1) as f64;
+                let effective_fps = if y4m_fps > 0.0 { y4m_fps } else { fps };
+                drop(y4m_probe);
+
+                let config_ip = build_ip_config(
+                    quality,
+                    qstep,
+                    keyframe_interval,
+                    rans,
+                    rice,
+                    &chroma_format,
+                    &bitrate,
+                    &rate_mode,
+                );
+
+                let ki_window = config_ip.keyframe_interval as usize + 4;
+                let frame_size_mb = w as f64 * h as f64 * 3.0 * 4.0 / 1_048_576.0;
+                eprintln!(
+                    "[streaming] Entering streaming I+P+B path: {} frames, window={} frames (~{:.0} MB peak)",
+                    num_frames,
+                    ki_window,
+                    ki_window as f64 * frame_size_mb,
+                );
+
+                let mut streaming_y4m = StreamingY4m {
+                    reader: Y4mReader::open(&input),
+                    cache: vec![None; num_frames],
+                    next_pos: 0,
+                    released_up_to: 0,
+                    ki_window,
+                    frame_count: num_frames,
+                    eof_frame: num_frames,
+                };
+
+                // GPU warmup: encode frame 0 with a throwaway call to trigger
+                // Metal lazy pipeline compilation before timing starts.
+                let warmup_frame = streaming_y4m.load(0);
+                let _ = encoder.encode(&ctx, &warmup_frame, w, h, &config_ip);
+
+                let start = std::time::Instant::now();
+                let compressed_ip = encoder.encode_sequence_streaming(
+                    &ctx,
+                    num_frames,
+                    |i| streaming_y4m.load(i),
+                    w,
+                    h,
+                    &config_ip,
+                    effective_fps,
+                );
+                let elapsed_ip = start.elapsed();
+
+                let total_bytes: usize = compressed_ip.iter().map(|f| f.byte_size()).sum();
+                let avg_bpp: f64 =
+                    compressed_ip.iter().map(|f| f.bpp()).sum::<f64>() / compressed_ip.len() as f64;
+                let encode_fps = compressed_ip.len() as f64 / elapsed_ip.as_secs_f64();
+                let i_count = compressed_ip
+                    .iter()
+                    .filter(|f| f.frame_type == gnc::FrameType::Intra)
+                    .count();
+                let p_count = compressed_ip
+                    .iter()
+                    .filter(|f| f.frame_type == gnc::FrameType::Predicted)
+                    .count();
+                let b_count = compressed_ip
+                    .iter()
+                    .filter(|f| f.frame_type == gnc::FrameType::Bidirectional)
+                    .count();
+
+                println!(
+                    "\n=== I+P+B streaming (keyframe_interval={}, {} frames) ===",
+                    keyframe_interval, num_frames
+                );
+                println!(
+                    "  Total: {} bytes, {:.3} bpp avg, {:.1} fps, {}I+{}P+{}B",
+                    total_bytes, avg_bpp, encode_fps, i_count, p_count, b_count,
+                );
+                println!(
+                    "  Note: quality metrics (PSNR/SSIM/VMAF) skipped for long sequences (>{} frames)",
+                    STREAMING_ENCODE_THRESHOLD,
+                );
+
+                // Write GNV1 container if --output is specified
+                if let Some(ref output_path) = output {
+                    let fps_num = effective_fps.round() as u32;
+                    let gnv1_data = serialize_sequence(&compressed_ip, (fps_num, 1));
+                    std::fs::write(output_path, &gnv1_data)
+                        .expect("Failed to write GNV1 output");
+                    println!(
+                        "\nGNV1 container written to {} ({} bytes)",
+                        output_path,
+                        gnv1_data.len()
+                    );
+                }
+
+                return;
+            }
+
             // Non-streaming path: load all frames into memory
             let mut frames_data: Vec<Vec<f32>> = Vec::new();
             let mut w = 0u32;
@@ -1866,31 +2081,16 @@ fn main() {
             if run_baseline {
             let mut frame_metrics_i: Vec<FrameMetrics> = Vec::new();
             // --- I+P encoding ---
-            let mut config_ip = if let Some(q) = quality {
-                gnc::quality_preset(q)
-            } else {
-                CodecConfig {
-                    quantization_step: qstep.unwrap_or(4.0),
-                    ..Default::default()
-                }
-            };
-            if let Some(qs) = qstep {
-                config_ip.quantization_step = qs;
-            }
-            config_ip.keyframe_interval = keyframe_interval;
-            if rans {
-                config_ip.entropy_coder = gnc::EntropyCoder::Rans;
-            }
-            if rice {
-                config_ip.entropy_coder = gnc::EntropyCoder::Rice;
-            }
-            config_ip.chroma_format = parse_chroma_format(&chroma_format);
-
-            // Apply rate control settings
-            if let Some(ref br) = bitrate {
-                config_ip.target_bitrate = Some(parse_bitrate(br));
-                config_ip.rate_mode = parse_rate_mode(&rate_mode);
-            }
+            let config_ip = build_ip_config(
+                quality,
+                qstep,
+                keyframe_interval,
+                rans,
+                rice,
+                &chroma_format,
+                &bitrate,
+                &rate_mode,
+            );
 
             // Warm up GPU shader pipelines (triggers Metal lazy compilation)
             let _ = encoder.encode(&ctx, &frames_data[0], w, h, &config_ip);

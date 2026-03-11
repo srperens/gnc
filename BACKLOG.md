@@ -510,7 +510,7 @@ H.264 comparison (#22) established the north star: GNC needs **2–5× more bits
 
 
 ### 51. Local parent-k Rice (inter-scale coefficient context)
-- **Status:** todo
+- **Status:** closed (RS veto 2026-03-11 — same mechanism as #21 which failed empirically; EMA already subsumes parent-k variance signal; bpp +5–7% in #21 is strong negative evidence)
 - **Motivation:** GNC uses a global EMA-based Rice parameter k per subband group. JPEG 2000 / SPIHT exploit that wavelet coefficients at fine scales are statistically correlated with their parent at the coarse scale — if the parent is large, the children are likely large too. Using the local parent magnitude to set k per spatial position (rather than per subband globally) should reduce entropy by fitting the local distribution better.
 - **Falsifiable claim:** Within-tile local parent-k reduces LH/HL/HH subband bits by ≥5% vs current EMA k on bbb q=75.
 - **Gate:** Add diagnostic: for each fine-subband coefficient, log actual Rice k used vs what local parent-k would give. If > 50% of coefficients would get a different k (|delta k| ≥ 1), the EMA k is a poor global fit → proceed.

@@ -358,6 +358,85 @@ GNC Rice 444 vs JPEG 2000 (single-frame PSNR metric):
 2. **PCRD-opt**: 6–22% tile-level potential; needs per-tile qstep infrastructure
 3. **Context entropy (EBCOT-style)**: likely largest remaining factor under PSNR metric; requires fundamental entropy redesign
 
+### Part 10: Tile Size Granularity — PCRD Proxy Test
+
+**Hypothesis:** Smaller tiles ≈ JPEG 2000 code-block granularity → finer bit allocation → PCRD benefit measurable.
+
+**Test:** rd-curve at tile_size 64, 128, 256 on crowd_run frame 0.
+
+**Results (bpp at q=70, same PSNR ~39.5 dB):**
+| tile_size | bpp | vs 256px |
+|-----------|-----|---------|
+| 256 | 6.648 | — |
+| 128 | 6.798 | +2.3% (worse) |
+| 64 | 8.718 | **+31% (much worse)** |
+
+**Finding:** Smaller tiles are **worse**, not better. Header overhead and worse per-tile k-estimation dominate. JPEG 2000's PCRD at code-block level requires EBCOT's truncatable arithmetic coding — Rice cannot be truncated at arbitrary points. **PCRD and context coding are architecturally coupled in JPEG 2000; both require MQ-coder to unlock.** Rice tiles cannot benefit from PCRD granularity without a fundamental entropy redesign.
+
+### Part 11: Subband Weight Calibration — Weight Direction Comparison
+
+**Hypothesis:** Current "perceptual" weights may be suboptimal; compare with UNIFORM (all 1.0) and PHYSICAL (reversed gradient, finest subbands get highest weight).
+
+**Single-frame RD curves, crowd_run frame 0, VMAF metric:**
+
+| q | UNIFORM bpp/PSNR/VMAF | PERCEPTUAL bpp/PSNR/VMAF | PHYSICAL bpp/PSNR/VMAF |
+|---|----------------------|--------------------------|------------------------|
+| 30 | 2.888 / 33.90 / 93.37 | 2.374 / 31.96 / 89.57 | 1.920 / 30.86 / 91.67 |
+| 40 | 3.906 / 35.84 / 94.76 | 3.229 / 33.89 / 92.04 | 2.510 / 32.46 / 93.51 |
+| 50 | 4.811 / 37.67 / 95.60 | 3.925 / 35.46 / 91.08 | 2.415 / 32.62 / 93.51 |
+| 60 | 6.306 / 39.87 / 96.25 | 5.279 / 37.52 / 93.49 | 3.146 / 34.16 / 94.79 |
+| 70 | 7.740 / 41.92 / 96.63 | 6.648 / 39.50 / 94.92 | 3.955 / 35.67 / 95.65 |
+| 80 | 9.993 / 45.25 / 96.95 | 8.867 / 42.81 / 96.16 | 5.644 / 38.35 / 96.37 |
+
+**Key finding: PERCEPTUAL weights are WORSE than UNIFORM on BOTH PSNR and VMAF at every data point.**
+
+At VMAF=95 on crowd_run:
+- UNIFORM: ~4.8 bpp
+- PERCEPTUAL: ~6.7 bpp → UNIFORM is 28% more efficient
+- PHYSICAL: ~3.3 bpp → PHYSICAL is 51% more efficient than PERCEPTUAL
+
+At VMAF=94 on park_joy:
+- UNIFORM: ~3.1 bpp
+- PERCEPTUAL: ~5.0 bpp → UNIFORM is 38% more efficient
+- PHYSICAL: ~2.5 bpp
+
+**Why PERCEPTUAL fails:** Current weights give finest subbands (outermost, highest-frequency, LEAST visible) the lowest quantization weight (1.0 = finest quantization = most bits spent), and coarsest subbands above LL (MOST visible) the highest weight (2.5 = coarsest quantization). This is backwards perceptually: it preserves invisible fine detail (wasting bits) while destroying visible medium-frequency content (hurting VMAF).
+
+**Sequence encoding benchmark, q=65/70 vs PERCEPTUAL q=75:**
+
+| Config | crowd_run bpp / VMAF | park_joy bpp / VMAF | Δ bpp |
+|--------|---------------------|---------------------|-------|
+| PERCEPTUAL q=75 **baseline** | 5.34 / 99.10 | 4.22 / 99.12 | — |
+| UNIFORM q=65 | 4.35 / 99.30 | 3.49 / 99.31 | **−18.5% / −17.3%** |
+| PHYSICAL q=70 | 4.21 / 99.12 | 3.39 / 99.16 | **−21.2% / −19.6%** |
+
+**At equivalent or better VMAF, the weight fix saves 18–21% bpp on natural sequences.**
+
+This is the **largest single bug found in GNC** — the perceptual weights are actively harmful. Both UNIFORM and PHYSICAL dominate the current calibration on every metric. Physical weights save slightly more bpp; UNIFORM weights are safer (pass all regression tests including synthetic content).
+
+**Regression test note:** With `GNC_PHYSICAL_WEIGHTS`, checkerboard −5.7 dB PSNR (expected — checkerboard is pure high-frequency, crushed by physical). With `GNC_UNIFORM_WEIGHTS`, all regression tests pass.
+
+### Final Gap Decomposition (complete measurement campaign)
+
+**GNC perceptual-weighted Rice vs JPEG 2000 = +47% BD-rate (PSNR metric, single frame)**
+
+| Factor | Bpp saving | Metric | Notes |
+|--------|-----------|--------|-------|
+| Wavelet levels 3→4 | 4.4% | PSNR | Already enabled for q≥50 |
+| Entropy Rice→rANS | 4.0% | PSNR | Minor; coder type not the bottleneck |
+| AQ on/off | 1.3% | PSNR | Small; redistributes within tiles |
+| Dead zone | 0% | PSNR | 0.75 already optimal |
+| **Subband weight fix** | **18–21%** | **VMAF (seq)** | **Biggest bug found; PERCEPTUAL→UNIFORM/PHYSICAL** |
+| PCRD at tile level | 6–22% (theoretical) | PSNR | Inaccessible with Rice (no truncatable coding) |
+| Tile size granularity | 0% (tested: +31% bpp) | PSNR | PCRD requires MQ-coder, not Rice |
+| Context coding (EBCOT) | **estimated 10–20%** | PSNR | Not directly measured; architectural gap |
+
+**Conclusion:**
+1. **The weight miscalibration is the biggest single fix available** — 18–21% bpp saving at sequence level with a 1-line code change. Implementable now.
+2. **PCRD is inaccessible without replacing the entropy coder** — Rice tiles cannot be truncated arbitrarily. The 6–22% theoretical PCRD gain requires EBCOT-style arithmetic coding.
+3. **Context coding gap (~10–20%)** — The remaining unexplained gap between GNC+uniform and JPEG 2000 is likely EBCOT's significance-map context model. Both PCRD and context coding are bundled in EBCOT.
+4. **Architecture verdict:** To close the full gap to JPEG 2000, GNC would need to replace Rice+ZRL with a context-adaptive arithmetic coder (CABAC/EBCOT-style). This is a fundamental architecture change. The weight fix alone brings GNC much closer and is the right immediate priority.
+
 ---
 
 ## 2026-03-11: #64 Pyramid-layer-dependent QP — DONE (−10–11% bpp, VMAF neutral)
@@ -2999,3 +3078,43 @@ Attempted "encoder-only overlap with trimming": encoder reads 264px (with 4px ha
 
 ### Conclusion
 Gate PASSED. Correct implementation identified (Approach A). Structural scaffolding in place. Full implementation deferred to next session (4-6 days: separate coefficient buffer sizing, all downstream shader params, decoder crop step, bitstream bump).
+
+## Measurement Campaign Part 12 — Subband Weight Fix (2026-03-11)
+
+### Finding (from Parts 8–11 of measurement campaign)
+The "perceptual" subband weights in `SubbandWeights::perceptual()` had the gradient direction INVERTED:
+- Finest/highest-frequency subbands: weight=1.0 (least aggressive quantization — wrong)
+- Coarsest subbands above LL: weight=2.5 (most aggressive quantization — wrong)
+
+Correct perceptual theory: finest subbands should get the HIGHEST weight (most aggressive quantization) because HVS is least sensitive to high-frequency detail. The name "perceptual" was misleading — this was anti-perceptual.
+
+Measurement campaign showed (q=75, 10 frames, 4:4:4, crowd_run):
+- PERCEPTUAL (old default): 5.34 bpp, VMAF 99.12
+- UNIFORM (all weights=1.0): ~4.35 bpp at matched VMAF ≈ 18% saving
+- PHYSICAL (reversed gradient): ~4.21 bpp at matched VMAF ≈ 21% saving
+
+### Implementation
+Changed default in `quality_preset()` from `SubbandWeights::perceptual()` to `SubbandWeights::uniform()`.
+- Removed `perceptual: bool` field from `Anchor` struct (no longer used in weight selection)
+- Kept `GNC_PHYSICAL_WEIGHTS=1` env var for future experiments via `SubbandWeights::perceptual()`
+- UNIFORM chosen over PHYSICAL as default: no regression risk on synthetic content, and difference is small
+
+### Validation (q=75, 10 frames, 4:4:4)
+
+**Sequence benchmarks:**
+| sequence   | old bpp | new bpp | delta bpp | old VMAF | new VMAF | delta VMAF |
+|------------|---------|---------|-----------|----------|----------|------------|
+| crowd_run  | 5.34    | 5.55    | +3.9%     | 99.12    | 99.36    | +0.24 pts  |
+| park_joy   | 4.22    | 4.43    | +5.0%     | 99.12    | 99.37    | +0.25 pts  |
+
+**Single-frame bbb_1080p:**
+| q  | old PSNR | new PSNR | old BPP | new BPP | old VMAF | new VMAF |
+|----|----------|----------|---------|---------|----------|----------|
+| 25 | 32.89 dB | 35.44 dB | 1.50    | 1.89    | 85.10    | 91.02    |
+| 50 | 37.53 dB | 40.34 dB | 2.22    | 2.79    | 89.68    | 95.08    |
+| 75 | 42.17 dB | 44.45 dB | 3.83    | 4.59    | 95.05    | 96.56    |
+
+**Interpretation:** At the same q value, uniform weights achieve higher quality (+2.28 dB PSNR, +1.51 VMAF at q=75) at moderately higher bpp (+20%). The bpp increase is because the old weights were aggressively quantizing coarse subbands — sacrificing perceptually important structure. At EQUAL VMAF/PSNR, uniform weights need ~18–21% less bpp (confirmed by measurement campaign Part 11). This is a BD-rate improvement, not a regression.
+
+Golden baselines in `tests/golden_baselines.toml` updated via `update_golden_baselines` ignored test.
+All 168 tests pass, zero clippy warnings.

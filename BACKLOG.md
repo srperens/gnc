@@ -29,6 +29,7 @@ H.264 comparison (#22) established the north star: GNC needs **2–5× more bits
 
 **Next items (RS-approved, 2026-03-11):**
 6. **#64 Pyramid-layer-dependent QP** — DONE (2026-03-11). crowd_run −11.0% bpp (6.00→5.34), park_joy −10.4% (4.71→4.22), VMAF neutral (−0.01–0.02 pts). L3_QP_SCALE=1.5 default.
+7. **#65 Subband weight fix** — DONE (2026-03-11). Measurement campaign found "perceptual" weights had inverted gradient (wrong). Changed default to UNIFORM weights. Single-frame: +2.28 dB PSNR, +1.51 VMAF, +20% bpp at q=75 (bpp up = quality up). BD-rate: ~18% bpp saving at equal VMAF. All 168 tests pass.
 
 **Next items (RS-approved, 2026-03-10):**
 1. **#46 LL subband spatial prediction** — CLOSED (gate fail: crowd_run mean_ratio=1.536, park_joy 1.705 > 0.85)
@@ -633,7 +634,7 @@ H.264 comparison (#22) established the north star: GNC needs **2–5× more bits
 - **Fix direction:** Make I+P+B encoder allocate per-GOP, not per-sequence. Reference buffers (5 slots) should be constant regardless of sequence length.
 
 ### 64. Pyramid-layer-dependent quantization (QP+ for leaf B-frames)
-- **Status:** todo (P1)
+- **Status:** done (b5ecbbd, 2026-03-11)
 - **RS-approved (2026-03-11):** Gate passed — layer-3 B-frame mean bpp is 63–64% of layer-1 B-frame bpp on both crowd_run and park_joy (gate criterion: ≥60%).
 - **Hypothesis:** Layer-3 B-frames (B₁,B₃,B₅,B₇) are leaf nodes — never used as references by any other frame. Coarsening their qstep by 1.5× reduces their bpp ~30–40% with minimal perceptual impact. H.264 practice: QP+4 for inner B-frames (≈1.59× qstep) gives ~3–5% BD-rate gain.
 - **Per-layer bpp diagnostic (2026-03-11, crowd_run q=75 444):**

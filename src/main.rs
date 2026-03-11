@@ -666,6 +666,11 @@ enum Command {
         /// Use rANS entropy coder instead of Rice (default).
         #[arg(long)]
         rans: bool,
+
+        /// Tile size in pixels (default: 256). Smaller tiles = finer granularity, more overhead.
+        /// Use 64 or 128 to test PCRD proxy (approximates JPEG 2000 code-block granularity).
+        #[arg(long, default_value = "256")]
+        tile_size: u32,
     },
 
     /// Automated benchmark across multiple Xiph sequences. Outputs CSV.
@@ -3277,6 +3282,7 @@ fn main() {
             vmaf,
             no_aq,
             rans,
+            tile_size: rd_tile_size,
         } => {
             // Parse quality values
             let q_vals: Vec<u32> = q_values
@@ -3343,6 +3349,7 @@ fn main() {
                     if rans {
                         config.entropy_coder = gnc::EntropyCoder::Rans;
                     }
+                    config.tile_size = rd_tile_size;
                     let qstep = config.quantization_step;
 
                     // Time encode

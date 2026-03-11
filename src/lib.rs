@@ -520,7 +520,6 @@ pub fn quality_preset(q: u32) -> CodecConfig {
         q: u32,
         qstep: f32,
         dead_zone: f32,
-        perceptual: bool,
         cfl: bool,
         per_subband: bool,
     }
@@ -528,81 +527,18 @@ pub fn quality_preset(q: u32) -> CodecConfig {
     let anchors: &[Anchor] = &[
         // CfL disabled at extreme compression: alpha precision hurts more than
         // chroma prediction helps at high qstep
-        Anchor {
-            q: 1,
-            qstep: 64.0,
-            dead_zone: 1.0,
-            perceptual: true,
-            cfl: false,
-            per_subband: true,
-        },
-        Anchor {
-            q: 10,
-            qstep: 32.0,
-            dead_zone: 0.75,
-            perceptual: true,
-            cfl: false, // CfL alpha precision too coarse at high qstep
-            per_subband: true,
-        },
-        Anchor {
-            q: 25,
-            qstep: 16.0,
-            dead_zone: 0.75,
-            perceptual: true,
-            cfl: false, // CfL alpha too coarse at qstep=16; hurts gradients
-            per_subband: true,
-        },
-        Anchor {
-            q: 50,
-            qstep: 8.0,
-            dead_zone: 0.75,
-            perceptual: true,
-            cfl: true,
-            per_subband: true,
-        },
-        Anchor {
-            q: 75,
-            qstep: 4.0,
-            dead_zone: 0.75,
-            perceptual: true,
-            cfl: true,
-            per_subband: true,
-        },
-        Anchor {
-            q: 85,
-            qstep: 2.8,
-            dead_zone: 0.5,
-            perceptual: true,
-            cfl: true,
-            per_subband: true,
-        },
+        Anchor { q: 1,   qstep: 64.0, dead_zone: 1.0,  cfl: false, per_subband: true },
+        Anchor { q: 10,  qstep: 32.0, dead_zone: 0.75, cfl: false, per_subband: true }, // CfL alpha precision too coarse at high qstep
+        Anchor { q: 25,  qstep: 16.0, dead_zone: 0.75, cfl: false, per_subband: true }, // CfL alpha too coarse at qstep=16; hurts gradients
+        Anchor { q: 50,  qstep: 8.0,  dead_zone: 0.75, cfl: true,  per_subband: true },
+        Anchor { q: 75,  qstep: 4.0,  dead_zone: 0.75, cfl: true,  per_subband: true },
+        Anchor { q: 85,  qstep: 2.8,  dead_zone: 0.5,  cfl: true,  per_subband: true },
         // CDF 9/7 at qstep >= 2.0 keeps rANS alphabet within GPU limits
-        Anchor {
-            q: 92,
-            qstep: 2.05,
-            dead_zone: 0.05,
-            perceptual: false,
-            cfl: false,
-            per_subband: true,
-        },
+        Anchor { q: 92,  qstep: 2.05, dead_zone: 0.05, cfl: false, per_subband: true },
         // Slow quality ramp at safe qstep floor — dead_zone→0 squeezes out last dB
-        Anchor {
-            q: 99,
-            qstep: 2.0,
-            dead_zone: 0.0,
-            perceptual: false,
-            cfl: false,
-            per_subband: true,
-        },
+        Anchor { q: 99,  qstep: 2.0,  dead_zone: 0.0,  cfl: false, per_subband: true },
         // Lossless: LeGall 5/3 with integer-exact lifting
-        Anchor {
-            q: 100,
-            qstep: 1.0,
-            dead_zone: 0.0,
-            perceptual: false,
-            cfl: false,
-            per_subband: true,
-        },
+        Anchor { q: 100, qstep: 1.0,  dead_zone: 0.0,  cfl: false, per_subband: true },
     ];
 
     // Find surrounding anchors and interpolation factor
@@ -640,8 +576,13 @@ pub fn quality_preset(q: u32) -> CodecConfig {
         .unwrap_or(if q >= 50 { 4 } else { 3 });
     let aq_enabled = q <= 80; // AQ helps in lossy range; variance computed on LL subband
     let aq_strength = if q >= 70 { 0.2 } else { 0.15 };
-    let mut weights = if disc.perceptual {
-        SubbandWeights::perceptual(wavelet_levels)
+    // Default: uniform weights. Measurement campaign showed "perceptual" weights had the
+    // gradient inverted (finest subbands weighted LEAST aggressively), making them worse
+    // than uniform on both PSNR and VMAF. Physical weights (correctly reversed) are best
+    // for natural sequences but use uniform as safe default.
+    // GNC_PHYSICAL_WEIGHTS=1: finest subbands get highest weight (reversed, correct theory).
+    let mut weights = if std::env::var("GNC_PHYSICAL_WEIGHTS").is_ok() {
+        SubbandWeights::perceptual(wavelet_levels) // perceptual() reads GNC_PHYSICAL_WEIGHTS internally
     } else {
         SubbandWeights::uniform(wavelet_levels)
     };

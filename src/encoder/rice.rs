@@ -53,6 +53,10 @@ pub fn max_stream_bytes_for_tile(tile_size: u32, qstep: f32) -> usize {
 pub const RICE_MAX_STREAM_BYTES: usize = 4096;
 
 /// Encoded tile using significance map + Golomb-Rice coding with zero-run-length.
+///
+/// #53: k_zrl is split into two context-dependent parameters:
+///   k_zrl_nz — used for zero runs that follow a nonzero coefficient
+///   k_zrl_z  — used for zero runs that follow another zero run or start-of-stream
 #[derive(Debug, Clone)]
 pub struct RiceTile {
     pub num_coefficients: u32,
@@ -61,8 +65,10 @@ pub struct RiceTile {
     pub num_groups: u32,
     /// Per-subband Rice parameter k for magnitudes (0..15).
     pub k_values: Vec<u8>,
-    /// Per-subband Rice parameter k for zero-run lengths (0..15).
-    pub k_zrl_values: Vec<u8>,
+    /// Per-subband Rice k for zero runs following a nonzero coefficient (0..15).
+    pub k_zrl_nz_values: Vec<u8>,
+    /// Per-subband Rice k for zero runs following another zero run / start-of-stream (0..15).
+    pub k_zrl_z_values: Vec<u8>,
     /// Skip bitmap: bit g = 1 means all coefficients in group g are zero.
     pub skip_bitmap: u8,
     /// Bytes used by each of the 256 streams.
@@ -87,7 +93,7 @@ impl RiceTile {
             // flags + skip_bitmap
             fixed_header + flags + 1
         } else {
-            let k_params = self.k_values.len() + self.k_zrl_values.len() + 1;
+            let k_params = self.k_values.len() + self.k_zrl_nz_values.len() + self.k_zrl_z_values.len() + 1;
             let stream_len_bytes: usize = self.stream_lengths.iter()
                 .map(|&l| varint_size(l as u16))
                 .sum();
@@ -248,31 +254,50 @@ pub fn rice_encode_tile(coefficients: &[i32], tile_size: u32, num_levels: u32) -
     }
     let k_values: Vec<u8> = group_abs_values.iter().map(|v| optimal_k(v)).collect();
 
-    // Phase 1b: Compute per-subband k_zrl from zero-run statistics
-    let mut group_run_lengths: Vec<Vec<u32>> = vec![Vec::new(); num_groups];
+    // Phase 1b: Compute 2-state k_zrl from zero-run statistics (#53).
+    // Context: was the preceding nonzero "large" (|coeff|>=2, i.e., magnitude>=1)?
+    //   k_zrl_nz — runs after large nonzero (clustered signal → shorter runs expected)
+    //   k_zrl_z  — runs after small nonzero (|coeff|==1) or start-of-stream (longer runs)
+    let mut group_run_lengths_nz: Vec<Vec<u32>> = vec![Vec::new(); num_groups];
+    let mut group_run_lengths_z: Vec<Vec<u32>> = vec![Vec::new(); num_groups];
     for stream_id in 0..RICE_STREAMS_PER_TILE {
         let mut run = 0u32;
         let mut zrl_group = 0usize;
+        let mut zrl_ctx_large = false; // context when this zero run started
+        let mut last_mag_large = false; // true if preceding nonzero had |coeff|>=2
         for s in 0..symbols_per_stream {
             let coeff_idx = stream_id + s * RICE_STREAMS_PER_TILE;
             if coefficients[coeff_idx] == 0 {
                 if run == 0 {
-                    // First zero in run — record its subband
                     let y = (coeff_idx / tile_size as usize) as u32;
                     let x = (coeff_idx % tile_size as usize) as u32;
                     zrl_group = compute_subband_group(x, y, tile_size, num_levels);
+                    zrl_ctx_large = last_mag_large;
                 }
                 run += 1;
-            } else if run > 0 {
-                group_run_lengths[zrl_group].push(run - 1);
-                run = 0;
+            } else {
+                if run > 0 {
+                    if zrl_ctx_large {
+                        group_run_lengths_nz[zrl_group].push(run - 1);
+                    } else {
+                        group_run_lengths_z[zrl_group].push(run - 1);
+                    }
+                    run = 0;
+                }
+                // |coeff|>=2 ↔ unsigned_abs()-1 >= 1
+                last_mag_large = coefficients[coeff_idx].unsigned_abs() >= 2;
             }
         }
         if run > 0 {
-            group_run_lengths[zrl_group].push(run - 1);
+            if zrl_ctx_large {
+                group_run_lengths_nz[zrl_group].push(run - 1);
+            } else {
+                group_run_lengths_z[zrl_group].push(run - 1);
+            }
         }
     }
-    let k_zrl_values: Vec<u8> = group_run_lengths.iter().map(|v| optimal_k(v)).collect();
+    let k_zrl_nz_values: Vec<u8> = group_run_lengths_nz.iter().map(|v| optimal_k(v)).collect();
+    let k_zrl_z_values: Vec<u8> = group_run_lengths_z.iter().map(|v| optimal_k(v)).collect();
 
     // Compute skip bitmap: bit g = 1 means all coefficients in group g are zero
     let mut skip_bitmap: u8 = 0;
@@ -296,6 +321,9 @@ pub fn rice_encode_tile(coefficients: &[i32], tile_size: u32, num_levels: u32) -
             ema[g] = (1u32 << k_values[g]).max(1) << 4;
         }
 
+        // Context state: was the preceding nonzero coefficient |coeff| >= 2?
+        let mut last_mag_large = false;
+
         while s < symbols_per_stream {
             let coeff_idx = stream_id + s * RICE_STREAMS_PER_TILE;
             let y = (coeff_idx / tile_size as usize) as u32;
@@ -311,8 +339,9 @@ pub fn rice_encode_tile(coefficients: &[i32], tile_size: u32, num_levels: u32) -
             let coeff = coefficients[coeff_idx];
 
             if coeff == 0 {
+                // Select k_zrl based on magnitude context of preceding nonzero
+                let k = if last_mag_large { k_zrl_nz_values[g] } else { k_zrl_z_values[g] };
                 // Count zero run (only count non-skipped positions)
-                let k = k_zrl_values[g];
                 let mut run = 1u32;
                 let mut ns = s + 1;
                 while ns < symbols_per_stream {
@@ -334,6 +363,7 @@ pub fn rice_encode_tile(coefficients: &[i32], tile_size: u32, num_levels: u32) -
                 writer.write_bit(0); // token: zero run
                 writer.write_rice(run - 1, k);
                 s = ns;
+                last_mag_large = false;
             } else {
                 writer.write_bit(1); // token: non-zero
                 writer.write_bit(if coeff < 0 { 1 } else { 0 });
@@ -351,6 +381,8 @@ pub fn rice_encode_tile(coefficients: &[i32], tile_size: u32, num_levels: u32) -
                 // Update EMA
                 ema[g] = ema[g] - (ema[g] >> 3) + (magnitude << 1);
                 s += 1;
+                // Large = |coeff| >= 2, i.e., magnitude = |coeff|-1 >= 1
+                last_mag_large = magnitude >= 1;
             }
         }
 
@@ -365,7 +397,8 @@ pub fn rice_encode_tile(coefficients: &[i32], tile_size: u32, num_levels: u32) -
         num_levels,
         num_groups: num_groups as u32,
         k_values,
-        k_zrl_values,
+        k_zrl_nz_values,
+        k_zrl_z_values,
         skip_bitmap,
         stream_lengths,
         stream_data: all_stream_data,
@@ -393,6 +426,7 @@ pub fn rice_decode_tile(tile: &RiceTile) -> Vec<i32> {
 
         let mut s = 0usize;
         let skip_bitmap = tile.skip_bitmap;
+        let mut last_mag_large = false;
         while s < symbols_per_stream {
             let coeff_idx = stream_id + s * RICE_STREAMS_PER_TILE;
             let cy = (coeff_idx / tile.tile_size as usize) as u32;
@@ -408,8 +442,13 @@ pub fn rice_decode_tile(tile: &RiceTile) -> Vec<i32> {
 
             let token = reader.read_bit();
             if token == 0 {
-                // Zero run
-                let run = reader.read_rice(tile.k_zrl_values[cur_g]) + 1;
+                // Zero run: select k_zrl based on magnitude context of preceding nonzero
+                let k = if last_mag_large {
+                    tile.k_zrl_nz_values[cur_g]
+                } else {
+                    tile.k_zrl_z_values[cur_g]
+                };
+                let run = reader.read_rice(k) + 1;
                 // Write zeros, skipping past bitmap-skipped positions
                 let mut written = 0u32;
                 let mut ws = s;
@@ -429,6 +468,7 @@ pub fn rice_decode_tile(tile: &RiceTile) -> Vec<i32> {
                     ws += 1;
                 }
                 s = ws;
+                last_mag_large = false;
             } else {
                 // Non-zero coefficient
                 let sign = reader.read_bit();
@@ -453,6 +493,8 @@ pub fn rice_decode_tile(tile: &RiceTile) -> Vec<i32> {
                 // Update EMA
                 ema[g] = ema[g] - (ema[g] >> 3) + (rice_val << 1);
                 s += 1;
+                // Mirror encoder: large = |coeff| >= 2, i.e., rice_val (= |coeff|-1) >= 1
+                last_mag_large = rice_val >= 1;
             }
         }
 
@@ -521,9 +563,10 @@ pub fn serialize_tile_rice(tile: &RiceTile) -> Vec<u8> {
         // Flags byte: always use varint stream lengths
         out.push(TILE_FLAG_COMPACT_STREAMS);
 
-        // k values + k_zrl values + skip_bitmap
+        // k values + k_zrl_nz + k_zrl_z + skip_bitmap
         out.extend_from_slice(&tile.k_values);
-        out.extend_from_slice(&tile.k_zrl_values);
+        out.extend_from_slice(&tile.k_zrl_nz_values);
+        out.extend_from_slice(&tile.k_zrl_z_values);
         out.push(tile.skip_bitmap);
 
         // Varint stream lengths (256 entries, 1-3 bytes each)
@@ -568,7 +611,8 @@ pub fn deserialize_tile_rice(data: &[u8]) -> (RiceTile, usize) {
                 num_levels,
                 num_groups,
                 k_values: vec![0; num_groups as usize],
-                k_zrl_values: vec![0; num_groups as usize],
+                k_zrl_nz_values: vec![0; num_groups as usize],
+                k_zrl_z_values: vec![0; num_groups as usize],
                 skip_bitmap,
                 stream_lengths: vec![0; RICE_STREAMS_PER_TILE],
                 stream_data: Vec::new(),
@@ -577,10 +621,12 @@ pub fn deserialize_tile_rice(data: &[u8]) -> (RiceTile, usize) {
         );
     }
 
-    // k_values + k_zrl_values + skip_bitmap
+    // k_values + k_zrl_nz_values + k_zrl_z_values + skip_bitmap
     let k_values = data[pos..pos + num_groups as usize].to_vec();
     pos += num_groups as usize;
-    let k_zrl_values = data[pos..pos + num_groups as usize].to_vec();
+    let k_zrl_nz_values = data[pos..pos + num_groups as usize].to_vec();
+    pos += num_groups as usize;
+    let k_zrl_z_values = data[pos..pos + num_groups as usize].to_vec();
     pos += num_groups as usize;
     let skip_bitmap = data[pos];
     pos += 1;
@@ -611,7 +657,8 @@ pub fn deserialize_tile_rice(data: &[u8]) -> (RiceTile, usize) {
             num_levels,
             num_groups,
             k_values,
-            k_zrl_values,
+            k_zrl_nz_values,
+            k_zrl_z_values,
             skip_bitmap,
             stream_lengths,
             stream_data,

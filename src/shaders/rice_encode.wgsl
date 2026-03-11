@@ -10,10 +10,19 @@
 //   Zero:     1 bit (0)
 //   Non-zero: 1 bit (1) + 1 sign bit + unary(quotient) + k bits (remainder)
 //   where quotient = (|val|-1) >> k, remainder = (|val|-1) & ((1<<k)-1)
+//
+// #53: 2-state k_zrl context based on MAGNITUDE of the preceding nonzero coefficient.
+// Zero-run lengths are encoded with one of two Rice parameters:
+//   k_zrl_large — preceding nonzero had |coeff| >= 2 (large → clustered, short runs expected)
+//   k_zrl_small — preceding nonzero had |coeff| == 1 (small/isolated → long runs expected)
+// Note: context "after zero run / start" maps to k_zrl_small since no magnitude is
+// available. The encoder gathers two separate run-length histograms in Phase 1 and
+// selects the appropriate k in Phase 2 via a per-stream boolean state.
 
 const STREAMS_PER_TILE: u32 = 256u;
 const MAX_GROUPS: u32 = 8u;
-const K_STRIDE: u32 = 17u;  // MAX_GROUPS * 2 + 1: stride per tile in k_output (mag k + zrl k per group + skip bitmap)
+// K_STRIDE per tile: [k_mag ×8][k_zrl_nz ×8][k_zrl_z ×8][skip_bitmap ×1] = 25
+const K_STRIDE: u32 = 25u;
 
 // Field order must stay in sync with rice_gpu.rs RiceParams (bytemuck::Pod).
 struct Params {
@@ -41,18 +50,23 @@ struct Params {
 var<workgroup> group_sum: array<atomic<u32>, 8>;
 var<workgroup> group_count: array<atomic<u32>, 8>;
 var<workgroup> shared_k: array<u32, 8>;
-// Per-subband ZRL stats
-var<workgroup> zrl_sum: array<atomic<u32>, 8>;
-var<workgroup> zrl_count: array<atomic<u32>, 8>;
-var<workgroup> shared_k_zrl: array<u32, 8>;
+// Per-subband ZRL stats — two contexts: after-nonzero (nz) and after-zero/start (z)
+var<workgroup> zrl_sum_nz: array<atomic<u32>, 8>;
+var<workgroup> zrl_count_nz: array<atomic<u32>, 8>;
+var<workgroup> zrl_sum_z: array<atomic<u32>, 8>;
+var<workgroup> zrl_count_z: array<atomic<u32>, 8>;
+var<workgroup> shared_k_zrl_nz: array<u32, 8>;
+var<workgroup> shared_k_zrl_z: array<u32, 8>;
 // Subband skip bitmap: bit g = 1 means all coefficients in group g are zero
 var<workgroup> shared_skip_bitmap: u32;
 
 // Per-thread local accumulators for Phase 1 (reduces atomic contention 32×)
 var<private> p_local_sum: array<u32, 8>;
 var<private> p_local_count: array<u32, 8>;
-var<private> p_local_zrl_sum: array<u32, 8>;
-var<private> p_local_zrl_count: array<u32, 8>;
+var<private> p_local_zrl_sum_nz: array<u32, 8>;
+var<private> p_local_zrl_count_nz: array<u32, 8>;
+var<private> p_local_zrl_sum_z: array<u32, 8>;
+var<private> p_local_zrl_count_z: array<u32, 8>;
 
 // Per-thread bit-packing state
 var<private> p_bit_buffer: u32;
@@ -167,29 +181,39 @@ fn main(
     let symbols_per_stream = params.coefficients_per_tile / STREAMS_PER_TILE;
     let num_groups = max(1u, params.num_levels * 2u);
 
-    // === Phase 1: Compute optimal k per subband group + k_zrl ===
+    // === Phase 1: Compute optimal k per subband group + 2-state k_zrl ===
 
     // Initialize shared accumulators
     if (thread_id < MAX_GROUPS) {
         atomicStore(&group_sum[thread_id], 0u);
         atomicStore(&group_count[thread_id], 0u);
-        atomicStore(&zrl_sum[thread_id], 0u);
-        atomicStore(&zrl_count[thread_id], 0u);
+        atomicStore(&zrl_sum_nz[thread_id], 0u);
+        atomicStore(&zrl_count_nz[thread_id], 0u);
+        atomicStore(&zrl_sum_z[thread_id], 0u);
+        atomicStore(&zrl_count_z[thread_id], 0u);
     }
 
     // Initialize per-thread local accumulators
     for (var g = 0u; g < MAX_GROUPS; g++) {
         p_local_sum[g] = 0u;
         p_local_count[g] = 0u;
-        p_local_zrl_sum[g] = 0u;
-        p_local_zrl_count[g] = 0u;
+        p_local_zrl_sum_nz[g] = 0u;
+        p_local_zrl_count_nz[g] = 0u;
+        p_local_zrl_sum_z[g] = 0u;
+        p_local_zrl_count_z[g] = 0u;
     }
     workgroupBarrier();
 
-    // Each thread scans its stream using LOCAL accumulators (no atomic contention)
+    // Each thread scans its stream using LOCAL accumulators (no atomic contention).
+    // Context for k_zrl selection: was the preceding nonzero coefficient |coeff| >= 2?
+    // "Large" (|coeff|>=2) → spatially clustered → shorter zero runs → k_zrl_nz (smaller k).
+    // "Small" (|coeff|==1) or start-of-stream → isolated → longer zero runs → k_zrl_z (larger k).
     {
         var zero_run = 0u;
         var zrl_group = 0u;
+        // zrl_ctx_large: true if the nonzero that preceded this run had abs_val >= 1 (|coeff|>=2)
+        var zrl_ctx_large: bool = false; // context at start of current zero run
+        var last_mag_large: bool = false; // true after a "large" nonzero coeff
         for (var s = 0u; s < symbols_per_stream; s++) {
             let coeff_idx = thread_id + s * STREAMS_PER_TILE;
             let tile_row = coeff_idx / params.tile_size;
@@ -204,20 +228,38 @@ fn main(
                 p_local_sum[g] += min(abs_val, 65535u);
                 p_local_count[g] += 1u;
                 if (zero_run > 0u) {
-                    p_local_zrl_sum[zrl_group] += min(zero_run - 1u, 65535u);
-                    p_local_zrl_count[zrl_group] += 1u;
+                    // Zero run ended; attribute to the correct context bucket.
+                    let rv = min(zero_run - 1u, 65535u);
+                    if (zrl_ctx_large) {
+                        p_local_zrl_sum_nz[zrl_group] += rv;
+                        p_local_zrl_count_nz[zrl_group] += 1u;
+                    } else {
+                        p_local_zrl_sum_z[zrl_group] += rv;
+                        p_local_zrl_count_z[zrl_group] += 1u;
+                    }
                     zero_run = 0u;
                 }
+                // Update context: |coeff| >= 2 ↔ abs_val >= 1
+                last_mag_large = (abs_val >= 1u);
             } else {
                 if (zero_run == 0u) {
+                    // First zero of a new run: record subband and magnitude context.
                     zrl_group = compute_subband_group(tile_col, tile_row);
+                    zrl_ctx_large = last_mag_large;
                 }
                 zero_run += 1u;
             }
         }
+        // Trailing zero run at end of stream
         if (zero_run > 0u) {
-            p_local_zrl_sum[zrl_group] += min(zero_run - 1u, 65535u);
-            p_local_zrl_count[zrl_group] += 1u;
+            let rv = min(zero_run - 1u, 65535u);
+            if (zrl_ctx_large) {
+                p_local_zrl_sum_nz[zrl_group] += rv;
+                p_local_zrl_count_nz[zrl_group] += 1u;
+            } else {
+                p_local_zrl_sum_z[zrl_group] += rv;
+                p_local_zrl_count_z[zrl_group] += 1u;
+            }
         }
     }
 
@@ -227,14 +269,18 @@ fn main(
             atomicAdd(&group_sum[g], p_local_sum[g]);
             atomicAdd(&group_count[g], p_local_count[g]);
         }
-        if (p_local_zrl_count[g] > 0u) {
-            atomicAdd(&zrl_sum[g], p_local_zrl_sum[g]);
-            atomicAdd(&zrl_count[g], p_local_zrl_count[g]);
+        if (p_local_zrl_count_nz[g] > 0u) {
+            atomicAdd(&zrl_sum_nz[g], p_local_zrl_sum_nz[g]);
+            atomicAdd(&zrl_count_nz[g], p_local_zrl_count_nz[g]);
+        }
+        if (p_local_zrl_count_z[g] > 0u) {
+            atomicAdd(&zrl_sum_z[g], p_local_zrl_sum_z[g]);
+            atomicAdd(&zrl_count_z[g], p_local_zrl_count_z[g]);
         }
     }
     workgroupBarrier();
 
-    // Compute k values
+    // Compute magnitude k values
     if (thread_id < num_groups) {
         let count = atomicLoad(&group_count[thread_id]);
         if (count > 0u) {
@@ -248,18 +294,24 @@ fn main(
             shared_k[thread_id] = 0u;
         }
     }
-    // Compute per-subband k_zrl values
+    // Compute k_zrl_nz (zero runs that follow a nonzero coefficient)
     if (thread_id < num_groups) {
-        let zc = atomicLoad(&zrl_count[thread_id]);
+        let zc = atomicLoad(&zrl_count_nz[thread_id]);
         if (zc > 0u) {
-            let zmean = atomicLoad(&zrl_sum[thread_id]) / zc;
-            if (zmean == 0u) {
-                shared_k_zrl[thread_id] = 0u;
-            } else {
-                shared_k_zrl[thread_id] = min(31u - countLeadingZeros(zmean), 15u);
-            }
+            let zmean = atomicLoad(&zrl_sum_nz[thread_id]) / zc;
+            shared_k_zrl_nz[thread_id] = select(0u, min(31u - countLeadingZeros(zmean), 15u), zmean > 0u);
         } else {
-            shared_k_zrl[thread_id] = 0u;
+            shared_k_zrl_nz[thread_id] = 0u;
+        }
+    }
+    // Compute k_zrl_z (zero runs that follow another zero run or start-of-stream)
+    if (thread_id < num_groups) {
+        let zc = atomicLoad(&zrl_count_z[thread_id]);
+        if (zc > 0u) {
+            let zmean = atomicLoad(&zrl_sum_z[thread_id]) / zc;
+            shared_k_zrl_z[thread_id] = select(0u, min(31u - countLeadingZeros(zmean), 15u), zmean > 0u);
+        } else {
+            shared_k_zrl_z[thread_id] = 0u;
         }
     }
     workgroupBarrier();
@@ -275,17 +327,19 @@ fn main(
         shared_skip_bitmap = bitmap;
     }
 
-    // Write k values (mag + zrl + skip bitmap) to output (stride K_STRIDE = MAX_GROUPS * 2 + 1)
+    // Write k values to output (stride K_STRIDE = MAX_GROUPS * 3 + 1)
+    // Layout: [k_mag ×8][k_zrl_nz ×8][k_zrl_z ×8][skip_bitmap]
     if (thread_id < num_groups) {
         k_output[tile_id * K_STRIDE + thread_id] = shared_k[thread_id];
-        k_output[tile_id * K_STRIDE + MAX_GROUPS + thread_id] = shared_k_zrl[thread_id];
+        k_output[tile_id * K_STRIDE + MAX_GROUPS + thread_id] = shared_k_zrl_nz[thread_id];
+        k_output[tile_id * K_STRIDE + MAX_GROUPS * 2u + thread_id] = shared_k_zrl_z[thread_id];
     }
     if (thread_id == 0u) {
         k_output[tile_id * K_STRIDE + K_STRIDE - 1u] = shared_skip_bitmap;
     }
     workgroupBarrier();
 
-    // === Phase 2: Encode stream with per-subband ZRL ===
+    // === Phase 2: Encode stream with 2-state per-subband ZRL ===
 
     // Initialize per-thread state
     p_tile_id = tile_id;
@@ -301,6 +355,10 @@ fn main(
     for (var gi = 0u; gi < MAX_GROUPS; gi++) {
         p_ema[gi] = max(1u, 1u << shared_k[gi]) << 4u;
     }
+
+    // Context state: was the preceding nonzero coefficient |coeff| >= 2?
+    // "Large" nonzero → clustered signal → shorter runs expected → k_zrl_nz (smaller k).
+    var last_mag_large: bool = false;
 
     var s = 0u;
     while (s < symbols_per_stream) {
@@ -321,7 +379,8 @@ fn main(
 
         if (coeff == 0) {
             let g_zrl = skip_g;
-            let k_zrl = shared_k_zrl[g_zrl];
+            // Select k_zrl based on magnitude context of preceding nonzero
+            let k_zrl = select(shared_k_zrl_z[g_zrl], shared_k_zrl_nz[g_zrl], last_mag_large);
 
             // Count zero run (only count non-skipped positions)
             var run = 1u;
@@ -372,6 +431,8 @@ fn main(
             }
 
             s = ns;
+            // After a zero run: no nonzero preceding the next run yet
+            last_mag_large = false;
         } else {
             let sign_bit = select(0u, 1u, coeff < 0);
             let magnitude = u32(abs(coeff)) - 1u;
@@ -414,6 +475,8 @@ fn main(
             p_ema[g] = p_ema[g] - (p_ema[g] >> 3u) + (magnitude << 1u);
 
             s += 1u;
+            // Update context: large = |coeff| >= 2, i.e., magnitude >= 1
+            last_mag_large = (magnitude >= 1u);
         }
     }
 

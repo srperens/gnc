@@ -14,7 +14,8 @@ use super::rice::{max_stream_bytes_for_tile, RiceTile, RICE_STREAMS_PER_TILE};
 use crate::{FrameInfo, GpuContext};
 
 const MAX_GROUPS: usize = 8;
-const K_STRIDE: usize = MAX_GROUPS * 2 + 1; // stride per tile in k_output (mag k + zrl k per group + skip bitmap)
+// K_STRIDE per tile: [k_mag ×8][k_zrl_nz ×8][k_zrl_z ×8][skip_bitmap ×1] = 25 (#53)
+const K_STRIDE: usize = MAX_GROUPS * 3 + 1;
 
 // Field order must stay in sync with shaders/rice_encode.wgsl Params struct (bytemuck::Pod).
 // Fields in order: num_tiles, coefficients_per_tile, plane_width, tile_size, tiles_x,
@@ -489,8 +490,11 @@ impl GpuRiceEncoder {
                 let k_values: Vec<u8> = (0..num_groups)
                     .map(|g| k_data[tile_idx * K_STRIDE + g] as u8)
                     .collect();
-                let k_zrl_values: Vec<u8> = (0..num_groups)
+                let k_zrl_nz_values: Vec<u8> = (0..num_groups)
                     .map(|g| k_data[tile_idx * K_STRIDE + MAX_GROUPS + g] as u8)
+                    .collect();
+                let k_zrl_z_values: Vec<u8> = (0..num_groups)
+                    .map(|g| k_data[tile_idx * K_STRIDE + MAX_GROUPS * 2 + g] as u8)
                     .collect();
                 let skip_bitmap = k_data[tile_idx * K_STRIDE + K_STRIDE - 1] as u8;
 
@@ -515,7 +519,8 @@ impl GpuRiceEncoder {
                     num_levels,
                     num_groups: num_groups as u32,
                     k_values,
-                    k_zrl_values,
+                    k_zrl_nz_values,
+                    k_zrl_z_values,
                     skip_bitmap,
                     stream_lengths,
                     stream_data: packed_data,
@@ -691,8 +696,11 @@ impl GpuRiceEncoder {
             let k_values: Vec<u8> = (0..num_groups)
                 .map(|g| k_data[tile_idx * K_STRIDE + g] as u8)
                 .collect();
-            let k_zrl_values: Vec<u8> = (0..num_groups)
+            let k_zrl_nz_values: Vec<u8> = (0..num_groups)
                 .map(|g| k_data[tile_idx * K_STRIDE + MAX_GROUPS + g] as u8)
+                .collect();
+            let k_zrl_z_values: Vec<u8> = (0..num_groups)
+                .map(|g| k_data[tile_idx * K_STRIDE + MAX_GROUPS * 2 + g] as u8)
                 .collect();
             let skip_bitmap = k_data[tile_idx * K_STRIDE + K_STRIDE - 1] as u8;
             let stream_lengths: Vec<u32> = (0..RICE_STREAMS_PER_TILE)
@@ -712,7 +720,8 @@ impl GpuRiceEncoder {
                 num_levels,
                 num_groups: num_groups as u32,
                 k_values,
-                k_zrl_values,
+                k_zrl_nz_values,
+                k_zrl_z_values,
                 skip_bitmap,
                 stream_lengths,
                 stream_data: packed_data,
@@ -920,8 +929,11 @@ impl GpuRiceEncoder {
                 let k_values: Vec<u8> = (0..num_groups)
                     .map(|g| k_data[tile_idx * K_STRIDE + g] as u8)
                     .collect();
-                let k_zrl_values: Vec<u8> = (0..num_groups)
+                let k_zrl_nz_values: Vec<u8> = (0..num_groups)
                     .map(|g| k_data[tile_idx * K_STRIDE + MAX_GROUPS + g] as u8)
+                    .collect();
+                let k_zrl_z_values: Vec<u8> = (0..num_groups)
+                    .map(|g| k_data[tile_idx * K_STRIDE + MAX_GROUPS * 2 + g] as u8)
                     .collect();
                 let skip_bitmap = k_data[tile_idx * K_STRIDE + K_STRIDE - 1] as u8;
 
@@ -945,7 +957,8 @@ impl GpuRiceEncoder {
                     num_levels,
                     num_groups: num_groups as u32,
                     k_values,
-                    k_zrl_values,
+                    k_zrl_nz_values,
+                    k_zrl_z_values,
                     skip_bitmap,
                     stream_lengths,
                     stream_data: packed_data,
@@ -1206,8 +1219,11 @@ impl GpuRiceEncoder {
                     let k_values: Vec<u8> = (0..num_groups)
                         .map(|g| k_data[tile_idx * K_STRIDE + g] as u8)
                         .collect();
-                    let k_zrl_values: Vec<u8> = (0..num_groups)
+                    let k_zrl_nz_values: Vec<u8> = (0..num_groups)
                         .map(|g| k_data[tile_idx * K_STRIDE + MAX_GROUPS + g] as u8)
+                        .collect();
+                    let k_zrl_z_values: Vec<u8> = (0..num_groups)
+                        .map(|g| k_data[tile_idx * K_STRIDE + MAX_GROUPS * 2 + g] as u8)
                         .collect();
                     let skip_bitmap = k_data[tile_idx * K_STRIDE + K_STRIDE - 1] as u8;
 
@@ -1232,7 +1248,8 @@ impl GpuRiceEncoder {
                         num_levels,
                         num_groups: num_groups as u32,
                         k_values,
-                        k_zrl_values,
+                        k_zrl_nz_values,
+                        k_zrl_z_values,
                         skip_bitmap,
                         stream_lengths,
                         stream_data: packed_data,
@@ -1367,14 +1384,17 @@ impl GpuRiceDecoder {
         let total_streams = num_tiles * RICE_STREAMS_PER_TILE;
 
         // k values: flat array indexed by tile_id * K_STRIDE + group
-        // k_zrl values stored at tile_id * K_STRIDE + MAX_GROUPS + group
+        // Layout: [k_mag ×8][k_zrl_nz ×8][k_zrl_z ×8][skip_bitmap] (#53)
         let mut k_values = vec![0u32; num_tiles * K_STRIDE];
         for (t, tile) in tiles.iter().enumerate() {
             for (g, &k) in tile.k_values.iter().enumerate() {
                 k_values[t * K_STRIDE + g] = k as u32;
             }
-            for (g, &k) in tile.k_zrl_values.iter().enumerate() {
+            for (g, &k) in tile.k_zrl_nz_values.iter().enumerate() {
                 k_values[t * K_STRIDE + MAX_GROUPS + g] = k as u32;
+            }
+            for (g, &k) in tile.k_zrl_z_values.iter().enumerate() {
+                k_values[t * K_STRIDE + MAX_GROUPS * 2 + g] = k as u32;
             }
             k_values[t * K_STRIDE + K_STRIDE - 1] = tile.skip_bitmap as u32;
         }
@@ -1759,8 +1779,8 @@ mod tests {
                 eprintln!("GPU vs CPU decode: {mismatches} mismatches / {padded_pixels} ({:.2}%)",
                     mismatches as f64 / padded_pixels as f64 * 100.0);
                 if let Some(tid) = first_mismatch_tile {
-                    eprintln!("First mismatch in tile {tid}: k_values={:?} k_zrl={:?}",
-                        plane_tiles[tid].k_values, plane_tiles[tid].k_zrl_values);
+                    eprintln!("First mismatch in tile {tid}: k_values={:?} k_zrl_nz={:?} k_zrl_z={:?}",
+                        plane_tiles[tid].k_values, plane_tiles[tid].k_zrl_nz_values, plane_tiles[tid].k_zrl_z_values);
                 }
                 assert_eq!(mismatches, 0, "GPU decode of real image differs from CPU decode");
             }

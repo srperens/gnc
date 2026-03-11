@@ -431,7 +431,7 @@ fn collect_rice_efficiency(entropy: &EntropyData) -> Option<RiceEfficiency> {
             let skipped = (tile.skip_bitmap >> g) & 1 != 0;
             if !skipped {
                 k_mag_sum += tile.k_values[g] as f64;
-                k_zrl_sum += tile.k_zrl_values[g] as f64;
+                k_zrl_sum += (tile.k_zrl_nz_values[g] as f64 + tile.k_zrl_z_values[g] as f64) / 2.0;
                 k_count += 1;
             }
         }

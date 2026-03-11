@@ -528,12 +528,13 @@ H.264 comparison (#22) established the north star: GNC needs **2–5× more bits
 - **Complexity:** 1–2 days. No bitstream change needed if alpha is fixed (baked in). Minor if alpha is signaled per subband.
 
 ### 53. Within-tile significance context coding
-- **Status:** gate PASSED (2026-03-11) — queued behind skip mode (#59 correct impl)
-- **Revised approach:** Above-neighbor context only (3×3 VETO'd — breaks 256-stream model). Above-neighbor = previous symbol in same Rice stream (same column, row-1) → within-stream, no architecture change.
-- **Gate results (2026-03-11, q=75 I-frame):** crowd_run H_above=0.823 (+0.42 bpp potential), park_joy H_above=0.703 (+0.51 bpp), rush_hour H_above=0.405 (+0.16 bpp). 2/3 pass H<0.80. Diagnostic committed 183e1c5 (GNC_SIG_CONTEXT=1).
-- **Implementation:** 2-state k_zrl context: k_zrl_after_nonzero vs k_zrl_after_zero per subband. Both states EMA-tracked per stream. 256-stream independence preserved. Bitstream change: 2× k tables per subband instead of 1×. No decoder architecture change.
-- **Success criteria:** bpp −3% on crowd_run q=75 at VMAF neutral; validated on park_joy + rush_hour.
-- **Complexity:** 2–3 days. Rice encoder + decoder shader changes only.
+- **Status:** DONE (2026-03-11) — partial success
+- **Revised approach:** Above-neighbor context only (3×3 VETO'd — breaks 256-stream model). Implemented as magnitude-conditioned k_zrl: two ZRL Rice parameters per subband — k_zrl_nz (after |coeff|≥2) and k_zrl_z (after |coeff|=1). Architectural finding: "last_was_nonzero" context is degenerate in ZRL (zero runs always follow nonzero by definition); magnitude discriminant is the correct context variable.
+- **Gate results (2026-03-11, q=75 I-frame):** crowd_run H_above=0.823 (+0.42 bpp potential), park_joy H_above=0.703 (+0.51 bpp), rush_hour H_above=0.405 (+0.16 bpp). 2/3 pass H<0.80.
+- **Implementation:** K_STRIDE 17→25 (adds k_zrl_z array); encoder Phase 1 tracks ZRL histograms by magnitude context; Phase 2 selects k_zrl_nz vs k_zrl_z per zero run; decoder mirrors exactly.
+- **Result:** crowd_run 6.32→6.30 bpp (−0.3%), park_joy 4.74→4.72 bpp (−0.4%). VMAF neutral. Short of −3% criterion.
+- **Note:** The full H_above potential (0.42–0.51 bpp) is not accessible through k_zrl tuning alone — ZRL encodes run lengths, not individual significance bits. Capturing per-bit correlation requires significance map encoding (e.g., CABAC, arithmetic coding). Not possible within Rice+ZRL architecture without fundamental redesign.
+- **Complexity:** 7 files changed, K_STRIDE bump (bitstream change GP14→GP15).
 
 ### 54. Quarter-pel ME for B-frames
 - **Status:** closed (gate fail — already qpel)

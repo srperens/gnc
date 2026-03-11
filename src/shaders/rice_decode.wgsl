@@ -4,12 +4,17 @@
 // No state chain — fully parallel across all 256 streams.
 //
 // Per coefficient:
-//   bit=0 → zero
-//   bit=1 → sign bit + Rice(magnitude-1, k) → ±magnitude
+//   bit=0 → zero run: Rice(run_length-1, k_zrl) where k_zrl selected by 2-state context
+//   bit=1 → sign bit + Rice(magnitude-1, k_mag) → ±magnitude
+//
+// #53: 2-state k_zrl context based on magnitude of the preceding nonzero coefficient.
+// k_zrl_nz is used after a "large" nonzero (|coeff| >= 2 → clustered signal, short runs);
+// k_zrl_z is used after a "small" nonzero (|coeff| == 1) or at start-of-stream.
 
 const STREAMS_PER_TILE: u32 = 256u;
 const MAX_GROUPS: u32 = 8u;
-const K_STRIDE: u32 = 17u;  // MAX_GROUPS * 2 + 1: stride per tile in k_values (mag k + zrl k per group + skip bitmap)
+// K_STRIDE per tile: [k_mag ×8][k_zrl_nz ×8][k_zrl_z ×8][skip_bitmap ×1] = 25
+const K_STRIDE: u32 = 25u;
 
 struct Params {
     num_tiles: u32,
@@ -28,9 +33,10 @@ struct Params {
 @group(0) @binding(3) var<storage, read> stream_offsets: array<u32>;
 @group(0) @binding(4) var<storage, read_write> output: array<f32>;
 
-// Shared k values for this tile (magnitude k per group + zrl k per group)
+// Shared k values for this tile
 var<workgroup> shared_k: array<u32, 8>;
-var<workgroup> shared_k_zrl: array<u32, 8>;
+var<workgroup> shared_k_zrl_nz: array<u32, 8>; // k_zrl after a large nonzero (|coeff|>=2)
+var<workgroup> shared_k_zrl_z: array<u32, 8>;  // k_zrl after a small nonzero (|coeff|==1) or start
 // Subband skip bitmap: bit g = 1 means all coefficients in group g are zero
 var<workgroup> shared_skip_bitmap: u32;
 
@@ -133,10 +139,12 @@ fn main(
     let symbols_per_stream = params.coefficients_per_tile / STREAMS_PER_TILE;
     let num_groups = max(1u, params.num_levels * 2u);
 
-    // Cooperatively load k values + per-subband k_zrl + skip bitmap into shared memory (stride K_STRIDE)
+    // Cooperatively load k values into shared memory (stride K_STRIDE = 25)
+    // Layout: [k_mag ×8][k_zrl_nz ×8][k_zrl_z ×8][skip_bitmap]
     if (thread_id < num_groups) {
-        shared_k[thread_id] = k_values[tile_id * K_STRIDE + thread_id];
-        shared_k_zrl[thread_id] = k_values[tile_id * K_STRIDE + MAX_GROUPS + thread_id];
+        shared_k[thread_id]        = k_values[tile_id * K_STRIDE + thread_id];
+        shared_k_zrl_nz[thread_id] = k_values[tile_id * K_STRIDE + MAX_GROUPS + thread_id];
+        shared_k_zrl_z[thread_id]  = k_values[tile_id * K_STRIDE + MAX_GROUPS * 2u + thread_id];
     }
     if (thread_id == 0u) {
         shared_skip_bitmap = k_values[tile_id * K_STRIDE + K_STRIDE - 1u];
@@ -153,6 +161,10 @@ fn main(
     p_byte_offset = stream_offsets[stream_idx];
     p_bit_pos = 8u;  // force load on first read_bit()
     p_current_byte = 0u;
+
+    // Context state: was the preceding nonzero coefficient |coeff| >= 2?
+    // Must mirror rice_encode.wgsl Phase 2 context tracking exactly.
+    var last_mag_large: bool = false;
 
     // Decode tokens with ZRL
     var s = 0u;
@@ -172,9 +184,10 @@ fn main(
 
         let token = read_bit();
         if (token == 0u) {
-            // Zero run: use subband of first zero for k_zrl
+            // Zero run: select k_zrl based on magnitude context of preceding nonzero
             let g_zrl = skip_g;
-            let run = read_rice(shared_k_zrl[g_zrl]) + 1u;
+            let k_zrl = select(shared_k_zrl_z[g_zrl], shared_k_zrl_nz[g_zrl], last_mag_large);
+            let run = read_rice(k_zrl) + 1u;
             // Write zeros, skipping past bitmap-skipped positions
             var written = 0u;
             var ws = s;
@@ -195,6 +208,7 @@ fn main(
                 ws += 1u;
             }
             s = ws;
+            last_mag_large = false;
         } else {
             // Non-zero coefficient
             let coeff_idx = ci0;
@@ -219,6 +233,8 @@ fn main(
             p_ema[g] = p_ema[g] - (p_ema[g] >> 3u) + (rice_val << 1u);
 
             s += 1u;
+            // Mirror encoder: large = |coeff| >= 2, i.e., rice_val (= |coeff|-1) >= 1
+            last_mag_large = (rice_val >= 1u);
         }
     }
 }

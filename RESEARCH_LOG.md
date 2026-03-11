@@ -4,6 +4,35 @@
 
 ---
 
+## 2026-03-11: #53 Within-tile significance context — DONE (partial gain)
+
+### Hypothesis
+H_above < 1.0 (crowd_run 0.823, park_joy 0.703) indicates spatial correlation in significance bits along the column direction (within each of the 256 Rice streams). The approved implementation: 2-state k_zrl context based on the magnitude of the preceding nonzero coefficient — large (|coeff|≥2) vs small (|coeff|=1) — to better model zero-run-length distributions.
+
+### Architectural insight discovered during implementation
+The naive "last_was_nonzero" context is degenerate in ZRL encoding: zero runs, by construction, always begin immediately after a nonzero coefficient (the scan terminates at the first nonzero per ZRL semantics). This means `last_was_nz` is always true at run-start except for the very first run at stream start. The correct discriminant is the **magnitude** of the preceding nonzero: large (|coeff|≥2) vs small (|coeff|=1). Large coefficients appear in clusters (edges, textures) → short following runs expected (k_zrl_nz, small k); isolated small coefficients → longer runs (k_zrl_z, larger k).
+
+### Implementation
+7 files changed. K_STRIDE bumped 17→25 (adds k_zrl_z array per tile, 8 groups). Phase 1 tracks two ZRL histograms per subband conditioned on magnitude context. Phase 2 selects k_zrl dynamically per run. Decoder mirrors encoder exactly. Bitstream version GP14→GP15.
+
+### Results (q=75, I+P+B, 444)
+
+| Sequence | Pre-#53 | #53 | Delta |
+|----------|---------|-----|-------|
+| crowd_run | 6.32 bpp | 6.30 bpp | −0.3% |
+| park_joy I+P+B | 4.74 bpp | 4.72 bpp | −0.4% |
+| park_joy I+P | 5.39 bpp | 5.36 bpp | −0.6% |
+| VMAF | 99.73 | 99.73 | neutral |
+
+### Assessment
+Gain is consistent but far short of −3% success criterion. The theoretical H_above potential (0.42–0.51 bpp improvement) is not accessible through k_zrl context tuning. The root cause: ZRL encodes *run lengths*, not individual significance bits. Capturing per-bit spatial correlation requires a significance-map entropy coder (e.g., CABAC or arithmetic), which is incompatible with the 256-stream parallel Rice architecture. Within the constraints of Rice+ZRL, magnitude-conditioned k_zrl is the best achievable context.
+
+Despite falling short of the gate criterion, the change is shipped: it is correct, tested, adds ~0.3-0.6% consistent compression improvement, and the added complexity (8 extra k values per tile + one bool per stream) is modest. Zero VMAF regression.
+
+### Decision: SHIP — small consistent gain, clean implementation, no regression.
+
+---
+
 ## 2026-03-10: #42 4:2:0 B-frame chroma MC bug — stale mv_chroma_buf (bugfix)
 
 ### Root cause

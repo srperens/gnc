@@ -616,12 +616,18 @@ pub fn quality_preset(q: u32) -> CodecConfig {
     // Log-interpolate qstep for perceptually uniform spacing
     let qstep = (lo.qstep.ln() + t * (hi.qstep.ln() - lo.qstep.ln())).exp();
     // Linear-interpolate dead zone
-    let dead_zone = lo.dead_zone + t * (hi.dead_zone - lo.dead_zone);
+    let dead_zone = std::env::var("GNC_DEAD_ZONE")
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok())
+        .unwrap_or(lo.dead_zone + t * (hi.dead_zone - lo.dead_zone));
 
     // Discrete settings: use lower-quality anchor until midpoint
     let disc = if t < 0.5 { lo } else { hi };
 
-    let wavelet_levels = if q >= 50 { 4 } else { 3 };
+    let wavelet_levels = std::env::var("GNC_WAVELET_LEVELS")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(if q >= 50 { 4 } else { 3 });
     let aq_enabled = q <= 80; // AQ helps in lossy range; variance computed on LL subband
     let aq_strength = if q >= 70 { 0.2 } else { 0.15 };
     let mut weights = if disc.perceptual {

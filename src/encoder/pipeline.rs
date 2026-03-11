@@ -1934,6 +1934,37 @@ impl EncoderPipeline {
             t_rice_end = t_wq_end;
         }
 
+        // === Significance-context diagnostic (GNC_SIG_CONTEXT=1) ===
+        // Runs on the first I-frame only. Reads quantized coefficient buffers (Y →
+        // mc_out, Co → ref_upload, Cg → plane_b) after wavelet+quantize but before
+        // entropy coding. Only active for the wavelet path.
+        if config.transform_type == crate::TransformType::Wavelet
+            && std::env::var("GNC_SIG_CONTEXT").is_ok()
+        {
+            use std::sync::OnceLock;
+            static SIG_CTX_DONE: OnceLock<()> = OnceLock::new();
+            ctx.device.poll(wgpu::Maintain::Wait);
+            SIG_CTX_DONE.get_or_init(|| {
+                let bufs = self.cached.as_ref().unwrap();
+                // For non-444 chroma, Co/Cg planes have smaller padded dimensions.
+                // The diagnostic handles each plane with its own pixel count.
+                let chroma_w = active_chroma_w;
+                let chroma_h = active_chroma_h;
+                super::sig_context_diag::run_multi_plane(
+                    ctx,
+                    &bufs.mc_out,
+                    &bufs.ref_upload,
+                    &bufs.plane_b,
+                    padded_w,
+                    padded_h,
+                    chroma_w,
+                    chroma_h,
+                    config.tile_size,
+                    config.wavelet_levels,
+                );
+            });
+        }
+
         // Per-plane infos for entropy encoding — chroma planes differ when non-444
         let plane_infos: [&FrameInfo; 3] = [
             &info,

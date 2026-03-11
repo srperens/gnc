@@ -6,37 +6,58 @@ Status: `todo` | `active` | `done` | `blocked`
 
 See [BASELINE.md](BASELINE.md) for current benchmark numbers.
 
-## Current Focus (updated 2026-03-10)
+## Current Focus (updated 2026-03-11)
 
-H.264 comparison (#22) established the north star: GNC needs **2–5× more bits** than H.264 at equal PSNR (BD-rate +171–216%, broadcast contribution, 4:2:2, I+P+B).
+**Mode: Mätning och buggfixning. Inga nya features.**
 
-**The gap is temporal prediction quality, not entropy or transform mismatch.**
-- P/B frames save only ~3% bpp vs all-I on high-motion content — H.264's MC is far more efficient
-- Rice+ZRL vs arithmetic coding is only ~0.1–0.2 bpp — not the bottleneck
-- #35 (DCT for inter residuals) deferred by RS: OBMC gate (0% bpp change from MV smoothing) falsifies the "block-boundary energy" premise; realistic gain 2-5%, not the 10% criterion
-- New focus: #43 multi-reference P-frames (gate first), then #42 hierarchical B-frames
+Mätkampanjen (del 8–13) har etablerat ny nollpunkt med uniforma vikter. Nu gäller:
+1. Fixa kända buggar
+2. Mät noggrant — sekvenser, chroma-format, video vs stillbild
+3. Toggling av funktionalitet för att hitta dead weight och felimplementationer
+4. Låt mätningarna peka ut nästa åtgärd
 
-**Priority order (updated 2026-03-10):**
-1–14: (see previous items, all done/closed)
-15. **#35 DCT for inter-frame residuals** (CLOSED — gate: LL 88% of residual energy, detail <15%; premise falsified)
-16. **#40 4×4 sub-block ME** (CLOSED — bpp +15–26%; MV overhead dominates; hypothesis falsified)
-17. **#41 Adaptive intra tiles in P/B frames** (CLOSED — gain < 1% at q=75; LL-dominant residuals = camera motion)
-18. **#44 DC subband offset correction** (CLOSED — DC shift < 1% bpp)
-19. **#45 Adaptive GOP** (CLOSED — ki=2 bpp worse than ki=8)
-20. **#43 Multi-reference P-frames** (CLOSED — pyramid ME ±96px already covers gap)
-21. **#42 Hierarchical B-frame GOP** (DONE 2026-03-10) — crowd_run −3.4% bpp, park_joy −3.9%, VMAF neutral
-22. **#24 Pyramid ME** (done 2026-03-10) — ±96px range, park_joy −3.4% bpp
+**Kända fakta (2026-03-11, uniforma vikter):**
+- Spatial BD-rate vs H.264 all-I: **+13.9%** — rimligt för en wavelet-kodare
+- Spatial BD-rate vs JPEG 2000 (4:4:4): **+28.3%** — gap minskar till ~11% vid hög kvalitet
+- Temporal: GNC I+P+B sparar ~17–27% vs all-I. H.264 sparar ~60–70% → temporalt gap kvarstår.
+- Allt ovan är PSNR-baserat (RGB). VMAF-baserad videojämförelse mot H.264 saknas fortfarande.
 
-**Next items (RS-approved, 2026-03-11):**
-6. **#64 Pyramid-layer-dependent QP** — DONE (2026-03-11). crowd_run −11.0% bpp (6.00→5.34), park_joy −10.4% (4.71→4.22), VMAF neutral (−0.01–0.02 pts). L3_QP_SCALE=1.5 default.
-7. **#65 Subband weight fix** — DONE (2026-03-11). Measurement campaign found "perceptual" weights had inverted gradient (wrong). Changed default to UNIFORM weights. Single-frame: +2.28 dB PSNR, +1.51 VMAF, +20% bpp at q=75 (bpp up = quality up). BD-rate: ~18% bpp saving at equal VMAF. All 168 tests pass.
+**Aktiv prioritetslista:**
 
-**Next items (RS-approved, 2026-03-10):**
-1. **#46 LL subband spatial prediction** — CLOSED (gate fail: crowd_run mean_ratio=1.536, park_joy 1.705 > 0.85)
-2. **#48 Chroma qpel for 4:2:0 B-frames** — CLOSED (gate fail: Co/Y=0.57, Cg/Y=0.43, both <1.2; chroma MC working correctly)
-3. **#50 Fast I-frame Rice skip** — CLOSED (gate fail: 0% qualifying tiles at q=75)
-4. **#49 P-frame reference from pyramid pool** — DONE (B₄-as-P forward-only; park_joy −0.2% bpp, crowd_run +0.3%, VMAF neutral)
-5. **#47 Overlapping tile windows** — gate PASSED (0.66 dB boundary gap), correct design documented. Structural code in place (overlap=0 is no-op). Full implementation needs: FrameInfo.overlap_pixels + separate coefficient buffer + decoder crop step + bitstream bump.
+### BUG-1 — 4:2:0 pyramid B-frame chroma-fel (PRIO 1, todo)
+B-frames på pyramid-lager 2–3 med 4:2:0 har ~22–26 dB PSNR trots 2–4 bpp. I-frames och P-frames
+är opåverkade (42 dB). B₄ (lager 1, direkt referens till I/P) fungerar (38 dB). Felet kaskaderar
+via chroma-referenskedjan: B₂/B₆ refererar B₄ som är 4:2:0-kodad, leaf-B refererar B₂/B₆.
+Root cause: troligt fel i 4:2:0 chroma-MC när referens är ett 4:2:0-kodat B-frame (inte I/P).
+
+### MEAS-1 — Korrekt videojämförelse GNC vs H.264 (todo)
+Kör H.264 (libx264, full inter, standard GOP) på crowd_run + park_joy, 10 frames, yuv420p.
+Mät PSNR och bpp per CRF-värde. Beräkna BD-rate mot GNC 4:2:0 I+P+B (efter BUG-1 fixad).
+Även GNC 4:4:4 vs H.264 yuv444p för rättvis jämförelse utan chroma-handicap.
+
+### MEAS-2 — Funktionalitetstoggling: vad bidrar och hur mycket? (todo)
+Systematisk toggle-mätning på crowd_run + park_joy, 10 frames, 4:4:4, q=75:
+- AQ on/off (GNC_NO_AQ)
+- CfL on/off
+- Pyramid QP scale on/off (GNC_L3_QP_SCALE=1.0 vs 1.5)
+- Pyramid B-frames vs flat B-frames (pyramid_enabled=false)
+- B-frames vs P-only (ki=1)
+- Rice vs rANS
+Varje toggle: rapportera bpp + VMAF delta. Mål: identifiera dead weight och negativa features.
+
+### MEAS-3 — RD-kurva sekvenser (todo)
+Kör rd-curve (q=25–90) på crowd_run och park_joy med 4:4:4, mät VMAF vid varje punkt.
+Nuvarande rd-curve saknar --chroma-format och --vmaf på sekvenser. Kanske räcker benchmark-loop.
+
+---
+
+**Historik (RS-approved, DONE):**
+- **#64 Pyramid L3 QP scale** — DONE (2026-03-11). crowd_run −11.0% bpp, park_joy −10.4%.
+- **#65 Subband weight fix** — DONE (2026-03-11). +2.28 dB PSNR, +1.51 VMAF vid q=75. BD-rate ~18% bpp besparing vid lika VMAF.
+- **#42 Hierarchical B-frame GOP** — DONE (2026-03-10). crowd_run −3.4%, park_joy −3.9%.
+- **#60 Adaptive block-size ME** — DONE (2026-03-11). Neutral VMAF.
+- **#49 B₄-as-P forward-only** — DONE (2026-03-10). Neutral.
+- **#35/#40/#41/#43/#44/#45/#46/#47/#48/#50** — CLOSED (gates misslyckades eller gain under tröskel).
 
 ## Items
 

@@ -40,6 +40,10 @@ struct Params {
 @group(0) @binding(1) var<storage, read>       current_plane:  array<f32>;
 @group(0) @binding(2) var<storage, read>       ref_plane:      array<f32>;
 @group(0) @binding(3) var<storage, read_write> motion_vectors: array<i32>;
+// binding 4: per-tile skip decisions (1 = skip, 0 = not skip), one u32 per tile.
+// Written by thread 0 after the skip decision in phase 3.
+// Indexed as tile_y * tiles_x + tile_x.
+@group(0) @binding(4) var<storage, read_write> tile_skip_out:  array<u32>;
 
 var<workgroup> shared_sum: array<f32, 256>;
 
@@ -95,6 +99,11 @@ fn main(
     if lid == 0u && !out_of_bounds {
         let mean_sad     = shared_sum[0] / f32(tile_pixels);
         shared_sum[0]    = select(0.0, 1.0, mean_sad < params.skip_threshold);
+        // Export skip decision to per-tile output buffer so the encoder can zero
+        // the quantised coefficient buffer for skip tiles after quantize (post-quant
+        // zeroing avoids wavelet-filter bleed that plagued the spatial-domain approach).
+        let tiles_x = params.padded_w / params.tile_size;
+        tile_skip_out[tile_y * tiles_x + tile_x] = u32(shared_sum[0]);
     }
     workgroupBarrier();
 

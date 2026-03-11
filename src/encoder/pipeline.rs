@@ -63,6 +63,8 @@ pub struct EncoderPipeline {
     tile_skip_motion_bgl: wgpu::BindGroupLayout,
     tile_skip_bidir_pipeline: wgpu::ComputePipeline,
     tile_skip_bidir_bgl: wgpu::BindGroupLayout,
+    zero_skip_tiles_by_map_pipeline: wgpu::ComputePipeline,
+    zero_skip_tiles_by_map_bgl: wgpu::BindGroupLayout,
     mv_median_smooth_pipeline: wgpu::ComputePipeline,
     mv_median_smooth_bgl: wgpu::BindGroupLayout,
     pub(super) cached: Option<CachedEncodeBuffers>,
@@ -344,6 +346,17 @@ impl EncoderPipeline {
                             },
                             count: None,
                         },
+                        // binding 4: tile_skip_out (read_write storage — one u32 per tile)
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 4,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
                     ],
                 });
         let tsm_pl = ctx
@@ -477,6 +490,78 @@ impl EncoderPipeline {
                     cache: None,
                 });
 
+        // GPU zero-skip-tiles-by-map pipeline: zeros quantised coefficient tiles for
+        // tiles flagged in the per-tile skip map (written by tile_skip_motion.wgsl).
+        // Must run AFTER quantize and BEFORE entropy encode.
+        // Binding 0: uniform params (padded_w, padded_h, tile_size)
+        // Binding 1: tile_skip_map (read-only u32 array, one entry per tile)
+        // Binding 2: coeffs (read_write f32 array — zeroed for skip tiles)
+        let zstm_shader = ctx
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("zero_skip_tiles_by_map"),
+                source: wgpu::ShaderSource::Wgsl(
+                    include_str!("../shaders/zero_skip_tiles_by_map.wgsl").into(),
+                ),
+            });
+        let zero_skip_tiles_by_map_bgl =
+            ctx.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("zstm_bgl"),
+                    entries: &[
+                        // binding 0: uniform params
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        // binding 1: tile_skip_map (read-only)
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        // binding 2: coeffs (read_write — zeroed for skip tiles)
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 2,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                    ],
+                });
+        let zstm_pl = ctx
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("zstm_pl"),
+                bind_group_layouts: &[&zero_skip_tiles_by_map_bgl],
+                push_constant_ranges: &[],
+            });
+        let zero_skip_tiles_by_map_pipeline =
+            ctx.device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("zero_skip_tiles_by_map_pipeline"),
+                    layout: Some(&zstm_pl),
+                    module: &zstm_shader,
+                    entry_point: Some("main"),
+                    compilation_options: Default::default(),
+                    cache: None,
+                });
+
         // GPU MV median smoothing pipeline (GNC_MV_SMOOTH=1): applies a 3×3 median filter
         // to the 8×8-resolution split MV buffer, reducing inter-block MV discontinuities
         // before motion compensation.  Reads from split_mv_buf, writes to scratch buffer;
@@ -578,6 +663,8 @@ impl EncoderPipeline {
             tile_skip_motion_bgl,
             tile_skip_bidir_pipeline,
             tile_skip_bidir_bgl,
+            zero_skip_tiles_by_map_pipeline,
+            zero_skip_tiles_by_map_bgl,
             mv_median_smooth_pipeline,
             mv_median_smooth_bgl,
             cached: None,
@@ -901,6 +988,7 @@ impl EncoderPipeline {
         current_plane: &wgpu::Buffer,
         ref_plane: &wgpu::Buffer,
         split_mv_buf: &wgpu::Buffer,
+        tile_skip_map_buf: &wgpu::Buffer,
         padded_w: u32,
         padded_h: u32,
         tile_size: u32,
@@ -953,6 +1041,10 @@ impl EncoderPipeline {
                     binding: 3,
                     resource: split_mv_buf.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: tile_skip_map_buf.as_entire_binding(),
+                },
             ],
         });
         let tiles_x = padded_w / tile_size;
@@ -962,6 +1054,75 @@ impl EncoderPipeline {
             timestamp_writes: None,
         });
         pass.set_pipeline(&self.tile_skip_motion_pipeline);
+        pass.set_bind_group(0, &bg, &[]);
+        pass.dispatch_workgroups(tiles_x, tiles_y, 1);
+    }
+
+    /// Dispatch zero-skip-tiles-by-map pass.
+    ///
+    /// Zeros quantised coefficient tiles whose entry in `tile_skip_map_buf` is 1.
+    /// Must run AFTER quantize and BEFORE entropy encode, in the same command encoder.
+    /// The skip map is written by `dispatch_tile_skip_motion` earlier in the same encoder.
+    ///
+    /// This is the correct post-quantize zeroing that avoids wavelet-filter bleed:
+    /// the broken spatial-domain zeroing (#59) zeroed BEFORE the wavelet transform,
+    /// causing bleed across tile boundaries. Zeroing AFTER quantize is safe because
+    /// quantised coefficients are already tile-independent.
+    ///
+    /// `coeff_buf` is the quantised output buffer (recon_y / co_plane / plane_b etc.).
+    /// `coeff_w` / `coeff_h` are the padded dimensions for this plane (may differ from
+    /// luma for 4:2:0/4:2:2 chroma — the skip map is always in luma tile space, so
+    /// for chroma we pass the luma tile map and use luma tile_size).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn dispatch_zero_skip_tiles_by_map(
+        &self,
+        ctx: &GpuContext,
+        cmd: &mut wgpu::CommandEncoder,
+        tile_skip_map_buf: &wgpu::Buffer,
+        coeff_buf: &wgpu::Buffer,
+        padded_w: u32,
+        padded_h: u32,
+        tile_size: u32,
+    ) {
+        use wgpu::util::DeviceExt;
+        // Params layout (matches shader struct):
+        //   offset 0: padded_w  u32
+        //   offset 4: padded_h  u32
+        //   offset 8: tile_size u32
+        //   offset 12: _pad     u32
+        let params_data: [u32; 4] = [padded_w, padded_h, tile_size, 0];
+        let params_buf = ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("zstm_params"),
+                contents: bytemuck::cast_slice(&params_data),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("zstm_bg"),
+            layout: &self.zero_skip_tiles_by_map_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: tile_skip_map_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: coeff_buf.as_entire_binding(),
+                },
+            ],
+        });
+        let tiles_x = padded_w / tile_size;
+        let tiles_y = padded_h / tile_size;
+        let mut pass = cmd.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("zero_skip_tiles_by_map_pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.zero_skip_tiles_by_map_pipeline);
         pass.set_bind_group(0, &bg, &[]);
         pass.dispatch_workgroups(tiles_x, tiles_y, 1);
     }

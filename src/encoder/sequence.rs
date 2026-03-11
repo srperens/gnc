@@ -52,14 +52,6 @@ fn tile_skip_threshold(_qstep: f32) -> f32 {
     0.0
 }
 
-/// Per-16×16-block SAD threshold for P-frame skip mode.
-/// Blocks with SAD below this threshold have their residual zeroed before the wavelet,
-/// saving entropy bits at negligible quality cost.
-/// 0.7× qstep gives ~20-28% skip rate and ~0.5-1% bpp reduction at VMAF neutral.
-fn skip_threshold(qstep: f32) -> u32 {
-    (qstep * 0.7 * 256.0) as u32
-}
-
 /// Pre-computed ME results for a P-frame.
 /// Produced by the look-ahead ME pass that runs while the previous frame's
 /// Metal sync is in progress, overlapping ~18ms of sync latency with ~20ms of ME.
@@ -3212,6 +3204,7 @@ impl EncoderPipeline {
                 &bufs.plane_a,
                 &bufs.gpu_ref_planes[0],
                 &split_mv_buf,
+                &bufs.tile_skip_map_buf,
                 padded_w,
                 padded_h,
                 config.tile_size,
@@ -3464,23 +3457,10 @@ impl EncoderPipeline {
                         padded_h,
                         &bufs.mc_fwd_params_8,
                     );
-                    // Skip mode (luma only): zero residual for blocks whose SAD < threshold.
-                    // Blocks where MC prediction is already close to the original gain
-                    // negligible quality from coding their residual; zeroing lets Rice ZRL save bits.
-                    if p == 0 {
-                        let thr = skip_threshold(config.quantization_step);
-                        if thr > 0 {
-                            self.motion.dispatch_zero_skip_blocks(
-                                ctx,
-                                &mut cmd,
-                                &bufs.me_sad_buf,
-                                &bufs.mc_out,
-                                padded_w,
-                                padded_h,
-                                thr,
-                            );
-                        }
-                    }
+                    // NOTE: spatial-domain block skip (dispatch_zero_skip_blocks) was removed.
+                    // It zeroed mc_out BEFORE the wavelet transform, causing wavelet-filter
+                    // bleed from neighbouring non-skip tiles into the zeroed skip tile.
+                    // Correct approach: zero QUANTISED COEFFICIENTS after quantize (see below).
                     // Diagnostics: copy per-channel residual before wavelet overwrites mc_out
                     if let Some(ref stg) = diag_residual_staging {
                         cmd.copy_buffer_to_buffer(&bufs.mc_out, 0, &stg[p], 0, plane_size);
@@ -3516,15 +3496,61 @@ impl EncoderPipeline {
                 }
             }
 
-            // Skip mode: zero low-energy residual tiles before entropy encode.
-            // Tiles zeroed here produce compact all-skip RiceTiles (saves bpp with minimal quality loss).
-            // Local decode reads the same buffers, so zeroed tiles reconstruct as MC+0=MC. ✓
-            // NOTE: currently disabled (threshold=0.0) — requires skip-mode-aware ME first.
-            let skip_thr_444 = tile_skip_threshold(config.quantization_step);
-            if matches!(entropy_mode, EntropyMode::Rice) && !is_non_444 && skip_thr_444 > 0.0 {
-                let quant_bufs_444 = [&bufs.recon_y, &bufs.co_plane, &bufs.plane_b];
-                for qb in &quant_bufs_444 {
-                    self.dispatch_tile_skip(ctx, &mut cmd, qb, padded_w, padded_h, config.tile_size, skip_thr_444);
+            // Skip mode: zero quantised coefficient tiles for tiles flagged by tile_skip_motion.
+            // The skip map was written by dispatch_tile_skip_motion (earlier in this encoder).
+            // Zeroing AFTER quantize (not before wavelet) avoids wavelet-filter bleed.
+            // All-zero tiles → Rice encoder emits TILE_FLAG_ALL_SKIP (minimal bits).
+            // Decoder reconstructs skip tiles from MC prediction + 0 residual = MC pred. ✓
+            //
+            // For 4:4:4: all 3 planes have luma dims, so all 3 can be zeroed via the skip map.
+            // For non-444 (4:2:0/4:2:2): chroma coeff buffers are at chroma dims with a
+            // different tile grid than the luma skip map. To stay correct and simple, only
+            // zero luma (recon_y) for non-444. Chroma gains are secondary and zeroing chroma
+            // tiles at different tile granularity requires a separate map; defer to future work.
+            if matches!(entropy_mode, EntropyMode::Rice) {
+                // Always zero luma coefficients for skip tiles.
+                self.dispatch_zero_skip_tiles_by_map(
+                    ctx,
+                    &mut cmd,
+                    &bufs.tile_skip_map_buf,
+                    &bufs.recon_y,
+                    padded_w,
+                    padded_h,
+                    config.tile_size,
+                );
+                // For 4:4:4: also zero Co and Cg (same dims as luma).
+                if !is_non_444 {
+                    self.dispatch_zero_skip_tiles_by_map(
+                        ctx,
+                        &mut cmd,
+                        &bufs.tile_skip_map_buf,
+                        &bufs.co_plane,
+                        padded_w,
+                        padded_h,
+                        config.tile_size,
+                    );
+                    self.dispatch_zero_skip_tiles_by_map(
+                        ctx,
+                        &mut cmd,
+                        &bufs.tile_skip_map_buf,
+                        &bufs.plane_b,
+                        padded_w,
+                        padded_h,
+                        config.tile_size,
+                    );
+                }
+
+                // GNC_SKIP_DIAG: copy tile skip map to staging for CPU readback after submit.
+                if std::env::var_os("GNC_SKIP_DIAG").is_some() {
+                    let map_count = bufs.tile_skip_map_count;
+                    let map_bytes = (map_count as u64) * 4;
+                    cmd.copy_buffer_to_buffer(
+                        &bufs.tile_skip_map_buf,
+                        0,
+                        &bufs.tile_skip_map_staging,
+                        0,
+                        map_bytes,
+                    );
                 }
             }
 
@@ -3942,6 +3968,34 @@ impl EncoderPipeline {
             // === Submit the batched command encoder ===
             let _t_submit = std::time::Instant::now();
             ctx.queue.submit(Some(cmd.finish()));
+
+            // === GNC_SKIP_DIAG: tile skip diagnostic ===
+            // Reads the tile_skip_map_staging buffer copied in the main cmd encoder.
+            // Prints skip tile count per P-frame to confirm the skip code path is active.
+            if std::env::var_os("GNC_SKIP_DIAG").is_some()
+                && matches!(entropy_mode, EntropyMode::Rice)
+            {
+                let map_count = bufs.tile_skip_map_count;
+                let map_bytes = (map_count as u64) * 4;
+                let slice = bufs.tile_skip_map_staging.slice(..map_bytes);
+                slice.map_async(wgpu::MapMode::Read, |_| {});
+                ctx.device.poll(wgpu::Maintain::Wait);
+                let data = slice.get_mapped_range();
+                let skip_map: &[u32] = bytemuck::cast_slice(&data);
+                let skip_count: u32 = skip_map.iter().sum();
+                drop(data);
+                bufs.tile_skip_map_staging.unmap();
+                let tiles_x = padded_w / config.tile_size;
+                let tiles_y = padded_h / config.tile_size;
+                eprintln!(
+                    "[skip_diag] P-frame: skip_tiles={}/{} ({}×{} tile grid, threshold={:.2})",
+                    skip_count,
+                    map_count,
+                    tiles_x,
+                    tiles_y,
+                    tile_skip_motion_threshold(config.quantization_step),
+                );
+            }
 
             // === Block-size diagnostic (GNC_BLOCKSIZE_DIAG=1) ===
             // Reads sub_sad_buf + me_sad_buf written by the just-submitted estimate_split.

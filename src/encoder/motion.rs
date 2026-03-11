@@ -111,9 +111,6 @@ pub struct MotionEstimator {
     /// Pyramid ME: spread pyramid MVs (scaled ×4) to full-resolution predictor buffer.
     mv_spread_4x_pipeline: wgpu::ComputePipeline,
     mv_spread_4x_bgl: wgpu::BindGroupLayout,
-    /// Skip-mode: zero residual pixels for 16×16 blocks whose SAD < threshold.
-    zero_skip_blocks_pipeline: wgpu::ComputePipeline,
-    zero_skip_blocks_bgl: wgpu::BindGroupLayout,
 }
 
 impl MotionEstimator {
@@ -503,42 +500,6 @@ impl MotionEstimator {
                     cache: None,
                 });
 
-        // --- Zero-skip blocks: zero MC residual pixels for 16×16 blocks below SAD threshold ---
-        let zero_skip_blocks_shader =
-            ctx.device
-                .create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some("zero_skip_blocks"),
-                    source: wgpu::ShaderSource::Wgsl(
-                        include_str!("../shaders/zero_skip_blocks.wgsl").into(),
-                    ),
-                });
-
-        let zero_skip_blocks_bgl =
-            ctx.device
-                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                    label: Some("zero_skip_blocks_bgl"),
-                    entries: &[bgl_uniform(0), bgl_storage_ro(1), bgl_storage_rw(2)],
-                });
-
-        let zero_skip_blocks_pl =
-            ctx.device
-                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("zero_skip_blocks_pl"),
-                    bind_group_layouts: &[&zero_skip_blocks_bgl],
-                    push_constant_ranges: &[],
-                });
-
-        let zero_skip_blocks_pipeline =
-            ctx.device
-                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some("zero_skip_blocks_pipeline"),
-                    layout: Some(&zero_skip_blocks_pl),
-                    module: &zero_skip_blocks_shader,
-                    entry_point: Some("main"),
-                    compilation_options: Default::default(),
-                    cache: None,
-                });
-
         Self {
             match_pipeline,
             match_bgl,
@@ -558,8 +519,6 @@ impl MotionEstimator {
             downsample_4x_bgl,
             mv_spread_4x_pipeline,
             mv_spread_4x_bgl,
-            zero_skip_blocks_pipeline,
-            zero_skip_blocks_bgl,
         }
     }
 
@@ -2192,88 +2151,6 @@ impl MotionEstimator {
             pass.set_bind_group(0, &bg, &[]);
             pass.dispatch_workgroups(workgroups, 1, 1);
         }
-    }
-
-    /// Zero residual pixels in `mc_out` for every 16×16 block whose SAD (from `sad_buf`)
-    /// is below `skip_threshold`.
-    ///
-    /// Skip-mode residual pass: if the MC prediction is already very close to the original
-    /// (low SAD), zeroing the residual lets the wavelet + Rice encoder produce near-zero
-    /// coefficient runs at minimal quality cost.
-    ///
-    /// Call after `compensate_cached` (luma plane, p=0) and before the wavelet transform.
-    #[allow(clippy::too_many_arguments)]
-    pub fn dispatch_zero_skip_blocks(
-        &self,
-        ctx: &GpuContext,
-        cmd: &mut wgpu::CommandEncoder,
-        sad_buf: &wgpu::Buffer,
-        mc_out: &wgpu::Buffer,
-        padded_w: u32,
-        padded_h: u32,
-        skip_threshold: u32,
-    ) {
-        #[repr(C)]
-        #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-        struct ZeroSkipParams {
-            padded_w: u32,
-            padded_h: u32,
-            blocks_x: u32,
-            total_pixels: u32,
-            skip_threshold: u32,
-            _pad0: u32,
-            _pad1: u32,
-            _pad2: u32,
-        }
-
-        let blocks_x = padded_w / ME_BLOCK_SIZE;
-        let total_pixels = padded_w * padded_h;
-        let params = ZeroSkipParams {
-            padded_w,
-            padded_h,
-            blocks_x,
-            total_pixels,
-            skip_threshold,
-            _pad0: 0,
-            _pad1: 0,
-            _pad2: 0,
-        };
-
-        let params_buf = ctx
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("zero_skip_params"),
-                contents: bytemuck::bytes_of(&params),
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
-
-        let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("zero_skip_bg"),
-            layout: &self.zero_skip_blocks_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: params_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: sad_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: mc_out.as_entire_binding(),
-                },
-            ],
-        });
-
-        let workgroups = total_pixels.div_ceil(256);
-        let mut pass = cmd.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("zero_skip_blocks_pass"),
-            timestamp_writes: None,
-        });
-        pass.set_pipeline(&self.zero_skip_blocks_pipeline);
-        pass.set_bind_group(0, &bg, &[]);
-        pass.dispatch_workgroups(workgroups, 1, 1);
     }
 
     /// Dispatch 4× average downscale of a luma plane (pyramid ME stage 1).

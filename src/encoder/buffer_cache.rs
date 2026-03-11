@@ -149,6 +149,16 @@ pub(super) struct CachedEncodeBuffers {
     pub(super) me_params_pyr_nopred: wgpu::Buffer,
     /// Params for full-res fine search with pyramid predictor (PYRAMID_PRED_FINE_RANGE).
     pub(super) me_params_pyramid_pred: wgpu::Buffer,
+
+    // --- Tile skip map (per-tile skip decisions from tile_skip_motion shader) ---
+    /// Per-tile skip decision map: tiles_x × tiles_y × u32.
+    /// Written by tile_skip_motion.wgsl (binding 4); read by zero_skip_tiles_by_map.wgsl.
+    /// Stays on GPU between tile_skip_motion dispatch and zero_skip_tiles_by_map dispatch.
+    pub(super) tile_skip_map_buf: wgpu::Buffer,
+    /// Tiles count stored here for sizing reference (tiles_x × tiles_y).
+    pub(super) tile_skip_map_count: u32,
+    /// Staging buffer for GNC_SKIP_DIAG readback (MAP_READ | COPY_DST, same size).
+    pub(super) tile_skip_map_staging: wgpu::Buffer,
 }
 
 /// Cached GPU buffers for temporal wavelet GOP encoding.
@@ -854,6 +864,43 @@ impl CachedEncodeBuffers {
                 true,
                 ME_PYRAMID_PRED_FINE_RANGE,
             ),
+
+            // Tile skip map: one u32 per tile at tile_size=256 grid.
+            // Written by tile_skip_motion.wgsl; read by zero_skip_tiles_by_map.wgsl.
+            // tile_skip_map_buf is sized for 256px tiles; update if tile_size becomes configurable.
+            tile_skip_map_buf: {
+                // TILE_SIZE must match the value used in dispatch_tile_skip_motion (always 256
+                // in production; see CodecConfig::tile_size default). If tile_size ever becomes
+                // runtime-variable, pass it as a parameter here and propagate through ensure_cached.
+                const TILE_SIZE: u32 = 256;
+                let tiles_x = orig_w.div_ceil(TILE_SIZE);
+                let tiles_y = orig_h.div_ceil(TILE_SIZE);
+                let count = tiles_x * tiles_y;
+                ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("enc_tile_skip_map"),
+                    size: (count as u64 * 4).max(4),
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: false,
+                })
+            },
+            tile_skip_map_count: {
+                const TILE_SIZE: u32 = 256;
+                let tiles_x = orig_w.div_ceil(TILE_SIZE);
+                let tiles_y = orig_h.div_ceil(TILE_SIZE);
+                tiles_x * tiles_y
+            },
+            tile_skip_map_staging: {
+                const TILE_SIZE: u32 = 256;
+                let tiles_x = orig_w.div_ceil(TILE_SIZE);
+                let tiles_y = orig_h.div_ceil(TILE_SIZE);
+                let count = tiles_x * tiles_y;
+                ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("enc_tile_skip_map_staging"),
+                    size: (count as u64 * 4).max(4),
+                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                })
+            },
         }
     }
 

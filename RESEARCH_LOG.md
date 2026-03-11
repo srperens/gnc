@@ -3118,3 +3118,100 @@ Changed default in `quality_preset()` from `SubbandWeights::perceptual()` to `Su
 
 Golden baselines in `tests/golden_baselines.toml` updated via `update_golden_baselines` ignored test.
 All 168 tests pass, zero clippy warnings.
+
+## Mätkampanj del 13 — Nollmätning med uniforma vikter vs H.264 och JPEG 2000 (2026-03-11)
+
+### Syfte
+Med de nya uniforma subband-vikterna: var står GNC egentligen jämfört med state-of-the-art?
+Tidigare siffra (+171–216% vs H.264) var jämförelse GNC all-I vs H.264 med full inter-prediktion — inte rättvisande för spatial kodarjämförelse.
+
+### Metodologi
+- **GNC 4:2:0**: `benchmark` med `--chroma-format 420`, q=20–90
+- **GNC 4:4:4**: `benchmark` med `--chroma-format 444`, q=20–90
+- **H.264 all-I**: ffmpeg libx264 `-g 1 -crf X -pix_fmt yuv420p`, CRF=10–48
+- **JPEG 2000**: OpenJPEG 2.x `opj_compress`, RGB-läge (4:4:4), ratio=5–250
+- PSNR mätt som RGB PSNR (ffmpeg psnr-filter, average av R/G/B)
+- Testbild: bbb_1080p.png, 1920×1080
+
+### RD-data bbb_1080p
+
+**GNC 4:2:0:**
+| q  | PSNR    | BPP  |
+|----|---------|------|
+| 20 | 32.20 dB | 1.09 |
+| 30 | 33.67 dB | 1.43 |
+| 40 | 34.88 dB | 1.81 |
+| 50 | 35.96 dB | 2.08 |
+| 60 | 36.75 dB | 2.58 |
+| 70 | 37.02 dB | 3.10 |
+| 75 | 37.21 dB | 3.37 |
+| 80 | 37.50 dB | 3.98 |
+| 90 | 38.42 dB | 5.30 |
+
+**H.264 all-I (libx264, yuv420p):**
+| CRF | PSNR    | BPP  |
+|-----|---------|------|
+|  48 | 25.12 dB | 0.09 |
+|  42 | 27.35 dB | 0.18 |
+|  37 | 29.38 dB | 0.33 |
+|  32 | 31.47 dB | 0.58 |
+|  28 | 33.05 dB | 0.90 |
+|  23 | 34.76 dB | 1.49 |
+|  20 | 35.54 dB | 1.97 |
+|  15 | 36.35 dB | 3.00 |
+|  10 | 36.72 dB | 4.30 |
+
+**JPEG 2000 (OpenJPEG, RGB 4:4:4):**
+| ratio | PSNR    | BPP  |
+|-------|---------|------|
+|   250 | 25.89 dB | 0.10 |
+|   150 | 27.42 dB | 0.16 |
+|    80 | 29.44 dB | 0.30 |
+|    50 | 31.32 dB | 0.48 |
+|    30 | 33.68 dB | 0.80 |
+|    20 | 35.82 dB | 1.20 |
+|    15 | 37.60 dB | 1.60 |
+|    10 | 40.21 dB | 2.40 |
+|     8 | 41.89 dB | 3.00 |
+|     5 | 45.55 dB | 4.80 |
+
+### BD-rate (bbb_1080p, spatial/I-frame)
+
+| Jämförelse                              | BD-rate |
+|-----------------------------------------|---------|
+| GNC 4:2:0 vs H.264 all-I 4:2:0         | **+13.9%** |
+| GNC 4:4:4 vs JPEG 2000 RGB             | **+28.3%** |
+| JPEG 2000 RGB vs H.264 all-I 4:2:0     | −24.0% (J2K 4:4:4 vs H264 4:2:0 = inte rättvist) |
+
+### Punkt-jämförelse (interpolerade BPP vid lika PSNR)
+
+| PSNR | GNC 4:2:0 | H.264 all-I | GNC 4:4:4 | J2K RGB | GNC420/H264 | GNC444/J2K |
+|------|-----------|-------------|-----------|---------|-------------|------------|
+| 33 dB | 1.26 | 0.89 | — | 0.69 | **1.42×** | — |
+| 34 dB | 1.53 | 1.19 | — | 0.85 | **1.28×** | — |
+| 35 dB | 1.84 | 1.63 | 1.78 | 1.03 | **1.13×** | **1.74×** |
+| 36 dB | 2.10 | 2.50 | 2.02 | 1.24 | **0.84×** | **1.63×** |
+| 37 dB | — | — | 2.19 | 1.45 | — | **1.51×** |
+| 38 dB | — | — | 2.34 | 1.70 | — | **1.37×** |
+| 40 dB | — | — | 2.72 | 2.32 | — | **1.17×** |
+| 42 dB | — | — | 3.38 | 3.04 | — | **1.11×** |
+| 44 dB | — | — | 4.36 | 3.93 | — | **1.11×** |
+
+### Slutsatser
+
+**GNC vs H.264 all-I (4:2:0):**
+- BD-rate: +13.9% — inte +171%. Den gamla siffran jämförde all-I GNC mot H.264 MED inter-prediktion.
+- Korsningspunkt ~36 dB: under = H.264 vinner, över = GNC vinner.
+- Vid hög kvalitet (>36 dB) är GNC mer effektivt än H.264 all-I.
+- Det förblir gapet mot H.264 med full inter-prediktion (~5–17% bpp besparing från inter) = temporalt gap.
+
+**GNC vs JPEG 2000 (4:4:4 rättvis jämförelse):**
+- BD-rate: +28.3% — inte +92%. Den höga siffran berodde på blandade chroma-format.
+- Vid hög kvalitet (42–44 dB) krymper gapet till ~11%.
+- Restgap 28% = EBCOT-kontextkodning (~5–8%) + PCRD-bitallokering (~10–15%) + överliggande subband-struktur.
+- PCRD ej tillgängligt med Rice (kräver trunkerbara aritmetiska koder).
+
+**Vad är kvar att lösa för spatial-kompetens (närmast JPEG 2000):**
+1. Kontextkodning — förälder-barn-prediktering av k-parameter (estimerat +0.1–0.2 bpp) — redan implementerat (#53)
+2. Per-tile bitallokering (PCRD-proxy) — kräver mjukare komprimeringsmodell — svårt med Rice
+3. Bättre subband-energidekorrellation — beror på wavelet-filtrens design

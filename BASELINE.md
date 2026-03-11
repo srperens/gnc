@@ -1,8 +1,8 @@
 # GNC Benchmark Baseline
 
-Last updated: 2026-03-10
-Baseline commit: (pyramid ME + B₄-as-P forward-only — #24 + #49 done)
-Mode: Spatial-only, I+P+B, Rice entropy, ki=9, 7B-per-group pyramid
+Last updated: 2026-03-11
+Baseline commit: (#64 layer-3 pyramid QP scale 1.5× — leaf B-frames only)
+Mode: Spatial-only, I+P+B, Rice entropy, ki=9, 7B-per-group pyramid, L3_QP_SCALE=1.5
 
 ## Single-Frame (bbb_1080p, Rice, 4:4:4)
 
@@ -15,11 +15,11 @@ Mode: Spatial-only, I+P+B, Rice entropy, ki=9, 7B-per-group pyramid
 
 ## Sequence Benchmarks (I+P+B, q=75, ki=9, 10 frames, 4:4:4)
 
-| sequence   | bpp  | PSNR avg | VMAF  | notes                                  |
-|------------|------|----------|-------|----------------------------------------|
-| crowd_run  | 6.02 | 38.57 dB | 99.13 | B₄-as-P forward-only #49 (pre: 6.00)  |
-| park_joy   | 4.74 | ~39.3 dB | 99.14 | B₄-as-P forward-only #49 (pre: 4.75)  |
-| bbb        | —    | —        | —     | Y4M too short (8 frames) for ki=9      |
+| sequence   | bpp  | PSNR avg | VMAF  | notes                                           |
+|------------|------|----------|-------|-------------------------------------------------|
+| crowd_run  | 5.34 | 38.29 dB | 99.12 | #64 L3 QP scale 1.5× (pre: 6.00 bpp, 99.13)   |
+| park_joy   | 4.22 | ~38.8 dB | 99.12 | #64 L3 QP scale 1.5× (pre: 4.71 bpp, 99.14)   |
+| bbb        | —    | —        | —     | Y4M too short (8 frames) for ki=9               |
 
 ## Regression Rules
 

@@ -980,12 +980,25 @@ impl EncoderPipeline {
                             _ => {}
                         }
                     }
-                    let b_config = if let Some(ref rc) = rate_ctrl {
-                        let mut cfg = config.clone();
-                        cfg.quantization_step = rc.estimate_qstep();
+                    // Layer-3 B-frames are leaf nodes (never used as references).
+                    // Apply QP scale to reduce their size; decoder reads qstep from frame header.
+                    // Layer-3 leaf B-frames (B₁,B₃,B₅,B₇) are never used as references.
+                    // Default 1.5× matches H.264 QP+4 practice for inner B-frames.
+                    // Disable with GNC_PYRAMID_L3_QP_SCALE=1.0.
+                    let l3_qp_scale: f32 = std::env::var("GNC_PYRAMID_L3_QP_SCALE")
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(1.5_f32);
+                    let b_config = {
+                        let mut cfg = if let Some(ref rc) = rate_ctrl {
+                            let mut c = config.clone();
+                            c.quantization_step = rc.estimate_qstep();
+                            c
+                        } else {
+                            config.clone()
+                        };
+                        cfg.quantization_step = (cfg.quantization_step * l3_qp_scale).min(64.0);
                         cfg
-                    } else {
-                        config.clone()
                     };
                     let b_frame_data = load_frame(b_display);
                     let (mut compressed, fwd_mv, bwd_mv, _) = self.encode_bframe(
@@ -1010,8 +1023,8 @@ impl EncoderPipeline {
                         }
                         if std::env::var("GNC_BFRAME_PYRAMID").is_ok() {
                             eprintln!(
-                                "[pyramid_b] Frame {} (display) layer=3 fwd_ref={} bwd_ref={}",
-                                b_display, fwd_idx, bwd_idx
+                                "[pyramid_b] Frame {} (display) layer=3 fwd_ref={} bwd_ref={} qstep={:.2} (l3_scale={:.2}x)",
+                                b_display, fwd_idx, bwd_idx, b_config.quantization_step, l3_qp_scale
                             );
                         }
                     }

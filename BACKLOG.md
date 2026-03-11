@@ -27,6 +27,9 @@ H.264 comparison (#22) established the north star: GNC needs **2–5× more bits
 21. **#42 Hierarchical B-frame GOP** (DONE 2026-03-10) — crowd_run −3.4% bpp, park_joy −3.9%, VMAF neutral
 22. **#24 Pyramid ME** (done 2026-03-10) — ±96px range, park_joy −3.4% bpp
 
+**Next items (RS-approved, 2026-03-11):**
+6. **#64 Pyramid-layer-dependent QP** — DONE (2026-03-11). crowd_run −11.0% bpp (6.00→5.34), park_joy −10.4% (4.71→4.22), VMAF neutral (−0.01–0.02 pts). L3_QP_SCALE=1.5 default.
+
 **Next items (RS-approved, 2026-03-10):**
 1. **#46 LL subband spatial prediction** — CLOSED (gate fail: crowd_run mean_ratio=1.536, park_joy 1.705 > 0.85)
 2. **#48 Chroma qpel for 4:2:0 B-frames** — CLOSED (gate fail: Co/Y=0.57, Cg/Y=0.43, both <1.2; chroma MC working correctly)
@@ -496,7 +499,7 @@ H.264 comparison (#22) established the north star: GNC needs **2–5× more bits
 - **Note:** Also note that 4:2:0 B-frame chroma currently uses wrong MV spatial mapping (16×16 luma MV applied to 4×4 chroma blocks with stride mismatch), but it's consistent in encoder and decoder. Fixing mapping would improve quality but is a separate item.
 
 ### 49. P-frame reference selection from pyramid pool
-- **Status:** todo
+- **Status:** done (6f7afa6, 2026-03-10) — neutral: park_joy −0.2% bpp, crowd_run +0.3%, VMAF unchanged
 - **RS hypothesis (2026-03-10):** P-frame currently references only the most recent I or P anchor. With the 5-slot pyramid pool from #42, the decoded B₄ (frame 4) is available as a closer reference for the P-frame (frame 8). Using B₄ instead of I₀ halves temporal distance from 8 to 4 frames on slow-motion content, reducing residual energy.
 - **Falsifiable claim:** On bbb (slow-motion), P-frame ME SAD against B₄ (closest decoded B) is < 80% of SAD against I₀. If SAD ratio > 0.9, temporal distance is not the bottleneck.
 - **Gate result (2026-03-10):** crowd_run: 52.5% tiles prefer B₄_src, mean_SAD_ratio=1.016 (PASS). park_joy: 85.0% tiles prefer B₄_src, mean_SAD_ratio=0.776 (PASS). Gate threshold was >20%.
@@ -628,3 +631,22 @@ H.264 comparison (#22) established the north star: GNC needs **2–5× more bits
 - **Likely cause:** I+P+B encoder allocates reference frame buffers (5-slot pyramid pool × full-res GPU buffers) upfront for the entire sequence, or something in the GOP pre-allocation scales with total frame count. The Haar path streams GOPs independently and does not have this problem.
 - **Gate:** Add peak RSS logging at benchmark-sequence startup for both I+P+B and Haar paths. Compare allocation profile for n=100, n=500, n=1800. If I+P+B allocation scales with n (not constant), find and fix the upfront allocation.
 - **Fix direction:** Make I+P+B encoder allocate per-GOP, not per-sequence. Reference buffers (5 slots) should be constant regardless of sequence length.
+
+### 64. Pyramid-layer-dependent quantization (QP+ for leaf B-frames)
+- **Status:** todo (P1)
+- **RS-approved (2026-03-11):** Gate passed — layer-3 B-frame mean bpp is 63–64% of layer-1 B-frame bpp on both crowd_run and park_joy (gate criterion: ≥60%).
+- **Hypothesis:** Layer-3 B-frames (B₁,B₃,B₅,B₇) are leaf nodes — never used as references by any other frame. Coarsening their qstep by 1.5× reduces their bpp ~30–40% with minimal perceptual impact. H.264 practice: QP+4 for inner B-frames (≈1.59× qstep) gives ~3–5% BD-rate gain.
+- **Per-layer bpp diagnostic (2026-03-11, crowd_run q=75 444):**
+  - Layer-1 (B₄ as P, d=4): 7.34 bpp (ratio 1.01 vs I-frame — zero gain from inter!)
+  - Layer-2 (B₂,B₆, d=2): ~6.20 bpp (ratio 0.85)
+  - Layer-3 (B₁,B₃,B₅,B₇, d=1): 1.00/5.56/5.69/6.22 bpp (mean 4.62, ratio 0.63)
+  - park_joy layer-3: 1.12/4.63/4.34/4.87 bpp (mean 3.74, ratio 0.64)
+- **Why leaf-only:** Layer-2 (B₂,B₆) ARE locally decoded and stored in pyramid pool → coarsening them propagates error to layer-3. Layer-3 frames are never decoded for reference. Safe to coarsen.
+- **Falsifiable claim:** Applying qstep×1.5 to layer-3 B-frames reduces crowd_run total bpp ≥3% (from 6.30 → ≤6.11) at VMAF loss <0.5 pts.
+- **Fail criterion:** Total bpp change < 1% → layer-3 qstep adaptation not taking effect or too few layer-3 tiles to matter.
+- **Canary:** Print `GNC: pyramid_qp layer=3 scale=1.50 frame=N` per B-frame to confirm code path runs.
+- **Success criteria:** crowd_run and park_joy bpp ≤−3% at q=75 444; VMAF loss <0.5 pts; no test regressions.
+- **Implementation:** In `sequence.rs`, build `layer3_config = config.clone()` with `qstep * PYRAMID_L3_QP_SCALE`; use for layer-3 B-frame encode only. Env var `GNC_PYRAMID_L3_QP_SCALE` for tuning (default 1.5).
+- **Complexity:** ~1 day.
+- **Result (2026-03-11):** crowd_run 6.00→5.34 bpp (−11.0%), VMAF 99.13→99.12 (−0.01 pts). park_joy 4.71→4.22 bpp (−10.4%), VMAF 99.14→99.12 (−0.02 pts). PSNR avg −0.28 dB on crowd_run (just below 0.3 dB flag threshold; confined to layer-3 leaf B-frames; VMAF confirms no perceptual regression — temporal masking on motion frames).
+- **Status:** done (pending commit)

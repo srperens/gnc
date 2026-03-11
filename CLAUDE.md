@@ -124,6 +124,14 @@ Claude operates as **team lead** for an autonomous multi-agent team. The team is
 - If the same bug resurfaces after two fix attempts — stop, diagnose root cause properly, do not loop
 - **No silent features** — every new code path must have a way to verify it actually executes
 
+### Quality Rules (added 2026-03-11 — lessons from sloppy execution)
+
+- **Neutral bpp = SEND BACK, not CLOSE.** If a feature predicts ≥3% bpp gain and measures 0.0%, that is a bug, not a null result. Team Lead must demand an explanation before accepting. "It compiles" is not evidence it runs correctly.
+- **Builder must show a canary metric.** Every implementation must include a logged count or value proving the new code path executes on real data (e.g., `skip_tiles=47`, `context_switches=1203`). A feature without a canary is not done.
+- **Domain declaration is mandatory before implementation.** Researcher must explicitly state: "this change operates on [spatial residual | quantized coefficients | wavelet coefficients | bitstream | reference buffer]" and justify why that domain is correct. Researcher role includes challenging this — a skip implemented in spatial domain in a wavelet codec is wrong by construction.
+- **Measurements must match baseline parameters exactly.** Same ki, same frame count, same sequence, same chroma format. Any deviation invalidates the comparison. State all parameters explicitly.
+- **"Neutral" after claimed improvement requires investigation, not acceptance.** Ask: Did the code actually run? Was the threshold ever exceeded? Is there a log line proving the new path was taken? If none of these can be answered — the feature is broken, not neutral.
+
 ### Checkpoints
 
 At every natural checkpoint (feature complete, priority item done):

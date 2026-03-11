@@ -241,7 +241,7 @@ H.264 comparison (#22) established the north star: GNC needs **2–5× more bits
   - H.264 intra-only is NOT the right comparison (we have B-frames). Use `-g 250 -bf 7` or similar for H.264 video mode.
   - Prior (incorrect) comparison used rANS + intra-only + 4:4:4 — discard those numbers.
 - **Result (2026-03-09, park_joy):** BD-rate +171–216%. GNC 2–5× bpp vs H.264 at same PSNR. See RESEARCH_LOG.md for full table.
-- **Key finding:** The gap is NOT entropy. Temporal prediction efficiency is the dominant bottleneck — P/B saves only ~3% vs all-I on high-motion content. Entropy improvements are secondary. Focus backlog on better motion compensation and temporal lifting.
+- **Key finding (revised 2026-03-11):** The "P/B saves only ~3% vs all-I" note was INCORRECT — measured with P-only (no B-frames). Corrected: crowd_run all-I (ki=1) = 7.28 bpp vs ki=9 with B-frames = 6.00 bpp → inter saves **17.7%**. rush_hour all-I = 1.96 bpp, ki=9 = 1.85 bpp → **5.5%**. H.264 saves ~60–70% on same content. The real gap: GNC inter is ~3–4× less efficient than H.264. Both temporal prediction AND entropy coding have room for improvement, but temporal prediction has the larger ceiling (potential 30–40 pp improvement vs ~2–3 pp for entropy).
 - **Status:** done (measurement complete; used as north star for compression priorities)
 
 ### 23. Skip/merge modes — suppress residual for flat/matched regions
@@ -528,14 +528,12 @@ H.264 comparison (#22) established the north star: GNC needs **2–5× more bits
 - **Complexity:** 1–2 days. No bitstream change needed if alpha is fixed (baked in). Minor if alpha is signaled per subband.
 
 ### 53. Within-tile significance context coding
-- **Status:** todo
-- **Motivation:** GNC's Rice entropy codes the significance bit (zero or not) with a flat 1-bit cost per coefficient. JPEG 2000/EBCOT uses a 3×3 spatial neighborhood context within each subband to predict significance probability. Coefficients near other significant coefficients are more likely to be significant. Context-adaptive coding of the significance map can save ~0.2–0.5 bpp.
-- **Falsifiable claim:** A 3×3 significance context within each tile subband has conditional entropy < 0.85 bits/coefficient on bbb q=75 (vs current 1 bit flat). If conditional entropy ≥ 0.95 bits, context gives negligible benefit → close.
-- **Gate:** Add diagnostic: compute actual conditional entropy of significance bits given 3×3 neighborhood context on bbb/park_joy. Gate threshold: conditional entropy < 0.85 bits/sig bit → proceed.
-- **Implementation:** Change significance map encoder from flat 1-bit to context-adaptive (4–8 context states → lookup table). Requires sequential scan order within tile workgroup — breaks 256-stream parallel model. May need architecture change in Rice encoder.
-- **Success criteria:** bpp −3% at VMAF neutral on bbb q=75.
-- **Complexity:** 4–5 days. Possible architecture change in entropy core.
-- **Note:** Higher risk than #51/#52 due to parallelism impact. Run #51 and #52 first.
+- **Status:** gate PASSED (2026-03-11) — queued behind skip mode (#59 correct impl)
+- **Revised approach:** Above-neighbor context only (3×3 VETO'd — breaks 256-stream model). Above-neighbor = previous symbol in same Rice stream (same column, row-1) → within-stream, no architecture change.
+- **Gate results (2026-03-11, q=75 I-frame):** crowd_run H_above=0.823 (+0.42 bpp potential), park_joy H_above=0.703 (+0.51 bpp), rush_hour H_above=0.405 (+0.16 bpp). 2/3 pass H<0.80. Diagnostic committed 183e1c5 (GNC_SIG_CONTEXT=1).
+- **Implementation:** 2-state k_zrl context: k_zrl_after_nonzero vs k_zrl_after_zero per subband. Both states EMA-tracked per stream. 256-stream independence preserved. Bitstream change: 2× k tables per subband instead of 1×. No decoder architecture change.
+- **Success criteria:** bpp −3% on crowd_run q=75 at VMAF neutral; validated on park_joy + rush_hour.
+- **Complexity:** 2–3 days. Rice encoder + decoder shader changes only.
 
 ### 54. Quarter-pel ME for B-frames
 - **Status:** closed (gate fail — already qpel)
@@ -592,7 +590,7 @@ H.264 comparison (#22) established the north star: GNC needs **2–5× more bits
 - **Design work required:** Before implementing resolution scaling, the team needs a general design document and explicit coding rules around pixel-absolute vs resolution-relative parameters. Every threshold, block size, search range, and energy value in the pipeline that is expressed in pixels is implicitly a 1080p assumption. This includes #59 (SAD threshold), #60 (block sizes, λ), ME search range, AQ energy map granularité, pyramid downsampling ratios, and any future parameters. The design document should establish: (1) which parameters are pixel-absolute by necessity (tile size — hardware), (2) which must be expressed relative to resolution (`width/1920` scale factor), (3) which should be per-pixel normalized (SAD, distortion, λ), and (4) a naming/commenting convention so future code makes the assumption explicit. This should be written before any 4K implementation work begins.
 
 ### 60. Adaptive block-size ME with RD selection
-- **Status:** active (gate PASSED 2026-03-11 — implementation approved by Team Lead)
+- **Status:** done (01cd639, 2026-03-11 — neutral bpp, HBAND 25-33% chosen, no regression)
 - **Gate result (2026-03-11):** GNC_BLOCKSIZE_DIAG diagnostic on 100 P-frames at q=75:
   - crowd_run 444: 16×16=67.1%, sub-16×16=32.9% → < 80% → PROCEED
   - park_joy 444: 16×16=76.0%, sub-16×16=24.0% → < 80% → PROCEED

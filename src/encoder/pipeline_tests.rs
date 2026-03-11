@@ -3142,13 +3142,16 @@ fn test_10bit_roundtrip() {
     let w = 256u32;
     let h = 256u32;
 
-    // Generate a synthetic 10-bit frame: smooth gradient with values in [0, 1023].
+    // Synthetic 10-bit frame: integer values in [0, 1023].
+    // Using values that are exact multiples of qstep (1.0) so they survive quantization
+    // and we can do pixel-exact comparison on the decode_u8 path.
     let mut frame: Vec<f32> = Vec::with_capacity((w * h * 3) as usize);
     for y in 0..h {
         for x in 0..w {
-            let r = (x as f32 / w as f32 * 1023.0).clamp(0.0, 1023.0);
-            let g = (y as f32 / h as f32 * 1023.0).clamp(0.0, 1023.0);
-            let b = ((x + y) as f32 / (w + h) as f32 * 1023.0).clamp(0.0, 1023.0);
+            // Vary all three channels across the 10-bit range (0..1023)
+            let r = (x * 4) as f32; // 0, 4, 8, ..., 1020
+            let g = (y * 4) as f32;
+            let b = ((x + y) % 256 * 4) as f32;
             frame.push(r);
             frame.push(g);
             frame.push(b);
@@ -3157,7 +3160,7 @@ fn test_10bit_roundtrip() {
 
     let mut config = CodecConfig::default();
     config.tile_size = 256;
-    config.quantization_step = 4.0;
+    config.quantization_step = 1.0; // near-lossless so pixel-exact comparison is valid
     config.keyframe_interval = 1;
     config.temporal_transform = TemporalTransform::None;
     config.cfl_enabled = false;
@@ -3165,38 +3168,52 @@ fn test_10bit_roundtrip() {
 
     let compressed = enc.encode(&ctx, &frame, w, h, &config);
 
-    // Verify bit_depth was stored in the compressed frame header
     assert_eq!(
         compressed.info.bit_depth, 10,
         "compressed frame should record bit_depth=10"
     );
 
-    let decoded = dec.decode(&ctx, &compressed);
+    // --- Test f32 decode path ---
+    let decoded_f32 = dec.decode(&ctx, &compressed);
+    assert_eq!(decoded_f32.len(), (w * h * 3) as usize, "f32 decoded length mismatch");
 
-    // Check output length matches
-    assert_eq!(
-        decoded.len(),
-        (w * h * 3) as usize,
-        "decoded length mismatch"
-    );
-
-    // Verify decoded values are in 10-bit range [0, 1023], NOT clipped to [0, 255]
-    let max_val = decoded
-        .iter()
-        .cloned()
-        .fold(f32::NEG_INFINITY, f32::max);
+    let max_val = decoded_f32.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     assert!(
         max_val > 255.0,
-        "decoded max value {max_val:.1} is ≤ 255: values appear clipped to 8-bit range"
+        "f32 decoded max value {max_val:.1} is ≤ 255: values appear clipped to 8-bit range"
     );
 
-    // Compute PSNR with 10-bit peak (1023)
-    let psnr = compute_psnr_peak(&frame, &decoded, 1023.0);
-    eprintln!("10-bit roundtrip PSNR: {psnr:.2} dB (peak=1023)");
-    assert!(
-        psnr > 30.0,
-        "10-bit roundtrip PSNR too low: {psnr:.2} dB (expected > 30 dB)"
+    let psnr = compute_psnr_peak(&frame, &decoded_f32, 1023.0);
+    eprintln!("10-bit roundtrip PSNR (f32): {psnr:.2} dB (peak=1023)");
+    assert!(psnr > 40.0, "10-bit roundtrip PSNR too low: {psnr:.2} dB");
+
+    // --- Test decode_u8 path (pack_u16 shader for 10-bit) ---
+    // For bit_depth>8, decode_u8 returns 2 bytes per component (little-endian u16).
+    let decoded_bytes = dec.decode_u8(&ctx, &compressed);
+    let expected_byte_count = (w * h * 3 * 2) as usize; // 2 bytes/component for 10-bit
+    assert_eq!(
+        decoded_bytes.len(),
+        expected_byte_count,
+        "decode_u8 returned {} bytes for 10-bit (expected {})",
+        decoded_bytes.len(),
+        expected_byte_count,
     );
+
+    // Interpret as u16 little-endian and compare against f32 decode
+    let mut max_pixel_error = 0u16;
+    for i in 0..(w * h * 3) as usize {
+        let lo = decoded_bytes[i * 2] as u16;
+        let hi = decoded_bytes[i * 2 + 1] as u16;
+        let packed_val = lo | (hi << 8);
+        let f32_val = decoded_f32[i].round().clamp(0.0, 1023.0) as u16;
+        let err = packed_val.abs_diff(f32_val);
+        max_pixel_error = max_pixel_error.max(err);
+    }
+    assert!(
+        max_pixel_error <= 1,
+        "decode_u8 10-bit values differ from f32 decode by up to {max_pixel_error} (expected ≤1)"
+    );
+    eprintln!("10-bit decode_u8 max pixel error vs f32: {max_pixel_error}");
 }
 
 // ---------------------------------------------------------------------------

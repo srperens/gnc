@@ -205,13 +205,13 @@ impl CachedBuffers {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
-        // Packed u8 output: ceil(total_f32s / 4) u32s
+        // Packed output buffer: allocated at worst-case size for 10-bit output
+        // (2 bytes per component). 8-bit uses only half this space (1 byte per component).
         let total_f32s = output_pixels * 3;
-        let packed_u32s = total_f32s.div_ceil(4) as u64;
-        let packed_byte_size = packed_u32s * 4;
+        let packed_byte_size_worst = (total_f32s as u64) * 2; // 10-bit: 2 bytes/component
         let packed_u8_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("dec_packed_u8"),
-            size: packed_byte_size,
+            size: packed_byte_size_worst,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
@@ -223,7 +223,7 @@ impl CachedBuffers {
         });
         let staging_u8 = ctx.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("dec_staging_u8"),
-            size: packed_byte_size,
+            size: packed_byte_size_worst,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });

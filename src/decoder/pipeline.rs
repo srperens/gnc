@@ -53,13 +53,16 @@ pub struct DecoderPipeline {
     pub(super) chroma_down: ChromaResampler,
     pub(super) crop_pipeline: wgpu::ComputePipeline,
     pub(super) crop_bgl: wgpu::BindGroupLayout,
-    pub(super) pack_pipeline: wgpu::ComputePipeline,
+    pub(super) pack_pipeline: wgpu::ComputePipeline,    // 8-bit: 4 components per u32
+    pub(super) pack_u16_pipeline: wgpu::ComputePipeline, // 10/16-bit: 2 components per u32
     pub(super) pack_bgl: wgpu::BindGroupLayout,
     pub(super) buf_to_tex_pipeline: wgpu::ComputePipeline,
     pub(super) buf_to_tex_bgl: wgpu::BindGroupLayout,
     pub(super) cached: RefCell<Option<CachedBuffers>>,
     pub(super) pending_rx:
         RefCell<Option<std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>>,
+    /// Bytes per component for the pending decode (1 = 8-bit, 2 = 10/16-bit).
+    pub(super) pending_bytes_per_component: RefCell<u32>,
 }
 
 impl DecoderPipeline {
@@ -193,6 +196,26 @@ impl DecoderPipeline {
                 cache: None,
             });
 
+        // Pack u16 shader (f32 → packed u16, 2 components per u32; for 10/16-bit output)
+        let pack_u16_shader = ctx
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("pack_u16"),
+                source: wgpu::ShaderSource::Wgsl(
+                    include_str!("../shaders/pack_u16.wgsl").into(),
+                ),
+            });
+        let pack_u16_pipeline = ctx
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("pack_u16_pipeline"),
+                layout: Some(&pack_pl), // same bind group layout as pack_pipeline
+                module: &pack_u16_shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+
         // Buffer-to-texture shader (f32 RGB buffer → rgba8unorm texture)
         let buf_to_tex_shader = ctx
             .device
@@ -280,11 +303,13 @@ impl DecoderPipeline {
             crop_pipeline,
             crop_bgl,
             pack_pipeline,
+            pack_u16_pipeline,
             pack_bgl,
             buf_to_tex_pipeline,
             buf_to_tex_bgl,
             cached: RefCell::new(None),
             pending_rx: RefCell::new(None),
+            pending_bytes_per_component: RefCell::new(1),
         }
     }
 
@@ -392,9 +417,10 @@ impl DecoderPipeline {
         result
     }
 
-    /// Decode a compressed frame to packed RGB u8 data.
-    /// Returns Vec<u8> of length width * height * 3. This is 4x smaller to read back
-    /// from the GPU than the f32 path, significantly reducing readback latency.
+    /// Decode a compressed frame to packed RGB bytes.
+    /// For 8-bit content: returns Vec<u8> of length width*height*3 (1 byte per component).
+    /// For 10/16-bit content: returns Vec<u8> of length width*height*6 (2 bytes per component,
+    /// each component stored as little-endian u16).
     pub fn decode_u8(&self, ctx: &GpuContext, frame: &CompressedFrame) -> Vec<u8> {
         let profile = std::env::var("GNC_PROFILE").is_ok();
         let t_start = std::time::Instant::now();
@@ -403,8 +429,15 @@ impl DecoderPipeline {
         let w = info.width;
         let h = info.height;
         let total_f32s = w * h * 3;
-        let packed_u32s = total_f32s.div_ceil(4);
+        // 8-bit: 4 components per u32; >8-bit: 2 components per u32 (u16 packing)
+        let is_hdr = info.bit_depth > 8;
+        let (packed_u32s, bytes_per_component) = if is_hdr {
+            (total_f32s.div_ceil(2), 2u32)
+        } else {
+            (total_f32s.div_ceil(4), 1u32)
+        };
         let packed_byte_size = (packed_u32s as u64) * 4;
+        let output_byte_count = total_f32s * bytes_per_component;
 
         self.ensure_cached(
             ctx,
@@ -435,7 +468,7 @@ impl DecoderPipeline {
 
         let mut cmd = self.encode_gpu_work(ctx, frame, bufs);
 
-        // GPU pack: f32 → packed u8 (using cached pack_params_buf)
+        // GPU pack: f32 → packed bytes (u8 for 8-bit, u16 for >8-bit)
         {
             let pack_bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("pack_bg"),
@@ -461,12 +494,16 @@ impl DecoderPipeline {
                 label: Some("pack_pass"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.pack_pipeline);
+            if is_hdr {
+                pass.set_pipeline(&self.pack_u16_pipeline);
+            } else {
+                pass.set_pipeline(&self.pack_pipeline);
+            }
             pass.set_bind_group(0, &pack_bg, &[]);
             pass.dispatch_workgroups(workgroups, 1, 1);
         }
 
-        // Copy packed u8 to staging
+        // Copy packed bytes to staging
         cmd.copy_buffer_to_buffer(
             &bufs.packed_u8_buf,
             0,
@@ -492,7 +529,7 @@ impl DecoderPipeline {
 
         let data = slice.get_mapped_range();
         let bytes: &[u8] = &data;
-        let result = bytes[..total_f32s as usize].to_vec();
+        let result = bytes[..output_byte_count as usize].to_vec();
         drop(data);
         bufs.staging_u8.unmap();
         drop(cached);
@@ -1887,7 +1924,12 @@ impl DecoderPipeline {
         let w = info.width;
         let h = info.height;
         let total_f32s = w * h * 3;
-        let packed_u32s = total_f32s.div_ceil(4);
+        let is_hdr = info.bit_depth > 8;
+        let (packed_u32s, bytes_per_component) = if is_hdr {
+            (total_f32s.div_ceil(2), 2u32)
+        } else {
+            (total_f32s.div_ceil(4), 1u32)
+        };
         let packed_byte_size = (packed_u32s as u64) * 4;
 
         self.ensure_cached(
@@ -1915,7 +1957,7 @@ impl DecoderPipeline {
 
         let mut cmd = self.encode_gpu_work(ctx, frame, bufs);
 
-        // GPU pack: f32 → packed u8 (using cached pack_params_buf)
+        // GPU pack: f32 → packed bytes (u8 for 8-bit, u16 for >8-bit)
         {
             let pack_bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("pack_bg"),
@@ -1941,12 +1983,16 @@ impl DecoderPipeline {
                 label: Some("pack_pass"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.pack_pipeline);
+            if is_hdr {
+                pass.set_pipeline(&self.pack_u16_pipeline);
+            } else {
+                pass.set_pipeline(&self.pack_pipeline);
+            }
             pass.set_bind_group(0, &pack_bg, &[]);
             pass.dispatch_workgroups(workgroups, 1, 1);
         }
 
-        // Copy packed u8 to staging
+        // Copy packed bytes to staging
         cmd.copy_buffer_to_buffer(
             &bufs.packed_u8_buf,
             0,
@@ -1965,12 +2011,13 @@ impl DecoderPipeline {
         });
         drop(cached);
 
-        // Store the receiver for later retrieval
+        // Store the receiver and bytes_per_component for later retrieval
         *self.pending_rx.borrow_mut() = Some(rx);
+        *self.pending_bytes_per_component.borrow_mut() = bytes_per_component;
     }
 
     /// Finish a previously submitted decode_u8 operation.
-    /// Blocks until the GPU work is complete and returns the u8 result.
+    /// Blocks until the GPU work is complete and returns the packed bytes result.
     pub fn finish_decode_u8(&self, ctx: &GpuContext, width: u32, height: u32) -> Vec<u8> {
         let rx = self
             .pending_rx
@@ -1978,7 +2025,8 @@ impl DecoderPipeline {
             .take()
             .expect("finish_decode_u8 called without prior submit_decode_u8");
 
-        let total_bytes = (width * height * 3) as usize;
+        let bytes_per_component = *self.pending_bytes_per_component.borrow();
+        let total_bytes = (width * height * 3 * bytes_per_component) as usize;
 
         ctx.device.poll(wgpu::Maintain::Wait);
         rx.recv().unwrap().unwrap();

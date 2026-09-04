@@ -33,11 +33,30 @@ positioned as an **intra-first, low-latency codec**; the priorities are:
 
 ## Active priority list
 
-### BUG-1 — 4:2:0 pyramid B-frame chroma bug (PRIO 1, todo)
+### BUG-1 — 4:2:0 pyramid B-frame chroma bug (PRIO 1, diagnosed — awaiting GPU confirmation + fix)
 B-frames at pyramid layers 2–3 with 4:2:0 show ~22–26 dB PSNR despite 2–4 bpp. I-frames and P-frames
 are unaffected (42 dB). B₄ (layer 1, direct reference to I/P) works (38 dB). The error cascades
 through the chroma reference chain: B₂/B₆ reference B₄ which is 4:2:0-coded, leaf-B references B₂/B₆.
-Root cause: likely error in 4:2:0 chroma-MC when reference is a 4:2:0-coded B-frame (not I/P).
+
+**Root-cause diagnosis (2026-09-04, code-reading — full writeup in [docs/BUG-1_DIAGNOSIS.md](docs/BUG-1_DIAGNOSIS.md)):**
+Primary candidate (HIGH confidence, MV field domain): encoder/decoder mismatch in the scaled
+chroma-MV tail. `dispatch_mv_scale` runs `split_total_blocks` (32640) threads over the B-frame's
+8160-entry MV buffer. The encoder's tail entries come from out-of-bounds reads (zero/clamped);
+the decoder's persistent `mv_buf` was grown to ≥32640 entries by earlier P/B₄ split-MV decodes
+and is never cleared, so its tail reads are **in-bounds stale P-frame MVs**. The chroma MC shader
+indexes the full 32640-block chroma grid → the bottom ~75% of Co/Cg is predicted with different
+MVs on encoder vs decoder. Explains the exact signature: I/P/B₄ fine (full split MVs), 4:4:4 fine
+(no chroma MV scaling), layers 2–3 broken and cascading, high bpp wasted.
+Secondary candidates: `block_modes` tail mismatch (same mechanism); B₇ encoder bwd-ref stale
+(B₆ instead of P₈, `sequence.rs:972–997`, all formats); end-of-group ref restore gated on Yuv444
+(`sequence.rs:1074–1078` — next GOP's P encoded against wrong reference in 4:2:0); encoder-only
+ref deblocking (noise floor — run confirmations with `GNC_REF_DEBLOCK=0`).
+
+**Next (dev machine, has GPU):** run confirmation diagnostics (a)–(d) from the writeup — the
+per-region chroma PSNR split (top 25% vs bottom 75% of the plane) is a one-run smoking gun —
+then implement the fix shape in the writeup (explicit tail zeroing on both sides, or proper
+16×16→8×8 MV spread which also fixes the #48 stride mismatch) plus the two one-line ref fixes.
+Also add a flat (non-pyramid) 4:2:0 B-frame roundtrip test: candidate 1 predicts it is broken too.
 
 ### MEAS-1 — Correct video comparison GNC vs H.264 (todo)
 Run H.264 (libx264, full inter, standard GOP) on crowd_run + park_joy, 10 frames, yuv420p.

@@ -1,6 +1,11 @@
-# GNC Backlog
+# GNC Long List (ARCHIVED 2026-09-04 — superseded)
 
-Baseline: v0.1-spatial (commit 617d8e6) — spatial-only, I+P+B default, temporal Haar experimentellt.
+> **This file is historical.** It was the original idea long-list from the v0.1-spatial era.
+> Nearly every item was since implemented or investigated and closed — see
+> [BACKLOG.md](../../BACKLOG.md) (open items) and [BACKLOG_CLOSED.md](BACKLOG_CLOSED.md)
+> (full history). Kept only as a record of the original idea set.
+
+Baseline: v0.1-spatial (commit 617d8e6) — spatial-only, I+P+B default, temporal Haar experimental.
 
 ---
 

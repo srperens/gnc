@@ -77,6 +77,44 @@ Each toggle: report bpp + VMAF delta. Goal: identify dead weight and negative fe
 Run rd-curve (q=25–90) on crowd_run and park_joy with 4:4:4, measure VMAF at each point.
 Current rd-curve lacks --chroma-format and --vmaf on sequences. A benchmark loop may suffice.
 
+### MEAS-4 — Inter-model gap decomposition: oracle experiments (todo, after MEAS-1)
+**Question:** Is GNC's 3–4× inter-efficiency gap vs H.264 caused by the *model* (tile-wide
+wavelet on MC residuals + context-free entropy) rather than by GPU-parallelism per se? If yes,
+a hybrid inter pipeline (per-block transform + block skip + context entropy — all GPU-parallel)
+has real headroom. Measure the ceiling offline before building anything. No bitstream changes;
+run in 4:4:4 (does not depend on BUG-1).
+
+- **MEAS-4a — P-residual subband energy distribution** (the #35 gate that was never run, ~0.5 day):
+  Diagnostic that logs per-subband energy of P/B-frame residual wavelet coefficients on
+  crowd_run, park_joy, rush_hour at q=75. Falsifiable: if detail subbands carry >40% of residual
+  energy, the wavelet is spreading block-structured energy (transform mismatch real). If LL
+  dominates, transform is not the problem — close MEAS-4b's DCT half.
+- **MEAS-4b — Oracle block-skip/DCT bound** (~1–2 days, offline): Dump spatial-domain MC
+  residuals (pre-transform) per P/B-frame to disk. Offline script computes: (1) fraction of
+  16×16 blocks with residual energy below the q=75 quantization threshold ("oracle-skippable");
+  (2) fraction of total residual energy in the top 10/25/50% of blocks; (3) estimated bpp of an
+  oracle coder: per-block 8×8 DCT + uniform quantizer + Shannon entropy of quantized coeffs
+  + 1 bit/block skip signaling. Compare against measured GNC inter bpp at same quality.
+  Falsifiable: oracle bound ≥40% below current GNC inter bpp on ≥2/3 sequences → the model
+  (not prediction quality) is the cap, hybrid inter pipeline has real ceiling. Oracle bound
+  <20% below → gap is prediction quality; intra-first positioning re-confirmed, close.
+- **MEAS-4c — Entropy context ceiling** (~1 day, offline, extends #53): On the same dumped
+  quantized coefficients, compute empirical conditional entropy with 1–2 neighbor/parent
+  contexts vs measured Rice bpp. Bounds what 4–16 context-adaptive streams per tile (still
+  thousands of parallel streams per frame) would recover vs the current 256 context-free streams.
+- **MEAS-4d — H.264 feature ablation** (~0.5 day, no GNC code): Decompose H.264's ~60–70%
+  temporal saving using x264 flags on the same sequences: baseline vs `--no-cabac` (context
+  entropy contribution), `--partitions none` (block partitioning), `--ref 1 --bframes 0`
+  (multi-ref/B contribution). Shows how much of H.264's inter gain comes from skip/partitioning
+  vs entropy vs prediction — i.e., which parts GNC is actually missing.
+
+**Decision rule:** MEAS-4b is the verdict. ≥40% oracle headroom → write a design doc for a
+hybrid inter pipeline (wavelet I-frames + per-block DCT inter residuals + block skip + context
+entropy) and take the positioning question back to the team. <20% → the structural-gap
+conclusion in GOALS.md stands with direct evidence; spend nothing further on inter.
+**Requires the dev machine** (GPU + test material) for the residual dumps; the offline analysis
+scripts are CPU-only.
+
 ## Noted — revisit only if conditions change
 
 ### ARCH-1 — Hybrid temporal: Haar for low motion, I+P+B for high motion (noted 2026-03-11)

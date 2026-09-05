@@ -46,6 +46,28 @@ the inter gap is, and targeting it is guesswork. See RESEARCH_LOG 2026-09-05.
 
 ## Active priority list
 
+### ARCH-2 — Inter residuals cannot skip locally (open design question, PRIO 1)
+Measured 2026-09-05. At matched VMAF on bbb, GNC's inter frames cost **8-10x** H.264's (P: 304-380
+KB vs 39 KB; B: 108 KB vs 14 KB) while intra costs only ~1.9x. On a fully static sequence — 17
+identical frames — x264 codes P-frames at 181 bytes and B-frames at 76; GNC needs ~18 KB.
+
+Ruled out by measurement, none of them the cause: multi-reference (~1-5%), sub-pel interpolation
+filter (neutral), motion search quality (GNC beats an offline oracle), context entropy (<=3.4%),
+pyramid QP scaling (-6% rate for -1.2 VMAF), tile size, dead zone (moves along the same RD curve,
+not off it).
+
+**Hypothesis:** GNC transforms the whole 256x256 tile with a wavelet, so the smallest region it
+can decline to code is a tile. H.264 skips per 16x16 macroblock for ~1 bit. Well-predicted areas
+therefore cost GNC ~0.5 bits per coefficient where they cost H.264 nothing.
+
+**Note on MEAS-4:** it concluded a rebuilt inter model was not worth it, comparing models at
+matched *residual distortion*. That comparison structurally cannot see the value of skip, because
+skipping trades distortion for rate. The conclusion should not be relied on for this question.
+
+**Needs a direction decision** — local skip means a block-local transform for inter residuals,
+which touches tile independence and GPU-parallel entropy. Escalated.
+
+
 ### BUG-1 — 4:2:0 pyramid B-frame chroma bug (**DONE 2026-09-05**)
 True B-frames in 4:2:0 reconstructed 4–6 dB below their bitrate; B₄ and P-frames unaffected;
 4:4:4 unaffected.

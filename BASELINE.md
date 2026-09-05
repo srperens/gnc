@@ -26,6 +26,24 @@ Previous (perceptual weights, #64): q=75 → 42.17 dB / 3.83 bpp / VMAF 95.05
 Note: bpp increased at q=75 because quality also increased (+0.25 VMAF, +2.28 dB PSNR for single-frame).
 BD-rate vs equal-VMAF comparison: uniform weights save ~18% bpp at matched VMAF.
 
+## Reported bitrate correction (2026-09-05)
+
+`CompressedFrame::byte_size()` counted motion vectors as 4 raw bytes per block while the
+bitstream delta-codes them as varints, inflating reported inter-frame sizes by up to 9x and
+sequence bpp by **27-58%**. Fixed; `byte_size()` now measures by serializing.
+
+**Every sequence bpp figure in this file and in RESEARCH_LOG predating 2026-09-05 is inflated by
+that much.** Single-frame (intra) figures are unaffected — I-frames carry no motion vectors.
+Corrected reference points, bbb 1080p ki=9 4:2:0, 17 frames:
+
+| q | reported before | corrected |
+|---|---|---|
+| 40 | 0.90 bpp | **0.57 bpp** |
+| 70 | 1.54 bpp | **1.22 bpp** |
+
+Per-frame at q=70: I 820 KB, P 304-380 KB, B 108 KB. For scale, x264 at matched VMAF spends
+I 439 KB, P 39 KB, B 14 KB — intra is ~1.9x, inter is **8-10x**.
+
 ## Video vs H.264 (MEAS-1, 2026-09-05) — the headline number
 
 Measured with `scripts/meas1_vs_h264.py`: VMAF-scored, one normalised reference for both codecs,

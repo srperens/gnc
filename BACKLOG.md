@@ -64,8 +64,29 @@ therefore cost GNC ~0.5 bits per coefficient where they cost H.264 nothing.
 matched *residual distortion*. That comparison structurally cannot see the value of skip, because
 skipping trades distortion for rate. The conclusion should not be relied on for this question.
 
-**Needs a direction decision** — local skip means a block-local transform for inter residuals,
-which touches tile independence and GPU-parallel entropy. Escalated.
+**Block-wise inter coding was investigated and rejected (2026-09-05).**
+`scripts/meas_block_skip_rd.py` compared GNC's tile wavelet against 16x16 blocks with an 8x8 DCT
+and a per-block RD skip decision, on GNC's own residuals. At matched residual PSNR it is 30-39%
+*worse* on bbb and 30-34% *better* on touchdown — content-dependent, and nowhere near the ~8x
+needed. Smaller tiles are not an option either: each tile costs ~290 bytes of header, so 16x16
+tiles would mean ~2.3 MB of headers per 1080p frame, and tile=64 measured 70% more bits at worse
+quality than tile=256.
+
+**Still open, and the two untested threads:**
+1. **No rate-distortion decisions anywhere.** GNC quantizes at the configured qstep and codes
+   whatever comes out. x264's ablation puts its RD mode decision at +22%.
+2. **Reference quality.** No in-loop deblocking; references carry wavelet ringing spread over the
+   tile. The inter residual's mean |value| (2.63) sits near the ~2.0 noise floor the reference
+   itself imposes — so much of each inter frame is re-coded reference noise. If that holds, the
+   fix is better references, not better residual coding. **This is the more promising of the
+   two.**
+
+### BUG-4 — Inter frames degrade at odd tile-column counts (todo, P2)
+At `--tile-size 128` on 1080p (15 tile columns, odd) several inter frames land 4-6 dB below their
+neighbours while I-frames are unaffected; VMAF min falls from 94 to 80. Same condition as BUG-3
+(`padded_w != 2 * chroma_padded_w`), which was fixed for the chroma MC stride — something else in
+that family remains. Reproduce: `benchmark-sequence -n 17 -k 9 -q 70 --chroma-format 420
+--tile-size 128`.
 
 
 ### BUG-1 — 4:2:0 pyramid B-frame chroma bug (**DONE 2026-09-05**)

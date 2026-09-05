@@ -3765,3 +3765,69 @@ coarsely than the target required. That is now corrected as a side effect.
 sequence where x264 spends 76-181 bytes — a 100-200x gap on the trivial case, now visible without
 the reporting error on top. The bits are MV data (5 KB for an all-zero MV field) and tile headers
 (1.1 KB), not coefficients. An all-zero MV field costing 5 KB is the next thing to look at.
+
+---
+
+## 2026-09-05 — Block-wise inter coding measured: ±30%, not the lever
+
+Direction approved by the user after ARCH-2 was logged: investigate coding inter residuals
+block-wise so that local skip becomes possible.
+
+**Why tiles cannot simply be made smaller** (the obvious alternative, and the user asked it
+directly). Each tile carries a fixed header of roughly 290 bytes regardless of its size:
+
+| tile size | tiles/frame | tile headers | share of frame |
+|---|---|---|---|
+| 256 | 64 | 18.8 KB | 2.3% |
+| 128 | 240 | 62.6 KB | 7.4% |
+| 64 | 960 | 227.0 KB | 20.7% |
+
+Skipping at H.264's 16x16 granularity would mean 8100 tiles at 1080p, ~2.3 MB of headers per
+frame. Measured end to end, tile=64 costs 70% more bits at *worse* quality than tile=256. Local
+skip therefore has to live inside a tile; it cannot come from shrinking tiles.
+
+(Also noted: at tile=128 several inter frames land 4-6 dB below their neighbours while I-frames
+are unaffected — 1920 gives 15 tile columns there, an odd count, which is the BUG-3 condition.
+The BUG-3 fix addressed the chroma MC stride; something else in that family remains. Logged.)
+
+**The experiment.** `scripts/meas_block_skip_rd.py` compares, on GNC's own dumped luma residuals:
+
+- *tile-wavelet* — the whole plane transformed at once, every coefficient coded (GNC today);
+- *block-dct* — 16x16 blocks, 8x8 DCT, per-block RD skip decision (D + λR, λ = 0.85·qstep²),
+  one bit per block signalled.
+
+Unlike MEAS-4 this is a rate-distortion comparison, so it can see the value of skip — which is
+the flaw that made MEAS-4's conclusion unreliable for this question.
+
+**Result: content-dependent, and not a multiple.** Interpolated to matched residual PSNR:
+
+| sequence | block-dct vs tile-wavelet | blocks skipped at qstep 4 |
+|---|---|---|
+| bbb (animation) | **30-39% worse** | 86.4% |
+| touchdown (camera) | **30-34% better** | 83.4% |
+
+The wavelet's energy compaction wins on smooth synthetic content; block coding plus skip wins on
+noisy camera content. Neither is close to the ~8x that GNC's inter frames are behind H.264's.
+
+**So the coding model is not where the gap is** — which is what MEAS-4 concluded, arrived at this
+time by a method that could actually have seen the alternative. Rebuilding the inter path as a
+block codec is not justified.
+
+**What that leaves.** Every candidate that could be tested in isolation has now come back
+negative: multi-reference, sub-pel interpolation filter, motion search quality, context entropy,
+pyramid QP scaling, tile size, dead zone, and now the transform-plus-skip model. The gap is real
+and measured (MEAS-1), but it does not decompose into any single mechanism that has been tried.
+
+Two threads remain unexamined and are the honest next steps:
+1. **Rate-distortion decisions at all.** GNC quantizes inter residuals at the configured qstep
+   with no RD comparison anywhere in the encoder. x264's ablation puts its RD mode decision at
+   +22% between "basic quarter-pel search" and its default. That is not 8x on its own, but it is
+   the largest single untested item.
+2. **Reference quality.** GNC has no in-loop deblocking (the encoder-only filter is an
+   encoder/decoder mismatch, disabled in all measurements here). Its references carry wavelet
+   ringing spread across the tile rather than block-local DCT noise, and the inter residual's
+   mean |value| of 2.63 sits close to the ~2.0 noise floor its own reference imposes — meaning
+   much of what GNC codes each frame is its previous frame's quantisation noise.
+
+Thread 2 is the more interesting of the two: if most of the inter residual is re-coded reference
+noise, the fix is better references, not better residual coding.

@@ -6,7 +6,9 @@ GNC is a patent-free **video codec** designed from scratch for GPU parallelism. 
 
 ### GNC is a contribution codec, not a distribution codec
 
-This is the decision that sets every target below, so it comes first.
+This is the decision that sets every target below, so it comes first. The full reasoning, the
+market requirements it rests on, and the measurements behind it are in
+**[docs/POSITIONING.md](docs/POSITIONING.md)** — read that before changing any target here.
 
 A distribution codec (H.264, HEVC, AV1) is encoded once and decoded a billion times. Spending
 enormous encoder effort to shave a percent off the bitrate is rational there, because the bitrate

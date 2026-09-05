@@ -144,6 +144,8 @@ At every natural checkpoint (feature complete, priority item done):
 ## Key Documents
 
 - **[GOALS.md](GOALS.md)** — Rules, priorities, current state, non-goals
+- **[docs/POSITIONING.md](docs/POSITIONING.md)** — What GNC is for, what the contribution market
+  requires, and where GNC measurably stands against it. The reasoning behind GOALS §1
 - **[BACKLOG.md](BACKLOG.md)** — Agent team backlog with status tracking
 - **[BASELINE.md](BASELINE.md)** — Benchmark regression baseline
 - **[docs/BITSTREAM_SPEC.md](docs/BITSTREAM_SPEC.md)** — Bitstream format specification

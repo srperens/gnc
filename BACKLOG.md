@@ -15,7 +15,7 @@ See [BASELINE.md](BASELINE.md) for current benchmark numbers.
 
 **Mode: Measurement and bugfixing. No new features.**
 
-**Positioning fixed 2026-09-05 (see GOALS §1): GNC is a contribution codec.** It does not try to
+**Positioning fixed 2026-09-05 (see [docs/POSITIONING.md](docs/POSITIONING.md) and GOALS §1): GNC is a contribution codec.** It does not try to
 beat H.264 on bitrate; it aims for H.264-class quality that runs on any GPU and scales with the
 card, against fixed-function encoders with session limits. Two consequences for this list: the
 headline metrics are now concurrent streams per GPU (MEAS-5) and latency (MEAS-6), neither of

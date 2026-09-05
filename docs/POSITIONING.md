@@ -3,6 +3,9 @@
 **Status:** current as of 2026-09-05. Supersedes nothing; it is the reasoning behind
 [GOALS.md](../GOALS.md) §1 and the priority order in [BACKLOG.md](../BACKLOG.md).
 
+**Shareable version:** <https://claude.ai/code/artifact/d8b12c5b-8437-40c9-9a1e-42b2fbb5bfa0>
+(same content, formatted for reading outside the repo).
+
 This document exists because GNC's targets were being set against the wrong operating point. It
 records three things: what GNC is for, what the market it aims at actually requires, and where GNC
 measurably stands against that. External claims are sourced. Internal claims are measured, and the

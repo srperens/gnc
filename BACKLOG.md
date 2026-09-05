@@ -15,6 +15,14 @@ See [BASELINE.md](BASELINE.md) for current benchmark numbers.
 
 **Mode: Measurement and bugfixing. No new features.**
 
+**Positioning fixed 2026-09-05 (see GOALS §1): GNC is a contribution codec.** It does not try to
+beat H.264 on bitrate; it aims for H.264-class quality that runs on any GPU and scales with the
+card, against fixed-function encoders with session limits. Two consequences for this list: the
+headline metrics are now concurrent streams per GPU (MEAS-5) and latency (MEAS-6), neither of
+which has ever been measured; and compression targets move to the contribution operating point,
+so historical BD-rate measured at distribution bitrates describes a use case GNC is not built for.
+Both intra and inter remain goals — going all-intra was considered and rejected.
+
 The measurement campaign (parts 8–13) established a new baseline with uniform subband
 weights, and the 2026-03 experiment sweep (~40 gated experiments, see archive) exhausted
 the cheap and medium-cost *incremental* inter-compression ideas. Temporal compression is still
@@ -45,6 +53,70 @@ the inter gap is, and targeting it is guesswork. See RESEARCH_LOG 2026-09-05.
 - All above is PSNR-based (RGB). VMAF-based video comparison vs H.264 still missing (MEAS-1).
 
 ## Active priority list
+
+### BUG-5 — B-frames cost 16.7x P-frames on unchanged content (todo, P0)
+Measured 2026-09-05 on 17 byte-identical 1080p frames (bbb, 4:4:4, Rice, fixed qstep, rate
+control off) — content where the correct answer for every inter frame is "nothing changed".
+
+| config | per inter frame | all_skip_tiles |
+|---|---|---|
+| P-only (`ki=8`, no B) | **3 246 B** | 120/120 every frame |
+| B-pyramid (`ki=17`) | **54 059 B** avg | 8-95/120, varies |
+
+The residual reaching the quantiser is statistically identical on both paths
+(`mean_abs=0.83-0.84, near_zero=68%`) and the skip threshold is the same function
+(`tile_skip_threshold`, `sequence.rs:3638` for P and `sequence.rs:6192` for B). So identical
+input and an identical threshold produce 120/120 skip on one path and 8/120 on the other.
+
+**The bits do not pay for themselves.** The B-pyramid buys +0.79 dB for 813 KB. Spending the same
+bits on the I-frame and letting every inter frame all-skip reaches the same quality for **34.4%
+fewer bytes** (1 348 021 B @ 45.04 dB vs 2 055 422 B @ 45.10 dB). On this content the temporal
+path is worse than not coding inter frames at all.
+
+**Working hypothesis (untested):** averaging two independently reconstructed references puts the
+prediction a half quantiser step off, so the residual escapes the dead zone almost everywhere,
+where a single reference's residual is exactly that reference's quantisation error and quantises
+back to zero.
+
+**Blocks/affects:**
+- **TUNE-1** — its -24% for longer GOPs was read as "GNC uses too few B-frames", but B is the
+  defective path here. The mechanism behind that number is not established and the headroom after
+  a fix is probably larger. Do not change the default GOP rule until BUG-5 is understood.
+- **MEAS-1 and ARCH-2** were both measured at `ki=9` with B-frames on. How much of the reported
+  5-7x gap is design and how much is this defect is currently unknown.
+
+**Next step:** reproduce on >=3 real sequences at matched VMAF before sizing a fix. Byte-identical
+frames are a synthetic extreme and do not by themselves quantify the loss on real content.
+Full measurement in RESEARCH_LOG 2026-09-05.
+
+### MEAS-5 — Concurrent streams per GPU vs NVENC (todo, P0 — never measured)
+The whole contribution-codec positioning (GOALS §1) rests on one unproven claim: a GPU's shader
+throughput scales with the card while its fixed-function encoder blocks do not, so a big GPU
+should run more GNC instances than it runs NVENC sessions. **Nobody has measured this.**
+
+Measure: N concurrent 1080p encode+decode instances on one GPU, at contribution quality, until
+throughput per instance drops below realtime. Report the N, and the same N for NVENC/VideoToolbox
+on the same machine. Needs at least the M1 and one discrete NVIDIA card; ideally an Intel iGPU too.
+
+Per-stream, compute will lose to fixed function — that is expected and not the claim. The claim is
+about the aggregate. If the aggregate also loses, the positioning is wrong and we need to know
+that before more compression work.
+
+### MEAS-6 — Latency per frame (todo, P1 — never measured)
+Contribution links need sub-frame latency, and tile independence is supposed to buy it. Measure
+end-to-end frame latency (submit → decoded frame available), not throughput fps. Currently
+unquantified.
+
+### FMT-1 — 10-bit support (todo, P1)
+8-bit is the main format gap for broadcast contribution. 4:2:2 and 4:2:0 already work, so bit
+depth is the remaining piece. Cheap now — GOALS rule 10 says the bitstream can still break freely
+and there are no users — and expensive once there is a spec, conformance streams and deployments.
+
+Not a research item: buffer formats, upload/download paths, PNG/Y4M I/O, bitstream fields, and the
+VMAF/PSNR comparison harness at 10-bit. No f64 needed; 10-bit fits f32/i32 comfortably.
+
+Note the interaction with the operating point: 10-bit costs bits at low bitrate and almost nothing
+at contribution quality, which is another reason to stop optimising against distribution bitrates.
 
 ### ARCH-2 — Inter residuals cannot skip locally (**CLOSED 2026-09-05** — measured, unreachable)
 Measured 2026-09-05. At matched VMAF on bbb, GNC's inter frames cost **8-10x** H.264's (P: 304-380

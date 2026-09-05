@@ -4,6 +4,45 @@
 
 GNC is a patent-free **video codec** designed from scratch for GPU parallelism. Everything runs as wgpu compute shaders (WGSL) — cross-platform on Metal, Vulkan, DX12, and WebGPU/WASM. The core idea: tile-independent processing with thousands of parallel threads instead of sequential CPU-era algorithms.
 
+### GNC is a contribution codec, not a distribution codec
+
+This is the decision that sets every target below, so it comes first.
+
+A distribution codec (H.264, HEVC, AV1) is encoded once and decoded a billion times. Spending
+enormous encoder effort to shave a percent off the bitrate is rational there, because the bitrate
+is paid a billion times over. **That is not what GNC is for.** GNC encodes and decodes roughly as
+often as each other: contribution links, mezzanine storage, low-latency preview, browser playback.
+
+So GNC does **not** try to beat H.264 or AV1 on compression. The target is to be *about as good as
+H.264* while winning on the axes that matter for contribution:
+
+| | fixed-function (NVENC/QSV/VideoToolbox) | GNC |
+|---|---|---|
+| where it runs | one vendor, specific silicon generations | any GPU with WebGPU/Vulkan/Metal/DX12 |
+| concurrent streams | a fixed number of encoder blocks per chip, plus driver session limits | limited by general compute, so it scales with the card |
+| 10-bit 4:2:2 | only on recent hardware (NVENC: Blackwell and later) | a design target from the start |
+| patents | licensed formats | patent-free |
+
+The structural argument is that the number of hardware encoder blocks in a chip is roughly
+constant no matter how large and expensive the GPU is, while shader throughput scales with the
+card. A bigger GPU should therefore buy more GNC instances; it does not buy more NVENC blocks.
+**That claim is currently unproven and is the single most important thing to measure.**
+
+Consequences that follow from this positioning:
+
+- The interesting operating point is **contribution quality** (high bitrate, visually lossless to
+  near-lossless), not streaming bitrates. Historical BD-rate numbers measured at distribution
+  bitrates describe an operating point GNC is not built for.
+- The headline throughput metric is **concurrent streams per GPU** and **latency per frame**, not
+  fps on a single stream.
+- Low latency, frame-accurate seeking and per-tile error resilience are features, not overhead —
+  they are what a contribution link needs, and tile independence is what buys them.
+
+**GNC is still both intra and inter.** Most established contribution formats are all-intra, and
+going all-intra would be the easy answer here — it is explicitly rejected. Strong intra *and*
+strong inter is the goal. Inter matters at contribution quality too: a static studio shot should
+cost almost nothing, and today it does not.
+
 ## 2. Design Rules
 
 1. **Patent-free** — No patented techniques, period. If it's patented, we don't use it.
@@ -47,8 +86,8 @@ rANS and Huffman exist in the codebase but are parked — Rice is the default fo
 **Known gaps:**
 - Sequence encode 31.7 fps → target 60 fps
 - Single-frame encode 40 fps → target 60 fps
-- 8-bit only (10-bit not implemented)
-- 4:4:4 only (4:2:2 not implemented)
+- 8-bit only (10-bit not implemented) — the main format gap for broadcast contribution
+- 4:4:4 / 4:2:2 / 4:2:0 all implemented (`--chroma-format`)
 - No true lossless with Rice (near-lossless 56 dB at q=100)
 
 ## 4. Where We Stand & Goals
@@ -94,12 +133,25 @@ GNC should become a **good, robust codec** — not optimized along a single axis
 
 | Property | Current | Target |
 |----------|---------|--------|
+| **Concurrent streams per GPU** | **never measured** | beat NVENC's session/block ceiling on the same machine |
+| **Latency per frame** | never measured | sub-frame, end to end |
 | Encode speed | 31.7 fps (seq, 1080p q=75) | 60 fps |
-| Compression (intra) | +46–55% vs H.264 all-I on video (VMAF); +13.9% on stills (PSNR) | ≤ H.264 all-I on the VMAF video measurement |
-| Compression (inter) | overall video BD-rate +457% to +672% vs H.264 | close the multiple, not percentages — see MEAS-1 |
+| Bit depth | 8-bit | 10-bit, in the format from the start |
+| Chroma formats | 4:4:4, 4:2:2, 4:2:0 | keep all three working at 10-bit |
+| Compression (intra) | +46–55% vs H.264 all-I on video (VMAF); +13.9% on stills (PSNR) | ≤ H.264 all-I, measured at contribution quality |
+| Compression (inter) | overall video BD-rate +457% to +672% vs H.264, measured at distribution bitrates with a known B-frame defect (BUG-5) | a static shot must cost near nothing; re-measure at contribution quality after BUG-5 |
 | Quality range | q=1–100 functional | smooth, predictable quality curve |
 | Robustness | basic test coverage | no artifacts, stable across q and content |
 | Bitstream | GNV1/GNV2 defined | well-specified, documented |
+
+The two metrics at the top of that table have never been measured, and they are the ones the
+whole positioning rests on. They come before further compression work.
+
+**On the compression numbers:** the +457% to +672% figures were measured at distribution
+bitrates, which is the operating point GNC is not built for, and with B-frames enabled — and
+B-frames are now known to be defective (BUG-5: on unchanged content they cost 16.7x what P-frames
+cost, and 34% more than not coding inter frames at all). Those numbers should not be treated as a
+measurement of GNC's design until both are corrected.
 
 VC-2 (Dirac) demonstrates that a patent-free wavelet codec can do real temporal work (MCTF) and
 reach H.264-class compression. That remains the reference point for where the inter path could go.

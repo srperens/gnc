@@ -4213,3 +4213,91 @@ the inter gap is: JPEG 2000 demonstrates that a wavelet still-image codec can re
 this content, at this quality.
 
 That makes intra the better place to spend effort, and it comes with an existence proof.
+
+---
+
+## 2026-09-05 — B-frames lose to doing nothing: 34% worse than one good I-frame on static content
+
+### Motivation
+
+Follow-up to the ARCH-2 header question: is GNC's per-tile fixed cost the floor that makes inter
+frames expensive? Measured directly on a synthetic worst case — one 1080p frame (bbb) replicated
+into 17 **byte-identical** frames, 4:4:4, Rice, fixed qstep (rate control off), M1. On this input
+the correct answer for every inter frame is "nothing changed".
+
+### The header floor is not the problem
+
+The all-skip tile path works and is cheap. An all-skip tile record is 18 bytes (16 B fixed header
++ flags + skip_bitmap); a non-skip tile costs ~280 B fixed (16 + flags + 3×num_groups k-params +
+skip_bitmap + 256 varint stream lengths), plus 1024 B when the checkerboard-k block is present.
+With P-only coding (`ki=8`, no B-frames), **every P frame on identical content costs 3 246 bytes
+with `all_skip_tiles=120/120`** — 2.1 KB of that is the 120 all-skip tile records. That is the
+floor working as designed. x264 does the same frame in 181 B, so the floor is ~18x, not the ~100x
+implied by the previously quoted 18 KB figure.
+
+### What is actually expensive: the B-pyramid
+
+Same content, same qstep, B-frames enabled (`ki=17`):
+
+| config | inter frames | total inter bytes | per inter frame | all_skip_tiles |
+|---|---|---|---|---|
+| P-only (ki=8) | 14 P | 45 444 | **3 246** | 120/120 every frame |
+| B-pyramid (ki=17) | 16 P/B | 864 943 | **54 059** | 8–95/120, varies per frame |
+
+**16.7x**, on content with zero change. Per-frame sizes in the pyramid: 3 246 / 33 724 / 34 908 /
+57 966 / 62 997 / 81 644 / 111 463 B. The frames coded first (pyramid anchors) reach 120/120
+all-skip; the deeper pyramid levels do not.
+
+Reproduced on touchdown_1080p (48 763 / 60 995 / 25 768 / 3 256 B on 9 identical frames) and
+identical under both entropy backends.
+
+### It is not the threshold, and not the residual
+
+- The residual reaching the quantiser is **statistically identical** across frame types:
+  `mean_abs=0.83–0.84, stddev=0.72–0.74, near_zero=68%` on every frame, anchors included.
+- The skip threshold is literally the same function for both paths —
+  `tile_skip_threshold(qstep)` at `sequence.rs:3638` (P) and `sequence.rs:6192` (B).
+
+So identical residual statistics and an identical threshold produce 120/120 skip on one path and
+8/120 on the other. The divergence is in what reaches the quantiser on the bidirectional path.
+**Working hypothesis (untested):** averaging two independently reconstructed references lands the
+prediction a half quantiser step off, so the residual falls outside the dead zone almost
+everywhere, where a single reference's residual is exactly the reference's own quantisation error
+and quantises back to zero. Note `mean_abs=0.83` on unchanged content is itself the I-frame's
+coding error — the inter path's entire input signal here is GNC's own reconstruction noise.
+
+### The bits are not buying their keep
+
+The B-pyramid does gain quality — but far less than the same bits spent on the I-frame.
+Decoded PSNR vs source, frames 5/10/15: P-only 44.33 dB (flat, frames are exact repeats),
+B-pyramid 45.10/45.15/45.12 dB. So 813 KB buys +0.79 dB.
+
+Spending those bits on the I-frame instead, and letting every inter frame all-skip:
+
+| config | total bytes | PSNR |
+|---|---|---|
+| B-pyramid, qstep 4.0 | 2 055 422 | 45.10–45.15 dB |
+| I @ qstep 3.5 + 16 all-skip P | **1 348 021** | 45.04 dB |
+| I @ qstep 3.2 + 16 all-skip P | 1 422 940 | 45.50 dB |
+
+**At matched quality the inter path costs 34.4% more than not coding inter frames at all.** On
+this content GNC's temporal machinery is worse than a still image plus skip flags.
+
+### Consequences
+
+1. **The 2026-09-05 GOP-structure result should be revisited.** It measured `ki=9 → ki=17` as
+   −24% on 17 frames and read it as "GNC spends too few frames on B". Longer GOPs do win, but the
+   B path is the defective one here; the mechanism behind that −24% is not established, and the
+   headroom after a fix is likely larger.
+2. **Every inter measurement at the default `ki=9` includes this.** MEAS-1's 5–7x and ARCH-2's
+   "B: 108 KB vs 14 KB" were both measured with B-frames on. How much of the measured gap is
+   design and how much is this defect is currently unknown.
+3. **This is the "no RD decisions anywhere" thread with a number on it.** The encoder has no
+   mechanism to notice that coding a frame costs more than it returns.
+
+### Limits of this measurement
+
+Byte-identical frames are a synthetic extreme; the dead zone behaves atypically when the residual
+is pure reconstruction error. This measures that the defect exists and is large in the limit — it
+does not quantify the loss on real content. Re-measuring on ≥3 real sequences at matched VMAF is
+the required next step before sizing the fix.

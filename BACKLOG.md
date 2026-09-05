@@ -5,7 +5,7 @@ Status: `todo` | `active` | `done` | `blocked`
 Only **open** items live here. All completed, closed, and vetoed items (66 of them,
 with gate experiments and measurements) are archived verbatim in
 [docs/archive/BACKLOG_CLOSED.md](docs/archive/BACKLOG_CLOSED.md).
-Positioning and priorities are defined in [GOALS.md](GOALS.md).
+Current state and priorities are described in [GOALS.md](GOALS.md).
 
 ## Baseline (v0.1-spatial, commit 617d8e6)
 
@@ -17,8 +17,9 @@ See [BASELINE.md](BASELINE.md) for current benchmark numbers.
 
 The measurement campaign (parts 8–13) established a new baseline with uniform subband
 weights, and the 2026-03 experiment sweep (~40 gated experiments, see archive) exhausted
-the cheap and medium-cost inter-compression ideas. Per [GOALS.md](GOALS.md), GNC is now
-positioned as an **intra-first, low-latency codec**; the priorities are:
+the cheap and medium-cost *incremental* inter-compression ideas. Temporal compression is still
+a goal (see [GOALS.md](GOALS.md) §4) — the open question is what shape it should take, and
+MEAS-4 is designed to answer that before anything gets built. Until then the priorities are:
 
 1. Fix known bugs (BUG-1)
 2. Finish the measurement campaign (MEAS-1/2/3) — honest VMAF-based video numbers
@@ -28,7 +29,8 @@ positioned as an **intra-first, low-latency codec**; the priorities are:
 **Known facts (2026-03-11, uniform weights):**
 - Spatial BD-rate vs H.264 all-I: **+13.9%** — reasonable for a wavelet codec; GNC wins above ~36 dB
 - Spatial BD-rate vs JPEG 2000 (4:4:4): **+28.3%** — gap narrows to ~11% at high quality
-- Temporal: GNC I+P+B saves ~17–27% vs all-I. H.264 saves ~60–70% → temporal gap is structural.
+- Temporal: GNC I+P+B saves ~17–27% vs all-I. H.264 saves ~60–70% → ~3–4× gap in the current
+  I/P/B design. Whether that is inherent or a wrong-model problem is unmeasured — that is MEAS-4.
 - All above is PSNR-based (RGB). VMAF-based video comparison vs H.264 still missing (MEAS-1).
 
 ## Active priority list
@@ -97,7 +99,8 @@ run in 4:4:4 (does not depend on BUG-1).
   + 1 bit/block skip signaling. Compare against measured GNC inter bpp at same quality.
   Falsifiable: oracle bound ≥40% below current GNC inter bpp on ≥2/3 sequences → the model
   (not prediction quality) is the cap, hybrid inter pipeline has real ceiling. Oracle bound
-  <20% below → gap is prediction quality; intra-first positioning re-confirmed, close.
+  <20% below → the gap is prediction quality, not the coding model; a rebuilt inter pipeline
+  would not pay for itself, so close this line of attack and look elsewhere for temporal gain.
 - **MEAS-4c — Entropy context ceiling** (~1 day, offline, extends #53): On the same dumped
   quantized coefficients, compute empirical conditional entropy with 1–2 neighbor/parent
   contexts vs measured Rice bpp. Bounds what 4–16 context-adaptive streams per tile (still
@@ -110,8 +113,8 @@ run in 4:4:4 (does not depend on BUG-1).
 
 **Decision rule:** MEAS-4b is the verdict. ≥40% oracle headroom → write a design doc for a
 hybrid inter pipeline (wavelet I-frames + per-block DCT inter residuals + block skip + context
-entropy) and take the positioning question back to the team. <20% → the structural-gap
-conclusion in GOALS.md stands with direct evidence; spend nothing further on inter.
+entropy). <20% → the current inter model is not the bottleneck; the gap is prediction quality,
+and further work on the coding side is not where the temporal win lives.
 **Requires the dev machine** (GPU + test material) for the residual dumps; the offline analysis
 scripts are CPU-only.
 
@@ -132,8 +135,9 @@ tracks that are never combined. Measurements show B-frames beat Haar on motion-h
 + per-GOP bitstream signaling.
 
 **More promising variant:** MCTF (motion-compensated temporal filtering) — Haar *with* ME, as used
-in Dirac/VC-2. Beats pure IPB in the literature but is a substantial project. Under the intra-first
-positioning ([GOALS.md](GOALS.md) §4) this is out of scope unless the positioning changes.
+in Dirac/VC-2. Beats pure IPB in the literature but is a substantial project — a plausible
+candidate for the "right shape" question in [GOALS.md](GOALS.md) §4. Parked until MEAS-4 bounds
+how much headroom a rebuilt inter path actually has.
 
 **Status:** Noted, nothing to implement now.
 
@@ -144,7 +148,7 @@ positioning ([GOALS.md](GOALS.md) §4) this is out of scope unless the positioni
 - **Success criteria:** bpp −3% on at least one test sequence; VMAF neutral; no regression on bbb/crowd_run.
 - **Complexity:** Medium. Requires decoder to track a reference buffer (already partially done for B-frames). ME shader needs a second reference input and cost comparison.
 - **Research Scientist verdict (2026-03-09):** DEFER. Expected gain requires content with periodic motion; current test sequences (bbb, crowd_run, rush_hour, park_joy) don't exhibit this. Gate on adding a periodic-motion test sequence AND running MV histogram showing >15% non-adjacent references.
-- **Note:** the tile-level dual-reference variant (#43) was separately CLOSED (2026-03-10) — see archive. Under the intra-first positioning, this stays deferred indefinitely.
+- **Note:** the tile-level dual-reference variant (#43) was separately CLOSED (2026-03-10) — see archive. Revisit alongside MEAS-4's outcome rather than on its own.
 
 ### 61. Resolution-adaptive pipeline scaling (4K / 8K / 12K readiness)
 - **Status:** todo (P2 — no action needed until 4K test material available, but design must account for this)

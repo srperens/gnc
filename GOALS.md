@@ -51,23 +51,29 @@ rANS and Huffman exist in the codebase but are parked — Rice is the default fo
 - 4:4:4 only (4:2:2 not implemented)
 - No true lossless with Rice (near-lossless 56 dB at q=100)
 
-## 4. Positioning & Goals
+## 4. Where We Stand & Goals
 
-**Positioning decision (2026-09-04): GNC is an intra-first, low-latency codec.**
+**Status (2026-09-04): intra is competitive, inter is the open problem.**
 
 The 2026-03 experiment sweep (~40 gated experiments, archived in
-[docs/archive/BACKLOG_CLOSED.md](docs/archive/BACKLOG_CLOSED.md)) established empirically that
-GNC's inter-frame gap vs H.264 (~3–4× less efficient temporal prediction) is structural:
-closing it would require rebuilding the inter pipeline (true MCTF, per-block residual
-transforms, soft entropy coding for RD allocation) — a design point that conflicts with tile
-independence and GPU-parallel entropy. Meanwhile the spatial layer is already competitive:
-BD-rate +13.9% vs H.264 all-I, and *better* than H.264 all-I above ~36 dB.
+[docs/archive/BACKLOG_CLOSED.md](docs/archive/BACKLOG_CLOSED.md)) exhausted the cheap and
+medium-cost incremental inter ideas. What it measured: the spatial layer is already strong —
+BD-rate +13.9% vs H.264 all-I, and *better* than H.264 all-I above ~36 dB — while the current
+I/P/B inter path saves only 17–27% vs all-I where H.264 saves 60–70%.
 
-The niche GNC targets is one nobody occupies: **patent-free + GPU-native + tile-independent +
-low-latency + WebGPU/WASM browser decode**. (JPEG XS is patented, VC-2 is CPU-era, JPEG 2000 is
-slow.) Corresponding use cases: broadcast contribution, mezzanine/intermediate storage,
-low-latency preview, browser playback. I/P/B inter coding stays in the codec as a lightweight
-bonus (17–27% saving vs all-I), but it is not the axis we compete on.
+That ~3–4× temporal gap is a real, reproduced measurement. What it is *not* yet is an
+explanation. The sweep tested tweaks to the existing design (tile-wide wavelet on MC residuals,
+context-free entropy); it did not test whether that design is the right shape. Meaningful
+temporal compression remains a goal — we most likely just haven't found the form yet.
+MEAS-4 (see [BACKLOG.md](BACKLOG.md)) is built to answer exactly that: measure the oracle
+ceiling offline before committing to, or ruling out, a rebuilt inter pipeline.
+
+Until that measurement lands, the practical stance is: don't spend more effort on incremental
+tweaks to the current inter path, and don't conclude the gap is closed off either. GNC's
+distinguishing properties hold regardless — **patent-free + GPU-native + tile-independent +
+low-latency + WebGPU/WASM browser decode** (JPEG XS is patented, VC-2 is CPU-era, JPEG 2000 is
+slow) — and they serve broadcast contribution, mezzanine storage, low-latency preview and
+browser playback whether or not the temporal side improves.
 
 GNC should become a **good, robust codec** — not optimized along a single axis. We iterate across multiple dimensions simultaneously, looking for combinations of techniques that work well together. No single property is a hard blocker for the others.
 
@@ -77,12 +83,13 @@ GNC should become a **good, robust codec** — not optimized along a single axis
 |----------|---------|--------|
 | Encode speed | 31.7 fps (seq, 1080p q=75) | 60 fps |
 | Compression (intra) | BD-rate +13.9% vs H.264 all-I, +28.3% vs JPEG 2000 | ≤ H.264 all-I overall; within ~15% of JPEG 2000 |
-| Compression (inter) | I+P+B saves 17–27% vs all-I | keep as lightweight bonus — do not chase H.264 full-inter |
+| Compression (inter) | I+P+B saves 17–27% vs all-I | substantially better — target set once MEAS-4 bounds what is reachable |
 | Quality range | q=1–100 functional | smooth, predictable quality curve |
 | Robustness | basic test coverage | no artifacts, stable across q and content |
 | Bitstream | GNV1/GNV2 defined | well-specified, documented |
 
-VC-2 (Dirac) demonstrates that a patent-free wavelet codec is viable in the broadcast contribution niche. That niche — not H.264 full-inter BD-rate — is our reference point.
+VC-2 (Dirac) demonstrates that a patent-free wavelet codec can do real temporal work (MCTF) and
+reach H.264-class compression. That remains the reference point for where the inter path could go.
 
 **How we iterate:**
 
@@ -130,7 +137,6 @@ When a diagnostic output exists (--diagnostics, per-frame PSNR, tile energy logs
 ## 6. Non-Goals
 
 - **Beating AV1/H.265 on compression ratio** — We occupy a different design point: parallel, low-latency, patent-free. We compete on speed and simplicity, not maximum compression.
-- **H.264-class inter compression** — The ~3–4× inter-efficiency gap is measured and structural (see [docs/archive/BACKLOG_CLOSED.md](docs/archive/BACKLOG_CLOSED.md)). The inter pipeline stays as-is (I/P/B + ME, lightweight bonus); large inter projects (MCTF, multi-reference, per-block transforms) are out of scope under the intra-first positioning.
 - **CPU decode path** — GPU-only by design. No software fallback.
 - **Backward compatibility** — No legacy bitstreams to support (rule 10).
 - **Neural/ML compression** — Extreme complexity for marginal gains. Not worth it for GPU-native design.

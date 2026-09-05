@@ -3325,6 +3325,57 @@ fn test_byte_size_matches_serialized_length() {
     }
 }
 
+/// A subsampled chroma format must fall back to Rice rather than abort.
+///
+/// The rANS and Huffman GPU paths batch all three planes assuming the luma tile layout, so they
+/// cannot encode subsampled chroma. Combining them used to panic deep in the encoder — a legal
+/// configuration should degrade, not abort. `normalize_for_chroma` does that.
+#[test]
+fn test_non444_falls_back_to_rice() {
+    for fmt in [crate::ChromaFormat::Yuv420, crate::ChromaFormat::Yuv422] {
+        for coder in [
+            crate::EntropyCoder::Rans,
+            crate::EntropyCoder::Huffman,
+            crate::EntropyCoder::Bitplane,
+        ] {
+            let mut config = crate::CodecConfig::default();
+            config.chroma_format = fmt;
+            config.entropy_coder = coder;
+            config.normalize_for_chroma();
+            assert_eq!(
+                config.entropy_coder,
+                crate::EntropyCoder::Rice,
+                "{fmt:?} with {coder:?} should normalise to Rice",
+            );
+        }
+    }
+    // 4:4:4 keeps whatever was asked for.
+    let mut c = crate::CodecConfig::default();
+    c.chroma_format = crate::ChromaFormat::Yuv444;
+    c.entropy_coder = crate::EntropyCoder::Rans;
+    c.normalize_for_chroma();
+    assert_eq!(c.entropy_coder, crate::EntropyCoder::Rans);
+}
+
+/// The quality preset picks rANS at low quality and Rice above, per the measured crossover.
+#[test]
+fn test_entropy_coder_follows_quality() {
+    for q in [1, 10, 20] {
+        assert_eq!(
+            crate::quality_preset(q).entropy_coder,
+            crate::EntropyCoder::Rans,
+            "q={q} should use rANS (5-19% smaller at identical PSNR below q=20)",
+        );
+    }
+    for q in [21, 40, 75, 100] {
+        assert_eq!(
+            crate::quality_preset(q).entropy_coder,
+            crate::EntropyCoder::Rice,
+            "q={q} should use Rice",
+        );
+    }
+}
+
 #[test]
 fn test_pframe_yuv422_sequence_roundtrip() {
     let (psnr1, psnr2) = pframe_chroma_sequence_psnr(crate::ChromaFormat::Yuv422);

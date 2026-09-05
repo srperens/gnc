@@ -854,6 +854,7 @@ fn build_ip_config(
         config.entropy_coder = gnc::EntropyCoder::Rice;
     }
     config.chroma_format = parse_chroma_format(chroma_format);
+            config.normalize_for_chroma();
     if let Some(ref br) = bitrate {
         config.target_bitrate = Some(parse_bitrate(br));
         config.rate_mode = parse_rate_mode(rate_mode);
@@ -999,6 +1000,7 @@ fn main() {
                 config.gpu_entropy_encode = false;
             }
             config.chroma_format = parse_chroma_format(&chroma_format);
+            config.normalize_for_chroma();
             config.bit_depth = bit_depth;
 
             let compressed = encoder.encode(&ctx, &rgb_data, w, h, &config);
@@ -1089,6 +1091,7 @@ fn main() {
                 config.dct_freq_strength = fs;
             }
             config.chroma_format = parse_chroma_format(&chroma_format);
+            config.normalize_for_chroma();
             config.bit_depth = bit_depth;
             config.tile_size = tile_size;
             config.overlap_pixels = overlap_pixels;
@@ -1502,6 +1505,7 @@ fn main() {
                     config_tw.entropy_coder = gnc::EntropyCoder::Rice;
                 }
                 config_tw.chroma_format = parse_chroma_format(&chroma_format);
+            config_tw.normalize_for_chroma();
                 println!(
                     "\n=== Temporal wavelet ({:?}, streaming, {}) ===",
                     temporal_mode,
@@ -2974,6 +2978,7 @@ fn main() {
             }
 
             config.chroma_format = parse_chroma_format(&chroma_format);
+            config.normalize_for_chroma();
 
             // Apply rate control settings
             if let Some(ref br) = bitrate {

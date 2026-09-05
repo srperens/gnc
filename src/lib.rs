@@ -513,6 +513,21 @@ pub fn luma_mad(frame_a: &[f32], frame_b: &[f32]) -> f32 {
 /// - 10: maximum compression (qstep=32)
 ///
 /// Intermediate values interpolate between anchor points (log-scale for qstep).
+impl CodecConfig {
+    /// Fall back to Rice when the chroma format cannot use the configured entropy coder.
+    ///
+    /// The rANS and Huffman GPU paths batch all three planes assuming the luma tile layout, so
+    /// they cannot encode subsampled chroma. Combining them used to panic deep in the encoder;
+    /// a legal, well-meant configuration should degrade rather than abort.
+    pub fn normalize_for_chroma(&mut self) {
+        if self.chroma_format != ChromaFormat::Yuv444
+            && self.entropy_coder != EntropyCoder::Rice
+        {
+            self.entropy_coder = EntropyCoder::Rice;
+        }
+    }
+}
+
 pub fn quality_preset(q: u32) -> CodecConfig {
     let q = q.clamp(1, 100);
 
@@ -617,9 +632,19 @@ pub fn quality_preset(q: u32) -> CodecConfig {
             WaveletType::CDF97
         },
         // Rice: 256 fully independent GPU-parallel streams per tile — matches our architecture.
-        // rANS is sequential (2048 ops/thread) and conflicts with GPU-parallel design.
-        // rANS available via --rans flag; wins at q≤40 but wrong default for this codec.
-        entropy_coder: EntropyCoder::Rice,
+        // rANS below q=20, Rice above. Measured on bbb, touchdown and kristensara: rANS is
+        // 5-19% smaller at q<=20 at identical PSNR, neutral-to-worse above, and the crossover is
+        // content-dependent (kristensara turns at q=20, the other two not until q>40). It costs
+        // ~8% encode and ~15% decode throughput, which the bitrate buys back several times over
+        // at low rates — and low rate is where MEAS-1 measured GNC furthest behind.
+        //
+        // Only 4:4:4: the rANS GPU path assumes all three planes share the luma tile layout.
+        // `normalize_for_chroma` falls back to Rice for subsampled formats.
+        entropy_coder: if q <= 20 {
+            EntropyCoder::Rans
+        } else {
+            EntropyCoder::Rice
+        },
         per_subband_entropy: disc.per_subband,
         adaptive_quantization: aq_enabled,
         aq_strength,

@@ -4479,3 +4479,80 @@ which EBU decides by expert viewing, not by VMAF.
 Re-run with a matched colour path (all codecs in the same 4:2:2 or 4:4:4 domain, no repeated RGB
 round-trip) before quoting any cross-codec number. Then repeat at 10-bit once FMT-1 lands, since
 EBU tests nothing below 10-bit 4:2:2.
+
+---
+
+## 2026-09-05 — Walking JPEG 2000's feature list: two wins, three negatives
+
+Continued from the wavelet-depth result. Each item is something JPEG 2000 does that GNC does not,
+measured in the real codec rather than simulated.
+
+### Negative: per-code-block parameter adaptation — ≤2.8%
+
+JPEG 2000 partitions each subband into 64x64 code-blocks and adapts its coder inside each; GNC
+codes a whole subband with one Rice `k`. `scripts/meas_codeblock_k.py` measures the ceiling using
+actual Golomb-Rice code lengths (not entropy, which would assume perfect adaptation and hide the
+effect):
+
+| qstep | whole subband | 64x64 blocks | 32x32 | 16x16 |
+|---|---|---|---|---|
+| 2.0 | 2.8794 bpp | +0.5% | +1.6% | **+2.8%** |
+| 4.0 | 2.0828 | −0.0% | +0.4% | +0.7% |
+| 8.0 | 1.5550 | −0.0% | −0.0% | −0.4% |
+| 16.0 | 1.2543 | −0.0% | −0.3% | −1.0% |
+
+Only helps at high rate, and the side cost of extra parameters overtakes it at low rate. GNC's
+per-subband `k` is already the right granularity.
+
+### Negative: subband quantiser weighting — uniform is correct
+
+JPEG 2000 derives a quantiser step per subband from the synthesis-basis norm. Those norms span
+**14.9x** on a 256px tile at 4 levels (LL 10.69 down to HH1 0.72), which looks like a large
+mis-allocation waiting to be fixed. It is not: GNC's existing `GNC_PHYSICAL_WEIGHTS` gradient,
+which pushes in exactly that direction (finest subbands coarser), loses to uniform by 8-14% at
+matched quality on all three images. GNC's CDF 9/7 already applies the K normalisation
+(`transform_97.wgsl`), so its coefficients are effectively normalised and a uniform step is right.
+The 14.9x spread is a property of *my offline model's* unnormalised lifting DWT, not of the codec —
+worth recording, because that normalisation is what flipped the earlier block-transform result from
+41% to 4%.
+
+### Negative: entropy-coder headroom is not what a naive model suggests
+
+A plain Golomb-Rice model (no zero-run coding) sits 19-168% above the zeroth-order entropy of the
+same coefficients, worst at low rate. That number is an artefact of the model: GNC's Rice backend
+has a significance map and ZRL, which is exactly what handles those zero runs. Context modelling
+on top of the true entropy is worth ~6%, consistent with the ≤3.4% measured earlier on inter
+residuals.
+
+### Win: entropy coder should follow quality — 5-19% at low rate
+
+GNC has a rANS backend, defaulted off with the note "wins at q≤40 but wrong default for this
+codec" (rANS is sequential, which conflicts with the GPU-parallel design). Measured, at identical
+PSNR:
+
+| | q=5 | q=10 | q=15 | q=20 | q=25 | q=40 | q=70 |
+|---|---|---|---|---|---|---|---|
+| bbb | **−16%** | −13% | −10% | −8% | −5% | +2% | +10% |
+| touchdown | **−19%** | −16% | −14% | −11% | −9% | −4% | +1% |
+| kristensara | −5% | −4% | −3% | 0% | +3% | +8% | +12% |
+
+Cost: ~8% encode and ~15% decode throughput. **Default is now rANS at q ≤ 20, Rice above** — the
+conservative crossover, where all three images win or break even. kristensara turns at q=20; the
+other two not until above q=40. Low rate is where MEAS-1 measured GNC furthest behind, so this
+lands where it is needed.
+
+Only 4:4:4: the rANS GPU path batches all three planes assuming the luma tile layout.
+
+### Bug fixed on the way: a legal config aborted the encoder
+
+Combining a subsampled chroma format with rANS, Huffman or Bitplane panicked deep in the encoder
+(`pipeline.rs:1685`). A legal, well-meant configuration should degrade, not abort.
+`CodecConfig::normalize_for_chroma()` now falls back to Rice, and the CLI calls it after parsing
+the format. Guarded by `test_non444_falls_back_to_rice` and
+`test_entropy_coder_follows_quality`.
+
+### Also noted
+
+The `--rice` CLI help claims Rice is "~30% worse compression" than rANS. Measured, Rice is
+*better* above q≈25 and by 8-12% at q=70. The help text is wrong and should be corrected to
+describe the actual crossover.

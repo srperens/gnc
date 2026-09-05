@@ -340,12 +340,31 @@ understated the 3→4 step by 5x (1.2% predicted, 6% measured), because Rice ada
 and an ideal-entropy model does not see that. So measure in-codec with a temporary widening
 before committing to the format change.
 
+### TUNE-3 — Entropy coder now follows quality (**DONE 2026-09-05**)
+rANS at q ≤ 20, Rice above. Measured at identical PSNR: rANS is 5-19% smaller below q=20 and
+neutral-to-worse above, crossover content-dependent (kristensara turns at q=20, bbb and touchdown
+not until above q=40). Costs ~8% encode and ~15% decode throughput. 4:4:4 only — the rANS GPU
+path batches all three planes on the luma tile layout.
+
+Also fixed: subsampled chroma combined with rANS/Huffman/Bitplane panicked in the encoder. A
+legal configuration should degrade, not abort; `CodecConfig::normalize_for_chroma()` falls back to
+Rice.
+
+**Follow-up:** the `--rice` CLI help says Rice is "~30% worse compression". Measured, Rice is
+*better* above q≈25 and by 8-12% at q=70. Text needs correcting.
+
 ### TUNE-2 — Wavelet levels default (**DONE 2026-09-05**)
 The quality preset used 3 levels below q=50. Measured 5-17% worse bitrate at equal or better
 quality on bbb, touchdown and kristensara at q=25/40/49, at no speed cost. Default is now 4
 everywhere.
 
 ### Closed by measurement 2026-09-05 — do not re-test
+- **Per-code-block Rice parameter adaptation** (JPEG 2000's code-block granularity): ≤2.8% at high
+  rate, negative at low rate (`scripts/meas_codeblock_k.py`). Per-subband `k` is already right.
+- **Subband quantiser weighting from synthesis norms** (what JPEG 2000 does): the existing
+  `GNC_PHYSICAL_WEIGHTS` gradient pushes in that direction and loses to uniform by 8-14% at
+  matched quality on all three images. GNC's CDF 9/7 applies the K normalisation, so its
+  coefficients are already effectively normalised and a uniform step is correct.
 - **Coefficient-level RDOQ**: +0.1% at best (`scripts/meas_rdoq.py`). GNC's uniform quantiser
   plus dead zone is already on its RD curve; this is why every dead-zone and QP sweep moved along
   the curve rather than off it.

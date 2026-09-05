@@ -213,6 +213,17 @@ was PSNR on stills rather than VMAF on video.
 The gap is multiples, not percentages. Work targeting single-digit-percent improvements is not
 addressing it.
 
+### Closed by measurement 2026-09-05 — do not re-test
+- **Coefficient-level RDOQ**: +0.1% at best (`scripts/meas_rdoq.py`). GNC's uniform quantiser
+  plus dead zone is already on its RD curve; this is why every dead-zone and QP sweep moved along
+  the curve rather than off it.
+- **Per-tile RD bit allocation** (PCRD's idea without truncatable codes): 0% within noise at
+  every rate (`scripts/meas_pcrd.py`). A uniform step already equalises the RD slope across tiles.
+  JPEG 2000's gain comes from truncating *embedded* per-code-block streams, which Rice cannot do.
+  **This retires the repo's standing hypothesis that PCRD accounts for ~89% of the intra gap.**
+- **Block intra prediction**: already measured at −11.76 dB / +29% bitrate (hence
+  `intra_prediction: false`), and worth only ~+6% to H.264 over JPEG 2000 regardless.
+
 ### MEAS-2 — Feature toggling: what contributes and how much? (todo)
 Systematic toggle measurement on crowd_run + park_joy, 10 frames, 4:4:4, q=75:
 - AQ on/off (GNC_NO_AQ)

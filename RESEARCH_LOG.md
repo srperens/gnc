@@ -4104,3 +4104,62 @@ change.
 Two real improvements found: GP16 motion-vector coding (5-15%, no quality cost) and GOP length
 (~11%, with a seeking trade-off). Together roughly 20%, against a measured 5-7x deficit. Twelve
 other levers measured and rejected.
+
+---
+
+## 2026-09-05 — Quantisation is already RD-efficient: RDOQ +0.1%, per-tile allocation 0%
+
+With the inter path measured out, attention moved to intra — which is worth attacking even for a
+video codec, since at the default GOP **I-frames are about half the total bitrate** (5 I-frames at
+820 KB out of 8.24 MB on the 33-frame run), and intra is only ~1.9x behind H.264 rather than 8x.
+
+The repo's own standing hypothesis for the intra gap (RESEARCH_LOG, gap decomposition vs
+JPEG 2000) was that ~89% of it is "quantization/transform quality, not entropy", most likely the
+absence of PCRD-style rate-distortion bit allocation. Two experiments, both negative.
+
+### Coefficient-level RDOQ — +0.1%
+
+`scripts/meas_rdoq.py`. For each wavelet coefficient, consider the rounded level and the levels
+below it (including zero) and pick the one minimising D + λR against the empirical per-subband
+code length. This needs no truncatable code and no bitstream change, unlike PCRD.
+
+Swept λ on bbb at qstep 4, compared at matched PSNR against the baseline curve:
+
+| λ scale | rate vs baseline at equal PSNR |
+|---|---|
+| 0.02–0.20 | **+0.0 to +0.1%** |
+| 0.40 | −2.0% |
+| 0.85 | −12.9% |
+
+The best achievable is a rounding error, and anything aggressive is worse. **GNC's uniform
+quantiser with its dead zone is already sitting on its own RD curve.** That also explains why
+every dead-zone and QP-scale sweep this session moved *along* the curve rather than off it — there
+was no slack to find.
+
+Why RDOQ pays in x264 but not here: x264's DCT coefficients are run-length and context coded
+within a block, so zeroing a trailing coefficient can eliminate a whole token. GNC's Rice+ZRL
+over 256 interleaved streams has much weaker inter-coefficient dependence, so there is no
+"cheap to drop" structure to exploit.
+
+### Per-tile RD allocation (the PCRD idea without truncatable codes) — 0%
+
+`scripts/meas_pcrd.py`. Each tile's RD curve computed independently over eleven quantiser steps,
+then compared at matched total rate:
+
+| uniform qstep | bpp | uniform PSNR | equal-slope PSNR | gain |
+|---|---|---|---|---|
+| 2.0 | 2.5131 | 49.01 | 49.01 | +0.00 dB |
+| 4.0 | 1.6164 | 43.28 | 43.22 | −0.06 dB |
+| 8.0 | 0.9313 | 38.16 | 38.16 | +0.00 dB |
+| 16.0 | 0.4769 | 33.69 | 33.73 | +0.04 dB |
+
+Zero, within noise, at every rate. A uniform quantiser step already equalises the RD slope across
+tiles, because the step *is* the slope. JPEG 2000's PCRD gain comes from truncating embedded
+per-code-block streams at fine granularity, not from choosing a step per block — and the embedded
+form is what Rice cannot do.
+
+**So the standing hypothesis for the intra gap is not supported.** Neither coefficient-level RD
+decisions nor per-tile bit allocation is where GNC loses to H.264 on intra. Also already settled
+in this repo and worth not re-testing: block intra prediction was implemented and measured at
+−11.76 dB / +29% bitrate (hence `intra_prediction: false`), and H.264's intra prediction is worth
+only ~+6% over JPEG 2000 anyway.

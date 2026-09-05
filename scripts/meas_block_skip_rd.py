@@ -73,6 +73,57 @@ def tile_wavelet_cost(resid, qstep, levels=3, dead_zone=0.75):
     return bits, float(((resid - rec) ** 2).sum())
 
 
+def dctN(blocks, n):
+    k = np.arange(n)
+    c = np.cos(np.pi * (2 * k[:, None] + 1) * k[None, :] / (2 * n))
+    sc = np.full(n, np.sqrt(2.0 / n))
+    sc[0] = np.sqrt(1.0 / n)
+    m = (c * sc[None, :]).T
+    return m @ blocks @ m.T
+
+
+def idctN(blocks, n):
+    k = np.arange(n)
+    c = np.cos(np.pi * (2 * k[:, None] + 1) * k[None, :] / (2 * n))
+    sc = np.full(n, np.sqrt(2.0 / n))
+    sc[0] = np.sqrt(1.0 / n)
+    m = (c * sc[None, :]).T
+    return m.T @ blocks @ m
+
+
+def block_dctN_rd_cost(resid, qstep, n=16, dead_zone=0.0):
+    """Block DCT of size n with a per-block RD skip decision, one bit per block.
+
+    The repo's own 2026-02-28 transform shootout measured DCT-16x16 as RD-equivalent to CDF-9/7
+    on intra content, and DCT-8x8 as slightly worse — so the earlier version of this experiment,
+    which used 8x8, was handicapping the block model for reasons unrelated to skip.
+    """
+    h, w = resid.shape
+    by, bx = h // n, w // n
+    lam = 0.85 * qstep * qstep
+
+    b = to_blocks(resid, n)
+    q = quantize(dctN(b, n), qstep, dead_zone)
+    rec = idctN(dequantize(q, qstep, dead_zone), n)
+
+    bits_per_block = np.zeros(q.shape[0])
+    for i in range(n):
+        for j in range(n):
+            sym = q[:, i, j]
+            vals, counts = np.unique(sym, return_counts=True)
+            p = counts / counts.sum()
+            cost = dict(zip(vals, -np.log2(p)))
+            bits_per_block += np.array([cost[v] for v in sym])
+
+    coded_dist = ((b - rec) ** 2).sum(axis=(1, 2))
+    skip_dist = (b ** 2).sum(axis=(1, 2))
+    skip = (skip_dist + lam) < (coded_dist + lam * (bits_per_block + 1.0))
+
+    bits = float(np.where(skip, 1.0, bits_per_block + 1.0).sum())
+    dist = float(np.where(skip, skip_dist, coded_dist).sum())
+    return bits, dist, float(skip.mean())
+
+
 def block_dct_rd_cost(resid, qstep, blk=16, dead_zone=0.0):
     """16x16 blocks, 8x8 DCT, per-block RD skip. One bit per block for the flag.
 

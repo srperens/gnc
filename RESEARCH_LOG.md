@@ -4045,3 +4045,62 @@ and every mechanism for saying it cheaply conflicts with tile-independent parall
 
 This is now a settled measurement rather than a hypothesis, and it bounds what any further inter
 work can achieve without revisiting that trade-off.
+
+---
+
+## 2026-09-05 — The hybrid answer, and a GOP-structure win
+
+**Question put by the project owner:** keep the wavelet for I-frames, use a different strategy
+for P/B. That is the right instinct — it is exactly what the ARCH-2 measurements point at — so it
+was tested properly rather than argued about.
+
+**Corrected an unfair handicap first.** The earlier block-coding experiment used an 8x8 DCT. The
+repo's own 2026-02-28 transform shootout had already measured DCT-16x16 as RD-*equivalent* to
+CDF-9/7 on intra content (48.0/1.9, 43.0/1.2, 38.4/0.7, 34.2/0.4 against 48.0/1.9, 43.0/1.1,
+38.4/0.7, 34.2/0.4) with DCT-8x8 slightly worse. So the block model was being penalised for its
+transform size, not for block coding as such. Re-ran with DCT-16 plus the same per-block RD skip:
+
+| sequence | qstep 4 wavelet | qstep 4 DCT-16 + skip | at matched PSNR |
+|---|---|---|---|
+| bbb (animation) | 0.7483 bpp @ 43.37 dB | 0.3588 bpp @ 38.92 dB, 87% skipped | wavelet **33-42% better** |
+| touchdown (camera) | 1.1271 bpp @ 41.67 dB | 0.3823 bpp @ 36.84 dB, 87% skipped | DCT **29% better** |
+
+Same content-dependent ±30% as the 8x8 version. **Transform size was not the issue, and a
+hybrid inter transform is worth roughly ±30% depending on content — not the 8x that is missing.**
+Three independent routes (8x8 DCT, 16x16 DCT, sub-tile masking inside the wavelet) now agree.
+
+### What did move: GOP structure
+
+Looking at the frame-type mix at matched quality exposed something simpler. At the default
+`ki=9`, GNC produces **2I + 8P + 7B** over 17 frames where x264 produces 2I + 4P + 11B. GNC is
+spending most of its frames on P — which are references, so their error propagates and they
+cannot be coded coarsely — while x264 spends most on disposable B-frames.
+
+The cause is that `ki=9` exactly matches the 8-frame pyramid group, so any trailing frames form a
+group too short for a pyramid and degrade to a P-chain.
+
+| 17 frames | mix | rate | VMAF |
+|---|---|---|---|
+| ki=9 (default) | 2I+8P+7B | 5 102 044 | 95.50 |
+| ki=17 | 1I+2P+14B | **3 878 022 (−24%)** | 95.02 |
+
+| 33 frames | mix | rate | VMAF |
+|---|---|---|---|
+| ki=9 (default) | 5I+7P+21B | 8 244 027 | 95.53 |
+| ki=17 | 3I+9P+21B | 7 329 462 (−11%) | 95.27 |
+| ki=33 | 2I+10P+21B | **6 956 021 (−16%)** | 95.07 |
+
+Normalised for the VMAF difference, a long GOP is worth roughly **11% BD-rate** on 33 frames and
+considerably more on short ones. x264 shows the same direction (keyint 9 → 17 takes it from
+1 184 259 to 854 597 bytes), so this is not a GNC quirk.
+
+**Not changed as a default.** GOP length is a real trade-off — longer GOPs mean coarser seeking
+and worse error resilience, both of which matter for the broadcast-contribution use case GNC
+targets. Recorded as a tuning recommendation and a backlog item rather than a silent default
+change.
+
+### Running total on the inter hunt
+
+Two real improvements found: GP16 motion-vector coding (5-15%, no quality cost) and GOP length
+(~11%, with a seeking trade-off). Together roughly 20%, against a measured 5-7x deficit. Twelve
+other levers measured and rejected.

@@ -175,6 +175,28 @@ every chroma plane unwritten, and the stale contents were still being coded.
 **Follow-up worth doing:** audit for other places deriving one plane's geometry from another's
 by a fixed factor. Three defects this session came from that single assumption.
 
+### TUNE-1 — Default keyframe interval fragments the B-pyramid (todo, P1)
+`ki=9` exactly matches the 8-frame pyramid group, so trailing frames form a group too short for a
+pyramid and degrade to a P-chain. Measured at 1080p q=70 4:2:0:
+
+| 17 frames | mix | rate | VMAF |
+|---|---|---|---|
+| ki=9 (default) | 2I+8P+7B | 5 102 044 | 95.50 |
+| ki=17 | 1I+2P+14B | **−24%** | 95.02 |
+
+| 33 frames | mix | rate | VMAF |
+|---|---|---|---|
+| ki=9 (default) | 5I+7P+21B | 8 244 027 | 95.53 |
+| ki=33 | 2I+10P+21B | **−16%** | 95.07 |
+
+Worth ~11% BD-rate on 33 frames, more on shorter ones. P-frames are references whose error
+propagates, so they cannot be coded coarsely; B-frames are disposable. x264 spends 4 P and 11 B
+where GNC spends 8 P and 7 B over the same 17 frames.
+
+**Not a free win:** longer GOPs mean coarser seeking and weaker error resilience, both of which
+matter for broadcast contribution. Needs a decision on the default, and probably a smarter rule
+than a fixed interval — e.g. never emit a group too short for a full pyramid.
+
 ### MEAS-1 — Correct video comparison GNC vs H.264 (**DONE 2026-09-05**)
 Harness: `scripts/meas1_vs_h264.py`. VMAF-scored, one normalised reference for both codecs,
 BD-rate over the overlapping quality range. 1080p 4:2:0, x264 at defaults.

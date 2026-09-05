@@ -3676,3 +3676,48 @@ PNG round trip.
 more often the harness than the codec. BUG-3's gate was wrong, the sub-pel validation had an
 inverted shift, and this had a colour-path mismatch. Cross-checking a new harness against an
 existing trusted number *before* drawing conclusions would have caught all three immediately.
+
+---
+
+## 2026-09-05 — MEAS-1 result: the video gap is ~5-7x, and almost all of it is inter
+
+First like-for-like, VMAF-scored comparison of GNC against H.264 on video.
+Harness: `scripts/meas1_vs_h264.py`. 1080p, 4:2:0, x264 at default settings, one normalised
+PNG-derived reference for every VMAF call, BD-rate integrated over the overlapping VMAF range.
+
+**Full video (ki=9, GNC I+B+P vs x264 defaults, 17 frames):**
+
+| sequence | BD-rate GNC vs H.264 | VMAF range |
+|---|---|---|
+| bbb | **+456.7%** | 76.3–97.3 |
+| touchdown | **+493.9%** | 77.3–99.0 |
+| old_town | **+672.1%** | 81.0–99.1 |
+
+Concretely on touchdown: GNC needs 1.48 bpp for VMAF 96.6; x264 reaches 95.8 at 0.33 bpp.
+
+**Intra only (ki=1 on both sides, 8 frames):**
+
+| sequence | BD-rate GNC vs H.264 all-I |
+|---|---|
+| bbb | +54.6% |
+| touchdown | +46.3% |
+
+**Decomposition.** Intra is roughly **+50%** behind H.264 at matched VMAF. Turning on inter
+coding multiplies the gap by a further **~8-10x**. So the inter path is where almost all of the
+deficit lives — which is the conclusion MEAS-4 reached from the other direction, now with a
+trustworthy number attached for the first time.
+
+**This supersedes the +13.9% figure** in BASELINE for spatial coding. That was PSNR-based, on
+single still images, against H.264 all-I. On video content scored with VMAF — the project's
+stated primary metric — intra measures +46-55%. The two are not contradictory so much as
+measuring different things; the video figure is the one that matters for a video codec.
+
+**Challenging the numbers.** GNC's path carries one extra RGB round trip (its only sequence
+output is PNG) that x264's does not; that is inherent to GNC's RGB-native pipeline, and it costs
+some VMAF at the high end but nothing like a factor of five. Both codecs get the same GOP length,
+the same source, the same reference, and the same VMAF invocation. x264 runs at its defaults —
+B-frames, CABAC, multi-reference, RD mode decision — which is the honest comparison against a
+codec as it actually ships.
+
+The size of the gap is itself the most important finding: previous work has been targeting
+percentage-level improvements against a deficit that is multiples, not percentages.

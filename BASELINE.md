@@ -1,6 +1,6 @@
 # GNC Benchmark Baseline
 
-Last updated: 2026-03-11
+Last updated: 2026-09-05
 Baseline commit: (subband weight fix — uniform weights default)
 Mode: Spatial-only, I+P+B, Rice entropy, ki=9, 7B-per-group pyramid, uniform subband weights
 
@@ -25,6 +25,24 @@ Previous (perceptual weights, #64): q=75 → 42.17 dB / 3.83 bpp / VMAF 95.05
 
 Note: bpp increased at q=75 because quality also increased (+0.25 VMAF, +2.28 dB PSNR for single-frame).
 BD-rate vs equal-VMAF comparison: uniform weights save ~18% bpp at matched VMAF.
+
+## Video vs H.264 (MEAS-1, 2026-09-05) — the headline number
+
+Measured with `scripts/meas1_vs_h264.py`: VMAF-scored, one normalised reference for both codecs,
+BD-rate over the overlapping quality range. 1080p, 4:2:0, 17 frames, x264 at its defaults.
+
+| | bbb | touchdown | old_town |
+|---|---|---|---|
+| full video (ki=9) | **+456.7%** | **+493.9%** | **+672.1%** |
+| intra only (ki=1, 8 frames) | +54.6% | +46.3% | — |
+
+**GNC needs roughly 5-7x the bitrate of H.264 for the same VMAF on video.** Intra accounts for
+about +50% of that; inter coding multiplies it a further 8-10x.
+
+This supersedes the +13.9% spatial BD-rate quoted below and elsewhere in the repo. That figure is
+PSNR-based, on single still images, against H.264 all-I — a different measurement, not a
+contradictory one, but not the number that matters for a video codec. Quote the table above when
+asked how GNC compares.
 
 ## Regression Rules
 

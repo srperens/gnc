@@ -106,10 +106,21 @@ every chroma plane unwritten, and the stale contents were still being coded.
 **Follow-up worth doing:** audit for other places deriving one plane's geometry from another's
 by a fixed factor. Three defects this session came from that single assumption.
 
-### MEAS-1 — Correct video comparison GNC vs H.264 (todo, **P1 — now a prerequisite**)
-Run H.264 (libx264, full inter, standard GOP) on crowd_run + park_joy, 10 frames, yuv420p.
-Measure PSNR and bpp per CRF value. Compute BD-rate against GNC 4:2:0 I+P+B (after BUG-1 fixed).
-Also GNC 4:4:4 vs H.264 yuv444p for fair comparison without chroma handicap.
+### MEAS-1 — Correct video comparison GNC vs H.264 (**DONE 2026-09-05**)
+Harness: `scripts/meas1_vs_h264.py`. VMAF-scored, one normalised reference for both codecs,
+BD-rate over the overlapping quality range. 1080p 4:2:0, x264 at defaults.
+
+| | bbb | touchdown | old_town |
+|---|---|---|---|
+| full video (ki=9) | **+456.7%** | **+493.9%** | **+672.1%** |
+| intra only (ki=1) | +54.6% | +46.3% | — |
+
+**GNC needs roughly 5-7x the bitrate of H.264 for the same VMAF on video.** Intra accounts for
+about +50%; inter multiplies the gap a further 8-10x. Supersedes the +13.9% spatial figure, which
+was PSNR on stills rather than VMAF on video.
+
+The gap is multiples, not percentages. Work targeting single-digit-percent improvements is not
+addressing it.
 
 ### MEAS-2 — Feature toggling: what contributes and how much? (todo)
 Systematic toggle measurement on crowd_run + park_joy, 10 frames, 4:4:4, q=75:

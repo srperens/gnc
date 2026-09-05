@@ -61,6 +61,12 @@ medium-cost incremental inter ideas. What it measured: the spatial layer is alre
 BD-rate +13.9% vs H.264 all-I, and *better* than H.264 all-I above ~36 dB — while the current
 I/P/B inter path saves only 17–27% vs all-I where H.264 saves 60–70%.
 
+**MEAS-1 (2026-09-05) measured the gap properly for the first time.** On video at matched VMAF,
+GNC needs **5-7x the bitrate of H.264** (BD-rate +457% / +494% / +672% on three sequences). Intra
+alone is +46-55%; inter coding multiplies the deficit a further 8-10x. The previously quoted
++13.9% was PSNR on still images, which is a different measurement and much more flattering than
+the video reality. See [BASELINE.md](BASELINE.md).
+
 **MEAS-4 (2026-09-05) located that gap.** It is *prediction quality*, not the coding model.
 Simulating both models on GNC's own motion-compensated residuals at matched distortion, an
 idealised per-block DCT with oracle block skip beats GNC's wavelet by only 4–23% at broadcast
@@ -89,8 +95,8 @@ GNC should become a **good, robust codec** — not optimized along a single axis
 | Property | Current | Target |
 |----------|---------|--------|
 | Encode speed | 31.7 fps (seq, 1080p q=75) | 60 fps |
-| Compression (intra) | BD-rate +13.9% vs H.264 all-I, +28.3% vs JPEG 2000 | ≤ H.264 all-I overall; within ~15% of JPEG 2000 |
-| Compression (inter) | I+P+B saves 17–27% vs all-I (49%/30% on bbb/touchdown at q=75) | substantially better via *prediction* — multi-reference first (#25); x264 saves 86–89% on the same content |
+| Compression (intra) | +46–55% vs H.264 all-I on video (VMAF); +13.9% on stills (PSNR) | ≤ H.264 all-I on the VMAF video measurement |
+| Compression (inter) | overall video BD-rate +457% to +672% vs H.264 | close the multiple, not percentages — see MEAS-1 |
 | Quality range | q=1–100 functional | smooth, predictable quality curve |
 | Robustness | basic test coverage | no artifacts, stable across q and content |
 | Bitstream | GNV1/GNV2 defined | well-specified, documented |

@@ -3721,3 +3721,47 @@ codec as it actually ships.
 
 The size of the gap is itself the most important finding: previous work has been targeting
 percentage-level improvements against a deficit that is multiples, not percentages.
+
+---
+
+## 2026-09-05 — Reported bitrate was inflated 27-58%: byte_size() counted raw MVs
+
+Chasing why GNC's inter frames cost so much, a static test settled it: 17 identical frames.
+x264 codes its P-frames at **181 bytes** and B-frames at **76 bytes**; GNC reported **164 992**
+and **109 936**. A codec spending 165 KB to say "nothing changed" is not a tuning problem.
+
+But the frame's own bit budget disagreed with its reported size: MV data 5.0 KB, tile headers
+1.1 KB, coefficient data 0.0 KB, all 64 tiles skipped — **6.1 KB of content against a reported
+164 992 bytes**. The container confirmed the budget: 1.91 MB actual against 3.77 MB reported.
+
+**Cause.** `CompressedFrame::byte_size()` summed per-component estimates and counted motion
+vectors as 4 raw bytes per block. The bitstream delta-codes them as zigzag varints. A 1080p
+P-frame carries 40960 split MVs, counted as 163 840 bytes against an actual ~5 KB — a 30x
+over-count on that component, and up to 9x on the frame.
+
+**Fix.** `byte_size()` now returns `serialize_compressed(self).len()` — the size measured by
+serializing, so it cannot drift from the bitstream again. Guarded by
+`test_byte_size_matches_serialized_length`.
+
+**Effect on reported numbers** (bbb, 1080p, ki=9, 4:2:0, 17 frames):
+
+| | reported before | reported after | actual container |
+|---|---|---|---|
+| q=40 | 3 955 190 (0.90 bpp) | **2 494 788 (0.57 bpp)** | 2 495 173 |
+| q=70 | 6 799 468 (1.54 bpp) | **5 367 040 (1.22 bpp)** | 5 367 425 |
+
+GNC's real bitrate is **21-37% lower** than the repo believed. The codec was always this good;
+the measurement was wrong. Every sequence bpp figure in BASELINE and in this log predating today
+is inflated by that much, and "saving vs all-I" comparisons were distorted because inter frames
+were over-counted far more than intra frames.
+
+**Rate control was also affected** — CBR/VBR targeted the inflated size, so it quantized more
+coarsely than the target required. That is now corrected as a side effect.
+
+**MEAS-1 is unaffected**: its harness measured real container bytes on disk, never
+`byte_size()`. The +457% / +494% / +672% BD-rates stand.
+
+**What this does not fix.** GNC still spends ~18 KB per inter frame on a completely static
+sequence where x264 spends 76-181 bytes — a 100-200x gap on the trivial case, now visible without
+the reporting error on top. The bits are MV data (5 KB for an all-zero MV field) and tile headers
+(1.1 KB), not coefficients. An all-zero MV field costing 5 KB is the next thing to look at.

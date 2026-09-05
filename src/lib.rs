@@ -713,25 +713,17 @@ pub struct ResidualStats {
 }
 
 impl CompressedFrame {
-    /// Total compressed size in bytes (all tiles + CfL alpha + weight map + MV overhead)
+    /// Total compressed size in bytes: exactly what this frame serializes to.
+    ///
+    /// Measured by serializing, rather than summing per-component estimates. An earlier version
+    /// counted motion vectors as 4 raw bytes per block, but the bitstream delta-codes them as
+    /// zigzag varints — so a 1080p P-frame's 40960 split MVs were counted as 164 KB against an
+    /// actual ~5 KB. That inflated every reported inter-frame size by up to 9x, and every
+    /// sequence bpp figure in the repo by 27-58%, while rate control targeted the inflated
+    /// number. Deriving the size from the serializer means it cannot drift from the bitstream
+    /// again.
     pub fn byte_size(&self) -> usize {
-        let tile_bytes = self.entropy.byte_size();
-        let cfl_bytes = self
-            .cfl_alphas
-            .as_ref()
-            .map_or(0, |a| a.alphas.len() * std::mem::size_of::<i16>());
-        let wm_bytes = self
-            .weight_map
-            .as_ref()
-            .map_or(0, |wm| wm.len() * std::mem::size_of::<f32>());
-        let mv_bytes = self.motion_field.as_ref().map_or(0, |mf| {
-            let fwd = mf.vectors.len() * 4; // 2 × i16 per block
-            let bwd = mf.backward_vectors.as_ref().map_or(0, |v| v.len() * 4);
-            let modes = mf.block_modes.as_ref().map_or(0, |m| m.len());
-            fwd + bwd + modes
-        });
-        let intra_bytes = self.intra_modes.as_ref().map_or(0, |m| m.len());
-        tile_bytes + cfl_bytes + wm_bytes + mv_bytes + intra_bytes
+        crate::format::serialize_compressed(self).len()
     }
 
     /// Bits per pixel

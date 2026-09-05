@@ -3284,6 +3284,47 @@ fn sequence_serialize_roundtrip(n: usize, ki: u32, w: u32, h: u32) {
     }
 }
 
+/// `byte_size()` must equal what the frame actually serializes to.
+///
+/// It used to sum per-component estimates, counting motion vectors as 4 raw bytes per block
+/// while the bitstream delta-codes them as varints. A 1080p P-frame's 40960 split MVs were
+/// counted as 164 KB against an actual ~5 KB, inflating every reported inter bpp in the repo and
+/// making rate control target a number 27-58% too high.
+#[test]
+fn test_byte_size_matches_serialized_length() {
+    let ctx = crate::GpuContext::new();
+    let mut encoder = EncoderPipeline::new(&ctx);
+
+    let w = 512u32;
+    let h = 512u32;
+    let frames_rgb: Vec<Vec<f32>> = (0..9i32)
+        .map(|i| make_moving_texture_frame(w, h, i))
+        .collect();
+    let refs: Vec<&[f32]> = frames_rgb.iter().map(|f| f.as_slice()).collect();
+
+    let mut config = crate::CodecConfig::default();
+    config.chroma_format = crate::ChromaFormat::Yuv420;
+    config.cfl_enabled = false;
+    config.tile_size = 256;
+    config.keyframe_interval = 9; // exercises I, B and P
+
+    for (i, c) in encoder
+        .encode_sequence(&ctx, &refs, w, h, &config)
+        .iter()
+        .enumerate()
+    {
+        let actual = crate::format::serialize_compressed(c).len();
+        assert_eq!(
+            c.byte_size(),
+            actual,
+            "frame {i} ({:?}): byte_size() reports {} against {} serialized",
+            c.frame_type,
+            c.byte_size(),
+            actual,
+        );
+    }
+}
+
 #[test]
 fn test_pframe_yuv422_sequence_roundtrip() {
     let (psnr1, psnr2) = pframe_chroma_sequence_psnr(crate::ChromaFormat::Yuv422);

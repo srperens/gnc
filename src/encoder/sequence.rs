@@ -45,11 +45,18 @@ fn tile_skip_motion_threshold(qstep: f32) -> f32 {
 /// Returns the tile skip threshold for the given quantization step.
 /// Tiles whose mean |coeff| is below this value are zeroed before Rice encoding.
 ///
-/// Currently returns 0.0 (disabled): explicit coefficient zeroing is not needed because
-/// the tile_skip_motion pass already forces MVs to zero for static tiles, so the
-/// quantiser drives those residuals to zero naturally.  Infrastructure kept for future use.
-fn tile_skip_threshold(_qstep: f32) -> f32 {
-    0.0
+/// Default 0.0 (disabled) on the reasoning that the tile_skip_motion pass already forces MVs to
+/// zero for static tiles, so the quantiser drives those residuals to zero naturally.
+///
+/// `GNC_TILE_SKIP_THRESH` sets the threshold as a multiple of qstep, for measuring what
+/// coefficient-domain tile skip is worth. MEAS-1 showed GNC spends ~85% of an inter frame's bits
+/// on coefficients and ~0.5 bits on every coefficient in the frame, where H.264 skips whole
+/// macroblocks for ~1 bit — so how much of that is buying perceptual quality is worth knowing.
+fn tile_skip_threshold(qstep: f32) -> f32 {
+    std::env::var("GNC_TILE_SKIP_THRESH")
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok())
+        .map_or(0.0, |m| qstep * m)
 }
 
 /// Pre-computed ME results for a P-frame.

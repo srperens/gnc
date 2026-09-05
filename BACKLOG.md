@@ -63,22 +63,21 @@ with the frame's own MV count. See
 rate down together. B₄, P and all 4:4:4 output bit-identical. Canary: `GNC_DIAGNOSTICS=1` prints
 `[bframe_chroma_mv] enc grid: ...` per B-frame.
 
-### BUG-2 — Pyramid reference-buffer defects (todo, P2)
-Two format-independent defects identified in the BUG-1 diagnosis and **not** addressed by that
-fix. Neither was implicated in the chroma collapse; both are wrong by inspection.
+### BUG-2 — Pyramid reference-buffer defects (**DONE 2026-09-05**)
+Two defects from the BUG-1 diagnosis, both measured before fixing. Writeup:
+[docs/decisions/0006-pyramid-reference-restore.md](docs/decisions/0006-pyramid-reference-restore.md).
 
-- **B₇'s encoder backward reference is stale.** `sequence.rs` `layer3_order`: B₅'s setup loads B₆
-  into `gpu_bwd_ref_planes`, then B₇ hits a no-op arm whose comment claims the future P is still
-  there. The encoder predicts B₇ from B₆ while the decoder loads P₈. Fix direction:
-  `1 => self.copy_pyramid_slot_to_bwd_ref(ctx, 4, plane_size)`.
-- **End-of-group reference restore is gated on 4:4:4.** In 4:2:0 pyramid the `else` branch calls
-  `swap_ref_planes()`, leaving `gpu_ref_planes` = B₆ rather than decoded P₈, so the next group's
-  P-frame is encoded against the wrong reference. Fix direction: use the slot-4 restore
-  unconditionally.
+- **B₇'s backward reference was stale.** Its `bwd_idx = 1` arm was a no-op asserting the future P
+  was still in the bwd buffer; B₁/B₃/B₅ had each overwritten it, leaving B₆. Now loads slot 4
+  explicitly. 4:4:4 ki=9: B₇ 39.21 → **40.17 dB** at 22% fewer bits.
+- **End-of-group reference restore was gated on 4:4:4.** In 4:2:0 the `else` branch left the
+  forward reference holding B₆ instead of the decoded anchor P, so the next group's P was encoded
+  against a reference the decoder does not have. Gate removed. 4:2:0 ki=17: P₁₆ 30.39 →
+  **40.35 dB**, sequence VMAF 84.10 → **95.68** (min 69.74 → 94.72), bpp −2.8%.
 
-Gate: per-frame PSNR in 4:4:4 pyramid should show B₇ measurably worse than B₁/B₃/B₅ today, and
-multi-GOP 4:2:0 should show drift from P₁₆ onward. Measure before fixing — if neither shows, the
-reasoning is wrong somewhere.
+**Why no test caught it:** every sequence test used ki ≤ 9, where the frame after a group is an
+I-frame and the restored reference is never read. Regression test
+`test_multi_group_yuv420_anchor_pframe` uses ki=17.
 
 ### BUG-3 — 4:2:0 collapses when the chroma plane is smaller than one tile (todo, P2)
 Found while building the BUG-1 regression test (2026-09-05). At 512x512 and 1024x1024 a 4:2:0

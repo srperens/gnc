@@ -989,7 +989,10 @@ impl EncoderPipeline {
                             _ => {}
                         }
                         match bwd_idx {
-                            1 => { /* future_P already in gpu_bwd_ref_planes (restored for B₆) */ }
+                            // future_P lives in slot 4; it is NOT still in gpu_bwd_ref_planes by
+                            // the time B₇ runs, because B₁/B₃/B₅ each overwrote bwd on their way
+                            // through this loop. Load it explicitly. (BUG-2)
+                            1 => self.copy_pyramid_slot_to_bwd_ref(ctx, 4, plane_size), // future_P
                             2 => self.copy_pyramid_slot_to_bwd_ref(ctx, 0, plane_size), // B₄
                             3 => self.copy_pyramid_slot_to_bwd_ref(ctx, 1, plane_size), // B₂
                             4 => self.copy_pyramid_slot_to_bwd_ref(ctx, 2, plane_size), // B₆
@@ -1071,7 +1074,12 @@ impl EncoderPipeline {
                 // any bwd manipulation. Restore it to gpu_ref_planes so the next group's P/I
                 // encode uses it as the forward reference.
                 // For non-pyramid path: swap back (original behaviour).
-                if pyramid_enabled && info.chroma_format == ChromaFormat::Yuv444 {
+                // The slot-4 restore exists precisely because bwd gets clobbered during the
+                // pyramid; that is true in every chroma format, so it must not be gated on 4:4:4.
+                // With the gate, 4:2:0 fell through to swap_ref_planes() and left gpu_ref_planes
+                // holding B₆ instead of the decoded P — the next group's P-frame was then encoded
+                // against a reference the decoder does not have. (BUG-2)
+                if pyramid_enabled {
                     self.copy_pyramid_slot_to_fwd_ref(ctx, 4, plane_size); // decoded_P → fwd
                 } else {
                     self.swap_ref_planes();

@@ -3134,6 +3134,63 @@ fn test_bframe_yuv420_chroma_mv_grid() {
     }
 }
 
+/// The second pyramid group's anchor P-frame must be as good as the first's.
+///
+/// Regression guard for BUG-2: the end-of-group reference restore was gated on 4:4:4, so in
+/// 4:2:0 the encoder fell through to `swap_ref_planes()` and left the forward reference holding
+/// B₆ instead of the decoded P. The next group's P-frame was then encoded against a reference
+/// the decoder does not have — measured at 30.4 dB against the first group's 40.5 dB on real
+/// content, with no test catching it because every existing sequence test uses ki <= 9, where
+/// the next frame is an I-frame and the restored reference is never read.
+///
+/// Needs ki > group_size (8) so a second group's anchor P actually exists.
+#[test]
+fn test_multi_group_yuv420_anchor_pframe() {
+    let ctx = crate::GpuContext::new();
+    let mut encoder = EncoderPipeline::new(&ctx);
+    let decoder = crate::decoder::pipeline::DecoderPipeline::new(&ctx);
+
+    let w = 512u32;
+    let h = 512u32;
+    let n = 17usize;
+    let frames_rgb: Vec<Vec<f32>> = (0..n as i32)
+        .map(|i| make_moving_texture_frame(w, h, i))
+        .collect();
+    let frame_refs: Vec<&[f32]> = frames_rgb.iter().map(|f| f.as_slice()).collect();
+
+    let mut config = crate::CodecConfig::default();
+    config.chroma_format = crate::ChromaFormat::Yuv420;
+    config.cfl_enabled = false;
+    config.tile_size = 256;
+    config.keyframe_interval = 17; // I [B x7] P [B x7] P — two groups, one keyframe
+
+    let compressed = encoder.encode_sequence(&ctx, &frame_refs, w, h, &config);
+    assert_eq!(compressed.len(), n);
+    assert_eq!(
+        compressed[8].frame_type,
+        crate::FrameType::Predicted,
+        "frame 8 should be the first group's anchor P",
+    );
+    assert_eq!(
+        compressed[16].frame_type,
+        crate::FrameType::Predicted,
+        "frame 16 should be the second group's anchor P — ki must exceed the group size",
+    );
+
+    let decoded = decoder.decode_sequence(&ctx, &compressed);
+    let p8 = compute_psnr(&frames_rgb[8], &decoded[8]);
+    let p16 = compute_psnr(&frames_rgb[16], &decoded[16]);
+    eprintln!("4:2:0 multi-group anchors: P8={p8:.2} dB  P16={p16:.2} dB");
+
+    // Some drift across a second group is legitimate. The defect produced a 10 dB cliff, so
+    // 3 dB separates a healthy reference chain from a broken one with room to spare.
+    assert!(
+        p16 > p8 - 3.0,
+        "second-group anchor P16 at {p16:.2} dB is more than 3 dB below P8 ({p8:.2} dB) — \
+         end-of-group reference restore broken? (see BUG-2)",
+    );
+}
+
 #[test]
 fn test_pframe_yuv422_sequence_roundtrip() {
     let (psnr1, psnr2) = pframe_chroma_sequence_psnr(crate::ChromaFormat::Yuv422);

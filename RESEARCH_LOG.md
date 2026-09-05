@@ -3388,3 +3388,39 @@ evidence, and it moves to the top of the inter work.
 
 **Coverage:** two quality points (q=75 broadcast, q=25 low bitrate) on two sequences of
 differing motion character. Not swept across resolution or GOP structure.
+
+---
+
+## 2026-09-05 — BUG-2 fixed: pyramid reference handling was format-dependent
+
+Two reference-buffer defects from the BUG-1 diagnosis, measured before fixing. Writeup:
+[docs/decisions/0006-pyramid-reference-restore.md](docs/decisions/0006-pyramid-reference-restore.md).
+
+**Gate measurements (before the fix), 1080p BBB q=75, `GNC_REF_DEBLOCK=0`:**
+- 4:4:4 ki=9: B₇ = 39.21 dB against B₁/B₃/B₅ at 41.19 / 40.43 / 40.30 — the one leaf frame whose
+  backward reference the loop had clobbered.
+- 4:2:0 ki=17: P₈ = 40.54 dB, **P₁₆ = 30.39 dB** at the same bitrate (547k vs 552k).
+- 4:4:4 ki=17: P₁₆ = 40.57 dB — unaffected. That contrast is what pinned the cause on the
+  `Yuv444` gate rather than on anything in the pyramid logic itself.
+
+**After:**
+
+| case | metric | before | after |
+|---|---|---|---|
+| 4:4:4 ki=9 | B₇ PSNR / bytes | 39.21 dB / 309 908 | **40.17 dB / 240 163** |
+| 4:2:0 ki=17 | P₁₆ PSNR | 30.39 dB | **40.35 dB** |
+| 4:2:0 ki=17 | VMAF mean / min | 84.10 / 69.74 | **95.68 / 94.72** |
+| 4:2:0 ki=17 | bpp | 1.3450 | **1.3072** |
+| 4:4:4 ki=17 | VMAF mean / min | 96.09 / 94.64 | 96.17 / 95.33 |
+| 4:2:0 ki=9 | VMAF mean / min | 96.13 / 93.68 | 96.19 / 94.74 |
+
+Quality up and rate down in every case.
+
+**Why it survived this long.** Every sequence test used ki ≤ 9. At ki=9 the group is 8 frames, so
+the frame after a group is an I-frame and the restored reference is never read — the defect is
+unobservable unless ki > group_size. The new test `test_multi_group_yuv420_anchor_pframe` uses
+ki=17 for that reason. This is the second time in this session that a defect hid behind a test
+parameter rather than behind missing code coverage; worth remembering that "there is a test for
+B-frames" is not the same as "the test reaches the path".
+
+**Tests:** 170 pass. Clippy clean on native and wasm32 --lib.

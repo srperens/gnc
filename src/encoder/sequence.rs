@@ -5189,6 +5189,28 @@ impl EncoderPipeline {
             (padded_w, padded_h, padded_pixels)
         };
 
+        // Mapping from the chroma 4x4 block grid onto the 16x16 B-frame ME grid. The decoder
+        // derives the identical value from the same constructor; see ChromaMvGrid.
+        let b_chroma_mv_grid = crate::encoder::motion::ChromaMvGrid::new(
+            padded_w,
+            padded_h,
+            ME_BLOCK_SIZE,
+            chroma_shift_x,
+            chroma_shift_y,
+        );
+        if diagnostics::enabled() {
+            eprintln!(
+                "[bframe_chroma_mv] enc grid: mv_blocks={}x{} shift=({},{}) me_blocks={} chroma_blocks={}x{}",
+                b_chroma_mv_grid.blocks_x,
+                b_chroma_mv_grid.blocks_y,
+                b_chroma_mv_grid.shift_x,
+                b_chroma_mv_grid.shift_y,
+                me_total_blocks,
+                chroma_padded_w / 4,
+                chroma_padded_h / 4,
+            );
+        }
+
         // === Batched GPU pipeline: preprocess + bidir ME + forward encode ===
         // MV/mode buffers stay on GPU — used directly by bidir MC.
         let fwd_mv_buf;
@@ -5298,6 +5320,11 @@ impl EncoderPipeline {
             }
 
             // 4:2.0 chroma-domain MC for B-frames: pre-scale both fwd and bwd MVs to chroma dims.
+            //
+            // The B-frame MV field is on the 16x16 ME grid, which is coarser than the chroma 4x4
+            // block grid the MC shader walks. Only me_total_blocks entries are scaled — the
+            // shader maps chroma blocks onto this grid via `b_chroma_mv_grid`, so there is no
+            // tail to fill and nothing for encoder and decoder to disagree about.
             if is_420 {
                 let mut cmd_scale =
                     ctx.device
@@ -5309,14 +5336,7 @@ impl EncoderPipeline {
                     &mut cmd_scale,
                     &fwd_mv_buf,
                     &bufs.mv_chroma_buf,
-                    // B-frame ME uses 16×16 blocks (me_total_blocks=8160), but mv_chroma_buf
-                    // holds one MV per 8×8 luma block (split_total_blocks=32640).  Pass the
-                    // full split count so entries beyond 8160 get zeroed via OOB reads — this
-                    // matches the decoder, which also dispatches split_total_blocks entries and
-                    // gets zeros for the out-of-bounds reads from mv_buf.
-                    // BUG: using me_total_blocks leaves entries 8160..32640 stale across
-                    // frames, causing encoder/decoder mismatch for all B-frames after B₄.
-                    bufs.split_total_blocks,
+                    me_total_blocks,
                     chroma_shift_x,
                     chroma_shift_y,
                 );
@@ -5332,7 +5352,7 @@ impl EncoderPipeline {
                     &mut cmd_scale_bwd,
                     &bwd_mv_buf,
                     &bufs.mv_chroma_buf_bwd,
-                    bufs.split_total_blocks, // same rationale as fwd
+                    me_total_blocks, // same grid as fwd
                     chroma_shift_x,
                     chroma_shift_y,
                 );
@@ -5442,6 +5462,7 @@ impl EncoderPipeline {
                         chroma_padded_w,
                         chroma_padded_h,
                         true, // forward: compute residual
+                        b_chroma_mv_grid,
                     );
 
                     // Diagnostics
@@ -6314,6 +6335,13 @@ impl EncoderPipeline {
                     chroma_padded_w,
                     chroma_padded_h,
                     false, // inverse: recon = residual + prediction
+                    crate::encoder::motion::ChromaMvGrid::new(
+                        padded_w,
+                        padded_h,
+                        crate::encoder::motion::ME_BLOCK_SIZE,
+                        chroma_shift_x,
+                        chroma_shift_y,
+                    ),
                 );
 
                 // Step 6: NN-upsample → recon_out (luma dims)

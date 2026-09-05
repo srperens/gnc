@@ -35,30 +35,59 @@ MEAS-4 is designed to answer that before anything gets built. Until then the pri
 
 ## Active priority list
 
-### BUG-1 — 4:2:0 pyramid B-frame chroma bug (PRIO 1, diagnosed — awaiting GPU confirmation + fix)
-B-frames at pyramid layers 2–3 with 4:2:0 show ~22–26 dB PSNR despite 2–4 bpp. I-frames and P-frames
-are unaffected (42 dB). B₄ (layer 1, direct reference to I/P) works (38 dB). The error cascades
-through the chroma reference chain: B₂/B₆ reference B₄ which is 4:2:0-coded, leaf-B references B₂/B₆.
+### BUG-1 — 4:2:0 pyramid B-frame chroma bug (**DONE 2026-09-05**)
+True B-frames in 4:2:0 reconstructed 4–6 dB below their bitrate; B₄ and P-frames unaffected;
+4:4:4 unaffected.
 
-**Root-cause diagnosis (2026-09-04, code-reading — full writeup in [docs/BUG-1_DIAGNOSIS.md](docs/BUG-1_DIAGNOSIS.md)):**
-Primary candidate (HIGH confidence, MV field domain): encoder/decoder mismatch in the scaled
-chroma-MV tail. `dispatch_mv_scale` runs `split_total_blocks` (32640) threads over the B-frame's
-8160-entry MV buffer. The encoder's tail entries come from out-of-bounds reads (zero/clamped);
-the decoder's persistent `mv_buf` was grown to ≥32640 entries by earlier P/B₄ split-MV decodes
-and is never cleared, so its tail reads are **in-bounds stale P-frame MVs**. The chroma MC shader
-indexes the full 32640-block chroma grid → the bottom ~75% of Co/Cg is predicted with different
-MVs on encoder vs decoder. Explains the exact signature: I/P/B₄ fine (full split MVs), 4:4:4 fine
-(no chroma MV scaling), layers 2–3 broken and cascading, high bpp wasted.
-Secondary candidates: `block_modes` tail mismatch (same mechanism); B₇ encoder bwd-ref stale
-(B₆ instead of P₈, `sequence.rs:972–997`, all formats); end-of-group ref restore gated on Yuv444
-(`sequence.rs:1074–1078` — next GOP's P encoded against wrong reference in 4:2:0); encoder-only
-ref deblocking (noise floor — run confirmations with `GNC_REF_DEBLOCK=0`).
+**Root cause** (measured, not the one the diagnosis led with): the chroma MC shader indexed the
+MV and block-mode fields with the chroma 4×4 block grid's row stride, but a true B-frame's MV
+field is on the 16×16 luma ME grid — half the resolution on each axis. Every chroma block read a
+spatially unrelated MV. The encoder/decoder tail divergence identified in
+[docs/BUG-1_DIAGNOSIS.md](docs/BUG-1_DIAGNOSIS.md) was real but secondary. A third defect found
+by the canary: luma and chroma pad to a tile multiple independently, so the two grids are not
+proportional (1080p → 192 chroma rows vs 80 MV rows) and the surplus rows indexed past the field
+on the P path too.
 
-**Next (dev machine, has GPU):** run confirmation diagnostics (a)–(d) from the writeup — the
-per-region chroma PSNR split (top 25% vs bottom 75% of the plane) is a one-run smoking gun —
-then implement the fix shape in the writeup (explicit tail zeroing on both sides, or proper
-16×16→8×8 MV spread which also fixes the #48 stride mismatch) plus the two one-line ref fixes.
-Also add a flat (non-pyramid) 4:2:0 B-frame roundtrip test: candidate 1 predicts it is broken too.
+**Fix:** `ChromaMvGrid` states the mapping explicitly, derived from block geometry and built from
+one constructor on both sides; the shader clamps to the field extent; `mv_scale` is dispatched
+with the frame's own MV count. See
+[docs/decisions/0004-chroma-mv-grid-mapping.md](docs/decisions/0004-chroma-mv-grid-mapping.md).
+
+**Result** (1080p q=75, ki=9, 4:2:0, `GNC_REF_DEBLOCK=0`): worst B-frame +4.6 dB (BBB) / +3.7 dB
+(touchdown); VMAF mean +0.61 / +0.42, VMAF min +2.58 / +2.10; bpp −1.4% / −0.4%. Quality up and
+rate down together. B₄, P and all 4:4:4 output bit-identical. Canary: `GNC_DIAGNOSTICS=1` prints
+`[bframe_chroma_mv] enc grid: ...` per B-frame.
+
+### BUG-2 — Pyramid reference-buffer defects (todo, P2)
+Two format-independent defects identified in the BUG-1 diagnosis and **not** addressed by that
+fix. Neither was implicated in the chroma collapse; both are wrong by inspection.
+
+- **B₇'s encoder backward reference is stale.** `sequence.rs` `layer3_order`: B₅'s setup loads B₆
+  into `gpu_bwd_ref_planes`, then B₇ hits a no-op arm whose comment claims the future P is still
+  there. The encoder predicts B₇ from B₆ while the decoder loads P₈. Fix direction:
+  `1 => self.copy_pyramid_slot_to_bwd_ref(ctx, 4, plane_size)`.
+- **End-of-group reference restore is gated on 4:4:4.** In 4:2:0 pyramid the `else` branch calls
+  `swap_ref_planes()`, leaving `gpu_ref_planes` = B₆ rather than decoded P₈, so the next group's
+  P-frame is encoded against the wrong reference. Fix direction: use the slot-4 restore
+  unconditionally.
+
+Gate: per-frame PSNR in 4:4:4 pyramid should show B₇ measurably worse than B₁/B₃/B₅ today, and
+multi-GOP 4:2:0 should show drift from P₁₆ onward. Measure before fixing — if neither shows, the
+reasoning is wrong somewhere.
+
+### BUG-3 — 4:2:0 collapses when the chroma plane is smaller than one tile (todo, P2)
+Found while building the BUG-1 regression test (2026-09-05). At 512x512 and 1024x1024 a 4:2:0
+pyramid GOP is healthy (I 38.1 dB, B 33–38, P 37.9). At **256x256 with tile_size=256** the whole
+GOP degrades progressively — I0 38.1, then 31.6 / 28.0 / 25.9 / 25.6 / 22.5 / 23.0 / 23.9, P8
+**20.6** — while the identical content in 4:4:4 stays flat at 42–44 dB across every frame.
+
+P-frames are affected too, so this is **not** the BUG-1 chroma MV mapping (that path is
+bit-identical for P). The distinguishing condition is that the chroma plane (128x128) is smaller
+than one tile, so the suspicion is chroma tile/padding handling at sub-tile plane sizes.
+
+Reproduce: `test_bframe_yuv420_chroma_mv_grid` with w=h=256 instead of 512. Gate before fixing:
+confirm it tracks `chroma_plane < tile_size` rather than the absolute resolution, e.g. 256x256
+with `tile_size=128` should be healthy if the theory holds.
 
 ### MEAS-1 — Correct video comparison GNC vs H.264 (todo)
 Run H.264 (libx264, full inter, standard GOP) on crowd_run + park_joy, 10 frames, yuv420p.

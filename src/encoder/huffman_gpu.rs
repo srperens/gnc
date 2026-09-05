@@ -419,7 +419,7 @@ impl GpuHuffmanEncoder {
                     for s in 0..HUFFMAN_ALPHABET_SIZE {
                         if s < cb.0.len() && cb.0[s] > 0 {
                             codebook_data[cb_base + s] =
-                                ((cb.0[s] as u32) << 16) | (cb.1[s] as u32);
+                                ((cb.0[s] as u32) << 16) | cb.1[s];
                         }
                     }
 
@@ -431,8 +431,7 @@ impl GpuHuffmanEncoder {
                 for g in 0..num_groups {
                     let sum = zrl_data[t * ZRL_STRIDE + g * 2] as u64;
                     let count = zrl_data[t * ZRL_STRIDE + g * 2 + 1] as u64;
-                    let k = if count > 0 {
-                        let mean = sum / count;
+                    let k = if let Some(mean) = sum.checked_div(count) {
                         if mean == 0 {
                             0u32
                         } else {

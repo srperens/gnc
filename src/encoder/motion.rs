@@ -4,6 +4,9 @@ use wgpu::util::DeviceExt;
 
 use crate::GpuContext;
 
+/// Chroma MC block size in chroma pixels.
+pub const CHROMA_BLOCK_SIZE: u32 = 4;
+
 pub const ME_BLOCK_SIZE: u32 = 16;
 pub const ME_SEARCH_RANGE: u32 = 32;
 /// Fine search range when using temporal MV predictor (±pixels).
@@ -59,6 +62,72 @@ struct MotionCompensateParams {
     total_pixels: u32,
     _pad0: u32,
     _pad1: u32,
+}
+
+/// How the chroma 4x4 block grid maps onto the motion-vector / block-mode field.
+///
+/// The chroma MC shader runs one thread per chroma pixel and derives a block index from the
+/// pixel position. That index is only a valid index into the MV field when the two grids
+/// coincide, which is true for P-frames (split MVs, one per 8x8 luma block) but false for
+/// B-frames (ME MVs, one per 16x16 luma block -> half the resolution on each axis). Encoder and
+/// decoder must agree on this mapping exactly, so both build it here rather than open-coding it.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ChromaMvGrid {
+    /// Row stride of the MV field.
+    pub blocks_x: u32,
+    /// Number of rows in the MV field; used to clamp padding blocks into range.
+    pub blocks_y: u32,
+    /// Right-shift taking a chroma block x to an MV-field x.
+    pub shift_x: u32,
+    /// Right-shift taking a chroma block y to an MV-field y.
+    pub shift_y: u32,
+}
+
+impl ChromaMvGrid {
+    /// `mv_block_size` is the MV field's block size in luma pixels (16 for the B-frame ME grid,
+    /// 8 for the P-frame split grid). `chroma_shift_{x,y}` are the plane's subsampling shifts.
+    ///
+    /// The shifts are derived from block geometry, not from the ratio of grid dimensions: the
+    /// chroma plane is padded to a tile multiple independently of luma, so those grids are not
+    /// proportional (e.g. 1080p -> luma 2048x1280, chroma 1024x768) and a ratio would be both
+    /// wrong and not a power of two.
+    pub fn new(
+        padded_w: u32,
+        padded_h: u32,
+        mv_block_size: u32,
+        chroma_shift_x: u32,
+        chroma_shift_y: u32,
+    ) -> Self {
+        // Luma pixels spanned by one 4x4 chroma block on each axis.
+        let luma_span_x = CHROMA_BLOCK_SIZE << chroma_shift_x;
+        let luma_span_y = CHROMA_BLOCK_SIZE << chroma_shift_y;
+        Self {
+            blocks_x: padded_w / mv_block_size,
+            blocks_y: padded_h / mv_block_size,
+            shift_x: (mv_block_size / luma_span_x.max(1)).max(1).trailing_zeros(),
+            shift_y: (mv_block_size / luma_span_y.max(1)).max(1).trailing_zeros(),
+        }
+    }
+}
+
+/// Parameters for chroma bidirectional MC.
+///
+/// Same leading layout as [`MotionCompensateParams`], but the trailing words carry the MV-grid
+/// mapping instead of padding: the chroma 4x4 block grid and the MV field grid coincide for
+/// P-frames but not for B-frames, so the mapping has to be stated rather than assumed 1:1.
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct BidirChromaParams {
+    width: u32,
+    height: u32,
+    block_size: u32,
+    mode: u32,
+    blocks_x: u32,
+    total_pixels: u32,
+    mv_blocks_x: u32,
+    mv_shift: u32, // low 16 bits: x, high 16 bits: y
+    mv_blocks_y: u32,
+    _pad: [u32; 3],
 }
 
 /// Staging buffers for deferred bidir data readback.
@@ -1424,20 +1493,22 @@ impl MotionEstimator {
         width: u32,
         height: u32,
         forward: bool,
+        mv_grid: ChromaMvGrid,
     ) {
         let total_pixels = width * height;
-        let blocks_x = width / 4; // chroma block size = 4 (half of luma 8)
-        let _blocks_y = height / 4;
+        let blocks_x = width / CHROMA_BLOCK_SIZE;
 
-        let params = MotionCompensateParams {
+        let params = BidirChromaParams {
             width,
             height,
-            block_size: 4,
+            block_size: CHROMA_BLOCK_SIZE,
             mode: u32::from(!forward), // 0 = forward (residual), 1 = inverse (reconstruct)
             blocks_x,
             total_pixels,
-            _pad0: 0,
-            _pad1: 0,
+            mv_blocks_x: mv_grid.blocks_x,
+            mv_shift: mv_grid.shift_x | (mv_grid.shift_y << 16),
+            mv_blocks_y: mv_grid.blocks_y,
+            _pad: [0; 3],
         };
         let params_buf = ctx
             .device

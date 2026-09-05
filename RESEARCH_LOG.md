@@ -3215,3 +3215,87 @@ Prior figure (+171–216% vs H.264) compared GNC all-I against H.264 with full i
 1. Context coding — parent-child k-parameter prediction (estimated +0.1–0.2 bpp) — already implemented (#53)
 2. Per-tile bit allocation (PCRD proxy) — requires softer compression model — hard with Rice
 3. Better subband energy decorrelation — depends on wavelet filter design
+
+---
+
+## 2026-09-05 — BUG-1 fixed: chroma MC indexed the B-frame MV field on the wrong grid
+
+**Hypothesis under test** (from `docs/BUG-1_DIAGNOSIS.md`, HIGH confidence): 4:2:0 pyramid
+B-frame chroma collapse is an encoder/decoder mismatch in the *tail* of the scaled chroma-MV
+buffer — the encoder reads out of bounds from a short buffer while the decoder reads stale
+P-frame MVs from its grown, never-cleared `mv_buf`.
+
+**Verdict: partly right, and incomplete.** The tail divergence is real and is exactly as
+described. But it is the *second* of two defects, and not the larger one. The chroma MC shader
+indexes the MV field with the chroma block grid's row stride (256 columns at 1080p) while a
+true B-frame's MV field is on the 16×16 ME grid (128 columns). Every chroma block therefore read
+a spatially unrelated MV — the prediction was wrong across the whole plane, not only past the
+8160/10240-entry boundary. `block_modes` was wrong the same way.
+
+A third defect was found by the canary during the fix: luma and chroma are padded to a tile
+multiple independently (1080p → luma 2048×1280, chroma 1024×768), so the chroma grid is 192 rows
+against the MV grid's 80 — ratio 2.4, not a power of two. A mapping derived from grid dimensions
+is therefore wrong in principle, and the surplus rows index past the field on the P path too.
+That one was latent (it lives in padding, so it never showed in PSNR) but it was a real
+encoder/decoder divergence.
+
+**Fix:** `ChromaMvGrid` derives stride and per-axis shifts from block geometry, both sides
+construct it from the same constructor, and the shader clamps to the field extent. See
+[docs/decisions/0004-chroma-mv-grid-mapping.md](docs/decisions/0004-chroma-mv-grid-mapping.md).
+The alternative of zero-filling both tails was rejected: it would have made encoder and decoder
+agree on a prediction that was still wrong.
+
+**Measurement.** 1080p, q=75, 17 frames, ki=9, 4:2:0, `GNC_REF_DEBLOCK=0`, rANS.
+
+| Frame | BBB before | BBB after | Δ | touchdown before | touchdown after | Δ |
+|---|---|---|---|---|---|---|
+| 1 [B] | 36.23 | 39.90 | +3.67 | 34.10 | 36.67 | +2.57 |
+| 2 [B] | 36.02 | 39.52 | +3.50 | 34.83 | 37.85 | +3.02 |
+| 3 [B] | 33.44 | 39.39 | +5.95 | 32.86 | 36.79 | +3.93 |
+| 4 [B₄] | 40.81 | 40.81 | 0.00 | 39.40 | 39.40 | 0.00 |
+| 5 [B] | 35.68 | 39.21 | +3.53 | 33.98 | 36.95 | +2.97 |
+| 6 [B] | 35.62 | 39.22 | +3.60 | 34.64 | 37.96 | +3.32 |
+| 7 [B] | 32.75 | 37.33 | +4.58 | 31.36 | 35.02 | +3.66 |
+| 8 [P] | 40.54 | 40.54 | 0.00 | 39.42 | 39.42 | 0.00 |
+
+| Sequence | VMAF mean | VMAF min | bpp |
+|---|---|---|---|
+| BBB before | 95.52 | 91.10 | 1.7900 |
+| BBB after | **96.13** | **93.68** | **1.7646** |
+| touchdown before | 97.17 | 92.86 | 2.0640 |
+| touchdown after | **97.59** | **94.96** | **2.0561** |
+
+**Challenging the numbers.** B₄ and P are unchanged to the byte, which is the control: they use
+the split-MV path where the two grids genuinely coincide, so the fix must not touch them, and it
+does not. 4:4:4 output is bit-identical before and after — that path has no chroma MC at all.
+The gain appears only where the model predicts it. Quality rose while rate fell on both
+sequences; a fix that merely re-aligned the two sides would have raised quality at higher rate,
+so the improvement is in the prediction, not in the agreement. Residual gap to 4:4:4 is
+1.3–1.9 dB, which is the ordinary 4:2:0 chroma penalty.
+
+**Regression test.** `test_bframe_yuv420_chroma_mv_grid` encodes a 512x512 translating-texture
+GOP in 4:2:0 and asserts every true-B frame is within 6 dB of the P-path anchor. Verified to
+discriminate: passes with the fix (worst B 4.8 dB below the anchor), fails with the shader
+mapping reverted (worst B 13.0 dB below). Three false starts worth recording, because each
+would have produced a test that passed vacuously:
+- A hard checkerboard translating 3 px/frame tripped **scene-cut detection**; the encoder emitted
+  I and P frames only and the "B-frame" assertions measured nothing. The test now asserts frame
+  types and the presence of backward vectors before it measures quality.
+- Decoding with `decoder.decode()` per frame in **display order** is wrong for B-frames, which
+  reference a future anchor. `decode_sequence` handles the reordering.
+- At **256x256** the test tripped an unrelated defect (BUG-3 below) that masked the signal.
+
+**BUG-3 found while doing this.** At 256x256 with tile_size=256 — i.e. a chroma plane (128x128)
+smaller than one tile — the entire 4:2:0 GOP degrades progressively (I0 38.1 dB down to P8
+20.6 dB) while the same content in 4:4:4 is flat at 42–44 dB. P-frames are affected, so it is not
+the BUG-1 mapping. Logged as BUG-3; the regression test uses 512x512 to avoid it.
+
+**Not addressed** (identified in the diagnosis, still open — see BACKLOG BUG-2):
+candidate 3 (B₇'s encoder backward reference is B₆, not P₈) and candidate 4 (end-of-group
+reference restore is gated on 4:4:4). Both are format-independent reference-buffer defects and
+neither is implicated in the collapse fixed here.
+
+**Tests:** 169 pass (150 lib + 19 integration). Clippy clean on native and `--target wasm32-unknown-unknown --lib`
+(also fixed 5 pre-existing warnings from a newer clippy). Note: `cargo clippy --release
+--target wasm32-unknown-unknown` without `--lib` fails on the binary target — `main.rs` is not
+wasm-compatible. Pre-existing; the CLAUDE.md command should specify `--lib`.

@@ -328,7 +328,7 @@ fn estimate_mv_delta_size(vectors: &[[i16; 2]], block_size: u32, width: u32, til
     // Count non-skip blocks and estimate varint sizes
     let padded_w = width.div_ceil(tile_size) * tile_size;
     let blocks_x = (padded_w / block_size) as usize;
-    let blocks_y = if blocks_x > 0 { n / blocks_x } else { 0 };
+    let blocks_y = n.checked_div(blocks_x).unwrap_or(0);
     let mut varint_bytes = 0usize;
     for by in 0..blocks_y {
         for bx in 0..blocks_x {

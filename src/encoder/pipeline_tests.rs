@@ -3019,6 +3019,121 @@ fn pframe_chroma_sequence_psnr(chroma_fmt: crate::ChromaFormat) -> (f64, f64) {
     (psnr1, psnr2)
 }
 
+/// Textured frame translated by `shift` pixels.
+///
+/// Texture rather than a smooth gradient, so that a wrong motion vector produces a visible
+/// residual instead of being masked by local flatness — but smooth texture (summed sinusoids)
+/// rather than a hard checkerboard, which would trip scene-cut detection at these shifts and
+/// turn the sequence into all-I frames.
+fn make_moving_texture_frame(w: u32, h: u32, shift: i32) -> Vec<f32> {
+    use std::f32::consts::TAU;
+    let mut data = Vec::with_capacity((w * h * 3) as usize);
+    for y in 0..h as i32 {
+        for x in 0..w as i32 {
+            let sx = (x + shift) as f32;
+            let fy = y as f32;
+            let a = (sx / 37.0 * TAU).sin() * (fy / 53.0 * TAU).cos();
+            let b = (sx / 71.0 * TAU).cos() * (fy / 29.0 * TAU).sin();
+            data.push((128.0 + 60.0 * a + 30.0 * b).clamp(0.0, 255.0));
+            data.push((128.0 - 45.0 * a + 50.0 * b).clamp(0.0, 255.0));
+            data.push((128.0 + 35.0 * b - 40.0 * a).clamp(0.0, 255.0));
+        }
+    }
+    data
+}
+
+/// True B-frames in 4:2:0 must reconstruct as well as the frames coded through the P path.
+///
+/// Regression guard for BUG-1: the chroma MC shader indexed the MV/mode field with the chroma
+/// block grid's row stride, but a true B-frame's MV field is on the coarser 16x16 luma ME grid.
+/// Every chroma block read a spatially unrelated MV, and indices past the field's end resolved
+/// differently on encoder (short buffer, out of bounds) and decoder (grown, stale buffer).
+///
+/// The content translates frame to frame so the P-frame MV field is non-zero — with a static
+/// scene the stale-MV half of the defect is invisible. See
+/// docs/decisions/0004-chroma-mv-grid-mapping.md.
+#[test]
+fn test_bframe_yuv420_chroma_mv_grid() {
+    let ctx = crate::GpuContext::new();
+    let mut encoder = EncoderPipeline::new(&ctx);
+    let decoder = crate::decoder::pipeline::DecoderPipeline::new(&ctx);
+
+    // 512x512, not 256x256: at 256 the chroma plane (128x128) is smaller than one 256px tile,
+    // which trips a separate chroma padding defect that would mask this test (see BUG-3).
+    let w = 512u32;
+    let h = 512u32;
+    let frames_rgb: Vec<Vec<f32>> = (0..9)
+        .map(|i| make_moving_texture_frame(w, h, i))
+        .collect();
+    let frame_refs: Vec<&[f32]> = frames_rgb.iter().map(|f| f.as_slice()).collect();
+
+    let mut config = crate::CodecConfig::default();
+    config.chroma_format = crate::ChromaFormat::Yuv420;
+    config.cfl_enabled = false; // CfL requires 4:4:4
+    config.tile_size = 256;
+    config.keyframe_interval = 9; // I [B x7] P — one full pyramid group
+
+    let compressed = encoder.encode_sequence(&ctx, &frame_refs, w, h, &config);
+    assert_eq!(compressed.len(), 9);
+
+    // The test is only meaningful if true (bidirectionally predicted) B-frames were actually
+    // produced. Scene-cut detection turning the sequence into I/P frames would make this pass
+    // vacuously, so check the structure before measuring quality.
+    assert_eq!(compressed[0].frame_type, crate::FrameType::Intra, "frame 0 should be I");
+    assert_eq!(compressed[8].frame_type, crate::FrameType::Predicted, "frame 8 should be P");
+    for i in 1..8 {
+        assert_eq!(
+            compressed[i].frame_type,
+            crate::FrameType::Bidirectional,
+            "frame {i} should be B — scene-cut detection may have fired",
+        );
+    }
+    let true_b = |i: usize| {
+        compressed[i]
+            .motion_field
+            .as_ref()
+            .is_some_and(|m| m.backward_vectors.is_some())
+    };
+    assert!(
+        (1..8).any(true_b),
+        "no frame carries backward vectors — the true-B chroma path is not being exercised",
+    );
+
+    // B-frames reference a future anchor, so they must be decoded in coding order —
+    // decode_sequence handles the reordering and returns frames in display order.
+    let decoded = decoder.decode_sequence(&ctx, &compressed);
+    assert_eq!(decoded.len(), 9);
+    let psnr: Vec<f64> = decoded
+        .iter()
+        .enumerate()
+        .map(|(i, d)| compute_psnr(&frames_rgb[i], d))
+        .collect();
+    eprintln!(
+        "4:2:0 B-frame PSNR: I0={:.2} B1={:.2} B2={:.2} B3={:.2} B4={:.2} B5={:.2} B6={:.2} B7={:.2} P8={:.2}",
+        psnr[0], psnr[1], psnr[2], psnr[3], psnr[4], psnr[5], psnr[6], psnr[7], psnr[8],
+    );
+
+    // Frames coded through the P path (the anchor P8, and B4 when it is forward-only) use the
+    // split MV grid, which genuinely coincides with the chroma block grid — they were never
+    // affected by the bug, so they are the in-test control.
+    let reference = psnr[8];
+    for i in 1..8 {
+        if !true_b(i) {
+            continue;
+        }
+        // B-frames are deliberately coded at a lower rate than the anchors, so some gap is
+        // expected. Threshold measured at 512x512, q default: with the mapping correct the
+        // worst B-frame sits 4.8 dB below P8; with it wrong the layer-3 frames fall 8-13 dB
+        // below. 6 dB separates the two cleanly with ~1 dB margin on each side.
+        assert!(
+            psnr[i] > reference - 6.0,
+            "4:2:0 B-frame {i} at {:.2} dB is more than 6 dB below the P-path reference \
+             ({reference:.2} dB) — chroma MV grid mapping wrong? (see BUG-1)",
+            psnr[i],
+        );
+    }
+}
+
 #[test]
 fn test_pframe_yuv422_sequence_roundtrip() {
     let (psnr1, psnr2) = pframe_chroma_sequence_psnr(crate::ChromaFormat::Yuv422);

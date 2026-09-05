@@ -80,9 +80,17 @@ impl DecoderPipeline {
         if (is_pframe || is_bframe) && is_420 {
             let chroma_shift_x = info.chroma_format.horiz_shift();
             let chroma_shift_y = info.chroma_format.vert_shift();
-            let split_blocks_x = padded_w / crate::encoder::motion::ME_SPLIT_BLOCK_SIZE;
-            let split_blocks_y = padded_h / crate::encoder::motion::ME_SPLIT_BLOCK_SIZE;
-            let total_blocks = split_blocks_x * split_blocks_y;
+            // P-frames carry one MV per 8x8 luma block (the split grid, which coincides with
+            // the chroma 4x4 block grid); B-frames carry one per 16x16 ME block. Scale exactly
+            // as many entries as the frame actually has — the persistent mv_buf is grown but
+            // never cleared, so scaling past the frame's own MVs would pick up the previous
+            // frame's motion and silently diverge from the encoder.
+            let mv_block_size = if is_bframe {
+                crate::encoder::motion::ME_BLOCK_SIZE
+            } else {
+                crate::encoder::motion::ME_SPLIT_BLOCK_SIZE
+            };
+            let total_blocks = (padded_w / mv_block_size) * (padded_h / mv_block_size);
 
             // Scale forward MVs to chroma dims
             self.motion.dispatch_mv_scale(
@@ -497,6 +505,13 @@ impl DecoderPipeline {
                     p_padded_w,
                     p_padded_h,
                     false, // inverse: reconstruct = residual + pred
+                    crate::encoder::motion::ChromaMvGrid::new(
+                        padded_w,
+                        padded_h,
+                        crate::encoder::motion::ME_BLOCK_SIZE,
+                        info.chroma_format.horiz_shift(),
+                        info.chroma_format.vert_shift(),
+                    ),
                 );
                 // Step 4: NN-upsample chroma_recon_buf → plane_results[p] (luma dims).
                 self.chroma_up.dispatch_upsample(

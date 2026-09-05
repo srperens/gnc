@@ -13,6 +13,12 @@
 // MVs are already scaled for chroma (÷2 from luma). Quarter-pel luma → half-pel chroma units.
 // One thread per chroma pixel. Dispatch for each chroma plane (Co, Cg) separately.
 
+// The MV/mode field is NOT always on the same grid as the chroma block grid.
+//   P-frames  : MVs come from the 8x8-luma split grid == chroma 4x4 grid  -> 1:1
+//   B-frames  : MVs come from the 16x16-luma ME grid, which is coarser    -> N:1
+// mv_blocks_{x,y} + mv_shift describe that mapping explicitly so both encoder and decoder
+// index the field identically. Getting this wrong scrambles chroma prediction spatially and
+// reads past the end of the field (see docs/decisions/0004-chroma-mv-grid-mapping.md).
 struct Params {
     width: u32,
     height: u32,
@@ -20,8 +26,12 @@ struct Params {
     mode: u32,       // 0 = forward (residual), 1 = inverse (reconstruct)
     blocks_x: u32,
     total_pixels: u32,
+    mv_blocks_x: u32,  // row stride of the MV/mode field
+    mv_shift: u32,     // low 16 bits: x shift, high 16 bits: y shift
+    mv_blocks_y: u32,  // rows in the MV/mode field
     _pad0: u32,
     _pad1: u32,
+    _pad2: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -93,7 +103,16 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
     let bx = x / params.block_size;
     let by = y / params.block_size;
-    let block_idx = by * params.blocks_x + bx;
+
+    // Map this chroma block onto the (possibly coarser) MV/mode grid.
+    // Luma and chroma planes are padded to a tile multiple independently, so the chroma grid
+    // can extend past the MV field; clamp rather than read out of bounds, which would resolve
+    // differently on the encoder (short buffer) than on the decoder (grown, stale buffer).
+    let shift_x = params.mv_shift & 0xffffu;
+    let shift_y = params.mv_shift >> 16u;
+    let mvx = min(bx >> shift_x, params.mv_blocks_x - 1u);
+    let mvy = min(by >> shift_y, params.mv_blocks_y - 1u);
+    let block_idx = mvy * params.mv_blocks_x + mvx;
 
     let fwd_dx = fwd_motion_vectors[block_idx * 2u];
     let fwd_dy = fwd_motion_vectors[block_idx * 2u + 1u];

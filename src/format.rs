@@ -470,7 +470,7 @@ fn serialize_mvs_delta(out: &mut Vec<u8>, vectors: &[[i16; 2]], blocks_x: usize)
         }
     }
     // Write delta MVs only for non-skip blocks
-    let blocks_y = if blocks_x > 0 { n / blocks_x } else { 0 };
+    let blocks_y = n.checked_div(blocks_x).unwrap_or(0);
     for by in 0..blocks_y {
         for bx in 0..blocks_x {
             let idx = by * blocks_x + bx;
@@ -498,7 +498,7 @@ fn deserialize_mvs_delta(
     let bitmap = &data[*pos..*pos + bitmap_bytes];
     *pos += bitmap_bytes;
     let mut vectors = Vec::with_capacity(num_blocks);
-    let blocks_y = if blocks_x > 0 { num_blocks / blocks_x } else { 0 };
+    let blocks_y = num_blocks.checked_div(blocks_x).unwrap_or(0);
     for by in 0..blocks_y {
         for bx in 0..blocks_x {
             let idx = by * blocks_x + bx;

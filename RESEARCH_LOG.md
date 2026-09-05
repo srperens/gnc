@@ -4598,3 +4598,54 @@ targets the same rate region.
 
 Both defaults now measured rather than guessed. `GNC_AQ_STRENGTH` left in place so the sweep is
 repeatable.
+
+---
+
+## 2026-09-05 — VMAF is luma-only: every chroma decision validated with it is unvalidated
+
+Continuing the sweep of never-measured fixed constants. Two results, one of them a
+methodology problem that reaches beyond this experiment.
+
+### Dead zone is already at its optimum
+
+`dead_zone` defaults to 0.75. Swept 0.4 / 0.75 / 1.1 / 1.5 on bbb and kristensara at q=25 and
+q=55. Both directions lose to simply changing q: at bbb q=25, dz 0.4 reaches VMAF 92.40 at
+2.22 bpp where the quality ladder reaches ~93.6 at the same rate, and dz 1.5 reaches 82.93 at
+1.14 bpp against ~83.9 from the ladder. Consistent with the RDOQ result (+0.1%) — the quantiser
+is on its RD curve and the dead-zone value is part of why.
+
+### Wavelet filter: no lever
+
+CDF 9/7 for all lossy, LeGall 5/3 only at q=100. That is JPEG 2000's own practice; nothing to
+change.
+
+### Chroma weight: cannot be tuned with the metrics available
+
+`chroma_weight` steps 1.5 / 1.3 / 1.2 / 1.0 by quality — fixed guesses, never swept. Sweeping
+1.0 / 1.5 / 2.5 / 4.0 against **VMAF** made higher weights look like a free win: bbb q=55 goes
+from 2.92 bpp @ 95.49 to 2.49 @ 95.33, i.e. −15% rate for −0.16 VMAF where the quality ladder
+would charge about −1.0 VMAF for the same saving.
+
+**That result is an artefact. The default VMAF model scores the luma plane only**, so it cannot
+see chroma being thrown away. Re-measured with RGB PSNR, which does include chroma, the same
+change is worth only +0.3 to +0.6 dB at matched rate, and the direction reverses at the low end
+(weight 1.0 is 1.28 dB *worse* than the ladder at bbb q=55).
+
+So the honest answer is that this parameter cannot be tuned here: VMAF ignores chroma entirely
+and RGB PSNR overweights it, and the truth is between. Left unchanged; `GNC_CHROMA_WEIGHT` added
+so a future sweep with a chroma-aware perceptual metric can repeat it.
+
+### The wider problem
+
+CLAUDE.md states "VMAF is the primary quality metric" and the research protocol requires `--vmaf`
+on every experiment. That is right for luma but **blind to chroma**, which means any decision in
+this repo about a chroma parameter that was validated on VMAF was not actually validated:
+
+- `chroma_weight` (this experiment)
+- the CfL enablement range (q=50–85)
+- chroma-format trade-offs generally
+
+The correctness fixes earlier today (BUG-1, BUG-2, BUG-3) are unaffected — all three moved PSNR
+by several dB as well, and BUG-1 and BUG-3 were chroma *correctness*, not chroma *allocation*.
+But the distinction matters, and the protocol should say so: **VMAF answers luma questions;
+chroma questions need a chroma-aware metric.**

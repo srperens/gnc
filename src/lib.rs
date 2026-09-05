@@ -625,13 +625,19 @@ pub fn quality_preset(q: u32) -> CodecConfig {
     };
     // Chroma weighting: HVS is less sensitive to chroma detail.
     // More aggressive at low quality where bitrate savings matter most.
-    if q < 40 {
-        weights.chroma_weight = 1.5;
-    } else if q < 60 {
-        weights.chroma_weight = 1.3;
-    } else if q < 85 {
-        weights.chroma_weight = 1.2;
-    }
+    // GNC_CHROMA_WEIGHT overrides for measurement — these were fixed guesses, never swept.
+    weights.chroma_weight = std::env::var("GNC_CHROMA_WEIGHT")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .unwrap_or(if q < 40 {
+            1.5
+        } else if q < 60 {
+            1.3
+        } else if q < 85 {
+            1.2
+        } else {
+            1.0
+        });
     CodecConfig {
         quantization_step: qstep,
         dead_zone,

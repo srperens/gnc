@@ -365,7 +365,22 @@ The quality preset used 3 levels below q=50. Measured 5-17% worse bitrate at equ
 quality on bbb, touchdown and kristensara at q=25/40/49, at no speed cost. Default is now 4
 everywhere.
 
+### MEAS-7 — A chroma-aware quality metric (todo, P2)
+VMAF scores luma only, so every chroma decision in this repo validated on VMAF is unvalidated:
+`chroma_weight`, the CfL enablement range (q=50–85), chroma-format trade-offs. A 2026-09-05
+`chroma_weight` sweep looked like a free 15% rate saving on VMAF and collapsed to +0.3 dB, with
+the direction reversing at the low end, once measured with RGB PSNR.
+
+Needed before any chroma parameter can be tuned. Candidates: VMAF with chroma-aware features,
+CIEDE2000 / ΔE on the decoded RGB, or a weighted YUV-PSNR with defensible weights. Whatever is
+chosen has to be justified, not just picked.
+
+`GNC_CHROMA_WEIGHT` is in place so the sweep can be repeated the moment a metric exists.
+
 ### Closed by measurement 2026-09-05 — do not re-test
+- **Intra dead zone**: 0.75 is at its optimum; 0.4 and 1.5 both lose to changing q instead.
+  Consistent with the RDOQ result.
+- **Wavelet filter choice**: CDF 9/7 lossy, LeGall 5/3 at q=100 — already JPEG 2000's practice.
 - **Huffman entropy backend**: 10-20% worse than Rice at every quality.
 - **Bitplane entropy backend**: **2.2-2.6x worse** than Rice and the slowest of the four
   (57.7 ms against 33.0 at q=70). Too far off to be a tuning matter — it looks unfinished. Not

@@ -46,6 +46,12 @@ The team's core principle: **correctness over speed, measurement over assumption
 
 ### Quality metrics
 **VMAF is the primary quality metric.** PSNR is a secondary cross-check only.
+
+**VMAF scores the luma plane only.** It cannot see chroma being degraded, so it cannot validate
+any decision about a chroma parameter — chroma weighting, CfL range, chroma format trade-offs. A
+2026-09-05 sweep of `chroma_weight` looked like a free 15% rate saving on VMAF and shrank to
++0.3 dB, direction-reversing, once measured with a metric that includes chroma. **Chroma
+questions need a chroma-aware metric; VMAF answers luma questions.**
 - VMAF catches perceptual regressions that PSNR misses (proven: TILE_ENERGY_ZERO_THRESH ghosting bug, chroma subsampling penalty)
 - Always run `--vmaf` on `benchmark` and `rd-curve`. Success criteria must include VMAF.
 - VMAF binary: `/opt/homebrew/Cellar/libvmaf/3.0.0/bin/vmaf` (also in PATH as `vmaf`)

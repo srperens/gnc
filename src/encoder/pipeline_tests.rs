@@ -3206,6 +3206,84 @@ fn test_multi_group_yuv420_anchor_pframe() {
     );
 }
 
+/// A sequence must decode identically whether its frames come straight from the encoder or
+/// through the container's serialize/deserialize path.
+///
+/// The container is the product's actual output, but every sequence quality number in the repo
+/// came from decoding in-memory frames. If serialization drops something, the shipped decoder is
+/// worse than every measurement says and nothing catches it.
+#[test]
+fn test_sequence_serialize_roundtrip_matches_direct() {
+    sequence_serialize_roundtrip(8, 9, 512, 512); // I + P...
+}
+
+/// Same check over a full hierarchical pyramid group, where the decode order and the reference
+/// pool matter. An I+P sequence does not exercise either.
+#[test]
+fn test_sequence_serialize_roundtrip_pyramid() {
+    sequence_serialize_roundtrip(9, 9, 512, 512); // I + B x7 + P
+}
+
+/// The same pyramid check at broadcast geometry. 1080p pads to a different tile grid than the
+/// square test sizes, and this repo has already had two defects that only appeared there.
+#[test]
+fn test_sequence_serialize_roundtrip_pyramid_1080p() {
+    sequence_serialize_roundtrip(9, 9, 1920, 1080);
+}
+
+fn sequence_serialize_roundtrip(n: usize, ki: u32, w: u32, h: u32) {
+    let ctx = crate::GpuContext::new();
+    let mut encoder = EncoderPipeline::new(&ctx);
+    let decoder = crate::decoder::pipeline::DecoderPipeline::new(&ctx);
+
+    let frames_rgb: Vec<Vec<f32>> = (0..n as i32)
+        .map(|i| make_moving_texture_frame(w, h, i))
+        .collect();
+    let refs: Vec<&[f32]> = frames_rgb.iter().map(|f| f.as_slice()).collect();
+
+    let mut config = crate::CodecConfig::default();
+    config.chroma_format = crate::ChromaFormat::Yuv420;
+    config.cfl_enabled = false;
+    config.tile_size = 256;
+    config.keyframe_interval = ki;
+
+    let compressed = encoder.encode_sequence(&ctx, &refs, w, h, &config);
+    let direct = decoder.decode_sequence(&ctx, &compressed);
+
+    let round: Vec<_> = compressed
+        .iter()
+        .map(|c| {
+            let bytes = crate::format::serialize_compressed(c);
+            crate::format::deserialize_compressed(&bytes)
+        })
+        .collect();
+    let viaser = decoder.decode_sequence(&ctx, &round);
+
+    // And through the GNV1 container pair, which is what `decode-sequence` actually uses.
+    let container = crate::format::serialize_sequence(&compressed, (30, 1));
+    let header = crate::format::deserialize_sequence_header(&container);
+    let via_container: Vec<_> = (0..n)
+        .map(|i| crate::format::deserialize_sequence_frame(&container, &header, i))
+        .collect();
+    let viacont = decoder.decode_sequence(&ctx, &via_container);
+
+    for i in 0..n {
+        let pd = compute_psnr(&frames_rgb[i], &direct[i]);
+        let ps = compute_psnr(&frames_rgb[i], &viaser[i]);
+        let pc = compute_psnr(&frames_rgb[i], &viacont[i]);
+        eprintln!("  frame {i}: direct={pd:.2}  via-frame-ser={ps:.2}  via-container={pc:.2}");
+        assert!(
+            ps > pd - 0.5,
+            "frame {i}: decoding via serialization gives {ps:.2} dB against {pd:.2} dB direct",
+        );
+        assert!(
+            pc > pd - 0.5,
+            "frame {i}: decoding via the GNV1 container gives {pc:.2} dB against {pd:.2} dB \
+             direct — the container path loses something the in-memory path keeps",
+        );
+    }
+}
+
 #[test]
 fn test_pframe_yuv422_sequence_roundtrip() {
     let (psnr1, psnr2) = pframe_chroma_sequence_psnr(crate::ChromaFormat::Yuv422);

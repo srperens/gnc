@@ -3139,10 +3139,14 @@ fn main() {
 
                 let start = std::time::Instant::now();
 
-                // Build decode order from frame types in the GNV1 index.
-                // B-frames must be decoded after their anchor P-frame (which comes
-                // later in display order but must be decoded first to provide the
-                // backward reference).
+                // Decode through DecoderPipeline::decode_sequence, the same path the
+                // sequence benchmark uses. An earlier version open-coded a simplified
+                // anchor-then-B-frames loop here, which does not implement the hierarchical
+                // pyramid's reference pool — so container output measured several dB worse
+                // than the encoder's own report, on frames the benchmark said were fine.
+                //
+                // Decoded in keyframe-delimited segments so peak memory stays at one GOP
+                // rather than the whole sequence.
                 let frame_types: Vec<FrameType> = (start_frame..end_frame)
                     .map(|i| match header.index[i].frame_type {
                         0 => FrameType::Intra,
@@ -3152,95 +3156,35 @@ fn main() {
                     })
                     .collect();
 
-                let decode_order = {
-                    let mut order = Vec::with_capacity(frame_types.len());
-                    let mut i = 0;
-                    while i < frame_types.len() {
-                        if frame_types[i] != FrameType::Bidirectional {
-                            order.push(i);
-                            i += 1;
-                        } else {
-                            // Collect consecutive B-frames
-                            let b_start = i;
-                            while i < frame_types.len()
-                                && frame_types[i] == FrameType::Bidirectional
-                            {
-                                i += 1;
-                            }
-                            let b_end = i;
-                            // Anchor (I/P) after B-frames must be decoded first
-                            if i < frame_types.len() {
-                                order.push(i);
-                                i += 1;
-                            }
-                            // Then the B-frames
-                            for b in b_start..b_end {
-                                order.push(b);
-                            }
-                        }
-                    }
-                    order
-                };
-
-                let mut results: Vec<Option<Vec<f32>>> =
-                    (0..frame_types.len()).map(|_| None).collect();
-                let mut output_count = 0usize;
-
-                let mut di = 0;
-                while di < decode_order.len() {
-                    let local_idx = decode_order[di];
-                    let abs_idx = start_frame + local_idx;
-                    let compressed = deserialize_sequence_frame(&gnv_data, &header, abs_idx);
-
-                    // Check if B-frames follow this anchor in decode order
-                    let b_frames_follow = di + 1 < decode_order.len()
-                        && frame_types[decode_order[di + 1]] == FrameType::Bidirectional;
-
-                    if frame_types[local_idx] == FrameType::Bidirectional {
-                        // B-frame: references already set up by preceding anchor
-                        results[local_idx] = Some(decoder.decode(&ctx, &compressed));
-                        di += 1;
-                    } else if b_frames_follow {
-                        // Anchor before B-frames: save current ref as backward,
-                        // decode the anchor (updates forward ref), then swap
-                        decoder.swap_forward_to_backward_ref(&ctx);
-                        results[local_idx] = Some(decoder.decode(&ctx, &compressed));
-                        decoder.swap_references(); // ref=past, bwd=future
-                        di += 1;
-
-                        // Decode all following B-frames
-                        while di < decode_order.len()
-                            && frame_types[decode_order[di]] == FrameType::Bidirectional
-                        {
-                            let b_local = decode_order[di];
-                            let b_abs = start_frame + b_local;
-                            let b_compressed =
-                                deserialize_sequence_frame(&gnv_data, &header, b_abs);
-                            results[b_local] = Some(decoder.decode(&ctx, &b_compressed));
-                            di += 1;
-                        }
-
-                        // Swap back: ref=future anchor (for next group's forward ref)
-                        decoder.swap_references();
-                    } else {
-                        // Regular I/P frame with no B-frames following
-                        results[local_idx] = Some(decoder.decode(&ctx, &compressed));
-                        di += 1;
+                let mut segments: Vec<(usize, usize)> = Vec::new();
+                let mut seg_start = 0usize;
+                for (i, ft) in frame_types.iter().enumerate().skip(1) {
+                    if *ft == FrameType::Intra {
+                        segments.push((seg_start, i));
+                        seg_start = i;
                     }
                 }
+                if seg_start < frame_types.len() {
+                    segments.push((seg_start, frame_types.len()));
+                }
 
-                // Output frames in display order
-                #[allow(clippy::needless_range_loop)] // local_idx used for both results[] and abs_idx
-                for local_idx in 0..frame_types.len() {
-                    let abs_idx = start_frame + local_idx;
-                    let should_output = if seek.is_some() {
-                        abs_idx == end_frame - 1
-                    } else {
-                        true
-                    };
+                let mut output_count = 0usize;
+                for (s, e) in segments {
+                    let compressed: Vec<_> = (s..e)
+                        .map(|local| {
+                            deserialize_sequence_frame(&gnv_data, &header, start_frame + local)
+                        })
+                        .collect();
+                    let decoded = decoder.decode_sequence(&ctx, &compressed);
 
-                    if should_output {
-                        if let Some(ref rgb_data) = results[local_idx] {
+                    for (k, rgb_data) in decoded.iter().enumerate() {
+                        let abs_idx = start_frame + s + k;
+                        let should_output = if seek.is_some() {
+                            abs_idx == end_frame - 1
+                        } else {
+                            true
+                        };
+                        if should_output {
                             let frame_path =
                                 output.replace("%04d", &format!("{:04}", abs_idx));
                             save_image_rgb_f32(
@@ -3253,6 +3197,7 @@ fn main() {
                         }
                     }
                 }
+
 
                 let decode_time = start.elapsed();
                 let decoded_count = end_frame - start_frame;

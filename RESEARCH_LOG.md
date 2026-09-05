@@ -3636,3 +3636,43 @@ targeting it is guesswork.
 Tooling produced, all reusable: `meas_multiref_gate.py`, `meas_subpel_filter.py`,
 `meas_me_quality.py`, plus encoder dumps of the residual, reference and current luma planes under
 `GNC_DUMP_RESIDUAL`.
+
+---
+
+## 2026-09-05 — Container decode did not implement the pyramid; MEAS-1 harness built
+
+**Bug fixed: `decode-sequence` decoded B-frames with a simplified loop.** The CLI's container
+decode open-coded its own "decode the anchor, then the B-frames in order" logic instead of using
+`DecoderPipeline::decode_sequence`, which is what the sequence benchmark uses and which
+implements the hierarchical pyramid's decode order and reference pool. Container output was
+therefore several dB worse than the encoder's own report on frames the benchmark said were fine —
+and the container is the product's actual output, while every sequence quality number in the repo
+came from decoding in-memory frames.
+
+Replaced with a call to `decode_sequence`, decoded in keyframe-delimited segments so peak memory
+stays at one GOP. Added `test_sequence_serialize_roundtrip_*` (I+P, pyramid, pyramid at 1080p),
+which assert that decoding through frame serialization *and* through the GNV1 container both
+match direct decoding. They pass, confirming serialization and the container format itself were
+never the problem — only the CLI's decode logic.
+
+**MEAS-1 harness (`scripts/meas1_vs_h264.py`).** The comparison this replaces was invalid: GNC
+reports PSNR in RGB and x264 in YUV, which are different quantities.
+
+Building it surfaced a second measurement trap worth recording. The first version used the source
+Y4M directly as the VMAF reference while GNC's decoded output came back through PNG. GNC's own
+VMAF read 95.2 where the harness read 74.5 — a 20-point gap that was entirely colour-path
+mismatch, not codec quality. It looked exactly like a codec bug, and two hours went into chasing
+it through serialization and the container before the harness turned out to be at fault. Every
+comparison is now normalised through the same PNG intermediate:
+
+    source Y4M -> reference PNGs -> reference Y4M      (the single VMAF reference)
+    reference PNGs -> GNC -> decoded PNGs -> Y4M
+    reference Y4M  -> x264 -> bitstream    -> Y4M
+
+With that, the harness reads 95.02 against GNC's internal 95.22 — agreement to within the extra
+PNG round trip.
+
+**Lesson, third time this session:** a measurement that disagrees with another measurement is
+more often the harness than the codec. BUG-3's gate was wrong, the sub-pel validation had an
+inverted shift, and this had a colour-path mismatch. Cross-checking a new harness against an
+existing trusted number *before* drawing conclusions would have caught all three immediately.

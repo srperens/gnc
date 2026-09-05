@@ -3011,7 +3011,15 @@ impl EncoderPipeline {
         let uniform_weights = crate::SubbandWeights::uniform(config.wavelet_levels);
         let weights_luma = uniform_weights.pack_weights();
         let weights_chroma = uniform_weights.pack_weights_chroma();
-        let res_dead_zone = config.dead_zone * 2.0;
+        // Inter residuals get twice the intra dead zone. GNC_INTER_DZ_MUL exposes that factor:
+        // on a pure pan the residual is essentially the reference's own quantisation noise, and
+        // GNC codes it finely enough to end up *better* than the I-frame it predicts from, which
+        // is bits spent on nothing a viewer asked for.
+        let inter_dz_mul: f32 = std::env::var("GNC_INTER_DZ_MUL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2.0);
+        let res_dead_zone = config.dead_zone * inter_dz_mul;
 
         // Config stored in CompressedFrame must match encoder parameters so decoder
         // uses the same dequantization.
@@ -3619,6 +3627,37 @@ impl EncoderPipeline {
                         config.wavelet_levels,
                         weights,
                     );
+                }
+            }
+
+            // Energy-based tile skip: zero quantised coefficient tiles whose residual is small
+            // enough that coding it is not buying anything. tile_skip_motion (below) only
+            // catches tiles that are *static*; this catches tiles that are merely
+            // well-predicted, which on a pure pan is the whole frame. Off by default
+            // (GNC_TILE_SKIP_THRESH); see RESEARCH_LOG 2026-09-05.
+            let p_skip_thr = tile_skip_threshold(config.quantization_step);
+            if matches!(entropy_mode, EntropyMode::Rice) && p_skip_thr > 0.0 {
+                self.dispatch_tile_skip(
+                    ctx,
+                    &mut cmd,
+                    &bufs.recon_y,
+                    padded_w,
+                    padded_h,
+                    config.tile_size,
+                    p_skip_thr,
+                );
+                if !is_non_444 {
+                    for buf in [&bufs.co_plane, &bufs.cg_plane] {
+                        self.dispatch_tile_skip(
+                            ctx,
+                            &mut cmd,
+                            buf,
+                            padded_w,
+                            padded_h,
+                            config.tile_size,
+                            p_skip_thr,
+                        );
+                    }
                 }
             }
 
@@ -5247,7 +5286,15 @@ impl EncoderPipeline {
         let uniform_weights = crate::SubbandWeights::uniform(config.wavelet_levels);
         let weights_luma = uniform_weights.pack_weights();
         let weights_chroma = uniform_weights.pack_weights_chroma();
-        let res_dead_zone = config.dead_zone * 2.0;
+        // Inter residuals get twice the intra dead zone. GNC_INTER_DZ_MUL exposes that factor:
+        // on a pure pan the residual is essentially the reference's own quantisation noise, and
+        // GNC codes it finely enough to end up *better* than the I-frame it predicts from, which
+        // is bits spent on nothing a viewer asked for.
+        let inter_dz_mul: f32 = std::env::var("GNC_INTER_DZ_MUL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2.0);
+        let res_dead_zone = config.dead_zone * inter_dz_mul;
 
         let mut res_config = config.clone();
         res_config.subband_weights = uniform_weights;
@@ -6339,7 +6386,15 @@ impl EncoderPipeline {
         let uniform_weights = crate::SubbandWeights::uniform(config.wavelet_levels);
         let weights_luma = uniform_weights.pack_weights();
         let weights_chroma = uniform_weights.pack_weights_chroma();
-        let res_dead_zone = config.dead_zone * 2.0;
+        // Inter residuals get twice the intra dead zone. GNC_INTER_DZ_MUL exposes that factor:
+        // on a pure pan the residual is essentially the reference's own quantisation noise, and
+        // GNC codes it finely enough to end up *better* than the I-frame it predicts from, which
+        // is bits spent on nothing a viewer asked for.
+        let inter_dz_mul: f32 = std::env::var("GNC_INTER_DZ_MUL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2.0);
+        let res_dead_zone = config.dead_zone * inter_dz_mul;
 
         let is_non_444 = info.chroma_format != ChromaFormat::Yuv444;
         let is_420 = info.chroma_format == ChromaFormat::Yuv420;

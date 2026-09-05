@@ -72,7 +72,19 @@ needed. Smaller tiles are not an option either: each tile costs ~290 bytes of he
 tiles would mean ~2.3 MB of headers per 1080p frame, and tile=64 measured 70% more bits at worse
 quality than tile=256.
 
-**Still open, and the two untested threads:**
+**Skip granularity confirmed as the binding constraint (2026-09-05).** On a pure pan, backing
+the inter quantiser off 3x cuts 31% of the bitrate and slightly *improves* VMAF — GNC was making
+inter frames better than the I-frame they predict from. On real content the same change loses to
+simply lowering q. The adaptive version GNC already has (`dispatch_tile_skip`, now wired for
+P-frames) is worse than the q-curve on real content because 256x256 is too coarse: a tile
+survives whole or dies whole. Combined with the block-transform result (±30%), GNC can neither
+skip finely with its current transform nor gain enough from changing it. That is where the 8x
+sits.
+
+Tunables added for measurement, all defaulting to current behaviour: `GNC_INTER_DZ_MUL`,
+`GNC_TILE_SKIP_THRESH`, `GNC_P_QP_SCALE`, `GNC_SPLIT_LAMBDA_SCALE`.
+
+**Earlier notes, both now tested and negative:**
 1. **No rate-distortion decisions anywhere.** GNC quantizes at the configured qstep and codes
    whatever comes out. x264's ablation puts its RD mode decision at +22%.
 2. **Reference quality.** No in-loop deblocking; references carry wavelet ringing spread over the

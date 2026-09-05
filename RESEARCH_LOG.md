@@ -3939,3 +3939,57 @@ where MEAS-1 measured the worst BD-rate, so this lands where it is most needed.
   from 1x to 64x, because the split MV field is serialized at full 8x8 density regardless of
   what the RD decision chooses. Merging only helps if the coder can express it cheaply — which
   is what GP16 now does.
+
+---
+
+## 2026-09-05 — Skip granularity confirmed as the binding constraint
+
+Continued from GP16, testing the remaining inter levers. All measured at 1080p 4:2:0, ki=9,
+17 frames, `GNC_REF_DEBLOCK=0`, VMAF against the source. Two new tunables added, both defaulting
+to current behaviour: `GNC_INTER_DZ_MUL` (inter dead-zone factor, default 2.0 as before) and
+`GNC_TILE_SKIP_THRESH` (now wired into the P-frame path as well as B).
+
+**Inter dead zone.** The clearest result of the session on the direction of the problem:
+
+| | rate | VMAF |
+|---|---|---|
+| pan, dz 2.0 (default) | 4 134 127 | 99.47 |
+| pan, dz 6.0 | **2 851 159 (−31%)** | **99.54 (+0.07)** |
+| bbb, dz 2.0 (default) | 5 102 044 | 95.50 |
+| bbb, dz 3.5 | 3 818 368 (−25%) | 92.49 (−3.0) |
+
+On a pure pan — where prediction is essentially perfect and the residual is the reference's own
+noise — backing the quantiser off cuts a third of the bitrate and *improves* VMAF slightly. GNC
+was spending those bits making the frame better than the I-frame it predicts from. On real
+content the same change is a straight loss, and worse than simply lowering q: at 3.86 MB the
+q-sweep gives VMAF 93.20 where the dead-zone sweep gives ~92.55.
+
+So the win exists but requires **adaptivity** — back off only where prediction is already good.
+
+**Energy-based tile skip** is the adaptive version GNC already has infrastructure for
+(`dispatch_tile_skip`, previously gated at threshold 0.0 and wired only for B-frames). Now
+enabled for P-frames too and swept:
+
+| | rate | VMAF |
+|---|---|---|
+| pan, thr 0.15 | 3 715 845 (−10%) | 99.37 (−0.10) |
+| bbb, thr 0.05 | 4 343 756 (−15%) | 92.37 (−3.1) |
+
+On bbb that is worse than the q-curve at the same rate (94.1 vs 92.37). **256x256 is too coarse a
+unit to skip**: a tile either survives whole or is destroyed whole, and almost every tile in real
+content has some region that needed coding.
+
+**Conclusion.** Skip granularity is the binding constraint, exactly as ARCH-2 hypothesised — and
+the earlier block-transform experiment showed that switching the transform to get finer skip
+buys only ±30%, content-dependent. So GNC can neither skip finely with its current transform nor
+gain enough by changing the transform to make finer skip worthwhile. That is a genuine
+architectural corner, and it is where the 8x inter deficit lives.
+
+**Also measured and rejected this round:**
+- *MV median smoothing* (`GNC_MV_SMOOTH`, shader already present, never enabled): neutral on all
+  three sequences (±0.7% rate, ±0.06 VMAF), despite 28% of MVs on the pan deviating from the
+  correct global motion.
+- *Encoder-side reference deblocking*: 95.44 with against 95.50 without. It only filters tile
+  boundaries — 2 pixels either side of a 256px seam — so it touches almost no pixels. Note that
+  H.264's in-loop deblocking is not the right analogue here anyway: a wavelet codec's artifact is
+  ringing, not blocking.

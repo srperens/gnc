@@ -164,3 +164,72 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# ---------------------------------------------------------------------------
+# Sub-tile skip inside the existing wavelet (added 2026-09-05)
+# ---------------------------------------------------------------------------
+
+
+def subtile_skip_cost(resid, qstep, sub=32, levels=3, dead_zone=0.75):
+    """Keep GNC's tile-wide wavelet, but zero the coefficients belonging to low-energy
+    spatial sub-blocks after quantisation.
+
+    This is the one option ARCH-2 left untested: finer skip *without* changing the transform and
+    *without* a new tile header. It needs no bitstream syntax at all — zeroed quantised
+    coefficients simply cost whatever the entropy coder charges for zeros, and the decoder
+    dequantises them to nothing.
+
+    A `sub`x`sub` spatial region of the plane maps to a sub/2^l rectangle in each level-l
+    subband, so the mask is applied per subband at the matching scale. The wavelet's synthesis
+    support is wider than the nominal region, so zeroing bleeds some ringing into neighbours —
+    that is a distortion cost, not a correctness problem, and it is what this measures.
+    """
+    h, w = resid.shape
+    ll, bands = dwt2(resid, levels)
+    g = subband_gains(resid.shape, levels)
+
+    # Per-sub-block residual energy drives the decision, with the same RD form as the block
+    # experiment: skip when the energy saved is not worth the bits.
+    lam = 0.85 * qstep * qstep
+    sy, sx = h // sub, w // sub
+    energy = (
+        (resid[: sy * sub, : sx * sub] ** 2)
+        .reshape(sy, sub, sx, sub)
+        .sum(axis=(1, 3))
+    )
+
+    def mask_for(shape, scale):
+        """Nearest-neighbour expansion of the sub-block decision onto a subband's grid."""
+        bh, bw = shape
+        yi = (np.arange(bh) * sy // max(bh, 1)).clip(0, sy - 1)
+        xi = (np.arange(bw) * sx // max(bw, 1)).clip(0, sx - 1)
+        return keep[np.ix_(yi, xi)]
+
+    # Decide per sub-block by comparing "code it" against "drop it", using the quantised cost of
+    # the whole plane as the rate proxy — the same generosity the block experiment allowed.
+    qll_full = quantize(ll * g["LL"], qstep, dead_zone)
+    bits_full = shannon_bits(qll_full.reshape(-1))
+    for lv, (lh, hl, hh) in enumerate(bands):
+        for b, nm in zip((lh, hl, hh), (f"LH{lv+1}", f"HL{lv+1}", f"HH{lv+1}")):
+            bits_full += shannon_bits(quantize(b * g[nm], qstep, dead_zone).reshape(-1))
+    bits_per_px = bits_full / (h * w)
+    sub_bits = bits_per_px * sub * sub
+    keep = (energy + lam * 1.0) > (lam * sub_bits)
+
+    # Apply the mask and measure what the kept coefficients cost and reconstruct to.
+    bits = float(keep.size)  # one bit per sub-block for the decision
+    qll = quantize(ll * g["LL"], qstep, dead_zone) * mask_for(ll.shape, levels)
+    bits += shannon_bits(qll.reshape(-1))
+    rec_bands = []
+    for lv, (lh, hl, hh) in enumerate(bands):
+        names = (f"LH{lv+1}", f"HL{lv+1}", f"HH{lv+1}")
+        m = mask_for(lh.shape, levels - lv - 1)
+        qs = [quantize(b * g[nm], qstep, dead_zone) * m for b, nm in zip((lh, hl, hh), names)]
+        for q in qs:
+            bits += shannon_bits(q.reshape(-1))
+        rec_bands.append(tuple(
+            dequantize(q, qstep, dead_zone) / g[nm] for q, nm in zip(qs, names)
+        ))
+    rec = idwt2(dequantize(qll, qstep, dead_zone) / g["LL"], rec_bands)
+    return bits, float(((resid - rec) ** 2).sum()), float(1.0 - keep.mean())

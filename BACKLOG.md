@@ -46,7 +46,7 @@ the inter gap is, and targeting it is guesswork. See RESEARCH_LOG 2026-09-05.
 
 ## Active priority list
 
-### ARCH-2 — Inter residuals cannot skip locally (open design question, PRIO 1)
+### ARCH-2 — Inter residuals cannot skip locally (**CLOSED 2026-09-05** — measured, unreachable)
 Measured 2026-09-05. At matched VMAF on bbb, GNC's inter frames cost **8-10x** H.264's (P: 304-380
 KB vs 39 KB; B: 108 KB vs 14 KB) while intra costs only ~1.9x. On a fully static sequence — 17
 identical frames — x264 codes P-frames at 181 bytes and B-frames at 76; GNC needs ~18 KB.
@@ -71,6 +71,20 @@ and a per-block RD skip decision, on GNC's own residuals. At matched residual PS
 needed. Smaller tiles are not an option either: each tile costs ~290 bytes of header, so 16x16
 tiles would mean ~2.3 MB of headers per 1080p frame, and tile=64 measured 70% more bits at worse
 quality than tile=256.
+
+**Closed: all three routes to fine-grained skip measured and rejected.**
+
+| route | result | why |
+|---|---|---|
+| shrink tiles | +70% bits at worse quality (64px) | ~290 B fixed header per tile |
+| block-based transform | −39% to +34%, content-dependent | wavelet compaction offsets the skip gain |
+| mask sub-blocks inside the wavelet | 5-30% worse at every sub-block size | synthesis support rings across region edges |
+
+**Parallelism is not the constraint and more tiles do not help.** Each tile already carries 256
+independent entropy streams, so 1080p/256px runs 10 240 independent streams per frame on an
+8-core M1. Tile count is a rate knob, not a speed knob; the per-tile header is the price of the
+stream independence that makes decode parallel. The design choice that makes GNC fast is the same
+one that makes its inter coding weak.
 
 **Skip granularity confirmed as the binding constraint (2026-09-05).** On a pure pan, backing
 the inter quantiser off 3x cuts 31% of the bitrate and slightly *improves* VMAF — GNC was making

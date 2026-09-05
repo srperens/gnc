@@ -3993,3 +3993,55 @@ architectural corner, and it is where the 8x inter deficit lives.
   boundaries — 2 pixels either side of a 256px seam — so it touches almost no pixels. Note that
   H.264's in-loop deblocking is not the right analogue here anyway: a wavelet codec's artifact is
   ringing, not blocking.
+
+---
+
+## 2026-09-05 — ARCH-2 closed: fine-grained skip is unreachable, by all three routes
+
+The last untested option: keep GNC's tile-wide wavelet, but zero the quantised coefficients
+belonging to low-energy *spatial sub-blocks* of a tile. This needs no bitstream syntax at all —
+zeroed coefficients cost only what the entropy coder charges for zeros, and the decoder
+dequantises them to nothing — and no new tile header, so it sidesteps both objections that killed
+the other two routes. Implemented as `subtile_skip_cost` in `scripts/meas_block_skip_rd.py` with
+the same RD decision form as the block experiment.
+
+**Result: worse than coding everything, at every sub-block size.** bbb, qstep 4.0, 3 luma
+residual planes:
+
+| | bpp | PSNR | skipped |
+|---|---|---|---|
+| tile-wavelet, no skip | 0.7483 | 43.37 | — |
+| sub-block 32px | 0.6285 | 41.25 | 51% |
+| sub-block 64px | 0.6300 | 40.80 | 42% |
+| sub-block 128px | 0.6651 | 41.81 | 30% |
+
+Interpolated to matched PSNR the wavelet is **24-30% better** on bbb and **5% better** on
+touchdown. The reason is the one the code comments already warned about: a wavelet coefficient's
+synthesis support is wider than the sub-block, so zeroing a region's coefficients rings into its
+neighbours. That distortion costs more than the skipped bits save, and it does not improve with a
+coarser sub-block — the bleed scales with the region.
+
+### ARCH-2 verdict
+
+Fine-grained skip is unreachable in GNC's architecture. All three routes measured:
+
+| route | result | why |
+|---|---|---|
+| shrink tiles | +70% bits at worse quality (tile=64px) | ~290 bytes of fixed header per tile |
+| change the transform to block-based | −39% to +34%, content-dependent | wavelet compaction offsets the skip gain |
+| mask sub-blocks inside the wavelet | 5-30% worse | synthesis support bleeds across region edges |
+
+**On parallelism** (the natural "just use more tiles" instinct): the tile count is not what makes
+GNC parallel. Each tile is already split into `RICE_STREAMS_PER_TILE = 256` independent entropy
+streams, so 1080p at 256px tiles runs **10 240 independent streams per frame** on an 8-core M1 —
+saturated by orders of magnitude. Halving the tile size to 128px does measure faster (13.5 → 16.4
+fps) but costs 70% more bits at 64px. The tile count is a rate knob, not a speed knob, and the
+per-tile header is the price of the stream independence that makes the decode parallel.
+
+That is the trade-off at the centre of the codec: **the design decision that makes GNC fast is the
+same one that makes its inter coding weak.** Sparse, spatially clustered inter residuals (57% of
+residual energy sits in 10% of 16x16 blocks, per MEAS-4) need a cheap way to say "nothing here",
+and every mechanism for saying it cheaply conflicts with tile-independent parallel entropy coding.
+
+This is now a settled measurement rather than a hypothesis, and it bounds what any further inter
+work can achieve without revisiting that trade-off.

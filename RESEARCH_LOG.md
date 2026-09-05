@@ -4368,3 +4368,43 @@ should be re-checked on camera content.
 Four sequences, 17 frames, four rate points, one resolution, 4:4:4 only. No 4:2:0 cross-check,
 and the qstep grid is coarse at the top end where the effect is largest. Confirming the crossover
 point per sequence needs a finer sweep.
+
+---
+
+## 2026-09-05 — What JPEG 2000 does that GNC does not: start with decomposition depth
+
+JPEG 2000 typically uses 5 wavelet decomposition levels. GNC's quality preset used **3 below
+q=50** and 4 above. Testing the difference in the real codec, across three images and three
+quality points:
+
+| image | q | 3 levels | 4 levels | rate | quality |
+|---|---|---|---|---|---|
+| bbb | 25 | 1.89 bpp @ 35.44 | 1.70 @ 35.38 | **−10%** | −0.06 dB |
+| bbb | 40 | 2.44 @ 38.59 | 2.29 @ 38.58 | **−6%** | −0.01 dB |
+| bbb | 49 | 2.89 @ 40.16 | 2.74 @ 40.16 | **−5%** | 0.00 dB |
+| touchdown | 25 | 1.27 @ 35.40 | 1.06 @ 35.35 | **−17%** | −0.05 dB |
+| touchdown | 40 | 1.79 @ 37.66 | 1.65 @ 37.67 | **−8%** | +0.01 dB |
+| touchdown | 49 | 2.26 @ 39.06 | 2.11 @ 39.10 | **−7%** | +0.04 dB |
+| kristensara | 25 | 0.94 @ 37.48 | 0.78 @ 37.95 | **−17%** | **+0.47 dB** |
+| kristensara | 40 | 1.25 @ 40.15 | 1.10 @ 40.32 | **−12%** | **+0.17 dB** |
+| kristensara | 49 | 1.47 @ 41.06 | 1.32 @ 41.29 | **−10%** | **+0.23 dB** |
+
+5-17% less rate at equal or *better* quality, on every image and every quality point, at no speed
+cost (30.5 → 30.4 fps encode). On the talking-head image it wins on both axes. **Default changed
+to 4 levels everywhere.**
+
+**An ideal-entropy model badly understates this.** Simulated offline with Shannon entropy per
+subband, 3→4 levels is worth only ~1.2%; in the real codec it is 6%. The difference is that Rice
+adapts its `k` per subband, so an extra level means finer parameter adaptation as well as better
+energy compaction. A useful reminder that offline transform comparisons — including several run
+earlier in this session — systematically miss what the real entropy coder does with the extra
+structure.
+
+**And GNC cannot go further: 5 levels panics.** `rice_gpu.rs` has `MAX_GROUPS = 8` with
+`num_groups = levels * 2`, so 4 levels sits exactly at the ceiling, and the per-tile skip bitmap
+is a single `u8` — 8 groups is all it can address. Logged as BUG-6. Whether levels 5-6 are worth
+the widening is unknown: offline they add only 0.2% and 0.1%, but offline understated the 3→4
+step by 5x, so that estimate cannot be trusted.
+
+This is the first clean win on the intra side, and it came from asking what JPEG 2000 does
+differently rather than from tuning what GNC already had.

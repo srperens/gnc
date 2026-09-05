@@ -314,6 +314,25 @@ was PSNR on stills rather than VMAF on video.
 The gap is multiples, not percentages. Work targeting single-digit-percent improvements is not
 addressing it.
 
+### BUG-6 — Wavelet decomposition capped at 4 levels; 5 panics (todo, P2)
+`GNC_WAVELET_LEVELS=5` panics at `rice_gpu.rs:942` (`index out of bounds: the len is 1000 but the
+index is 1000`). `MAX_GROUPS = 8` with `num_groups = levels * 2` puts 4 levels exactly at the
+ceiling, and the per-tile skip bitmap is a single `u8`, so 8 groups is the hard limit.
+
+JPEG 2000 typically uses 5 levels, and moving 3 → 4 measured 5-17% better (see TUNE-2), so the
+cap sits right where the gains might continue. Widening needs `MAX_GROUPS`, `K_STRIDE`, the GPU
+buffer layout and a wider skip bitmap — the last is a bitstream change.
+
+Gate before building: offline, levels 5 and 6 add only 0.2% and 0.1% over 4. But offline
+understated the 3→4 step by 5x (1.2% predicted, 6% measured), because Rice adapts `k` per subband
+and an ideal-entropy model does not see that. So measure in-codec with a temporary widening
+before committing to the format change.
+
+### TUNE-2 — Wavelet levels default (**DONE 2026-09-05**)
+The quality preset used 3 levels below q=50. Measured 5-17% worse bitrate at equal or better
+quality on bbb, touchdown and kristensara at q=25/40/49, at no speed cost. Default is now 4
+everywhere.
+
 ### Closed by measurement 2026-09-05 — do not re-test
 - **Coefficient-level RDOQ**: +0.1% at best (`scripts/meas_rdoq.py`). GNC's uniform quantiser
   plus dead zone is already on its RD curve; this is why every dead-zone and QP sweep moved along

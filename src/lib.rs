@@ -570,10 +570,18 @@ pub fn quality_preset(q: u32) -> CodecConfig {
     // Discrete settings: use lower-quality anchor until midpoint
     let disc = if t < 0.5 { lo } else { hi };
 
+    // 4 levels everywhere. The old rule dropped to 3 below q=50, which measured 5-17% worse
+    // bitrate at equal or better quality on every image and quality point tested (bbb,
+    // touchdown, kristensara at q=25/40/49) — see RESEARCH_LOG 2026-09-05. More levels means
+    // more subbands, and Rice adapts its k per subband, so the real coder gains considerably
+    // more from the extra level than an ideal-entropy model predicts (6% against 1.2%).
+    //
+    // 4 is also the ceiling: rice_gpu's MAX_GROUPS is 8 and num_groups = levels * 2, and the
+    // per-tile skip bitmap is a single byte. 5 levels panics. See BUG-6.
     let wavelet_levels = std::env::var("GNC_WAVELET_LEVELS")
         .ok()
         .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(if q >= 50 { 4 } else { 3 });
+        .unwrap_or(4);
     let aq_enabled = q <= 80; // AQ helps in lossy range; variance computed on LL subband
     let aq_strength = if q >= 70 { 0.2 } else { 0.15 };
     // Default: uniform weights. Measurement campaign showed "perceptual" weights had the

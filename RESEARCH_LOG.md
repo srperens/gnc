@@ -4408,3 +4408,74 @@ step by 5x, so that estimate cannot be trusted.
 
 This is the first clean win on the intra side, and it came from asking what JPEG 2000 does
 differently rather than from tuning what GNC already had.
+
+---
+
+## 2026-09-05 — EBU-style multi-generation test: no breakdown point, no tile-grid catastrophe
+
+### Motivation
+
+External research (contribution-codec landscape sweep, same date) identified the EBU TR 091
+multi-generation test as the cheapest experiment that could **falsify GNC's contribution
+positioning**. The specific risk: GNC has a fixed 256x256 tile grid, and TR 091 deliberately
+shifts the picture between generations, so content moves relative to that grid. If tile-boundary
+artefacts accumulate, the positioning fails regardless of anything else.
+
+EBU TR 092 (Oct 2025) reports JPEG XS showing "minimal artefacts visible at either 1st or 3rd
+generation" while low-latency HEVC showed "a visible reduction in quality for the 3rd generation".
+That is the bar.
+
+### Method
+
+encode → decode → pixel-shift → re-encode, 5 generations, q=75 (~6:1, EBU's recommended JPEG XS
+operating ratio), Rice, 4:4:4, three 1080p sources. Shift schedule between generations:
+(+4,+4), (0,+2), (−2,0), (+2,−4), (−4,+2). **The same shifts are applied to an uncoded reference
+chain**, so what is measured is codec degradation alone rather than the shift.
+
+### Result
+
+| sequence | gen 1 | gen 3 | gen 5 | Δ VMAF | Δ PSNR | bitrate |
+|---|---|---|---|---|---|---|
+| bbb | 96.51 | 95.33 | 94.05 | **−2.46** | −3.70 dB | flat, 4.65→4.53 bpp |
+| touchdown | 96.32 | 94.72 | 92.90 | **−3.43** | −3.32 dB | flat, 4.26→3.94 bpp |
+| blue_sky | 96.85 | 94.84 | 90.64 | **−6.21** | −5.29 dB | flat, 4.00→4.05 bpp |
+
+**No breakdown point and no cliff within 5 generations.** Degradation is smooth and roughly linear
+at −0.6 to −1.5 VMAF per generation. Bitrate stays flat, so the codec is not spending more to hold
+quality — it is simply losing a little each pass. **The tile-grid failure mode that could have
+killed the positioning is not observed.**
+
+blue_sky degrades over twice as fast as bbb. It is the smooth-gradient sky content, which is where
+a wavelet quantiser's ringing is most visible and least maskable — worth a closer look, but not a
+structural failure.
+
+### Reference points, with an important caveat
+
+The same chain run on ProRes 422 HQ and x264 all-intra at comparable bitrate:
+
+| codec | bbb | touchdown | blue_sky |
+|---|---|---|---|
+| GNC q=75 | −2.46 | −3.43 | −6.21 |
+| x264 intra qp14 | −2.78 | −2.45 | −1.51 |
+| ProRes 422 HQ | −11.51 | −9.02 | −8.78 |
+
+**Do not read the ProRes row as a win.** Both reference codecs were driven through ffmpeg with
+`yuv422p10le` / `yuv420p` intermediates, so their chains accumulate an RGB↔YUV conversion loss on
+*every* generation that GNC's 4:4:4 chain never pays. The PSNR columns for those two are
+conversion-dominated (−10 to −12.7 dB) and are unusable. The VMAF comparison is indicative only.
+
+What can be said honestly: GNC's multi-generation decay is **in the same range as x264 all-intra on
+two of three sequences and clearly worse on the third**, under a comparison that favours GNC.
+
+### Conclusion
+
+The falsification test does not falsify. GNC survives 5 generations with pixel shifts without
+structural failure, which is the necessary condition for a contribution codec. It is not yet
+evidence of the *sufficient* condition — "visually lossless at 6:1, still clean at generation 3" —
+which EBU decides by expert viewing, not by VMAF.
+
+### Next
+
+Re-run with a matched colour path (all codecs in the same 4:2:2 or 4:4:4 domain, no repeated RGB
+round-trip) before quoting any cross-codec number. Then repeat at 10-bit once FMT-1 lands, since
+EBU tests nothing below 10-bit 4:2:2.

@@ -3424,3 +3424,68 @@ parameter rather than behind missing code coverage; worth remembering that "ther
 B-frames" is not the same as "the test reaches the path".
 
 **Tests:** 170 pass. Clippy clean on native and wasm32 --lib.
+
+---
+
+## 2026-09-05 — BUG-3 fixed: chroma MC used the wrong row stride (720p was broken)
+
+Writeup: [docs/decisions/0007-chroma-plane-stride.md](docs/decisions/0007-chroma-plane-stride.md).
+
+**The gate I wrote for this was wrong.** BUG-3 was logged as "4:2:0 collapses when the chroma
+plane is smaller than one tile", inferred from two data points. A sweep falsified it immediately:
+384x384 has a chroma plane (192) smaller than the tile (256) and is healthy. Reading the sweep by
+tile counts instead, and then testing a non-square geometry, gave the real rule:
+
+| geometry | luma tile grid | result |
+|---|---|---|
+| 768x512 | 3 x 2 | broken |
+| 512x768 | 2 x 3 | healthy |
+| 1920x1088 | 8 x 5 | healthy |
+
+Only the horizontal tile count matters — a wrong *row stride*, not a wrong region size. Condition:
+`padded_w != 2 * chroma_padded_w`, i.e. `tiles_x` odd. **That includes 1280x720**, where inter
+frames measured 23.6 dB.
+
+**Root cause — two off-by-stride errors, one per side, in the P-frame 4:2:0 chroma path:**
+- Encoder built `mc_fwd_params_chroma420` from `padded_w / 2, padded_h / 2` under a comment
+  asserting "chroma dims = padded/2". Chroma pads to a tile multiple independently of luma, so
+  that is false when `tiles_x` is odd.
+- Decoder passed correct chroma dims but derived the MV index from `chroma_padded_w / 4`, while
+  the MV field is on the luma 8x8 split grid with stride `padded_w / 8` (192 vs 160 at 720p).
+
+Same defect class as BUG-1: assuming the chroma grid and the MV grid coincide. Fixed the same
+way — state both grids explicitly and clamp.
+
+**Measured, synthetic sweep (anchor P-frame PSNR):**
+
+| geometry | before | after |
+|---|---|---|
+| 1280x720 | 23.63 | **37.92** |
+| 768x768 | 23.86 | **37.93** |
+| 256x256 | 20.57 | **37.93** |
+| 512x512 | 37.91 | 37.91 (control, unchanged) |
+| 1920x1088 | 37.92 | 37.92 (control, unchanged) |
+
+**Measured, real content (1080p q=75 ki=9 4:2:0, 17 frames):**
+
+| | VMAF mean | VMAF min | total bytes |
+|---|---|---|---|
+| BBB before | 96.19 | 94.74 | 7 760 719 |
+| BBB after | 96.19 | 94.74 | **7 457 987 (−3.9%)** |
+| touchdown before | 97.59 | 94.96 | 9 046 580 |
+| touchdown after | 97.65 | 95.01 | **8 691 484 (−3.9%)** |
+
+1080p has an even `tiles_x` so its horizontal stride was fine — but the *height* was also wrong
+(640 against 768 chroma rows), and the shader's `total_pixels` guard left the bottom 128 rows
+unwritten. They are padding, so quality never showed it, but the stale contents were still
+transformed and entropy-coded. **The encoder was paying to code garbage in the bottom of every
+chroma plane at the primary target resolution**, and that is the 3.9%.
+
+**Tests:** 173 pass, including new guards at 1280x720 and 768x768. Clippy clean on native and
+wasm32 --lib.
+
+**Lesson worth keeping:** three bugs this session (BUG-1, BUG-3, and the padding half of BUG-1)
+all came from the same assumption — that luma and chroma geometries are related by a fixed
+factor. They are not, because each plane pads to a tile multiple independently. Any code deriving
+one plane's dimensions from another's by shifting is suspect; a grep for `padded_w / 2`,
+`>> chroma_shift` and similar in geometry contexts would be a cheap audit.

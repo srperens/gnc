@@ -242,6 +242,7 @@ impl DecoderPipeline {
                 padded_h,
                 false, // inverse: recon = residual + predicted
                 bufs.mc_block_size,
+                None, // luma: MV grid == this plane's block grid
             );
 
             ctx.queue.submit(Some(cmd.finish()));

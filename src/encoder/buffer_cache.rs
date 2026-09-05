@@ -16,6 +16,11 @@ pub(super) struct CachedEncodeBuffers {
     pub(super) padded_h: u32,
     pub(super) orig_w: u32,
     pub(super) orig_h: u32,
+    /// Chroma padded dimensions. Tracked because the chroma plane is padded to a tile multiple
+    /// independently of luma, so these are not derivable from padded_w/padded_h, and the cached
+    /// chroma MC params depend on them.
+    pub(super) chroma_padded_w: u32,
+    pub(super) chroma_padded_h: u32,
 
     // Raw (unpadded) input buffer for GPU padding (size = orig_w * orig_h * 3 * f32)
     pub(super) raw_input_buf: wgpu::Buffer,
@@ -371,6 +376,8 @@ impl CachedEncodeBuffers {
         padded_h: u32,
         orig_w: u32,
         orig_h: u32,
+        chroma_padded_w: u32,
+        chroma_padded_h: u32,
     ) -> Self {
         let padded_pixels = (padded_w * padded_h) as usize;
         let plane_size = (padded_pixels * std::mem::size_of::<f32>()) as u64;
@@ -404,6 +411,8 @@ impl CachedEncodeBuffers {
             padded_h,
             orig_w,
             orig_h,
+            chroma_padded_w,
+            chroma_padded_h,
 
             raw_input_buf: ctx.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("enc_raw_input"),
@@ -696,21 +705,27 @@ impl CachedEncodeBuffers {
                 ME_SPLIT_BLOCK_SIZE,
             ),
 
-            // 4:2:0 chroma MC params: chroma dims = padded/2, block_size = ME_SPLIT_BLOCK_SIZE/2 = 4.
-            // The block grid is identical to luma (same count), only the spatial dims differ.
-            mc_fwd_params_chroma420: Self::make_mc_params_bs(
+            // 4:2:0 chroma MC params. The chroma plane is padded to a tile multiple
+            // independently of luma, so its dimensions are NOT padded_w/2 — using that as the
+            // row stride shifts every row whenever tiles_x is odd (720p, for instance). The MV
+            // field stays on the luma 8x8 split grid, so pass that grid separately.
+            mc_fwd_params_chroma420: Self::make_mc_params_bs_mv(
                 ctx,
-                padded_w / 2,
-                padded_h / 2,
+                chroma_padded_w,
+                chroma_padded_h,
                 true,
                 ME_SPLIT_BLOCK_SIZE / 2,
+                padded_w / ME_SPLIT_BLOCK_SIZE,
+                padded_h / ME_SPLIT_BLOCK_SIZE,
             ),
-            mc_inv_params_chroma420: Self::make_mc_params_bs(
+            mc_inv_params_chroma420: Self::make_mc_params_bs_mv(
                 ctx,
-                padded_w / 2,
-                padded_h / 2,
+                chroma_padded_w,
+                chroma_padded_h,
                 false,
                 ME_SPLIT_BLOCK_SIZE / 2,
+                padded_w / ME_SPLIT_BLOCK_SIZE,
+                padded_h / ME_SPLIT_BLOCK_SIZE,
             ),
 
             mv_chroma_buf: {
@@ -1016,12 +1031,37 @@ impl CachedEncodeBuffers {
             })
     }
 
+    /// Luma / 4:4:4 case: the MV field is on this plane's own block grid.
     fn make_mc_params_bs(
         ctx: &GpuContext,
         padded_w: u32,
         padded_h: u32,
         forward: bool,
         block_size: u32,
+    ) -> wgpu::Buffer {
+        Self::make_mc_params_bs_mv(
+            ctx,
+            padded_w,
+            padded_h,
+            forward,
+            block_size,
+            padded_w / block_size,
+            padded_h / block_size,
+        )
+    }
+
+    /// `mv_blocks_{x,y}` is the grid of the motion-vector field this plane will be compensated
+    /// against, which is NOT this plane's own block grid for subsampled chroma — see the note
+    /// in motion_compensate.wgsl.
+    #[allow(clippy::too_many_arguments)]
+    fn make_mc_params_bs_mv(
+        ctx: &GpuContext,
+        padded_w: u32,
+        padded_h: u32,
+        forward: bool,
+        block_size: u32,
+        mv_blocks_x: u32,
+        mv_blocks_y: u32,
     ) -> wgpu::Buffer {
         #[repr(C)]
         #[derive(Copy, Clone, Pod, Zeroable)]
@@ -1032,8 +1072,8 @@ impl CachedEncodeBuffers {
             mode: u32,
             blocks_x: u32,
             total_pixels: u32,
-            _pad0: u32,
-            _pad1: u32,
+            mv_blocks_x: u32,
+            mv_blocks_y: u32,
         }
         let params = MotionCompensateParams {
             width: padded_w,
@@ -1042,8 +1082,8 @@ impl CachedEncodeBuffers {
             mode: if forward { 0 } else { 1 },
             blocks_x: padded_w / block_size,
             total_pixels: padded_w * padded_h,
-            _pad0: 0,
-            _pad1: 0,
+            mv_blocks_x,
+            mv_blocks_y,
         };
         ctx.device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {

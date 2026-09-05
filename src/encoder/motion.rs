@@ -58,10 +58,13 @@ struct MotionCompensateParams {
     height: u32,
     block_size: u32,
     mode: u32, // 0 = forward (residual), 1 = inverse (reconstruct)
+    /// This plane's own block grid stride.
     blocks_x: u32,
     total_pixels: u32,
-    _pad0: u32,
-    _pad1: u32,
+    /// The motion-vector field's grid. Equal to `blocks_x` for luma, but not for subsampled
+    /// chroma — see the note in motion_compensate.wgsl.
+    mv_blocks_x: u32,
+    mv_blocks_y: u32,
 }
 
 /// How the chroma 4x4 block grid maps onto the motion-vector / block-mode field.
@@ -723,9 +726,13 @@ impl MotionEstimator {
         height: u32,
         forward: bool,
         block_size: u32,
+        // Grid of the MV field being indexed. `None` means it coincides with this plane's own
+        // block grid (luma and 4:4:4); subsampled chroma must pass the luma split grid.
+        mv_grid: Option<(u32, u32)>,
     ) {
         let blocks_x = width / block_size;
         let total_pixels = width * height;
+        let (mv_blocks_x, mv_blocks_y) = mv_grid.unwrap_or((blocks_x, height / block_size));
 
         let params = MotionCompensateParams {
             width,
@@ -734,8 +741,8 @@ impl MotionEstimator {
             mode: if forward { 0 } else { 1 },
             blocks_x,
             total_pixels,
-            _pad0: 0,
-            _pad1: 0,
+            mv_blocks_x,
+            mv_blocks_y,
         };
 
         let params_buf = ctx
@@ -954,9 +961,13 @@ impl MotionEstimator {
         height: u32,
         forward: bool,
         block_size: u32,
+        // Grid of the MV field being indexed. `None` means it coincides with this plane's own
+        // block grid (luma and 4:4:4); subsampled chroma must pass the luma split grid.
+        mv_grid: Option<(u32, u32)>,
     ) {
         let blocks_x = width / block_size;
         let total_pixels = width * height;
+        let (mv_blocks_x, mv_blocks_y) = mv_grid.unwrap_or((blocks_x, height / block_size));
 
         let params = MotionCompensateParams {
             width,
@@ -965,8 +976,8 @@ impl MotionEstimator {
             mode: if forward { 0 } else { 1 },
             blocks_x,
             total_pixels,
-            _pad0: 0,
-            _pad1: 0,
+            mv_blocks_x,
+            mv_blocks_y,
         };
 
         let params_buf = ctx
@@ -2598,6 +2609,7 @@ mod tests {
             height,
             true,
             ME_BLOCK_SIZE,
+            None,
         );
         ctx.queue.submit(Some(cmd.finish()));
 
@@ -2618,6 +2630,7 @@ mod tests {
             height,
             false,
             ME_BLOCK_SIZE,
+            None,
         );
         ctx.queue.submit(Some(cmd.finish()));
 

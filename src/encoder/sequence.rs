@@ -172,7 +172,14 @@ impl EncoderPipeline {
         let padded_pixels = (padded_w * padded_h) as usize;
 
         // Ensure cached buffers (including gpu_ref_planes) exist for this resolution
-        self.ensure_cached(ctx, padded_w, padded_h, width, height);
+        self.ensure_cached(
+            ctx,
+            padded_w,
+            padded_h,
+            width,
+            height,
+            (info.chroma_padded_width(), info.chroma_padded_height()),
+        );
 
         // Create rate controller if target bitrate is set
         let mut rate_ctrl = config
@@ -1263,7 +1270,14 @@ impl EncoderPipeline {
         let padded_h = info.padded_height();
         let padded_pixels = (padded_w * padded_h) as usize;
         let plane_size = (padded_pixels * std::mem::size_of::<f32>()) as u64;
-        self.ensure_cached(ctx, padded_w, padded_h, width, height);
+        self.ensure_cached(
+            ctx,
+            padded_w,
+            padded_h,
+            width,
+            height,
+            (info.chroma_padded_width(), info.chroma_padded_height()),
+        );
         while i + group_size <= frames.len() {
             let current_gop_idx = i / group_size;
             match mode {
@@ -1800,7 +1814,14 @@ impl EncoderPipeline {
         let padded_h = info.padded_height();
         let padded_pixels = (padded_w * padded_h) as usize;
         let plane_size = (padded_pixels * std::mem::size_of::<f32>()) as u64;
-        self.ensure_cached(ctx, padded_w, padded_h, width, height);
+        self.ensure_cached(
+            ctx,
+            padded_w,
+            padded_h,
+            width,
+            height,
+            (info.chroma_padded_width(), info.chroma_padded_height()),
+        );
 
         // Reuse cached temporal wavelet buffers across GOPs (avoids ~22ms per-GOP allocation).
         // We take() the cache out of self to avoid holding an immutable borrow on self
@@ -2954,7 +2975,14 @@ impl EncoderPipeline {
     ) -> (CompressedFrame, wgpu::Buffer, Option<PrecomputedPFrameME>) {
         let plane_size = (padded_pixels * std::mem::size_of::<f32>()) as u64;
 
-        self.ensure_cached(ctx, padded_w, padded_h, width, height);
+        self.ensure_cached(
+            ctx,
+            padded_w,
+            padded_h,
+            width,
+            height,
+            (info.chroma_padded_width(), info.chroma_padded_height()),
+        );
         let bufs = self.cached.as_ref().unwrap();
 
         // Upload raw (unpadded) frame — GPU shader handles padding.
@@ -5123,7 +5151,14 @@ impl EncoderPipeline {
     ) -> (CompressedFrame, wgpu::Buffer, wgpu::Buffer, Option<PrecomputedBFrameME>) {
         let plane_size = (padded_pixels * std::mem::size_of::<f32>()) as u64;
 
-        self.ensure_cached(ctx, padded_w, padded_h, width, height);
+        self.ensure_cached(
+            ctx,
+            padded_w,
+            padded_h,
+            width,
+            height,
+            (info.chroma_padded_width(), info.chroma_padded_height()),
+        );
         let bufs = self.cached.as_ref().unwrap();
 
         let skip_preprocess = precomputed_me
@@ -6005,6 +6040,7 @@ impl EncoderPipeline {
                     padded_h,
                     true,
                     ME_BLOCK_SIZE, // B-frames still use 16x16 blocks
+                    None,          // luma: MV grid == this plane's block grid
                 );
                 // mc_out feeds directly into wavelet (read-only at level 0)
                 self.transform.forward(
@@ -6251,7 +6287,14 @@ impl EncoderPipeline {
                 (padded_w, padded_h, padded_pixels)
             };
 
-        self.ensure_cached(ctx, padded_w, padded_h, info.width, info.height);
+        self.ensure_cached(
+            ctx,
+            padded_w,
+            padded_h,
+            info.width,
+            info.height,
+            (info.chroma_padded_width(), info.chroma_padded_height()),
+        );
         let bufs = self.cached.as_ref().unwrap();
 
         // For non-444 Co quantized output was written to ref_upload (not co_plane).
@@ -6784,7 +6827,14 @@ impl EncoderPipeline {
         let padded_w = info.padded_width();
         let padded_h = info.padded_height();
         let padded_pixels = (padded_w * padded_h) as usize;
-        self.ensure_cached(ctx, padded_w, padded_h, info.width, info.height);
+        self.ensure_cached(
+            ctx,
+            padded_w,
+            padded_h,
+            info.width,
+            info.height,
+            (info.chroma_padded_width(), info.chroma_padded_height()),
+        );
         let staging: [wgpu::Buffer; 3] = std::array::from_fn(|idx| {
             ctx.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(
@@ -6822,7 +6872,14 @@ impl EncoderPipeline {
         let padded_w = info.padded_width();
         let padded_h = info.padded_height();
         let padded_pixels = (padded_w * padded_h) as usize;
-        self.ensure_cached(ctx, padded_w, padded_h, info.width, info.height);
+        self.ensure_cached(
+            ctx,
+            padded_w,
+            padded_h,
+            info.width,
+            info.height,
+            (info.chroma_padded_width(), info.chroma_padded_height()),
+        );
 
         let plane_size = (padded_pixels * std::mem::size_of::<f32>()) as u64;
         let bufs = self.cached.as_ref().unwrap();

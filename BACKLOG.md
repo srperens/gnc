@@ -79,19 +79,26 @@ Two defects from the BUG-1 diagnosis, both measured before fixing. Writeup:
 I-frame and the restored reference is never read. Regression test
 `test_multi_group_yuv420_anchor_pframe` uses ki=17.
 
-### BUG-3 — 4:2:0 collapses when the chroma plane is smaller than one tile (todo, P2)
-Found while building the BUG-1 regression test (2026-09-05). At 512x512 and 1024x1024 a 4:2:0
-pyramid GOP is healthy (I 38.1 dB, B 33–38, P 37.9). At **256x256 with tile_size=256** the whole
-GOP degrades progressively — I0 38.1, then 31.6 / 28.0 / 25.9 / 25.6 / 22.5 / 23.0 / 23.9, P8
-**20.6** — while the identical content in 4:4:4 stays flat at 42–44 dB across every frame.
+### BUG-3 — 4:2:0 chroma MC used the wrong row stride (**DONE 2026-09-05**)
+Logged with a gate that turned out to be **wrong** ("breaks when chroma plane < tile size" —
+falsified by 384x384, which is healthy). The real rule, from a sweep plus a non-square test:
+breakage depends only on the *horizontal* tile count, i.e. `padded_w != 2 * chroma_padded_w`,
+which holds whenever `tiles_x` is odd — **including 1280x720**, where inter frames measured
+23.6 dB. Writeup:
+[docs/decisions/0007-chroma-plane-stride.md](docs/decisions/0007-chroma-plane-stride.md).
 
-P-frames are affected too, so this is **not** the BUG-1 chroma MV mapping (that path is
-bit-identical for P). The distinguishing condition is that the chroma plane (128x128) is smaller
-than one tile, so the suspicion is chroma tile/padding handling at sub-tile plane sizes.
+Two off-by-stride errors, one per side: the encoder built the chroma MC params from
+`padded_w / 2` (false when tiles_x is odd), the decoder derived the MV index from the chroma
+block grid rather than the luma split grid the MVs actually live on. Fixed the BUG-1 way — state
+both grids explicitly and clamp.
 
-Reproduce: `test_bframe_yuv420_chroma_mv_grid` with w=h=256 instead of 512. Gate before fixing:
-confirm it tracks `chroma_plane < tile_size` rather than the absolute resolution, e.g. 256x256
-with `tile_size=128` should be healthy if the theory holds.
+**Result:** 720p anchor P 23.63 → **37.92 dB**; 768x768 23.86 → 37.93; 256x256 20.57 → 37.93;
+512x512 and 1920x1088 unchanged (controls). On real 1080p content, identical VMAF at
+**−3.9% bitrate** on both sequences — the old height (640 vs 768 chroma rows) left the bottom of
+every chroma plane unwritten, and the stale contents were still being coded.
+
+**Follow-up worth doing:** audit for other places deriving one plane's geometry from another's
+by a fixed factor. Three defects this session came from that single assumption.
 
 ### MEAS-1 — Correct video comparison GNC vs H.264 (todo)
 Run H.264 (libx264, full inter, standard GOP) on crowd_run + park_joy, 10 frames, yuv420p.

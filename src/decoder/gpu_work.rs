@@ -433,6 +433,13 @@ impl DecoderPipeline {
                     p_padded_h,
                     false, // inverse: recon = residual + predicted
                     bufs.mc_block_size / 2,
+                    // The MVs live on the luma split grid, whose stride is padded_w/block_size
+                    // — not this chroma plane's own p_padded_w/(block_size/2), which differs
+                    // whenever chroma pads to a different tile count than luma. (BUG-3)
+                    Some((
+                        padded_w / bufs.mc_block_size,
+                        padded_h / bufs.mc_block_size,
+                    )),
                 );
                 // Step 3: NN-upsample chroma_recon_buf → plane_results[p] (luma dims).
                 self.chroma_up.dispatch_upsample(
@@ -542,6 +549,7 @@ impl DecoderPipeline {
                     padded_h,
                     false, // inverse: recon = residual + predicted
                     bufs.mc_block_size,
+                    None, // luma: MV grid == this plane's block grid
                 );
             } else if is_pframe {
                 // P-frame luma or 4:4:4/4:2:2 chroma: scratch_a has residual at luma dims,
@@ -557,6 +565,7 @@ impl DecoderPipeline {
                     padded_h,
                     false, // inverse: recon = residual + predicted
                     bufs.mc_block_size,
+                    None, // luma: MV grid == this plane's block grid
                 );
             } else {
                 // I-frame: scratch_a has reconstructed spatial data (luma-sized after any upsample)

@@ -9,6 +9,11 @@
 // One thread per pixel. Each thread reads its block's MV and applies it.
 // Operates on a single plane — dispatch 3 times for Y, Co, Cg.
 
+// blocks_x describes THIS plane's block grid; mv_blocks_{x,y} describe the motion-vector
+// field's grid. They coincide for luma, but not for 4:2:0 chroma: luma and chroma planes are
+// padded to a tile multiple independently, so chroma_padded_w/4 can exceed padded_w/8 (e.g.
+// 720p: 768/4 = 192 chroma blocks against 1280/8 = 160 MV columns). Indexing the MV field with
+// this plane's stride then shifts every row. See docs/decisions/0007.
 struct Params {
     width: u32,
     height: u32,
@@ -16,8 +21,8 @@ struct Params {
     mode: u32,       // 0 = forward, 1 = inverse
     blocks_x: u32,
     total_pixels: u32,
-    _pad0: u32,
-    _pad1: u32,
+    mv_blocks_x: u32,  // row stride of the MV field
+    mv_blocks_y: u32,  // rows in the MV field
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -72,10 +77,13 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let x = pixel_idx % params.width;
     let y = pixel_idx / params.width;
 
-    // Determine which block this pixel belongs to
+    // Determine which block this pixel belongs to, then index the MV field with ITS stride.
+    // Blocks past the end of the MV field are padding; clamp so encoder and decoder resolve
+    // them identically instead of reading out of bounds.
     let bx = x / params.block_size;
     let by = y / params.block_size;
-    let block_idx = by * params.blocks_x + bx;
+    let block_idx = min(by, params.mv_blocks_y - 1u) * params.mv_blocks_x
+                  + min(bx, params.mv_blocks_x - 1u);
 
     // Read motion vector for this block (in quarter-pel units)
     let dx_qp = motion_vectors[block_idx * 2u];

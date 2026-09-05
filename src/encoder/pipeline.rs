@@ -819,13 +819,22 @@ impl EncoderPipeline {
         padded_h: u32,
         orig_w: u32,
         orig_h: u32,
+        // Chroma padded (width, height). Independent of the luma padding, so it cannot be
+        // derived from padded_w/padded_h — see BUG-3.
+        chroma_padded: (u32, u32),
     ) {
+        let (chroma_padded_w, chroma_padded_h) = chroma_padded;
         let needs_alloc = match &self.cached {
             Some(c) => {
                 c.padded_w != padded_w
                     || c.padded_h != padded_h
                     || c.orig_w != orig_w
                     || c.orig_h != orig_h
+                    // Chroma padding is independent of luma padding and changes with the chroma
+                    // format, so it has to be part of the key or the cached chroma MC params
+                    // survive a format switch with the wrong row stride.
+                    || c.chroma_padded_w != chroma_padded_w
+                    || c.chroma_padded_h != chroma_padded_h
             }
             None => true,
         };
@@ -833,7 +842,13 @@ impl EncoderPipeline {
             return;
         }
         self.cached = Some(CachedEncodeBuffers::new(
-            ctx, padded_w, padded_h, orig_w, orig_h,
+            ctx,
+            padded_w,
+            padded_h,
+            orig_w,
+            orig_h,
+            chroma_padded_w,
+            chroma_padded_h,
         ));
     }
 
@@ -1538,7 +1553,14 @@ impl EncoderPipeline {
         let chroma_info = info.make_chroma_info(); // subsampled dims; Yuv444 so wavelet sees full-res within chroma plane
 
         // Ensure cached buffers exist for this resolution
-        self.ensure_cached(ctx, padded_w, padded_h, width, height);
+        self.ensure_cached(
+            ctx,
+            padded_w,
+            padded_h,
+            width,
+            height,
+            (info.chroma_padded_width(), info.chroma_padded_height()),
+        );
         let bufs = self.cached.as_ref().unwrap();
 
         let t_setup = t_start.elapsed();

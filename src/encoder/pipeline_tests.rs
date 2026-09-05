@@ -2677,6 +2677,7 @@ fn test_pframe_divergence_checkpoints() {
             padded_h,
             false, // inverse: output = zero + prediction = prediction
             mf.block_size,
+            None,
         );
         ctx.queue.submit(Some(cmd.finish()));
         ctx.device.poll(wgpu::Maintain::Wait);
@@ -3054,14 +3055,28 @@ fn make_moving_texture_frame(w: u32, h: u32, shift: i32) -> Vec<f32> {
 /// docs/decisions/0004-chroma-mv-grid-mapping.md.
 #[test]
 fn test_bframe_yuv420_chroma_mv_grid() {
+    bframe_yuv420_quality_check(512, 512);
+}
+
+/// 1280x720 in 4:2:0 gives 5 luma tile columns (odd), so the chroma plane pads to 768 while
+/// padded_w/2 is 640 — the two disagree. Regression guard for BUG-3, which made every inter
+/// frame at this mainstream resolution reconstruct around 23 dB.
+#[test]
+fn test_bframe_yuv420_720p_chroma_stride() {
+    bframe_yuv420_quality_check(1280, 720);
+}
+
+/// 768x768: 3 luma tile columns, chroma pads 384 -> 512. Same defect class as 720p, square.
+#[test]
+fn test_bframe_yuv420_odd_tile_columns() {
+    bframe_yuv420_quality_check(768, 768);
+}
+
+fn bframe_yuv420_quality_check(w: u32, h: u32) {
     let ctx = crate::GpuContext::new();
     let mut encoder = EncoderPipeline::new(&ctx);
     let decoder = crate::decoder::pipeline::DecoderPipeline::new(&ctx);
 
-    // 512x512, not 256x256: at 256 the chroma plane (128x128) is smaller than one 256px tile,
-    // which trips a separate chroma padding defect that would mask this test (see BUG-3).
-    let w = 512u32;
-    let h = 512u32;
     let frames_rgb: Vec<Vec<f32>> = (0..9)
         .map(|i| make_moving_texture_frame(w, h, i))
         .collect();
@@ -3109,7 +3124,7 @@ fn test_bframe_yuv420_chroma_mv_grid() {
         .map(|(i, d)| compute_psnr(&frames_rgb[i], d))
         .collect();
     eprintln!(
-        "4:2:0 B-frame PSNR: I0={:.2} B1={:.2} B2={:.2} B3={:.2} B4={:.2} B5={:.2} B6={:.2} B7={:.2} P8={:.2}",
+        "{w}x{h} 4:2:0 B-frame PSNR: I0={:.2} B1={:.2} B2={:.2} B3={:.2} B4={:.2} B5={:.2} B6={:.2} B7={:.2} P8={:.2}",
         psnr[0], psnr[1], psnr[2], psnr[3], psnr[4], psnr[5], psnr[6], psnr[7], psnr[8],
     );
 
@@ -3127,8 +3142,8 @@ fn test_bframe_yuv420_chroma_mv_grid() {
         // below. 6 dB separates the two cleanly with ~1 dB margin on each side.
         assert!(
             psnr[i] > reference - 6.0,
-            "4:2:0 B-frame {i} at {:.2} dB is more than 6 dB below the P-path reference \
-             ({reference:.2} dB) — chroma MV grid mapping wrong? (see BUG-1)",
+            "{w}x{h} 4:2:0 B-frame {i} at {:.2} dB is more than 6 dB below the P-path \
+             reference ({reference:.2} dB) — chroma MV grid or stride wrong? (BUG-1 / BUG-3)",
             psnr[i],
         );
     }

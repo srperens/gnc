@@ -3489,3 +3489,62 @@ all came from the same assumption — that luma and chroma geometries are relate
 factor. They are not, because each plane pads to a tile multiple independently. Any code deriving
 one plane's dimensions from another's by shifting is suspect; a grep for `padded_w / 2`,
 `>> chroma_shift` and similar in geometry contexts would be a cheap audit.
+
+---
+
+## 2026-09-05 — #25 gate, and a correction to MEAS-4's conclusion
+
+**I got the MEAS-4 recommendation wrong, and the gate for #25 is what exposed it.**
+
+MEAS-4 concluded the inter gap is prediction quality (that part stands) and promoted #25
+(multi-reference P-frames) to P1 on the strength of an x264 ablation showing
+`--ref 1 --bframes 0` costing +29–32%. That flag combination changes **two** things at once, and
+GNC already has B-frames. Separating them:
+
+| sequence | `--ref 1` alone | `--bframes 0` alone | both |
+|---|---|---|---|
+| bbb | **+1.8%** | +22.0% | +29.2% |
+| touchdown | **+0.2%** | +28.9% | +31.5% |
+| speed_bag | **+0.9%** | +34.9% | +39.6% |
+| old_town | **+1.2%** | +41.3% | +43.8% |
+
+Multi-reference is worth **~1%** in a mature codec. The +29–32% was almost entirely B-frames,
+which GNC has. The promotion of #25 rested on a conflated measurement and is withdrawn.
+
+**#25's own gate** (`scripts/meas_multiref_gate.py`, offline block matching of frame n against
+n-1 and n-2, 16x16 blocks, ±16 full search, 5% margin):
+
+| sequence | blocks preferring n-2 | SAD reduction from best-of-2 | gate (>15%) |
+|---|---|---|---|
+| speed_bag (periodic) | 10.1% | 2.28% | FAIL |
+| old_town (panning) | 22.0% | 4.90% | PASS |
+| bbb (animation) | 7.8% | 2.09% | FAIL |
+| touchdown (sports) | 25.8% | 4.21% | PASS |
+
+Note the sequence chosen *specifically* as the best case — speed_bag, literally periodic motion —
+scores lowest. Where blocks do prefer the older reference (2/4 sequences), the SAD reduction is
+still only 4–5%, and x264 says the realised bitrate gain of multi-ref is ~1%.
+
+**Where the gap actually is.** Continuing the ablation with B-frames disabled on both sides, so
+GNC and x264 are compared like for like on P-frames alone:
+
+| | saves vs all-I |
+|---|---|
+| x264 P-only | 86.9% (bbb) / 82.6% (touchdown) |
+| **GNC P-only** | **38.5%** (bbb) |
+| x264 P-only, `--subme 0` | 79.9% / 77.1% |
+| x264 P-only, `--subme 0 --me dia --partitions none` | 79.5% / 76.8% |
+
+Crippling x264's sub-pel refinement and RD mode decision costs **+52.8% / +31.5%** bitrate — an
+order of magnitude more than CABAC (+8–9%), multi-reference (+1%) or block partitioning (+1%).
+And even a crippled x264 P-frame path still saves ~77–80% vs all-I where GNC saves 38.5%.
+
+So the inter gap is in **motion estimation and mode decision quality**, not in reference count,
+not in entropy coding, not in the transform. That is consistent with MEAS-4's finding that GNC's
+residuals have almost nothing an oracle could skip: the prediction is leaving energy everywhere
+because the motion search and mode decision are not finding it.
+
+**Method caveat on the gate script:** it matches on *source* frames, not decoded references, so it
+ignores the extra quantization noise an older reference carries (optimistic for n-2); and it
+charges nothing for the reference-index bit while giving no RD search (pessimistic). It bounds
+headroom, it does not predict bpp.

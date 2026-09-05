@@ -403,32 +403,6 @@ fn zigzag_decode(val: u16) -> i16 {
     ((val >> 1) as i16) ^ -((val & 1) as i16)
 }
 
-/// Write unsigned varint (u16 range: max 3 bytes)
-fn write_varint(out: &mut Vec<u8>, val: u16) {
-    let mut v = val as u32;
-    while v >= 0x80 {
-        out.push((v & 0x7F) as u8 | 0x80);
-        v >>= 7;
-    }
-    out.push(v as u8);
-}
-
-/// Read unsigned varint → u16
-fn read_varint(data: &[u8], pos: &mut usize) -> u16 {
-    let mut result = 0u32;
-    let mut shift = 0;
-    loop {
-        let b = data[*pos] as u32;
-        *pos += 1;
-        result |= (b & 0x7F) << shift;
-        if b < 0x80 {
-            break;
-        }
-        shift += 7;
-    }
-    result as u16
-}
-
 /// Median of three i16 values
 #[inline]
 fn median3(a: i16, b: i16, c: i16) -> i16 {
@@ -453,14 +427,121 @@ fn mv_predictor(vectors: &[[i16; 2]], bx: usize, by: usize, blocks_x: usize) -> 
     ]
 }
 
-/// Serialize motion vectors as delta-coded zigzag varints with skip bitmap.
+// ---- Bit-level Exp-Golomb coding for motion vectors (GP16) ----
+//
+// GP15 and earlier wrote each MV delta component as a zigzag varint. Varints are byte-aligned,
+// so a perfectly predicted motion vector still cost 2 bytes — a floor of 80 KB per 1080p P-frame
+// with its 40960 split MVs, measured at half the frame on a pure pan and 9-28% on real content.
+// Exp-Golomb codes zigzag(0) in a single bit, which is what a well-predicted field deserves.
+
+struct BitWriter {
+    bits: u64,
+    nbits: u32,
+}
+
+impl BitWriter {
+    fn new() -> Self {
+        Self { bits: 0, nbits: 0 }
+    }
+
+    fn put(&mut self, out: &mut Vec<u8>, value: u64, count: u32) {
+        debug_assert!(count <= 32);
+        self.bits = (self.bits << count) | (value & ((1u64 << count) - 1));
+        self.nbits += count;
+        while self.nbits >= 8 {
+            self.nbits -= 8;
+            out.push(((self.bits >> self.nbits) & 0xFF) as u8);
+        }
+    }
+
+    /// Exp-Golomb order 0: value v is written as ceil(log2(v+2)) zeros then (v+1) in binary.
+    fn put_ue(&mut self, out: &mut Vec<u8>, v: u32) {
+        let n = v as u64 + 1;
+        let len = 64 - n.leading_zeros(); // bits in n
+        self.put(out, 0, len - 1);
+        self.put(out, n, len);
+    }
+
+    fn flush(&mut self, out: &mut Vec<u8>) {
+        if self.nbits > 0 {
+            out.push(((self.bits << (8 - self.nbits)) & 0xFF) as u8);
+            self.nbits = 0;
+            self.bits = 0;
+        }
+    }
+}
+
+struct BitReader<'a> {
+    data: &'a [u8],
+    byte: usize,
+    bit: u32,
+}
+
+impl<'a> BitReader<'a> {
+    fn new(data: &'a [u8], start: usize) -> Self {
+        Self { data, byte: start, bit: 0 }
+    }
+
+    fn get_bit(&mut self) -> u32 {
+        if self.byte >= self.data.len() {
+            return 0;
+        }
+        let b = (self.data[self.byte] >> (7 - self.bit)) & 1;
+        self.bit += 1;
+        if self.bit == 8 {
+            self.bit = 0;
+            self.byte += 1;
+        }
+        b as u32
+    }
+
+    fn get(&mut self, count: u32) -> u64 {
+        let mut v = 0u64;
+        for _ in 0..count {
+            v = (v << 1) | self.get_bit() as u64;
+        }
+        v
+    }
+
+    fn get_ue(&mut self) -> u32 {
+        let mut zeros = 0u32;
+        while self.get_bit() == 0 {
+            zeros += 1;
+            if zeros > 32 || self.byte >= self.data.len() {
+                return 0;
+            }
+        }
+        let rest = self.get(zeros);
+        (((1u64 << zeros) | rest) - 1) as u32
+    }
+
+    /// Byte position after the last bit consumed, rounding up.
+    fn finish(&self) -> usize {
+        if self.bit > 0 {
+            self.byte + 1
+        } else {
+            self.byte
+        }
+    }
+}
+
+/// Serialize motion vectors as median-predicted deltas.
 ///
-/// Format: [skip_bitmap: ceil(N/8) bytes] [delta MVs for non-skip blocks]
-/// Skip bit = 1 means MV is (0,0) — no delta bytes written for that block.
-/// Skip bit = 0 means delta MV follows (2 zigzag varints: dx, dy).
+/// Layout: `[all_zero: 1 byte]`, and when that flag is 0,
+/// `[skip_bitmap: ceil(N/8) bytes] [Exp-Golomb delta pairs for non-skip blocks]`.
+/// A skip bit of 1 means the vector is (0,0) and carries no delta.
 fn serialize_mvs_delta(out: &mut Vec<u8>, vectors: &[[i16; 2]], blocks_x: usize) {
     let n = vectors.len();
-    // Build skip bitmap: bit=1 for MV=(0,0) blocks
+    let all_zero = vectors.iter().all(|mv| mv[0] == 0 && mv[1] == 0);
+    // One flag byte instead of an all-ones bitmap: a static frame's 40960-block field was
+    // costing 5 KB to say "nothing moved".
+    out.push(u8::from(all_zero));
+    if all_zero {
+        return;
+    }
+
+    // Skip bitmap: bit=1 for MV=(0,0) blocks. Still the cheapest way to carry the zero mask,
+    // at one bit per block.
     let bitmap_bytes = n.div_ceil(8);
     let bitmap_start = out.len();
     out.resize(bitmap_start + bitmap_bytes, 0);
@@ -469,8 +550,11 @@ fn serialize_mvs_delta(out: &mut Vec<u8>, vectors: &[[i16; 2]], blocks_x: usize)
             out[bitmap_start + i / 8] |= 1 << (i % 8);
         }
     }
-    // Write delta MVs only for non-skip blocks
+
+    // Delta MVs for non-skip blocks, Exp-Golomb coded so a well-predicted vector costs bits
+    // rather than bytes.
     let blocks_y = n.checked_div(blocks_x).unwrap_or(0);
+    let mut bw = BitWriter::new();
     for by in 0..blocks_y {
         for bx in 0..blocks_x {
             let idx = by * blocks_x + bx;
@@ -478,12 +562,11 @@ fn serialize_mvs_delta(out: &mut Vec<u8>, vectors: &[[i16; 2]], blocks_x: usize)
                 continue; // skip — no MV data needed
             }
             let pred = mv_predictor(vectors, bx, by, blocks_x);
-            let dx = vectors[idx][0] - pred[0];
-            let dy = vectors[idx][1] - pred[1];
-            write_varint(out, zigzag_encode(dx));
-            write_varint(out, zigzag_encode(dy));
+            bw.put_ue(out, zigzag_encode(vectors[idx][0] - pred[0]) as u32);
+            bw.put_ue(out, zigzag_encode(vectors[idx][1] - pred[1]) as u32);
         }
     }
+    bw.flush(out);
 }
 
 /// Deserialize delta-coded zigzag varint MVs with skip bitmap back to absolute MVs.
@@ -493,12 +576,19 @@ fn deserialize_mvs_delta(
     num_blocks: usize,
     blocks_x: usize,
 ) -> Vec<[i16; 2]> {
+    let all_zero = data[*pos] != 0;
+    *pos += 1;
+    if all_zero {
+        return vec![[0, 0]; num_blocks];
+    }
+
     // Read skip bitmap
     let bitmap_bytes = num_blocks.div_ceil(8);
-    let bitmap = &data[*pos..*pos + bitmap_bytes];
+    let bitmap = data[*pos..*pos + bitmap_bytes].to_vec();
     *pos += bitmap_bytes;
     let mut vectors = Vec::with_capacity(num_blocks);
     let blocks_y = num_blocks.checked_div(blocks_x).unwrap_or(0);
+    let mut br = BitReader::new(data, *pos);
     for by in 0..blocks_y {
         for bx in 0..blocks_x {
             let idx = by * blocks_x + bx;
@@ -507,12 +597,13 @@ fn deserialize_mvs_delta(
                 vectors.push([0, 0]);
             } else {
                 let pred = mv_predictor(&vectors, bx, by, blocks_x);
-                let dx = zigzag_decode(read_varint(data, pos));
-                let dy = zigzag_decode(read_varint(data, pos));
+                let dx = zigzag_decode(br.get_ue() as u16);
+                let dy = zigzag_decode(br.get_ue() as u16);
                 vectors.push([pred[0] + dx, pred[1] + dy]);
             }
         }
     }
+    *pos = br.finish();
     vectors
 }
 
@@ -527,7 +618,7 @@ pub fn serialize_compressed(frame: &crate::CompressedFrame) -> Vec<u8> {
     // magnitude-conditioned zero-run context, K_STRIDE 17→25 per tile, #53).
     // GP14 adds fwd_ref_idx + bwd_ref_idx for hierarchical pyramid B-frames.
     // GP13 is GP12 + chroma_format byte.
-    out.extend_from_slice(b"GP15");
+    out.extend_from_slice(b"GP16");
     // Common header fields (includes chroma_format byte for GP13)
     serialize_frame_header(frame, &mut out);
     // Motion field — GP12 uses delta-coded varint MVs
@@ -767,8 +858,19 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
     let is_gp13 = magic == b"GP13";
     let is_gp14 = magic == b"GP14";
     let is_gp15 = magic == b"GP15";
+    // GP16: motion-vector deltas are Exp-Golomb bit-coded rather than byte-aligned varints,
+    // preceded by an all-zero flag byte.
+    let is_gp16 = magic == b"GP16";
     assert!(
-        magic == b"GPC8" || is_gpc9 || is_gp10 || is_gp11 || is_gp12 || is_gp13 || is_gp14 || is_gp15,
+        magic == b"GPC8"
+            || is_gpc9
+            || is_gp10
+            || is_gp11
+            || is_gp12
+            || is_gp13
+            || is_gp14
+            || is_gp15 || is_gp16
+            || is_gp16,
         "Invalid magic (expected GPC8, GPC9, GP10, GP11, GP12, GP13, GP14 or GP15; older files must be re-encoded)"
     );
 
@@ -794,14 +896,14 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
     };
 
     // Per-subband entropy flag (GPC9/GP10/GP11/GP12/GP13/GP14)
-    let (per_subband_entropy, mut pos) = if is_gpc9 || is_gp10 || is_gp11 || is_gp12 || is_gp13 || is_gp14 || is_gp15 {
+    let (per_subband_entropy, mut pos) = if is_gpc9 || is_gp10 || is_gp11 || is_gp12 || is_gp13 || is_gp14 || is_gp15 || is_gp16 {
         (data[34] != 0, 35)
     } else {
         (false, 34)
     };
 
     // Chroma format byte (GP13/GP14; older formats default to 4:4:4)
-    let chroma_format_decoded = if is_gp13 || is_gp14 || is_gp15 {
+    let chroma_format_decoded = if is_gp13 || is_gp14 || is_gp15 || is_gp16 {
         let cf = crate::ChromaFormat::from_u8(data[pos])
             .unwrap_or(crate::ChromaFormat::Yuv444);
         pos += 1;
@@ -871,7 +973,7 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
     };
 
     // --- Intra prediction modes (GP11/GP12/GP13/GP14) ---
-    let intra_modes = if (is_gp11 || is_gp12 || is_gp13 || is_gp14 || is_gp15) && data[pos] != 0 {
+    let intra_modes = if (is_gp11 || is_gp12 || is_gp13 || is_gp14 || is_gp15 || is_gp16) && data[pos] != 0 {
         pos += 1; // skip intra_flag
         let _num_blocks = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
         pos += 4;
@@ -880,7 +982,7 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
         let modes = data[pos..pos + packed_len].to_vec();
         pos += packed_len;
         Some(modes)
-    } else if is_gp11 || is_gp12 || is_gp13 || is_gp14 || is_gp15 {
+    } else if is_gp11 || is_gp12 || is_gp13 || is_gp14 || is_gp15 || is_gp16 {
         pos += 1; // skip intra_flag = 0
         None
     } else {
@@ -888,7 +990,7 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
     };
 
     // --- Frame type + motion field (GP10/GP11/GP12/GP13/GP14) ---
-    let (frame_type, motion_field) = if is_gp10 || is_gp11 || is_gp12 || is_gp13 || is_gp14 || is_gp15 {
+    let (frame_type, motion_field) = if is_gp10 || is_gp11 || is_gp12 || is_gp13 || is_gp14 || is_gp15 || is_gp16 {
         let ft = match data[pos] {
             0 => crate::FrameType::Intra,
             1 => crate::FrameType::Predicted,
@@ -902,7 +1004,7 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
             let num_blocks =
                 u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
             pos += 4;
-            let vectors = if is_gp12 || is_gp13 || is_gp14 || is_gp15 {
+            let vectors = if is_gp12 || is_gp13 || is_gp14 || is_gp15 || is_gp16 {
                 // GP12/GP13/GP14: delta-coded zigzag varint MVs
                 let padded_w = width.div_ceil(tile_size) * tile_size;
                 let blocks_x = (padded_w / block_size) as usize;
@@ -920,12 +1022,12 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
             };
             // GP11/GP12/GP13/GP14 B-frames: backward vectors + block modes
             let (backward_vectors, block_modes, fwd_ref_idx, bwd_ref_idx) =
-                if (is_gp11 || is_gp12 || is_gp13 || is_gp14 || is_gp15) && ft == crate::FrameType::Bidirectional {
+                if (is_gp11 || is_gp12 || is_gp13 || is_gp14 || is_gp15 || is_gp16) && ft == crate::FrameType::Bidirectional {
                     let bwd_count =
                         u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
                     pos += 4;
                     let bwd = if bwd_count > 0 {
-                        if is_gp12 || is_gp13 || is_gp14 || is_gp15 {
+                        if is_gp12 || is_gp13 || is_gp14 || is_gp15 || is_gp16 {
                             let padded_w = width.div_ceil(tile_size) * tile_size;
                             let bwd_blocks_x = (padded_w / 16) as usize;
                             Some(deserialize_mvs_delta(data, &mut pos, bwd_count, bwd_blocks_x))
@@ -955,7 +1057,7 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
                         None
                     };
                     // GP14+: ref pool indices (1 byte each); older formats default to 0/1
-                    let (fwd_idx, bwd_idx) = if is_gp14 || is_gp15 {
+                    let (fwd_idx, bwd_idx) = if is_gp14 || is_gp15 || is_gp16 {
                         let f = data[pos];
                         let b = data[pos + 1];
                         pos += 2;
@@ -991,7 +1093,7 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
     pos += 4;
 
     // GP11/GP12/GP13/GP14: tile index table with sizes + CRC-32s
-    let (tile_sizes, tile_crcs) = if is_gp11 || is_gp12 || is_gp13 || is_gp14 || is_gp15 {
+    let (tile_sizes, tile_crcs) = if is_gp11 || is_gp12 || is_gp13 || is_gp14 || is_gp15 || is_gp16 {
         let mut sizes = Vec::with_capacity(num_tiles);
         let mut expected_crcs = Vec::with_capacity(num_tiles);
         for _ in 0..num_tiles {
@@ -1690,6 +1792,39 @@ pub fn seek_to_temporal_keyframe(header: &TemporalSequenceHeader, target_pts: u3
 
 #[cfg(test)]
 mod tests {
+    /// Exp-Golomb motion-vector coding must round-trip exactly, including the values that
+    /// dominate a well-predicted field: zero deltas, and long runs of them.
+    #[test]
+    fn mv_expgolomb_roundtrip() {
+        let cases: Vec<Vec<[i16; 2]>> = vec![
+            vec![[0, 0]; 64],
+            (0..64).map(|i| [i as i16 - 32, 32 - i as i16]).collect(),
+            // A constant field with one outlier — the pan case that exposed the varint floor.
+            {
+                let mut v = vec![[-8i16, 0i16]; 64];
+                v[37] = [123, -456];
+                v[0] = [0, 0];
+                v
+            },
+        ];
+        for vectors in cases {
+            let mut buf = Vec::new();
+            serialize_mvs_delta(&mut buf, &vectors, 8);
+            let mut pos = 0usize;
+            let back = deserialize_mvs_delta(&buf, &mut pos, vectors.len(), 8);
+            assert_eq!(back, vectors, "round-trip mismatch, {} bytes", buf.len());
+            assert_eq!(pos, buf.len(), "reader ended at {pos} of {}", buf.len());
+        }
+    }
+
+    /// A field that is entirely zero must not pay for a bitmap.
+    #[test]
+    fn mv_all_zero_is_one_byte() {
+        let mut buf = Vec::new();
+        serialize_mvs_delta(&mut buf, &vec![[0, 0]; 40960], 240);
+        assert_eq!(buf.len(), 1, "all-zero MV field cost {} bytes", buf.len());
+    }
+
     use super::*;
     use crate::encoder::rice;
 

@@ -3895,3 +3895,47 @@ fix recovers.
 That is a strategy question rather than an engineering one, and it is being taken back to the
 project owner. Note `GNC_P_QP_SCALE` is left in place (default 1.0, no behaviour change) since it
 is the only quantiser lever the pyramid lacked and it is now measurable.
+
+---
+
+## 2026-09-05 — GP16: Exp-Golomb motion vectors, 5-15% off the bitrate at identical quality
+
+First improvement from the "keep hunting the video gap" direction.
+
+**What was wrong.** `serialize_mvs_delta` wrote each median-predicted MV delta component as a
+zigzag varint. Varints are byte-aligned, so a *perfectly predicted* vector still cost 2 bytes.
+With 40960 split MVs per 1080p frame that is an 80 KB floor whenever motion is non-zero,
+regardless of how predictable the motion is — measured at **50.7% of a P-frame** on a pure global
+pan. A frame with no motion at all still paid 5 KB for an all-ones skip bitmap.
+
+**Change (bitstream: GP15 → GP16).**
+- MV deltas are Exp-Golomb order-0 coded on a bit stream. A zero delta costs 1 bit rather than
+  8, which is what a well-predicted field deserves.
+- An all-zero MV field is signalled by a single flag byte instead of a 5 KB bitmap.
+- The per-block zero bitmap is kept for mixed fields; at one bit per block it is already the
+  cheapest way to carry that mask.
+
+Guarded by `mv_expgolomb_roundtrip` (zero fields, ramps, constant-plus-outlier) and
+`mv_all_zero_is_one_byte`.
+
+**Measured**, 1080p 4:2:0 ki=9, 17 frames, `GNC_REF_DEBLOCK=0`:
+
+| sequence | before | after | change |
+|---|---|---|---|
+| bbb q=40 | 2 494 788 | **2 247 022** | **−9.9%** |
+| bbb q=70 | 5 367 040 | **5 102 044** | **−4.9%** |
+| pan q=70 | 4 876 285 | **4 134 127** | **−15.2%** |
+
+VMAF on bbb q=70 is unchanged at mean 95.50 / min 94.02 — MV coding is lossless, so this is
+rate reduction at identical quality. The gain is largest where motion is real and coherent (the
+pan) and at low bitrate, where MVs are a bigger share of a smaller frame. Low bitrate is also
+where MEAS-1 measured the worst BD-rate, so this lands where it is most needed.
+
+**Levers checked and rejected on the way here:**
+- *Encoder-side reference deblocking* (on by default, decoder has none, so it is an
+  encoder/decoder mismatch): VMAF 95.44 with, 95.50 without. Marginally harmful and nearly a
+  no-op. Left alone for now; proper in-loop deblocking on both sides is the real version.
+- *Split-decision lambda* (`GNC_SPLIT_LAMBDA_SCALE`, added): no effect on bitrate at any scale
+  from 1x to 64x, because the split MV field is serialized at full 8x8 density regardless of
+  what the RD decision chooses. Merging only helps if the coder can express it cheaply — which
+  is what GP16 now does.

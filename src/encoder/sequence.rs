@@ -3265,7 +3265,17 @@ impl EncoderPipeline {
                 // Variable block size: 8x8 split decision
                 // Lambda must be high enough to prevent unnecessary splits on easy content.
                 // Each split adds 3 extra MVs (12 bytes raw); must outweigh residual savings.
-                let lambda_sad = (config.quantization_step * 16.0 + 128.0).round() as u32;
+                // RD penalty for splitting a 16x16 macroblock into finer partitions. Higher =
+                // fewer splits. Each extra motion vector costs at least 2 bytes in the bitstream
+                // (varints have a one-byte floor per component), so splitting is more expensive
+                // than this SAD-domain constant suggests; GNC_SPLIT_LAMBDA_SCALE exposes it for
+                // measurement. See RESEARCH_LOG 2026-09-05.
+                let split_lambda_scale: f32 = std::env::var("GNC_SPLIT_LAMBDA_SCALE")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(1.0);
+                let lambda_sad =
+                    ((config.quantization_step * 16.0 + 128.0) * split_lambda_scale).round() as u32;
                 split_mv_buf = self.motion.estimate_split(
                     ctx,
                     &mut cmd,

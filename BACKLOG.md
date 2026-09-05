@@ -139,6 +139,18 @@ and there are no users — and expensive once there is a spec, conformance strea
 Not a research item: buffer formats, upload/download paths, PNG/Y4M I/O, bitstream fields, and the
 VMAF/PSNR comparison harness at 10-bit. No f64 needed; 10-bit fits f32/i32 comfortably.
 
+**Partly present already (verified 2026-09-05).** `gnc encode` accepts `--bit-depth 10` and the
+still-image encode/decode round-trip runs. **`gnc encode-sequence` has no bit-depth option at
+all**, so the video path — the one the market actually requires — is 8-bit. Scope is therefore
+"extend the existing still-image 10-bit path through the sequence pipeline and container", not
+"implement 10-bit from scratch". Verify the still path is genuinely 10-bit end to end (the decoded
+PNG's actual bit depth was not confirmed) before relying on it.
+
+**External requirement, confirmed 2026-09-05.** EBU R 153 specifies 10-bit 4:2:2 Y'C'BC'R for live
+UHD/HDR contribution and forbids SDR transfer functions; EBU TR 091's entire codec test matrix is
+10-bit BT.2100 HLG with no 8-bit or 4:2:0 test point anywhere. A codec that cannot ingest 10-bit
+4:2:2 cannot be entered into the industry's reference evaluation. This is a gate, not a feature.
+
 Note the interaction with the operating point: 10-bit costs bits at low bitrate and almost nothing
 at contribution quality, which is another reason to stop optimising against distribution bitrates.
 

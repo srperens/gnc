@@ -4556,3 +4556,45 @@ the format. Guarded by `test_non444_falls_back_to_rice` and
 The `--rice` CLI help claims Rice is "~30% worse compression" than rANS. Measured, Rice is
 *better* above q≈25 and by 8-12% at q=70. The help text is wrong and should be corrected to
 describe the actual crossover.
+
+---
+
+## 2026-09-05 — Two more entropy backends ruled out; adaptive-quantisation gradient was inverted
+
+### The other two entropy coders are not competitive
+
+Only Rice and rANS had been compared. Measured all four on bbb at identical PSNR:
+
+| q | Rice | rANS | Bitplane | Huffman |
+|---|---|---|---|---|
+| 10 | 0.97 | **0.84** | 2.54 | 1.16 |
+| 25 | 1.70 | **1.62** | 4.35 | 1.89 |
+| 40 | **2.29** | 2.33 | 5.76 | 2.51 |
+| 70 | **4.20** | 4.63 | 9.35 | 4.55 |
+
+Huffman is 10-20% worse than Rice everywhere. **Bitplane is 2.2-2.6x worse**, which is too far off
+to be a tuning matter — it looks unfinished rather than weak, and it is also the slowest (57.7 ms
+against 33.0 ms at q=70). Neither is worth carrying as a candidate; Rice and rANS are the real
+options, and TUNE-3 already picks between them by quality.
+
+### Adaptive quantisation: strength gradient was backwards
+
+`aq_strength` was 0.2 above q=70 and 0.15 below — never swept. Measured across three images:
+
+| | q=10 | q=25 | q=40 | q=55–80 |
+|---|---|---|---|---|
+| bbb, 0.15 → 0.3 | 78.55 → **78.95** | 90.45 → **90.74** | 93.77 → 93.87 | ±0.01 |
+| touchdown, 0.15 → 0.3 | 76.18 → 76.19 | 89.50 → **89.62** | 93.70 → 93.62 | — |
+| kristensara, 0.15 → 0.3 | 85.57 → **86.12** | 93.18 → **93.49** | 95.24 → 95.30 | ±0.03 |
+
+VMAF, at under 1% more rate in every low-q case (0.84 → 0.85 bpp, 1.70 → 1.71, 0.50 → 0.51).
+Strengths of 0.45 and 0.6 fall back again, so 0.3 is the peak, not just "more is better". From
+q=40 upward the trade turns neutral or negative, and above q=55 the setting barely registers at
+all.
+
+**So AQ helps precisely where it was set weakest.** New rule: 0.3 below q=30, unchanged above.
+Worth roughly 1-5% BD-rate at low quality — small, but free, and it stacks with TUNE-3, which
+targets the same rate region.
+
+Both defaults now measured rather than guessed. `GNC_AQ_STRENGTH` left in place so the sweep is
+repeatable.

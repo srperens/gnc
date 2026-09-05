@@ -598,7 +598,21 @@ pub fn quality_preset(q: u32) -> CodecConfig {
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(4);
     let aq_enabled = q <= 80; // AQ helps in lossy range; variance computed on LL subband
-    let aq_strength = if q >= 70 { 0.2 } else { 0.15 };
+    // Swept 2026-09-05 on bbb, touchdown and kristensara. Below q=30 a strength of 0.3 buys
+    // +0.1 to +0.55 VMAF for under 1% more rate; 0.45 and 0.6 fall back again, so 0.3 is the
+    // peak. From q=40 upward it is neutral or slightly negative, and above q=55 the strength
+    // barely registers at all (±0.03 VMAF). The old rule had the gradient the wrong way round —
+    // the weakest setting where AQ helps most.
+    let aq_strength = std::env::var("GNC_AQ_STRENGTH")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .unwrap_or(if q < 30 {
+            0.3
+        } else if q >= 70 {
+            0.2
+        } else {
+            0.15
+        });
     // Default: uniform weights. Measurement campaign showed "perceptual" weights had the
     // gradient inverted (finest subbands weighted LEAST aggressively), making them worse
     // than uniform on both PSNR and VMAF. Physical weights (correctly reversed) are best

@@ -340,6 +340,13 @@ understated the 3→4 step by 5x (1.2% predicted, 6% measured), because Rice ada
 and an ideal-entropy model does not see that. So measure in-codec with a temporary widening
 before committing to the format change.
 
+### TUNE-4 — Adaptive quantisation gradient was inverted (**DONE 2026-09-05**)
+`aq_strength` was 0.2 above q=70 and 0.15 below, never swept. Measured: 0.3 below q=30 buys +0.1
+to +0.55 VMAF for under 1% more rate on all three images; 0.45 and 0.6 fall back, so 0.3 is the
+peak. Neutral-to-negative from q=40 up, and irrelevant above q=55. AQ helped precisely where it
+was set weakest. New rule: 0.3 below q=30, unchanged above. ~1-5% BD-rate at low quality, and it
+stacks with TUNE-3.
+
 ### TUNE-3 — Entropy coder now follows quality (**DONE 2026-09-05**)
 rANS at q ≤ 20, Rice above. Measured at identical PSNR: rANS is 5-19% smaller below q=20 and
 neutral-to-worse above, crossover content-dependent (kristensara turns at q=20, bbb and touchdown
@@ -359,6 +366,10 @@ quality on bbb, touchdown and kristensara at q=25/40/49, at no speed cost. Defau
 everywhere.
 
 ### Closed by measurement 2026-09-05 — do not re-test
+- **Huffman entropy backend**: 10-20% worse than Rice at every quality.
+- **Bitplane entropy backend**: **2.2-2.6x worse** than Rice and the slowest of the four
+  (57.7 ms against 33.0 at q=70). Too far off to be a tuning matter — it looks unfinished. Not
+  worth carrying as a candidate.
 - **Per-code-block Rice parameter adaptation** (JPEG 2000's code-block granularity): ≤2.8% at high
   rate, negative at low rate (`scripts/meas_codeblock_k.py`). Per-subband `k` is already right.
 - **Subband quantiser weighting from synthesis norms** (what JPEG 2000 does): the existing

@@ -3831,3 +3831,67 @@ Two threads remain unexamined and are the honest next steps:
 
 Thread 2 is the more interesting of the two: if most of the inter residual is re-coded reference
 noise, the fix is better references, not better residual coding.
+
+---
+
+## 2026-09-05 — Where an inter frame's bits actually go, and why no single lever moves it
+
+A pure global translation makes the cleanest possible test: every block has the same integer
+motion vector, so prediction should be near-perfect. Frame 0 of bbb, shifted 2 px per frame,
+17 frames, 1080p 4:2:0, matched quality:
+
+| | P-frame | B-frame |
+|---|---|---|
+| x264 (crf 20) | **1 783 bytes** | **123 bytes** |
+| GNC (q=70) | **175 387 bytes** | — |
+
+98x, on the easiest case there is. GNC's P-frame here also reconstructs at 42.48 dB against its
+own I-frame's 41.71 — it spends bits making the frame *better* than the reference it predicts
+from. Breakdown of that 171 KB frame:
+
+| | bytes | share |
+|---|---|---|
+| motion vectors | 84.5 KB | **50.7%** |
+| tile headers | 18.6 KB | 11.2% |
+| coefficients | 63.5 KB | 38.1% |
+
+Half the frame is motion vectors — for a field that is constant across the whole picture. The
+residual (mean \|value\| 1.40) is *below* the reference's own noise level, so the prediction is
+essentially perfect and the coefficients are coding the previous frame's quantisation noise.
+
+**Why the MV field costs so much.** `serialize_mvs_delta` writes a 1-bit-per-block skip bitmap
+(5 KB per 1080p frame, unconditionally, even when every MV is zero) and then, for every non-zero
+block, a zigzag varint per component. A varint has a one-byte floor, so a *perfectly predicted*
+MV still costs 2 bytes. With 40960 split MVs per 1080p frame that is an **80 KB floor** whenever
+motion is non-zero, independent of how predictable that motion is.
+
+On real content 70% of MVs are zero and the bitmap catches them, so the cost falls to ~28.6 KB —
+9% of a P-frame at q=70, but 28% at q=40 where the frame is smaller. Entropy-coding the deltas
+sub-byte would recover an estimated ~4% on real content and ~43% on the pan. Content-dependent,
+and not worth a bitstream change on its own.
+
+### Levers tested and rejected, in one place
+
+Every candidate that can be isolated has now been measured on real content at matched quality:
+
+| lever | result |
+|---|---|
+| multi-reference P-frames | +0.2 to +5.5% (x264's own ablation); #25 withdrawn |
+| 6-tap sub-pel interpolation | neutral to worse on 3 of 4 sequences |
+| motion search quality | GNC beats an offline full-search oracle |
+| context-adaptive entropy | ≤3.4% |
+| block DCT + RD skip for residuals | −39% to +34%, content-dependent |
+| smaller tiles | 70% more bits at worse quality (headers are ~290 B/tile) |
+| dead zone | moves along the same RD curve, not off it |
+| pyramid QP scaling (B-frames) | −6% rate for −1.2 VMAF |
+| **P-frame QP scaling** (new lever, `GNC_P_QP_SCALE`) | worse than lowering q uniformly; VMAF min falls 94→71 as reference error propagates |
+| MV entropy coding | ~4% on real content |
+
+**The deficit does not decompose.** MEAS-1 puts GNC 5-7x behind H.264 on video, and no single
+mechanism accounts for more than a few tens of percent. What is left is the compound of many
+moderate losses — which is what a mature RD-optimised encoder buys, and not something a targeted
+fix recovers.
+
+That is a strategy question rather than an engineering one, and it is being taken back to the
+project owner. Note `GNC_P_QP_SCALE` is left in place (default 1.0, no behaviour change) since it
+is the only quantiser lever the pyramid lacked and it is now measurable.

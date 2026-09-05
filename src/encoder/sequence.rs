@@ -3019,6 +3019,18 @@ impl EncoderPipeline {
         res_config.subband_weights = uniform_weights;
         res_config.dead_zone = res_dead_zone;
 
+        // P-frames are quantised at the same step as intra, which H.264 does not do: x264 runs
+        // its P-frames about 4 QP steps coarser (~1.6x) and its B-frames coarser still. GNC's
+        // pyramid has scales for layers 2 and 3 but nothing for P, so this exposes one.
+        // Measured: see RESEARCH_LOG 2026-09-05.
+        let p_qp_scale: f32 = std::env::var("GNC_P_QP_SCALE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1.0);
+        // The decoder dequantises from the stored config, so both must use this value.
+        let res_qstep = (config.quantization_step * p_qp_scale).min(64.0);
+        res_config.quantization_step = res_qstep;
+
         let entropy_mode = EntropyMode::from_config(config);
         let tile_size = config.tile_size as usize;
         let tiles_x = info.tiles_x() as usize;
@@ -3476,7 +3488,7 @@ impl EncoderPipeline {
                         &bufs.plane_c,
                         quant_out,
                         chroma_pixels as u32,
-                        config.quantization_step,
+                        res_qstep,
                         res_dead_zone,
                         true,
                         chroma_padded_w,
@@ -3539,7 +3551,7 @@ impl EncoderPipeline {
                         &bufs.plane_c,
                         quant_out,
                         chroma_pixels as u32,
-                        config.quantization_step,
+                        res_qstep,
                         res_dead_zone,
                         true,
                         chroma_padded_w,
@@ -3588,7 +3600,7 @@ impl EncoderPipeline {
                         &bufs.plane_c,
                         quant_out,
                         padded_pixels as u32,
-                        config.quantization_step,
+                        res_qstep,
                         res_dead_zone,
                         true,
                         padded_w,

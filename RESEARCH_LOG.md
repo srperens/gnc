@@ -4301,3 +4301,70 @@ Byte-identical frames are a synthetic extreme; the dead zone behaves atypically 
 is pure reconstruction error. This measures that the defect exists and is large in the limit — it
 does not quantify the loss on real content. Re-measuring on ≥3 real sequences at matched VMAF is
 the required next step before sizing the fix.
+
+---
+
+## 2026-09-05 — BUG-5 on real content: B-frames lose at contribution quality on 3 of 4 sequences
+
+### Motivation
+
+The static-content measurement above showed the B-pyramid costing 16.7x what P-frames cost on
+byte-identical frames. That is a synthetic extreme. This is the required follow-up on real content.
+
+### Method
+
+Four 1080p sequences × 17 frames × 4 qsteps × two configs, 4:4:4, Rice, fixed qstep (rate control
+off), VMAF measured on decoded output against the source (yuv420p, libvmaf default model).
+Configs: **P-only** (`ki=8`, no B-frames) and **B-pyramid** (`ki=17`).
+
+**The comparison handicaps P-only.** `ki=8` emits 3 I-frames over 17 frames where `ki=17` emits 1,
+so the P-only config carries two extra I-frames it has to pay for. Where P-only still wins, the
+B-frame deficit is at least that large.
+
+### Result
+
+BD-rate, B-pyramid vs P-only, VMAF-based. Negative = B-pyramid cheaper.
+
+| sequence | content | BD-rate, full range | BD-rate, high-quality end | matched-VMAF check |
+|---|---|---|---|---|
+| bbb | animation | **−37.2%** | −35.3% | −33.5% @ VMAF 96.3 |
+| touchdown | camera, sport | −9.4% | **+8.2%** | +10.1% @ VMAF 98.2 |
+| old_town | camera, pan | +7.9% | **+7.4%** | +7.0% @ VMAF 98.3 |
+| speed_bag | camera, high motion | +15.2% | **+31.4%** | +30.9% @ VMAF 96.9 |
+
+The two independent methods (BD-rate integration and a direct matched-VMAF interpolation) agree to
+within ~1.5 points on every sequence, so the sign and rough magnitude are trustworthy even though
+a cubic BD-rate fit over four rate points is poorly conditioned.
+
+### Reading
+
+**The B-pyramid pays off at distribution bitrates and loses at contribution quality.** Over the
+full range it wins on two sequences; restricted to the high-quality end — which is the operating
+point GNC has just committed to (GOALS §1) — it loses on three of four, by 7–31%, while carrying a
+two-I-frame advantage. That is consistent with the static-content result, which is simply the
+extreme high-quality case.
+
+**bbb is the exception, and bbb is our primary test sequence.** Animation with large flat regions
+is the one content type where the B path wins at high quality, and it is the sequence most of this
+repo's historical measurements were run on. Any conclusion about inter coding drawn from bbb alone
+should be re-checked on camera content.
+
+### Consequences
+
+1. **TUNE-1's recommendation points the wrong way for contribution.** Its −24% for longer GOPs was
+   measured at q=70 4:2:0 — a distribution operating point — and longer GOPs mean more B-frames.
+   At contribution quality on camera content that is a loss, not a win. Do not change the default
+   GOP rule on the strength of that number.
+2. **BUG-5 is confirmed but re-scoped.** The B path is not globally broken; it is mis-tuned in a
+   quality-dependent way. Something in the bidirectional path stops earning its bits as the
+   quantiser gets finer — consistent with the dead-zone/averaging hypothesis, since a finer
+   quantiser makes the half-step offset relatively larger.
+3. **A cheap conditional fix exists before any root-cause work:** disable or shorten the B-pyramid
+   above a quality threshold. Worth 7–31% at contribution quality on camera content, and it is a
+   configuration change, not a bitstream change.
+
+### Limits
+
+Four sequences, 17 frames, four rate points, one resolution, 4:4:4 only. No 4:2:0 cross-check,
+and the qstep grid is coarse at the top end where the effect is largest. Confirming the crossover
+point per sequence needs a finer sweep.

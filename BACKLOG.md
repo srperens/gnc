@@ -54,7 +54,7 @@ the inter gap is, and targeting it is guesswork. See RESEARCH_LOG 2026-09-05.
 
 ## Active priority list
 
-### BUG-5 — B-frames cost 16.7x P-frames on unchanged content (todo, P0)
+### BUG-5 — B-frames stop paying at contribution quality (todo, P0)
 Measured 2026-09-05 on 17 byte-identical 1080p frames (bbb, 4:4:4, Rice, fixed qstep, rate
 control off) — content where the correct answer for every inter frame is "nothing changed".
 
@@ -85,8 +85,32 @@ back to zero.
 - **MEAS-1 and ARCH-2** were both measured at `ki=9` with B-frames on. How much of the reported
   5-7x gap is design and how much is this defect is currently unknown.
 
-**Next step:** reproduce on >=3 real sequences at matched VMAF before sizing a fix. Byte-identical
-frames are a synthetic extreme and do not by themselves quantify the loss on real content.
+**Confirmed on real content 2026-09-05.** Four 1080p sequences x 17 frames x 4 qsteps, 4:4:4,
+Rice, fixed qstep, VMAF-based BD-rate of B-pyramid (`ki=17`) against P-only (`ki=8`). Negative =
+B-pyramid cheaper:
+
+| sequence | content | full range | high-quality end |
+|---|---|---|---|
+| bbb | animation | -37.2% | -35.3% |
+| touchdown | camera, sport | -9.4% | **+8.2%** |
+| old_town | camera, pan | +7.9% | **+7.4%** |
+| speed_bag | camera, high motion | +15.2% | **+31.4%** |
+
+The B path is **not globally broken** — it wins at distribution bitrates, and on animation it wins
+everywhere. It loses at the high-quality end on all three camera sequences, by 7-31%, *while
+P-only is handicapped by two extra I-frames* (`ki=8` emits 3 I-frames over 17 frames, `ki=17`
+emits 1). The static-content result above is the extreme case of the same effect. A finer
+quantiser makes the hypothesised half-step averaging offset relatively larger, which fits.
+
+**Note on test material:** bbb is the one sequence where B wins at high quality, and it is this
+repo's primary test sequence. Historical inter conclusions drawn from bbb need re-checking on
+camera content.
+
+**Cheap conditional fix, available before any root-cause work:** disable or shorten the B-pyramid
+above a quality threshold. Worth 7-31% at contribution quality on camera content; a configuration
+change, not a bitstream change. Root cause still worth finding — it may be worth more.
+
+**Next step:** finer qstep sweep to locate the crossover per sequence, and a 4:2:0 cross-check.
 Full measurement in RESEARCH_LOG 2026-09-05.
 
 ### MEAS-5 — Concurrent streams per GPU vs NVENC (todo, P0 — never measured)
@@ -265,7 +289,12 @@ Worth ~11% BD-rate on 33 frames, more on shorter ones. P-frames are references w
 propagates, so they cannot be coded coarsely; B-frames are disposable. x264 spends 4 P and 11 B
 where GNC spends 8 P and 7 B over the same 17 frames.
 
-**Not a free win:** longer GOPs mean coarser seeking and weaker error resilience, both of which
+**Superseded in part by BUG-5 (2026-09-05).** The -24% above was measured at q=70 4:2:0, a
+distribution operating point. Longer GOPs mean more B-frames, and at contribution quality on
+camera content B-frames *cost* 7-31%. Do not change the default GOP rule on the strength of this
+number until BUG-5 is resolved.
+
+**Not a free win either way:** longer GOPs mean coarser seeking and weaker error resilience, both of which
 matter for broadcast contribution. Needs a decision on the default, and probably a smarter rule
 than a fixed interval — e.g. never emit a group too short for a full pyramid.
 

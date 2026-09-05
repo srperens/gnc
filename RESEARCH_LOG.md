@@ -3299,3 +3299,92 @@ neither is implicated in the collapse fixed here.
 (also fixed 5 pre-existing warnings from a newer clippy). Note: `cargo clippy --release
 --target wasm32-unknown-unknown` without `--lib` fails on the binary target — `main.rs` is not
 wasm-compatible. Pre-existing; the CLAUDE.md command should specify `--lib`.
+
+---
+
+## 2026-09-05 — MEAS-4: the inter gap is prediction, not the coding model
+
+**Question.** Is GNC's inter-efficiency gap vs H.264 caused by the coding model (tile-wide
+wavelet on MC residuals, context-free entropy, no block skip) or by the prediction that model is
+asked to code? Bounded offline on GNC's own dumped residuals; nothing built.
+
+Full method and reasoning in
+[docs/decisions/0005-meas4-inter-gap-decomposition.md](docs/decisions/0005-meas4-inter-gap-decomposition.md).
+Encoder hook: `GNC_DUMP_RESIDUAL=<dir> GNC_DIAGNOSTICS=1` (4:4:4 only). Analysis:
+`scripts/meas4_oracle.py`.
+
+**Setup.** 1080p, q=75 (qstep 4.0), 17 frames, ki=9, 4:4:4, 15 inter frames per sequence,
+`GNC_REF_DEBLOCK=0`. Both models simulated on identical residuals, both with an ideal entropy
+coder, the rival additionally given an oracle skip decision and charged no MV cost.
+
+**4b — model vs model at matched distortion (the decision experiment).**
+
+| quality | sequence | wavelet model (GNC's) | DCT + oracle skip | rival advantage | oracle-skippable |
+|---|---|---|---|---|---|
+| q=75 | BBB | 1.6238 bpp @ MSE 2.951 | 1.5610 bpp | +3.9% | 2.1% |
+| q=75 | touchdown | 1.7219 bpp @ MSE 2.839 | 1.3321 bpp | +22.6% | 0.0% |
+| q=25 | BBB | 0.3159 bpp @ MSE 18.07 | 0.3257 bpp | −3.1% | 20.8% |
+| q=25 | touchdown | 0.2143 bpp @ MSE 11.99 | 0.2522 bpp | −17.7% | 49.7% |
+
+Decision rule was ≥40% → build a hybrid inter pipeline; <20% → prediction quality is the cap.
+Nothing approaches 40%. At high quality the rival is 4–23% ahead; at low bitrate, where skip
+finally has something to skip (21–50% of blocks), the rival is 3–18% **behind**.
+**Verdict: do not rebuild the inter coding model.**
+
+Oracle-skippable 16x16 blocks at q=75: **2.1%** (BBB), **0.0%** (touchdown). Block skip — one of
+H.264's biggest inter tools — has essentially nothing to skip on GNC's residuals at broadcast
+quality. That is the prediction leaving error nearly everywhere.
+
+The q=25 run first came back as "rival is 315% worse", which was not a finding but a bug: the
+quantizer ladder did not extend far enough for the rival model to reach the wavelet's distortion,
+so the interpolation returned a clamped endpoint. The ladder now runs to qstep 96 and the script
+refuses to print a number when the comparison would be extrapolated.
+
+**4c — entropy context ceiling.** A 1-neighbour context model recovers at most 2.7% / 2.2% of
+coefficient bits at q=75, and 3.4% / 3.1% at q=25. Context-adaptive entropy coding is not the
+answer either.
+
+**4a — residual subband energy.** 97–99% in detail subbands on both sequences. The proposed
+gate (">40% detail ⇒ transform mismatch") **cannot discriminate** — an MC residual is high-pass
+by construction, so it passes trivially whatever the truth is. Recording this as a gate that
+should not be used; #35 was right to never run it in that form.
+
+**4d — x264 feature ablation** (--qp 26, same 17 frames):
+
+| | temporal saving vs all-I | multi-ref + B | CABAC | sub-block partitions |
+|---|---|---|---|---|
+| BBB | 89.2% | **+29.2%** | +8.4% | +1.3% |
+| touchdown | 86.5% | **+31.5%** | +9.3% | +1.0% |
+| GNC (same content, q=75) | 48.9% / 29.8% | — | — | — |
+
+**Challenging the numbers.** Three method errors were found and fixed *before* these results,
+each of which alone flipped the conclusion:
+- Comparing bits at equal *qstep* rather than equal *distortion*. The two transforms land at
+  different MSE, so the first comparison was meaningless.
+- An unnormalised lifting DWT loses to an orthonormal DCT on scaling alone. Normalising each
+  subband by the measured L2 norm of its synthesis basis moved the rival's advantage from
+  **41% to 4%** on BBB. This single correction is the difference between "rebuild the pipeline"
+  and "do not".
+- Averaging bpp per *plane* instead of per *frame* understated everything by exactly 3x, and
+  leaving the zero padding in the analysis inflated every skip statistic.
+
+Cross-check that the simulation is faithful: GNC's measured coefficient bitrate sits within
+−13.9% (BBB) and −1.6% (touchdown) of the simulated wavelet model at its operating point. The
+simulation is a slightly pessimistic proxy for the real encoder, not an idealisation detached
+from it. (It is not a rigorous efficiency measurement of GNC's entropy coder — GNC's actual
+residual-domain distortion is not measured, so the two operating points are only approximately
+aligned.)
+
+**Conclusion, and what it opens up.** Two independent lines of evidence agree: GNC's residuals
+have almost nothing an oracle could skip, and x264's own ablation says its biggest inter lever —
+3x CABAC, 30x partitioning — is multi-reference and B-frame *prediction*. The gap is in
+prediction quality, not in how the residual is coded.
+
+This is a more encouraging result than the "structural gap" reading it replaces. GNC uses
+**single-reference P-frames**; the lever that matters most for H.264 is precisely the one GNC
+lacks, and multi-reference prediction is ordinary, well understood and GPU-parallel — not a
+pipeline rewrite. Backlog **#25** was deferred in 2026-03 for want of evidence; this is that
+evidence, and it moves to the top of the inter work.
+
+**Coverage:** two quality points (q=75 broadcast, q=25 low bitrate) on two sequences of
+differing motion character. Not swept across resolution or GOP structure.

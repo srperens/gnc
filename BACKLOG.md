@@ -11,7 +11,7 @@ Current state and priorities are described in [GOALS.md](GOALS.md).
 
 See [BASELINE.md](BASELINE.md) for current benchmark numbers.
 
-## Current Focus (updated 2026-09-04)
+## Current Focus (updated 2026-09-05)
 
 **Mode: Measurement and bugfixing. No new features.**
 
@@ -21,16 +21,21 @@ the cheap and medium-cost *incremental* inter-compression ideas. Temporal compre
 a goal (see [GOALS.md](GOALS.md) §4) — the open question is what shape it should take, and
 MEAS-4 is designed to answer that before anything gets built. Until then the priorities are:
 
-1. Fix known bugs (BUG-1)
+1. Fix known bugs (BUG-1 done; BUG-2, BUG-3 open)
 2. Finish the measurement campaign (MEAS-1/2/3) — honest VMAF-based video numbers
 3. Toggle features to identify dead weight and incorrect implementations
 4. Let measurements drive the next action
 
+MEAS-4 (done 2026-09-05) answered the standing question about the inter path: the gap is
+**prediction quality, not the coding model**, so the next inter work is multi-reference
+prediction (#25, promoted to P1) rather than a rebuilt residual coder.
+
 **Known facts (2026-03-11, uniform weights):**
 - Spatial BD-rate vs H.264 all-I: **+13.9%** — reasonable for a wavelet codec; GNC wins above ~36 dB
 - Spatial BD-rate vs JPEG 2000 (4:4:4): **+28.3%** — gap narrows to ~11% at high quality
-- Temporal: GNC I+P+B saves ~17–27% vs all-I. H.264 saves ~60–70% → ~3–4× gap in the current
-  I/P/B design. Whether that is inherent or a wrong-model problem is unmeasured — that is MEAS-4.
+- Temporal: GNC I+P+B saves ~17–27% vs all-I (48.9%/29.8% on bbb/touchdown at q=75, 4:4:4).
+  x264 saves 86–89% on the same content → the gap is real and large. **MEAS-4 located it in
+  prediction quality, not in the coding model.**
 - All above is PSNR-based (RGB). VMAF-based video comparison vs H.264 still missing (MEAS-1).
 
 ## Active priority list
@@ -108,44 +113,36 @@ Each toggle: report bpp + VMAF delta. Goal: identify dead weight and negative fe
 Run rd-curve (q=25–90) on crowd_run and park_joy with 4:4:4, measure VMAF at each point.
 Current rd-curve lacks --chroma-format and --vmaf on sequences. A benchmark loop may suffice.
 
-### MEAS-4 — Inter-model gap decomposition: oracle experiments (todo, after MEAS-1)
-**Question:** Is GNC's 3–4× inter-efficiency gap vs H.264 caused by the *model* (tile-wide
-wavelet on MC residuals + context-free entropy) rather than by GPU-parallelism per se? If yes,
-a hybrid inter pipeline (per-block transform + block skip + context entropy — all GPU-parallel)
-has real headroom. Measure the ceiling offline before building anything. No bitstream changes;
-run in 4:4:4 (does not depend on BUG-1).
+### MEAS-4 — Inter-model gap decomposition (**DONE 2026-09-05**)
+**Answer: the inter gap is prediction quality, not the coding model.** Full method, numbers and
+caveats in [docs/decisions/0005-meas4-inter-gap-decomposition.md](docs/decisions/0005-meas4-inter-gap-decomposition.md).
 
-- **MEAS-4a — P-residual subband energy distribution** (the #35 gate that was never run, ~0.5 day):
-  Diagnostic that logs per-subband energy of P/B-frame residual wavelet coefficients on
-  crowd_run, park_joy, rush_hour at q=75. Falsifiable: if detail subbands carry >40% of residual
-  energy, the wavelet is spreading block-structured energy (transform mismatch real). If LL
-  dominates, transform is not the problem — close MEAS-4b's DCT half.
-- **MEAS-4b — Oracle block-skip/DCT bound** (~1–2 days, offline): Dump spatial-domain MC
-  residuals (pre-transform) per P/B-frame to disk. Offline script computes: (1) fraction of
-  16×16 blocks with residual energy below the q=75 quantization threshold ("oracle-skippable");
-  (2) fraction of total residual energy in the top 10/25/50% of blocks; (3) estimated bpp of an
-  oracle coder: per-block 8×8 DCT + uniform quantizer + Shannon entropy of quantized coeffs
-  + 1 bit/block skip signaling. Compare against measured GNC inter bpp at same quality.
-  Falsifiable: oracle bound ≥40% below current GNC inter bpp on ≥2/3 sequences → the model
-  (not prediction quality) is the cap, hybrid inter pipeline has real ceiling. Oracle bound
-  <20% below → the gap is prediction quality, not the coding model; a rebuilt inter pipeline
-  would not pay for itself, so close this line of attack and look elsewhere for temporal gain.
-- **MEAS-4c — Entropy context ceiling** (~1 day, offline, extends #53): On the same dumped
-  quantized coefficients, compute empirical conditional entropy with 1–2 neighbor/parent
-  contexts vs measured Rice bpp. Bounds what 4–16 context-adaptive streams per tile (still
-  thousands of parallel streams per frame) would recover vs the current 256 context-free streams.
-- **MEAS-4d — H.264 feature ablation** (~0.5 day, no GNC code): Decompose H.264's ~60–70%
-  temporal saving using x264 flags on the same sequences: baseline vs `--no-cabac` (context
-  entropy contribution), `--partitions none` (block partitioning), `--ref 1 --bframes 0`
-  (multi-ref/B contribution). Shows how much of H.264's inter gain comes from skip/partitioning
-  vs entropy vs prediction — i.e., which parts GNC is actually missing.
+At matched distortion on GNC's own dumped residuals, an idealised DCT + oracle-block-skip model
+beats GNC's wavelet model by only 3.9% (BBB) / 22.6% (touchdown) at q=75, and *loses* by 3.1% /
+17.7% at q=25. The decision rule required ≥40% to justify a hybrid inter pipeline. Context-
+adaptive entropy coding is worth ≤3.4%. Oracle-skippable blocks at q=75: 2.1% / 0.0% — GNC's
+prediction leaves residual energy nearly everywhere, so H.264's skip tool would have nothing to
+work with.
 
-**Decision rule:** MEAS-4b is the verdict. ≥40% oracle headroom → write a design doc for a
-hybrid inter pipeline (wavelet I-frames + per-block DCT inter residuals + block skip + context
-entropy). <20% → the current inter model is not the bottleneck; the gap is prediction quality,
-and further work on the coding side is not where the temporal win lives.
-**Requires the dev machine** (GPU + test material) for the residual dumps; the offline analysis
-scripts are CPU-only.
+x264 ablation on the same content says H.264's own biggest inter lever is multi-reference and
+B-frame prediction (+29–32%), three times CABAC (+8–9%) and thirty times sub-block partitioning
+(+1%). Both lines of evidence point at prediction.
+
+Tooling, reusable: `GNC_DUMP_RESIDUAL=<dir> GNC_DIAGNOSTICS=1` (4:4:4) dumps spatial MC
+residuals; `scripts/meas4_oracle.py` runs 4a/4b/4c.
+
+**Consequence:** #25 (multi-reference P-frames) is promoted out of deferred — see below. Do not
+spend effort on per-block inter transforms, block skip, or context entropy for inter.
+
+### 25. Multi-reference P-frames
+- **Status:** todo (P1 — promoted from deferred 2026-09-05 by MEAS-4)
+- **Motivation:** GNC P-frames reference only the immediately preceding decoded frame. H.264 can reference up to 16 frames, which dramatically improves compression for repeated textures (scrolling text, panning shots) and periodic motion. Even 2-reference P-frames would cover the most common cases.
+- **Why now:** MEAS-4 established that GNC's inter gap is prediction quality, not coding model, and the x264 ablation put multi-reference + B-frame prediction at +29–32% — H.264's largest single inter lever, three times CABAC's contribution. This is the technique GNC lacks that the measurement says matters most, and it is ordinary and GPU-parallel rather than a pipeline rewrite.
+- **Hypothesis:** Allowing P-frames to choose the best of 2 reference frames (prev and prev-prev) reduces bpp 3–8% on sequences with periodic motion or scene repetition.
+- **Success criteria:** bpp −3% on at least one test sequence; VMAF neutral; no regression on bbb/crowd_run.
+- **Complexity:** Medium. Requires decoder to track a reference buffer (already partially done for B-frames). ME shader needs a second reference input and cost comparison.
+- **Gate (unchanged from the 2026-03 deferral):** add a periodic-motion test sequence AND run an MV histogram showing >15% non-adjacent references. Measure the histogram before building the encoder side — if references are overwhelmingly adjacent, the hypothesis is wrong for this content and the ordering of the multi-ref work should change.
+- **Note:** the tile-level dual-reference variant (#43) was separately CLOSED (2026-03-10) — see archive. Revisit alongside this item.
 
 ## Noted — revisit only if conditions change
 
@@ -164,20 +161,12 @@ tracks that are never combined. Measurements show B-frames beat Haar on motion-h
 + per-GOP bitstream signaling.
 
 **More promising variant:** MCTF (motion-compensated temporal filtering) — Haar *with* ME, as used
-in Dirac/VC-2. Beats pure IPB in the literature but is a substantial project — a plausible
-candidate for the "right shape" question in [GOALS.md](GOALS.md) §4. Parked until MEAS-4 bounds
-how much headroom a rebuilt inter path actually has.
+in Dirac/VC-2. Beats pure IPB in the literature but is a substantial project. MEAS-4 found the
+inter gap to be prediction quality rather than the coding model, and MCTF is a *prediction*
+technique, so it stays live as a candidate — but behind #25, which is far cheaper and targets
+the same lever.
 
 **Status:** Noted, nothing to implement now.
-
-### 25. Multi-reference P-frames
-- **Status:** deferred (P3)
-- **Motivation:** GNC P-frames reference only the immediately preceding decoded frame. H.264 can reference up to 16 frames, which dramatically improves compression for repeated textures (scrolling text, panning shots) and periodic motion. Even 2-reference P-frames would cover the most common cases.
-- **Hypothesis:** Allowing P-frames to choose the best of 2 reference frames (prev and prev-prev) reduces bpp 3–8% on sequences with periodic motion or scene repetition.
-- **Success criteria:** bpp −3% on at least one test sequence; VMAF neutral; no regression on bbb/crowd_run.
-- **Complexity:** Medium. Requires decoder to track a reference buffer (already partially done for B-frames). ME shader needs a second reference input and cost comparison.
-- **Research Scientist verdict (2026-03-09):** DEFER. Expected gain requires content with periodic motion; current test sequences (bbb, crowd_run, rush_hour, park_joy) don't exhibit this. Gate on adding a periodic-motion test sequence AND running MV histogram showing >15% non-adjacent references.
-- **Note:** the tile-level dual-reference variant (#43) was separately CLOSED (2026-03-10) — see archive. Revisit alongside MEAS-4's outcome rather than on its own.
 
 ### 61. Resolution-adaptive pipeline scaling (4K / 8K / 12K readiness)
 - **Status:** todo (P2 — no action needed until 4K test material available, but design must account for this)

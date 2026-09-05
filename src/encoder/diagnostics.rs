@@ -56,6 +56,70 @@ pub fn enable() {
     std::env::set_var("GNC_DIAGNOSTICS", "1");
 }
 
+/// Directory to dump raw MC residual planes into, if `GNC_DUMP_RESIDUAL` is set.
+///
+/// Used by MEAS-4: the oracle experiments need the *spatial-domain* motion-compensated
+/// residual (post-MC, pre-transform), which is exactly what the diagnostic staging buffers
+/// already hold. Analysis happens offline — see `scripts/meas4_oracle.py`.
+pub fn residual_dump_dir() -> Option<&'static std::path::Path> {
+    use std::sync::OnceLock;
+    static DIR: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let d = std::env::var_os("GNC_DUMP_RESIDUAL")?;
+        let p = std::path::PathBuf::from(d);
+        std::fs::create_dir_all(&p).ok()?;
+        Some(p)
+    })
+    .as_deref()
+}
+
+/// Write one residual plane to `<dir>/resid_<kind>_<n>.f32` as raw little-endian f32, plus a sidecar
+/// `.json` recording the geometry needed to interpret it.
+///
+/// Maps and unmaps the staging buffer; safe to call before `compute_residual_stats` on the
+/// same buffer, which maps it again.
+pub fn dump_residual_plane(
+    ctx: &GpuContext,
+    staging_buf: &wgpu::Buffer,
+    buf_size: u64,
+    width: u32,
+    height: u32,
+    kind: &str,
+) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
+    let Some(dir) = residual_dump_dir() else {
+        return;
+    };
+    let tag = format!("resid_{kind}_{:05}", SEQ.fetch_add(1, Ordering::Relaxed));
+    let buf_slice = staging_buf.slice(..buf_size);
+    let (tx, rx) = std::sync::mpsc::channel();
+    buf_slice.map_async(wgpu::MapMode::Read, move |result| {
+        tx.send(result).ok();
+    });
+    ctx.device.poll(wgpu::Maintain::Wait);
+    if rx.recv().is_err() {
+        return;
+    }
+    let data = buf_slice.get_mapped_range();
+    let floats: &[f32] = bytemuck::cast_slice(&data);
+    let n = (width as usize) * (height as usize);
+    let n = n.min(floats.len());
+
+    let mut bytes = Vec::with_capacity(n * 4);
+    for &v in &floats[..n] {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    let _ = std::fs::write(dir.join(format!("{tag}.f32")), &bytes);
+    let _ = std::fs::write(
+        dir.join(format!("{tag}.json")),
+        format!("{{\"width\":{width},\"height\":{height},\"count\":{n}}}\n"),
+    );
+
+    drop(data);
+    staging_buf.unmap();
+}
+
 /// Read back a GPU staging buffer containing f32 residual values and compute statistics.
 /// The residual is in YCoCg-R Y-plane space (roughly [0,255] range for the original signal).
 pub fn compute_residual_stats(

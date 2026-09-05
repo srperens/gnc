@@ -53,7 +53,7 @@ rANS and Huffman exist in the codebase but are parked — Rice is the default fo
 
 ## 4. Where We Stand & Goals
 
-**Status (2026-09-04): intra is competitive, inter is the open problem.**
+**Status (2026-09-05): intra is competitive; the inter gap is now located.**
 
 The 2026-03 experiment sweep (~40 gated experiments, archived in
 [docs/archive/BACKLOG_CLOSED.md](docs/archive/BACKLOG_CLOSED.md)) exhausted the cheap and
@@ -61,19 +61,26 @@ medium-cost incremental inter ideas. What it measured: the spatial layer is alre
 BD-rate +13.9% vs H.264 all-I, and *better* than H.264 all-I above ~36 dB — while the current
 I/P/B inter path saves only 17–27% vs all-I where H.264 saves 60–70%.
 
-That ~3–4× temporal gap is a real, reproduced measurement. What it is *not* yet is an
-explanation. The sweep tested tweaks to the existing design (tile-wide wavelet on MC residuals,
-context-free entropy); it did not test whether that design is the right shape. Meaningful
-temporal compression remains a goal — we most likely just haven't found the form yet.
-MEAS-4 (see [BACKLOG.md](BACKLOG.md)) is built to answer exactly that: measure the oracle
-ceiling offline before committing to, or ruling out, a rebuilt inter pipeline.
+**MEAS-4 (2026-09-05) located that gap.** It is *prediction quality*, not the coding model.
+Simulating both models on GNC's own motion-compensated residuals at matched distortion, an
+idealised per-block DCT with oracle block skip beats GNC's wavelet by only 4–23% at broadcast
+quality and *loses* by 3–18% at low bitrate; context-adaptive entropy coding is worth ≤3.4%; and
+only 0–2% of blocks are skippable at q=75, meaning the prediction leaves error nearly everywhere.
+An x264 ablation on the same content agrees from the other side: H.264's largest inter lever is
+multi-reference and B-frame prediction (+29–32%), three times CABAC and thirty times sub-block
+partitioning. Full writeup:
+[docs/decisions/0005-meas4-inter-gap-decomposition.md](docs/decisions/0005-meas4-inter-gap-decomposition.md).
 
-Until that measurement lands, the practical stance is: don't spend more effort on incremental
-tweaks to the current inter path, and don't conclude the gap is closed off either. GNC's
-distinguishing properties hold regardless — **patent-free + GPU-native + tile-independent +
+So meaningful temporal compression stays a goal, and the form is now much clearer than "rebuild
+the inter pipeline": GNC uses **single-reference P-frames**, and the lever the measurement says
+matters most is the one it does not have. Multi-reference prediction is ordinary and
+GPU-parallel. That is where the inter work goes next ([BACKLOG.md](BACKLOG.md) #25); per-block
+inter transforms, block skip and context entropy are ruled out by measurement.
+
+GNC's distinguishing properties hold regardless — **patent-free + GPU-native + tile-independent +
 low-latency + WebGPU/WASM browser decode** (JPEG XS is patented, VC-2 is CPU-era, JPEG 2000 is
 slow) — and they serve broadcast contribution, mezzanine storage, low-latency preview and
-browser playback whether or not the temporal side improves.
+browser playback.
 
 GNC should become a **good, robust codec** — not optimized along a single axis. We iterate across multiple dimensions simultaneously, looking for combinations of techniques that work well together. No single property is a hard blocker for the others.
 
@@ -83,7 +90,7 @@ GNC should become a **good, robust codec** — not optimized along a single axis
 |----------|---------|--------|
 | Encode speed | 31.7 fps (seq, 1080p q=75) | 60 fps |
 | Compression (intra) | BD-rate +13.9% vs H.264 all-I, +28.3% vs JPEG 2000 | ≤ H.264 all-I overall; within ~15% of JPEG 2000 |
-| Compression (inter) | I+P+B saves 17–27% vs all-I | substantially better — target set once MEAS-4 bounds what is reachable |
+| Compression (inter) | I+P+B saves 17–27% vs all-I (49%/30% on bbb/touchdown at q=75) | substantially better via *prediction* — multi-reference first (#25); x264 saves 86–89% on the same content |
 | Quality range | q=1–100 functional | smooth, predictable quality curve |
 | Robustness | basic test coverage | no artifacts, stable across q and content |
 | Bitstream | GNV1/GNV2 defined | well-specified, documented |

@@ -4357,6 +4357,20 @@ impl EncoderPipeline {
                 bufs.split_total_blocks,
             );
 
+            // MEAS-4: dump the spatial-domain MC residual (post-MC, pre-transform) for the
+            // offline oracle analysis. Luma only — that is what the oracle bound is computed on.
+            if let Some(ref stg) = diag_residual_staging {
+                // 4:4:4 only: there all three planes share the luma geometry, so the oracle can
+                // be compared against GNC's whole coefficient budget rather than a luma slice.
+                if info.chroma_format == crate::ChromaFormat::Yuv444 {
+                    for (pi, name) in ["Py", "Pco", "Pcg"].iter().enumerate() {
+                        diagnostics::dump_residual_plane(
+                            ctx, &stg[pi], plane_size, padded_w, padded_h, name,
+                        );
+                    }
+                }
+            }
+
             // Diagnostics: read back per-channel residual and compute stats
             let (residual_stats, residual_stats_co, residual_stats_cg) =
                 if let Some(ref stg) = diag_residual_staging {
@@ -5801,6 +5815,17 @@ impl EncoderPipeline {
                 modes_size,
                 bufs.me_total_blocks,
             );
+
+            // MEAS-4: dump the spatial-domain bidir MC residual, same as the P path.
+            if let Some(ref stg) = diag_residual_staging {
+                if info.chroma_format == crate::ChromaFormat::Yuv444 {
+                    for (pi, name) in ["By", "Bco", "Bcg"].iter().enumerate() {
+                        diagnostics::dump_residual_plane(
+                            ctx, &stg[pi], plane_size, padded_w, padded_h, name,
+                        );
+                    }
+                }
+            }
 
             // Diagnostics: read back per-channel residual and compute stats
             let (residual_stats, residual_stats_co, residual_stats_cg) =

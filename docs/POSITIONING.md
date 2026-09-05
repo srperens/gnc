@@ -31,8 +31,63 @@ regardless of how large and expensive the GPU is, and driver session limits cap 
 general shader throughput scales with the card. A bigger GPU should therefore buy more GNC
 instances; it does not buy more NVENC blocks.
 
-**That claim is unproven. It is the single most important thing to measure** ([BACKLOG.md](../BACKLOG.md)
-MEAS-5). Everything below is downstream of it.
+### The thesis is two claims, and only one of them holds today
+
+Measured and sourced 2026-09-05 ([BACKLOG.md](../BACKLOG.md) MEAS-5).
+
+**Claim A — "no session cap, and it runs where NVENC does not" — holds, and is stronger than the
+project has been claiming.**
+
+- NVENC's consumer limit is **12 concurrent sessions per *system***, explicitly *"the combined
+  number of encoding sessions executed on all non-qualified cards present in the system."*
+  **Adding a second GeForce buys zero additional sessions.**
+- **A100, H100 and B200 ship with zero NVENC.** NVIDIA's Hopper whitepaper states it outright:
+  H100 GPUs *"do not include display connectors, NVIDIA RT Cores for ray-tracing acceleration, or
+  an NVENC encoder."* 132 SMs and no encoder. **The most valuable GPUs in the world cannot encode
+  video at all**, so any organisation with an idle AI fleet has zero encode capacity. That is a
+  market, not a benchmark, and it is the most under-used fact GNC has.
+- The **GeForce driver licence §2.8** prohibits datacenter deployment. Encoding at density with
+  NVENC legally requires professional or datacenter SKUs, independent of the session counter — a
+  commercial wall, not just a driver counter.
+- Engine counts are flat or sublinear against compute: Ampere runs one NVENC from RTX 3050 (20
+  SM) to RTX 3090 Ti (84 SM), **4.2× the compute with the same single encoder**. And **per-engine
+  throughput grew just 14% from Turing to Blackwell** while shader FP32 grew roughly sixfold.
+
+**Claim B — "more aggregate throughput than the card's own NVENCs" — is unproven, and the first
+local measurement is sobering.** N concurrent 1080p encodes on the M1, two runs:
+
+| instances | 1 | 2 | 4 | 8 |
+|---|---|---|---|---|
+| aggregate fps | 7.02 / 6.22 | 11.13 / 9.51 | 11.51 / 12.23 | 14.15 / 13.38 |
+
+**Roughly 2× aggregate at N=8, and most of it already reached at N=2.** A single 1080p encode does
+not saturate the M1, so there is real headroom — but nowhere near linear. The published
+multi-tenancy literature agrees: concurrency converts *idle* GPU into *useful* GPU; it does not
+create GPU. NVIDIA's own consolidation study measured time-slicing at 0.76 requests/s where MIG
+gave 1.00 — a 32% *reduction*.
+
+**What this changes:** lead with Claim A, which is defensible today and does not depend on
+out-running fixed-function silicon. Do not put Claim B in front of anyone until it is measured on
+a discrete card.
+
+### The historical GPU-encoder failures do not generalise to GNC
+
+Every documented failure was a **block-based hybrid codec with adaptive arithmetic coding**. Jason
+Garrett-Glaser, x264 maintainer, 2008: *"basically everything can be reasonably done on the GPU
+except CABAC (which could be done, it just couldn't be parallelized)."* NVIDIA's deprecated CUDA
+encoder failed on *scope* — one reference frame, no configurable search range, no two-pass — not
+on physics. BeHardware's 2011 study found the shipping GPU encoders performed identically on €100
+and €330 cards because they were never compute-bound at all.
+
+Every surviving GPU-compute codec has GNC's exact shape: wavelet, spatially independent tiles,
+parallel entropy coding. NVIDIA killed its CUDA H.264 encoder and ships nvJPEG2000 in the same
+product line.
+
+The most encouraging sourced datapoint, and it is an inference rather than our measurement:
+Fastvideo's JPEG 2000 encoder on an RTX 4090 reports 616 fps at 4K — about **5.1 Gpixel/s** —
+against that same card's two NVENC engines at H.264 P1, about **3.8 Gpixel/s**. A CUDA wavelet
+codec already out-throughputs the card's fixed-function encoders in raw pixels per second, while
+carrying EBCOT, which is dramatically heavier than Rice or rANS.
 
 ---
 
@@ -159,10 +214,25 @@ is least maskable — degrades over twice as fast as bbb and deserves a closer l
 This is the *necessary* condition for a contribution codec. It is not yet evidence of the
 *sufficient* condition, which EBU decides by expert viewing rather than by VMAF.
 
-### Speed: below real time for the use case
+### Speed: below real time, and we do not agree with ourselves about by how much
 
-31.7 fps sequence encode at 1080p. Contribution is 50 or 59.94 fps real time. **The primary use
-case does not yet function on the reference platform.**
+At BASELINE's own stated parameters (bbb, q=75, Rice, ki=8, 10 frames), this session measured:
+
+| what is being timed | fps |
+|---|---|
+| `benchmark-sequence`, GPU encode phase only | 13.6 |
+| `encode-sequence`, end to end incl. PNG decode and container write | 7.8 |
+| BASELINE.md, stated | 31.7 |
+
+The binary used was built at this session's start and HEAD has moved since, so this is not yet a
+regression claim. But **three different numbers are in circulation for "GNC encode fps" and GOALS
+quotes one of them without saying which** — and the CLI's own help text concedes that PNG input
+inflates the cost. For a codec whose thesis is real-time density, that ambiguity is not
+survivable. Pin the definition before any density claim rests on it.
+
+Either way: contribution is 50 or 59.94 fps real time, concurrency multiplies throughput by about
+two rather than by eight, and **the primary use case does not yet function on the reference
+platform.**
 
 ### Format coverage
 
@@ -274,22 +344,26 @@ built by people with distribution GNC does not have.
 
 In priority order. Items map to [BACKLOG.md](../BACKLOG.md).
 
-1. **Measure concurrent streams per GPU against NVENC** (MEAS-5). The entire strategic argument
-   rests on this and it has never been measured. Per-stream, compute will lose to fixed function —
-   that is expected and is not the claim. The claim is about the aggregate. If the aggregate also
-   loses, the positioning is wrong and it is better to know now than after another quarter.
-2. **10-bit through the video path** (FMT-1). A gate, not a feature. Cheaper than assumed: the
+1. **Finish MEAS-5 on a discrete card.** Claim A is settled and defensible. Claim B needs a head
+   to head against NVENC at both P1 and P7 presets — P7 sits nearer GNC's quality target and is
+   roughly four times easier to win — and then on an H100, where the NVENC column is a zero.
+   **Pin the fps definition first**; three numbers are currently in circulation (§4).
+2. **Spend optimisation effort on entropy coding, not the wavelet.** Entropy coding is 51–85% of
+   runtime in every GPU wavelet codec measured, and it is local-memory-latency bound, where
+   register footprint per thread is the lever. Rate control, not the transform, is also what sank
+   the historical GPU encoders' quality — scrutinise it as hard as the DWT.
+3. **10-bit through the video path** (FMT-1). A gate, not a feature. Cheaper than assumed: the
    still-image path already has the flag; `encode-sequence` has no bit-depth option at all.
-3. **Add a rate-distortion decision** (BUG-5 and successors). Minimal viable version: per tile,
+4. **Add a rate-distortion decision** (BUG-5 and successors). Minimal viable version: per tile,
    compare the Lagrangian cost of coding the residual against zeroing it, take the cheaper. No
    bitstream change. Then the same decision at code-block granularity, which needs one. x264's
    decimation rule and an inter-specific dead zone are cheap approximations worth measuring first.
    Note this is **pricing**, not masking — the earlier rejected experiment masked coefficients in
    the wavelet domain, which changes the signal and causes ringing. Different thing.
-4. **Decide between live contribution and cloud mezzanine, and stop straddling** (§2).
-5. **Measure latency** (MEAS-6), and confront the ~256-line tile floor against the target segment's
+5. **Decide between live contribution and cloud mezzanine, and stop straddling** (§2).
+6. **Measure latency** (MEAS-6), and confront the ~256-line tile floor against the target segment's
    budget.
-6. **Sharpen the licensing claim** from "patent-free" to the specific documented one, and back it
+7. **Sharpen the licensing claim** from "patent-free" to the specific documented one, and back it
    with a patent search and a defensive publication.
 
 ### Dead ends — do not attempt

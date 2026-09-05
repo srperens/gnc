@@ -4163,3 +4163,53 @@ decisions nor per-tile bit allocation is where GNC loses to H.264 on intra. Also
 in this repo and worth not re-testing: block intra prediction was implemented and measured at
 −11.76 dB / +29% bitrate (hence `intra_prediction: false`), and H.264's intra prediction is worth
 only ~+6% over JPEG 2000 anyway.
+
+---
+
+## 2026-09-05 — Intra measured against both H.264 and JPEG 2000, like for like
+
+Prompted by a direct question from the project owner: is GNC's intra really 2x behind H.264?
+Short answer: no, but it is well behind, and the repo's own figures are too optimistic.
+
+**A handicap in the harness was found and removed first.** In 4:2:0, GNC's chroma is subsampled
+twice — once inside the codec, once converting its decoded PNGs back to Y4M — while x264's single
+subsampling matches the reference exactly. `meas1_vs_h264.py` now takes `--chroma 444`, which sets
+the reference, both codecs and both distorted files to 4:4:4 and removes the asymmetry. (It made
+little difference in the end: 4:2:0 gave +54.6%, 4:4:4 gives +46.2%.)
+
+**A second problem was a near-empty overlap.** The first 4:4:4 run compared curves that shared
+only 0.4 VMAF points, which makes a BD-rate meaningless. Widened to VMAF 80.3–97.2.
+
+**The harness itself was verified against the single-image path**: GNC at q=40 reads 2.44 bpp
+through `benchmark` and 2.56 bpp through the sequence-plus-container path (the difference being
+container overhead over 6 frames), and q=100 is bit-exact lossless. So the measured deficit is the
+codec, not the chain.
+
+**Result.** 6 frames of bbb at 1080p, 4:4:4, all-intra, one PNG-derived reference, all three
+codecs scored by the same `vmaf` binary:
+
+| | bpp @ VMAF 96 | bpp @ PSNR-Y 43 |
+|---|---|---|
+| GNC | 2.678 | 3.213 |
+| H.264 intra (x264, i444) | 1.880 | 1.874 |
+| JPEG 2000 (openjpeg) | 1.496 | 2.201 |
+
+| | on VMAF | on PSNR-Y |
+|---|---|---|
+| GNC vs H.264 intra | **1.42x** | 1.71x |
+| GNC vs JPEG 2000 | **1.79x** | 1.46x |
+
+**This does not agree with the repo's standing figures** (+13.9% vs H.264 all-I, +17.6% vs
+JPEG 2000 from `rd-curve --compare-codecs`). Those are RGB PSNR on a single still image; these are
+VMAF and PSNR-Y on video frames through a reference shared by all three codecs. The repo's tool
+was re-run to confirm it still reports +17.6% vs JPEG 2000, so this is a methodology difference,
+not drift. Given VMAF is the project's stated primary metric and the reference here is common to
+all three codecs, the table above is the one to quote.
+
+**The important part is which codec is ahead.** JPEG 2000 beats H.264 intra on VMAF here (1.50 vs
+1.88 bpp at VMAF 96) — so GNC is not losing to a fundamentally different design. It is losing to
+**another wavelet codec, by 1.8x**. That means the intra gap is not an architectural limit the way
+the inter gap is: JPEG 2000 demonstrates that a wavelet still-image codec can reach that rate, on
+this content, at this quality.
+
+That makes intra the better place to spend effort, and it comes with an existence proof.

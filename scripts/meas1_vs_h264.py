@@ -37,8 +37,14 @@ import tempfile
 import numpy as np
 
 
-# Single VMAF reference, set once in main().
+# Single VMAF reference and pixel format, set once in main().
+#
+# 4:2:0 puts GNC at a disadvantage the codec does not deserve: its only sequence output is PNG,
+# so its chroma is subsampled twice (once inside the codec, once converting its PNGs back to
+# Y4M) while x264's single subsampling matches the reference exactly. Comparing in 4:4:4 removes
+# that entirely and measures the coding, not the conversion.
 REFERENCE = [None]
+PIX_FMT = ["yuv420p"]
 
 
 def sh(cmd, **kw):
@@ -55,14 +61,21 @@ def y4m_geometry(path):
 
 def vmaf_score(ref, dist):
     out = os.path.join(tempfile.gettempdir(), f"vmaf_{os.getpid()}.json")
-    r = sh(["vmaf", "--reference", ref, "--distorted", dist, "--json", "--output", out, "--quiet"])
+    r = sh(["vmaf", "--reference", ref, "--distorted", dist, "--json", "--output", out,
+            "--quiet", "--feature", "psnr"])
     if r.returncode != 0 or not os.path.exists(out):
         print(f"    vmaf failed: {r.stderr.strip()[:200]}", file=sys.stderr)
         return None
     with open(out) as f:
         j = json.load(f)
     os.remove(out)
-    return j["pooled_metrics"]["vmaf"]["mean"]
+    pooled = j["pooled_metrics"]
+    psnr = None
+    for k in ("psnr_y", "psnr"):
+        if k in pooled:
+            psnr = pooled[k]["mean"]
+            break
+    return j["pooled_metrics"]["vmaf"]["mean"], psnr
 
 
 def bd_rate(rate_a, q_a, rate_b, q_b):
@@ -83,7 +96,7 @@ def bd_rate(rate_a, q_a, rate_b, q_b):
     return (10 ** ((ib - ia) / (hi - lo)) - 1) * 100, (lo, hi)
 
 
-def normalise_source(src, work, n):
+def normalise_source(src, work, n, pix_fmt="yuv420p"):
     """Decode the source once to PNG and back, giving one canonical reference for everything."""
     pngdir = os.path.join(work, "ref_png")
     os.makedirs(pngdir, exist_ok=True)
@@ -91,10 +104,10 @@ def normalise_source(src, work, n):
         sh(["ffmpeg", "-nostdin", "-y", "-loglevel", "error", "-i", src,
             "-frames:v", str(n), "-start_number", "0",
             os.path.join(pngdir, "%04d.png")])
-    ref_y4m = os.path.join(work, "reference.y4m")
+    ref_y4m = os.path.join(work, f"reference_{pix_fmt}.y4m")
     if not os.path.exists(ref_y4m):
         sh(["ffmpeg", "-nostdin", "-y", "-loglevel", "error", "-start_number", "0",
-            "-i", os.path.join(pngdir, "%04d.png"), "-pix_fmt", "yuv420p",
+            "-i", os.path.join(pngdir, "%04d.png"), "-pix_fmt", pix_fmt,
             "-f", "yuv4mpegpipe", ref_y4m])
     return pngdir, ref_y4m
 
@@ -115,7 +128,7 @@ def run_gnc(src, work, n, ki, q, chroma, gnc_bin):
     sh([gnc_bin, "decode-sequence", "-i", gnv, "-o", os.path.join(pngdir, "%04d.png")])
     dist = os.path.join(work, f"{tag}.y4m")
     sh(["ffmpeg", "-nostdin", "-y", "-loglevel", "error", "-i",
-        os.path.join(pngdir, "%04d.png"), "-pix_fmt", "yuv420p", "-f", "yuv4mpegpipe", dist])
+        os.path.join(pngdir, "%04d.png"), "-pix_fmt", PIX_FMT[0], "-f", "yuv4mpegpipe", dist])
     shutil.rmtree(pngdir, ignore_errors=True)
     if not os.path.exists(dist):
         return None
@@ -128,14 +141,15 @@ def run_gnc(src, work, n, ki, q, chroma, gnc_bin):
 def run_x264(src, work, n, ki, crf, extra):
     tag = f"x264_crf{crf}"
     bs = os.path.join(work, f"{tag}.264")
+    csp = ["--output-csp", "i444"] if PIX_FMT[0] == "yuv444p" else []
     sh(["x264", "--crf", str(crf), "--frames", str(n), "--keyint", str(ki),
-        "--tune", "psnr", *extra, "-o", bs, src])
+        "--tune", "psnr", *csp, *extra, "-o", bs, src])
     if not os.path.exists(bs):
         return None
     size = os.path.getsize(bs)
     dist = os.path.join(work, f"{tag}.y4m")
     sh(["ffmpeg", "-nostdin", "-y", "-loglevel", "error", "-i", bs,
-        "-pix_fmt", "yuv420p", "-f", "yuv4mpegpipe", dist])
+        "-pix_fmt", PIX_FMT[0], "-f", "yuv4mpegpipe", dist])
     if not os.path.exists(dist):
         return None
     v = vmaf_score(REFERENCE[0], dist)
@@ -149,7 +163,7 @@ def main():
     ap.add_argument("src")
     ap.add_argument("--frames", type=int, default=17)
     ap.add_argument("--keyint", type=int, default=9)
-    ap.add_argument("--chroma", default="420")
+    ap.add_argument("--chroma", default="420", help="420 or 444; sets both codecs and the reference")
     ap.add_argument("--q", default="25,40,55,70,85")
     ap.add_argument("--crf", default="18,23,28,33,38")
     ap.add_argument("--gnc", default="./target/release/gnc")
@@ -162,7 +176,8 @@ def main():
     px = w * h * args.frames
     work = args.workdir or tempfile.mkdtemp(prefix="meas1_")
     os.makedirs(work, exist_ok=True)
-    ref_pngs, ref_y4m = normalise_source(args.src, work, args.frames)
+    PIX_FMT[0] = "yuv444p" if args.chroma == "444" else "yuv420p"
+    ref_pngs, ref_y4m = normalise_source(args.src, work, args.frames, PIX_FMT[0])
     REFERENCE[0] = ref_y4m
     gnc_input = os.path.join(ref_pngs, "%04d.png")
 
@@ -171,36 +186,38 @@ def main():
           f"chroma {args.chroma} ===")
 
     rows = []
-    print(f"\n  {'codec':6} {'setting':>8} {'bpp':>9} {'VMAF':>8}")
-    gr, gq = [], []
+    print(f"\n  {'codec':6} {'setting':>8} {'bpp':>9} {'VMAF':>8} {'PSNR-Y':>8}")
+    gr, gq, gp = [], [], []
     for q in [int(x) for x in args.q.split(",")]:
         res = run_gnc(gnc_input, work, args.frames, args.keyint, q, args.chroma, args.gnc)
         if not res or res[1] is None:
             continue
-        size, v = res
+        size, (v, ps) = res
         bpp = size * 8 / px
         gr.append(bpp)
         gq.append(v)
-        rows.append(("gnc", q, bpp, v))
-        print(f"  {'gnc':6} {q:8} {bpp:9.4f} {v:8.2f}")
+        rows.append(("gnc", q, bpp, v, ps))
+        gp.append(ps)
+        print(f"  {'gnc':6} {q:8} {bpp:9.4f} {v:8.2f} {ps if ps is None else f'{ps:8.2f}'}")
 
-    xr, xq = [], []
+    xr, xq, xp = [], [], []
     for crf in [int(x) for x in args.crf.split(",")]:
         res = run_x264(ref_y4m, work, args.frames, args.keyint, crf, [])
         if not res or res[1] is None:
             continue
-        size, v = res
+        size, (v, ps) = res
         bpp = size * 8 / px
         xr.append(bpp)
         xq.append(v)
-        rows.append(("x264", crf, bpp, v))
-        print(f"  {'x264':6} {crf:8} {bpp:9.4f} {v:8.2f}")
+        rows.append(("x264", crf, bpp, v, ps))
+        xp.append(ps)
+        print(f"  {'x264':6} {crf:8} {bpp:9.4f} {v:8.2f} {ps if ps is None else f'{ps:8.2f}'}")
 
     if args.csv:
         with open(args.csv, "w") as f:
-            f.write("codec,setting,bpp,vmaf\n")
-            for c, s, b, v in rows:
-                f.write(f"{c},{s},{b:.6f},{v:.4f}\n")
+            f.write("codec,setting,bpp,vmaf,psnr\n")
+            for c, st, b, v, ps in rows:
+                f.write(f"{c},{st},{b:.6f},{v:.4f},{'' if ps is None else f'{ps:.4f}'}\n")
 
     if len(gq) >= 2 and len(xq) >= 2:
         # BD-rate of GNC relative to x264: positive means GNC needs more bits.
@@ -210,6 +227,11 @@ def main():
         else:
             print(f"\n  BD-rate GNC vs H.264 (VMAF {lo:.1f}-{hi:.1f}): {bd:+.1f}%")
             print("  (positive = GNC needs more bits for the same VMAF)")
+        if all(p is not None for p in gp + xp) and len(gp) >= 2 and len(xp) >= 2:
+            bdp, (plo, phi) = bd_rate(np.array(xr), np.array(xp), np.array(gr), np.array(gp))
+            if bdp is not None:
+                print(f"  BD-rate on PSNR-Y   ({plo:.1f}-{phi:.1f} dB): {bdp:+.1f}%")
+                print("  (the repo's +13.9% figure is PSNR-based; VMAF is the stated primary metric)")
     print()
 
 

@@ -44,6 +44,27 @@ Corrected reference points, bbb 1080p ki=9 4:2:0, 17 frames:
 Per-frame at q=70: I 820 KB, P 304-380 KB, B 108 KB. For scale, x264 at matched VMAF spends
 I 439 KB, P 39 KB, B 14 KB — intra is ~1.9x, inter is **8-10x**.
 
+## Intra vs H.264 and JPEG 2000 (2026-09-05, like-for-like)
+
+6 frames of bbb at 1080p, 4:4:4, all-intra, one PNG-derived reference, all three codecs scored by
+the same `vmaf` binary. `scripts/meas1_vs_h264.py --chroma 444 --keyint 1`.
+
+| | bpp @ VMAF 96 | bpp @ PSNR-Y 43 |
+|---|---|---|
+| GNC | 2.678 | 3.213 |
+| H.264 intra (x264, i444) | 1.880 | 1.874 |
+| JPEG 2000 (openjpeg) | 1.496 | 2.201 |
+
+**GNC needs 1.42x H.264 intra and 1.79x JPEG 2000 at VMAF 96.**
+
+This supersedes the +13.9% and +17.6% figures below, which are RGB PSNR on a single still image.
+`rd-curve --compare-codecs` still reports +17.6% vs JPEG 2000, so the difference is methodology,
+not drift — but VMAF on a shared reference is the measurement to quote.
+
+**JPEG 2000 beats H.264 intra here**, so GNC is losing to another wavelet codec, not to a
+fundamentally different design. Unlike the inter gap, intra has an existence proof that the rate
+is reachable.
+
 ## Video vs H.264 (MEAS-1, 2026-09-05) — the headline number
 
 Measured with `scripts/meas1_vs_h264.py`: VMAF-scored, one normalised reference for both codecs,

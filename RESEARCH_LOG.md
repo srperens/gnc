@@ -4649,3 +4649,113 @@ The correctness fixes earlier today (BUG-1, BUG-2, BUG-3) are unaffected — all
 by several dB as well, and BUG-1 and BUG-3 were chroma *correctness*, not chroma *allocation*.
 But the distinction matters, and the protocol should say so: **VMAF answers luma questions;
 chroma questions need a chroma-aware metric.**
+
+---
+
+## 2026-09-05 — The density thesis splits in two, and only one half survives contact
+
+### Motivation
+
+MEAS-5 asks whether a big GPU runs more concurrent GNC instances than it runs NVENC sessions.
+An external hardware/literature sweep plus a local concurrency measurement now answer it —
+and the answer is that this was never one claim.
+
+### Claim A — "no session cap" — holds, and is stronger than we thought
+
+From NVIDIA's own Video Encode and Decode GPU Support Matrix and the NVENC Application Note
+(Video Codec SDK 13.1):
+
+- The consumer concurrent-session limit is **12 per system**, and explicitly *"applies to the
+  combined number of encoding sessions executed on all non-qualified cards present in the
+  system."* **Adding a second GeForce buys zero additional sessions.**
+- **A100, H100 and B200 ship with zero NVENC.** The Hopper whitepaper states it outright: H100
+  "do not include display connectors, NVIDIA RT Cores ... or an NVENC encoder". 132 SMs, no
+  encoder. The most valuable GPUs in the world cannot encode video at all.
+- The **GeForce driver licence §2.8** prohibits datacenter deployment. Encoding at density with
+  NVENC legally requires professional or datacenter SKUs, independent of the session counter.
+- Engine counts are flat or sublinear against compute: Ampere runs 1 NVENC from RTX 3050 (20 SM)
+  to RTX 3090 Ti (84 SM) — **4.2× the compute, same one encoder**. Blackwell scales 3× encoders
+  across 5.7× compute. Apple: M4 → M4 Max is 4× the GPU for 2× the encoders.
+- **Per-engine throughput has barely moved in seven years.** 1080p H.264 P1: Turing 855 fps →
+  Blackwell 977 fps, **+14%**, while shader FP32 grew roughly 6× over the same period.
+
+This half of the thesis is fully sourced and defensible today.
+
+### Claim B — "more aggregate throughput than the card's own NVENCs" — is unproven, and the
+### multi-tenancy literature is against the naive version
+
+N GNC instances share one SM array and one memory bus; NVENC sessions run on separate silicon
+that consumes almost no SMs. Published multi-tenancy results are blunt: default time-slicing has
+kernels from distinct processes never executing simultaneously; NVIDIA's own consolidation study
+measured time-slicing at **0.76 req/s where MIG gave 1.00** — a 32% *reduction*. Concurrency
+converts idle GPU into useful GPU; it does not create GPU.
+
+**Measured locally (M1, 8 GPU cores, 1080p touchdown, 17 frames, qstep 4.0, Rice, ki=17):**
+
+| instances | aggregate fps, run 1 | run 2 |
+|---|---|---|
+| 1 | 7.02 | 6.22 |
+| 2 | 11.13 | 9.51 |
+| 4 | 11.51 | 12.23 |
+| 8 | 14.15 | 13.38 |
+
+**Roughly 2× aggregate at N=8, and most of it already reached at N=2.** So a single 1080p encode
+does not saturate the M1 — there is real headroom — but it is nowhere near linear, and the
+ceiling on this hardware is about 13–14 fps aggregate at 1080p. Per-process startup was ruled out
+as the cause: a slope fit over n = 1, 5, 9, 13, 17 frames gives ~0.19 s/frame with an intercept
+near 0.01 s.
+
+### An unrelated discrepancy this turned up, which needs resolving
+
+At **BASELINE's own stated parameters** (bbb, q=75, Rice, ki=8, 10 frames) this session measures:
+
+| what is being timed | fps |
+|---|---|
+| `benchmark-sequence`, GPU encode phase only | **13.6** |
+| `encode-sequence`, end to end incl. PNG decode and container write | **7.8** |
+| BASELINE.md, stated | **31.7** |
+
+The binary used here was built at this session's start and HEAD has moved several commits since,
+so this is not yet a regression claim. But **three different numbers are in circulation for "GNC
+encode fps" and GOALS quotes one of them without saying which**, and the CLI's own help text
+concedes that PNG input inflates the cost (*"Y4M input avoids PNG decode overhead and measures
+actual GNC encoder throughput"*). For a codec whose thesis is real-time density, that ambiguity
+is not survivable. Pin the definition before any density claim rests on it.
+
+Either way, 1080p50 real time is far off on an M1, and concurrency multiplies it by about 2, not
+by 8.
+
+### Why the historical GPU-compute encoder failures do not generalise to GNC
+
+Every documented failure was a **block-based hybrid codec with adaptive arithmetic coding**.
+Jason Garrett-Glaser, 2008: *"basically everything can be reasonably done on the GPU except CABAC
+(which could be done, it just couldn't be parallelized)."* NVIDIA's deprecated CUDA encoder failed
+on scope — 1 reference frame, no configurable search range, no 2-pass — not on physics.
+BeHardware's 2011 study found the shipping GPU encoders performed identically on €100 and €330
+cards because they were never compute-bound at all.
+
+Every surviving GPU-compute codec has GNC's exact shape: wavelet, spatially independent tiles,
+parallel entropy coding. NVIDIA killed its CUDA H.264 encoder and ships nvJPEG2000 in the same
+product line.
+
+**The most encouraging sourced datapoint, and it is an inference:** Fastvideo's JPEG 2000 encoder
+on an RTX 4090 reports 616 fps at 4K ≈ **5.1 Gpixel/s**, against that same card's two NVENC
+engines at H.264 P1 ≈ **3.8 Gpixel/s**. A CUDA wavelet codec already out-throughputs the card's
+fixed-function encoders in raw pixels per second — while carrying EBCOT, which is dramatically
+heavier than Rice or rANS. Different codec, different quality point, vendor-published. Not our
+measurement.
+
+### Where the effort should go
+
+Entropy coding is **51–85% of runtime in every GPU wavelet codec measured** (Fastvideo profiles
+EBCOT Tier-1 at 51–73%; NVIDIA keeps Tier-2 on the CPU entirely), and it is local-memory-latency
+bound, where register footprint per thread is the lever. **GNC's Rice and rANS backends deserve
+more optimisation attention than the wavelet does.** Secondarily: rate control, not the transform,
+is what sank the historical GPU encoders' quality.
+
+### A canary worth adopting permanently
+
+BeHardware's 2011 finding — GPU encoders performing identically across price tiers because they
+were never compute-bound — is exactly the silent-feature failure CLAUDE.md's quality rules exist
+to catch. **If GNC's encode time does not move between the M1 and a discrete GPU, the pipeline is
+not running where we think it is.** Cheap to add, and it should be permanent.

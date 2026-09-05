@@ -113,23 +113,61 @@ change, not a bitstream change. Root cause still worth finding — it may be wor
 **Next step:** finer qstep sweep to locate the crossover per sequence, and a 4:2:0 cross-check.
 Full measurement in RESEARCH_LOG 2026-09-05.
 
-### MEAS-5 — Concurrent streams per GPU vs NVENC (todo, P0 — never measured)
-The whole contribution-codec positioning (GOALS §1) rests on one unproven claim: a GPU's shader
-throughput scales with the card while its fixed-function encoder blocks do not, so a big GPU
-should run more GNC instances than it runs NVENC sessions. **Nobody has measured this.**
+### MEAS-5 — Concurrent streams per GPU vs NVENC (partly answered 2026-09-05, P0)
 
-Measure: N concurrent 1080p encode+decode instances on one GPU, at contribution quality, until
-throughput per instance drops below realtime. Report the N, and the same N for NVENC/VideoToolbox
-on the same machine. Needs at least the M1 and one discrete NVIDIA card; ideally an Intel iGPU too.
+**The thesis was never one claim. It is two, and they are not equally strong.**
 
-Per-stream, compute will lose to fixed function — that is expected and not the claim. The claim is
-about the aggregate. If the aggregate also loses, the positioning is wrong and we need to know
-that before more compression work.
+**Claim A — "no session cap, and it runs where NVENC does not" — HOLDS. Fully sourced.**
+- NVENC's consumer limit is **12 concurrent sessions per *system***, explicitly *"the combined
+  number ... on all non-qualified cards present in the system"*. **A second GeForce buys zero.**
+- **A100, H100 and B200 ship with zero NVENC.** NVIDIA's Hopper whitepaper states it outright.
+  The most valuable GPUs in the world cannot encode video at all — an idle AI fleet has no encode
+  capacity whatsoever. This is the strongest and most under-used fact we have.
+- **GeForce driver licence §2.8 prohibits datacenter deployment**, so NVENC at density legally
+  requires professional or datacenter SKUs regardless of the session counter.
+- Engine counts are flat or sublinear against compute (Ampere: 1 NVENC across 4.2x the SMs), and
+  **per-engine throughput grew +14% from Turing to Blackwell while shader FP32 grew ~6x.**
+
+**Claim B — "more aggregate throughput than the card's own NVENCs" — STILL UNPROVEN, and the
+first local measurement is sobering.** M1, 1080p, N concurrent encode processes:
+
+| instances | aggregate fps (two runs) |
+|---|---|
+| 1 | 7.02 / 6.22 |
+| 2 | 11.13 / 9.51 |
+| 4 | 11.51 / 12.23 |
+| 8 | 14.15 / 13.38 |
+
+**~2x aggregate at N=8, most of it already at N=2.** A single 1080p encode does not saturate the
+M1, so there is real headroom — but it is far from linear, and the published multi-tenancy
+literature agrees: concurrency converts *idle* GPU into *useful* GPU, it does not create GPU.
+NVIDIA's own consolidation study measured time-slicing at 0.76 req/s where MIG gave 1.00.
+
+**Still to do:** the same measurement on a discrete NVIDIA card, head to head against NVENC at
+both P1 and P7 presets (P7 is nearer GNC's quality target and roughly 4x easier to win), and on an
+H100 where the NVENC column is a zero.
+
+**Blocked on a definition problem — fix this first.** At BASELINE's own stated parameters this
+session measured **13.6 fps** for the GPU encode phase (`benchmark-sequence`) and **7.8 fps** end
+to end (`encode-sequence`, incl. PNG decode and container write), against BASELINE's stated
+**31.7 fps**. The CLI's own help concedes PNG input inflates the cost. Three numbers are in
+circulation for "GNC encode fps" and GOALS quotes one without saying which. **Pin the definition
+before any density claim rests on it.**
 
 ### MEAS-6 — Latency per frame (todo, P1 — never measured)
 Contribution links need sub-frame latency, and tile independence is supposed to buy it. Measure
 end-to-end frame latency (submit → decoded frame available), not throughput fps. Currently
 unquantified.
+
+### CANARY-1 — Encode time must move across GPU tiers (todo, P1)
+BeHardware's 2011 study found the shipping GPU H.264 encoders performed *identically* on 100 EUR
+and 330 EUR cards, because they were never compute-bound at all — the GPU was doing far less than
+the marketing implied. That is exactly the silent-feature failure CLAUDE.md's quality rules exist
+to catch.
+
+**If GNC's encode time does not move between the M1 and a discrete GPU, the pipeline is not
+running where we think it is.** Add a cross-tier scaling check to the regression suite and keep it
+permanently. Cheap, and it guards the single assumption the whole project rests on.
 
 ### FMT-1 — 10-bit support (todo, P1)
 8-bit is the main format gap for broadcast contribution. 4:2:2 and 4:2:0 already work, so bit

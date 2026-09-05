@@ -3548,3 +3548,91 @@ because the motion search and mode decision are not finding it.
 ignores the extra quantization noise an older reference carries (optimistic for n-2); and it
 charges nothing for the reference-index bit while giving no RD search (pessimistic). It bounds
 headroom, it does not predict bpp.
+
+---
+
+## 2026-09-05 — Hunting the inter gap: four negative results, and a broken premise
+
+Following the decision to pivot from #25 to motion estimation and mode decision. Four experiments,
+**all negative or inconclusive**, and then the framing itself turned out not to hold. Recording in
+full, because each one closes off a direction that looked obvious.
+
+### Quality-matched x264 ablation (the corrected version)
+
+The earlier ablation compared file sizes at fixed QP, which is invalid for prediction tools —
+disabling one changes quality as well as size. Redone at constant quality (`--crf 23 --tune psnr`,
+P-only), reporting both:
+
+| tool removed | bbb | touchdown | old_town |
+|---|---|---|---|
+| sub-pel entirely (`--subme 0`) | **+82.8%** | **+46.8%** | **+79.2%** |
+| down to 1-iteration qpel (`--subme 1`) | +22.3% | +18.3% | +11.7% |
+| down to qpel SATD (`--subme 2`) | +5.8% | +3.4% | +4.6% |
+| CABAC | +8.8% | +6.8% | +8.6% |
+| sub-block partitions | +1.3% | +2.8% | +3.5% |
+| multi-reference | +5.5% | +2.3% | −0.2% |
+
+Sub-pel motion compensation dominates everything else by roughly an order of magnitude. GNC
+already has quarter-pel MC, so the question became *how good* GNC's is.
+
+### 1. Interpolation filter — NEGATIVE
+
+GNC interpolates sub-pel positions bilinearly; H.264 uses a 6-tap Wiener filter for half-pel.
+`scripts/meas_subpel_filter.py` compares them with identical motion, identical blocks.
+
+Against an ideal FFT sub-pixel shift of a band-limited image, the 6-tap filter is **5x more
+accurate** (RMSE 0.93 vs 4.72 at half-pel), so both implementations are correct. On real video,
+however, the 6-tap filter is **neutral to slightly worse** than bilinear on SATD and on estimated
+bits (−3% to −5% on three of four sequences; only clean animation favours it, +13.9%).
+
+Bilinear's blur evidently helps on camera-captured content, where it suppresses sensor noise the
+sharper filter faithfully reproduces. **Not worth implementing on this evidence.**
+
+Two method bugs were found and fixed before believing any of this: SAD as the metric (it rewards
+blur, which is the whole question — switched to SATD plus a quantized-DCT rate proxy), and an
+inverted shift direction in the validation harness, which made *both* interpolators look broken
+(RMSE ~25 on a 0–255 image) and would have been read as "the 6-tap filter is buggy".
+
+### 2. Motion search quality — NEGATIVE
+
+`scripts/meas_me_quality.py` compares GNC's achieved luma residual against an offline oracle
+search on the *same decoded reference* (the encoder now dumps the reference and current planes
+alongside the residual, so this is not a source-frame proxy).
+
+The oracle — full ±32 integer search plus bilinear quarter-pel — comes out **20.8% worse on SATD
+and 14.4% worse on estimated bits** than GNC as shipped. GNC's search beats it because GNC splits
+to 8x8 blocks where the oracle uses 16x16. **GNC's motion search is not the deficiency.**
+
+### 3. Multi-reference — NEGATIVE (already recorded above)
+
+~1–5% at matched quality; #25 withdrawn.
+
+### 4. The premise itself does not hold
+
+The number driving all of this — "GNC P-only saves 38.5% vs all-I where x264 saves 86.9%" — is
+**not a valid comparison**. Checked directly on bbb, 4:2:0, 8 frames:
+
+| | bpp | PSNR |
+|---|---|---|
+| GNC all-I q=75 | 3.45 | 42.31 dB (RGB) |
+| GNC I+P q=75 | 2.03 | 39.97 dB (RGB) |
+| x264 all-I qp=26 | 1.23 | 42.07 dB (YUV) |
+| x264 P-only qp=26 | 0.23 | 42.20 dB (YUV) |
+
+**GNC's PSNR is computed in RGB and x264's in YUV.** Those are not the same quantity — YUV PSNR
+weights luma heavily and is systematically higher — so neither the absolute bitrates nor the
+percentage savings can be compared across the two rows. The apparent 2.8x intra gap here also
+contradicts BASELINE's +13.9% BD-rate vs H.264 all-I, which is the signal that the measurement,
+not the codec, is wrong.
+
+### Conclusion
+
+Every specific inter hypothesis tested this session came back negative, and the gap they were
+meant to explain rests on a comparison that does not survive inspection. **MEAS-1 (correct,
+VMAF-based GNC vs H.264 video comparison) is now a hard prerequisite for any further inter work.**
+Until it exists there is no trustworthy number saying how large GNC's inter gap actually is, and
+targeting it is guesswork.
+
+Tooling produced, all reusable: `meas_multiref_gate.py`, `meas_subpel_filter.py`,
+`meas_me_quality.py`, plus encoder dumps of the residual, reference and current luma planes under
+`GNC_DUMP_RESIDUAL`.

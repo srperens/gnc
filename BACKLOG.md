@@ -26,9 +26,15 @@ MEAS-4 is designed to answer that before anything gets built. Until then the pri
 3. Toggle features to identify dead weight and incorrect implementations
 4. Let measurements drive the next action
 
-MEAS-4 (done 2026-09-05) answered the standing question about the inter path: the gap is
-**prediction quality, not the coding model**, so the next inter work is multi-reference
-prediction (#25, promoted to P1) rather than a rebuilt residual coder.
+MEAS-4 (done 2026-09-05) established that the inter gap is **not** in the coding model. The
+follow-up hunt for where it *is* returned four negative results in a row (multi-reference,
+sub-pel interpolation filter, motion search quality, and the earlier transform/entropy work),
+and then the premise itself failed inspection: the "GNC saves 38.5% vs x264's 86.9%" figure
+compares GNC's RGB PSNR against x264's YUV PSNR, which are not the same quantity.
+
+**MEAS-1 is therefore a hard prerequisite for any further inter work.** Until there is a
+trustworthy, VMAF-based, like-for-like comparison, there is no reliable number saying how large
+the inter gap is, and targeting it is guesswork. See RESEARCH_LOG 2026-09-05.
 
 **Known facts (2026-03-11, uniform weights):**
 - Spatial BD-rate vs H.264 all-I: **+13.9%** — reasonable for a wavelet codec; GNC wins above ~36 dB
@@ -100,7 +106,7 @@ every chroma plane unwritten, and the stale contents were still being coded.
 **Follow-up worth doing:** audit for other places deriving one plane's geometry from another's
 by a fixed factor. Three defects this session came from that single assumption.
 
-### MEAS-1 — Correct video comparison GNC vs H.264 (todo)
+### MEAS-1 — Correct video comparison GNC vs H.264 (todo, **P1 — now a prerequisite**)
 Run H.264 (libx264, full inter, standard GOP) on crowd_run + park_joy, 10 frames, yuv420p.
 Measure PSNR and bpp per CRF value. Compute BD-rate against GNC 4:2:0 I+P+B (after BUG-1 fixed).
 Also GNC 4:4:4 vs H.264 yuv444p for fair comparison without chroma handicap.
@@ -140,15 +146,18 @@ residuals; `scripts/meas4_oracle.py` runs 4a/4b/4c.
 **Consequence:** #25 (multi-reference P-frames) is promoted out of deferred — see below. Do not
 spend effort on per-block inter transforms, block skip, or context entropy for inter.
 
-### 25. Multi-reference P-frames
-- **Status:** todo (P1 — promoted from deferred 2026-09-05 by MEAS-4)
-- **Motivation:** GNC P-frames reference only the immediately preceding decoded frame. H.264 can reference up to 16 frames, which dramatically improves compression for repeated textures (scrolling text, panning shots) and periodic motion. Even 2-reference P-frames would cover the most common cases.
-- **Why now:** MEAS-4 established that GNC's inter gap is prediction quality, not coding model, and the x264 ablation put multi-reference + B-frame prediction at +29–32% — H.264's largest single inter lever, three times CABAC's contribution. This is the technique GNC lacks that the measurement says matters most, and it is ordinary and GPU-parallel rather than a pipeline rewrite.
-- **Hypothesis:** Allowing P-frames to choose the best of 2 reference frames (prev and prev-prev) reduces bpp 3–8% on sequences with periodic motion or scene repetition.
-- **Success criteria:** bpp −3% on at least one test sequence; VMAF neutral; no regression on bbb/crowd_run.
-- **Complexity:** Medium. Requires decoder to track a reference buffer (already partially done for B-frames). ME shader needs a second reference input and cost comparison.
-- **Gate (unchanged from the 2026-03 deferral):** add a periodic-motion test sequence AND run an MV histogram showing >15% non-adjacent references. Measure the histogram before building the encoder side — if references are overwhelmingly adjacent, the hypothesis is wrong for this content and the ordering of the multi-ref work should change.
-- **Note:** the tile-level dual-reference variant (#43) was separately CLOSED (2026-03-10) — see archive. Revisit alongside this item.
+### 25. Multi-reference P-frames (**WITHDRAWN 2026-09-05** — measured, not worth it)
+Promoted to P1 by MEAS-4 on an x264 ablation that turned out to conflate multi-reference with
+B-frames. Separated: `--ref 1` alone costs **+0.2% to +5.5%** at matched quality, while
+`--bframes 0` costs +22% to +41%. GNC already has B-frames.
+
+The item's own gate (`scripts/meas_multiref_gate.py`) passes on only 2 of 4 sequences (10.1% /
+22.0% / 7.8% / 25.8% of blocks preferring frame n−2), and the SAD reduction from best-of-two is
+2.1–4.9% everywhere. The sequence chosen specifically as the best case — speed_bag, literally
+periodic motion — scores lowest. Expected gain is below the item's own 3% success criterion, for
+a bitstream format change.
+
+Revisit only if MEAS-1 shows an inter gap that nothing cheaper explains.
 
 ## Noted — revisit only if conditions change
 

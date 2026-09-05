@@ -4393,6 +4393,46 @@ impl EncoderPipeline {
                 bufs.split_total_blocks,
             );
 
+            // Dump the luma reference plane alongside the residual. Comparing GNC's achieved
+            // prediction against an offline oracle ME only means anything if both predict from
+            // the *same* reference — GNC's is a decoded frame, not the source.
+            if diagnostics::residual_dump_dir().is_some() {
+                let stg_ref = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("diag_ref_staging"),
+                    size: plane_size,
+                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                let mut c = ctx
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("diag_ref_copy"),
+                    });
+                c.copy_buffer_to_buffer(&bufs.gpu_ref_planes[0], 0, &stg_ref, 0, plane_size);
+                ctx.queue.submit(Some(c.finish()));
+                diagnostics::dump_residual_plane(
+                    ctx, &stg_ref, plane_size, padded_w, padded_h, "Pref",
+                );
+
+                // ... and the current luma plane, so the oracle sees exactly the pair GNC saw.
+                let stg_cur = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("diag_cur_staging"),
+                    size: plane_size,
+                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                let mut c2 = ctx
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("diag_cur_copy"),
+                    });
+                c2.copy_buffer_to_buffer(&bufs.plane_a, 0, &stg_cur, 0, plane_size);
+                ctx.queue.submit(Some(c2.finish()));
+                diagnostics::dump_residual_plane(
+                    ctx, &stg_cur, plane_size, padded_w, padded_h, "Pcur",
+                );
+            }
+
             // MEAS-4: dump the spatial-domain MC residual (post-MC, pre-transform) for the
             // offline oracle analysis. Luma only — that is what the oracle bound is computed on.
             if let Some(ref stg) = diag_residual_staging {

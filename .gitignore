@@ -27,3 +27,4 @@ examples/web/*.pem
 # Python bytecode
 __pycache__/
 *.pyc
+examples/web/*.log

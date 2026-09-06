@@ -597,32 +597,28 @@
 
         // --- Demo files ---
         const demoFiles = [
-            // I+P motion vector codec — diverse real-world content
-            { name: 'ducks_q75.gnv',   label: 'Ducks Take Off',   desc: '300f 50fps 1080p q=75 — water, feathers, fast motion', group: 'I+P (motion vectors)' },
-            { name: 'rush_hour.gnv',   label: 'Rush Hour',        desc: '200f 25fps 1080p q=75 — city traffic, slow pan', group: 'I+P (motion vectors)' },
-            { name: 'old_town_cross.gnv', label: 'Old Town Cross', desc: '200f 50fps 1080p q=75 — urban pedestrians', group: 'I+P (motion vectors)' },
-            { name: 'pedestrian_area.gnv', label: 'Pedestrian Area', desc: '200f 25fps 1080p q=75 — walking crowd', group: 'I+P (motion vectors)' },
-            { name: 'bbb_2min.gnv',         label: 'BBB 2 min q=75',       desc: '1800f 30fps 1080p q=75 4:4:4 — animated film, varied scenes', group: 'I+P (motion vectors)' },
-            { name: 'bbb_2min_420_q25.gnv', label: 'BBB 2 min q=25 4:2:0', desc: '1800f 30fps 1080p q=25 4:2:0 — same clip, lower bitrate', group: 'I+P (motion vectors)' },
-            { name: 'bbb_2min_q5.gnv',      label: 'BBB 2 min q=5',        desc: '1800f 30fps 1080p q=5 4:4:4 — extreme compression, visible artefacts', group: 'I+P (motion vectors)' },
-            // Temporal wavelet — same clips for direct comparison
-            { name: 'tw_ducks_q75.gnv2',        label: 'Ducks Take Off',   desc: '300f 50fps 1080p q=75 Haar temporal wavelet', group: 'Temporal Wavelet (Haar)' },
-            { name: 'tw_rush_hour.gnv2',         label: 'Rush Hour',        desc: '200f 25fps 1080p q=75 Haar temporal wavelet', group: 'Temporal Wavelet (Haar)' },
-            { name: 'tw_old_town_cross.gnv2',    label: 'Old Town Cross',   desc: '200f 50fps 1080p q=75 Haar temporal wavelet', group: 'Temporal Wavelet (Haar)' },
-            { name: 'tw_pedestrian_area.gnv2',   label: 'Pedestrian Area',  desc: '200f 25fps 1080p q=75 Haar temporal wavelet', group: 'Temporal Wavelet (Haar)' },
-            { name: 'tw_bbb_2min.gnv2',          label: 'BBB 2 min q=75',   desc: '1800f 30fps 1080p q=75 Haar temporal wavelet', group: 'Temporal Wavelet (Haar)' },
-            { name: 'tw_bbb_2min_q5.gnv2',       label: 'BBB 2 min q=5',    desc: '1800f 30fps 1080p q=5 Haar — extreme compression', group: 'Temporal Wavelet (Haar)' },
-            // Chroma subsampling — Crowd Run, two quality levels
-            { name: 'crowd_444_q50.gnv', label: '4:4:4  q=50', desc: '100f 50fps 1080p q=50 — full chroma (3.65 bpp avg)', group: 'Chroma: Crowd Run (4:4:4 vs 4:2:2 vs 4:2:0)' },
-            { name: 'crowd_422_q50.gnv', label: '4:2:2  q=50', desc: '100f 50fps 1080p q=50 — half horiz chroma (2.73 bpp, −25%)', group: 'Chroma: Crowd Run (4:4:4 vs 4:2:2 vs 4:2:0)' },
-            { name: 'crowd_420_q50.gnv', label: '4:2:0  q=50', desc: '100f 50fps 1080p q=50 — quarter chroma (2.45 bpp, −33%)', group: 'Chroma: Crowd Run (4:4:4 vs 4:2:2 vs 4:2:0)' },
-            { name: 'crowd_444_q25.gnv', label: '4:4:4  q=25', desc: '100f 50fps 1080p q=25 — full chroma (1.91 bpp avg)', group: 'Chroma: Crowd Run (4:4:4 vs 4:2:2 vs 4:2:0)' },
-            { name: 'crowd_422_q25.gnv', label: '4:2:2  q=25', desc: '100f 50fps 1080p q=25 — half horiz chroma (1.51 bpp, −21%)', group: 'Chroma: Crowd Run (4:4:4 vs 4:2:2 vs 4:2:0)' },
-            { name: 'crowd_420_q25.gnv', label: '4:2:0  q=25', desc: '100f 50fps 1080p q=25 — quarter chroma (1.41 bpp, −26%)', group: 'Chroma: Crowd Run (4:4:4 vs 4:2:2 vs 4:2:0)' },
-            // Chroma subsampling — Park Joy, q=50
-            { name: 'park_joy_444_q50.gnv', label: '4:4:4  q=50', desc: '100f 50fps 1080p q=50 — full chroma (4.29 bpp avg)', group: 'Chroma: Park Joy (4:4:4 vs 4:2:2 vs 4:2:0)' },
-            { name: 'park_joy_422_q50.gnv', label: '4:2:2  q=50', desc: '100f 50fps 1080p q=50 — half horiz chroma (3.22 bpp, −25%)', group: 'Chroma: Park Joy (4:4:4 vs 4:2:2 vs 4:2:0)' },
-            { name: 'park_joy_420_q50.gnv', label: '4:2:0  q=50', desc: '100f 50fps 1080p q=50 — quarter chroma (3.02 bpp, −30%)', group: 'Chroma: Park Joy (4:4:4 vs 4:2:2 vs 4:2:0)' },
+            // Regenerate with ./generate_demos.sh. Sizes below are from the 2026-09-06 build.
+
+            // Quality range — same clip and frame count throughout, so the group is comparable.
+            // The range above q=92 was dead until 2026-09-06: an rANS constraint capped qstep at
+            // 2.0 for every entropy coder, so q=92, 96 and 99 produced the same picture.
+            { name: 'range_q25.gnv',  label: 'q=25',  desc: '24f 1080p 4:4:4 — heavy compression, visible artefacts (0.9 MB)', group: 'Quality range: q=25 to lossless' },
+            { name: 'range_q50.gnv',  label: 'q=50',  desc: '24f 1080p 4:4:4 — balanced (1.0 MB)', group: 'Quality range: q=25 to lossless' },
+            { name: 'range_q75.gnv',  label: 'q=75',  desc: '24f 1080p 4:4:4 — the default preset (1.4 MB)', group: 'Quality range: q=25 to lossless' },
+            { name: 'range_q92.gnv',  label: 'q=92',  desc: '24f 1080p 4:4:4 — contribution quality (11.6 MB)', group: 'Quality range: q=25 to lossless' },
+            { name: 'range_q100_lossless.gnv', label: 'q=100 lossless', desc: '24f 1080p 4:4:4 — bit-exact, verified zero error (40.2 MB)', group: 'Quality range: q=25 to lossless' },
+
+            // Temporal mode — the same clip through the two ways GNC relates frames to each other.
+            // I+P predicts with motion vectors and codes the difference; the Haar temporal wavelet
+            // transforms across frame pairs with no motion compensation. Measured 2026-09-06 on
+            // three sequences: the wavelet runs +2.4 to +5.4 dB PSNR at equal q, for more bits.
+            { name: 'temporal_ip.gnv',    label: 'I+P (motion vectors)', desc: '24f 1080p q=75 — GNV1, motion-compensated prediction (39.1 MB)', group: 'Temporal mode: I+P vs temporal wavelet' },
+            { name: 'temporal_haar.gnv2', label: 'Haar temporal wavelet', desc: '24f 1080p q=75 — GNV2, transform across frames, no motion vectors (43.3 MB)', group: 'Temporal mode: I+P vs temporal wavelet' },
+
+            // Chroma format — same clip, same q, three subsampling ratios.
+            { name: 'chroma_444.gnv', label: '4:4:4', desc: '24f 1080p q=50 — full chroma (14.4 MB)', group: 'Chroma format' },
+            { name: 'chroma_422.gnv', label: '4:2:2', desc: '24f 1080p q=50 — half horizontal chroma (10.8 MB)', group: 'Chroma format' },
+            { name: 'chroma_420.gnv', label: '4:2:0', desc: '24f 1080p q=50 — quarter chroma (9.2 MB)', group: 'Chroma format' },
         ];
 
         function formatSize(bytes) {

@@ -196,6 +196,16 @@ without an org chart:
 - Zero clippy warnings after every change
 - If the same bug resurfaces after two fix attempts — stop, diagnose root cause properly, do not loop
 - **No silent features** — every new code path must have a way to verify it actually executes
+- **Serial dependencies must be bounded, not absent.** A dependency chain whose length grows with
+  frame size or content sets a ceiling no future hardware can lift; one confined to a tile or a
+  code block is an affordable tax. Forbidden: chains spanning a whole frame, or crossing tiles or
+  frames. Allowed: MED's per-pixel wavefront (511 steps per 256x256 tile, tiles independent) and
+  abac's per-symbol chain (blocks independent). Measured 2026-09-06: a per-pixel dependency costs
+  4.9x on the pass carrying it and still runs at 201 fps for 1080p 4:4:4 — and it is occupancy
+  bound, so the ratio worsens on a larger GPU while staying absolutely cheap. **Price the tool,
+  do not refuse it on principle** — spatial prediction, in-loop filtering and context-adaptive
+  coding were all waved off on parallelism grounds without a number, and the first of those became
+  the largest lossless win of the day (RESEARCH_LOG, "What a serial dependency actually costs").
 
 ### Quality Rules (added 2026-03-11 — lessons from sloppy execution)
 

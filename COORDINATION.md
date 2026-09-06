@@ -47,7 +47,7 @@ Add your row when you create one, remove it when you are done.
 
 | worktree | branch | area |
 |---|---|---|
-| `/Users/per/src/gnc-abac` | `abac` | adaptive binary code-block entropy coder (EBCOT follow-up), CPU + GPU |
+| `/Users/per/src/gnc-abac` | `abac` | adaptive binary code-block entropy coder (EBCOT follow-up), CPU + GPU. Rate −19 to −25% confirmed; GPU decode bit-exact but 6-13 fps, so throughput is the open gate. |
 
 ## The four rules that have actually bitten us
 

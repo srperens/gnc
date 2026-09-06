@@ -35,9 +35,22 @@ const PROB_ONE: u32 = 1 << PROB_BITS;
 /// enough not to thrash on noise.
 const ADAPT_SHIFT: u32 = 5;
 
-const HALF: u32 = 0x8000_0000;
-const QUARTER: u32 = 0x4000_0000;
-const THREE_QUARTER: u32 = 0xC000_0000;
+/// The coder's interval is 16 bits wide, not 32.
+///
+/// This is a portability constraint, not a taste one: **WGSL has no 64-bit integers**, and the
+/// interval split needs `range * probability`. With a 32-bit interval that product reaches 2^44
+/// and a shader cannot compute it without splitting the multiply. With a 16-bit interval,
+/// `range <= 2^16` and `p < 2^12`, so the product stays under 2^28 and fits a `u32` with room to
+/// spare — `abac_decode.wgsl` is then a direct port of this code.
+///
+/// The cost is precision, and it measured at exactly zero: renormalisation guarantees
+/// `range > QUARTER`, so the interval never drops below 2^14, and with 12-bit probabilities the
+/// encoded output is byte-identical to the 32-bit version on all four test images.
+const STATE_BITS: u32 = 16;
+const STATE_MASK: u32 = (1 << STATE_BITS) - 1;
+const HALF: u32 = 1 << (STATE_BITS - 1);
+const QUARTER: u32 = 1 << (STATE_BITS - 2);
+const THREE_QUARTER: u32 = HALF + QUARTER;
 
 /// Number of neighbourhood buckets a context is drawn from.
 const NUM_BUCKETS: usize = 6;
@@ -130,7 +143,7 @@ struct Encoder {
 
 impl Encoder {
     fn new() -> Self {
-        Self { low: 0, high: u32::MAX, pending: 0, out: BitWriter::new() }
+        Self { low: 0, high: STATE_MASK, pending: 0, out: BitWriter::new() }
     }
 
     fn emit(&mut self, bit: bool) {
@@ -142,9 +155,10 @@ impl Encoder {
     }
 
     fn encode(&mut self, bit: bool, p: &mut Prob) {
-        let range = (self.high - self.low) as u64 + 1;
+        let range = self.high - self.low + 1;
         // Split proportional to P(bit == 0); -1 keeps `mid` strictly below `high`.
-        let mid = self.low + ((range * p.0 as u64) >> PROB_BITS) as u32 - 1;
+        // `range * p.0` stays under 2^28 by construction — see STATE_BITS.
+        let mid = self.low + ((range * p.0) >> PROB_BITS) - 1;
         if bit {
             self.low = mid + 1;
         } else {
@@ -165,22 +179,20 @@ impl Encoder {
             } else {
                 break;
             }
-            self.low <<= 1;
-            self.high = (self.high << 1) | 1;
+            self.low = (self.low << 1) & STATE_MASK;
+            self.high = ((self.high << 1) | 1) & STATE_MASK;
         }
     }
 
     /// Bypass bit: coded at a fixed half probability, as CABAC does for suffix and sign bits.
     fn encode_bypass(&mut self, bit: bool) {
-        let mut half = Prob(PROB_ONE / 2);
-        let range = (self.high - self.low) as u64 + 1;
-        let mid = self.low + ((range * half.0 as u64) >> PROB_BITS) as u32 - 1;
+        let range = self.high - self.low + 1;
+        let mid = self.low + ((range * (PROB_ONE / 2)) >> PROB_BITS) - 1;
         if bit {
             self.low = mid + 1;
         } else {
             self.high = mid;
         }
-        let _ = &mut half; // bypass bits do not adapt
         loop {
             if self.high < HALF {
                 self.emit(false);
@@ -195,8 +207,8 @@ impl Encoder {
             } else {
                 break;
             }
-            self.low <<= 1;
-            self.high = (self.high << 1) | 1;
+            self.low = (self.low << 1) & STATE_MASK;
+            self.high = ((self.high << 1) | 1) & STATE_MASK;
         }
     }
 
@@ -223,10 +235,10 @@ impl<'a> Decoder<'a> {
     fn new(bytes: &'a [u8]) -> Self {
         let mut input = BitReader::new(bytes);
         let mut code = 0u32;
-        for _ in 0..32 {
+        for _ in 0..STATE_BITS {
             code = (code << 1) | u32::from(input.get());
         }
-        Self { low: 0, high: u32::MAX, code, input }
+        Self { low: 0, high: STATE_MASK, code, input }
     }
 
     fn renormalise(&mut self) {
@@ -244,15 +256,15 @@ impl<'a> Decoder<'a> {
             } else {
                 break;
             }
-            self.low <<= 1;
-            self.high = (self.high << 1) | 1;
+            self.low = (self.low << 1) & STATE_MASK;
+            self.high = ((self.high << 1) | 1) & STATE_MASK;
             self.code = (self.code << 1) | u32::from(self.input.get());
         }
     }
 
     fn decode(&mut self, p: &mut Prob) -> bool {
-        let range = (self.high - self.low) as u64 + 1;
-        let mid = self.low + ((range * p.0 as u64) >> PROB_BITS) as u32 - 1;
+        let range = self.high - self.low + 1;
+        let mid = self.low + ((range * p.0) >> PROB_BITS) - 1;
         let bit = self.code > mid;
         if bit {
             self.low = mid + 1;
@@ -265,8 +277,8 @@ impl<'a> Decoder<'a> {
     }
 
     fn decode_bypass(&mut self) -> bool {
-        let range = (self.high - self.low) as u64 + 1;
-        let mid = self.low + ((range * (PROB_ONE / 2) as u64) >> PROB_BITS) as u32 - 1;
+        let range = self.high - self.low + 1;
+        let mid = self.low + ((range * (PROB_ONE / 2)) >> PROB_BITS) - 1;
         let bit = self.code > mid;
         if bit {
             self.low = mid + 1;

@@ -78,24 +78,28 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>) {
                 for (var i = 0u; i < BLOCK_SIZE; i = i + 1u) {
                     dc_sum += left_col[i] + top_row[i];
                 }
-                dc_sum = dc_sum / f32(BLOCK_SIZE * 2u);
+                dc_sum = round(dc_sum / f32(BLOCK_SIZE * 2u));
             } else if (has_left) {
                 for (var i = 0u; i < BLOCK_SIZE; i = i + 1u) {
                     dc_sum += left_col[i];
                 }
-                dc_sum = dc_sum / f32(BLOCK_SIZE);
+                dc_sum = round(dc_sum / f32(BLOCK_SIZE));
             } else if (has_top) {
                 for (var i = 0u; i < BLOCK_SIZE; i = i + 1u) {
                     dc_sum += top_row[i];
                 }
-                dc_sum = dc_sum / f32(BLOCK_SIZE);
+                dc_sum = round(dc_sum / f32(BLOCK_SIZE));
             } else {
                 dc_sum = 128.0;
             }
 
             // Top-right pixel for diagonal
             var top_right: f32;
-            if (has_top && ox + BLOCK_SIZE < params.plane_width) {
+            // Availability must be tested against the *tile* boundary, not the plane. For a
+            // block in the last column of an intra tile, ox + BLOCK_SIZE crosses into the
+            // neighbouring tile, which the decoder has not reconstructed — encoder and decoder
+            // then disagreed exactly on the anti-diagonal of those blocks (BUG-13).
+            if (has_top && lbx + 1u < tile_blocks) {
                 top_right = out_pixel(ox + BLOCK_SIZE, oy - 1u);
             } else if (has_top) {
                 top_right = top_row[BLOCK_SIZE - 1u];

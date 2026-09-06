@@ -7458,3 +7458,76 @@ This is the fourth instance in two days of a conclusion resting on a measurement
 conditions that did not support it (see TUNE-5, "inter saves 17–27%", BUG-10). The pattern here is
 narrower and worth naming separately: **a feature measured while broken, and recorded as an idea
 that failed.**
+
+---
+
+## 2026-09-06 — BUG-13 fixed: two defects in intra prediction, and what the corrected measurement does and does not settle
+
+### The two defects
+
+**1. The DC predictor was fractional.** `dc_sum = dc_sum / f32(BLOCK_SIZE)` with no rounding, so
+DC-mode predictions carried a fraction and `input − prediction` was fractional. The integer-
+reversible LeGall 5/3 lossless path cannot represent that exactly. Rounding the average in both
+the forward and the reconstruct shader took wrong pixels from **74.6% to 0.08%**.
+
+**2. The top-right reference was tested against the plane, not the tile.** The remaining 0.08% sat
+on a clean anti-diagonal inside each 8×8 block — exactly the region where diagonal-down-left mode
+falls back on `top_right` (`x + y + 1 >= 8`), and concentrated in the rightmost column of each
+32×32 intra tile:
+
+| errors by block position in the tile | col 0 | col 1 | col 2 | col 3 |
+|---|---|---|---|---|
+| row 1 | 0 | 0 | 0 | **360** |
+| row 2 | 0 | 0 | 36 | **680** |
+| row 3 | 0 | 36 | 100 | **764** |
+
+The guard was `ox + BLOCK_SIZE < params.plane_width`. For a block in the last column of an intra
+tile that reads across the tile boundary into a tile the decoder has not reconstructed. Changed to
+`lbx + 1u < tile_blocks` in both shaders.
+
+**Result: bit-exact at q=100 on all four test images.** 189 tests pass, clippy clean on native.
+
+### What the corrected measurement says
+
+With a working implementation, at q=100 (lossless, so quality is identical by construction — the
+cleanest matched-quality comparison there is):
+
+| image | prediction off | prediction on | |
+|---|---|---|---|
+| touchdown | 3 195 978 | 3 324 640 | **+4.0%** |
+| bbb | 3 436 337 | 3 627 370 | **+5.6%** |
+| blue_sky | 2 911 571 | 3 151 875 | **+8.3%** |
+| kristensara | 1 190 210 | 1 277 099 | **+7.3%** |
+
+**Prediction *before* the wavelet is refuted.** It costs 4–8% at lossless, and the mechanism is the
+one `intra.rs` already documented: block-level prediction creates boundary discontinuities that a
+tile-wide wavelet codes expensively. The module doc was right about the mechanism even though the
+measurement behind the "-11.76 dB" figure was measuring a bug.
+
+### What it does *not* settle — and this is the important part
+
+The hypothesis was that spatial prediction is the lever FFV1 and x264 `-qp 0` use to beat GNC by
+27–43% at lossless. **That is still untested**, because what was measured here is not what those
+codecs do:
+
+| | GNC's intra prediction | FFV1 / JPEG-LS |
+|---|---|---|
+| predictor | 4 block modes (DC/H/V/diag) | per-pixel median (MED/LOCO-I) |
+| unit | one mode per 8×8 block | every pixel |
+| relation to transform | prediction **then** wavelet | prediction **instead of** a transform |
+| mode criterion | minimises SAD (a lossy criterion) | n/a |
+| extent | resets every 32 px (`INTRA_TILE_SIZE`) | whole frame |
+| planes | luma only | all |
+
+Five differences, and the third is the decisive one. FFV1 does not predict *and* transform; it
+predicts and entropy-codes the prediction error directly. Adding a predictor in front of a wavelet
+gives the wavelet a harder signal — which is exactly the +4–8% measured.
+
+**So the open question is narrower and better posed than before:** would a *prediction-based
+lossless path that bypasses the wavelet entirely* close the 27–43% gap? That is a second coding
+path, not a flag, and it is the mechanism every codec that beats GNC at lossless actually uses.
+Filed as the successor to this experiment rather than claimed either way.
+
+This is the fifth time in two days that a conclusion turned on the operating point or the exact
+configuration measured. The pattern is consistent enough to be worth stating as a rule: **name the
+mechanism you are testing, then check that the implementation actually implements that mechanism.**

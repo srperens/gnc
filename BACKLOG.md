@@ -309,7 +309,7 @@ allows 6, and `GNC_WAVELET_LEVELS=6` is silently ignored with it.
 Harmless for the shipped presets (256 px everywhere) but it means every past `--tile-size`
 experiment ran with a hidden cap. Fix: re-derive the ceiling after the CLI overrides land.
 
-### BUG-13 — intra prediction produces corrupt output at every quality (todo, P1)
+### BUG-13 — intra prediction produced corrupt output (**FIXED 2026-09-06**)
 `GNC_INTRA_PRED=1` (added 2026-09-06 to gate the lossless hypothesis) does not reconstruct
 correctly at any setting: max error 197-255 from q=50 to q=100, and at q=100 — where there is no
 quantiser and the transform is reversible — it loses 62 dB against a bit-exact baseline. PSNR sits
@@ -330,6 +330,22 @@ First block row and column are also dirty, so it is not only boundary initialisa
 and x264 `-qp 0` by 43% at q=100, and both win by decorrelating against the neighbour rather than
 the scale. Whether that transfers here is **untested, not refuted** — it cannot be measured until
 this reconstructs.
+
+### LOSSLESS-1 — a prediction-based lossless path that bypasses the wavelet (todo, P2)
+GNC is 27% behind FFV1 and 43% behind x264 `-qp 0` at q=100, and both win the same way: a
+per-pixel median predictor whose error is entropy-coded **directly**, with no transform. GNC's own
+block intra prediction was fixed and measured (BUG-13) and costs **4-8%** at lossless — but it
+predicts *and then* transforms, which hands the wavelet a harder signal. That refutes prediction
+before a wavelet; it says nothing about prediction instead of one.
+
+Five differences from what FFV1 does: block modes vs per-pixel median; one mode per 8x8 block vs
+every pixel; before the transform vs replacing it; SAD-selected vs n/a; resets every 32 px vs whole
+frame; luma only vs all planes.
+
+A second coding path, not a flag. Gate it offline first: run a MED/LOCO-I predictor over the source
+in a script and compare the entropy of its residual against GNC's current lossless bitstream. If
+the offline gate does not show most of the 27%, do not build it. Note LOOP.md's warning that
+offline models *understate* the real coder.
 
 ### BUG-9 — rANS panics below qstep 1.0 instead of rejecting the configuration (todo, P2)
 Panics with `range start index 4294963272 out of range for slice of length 5242880` at

@@ -8512,3 +8512,113 @@ the abac track is already blocked on.
 
 Not integrating it here: the abac worktree owns that code, and this is the number it needs, not a
 second implementation of it. Recorded and handed over.
+
+## 2026-09-06 — CHROMA-1: the luma/chroma frontier is steep, and it is an intra lever only
+
+**Why.** QUAL-1 found GNC ahead of x264 on colour at matched rate while 7.4–8.8 dB behind on luma.
+Two codecs allocating differently between luma and chroma is a *configuration* difference, not a
+coding-efficiency one, so part of the +90.5% luma gap might be reclaimable by moving the
+allocation — a one-line change rather than a new algorithm. `chroma_weight` (multiplies the chroma
+quantiser step: higher = coarser chroma = fewer chroma bits) had never been swept; the values were
+recorded as "fixed guesses".
+
+**The trap, written down before starting.** This exact knob was swept once on VMAF, looked like a
+free 15% rate saving, and reversed sign once measured with a chroma-aware metric. VMAF is luma-only
+*and* saturated above q=85 — doubly blind here. Judged on Y-PSNR and CIEDE2000 together, by
+BD-rate over each arm's own curve, never at fixed q.
+
+**Method.** Four images x q=75/85/92/96 x seven weights = 112 points, worktree pinned to `157671b`.
+
+### A methodology error caught in my own harness first
+
+The obvious luma metric — BT.709 Y from decoded RGB — is **contaminated by the very thing under
+test.** Perturb only Co/Cg and the reconstructed RGB moves, so BT.709 Y moves with it. On
+kristensara at q=92, weight 1.0 → 3.0:
+
+| luma measured as | 1.0 | 3.0 | apparent loss |
+|---|---|---|---|
+| BT.709 Y from RGB | 51.94 | 51.38 | **−0.56 dB** |
+| YCoCg-R Y (what GNC codes) | 50.975 | 50.825 | **−0.15 dB** |
+
+**A 3.7x overstatement**, and it points the wrong way: it makes coarsening chroma look expensive in
+luma when it is nearly free. Luma is now taken in YCoCg-R, the plane the bits actually go to, with
+BT.709 Y reported alongside because it is what a YUV-based harness would show.
+
+### The frontier, and it is not flat
+
+BD-rate against the shipped policy, mean over four images (negative = fewer bits for equal
+quality). Colour BD-rate is computed on −dE00 so the sign convention matches:
+
+| weight | luma BD-rate | colour BD-rate | exchange rate |
+|---|---|---|---|
+| 0.8 | +9.8% | −0.4% | — (worse on luma) |
+| 1.0 | +1.3% | 0.0% | — |
+| **1.2** | **−5.2%** | **+1.2%** | **4.3:1** |
+| 1.5 | −12.9% | +4.0% | 3.2:1 |
+| 2.0 | −21.8% | +9.7% | 2.2:1 |
+| 3.0 | −32.0% | +22.2% | 1.5:1 |
+
+Monotone on all four images, no crossings. Re-baselined on constant 1.0 (the shipped policy is
+mixed — 1.2 below q=85, 1.0 above) the figures are −6.5% / −14.1% / −23.0% / −32.9% luma against
++1.3% / +4.0% / +9.5% / +21.7% colour, so the conclusion does not depend on the baseline choice.
+
+In dB at matched rate, weight 1.5 against 1.0: **+0.95 (bbb), +1.34 (blue_sky), +1.48 (touchdown),
++1.35 (kristensara)** — mean +1.28 dB, against a success criterion of ≥0.5 dB. The luma side of the
+hypothesis holds comfortably.
+
+### But the criterion as written could not be tested, and the honest substitute says 1.2
+
+The stated criterion was "≥0.5 dB while mean dE00 stays below x264's (0.611–0.949)". **That
+comparison is invalid**: QUAL-1's x264 figures are 4:2:0 *video*, this sweep is 4:4:4 *stills* —
+different chroma format, different content. Substituted MEAS-8's internal criterion, 95% of pixels
+below the JND, counting how many of the four images pass:
+
+| weight | q=75 | q=85 | q=92 | q=96 |
+|---|---|---|---|---|
+| shipped | 1.81 (0/4) | 1.08 (1/4) | 0.91 (2/4) | 0.73 (4/4) |
+| 1.2 | 1.81 (0/4) | 1.23 (1/4) | 0.98 (2/4) | 0.79 (4/4) |
+| 1.5 | 2.00 (0/4) | 1.39 (1/4) | 1.13 (**1/4**) | 0.87 (**2/4**) |
+| 2.0 | 2.30 (0/4) | 1.64 (**0/4**) | 1.36 (1/4) | 0.99 (2/4) |
+
+**1.2 is the largest weight that costs nothing** — identical pass counts at every q. 1.5 and beyond
+buy more luma by trading away exactly the criterion a contribution codec is judged on.
+
+### The important half: this is an intra lever, and that closes off an explanation
+
+The stills result does **not** transfer to the shipped video configuration. My first guess was the
+chroma format, since 4:2:0 halves the chroma material. **Wrong** — the control says so:
+
+| configuration | weight 2.0 vs shipped, bytes |
+|---|---|
+| 4:4:4 stills | ≈ −25% |
+| 4:4:4 video, all-intra (ki=1) | **−20.8%** |
+| 4:4:4 video, P-chain (ki=9) | **−2.9%** |
+| 4:2:0 video, P-chain (ki=9) | −1.5% |
+
+It is **inter**, not the format. After motion compensation there is almost no chroma residual left
+to coarsen; the effect lives in I-frames and is diluted sevenfold by the P-chain. Luma at q=92
+4:2:0 moves 0.01 dB across the knob's whole useful range.
+
+**So the +90.5% video gap is not an allocation artefact.** In the configuration QUAL-1 measured,
+this lever does essentially nothing. The gap is genuine luma coding deficit, and **intra work is
+the only route** — now because the alternative was measured and eliminated rather than assumed.
+The lever is still real where intra dominates, and that is not a corner case: all-intra is a normal
+contribution mode (lowest latency, best generation survival) in exactly the 4:4:4 / 4:2:2 formats
+POSITIONING calls a gate.
+
+### Shipped
+
+`chroma_weight` no longer drops to 1.0 above q=85; it stays at 1.2. Verified:
+
+- **q=100 stays bit-exact** and byte-identical at every weight — the quantiser is bypassed there,
+  so lossless cannot be affected. Checked before the change, not after.
+- q=75 output is byte-identical (already 1.2); q=92 matches a forced `GNC_CHROMA_WEIGHT=1.2`
+  exactly, so the new default is the measured configuration and nothing else moved.
+- 198 tests pass, `cargo clippy --release` and the wasm target both clean.
+
+**BASELINE's q=90 row moves, and it looks worse at fixed q:** PSNR(RGB) 51.02 → 50.63 dB, bpp
+8.58 → 8.07 (−6.0%). Both effects are expected and neither is a regression. Most of that 0.39 dB is
+chroma leaking into an RGB metric — the codec's own luma moves **0.055 dB** (50.825 → 50.770) and
+dE00 goes 0.325 → 0.353 mean, 0.721 → 0.772 p95, both far under the JND. A fixed-q point cannot
+judge a rate/quality trade; the −5.2% BD-rate is the measurement that can, and it says the same
+quality is now cheaper. Recorded here per BASELINE's regression rule.

@@ -59,7 +59,6 @@ the shared checkout** — no absolute paths, no session ids.
 |---|---|---|
 | `../gnc-abac` | `abac` | **paused, free to take.** Adaptive binary code-block entropy coder (EBCOT follow-up), CPU + GPU. Rate −15 to −25% confirmed, two coder variants behind `GNC_ABAC_CODER`. Blocked only on `cargo test --release --test abac_bench -- --ignored` on an idle machine. |
 | `../gnc-abac` | `abac` | same worktree, now on **BUG-8** — the encoder's local decode diverges from the real decoder down a GOP. |
-| `../gnc-chroma` (scratchpad) | `meas/chroma-alloc` | CHROMA-1 — is GNC's luma/chroma rate split on the frontier? Measurement + `GNC_CHROMA_WEIGHT`, no `src/` changes. Judged on Y-PSNR **and** dE00 at matched rate; never on VMAF. |
 
 ## Timing: the machine is shared, so throughput numbers are not measurable during a session
 
@@ -106,6 +105,18 @@ the option that spends more bits. Use BD-rate, or compare at matched rate. At le
 wrong conclusions have come from this one error.
 
 ## Landed today, and what each one invalidates
+
+- **CHROMA-1 — `chroma_weight` now stays at 1.2 above q=85 instead of dropping to 1.0.**
+  Changes default output at **q ≥ 85 only**: BASELINE's q=90 row moves 50.41 → 50.06 dB and
+  8.58 → 8.07 bpp, which is −5.2% luma BD-rate for +1.2% on colour. q=25/50/75 are byte-identical
+  and q=100 stays bit-exact (the quantiser is bypassed there). **Any q ≥ 85 file size measured
+  before this is stale**; ratios within one build are fine.
+  Two things worth carrying: **VMAF read 97.08 before and after, on 6% fewer bits** — luma-only and
+  saturated, so a VMAF-only verdict here is worthless, which is the same illusion that made the
+  2026-09-05 sweep look like a free 15%. And **luma measured as BT.709 Y from decoded RGB is
+  contaminated by chroma error** — it overstated the loss 3.7x. Use YCoCg-R Y (`ypsnr_de00.py`).
+  Also settled by elimination: the +90.5% video gap is **not** an allocation artefact. The knob is
+  intra-only (−20.8% all-intra against −2.9% on a ki=9 P-chain), so intra really is the only route.
 
 - **QUAL-1 — the headline gap figure is corrected.** At the contribution operating point GNC needs
   **+90.5% BD-rate on PSNR** (about 1.9x), not the **+456.7% to +672.1%** recorded from MEAS-1.

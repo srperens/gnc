@@ -67,8 +67,9 @@ comparison misleads in whichever direction suits.
 3. **MEAS-5 / CANARY-1** — blocked on a discrete GPU. The entire strategic thesis rests on MEAS-5
    and it has never been measured.
 4. ~~**QUAL-1**~~ — done 2026-09-06: the contribution gap is **+90.5% BD-rate on PSNR**, about
-   1.9x, not the 5.6x recorded at distribution bitrates. Follow-up: sweep `GNC_CHROMA_WEIGHT` at
-   matched rate, judged on PSNR *and* dE00.
+   1.9x, not the 5.6x recorded at distribution bitrates. ~~Follow-up: `GNC_CHROMA_WEIGHT`~~ — done
+   too (CHROMA-1): the frontier is steep but intra-only, so it does **not** explain the video gap.
+   That gap is genuine luma coding deficit, which is why item 1 is intra.
 5. Bugs: BUG-9 (rANS bounds, message now actionable), BUG-14. BUG-12 closed 2026-09-06.
 
 **Do not re-test** (measured and closed this week): MCTF, GOP length, the B-pyramid at contribution
@@ -484,7 +485,7 @@ validated against the shipped encoder to within 3% before being used to reject t
 isolated gate; the shipped decoder has never been timed, and the machine was too loaded to do it
 (COORDINATION rule 1).
 
-### CHROMA-1 — Is GNC's luma/chroma rate split on the frontier? (todo, P2)
+### CHROMA-1 — Is GNC's luma/chroma rate split on the frontier? (**DONE 2026-09-06**)
 Falls out of QUAL-1. At rate matched to 1%, GNC beats x264 on dE00 on all three sequences while
 sitting **7.4–8.8 dB behind on luma**. The two codecs allocate rate differently between luma and
 chroma, so part of the +90.5% luma gap may be an allocation *choice* rather than a coding
@@ -505,6 +506,51 @@ free 15% rate saving, and reversed sign once measured with a chroma-aware metric
 VMAF is luma-only *and* saturated above q=85, so it is doubly blind here. Judge on Y-PSNR and
 CIEDE2000 together, at matched rate — a fixed-q point measurement always flatters whichever arm
 spends more bits.
+
+---
+
+**Answered 2026-09-06. Yes there is a frontier, it is steep, and the default sat off it — but it
+is an intra lever, so it does not touch the +90.5% video gap.**
+
+BD-rate against the shipped policy, four images x q=75/85/92/96, luma in YCoCg-R, colour as dE00:
+
+| weight | luma BD-rate | colour BD-rate | exchange rate |
+|---|---|---|---|
+| **1.2** | **−5.2%** | **+1.2%** | **4.3:1** |
+| 1.5 | −12.9% | +4.0% | 3.2:1 |
+| 2.0 | −21.8% | +9.7% | 2.2:1 |
+| 3.0 | −32.0% | +22.2% | 1.5:1 |
+
+Monotone on all four images. Weight 1.5 is **+1.28 dB at matched rate** against a 0.5 dB criterion,
+so the luma side of the hypothesis holds easily — but it pays by losing MEAS-8's "95% of pixels
+under the JND" on two of four images at q=96. **1.2 is the largest weight that costs nothing
+there**, so that is what shipped: `chroma_weight` no longer drops to 1.0 above q=85.
+
+**The criterion as written was not testable.** It said "mean dE00 below x264's (0.611–0.949)", but
+those are 4:2:0 *video* figures and this sweep is 4:4:4 *stills* — not comparable. MEAS-8's
+internal criterion was substituted.
+
+**Why it does not help the video gap — the control that settles it.** First guess was the chroma
+format; wrong:
+
+| configuration | weight 2.0 vs shipped |
+|---|---|
+| 4:4:4 stills | ≈ −25% |
+| 4:4:4 video, all-intra (ki=1) | **−20.8%** |
+| 4:4:4 video, P-chain (ki=9) | **−2.9%** |
+| 4:2:0 video, P-chain (ki=9) | −1.5% |
+
+It is **inter**. After motion compensation there is almost no chroma residual left to coarsen, so
+the effect lives in I-frames and is diluted sevenfold by the P-chain. At q=92 4:2:0, luma moves
+**0.01 dB** across the knob's whole useful range. **So the +90.5% is genuine luma coding deficit,
+not an allocation artefact, and intra is the only route** — established by elimination rather than
+assumption. The lever stays real for all-intra 4:4:4/4:2:2 contribution modes, which are not a
+corner case for this codec.
+
+**Two measurement errors caught, both in my own harness.** BT.709 Y from decoded RGB is
+contaminated by chroma error and overstated the luma loss **3.7x** (−0.56 vs −0.15 dB); luma is now
+taken in YCoCg-R. And VMAF read **97.08 before and after** the shipped change, on 6% fewer bits —
+the same illusion that made the 2026-09-05 sweep look like a free 15%.
 
 ### BUG-14 — Huffman's stream mapping has BUG-11 (todo, P4)
 `huffman_encode.wgsl`, `huffman_decode.wgsl` and `huffman_histogram.wgsl` all carry the same

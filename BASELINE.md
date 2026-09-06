@@ -41,7 +41,7 @@ Re-measured 2026-09-06 after BUG-6 made 5 wavelet levels the default at q ≥ 25
 | 25  | 35.51 dB | 1.60 | 90.25 | 5 |
 | 50  | 40.30 dB | 2.73 | 95.02 | 5 |
 | 75  | 44.84 dB | 4.53 | 96.58 | 5 |
-| 90  | 50.41 dB | 8.58 | 97.08 | 5 |
+| 90  | 50.06 dB | 8.07 | 97.08 | 5 |
 
 **PSNR figures recorded before BUG-8 (2026-09-06) are not comparable to these.** The metric used
 to compare the encoder's `f32` reconstruction; it now compares what the decoder actually emits,
@@ -53,6 +53,20 @@ either direction, this is why; re-measure rather than reconciling.
 
 The bpp column dropped again with GP17 (Rice-coded stream-length tables, 2026-09-06) at
 **bit-identical output** — PSNR and VMAF are unchanged by construction, only the headers shrank.
+
+**The q=90 row moved again with CHROMA-1 (2026-09-06): 50.41 → 50.06 dB, 8.58 → 8.07 bpp.**
+`chroma_weight` now stays at 1.2 above q=85 instead of dropping to 1.0, which the sweep showed was
+the wrong direction — **−5.2% luma BD-rate for +1.2% on colour**, a 4.3:1 trade. This is a move
+along the RD curve, not a regression: most of that 0.35 dB is chroma leaking into an RGB metric,
+and the codec's own YCoCg-R luma moves **0.055 dB** while dE00 goes 0.325 → 0.353 mean and
+0.721 → 0.772 p95, both far under the JND. q=25/50/75 are untouched (they already used 1.2 or
+higher) — q=75 re-measured at 44.84 dB / 4.53 bpp, identical to the row above, as a control.
+
+**And note what VMAF did: nothing.** 97.08 before, 97.08 after, on 6% fewer bits. VMAF is luma-only
+and saturated here, so judged on it alone this change reads as a free 6% rate saving with no cost
+whatsoever. That is the same illusion that made a 2026-09-05 `chroma_weight` sweep look like a free
+15% before a chroma-aware metric reversed its sign. **A VMAF-only verdict on anything touching
+chroma is worthless**, and above q=85 a VMAF verdict on anything at all is close to it.
 
 Against the 2026-09-05 rows, **q=25 moved to a different operating point** — 1.89 → 1.60 bpp
 (−15%) for −0.77 VMAF. A VMAF drop that arrives with a 15% rate drop is a move along the RD curve,

@@ -7868,3 +7868,58 @@ recorded here so the next person does not rediscover the crash and assume it is 
 ENT-1 itself stands: −16.6% on the rANS coder for no quality change. What it did *not* do is
 change which coder the codec should use — and knowing that costs nothing further, because the
 comparison was exact rather than a sweep.
+---
+
+## 2026-09-06 — LOSSLESS-1 gate passes: 10–26% available, but it costs the parallelism
+
+### The gate
+
+`scripts/lossless_gate.py`. MED / LOCO-I per-pixel prediction in GNC's own reversible YCoCg-R
+colour space, then zeroth-order entropy of the residual. **Calibrated against FFV1's real output
+on the same image**, so the model's optimism is measured rather than assumed:
+
+| image | GNC q=100 | FFV1 real | MED+H₀ model | model vs GNC | model vs FFV1 |
+|---|---|---|---|---|---|
+| touchdown | 2 973 449 | 2 267 744 | 2 391 101 | **−19.6%** | +5.4% |
+| bbb | 3 227 179 | 2 494 733 | 2 921 462 | **−9.5%** | +17.1% |
+| blue_sky | 2 747 082 | 1 760 498 | 2 028 036 | **−26.2%** | +15.2% |
+| kristensara | 1 061 563 | 795 135 | 848 860 | **−20.0%** | +6.8% |
+
+**The calibration is the load-bearing part.** The model lands 5–17% *above* FFV1's real file, so it
+is conservative, not optimistic — FFV1 beats zeroth-order entropy because it adds context modelling
+and adaptive Golomb coding, neither of which the model has. LOOP.md's standing warning is that
+offline models *understate* the real coder, and here that is visible in the numbers.
+
+So the mechanism is worth **10–26%** at lossless as modelled, and plausibly more implemented.
+**Gate passes.**
+
+(GNC's lossless figures are ~5% smaller than this morning's — the entropy work landed by other
+sessions since. Measured in a worktree pinned to one commit, so the columns are internally
+consistent.)
+
+### The cost the gate does not price: parallelism
+
+MED predicts from the left, above and upper-left *reconstructed* neighbours. The decoder therefore
+cannot produce pixel (x, y) before (x−1, y). **That is a serial dependency per pixel, and it is
+exactly what GNC's architecture is built to avoid.** It is also why FFV1 is CPU-bound and why
+GPU-native lossless codecs are rare.
+
+It is not fatal, and the two standard escapes both apply here:
+
+- **Slices/tiles.** FFV1 has slices for this reason; GNC already has 256×256 independent tiles, so
+  the coarse parallelism is free.
+- **Wavefront.** Within a tile, anti-diagonals are independent, giving O(w + h) sequential steps
+  instead of O(w·h) — for a 256×256 tile, 511 steps of up to 256 lanes each rather than 65 536
+  serial steps.
+
+But a wavefront is a materially different parallelism profile from the current
+one-thread-per-coefficient design, and "massively GPU-parallel" is the project's core claim
+(GOALS §1). **The next gate is throughput, not compression:** implement the MED decode wavefront in
+a shader and measure decode fps against the current path before committing to a second coding path.
+If the wavefront costs more fps than the 10–26% is worth at the contribution operating point, this
+stays on the shelf.
+
+### Status
+
+LOSSLESS-1 moves from "untested hypothesis" to "compression gate passed, throughput gate pending".
+It is the only lever this week that has passed a gate rather than failing one.

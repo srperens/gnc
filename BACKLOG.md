@@ -268,6 +268,69 @@ so the inter dead-zone doubling was live where at q=99 it is not. Re-check befor
 byte-identical frames at qstep 0.25 and check whether the reconstruction is bit-exact. That
 separates precision from prediction in one run. Full measurement in RESEARCH_LOG 2026-09-06.
 
+### BUG-11 — Rice's stream mapping hardcodes tile width 256 (todo, **P1**)
+Rice maps coefficient *i* to stream `i % 256`. At tile width 256 each stream is exactly one tile
+column, so the previous symbol in a stream is the pixel above — the property the vertical-context
+result (−11.7%) calls free. At any other width the modulus interleaves spatially distant columns
+into one stream and the adaptive *k* tracks a mixture.
+
+Measured 2026-09-06 (worktree `d3744f5`, padding-neutral crops): across the q=20/q=25 coder switch
+the tile-size effect **reverses sign** on all four images — rANS gains 14–20% going from 256 to 512
+px tiles, Rice loses 15–22% — at PSNR matched to 0.04 dB. See RESEARCH_LOG, "Tile size: hypothesis
+falsified".
+
+Two consequences. **Every tile-size experiment in this repo, #47 included, was measured through a
+coder that penalises the larger-tile arm** — those results do not bound what the geometry is worth.
+And any future tile-size change is blocked behind this.
+
+Fix: make the mapping tile-width-aware, so a stream is one column at any width (or a contiguous
+column, if the stream count must stay at 256). Then re-run the tile-size sweep.
+
+### ENT-1 — Per-tile frequency tables cost about 9% of the file at 1 bpp (todo, P1)
+Fell out of the tile-size measurement. On the rANS path, bbb at q=20, quadrupling tile area (256 →
+512 px, so 4x fewer tables per coefficient) saves **14.2%** with per-subband tables and only
+**5.5%** with a single table per tile. About 9 points of that is table overhead rather than
+transform continuity.
+
+The tables are being amortised by geometry, which is the wrong lever — the geometry is worth ~5%
+and is blocked behind BUG-11, while the tables can be attacked directly: share them across tiles
+within a plane, or code them differentially against a neighbour or a default. JPEG 2000 and the
+video codecs both do a version of this. Worth more than the experiment that found it.
+
+Caveat: single-table mode is a worse coder overall, so the 9/5 split is indicative, not exact.
+Measure properly before building.
+
+### BUG-12 — `--tile-size` cannot reach its own wavelet-level ceiling (todo, P3)
+`quality_preset` ends with `cfg.wavelet_levels = min(levels, cfg.max_wavelet_levels())`, computed
+against the **default** tile size. `main.rs` then sets `config.tile_size = tile_size` from the CLI,
+after the clamp has already run. So `--tile-size 512` is capped at 5 levels though a 512 px tile
+allows 6, and `GNC_WAVELET_LEVELS=6` is silently ignored with it.
+
+Harmless for the shipped presets (256 px everywhere) but it means every past `--tile-size`
+experiment ran with a hidden cap. Fix: re-derive the ceiling after the CLI overrides land.
+
+### BUG-11 — intra prediction produces corrupt output at every quality (todo, P1)
+`GNC_INTRA_PRED=1` (added 2026-09-06 to gate the lossless hypothesis) does not reconstruct
+correctly at any setting: max error 197-255 from q=50 to q=100, and at q=100 — where there is no
+quantiser and the transform is reversible — it loses 62 dB against a bit-exact baseline. PSNR sits
+at 33.9-38.3 dB and barely responds to q, which is a systematic reconstruction error rather than a
+coding cost.
+
+**The measurement that disabled this feature was measuring the bug.** 49.88 - 38.33 = 11.55 dB at
+q=90 against the recorded "-11.76 dB" behind `intra_prediction: false`. It is recorded as "the idea
+does not work"; what was shown is "the implementation does not work".
+
+**Where it is:** error accumulates toward the bottom-right of every 32x32 block (row 0 col 0: 6,
+row 31 col 31: 200), affecting 99.9% of blocks and 74.6% of pixels. That is the signature of an
+encoder/decoder mismatch in a sequential predictor -- encoder predicting from *original*
+neighbours, decoder from *reconstructed* ones -- so error compounds along both scan directions.
+First block row and column are also dirty, so it is not only boundary initialisation.
+
+**Blocks:** the lossless-prediction hypothesis (RESEARCH_LOG 2026-09-06). GNC loses to FFV1 by 27%
+and x264 `-qp 0` by 43% at q=100, and both win by decorrelating against the neighbour rather than
+the scale. Whether that transfers here is **untested, not refuted** — it cannot be measured until
+this reconstructs.
+
 ### BUG-9 — rANS panics below qstep 1.0 instead of rejecting the configuration (todo, P2)
 Panics with `range start index 4294963272 out of range for slice of length 5242880` at
 `rans_gpu_encode.rs:1813` in `pack_tiles`. Measured 2026-09-06: rANS OK at 2.0 and 1.5, panics at

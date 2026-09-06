@@ -7306,3 +7306,155 @@ code. The file records what is claimed, what each of today's changes invalidated
 measurement rules that have actually bitten us — measure against a commit, measure the range the
 project cares about, watch the metric's saturation, and never judge a rate/quality trade from a
 point measurement at fixed q.
+
+---
+
+## 2026-09-06 — Tile size: hypothesis falsified, and the entropy coder is why
+
+Proposed by the project owner as the untested structural candidate in the 89% of the JPEG 2000 gap
+that sits in transform/quantisation: JPEG 2000 codes 1080p as a single tile, GNC cuts it into
+256 px tiles, and the wavelet loses all correlation across every boundary.
+
+**Method.** Worktree pinned to `d3744f5` (COORDINATION rule 1), built separately from the shared
+checkout. Padding was the first confound and had to go: 1920x1080 with 512 px tiles pads to
+2048x1536 against 2048x1280 for 256 px, so the first run measured 20% more coded pixels rather
+than the transform. All figures below use centre crops of **1536x1024** (1024x512 for kristensara),
+which divide exactly by 128, 256 and 512. PSNR led above q=80 (COORDINATION rule 3); VMAF is
+reported and agreed everywhere it was not saturated.
+
+### 256 is a local optimum, and both directions are worse
+
+bpp at matched quality — PSNR within 0.07 dB and VMAF within 0.03 across each row:
+
+| image | q | 128 px | **256 px** | 512 px |
+|---|---|---|---|---|
+| bbb | 50 | 3.05 | **2.48** | 2.97 |
+| bbb | 70 | 4.38 | **3.77** | 4.35 |
+| bbb | 90 | 8.48 | **7.88** | 8.24 |
+| blue_sky | 70 | 3.57 | **3.07** | 3.59 |
+| touchdown | 70 | 3.99 | **3.45** | 3.88 |
+| kristensara | 70 | 3.05 | **2.48** | 2.93 |
+
+512 px costs **+9% to +21%**; 128 px costs +13% to +23%. Twelve of twelve points favour 256. The
+128 px arm carries a confound — a 128 px tile allows only 4 wavelet levels against 5 — but the
+512 px arm does not, and it is the one that tested the hypothesis.
+
+Deeper decomposition does not rescue it. A 512 px tile permits 6 levels; measured against 5 in the
+same build, 6 levels is **−0.3%**. (Side experiment only: reaching 6 levels needed a patch, and
+that patch also perturbed the subband weights, so only the within-build delta is usable.)
+
+### The sign flips with the entropy coder, not with the tile size
+
+The preset switches from rANS to Rice between q=20 and q=25. One step of q, the same content, the
+same tile geometry — and the tile-size effect reverses on all four images:
+
+| image | q=20, **rANS** 256 → 512 | q=25, **Rice** 256 → 512 |
+|---|---|---|
+| bbb | 1.15 → 0.99 = **−13.9%** | 1.48 → 1.80 = **+21.6%** |
+| blue_sky | 0.83 → 0.70 = **−15.7%** | 1.02 → 1.22 = **+19.6%** |
+| touchdown | 0.69 → 0.55 = **−20.3%** | 0.91 → 1.05 = **+15.4%** |
+| kristensara | 0.76 → 0.61 = **−19.7%** | 0.79 → 0.94 = **+19.0%** |
+
+PSNR matched to within 0.04 dB in every pair. **Bigger tiles are not the problem. Rice is.**
+
+**Why.** Rice maps coefficient *i* to stream `i % 256`. At tile width 256 that makes each stream
+exactly one tile column, so the previous symbol in a stream is the pixel directly above — the
+property the vertical-context result (−11.7%) depends on and calls free. At width 512, `i % 256`
+interleaves two columns 256 px apart into one stream, and the adaptive *k* then tracks an EMA over
+a mixture of two unrelated regions. The constant is a hidden assumption about tile width, not a
+stream count.
+
+### How much of the rANS gain is transform continuity? About a third of it.
+
+Per-tile frequency tables are the other thing a 4x larger tile amortises. Same image and quality,
+bbb q=20, tables per tile varied:
+
+| | 256 px | 512 px | gain |
+|---|---|---|---|
+| per-subband (10 tables/tile) | 226 819 B | 194 689 B | **−14.2%** |
+| single table per tile | 298 790 B | 282 245 B | **−5.5%** |
+
+With 4x fewer tables per coefficient the gain falls from 14.2% to 5.5%, so roughly **9 points of
+it was table overhead** and about 5% is transform continuity plus length-field amortisation. The
+single-table mode is a worse coder overall, so treat this as indicative rather than exact.
+
+**That reverses the priority.** Tile geometry is worth ~5%; the per-tile tables it was amortising
+are worth ~9% at this rate, and they can be attacked without touching the geometry at all —
+share tables across tiles, or code them differentially. That is a bigger prize than the thing
+this experiment set out to test.
+
+### Verdict
+
+**Do not change the tile size.** 256 px is where the current design is best, and the reasoning
+that motivated the experiment — fewer boundaries must mean fewer bits — is true only for a coder
+that does not hardcode the tile width. Three findings worth more than the hypothesis:
+
+1. **Rice's 256-stream mapping silently degrades at any tile width other than 256.** Filed as
+   BUG-11. It also means every past tile-size experiment in this log, #47 included, was measured
+   through a coder that penalises the arm being tested.
+2. **Per-tile frequency tables cost ~9% of the file at 1 bpp on the rANS path.** Filed as ENT-1.
+3. **`--tile-size` cannot reach its own level ceiling.** `quality_preset` clamps `wavelet_levels`
+   against the default tile size before the CLI applies `--tile-size`, so `--tile-size 512` is
+   capped at 5 levels and always has been. Filed as BUG-12.
+
+---
+
+## 2026-09-06 — BUG-11: intra prediction is broken, and the measurement that disabled it measured the bug
+
+### The gate, and why it could not answer its question
+
+The hypothesis was that spatial prediction is the lever FFV1 and x264-lossless use to beat GNC by
+27–43% at q=100, and that GNC's own intra prediction was rejected at the wrong operating point
+(measured on lossy content at −11.76 dB / +29% bitrate). Exposed it as `GNC_INTRA_PRED=1` and
+measured at q=100 on four images, both entropy coders.
+
+**It does not encode losslessly. It does not encode correctly at any quality.**
+
+| q | intra_pred=0 | intra_pred=1 |
+|---|---|---|
+| 50 | 39.24 dB, max_err 19 | 33.91 dB, **max_err 255** |
+| 75 | 43.92 dB, max_err 10 | 37.88 dB, **max_err 254** |
+| 90 | 49.88 dB, max_err 4 | 38.33 dB, **max_err 207** |
+| 100 | **lossless**, max_err 0 | 37.62 dB, **max_err 197** |
+
+PSNR with prediction on sits at 33.9–38.3 dB and barely responds to the quantiser — a hard ceiling,
+which is the signature of a systematic reconstruction error rather than a coding inefficiency. At
+q=100 there is no quantiser at all and it still loses 62 dB.
+
+**The historical measurement was measuring this.** 49.88 − 38.33 = 11.55 dB at q=90, against the
+recorded "−11.76 dB" that got `intra_prediction: false`. The feature was recorded as *the idea does
+not work*; what was measured is *the implementation does not work*. Those are different claims and
+only the second is supported.
+
+Files were also 3.5–8.8% larger with prediction on, but that number is meaningless while the
+output is corrupt.
+
+### Where the defect is
+
+Error distribution inside each 32×32 intra block (max over all 1 980 blocks, touchdown, q=100 —
+99.9% of blocks are affected and 74.6% of pixels are wrong):
+
+| | col 0 | col 1 | col 15 | col 30 | col 31 |
+|---|---|---|---|---|---|
+| row 0 | 6 | 6 | 7 | 10 | 10 |
+| row 2 | 5 | 4 | 5 | 9 | 9 |
+| row 15 | 8 | 8 | 10 | **175** | **175** |
+| row 31 | 10 | 10 | 15 | **202** | **200** |
+
+**The error accumulates toward the bottom-right of every block**, small at the top-left origin and
+growing along both scan directions. That is the classic signature of an encoder/decoder mismatch in
+a sequential predictor: the encoder predicting from *original* neighbours while the decoder
+predicts from *reconstructed* ones, so each predicted sample inherits its neighbours' error and it
+compounds down and right. The first block row and column are not clean either, so it is not purely
+a boundary-initialisation problem.
+
+### Status of the original hypothesis
+
+**Untested, not refuted.** Whether spatial prediction closes the 27–43% lossless gap cannot be
+determined until the implementation reconstructs correctly. Filed as **BUG-11**; the hypothesis
+stays open behind it.
+
+This is the fourth instance in two days of a conclusion resting on a measurement taken under
+conditions that did not support it (see TUNE-5, "inter saves 17–27%", BUG-10). The pattern here is
+narrower and worth naming separately: **a feature measured while broken, and recorded as an idea
+that failed.**

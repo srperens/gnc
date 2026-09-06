@@ -746,6 +746,12 @@ pub fn quality_preset(q: u32) -> CodecConfig {
         use_fused_quantize_histogram: true, // auto-disabled when CfL is active
         transform_type: TransformType::Wavelet, // block DCT opt-in via config override
         dct_freq_strength: 7.0,
+        // Intra prediction is off by default: measured at -11.76 dB / +29% bitrate on lossy
+        // content, where the wavelet has already removed most of the correlation a predictor
+        // would find. That measurement says nothing about q=100, where there is no quantiser,
+        // the transform is reversible, and prediction is exactly the tool FFV1 and x264-lossless
+        // use to beat this codec by 27-43%. GNC_INTRA_PRED=1 exposes it for measurement.
+        intra_prediction: std::env::var("GNC_INTRA_PRED").map(|v| v == "1").unwrap_or(false),
         // Hierarchical B-pyramid off by default, on two independent measurements (2026-09-06).
         //
         // Rate: at matched VMAF the pyramid costs *more* than P-only coding on every camera

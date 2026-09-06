@@ -3376,6 +3376,47 @@ fn test_entropy_coder_follows_quality() {
     }
 }
 
+/// A 10-bit encode must survive the decoder's output path.
+///
+/// The CLI decoded every frame at 8 bits regardless of what it was coded at, so a 10-bit encode
+/// was truncated on the way out and the extra precision was thrown away at the last step. The
+/// codec itself was fine — only the write was lossy. MEAS-8 showed 8-bit is what limits GNC's
+/// colour fidelity, so silently truncating defeats the point of having 10-bit at all.
+#[test]
+fn test_10bit_survives_the_frame_header() {
+    let ctx = crate::GpuContext::new();
+    let mut encoder = EncoderPipeline::new(&ctx);
+
+    let w = 256u32;
+    let h = 256u32;
+    // A smooth ramp over the full 10-bit range: the case 8 bits cannot represent.
+    let mut rgb = Vec::with_capacity((w * h * 3) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            let a = x as f32 * 1023.0 / (w - 1) as f32;
+            let b = y as f32 * 1023.0 / (h - 1) as f32;
+            rgb.push(a);
+            rgb.push(b);
+            rgb.push((a + b) * 0.5);
+        }
+    }
+
+    let mut config = crate::CodecConfig::default();
+    config.bit_depth = 10;
+    let compressed = encoder.encode(&ctx, &rgb, w, h, &config);
+
+    assert_eq!(
+        compressed.info.bit_depth, 10,
+        "encoder dropped the bit depth from the frame header",
+    );
+    let bytes = crate::format::serialize_compressed(&compressed);
+    assert_eq!(
+        crate::format::deserialize_compressed(&bytes).info.bit_depth,
+        10,
+        "bit depth did not survive the bitstream",
+    );
+}
+
 #[test]
 fn test_pframe_yuv422_sequence_roundtrip() {
     let (psnr1, psnr2) = pframe_chroma_sequence_psnr(crate::ChromaFormat::Yuv422);

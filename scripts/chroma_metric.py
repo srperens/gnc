@@ -116,11 +116,28 @@ def ciede2000(lab1, lab2):
     )
 
 
-def compare(ref_path, dist_path):
+def load_rgb(path):
+    """Load an 8- or 16-bit RGB PNG and return values on a 0-255 scale.
+
+    16-bit files must not go through `convert("RGB")` — that truncates to 8 bits and silently
+    destroys exactly the precision a 10-bit encode exists to preserve.
+    """
     from PIL import Image
 
-    a = np.asarray(Image.open(ref_path).convert("RGB"), dtype=np.float64)
-    b = np.asarray(Image.open(dist_path).convert("RGB"), dtype=np.float64)
+    im = Image.open(path)
+    a = np.asarray(im)
+    if a.dtype == np.uint16:
+        # GNC writes 10-bit samples in the high bits of 16-bit channels.
+        return a.astype(np.float64) / 65535.0 * 255.0
+    if im.mode != "RGB":
+        im = im.convert("RGB")
+        a = np.asarray(im)
+    return a.astype(np.float64)
+
+
+def compare(ref_path, dist_path):
+    a = load_rgb(ref_path)
+    b = load_rgb(dist_path)
     if a.shape != b.shape:
         h = min(a.shape[0], b.shape[0])
         w = min(a.shape[1], b.shape[1])

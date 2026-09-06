@@ -4903,3 +4903,42 @@ floor while the pipeline is 8-bit.
    FMT-1 well above the tuning work.
 3. The 8-bit floor also bounds what any future chroma work can be worth, which retires a class of
    experiment before it is run.
+
+## 2026-09-06 — FMT-1: the 10-bit still path was truncating on output
+
+MEAS-8 made bit depth the first-order problem, so FMT-1 first. The encode side already accepted
+`--bit-depth 10` and the bitstream already carried it (byte 12 of the frame header reads 10). The
+**decoder wrote 8-bit PNGs regardless**: `decode`, the GNV2 sequence path and the GNV1 sequence
+path all called `save_image_rgb_f32`, which hardcodes 8, rather than the `_bits` variant that was
+sitting next to it. So a 10-bit encode was truncated at the very last step and the whole path was
+pointless end to end.
+
+All three call sites now pass the frame's own bit depth. Verified: the decoded PNG's IHDR reads
+bit depth 16, colour type 2, and a 10-bit q=100 round-trip is **bit-exact** (max abs diff 0 over
+1.5M samples).
+
+**Measured benefit**, on a smooth 10-bit gradient — the case 8 bits cannot represent — with the
+true 10-bit source as reference:
+
+| | size | dE00 mean | p95 |
+|---|---|---|---|
+| 8-bit source, no coding at all | — | 0.1624 | 0.3323 |
+| 8-bit pipeline, q=92 | 27 153 | 0.1669 | 0.3444 |
+| **10-bit pipeline, q=92** | 39 285 | **0.0028** | **0.0000** |
+
+The 8-bit *pipeline* is barely worse than 8-bit *truncation alone* (0.1669 against 0.1624) — the
+coding contributes almost nothing to the error, the format does. At 10 bits the same encode is
+58x more accurate for 45% more bits.
+
+### Tooling this needed
+
+`scripts/png16.py` reads and writes 16-bit RGB PNGs, because **Pillow can do neither**: it has no
+16-bit-per-channel RGB mode, and it silently truncates such files to 8 bits on open. Measuring a
+10-bit pipeline through Pillow would have shown no benefit at all and looked like a codec failure.
+The reader implements all five PNG filter types — the `image` crate writes Paeth, so filter 0
+alone was not enough. `scripts/chroma_metric.py` now uses it, so dE00 can be measured at 10 bits.
+
+Guarded by `test_10bit_survives_the_frame_header`.
+
+**Still open in FMT-1:** `encode-sequence` has no bit-depth option, so the video path — the one
+the contribution market actually requires — remains 8-bit.

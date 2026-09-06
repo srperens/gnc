@@ -187,12 +187,20 @@ and there are no users — and expensive once there is a spec, conformance strea
 Not a research item: buffer formats, upload/download paths, PNG/Y4M I/O, bitstream fields, and the
 VMAF/PSNR comparison harness at 10-bit. No f64 needed; 10-bit fits f32/i32 comfortably.
 
-**Partly present already (verified 2026-09-05).** `gnc encode` accepts `--bit-depth 10` and the
-still-image encode/decode round-trip runs. **`gnc encode-sequence` has no bit-depth option at
-all**, so the video path — the one the market actually requires — is 8-bit. Scope is therefore
-"extend the existing still-image 10-bit path through the sequence pipeline and container", not
-"implement 10-bit from scratch". Verify the still path is genuinely 10-bit end to end (the decoded
-PNG's actual bit depth was not confirmed) before relying on it.
+**Still-image path fixed 2026-09-06.** The decoder wrote 8-bit PNGs regardless of what the frame
+was coded at — all three call sites used `save_image_rgb_f32` (hardcoded 8) rather than the
+`_bits` variant beside it — so a 10-bit encode was truncated at the last step. Fixed; the decoded
+PNG now reads IHDR bit depth 16 and a 10-bit q=100 round-trip is bit-exact. On a smooth 10-bit
+gradient the 10-bit path measures dE00 0.0028 against the 8-bit path's 0.1669, for 45% more bits.
+Guarded by `test_10bit_survives_the_frame_header`.
+
+Needed `scripts/png16.py`, since Pillow can neither write nor read 16-bit RGB PNGs (it truncates
+silently on open) — without it the measurement would have shown no benefit and looked like a
+codec failure.
+
+**Remaining: `gnc encode-sequence` has no bit-depth option**, so the video path — the one the
+market actually requires — is still 8-bit. Scope is "extend the working still-image 10-bit path
+through the sequence pipeline and container", not "implement 10-bit from scratch".
 
 **External requirement, confirmed 2026-09-05.** EBU R 153 specifies 10-bit 4:2:2 Y'C'BC'R for live
 UHD/HDR contribution and forbids SDR transfer functions; EBU TR 091's entire codec test matrix is

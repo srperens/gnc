@@ -15,7 +15,7 @@ use gnc::format::{
     deserialize_temporal_sequence, seek_to_keyframe, serialize_compressed, serialize_sequence,
     serialize_temporal_sequence,
 };
-use gnc::image_util::{load_image_rgb_f32, load_image_rgb_f32_bits, parse_chroma_format, parse_wavelet_type, save_image_rgb_f32};
+use gnc::image_util::{load_image_rgb_f32, load_image_rgb_f32_bits, parse_chroma_format, parse_wavelet_type, save_image_rgb_f32_bits};
 use gnc::{
     CodecConfig, CompressedFrame, EntropyData, FrameType, GpuContext, RateMode, TemporalTransform,
 };
@@ -1032,11 +1032,16 @@ fn main() {
             let decoder = DecoderPipeline::new(&ctx);
 
             let rgb_data = decoder.decode(&ctx, &compressed);
-            save_image_rgb_f32(
+            // Write at the bit depth the frame was coded at. Writing 8-bit unconditionally threw
+            // away the extra precision a 10-bit encode had just preserved, which made the 10-bit
+            // path pointless end to end (MEAS-8: 8-bit is what limits colour fidelity, not the
+            // codec, so truncating on output defeats the reason for having 10-bit at all).
+            save_image_rgb_f32_bits(
                 &output,
                 &rgb_data,
                 compressed.info.width,
                 compressed.info.height,
+                compressed.info.bit_depth,
             );
             println!("Decoded to {}", output);
         }
@@ -3093,9 +3098,10 @@ fn main() {
                 // Write output frames
                 let width = seq.groups[0].low_frame.info.width;
                 let height = seq.groups[0].low_frame.info.height;
+                let bit_depth = seq.groups[0].low_frame.info.bit_depth;
                 for (i, rgb_f32) in decoded_frames.iter().enumerate() {
                     let out_path = format!("{}_{:04}.png", output, i);
-                    save_image_rgb_f32(&out_path, rgb_f32, width, height);
+                    save_image_rgb_f32_bits(&out_path, rgb_f32, width, height, bit_depth);
                     println!("  Wrote frame {} → {}", i, out_path);
                 }
             } else if magic == b"GNV1" {
@@ -3181,6 +3187,8 @@ fn main() {
                         })
                         .collect();
                     let decoded = decoder.decode_sequence(&ctx, &compressed);
+                    // The GNV1 header carries no bit depth, but every frame does.
+                    let bit_depth = compressed.first().map_or(8, |f| f.info.bit_depth);
 
                     for (k, rgb_data) in decoded.iter().enumerate() {
                         let abs_idx = start_frame + s + k;
@@ -3192,11 +3200,12 @@ fn main() {
                         if should_output {
                             let frame_path =
                                 output.replace("%04d", &format!("{:04}", abs_idx));
-                            save_image_rgb_f32(
+                            save_image_rgb_f32_bits(
                                 &frame_path,
                                 rgb_data,
                                 header.width,
                                 header.height,
+                                bit_depth,
                             );
                             output_count += 1;
                         }

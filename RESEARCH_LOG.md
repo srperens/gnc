@@ -7868,6 +7868,7 @@ recorded here so the next person does not rediscover the crash and assume it is 
 ENT-1 itself stands: −16.6% on the rANS coder for no quality change. What it did *not* do is
 change which coder the codec should use — and knowing that costs nothing further, because the
 comparison was exact rather than a sweep.
+
 ---
 
 ## 2026-09-06 — LOSSLESS-1 gate passes: 10–26% available, but it costs the parallelism

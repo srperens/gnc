@@ -323,7 +323,15 @@ same expanded buffers.
 **Tables 65–82% smaller; the file 11.7–26.6% smaller, mean −16.6%, at bit-identical quality.**
 Four images, q=50 and q=70. On the preset path (rANS at q ≤ 20) it is −4.5%.
 
-**Follow-up (open, P1): re-sweep the Rice/rANS crossover.** rANS is pinned to q ≤ 20 because Rice
+**Follow-up: DONE 2026-09-06 — the crossover stays where it is.** Re-swept on four images at
+q=25/40/55/70, exactly rather than by BD-rate (both coders quantise identically and entropy coding
+is lossless, so equal q is matched quality — verified end to end, bbb q=70 reads PSNR 44.25 under
+both). rANS went from 15–25% behind Rice to level or ahead on three of four images: mean −1.9% at
+q=70, but that is touchdown at −7.8% pulling three flat ones, kristensara regresses 1.2–6.3%
+everywhere, rANS costs ~15% decode (TUNE-3), and it crashes on every image from q=80 up (BUG-9).
+A content bet that is slower and cannot run at the operating point is not a new default.
+
+**Original follow-up text:** rANS is pinned to q ≤ 20 because Rice
 measured better above it. With the tables packed, rANS at q=70 is level with Rice on bbb, ahead on
 blue_sky (3.04 vs 3.07) and touchdown (3.18 vs 3.45), and 1% behind on kristensara — where it used
 to be 15–25% behind everywhere. The crossover was measuring table overhead, not the coder. Verify
@@ -424,10 +432,25 @@ The rANS fused histogram shader (`quantize_histogram_fused.wgsl`) has the same s
 streams, but rANS *gains* 14–20% at tile 512, so its ordering is not costing it the same way. Not
 filed as a bug — noted so nobody mistakes it for one.
 
-### BUG-9 — rANS panics below qstep 1.0 instead of rejecting the configuration (todo, P2)
-Panics with `range start index 4294963272 out of range for slice of length 5242880` at
-`rans_gpu_encode.rs:1813` in `pack_tiles`. Measured 2026-09-06: rANS OK at 2.0 and 1.5, panics at
-1.0; Rice is fine to at least 0.5.
+### BUG-9 — rANS overflows its per-stream buffer at fine quantiser steps (**diagnosed, guard landed; full fix deliberately not done**, P3)
+The host now catches it and says so — `rANS stream 320 overflowed its 4096-byte output slot` —
+instead of panicking on a raw slice index. That is the right amount of fixing; see below.
+
+**The threshold recorded here was wrong and understated it.** "OK at qstep 2.0 and 1.5, panics at
+1.0" came from `-q 15 --qstep 1.0`, whose preset carries 4 wavelet levels, different subband
+weights and a different dead zone. In the **default** configuration bbb survives q=78
+(qstep 3.594) and fails at q=80 (qstep 3.347) — it breaks at three times the recorded step. The
+limit is a function of the whole configuration, not of qstep, so a static qstep guard would be the
+wrong fix and a fallback keyed on one would misfire.
+
+**Consequence:** rANS cannot be measured at all from q=80 up, which is the contribution operating
+point. Reaching it means threading a runtime buffer size through three encode shaders and six
+allocation sites, the way Rice already sizes its own from qstep (`max_stream_bytes_for_tile`).
+
+**Not doing it, on purpose.** The crossover re-sweep (below) says nobody wants what it would buy:
+rANS is 1.9% smaller than Rice at q=70 on the mean of four images, regresses up to 6% on one of
+them, and costs ~15% decode throughput. Recorded so the next person does not rediscover the crash
+and assume the fix is cheap.
 
 **Repro line corrected.** `--qstep 1.0 --rans` does *not* reproduce it — `--rans` is a no-op flag
 kept for backward compatibility, so that command encodes with Rice and succeeds. rANS is reached

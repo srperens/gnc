@@ -348,6 +348,24 @@ number until BUG-5 is resolved.
 matter for broadcast contribution. Needs a decision on the default, and probably a smarter rule
 than a fixed interval — e.g. never emit a group too short for a full pyramid.
 
+### MEAS-8 — What quality does colour fidelity actually require? (todo, P2)
+Measured while settling `chroma_weight`: at the current default, mean CIEDE2000 sits at
+**1.0–1.5 across q = 30–70** on bbb and kristensara — at or above the nominal just-noticeable
+difference of 1. Only bbb at q=70 (0.77) is comfortably below.
+
+GNC is positioned as a contribution codec, and contribution feeds grading and further processing,
+where colour fidelity has to survive. So the operating point is not a free choice: the codec needs
+a documented minimum q for colour error below JND, per content class. Present evidence suggests
+roughly q≥70 for easy content and higher for faces, but that is two images.
+
+Measure across the full test set with `scripts/chroma_metric.py`, then state the floor in GOALS.
+
+### Chroma weight — settled, do not re-sweep on VMAF alone
+Raising `chroma_weight` from 1.3 to 2.0 or 3.0 moves bits from chroma to luma: at matched rate,
+VMAF rises 0.26–1.27 and dE00 worsens 0.013–0.141. A genuine trade, not the free 15% a VMAF-only
+sweep suggested. **Left at 1.3** — contribution feeds downstream grading, so trading colour
+fidelity for luma sharpness is the wrong direction for this market.
+
 ### MEAS-1 — Correct video comparison GNC vs H.264 (**DONE 2026-09-05**)
 Harness: `scripts/meas1_vs_h264.py`. VMAF-scored, one normalised reference for both codecs,
 BD-rate over the overlapping quality range. 1080p 4:2:0, x264 at defaults.

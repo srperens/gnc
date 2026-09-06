@@ -4814,3 +4814,36 @@ which is what a chroma parameter needs in order to be tuned at all.
 Two false starts on the way, both mine: the first validation run reported 2/8 mismatches, which
 turned out to be two mis-transcribed expected values rather than implementation errors, and the
 implementation was correct throughout.
+
+---
+
+## 2026-09-06 — Chroma weight settled: a real trade, and the wrong one for a contribution codec
+
+With CIEDE2000 available, the `chroma_weight` question from yesterday can finally be answered.
+Swept w = 1.3 (current) / 2.0 / 3.0 across q = 30…70 on two images, comparing each against the
+q-ladder at *matched rate* — so the question is not "does raising w save bits" (it does) but
+"does it beat simply lowering q".
+
+At matched rate, relative to w = 1.3:
+
+| image | w | dE00 | VMAF |
+|---|---|---|---|
+| bbb | 2.0 | **+0.015 to +0.029** | +0.41 to +0.76 |
+| bbb | 3.0 | **+0.091 to +0.107** | +0.66 to +1.27 |
+| kristensara | 2.0 | **+0.013 to +0.064** | +0.26 to +0.63 |
+| kristensara | 3.0 | **+0.063 to +0.141** | +0.40 to +1.06 |
+
+So it is a genuine trade and not a free win: bits move from chroma to luma, VMAF rises, colour
+error rises. Yesterday's VMAF-only sweep saw only the first half of that and called it 15% free.
+
+**Decided against raising it.** Not because the trade is bad in the abstract — at w=2.0,
++0.5 VMAF for +0.03 dE00 is arguably favourable — but because of what GNC is for. GOALS §1 states
+a contribution codec, and contribution feeds grading and further processing downstream, where
+colour fidelity is the thing that must survive. Trading it for luma sharpness is the wrong
+direction for that market, whatever a luma-weighted metric says.
+
+**A more useful finding fell out of the same data.** At the current default, mean dE00 sits at
+**1.0–1.5 across q = 30–70** — at or above the nominal just-noticeable difference of 1. Only bbb
+at q=70 (0.77) is comfortably below it. For a codec positioned on contribution that is the
+operating-point question worth asking: *what q does GNC need for colour error below JND?* On this
+evidence, roughly q≥70 for easy content and higher for faces. Logged as MEAS-8.

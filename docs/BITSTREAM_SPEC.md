@@ -31,8 +31,9 @@ since GPC8 is gated on `gen >= N`; adding a generation is one entry in that tabl
 | 20 | 4 | f32 | qstep | Quantization step size |
 | 24 | 4 | f32 | dead_zone | Dead zone width for quantization |
 | 28 | 4 | u32 | wavelet_levels | Number of wavelet decomposition levels |
-| 32 | 1 | u8 | wavelet_type | 0 = LeGall 5/3, 1 = CDF 9/7 |
-| 33 | 1 | u8 | per_subband | 0 = off, 1 = per-subband entropy coding |
+| 32 | 1 | u8 | wavelet_type | 0 = LeGall 5/3, 1 = CDF 9/7 (ignored when transform_type = 2) |
+| 33 | 1 | u8 | transform_type | 0 = wavelet, 1 = block DCT-8×8, 2 = MED prediction (lossless) |
+| 34 | 1 | u8 | per_subband | 0 = off, 1 = per-subband entropy coding |
 
 **Derived values:**
 - `tiles_x = ceil(width / tile_size)`
@@ -435,6 +436,27 @@ To seek to time T: compute `gop_index = T / gop_size`, find the lowpass frame (f
 **CDF 9/7** (lossy modes, q=1-99):
 - Floating-point lifting steps
 - 4 vanishing moments, better energy compaction
+
+**MED prediction (`transform_type = 2`).** The lossless path replaces the wavelet entirely. Each
+sample is predicted from its already-coded neighbours with the LOCO-I median edge detector, and
+the residual is entropy-coded directly:
+
+```
+a = left, b = above, c = above-left        (all within the same tile)
+pred = min(a,b)   if c >= max(a,b)
+       max(a,b)   if c <= min(a,b)
+       a + b - c  otherwise
+residual = sample - pred
+```
+
+At a tile's origin `pred = 0`; on its top row `pred = a`; in its left column `pred = b`.
+**Prediction resets at every tile boundary**, so tiles remain independently decodable. There are
+no subbands, so `wavelet_levels` is 0 and the entropy coder sees a single group. The colour
+transform is the reversible YCoCg-R, as for wavelet lossless.
+
+Decoding is inherently sequential within a tile — sample (x,y) needs (x-1,y) and (x,y-1) — so a
+GPU decoder marches anti-diagonals: every sample on diagonal *d* depends only on *d-1* and *d-2*,
+so a whole diagonal decodes in parallel.
 
 **Decomposition depth.** The transform runs per tile, so each level halves the tile; a 256 px tile
 allows at most 5 levels before the LL band gets too small for per-subband statistics to mean

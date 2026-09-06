@@ -1333,10 +1333,17 @@ abac_entropy`, the bracket collapses:
 | **Range** | 27.5 − 14.0 + 33.0 = **46.5 ms** | **1.69×** | −16.7% mean |
 | Interval | 27.5 − 14.0 + 96.3 = **109.8 ms** | 3.99× | −14.5% |
 
-**The decision is ~16.7% of rate for ~1.65-1.7× frame decode.** A real trade with no obviously
-right answer — it turns on whether GNC sells bitrate or streams-per-GPU, which is
-docs/POSITIONING.md's question, not an engineering one. Recommended configuration if taken up:
-**Range at cb=64**, which dominates every other cell measured.
+**The decision is ~16.7% of rate for ~1.65-1.7× frame decode.** Under GOALS §5 "form first, then
+speed" (owner, 2026-09-06) that resolves in favour of **keeping it**: during the form phase a
+change that closes a real compression gap is worth taking even when it costs decode time, because
+a fast architecture that is behind on compression is the harder problem to fix afterwards. The
+1.69× is therefore **logged throughput debt**, not a veto — it goes on the list the later
+performance push works from, with a measured cost rather than a re-measurement project.
+
+Recommended configuration if taken up: **Range at cb=64**, which dominates every other cell
+measured. Still outstanding before it could ship: bitstream integration (a GP18 generation with
+`EntropyCoder::Abac`, per-block length fields, block size in the tile header) and inter frames —
+all of the above is intra, and residual statistics differ.
 
 Also fixed the measurement method itself: three consecutive processes on identical input read
 66.5 / 45.3 / 34.9 ms on an *idle* machine — the GPU's clock ramp, not load. `abac_bench` now uses

@@ -198,6 +198,29 @@ reach H.264-class compression. That remains the reference point for where the in
 
 **Correctness over speed.** A codec with subtle bugs is worthless. Verify every change end-to-end. A fast encoder that produces subtly wrong output is not a working encoder.
 
+**Form first, then speed — but speed is not optional (owner, 2026-09-06).** The codec has to end up
+*ruthlessly* fast; that is a headline property, not a nice-to-have. Right now, though, the binding
+constraint is the shape of the thing: the algorithms, the design, and the measured gaps against
+H.264/H.265 (§4). So the sequencing is deliberate:
+
+- **Now:** close the gaps. Get the algorithms and the design right. A change that closes a real gap
+  is worth taking even if it costs decode time, because an architecture that is fast and behind on
+  compression is the harder of the two problems to fix later — you cannot optimise your way to a
+  better transform or a better predictor.
+- **Later, as a first-class push:** performance. Not incidental tuning — a dedicated effort with
+  its own targets, against real profiling, on an idle machine.
+
+Two standing consequences:
+
+1. **Do not reject a design win purely on throughput while we are in the "form" phase.** Record the
+   cost honestly, in a comparable unit, and keep the option. The abac entropy coder is the worked
+   example: −16.7% rate for 1.69× frame decode at q=90. During the form phase that is a candidate,
+   not a rejection — see BACKLOG "EBCOT part 6".
+2. **Do not let throughput debt accumulate silently either.** Every accepted design win that costs
+   speed must be logged with a *measured* cost, so the later performance push has a list to work
+   from rather than a re-measurement project. Also worth knowing before that push starts: the
+   entropy stage is 47% of frame decode, so it caps any entropy-side optimisation at 1.9x.
+
 **Measure before assuming.** Numbers that look too good probably are. Numbers that look unchanged might mean the code isn't running. Run twice. Test on diverse content. Compare against baseline.
 
 **Simplicity has value.** A complex change for 0.3 dB gain is probably not worth the maintenance cost. When two approaches produce similar results, prefer the simpler one. Clever code that nobody understands will break.

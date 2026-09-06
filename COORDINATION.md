@@ -1,9 +1,34 @@
 # Coordination between concurrent Claude sessions
 
-Two Claude sessions work in this checkout at the same time. That has cost real work today —
-a published BD-rate figure had to be retracted, a measurement premise was invalidated
-mid-experiment, and one session nearly deleted the other's in-flight code. This file is how we
-avoid that. **Read it before starting, update it when you claim or release something.**
+**Up to five Claude sessions work on this repository at the same time.** Sharing one checkout
+between them does not work: it has already cost a retracted BD-rate figure, a measurement premise
+invalidated mid-experiment, and one session nearly deleting another's in-flight code. This file is
+how we avoid that. **Read it before starting, update it when you claim or release something.**
+
+## Rule 0 — start by moving into your own worktree (2026-09-06)
+
+**Do this before reading anything else, before your first build, before your first measurement.**
+The shared checkout `/Users/per/src/gnc` is for reading, for the coordination and log files, and
+for merging. It is not where you work.
+
+```bash
+git worktree add <your-scratchpad>/wt <base-sha>     # pin the base explicitly
+ln -sfn /Users/per/src/gnc/test_material/frames <your-scratchpad>/wt/test_material/frames
+```
+
+- **Pin the worktree to a commit**, not to `main`, so nobody else's merge moves the ground under a
+  running sweep (rule 1 below is a consequence of this one).
+- **Use a separate `target/`** — the worktree gets its own by default. It costs one full build
+  (~2 min) and buys you a build that no other session invalidates mid-run.
+- **Symlink the test material** rather than copying it; it is gitignored and large.
+- Do codec work there. Commit there. Only touch the shared checkout to update
+  `COORDINATION.md` / `RESEARCH_LOG.md` / `BACKLOG.md` / `BASELINE.md` and to merge your branch.
+- When you are done, `git worktree remove` it. Three worktrees from 2026-03 sat abandoned for six
+  months with uncommitted diffs in them.
+
+Editing `src/` in the shared checkout while four other sessions do the same is how the failures in
+the next section happened. A shared working tree makes every session's numbers mutually invalid —
+not just risky, invalid, because no number can be attributed to a known state of the code.
 
 ## The three rules that have actually bitten us
 

@@ -12,6 +12,11 @@ project is for.
 
 ## The loop
 
+0. **Move into your own worktree before anything else.** Up to five sessions run at once; the
+   shared checkout is for reading and merging, not for working. See
+   [COORDINATION.md](COORDINATION.md) rule 0 for the exact commands — pin it to a commit, give it
+   its own `target/`, symlink `test_material/frames`, and remove it when you are done. Then claim
+   your area in COORDINATION.md.
 1. Read [BACKLOG.md](BACKLOG.md). Pick the item with the best value-to-effort ratio that is not
    blocked — not necessarily the highest-numbered priority.
 2. **Measure the current state before changing anything.** A change with no before-number is not

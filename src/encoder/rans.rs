@@ -856,7 +856,7 @@ impl SubbandRansTile {
         let group_overhead: usize = self
             .groups
             .iter()
-            .map(|g| 12 + g.alphabet_size as usize * 2)
+            .map(|g| 12 + packed_freqs_bytes(&g.freqs))
             .sum();
         16 + group_overhead + 256 + self.stream_data.iter().map(|s| s.len()).sum::<usize>()
     }
@@ -1630,21 +1630,178 @@ pub fn rans_decode_tile_interleaved_subband_ctx(tile: &SubbandRansTile) -> Vec<i
     output
 }
 
+// ---- ENT-1: compressed per-group frequency tables ----
+//
+// A normalised table sums to RANS_M and is mostly empty: at q=70 on bbb, 68% of the entries are
+// zero and the mean nonzero entry is single-digit, yet each was stored as a flat u16. Tables were
+// 23-26% of every subband-rANS file across the whole quality range.
+//
+// The layout is a run of (zero-run length, value) pairs, both Exp-Golomb order 0, MSB-first,
+// flushed to a byte boundary per group. Exp-Golomb rather than Rice because the zero-coefficient
+// symbol routinely holds a frequency in the thousands, which unary-coded would be catastrophic;
+// ue codes 4096 in 25 bits. No prefix bit is needed — runs and values alternate by construction.
+//
+// Signalled by bit 31 of the tile's `num_groups` word, which holds a value of at most 12. The tile
+// therefore versions itself and files written before this parse unchanged, the same mechanism the
+// Rice skip bitmap uses (docs/BITSTREAM_SPEC.md §2.4).
+pub(crate) const TILE_FLAG_PACKED_FREQS: u32 = 1 << 31;
+
+struct FreqBitWriter {
+    acc: u64,
+    nbits: u32,
+}
+
+impl FreqBitWriter {
+    fn new() -> Self {
+        Self { acc: 0, nbits: 0 }
+    }
+
+    fn put(&mut self, out: &mut Vec<u8>, value: u64, count: u32) {
+        debug_assert!(count <= 32);
+        self.acc = (self.acc << count) | (value & ((1u64 << count) - 1));
+        self.nbits += count;
+        while self.nbits >= 8 {
+            self.nbits -= 8;
+            out.push(((self.acc >> self.nbits) & 0xFF) as u8);
+        }
+    }
+
+    /// Exp-Golomb order 0: v is written as (len-1) zero bits then (v+1) in len bits.
+    fn put_ue(&mut self, out: &mut Vec<u8>, v: u32) {
+        let n = v as u64 + 1;
+        let len = 64 - n.leading_zeros();
+        self.put(out, 0, len - 1);
+        self.put(out, n, len);
+    }
+
+    fn flush(&mut self, out: &mut Vec<u8>) {
+        if self.nbits > 0 {
+            out.push(((self.acc << (8 - self.nbits)) & 0xFF) as u8);
+            self.acc = 0;
+            self.nbits = 0;
+        }
+    }
+}
+
+struct FreqBitReader<'a> {
+    data: &'a [u8],
+    pos: usize,
+    bit: u32,
+}
+
+impl<'a> FreqBitReader<'a> {
+    fn new(data: &'a [u8], pos: usize) -> Self {
+        Self { data, pos, bit: 0 }
+    }
+
+    fn read_bit(&mut self) -> u32 {
+        // Past the end reads as zero: a truncated or corrupt tile must not panic before its CRC
+        // is checked (the lesson from conformance_crc_detects_corruption).
+        let byte = if self.pos < self.data.len() { self.data[self.pos] } else { 0 };
+        let b = (byte >> (7 - self.bit)) & 1;
+        self.bit += 1;
+        if self.bit == 8 {
+            self.bit = 0;
+            self.pos += 1;
+        }
+        b as u32
+    }
+
+    fn read_ue(&mut self) -> u32 {
+        let mut len = 1u32;
+        while self.read_bit() == 0 && len < 32 && self.pos <= self.data.len() {
+            len += 1;
+        }
+        let mut n = 1u32;
+        for _ in 1..len {
+            n = (n << 1) | self.read_bit();
+        }
+        n - 1
+    }
+
+    /// Byte position after flushing the current partial byte.
+    fn finish(&self) -> usize {
+        if self.bit > 0 {
+            self.pos + 1
+        } else {
+            self.pos
+        }
+    }
+}
+
+fn ue_bits(v: u32) -> u32 {
+    let n = v as u64 + 1;
+    2 * (64 - n.leading_zeros()) - 1
+}
+
+/// Exact serialised size of one packed frequency table, in bytes.
+fn packed_freqs_bytes(freqs: &[u32]) -> usize {
+    let mut bits = 0u32;
+    let mut run = 0u32;
+    for &f in freqs {
+        if f == 0 {
+            run += 1;
+        } else {
+            bits += ue_bits(run) + ue_bits(f - 1);
+            run = 0;
+        }
+    }
+    if run > 0 {
+        bits += ue_bits(run);
+    }
+    bits.div_ceil(8) as usize
+}
+
+fn write_packed_freqs(out: &mut Vec<u8>, freqs: &[u32]) {
+    let mut w = FreqBitWriter::new();
+    let mut run = 0u32;
+    for &f in freqs {
+        if f == 0 {
+            run += 1;
+        } else {
+            w.put_ue(out, run);
+            w.put_ue(out, f - 1);
+            run = 0;
+        }
+    }
+    // A trailing zero run is written so the decoder stops on count rather than on a sentinel.
+    if run > 0 {
+        w.put_ue(out, run);
+    }
+    w.flush(out);
+}
+
+fn read_packed_freqs(data: &[u8], pos: &mut usize, alphabet_size: usize) -> Vec<u32> {
+    let mut freqs = vec![0u32; alphabet_size];
+    let mut r = FreqBitReader::new(data, *pos);
+    let mut i = 0usize;
+    while i < alphabet_size {
+        let run = r.read_ue() as usize;
+        i += run;
+        if i >= alphabet_size {
+            break;
+        }
+        freqs[i] = r.read_ue() + 1;
+        i += 1;
+    }
+    *pos = r.finish();
+    freqs
+}
+
 /// Serialize a SubbandRansTile to bytes.
 pub fn serialize_tile_subband(tile: &SubbandRansTile) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&tile.num_coefficients.to_le_bytes());
     out.extend_from_slice(&tile.tile_size.to_le_bytes());
     out.extend_from_slice(&tile.num_levels.to_le_bytes());
-    out.extend_from_slice(&tile.num_groups.to_le_bytes());
-    // Per-group frequency tables (with zrun_base)
+    out.extend_from_slice(&(tile.num_groups | TILE_FLAG_PACKED_FREQS).to_le_bytes());
+    // Per-group frequency tables (with zrun_base). The tables themselves are Exp-Golomb packed;
+    // see TILE_FLAG_PACKED_FREQS.
     for g in &tile.groups {
         out.extend_from_slice(&g.min_val.to_le_bytes());
         out.extend_from_slice(&g.alphabet_size.to_le_bytes());
         out.extend_from_slice(&g.zrun_base.to_le_bytes());
-        for &f in &g.freqs {
-            out.extend_from_slice(&(f as u16).to_le_bytes());
-        }
+        write_packed_freqs(&mut out, &g.freqs);
     }
     // 32 stream data lengths
     for s in 0..STREAMS_PER_TILE {
@@ -1672,8 +1829,10 @@ pub fn deserialize_tile_subband(data: &[u8]) -> (SubbandRansTile, usize) {
     pos += 4;
     let num_levels = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
     pos += 4;
-    let num_groups = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
+    let num_groups_word = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
     pos += 4;
+    let packed_freqs = num_groups_word & TILE_FLAG_PACKED_FREQS != 0;
+    let num_groups = num_groups_word & !TILE_FLAG_PACKED_FREQS;
 
     let mut groups = Vec::with_capacity(num_groups as usize);
     for _ in 0..num_groups {
@@ -1684,12 +1843,16 @@ pub fn deserialize_tile_subband(data: &[u8]) -> (SubbandRansTile, usize) {
         let zrun_base = i32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
         pos += 4;
 
-        let mut freqs = Vec::with_capacity(alphabet_size as usize);
-        for _ in 0..alphabet_size {
-            let f = u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap());
-            freqs.push(f as u32);
-            pos += 2;
-        }
+        let freqs = if packed_freqs {
+            read_packed_freqs(data, &mut pos, alphabet_size as usize)
+        } else {
+            let mut v = Vec::with_capacity(alphabet_size as usize);
+            for _ in 0..alphabet_size {
+                v.push(u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap()) as u32);
+                pos += 2;
+            }
+            v
+        };
 
         let mut cumfreqs = vec![0u32; alphabet_size as usize + 1];
         for i in 0..alphabet_size as usize {

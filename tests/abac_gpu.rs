@@ -8,6 +8,7 @@
 //!
 //! Synthesises its own coefficients so it runs without test material.
 
+use gnc::encoder::abac::Coder;
 use gnc::encoder::abac_gpu::{verify_against_cpu, GpuAbacDecoder};
 use gnc::GpuContext;
 use std::sync::OnceLock;
@@ -67,13 +68,15 @@ fn gpu_decode_matches_cpu_coder() {
         (2048, 1280, 32, 9),
     ] {
         let plane = synth_plane(w, h, seed);
-        let (bytes, gpu_s) = verify_against_cpu(ctx, &decoder, &plane, w, h, cb);
-        let mc = (w * h) as f64 / 1e6;
-        eprintln!(
-            "  {w}x{h} cb={cb}: {bytes} B, GPU decode {:.3} ms ({:.1} Mcoeff/s)",
-            gpu_s * 1e3,
-            mc / gpu_s
-        );
+        for coder in [Coder::Interval, Coder::Range] {
+            let (bytes, gpu_s) = verify_against_cpu(ctx, &decoder, &plane, w, h, cb, coder);
+            let mc = (w * h) as f64 / 1e6;
+            eprintln!(
+                "  {w}x{h} cb={cb} {coder:?}: {bytes} B, GPU decode {:.3} ms ({:.1} Mcoeff/s)",
+                gpu_s * 1e3,
+                mc / gpu_s
+            );
+        }
     }
 }
 
@@ -83,10 +86,12 @@ fn gpu_decode_matches_cpu_coder() {
 fn gpu_decode_handles_degenerate_planes() {
     let ctx = gpu();
     let decoder = GpuAbacDecoder::new(ctx);
-    let zero = vec![0i32; 128 * 128];
-    verify_against_cpu(ctx, &decoder, &zero, 128, 128, 64);
-    let ones = vec![1i32; 128 * 128];
-    verify_against_cpu(ctx, &decoder, &ones, 128, 128, 64);
-    let big = vec![-9999i32; 64 * 64];
-    verify_against_cpu(ctx, &decoder, &big, 64, 64, 64);
+    for coder in [Coder::Interval, Coder::Range] {
+        let zero = vec![0i32; 128 * 128];
+        verify_against_cpu(ctx, &decoder, &zero, 128, 128, 64, coder);
+        let ones = vec![1i32; 128 * 128];
+        verify_against_cpu(ctx, &decoder, &ones, 128, 128, 64, coder);
+        let big = vec![-9999i32; 64 * 64];
+        verify_against_cpu(ctx, &decoder, &big, 64, 64, 64, coder);
+    }
 }

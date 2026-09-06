@@ -17,6 +17,7 @@
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
+use super::abac::Coder;
 use crate::GpuContext;
 
 /// Widest code-block the decode shader can handle, set by its workgroup scratch. Must match
@@ -75,7 +76,9 @@ struct Params {
 }
 
 pub struct GpuAbacDecoder {
-    pipeline: wgpu::ComputePipeline,
+    /// One pipeline per coder variant, indexed by `Coder as usize`. Specialised at compile time
+    /// by entry point rather than branched at run time, so neither variant pays for the other.
+    pipelines: [wgpu::ComputePipeline; 2],
     bgl: wgpu::BindGroupLayout,
 }
 
@@ -117,17 +120,20 @@ impl GpuAbacDecoder {
                 bind_group_layouts: &[&bgl],
                 push_constant_ranges: &[],
             });
-        let pipeline = ctx
-            .device
-            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("abac_decode"),
-                layout: Some(&layout),
-                module: &shader,
-                entry_point: Some("main"),
-                compilation_options: Default::default(),
-                cache: None,
-            });
-        Self { pipeline, bgl }
+        let build = |entry: &str| {
+            ctx.device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some(entry),
+                    layout: Some(&layout),
+                    module: &shader,
+                    entry_point: Some(entry),
+                    compilation_options: Default::default(),
+                    cache: None,
+                })
+        };
+        // Index order must match `Coder`.
+        let pipelines = [build("main"), build("main_rc")];
+        Self { pipelines, bgl }
     }
 
     /// Decode every block into one output plane. Returns the plane and the submit-to-idle time.
@@ -141,6 +147,7 @@ impl GpuAbacDecoder {
         packed: &[u8],
         infos: &[BlockInfo],
         out_len: usize,
+        coder: Coder,
     ) -> (Vec<i32>, f64) {
         assert!(!infos.is_empty(), "nothing to decode");
         assert!(
@@ -207,7 +214,7 @@ impl GpuAbacDecoder {
                 label: Some("abac_decode_pass"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.pipeline);
+            pass.set_pipeline(&self.pipelines[coder as usize]);
             pass.set_bind_group(0, &bind, &[]);
             // workgroup_size(32) in the shader; one thread per block.
             pass.dispatch_workgroups((infos.len() as u32).div_ceil(32), 1, 1);
@@ -225,6 +232,7 @@ impl GpuAbacDecoder {
 
 /// Cut a plane into code-blocks, encode each on the CPU, decode them all on the GPU, and assert
 /// the GPU reproduced the plane exactly. Returns `(packed_bytes, gpu_seconds)`.
+#[allow(clippy::too_many_arguments)] // plane geometry plus the variant under test
 pub fn verify_against_cpu(
     ctx: &GpuContext,
     decoder: &GpuAbacDecoder,
@@ -232,6 +240,7 @@ pub fn verify_against_cpu(
     stride: usize,
     height: usize,
     cb: usize,
+    coder: Coder,
 ) -> (usize, f64) {
     let mut packed: Vec<u8> = Vec::new();
     let mut infos: Vec<BlockInfo> = Vec::new();
@@ -247,7 +256,7 @@ pub fn verify_against_cpu(
                 let row = (by + y) * stride + bx;
                 blk.extend_from_slice(&plane[row..row + bw]);
             }
-            let bytes = super::abac::encode_block(&blk, bw);
+            let bytes = coder.encode_block(&blk, bw);
             infos.push(BlockInfo::new(
                 packed.len() as u32,
                 bytes.len() as u32,
@@ -268,7 +277,7 @@ pub fn verify_against_cpu(
     // remains is data-dependent and cannot be removed.
     infos.sort_by_key(|i| std::cmp::Reverse(i.width * i.height));
 
-    let (got, gpu_s) = decoder.decode(ctx, &packed, &infos, plane.len());
+    let (got, gpu_s) = decoder.decode(ctx, &packed, &infos, plane.len(), coder);
     if got != plane {
         let at = got
             .iter()
@@ -278,7 +287,7 @@ pub fn verify_against_cpu(
         panic!(
             "GPU abac decode diverged from the CPU coder at coefficient {at} (row {}, col {}): \
              got {}, expected {}. The shader and abac.rs must agree bit-for-bit; a divergence \
-             here decodes without error and reconstructs the wrong image.",
+             here decodes without error and reconstructs the wrong image. Coder: {coder:?}.",
             at / stride,
             at % stride,
             got[at],

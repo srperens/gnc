@@ -416,14 +416,294 @@ pub fn decode_block(bytes: &[u8], count: usize, width: usize) -> Vec<i32> {
     out
 }
 
+// ---------------------------------------------------------------------------
+// Variant B: byte-renormalising range coder
+// ---------------------------------------------------------------------------
+//
+// Same binarisation and the same contexts as the interval coder above; only the arithmetic
+// engine differs. The point is the renormalisation.
+//
+// The interval coder renormalises **one bit at a time**, and how many iterations that takes
+// depends on the data — anywhere from 0 to 16 per binary decision. On a GPU that variable-length
+// inner loop is the whole cost: every lane of a SIMD group runs a different number of iterations
+// for every symbol, so the group runs at its worst lane, constantly.
+//
+// This one renormalises **one byte at a time** and cannot iterate more than three times, because
+// `range` is kept above 2^24. In practice it is 0 or 1. That is roughly 8x fewer iterations in
+// the hottest loop in the decoder, which is the structural fix the GPU work pointed at.
+//
+// It also stays comfortably inside 32-bit arithmetic without needing a narrowed interval:
+// `(range >> RC_PROB_BITS) * p` is at most 2^21 * 2^11 = 2^32, so no `u64` and no split multiply.
+// This is the LZMA/VP8 family of range coder, chosen because it is widely reproduced and easy to
+// verify rather than because it is clever.
+//
+// Which coder is better here is an open question — see RESEARCH_LOG. Both are built so one
+// idle-machine run can settle it.
+
+const RC_PROB_BITS: u32 = 11;
+const RC_PROB_ONE: u32 = 1 << RC_PROB_BITS;
+const RC_ADAPT_SHIFT: u32 = 5;
+const RC_TOP: u32 = 1 << 24;
+
+struct RangeEncoder {
+    low: u64,
+    range: u32,
+    cache: u8,
+    cache_size: u64,
+    out: Vec<u8>,
+}
+
+impl RangeEncoder {
+    fn new() -> Self {
+        Self { low: 0, range: u32::MAX, cache: 0, cache_size: 1, out: Vec::new() }
+    }
+
+    /// Emit the top byte of `low`, propagating a carry back through any pending 0xFF run.
+    fn shift_low(&mut self) {
+        if self.low < 0xFF00_0000 || self.low > 0xFFFF_FFFF {
+            let carry = (self.low >> 32) as u8;
+            loop {
+                self.out.push(self.cache.wrapping_add(carry));
+                self.cache = 0xFF;
+                self.cache_size -= 1;
+                if self.cache_size == 0 {
+                    break;
+                }
+            }
+            self.cache = ((self.low >> 24) & 0xFF) as u8;
+        }
+        self.cache_size += 1;
+        self.low = (self.low << 8) & 0xFFFF_FFFF;
+    }
+
+    fn encode(&mut self, bit: bool, p: &mut u32) {
+        let bound = (self.range >> RC_PROB_BITS) * *p;
+        if bit {
+            self.low += bound as u64;
+            self.range -= bound;
+            *p -= *p >> RC_ADAPT_SHIFT;
+        } else {
+            self.range = bound;
+            *p += (RC_PROB_ONE - *p) >> RC_ADAPT_SHIFT;
+        }
+        *p = (*p).clamp(1, RC_PROB_ONE - 1);
+        while self.range < RC_TOP {
+            self.range <<= 8;
+            self.shift_low();
+        }
+    }
+
+    fn encode_bypass(&mut self, bit: bool) {
+        self.range >>= 1;
+        if bit {
+            self.low += self.range as u64;
+        }
+        while self.range < RC_TOP {
+            self.range <<= 8;
+            self.shift_low();
+        }
+    }
+
+    fn finish(mut self) -> Vec<u8> {
+        for _ in 0..5 {
+            self.shift_low();
+        }
+        self.out
+    }
+}
+
+struct RangeDecoder<'a> {
+    range: u32,
+    code: u32,
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> RangeDecoder<'a> {
+    /// Past the end reads as zero, so a truncated or corrupt block terminates rather than
+    /// panicking — the same rule the rest of this module follows.
+    fn next_byte(&mut self) -> u32 {
+        let b = self.bytes.get(self.pos).copied().unwrap_or(0);
+        self.pos += 1;
+        b as u32
+    }
+
+    fn new(bytes: &'a [u8]) -> Self {
+        let mut d = Self { range: u32::MAX, code: 0, bytes, pos: 0 };
+        // The encoder's first `shift_low` emits the initial cache byte, which carries no
+        // information; skip it and prime with the next four.
+        d.next_byte();
+        for _ in 0..4 {
+            d.code = (d.code << 8) | d.next_byte();
+        }
+        d
+    }
+
+    fn decode(&mut self, p: &mut u32) -> bool {
+        let bound = (self.range >> RC_PROB_BITS) * *p;
+        let bit = self.code >= bound;
+        if bit {
+            self.range -= bound;
+            self.code -= bound;
+            *p -= *p >> RC_ADAPT_SHIFT;
+        } else {
+            self.range = bound;
+            *p += (RC_PROB_ONE - *p) >> RC_ADAPT_SHIFT;
+        }
+        *p = (*p).clamp(1, RC_PROB_ONE - 1);
+        while self.range < RC_TOP {
+            self.range <<= 8;
+            self.code = (self.code << 8) | self.next_byte();
+        }
+        bit
+    }
+
+    fn decode_bypass(&mut self) -> bool {
+        self.range >>= 1;
+        let bit = self.code >= self.range;
+        if bit {
+            self.code -= self.range;
+        }
+        while self.range < RC_TOP {
+            self.range <<= 8;
+            self.code = (self.code << 8) | self.next_byte();
+        }
+        bit
+    }
+}
+
+/// Variant B of `encode_block`: identical binarisation and contexts, byte-renormalising coder.
+pub fn encode_block_rc(coefficients: &[i32], width: usize) -> Vec<u8> {
+    assert!(width > 0, "code-block width must be non-zero");
+    assert_eq!(
+        coefficients.len() % width,
+        0,
+        "code-block must be rectangular: {} coefficients at width {width}",
+        coefficients.len()
+    );
+    let height = coefficients.len() / width;
+    let mut probs = [RC_PROB_ONE / 2; NUM_CONTEXTS];
+    let mut enc = RangeEncoder::new();
+    let mut mag = vec![0u32; coefficients.len()];
+
+    for y in 0..height {
+        for x in 0..width {
+            let v = coefficients[y * width + x];
+            let a = v.unsigned_abs();
+            let ctx = bucket(neighbour_sum(&mag, width, y, x));
+            enc.encode(a > 0, &mut probs[ctx]);
+            if a > 0 {
+                enc.encode(a > 1, &mut probs[NUM_BUCKETS + ctx]);
+                if a > 1 {
+                    enc.encode(a > 2, &mut probs[2 * NUM_BUCKETS + ctx]);
+                    if a > 2 {
+                        let n = a - 3 + 1;
+                        let len = 32 - n.leading_zeros();
+                        for _ in 0..len - 1 {
+                            enc.encode_bypass(false);
+                        }
+                        for i in (0..len).rev() {
+                            enc.encode_bypass((n >> i) & 1 != 0);
+                        }
+                    }
+                }
+                enc.encode_bypass(v < 0);
+            }
+            mag[y * width + x] = a;
+        }
+    }
+    enc.finish()
+}
+
+/// Inverse of `encode_block_rc`.
+pub fn decode_block_rc(bytes: &[u8], count: usize, width: usize) -> Vec<i32> {
+    assert!(width > 0, "code-block width must be non-zero");
+    let height = count / width;
+    let mut probs = [RC_PROB_ONE / 2; NUM_CONTEXTS];
+    let mut dec = RangeDecoder::new(bytes);
+    let mut out = vec![0i32; count];
+    let mut mag = vec![0u32; count];
+
+    for y in 0..height {
+        for x in 0..width {
+            let ctx = bucket(neighbour_sum(&mag, width, y, x));
+            let mut a: u32 = 0;
+            if dec.decode(&mut probs[ctx]) {
+                a = 1;
+                if dec.decode(&mut probs[NUM_BUCKETS + ctx]) {
+                    a = 2;
+                    if dec.decode(&mut probs[2 * NUM_BUCKETS + ctx]) {
+                        let mut zeros = 0u32;
+                        while !dec.decode_bypass() {
+                            zeros += 1;
+                            if zeros > 32 {
+                                return out;
+                            }
+                        }
+                        let mut n = 1u32;
+                        for _ in 0..zeros {
+                            n = (n << 1) | u32::from(dec.decode_bypass());
+                        }
+                        a = n - 1 + 3;
+                    }
+                }
+                let neg = dec.decode_bypass();
+                out[y * width + x] = if neg { -(a as i32) } else { a as i32 };
+            }
+            mag[y * width + x] = a;
+        }
+    }
+    out
+}
+
+/// Which arithmetic engine to use. Same bitstream syntax, different coder — the streams are not
+/// interchangeable, so a variant is chosen once for a whole encode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Coder {
+    /// Bit-renormalising interval coder. 0-16 iterations per decision, data-dependent.
+    #[default]
+    Interval,
+    /// Byte-renormalising range coder. At most 3 iterations per decision, usually 0 or 1.
+    Range,
+}
+
+impl Coder {
+    /// Selected by `GNC_ABAC_CODER=interval|range`. Defaults to `Interval`, which is the one the
+    /// −19% to −25% rate figures were measured with.
+    pub fn from_env() -> Self {
+        match std::env::var("GNC_ABAC_CODER").as_deref() {
+            Ok("range") | Ok("rc") => Coder::Range,
+            _ => Coder::Interval,
+        }
+    }
+
+    pub fn encode_block(self, coefficients: &[i32], width: usize) -> Vec<u8> {
+        match self {
+            Coder::Interval => encode_block(coefficients, width),
+            Coder::Range => encode_block_rc(coefficients, width),
+        }
+    }
+
+    pub fn decode_block(self, bytes: &[u8], count: usize, width: usize) -> Vec<i32> {
+        match self {
+            Coder::Interval => decode_block(bytes, count, width),
+            Coder::Range => decode_block_rc(bytes, count, width),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Both coders must roundtrip every case. They are separate arithmetic engines over the same
+    /// binarisation, so a bug in one is invisible to the other.
     fn roundtrip(coefficients: &[i32], width: usize, label: &str) {
-        let bytes = encode_block(coefficients, width);
-        let back = decode_block(&bytes, coefficients.len(), width);
-        assert_eq!(back, coefficients, "{label}: roundtrip must be exact");
+        for coder in [Coder::Interval, Coder::Range] {
+            let bytes = coder.encode_block(coefficients, width);
+            let back = coder.decode_block(&bytes, coefficients.len(), width);
+            assert_eq!(back, coefficients, "{label} ({coder:?}): roundtrip must be exact");
+        }
     }
 
     #[test]
@@ -452,15 +732,40 @@ mod tests {
     #[test]
     fn corrupt_stream_does_not_panic() {
         let coefficients: Vec<i32> = (0..64 * 64).map(|i| (i % 13) as i32 - 6).collect();
-        let bytes = encode_block(&coefficients, 64);
-        for cut in [0, 1, 7, bytes.len() / 3, bytes.len() / 2] {
-            let _ = decode_block(&bytes[..cut], coefficients.len(), 64);
+        for coder in [Coder::Interval, Coder::Range] {
+            let bytes = coder.encode_block(&coefficients, 64);
+            for cut in [0, 1, 7, bytes.len() / 3, bytes.len() / 2] {
+                let _ = coder.decode_block(&bytes[..cut], coefficients.len(), 64);
+            }
+            for pos in [0, 3, bytes.len() / 2, bytes.len() - 1] {
+                let mut bad = bytes.clone();
+                bad[pos] ^= 0xFF;
+                let _ = coder.decode_block(&bad, coefficients.len(), 64);
+            }
         }
-        for pos in [0, 3, bytes.len() / 2, bytes.len() - 1] {
-            let mut bad = bytes.clone();
-            bad[pos] ^= 0xFF;
-            let _ = decode_block(&bad, coefficients.len(), 64);
+    }
+
+    /// The two engines carry the same information, so their output sizes should be within a
+    /// percent or so. A large gap means one of them is broken rather than merely different, and
+    /// this catches that without needing a rate measurement on real data.
+    #[test]
+    fn both_coders_reach_similar_sizes() {
+        let w = 64usize;
+        let mut c = vec![0i32; w * w];
+        for y in 0..w {
+            for x in 0..w {
+                if (y / 8 + x / 8) % 3 == 0 {
+                    c[y * w + x] = (((y * 31 + x * 17) % 9) as i32) - 4;
+                }
+            }
         }
+        let a = encode_block(&c, w).len() as f64;
+        let b = encode_block_rc(&c, w).len() as f64;
+        let ratio = b / a;
+        assert!(
+            (0.9..1.1).contains(&ratio),
+            "the two coders should agree within 10%: interval {a} B, range {b} B (ratio {ratio:.3})"
+        );
     }
 
     /// The point of the whole exercise: on a sparse, clustered field of the kind a wavelet

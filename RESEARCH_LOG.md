@@ -8043,3 +8043,77 @@ in-loop filtering and context-adaptive coding partly on parallelism grounds, and
 tax is now quantified at 5× on one pass rather than being a disqualification. Entropy coding is
 51-85% of decode runtime, so it is the right thing to be working on — which is some comfort for
 this track even though its own gate is still open.
+
+---
+
+## 2026-09-06 — abac: two coder variants behind a switch, and one dominates the other
+
+The machine is shared by up to five sessions, so throughput cannot be measured during a working
+session (COORDINATION.md). The response is to stop trying: build every plausible variant, make it
+selectable, and add a bench that settles the grid in one idle-machine run.
+
+### What is now switchable
+
+- `GNC_ABAC_CODER=interval|range` — the arithmetic engine.
+- `GNC_ABAC_CB=<px>` — code-block size.
+- `cargo test --release --test abac_bench -- --ignored --nocapture` — times the whole grid, GPU and
+  CPU, and prints the run-to-run spread so a loaded run announces itself.
+
+Both coders share the binarisation, the contexts and the block geometry. Only the arithmetic
+differs, so their streams are not interchangeable and a variant is chosen for a whole encode.
+
+**Interval** (the original): bit-renormalising, 16-bit interval, 12-bit probabilities.
+Renormalisation runs 0-16 iterations per binary decision, depending on the data.
+
+**Range** (new): byte-renormalising, LZMA/VP8 family, 11-bit probabilities. Renormalisation cannot
+run more than three times and in practice runs 0 or 1 — roughly **8x fewer iterations in the
+hottest loop in the decoder**, which is exactly what the GPU work pointed at. It also needs no
+narrowed interval: `(range >> 11) * p` peaks at 2^32, so it fits a `u32` without the 16-bit
+compromise the other coder makes.
+
+### Rate, on real coefficients (bbb_1080p, q=55, against the shipped Rice coder)
+
+| coder | cb=32 | cb=64 | cb=128 |
+|---|---|---|---|
+| Interval | **−15.0%** | **−19.2%** | **−20.0%** |
+| Range | −10.2% | −17.0% | −18.4% |
+
+Range costs 1.6-4.8 points of rate, and the gap widens as blocks get smaller: its final flush is
+five bytes per block, so at cb=32 there are 8400 blocks per frame paying 42 KB of flush. That is a
+fixable inefficiency in the range coder, not a property of byte renormalisation, and it is the
+obvious next thing to try if Range wins on speed.
+
+### Throughput, paired within a single run — provisional but credible
+
+Same input, both variants timed back-to-back in one process so they see the same machine load,
+which is the one comparison that survives a busy machine. Padded 1080p luma plane:
+
+| cb | Interval | Range |
+|---|---|---|
+| 64 px | 38.1 Mcoeff/s | **84.2** |
+| 32 px | 77.2 Mcoeff/s | **157.5** |
+
+**About 2x, consistently, at both block sizes.** Absolute values are not to be trusted — five
+sessions were running — but the ratio is a paired measurement and the factor held across both
+rows.
+
+### The useful conclusion
+
+**Range at cb=64 dominates Interval at cb=32 on both axes**: −17.0% against −15.0% on rate, and
+84.2 against 77.2 Mcoeff/s. If throughput turns out to matter, the answer is not "smaller blocks
+with the interval coder" — it is "the range coder with bigger blocks". That is not a trade-off, it
+is a strictly better point, and it is the kind of thing a switchable grid finds and a single
+measurement does not.
+
+Both variants are verified bit-exact CPU↔GPU across seven geometries including ragged
+subband-edge blocks and degenerate planes, and both survive truncated and corrupted streams
+without panicking. There is a unit test asserting the two engines land within 10% of each other on
+the same data, because a large gap would mean one is broken rather than merely different.
+
+### Still open, and needs an idle machine
+
+Which variant to keep, and whether either is fast enough at all. GNC's whole decode is ~34 ms and
+entropy coding is 51-85% of it (MEAS 75ca12b), so the entropy stage it would replace is roughly
+17-29 ms. Range at cb=32 would put three planes at about 50 ms on today's provisional numbers —
+still slower than the stage it replaces, before the flush fix. One idle-machine bench run and the
+five-byte flush are the next two steps, in that order.

@@ -58,6 +58,7 @@ the shared checkout** — no absolute paths, no session ids.
 | worktree | branch | area |
 |---|---|---|
 | `../gnc-abac` | `abac` | adaptive binary code-block entropy coder (EBCOT follow-up), CPU + GPU. Rate −19 to −25% confirmed; GPU decode bit-exact but 6-13 fps, so throughput is the open gate. |
+| `../gnc-qual1` (scratchpad) | `meas/qual-1` | QUAL-1 — re-run MEAS-1 at q=92/96/99 vs crf 4/8/12. Measurement only, no `src/` changes; PSNR + CIEDE2000 lead, VMAF saturated at this end. |
 
 ## Timing: the machine is shared, so throughput numbers are not measurable during a session
 

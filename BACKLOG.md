@@ -54,7 +54,7 @@ convenient one.
 4. **QUAL-1** — re-run MEAS-1 at the contribution end now that the quality range above q=92 exists
    (it was dead until today, so every contribution-quality comparison predating that is invalid at
    the top).
-5. Bugs: BUG-9 (rANS bounds, message now actionable), BUG-12, BUG-14.
+5. Bugs: BUG-9 (rANS bounds, message now actionable), BUG-14. BUG-12 closed 2026-09-06.
 
 **Do not re-test** (measured and closed this week): MCTF, GOP length, the B-pyramid at contribution
 quality, RD decisions, multi-reference, sub-pel filters, motion search, block transforms, sub-block

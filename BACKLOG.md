@@ -693,6 +693,24 @@ a bitstream format change.
 
 Revisit only if MEAS-1 shows an inter gap that nothing cheaper explains.
 
+### MCTF — motion-compensated temporal filtering (**REJECTED 2026-09-06** — gated, do not re-test)
+`src/temporal.rs` is 129 lines with no motion compensation, so warping along motion vectors and
+*then* filtering temporally — MC-EZBC / 3D-SPIHT's combination — was genuinely untested. Two
+offline gates, identical motion vectors in both arms:
+
+| gate | touchdown | old_town | speed_bag | bbb |
+|---|---|---|---|---|
+| open loop (closed/open residual) | 0.99x | 0.99x | 0.98x | 1.34x |
+| multi-frame transform (MCTF/P-chain) | 1.04x | 1.05x | 1.13x | 1.14x |
+
+The open loop wins nothing on camera content — real motion dominates reference noise 4-5x — and
+the temporal transform is *worse* than a P-chain everywhere, because the level-2 highpass
+differences two lowpass frames two apart, which align worse than originals. Stable under a finer
+motion estimator (8x8/±16: 0.99→1.01x). Full measurement in RESEARCH_LOG 2026-09-06.
+
+Reaches the same verdict as ICME 2006 and MPEG's deletion of the SVC temporal update step, from an
+independent direction.
+
 ## Noted — revisit only if conditions change
 
 ### ARCH-1 — Hybrid temporal: Haar for low motion, I+P+B for high motion (noted 2026-03-11)

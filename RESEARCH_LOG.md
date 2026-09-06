@@ -5642,3 +5642,85 @@ resolve by citing a policy.
 **Open, and the next step is specific:** more rate points (only two overlapped per sequence here),
 a third and fourth camera sequence, and a chroma-aware cross-check with CIEDE2000 before any
 default changes. **No default was changed on the strength of this.**
+
+---
+
+## 2026-09-06 — MCTF gated and rejected: both mechanisms measured, both negative on target content
+
+### Why it was worth testing
+
+Proposed by the project owner, and the premise was factually right: **`src/temporal.rs` is 129
+lines with no motion compensation at all** — no MV, no warp, no alignment. Haar over 2 frames and
+LeGall 5/3 over 4, on *unaligned* frames, which is the configuration that only works on static
+content. Hierarchical block-matching ME exists separately. **Both halves are built and had never
+been combined**, and MC-EZBC / 3D-SPIHT are exactly that combination.
+
+The literature is against it (ICME 2006's fair fight; MPEG deleting the temporal update step from
+SVC citing *better* efficiency), but the 2006 result attributes MCTF's loss to open-loop control
+being unable to compensate for reference quantisation error — and that verdict assumes a competent
+closed loop. GNC's closed loop is measurably weak. So the settled literature might not transfer,
+and the question deserved a local measurement rather than a citation.
+
+Two offline gates, no codec change. Both arms use identical motion vectors, so only the variable
+under test differs.
+
+### Gate 1 — the open loop. Nothing to win on camera content.
+
+`closed = orig(t) − W(decoded(t−1))` (what GNC codes) against `open = orig(t) − W(orig(t−1))`
+(what MCTF would code). 1080p, 17 frames, qstep 4.0, luma.
+
+| sequence | open mean\|r\| | closed mean\|r\| | closed/open | open >dz | closed >dz |
+|---|---|---|---|---|---|
+| touchdown | 3.872 | 3.827 | **0.99x** | 62.6% | 61.9% |
+| old_town | 5.250 | 5.207 | **0.99x** | 73.4% | 73.6% |
+| speed_bag | 1.984 | 1.947 | **0.98x** | 36.2% | 34.2% |
+| bbb (animation) | 2.327 | 3.111 | **1.34x** | 33.9% | 49.0% |
+
+**On camera content the reference's quantisation noise contributes nothing** — the closed-loop
+residual is if anything marginally *smaller*, because a quantised reference is smoothed and
+matches slightly better in SAD. Real motion dominates by 4–5x over the noise floor.
+
+On animation it is a third of the residual, and pushes 15 percentage points more coefficients over
+the dead zone. Same content split as every other finding this week: large flat regions are where
+reference noise dominates.
+
+**Sensitivity check.** Re-run with finer motion (8x8 blocks, ±16 search instead of 16x16, ±12):
+touchdown 0.99x → 1.01x, bbb 1.34x → 1.37x. Better vectors lower both arms about equally and the
+ratio is stable, so the gate is not an artefact of a weak matcher.
+
+### Gate 2 — the multi-frame transform. Worse than a P-chain, everywhere.
+
+MCTF's other mechanism is decomposing across more than one frame gap. Over 4 input frames both
+schemes produce 3 detail frames plus one anchor, so the comparison is like for like. Open loop on
+both sides, isolating the transform:
+
+| sequence | P-chain mean\|detail\| | MCTF (2-level lifting Haar) | ratio |
+|---|---|---|---|
+| touchdown | 3.817 | 3.973 | **1.04x** |
+| old_town | 5.281 | 5.547 | **1.05x** |
+| speed_bag | 1.992 | 2.251 | **1.13x** |
+| bbb | 2.324 | 2.649 | **1.14x** |
+
+**The P-chain's detail frames are sparser on every sequence, animation included.** The mechanism
+is visible in the construction: the level-2 highpass is a difference between two *lowpass* frames
+two apart, so it carries larger motion and the lowpass frames are blends that align worse than
+originals do. The deeper temporal level costs more than it saves.
+
+### Verdict
+
+**MCTF is rejected.** Its open loop is worth nothing on camera content and its transform is worse
+than a P-chain on all content. The one place the open loop pays — animation, 1.37x — is not the
+target content, and gate 2 loses there too.
+
+Notably this reaches the same conclusion as ICME 2006 and MPEG's deletion of the temporal update
+step, from a completely independent direction: this codec's own content, its own reference frames,
+measured locally. That agreement is worth more than either alone.
+
+### Limits
+
+Lifting Haar at 2 levels with integer-pel block matching. A real MCTF would use OBMC, sub-pel
+motion and 5/3 lifting with update steps, all of which improve alignment — and LOOP.md's standing
+warning is that offline models *understate* the real coder. But the margin is 4–14% in the wrong
+direction on every sequence and the open-loop gate is flat at 0.98–1.01x, so closing this would
+require the missing pieces to be worth more than everything measured, which no published result
+supports. `mean|detail|` is a rate proxy, not rate. 4 groups per sequence.

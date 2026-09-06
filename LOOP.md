@@ -98,6 +98,12 @@ numbers in this repo were measured at the wrong one.
   POSITIONING.md draft prescribed RD decisions from published magnitudes; this repo's own numbers
   refute it, and the document has been corrected.
 
+- **MCTF is now measured locally, not just cited (2026-09-06).** `src/temporal.rs` has no motion
+  compensation, so warping first and then filtering temporally was genuinely untested. Two offline
+  gates: the open loop is worth **0.98-1.01x** on camera content (nothing — real motion dominates
+  reference noise 4-5x) and 1.34-1.37x on animation; the multi-frame temporal transform is
+  **1.04-1.14x worse** than a P-chain on *every* sequence. Rejected. Do not rebuild it.
+
 So the honest state is **open and unexplained after exhausting the local levers** — do not fill
 it with a guess. The one untested lever with a mechanism specific to a wavelet codec is OBMC.
 Expect single digits from it.

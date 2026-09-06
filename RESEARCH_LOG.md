@@ -8350,3 +8350,88 @@ halves now exist in this repo.
 Decode throughput on the real path. Four sessions were building on this machine and COORDINATION
 rule 1 forbids timing under load; the 201 fps figure is the isolated gate, not the shipped
 decoder. Measure on an idle machine before quoting any lossless fps.
+
+---
+
+---
+
+## 2026-09-06 — BUG-8 was not drift: the encoder was measuring a reconstruction that never leaves it
+
+BUG-8 was filed as a suspected encoder/decoder divergence — encoder-internal PSNR drifting from
+the real decoded output, monotonically, down a GOP. It is not divergence. There is no difference
+between the encoder's reference and the decoder's. The metric was wrong.
+
+### Reproducing it, and the clue that broke it open
+
+The gap is content-dependent, which a real drift would not be. Over 10 frames at q=50, decoder
+minus encoder PSNR:
+
+| sequence | frame 0 → 9 |
+|---|---|
+| old_town_cross | −0.03 → 0.00, flat |
+| bbb | −0.04 → **+0.07** |
+| blue_sky | −0.05 → **+0.36** |
+
+blue_sky is a bright sky; old_town_cross is mid-tone detail. That pattern says *clipping*, not
+drift.
+
+Then the decisive one — the gap against quality, blue_sky, last frame of the GOP:
+
+| q | 25 | 50 | 75 | 90 |
+|---|---|---|---|---|
+| gap | +0.222 | +0.355 | +0.231 | **−0.530** |
+
+**It changes sign.** Drift accumulates in one direction; this does not.
+
+### The cause
+
+`bench::quality::psnr` compared raw `f32` values. What a viewer actually sees is what
+`pack_u8.wgsl` writes: `u32(clamp(f + 0.5, 0.0, peak))`. Two differences, pulling opposite ways:
+
+- **Clamping helps.** A reconstruction overshooting 255 in a bright sky is pulled back to 255,
+  which is closer to the source than the float value was. This grows down a GOP as error
+  accumulates and pushes further out of range — which is exactly what looked like drift.
+- **Rounding hurts.** Quantising to integers adds up to half a level of error the float
+  reconstruction does not carry. This dominates at high quality, where there is nothing left to
+  clip, and flips the sign.
+
+So the encoder was reporting the quality of a signal that never exists outside its own memory.
+
+### The fix and what it costs
+
+Every function in `bench::quality` now quantises both inputs to the output grid first, using the
+same expression as the pack shader in the same order. For a source loaded from an 8-bit PNG that
+is a no-op; for a float reconstruction it is the whole difference.
+
+The gap collapses from ±0.5 dB to ±0.005 dB — the residual is PNG round-trip noise:
+
+| q | 25 | 50 | 75 | 90 |
+|---|---|---|---|---|
+| gap after | +0.002 | −0.005 | +0.001 | −0.000 |
+
+**This matters most exactly where GNC is aimed.** At contribution quality the old metric
+*overstated* quality by half a dB, and it is the number rate control and any RD decision reads.
+
+### Two things it changed, both correctly
+
+**The checkerboard q90 baseline moved 50.82 → 50.19 dB.** That 0.63 dB is the cost of rounding to
+integers, which the float metric never charged. The codec did not change; the baseline was
+recording an unachievable number.
+
+**The PSNR monotonicity test started failing at the top end** — gradient q=90 scored 66.13 and
+q=95 scored 60.28. That is not a codec defect. Above about 55 dB the metric hits the 8-bit output
+grid: at 60 dB roughly 6% of samples differ from the source by exactly one level, at 66 dB about
+1.6%, and two encodes that both reconstruct to within ±1 can order either way depending on which
+pixels happen to round which way. Verified directly: a plain gradient is reconstructed **exactly**,
+zero error, from q=92 upward. The test now stops asserting monotonicity above 55 dB, with that
+reasoning written down.
+
+### Worth noting separately
+
+On the test gradient, q=90 costs 0.275 bpp and q=95 costs **1.142 bpp** — four times the bits for
+output that is bit-identical at 8 bits. That is the anchor ladder doing what it says (qstep 2.2 →
+about 1.45, dead zone to zero), not a bug, but it means **above roughly q=90 on smooth content an
+8-bit encode is paying for precision it cannot emit.** For a contribution codec that may output
+10-bit the calculation differs, which is the case for keeping the ladder — but a rate-control rule
+that knows the output bit depth would save those bits when it is 8.
+

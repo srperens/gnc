@@ -307,8 +307,19 @@ fn regression_quality_monotonicity_extended() {
                 result.psnr, result.bpp
             );
 
-            // inf PSNR (lossless) is always >= any finite value
-            if !result.psnr.is_infinite() {
+            // Above ~55 dB the metric hits the 8-bit output grid and stops measuring the codec.
+            // At 60 dB, MSE is 0.06 — about 6% of samples differ from the source by exactly one
+            // level, and at 66 dB about 1.6%. Two encodes that both reconstruct to within ±1 can
+            // therefore order either way depending on which pixels happen to round which way,
+            // and on smooth content GNC reaches that floor by q=90. Asserting monotonicity up
+            // there tests the rounding, not the codec.
+            //
+            // This only became visible when the metric started measuring the decoder's real
+            // output instead of the encoder's float reconstruction (BUG-8); the float metric had
+            // no floor and looked monotonic. Verified separately that a plain gradient is
+            // reconstructed *exactly* — zero error — from q=92 up, so there is no defect here.
+            const OUTPUT_GRID_FLOOR_DB: f64 = 55.0;
+            if !result.psnr.is_infinite() && result.psnr < OUTPUT_GRID_FLOOR_DB {
                 assert!(
                     result.psnr >= prev_psnr - 0.5,
                     "{name}: PSNR not monotonic: q={q} PSNR={:.2} < prev q={prev_q} PSNR={:.2}",

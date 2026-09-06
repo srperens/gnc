@@ -6621,3 +6621,49 @@ script and should be the next step before any code is written. Everything above 
 conditional entropy and says nothing about decode throughput, which is the other axis a
 contribution codec is judged on: an MQ coder is serial within a stream and far costlier per symbol
 than Rice.
+
+### EBCOT part 2, settled: the configuration to build, measured
+
+The recommended shape — CABAC-style binarisation, adaptive binary contexts (so no frequency
+tables), context from the fully-decoded vertical neighbours — measured against GNC's own coder on
+the same coefficients:
+
+| image | qstep 4 (GNC's operating point) | qstep 8 |
+|---|---|---|
+| touchdown_1080p | −6.4% | −9.8% |
+| bbb_1080p | −6.6% | −8.3% |
+| blue_sky_1080p | −11.6% | −13.3% |
+| kristensara_720p | **−14.5%** | **−18.9%** |
+| mean | **−9.8%** | **−12.6%** |
+
+Positive on all four, worst case −6.4%, and it beats EBCOT as specified (−7.3% mean at qstep 4)
+while needing far less machinery.
+
+Binarisation: significant?, then |v|>1?, |v|>2?, then the remainder as Exp-Golomb suffix bits and
+the sign, both bypassed at one bit each as CABAC does. Contexts on the three coded decisions only,
+bucketed from `2·|above| + |above-above|`.
+
+What it does **not** need, and why each drops out:
+
+- **No frequency tables.** Adaptive binary contexts are learned by the decoder. This is the whole
+  reason to binarise: the `--table-bits` sweep showed symbol-level context coding, which needs
+  tables, goes from −10.9% to +5.1% as the table charge rises from 8 to 64 bits per symbol per
+  context, and GNC's static per-tile rANS tables sit at the wrong end of that.
+- **No code-blocks and no plane-major scan.** The context is vertical, and a GNC stream *is* a tile
+  column, so all 256 streams still decode in parallel with the context available inside each one.
+  This is the property that makes it a fit for a GPU codec at all.
+- **No PCRD, and no truncatability.** Part 1: 0.00 dB at any granularity. Giving up plane-major
+  order gives up embedded truncation, which costs nothing here.
+
+Two things still unmeasured, and they are the ones that could sink it:
+
+1. **Decode throughput.** An adaptive binary coder is serial per symbol within a stream and much
+   costlier per symbol than Rice's branch-free path. GNC decodes 256 streams per tile in parallel
+   so the parallelism is intact, but per-symbol cost is not, and throughput is the axis a
+   contribution codec is judged on alongside rate. A 10% rate win that halves decode fps is not
+   obviously a win for this project.
+2. **Chroma.** Luma only, one crop per image, four images.
+
+The rate case is now strong enough that the next step is a CPU reference implementation behind an
+`EntropyCoder` variant — enough to confirm the rate on real bitstreams and to time the decode
+before committing to a shader.

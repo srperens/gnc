@@ -267,6 +267,56 @@ def vertical_context_bits(coef, table_bits=8.0):
     return total
 
 
+def binary_adaptive_vertical_bits(coef):
+    """The configuration actually recommended: CABAC-style binarisation, adaptive contexts, no
+    frequency tables, context from the *fully decoded* vertical neighbours.
+
+    Why this shape rather than EBCOT's:
+      - GNC decodes each stream's symbols in order, and a stream is a tile column, so when a
+        coefficient is decoded both coefficients above it are fully known — not partially known as
+        in a plane-major bit-plane scan. That is a strictly richer context, for free.
+      - Binary decisions mean an adaptive binary coder can be used, which carries no tables. The
+        table cost is what kills symbol-level context coding here (see the --table-bits sweep).
+      - Giving up plane-major order gives up truncatability, which part 1 measured at 0.00 dB.
+
+    Binarisation per coefficient: significant?, then |v|>1?, |v|>2?, then the remainder as raw
+    Exp-Golomb suffix bits (uncoded, as CABAC bypasses them), then the sign. Every coded decision
+    gets a context from the bucketed magnitudes of the two coefficients above; suffix and sign bits
+    are charged at one bit each, uncoded.
+    """
+    a = np.abs(coef).astype(np.int64)
+    up1 = np.vstack([np.zeros((1, a.shape[1]), dtype=np.int64), a[:-1]])
+    up2 = np.vstack([np.zeros((2, a.shape[1]), dtype=np.int64), a[:-2]])
+    nb = up1 * 2 + up2
+    ctx = np.where(nb == 0, 0, np.minimum(np.log2(np.maximum(nb, 1)).astype(np.int64) + 1, 5))
+
+    v = a.ravel()
+    c = ctx.ravel()
+    total = 0.0
+
+    # decision 1: significant?
+    t, _ = cond_entropy_bits(c, (v > 0).astype(np.int64))
+    total += t
+    # decision 2: |v| > 1, among the significant
+    m = v > 0
+    if m.any():
+        t, _ = cond_entropy_bits(c[m], (v[m] > 1).astype(np.int64))
+        total += t
+    # decision 3: |v| > 2, among those
+    m2 = v > 1
+    if m2.any():
+        t, _ = cond_entropy_bits(c[m2], (v[m2] > 2).astype(np.int64))
+        total += t
+    # remainder: Exp-Golomb order 0 of (|v| - 3), bypassed at one bit per bit
+    m3 = v > 2
+    if m3.any():
+        rem = v[m3] - 3
+        total += float((2 * np.floor(np.log2(rem + 1)) + 1).sum())
+    # sign, one bypassed bit per significant coefficient
+    total += float((v > 0).sum())
+    return total
+
+
 def h0_bits(coef):
     v = coef.astype(np.int64).ravel()
     _, counts = np.unique(v, return_counts=True)
@@ -309,9 +359,9 @@ def main():
           f"({args.levels} levels) ===")
     print(f"  {'qstep':>6} {'rice split':>11} {'rice 1-stream':>14} {'H0':>8} "
           f"{'ebcot':>8} {'+KT':>8} {'ebcot vs':>10} {'full-ctx':>10} {'full vs':>10} "
-          f"{'vert-ctx':>9} {'vert vs':>9}")
+          f"{'vert-ctx':>9} {'vert vs':>9} {'bin-adap':>9} {'bin vs':>8}")
     for q in args.qstep:
-        rs = r = h = e = ep = cc = vc = 0.0
+        rs = r = h = e = ep = cc = vc = ba = 0.0
         for bid, (nm, band, orient) in enumerate(named):
             qq = quantize(band * g[nm], q, args.dead_zone).astype(np.int64)
             rs += rice_zrl_split_bits(qq)
@@ -319,13 +369,15 @@ def main():
             h += h0_bits(qq)
             cc += context_coefficient_bits(qq, args.table_bits)
             vc += vertical_context_bits(qq, args.table_bits)
+            ba += binary_adaptive_vertical_bits(qq)
             a, b = band_bits(qq, orient, bid)
             e += a
             ep += b
         globals()["_ctx_coef_bpp"] = cc / px
         print(f"  {q:>6.1f} {rs/px:>11.4f} {r/px:>14.4f} {h/px:>8.4f} "
               f"{e/px:>8.4f} {ep/px:>8.4f} {(ep/rs-1)*100:>+9.1f}% "
-              f"{cc/px:>10.4f} {(cc/rs-1)*100:>+9.1f}% {vc/px:>9.4f} {(vc/rs-1)*100:>+8.1f}%")
+              f"{cc/px:>10.4f} {(cc/rs-1)*100:>+9.1f}% {vc/px:>9.4f} {(vc/rs-1)*100:>+8.1f}% "
+              f"{ba/px:>9.4f} {(ba/rs-1)*100:>+8.1f}%")
     print()
     print("  'rice split' is what GNC really codes: 256 independent streams per tile.")
     print("  'rice 1-stream' is one stream per subband — an idealised Rice that shares runs and")

@@ -649,11 +649,30 @@ Plan: adaptive binary coder, bit-planes, **GNC's vertical magnitude context rath
 neighbourhood**, no PCRD. Expected −9% to −12%. Ship as a fourth `EntropyCoder` variant, gated and
 measured against Rice at every quality like the other three.
 
-**Next step before writing code:** measure a bit-plane coder with the vertical magnitude context,
-adaptive and table-free. That exact configuration is unmeasured and it is a small extension of
-`meas_ebcot_context.py`. Also unmeasured: decode throughput. An MQ coder is serial within a stream
-and far costlier per symbol than Rice, and throughput is the other axis a contribution codec is
-judged on.
+**Measured 2026-09-06 — the configuration to build gives −9.8% mean.** CABAC-style binarisation
+(significant?, |v|>1?, |v|>2?, then Exp-Golomb suffix and sign bypassed), adaptive binary contexts
+so no frequency tables, context bucketed from the fully-decoded vertical neighbours:
+
+| image | qstep 4 (operating point) | qstep 8 |
+|---|---|---|
+| touchdown | −6.4% | −9.8% |
+| bbb | −6.6% | −8.3% |
+| blue_sky | −11.6% | −13.3% |
+| kristensara | **−14.5%** | **−18.9%** |
+| mean | **−9.8%** | **−12.6%** |
+
+Positive on all four, worst case −6.4%, and it beats EBCOT as specified (−7.3%) with far less
+machinery. No tables (adaptive), no code-blocks, no plane-major scan, no PCRD — and **all 256
+streams still decode in parallel**, because the context is vertical and a stream is a tile column.
+
+**Two risks, both unmeasured, either could sink it:**
+1. **Decode throughput.** An adaptive binary coder is serial per symbol and much costlier than
+   Rice's branch-free path. Parallelism across streams is intact; per-symbol cost is not. A 10%
+   rate win that halves decode fps is not a win for a contribution codec.
+2. **Chroma.** Luma only, one crop per image, four images.
+
+**Next step:** CPU reference implementation behind an `EntropyCoder` variant — enough to confirm
+the rate on real bitstreams and to time the decode, before committing to a shader.
 
 **Ceiling excludes:** the MQ coder's own adaptation loss (real coders land a couple of percent
 above conditional entropy), per-code-block length/pass overheads (GNC's equivalent is 4-5% of a

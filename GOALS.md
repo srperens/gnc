@@ -108,11 +108,22 @@ medium-cost incremental inter ideas. What it measured: the spatial layer is alre
 BD-rate +13.9% vs H.264 all-I, and *better* than H.264 all-I above ~36 dB — while the current
 I/P/B inter path saves only 17–27% vs all-I where H.264 saves 60–70%.
 
-**MEAS-1 (2026-09-05) measured the gap properly for the first time.** On video at matched VMAF,
-GNC needs **5-7x the bitrate of H.264** (BD-rate +457% / +494% / +672% on three sequences). Intra
-alone is +46-55%; inter coding multiplies the deficit a further 8-10x. The previously quoted
-+13.9% was PSNR on still images, which is a different measurement and much more flattering than
-the video reality. See [BASELINE.md](BASELINE.md).
+**MEAS-1 (2026-09-05) measured the gap properly for the first time — at the wrong operating
+point. QUAL-1 (2026-09-06) re-measured it at the right one.** MEAS-1 found GNC needing **5-7x**
+the bitrate of H.264 (BD-rate +457% / +494% / +672%) at *distribution* bitrates, with the quality
+ladder above q=92 dead. Re-run at contribution quality with that ladder working, the same harness
+and the same parameters gives **+90.5% BD-rate on PSNR — about 1.9x** (+129.0% bbb, +71.9%
+old_town, +70.6% crowd_run). Nothing in the coder changed between the two; the 5-7x figure was
+measured somewhere GNC is not built to operate. **Use +90.5%, and do not quote a VMAF BD-rate at
+this end** — widening the quality ladder moved the VMAF figure by 47.5 points on average and the
+PSNR figure by 1.0. The +13.9% still-image figure is PSNR on stills, a third quantity again.
+See [RESEARCH_LOG.md](RESEARCH_LOG.md), 2026-09-06.
+
+**And luma alone misleads here.** At rate matched to 1%, GNC beats x264 on CIEDE2000 (0.611 vs
+0.684 on bbb, 0.911 vs 0.949 on old_town, better 95th percentile on all three) while losing
+7.4-8.8 dB of luma PSNR. The two codecs allocate rate differently between luma and chroma, so a
+single luma number overstates the gap for a colour-critical use case and understates the luma
+deficit. Quote both.
 
 **MEAS-4 (2026-09-05) located that gap.** It is *prediction quality*, not the coding model.
 Simulating both models on GNC's own motion-compensated residuals at matched distortion, an
@@ -147,7 +158,8 @@ GNC should become a **good, robust codec** — not optimized along a single axis
 | Bit depth | 8-bit | 10-bit, in the format from the start |
 | Chroma formats | 4:4:4, 4:2:2, 4:2:0 | keep all three working at 10-bit |
 | Compression (intra) | +46–55% vs H.264 all-I on video (VMAF); +13.9% on stills (PSNR) | ≤ H.264 all-I, measured at contribution quality |
-| Compression (inter) | overall video BD-rate +457% to +672% vs H.264, measured at distribution bitrates with a known B-frame defect (BUG-5) | a static shot must cost near nothing; re-measure at contribution quality after BUG-5 |
+| Compression (video) | **+90.5% BD-rate on PSNR vs H.264 at contribution quality** (QUAL-1, 2026-09-06; +457% to +672% was distribution bitrates and is superseded) | ≤ +25%, and the remaining gap is intra |
+| Colour accuracy | **ahead of x264 on dE00 at matched rate** (0.611 vs 0.684 mean) while 7.4–8.8 dB behind on luma | keep the colour lead, close the luma gap |
 | Quality range | q=1–100 functional | smooth, predictable quality curve |
 | Robustness | basic test coverage | no artifacts, stable across q and content |
 | Bitstream | GNV1/GNV2 defined | well-specified, documented |
@@ -155,11 +167,11 @@ GNC should become a **good, robust codec** — not optimized along a single axis
 The two metrics at the top of that table have never been measured, and they are the ones the
 whole positioning rests on. They come before further compression work.
 
-**On the compression numbers:** the +457% to +672% figures were measured at distribution
-bitrates, which is the operating point GNC is not built for, and with B-frames enabled — and
-B-frames are now known to be defective (BUG-5: on unchanged content they cost 16.7x what P-frames
-cost, and 34% more than not coding inter frames at all). Those numbers should not be treated as a
-measurement of GNC's design until both are corrected.
+**On the compression numbers:** both objections to the +457% to +672% figures have now been
+settled rather than merely noted. B-frames were defective (BUG-5) and are off by default; the
+operating point was wrong, and QUAL-1 re-measured it at the contribution end, where the gap is
+**+90.5%**. Treat +457% to +672% as a historical distribution-bitrate figure only. The remaining
+gap is **intra** — inter breaks even for both codecs at this quality, and does so for x264 too.
 
 VC-2 (Dirac) demonstrates that a patent-free wavelet codec can do real temporal work (MCTF) and
 reach H.264-class compression. That remains the reference point for where the inter path could go.

@@ -13,10 +13,12 @@ primary figure here. BT.709 Y is reported alongside as the contaminated cross-ch
 what a YUV-based harness would show.
 """
 import sys
+from pathlib import Path
+
 import numpy as np
 from PIL import Image
 
-sys.path.insert(0, "scripts")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from chroma_metric import ciede2000, srgb_to_lab  # noqa: E402
 
 

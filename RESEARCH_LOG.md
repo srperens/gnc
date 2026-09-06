@@ -6449,3 +6449,91 @@ MEAS-1 needs re-running at the contribution end now that the range exists. The d
 gap (+306% to +617%) is unaffected and stands.
 
 165+11+8+1 tests pass; clippy clean on native and wasm.
+
+---
+
+## 2026-09-06 — EBCOT, part 2: the context-coded engine is worth about 9%, and it is worth building
+
+Part 1 closed EBCOT's rate-allocation half at 0.00 dB. This measures the other half: the engine —
+bit-plane coding with a significance context derived from the 8-neighbourhood, sign contexts, and
+magnitude-refinement contexts. `scripts/meas_ebcot_context.py`.
+
+### Method
+
+Every column comes from the **same quantised coefficients**, so the comparison is internal and does
+not depend on my DWT matching GNC's:
+
+- **rice split** — Golomb-Rice with the best per-band k plus ZRL, with the band cut into 256
+  interleaved independent streams and each charged a length field. This is what GNC actually does.
+- **rice 1-stream** — the same coder with one stream per subband, sharing runs and statistics
+  across the whole band. The gap to *rice split* is what GNC pays for its GPU parallelism.
+- **H0** — zeroth-order entropy per subband, a memoryless ideal.
+- **ebcot** — empirical conditional entropy of every coded bit given its context: the 9-context
+  zero-coding table by band orientation, sign contexts from the horizontal and vertical
+  neighbours' signs, three magnitude-refinement contexts. **+KT** adds a 0.5·log2(n)-per-context
+  learning cost, which is the fairer bound; both comparisons below use it.
+
+### Results — EBCOT against what GNC actually codes
+
+| image | qstep 4 | qstep 8 | qstep 16 |
+|---|---|---|---|
+| touchdown_1080p | −0.1% | −3.5% | −9.3% |
+| bbb_1080p | −6.2% | −5.8% | −5.9% |
+| kristensara_720p | **−15.0%** | **−18.7%** | **−22.3%** |
+| blue_sky_1080p | **−15.6%** | **−16.6%** | **−17.5%** |
+| mean | **−9.2%** | −11.2% | −13.8% |
+
+**Take the qstep-4 column as the headline: about −9%.** Those luma bitrates (0.98–1.75 bpp) are the
+ones that match GNC's real operating point — the codec's actual luma coefficient bpp at q=50 is
+around 1.0, so the coarser columns describe rates GNC does not run at, even though the gain grows
+there. Content variance is wide: 0% on touchdown, 15–16% on smooth content.
+
+Two supporting observations:
+
+**GNC's 256-way stream split is nearly free.** *rice split* against *rice 1-stream* is under 1% at
+qstep 4 and 3–5% at qstep 16. The parallelism that defines this codec's architecture costs almost
+nothing in compression, and an EBCOT implementation on independent code-blocks would keep it.
+
+**Context modelling is where the gain is, not the entropy coder.** H0 sits 4–7% below *rice split*
+and EBCOT sits a further 2–11% below H0. So roughly a third of the gain is available from any
+better memoryless coder and the rest requires the contexts.
+
+### Why this disagrees with "context-adaptive entropy ≤3.4%"
+
+That figure came from `GNC_SIG_CONTEXT`, which models **two** context signals — is the coefficient
+above significant, and is its parent in the coarser subband significant. Run on blue_sky at q=50 it
+reports the significance map's conditional entropy falling from 0.402 to 0.251 bits/coefficient
+with the above-neighbour context alone.
+
+EBCOT's model is not two signals. It is nine zero-coding contexts separated by band orientation,
+plus sign contexts, plus refinement contexts, applied per bit-plane rather than to a single
+significance decision. The ≤3.4% number is a correct measurement of a much weaker model, and it was
+read as a verdict on context modelling in general. I have not reconstructed exactly how ≤3.4%
+was converted to a total-bits share, so this is a difference in what was modelled, not a claim that
+the old number was computed wrongly.
+
+### Recommendation: build it, as a fourth entropy backend
+
+About 9% at GNC's operating point, up to 16% on smooth content, is the largest single-mechanism
+gain measured in this repo in some time — the whole of today's shipped work came to −5% BD-rate.
+It is roughly a third of the +28.3% intra gap to JPEG 2000, which is unsurprising, since it is
+JPEG 2000's own coder.
+
+Build it the way the other three backends were built: behind an `EntropyCoder` variant, measured
+against Rice at every quality, shipped only if it wins. It is not a small job — three coding passes
+per bit-plane, an MQ arithmetic coder, per-code-block state — but the parallelism question, which
+is the one that would have killed it for a GPU codec, is answered: code-blocks are independent, and
+the stream-split measurement above shows independence costs almost nothing.
+
+### What this ceiling does not include
+
+- **The MQ coder's own adaptation loss.** These figures are conditional entropy. A real MQ coder
+  typically lands within a couple of percent, so the achievable number is a little below −9%.
+- **Per-code-block overheads.** Code-blocks need their own length fields and pass boundaries, and
+  GP17 just measured GNC's equivalent at 4–5% of a frame. EBCOT's are not free either.
+- **Chroma.** Luma only, one crop per image, four images. The chroma planes are sparser and the
+  context model may behave differently there.
+- **Decode throughput.** GNC decodes 256 Rice streams per tile in parallel with no arithmetic
+  coder. An MQ coder is serial within a code-block. Blocks are independent so the parallelism is
+  there in principle, but the per-symbol cost is much higher and this measurement says nothing
+  about fps.

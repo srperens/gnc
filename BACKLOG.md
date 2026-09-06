@@ -595,12 +595,43 @@ and that slope depends on the *step*, not on the coefficient or its neighbours. 
 between groups cannot find a gain that is absent at the coefficient level — and coefficient-level
 RDOQ already measured +0.1%. Granularity was never the issue.
 
-**Part 2 — context-modelled bit-plane coder: open, being measured.** The other half is EBCOT's real
-engine: three coding passes per bit-plane with significance contexts from the 8-neighbourhood. The
-repo's existing 4c figure (1-neighbour context, ≤10.4%) was computed on *inter* residuals, and the
-+28.3% gap to JPEG 2000 is an *intra* number — wrong measurement for this question. Measure the
-conditional entropy of intra coefficients under EBCOT-style contexts against GNC's actual bits
-before deciding.
+**Part 2 — context-modelled bit-plane coder: about −9%. BUILD IT.**
+`scripts/meas_ebcot_context.py`. Conditional entropy of every coded bit under EBCOT's context model
+(9 zero-coding contexts by band orientation, sign contexts, 3 refinement contexts), against a
+faithful simulation of GNC's own coder on the **same coefficients** — Rice+ZRL with per-band k, cut
+into 256 interleaved independent streams each charged a length field.
+
+| image | qstep 4 (GNC's operating point) | qstep 8 | qstep 16 |
+|---|---|---|---|
+| touchdown | −0.1% | −3.5% | −9.3% |
+| bbb | −6.2% | −5.8% | −5.9% |
+| kristensara | **−15.0%** | −18.7% | −22.3% |
+| blue_sky | **−15.6%** | −16.6% | −17.5% |
+| mean | **−9.2%** | −11.2% | −13.8% |
+
+Take qstep 4 as the headline: those luma rates (0.98-1.75 bpp) match GNC's real operating point.
+**~9% mean, 0-16% by content**, and roughly a third of the +28.3% intra gap to JPEG 2000 — which is
+unsurprising, since it *is* JPEG 2000's coder. Larger than everything shipped today put together
+(−5% BD-rate).
+
+**The parallelism objection is answered.** GNC's 256-way stream split costs under 1% at qstep 4 and
+3-5% at qstep 16 against one stream per subband. Independence is nearly free here, and EBCOT
+code-blocks are independent, so a GPU implementation keeps the architecture.
+
+**Why this disagrees with the "context-adaptive entropy ≤3.4%" entry:** that came from
+`GNC_SIG_CONTEXT`, which models *two* signals (above-neighbour, parent-subband). EBCOT's model is
+nine orientation-separated zero-coding contexts plus sign and refinement contexts, applied per
+bit-plane. The old figure correctly measured a much weaker model and was read as a verdict on
+context modelling in general.
+
+**Build as a fourth `EntropyCoder` variant**, measured against Rice at every quality and shipped
+only if it wins — the same gate the other three passed. Not small: three passes per bit-plane, an
+MQ arithmetic coder, per-code-block state.
+
+**Ceiling excludes:** the MQ coder's own adaptation loss (real coders land a couple of percent
+above conditional entropy), per-code-block length/pass overheads (GNC's equivalent is 4-5% of a
+frame per GP17), chroma (luma only, one crop, four images), and decode throughput (an MQ coder is
+serial within a block and much costlier per symbol than Rice).
 
 ### BUG-8 — The encoder's local decode diverges from the real decoder down a GOP (**OPEN, not diagnosed**)
 bbb17, 17 frames, ki=17, q=50. Per-frame PSNR of the encoder's own reconstruction vs the actual

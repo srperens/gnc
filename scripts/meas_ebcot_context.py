@@ -1,0 +1,268 @@
+#!/usr/bin/env python3
+"""EBCOT part 2: what could a context-modelled bit-plane coder buy over GNC's Rice+ZRL?
+
+Part 1 (`meas_ebcot_pcrd.py`) showed EBCOT's rate-allocation half is worth 0.00 dB here. This
+measures the other half — the engine: three coding passes per bit-plane, with the significance bit
+of each coefficient coded under a context derived from its 8-neighbourhood's significance state
+and the subband's orientation.
+
+All three figures come from the *same* quantised coefficients, so they are directly comparable:
+
+  rice+zrl   Golomb-Rice with a per-subband optimal k plus zero-run-length, which is what GNC
+             actually codes with. Simulated rather than read from the encoder so it sees exactly
+             the coefficients the other two arms see.
+  H0         zeroth-order entropy per subband — an ideal memoryless coder. GNC's floor.
+  ebcot      empirical conditional entropy of each coded bit given its EBCOT context, summed over
+             bit-planes, plus context-coded sign bits. This is the rate an adaptive arithmetic
+             coder converges to, so it is a *ceiling* on what EBCOT's engine could achieve; the MQ
+             coder's own adaptation loss is not modelled and would make the real thing worse.
+
+The contexts follow JPEG 2000's significance-propagation table in spirit: the count of significant
+horizontal, vertical and diagonal neighbours, bucketed, and separated by band orientation. Sign
+bits get their own contexts from the signs of the horizontal and vertical neighbours. Magnitude
+refinement bits are coded under three contexts as in the standard (first refinement with and
+without significant neighbours, later refinements).
+
+Run:  python3 scripts/meas_ebcot_context.py <png> [--levels 5] [--qstep 8]
+"""
+
+import argparse
+import os
+import sys
+
+import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from meas4_oracle import dwt2, quantize, subband_gains  # noqa: E402
+
+
+def cond_entropy_bits(contexts, bits):
+    """Total bits an ideal adaptive coder spends on `bits` given `contexts`.
+
+    Sum over contexts of n_c * H(p_c) — the conditional entropy, which is what an adaptive
+    arithmetic coder converges to. Contexts seen once cost 0 by this measure, which flatters the
+    result slightly; the alternative (a Krichevsky-Trofimov style penalty) is reported too.
+    """
+    if len(bits) == 0:
+        return 0.0, 0.0
+    contexts = np.asarray(contexts)
+    bits = np.asarray(bits, dtype=np.int64)
+    total = 0.0
+    penalised = 0.0
+    for c in np.unique(contexts):
+        m = contexts == c
+        n = int(m.sum())
+        ones = int(bits[m].sum())
+        p = ones / n
+        if 0.0 < p < 1.0:
+            h = -(p * np.log2(p) + (1 - p) * np.log2(1 - p))
+        else:
+            h = 0.0
+        total += n * h
+        # Adaptive-coder learning cost: ~0.5*log2(n) bits per context (KT bound).
+        penalised += n * h + 0.5 * np.log2(max(n, 2))
+    return total, penalised
+
+
+def neighbour_counts(sig):
+    """(horizontal, vertical, diagonal) significant-neighbour counts for every position."""
+    p = np.pad(sig.astype(np.int8), 1)
+    h = p[1:-1, :-2] + p[1:-1, 2:]
+    v = p[:-2, 1:-1] + p[2:, 1:-1]
+    d = p[:-2, :-2] + p[:-2, 2:] + p[2:, :-2] + p[2:, 2:]
+    return h, v, d
+
+
+def zc_context(h, v, d, orient):
+    """Zero-coding context, JPEG 2000 Table D.1 in spirit: 9 contexts per orientation class."""
+    if orient == "HH":
+        hv = h + v
+        ctx = np.where(d >= 3, 8,
+              np.where((d == 2) & (hv >= 1), 7,
+              np.where((d == 2) & (hv == 0), 6,
+              np.where((d == 1) & (hv >= 2), 5,
+              np.where((d == 1) & (hv == 1), 4,
+              np.where((d == 1) & (hv == 0), 3,
+              np.where(hv >= 2, 2, np.where(hv == 1, 1, 0))))))))
+    else:
+        # For LL/LH/HL the standard swaps the roles of h and v by orientation; use h as the
+        # "preferred" direction for HL and v for LH, which is what the table encodes.
+        a, b = (v, h) if orient == "LH" else (h, v)
+        ctx = np.where(a >= 2, 8,
+              np.where((a == 1) & (b >= 1), 7,
+              np.where((a == 1) & (b == 0) & (d >= 1), 6,
+              np.where((a == 1) & (b == 0) & (d == 0), 5,
+              np.where((a == 0) & (b >= 2), 4,
+              np.where((a == 0) & (b == 1), 3,
+              np.where((a == 0) & (b == 0) & (d >= 2), 2,
+              np.where((a == 0) & (b == 0) & (d == 1), 1, 0))))))))
+    return ctx
+
+
+def band_bits(coef, orient, band_id):
+    """Simulate EBCOT bit-plane coding of one subband; return (ebcot_bits, ebcot_penalised)."""
+    mag = np.abs(coef).astype(np.int64)
+    sign = (coef < 0).astype(np.int8)
+    if mag.max() == 0:
+        return 0.0, 0.0
+    nplanes = int(mag.max()).bit_length()
+
+    sig = np.zeros(mag.shape, dtype=bool)
+    refined_once = np.zeros(mag.shape, dtype=bool)
+    zc_ctx_all, zc_bit_all = [], []
+    sc_ctx_all, sc_bit_all = [], []
+    mr_ctx_all, mr_bit_all = [], []
+
+    for plane in range(nplanes - 1, -1, -1):
+        bit = ((mag >> plane) & 1).astype(np.int8)
+        h, v, d = neighbour_counts(sig)
+
+        # Magnitude refinement: coefficients already significant.
+        mr = sig
+        if mr.any():
+            nb = (h + v + d) > 0
+            ctx = np.where(refined_once[mr], 2, np.where(nb[mr], 1, 0)).astype(np.int64)
+            mr_ctx_all.append(ctx + band_id * 3)
+            mr_bit_all.append(bit[mr])
+            refined_once = refined_once | mr
+
+        # Significance coding: not yet significant. Context from the neighbourhood.
+        ns = ~sig
+        if ns.any():
+            ctx = zc_context(h, v, d, orient)
+            zc_ctx_all.append(ctx[ns].astype(np.int64) + band_id * 9)
+            zc_bit_all.append(bit[ns])
+            # Sign coding for those that just became significant.
+            became = ns & (bit == 1)
+            if became.any():
+                ps = np.pad(np.where(sig, np.where(sign == 1, -1, 1), 0).astype(np.int8), 1)
+                hc = np.clip(ps[1:-1, :-2] + ps[1:-1, 2:], -1, 1)
+                vc = np.clip(ps[:-2, 1:-1] + ps[2:, 1:-1], -1, 1)
+                sc_ctx_all.append(
+                    ((hc[became].astype(np.int64) + 1) * 3 + (vc[became].astype(np.int64) + 1))
+                    + band_id * 9
+                )
+                sc_bit_all.append(sign[became])
+            sig = sig | became
+
+    total = pen = 0.0
+    for ctxs, bits in ((zc_ctx_all, zc_bit_all), (sc_ctx_all, sc_bit_all), (mr_ctx_all, mr_bit_all)):
+        if ctxs:
+            t, p = cond_entropy_bits(np.concatenate(ctxs), np.concatenate(bits))
+            total += t
+            pen += p
+    return total, pen
+
+
+def rice_zrl_bits(coef):
+    """Golomb-Rice with the best per-band k, plus zero-run-length, as GNC codes."""
+    v = coef.astype(np.int64).ravel()
+    nz = v != 0
+    # Zero runs between non-zeros, Rice-coded with their own k.
+    runs = []
+    run = 0
+    for is_nz in nz:
+        if is_nz:
+            runs.append(run)
+            run = 0
+        else:
+            run += 1
+    runs.append(run)
+    mags = np.abs(v[nz])
+    if mags.size == 0:
+        return float(len(runs) * 2)
+
+    def rice_cost(vals):
+        vals = np.asarray(vals, dtype=np.int64)
+        best = None
+        for k in range(16):
+            c = int(((vals >> k) + 1 + k).sum())
+            if best is None or c < best:
+                best = c
+        return best
+
+    # magnitudes coded as (mag-1), plus one sign bit each
+    return float(rice_cost(mags - 1) + mags.size + rice_cost(np.array(runs)))
+
+
+def rice_zrl_split_bits(coef, nstreams=256):
+    """Rice+ZRL as GNC actually codes it: the tile split into `nstreams` independent streams.
+
+    GNC gives each tile 256 fully independent entropy streams for GPU parallelism. Independent
+    streams cannot share a zero run across a boundary and each pays for its own length field, so
+    this is strictly worse than one stream per subband — and it is what the codec really does, so
+    the gap between this and `rice_zrl_bits` is the price of the parallelism.
+    """
+    v = coef.astype(np.int64).ravel()
+    if v.size == 0:
+        return 0.0
+    total = 0.0
+    # Interleave as the shader does: stream s takes every nstreams-th coefficient.
+    for s0 in range(min(nstreams, v.size)):
+        part = v[s0::nstreams]
+        if part.size == 0:
+            continue
+        total += rice_zrl_bits(part)
+        total += 8.0  # the stream's length field, Rice-coded per GP17: about a byte
+    return total
+
+
+def h0_bits(coef):
+    v = coef.astype(np.int64).ravel()
+    _, counts = np.unique(v, return_counts=True)
+    p = counts / counts.sum()
+    return float(-(p * np.log2(p)).sum() * v.size)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("png")
+    ap.add_argument("--levels", type=int, default=5)
+    ap.add_argument("--qstep", type=float, nargs="*", default=[4.0, 8.0, 16.0])
+    ap.add_argument("--dead-zone", type=float, default=0.75)
+    ap.add_argument("--crop", type=int, nargs=2, default=[1792, 1024])
+    args = ap.parse_args()
+
+    from PIL import Image
+
+    im = np.asarray(Image.open(args.png).convert("L"), dtype=np.float64)
+    cw, ch = args.crop
+    y0 = max(0, (im.shape[0] - ch) // 2)
+    x0 = max(0, (im.shape[1] - cw) // 2)
+    img = im[y0 : y0 + ch, x0 : x0 + cw]
+    px = img.size
+
+    ll, bands = dwt2(img, args.levels)
+    g = subband_gains(img.shape, args.levels)
+    named = [("LL", ll, "LL")]
+    for lv, (lh, hl, hh) in enumerate(bands):
+        named += [(f"LH{lv+1}", lh, "LH"), (f"HL{lv+1}", hl, "HL"), (f"HH{lv+1}", hh, "HH")]
+
+    print(f"\n=== EBCOT context-coding ceiling: {os.path.basename(args.png)} "
+          f"({args.levels} levels) ===")
+    print(f"  {'qstep':>6} {'rice split':>11} {'rice 1-stream':>14} {'H0':>8} "
+          f"{'ebcot':>8} {'+KT':>8} {'vs split':>10} {'vs 1-str':>9}")
+    for q in args.qstep:
+        rs = r = h = e = ep = 0.0
+        for bid, (nm, band, orient) in enumerate(named):
+            qq = quantize(band * g[nm], q, args.dead_zone).astype(np.int64)
+            rs += rice_zrl_split_bits(qq)
+            r += rice_zrl_bits(qq)
+            h += h0_bits(qq)
+            a, b = band_bits(qq, orient, bid)
+            e += a
+            ep += b
+        print(f"  {q:>6.1f} {rs/px:>11.4f} {r/px:>14.4f} {h/px:>8.4f} "
+              f"{e/px:>8.4f} {ep/px:>8.4f} {(ep/rs-1)*100:>+9.1f}% {(ep/r-1)*100:>+8.1f}%")
+    print()
+    print("  'rice split' is what GNC really codes: 256 independent streams per tile.")
+    print("  'rice 1-stream' is one stream per subband — an idealised Rice that shares runs and")
+    print("  statistics across the whole band, i.e. what GNC gives up for GPU parallelism.")
+    print("  'ebcot' is the conditional entropy, a ceiling: the MQ coder's own adaptation loss")
+    print("  is excluded. '+KT' adds a 0.5*log2(n)-per-context learning cost and is the fairer")
+    print("  bound; both 'vs' columns compare against +KT.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

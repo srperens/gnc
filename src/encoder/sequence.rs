@@ -302,7 +302,10 @@ impl EncoderPipeline {
 
             let is_keyframe = ki <= 1 || display_idx % ki == 0 || !has_reference || scene_cut_forced;
 
-            // Build per-frame config: override qstep if rate control is active
+            // Build per-frame config: override qstep if rate control is active.
+            // A quantiser *cascade* down the GOP (step growing with distance from the keyframe)
+            // was measured here and rejected — see RESEARCH_LOG 2026-09-06. It is the flat step
+            // in encode_pframe that pays; making it grow collapses the GOP tail.
             let frame_config = if let Some(ref rc) = rate_ctrl {
                 let mut cfg = config.clone();
                 cfg.quantization_step = rc.estimate_qstep();
@@ -310,6 +313,7 @@ impl EncoderPipeline {
             } else {
                 config.clone()
             };
+
 
             if is_keyframe {
                 let _t_iframe = std::time::Instant::now();

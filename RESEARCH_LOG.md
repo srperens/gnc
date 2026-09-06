@@ -6045,3 +6045,28 @@ Per-frame PSNR does decline across a GOP now — blue_sky at q=50 runs 41.3 → 
 41.3 → 38.3 — and that decline is real. It is also what moving to a lower-rate operating point
 looks like: at matched rate the floor is higher. Worth flagging because PSNR and VMAF disagree in
 sign here, and VMAF is the primary metric for the stated reason.
+
+### Quantiser cascade down the GOP — measured and rejected
+
+Natural follow-up to TUNE-5: if one flat step for all P-frames beats none, should the step also
+grow with distance from the keyframe? A P-frame late in the GOP is referenced by fewer frames than
+an early one, so the same reasoning appears to apply recursively.
+
+It does not. old_town, ki=17, at **exactly matched rate** (0.53 bpp both):
+
+| | VMAF mean | VMAF min |
+|---|---|---|
+| flat 1.25, q=30 | **81.63** | **79.32** |
+| cascade +0.03/frame, q=35 | 80.68 | 74.28 |
+
+Flat is +0.95 VMAF mean and **+5.04 VMAF min**. The mean-vs-min spread tells the story: 2.29
+points flat, 6.40 with the cascade, widening further at +0.06 and +0.10.
+
+This is the reference-error propagation the 2026-09-05 sweep warned about — it just is not
+triggered by a flat step. Each P-frame in a cascade predicts from a reference that was itself
+coded more coarsely than its own predecessor, so the error compounds geometrically instead of
+settling. A flat step reaches a steady state; a cascade never does.
+
+Worth recording as a pair with TUNE-5: the same argument that justifies separating I from P does
+*not* extend to separating P from P, and the reason is that the recursion has no fixed point.
+Lever removed rather than left in place — a rejected lever is dead code.

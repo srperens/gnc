@@ -781,6 +781,17 @@ chosen has to be justified, not just picked.
 
 `GNC_CHROMA_WEIGHT` is in place so the sweep can be repeated the moment a metric exists.
 
+### Closed by measurement 2026-09-06 — do not re-test
+- **Quantiser cascade down the GOP** (P-frame step growing with distance from the keyframe): at
+  exactly matched rate on old_town ki=17 a flat 1.25 step beats a +0.03/frame cascade by +0.95
+  VMAF mean and **+5.04 VMAF min**; the mean-vs-min spread goes 2.29 → 6.40 points. Each P in a
+  cascade predicts from a reference coded more coarsely than its own predecessor, so error
+  compounds geometrically instead of settling. TUNE-5's argument for separating I from P does not
+  extend to separating P from P. Lever removed.
+- **Hierarchically coded MV zero mask** (2x2 group flag instead of one bit per block): −0% to +3%,
+  sign flips with content. Helps only when the field is nearly all zero, which is when the MV field
+  is a negligible share of an already tiny frame.
+
 ### Closed by measurement 2026-09-05 — do not re-test
 - **Intra dead zone**: 0.75 is at its optimum; 0.4 and 1.5 both lose to changing q instead.
   Consistent with the RDOQ result.

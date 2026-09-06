@@ -731,7 +731,31 @@ pub fn quality_preset(q: u32) -> CodecConfig {
     };
     // Chroma weighting: HVS is less sensitive to chroma detail.
     // More aggressive at low quality where bitrate savings matter most.
-    // GNC_CHROMA_WEIGHT overrides for measurement — these were fixed guesses, never swept.
+    // Chroma quantiser multiplier: higher = coarser chroma = fewer chroma bits.
+    //
+    // CHROMA-1 (2026-09-06) swept this properly for the first time — the values below q=85 were
+    // fixed guesses. Measured on four images at q=75/85/92/96, BD-rate against the shipped
+    // policy, luma taken in YCoCg-R (a luma computed from decoded RGB is contaminated by chroma
+    // error and overstates the loss 3.7x) and colour as CIEDE2000:
+    //
+    //   weight  luma BD-rate  colour BD-rate  exchange rate
+    //     1.2       −5.2%         +1.2%          4.3:1
+    //     1.5      −12.9%         +4.0%          3.2:1
+    //     2.0      −21.8%         +9.7%          2.2:1
+    //     3.0      −32.0%        +22.2%          1.5:1
+    //
+    // The frontier is steep and the old `1.0` above q=85 sat off it: dropping the weight there
+    // spent bits on chroma that buy far more in luma. 1.2 is chosen because it is the largest
+    // value that costs **nothing** on MEAS-8's criterion — 95% of pixels below the JND — whose
+    // per-image pass counts are unchanged at every q. 1.5 and beyond do trade that away.
+    //
+    // **This is an intra lever.** Its reach is set by how much chroma residual there is to
+    // reclaim, and after motion compensation there is almost none: at q=92 on 4:4:4 video,
+    // weight 2.0 saves 20.8% of an all-intra sequence and only 2.9% of a ki=9 P-chain (1.5% at
+    // 4:2:0). So this helps all-intra and short-GOP contribution modes and does close to nothing
+    // in the default P-chain — which is also why the +90.5% video gap (QUAL-1) is *not* an
+    // allocation artefact. Ignored entirely at q=100, where the quantiser is bypassed and output
+    // stays bit-exact.
     weights.chroma_weight = std::env::var("GNC_CHROMA_WEIGHT")
         .ok()
         .and_then(|v| v.parse::<f32>().ok())
@@ -739,10 +763,8 @@ pub fn quality_preset(q: u32) -> CodecConfig {
             1.5
         } else if q < 60 {
             1.3
-        } else if q < 85 {
-            1.2
         } else {
-            1.0
+            1.2
         });
     let mut cfg = CodecConfig {
         quantization_step: qstep,

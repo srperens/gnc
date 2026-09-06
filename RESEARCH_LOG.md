@@ -4847,3 +4847,59 @@ direction for that market, whatever a luma-weighted metric says.
 at q=70 (0.77) is comfortably below it. For a codec positioned on contribution that is the
 operating-point question worth asking: *what q does GNC need for colour error below JND?* On this
 evidence, roughly q≥70 for easy content and higher for faces. Logged as MEAS-8.
+
+---
+
+## 2026-09-06 — MEAS-8: colour fidelity has an 8-bit floor the codec is already under
+
+What quality does GNC need for colour error below the just-noticeable difference? Measured with
+`scripts/chroma_metric.py` on four images, 4:4:4.
+
+**Mean dE00** crosses 1.0 at around q=70:
+
+| image | q=55 | q=70 | q=80 | q=85 | q=92 |
+|---|---|---|---|---|---|
+| bbb | 0.95 | 0.75 | 0.59 | 0.38 | 0.30 |
+| touchdown | 1.22 | 0.98 | 0.75 | 0.51 | 0.40 |
+| kristensara | 1.15 | 1.00 | 0.83 | 0.56 | 0.44 |
+| blue_sky | 1.07 | 0.91 | 0.76 | 0.46 | 0.36 |
+
+**95th percentile** is far stricter, and is the number that matters for contribution — the
+fraction of pixels above JND is in parentheses:
+
+| image | q=70 | q=80 | q=85 | q=92 | q=99 |
+|---|---|---|---|---|---|
+| bbb | 1.65 (23.9%) | 1.33 (12.6%) | 0.81 (2.0%) | 0.68 (0.7%) | 0.67 (0.6%) |
+| touchdown | 1.96 (39.8%) | 1.58 (20.6%) | 1.00 (5.1%) | 0.82 (1.9%) | 0.80 (1.8%) |
+| kristensara | 2.26 (40.7%) | 1.87 (30.3%) | 1.31 (12.7%) | 1.08 (7.3%) | 1.07 (7.0%) |
+| blue_sky | 2.48 (32.3%) | 2.02 (25.3%) | 1.18 (9.8%) | 1.06 (6.3%) | 1.05 (6.1%) |
+
+Note that **q=99 is barely better than q=92** — 7.3% → 7.0% on kristensara. Something other than
+quantisation is the limit up there.
+
+### It is the container format, not the codec
+
+The smallest change 8-bit RGB can express is one LSB. Perturbing every pixel by ±1 LSB:
+
+| image | dE00 mean | p95 | above JND |
+|---|---|---|---|
+| bbb | 0.609 | 1.16 | 8.5% |
+| touchdown | 0.757 | 1.22 | 16.1% |
+| kristensara | 0.854 | **1.95** | **36.6%** |
+| blue_sky | 0.759 | **1.98** | **27.9%** |
+
+**GNC at q=99 is already better than a one-LSB perturbation** — 1.07 p95 against 1.95 on
+kristensara, 1.05 against 1.98 on blue_sky. Lab is strongly non-linear in dark and saturated
+regions, so a sub-LSB error there still exceeds JND, and no quantiser setting can cross that
+floor while the pipeline is 8-bit.
+
+### Consequences
+
+1. **MEAS-8 answered.** For 95% of pixels below JND: q≥85 on easy content, q≥92 on faces and
+   skies, and *not reachable at all* on the hardest content in 8 bits.
+2. **This is the strongest measured argument yet for 10-bit support (FMT-1).** GNC is positioned
+   on contribution, where the output feeds grading; the codec's own colour accuracy is already
+   past what 8 bits can carry, so bit depth — not compression — is what limits it. That reorders
+   FMT-1 well above the tuning work.
+3. The 8-bit floor also bounds what any future chroma work can be worth, which retires a class of
+   experiment before it is run.

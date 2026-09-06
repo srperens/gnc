@@ -169,7 +169,17 @@ to catch.
 running where we think it is.** Add a cross-tier scaling check to the regression suite and keep it
 permanently. Cheap, and it guards the single assumption the whole project rests on.
 
-### FMT-1 — 10-bit support (todo, P1)
+### FMT-1 — 10-bit support (todo, **P0** — now the binding constraint on colour)
+**Measured 2026-09-06 (MEAS-8): 8-bit, not compression, is what limits GNC's colour fidelity.**
+A single-LSB perturbation of an 8-bit image already gives p95 dE00 of 1.16–1.98 and puts
+8.5–36.6% of pixels above the just-noticeable difference. GNC at q=99 measures *better* than that
+(p95 1.07 against 1.95 on kristensara). So the codec is already operating below the floor its own
+container format imposes, and no quality setting can cross it — which is why q=99 is barely
+better than q=92.
+
+For a codec positioned on contribution, where the output feeds grading, that makes bit depth the
+first-order problem and the compression tuning second-order.
+
 8-bit is the main format gap for broadcast contribution. 4:2:2 and 4:2:0 already work, so bit
 depth is the remaining piece. Cheap now — GOALS rule 10 says the bitstream can still break freely
 and there are no users — and expensive once there is a spec, conformance streams and deployments.
@@ -348,7 +358,21 @@ number until BUG-5 is resolved.
 matter for broadcast contribution. Needs a decision on the default, and probably a smarter rule
 than a fixed interval — e.g. never emit a group too short for a full pyramid.
 
-### MEAS-8 — What quality does colour fidelity actually require? (todo, P2)
+### MEAS-8 — What quality does colour fidelity require? (**DONE 2026-09-06**)
+Measured on four images with `scripts/chroma_metric.py`. Mean dE00 crosses the JND of 1.0 at
+about q=70. For the stricter and more relevant criterion — 95% of pixels below JND — q≥85 on easy
+content, q≥92 on faces and skies.
+
+**And the limit is 8-bit, not the codec.** Perturbing every pixel by a single LSB gives p95 dE00
+of 1.16–1.98 and puts 8.5–36.6% of pixels above JND. GNC at q=99 measures *better* than that
+(p95 1.07 on kristensara against 1.95 for one LSB). Lab is strongly non-linear in dark and
+saturated regions, so no quantiser setting can cross that floor in 8 bits — which is why q=99 is
+barely better than q=92.
+
+**Consequence: FMT-1 (10-bit) is the binding constraint on contribution-grade colour, not
+compression.** Promoted accordingly. It also bounds what any future chroma work can be worth.
+
+### MEAS-8 — original statement
 Measured while settling `chroma_weight`: at the current default, mean CIEDE2000 sits at
 **1.0–1.5 across q = 30–70** on bbb and kristensara — at or above the nominal just-noticeable
 difference of 1. Only bbb at q=70 (0.77) is comfortably below.

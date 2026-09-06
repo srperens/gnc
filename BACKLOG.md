@@ -106,12 +106,30 @@ quantiser makes the hypothesised half-step averaging offset relatively larger, w
 repo's primary test sequence. Historical inter conclusions drawn from bbb need re-checking on
 camera content.
 
-**Cheap conditional fix, available before any root-cause work:** disable or shorten the B-pyramid
-above a quality threshold. Worth 7-31% at contribution quality on camera content; a configuration
-change, not a bitstream change. Root cause still worth finding — it may be worth more.
+**Finer sweep 2026-09-06: there is no quality crossover. It is content, not quality.** Rate of
+the B-pyramid relative to P-only at matched VMAF, per qstep (positive = pyramid costs more):
 
-**Next step:** finer qstep sweep to locate the crossover per sequence, and a 4:2:0 cross-check.
-Full measurement in RESEARCH_LOG 2026-09-05.
+| qstep | bbb (animation) | old_town | speed_bag | touchdown |
+|---|---|---|---|---|
+| 4.0 | -34.3% | +5.7% | +26.7% | +7.3% |
+| 5.0 | -37.1% | +7.1% | +7.3% | +6.6% |
+| 6.0 | -39.1% | +7.1% | +4.0% | +3.9% |
+| 7.0 | - | +6.6% | - | +0.8% |
+| 8.0 | - | +16.3% | - | -6.5% |
+| 9.0 | - | +19.7% | - | - |
+
+The pyramid loses on camera content at nearly every rate point tested, and old_town gets *worse*
+at high qstep. It wins 34-39% on animation everywhere. **A quality threshold would have been the
+wrong fix**; the earlier reading of "wins at distribution bitrates" was an artefact of integrating
+BD-rate over the whole range.
+
+**Caveat (LOOP.md rule):** measured with VMAF, which scores luma only, at 4:4:4. B-frames do
+chroma motion compensation, so any chroma effect is invisible here. The luma conclusion stands;
+the chroma one is unvalidated. Cross-check with CIEDE2000 (MEAS-7) before treating it as settled.
+
+**Fix:** default the pyramid off on the quality-preset path, keep it available via
+`GNC_B_PYRAMID=1`. Justified on two independent measurements — rate on camera content, and 160 ms
+of reordering latency (MEAS-6) that applies regardless of content.
 
 ### MEAS-5 — Concurrent streams per GPU vs NVENC (partly answered 2026-09-05, P0)
 

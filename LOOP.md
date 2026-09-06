@@ -66,6 +66,28 @@ twice. Write them up as carefully as the wins.
 
 Read the tail of [RESEARCH_LOG.md](RESEARCH_LOG.md) — it is chronological and the last entries are
 the current picture. In brief: intra is roughly 1.4x behind H.264 and has room; inter is about 4x
-behind and the gap is architectural (ARCH-2, closed — fine-grained skip is unreachable with a
-tile-wide wavelet); 10-bit now works end to end and is worth 2.1–2.4x on colour accuracy at
-matched rate.
+behind; 10-bit now works end to end and is worth 2.1–2.4x on colour accuracy at matched rate.
+
+Also read **[docs/POSITIONING.md](docs/POSITIONING.md)** — what GNC is *for* (a contribution
+codec, not a distribution one), what that market requires, and which of the project's claims are
+real. It sets the operating point every target should be measured at, and several historical
+numbers in this repo were measured at the wrong one.
+
+**On the inter gap, be precise (reconciled 2026-09-06 — see the RESEARCH_LOG entry of that date).**
+"Architectural" is right about the *coupling* and wrong if read as a ceiling:
+
+- Right: 256 independent streams per tile → ~290 B fixed per-tile header → smaller tiles cost
+  +70% → the smallest region that can decline to be coded is 256x256 → almost nothing skips
+  (0–3% of tiles at q=75). The design choice that makes decode parallel is the one that blocks
+  fine-grained skip. ARCH-2 closed all three routes to finer granularity, correctly.
+- Wrong: Dirac shipped **this exact architecture** — closed-loop hybrid, OBMC, wavelet on the
+  motion-compensated residual, RDO — and landed at roughly H.264-class. The pipeline shape is not
+  the cap.
+- Also settled: adding rate-distortion decisions is **not** the answer either. Coefficient RDOQ
+  measured +0.1%, per-tile allocation 0.00 dB, tile skip dominated by simply raising q. A
+  POSITIONING.md draft prescribed RD decisions from published magnitudes; this repo's own numbers
+  refute it, and the document has been corrected.
+
+So the honest state is **open and unexplained after exhausting the local levers** — do not fill
+it with a guess. The one untested lever with a mechanism specific to a wavelet codec is OBMC.
+Expect single digits from it.

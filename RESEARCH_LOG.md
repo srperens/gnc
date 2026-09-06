@@ -5121,3 +5121,82 @@ data point, not a result.
 The full-sequence run on the same content is dominated by something already understood: Chimera is
 nearly static, so x264's inter frames cost 0.0093–0.027 bpp while GNC's have the floor measured in
 ARCH-2. That comparison says nothing new.
+
+---
+
+## 2026-09-06 — Reconciling LOOP.md and POSITIONING.md on the inter gap: POSITIONING was wrong
+
+### The conflict
+
+Two documents in this repo gave opposite answers to the same question.
+
+- **LOOP.md**: *"inter is about 4x behind and the gap is architectural (ARCH-2, closed —
+  fine-grained skip is unreachable with a tile-wide wavelet)."*
+- **POSITIONING.md §5** (written 2026-09-05 from an external literature sweep): the gap is **not**
+  architectural, and *"the missing machinery is rate-distortion decisions."*
+
+An autonomous session reads LOOP.md to know where it stands, so a wrong summary there sends the
+next run after the wrong thing. Resolved here before any further work.
+
+### Applying LOOP.md's own rule — check the new claim first
+
+POSITIONING's claim was the newer one, and it was built from published magnitudes rather than
+from this repo's measurements. Checked against the repo's own record, **it does not survive**:
+
+| this repo already measured | result |
+|---|---|
+| Coefficient-level RDOQ (per coefficient, D + λR, zero among the candidate levels) | **+0.1%** |
+| Per-tile RD bit allocation (equal-slope quantiser step per tile) | **0.00 dB at every rate** |
+| Energy-based tile skip, P and B paths | **−15% rate at VMAF 92.37 where the q-curve gives 94.1 at the same rate — dominated** |
+
+The RDOQ entry also gives a mechanism that generalises beyond intra: Rice+ZRL over 256
+interleaved streams has much weaker inter-coefficient dependence than x264's run-length,
+context-coded blocks, so there is no "cheap to drop" structure for an RD decision to exploit.
+
+And the tile-skip result is the direct refutation: an RD criterion would choose *which* tiles to
+zero; it would not change the granularity. **Granularity is what the measurements say is
+binding**, and a tile either survives whole or dies whole.
+
+**So POSITIONING.md §5's prescription was wrong, and it was wrong because it weighted published
+generic magnitudes (RDOQ is worth 6–8% in HEVC) above this repo's specific negatives.** Corrected
+in the document.
+
+### LOOP.md's wording is supported, with one precision
+
+"Architectural" is accurate if it means the *coupling*, and the chain is real and measured:
+
+> 256 independent entropy streams per tile → ~290 B fixed per-tile header → smaller tiles cost
+> +70% → the smallest region that can decline to be coded is 256×256 → almost every tile in real
+> content contains something → almost nothing skips (measured: 0–3% of tiles at q=75).
+
+The design choice that makes GNC decode in parallel is the same one that blocks fine-grained skip.
+That is a genuine architectural coupling, not a tuning failure.
+
+It is *not* accurate if it means "the architecture caps GNC here". Dirac shipped **this exact
+architecture** — closed-loop hybrid, OBMC, wavelet on the motion-compensated residual, RDO
+quantisation, arithmetic coding — and landed at roughly H.264-class rather than multiples behind.
+Whatever separates GNC from Dirac is not the shape of the pipeline.
+
+### What survives from POSITIONING §5 unchanged
+
+Independent of everything above, and not in conflict with any measurement here:
+
+- **Transform choice is not the answer.** Every published transform effect on motion-compensated
+  residuals sits at 5–15% (Kamisli & Lim's 1-D directional transforms 4.1–11.4%; OBMC 1–4%;
+  AV2 secondary transforms 1.8%) against a measured gap of 400–600%. Different kind of quantity.
+- **MCTF and in-band temporal lifting remain dead ends**, settled at standards level.
+
+### Honest state of the question
+
+**Unexplained after exhausting the locally available levers.** Multi-reference, sub-pel filters,
+motion search, context entropy, block transforms, sub-block masking, smaller tiles, dead zone,
+QP scaling, coefficient RDOQ, per-tile allocation and tile skip have all been measured and
+rejected. That is a legitimate scientific state and it should be recorded as one rather than
+filled with a guess — which is exactly what POSITIONING.md did.
+
+The one untested lever with a mechanism specific to *this* weakness is **OBMC**. A block-edge
+step in the residual is cheap for a DCT (it lands on a transform boundary) and expensive inside a
+256×256 CDF 9/7 tile, where it lights up coefficients at every scale. Dirac adopted OBMC for
+exactly this reason and it is patent-clear (H.263 Annex F era, shipped in AV1 under AOMedia's
+royalty-free licence). Published at 1–4% in DCT codecs; plausibly more here — **inference, not a
+measurement.**

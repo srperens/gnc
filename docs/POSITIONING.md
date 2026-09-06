@@ -298,16 +298,49 @@ critically-sampled wavelet because of shift variance; the standard remedy is a r
 overcomplete transform. If the rule exists for GPU-dataflow reasons, CLAUDE.md should say so —
 on compression grounds it is backwards.
 
-### What is actually missing: rate-distortion decisions
+### What is missing — corrected 2026-09-06
 
-Two independent literature sweeps converged on the same answer, and GNC's own measurements agree.
+An earlier version of this section claimed the missing machinery was rate-distortion decisions,
+reasoning from published magnitudes (RDOQ is worth 6–8% in HEVC, deblocking up to 9% in H.264).
+**That claim was wrong, and this repo had already measured it.** It is recorded here rather than
+quietly deleted, because the mistake is instructive: generic published magnitudes were weighted
+above this project's own specific negatives.
 
-**GNC makes no rate-distortion decision anywhere.** It quantises at the configured step and codes
-whatever comes out. Dirac had RDO mode decision. Every hybrid codec's inter advantage comes from
-most of a P-frame costing approximately nothing — skip flags, coded-block-pattern hierarchies,
-end-of-block. GNC has only the degenerate case: a tile that *happened* to quantise to all zeros.
+| already measured here | result |
+|---|---|
+| Coefficient-level RDOQ (per coefficient, D + λR, zero among the candidates) | **+0.1%** |
+| Per-tile RD bit allocation (equal-slope quantiser step per tile) | **0.00 dB at every rate** |
+| Energy-based tile skip, P and B paths | **dominated by simply raising q** — −15% rate at VMAF 92.37 where the q-curve gives 94.1 at the same rate |
 
-Measured support, 2026-09-05:
+The RDOQ entry also supplies a mechanism that generalises: Rice+ZRL over 256 interleaved streams
+has far weaker inter-coefficient dependence than x264's run-length, context-coded blocks, so there
+is no "cheap to drop" structure for an RD decision to exploit. And the tile-skip result is the
+direct refutation — an RD criterion would choose *which* tiles to zero, not change the
+granularity, and **granularity is what the measurements say is binding.**
+
+**What is actually binding is an architectural coupling, and it is measured end to end:**
+
+> 256 independent entropy streams per tile → ~290 B fixed per-tile header → smaller tiles cost
+> +70% → the smallest region that can decline to be coded is 256×256 → almost every tile in real
+> content contains something → almost nothing skips (0–3% of tiles at q=75).
+
+The design choice that makes GNC decode in parallel is the same one that blocks fine-grained skip.
+
+**But that coupling is not a ceiling.** Dirac shipped this exact architecture and landed at roughly
+H.264-class. Whatever separates GNC from Dirac is not the shape of the pipeline.
+
+**Honest state: unexplained after exhausting the locally available levers.** Multi-reference,
+sub-pel filters, motion search, context entropy, block transforms, sub-block masking, smaller
+tiles, dead zone, QP scaling, coefficient RDOQ, per-tile allocation and tile skip have all been
+measured and rejected. That is a legitimate result and it is recorded as one.
+
+The one untested lever with a mechanism specific to *this* weakness is **OBMC**. A block-edge step
+is cheap for a DCT — it lands on a transform boundary — and expensive inside a 256×256 CDF 9/7
+tile, where it lights up coefficients at every scale. Dirac adopted OBMC for exactly that reason,
+and it is patent-clear. Published at 1–4% in DCT codecs; plausibly more here, but that is
+inference, not a measurement.
+
+Supporting measurements, 2026-09-05:
 
 - **The fixed-cost floor is not the problem.** Tile headers are 3–16% of an inter frame on real
   content; coefficients are 84–97%.
@@ -372,12 +405,11 @@ In priority order. Items map to [BACKLOG.md](../BACKLOG.md).
    the historical GPU encoders' quality — scrutinise it as hard as the DWT.
 3. **10-bit through the video path** (FMT-1). A gate, not a feature. Cheaper than assumed: the
    still-image path already has the flag; `encode-sequence` has no bit-depth option at all.
-4. **Add a rate-distortion decision** (BUG-5 and successors). Minimal viable version: per tile,
-   compare the Lagrangian cost of coding the residual against zeroing it, take the cheaper. No
-   bitstream change. Then the same decision at code-block granularity, which needs one. x264's
-   decimation rule and an inter-specific dead zone are cheap approximations worth measuring first.
-   Note this is **pricing**, not masking — the earlier rejected experiment masked coefficients in
-   the wavelet domain, which changes the signal and causes ringing. Different thing.
+4. **Stop looking for the inter gap in the coding model** (§5, corrected 2026-09-06). Every
+   locally available lever has now been measured and rejected, RD decisions included. Treat the
+   gap as open and unexplained rather than prescribing a fix. The one untested lever with a
+   mechanism specific to a wavelet codec is OBMC — measure it, expect single digits, and do not
+   expect it to close a multiple.
 5. **Decide between live contribution and cloud mezzanine, and stop straddling** (§2).
 6. **Drop the B-pyramid at contribution quality.** Two independent measurements now agree it is
    the wrong default here: it costs 7–31% in rate on camera content (BUG-5) and 160 ms in latency

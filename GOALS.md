@@ -93,7 +93,10 @@ on a non-idle machine: GPU encode phase 12.2 fps, end to end 5.0 fps.
 - Single-frame encode 40 fps → target 60 fps
 - 8-bit only (10-bit not implemented) — the main format gap for broadcast contribution
 - 4:4:4 / 4:2:2 / 4:2:0 all implemented (`--chroma-format`)
-- No true lossless with Rice (near-lossless 56 dB at q=100)
+- ~~No true lossless with Rice~~ — **wrong, corrected 2026-09-06.** `q=100` is bit-exact lossless
+  on every entropy coder (Rice, rANS, default), verified on two 1080p images: max error 0, zero
+  wrong pixels. At 1.99:1 it beats JPEG 2000 lossless by 10.8% and PNG by 7.8%, and loses to FFV1
+  by 27% and x264 `-qp 0` by 43% — both of which use spatial prediction
 
 ## 4. Where We Stand & Goals
 

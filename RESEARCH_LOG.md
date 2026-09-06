@@ -7191,3 +7191,56 @@ point [docs/POSITIONING.md](../GOALS.md) says GNC is not built for.
    Multi-reference (1–5%), the B-pyramid and others were measured under configurations since found
    defective: BUG-4 (tile skip wrong everywhere), BUG-7 (diagnostics corrupting the encoder by 32%),
    and TUNE-5's P-frame quantiser scale. Cheap to re-run, and the scripts exist.
+
+---
+
+## 2026-09-06 — The lossless end: GOALS was wrong, and the missing lever is spatial prediction
+
+### q=100 is genuinely lossless
+
+GOALS listed "no true lossless with Rice (near-lossless 56 dB at q=100)" as a known gap. **That is
+wrong.** Verified bit-exactly rather than by PSNR, on two 1080p images across all three entropy
+coders:
+
+| image | coder | max error | wrong pixels |
+|---|---|---|---|
+| touchdown | Rice / rANS / default | **0** | **0 (0.00%)** |
+| bbb | Rice / rANS / default | **0** | **0 (0.00%)** |
+
+The lossless end of the range works. GOALS corrected.
+
+### Where it stands against the field
+
+touchdown 1080p, raw 6 220 800 B:
+
+| codec | bytes | ratio | vs GNC |
+|---|---|---|---|
+| x264 `-qp 0` | 1 781 088 | 3.49:1 | **−42.9%** |
+| FFV1 level 3 | 2 267 744 | 2.74:1 | **−27.4%** |
+| **GNC q=100 (rANS)** | **3 121 571** | **1.99:1** | — |
+| PNG −9 | 3 363 681 | 1.85:1 | +7.8% |
+| JPEG 2000 lossless | 3 458 583 | 1.80:1 | +10.8% |
+
+**GNC is the best wavelet here** — it beats JPEG 2000's reversible 5/3 path, its closest peer, by
+10.8%, and PNG by 7.8%. It loses to the two **predictive** coders.
+
+### The mechanism, and a lever measured at the wrong operating point
+
+FFV1 and x264-lossless both work by *spatial prediction* — a median or gradient predictor, or
+directional intra prediction — followed by entropy coding of the prediction error. A wavelet
+decorrelates by scale; a predictor decorrelates by neighbour. For lossless coding of natural
+images, prediction is the stronger tool, and the 27–43% gap is that difference.
+
+GNC **has** intra prediction, and it is disabled: measured at −11.76 dB and +29% bitrate, hence
+`intra_prediction: false`. **But that measurement was taken on lossy content**, where the wavelet
+has already removed most of the correlation a predictor would find and the predictor's own
+residual then quantises badly. At q=100 there is no quantiser, the transform is reversible, and
+prediction is precisely the tool the winning codecs use.
+
+**Proposal: re-gate intra prediction at q=100 only.** It is the one lever with a published
+mechanism pointing at exactly the gap measured here, it was rejected at a different operating
+point, and the code already exists behind a flag. Expected magnitude if the mechanism transfers:
+single-digit to 27%, bounded above by FFV1's margin.
+
+This is the same error pattern as TUNE-5 and the "inter saves 17–27%" figure: **a lever measured
+at one operating point and then assumed to hold at another.** Three instances in two days.

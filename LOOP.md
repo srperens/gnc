@@ -17,6 +17,19 @@ project is for.
    [COORDINATION.md](COORDINATION.md) rule 0 for the exact commands — pin it to a commit, give it
    its own `target/`, symlink `test_material/frames`, and remove it when you are done. Then claim
    your area in COORDINATION.md.
+0b. **Sync with `main` before you pick, never while you measure.** All the worktrees share one
+   `.git`, so another session's commit to `main` is visible to you *instantly* — `git log main`
+   is always current, no fetch needed — but your own files do not move until you
+   `git rebase main`. Visibility is automatic; adoption is not.
+
+   So at the top of each iteration: `git log --oneline main` to see what landed, read the
+   "Landed today, and what each one invalidates" section of
+   [COORDINATION.md](COORDINATION.md), then `git rebase main` and **re-run the gates** — a rebase
+   breaks things silently. After that, do not rebase again until the item is finished and
+   committed: a before-number and an after-number taken across a rebase are numbers from two
+   different codebases, and rule 1 says neither is valid. If something that landed invalidates the
+   item you were about to do, that is the cheapest possible time to find out.
+
 1. Read [BACKLOG.md](BACKLOG.md). Pick the item with the best value-to-effort ratio that is not
    blocked — not necessarily the highest-numbered priority.
 2. **Measure the current state before changing anything.** A change with no before-number is not

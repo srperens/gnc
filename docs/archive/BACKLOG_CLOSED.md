@@ -97,7 +97,7 @@ Summary of shipped improvements (RS-approved, DONE):
   3. Run VMAF baseline on current chroma variants (444 vs 422 vs 420 at q=50/75) and log in RESEARCH_LOG.md
   4. Document VMAF call convention in CLAUDE.md
 - **Success criteria:** `cargo run -- benchmark -i ... -q 75 --vmaf` prints VMAF score. `rd-curve --vmaf` outputs VMAF column. Chroma 422/420 VMAF baseline logged.
-- **Effort:** ~half day (libvmaf already at `/opt/homebrew/Cellar/libvmaf/3.0.0/bin/vmaf`; pattern exists in `benchmark-sequence`)
+- **Effort:** ~half day (libvmaf already installed and on `PATH`; pattern exists in `benchmark-sequence`)
 
 ### 9. Bilinear chroma upsampling for 4:2:2 / 4:2:0
 - **Status:** invalidated (2026-03-08) — experiment run, hypothesis disproven

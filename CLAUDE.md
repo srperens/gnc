@@ -46,6 +46,34 @@ Shader source is in `src/shaders/*.wgsl` (32 shaders). Rust host code is in `src
 - Each pipeline stage is a separate module; new experiments go in `src/experiments/`.
 - Don't commit test material to git (it's in `.gitignore`).
 
+## Never commit secrets or local infrastructure detail
+
+Everything in this repository is written as if it were public, because one day it may be. That
+means **no secrets and nothing that identifies a machine, an account, a network or a person.**
+
+Concretely, never commit:
+
+- **Absolute paths containing a username** — `/Users/<name>/src/gnc`, `/home/<name>/...`. Derive
+  the repository root instead: `REPO=$(git rev-parse --show-toplevel)` in shell,
+  `Path(__file__).resolve().parents[1]` in Python, or take it from an argument or environment
+  variable. Placeholders like `<repo-root>` are fine in prose.
+- **Private network addresses and hostnames** — LAN IPs (`192.168.x.x`, `10.x.x.x`), `*.local`
+  names, machine names. Detect or parameterise them at run time.
+- **Version-pinned local tool paths** — `/opt/homebrew/Cellar/<pkg>/<version>/bin/<tool>` says which
+  machine, which package manager and which version. Say `vmaf` and let `PATH` resolve it.
+- **Credentials of any kind** — API keys, tokens, passwords, certificates, private keys. Also no
+  `.env` files, and no `mkcert`-generated certs.
+- **Personal data** — names, email addresses, employer, session or scratchpad paths that embed a
+  session or user id.
+
+Two habits that make this cheap: paths in scripts are always *derived*, never *typed*; and before
+committing a document that explains a workflow, reread it for the machine it was written on. Both
+of the leaks found on 2026-09-06 were in workflow docs — a coordination file written by pasting
+real commands, and a benchmark script with a hardcoded frames directory.
+
+Git history is the one place this is expensive to undo, so the check belongs *before* the commit,
+not after.
+
 ## Research Protocol — Skeptical Scientific Method
 
 The team's core principle: **correctness over speed, measurement over assumption, skepticism over optimism.**
@@ -60,7 +88,7 @@ any decision about a chroma parameter — chroma weighting, CfL range, chroma fo
 questions need a chroma-aware metric; VMAF answers luma questions.**
 - VMAF catches perceptual regressions that PSNR misses (proven: TILE_ENERGY_ZERO_THRESH ghosting bug, chroma subsampling penalty)
 - Always run `--vmaf` on `benchmark` and `rd-curve`. Success criteria must include VMAF.
-- VMAF binary: `/opt/homebrew/Cellar/libvmaf/3.0.0/bin/vmaf` (also in PATH as `vmaf`)
+- VMAF binary: `vmaf`, resolved from `PATH` (libvmaf 3.0.0 here; install it however your platform prefers)
 - Tolerances: VMAF regression >0.5 points = BLOCK. PSNR regression >0.3 dB = flag but investigate.
 
 ### Before any experiment

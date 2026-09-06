@@ -1,6 +1,6 @@
 # Coordination between concurrent Claude sessions
 
-**Five Claude sessions work on this repository. Do not work in `/Users/per/src/gnc` directly.
+**Five Claude sessions work on this repository. Do not work in the shared checkout directly.
 Your first action in a session is to move into your own git worktree.**
 
 Sharing one working directory does not work, and we have the scars: a published BD-rate figure had
@@ -11,10 +11,19 @@ sessions' edits to `abac.rs` and `gpu_util.rs` overwrote each other and were los
 ## Rule 0 — start here, every session
 
 ```bash
-# Pick a short name for the area you are working on, not for the session.
-git -C /Users/per/src/gnc worktree add -b <area> /Users/per/src/gnc-<area> main
-cd /Users/per/src/gnc-<area>
-ln -s /Users/per/src/gnc/test_material/frames test_material/frames   # gitignored, ~GB
+# Derive the paths, never type them — see CLAUDE.md, "Never commit secrets or local
+# infrastructure detail". Pick a short name for the *area*, not for the session.
+REPO=$(git rev-parse --show-toplevel)
+AREA=<area>
+git -C "$REPO" worktree add -b "$AREA" "$REPO-$AREA" main
+cd "$REPO-$AREA"
+
+# Link the test material in. NEVER run this in the shared checkout, and never with -f:
+# `frames` there is itself a symlink to the real ~31 GB directory, and `ln -sfn` pointed it
+# at itself on 2026-09-06, breaking every session's measurements at once.
+[ "$PWD" != "$REPO" ] || { echo "refusing: you are in the shared checkout"; return 1 2>/dev/null || exit 1; }
+ln -s "$(readlink "$REPO/test_material/frames" || echo "$REPO/test_material/frames")" \
+      test_material/frames
 ```
 
 `test_material/` itself is tracked (it holds the fetch script), so symlink `frames` inside it
@@ -25,8 +34,8 @@ table below. Each worktree has its own
 When your work is ready:
 
 ```bash
-cargo test --release && cargo clippy --release          # the usual gates, in your worktree
-git -C /Users/per/src/gnc-<area> push -u origin <area>  # or merge to main if you own it
+cargo test --release && cargo clippy --release   # the usual gates, in your worktree
+git push -u origin "$AREA"                       # or merge to main if you own it
 ```
 
 To merge into main, rebase onto it first so the history stays linear and conflicts surface in your
@@ -37,18 +46,19 @@ git fetch origin && git rebase origin/main
 cargo test --release                                   # rebase can break things silently
 ```
 
-Clean up when the area is done: `git -C /Users/per/src/gnc worktree remove /Users/per/src/gnc-<area>`.
+Clean up when the area is done: `git -C "$REPO" worktree remove "$REPO-$AREA"`.
 
-**`/Users/per/src/gnc` itself stays on `main` and is for merging and reading, not for editing.**
+**The shared checkout stays on `main` and is for merging and reading, not for editing.**
 
 ## Worktrees currently out
 
-Add your row when you create one, remove it when you are done.
+Add your row when you create one, remove it when you are done. Write the worktree **relative to
+the shared checkout** — no absolute paths, no session ids.
 
 | worktree | branch | area |
 |---|---|---|
-| `/Users/per/src/gnc-abac` | `abac` | adaptive binary code-block entropy coder (EBCOT follow-up), CPU + GPU. Rate −19 to −25% confirmed; GPU decode bit-exact but 6-13 fps, so throughput is the open gate. |
-| `…/60395aaf…/scratchpad/wt-tile` | `fix/bug-11-rice-stream-mapping` | Rice stream mapping + tile/level config (BUG-11, BUG-12) — **merging now, then removed** |
+| `../gnc-abac` | `abac` | adaptive binary code-block entropy coder (EBCOT follow-up), CPU + GPU. Rate −19 to −25% confirmed; GPU decode bit-exact but 6-13 fps, so throughput is the open gate. |
+| `../gnc-tile` (scratchpad) | `fix/bug-11-rice-stream-mapping` | Rice stream mapping + tile/level config (BUG-11, BUG-12) — **merging now, then removed** |
 
 ## The four rules that have actually bitten us
 
@@ -72,6 +82,14 @@ the option that spends more bits. Use BD-rate, or compare at matched rate. At le
 wrong conclusions have come from this one error.
 
 ## Landed today, and what each one invalidates
+
+- **The test material was unreachable for about ten minutes (18:04, restored).** `ln -sfn` run
+  inside the shared checkout pointed `test_material/frames` at itself, so every worktree's link
+  resolved to a loop and no session could read a test image. Restored to the real directory and
+  rule 0's command is now guarded against being run in the shared checkout. **Lost in the process:
+  the `frames/hdr/` 10-bit material**, which was generated rather than fetched — regenerate it with
+  `scripts/png16.py` if a 10-bit measurement is needed. Nothing else was lost, and no committed
+  result depended on it.
 
 - **BUG-11 + BUG-12** — Rice's stream mapping is now tile-width-aware (column-major, cut into 256
   contiguous segments) and the wavelet-level ceiling now follows the tile size actually in use.

@@ -8,9 +8,14 @@ WEBDIR="$REPO/examples/web"
 CERT="$WEBDIR/localhost+1.pem"
 KEY="$WEBDIR/localhost+1-key.pem"
 
+# LAN address for testing from another device. Detected, not hardcoded — a committed
+# address identifies a network (CLAUDE.md, "Never commit secrets or local infrastructure
+# detail"). Override with GNC_LAN_IP, or leave unset for localhost only.
+LAN_IP="${GNC_LAN_IP:-$(ipconfig getifaddr en0 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}')}"
+
 if [ ! -f "$CERT" ] || [ ! -f "$KEY" ]; then
     echo "No TLS certs found. Generating with mkcert..."
-    (cd "$WEBDIR" && mkcert localhost 192.168.5.130)
+    (cd "$WEBDIR" && mkcert localhost ${LAN_IP:+"$LAN_IP"})
 fi
 
 echo "Building WASM..."
@@ -19,7 +24,7 @@ echo "Building WASM..."
 echo ""
 echo "Serving at:"
 echo "  https://localhost:${PORT}/examples/web/player.html"
-echo "  https://192.168.5.130:${PORT}/examples/web/player.html"
+[ -n "$LAN_IP" ] && echo "  https://${LAN_IP}:${PORT}/examples/web/player.html"
 echo ""
 echo "Press Ctrl-C to stop."
 

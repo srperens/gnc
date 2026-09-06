@@ -11,10 +11,15 @@ zeroth-order entropy of the residual. Calibrated against FFV1's real output on t
 the model's optimism is visible rather than assumed.
 """
 import os, subprocess, sys
+from pathlib import Path
 import numpy as np
 from PIL import Image
 
-FRAMES = "/Users/per/src/gnc/test_material/frames"
+# Derived, never typed: scripts/ sits one level below the repo root.
+# GNC_FRAMES overrides it if the test material lives elsewhere.
+FRAMES = os.environ.get(
+    "GNC_FRAMES", str(Path(__file__).resolve().parents[1] / "test_material" / "frames")
+)
 
 def ycocg_r(rgb):
     """Integer-reversible YCoCg-R, the same transform GNC uses."""

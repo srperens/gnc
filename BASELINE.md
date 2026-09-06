@@ -13,13 +13,23 @@ they were scored through a stream mapping that penalised the larger-tile arm by 
 that flag clobbered the motion-compensation reference and inflated files by 32%. Re-measure
 anything quoted from a diagnostics-enabled run.
 
-## Session of 2026-09-06, against the morning's commit (90ae8b1)
+## Partial session figure, 2026-09-06 — **stale, do not quote as the session total**
 
-BD-rate on VMAF at matched quality, both binaries built from pinned checkouts:
+BD-rate on VMAF at matched quality, HEAD-at-the-time against the morning's commit `90ae8b1`, both
+binaries built from pinned checkouts:
 
 | stills | mean **−5.04%** | blue_sky −10.59%, touchdown −5.07%, kristensara −2.39%, bbb −2.09% |
 |---|---|---|
 | video | mean **−5.43%** | old_town −5.99%, aerial −4.87% |
+
+It covers BUG-6, FMT-2/GP17 and TUNE-5 only. **Everything after it is missing**: TUNE-6 (which
+partly reversed TUNE-5 above q=80), MEAS-2's AQ rule change and reference-deblock default flip,
+and the work the other sessions landed the same day. The figure is not wrong for what it measured —
+BD-rate on VMAF is unaffected by the BUG-8 metric fix, since VMAF was always computed from decoded
+output — it is simply a mid-session snapshot that reads like a total.
+
+A real session total needs one fresh sweep against `90ae8b1` from current HEAD. Not done: it is a
+long measurement and the machine is shared.
 
 ## Single-Frame (bbb_1080p, Rice, 4:4:4)
 
@@ -28,22 +38,31 @@ Re-measured 2026-09-06 after BUG-6 made 5 wavelet levels the default at q ≥ 25
 
 | q   | PSNR     | BPP  | VMAF  | levels |
 |-----|----------|------|-------|--------|
-| 25  | 35.24 dB | 1.61 | 90.38 | 5 |
-| 50  | 40.34 dB | 2.73 | 95.02 | 5 |
-| 75  | 44.47 dB | 4.53 | 96.57 | 5 |
-| 90  | 51.02 dB | 8.58 | 97.08 | 5 |
+| 25  | 35.51 dB | 1.60 | 90.25 | 5 |
+| 50  | 40.30 dB | 2.73 | 95.02 | 5 |
+| 75  | 44.84 dB | 4.53 | 96.58 | 5 |
+| 90  | 50.41 dB | 8.58 | 97.08 | 5 |
+
+**PSNR figures recorded before BUG-8 (2026-09-06) are not comparable to these.** The metric used
+to compare the encoder's `f32` reconstruction; it now compares what the decoder actually emits,
+`u32(clamp(f + 0.5, 0.0, peak))`. Clamping helps and rounding hurts, so the correction changes
+sign with quality — on this exact table: q=25 +0.27 dB, q=50 −0.04, q=75 +0.37, **q=90 −0.61**.
+bpp and VMAF are untouched, because VMAF was always computed from decoded output and was
+therefore already honest. If a PSNR number here disagrees with an older one by a few tenths in
+either direction, this is why; re-measure rather than reconciling.
 
 The bpp column dropped again with GP17 (Rice-coded stream-length tables, 2026-09-06) at
 **bit-identical output** — PSNR and VMAF are unchanged by construction, only the headers shrank.
 
-Against the 2026-09-05 rows, q=50 and q=75 are unchanged within noise; **q=25 moved to a different
-operating point** — 1.89 → 1.61 bpp (−15%) for −0.20 dB and −0.64 VMAF. A VMAF drop that comes
-with a 15% rate drop is a move along the RD curve, not a regression — but it means **the q=25 row
-is not comparable to the old one point-for-point.** Compare with BD-rate, or at matched rate.
+Against the 2026-09-05 rows, **q=25 moved to a different operating point** — 1.89 → 1.60 bpp
+(−15%) for −0.77 VMAF. A VMAF drop that arrives with a 15% rate drop is a move along the RD curve,
+not a regression, but it means **the q=25 row is not comparable to the old one point-for-point.**
+Compare with BD-rate, or at matched rate.
 
-The q=25 row was first logged here as 34.94 dB / 1.60 bpp. That reading came from an uncommitted
-working tree shared with a second agent and does not reproduce; re-derived against the commit it is
-35.24 dB / 1.61 bpp. Measure against a hash, not a checkout.
+Two corrections this row has already needed, both worth remembering. It was first logged as
+34.94 dB / 1.60 bpp, from an uncommitted working tree shared with another session; that does not
+reproduce — measure against a hash, not a checkout. It was then logged as 35.24 dB under the old
+float metric; it is 35.51 dB now that the metric measures the decoder's real output.
 
 Previous (perceptual weights, #64): q=75 → 42.17 dB / 3.83 bpp / VMAF 95.05
 

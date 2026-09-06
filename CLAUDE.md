@@ -2,7 +2,11 @@
 
 All project goals, design rules, and priorities are in **[GOALS.md](GOALS.md)** — the single source of truth. This file contains only AI-specific instructions and technical reference.
 
-**Two Claude sessions work in this checkout concurrently. Read [COORDINATION.md](COORDINATION.md) before starting and update it when you claim or release an area** — it lists what is in flight, what each recent change invalidated, and the measurement rules that have already cost retracted results.
+**Up to five Claude sessions work on this repository concurrently. Start by moving into your own
+git worktree — [COORDINATION.md](COORDINATION.md) rule 0 — then read the rest of that file and
+claim your area in it.** It lists what is in flight, what each recent change invalidated, and the
+measurement rules that have already cost retracted results. The shared checkout is for reading,
+for the coordination and log files, and for merging; it is not where you work.
 
 ## Build & Run
 

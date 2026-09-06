@@ -27,7 +27,13 @@ ln -sfn /Users/per/src/gnc/test_material/frames <your-scratchpad>/wt/test_materi
   months with uncommitted diffs in them.
 
 Editing `src/` in the shared checkout while four other sessions do the same is how the failures in
-the next section happened. A shared working tree makes every session's numbers mutually invalid —
+the next section happened. The sharpest example, 17:30 on 2026-09-06: the abac session's 16-bit
+entropy coder was reverted to HEAD's 32-bit version while its GPU decode shader — a direct port of
+the 16-bit one — was left in place, along with a `mod.rs` declaration and a `gpu_util.rs` helper
+that vanished from under the module needing them. Nothing warned anyone. The symptom was a
+bit-exactness test failing at coefficient 8, which reads exactly like a shader bug and is not one.
+**A half-reverted entropy coder is the worst case of this failure mode**, because an arithmetic
+decoder that disagrees with its encoder does not error — it produces plausible garbage. A shared working tree makes every session's numbers mutually invalid —
 not just risky, invalid, because no number can be attributed to a known state of the code.
 
 ## The three rules that have actually bitten us

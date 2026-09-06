@@ -295,6 +295,30 @@ fn optimal_k(values: &[u32]) -> u8 {
     (63 - mean.leading_zeros()).min(15) as u8
 }
 
+/// Tile-local raster index of symbol `s` in stream `stream_id`.
+///
+/// Streams walk the tile in **column-major** order, cut into `RICE_STREAMS_PER_TILE` contiguous
+/// segments, so the previous symbol in a stream is the coefficient directly above it. That
+/// vertical adjacency is what the adaptive *k* and the zero runs are tuned against.
+///
+/// BUG-11: the mapping used to be `stream_id + s * RICE_STREAMS_PER_TILE`, i.e. `i % 256`. At the
+/// default 256 px tile a segment is exactly one column and the two agree coefficient for
+/// coefficient, so shipped bitstreams are unchanged. At any other width `i % 256` interleaved
+/// columns `tile_size / 256` apart into a single stream and *k* tracked an EMA over a mixture of
+/// unrelated regions — which is why every past tile-size experiment scored the larger-tile arm
+/// through a penalty that had nothing to do with the geometry.
+#[inline]
+fn stream_coeff_index(
+    stream_id: usize,
+    s: usize,
+    symbols_per_stream: usize,
+    tile_size: usize,
+) -> usize {
+    // Column-major position within the tile: j = x * tile_size + y.
+    let j = stream_id * symbols_per_stream + s;
+    (j % tile_size) * tile_size + j / tile_size
+}
+
 /// Encode a tile of quantized coefficients using Golomb-Rice with zero-run-length.
 ///
 /// Token encoding (per stream):
@@ -331,7 +355,8 @@ pub fn rice_encode_tile(coefficients: &[i32], tile_size: u32, num_levels: u32) -
         let mut zrl_ctx_large = false; // context when this zero run started
         let mut last_mag_large = false; // true if preceding nonzero had |coeff|>=2
         for s in 0..symbols_per_stream {
-            let coeff_idx = stream_id + s * RICE_STREAMS_PER_TILE;
+            let coeff_idx =
+                stream_coeff_index(stream_id, s, symbols_per_stream, tile_size as usize);
             if coefficients[coeff_idx] == 0 {
                 if run == 0 {
                     let y = (coeff_idx / tile_size as usize) as u32;
@@ -396,7 +421,8 @@ pub fn rice_encode_tile(coefficients: &[i32], tile_size: u32, num_levels: u32) -
 
         let mut last_mag_large = false;
         while s < symbols_per_stream {
-            let coeff_idx = stream_id + s * RICE_STREAMS_PER_TILE;
+            let coeff_idx =
+                stream_coeff_index(stream_id, s, symbols_per_stream, tile_size as usize);
             let y = (coeff_idx / tile_size as usize) as u32;
             let x = (coeff_idx % tile_size as usize) as u32;
             let g = compute_subband_group(x, y, tile_size, num_levels);
@@ -412,7 +438,8 @@ pub fn rice_encode_tile(coefficients: &[i32], tile_size: u32, num_levels: u32) -
                 let mut run = 1u32;
                 let mut ns = s + 1;
                 while ns < symbols_per_stream {
-                    let next_idx = stream_id + ns * RICE_STREAMS_PER_TILE;
+                    let next_idx =
+                        stream_coeff_index(stream_id, ns, symbols_per_stream, tile_size as usize);
                     let ny = (next_idx / tile_size as usize) as u32;
                     let nx = (next_idx % tile_size as usize) as u32;
                     let ng = compute_subband_group(nx, ny, tile_size, num_levels);
@@ -490,7 +517,8 @@ pub fn rice_encode_tile(coefficients: &[i32], tile_size: u32, num_levels: u32) -
 
         let mut last_mag_large = false;
         while s < symbols_per_stream {
-            let coeff_idx = stream_id + s * RICE_STREAMS_PER_TILE;
+            let coeff_idx =
+                stream_coeff_index(stream_id, s, symbols_per_stream, tile_size as usize);
             let y = (coeff_idx / tile_size as usize) as u32;
             let x = (coeff_idx % tile_size as usize) as u32;
             let g = compute_subband_group(x, y, tile_size, num_levels);
@@ -506,7 +534,8 @@ pub fn rice_encode_tile(coefficients: &[i32], tile_size: u32, num_levels: u32) -
                 let mut run = 1u32;
                 let mut ns = s + 1;
                 while ns < symbols_per_stream {
-                    let next_idx = stream_id + ns * RICE_STREAMS_PER_TILE;
+                    let next_idx =
+                        stream_coeff_index(stream_id, ns, symbols_per_stream, tile_size as usize);
                     let ny = (next_idx / tile_size as usize) as u32;
                     let nx = (next_idx % tile_size as usize) as u32;
                     let ng = compute_subband_group(nx, ny, tile_size, num_levels);
@@ -599,7 +628,8 @@ pub fn rice_decode_tile(tile: &RiceTile) -> Vec<i32> {
         let mut s = 0usize;
         let mut last_mag_large = false;
         while s < symbols_per_stream {
-            let coeff_idx = stream_id + s * RICE_STREAMS_PER_TILE;
+            let coeff_idx =
+                stream_coeff_index(stream_id, s, symbols_per_stream, tile_size);
             let cy = (coeff_idx / tile_size) as u32;
             let cx = (coeff_idx % tile_size) as u32;
             let cur_g = compute_subband_group(cx, cy, tile.tile_size, tile.num_levels);
@@ -619,7 +649,8 @@ pub fn rice_decode_tile(tile: &RiceTile) -> Vec<i32> {
                 let mut written = 0u32;
                 let mut ws = s;
                 while written < run && ws < symbols_per_stream {
-                    let wi = stream_id + ws * RICE_STREAMS_PER_TILE;
+                    let wi =
+                        stream_coeff_index(stream_id, ws, symbols_per_stream, tile_size);
                     let wy = (wi / tile_size) as u32;
                     let wx = (wi % tile_size) as u32;
                     let wg = compute_subband_group(wx, wy, tile.tile_size, tile.num_levels);

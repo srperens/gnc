@@ -46,6 +46,18 @@ struct Params {
 // One u32 per tile; set to 1 if any stream in that tile overflows max_stream_bytes.
 @group(0) @binding(5) var<storage, read_write> overflow_flags: array<atomic<u32>>;
 
+// Tile-local raster index of symbol `s` in stream `stream_id`.
+//
+// Streams walk the tile in column-major order, cut into STREAMS_PER_TILE contiguous segments, so
+// the previous symbol in a stream is the coefficient directly above it. At the default 256 px tile
+// a segment is exactly one column and this equals the old `stream_id + s * 256` coefficient for
+// coefficient; at any other width that modulus interleaved distant columns into one stream and the
+// adaptive k tracked the mixture (BUG-11). Must stay in sync with rice.rs stream_coeff_index().
+fn stream_coeff_index(stream_id: u32, s: u32, symbols_per_stream: u32) -> u32 {
+    let j = stream_id * symbols_per_stream + s;
+    return (j % params.tile_size) * params.tile_size + j / params.tile_size;
+}
+
 // Shared memory for Phase 1: k computation
 var<workgroup> group_sum: array<atomic<u32>, 12>;
 var<workgroup> group_count: array<atomic<u32>, 12>;
@@ -219,7 +231,7 @@ fn main(
         var zrl_ctx_large: bool = false; // context at start of current zero run
         var last_mag_large: bool = false; // true after a "large" nonzero coeff
         for (var s = 0u; s < symbols_per_stream; s++) {
-            let coeff_idx = thread_id + s * STREAMS_PER_TILE;
+            let coeff_idx = stream_coeff_index(thread_id, s, symbols_per_stream);
             let tile_row = coeff_idx / params.tile_size;
             let tile_col = coeff_idx % params.tile_size;
             let plane_idx = (tile_origin_y + tile_row) * params.plane_width
@@ -377,7 +389,7 @@ fn main(
         var last_mag_large_e: bool = false;
         var se = 0u;
         while (se < symbols_per_stream) {
-            let coeff_idx_e = thread_id + se * STREAMS_PER_TILE;
+            let coeff_idx_e = stream_coeff_index(thread_id, se, symbols_per_stream);
             let tile_row_e = coeff_idx_e / params.tile_size;
             let tile_col_e = coeff_idx_e % params.tile_size;
 
@@ -398,7 +410,7 @@ fn main(
                 var run_e = 1u;
                 var ns_e = se + 1u;
                 while (ns_e < symbols_per_stream) {
-                    let ni_e = thread_id + ns_e * STREAMS_PER_TILE;
+                    let ni_e = stream_coeff_index(thread_id, ns_e, symbols_per_stream);
                     let nr_e = ni_e / params.tile_size;
                     let nc_e = ni_e % params.tile_size;
                     let ns_ge = compute_subband_group(nc_e, nr_e);
@@ -521,7 +533,7 @@ fn main(
         var last_mag_large_o: bool = false;
         var so = 0u;
         while (so < symbols_per_stream) {
-            let coeff_idx_o = thread_id + so * STREAMS_PER_TILE;
+            let coeff_idx_o = stream_coeff_index(thread_id, so, symbols_per_stream);
             let tile_row_o = coeff_idx_o / params.tile_size;
             let tile_col_o = coeff_idx_o % params.tile_size;
 
@@ -542,7 +554,7 @@ fn main(
                 var run_o = 1u;
                 var ns_o = so + 1u;
                 while (ns_o < symbols_per_stream) {
-                    let ni_o = thread_id + ns_o * STREAMS_PER_TILE;
+                    let ni_o = stream_coeff_index(thread_id, ns_o, symbols_per_stream);
                     let nr_o = ni_o / params.tile_size;
                     let nc_o = ni_o % params.tile_size;
                     let ns_go = compute_subband_group(nc_o, nr_o);

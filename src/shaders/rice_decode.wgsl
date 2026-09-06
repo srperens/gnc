@@ -58,6 +58,18 @@ var<private> p_byte_offset: u32; // absolute byte offset in stream_data
 var<private> p_ema: array<u32, 12>;
 
 // Directional subband grouping — must match encoder exactly.
+// Tile-local raster index of symbol `s` in stream `stream_id`.
+//
+// Streams walk the tile in column-major order, cut into STREAMS_PER_TILE contiguous segments, so
+// the previous symbol in a stream is the coefficient directly above it. At the default 256 px tile
+// a segment is exactly one column and this equals the old `stream_id + s * 256` coefficient for
+// coefficient; at any other width that modulus interleaved distant columns into one stream and the
+// adaptive k tracked the mixture (BUG-11). Must stay in sync with rice.rs stream_coeff_index().
+fn stream_coeff_index(stream_id: u32, s: u32, symbols_per_stream: u32) -> u32 {
+    let j = stream_id * symbols_per_stream + s;
+    return (j % params.tile_size) * params.tile_size + j / params.tile_size;
+}
+
 fn compute_subband_group(lx: u32, ly: u32) -> u32 {
     var region = params.tile_size;
     for (var level = 0u; level < params.num_levels; level++) {
@@ -140,7 +152,7 @@ fn decode_stream_body(
     var last_mag_large: bool = false;
     var s = 0u;
     while (s < symbols_per_stream) {
-        let ci0 = thread_id + s * STREAMS_PER_TILE;
+        let ci0 = stream_coeff_index(thread_id, s, symbols_per_stream);
         let cr0 = ci0 / params.tile_size;
         let cc0 = ci0 % params.tile_size;
 
@@ -163,7 +175,7 @@ fn decode_stream_body(
             var written = 0u;
             var ws = s;
             while (written < run && ws < symbols_per_stream) {
-                let ci = thread_id + ws * STREAMS_PER_TILE;
+                let ci = stream_coeff_index(thread_id, ws, symbols_per_stream);
                 let cr = ci / params.tile_size;
                 let cc = ci % params.tile_size;
                 let pi = (tile_origin_y + cr) * params.plane_width + (tile_origin_x + cc);

@@ -2624,8 +2624,12 @@ impl EncoderPipeline {
         // Placed after entropy coding so the baseline can be the *shipped* Rice size rather than
         // the CPU reference coder, which is much worse and made abac look 35% better than its
         // own offline ceiling. First I-frame only.
-        if config.transform_type == crate::TransformType::Wavelet
-            && std::env::var("GNC_ABAC_COMPARE").is_ok()
+        // MedPredict is included: with num_levels = 0 `subbands()` yields one region covering the
+        // tile, which is the right cut for a prediction residual — it has no subbands to split.
+        if matches!(
+            config.transform_type,
+            crate::TransformType::Wavelet | crate::TransformType::MedPredict
+        ) && std::env::var("GNC_ABAC_COMPARE").is_ok()
         {
             use std::sync::OnceLock;
             static ABAC_DONE: OnceLock<()> = OnceLock::new();

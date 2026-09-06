@@ -1,6 +1,6 @@
 # GNC Bitstream Specification
 
-**Version:** GP16 (frame codec), GNV1 / GNV2 (containers)
+**Version:** GP17 (frame codec), GNV1 / GNV2 (containers)
 **Date:** 2026-09-06
 
 This document specifies the GNC bitstream format at a level of detail sufficient for an independent implementation.
@@ -9,12 +9,15 @@ All multi-byte values are **little-endian**. All byte offsets are from the start
 
 ---
 
-## 1. Frame Codec (GP11 … GP16)
+## 1. Frame Codec (GP11 … GP17)
 
 A frame bitstream encodes a single image frame. The sequence container (GNV1, Section 3) wraps
 multiple frames for video. The magic in the first four bytes names the generation; the encoder
-writes **GP16** today, and Section 6 lists what each generation added. Field layouts below are
-GP16 unless a row says otherwise.
+writes **GP17** today, and Section 6 lists what each generation added. Field layouts below are
+GP17 unless a row says otherwise.
+
+The decoder tracks the generation as a single number parsed from the magic, and every field added
+since GPC8 is gated on `gen >= N`; adding a generation is one entry in that table.
 
 ### 1.1 Frame Header
 
@@ -240,7 +243,7 @@ stream, so all 256 streams decode in parallel with no shared state.
 | 4 | u32 | tile_size | Tile dimension |
 | 4 | u32 | num_levels | Wavelet decomposition levels |
 | 4 | u32 | num_groups | `num_levels * 2` — subband grouping is the same as Section 2.2 |
-| 1 | u8 | flags | Bit 0 (0x01) = varint stream lengths, bit 1 (0x02) = all-skip, bit 2 (0x04) = checkerboard-k block present |
+| 1 | u8 | flags | Bit 0 (0x01) = varint stream lengths, bit 1 (0x02) = all-skip, bit 2 (0x04) = checkerboard-k block present, bit 3 (0x08) = Rice-coded stream lengths (GP17) |
 
 **All-skip tiles** (`flags & 0x02`): the skip bitmap is the only remaining field; every
 coefficient is zero and all 256 stream lengths are 0. A whole tile costs 18–19 bytes.
@@ -254,8 +257,27 @@ Otherwise, in order:
 | num_groups | u8[] | k_zrl_z | Rice *k* for zero runs following a zero run or start-of-stream |
 | 1 or 2 | u8 / u16 | skip_bitmap | Bit *g* = 1 means group *g* is entirely zero |
 | 128 * ck_stride | u8[] | k_stream_odd | Present only when `flags & 0x04`; see below |
-| variable | varint[256] | stream_lengths | Byte length of each stream (1–3 byte varints; legacy tiles without bit 0 use 256 × u16) |
+| variable | see below | stream_lengths | Byte length of each of the 256 streams |
 | sum(lengths) | u8[] | stream_data | The 256 streams, concatenated in order |
+
+**Stream-length table.** Three encodings, selected by the flags byte, most specific first:
+
+| flags | encoding |
+|---|---|
+| bit 3 (0x08) | 4-bit `k`, then 256 Golomb-Rice codes, MSB-first, padded to a byte boundary. GP17 and later. |
+| bit 0 (0x01) | 256 byte-aligned varints, 1–3 bytes each. |
+| neither | Legacy: 256 × u16 little-endian. |
+
+A Rice code with parameter `k` is the quotient `v >> k` as that many 1 bits and a terminating 0,
+then the low `k` bits of `v`. Unary-then-terminator, rather than zeros-then-one, means a read past
+the end of the buffer terminates at quotient 0 instead of spinning.
+
+The encoder searches `k = 0..15` for the fewest bits and falls back to varints if they are smaller
+— in practice Rice always wins, by 20–61% of the table. It matters because 256 independent streams
+per tile means the table is a fixed ~256 bytes per tile whatever the tile holds: 5% of an I-frame
+and 17–31% of a P-frame. Note that an optimal `k` deliberately leaves single long streams with a
+long unary run rather than raising `k` for all 256 entries, so a decoder must not cap the quotient
+anywhere near the typical value — `64 << k` silently truncates real high-quality frames.
 
 **Skip bitmap width.** One byte while `num_groups <= 8`, two little-endian bytes above that. Five
 wavelet levels produce 10 groups, which no longer fit in a byte. `num_groups` sits in the tile
@@ -425,7 +447,8 @@ Tiles are strictly independent: no cross-tile dependencies at any stage. Each ti
 
 | Magic | Readable | Notes |
 |-------|----------|-------|
-| GP16 | Yes | Current version: Exp-Golomb bit-coded MV deltas + all-zero flag byte |
+| GP17 | Yes | Current version: Golomb-Rice stream-length tables (tile flag 0x08) |
+| GP16 | Yes | Exp-Golomb bit-coded MV deltas + all-zero flag byte |
 | GP15 | Yes | Rice `k_zrl` split into `k_zrl_nz` + `k_zrl_z` per subband |
 | GP14 | Yes | Per-block `fwd_ref_idx` / `bwd_ref_idx` for hierarchical pyramid B-frames |
 | GP13 | Yes | GP12 + chroma_format byte in the header |

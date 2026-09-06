@@ -1,7 +1,7 @@
 # GNC Benchmark Baseline
 
 Last updated: 2026-09-06 (compression columns; fps columns are older — see below)
-Baseline commit: (BUG-6 — 5 wavelet levels at q ≥ 25)
+Baseline commit: (FMT-2 — GP17 Rice-coded stream-length tables, on top of BUG-6)
 Mode: Spatial-only, Rice entropy, uniform subband weights. P-only by default since BUG-5.
 
 ## Single-Frame (bbb_1080p, Rice, 4:4:4)
@@ -11,17 +11,22 @@ Re-measured 2026-09-06 after BUG-6 made 5 wavelet levels the default at q ≥ 25
 
 | q   | PSNR     | BPP  | VMAF  | levels |
 |-----|----------|------|-------|--------|
-| 25  | 34.94 dB | 1.60 | 90.21 | 5 |
-| 50  | 40.34 dB | 2.76 | 95.02 | 5 |
-| 75  | 44.47 dB | 4.56 | 96.57 | 5 |
-| 90  | 51.02 dB | 8.60 | 97.08 | 5 |
+| 25  | 35.24 dB | 1.61 | 90.38 | 5 |
+| 50  | 40.34 dB | 2.73 | 95.02 | 5 |
+| 75  | 44.47 dB | 4.53 | 96.57 | 5 |
+| 90  | 51.02 dB | 8.58 | 97.08 | 5 |
+
+The bpp column dropped again with GP17 (Rice-coded stream-length tables, 2026-09-06) at
+**bit-identical output** — PSNR and VMAF are unchanged by construction, only the headers shrank.
 
 Against the 2026-09-05 rows, q=50 and q=75 are unchanged within noise; **q=25 moved to a different
-operating point** — 1.89 → 1.60 bpp (−15%) for −0.50 dB and −0.81 VMAF. Part of that is BUG-6
-(isolated: −6.4% rate, +0.28 dB, −0.53 VMAF at q=25) and the rest predates it. A VMAF drop that
-comes with a 15% rate drop is a move along the RD curve, not a regression — but it means **the
-q=25 row is not comparable to the old one point-for-point.** Compare with BD-rate, or at matched
-rate.
+operating point** — 1.89 → 1.61 bpp (−15%) for −0.20 dB and −0.64 VMAF. A VMAF drop that comes
+with a 15% rate drop is a move along the RD curve, not a regression — but it means **the q=25 row
+is not comparable to the old one point-for-point.** Compare with BD-rate, or at matched rate.
+
+The q=25 row was first logged here as 34.94 dB / 1.60 bpp. That reading came from an uncommitted
+working tree shared with a second agent and does not reproduce; re-derived against the commit it is
+35.24 dB / 1.61 bpp. Measure against a hash, not a checkout.
 
 Previous (perceptual weights, #64): q=75 → 42.17 dB / 3.83 bpp / VMAF 95.05
 

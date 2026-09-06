@@ -515,6 +515,44 @@ was PSNR on stills rather than VMAF on video.
 The gap is multiples, not percentages. Work targeting single-digit-percent improvements is not
 addressing it.
 
+### FMT-2 — Stream-length tables were 12-17% of a P-frame (**DONE 2026-09-06**, GP17)
+Each tile carries a 256-entry table of entropy-stream lengths — the price of 256 independent
+streams per tile. As byte-aligned varints that is ~256 bytes per tile, ~30 KB per 1080p frame,
+regardless of how much the tile actually holds. Measured share of frame size: **5% of an I-frame,
+17-31% of a P-frame**. Never measured before.
+
+Priced three encodings before implementing: varint (existing), Exp-Golomb order 0 with a zero
+bitmap, and Golomb-Rice with a per-tile `k`. **Rice wins at every point (−20% to −61%)**;
+Exp-Golomb *loses* to varints on high-quality I-frames (+4% at q=50, +24% at q=75) where lengths
+cluster near the 4096-byte stream cap. Per-tile best-of-three with a mode flag never beat plain
+Rice, so there is no mode signalling — just a 4-bit `k` and 256 Rice codes.
+
+Quality is bit-identical (headers only), so the whole size reduction is gain:
+
+| | q=25/30 | q=40/50 | q=55/75 |
+|---|---|---|---|
+| stills (4 images) | −2.8% to **−7.6%** | −1.8% to −4.5% | −0.5% to −2.7% |
+| video (bbb17, blue_sky, 8f) | **−6.9% / −7.6%** | −3.7% | −1.4% to −1.5% |
+
+Largest at low bitrate — the contribution operating point — because the table is a fixed cost that
+does not shrink with the coefficients.
+
+**Bitstream:** GP17. Tile flag 0x08 marks a Rice-coded length table. A GP16 decoder has no such
+flag, hence the bump. Generation tracking was also collapsed from eight `is_gpXX` booleans ORed
+into a dozen chains (`is_gp15` and `is_gp16` appeared twice in one assert) into a single
+`gen: u32` with `gen >= N` tests. Verified: GP16 files decode in the GP17 binary; GP17 files are
+refused by the GP16 binary with "invalid magic" rather than misparsed.
+
+**Canary:** `GNC_DIAGNOSTICS=1` prints
+`Stream-length tables: 15.0 KB (varint would be 30.0 KB, -50%)  rice_tiles=120/120`.
+
+**Near miss worth remembering:** the first decoder capped the Rice quotient at 64 as a
+corrupt-input guard, which silently truncated any length above `64 << k` — over 2048 bytes at a
+typical k=5, which occurs on high-quality I-frames. Termination never needed the cap
+(`get_bit` returns 0 past the end of the buffer); the cap is a sanity bound and is now 65536.
+
+**Does not touch the 5-7x video gap.** That gap is not in the headers.
+
 ### BUG-6 — Wavelet decomposition capped at 4 levels; 5 panics (**DONE 2026-09-06**)
 The cap was `MAX_GROUPS = 8` with `num_groups = levels * 2`, which put 4 levels exactly at the
 ceiling, plus a one-byte per-tile skip bitmap. Raised to 12 groups (6 levels) across both entropy
@@ -531,9 +569,13 @@ checkerboard-k block follows the same rule (stride 8, or 12 for wide tiles).
 
 | image | bpp 4L → 5L | Δ rate | Δ PSNR | Δ VMAF |
 |---|---|---|---|---|
-| blue_sky_1080p | 3.51 → 3.37 | **−4.0%** | +1.40 dB | 0.00 |
-| kristensara_720p | 2.31 → 2.27 | **−1.7%** | +0.86 dB | +3.32 |
-| bbb_1080p | 4.20 → 4.16 | −1.0% | +0.01 dB | 0.00 |
+| blue_sky_1080p | 3.47 → 3.33 | **−4.0%** | +1.40 dB | 0.00 |
+| kristensara_720p | 2.28 → 2.24 | −1.8% | +0.86 dB | −0.08 |
+| bbb_1080p | 4.17 → 4.13 | −1.0% | +0.01 dB | 0.00 |
+
+*(The kristensara VMAF was first logged as +3.32, from an L4 reading of 93.49. Re-measured, L4 at
+q=70 scores 96.89 and L5 96.81 — the +3.32 was a bad baseline reading, not a real jump. It was
+flagged as suspicious at the time and it should have been.)*
 
 Smooth content gains most, which is what a deeper decomposition should do.
 `CodecConfig::max_wavelet_levels()` states the tile-size ceiling (5 for a 256 px tile);
@@ -545,16 +587,20 @@ only appears at equal quality. BD-rate on VMAF over q=25–70, four images:
 
 | image | BD-rate (VMAF) |
 |---|---|
-| blue_sky_1080p | **−6.88%** |
-| touchdown_1080p | **−4.31%** |
-| kristensara_720p | −1.89% |
-| bbb_1080p | −1.84% |
-| mean | **−3.73%** |
+| blue_sky_1080p | **−4.82%** |
+| touchdown_1080p | −2.35% |
+| kristensara_720p | −1.35% |
+| bbb_1080p | −0.83% |
+| mean | **−2.34%** |
 
-**Lower cutoff (kept).** Over q=15–35 the sign flips: +4.25% bbb, +2.44% kristensara, +2.18%
-touchdown (blue_sky still −9.53%). Below q≈25 the deep subbands quantise to all-zero anyway, so
-their k values and rANS frequency tables are pure overhead — at q=15–20 five levels costs *more*
-bits **and** ~1 VMAF point. Hence 25.
+*(These numbers were re-measured on the committed tree. The first set logged here — mean −3.73% —
+came from an intermediate working-tree state while two sessions were editing the same checkout,
+and overstated the gain. The sign and the cutoff are unchanged; the magnitudes are smaller.)*
+
+**Lower cutoff (kept).** Over q=15–35 the sign flips: +5.92% bbb, +3.42% touchdown, +2.84%
+kristensara (blue_sky still −5.73%), mean +1.61%. Below q≈25 the deep subbands quantise to
+all-zero anyway, so their k values and rANS frequency tables are pure overhead — at q=15–20 five
+levels costs *more* bits **and** about 1 VMAF point. Hence 25.
 
 **Upper cutoff (removed).** The old q ≤ 80 cap was measuring the aliasing bug, not the transform.
 Swept q=85/90/95/99 on all four images: all 16 points save 0.3–0.6% of the bits at PSNR and VMAF

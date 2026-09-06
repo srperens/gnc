@@ -5532,11 +5532,23 @@ BD-rate on VMAF, q=25–70, four images:
 
 | image | q15–35 | q25–70 | q30–70 |
 |---|---|---|---|
-| bbb_1080p | +4.25% | −1.84% | −1.55% |
-| blue_sky_1080p | −9.53% | **−6.88%** | −4.30% |
-| touchdown_1080p | +2.18% | **−4.31%** | −3.30% |
-| kristensara_720p | +2.44% | −1.89% | −1.74% |
-| mean | −0.17% | **−3.73%** | −2.72% |
+| bbb_1080p | +5.92% | −0.83% | −0.96% |
+| blue_sky_1080p | −5.73% | **−4.82%** | −3.45% |
+| touchdown_1080p | +3.42% | −2.35% | −1.92% |
+| kristensara_720p | +2.84% | −1.35% | −1.32% |
+| mean | +1.61% | **−2.34%** | −1.91% |
+
+**Corrected 2026-09-06, later the same day.** The first version of this table read mean −3.73% over
+q=25–70. It was measured on a working tree that no longer exists: two sessions were editing the
+same checkout, and the coefficient path moved between my measurement and my commit — bbb at q=25
+read 34.94 dB / 1.60 bpp during the sweep and 35.24 dB / 1.66 bpp on the committed tree, which is
+not a difference a header change can produce. Caught by re-deriving the BASELINE row and finding
+PSNR 0.3 dB off from what I had recorded hours earlier.
+
+The conclusion survives: 5 levels wins from q=25 up on all four images and loses below it on three
+of four. Only the size of the win was overstated. The process lesson is narrower and worth stating
+plainly: **when another agent is editing the same working tree, a measurement is only valid against
+a commit.** Measure in a worktree pinned to a hash, or commit first and measure after.
 
 The sign flip below q≈25 is physical: at those rates the two deepest subbands quantise to all-zero
 on most tiles, so their per-group k values — and, on the rANS path, their per-group frequency
@@ -5724,3 +5736,116 @@ warning is that offline models *understate* the real coder. But the margin is 4�
 direction on every sequence and the open-loop gate is flat at 0.98–1.01x, so closing this would
 require the missing pieces to be worth more than everything measured, which no published result
 supports. `mean|detail|` is a rate proxy, not rate. 4 groups per sequence.
+
+---
+
+## 2026-09-06 — GP17: the stream-length table was 12-17% of a P-frame
+
+### Where the bits actually were
+
+BUG-6 done, the next question was the one the user has been asking for a while: video costs 5-7x
+H.264 for the same VMAF, and four prediction-side experiments in a row came back negative. So
+instead of guessing at prediction again, this looked at the *bit budget* — what a P-frame is made
+of. `GNC_DIAGNOSTICS=1` on bbb17 at q=50, 1080p:
+
+```
+Frame 0 [I] size=715367   Tile headers: 35.7 KB (5.1%)   Coefficients: 659.1 KB (94.5%)
+Frame 1 [P] size=71979    Tile headers: 13.1 KB (16.6%)  Coefficients:  44.8 KB (56.8%)
+Frame 2 [P] size=3378     Tile headers:  2.2 KB (30.8%)  Coefficients:   0.0 KB (0.0%)
+```
+
+Tile headers are 5% of an I-frame and **17-31% of a P-frame**. And almost all of that is one
+field: GNC's architecture gives each tile 256 fully independent entropy streams, so every tile
+carries a 256-entry table of stream lengths. At 1-3 byte varints that is ~256 bytes per tile,
+30 KB per 1080p frame, whether the tile holds 200 KB of coefficients or 400 bytes.
+
+This is the cost of the parallelism, and nobody had ever measured it.
+
+### Three candidate encodings, measured before implementing
+
+Instrumented `collect_rice_efficiency` to price the same tables three ways: the existing
+byte-aligned varints, Exp-Golomb order 0 with a zero-bitmap (what GP16 already does for motion
+vectors), and Golomb-Rice with a per-tile `k` found by exhaustive search over k=0..15.
+
+| content | q | frame | varint | exp-golomb | **rice** |
+|---|---|---|---|---|---|
+| bbb17 (animation) | 30 | I | 30.0 KB | −13% | **−37%** |
+| bbb17 | 30 | P | 9.0 KB | −48% | **−61%** |
+| bbb17 | 50 | I | 30.0 KB | **+4%** | **−29%** |
+| bbb17 | 75 | I | 30.2 KB | **+24%** | **−20%** |
+| blue_sky (camera) | 30 | I | 30.0 KB | −36% | **−50%** |
+| blue_sky | 30 | P | 23.2 KB | −40% | **−56%** |
+| blue_sky | 50 | P | 22.5 KB | −23% | **−44%** |
+
+Rice wins at every single point; Exp-Golomb *loses* to varints on high-quality I-frames, where
+lengths cluster near the 4096-byte stream cap and its unary prefix gets long. A per-tile
+best-of-three with 2 signalling bits was also priced and never beat plain Rice by more than
+rounding — so there is no mode flag, just Rice with a 4-bit `k`.
+
+The reason Rice wins is the shape of the data: within a tile the 256 streams have a
+characteristic size with a long tail. That is exactly the distribution Rice is for, and it is the
+same argument the codec already makes for coefficient magnitudes — the length table just never
+got the same treatment.
+
+### Result — pure header saving, quality bit-identical
+
+The coefficients are untouched, so this is not an RD tradeoff: the decoded image is
+bit-for-bit what it was, and the whole size reduction is gain.
+
+Stills, bytes at identical output:
+
+| image | q=25 | q=40 | q=55 | q=75 |
+|---|---|---|---|---|
+| bbb_1080p | −2.75% | −1.75% | −1.07% | −0.53% |
+| blue_sky_1080p | −4.92% | −3.06% | −1.95% | −0.98% |
+| touchdown_1080p | **−6.23%** | −3.13% | −1.66% | −0.65% |
+| kristensara_720p | **−7.58%** | −4.45% | −2.68% | −1.00% |
+
+Video, 8 frames, total container bytes:
+
+| sequence | q=30 | q=50 | q=75 |
+|---|---|---|---|
+| bbb17 | **−6.86%** | −3.70% | −1.51% |
+| blue_sky | **−7.58%** | −3.67% | −1.37% |
+
+The gain is largest exactly where GNC is positioned — low bitrate, contribution operating point —
+because the length table is a fixed cost that does not shrink with the coefficients.
+
+### The bug this nearly shipped with
+
+First implementation capped the Rice quotient at 64 in the decoder, as a guard against corrupt
+input spinning forever. That silently broke real files: with an optimal per-tile `k` a single
+outlier stream keeps a long unary run rather than forcing `k` up for all 256 entries, so any
+length above `64 << k` decoded as 0. At a typical k=5 that is anything over 2048 bytes — which
+exists on high-quality I-frames. The unit test that caught it deliberately includes a 4095 outlier
+among small values.
+
+The termination guarantee never needed the cap: `BitReader::get_bit` returns 0 past the end of the
+buffer, so a truncated or all-ones stream always terminates. The cap is now 65536, a sanity bound
+well clear of the longest legitimate run.
+
+### Generation handling, fixed while bumping it
+
+The format needed a bump to GP17 because a GP16 decoder has no tile flag 0x08 and would misparse.
+The generation was tracked as eight separate `is_gpXX` booleans ORed into a dozen chains — and
+`is_gp15` and `is_gp16` were already ORed *twice* into the same assert, harmlessly but visibly. It
+is now one `gen: u32` from a match on the magic, with every gated field written as `gen >= N`. A
+future generation is one table entry.
+
+Verified both directions: a GP16 file decodes correctly in the GP17 binary (41.52 dB, matching
+what the GP16 binary produced), and a GP17 file in the GP16 binary refuses with "invalid magic"
+rather than reading garbage.
+
+### Canary
+
+`GNC_DIAGNOSTICS=1` prints per frame:
+`Stream-length tables: 15.0 KB (varint would be 30.0 KB, -50%)  rice_tiles=120/120`.
+Zero `rice_tiles` with a non-zero table would mean the path is not running.
+
+### Would we ship it?
+
+Yes, without reservation. It is a header encoding, quality is bit-identical, the win is 1-8% of
+total bitrate and biggest at the operating point that matters, and it needs no shader change —
+the length table is parsed on the host before the GPU sees the streams.
+
+It does not touch the 5-7x video gap. That gap is not in the headers.

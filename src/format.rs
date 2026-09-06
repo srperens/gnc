@@ -434,17 +434,17 @@ fn mv_predictor(vectors: &[[i16; 2]], bx: usize, by: usize, blocks_x: usize) -> 
 // with its 40960 split MVs, measured at half the frame on a pure pan and 9-28% on real content.
 // Exp-Golomb codes zigzag(0) in a single bit, which is what a well-predicted field deserves.
 
-struct BitWriter {
+pub(crate) struct BitWriter {
     bits: u64,
     nbits: u32,
 }
 
 impl BitWriter {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self { bits: 0, nbits: 0 }
     }
 
-    fn put(&mut self, out: &mut Vec<u8>, value: u64, count: u32) {
+    pub(crate) fn put(&mut self, out: &mut Vec<u8>, value: u64, count: u32) {
         debug_assert!(count <= 32);
         self.bits = (self.bits << count) | (value & ((1u64 << count) - 1));
         self.nbits += count;
@@ -455,14 +455,33 @@ impl BitWriter {
     }
 
     /// Exp-Golomb order 0: value v is written as ceil(log2(v+2)) zeros then (v+1) in binary.
-    fn put_ue(&mut self, out: &mut Vec<u8>, v: u32) {
+    pub(crate) fn put_ue(&mut self, out: &mut Vec<u8>, v: u32) {
         let n = v as u64 + 1;
         let len = 64 - n.leading_zeros(); // bits in n
         self.put(out, 0, len - 1);
         self.put(out, n, len);
     }
 
-    fn flush(&mut self, out: &mut Vec<u8>) {
+    /// Golomb-Rice with parameter `k`: the quotient `v >> k` as that many 1 bits and a
+    /// terminating 0, then the low `k` bits of `v`. Unary-then-terminator (rather than
+    /// zeros-then-one) means a read past the end of the buffer terminates at quotient 0
+    /// instead of spinning — see `BitReader::get_rice`.
+    pub(crate) fn put_rice(&mut self, out: &mut Vec<u8>, v: u32, k: u32) {
+        let mut q = v >> k;
+        while q >= 24 {
+            self.put(out, 0xFF_FFFF, 24);
+            q -= 24;
+        }
+        if q > 0 {
+            self.put(out, (1u64 << q) - 1, q);
+        }
+        self.put(out, 0, 1);
+        if k > 0 {
+            self.put(out, v as u64, k);
+        }
+    }
+
+    pub(crate) fn flush(&mut self, out: &mut Vec<u8>) {
         if self.nbits > 0 {
             out.push(((self.bits << (8 - self.nbits)) & 0xFF) as u8);
             self.nbits = 0;
@@ -471,18 +490,18 @@ impl BitWriter {
     }
 }
 
-struct BitReader<'a> {
+pub(crate) struct BitReader<'a> {
     data: &'a [u8],
     byte: usize,
     bit: u32,
 }
 
 impl<'a> BitReader<'a> {
-    fn new(data: &'a [u8], start: usize) -> Self {
+    pub(crate) fn new(data: &'a [u8], start: usize) -> Self {
         Self { data, byte: start, bit: 0 }
     }
 
-    fn get_bit(&mut self) -> u32 {
+    pub(crate) fn get_bit(&mut self) -> u32 {
         if self.byte >= self.data.len() {
             return 0;
         }
@@ -495,7 +514,7 @@ impl<'a> BitReader<'a> {
         b as u32
     }
 
-    fn get(&mut self, count: u32) -> u64 {
+    pub(crate) fn get(&mut self, count: u32) -> u64 {
         let mut v = 0u64;
         for _ in 0..count {
             v = (v << 1) | self.get_bit() as u64;
@@ -503,7 +522,7 @@ impl<'a> BitReader<'a> {
         v
     }
 
-    fn get_ue(&mut self) -> u32 {
+    pub(crate) fn get_ue(&mut self) -> u32 {
         let mut zeros = 0u32;
         while self.get_bit() == 0 {
             zeros += 1;
@@ -515,8 +534,28 @@ impl<'a> BitReader<'a> {
         (((1u64 << zeros) | rest) - 1) as u32
     }
 
+    /// Inverse of `BitWriter::put_rice`.
+    ///
+    /// The quotient cap is a sanity bound, not the termination condition: `get_bit` returns 0
+    /// past the end of the buffer, so a truncated or all-ones stream always terminates. The cap
+    /// has to clear the longest legitimate run — a stream length of `MAX_STREAM_BYTES` at k=0 —
+    /// because an optimal per-tile k leaves single outliers with a long unary run rather than
+    /// raising k for all 256 entries.
+    pub(crate) fn get_rice(&mut self, k: u32) -> u32 {
+        const MAX_QUOTIENT: u32 = 1 << 16;
+        let mut q = 0u32;
+        while self.get_bit() == 1 {
+            q += 1;
+            if q >= MAX_QUOTIENT {
+                return 0;
+            }
+        }
+        let rem = if k > 0 { self.get(k) as u32 } else { 0 };
+        (q << k) | rem
+    }
+
     /// Byte position after the last bit consumed, rounding up.
-    fn finish(&self) -> usize {
+    pub(crate) fn finish(&self) -> usize {
         if self.bit > 0 {
             self.byte + 1
         } else {
@@ -618,7 +657,7 @@ pub fn serialize_compressed(frame: &crate::CompressedFrame) -> Vec<u8> {
     // magnitude-conditioned zero-run context, K_STRIDE 17→25 per tile, #53).
     // GP14 adds fwd_ref_idx + bwd_ref_idx for hierarchical pyramid B-frames.
     // GP13 is GP12 + chroma_format byte.
-    out.extend_from_slice(b"GP16");
+    out.extend_from_slice(b"GP17");
     // Common header fields (includes chroma_format byte for GP13)
     serialize_frame_header(frame, &mut out);
     // Motion field — GP12 uses delta-coded varint MVs
@@ -851,28 +890,27 @@ pub fn deserialize_compressed(data: &[u8]) -> crate::CompressedFrame {
 pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
     assert!(data.len() >= 37, "File too small");
     let magic = &data[0..4];
-    let is_gpc9 = magic == b"GPC9";
-    let is_gp10 = magic == b"GP10";
-    let is_gp11 = magic == b"GP11";
-    let is_gp12 = magic == b"GP12";
-    let is_gp13 = magic == b"GP13";
-    let is_gp14 = magic == b"GP14";
-    let is_gp15 = magic == b"GP15";
-    // GP16: motion-vector deltas are Exp-Golomb bit-coded rather than byte-aligned varints,
-    // preceded by an all-zero flag byte.
-    let is_gp16 = magic == b"GP16";
-    assert!(
-        magic == b"GPC8"
-            || is_gpc9
-            || is_gp10
-            || is_gp11
-            || is_gp12
-            || is_gp13
-            || is_gp14
-            || is_gp15 || is_gp16
-            || is_gp16,
-        "Invalid magic (expected GPC8, GPC9, GP10, GP11, GP12, GP13, GP14 or GP15; older files must be re-encoded)"
-    );
+    // Frame-codec generation as a number. Every field added since GPC8 is gated on "generation
+    // at least N", so a new generation is one entry in this table rather than a new term in a
+    // dozen boolean chains — which is how GP15 ended up ORed twice in the same assert.
+    let gen: u32 = match magic {
+        b"GPC8" => 8,
+        b"GPC9" => 9,
+        b"GP10" => 10,
+        b"GP11" => 11,
+        b"GP12" => 12,
+        b"GP13" => 13,
+        b"GP14" => 14,
+        b"GP15" => 15,
+        // GP16: motion-vector deltas are Exp-Golomb bit-coded rather than byte-aligned varints,
+        // preceded by an all-zero flag byte.
+        b"GP16" => 16,
+        // GP17: per-tile stream-length tables may be Golomb-Rice coded (tile flag 0x08).
+        b"GP17" => 17,
+        _ => panic!(
+            "Invalid magic (expected GPC8..GP17; older files must be re-encoded)"
+        ),
+    };
 
     // --- Common header (same layout for GPC9/GP10/GP11; GPC8 lacks per-subband flag) ---
     let width = u32::from_le_bytes(data[4..8].try_into().unwrap());
@@ -896,14 +934,14 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
     };
 
     // Per-subband entropy flag (GPC9/GP10/GP11/GP12/GP13/GP14)
-    let (per_subband_entropy, mut pos) = if is_gpc9 || is_gp10 || is_gp11 || is_gp12 || is_gp13 || is_gp14 || is_gp15 || is_gp16 {
+    let (per_subband_entropy, mut pos) = if gen >= 9 {
         (data[34] != 0, 35)
     } else {
         (false, 34)
     };
 
     // Chroma format byte (GP13/GP14; older formats default to 4:4:4)
-    let chroma_format_decoded = if is_gp13 || is_gp14 || is_gp15 || is_gp16 {
+    let chroma_format_decoded = if gen >= 13 {
         let cf = crate::ChromaFormat::from_u8(data[pos])
             .unwrap_or(crate::ChromaFormat::Yuv444);
         pos += 1;
@@ -973,7 +1011,7 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
     };
 
     // --- Intra prediction modes (GP11/GP12/GP13/GP14) ---
-    let intra_modes = if (is_gp11 || is_gp12 || is_gp13 || is_gp14 || is_gp15 || is_gp16) && data[pos] != 0 {
+    let intra_modes = if (gen >= 11) && data[pos] != 0 {
         pos += 1; // skip intra_flag
         let _num_blocks = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
         pos += 4;
@@ -982,7 +1020,7 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
         let modes = data[pos..pos + packed_len].to_vec();
         pos += packed_len;
         Some(modes)
-    } else if is_gp11 || is_gp12 || is_gp13 || is_gp14 || is_gp15 || is_gp16 {
+    } else if gen >= 11 {
         pos += 1; // skip intra_flag = 0
         None
     } else {
@@ -990,7 +1028,7 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
     };
 
     // --- Frame type + motion field (GP10/GP11/GP12/GP13/GP14) ---
-    let (frame_type, motion_field) = if is_gp10 || is_gp11 || is_gp12 || is_gp13 || is_gp14 || is_gp15 || is_gp16 {
+    let (frame_type, motion_field) = if gen >= 10 {
         let ft = match data[pos] {
             0 => crate::FrameType::Intra,
             1 => crate::FrameType::Predicted,
@@ -1004,7 +1042,7 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
             let num_blocks =
                 u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
             pos += 4;
-            let vectors = if is_gp12 || is_gp13 || is_gp14 || is_gp15 || is_gp16 {
+            let vectors = if gen >= 12 {
                 // GP12/GP13/GP14: delta-coded zigzag varint MVs
                 let padded_w = width.div_ceil(tile_size) * tile_size;
                 let blocks_x = (padded_w / block_size) as usize;
@@ -1022,12 +1060,12 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
             };
             // GP11/GP12/GP13/GP14 B-frames: backward vectors + block modes
             let (backward_vectors, block_modes, fwd_ref_idx, bwd_ref_idx) =
-                if (is_gp11 || is_gp12 || is_gp13 || is_gp14 || is_gp15 || is_gp16) && ft == crate::FrameType::Bidirectional {
+                if (gen >= 11) && ft == crate::FrameType::Bidirectional {
                     let bwd_count =
                         u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
                     pos += 4;
                     let bwd = if bwd_count > 0 {
-                        if is_gp12 || is_gp13 || is_gp14 || is_gp15 || is_gp16 {
+                        if gen >= 12 {
                             let padded_w = width.div_ceil(tile_size) * tile_size;
                             let bwd_blocks_x = (padded_w / 16) as usize;
                             Some(deserialize_mvs_delta(data, &mut pos, bwd_count, bwd_blocks_x))
@@ -1057,7 +1095,7 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
                         None
                     };
                     // GP14+: ref pool indices (1 byte each); older formats default to 0/1
-                    let (fwd_idx, bwd_idx) = if is_gp14 || is_gp15 || is_gp16 {
+                    let (fwd_idx, bwd_idx) = if gen >= 14 {
                         let f = data[pos];
                         let b = data[pos + 1];
                         pos += 2;
@@ -1093,7 +1131,7 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
     pos += 4;
 
     // GP11/GP12/GP13/GP14: tile index table with sizes + CRC-32s
-    let (tile_sizes, tile_crcs) = if is_gp11 || is_gp12 || is_gp13 || is_gp14 || is_gp15 || is_gp16 {
+    let (tile_sizes, tile_crcs) = if gen >= 11 {
         let mut sizes = Vec::with_capacity(num_tiles);
         let mut expected_crcs = Vec::with_capacity(num_tiles);
         for _ in 0..num_tiles {

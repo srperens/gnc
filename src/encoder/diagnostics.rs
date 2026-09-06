@@ -48,6 +48,15 @@ pub struct RiceEfficiency {
     /// fit since the skip bitmap became two bytes. Zero here at 5 levels means the widened
     /// field is not actually being written.
     pub deep_subbands_skipped: usize,
+    /// Bytes the 256-entry stream-length tables cost as written — Rice-coded where that wins.
+    pub stream_len_bytes: usize,
+    /// What the same tables would have cost as byte-aligned varints, the pre-GP17 encoding.
+    /// The gap between this and `stream_len_bytes` is the canary for the Rice length path.
+    pub stream_len_bytes_varint: usize,
+    /// Tiles that chose the Rice length table over varints.
+    pub tiles_rice_lengths: usize,
+    /// Tiles that wrote a length table at all (all-skip tiles write none).
+    pub tiles_with_lengths: usize,
 }
 
 /// Check if diagnostics are enabled (cached after first call).
@@ -491,10 +500,31 @@ fn collect_rice_efficiency(entropy: &EntropyData) -> Option<RiceEfficiency> {
     let mut tiles_all_skipped = 0usize;
     let mut max_groups = 0u32;
     let mut deep_subbands_skipped = 0usize;
+    let mut stream_len_bytes = 0usize;
+    let mut stream_len_bytes_varint = 0usize;
+    let mut tiles_rice_lengths = 0usize;
+    let mut tiles_with_lengths = 0usize;
 
     for tile in tiles {
         max_groups = max_groups.max(tile.num_groups);
         deep_subbands_skipped += (tile.skip_bitmap >> 8).count_ones() as usize;
+
+        // Stream-length accounting. An all-skip tile writes no length table at all, so only
+        // count tiles that do. `varint` is what the table cost before GP17 Rice-coded it.
+        let all_mask_len = crate::encoder::rice::all_groups_mask(tile.num_groups);
+        let is_all_skip = tile.stream_data.is_empty()
+            && tile.stream_lengths.iter().all(|&l| l == 0)
+            && all_mask_len != 0
+            && tile.skip_bitmap & all_mask_len == all_mask_len;
+        if !is_all_skip {
+            tiles_with_lengths += 1;
+            let (varint, actual) = crate::encoder::rice::length_table_bytes(&tile.stream_lengths);
+            stream_len_bytes_varint += varint;
+            stream_len_bytes += actual;
+            if actual < varint {
+                tiles_rice_lengths += 1;
+            }
+        }
         // Stream data bits
         let tile_stream_bytes: u64 = tile.stream_lengths.iter().map(|&l| l as u64).sum();
         total_stream_bits += tile_stream_bytes * 8;
@@ -536,6 +566,10 @@ fn collect_rice_efficiency(entropy: &EntropyData) -> Option<RiceEfficiency> {
         total_tiles,
         max_groups,
         deep_subbands_skipped,
+        stream_len_bytes,
+        stream_len_bytes_varint,
+        tiles_rice_lengths,
+        tiles_with_lengths,
     })
 }
 
@@ -805,6 +839,28 @@ pub fn print(diag: &FrameDiagnostics) {
             re.max_groups,
             re.deep_subbands_skipped,
         );
+        if re.tiles_with_lengths > 0 {
+            eprintln!(
+                "    Stream-length tables: {:.1} KB (varint would be {:.1} KB, \
+                 {:+.0}%)  rice_tiles={}/{}",
+                re.stream_len_bytes as f64 / 1024.0,
+                re.stream_len_bytes_varint as f64 / 1024.0,
+                (re.stream_len_bytes as f64 / re.stream_len_bytes_varint as f64 - 1.0) * 100.0,
+                re.tiles_rice_lengths,
+                re.tiles_with_lengths,
+            );
+        }
+        if re.tiles_with_lengths > 0 {
+            eprintln!(
+                "  Stream-length tables: {:.1} KB (varint would be {:.1} KB, \
+                 {:+.0}%)  rice_tiles={}/{}",
+                re.stream_len_bytes as f64 / 1024.0,
+                re.stream_len_bytes_varint as f64 / 1024.0,
+                (re.stream_len_bytes as f64 / re.stream_len_bytes_varint as f64 - 1.0) * 100.0,
+                re.tiles_rice_lengths,
+                re.tiles_with_lengths,
+            );
+        }
     }
 
     // Warnings

@@ -65,7 +65,11 @@ do.
 
 The range came from BD-rate on VMAF, not from a q sweep, and the distinction mattered: at equal q
 the fifth level scores *slightly worse* VMAF, because it also removes 1–16% of the bits. Compared
-at equal quality it is −1.8% to −6.9% BD-rate over q=25–70 (mean −3.7%) on four images.
+at equal quality it is −0.8% to −4.8% BD-rate over q=25–70 (mean −2.3%) on four images.
+
+(An earlier version of this record claimed mean −3.7%. That was measured on an uncommitted working
+tree shared with another agent, and the coefficient path moved underneath the measurement. The
+figures above are re-measured against the commit; the decision is unchanged.)
 
 **The lower cutoff is real.** Over q=15–35 the sign flips on three of four images (+2.2% to +4.3%);
 below q≈25 the two deepest subbands quantise to all-zero on most tiles, so their k values and

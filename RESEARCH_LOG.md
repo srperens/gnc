@@ -5417,3 +5417,136 @@ fps and latency figure is not.**
 Recorded as a standing rule: *timing measurements require an idle machine, and the run must say
 whether it had one.* The numbers in this entry did not, so they are load-bounded lower bounds —
 the true idle values are somewhat higher, and the A:C ratio is the trustworthy part.
+
+---
+
+## 2026-09-06 — BUG-6 closed: 5 wavelet levels, and what the half-landed version was hiding
+
+### State found
+
+The group-width widening was already in the working tree — `MAX_GROUPS` 8 → 12 in `rice_gpu.rs`,
+`rans_gpu_encode.rs` and the WGSL shaders, a `u16` skip bitmap, and a preset defaulting to 5
+levels at q ≤ 80. It did not build a working codec:
+
+- `cargo test --release`: **2 failures**. The CPU Rice decode path still held its EMA and
+  per-odd-stream k state in `[u32; 8]` arrays, so the first tile with 10 groups panicked
+  (`index out of bounds: the len is 8 but the index is 8`).
+- `rice_encode.wgsl` phase 1 still declared its six statistics accumulators as
+  `array<atomic<u32>, 8>` while the loops around them ran to `MAX_GROUPS = 12`. WGSL clamps an
+  out-of-bounds workgroup index rather than trapping, so groups 8–11 silently accumulated into
+  group 7 and the two deepest levels were coded with the wrong `k`. **No test could have caught
+  this** — the bitstream carries `k`, so the file still decoded exactly; it was just bigger.
+
+Widened both, plus the serialised checkerboard-k stride (8 for ≤8-group tiles, 12 above), and gave
+`rice.rs` a single `RICE_MAX_GROUPS` that `rice_gpu.rs` now imports instead of redeclaring.
+`cargo test --release`: **182 passed / 0 failed**.
+
+### Measured, after the fix — q=70, 5 levels against 4
+
+| image | bpp 4L | bpp 5L | Δ rate | PSNR 4L | PSNR 5L | VMAF 4L | VMAF 5L |
+|---|---|---|---|---|---|---|---|
+| blue_sky_1080p | 3.51 | 3.37 | **−4.0%** | 42.76 | 44.16 | 96.74 | 96.74 |
+| kristensara_720p | 2.31 | 2.27 | **−1.7%** | 43.13 | 43.99 | 93.49 | 96.81 |
+| bbb_1080p | 4.20 | 4.16 | −1.0% | 43.65 | 43.66 | 96.40 | 96.40 |
+
+Rate *and* quality both move the right way, which is the signature of a transform change rather
+than a rate reallocation. The ordering is physical: blue_sky is smooth gradient, where a fifth
+halving still finds structure; bbb is animation with hard edges, where it does not. The
+kristensara VMAF jump (+3.3) is out of proportion to its rate saving and worth a second look —
+93.49 is low enough for that image that a single blocking artefact could dominate the score.
+
+The pre-fix numbers quoted in the `quality_preset` comment (blue_sky −2.8%, kristensara −1.7%)
+were taken with groups 8–9 aliased onto group 7. They were a lower bound, as expected.
+
+### The q ≤ 80 cutoff does not survive the fix
+
+The preset caps at 4 levels above q=80, on the reading that deep bands there carry real detail and
+the extra level costs bits for identical PSNR. Re-measured at q=90 with the accumulators correct:
+
+| image | bpp 4L → 5L | Δ rate | Δ PSNR | Δ VMAF |
+|---|---|---|---|---|
+| blue_sky_1080p | 7.45 → 7.41 | −0.5% | −0.01 dB | 0.00 |
+| kristensara_720p | 6.71 → 6.68 | −0.4% | 0.00 dB | −0.02 |
+
+Not a loss — a small win. The cutoff was measuring the aliasing bug, not the transform. Left in
+place for now because 0.4% on two images at one quality point is not enough to move a default;
+logged as the open follow-up on BUG-6 (sweep q=85–99 on ≥3 images).
+
+### Notes on method
+
+Compression figures only — bpp, PSNR, VMAF — all deterministic and unaffected by the machine load
+another session was putting on this Mac at the time. No throughput number is claimed here.
+Two agents were editing this working tree concurrently; the `take_bytes` bounds-clamping in
+`deserialize_tile_rice` came from the other session and is not measured above.
+
+---
+
+## 2026-09-06 — TUNE-1 closed: GOP length is worth ~nothing, and the "inter saves 17-27%" figure is an equal-qstep artefact
+
+### Why TUNE-1 was re-opened
+
+Its −24% for longer GOPs was measured with the B-pyramid on, and read as "GNC spends too few
+frames on B". BUG-5 turned the pyramid off by default this morning, so every keyframe interval now
+produces P-only coding and the question is different: what does GOP length cost or buy with
+P-frames alone?
+
+Four 1080p sequences × 17 frames × 2 qsteps, 4:4:4, Rice, rate at matched VMAF against `ki=8`.
+
+| sequence | ki=2 | ki=4 | ki=8 | ki=17 |
+|---|---|---|---|---|
+| touchdown | −2.9% | −1.5% | — | −1.3% |
+| old_town | −11.9% | −4.8% | — | +2.2% |
+| speed_bag | −3.8% | −1.0% | — | −0.8% |
+| bbb (animation) | +11.6% | +1.5% | — | −1.7% |
+
+**Longer GOP is worth −1.7% to +2.2% — nothing.** The −24% TUNE-1 measured came entirely from the
+B-pyramid, not from GOP length. With the pyramid off there is no reason to lengthen the default,
+and the seeking and error-resilience arguments for keeping it short now win uncontested.
+**TUNE-1 closed: keep the default.**
+
+Note the direction on camera content: *shorter* is mildly cheaper (−1 to −12%), and only
+animation prefers longer. That is the same content split as BUG-5.
+
+### The bigger finding: a standing repo figure is an equal-qstep artefact
+
+Pushing the sweep to `ki=1` (all-intra) produced a sign flip against the repo's standing claim
+that "GNC I+P+B saves ~17–27% vs all-I". Both readings, from the same runs:
+
+| sequence | qstep | all-intra | ki=8 | **saving at equal qstep** | all-intra VMAF | ki=8 VMAF |
+|---|---|---|---|---|---|---|
+| touchdown | 4.0 | 17 247 171 | 11 566 531 | −32.9% | 99.45 | 98.25 |
+| old_town | 4.0 | 36 340 223 | 30 129 886 | −17.1% | 99.67 | 98.24 |
+| speed_bag | 6.0 | 5 316 773 | 3 500 393 | −34.2% | 97.72 | 95.24 |
+| bbb | 6.0 | 15 312 881 | 6 759 606 | −55.9% | 97.69 | 93.77 |
+
+At equal qstep inter "saves" 17–56% — which is where the 17–27% figure comes from. But it is also
+**1.2 to 3.9 VMAF points worse**. This is exactly the trap LOOP.md's own list names: *comparing
+bitrates at equal qstep rather than equal distortion is meaningless.*
+
+**The "inter saves 17–27% vs all-I" figure should be retired.** It measures a quality difference,
+not a rate saving.
+
+### At matched quality — and here the metrics disagree, so the claim stays narrow
+
+All-intra against `ki=8`, rate at matched quality, negative = all-intra cheaper. VMAF ranges were
+checked for real overlap on every sequence (no extrapolation):
+
+| sequence | by VMAF | by PSNR |
+|---|---|---|
+| old_town | **−39.1%** | **−17.9%** |
+| touchdown | −12.0% | **+5.4%** |
+
+**On old_town both metrics agree that all-intra is cheaper. On touchdown they disagree in sign.**
+So the strong reading — "GNC's inter coding is actively harmful on camera content" — is **not
+supported**. What is supported: at matched quality the inter saving is far smaller than the repo
+has believed, is content-dependent, and on at least one sequence is negative.
+
+The disagreement is itself informative: P-frames score relatively better on PSNR than on VMAF,
+consistent with inter coding introducing error that PSNR under-penalises — drift and temporal
+blurring across a GOP are perceptually visible and PSNR-cheap. CLAUDE.md makes VMAF primary and
+PSNR a cross-check, which would favour the all-intra reading, but a sign flip is not something to
+resolve by citing a policy.
+
+**Open, and the next step is specific:** more rate points (only two overlapped per sequence here),
+a third and fourth camera sequence, and a chroma-aware cross-check with CIEDE2000 before any
+default changes. **No default was changed on the strength of this.**

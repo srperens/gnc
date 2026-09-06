@@ -427,7 +427,20 @@ every chroma plane unwritten, and the stale contents were still being coded.
 **Follow-up worth doing:** audit for other places deriving one plane's geometry from another's
 by a fixed factor. Three defects this session came from that single assumption.
 
-### TUNE-1 — Default keyframe interval fragments the B-pyramid (todo, P1)
+### TUNE-1 — Default keyframe interval (**CLOSED 2026-09-06** — keep the default)
+Re-measured after BUG-5 turned the B-pyramid off. With P-only coding, GOP length is worth
+**−1.7% to +2.2%** at matched VMAF across four sequences — nothing. The −24% below came entirely
+from the pyramid, not from GOP length. The seeking and error-resilience arguments for a short GOP
+now win uncontested. On camera content *shorter* is even mildly cheaper (−1 to −12%); only
+animation prefers longer.
+
+**Spun off as an open question:** pushing the same sweep to `ki=1` showed the repo's standing
+"inter saves 17–27% vs all-I" is an **equal-qstep comparison** — at equal qstep inter saves 17–56%
+but is also 1.2–3.9 VMAF worse. At matched quality all-intra is cheaper by 39% (old_town) and 12%
+(touchdown) on VMAF, but PSNR disagrees in sign on touchdown (+5.4%). Needs more rate points and a
+chroma cross-check before anything is concluded. See RESEARCH_LOG 2026-09-06.
+
+### Superseded detail — original TUNE-1 (measured with the B-pyramid on)
 `ki=9` exactly matches the 8-frame pyramid group, so trailing frames form a group too short for a
 pyramid and degrade to a P-chain. Measured at 1080p q=70 4:2:0:
 
@@ -502,19 +515,35 @@ was PSNR on stills rather than VMAF on video.
 The gap is multiples, not percentages. Work targeting single-digit-percent improvements is not
 addressing it.
 
-### BUG-6 — Wavelet decomposition capped at 4 levels; 5 panics (todo, P2)
-`GNC_WAVELET_LEVELS=5` panics at `rice_gpu.rs:942` (`index out of bounds: the len is 1000 but the
-index is 1000`). `MAX_GROUPS = 8` with `num_groups = levels * 2` puts 4 levels exactly at the
-ceiling, and the per-tile skip bitmap is a single `u8`, so 8 groups is the hard limit.
+### BUG-6 — Wavelet decomposition capped at 4 levels; 5 panics (**DONE 2026-09-06**)
+The cap was `MAX_GROUPS = 8` with `num_groups = levels * 2`, which put 4 levels exactly at the
+ceiling, plus a one-byte per-tile skip bitmap. Raised to 12 groups (6 levels) across both entropy
+backends: `rice.rs`, `rice_gpu.rs`, `rans_gpu.rs`, `rans_gpu_encode.rs` and the five WGSL shaders.
+The tile-info and k strides are now derived from `MAX_GROUPS` rather than written out as literals,
+which is what the old `33`/`25`/`36` constants were.
 
-JPEG 2000 typically uses 5 levels, and moving 3 → 4 measured 5-17% better (see TUNE-2), so the
-cap sits right where the gains might continue. Widening needs `MAX_GROUPS`, `K_STRIDE`, the GPU
-buffer layout and a wider skip bitmap — the last is a bitstream change.
+**Bitstream:** the Rice skip bitmap is one byte for ≤8 groups and two little-endian bytes above
+that. `num_groups` is already in the tile header, so no generation flag was needed and existing
+files keep parsing — see [docs/BITSTREAM_SPEC.md](docs/BITSTREAM_SPEC.md) §2.4. The per-odd-stream
+checkerboard-k block follows the same rule (stride 8, or 12 for wide tiles).
 
-Gate before building: offline, levels 5 and 6 add only 0.2% and 0.1% over 4. But offline
-understated the 3→4 step by 5x (1.2% predicted, 6% measured), because Rice adapts `k` per subband
-and an ideal-entropy model does not see that. So measure in-codec with a temporary widening
-before committing to the format change.
+**Measured** at q=70, 5 levels against 4, on the shipped binary after the fix:
+
+| image | bpp 4L → 5L | Δ rate | Δ PSNR | Δ VMAF |
+|---|---|---|---|---|
+| blue_sky_1080p | 3.51 → 3.37 | **−4.0%** | +1.40 dB | 0.00 |
+| kristensara_720p | 2.31 → 2.27 | **−1.7%** | +0.86 dB | +3.32 |
+| bbb_1080p | 4.20 → 4.16 | −1.0% | +0.01 dB | 0.00 |
+
+Smooth content gains most, which is what a deeper decomposition should do. Default is now 5 levels
+at q ≤ 80, 4 above; `GNC_WAVELET_LEVELS` still overrides. `CodecConfig::max_wavelet_levels()`
+states the tile-size ceiling (5 for a 256 px tile).
+
+**Follow-up (open):** the q ≤ 80 cutoff no longer reproduces. It was set when the encoder's
+phase-1 statistics arrays were still 8 wide, so groups 8–9 aliased group 7 and the deep levels got
+the wrong `k`. Re-measured at q=90 with correct widths, 5 levels is −0.4% (blue_sky) and −0.5%
+(kristensara) at identical PSNR and VMAF — small, but not the loss the cutoff assumes. Sweep
+q=85–99 on ≥3 images before either removing the cutoff or writing down why it stays.
 
 ### TUNE-4 — Adaptive quantisation gradient was inverted (**DONE 2026-09-05**)
 `aq_strength` was 0.2 above q=70 and 0.15 below, never swept. Measured: 0.3 below q=30 buys +0.1

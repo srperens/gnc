@@ -120,7 +120,8 @@ old_town, +70.6% crowd_run). Nothing in the coder changed between the two; the 5
 measured somewhere GNC is not built to operate. **Use +90.5%, and do not quote a VMAF BD-rate at
 this end** — widening the quality ladder moved the VMAF figure by 47.5 points on average and the
 PSNR figure by 1.0. The +13.9% still-image figure is PSNR on stills, a third quantity again.
-See [RESEARCH_LOG.md](RESEARCH_LOG.md), 2026-09-06.
+See [RESEARCH_LOG.md](RESEARCH_LOG.md), 2026-09-06, and the decision record
+[docs/decisions/0013](docs/decisions/0013-the-headline-gap-figure-was-the-wrong-operating-point.md).
 
 **And luma alone misleads here.** At rate matched to 1%, GNC beats x264 on CIEDE2000 (0.611 vs
 0.684 on bbb, 0.911 vs 0.949 on old_town, better 95th percentile on all three) while losing

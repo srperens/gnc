@@ -207,11 +207,16 @@ without an org chart:
 ### Checkpoints
 
 At every natural checkpoint (feature complete, priority item done):
-1. Run `cargo test --release` — fix failures before proceeding
-2. Log progress in `RESEARCH_LOG.md` with full numbers
-3. Commit with descriptive message
-4. Update `BACKLOG.md` status and `BASELINE.md` if improved
-5. Continue automatically with next item
+1. Run `cargo test --release` and both clippy targets — fix failures before proceeding
+2. Log progress in `RESEARCH_LOG.md` with full numbers, including the failures
+3. Update `BACKLOG.md` status, and `BASELINE.md` if any figure in it moved
+4. **Write a decision record** in `docs/decisions/NNNN-title.md` if the item involved a *choice* —
+   a default changed, an option rejected, a recorded conclusion reversed. Document *why*, and
+   especially what was **not** chosen and what it would have cost. Skip it for a plain bug fix
+   with no judgement in it. This convention lost its owner when the role-based team was retired
+   (0012–0014 were written late because of that); it belongs to whoever ships the item.
+5. Commit with the numbers in the message. Push.
+6. Continue automatically with next item
 
 ## Key Documents
 

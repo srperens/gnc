@@ -1,3 +1,5 @@
+pub mod abac;
+pub mod abac_compare;
 pub mod adaptive;
 pub mod bitplane;
 pub mod block_transform;

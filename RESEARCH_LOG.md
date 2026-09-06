@@ -6902,3 +6902,96 @@ succeeds. Use `-q 15 --qstep 1.0`.
 Recommended fix is a bounds check on the host, not a wider alphabet: rANS is selected only at
 q ≤ 20 where 4 KB is ample, and it measures worse than Rice above q=20, so the capability has no
 user. Turn the crash into a sentence and leave it there.
+
+---
+
+## 2026-09-06 — EBCOT part 3: built the CPU reference, measured in-codec. −19 to −25% against the shipped Rice coder.
+
+`src/encoder/abac.rs` — adaptive binary arithmetic coding over code-blocks, the design the ceiling
+work settled on. Textbook Witten-Neal-Cleary coder, chosen because it is short enough to verify by
+exhaustive roundtrip rather than because it is fast. `src/encoder/abac_compare.rs` codes every tile
+of a real encode twice, gated on `GNC_ABAC_COMPARE=1`.
+
+### The number
+
+Against the **shipped** Rice tiles, on identical coefficients:
+
+| image | q=40 | q=55 | q=70 |
+|---|---|---|---|
+| bbb_1080p | −21.9% | −19.2% | −16.7% |
+| blue_sky_1080p | −22.9% | −21.0% | −18.2% |
+| touchdown_1080p | −24.4% | −22.1% | −19.3% |
+| kristensara_720p | **−25.5%** | −23.4% | −22.1% |
+| mean | **−23.7%** | **−21.4%** | **−19.1%** |
+
+### Three checks, because a result this large is more likely to be a bug than a breakthrough
+
+**1. It is the same coefficients.** Rice is dispatched over
+`[&bufs.mc_out, &bufs.ref_upload, &bufs.plane_b]` (pipeline.rs:2316) and the comparison reads back
+exactly those three buffers. Not an equivalent signal — the same one.
+
+**2. Every block round-trips, and every coefficient is covered.** `decode_block` is run on every
+block of every tile of the real encode and asserted equal to its input — not a sample. And the
+subband cutting asserts it covered `tile_size²` coefficients: a layout that silently missed
+coefficients would make abac look smaller while every individual roundtrip still passed, which is
+the one way this could have been wrong with no test failing.
+
+**3. The first baseline was wrong, and that is how the first version of this result was caught.**
+It compared against `rice::rice_encode_tile`, the CPU reference Rice, and reported −35%. The CPU
+reference produces more bytes for the coefficients alone than the real encoder produces for the
+entire file — it lacks the per-stream k and checkerboard k-context the GPU path has. The tell was
+that −35% beat the offline conditional-entropy *ceiling* of −13.7%, which is impossible. Fixed by
+taking the baseline from the frame's own entropy data.
+
+### Why it still exceeds the offline ceiling, and why that is fine
+
+−19% to −25% is larger than the −13.7% the offline script predicted. Those two numbers are not
+comparable and should not be reconciled:
+
+- The offline measurement ran on a **Python DWT** with its own gain normalisation, no adaptive
+  quantisation and a different crop. Different coefficients have different achievable gains.
+- Its Rice baseline was **idealised**: best per-band k, no real per-tile headers. GNC's shipped Rice
+  pays a 16-byte tile header, k values per group, a skip bitmap and 256 stream-length fields per
+  tile. abac's equivalent is 25 code-blocks per tile at two bytes each — 50 bytes against a few
+  hundred. Part of the win is header structure, not context modelling.
+
+The in-codec number is the one that counts: same coefficients, real baseline, verified
+reconstruction.
+
+### Throughput — the other half of the decision
+
+Single-threaded, unoptimised, no SIMD, no GPU:
+
+| image | decode |
+|---|---|
+| bbb_1080p | 77.4 Mcoeff/s |
+| blue_sky_1080p | 91.5 Mcoeff/s |
+| kristensara_720p | 107.8 Mcoeff/s |
+
+A padded 1080p 4:4:4 frame is 7.86 Mcoeff, so about 100 ms per frame on one core — roughly 10 fps,
+against Rice's branch-free parallel decode. That sounds fatal and probably is not:
+
+- A frame holds about **3000 independent code-blocks** (25 per tile × 40 tiles × 3 planes), so the
+  work is embarrassingly parallel at frame scale even though it is serial within a block. That was
+  the objection this whole line of work had to answer, and it is answered.
+- This is a textbook WNC coder with a `u64` multiply and a loop per binary decision. A production
+  binary decoder (VP8-style, table-driven renormalisation) is typically several times faster.
+
+Not conclusive. It is a plausible-to-proceed signal, not a green light on fps.
+
+### Where this leaves it
+
+The rate case is now made on real data with the checks above. What is not done, in order:
+
+1. **A GPU decode shader**, and honest fps against Rice on an idle machine. This is the gate.
+2. **Bitstream integration** — a `GP18` generation with an `EntropyCoder::Abac` variant, code-block
+   length fields, and the tile header carrying the block size. No format change has been made yet;
+   `abac` is a standalone module and `abac_compare` is a diagnostic.
+3. **Inter frames.** All of the above is intra. Residual coefficients have different neighbourhood
+   statistics and the contexts may need re-tuning.
+
+One thing worth flagging for whoever picks this up: the deep subbands at 5 levels produce 8×8
+code-blocks — 64 coefficients to adapt 18 context probabilities on. That is the same
+too-little-data problem that killed the 256-stream variant, at a smaller scale. A block-size rule
+that merges the deep subbands into one code-block is probably worth measuring before the shader is
+written.

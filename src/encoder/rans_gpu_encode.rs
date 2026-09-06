@@ -1810,6 +1810,17 @@ impl GpuRansEncoder {
                 let final_state = meta_data[meta_base + 1];
 
                 let byte_base = stream_idx * MAX_STREAM_BYTES;
+                // The shader writes each stream *backwards* from the end of its fixed
+                // MAX_STREAM_BYTES slot, so write_ptr counts down. A stream needing more than
+                // the slot underflows and wraps to a huge u32, which used to surface as a
+                // cryptic "range start index 4297717596 out of range" (BUG-9). The alphabet is
+                // not the limit here — the output slot is.
+                assert!(
+                    write_ptr <= MAX_STREAM_BYTES,
+                    "rANS stream {stream_idx} overflowed its {MAX_STREAM_BYTES}-byte output \
+                     slot (write_ptr={write_ptr}). rANS cannot encode this configuration; it \
+                     happens at very fine quantiser steps. Use --rice, or a coarser --qstep."
+                );
                 let bytes = stream_bytes[byte_base + write_ptr..byte_base + MAX_STREAM_BYTES].to_vec();
 
                 per_stream_data.push(bytes);

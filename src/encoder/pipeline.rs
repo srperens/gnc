@@ -2582,6 +2582,38 @@ impl EncoderPipeline {
             None
         };
 
+        // === Adaptive-binary code-block coder comparison (GNC_ABAC_COMPARE=1) ===
+        // Placed after entropy coding so the baseline can be the *shipped* Rice size rather than
+        // the CPU reference coder, which is much worse and made abac look 35% better than its
+        // own offline ceiling. First I-frame only.
+        if config.transform_type == crate::TransformType::Wavelet
+            && std::env::var("GNC_ABAC_COMPARE").is_ok()
+        {
+            use std::sync::OnceLock;
+            static ABAC_DONE: OnceLock<()> = OnceLock::new();
+            let rice_ref: usize = rice_tiles
+                .iter()
+                .map(|t| super::rice::serialize_tile_rice(t).len())
+                .sum();
+            ctx.device.poll(wgpu::Maintain::Wait);
+            ABAC_DONE.get_or_init(|| {
+                let bufs = self.cached.as_ref().unwrap();
+                super::abac_compare::run_multi_plane(
+                    ctx,
+                    &bufs.mc_out,
+                    &bufs.ref_upload,
+                    &bufs.plane_b,
+                    padded_w,
+                    padded_h,
+                    active_chroma_w,
+                    active_chroma_h,
+                    config.tile_size,
+                    config.wavelet_levels,
+                    rice_ref,
+                );
+            });
+        }
+
         let entropy = match entropy_mode {
             EntropyMode::Bitplane => EntropyData::Bitplane(bp_tiles),
             EntropyMode::SubbandRans | EntropyMode::SubbandRansCtx => {

@@ -347,12 +347,21 @@ Tunables added for measurement, all defaulting to current behaviour: `GNC_INTER_
    fix is better references, not better residual coding. **This is the more promising of the
    two.**
 
-### BUG-4 — Inter frames degrade at odd tile-column counts (todo, P2)
-At `--tile-size 128` on 1080p (15 tile columns, odd) several inter frames land 4-6 dB below their
-neighbours while I-frames are unaffected; VMAF min falls from 94 to 80. Same condition as BUG-3
-(`padded_w != 2 * chroma_padded_w`), which was fixed for the chroma MC stride — something else in
-that family remains. Reproduce: `benchmark-sequence -n 17 -k 9 -q 70 --chroma-format 420
---tile-size 128`.
+### BUG-4 — Tile-skip used an absolute threshold (**DONE 2026-09-06**)
+Not the BUG-3 family after all — the odd-tile-column guess was wrong. 4:4:4 was affected too, so
+not chroma, and only P-frames, so not the shared path.
+
+`tile_skip_motion` declared a tile static when its mean zero-MV SAD fell below `0.5 · qstep` and
+zeroed all its motion vectors. That mean is taken over a whole tile, so its meaning depends on
+tile area: at 256px a tile with a moving object still contains enough static background to stay
+above the threshold; at 128px the same motion fills the tile and drops under it. Tiles with real
+motion were being told they were static.
+
+Now compares against the motion the search found — skip only when zero-MV error is also no worse
+than the motion-compensated error (`GNC_TILE_SKIP_MC_MARGIN`, default 0). Measured at q=70, 4:2:0:
+bbb **+0.36 VMAF** net at tile 256 and **+2.1** at tile 128; touchdown neutral at both. Positive
+at the default size too — the old rule was slightly wrong everywhere and only visibly wrong when
+tiles were small.
 
 
 ### BUG-1 — 4:2:0 pyramid B-frame chroma bug (**DONE 2026-09-05**)

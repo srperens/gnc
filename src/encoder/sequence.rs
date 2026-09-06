@@ -39,7 +39,14 @@ const B_FRAMES_PER_GROUP: usize = 7;
 /// per pixel) are skipped.  This is conservative enough to avoid zeroing tiles with
 /// real motion while aggressive enough to catch static background regions.
 fn tile_skip_motion_threshold(qstep: f32) -> f32 {
-    qstep * 0.5
+    // GNC_TILE_SKIP_MOTION_MUL overrides the 0.5 factor (0 disables the pass entirely). The
+    // threshold is a mean over a whole tile, so its meaning changes with tile size — smaller
+    // tiles have noisier means and mis-declare more tiles static. See BUG-4.
+    let mul: f32 = std::env::var("GNC_TILE_SKIP_MOTION_MUL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.5);
+    qstep * mul
 }
 
 /// Returns the tile skip threshold for the given quantization step.

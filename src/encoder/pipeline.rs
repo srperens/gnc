@@ -1096,7 +1096,16 @@ impl EncoderPipeline {
         //   offset 12: block_size_8       u32
         //   offset 16: skip_threshold     f32
         //   offset 20: block_skip_enabled u32  (1 = per-8×8-block skip in non-skip tiles)
-        //   (padded to 32 bytes by WGSL alignment rules — last 8 bytes unused)
+        //   offset 24: mc_margin          f32  (how much worse than MC zero-motion may be)
+        //   (padded to 32 bytes by WGSL alignment rules — last 4 bytes unused)
+        //
+        // mc_margin is what makes the skip decision safe at tile sizes other than 256: the
+        // absolute threshold is a mean over a tile, so its meaning changes with tile area.
+        // See BUG-4 and the note at the top of tile_skip_motion.wgsl.
+        let mc_margin: f32 = std::env::var("GNC_TILE_SKIP_MC_MARGIN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.05);
         let params_data: [u32; 8] = [
             padded_w,
             padded_h,
@@ -1104,7 +1113,8 @@ impl EncoderPipeline {
             block_size_8,
             skip_threshold.to_bits(),
             block_skip_enabled as u32,
-            0, 0, // padding
+            mc_margin.to_bits(),
+            0, // padding
         ];
         let params_buf = ctx
             .device

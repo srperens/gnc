@@ -3,8 +3,23 @@
 // For each tile, computes the zero-MV prediction error:
 //   mean_sad = mean |current_pixel - reference_pixel_at_same_position|
 //
-// If mean_sad < skip_threshold, the tile is a "skip tile": all 8×8 split MVs
-// covering that tile are zeroed.  After this pass:
+// A tile is a "skip tile" — all its 8×8 split MVs zeroed — when zero motion is
+// *not meaningfully worse than the motion the search found*:
+//
+//   mean_sad < skip_threshold  AND  mean_sad <= mc_mean_sad * (1 + margin)
+//
+// The absolute threshold alone is not a safe test. It is a mean over a whole tile,
+// so what it means depends on tile size: at 256px a tile containing a moving object
+// also contains enough static background to keep the mean high, while at 128px the
+// same motion fills a tile and its mean falls under the threshold. Measured on
+// bbb at 1080p, threshold 0.5·qstep: P-frames held 39.9 dB at 256px tiles and
+// collapsed to 33.4 dB at 128px, because tiles with real motion were being told
+// they were static. See BUG-4.
+//
+// Comparing against the motion-compensated error instead makes the decision mean
+// the same thing at any tile size: on genuinely static content zero-MV and MC
+// agree, so the skip still fires (and still shrinks a static P-frame roughly 5x);
+// where the search found real motion, MC is much better and the tile is left alone.  After this pass:
 //   MC produces residual = current − ref_same_pos (the actual temporal change).
 //   For correctly identified skip tiles that residual is small, quantisation
 //   drives it to zero, and the Rice encoder produces a compact all-skip RiceTile.
@@ -34,6 +49,10 @@ struct Params {
     block_size_8:      u32,  // 8  (split-MV resolution)
     skip_threshold:    f32,  // mean per-pixel SAD below which tile/block is skipped
     block_skip_enabled: u32, // 1 = also apply per-8×8-block skip in non-skip tiles
+    /// Zero motion must be within this factor of the motion-compensated error to skip.
+    /// 0 = accept only when zero-MV is at least as good; 0.05 allows 5% worse.
+    mc_margin:         f32,
+    _pad:              u32,
 }
 
 @group(0) @binding(0) var<uniform>             params:         Params;
@@ -46,6 +65,7 @@ struct Params {
 @group(0) @binding(4) var<storage, read_write> tile_skip_out:  array<u32>;
 
 var<workgroup> shared_sum: array<f32, 256>;
+var<workgroup> shared_mc:  array<f32, 256>;
 
 @compute @workgroup_size(256)
 fn main(
@@ -61,6 +81,7 @@ fn main(
 
     // Unconditional initialisation (Metal/M1 requires barriers outside divergent branches).
     shared_sum[lid] = 0.0;
+    shared_mc[lid] = 0.0;
     workgroupBarrier();
 
     // ── Phase 1: accumulate |current − reference| over all tile pixels ───────
@@ -71,6 +92,8 @@ fn main(
         let tile_origin_x = tile_x * params.tile_size;
         let tile_origin_y = tile_y * params.tile_size;
         var local_sum: f32 = 0.0;
+        var local_mc:  f32 = 0.0;
+        let blocks_total_x_p1 = params.padded_w / params.block_size_8;
         for (var i = 0u; i < pixels_per_thread; i++) {
             let pixel_idx = lid * pixels_per_thread + i;
             if pixel_idx < tile_pixels {
@@ -79,10 +102,26 @@ fn main(
                 let gx      = tile_origin_x + local_x;
                 let gy      = tile_origin_y + local_y;
                 let idx     = gy * params.padded_w + gx;
-                local_sum  += abs(current_plane[idx] - ref_plane[idx]);
+                let cur     = current_plane[idx];
+                local_sum  += abs(cur - ref_plane[idx]);
+
+                // Same pixel under the motion the search found. Integer-pel is enough here:
+                // the decision needs a comparison, not a reconstruction, so this costs one
+                // extra fetch per pixel. Round to nearest rather than truncating — i32
+                // division truncates toward zero, which biases negative vectors the wrong way
+                // and makes motion compensation look worse than it is, letting bad skips
+                // through.
+                let blk     = (gy / params.block_size_8) * blocks_total_x_p1
+                            + (gx / params.block_size_8);
+                let mvx     = motion_vectors[blk * 2u];
+                let mvy     = motion_vectors[blk * 2u + 1u];
+                let sx      = clamp(i32(gx) + (mvx / 4), 0, i32(params.padded_w) - 1);
+                let sy      = clamp(i32(gy) + (mvy / 4), 0, i32(params.padded_h) - 1);
+                local_mc   += abs(cur - ref_plane[u32(sy) * params.padded_w + u32(sx)]);
             }
         }
         shared_sum[lid] = local_sum;
+        shared_mc[lid]  = local_mc;
     }
     workgroupBarrier();
 
@@ -91,6 +130,7 @@ fn main(
     for (var stride = 128u; stride > 0u; stride >>= 1u) {
         if lid < stride {
             shared_sum[lid] += shared_sum[lid + stride];
+            shared_mc[lid]  += shared_mc[lid + stride];
         }
         workgroupBarrier();
     }
@@ -98,7 +138,13 @@ fn main(
     // ── Phase 3: skip decision — reuse shared_sum[0] as flag (1.0 = skip) ───
     if lid == 0u && !out_of_bounds {
         let mean_sad     = shared_sum[0] / f32(tile_pixels);
-        shared_sum[0]    = select(0.0, 1.0, mean_sad < params.skip_threshold);
+        let mean_mc      = shared_mc[0] / f32(tile_pixels);
+        // Skip only when zero motion is both small in absolute terms and no worse than
+        // the motion the search found. The second condition is what makes this safe at
+        // any tile size — see the note at the top.
+        let cheap        = mean_sad < params.skip_threshold;
+        let no_worse     = mean_sad <= mean_mc * (1.0 + params.mc_margin);
+        shared_sum[0]    = select(0.0, 1.0, cheap && no_worse);
         // Export skip decision to per-tile output buffer so the encoder can zero
         // the quantised coefficient buffer for skip tiles after quantize (post-quant
         // zeroing avoids wavelet-filter bleed that plagued the spatial-domain approach).

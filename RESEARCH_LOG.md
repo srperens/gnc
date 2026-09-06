@@ -5200,3 +5200,48 @@ step in the residual is cheap for a DCT (it lands on a transform boundary) and e
 exactly this reason and it is patent-clear (H.263 Annex F era, shipped in AV1 under AOMedia's
 royalty-free licence). Published at 1–4% in DCT codecs; plausibly more here — **inference, not a
 measurement.**
+
+## 2026-09-06 — BUG-4 fixed: the tile-skip decision was an absolute threshold
+
+At `--tile-size 128` on 1080p, P-frames collapsed to 33 dB while I-frames held 43. Isolating it:
+4:4:4 was affected too, so not chroma; B-frames were fine, so it was specific to the P path.
+Disabling `tile_skip_motion` restored P₁₂ from 33.44 to 39.60 dB, which named the culprit.
+
+**Cause.** The pass declared a tile static when its mean zero-MV SAD fell below `0.5 · qstep`,
+and all the tile's 8x8 motion vectors were then zeroed. That is a mean over a whole tile, so what
+it means depends on tile area: at 256px a tile containing a moving object also contains enough
+static background to keep the mean above the threshold, while at 128px the same motion fills the
+tile and its mean falls under it. Tiles with real motion were being told they were static.
+
+**Fix.** Compare against the motion the search actually found rather than an absolute number: skip
+only when `mean_sad < threshold` **and** `mean_sad <= mc_mean_sad · (1 + margin)`, with the
+motion-compensated error accumulated in the same pass (integer-pel — the decision needs a
+comparison, not a reconstruction). Default margin 0, i.e. zero motion must be at least as good.
+On genuinely static content the two errors agree and the skip still fires; where the search found
+motion, MC is far better and the tile is left alone.
+
+**Measured** (1080p, q=70, 4:2:0, 17 frames, `GNC_REF_DEBLOCK=0`), old absolute-only rule against
+the new comparison:
+
+| | rate | VMAF | net after rate |
+|---|---|---|---|
+| bbb, tile 256 | 5 902 548 → 6 120 979 | 95.62 → **96.35** | **+0.36** |
+| bbb, tile 128 | 5 144 249 → 5 902 974 | 88.82 → **92.29** | **+2.1** |
+| touchdown, tile 256 | 6 613 943 → 6 625 955 | 97.81 → 97.82 | neutral |
+| touchdown, tile 128 | unchanged | 97.78 | neutral |
+
+Positive at the default tile size as well, not merely a repair for 128 — the old rule was
+slightly wrong everywhere and only visibly wrong when tiles were small. Neutral on high-motion
+content, where the skip rarely fires either way.
+
+### A measurement hazard worth recording
+
+Midway through this experiment the frame mix changed from `2I+8P+7B` to `2I+15P+0B` between two
+runs of the same command. Nothing I had touched could do that: **another session was editing the
+same working tree**, and had just landed a well-measured change turning the B-pyramid off by
+default. Several comparisons taken across that boundary were invalid, and the numbers above are
+all re-measured after it.
+
+Two sessions sharing one working tree makes any before/after unreliable, because the "before" can
+change under you. The `2I+8P+7B` → `2I+15P+0B` line in the output is what caught it — worth
+checking that the frame mix is what you expect before trusting a sequence comparison.

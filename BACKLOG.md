@@ -34,11 +34,21 @@ MEAS-4 is designed to answer that before anything gets built. Until then the pri
 3. Toggle features to identify dead weight and incorrect implementations
 4. Let measurements drive the next action
 
-MEAS-4 (done 2026-09-05) established that the inter gap is **not** in the coding model. The
-follow-up hunt for where it *is* returned four negative results in a row (multi-reference,
-sub-pel interpolation filter, motion search quality, and the earlier transform/entropy work),
-and then the premise itself failed inspection: the "GNC saves 38.5% vs x264's 86.9%" figure
-compares GNC's RGB PSNR against x264's YUV PSNR, which are not the same quantity.
+MEAS-4 (2026-09-05) was read as establishing that the inter gap is **not** in the coding model.
+**BUG-7 (2026-09-06) withdraws that.** MEAS-4's residual dumps were taken with
+`GNC_DIAGNOSTICS=1`, which clobbered the motion-compensation reference from the third frame of
+every sequence onward, so the residuals it analysed were about 6x larger than the encoder's real
+ones. MEAS-4 is reopened; its conclusion should not be relied on.
+
+That matters for what came after. The follow-up hunt for where the gap *is* returned four negative
+results in a row — multi-reference P-frames, the sub-pel interpolation filter, motion-search
+quality, and MCTF — and **every one of them was chosen because MEAS-4 pointed at prediction.** A
+run of negatives against a hypothesis is weak evidence the hypothesis was wrong; there is now a
+concrete reason to think it was never properly tested. Whether the gap is in prediction or in the
+coding model is an open question again.
+
+Separately, the old premise had already failed inspection: the "GNC saves 38.5% vs x264's 86.9%"
+figure compares GNC's RGB PSNR against x264's YUV PSNR, which are not the same quantity.
 
 **MEAS-1 is therefore a hard prerequisite for any further inter work.** Until there is a
 trustworthy, VMAF-based, like-for-like comparison, there is no reliable number saying how large
@@ -48,8 +58,9 @@ the inter gap is, and targeting it is guesswork. See RESEARCH_LOG 2026-09-05.
 - Spatial BD-rate vs H.264 all-I: **+13.9%** — reasonable for a wavelet codec; GNC wins above ~36 dB
 - Spatial BD-rate vs JPEG 2000 (4:4:4): **+28.3%** — gap narrows to ~11% at high quality
 - Temporal: GNC I+P+B saves ~17–27% vs all-I (48.9%/29.8% on bbb/touchdown at q=75, 4:4:4).
-  x264 saves 86–89% on the same content → the gap is real and large. **MEAS-4 located it in
-  prediction quality, not in the coding model.**
+  x264 saves 86–89% on the same content → the gap is real and large. **Where it lies is again an
+  open question — see BUG-7 and the reopened MEAS-4.** For reference, on blue_sky at q=50 a
+  P-frame really costs 0.55–0.61 of an I-frame, not the ~1.0 the diagnostics were reporting.
 - All above is PSNR-based (RGB). VMAF-based video comparison vs H.264 still missing (MEAS-1).
 
 ## Active priority list
@@ -515,11 +526,64 @@ was PSNR on stills rather than VMAF on video.
 The gap is multiples, not percentages. Work targeting single-digit-percent improvements is not
 addressing it.
 
-### FMT-2 — Stream-length tables were 12-17% of a P-frame (**DONE 2026-09-06**, GP17)
+### BUG-7 — Diagnostics corrupted the encoder: 32% larger files with `GNC_DIAGNOSTICS=1` (**FIXED 2026-09-06**)
+The temporal-wavelet diagnostic ran a second full wavelet transform through the encoder's *shared*
+GPU buffers, clobbering the motion-compensation reference. Every P-frame after the second then
+encoded against garbage. blue_sky, 8 frames, q=50: **2,808,848 bytes quiet vs 3,703,862 with
+diagnostics (+31.9%)**. Residual Y mean-abs 2.5 real, 14.7 reported — i.e. reported as large as
+the raw frame difference, meaning MC contributing nothing.
+
+Gated behind `GNC_DIAG_TWAV=1`; a diagnostics-enabled run is now byte-identical to a quiet one.
+
+**What it invalidates:**
+- `ratio_vs_iframe` and every "temporal prediction may not be effective" warning. Real ratios on
+  blue_sky q=50 are **0.55–0.61**, not the 1.02–1.06 that was being reported and believed.
+- Residual statistics from the third frame of any sequence onward.
+- **MEAS-4 (reopened below).** Its residual dumps used `GNC_DIAGNOSTICS=1`.
+- The bit-budget shares in FMT-2's first write-up. Corrected: tile headers ~4% of an I-frame, ~6%
+  of a P-frame. The GP17 *gain* is unaffected — measured on file sizes with diagnostics off.
+
+MEAS-1's 5–7x figure is unaffected (`meas1_vs_h264.py` encodes without diagnostics).
+
+**Regression test:** `tests/diagnostics_neutral.rs` encodes six synthetic frames twice, with and
+without diagnostics, and asserts byte-identical output. Verified to fail when the diagnostic is
+re-enabled (+72.1%). Synthesises its own frames, and sets `keyframe_interval = 9` — the default
+preset is all-intra and cannot exercise a P-frame bug.
+
+**Why it hid so long:** the symptom looked like a codec result ("P-frames cost as much as
+I-frames") rather than a bug, so it was recorded as a finding. And it was perfectly reproducible,
+which read as evidence it was real — reproducibility separates a bug from noise, not a codec
+property from an instrumentation artefact.
+
+### MEAS-4 — Inter-model gap decomposition (**REOPENED 2026-09-06** — measured on corrupted data)
+Previously closed 2026-09-05 with the conclusion "the inter gap is in prediction quality, not the
+coding model". That conclusion rests on residual dumps taken with
+`GNC_DUMP_RESIDUAL=<dir> GNC_DIAGNOSTICS=1`, and BUG-7 shows those dumps had a clobbered MC
+reference from the third frame of every sequence onward. The residuals analysed were therefore
+much larger than the encoder's real ones (14.7 vs 2.5 mean-abs on blue_sky q=50) — which is
+precisely the signal that pointed at prediction.
+
+**This matters beyond MEAS-4.** Four subsequent experiments were chosen *because* MEAS-4 pointed at
+prediction, and all four came back negative: multi-reference P-frames (#25, withdrawn), the sub-pel
+interpolation filter, motion-search quality, and MCTF (rejected 2026-09-06). A run of negatives
+against a hypothesis is weak evidence the hypothesis was wrong; here there is now a concrete reason
+to think the hypothesis was never properly tested.
+
+**To redo:** re-dump residuals with `GNC_DIAG_TWAV` unset (or dump without diagnostics at all —
+the dump hook should not need the temporal-wavelet staging), then re-run `scripts/meas4_oracle.py`
+and `scripts/meas_me_quality.py`. State explicitly which frames each dump covers. Do not re-derive
+any conclusion from the old dumps.
+
+### FMT-2 — Stream-length tables cost more than the coefficients they describe (**DONE 2026-09-06**, GP17)
 Each tile carries a 256-entry table of entropy-stream lengths — the price of 256 independent
 streams per tile. As byte-aligned varints that is ~256 bytes per tile, ~30 KB per 1080p frame,
-regardless of how much the tile actually holds. Measured share of frame size: **5% of an I-frame,
-17-31% of a P-frame**. Never measured before.
+regardless of how much the tile actually holds. Never measured before.
+
+Share of frame size, on blue_sky q=50 with the GP17 coding in place: tile headers are 4.4% of an
+I-frame and ~6% of a P-frame, of which the length table is 12.6 KB of a 301 KB P-frame. Pre-GP17
+the same table was 22.5 KB — about 7% of the frame. *(A first version of this entry quoted 5% / 17-31%
+from runs taken with `GNC_DIAGNOSTICS=1`, which BUG-7 shows were corrupted encodes. The measured
+size reductions below are unaffected: they were taken on actual file sizes with diagnostics off.)*
 
 Priced three encodings before implementing: varint (existing), Exp-Golomb order 0 with a zero
 bitmap, and Golomb-Rice with a per-tile `k`. **Rice wins at every point (−20% to −61%)**;
@@ -705,7 +769,7 @@ Each toggle: report bpp + VMAF delta. Goal: identify dead weight and negative fe
 Run rd-curve (q=25–90) on crowd_run and park_joy with 4:4:4, measure VMAF at each point.
 Current rd-curve lacks --chroma-format and --vmaf on sequences. A benchmark loop may suffice.
 
-### MEAS-4 — Inter-model gap decomposition (**DONE 2026-09-05**)
+### MEAS-4 — Inter-model gap decomposition (**SUPERSEDED — see REOPENED entry above; these results came from corrupted dumps, BUG-7**)
 **Answer: the inter gap is prediction quality, not the coding model.** Full method, numbers and
 caveats in [docs/decisions/0005-meas4-inter-gap-decomposition.md](docs/decisions/0005-meas4-inter-gap-decomposition.md).
 

@@ -564,6 +564,17 @@ impl<'a> BitReader<'a> {
     }
 }
 
+/// Exact serialized size of one motion-vector field.
+///
+/// Diagnostics use this rather than re-deriving the encoding, which is how the bit-budget MV row
+/// came to report a GP12 varint estimate long after GP16 changed the coding — a static frame's
+/// field costs one byte and the budget claimed 5 KB.
+pub(crate) fn mv_field_bytes(vectors: &[[i16; 2]], blocks_x: usize) -> usize {
+    let mut buf = Vec::new();
+    serialize_mvs_delta(&mut buf, vectors, blocks_x);
+    buf.len()
+}
+
 /// Serialize motion vectors as median-predicted deltas.
 ///
 /// Layout: `[all_zero: 1 byte]`, and when that flag is 0,

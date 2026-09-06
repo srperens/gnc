@@ -5849,3 +5849,99 @@ total bitrate and biggest at the operating point that matters, and it needs no s
 the length table is parsed on the host before the GPU sees the streams.
 
 It does not touch the 5-7x video gap. That gap is not in the headers.
+
+---
+
+## 2026-09-06 — The diagnostics were corrupting the encoder: `GNC_DIAGNOSTICS=1` made files 32% larger
+
+### How it surfaced
+
+Reading the bit budget for GP17 turned up a P-frame pattern that made no physical sense on
+blue_sky (a steady pan, uniform 15.4 mean-abs difference between every consecutive source frame):
+
+```
+Frame 0 [I] size=547105          Frame 3 [P] size=569337  ratio_vs_iframe=1.04
+Frame 1 [P] size=301241  0.55    Frame 4 [P] size=556711  ratio_vs_iframe=1.02
+Frame 2 [P] size=  9899  0.02    Frame 5 [P] size=577376  ratio_vs_iframe=1.06
+```
+
+One frame at 2% of the I-frame, the rest at 100%+, on content whose frame-to-frame difference is
+constant. Frame 2 was the anomalous one in *every* sequence tested, and shifting the input by two
+frames kept the anomaly at coding index 2 — so it was structural, not content.
+
+The decoded output was correct in every case. Each decoded frame matched its own source to
+~1.7 mean abs, and consecutive decoded frames differed by ~14.8, matching the source. So the
+bitstream was valid, which ruled out a reference-buffer bug.
+
+### The measurement was the bug
+
+The same encode reported two different sets of frame sizes — the diagnostics printed 9899 / 569337
+for frames 2 and 3 while the frames handed to the container were 336358 / 319454. Since
+`byte_size()` is `serialize_compressed(self).len()` and serialization is pure, the objects had to
+differ, and they could not: one variable, one assignment.
+
+They did not differ. **The encode differed.** Container size for eight frames of blue_sky at q=50:
+
+| | bytes |
+|---|---|
+| without `GNC_DIAGNOSTICS` | 2,808,848 |
+| with `GNC_DIAGNOSTICS=1` | **3,703,862** (+31.9%) |
+
+The temporal-wavelet diagnostic (`diag_original_wavelet_coefficients`) runs a second, full wavelet
+transform through the encoder's *shared* GPU buffers to capture original-signal coefficients. That
+clobbers the motion-compensation reference. Every P-frame after the second then encoded against
+garbage: residual mean-abs 14.7 instead of 2.5 — that is, as large as the raw frame difference,
+meaning motion compensation contributed nothing at all.
+
+Gating that one diagnostic off makes a diagnostics-enabled run **byte-identical** to a quiet one.
+
+### What this invalidates
+
+Everything measured with `GNC_DIAGNOSTICS=1` on a sequence, and specifically:
+
+- **`ratio_vs_iframe` and the "temporal prediction may not be effective" warnings are false.** The
+  real ratios on blue_sky q=50 are 0.55–0.61, not 1.02–1.06. The warning was firing on damage the
+  diagnostic itself caused.
+- **The residual statistics are false** from the third frame on. Real Y residual mean-abs ~2.5;
+  reported 14.7.
+- **MEAS-4 must be re-run.** Its residual dumps came from
+  `GNC_DUMP_RESIDUAL=<dir> GNC_DIAGNOSTICS=1`, so every frame after the second in those dumps was
+  a post-MC residual against a clobbered reference. MEAS-4's conclusion — "the inter gap is in
+  prediction quality, not the coding model" — is the premise the last several experiments were
+  built on, including the four negative results (multi-reference, sub-pel filter, motion-search
+  quality) that were chosen *because* MEAS-4 pointed at prediction. `scripts/meas_me_quality.py`
+  reads the same dumps and is affected identically.
+- The bit-budget shares quoted in the GP17 entry above ("tile headers 17–31% of a P-frame") came
+  from corrupted encodes. Corrected, on blue_sky q=50: tile headers are ~4% of an I-frame and ~6%
+  of a P-frame, of which the stream-length table is ~4–5%. **The GP17 gain itself is unaffected**
+  — it was measured on actual file sizes with diagnostics off, and reproduces.
+
+MEAS-1's 5–7x figure comes from `scripts/meas1_vs_h264.py`, which encodes without diagnostics, so
+it stands.
+
+### Why no test caught it
+
+Nothing compared a diagnostics-enabled encode against a quiet one. Diagnostics were assumed
+read-only, and in a CPU codec that assumption would have been safe. On a GPU pipeline with a
+shared buffer pool it is not: a read-only *intent* still needs scratch space, and scratch space
+came from the working set.
+
+`tests/diagnostics_neutral.rs` now encodes six synthetic 512x512 frames twice, once with
+diagnostics and once without, and asserts the bitstreams are byte-identical. Verified to fail
+when the diagnostic is re-enabled: **+72.1%**, with the same signature (one collapsed frame, then
+several inflated ones). The test synthesises its own frames so it runs without test material, and
+it sets `keyframe_interval = 9` — the default preset is all-intra, and an all-intra sequence
+cannot exercise a P-frame bug.
+
+### Process notes
+
+Two things kept this hidden for a long time. The first is that the failure looked like a *codec*
+result rather than a bug: "P-frames cost as much as I-frames" is a plausible thing for a wavelet
+codec to do, so it got written down as a finding instead of investigated as an anomaly. The tell
+was the frame-2 outlier — 2% of an I-frame is not a plausible codec result, and an implausible
+number next to a plausible one means neither can be trusted.
+
+The second is that the anomaly was reproducible, which read as evidence that it was real. It was
+reproducible because the corruption is deterministic. Reproducibility distinguishes a bug from
+noise; it does not distinguish a codec property from an instrumentation artefact. The check that
+does is the one now in the test: does observing change the observation?

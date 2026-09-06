@@ -226,7 +226,14 @@ impl EncoderPipeline {
         let mut prev_frame_luma: Option<Vec<f32>> = None;
 
         // Temporal wavelet diagnostic: staging buffers + previous frame state
-        let diag_twav_staging: Option<[wgpu::Buffer; 3]> = if diag_enabled {
+        // The temporal-wavelet diagnostic runs a second, full wavelet transform through the
+        // encoder's shared GPU buffers, which clobbers the motion-compensation reference and
+        // makes every following P-frame encode far worse — the encoder produced a 32% larger
+        // file with diagnostics on than off. Off by default until that is fixed; set
+        // GNC_DIAG_TWAV=1 to opt in and accept the corruption. See RESEARCH_LOG 2026-09-06.
+        let diag_twav_staging: Option<[wgpu::Buffer; 3]> = if diag_enabled
+            && std::env::var("GNC_DIAG_TWAV").is_ok()
+        {
             Some(std::array::from_fn(|i| {
                 ctx.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some(["diag_twav_y", "diag_twav_co", "diag_twav_cg"][i]),
@@ -423,7 +430,16 @@ impl EncoderPipeline {
                     prev_mv_buf.as_ref(),
                     false,
                     !next_is_key_or_end,
-                    pending_me.take(),
+                    // GNC_NO_LOOKAHEAD_ME=1 forces fresh motion estimation for every P-frame
+                    // instead of reusing the look-ahead's. Diagnostic lever: the look-ahead
+                    // searches against the reference available while encoding the *previous*
+                    // frame, so if it is ever used after the reference advances the vectors are
+                    // stale. See RESEARCH_LOG 2026-09-06.
+                    if std::env::var("GNC_NO_LOOKAHEAD_ME").is_ok() {
+                        None
+                    } else {
+                        pending_me.take()
+                    },
                     next_pframe_pixels.as_deref(),
                     // P-only mode: no B-frames between look-ahead and next P-frame,
                     // so preprocess results are safe to cache.

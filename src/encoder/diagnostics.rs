@@ -59,16 +59,36 @@ pub struct RiceEfficiency {
     pub tiles_with_lengths: usize,
 }
 
-/// Check if diagnostics are enabled (cached after first call).
+/// Whether diagnostics are enabled. Seeded from `GNC_DIAGNOSTICS` on first read and then
+/// held in an atomic, so `enable`/`set_enabled` work at any point and tests can toggle it
+/// without mutating the process environment.
 pub fn enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("GNC_DIAGNOSTICS").is_ok())
+    use std::sync::atomic::Ordering;
+    match DIAG_STATE.load(Ordering::Relaxed) {
+        DIAG_OFF => false,
+        DIAG_ON => true,
+        _ => {
+            let from_env = std::env::var("GNC_DIAGNOSTICS").is_ok();
+            DIAG_STATE.store(if from_env { DIAG_ON } else { DIAG_OFF }, Ordering::Relaxed);
+            from_env
+        }
+    }
 }
+
+const DIAG_UNSET: u8 = 0;
+const DIAG_OFF: u8 = 1;
+const DIAG_ON: u8 = 2;
+static DIAG_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(DIAG_UNSET);
 
 /// Enable diagnostics programmatically (e.g. from CLI flag).
 pub fn enable() {
-    std::env::set_var("GNC_DIAGNOSTICS", "1");
+    set_enabled(true);
+}
+
+/// Turn diagnostics on or off, overriding `GNC_DIAGNOSTICS`.
+pub fn set_enabled(on: bool) {
+    use std::sync::atomic::Ordering;
+    DIAG_STATE.store(if on { DIAG_ON } else { DIAG_OFF }, Ordering::Relaxed);
 }
 
 /// Directory to dump raw MC residual planes into, if `GNC_DUMP_RESIDUAL` is set.
@@ -395,35 +415,18 @@ fn collect_entropy_stats(diag: &mut FrameDiagnostics, entropy: &EntropyData) {
     }
 }
 
-/// Estimate the serialized size of delta-coded zigzag varint MVs with skip bitmap.
-/// This matches the GP12 encoding in format.rs (but avoids full serialization).
-fn estimate_mv_delta_size(vectors: &[[i16; 2]], block_size: u32, width: u32, tile_size: u32) -> usize {
-    let n = vectors.len();
-    if n == 0 {
+/// Exact serialized size of a motion-vector field.
+///
+/// Delegates to `format::mv_field_bytes` rather than re-deriving the encoding. The estimate this
+/// replaced still described GP12 varints long after GP16 changed the coding, so the bit budget
+/// reported 5 KB of motion vectors for a static frame whose field costs one byte.
+fn mv_field_size(vectors: &[[i16; 2]], block_size: u32, width: u32, tile_size: u32) -> usize {
+    if vectors.is_empty() || block_size == 0 {
         return 0;
     }
-    // Skip bitmap: ceil(N/8) bytes
-    let bitmap_bytes = n.div_ceil(8);
-    // Count non-skip blocks and estimate varint sizes
     let padded_w = width.div_ceil(tile_size) * tile_size;
     let blocks_x = (padded_w / block_size) as usize;
-    let blocks_y = n.checked_div(blocks_x).unwrap_or(0);
-    let mut varint_bytes = 0usize;
-    for by in 0..blocks_y {
-        for bx in 0..blocks_x {
-            let idx = by * blocks_x + bx;
-            if idx >= n {
-                break;
-            }
-            if vectors[idx][0] == 0 && vectors[idx][1] == 0 {
-                continue; // skip — no bytes
-            }
-            // Estimate: each varint is 1-3 bytes. For small deltas (most cases), 1 byte.
-            // Median predictor makes deltas small. Assume ~2 bytes per non-skip MV.
-            varint_bytes += 2;
-        }
-    }
-    bitmap_bytes + varint_bytes
+    crate::format::mv_field_bytes(vectors, blocks_x)
 }
 
 /// Compute bit budget breakdown from the compressed frame.
@@ -431,10 +434,11 @@ fn collect_bit_budget(frame: &CompressedFrame) -> BitBudget {
     let mv_bytes = frame.motion_field.as_ref().map_or(0, |mf| {
         let w = frame.info.width;
         let ts = frame.info.tile_size;
-        let fwd = estimate_mv_delta_size(&mf.vectors, mf.block_size, w, ts);
-        let bwd = mf.backward_vectors.as_ref().map_or(0, |v| {
-            estimate_mv_delta_size(v, 16, w, ts)
-        });
+        let fwd = mv_field_size(&mf.vectors, mf.block_size, w, ts);
+        let bwd = mf
+            .backward_vectors
+            .as_ref()
+            .map_or(0, |v| mv_field_size(v, 16, w, ts));
         let modes = mf.block_modes.as_ref().map_or(0, |m| m.len());
         // Also include block_size(u16) + num_blocks(u32) header = 6 bytes
         6 + fwd + bwd + modes

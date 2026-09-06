@@ -39,6 +39,12 @@ without saying so here first.
 
 Newest first. If you have measurements taken before one of these, they are suspect.
 
+- **Tile-size sweep (BUG-11 / ENT-1 / BUG-12)** — measurement only, no code change. Result: 256 px
+  is a local optimum and both 128 and 512 are worse *through Rice*, but the sign reverses on the
+  rANS path (512 gains 14–20%). Rice hardcodes tile width 256 in its `i % 256` stream mapping.
+  **Invalidates the conclusion of every past tile-size experiment, #47 included** — they were all
+  scored through the coder that penalises the larger-tile arm. Also: `--tile-size` never reached
+  its own level ceiling (BUG-12), so those runs were capped at 5 levels too.
 - **TUNE-6** — the P-frame quantiser scale now follows the quantiser step (1.25× at step ≥ 4.6,
   tapering to 1.0 at step ≤ 2.8). Fixes BUG-10. **Invalidates any inter measurement taken between
   TUNE-5 and now at q > 80.**

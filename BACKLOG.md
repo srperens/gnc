@@ -207,9 +207,22 @@ at any q, rather than a bit-depth defect. Guarded by
 The encode side and the bitstream already handled 10 bits; the gaps were a missing CLI flag and
 three decoder call sites writing 8-bit output unconditionally.
 
-**Follow-up:** the VMAF/PSNR comparison harness still measures at 8 bits, so 10-bit RD curves
-cannot be produced yet. `scripts/png16.py` and `scripts/chroma_metric.py` already handle 16-bit,
-so this is plumbing in `meas1_vs_h264.py`, not new work.
+**Confirmed on genuine content 2026-09-06.** Two Sintel frames from Xiph's `sintel-4k-png16` set
+(really 16-bit, 781/840 distinct levels against 196/212 at 8 bits), cropped to 1920x1088:
+
+| | q=55 | q=70 | q=85 |
+|---|---|---|---|
+| 8-bit | dE00 0.408 / 0.364 | 0.376 / 0.350 | 0.348 / 0.316 |
+| 10-bit | 0.147 / 0.147 | 0.139 / 0.150 | **0.086 / 0.080** |
+
+Tripling the bitrate improves 8-bit colour accuracy by 13-15% and 10-bit by 42-45%. **At matched
+bitrate 10-bit is 2.1-2.4x more accurate.** So 10-bit is a better use of the same bits for colour
+fidelity, not just a format checkbox.
+
+**Follow-up:** the RD harness still measures at 8 bits. The chain is verified working
+(`ffmpeg -strict -1` for 10-bit Y4M, x264 `--input-depth 10 --output-depth 10 --profile high444`,
+vmaf scores 10-bit Y4M directly) and the source-material problem is solved — `sintel-4k-png16`
+for stills, Netflix Chimera 10-bit Y4M on the same server for video. Plumbing, not new work.
 
 **External requirement, confirmed 2026-09-05.** EBU R 153 specifies 10-bit 4:2:2 Y'C'BC'R for live
 UHD/HDR contribution and forbids SDR transfer functions; EBU TR 091's entire codec test matrix is

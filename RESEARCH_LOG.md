@@ -4971,3 +4971,45 @@ Two traps worth recording, both of which would have produced a confident wrong a
   assignment landed in the wrong handler — both caught by the compiler and by checking the
   container's stored bit-depth byte directly rather than trusting the CLI to have done what was
   asked.
+
+## 2026-09-06 — 10-bit measured on genuine content: 8-bit has a floor bitrate cannot cross
+
+The synthetic-ramp result needed confirming on real material. Fetched two frames of Sintel from
+Xiph's `sintel-4k-png16` set — genuinely 16-bit source, not 8-bit upscaled — and centre-cropped
+to 1920x1088. They carry **781 and 840 distinct levels per channel at 10 bits against 196 and 212
+at 8**, so there is real precision to lose.
+
+Encoded each at 8 and 10 bits, scored with CIEDE2000 against the true 10-bit source:
+
+| | q=55 | q=70 | q=85 |
+|---|---|---|---|
+| sintel_350, 8-bit | 151 882 B, dE00 **0.408** | 188 435 B, **0.376** | 316 867 B, **0.348** |
+| sintel_350, 10-bit | 284 897 B, 0.147 | 357 329 B, 0.139 | 575 206 B, **0.086** |
+| sintel_700, 8-bit | 110 949 B, **0.364** | 139 115 B, **0.350** | 242 989 B, **0.316** |
+| sintel_700, 10-bit | 201 969 B, 0.147 | 259 310 B, 0.150 | 442 892 B, **0.080** |
+
+**The 8-bit column barely moves.** Tripling the bitrate from q=55 to q=85 improves colour accuracy
+by 13% and 15%; the 10-bit column improves by 42% and 45% over the same span and keeps going. That
+is the format floor MEAS-8 predicted, now visible on real content: past a point, bits spent in an
+8-bit pipeline do not buy colour accuracy.
+
+**At matched bitrate**, 10-bit is **2.1–2.4x more accurate**:
+
+| | rate | 8-bit dE00 | 10-bit dE00 |
+|---|---|---|---|
+| sintel_350 | 316 867 B | 0.3476 | **0.1430** |
+| sintel_700 | 242 989 B | 0.3164 | **0.1488** |
+
+So 10-bit is not merely a format checkbox for the contribution market — it is a better use of the
+same bitrate for colour fidelity, which is the thing contribution exists to preserve.
+
+### The measurement chain now works at 10 bits
+
+`ffmpeg` needs `-strict -1` as an *output* option to write 10-bit Y4M (`C420p10` / `C444p10`);
+x264 takes `--input-depth 10 --output-depth 10 --profile high444`; `vmaf` scores 10-bit Y4M
+directly. Verified end to end at VMAF 91.145 on a two-frame check.
+
+A 10-bit RD comparison against x264 still needs the harness plumbed for it, but the pieces are all
+confirmed working, and — more importantly — the source material problem is solved: Xiph's
+`sintel-4k-png16` is genuinely 16-bit, and Netflix's Chimera set on the same server offers 10-bit
+Y4M sequences for the video side.

@@ -123,9 +123,12 @@ at high qstep. It wins 34-39% on animation everywhere. **A quality threshold wou
 wrong fix**; the earlier reading of "wins at distribution bitrates" was an artefact of integrating
 BD-rate over the whole range.
 
-**Caveat (LOOP.md rule):** measured with VMAF, which scores luma only, at 4:4:4. B-frames do
-chroma motion compensation, so any chroma effect is invisible here. The luma conclusion stands;
-the chroma one is unvalidated. Cross-check with CIEDE2000 (MEAS-7) before treating it as settled.
+**Chroma caveat closed 2026-09-06.** Re-measured with CIEDE2000 (MEAS-7) at matched rate: the
+pyramid's colour error differs by **−0.019 / −0.034 / +0.017 dE00** on the three camera sequences,
+against a just-noticeable difference of about 1.0 — one to two orders of magnitude below JND, and
+sign-inconsistent. No hidden chroma effect. On animation the pyramid is better on both metrics
+(−0.36 dE00, +2.40 VMAF), consistent with it being a content bet. The default is validated on
+both halves.
 
 **Fix:** default the pyramid off on the quality-preset path, keep it available via
 `GNC_B_PYRAMID=1`. Justified on two independent measurements — rate on camera content, and 160 ms

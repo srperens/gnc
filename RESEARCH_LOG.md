@@ -5323,3 +5323,48 @@ unvalidated. Cross-check with CIEDE2000 (MEAS-7) before treating that half as se
 
 `cargo test --release` 182 passed / 0 failed. `cargo clippy --release` and
 `--target wasm32-unknown-unknown --lib` both clean.
+
+---
+
+## 2026-09-06 — BUG-5 chroma caveat closed: the B-pyramid buys no colour accuracy
+
+### Why this was needed
+
+The B-pyramid default (shipped earlier today) was decided on VMAF, which scores **luma only**,
+while B-frames do chroma motion compensation. LOOP.md's standing rule — suspect the measurement —
+made this an open caveat rather than a settled result. Re-measured with CIEDE2000
+(`scripts/chroma_metric.py`, MEAS-7).
+
+**A parse bug had to be fixed first.** The first run reported dE00 = 0.0000 for every arm, which
+is not a result. The regex `[-+]?\d*\.\d+|\d+` matched `00` inside the literal string `dE00` in
+the tool's own output line. Fixed to anchor on `mean\s+([0-9.]+)`. Recorded because it is the
+third measurement-harness bug in two days and it produced a plausible-looking null.
+
+### Result, at matched rate
+
+Comparing at the same qstep is confounded — the pyramid spends fewer bits, so worse colour is
+expected. Evaluated instead at each pyramid rate point with the default interpolated:
+
+| sequence | rate | dE00 pyramid | dE00 default | Δ dE00 | Δ VMAF |
+|---|---|---|---|---|---|
+| touchdown | 8 353 085 | 1.2801 | 1.2996 | **−0.0195** | −0.12 |
+| old_town | 22 652 760 | 2.2908 | 2.3251 | **−0.0343** | −0.11 |
+| speed_bag | 4 989 720 | 1.2205 | 1.2033 | **+0.0172** | −0.42 |
+| bbb (animation) | 6 261 753 | 0.8553 | 1.2158 | −0.3605 | +2.40 |
+
+**A dE00 of about 1.0 is the nominal just-noticeable difference.** On the three camera sequences
+the difference is 0.017–0.034 — one to two orders of magnitude below JND, and it changes sign
+across sequences. There is no hidden chroma effect; the pyramid neither buys nor costs colour
+accuracy on camera content.
+
+On animation the pyramid is better on both metrics (−0.36 dE00, +2.40 VMAF), consistent with
+everything else measured about bbb: the pyramid is a content bet and animation is where it pays.
+
+**The default shipped earlier today stands, now validated on both halves of the picture.**
+
+### Limits
+
+Only one rate point per sequence falls inside the interpolation range (the other extrapolates and
+was excluded). This is enough to rule out a *large* hidden chroma effect — which is what the
+caveat asserted — but it is not a rate-distortion curve in dE00. If a chroma-sensitive decision
+ever rests on this, measure more rate points.

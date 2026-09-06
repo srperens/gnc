@@ -596,36 +596,27 @@
         }
 
         // --- Demo files ---
-        const demoFiles = [
-            // Regenerate with ./generate_demos.sh. Sizes below are from the 2026-09-06 build.
-
-            // Quality range — same clip and frame count throughout, so the group is comparable.
-            // The range above q=92 was dead until 2026-09-06: an rANS constraint capped qstep at
-            // 2.0 for every entropy coder, so q=92, 96 and 99 produced the same picture.
-            { name: 'range_q25.gnv',  label: 'q=25',  desc: '24f 1080p 4:4:4 — heavy compression, visible artefacts (0.9 MB)', group: 'Quality range: q=25 to lossless' },
-            { name: 'range_q50.gnv',  label: 'q=50',  desc: '24f 1080p 4:4:4 — balanced (1.0 MB)', group: 'Quality range: q=25 to lossless' },
-            { name: 'range_q75.gnv',  label: 'q=75',  desc: '24f 1080p 4:4:4 — the default preset (1.4 MB)', group: 'Quality range: q=25 to lossless' },
-            { name: 'range_q92.gnv',  label: 'q=92',  desc: '24f 1080p 4:4:4 — contribution quality (11.6 MB)', group: 'Quality range: q=25 to lossless' },
-            { name: 'range_q100_lossless.gnv', label: 'q=100 lossless', desc: '24f 1080p 4:4:4 — bit-exact, verified zero error (40.2 MB)', group: 'Quality range: q=25 to lossless' },
-
-            // Temporal mode — the same clip through the two ways GNC relates frames to each other.
-            // I+P predicts with motion vectors and codes the difference; the Haar temporal wavelet
-            // transforms across frame pairs with no motion compensation. Measured 2026-09-06 on
-            // three sequences: the wavelet runs +2.4 to +5.4 dB PSNR at equal q, for more bits.
-            { name: 'temporal_ip.gnv',    label: 'I+P (motion vectors)', desc: '24f 1080p q=75 — GNV1, motion-compensated prediction (39.1 MB)', group: 'Temporal mode: I+P vs temporal wavelet' },
-            { name: 'temporal_haar.gnv2', label: 'Haar temporal wavelet', desc: '24f 1080p q=75 — GNV2, transform across frames, no motion vectors (43.3 MB)', group: 'Temporal mode: I+P vs temporal wavelet' },
-
-            // Chroma format — same clip, same q, three subsampling ratios.
-            { name: 'chroma_444.gnv', label: '4:4:4', desc: '24f 1080p q=50 — full chroma (14.4 MB)', group: 'Chroma format' },
-            { name: 'chroma_422.gnv', label: '4:2:2', desc: '24f 1080p q=50 — half horizontal chroma (10.8 MB)', group: 'Chroma format' },
-            { name: 'chroma_420.gnv', label: '4:2:0', desc: '24f 1080p q=50 — quarter chroma (9.2 MB)', group: 'Chroma format' },
-        ];
+        // Demo list comes from demos.json, written by generate_demos.sh. Hardcoding it here is
+        // what let the page drift into listing 20 files none of which existed; the manifest
+        // cannot disagree with what the generator produced.
+        let demoFiles = [];
+        try {
+            const resp = await fetch('demos.json', { cache: 'no-store' });
+            if (resp.ok) demoFiles = await resp.json();
+        } catch (e) { /* falls through to the empty-state message below */ }
 
         function formatSize(bytes) {
             if (bytes >= 1e9) return (bytes / 1e9).toFixed(1) + ' GB';
             if (bytes >= 1e6) return (bytes / 1e6).toFixed(0) + ' MB';
             if (bytes >= 1e3) return (bytes / 1e3).toFixed(0) + ' KB';
             return bytes + ' B';
+        }
+
+        if (demoFiles.length === 0) {
+            const opt = document.createElement('option');
+            opt.textContent = 'No demos found — run ./generate_demos.sh';
+            opt.disabled = true;
+            demoSelect.appendChild(opt);
         }
 
         // Build grouped <optgroup> dropdown

@@ -28,3 +28,4 @@ examples/web/*.pem
 __pycache__/
 *.pyc
 examples/web/*.log
+examples/web/demos.json

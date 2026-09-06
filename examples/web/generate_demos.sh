@@ -60,7 +60,23 @@ encode() {                       # encode <outfile> <source> <frames> [flags...]
 echo "Removing previous demo files..."
 rm -f "$OUT"/*.gnv "$OUT"/*.gnv2 "$OUT"/*.log
 
-echo "1/3  Quality range — same clip, q=25 to lossless"
+# --- Watchable material: whole clips at the default preset -----------------------------------
+# The comparison groups below are deliberately short; these are the ones you actually watch.
+echo "1/4  Full clips at q=75 — material to watch"
+watch() {                        # watch <name> <clip> <frames> [flags...]
+    local name="$1" clip="$2" frames="$3"; shift 3
+    local src; src=$(pick "$clip") || { printf '  %-26s skipped (no source)\n' "$name.gnv"; return; }
+    encode "$OUT/$name.gnv" "$src" "$frames" -q 75 "$@"
+}
+watch watch_rush_hour       rush_hour       200      # 8 s at 25 fps — city traffic, slow pan
+watch watch_pedestrian_area pedestrian_area 200      # 8 s at 25 fps — walking crowd
+watch watch_old_town_cross  old_town_cross  200      # 4 s at 50 fps — urban pan
+watch watch_bbb_2min        bbb_2min        600      # 20 s at 30 fps — animation, varied scenes
+# Ducks is ~6 bpp at q=75, so a full 300 frames would be half a gigabyte. q=50 keeps it viewable.
+src_ducks=$(pick ducks_take_off) && encode "$OUT/watch_ducks_q50.gnv" "$src_ducks" 300 -q 50
+
+echo
+echo "2/4  Quality range — short and uniform, for A/B"
 for q in 25 50 75 92; do
     encode "$OUT/range_q${q}.gnv" "$CLIP_MAIN" 24 -q "$q"
 done
@@ -70,15 +86,19 @@ done
 encode "$OUT/range_q100_lossless.gnv" "$CLIP_MAIN" 24 -q 100
 
 echo
-echo "2/3  Temporal mode — same clip, same q"
+echo "3/4  Temporal mode — same clip, same q"
 encode "$OUT/temporal_ip.gnv"    "$CLIP_MOTION" 24 -q 75 --temporal-wavelet none
 encode "$OUT/temporal_haar.gnv2" "$CLIP_MOTION" 24 -q 75 --temporal-wavelet haar
 
 echo
-echo "3/3  Chroma format — same clip, same q"
+echo "4/4  Chroma format — same clip, same q"
 for fmt in 444 422 420; do
     encode "$OUT/chroma_${fmt}.gnv" "$CLIP_CHROMA" 24 -q 50 --chroma-format "$fmt"
 done
+
+echo
+echo "Writing demos.json manifest..."
+python3 "$SCRIPT_DIR/write_manifest.py" "$SCRIPT_DIR"
 
 echo
 echo "Done. Serve with ./serve.sh, then open player.html"

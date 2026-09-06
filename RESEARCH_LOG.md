@@ -6284,3 +6284,81 @@ considered and rejected: the mean difference is 1.1% and neither boundary is cle
 quality for average. At matched q it looks dramatic (12-31% rate saved for 0.2-1.7 VMAF) but that
 is movement along the curve, not off it. Kept at the current 0.5 multiplier; the min penalty is
 worth remembering if GOP-tail quality ever becomes a complaint.
+
+---
+
+## 2026-09-06 — EBCOT, part 1: PCRD-opt is worth 0.00 dB to GNC, and the reason is structural
+
+Prompted by the project owner: "we should do EBCOT". Well aimed — it targets the one thing this
+repo's own log said could not be tested by proxy:
+
+> *"JPEG 2000's gain comes from truncating **embedded** per-code-block streams, which Rice cannot
+> do."*
+
+EBCOT has two separable halves. This measures the first.
+
+### Why the existing 0% result did not settle it
+
+`meas_pcrd.py` measured RD bit allocation at **tile** granularity and got 0%, concluding "a
+uniform quantiser step already equalises the RD slope across tiles". That does not bound EBCOT,
+because the partition is different in kind:
+
+- a 256×256 **tile** spans every subband and every kind of content in its region, so its RD slope
+  is an average over all of them — and averages across tiles look alike almost by construction.
+- a 64×64 **code-block** is a piece of *one* subband: all high-frequency or all low, all busy or
+  all flat. Nothing is averaged.
+
+If the slope variance lives below the tile level, tile-granular allocation is blind to it. That is
+exactly the gap EBCOT's PCRD is supposed to exploit.
+
+### Measured at code-block granularity — still nothing
+
+`scripts/meas_ebcot_pcrd.py`. Per code-block RD curves over a 15-point quantiser ladder (bits from
+each block's own zeroth-order entropy plus a 16-bit per-block header, since an EBCOT code-block
+cannot share coding state), Lagrangian equal-slope allocation against uniform, at matched total
+rate:
+
+| image | code-block | mean gain |
+|---|---|---|
+| bbb_1080p | 64 px | **+0.01 dB** |
+| bbb_1080p | 32 px | **+0.00 dB** |
+| blue_sky_1080p | 64 px | **+0.00 dB** |
+| touchdown_1080p | 64 px | **−0.00 dB** |
+
+Zero at every rate from 0.05 to 3.5 bpp, at two block sizes, on three images.
+
+### Why, and why that is more convincing than the number
+
+Uniform scalar quantisation of a near-orthonormal transform under MSE puts every coefficient at
+the same rate-distortion slope, and that slope is a function of the *step*, not of the coefficient's
+magnitude or its neighbours. Grouping coefficients into blocks and re-allocating between the groups
+cannot find a gain that is not there at the coefficient level — and coefficient-level RDOQ was
+already measured at +0.1%. The granularity was never the issue.
+
+So the tile-level 0% was not an artifact of coarse partitioning. It was the correct answer, arrived
+at for a reason the original write-up did not state.
+
+### Method note — the check that nearly invalidated this
+
+Per-block RD curves must use coefficient-domain distortion; a code-block cannot be
+inverse-transformed alone, and JPEG 2000's own PCRD works the same way. But the gain-normalised
+CDF 9/7 is only approximately orthonormal: it flatters coefficient-domain PSNR by 0.24 dB at
+qstep 4 and **0.52 dB at qstep 16**. The first version of this script reported coefficient-domain
+PSNR and would have inherited that bias into both arms.
+
+It now uses the coefficient-domain slopes only to *choose* the allocation, then reconstructs both
+the uniform and the allocated result through a real inverse DWT and scores pixel error. The script
+still runs the orthonormality check and prints it, because a future change to the subband gains
+would silently reintroduce the bias.
+
+### What this does not close
+
+**Only the PCRD half.** The other half of EBCOT is the context-modelled bit-plane arithmetic coder
+— three passes per bit-plane with significance contexts derived from the neighbourhood — and
+nothing here bounds it. That is measured next. The repo's existing 4c figure (a 1-neighbour context
+recovering ≤10.4% of coefficient bits) was computed on *inter* residuals, and the +28.3% gap to
+JPEG 2000 is an *intra* number, so it is the wrong measurement for this question.
+
+One caveat worth stating: this measures MSE-optimal allocation. Part of what PCRD does for
+JPEG 2000 in practice is hit an exact rate target by truncation, which is a rate-control property
+rather than an RD gain, and GNC does that another way.

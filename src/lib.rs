@@ -580,10 +580,25 @@ pub fn quality_preset(q: u32) -> CodecConfig {
         Anchor { q: 50,  qstep: 8.0,  dead_zone: 0.75, cfl: true,  per_subband: true },
         Anchor { q: 75,  qstep: 4.0,  dead_zone: 0.75, cfl: true,  per_subband: true },
         Anchor { q: 85,  qstep: 2.8,  dead_zone: 0.5,  cfl: true,  per_subband: true },
-        // CDF 9/7 at qstep >= 2.0 keeps rANS alphabet within GPU limits
-        Anchor { q: 92,  qstep: 2.05, dead_zone: 0.05, cfl: false, per_subband: true },
-        // Slow quality ramp at safe qstep floor — dead_zone→0 squeezes out last dB
-        Anchor { q: 99,  qstep: 2.0,  dead_zone: 0.0,  cfl: false, per_subband: true },
+        // The ladder used to flatten here: q=92 and q=99 both sat at qstep ~2.0, so q=92, 96
+        // and 99 produced the *same picture* and the entire top of the lossy range was
+        // unreachable. The floor came from rANS — its GPU alphabet cannot represent the symbol
+        // range below about qstep 2.0 — but rANS is only selected at q<=20 (see entropy_coder
+        // below), where qstep is 32 or coarser, so the floor never applied to the coder that
+        // actually runs up here.
+        //
+        // Measured 2026-09-06, 1080p touchdown, single frame, Rice, decode verified correct
+        // (max abs error 1, 86.6% of pixels bit-exact at qstep 0.75):
+        //   qstep 2.0 -> 50.69 dB    1.5 -> 52.69 dB    1.0 -> 56.29 dB    0.75 -> 60.67 dB
+        // x264 at crf 4 reaches 53.12 dB, so this is the difference between GNC topping out
+        // below H.264 and passing it — at exactly the contribution operating point the codec
+        // is positioned for (docs/POSITIONING.md).
+        //
+        // rANS still panics below qstep 1.0 ("range start index out of range"); filed as BUG-9.
+        // It is unreachable from this table but reachable via an explicit --qstep with --rans.
+        Anchor { q: 92,  qstep: 1.5,  dead_zone: 0.05, cfl: false, per_subband: true },
+        Anchor { q: 96,  qstep: 1.0,  dead_zone: 0.0,  cfl: false, per_subband: true },
+        Anchor { q: 99,  qstep: 0.75, dead_zone: 0.0,  cfl: false, per_subband: true },
         // Lossless: LeGall 5/3 with integer-exact lifting
         Anchor { q: 100, qstep: 1.0,  dead_zone: 0.0,  cfl: false, per_subband: true },
     ];

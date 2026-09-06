@@ -558,6 +558,31 @@ I-frames") rather than a bug, so it was recorded as a finding. And it was perfec
 which read as evidence it was real — reproducibility separates a bug from noise, not a codec
 property from an instrumentation artefact.
 
+### EBCOT — evaluating in halves (**part 1 closed 2026-09-06**, part 2 open)
+Proposed by the project owner. Well aimed: it targets the one mechanism this repo's log said could
+not be tested by proxy — *"JPEG 2000's gain comes from truncating embedded per-code-block streams,
+which Rice cannot do"*. EBCOT has two separable halves and they are being measured separately
+before anything is built.
+
+**Part 1 — PCRD-opt rate allocation: 0.00 dB. Closed.** `scripts/meas_ebcot_pcrd.py`. The existing
+0% result was at *tile* granularity and did not bound EBCOT, because a 256px tile averages every
+subband and kind of content while a 64px code-block is homogeneous. Re-measured at code-block
+granularity: **+0.01 dB (bbb 64px), +0.00 (bbb 32px), +0.00 (blue_sky), −0.00 (touchdown)** — zero
+at every rate from 0.05 to 3.5 bpp.
+
+The reason is structural, which makes it more convincing than the number: uniform scalar
+quantisation of a near-orthonormal transform under MSE puts every coefficient at the same RD slope,
+and that slope depends on the *step*, not on the coefficient or its neighbours. Re-allocating
+between groups cannot find a gain that is absent at the coefficient level — and coefficient-level
+RDOQ already measured +0.1%. Granularity was never the issue.
+
+**Part 2 — context-modelled bit-plane coder: open, being measured.** The other half is EBCOT's real
+engine: three coding passes per bit-plane with significance contexts from the 8-neighbourhood. The
+repo's existing 4c figure (1-neighbour context, ≤10.4%) was computed on *inter* residuals, and the
++28.3% gap to JPEG 2000 is an *intra* number — wrong measurement for this question. Measure the
+conditional entropy of intra coefficients under EBCOT-style contexts against GNC's actual bits
+before deciding.
+
 ### BUG-8 — The encoder's local decode diverges from the real decoder down a GOP (**OPEN, not diagnosed**)
 bbb17, 17 frames, ki=17, q=50. Per-frame PSNR of the encoder's own reconstruction vs the actual
 decoded file: gap −0.04 dB at frame 0, +0.08 at frame 8, **+0.23 at frame 16** — monotonic,

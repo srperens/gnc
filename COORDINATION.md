@@ -58,7 +58,6 @@ the shared checkout** — no absolute paths, no session ids.
 | worktree | branch | area |
 |---|---|---|
 | `../gnc-abac` | `abac` | adaptive binary code-block entropy coder (EBCOT follow-up), CPU + GPU. Rate −19 to −25% confirmed; GPU decode bit-exact but 6-13 fps, so throughput is the open gate. |
-| `../gnc-tile` (scratchpad) | `fix/bug-11-rice-stream-mapping` | Rice stream mapping + tile/level config (BUG-11, BUG-12) — **merging now, then removed** |
 
 ## The four rules that have actually bitten us
 

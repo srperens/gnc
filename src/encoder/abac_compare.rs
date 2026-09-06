@@ -51,6 +51,41 @@ pub struct Timing {
 }
 
 #[allow(clippy::too_many_arguments)] // tile geometry plus the variant under test
+/// The frame's real code-blocks, collected so the GPU can decode exactly what the CPU just did.
+///
+/// `tests/abac_bench.rs` times the same grid on *synthesised* planes, and that answers a slightly
+/// different question: significance density drives how many binary decisions each coefficient
+/// costs, so a synthetic plane is not the same workload. Measured, the synthetic proxy runs 6%
+/// fast at cb=64. More importantly, only a real frame can be compared against the codec's own
+/// whole-frame decode figure in the same process — which is the comparison that decides whether
+/// any of this is shippable.
+#[derive(Default)]
+struct GpuWorkload {
+    packed: Vec<u8>,
+    infos: Vec<crate::encoder::abac_gpu::BlockInfo>,
+    /// The CPU-decoded coefficients, laid out block-contiguously to match `infos`.
+    expected: Vec<i32>,
+}
+
+impl GpuWorkload {
+    /// Blocks are laid out contiguously rather than at their plane positions. That is sound
+    /// because the shader takes neighbour magnitudes from workgroup memory, never from the output
+    /// buffer, so the output layout cannot change what it decodes — only where it lands.
+    fn push(&mut self, bytes: &[u8], block: &[i32], bw: usize, bh: usize) {
+        self.infos.push(crate::encoder::abac_gpu::BlockInfo::new(
+            self.packed.len() as u32,
+            bytes.len() as u32,
+            self.expected.len() as u32,
+            bw as u32,
+            bh as u32,
+            bw as u32,
+        ));
+        self.packed.extend_from_slice(bytes);
+        self.expected.extend_from_slice(block);
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // a diagnostic's plane geometry; splitting it would obscure
 fn abac_tile_bytes(
     tile: &[i32],
     tile_size: usize,
@@ -58,6 +93,7 @@ fn abac_tile_bytes(
     cb: usize,
     coder: Coder,
     timing: &mut Timing,
+    work: &mut GpuWorkload,
 ) -> usize {
     let mut total = 0usize;
     let mut blocks = 0usize;
@@ -91,6 +127,7 @@ fn abac_tile_bytes(
                     "abac roundtrip failed on a real {bw}x{bh} code-block — the size comparison \
                      below would be meaningless"
                 );
+                work.push(&bytes, &blk, bw, bh);
                 total += bytes.len();
                 covered += blk.len();
                 blocks += 1;
@@ -122,6 +159,7 @@ fn abac_plane_bytes(
     cb: usize,
     coder: Coder,
     timing: &mut Timing,
+    work: &mut GpuWorkload,
 ) -> usize {
     let ts = tile_size as usize;
     let tiles_x = (width as usize) / ts;
@@ -135,7 +173,7 @@ fn abac_plane_bytes(
                 let row = (ty * ts + y) * (width as usize) + tx * ts;
                 tile.extend(plane[row..row + ts].iter().map(|&v| v.round() as i32));
             }
-            abac_bytes += abac_tile_bytes(&tile, ts, num_levels, cb, coder, timing);
+            abac_bytes += abac_tile_bytes(&tile, ts, num_levels, cb, coder, timing, work);
         }
     }
     eprintln!("  [abac] {label:3} {tiles_x}x{tiles_y} tiles: abac {abac_bytes:>9} B");
@@ -179,12 +217,15 @@ pub fn run_multi_plane(
 
     let mut a_tot = 0usize;
     let mut timing = Timing::default();
+    let mut work = GpuWorkload::default();
     for (label, plane, w, h) in [
         ("Y", &y, padded_w, padded_h),
         ("Co", &co, chroma_w, chroma_h),
         ("Cg", &cg, chroma_w, chroma_h),
     ] {
-        a_tot += abac_plane_bytes(label, plane, w, h, tile_size, num_levels, cb, coder, &mut timing);
+        a_tot += abac_plane_bytes(
+            label, plane, w, h, tile_size, num_levels, cb, coder, &mut timing, &mut work,
+        );
     }
     if rice_reference_bytes > 0 {
         eprintln!(
@@ -203,5 +244,77 @@ pub fn run_multi_plane(
         timing.decode_s * 1e3,
         mc,
         mc / timing.decode_s.max(1e-9)
+    );
+
+    gpu_decode_report(ctx, &work, coder, cb);
+}
+
+/// Decode the frame's real code-blocks on the GPU, verify them against the CPU coder, then time
+/// the dispatch.
+///
+/// Scope is the entropy stage only, so it is a *lower bound* on any abac frame decode: the
+/// inverse wavelet and the colour transform come on top, and both are shared with Rice. That is
+/// what makes it comparable against the codec's own `Decode:` figure printed by `benchmark` —
+/// since the shared stages cancel,
+///
+/// ```text
+/// abac_frame − rice_frame = abac_entropy − rice_entropy ≥ abac_entropy − rice_frame
+/// ```
+///
+/// so this number minus the whole-frame Rice figure is a conservative floor on what abac costs.
+fn gpu_decode_report(ctx: &crate::GpuContext, work: &GpuWorkload, coder: Coder, cb: usize) {
+    use crate::encoder::abac_gpu::{GpuAbacDecoder, MAX_BLOCK_W};
+    if work.infos.is_empty() {
+        return;
+    }
+    if work.infos.iter().any(|i| i.width > MAX_BLOCK_W) {
+        eprintln!(
+            "  [abac] GPU decode skipped: code-block {cb}px exceeds the shader's {MAX_BLOCK_W}px \
+             cap. The rate figures above are unaffected."
+        );
+        return;
+    }
+    let decoder = GpuAbacDecoder::new(ctx);
+    let out_len = work.expected.len();
+
+    // Repeat rather than trust one reading: five sessions share this Mac and the same dispatch
+    // has read 48% apart across runs. The first call also carries pipeline setup.
+    const REPEATS: usize = 7;
+    let mut times = Vec::with_capacity(REPEATS);
+    for i in 0..=REPEATS {
+        let (got, gpu_s) = decoder.decode(ctx, &work.packed, &work.infos, out_len, coder);
+        if i == 0 {
+            // A timing number for a decode that is wrong is worth nothing, so check before timing.
+            let bad = got
+                .iter()
+                .zip(work.expected.iter())
+                .filter(|(a, b)| a != b)
+                .count();
+            assert_eq!(
+                bad, 0,
+                "GPU abac decode diverged from the CPU {coder:?} coder on {bad} of {out_len} \
+                 real coefficients"
+            );
+        } else {
+            times.push(gpu_s);
+        }
+    }
+    times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let median = times[times.len() / 2];
+    let mc = out_len as f64 / 1e6;
+    eprintln!(
+        "  [abac] GPU decode, {coder:?} coder, the SAME real blocks: {} blocks, {:.2} Mcoeff, \
+         median {:.1} ms ({:.1} Mcoeff/s) over {} dispatches [{:.1}-{:.1} ms], all {} \
+         coefficients bit-exact vs the CPU coder. ENTROPY STAGE ONLY — a lower bound; compare \
+         against the whole-frame `Decode:` figure below, which already includes Rice's entropy \
+         stage plus the inverse wavelet and colour transform.",
+        work.infos.len(),
+        mc,
+        median * 1e3,
+        mc / median,
+        times.len(),
+        times[0] * 1e3,
+        times[times.len() - 1] * 1e3,
+        out_len
     );
 }

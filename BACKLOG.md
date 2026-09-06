@@ -1284,9 +1284,54 @@ option, which is a product decision for the owner, not an engineering one.
 **The rate result stands regardless: −19% to −25% at identical quality**, verified against the
 shipped Rice coder with per-block roundtrip and coverage assertions.
 
+**Part 6 — measured on REAL coefficients against Rice in the same process, at q=90
+(2026-09-06). The Range coder makes this a live trade, not a rejection.**
+
+`GNC_ABAC_COMPARE=1` now decodes the frame's *real* code-blocks on the GPU, verifies all 7 864 320
+bit-exact against the CPU coder, then times seven dispatches. `tests/abac_bench.rs` times the same
+grid on *synthesised* planes, which is a slightly different workload — significance density drives
+the binary-decision count, and the synthetic proxy runs ~6% fast at cb=64. More importantly, only
+a real frame can be paired against the codec's own whole-frame `Decode:` figure **inside one
+process**, which is what makes a ratio survive a shared machine.
+
+Identical real blocks, bbb, q=90, cb=64:
+
+| coder | entropy-stage decode | rate vs shipped Rice |
+|---|---|---|
+| Interval | 113.9 ms (69.1 Mcoeff/s) | −14.5% |
+| Range | 33.8–41.4 ms (190–232 Mcoeff/s) | −13.8% |
+
+**~3× the throughput for 0.7 points of rate** — a wider speed gap and a much narrower rate gap
+than the synthetic bench found at q=55, because Range's 5-byte-per-block flush amortises as blocks
+fill. Both effects favour Range *more* at the operating point that matters. Range at cb=64 also
+dominates Range at cb=32 (−13.8% vs −10.9%, 33.8 ms vs 31.4 ms).
+
+Range rate at q=90, cb=64: bbb −13.8%, blue_sky −16.6%, touchdown −16.3%, kristensara −20.1%,
+**mean −16.7%**.
+
+**Cost per frame, three repeats at load 17 (the quietest window available):** abac Range entropy
+stage ~39.5 ms against Rice's *whole frame* ~35.6 ms. The shared inverse wavelet and colour
+transform cancel, so `abac_frame − rice_frame = abac_entropy − rice_entropy`, bracketing the
+answer between **1.11×** (if Rice's entropy stage were its whole frame) and **2.11×** (if it were
+free). Rice's frame decode is nearly q-insensitive — 29.3 / 37.6 / 32.5 ms at q=20 / 55 / 90,
+non-monotonic, i.e. load rather than coefficient count — so a branch-free 256-stream coder's
+entropy stage is small and flat, and the estimate sits near the ceiling: **realistically
+~1.7–1.9× frame decode for ~16.7% of rate.**
+
+**A genuine trade, and not yet a decision.** The measurement that settles it is well defined:
+instrument Rice's entropy dispatch with a GPU timestamp query and the bracket collapses to a
+number. That is the next step.
+
+**Scope warning on an earlier verdict.** A "closed by measurement — do not re-test" note was
+written for abac on the strength of the Interval coder alone, and it was wrong as a statement
+about the idea: Range is ~3× faster on the identical workload. "Closed by measurement" is a claim
+about a mechanism, not about a measurement, and a "do not re-test" note is the most expensive kind
+of wrong because it is written precisely so nobody checks it again. Scope such notes to what was
+actually varied.
+
 **Superseded next steps:**
-1. ~~GPU decode shader and honest fps against Rice on an idle machine.~~ Written; fps needs an
-   idle machine to be trusted.
+1. ~~GPU decode shader and honest fps against Rice on an idle machine.~~ Written; measured on real
+   coefficients against Rice in-process — see Part 6.
 2. Bitstream integration — a GP18 generation with `EntropyCoder::Abac`, code-block length fields,
    block size in the tile header. Nothing is integrated yet; `abac` is standalone and
    `abac_compare` is a diagnostic.

@@ -8622,3 +8622,116 @@ chroma leaking into an RGB metric — the codec's own luma moves **0.055 dB** (5
 dE00 goes 0.325 → 0.353 mean, 0.721 → 0.772 p95, both far under the JND. A fixed-q point cannot
 judge a rate/quality trade; the −5.2% BD-rate is the measurement that can, and it says the same
 quality is now cheaper. Recorded here per BASELINE's regression rule.
+---
+---
+---
+## 2026-09-06 — abac measured on REAL coefficients at the contribution operating point: the range coder changes the answer
+
+Branch `abac-gate` off `603575f`. This entry supersedes a verdict I had already written and
+committed on a parallel branch, and the correction is the most useful thing in it — see the last
+section.
+
+### What was added
+
+`GNC_ABAC_COMPARE=1` now decodes the frame's **real** code-blocks on the GPU, in the same process
+as the encode, verifies all 7 864 320 of them bit-exact against the CPU coder, and only then times
+seven dispatches and reports the median.
+
+`tests/abac_bench.rs` already timed the same grid, but on *synthesised* planes. That answers a
+slightly different question — significance density drives how many binary decisions each
+coefficient costs — and measured, the synthetic proxy runs about 6% fast at cb=64. The bigger gain
+is that a real frame can be compared against the codec's own whole-frame `Decode:` figure **in the
+same process**, which is the only comparison that survives a machine five sessions share. The Rice
+frame figure alone swung 27→62 ms across runs on load; within one run the pairing holds.
+
+### Interval vs Range on identical real blocks (bbb, q=90, cb=64)
+
+| coder | entropy-stage decode | rate vs shipped Rice |
+|---|---|---|
+| Interval | 113.9 ms (69.1 Mcoeff/s) | −14.5% |
+| Range | 33.8–41.4 ms (190–232 Mcoeff/s) | −13.8% |
+
+**About 3× the throughput for 0.7 points of rate.** The gap is much wider than the 2× the
+synthetic bench found, and the rate penalty much narrower than the 2.2 points it found at q=55 —
+Range's 5-byte-per-block flush amortises as blocks fill up, so at high q it nearly vanishes. Both
+effects favour Range more at the operating point that matters than at the one it was tuned on.
+
+Range at cb=64 also **dominates** Range at cb=32 (bbb, q=90): −13.8% against −10.9%, and 33.8 ms
+against 31.4 ms — 2.9 points of rate for 7% of speed. Bigger blocks, again.
+
+### Range coder rate at q=90, cb=64, four images
+
+| image | abac (Range) vs shipped Rice |
+|---|---|
+| bbb | −13.8% |
+| blue_sky | −16.6% |
+| touchdown | −16.3% |
+| kristensara | −20.1% |
+| **mean** | **−16.7%** |
+
+### How much does it actually cost per frame?
+
+Three repeats at load 17, the quietest window available, bbb q=90 cb=64:
+
+- abac Range, entropy stage only: 41.4 / 36.2 / 39.5 ms → **~39.5 ms**
+- Rice, **whole frame**: 35.6 / 33.7 / 37.0 ms → **~35.6 ms**
+
+Both coders share the inverse wavelet and the colour transform, so those cancel:
+
+    abac_frame − rice_frame = abac_entropy − rice_entropy
+
+`rice_entropy` is not directly instrumented, which bounds the answer rather than settling it:
+
+- **Floor** (`rice_entropy → rice_frame`): abac_frame ≈ 39.5 ms, **1.11×**.
+- **Ceiling** (`rice_entropy → 0`): abac_frame ≈ 75.1 ms, **2.11×**.
+
+Rice's frame decode is nearly **q-insensitive** — 29.3 / 37.6 / 32.5 ms at q=20 / 55 / 90,
+non-monotonic, so the spread is load and not coefficient count. A branch-free coder over 256
+parallel streams is dominated by fixed per-tile work, so its entropy stage is both small and flat.
+That pushes the estimate toward the ceiling: **realistically ~1.7–1.9× the frame decode, to buy
+~16.7% of rate.**
+
+**This is a genuine trade, not a rejection.** It is also not yet a decision, and the measurement
+that would settle it is well defined: instrument Rice's entropy dispatch with a GPU timestamp
+query and the bracket collapses to a number.
+
+### Interval-coder results worth keeping
+
+Measured before the range coder existed, on the same real-coefficient harness. They still describe
+the Interval variant, which is still in the tree:
+
+**The 16-bit interval narrowing is free.** Interval needs its arithmetic interval cut from 32 to
+16 bits to be portable to WGSL at all (no 64-bit integers; `range * probability` reaches 2^44).
+Both arms in one tree, cb=64, byte-identical Rice baselines confirming identical coefficients:
+bbb +8/+6 B, blue_sky +18/+18 B, touchdown 0/**−6** B, kristensara +5/+1 B at q=40/70.
+**Mean +0.002%, max +0.006%, sign-varying.** Range needs no such compromise — `(range >> 11) * p`
+peaks at 2^32 and fits a `u32` — which is one more reason it is the better engine.
+
+**Interval's code-block trade, four images, two quality points.** Dropping 64→32 costs 5.5 / 7.2 /
+8.1 / 10.2 points at q=40 and 3.1 / 4.0 / 3.7 / 5.2 at q=70 (bbb / blue_sky / touchdown /
+kristensara) — **mean 5.9 points, ~30% of the whole coding gain**, worst at low q. Interval's
+benefit also decays with quality: −21.9% (q=40) → −16.7% (q=70) → −14.5% (q=90) at cb=64, while
+its cost climbs, 74 → 153 → 138 ms. Both trends run against a contribution codec. Range shares the
+first trend far more weakly and does not share the second.
+
+### The correction, which is the point of this entry
+
+I measured the Interval coder against Rice at q=90, found it cost ≥2.9× the whole frame decode for
+12.5–18.2%, and **wrote a verdict of "closed by measurement — do not re-test" into BACKLOG and
+committed it.** That verdict is wrong as a general statement about abac. The Range coder, which
+another session had built and merged to `main` while I was measuring, is ~3× faster on the
+identical workload for 0.7 points of rate, and lands in a completely different place.
+
+What caught it was not a test. It was rebasing onto `main` and reading another session's commit
+message before merging my own. The near-miss is worth naming precisely:
+
+- **"Closed by measurement" is a claim about a mechanism, not about a measurement.** I had measured
+  one *engine* and written the conclusion about the *idea*. The correct scope was "the
+  bit-renormalising interval engine does not close the gate", which leaves the obvious next
+  question visible instead of forbidding it.
+- **A "do not re-test" note is the most expensive kind of wrong.** It is written precisely so that
+  nobody pays to check it again, so an over-broad one does not get corrected by the normal
+  process — it silently removes the correction path. Scope those to what was actually varied.
+
+The branch carrying the wrong verdict (`abac-gpu`) is **not to be merged**; its measurements are
+carried forward here and its conclusion is superseded.

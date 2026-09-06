@@ -6074,9 +6074,15 @@ Lever removed rather than left in place — a rejected lever is dead code.
 ### Reference filtering (the in-loop filter GNC does not have) — measured at 1-2%, not pursued
 
 With the coding model, the motion search and the entropy ceiling all ruled out on clean data, the
-most conspicuous remaining "mature encoder" item is an in-loop filter. GNC has none. Every
-mature codec does, and the argument is not cosmetic: a P-frame predicts from a *decoded* frame, so
-the reference carries quantisation noise, and that noise is paid for in every frame that follows.
+most conspicuous remaining "mature encoder" item is an in-loop filter. The argument is not
+cosmetic: a P-frame predicts from a *decoded* frame, so the reference carries quantisation noise,
+and that noise is paid for in every frame that follows.
+
+**Correction to the first version of this entry: GNC is not without one.** `GNC_REF_DEBLOCK`
+(commit 9f20abb, 2026-03-11) applies 4-tap adaptive smoothing at 256-pixel tile boundaries in the
+reference before ME, and it was on by default. It is narrower than a general in-loop filter — tile
+seams only — which is why the measurement below, which filters the whole reference, is still the
+right ceiling question. See the deblock re-measurement further down.
 
 Measured offline before implementing anything (`scripts/meas_ref_filter.py`): block-match the
 source against the decoded reference, and against 3x3 low-pass versions of the same reference.
@@ -6137,3 +6143,47 @@ ones MEAS-4's conclusion rested on.
 
 Three ideas measured and rejected today, all recorded above with numbers: the quantiser cascade,
 the hierarchical MV zero mask, and non-adaptive reference filtering.
+
+### The existing tile-boundary deblock filter: measured neutral-to-negative, default flipped off
+
+`GNC_REF_DEBLOCK` was on by default. Its own commit measured the effect as *negligible* (0.016%
+bpp on crowd_run, VMAF neutral) and explained why structurally: tile-boundary pixels are
+2/256 = 0.78% of ME decisions, and the adaptive gate (skip when |p1−p0| > 2·qstep) declines to
+smooth real edges. It was retained on the reasoning that it "may help at edge cases not in test
+suite".
+
+Re-measured on three sequences with VMAF, on/off at matched q:
+
+| sequence | bpp on/off | VMAF mean on/off | VMAF min on/off |
+|---|---|---|---|
+| old_town, q=40 | 1.01 / 1.01 | 87.19 / 87.27 | 84.20 / 84.21 |
+| aerial, q=40 | 0.67 / 0.67 | 87.17 / 87.17 | 82.99 / 83.01 |
+| bbb17, q=30 | 0.38 / 0.38 | 79.30 / **79.39** | 74.40 / **75.06** |
+| bbb17, q=50 | 0.77 / **0.76** | 87.31 / **87.44** | 84.94 / **85.08** |
+
+Exactly neutral on the two camera sequences — identical bpp, VMAF within 0.09 — and **off is
+better on animation**, by +0.66 VMAF min at q=30 and smaller at the same rate at q=50. Nothing to
+gain and a little to lose, from a shader, two compute pipelines and a per-frame dispatch.
+
+**Default flipped to off** (`GNC_REF_DEBLOCK=1` to re-enable for A/B). The code is left in place
+rather than deleted: the margin is 0.1 VMAF, the implementation is correct, and a second agent is
+editing this working tree, so deleting ~200 lines of shader and pipeline code right now buys a
+merge conflict for very little. It should be deleted if nothing revives it — "may help at edge
+cases not in the test suite" is a hope, not evidence, and it has now failed two measurements.
+
+### The encoder's local decode is not the decoder's output, and the gap grows down the GOP
+
+Found while checking the deblock filter for encoder/decoder mismatch. It is not the filter — the
+divergence persists with deblocking off — but it is real. bbb17, 17 frames, ki=17, q=50, per-frame
+PSNR of the encoder's own reconstruction against the actual decoded file:
+
+| frame | 0 | 4 | 8 | 12 | 16 |
+|---|---|---|---|---|---|
+| encoder-internal | 40.34 | 35.18 | 34.44 | 33.60 | 32.81 |
+| real decoder | 40.30 | 35.20 | 34.52 | 33.77 | **33.04** |
+| gap | −0.04 | +0.02 | +0.08 | +0.17 | **+0.23** |
+
+Monotonic, accumulating, and in the decoder's favour. The output is valid and slightly better than
+the encoder believes, so this is not a correctness failure of the bitstream — but the encoder's
+local decode loop is what rate control and any RD decision reads, and it is wrong by up to a
+quarter of a dB by the end of a GOP. Logged as BUG-8; not diagnosed.

@@ -1398,8 +1398,15 @@ impl EncoderPipeline {
     ///   - main_v: vertical tile boundary columns (between col C-1 and col C, C = k*tile_size)
     ///
     /// The feature is controlled by `GNC_REF_DEBLOCK`:
-    ///   - unset / "1" → enabled (default)
-    ///   - "0"         → disabled (for A/B testing)
+    ///   - unset / "0" → disabled (default since 2026-09-06)
+    ///   - "1"         → enabled (for A/B testing)
+    ///
+    /// **Off by default because it measures slightly negative.** Its own commit measured the
+    /// effect as negligible (0.016% bpp, VMAF neutral) and explained why: tile-boundary pixels
+    /// are 2/256 = 0.78% of ME decisions, and the adaptive gate skips real edges. Re-measured
+    /// 2026-09-06 on three sequences with VMAF: exactly neutral on old_town and aerial (identical
+    /// bpp, VMAF within 0.09) and *worse* on bbb17 — at q=30, off is +0.09 VMAF mean and
+    /// +0.66 VMAF min at the same rate. Nothing to gain and a little to lose.
     ///
     /// Returns the number of boundary segments dispatched (for canary diagnostic).
     /// When the feature is disabled returns 0.
@@ -1419,8 +1426,8 @@ impl EncoderPipeline {
         tile_size: u32,
         qstep: f32,
     ) -> u32 {
-        // Feature gate: GNC_REF_DEBLOCK=0 disables, anything else (or unset) enables.
-        if std::env::var("GNC_REF_DEBLOCK").as_deref() == Ok("0") {
+        // Feature gate: GNC_REF_DEBLOCK=1 enables, anything else (or unset) disables.
+        if std::env::var("GNC_REF_DEBLOCK").as_deref() != Ok("1") {
             return 0;
         }
 

@@ -558,6 +558,32 @@ I-frames") rather than a bug, so it was recorded as a finding. And it was perfec
 which read as evidence it was real — reproducibility separates a bug from noise, not a codec
 property from an instrumentation artefact.
 
+### BUG-8 — The encoder's local decode diverges from the real decoder down a GOP (**OPEN, not diagnosed**)
+bbb17, 17 frames, ki=17, q=50. Per-frame PSNR of the encoder's own reconstruction vs the actual
+decoded file: gap −0.04 dB at frame 0, +0.08 at frame 8, **+0.23 at frame 16** — monotonic,
+accumulating, and in the decoder's favour.
+
+The bitstream is valid and the decoded output is slightly *better* than the encoder believes, so
+this is not a correctness failure of the output. It is a correctness failure of the encoder's
+model: the local decode loop is what rate control and any RD decision reads, and by the end of a
+GOP it is wrong by a quarter of a dB.
+
+**Not the deblock filter** — the divergence persists with `GNC_REF_DEBLOCK` off. Cause unknown.
+Any RD or rate-control work should treat encoder-internal PSNR as suspect until this is diagnosed.
+First step: find whether the local decode's reference buffer differs from the decoder's after one
+P-frame, and if so by what.
+
+### MEAS-2 — Feature toggling: what contributes and how much? (in progress 2026-09-06)
+First toggle measured: **`GNC_REF_DEBLOCK` — neutral to negative, default flipped off.** Its own
+commit measured 0.016% bpp / VMAF neutral and explained why (tile-boundary pixels are 0.78% of ME
+decisions); re-measured with VMAF it is exactly neutral on old_town and aerial and *worse* on
+bbb17 (+0.66 VMAF min with it off at q=30). Code retained rather than deleted — 0.1 VMAF margin,
+correct implementation, and a second agent is editing this tree. Delete it if nothing revives it.
+
+Remaining toggles to measure the same way: AQ on/off, CfL on/off, pyramid QP scales, B-pyramid,
+Rice vs rANS at each quality, tile-skip. Each: bpp + VMAF mean + VMAF min at matched q, then
+BD-rate if the point measurement is not decisive.
+
 ### MEAS-4 — Inter-model gap decomposition (**RE-RUN AND CLOSED 2026-09-06** on clean data)
 Reopened because its residual dumps were taken with `GNC_DIAGNOSTICS=1` (BUG-7), which clobbered
 the MC reference from the third frame of every sequence onward. Re-dumped with the diagnostic
@@ -782,7 +808,8 @@ chosen has to be justified, not just picked.
 `GNC_CHROMA_WEIGHT` is in place so the sweep can be repeated the moment a metric exists.
 
 ### Closed by measurement 2026-09-06 — do not re-test
-- **Non-adaptive reference filtering** (the in-loop filter GNC lacks): a mild 3x3 low-pass on the
+- **Non-adaptive reference filtering** (a general in-loop filter; GNC has only tile-seam
+  deblocking, now off by default): a mild 3x3 low-pass on the
   reference buys **0.9-1.8% on prediction SATD** — consistent in sign on blue_sky, bbb17 and
   old_town, reversing if over-filtered. An edge-selective deblocking proxy is −0.16% to +0.41%,
   i.e. nothing. Too small for a normative bitstream filter the decoder must reproduce bit-exactly.
@@ -826,7 +853,7 @@ chosen has to be justified, not just picked.
 - **Block intra prediction**: already measured at −11.76 dB / +29% bitrate (hence
   `intra_prediction: false`), and worth only ~+6% to H.264 over JPEG 2000 regardless.
 
-### MEAS-2 — Feature toggling: what contributes and how much? (todo)
+### MEAS-2 — original statement (superseded by the in-progress entry above)
 Systematic toggle measurement on crowd_run + park_joy, 10 frames, 4:4:4, q=75:
 - AQ on/off (GNC_NO_AQ)
 - CfL on/off

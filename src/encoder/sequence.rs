@@ -2957,7 +2957,7 @@ impl EncoderPipeline {
             let horiz = tiles_y.saturating_sub(1);
             let vert = tiles_x.saturating_sub(1);
             let segs_per_plane = horiz * tiles_x + vert * tiles_y;
-            let enabled = std::env::var("GNC_REF_DEBLOCK").as_deref() != Ok("0");
+            let enabled = std::env::var("GNC_REF_DEBLOCK").as_deref() == Ok("1");
             if enabled {
                 eprintln!(
                     "[deblock] I-frame: applied {} boundary segments ({} planes × {} segs/plane, {}×{} tile grid)",
@@ -4205,7 +4205,7 @@ impl EncoderPipeline {
                 let horiz = tiles_y.saturating_sub(1);
                 let vert = tiles_x.saturating_sub(1);
                 let segs_per_plane = horiz * tiles_x + vert * tiles_y;
-                let enabled = std::env::var("GNC_REF_DEBLOCK").as_deref() != Ok("0");
+                let enabled = std::env::var("GNC_REF_DEBLOCK").as_deref() == Ok("1");
                 if enabled {
                     eprintln!(
                         "[deblock] P-frame: applied {} boundary segments ({} planes × {} segs/plane, {}×{} tile grid)",
@@ -6786,7 +6786,7 @@ impl EncoderPipeline {
             let horiz = tiles_y.saturating_sub(1);
             let vert = tiles_x.saturating_sub(1);
             let segs_per_plane = horiz * tiles_x + vert * tiles_y;
-            let enabled = std::env::var("GNC_REF_DEBLOCK").as_deref() != Ok("0");
+            let enabled = std::env::var("GNC_REF_DEBLOCK").as_deref() == Ok("1");
             if enabled {
                 eprintln!(
                     "[deblock] B-frame pyramid slot {}: applied {} boundary segments ({} planes × {} segs/plane, {}×{} tile grid)",

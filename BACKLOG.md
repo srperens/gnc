@@ -11,60 +11,54 @@ Current state and priorities are described in [GOALS.md](GOALS.md).
 
 See [BASELINE.md](BASELINE.md) for current benchmark numbers.
 
-## Current Focus (updated 2026-09-05)
+## Current Focus (updated 2026-09-06)
 
-**Mode: Measurement and bugfixing. No new features.**
+**Positioning: GNC is a contribution codec** ([docs/POSITIONING.md](docs/POSITIONING.md), GOALS §1).
+It does not try to beat H.264 on bitrate; it aims for H.264-class quality that runs on any GPU and
+scales with the card, against fixed-function encoders with session limits.
 
-**Positioning fixed 2026-09-05 (see [docs/POSITIONING.md](docs/POSITIONING.md) and GOALS §1): GNC is a contribution codec.** It does not try to
-beat H.264 on bitrate; it aims for H.264-class quality that runs on any GPU and scales with the
-card, against fixed-function encoders with session limits. Two consequences for this list: the
-headline metrics are now concurrent streams per GPU (MEAS-5) and latency (MEAS-6), neither of
-which has ever been measured; and compression targets move to the contribution operating point,
-so historical BD-rate measured at distribution bitrates describes a use case GNC is not built for.
-Both intra and inter remain goals — going all-intra was considered and rejected.
+### What 2026-09-06 established, and what it changes
 
-The measurement campaign (parts 8–13) established a new baseline with uniform subband
-weights, and the 2026-03 experiment sweep (~40 gated experiments, see archive) exhausted
-the cheap and medium-cost *incremental* inter-compression ideas. Temporal compression is still
-a goal (see [GOALS.md](GOALS.md) §4) — the open question is what shape it should take, and
-MEAS-4 is designed to answer that before anything gets built. Until then the priorities are:
+**1. There is no inter gap at the contribution operating point — for anyone.** Measured x264's own
+inter saving: **+63.9% at crf 23, +0.6% at crf 12, −33.3% at crf 2**. Its crossover is around
+crf 12; GNC's is between q=75 and q=92. At contribution quality both codecs break even, and GNC is
+if anything better behaved (−2% against x264's −33% on raw rate). Near lossless the MC residual is
+noise-like (Girod), so it costs about what the picture costs and the motion vectors are overhead.
+**The +118–177% GNC is behind at contribution quality is an *intra* gap.** Stop spending inter
+effort there; the inter gap is real only at distribution bitrates.
 
-1. Fix known bugs (BUG-1 done; BUG-2, BUG-3 open)
-2. Finish the measurement campaign (MEAS-1/2/3) — honest VMAF-based video numbers
-3. Toggle features to identify dead weight and incorrect implementations
-4. Let measurements drive the next action
+**2. A serial dependency costs 4.9x and is still 201 fps.** Measured directly
+(`tests/wavefront_cost.rs`): 1.02 ms independent against 4.98 ms for a true per-pixel wavefront on
+1080p 4:4:4. That is 25% of the 20 ms budget at 50 fps. **The parallelism objection that has been
+used to decline tools is quantitatively much weaker than assumed** — a dependency is a tax on one
+pass, not a disqualification, and no such pass is near the bottleneck (entropy coding, 51–85% of
+runtime).
 
-MEAS-4's residual dumps were taken with `GNC_DIAGNOSTICS=1`, which BUG-7 (2026-09-06) shows
-clobbered the motion-compensation reference from the third frame of every sequence onward. **It has
-been re-run on clean dumps and its conclusion holds**: the coding model is not the gap (a
-DCT-plus-oracle-skip rival is +5.7% worse), the motion search is not the gap (GNC beats a
-full-search oracle by 6%), and context modelling has a 10.4% ceiling. What the corruption did
-invalidate is claims about the residual's absolute size, which were about 6x too large.
+**3. Lossless works and is the best wavelet in the field.** `q=100` is bit-exact on all three
+coders (GOALS was wrong). 1.99:1 beats JPEG 2000 lossless by 10.8% and PNG by 7.8%; loses to FFV1
+by 27% and x264 `-qp 0` by 43%, both of which predict against the neighbour rather than the scale.
 
-The honest inter numbers are also better than this list carried: **inter saves 33-73%**, not
-17-27%. x264 saves 86-89%, so the gap is real, but it is not the near-total failure the corrupted
-diagnostics implied.
+**4. Five conclusions this week turned on the operating point or configuration measured**, not on
+the idea: TUNE-5, "inter saves 17–27%", BUG-10, BUG-13, and the intra-prediction rejection. The
+standing rule is now: *name the mechanism you are testing, then check that the implementation
+actually implements that mechanism* — and measure the range the project cares about, not the
+convenient one.
 
-With the model, the search and the entropy ceiling all ruled out, what is left is what a mature
-encoder does that GNC does not. The first item off that list paid: **TUNE-5** found that GNC spent
-the same bits on a P-frame as on an I-frame, and separating them is −3.3% BD-rate at ki=9 and about
-−20% at ki=17.
+### Priority order
 
-Separately, the old premise had already failed inspection: the "GNC saves 38.5% vs x264's 86.9%"
-figure compares GNC's RGB PSNR against x264's YUV PSNR, which are not the same quantity.
+1. **LOSSLESS-1** — both gates green (10–26% for ~5 ms/frame). The one lever this week that passed
+   rather than failed. Buildable now.
+2. **Intra at contribution quality** — where the whole remaining gap is, per finding 1.
+3. **MEAS-5 / CANARY-1** — blocked on a discrete GPU. The entire strategic thesis rests on MEAS-5
+   and it has never been measured.
+4. **QUAL-1** — re-run MEAS-1 at the contribution end now that the quality range above q=92 exists
+   (it was dead until today, so every contribution-quality comparison predating that is invalid at
+   the top).
+5. Bugs: BUG-9 (rANS bounds, message now actionable), BUG-12, BUG-14.
 
-**MEAS-1 is therefore a hard prerequisite for any further inter work.** Until there is a
-trustworthy, VMAF-based, like-for-like comparison, there is no reliable number saying how large
-the inter gap is, and targeting it is guesswork. See RESEARCH_LOG 2026-09-05.
-
-**Known facts (2026-03-11, uniform weights):**
-- Spatial BD-rate vs H.264 all-I: **+13.9%** — reasonable for a wavelet codec; GNC wins above ~36 dB
-- Spatial BD-rate vs JPEG 2000 (4:4:4): **+28.3%** — gap narrows to ~11% at high quality
-- Temporal: GNC I+P+B saves ~17–27% vs all-I (48.9%/29.8% on bbb/touchdown at q=75, 4:4:4).
-  x264 saves 86–89% on the same content → the gap is real and large. **Where it lies is again an
-  open question — see BUG-7 and the reopened MEAS-4.** For reference, on blue_sky at q=50 a
-  P-frame really costs 0.55–0.61 of an I-frame, not the ~1.0 the diagnostics were reporting.
-- All above is PSNR-based (RGB). VMAF-based video comparison vs H.264 still missing (MEAS-1).
+**Do not re-test** (measured and closed this week): MCTF, GOP length, the B-pyramid at contribution
+quality, RD decisions, multi-reference, sub-pel filters, motion search, block transforms, sub-block
+masking, smaller tiles, prediction *before* the wavelet.
 
 ## Active priority list
 

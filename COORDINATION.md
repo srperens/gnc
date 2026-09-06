@@ -152,6 +152,14 @@ wrong conclusions have come from this one error.
 
 Newest first. If you have measurements taken before one of these, they are suspect.
 
+- **For the abac track, a result you did not ask for.** The `GNC_ABAC_COMPARE=1` harness was gated
+  on `TransformType::Wavelet`, so it could not see the new lossless path. Gate widened (one
+  `matches!`); `subbands()` at `num_levels = 0` already yields the right single region. **abac on
+  MED residuals measures −14.3% mean on real coefficients** (bbb −14.9, blue_sky −15.6,
+  kristensara −15.5, touchdown −11.2). With LOSSLESS-1 that is −27% against this morning's
+  lossless and **+7.7% behind FFV1, from +48.4%**. Rate only. Your GPU decode throughput gate is
+  now the only thing between that and a shipped result. Not implemented here — it is your code.
+
 - **LOSSLESS-1** — q=100 now codes MED prediction residuals instead of wavelet coefficients
   (`TransformType::MedPredict`, bitstream `transform_type = 2`, `GNC_MED=0` to revert). Files are
   **14.9% smaller, still bit-exact**. **Invalidates every lossless figure in this repo**, including

@@ -168,6 +168,14 @@ fn bucket(nb: u32) -> u32 {
 // Budget on an M1 (32 KB per workgroup): 32 threads x 18 probabilities = 2.3 KB, plus two rows
 // of magnitudes per thread at MAX_BLOCK_W = 64 => 32 x 2 x 64 x 4 B = 16 KB. Total 18.3 KB.
 // This is why the code-block width is capped at 64 and the host asserts it.
+//
+// **Both arrays are thread-interleaved, and that is the whole performance story.** The obvious
+// layout gives thread `t` a contiguous slice — `rows[t * 128 + x]` — which puts adjacent threads
+// 128 words apart. Metal threadgroup memory has 32 banks of 4 bytes, and 128 is a multiple of 32,
+// so all 32 lanes of a SIMD group hit the *same bank* on every single neighbour read: a 32x
+// serialisation on the hottest access in the decoder. Indexing as `[x * WG + t]` instead puts
+// lane `t` in bank `t`. Getting this wrong is invisible — the decode is still bit-exact, just
+// dramatically slower.
 const WG: u32 = 32u;
 const MAX_BLOCK_W: u32 = 64u;
 
@@ -186,14 +194,13 @@ fn main(
     }
     let info = blocks[blk];
 
-    let pbase = tid * NUM_CONTEXTS;
+    // Thread-interleaved indexing: context `i` for this thread lives at `i * WG + tid`.
     for (var i = 0u; i < NUM_CONTEXTS; i++) {
-        probs[pbase + i] = PROB_HALF;
+        probs[i * WG + tid] = PROB_HALF;
     }
     // Two row buffers per thread, alternated by row parity so no copy is needed between rows.
-    let rbase = tid * 2u * MAX_BLOCK_W;
     for (var i = 0u; i < 2u * MAX_BLOCK_W; i++) {
-        rows[rbase + i] = 0u;
+        rows[i * WG + tid] = 0u;
     }
 
     var d: Dec;
@@ -214,31 +221,31 @@ fn main(
         // `cur` is the row being decoded, `prev` the one above. Positions outside the block read
         // as zero, so blocks stay independent — a block must decode without reference to any
         // other, which is what lets them run concurrently.
-        let cur = rbase + (y & 1u) * MAX_BLOCK_W;
-        let prev = rbase + ((y + 1u) & 1u) * MAX_BLOCK_W;
+        let cur = (y & 1u) * MAX_BLOCK_W;
+        let prev = ((y + 1u) & 1u) * MAX_BLOCK_W;
         for (var x = 0u; x < info.width; x++) {
             var nb = 0u;
             if (x > 0u) {
-                nb = nb + rows[cur + x - 1u];
+                nb = nb + rows[(cur + x - 1u) * WG + tid];
             }
             if (y > 0u) {
-                nb = nb + rows[prev + x];
+                nb = nb + rows[(prev + x) * WG + tid];
                 if (x > 0u) {
-                    nb = nb + rows[prev + x - 1u];
+                    nb = nb + rows[(prev + x - 1u) * WG + tid];
                 }
                 if (x + 1u < info.width) {
-                    nb = nb + rows[prev + x + 1u];
+                    nb = nb + rows[(prev + x + 1u) * WG + tid];
                 }
             }
             let ctx = bucket(nb);
 
             var a = 0u;
             var v = 0i;
-            if (decode_bit(&d, pbase + ctx) == 1u) {
+            if (decode_bit(&d, ctx * WG + tid) == 1u) {
                 a = 1u;
-                if (decode_bit(&d, pbase + NUM_BUCKETS + ctx) == 1u) {
+                if (decode_bit(&d, (NUM_BUCKETS + ctx) * WG + tid) == 1u) {
                     a = 2u;
-                    if (decode_bit(&d, pbase + 2u * NUM_BUCKETS + ctx) == 1u) {
+                    if (decode_bit(&d, (2u * NUM_BUCKETS + ctx) * WG + tid) == 1u) {
                         // Exp-Golomb order 0, bypass-coded.
                         var zeros = 0u;
                         loop {
@@ -265,7 +272,7 @@ fn main(
                 }
             }
             out[info.out_offset + y * info.stride + x] = v;
-            rows[cur + x] = a;
+            rows[(cur + x) * WG + tid] = a;
         }
     }
 }

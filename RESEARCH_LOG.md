@@ -7982,3 +7982,64 @@ Synthetic pass with minimal arithmetic — a real MED decoder also entropy-decod
 either way. One GPU (M1, 8 cores). 256×256 tiles specifically; the occupancy argument says the
 ratio is tile-size dependent. And this measures the *decode* dependency; encode-side MED can be
 fully parallel at lossless, since encoder-side reconstruction equals the input.
+
+### abac GPU throughput is not measurable on this machine, and three optimisations proved it
+
+Three plausible optimisations to the decode shader, each targeting a different suspected
+bottleneck, and none of them moved the number:
+
+1. **Context scratch out of device memory.** The first version kept 18 context probabilities in a
+   dynamically indexed function array (which spills to device-backed thread memory on Metal) and
+   read neighbour magnitudes back out of the uncached output buffer — roughly five device-memory
+   accesses per coefficient. Moved both into workgroup memory. No change.
+2. **Blocks sorted by size.** A Metal SIMD group runs at its slowest lane, so an 8×8 block sharing
+   a group with a 64×64 one wastes most of the group. Sorting by area removes the geometric part
+   of the divergence. No change. (Kept anyway: it required giving `BlockInfo` an explicit
+   `byte_len` instead of deriving each block's end from the next block's offset, which removed a
+   load-bearing ordering assumption and is better code regardless.)
+3. **Thread-interleaved workgroup arrays.** The obvious layout gives thread *t* a contiguous slice,
+   `rows[t * 128 + x]`, which puts adjacent threads 128 words apart. Metal threadgroup memory has
+   32 banks of 4 bytes and 128 is a multiple of 32, so **all 32 lanes hit the same bank on every
+   neighbour read** — a 32× serialisation on the decoder's hottest access. Re-indexed as
+   `[x * WG + t]` so lane *t* lands in bank *t*. No change. (Also kept: it is correct, standard,
+   and the failure mode is invisible — bit-exact but slow.)
+
+Three targeted optimisations against three different suspects, all null, while the *same input*
+timed 25.2, 31.1 and 37.5 ms across runs. That is a 48% spread on identical work. **The
+conclusion is about the measurement, not the shader:** five sessions were compiling and running
+GPU work on this M1 throughout, and LOOP.md's own rule is that timing needs an idle machine.
+
+So the throughput figures in the previous entry — 50-105 Mcoeff/s, 6-13 fps — should be read as
+an order of magnitude and nothing finer, and the three optimisations above are untested rather
+than disproven. I have stopped optimising until the machine is quiet, because optimising against
+noise produces changes that look justified and are not.
+
+### What the concurrent session's wavefront measurement contributes
+
+`MEAS: a serial dependency costs 4.9x and is still 201 fps` (75ca12b) is the useful calibration
+here, and it narrows the diagnosis:
+
+- A trivially parallel shader does 7.86 M elements in **1.02 ms**. So the GPU is not slow at this
+  frame size; abac at 50-105 Mcoeff/s is 75-150× off that.
+- A *wavefront dependency* — 511 diagonals with a storage barrier, one active lane in 256 at the
+  extremes — costs only **4.9×**, and they located that cost as occupancy rather than
+  synchronisation.
+
+So a serial dependency per se is cheap, and abac's problem is not "it has a dependency". The
+difference in shape is that their wavefront keeps 256 threads per workgroup progressing in
+lockstep, while abac gives one thread 4096 sequential symbols with 31 lanes idle beside it. The
+remaining candidate is therefore the per-symbol instruction count on a single lane — three
+context-coded binary decisions per coefficient, each a multiply, a compare, an adaptation and a
+variable-length renormalisation loop — not memory behaviour, which is what the three failed
+optimisations were all aimed at.
+
+That points at the one structural fix worth trying when the machine is free: replace the
+renormalisation loop with a table lookup of fixed cost, as VP8's bool decoder does. It is a coder
+core rewrite rather than a shader tweak, and the 16-bit interval work is already a prerequisite
+for it.
+
+Their measurement is also worth taking on its own terms: GNC has declined spatial prediction,
+in-loop filtering and context-adaptive coding partly on parallelism grounds, and the parallelism
+tax is now quantified at 5× on one pass rather than being a disqualification. Entropy coding is
+51-85% of decode runtime, so it is the right thing to be working on — which is some comfort for
+this track even though its own gate is still open.

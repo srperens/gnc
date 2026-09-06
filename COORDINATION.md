@@ -59,7 +59,6 @@ the shared checkout** — no absolute paths, no session ids.
 |---|---|---|
 | `../gnc-abac` | `abac` | **paused, free to take.** Adaptive binary code-block entropy coder (EBCOT follow-up), CPU + GPU. Rate −15 to −25% confirmed, two coder variants behind `GNC_ABAC_CODER`. Blocked only on `cargo test --release --test abac_bench -- --ignored` on an idle machine. |
 | `../gnc-abac` | `abac` | same worktree, now on **BUG-8** — the encoder's local decode diverges from the real decoder down a GOP. |
-| `../gnc-qual1` (scratchpad) | `meas/qual-1` | QUAL-1 — re-run MEAS-1 at q=92/96/99 vs crf 4/8/12. Measurement only, no `src/` changes; PSNR + CIEDE2000 lead, VMAF saturated at this end. |
 
 ## Timing: the machine is shared, so throughput numbers are not measurable during a session
 
@@ -104,6 +103,18 @@ the option that spends more bits. Use BD-rate, or compare at matched rate. At le
 wrong conclusions have come from this one error.
 
 ## Landed today, and what each one invalidates
+
+- **QUAL-1 — the headline gap figure is corrected.** At the contribution operating point GNC needs
+  **+90.5% BD-rate on PSNR** (about 1.9x), not the **+456.7% to +672.1%** recorded from MEAS-1.
+  Nothing in the coder changed; the old figure was measured at distribution bitrates.
+  **Invalidates every use of the 5-7x figure**, including in POSITIONING and any argument that
+  single-digit improvements are pointless — against 1.9x they are not.
+  Two further things to carry: **never quote a VMAF BD-rate above about q=85** (widening the ladder
+  moved it 47.5 points on average, 110 on old_town, while PSNR moved 1.0); and **at matched rate
+  GNC beats x264 on dE00** while losing 7.4-8.8 dB of luma, so quote luma and colour together or
+  the number misleads in whichever direction suits.
+  Also: **MEAS-1's stated sources are not reproducible** — `bbb.y4m` has 8 frames, not 17, and no
+  `touchdown` sequence exists in the tree.
 
 - **The test material was unreachable for about ten minutes (18:04, restored).** `ln -sfn` run
   inside the shared checkout pointed `test_material/frames` at itself, so every worktree's link

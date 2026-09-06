@@ -51,9 +51,9 @@ convenient one.
 2. **Intra at contribution quality** — where the whole remaining gap is, per finding 1.
 3. **MEAS-5 / CANARY-1** — blocked on a discrete GPU. The entire strategic thesis rests on MEAS-5
    and it has never been measured.
-4. **QUAL-1** — re-run MEAS-1 at the contribution end now that the quality range above q=92 exists
-   (it was dead until today, so every contribution-quality comparison predating that is invalid at
-   the top).
+4. ~~**QUAL-1**~~ — done 2026-09-06: the contribution gap is **+90.5% BD-rate on PSNR**, about
+   1.9x, not the 5.6x recorded at distribution bitrates. Follow-up: sweep `GNC_CHROMA_WEIGHT` at
+   matched rate, judged on PSNR *and* dE00.
 5. Bugs: BUG-9 (rANS bounds, message now actionable), BUG-14. BUG-12 closed 2026-09-06.
 
 **Do not re-test** (measured and closed this week): MCTF, GOP length, the B-pyramid at contribution
@@ -479,16 +479,54 @@ Rice's overflow flag. Do **not** make rANS work at fine qstep: it is selected on
 4 KB is ample, and it measures worse than Rice above q=20, so the capability has no user. The
 value here is turning a wrapped-pointer crash into a sentence.
 
-### QUAL-1 — Re-run MEAS-1 at the contribution operating point (todo, P1)
+### QUAL-1 — Re-run MEAS-1 at the contribution operating point (**DONE 2026-09-06**)
 The quality ladder above q=92 was dead until 2026-09-06 — q=92, 96 and 99 produced the same
 picture, capped at qstep 2.0 by an rANS constraint that no longer applied. **Every
 contribution-quality comparison in this repo predating that fix is invalid at the top of the
 range**, because GNC was pinned while the competitor was not. The distribution-bitrate figures
 (+306% to +617%) are unaffected.
 
-Re-run MEAS-1 with `--q 92,96,99` against `--crf 4,8,12` now that GNC reaches 60.7 dB where it
-previously stopped at 50.5. Note VMAF saturates around 99.8 and is useless at this end; use PSNR
-and CIEDE2000.
+**Done 2026-09-06. The contribution-quality gap is +90.5% BD-rate on PSNR — about 1.9x, against
+the 5.6x mean recorded at distribution bitrates.**
+
+1920x1080, 17 frames, ki=9, chroma 420, 8-bit, x264 at defaults — MEAS-1's parameters exactly,
+only the operating point changed. q=85,92,96,99 against crf=1,2,4,8 (the first pass at
+q=92-99/crf=4-12 left only 1.8 dB of curve overlap; extended to 6.5 dB).
+
+| sequence | BD-rate PSNR-Y | overlap | BD-rate VMAF |
+|---|---|---|---|
+| bbb_extended | **+129.0%** | 49.4–55.9 dB | +122.6% |
+| old_town_cross | **+71.9%** | 50.0–56.2 dB | +191.4% |
+| crowd_run | **+70.6%** | 49.9–56.3 dB | +113.6% |
+| **mean** | **+90.5%** | | +142.5% |
+
+Nothing was fixed in the coder — the gap was always this size *here*; +456.7% to +672.1% was
+measured somewhere else. Corroborates the Current Focus +118–177% intra gap independently, and
+lands slightly better than it.
+
+**Never quote a VMAF BD-rate above about q=85.** Widening the ladder moved the VMAF figure by a
+mean of **47.5 points** (old_town: +81.1% → +191.4%) and the PSNR figure by **1.0 point**. On
+old_town VMAF reads 99.62–99.68 across a 6 dB PSNR spread — no signal left to integrate. This is
+COORDINATION rule 3 with a magnitude attached.
+
+**Colour reverses at matched rate.** CIEDE2000 on decoded RGB, rate matched to 1%: GNC 0.611 vs
+x264 0.684 (bbb), 0.911 vs 0.949 (old_town) — GNC better on mean and 95th percentile on all three
+sequences, with fewer pixels past the JND, **while losing luma by 7.4–8.8 dB at the same points.**
+That is the two codecs allocating rate differently between luma and chroma, not GNC being better.
+So a single luma BD-rate overstates the gap for a colour-weighted use case and understates the
+luma deficit. Quote both. (crowd_run's pair is 1.08x on rate, so its dE00 win is partly bought;
+the two matched pairs give +4.1% and +10.7%.)
+
+**Correction to MEAS-1's record.** It states 17 frames on bbb / touchdown / old_town. `bbb.y4m` has
+**8 frames** and there is no `touchdown` sequence in the tree; with `--frames 17` the GNC arm dies
+on a missing PNG. Either MEAS-1 ran against sources no longer present or against fewer frames than
+recorded — so its absolute figures are not reproducible as written. Sources used here, stated
+explicitly and MD5-confirmed distinct: bbb_extended (24 frames), old_town_cross (200), crowd_run
+(32).
+
+**Follow-up worth doing (new, P2):** sweep `GNC_CHROMA_WEIGHT` at *matched total rate* to see
+whether moving bits from chroma to luma closes part of the +90.5%. Judge on luma PSNR **and** dE00
+together — that sweep was run once on VMAF, looked like a free 15%, and reversed sign on dE00.
 
 ### MEAS-5 — Concurrent streams per GPU vs NVENC (partly answered 2026-09-05, P0)
 

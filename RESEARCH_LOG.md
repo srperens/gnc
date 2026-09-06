@@ -8184,3 +8184,95 @@ One self-inflicted measurement error worth recording: the first demo set built q
 and lossless from 8, which made lossless look *cheaper* than q=92. bbb_2min opens on a quiet intro.
 Same class of error as several others this week — the group is now uniform.
 
+
+## 2026-09-06 — QUAL-1: the contribution-quality gap is ~1.9x, not the recorded 5.6x
+
+**Why re-run.** The quality ladder above q=92 was dead until 2026-09-06 — q=92, 96 and 99 produced
+the same picture, capped at qstep 2.0 by an rANS constraint that no longer applied. Every
+contribution-quality comparison predating that fix had GNC pinned while the competitor was not.
+MEAS-1's recorded **+456.7% to +672.1%** was measured at distribution bitrates (crf 18-38),
+which COORDINATION rule 2 says is the wrong range for this codec.
+
+**Canary first.** The ladder is alive: bbb still, q=85/92/96/99 → 49.48 / 51.69 / 55.19 / 59.77 dB,
+monotone, rate climbing 7.05 → 14.28 bpp. Without this check the whole re-run would have measured
+the same picture four times, which is what the original did.
+
+**Method.** `scripts/meas1_vs_h264.py`, one normalised reference through PNG for both codecs, same
+`vmaf` binary and arguments for every score, rate from the actual coded bitstream. 1920x1080,
+17 frames, ki=9, chroma 420, 8-bit, x264 at defaults — MEAS-1's parameters exactly, except the
+operating point. Worktree pinned to `7a93942` with its own `target/`.
+
+**Sources — a correction to MEAS-1's record.** MEAS-1 states 17 frames on bbb / touchdown /
+old_town. `bbb.y4m` in the tree has **8 frames**, and there is no `touchdown` sequence at all; with
+`--frames 17` the GNC arm dies on a missing PNG, which is what happened on the first attempt here.
+Either MEAS-1 ran against sources no longer present, or against fewer frames than recorded. This
+run states its sources explicitly: **bbb_extended (24 frames), old_town_cross (200), crowd_run
+(32)** — first-frame MD5s confirmed distinct, all 1080p.
+
+### PSNR leads, and the answer is +90.5%
+
+| sequence | GNC bpp span | x264 bpp span | overlap | **BD-rate (PSNR-Y)** | BD-rate (VMAF) |
+|---|---|---|---|---|---|
+| bbb_extended | 2.67–6.92 | 1.34–3.02 | 49.4–55.9 dB | **+129.0%** | +122.6% |
+| old_town_cross | 5.49–9.53 | 3.47–5.24 | 50.0–56.2 dB | **+71.9%** | +191.4% |
+| crowd_run | 5.57–9.68 | 3.55–5.42 | 49.9–56.3 dB | **+70.6%** | +113.6% |
+| **mean** | | | | **+90.5%** | +142.5% |
+
+**GNC needs about 1.9x the bitrate of H.264 for the same luma PSNR at contribution quality**,
+against the 5.6x average recorded at distribution bitrates. The gap did not close because anything
+was fixed in the coder — it was always this size *here*; the recorded figure was measured somewhere
+else. This independently corroborates the Current Focus finding of a +118–177% intra gap, from a
+different direction, and lands slightly better than it.
+
+### The VMAF column is not usable at this end, and now there is a number for it
+
+The first pass used q=92,96,99 against crf=4,8,12, which left only **1.8 dB** of curve overlap — a
+cubic fit integrated over 1.8 dB is fragile, so both ladders were extended to q=85–99 against
+crf=1–8 for a 6.5 dB overlap. What the two metrics did when the window widened:
+
+| sequence | VMAF: narrow → wide | shift | PSNR: narrow → wide | shift |
+|---|---|---|---|---|
+| bbb_extended | 126.5% → 122.6% | −3.9 | 131.1% → 129.0% | −2.1 |
+| old_town_cross | 81.1% → **191.4%** | **+110.3** | 72.0% → 71.9% | −0.1 |
+| crowd_run | 85.4% → 113.6% | +28.2 | 71.4% → 70.6% | −0.8 |
+
+**Mean absolute shift: VMAF 47.5 points, PSNR 1.0 point.** On old_town VMAF reads 99.62–99.68
+across a 6 dB PSNR spread — there is no signal left to integrate, so the BD-rate is fitting noise.
+This is COORDINATION rule 3 with a magnitude attached: above about q=85, **a VMAF BD-rate can move
+110 points on the same data purely from where the ladder ends.** Do not quote one.
+
+### Colour: at matched rate GNC is *ahead*, and that reframes the luma gap
+
+Luma alone cannot judge a contribution codec, and 4:2:0 is where GNC falls back from rANS to Rice.
+CIEDE2000 on decoded RGB, at rate matched to within 1%:
+
+| sequence | pair | bytes (GNC / x264) | GNC dE00 mean / p95 | x264 dE00 mean / p95 |
+|---|---|---|---|---|
+| bbb_extended | q=85 vs crf=2 | 11 782 280 / 11 775 618 | **0.611** / **1.304** | 0.684 / 1.503 |
+| old_town_cross | q=85 vs crf=1 | 24 204 430 / 24 024 499 | **0.911** / **1.943** | 0.949 / 2.196 |
+| crowd_run | q=85 vs crf=1 | 24 560 193 / 22 774 457 | **0.837** / **1.844** | 0.913 / 2.195 |
+
+GNC is better on mean dE00 on all three, has a lower 95th percentile on all three, and leaves
+fewer pixels past the nominal JND (13.1% vs 17.8%, 34.8% vs 37.9%, 29.2% vs 35.0%) — **while
+losing luma by 7.4–8.8 dB at those same operating points.**
+
+**Caveat on the third row:** bbb and old_town are matched to 1.00x and 1.01x, but crowd_run's GNC
+arm carries **8% more bytes**, so part of its 8.3% dE00 advantage is bought rather than earned.
+The two properly matched pairs give +4.1% and +10.7%, and those are the ones to quote.
+
+That asymmetry is not GNC being better; it is the two codecs **allocating rate differently between
+luma and chroma.** x264's crf carries a chroma QP offset that favours luma; GNC's subband weights
+and `chroma_weight` (1.2 below q=85) spend relatively more on colour. Two consequences, and the
+second is the useful one:
+
+1. A single luma BD-rate **overstates** the gap for a use case that weights colour, and
+   **understates** GNC's luma deficit. Quote both.
+2. **Part of the +90.5% may be an allocation choice rather than a coding-efficiency deficit** —
+   testable directly, since `GNC_CHROMA_WEIGHT` is already a knob. The obvious next experiment is
+   to sweep it at *matched total rate* and see whether moving bits from chroma to luma closes any
+   of it. **The trap is documented:** that sweep was run once on VMAF, looked like a free 15%, and
+   reversed sign on dE00 (CLAUDE.md). So it must be judged on luma PSNR *and* dE00 together, at
+   matched rate — never on VMAF, which cannot see the half being traded away.
+
+**Machine was heavily loaded throughout (load average 50–109, four other sessions).** Irrelevant
+here: every figure above is bpp, PSNR or dE00, all deterministic. No throughput number is quoted.

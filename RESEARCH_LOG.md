@@ -8735,3 +8735,87 @@ message before merging my own. The near-miss is worth naming precisely:
 
 The branch carrying the wrong verdict (`abac-gpu`) is **not to be merged**; its measurements are
 carried forward here and its conclusion is superseded.
+
+---
+
+## 2026-09-06 (idle machine) — the abac decision resolves to a number: 1.65× frame decode for 16.7% of rate
+
+The first genuinely idle window of the day (load 3.8–8.8, one single-core Python job, GPU free).
+Three things got settled: what was wrong with the timing method, what the coders actually cost,
+and what fraction of a frame decode the entropy stage even is.
+
+### The timing method was measuring the GPU's clock ramp
+
+Three consecutive *processes*, identical input, idle machine: **66.5, 45.3, 34.9 ms** — a 1.9×
+spread, monotonically decreasing. Not load. A freshly-idle M1 starts in a low power state and
+needs on the order of a second of sustained work to boost, and seven dispatches did not outlast
+the ramp. `tests/abac_bench.rs` printed a `spread` column blaming a busy machine for exactly this,
+and its two `#[test]` functions were also running **concurrently on the same GPU** under cargo's
+default threading, contending and interleaving their output.
+
+Both fixed: 24 dispatches, **best-of as the headline** with `med/best` beside it as the
+settled-or-not diagnostic. For a deterministic kernel on fixed input every error source — clock
+ramp, another session, scheduler noise — only makes a reading *slower*, so the minimum is the
+least-contaminated estimate available. The bench now documents `--test-threads=1`.
+
+**This is the general lesson, and it is not "the machine was busy":** an idle machine is necessary
+and not sufficient. A GPU measurement also has to outlast the clock ramp, and a repeat count
+chosen for a CPU benchmark will not.
+
+### Both coders on real coefficients, settled (bbb, q=90, cb=64)
+
+min and median within 1% of each other, so these are quotable:
+
+| coder | entropy-stage decode | throughput | rate vs shipped Rice |
+|---|---|---|---|
+| Interval | 96.3 ms | 81.7 Mcoeff/s | −14.5% |
+| **Range** | **33.0 ms** | **238.6 Mcoeff/s** | **−13.8%** |
+
+**Range is 2.92× Interval for 0.7 points of rate.** The synthetic grid in `abac_bench` puts the
+same ratio at 2.84× (160.7 vs 56.5 Mcoeff/s), which is a good cross-check of two independent
+harnesses. Note the *absolute* figures differ a lot: real coefficients decode at 238.6 Mcoeff/s
+against synthetic's 160.7, i.e. **synthetic is 33% pessimistic here** — the opposite direction to
+the 6% I estimated at q=55, so the two harnesses are not interchangeable for absolute numbers.
+Use the grid for ratios and `GNC_ABAC_COMPARE=1` for absolutes.
+
+### How big is the entropy stage anyway? 47% of frame decode
+
+New `GNC_RICE_DISPATCH_REPEAT=k` issues Rice's entropy dispatch k times instead of once. The
+decode is idempotent, so the slope isolates the stage without needing timestamp-query support:
+
+| k | frame decode |
+|---|---|
+| 1 | 29.50 ms |
+| 5 | 85.16 ms |
+| 9 | 141.55 ms |
+
+Slope from k=9: (141.55 − 29.50)/8 = **14.01 ms**. From k=5: (85.16 − 29.50)/4 = **13.92 ms**.
+Two independent estimates agreeing to 0.6%, and the series is linear, which is what makes it
+believable.
+
+**Rice's entropy stage is 14.0 ms of a 29.5 ms frame decode — 47%.** Worth keeping quite apart
+from abac: it is the ceiling on *any* entropy-coder work in this codec. A hypothetical free
+entropy coder would make frame decode 1.9× faster and no more.
+
+### The answer
+
+The shared inverse wavelet and colour transform cancel, so
+`abac_frame = rice_frame − rice_entropy + abac_entropy`:
+
+| coder | abac entropy | implied frame decode | vs Rice | rate |
+|---|---|---|---|---|
+| Range | 33.0 ms | 27.5 − 14.0 + 33.0 = **46.5 ms** | **1.69×** | −16.7% mean |
+| Interval | 96.3 ms | 27.5 − 14.0 + 96.3 = **109.8 ms** | **3.99×** | −14.5% (bbb) |
+
+The 1.20×–2.20× bracket in the previous entry collapses to **1.69×**, and it lands nearer the
+pessimistic end, as the q-insensitivity argument predicted. Per stage, abac-Range's entropy is
+2.36× Rice's.
+
+**So the decision is: ~16.7% of rate for ~1.65-1.7× the frame decode time, at the operating point
+that matters.** That is a real trade with no obviously right answer — it depends whether GNC is
+selling bitrate or streams-per-GPU, which is a positioning question (docs/POSITIONING.md) rather
+than an engineering one. What is now settled is that it is *that* trade and not the 4× one the
+Interval coder implied, and not the "free −20%" the early rate-only numbers implied.
+
+**Recommended if it is taken up:** Range, cb=64. It dominates Range at cb=32 (−13.8% vs −10.9%
+at 33.0 vs 31.4 ms) and dominates Interval on both axes at every size measured.

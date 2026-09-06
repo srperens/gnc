@@ -15,8 +15,27 @@
 //! - **Paired within a run.** Every variant is timed back-to-back on the same input in the same
 //!   process, so they see the same load. Comparing two numbers from different runs is what
 //!   produced the earlier null results.
-//! - **Median of repeats, and the spread is printed.** If `spread` is large the run was not idle
-//!   and the absolute numbers should be discarded — the ratios may still hold.
+//! - **Best of many repeats, with the median printed beside it.** For a deterministic kernel on
+//!   fixed input every error source only makes a reading *slower*, so the minimum is the
+//!   least-contaminated estimate. `best` is the headline and `med/best` is the diagnostic: when
+//!   it is far above 1.0 the run was not settled.
+//!
+//! # Run it single-threaded
+//!
+//! ```text
+//! cargo test --release --test abac_bench -- --ignored --nocapture --test-threads=1
+//! ```
+//!
+//! Two things corrupted the first idle-machine run of this bench, and neither was load:
+//!
+//! - **The GPU ramps its clocks.** Three consecutive processes on identical input read 66.5,
+//!   45.3 and 34.9 ms — a 1.9x spread, monotonically decreasing. A freshly-idle M1 starts in a
+//!   low power state and needs on the order of a second of sustained work to boost. Seven
+//!   repeats did not outlast the ramp, so the median was measuring the ramp and the spread
+//!   column blamed a machine that was in fact idle.
+//! - **Cargo runs test functions concurrently by default**, so the CPU bench below and the GPU
+//!   grid above were contending for the same device and interleaving their output. Hence
+//!   `--test-threads=1`.
 
 use gnc::encoder::abac::Coder;
 use gnc::encoder::abac_gpu::{verify_against_cpu, GpuAbacDecoder};
@@ -66,7 +85,8 @@ fn median(mut v: Vec<f64>) -> f64 {
 #[test]
 #[ignore = "throughput bench: needs an idle machine, see COORDINATION.md"]
 fn abac_decode_throughput_grid() {
-    const REPEATS: usize = 7;
+    // 24, not 7: seven dispatches do not outlast the GPU's clock ramp (see the module comment).
+    const REPEATS: usize = 24;
     // A padded 1080p luma plane. A 4:4:4 frame is three of these.
     let (w, h) = (2048usize, 1280usize);
     let plane = synth_plane(w, h, 11);
@@ -76,12 +96,12 @@ fn abac_decode_throughput_grid() {
     let decoder = GpuAbacDecoder::new(ctx);
 
     println!(
-        "\nabac decode throughput — {w}x{h} ({mcoeff:.2} Mcoeff), median of {REPEATS} runs\n\
+        "\nabac decode throughput — {w}x{h} ({mcoeff:.2} Mcoeff), best of {REPEATS} dispatches\n\
          A 4:4:4 frame is 3 planes, so frame ms = 3 x the ms column.\n"
     );
     println!(
-        "  {:<10} {:>4} {:>8} {:>10} {:>11} {:>9} {:>8}",
-        "coder", "cb", "bytes", "ms", "Mcoeff/s", "frame fps", "spread"
+        "  {:<10} {:>4} {:>8} {:>10} {:>11} {:>9} {:>9}",
+        "coder", "cb", "bytes", "best ms", "Mcoeff/s", "frame fps", "med/best"
     );
 
     let mut baseline: Option<f64> = None;
@@ -94,29 +114,31 @@ fn abac_decode_throughput_grid() {
                 bytes = b;
                 times.push(s);
             }
-            let lo = times.iter().cloned().fold(f64::MAX, f64::min);
-            let hi = times.iter().cloned().fold(0.0, f64::max);
+            let best = times.iter().cloned().fold(f64::MAX, f64::min);
             let med = median(times);
-            let frame_fps = 1.0 / (med * 3.0);
+            let frame_fps = 1.0 / (best * 3.0);
             if baseline.is_none() {
-                baseline = Some(med);
+                baseline = Some(best);
             }
             println!(
-                "  {:<10} {:>4} {:>8} {:>10.2} {:>11.1} {:>9.1} {:>7.0}%",
+                "  {:<10} {:>4} {:>8} {:>10.2} {:>11.1} {:>9.1} {:>8.2}x",
                 format!("{coder:?}"),
                 cb,
                 bytes,
-                med * 1e3,
-                mcoeff / med,
+                best * 1e3,
+                mcoeff / best,
                 frame_fps,
-                (hi / lo - 1.0) * 100.0
+                med / best
             );
         }
     }
     println!(
-        "\n  If the spread column is more than ~10% the machine was not idle: discard the absolute\n\
-         numbers. Variants within one row group were timed back-to-back, so their ratio is more\n\
-         robust to load than any single figure.\n"
+        "\n  med/best near 1.0 means the run was settled and the absolute numbers can be quoted.\n\
+         Well above it means the GPU was still ramping or another session was working — the\n\
+         ratios between rows may still hold, since variants were timed back-to-back.\n\
+         Real coefficients decode faster than these synthetic ones (GNC_ABAC_COMPARE=1 on a real\n\
+         encode reports the same measurement on a real frame); use this grid for ratios and that\n\
+         one for absolute figures.\n"
     );
 }
 
@@ -126,7 +148,7 @@ fn abac_decode_throughput_grid() {
 #[test]
 #[ignore = "throughput bench: needs an idle machine, see COORDINATION.md"]
 fn abac_cpu_decode_throughput() {
-    const REPEATS: usize = 5;
+    const REPEATS: usize = 9;
     let (w, h) = (1024usize, 1024);
     let plane = synth_plane(w, h, 13);
     let mcoeff = (w * h) as f64 / 1e6;

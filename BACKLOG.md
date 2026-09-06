@@ -1318,9 +1318,31 @@ non-monotonic, i.e. load rather than coefficient count — so a branch-free 256-
 entropy stage is small and flat, and the estimate sits near the ceiling: **realistically
 ~1.7–1.9× frame decode for ~16.7% of rate.**
 
-**A genuine trade, and not yet a decision.** The measurement that settles it is well defined:
-instrument Rice's entropy dispatch with a GPU timestamp query and the bracket collapses to a
-number. That is the next step.
+**RESOLVED on an idle machine, same day.** `GNC_RICE_DISPATCH_REPEAT=k` issues Rice's entropy
+dispatch k times (it is idempotent, so the slope isolates the stage without timestamp queries):
+29.50 ms at k=1, 85.16 at k=5, 141.55 at k=9 — **14.0 ms per dispatch**, two independent slopes
+agreeing to 0.6%. **Rice's entropy stage is 47% of frame decode**, which is also the ceiling on
+any entropy-coder work here: a free entropy coder would buy 1.9× and no more.
+
+Settled figures (bbb, q=90, cb=64, min and median within 1%): Range entropy **33.0 ms**
+(238.6 Mcoeff/s), Interval **96.3 ms** (81.7). Since `abac_frame = rice_frame − rice_entropy +
+abac_entropy`, the bracket collapses:
+
+| coder | implied frame decode | vs Rice | rate |
+|---|---|---|---|
+| **Range** | 27.5 − 14.0 + 33.0 = **46.5 ms** | **1.69×** | −16.7% mean |
+| Interval | 27.5 − 14.0 + 96.3 = **109.8 ms** | 3.99× | −14.5% |
+
+**The decision is ~16.7% of rate for ~1.65-1.7× frame decode.** A real trade with no obviously
+right answer — it turns on whether GNC sells bitrate or streams-per-GPU, which is
+docs/POSITIONING.md's question, not an engineering one. Recommended configuration if taken up:
+**Range at cb=64**, which dominates every other cell measured.
+
+Also fixed the measurement method itself: three consecutive processes on identical input read
+66.5 / 45.3 / 34.9 ms on an *idle* machine — the GPU's clock ramp, not load. `abac_bench` now uses
+24 dispatches and reports best-of with `med/best` as the settled-or-not diagnostic, and documents
+`--test-threads=1` (its two tests were contending for the GPU). An idle machine is necessary and
+not sufficient.
 
 **Scope warning on an earlier verdict.** A "closed by measurement — do not re-test" note was
 written for abac on the strength of the Interval coder alone, and it was wrong as a statement

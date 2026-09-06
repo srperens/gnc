@@ -146,17 +146,32 @@ impl DecoderPipeline {
             } else {
                 match &frame.entropy {
                     EntropyData::Rice(_) => {
-                        // GPU Rice decode: 256 parallel streams per tile
-                        self.rice_decoder.dispatch_decode(
-                            ctx,
-                            &mut cmd,
-                            &bufs.entropy_params[p],
-                            &bufs.entropy_tile_info[p],
-                            &bufs.entropy_var_a[p],
-                            &bufs.entropy_var_b[p],
-                            &bufs.scratch_a,
-                            p_tiles as u32,
-                        );
+                        // GPU Rice decode: 256 parallel streams per tile.
+                        //
+                        // `GNC_RICE_DISPATCH_REPEAT=k` issues the dispatch k times instead of
+                        // once, purely as a measurement aid: the decode is idempotent (same
+                        // inputs, same output buffer), so frame_time(k) - frame_time(1) divided
+                        // by (k-1) isolates what the entropy stage costs, without needing
+                        // timestamp-query support. That number is what turns "abac's entropy
+                        // stage vs Rice's WHOLE frame" into a like-for-like comparison; without
+                        // it the answer is only bracketed. Defaults to 1 and costs nothing.
+                        let repeats = std::env::var("GNC_RICE_DISPATCH_REPEAT")
+                            .ok()
+                            .and_then(|v| v.parse::<u32>().ok())
+                            .unwrap_or(1)
+                            .max(1);
+                        for _ in 0..repeats {
+                            self.rice_decoder.dispatch_decode(
+                                ctx,
+                                &mut cmd,
+                                &bufs.entropy_params[p],
+                                &bufs.entropy_tile_info[p],
+                                &bufs.entropy_var_a[p],
+                                &bufs.entropy_var_b[p],
+                                &bufs.scratch_a,
+                                p_tiles as u32,
+                            );
+                        }
                     }
                     EntropyData::Rans(_) | EntropyData::SubbandRans(_) => {
                         self.rans_decoder.dispatch_decode(

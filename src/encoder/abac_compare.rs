@@ -277,9 +277,20 @@ fn gpu_decode_report(ctx: &crate::GpuContext, work: &GpuWorkload, coder: Coder, 
     let decoder = GpuAbacDecoder::new(ctx);
     let out_len = work.expected.len();
 
-    // Repeat rather than trust one reading: five sessions share this Mac and the same dispatch
-    // has read 48% apart across runs. The first call also carries pipeline setup.
-    const REPEATS: usize = 7;
+    // Repeat rather than trust one reading, and repeat a lot.
+    //
+    // Measured on an idle machine, three consecutive *processes* on identical input read 66.5,
+    // 45.3 and 34.9 ms — a 1.9x spread, monotonically decreasing. That is the GPU ramping its
+    // clocks, not the coder: a freshly-idle M1 starts at a low power state and takes on the order
+    // of a second of sustained work to boost. Seven dispatches did not outlast the ramp, so the
+    // median was still measuring the ramp.
+    //
+    // Hence 24 dispatches and the **minimum** as the headline. For a deterministic kernel on
+    // fixed input, the minimum is the least-contaminated estimate available — every source of
+    // error here (clock ramp, another session's work, scheduler noise) makes a reading slower,
+    // never faster. The median is kept alongside it as the ramp/contention indicator: min and
+    // median far apart means the machine was not settled.
+    const REPEATS: usize = 24;
     let mut times = Vec::with_capacity(REPEATS);
     for i in 0..=REPEATS {
         let (got, gpu_s) = decoder.decode(ctx, &work.packed, &work.infos, out_len, coder);
@@ -300,16 +311,21 @@ fn gpu_decode_report(ctx: &crate::GpuContext, work: &GpuWorkload, coder: Coder, 
         }
     }
     times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let best = times[0];
     let median = times[times.len() / 2];
     let mc = out_len as f64 / 1e6;
     eprintln!(
-        "  [abac] GPU decode, {coder:?} coder, the SAME real blocks: {} blocks, {:.2} Mcoeff, \
-         median {:.1} ms ({:.1} Mcoeff/s) over {} dispatches [{:.1}-{:.1} ms], all {} \
-         coefficients bit-exact vs the CPU coder. ENTROPY STAGE ONLY — a lower bound; compare \
-         against the whole-frame `Decode:` figure below, which already includes Rice's entropy \
-         stage plus the inverse wavelet and colour transform.",
+        "  [abac] GPU decode, {coder:?} coder, the SAME real blocks: {} blocks, {:.2} Mcoeff. \
+         BEST {:.1} ms ({:.1} Mcoeff/s), median {:.1} ms ({:.1} Mcoeff/s) over {} dispatches \
+         [{:.1}-{:.1} ms]. All {} coefficients bit-exact vs the CPU coder. Best is the headline \
+         (every error source here only slows a reading); median far from best means the GPU was \
+         still ramping or the machine was busy. ENTROPY STAGE ONLY — compare against the \
+         whole-frame `Decode:` figure below, which already includes Rice's entropy stage plus \
+         the inverse wavelet and colour transform.",
         work.infos.len(),
         mc,
+        best * 1e3,
+        mc / best,
         median * 1e3,
         mc / median,
         times.len(),

@@ -6187,3 +6187,64 @@ Monotonic, accumulating, and in the decoder's favour. The output is valid and sl
 the encoder believes, so this is not a correctness failure of the bitstream — but the encoder's
 local decode loop is what rate control and any RD decision reads, and it is wrong by up to a
 quarter of a dB by the end of a GOP. Logged as BUG-8; not diagnosed.
+
+### MEAS-2 continued: CfL earns its keep, AQ had its gradient inverted (again)
+
+#### CfL — the toggle test that would have deleted a working feature
+
+Toggled `cfl_enabled` off (new `GNC_NO_CFL` lever) and measured on VMAF at matched q:
+
+| image | bpp on/off | VMAF on/off |
+|---|---|---|
+| bbb_1080p q=70 | 4.13 / 4.55 | 96.40 / **96.49** |
+| blue_sky q=70 | 3.33 / 3.31 | **96.74** / 96.51 |
+| kristensara q=70 | 2.24 / 2.20 | 96.81 / **96.86** |
+
+Read on VMAF alone that is a loss on two of three images: CfL costs 2-3% more rate on blue_sky and
+kristensara and *loses* VMAF on two. On that evidence a toggle sweep would have deleted it.
+
+**VMAF scores the luma plane only, and CfL is a chroma tool.** VMAF can see the rate CfL spends and
+cannot see what it buys. Re-measured with CIEDE2000 (`scripts/chroma_metric.py`, re-validated
+against all 16 Sharma reference pairs at the start of the run):
+
+| image | CfL on | CfL off, same q | CfL off, q+2 |
+|---|---|---|---|
+| bbb_1080p q=55 | 779 KB, dE00 **0.951** | 854 KB, 1.022 | 889 KB, 0.989 |
+| blue_sky q=55 | 604 KB, dE00 **1.047** | 602 KB, 1.139 | 627 KB, 1.111 |
+| kristensara q=55 | 165 KB, dE00 **1.130** | 161 KB, 1.153 | 169 KB, 1.131 |
+
+CfL is better on both axes at once on bbb — 9% smaller *and* better colour — and on the other two
+it reaches a colour accuracy that costs 3-14% more rate to match without it. It stays.
+
+The lesson is one the repo already wrote down after the `chroma_weight` episode and it still
+caught me: **a toggle measured on the wrong metric reads as dead weight.** Any MEAS-2 toggle that
+touches chroma has to be scored with dE00.
+
+#### AQ — helps at high quality, hurts at low, and the rule had it backwards
+
+BD-rate on VMAF of turning adaptive quantisation *off* (negative means off is better, i.e. AQ was
+costing rate), four images:
+
+| range | bbb | blue_sky | touchdown | kristensara | mean |
+|---|---|---|---|---|---|
+| q=15-30 (was strength 0.3) | +0.92% | **−9.89%** | **−4.21%** | **−5.14%** | **−4.58%** |
+| q=30-55 | +0.06% | −0.42% | −0.06% | +0.38% | −0.01% |
+| q=55-80 | +0.85% | +1.25% | +0.61% | **+4.56%** | **+1.82%** |
+
+AQ helps at high quality and **costs 4.6% of the bitrate at low quality** — where the 2026-09-05
+rule set its strength *highest*. New rule: **off below q=30, strength 0.15 from 30 to 80.**
+Re-verified at that fixed strength: +1.63% mean in 55-80, positive on all four.
+
+Strength barely matters in the upper range: 0.15/0.20/0.30 swept on all four images, every
+difference under 0.07 VMAF and 1.7% bpp. Took the lowest that keeps the benefit.
+
+**Why the disagreement with TUNE-4.** That sweep read point VMAF at fixed q and saw "+0.1 to +0.55
+VMAF for under 1% more rate". Measured as rate at matched quality, the same trade is 4-7% of the
+bitrate on some content, because the RD slope is steep down there — kristensara at q=15 is +0.88
+VMAF for **+7.1% rate**, which reads as a win point-wise and is a clear loss on the curve. This is
+the third time today the same error class has turned up: a point measurement at fixed q cannot
+judge a rate/quality trade, and it always flatters the option that spends more bits.
+
+**And part of it is self-inflicted.** BUG-6 moved q≥25 from 4 wavelet levels to 5 earlier the same
+day, and AQ computes its variance on the LL subband — whose size and content that change alters.
+Any future AQ tuning must be redone after a level change. Noted in the code.

@@ -580,9 +580,27 @@ decisions); re-measured with VMAF it is exactly neutral on old_town and aerial a
 bbb17 (+0.66 VMAF min with it off at q=30). Code retained rather than deleted — 0.1 VMAF margin,
 correct implementation, and a second agent is editing this tree. Delete it if nothing revives it.
 
-Remaining toggles to measure the same way: AQ on/off, CfL on/off, pyramid QP scales, B-pyramid,
-Rice vs rANS at each quality, tile-skip. Each: bpp + VMAF mean + VMAF min at matched q, then
-BD-rate if the point measurement is not decisive.
+**Second: CfL — keeps its place, but only visible with the right metric.** On VMAF alone it reads
+as a loss on two of three images (costs 2-3% rate, loses VMAF). VMAF is luma-only and CfL is a
+chroma tool, so it can see the cost and not the benefit. On CIEDE2000 it is better on both axes at
+once on bbb (9% smaller *and* better colour) and reaches a colour accuracy the others need 3-14%
+more rate to match. **Any MEAS-2 toggle touching chroma must be scored with dE00** — the naive
+sweep would have deleted a working feature.
+
+**Third: AQ — gradient was inverted, now off below q=30.** BD-rate of turning AQ off:
+**−4.58% at q=15-30** (AQ was costing rate where the old rule set its strength highest), −0.01% at
+q=30-55, **+1.82% at q=55-80** (AQ earns its keep). New rule: off below 30, strength 0.15 from 30
+to 80; re-verified +1.63% mean at that strength, positive on all four images. Strength is noise in
+the upper range (0.15/0.20/0.30 all within 0.07 VMAF).
+
+The TUNE-4 disagreement is the same error class as MEAS-4's equal-qstep comparison: point VMAF at
+fixed q read "+0.1 to +0.55 VMAF for under 1% rate", but at matched quality the trade is 4-7% of
+the bitrate. Also partly self-inflicted — BUG-6 changed the wavelet level count at q≥25 the same
+day, and AQ measures variance on the LL subband.
+
+Remaining toggles: pyramid QP scales, B-pyramid, Rice vs rANS at each quality, tile-skip. Each:
+bpp + VMAF mean + VMAF min at matched q, dE00 as well if chroma is involved, then BD-rate if the
+point measurement is not decisive.
 
 ### MEAS-4 — Inter-model gap decomposition (**RE-RUN AND CLOSED 2026-09-06** on clean data)
 Reopened because its residual dumps were taken with `GNC_DIAGNOSTICS=1` (BUG-7), which clobbered

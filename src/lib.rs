@@ -642,22 +642,33 @@ pub fn quality_preset(q: u32) -> CodecConfig {
         .ok()
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(default_levels);
-    let aq_enabled = q <= 80; // AQ helps in lossy range; variance computed on LL subband
-    // Swept 2026-09-05 on bbb, touchdown and kristensara. Below q=30 a strength of 0.3 buys
-    // +0.1 to +0.55 VMAF for under 1% more rate; 0.45 and 0.6 fall back again, so 0.3 is the
-    // peak. From q=40 upward it is neutral or slightly negative, and above q=55 the strength
-    // barely registers at all (±0.03 VMAF). The old rule had the gradient the wrong way round —
-    // the weakest setting where AQ helps most.
+    // AQ from q=30 to q=80, off below. Variance is computed on the LL subband.
+    //
+    // BD-rate on VMAF of turning AQ *off*, four images, measured 2026-09-06 (negative means off
+    // is better, i.e. AQ was costing rate):
+    //
+    //   q=15-30   −4.58% mean  (blue_sky −9.89, kristensara −5.14, touchdown −4.21, bbb +0.92)
+    //   q=30-55   −0.01% mean  — neutral
+    //   q=55-80   +1.82% mean  (kristensara +4.56, blue_sky +1.25, bbb +0.85, touchdown +0.61)
+    //
+    // So AQ helps at high quality and *hurts* at low — the opposite of the 2026-09-05 rule, which
+    // set the strength highest (0.3) exactly where it costs the most. That sweep read point VMAF
+    // at fixed q and saw "+0.1 to +0.55 VMAF for under 1% more rate"; measured as rate at matched
+    // quality the same trade is 4-7% of the bitrate on some content, because the RD slope is
+    // steep down there. A point measurement at fixed q cannot judge a rate/quality trade — the
+    // same error that made MEAS-4 compare at equal qstep.
+    //
+    // Part of the disagreement is self-inflicted and worth noting: BUG-6 moved q>=25 from 4
+    // wavelet levels to 5 the same day, which changes the size and content of the LL subband that
+    // AQ measures variance on. Any future AQ tuning has to be re-done after a level change.
+    let aq_enabled = (30..=80).contains(&q);
     let aq_strength = std::env::var("GNC_AQ_STRENGTH")
         .ok()
         .and_then(|v| v.parse::<f32>().ok())
-        .unwrap_or(if q < 30 {
-            0.3
-        } else if q >= 70 {
-            0.2
-        } else {
-            0.15
-        });
+        // Strength barely registers in 55-80: swept 0.15/0.20/0.30 on all four images and every
+        // difference is under 0.07 VMAF and 1.7% bpp, i.e. noise. Take the lowest that keeps the
+        // benefit, which is also the setting most of the +1.82% above was measured at.
+        .unwrap_or(0.15);
     // Default: uniform weights. Measurement campaign showed "perceptual" weights had the
     // gradient inverted (finest subbands weighted LEAST aggressively), making them worse
     // than uniform on both PSNR and VMAF. Physical weights (correctly reversed) are best
@@ -688,8 +699,9 @@ pub fn quality_preset(q: u32) -> CodecConfig {
         dead_zone,
         wavelet_levels,
         subband_weights: weights,
-        // CfL: use anchor's setting (disabled at q>=99 to avoid chroma artifacts near lossless)
-        cfl_enabled: disc.cfl,
+        // CfL: use anchor's setting (disabled at q>=99 to avoid chroma artifacts near lossless).
+        // GNC_NO_CFL=1 forces it off, for MEAS-2 toggle measurement.
+        cfl_enabled: disc.cfl && std::env::var("GNC_NO_CFL").is_err(),
         // LeGall 5/3 only for lossless (q=100); CDF 9/7 for all lossy
         wavelet_type: if q == 100 {
             WaveletType::LeGall53

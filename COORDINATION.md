@@ -59,6 +59,7 @@ the shared checkout** — no absolute paths, no session ids.
 |---|---|---|
 | `../gnc-abac` | `abac` | **paused, free to take.** Adaptive binary code-block entropy coder (EBCOT follow-up), CPU + GPU. Rate −15 to −25% confirmed, two coder variants behind `GNC_ABAC_CODER`. Blocked only on `cargo test --release --test abac_bench -- --ignored` on an idle machine. |
 | `../gnc-abac` | `abac` | same worktree, now on **BUG-8** — the encoder's local decode diverges from the real decoder down a GOP. |
+| `../gnc-chroma` (scratchpad) | `meas/chroma-alloc` | CHROMA-1 — is GNC's luma/chroma rate split on the frontier? Measurement + `GNC_CHROMA_WEIGHT`, no `src/` changes. Judged on Y-PSNR **and** dE00 at matched rate; never on VMAF. |
 
 ## Timing: the machine is shared, so throughput numbers are not measurable during a session
 

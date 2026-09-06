@@ -474,6 +474,28 @@ been put together. Expect a large part of the remaining 26%.
 isolated gate; the shipped decoder has never been timed, and the machine was too loaded to do it
 (COORDINATION rule 1).
 
+### CHROMA-1 — Is GNC's luma/chroma rate split on the frontier? (todo, P2)
+Falls out of QUAL-1. At rate matched to 1%, GNC beats x264 on dE00 on all three sequences while
+sitting **7.4–8.8 dB behind on luma**. The two codecs allocate rate differently between luma and
+chroma, so part of the +90.5% luma gap may be an allocation *choice* rather than a coding
+efficiency deficit — and allocation is a one-line config change, not a new algorithm.
+
+**Hypothesis (falsifiable):** GNC's `chroma_weight` (1.5 below q=40, tapering to 1.0 at q≥85)
+spends more on chroma than the joint luma/colour optimum. If so, coarsening chroma and spending
+the recovered bits on luma should improve luma at matched total rate.
+
+**Success criterion:** ≥0.5 dB Y-PSNR at matched rate while mean dE00 stays below x264's at that
+rate — i.e. buy luma without surrendering the colour lead, which is a real differentiator
+(docs/POSITIONING.md §4). Below 0.2 dB, reject and record that the default is already on the
+frontier. **If the frontier is flat, that is a useful answer too** — it means the +90.5% is
+genuine coding deficit and intra work is the only route.
+
+**The trap, documented before starting:** this exact knob was swept once on VMAF, looked like a
+free 15% rate saving, and reversed sign once measured with a chroma-aware metric (CLAUDE.md).
+VMAF is luma-only *and* saturated above q=85, so it is doubly blind here. Judge on Y-PSNR and
+CIEDE2000 together, at matched rate — a fixed-q point measurement always flatters whichever arm
+spends more bits.
+
 ### BUG-14 — Huffman's stream mapping has BUG-11 (todo, P4)
 `huffman_encode.wgsl`, `huffman_decode.wgsl` and `huffman_histogram.wgsl` all carry the same
 `thread_id + s * STREAMS_PER_TILE` mapping that BUG-11 fixed in Rice, so a Huffman stream is one

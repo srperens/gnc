@@ -268,7 +268,7 @@ so the inter dead-zone doubling was live where at q=99 it is not. Re-check befor
 byte-identical frames at qstep 0.25 and check whether the reconstruction is bit-exact. That
 separates precision from prediction in one run. Full measurement in RESEARCH_LOG 2026-09-06.
 
-### BUG-11 — Rice's stream mapping hardcodes tile width 256 (todo, **P1**)
+### BUG-11 — Rice's stream mapping hardcoded tile width 256 (**DONE 2026-09-06**)
 Rice maps coefficient *i* to stream `i % 256`. At tile width 256 each stream is exactly one tile
 column, so the previous symbol in a stream is the pixel above — the property the vertical-context
 result (−11.7%) calls free. At any other width the modulus interleaves spatially distant columns
@@ -283,8 +283,31 @@ Two consequences. **Every tile-size experiment in this repo, #47 included, was m
 coder that penalises the larger-tile arm** — those results do not bound what the geometry is worth.
 And any future tile-size change is blocked behind this.
 
-Fix: make the mapping tile-width-aware, so a stream is one column at any width (or a contiguous
-column, if the stream count must stay at 256). Then re-run the tile-size sweep.
+**Fixed 2026-09-06.** Streams now walk the tile in **column-major** order, cut into 256 contiguous
+segments: `j = stream_id * symbols_per_stream + s`, raster index
+`(j % tile_size) * tile_size + j / tile_size`. One expression, uniform in the width, and at 256 px
+a segment is exactly one column so it reduces to the old mapping — **tile 256 output is
+byte-identical at all 12 measured points**, which is both the correctness proof and the reason no
+shipped preset moves.
+
+At tile 512, same q, PSNR delta exactly 0.00 dB (the change touches entropy coding only):
+
+| image | q=75 | q=90 | q=99 |
+|---|---|---|---|
+| bbb | −14.4% | −5.5% | −0.6% |
+| blue_sky | −15.3% | −5.8% | −1.3% |
+| touchdown | −12.9% | −5.6% | −0.5% |
+| kristensara | −18.6% | −7.8% | −0.8% |
+
+Encode/decode agree bit-exactly at tile 128, 256 and 512 (q=100 lossless roundtrip, max error 0).
+
+**The tile-size conclusion reverses, and the prize is ~1%.** 512 now beats 256 on all 12 fixed-q
+points, but BD-rate (q=60–95, PSNR-driven) is **−0.91% mean** — bbb −0.23%, blue_sky −0.84%,
+touchdown −1.99%, kristensara −0.61%. The fixed-q points flatter 512 because its q=75 arm also
+sits 0.03–0.23 dB lower in PSNR. So the *sign* was the coder, as hypothesised, but the geometry
+underneath is worth about 1%, not the ~5% inferred from the rANS arm. **Not changing the default
+tile size for 0.91%** — a 512 px tile quadruples the threadgroup working set and adds latency.
+Full numbers in RESEARCH_LOG, 2026-09-06.
 
 ### ENT-1 — Per-tile frequency tables (**DONE 2026-09-06**)
 Subband-rANS stored each normalised frequency as a flat `u16`, and the tables were **23–26% of
@@ -310,14 +333,32 @@ wrong three times in this repo today.
 **Caveat:** the ABAC track needs no tables at all and measures −19 to −25% against Rice. If it
 clears its GPU throughput gate this work is superseded, and it was built knowing that.
 
-### BUG-12 — `--tile-size` cannot reach its own wavelet-level ceiling (todo, P3)
+**The other half of that 14.2%, measured directly (BUG-11, 2026-09-06).** The 256→512 rANS gain
+was split into ~9 points of table overhead and ~5% of "transform continuity plus length
+amortisation". With Rice's stream mapping fixed, the geometry alone measures **−0.91% BD-rate**
+(bbb −0.23, blue_sky −0.84, touchdown −1.99, kristensara −0.61). So continuity is worth ~1%, not
+~5%, and the tables really were the whole lever — which is what this entry then went and fixed.
+Rice carries no frequency tables, so those figures are independent of the packing above.
+
+### BUG-12 — `--tile-size` could not reach its own wavelet-level ceiling (**DONE 2026-09-06**)
 `quality_preset` ends with `cfg.wavelet_levels = min(levels, cfg.max_wavelet_levels())`, computed
 against the **default** tile size. `main.rs` then sets `config.tile_size = tile_size` from the CLI,
 after the clamp has already run. So `--tile-size 512` is capped at 5 levels though a 512 px tile
 allows 6, and `GNC_WAVELET_LEVELS=6` is silently ignored with it.
 
 Harmless for the shipped presets (256 px everywhere) but it means every past `--tile-size`
-experiment ran with a hidden cap. Fix: re-derive the ceiling after the CLI overrides land.
+experiment ran with a hidden cap.
+
+**Fixed 2026-09-06.** `CodecConfig::set_tile_size()` re-derives the ceiling from a recorded
+`requested_wavelet_levels`, in both directions, and all five call sites in `main.rs` use it instead
+of assigning `tile_size`. `tests/tile_size_levels.rs` pins it, including that the shipped presets
+do not move.
+
+And the level it unlocked is worth nothing: 6 levels against 5 at tile 512 measures **−0.0% to
+−0.5%** of the bits (−0.1% at q=90, where PSNR is identical to 0.00 dB). Consistent with the
+earlier −0.3% note. The q=75 arm is not interpretable — a 6th level shrinks the LL band that
+adaptive quantisation measures variance on, and AQ is active at q=30–80, so PSNR swings by image
+(−1.13 dB bbb, +0.56 dB kristensara). **Closed: deeper decomposition is not a lever.**
 
 ### BUG-13 — intra prediction produced corrupt output (**FIXED 2026-09-06**)
 `GNC_INTRA_PRED=1` (added 2026-09-06 to gate the lossless hypothesis) does not reconstruct
@@ -356,6 +397,17 @@ A second coding path, not a flag. Gate it offline first: run a MED/LOCO-I predic
 in a script and compare the entropy of its residual against GNC's current lossless bitstream. If
 the offline gate does not show most of the 27%, do not build it. Note LOOP.md's warning that
 offline models *understate* the real coder.
+
+### BUG-14 — Huffman's stream mapping has BUG-11 (todo, P4)
+`huffman_encode.wgsl`, `huffman_decode.wgsl` and `huffman_histogram.wgsl` all carry the same
+`thread_id + s * STREAMS_PER_TILE` mapping that BUG-11 fixed in Rice, so a Huffman stream is one
+tile column only at 256 px. Left alone deliberately: Huffman is not a default coder, is capped at
+4 levels, and nothing measures through it. The fix is the same `stream_coeff_index` expression if
+it ever matters.
+
+The rANS fused histogram shader (`quantize_histogram_fused.wgsl`) has the same shape over 32
+streams, but rANS *gains* 14–20% at tile 512, so its ordering is not costing it the same way. Not
+filed as a bug — noted so nobody mistakes it for one.
 
 ### BUG-9 — rANS panics below qstep 1.0 instead of rejecting the configuration (todo, P2)
 Panics with `range start index 4294963272 out of range for slice of length 5242880` at

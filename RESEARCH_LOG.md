@@ -7614,3 +7614,97 @@ hedge on that gate, and it is cheap — about 150 lines confined to `rans.rs`, n
 generation bump. The 25% measurement is worth having either way: it is the reason rANS looked
 weak, and it says the same overhead question should be asked of any coder that ships per-tile
 tables.
+
+## 2026-09-06 — BUG-11 fixed: the tile-size conclusion was the entropy coder all along
+
+**Hypothesis under test.** Rice maps coefficient *i* to stream `i % 256`. At tile width 256 each
+stream is exactly one tile column, so the previous symbol in a stream is the coefficient directly
+above — the vertical adjacency the adaptive *k* and the zero runs are tuned against. At any other
+width the modulus interleaves spatially distant columns into one stream. If that is the whole
+story, making the mapping width-aware should recover the loss, and the recorded "256 px is a local
+optimum, twelve of twelve points favour it" should reverse.
+
+**Falsifiable prediction, stated before measuring:** tile 256 output stays *byte-identical* (the
+new mapping must reduce to the old one there), and tile 512 loses much less or turns positive. If
+256 moved by a single byte, the implementation was wrong, not the idea.
+
+**The fix.** Streams now walk the tile in **column-major** order, cut into 256 contiguous
+segments — `j = stream_id * symbols_per_stream + s`, then raster index
+`(j % tile_size) * tile_size + j / tile_size`. One expression, uniform in the width:
+
+| tile | old: stream = | new: stream = |
+|---|---|---|
+| 128 | one column, alternate rows | half a column, contiguous |
+| **256** | **one column** | **one column (identical)** |
+| 512 | two columns 256 px apart, interleaved | two adjacent columns, walked down |
+
+`src/encoder/rice.rs` (`stream_coeff_index`), `src/shaders/rice_encode.wgsl`,
+`src/shaders/rice_decode.wgsl`. Measured in a worktree pinned to `1ed593a` (COORDINATION rule 0),
+own `target/`, padding-neutral centre crops of 1536x1024 (1024x512 for kristensara) which divide
+exactly by 128, 256 and 512, `GNC_WAVELET_LEVELS=5` pinned so BUG-12's hidden cap is not a
+confound.
+
+### The prediction held on both halves
+
+**Tile 256 is byte-identical at all 12 points** — 4 images x q=75/90/99, same file sizes to the
+byte. The reduction property is exact, so no shipped preset moves and BASELINE.md is untouched.
+
+**Tile 512, same q, PSNR delta exactly 0.00 dB everywhere** (the change touches only entropy
+coding, never reconstruction — so fixed-q *is* a valid comparison here):
+
+| image | q=75 | q=90 | q=99 |
+|---|---|---|---|
+| bbb | **−14.4%** | −5.5% | −0.6% |
+| blue_sky | **−15.3%** | −5.8% | −1.3% |
+| touchdown | **−12.9%** | −5.6% | −0.5% |
+| kristensara | **−18.6%** | −7.8% | −0.8% |
+
+The gain shrinks with q because at q=99 almost nothing is zero, so the mixture the adaptive *k*
+was tracking barely costs anything. It is largest exactly where the old measurement found its
+"+15% to +22% Rice penalty".
+
+### The recorded conclusion reverses — and the prize is 1%, not 5%
+
+512 now beats 256 on **all 12 fixed-q points**, by 0.8% to 5.0%. But those points flatter it: at
+q=75 the 512 arm also sits 0.03–0.23 dB *lower* in PSNR, so part of that saving is quality, not
+efficiency. BD-rate over q=60/70/80/90/95, PSNR-driven, is the honest figure:
+
+| image | BD-rate, 512 vs 256 | overlap |
+|---|---|---|
+| bbb | −0.23% | 42.4–54.3 dB |
+| blue_sky | −0.84% | 42.9–54.3 dB |
+| touchdown | −1.99% | 41.1–54.0 dB |
+| kristensara | −0.61% | 42.2–54.0 dB |
+| **mean** | **−0.91%** | |
+
+So: **the sign of the tile-size effect was the coder, exactly as BUG-11 predicted, but the
+geometry underneath it is worth about 1%, not the ~5% inferred from the rANS arm.** Both halves of
+the old entry need correcting — its conclusion ("both directions are worse, 256 is a local
+optimum") was an artefact, and the ~5% it attributed to transform continuity was itself measured
+through the same broken arm.
+
+**This independently confirms ENT-1's priority.** ENT-1 split the rANS 512 gain into ~9 points of
+per-tile table overhead and ~5% of "transform continuity plus length amortisation". Measured
+directly with the coder fixed, continuity is worth 0.91%. The tables are the lever; the geometry
+is not. **Do not change the default tile size for 0.91%** — a 512 px tile quadruples the
+threadgroup working set and adds latency, and GOALS' "would we ship this?" says no.
+
+**Correctness.** Encode and decode agree bit-exactly at tile 128, 256 and 512: q=100 lossless
+roundtrip on two images, max error 0, zero mismatched pixels. That is the canary — an
+encoder/decoder disagreement about the mapping would break lossless first and loudest.
+
+### Also fixed: BUG-12, the hidden level cap
+
+`quality_preset` clamped `wavelet_levels` against the **default** tile size; `main.rs` applied
+`--tile-size` afterwards. So `--tile-size 512` ran at 5 levels where 512 allows 6, and
+`GNC_WAVELET_LEVELS=6` was silently discarded with it. `CodecConfig::set_tile_size()` now
+re-derives the ceiling from the recorded request, in both directions, and all five call sites use
+it. `tests/tile_size_levels.rs` pins the behaviour, including that the shipped presets do not move.
+
+### Still broken, filed not fixed
+
+The Huffman shaders (`huffman_encode.wgsl`, `huffman_decode.wgsl`, `huffman_histogram.wgsl`) carry
+the identical `thread_id + s * STREAMS_PER_TILE` mapping and the identical bug. Huffman is not a
+default coder and is capped at 4 levels, so it was left alone — filed as BUG-14. The rANS fused
+histogram shader has the same shape over 32 streams, but rANS *gains* at 512, so its ordering is
+not costing it the same way; not filed as a bug.

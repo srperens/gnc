@@ -207,6 +207,66 @@ def rice_zrl_split_bits(coef, nstreams=256):
     return total
 
 
+def context_coefficient_bits(coef, table_bits=8.0, nctx_mag=4):
+    """Conditional entropy of the whole quantised coefficient given a neighbourhood context.
+
+    This is the cheap alternative to EBCOT: keep coding coefficients as symbols (which is what
+    GNC's rANS backend already does with per-subband frequency tables) and condition the table on
+    a context instead. No bit-planes, no MQ coder, no three passes — the existing interleaved
+    rANS machinery with more tables.
+
+    Context = bucketed sum of the absolute values of the four causal neighbours (left, up,
+    up-left, up-right), which is available to a decoder in raster order.
+    """
+    a = np.abs(coef).astype(np.int64)
+    p = np.pad(a, 1)
+    nb = p[1:-1, :-2] + p[:-2, 1:-1] + p[:-2, :-2] + p[:-2, 2:]
+    # Bucket: 0, 1, 2-3, 4-7, 8+  (five buckets; nctx_mag controls the log spread)
+    ctx = np.zeros_like(nb)
+    ctx = np.where(nb == 0, 0, np.minimum(np.log2(np.maximum(nb, 1)).astype(np.int64) + 1, nctx_mag + 1))
+    total = 0.0
+    v = coef.astype(np.int64).ravel()
+    c = ctx.ravel()
+    for cc in np.unique(c):
+        m = c == cc
+        vals = v[m]
+        _, counts = np.unique(vals, return_counts=True)
+        pr = counts / counts.sum()
+        total += float(-(pr * np.log2(pr)).sum() * vals.size)
+        # Each context needs its own frequency table. rANS pays for these: charge the alphabet.
+        total += float(counts.size) * table_bits
+    return total
+
+
+def vertical_context_bits(coef, table_bits=8.0):
+    """Context from the vertical neighbours only — the ones GNC can already reach.
+
+    Rice and rANS map coefficient `i` of a tile to stream `i % STREAMS_PER_TILE`, so with 256
+    streams in a 256-wide tile **each stream is one column**: consecutive symbols within a stream
+    are vertically adjacent. The row above is therefore already decoded when the current symbol is
+    decoded, in the existing architecture, with no restructuring at all. The horizontal neighbours
+    live in sibling streams decoded concurrently and are not available.
+
+    So this is the context GNC can have for free, as opposed to the full neighbourhood which needs
+    EBCOT's per-code-block sequential model.
+    """
+    a = np.abs(coef).astype(np.int64)
+    up1 = np.vstack([np.zeros((1, a.shape[1]), dtype=np.int64), a[:-1]])
+    up2 = np.vstack([np.zeros((2, a.shape[1]), dtype=np.int64), a[:-2]])
+    nb = up1 * 2 + up2
+    ctx = np.where(nb == 0, 0, np.minimum(np.log2(np.maximum(nb, 1)).astype(np.int64) + 1, 5))
+    total = 0.0
+    v = coef.astype(np.int64).ravel()
+    c = ctx.ravel()
+    for cc in np.unique(c):
+        vals = v[c == cc]
+        _, counts = np.unique(vals, return_counts=True)
+        pr = counts / counts.sum()
+        total += float(-(pr * np.log2(pr)).sum() * vals.size)
+        total += float(counts.size) * table_bits
+    return total
+
+
 def h0_bits(coef):
     v = coef.astype(np.int64).ravel()
     _, counts = np.unique(v, return_counts=True)
@@ -221,6 +281,13 @@ def main():
     ap.add_argument("--qstep", type=float, nargs="*", default=[4.0, 8.0, 16.0])
     ap.add_argument("--dead-zone", type=float, default=0.75)
     ap.add_argument("--crop", type=int, nargs=2, default=[1792, 1024])
+    ap.add_argument(
+        "--table-bits",
+        type=float,
+        default=8.0,
+        help="bits charged per alphabet symbol per context for the frequency table. The gain is "
+        "sensitive to this and rANS already loses to Rice on table cost, so sweep it.",
+    )
     args = ap.parse_args()
 
     from PIL import Image
@@ -241,19 +308,24 @@ def main():
     print(f"\n=== EBCOT context-coding ceiling: {os.path.basename(args.png)} "
           f"({args.levels} levels) ===")
     print(f"  {'qstep':>6} {'rice split':>11} {'rice 1-stream':>14} {'H0':>8} "
-          f"{'ebcot':>8} {'+KT':>8} {'vs split':>10} {'vs 1-str':>9}")
+          f"{'ebcot':>8} {'+KT':>8} {'ebcot vs':>10} {'full-ctx':>10} {'full vs':>10} "
+          f"{'vert-ctx':>9} {'vert vs':>9}")
     for q in args.qstep:
-        rs = r = h = e = ep = 0.0
+        rs = r = h = e = ep = cc = vc = 0.0
         for bid, (nm, band, orient) in enumerate(named):
             qq = quantize(band * g[nm], q, args.dead_zone).astype(np.int64)
             rs += rice_zrl_split_bits(qq)
             r += rice_zrl_bits(qq)
             h += h0_bits(qq)
+            cc += context_coefficient_bits(qq, args.table_bits)
+            vc += vertical_context_bits(qq, args.table_bits)
             a, b = band_bits(qq, orient, bid)
             e += a
             ep += b
+        globals()["_ctx_coef_bpp"] = cc / px
         print(f"  {q:>6.1f} {rs/px:>11.4f} {r/px:>14.4f} {h/px:>8.4f} "
-              f"{e/px:>8.4f} {ep/px:>8.4f} {(ep/rs-1)*100:>+9.1f}% {(ep/r-1)*100:>+8.1f}%")
+              f"{e/px:>8.4f} {ep/px:>8.4f} {(ep/rs-1)*100:>+9.1f}% "
+              f"{cc/px:>10.4f} {(cc/rs-1)*100:>+9.1f}% {vc/px:>9.4f} {(vc/rs-1)*100:>+8.1f}%")
     print()
     print("  'rice split' is what GNC really codes: 256 independent streams per tile.")
     print("  'rice 1-stream' is one stream per subband — an idealised Rice that shares runs and")

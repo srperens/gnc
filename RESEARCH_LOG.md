@@ -6537,3 +6537,87 @@ the stream-split measurement above shows independence costs almost nothing.
   coder. An MQ coder is serial within a code-block. Blocks are independent so the parallelism is
   there in principle, but the per-symbol cost is much higher and this measurement says nothing
   about fps.
+
+### EBCOT part 2, continued: why the bit-planes are there after all
+
+The result above — that context-conditioned *symbol* coding beats EBCOT's bit-plane coding by
+roughly 2x — looked like an argument for skipping the bit-planes. It is not, and finding out why
+explains EBCOT's design.
+
+#### The free context: each of GNC's 256 streams is a tile column
+
+`rice_encode.wgsl` maps coefficient *i* of a tile to stream `i % 256`. In a 256-wide tile that
+makes **each stream exactly one column**, so consecutive symbols within a stream are vertically
+adjacent and the row above is already decoded when the current symbol is. A vertical context is
+therefore available in the *existing* architecture with no restructuring. The horizontal neighbours
+sit in sibling streams decoded concurrently and are not available without EBCOT's per-code-block
+sequential model.
+
+At qstep 4 (the rate matching GNC's real luma operating point), against GNC's own coder:
+
+| image | EBCOT as specified | full neighbourhood | **vertical only** |
+|---|---|---|---|
+| touchdown_1080p | −0.1% | −9.8% | −7.7% |
+| bbb_1080p | −6.2% | −14.4% | −9.8% |
+| kristensara_720p | −15.0% | −19.3% | −14.3% |
+| blue_sky_1080p | −15.6% | −22.0% | −15.1% |
+| mean | **−9.2%** | **−16.4%** | **−11.7%** |
+
+The vertical-only context, which costs nothing architecturally, beats full EBCOT.
+
+#### And then the table cost eats it
+
+Those figures charge 8 bits per alphabet symbol per context for the frequency tables. Sweeping that
+charge, mean over bbb, blue_sky and touchdown at qstep 4:
+
+| bits per symbol per context | mean gain |
+|---|---|
+| 8 | −10.9% |
+| 16 | −8.6% |
+| 32 | −4.0% |
+| 64 | **+5.1%** — a loss |
+
+The gain collapses between 32 and 64 bits and flips sign. And GNC's rANS carries **static** tables
+signalled per tile: a vertical context with 6 buckets multiplies its table count from 10 per tile
+to 60. rANS already loses to Rice above q=25 *because of* per-group table cost (measured earlier
+today: +8% to +32%). Multiplying the tables by six makes that far worse.
+
+#### Which is exactly what EBCOT's design is for
+
+An adaptive binary arithmetic coder carries **no tables at all**. Contexts adapt as the decoder
+decodes, so the signalling cost is zero and only a small learning cost remains — the KT term in the
+ebcot column above, which is negligible at these symbol counts. To use a binary adaptive coder you
+need binary decisions, and turning a multi-symbol coefficient into binary decisions is precisely
+what bit-plane decomposition does.
+
+So the bit-planes are not there for truncatability alone (part 1 showed truncatability is worth
+0.00 dB here). **They are there so the contexts can be free.** EBCOT pays about 7 percentage points
+of coding efficiency for that, and gets to spend it on contexts that would otherwise be
+unaffordable. The 2x advantage of symbol-level context coding is real but it is priced in a currency
+GNC cannot pay.
+
+#### Corrected recommendation
+
+Build an **adaptive binary context coder**, which is most of EBCOT's machinery. But choose the
+context set and scan for GNC's layout rather than copying JPEG 2000's:
+
+- GNC's column-per-stream mapping makes the *vertical* neighbourhood free and the horizontal
+  neighbourhood expensive; JPEG 2000's code-blocks make both available and cost the parallelism.
+  The context table should be built around what GNC can reach.
+- Richer context than significance-only is available: the vertical measurement above conditions on
+  the *magnitudes* of the two coefficients above, not just whether they are significant, and that
+  is where its advantage over EBCOT's model comes from.
+- Skip PCRD entirely. Part 1: 0.00 dB, at any granularity.
+
+Expected landing zone: between −9.2% (EBCOT's own contexts, adaptive, free tables) and −11.7%
+(vertical magnitude context, if it can be made adaptive at similar cost). Not the −16.4% of the
+full neighbourhood, which needs the code-block restructuring and would cost the 256-way decode.
+
+#### What is still unmeasured
+
+The decisive number for the corrected plan — a bit-plane coder with GNC's *vertical magnitude*
+context, adaptive, no tables — has not been measured. It is a small extension of the existing
+script and should be the next step before any code is written. Everything above is a ceiling on
+conditional entropy and says nothing about decode throughput, which is the other axis a
+contribution codec is judged on: an MQ coder is serial within a stream and far costlier per symbol
+than Rice.

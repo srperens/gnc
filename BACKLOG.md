@@ -624,9 +624,36 @@ nine orientation-separated zero-coding contexts plus sign and refinement context
 bit-plane. The old figure correctly measured a much weaker model and was read as a verdict on
 context modelling in general.
 
-**Build as a fourth `EntropyCoder` variant**, measured against Rice at every quality and shipped
-only if it wins — the same gate the other three passed. Not small: three passes per bit-plane, an
-MQ arithmetic coder, per-code-block state.
+**Corrected 2026-09-06 after measuring the table cost — build an adaptive binary context coder,
+not JPEG 2000's EBCOT verbatim.**
+
+GNC's 256 streams map coefficient *i* to stream `i % 256`, so in a 256-wide tile **each stream is
+one tile column**: the vertical neighbour is already decoded, free, in the current architecture. A
+vertical-magnitude context measures **−11.7% mean** at qstep 4 — better than EBCOT's own
+significance-only contexts (−9.2%) and needing no restructuring. The full neighbourhood is −16.4%
+but needs EBCOT's per-code-block sequential model, which costs the 256-way decode.
+
+**But the whole gain depends on table cost, and that is why bit-planes exist.** Charging table bits
+per alphabet symbol per context, mean at qstep 4: 8 bits → −10.9%, 16 → −8.6%, 32 → −4.0%,
+**64 → +5.1%, a loss.** GNC's rANS signals *static* tables per tile, and a 6-bucket context
+multiplies its table count from 10 to 60 — while rANS already loses to Rice above q=25 *because of*
+per-group table cost (+8% to +32%, measured today).
+
+An adaptive binary arithmetic coder carries no tables at all: contexts adapt as the decoder
+decodes. To use one you need binary decisions, and that is what bit-plane decomposition is for. So
+the bit-planes are not (here) about truncatability — part 1 measured that at 0.00 dB — **they are
+what makes the contexts affordable.** EBCOT pays ~7 points of coding efficiency to get contexts for
+free.
+
+Plan: adaptive binary coder, bit-planes, **GNC's vertical magnitude context rather than JPEG 2000's
+neighbourhood**, no PCRD. Expected −9% to −12%. Ship as a fourth `EntropyCoder` variant, gated and
+measured against Rice at every quality like the other three.
+
+**Next step before writing code:** measure a bit-plane coder with the vertical magnitude context,
+adaptive and table-free. That exact configuration is unmeasured and it is a small extension of
+`meas_ebcot_context.py`. Also unmeasured: decode throughput. An MQ coder is serial within a stream
+and far costlier per symbol than Rice, and throughput is the other axis a contribution codec is
+judged on.
 
 **Ceiling excludes:** the MQ coder's own adaptation loss (real coders land a couple of percent
 above conditional entropy), per-code-block length/pass overheads (GNC's equivalent is 4-5% of a

@@ -1071,8 +1071,23 @@ because the divergence is data-dependent**, every lane's renormalisation loop ru
 number of iterations per symbol. In hindsight this is exactly why Rice uses 256 branch-free
 streams per tile.
 
-**Timing caveat:** five sessions were on this machine and the numbers moved 20% between runs. The
-ordering is robust, the absolute values are not.
+**Timing is not currently measurable.** Three targeted optimisations — context scratch into
+workgroup memory, blocks sorted by size for SIMD-group uniformity, and thread-interleaved
+workgroup arrays to kill a 32-way bank conflict — all returned *nothing*, while the same input
+timed 25.2 / 31.1 / 37.5 ms across runs. A 48% spread on identical work with five sessions
+hammering the GPU means the figures above are an order of magnitude and no finer, and those three
+optimisations are untested rather than disproven. Re-time on an idle machine before touching the
+shader again; optimising against noise produces changes that look justified and are not.
+
+**Diagnosis narrowed by MEAS 75ca12b.** A trivially parallel shader does 7.86 M elements in
+1.02 ms, and a wavefront *dependency* costs only 4.9×. So a serial dependency is cheap and abac's
+problem is not that it has one. The difference is shape: a wavefront keeps 256 threads progressing
+in lockstep, abac gives one thread 4096 sequential symbols with 31 lanes idle. That points at
+per-symbol instruction count on a single lane — three context-coded decisions per coefficient,
+each with a variable-length renormalisation loop — rather than memory behaviour, which is what all
+three failed optimisations targeted. **The structural fix to try: replace the renormalisation loop
+with a fixed-cost table lookup, as VP8's bool decoder does.** Coder-core rewrite, not a shader
+tweak; the 16-bit interval work is a prerequisite either way.
 
 **Three things would change the answer**, in order of leverage: (1) re-time on an idle machine —
 cheapest and unambiguous; (2) a table-driven binary coder with fixed per-symbol cost instead of a

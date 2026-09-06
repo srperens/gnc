@@ -45,6 +45,10 @@ import numpy as np
 # that entirely and measures the coding, not the conversion.
 REFERENCE = [None]
 PIX_FMT = ["yuv420p"]
+# Bit depth of the whole comparison. 10-bit needs `-strict -1` on every ffmpeg *output* (the
+# 10-bit Y4M colourspaces are not "official"), x264's --input-depth/--output-depth/--profile,
+# and GNC's --bit-depth. vmaf scores 10-bit Y4M directly.
+DEPTH = [8]
 
 
 def sh(cmd, **kw):
@@ -96,19 +100,28 @@ def bd_rate(rate_a, q_a, rate_b, q_b):
     return (10 ** ((ib - ia) / (hi - lo)) - 1) * 100, (lo, hi)
 
 
+def strictly(args):
+    """ffmpeg refuses the 10-bit Y4M colourspaces without -strict -1 on the output."""
+    return args + (["-strict", "-1"] if DEPTH[0] == 10 else [])
+
+
+def png_fmt():
+    return "rgb48le" if DEPTH[0] == 10 else "rgb24"
+
+
 def normalise_source(src, work, n, pix_fmt="yuv420p"):
     """Decode the source once to PNG and back, giving one canonical reference for everything."""
     pngdir = os.path.join(work, "ref_png")
     os.makedirs(pngdir, exist_ok=True)
     if not os.path.exists(os.path.join(pngdir, "0000.png")):
         sh(["ffmpeg", "-nostdin", "-y", "-loglevel", "error", "-i", src,
-            "-frames:v", str(n), "-start_number", "0",
+            "-frames:v", str(n), "-start_number", "0", "-pix_fmt", png_fmt(),
             os.path.join(pngdir, "%04d.png")])
     ref_y4m = os.path.join(work, f"reference_{pix_fmt}.y4m")
     if not os.path.exists(ref_y4m):
-        sh(["ffmpeg", "-nostdin", "-y", "-loglevel", "error", "-start_number", "0",
-            "-i", os.path.join(pngdir, "%04d.png"), "-pix_fmt", pix_fmt,
-            "-f", "yuv4mpegpipe", ref_y4m])
+        sh(strictly(["ffmpeg", "-nostdin", "-y", "-loglevel", "error", "-start_number", "0",
+                     "-i", os.path.join(pngdir, "%04d.png"), "-pix_fmt", pix_fmt])
+           + ["-f", "yuv4mpegpipe", ref_y4m])
     return pngdir, ref_y4m
 
 
@@ -116,7 +129,8 @@ def run_gnc(src, work, n, ki, q, chroma, gnc_bin):
     tag = f"gnc_q{q}"
     gnv = os.path.join(work, f"{tag}.gnv2")
     r = sh([gnc_bin, "benchmark-sequence", "-i", src, "-n", str(n), "-k", str(ki),
-            "-q", str(q), "--chroma-format", chroma, "-o", gnv],
+            "-q", str(q), "--chroma-format", chroma, "-o", gnv]
+           + (["--bit-depth", "10"] if DEPTH[0] == 10 else []),
            env={**os.environ, "GNC_REF_DEBLOCK": "0"})
     if not os.path.exists(gnv):
         print(f"    gnc encode failed at q={q}: {r.stderr.strip()[:200]}", file=sys.stderr)
@@ -127,8 +141,9 @@ def run_gnc(src, work, n, ki, q, chroma, gnc_bin):
     os.makedirs(pngdir, exist_ok=True)
     sh([gnc_bin, "decode-sequence", "-i", gnv, "-o", os.path.join(pngdir, "%04d.png")])
     dist = os.path.join(work, f"{tag}.y4m")
-    sh(["ffmpeg", "-nostdin", "-y", "-loglevel", "error", "-i",
-        os.path.join(pngdir, "%04d.png"), "-pix_fmt", PIX_FMT[0], "-f", "yuv4mpegpipe", dist])
+    sh(strictly(["ffmpeg", "-nostdin", "-y", "-loglevel", "error", "-i",
+                 os.path.join(pngdir, "%04d.png"), "-pix_fmt", PIX_FMT[0]])
+       + ["-f", "yuv4mpegpipe", dist])
     shutil.rmtree(pngdir, ignore_errors=True)
     if not os.path.exists(dist):
         return None
@@ -141,15 +156,18 @@ def run_gnc(src, work, n, ki, q, chroma, gnc_bin):
 def run_x264(src, work, n, ki, crf, extra):
     tag = f"x264_crf{crf}"
     bs = os.path.join(work, f"{tag}.264")
-    csp = ["--output-csp", "i444"] if PIX_FMT[0] == "yuv444p" else []
+    csp = ["--output-csp", "i444"] if PIX_FMT[0].startswith("yuv444") else []
+    if DEPTH[0] == 10:
+        csp += ["--input-depth", "10", "--output-depth", "10",
+                "--profile", "high444" if PIX_FMT[0].startswith("yuv444") else "high10"]
     sh(["x264", "--crf", str(crf), "--frames", str(n), "--keyint", str(ki),
         "--tune", "psnr", *csp, *extra, "-o", bs, src])
     if not os.path.exists(bs):
         return None
     size = os.path.getsize(bs)
     dist = os.path.join(work, f"{tag}.y4m")
-    sh(["ffmpeg", "-nostdin", "-y", "-loglevel", "error", "-i", bs,
-        "-pix_fmt", PIX_FMT[0], "-f", "yuv4mpegpipe", dist])
+    sh(strictly(["ffmpeg", "-nostdin", "-y", "-loglevel", "error", "-i", bs,
+                 "-pix_fmt", PIX_FMT[0]]) + ["-f", "yuv4mpegpipe", dist])
     if not os.path.exists(dist):
         return None
     v = vmaf_score(REFERENCE[0], dist)
@@ -164,6 +182,8 @@ def main():
     ap.add_argument("--frames", type=int, default=17)
     ap.add_argument("--keyint", type=int, default=9)
     ap.add_argument("--chroma", default="420", help="420 or 444; sets both codecs and the reference")
+    ap.add_argument("--depth", type=int, default=8, choices=(8, 10),
+                    help="bit depth of the whole comparison; 10 needs 10-bit source material")
     ap.add_argument("--q", default="25,40,55,70,85")
     ap.add_argument("--crf", default="18,23,28,33,38")
     ap.add_argument("--gnc", default="./target/release/gnc")
@@ -176,14 +196,16 @@ def main():
     px = w * h * args.frames
     work = args.workdir or tempfile.mkdtemp(prefix="meas1_")
     os.makedirs(work, exist_ok=True)
-    PIX_FMT[0] = "yuv444p" if args.chroma == "444" else "yuv420p"
+    DEPTH[0] = args.depth
+    base = "yuv444p" if args.chroma == "444" else "yuv420p"
+    PIX_FMT[0] = base + ("10le" if args.depth == 10 else "")
     ref_pngs, ref_y4m = normalise_source(args.src, work, args.frames, PIX_FMT[0])
     REFERENCE[0] = ref_y4m
     gnc_input = os.path.join(ref_pngs, "%04d.png")
 
     name = args.label or os.path.basename(args.src)
     print(f"\n=== MEAS-1 {name} — {w}x{h}, {args.frames} frames, ki={args.keyint}, "
-          f"chroma {args.chroma} ===")
+          f"chroma {args.chroma}, {args.depth}-bit ===")
 
     rows = []
     print(f"\n  {'codec':6} {'setting':>8} {'bpp':>9} {'VMAF':>8} {'PSNR-Y':>8}")

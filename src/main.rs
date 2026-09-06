@@ -46,6 +46,8 @@ enum Y4mChroma {
 }
 
 struct Y4mReader {
+    /// Bits per sample in the file: 8, or 10 for C420p10 / C444p10.
+    bit_depth: u32,
     reader: std::io::BufReader<std::fs::File>,
     pub width: u32,
     pub height: u32,
@@ -77,6 +79,7 @@ impl Y4mReader {
         let mut fps_num = 30u32;
         let mut fps_den = 1u32;
         let mut chroma = Y4mChroma::C420;
+        let mut bit_depth: u32 = 8;
 
         for token in header.split_ascii_whitespace().skip(1) {
             match token.chars().next() {
@@ -91,19 +94,25 @@ impl Y4mReader {
                 }
                 Some('C') => {
                     let fmt = &token[1..];
-                    // Strip optional bit-depth suffix (e.g. "420p10" → "420")
                     let fmt_base = fmt.trim_start_matches(|c: char| !c.is_ascii_digit());
                     chroma = if fmt_base.starts_with("444") {
                         Y4mChroma::C444
                     } else {
                         Y4mChroma::C420 // default; 420jpeg / 420mpeg2 / plain 420
                     };
+                    // The bit-depth suffix ("420p10", "444p10") used to be stripped and
+                    // discarded, so a 10-bit file was read as 8-bit — half the samples, and
+                    // noise out. Keep it: 10-bit samples are two little-endian bytes each.
+                    bit_depth = match fmt_base.split('p').nth(1) {
+                        Some(d) => d.parse().unwrap_or(8),
+                        None => 8,
+                    };
                 }
                 _ => {}
             }
         }
         assert!(width > 0 && height > 0, "Y4M header missing W/H");
-        Y4mReader { reader, width, height, fps_num, fps_den, chroma }
+        Y4mReader { reader, width, height, fps_num, fps_den, chroma, bit_depth }
     }
 
     /// Read one frame and return interleaved RGB f32 (0-255), or None at EOF.
@@ -128,33 +137,39 @@ impl Y4mReader {
 
         let w = self.width as usize;
         let h = self.height as usize;
-
-        // Read luma plane (Y): w*h bytes
         let y_size = w * h;
-        let mut y_plane = vec![0u8; y_size];
-        self.reader
-            .read_exact(&mut y_plane)
-            .expect("Y4M: truncated Y plane");
 
-        // Read chroma planes (Cb, Cr)
+        // Read one plane as f32 on the 0-255 scale, whatever the file's bit depth. 10-bit
+        // samples are two little-endian bytes and are divided by 4 so the BT.601 conversion
+        // below — written against 8-bit ranges — stays correct while keeping the extra
+        // precision in the fractional part.
+        let depth = self.bit_depth;
+        let mut read_plane = |count: usize, what: &str| -> Vec<f32> {
+            if depth > 8 {
+                let mut raw = vec![0u8; count * 2];
+                self.reader
+                    .read_exact(&mut raw)
+                    .unwrap_or_else(|_| panic!("Y4M: truncated {what} plane"));
+                let scale = 1.0f32 / (1u32 << (depth - 8)) as f32;
+                raw.chunks_exact(2)
+                    .map(|c| u16::from_le_bytes([c[0], c[1]]) as f32 * scale)
+                    .collect()
+            } else {
+                let mut raw = vec![0u8; count];
+                self.reader
+                    .read_exact(&mut raw)
+                    .unwrap_or_else(|_| panic!("Y4M: truncated {what} plane"));
+                raw.into_iter().map(f32::from).collect()
+            }
+        };
+
+        let y_plane = read_plane(y_size, "Y");
         let (cb_plane, cr_plane) = match self.chroma {
             Y4mChroma::C420 => {
-                let uv_w = w.div_ceil(2);
-                let uv_h = h.div_ceil(2);
-                let uv_size = uv_w * uv_h;
-                let mut cb = vec![0u8; uv_size];
-                let mut cr = vec![0u8; uv_size];
-                self.reader.read_exact(&mut cb).expect("Y4M: truncated Cb plane");
-                self.reader.read_exact(&mut cr).expect("Y4M: truncated Cr plane");
-                (cb, cr)
+                let uv_size = w.div_ceil(2) * h.div_ceil(2);
+                (read_plane(uv_size, "Cb"), read_plane(uv_size, "Cr"))
             }
-            Y4mChroma::C444 => {
-                let mut cb = vec![0u8; y_size];
-                let mut cr = vec![0u8; y_size];
-                self.reader.read_exact(&mut cb).expect("Y4M: truncated Cb plane");
-                self.reader.read_exact(&mut cr).expect("Y4M: truncated Cr plane");
-                (cb, cr)
-            }
+            Y4mChroma::C444 => (read_plane(y_size, "Cb"), read_plane(y_size, "Cr")),
         };
 
         // Convert YCbCr → RGB f32 (0-255), BT.601 limited-range (studio swing).
@@ -167,18 +182,18 @@ impl Y4mReader {
         let mut rgb = vec![0.0f32; w * h * 3];
         for row in 0..h {
             for col in 0..w {
-                let y_val = y_plane[row * w + col] as f32;
+                let y_val = y_plane[row * w + col];
                 let (cb_val, cr_val) = match self.chroma {
                     Y4mChroma::C444 => {
                         let idx = row * w + col;
-                        (cb_plane[idx] as f32, cr_plane[idx] as f32)
+                        (cb_plane[idx], cr_plane[idx])
                     }
                     Y4mChroma::C420 => {
                         let uv_w = w.div_ceil(2);
                         let uv_row = row / 2;
                         let uv_col = col / 2;
                         let idx = uv_row * uv_w + uv_col;
-                        (cb_plane[idx] as f32, cr_plane[idx] as f32)
+                        (cb_plane[idx], cr_plane[idx])
                     }
                 };
                 let yy = 1.164_f32 * (y_val - 16.0);
@@ -534,6 +549,11 @@ enum Command {
         /// Tile size in pixels (default 256).
         #[arg(long, default_value = "256")]
         tile_size: u32,
+
+        /// Bit depth to encode at (8 or 10). Default: 8. A 10-bit Y4M source is read at its own
+        /// depth regardless; this selects what the codec encodes and stores.
+        #[arg(long, default_value = "8")]
+        bit_depth: u32,
     },
 
     /// Encode a sequence of image frames into a .gnv container
@@ -1411,6 +1431,7 @@ fn main() {
             vmaf,
             chroma_format,
             tile_size,
+            bit_depth,
         } => {
             if diagnostics {
                 gnc::encoder::diagnostics::enable();
@@ -1478,7 +1499,7 @@ fn main() {
                     (fw, fh, Some(y4m_fps_val), Some(probe))
                 } else {
                     let first_path = input.replace("%04d", &format!("{:04}", 0));
-                    let (_, fw, fh) = load_image_rgb_f32(&first_path);
+                    let (_, fw, fh) = load_image_rgb_f32_bits(&first_path, bit_depth);
                     (fw, fh, None, None)
                 };
                 // Use fps from Y4M header when available; otherwise keep CLI --fps value.
@@ -1560,7 +1581,7 @@ fn main() {
                     (0..gop_size)
                         .map(|j| {
                             let path = input.replace("%04d", &format!("{:04}", j));
-                            let (rgb, _, _) = load_image_rgb_f32(&path);
+                            let (rgb, _, _) = load_image_rgb_f32_bits(&path, bit_depth);
                             rgb
                         })
                         .collect()
@@ -1674,7 +1695,7 @@ fn main() {
                         } else {
                             for j in 0..gop_size {
                                 let path = input.replace("%04d", &format!("{:04}", base + j));
-                                let (rgb, _, _) = load_image_rgb_f32(&path);
+                                let (rgb, _, _) = load_image_rgb_f32_bits(&path, bit_depth);
                                 frames.push(rgb);
                             }
                         }
@@ -1743,7 +1764,7 @@ fn main() {
                         } else {
                             for j in 0..gop_size {
                                 let path = input.replace("%04d", &format!("{:04}", next_base + j));
-                                let (rgb, _, _) = load_image_rgb_f32(&path);
+                                let (rgb, _, _) = load_image_rgb_f32_bits(&path, bit_depth);
                                 next_frames.push(rgb);
                             }
                         }
@@ -1909,7 +1930,7 @@ fn main() {
                         }
                     } else {
                         let path = input.replace("%04d", &format!("{:04}", i));
-                        let (f, _, _) = load_image_rgb_f32(&path);
+                        let (f, _, _) = load_image_rgb_f32_bits(&path, bit_depth);
                         f
                     };
                     total_io_ms += t_io_start.elapsed().as_secs_f64() * 1000.0;
@@ -2044,6 +2065,8 @@ fn main() {
                     &rate_mode,
                 );
                 config_ip.tile_size = tile_size;
+            config_ip.bit_depth = bit_depth;
+                config_ip.bit_depth = bit_depth;
 
                 let ki_window = config_ip.keyframe_interval as usize + 4;
                 let frame_size_mb = w as f64 * h as f64 * 3.0 * 4.0 / 1_048_576.0;
@@ -2144,7 +2167,7 @@ fn main() {
             } else {
                 for i in 0..num_frames {
                     let path = input.replace("%04d", &format!("{:04}", i));
-                    let (rgb, fw, fh) = load_image_rgb_f32(&path);
+                    let (rgb, fw, fh) = load_image_rgb_f32_bits(&path, bit_depth);
                     w = fw;
                     h = fh;
                     frames_data.push(rgb);
@@ -2173,6 +2196,7 @@ fn main() {
                 &rate_mode,
             );
             config_ip.tile_size = tile_size;
+            config_ip.bit_depth = bit_depth;
 
             // Warm up GPU shader pipelines (triggers Metal lazy compilation)
             let _ = encoder.encode(&ctx, &frames_data[0], w, h, &config_ip);

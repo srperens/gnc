@@ -246,7 +246,16 @@ Tripling the bitrate improves 8-bit colour accuracy by 13-15% and 10-bit by 42-4
 bitrate 10-bit is 2.1-2.4x more accurate.** So 10-bit is a better use of the same bits for colour
 fidelity, not just a format checkbox.
 
-**Follow-up:** the RD harness still measures at 8 bits. The chain is verified working
+**Harness plumbed 2026-09-06.** `meas1_vs_h264.py --depth 8|10` drives the whole chain. Two
+codec defects surfaced doing it: the **Y4M reader parsed the colourspace tag but discarded the
+bit-depth suffix**, reading any 10-bit file as 8-bit (half the samples, noise out); and
+`benchmark-sequence` had no `--bit-depth` and six hardcoded 8-bit PNG load sites. Both fixed.
+
+First 10-bit numbers on Netflix Chimera (intra-only): BD-rate +131% VMAF / +251% PSNR-Y, worse
+than the +46% measured on 8-bit intra elsewhere. One sequence, and a hard one — a dark interior
+where GNC's VMAF saturates above 97 by q=25. Needs more 10-bit material before it means anything.
+
+**Old note:** the RD harness still measures at 8 bits. The chain is verified working
 (`ffmpeg -strict -1` for 10-bit Y4M, x264 `--input-depth 10 --output-depth 10 --profile high444`,
 vmaf scores 10-bit Y4M directly) and the source-material problem is solved — `sintel-4k-png16`
 for stills, Netflix Chimera 10-bit Y4M on the same server for video. Plumbing, not new work.

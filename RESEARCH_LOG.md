@@ -5080,3 +5080,44 @@ capture-to-encoder-input, encoder-output-to-network, and decoder-output-to-displ
 unmeasured. The decode figure includes PNG writing and is an upper bound. The ~256-line tile
 floor discussed in POSITIONING.md §3 is not currently reachable anyway — the pipeline processes
 whole frames, so the practical floor is one full frame regardless of tile size.
+
+## 2026-09-06 — 10-bit measurement chain complete, and the Y4M reader was discarding bit depth
+
+Plumbing 10 bits through the RD harness turned up two real defects in the codec's own I/O.
+
+**The Y4M reader threw the bit depth away.** It parsed the colourspace tag, stripped the depth
+suffix (`420p10` → `420`) and then read the file as 8-bit — half the samples, noise out. Any
+10-bit Y4M would have been silently misread. Now parsed and honoured: 10-bit samples are two
+little-endian bytes, divided by `1 << (depth - 8)` so the BT.601 conversion below stays correct
+while keeping the extra precision in the fraction.
+
+**`benchmark-sequence` had no `--bit-depth` at all**, and six of its PNG load sites were hardcoded
+to 8-bit. The first 10-bit harness run showed GNC at **VMAF 0.00 and PSNR-Y 21.8** — obviously
+broken rather than subtly wrong, which is the good kind of failure.
+
+`scripts/meas1_vs_h264.py` now takes `--depth 8|10` and drives the whole chain: `ffmpeg` needs
+`-strict -1` on every *output* to write 10-bit Y4M, PNG intermediates go through `rgb48le`, x264
+takes `--input-depth 10 --output-depth 10 --profile high444|high10`, and `vmaf` scores 10-bit Y4M
+directly.
+
+### First 10-bit numbers, and a caveat
+
+Netflix Chimera (dinner scene, genuinely 10-bit, 1920x1080, 4:2:0), intra-only:
+
+| | bpp | VMAF | PSNR-Y |
+|---|---|---|---|
+| GNC q=2 | 0.2398 | 90.04 | 43.49 |
+| GNC q=10 | 0.5574 | 95.83 | 44.90 |
+| GNC q=25 | 1.6529 | 97.88 | 47.95 |
+| x264 crf 20 | 0.1959 | 93.67 | 44.89 |
+| x264 crf 26 | 0.0572 | 88.29 | 43.49 |
+
+BD-rate **+131% on VMAF, +251% on PSNR-Y** — considerably worse than the +46% measured on 8-bit
+intra across bbb, touchdown and kristensara. **This is one sequence, and a hard one**: a dark
+interior where GNC's VMAF saturates above 97 by q=25. Content, not bit depth, is the likely
+explanation, but it needs more 10-bit sequences before anything is concluded. Recorded as a first
+data point, not a result.
+
+The full-sequence run on the same content is dominated by something already understood: Chimera is
+nearly static, so x264's inter frames cost 0.0093–0.027 bpp while GNC's have the floor measured in
+ARCH-2. That comparison says nothing new.

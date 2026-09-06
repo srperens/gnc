@@ -7399,7 +7399,7 @@ that does not hardcode the tile width. Three findings worth more than the hypoth
 
 ---
 
-## 2026-09-06 — BUG-11: intra prediction is broken, and the measurement that disabled it measured the bug
+## 2026-09-06 — BUG-13: intra prediction is broken, and the measurement that disabled it measured the bug
 
 ### The gate, and why it could not answer its question
 

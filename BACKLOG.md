@@ -309,7 +309,7 @@ allows 6, and `GNC_WAVELET_LEVELS=6` is silently ignored with it.
 Harmless for the shipped presets (256 px everywhere) but it means every past `--tile-size`
 experiment ran with a hidden cap. Fix: re-derive the ceiling after the CLI overrides land.
 
-### BUG-11 — intra prediction produces corrupt output at every quality (todo, P1)
+### BUG-13 — intra prediction produces corrupt output at every quality (todo, P1)
 `GNC_INTRA_PRED=1` (added 2026-09-06 to gate the lossless hypothesis) does not reconstruct
 correctly at any setting: max error 197-255 from q=50 to q=100, and at q=100 — where there is no
 quantiser and the transform is reversible — it loses 62 dB against a bit-exact baseline. PSNR sits

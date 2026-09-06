@@ -33,9 +33,22 @@ without saying so here first.
 |---|---|---|
 | `src/encoder/abac.rs`, `src/encoder/abac_compare.rs` | EBCOT/abac track | **active** — CPU reference landed, GPU decode shader next |
 | `src/encoder/sequence.rs` P-frame quantiser block | EBCOT/abac track | **released** — TUNE-6 landed, see below |
+| `src/encoder/intra.rs`, `src/shaders/intra_predict.wgsl` | lossless/intra track | **active** — fixing BUG-13 (encoder/decoder predictor mismatch) |
 | everything else | unclaimed | — |
 
 ## Landed today, and what each one invalidates
+
+- **BUG-13 filed** — `GNC_INTRA_PRED=1` (new knob) produces corrupt output at every quality: max
+  error 197-255 from q=50 to q=100, and at q=100 it loses 62 dB against a bit-exact baseline.
+  **The historical "-11.76 dB / +29%" measurement that set `intra_prediction: false` was measuring
+  this bug**, not the idea. Error accumulates toward the bottom-right of every 32x32 block, which
+  is an encoder/decoder predictor mismatch. Nothing else is invalidated -- the feature has always
+  been off by default -- but the *conclusion* recorded against it is.
+- **q=100 verified bit-exact lossless** on all three entropy coders. GOALS' "no true lossless with
+  Rice" was stale and is corrected. GNC beats JPEG 2000 lossless by 10.8% and PNG by 7.8%; loses to
+  FFV1 by 27% and x264 `-qp 0` by 43%, both of which predict against the neighbour.
+- **Note on numbering:** BUG-11 was assigned twice on 2026-09-06 (Rice tile width, and intra
+  prediction). The intra one has been renumbered **BUG-13**. Check this file before taking a number.
 
 Newest first. If you have measurements taken before one of these, they are suspect.
 

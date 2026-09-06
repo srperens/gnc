@@ -342,6 +342,14 @@ pub struct CodecConfig {
     pub quantization_step: f32,
     pub dead_zone: f32,
     pub wavelet_levels: u32,
+    /// Wavelet levels asked for, before any tile-size ceiling was applied.
+    ///
+    /// BUG-12: `quality_preset` clamps `wavelet_levels` against the *default* tile size, but
+    /// `--tile-size` lands afterwards, so a larger tile inherited a ceiling from a tile size it
+    /// no longer uses. Keeping the request lets `set_tile_size` re-derive the ceiling. 0 means
+    /// "nothing recorded" — `set_tile_size` then treats the current `wavelet_levels` as the
+    /// request, so setting that field directly still works.
+    pub requested_wavelet_levels: u32,
     pub subband_weights: SubbandWeights,
     pub cfl_enabled: bool,
     /// Which entropy coder to use (default: Rans — best compression; Rice is faster but ~30% worse)
@@ -454,6 +462,7 @@ impl Default for CodecConfig {
             quantization_step: 4.0,
             dead_zone: 0.0,
             wavelet_levels: 3,
+            requested_wavelet_levels: 0,
             subband_weights: SubbandWeights::uniform(3),
             cfl_enabled: false,
             entropy_coder: EntropyCoder::Rice,
@@ -529,6 +538,18 @@ impl CodecConfig {
     /// a 256 tile allows 5 levels, 128 allows 4, 64 allows 3.
     pub fn max_wavelet_levels(&self) -> u32 {
         (self.tile_size / 8).max(1).trailing_zeros().max(1)
+    }
+
+    /// Set the tile size and re-derive the wavelet-level ceiling it implies.
+    ///
+    /// Always prefer this to assigning `tile_size` directly. The DWT runs per tile, so the tile
+    /// size — not the image size — sets how deep the decomposition can go, and a change of tile
+    /// size changes that ceiling in both directions (BUG-12).
+    pub fn set_tile_size(&mut self, tile_size: u32) {
+        self.tile_size = tile_size;
+        let requested = self.requested_wavelet_levels.max(self.wavelet_levels);
+        self.wavelet_levels = requested.min(self.max_wavelet_levels());
+        self.normalize_for_entropy_group_limit();
     }
 
     /// Fall back to Rice when the chroma format cannot use the configured entropy coder.
@@ -770,8 +791,12 @@ pub fn quality_preset(q: u32) -> CodecConfig {
         b_pyramid: std::env::var("GNC_B_PYRAMID").map(|v| v == "1").unwrap_or(false),
         ..Default::default()
     };
-    // The DWT runs per tile, so the tile size, not the image size, sets the ceiling.
-    cfg.wavelet_levels = cfg.wavelet_levels.min(cfg.max_wavelet_levels());
+    // The DWT runs per tile, so the tile size, not the image size, sets the ceiling. Record the
+    // request first: `--tile-size` is applied after this returns, and set_tile_size() re-derives
+    // the ceiling from the request rather than from this tile size (BUG-12).
+    cfg.requested_wavelet_levels = cfg.wavelet_levels;
+    let ts = cfg.tile_size;
+    cfg.set_tile_size(ts);
     cfg
 }
 

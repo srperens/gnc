@@ -996,7 +996,7 @@ fn main() {
             };
 
             // Apply explicit CLI overrides
-            config.tile_size = tile_size;
+            config.set_tile_size(tile_size);
             if let Some(qs) = qstep {
                 config.quantization_step = qs;
             }
@@ -1123,7 +1123,7 @@ fn main() {
             config.chroma_format = parse_chroma_format(&chroma_format);
             config.normalize_for_chroma();
             config.bit_depth = bit_depth;
-            config.tile_size = tile_size;
+            config.set_tile_size(tile_size);
             config.overlap_pixels = overlap_pixels;
 
             let coder_name = match config.entropy_coder {
@@ -2064,7 +2064,7 @@ fn main() {
                     &bitrate,
                     &rate_mode,
                 );
-                config_ip.tile_size = tile_size;
+                config_ip.set_tile_size(tile_size);
             config_ip.bit_depth = bit_depth;
                 config_ip.bit_depth = bit_depth;
 
@@ -2195,7 +2195,7 @@ fn main() {
                 &bitrate,
                 &rate_mode,
             );
-            config_ip.tile_size = tile_size;
+            config_ip.set_tile_size(tile_size);
             config_ip.bit_depth = bit_depth;
 
             // Warm up GPU shader pipelines (triggers Metal lazy compilation)
@@ -3339,7 +3339,7 @@ fn main() {
                     if rans {
                         config.entropy_coder = gnc::EntropyCoder::Rans;
                     }
-                    config.tile_size = rd_tile_size;
+                    config.set_tile_size(rd_tile_size);
                     let qstep = config.quantization_step;
 
                     // Time encode

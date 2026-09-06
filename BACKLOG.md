@@ -341,7 +341,7 @@ and x264 `-qp 0` by 43% at q=100, and both win by decorrelating against the neig
 the scale. Whether that transfers here is **untested, not refuted** — it cannot be measured until
 this reconstructs.
 
-### LOSSLESS-1 — a prediction-based lossless path that bypasses the wavelet (todo, P2)
+### LOSSLESS-1 — prediction-based lossless path (**compression gate PASSED 2026-09-06**, P1)
 GNC is 27% behind FFV1 and 43% behind x264 `-qp 0` at q=100, and both win the same way: a
 per-pixel median predictor whose error is entropy-coded **directly**, with no transform. GNC's own
 block intra prediction was fixed and measured (BUG-13) and costs **4-8%** at lossless — but it
@@ -352,10 +352,25 @@ Five differences from what FFV1 does: block modes vs per-pixel median; one mode 
 every pixel; before the transform vs replacing it; SAD-selected vs n/a; resets every 32 px vs whole
 frame; luma only vs all planes.
 
-A second coding path, not a flag. Gate it offline first: run a MED/LOCO-I predictor over the source
-in a script and compare the entropy of its residual against GNC's current lossless bitstream. If
-the offline gate does not show most of the 27%, do not build it. Note LOOP.md's warning that
-offline models *understate* the real coder.
+**Gate run and passed** (`scripts/lossless_gate.py`). MED/LOCO-I in GNC's own reversible YCoCg-R,
+zeroth-order entropy of the residual, calibrated against FFV1's real output:
+
+| image | vs GNC q=100 | vs FFV1 real |
+|---|---|---|
+| touchdown | **-19.6%** | +5.4% |
+| bbb | **-9.5%** | +17.1% |
+| blue_sky | **-26.2%** | +15.2% |
+| kristensara | **-20.0%** | +6.8% |
+
+The model is 5-17% *larger* than FFV1's real file, so it is conservative — FFV1 adds context
+modelling and adaptive Golomb that the model lacks. **10-26% available, plausibly more.**
+
+**Second gate, not yet run: throughput.** MED cannot produce pixel (x,y) before (x-1,y) — a serial
+per-pixel dependency, which is what this architecture exists to avoid. Escapes: tiles (already
+have them) and a wavefront within each tile (511 steps of up to 256 lanes for a 256px tile, versus
+65 536 serial). But a wavefront is a different parallelism profile from one-thread-per-coefficient,
+and "massively GPU-parallel" is the core claim. **Implement the MED decode wavefront and measure
+decode fps before committing to a second coding path.**
 
 ### BUG-9 — rANS panics below qstep 1.0 instead of rejecting the configuration (todo, P2)
 Panics with `range start index 4294963272 out of range for slice of length 5242880` at

@@ -7804,3 +7804,67 @@ Three things would change the answer, in order of how much they would change it:
 Nothing is integrated into the bitstream. `abac` and `abac_gpu` are standalone, `abac_compare` is
 a diagnostic, and there is no format change.
 
+
+---
+
+## 2026-09-06 — The Rice/rANS crossover, re-swept after ENT-1: leave it where it is
+
+The follow-up ENT-1 filed. Worktree pinned to `25655b4` plus the ENT-1 packing, own `target/`,
+padding-neutral crops.
+
+**The comparison is exact, not a BD-rate estimate.** Entropy coding is lossless and both coders
+quantise identically, so at the same q they produce the same picture and only the rate differs.
+Verified end-to-end rather than assumed: bbb at q=70 reads PSNR 44.25 under both coders. Equal q
+is therefore matched quality, and bpp can be compared directly.
+
+### rANS against Rice, bpp, negative means rANS is smaller
+
+| image | q=25 | q=40 | q=55 | q=70 | q≥80 |
+|---|---|---|---|---|---|
+| bbb | −5.4% | −2.0% | −0.7% | 0.0% | crash |
+| blue_sky | −1.0% | −0.6% | −0.9% | −1.0% | crash |
+| touchdown | −6.6% | −8.0% | −7.9% | −7.8% | crash |
+| kristensara | **+6.3%** | **+5.1%** | **+3.6%** | **+1.2%** | crash |
+| mean | −1.7% | −1.4% | −1.5% | −1.9% | — |
+
+Before ENT-1 rANS was 15–25% behind Rice at q=70. It is now level or ahead on three of four
+images. The gain is real and it is what ENT-1 predicted.
+
+### The recommendation is still: do not move the crossover
+
+Three reasons, and the third is decisive.
+
+1. **The mean is small and the spread is not.** −1.9% at q=70 is one image (touchdown, −7.8%)
+   pulling three flat ones along, and kristensara regresses on every point measured. A default that
+   costs 6% on portrait content to save 8% on sport is a content bet, not an improvement.
+2. **rANS is slower.** TUNE-3 measured ~8% encode and ~15% decode against Rice. Quoted from that
+   entry rather than re-measured: four sessions were building on this machine and COORDINATION
+   rule 1 forbids timing under load. For a codec judged on concurrent streams per GPU, 2% of rate
+   for 15% of decode is the wrong direction.
+3. **rANS cannot run at the operating point at all.** Every image crashes from q=80 up.
+
+### Why it crashes, and what the backlog gets wrong about it
+
+`rANS stream 320 overflowed its 4096-byte output slot (write_ptr=4294963712)` — the fixed
+per-stream buffer, confirming the BUG-9 diagnosis rather than the alphabet theory it replaced.
+The host-side bounds check the other session added turns it into that sentence instead of a raw
+slice panic, which is the right amount of fixing.
+
+**But BUG-9's threshold is wrong and understates the problem.** It records "OK at qstep 2.0 and
+1.5, panics at 1.0", measured through `-q 15 --qstep 1.0`. In the default configuration bbb
+survives q=78 (qstep 3.594) and fails at q=80 (qstep 3.347) — it breaks at **three times** the
+recorded step. The q=15 preset carries 4 wavelet levels, different subband weights and a different
+dead zone, so it produces a much milder coefficient distribution at the same nominal step. The
+threshold is a function of the whole configuration, not of qstep, which is also why a static
+qstep guard would be the wrong fix.
+
+Making rANS reach the operating point means threading a runtime buffer size through three encode
+shaders and six allocation sites, the way Rice already sizes its own from qstep. That is real work
+and the measurement above says nobody wants what it would buy. **Left undone deliberately**, and
+recorded here so the next person does not rediscover the crash and assume it is cheap.
+
+### What this thread produced
+
+ENT-1 itself stands: −16.6% on the rANS coder for no quality change. What it did *not* do is
+change which coder the codec should use — and knowing that costs nothing further, because the
+comparison was exact rather than a sweep.

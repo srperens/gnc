@@ -156,9 +156,27 @@ matters is *"visually lossless at 6:1, still clean at the third generation."*
 | NDI High Bandwidth | < 16 ms at 1080p60 |
 | low-latency HEVC | EBU measured **120 ms – 3060 ms** across real vendors |
 
-**GNC's 256×256 tiles impose a structural floor of ~256 lines** before the first tile row can be
-emitted — roughly an order of magnitude coarser than JPEG XS. This is an architectural fact, not
-a tuning problem, and it is a second reason live contribution is the harder target.
+**Measured 2026-09-06 (MEAS-6):** GNC's codec round trip at 1080p on an M1 is **~80 ms** — about
+47 ms encode plus 35 ms decode. On top of that, **the default B-pyramid costs 8 frames of
+lookahead**: `ki=17` encodes in the order `0[I] 4[B] 8[P] 2[B] 6[B] 1[B] ...`, so frame 1 cannot
+be coded until frame 8 has arrived. At 50 fps that is **160 ms of structural delay before any
+coding runs**. P-only coding encodes in display order with **zero** reordering delay.
+
+| | latency |
+|---|---|
+| JPEG XS | 1–32 lines; EBU measured under one frame |
+| NDI High Bandwidth | under 16 ms |
+| **GNC, intra or P-only** | **~80 ms** |
+| **GNC, B-pyramid (current default)** | **~240 ms** |
+| low-latency HEVC | 120–3060 ms |
+
+**GNC's default configuration sits in the low-latency-HEVC band, not the JPEG XS band.** Dropping
+the pyramid is worth roughly 3× — and BUG-5 independently measured that same pyramid as *costing*
+7–31% in rate at contribution quality on camera content. Two measurements, one conclusion.
+
+Note also that the often-quoted ~256-line tile floor is not currently reachable: the pipeline
+processes whole frames, so the practical floor is one full frame regardless of tile size. Getting
+near JPEG XS would require emitting tile rows as they complete, which the pipeline does not do.
 
 ### Error resilience: nobody appears to be buying it
 
@@ -361,8 +379,10 @@ In priority order. Items map to [BACKLOG.md](../BACKLOG.md).
    Note this is **pricing**, not masking — the earlier rejected experiment masked coefficients in
    the wavelet domain, which changes the signal and causes ringing. Different thing.
 5. **Decide between live contribution and cloud mezzanine, and stop straddling** (§2).
-6. **Measure latency** (MEAS-6), and confront the ~256-line tile floor against the target segment's
-   budget.
+6. **Drop the B-pyramid at contribution quality.** Two independent measurements now agree it is
+   the wrong default here: it costs 7–31% in rate on camera content (BUG-5) and 160 ms in latency
+   (MEAS-6). A configuration change, not a bitstream change. Keep P-frames — they have zero
+   reordering delay and were the better performer.
 7. **Sharpen the licensing claim** from "patent-free" to the specific documented one, and back it
    with a patent search and a defensive publication.
 

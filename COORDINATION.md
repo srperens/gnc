@@ -14,10 +14,12 @@ sessions' edits to `abac.rs` and `gpu_util.rs` overwrote each other and were los
 # Pick a short name for the area you are working on, not for the session.
 git -C /Users/per/src/gnc worktree add -b <area> /Users/per/src/gnc-<area> main
 cd /Users/per/src/gnc-<area>
-ln -s /Users/per/src/gnc/test_material test_material   # gitignored, ~GB, do not copy it
+ln -s /Users/per/src/gnc/test_material/frames test_material/frames   # gitignored, ~GB
 ```
 
-Then work only in that directory, and add your row to the table below. Each worktree has its own
+`test_material/` itself is tracked (it holds the fetch script), so symlink `frames` inside it
+rather than replacing the directory. Then work only in that directory, and add your row to the
+table below. Each worktree has its own
 `target/`, so builds no longer block on each other's cargo lock — that alone is worth the disk.
 
 When your work is ready:

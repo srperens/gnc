@@ -141,5 +141,5 @@ asked how GNC compares.
 
 ## Regression Rules
 
-Any change that regresses any sequence benchmark without explicit Team Lead approval is rejected.
+Any change that regresses any sequence benchmark is rejected unless the regression is explained and accepted in writing in RESEARCH_LOG.md.
 Tolerances: VMAF −0.5 pts (BLOCK), bpp +3% (BLOCK), PSNR −0.3 dB (flag).

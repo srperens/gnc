@@ -79,9 +79,7 @@ questions need a chroma-aware metric; VMAF answers luma questions.**
 - Always compare against baseline AND previous best.
 - Include raw numbers, not just deltas.
 
-## AI Team Protocol
-
-Claude operates as **team lead** for an autonomous multi-agent team. The team is **self-governing** — it picks tasks, investigates, implements, validates, and ships without human intervention. Escalate to human only when genuinely blocked or when a design decision has major irreversible consequences (e.g., bitstream format change).
+## How to work
 
 ### Operating Philosophy
 
@@ -91,36 +89,47 @@ Claude operates as **team lead** for an autonomous multi-agent team. The team is
 - **Know when to stop.** If an approach yields <1% improvement after honest measurement, move on. Don't polish a dead end.
 - **Iterate toward the best codec possible** using known techniques. Read literature, compare against state of the art, identify the biggest gaps, and close them systematically.
 
-### Roles (implemented as parallel Agent tool calls)
+### The loop
 
-| Role | Responsibility | Rules |
-|------|---------------|-------|
-| **Team Lead** (main context) | Prioritize, assign, review, challenge results | Questions everything. "Is this real? Is this the right thing to build?" |
-| **Visionary** (subagent) | Searches online for recent research in codecs, DSP, mathematics, signal processing, and adjacent fields. Proposes unconventional ideas: inverting pipeline stage order, applying techniques from other domains, reframing problems in different dimensions or time representations. Output goes to Research Scientist, not directly to Builder. | Uses WebSearch and WebFetch to read recent papers and developments. Thinks laterally — "what if we did X backwards?", "what does audio codec research say about this?", "what does this look like in the frequency domain vs the spatial domain?". Does NOT evaluate feasibility — that's Research Scientist's job. Does NOT write code. |
-| **Research Scientist** (subagent) | Filter between ideas and implementation. Evaluates hypotheses, sweeps literature, ranks backlog | Every experiment needs a falsifiable hypothesis + measurable success criterion. Vetoes mathematically unsound plans. Does NOT write code. |
-| **Researcher** (subagent) | Diagnose root causes, read code, form hypotheses, review literature | Does NOT write production code. Must state confidence level. |
-| **Builder** (subagent) | Implement changes based on approved diagnosis | Never change bitstream format without approval. Adds diagnostic output to verify code runs. |
-| **Critic** (subagent) | Structural code review after Builder, before Tester | Looks for duplication, dead parameters, wrong layer, unjustified complexity. Verdicts: APPROVE or SEND BACK. Does NOT comment on style or correctness. |
-| **Tester** (subagent) | `cargo test --release` + `cargo clippy --release` | Blocks on any regression. Reports full output on failure. |
-| **Validator** (subagent) | Benchmark suite, compare against [BASELINE.md](BASELINE.md) | **Primary metric: VMAF.** Flags VMAF regression >0.5 pts or bpp +3%. PSNR is secondary cross-check. Runs twice if results seem surprising. |
-| **Documentation Agent** (subagent) | Writes decision records after each completed backlog item | Outputs `docs/decisions/NNNN-title.md`. Documents *why*, not *what*. Flags unexplained decisions to Team Lead. |
-| **Performance Profiler** (subagent) | Profiles encode/decode when fps is below target | Identifies top 3 hotspots, does NOT suggest fixes. Hands report to Researcher. |
-| **Regression Guard** (subagent) | Runs after every merge, compares against `docs/baseline.csv` | Tolerances: **vmaf -0.5pts** (BLOCK), bpp +3% (BLOCK), psnr -0.3dB (flag), fps ±10% (flag). PASS or BLOCK output. Never updates baseline without Team Lead approval. |
+One agent, in one context, carries an item from hypothesis to committed measurement. See
+[LOOP.md](LOOP.md) for the step list. In short: pick from [BACKLOG.md](BACKLOG.md) by
+value-to-effort, question whether it is still the right item, measure the *before*, change, measure
+the *after* on ≥3 sequences and ≥2 quality points, run the three clean-build checks, write the
+numbers into [RESEARCH_LOG.md](RESEARCH_LOG.md) including the failures, commit with the numbers in
+the message.
 
-### Iteration Loop
+### On subagents — the role-based team was tried and retired (2026-09-06)
 
-1. Team Lead reads [BACKLOG.md](BACKLOG.md), picks highest-priority `todo` item
-2. **Question the task** — Is this still the right priority? Has something changed?
-3. **Research Scientist** evaluates hypothesis — falsifiable claim + success criterion required. Veto if unsound.
-4. Researcher investigates code → written diagnosis with confidence level
-5. Team Lead reviews diagnosis — **challenges weak hypotheses**, approves strong ones
-6. Builder implements with diagnostic verification
-7. **Critic reviews** — structural review of Builder's diff. SEND BACK = Builder fixes before continuing.
-8. Tester verifies (all tests + clippy clean)
-9. Validator benchmarks on ≥3 sequences with `--vmaf`, compares against BASELINE.md
-10. **Research Scientist** post-experiment analysis — did the hypothesis hold?
-11. Team Lead reviews results — **are they real? do they make sense? would we ship this?**
-12. Ship or iterate. Update BACKLOG.md, BASELINE.md, RESEARCH_LOG.md, commit.
+This file used to prescribe an eleven-role pipeline — Visionary → Research Scientist → Researcher →
+Team Lead → Builder → Critic → Tester → Validator → Documentation Agent, with a Regression Guard
+and a Performance Profiler on the side. It was run. It consumed a large amount of context and did
+not produce better work than a single agent following the rules below. It is gone, along with the
+`opencode` scaffolding (`AGENTS.md`, `run-team.sh`, `.opencode/`) and the three abandoned worktrees
+that were its only visible output. **Do not reinstate it.** Three reasons it did not fit this
+project:
+
+1. **The binding constraint here is measurement, and measurement is mechanical.** `benchmark
+   --vmaf` is deterministic. A persona does not make it more truthful; running it on the right
+   sequence, at the right operating point, against a pinned commit does. Every retracted result in
+   this repo — the `chroma_weight` sign reversal, the 8-bit-truncated 10-bit run, the unnormalised
+   DWT, the inflated `byte_size()`, the −3.7% BD-rate that was −2.3% — came from a harness error,
+   not from a missing reviewer.
+2. **Role boundaries force handoffs, and handoffs lose the context that catches those errors.**
+   "Researcher does NOT write production code", "Profiler does NOT suggest fixes" means the person
+   who understands the claim is never the one holding the code. None of the errors above would have
+   been caught by a Critic reading a diff. They were caught by someone who knew the harness *and*
+   the claim at the same time.
+3. **The hardware is one M1 with 8 GPU cores.** Parallel agents contend for the single resource
+   every measurement needs — the same fps run reads 20% slower with another session busy — and a
+   shared working tree makes their numbers mutually invalid (COORDINATION.md rule 1).
+
+**What subagents are still worth spawning:** read-only fan-out where the answer is a conclusion and
+the cost is reading. Searching a 400 KB `RESEARCH_LOG.md` and a 90 KB `BACKLOG.md` for whether an
+idea has already been measured and rejected. Literature search on a specific mechanism. Both return
+a paragraph, not a diff, and neither needs the GPU. Spawn those freely; do the codec work yourself.
+
+**What survives from the protocol is the rules, not the roles.** They are checklists, and they work
+without an org chart:
 
 ### Hard Rules
 
@@ -134,7 +143,7 @@ Claude operates as **team lead** for an autonomous multi-agent team. The team is
 
 ### Quality Rules (added 2026-03-11 — lessons from sloppy execution)
 
-- **Neutral bpp = SEND BACK, not CLOSE.** If a feature predicts ≥3% bpp gain and measures 0.0%, that is a bug, not a null result. Team Lead must demand an explanation before accepting. "It compiles" is not evidence it runs correctly.
+- **Neutral bpp = SEND BACK, not CLOSE.** If a feature predicts ≥3% bpp gain and measures 0.0%, that is a bug, not a null result. Demand an explanation of yourself before accepting it. "It compiles" is not evidence it runs correctly.
 - **Builder must show a canary metric.** Every implementation must include a logged count or value proving the new code path executes on real data (e.g., `skip_tiles=47`, `context_switches=1203`). A feature without a canary is not done.
 - **Domain declaration is mandatory before implementation.** Researcher must explicitly state: "this change operates on [spatial residual | quantized coefficients | wavelet coefficients | bitstream | reference buffer]" and justify why that domain is correct. Researcher role includes challenging this — a skip implemented in spatial domain in a wavelet codec is wrong by construction.
 - **Measurements must match baseline parameters exactly.** Same ki, same frame count, same sequence, same chroma format. Any deviation invalidates the comparison. State all parameters explicitly.

@@ -20,3 +20,7 @@ examples/web/*.gnc
 examples/web/*.diag
 examples/web/*.pem
 .aider*
+
+# Python bytecode
+__pycache__/
+*.pyc

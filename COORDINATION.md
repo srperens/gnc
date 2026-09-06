@@ -31,9 +31,11 @@ without saying so here first.
 
 | files / area | session | state |
 |---|---|---|
-| `src/encoder/abac.rs`, `src/encoder/abac_compare.rs` | EBCOT/abac track | **active** — CPU reference landed, GPU decode shader next |
+| `src/encoder/abac*.rs`, `src/shaders/abac_decode.wgsl`, `tests/abac_gpu.rs` | EBCOT/abac track | **active** — GPU decode shader landed and bit-exact; measuring the 16-bit interval's rate cost |
 | `src/encoder/sequence.rs` P-frame quantiser block | EBCOT/abac track | **released** — TUNE-6 landed, see below |
 | `src/encoder/intra.rs`, `src/shaders/intra_predict.wgsl` | lossless/intra track | **active** — fixing BUG-13 (encoder/decoder predictor mismatch) |
+| `src/encoder/rice.rs`, `rice_gpu.rs`, `src/shaders/rice_*.wgsl` | tile-geometry track | **active** — BUG-11 (Rice stream mapping is tile-width-blind) + BUG-12 |
+| repo hygiene + `CLAUDE.md` / `AGENTS.md` / `run-team.sh` / `.opencode/` | tile-geometry track | **active** — retiring the dead opencode agent team, de-duplicating the rule docs |
 | everything else | unclaimed | — |
 
 ## Landed today, and what each one invalidates

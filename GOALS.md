@@ -73,7 +73,10 @@ rANS and Huffman exist in the codebase but are parked — Rice is the default fo
 
 *(Single-frame, 1080p bbb reference, M1 GPU, 2026-02-27)*
 
-**Sequence encode: 31.7 fps** (1080p, q=75, Rice, ki=8, 10 frames I+P+B)
+**Sequence encode: see [BASELINE.md](BASELINE.md) — three different quantities have been called
+"encode fps" and they differ by 2.4x.** The previously quoted 31.7 fps is not reproducible and its
+stated parameters are internally inconsistent (ki=8 cannot produce B-frames). Measured 2026-09-06
+on a non-idle machine: GPU encode phase 12.2 fps, end to end 5.0 fps.
 
 **What works:**
 - Full I/P/B frame video pipeline with motion estimation, rate control, GNV1 container

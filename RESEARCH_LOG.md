@@ -5368,3 +5368,52 @@ Only one rate point per sequence falls inside the interpolation range (the other
 was excluded). This is enough to rule out a *large* hidden chroma effect — which is what the
 caveat asserted — but it is not a rate-distortion curve in dE00. If a chroma-sensitive decision
 ever rests on this, measure more rate points.
+
+---
+
+## 2026-09-06 — Pinning the fps definition, and a methodology gap: two agents, one GPU
+
+### The problem
+
+Three different numbers are in circulation for "GNC encode fps" and GOALS quotes one of them
+without saying which. The CLI's own help text concedes the difference (*"Y4M input avoids PNG
+decode overhead and measures actual GNC encoder throughput"*).
+
+### The three definitions, named
+
+Measured on the same binary, same content, same parameters — 1080p, 10 frames, `ki=8` (P-only,
+the new default), Rice, M1:
+
+| | what it times | median | range |
+|---|---|---|---|
+| **A — GPU encode phase** | `benchmark-sequence`, Y4M in. Transform, quantise, entropy encode. Excludes input decode and container write. | **12.2 fps** | 9.8–13.0 |
+| **B — encoder loop** | the figure `encode-sequence` prints itself. Includes per-frame host work, excludes process start. | **5.6 fps** | 5.1–6.8 |
+| **C — end to end** | wall clock around `encode-sequence` with PNG input. What a user experiences. | **5.0 fps** | 4.2–6.2 |
+
+**A is 2.4x C.** That factor is the whole confusion. Neither is wrong; they answer different
+questions, and a claim about GPU density needs A while a claim about a working pipeline needs C.
+
+**Use A when comparing against another codec's encoder, C when claiming throughput.** State which
+one, every time.
+
+### BASELINE's 31.7 fps is not reproducible and should not be quoted
+
+It matches none of the three, on any sequence, at either quality point. Its stated parameters are
+also internally inconsistent: *"q=75, ki=8, 10 frames I+P+B"* — but `ki=8` is below
+`B_FRAMES_PER_GROUP + 2 = 9`, so that configuration cannot contain B-frames, and the encoder
+confirms it emits `2I + 8P`. Either the number predates a change or it was taken by a method not
+recorded. **Marked stale; do not build a density claim on it.**
+
+### The methodology gap — this matters more than the numbers
+
+**Both measurements above were taken while another agent was compiling on the same machine.** A
+first run, during a `cargo test --release`, gave A = 10.2 median. A second run gave A = 12.2 — a
+**20% swing from machine contention alone**, larger than most effects this project chases.
+
+Two agents now share one Mac, and neither session had noted that this invalidates timing work.
+Compression measurements (bpp, VMAF, dE00) are deterministic and unaffected; **every throughput,
+fps and latency figure is not.**
+
+Recorded as a standing rule: *timing measurements require an idle machine, and the run must say
+whether it had one.* The numbers in this entry did not, so they are load-bounded lower bounds —
+the true idle values are somewhat higher, and the A:C ratio is the trustworthy part.

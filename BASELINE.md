@@ -15,6 +15,26 @@ Mode: Spatial-only, I+P+B, Rice entropy, ki=9, 7B-per-group pyramid, uniform sub
 
 Previous (perceptual weights, #64): q=75 → 42.17 dB / 3.83 bpp / VMAF 95.05
 
+## How to read the fps figures in this file
+
+Three different quantities have been called "encode fps" here. State which one, every time:
+
+| | what it times | measured 2026-09-06 (1080p, ki=8, Rice, M1, **machine not idle**) |
+|---|---|---|
+| **A — GPU encode phase** | `benchmark-sequence` with Y4M input | 12.2 fps median |
+| **B — encoder loop** | the figure `encode-sequence` prints | 5.6 fps median |
+| **C — end to end** | wall clock around `encode-sequence`, PNG input | 5.0 fps median |
+
+**A is 2.4x C.** Use A to compare against another codec's encoder, C to claim throughput.
+
+**Timing runs require an idle machine.** Two agents share this Mac; a run taken during a
+`cargo test` measured 20% slower than the same run taken after it. Compression figures (bpp,
+VMAF, dE00) are deterministic and unaffected; fps and latency are not.
+
+**The 31.7 fps figure quoted in GOALS is not reproducible** and matches none of the three. Its
+stated parameters are also inconsistent — "ki=8 ... I+P+B", but ki=8 is below the B-frame
+threshold of 9, and the encoder emits 2I+8P. Do not build a density claim on it.
+
 ## Sequence Benchmarks (I+P+B, q=75, ki=9, 10 frames, 4:4:4)
 
 > **Stale as of 2026-09-06.** `quality_preset` now vetoes the hierarchical B-pyramid by default

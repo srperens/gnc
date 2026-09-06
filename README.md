@@ -21,8 +21,15 @@ GNC targets **contribution** — the high-quality, low-latency link between a ca
 **Where it stands against H.264** (measured 2026-09-06, `scripts/meas1_vs_h264.py`, 1080p, ki=9, x264 at defaults):
 
 - **Contribution quality: +90.5% BD-rate on PSNR** — about 1.9x the bitrate of x264 for the same luma quality, across three sequences.
-- **Colour: ahead of x264.** At rate matched to 1%, GNC scores better CIEDE2000 on all three sequences (0.611 vs 0.684 mean on bbb) with fewer pixels past the just-noticeable threshold — while sitting 7.4–8.8 dB behind on luma. The two codecs spend their bits differently between brightness and colour, so both numbers are needed to describe the difference honestly.
+- **Colour: GNC spends more of its budget on chroma.** At rate matched to 1%, GNC scores better CIEDE2000 on all three sequences (0.611 vs 0.684 mean on bbb) with fewer pixels past the just-noticeable threshold — while sitting 7.4–8.8 dB behind on luma. That is an allocation difference, and it is not yet known whether it is more than one: the test that would settle it is giving x264 the same allocation (`--chroma-qp-offset`) and re-measuring CIEDE2000 at the same total rate. Until that runs, this row says where the bits went, not that the transform preserves colour better.
 - **Lossless: the best wavelet result in the field.** 1.99:1 at `q=100`, beating JPEG 2000 lossless by 10.8% and PNG by 7.8%; behind FFV1 by 27% and x264 `-qp 0` by 43%, both of which predict against the neighbouring pixel rather than across scales.
+- **Latency: ~80 ms round trip** intra or P-only, ~240 ms with the B-pyramid, 1080p on an M1
+  (MEAS-6). That is the low-latency-HEVC band, **not** the JPEG XS band — JPEG XS codes 1–32
+  lines and EBU measures it under one frame. The 256-line tile floor is not reachable today: the
+  pipeline processes whole frames, so the practical floor is one full frame whatever the tile
+  size. See [`docs/POSITIONING.md`](docs/POSITIONING.md) for where that leaves GNC against the
+  incumbents in this segment, and note that the +90.5% figure above is measured against x264,
+  which is a sanity anchor rather than a competitor here — JPEG XS, J2K, VC-2 and ProRes are.
 - At *distribution* bitrates the gap is much larger. GNC is not built for that operating point.
 
 **Off by default, and why:** the B-frame pyramid (costs 7–31% in rate on camera content and 160 ms in latency), temporal wavelet mode (loses 2–5 dB on high motion), and motion-compensated temporal filtering (measured 1.04–1.14x *worse* than a P-frame chain on every sequence tested).
@@ -102,7 +109,7 @@ gnc decode -i output.gpuc -o output.png
 
 ```bash
 gnc benchmark -i input.png -q 75              # Rice+ZRL (default)
-gnc benchmark -i input.png -q 75 --rans       # rANS entropy (better compression)
+gnc benchmark -i input.png -q 75 --rans       # rANS entropy (see Entropy Coders)
 ```
 
 ### Rate-distortion curve
@@ -138,12 +145,21 @@ Downloads representative broadcast frames from [Xiph.org](https://media.xiph.org
 
 GNC has four entropy coding backends, all running as GPU compute shaders:
 
-| Coder | Streams/tile | Compression | Speed | Patent risk |
-|-------|-------------|-------------|-------|-------------|
-| **Rice+ZRL** (default) | 256 | 4.01 bpp @ q=75 | **1.5–2× faster** | None |
-| rANS (`--rans`) | 32 | 4.22 bpp @ q=75 | Baseline | Possible (MS patent) |
+| Coder | Streams/tile | Coding | Speed | Patent risk |
+|-------|-------------|--------|-------|-------------|
+| **Rice+ZRL** (default) | 256 | Golomb-Rice + zero-run | **1.5–2× faster** | None |
+| rANS (`--rans`) | 32 | Range asymmetric numeral systems | Baseline | Possible (MS patent) |
 | Huffman (parked) | 256 | 64-symbol + escape | Moderate | None |
 | Bitplane (parked) | Per-block | Sign + magnitude bitplanes | Moderate | None |
+
+*No compression column: **the coders have never been measured against each other on one commit.**
+The figures that stood here (Rice 4.01 bpp, rANS 4.22 bpp @ q=75) were taken at an operating point
+that no longer exists — q=75 has since moved from 42.17 dB / 3.83 bpp to 44.84 dB / 4.53 bpp with
+uniform weights and 5 levels — and GP17 (Rice-coded stream-length tables) shrank Rice's headers at
+bit-identical output without touching rANS. Quoting 4.53 against 4.22 would compare three changes
+at once. Rice is expected to still win, and by more than before, since header overhead scales with
+stream count and Rice runs 256 streams to rANS's 32 — but that is a prediction, not a measurement.
+[BASELINE.md](BASELINE.md) carries Rice only.*
 
 Rice is the default because it eliminates the sequential state chain that limits rANS. Each of the 256 streams encodes independently — no shared state, no synchronization, minimal shared memory (< 1 KB vs rANS's 16 KB frequency tables). rANS, Huffman, and Bitplane are available but parked — they'll be revisited once speed targets are met.
 
@@ -153,12 +169,17 @@ Smooth, monotonic quality scaling from lossless to extreme compression:
 
 ```
 q=100  Lossless     — bit-exact round-trip (LeGall 5/3 integer wavelet)
-q=90   High quality — 50 dB PSNR, near-transparent
-q=75   Production   — 42 dB PSNR, good general-purpose quality
-q=50   Balanced     — 37 dB PSNR, CfL + adaptive quantization
-q=25   Compressed   — 33 dB PSNR, broadcast-suitable
-q=5    Extreme      — 27 dB PSNR, 0.47 bpp (preview/thumbnail)
+q=90   High quality — near-transparent
+q=75   Production   — good general-purpose quality
+q=50   Balanced     — CfL + adaptive quantization
+q=25   Compressed   — broadcast-suitable
+q=5    Extreme      — preview/thumbnail
 ```
+
+*Deliberately without dB figures. This block used to carry its own set (q=75 → 42 dB, q=50 → 37,
+q=25 → 33) which was a third copy of the 2026-02-27 numbers and had drifted 2–3 dB from the table
+above. [BASELINE.md](BASELINE.md) is the single source; the Current Results table quotes it, and
+nothing else in this file should.*
 
 ## WebGPU / WASM
 
@@ -194,7 +215,7 @@ src/
 │   ├── pipeline.rs     Decoder orchestration
 │   ├── frame_data.rs   Frame data upload
 │   └── gpu_work.rs     GPU dispatch
-├── shaders/            42 WGSL compute shaders
+├── shaders/            WGSL compute shaders
 │   ├── rice_encode.wgsl, rice_decode.wgsl
 │   ├── rans_encode.wgsl, rans_decode.wgsl
 │   ├── transform_97.wgsl, transform_53.wgsl

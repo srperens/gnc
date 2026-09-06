@@ -1790,6 +1790,59 @@ motion estimator (8x8/±16: 0.99→1.01x). Full measurement in RESEARCH_LOG 2026
 Reaches the same verdict as ICME 2006 and MPEG's deletion of the SVC temporal update step, from an
 independent direction.
 
+### CHROMA-2 — Is the colour result more than an allocation difference? (todo, P1)
+
+The README's one claimed win over x264 is CIEDE2000 on all three sequences at rate matched to 1%,
+while trailing 7.4–8.8 dB on luma. Both halves are real, and together they say GNC spends a larger
+share of the budget on chroma. They do **not** say the transform preserves colour better, and the
+README now says so explicitly rather than implying the stronger claim.
+
+**The control that settles it:** give x264 the same allocation — `--chroma-qp-offset -6`, or
+whatever offset matches GNC's split — and re-measure CIEDE2000 at the same *total* rate on all
+three sequences.
+
+- If x264 takes the dE00 win back, the colour row is an allocation artefact. Say so and drop it.
+- If it cannot — if the luma cost is disproportionate — then 4:4:4 wavelet plus CfL is doing
+  something a block DCT at 8x8 does not, and that is a contribution argument worth making, since
+  chroma keying and grading are exactly what contribution material has to survive.
+
+Metric rules apply: dE00 via `scripts/chroma_metric.py`, luma in YCoCg-R via `scripts/ypsnr_de00.py`,
+not luma computed from decoded RGB. Success criterion: state the offset, the matched rate, and the
+dE00 delta per sequence. Half an afternoon.
+
+### MEAS-9 — JPEG XS in `--compare-codecs` (todo, P1)
+
+`--compare-codecs` covers JPEG and JPEG 2000. The framing is contribution, and in that segment the
+incumbents are JPEG XS, J2K, VC-2 and ProRes (docs/POSITIONING.md) — x264 is a sanity anchor, not
+a competitor. **JPEG XS is the one that decides the positioning** and it is not measured.
+
+Three implementations are available to compare against; the ISO reference (libjxs) and Intel's
+SVT-JPEG-XS with its ffmpeg plugin are the practical routes. Measure at the contribution operating
+point, report bpp at matched PSNR-Y and dE00, and put the number next to the latency row from
+MEAS-6 — +90.5% against x264 is far easier to defend beside a JPEG XS figure and a latency figure
+than on its own.
+
+Note JPEG XS is patented (GOALS §, and docs/POSITIONING.md) — this is a comparison, not a target
+to adopt.
+
+### ENT-2 — Rice vs rANS on one commit (todo, P2)
+
+**The entropy coders have never been compared on a single commit.** The README carried Rice
+4.01 bpp against rANS 4.22 bpp @ q=75 until 2026-09-06; that pair was taken at an operating point
+that no longer exists — q=75 has moved from 42.17 dB / 3.83 bpp to 44.84 dB / 4.53 bpp with uniform
+weights and 5 levels — and GP17 (Rice-coded stream-length tables) shrank Rice's headers at
+bit-identical output without touching rANS. Quoting today's 4.53 against that 4.22 would compare
+three changes at once, so the compression column is gone from the README and BASELINE.md carries
+Rice only.
+
+**Measure both coders on one commit, at q=25/50/75/90, on ≥3 sequences.** Rice is expected to still
+win and by more than before — header overhead scales with stream count and Rice runs 256 streams to
+rANS's 32 — but that is a prediction. Watch BUG-9: rANS overflows its per-stream buffer at fine
+quantiser steps, so q=90 may not complete.
+
+This is a documentation-integrity item, not a performance one: the default is Rice for the
+sequential-state-chain reason, which no bpp figure changes.
+
 ## Noted — revisit only if conditions change
 
 ### ARCH-1 — Hybrid temporal: Haar for low motion, I+P+B for high motion (noted 2026-03-11)

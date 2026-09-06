@@ -32,7 +32,10 @@ bpp_max = 2.4782
 psnr_min = 45.33
 bpp_max = 3.7204
 
+# Re-recorded 2026-09-06 when the quality metric started measuring the decoder's actual 8-bit
+# output rather than the encoder's float reconstruction (BUG-8). 50.82 -> 50.19: the 0.63 dB is
+# the cost of rounding to integers, which the float metric never saw. The codec did not change.
 [checkerboard_512x512.q90]
-psnr_min = 50.82
+psnr_min = 50.19
 bpp_max = 7.6607
 

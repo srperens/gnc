@@ -1141,20 +1141,39 @@ The 8×8 deep-subband concern flagged earlier is real but immaterial: LL plus th
 subbands are 256 of 65536 coefficients, 0.4% of a tile, and they are already one block each. Not
 worth merging subbands into a shared coder. Dropped.
 
-### BUG-8 — The encoder's local decode diverges from the real decoder down a GOP (**OPEN, not diagnosed**)
-bbb17, 17 frames, ki=17, q=50. Per-frame PSNR of the encoder's own reconstruction vs the actual
-decoded file: gap −0.04 dB at frame 0, +0.08 at frame 8, **+0.23 at frame 16** — monotonic,
-accumulating, and in the decoder's favour.
+### BUG-8 — The encoder measured a reconstruction that never leaves it (**FIXED 2026-09-06** — a metric bug, not drift)
+Filed as a suspected encoder/decoder divergence. It is not: the reference buffers never differ.
+`bench::quality::psnr` compared raw `f32`, while the decoder's output is what `pack_u8.wgsl`
+writes — `u32(clamp(f + 0.5, 0.0, peak))`.
 
-The bitstream is valid and the decoded output is slightly *better* than the encoder believes, so
-this is not a correctness failure of the output. It is a correctness failure of the encoder's
-model: the local decode loop is what rate control and any RD decision reads, and by the end of a
-GOP it is wrong by a quarter of a dB.
+Two effects pulling opposite ways. **Clamping helps** (a reconstruction overshooting 255 in a
+bright sky is pulled back, and the overshoot grows down a GOP — which is what looked like drift).
+**Rounding hurts** (up to half a level the float reconstruction never carries), and dominates at
+high quality. The tell was that the gap **changes sign**: blue_sky last frame, decoder minus
+encoder, +0.222 dB at q=25, +0.355 at q=50, +0.231 at q=75, **−0.530 at q=90**. Drift accumulates
+one way; this does not. It was also content-dependent — flat on old_town_cross, +0.36 on
+blue_sky — which a real divergence would not be.
 
-**Not the deblock filter** — the divergence persists with `GNC_REF_DEBLOCK` off. Cause unknown.
-Any RD or rate-control work should treat encoder-internal PSNR as suspect until this is diagnosed.
-First step: find whether the local decode's reference buffer differs from the decoder's after one
-P-frame, and if so by what.
+Every metric now quantises both inputs to the output grid first, same expression and same order as
+the pack shader. Gap collapses to ±0.005 dB. **This matters most where GNC is aimed:** at
+contribution quality the old metric overstated by half a dB, and it is what rate control and any
+RD decision read.
+
+Two consequences, both correct: the checkerboard q90 golden baseline moved 50.82 → 50.19 dB (the
+cost of rounding, previously uncharged — the codec did not change), and the PSNR monotonicity test
+now stops at 55 dB, above which the 8-bit grid dominates and two encodes within ±1 of the source
+can order either way. Verified that a plain gradient reconstructs *exactly* from q=92 up, so there
+is no defect behind that.
+
+### RATE-1 — Above ~q=90 on smooth content an 8-bit encode buys precision it cannot emit (todo, P2)
+On the test gradient, q=90 costs 0.275 bpp and q=95 costs **1.142 bpp** — four times the bits for
+output that is bit-identical at 8 bits. Not a bug: the anchor ladder halves qstep and zeroes the
+dead zone up there, as designed. But nothing tells it the output is 8-bit.
+
+For a contribution codec that may emit 10-bit the extra precision is real, which is why the ladder
+should stay. A rate-control rule that knows the output bit depth could stop spending on it when the
+target is 8-bit. Measure how much is recoverable across content before building anything — the
+gradient is the best case for this and real content will show less.
 
 ### MEAS-2 — Feature toggling: what contributes and how much? (in progress 2026-09-06)
 First toggle measured: **`GNC_REF_DEBLOCK` — neutral to negative, default flipped off.** Its own

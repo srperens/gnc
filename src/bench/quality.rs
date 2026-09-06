@@ -1,6 +1,40 @@
-/// Quality metrics: PSNR, SSIM
+//! Quality metrics: PSNR, SSIM
+//!
+//! # Everything here is measured on the output grid, not on floats
+//!
+//! The encoder holds its reconstruction as `f32`, but what a viewer sees is what `pack_u8.wgsl`
+//! writes: `u32(clamp(f + 0.5, 0.0, peak))`. Those are not the same signal, and comparing the
+//! float one overstates or understates quality depending on the content:
+//!
+//! - **Clamping** helps. A reconstruction that overshoots 255 in a bright sky is pulled back to
+//!   255, which is closer to the source than the float value was.
+//! - **Rounding** hurts. Quantising to integers adds up to half a level of error the float
+//!   reconstruction does not have.
+//!
+//! Which one wins depends on how far the reconstruction leaves the valid range versus how much
+//! rounding costs, so the error changes *sign* with quality. Measured on blue_sky, 10 frames,
+//! last frame of the GOP, encoder-internal PSNR against the real decoded output: **+0.22 dB at
+//! q=25, +0.36 at q=50, +0.23 at q=75, −0.53 at q=90.** That was filed as BUG-8, a suspected
+//! encoder/decoder drift; it is not drift, and there is no divergence in the reference buffers.
+//! It was this metric measuring a reconstruction that never leaves the encoder.
+//!
+//! It matters because these numbers drive rate control and any RD decision, and at contribution
+//! quality — where GNC is aimed — the old metric *overstated* quality by half a dB.
+//!
+//! So every function here quantises both inputs to the output grid first. For a source loaded
+//! from an 8-bit PNG that is a no-op; for a float reconstruction it is the difference between
+//! measuring the codec and measuring an intermediate.
+
+/// Quantise a sample to the integer grid the decoder will actually emit.
 ///
-/// Compute Peak Signal-to-Noise Ratio between original and reconstructed frames.
+/// Must match `pack_u8.wgsl` / `pack_u16.wgsl` exactly, including the order: add the rounding
+/// offset, *then* clamp, then truncate. `peak` is `255.0` for 8-bit and `1023.0` for 10-bit.
+#[inline]
+pub fn to_output_grid(v: f32, peak: f32) -> f64 {
+    ((v + 0.5).clamp(0.0, peak)).floor() as f64
+}
+
+/// /// Compute Peak Signal-to-Noise Ratio between original and reconstructed frames.
 /// Both inputs are f32 slices in [0, peak_val] range, same length (W*H*3 interleaved).
 pub fn psnr(original: &[f32], reconstructed: &[f32], peak_val: f32) -> f64 {
     assert_eq!(original.len(), reconstructed.len());
@@ -10,7 +44,7 @@ pub fn psnr(original: &[f32], reconstructed: &[f32], peak_val: f32) -> f64 {
         .iter()
         .zip(reconstructed.iter())
         .map(|(a, b)| {
-            let diff = (*a as f64) - (*b as f64);
+            let diff = to_output_grid(*a, peak_val) - to_output_grid(*b, peak_val);
             diff * diff
         })
         .sum::<f64>()
@@ -33,7 +67,8 @@ pub fn psnr_per_channel(original: &[f32], reconstructed: &[f32], peak_val: f32) 
     let mut mse = [0.0f64; 3];
     for i in 0..pixels {
         for c in 0..3 {
-            let diff = (original[i * 3 + c] as f64) - (reconstructed[i * 3 + c] as f64);
+            let diff = to_output_grid(original[i * 3 + c], peak_val)
+                - to_output_grid(reconstructed[i * 3 + c], peak_val);
             mse[c] += diff * diff;
         }
     }
@@ -75,8 +110,8 @@ pub fn ssim_approx(original: &[f32], reconstructed: &[f32], peak_val: f32) -> f6
 
     // Use luminance channel (index 0 of each triple)
     for i in 0..pixels {
-        let x = original[i * 3] as f64;
-        let y = reconstructed[i * 3] as f64;
+        let x = to_output_grid(original[i * 3], peak_val);
+        let y = to_output_grid(reconstructed[i * 3], peak_val);
         mu_x += x;
         mu_y += y;
     }
@@ -85,8 +120,8 @@ pub fn ssim_approx(original: &[f32], reconstructed: &[f32], peak_val: f32) -> f6
     mu_y /= n;
 
     for i in 0..pixels {
-        let x = original[i * 3] as f64;
-        let y = reconstructed[i * 3] as f64;
+        let x = to_output_grid(original[i * 3], peak_val);
+        let y = to_output_grid(reconstructed[i * 3], peak_val);
         sigma_x2 += (x - mu_x) * (x - mu_x);
         sigma_y2 += (y - mu_y) * (y - mu_y);
         sigma_xy += (x - mu_x) * (y - mu_y);
@@ -131,7 +166,8 @@ pub fn psnr_tile_boundary(
             let pixel_idx = (y * width + x) * 3;
             let mut sq_err = 0.0f64;
             for c in 0..3 {
-                let diff = (original[pixel_idx + c] as f64) - (reconstructed[pixel_idx + c] as f64);
+                let diff = to_output_grid(original[pixel_idx + c], peak_val)
+                    - to_output_grid(reconstructed[pixel_idx + c], peak_val);
                 sq_err += diff * diff;
             }
             if is_boundary {

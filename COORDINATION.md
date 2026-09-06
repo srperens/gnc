@@ -149,6 +149,14 @@ wrong conclusions have come from this one error.
 
 Newest first. If you have measurements taken before one of these, they are suspect.
 
+- **LOSSLESS-1** — q=100 now codes MED prediction residuals instead of wavelet coefficients
+  (`TransformType::MedPredict`, bitstream `transform_type = 2`, `GNC_MED=0` to revert). Files are
+  **14.9% smaller, still bit-exact**. **Invalidates every lossless figure in this repo**, including
+  the "beats JPEG 2000 by 10.8%, loses to FFV1 by 27%" line — the FFV1 gap is now +25.8% measured
+  as +48.4% before the change, so that comparison was against a different baseline than it reads.
+  Also note `is_lossless()` now decides per transform type; anything keying on it should be
+  re-read.
+
 - **ENT-1** — subband-rANS frequency tables are now Exp-Golomb packed (bit 31 of the tile's
   `num_groups` word). Files shrink 11.7–26.6% on that coder at bit-identical quality; the preset
   path (q ≤ 20) shrinks 4.5%. **Invalidates every absolute byte or bpp figure for the rANS coder**,

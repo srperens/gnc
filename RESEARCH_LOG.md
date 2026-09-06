@@ -8276,3 +8276,77 @@ second is the useful one:
 
 **Machine was heavily loaded throughout (load average 50–109, four other sessions).** Irrelevant
 here: every figure above is bpp, PSNR or dE00, all deterministic. No throughput number is quoted.
+
+---
+
+## 2026-09-06 — LOSSLESS-1 built: MED prediction instead of the wavelet, −14.9% at q=100
+
+Built in a worktree on `lossless`, rebased onto `e872904`, merged. All four images verified
+bit-exact through encode → file → decode, not just in memory.
+
+### Result
+
+| image | wavelet (q=100) | MED | delta | bit-exact |
+|---|---|---|---|---|
+| bbb_1080p | 3 436 337 | 3 235 737 | −5.8% | yes |
+| touchdown_1080p | 3 195 978 | 2 724 578 | −14.7% | yes |
+| kristensara_720p | 1 190 210 | 984 178 | −17.3% | yes |
+| blue_sky_1080p | 2 911 571 | 2 278 064 | **−21.8%** | yes |
+| mean | | | **−14.9%** | |
+
+Against the field, same images, `ffv1 -level 3` and the source PNGs:
+
+| | vs FFV1 before | vs FFV1 now | vs PNG now |
+|---|---|---|---|
+| bbb | +37.7% | +29.7% | −1.4% |
+| blue_sky | +65.4% | +29.4% | −18.8% |
+| touchdown | +40.9% | +20.1% | −19.3% |
+| kristensara | +49.7% | +23.8% | −20.7% |
+| mean | **+48.4%** | **+25.8%** | −15.1% |
+
+**Half the FFV1 gap closed in one change**, and GNC now beats PNG on three of four images where
+before it lost to PNG on all four.
+
+### What it is
+
+A third `TransformType`, selected at q=100 only. The residual is
+`pixel − MED(left, above, above-left)` — the LOCO-I/FFV1 predictor — in GNC's own reversible
+YCoCg-R, entropy-coded directly with no transform. Prediction resets at every tile boundary, so
+tiles stay independently decodable.
+
+**Forward is fully parallel**, which is the part that makes this viable at all: at lossless the
+encoder's reconstruction *is* its input, so every thread reads its neighbours from `src` and the
+serial dependency never materialises on the encode side. Only decode marches the wavefront —
+`2*tile_size-1` anti-diagonals, one workgroup per tile, a storage barrier between each. That was
+gated in advance at 4.9x one pass, 201 fps on 1080p 4:4:4.
+
+### The bug that cost the first run
+
+The first roundtrip came back with max error 36 and 92% of pixels wrong. Cause: `is_lossless()`
+tested `transform_type == Wavelet`, so the MED configuration did not qualify and the **integer-exact
+YCoCg-R was silently switched off**. Small per-pixel colour error, then MED chaining it along
+every row of every tile — which is exactly why the error looked far larger than a rounding bug.
+`is_lossless()` now decides per transform: LeGall for the wavelet, unconditionally true for MED
+(a difference of integers is an integer), false for the DCT.
+
+Worth recording as a pattern: **a predicate that enumerates the old cases silently excludes the
+new one**, and a predictive coder amplifies whatever that costs.
+
+### Against the gate
+
+The offline gate predicted −9.5 / −19.6 / −20.0 / −26.2%; measured is −5.8 / −14.7 / −17.3 /
+−21.8%. **79% of prediction, uniformly short rather than scattered**, which points at a systematic
+cause rather than noise: the gate modelled zeroth-order entropy of the residual, while Rice codes
+a significance bit per coefficient. That bit is nearly free on quantised wavelet coefficients,
+which are mostly zero, and is close to a wasted bit per pixel on a MED residual, which is dense.
+
+**So the remaining +26% against FFV1 is an entropy-coding gap, not a prediction gap** — FFV1 pairs
+the same predictor with context modelling and adaptive range coding. That is precisely what the
+abac track is building. MED residuals plus a context-adaptive coder is the FFV1 recipe, and both
+halves now exist in this repo.
+
+### Not measured
+
+Decode throughput on the real path. Four sessions were building on this machine and COORDINATION
+rule 1 forbids timing under load; the 201 fps figure is the isolated gate, not the shipped
+decoder. Measure on an idle machine before quoting any lossless fps.

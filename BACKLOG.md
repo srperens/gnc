@@ -384,7 +384,7 @@ and x264 `-qp 0` by 43% at q=100, and both win by decorrelating against the neig
 the scale. Whether that transfers here is **untested, not refuted** — it cannot be measured until
 this reconstructs.
 
-### LOSSLESS-1 — prediction-based lossless path (**both gates PASSED 2026-09-06**, P1)
+### LOSSLESS-1 — prediction-based lossless path (**BUILT AND MEASURED 2026-09-06**)
 GNC is 27% behind FFV1 and 43% behind x264 `-qp 0` at q=100, and both win the same way: a
 per-pixel median predictor whose error is entropy-coded **directly**, with no transform. GNC's own
 block intra prediction was fixed and measured (BUG-13) and costs **4-8%** at lossless — but it
@@ -430,6 +430,34 @@ not synchronisation** — the short diagonals idle most of the workgroup.
 **Both gates are green. This is buildable.** Scope: a second coding path (MED predict + entropy
 code, no wavelet) selected at q=100, with the wavefront only on the decode side — encode-side MED
 is fully parallel at lossless because the encoder's reconstruction equals its input.
+
+**Built and shipped.** `TransformType::MedPredict`, bitstream `transform_type = 2`, selected at
+q=100; `GNC_MED=0` restores the wavelet. Four images, every one verified bit-exact through
+encode → file → decode:
+
+| image | wavelet | MED | delta |
+|---|---|---|---|
+| bbb | 3 436 337 | 3 235 737 | −5.8% |
+| touchdown | 3 195 978 | 2 724 578 | −14.7% |
+| kristensara | 1 190 210 | 984 178 | −17.3% |
+| blue_sky | 2 911 571 | 2 278 064 | **−21.8%** |
+| mean | | | **−14.9%** |
+
+**The FFV1 gap halves: +48.4% → +25.8%**, and GNC now beats PNG by ~19% on three of four images
+where it previously lost to PNG on all four.
+
+**Delivered 79% of the gate, uniformly short**, which located the remainder precisely: the gate
+modelled zeroth-order entropy while Rice spends a significance bit per coefficient — nearly free
+on sparse wavelet coefficients, close to a wasted bit per pixel on a dense MED residual. **The
+remaining +26% against FFV1 is therefore an entropy-coding gap, not a prediction one.**
+
+**Follow-up (open, P1): MED residuals through the abac coder.** FFV1's recipe is this predictor
+plus context modelling and adaptive range coding. Both halves now exist in the repo and have never
+been put together. Expect a large part of the remaining 26%.
+
+**Follow-up (open, P3): decode throughput on the real path.** The 201 fps wavefront figure is the
+isolated gate; the shipped decoder has never been timed, and the machine was too loaded to do it
+(COORDINATION rule 1).
 
 ### BUG-14 — Huffman's stream mapping has BUG-11 (todo, P4)
 `huffman_encode.wgsl`, `huffman_decode.wgsl` and `huffman_histogram.wgsl` all carry the same

@@ -6995,3 +6995,88 @@ code-blocks — 64 coefficients to adapt 18 context probabilities on. That is th
 too-little-data problem that killed the 256-stream variant, at a smaller scale. A block-size rule
 that merges the deep subbands into one code-block is probably worth measuring before the shader is
 written.
+
+---
+
+## 2026-09-06 — BUG-10 corrected: it is not a ceiling, it is TUNE-5. And BUG-9's cause was wrong too.
+
+### BUG-10's diagnosis was wrong
+
+My entry earlier today concluded that "inter frames have a quality ceiling independent of the
+quantiser" and listed three untested suspects: reference precision, the interpolation filter, and
+clamping. **All three are wrong, and the real cause was committed to this repo eight hours
+earlier**: `TUNE-5` (1e238f9) sets `GNC_P_QP_SCALE` to 1.25, quantising P-frames 25% coarser than
+intra. I listed that commit in my own log output and did not connect it.
+
+Verified on the current build — touchdown, 8 frames, q=99, ki=8:
+
+| | rate | avg PSNR | min (worst P) | max (I) | stddev |
+|---|---|---|---|---|---|
+| `GNC_P_QP_SCALE=1.25` (default) | 11.81 bpp | 49.46 | **45.01** | 59.87 | 5.60 |
+| `GNC_P_QP_SCALE=1.0` | 13.00 bpp | **59.80** | **59.77** | 59.87 | **0.03** |
+
+**The ceiling disappears completely.** Not attenuated — gone: every P-frame lands within 0.1 dB of
+the I-frame. The first step down is ~1.9 dB, which is what a 25% coarser quantiser costs, and each
+frame then inherits its predecessor's error, so the chain decays until it flattens.
+
+**Cost of switching it off: +10.1% bits for +10.3 dB** at this operating point.
+
+### The explicit-qstep anomaly, also explained
+
+The same entry reported P-frames at 36.5–36.8 dB with an explicit `--qstep`, far below the q=99
+numbers, and treated it as further evidence of a hard cap. It is not: `--qstep` overrides only the
+step, and the CLI's `-q` still defaults to 75, so `dead_zone` stayed at 0.75 while `q=99` sets it
+to 0.0. Those runs were quantising with a large dead zone *and* the 1.25 P-frame scale. Not
+comparable, and not evidence of anything.
+
+### What survives, and it is the more important half
+
+The measurement that motivated BUG-10 still stands, and now has a mechanism rather than a mystery:
+
+**At contribution quality, motion compensation earns essentially nothing.** With the scale at 1.0,
+1 I-frame + 7 P-frames costs 13.00 bpp, against 13.25 bpp for all-intra on the same content — a
+**1.9% saving** for the entire inter path. TUNE-5 made the inter path *look* cheap (11.81 bpp) by
+paying in quality instead of bits, and at contribution quality that trade is a bad one.
+
+This is consistent with everything else measured this week: all-intra beating `ki=8` at matched
+quality, the B-pyramid ceasing to pay as the quantiser gets finer, and "inter saves 17–27%"
+holding only at equal qstep.
+
+**TUNE-5 is not wrong** — it was measured at distribution bitrates, where 25% coarser P-frames buy
+real rate. It is wrong *at the contribution operating point*, which is a different question than
+the one it was measured against. The lever should follow the operating point.
+
+### BUG-9's recorded cause was also wrong
+
+I wrote that rANS's "GPU alphabet cannot represent the symbol range below about qstep 1.5". That
+points at `MAX_ALPHABET`, and it is the wrong constant. The real mechanism, confirmed in the code
+and now in the error message:
+
+`rans_gpu_encode.rs` gives each stream a fixed `MAX_STREAM_BYTES = 4096` output slot, and the
+shader writes **backwards** from the end of it, so `write_ptr` counts down. A stream needing more
+than 4 KB underflows and wraps to a huge `u32`, which surfaced as
+`range start index 4297717596 out of range`. The alphabet is not the limit; the **output slot** is.
+Rice does not hit this because its `k` follows qstep and it carries an overflow flag.
+
+Fixed as a bounds check with an actionable message rather than a cryptic slice panic:
+
+```
+rANS stream 672 overflowed its 4096-byte output slot (write_ptr=4294965084).
+rANS cannot encode this configuration; it happens at very fine quantiser steps.
+Use --rice, or a coarser --qstep.
+```
+
+`write_ptr=4294965084` is 2^32 − 2212, so that stream needed 6308 bytes against a 4096-byte slot.
+
+**Deliberately not fixed:** making rANS actually encode at these steps. It is only selected below
+q=20, where qstep is 32 or coarser and 4 KB is ample, and it loses to Rice above q=20 anyway. That
+would be work for a path nobody takes.
+
+189 tests pass; clippy clean on native and wasm.
+
+### Process note
+
+Two of my three diagnoses today were wrong in the same way: I reasoned from a plausible mechanism
+instead of checking what had just been committed. BUG-10's cause was in the log I had printed
+myself. LOOP.md's rule is *suspect the measurement first* — the sibling rule it needs is **read the
+recent commits before attributing a defect to a mystery.**

@@ -148,7 +148,36 @@ both halves.
 `GNC_B_PYRAMID=1`. Justified on two independent measurements — rate on camera content, and 160 ms
 of reordering latency (MEAS-6) that applies regardless of content.
 
-### BUG-10 — P-frame quality saturates; adding bits does not improve an inter frame (todo, **P0**)
+### BUG-10 — P-frame quality saturates (**CORRECTED AND CLOSED 2026-09-06** — it is TUNE-5)
+**The original diagnosis in this entry was wrong.** It is not a structural ceiling and none of the
+three suspects it listed (reference precision, interpolation filter, reconstruction clamping) is
+involved. The cause is `TUNE-5` (1e238f9): `GNC_P_QP_SCALE` defaults to 1.25, quantising P-frames
+25% coarser than intra, and each frame inherits its predecessor's error down the chain.
+
+Verified, touchdown, 8 frames, q=99, ki=8:
+
+| | rate | avg | min (worst P) | stddev |
+|---|---|---|---|---|
+| scale 1.25 (default) | 11.81 bpp | 49.46 | 45.01 | 5.60 |
+| scale 1.0 | 13.00 bpp | **59.80** | **59.77** | **0.03** |
+
+The ceiling vanishes; +10.1% bits for +10.3 dB. The explicit-qstep figures in the original entry
+were also confounded — `--qstep` leaves `-q` at its default of 75, so `dead_zone` stayed 0.75.
+
+**What survives is more important than the bug.** With the scale at 1.0, 1I+7P costs 13.00 bpp
+against 13.25 bpp for all-intra — motion compensation earns **1.9%** at contribution quality.
+TUNE-5 made the inter path look cheap by paying in quality rather than bits. TUNE-5 is not wrong;
+it was measured at distribution bitrates. **The lever should follow the operating point** — that is
+the open item, see below.
+
+### TUNE-6 — P-frame quantiser scale should follow the operating point (todo, P1)
+`GNC_P_QP_SCALE=1.25` is right at distribution bitrates (measured, TUNE-5) and wrong at
+contribution quality, where it costs 10.3 dB to save 10% of bits (BUG-10). Make it quality-
+dependent, the way the entropy coder now follows quality (TUNE-3). Measure the crossover before
+picking a rule — BUG-5 is the cautionary example, where an assumed quality threshold turned out to
+be content.
+
+
 Measured 2026-09-06, touchdown, 17 frames, ki=8, Rice, 4:4:4. `min` is the worst P-frame, `max`
 the I-frame:
 

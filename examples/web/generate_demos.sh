@@ -1,13 +1,21 @@
 #!/usr/bin/env bash
 #
-# Generate demo .gnv files (I+P+B motion vectors) for the web player.
-# Uses benchmark-sequence --output, which encodes, decodes, and reports per-frame
-# PSNR/SSIM/bpp — same diagnostics as the research workflow.
-# For temporal wavelet demos (GNV2), see generate_demos_tw.sh.
-# Re-run this whenever the bitstream format changes.
+# Generate the demo set for the web player.
 #
-# Requires: cargo build --release (gnc binary)
-# Source material: test_material/frames/sequences/ (run fetch_test_frames.sh first)
+# Replaces the four scripts that used to live here (generate_demos.sh, generate_demos_tw.sh,
+# generate_demos_tw_bbb2min.sh, generate_demos_chroma.sh). They referenced source clips that are
+# no longer fetched and built 300-1800 frame demos that took an hour; this produces a browsable
+# set in a few minutes.
+#
+# What each group demonstrates:
+#   1. Quality range — q=25 to q=100. The range above q=92 was dead until 2026-09-06 (an rANS
+#      constraint capped qstep at 2.0 for every coder); q=100 is bit-exact lossless.
+#   2. Temporal mode — I+P against the Haar temporal wavelet on the same clip. Measured
+#      2026-09-06 on three sequences: the wavelet is +2.4 to +5.4 dB PSNR at equal q.
+#   3. Chroma format — 4:4:4 / 4:2:2 / 4:2:0 at matched q.
+#
+# Requires: cargo build --release, and test_material/frames/sequences populated.
+# Output is gitignored. Re-run after any bitstream change.
 #
 set -euo pipefail
 
@@ -15,114 +23,62 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 GNC="$ROOT/target/release/gnc"
 SEQ="$ROOT/test_material/frames/sequences"
-
-# Helper: resolve y4m path for a sequence directory
-y4m() { echo "$SEQ/$1/$1.y4m"; }
 OUT="$SCRIPT_DIR"
 
-if [ ! -x "$GNC" ]; then
-    echo "Building gnc..."
-    (cd "$ROOT" && cargo build --release)
-fi
+[ -x "$GNC" ] || { echo "Build first: cargo build --release" >&2; exit 1; }
 
-# Encode a demo using benchmark-sequence (gives per-frame PSNR/SSIM + saves GNV1).
-# Usage: bench_encode <output-name> <y4m-path> [benchmark-sequence flags...]
-bench_encode() {
-    local name="$1"
-    local input="$2"
-    shift 2
-
-    local outfile="$OUT/${name}.gnv"
-    echo ""
-    echo "=== ${name}.gnv ==="
-
-    "$GNC" benchmark-sequence -i "$input" -o "$outfile" "$@"
-
-    local size
-    size=$(ls -lh "$outfile" | awk '{print $5}')
-    echo "  → saved: $outfile ($size)"
+# Pick the first clip that exists, so the script survives a different fetch.
+pick() {
+    for name in "$@"; do
+        [ -f "$SEQ/$name/$name.y4m" ] && { echo "$SEQ/$name/$name.y4m"; return 0; }
+    done
+    return 1
 }
 
-# Clean old GNV1 demo files (not tw_* which belong to generate_demos_tw.sh)
-echo "GNC demo file generator (GNV1 — I+P+B, benchmark-sequence)"
-echo "============================================================"
-echo "output: $OUT"
-echo ""
-echo "Removing old .gnv files..."
-rm -f "$OUT"/*.gnv
+CLIP_MAIN=$(pick bbb_2min big_buck_bunny bbb ducks_take_off) \
+    || { echo "No source clip with a .y4m found under $SEQ" >&2; exit 1; }
+CLIP_MOTION=$(pick ducks_take_off crowd_run park_joy) || CLIP_MOTION="$CLIP_MAIN"
+CLIP_CHROMA=$(pick crowd_run park_joy ducks_take_off) || CLIP_CHROMA="$CLIP_MAIN"
 
-# --- Broadcast sequences (long, q=75) ---
+echo "Sources:"
+echo "  quality range : $(basename "$CLIP_MAIN")"
+echo "  temporal      : $(basename "$CLIP_MOTION")"
+echo "  chroma        : $(basename "$CLIP_CHROMA")"
+echo
 
-bench_encode "ducks_q75" \
-    "$(y4m ducks_take_off)" \
-    -q 75 -n 300 --keyframe-interval 9 --chroma-format 444
+encode() {                       # encode <outfile> <source> <frames> [flags...]
+    local out="$1" src="$2" frames="$3"; shift 3
+    printf '  %-26s ' "$(basename "$out")"
+    if "$GNC" benchmark-sequence -i "$src" -n "$frames" -k 8 --output "$out" "$@" \
+         > "${out}.log" 2>&1; then
+        printf '%12s bytes\n' "$(wc -c < "$out" | tr -d ' ')"
+    else
+        printf 'FAILED (%s)\n' "$(basename "$out").log"
+    fi
+}
 
-bench_encode "rush_hour" \
-    "$(y4m rush_hour)" \
-    -q 75 -n 200 --keyframe-interval 9 --chroma-format 444
+echo "Removing previous demo files..."
+rm -f "$OUT"/*.gnv "$OUT"/*.gnv2 "$OUT"/*.log
 
-bench_encode "old_town_cross" \
-    "$(y4m old_town_cross)" \
-    -q 75 -n 200 --keyframe-interval 9 --chroma-format 444
+echo "1/3  Quality range — same clip, q=25 to lossless"
+for q in 25 50 75 92; do
+    encode "$OUT/range_q${q}.gnv" "$CLIP_MAIN" 24 -q "$q"
+done
+# Same frame count as the rest of the group. A shorter clip here made lossless look *cheaper*
+# than q=92 in an earlier version of this script — bbb_2min opens on a quiet intro, so 8 frames
+# is not comparable with 24. Keep the group uniform or the comparison it exists to show is false.
+encode "$OUT/range_q100_lossless.gnv" "$CLIP_MAIN" 24 -q 100
 
-bench_encode "pedestrian_area" \
-    "$(y4m pedestrian_area)" \
-    -q 75 -n 200 --keyframe-interval 9 --chroma-format 444
+echo
+echo "2/3  Temporal mode — same clip, same q"
+encode "$OUT/temporal_ip.gnv"    "$CLIP_MOTION" 24 -q 75 --temporal-wavelet none
+encode "$OUT/temporal_haar.gnv2" "$CLIP_MOTION" 24 -q 75 --temporal-wavelet haar
 
-# --- Long-form ---
+echo
+echo "3/3  Chroma format — same clip, same q"
+for fmt in 444 422 420; do
+    encode "$OUT/chroma_${fmt}.gnv" "$CLIP_CHROMA" 24 -q 50 --chroma-format "$fmt"
+done
 
-bench_encode "bbb_2min" \
-    "$(y4m bbb_2min)" \
-    -q 75 -n 1800 --keyframe-interval 27 --chroma-format 444
-
-bench_encode "bbb_2min_q5" \
-    "$(y4m bbb_2min)" \
-    -q 5 -n 1800 --keyframe-interval 27 --chroma-format 444
-
-# --- Chroma subsampling: Crowd Run ---
-
-bench_encode "crowd_444_q50" \
-    "$(y4m crowd_run)" \
-    -q 50 -n 100 --keyframe-interval 9 --chroma-format 444
-
-bench_encode "crowd_422_q50" \
-    "$(y4m crowd_run)" \
-    -q 50 -n 100 --keyframe-interval 9 --chroma-format 422
-
-bench_encode "crowd_420_q50" \
-    "$(y4m crowd_run)" \
-    -q 50 -n 100 --keyframe-interval 9 --chroma-format 420
-
-bench_encode "crowd_444_q25" \
-    "$(y4m crowd_run)" \
-    -q 25 -n 100 --keyframe-interval 9 --chroma-format 444
-
-bench_encode "crowd_422_q25" \
-    "$(y4m crowd_run)" \
-    -q 25 -n 100 --keyframe-interval 9 --chroma-format 422
-
-bench_encode "crowd_420_q25" \
-    "$(y4m crowd_run)" \
-    -q 25 -n 100 --keyframe-interval 9 --chroma-format 420
-
-# --- Chroma subsampling: Park Joy ---
-
-bench_encode "park_joy_444_q50" \
-    "$(y4m park_joy)" \
-    -q 50 -n 100 --keyframe-interval 9 --chroma-format 444
-
-bench_encode "park_joy_422_q50" \
-    "$(y4m park_joy)" \
-    -q 50 -n 100 --keyframe-interval 9 --chroma-format 422
-
-bench_encode "park_joy_420_q50" \
-    "$(y4m park_joy)" \
-    -q 50 -n 100 --keyframe-interval 9 --chroma-format 420
-
-echo ""
-echo "=== Summary ==="
-echo ""
-echo "GNV1 (I+P+B) files:"
-ls -lhS "$OUT"/*.gnv 2>/dev/null || echo "  (none)"
-echo ""
-echo "Serve with: cd examples/web && bash serve.sh"
+echo
+echo "Done. Serve with ./serve.sh, then open player.html"

@@ -3131,7 +3131,14 @@ fn main() {
                 let height = seq.groups[0].low_frame.info.height;
                 let bit_depth = seq.groups[0].low_frame.info.bit_depth;
                 for (i, rgb_f32) in decoded_frames.iter().enumerate() {
-                    let out_path = format!("{}_{:04}.png", output, i);
+                    // Honour the %04d pattern, as the GNV1 path does. This branch used to
+                    // append "_{:04}.png" to the whole argument, so `-o dir/f_%04d.png`
+                    // produced files literally named `f_%04d.png_0000.png`.
+                    let out_path = if output.contains("%04d") {
+                        output.replace("%04d", &format!("{:04}", i))
+                    } else {
+                        format!("{}_{:04}.png", output, i)
+                    };
                     save_image_rgb_f32_bits(&out_path, rgb_f32, width, height, bit_depth);
                     println!("  Wrote frame {} → {}", i, out_path);
                 }

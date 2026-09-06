@@ -8043,3 +8043,66 @@ in-loop filtering and context-adaptive coding partly on parallelism grounds, and
 tax is now quantified at 5× on one pass rather than being a disqualification. Entropy coding is
 51-85% of decode runtime, so it is the right thing to be working on — which is some comfort for
 this track even though its own gate is still open.
+---
+
+## 2026-09-06 — Web demo repaired, and the temporal wavelet is not what we assumed
+
+### BUG-15: the GNV2 decode path ignored the output pattern
+
+`decode-sequence` on a `.gnv2` built its filenames as `format!("{}_{:04}.png", output, i)`, so
+`-o dir/f_%04d.png` produced files literally named `f_%04d.png_0000.png`. The GNV1 branch a hundred
+lines below already did the right thing with `output.replace("%04d", …)`. Fixed to match.
+
+**This had hidden the temporal wavelet's quality for as long as it has been there** — nothing that
+measured a `.gnv2` by decoding it to PNGs could find the frames, and `benchmark-sequence` does not
+print PSNR on that path at all.
+
+### The temporal wavelet works, and is better than assumed
+
+Both modes encode the same clip at the same q with the same entropy coder, so only the temporal
+stage differs — I+P motion compensation against a Haar transform across frame pairs. Decoded and
+measured against the source, three sequences, two quality points:
+
+| sequence | q | mode | bpp | VMAF | PSNR-Y |
+|---|---|---|---|---|---|
+| ducks_take_off | 50 | I+P | 2.38 | 93.32 | 35.20 |
+| ducks_take_off | 50 | **Haar** | 3.28 | **97.87** | **38.09** |
+| ducks_take_off | 75 | I+P | 5.74 | 98.91 | 39.93 |
+| ducks_take_off | 75 | **Haar** | 6.38 | 98.99 | **43.10** |
+| crowd_run | 50 | I+P | 2.15 | 95.40 | 35.69 |
+| crowd_run | 50 | **Haar** | 3.26 | **98.63** | **38.30** |
+| crowd_run | 75 | I+P | 4.88 | 99.18 | 40.30 |
+| crowd_run | 75 | **Haar** | 6.10 | 99.09 | **43.32** |
+| bbb_2min | 75 | I+P | 0.04 | 93.13 | 53.62 |
+| bbb_2min | 75 | **Haar** | **0.03** | **93.26** | **56.02** |
+
+**+2.4 to +5.4 dB PSNR at equal q on every sequence**, VMAF equal or better, and on bbb_2min it is
+*cheaper as well as better*. Interpolating I+P to matched PSNR, Haar is roughly **20% cheaper on
+ducks_take_off and 5% on crowd_run**.
+
+This does **not** contradict the MCTF rejection earlier today — that gate compared *motion-
+compensated* temporal filtering against a P-chain, both open loop. This is unaligned Haar against
+closed-loop I+P, a different comparison. But it does say the temporal wavelet is a live option
+rather than the dead branch the demo page and this log had it filed as. **Worth a proper gate.**
+
+### Web demo
+
+Four generator scripts referencing clips that are no longer fetched, and a demo list of 20 files
+none of which existed, replaced with one `generate_demos.sh` and ten files that do:
+
+- **Quality range** q=25 / 50 / 75 / 92 / 100-lossless, same clip and frame count. Exercises the
+  range above q=92 that was dead until this morning.
+- **Temporal mode** I+P against Haar on the same clip — the comparison above, viewable.
+- **Chroma format** 4:4:4 / 4:2:2 / 4:2:0 at matched q.
+
+`serve.sh` now defaults to plain HTTP on localhost (a secure context, so WebGPU works) instead of
+requiring mkcert and a hardcoded LAN address; `--https` keeps the old behaviour for LAN access.
+`index.html` gained working sample links so the still-frame decoder has something to show.
+
+Verified: WASM builds (570 KB), its four exports match what both pages import, all ten bitstreams
+decode through the CLI, both pages' modules parse, and every asset serves over HTTP.
+**Not verified: an actual browser render** — that needs a human at a browser.
+
+One self-inflicted measurement error worth recording: the first demo set built q=92 from 24 frames
+and lossless from 8, which made lossless look *cheaper* than q=92. bbb_2min opens on a quiet intro.
+Same class of error as several others this week — the group is now uniform.

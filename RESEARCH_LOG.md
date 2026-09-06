@@ -5245,3 +5245,81 @@ all re-measured after it.
 Two sessions sharing one working tree makes any before/after unreliable, because the "before" can
 change under you. The `2I+8P+7B` → `2I+15P+0B` line in the output is what caught it — worth
 checking that the frame mix is what you expect before trusting a sequence comparison.
+
+---
+
+## 2026-09-06 — BUG-5 fixed: hierarchical B-pyramid off by default
+
+### The measurement that decided the shape of the fix
+
+A finer qstep sweep (4 sequences × 6 rate points, matched VMAF) killed the fix I was about to
+build. The earlier reading — "the pyramid wins at distribution bitrates and loses at contribution
+quality" — was an artefact of integrating BD-rate over the whole range. Per rate point:
+
+| qstep | bbb (animation) | old_town | speed_bag | touchdown |
+|---|---|---|---|---|
+| 4.0 | −34.3% | +5.7% | +26.7% | +7.3% |
+| 5.0 | −37.1% | +7.1% | +7.3% | +6.6% |
+| 6.0 | −39.1% | +7.1% | +4.0% | +3.9% |
+| 7.0 | — | +6.6% | — | +0.8% |
+| 8.0 | — | +16.3% | — | −6.5% |
+| 9.0 | — | +19.7% | — | — |
+
+**It is content, not quality.** The pyramid loses on camera content at nearly every rate point
+tested — old_town actually gets *worse* at high qstep — and wins 34–39% on animation everywhere.
+A quality threshold would have been the wrong mechanism.
+
+### The fix
+
+`CodecConfig::b_pyramid`, defaulting to `true` in `Default` (so code constructing a config
+directly keeps the old behaviour, including the four tests that assert B-frame structure) and set
+to **`false` by `quality_preset`**, which is what every CLI path goes through.
+`GNC_B_PYRAMID=1` restores it.
+
+Two independent justifications, and the second is content-independent:
+
+- **Rate**, above.
+- **Latency** (MEAS-6): the pyramid encodes `0 4 8 2 6 1 3 5 7 …`, so frame 1 cannot be coded
+  until frame 8 arrives — 8 frames, **160 ms at 50 fps**, before any coding runs. P-only codes in
+  display order with zero reordering delay.
+
+### Canary
+
+The veto path prints when it fires, since suppression is the non-obvious branch:
+
+```
+GNC: B-pyramid suppressed (ki=17 would allow it) — P-only coding, zero reordering latency.
+```
+
+Verified end to end on the shipped binary. Encode order, `--keyframe-interval 17`:
+
+```
+default            0[I] 1[P] 2[P] 3[P] … 16[P]      (display order, zero delay)
+GNC_B_PYRAMID=1    0[I] 4[B] 8[P] 2[B] 6[B] 1[B] …  (unchanged pyramid)
+```
+
+### Confirmation with the handicap removed
+
+The measurements above compared `ki=8` (3 I-frames over 17) against `ki=17` (1 I-frame), which
+handicapped the P-only arm. Re-run with **both arms at `ki=17`**, so each has exactly one I-frame.
+Rate of the pyramid relative to the new default, at matched VMAF — positive means the new default
+is better:
+
+| sequence | qstep 4.0 | qstep 6.0 |
+|---|---|---|
+| touchdown | **+7.6%** | **+7.8%** |
+| old_town | **+3.3%** | **+4.0%** |
+| speed_bag | **+19.0%** | **+15.9%** |
+| bbb (animation) | −31.4% | — |
+
+Sign and magnitude hold. Removing the handicap did shrink old_town from +5.7/+7.1 to +3.3/+4.0,
+so the earlier figures were mildly inflated — the conclusion is not.
+
+### Caveat, per LOOP.md's own rule
+
+Measured with VMAF, which scores **luma only**, at 4:4:4. B-frames do chroma motion compensation,
+so a chroma effect would be invisible here. The luma conclusion stands; the chroma one is
+unvalidated. Cross-check with CIEDE2000 (MEAS-7) before treating that half as settled.
+
+`cargo test --release` 182 passed / 0 failed. `cargo clippy --release` and
+`--target wasm32-unknown-unknown --lib` both clean.

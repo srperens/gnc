@@ -54,7 +54,7 @@ the inter gap is, and targeting it is guesswork. See RESEARCH_LOG 2026-09-05.
 
 ## Active priority list
 
-### BUG-5 — B-frames stop paying at contribution quality (todo, P0)
+### BUG-5 — B-frames stop paying on camera content (**FIXED 2026-09-06** — pyramid off by default)
 Measured 2026-09-05 on 17 byte-identical 1080p frames (bbb, 4:4:4, Rice, fixed qstep, rate
 control off) — content where the correct answer for every inter frame is "nothing changed".
 

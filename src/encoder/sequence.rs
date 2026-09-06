@@ -165,7 +165,17 @@ impl EncoderPipeline {
         let ki = config.keyframe_interval as usize;
         // Need ki > group_size = B_FRAMES_PER_GROUP + 1 so that at least one full group
         // fits between I-frames (remaining = ki - 1 >= group_size requires ki >= group_size + 1).
-        let use_bframes = ki >= B_FRAMES_PER_GROUP + 2;
+        let ki_allows_bframes = ki >= B_FRAMES_PER_GROUP + 2;
+        // `quality_preset` vetoes the pyramid by default — it costs rate on camera content and
+        // 8 frames of reordering latency. See CodecConfig::b_pyramid.
+        let use_bframes = ki_allows_bframes && config.b_pyramid;
+        if ki_allows_bframes && !config.b_pyramid {
+            // Canary: the veto is the non-obvious path, so say when it fires.
+            eprintln!(
+                "GNC: B-pyramid suppressed (ki={ki} would allow it) — P-only coding, \
+                 zero reordering latency. Set GNC_B_PYRAMID=1 to restore."
+            );
+        }
         let b_count = if use_bframes { B_FRAMES_PER_GROUP } else { 0 };
         let group_size = b_count + 1;
 

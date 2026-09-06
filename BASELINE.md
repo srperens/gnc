@@ -17,6 +17,11 @@ Previous (perceptual weights, #64): q=75 → 42.17 dB / 3.83 bpp / VMAF 95.05
 
 ## Sequence Benchmarks (I+P+B, q=75, ki=9, 10 frames, 4:4:4)
 
+> **Stale as of 2026-09-06.** `quality_preset` now vetoes the hierarchical B-pyramid by default
+> (BUG-5: it costs +3 to +19% at matched VMAF on camera content and 160 ms of reordering
+> latency). Any `-q` run now produces I+P, not I+P+B. Set `GNC_B_PYRAMID=1` to reproduce the
+> figures below. These numbers need re-measuring against the new default.
+
 | sequence   | bpp  | PSNR avg | VMAF  | notes                                                        |
 |------------|------|----------|-------|--------------------------------------------------------------|
 | crowd_run  | 5.55 | 39.04 dB | 99.36 | uniform weights (pre: 5.34 bpp / VMAF 99.12, perceptual)    |

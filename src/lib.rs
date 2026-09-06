@@ -362,6 +362,13 @@ pub struct CodecConfig {
     /// Keyframe interval for temporal coding.
     /// 1 = all I-frames (default, backward compat). N > 1 = I-frame every N frames.
     pub keyframe_interval: u32,
+    /// Allow the hierarchical B-pyramid when `keyframe_interval` is large enough for it.
+    ///
+    /// `true` here means "do not veto"; the pyramid still requires
+    /// `keyframe_interval >= B_FRAMES_PER_GROUP + 2`. Defaults to `true` so that code
+    /// constructing a `CodecConfig` directly keeps the historical behaviour, but
+    /// [`quality_preset`] turns it **off** — see the note there for the measurements.
+    pub b_pyramid: bool,
     /// Use GPU compute shaders for rANS entropy encoding (default: true).
     /// When false, falls back to CPU entropy encoding.
     pub gpu_entropy_encode: bool,
@@ -455,6 +462,7 @@ impl Default for CodecConfig {
             aq_strength: 0.0,
             per_subband_entropy: false,
             keyframe_interval: 1,
+            b_pyramid: true,
             gpu_entropy_encode: true,
             context_adaptive: false,
             target_bitrate: None,
@@ -672,6 +680,22 @@ pub fn quality_preset(q: u32) -> CodecConfig {
         use_fused_quantize_histogram: true, // auto-disabled when CfL is active
         transform_type: TransformType::Wavelet, // block DCT opt-in via config override
         dct_freq_strength: 7.0,
+        // Hierarchical B-pyramid off by default, on two independent measurements (2026-09-06).
+        //
+        // Rate: at matched VMAF the pyramid costs *more* than P-only coding on every camera
+        // sequence tested and at nearly every rate point — old_town +5.7 to +19.7%, touchdown
+        // +0.8 to +7.3%, speed_bag +4.0 to +26.7% over qstep 4-9 — while the P-only comparison
+        // was handicapped by two extra I-frames. It wins 34-39% on animation (bbb), so this is
+        // a content bet, not a quality one; an earlier reading as a quality threshold was an
+        // artefact of integrating BD-rate over the whole range.
+        //
+        // Latency: the pyramid encodes 0 4 8 2 6 1 3 5 7..., so frame 1 cannot be coded until
+        // frame 8 arrives — 8 frames, 160 ms at 50 fps, before any coding runs. P-only codes in
+        // display order with zero reordering delay. That cost is content-independent and matters
+        // directly for the contribution use case (docs/POSITIONING.md).
+        //
+        // Set GNC_B_PYRAMID=1 to restore it — worth it on animation and at low bitrate.
+        b_pyramid: std::env::var("GNC_B_PYRAMID").map(|v| v == "1").unwrap_or(false),
         ..Default::default()
     }
 }

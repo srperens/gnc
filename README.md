@@ -33,12 +33,17 @@ See [`RESEARCH_LOG.md`](RESEARCH_LOG.md) for every measurement, including the on
 
 ### Single-frame (Rice+ZRL entropy)
 
-| Quality | PSNR | BPP | Encode | Decode |
-|---------|------|-----|--------|--------|
-| q=25 (high compression) | 33.2 dB | 1.71 | 39 fps | 72 fps |
-| q=50 (balanced) | 37.7 dB | 2.37 | 40 fps | 60 fps |
-| q=75 (good quality) | 42.8 dB | 4.01 | 40 fps | 59 fps |
-| q=90 (high quality) | 50.5 dB | 8.90 | 40 fps | 63 fps |
+| q | PSNR | BPP | VMAF | levels |
+|---|------|-----|------|--------|
+| 25 | 35.51 dB | 1.60 | 90.25 | 5 |
+| 50 | 40.30 dB | 2.73 | 95.02 | 5 |
+| 75 | 44.84 dB | 4.53 | 96.58 | 5 |
+| 90 | 50.06 dB | 8.07 | 97.08 | 5 |
+
+*Single-frame, 1080p bbb reference, Rice, 4:4:4. **[BASELINE.md](BASELINE.md) is the single source
+for these** — this table was three separate copies from 2026-02-27 and had drifted more than 2 dB.
+Throughput columns are deliberately absent: see BASELINE's fps section for why no single "encode
+fps" exists.*
 
 ### Video sequence
 
@@ -148,7 +153,7 @@ Smooth, monotonic quality scaling from lossless to extreme compression:
 
 ```
 q=100  Lossless     — bit-exact round-trip (LeGall 5/3 integer wavelet)
-q=90   High quality — 49 dB PSNR, near-transparent
+q=90   High quality — 50 dB PSNR, near-transparent
 q=75   Production   — 42 dB PSNR, good general-purpose quality
 q=50   Balanced     — 37 dB PSNR, CfL + adaptive quantization
 q=25   Compressed   — 33 dB PSNR, broadcast-suitable

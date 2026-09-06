@@ -57,7 +57,9 @@ users and no compatibility burden — as long as it is measured and the format m
 **Suspect the measurement before the codec.** Roughly half of this session's dramatic findings
 were bugs in the measuring, not the measured:
 
-- VMAF scores **luma only**. It cannot validate a chroma decision. A `chroma_weight` sweep looked
+- VMAF scores **luma only**, and it cannot validate a chroma decision. Twice proven: CHROMA-1
+  shipped a 6% rate cut on which VMAF read 97.08 before and 97.08 after — no change at all, while
+  the real cost sat entirely in dE00. And earlier, a `chroma_weight` sweep looked
   like a free 15% and reversed sign once measured with CIEDE2000.
 - Pillow **silently truncates 16-bit PNGs to 8 bits on open**. The first 10-bit measurement showed
   no benefit and looked like a codec failure. Use `scripts/png16.py`.

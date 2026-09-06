@@ -231,6 +231,13 @@ Three consequences for this document's argument:
   x264 on CIEDE2000 on all three sequences (0.611 vs 0.684 mean on bbb) with fewer pixels past the
   JND, while sitting 7.4–8.8 dB behind on luma. For a codec sold on generation survival and colour
   fidelity that is the more relevant half, and no VMAF-based comparison can see it.
+- **And the luma gap is not an allocation choice.** The obvious cheap explanation — that GNC simply
+  overspends on chroma — was tested and eliminated (CHROMA-1, 2026-09-06). In the shipped 4:2:0
+  P-chain, moving `chroma_weight` across its whole useful range changes the file by 1.5% and luma
+  by 0.01 dB, because motion compensation leaves almost no chroma residual to reclaim. The knob is
+  a real lever only where intra dominates (−20.8% all-intra against −2.9% on a ki=9 P-chain) —
+  which is a normal contribution mode, so it is worth having, but it does not touch the gap.
+  **The +90.5% is genuine luma coding deficit. Intra is the only route, established by elimination.**
 
 **And do not quote a VMAF BD-rate above about q=85.** Widening the quality ladder moved the VMAF
 figure by a mean of 47.5 points (old_town +81.1% → +191.4%) while PSNR moved 1.0 point. §3's note

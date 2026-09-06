@@ -64,7 +64,12 @@ q[i] = round(coeff[i] / (step × subband_weight × aq_weight)) × sign(coeff[i])
 
 - **Dead zone:** coefficients in `[-dead_zone, +dead_zone]` map to zero
 - **Subband weights:** uniform by default; `GNC_PHYSICAL_WEIGHTS` selects the perceptual curve
-- **Chroma:** `chroma_weight` 1.0–1.5, tightening with quality (1.0 at q≥85)
+- **Chroma:** `chroma_weight` multiplies the chroma quantiser step — 1.5 below q=40, 1.3 to
+  q=60, then **1.2 all the way up** (CHROMA-1, 2026-09-06; it used to drop to 1.0 above q=85,
+  which measured as the wrong direction — −5.2% luma BD-rate for +1.2% on colour). Ignored at
+  q=100, where the quantiser is bypassed. **It is an intra lever**: worth −20.8% on an
+  all-intra sequence and −2.9% on a ki=9 P-chain, because motion compensation leaves almost
+  no chroma residual to coarsen
 - **Quality step:** log-interpolated from preset anchors (q=1,10,25,50,75,85,92,99,100). The
   ladder above q=92 was capped at qstep 2.0 by a stale rANS constraint until 2026-09-06; q=92/96/99
   now give 51.7 / 55.2 / 59.8 dB where they previously gave the same picture three times
@@ -118,14 +123,17 @@ and it stayed where it was.
 
 ## Current Performance (1080p, bbb reference, M1 GPU)
 
-| Quality | PSNR | BPP | Encode FPS | Decode FPS |
-|---------|------|-----|------------|------------|
-| q=25 | 33.2 dB | 1.71 | 39 | 72 |
-| q=50 | 37.7 dB | 2.37 | 40 | 60 |
-| q=75 | 42.8 dB | 4.01 | 40 | 59 |
-| q=90 | 50.5 dB | 8.90 | 40 | 63 |
+| q | PSNR | BPP | VMAF | levels |
+|---|------|-----|------|--------|
+| 25 | 35.51 dB | 1.60 | 90.25 | 5 |
+| 50 | 40.30 dB | 2.73 | 95.02 | 5 |
+| 75 | 44.84 dB | 4.53 | 96.58 | 5 |
+| 90 | 50.06 dB | 8.07 | 97.08 | 5 |
 
-Sequence encode: **31.7 fps** (1080p, q=75, Rice, keyframe interval 8, I+P+B frames)
+*Single-frame, 1080p bbb reference, Rice, 4:4:4. **[BASELINE.md](../BASELINE.md) is the single source
+for these** — this table was three separate copies from 2026-02-27 and had drifted more than 2 dB.
+Throughput columns are deliberately absent: see BASELINE's fps section for why no single "encode
+fps" exists.*
 
 > These throughput figures are indicative to about ±25%. Up to five sessions share this machine and
 > the same workload has timed 25.2, 31.1 and 37.5 ms across three runs. Three different quantities

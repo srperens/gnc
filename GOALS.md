@@ -64,14 +64,17 @@ cost almost nothing, and today it does not.
 **Entropy coder: Rice+ZRL** (256 independent streams/tile, fully GPU-parallel, patent-free).
 rANS and Huffman exist in the codebase but are parked — Rice is the default for all paths.
 
-| Quality | PSNR | BPP | Encode | Decode |
-|---------|------|-----|--------|--------|
-| q=25 | 33.2 dB | 1.71 | 39 fps | 72 fps |
-| q=50 | 37.7 dB | 2.37 | 40 fps | 60 fps |
-| q=75 | 42.8 dB | 4.01 | 40 fps | 59 fps |
-| q=90 | 50.5 dB | 8.90 | 40 fps | 63 fps |
+| q | PSNR | BPP | VMAF | levels |
+|---|------|-----|------|--------|
+| 25 | 35.51 dB | 1.60 | 90.25 | 5 |
+| 50 | 40.30 dB | 2.73 | 95.02 | 5 |
+| 75 | 44.84 dB | 4.53 | 96.58 | 5 |
+| 90 | 50.06 dB | 8.07 | 97.08 | 5 |
 
-*(Single-frame, 1080p bbb reference, M1 GPU, 2026-02-27)*
+*Single-frame, 1080p bbb reference, Rice, 4:4:4. **[BASELINE.md](BASELINE.md) is the single source
+for these** — this table was three separate copies from 2026-02-27 and had drifted more than 2 dB.
+Throughput columns are deliberately absent: see BASELINE's fps section for why no single "encode
+fps" exists.*
 
 **Sequence encode: see [BASELINE.md](BASELINE.md) — three different quantities have been called
 "encode fps" and they differ by 2.4x.** The previously quoted 31.7 fps is not reproducible and its
@@ -125,6 +128,13 @@ See [RESEARCH_LOG.md](RESEARCH_LOG.md), 2026-09-06.
 single luma number overstates the gap for a colour-critical use case and understates the luma
 deficit. Quote both.
 
+**And that allocation difference is not where the gap is — CHROMA-1 checked (2026-09-06).** If GNC
+simply spent more on chroma than the optimum, the luma gap would be partly a config choice. It is
+not: `chroma_weight` moves the file by 1.5% and luma by 0.01 dB in the shipped 4:2:0 P-chain,
+because motion compensation leaves almost no chroma residual to reclaim. The knob is worth
+−20.8% on an all-intra sequence and −2.9% on a ki=9 P-chain. **So the +90.5% is genuine luma
+coding deficit, and intra is the only route** — by elimination now, not by assumption.
+
 **MEAS-4 (2026-09-05) located that gap.** It is *prediction quality*, not the coding model.
 Simulating both models on GNC's own motion-compensated residuals at matched distortion, an
 idealised per-block DCT with oracle block skip beats GNC's wavelet by only 4–23% at broadcast
@@ -160,6 +170,7 @@ GNC should become a **good, robust codec** — not optimized along a single axis
 | Compression (intra) | +46–55% vs H.264 all-I on video (VMAF); +13.9% on stills (PSNR) | ≤ H.264 all-I, measured at contribution quality |
 | Compression (video) | **+90.5% BD-rate on PSNR vs H.264 at contribution quality** (QUAL-1, 2026-09-06; +457% to +672% was distribution bitrates and is superseded) | ≤ +25%, and the remaining gap is intra |
 | Colour accuracy | **ahead of x264 on dE00 at matched rate** (0.611 vs 0.684 mean) while 7.4–8.8 dB behind on luma | keep the colour lead, close the luma gap |
+| Luma/chroma split | on the frontier as of CHROMA-1 (2026-09-06) — `chroma_weight` 1.2 is the largest value that costs nothing on MEAS-8's criterion | leave it; the remaining gap is not here |
 | Quality range | q=1–100 functional | smooth, predictable quality curve |
 | Robustness | basic test coverage | no artifacts, stable across q and content |
 | Bitstream | GNV1/GNV2 defined | well-specified, documented |

@@ -93,10 +93,19 @@ which means **PSNR leads more often than the old "VMAF is primary" rule implied.
 written for the lossy range and was wrong above it.
 
 **VMAF scores the luma plane only.** It cannot see chroma being degraded, so it cannot validate
-any decision about a chroma parameter — chroma weighting, CfL range, chroma format trade-offs. A
-2026-09-05 sweep of `chroma_weight` looked like a free 15% rate saving on VMAF and shrank to
-+0.3 dB, direction-reversing, once measured with a metric that includes chroma. **Chroma
-questions need a chroma-aware metric; VMAF answers luma questions.**
+any decision about a chroma parameter — chroma weighting, CfL range, chroma format trade-offs.
+Twice now this has produced a confident wrong answer:
+
+- A 2026-09-05 `chroma_weight` sweep looked like a free 15% rate saving on VMAF and shrank to
+  +0.3 dB, direction-reversing, once measured with a metric that includes chroma.
+- CHROMA-1 (2026-09-06) shipped a change that cuts 6% of the bits at q=90. **VMAF read 97.08
+  before and 97.08 after** — not "a small change", *no* change, on a 6% rate move. Judged on VMAF
+  alone it is a free win with no cost at all; the cost is real and sits entirely in dE00.
+
+**Chroma questions need a chroma-aware metric; VMAF answers luma questions.** And when the
+question is a luma/chroma *trade*, measure luma in **YCoCg-R** — the plane GNC actually codes.
+A luma computed from decoded RGB is contaminated by chroma error and overstated the loss 3.7x
+(−0.56 dB against a true −0.15 dB). `scripts/ypsnr_de00.py` reports both plus dE00.
 - Always run `--vmaf` on `benchmark` and `rd-curve` — it is nearly free and its absence is worse
   than a saturated reading. But at q>85, report it and lead with PSNR.
 - **A luma number alone cannot describe a rate/quality difference here.** At rate matched to 1%,

@@ -3417,6 +3417,53 @@ fn test_10bit_survives_the_frame_header() {
     );
 }
 
+/// The sequence encoder must carry bit depth through to every frame in the container.
+///
+/// `encode-sequence` had no bit-depth option at all, so the video path — the one the contribution
+/// market requires — was 8-bit regardless of the source. MEAS-8 showed 8-bit is what limits GNC's
+/// colour fidelity, so this was the binding constraint rather than a nicety.
+#[test]
+fn test_10bit_survives_the_sequence_container() {
+    let ctx = crate::GpuContext::new();
+    let mut encoder = EncoderPipeline::new(&ctx);
+
+    let w = 256u32;
+    let h = 256u32;
+    let frames: Vec<Vec<f32>> = (0..4)
+        .map(|k| {
+            let mut v = Vec::with_capacity((w * h * 3) as usize);
+            for y in 0..h {
+                for x in 0..w {
+                    let a = ((x + k) % w) as f32 * 1023.0 / (w - 1) as f32;
+                    let b = y as f32 * 1023.0 / (h - 1) as f32;
+                    v.push(a);
+                    v.push(b);
+                    v.push((a + b) * 0.5);
+                }
+            }
+            v
+        })
+        .collect();
+    let refs: Vec<&[f32]> = frames.iter().map(|f| f.as_slice()).collect();
+
+    let mut config = crate::CodecConfig::default();
+    config.bit_depth = 10;
+    config.keyframe_interval = 4;
+
+    let compressed = encoder.encode_sequence(&ctx, &refs, w, h, &config);
+    assert_eq!(compressed.len(), 4);
+
+    let container = crate::format::serialize_sequence(&compressed, (30, 1));
+    let header = crate::format::deserialize_sequence_header(&container);
+    for i in 0..compressed.len() {
+        let frame = crate::format::deserialize_sequence_frame(&container, &header, i);
+        assert_eq!(
+            frame.info.bit_depth, 10,
+            "frame {i} lost its bit depth through the container",
+        );
+    }
+}
+
 #[test]
 fn test_pframe_yuv422_sequence_roundtrip() {
     let (psnr1, psnr2) = pframe_chroma_sequence_psnr(crate::ChromaFormat::Yuv422);

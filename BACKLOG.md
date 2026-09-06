@@ -169,7 +169,7 @@ to catch.
 running where we think it is.** Add a cross-tier scaling check to the regression suite and keep it
 permanently. Cheap, and it guards the single assumption the whole project rests on.
 
-### FMT-1 — 10-bit support (todo, **P0** — now the binding constraint on colour)
+### FMT-1 — 10-bit support (**DONE 2026-09-06**)
 **Measured 2026-09-06 (MEAS-8): 8-bit, not compression, is what limits GNC's colour fidelity.**
 A single-LSB perturbation of an 8-bit image already gives p95 dE00 of 1.16–1.98 and puts
 8.5–36.6% of pixels above the just-noticeable difference. GNC at q=99 measures *better* than that
@@ -198,9 +198,18 @@ Needed `scripts/png16.py`, since Pillow can neither write nor read 16-bit RGB PN
 silently on open) — without it the measurement would have shown no benefit and looked like a
 codec failure.
 
-**Remaining: `gnc encode-sequence` has no bit-depth option**, so the video path — the one the
-market actually requires — is still 8-bit. Scope is "extend the working still-image 10-bit path
-through the sequence pipeline and container", not "implement 10-bit from scratch".
+**Video path done 2026-09-06.** `encode-sequence` now takes `--bit-depth`, wired through frame
+loading and `CodecConfig`. Verified: decoded frames are 16-bit PNGs, an I-frame at q=100 is
+bit-exact, and P-frames differ by 8–11 units of 1023 — motion compensation, which is not lossless
+at any q, rather than a bit-depth defect. Guarded by
+`test_10bit_survives_the_sequence_container`.
+
+The encode side and the bitstream already handled 10 bits; the gaps were a missing CLI flag and
+three decoder call sites writing 8-bit output unconditionally.
+
+**Follow-up:** the VMAF/PSNR comparison harness still measures at 8 bits, so 10-bit RD curves
+cannot be produced yet. `scripts/png16.py` and `scripts/chroma_metric.py` already handle 16-bit,
+so this is plumbing in `meas1_vs_h264.py`, not new work.
 
 **External requirement, confirmed 2026-09-05.** EBU R 153 specifies 10-bit 4:2:2 Y'C'BC'R for live
 UHD/HDR contribution and forbids SDR transfer functions; EBU TR 091's entire codec test matrix is

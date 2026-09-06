@@ -600,6 +600,11 @@ enum Command {
         /// Chroma subsampling format: 444, 422, or 420 [default: 444]
         #[arg(long, default_value = "444")]
         chroma_format: String,
+
+        /// Bit depth of the input frames (8 or 10). Default: 8.
+        /// 10-bit PNGs must store 10-bit values in the high bits of 16-bit channels.
+        #[arg(long, default_value = "8")]
+        bit_depth: u32,
     },
 
     /// Decode a .gnv or .gnv2 container back to image frames
@@ -2909,6 +2914,7 @@ fn main() {
             diagnostics,
             temporal_wavelet,
             chroma_format,
+            bit_depth,
         } => {
             // encode-sequence is the I+P (motion vector) production encoder → GNV1.
             // For temporal wavelet encoding → GNV2, use benchmark-sequence instead
@@ -2965,7 +2971,7 @@ fn main() {
 
             // Probe first frame for dimensions
             let first_path = input.replace("%04d", &format!("{:04}", 0));
-            let (_, w, h) = load_image_rgb_f32(&first_path);
+            let (_, w, h) = load_image_rgb_f32_bits(&first_path, bit_depth);
 
             let ctx = GpuContext::new();
             let mut encoder = EncoderPipeline::new(&ctx);
@@ -2984,6 +2990,7 @@ fn main() {
 
             config.chroma_format = parse_chroma_format(&chroma_format);
             config.normalize_for_chroma();
+            config.bit_depth = bit_depth;
 
             // Apply rate control settings
             if let Some(ref br) = bitrate {
@@ -2998,7 +3005,7 @@ fn main() {
                 frame_count,
                 |i| {
                     let path = input_pattern.replace("%04d", &format!("{:04}", i));
-                    let (rgb, fw, fh) = load_image_rgb_f32(&path);
+                    let (rgb, fw, fh) = load_image_rgb_f32_bits(&path, bit_depth);
                     assert!(
                         fw == w && fh == h,
                         "Frame {} has different dimensions ({}x{} vs {}x{})",

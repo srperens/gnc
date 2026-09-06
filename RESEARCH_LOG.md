@@ -4942,3 +4942,32 @@ Guarded by `test_10bit_survives_the_frame_header`.
 
 **Still open in FMT-1:** `encode-sequence` has no bit-depth option, so the video path — the one
 the contribution market actually requires — remains 8-bit.
+
+## 2026-09-06 — FMT-1 complete: 10-bit works through the video path
+
+`encode-sequence` had no bit-depth option at all, so the video path was 8-bit whatever the
+source. Added `--bit-depth`, wired through frame loading and `CodecConfig`, and verified end to
+end.
+
+| | result |
+|---|---|
+| decoded frame PNG | IHDR bit depth 16, colour type 2 |
+| I-frame, q=100, 10-bit | **bit-exact** (max abs diff 0) |
+| P-frames, q=100, 10-bit | 8–11 units of 1023 (~1%) |
+
+The P-frame residue is motion compensation, which is not lossless at any q — consistent with the
+codec's documented near-lossless behaviour — not a bit-depth defect. Guarded by
+`test_10bit_survives_the_sequence_container`.
+
+**FMT-1 is now done for both paths.** What made it look larger than it was: the encode side and
+the bitstream already handled 10 bits correctly; the gaps were a missing CLI flag on one command
+and three decoder call sites that wrote 8-bit output unconditionally. Neither was visible without
+a way to inspect 16-bit PNGs, which is why `scripts/png16.py` had to come first.
+
+Two traps worth recording, both of which would have produced a confident wrong answer:
+- **Pillow silently truncates 16-bit RGB PNGs to 8 bits on open**, so the first measurement of the
+  10-bit path showed no benefit whatsoever and looked like a codec failure.
+- A `str.replace` on `load_image_rgb_f32(&path)` hit a second, unrelated command, and an
+  assignment landed in the wrong handler — both caught by the compiler and by checking the
+  container's stored bit-depth byte directly rather than trusting the CLI to have done what was
+  asked.

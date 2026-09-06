@@ -836,10 +836,19 @@ textbook one. **Plausible-to-proceed, not a green light on fps.**
 3. Inter frames. All of the above is intra; residual statistics differ and contexts may need
    re-tuning.
 
-**Flag for whoever picks this up:** at 5 levels the deep subbands give 8×8 code-blocks — 64
-coefficients to adapt 18 context probabilities on, the same too-little-data problem that killed the
-256-stream variant, one scale down. Measure a rule that merges the deep subbands into one
-code-block before writing the shader.
+**Code-block size settled: 128px, i.e. one block per subband.** Swept on bbb at q=55: 16px
+**+1.1% — worse than Rice**, 32px −15.1%, 64px −19.2%, 128px −20.0%, 256px identical to 128 (no
+subband exceeds 128). Verified across images at 128px: blue_sky −24.5/−22.1/−18.9%, touchdown
+−26.1/−23.2/−19.9%, kristensara **−27.6**/−25.0/−23.3% at q=40/55/70. Parallelism remains ample:
+~1900 independent code-blocks per 1080p frame.
+
+That 16px loses to Rice is the **third independent confirmation of one mechanism** today: a
+context-adaptive coder needs symbols to learn on. It killed the 256-stream variant (256 symbols
+each), it orders the block-size sweep, and it is why EBCOT uses code-blocks at all.
+
+The 8×8 deep-subband concern flagged earlier is real but immaterial: LL plus the three level-5
+subbands are 256 of 65536 coefficients, 0.4% of a tile, and they are already one block each. Not
+worth merging subbands into a shared coder. Dropped.
 
 ### BUG-8 — The encoder's local decode diverges from the real decoder down a GOP (**OPEN, not diagnosed**)
 bbb17, 17 frames, ki=17, q=50. Per-frame PSNR of the encoder's own reconstruction vs the actual

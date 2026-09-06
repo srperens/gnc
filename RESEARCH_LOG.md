@@ -7080,3 +7080,39 @@ Two of my three diagnoses today were wrong in the same way: I reasoned from a pl
 instead of checking what had just been committed. BUG-10's cause was in the log I had printed
 myself. LOOP.md's rule is *suspect the measurement first* — the sibling rule it needs is **read the
 recent commits before attributing a defect to a mystery.**
+
+### Code-block size: one block per subband, and a third confirmation of the same mechanism
+
+Swept on bbb at q=55, against the shipped Rice:
+
+| code-block | result |
+|---|---|
+| 16 px | **+1.1%** — worse than Rice |
+| 32 px | −15.1% |
+| 64 px | −19.2% |
+| 128 px | **−20.0%** |
+| 256 px | −20.0% (identical — no subband exceeds 128 at 5 levels in a 256px tile) |
+
+**16px blocks lose to Rice.** 256 coefficients is not enough to learn 18 context probabilities on,
+so the contexts cost more than they save. That is the third independent confirmation of one
+mechanism today: it killed the 256-stream-per-tile variant (256 symbols each, −6.6% → −0.7%), it
+shows up as 32px beating 16px and 64px beating 32px, and it is why EBCOT uses code-blocks at all.
+
+128 px is the pick — one code-block per subband. Verified across images:
+
+| image | q=40 | q=55 | q=70 |
+|---|---|---|---|
+| bbb_1080p | — | −20.0% | — |
+| blue_sky_1080p | −24.5% | −22.1% | −18.9% |
+| touchdown_1080p | −26.1% | −23.2% | −19.9% |
+| kristensara_720p | **−27.6%** | −25.0% | −23.3% |
+
+Roughly 1-2 percentage points better than 64px everywhere. Parallelism is still ample: 16
+code-blocks per tile (LL plus 15 subbands) × 40 tiles × 3 planes ≈ **1900 independent blocks per
+1080p frame**.
+
+**The 8×8 deep-subband concern flagged earlier is real but immaterial.** At 5 levels the level-5
+subbands are 8×8 — 64 coefficients each, far too few to adapt on, and no block-size rule fixes it
+because they are already one block. But LL plus the three level-5 subbands total 256 coefficients
+out of 65536, or 0.4% of a tile. Not worth the complexity of merging subbands into a shared coder,
+which would also mix their statistics. Dropped rather than pursued.

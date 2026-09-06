@@ -154,10 +154,16 @@ pub fn run_multi_plane(
     num_levels: u32,
     rice_reference_bytes: usize,
 ) {
+    // 128 means one code-block per subband at 5 levels in a 256px tile, which measured best.
+    // Swept on bbb at q=55: 16px +1.1% (worse than Rice), 32px −15.1%, 64px −19.2%,
+    // 128px −20.0%, 256px −20.0% (identical, since no subband exceeds 128). Bigger is better
+    // because a context-adaptive coder needs symbols to learn on — the same mechanism that made
+    // the 256-stream variant fail, one scale down. 16px blocks hold 256 coefficients, which is
+    // not enough to learn 18 context probabilities and lands worse than Rice.
     let cb: usize = std::env::var("GNC_ABAC_CB")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(64);
+        .unwrap_or(128);
     eprintln!("[abac] comparison active (GNC_ABAC_COMPARE), code-block {cb}px, {num_levels} levels");
 
     let y = crate::gpu_util::read_buffer_f32(ctx, y_buf, (padded_w * padded_h) as usize);

@@ -57,8 +57,33 @@ the shared checkout** — no absolute paths, no session ids.
 
 | worktree | branch | area |
 |---|---|---|
-| `../gnc-abac` | `abac` | **paused, free to take.** Adaptive binary code-block entropy coder (EBCOT follow-up), CPU + GPU. Rate −15 to −25% confirmed, two coder variants behind `GNC_ABAC_CODER`. Blocked only on `cargo test --release --test abac_bench -- --ignored` on an idle machine. |
+| `../gnc-abac`, `.claude/worktrees/abac` (`abac-gate`) | `abac` | **released — question answered, see BACKLOG Part 6.** The idle-machine bench is run. Range at cb=64 costs **1.69× frame decode for −16.7% rate** at q=90; Interval costs 3.99×. Rice's own entropy stage is 47% of frame decode, which caps any entropy work at 1.9×. What remains is a positioning call, not an engineering one. |
 | `../gnc-abac` | `abac` | same worktree, now on **BUG-8** — the encoder's local decode diverges from the real decoder down a GOP. |
+
+## Timing: an idle machine is necessary and NOT sufficient (added 2026-09-06, after an idle run still lied)
+
+**The GPU ramps its clocks, and a repeat count chosen for a CPU benchmark will not outlast the
+ramp.** On a genuinely idle machine (load 3.8, GPU free), three consecutive *processes* on
+identical input read **66.5, 45.3 and 34.9 ms** — a 1.9× spread, monotonically decreasing. A
+freshly-idle M1 starts in a low power state and needs on the order of a second of sustained work
+to boost. `abac_bench` had a `spread` column that blamed a busy machine for exactly this, so the
+instrument was reporting the ramp *and* misattributing it.
+
+Two rules that follow, and they cost nothing:
+
+- **Take the best of ~24 repeats, not the median of ~7.** For a deterministic kernel on fixed
+  input every error source — clock ramp, another session, scheduler noise — only makes a reading
+  *slower*. The minimum is therefore the least-contaminated estimate, and `median / best` is a
+  free settled-or-not diagnostic: near 1.0 means quotable, well above means keep only the ratios.
+- **Run benches with `--test-threads=1`.** Cargo runs `#[test]` functions concurrently by default,
+  so two GPU benches in one file contend for the device and interleave their output. This was
+  happening and nothing warned about it.
+
+**Isolating one GPU stage without timestamp queries:** dispatch it k times behind an env var and
+difference. Rice's entropy decode is idempotent, so `GNC_RICE_DISPATCH_REPEAT=k` gives frame times
+of 29.50 / 85.16 / 141.55 ms at k = 1 / 5 / 9 — slope 14.0 ms, two independent estimates agreeing
+to 0.6%. That is how the abac question stopped being a bracket and became a number, and the same
+trick works for any idempotent stage.
 
 ## Timing: the machine is shared, so throughput numbers are not measurable during a session
 

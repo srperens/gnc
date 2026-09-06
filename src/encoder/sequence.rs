@@ -3064,27 +3064,56 @@ impl EncoderPipeline {
         res_config.subband_weights = uniform_weights;
         res_config.dead_zone = res_dead_zone;
 
-        // P-frames are quantised 1.25x coarser than intra. Every mature codec does something
-        // like this — x264 runs P about 4 QP steps coarser (~1.6x) — because the I-frame is
-        // referenced by every P that follows, so bits spent there are reused and bits spent on
-        // a P frame are not.
+        // P-frames are quantised coarser than intra, by a factor that follows the operating
+        // point: 1.25x at coarse steps, tapering to 1.0 as the step gets fine.
         //
-        // Measured on VMAF BD-rate against 1.0 at ki=9: blue_sky -0.6%, aerial -0.5%,
-        // bbb17 -5.3%, old_town -6.8% (mean -3.3%, better on all four). 1.5 gains nothing more
-        // on average and costs +2.9% on blue_sky, so 1.25 is the pick. The win grows with GOP
-        // length, as it should when there are more P-frames to spread: at ki=17 on old_town,
-        // 1.25 reaches the same VMAF as 1.0 at 0.65 bpp against 0.82, about -20%.
+        // Why coarser at all: the I-frame is referenced by every P that follows it, so bits spent
+        // there are reused across the GOP and bits spent on a P-frame are not. x264 runs P about
+        // 4 QP steps coarser (~1.6x).
         //
-        // This reverses the 2026-09-05 entry that rejected the lever as "worse than lowering q
-        // uniformly; VMAF min falls 94→71 as reference error propagates". That collapse does not
-        // reproduce. Measured mean-vs-min spread on old_town at ki=17, q=35: 3.32 VMAF points at
-        // 1.0 and 2.75 at 1.25 — the spread *narrows*, and it still narrows at 1.6. The
-        // propagation concern was the right thing to check and it is why min is quoted here, but
-        // the effect is not there.
+        // Why it has to taper. TUNE-5 measured a flat 1.25 at q=15-50 and found -3.3% BD-rate at
+        // ki=9 and about -20% at ki=17. Those are *distribution* bitrates. At contribution
+        // quality the same lever inverts, because each P-frame inherits its predecessor's error
+        // and there is no quantisation floor left to hide it. Compared at matched rate:
+        //
+        //   old_town  q=65: 1.25 is +0.94 dB avg, −0.06 dB on the worst frame — clear win
+        //   old_town  q=85: +0.40 dB avg, **−2.2 dB** worst
+        //   old_town  q=99: **−3.8 dB** avg, **−14.2 dB** worst
+        //   aerial    q=80: +0.81 dB avg, −0.52 dB worst
+        //   aerial    q=90: −0.21 dB avg, **−2.75 dB** worst
+        //
+        // Both sequences turn between q=80 and q=90, and it is the *worst frame* that pays, which
+        // matters more than the average for a contribution codec. A taper rather than a step so
+        // the RD curve has no cliff at the boundary.
+        //
+        // Note on metrics: VMAF is useless here. On old_town at q>=85 it reads 99.64/96.80 for
+        // both settings while the rate differs by 14% and PSNR differs by 4.8 dB on the worst
+        // frame — it has saturated. Above about q=80 PSNR has to lead and VMAF is the cross-check,
+        // the reverse of the usual rule.
+        //
+        // Found by the concurrent session as BUG-10; TUNE-5's measurement was sound for the range
+        // it covered and simply did not cover this one.
+        //
+        // Keyed on the quantiser step rather than on `q`, for two reasons: the step is the
+        // physically relevant quantity — how coarse a P-frame may be depends on how much
+        // quantisation error there is to hide behind, not on a preset index — and `q` is not
+        // available here at all under `--qstep` or rate control, both of which set the step
+        // directly. The breakpoints are the measured ones: q=70 is qstep 4.6 and q=85 is 2.8.
+        const P_SCALE_COARSE_STEP: f32 = 4.6;
+        const P_SCALE_FINE_STEP: f32 = 2.8;
+        let step = config.quantization_step;
+        let p_qp_scale_default: f32 = if step >= P_SCALE_COARSE_STEP {
+            1.25
+        } else if step <= P_SCALE_FINE_STEP {
+            1.0
+        } else {
+            1.0 + 0.25 * (step - P_SCALE_FINE_STEP)
+                / (P_SCALE_COARSE_STEP - P_SCALE_FINE_STEP)
+        };
         let p_qp_scale: f32 = std::env::var("GNC_P_QP_SCALE")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(1.25);
+            .unwrap_or(p_qp_scale_default);
         // The decoder dequantises from the stored config, so both must use this value.
         let res_qstep = (config.quantization_step * p_qp_scale).min(64.0);
         res_config.quantization_step = res_qstep;

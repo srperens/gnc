@@ -2,6 +2,8 @@
 
 All project goals, design rules, and priorities are in **[GOALS.md](GOALS.md)** — the single source of truth. This file contains only AI-specific instructions and technical reference.
 
+**Two Claude sessions work in this checkout concurrently. Read [COORDINATION.md](COORDINATION.md) before starting and update it when you claim or release an area** — it lists what is in flight, what each recent change invalidated, and the measurement rules that have already cost retracted results.
+
 ## Build & Run
 
 ```bash

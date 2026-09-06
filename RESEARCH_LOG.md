@@ -7244,3 +7244,65 @@ single-digit to 27%, bounded above by FFV1's margin.
 
 This is the same error pattern as TUNE-5 and the "inter saves 17–27%" figure: **a lever measured
 at one operating point and then assumed to hold at another.** Three instances in two days.
+
+---
+
+## 2026-09-06 — TUNE-6: the P-frame quantiser scale has to follow the operating point
+
+The concurrent session filed BUG-10 against TUNE-5, and it was right. TUNE-5 set
+`GNC_P_QP_SCALE` to a flat 1.25 on a sweep of q=15-50, and at q=99 that costs **10.3 dB to save
+10% of the bits**. The sweep was sound for the range it covered. It simply did not cover the range
+this project is positioned for — GNC is a contribution codec, and a sweep that stops at q=50 has
+not tested it. That is the methodological failure, and it is mine.
+
+### The measurement
+
+Matched **rate**, not matched q, PSNR average and worst frame, 1.25 against 1.0:
+
+| sequence | q | Δ avg | Δ worst |
+|---|---|---|---|
+| old_town | 65 | +0.94 dB | −0.06 dB |
+| old_town | 75 | +0.93 dB | −0.66 dB |
+| old_town | 85 | +0.40 dB | **−2.2 dB** |
+| old_town | 99 | **−3.8 dB** | **−14.2 dB** |
+| aerial | 70 | +0.56 dB | −0.47 dB |
+| aerial | 80 | +0.81 dB | −0.52 dB |
+| aerial | 90 | −0.21 dB | **−2.75 dB** |
+
+Both sequences turn between q=80 and q=90, and the average hides it: at q=85 on old_town the
+average is still *up* 0.40 dB while the worst frame is down 2.2. The mechanism is plain — each
+P-frame inherits its predecessor's error, and near lossless there is no quantisation noise left for
+that error to hide behind.
+
+### The rule
+
+1.25× while the quantiser step is ≥ 4.6, tapering linearly to 1.0 by step ≤ 2.8. Those are the
+measured breakpoints: q=70 and q=85 on the default ladder.
+
+Keyed on the **step**, not on `q`, for two reasons. The step is the physically relevant quantity:
+how coarse a P-frame may be depends on how much quantisation error there is to hide behind. And
+`q` is not available in `encode_pframe` at all under `--qstep` or rate control, both of which set
+the step directly — and `--qstep` is exactly how a contribution encode would be driven.
+
+Tapered rather than stepped so the RD curve has no cliff at the boundary. Verified after the
+change: old_town at q=99 is back to 59.74 dB average and 59.74 worst, against 54.01/43.60 with the
+flat scale, and q=50 keeps the 1.64 bpp the flat 1.25 bought.
+
+### VMAF is saturated up there, and that is worth generalising
+
+On old_town at q ≥ 85, VMAF reads 99.64 mean / 96.80 min for **both** settings — while the rate
+differs by 14% and the worst-frame PSNR by 4.8 dB. It cannot see the difference at all.
+
+CLAUDE.md's rule is VMAF primary, PSNR as a secondary cross-check, and that rule is right in the
+lossy range and wrong near lossless. **Above roughly q=80, PSNR leads.** This is now in
+COORDINATION.md, because it is the kind of thing that will otherwise be rediscovered by whichever
+session next measures at contribution quality.
+
+### Coordination
+
+`COORDINATION.md` added and linked from CLAUDE.md. Two sessions in one checkout have now cost a
+retracted BD-rate figure, an invalidated measurement premise, and one near-deletion of in-flight
+code. The file records what is claimed, what each of today's changes invalidated, and the four
+measurement rules that have actually bitten us — measure against a commit, measure the range the
+project cares about, watch the metric's saturation, and never judge a rate/quality trade from a
+point measurement at fixed q.

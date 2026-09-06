@@ -170,12 +170,38 @@ TUNE-5 made the inter path look cheap by paying in quality rather than bits. TUN
 it was measured at distribution bitrates. **The lever should follow the operating point** — that is
 the open item, see below.
 
-### TUNE-6 — P-frame quantiser scale should follow the operating point (todo, P1)
-`GNC_P_QP_SCALE=1.25` is right at distribution bitrates (measured, TUNE-5) and wrong at
-contribution quality, where it costs 10.3 dB to save 10% of bits (BUG-10). Make it quality-
-dependent, the way the entropy coder now follows quality (TUNE-3). Measure the crossover before
-picking a rule — BUG-5 is the cautionary example, where an assumed quality threshold turned out to
-be content.
+### TUNE-6 — P-frame quantiser scale now follows the operating point (**DONE 2026-09-06**)
+`GNC_P_QP_SCALE` was a flat 1.25, right at distribution bitrates (TUNE-5) and wrong at
+contribution quality, where it cost 10.3 dB to save 10% of bits (BUG-10, found by the concurrent
+session). Now keyed on the **quantiser step**: 1.25× at step ≥ 4.6, tapering linearly to 1.0 at
+step ≤ 2.8. Those breakpoints are q=70 and q=85 on the default ladder.
+
+Keyed on the step rather than on `q` because the step is the physically relevant quantity — how
+coarse a P-frame may be depends on how much quantisation error there is to hide behind, not on a
+preset index — and because `q` is not available in `encode_pframe` at all under `--qstep` or rate
+control, both of which set the step directly.
+
+Measured at **matched rate**, PSNR average and worst frame:
+
+| sequence | q | Δ avg | Δ worst |
+|---|---|---|---|
+| old_town | 65 | +0.94 dB | −0.06 dB |
+| old_town | 75 | +0.93 dB | −0.66 dB |
+| old_town | 85 | +0.40 dB | **−2.2 dB** |
+| old_town | 99 | **−3.8 dB** | **−14.2 dB** |
+| aerial | 70 | +0.56 dB | −0.47 dB |
+| aerial | 80 | +0.81 dB | −0.52 dB |
+| aerial | 90 | −0.21 dB | **−2.75 dB** |
+
+Both sequences turn between q=80 and q=90, and it is the **worst frame** that pays — which matters
+more than the average for a contribution codec. Tapered rather than stepped so the RD curve has no
+cliff at the boundary. Verified after the change: old_town at q=99 is back to 59.74 dB average and
+59.74 worst (was 54.01/43.60), and q=50 keeps the 1.64 bpp the flat 1.25 bought.
+
+**Metric note, and it generalises:** VMAF is useless here. On old_town at q≥85 it reads
+99.64/96.80 for both settings while the rate differs 14% and worst-frame PSNR differs 4.8 dB — it
+has saturated. **Above about q=80, PSNR leads and VMAF is the cross-check**, the reverse of
+CLAUDE.md's usual rule. Recorded in COORDINATION.md.
 
 
 Measured 2026-09-06, touchdown, 17 frames, ki=8, Rice, 4:4:4. `min` is the worst P-frame, `max`

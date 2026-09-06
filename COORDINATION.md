@@ -59,6 +59,27 @@ the shared checkout** — no absolute paths, no session ids.
 |---|---|---|
 | `../gnc-abac` | `abac` | adaptive binary code-block entropy coder (EBCOT follow-up), CPU + GPU. Rate −19 to −25% confirmed; GPU decode bit-exact but 6-13 fps, so throughput is the open gate. |
 
+## Timing: the machine is shared, so throughput numbers are not measurable during a session
+
+Up to five sessions compile and run GPU work on this one M1 at the same time. That makes every
+wall-clock figure unreliable while anyone else is working — on 2026-09-06 the same abac decode
+input timed **25.2, 31.1 and 37.5 ms across three runs**, a 48% spread on identical work, and
+three targeted shader optimisations against three different suspected bottlenecks all returned
+exactly nothing. Three plausible fixes measuring null is far likelier to be a broken instrument
+than three wrong hypotheses.
+
+So:
+
+- **Compression figures (bpp, PSNR, VMAF, dE00) are safe.** They are deterministic and unaffected
+  by load. Measure and quote them freely.
+- **Throughput figures are not.** Do not tune against them, and do not record one without saying
+  the machine was loaded. An optimisation validated against noise looks justified and is not.
+- **Build the alternatives behind switches and measure them later, together.** When something has
+  several plausible implementations, implement them all, make them selectable, and add a bench
+  that runs the whole set in one command. Then one idle-machine run settles it. `abac` does this:
+  `GNC_ABAC_CODER` selects the entropy coder variant and
+  `cargo test --release --test abac_bench -- --ignored --nocapture` times every combination.
+
 ## The four rules that have actually bitten us
 
 **1. A number is only valid against a commit.** The tree can change under you with no signal. A

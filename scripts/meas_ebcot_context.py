@@ -317,6 +317,101 @@ def binary_adaptive_vertical_bits(coef):
     return total
 
 
+def binary_adaptive_per_stream_bits(coef, nstreams=256, warm_start=True):
+    """The same coder, but with each of the 256 streams adapting its contexts independently.
+
+    This is what a parallel decode forces: stream `s` holds coefficients s, s+256, s+512, ... and
+    decodes them in order, so its context is its own previous two symbols and its probability
+    estimates can only be learned from its own history. That is roughly 256 symbols per stream to
+    learn 3 decisions x 6 buckets on, which is little.
+
+    `warm_start=True` charges a per-tile initial-probability table (one byte per context, as GNC
+    already signals per-subband k) and then charges only the conditional entropy; `False` charges
+    the KT learning cost instead, modelling a cold start with no table.
+    """
+    a = np.abs(coef).astype(np.int64)
+    flat = a.ravel()
+    n = flat.size
+    total = 0.0
+    NB = 6
+    # Accumulate (context, decision) pairs per stream, then charge each stream separately.
+    for s0 in range(min(nstreams, n)):
+        part = flat[s0::nstreams]
+        if part.size == 0:
+            continue
+        up1 = np.concatenate([[0], part[:-1]])
+        up2 = np.concatenate([[0, 0], part[:-2]])
+        nb = up1 * 2 + up2
+        ctx = np.where(nb == 0, 0, np.minimum(np.log2(np.maximum(nb, 1)).astype(np.int64) + 1, NB - 1))
+        for sel, dec in (
+            (np.ones(part.shape, dtype=bool), part > 0),
+            (part > 0, part > 1),
+            (part > 1, part > 2),
+        ):
+            if sel.any():
+                t, p = cond_entropy_bits(ctx[sel], dec[sel].astype(np.int64))
+                total += t if warm_start else p
+        m3 = part > 2
+        if m3.any():
+            rem = part[m3] - 3
+            total += float((2 * np.floor(np.log2(rem + 1)) + 1).sum())
+        total += float((part > 0).sum())
+    if warm_start:
+        total += 3 * NB * 8.0  # per-tile initial probabilities, one byte per context
+    return total
+
+
+def codeblock_adaptive_bits(coef, cb=64, warm_start=False):
+    """EBCOT's actual design: independent code-blocks, raster scan inside each, full neighbourhood.
+
+    This is the configuration that resolves the tension the per-stream measurement exposed. GNC's
+    256-streams-per-tile gives each coder only ~256 symbols to adapt 18 context probabilities on,
+    which wipes out the gain. A 64x64 code-block gives one coder 4096 symbols — enough to adapt —
+    and a 1080p plane still holds about 640 independent code-blocks, which is ample GPU
+    parallelism even though it is not 256-per-tile.
+
+    Inside a block the scan is raster, so left, up, up-left and up-right are all decoded and the
+    full neighbourhood context is available, not just the vertical one.
+
+    Charged with the KT learning cost by default (`warm_start=False`), i.e. each block starts cold
+    with no signalled table — the honest number for an adaptive coder.
+    """
+    a = np.abs(coef).astype(np.int64)
+    NB = 6
+    total = 0.0
+    h, w = a.shape
+    nblocks = 0
+    for by in range(0, h, cb):
+        for bx in range(0, w, cb):
+            blk = a[by : by + cb, bx : bx + cb]
+            if blk.size == 0:
+                continue
+            nblocks += 1
+            p = np.pad(blk, 1)
+            nb = p[1:-1, :-2] + p[:-2, 1:-1] + p[:-2, :-2] + p[:-2, 2:]
+            ctx = np.where(nb == 0, 0,
+                           np.minimum(np.log2(np.maximum(nb, 1)).astype(np.int64) + 1, NB - 1))
+            v = blk.ravel()
+            c = ctx.ravel()
+            for sel, dec in (
+                (np.ones(v.shape, dtype=bool), v > 0),
+                (v > 0, v > 1),
+                (v > 1, v > 2),
+            ):
+                if sel.any():
+                    t, pen = cond_entropy_bits(c[sel], dec[sel].astype(np.int64))
+                    total += t if warm_start else pen
+            m3 = v > 2
+            if m3.any():
+                rem = v[m3] - 3
+                total += float((2 * np.floor(np.log2(rem + 1)) + 1).sum())
+            total += float((v > 0).sum())
+            total += 16.0  # the block's own length field
+    if warm_start:
+        total += nblocks * 3 * NB * 8.0
+    return total
+
+
 def h0_bits(coef):
     v = coef.astype(np.int64).ravel()
     _, counts = np.unique(v, return_counts=True)
@@ -359,9 +454,10 @@ def main():
           f"({args.levels} levels) ===")
     print(f"  {'qstep':>6} {'rice split':>11} {'rice 1-stream':>14} {'H0':>8} "
           f"{'ebcot':>8} {'+KT':>8} {'ebcot vs':>10} {'full-ctx':>10} {'full vs':>10} "
-          f"{'vert-ctx':>9} {'vert vs':>9} {'bin-adap':>9} {'bin vs':>8}")
+          f"{'vert-ctx':>9} {'vert vs':>9} {'bin-adap':>9} {'bin vs':>8} "
+          f"{'per-str':>9} {'cold':>9} {'cb64':>9} {'cb32':>9}")
     for q in args.qstep:
-        rs = r = h = e = ep = cc = vc = ba = 0.0
+        rs = r = h = e = ep = cc = vc = ba = bs = bc = cb64 = cb32 = 0.0
         for bid, (nm, band, orient) in enumerate(named):
             qq = quantize(band * g[nm], q, args.dead_zone).astype(np.int64)
             rs += rice_zrl_split_bits(qq)
@@ -370,6 +466,10 @@ def main():
             cc += context_coefficient_bits(qq, args.table_bits)
             vc += vertical_context_bits(qq, args.table_bits)
             ba += binary_adaptive_vertical_bits(qq)
+            bs += binary_adaptive_per_stream_bits(qq, warm_start=True)
+            bc += binary_adaptive_per_stream_bits(qq, warm_start=False)
+            cb64 += codeblock_adaptive_bits(qq, 64)
+            cb32 += codeblock_adaptive_bits(qq, 32)
             a, b = band_bits(qq, orient, bid)
             e += a
             ep += b
@@ -377,7 +477,9 @@ def main():
         print(f"  {q:>6.1f} {rs/px:>11.4f} {r/px:>14.4f} {h/px:>8.4f} "
               f"{e/px:>8.4f} {ep/px:>8.4f} {(ep/rs-1)*100:>+9.1f}% "
               f"{cc/px:>10.4f} {(cc/rs-1)*100:>+9.1f}% {vc/px:>9.4f} {(vc/rs-1)*100:>+8.1f}% "
-              f"{ba/px:>9.4f} {(ba/rs-1)*100:>+8.1f}%")
+              f"{ba/px:>9.4f} {(ba/rs-1)*100:>+8.1f}% "
+              f"{(bs/rs-1)*100:>+9.1f}% {(bc/rs-1)*100:>+9.1f}% "
+              f"{(cb64/rs-1)*100:>+9.1f}% {(cb32/rs-1)*100:>+9.1f}%")
     print()
     print("  'rice split' is what GNC really codes: 256 independent streams per tile.")
     print("  'rice 1-stream' is one stream per subband — an idealised Rice that shares runs and")

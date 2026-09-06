@@ -6667,3 +6667,77 @@ Two things still unmeasured, and they are the ones that could sink it:
 The rate case is now strong enough that the next step is a CPU reference implementation behind an
 `EntropyCoder` variant — enough to confirm the rate on real bitstreams and to time the decode
 before committing to a shader.
+
+### EBCOT part 2, resolved: the code-blocks are load-bearing, and the answer is −13.7%
+
+The previous entry recommended keeping GNC's 256 streams and conditioning on the vertical
+neighbour, on the grounds that a stream is a tile column so the neighbour above is free. That was
+wrong, and the reason is worth more than the conclusion.
+
+#### Why the shortcut fails
+
+Pooling all 256 streams' statistics when computing conditional entropy quietly assumed the
+probability estimates are **shared** across streams. A parallel decode cannot share them: stream
+*s* decodes independently, so it can only adapt on its own history — about 256 symbols, to learn
+3 decisions × 6 context buckets. Measured with each stream adapting alone, at qstep 4:
+
+| image | pooled (what I reported) | per-stream, warm start | per-stream, cold |
+|---|---|---|---|
+| bbb_1080p | −6.6% | **−0.7%** | **+2.4%** |
+| blue_sky_1080p | −11.6% | −0.4% | +3.8% |
+| touchdown_1080p | −6.4% | −4.8% | −1.4% |
+
+The gain essentially disappears, and goes negative without a signalled initial-probability table.
+
+**So GNC's 256-way-per-tile parallelism is what makes context modelling unaffordable** — and not
+through table cost, which was the previous hypothesis, but through *statistics*: 256 symbols is too
+little data to learn on. Two wrong diagnoses in a row on the same question, both corrected by
+measuring the thing rather than reasoning about it.
+
+#### Which is exactly what code-blocks are for
+
+A 64×64 code-block gives one coder 4096 symbols — enough to adapt — and the scan inside it is
+raster, so left, up, up-left and up-right are all decoded and the *full* neighbourhood context is
+available rather than only the vertical one. The parallelism objection dissolves on inspection: a
+1080p luma plane holds roughly 450 independent 64×64 code-blocks, which is ample GPU work even
+though it is not 256 per tile. Parallelism at frame scale was never the constraint; parallelism
+per tile was a self-imposed one.
+
+Measured with **cold-start adaptation** (KT learning cost, no signalled tables) and a per-block
+length field charged, at qstep 4 — GNC's operating point:
+
+| image | code-block 64 | code-block 32 |
+|---|---|---|
+| touchdown_1080p | **−7.6%** | −6.2% |
+| bbb_1080p | **−11.0%** | −9.8% |
+| kristensara_720p | **−18.0%** | −16.7% |
+| blue_sky_1080p | **−18.3%** | −16.4% |
+| mean | **−13.7%** | −12.3% |
+
+Positive on all four, worst case −7.6%. 64 beats 32 consistently, which is the same effect one
+level down: fewer symbols per block, less to adapt on.
+
+#### The recommendation, third and final version
+
+**Build EBCOT's design: independent code-blocks, adaptive binary contexts, full neighbourhood.**
+Not a variant fitted to GNC's stream layout — that was measured and it does not work. The two
+things to drop are still worth dropping: PCRD (part 1: 0.00 dB) and plane-major scan with its
+embedded truncatability, which buys nothing here and costs the richer full-magnitude context that
+a coefficient-major scan inside a block allows.
+
+−13.7% mean at the operating point is the largest single-mechanism gain measured in this repo, and
+roughly half the +28.3% intra gap to JPEG 2000 — which is what one should expect from adopting
+JPEG 2000's coder.
+
+#### The one risk left, and it is not small
+
+**Decode throughput.** Rice decodes 256 branch-free streams per tile. This replaces that with ~450
+code-blocks per plane, each running a serial adaptive binary coder at several binary decisions per
+coefficient. Per-symbol cost goes up a lot, and parallelism per tile goes down 16×. For a
+contribution codec judged on concurrent streams per GPU and latency, a 13.7% rate win that halves
+throughput may not be a win at all.
+
+That makes the order of work clear: a CPU reference implementation first, measured for rate on real
+bitstreams *and* timed, before any shader is written. If the rate holds and the CPU decode is not
+catastrophic, the shader is worth building; if not, this is a documented negative and the ceiling
+measurements above are the record of why.

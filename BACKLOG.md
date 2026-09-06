@@ -649,35 +649,50 @@ Plan: adaptive binary coder, bit-planes, **GNC's vertical magnitude context rath
 neighbourhood**, no PCRD. Expected −9% to −12%. Ship as a fourth `EntropyCoder` variant, gated and
 measured against Rice at every quality like the other three.
 
-**Measured 2026-09-06 — the configuration to build gives −9.8% mean.** CABAC-style binarisation
-(significant?, |v|>1?, |v|>2?, then Exp-Golomb suffix and sign bypassed), adaptive binary contexts
-so no frequency tables, context bucketed from the fully-decoded vertical neighbours:
+**RESOLVED 2026-09-06 — build EBCOT's code-block design. −13.7% mean.**
 
-| image | qstep 4 (operating point) | qstep 8 |
+Two wrong turns first, both instructive. GNC's 256 streams map coefficient *i* to stream `i % 256`,
+so each stream is a tile column and the vertical neighbour is free — that much is true, and it
+suggested keeping the existing streams and just adding a context. It does not work: pooling all
+256 streams' statistics assumes **shared** probability estimates, and a parallel decode cannot
+share them. With each stream adapting on its own ~256 symbols, the gain collapses from −6.6% to
+**−0.7%** (warm start) or **+2.4%** (cold). So GNC's 256-way-per-tile parallelism is what makes
+context modelling unaffordable — not through table cost, which was the previous hypothesis, but
+through *statistics*: 256 symbols is too little to learn 18 context probabilities on.
+
+**Code-blocks exist to solve exactly that.** A 64×64 block gives one coder 4096 symbols, and its
+raster scan makes the full neighbourhood available rather than only the vertical. The parallelism
+objection dissolves: a 1080p luma plane holds ~450 independent 64×64 code-blocks — ample GPU work,
+even though it is not 256 per tile. Parallelism at *frame* scale was never the constraint.
+
+Measured with cold-start adaptation (KT learning cost, no signalled tables) and a per-block length
+field charged, at qstep 4 (GNC's operating point):
+
+| image | code-block 64 | code-block 32 |
 |---|---|---|
-| touchdown | −6.4% | −9.8% |
-| bbb | −6.6% | −8.3% |
-| blue_sky | −11.6% | −13.3% |
-| kristensara | **−14.5%** | **−18.9%** |
-| mean | **−9.8%** | **−12.6%** |
+| touchdown | **−7.6%** | −6.2% |
+| bbb | **−11.0%** | −9.8% |
+| kristensara | **−18.0%** | −16.7% |
+| blue_sky | **−18.3%** | −16.4% |
+| mean | **−13.7%** | −12.3% |
 
-Positive on all four, worst case −6.4%, and it beats EBCOT as specified (−7.3%) with far less
-machinery. No tables (adaptive), no code-blocks, no plane-major scan, no PCRD — and **all 256
-streams still decode in parallel**, because the context is vertical and a stream is a tile column.
+Positive on all four, worst case −7.6%. Largest single-mechanism gain measured in this repo, and
+roughly half the +28.3% intra gap to JPEG 2000 — as one should expect from adopting JPEG 2000's
+coder.
 
-**Two risks, both unmeasured, either could sink it:**
-1. **Decode throughput.** An adaptive binary coder is serial per symbol and much costlier than
-   Rice's branch-free path. Parallelism across streams is intact; per-symbol cost is not. A 10%
-   rate win that halves decode fps is not a win for a contribution codec.
-2. **Chroma.** Luma only, one crop per image, four images.
+**Build:** independent code-blocks, adaptive binary contexts, full neighbourhood, coefficient-major
+scan inside a block. **Drop:** PCRD (part 1: 0.00 dB) and plane-major scan — its embedded
+truncatability buys nothing here and costs the richer full-magnitude context a coefficient-major
+scan allows.
 
-**Next step:** CPU reference implementation behind an `EntropyCoder` variant — enough to confirm
-the rate on real bitstreams and to time the decode, before committing to a shader.
+**The one real risk: decode throughput.** Rice decodes 256 branch-free streams per tile. This is
+~450 serial adaptive-binary coders per plane at several binary decisions per coefficient:
+per-symbol cost up a lot, parallelism per tile down 16×. For a codec judged on concurrent streams
+per GPU and latency, a 13.7% rate win that halves throughput may not be a win.
 
-**Ceiling excludes:** the MQ coder's own adaptation loss (real coders land a couple of percent
-above conditional entropy), per-code-block length/pass overheads (GNC's equivalent is 4-5% of a
-frame per GP17), chroma (luma only, one crop, four images), and decode throughput (an MQ coder is
-serial within a block and much costlier per symbol than Rice).
+**Order of work:** CPU reference implementation first, measured for rate on real bitstreams *and*
+timed, before any shader. If the rate holds and CPU decode is not catastrophic, build the shader;
+if not, this is a documented negative with the ceiling measurements as the record.
 
 ### BUG-8 — The encoder's local decode diverges from the real decoder down a GOP (**OPEN, not diagnosed**)
 bbb17, 17 frames, ki=17, q=50. Per-frame PSNR of the encoder's own reconstruction vs the actual

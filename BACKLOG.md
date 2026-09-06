@@ -598,9 +598,20 @@ fixed q read "+0.1 to +0.55 VMAF for under 1% rate", but at matched quality the 
 the bitrate. Also partly self-inflicted — BUG-6 changed the wavelet level count at q≥25 the same
 day, and AQ measures variance on the LL subband.
 
-Remaining toggles: pyramid QP scales, B-pyramid, Rice vs rANS at each quality, tile-skip. Each:
-bpp + VMAF mean + VMAF min at matched q, dE00 as well if chroma is involved, then BD-rate if the
-point measurement is not decisive.
+**Fourth: Rice vs rANS — q≤20 boundary survives, for a new reason.** rANS keeps a ~2% mean edge
+below q=20 and loses 8-32% from q=25 up. The cliff is at *exactly* q=25, where BUG-6 switches 4
+wavelet levels to 5: rANS carries a frequency table per subband group, so a 5th level costs it two
+more tables per tile, while GP17 made Rice's length table cheaper. **Re-check this boundary if the
+wavelet-level rule moves again.** Tightening 20→15 rejected — 1.1% mean difference and neither
+boundary is clean (rANS loses 5.7-8.2% on kristensara throughout its own range).
+
+**Fifth: motion tile-skip — on the RD curve, kept.** At matched rate on aerial: skip on gives
+0.91 bpp / 88.87 VMAF mean / 85.05 min; skip off gives 0.92 bpp / 88.58 / 85.71. +0.29 mean and
+−0.66 min, i.e. trading tail quality for average, essentially on the curve. At matched *q* it looks
+dramatic (12-31% rate for 0.2-1.7 VMAF) but that is movement along the curve.
+
+Remaining: pyramid QP scales and B-pyramid (both behind BUG-5's pyramid-off default, so lower
+value). MEAS-2's main finding is that three of five toggles were mis-tuned or mis-measured.
 
 ### MEAS-4 — Inter-model gap decomposition (**RE-RUN AND CLOSED 2026-09-06** on clean data)
 Reopened because its residual dumps were taken with `GNC_DIAGNOSTICS=1` (BUG-7), which clobbered

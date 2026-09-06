@@ -6248,3 +6248,39 @@ judge a rate/quality trade, and it always flatters the option that spends more b
 **And part of it is self-inflicted.** BUG-6 moved q≥25 from 4 wavelet levels to 5 earlier the same
 day, and AQ computes its variance on the LL subband — whose size and content that change alters.
 Any future AQ tuning must be redone after a level change. Noted in the code.
+
+### MEAS-2, remaining toggles: entropy backend and motion tile-skip
+
+**Rice vs rANS — the existing q≤20 boundary survives, for a new reason.** bpp at identical VMAF
+(the two coders code the same coefficients, so quality is unchanged):
+
+| image | q=10 | q=15 | q=20 | q=25 | q=30 | q=40 |
+|---|---|---|---|---|---|---|
+| bbb | −8.8% | −6.3% | −4.4% | +8.1% | +9.4% | +13.5% |
+| blue_sky | −3.1% | −2.6% | −3.1% | +12.5% | +14.2% | +14.6% |
+| touchdown | −3.8% | −6.2% | −5.1% | +8.5% | +9.3% | +7.7% |
+| kristensara | +6.7% | +5.7% | +8.2% | +31.3% | +32.0% | +31.7% |
+| mean | −2.3% | −2.4% | −1.1% | **+15.1%** | +16.2% | +16.9% |
+
+(negative = rANS smaller). rANS keeps a ~2% mean edge below q=20 and loses everywhere from q=25 —
+and the cliff is at **exactly** q=25, which is where BUG-6 switches from 4 wavelet levels to 5.
+rANS carries a frequency table per subband group, so a 5th level costs it two more tables per
+tile; Rice carries three `k` bytes per group and GP17 made its length table cheaper. The two
+decisions interact.
+
+TUNE-3's rule is unchanged, but the boundary is now load-bearing for a different reason than when
+it was set, and **must be re-checked if the wavelet-level rule moves again.** Tightening 20→15 was
+considered and rejected: the mean difference is 1.1% and neither boundary is clean (rANS loses
+5.7-8.2% on kristensara throughout its own range).
+
+**Motion tile-skip — on the RD curve, kept.** At matched rate on aerial, 16 frames:
+
+| | bpp | VMAF mean | VMAF min |
+|---|---|---|---|
+| skip on, q=50 | 0.91 | **88.87** | 85.05 |
+| skip off, q=40 | 0.92 | 88.58 | **85.71** |
+
++0.29 VMAF mean and −0.66 VMAF min at the same rate — essentially on the curve, trading tail
+quality for average. At matched q it looks dramatic (12-31% rate saved for 0.2-1.7 VMAF) but that
+is movement along the curve, not off it. Kept at the current 0.5 multiplier; the min penalty is
+worth remembering if GOP-tail quality ever becomes a complaint.

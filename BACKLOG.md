@@ -1073,6 +1073,33 @@ hammering the GPU means the figures above are an order of magnitude and no finer
 optimisations are untested rather than disproven. Re-time on an idle machine before touching the
 shader again; optimising against noise produces changes that look justified and are not.
 
+**Part 5 — two coder variants behind a switch (2026-09-06).** Since throughput is not measurable
+while the machine is shared, both plausible engines are built and selectable, with a bench that
+settles the grid in one idle run: `GNC_ABAC_CODER=interval|range`, `GNC_ABAC_CB=<px>`,
+`cargo test --release --test abac_bench -- --ignored --nocapture`.
+
+*Interval* is bit-renormalising (0-16 iterations per decision, data-dependent). *Range* is
+byte-renormalising, LZMA/VP8 family — at most 3 iterations, usually 0 or 1, so **~8x fewer
+iterations in the decoder's hottest loop**, and it needs no narrowed interval.
+
+Rate on real coefficients (bbb, q=55, vs shipped Rice):
+
+| coder | cb=32 | cb=64 | cb=128 |
+|---|---|---|---|
+| Interval | −15.0% | −19.2% | −20.0% |
+| Range | −10.2% | −17.0% | −18.4% |
+
+Throughput, paired within one run (provisional, machine loaded, but the *ratio* is paired):
+Interval 38.1 / Range **84.2** Mcoeff/s at cb=64; 77.2 / **157.5** at cb=32. About 2x at both
+sizes.
+
+**Range at cb=64 dominates Interval at cb=32 on both axes** — −17.0% vs −15.0% rate *and* faster.
+So if throughput matters the answer is the range coder with bigger blocks, not the interval coder
+with smaller ones.
+
+Range's rate penalty widens as blocks shrink because its final flush is 5 bytes per block: at
+cb=32 that is 42 KB per frame. **Fixable, and the obvious next step if Range wins on speed.**
+
 **Diagnosis narrowed by MEAS 75ca12b.** A trivially parallel shader does 7.86 M elements in
 1.02 ms, and a wavefront *dependency* costs only 4.9×. So a serial dependency is cheap and abac's
 problem is not that it has one. The difference is shape: a wavefront keeps 256 threads progressing

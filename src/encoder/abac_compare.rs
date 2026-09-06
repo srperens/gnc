@@ -19,7 +19,7 @@
 //! k-context that the reference lacks. A result better than its own offline ceiling (−13.7%) is
 //! how that showed up.
 
-use super::abac;
+use super::abac::Coder;
 
 /// Enumerate a tile's subbands as `(x0, y0, w, h)` in tile-local coordinates.
 ///
@@ -50,11 +50,13 @@ pub struct Timing {
     pub coefficients: usize,
 }
 
+#[allow(clippy::too_many_arguments)] // tile geometry plus the variant under test
 fn abac_tile_bytes(
     tile: &[i32],
     tile_size: usize,
     num_levels: u32,
     cb: usize,
+    coder: Coder,
     timing: &mut Timing,
 ) -> usize {
     let mut total = 0usize;
@@ -76,12 +78,12 @@ fn abac_tile_bytes(
                     blk.extend_from_slice(&tile[row..row + bw]);
                 }
                 let t0 = std::time::Instant::now();
-                let bytes = abac::encode_block(&blk, bw);
+                let bytes = coder.encode_block(&blk, bw);
                 timing.encode_s += t0.elapsed().as_secs_f64();
                 let t1 = std::time::Instant::now();
                 // Canary: a size comparison against a coder that does not reproduce its input
                 // is meaningless. Verify every block, not a sample.
-                let back = abac::decode_block(&bytes, blk.len(), bw);
+                let back = coder.decode_block(&bytes, blk.len(), bw);
                 timing.decode_s += t1.elapsed().as_secs_f64();
                 timing.coefficients += blk.len();
                 assert_eq!(
@@ -118,6 +120,7 @@ fn abac_plane_bytes(
     tile_size: u32,
     num_levels: u32,
     cb: usize,
+    coder: Coder,
     timing: &mut Timing,
 ) -> usize {
     let ts = tile_size as usize;
@@ -132,7 +135,7 @@ fn abac_plane_bytes(
                 let row = (ty * ts + y) * (width as usize) + tx * ts;
                 tile.extend(plane[row..row + ts].iter().map(|&v| v.round() as i32));
             }
-            abac_bytes += abac_tile_bytes(&tile, ts, num_levels, cb, timing);
+            abac_bytes += abac_tile_bytes(&tile, ts, num_levels, cb, coder, timing);
         }
     }
     eprintln!("  [abac] {label:3} {tiles_x}x{tiles_y} tiles: abac {abac_bytes:>9} B");
@@ -164,7 +167,11 @@ pub fn run_multi_plane(
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(128);
-    eprintln!("[abac] comparison active (GNC_ABAC_COMPARE), code-block {cb}px, {num_levels} levels");
+    let coder = Coder::from_env();
+    eprintln!(
+        "[abac] comparison active (GNC_ABAC_COMPARE), coder {coder:?} (GNC_ABAC_CODER), \
+         code-block {cb}px (GNC_ABAC_CB), {num_levels} levels"
+    );
 
     let y = crate::gpu_util::read_buffer_f32(ctx, y_buf, (padded_w * padded_h) as usize);
     let co = crate::gpu_util::read_buffer_f32(ctx, co_buf, (chroma_w * chroma_h) as usize);
@@ -177,7 +184,7 @@ pub fn run_multi_plane(
         ("Co", &co, chroma_w, chroma_h),
         ("Cg", &cg, chroma_w, chroma_h),
     ] {
-        a_tot += abac_plane_bytes(label, plane, w, h, tile_size, num_levels, cb, &mut timing);
+        a_tot += abac_plane_bytes(label, plane, w, h, tile_size, num_levels, cb, coder, &mut timing);
     }
     if rice_reference_bytes > 0 {
         eprintln!(

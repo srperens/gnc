@@ -276,3 +276,167 @@ fn main(
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Variant B: byte-renormalising range coder
+// ---------------------------------------------------------------------------
+//
+// A second entry point, `main_rc`, rather than a branch inside the shared one. The two coders
+// differ in state, probability precision and renormalisation, so a shared loop would need both
+// states live and a const-folded branch at every call — clearer to duplicate the forty lines.
+//
+// The reason it exists: the interval coder above renormalises one *bit* at a time, 0-16 times per
+// binary decision, and how many depends on the data. On a GPU that variable-length inner loop is
+// the suspected cost, since every lane of a SIMD group runs a different count for every symbol.
+// This coder renormalises one *byte* at a time and cannot iterate more than three times — in
+// practice 0 or 1. Roughly 8x fewer iterations in the hottest loop.
+//
+// `(range >> RC_PROB_BITS) * p` peaks at 2^21 * 2^11 = 2^32, so it fits a u32 without the
+// narrowed interval the other coder needs. Matches `encode_block_rc` in abac.rs bit-for-bit.
+
+const RC_PROB_BITS: u32 = 11u;
+const RC_PROB_ONE: u32 = 2048u;
+const RC_PROB_HALF: u32 = 1024u;
+const RC_ADAPT_SHIFT: u32 = 5u;
+const RC_TOP: u32 = 16777216u;   // 1 << 24
+
+struct RDec {
+    range: u32,
+    code: u32,
+    byte_pos: u32,
+    byte_end: u32,
+}
+
+fn rc_next_byte(d: ptr<function, RDec>) -> u32 {
+    if ((*d).byte_pos >= (*d).byte_end) {
+        (*d).byte_pos = (*d).byte_pos + 1u;
+        return 0u;
+    }
+    let b = get_byte((*d).byte_pos);
+    (*d).byte_pos = (*d).byte_pos + 1u;
+    return b;
+}
+
+fn rc_renormalise(d: ptr<function, RDec>) {
+    loop {
+        if ((*d).range >= RC_TOP) {
+            break;
+        }
+        (*d).range = (*d).range << 8u;
+        (*d).code = ((*d).code << 8u) | rc_next_byte(d);
+    }
+}
+
+fn rc_decode_bit(d: ptr<function, RDec>, pi: u32) -> u32 {
+    let bound = ((*d).range >> RC_PROB_BITS) * probs[pi];
+    var bit = 0u;
+    var p = probs[pi];
+    if ((*d).code >= bound) {
+        bit = 1u;
+        (*d).range = (*d).range - bound;
+        (*d).code = (*d).code - bound;
+        p = p - (p >> RC_ADAPT_SHIFT);
+    } else {
+        (*d).range = bound;
+        p = p + ((RC_PROB_ONE - p) >> RC_ADAPT_SHIFT);
+    }
+    probs[pi] = clamp(p, 1u, RC_PROB_ONE - 1u);
+    rc_renormalise(d);
+    return bit;
+}
+
+fn rc_decode_bypass(d: ptr<function, RDec>) -> u32 {
+    (*d).range = (*d).range >> 1u;
+    var bit = 0u;
+    if ((*d).code >= (*d).range) {
+        bit = 1u;
+        (*d).code = (*d).code - (*d).range;
+    }
+    rc_renormalise(d);
+    return bit;
+}
+
+@compute @workgroup_size(32)
+fn main_rc(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+) {
+    let blk = gid.x;
+    let tid = lid.x;
+    if (blk >= params.num_blocks) {
+        return;
+    }
+    let info = blocks[blk];
+
+    for (var i = 0u; i < NUM_CONTEXTS; i++) {
+        probs[i * WG + tid] = RC_PROB_HALF;
+    }
+    for (var i = 0u; i < 2u * MAX_BLOCK_W; i++) {
+        rows[i * WG + tid] = 0u;
+    }
+
+    var d: RDec;
+    d.range = 0xFFFFFFFFu;
+    d.code = 0u;
+    d.byte_pos = info.byte_offset;
+    d.byte_end = info.byte_offset + info.byte_len;
+    // The encoder's first shift_low emits a cache byte carrying no information; skip it.
+    rc_next_byte(&d);
+    for (var i = 0u; i < 4u; i++) {
+        d.code = (d.code << 8u) | rc_next_byte(&d);
+    }
+
+    for (var y = 0u; y < info.height; y++) {
+        let cur = (y & 1u) * MAX_BLOCK_W;
+        let prev = ((y + 1u) & 1u) * MAX_BLOCK_W;
+        for (var x = 0u; x < info.width; x++) {
+            var nb = 0u;
+            if (x > 0u) {
+                nb = nb + rows[(cur + x - 1u) * WG + tid];
+            }
+            if (y > 0u) {
+                nb = nb + rows[(prev + x) * WG + tid];
+                if (x > 0u) {
+                    nb = nb + rows[(prev + x - 1u) * WG + tid];
+                }
+                if (x + 1u < info.width) {
+                    nb = nb + rows[(prev + x + 1u) * WG + tid];
+                }
+            }
+            let ctx = bucket(nb);
+
+            var a = 0u;
+            var v = 0i;
+            if (rc_decode_bit(&d, ctx * WG + tid) == 1u) {
+                a = 1u;
+                if (rc_decode_bit(&d, (NUM_BUCKETS + ctx) * WG + tid) == 1u) {
+                    a = 2u;
+                    if (rc_decode_bit(&d, (2u * NUM_BUCKETS + ctx) * WG + tid) == 1u) {
+                        var zeros = 0u;
+                        loop {
+                            if (rc_decode_bypass(&d) == 1u) {
+                                break;
+                            }
+                            zeros = zeros + 1u;
+                            if (zeros > 32u) {
+                                break;
+                            }
+                        }
+                        var n = 1u;
+                        for (var k = 0u; k < zeros; k++) {
+                            n = (n << 1u) | rc_decode_bypass(&d);
+                        }
+                        a = n - 1u + 3u;
+                    }
+                }
+                if (rc_decode_bypass(&d) == 1u) {
+                    v = -i32(a);
+                } else {
+                    v = i32(a);
+                }
+            }
+            out[info.out_offset + y * info.stride + x] = v;
+            rows[(cur + x) * WG + tid] = a;
+        }
+    }
+}

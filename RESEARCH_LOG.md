@@ -6741,3 +6741,87 @@ That makes the order of work clear: a CPU reference implementation first, measur
 bitstreams *and* timed, before any shader is written. If the rate holds and the CPU decode is not
 catastrophic, the shader is worth building; if not, this is a documented negative and the ceiling
 measurements above are the record of why.
+
+---
+
+## 2026-09-06 — BUG-10: P-frame quality saturates. Adding bits does not improve an inter frame.
+
+### The measurement
+
+Once the quality range above q=92 was unlocked (same date), the sequence path stopped tracking it.
+touchdown, 17 frames, ki=8, Rice, 4:4:4 — `min` is the worst P-frame, `max` is the I-frame:
+
+| q | avg | **P-frame (min)** | **I-frame (max)** |
+|---|---|---|---|
+| 85 | 43.00 | 40.52 | 48.95 |
+| 92 | 46.41 | 43.02 | 51.40 |
+| 96 | 48.23 | 43.68 | 55.19 |
+| 99 | 50.01 | **44.01** | **59.88** |
+
+**The I-frame gains 10.9 dB across that range. The P-frame gains 3.5 dB and flattens.** The same
+shape with an explicit qstep, bypassing the preset entirely:
+
+| qstep | 2.0 | 1.0 | 0.5 | 0.25 |
+|---|---|---|---|---|
+| I-frame | 44.63 | 45.74 | 47.88 | 50.28 |
+| P-frame | 32.02 | 36.82 | 36.47 | **36.59** |
+
+Below qstep 1.0 the P-frame does not improve at all. **Inter frames have a quality ceiling that is
+independent of the quantiser.**
+
+### What it costs
+
+At contribution quality, all-intra against the default GOP on the same content and settings:
+
+| touchdown, q=99 | bpp | PSNR-Y |
+|---|---|---|
+| ki=8 (I+P) | 12.63 | 50.95 |
+| ki=1 (all-intra) | 13.25 | **60.00** |
+
+**5% more bits for 9 dB more quality.** old_town: 3.5% more bits for 9.5 dB. And against x264 at
+the same operating point, turning inter off roughly halves the gap:
+
+| BD-rate on PSNR-Y vs x264 | ki=8 | ki=1 |
+|---|---|---|
+| touchdown | +349.9% | **+176.9%** |
+| old_town | +219.3% | **+118.0%** |
+
+### Why this matters more than anything else measured this week
+
+It explains, in one mechanism, a string of results that had been treated as separate:
+
+- why all-intra beat `ki=8` at matched quality (TUNE-1 spin-off, same date);
+- why the B-pyramid stopped paying as the quantiser got finer (BUG-5);
+- why the inter gap looked catastrophic at high quality and merely bad at low quality;
+- why "inter saves 17–27%" only held at equal qstep — at equal *quality* the inter path cannot
+  reach the operating point at all.
+
+**The contribution operating point is precisely where a P-frame ceiling hurts most**, because that
+is where the I-frames are near-lossless and the P-frames are not.
+
+### What it is not
+
+- Not the inter dead zone. `GNC_INTER_DZ_MUL` at 2.0, 1.0 and 0.0 gives byte-identical results at
+  q=99 — the preset already sets `dead_zone: 0.0` there, so the multiplier has nothing to scale.
+- Not the B-pyramid; these runs are P-only (`ki=8`, and the pyramid is off by default since BUG-5).
+- Not motion search quality — that was measured against an offline oracle and GNC won.
+
+### Candidates, none tested yet
+
+1. **Reference buffer precision.** If the reconstruction is clamped or rounded to 8 bits each
+   frame, a P-chain accumulates rounding the residual cannot undo. Note an 8-bit round-trip alone
+   caps around 58–59 dB, which is roughly where the *I*-frames sit — so this would have to be
+   accumulation across the chain, not a single rounding.
+2. **Quarter-pel bilinear interpolation.** `motion_compensate.wgsl` is bilinear at quarter-pel.
+   Bilinear low-passes the reference, so the prediction is missing high frequencies everywhere the
+   motion is sub-pel, and the residual has to carry them back. A 6-tap filter was measured as
+   "neutral to worse" *at distribution bitrates* — that measurement should not be assumed to hold
+   at near-lossless, where the blur is a much larger share of the error.
+3. **Clamping in the reconstruction path** (`residual + prediction` to [0,255] per frame).
+
+**Next step is diagnosis, not a fix:** encode a P-frame with a forced zero motion field on
+byte-identical frames at qstep 0.25 and check whether the reconstruction is bit-exact. If it is
+not, walk the pipeline stage by stage. That isolates precision from prediction in one run.
+
+Filed as **BUG-10, P0** — it is the largest single defect the project has measured, and it sits
+directly on the operating point the codec is positioned for.

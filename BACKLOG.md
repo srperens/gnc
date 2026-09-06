@@ -148,6 +148,42 @@ both halves.
 `GNC_B_PYRAMID=1`. Justified on two independent measurements — rate on camera content, and 160 ms
 of reordering latency (MEAS-6) that applies regardless of content.
 
+### BUG-10 — P-frame quality saturates; adding bits does not improve an inter frame (todo, **P0**)
+Measured 2026-09-06, touchdown, 17 frames, ki=8, Rice, 4:4:4. `min` is the worst P-frame, `max`
+the I-frame:
+
+| q | P-frame (min) | I-frame (max) |
+|---|---|---|
+| 85 | 40.52 | 48.95 |
+| 92 | 43.02 | 51.40 |
+| 96 | 43.68 | 55.19 |
+| 99 | **44.01** | **59.88** |
+
+The I-frame gains 10.9 dB across the range; the P-frame gains 3.5 and flattens. With an explicit
+qstep the P-frame stops improving entirely below qstep 1.0 (36.82 / 36.47 / 36.59 at 1.0 / 0.5 /
+0.25). **Inter frames have a quality ceiling independent of the quantiser.**
+
+**Cost at the contribution operating point:** all-intra buys +9.0 dB (touchdown) and +9.5 dB
+(old_town) for 3-5% more bits, and halves the BD-rate gap to x264 (+350% -> +177%, +219% -> +118%).
+
+**This is probably the single largest defect the project has measured**, and it explains several
+results previously treated as separate: all-intra beating ki=8 at matched quality, the B-pyramid
+ceasing to pay as the quantiser gets finer (BUG-5), and "inter saves 17-27%" holding only at equal
+qstep.
+
+**Ruled out:** the inter dead zone (`GNC_INTER_DZ_MUL` at 2.0/1.0/0.0 is byte-identical at q=99 —
+`dead_zone` is already 0 there); the B-pyramid (these are P-only); motion search quality (beats an
+offline oracle).
+
+**Candidates, untested:** reference-buffer precision accumulating across a P-chain; quarter-pel
+**bilinear** interpolation low-passing the reference (a 6-tap filter measured "neutral to worse" —
+but at *distribution* bitrates, where blur is a small share of the error, so that result should not
+be assumed to hold near-lossless); clamping in the reconstruction path.
+
+**Next step is diagnosis, not a fix.** Encode a P-frame with a forced zero motion field on
+byte-identical frames at qstep 0.25 and check whether the reconstruction is bit-exact. That
+separates precision from prediction in one run. Full measurement in RESEARCH_LOG 2026-09-06.
+
 ### BUG-9 — rANS panics below qstep 1.0 instead of rejecting the configuration (todo, P2)
 `gnc encode --qstep 1.0 --rans` panics with `range start index 4297717596 out of range for slice
 of length 5242880`. rANS's GPU alphabet cannot represent the symbol range below about qstep 1.5;

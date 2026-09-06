@@ -7116,3 +7116,78 @@ subbands are 8×8 — 64 coefficients each, far too few to adapt on, and no bloc
 because they are already one block. But LL plus the three level-5 subbands total 256 coefficients
 out of 65536, or 0.4% of a tile. Not worth the complexity of merging subbands into a shared coder,
 which would also mix their statistics. Dropped rather than pursued.
+
+---
+
+## 2026-09-06 — Inter coding stops paying at high quality. For H.264 too.
+
+### The question this answers
+
+"How do we close the inter gap" assumes there is one at the operating point GNC is positioned for.
+Measured for the first time: what does *H.264's* inter coding earn at contribution quality?
+
+x264, touchdown, 8 frames, all-intra (`keyint=1`) against I+P (`keyint=8:bframes=0`) at the same
+crf:
+
+| crf | all-intra | I+P | inter earns |
+|---|---|---|---|
+| 23 (distribution) | 0.479 bpp | 0.173 bpp | **+63.9%** |
+| 12 | 1.500 | 1.491 | +0.6% |
+| 5 | 2.244 | 2.693 | −20.0% |
+| 2 (contribution) | 2.642 | 3.521 | **−33.3%** |
+
+**x264's crossover is around crf 12.** Above it, inter coding costs more than it saves.
+
+Quality-checked at crf 2, since equal-setting is not equal-quality (the trap that produced the
+repo's bogus "inter saves 17–27%"):
+
+| | bpp | VMAF | PSNR-Y |
+|---|---|---|---|
+| x264 all-intra | 2.642 | **99.663** | 53.88 |
+| x264 I+P | 3.521 | 99.647 | 54.92 |
+
+So at crf 2, inter costs 33% more bits for **worse VMAF** and +1.04 dB PSNR — roughly break-even to
+negative, not the dramatic loss the raw ratio suggests, but nowhere near what it earns at crf 23.
+
+### GNC's own crossover
+
+Same measurement, with `GNC_P_QP_SCALE=1.0` so TUNE-5's lever does not distort it:
+
+| q | all-intra | I+P | inter earns |
+|---|---|---|---|
+| 25 | 0.870 bpp | 0.430 | +50.6% |
+| 50 | 1.910 | 0.930 | +51.3% |
+| 75 | 3.720 | 2.380 | +36.0% |
+| 92 | 7.840 | 8.240 | −5.1% |
+| 99 | 12.420 | 13.000 | −4.7% |
+
+**GNC's crossover sits between q=75 and q=92.** These are equal-setting figures and therefore
+carry the same caveat as x264's; the matched-quality check at q=99 gives 13.00 bpp @ 59.80 dB
+against 13.25 @ 60.00, i.e. a 1.9% saving for 0.2 dB — break-even.
+
+### What this means
+
+**At the contribution operating point there is no inter gap to close.** Both codecs' inter coding
+is break-even there, and GNC's is if anything slightly better behaved than x264's (−2% versus
+−33% on raw rate). The +118% to +177% that GNC is behind at contribution quality is **entirely an
+intra gap**.
+
+The reason is not a defect in either codec. Near lossless, a motion-compensated residual is
+noise-like — Girod's result that its spectrum is far flatter than an image's — so it costs about
+as much to code as the original picture, and the motion vectors are pure overhead on top. Both
+codecs hit the same wall; they just hit it at different quality levels.
+
+**The inter gap is real at distribution bitrates**, where x264 earns +64% and GNC earns
+substantially less at matched quality. That is a genuine deficiency, but it is at the operating
+point [docs/POSITIONING.md](../GOALS.md) says GNC is not built for.
+
+### Consequence for where effort goes
+
+1. **Intra is the whole game at contribution quality.** Closing +118–177% on intra is worth more
+   than any inter work, and it is measured against a codec whose inter coding also gives up there.
+2. **Inter work belongs to the preview/proxy tier**, if that tier is pursued — a different product
+   decision, not a codec one.
+3. **Several inter rejections should be re-gated before being trusted at distribution bitrates.**
+   Multi-reference (1–5%), the B-pyramid and others were measured under configurations since found
+   defective: BUG-4 (tile skip wrong everywhere), BUG-7 (diagnostics corrupting the encoder by 32%),
+   and TUNE-5's P-frame quantiser scale. Cheap to re-run, and the scripts exist.

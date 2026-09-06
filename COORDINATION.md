@@ -57,7 +57,6 @@ the shared checkout** — no absolute paths, no session ids.
 
 | worktree | branch | area |
 |---|---|---|
-| `../gnc-readme-drift` | `readme-drift` | **docs — pushed, ready to merge.** README carried three copies of the 2026-02-27 figures that contradicted the corrected Current Results table; removed, BASELINE is now the only place the README quotes a number from. Entropy compression column withdrawn (decision 0015, ENT-2 opened). MEAS-6's latency figures added — they were measured and absent. CLAUDE.md had the default entropy coder backwards. No code touched. |
 | `../gnc-abac`, `.claude/worktrees/abac` (`abac-gate`) | `abac` | **released — question answered, see BACKLOG Part 6.** The idle-machine bench is run. Range at cb=64 costs **1.69× frame decode for −16.7% rate** at q=90; Interval costs 3.99×. Rice's own entropy stage is 47% of frame decode, which caps any entropy work at 1.9×. What remains is a positioning call, not an engineering one. |
 | `../gnc-abac` | `abac` | same worktree, now on **BUG-8** — the encoder's local decode diverges from the real decoder down a GOP. |
 

@@ -6825,3 +6825,80 @@ not, walk the pipeline stage by stage. That isolates precision from prediction i
 
 Filed as **BUG-10, P0** — it is the largest single defect the project has measured, and it sits
 directly on the operating point the codec is positioned for.
+
+---
+
+## 2026-09-06 — BUG-10 has a cause, and it is a lever we set ourselves
+
+Measured on commit `217cb25`, the tree that filed BUG-10. Compression figures only; the machine was
+not idle and no timing is claimed.
+
+### The ceiling is `GNC_P_QP_SCALE`
+
+BUG-10 recorded that inter frames stop improving as the quantiser gets finer, and listed three
+untested candidates: reference-buffer precision, bilinear quarter-pel interpolation, and clamping
+in the reconstruction path. None of them is the cause. **All three are still present in the run
+below, which is flat.**
+
+Touchdown — the sequence BUG-10 was filed on — 8 frames, ki=8, q=99, Rice, 4:4:4:
+
+| frame | default (`p_qp_scale` 1.25) | `GNC_P_QP_SCALE=1.0` |
+|---|---|---|
+| 0 [I] | 59.87 | 59.87 |
+| 1 [P] | 57.91 | 59.82 |
+| 2 [P] | 48.89 | 59.80 |
+| 3 [P] | 47.33 | 59.79 |
+| 4 [P] | 46.03 | 59.79 |
+| 5 [P] | 45.42 | 59.79 |
+| 6 [P] | 45.23 | 59.78 |
+| 7 [P] | 45.01 | **59.77** |
+
+old_town, same parameters: I 59.74, P 57.80 → 44.30 by default; **flat 59.74 on every P frame**
+with the lever off.
+
+### Why it looked like a hard ceiling
+
+The first P frame loses **1.94 dB**, and 20·log10(1.25) = 1.94 dB. That is the lever's own cost,
+paid once and exactly. Frame 2 then predicts from a reference that already carries it and pays it
+again, and so on. A cost that is re-applied to its own output converges — which is what a
+saturation curve looks like from the outside. The give-away is in the per-frame numbers rather than
+the summary: a hard ceiling would clip the first P frame too, and it does not.
+
+This is the third time this project has read an accumulating loss as a fixed limit. The tell is the
+same each time: **look at the per-frame series, not the min/max of the sequence.**
+
+### The finding underneath the finding
+
+Turning the lever off costs about 9% more bits (touchdown 11.4–12.1 → 12.8–13.3 bpp). At that
+point a P frame costs **more than the I frame it predicts from** — 13.0 bpp against 12.59. So at
+the contribution operating point, motion compensation on this content buys nothing whatsoever: the
+residual after MC is noise-like and codes no better than the picture itself.
+
+That reframes the "all-intra buys +9 dB for 3–5% more bits" result in BUG-10. All-intra is not
+winning because intra is unusually good; inter is contributing nothing, and the lever was
+converting that nothing into a 15 dB quality loss instead of into bits.
+
+**So the fix is two-part, and only the first part is a bug.** (1) Make `p_qp_scale` descend to 1.0
+above roughly q=90, the same fix QUAL-1 applied to the qstep anchors — a lever measured at q≈35
+being applied at q=99. (2) Then re-ask whether the inter path earns its place at contribution
+quality at all, with the lever no longer masking the answer.
+
+### Not explained
+
+BUG-10's handset-qstep row — 36.82 / 36.47 / 36.59 at qstep 1.0 / 0.5 / 0.25 — sits far below the
+q=99 figures and does not follow from this. Most likely `dead_zone` was non-zero in that run, so
+the inter dead-zone doubling was live where at q=99 it is not. Check before closing BUG-10.
+
+### BUG-9, while in the same code
+
+The stated cause — "rANS's GPU alphabet cannot represent the symbol range" — is wrong.
+`rans_encode.wgsl` writes each stream backwards from the end of a fixed 4 KB buffer, `write_ptr`
+decremented with no bound check. Over 4 KB it underflows: the reported index 4294963272 is
+2^32 − 4024, an overrun of 4024 bytes. Rice survives the same qstep because it sizes that buffer
+from qstep and carries an overflow flag the shader sets; rANS has neither. The repro in the backlog
+is also stale — `--rans` is a no-op flag, so `--qstep 1.0 --rans` quietly encodes with Rice and
+succeeds. Use `-q 15 --qstep 1.0`.
+
+Recommended fix is a bounds check on the host, not a wider alphabet: rANS is selected only at
+q ≤ 20 where 4 KB is ample, and it measures worse than Rice above q=20, so the capability has no
+user. Turn the crash into a sentence and leave it there.

@@ -175,22 +175,65 @@ qstep.
 `dead_zone` is already 0 there); the B-pyramid (these are P-only); motion search quality (beats an
 offline oracle).
 
-**Candidates, untested:** reference-buffer precision accumulating across a P-chain; quarter-pel
-**bilinear** interpolation low-passing the reference (a 6-tap filter measured "neutral to worse" —
-but at *distribution* bitrates, where blur is a small share of the error, so that result should not
-be assumed to hold near-lossless); clamping in the reconstruction path.
+**Cause found 2026-09-06 (commit 217cb25) — it is not a ceiling.** `GNC_P_QP_SCALE`, the
+deliberate 1.25x coarser quantiser on predicted frames, compounding down the reference chain. Set
+it to 1.0 and the ceiling disappears completely. Touchdown, 8 frames, ki=8, q=99:
+
+| frame | default (1.25) | `GNC_P_QP_SCALE=1.0` |
+|---|---|---|
+| 0 [I] | 59.87 | 59.87 |
+| 1 [P] | 57.91 | 59.82 |
+| 2 [P] | 48.89 | 59.80 |
+| 4 [P] | 46.03 | 59.79 |
+| 7 [P] | 45.01 | **59.77** |
+
+Same shape on old_town (I 59.74; P 57.80 → 44.30 by default, flat 59.74 with the lever off). The
+first step is **1.94 dB, which is exactly 20·log10(1.25)** — the lever's own cost, paid once. What
+follows is that cost being re-paid against an already-coarsened reference, frame after frame, until
+it asymptotes. The candidates previously listed here (reference precision, bilinear interpolation,
+clamping in reconstruction) are ruled out by the fact that all of them are still present in the
+`GNC_P_QP_SCALE=1.0` run, which is flat.
+
+**What this costs, and the second finding underneath it.** Turning the lever off raises the rate
+about 9% (touchdown 11.4–12.1 → 12.8–13.3 bpp). At that point a P-frame costs **more than the
+I-frame it predicts from** (13.0 against 12.59 bpp). So at contribution quality, motion
+compensation on these sequences buys nothing at all — the residual is essentially noise. The lever
+was hiding that by paying in quality instead of bits, which is why all-intra looked like a free
++9 dB.
+
+**Fix, not yet made:** the lever is sound where it was measured (q≈35, −3.3% BD-rate) and wrong at
+the top of the range. Make it descend with q, exactly as the qstep anchors were fixed for QUAL-1.
+Above roughly q=90 it should be 1.0.
+
+**One data point this does not explain.** The handset-qstep row above (36.82 / 36.47 / 36.59 at
+qstep 1.0 / 0.5 / 0.25) sits far below the q=99 numbers. Suspect `dead_zone` was not 0 in that run,
+so the inter dead-zone doubling was live where at q=99 it is not. Re-check before closing.
 
 **Next step is diagnosis, not a fix.** Encode a P-frame with a forced zero motion field on
 byte-identical frames at qstep 0.25 and check whether the reconstruction is bit-exact. That
 separates precision from prediction in one run. Full measurement in RESEARCH_LOG 2026-09-06.
 
 ### BUG-9 — rANS panics below qstep 1.0 instead of rejecting the configuration (todo, P2)
-`gnc encode --qstep 1.0 --rans` panics with `range start index 4297717596 out of range for slice
-of length 5242880`. rANS's GPU alphabet cannot represent the symbol range below about qstep 1.5;
-that is a legitimate limit, but a coder that cannot encode a configuration should say so, not
-panic. Unreachable from `quality_preset` (rANS is only selected at q<=20, where qstep is 32+),
-reachable from an explicit `--qstep` with `--rans`. Measured 2026-09-06: rANS OK at 2.0 and 1.5,
-panics at 1.0; Rice is fine to at least 0.5.
+Panics with `range start index 4294963272 out of range for slice of length 5242880` at
+`rans_gpu_encode.rs:1813` in `pack_tiles`. Measured 2026-09-06: rANS OK at 2.0 and 1.5, panics at
+1.0; Rice is fine to at least 0.5.
+
+**Repro line corrected.** `--qstep 1.0 --rans` does *not* reproduce it — `--rans` is a no-op flag
+kept for backward compatibility, so that command encodes with Rice and succeeds. rANS is reached
+through the preset only, so the panic needs `gnc encode -q 15 --qstep 1.0`.
+
+**Stated cause was wrong.** This is not the symbol alphabet. `rans_encode.wgsl` writes each stream
+*backwards* from the end of a fixed 4 KB buffer (`MAX_STREAM_BYTES = 4096`, `write_ptr` starting at
+the top and decremented with no bound check). When a stream needs more than 4 KB the pointer
+underflows: 4294963272 is 2^32 − 4024, i.e. the stream overran by 4024 bytes. Rice survives the
+same qstep for two reasons — it sizes that buffer from qstep (`max_stream_bytes_for_tile`) and it
+carries a per-tile overflow flag that the shader sets. rANS has neither.
+
+**Recommended fix — the cheap half only.** Bounds-check `write_ptr` on the host (about three lines:
+`write_ptr > MAX_STREAM_BYTES` means that stream overflowed) and return a named error, or port
+Rice's overflow flag. Do **not** make rANS work at fine qstep: it is selected only at q<=20 where
+4 KB is ample, and it measures worse than Rice above q=20, so the capability has no user. The
+value here is turning a wrapped-pointer crash into a sentence.
 
 ### QUAL-1 — Re-run MEAS-1 at the contribution operating point (todo, P1)
 The quality ladder above q=92 was dead until 2026-09-06 — q=92, 96 and 99 produced the same

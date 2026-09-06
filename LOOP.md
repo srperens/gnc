@@ -53,6 +53,16 @@ were bugs in the measuring, not the measured:
 So: when a new measurement disagrees with an existing trusted number, **check the new harness
 first**. Cross-check it against something already believed before drawing a conclusion.
 
+**Timing needs an idle machine (added 2026-09-06).** Two agents share this Mac. The same fps run
+measured 20% slower during another session's `cargo test` than after it — larger than most effects
+this project chases. Compression figures (bpp, VMAF, dE00) are deterministic and unaffected;
+**every fps, throughput and latency number is not.** Check with `uptime` and `ps` before timing,
+and say in the write-up whether the machine was idle.
+
+**Say which fps you mean.** Three quantities have been called "encode fps" and they differ by
+2.4x: the GPU encode phase (`benchmark-sequence`, Y4M in), the encoder loop (what
+`encode-sequence` prints), and end-to-end wall clock. See [BASELINE.md](BASELINE.md).
+
 **Offline models understate the real coder.** Simulated with ideal entropy, going from 3 to 4
 wavelet levels was worth 1.2%; in the codec it was 6%, because Rice adapts its parameter per
 subband and the model could not see that. Prefer in-codec measurement; use offline models to

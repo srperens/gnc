@@ -48,6 +48,7 @@ Add your row when you create one, remove it when you are done.
 | worktree | branch | area |
 |---|---|---|
 | `/Users/per/src/gnc-abac` | `abac` | adaptive binary code-block entropy coder (EBCOT follow-up), CPU + GPU |
+| `…/60395aaf…/scratchpad/wt-tile` | `fix/bug-11-rice-stream-mapping` | Rice stream mapping + tile/level config (BUG-11, BUG-12) — **merging now, then removed** |
 
 ## The four rules that have actually bitten us
 
@@ -71,6 +72,17 @@ the option that spends more bits. Use BD-rate, or compare at matched rate. At le
 wrong conclusions have come from this one error.
 
 ## Landed today, and what each one invalidates
+
+- **BUG-11 + BUG-12** — Rice's stream mapping is now tile-width-aware (column-major, cut into 256
+  contiguous segments) and the wavelet-level ceiling now follows the tile size actually in use.
+  **Tile 256 output is byte-identical at all 12 measured points**, so nothing in BASELINE.md moves
+  and no measurement taken at the default tile size is affected. What *is* invalidated: **every
+  tile-size result in this repo, #47 and this morning's sweep included** — all of them scored the
+  larger-tile arm through a coder that penalised it by 13–19%. Corrected figure: 512 over 256 is
+  **−0.91% BD-rate**, so the geometry is worth ~1% and the default stays at 256. Also closed:
+  6 wavelet levels at tile 512 is worth −0.1%, so deeper decomposition is not a lever either.
+  **Use `CodecConfig::set_tile_size()`, never assign `tile_size` directly** — the level ceiling
+  depends on it.
 
 - **BUG-13 filed** — `GNC_INTRA_PRED=1` (new knob) produces corrupt output at every quality: max
   error 197-255 from q=50 to q=100, and at q=100 it loses 62 dB against a bit-exact baseline.

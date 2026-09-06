@@ -7924,3 +7924,61 @@ stays on the shelf.
 
 LOSSLESS-1 moves from "untested hypothesis" to "compression gate passed, throughput gate pending".
 It is the only lever this week that has passed a gate rather than failing one.
+
+---
+
+## 2026-09-06 — What a serial dependency actually costs: 4.9x, and still 201 fps
+
+### Why this was worth measuring on its own
+
+GNC has declined several tools partly on parallelism grounds — spatial prediction, in-loop
+filtering, context-adaptive coding — without the cost ever being measured. LOSSLESS-1's compression
+gate passed at 10–26%, but its decoder needs MED prediction, which cannot produce pixel (x, y)
+before (x−1, y). Rather than build the codec to find out, measure the dependency itself.
+
+`tests/wavefront_cost.rs`. Two shaders, **identical arithmetic**, one difference: where the
+neighbours come from.
+
+- **independent** — neighbours from a separate input buffer, one thread per pixel. The shape GNC
+  uses everywhere today.
+- **wavefront** — neighbours from its own output buffer, so the dependency is real. One workgroup
+  per 256×256 tile, 256 threads, marching all 511 anti-diagonals with a `storageBarrier()` between
+  each.
+
+2048×1280 × 3 planes (1080p 4:4:4 padded to whole tiles), 7.86 M pixels, 20 iterations, M1:
+
+| | per frame | fps |
+|---|---|---|
+| independent | **1.02 ms** | 980 |
+| wavefront | **4.98 ms** | 201 |
+
+**A per-pixel serial dependency costs 4.9x — and is still 201 fps for a full 1080p 4:4:4 frame.**
+
+### Reading it
+
+The absolute number decides this, not the ratio. 4.98 ms is **25% of the 20 ms frame budget at
+50 fps**, and about **15% of GNC's current ~34 ms decode**. That is affordable.
+
+Measured first with `workgroupBarrier()` and then correctly with `storageBarrier()`: 4.79 ms
+against 4.98 ms. The barrier type barely moves it, which locates the cost — it is **occupancy, not
+synchronisation**. The first and last anti-diagonals have one active lane out of 256; averaged over
+a 256×256 tile the mean diagonal length is 128, so roughly half the threads idle. That also
+predicts the scaling: smaller tiles would be *better* here, and a GPU with more cores would show a
+worse ratio while staying absolutely affordable.
+
+### What it settles beyond LOSSLESS-1
+
+**The parallelism objection is quantitatively much weaker than it has been treated as.** A
+dependency is a 5x tax on the pass that carries it, not a disqualification — and no pass of that
+shape is anywhere near GNC's bottleneck, which is entropy coding at 51–85% of runtime. Tools
+previously waved off on "that would serialise the GPU" deserve a number rather than a principle.
+
+**LOSSLESS-1's throughput gate passes.** Both gates are now green: 10–26% compression available,
+~5 ms/frame to collect it.
+
+### Limits
+
+Synthetic pass with minimal arithmetic — a real MED decoder also entropy-decodes, which dominates
+either way. One GPU (M1, 8 cores). 256×256 tiles specifically; the occupancy argument says the
+ratio is tile-size dependent. And this measures the *decode* dependency; encode-side MED can be
+fully parallel at lossless, since encoder-side reconstruction equals the input.

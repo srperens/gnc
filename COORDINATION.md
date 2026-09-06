@@ -57,7 +57,8 @@ the shared checkout** — no absolute paths, no session ids.
 
 | worktree | branch | area |
 |---|---|---|
-| `../gnc-abac` | `abac` | adaptive binary code-block entropy coder (EBCOT follow-up), CPU + GPU. Rate −19 to −25% confirmed; GPU decode bit-exact but 6-13 fps, so throughput is the open gate. |
+| `../gnc-abac` | `abac` | **paused, free to take.** Adaptive binary code-block entropy coder (EBCOT follow-up), CPU + GPU. Rate −15 to −25% confirmed, two coder variants behind `GNC_ABAC_CODER`. Blocked only on `cargo test --release --test abac_bench -- --ignored` on an idle machine. |
+| `../gnc-abac` | `abac` | same worktree, now on **BUG-8** — the encoder's local decode diverges from the real decoder down a GOP. |
 | `../gnc-qual1` (scratchpad) | `meas/qual-1` | QUAL-1 — re-run MEAS-1 at q=92/96/99 vs crf 4/8/12. Measurement only, no `src/` changes; PSNR + CIEDE2000 lead, VMAF saturated at this end. |
 
 ## Timing: the machine is shared, so throughput numbers are not measurable during a session

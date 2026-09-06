@@ -12,9 +12,9 @@ const WG_SIZE: u32 = 256u;
 const RANS_M: u32 = 4096u;           // 1 << 12, must match RANS_PRECISION
 const MAX_ALPHABET: u32 = 4096u;
 const MAX_GROUP_ALPHABET: u32 = 4096u;
-const MAX_GROUPS: u32 = 8u;
-const HIST_TILE_STRIDE: u32 = 32793u;  // 1 + MAX_GROUPS*(3+MAX_GROUP_ALPHABET)
-const ENCODE_TILE_INFO_STRIDE: u32 = 36u;
+const MAX_GROUPS: u32 = 12u;
+const HIST_TILE_STRIDE: u32 = 1u + MAX_GROUPS * (3u + MAX_GROUP_ALPHABET);
+const ENCODE_TILE_INFO_STRIDE: u32 = 1u + MAX_GROUPS * 4u;
 
 struct Params {
     num_tiles: u32,

@@ -49,7 +49,7 @@ Each tile (256x256) is fully independent — no cross-tile dependencies. This gi
 ### Pipeline stages
 
 1. **Color space** — YCoCg-R via lifting (integer-exact, lossless-capable)
-2. **Wavelet transform** — CDF 9/7 for lossy (q=1–99), LeGall 5/3 for lossless (q=100), 3–4 decomposition levels
+2. **Wavelet transform** — CDF 9/7 for lossy (q=1–99), LeGall 5/3 for lossless (q=100), 5 decomposition levels at q≥25, 4 below
 3. **Adaptive quantization** — Per-block variance analysis on LL subband, geometric mean normalization, 3×3 spatial smoothing
 4. **Quantization** — Uniform scalar with perceptual subband weights, dead zone, adaptive QP from AQ weight map. Fused quantize+histogram kernel when CfL is off.
 5. **Chroma-from-Luma (CfL)** — Per-tile per-subband least-squares alpha (14-bit), active at q=50–85. Encodes chroma residuals instead of raw coefficients.

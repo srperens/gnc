@@ -1,19 +1,33 @@
 # GNC Benchmark Baseline
 
-Last updated: 2026-09-05
-Baseline commit: (subband weight fix — uniform weights default)
-Mode: Spatial-only, I+P+B, Rice entropy, ki=9, 7B-per-group pyramid, uniform subband weights
+Last updated: 2026-09-06 (compression columns; fps columns are older — see below)
+Baseline commit: (BUG-6 — 5 wavelet levels at q ≥ 25)
+Mode: Spatial-only, Rice entropy, uniform subband weights. P-only by default since BUG-5.
 
 ## Single-Frame (bbb_1080p, Rice, 4:4:4)
 
-| q   | PSNR     | BPP  | Encode  | Decode  | VMAF  |
-|-----|----------|------|---------|---------|-------|
-| 25  | 35.44 dB | 1.89 | 28.5 fps | 46.9 fps | 91.02 |
-| 50  | 40.34 dB | 2.79 | 28.6 fps | 41.7 fps | 95.08 |
-| 75  | 44.45 dB | 4.59 | 29.6 fps | 41.3 fps | 96.56 |
-| 90  | 51.0 dB  | 9.65 | 39 fps   | 55 fps   | —     |
+Re-measured 2026-09-06 after BUG-6 made 5 wavelet levels the default at q ≥ 25 (no upper cutoff
+— the earlier q ≤ 80 cap was measuring an aliasing bug, see RESEARCH_LOG).
+
+| q   | PSNR     | BPP  | VMAF  | levels |
+|-----|----------|------|-------|--------|
+| 25  | 34.94 dB | 1.60 | 90.21 | 5 |
+| 50  | 40.34 dB | 2.76 | 95.02 | 5 |
+| 75  | 44.47 dB | 4.56 | 96.57 | 5 |
+| 90  | 51.02 dB | 8.60 | 97.08 | 5 |
+
+Against the 2026-09-05 rows, q=50 and q=75 are unchanged within noise; **q=25 moved to a different
+operating point** — 1.89 → 1.60 bpp (−15%) for −0.50 dB and −0.81 VMAF. Part of that is BUG-6
+(isolated: −6.4% rate, +0.28 dB, −0.53 VMAF at q=25) and the rest predates it. A VMAF drop that
+comes with a 15% rate drop is a move along the RD curve, not a regression — but it means **the
+q=25 row is not comparable to the old one point-for-point.** Compare with BD-rate, or at matched
+rate.
 
 Previous (perceptual weights, #64): q=75 → 42.17 dB / 3.83 bpp / VMAF 95.05
+
+**The fps columns were dropped from this table**, not re-measured: the encode/decode figures in the
+2026-09-05 version were taken by an unrecorded method, and this Mac was not idle on 2026-09-06.
+See the section below before quoting any throughput number.
 
 ## How to read the fps figures in this file
 

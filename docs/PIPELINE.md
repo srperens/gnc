@@ -41,7 +41,7 @@ Separable 2D wavelet (row pass → column pass), repeated for 3–4 decompositio
 | Lossy (q=1–99) | CDF 9/7 | Better energy compaction |
 | Lossless (q=100) | LeGall 5/3 | Integer-exact roundtrip |
 
-Produces LL (lowpass, top-left) + detail subbands LH, HL, HH per level. 8 dispatches per level × 3–4 levels.
+Produces LL (lowpass, top-left) + detail subbands LH, HL, HH per level. 8 dispatches per level × 4–5 levels (5 at q≥25).
 
 **Alternative:** Block DCT-8×8 (`dct8_fused.wgsl`) — fused forward+quantize+inverse mega-kernel. Matches CDF 9/7 RD in fewer dispatches. Currently experimental.
 

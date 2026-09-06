@@ -17,14 +17,14 @@
 const WG_SIZE: u32 = 256u;
 const MAX_ALPHABET: u32 = 4096u;
 const MAX_GROUP_ALPHABET: u32 = 4096u;
-const MAX_GROUPS: u32 = 8u;
+const MAX_GROUPS: u32 = 12u;
 const MAX_ZERO_RUN: u32 = 256u;
 const STREAMS_PER_TILE: u32 = 32u;
 
 // Output stride per tile in u32s.
 // Single-table: [min_val, alphabet_size, zrun_base, hist[0..MAX_ALPHABET]]
 // Per-subband:  [num_groups, {min_val, alphabet_size, zrun_base, hist[0..MAX_GROUP_ALPHABET]} x groups]
-const HIST_TILE_STRIDE: u32 = 32793u;  // 1 + MAX_GROUPS*(3+MAX_GROUP_ALPHABET)
+const HIST_TILE_STRIDE: u32 = 1u + MAX_GROUPS * (3u + MAX_GROUP_ALPHABET);
 
 struct Params {
     num_tiles: u32,
@@ -51,10 +51,10 @@ var<workgroup> shared_reduce_u: array<u32, 256>;
 var<workgroup> shared_hist: array<atomic<u32>, 5120>;
 
 // Per-group metadata broadcast from thread 0
-var<workgroup> shared_group_min: array<i32, 8>;
-var<workgroup> shared_group_asize: array<u32, 8>;
-var<workgroup> shared_group_hist_off: array<u32, 8>;
-var<workgroup> shared_group_zrun: array<i32, 8>;
+var<workgroup> shared_group_min: array<i32, 12>;
+var<workgroup> shared_group_asize: array<u32, 12>;
+var<workgroup> shared_group_hist_off: array<u32, 12>;
+var<workgroup> shared_group_zrun: array<i32, 12>;
 var<workgroup> shared_num_groups: u32;
 // Flag: does any group have ZRL enabled?
 var<workgroup> shared_any_zrl: u32;
@@ -141,12 +141,12 @@ fn main(
 
         // Phase 1: Find per-group min/max, zero_count, max_abs_nonzero.
         // Each thread tracks local stats per group in registers.
-        var local_min: array<i32, 8>;
-        var local_max: array<i32, 8>;
-        var local_has: array<bool, 8>;
-        var local_zero_count: array<u32, 8>;
-        var local_total_count: array<u32, 8>;
-        var local_max_abs_nz: array<i32, 8>;
+        var local_min: array<i32, 12>;
+        var local_max: array<i32, 12>;
+        var local_has: array<bool, 12>;
+        var local_zero_count: array<u32, 12>;
+        var local_total_count: array<u32, 12>;
+        var local_max_abs_nz: array<i32, 12>;
 
         for (var g = 0u; g < num_groups; g++) {
             local_min[g] = 2147483647;

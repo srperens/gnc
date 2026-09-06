@@ -535,15 +535,46 @@ checkerboard-k block follows the same rule (stride 8, or 12 for wide tiles).
 | kristensara_720p | 2.31 → 2.27 | **−1.7%** | +0.86 dB | +3.32 |
 | bbb_1080p | 4.20 → 4.16 | −1.0% | +0.01 dB | 0.00 |
 
-Smooth content gains most, which is what a deeper decomposition should do. Default is now 5 levels
-at q ≤ 80, 4 above; `GNC_WAVELET_LEVELS` still overrides. `CodecConfig::max_wavelet_levels()`
-states the tile-size ceiling (5 for a 256 px tile).
+Smooth content gains most, which is what a deeper decomposition should do.
+`CodecConfig::max_wavelet_levels()` states the tile-size ceiling (5 for a 256 px tile);
+`GNC_WAVELET_LEVELS` still overrides.
 
-**Follow-up (open):** the q ≤ 80 cutoff no longer reproduces. It was set when the encoder's
-phase-1 statistics arrays were still 8 wide, so groups 8–9 aliased group 7 and the deep levels got
-the wrong `k`. Re-measured at q=90 with correct widths, 5 levels is −0.4% (blue_sky) and −0.5%
-(kristensara) at identical PSNR and VMAF — small, but not the loss the cutoff assumes. Sweep
-q=85–99 on ≥3 images before either removing the cutoff or writing down why it stays.
+**Range settled by BD-rate, 2026-09-06 — 5 levels at q ≥ 25, 4 below.** Per-point VMAF at equal q
+looks slightly *worse* with 5 levels, because 5 levels also removes 1–16% of the bits; the gain
+only appears at equal quality. BD-rate on VMAF over q=25–70, four images:
+
+| image | BD-rate (VMAF) |
+|---|---|
+| blue_sky_1080p | **−6.88%** |
+| touchdown_1080p | **−4.31%** |
+| kristensara_720p | −1.89% |
+| bbb_1080p | −1.84% |
+| mean | **−3.73%** |
+
+**Lower cutoff (kept).** Over q=15–35 the sign flips: +4.25% bbb, +2.44% kristensara, +2.18%
+touchdown (blue_sky still −9.53%). Below q≈25 the deep subbands quantise to all-zero anyway, so
+their k values and rANS frequency tables are pure overhead — at q=15–20 five levels costs *more*
+bits **and** ~1 VMAF point. Hence 25.
+
+**Upper cutoff (removed).** The old q ≤ 80 cap was measuring the aliasing bug, not the transform.
+Swept q=85/90/95/99 on all four images: all 16 points save 0.3–0.6% of the bits at PSNR and VMAF
+identical to two decimals, and q=100 stays bit-exact lossless while shrinking 0.2%. No loss found
+anywhere above q=25, so the cap is gone.
+
+**Video** (old_town, 16 frames, q=30): I-only −4.6% and I+P −3.2% bitrate for −0.20 VMAF; aerial
+q=30 I+P −6.0%. Same shape as stills, well inside the −0.5 VMAF block threshold.
+
+**Root cause was wider than the skip bitmap.** Four separate places capped the codec at 8 subband
+groups, and each had to be found by a different failure: the Rice k arrays (panic), the Rice
+phase-1 accumulators (silent aliasing), the rANS group arrays (validation error), and
+`quantize_histogram_fused.wgsl` — the fourth histogram producer, which still wrote at the 8-group
+stride so every tile but tile 0 read back `num_groups=0` and the encoder overran its stream buffer.
+All four now derive from one `MAX_GROUPS`/`RICE_MAX_GROUPS` constant per backend, and the rANS
+decode tile-info offsets derive from it too instead of being hardcoded 33/34/66.
+
+**Canary:** `GNC_DIAGNOSTICS=1` prints `groups=N deep_skipped=M` per frame. At 5 levels it reads
+`groups=10` with `deep_skipped>0` at low rate; at 4 levels `groups=8 deep_skipped=0` always.
+`deep_skipped` counts skips in groups ≥8, which only the two-byte bitmap can carry.
 
 ### TUNE-4 — Adaptive quantisation gradient was inverted (**DONE 2026-09-05**)
 `aq_strength` was 0.2 above q=70 and 0.15 below, never swept. Measured: 0.3 below q=30 buys +0.1

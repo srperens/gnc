@@ -7638,11 +7638,7 @@ impl EncoderPipeline {
     fn make_zero_compressed_frame(config: &CodecConfig, info: &FrameInfo) -> CompressedFrame {
         let num_tiles = (info.tiles_x() * info.tiles_y()) as usize;
         let num_groups = (config.wavelet_levels * 2).max(1) as usize;
-        let all_skip_mask = if num_groups >= 8 {
-            0xFFu8
-        } else {
-            (1u8 << num_groups) - 1
-        };
+        let all_skip_mask = crate::encoder::rice::all_groups_mask(num_groups as u32);
         let rice_tiles: Vec<crate::encoder::rice::RiceTile> = (0..num_tiles * 3)
             .map(|_| crate::encoder::rice::RiceTile {
                 num_coefficients: info.tile_size * info.tile_size,

@@ -17,11 +17,11 @@ use super::rans::{InterleavedRansTile, SubbandGroupFreqs, SubbandRansTile, STREA
 use crate::{FrameInfo, GpuContext};
 
 const MAX_STREAM_BYTES: usize = 4096;
-const HIST_TILE_STRIDE: usize = 32793; // 1 + MAX_GROUPS*(3+MAX_GROUP_ALPHABET)
-const ENCODE_TILE_INFO_STRIDE: usize = 36;
+pub(super) const HIST_TILE_STRIDE: usize = 1 + MAX_GROUPS * (3 + MAX_GROUP_ALPHABET);
+const ENCODE_TILE_INFO_STRIDE: usize = 1 + MAX_GROUPS * 4;
 const MAX_ALPHABET: usize = 4096;
 const MAX_GROUP_ALPHABET: usize = 4096;
-const MAX_GROUPS: usize = 8;
+const MAX_GROUPS: usize = 12;
 
 fn cumfreq_stride(per_subband: bool) -> usize {
     if per_subband {
@@ -1747,6 +1747,11 @@ impl GpuRansEncoder {
                     });
                 }
 
+                if std::env::var("GNC_RANS_DIAG").is_ok() && t < 2 {
+                    let total: usize = groups.iter().map(|g| g.alphabet_size as usize + 1).sum();
+                    let sizes: Vec<u32> = groups.iter().map(|g| g.alphabet_size).collect();
+                    eprintln!("[rans] tile {t}: groups={num_groups} cf_entries={total} asizes={sizes:?}");
+                }
                 tile_freqs.push(TileFreqs::Subband(NormalizedSubbandTileFreqs {
                     num_groups: num_groups as u32,
                     groups,

@@ -1133,8 +1133,8 @@ impl CachedEncodeBuffers {
         if self.fused_hist_bufs.is_some() {
             return;
         }
-        const HIST_TILE_STRIDE: u64 = 32793;
-        let hist_size = (num_tiles as u64) * HIST_TILE_STRIDE * 4;
+        let hist_size =
+            (num_tiles as u64) * super::rans_gpu_encode::HIST_TILE_STRIDE as u64 * 4;
         let usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC;
         self.fused_hist_bufs = Some(std::array::from_fn(|i| {
             ctx.device.create_buffer(&wgpu::BufferDescriptor {

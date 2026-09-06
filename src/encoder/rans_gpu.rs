@@ -10,7 +10,14 @@ use wgpu::util::DeviceExt;
 use super::rans::{InterleavedRansTile, SubbandRansTile, STREAMS_PER_TILE};
 use crate::{FrameInfo, GpuContext};
 
-pub(crate) const TILE_INFO_STRIDE: usize = 100;
+/// Max subband groups the decode shader can hold (must match MAX_GROUPS in rans_decode.wgsl).
+pub(crate) const MAX_GROUPS: usize = 12;
+/// Tile-info offsets, derived from MAX_GROUPS. Layout: [0]=num_groups,
+/// [1..1+MAX_GROUPS*4]=group records, then byte_base, 32 states, 32 offsets.
+pub(crate) const TI_BYTE_BASE: usize = 1 + MAX_GROUPS * 4;
+pub(crate) const TI_STATES: usize = TI_BYTE_BASE + 1;
+pub(crate) const TI_OFFSETS: usize = TI_STATES + 32;
+pub(crate) const TILE_INFO_STRIDE: usize = TI_OFFSETS + 32;
 
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
@@ -332,13 +339,13 @@ impl GpuRansDecoder {
             // With 4 u32s per group and max 8 groups: 1 + 8*4 = 33
             // [33]: stream_data_byte_base
             let tile_stream_byte_base = stream_bytes_all.len() as u32;
-            tile_info_data[base + 33] = tile_stream_byte_base;
+            tile_info_data[base + TI_BYTE_BASE] = tile_stream_byte_base;
 
             // [34..66]: 32 initial states
             let mut stream_byte_offset = 0u32;
             for s in 0..STREAMS_PER_TILE {
-                tile_info_data[base + 34 + s] = tile.stream_initial_state[s];
-                tile_info_data[base + 66 + s] = stream_byte_offset;
+                tile_info_data[base + TI_STATES + s] = tile.stream_initial_state[s];
+                tile_info_data[base + TI_OFFSETS + s] = stream_byte_offset;
                 stream_byte_offset += tile.stream_data[s].len() as u32;
             }
 

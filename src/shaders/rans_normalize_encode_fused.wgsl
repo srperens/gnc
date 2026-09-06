@@ -17,10 +17,10 @@ const RANS_PRECISION: u32 = 12u;
 const STREAMS_PER_TILE: u32 = 32u;
 const MAX_ALPHABET: u32 = 4096u;
 const MAX_GROUP_ALPHABET: u32 = 4096u;
-const MAX_GROUPS: u32 = 8u;
+const MAX_GROUPS: u32 = 12u;
 const MAX_STREAM_BYTES: u32 = 4096u;
-const HIST_TILE_STRIDE: u32 = 32793u;
-const ENCODE_TILE_INFO_STRIDE: u32 = 36u;
+const HIST_TILE_STRIDE: u32 = 49189u;
+const ENCODE_TILE_INFO_STRIDE: u32 = 1u + MAX_GROUPS * 4u;
 
 struct Params {
     num_tiles: u32,
@@ -272,9 +272,9 @@ fn main(
 
         // ===== Phase 2 — Load cumfreq from global into shared (L1/L2 cache hit) =====
         // This is the same load pattern as rans_encode_lean.wgsl but data is cache-hot
-        var group_min: array<i32, 8>;
-        var group_asize: array<u32, 8>;
-        var group_cf_start: array<u32, 8>;
+        var group_min: array<i32, 12>;
+        var group_asize: array<u32, 12>;
+        var group_cf_start: array<u32, 12>;
         var total_cf_entries = 0u;
 
         for (var g = 0u; g < num_groups; g++) {

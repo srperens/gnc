@@ -13,10 +13,15 @@ const RANS_PRECISION: u32 = 12u;
 const RANS_MASK: u32 = 4095u;       // (1 << 12) - 1
 const STREAMS_PER_TILE: u32 = 32u;
 const MAX_ALPHABET: u32 = 4096u;
-const MAX_GROUPS: u32 = 8u;
+const MAX_GROUPS: u32 = 12u;
 
 // Per-tile info stride in u32s (must match host TILE_INFO_STRIDE)
-const TILE_INFO_STRIDE: u32 = 100u;
+// Derived from MAX_GROUPS: [0]=num_groups, [1 .. 1+MAX_GROUPS*4] group records,
+// then byte_base, 32 states, 32 offsets. Keep in sync with host TILE_INFO_STRIDE.
+const TI_BYTE_BASE: u32 = 1u + MAX_GROUPS * 4u;
+const TI_STATES: u32 = TI_BYTE_BASE + 1u;
+const TI_OFFSETS: u32 = TI_STATES + 32u;
+const TILE_INFO_STRIDE: u32 = TI_OFFSETS + 32u;
 
 struct Params {
     num_tiles: u32,
@@ -134,17 +139,17 @@ fn main(
         //   [1+g*4+1]: group g alphabet_size
         //   [1+g*4+2]: group g cumfreq_offset (into cumfreq_data)
         //   [1+g*4+3]: group g zrun_base (0 = no ZRL)
-        //   [33]: stream_data_byte_base
-        //   [34..66]: 32 initial states
-        //   [66..98]: 32 stream byte offsets
+        //   [TI_BYTE_BASE]: stream_data_byte_base
+        //   [TI_STATES ..+32]: 32 initial states
+        //   [TI_OFFSETS ..+32]: 32 stream byte offsets
 
         let num_groups = tile_info[base];
 
         // Load per-group metadata into local arrays
-        var group_min: array<i32, 8>;
-        var group_asize: array<u32, 8>;
-        var group_cf_start: array<u32, 8>;  // start index in shared_cumfreq
-        var group_zrun: array<i32, 8>;      // per-group zrun_base
+        var group_min: array<i32, 12>;
+        var group_asize: array<u32, 12>;
+        var group_cf_start: array<u32, 12>;  // start index in shared_cumfreq
+        var group_zrun: array<i32, 12>;      // per-group zrun_base
         var total_cf_entries = 0u;
         var has_any_zrl = false;
 
@@ -170,9 +175,9 @@ fn main(
         workgroupBarrier();
 
         // Per-stream decode setup
-        let stream_byte_base = tile_info[base + 33u];
-        let initial_state = tile_info[base + 34u + thread_id];
-        let stream_offset = tile_info[base + 66u + thread_id];
+        let stream_byte_base = tile_info[base + TI_BYTE_BASE];
+        let initial_state = tile_info[base + TI_STATES + thread_id];
+        let stream_offset = tile_info[base + TI_OFFSETS + thread_id];
 
         var state = initial_state;
         var byte_ptr = stream_byte_base + stream_offset;

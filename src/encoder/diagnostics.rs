@@ -42,6 +42,12 @@ pub struct RiceEfficiency {
     pub tiles_all_skipped: usize,
     /// Total tiles
     pub total_tiles: usize,
+    /// Highest subband-group count seen. 8 at 4 wavelet levels, 10 at 5.
+    pub max_groups: u32,
+    /// Skips recorded in groups 8 and above — the groups that only exist at 5 levels and only
+    /// fit since the skip bitmap became two bytes. Zero here at 5 levels means the widened
+    /// field is not actually being written.
+    pub deep_subbands_skipped: usize,
 }
 
 /// Check if diagnostics are enabled (cached after first call).
@@ -483,8 +489,12 @@ fn collect_rice_efficiency(entropy: &EntropyData) -> Option<RiceEfficiency> {
     let mut k_zrl_sum = 0f64;
     let mut k_count = 0usize;
     let mut tiles_all_skipped = 0usize;
+    let mut max_groups = 0u32;
+    let mut deep_subbands_skipped = 0usize;
 
     for tile in tiles {
+        max_groups = max_groups.max(tile.num_groups);
+        deep_subbands_skipped += (tile.skip_bitmap >> 8).count_ones() as usize;
         // Stream data bits
         let tile_stream_bytes: u64 = tile.stream_lengths.iter().map(|&l| l as u64).sum();
         total_stream_bits += tile_stream_bytes * 8;
@@ -501,8 +511,7 @@ fn collect_rice_efficiency(entropy: &EntropyData) -> Option<RiceEfficiency> {
         }
 
         // All-skipped tiles: skip_bitmap has all num_groups bits set
-        let ng = tile.num_groups.min(8);
-        let all_mask = if ng >= 8 { 0xFFu8 } else { (1u8 << ng) - 1 };
+        let all_mask = crate::encoder::rice::all_groups_mask(tile.num_groups);
         if all_mask != 0 && tile.skip_bitmap & all_mask == all_mask {
             tiles_all_skipped += 1;
         }
@@ -525,6 +534,8 @@ fn collect_rice_efficiency(entropy: &EntropyData) -> Option<RiceEfficiency> {
         avg_k_zrl,
         tiles_all_skipped,
         total_tiles,
+        max_groups,
+        deep_subbands_skipped,
     })
 }
 
@@ -784,12 +795,15 @@ pub fn print(diag: &FrameDiagnostics) {
             0.0
         };
         eprintln!(
-            "  Rice: bits/coeff={:.2} avg_k_mag={:.1} avg_k_zrl={:.1} all_skip_tiles={}/{}",
+            "  Rice: bits/coeff={:.2} avg_k_mag={:.1} avg_k_zrl={:.1} all_skip_tiles={}/{} \
+             groups={} deep_skipped={}",
             bits_per_coeff,
             re.avg_k_mag,
             re.avg_k_zrl,
             re.tiles_all_skipped,
             re.total_tiles,
+            re.max_groups,
+            re.deep_subbands_skipped,
         );
     }
 
@@ -1228,21 +1242,30 @@ fn print_temporal_frame_detail(
         let mut tiles_with_skip = 0usize;
         let mut subbands_skipped = 0usize;
         let mut subbands_total = 0usize;
+        // Groups 8..12 exist only at 5 wavelet levels and only fit since the skip bitmap became
+        // two bytes. Counting their skips is the canary that the widened field is live: it must
+        // be non-zero whenever num_groups > 8, and zero at 4 levels.
+        let mut deep_subbands_skipped = 0usize;
+        let mut max_groups = 0u32;
         for tile in tiles {
             if tile.skip_bitmap != 0 {
                 tiles_with_skip += 1;
             }
             subbands_skipped += tile.skip_bitmap.count_ones() as usize;
+            deep_subbands_skipped += (tile.skip_bitmap >> 8).count_ones() as usize;
             subbands_total += tile.num_groups as usize;
+            max_groups = max_groups.max(tile.num_groups);
         }
         if total_tiles > 0 {
             eprintln!(
-                "    Rice: tiles_with_skipped_subbands={}/{} ({:.0}%)  subbands_skipped={}/{}",
+                "    Rice: tiles_with_skipped_subbands={}/{} ({:.0}%)  subbands_skipped={}/{}                   groups={} deep_skipped={}",
                 tiles_with_skip,
                 total_tiles,
                 tiles_with_skip as f64 / total_tiles as f64 * 100.0,
                 subbands_skipped,
-                subbands_total
+                subbands_total,
+                max_groups,
+                deep_subbands_skipped
             );
         }
     }
@@ -1299,12 +1322,15 @@ fn print_temporal_frame_detail(
             0.0
         };
         eprintln!(
-            "    Rice: bits/coeff={:.2} avg_k_mag={:.1} avg_k_zrl={:.1} all_skip_tiles={}/{}",
+            "    Rice: bits/coeff={:.2} avg_k_mag={:.1} avg_k_zrl={:.1} all_skip_tiles={}/{} \
+             groups={} deep_skipped={}",
             bits_per_coeff,
             re.avg_k_mag,
             re.avg_k_zrl,
             re.tiles_all_skipped,
             re.total_tiles,
+            re.max_groups,
+            re.deep_subbands_skipped,
         );
     }
 }

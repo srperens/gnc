@@ -1,7 +1,7 @@
 # GNC Bitstream Specification
 
-**Version:** GP12 (frame codec), GNV1 (sequence container)
-**Date:** 2026-03-01
+**Version:** GP16 (frame codec), GNV1 / GNV2 (containers)
+**Date:** 2026-09-06
 
 This document specifies the GNC bitstream format at a level of detail sufficient for an independent implementation.
 
@@ -9,9 +9,12 @@ All multi-byte values are **little-endian**. All byte offsets are from the start
 
 ---
 
-## 1. Frame Codec (GP11)
+## 1. Frame Codec (GP11 … GP16)
 
-A GP11 bitstream encodes a single image frame. The sequence container (GNV1, Section 2) wraps multiple GP11 frames for video.
+A frame bitstream encodes a single image frame. The sequence container (GNV1, Section 3) wraps
+multiple frames for video. The magic in the first four bytes names the generation; the encoder
+writes **GP16** today, and Section 6 lists what each generation added. Field layouts below are
+GP16 unless a row says otherwise.
 
 ### 1.1 Frame Header
 
@@ -86,12 +89,20 @@ Present only when `frame_type != 0`:
 | 2 | u16 | block_size | Motion estimation block size (8 for variable block) |
 | 4 | u32 | num_blocks | Number of motion blocks in the 2D grid |
 
-**GP12 delta-coded motion vectors (forward):**
+**Delta-coded motion vectors (forward):**
 
-Motion vectors are delta-coded using a median spatial predictor and encoded with zigzag varint, preceded by a skip bitmap:
+Motion vectors are delta-coded using a median spatial predictor, preceded by an all-zero flag and
+a skip bitmap:
 
-1. **Skip bitmap**: `ceil(num_blocks / 8)` bytes. Bit *i* = 1 means block *i* has MV = (0,0); no delta bytes follow.
-2. **Delta MVs**: For each non-skip block (in raster order), two zigzag-encoded unsigned varints (dx_delta, dy_delta).
+1. **All-zero flag** (GP16): 1 byte, 1 if every vector in the field is (0,0). When set, nothing
+   else follows — a static frame no longer pays 5 KB for an all-ones bitmap.
+2. **Skip bitmap**: `ceil(num_blocks / 8)` bytes. Bit *i* = 1 means block *i* has MV = (0,0); no delta bytes follow.
+3. **Delta MVs**: For each non-skip block (in raster order), two deltas (dx_delta, dy_delta).
+   - **GP12–GP15**: zigzag-encoded unsigned varints, byte-aligned.
+   - **GP16**: zigzag values written as **Exp-Golomb order 0** into one MSB-first bit stream,
+     flushed to a byte boundary at the end of the field. Value *v* is `ceil(log2(v+2))-1` zero
+     bits followed by *(v+1)* in binary, so a perfectly predicted vector costs one bit per
+     component instead of two bytes.
 
 The **median predictor** for block at grid position (bx, by):
 - `left` = MV at (bx-1, by), or (0,0) if at left edge
@@ -116,7 +127,7 @@ For B-frames (`frame_type == 2`), additionally:
 
 | Size | Type | Field | Description |
 |------|------|-------|-------------|
-| 4 | u32 | entropy_type | 0 = InterleavedRans, 1 = Bitplane, 2 = SubbandRans |
+| 4 | u32 | entropy_type | 0 = InterleavedRans, 1 = Bitplane, 2 = SubbandRans, 3 = Rice+ZRL, 4 = Huffman |
 | 4 | u32 | num_tiles | Total tile count (tiles_x * tiles_y * 3) |
 
 ### 1.8 Tile Index Table (GP11)
@@ -216,6 +227,66 @@ For p = (max_bitplane-1) down to 0:
     significance_map: 1024 bits (one per coefficient)
 sign_bits: N bits (one per nonzero coefficient)
 ```
+
+### 2.4 Rice+ZRL Tile (entropy_type = 3)
+
+Significance map + Golomb-Rice magnitudes + zero-run-length, across **256 independent streams**
+per tile. Coefficient *i* of the tile belongs to stream `i % 256` and is symbol `i / 256` of that
+stream, so all 256 streams decode in parallel with no shared state.
+
+| Size | Type | Field | Description |
+|------|------|-------|-------------|
+| 4 | u32 | num_coefficients | tile_size² |
+| 4 | u32 | tile_size | Tile dimension |
+| 4 | u32 | num_levels | Wavelet decomposition levels |
+| 4 | u32 | num_groups | `num_levels * 2` — subband grouping is the same as Section 2.2 |
+| 1 | u8 | flags | Bit 0 (0x01) = varint stream lengths, bit 1 (0x02) = all-skip, bit 2 (0x04) = checkerboard-k block present |
+
+**All-skip tiles** (`flags & 0x02`): the skip bitmap is the only remaining field; every
+coefficient is zero and all 256 stream lengths are 0. A whole tile costs 18–19 bytes.
+
+Otherwise, in order:
+
+| Size | Type | Field | Description |
+|------|------|-------|-------------|
+| num_groups | u8[] | k_values | Rice parameter *k* for magnitudes, per subband group (0–15) |
+| num_groups | u8[] | k_zrl_nz | Rice *k* for zero runs following a nonzero coefficient |
+| num_groups | u8[] | k_zrl_z | Rice *k* for zero runs following a zero run or start-of-stream |
+| 1 or 2 | u8 / u16 | skip_bitmap | Bit *g* = 1 means group *g* is entirely zero |
+| 128 * ck_stride | u8[] | k_stream_odd | Present only when `flags & 0x04`; see below |
+| variable | varint[256] | stream_lengths | Byte length of each stream (1–3 byte varints; legacy tiles without bit 0 use 256 × u16) |
+| sum(lengths) | u8[] | stream_data | The 256 streams, concatenated in order |
+
+**Skip bitmap width.** One byte while `num_groups <= 8`, two little-endian bytes above that. Five
+wavelet levels produce 10 groups, which no longer fit in a byte. `num_groups` sits in the tile
+header and is read first, so a decoder knows the width without a format flag and tiles written
+before 5 levels existed keep parsing byte-for-byte (BUG-6, 2026-09-06).
+
+**Coefficient syntax**, MSB-first within each stream:
+
+```
+significance bit
+  0 -> zero run: Rice(k_zrl_nz or k_zrl_z) + 1 zero coefficients.
+       k_zrl_nz applies when the previous coefficient had |v| >= 2, k_zrl_z otherwise.
+       Coefficients in skipped groups are consumed by the run without costing bits.
+  1 -> sign bit (1 = negative), then Rice(k) carrying |v| - 1.
+```
+
+*k* is not constant within a stream: it tracks an EMA of recent magnitudes, held in fixed point
+×16 with a window of ≈8 coefficients. Per group *g* the stream starts at
+`ema = max(1, 1 << k_values[g]) << 4`, uses `k = floor(log2(ema >> 4))` clamped to 15, and
+updates `ema += (rice_val << 1) - (ema >> 3)` after every nonzero. Encoder and decoder derive *k*
+from the same decoded history, so only the per-group seed is transmitted.
+
+**Checkerboard context** (`flags & 0x04`). Even streams are coded first; each odd stream warm-starts
+from its left neighbour's final EMA rather than from `k_values`. `k_stream_odd[odd_idx * ck_stride + g]`
+holds the blended seed for stream `2*odd_idx + 1`, group *g*, where
+`ck_stride = 8` for tiles with ≤8 groups and 12 above that. Tiles encoded on the GPU derive the
+same values in-shader from the decoded even streams and leave the block out entirely.
+
+### 2.5 Huffman Tile (entropy_type = 4)
+
+Canonical Huffman, per-subband tables. Not yet specified here — read `src/encoder/huffman.rs`.
 
 ---
 
@@ -325,6 +396,13 @@ To seek to time T: compute `gop_index = T / gop_size`, find the lowpass frame (f
 - Floating-point lifting steps
 - 4 vanishing moments, better energy compaction
 
+**Decomposition depth.** The transform runs per tile, so each level halves the tile; a 256 px tile
+allows at most 5 levels before the LL band gets too small for per-subband statistics to mean
+anything (`CodecConfig::max_wavelet_levels`). The quality preset uses **5 levels at q ≥ 25 and 4
+below** — below that the two deepest subbands quantise to all-zero and their k values and rANS
+frequency tables cost more than they save. `wavelet_levels` is in the frame header, so a decoder
+never has to infer it.
+
 ### 5.3 Quantization
 
 Uniform scalar quantization with dead zone:
@@ -347,7 +425,11 @@ Tiles are strictly independent: no cross-tile dependencies at any stage. Each ti
 
 | Magic | Readable | Notes |
 |-------|----------|-------|
-| GP12 | Yes | Current version: delta-coded varint MVs with skip bitmap |
+| GP16 | Yes | Current version: Exp-Golomb bit-coded MV deltas + all-zero flag byte |
+| GP15 | Yes | Rice `k_zrl` split into `k_zrl_nz` + `k_zrl_z` per subband |
+| GP14 | Yes | Per-block `fwd_ref_idx` / `bwd_ref_idx` for hierarchical pyramid B-frames |
+| GP13 | Yes | GP12 + chroma_format byte in the header |
+| GP12 | Yes | Delta-coded varint MVs with skip bitmap |
 | GP11 | Yes | CRC-32 and tile index, raw i16 MVs |
 | GP10 | Yes | Temporal coding, no CRC, no tile index |
 | GPC9 | Yes | Per-subband entropy, no temporal |
@@ -359,6 +441,12 @@ When reading older formats, missing features are defaulted:
 - No frame_type -> `frame_type = Intra`
 - No tile index -> no CRC validation available
 - No B-frame motion -> `backward_vectors = None, block_modes = None`
+- No chroma_format byte -> 4:4:4
+- No ref indices -> `fwd = 0, bwd = 1`
+
+Tile payloads carry no generation of their own; they are versioned by their own header fields.
+The Rice skip-bitmap width (Section 2.4) is the current example — `num_groups` decides it, so
+old and new tiles coexist in the same frame format.
 
 ---
 

@@ -522,6 +522,15 @@ pub fn luma_mad(frame_a: &[f32], frame_b: &[f32]) -> f32 {
 ///
 /// Intermediate values interpolate between anchor points (log-scale for qstep).
 impl CodecConfig {
+    /// Deepest wavelet decomposition this tile size can carry.
+    ///
+    /// The DWT runs per tile, so each level halves the tile. The floor of 8 samples keeps the
+    /// LL band large enough for the entropy coder's per-subband statistics to mean anything:
+    /// a 256 tile allows 5 levels, 128 allows 4, 64 allows 3.
+    pub fn max_wavelet_levels(&self) -> u32 {
+        (self.tile_size / 8).max(1).trailing_zeros().max(1)
+    }
+
     /// Fall back to Rice when the chroma format cannot use the configured entropy coder.
     ///
     /// The rANS and Huffman GPU paths batch all three planes assuming the luma tile layout, so
@@ -532,6 +541,21 @@ impl CodecConfig {
             && self.entropy_coder != EntropyCoder::Rice
         {
             self.entropy_coder = EntropyCoder::Rice;
+        }
+        self.normalize_for_entropy_group_limit();
+    }
+
+    /// Cap the decomposition depth at what the selected entropy backend can address.
+    ///
+    /// BUG-6 widened Rice and rANS to 12 subband groups (6 levels). The Huffman backend was left
+    /// at 8 — its codebook, decode-table and ZRL strides are all `MAX_GROUPS`-derived across three
+    /// shaders and the host, and it is not a default coder. With 5 levels it would write group 8
+    /// and 9 into the *next tile's* k_zrl slot: silent corruption, not a panic. Clamping to 4
+    /// levels keeps the configuration legal and lossy-correct rather than wrong.
+    fn normalize_for_entropy_group_limit(&mut self) {
+        const HUFFMAN_MAX_LEVELS: u32 = 4;
+        if self.entropy_coder == EntropyCoder::Huffman && self.wavelet_levels > HUFFMAN_MAX_LEVELS {
+            self.wavelet_levels = HUFFMAN_MAX_LEVELS;
         }
     }
 }
@@ -593,18 +617,31 @@ pub fn quality_preset(q: u32) -> CodecConfig {
     // Discrete settings: use lower-quality anchor until midpoint
     let disc = if t < 0.5 { lo } else { hi };
 
-    // 4 levels everywhere. The old rule dropped to 3 below q=50, which measured 5-17% worse
-    // bitrate at equal or better quality on every image and quality point tested (bbb,
+    // 5 levels up to q=80, 4 above. The old rule dropped to 3 below q=50, which measured 5-17%
+    // worse bitrate at equal or better quality on every image and quality point tested (bbb,
     // touchdown, kristensara at q=25/40/49) — see RESEARCH_LOG 2026-09-05. More levels means
     // more subbands, and Rice adapts its k per subband, so the real coder gains considerably
     // more from the extra level than an ideal-entropy model predicts (6% against 1.2%).
     //
-    // 4 is also the ceiling: rice_gpu's MAX_GROUPS is 8 and num_groups = levels * 2, and the
-    // per-tile skip bitmap is a single byte. 5 levels panics. See BUG-6.
+    // The 5th level was unreachable until BUG-6 widened both entropy backends past 8 subband
+    // groups. BD-rate on VMAF over q=25-70, measured on bbb, blue_sky, touchdown and
+    // kristensara: -1.8%, -6.9%, -4.3%, -1.9% (mean -3.7%). Per-point VMAF at equal q looks
+    // slightly *worse* because the 5th level also cuts 1-16% of the bits — the gain only shows
+    // up at equal quality, which is why this is gated on a BD-rate number and not a q sweep.
+    //
+    // Below q=25 it reverses: the deep subbands quantise to all-zero anyway, so their per-group
+    // k values and rANS frequency tables are pure overhead, and L5 costs *more* bits for less
+    // VMAF (+4.3% bbb, +2.4% kristensara, +2.2% touchdown over q=15-35). That is the only cutoff.
+    //
+    // There is no upper cutoff. An earlier q<=80 cap was measuring the group-8..11 aliasing bug in
+    // rice_encode.wgsl, not the transform; with that fixed, all 16 points of a q=85/90/95/99 sweep
+    // over the four images save 0.3-0.6% of the bits at PSNR and VMAF identical to two decimals,
+    // and q=100 stays bit-exact lossless while shrinking 0.2%. Never a loss above q=25.
+    let default_levels = if q >= 25 { 5 } else { 4 };
     let wavelet_levels = std::env::var("GNC_WAVELET_LEVELS")
         .ok()
         .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(4);
+        .unwrap_or(default_levels);
     let aq_enabled = q <= 80; // AQ helps in lossy range; variance computed on LL subband
     // Swept 2026-09-05 on bbb, touchdown and kristensara. Below q=30 a strength of 0.3 buys
     // +0.1 to +0.55 VMAF for under 1% more rate; 0.45 and 0.6 fall back again, so 0.3 is the
@@ -646,7 +683,7 @@ pub fn quality_preset(q: u32) -> CodecConfig {
         } else {
             1.0
         });
-    CodecConfig {
+    let mut cfg = CodecConfig {
         quantization_step: qstep,
         dead_zone,
         wavelet_levels,
@@ -697,7 +734,10 @@ pub fn quality_preset(q: u32) -> CodecConfig {
         // Set GNC_B_PYRAMID=1 to restore it — worth it on animation and at low bitrate.
         b_pyramid: std::env::var("GNC_B_PYRAMID").map(|v| v == "1").unwrap_or(false),
         ..Default::default()
-    }
+    };
+    // The DWT runs per tile, so the tile size, not the image size, sets the ceiling.
+    cfg.wavelet_levels = cfg.wavelet_levels.min(cfg.max_wavelet_levels());
+    cfg
 }
 
 /// Entropy-coded tile data — rANS, per-subband rANS, or bitplane coded.

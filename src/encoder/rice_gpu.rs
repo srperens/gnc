@@ -13,9 +13,13 @@ use wgpu;
 use super::rice::{max_stream_bytes_for_tile, RiceTile, RICE_STREAMS_PER_TILE};
 use crate::{FrameInfo, GpuContext};
 
-const MAX_GROUPS: usize = 8;
-// K_STRIDE per tile: [k_mag ×8][k_zrl_nz ×8][k_zrl_z ×8][skip_bitmap ×1] = 25
-const K_STRIDE: usize = MAX_GROUPS * 3 + 1; // 25
+/// Groups are two per wavelet level, so this caps decomposition depth at MAX_GROUPS/2.
+/// Raised from 8 (4 levels) to 12 (6 levels) for BUG-6; 5 levels is what the 256 px tile
+/// actually allows. The same value is hardcoded as MAX_GROUPS in rice_encode.wgsl and
+/// rice_decode.wgsl — change all three together.
+const MAX_GROUPS: usize = super::rice::RICE_MAX_GROUPS;
+// K_STRIDE per tile: [k_mag x12][k_zrl_nz x12][k_zrl_z x12][skip_bitmap x1] = 37
+const K_STRIDE: usize = MAX_GROUPS * 3 + 1; // 37
 
 // Field order must stay in sync with shaders/rice_encode.wgsl Params struct (bytemuck::Pod).
 // Fields in order: num_tiles, coefficients_per_tile, plane_width, tile_size, tiles_x,
@@ -500,7 +504,7 @@ impl GpuRiceEncoder {
                 let k_zrl_z_values: Vec<u8> = (0..num_groups)
                     .map(|g| k_data[tile_idx * K_STRIDE + MAX_GROUPS * 2 + g] as u8)
                     .collect();
-                let skip_bitmap = k_data[tile_idx * K_STRIDE + K_STRIDE - 1] as u8;
+                let skip_bitmap = k_data[tile_idx * K_STRIDE + K_STRIDE - 1] as u16;
 
                 let stream_lengths: Vec<u32> = (0..RICE_STREAMS_PER_TILE)
                     .map(|s| lengths_data[tile_idx * RICE_STREAMS_PER_TILE + s])
@@ -707,7 +711,7 @@ impl GpuRiceEncoder {
             let k_zrl_z_values: Vec<u8> = (0..num_groups)
                 .map(|g| k_data[tile_idx * K_STRIDE + MAX_GROUPS * 2 + g] as u8)
                 .collect();
-            let skip_bitmap = k_data[tile_idx * K_STRIDE + K_STRIDE - 1] as u8;
+            let skip_bitmap = k_data[tile_idx * K_STRIDE + K_STRIDE - 1] as u16;
             let stream_lengths: Vec<u32> = (0..RICE_STREAMS_PER_TILE)
                 .map(|s| lengths_data[tile_idx * RICE_STREAMS_PER_TILE + s])
                 .collect();
@@ -941,7 +945,7 @@ impl GpuRiceEncoder {
                 let k_zrl_z_values: Vec<u8> = (0..num_groups)
                     .map(|g| k_data[tile_idx * K_STRIDE + MAX_GROUPS * 2 + g] as u8)
                     .collect();
-                let skip_bitmap = k_data[tile_idx * K_STRIDE + K_STRIDE - 1] as u8;
+                let skip_bitmap = k_data[tile_idx * K_STRIDE + K_STRIDE - 1] as u16;
 
                 let stream_lengths: Vec<u32> = (0..RICE_STREAMS_PER_TILE)
                     .map(|s| lengths_data[tile_idx * RICE_STREAMS_PER_TILE + s])
@@ -1232,7 +1236,7 @@ impl GpuRiceEncoder {
                     let k_zrl_z_values: Vec<u8> = (0..num_groups)
                         .map(|g| k_data[tile_idx * K_STRIDE + MAX_GROUPS * 2 + g] as u8)
                         .collect();
-                    let skip_bitmap = k_data[tile_idx * K_STRIDE + K_STRIDE - 1] as u8;
+                    let skip_bitmap = k_data[tile_idx * K_STRIDE + K_STRIDE - 1] as u16;
 
                     let stream_lengths: Vec<u32> = (0..RICE_STREAMS_PER_TILE)
                         .map(|s| lengths_data[tile_idx * RICE_STREAMS_PER_TILE + s])

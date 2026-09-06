@@ -11,7 +11,8 @@ const RANS_PRECISION: u32 = 12u;
 const STREAMS_PER_TILE: u32 = 32u;
 const MAX_ALPHABET: u32 = 4096u;
 const MAX_STREAM_BYTES: u32 = 4096u;
-const ENCODE_TILE_INFO_STRIDE: u32 = 36u;
+const MAX_GROUPS: u32 = 12u;
+const ENCODE_TILE_INFO_STRIDE: u32 = 1u + MAX_GROUPS * 4u;
 
 struct Params {
     num_tiles: u32,
@@ -110,9 +111,9 @@ fn main(
         // --- Per-subband encode (no ZRL) ---
         let num_groups = tile_info[base];
 
-        var group_min: array<i32, 8>;
-        var group_asize: array<u32, 8>;
-        var group_cf_start: array<u32, 8>;
+        var group_min: array<i32, 12>;
+        var group_asize: array<u32, 12>;
+        var group_cf_start: array<u32, 12>;
         var total_cf_entries = 0u;
 
         for (var g = 0u; g < num_groups; g++) {

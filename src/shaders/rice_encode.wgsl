@@ -20,9 +20,9 @@
 // selects the appropriate k in Phase 2 via a per-stream boolean state.
 
 const STREAMS_PER_TILE: u32 = 256u;
-const MAX_GROUPS: u32 = 8u;
-// K_STRIDE per tile: [k_mag ×8][k_zrl_nz ×8][k_zrl_z ×8][skip_bitmap ×1] = 25
-const K_STRIDE: u32 = 25u;
+const MAX_GROUPS: u32 = 12u;
+// K_STRIDE per tile: [k_mag][k_zrl_nz][k_zrl_z] × MAX_GROUPS, then skip_bitmap
+const K_STRIDE: u32 = MAX_GROUPS * 3u + 1u;
 
 // Field order must stay in sync with rice_gpu.rs RiceParams (bytemuck::Pod).
 struct Params {
@@ -47,30 +47,30 @@ struct Params {
 @group(0) @binding(5) var<storage, read_write> overflow_flags: array<atomic<u32>>;
 
 // Shared memory for Phase 1: k computation
-var<workgroup> group_sum: array<atomic<u32>, 8>;
-var<workgroup> group_count: array<atomic<u32>, 8>;
-var<workgroup> shared_k: array<u32, 8>;
+var<workgroup> group_sum: array<atomic<u32>, 12>;
+var<workgroup> group_count: array<atomic<u32>, 12>;
+var<workgroup> shared_k: array<u32, 12>;
 // Per-subband ZRL stats — two contexts: after-nonzero (nz) and after-zero/start (z)
-var<workgroup> zrl_sum_nz: array<atomic<u32>, 8>;
-var<workgroup> zrl_count_nz: array<atomic<u32>, 8>;
-var<workgroup> zrl_sum_z: array<atomic<u32>, 8>;
-var<workgroup> zrl_count_z: array<atomic<u32>, 8>;
-var<workgroup> shared_k_zrl_nz: array<u32, 8>;
-var<workgroup> shared_k_zrl_z: array<u32, 8>;
+var<workgroup> zrl_sum_nz: array<atomic<u32>, 12>;
+var<workgroup> zrl_count_nz: array<atomic<u32>, 12>;
+var<workgroup> zrl_sum_z: array<atomic<u32>, 12>;
+var<workgroup> zrl_count_z: array<atomic<u32>, 12>;
+var<workgroup> shared_k_zrl_nz: array<u32, 12>;
+var<workgroup> shared_k_zrl_z: array<u32, 12>;
 // Subband skip bitmap: bit g = 1 means all coefficients in group g are zero
 var<workgroup> shared_skip_bitmap: u32;
 // #checkerboard-ctx: even threads expose their final EMA mean to adjacent odd threads.
 // shared_ctx_even[even_idx][group] = EMA mean (p_ema[g] >> 4) after encoding.
 // Size: 128 × 8 × 4 = 4096 bytes. Total workgroup mem stays well below 32 KB.
-var<workgroup> shared_ctx_even: array<array<u32, 8>, 128>;
+var<workgroup> shared_ctx_even: array<array<u32, 12>, 128>;
 
 // Per-thread local accumulators for Phase 1 (reduces atomic contention 32×)
-var<private> p_local_sum: array<u32, 8>;
-var<private> p_local_count: array<u32, 8>;
-var<private> p_local_zrl_sum_nz: array<u32, 8>;
-var<private> p_local_zrl_count_nz: array<u32, 8>;
-var<private> p_local_zrl_sum_z: array<u32, 8>;
-var<private> p_local_zrl_count_z: array<u32, 8>;
+var<private> p_local_sum: array<u32, 12>;
+var<private> p_local_count: array<u32, 12>;
+var<private> p_local_zrl_sum_nz: array<u32, 12>;
+var<private> p_local_zrl_count_nz: array<u32, 12>;
+var<private> p_local_zrl_sum_z: array<u32, 12>;
+var<private> p_local_zrl_count_z: array<u32, 12>;
 
 // Per-thread bit-packing state
 var<private> p_bit_buffer: u32;
@@ -82,7 +82,7 @@ var<private> p_stream_word_base: u32;
 var<private> p_total_bytes: u32;
 
 // Per-thread EMA state for adaptive k (fixed-point ×16, window ≈ 8 coefficients)
-var<private> p_ema: array<u32, 8>;
+var<private> p_ema: array<u32, 12>;
 
 // Directional subband grouping — matches CPU compute_subband_group exactly.
 fn compute_subband_group(lx: u32, ly: u32) -> u32 {
@@ -332,7 +332,7 @@ fn main(
     }
 
     // Write k values to output.
-    // Layout: [k_mag ×8][k_zrl_nz ×8][k_zrl_z ×8][skip_bitmap] = K_STRIDE=25
+    // Layout: [k_mag ×MAX_GROUPS][k_zrl_nz ×MAX_GROUPS][k_zrl_z ×MAX_GROUPS][skip_bitmap]
     if (thread_id < num_groups) {
         k_output[tile_id * K_STRIDE + thread_id] = shared_k[thread_id];
         k_output[tile_id * K_STRIDE + MAX_GROUPS + thread_id] = shared_k_zrl_nz[thread_id];

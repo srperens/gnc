@@ -23,7 +23,8 @@ const MAX_ZERO_RUN: u32 = 256u;
 // Single-table: [0]=min_val, [1]=alphabet_size, [2]=cumfreq_offset, [3]=zrun_base
 // Per-subband:  [0]=num_groups, [1+g*4]=min_val, [2+g*4]=alphabet_size,
 //               [3+g*4]=cumfreq_offset, [4+g*4]=zrun_base
-const ENCODE_TILE_INFO_STRIDE: u32 = 36u;
+const MAX_GROUPS: u32 = 12u;
+const ENCODE_TILE_INFO_STRIDE: u32 = 1u + MAX_GROUPS * 4u;
 
 // Max ZRL-encoded symbols per stream. With ZRL, the symbol count can only
 // decrease (runs of zeros become single symbols), so this is a safe upper bound.
@@ -185,10 +186,10 @@ fn main(
         let num_groups = tile_info[base];
 
         // Load per-group metadata into local arrays
-        var group_min: array<i32, 8>;
-        var group_asize: array<u32, 8>;
-        var group_cf_start: array<u32, 8>;
-        var group_zrun: array<i32, 8>;
+        var group_min: array<i32, 12>;
+        var group_asize: array<u32, 12>;
+        var group_cf_start: array<u32, 12>;
+        var group_zrun: array<i32, 12>;
         var total_cf_entries = 0u;
         var has_any_zrl = false;
 

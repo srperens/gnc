@@ -18,9 +18,9 @@
 // then decode with that warm-start. No extra bitstream data — context from decoded data.
 
 const STREAMS_PER_TILE: u32 = 256u;
-const MAX_GROUPS: u32 = 8u;
-// K_STRIDE per tile: [k_mag ×8][k_zrl_nz ×8][k_zrl_z ×8][skip_bitmap ×1] = 25
-const K_STRIDE: u32 = 25u;
+const MAX_GROUPS: u32 = 12u;
+// K_STRIDE per tile: [k_mag][k_zrl_nz][k_zrl_z] × MAX_GROUPS, then skip_bitmap
+const K_STRIDE: u32 = MAX_GROUPS * 3u + 1u;
 
 struct Params {
     num_tiles: u32,
@@ -40,14 +40,14 @@ struct Params {
 @group(0) @binding(4) var<storage, read_write> output: array<f32>;
 
 // Shared k values for this tile
-var<workgroup> shared_k: array<u32, 8>;
-var<workgroup> shared_k_zrl_nz: array<u32, 8>; // k_zrl after a large nonzero (|coeff|>=2)
-var<workgroup> shared_k_zrl_z: array<u32, 8>;  // k_zrl after a small nonzero (|coeff|==1) or start
+var<workgroup> shared_k: array<u32, 12>;
+var<workgroup> shared_k_zrl_nz: array<u32, 12>; // k_zrl after a large nonzero (|coeff|>=2)
+var<workgroup> shared_k_zrl_z: array<u32, 12>;  // k_zrl after a small nonzero (|coeff|==1) or start
 // Subband skip bitmap: bit g = 1 means all coefficients in group g are zero
 var<workgroup> shared_skip_bitmap: u32;
 // Checkerboard context: even threads write final EMA means here after decoding.
 // Odd threads read their left neighbor's EMA to derive adjusted k warm-start.
-var<workgroup> shared_ctx_even: array<array<u32, 8>, 128>;
+var<workgroup> shared_ctx_even: array<array<u32, 12>, 128>;
 
 // Per-thread bit-reader state
 var<private> p_current_byte: u32;
@@ -55,7 +55,7 @@ var<private> p_bit_pos: u32;     // 0..8, position within current byte
 var<private> p_byte_offset: u32; // absolute byte offset in stream_data
 
 // Per-thread EMA state for adaptive k (fixed-point ×16, window ≈ 8 coefficients)
-var<private> p_ema: array<u32, 8>;
+var<private> p_ema: array<u32, 12>;
 
 // Directional subband grouping — must match encoder exactly.
 fn compute_subband_group(lx: u32, ly: u32) -> u32 {
@@ -230,7 +230,7 @@ fn main(
     let num_groups = max(1u, params.num_levels * 2u);
 
     // Cooperatively load k values into shared memory.
-    // Layout: [k_mag ×8][k_zrl_nz ×8][k_zrl_z ×8][skip_bitmap @K_STRIDE-1] = 25 entries
+    // Layout: [k_mag][k_zrl_nz][k_zrl_z] × MAX_GROUPS, skip_bitmap @K_STRIDE-1
     if (thread_id < num_groups) {
         shared_k[thread_id]        = k_values[tile_id * K_STRIDE + thread_id];
         shared_k_zrl_nz[thread_id] = k_values[tile_id * K_STRIDE + MAX_GROUPS + thread_id];

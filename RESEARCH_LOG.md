@@ -5481,6 +5481,98 @@ Two agents were editing this working tree concurrently; the `take_bytes` bounds-
 
 ---
 
+## 2026-09-06 — BUG-6, second half: the fourth 8-group cap, and the range settled by BD-rate
+
+Written by the other of the two concurrent sessions. The half above found three of the four places
+that capped the codec at 8 subband groups. There was a fourth, and it was the one that actually
+made 5 levels unusable.
+
+### The fourth cap
+
+`quantize_histogram_fused.wgsl` — the fused quantize+histogram kernel, a *fourth* producer of the
+rANS histogram buffer, separate from `rans_histogram.wgsl`. It still held `MAX_GROUPS = 8u` and
+`HIST_TILE_STRIDE = 32793u` while the host and the other three shaders had moved to 12/49189. The
+symptom did not look like a group-width bug at all:
+
+- q ≥ 25 (Rice): worked, because Rice does not use this buffer.
+- q ≤ 20 (rANS): `wgpu` validation error — `copy of 0..2951340 would overrun a source buffer of
+  size 1967580`. The ratio is exactly 12/8.
+- After fixing a *stale duplicate* of the same constant in `buffer_cache.rs`
+  (`const HIST_TILE_STRIDE: u64 = 32793`), the validation error became a panic in
+  `pack_tiles`: `range start index 4295094272 out of range` — a `write_ptr` that had wrapped
+  negative.
+
+The diagnostic that resolved it: print `num_groups` per tile as read back from `tile_info`. Tile 0
+read 8 groups correctly; **tiles 1–14 read `num_groups = 0`**. A writer and a reader disagreeing
+about a stride always looks like this — element 0 is fine because its base offset is 0. Worth
+remembering as a signature.
+
+All four caps, and the rANS decode tile-info offsets (hardcoded 33/34/66), now derive from a single
+constant per backend. The three strides that were duplicated as literals in five files are one
+expression each.
+
+### Corruption-safety fell out of it
+
+Widening the skip bitmap shifted the tile byte layout, and `conformance_crc_detects_corruption`
+started failing — not on the CRC, but with `range end index 10311 out of range for slice of
+length 389` inside `deserialize_tile_rice`. The test flips a byte and expects the CRC to reject the
+tile; instead the parser panicked before the CRC ran. That is a real defect in a codec that
+advertises per-tile CRC error resilience: **a tile cannot be checked until it parses, so parsing
+must not panic.** Every read in `deserialize_tile_rice` now goes through `take_bytes`, which
+zero-fills past the end, the varint reader stops at the buffer end, and `num_groups` is clamped to
+`RICE_MAX_GROUPS` so a corrupt header cannot become a huge allocation. The CRC then does its job.
+The layout change only exposed this; it was reachable before on any truncated file.
+
+### The range, by BD-rate rather than by q sweep
+
+Per-point VMAF at equal q reads slightly *worse* with 5 levels — up to −0.71 on kristensara at
+q=25. That is not a regression: 5 levels also removes 1–16% of the bits, so the two points are not
+at the same quality. Comparing them point-for-point is the same error MEAS-4 made three times.
+BD-rate on VMAF, q=25–70, four images:
+
+| image | q15–35 | q25–70 | q30–70 |
+|---|---|---|---|
+| bbb_1080p | +4.25% | −1.84% | −1.55% |
+| blue_sky_1080p | −9.53% | **−6.88%** | −4.30% |
+| touchdown_1080p | +2.18% | **−4.31%** | −3.30% |
+| kristensara_720p | +2.44% | −1.89% | −1.74% |
+| mean | −0.17% | **−3.73%** | −2.72% |
+
+The sign flip below q≈25 is physical: at those rates the two deepest subbands quantise to all-zero
+on most tiles, so their per-group k values — and, on the rANS path, their per-group frequency
+tables — are pure overhead. At q=15–20 five levels costs *more* bits (bbb 1.06→1.10, touchdown
+0.64→0.66, kristensara 0.60→0.62) **and** about 1 VMAF point. So: 5 levels at q ≥ 25.
+
+The upper cutoff is gone. Swept q=85/90/95/99 on all four images with the accumulators correct —
+16 of 16 points save 0.3–0.6% of the bits at PSNR and VMAF identical to two decimals, and q=100
+remains bit-exact lossless (inf PSNR) while shrinking 0.2%. The q ≤ 80 cap was measuring the
+aliasing bug, exactly as the previous entry suspected.
+
+### Video
+
+| sequence | q | I-only bpp | I+P bpp | Δ I+P | VMAF |
+|---|---|---|---|---|---|
+| aerial (16f) | 30 | 2.20 → 2.04 | 0.50 → 0.47 | −6.0% | — |
+| old_town (16f) | 30 | 1.87 → 1.68 | 0.82 → 0.80 | −3.2% | 84.87 → 84.67 |
+| old_town (16f) | 50 | 4.32 → 4.29 | 2.42 → 2.42 | −0.3% | — |
+
+Same shape as stills, and −0.20 VMAF for −3.2% rate is well inside the −0.5 block threshold.
+Inter-frame PSNR consistency also improved slightly (old_town max drop 2.56 → 2.24 dB).
+
+### Would we ship it?
+
+Yes. −3.7% BD-rate mean with no loss anywhere above q=25, and the same code path now has a canary
+(`groups=N deep_skipped=M` under `GNC_DIAGNOSTICS=1`) that distinguishes 4 from 5 levels on real
+data. The bitstream change is one byte per tile, keyed on `num_groups` which was already in the
+tile header, so no generation bump and old streams parse byte-for-byte.
+
+The honest caveat: three of the four caps produced *silent* wrongness rather than a crash, and one
+of those (the phase-1 accumulator aliasing) could not have been caught by any test, because the
+bitstream carries `k` and the file still decoded exactly — it was only bigger. A widening like this
+needs a grep for the constant across every file, not a test run.
+
+---
+
 ## 2026-09-06 — TUNE-1 closed: GOP length is worth ~nothing, and the "inter saves 17-27%" figure is an equal-qstep artefact
 
 ### Why TUNE-1 was re-opened

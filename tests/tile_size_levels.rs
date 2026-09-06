@@ -60,7 +60,10 @@ fn setting_levels_directly_is_still_honoured_as_a_request() {
 fn the_shipped_presets_are_unchanged() {
     // 5 levels at q >= 25, 4 below, on the default 256 px tile (BUG-6). This fix must not move
     // them — every measurement in BASELINE.md was taken here.
-    for (q, expect) in [(10u32, 4u32), (20, 4), (25, 5), (75, 5), (100, 5)] {
+    //
+    // q=100 is excluded: LOSSLESS-1 replaced the wavelet there with MED prediction, so it has no
+    // levels to keep. That is asserted separately below rather than dropped.
+    for (q, expect) in [(10u32, 4u32), (20, 4), (25, 5), (75, 5), (99, 5)] {
         let cfg = quality_preset(q);
         assert_eq!(cfg.tile_size, 256);
         assert_eq!(
@@ -68,4 +71,16 @@ fn the_shipped_presets_are_unchanged() {
             "q={q} should keep {expect} levels"
         );
     }
+}
+
+#[test]
+fn lossless_uses_med_prediction_not_the_wavelet() {
+    // LOSSLESS-1: q=100 codes MED residuals directly. No wavelet means no subbands, so levels
+    // must be 0 — the entropy coder groups by subband and would otherwise split flat data.
+    let cfg = quality_preset(100);
+    assert_eq!(cfg.transform_type, gnc::TransformType::MedPredict);
+    assert_eq!(cfg.wavelet_levels, 0);
+    assert!(cfg.is_lossless(), "the MED path must still count as lossless");
+    assert!(!cfg.adaptive_quantization);
+    assert!(!cfg.cfl_enabled);
 }

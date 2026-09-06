@@ -296,6 +296,11 @@ pub enum TransformType {
     /// Block DCT-8×8: single dispatch per plane, fuseable with quantize.
     /// Replaces 24+ wavelet dispatches with 1 per plane.
     BlockDCT8,
+    /// MED / LOCO-I per-pixel prediction *instead of* a transform (LOSSLESS-1).
+    /// Lossless path only: the residual is entropy-coded directly, which is how FFV1 and
+    /// x264 `-qp 0` beat GNC at q=100. Forward is fully parallel; the decoder marches a
+    /// wavefront (4.9x one pass, still 201 fps on 1080p 4:4:4).
+    MedPredict,
 }
 
 /// Temporal transform mode (in-memory only for now; not serialized).
@@ -447,11 +452,18 @@ pub struct CodecConfig {
 impl CodecConfig {
     /// Returns true when the configuration implies bit-exact lossless coding.
     /// This activates integer-exact color conversion and wavelet lifting.
+    ///
+    /// MED prediction qualifies on its own terms: it is integer-exact by construction (the
+    /// residual is a difference of integers) and needs the same reversible YCoCg-R in front of
+    /// it. Leaving it out silently disabled that colour path and cost bit-exactness.
     pub fn is_lossless(&self) -> bool {
         self.quantization_step <= 1.0
             && self.dead_zone == 0.0
-            && self.wavelet_type == WaveletType::LeGall53
-            && self.transform_type == TransformType::Wavelet
+            && match self.transform_type {
+                TransformType::Wavelet => self.wavelet_type == WaveletType::LeGall53,
+                TransformType::MedPredict => true,
+                TransformType::BlockDCT8 => false,
+            }
     }
 }
 
@@ -797,6 +809,22 @@ pub fn quality_preset(q: u32) -> CodecConfig {
     cfg.requested_wavelet_levels = cfg.wavelet_levels;
     let ts = cfg.tile_size;
     cfg.set_tile_size(ts);
+
+    // LOSSLESS-1: MED prediction instead of the wavelet, at q=100 only. Measured in-codec on
+    // four images, all bit-exact: bbb −5.8%, touchdown −14.7%, kristensara −17.3%,
+    // blue_sky −21.8% (mean −14.9%). That is about 79% of what the offline gate predicted, the
+    // shortfall being Rice's significance bit on a residual that is dense rather than sparse.
+    // It also halves the gap to FFV1, from +48% to +26%. `GNC_MED=0` restores the wavelet.
+    if q == 100 && std::env::var("GNC_MED").map(|v| v != "0").unwrap_or(true) {
+        cfg.transform_type = TransformType::MedPredict;
+        // No subbands: one entropy group, flat weights, and nothing for AQ or CfL to key on.
+        cfg.wavelet_levels = 0;
+        cfg.requested_wavelet_levels = 0;
+        cfg.subband_weights = SubbandWeights::uniform(0);
+        cfg.adaptive_quantization = false;
+        cfg.cfl_enabled = false;
+        eprintln!("GNC: MED prediction path active (LOSSLESS-1) — wavelet bypassed");
+    }
     cfg
 }
 

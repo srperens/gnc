@@ -297,10 +297,11 @@ fn serialize_frame_header(frame: &crate::CompressedFrame, out: &mut Vec<u8>) {
         crate::WaveletType::CDF97 => 1,
     };
     out.push(wavelet_byte);
-    // Transform type: 0 = Wavelet, 1 = BlockDCT8
+    // Transform type: 0 = Wavelet, 1 = BlockDCT8, 2 = MED prediction (lossless path)
     let transform_byte: u8 = match frame.config.transform_type {
         crate::TransformType::Wavelet => 0,
         crate::TransformType::BlockDCT8 => 1,
+        crate::TransformType::MedPredict => 2,
     };
     out.push(transform_byte);
     // Per-subband entropy: 0 = off, 1 = on
@@ -941,6 +942,7 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
     let transform_type = match data[33] {
         0 => crate::TransformType::Wavelet,
         1 => crate::TransformType::BlockDCT8,
+        2 => crate::TransformType::MedPredict,
         t => panic!("Unknown transform type: {t}"),
     };
 

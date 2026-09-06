@@ -315,16 +315,38 @@ impl DecoderPipeline {
                         config.wavelet_levels,
                     );
 
-                    self.transform.inverse(
+                    if config.transform_type == crate::TransformType::MedPredict {
+                        self.med.inverse(
+                            ctx,
+                            &mut cmd,
+                            &bufs.scratch_c,
+                            &bufs.scratch_a,
+                            p_info.padded_width(),
+                            p_info.padded_height(),
+                            config.tile_size,
+                        );
+                    } else {
+                        self.transform.inverse(
+                            ctx,
+                            &mut cmd,
+                            &bufs.scratch_c,
+                            &bufs.scratch_b,
+                            &bufs.scratch_a,
+                            p_info,
+                            config.wavelet_levels,
+                            config.wavelet_type,
+                            p, // plane_idx: avoids param slot collision in non-444 mode
+                        );
+                    }
+                } else if config.transform_type == crate::TransformType::MedPredict {
+                    self.med.inverse(
                         ctx,
                         &mut cmd,
-                        &bufs.scratch_c,
                         &bufs.scratch_b,
                         &bufs.scratch_a,
-                        p_info,
-                        config.wavelet_levels,
-                        config.wavelet_type,
-                        p, // plane_idx: avoids param slot collision in non-444 mode
+                        p_info.padded_width(),
+                        p_info.padded_height(),
+                        config.tile_size,
                     );
                 } else {
                     self.transform.inverse(

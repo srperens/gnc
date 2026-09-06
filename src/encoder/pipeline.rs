@@ -35,6 +35,7 @@ use crate::{
 pub struct EncoderPipeline {
     pub(super) color: ColorConverter,
     pub(super) transform: WaveletTransform,
+    pub(super) med: super::med::MedTransform,
     pub(super) quantize: Quantizer,
     pub(super) variance: VarianceAnalyzer,
     pub(super) motion: super::motion::MotionEstimator,
@@ -709,6 +710,7 @@ impl EncoderPipeline {
         Self {
             color: ColorConverter::new(ctx),
             transform: WaveletTransform::new(ctx),
+            med: super::med::MedTransform::new(ctx),
             quantize: super::quantize::Quantizer::new(ctx),
             variance: VarianceAnalyzer::new(ctx),
             motion: super::motion::MotionEstimator::new(ctx),
@@ -1896,18 +1898,30 @@ impl EncoderPipeline {
             }
 
             // --- Y plane: wavelet transform ---
-            self.transform.forward(
-                ctx,
-                &mut cmd,
-                &bufs.plane_a,
-                &bufs.plane_b,
-                &bufs.plane_c,
-                &info,
-                config.wavelet_levels,
-                config.wavelet_type,
-                0, // plane_idx: Y
-                config.overlap_pixels, // overlap
-            );
+            if config.transform_type == TransformType::MedPredict {
+                self.med.forward(
+                    ctx,
+                    &mut cmd,
+                    &bufs.plane_a,
+                    &bufs.plane_c,
+                    padded_w,
+                    padded_h,
+                    config.tile_size,
+                );
+            } else {
+                self.transform.forward(
+                    ctx,
+                    &mut cmd,
+                    &bufs.plane_a,
+                    &bufs.plane_b,
+                    &bufs.plane_c,
+                    &info,
+                    config.wavelet_levels,
+                    config.wavelet_type,
+                    0, // plane_idx: Y
+                    config.overlap_pixels, // overlap
+                );
+            }
             // After wavelet: plane_c has Y wavelet coefficients
 
             // --- Adaptive quantization: variance analysis on Y's LL subband ---
@@ -2051,18 +2065,30 @@ impl EncoderPipeline {
             // active_chroma_info / active_chroma_w/h/px are defined at outer scope (hoisted above)
             let chroma_plane_bytes = (active_chroma_px * std::mem::size_of::<f32>()) as u64;
 
-            self.transform.forward(
-                ctx,
-                &mut cmd,
-                co_input,
-                &bufs.plane_b,
-                &bufs.plane_c,
-                active_chroma_info,
-                config.wavelet_levels,
-                config.wavelet_type,
-                1, // plane_idx: Co
-                config.overlap_pixels, // overlap
-            );
+            if config.transform_type == TransformType::MedPredict {
+                self.med.forward(
+                    ctx,
+                    &mut cmd,
+                    co_input,
+                    &bufs.plane_c,
+                    active_chroma_w,
+                    active_chroma_h,
+                    config.tile_size,
+                );
+            } else {
+                self.transform.forward(
+                    ctx,
+                    &mut cmd,
+                    co_input,
+                    &bufs.plane_b,
+                    &bufs.plane_c,
+                    active_chroma_info,
+                    config.wavelet_levels,
+                    config.wavelet_type,
+                    1, // plane_idx: Co
+                    config.overlap_pixels, // overlap
+                );
+            }
 
             if use_cfl {
                 self.cfl_alpha.dispatch(
@@ -2154,18 +2180,30 @@ impl EncoderPipeline {
             } else {
                 &bufs.cg_plane_ds
             };
-            self.transform.forward(
-                ctx,
-                &mut cmd,
-                cg_input,
-                &bufs.plane_b,
-                &bufs.plane_c,
-                active_chroma_info,
-                config.wavelet_levels,
-                config.wavelet_type,
-                2, // plane_idx: Cg
-                config.overlap_pixels, // overlap
-            );
+            if config.transform_type == TransformType::MedPredict {
+                self.med.forward(
+                    ctx,
+                    &mut cmd,
+                    cg_input,
+                    &bufs.plane_c,
+                    active_chroma_w,
+                    active_chroma_h,
+                    config.tile_size,
+                );
+            } else {
+                self.transform.forward(
+                    ctx,
+                    &mut cmd,
+                    cg_input,
+                    &bufs.plane_b,
+                    &bufs.plane_c,
+                    active_chroma_info,
+                    config.wavelet_levels,
+                    config.wavelet_type,
+                    2, // plane_idx: Cg
+                    config.overlap_pixels, // overlap
+                );
+            }
 
             if use_cfl {
                 self.cfl_alpha.dispatch(
@@ -2285,7 +2323,7 @@ impl EncoderPipeline {
 
         // Entropy levels: wavelet uses config.wavelet_levels, block DCT uses 0 (flat)
         let entropy_levels = match config.transform_type {
-            TransformType::BlockDCT8 => 0,
+            TransformType::BlockDCT8 | TransformType::MedPredict => 0,
             TransformType::Wavelet => config.wavelet_levels,
         };
 

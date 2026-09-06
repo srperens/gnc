@@ -36,6 +36,7 @@ pub struct TextureHandle {
 pub struct DecoderPipeline {
     pub(super) color: ColorConverter,
     pub(super) transform: WaveletTransform,
+    pub(super) med: crate::encoder::med::MedTransform,
     pub(super) quantize: Quantizer,
     pub(super) rans_decoder: GpuRansDecoder,
     pub(super) bitplane_decoder: GpuBitplaneDecoder,
@@ -286,6 +287,7 @@ impl DecoderPipeline {
         Self {
             color: ColorConverter::new(ctx),
             transform: WaveletTransform::new(ctx),
+            med: crate::encoder::med::MedTransform::new(ctx),
             quantize: Quantizer::new(ctx),
             rans_decoder: GpuRansDecoder::new(ctx),
             bitplane_decoder: GpuBitplaneDecoder::new(ctx),

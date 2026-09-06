@@ -466,9 +466,19 @@ modelled zeroth-order entropy while Rice spends a significance bit per coefficie
 on sparse wavelet coefficients, close to a wasted bit per pixel on a dense MED residual. **The
 remaining +26% against FFV1 is therefore an entropy-coding gap, not a prediction one.**
 
-**Follow-up (open, P1): MED residuals through the abac coder.** FFV1's recipe is this predictor
-plus context modelling and adaptive range coding. Both halves now exist in the repo and have never
-been put together. Expect a large part of the remaining 26%.
+**Follow-up: MEASURED 2026-09-06, −14.3% more.** MED residuals through abac, real coefficients via
+`GNC_ABAC_COMPARE=1` (the harness was gated on the wavelet path and could not see this one; gate
+widened): bbb −14.9%, blue_sky −15.6%, kristensara −15.5%, touchdown −11.2%. **Together with
+LOSSLESS-1 that is −27% against this morning's wavelet lossless, and it puts GNC +7.7% behind
+FFV1 — from +48.4%.** Rate only; abac's GPU decode throughput gate is now the only thing in the
+way, and it is the gate the abac track is already blocked on. Handed to that track rather than
+implemented twice.
+
+**Closed by measurement — do not re-test: a dense Rice mode for MED residuals.** Zigzag every
+coefficient, no significance bit, no zero runs. Modelled at −6.6/−7.5/−7.4% on three images and
+**+2.4% on blue_sky**, whose smooth sky makes run-length coding pay. Content-dependent ~5% for
+changes to both Rice shaders, against −14.3% from a coder that already exists. The model was
+validated against the shipped encoder to within 3% before being used to reject the idea.
 
 **Follow-up (open, P3): decode throughput on the real path.** The 201 fps wavefront figure is the
 isolated gate; the shipped decoder has never been timed, and the machine was too loaded to do it

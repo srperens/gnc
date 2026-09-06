@@ -8435,3 +8435,80 @@ about 1.45, dead zone to zero), not a bug, but it means **above roughly q=90 on 
 10-bit the calculation differs, which is the case for keeping the ladder — but a rate-control rule
 that knows the output bit depth would save those bits when it is 8.
 
+
+---
+
+## 2026-09-06 — Where the rest of the lossless gap is: measured, not guessed
+
+Follow-up to LOSSLESS-1, which landed −14.9% and left GNC +25.8% behind FFV1. Two candidate
+explanations for the remainder, both testable without building anything.
+
+### First: is GNC's own coder simply the wrong shape for a prediction residual?
+
+Rice spends a significance bit per coefficient and run-length codes the zeros. That is nearly free
+on quantised wavelet coefficients, which are mostly zero, and looks wasteful on a MED residual,
+which is dense. A dense alternative — zigzag to unsigned, Rice every coefficient, no significance
+bit, no runs — was priced offline (`scratchpad/dense.py`, YCoCg-R and MED replicated from the
+shaders).
+
+**The model reproduces the shipped encoder to within 3%** on all four images (bbb 3 328 976 B
+modelled against 3 235 737 B shipped, touchdown 2 720 571 against 2 724 578), which is what makes
+the comparison worth anything.
+
+| image | significance (shipped shape) | dense | order-0 entropy |
+|---|---|---|---|
+| bbb | 3 328 976 B | −6.6% | −12.1% |
+| blue_sky | 2 377 253 B | **+2.4%** | −14.6% |
+| touchdown | 2 720 571 B | −7.5% | −12.1% |
+| kristensara | 990 200 B | −7.4% | −14.2% |
+
+**Dense coding is worth about 5% and loses on one image** — blue_sky's smooth sky produces enough
+zero runs that run-length coding pays there. It would cost changes to both Rice shaders for a
+content-dependent 5%. **Not worth building**, and the order-0 column says why: 12–15% is available
+to *any* better coder, so the significance bit is not the main cost.
+
+### Second: the coder that already exists
+
+The abac comparison harness (`GNC_ABAC_COMPARE=1`) codes every tile twice on real coefficients —
+but it was gated on `TransformType::Wavelet`, so the lossless path it most needs to judge was
+invisible to it. With `num_levels = 0` its `subbands()` already yields one region covering the
+tile, which is exactly the right cut for a prediction residual, so the gate was the only thing in
+the way.
+
+**MED residuals through abac, on top of the shipped MED path:**
+
+| image | shipped Rice | abac | delta |
+|---|---|---|---|
+| bbb | 3 234 706 B | 2 751 981 B | **−14.9%** |
+| blue_sky | 2 277 033 B | 1 921 862 B | **−15.6%** |
+| touchdown | 2 723 547 B | 2 418 708 B | −11.2% |
+| kristensara | 983 747 B | 830 913 B | **−15.5%** |
+| mean | | | **−14.3%** |
+
+That is above the order-0 figure, as it should be: abac models contexts, order-0 does not.
+
+### What the two changes are worth together
+
+Against FFV1 `-level 3` on the same images:
+
+| image | wavelet | MED (shipped) | MED + abac |
+|---|---|---|---|
+| bbb | +37.7% | +29.7% | **+10.3%** |
+| blue_sky | +65.4% | +29.4% | **+9.2%** |
+| touchdown | +40.9% | +20.1% | **+6.7%** |
+| kristensara | +49.7% | +23.8% | **+4.5%** |
+| mean | **+48.4%** | **+25.8%** | **+7.7%** |
+
+**Within 8% of FFV1**, from +48% this morning, and both halves are already in the repo. FFV1 is
+the reference lossless video codec; being within single digits of it while decoding on any GPU is
+a different claim from where this path started the day.
+
+### Caveats, and who should take it
+
+Rate only. abac is serial per symbol — the harness's own CPU reference does 46 Mcoeff/s decode —
+and the GPU decoder exists but has not cleared its throughput gate. **That gate is now the only
+thing between this measurement and a shipped 27% lossless improvement**, and it is the same gate
+the abac track is already blocked on.
+
+Not integrating it here: the abac worktree owns that code, and this is the number it needs, not a
+second implementation of it. Recorded and handed over.

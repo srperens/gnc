@@ -995,8 +995,42 @@ code-blocks at 2 bytes against Rice's 16-byte header plus per-group k plus 256 l
 is parallel at frame scale, and a production binary decoder is several times faster than this
 textbook one. **Plausible-to-proceed, not a green light on fps.**
 
-**Next, in order:**
-1. **GPU decode shader and honest fps against Rice on an idle machine.** This is the gate.
+**Part 4 — GPU decode written, bit-exact, and throughput is the blocker (2026-09-06).**
+`src/shaders/abac_decode.wgsl` + `src/encoder/abac_gpu.rs` + `tests/abac_gpu.rs`. One thread per
+code-block. Verified bit-exact against the CPU coder across seven geometries including ragged
+subband-edge blocks and degenerate planes — which caught two real bugs that produced *plausible
+wrong images* rather than errors (WGSL `firstLeadingBit` vs Rust `leading_zeros` differ by one; a
+`vec3` tail makes a uniform struct 32 bytes not 16).
+
+| code-block | blocks per 1080p luma plane | decode |
+|---|---|---|
+| 64 px | 640 | ~50 Mcoeff/s |
+| 32 px | 2560 | ~85-105 Mcoeff/s |
+
+A 4:4:4 frame is 7.86 Mcoeff → **75-155 ms, 6-13 fps**. Rice is far faster. **On throughput this
+does not pass.**
+
+Two optimisations that did *not* help: moving the context scratch from device memory into
+workgroup memory, and sorting blocks by size so a SIMD group holds equal-sized work. That both
+failed points at the real cause — **one serial coder per thread wastes most of a SIMD group
+because the divergence is data-dependent**, every lane's renormalisation loop running a different
+number of iterations per symbol. In hindsight this is exactly why Rice uses 256 branch-free
+streams per tile.
+
+**Timing caveat:** five sessions were on this machine and the numbers moved 20% between runs. The
+ordering is robust, the absolute values are not.
+
+**Three things would change the answer**, in order of leverage: (1) re-time on an idle machine —
+cheapest and unambiguous; (2) a table-driven binary coder with fixed per-symbol cost instead of a
+renormalisation loop, which is a coder-core rewrite; (3) accept it as an encode-side or CPU-decode
+option, which is a product decision for the owner, not an engineering one.
+
+**The rate result stands regardless: −19% to −25% at identical quality**, verified against the
+shipped Rice coder with per-block roundtrip and coverage assertions.
+
+**Superseded next steps:**
+1. ~~GPU decode shader and honest fps against Rice on an idle machine.~~ Written; fps needs an
+   idle machine to be trusted.
 2. Bitstream integration — a GP18 generation with `EntropyCoder::Abac`, code-block length fields,
    block size in the tile header. Nothing is integrated yet; `abac` is standalone and
    `abac_compare` is a diagnostic.

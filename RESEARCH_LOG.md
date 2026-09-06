@@ -7708,3 +7708,99 @@ the identical `thread_id + s * STREAMS_PER_TILE` mapping and the identical bug. 
 default coder and is capped at 4 levels, so it was left alone — filed as BUG-14. The rANS fused
 histogram shader has the same shape over 32 streams, but rANS *gains* at 512, so its ordering is
 not costing it the same way; not filed as a bug.
+
+---
+
+## 2026-09-06 — abac GPU decode: the port is correct, the throughput is the blocker
+
+`src/shaders/abac_decode.wgsl` plus `src/encoder/abac_gpu.rs`. One thread per code-block, because
+the coder is serial within a block — every symbol's interval depends on the previous one, every
+context on already-decoded neighbours — so the parallelism has to come from having many blocks.
+
+### The port is bit-exact, and that took proving
+
+`tests/abac_gpu.rs` encodes on the CPU and decodes on the GPU across seven geometries, including
+ragged blocks at subband edges and degenerate all-zero / all-saturated planes, and asserts the
+planes match exactly.
+
+This mattered more than a usual equivalence test. An adaptive arithmetic decoder that diverges
+from its encoder by one bit **does not fail** — it continues, decoding every later symbol from a
+corrupted interval *and* a corrupted context, and produces a plausible image. Two real bugs found
+this way:
+
+- WGSL has `firstLeadingBit` where Rust has `leading_zeros`, and they differ by one. The context
+  bucket was off by one for every coefficient. It decoded without error.
+- `u32 + vec3<u32>` as a uniform struct is 32 bytes in WGSL, not 16, because a `vec3` forces
+  16-byte alignment. That one at least failed loudly.
+
+Two portability constraints shaped the design and are worth stating for anyone porting a coder
+to WGSL: **there are no 64-bit integers**, so the interval was narrowed to 16 bits to keep
+`range * probability` under 2^28 (measured cost: zero — byte-identical output); and **pointer
+parameters are only allowed in the `function` address space**, so the probability model is passed
+as an index rather than a `ptr<workgroup, u32>`.
+
+### Throughput, and two optimisations that did not work
+
+On a padded 1080p luma plane (2048×1280, 2.6 Mcoeff):
+
+| code-block | blocks | decode |
+|---|---|---|
+| 64 px | 640 | ~50 Mcoeff/s |
+| 32 px | 2560 | ~85-105 Mcoeff/s |
+
+A full 4:4:4 frame is 7.86 Mcoeff, so **75-155 ms per frame, or 6-13 fps.** Rice decodes far
+faster than that. On throughput this does not pass.
+
+Two things I expected to help and which did not:
+
+1. **Moving the context scratch out of device memory.** The first version kept the 18 context
+   probabilities in a dynamically indexed function array (which spills) and read neighbour
+   magnitudes back out of the output buffer (uncached) — about five device-memory accesses per
+   coefficient. Moving both into workgroup memory changed nothing measurable.
+2. **Sorting blocks by size** so a Metal SIMD group holds equal-sized blocks. A group runs at its
+   slowest lane, so mixing an 8×8 block with a 64×64 one should waste most of the group.
+   Also nothing.
+
+That both failed points at the remaining explanation: **one serial coder per thread wastes most of
+each SIMD group no matter what, because the divergence is data-dependent.** Every lane's
+renormalisation loop runs a different number of iterations for every symbol. Sorting removes the
+geometric part of the divergence; the data-dependent part is the coder itself and cannot be
+removed without changing the coder.
+
+This is, in hindsight, exactly why GNC's Rice coder is shaped the way it is: 256 branch-free
+streams per tile exist to keep SIMD lanes busy. The measurement that said the 256-way split costs
+under 1% of rate was measuring the *rate* cost of that choice. This is the other side of the same
+coin.
+
+### Timing caveat, and it is not small
+
+Five sessions were running on this machine during these measurements and the numbers moved 20%
+between runs (104 → 84 Mcoeff/s on the same input). LOOP.md's own rule is that timing needs an
+idle machine. **Treat every throughput figure above as provisional** — the ordering (32px faster
+than 64px) is robust, the absolute values are not.
+
+### Where this leaves the EBCOT track
+
+The rate result stands and is worth restating: **−19% to −25% at identical quality**, verified on
+real coefficients against the shipped Rice coder, with per-block roundtrip and coverage assertions.
+That is real and it is large.
+
+What is not established is that GNC can spend it. For a contribution codec judged on concurrent
+streams per GPU and latency, 6-13 fps is not a trade against 19% of the bitrate — it is a
+different product.
+
+Three things would change the answer, in order of how much they would change it:
+
+1. **Re-time on an idle machine.** The cheapest step and it is unambiguous. If the real number is
+   at the top of the range and Rice is nearer 40 fps than 100, the gap is 3× rather than 10×.
+2. **A coder with less data-dependent divergence.** A table-driven binary coder (VP8-style, with
+   renormalisation as a lookup rather than a loop) has a fixed cost per symbol. That is a rewrite
+   of the coder core, not a tuning change, and the 16-bit interval work already done is a
+   prerequisite either way.
+3. **Accept it as an encode-side or CPU-decode option.** The rate win is real for anything that is
+   not decoding on a GPU in real time — archival, or a CPU decoder. That is a product decision,
+   not an engineering one, and it belongs to the project owner.
+
+Nothing is integrated into the bitstream. `abac` and `abac_gpu` are standalone, `abac_compare` is
+a diagnostic, and there is no format change.
+

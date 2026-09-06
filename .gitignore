@@ -12,6 +12,9 @@ test_material/*.exr
 test_material/*.dpx
 test_material/*.raw
 test_material/frames/
+# ...and the same path as a symlink: worktrees link it in rather than copying ~GB of frames,
+# and a trailing slash matches only a real directory.
+test_material/frames
 
 # Web demo media (too large for git)
 examples/web/*.gnv

@@ -55,3 +55,40 @@ pub fn read_buffer_f32(ctx: &GpuContext, buffer: &wgpu::Buffer, count: usize) ->
     staging.unmap();
     result
 }
+
+/// Read `count` `u32`s back from a GPU buffer.
+///
+/// Same shape as `read_buffer_f32`, separate rather than reinterpreting through `f32`: the entropy
+/// paths carry integer coefficients, and a bit pattern that happens to be a signalling NaN can be
+/// altered by an `f32` round trip on some targets.
+pub fn read_buffer_u32(ctx: &GpuContext, buffer: &wgpu::Buffer, count: usize) -> Vec<u32> {
+    let size = (count * std::mem::size_of::<u32>()) as u64;
+    let staging = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("staging_read_u32"),
+        size,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    let mut cmd = ctx
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("copy_to_staging_u32"),
+        });
+    cmd.copy_buffer_to_buffer(buffer, 0, &staging, 0, size);
+    ctx.queue.submit(Some(cmd.finish()));
+
+    let slice = staging.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        tx.send(result).unwrap();
+    });
+    ctx.device.poll(wgpu::Maintain::Wait);
+    rx.recv().unwrap().unwrap();
+
+    let data = slice.get_mapped_range();
+    let result: Vec<u32> = bytemuck::cast_slice(&data).to_vec();
+    drop(data);
+    staging.unmap();
+    result
+}

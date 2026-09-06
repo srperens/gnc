@@ -403,7 +403,15 @@ The quality preset used 3 levels below q=50. Measured 5-17% worse bitrate at equ
 quality on bbb, touchdown and kristensara at q=25/40/49, at no speed cost. Default is now 4
 everywhere.
 
-### MEAS-7 — A chroma-aware quality metric (todo, P2)
+### MEAS-7 — A chroma-aware quality metric (**DONE 2026-09-06**)
+`scripts/chroma_metric.py`: CIEDE2000 on decoded RGB, validated against all 16 critical Sharma
+reference pairs to 1e-3 (`--selftest`). Report it next to VMAF — VMAF for luma structure, mean and
+p95 dE00 for colour accuracy. dE00 ≈ 1 is the nominal just-noticeable difference.
+
+Unblocks the chroma parameters that could not be tuned before: `chroma_weight`, the CfL
+enablement range, chroma-format trade-offs.
+
+### Original statement of the problem
 VMAF scores luma only, so every chroma decision in this repo validated on VMAF is unvalidated:
 `chroma_weight`, the CfL enablement range (q=50–85), chroma-format trade-offs. A 2026-09-05
 `chroma_weight` sweep looked like a free 15% rate saving on VMAF and collapsed to +0.3 dB, with

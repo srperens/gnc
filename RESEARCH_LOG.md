@@ -4759,3 +4759,58 @@ BeHardware's 2011 finding — GPU encoders performing identically across price t
 were never compute-bound — is exactly the silent-feature failure CLAUDE.md's quality rules exist
 to catch. **If GNC's encode time does not move between the M1 and a discrete GPU, the pipeline is
 not running where we think it is.** Cheap to add, and it should be permanent.
+
+---
+
+## 2026-09-06 — Where a day's work actually landed, measured against its own starting point
+
+Fair challenge from the project owner: does any of this add up? Answered by building the
+session's starting commit (33c9ad8) in a worktree and running both binaries over the same
+quality ladder.
+
+**Intra**, BD-rate on VMAF, three images, q = 5…70:
+
+| image | BD-rate (negative = better now) |
+|---|---|
+| bbb | **−17.8%** |
+| touchdown | **−19.4%** |
+| kristensara | **−13.7%** |
+| mean | **−17.0%** |
+
+**Video**, 1080p 4:2:0 ki=9, 17 frames, real container bytes, VMAF against a shared reference:
+
+| q | before | after |
+|---|---|---|
+| 15 | 0.3102 bpp / 58.19 | 0.2575 / 63.79 |
+| 25 | 0.4229 / 68.23 | 0.3524 / 76.03 |
+| 40 | 0.5966 / 76.58 | 0.5088 / 85.68 |
+| 55 | 0.8630 / 81.65 | 0.7568 / 91.68 |
+| 70 | 1.3054 / 84.82 | 1.1649 / **95.32** |
+
+**BD-rate −40.2%.** At q=70 the codec now reaches VMAF 95.32 at 1.16 bpp where it managed 84.82
+at 1.31 bpp — lower rate and 10.5 VMAF points better at once. For reference, x264 at CRF 20 sits
+at 95.07 for 0.29 bpp, so the remaining gap on video is about 4x rather than the 5-7x MEAS-1
+measured yesterday.
+
+What produced it: three encoder/decoder disagreements (BUG-1, BUG-2, BUG-3 — the last of which
+made 1280x720 in 4:2:0 unusable at 23.6 dB), the container decoding through the wrong path,
+byte-aligned motion vectors (GP16), wavelet depth, entropy-coder selection by quality, and the
+adaptive-quantisation gradient. Roughly twenty other ideas were measured and rejected, which is
+what makes the running commentary read as though nothing is moving.
+
+## 2026-09-06 — A chroma-aware metric (MEAS-7)
+
+`scripts/chroma_metric.py` implements CIEDE2000 on decoded RGB, validated against all 16 critical
+pairs of the Sharma et al. reference data to within 1e-3 (`--selftest`). Those pairs are the ones
+that exercise the RT rotation term, the blue region, the achromatic case and hue wrap-around, so
+matching them is a real check rather than a smoke test.
+
+CIEDE2000 rather than a weighted YUV-PSNR because the weights in the latter are exactly what is
+under dispute; dE00 is calibrated against human colour judgements and a value of about 1 is the
+nominal just-noticeable difference. Reported next to VMAF it gives two numbers answering
+different questions — VMAF for luma structure, mean and 95th-percentile dE00 for colour accuracy —
+which is what a chroma parameter needs in order to be tuned at all.
+
+Two false starts on the way, both mine: the first validation run reported 2/8 mismatches, which
+turned out to be two mis-transcribed expected values rather than implementation errors, and the
+implementation was correct throughout.

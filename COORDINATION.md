@@ -1,50 +1,59 @@
 # Coordination between concurrent Claude sessions
 
-**Up to five Claude sessions work on this repository at the same time.** Sharing one checkout
-between them does not work: it has already cost a retracted BD-rate figure, a measurement premise
-invalidated mid-experiment, and one session nearly deleting another's in-flight code. This file is
-how we avoid that. **Read it before starting, update it when you claim or release something.**
+**Five Claude sessions work on this repository. Do not work in `/Users/per/src/gnc` directly.
+Your first action in a session is to move into your own git worktree.**
 
-## Rule 0 — start by moving into your own worktree (2026-09-06)
+Sharing one working directory does not work, and we have the scars: a published BD-rate figure had
+to be retracted because the tree changed mid-experiment, a measurement premise was invalidated
+under a running sweep, one session nearly deleted another's in-flight code, and on 2026-09-06 two
+sessions' edits to `abac.rs` and `gpu_util.rs` overwrote each other and were lost outright.
 
-**Do this before reading anything else, before your first build, before your first measurement.**
-The shared checkout `/Users/per/src/gnc` is for reading, for the coordination and log files, and
-for merging. It is not where you work.
+## Rule 0 — start here, every session
 
 ```bash
-git worktree add <your-scratchpad>/wt <base-sha>     # pin the base explicitly
-ln -sfn /Users/per/src/gnc/test_material/frames <your-scratchpad>/wt/test_material/frames
+# Pick a short name for the area you are working on, not for the session.
+git -C /Users/per/src/gnc worktree add -b <area> /Users/per/src/gnc-<area> main
+cd /Users/per/src/gnc-<area>
+ln -s /Users/per/src/gnc/test_material test_material   # gitignored, ~GB, do not copy it
 ```
 
-- **Pin the worktree to a commit**, not to `main`, so nobody else's merge moves the ground under a
-  running sweep (rule 1 below is a consequence of this one).
-- **Use a separate `target/`** — the worktree gets its own by default. It costs one full build
-  (~2 min) and buys you a build that no other session invalidates mid-run.
-- **Symlink the test material** rather than copying it; it is gitignored and large.
-- Do codec work there. Commit there. Only touch the shared checkout to update
-  `COORDINATION.md` / `RESEARCH_LOG.md` / `BACKLOG.md` / `BASELINE.md` and to merge your branch.
-- When you are done, `git worktree remove` it. Three worktrees from 2026-03 sat abandoned for six
-  months with uncommitted diffs in them.
+Then work only in that directory, and add your row to the table below. Each worktree has its own
+`target/`, so builds no longer block on each other's cargo lock — that alone is worth the disk.
 
-Editing `src/` in the shared checkout while four other sessions do the same is how the failures in
-the next section happened. The sharpest example, 17:30 on 2026-09-06: the abac session's 16-bit
-entropy coder was reverted to HEAD's 32-bit version while its GPU decode shader — a direct port of
-the 16-bit one — was left in place, along with a `mod.rs` declaration and a `gpu_util.rs` helper
-that vanished from under the module needing them. Nothing warned anyone. The symptom was a
-bit-exactness test failing at coefficient 8, which reads exactly like a shader bug and is not one.
-**A half-reverted entropy coder is the worst case of this failure mode**, because an arithmetic
-decoder that disagrees with its encoder does not error — it produces plausible garbage. A shared working tree makes every session's numbers mutually invalid —
-not just risky, invalid, because no number can be attributed to a known state of the code.
+When your work is ready:
 
-## The three rules that have actually bitten us
+```bash
+cargo test --release && cargo clippy --release          # the usual gates, in your worktree
+git -C /Users/per/src/gnc-<area> push -u origin <area>  # or merge to main if you own it
+```
 
-**1. A number is only valid against a commit.** The working tree can change under you without any
-signal. On 2026-09-06 a BD-rate figure moved from −3.7% to −2.3% purely because the coefficient
-path changed between the sweep and the commit, and it had to be corrected in BACKLOG, RESEARCH_LOG
-and a decision record after publication. Before quoting a benchmark number: either commit first
-and measure the committed state, or measure in a worktree pinned to a hash
-(`git worktree add <dir> <sha>`). If a number looks 0.1 dB off from one taken earlier in the same
-session, suspect the tree before suspecting the metric.
+To merge into main, rebase onto it first so the history stays linear and conflicts surface in your
+worktree rather than in someone else's:
+
+```bash
+git fetch origin && git rebase origin/main
+cargo test --release                                   # rebase can break things silently
+```
+
+Clean up when the area is done: `git -C /Users/per/src/gnc worktree remove /Users/per/src/gnc-<area>`.
+
+**`/Users/per/src/gnc` itself stays on `main` and is for merging and reading, not for editing.**
+
+## Worktrees currently out
+
+Add your row when you create one, remove it when you are done.
+
+| worktree | branch | area |
+|---|---|---|
+| `/Users/per/src/gnc-abac` | `abac` | adaptive binary code-block entropy coder (EBCOT follow-up), CPU + GPU |
+
+## The four rules that have actually bitten us
+
+**1. A number is only valid against a commit.** The tree can change under you with no signal. A
+BD-rate figure moved from −3.7% to −2.3% purely because the coefficient path changed between the
+sweep and the commit, and it had to be corrected in three documents after publication. Working in
+your own worktree fixes most of this; still, measure a committed state, or a worktree pinned to a
+hash (`git worktree add <dir> <sha>`).
 
 **2. Measure the range the project cares about, not the range that is convenient.** GNC is a
 *contribution* codec (GOALS §1). TUNE-5 was measured at q=15-50, shipped, and then found to cost
@@ -53,21 +62,11 @@ tested this codec.
 
 **3. Above about q=80, VMAF is saturated and PSNR must lead.** On old_town at q≥85 VMAF reads
 identical for two settings whose worst-frame PSNR differs by 4.8 dB. CLAUDE.md's "VMAF primary"
-rule is right in the lossy range and wrong near lossless. State which metric led and why.
+rule is right in the lossy range and wrong near lossless. State which metric led, and why.
 
-## Claimed right now
-
-Update this section when you start and when you finish. "Claimed" means *do not edit these files*
-without saying so here first.
-
-| files / area | session | state |
-|---|---|---|
-| `src/encoder/abac*.rs`, `src/shaders/abac_decode.wgsl`, `tests/abac_gpu.rs` | EBCOT/abac track | **active** — GPU decode shader landed and bit-exact; measuring the 16-bit interval's rate cost |
-| `src/encoder/sequence.rs` P-frame quantiser block | EBCOT/abac track | **released** — TUNE-6 landed, see below |
-| `src/encoder/intra.rs`, `src/shaders/intra_predict.wgsl` | lossless/intra track | **active** — fixing BUG-13 (encoder/decoder predictor mismatch) |
-| `src/encoder/rice.rs`, `rice_gpu.rs`, `src/shaders/rice_*.wgsl` | tile-geometry track | **active** — BUG-11 (Rice stream mapping is tile-width-blind) + BUG-12 |
-| repo hygiene + `CLAUDE.md` / `AGENTS.md` / `run-team.sh` / `.opencode/` | tile-geometry track | **active** — retiring the dead opencode agent team, de-duplicating the rule docs |
-| everything else | unclaimed | — |
+**4. A point measurement at fixed q cannot judge a rate/quality trade**, and it always flatters
+the option that spends more bits. Use BD-rate, or compare at matched rate. At least four separate
+wrong conclusions have come from this one error.
 
 ## Landed today, and what each one invalidates
 

@@ -148,6 +148,25 @@ both halves.
 `GNC_B_PYRAMID=1`. Justified on two independent measurements — rate on camera content, and 160 ms
 of reordering latency (MEAS-6) that applies regardless of content.
 
+### BUG-9 — rANS panics below qstep 1.0 instead of rejecting the configuration (todo, P2)
+`gnc encode --qstep 1.0 --rans` panics with `range start index 4297717596 out of range for slice
+of length 5242880`. rANS's GPU alphabet cannot represent the symbol range below about qstep 1.5;
+that is a legitimate limit, but a coder that cannot encode a configuration should say so, not
+panic. Unreachable from `quality_preset` (rANS is only selected at q<=20, where qstep is 32+),
+reachable from an explicit `--qstep` with `--rans`. Measured 2026-09-06: rANS OK at 2.0 and 1.5,
+panics at 1.0; Rice is fine to at least 0.5.
+
+### QUAL-1 — Re-run MEAS-1 at the contribution operating point (todo, P1)
+The quality ladder above q=92 was dead until 2026-09-06 — q=92, 96 and 99 produced the same
+picture, capped at qstep 2.0 by an rANS constraint that no longer applied. **Every
+contribution-quality comparison in this repo predating that fix is invalid at the top of the
+range**, because GNC was pinned while the competitor was not. The distribution-bitrate figures
+(+306% to +617%) are unaffected.
+
+Re-run MEAS-1 with `--q 92,96,99` against `--crf 4,8,12` now that GNC reaches 60.7 dB where it
+previously stopped at 50.5. Note VMAF saturates around 99.8 and is useless at this end; use PSNR
+and CIEDE2000.
+
 ### MEAS-5 — Concurrent streams per GPU vs NVENC (partly answered 2026-09-05, P0)
 
 **The thesis was never one claim. It is two, and they are not equally strong.**

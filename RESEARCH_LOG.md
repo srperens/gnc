@@ -6362,3 +6362,90 @@ JPEG 2000 is an *intra* number, so it is the wrong measurement for this question
 One caveat worth stating: this measures MSE-optimal allocation. Part of what PCRD does for
 JPEG 2000 in practice is hit an exact rate target by truncation, which is a rate-control property
 rather than an RD gain, and GNC does that another way.
+
+---
+
+## 2026-09-06 — The contribution operating point was unreachable: a dead quality range above q=92
+
+### Where this came from
+
+Re-measuring the GNC vs H.264 gap (MEAS-1 with today's code, pinned build in an isolated
+worktree) reproduced it — it has *not* shrunk despite everything fixed this week:
+
+| sequence | BD-rate on VMAF | BD-rate on PSNR-Y |
+|---|---|---|
+| touchdown | +305.9% | +278.2% |
+| old_town | +616.7% | +433.9% |
+| bbb | +369.6% | +420.2% |
+
+Both metrics agree this time, so the gap is not a VMAF artefact. **My hypothesis that the number
+was stale and had shrunk is refuted.**
+
+But that comparison integrates over VMAF 83–97 at 0.02–4.3 bpp — distribution bitrates, which
+[docs/POSITIONING.md](docs/POSITIONING.md) says is the wrong operating point. Re-running at the
+contribution end exposed something else entirely.
+
+### GNC saturated, and it was not the codec
+
+| | bpp | VMAF | PSNR-Y |
+|---|---|---|---|
+| gnc q=85 | 4.32 | 99.53 | 44.68 |
+| gnc q=92 | 7.74 | 99.80 | 47.69 |
+| gnc q=96 | 7.80 | 99.80 | **47.74** |
+| gnc q=99 | 7.85 | 99.80 | **47.78** |
+| x264 crf 4 | 3.90 | 99.83 | **53.12** |
+
+**q=92, 96 and 99 produced the same picture.** Three quality settings, one output, and a ceiling
+7 dB below what x264 reaches at *half* the bitrate. (The VMAF BD-rate here reads +9743%, which is
+meaningless — the integration window is 0.3 VMAF points wide and GNC's curve is vertical inside
+it. PSNR is the usable metric at this end: +295% and +221%.)
+
+### Root cause: an rANS constraint applied to the coder that no longer runs there
+
+The anchor table capped qstep at ~2.0 for the whole lossy range, carrying the comment *"CDF 9/7 at
+qstep >= 2.0 keeps rANS alphabet within GPU limits"*. But TUNE-3 made **rANS the coder only at
+q<=20**, where qstep is 32 or coarser. The floor has not applied to the coder that actually runs
+at the top of the range for some time.
+
+Measured directly, 1080p touchdown, single frame, Rice:
+
+| qstep | 2.0 | 1.5 | 1.0 | 0.75 | 0.5 |
+|---|---|---|---|---|---|
+| PSNR | 50.69 | 52.69 | 56.29 | 60.67 | 72.23 |
+
+Decode verified correct at qstep 0.75: **max absolute error 1, 86.6% of pixels bit-exact.**
+
+And the floor *is* real for rANS, but set too conservatively: rANS encodes fine at qstep 1.5 and
+**panics** at 1.0 — `range start index 4297717596 out of range for slice of length 5242880`.
+Unreachable from the preset table, reachable via an explicit `--qstep` with `--rans`. Filed as
+**BUG-9**; a coder that cannot represent a configuration should reject it, not panic.
+
+### The fix
+
+Anchors above q=92 now descend: q=96 → qstep 1.30, q=99 → qstep 0.75. **q<=92 is left exactly as
+it was**, so no existing quality point moves and only the previously dead range changes.
+
+A first attempt moved q=92 to 1.5 as well; `regression_checkerboard_q90` caught it immediately
+(bpp 8.43 against a 7.66 maximum) because that shifts every point between 85 and 92. The
+regression test did its job — the narrower change is the right one.
+
+Ladder before and after, 1080p touchdown, single frame:
+
+| q | 85 | 90 | 92 | 96 | 99 |
+|---|---|---|---|---|---|
+| before | 48.29 | 49.88 | 50.51 | **50.5** | **50.5** |
+| after | 48.29 | 49.88 | 50.51 | **53.76** | **60.66** |
+
+**GNC now reaches and passes x264's 53.12 dB.** The codec could always do this; the quality ladder
+never let anyone ask for it.
+
+### What this means
+
+The "+295% at contribution quality" figure measured earlier today was measuring an artificial cap,
+not the codec. **Every contribution-quality comparison in this repo predating this fix is invalid
+at the top of the range** — GNC was pinned at qstep 2.0 while the competitor was not.
+
+MEAS-1 needs re-running at the contribution end now that the range exists. The distribution-bitrate
+gap (+306% to +617%) is unaffected and stands.
+
+165+11+8+1 tests pass; clippy clean on native and wasm.

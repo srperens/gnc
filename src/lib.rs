@@ -596,8 +596,10 @@ pub fn quality_preset(q: u32) -> CodecConfig {
         //
         // rANS still panics below qstep 1.0 ("range start index out of range"); filed as BUG-9.
         // It is unreachable from this table but reachable via an explicit --qstep with --rans.
-        Anchor { q: 92,  qstep: 1.5,  dead_zone: 0.05, cfl: false, per_subband: true },
-        Anchor { q: 96,  qstep: 1.0,  dead_zone: 0.0,  cfl: false, per_subband: true },
+        // q<=92 is deliberately left exactly as it was, so no existing quality point moves;
+        // only the previously dead range above it changes.
+        Anchor { q: 92,  qstep: 2.05, dead_zone: 0.05, cfl: false, per_subband: true },
+        Anchor { q: 96,  qstep: 1.30, dead_zone: 0.0,  cfl: false, per_subband: true },
         Anchor { q: 99,  qstep: 0.75, dead_zone: 0.0,  cfl: false, per_subband: true },
         // Lossless: LeGall 5/3 with integer-exact lifting
         Anchor { q: 100, qstep: 1.0,  dead_zone: 0.0,  cfl: false, per_subband: true },

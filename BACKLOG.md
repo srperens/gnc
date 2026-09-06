@@ -782,6 +782,16 @@ chosen has to be justified, not just picked.
 `GNC_CHROMA_WEIGHT` is in place so the sweep can be repeated the moment a metric exists.
 
 ### Closed by measurement 2026-09-06 — do not re-test
+- **Non-adaptive reference filtering** (the in-loop filter GNC lacks): a mild 3x3 low-pass on the
+  reference buys **0.9-1.8% on prediction SATD** — consistent in sign on blue_sky, bbb17 and
+  old_town, reversing if over-filtered. An edge-selective deblocking proxy is −0.16% to +0.41%,
+  i.e. nothing. Too small for a normative bitstream filter the decoder must reproduce bit-exactly.
+  **Bounds a non-adaptive filter only** — an edge-adaptive filter with per-block strength is not
+  bounded by this, and the trade improves if reference quality ever matters more (longer GOP
+  default, hierarchical references). `scripts/meas_ref_filter.py`.
+  Do *not* try to bound this by predicting from the previous frame's clean source: that comparison
+  is confounded (a decoded reference is the source *low-pass filtered by the quantiser*, not the
+  source plus noise) and read −31.6% on bbb17 against +12.3% on old_town.
 - **Quantiser cascade down the GOP** (P-frame step growing with distance from the keyframe): at
   exactly matched rate on old_town ki=17 a flat 1.25 step beats a +0.03/frame cascade by +0.95
   VMAF mean and **+5.04 VMAF min**; the mean-vs-min spread goes 2.29 → 6.40 points. Each P in a

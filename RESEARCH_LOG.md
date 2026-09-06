@@ -6070,3 +6070,46 @@ settling. A flat step reaches a steady state; a cascade never does.
 Worth recording as a pair with TUNE-5: the same argument that justifies separating I from P does
 *not* extend to separating P from P, and the reason is that the recursion has no fixed point.
 Lever removed rather than left in place — a rejected lever is dead code.
+
+### Reference filtering (the in-loop filter GNC does not have) — measured at 1-2%, not pursued
+
+With the coding model, the motion search and the entropy ceiling all ruled out on clean data, the
+most conspicuous remaining "mature encoder" item is an in-loop filter. GNC has none. Every
+mature codec does, and the argument is not cosmetic: a P-frame predicts from a *decoded* frame, so
+the reference carries quantisation noise, and that noise is paid for in every frame that follows.
+
+Measured offline before implementing anything (`scripts/meas_ref_filter.py`): block-match the
+source against the decoded reference, and against 3x3 low-pass versions of the same reference.
+Scored on **SATD, not SAD** — SAD rewards a blurred predictor, which would make any low-pass
+filter look good for free.
+
+| centre weight | blue_sky | bbb17 | old_town |
+|---|---|---|---|
+| 12 (mildest) | **−0.89%** | **−1.78%** | **−1.44%** |
+| 8 | −0.77% | −0.98% | −1.49% |
+| 4 (strongest) | +0.37% | +3.34% | −0.60% |
+
+Consistent in sign across all three: a mild reference filter buys **0.9-1.8% on prediction SATD**,
+and over-filtering reverses it. An edge-selective variant (filtering only within a pixel of the
+16-grid, as a deblocking filter does) came in between −0.16% and +0.41% — nothing.
+
+**Verdict: real, small, not pursued.** SATD does not convert one-for-one to bitrate, so 1-2% SATD
+is low single digits at best, against a normative bitstream change: a filter the decoder must
+reproduce bit-exactly, a new shader, and decoder symmetry to maintain forever. That is the wrong
+trade at this size.
+
+**What would change it:** this bounds a *non-adaptive* filter only. A real in-loop filter is
+edge-adaptive with a per-block strength decision, and nothing here bounds that. If some other line
+of work makes reference quality matter more — a longer GOP default, or hierarchical references
+where one frame is reused many times — the 1-2% grows and this is worth revisiting.
+
+**A confounded measurement I nearly published.** The obvious ceiling test is to predict from the
+previous frame's *clean source* instead of the decoded reference, on the reasoning that this
+removes 100% of the reference noise rather than some of it. That comparison is invalid, and
+spectacularly so: it read −31.6% on bbb17 and **+12.3% on old_town**, i.e. a noise-free reference
+predicting *worse*. The reason is that a decoded reference is not the source plus noise — it is the
+source low-pass filtered by the quantiser, and on high-detail content with large motion that
+smoothing helps more than the noise hurts. Two effects, opposite signs, and the confound is large
+enough to flip the sign of the answer. The inconsistency across sequences is what gave it away:
+three numbers spanning 44 percentage points is not a ceiling, it is a broken instrument. The
+warning is in the script's docstring so the next person does not repeat it.

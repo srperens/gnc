@@ -7531,3 +7531,86 @@ Filed as the successor to this experiment rather than claimed either way.
 This is the fifth time in two days that a conclusion turned on the operating point or the exact
 configuration measured. The pattern is consistent enough to be worth stating as a rule: **name the
 mechanism you are testing, then check that the implementation actually implements that mechanism.**
+
+---
+
+## 2026-09-06 — ENT-1: a quarter of every rANS file was frequency tables
+
+Measured in a worktree pinned to `25655b4`, own `target/`, padding-neutral 1536x1024 crops
+(1024x512 for kristensara). Quality is untouched by construction — this codes side information,
+not coefficients — and PSNR came back bit-identical at every point checked.
+
+### What the tables were costing
+
+Not a low-bitrate curiosity, which is how ENT-1 was filed. The share is roughly constant across
+the whole range, because the alphabet grows with quality in step with the payload:
+
+| q | freq tables | fixed per-tile header | streams | max alphabet |
+|---|---|---|---|---|
+| 20 | 11.4% | 11.7% | 76.7% | 202 |
+| 35 | 18.4% | 7.1% | 74.3% | 680 |
+| 50 | 20.3% | 5.0% | 74.2% | 1029 |
+| 70 | 22.8% | 3.1% | 73.8% | 1791 |
+
+**23–26% of every subband-rANS file was per-tile side information.** The tables were stored as one
+flat `u16` per symbol while being 68% zeros at q=70 with a mean nonzero entry in the single digits.
+Order-0 entropy of the table values was 27 KB against the 205 KB stored.
+
+### The coding
+
+Zero-run length and value alternating, both Exp-Golomb order 0, MSB-first, flushed to a byte
+boundary per group. Exp-Golomb rather than Rice because the zero-coefficient symbol routinely
+holds a frequency in the thousands and unary coding it would be catastrophic; ue codes 4096 in
+25 bits. Runs and values alternate by construction, so no prefix bit is needed.
+
+Signalled by **bit 31 of the tile's `num_groups` word**, which holds at most 12. The tile versions
+itself, no frame generation was spent, and files written before today parse unchanged — the same
+mechanism the Rice skip bitmap uses. The GPU shaders are untouched: tables are expanded on the
+host into the same buffers before dispatch.
+
+### Result — 4 images, 2 quality points, subband rANS forced
+
+| image | q | tables | file | bpp |
+|---|---|---|---|---|
+| bbb | 50 | 113 844 → 35 394 B (−69%) | −14.0% | 2.853 → 2.454 |
+| bbb | 70 | 205 034 → 48 743 B (−76%) | **−17.4%** | 4.567 → 3.772 |
+| blue_sky | 50 | 78 720 → 27 864 B (−65%) | −11.7% | 2.215 → 1.956 |
+| blue_sky | 70 | 140 162 → 38 405 B (−73%) | −14.5% | 3.561 → 3.044 |
+| touchdown | 50 | 71 518 → 23 271 B (−67%) | −11.8% | 2.073 → 1.827 |
+| touchdown | 70 | 126 796 → 32 580 B (−74%) | −13.1% | 3.662 → 3.183 |
+| kristensara | 50 | 40 644 → 9 927 B (−76%) | −23.4% | 2.002 → 1.533 |
+| kristensara | 70 | 72 722 → 13 297 B (−82%) | **−26.6%** | 3.412 → 2.506 |
+
+**Mean −16.6% of the file, for no quality change whatsoever.** On the preset path (rANS at q ≤ 20)
+it is −4.3% at q=15 and −4.5% at q=20, PSNR identical to two decimals (32.76 and 34.10 before and
+after), and a file written to disk and decoded back reads 34.11 dB.
+
+### The consequence is larger than the saving
+
+rANS is confined to q ≤ 20 because Rice measured better above it. Compare the packed rANS against
+the Rice figures from today's tile-size grid, same crops, same q=70:
+
+| image | Rice | rANS packed |
+|---|---|---|
+| bbb | 3.77 | 3.77 |
+| blue_sky | 3.07 | **3.04** |
+| touchdown | 3.45 | **3.18** |
+| kristensara | 2.48 | 2.51 |
+
+rANS was 15–25% behind Rice at this quality. It is now level or ahead on three of four images.
+**The crossover at q=20 was measuring table overhead, not the coder** — the same shape of error as
+the q ≤ 80 wavelet cutoff and the P-frame quantiser lever, both found earlier today.
+
+Not claimed as settled: PSNR equality between the two coders is by construction (identical
+quantisation, lossless entropy coding) and was not verified end-to-end for the forced
+configuration. Re-sweep the crossover properly with matched PSNR before moving the preset — filed
+as the follow-up on ENT-1.
+
+### Worth building at all?
+
+Stated before building, and it still stands: the ABAC track measures −19 to −25% against Rice and
+needs no tables at all, so if it clears its GPU throughput gate this work is superseded. It is a
+hedge on that gate, and it is cheap — about 150 lines confined to `rans.rs`, no shader change, no
+generation bump. The 25% measurement is worth having either way: it is the reason rANS looked
+weak, and it says the same overhead question should be asked of any coder that ships per-tile
+tables.

@@ -187,7 +187,7 @@ Uses per-subband frequency tables with 32 interleaved rANS streams.
 | 4 | u32 | num_coefficients | Total coefficients |
 | 4 | u32 | tile_size | Tile dimension |
 | 4 | u32 | num_levels | Wavelet decomposition levels |
-| 4 | u32 | num_groups | num_levels * 2 (LL + deepest merged + directional pairs) |
+| 4 | u32 | num_groups | Low bits: `num_levels * 2` (LL + deepest merged + directional pairs). **Bit 31** = frequency tables are packed, see below |
 
 For each group (num_groups times):
 
@@ -196,7 +196,7 @@ For each group (num_groups times):
 | 4 | i32 | min_val | Group minimum value |
 | 4 | u32 | alphabet_size | Group alphabet size |
 | 4 | i32 | zrun_base | ZRL base (0 = no ZRL; group 0 never uses ZRL) |
-| alphabet_size * 2 | u16[] | freqs | Normalized frequencies (sum = 4096) |
+| variable | u16[] or packed | freqs | Normalized frequencies (sum = 4096). Flat `u16` per symbol unless bit 31 of `num_groups` is set |
 
 After all groups:
 
@@ -205,6 +205,24 @@ After all groups:
 | 32 * 4 | u32[32] | stream_lengths | Byte length per stream |
 | 32 * 4 | u32[32] | stream_states | Initial rANS state per stream |
 | variable | u8[] | stream_data | Concatenated stream bytes |
+
+**Packed frequency tables** (`num_groups & 0x8000_0000`). A normalised table is mostly empty —
+68% zeros at q=70, mean nonzero entry in the single digits — so a flat `u16` per symbol made the
+tables 23–26% of the file. Packed, each group's table is a bit stream of alternating
+**zero-run length** and **value**, both **Exp-Golomb order 0**, MSB-first, flushed to a byte
+boundary at the end of the group:
+
+```
+repeat until alphabet_size symbols have been placed:
+    ue(run)        -- number of zero-frequency symbols to skip
+    ue(freq - 1)   -- frequency of the symbol that follows the run
+```
+
+A trailing run with no value after it terminates the table. Runs and values alternate by
+construction, so no prefix bit is spent. Exp-Golomb rather than Rice because the zero-coefficient
+symbol routinely holds a frequency in the thousands; ue codes 4096 in 25 bits where unary would
+need 4096. `num_groups` is read before the tables, so the tile versions itself and streams written
+before this parse unchanged.
 
 **Group assignment (directional splitting):** Group 0 = LL subband. Group 1 = deepest detail level (LH+HL+HH merged). For remaining levels (deep to shallow): even groups = LH+HL subbands, odd groups = HH subband. Total groups = num_levels * 2. This separates diagonal (HH) from horizontal/vertical (LH+HL) detail for tighter frequency distributions.
 

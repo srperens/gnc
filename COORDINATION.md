@@ -86,6 +86,13 @@ wrong conclusions have come from this one error.
 
 Newest first. If you have measurements taken before one of these, they are suspect.
 
+- **ENT-1** — subband-rANS frequency tables are now Exp-Golomb packed (bit 31 of the tile's
+  `num_groups` word). Files shrink 11.7–26.6% on that coder at bit-identical quality; the preset
+  path (q ≤ 20) shrinks 4.5%. **Invalidates every absolute byte or bpp figure for the rANS coder**,
+  and it invalidates the *reason* for the Rice/rANS crossover at q=20 — re-sweep before quoting it.
+  Landed inside commit `0e8987c`, which swept up another session's uncommitted work; the change was
+  verified and measured only afterwards.
+
 - **Tile-size sweep (BUG-11 / ENT-1 / BUG-12)** — measurement only, no code change. Result: 256 px
   is a local optimum and both 128 and 512 are worse *through Rice*, but the sign reverses on the
   rANS path (512 gains 14–20%). Rice hardcodes tile width 256 in its `i % 256` stream mapping.

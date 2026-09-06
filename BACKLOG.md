@@ -286,19 +286,29 @@ And any future tile-size change is blocked behind this.
 Fix: make the mapping tile-width-aware, so a stream is one column at any width (or a contiguous
 column, if the stream count must stay at 256). Then re-run the tile-size sweep.
 
-### ENT-1 — Per-tile frequency tables cost about 9% of the file at 1 bpp (todo, P1)
-Fell out of the tile-size measurement. On the rANS path, bbb at q=20, quadrupling tile area (256 →
-512 px, so 4x fewer tables per coefficient) saves **14.2%** with per-subband tables and only
-**5.5%** with a single table per tile. About 9 points of that is table overhead rather than
-transform continuity.
+### ENT-1 — Per-tile frequency tables (**DONE 2026-09-06**)
+Subband-rANS stored each normalised frequency as a flat `u16`, and the tables were **23–26% of
+every file across the whole quality range** — not just at low bitrate, because the alphabet grows
+with quality in step with the payload (202 symbols at q=20, 1791 at q=70). At q=70 they were 68%
+zeros with an order-0 entropy of 27 KB against 205 KB stored.
 
-The tables are being amortised by geometry, which is the wrong lever — the geometry is worth ~5%
-and is blocked behind BUG-11, while the tables can be attacked directly: share them across tiles
-within a plane, or code them differentially against a neighbour or a default. JPEG 2000 and the
-video codecs both do a version of this. Worth more than the experiment that found it.
+Now coded as alternating zero-run and value, both Exp-Golomb order 0, byte-aligned per group.
+Signalled by bit 31 of the tile's `num_groups` word, so the tile versions itself, no frame
+generation was spent, and older files parse unchanged. Host-side only — the GPU shaders see the
+same expanded buffers.
 
-Caveat: single-table mode is a worse coder overall, so the 9/5 split is indicative, not exact.
-Measure properly before building.
+**Tables 65–82% smaller; the file 11.7–26.6% smaller, mean −16.6%, at bit-identical quality.**
+Four images, q=50 and q=70. On the preset path (rANS at q ≤ 20) it is −4.5%.
+
+**Follow-up (open, P1): re-sweep the Rice/rANS crossover.** rANS is pinned to q ≤ 20 because Rice
+measured better above it. With the tables packed, rANS at q=70 is level with Rice on bbb, ahead on
+blue_sky (3.04 vs 3.07) and touchdown (3.18 vs 3.45), and 1% behind on kristensara — where it used
+to be 15–25% behind everywhere. The crossover was measuring table overhead, not the coder. Verify
+PSNR equality end-to-end first: it is identical by construction, and "by construction" has been
+wrong three times in this repo today.
+
+**Caveat:** the ABAC track needs no tables at all and measures −19 to −25% against Rice. If it
+clears its GPU throughput gate this work is superseded, and it was built knowing that.
 
 ### BUG-12 — `--tile-size` cannot reach its own wavelet-level ceiling (todo, P3)
 `quality_preset` ends with `cfg.wavelet_levels = min(levels, cfg.max_wavelet_levels())`, computed

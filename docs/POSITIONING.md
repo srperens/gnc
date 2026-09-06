@@ -206,8 +206,36 @@ insistence on VMAF is good engineering practice but is not this market's currenc
 
 ## 4. Where GNC actually stands
 
-Everything in this section was measured on 2026-09-05. Details and raw numbers in
+Measured 2026-09-05 unless a subsection says otherwise. Details and raw numbers in
 [RESEARCH_LOG.md](../RESEARCH_LOG.md).
+
+### Compression against H.264: 1.9x at contribution quality, and the gap is intra
+
+**Updated 2026-09-06 (QUAL-1). This supersedes the 5–7x figure used throughout earlier drafts of
+this document.** Re-running the same harness at the operating point §1 says GNC is *for* —
+rather than at distribution bitrates, where the earlier figure was taken and where the quality
+ladder above q=92 was dead — gives **+90.5% BD-rate on PSNR**, about **1.9x**: +129.0% on bbb,
++71.9% on old_town, +70.6% on crowd_run. Nothing in the coder changed between the two
+measurements.
+
+Three consequences for this document's argument:
+
+- **The "no published transform result exceeds ~15%, so nothing closes a 5–7x gap" reasoning still
+  holds arithmetically but no longer bites as hard.** Against 1.9x, single-digit and low-double-digit
+  improvements are worth having. §7's dead-end entry is corrected accordingly.
+- **The remaining gap is intra, not inter.** x264's own inter saving at this quality is +0.6% at
+  crf 12 and −33.3% at crf 2 — near lossless the motion-compensated residual is noise-like, so it
+  costs about what the picture costs and the vectors are overhead. Both codecs break even here.
+  Inter is a distribution-bitrate problem, and GNC is not a distribution codec.
+- **Colour is a genuine lead, and luma-only metrics hide it.** At rate matched to 1%, GNC beats
+  x264 on CIEDE2000 on all three sequences (0.611 vs 0.684 mean on bbb) with fewer pixels past the
+  JND, while sitting 7.4–8.8 dB behind on luma. For a codec sold on generation survival and colour
+  fidelity that is the more relevant half, and no VMAF-based comparison can see it.
+
+**And do not quote a VMAF BD-rate above about q=85.** Widening the quality ladder moved the VMAF
+figure by a mean of 47.5 points (old_town +81.1% → +191.4%) while PSNR moved 1.0 point. §3's note
+that VMAF is barely present in the contribution literature turns out to be the right instinct for
+a second, purely numerical reason.
 
 ### Multi-generation robustness: the falsification test does not falsify
 
@@ -405,11 +433,12 @@ In priority order. Items map to [BACKLOG.md](../BACKLOG.md).
    the historical GPU encoders' quality — scrutinise it as hard as the DWT.
 3. **10-bit through the video path** (FMT-1). A gate, not a feature. Cheaper than assumed: the
    still-image path already has the flag; `encode-sequence` has no bit-depth option at all.
-4. **Stop looking for the inter gap in the coding model** (§5, corrected 2026-09-06). Every
-   locally available lever has now been measured and rejected, RD decisions included. Treat the
-   gap as open and unexplained rather than prescribing a fix. The one untested lever with a
-   mechanism specific to a wavelet codec is OBMC — measure it, expect single digits, and do not
-   expect it to close a multiple.
+4. **Stop working on inter at this operating point** (§4, §5, corrected 2026-09-06). Not because
+   the gap is unexplained — because at contribution quality there is no inter gap to close, for
+   GNC or for x264. Every locally available inter lever was measured and rejected, RD decisions
+   included, and then the operating point turned out to be the whole story. OBMC remains the one
+   untested wavelet-specific lever; it is now a low priority rather than the last hope. **Spend
+   the effort on intra**, which is where the +90.5% lives.
 5. **Decide between live contribution and cloud mezzanine, and stop straddling** (§2).
 6. **Drop the B-pyramid at contribution quality.** Two independent measurements now agree it is
    the wrong default here: it costs 7–31% in rate on camera content (BUG-5) and 160 ms in latency
@@ -428,10 +457,15 @@ In priority order. Items map to [BACKLOG.md](../BACKLOG.md).
   hypotheses. Already ruled out by GNC's own measurements and now explained by Girod's bounds —
   half-pel already captures roughly 1.8 of the ~2 bits/sample available.
 - **Smaller tiles.** Measured at +70% bits, and the header floor is not where the gap is.
-- **Any expectation that a transform change closes a 5–7× gap.** No published transform result on
-  motion-compensated residuals exceeds ~15%.
-- **Blaming low latency for the inter gap.** Low-delay costs perhaps 15–25% versus random access,
-  not multiples. GNC currently saves 17–27% where a low-latency-adjusted target is 40–55%.
+- **Any expectation that a *single* transform change closes the gap.** No published transform
+  result on motion-compensated residuals exceeds ~15%. Note the target moved on 2026-09-06: the
+  gap at contribution quality is 1.9x, not 5–7x (§4), so an accumulation of single-digit wins is a
+  credible route where against 5–7x it was not. What remains a dead end is expecting one of them to
+  do it alone.
+- **Blaming low latency for the inter gap** — and, since 2026-09-06, **treating the inter gap as
+  the priority at all.** At contribution quality both codecs break even on inter; x264's own inter
+  saving is +0.6% at crf 12. The 17–27% versus 40–55% comparison was drawn at distribution
+  bitrates and does not describe this operating point. The gap here is intra.
 
 ---
 

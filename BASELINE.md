@@ -1,8 +1,13 @@
 # GNC Benchmark Baseline
 
 Last updated: 2026-09-06 (compression columns; fps columns are older — see below)
-Baseline commit: (TUNE-5 — P-frame quantiser scale 1.25, on top of BUG-7/FMT-2/BUG-6)
+Baseline commit: `e872904` — after ENT-1 (packed frequency tables), BUG-11 (Rice stream mapping),
+BUG-12, BUG-13 (intra prediction bit-exact) and QUAL-1.
 Mode: Spatial-only, Rice entropy, uniform subband weights. P-only by default since BUG-5.
+
+**Tile size 256 is unchanged by BUG-11 — byte-identical at all 12 measured points** — so every
+compression figure in this file still stands. Non-256 tile figures from before 2026-09-06 do not:
+they were scored through a stream mapping that penalised the larger-tile arm by 13–19%.
 
 **Sequence numbers taken before 2026-09-06 with `GNC_DIAGNOSTICS=1` are not valid** — see BUG-7:
 that flag clobbered the motion-compensation reference and inflated files by 32%. Re-measure
@@ -121,23 +126,47 @@ not drift — but VMAF on a shared reference is the measurement to quote.
 fundamentally different design. Unlike the inter gap, intra has an existence proof that the rate
 is reachable.
 
-## Video vs H.264 (MEAS-1, 2026-09-05) — the headline number
+## Video vs H.264 — the headline number (QUAL-1, 2026-09-06)
 
-Measured with `scripts/meas1_vs_h264.py`: VMAF-scored, one normalised reference for both codecs,
-BD-rate over the overlapping quality range. 1080p, 4:2:0, 17 frames, x264 at its defaults.
+`scripts/meas1_vs_h264.py`: one normalised reference through PNG for both codecs, the same `vmaf`
+binary and arguments for every score, rate from the actual coded bitstream. 1920x1080, 17 frames,
+ki=9, 4:2:0, 8-bit, x264 at its defaults.
 
-| | bbb | touchdown | old_town |
+**BD-rate on PSNR-Y at contribution quality** — q=85,92,96,99 against crf=1,2,4,8:
+
+| | bbb_extended | old_town_cross | crowd_run | **mean** |
+|---|---|---|---|---|
+| full video (ki=9) | **+129.0%** | **+71.9%** | **+70.6%** | **+90.5%** |
+| curve overlap | 49.4–55.9 dB | 50.0–56.2 dB | 49.9–56.3 dB | |
+
+**GNC needs about 1.9x the bitrate of H.264 for the same luma PSNR at contribution quality.**
+
+**Colour, at rate matched to 1%** — CIEDE2000 on decoded RGB, which VMAF cannot see:
+
+| | bbb_extended | old_town_cross | crowd_run |
 |---|---|---|---|
-| full video (ki=9) | **+456.7%** | **+493.9%** | **+672.1%** |
-| intra only (ki=1, 8 frames) | +54.6% | +46.3% | — |
+| GNC dE00 mean / p95 | **0.611** / 1.304 | **0.911** / 1.943 | 0.837 / 1.844 |
+| x264 dE00 mean / p95 | 0.684 / 1.503 | 0.949 / 2.196 | 0.913 / 2.195 |
 
-**GNC needs roughly 5-7x the bitrate of H.264 for the same VMAF on video.** Intra accounts for
-about +50% of that; inter coding multiplies it a further 8-10x.
+GNC is ahead on colour on all three while **7.4–8.8 dB behind on luma** at those same points — the
+two codecs allocate rate differently between luma and chroma. Quote both numbers or the comparison
+misleads in whichever direction suits. (crowd_run's pair is 1.08x on rate, so its colour win is
+partly bought; the matched pairs give +4.1% and +10.7%.)
 
-This supersedes the +13.9% spatial BD-rate quoted below and elsewhere in the repo. That figure is
-PSNR-based, on single still images, against H.264 all-I — a different measurement, not a
-contradictory one, but not the number that matters for a video codec. Quote the table above when
-asked how GNC compares.
+### Three rules for quoting these
+
+1. **PSNR leads above q=85, not VMAF.** Widening the quality ladder from 1.8 dB to 6.5 dB of
+   overlap moved the VMAF BD-rate by a mean of **47.5 points** (old_town +81.1% → +191.4%) and the
+   PSNR BD-rate by **1.0 point**. VMAF reads 99.62–99.68 across a 6 dB PSNR spread: saturated, so
+   the fit is on noise. Never quote a VMAF BD-rate at this end.
+2. **Superseded: +456.7% / +493.9% / +672.1% (MEAS-1, 2026-09-05).** That was measured at
+   *distribution* bitrates (crf 18–38) with the quality ladder above q=92 dead. Nothing in the
+   coder changed between the two measurements. Treat it as a historical distribution-bitrate figure
+   only. Its stated sources are also not reproducible: `bbb.y4m` has 8 frames, not 17, and no
+   `touchdown` sequence exists in the tree.
+3. **The +13.9% spatial figure is a third quantity** — PSNR on single stills against H.264 all-I.
+   Not contradictory, just a different measurement. The intra-only figures (+54.6% / +46.3%,
+   ki=1) predate the fix to the high-q ladder and have not been re-run.
 
 ## Regression Rules
 

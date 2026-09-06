@@ -44,11 +44,26 @@ standing rule is now: *name the mechanism you are testing, then check that the i
 actually implements that mechanism* — and measure the range the project cares about, not the
 convenient one.
 
+### 5. The headline gap figure was wrong by 3x, and the target is now reachable (QUAL-1)
+
+At the contribution operating point GNC needs **+90.5% BD-rate on PSNR** against x264 — about
+1.9x — not the 5.6x recorded from MEAS-1, which was measured at distribution bitrates with the
+quality ladder above q=92 dead. Nothing in the coder changed between the two measurements. This
+matters for prioritisation more than for pride: **against 5–7x, single-digit improvements were
+provably pointless; against 1.9x they accumulate into the target.** Every "this is too small to
+bother with" judgement in this repo predating 2026-09-06 was made against the wrong denominator.
+
+Also settled: **never quote a VMAF BD-rate above about q=85** (widening the ladder moved it 47.5
+points on average, 110 on old_town, while PSNR moved 1.0), and **GNC leads x264 on colour at
+matched rate** (dE00 0.611 vs 0.684) while trailing 7.4–8.8 dB on luma — so quote both or the
+comparison misleads in whichever direction suits.
+
 ### Priority order
 
-1. **LOSSLESS-1** — both gates green (10–26% for ~5 ms/frame). The one lever this week that passed
+1. **Intra at contribution quality** — the whole remaining +90.5% lives here, per findings 1 and 5.
+   Inter breaks even at this operating point for x264 too, so this is the only place the gap is.
+2. **LOSSLESS-1** — both gates green (10–26% for ~5 ms/frame). The one lever this week that passed
    rather than failed. Buildable now.
-2. **Intra at contribution quality** — where the whole remaining gap is, per finding 1.
 3. **MEAS-5 / CANARY-1** — blocked on a discrete GPU. The entire strategic thesis rests on MEAS-5
    and it has never been measured.
 4. ~~**QUAL-1**~~ — done 2026-09-06: the contribution gap is **+90.5% BD-rate on PSNR**, about
@@ -933,6 +948,13 @@ BD-rate over the overlapping quality range. 1080p 4:2:0, x264 at defaults.
 **GNC needs roughly 5-7x the bitrate of H.264 for the same VMAF on video.** Intra accounts for
 about +50%; inter multiplies the gap a further 8-10x. Supersedes the +13.9% spatial figure, which
 was PSNR on stills rather than VMAF on video.
+
+> **SUPERSEDED 2026-09-06 by QUAL-1.** These figures were measured at *distribution* bitrates
+> (crf 18–38) with the quality ladder above q=92 dead, and on VMAF, which is saturated at the
+> contribution end. Re-run at the operating point GNC is built for, the gap is **+90.5% BD-rate on
+> PSNR — about 1.9x.** Nothing in the coder changed. The sources stated here are also not
+> reproducible: `bbb.y4m` has 8 frames, not 17, and there is no `touchdown` sequence in the tree.
+> Keep this entry as the historical distribution-bitrate figure; do not quote it as current.
 
 The gap is multiples, not percentages. Work targeting single-digit-percent improvements is not
 addressing it.

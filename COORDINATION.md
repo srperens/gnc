@@ -95,8 +95,10 @@ hash (`git worktree add <dir> <sha>`).
 tested this codec.
 
 **3. Above about q=80, VMAF is saturated and PSNR must lead.** On old_town at q≥85 VMAF reads
-identical for two settings whose worst-frame PSNR differs by 4.8 dB. CLAUDE.md's "VMAF primary"
-rule is right in the lossy range and wrong near lossless. State which metric led, and why.
+identical for two settings whose worst-frame PSNR differs by 4.8 dB. State which metric led, and
+why. CLAUDE.md now carries this as a table rather than a blanket "VMAF primary" rule, and QUAL-1
+put a magnitude on it: widening a BD-rate ladder moved the VMAF figure by **47.5 points on
+average, 110 at worst**, while the PSNR figure moved **1.0**.
 
 **4. A point measurement at fixed q cannot judge a rate/quality trade**, and it always flatters
 the option that spends more bits. Use BD-rate, or compare at matched rate. At least four separate

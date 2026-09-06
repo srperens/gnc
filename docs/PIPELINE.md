@@ -1,6 +1,6 @@
 # GNC Encode Pipeline
 
-*2026-03-01 — reflects current codebase on `main`*
+*Updated 2026-09-06 — reflects current codebase on `main`*
 
 ## Overview
 
@@ -34,7 +34,9 @@ Scatters interleaved YCoCg-R into three separate plane buffers: Y (luminance), C
 
 ### 4. Wavelet Transform — `transform_97.wgsl` / `transform_53.wgsl`
 
-Separable 2D wavelet (row pass → column pass), repeated for 3–4 decomposition levels.
+Separable 2D wavelet (row pass → column pass), repeated for 4–5 decomposition levels (5 at q≥25, 4 below — BUG-6).
+
+The tile size sets the ceiling, not the image size: each level halves the tile, and the floor of 8 samples means 256 px carries 5 levels, 512 carries 6, 128 carries 4. Use `CodecConfig::set_tile_size()` rather than assigning `tile_size` directly — it re-derives that ceiling in both directions (BUG-12).
 
 | Mode | Filter | Use case |
 |------|--------|----------|
@@ -61,9 +63,13 @@ q[i] = round(coeff[i] / (step × subband_weight × aq_weight)) × sign(coeff[i])
 ```
 
 - **Dead zone:** coefficients in `[-dead_zone, +dead_zone]` map to zero
-- **16 subband weights** (4 per level, perceptually tuned)
-- **Chroma:** 2× heavier quantization than Y
-- **Quality step:** log-interpolated from preset anchors (q=1,10,25,50,75,85,92,99,100)
+- **Subband weights:** uniform by default; `GNC_PHYSICAL_WEIGHTS` selects the perceptual curve
+- **Chroma:** `chroma_weight` 1.0–1.5, tightening with quality (1.0 at q≥85)
+- **Quality step:** log-interpolated from preset anchors (q=1,10,25,50,75,85,92,99,100). The
+  ladder above q=92 was capped at qstep 2.0 by a stale rANS constraint until 2026-09-06; q=92/96/99
+  now give 51.7 / 55.2 / 59.8 dB where they previously gave the same picture three times
+- **P-frames** are quantised more coarsely than I-frames, scaled 1.25x at qstep ≥ 4.6 and tapering
+  to 1.0 at qstep ≤ 2.8 (TUNE-6)
 
 **Fused path** (`quantize_histogram_fused.wgsl`): combines quantization + entropy histogram in one kernel. Used when CfL is off. Saves one full GPU pass.
 
@@ -78,22 +84,32 @@ Encoder transmits residuals (lower entropy) + alpha values. Decoder reverses wit
 
 ### 8. Entropy Coding
 
-Three backends exist. **Rice+ZRL is the default** and only actively maintained path.
+Three backends exist. **Rice+ZRL is the default above q=20**; rANS is selected at q≤20, where it
+codes better. The crossover was re-swept on 2026-09-06 after rANS's frequency tables were packed
+and it stayed where it was.
 
 #### Rice+ZRL (default) — `rice_encode.wgsl`
 
 - **256 fully independent streams per tile** — maximum GPU parallelism
 - Per coefficient: zero-bit → (if nonzero) sign + Golomb-Rice magnitude code
 - Zero-run-length extension for efficient zero runs
-- Rice parameter `k` chosen per subband group
+- Rice parameter `k` chosen per subband group; zero-run `k` has two magnitude contexts
 - Shared memory usage < 1 KB → excellent occupancy on M1
+- **Stream layout:** streams walk the tile **column-major**, cut into 256 contiguous segments, so
+  the previous symbol in a stream is the coefficient directly above it — the vertical adjacency
+  the adaptive `k` and the zero runs are tuned against. Until 2026-09-06 the mapping was `i % 256`,
+  which gives that property only at a 256 px tile and interleaved distant columns at any other
+  width (BUG-11). At 256 px the two are identical coefficient for coefficient
 
 #### rANS (parked) — `rans_encode.wgsl`
 
 - 32 interleaved streams per tile
 - Requires histogram (`rans_histogram.wgsl`) → normalization to 12-bit (`rans_normalize.wgsl`) → encode
 - Per-subband frequency tables, optional context-adaptive mode
-- Better compression but 2× slower due to sequential dependency
+- Frequency tables are coded as alternating zero-run and value, both Exp-Golomb order 0 (ENT-1,
+  2026-09-06). They used to be flat `u16` and cost 23–26% of every file; packing them made the
+  file 11.7–26.6% smaller at bit-identical quality
+- Better compression at low rate, but a sequential dependency the Rice path does not have
 
 #### Huffman (parked) — `huffman_encode.wgsl`
 
@@ -110,6 +126,11 @@ Three backends exist. **Rice+ZRL is the default** and only actively maintained p
 | q=90 | 50.5 dB | 8.90 | 40 | 63 |
 
 Sequence encode: **31.7 fps** (1080p, q=75, Rice, keyframe interval 8, I+P+B frames)
+
+> These throughput figures are indicative to about ±25%. Up to five sessions share this machine and
+> the same workload has timed 25.2, 31.1 and 37.5 ms across three runs. Three different quantities
+> have also been called "encode fps" and they differ by 2.4x — see BASELINE.md. The compression
+> columns are deterministic and carry no such caveat.
 
 ## Shader Inventory (encode path)
 

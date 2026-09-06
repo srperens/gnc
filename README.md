@@ -10,13 +10,24 @@ Traditional codecs (H.264, HEVC, AV1) are shaped by decades of CPU constraints �
 
 GNC asks: if you start from zero with a GPU-first mindset, what do you end up with?
 
-The answer so far: tile-independent processing, fully parallel entropy coding (256 independent streams per tile), and wavelet transforms that map naturally to GPU workgroups. The result competes with JPEG on compression while encoding/decoding at 40–70 fps at 1080p — including a full I/P/B video pipeline.
+The answer so far: tile-independent processing, fully parallel entropy coding (256 independent streams per tile), and wavelet transforms that map naturally to GPU workgroups. It runs a full I/P/B video pipeline in real time at 1080p on an eight-core integrated GPU.
+
+GNC targets **contribution** — the high-quality, low-latency link between a camera or a production facility and whatever comes next — not distribution to viewers. That choice sets the operating point everything below is measured at, and it is why the comparisons are against H.264 near lossless rather than at streaming bitrates.
 
 ## Status
 
-**Spatial codec (I+P+B) is production-ready** — 40 dB PSNR at 2–8 bpp, 20–60 fps encode/decode at 1080p, lossless mode, full video pipeline with motion estimation.
-Temporal wavelet mode (`--temporal-wavelet haar`) is **experimental** — works for low-motion content but loses 2–5 dB on high-motion sequences; off by default.
-See [`RESEARCH_LOG.md`](RESEARCH_LOG.md) for detailed benchmarks and analysis.
+**Working end to end:** I/P/B video pipeline with motion estimation, 8- and 10-bit, 4:4:4 / 4:2:2 / 4:2:0, three interchangeable entropy coders, and bit-exact lossless at `q=100`. Runs on Metal, Vulkan, DX12 and WebGPU.
+
+**Where it stands against H.264** (measured 2026-09-06, `scripts/meas1_vs_h264.py`, 1080p, ki=9, x264 at defaults):
+
+- **Contribution quality: +90.5% BD-rate on PSNR** — about 1.9x the bitrate of x264 for the same luma quality, across three sequences.
+- **Colour: ahead of x264.** At rate matched to 1%, GNC scores better CIEDE2000 on all three sequences (0.611 vs 0.684 mean on bbb) with fewer pixels past the just-noticeable threshold — while sitting 7.4–8.8 dB behind on luma. The two codecs spend their bits differently between brightness and colour, so both numbers are needed to describe the difference honestly.
+- **Lossless: the best wavelet result in the field.** 1.99:1 at `q=100`, beating JPEG 2000 lossless by 10.8% and PNG by 7.8%; behind FFV1 by 27% and x264 `-qp 0` by 43%, both of which predict against the neighbouring pixel rather than across scales.
+- At *distribution* bitrates the gap is much larger. GNC is not built for that operating point.
+
+**Off by default, and why:** the B-frame pyramid (costs 7–31% in rate on camera content and 160 ms in latency), temporal wavelet mode (loses 2–5 dB on high motion), and motion-compensated temporal filtering (measured 1.04–1.14x *worse* than a P-frame chain on every sequence tested).
+
+See [`RESEARCH_LOG.md`](RESEARCH_LOG.md) for every measurement, including the ones that failed — roughly two dozen ideas have been tested and rejected, and they are written up as carefully as the wins.
 
 ## Current Results (1080p, bbb reference, M1 GPU)
 
@@ -32,6 +43,13 @@ See [`RESEARCH_LOG.md`](RESEARCH_LOG.md) for detailed benchmarks and analysis.
 ### Video sequence
 
 **31.7 fps** (1080p, q=75, keyframe interval 8, I+P+B frames)
+
+> **On the throughput figures above.** Three different quantities have been called "encode fps" in
+> this project and they differ by 2.4x — the GPU encode phase, the encoder loop, and end-to-end
+> wall clock. The figures here are the encoder loop. They were also measured on a machine that is
+> not reliably idle: the same workload has timed 25.2, 31.1 and 37.5 ms across three runs, a 48%
+> spread on identical work. **Treat every fps number in this README as indicative to about ±25%.**
+> The compression figures (bpp, PSNR, CIEDE2000) are deterministic and carry no such caveat.
 
 ## Architecture
 

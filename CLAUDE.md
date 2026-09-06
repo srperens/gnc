@@ -79,15 +79,29 @@ not after.
 The team's core principle: **correctness over speed, measurement over assumption, skepticism over optimism.**
 
 ### Quality metrics
-**VMAF is the primary quality metric.** PSNR is a secondary cross-check only.
+
+**Which metric leads depends on the operating point, and you must say which one you used.**
+
+| range | leads | why |
+|---|---|---|
+| q ≤ 85 (lossy) | **VMAF** | It catches perceptual regressions PSNR misses — proven by the TILE_ENERGY_ZERO_THRESH ghosting bug and the chroma-subsampling penalty. PSNR is the cross-check. |
+| q > 85 (contribution, near lossless) | **PSNR** | VMAF is saturated and reads noise. Measured 2026-09-06: on old_town it returns 99.62–99.68 across a 6 dB PSNR spread, and widening a BD-rate ladder moved the VMAF figure by **47.5 points on average, 110 at worst**, while the PSNR figure moved **1.0**. A VMAF BD-rate at this end is not a weak number, it is not a number. |
+| anything touching chroma | **CIEDE2000** (`scripts/chroma_metric.py`) | VMAF cannot see colour at all. See below. |
+
+Since GNC is a *contribution* codec (GOALS §1), the second row is the project's home range —
+which means **PSNR leads more often than the old "VMAF is primary" rule implied.** That rule was
+written for the lossy range and was wrong above it.
 
 **VMAF scores the luma plane only.** It cannot see chroma being degraded, so it cannot validate
 any decision about a chroma parameter — chroma weighting, CfL range, chroma format trade-offs. A
 2026-09-05 sweep of `chroma_weight` looked like a free 15% rate saving on VMAF and shrank to
 +0.3 dB, direction-reversing, once measured with a metric that includes chroma. **Chroma
 questions need a chroma-aware metric; VMAF answers luma questions.**
-- VMAF catches perceptual regressions that PSNR misses (proven: TILE_ENERGY_ZERO_THRESH ghosting bug, chroma subsampling penalty)
-- Always run `--vmaf` on `benchmark` and `rd-curve`. Success criteria must include VMAF.
+- Always run `--vmaf` on `benchmark` and `rd-curve` — it is nearly free and its absence is worse
+  than a saturated reading. But at q>85, report it and lead with PSNR.
+- **A luma number alone cannot describe a rate/quality difference here.** At rate matched to 1%,
+  GNC beats x264 on dE00 while trailing 7.4–8.8 dB on luma: the two codecs allocate differently
+  between luma and chroma. Quoting either half alone misleads in whichever direction suits.
 - VMAF binary: `vmaf`, resolved from `PATH` (libvmaf 3.0.0 here; install it however your platform prefers)
 - Tolerances: VMAF regression >0.5 points = BLOCK. PSNR regression >0.3 dB = flag but investigate.
 

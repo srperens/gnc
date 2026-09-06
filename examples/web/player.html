@@ -387,6 +387,13 @@
         let player = null;
         let playing = false;
         let zeroCopy = false;
+        // Decode-ahead queue. GNV2 decodes a whole temporal group at once and buffers it, so
+        // frames arrive in bursts: one long stall, then several instant frames. Presenting
+        // straight off the decoder turns that into stall-and-sprint. The queue absorbs the burst
+        // so presentation can run at a steady cadence. Depth covers one group plus slack.
+        const FRAME_QUEUE_MAX = 16;
+        let frameQueue = [];
+        let decoderRunning = false;
         let animId = null;
         let playbackStartTime = 0;
         let playbackStartFrame = 0;
@@ -821,12 +828,39 @@
         }
 
         // --- Playback ---
-        let jsCurrentFrame = 0;
+        let jsCurrentFrame = 0;   // next frame to *present*
+        let jsDecodeFrame = 0;    // next frame the decoder will produce (runs ahead of the above)
 
         function updateFrameLabel(idx) {
             frameLabel.textContent = `${idx} / ${cachedFc > 0 ? cachedFc - 1 : 0}`;
         }
 
+        // Producer: keep the queue topped up. Runs as fast as the decoder allows.
+        async function decoderLoop() {
+            if (decoderRunning) return;
+            decoderRunning = true;
+            try {
+                while (playing && !zeroCopy) {
+                    if (frameQueue.length >= FRAME_QUEUE_MAX) {
+                        await new Promise(r => setTimeout(r, 4));
+                        continue;
+                    }
+                    const idx = jsDecodeFrame;
+                    const rgba = await player.decode_next_frame();
+                    if (!playing) break;
+                    frameQueue.push({ rgba, idx });
+                    jsDecodeFrame++;
+                    if (jsDecodeFrame >= cachedFc) {
+                        jsDecodeFrame = 0;
+                        player.reset();
+                    }
+                }
+            } finally {
+                decoderRunning = false;
+            }
+        }
+
+        // Consumer: present on the wall clock, one frame per tick, never sprinting.
         async function playLoop() {
             if (!playing || !player) return;
 
@@ -838,42 +872,38 @@
                 return;
             }
 
+            let seekMs = 0, decodeMs = 0;
             if (zeroCopy) {
                 player.decode_and_present();
+                seekMs = player.last_seek_ms;
+                decodeMs = player.last_decode_ms;
             } else {
-                const rgba = await player.decode_next_frame();
-                if (!playing) return;
-                paintFrame(rgba, cachedWidth, cachedHeight);
+                const next = frameQueue.shift();
+                if (!next) {
+                    // Decoder is inside a group; hold the current frame rather than sprinting
+                    // once it catches up. Resync the clock so we do not accrue a debt to repay.
+                    playbackStartTime = performance.now();
+                    playbackStartFrame = jsCurrentFrame;
+                    animId = requestAnimationFrame(playLoop);
+                    return;
+                }
+                paintFrame(next.rgba, cachedWidth, cachedHeight);
             }
-
-            const seekMs = zeroCopy ? player.last_seek_ms : 0;
-            const decodeMs = zeroCopy ? player.last_decode_ms : 0;
+            if (!playing) return;
 
             jsCurrentFrame++;
             if (jsCurrentFrame >= cachedFc) jsCurrentFrame = 0;
 
-            if (!playing) return;
-
             const displayFrame = (jsCurrentFrame + cachedFc - 1) % cachedFc;
             seekBar.value = displayFrame;
             updateFrameLabel(displayFrame);
-
-            // Log per-frame timing
             logTiming(displayFrame, seekMs, decodeMs);
-
-            const behind = targetFrame - displayFrame;
-            if (behind > 3) {
-                playbackStartTime = performance.now();
-                playbackStartFrame = jsCurrentFrame;
-            }
 
             framesSinceLastStat++;
             statSeekAccum += seekMs;
             statDecodeAccum += decodeMs;
             if (framesSinceLastStat >= 10) {
-                const avgSeek = statSeekAccum / framesSinceLastStat;
-                const avgDecode = statDecodeAccum / framesSinceLastStat;
-                showTimingAvg(avgSeek, avgDecode);
+                showTimingAvg(statSeekAccum / framesSinceLastStat, statDecodeAccum / framesSinceLastStat);
                 framesSinceLastStat = 0;
                 statSeekAccum = 0;
                 statDecodeAccum = 0;
@@ -881,18 +911,12 @@
             }
 
             if (jsCurrentFrame === 0) {
-                player.reset();
+                if (zeroCopy) player.reset();
                 playbackStartTime = performance.now();
                 playbackStartFrame = 0;
             }
 
-            const nowAfter = performance.now();
-            const nextTarget = Math.floor((nowAfter - playbackStartTime) / 1000 * cachedFps) + playbackStartFrame;
-            if (jsCurrentFrame <= nextTarget) {
-                setTimeout(playLoop, 0);
-            } else {
-                animId = requestAnimationFrame(playLoop);
-            }
+            animId = requestAnimationFrame(playLoop);
         }
 
         function play() {
@@ -904,11 +928,16 @@
             framesSinceLastStat = 0;
             statSeekAccum = 0;
             statDecodeAccum = 0;
+            jsDecodeFrame = jsCurrentFrame;
+            frameQueue = [];
+            decoderLoop();                       // producer; playLoop below is the consumer
             animId = requestAnimationFrame(playLoop);
         }
 
         function pause() {
             playing = false;
+            frameQueue = [];                     // decoded-ahead frames are stale once we resume
+
             if (cachedFc > 1) playBtn.textContent = 'Play';
             if (animId) { cancelAnimationFrame(animId); animId = null; }
         }
@@ -918,6 +947,8 @@
             if (player) {
                 player.reset();
                 jsCurrentFrame = 0;
+                jsDecodeFrame = 0;
+                frameQueue = [];
                 seekBar.value = 0;
                 updateFrameLabel(0);
                 $('timPlayFps').textContent = '';

@@ -5013,3 +5013,70 @@ A 10-bit RD comparison against x264 still needs the harness plumbed for it, but 
 confirmed working, and — more importantly — the source material problem is solved: Xiph's
 `sintel-4k-png16` is genuinely 16-bit, and Netflix's Chimera set on the same server offers 10-bit
 Y4M sequences for the video side.
+
+---
+
+## 2026-09-06 — MEAS-6 first pass: the B-pyramid costs 8 frames of latency before any coding
+
+### Motivation
+
+Latency is one of the two headline metrics the contribution positioning rests on
+([docs/POSITIONING.md](docs/POSITIONING.md) §3) and it had never been measured. The reference
+points: JPEG XS is 1–32 lines algorithmic and EBU measured it under one frame; NDI High Bandwidth
+is under 16 ms; low-latency HEVC was measured by EBU at 120–3060 ms across real vendors.
+
+### Structural reordering delay — exact, and the headline
+
+Encode order, 17 frames, from the encoder's own diagnostics:
+
+```
+ki=17 (B-pyramid):  0[I] 4[B] 8[P] 2[B] 6[B] 1[B] 3[B] 5[B] 7[B] 12[B] 16[P] 10[B] 14[B] ...
+ki=8  (P-only):     0[I] 1[P] 2[P] 3[P] 4[P] 5[P] 6[P] 7[P] 8[I] 9[P] 10[P] ...
+```
+
+**With the B-pyramid, frame 1 cannot be encoded until frame 8 has arrived — 8 frames of
+lookahead.** At 50 fps that is **160 ms of structural delay before a single coding operation
+runs**; 133 ms at 59.94. **P-only encodes in display order: zero reordering delay.**
+
+This is not a tuning parameter. It is what a hierarchical pyramid is.
+
+### Coding time (1080p, M1, all-intra)
+
+| stage | per frame |
+|---|---|
+| GPU encode (`benchmark-sequence`, Y4M in, 10 frames all-I) | **~47 ms** |
+| decode (`decode-sequence`, incl. PNG write — upper bound) | ~35 ms |
+| **codec round trip** | **~80 ms** |
+| CLI round trip incl. PNG decode, PNG encode, process start | 350–410 ms |
+
+### Where that puts GNC
+
+| | latency |
+|---|---|
+| JPEG XS | 1–32 lines; EBU measured < 1 frame |
+| NDI High Bandwidth | < 16 ms |
+| **GNC, intra or P-only** | **~80 ms** |
+| **GNC, B-pyramid** | **~240 ms** (80 ms coding + 160 ms reordering) |
+| low-latency HEVC | 120–3060 ms (EBU, real vendors) |
+
+**GNC in its default B-pyramid configuration sits in the low-latency-HEVC band, not the JPEG XS
+band.** Without B-frames it is roughly three times better and lands between NDI and HEVC — still
+two orders of magnitude off JPEG XS, which is a line-based codec by construction.
+
+### This converges with BUG-5
+
+The B-pyramid was already measured as *costing* 7–31% at contribution quality on camera content
+(2026-09-05). It now also costs 160 ms of latency. **Two independent measurements, one
+conclusion: the hierarchical B-pyramid is the wrong default for this operating point.** That is
+now a well-supported configuration change rather than a hypothesis.
+
+Note this does not contradict keeping inter coding — P-frames have zero reordering delay and were
+the *better* performer at contribution quality. The finding is about the pyramid, not about inter.
+
+### Limits
+
+This is a first bound, not glass-to-glass. Real latency needs instrumentation we do not have:
+capture-to-encoder-input, encoder-output-to-network, and decoder-output-to-display are all
+unmeasured. The decode figure includes PNG writing and is an upper bound. The ~256-line tile
+floor discussed in POSITIONING.md §3 is not currently reachable anyway — the pipeline processes
+whole frames, so the practical floor is one full frame regardless of tile size.

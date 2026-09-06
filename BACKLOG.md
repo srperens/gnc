@@ -154,10 +154,37 @@ to end (`encode-sequence`, incl. PNG decode and container write), against BASELI
 circulation for "GNC encode fps" and GOALS quotes one without saying which. **Pin the definition
 before any density claim rests on it.**
 
-### MEAS-6 — Latency per frame (todo, P1 — never measured)
-Contribution links need sub-frame latency, and tile independence is supposed to buy it. Measure
-end-to-end frame latency (submit → decoded frame available), not throughput fps. Currently
-unquantified.
+### MEAS-6 — Latency per frame (first pass done 2026-09-06, P1)
+
+**The B-pyramid costs 8 frames of lookahead before any coding runs.** From the encoder's own
+diagnostics, `ki=17` encodes in the order `0[I] 4[B] 8[P] 2[B] 6[B] 1[B] 3[B] ...` — frame 1
+cannot be encoded until frame 8 has arrived. At 50 fps that is **160 ms of structural delay**.
+`ki=8` (P-only) encodes in display order: **zero reordering delay**. This is not a tuning
+parameter; it is what a hierarchical pyramid is.
+
+Coding time, 1080p, M1, all-intra: GPU encode ~47 ms/frame, decode ~35 ms/frame (upper bound,
+includes PNG write), **codec round trip ~80 ms**.
+
+| | latency |
+|---|---|
+| JPEG XS | 1-32 lines; EBU measured < 1 frame |
+| NDI High Bandwidth | < 16 ms |
+| **GNC, intra or P-only** | **~80 ms** |
+| **GNC, B-pyramid (default)** | **~240 ms** |
+| low-latency HEVC | 120-3060 ms (EBU, real vendors) |
+
+**GNC's default configuration sits in the low-latency-HEVC band, not the JPEG XS band.**
+
+**Converges with BUG-5.** The B-pyramid already measured as *costing* 7-31% at contribution
+quality on camera content. It now also costs 160 ms. Two independent measurements, one
+conclusion: **the hierarchical B-pyramid is the wrong default for this operating point.** This is
+now a supported configuration change rather than a hypothesis. It does not argue against inter
+coding — P-frames have zero reordering delay and were the better performer at contribution quality.
+
+**Still to do:** glass-to-glass instrumentation (capture-to-input, output-to-network,
+output-to-display are all unmeasured). Note the ~256-line tile floor is not currently reachable:
+the pipeline processes whole frames, so the practical floor is one full frame regardless of tile
+size.
 
 ### CANARY-1 — Encode time must move across GPU tiers (todo, P1)
 BeHardware's 2011 study found the shipping GPU H.264 encoders performed *identically* on 100 EUR

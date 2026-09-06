@@ -382,7 +382,7 @@ and x264 `-qp 0` by 43% at q=100, and both win by decorrelating against the neig
 the scale. Whether that transfers here is **untested, not refuted** — it cannot be measured until
 this reconstructs.
 
-### LOSSLESS-1 — prediction-based lossless path (**compression gate PASSED 2026-09-06**, P1)
+### LOSSLESS-1 — prediction-based lossless path (**both gates PASSED 2026-09-06**, P1)
 GNC is 27% behind FFV1 and 43% behind x264 `-qp 0` at q=100, and both win the same way: a
 per-pixel median predictor whose error is entropy-coded **directly**, with no transform. GNC's own
 block intra prediction was fixed and measured (BUG-13) and costs **4-8%** at lossless — but it
@@ -410,8 +410,24 @@ modelling and adaptive Golomb that the model lacks. **10-26% available, plausibl
 per-pixel dependency, which is what this architecture exists to avoid. Escapes: tiles (already
 have them) and a wavefront within each tile (511 steps of up to 256 lanes for a 256px tile, versus
 65 536 serial). But a wavefront is a different parallelism profile from one-thread-per-coefficient,
-and "massively GPU-parallel" is the core claim. **Implement the MED decode wavefront and measure
-decode fps before committing to a second coding path.**
+and "massively GPU-parallel" is the core claim.
+
+**Throughput gate run and passed** (`tests/wavefront_cost.rs`). Identical arithmetic, the only
+difference being whether neighbours come from a separate buffer or from the output the workgroup is
+still writing. 1080p 4:4:4 padded, M1:
+
+| | per frame | fps |
+|---|---|---|
+| independent (1 thread/px) | 1.02 ms | 980 |
+| wavefront (511 diagonals, storageBarrier) | **4.98 ms** | **201** |
+
+**4.9x, and still 201 fps.** 25% of the 20 ms budget at 50 fps, ~15% of GNC's current decode. The
+barrier type barely matters (4.79 vs 4.98 ms with the weaker barrier), so the cost is **occupancy,
+not synchronisation** — the short diagonals idle most of the workgroup.
+
+**Both gates are green. This is buildable.** Scope: a second coding path (MED predict + entropy
+code, no wavelet) selected at q=100, with the wavefront only on the decode side — encode-side MED
+is fully parallel at lossless because the encoder's reconstruction equals its input.
 
 ### BUG-14 — Huffman's stream mapping has BUG-11 (todo, P4)
 `huffman_encode.wgsl`, `huffman_decode.wgsl` and `huffman_histogram.wgsl` all carry the same

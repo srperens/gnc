@@ -6113,3 +6113,27 @@ smoothing helps more than the noise hurts. Two effects, opposite signs, and the 
 enough to flip the sign of the answer. The inconsistency across sequences is what gave it away:
 three numbers spanning 44 percentage points is not a ceiling, it is a broken instrument. The
 warning is in the script's docstring so the next person does not repeat it.
+
+### Session total, 2026-09-06 — measured against the morning's commit
+
+BD-rate on VMAF, matched quality, current HEAD against `90ae8b1` (both binaries built from a
+pinned checkout — see the note on measuring a shared working tree):
+
+| stills | | video (16 frames, ki=9) | |
+|---|---|---|---|
+| blue_sky_1080p | **−10.59%** | old_town | **−5.99%** |
+| touchdown_1080p | −5.07% | aerial | −4.87% |
+| kristensara_720p | −2.39% | | |
+| bbb_1080p | −2.09% | | |
+| **mean** | **−5.04%** | **mean** | **−5.43%** |
+
+What contributed: BUG-6 (5 wavelet levels, −2.3% mean), FMT-2/GP17 (Rice-coded stream-length
+tables, −0.5% to −7.6% depending on rate), TUNE-5 (P-frame quantiser scale, −3.3% at ki=9 and
+about −20% at ki=17). The three overlap — they all reduce rate — so the total is less than the sum.
+
+Not in these numbers, and more important than them: **BUG-7**, which had `GNC_DIAGNOSTICS=1`
+inflating files by 32% and invalidating every sequence measurement taken with it, including the
+ones MEAS-4's conclusion rested on.
+
+Three ideas measured and rejected today, all recorded above with numbers: the quantiser cascade,
+the hierarchical MV zero mask, and non-adaptive reference filtering.

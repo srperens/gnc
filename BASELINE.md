@@ -8,6 +8,14 @@ Mode: Spatial-only, Rice entropy, uniform subband weights. P-only by default sin
 that flag clobbered the motion-compensation reference and inflated files by 32%. Re-measure
 anything quoted from a diagnostics-enabled run.
 
+## Session of 2026-09-06, against the morning's commit (90ae8b1)
+
+BD-rate on VMAF at matched quality, both binaries built from pinned checkouts:
+
+| stills | mean **−5.04%** | blue_sky −10.59%, touchdown −5.07%, kristensara −2.39%, bbb −2.09% |
+|---|---|---|
+| video | mean **−5.43%** | old_town −5.99%, aerial −4.87% |
+
 ## Single-Frame (bbb_1080p, Rice, 4:4:4)
 
 Re-measured 2026-09-06 after BUG-6 made 5 wavelet levels the default at q ≥ 25 (no upper cutoff

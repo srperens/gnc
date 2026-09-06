@@ -399,6 +399,12 @@ enum Command {
         output: String,
     },
 
+    /// List every GPU wgpu can see, with its backend and device type.
+    ///
+    /// Names printed here are what `GNC_GPU_ADAPTER` matches against (substring,
+    /// case-insensitive), so this is the first command to run on a new machine.
+    GpuInfo,
+
     /// Run encode-decode benchmark on an image
     Benchmark {
         /// Input image file
@@ -1069,6 +1075,22 @@ fn main() {
                 compressed.info.bit_depth,
             );
             println!("Decoded to {}", output);
+        }
+
+        Command::GpuInfo => {
+            let adapters = gnc::list_adapters();
+            if adapters.is_empty() {
+                println!("No GPU adapters found.");
+            } else {
+                println!("{} adapter(s):", adapters.len());
+                for info in &adapters {
+                    println!("  {}", gnc::describe_adapter(info));
+                }
+                println!(
+                    "\nSelect one with GNC_GPU_ADAPTER=<substring of the name>, \
+                     a backend with GNC_GPU_BACKEND=vulkan|dx12|metal|gl."
+                );
+            }
         }
 
         Command::Benchmark {

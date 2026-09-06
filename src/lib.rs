@@ -1020,6 +1020,150 @@ pub fn decode_order(frames: &[CompressedFrame]) -> Vec<usize> {
     order
 }
 
+/// One line describing an adapter: name, backend and what kind of device it is.
+pub fn describe_adapter(info: &wgpu::AdapterInfo) -> String {
+    format!("{} [{:?}, {:?}]", info.name, info.backend, info.device_type)
+}
+
+/// Every adapter wgpu can see, across every backend. Used by the `gpu-info`
+/// subcommand and by `scripts/gpu_tier_bench.py` to discover what a machine has
+/// before it measures anything on it.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn list_adapters() -> Vec<wgpu::AdapterInfo> {
+    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::all(),
+        ..Default::default()
+    });
+    instance
+        .enumerate_adapters(wgpu::Backends::all())
+        .iter()
+        .map(|a| a.get_info())
+        .collect()
+}
+
+// ---- GPU selection from the environment (CANARY-1) ----
+//
+// CANARY-1 needs one binary pointed at each GPU in a machine in turn: if encode time
+// does not move between an integrated and a discrete GPU, the pipeline is not running
+// where we think it is. wgpu's `HighPerformance` preference always picks the discrete
+// one, so without an override only half the comparison is reachable.
+//
+//   GNC_GPU_BACKEND=vulkan|dx12|metal|gl   restrict the instance to one backend
+//   GNC_GPU_ADAPTER=<substring>            first adapter whose name contains it (case-insensitive)
+//   GNC_GPU_POWER=high|low                 power preference, when no adapter name is given
+//   GNC_GPU_INFO=1                         print the adapter actually in use to stderr
+//
+// A `GNC_GPU_ADAPTER` that matches nothing is a hard error listing what is present.
+// Falling back to the default adapter would file a measurement of one GPU under the
+// name of another — the silent-feature failure the quality rules exist to catch.
+
+#[cfg(not(target_arch = "wasm32"))]
+fn env_backends() -> Result<wgpu::Backends, String> {
+    let Ok(raw) = std::env::var("GNC_GPU_BACKEND") else {
+        return Ok(wgpu::Backends::all());
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "all" => Ok(wgpu::Backends::all()),
+        "vulkan" | "vk" => Ok(wgpu::Backends::VULKAN),
+        "dx12" | "d3d12" | "directx12" => Ok(wgpu::Backends::DX12),
+        "metal" | "mtl" => Ok(wgpu::Backends::METAL),
+        "gl" | "opengl" | "gles" => Ok(wgpu::Backends::GL),
+        other => Err(format!(
+            "GNC_GPU_BACKEND=\"{other}\" is not a backend. Use vulkan, dx12, metal, gl or all."
+        )),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn env_power_preference() -> Result<wgpu::PowerPreference, String> {
+    let Ok(raw) = std::env::var("GNC_GPU_POWER") else {
+        return Ok(wgpu::PowerPreference::HighPerformance);
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "high" | "discrete" => Ok(wgpu::PowerPreference::HighPerformance),
+        "low" | "integrated" => Ok(wgpu::PowerPreference::LowPower),
+        other => Err(format!(
+            "GNC_GPU_POWER=\"{other}\" is not a preference. Use high or low."
+        )),
+    }
+}
+
+/// The adapter named by `GNC_GPU_ADAPTER`, or `None` when the variable is unset.
+#[cfg(not(target_arch = "wasm32"))]
+fn adapter_from_env(
+    instance: &wgpu::Instance,
+    backends: wgpu::Backends,
+) -> Result<Option<wgpu::Adapter>, String> {
+    let Ok(wanted) = std::env::var("GNC_GPU_ADAPTER") else {
+        return Ok(None);
+    };
+    let wanted = wanted.trim().to_ascii_lowercase();
+    if wanted.is_empty() {
+        return Ok(None);
+    }
+
+    let available = instance.enumerate_adapters(backends);
+    let found = available
+        .into_iter()
+        .find(|a| a.get_info().name.to_ascii_lowercase().contains(&wanted));
+
+    found.map(Some).ok_or_else(|| {
+        let present: Vec<String> = instance
+            .enumerate_adapters(backends)
+            .iter()
+            .map(|a| describe_adapter(&a.get_info()))
+            .collect();
+        format!(
+            "GNC_GPU_ADAPTER=\"{wanted}\" matched no adapter. Present: {}",
+            if present.is_empty() {
+                "none".to_string()
+            } else {
+                present.join("; ")
+            }
+        )
+    })
+}
+
+/// No adapter enumeration on the web: the browser exposes exactly one device and
+/// chooses it itself. Present so callers compile identically on both targets.
+#[cfg(target_arch = "wasm32")]
+pub fn list_adapters() -> Vec<wgpu::AdapterInfo> {
+    Vec::new()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn env_backends() -> Result<wgpu::Backends, String> {
+    Ok(wgpu::Backends::all())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn env_power_preference() -> Result<wgpu::PowerPreference, String> {
+    Ok(wgpu::PowerPreference::HighPerformance)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn adapter_from_env(
+    _instance: &wgpu::Instance,
+    _backends: wgpu::Backends,
+) -> Result<Option<wgpu::Adapter>, String> {
+    Ok(None)
+}
+
+/// Canary for the selection above: says which GPU the run actually used, so a tier
+/// comparison cannot silently be two runs on the same device.
+#[cfg(not(target_arch = "wasm32"))]
+fn report_adapter(info: &wgpu::AdapterInfo) {
+    let asked = ["GNC_GPU_ADAPTER", "GNC_GPU_BACKEND", "GNC_GPU_POWER"]
+        .iter()
+        .any(|k| std::env::var(k).is_ok());
+    if asked || std::env::var("GNC_GPU_INFO").is_ok() {
+        eprintln!("[gpu] {}", describe_adapter(info));
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn report_adapter(_info: &wgpu::AdapterInfo) {}
+
 /// GPU context shared across encoder/decoder
 pub struct GpuContext {
     pub instance: wgpu::Instance,
@@ -1051,25 +1195,31 @@ impl GpuContext {
 
     /// Fallible version of `new_async()`. Returns an error string if GPU is unavailable.
     pub async fn try_new_async() -> Result<Self, String> {
+        let backends = env_backends()?;
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::all(),
+            backends,
             ..Default::default()
         });
 
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: None,
-                force_fallback_adapter: false,
-            })
-            .await
-            .ok_or_else(|| {
-                "No suitable GPU adapter found. WebGPU may be unavailable or all adapters \
-                 are blocklisted by your browser. Try enabling chrome://flags/#enable-unsafe-webgpu"
-                    .to_string()
-            })?;
+        let adapter = match adapter_from_env(&instance, backends)? {
+            Some(adapter) => adapter,
+            None => instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: env_power_preference()?,
+                    compatible_surface: None,
+                    force_fallback_adapter: false,
+                })
+                .await
+                .ok_or_else(|| {
+                    "No suitable GPU adapter found. WebGPU may be unavailable or all adapters \
+                     are blocklisted by your browser. Try enabling chrome://flags/#enable-unsafe-webgpu"
+                        .to_string()
+                })?,
+        };
 
-        log::info!("Using GPU: {}", adapter.get_info().name);
+        let info = adapter.get_info();
+        log::info!("Using GPU: {}", describe_adapter(&info));
+        report_adapter(&info);
 
         let (device, queue) = adapter
             .request_device(

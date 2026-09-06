@@ -679,6 +679,12 @@ M1, so there is real headroom — but it is far from linear, and the published m
 literature agrees: concurrency converts *idle* GPU into *useful* GPU, it does not create GPU.
 NVIDIA's own consolidation study measured time-slicing at 0.76 req/s where MIG gave 1.00.
 
+**Harness built 2026-09-06, not yet run.** `scripts/gpu_tier_bench.py --density` and `--hwenc`
+sweep concurrent instances of GNC and of the machine's fixed-function encoder over the same clip.
+Two things to know before reading its NVENC rows: the 12-session cap is a GeForce driver
+restriction and will not appear on a professional Ada part, and the rows are **not
+quality-matched** — `meas1_vs_h264.py` is the harness for that.
+
 **Still to do:** the same measurement on a discrete NVIDIA card, head to head against NVENC at
 both P1 and P7 presets (P7 is nearer GNC's quality target and roughly 4x easier to win), and on an
 H100 where the NVENC column is a zero.
@@ -723,6 +729,13 @@ the pipeline processes whole frames, so the practical floor is one full frame re
 size.
 
 ### CANARY-1 — Encode time must move across GPU tiers (todo, P1)
+
+**Harness built 2026-09-06, not yet run.** `scripts/gpu_tier_bench.py --tier` measures the
+single-frame encode/decode loop on every GPU a machine exposes, best of N processes, and says in
+plain words when the spread is under 15% — the failure signal. Needs a machine with more than one
+GPU; a laptop with an integrated and a discrete GPU is the cheapest version of the experiment.
+`docs/GPU_TIER_TEST.md` states what it proves and what it does not.
+
 BeHardware's 2011 study found the shipping GPU H.264 encoders performed *identically* on 100 EUR
 and 330 EUR cards, because they were never compute-bound at all — the GPU was doing far less than
 the marketing implied. That is exactly the silent-feature failure CLAUDE.md's quality rules exist

@@ -3060,14 +3060,27 @@ impl EncoderPipeline {
         res_config.subband_weights = uniform_weights;
         res_config.dead_zone = res_dead_zone;
 
-        // P-frames are quantised at the same step as intra, which H.264 does not do: x264 runs
-        // its P-frames about 4 QP steps coarser (~1.6x) and its B-frames coarser still. GNC's
-        // pyramid has scales for layers 2 and 3 but nothing for P, so this exposes one.
-        // Measured: see RESEARCH_LOG 2026-09-05.
+        // P-frames are quantised 1.25x coarser than intra. Every mature codec does something
+        // like this — x264 runs P about 4 QP steps coarser (~1.6x) — because the I-frame is
+        // referenced by every P that follows, so bits spent there are reused and bits spent on
+        // a P frame are not.
+        //
+        // Measured on VMAF BD-rate against 1.0 at ki=9: blue_sky -0.6%, aerial -0.5%,
+        // bbb17 -5.3%, old_town -6.8% (mean -3.3%, better on all four). 1.5 gains nothing more
+        // on average and costs +2.9% on blue_sky, so 1.25 is the pick. The win grows with GOP
+        // length, as it should when there are more P-frames to spread: at ki=17 on old_town,
+        // 1.25 reaches the same VMAF as 1.0 at 0.65 bpp against 0.82, about -20%.
+        //
+        // This reverses the 2026-09-05 entry that rejected the lever as "worse than lowering q
+        // uniformly; VMAF min falls 94→71 as reference error propagates". That collapse does not
+        // reproduce. Measured mean-vs-min spread on old_town at ki=17, q=35: 3.32 VMAF points at
+        // 1.0 and 2.75 at 1.25 — the spread *narrows*, and it still narrows at 1.6. The
+        // propagation concern was the right thing to check and it is why min is quoted here, but
+        // the effect is not there.
         let p_qp_scale: f32 = std::env::var("GNC_P_QP_SCALE")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(1.0);
+            .unwrap_or(1.25);
         // The decoder dequantises from the stored config, so both must use this value.
         let res_qstep = (config.quantization_step * p_qp_scale).min(64.0);
         res_config.quantization_step = res_qstep;

@@ -1,8 +1,12 @@
 # GNC Benchmark Baseline
 
 Last updated: 2026-09-06 (compression columns; fps columns are older — see below)
-Baseline commit: (FMT-2 — GP17 Rice-coded stream-length tables, on top of BUG-6)
+Baseline commit: (TUNE-5 — P-frame quantiser scale 1.25, on top of BUG-7/FMT-2/BUG-6)
 Mode: Spatial-only, Rice entropy, uniform subband weights. P-only by default since BUG-5.
+
+**Sequence numbers taken before 2026-09-06 with `GNC_DIAGNOSTICS=1` are not valid** — see BUG-7:
+that flag clobbered the motion-compensation reference and inflated files by 32%. Re-measure
+anything quoted from a diagnostics-enabled run.
 
 ## Single-Frame (bbb_1080p, Rice, 4:4:4)
 

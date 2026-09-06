@@ -34,18 +34,21 @@ MEAS-4 is designed to answer that before anything gets built. Until then the pri
 3. Toggle features to identify dead weight and incorrect implementations
 4. Let measurements drive the next action
 
-MEAS-4 (2026-09-05) was read as establishing that the inter gap is **not** in the coding model.
-**BUG-7 (2026-09-06) withdraws that.** MEAS-4's residual dumps were taken with
-`GNC_DIAGNOSTICS=1`, which clobbered the motion-compensation reference from the third frame of
-every sequence onward, so the residuals it analysed were about 6x larger than the encoder's real
-ones. MEAS-4 is reopened; its conclusion should not be relied on.
+MEAS-4's residual dumps were taken with `GNC_DIAGNOSTICS=1`, which BUG-7 (2026-09-06) shows
+clobbered the motion-compensation reference from the third frame of every sequence onward. **It has
+been re-run on clean dumps and its conclusion holds**: the coding model is not the gap (a
+DCT-plus-oracle-skip rival is +5.7% worse), the motion search is not the gap (GNC beats a
+full-search oracle by 6%), and context modelling has a 10.4% ceiling. What the corruption did
+invalidate is claims about the residual's absolute size, which were about 6x too large.
 
-That matters for what came after. The follow-up hunt for where the gap *is* returned four negative
-results in a row — multi-reference P-frames, the sub-pel interpolation filter, motion-search
-quality, and MCTF — and **every one of them was chosen because MEAS-4 pointed at prediction.** A
-run of negatives against a hypothesis is weak evidence the hypothesis was wrong; there is now a
-concrete reason to think it was never properly tested. Whether the gap is in prediction or in the
-coding model is an open question again.
+The honest inter numbers are also better than this list carried: **inter saves 33-73%**, not
+17-27%. x264 saves 86-89%, so the gap is real, but it is not the near-total failure the corrupted
+diagnostics implied.
+
+With the model, the search and the entropy ceiling all ruled out, what is left is what a mature
+encoder does that GNC does not. The first item off that list paid: **TUNE-5** found that GNC spent
+the same bits on a P-frame as on an I-frame, and separating them is −3.3% BD-rate at ki=9 and about
+−20% at ki=17.
 
 Separately, the old premise had already failed inspection: the "GNC saves 38.5% vs x264's 86.9%"
 figure compares GNC's RGB PSNR against x264's YUV PSNR, which are not the same quantity.
@@ -555,24 +558,71 @@ I-frames") rather than a bug, so it was recorded as a finding. And it was perfec
 which read as evidence it was real — reproducibility separates a bug from noise, not a codec
 property from an instrumentation artefact.
 
-### MEAS-4 — Inter-model gap decomposition (**REOPENED 2026-09-06** — measured on corrupted data)
-Previously closed 2026-09-05 with the conclusion "the inter gap is in prediction quality, not the
-coding model". That conclusion rests on residual dumps taken with
-`GNC_DUMP_RESIDUAL=<dir> GNC_DIAGNOSTICS=1`, and BUG-7 shows those dumps had a clobbered MC
-reference from the third frame of every sequence onward. The residuals analysed were therefore
-much larger than the encoder's real ones (14.7 vs 2.5 mean-abs on blue_sky q=50) — which is
-precisely the signal that pointed at prediction.
+### MEAS-4 — Inter-model gap decomposition (**RE-RUN AND CLOSED 2026-09-06** on clean data)
+Reopened because its residual dumps were taken with `GNC_DIAGNOSTICS=1` (BUG-7), which clobbered
+the MC reference from the third frame of every sequence onward. Re-dumped with the diagnostic
+gated off — **verified bitstream-neutral first**: the dump run and a quiet run produce
+byte-identical files.
 
-**This matters beyond MEAS-4.** Four subsequent experiments were chosen *because* MEAS-4 pointed at
-prediction, and all four came back negative: multi-reference P-frames (#25, withdrawn), the sub-pel
-interpolation filter, motion-search quality, and MCTF (rejected 2026-09-06). A run of negatives
-against a hypothesis is weak evidence the hypothesis was wrong; here there is now a concrete reason
-to think the hypothesis was never properly tested.
+**The conclusion survives.** 4b (blue_sky, q=50, at the wavelet's operating point): wavelet
+2.1528 bpp vs DCT-plus-oracle-skip 2.0291 — **the rival model is +5.7% worse**. 4c: context
+modelling could recover at most **10.4%** of coefficient bits. `meas_me_quality.py` on clean
+dumps: the offline full-search oracle is **6.0% worse on SATD** than GNC's shipped search
+(previously reported 20.8% — the margin shrank by two thirds, the direction held).
 
-**To redo:** re-dump residuals with `GNC_DIAG_TWAV` unset (or dump without diagnostics at all —
-the dump hook should not need the temporal-wavelet staging), then re-run `scripts/meas4_oracle.py`
-and `scripts/meas_me_quality.py`. State explicitly which frames each dump covers. Do not re-derive
-any conclusion from the old dumps.
+**Why it survived a corrupted input:** 4b and 4c are ratios between two models simulated on the
+*same* residual, so a corrupted residual moves both arms together and largely cancels. What the
+corruption did invalidate is every claim about the residual's **absolute** size — "the prediction
+is leaving error nearly everywhere" rested on magnitudes about 6x too large.
+
+**Honest inter numbers** (diagnostics off, all-I vs I+P, 8 frames): blue_sky saves 38.3% / 37.4% /
+33.0% at q=30/50/75; bbb17 saves 72.7% / 65.4% / 49.9%. **Inter saves 33-73%**, not the 17-27%
+this backlog carried. x264 saves 86-89% on comparable content — the gap is real, but not the
+near-total failure the corrupted diagnostics implied.
+
+**What clean data rules out, all at once:** the coding model, the motion search, and context
+modelling. None is the multiple-x deficit. What is left is what a mature encoder does that GNC does
+not — starting with rate allocation, see TUNE-5.
+
+### TUNE-5 — P-frames were quantised as finely as I-frames (**DONE 2026-09-06**)
+`GNC_P_QP_SCALE` defaulted to 1.0: identical quantiser step for intra and predicted frames. Every
+mature codec separates them (x264 runs P about 4 QP steps coarser, ~1.6x) because the I-frame is
+referenced by every P that follows, so bits spent there are reused and bits spent on a P frame are
+not. **Default is now 1.25**; the env var still overrides.
+
+VMAF BD-rate against 1.0, ki=9:
+
+| sequence | 1.15 | 1.25 | 1.5 |
+|---|---|---|---|
+| blue_sky | — | **−0.59%** | +2.93% |
+| aerial | −0.63% | **−0.51%** | −2.36% |
+| bbb17 | — | **−5.27%** | −8.11% |
+| old_town | −6.00% | **−6.77%** | −6.39% |
+| mean | −3.32% | **−3.29%** | −3.48% |
+
+1.25 is better on all four. 1.5 gains nothing more on average and regresses blue_sky, so 1.25 is
+the pick. **The win grows with GOP length** — on old_town at ki=17, 1.25 reaches the same VMAF as
+1.0 at 0.65 bpp against ~0.82, about **−20%**.
+
+**This reverses the 2026-09-05 rejection** ("worse than lowering q uniformly; VMAF min falls 94→71
+as reference error propagates"). That was the right thing to check — coarser P degrades the
+reference each P predicts from, and a mean hides a collapsing tail. It does not reproduce.
+Mean-vs-min spread on old_town at ki=17, q=35: 3.32 VMAF points at 1.0, 2.75 at 1.25 — the spread
+*narrows*, and still narrows at 1.6. Decisive test at matched **rate** rather than matched q:
+
+| | bpp | VMAF mean | VMAF min |
+|---|---|---|---|
+| scale 1.0, q=28 | 0.66 | 82.00 | 78.14 |
+| **scale 1.25, q=35** | **0.65** | **84.07** | **81.32** |
+
+At the same bitrate the coarser-P encode is **+2.07 VMAF mean and +3.18 VMAF min** — the worst
+frame is better, not worse. A plausible explanation for 94→71 is that it was measured with
+`GNC_DIAGNOSTICS=1`, which BUG-7 shows destroys P-frame prediction from the third frame onward:
+exactly the frames where a propagation argument would look confirmed.
+
+**Flagged:** per-frame PSNR now declines across a GOP (blue_sky q=50: 41.3 → 35.8 dB, was
+41.3 → 38.3). That decline is real, and is what a lower-rate operating point looks like; at matched
+rate the floor is higher. PSNR and VMAF disagree in sign here, and VMAF is primary.
 
 ### FMT-2 — Stream-length tables cost more than the coefficients they describe (**DONE 2026-09-06**, GP17)
 Each tile carries a 256-entry table of entropy-stream lengths — the price of 256 independent
@@ -769,7 +819,7 @@ Each toggle: report bpp + VMAF delta. Goal: identify dead weight and negative fe
 Run rd-curve (q=25–90) on crowd_run and park_joy with 4:4:4, measure VMAF at each point.
 Current rd-curve lacks --chroma-format and --vmaf on sequences. A benchmark loop may suffice.
 
-### MEAS-4 — Inter-model gap decomposition (**SUPERSEDED — see REOPENED entry above; these results came from corrupted dumps, BUG-7**)
+### MEAS-4 — Inter-model gap decomposition (**SUPERSEDED — original run, on dumps corrupted by BUG-7. See the re-run above.**)
 **Answer: the inter gap is prediction quality, not the coding model.** Full method, numbers and
 caveats in [docs/decisions/0005-meas4-inter-gap-decomposition.md](docs/decisions/0005-meas4-inter-gap-decomposition.md).
 

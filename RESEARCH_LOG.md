@@ -5945,3 +5945,103 @@ The second is that the anomaly was reproducible, which read as evidence that it 
 reproducible because the corruption is deterministic. Reproducibility distinguishes a bug from
 noise; it does not distinguish a codec property from an instrumentation artefact. The check that
 does is the one now in the test: does observing change the observation?
+
+---
+
+## 2026-09-06 — MEAS-4 re-run on clean data, and the I/P rate split that was rejected on a number that does not reproduce
+
+### MEAS-4, re-measured
+
+BUG-7 forced this: MEAS-4's residual dumps had a clobbered MC reference from the third frame on.
+Re-dumped with the diagnostic gated off (**verified bitstream-neutral first** — the dump run and a
+quiet run produce byte-identical files, 2,808,848 both), then re-ran the same scripts on blue_sky,
+8 frames, q=50.
+
+**4b — model vs model at matched distortion.** At the wavelet's operating point (qstep 8,
+MSE 5.33): wavelet 2.1528 bpp, DCT-plus-oracle-skip 2.0291 bpp interpolated — **the rival model is
++5.7% worse**. Oracle-skippable 16x16 blocks: 4.9% at qstep 4, 20.0% at qstep 8.
+
+**4c — entropy context ceiling.** Context-free 4.0747 bpp, one-neighbour context 3.6525 bpp:
+context modelling could recover at most **10.4%** of coefficient bits.
+
+**The old conclusion survives**, and for a reason worth writing down: 4b and 4c are *ratios between
+two models simulated on the same residual*, so a corrupted residual moves both arms together and
+largely cancels. What the corruption did invalidate is every claim about the residual's **absolute**
+size — "the prediction is leaving error nearly everywhere" was resting on residual magnitudes that
+were about 6x too large.
+
+**Motion search, re-measured.** `meas_me_quality.py` on the clean dump: the offline oracle
+(+/-32 full integer search plus bilinear quarter-pel, 16x16) is **6.0% worse on SATD** and 3.2%
+worse on estimated bits than GNC's shipped search. Previously reported as 20.8% worse — the
+margin shrank by two thirds on clean data, but the direction holds. GNC's motion search is not the
+deficiency.
+
+### The honest inter numbers
+
+With diagnostics off, all-I against I+P on the same 8 frames:
+
+| sequence | q=30 | q=50 | q=75 |
+|---|---|---|---|
+| blue_sky | 38.3% | 37.4% | 33.0% |
+| bbb17 | 72.7% | 65.4% | 49.9% |
+
+**Inter saves 33-73%**, not the 17-27% carried in the backlog. x264 saves 86-89% on comparable
+content, so the gap is real; it is not the near-total failure the corrupted diagnostics implied.
+
+### Where that left the search
+
+Clean data rules out three things at once: the coding model (wavelet beats DCT+skip by 5.7%),
+the motion search (beats a full-search oracle by 6%), and context modelling (10.4% ceiling). None
+of those is the multiple-x deficit. What is left is what a mature encoder does that GNC does not,
+and the cheapest item on that list turned out to be rate allocation.
+
+### GNC spent the same number of bits on a P-frame as on an I-frame
+
+`GNC_P_QP_SCALE` defaulted to 1.0: identical quantiser step for intra and predicted frames. Every
+mature codec separates them — x264 runs P about 4 QP steps coarser, roughly 1.6x — because the
+I-frame is referenced by every P that follows it, so bits spent there are reused and bits spent on
+a P frame are not.
+
+VMAF BD-rate against 1.0, four sequences, ki=9:
+
+| sequence | 1.15 | 1.25 | 1.5 |
+|---|---|---|---|
+| blue_sky | — | **−0.59%** | +2.93% |
+| aerial | −0.63% | **−0.51%** | −2.36% |
+| bbb17 | — | **−5.27%** | −8.11% |
+| old_town | −6.00% | **−6.77%** | −6.39% |
+| mean | −3.32% | **−3.29%** | −3.48% |
+
+1.25 is better on all four. 1.5 gains nothing more on average and costs +2.9% on blue_sky, so 1.25
+is the pick — same mean, no regression anywhere.
+
+The win grows with GOP length, as it must when there are more P-frames to spread the saving over.
+On old_town at ki=17, q=35: 1.25 reaches 84.07 mean VMAF at 0.65 bpp where 1.0 needs about
+0.82 bpp for the same quality — roughly **−20%**.
+
+### The finding this reverses, and why it was worth checking
+
+The 2026-09-05 sweep rejected this lever: *"worse than lowering q uniformly; VMAF min falls 94→71
+as reference error propagates."* That is exactly the right thing to worry about — coarser P-frames
+degrade the reference each P-frame predicts from, and a mean hides a collapsing tail completely.
+It is why min is quoted throughout here.
+
+**The collapse does not reproduce.** Mean-vs-min spread on old_town at ki=17, q=35: 3.32 VMAF
+points at 1.0, 2.75 at 1.25 — the spread *narrows*. It still narrows at 1.6. And the decisive test,
+matched **rate** rather than matched q, on old_town at ki=17:
+
+| | bpp | VMAF mean | VMAF min |
+|---|---|---|---|
+| scale 1.0, q=28 | 0.66 | 82.00 | 78.14 |
+| **scale 1.25, q=35** | **0.65** | **84.07** | **81.32** |
+
+At the same bitrate the coarser-P encode is **+2.07 VMAF mean and +3.18 VMAF min**. The worst
+frame is better, not worse. Whatever produced 94→71 was not this lever at this setting on this
+content — a plausible candidate is that it was measured with `GNC_DIAGNOSTICS=1`, which BUG-7
+shows destroys P-frame prediction from the third frame onward, exactly the frames where a
+propagation argument would look confirmed.
+
+Per-frame PSNR does decline across a GOP now — blue_sky at q=50 runs 41.3 → 35.8 dB where it was
+41.3 → 38.3 — and that decline is real. It is also what moving to a lower-rate operating point
+looks like: at matched rate the floor is higher. Worth flagging because PSNR and VMAF disagree in
+sign here, and VMAF is the primary metric for the stated reason.

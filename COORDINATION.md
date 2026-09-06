@@ -59,7 +59,6 @@ the shared checkout** — no absolute paths, no session ids.
 |---|---|---|
 | `../gnc-abac`, `.claude/worktrees/abac` (`abac-gate`) | `abac` | **released — question answered, see BACKLOG Part 6.** The idle-machine bench is run. Range at cb=64 costs **1.69× frame decode for −16.7% rate** at q=90; Interval costs 3.99×. Rice's own entropy stage is 47% of frame decode, which caps any entropy work at 1.9×. What remains is a positioning call, not an engineering one. |
 | `../gnc-abac` | `abac` | same worktree, now on **BUG-8** — the encoder's local decode diverges from the real decoder down a GOP. |
-| `../gnc-gputier` | `gputier` | **harness only, no measurement yet.** CANARY-1 + MEAS-5 on a machine with more than one GPU. Adds env-driven GPU selection (`GNC_GPU_ADAPTER`, `GNC_GPU_BACKEND`, `GNC_GPU_POWER`), a `gpu-info` subcommand, `scripts/gpu_tier_bench.py` and `docs/GPU_TIER_TEST.md`. Encoder output unchanged — q=75 still 44.84 dB / 4.53 bpp. Waiting on a Windows laptop (Intel iGPU + RTX 2000 Ada) to run it. |
 
 ## Timing: an idle machine is necessary and NOT sufficient (added 2026-09-06, after an idle run still lied)
 
@@ -131,6 +130,15 @@ the option that spends more bits. Use BD-rate, or compare at matched rate. At le
 wrong conclusions have come from this one error.
 
 ## Landed today, and what each one invalidates
+
+- **GPU selection from the environment, and a tier/density harness — invalidates nothing.**
+  `GNC_GPU_ADAPTER` (name substring), `GNC_GPU_BACKEND`, `GNC_GPU_POWER` and `GNC_GPU_INFO` choose
+  the device at context creation; `gnc gpu-info` lists what wgpu can see. Encoder output is
+  unchanged and verified so — q=75 on bbb_1080p is still 44.84 dB / 4.53 bpp, matching BASELINE.
+  A `GNC_GPU_ADAPTER` that matches nothing is a hard error rather than a silent fallback, so a
+  tier comparison cannot quietly be two runs on the same card. **Nothing is measured yet**:
+  `scripts/gpu_tier_bench.py` and `docs/GPU_TIER_TEST.md` are waiting on a machine with more than
+  one GPU. Do not quote a throughput number from this repo until that has run.
 
 - **CHROMA-1 — `chroma_weight` now stays at 1.2 above q=85 instead of dropping to 1.0.**
   Changes default output at **q ≥ 85 only**: BASELINE's q=90 row moves 50.41 → 50.06 dB and

@@ -1,91 +1,136 @@
 # Coordination between concurrent Claude sessions
 
-**Five Claude sessions work on this repository. Do not work in the shared checkout directly.
-Your first action in a session is to move into your own git worktree.**
+**Eight Claude sessions work on this repository at the same time.** They share one `.git`, one
+GPU and one test-material directory, and nothing else. Every rule below exists because it has
+already been broken and cost a retracted result or lost work.
 
-Sharing one working directory does not work, and we have the scars: a published BD-rate figure had
-to be retracted because the tree changed mid-experiment, a measurement premise was invalidated
-under a running sweep, one session nearly deleted another's in-flight code, and on 2026-09-06 two
-sessions' edits to `abac.rs` and `gpu_util.rs` overwrote each other and were lost outright.
+**There is exactly one lock, and it is `scripts/claim`.** Every other record of who is doing
+what — the worktree table further down, BACKLOG's `(in progress)` markers, a sentence in
+RESEARCH_LOG — is documentation written *after* the claim succeeded. None of them excludes
+anyone. If you are deciding what to work on by reading prose, you are about to collide with
+another session: reading, deciding and writing your row are three separate steps, and eight
+sessions that start together all read "free" before any of them writes.
 
-## Rule 0 — start here, every session
+## Start of session — four commands, in this order, no exceptions
 
 ```bash
-# Derive the paths, never type them — see CLAUDE.md, "Never commit secrets or local
-# infrastructure detail". Pick a short name for the *area*, not for the session.
+# 1. Your own worktree. The shared checkout is for reading, coordination and merging, never
+#    for working: two sessions in one directory is how one committed the other's uncommitted
+#    work on 2026-09-07, and how the abac.rs and gpu_util.rs edits were lost on 2026-09-06.
+#    Derive the paths, never type them (CLAUDE.md, "Never commit secrets or local
+#    infrastructure detail"). Name the AREA for the *work*, not for the session.
 REPO=$(git rev-parse --show-toplevel)
 AREA=<area>
 git -C "$REPO" worktree add -b "$AREA" "$REPO-$AREA" main
 cd "$REPO-$AREA"
 
-# Link the test material in. NEVER run this in the shared checkout, and never with -f:
-# `frames` there is itself a symlink to the real ~31 GB directory, and `ln -sfn` pointed it
-# at itself on 2026-09-06, breaking every session's measurements at once.
+# 2. Link the test material in. NEVER run this in the shared checkout, and never with -f:
+#    `frames` there is itself a symlink to the real ~31 GB directory, and `ln -sfn` pointed it
+#    at itself on 2026-09-06, breaking every session's measurements at once.
 [ "$PWD" != "$REPO" ] || { echo "refusing: you are in the shared checkout"; return 1 2>/dev/null || exit 1; }
 ln -s "$(readlink "$REPO/test_material/frames" || echo "$REPO/test_material/frames")" \
       test_material/frames
+
+# 3. Claim the worktree. Refuses if a live session already holds it; takes over automatically
+#    if that session is gone, which is the normal case, not an exception.
+scripts/claim worktree
+
+# 4. Claim your work. This picks the top free BACKLOG item AND claims it in one atomic step.
+scripts/claim next "why this item, briefly"
 ```
 
-## Rule 0b — claim the item atomically, before you touch it
+That is the whole start-of-session procedure. It is also enforced: `scripts/claim` refuses to
+hand you work from the shared checkout, and refuses to hand you work in a worktree you do not
+hold. You cannot get to step 4 by skipping steps 1 and 3.
 
-**The table below is documentation. `scripts/claim` is the lock.** Eight instances now run
-against this one checkout, and reading the table, deciding, and writing your row are three
-separate steps — so sessions that start together all read "free" before any of them writes. That
-is not a hypothetical: on 2026-09-07 several sessions picked MEAS-9 at the same time and a
-duplicate row had to be cleaned up by hand.
+## Why `next`, and not "read the backlog, pick, then claim"
+
+The MEAS-9 collision on 2026-09-07 was not bad luck. Every session applies the same rule — *the
+best value-to-effort open item* — to the same file, so every session gets the same answer, inside
+the same two minutes, before any of them can write a row. **Being deterministic is exactly what
+makes the collision reliable rather than unlikely.** An atomic claim on its own does not fix
+that: it just means seven sessions lose a round and go back to the same list.
+
+`scripts/claim next` closes the window by making the pick *be* the compare-and-swap. It walks
+BACKLOG's startable items in priority order and takes the first one nobody holds, so N sessions
+running it at the same instant get N *different* items, by construction. `scripts/claim selftest`
+asserts both halves: 16 processes racing for one item produce exactly one winner, and 6 processes
+racing on one queue produce 6 distinct claims.
+
+Use `scripts/claim take <ITEM> "<why>"` only when you have a specific reason to want *that* item
+— a bug you just found, a follow-up the previous item obliges you to do. For "what should I work
+on", use `next`.
+
+## The claim commands
 
 ```bash
-scripts/claim worktree                   # claim the worktree you are standing in (do this in rule 0)
-scripts/claim list                       # what is held, by whom, for how long
-scripts/claim take MEAS-9 "why, briefly" # atomic: exactly one session can win this
-scripts/claim touch MEAS-9               # heartbeat, so the age in `list` stays honest
-scripts/claim drop MEAS-9                # when you are done
+scripts/claim worktree                    # step 3 above; the precondition for everything else
+scripts/claim next "why, briefly"         # pick AND claim the top free item, atomically
+scripts/claim items                       # the startable queue, and which entries are free
+scripts/claim list                        # what is held, by whom, for how long
+scripts/claim take <ITEM> "why, briefly"  # claim one named item; non-zero means you lost the race
+scripts/claim touch <ITEM>                # heartbeat, so the age in `list` stays honest
+scripts/claim drop <ITEM>                 # when you are done — do this, or the item stays parked
+scripts/claim steal <ITEM> "why"          # take over from a session that is gone
+scripts/claim selftest                    # proves the exclusion rather than asserting it
 ```
 
-**Claim the worktree, not only the item.** A claim on an item does not stop a second session
-`cd`-ing into your directory, and that was the more damaging half of 2026-09-07: two sessions had
-cwd in `gnc-meas9`, both edited `scripts/meas9_contribution.py`, and one committed the other's
-uncommitted work. `scripts/claim worktree` refuses if a **live** other session holds it, and takes
-over automatically if the holder's session is gone — a finished session's worktree is free, that is
-the normal case and not an exception. The shared checkout is not claimable: it is shared on
-purpose.
+**What makes an item startable.** `next` and `items` read the committed `main:BACKLOG.md` — not
+your working copy, and not anyone else's — and treat a heading as a queue entry when it looks
+like `### NAME-<n> — title (todo, P<n>)`. That is the convention BACKLOG already uses. Finished
+items carry `**DONE**` / `**CLOSED**` / `**FIXED**` / `**REJECTED**` and no priority, so they
+drop out by construction; items in flight drop out because they are claimed. Two consequences
+worth knowing:
 
-Identity is `<worktree>@<branch>#s<pid>`, where the pid is the session's own `claude` process — the
-same number the peer sockets use. It has to be the session, not the directory: identity was
-`<worktree>@<branch>` for the first hour and two sessions in one worktree were therefore *the same
-principal*, so one's `touch` succeeded against the other's claim. The claim excluded every session
-except the one it needed to. The pid also makes an abandoned claim detectable rather than merely
-old — `list` marks it `SESSION GONE, safe to steal`.
+- **To put an idea into rotation**, give it an ID of the form `NAME-<n>` and a `(todo, P<n>)`
+  marker in its heading. An idea with no ID and no priority is invisible to `next` — that is why
+  `ARCH-1`, `EBCOT` part 2 and the numbered legacy entries are not offered.
+- **To take an item out of rotation without holding it as a session**, park it:
+  `scripts/claim take --as blocked-<reason> <ITEM> "why"`. `CANARY-1` and `MEAS-5` are parked
+  this way — both need a second GPU — so `next` skips them instead of handing out work nobody
+  can do.
 
-A refused `take` prints the current owner and exits non-zero, so it is safe in a script: if it
-fails, pick something else. **If it succeeds, the item is yours and no other session can take it.**
+**Identity is `<worktree>@<branch>#s<pid>`**, where the pid is the session's own `claude`
+process. It has to be the session, not the directory: identity was `<worktree>@<branch>` for the
+first hour and two sessions in one worktree were therefore *the same principal*, so one's `touch`
+succeeded against the other's claim — the lock excluded every session except the one it needed
+to. The pid also makes an abandoned claim detectable rather than merely old: `list` marks it
+`SESSION GONE, safe to steal`, and separately marks a live holder that has not touched in an hour
+`STALE, no heartbeat`. Those need different actions — steal the first, ask about the second.
 
-Why this is atomic and needs no new infrastructure: every worktree shares one `.git`, so
-`refs/claims/*` is visible to all of them the instant it is written — no fetch, no daemon, no lock
-file in the working tree — and `git update-ref <ref> <new> <old>` is a compare-and-swap under
-git's own ref lock, where an empty `<old>` means "must not exist". `scripts/claim selftest` races
-16 processes for one claim and asserts exactly one wins; run it if you doubt it.
+**Why this is atomic and needs no new infrastructure:** every worktree shares one `.git`, so
+`refs/claims/*` is visible to all of them the instant it is written — no fetch, no daemon, no
+lock file in the working tree — and `git update-ref <ref> <new> <old>` is a compare-and-swap
+under git's own ref lock, where an empty `<old>` means "must not exist". Claims are metadata
+blobs, so `git cat-file -p refs/claims/MEAS-9` shows the owner, the time and the commit it was
+taken against. Nothing is pushed; the contention is local to this machine. See
+[docs/decisions/0016-claiming-an-item-is-a-ref-cas-not-a-table-row.md](docs/decisions/0016-claiming-an-item-is-a-ref-cas-not-a-table-row.md).
 
-Claims are metadata blobs — `git cat-file -p refs/claims/MEAS-9` shows the owner, the time and the
-commit it was taken against. Nothing is pushed; the contention is local to this machine.
+**Do not leave a claim held for hours without a `touch`, and drop it when you are done.** A
+parked item is invisible to `next`, so an abandoned claim removes work from seven other sessions.
 
-**If a session is gone and its claim is not:** `scripts/claim steal <ITEM> "<why>"`. It demands a
-reason, records who it was taken from, and is itself a compare-and-swap, so two sessions stealing
-at once cannot both win. Do not steal a claim whose age is minutes; do not leave one held for
-hours without a `touch`.
+**Decision-record numbers are a shared resource too, and they collided the same way.** `main`
+currently carries **two** files numbered `0018` — `0018-gnc-is-broad-on-purpose.md` and
+`0018-the-entropy-coders-are-level-and-0015s-prediction-was-wrong.md` — plus an 0020 that had to
+be renumbered from 0018 by hand. Same mechanism as the MEAS-9 collision: two sessions read
+`ls docs/decisions/`, both computed "next is 0018", and neither could see the other. The lock
+already handles this — **reserve the number before you write the file**:
 
-Then add your row to the table below, for the prose the ref cannot carry.
+```bash
+scripts/claim take dr-0019 "the pick is the lock"   # non-zero: someone has it, use the next one
+```
 
-`test_material/` itself is tracked (it holds the fetch script), so symlink `frames` inside it
-rather than replacing the directory. Then work only in that directory, and add your row to the
-table below. Each worktree has its own
-`target/`, so builds no longer block on each other's **target** lock — that alone is worth the disk.
+Reserving costs one command and is the difference between picking a number and being *given*
+one. Drop it once the record is merged.
 
-**They do still block on the package-cache lock**, and that surprised the `abacship` session on
-2026-09-07: `cargo test --release` sat at `Blocking waiting for file lock on package cache` for
+## Builds queue on one lock, and that looks like a hang
+
+Each worktree has its own `target/`, so builds no longer block on each other's **target** lock —
+that alone is worth the disk. **They do still block on the package-cache lock**, and that
+surprised the `abacship` session on 2026-09-07: `cargo test --release` sat at `Blocking waiting for file lock on package cache` for
 minutes while other sessions compiled, with 35 `rustc` processes on the machine. The lock is in
 `~/.cargo`, which every worktree shares; a separate `target/` does not help. So **a build queued
-behind four other sessions is normal, not a hang** — start long test runs in the background rather
+behind seven other sessions is normal, not a hang** — start long test runs in the background rather
 than waiting on them, and before assuming something is stuck, ask *who holds the lock*:
 
 ```bash
@@ -103,30 +148,31 @@ running with its parent reparented to launchd, and every later build in that wor
 `file lock on build directory` — with no other session at fault and nothing in `ps` that looks
 wrong unless you go looking for the lock holder. Kill the pid `lsof` names, not the pattern.
 
-When your work is ready:
+## End of session
 
 ```bash
 cargo test --release && cargo clippy --release   # the usual gates, in your worktree
+git fetch origin && git rebase origin/main       # rebase before merging, so conflicts land here
+cargo test --release                             # a rebase can break things silently
 git push -u origin "$AREA"                       # or merge to main if you own it
+scripts/claim drop <ITEM>                        # release the item
+git -C "$REPO" worktree remove "$REPO-$AREA"     # only when the area is finished
 ```
 
-To merge into main, rebase onto it first so the history stays linear and conflicts surface in your
-worktree rather than in someone else's:
-
-```bash
-git fetch origin && git rebase origin/main
-cargo test --release                                   # rebase can break things silently
-```
-
-Clean up when the area is done: `git -C "$REPO" worktree remove "$REPO-$AREA"`.
+Removing the worktree does not release its claim; the next session to stand in a directory of
+that name reclaims it automatically once your session is gone.
 
 **The shared checkout stays on `main` and is for merging and reading, not for editing.**
 
 ## Worktrees currently out
 
-Add your row when you create one, remove it when you are done. Write the worktree **relative to
-the shared checkout** — no absolute paths, no session ids. **This table does not exclude anyone —
-`scripts/claim` does (rule 0b). Take the claim first; the row is the explanation, not the lock.**
+**This table is not the lock and never was — `scripts/claim list` is the live answer to "who
+holds what".** It carries the prose a claim note cannot: what the item is really about, what it
+touches, what was found on the way in. Write the row *after* the claim succeeds, and write the
+worktree **relative to the shared checkout** — no absolute paths, no session ids. Remove your
+row when you are done.
+
+If this table and `scripts/claim list` disagree, the table is wrong.
 
 | worktree | branch | area |
 |---|---|---|
@@ -136,6 +182,7 @@ the shared checkout** — no absolute paths, no session ids. **This table does n
 | `../gnc-chroma2` | `chroma2` | **CHROMA-2 — DONE, merged at 062f49e.** The colour lead over x264 is **withdrawn**: rate-matched, x264 wins dE00 on **6 runs of 6**, and on five it needs no chroma-QP offset at all — ahead on colour *and* luma at once. **GNC now has no measured advantage over x264 on any axis** at the contribution operating point, so the +90.5% is the whole picture rather than one side of a trade, and GOALS loses "keep the colour lead" as a target. Decision 0020. Also did the test-material refetch, the shared venv, and the arm64 JPEG XS build. |
 | `../gnc-abacship` | `abacship` | **ABAC-SHIP merged to main 2026-09-07** (`60bed17`, `378a0c7`). abac is a real entropy coder now: `--abac`, entropy type 5, **GP18**. −16.6% to −18.8% of rate against Rice at *identical pixels*, −13.4% at lossless (FFV1 gap +23.9% → +7.3%). Rice stays the default — `docs/decisions/0017`. **Every frame this encoder writes now says GP18**; a GP18 Rice frame is a GP17 payload with a new label, proved by relabelling and decoding, and GP17 still reads. Worktree kept: next on this row is a real inter measurement (correctness is tested, rate is not). |
 | `../gnc-rate1` | `rate1` | **RATE-1 — how much rate above q=90 an 8-bit output cannot emit.** BACKLOG's figure is on the test gradient alone (q=90 costs 0.275 bpp, q=95 costs 1.142 bpp for bit-identical 8-bit output), which is the best case by construction. Measuring the recoverable fraction per image — lowest q whose 8-bit decode is bit-exact to the original, and the softer within-1-LSB tier — on four synthetic patterns plus the four pinned stills, before building any rate-control rule. `scripts/meas_rate1_precision.py` only; no codec change yet. Claimed 2026-09-07. |
+| `../gnc-coord` | `coord` | **COORD-1 — the claim mechanism enforces the rules instead of restating them.** Docs and `scripts/claim` only; no codec change, invalidates no measurement. `scripts/claim next` makes the *pick* atomic, the shared-checkout and worktree preconditions are now refusals rather than prose, and the session identity bug that made `SESSION GONE` undetectable is fixed. See `docs/decisions/0019`. Claimed 2026-09-07. |
 | `../gnc-meas9` | `meas9` | **MEAS-9 merged (`ed62de7`) — now on ENT-3.** MEAS-9's result: J2K in irreversible 9/7 mode uses **GNC's own transform at GNC's own depth** and needs **54.2% fewer bits on RGB PSNR / 79.7% on Y-PSNR**, so the intra gap is the entropy coder, not the transform. GNC is −10.2%/+29.4% against JPEG XS 4:4:4 and +20.2%/+29.3% against ProRes 4444. **ENT-3 is the inter half**: abac against Rice on P-frame residuals, which ABAC-SHIP explicitly left out of scope. Touches nothing another row owns — measurement first. |
 
 ## The test material was missing entirely, and the `chroma2` session is refetching it (2026-09-07)
@@ -147,7 +194,7 @@ survived it.
 
 **DONE — the material is back (2026-09-07 ~19:30), and it reproduces BASELINE.** All 22
 artefacts are present and verified, and `q=75` on `bbb_1080p` reads **44.84 dB / 4.53 bpp**,
-exactly the committed figure. Symlink your worktree at it per rule 0 and carry on.
+exactly the committed figure. Symlink your worktree at it per "Start of session" and carry on.
 
 **Two things the refetch turned up, both now fixed in `fetch_test_frames.sh`:**
 
@@ -309,7 +356,7 @@ trick works for any idempotent stage.
 
 ## Timing: the machine is shared, so throughput numbers are not measurable during a session
 
-Up to five sessions compile and run GPU work on this one M1 at the same time. That makes every
+Eight sessions compile and run GPU work on this one M1 at the same time. That makes every
 wall-clock figure unreliable while anyone else is working — on 2026-09-06 the same abac decode
 input timed **25.2, 31.1 and 37.5 ms across three runs**, a 48% spread on identical work, and
 three targeted shader optimisations against three different suspected bottlenecks all returned
@@ -423,7 +470,7 @@ Three things to carry:
 - **The test material was unreachable for about ten minutes (18:04, restored).** `ln -sfn` run
   inside the shared checkout pointed `test_material/frames` at itself, so every worktree's link
   resolved to a loop and no session could read a test image. Restored to the real directory and
-  rule 0's command is now guarded against being run in the shared checkout. **Lost in the process:
+  the start-of-session command is now guarded against being run in the shared checkout. **Lost in the process:
   the `frames/hdr/` 10-bit material**, which was generated rather than fetched — regenerate it with
   `scripts/png16.py` if a 10-bit measurement is needed. Nothing else was lost, and no committed
   result depended on it.

@@ -2,6 +2,19 @@
 
 Status: `todo` | `active` | `done` | `blocked`
 
+**This file is the queue, not the lock.** `scripts/claim` decides who works on what
+([COORDINATION.md](COORDINATION.md), "Start of session"); take your item with
+`scripts/claim next "<why>"`, which reads the headings below and claims one atomically. An
+`(in progress)` marker here is documentation written afterwards and goes stale — never treat it
+as evidence that an item is free or taken. `scripts/claim items` is the live answer.
+
+**So a heading is a queue entry only if it looks like `### NAME-<n> — title (todo, P<n>)`.** Give
+a new idea an ID of that shape and a priority, or `next` cannot offer it. A finished item is
+marked `**DONE**` / `**CLOSED**` / `**FIXED**` / `**REJECTED**` and loses its priority marker, so
+it drops out of the queue by construction. To park an item that nobody can start — `CANARY-1` and
+`MEAS-5` both need a second GPU — hold it with
+`scripts/claim take --as blocked-<reason> <ITEM> "<why>"` rather than deleting the priority.
+
 Only **open** items live here. All completed, closed, and vetoed items (66 of them,
 with gate experiments and measurements) are archived verbatim in
 [docs/archive/BACKLOG_CLOSED.md](docs/archive/BACKLOG_CLOSED.md).
@@ -563,6 +576,35 @@ corner case for this codec.
 contaminated by chroma error and overstated the luma loss **3.7x** (−0.56 vs −0.15 dB); luma is now
 taken in YCoCg-R. And VMAF read **97.08 before and after** the shipped change, on 6% fewer bits —
 the same illusion that made the 2026-09-05 sweep look like a free 15%.
+
+### BUG-17 — the abac chroma test fails only under test parallelism (todo, P2)
+
+`cargo test --release`, the gate CLAUDE.md prescribes, is **non-deterministic**. Measured
+2026-09-07 on a loaded machine:
+
+| how it is run | result |
+|---|---|
+| `abac_handles_subsampled_chroma` alone | ok |
+| whole `abac_bitstream` file, default parallelism | **2 failures in 4 runs** |
+| whole file, `--test-threads=1` | **ok, 4 of 4** |
+
+Failure is `tests/abac_bitstream.rs:172` — `Yuv422: abac and Rice decoded different pixels`,
+`left: 85321.734  right: 0.0`. **The magnitude is identical on every failure**, so it is one
+specific corruption when the race lands, not noise. The test compares the two coders on the
+*same* CPU encode path precisely so the assertion is about the entropy coder rather than which
+quantise shader ran, which makes a clean "the test is just badly isolated" explanation less
+comfortable than it looks.
+
+**The question to answer, and it is not yet answered:** is the test wrong to share a GPU device
+with its six neighbours, or is there shared state in the abac/GPU path that concurrency merely
+exposes? If the second, `--test-threads=1` would hide a real bug rather than fix one — so
+establish which before changing the gate. `rice_gpu_and_cpu_encode_paths_differ_at_subsampled_chroma`
+sits in the same file and BUG-16 is in the same area.
+
+Found 2026-09-07 by the `coord` session while running the gates on a documentation-only change
+(no `.rs`, `.wgsl` or `.toml` in the diff), so it is inherited from the ABAC-SHIP merge rather
+than caused by it being observed. Everything else in that run was green: 175 + 6 tests,
+`cargo clippy --release` and the wasm target both clean.
 
 ### BUG-16 — Rice's GPU and CPU encode paths disagree on the coefficients (todo, P2)
 
@@ -1565,7 +1607,14 @@ alternative is to stop advertising q=95-99.
 **Do not measure a contribution operating point at q=95-99 without knowing this.** Any BD-rate
 whose ladder includes those rungs has scored GNC through its dominated range.
 
-### MEAS-2 — Feature toggling: what contributes and how much? (in progress 2026-09-06)
+### MEAS-2 — Feature toggling: what contributes and how much? (todo, P3)
+
+**Back in the queue 2026-09-07.** This heading read `(in progress 2026-09-06)` for a day
+with nobody holding a claim on it — the stale-marker failure that COORD-1 removed the
+instruction for. Four toggles are measured below and the sweep is not finished, so it is
+startable. **P3 is carried over from the stale marker, not measured — re-rank it if that
+is wrong.**
+
 First toggle measured: **`GNC_REF_DEBLOCK` — neutral to negative, default flipped off.** Its own
 commit measured 0.016% bpp / VMAF neutral and explained why (tile-boundary pixels are 0.78% of ME
 decisions); re-measured with VMAF it is exactly neutral on old_town and aerial and *worse* on

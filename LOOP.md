@@ -12,11 +12,13 @@ project is for.
 
 ## The loop
 
-0. **Move into your own worktree before anything else.** Up to five sessions run at once; the
-   shared checkout is for reading and merging, not for working. See
-   [COORDINATION.md](COORDINATION.md) rule 0 for the exact commands — pin it to a commit, give it
-   its own `target/`, symlink `test_material/frames`, and remove it when you are done. Then claim
-   your area in COORDINATION.md.
+0. **Start the session: four commands, in order.** See [COORDINATION.md](COORDINATION.md),
+   "Start of session" — your own worktree, the test-material symlink, `scripts/claim worktree`,
+   `scripts/claim next`. That section is the single copy of the procedure; do not reconstruct it
+   from memory. Eight sessions run at once, and the shared checkout is for reading and merging,
+   never for working. `scripts/claim` enforces both: it refuses to hand you work from the shared
+   checkout, and refuses to hand you work in a worktree you do not hold.
+
 0b. **Sync with `main` before you pick, never while you measure.** All the worktrees share one
    `.git`, so another session's commit to `main` is visible to you *instantly* — `git log main`
    is always current, no fetch needed — but your own files do not move until you
@@ -30,27 +32,31 @@ project is for.
    different codebases, and rule 1 says neither is valid. If something that landed invalidates the
    item you were about to do, that is the cheapest possible time to find out.
 
-1. Read [BACKLOG.md](BACKLOG.md). Pick the item with the best value-to-effort ratio that is not
-   blocked — not necessarily the highest-numbered priority.
+1. **Take your item with `scripts/claim next "why, briefly"`.** It walks the startable BACKLOG
+   items in priority order and takes the first one nobody holds — the pick *is* the
+   compare-and-swap, so eight sessions running it at the same instant get eight different items.
 
-   **Then claim it atomically, and do not start until the claim succeeds:**
+   **Do not read BACKLOG, decide, and then claim.** That is three steps, and every session
+   applying the same rule to the same file gets the same answer inside the same two minutes: on
+   2026-09-07 it sent several sessions at MEAS-9 at once. Being deterministic is precisely what
+   makes the collision reliable rather than unlikely, and an atomic claim alone does not fix it —
+   it just means seven sessions lose a round and go back to the same list.
 
-   ```bash
-   scripts/claim list                        # what other sessions hold
-   scripts/claim take <ITEM> "why, briefly"  # non-zero means someone beat you to it: pick again
-   ```
+   Then read the item's BACKLOG entry and **question whether it is still the right item**;
+   something that landed this morning may have invalidated it. If it has, `scripts/claim drop` it,
+   record why in its entry, and run `next` again. Use `scripts/claim take <ITEM>` only when you
+   want one specific item for a reason you can state — a bug you just found, a follow-up the last
+   item obliges you to do.
 
-   A markdown table cannot exclude anyone. Reading it, deciding, and writing your row are three
-   steps, and eight instances run against this checkout — so sessions that start together all read
-   "free". On 2026-09-07 that sent several at MEAS-9 at once: with CANARY-1 hardware-blocked and
-   CHROMA-2 taken it was the only startable P1, so every session applying this rule to the same
-   list got the same answer inside the same two minutes, before any row could be written. Being
-   deterministic is exactly what makes the collision reliable rather than unlikely.
+   `scripts/claim touch <ITEM>` as you go: a claim with no heartbeat for an hour shows as `STALE`,
+   and a held item is invisible to `next`, so an abandoned claim takes work away from seven other
+   sessions.
 
-   `scripts/claim` is a compare-and-swap on a ref in the shared `.git`, so it is atomic and
-   instantly visible to every worktree — see COORDINATION.md rule 0b. Also mark the heading in
-   BACKLOG `(in progress <date>, <worktree>)`, so the file you pick *from* stops advertising a
-   taken item, and `scripts/claim drop <ITEM>` when you are done.
+   **Record the claim nowhere else.** BACKLOG's `(in progress)` markers and COORDINATION's
+   worktree table are documentation, not locks; a second copy of "who holds what" only goes stale
+   and sends the next session at an item that is already taken. Write the BACKLOG status when the
+   item is *finished*, and add a worktree row for the prose a claim note cannot carry.
+
 2. **Measure the current state before changing anything.** A change with no before-number is not
    an improvement, it is a hope.
 3. Make the change.
@@ -61,7 +67,7 @@ project is for.
 6. Write the numbers into [RESEARCH_LOG.md](RESEARCH_LOG.md) — including the failures. Update
    [BACKLOG.md](BACKLOG.md) and [BASELINE.md](BASELINE.md) if the picture changed.
 7. Commit with the numbers in the message. Push.
-8. Go to 1. **Do not stop to ask whether to continue.**
+8. `scripts/claim drop <ITEM>`, then go to 0b. **Do not stop to ask whether to continue.**
 
 ## Escalate only for
 

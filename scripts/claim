@@ -1,43 +1,64 @@
 #!/usr/bin/env bash
-# Atomic claims for concurrent sessions.
+# Atomic claims for concurrent sessions. This is the lock. Everything else is documentation.
 #
-# The claims table in COORDINATION.md is documentation, not a lock. Reading it, deciding, and
-# writing your row are three separate steps, so N sessions that start together all read "free"
-# before any of them writes. On 2026-09-07 that sent several sessions at MEAS-9 simultaneously,
-# and a duplicate row had to be cleaned up by hand. With eight instances the window is wider,
-# not narrower.
+# Eight Claude sessions run against this one checkout. Reading a markdown table, deciding, and
+# writing your row are three separate steps, so sessions that start together all read "free"
+# before any of them writes. On 2026-09-07 that sent several at MEAS-9 simultaneously and a
+# duplicate row had to be cleaned up by hand.
 #
-# This uses the atomic primitive the repository already has. Every worktree shares one .git, so
+# The atomic primitive is one the repository already has. Every worktree shares one .git, so
 # `refs/claims/*` is visible to all of them the instant it is written -- no fetch, no daemon, no
-# lock file in the tree -- and `git update-ref <ref> <new> <old>` is a compare-and-swap that
-# takes git's own ref lock. `<old>` as the empty string means "must not exist", which is exactly
-# create-if-absent. Two sessions racing on the same item cannot both win; the loser is told who
-# holds it.
+# lock file in the tree -- and `git update-ref <ref> <new> <old>` is a compare-and-swap under
+# git's own ref lock, where an empty `<old>` means "must not exist". Two sessions racing for the
+# same item cannot both win; the loser is told who holds it.
+#
+# Three things this enforces rather than merely asks for:
+#   * you cannot claim work from the shared checkout
+#   * you cannot claim work without holding a worktree
+#   (both from COORDINATION.md, "Start of session")
+#   * `next` picks *and* claims in one atomic step, so two sessions cannot pick the same item
 #
 # Claims are metadata blobs, so `git cat-file -p refs/claims/<ITEM>` shows the owner directly.
-# Nothing is pushed: refs/claims stays local to this machine's checkout, which is where the
-# contention is.
-#
-#   scripts/claim take MEAS-9 "cross-codec measurement, no encoder change"
-#   scripts/claim list
-#   scripts/claim owner MEAS-9
-#   scripts/claim touch MEAS-9          # heartbeat, so `list` ages stay honest
-#   scripts/claim drop MEAS-9
-#   scripts/claim steal MEAS-9 "abandoned, owner's worktree is gone"
-#   scripts/claim worktree              # claim the worktree you are standing in (rule 0)
-#   scripts/claim selftest              # proves the mutual exclusion, 16 racing processes
+# Nothing is pushed: refs/claims stays local to this machine, which is where the contention is.
 
 set -u
 
-usage() { sed -n '3,30p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-1}"; }
+usage() {
+  cat <<'USAGE'
+scripts/claim -- the lock for concurrent sessions (COORDINATION.md, "Start of session")
+
+  claim worktree                 claim the worktree you stand in; do this first, every session
+  claim next "<why>"             atomically pick AND claim the top free BACKLOG item -- use this
+  claim take <ITEM> "<why>"      claim one named item; non-zero means someone beat you to it
+  claim list                     what is held, by whom, for how long
+  claim items                    the startable BACKLOG queue, and which entries are free
+  claim owner <ITEM>             who holds one item
+  claim touch <ITEM>             heartbeat, so the age in `list` stays honest
+  claim drop <ITEM>              release when you are done
+  claim steal <ITEM> "<why>"     take over from a session that is gone
+  claim selftest                 prove the mutual exclusion: racing processes, distinct winners
+
+Take an item out of rotation without holding it as a session:
+  claim take --as blocked-<reason> <ITEM> "<why>"
+
+Reserve a decision-record number before writing the file -- `main` already carries two 0018s
+because two sessions both read `ls docs/decisions/` and both computed "next is 0018":
+  claim take dr-0021 "<title>"
+USAGE
+  exit "${1:-1}"
+}
 
 # --- identity: what a claim records. No usernames, no hostnames, no absolute paths --------------
 # (CLAUDE.md, "Never commit secrets or local infrastructure detail")
 
 COMMON=$(git rev-parse --git-common-dir 2>/dev/null) || { echo "not a git repository" >&2; exit 2; }
+case "$COMMON" in /*) ;; *) COMMON=$PWD/$COMMON ;; esac
 SHARED=$(cd "$(dirname "$COMMON")" && pwd)
+TOP=$(git rev-parse --show-toplevel)
+STALE_AFTER=${CLAIM_STALE_AFTER:-3600}      # seconds without a touch before `list` says STALE
+
 here_branch() { git symbolic-ref --quiet --short HEAD 2>/dev/null || echo "detached"; }
-here_tree()   { local r; r=$(git rev-parse --show-toplevel); basename "$r"; }
+here_tree()   { basename "$TOP"; }
 
 # The session, not the directory. Identity used to be worktree@branch, and on 2026-09-07 that
 # turned out to be the wrong principal: two sessions had cwd in the same worktree on the same
@@ -48,21 +69,38 @@ here_tree()   { local r; r=$(git rev-parse --show-toplevel); basename "$r"; }
 # life, while every Bash call is a fresh shell. Walk up from here to find it. It is also a liveness
 # oracle: `kill -0` on it says whether the holder still exists, which is what makes an abandoned
 # claim detectable rather than merely old.
+#
+# This walk used to print the *parent* of the claude process instead of the process itself, so
+# identity was the terminal claude was launched from: two sessions started from one shell were
+# again the same principal, and `kill -0` tested a shell that outlives the session, so SESSION GONE
+# could never fire. Print $p, not $ppid.
 session_pid() {
   local p=$$ ppid comm
-  for _ in 1 2 3 4 5 6 7 8; do
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
     read -r ppid comm <<< "$(ps -o ppid=,comm= -p "$p" 2>/dev/null)"
     [ -z "${ppid:-}" ] && break
-    [ "$(basename "${comm:-}")" = "claude" ] && { printf 's%s' "$ppid"; return; }
+    [ "$(basename "${comm:-}")" = "claude" ] && { printf 's%s' "$p"; return; }
+    if [ "$ppid" = "1" ] || [ "$ppid" = "0" ]; then break; fi
     p=$ppid
-    [ "$p" = "1" ] && break
   done
   printf 's?'   # not under a session (a plain shell, or a nested wrapper): unidentifiable
 }
 
-session_alive() { # s<pid> -> 0 if that session's process still exists
+ancestor_pids() { # this process's ancestors, nearest first
+  local p=$$ ppid
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    ppid=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
+    [ -z "$ppid" ] && break
+    printf '%s\n' "$ppid"
+    [ "$ppid" -le 1 ] 2>/dev/null && break
+    p=$ppid
+  done
+}
+
+session_alive() { # s<pid> -> 0 alive, 1 gone, 2 cannot say
   case "$1" in
-    s\?|"") return 2 ;;                                  # unknown, cannot say
+    s\?|"") return 2 ;;
+    s*[!0-9s]*) return 2 ;;
     s*) kill -0 "${1#s}" 2>/dev/null ;;
     *) return 2 ;;
   esac
@@ -70,6 +108,23 @@ session_alive() { # s<pid> -> 0 if that session's process still exists
 
 me() { [ -n "${CLAIM_AS:-}" ] && { printf '%s' "$CLAIM_AS"; return; }
        printf '%s@%s#%s' "$(here_tree)" "$(here_branch)" "$(session_pid)"; }
+
+# Claims taken before the session_pid fix recorded the pid one level above the session's own
+# `claude` process. A session holding such a claim would be refused by its own `touch` after the
+# fix and would have to `steal` from itself -- exactly the manual cleanup this script exists to
+# stop. So accept an owner whose worktree and branch match and whose recorded pid is one of this
+# process's ancestors: that is the old identity and nothing else. It decays as those claims drop.
+owner_is_me() {
+  local owner=$1 mine; mine=$(me)
+  [ "$owner" = "$mine" ] && return 0
+  [ -n "${CLAIM_AS:-}" ] && return 1
+  case "$owner" in *#*) ;; *) return 1 ;; esac
+  [ "${owner%#*}" = "${mine%#*}" ] || return 1
+  local osess=${owner##*#} a
+  case "$osess" in s[0-9]*) ;; *) return 1 ;; esac
+  for a in $(ancestor_pids); do [ "s$a" = "$osess" ] && return 0; done
+  return 1
+}
 
 valid_item() {
   case "$1" in
@@ -80,7 +135,7 @@ valid_item() {
 
 ref_of() { printf 'refs/claims/%s' "$1"; }
 
-blob_for() { # item note  -> writes metadata blob, prints sha
+blob_for() { # item note prev -> writes metadata blob, prints sha
   local item=$1 note=${2:-} prev=${3:-}
   { printf 'item:    %s\n' "$item"
     printf 'owner:   %s\n' "$(me)"
@@ -95,53 +150,162 @@ blob_for() { # item note  -> writes metadata blob, prints sha
 
 field() { git cat-file -p "$1" 2>/dev/null | sed -n "s/^$2: *//p" | head -1; }
 
+age_secs() { local e; e=$(field "$1" epoch); [ -z "$e" ] && { echo -1; return; }
+             echo $(( $(date -u +%s) - e )); }
+
 age_of() { # blobsha -> human age
-  local e now d
-  e=$(field "$1" epoch); now=$(date -u +%s)
-  [ -z "$e" ] && { echo "?"; return; }
-  d=$((now - e))
+  local d; d=$(age_secs "$1")
+  [ "$d" -lt 0 ] && { echo "?"; return; }
   if   [ "$d" -lt 90 ];   then echo "${d}s"
   elif [ "$d" -lt 5400 ]; then echo "$((d / 60))m"
   else echo "$((d / 3600))h$(((d % 3600) / 60))m"; fi
 }
 
-owner_state() { # owner-string -> "" | " -- SESSION GONE, safe to steal"
-  local sess=${1##*#}
-  [ "$sess" = "$1" ] && return          # no session part (a seeded or --as claim)
+# Two different things a stale claim can be, and they need different actions:
+#   SESSION GONE  -- the holder no longer exists.       steal it.
+#   STALE         -- alive but has not touched in an hour. ask before stealing.
+claim_state() { # blobsha -> "" | " -- SESSION GONE, safe to steal" | " -- STALE, no heartbeat"
+  local sha=$1 owner sess d
+  owner=$(field "$sha" owner); sess=${owner##*#}
+  # A seeded or --as claim records no session, so nothing can say whether it is still real.
+  # Say that, rather than showing it as healthy: an unverifiable claim held for hours is exactly
+  # the abandoned claim that takes work away from everyone else.
+  [ "$sess" = "$owner" ] && { printf ' -- no session recorded, verify before trusting'; return; }
   session_alive "$sess"
   case $? in
-    0) : ;;
-    1) printf ' -- SESSION GONE, safe to steal' ;;
-    *) : ;;
+    1) printf ' -- SESSION GONE, safe to steal'; return ;;
+    2) printf ' -- OWNER UNIDENTIFIABLE'; return ;;
   esac
+  d=$(age_secs "$sha")
+  [ "$d" -ge 0 ] && [ "$d" -gt "$STALE_AFTER" ] && printf ' -- STALE, no heartbeat'
+  return 0
 }
 
-describe() { # item -> "owner, age, note"
+describe() { # item -> "owner (held Nm, note)"
   local sha; sha=$(git rev-parse --quiet --verify "$(ref_of "$1")") || return 1
   local o; o=$(field "$sha" owner)
   printf '%s (held %s' "$o" "$(age_of "$sha")"
   local n; n=$(field "$sha" note); [ -n "$n" ] && printf ', %s' "$n"
-  printf ')%s\n' "$(owner_state "$o")"
+  printf ')%s\n' "$(claim_state "$sha")"
+}
+
+held() { git rev-parse --quiet --verify "$(ref_of "$1")" >/dev/null; }
+
+# --- the two guards that turn "Start of session" from prose into behaviour ---------------------
+
+require_own_worktree() {
+  if [ "$TOP" = "$SHARED" ]; then
+    echo "REFUSED: you are in the shared checkout. It is for reading, coordination and merging." >&2
+    echo "  Two sessions were claiming work from here on 2026-09-07, which the procedure forbids." >&2
+    echo "  Make your own worktree first (COORDINATION.md, \"Start of session\"):" >&2
+    echo '    REPO=$(git rev-parse --show-toplevel); AREA=<area>' >&2
+    echo '    git -C "$REPO" worktree add -b "$AREA" "$REPO-$AREA" main && cd "$REPO-$AREA"' >&2
+    echo '    scripts/claim worktree' >&2
+    return 1
+  fi
+  local wt sha owner; wt="worktree.$(here_tree)"
+  sha=$(git rev-parse --quiet --verify "$(ref_of "$wt")") || {
+    echo "REFUSED: you do not hold this worktree. Run 'scripts/claim worktree' first." >&2
+    return 1; }
+  owner=$(field "$sha" owner)
+  owner_is_me "$owner" || {
+    echo "REFUSED: worktree $(here_tree) is held by $owner, not by $(me)." >&2
+    echo "  Two sessions in one worktree is how one committed the other's uncommitted work on" >&2
+    echo "  2026-09-07. Make your own: COORDINATION.md, \"Start of session\"." >&2
+    return 1; }
+}
+
+# --- the queue: BACKLOG.md's own headings, so there is no second file to keep in sync -----------
+#
+# An item is startable iff its heading carries a priority marker -- `(todo, P2)`, `(..., P1)`,
+# `(todo)` -- which is the convention BACKLOG.md already uses. Everything finished is marked
+# **DONE** / **CLOSED** / **FIXED** / **REJECTED** and carries no priority, so it drops out by
+# construction; everything in flight drops out because it is claimed. To put an idea into
+# rotation, give it an ID of the form NAME-<n> and a `(todo, P<n>)` marker. To take one out
+# without holding it as a session: `claim take --as blocked-<reason> <ITEM> "<why>"`.
+#
+# Read from committed `main`, not from anyone's working tree: the queue must not depend on whose
+# editor happens to be dirty.
+backlog_source() {
+  if [ -n "${CLAIM_BACKLOG:-}" ]; then cat "$CLAIM_BACKLOG"; return; fi
+  git show main:BACKLOG.md 2>/dev/null || cat "$TOP/BACKLOG.md"
+}
+
+candidates() { # -> "<prio> <ID> <heading text>", best priority first, file order within a priority
+  backlog_source | awk '
+    /^### / {
+      h = substr($0, 5)
+      if (match(h, /^[A-Z][A-Z0-9]*-[0-9]+/) != 1) next
+      id = substr(h, RSTART, RLENGTH)
+      if (h ~ /\*\*(DONE|CLOSED|FIXED|REJECTED|WITHDRAWN|SUPERSEDED|CORRECTED)/) next
+      prio = -1
+      if (match(h, /P[0-9]/)) prio = substr(h, RSTART + 1, 1) + 0
+      else if (h ~ /\(todo/) prio = 9
+      if (prio < 0) next
+      printf "%d %s %s\n", prio, id, h
+    }' | sort -s -k1,1n
 }
 
 # --- subcommands --------------------------------------------------------------------------------
+
+try_take() { # item note -> 0 if the CAS won. Silent; no guards. The one place that writes a claim.
+  local sha; sha=$(blob_for "$1" "${2:-}")
+  git update-ref "$(ref_of "$1")" "$sha" "" 2>/dev/null
+}
 
 cmd_take() {
   local as=""
   if [ "${1:-}" = "--as" ]; then as=${2:-}; shift 2; fi
   local item=${1:-}; shift || true; local note="$*"
   valid_item "$item" || exit 2
-  # --as exists to seed the claims that already existed as table rows, and to hand an area over.
-  # It is a cooperative tool, not an authorisation boundary: it records who says they own it.
-  [ -n "$as" ] && CLAIM_AS=$as
-  local sha; sha=$(blob_for "$item" "$note")
-  if git update-ref "$(ref_of "$item")" "$sha" "" 2>/dev/null; then
-    echo "claimed $item as $(me)"
-    return 0
+  # --as exists to seed claims, to hand an area over, and to park a blocked item. It is a
+  # cooperative tool, not an authorisation boundary: it records who says they own it, and it
+  # skips the worktree guard because it is not claiming work for this session.
+  if [ -n "$as" ]; then CLAIM_AS=$as
+  else
+    case "$item" in worktree.*) ;; *) require_own_worktree || return 1 ;; esac
   fi
+  if try_take "$item" "$note"; then echo "claimed $item as $(me)"; return 0; fi
   echo "REFUSED: $item is already held by $(describe "$item")" >&2
-  echo "  pick another item, or 'scripts/claim steal $item \"<why>\"' if that session is gone." >&2
+  echo "  Run 'scripts/claim next \"<why>\"' to be handed a free one instead." >&2
   return 1
+}
+
+# Pick and claim in ONE atomic step. This is the fix for the collision that keeps happening:
+# every session applying "take the best value-to-effort open item" to the same list gets the same
+# answer inside the same two minutes, so being deterministic is what makes the collision reliable
+# rather than unlikely. Here the pick IS the compare-and-swap -- N sessions running this at the
+# same instant get N different items, by construction.
+cmd_next() {
+  local note="$*"
+  [ -n "$note" ] || { echo "next needs a reason: scripts/claim next \"<why>\"" >&2; return 2; }
+  [ -n "${CLAIM_AS:-}" ] || require_own_worktree || return 1
+  local prio id rest skipped=0
+  while read -r prio id rest; do
+    [ -z "${id:-}" ] && continue
+    if held "$id"; then skipped=$((skipped + 1)); continue; fi
+    if try_take "$id" "$note"; then
+      echo "claimed $id as $(me)"
+      echo "  P$prio  $rest"
+      [ "$skipped" -gt 0 ] && echo "  ($skipped higher- or equal-priority item(s) already held)"
+      return 0
+    fi
+    skipped=$((skipped + 1))   # lost the race to another session; keep going down the list
+  done < <(candidates)
+  echo "every startable BACKLOG item is claimed ($skipped of them). Nothing to hand out." >&2
+  echo "  'scripts/claim items' shows the queue; 'scripts/claim list' shows who holds what." >&2
+  return 1
+}
+
+cmd_items() {
+  local prio id rest any=0
+  while read -r prio id rest; do
+    [ -z "${id:-}" ] && continue
+    any=1
+    if held "$id"; then printf '  P%s %-20s HELD  %s\n' "$prio" "$id" "$(describe "$id")"
+    else               printf '  P%s %-20s free  %s\n' "$prio" "$id" "$rest"; fi
+  done < <(candidates)
+  [ "$any" -eq 1 ] || echo "  (no startable items -- BACKLOG headings need '(todo, P<n>)' markers)"
 }
 
 cmd_drop() {
@@ -151,7 +315,7 @@ cmd_drop() {
   local sha; sha=$(git rev-parse --quiet --verify "$(ref_of "$item")") || {
     echo "$item is not claimed" >&2; return 1; }
   local owner; owner=$(field "$sha" owner)
-  if [ "$owner" != "$(me)" ] && [ "$force" -eq 0 ]; then
+  if ! owner_is_me "$owner" && [ "$force" -eq 0 ]; then
     echo "REFUSED: $item is held by $owner, not by $(me). Use --force if you mean it." >&2
     return 1
   fi
@@ -164,7 +328,7 @@ cmd_touch() {
   local sha; sha=$(git rev-parse --quiet --verify "$(ref_of "$item")") || {
     echo "$item is not claimed" >&2; return 1; }
   local owner note; owner=$(field "$sha" owner); note=$(field "$sha" note)
-  [ "$owner" = "$(me)" ] || { echo "REFUSED: $item is held by $owner" >&2; return 1; }
+  owner_is_me "$owner" || { echo "REFUSED: $item is held by $owner" >&2; return 1; }
   local new; new=$(blob_for "$item" "$note")
   git update-ref "$(ref_of "$item")" "$new" "$sha" && echo "refreshed $item"
 }
@@ -187,49 +351,31 @@ cmd_owner() {
 }
 
 cmd_list() {
-  local any=0
+  local any=0 name sha o
   while read -r name sha; do
     [ -z "$name" ] && continue
     any=1
-    local o; o=$(field "$sha" owner)
-    printf '  %-16s %-34s %6s%s  %s\n' "$name" "$o" "$(age_of "$sha")" \
-      "$(owner_state "$o")" "$(field "$sha" note)"
+    o=$(field "$sha" owner)
+    printf '  %-20s %-30s %6s%s  %s\n' "$name" "$o" "$(age_of "$sha")" \
+      "$(claim_state "$sha")" "$(field "$sha" note)"
   done < <(git for-each-ref --format='%(refname:lstrip=2) %(objectname)' refs/claims/)
   [ "$any" -eq 1 ] || echo "  (nothing claimed)"
 }
 
-# The canary CLAUDE.md asks for: proof the mutual exclusion is real, not asserted.
-cmd_selftest() {
-  local item="selftest.$$" n=16 wins=0 out
-  out=$(mktemp -d)
-  for i in $(seq "$n"); do
-    ( "$0" take "$item" "racer $i" >"$out/$i.ok" 2>"$out/$i.err"; echo $? >"$out/$i.rc" ) &
-  done
-  wait
-  for i in $(seq "$n"); do [ "$(cat "$out/$i.rc")" = "0" ] && wins=$((wins + 1)); done
-  echo "$n processes raced for one claim; $wins won"
-  local rc=0
-  [ "$wins" -eq 1 ] || { echo "FAIL: expected exactly 1 winner"; rc=1; }
-  # and the loser must be told who holds it, not just refused
-  grep -q "already held by" "$out"/*.err || { echo "FAIL: losers were not told the owner"; rc=1; }
-  "$0" drop --force "$item" >/dev/null 2>&1
-  rm -rf "$out"
-  [ "$rc" -eq 0 ] && echo "PASS: claims are atomic"
-  return "$rc"
-}
-
 # A claim on an *item* does not stop a second session cd-ing into your worktree, which is the more
 # damaging half of what happened on 2026-09-07: two sessions edited one file and one committed the
-# other's uncommitted work. So the worktree is claimable too, under the same CAS.
+# other's uncommitted work. So the worktree is claimable too, under the same CAS, and holding it
+# is a precondition for claiming any item.
 #
-# A worktree whose holding session is gone is free -- taking it over is the normal case after a
+# A worktree whose holding session is GONE is free -- taking it over is the normal case after a
 # session ends, not an exception -- so this reclaims automatically and says that it did. A worktree
-# held by a LIVE other session refuses.
+# held by a live session refuses. A worktree whose owner cannot be identified also refuses: an
+# unknown liveness used to fall through to the takeover branch, which is the wrong default.
 cmd_worktree() {
   local base item sha o
-  if [ "$(git rev-parse --show-toplevel)" = "$SHARED" ]; then
+  if [ "$TOP" = "$SHARED" ]; then
     echo "the shared checkout is shared on purpose -- not claimable." >&2
-    echo "  It is where the coordination files, the logs and the merges live (COORDINATION rule 0)." >&2
+    echo "  It is where the coordination files, the logs and the merges live (COORDINATION.md, \"Start of session\")." >&2
     echo "  Claim a worktree of your own instead: git worktree add -b <area> ../<repo>-<area> main" >&2
     return 2
   fi
@@ -237,19 +383,65 @@ cmd_worktree() {
   sha=$(git rev-parse --quiet --verify "$(ref_of "$item")") || {
     cmd_take "$item" "in use by this session"; return $?; }
   o=$(field "$sha" owner)
-  if [ "$o" = "$(me)" ]; then echo "$base is already yours"; return 0; fi
-  if session_alive "${o##*#}"; then
-    echo "REFUSED: worktree $base is in use by a LIVE session -- $o (since $(age_of "$sha"))" >&2
-    echo "  Do not work here. 'git worktree add' your own, per COORDINATION rule 0." >&2
-    return 1
-  fi
+  if owner_is_me "$o"; then echo "$base is already yours"; return 0; fi
+  session_alive "${o##*#}"
+  case $? in
+    0) echo "REFUSED: worktree $base is in use by a LIVE session -- $o (since $(age_of "$sha"))" >&2
+       echo "  Do not work here. 'git worktree add' your own, per COORDINATION.md, \"Start of session\"." >&2
+       return 1 ;;
+    2) echo "REFUSED: worktree $base is held by $o, whose liveness cannot be determined." >&2
+       echo "  Check for a live session there, then 'scripts/claim steal $item \"<why>\"'." >&2
+       return 1 ;;
+  esac
   local new; new=$(blob_for "$item" "in use by this session" "$o (session gone)")
   git update-ref "$(ref_of "$item")" "$new" "$sha" &&
     echo "took over worktree $base from $o (its session is gone)"
 }
 
+# The canary CLAUDE.md asks for: proof the mutual exclusion is real, not asserted. Two properties,
+# because they fail differently -- one item must have exactly one winner, and N sessions picking
+# from one queue must end up on N different items.
+cmd_selftest() {
+  local out rc=0; out=$(mktemp -d)
+
+  local item="selftest.$$" n=16 wins=0 i
+  for i in $(seq "$n"); do
+    ( CLAIM_AS="selftest-racer-$i" "$0" take --as "selftest-racer-$i" "$item" "racer $i" \
+        >"$out/$i.ok" 2>"$out/$i.err"; echo $? >"$out/$i.rc" ) &
+  done
+  wait
+  for i in $(seq "$n"); do [ "$(cat "$out/$i.rc")" = "0" ] && wins=$((wins + 1)); done
+  echo "one item, $n racing processes: $wins won"
+  [ "$wins" -eq 1 ] || { echo "FAIL: expected exactly 1 winner"; rc=1; }
+  grep -q "already held by" "$out"/*.err || { echo "FAIL: losers were not told the owner"; rc=1; }
+  "$0" drop --force "$item" >/dev/null 2>&1
+
+  # `next` must hand distinct items to simultaneous callers. Synthetic queue, so the real
+  # backlog is untouched.
+  local q="$out/BACKLOG.md" m=6 j
+  { for j in $(seq "$m"); do printf '### SELF%s-%s — synthetic queue entry %s (todo, P1)\n\n' "$$" "$j" "$j"; done
+  } > "$q"
+  for j in $(seq "$m"); do
+    ( CLAIM_AS="selftest-picker-$j" CLAIM_BACKLOG="$q" "$0" next "picker $j" \
+        >"$out/n$j.ok" 2>"$out/n$j.err" ) &
+  done
+  wait
+  local got; got=$(cat "$out"/n*.ok 2>/dev/null | sed -n 's/^claimed \(SELF[0-9]*-[0-9]*\) .*/\1/p' | sort)
+  local ngot nuniq; ngot=$(echo "$got" | grep -c . ); nuniq=$(echo "$got" | sort -u | grep -c . )
+  echo "one queue of $m, $m racing pickers: $ngot claimed, $nuniq distinct"
+  [ "$ngot" -eq "$m" ] || { echo "FAIL: expected all $m pickers to get an item"; rc=1; }
+  [ "$ngot" -eq "$nuniq" ] || { echo "FAIL: two pickers got the same item"; rc=1; }
+  for j in $(seq "$m"); do "$0" drop --force "SELF$$-$j" >/dev/null 2>&1; done
+
+  rm -rf "$out"
+  [ "$rc" -eq 0 ] && echo "PASS: claims are atomic, and so is the pick"
+  return "$rc"
+}
+
 case "${1:-}" in
   take|claim)  shift; cmd_take "$@" ;;
+  next)        shift; cmd_next "$@" ;;
+  items)       cmd_items ;;
   worktree|wt) cmd_worktree ;;
   drop|release) shift; cmd_drop "$@" ;;
   touch)       shift; cmd_touch "$@" ;;

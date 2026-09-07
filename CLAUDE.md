@@ -2,11 +2,18 @@
 
 All project goals, design rules, and priorities are in **[GOALS.md](GOALS.md)** — the single source of truth. This file contains only AI-specific instructions and technical reference.
 
-**Up to five Claude sessions work on this repository concurrently. Start by moving into your own
-git worktree — [COORDINATION.md](COORDINATION.md) rule 0 — then read the rest of that file and
-claim your area in it.** It lists what is in flight, what each recent change invalidated, and the
-measurement rules that have already cost retracted results. The shared checkout is for reading,
-for the coordination and log files, and for merging; it is not where you work.
+**Eight Claude sessions work on this repository at the same time. Before anything else, run the
+four commands under "Start of session" in [COORDINATION.md](COORDINATION.md)** — your own
+worktree, the test-material symlink, `scripts/claim worktree`, `scripts/claim next`. The shared
+checkout is for reading, for the coordination and log files, and for merging; it is not where you
+work, and `scripts/claim` will refuse to hand you work from it.
+
+**`scripts/claim` is the only lock.** Do not decide what to work on by reading a markdown table:
+reading, deciding and writing your row are three separate steps, so sessions that start together
+all read "free" before any of them writes. `scripts/claim next "<why>"` picks *and* claims in one
+compare-and-swap, so simultaneous callers get different items. Then read the rest of
+COORDINATION.md — what is in flight, what each recent change invalidated, and the measurement
+rules that have already cost retracted results.
 
 ## Build & Run
 

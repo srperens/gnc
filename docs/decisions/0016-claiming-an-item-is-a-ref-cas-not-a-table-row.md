@@ -1,7 +1,9 @@
 # 0016 — Claiming an item is a ref compare-and-swap, not a table row
 
 **Date:** 2026-09-07
-**Status:** adopted
+**Status:** adopted; the "does not fix" section is partly superseded by
+[0019](0019-the-pick-is-the-lock.md), which makes the *pick* atomic and turns rules 0 and 0b into
+refusals
 **Scope:** coordination between concurrent sessions. No effect on the codec, the bitstream or any
 measurement.
 
@@ -107,7 +109,12 @@ not asserted. It passes.
 BACKLOG's MEAS-9 heading read `(todo, P1)` for the whole time it was claimed in COORDINATION.md.
 The claim lived in one file and the pick was made from another, so the file sessions choose *from*
 was advertising a taken item. The `(in progress <date>)` marker already existed in BACKLOG and was
-used once in 90 KB; it is now used for MEAS-9, and LOOP step 1 says to set it.
+used once in 90 KB; it was set for MEAS-9, and LOOP step 1 was made to require it.
+
+**That remedy is withdrawn — see [0019](0019-the-pick-is-the-lock.md).** It created a third copy
+of "who holds what", and a second copy of state cannot be kept in sync by instruction. `scripts/claim
+next` now reads the queue and the claims together, so a claimed item is never offered whatever its
+heading says. BACKLOG's status is written when the item finishes, not when it is claimed.
 
 Recorded at the same time, so the next session does not re-derive it: **JPEG XS is not measurable
 on this machine.** ffmpeg knows the codec id and has no implementation (`..VILS jpegxs`), neither

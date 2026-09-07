@@ -145,6 +145,12 @@ bit-exactness, not encoder reproducibility.
 > (BUG-5: it costs +3 to +19% at matched VMAF on camera content and 160 ms of reordering
 > latency). Any `-q` run now produces I+P, not I+P+B. Set `GNC_B_PYRAMID=1` to reproduce the
 > figures below. These numbers need re-measuring against the new default.
+>
+> **And stale for a second reason as of 2026-09-07: BUG-27.** q=75 is inside the range where the
+> encoder's P-frame reference was dequantised with the intra quantiser step (any q <= 80), so these
+> bpp and PSNR figures were taken through a diverging prediction loop. Whoever re-measures them
+> for the B-pyramid change gets both corrections at once. Nothing at q >= 85 in this file is
+> affected — verified byte-identical, 27/27. See `docs/decisions/0023`.
 
 | sequence   | bpp  | PSNR avg | VMAF  | notes                                                        |
 |------------|------|----------|-------|--------------------------------------------------------------|

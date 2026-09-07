@@ -11559,3 +11559,247 @@ rested partly on *"the hardware is one M1 with 8 GPU cores"* — the contention 
 intact, the hardware claim inside it does not.
 
 Filed and closed as **BUG-29**.
+
+## 2026-09-07 — INTER-1 + BUG-27: the inter path's verdict was largely a reference-mismatch bug, and the ki default is right
+
+INTER-1 asked three questions in order — sweep ki at contribution quality, re-price TUNE-6's
+P-frame quantiser scale, then decide what the inter path is for. Step 1 answered cleanly. Step 2
+refused to behave, and the reason was a defect on the default path that invalidates most of the
+evidence the item was filed on.
+
+Worktree `../gnc-inter1`, branch `inter1`, base `07c01b1`. Three sequences (crowd_run,
+old_town_cross, bbb_extended), 24 frames each, 4:4:4, Rice. Input hashes recorded; the machine was
+loaded throughout and **no throughput figure was taken** — every number here is a byte count or a
+quality score.
+
+### Step 1 — the ki sweep says the default is the best of the four, not the worst
+
+`scripts/meas_inter1_ki.py`, q=85/90/92/95/99, BD-rate of each keyframe interval against
+all-intra. Negative means the inter arm needs fewer bits. Mean **and** worst-frame PSNR, because
+COORDINATION requires both for anything touching the inter path, and MEAS-3 is the reason.
+
+| sequence | ki=2 | ki=4 | ki=9 |
+|---|---|---|---|
+| crowd_run | +0.9% / +2.1% | +1.4% / +2.9% | +1.7% / +3.2% |
+| old_town_cross | +2.9% / +4.1% | +4.5% / +5.9% | +5.3% / +6.8% |
+| bbb_extended | −7.7% / −4.7% | −11.1% / −8.7% | **−12.7% / −10.6%** |
+| **mean** | −1.30% / +0.50% | −1.73% / +0.03% | **−1.90% / −0.20%** |
+
+Every VMAF BD-rate in the run was discarded by the harness's own guard — the overlaps are
+99.21–99.89, with nothing left to integrate. PSNR led, per CLAUDE.md's table.
+
+**The item's hypothesis was that a win confined to short GOPs would mean the default is wrong. The
+opposite holds:** BD-rate improves monotonically with GOP length on all three sequences, so ki=9
+wins the mean on both metrics and shortening the GOP costs money everywhere. The sign is set by
+*content*, not by GOP length — the two camera sequences lose at every ki, the animation wins at
+every ki — so no keyframe interval fixes both classes and moving the default only trades one for
+the other.
+
+### Step 2 would not behave, and that was the codec
+
+Forcing `GNC_P_QP_SCALE=1.25` at q=90 did not cost the ~1 dB a 25% coarser quantiser should. It
+cost 10, and the whole ladder went flat — q=85→99 moved the worst frame from 33.72 to 34.30 while
+rate rose normally. Then the control in the other direction, scale 0.90, spent **4% more bits for
+5 dB less quality**. That is not a bad trade, it is a broken arm, and it is what turned a
+measurement into a bug hunt: coarser-and-worse had a plausible reading available and nearly got
+written up as one, while finer-and-worse had none.
+
+Per-frame PSNR gave the mechanism immediately (crowd_run, q=90, ki=9, scale 1.25):
+
+```
+Frame 0 [I] 49.23   Frame 1 [P] 47.95   Frame 2 [P] 41.10   Frame 3 [P] 38.27
+Frame 4 [P] 36.46   Frame 5 [P] 35.63   Frame 6 [P] 35.12   Frame 7 [P] 34.61
+Frame 8 [P] 34.14   Frame 9 [I] 49.24
+```
+
+A monotone ramp that resets at every I-frame, with the **first** P-frame correct in both
+directions (47.95 at 1.25, 50.48 at 0.90 — both physically sensible for the bits spent). Only a P
+that predicts from another P can inherit a wrong reference, which points at the encoder's own
+local decode rather than at the transform, the quantiser or the entropy coder.
+
+**BUG-27** (filed as BUG-25 in the worktree, renumbered per COORDINATION's resolution of the
+double-used id; `arch3` found the same defect independently while reading both P-frame
+implementations for ARCH-3, and neither of us had fixed it). In `encode_pframe`, all six quantise dispatches use
+`res_qstep = quantization_step * p_qp_scale`, and all six matching **local-decode dequantise**
+dispatches used `config.quantization_step` — all three of luma / 4:2:0 chroma / 4:2:2 chroma, and
+in *both* P-frame implementations before ARCH-3 deleted one of them, so it was an artefact of
+neither. The encoder reconstructed its reference with the intra step while the bitstream
+carried the residual at `res_qstep`, so its reference differed from the decoder's by
+`quantization_step / res_qstep`. PSNR here is computed from `decode_sequence`, so this is what a
+real decoder produces, not an encoder-side artefact. Fixed in `2224c50`; the three scales are flat
+after it (1.25 → 47.95 across the GOP, 0.90 → 50.49).
+
+**Why it survived.** The taper is keyed on the quantiser step and returns exactly 1.0 for every
+step at or below 2.8 — which is q=85 and above. There the wrong value and the right one coincide,
+so the entire contribution range was correct *by coincidence*, and the defect was reachable only
+where the taper does something. Output is byte-identical before and after at q≥85, verified
+against a pinned `07c01b1` build (crowd_run ki=9: 27588358 / 34128220 / 49328550 bytes at
+q=85/90/99, both ways). Below q=85 it was live on the shipped default:
+
+| q | before | after | delta |
+|---|---|---|---|
+| 25 | 3233137 B, 29.18/27.78 dB | 3247396 B, 29.47/28.19 dB | +0.4% B, +0.29/+0.41 dB |
+| 50 | 7201466 B, 32.49/30.37 dB | 7316803 B, 33.39/32.15 dB | +1.6% B, +0.90/+1.78 dB |
+| 70 | 13161434 B, 35.20/32.08 dB | 13423148 B, 37.02/35.70 dB | +2.0% B, **+1.82/+3.62 dB** |
+| 80 | 21595433 B, 40.77/38.91 dB | 21734608 B, 41.57/40.53 dB | +0.6% B, +0.80/+1.62 dB |
+
+(crowd_run, 10 frames, ki=9, 4:4:4, mean/worst-frame PSNR.)
+
+### What that costs the record: MEAS-3 and decision 0019 are corrected
+
+MEAS-3's ladder is q=25–95, so most of it ran with the defect live. Re-run on the same harness,
+same 18 frames, same sequences, against `2224c50`:
+
+| sequence | mean: 0019 → now | worst-frame: 0019 → now |
+|---|---|---|
+| crowd_run | +15.9% → **+6.5%** | +32.4% → **+12.0%** |
+| old_town_cross | +22.2% → **+19.3%** | +35.4% → **+28.7%** |
+| bbb_extended | −24.2% → **−26.8%** | −10.5% → **−16.5%** |
+| **mean** | **+4.6% → −0.3%** | **+19.1% → +8.0%** |
+
+The bug accounted for all of MEAS-3's mean penalty and about 60% of its worst-frame penalty. What
+survives is the shape of the conclusion, not its magnitude: the inter path is roughly neutral on
+the mean over q=25–95 and still costs +8% on the worst frame, driven almost entirely by
+old_town_cross at +28.7%. **INTER-1's own title — "the inter path is a loss at contribution
+quality" — does not survive**: at q=85–99 the shipped configuration is −1.9% mean / −0.2%
+worst-frame.
+
+**TUNE-5 and TUNE-6 are invalidated too, and this matters more than the MEAS-3 correction.** Both
+measured the P-scale itself, and both did it through the defect: TUNE-5's flat-1.25 "−3.3% BD-rate
+at ki=9" (q=15–50, entirely inside the live range) and TUNE-6's taper justification, whose
+recorded "old_town q=99: −3.8 dB avg, **−14.2 dB worst** for scale 1.25" was measuring a diverging
+prediction loop, not a rate/quality trade. So "1.25 is bad at high q" was not a supported claim,
+and the taper's shape had no valid basis in either direction.
+
+### Step 2, measured properly: 1.0 is right at contribution quality, for a different reason
+
+Four scales at q=85–99, ki=9 against all-intra. **The four BD-rates cannot be compared as printed**
+— a coarser scale lowers the top of the inter arm's ladder (ki=9 reaches 59.5 dB at scale 1.0, 57.4
+at 1.25, 55.6 at 1.50), so each is integrated over a different interval, and QUAL-1 measured what
+that does: 47.5 points on average when a ladder widens. `scripts/meas_inter1_pscale.py` recomputes
+all of them over the intersection of their overlaps, and asserts the all-intra arm is identical
+across runs (a P-scale that moved intra would be a harness error, not a result):
+
+| metric | 0.90 | 1.00 (taper) | 1.25 | 1.50 |
+|---|---|---|---|---|
+| mean PSNR | −3.0% | −3.0% | −3.4% | **−3.6%** |
+| worst-frame PSNR | +2.6% | −1.2% | **−2.3%** | −1.5% |
+
+On the mean the scale barely registers (0.6 points across the whole sweep); on the worst frame it
+matters (4.9 points) with an optimum near 1.25. Taken alone that says the taper is backwards — it
+falls to 1.0 exactly where 1.25 measures 1.1 points better.
+
+**It is not the whole story, and the missing half reverses the recommendation.** The common
+interval is 48.7–55.1 dB, and it is common precisely because the coarser arms cannot reach higher.
+At the top rung:
+
+| scale | crowd_run q=99 worst-frame | vs all-intra (59.49) |
+|---|---|---|
+| 0.90 | 59.50 | +0.01 |
+| **1.00 (taper)** | **59.50** | **+0.01** |
+| 1.25 | 57.05 | −2.45 |
+| 1.50 | 54.99 | −4.50 |
+
+Same to two decimals on the other two sequences. **At scale 1.0 the inter arm's worst frame equals
+what all-intra achieves at the same q** — because the worst frame *is* the I-frame, the P-frames
+sitting at or above it. Any scale above 1.0 pushes the P-frames below the I-frame and the floor
+drops with it. A BD-rate over a common interval cannot see this by construction: it discards the
+range the coarse arms never reach, which is the range a contribution codec is sold on.
+
+So TUNE-6's taper arrives at the right value for q≥85 and its stated reason was an artefact. The
+defensible reason is a **ceiling guarantee, not a rate/quality trade**: at 1.0 no frame in a GOP is
+worse than the same content coded all-intra, which is the property that matters when the output is
+re-encoded downstream. That is a stronger justification than the one it replaces, and it is why the
+1.1-point worst-frame BD-rate advantage of 1.25 is declined rather than banked.
+
+### Method notes worth keeping
+
+- **A knob that is a no-op where you test hides bugs in itself.** `p_qp_scale` is 1.0 for all
+  q≥85, so every measurement at the operating point this project cares about was blind to a defect
+  that only exists where the knob acts. Nothing was wrong with the taper; what was wrong was
+  reachable only through it.
+- **More bits for worse quality is not a trade, it is a broken arm.** The sub-1.0 direction had no
+  plausible reading as a bad trade, which is the argument for bounding a direction you *expect* to
+  lose rather than assuming it away. Had only 1.25 and 1.50 been run, the defect would have been
+  published as a rate/quality curve.
+- **`cargo test` rewrites `target/release/gnc`, including underneath a running sweep.** Mine was
+  replaced 3.5 minutes into a 25-minute run by a comment-only edit, so the output was certainly
+  identical — and the run was discarded and restarted against a copied, hash-recorded binary
+  (`67c4044…`), because "certainly identical" is not a measurement. Copy the binary before
+  backgrounding a sweep and point the harness at the copy.
+- **A common-interval BD-rate flatters the arm whose ladder stops early.** It is the right fix for
+  comparing arms of unequal reach, and it silently deletes the evidence about reach. Report the
+  top rung beside it.
+
+### The taper's *other* endpoint, which nobody had measured either
+
+TUNE-5's low-range figure went through the same defect, so q=25–70 was as unmeasured as the top.
+Same four scales, q=25/40/55/70, ki=9 against all-intra, common interval per sequence:
+
+| metric | 1.00 | taper (=1.25 here) | 1.25 | 1.50 |
+|---|---|---|---|---|
+| mean PSNR | −0.8% | −4.5% | −4.5% | **−5.3%** |
+| worst-frame PSNR | +18.0% | **+13.7%** | +13.8% | +18.7% |
+
+The `taper` and `1.25` columns agreeing to a decimal is the control: the taper *is* a flat 1.25
+across this whole range (qstep ≥ 4.6 at q ≤ 70), which is what the canary claimed and this
+confirms by encoding.
+
+**So 1.25 is right down here, and it is not a small effect** — worth 3.7 points of mean BD-rate and
+4.3 of worst-frame against 1.0, with 1.50 overshooting on the worst frame. **TUNE-5's conclusion
+survives its own invalidation**, re-derived on corrected code. And the inter path is genuinely poor
+on old_town_cross at these rates (+51% worst-frame), which is the same content signature MEAS-3's
+corrected +28.7% shows over the full ladder.
+
+### Step 3 — the decision: nothing changes, and both endpoints are now justified
+
+**The P-scale taper stays exactly as it is,** and for the first time both ends rest on
+measurements taken after BUG-27 — each for a different reason, which is why a taper and not a
+constant is the right shape:
+
+- **q ≤ 70: 1.25, because it is more efficient.** −4.5% mean against 1.0's −0.8%.
+- **q ≥ 85: 1.0, because it preserves the ceiling.** Efficiency actually favours 1.25 here by 1.1
+  points of worst-frame BD-rate, and it is declined: at 1.0 the worst frame in a GOP equals what
+  all-intra reaches at the same q (59.50 against 59.49), and every scale above 1.0 drops it
+  (57.05 at 1.25, 54.99 at 1.50). For a contribution codec whose output is re-encoded downstream,
+  never being worse than your own all-intra mode is worth more than 1.1 points.
+
+**The keyframe interval stays at 9.** It is the best of the four measured at contribution quality
+on both metrics, and BD-rate improves monotonically with GOP length, so there is no shorter default
+to move to.
+
+**Inter stays a default; it is not made opt-in.** The case for demoting it was MEAS-3's
++4.6%/+19.1%, and after BUG-27 that reads −0.3%/+8.0% — while at the contribution operating point
+specifically the shipped configuration measures −1.9%/−0.2%, a wash tilted slightly its way. The
+evidence that motivated the question was about 60% defect. What remains is content-specific
+(old_town_cross), and MEAS-4 already located it in prediction quality rather than in the coding
+model, which is a fixable thing and not an argument about architecture.
+
+**What was not chosen, and what it would have cost:** a flat 1.25 everywhere — simpler, one
+constant instead of a taper, and −3.4% against −3.0% on mean PSNR at q≥85 — is rejected because it
+caps the top rung 2.45 dB below all-intra on every sequence tested. A flat 1.0 everywhere — also
+simpler — is rejected because it gives up 3.7 points of mean BD-rate below q=70. The taper earns
+its complexity.
+
+### One lever found on the way, filed rather than chased
+
+The q=85 rung behaves unlike every rung above it: the inter arm goes *cheap and worse* there
+(10.50 bpp against all-intra's 11.64, 2.9 dB down on the worst frame) while from q=90 up it goes
+*dearer and slightly better*. The P-scale is 1.0 across all of it, so the scale is not the cause.
+The **inter dead zone** is: `inter_dz_mul` doubles it, and the intra dead zone falls from 0.5 at
+q=85 to 0.05 at q=92, so the inter dead zone goes 1.0 → ~0.1 across exactly that boundary. At
+q=85 it is large enough to zero coefficients that matter; above q=90 there is nothing left of it.
+
+One point measurement, crowd_run q=85 ki=9, 24 frames — **a point measurement cannot rank these
+(COORDINATION rule 4), it only sizes the lever**:
+
+| | bytes | mean / worst-frame |
+|---|---|---|
+| `inter_dz_mul=2.0` (shipped) | 65293226 | 45.02 / 44.61 dB |
+| `inter_dz_mul=1.0` | 74831067 | 47.89 / **47.48** dB |
+| all-intra reference | 72379589 | 47.48 / 47.48 dB |
+
+At 1.0 the worst frame lands exactly on all-intra's 47.48 — the same ceiling property the P-scale
+has at 1.0, from a second knob. The lever is worth 12.7% of the rate and 2.87 dB of worst-frame,
+which is large enough to deserve a BD-rate rather than a guess. Filed as **INTER-2**; not chased
+here, because a claim taken for one item does not cover what you trip over inside it.

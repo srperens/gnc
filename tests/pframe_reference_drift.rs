@@ -1,4 +1,4 @@
-//! BUG-25 — the encoder's P-frame reference must be reconstructed with the residual quantiser
+//! BUG-27 — the encoder's P-frame reference must be reconstructed with the residual quantiser
 //! step, not the intra one.
 //!
 //! `encode_pframe` quantises P residuals at `res_qstep = quantization_step * p_qp_scale`
@@ -129,7 +129,7 @@ fn p_frame_quality_does_not_decay_along_a_gop() {
         "P-frame quality decays along the GOP: first P {:.2} dB, worst P {:.2} dB, last P \
          {:.2} dB (all frames: {:?}). This is more drift than the inter dead zone accounts \
          for, so it is an encoder/decoder reference mismatch — check that every dequantise in \
-         encode_pframe's local decode uses res_qstep and not config.quantization_step (BUG-25).",
+         encode_pframe's local decode uses res_qstep and not config.quantization_step (BUG-27).",
         first_p,
         worst_p,
         last_p,

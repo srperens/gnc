@@ -1,8 +1,19 @@
 # 0019 — The inter path's saving was an equal-setting figure, not a saving
 
 **Date:** 2026-09-07
-**Status:** Accepted. Corrects GOALS §4's "saves 17–27% vs all-I"; the default is **not** changed
-here — what to do about it is BACKLOG **INTER-1**.
+**Status:** Accepted, and **its numbers are superseded by [0023](0023-the-p-frame-scale-taper-was-right-for-the-wrong-reason.md)
+(2026-09-07).** Corrects GOALS §4's "saves 17–27% vs all-I"; the default is **not** changed
+here — what to do about it was BACKLOG **INTER-1**, now done.
+
+> **Superseded figures.** The table below was measured over q=25–95 with **BUG-27** live: the
+> encoder's P-frame reference was dequantised with the *intra* quantiser step, so it disagreed
+> with the decoder's at every q ≤ 80. Re-run after the fix, on the same harness, frames and
+> sequences: crowd_run **+6.5% / +12.0%**, old_town_cross **+19.3% / +28.7%**, bbb_extended
+> **−26.8% / −16.5%**, mean **−0.3% / +8.0%** (was +4.6% / +19.1%). About 60% of the worst-frame
+> penalty was the defect. **Everything else in this record stands** — the three reasons the *old*
+> 17–27% figure read the other way are unaffected, and so is the rule that both PSNR columns must
+> be quoted. What changes is the magnitude of the verdict, and with it the answer to the question
+> this record handed to INTER-1: inter stays a default. See 0023.
 
 ## The decision
 

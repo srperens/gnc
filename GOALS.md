@@ -142,6 +142,16 @@ I/P/B inter path saves only 17–27% vs all-I where H.264 saves 60–70%.
 > 7.6 dB worse on crowd_run — its quality evidence was VMAF 99.09 against 99.10, which is
 > saturated. The H.264 60–70% half of the sentence stands; it was not re-measured. See
 > `docs/decisions/0019` and BACKLOG INTER-1.
+>
+> **Corrected again, INTER-1 (2026-09-07): those figures were themselves measuring BUG-27** — the
+> encoder's P-frame reference was dequantised with the intra quantiser step, so its reference
+> disagreed with the decoder's at every q ≤ 80, which is most of MEAS-3's q=25–95 ladder. Re-run
+> on the same harness: **−0.3% on mean PSNR and +8.0% on worst-frame**, not +4.6% / +19.1%. And at
+> the contribution operating point specifically (q=85–99, where the defect could not occur) the
+> shipped configuration measures **−1.9% mean / −0.2% worst-frame** — a wash, not a loss. The
+> remaining deficit is content-specific: old_town_cross alone is +28.7% on the worst frame.
+> **So "the inter path is a loss at contribution quality" is withdrawn**; ki=9 is the best of four
+> intervals measured, and inter stays a default. See `docs/decisions/0023`.
 
 **MEAS-1 (2026-09-05) measured the gap properly for the first time — at the wrong operating
 point. QUAL-1 (2026-09-06) re-measured it at the right one.** MEAS-1 found GNC needing **5-7x**

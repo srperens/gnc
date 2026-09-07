@@ -198,6 +198,22 @@ impl DecoderPipeline {
                             total_blocks,
                         );
                     }
+                    EntropyData::Abac(_) => {
+                        // One thread per code-block. The coder is serial *within* a block, so the
+                        // parallelism is across blocks — roughly 1000 per plane at 1080p 4:4:4
+                        // with 64px blocks. Blocks were sorted by area at pack time so a SIMD
+                        // group holds equal-sized work.
+                        self.abac_decoder.dispatch_decode(
+                            ctx,
+                            &mut cmd,
+                            &bufs.entropy_params[p],
+                            &bufs.entropy_var_a[p],
+                            &bufs.entropy_var_b[p],
+                            &bufs.scratch_a,
+                            bufs.abac_blocks[p],
+                            bufs.abac_coder,
+                        );
+                    }
                     EntropyData::Huffman(_) => {
                         // GPU Huffman decode: 256 parallel streams per tile
                         // Bindings: params, decode_table (tile_info), k_zrl (cpu_decoded_planes),

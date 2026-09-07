@@ -18,7 +18,8 @@ use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
 use super::abac::Coder;
-use crate::GpuContext;
+use super::abac_tile::{code_blocks, AbacTile};
+use crate::{FrameInfo, GpuContext};
 
 /// Widest code-block the decode shader can handle, set by its workgroup scratch. Must match
 /// `MAX_BLOCK_W` in `abac_decode.wgsl`.
@@ -70,7 +71,7 @@ impl BlockInfo {
 /// makes the uniform 32 bytes and stops it matching this struct.
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
-struct Params {
+pub struct Params {
     num_blocks: u32,
     _pad: [u32; 3],
 }
@@ -138,9 +139,9 @@ impl GpuAbacDecoder {
 
     /// Decode every block into one output plane. Returns the plane and the submit-to-idle time.
     ///
-    /// `packed` holds the blocks' streams concatenated in the same order as `infos`, each info's
-    /// `byte_offset` pointing into it. The shader takes a block's stream end from the *next*
-    /// block's offset, so that order is load-bearing.
+    /// `packed` holds every block's stream, each info's `byte_offset` pointing into it. Each
+    /// block also carries its own `byte_len`, so `infos` may be in any order — which the shipped
+    /// decode path uses to group equal-sized blocks together.
     pub fn decode(
         &self,
         ctx: &GpuContext,
@@ -224,9 +225,128 @@ impl GpuAbacDecoder {
         ctx.device.poll(wgpu::Maintain::Wait);
         let gpu_s = t0.elapsed().as_secs_f64();
 
-        let raw = crate::gpu_util::read_buffer_u32(ctx, &out_buf, out_len);
-        let out = raw.into_iter().map(|w| w as i32).collect();
+        // The shader writes f32 because that is what `scratch_a` is downstream; coefficients are
+        // integers well inside f32's exact range, so this is lossless.
+        let raw = crate::gpu_util::read_buffer_f32(ctx, &out_buf, out_len);
+        let out = raw.into_iter().map(|v| v as i32).collect();
         (out, gpu_s)
+    }
+}
+
+/// A frame plane's blocks, flattened for upload into the decoder's cached buffers.
+///
+/// Mirrors `pack_decode_data` on the Rice, rANS, Huffman and bitplane decoders so the decoder's
+/// per-plane upload loop looks the same for every coder.
+pub struct AbacPacked {
+    pub params: Params,
+    /// `BlockInfo` array as raw words — 8 per block.
+    pub block_info: Vec<u32>,
+    /// Every block's stream, packed little-endian into words the shader unpacks the same way.
+    pub stream_data: Vec<u32>,
+    /// The engine every tile in the plane was coded with.
+    pub coder: Coder,
+    pub num_blocks: u32,
+}
+
+impl GpuAbacDecoder {
+    /// Flatten one plane's tiles into upload-ready buffers.
+    ///
+    /// Block positions are computed in *plane* coordinates: `out_offset` is the block's top-left
+    /// coefficient in the padded plane and `stride` is the plane width, so the shader scatters
+    /// straight into `scratch_a` where the dequantiser expects it. Geometry comes from
+    /// `abac_tile::code_blocks`, the same function the encoder cut with — deriving it twice is
+    /// how a coverage bug would get in.
+    pub fn pack_decode_data(tiles: &[AbacTile], info: &FrameInfo) -> AbacPacked {
+        assert!(!tiles.is_empty(), "a plane with no tiles cannot be decoded");
+        let coder = tiles[0].coder;
+        assert!(
+            tiles.iter().all(|t| t.coder == coder),
+            "every tile in a plane must share one arithmetic engine"
+        );
+        let padded_w = info.padded_width() as usize;
+        let ts = tiles[0].tile_size as usize;
+        let tiles_x = padded_w / ts;
+
+        let mut packed: Vec<u8> = Vec::new();
+        let mut infos: Vec<BlockInfo> = Vec::new();
+        for (t, tile) in tiles.iter().enumerate() {
+            let tx = t % tiles_x;
+            let ty = t / tiles_x;
+            let origin = (ty * ts) * padded_w + tx * ts;
+            let blocks = code_blocks(ts, tile.num_levels, tile.cb_size as usize);
+            assert_eq!(
+                blocks.len(),
+                tile.block_lengths.len(),
+                "tile {t} carries {} block lengths but its geometry yields {}",
+                tile.block_lengths.len(),
+                blocks.len()
+            );
+            let mut off = 0usize;
+            for (i, (bx, by, bw, bh)) in blocks.into_iter().enumerate() {
+                let len = tile.block_lengths[i] as usize;
+                infos.push(BlockInfo::new(
+                    packed.len() as u32,
+                    len as u32,
+                    (origin + by * padded_w + bx) as u32,
+                    bw as u32,
+                    bh as u32,
+                    padded_w as u32,
+                ));
+                packed.extend_from_slice(&tile.block_data[off..off + len]);
+                off += len;
+            }
+        }
+
+        // One thread decodes one block and a Metal SIMD group runs at its slowest lane, so a
+        // group holding an 8x8 block next to a 64x64 one wastes most of itself. Sorting by area
+        // removes the geometric part of that divergence; what is left is data-dependent.
+        infos.sort_by_key(|i| std::cmp::Reverse(i.width * i.height));
+
+        let mut stream_data = vec![0u32; packed.len().div_ceil(4).max(1)];
+        for (i, &b) in packed.iter().enumerate() {
+            stream_data[i >> 2] |= (b as u32) << ((i & 3) * 8);
+        }
+        let num_blocks = infos.len() as u32;
+        AbacPacked {
+            params: Params { num_blocks, _pad: [0; 3] },
+            block_info: bytemuck::cast_slice(&infos).to_vec(),
+            stream_data,
+            coder,
+            num_blocks,
+        }
+    }
+
+    /// Record a decode into an existing command encoder, writing into `out`.
+    #[allow(clippy::too_many_arguments)] // one binding per buffer, like every other decoder here
+    pub fn dispatch_decode(
+        &self,
+        ctx: &GpuContext,
+        cmd: &mut wgpu::CommandEncoder,
+        params: &wgpu::Buffer,
+        stream: &wgpu::Buffer,
+        block_info: &wgpu::Buffer,
+        out: &wgpu::Buffer,
+        num_blocks: u32,
+        coder: Coder,
+    ) {
+        let bind = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("abac_decode_bind"),
+            layout: &self.bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: stream.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: block_info.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: out.as_entire_binding() },
+            ],
+        });
+        let mut pass = cmd.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("abac_decode_pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.pipelines[coder as usize]);
+        pass.set_bind_group(0, &bind, &[]);
+        // workgroup_size(32) in the shader; one thread per block.
+        pass.dispatch_workgroups(num_blocks.div_ceil(32), 1, 1);
     }
 }
 

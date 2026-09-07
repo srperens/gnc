@@ -1,6 +1,6 @@
 # GNC Bitstream Specification
 
-**Version:** GP17 (frame codec), GNV1 / GNV2 (containers)
+**Version:** GP18 (frame codec), GNV1 / GNV2 (containers)
 **Date:** 2026-09-06
 
 This document specifies the GNC bitstream format at a level of detail sufficient for an independent implementation.
@@ -9,12 +9,12 @@ All multi-byte values are **little-endian**. All byte offsets are from the start
 
 ---
 
-## 1. Frame Codec (GP11 … GP17)
+## 1. Frame Codec (GP11 … GP18)
 
 A frame bitstream encodes a single image frame. The sequence container (GNV1, Section 3) wraps
 multiple frames for video. The magic in the first four bytes names the generation; the encoder
-writes **GP17** today, and Section 6 lists what each generation added. Field layouts below are
-GP17 unless a row says otherwise.
+writes **GP18** today, and Section 6 lists what each generation added. Field layouts below are
+GP18 unless a row says otherwise.
 
 The decoder tracks the generation as a single number parsed from the magic, and every field added
 since GPC8 is gated on `gen >= N`; adding a generation is one entry in that table.
@@ -131,7 +131,7 @@ For B-frames (`frame_type == 2`), additionally:
 
 | Size | Type | Field | Description |
 |------|------|-------|-------------|
-| 4 | u32 | entropy_type | 0 = InterleavedRans, 1 = Bitplane, 2 = SubbandRans, 3 = Rice+ZRL, 4 = Huffman |
+| 4 | u32 | entropy_type | 0 = InterleavedRans, 1 = Bitplane, 2 = SubbandRans, 3 = Rice+ZRL, 4 = Huffman, 5 = abac code-blocks (GP18) |
 | 4 | u32 | num_tiles | Total tile count (tiles_x * tiles_y * 3) |
 
 ### 1.8 Tile Index Table (GP11)
@@ -329,6 +329,49 @@ same values in-shader from the decoded even streams and leave the block out enti
 
 Canonical Huffman, per-subband tables. Not yet specified here — read `src/encoder/huffman.rs`.
 
+### 2.6 Abac Code-Block Tile (entropy_type = 5, GP18)
+
+Adaptive binary arithmetic coding over independent code-blocks — EBCOT's code-block design without
+its bit-planes or its PCRD rate allocation. Coefficients are binarised (significance, magnitude
+continuation, sign) and each binary decision is coded against a context adapted from the already
+decoded neighbourhood, so nothing has to be signalled: the decoder learns the same probabilities
+from the same symbols.
+
+| Size | Type | Field | Description |
+|------|------|-------|-------------|
+| 2 | u16 | tile_size | Tile dimension |
+| 1 | u8 | num_levels | Wavelet decomposition levels; 0 for the MED lossless path |
+| 1 | u8 | cb_log2 | Code-block edge, log₂. 6 (64 px) is what the encoder writes |
+| 1 | u8 | coder | Arithmetic engine: 0 = interval (bit-renormalising), 1 = range (byte) |
+| 2 | u16 | num_blocks | Code-blocks in this tile |
+| variable | uvarint[] | block_lengths | Byte length of each block's stream, in scan order |
+| sum(lengths) | u8[] | block_data | The blocks' streams, concatenated in the same order |
+
+**Block geometry is derived, not transmitted.** Both sides enumerate the tile's subbands in Mallat
+order (LL first, then HL/LH/HH per level outward) and cut each into `cb × cb` blocks in raster
+order; a subband smaller than `cb` becomes one short block. `abac_tile::code_blocks` is the single
+definition and the encoder, the CPU decoder and the GPU decoder all call it — a second copy of the
+loop is how a coverage bug gets in, and a coverage bug here makes the file *smaller* while every
+individual block still round-trips.
+
+Blocks never straddle a subband boundary: coefficients either side have different orientation and
+different statistics, and the context model assumes a block is homogeneous.
+
+**Why a per-tile `coder` byte.** The two engines share this binarisation but not a bitstream. A
+decoder that picks the wrong one does not fail — an adaptive arithmetic decoder reads every later
+symbol from a corrupted interval *and* a corrupted context, and reconstructs a plausible wrong
+image. Recording the choice per tile costs one byte and removes the failure mode.
+
+**Lengths are varints** because block size spans three orders of magnitude within one tile: the
+8×8 deep subbands cost a handful of bytes where a busy 64×64 HL block costs thousands. At tile 256
+with 5 levels a tile holds 25 blocks, so a flat u32 table would spend ~120 KB per 1080p 4:4:4
+frame on header alone.
+
+**Code-block size.** `cb = 64` is the shipped value. Larger blocks code better — an adaptive coder
+needs symbols to learn on, and 16 px blocks lose to Rice outright — but `abac_decode.wgsl` keeps
+two rows of neighbour magnitudes per thread in workgroup memory and is sized for 64. The decoder
+must reject a `cb_log2` it cannot address rather than decode it wrongly.
+
 ---
 
 ## 3. Sequence Container (GNV1)
@@ -487,7 +530,8 @@ Tiles are strictly independent: no cross-tile dependencies at any stage. Each ti
 
 | Magic | Readable | Notes |
 |-------|----------|-------|
-| GP17 | Yes | Current version: Golomb-Rice stream-length tables (tile flag 0x08) |
+| GP18 | Yes | Current version: entropy type 5, adaptive binary code-block coder (Section 2.6) |
+| GP17 | Yes | Golomb-Rice stream-length tables (tile flag 0x08) |
 | GP16 | Yes | Exp-Golomb bit-coded MV deltas + all-zero flag byte |
 | GP15 | Yes | Rice `k_zrl` split into `k_zrl_nz` + `k_zrl_z` per subband |
 | GP14 | Yes | Per-block `fwd_ref_idx` / `bwd_ref_idx` for hierarchical pyramid B-frames |

@@ -1,6 +1,7 @@
 pub mod abac;
 pub mod abac_compare;
 pub mod abac_gpu;
+pub mod abac_tile;
 pub mod adaptive;
 pub mod bitplane;
 pub mod block_transform;

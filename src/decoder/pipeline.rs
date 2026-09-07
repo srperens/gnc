@@ -41,6 +41,7 @@ pub struct DecoderPipeline {
     pub(super) rans_decoder: GpuRansDecoder,
     pub(super) bitplane_decoder: GpuBitplaneDecoder,
     pub(super) rice_decoder: GpuRiceDecoder,
+    pub(super) abac_decoder: crate::encoder::abac_gpu::GpuAbacDecoder,
     pub(super) huffman_decoder: GpuHuffmanDecoder,
     pub(super) interleaver: PlaneInterleaver,
     pub(super) cfl_predictor: CflPredictor,
@@ -292,6 +293,7 @@ impl DecoderPipeline {
             rans_decoder: GpuRansDecoder::new(ctx),
             bitplane_decoder: GpuBitplaneDecoder::new(ctx),
             rice_decoder: GpuRiceDecoder::new(ctx),
+            abac_decoder: crate::encoder::abac_gpu::GpuAbacDecoder::new(ctx),
             huffman_decoder: GpuHuffmanDecoder::new(ctx),
             interleaver: PlaneInterleaver::new(ctx),
             cfl_predictor: CflPredictor::new(ctx),
@@ -1486,6 +1488,22 @@ impl DecoderPipeline {
                         &bufs.entropy_var_b[plane],
                         &bufs.scratch_a,
                         total_blocks,
+                    );
+                }
+                EntropyData::Abac(_) => {
+                    // One thread per code-block. The coder is serial *within* a block, so the
+                    // parallelism is across blocks — roughly 1000 per plane at 1080p 4:4:4
+                    // with 64px blocks. Blocks were sorted by area at pack time so a SIMD
+                    // group holds equal-sized work.
+                    self.abac_decoder.dispatch_decode(
+                        ctx,
+                        cmd,
+                        &bufs.entropy_params[plane],
+                        &bufs.entropy_var_a[plane],
+                        &bufs.entropy_var_b[plane],
+                        &bufs.scratch_a,
+                        bufs.abac_blocks[plane],
+                        bufs.abac_coder,
                     );
                 }
                 EntropyData::Huffman(_) => {

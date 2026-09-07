@@ -85,6 +85,11 @@ pub(super) struct CachedBuffers {
     /// When true, entropy decoding was done on CPU (context-adaptive mode).
     /// `encode_gpu_work` should copy from `cpu_decoded_planes` instead of GPU decode.
     pub(super) ctx_adaptive_decode: bool,
+
+    /// Blocks uploaded per plane for `EntropyData::Abac`, and the engine they were coded with.
+    /// The dispatch needs both and neither is derivable from the buffers it binds.
+    pub(super) abac_blocks: [u32; 3],
+    pub(super) abac_coder: crate::encoder::abac::Coder,
     /// Per-plane CPU-decoded coefficient buffers (used for context-adaptive decode).
     pub(super) cpu_decoded_planes: [wgpu::Buffer; 3],
 
@@ -517,6 +522,8 @@ impl CachedBuffers {
             plane_alpha_bufs,
             plane_alpha_cap,
             ctx_adaptive_decode: false,
+            abac_blocks: [0; 3],
+            abac_coder: crate::encoder::abac::Coder::default(),
             cpu_decoded_planes: std::array::from_fn(|i| {
                 ctx.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some(["dec_cpu_plane0", "dec_cpu_plane1", "dec_cpu_plane2"][i]),

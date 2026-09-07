@@ -5,6 +5,7 @@ use crate::encoder::bitplane::GpuBitplaneDecoder;
 use crate::encoder::cfl;
 use crate::encoder::entropy_helpers;
 use crate::encoder::motion::MotionEstimator;
+use crate::encoder::abac_gpu::GpuAbacDecoder;
 use crate::encoder::rans_gpu::GpuRansDecoder;
 use crate::encoder::rice_gpu::GpuRiceDecoder;
 use crate::encoder::huffman_gpu::GpuHuffmanDecoder;
@@ -230,6 +231,53 @@ impl DecoderPipeline {
                         &bufs.entropy_var_b[p],
                         0,
                         bytemuck::cast_slice(&packed.stream_offsets),
+                    );
+                }
+            }
+            EntropyData::Abac(tiles) => {
+                for p in 0..3 {
+                    let start = plane_offset[p];
+                    let p_tiles = &tiles[start..start + plane_tiles[p]];
+                    let packed = GpuAbacDecoder::pack_decode_data(p_tiles, plane_info[p]);
+                    bufs.abac_blocks[p] = packed.num_blocks;
+                    bufs.abac_coder = packed.coder;
+
+                    ctx.queue.write_buffer(
+                        &bufs.entropy_params[p],
+                        0,
+                        bytemuck::bytes_of(&packed.params),
+                    );
+
+                    // block streams → entropy_var_a
+                    let stream_size = (packed.stream_data.len() * 4) as u64;
+                    ensure_var_buf(
+                        ctx,
+                        &mut bufs.entropy_var_a[p],
+                        &mut bufs.entropy_var_a_cap[p],
+                        stream_size.max(4),
+                        "dec_abac_stream",
+                        storage_dst,
+                    );
+                    ctx.queue.write_buffer(
+                        &bufs.entropy_var_a[p],
+                        0,
+                        bytemuck::cast_slice(&packed.stream_data),
+                    );
+
+                    // per-block geometry → entropy_var_b
+                    let info_size = (packed.block_info.len() * 4) as u64;
+                    ensure_var_buf(
+                        ctx,
+                        &mut bufs.entropy_var_b[p],
+                        &mut bufs.entropy_var_b_cap[p],
+                        info_size.max(4),
+                        "dec_abac_blocks",
+                        storage_dst,
+                    );
+                    ctx.queue.write_buffer(
+                        &bufs.entropy_var_b[p],
+                        0,
+                        bytemuck::cast_slice(&packed.block_info),
                     );
                 }
             }

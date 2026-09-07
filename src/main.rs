@@ -366,6 +366,11 @@ enum Command {
         #[arg(long)]
         huffman: bool,
 
+        /// Use the adaptive binary code-block coder (abac). Smallest files measured — −16.7% mean
+        /// against Rice at q=90 — at about 1.69x Rice's frame decode. CPU encode, GPU decode.
+        #[arg(long)]
+        abac: bool,
+
         /// Wavelet type: 97 (CDF 9/7) or 53 (LeGall 5/3). Overrides quality preset if specified.
         #[arg(long)]
         wavelet: Option<String>,
@@ -438,6 +443,11 @@ enum Command {
         /// Use canonical Huffman entropy coder instead of rANS (default)
         #[arg(long)]
         huffman: bool,
+
+        /// Use the adaptive binary code-block coder (abac). Smallest files measured — −16.7% mean
+        /// against Rice at q=90 — at about 1.69x Rice's frame decode. CPU encode, GPU decode.
+        #[arg(long)]
+        abac: bool,
 
         /// Use CPU entropy encoding instead of GPU
         #[arg(long)]
@@ -975,6 +985,7 @@ fn main() {
             rans,
             rice,
             huffman,
+            abac,
             wavelet,
             no_per_subband,
             cpu_encode,
@@ -1023,6 +1034,9 @@ fn main() {
             }
             if huffman {
                 config.entropy_coder = gnc::EntropyCoder::Huffman;
+            }
+            if abac {
+                config.entropy_coder = gnc::EntropyCoder::Abac;
             }
             if no_per_subband {
                 config.per_subband_entropy = false;
@@ -1102,6 +1116,7 @@ fn main() {
             rans,
             rice,
             huffman,
+            abac,
             cpu_encode,
             dct,
             dct_freq_strength,
@@ -1130,6 +1145,9 @@ fn main() {
             if huffman {
                 config.entropy_coder = gnc::EntropyCoder::Huffman;
             }
+            if abac {
+                config.entropy_coder = gnc::EntropyCoder::Abac;
+            }
             if cpu_encode {
                 config.gpu_entropy_encode = false;
             }
@@ -1154,6 +1172,7 @@ fn main() {
                 gnc::EntropyCoder::Rans => "rANS single-table".to_string(),
                 gnc::EntropyCoder::Rice => "Rice (sig+Golomb)".to_string(),
                 gnc::EntropyCoder::Huffman => "Huffman (sig+canonical)".to_string(),
+                gnc::EntropyCoder::Abac => "abac (adaptive binary code-blocks)".to_string(),
             };
             let encode_mode = if config.gpu_entropy_encode {
                 "GPU"

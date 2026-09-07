@@ -52,7 +52,11 @@ struct Params {
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var<storage, read> stream: array<u32>;
 @group(0) @binding(2) var<storage, read> blocks: array<BlockInfo>;
-@group(0) @binding(3) var<storage, read_write> out: array<i32>;
+// f32, not i32: this is the same buffer every other entropy decoder writes (`scratch_a`), and the
+// dequantiser downstream reads it as float. Writing raw i32 bits here decodes without error and
+// then turns every negative coefficient into a NaN, because -1 as i32 is 0xFFFFFFFF, which is a
+// quiet NaN as f32. Quantised coefficients are far inside f32's exact-integer range.
+@group(0) @binding(3) var<storage, read_write> out: array<f32>;
 
 // Decoder state, per thread. Kept in one struct so the helpers read like the Rust ones.
 struct Dec {
@@ -271,7 +275,7 @@ fn main(
                     v = i32(a);
                 }
             }
-            out[info.out_offset + y * info.stride + x] = v;
+            out[info.out_offset + y * info.stride + x] = f32(v);
             rows[(cur + x) * WG + tid] = a;
         }
     }
@@ -435,7 +439,7 @@ fn main_rc(
                     v = i32(a);
                 }
             }
-            out[info.out_offset + y * info.stride + x] = v;
+            out[info.out_offset + y * info.stride + x] = f32(v);
             rows[(cur + x) * WG + tid] = a;
         }
     }

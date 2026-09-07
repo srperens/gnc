@@ -338,6 +338,14 @@ pub enum EntropyCoder {
     /// Distribution-adaptive codes (vs Rice's fixed Golomb-Rice), closing the
     /// low-bitrate gap. Same ZRL scheme as Rice for zero runs.
     Huffman,
+    /// Adaptive binary arithmetic coding over independent code-blocks (EBCOT's design, without
+    /// its bit-planes or PCRD). CPU encode, GPU decode — one thread per code-block.
+    ///
+    /// The rate win over Rice is the largest single mechanism measured in this repo: −16.7% mean
+    /// at q=90 (bbb −13.8, blue_sky −16.6, touchdown −16.3, kristensara −20.1). It costs about
+    /// 1.69x Rice's frame decode, which is logged throughput debt rather than a veto — GOALS §5,
+    /// form first, then speed. Not a default; select it explicitly.
+    Abac,
 }
 
 /// Codec configuration
@@ -572,6 +580,7 @@ impl CodecConfig {
     pub fn normalize_for_chroma(&mut self) {
         if self.chroma_format != ChromaFormat::Yuv444
             && self.entropy_coder != EntropyCoder::Rice
+            && self.entropy_coder != EntropyCoder::Abac
         {
             self.entropy_coder = EntropyCoder::Rice;
         }
@@ -859,6 +868,7 @@ pub enum EntropyData {
     Bitplane(Vec<encoder::bitplane::BitplaneTile>),
     Rice(Vec<encoder::rice::RiceTile>),
     Huffman(Vec<encoder::huffman::HuffmanTile>),
+    Abac(Vec<encoder::abac_tile::AbacTile>),
 }
 
 impl EntropyData {
@@ -869,6 +879,7 @@ impl EntropyData {
             EntropyData::Bitplane(tiles) => tiles.iter().map(|t| t.byte_size()).sum(),
             EntropyData::Rice(tiles) => tiles.iter().map(|t| t.byte_size()).sum(),
             EntropyData::Huffman(tiles) => tiles.iter().map(|t| t.byte_size()).sum(),
+            EntropyData::Abac(tiles) => tiles.iter().map(|t| t.byte_size()).sum(),
         }
     }
 }

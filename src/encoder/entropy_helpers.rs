@@ -1,3 +1,5 @@
+use super::abac::Coder;
+use super::abac_tile::{self, AbacTile};
 use super::bitplane;
 use super::huffman;
 use super::rans;
@@ -15,11 +17,15 @@ pub(super) enum EntropyMode {
     Bitplane,
     Rice,
     Huffman,
+    /// Adaptive binary arithmetic coding over code-blocks. CPU encode, GPU decode.
+    Abac,
 }
 
 impl EntropyMode {
     pub(super) fn from_config(config: &CodecConfig) -> Self {
-        if config.entropy_coder == EntropyCoder::Huffman {
+        if config.entropy_coder == EntropyCoder::Abac {
+            EntropyMode::Abac
+        } else if config.entropy_coder == EntropyCoder::Huffman {
             EntropyMode::Huffman
         } else if config.entropy_coder == EntropyCoder::Rice {
             EntropyMode::Rice
@@ -56,8 +62,14 @@ pub(super) fn encode_entropy(
     bp_tiles: &mut Vec<bitplane::BitplaneTile>,
     rice_tiles: &mut Vec<rice::RiceTile>,
     huffman_tiles: &mut Vec<huffman::HuffmanTile>,
+    abac_tiles: &mut Vec<AbacTile>,
 ) {
-    if use_gpu_encode && !matches!(entropy_mode, EntropyMode::Rice | EntropyMode::Huffman) {
+    if use_gpu_encode
+        && !matches!(
+            entropy_mode,
+            EntropyMode::Rice | EntropyMode::Huffman | EntropyMode::Abac
+        )
+    {
         let (mut rt, mut st) = gpu_encoder.encode_plane_to_tiles(
             ctx,
             quantized_buf,
@@ -83,6 +95,7 @@ pub(super) fn encode_entropy(
             bp_tiles,
             rice_tiles,
             huffman_tiles,
+            abac_tiles,
         );
     }
 }
@@ -124,6 +137,7 @@ pub(crate) fn entropy_decode_plane(
             EntropyData::Bitplane(tiles) => bitplane::bitplane_decode_tile(&tiles[tile_start + t]),
             EntropyData::Rice(tiles) => rice::rice_decode_tile(&tiles[tile_start + t]),
             EntropyData::Huffman(tiles) => huffman::huffman_decode_tile(&tiles[tile_start + t]),
+            EntropyData::Abac(tiles) => abac_tile::abac_decode_tile(&tiles[tile_start + t]),
         };
 
         // Scatter tile coefficients back into flat plane
@@ -155,7 +169,15 @@ pub(super) fn entropy_encode_tiles(
     bp_tiles: &mut Vec<bitplane::BitplaneTile>,
     rice_tiles: &mut Vec<rice::RiceTile>,
     huffman_tiles: &mut Vec<huffman::HuffmanTile>,
+    abac_tiles: &mut Vec<AbacTile>,
 ) {
+    // One engine for the whole encode: the two share a binarisation but not a bitstream, and it
+    // is recorded per tile so the decoder never has to consult the environment.
+    let abac_coder = if matches!(mode, EntropyMode::Abac) {
+        abac_coder_from_env()
+    } else {
+        Coder::default()
+    };
     for ty in 0..tiles_y {
         for tx in 0..tiles_x {
             let coeffs = extract_tile_coefficients(quantized, plane_width, tx, ty, tile_size);
@@ -194,8 +216,36 @@ pub(super) fn entropy_encode_tiles(
                         num_levels,
                     ));
                 }
+                EntropyMode::Abac => {
+                    abac_tiles.push(abac_tile::abac_encode_tile(
+                        &coeffs,
+                        tile_size_u32,
+                        num_levels,
+                        abac_cb_from_env(),
+                        abac_coder,
+                    ));
+                }
             }
         }
+    }
+
+    // Canary. A silently-inactive entropy coder shows up as "no rate change", which reads as a
+    // null result rather than a bug; this prints what actually ran on real coefficients.
+    if matches!(mode, EntropyMode::Abac) && super::diagnostics::enabled() {
+        let coded = &abac_tiles[abac_tiles.len() - tiles_x * tiles_y..];
+        let blocks: usize = coded.iter().map(|t| t.block_lengths.len()).sum();
+        let bytes: usize = coded.iter().map(|t| t.block_data.len()).sum();
+        let empty = coded
+            .iter()
+            .flat_map(|t| t.block_lengths.iter())
+            .filter(|&&l| l == 0)
+            .count();
+        eprintln!(
+            "  [abac] plane {tiles_x}x{tiles_y} tiles: abac_blocks={blocks} \
+             (empty={empty}) bytes={bytes} coder={:?} cb={}",
+            abac_coder,
+            abac_cb_from_env(),
+        );
     }
 }
 
@@ -218,4 +268,35 @@ fn extract_tile_coefficients(
         }
     }
     coeffs
+}
+
+/// Which arithmetic engine `EntropyCoder::Abac` encodes with.
+///
+/// **Range by default**, unlike [`Coder::from_env`], which the standalone diagnostics use and
+/// which defaults to Interval because that is what their −19% to −25% figures were measured with.
+/// For a shipped encode the choice is settled: on real coefficients at q=90 Range costs 33.0 ms
+/// of entropy decode against Interval's 96.3 ms — 2.9x — for 0.7 points of rate (−13.8% vs
+/// −14.5% on bbb). Range at cb=64 dominates every other cell measured.
+pub(crate) fn abac_coder_from_env() -> Coder {
+    match std::env::var("GNC_ABAC_CODER").as_deref() {
+        Ok("interval") => Coder::Interval,
+        _ => Coder::Range,
+    }
+}
+
+/// Code-block edge, `GNC_ABAC_CB`. Clamped to what `abac_decode.wgsl` can address: it keeps two
+/// rows of neighbour magnitudes per thread in workgroup memory, sized for 64. A larger value
+/// would code better and then fail to decode on the GPU, so it is refused here rather than at
+/// dispatch.
+pub(crate) fn abac_cb_from_env() -> u32 {
+    let cb = std::env::var("GNC_ABAC_CB")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(abac_tile::DEFAULT_CB);
+    assert!(
+        cb.is_power_of_two() && (4..=crate::encoder::abac_gpu::MAX_BLOCK_W).contains(&cb),
+        "GNC_ABAC_CB must be a power of two in 4..={}, got {cb}",
+        crate::encoder::abac_gpu::MAX_BLOCK_W
+    );
+    cb
 }

@@ -1685,12 +1685,16 @@ impl EncoderPipeline {
         let mut bp_tiles: Vec<bitplane::BitplaneTile> = Vec::new();
         let mut rice_tiles: Vec<rice::RiceTile> = Vec::new();
         let mut huffman_tiles: Vec<huffman::HuffmanTile> = Vec::new();
+        let mut abac_tiles: Vec<crate::encoder::abac_tile::AbacTile> = Vec::new();
         let entropy_mode = EntropyMode::from_config(config);
         let tile_size = config.tile_size as usize;
         let tiles_x = info.tiles_x() as usize;
         let tiles_y = info.tiles_y() as usize;
+        // Abac has no GPU encode path: it is a serial adaptive coder, encoded on the CPU from a
+        // readback and decoded on the GPU one thread per code-block.
         let use_gpu_encode = config.gpu_entropy_encode
             && config.entropy_coder != EntropyCoder::Bitplane
+            && config.entropy_coder != EntropyCoder::Abac
             && !config.context_adaptive;
         let use_gpu_rice = use_gpu_encode && config.entropy_coder == EntropyCoder::Rice;
         let use_gpu_huffman = use_gpu_encode && config.entropy_coder == EntropyCoder::Huffman;
@@ -1702,8 +1706,11 @@ impl EncoderPipeline {
         // Catch any misconfiguration early rather than encoding silently corrupt output.
         if chroma_format != ChromaFormat::Yuv444 {
             assert!(
-                config.entropy_coder == EntropyCoder::Rice,
-                "non-444 chroma subsampling requires Rice entropy coder; \
+                matches!(
+                    config.entropy_coder,
+                    EntropyCoder::Rice | EntropyCoder::Abac
+                ),
+                "non-444 chroma subsampling requires the Rice or abac entropy coder; \
                  got {:?} which lacks a per-plane GPU dispatch path",
                 config.entropy_coder,
             );
@@ -2471,6 +2478,7 @@ impl EncoderPipeline {
                     &mut bp_tiles,
                     &mut rice_tiles,
                     &mut huffman_tiles,
+                    &mut abac_tiles,
                 );
             }
         }
@@ -2664,6 +2672,7 @@ impl EncoderPipeline {
             EntropyMode::Rans => EntropyData::Rans(rans_tiles),
             EntropyMode::Rice => EntropyData::Rice(rice_tiles),
             EntropyMode::Huffman => EntropyData::Huffman(huffman_tiles),
+            EntropyMode::Abac => EntropyData::Abac(abac_tiles),
         };
 
         if profile {

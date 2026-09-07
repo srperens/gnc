@@ -3122,8 +3122,11 @@ impl EncoderPipeline {
         let tile_size = config.tile_size as usize;
         let tiles_x = info.tiles_x() as usize;
         let tiles_y = info.tiles_y() as usize;
-        let use_gpu_encode =
-            config.gpu_entropy_encode && config.entropy_coder != EntropyCoder::Bitplane;
+        // Abac has no GPU encode path: it is a serial adaptive coder, encoded on the CPU from a
+        // readback and decoded on the GPU one thread per code-block.
+        let use_gpu_encode = config.gpu_entropy_encode
+            && config.entropy_coder != EntropyCoder::Bitplane
+            && config.entropy_coder != EntropyCoder::Abac;
 
         // Non-444 chroma subsampling: compute chroma-plane dimensions.
         // gpu_ref_planes stores all planes at luma size (chroma was NN-upsampled after I-frame
@@ -3163,6 +3166,7 @@ impl EncoderPipeline {
         let mut bp_tiles: Vec<bitplane::BitplaneTile> = Vec::new();
         let mut rice_tiles: Vec<rice::RiceTile> = Vec::new();
         let mut huffman_tiles: Vec<huffman::HuffmanTile> = Vec::new();
+        let mut abac_tiles: Vec<crate::encoder::abac_tile::AbacTile> = Vec::new();
 
         // Diagnostics: staging buffers for per-channel residual readback
         let diag_enabled = diagnostics::enabled();
@@ -4629,6 +4633,7 @@ impl EncoderPipeline {
                 EntropyMode::Rans => EntropyData::Rans(rans_tiles),
                 EntropyMode::Rice => EntropyData::Rice(rice_tiles),
                 EntropyMode::Huffman => EntropyData::Huffman(huffman_tiles),
+            EntropyMode::Abac => EntropyData::Abac(abac_tiles),
             };
 
             return (
@@ -5015,6 +5020,7 @@ impl EncoderPipeline {
                     &mut bp_tiles,
                     &mut rice_tiles,
                     &mut huffman_tiles,
+                    &mut abac_tiles,
                 );
             }
         }
@@ -5027,6 +5033,7 @@ impl EncoderPipeline {
             EntropyMode::Rans => EntropyData::Rans(rans_tiles),
             EntropyMode::Rice => EntropyData::Rice(rice_tiles),
             EntropyMode::Huffman => EntropyData::Huffman(huffman_tiles),
+            EntropyMode::Abac => EntropyData::Abac(abac_tiles),
         };
 
         // === Batched local decode + MV copy: single command encoder ===
@@ -5383,8 +5390,11 @@ impl EncoderPipeline {
         let tile_size = config.tile_size as usize;
         let tiles_x = info.tiles_x() as usize;
         let tiles_y = info.tiles_y() as usize;
-        let use_gpu_encode =
-            config.gpu_entropy_encode && config.entropy_coder != EntropyCoder::Bitplane;
+        // Abac has no GPU encode path: it is a serial adaptive coder, encoded on the CPU from a
+        // readback and decoded on the GPU one thread per code-block.
+        let use_gpu_encode = config.gpu_entropy_encode
+            && config.entropy_coder != EntropyCoder::Bitplane
+            && config.entropy_coder != EntropyCoder::Abac;
 
         let me_total_blocks = (padded_w / ME_BLOCK_SIZE) * (padded_h / ME_BLOCK_SIZE);
 
@@ -5393,6 +5403,7 @@ impl EncoderPipeline {
         let mut bp_tiles: Vec<bitplane::BitplaneTile> = Vec::new();
         let mut rice_tiles: Vec<rice::RiceTile> = Vec::new();
         let mut huffman_tiles: Vec<huffman::HuffmanTile> = Vec::new();
+        let mut abac_tiles: Vec<crate::encoder::abac_tile::AbacTile> = Vec::new();
 
         // Diagnostics: staging buffers for per-channel residual readback
         let diag_enabled = diagnostics::enabled();
@@ -6100,6 +6111,7 @@ impl EncoderPipeline {
                 EntropyMode::Rans => EntropyData::Rans(rans_tiles),
                 EntropyMode::Rice => EntropyData::Rice(rice_tiles),
                 EntropyMode::Huffman => EntropyData::Huffman(huffman_tiles),
+            EntropyMode::Abac => EntropyData::Abac(abac_tiles),
             };
 
             return (
@@ -6294,6 +6306,7 @@ impl EncoderPipeline {
                     &mut bp_tiles,
                     &mut rice_tiles,
                     &mut huffman_tiles,
+                    &mut abac_tiles,
                 );
             }
         }
@@ -6306,6 +6319,7 @@ impl EncoderPipeline {
             EntropyMode::Rans => EntropyData::Rans(rans_tiles),
             EntropyMode::Rice => EntropyData::Rice(rice_tiles),
             EntropyMode::Huffman => EntropyData::Huffman(huffman_tiles),
+            EntropyMode::Abac => EntropyData::Abac(abac_tiles),
         };
 
         // === Deferred batched readback: single submit + poll for all bidir data ===
@@ -7164,6 +7178,7 @@ impl EncoderPipeline {
         let mut bp_tiles: Vec<bitplane::BitplaneTile> = Vec::new();
         let mut rice_tiles: Vec<rice::RiceTile> = Vec::new();
         let mut huffman_tiles: Vec<huffman::HuffmanTile> = Vec::new();
+        let mut abac_tiles: Vec<crate::encoder::abac_tile::AbacTile> = Vec::new();
 
         let bufs = self.cached.as_ref().unwrap();
         let staging: [wgpu::Buffer; 3] = std::array::from_fn(|idx| {
@@ -7232,6 +7247,7 @@ impl EncoderPipeline {
                 &mut bp_tiles,
                 &mut rice_tiles,
                 &mut huffman_tiles,
+                &mut abac_tiles,
             );
         }
 
@@ -7243,6 +7259,7 @@ impl EncoderPipeline {
             EntropyMode::Rans => EntropyData::Rans(rans_tiles),
             EntropyMode::Rice => EntropyData::Rice(rice_tiles),
             EntropyMode::Huffman => EntropyData::Huffman(huffman_tiles),
+            EntropyMode::Abac => EntropyData::Abac(abac_tiles),
         };
 
         CompressedFrame {

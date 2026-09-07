@@ -387,6 +387,10 @@ fn serialize_tile_blobs(entropy: &crate::EntropyData) -> Vec<Vec<u8>> {
         crate::EntropyData::Huffman(tiles) => {
             tiles.iter().map(huffman::serialize_tile_huffman).collect()
         }
+        crate::EntropyData::Abac(tiles) => tiles
+            .iter()
+            .map(crate::encoder::abac_tile::serialize_tile_abac)
+            .collect(),
     }
 }
 
@@ -665,11 +669,15 @@ fn deserialize_mvs_delta(
 /// MV overhead by 50-80% for typical content.
 pub fn serialize_compressed(frame: &crate::CompressedFrame) -> Vec<u8> {
     let mut out = Vec::new();
-    // Magic: GP15 (splits Rice k_zrl into k_zrl_nz + k_zrl_z per subband for 2-state
-    // magnitude-conditioned zero-run context, K_STRIDE 17→25 per tile, #53).
+    // Magic: GP18 adds entropy type 5, the adaptive binary code-block coder (`EntropyData::Abac`).
+    // Nothing else moved, so a GP18 frame using any older coder is byte-identical to the GP17 one
+    // apart from these four bytes — but a GP17 decoder would reject type 5 rather than
+    // misinterpret it, which is what the generation is for.
+    // GP17 added Golomb-Rice stream-length tables (tile flag 0x08).
+    // GP15 splits Rice k_zrl into k_zrl_nz + k_zrl_z per subband (K_STRIDE 17→25 per tile, #53).
     // GP14 adds fwd_ref_idx + bwd_ref_idx for hierarchical pyramid B-frames.
     // GP13 is GP12 + chroma_format byte.
-    out.extend_from_slice(b"GP17");
+    out.extend_from_slice(b"GP18");
     // Common header fields (includes chroma_format byte for GP13)
     serialize_frame_header(frame, &mut out);
     // Motion field — GP12 uses delta-coded varint MVs
@@ -702,13 +710,15 @@ pub fn serialize_compressed(frame: &crate::CompressedFrame) -> Vec<u8> {
             out.push(mf.bwd_ref_idx.unwrap_or(1));
         }
     }
-    // Entropy coder type: 0 = rANS, 1 = bitplane, 2 = per-subband rANS, 3 = Rice, 4 = Huffman
+    // Entropy coder type: 0 = rANS, 1 = bitplane, 2 = per-subband rANS, 3 = Rice, 4 = Huffman,
+    // 5 = abac code-blocks (GP18)
     let entropy_type: u32 = match &frame.entropy {
         crate::EntropyData::Rans(_) => 0,
         crate::EntropyData::SubbandRans(_) => 2,
         crate::EntropyData::Bitplane(_) => 1,
         crate::EntropyData::Rice(_) => 3,
         crate::EntropyData::Huffman(_) => 4,
+        crate::EntropyData::Abac(_) => 5,
     };
     out.extend_from_slice(&entropy_type.to_le_bytes());
     // Serialize each tile to bytes, compute CRC-32
@@ -809,6 +819,21 @@ pub fn substitute_tiles(frame: &mut crate::CompressedFrame, tile_indices: &[usiz
                         block_offsets: vec![0; t.block_offsets.len()],
                         block_data: Vec::new(),
                     };
+                }
+            }
+            // An abac tile with no blocks decodes to nothing; give it one empty block per
+            // code-block position so the geometry the decoder derives still matches, and let the
+            // coder's own all-zero encoding fill the tile with zeros.
+            crate::EntropyData::Abac(ref mut tiles) => {
+                if idx < tiles.len() {
+                    let t = &tiles[idx];
+                    tiles[idx] = crate::encoder::abac_tile::abac_encode_tile(
+                        &vec![0i32; (t.tile_size * t.tile_size) as usize],
+                        t.tile_size,
+                        t.num_levels,
+                        t.cb_size,
+                        t.coder,
+                    );
                 }
             }
             crate::EntropyData::Rice(ref mut tiles) => {
@@ -919,8 +944,10 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
         b"GP16" => 16,
         // GP17: per-tile stream-length tables may be Golomb-Rice coded (tile flag 0x08).
         b"GP17" => 17,
+        // GP18: entropy type 5, the adaptive binary code-block coder.
+        b"GP18" => 18,
         _ => panic!(
-            "Invalid magic (expected GPC8..GP17; older files must be re-encoded)"
+            "Invalid magic (expected GPC8..GP18; older files must be re-encoded)"
         ),
     };
 
@@ -1256,6 +1283,29 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
             (
                 crate::EntropyCoder::Huffman,
                 crate::EntropyData::Huffman(tiles),
+                false,
+            )
+        }
+        5 => {
+            assert!(
+                gen >= 18,
+                "entropy type 5 (abac) requires GP18 or later, got GP{gen}"
+            );
+            let mut tiles = Vec::with_capacity(num_tiles);
+            for i in 0..num_tiles {
+                let slice = if let Some(ref sizes) = tile_sizes {
+                    &data[pos..pos + sizes[i] as usize]
+                } else {
+                    &data[pos..]
+                };
+                let (tile, consumed) =
+                    crate::encoder::abac_tile::deserialize_tile_abac(slice);
+                tiles.push(tile);
+                pos += consumed;
+            }
+            (
+                crate::EntropyCoder::Abac,
+                crate::EntropyData::Abac(tiles),
                 false,
             )
         }

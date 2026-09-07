@@ -133,6 +133,22 @@ impl DecoderPipeline {
                             tiles_per_plane as u32,
                         );
                     }
+                    EntropyData::Abac(_) => {
+                        // One thread per code-block. The coder is serial *within* a block, so the
+                        // parallelism is across blocks — roughly 1000 per plane at 1080p 4:4:4
+                        // with 64px blocks. Blocks were sorted by area at pack time so a SIMD
+                        // group holds equal-sized work.
+                        self.abac_decoder.dispatch_decode(
+                            ctx,
+                            &mut cmd,
+                            &bufs.entropy_params[0],
+                            &bufs.entropy_var_a[0],
+                            &bufs.entropy_var_b[0],
+                            &bufs.scratch_a,
+                            bufs.abac_blocks[0],
+                            bufs.abac_coder,
+                        );
+                    }
                     EntropyData::Bitplane(_) => {
                         let total_blocks = (tiles_per_plane * blocks_per_tile) as u32;
                         self.bitplane_decoder.dispatch_decode(

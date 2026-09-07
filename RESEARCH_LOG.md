@@ -4,6 +4,144 @@
 
 ---
 
+## INTRA-1 step 1 — GNC spends within 7.5% of the entropy of its own coefficients, so ~72% of the JPEG 2000 gap is upstream (2026-09-07)
+
+**Hypothesis and the fork it settles.** ENT-4 left GNC at **+27.1% of rate against JPEG 2000 in
+irreversible 9/7 mode** at matched RGB PSNR, with `--abac` on, on the same transform at the same
+depth. INTRA-1 step 1 asks one question: does GNC spend close to the entropy of its own
+coefficients? Close ⇒ the coder is done and the problem is upstream (quantiser, lifting
+normalisation, tiling). Materially more ⇒ there is coder headroom left after abac.
+
+**Success criteria, set before measuring.** The two branches were declared to be separated at
+roughly a third of the gap: if entropy coding could account for ≥ ~9 of the 27.1 points, keep going
+down the coder road; below that, the gap is upstream and step 2 runs instead.
+
+**Method.** New diagnostic `src/encoder/coef_entropy_diag.rs`, gated `GNC_COEF_ENTROPY=1`, zero
+cost when unset, read-only on data the encoder has already produced (decision 0010). It takes the
+**shipped** abac tiles — not a re-encode, not a Python DWT — decodes them back with abac's own
+decoder, and prices the coefficients that came out, per plane and per subband, against what the
+bitstream actually paid for them:
+
+| column | model |
+|---|---|
+| `shipped` | real bytes per code-block plus each block's length field |
+| `H0` | zeroth-order entropy of the signed symbols, pooled per plane and subband |
+| `Hctx` | conditional entropy of abac's **own** binarisation under abac's **own** 18 contexts, pooled |
+| `Hnb` | magnitude as one symbol under a 50-context causal neighbourhood, KT model cost charged |
+| `Hnb0` | the same with no model cost charged — an absolute floor no real coder reaches |
+| `Hbig` | a 4x wider template, 200 contexts reaching two coefficients out, KT cost charged |
+
+Four images (the ENT-4 set), six quality points, 4:4:4, tile 256, 5 levels, cb 64, `--abac`.
+Commit: this one; binary built in `../gnc-intra1`.
+
+**Instrument checks.** The per-band rows account for **99.95%** of the serialized abac payload —
+the remainder is the seven-byte per-tile header — and the coefficients priced are abac's own decode
+of its own stream, so the comparison cannot be against a different set of coefficients than the one
+that was paid for. Coefficient counts are constant across q per image (7 864 320 for 1080p 4:4:4 at
+tile 256, 2 949 120 for 720p), which is the padding canary. Re-running after a refactor reproduced
+every figure exactly.
+
+### Raw numbers — bytes, whole frame, all three planes
+
+| image | q | shipped | H0 | Hctx | Hnb | best bound | ship vs Hctx | **ship vs best** |
+|---|---|---|---|---|---|---|---|---|
+| bbb_1080p | 60 | 736396 | 852340 | 714181 | 688838 | 674547 | +3.1% | **+9.2%** |
+| bbb_1080p | 75 | 997067 | 1155846 | 979955 | 938010 | 919414 | +1.7% | **+8.4%** |
+| bbb_1080p | 85 | 1436965 | 1683572 | 1430114 | 1365325 | 1342535 | +0.5% | **+7.0%** |
+| bbb_1080p | 90 | 1791863 | 2080743 | 1790424 | 1696020 | 1669242 | +0.1% | **+7.3%** |
+| bbb_1080p | 95 | 2288929 | 2581261 | 2294640 | 2149016 | 2114784 | −0.2% | **+8.2%** |
+| bbb_1080p | 99 | 3198632 | 3438680 | 3219137 | 2949206 | 2900653 | −0.6% | **+10.3%** |
+| blue_sky_1080p | 60 | 568668 | 708247 | 543279 | 514895 | 503477 | +4.7% | **+12.9%** |
+| blue_sky_1080p | 75 | 797330 | 988435 | 779663 | 736755 | 721811 | +2.3% | **+10.5%** |
+| blue_sky_1080p | 85 | 1260905 | 1541685 | 1261251 | 1199421 | 1176785 | −0.0% | **+7.1%** |
+| blue_sky_1080p | 90 | 1472179 | 1776879 | 1476540 | 1395887 | 1370667 | −0.3% | **+7.4%** |
+| blue_sky_1080p | 95 | 1933455 | 2264269 | 1946785 | 1827265 | 1797344 | −0.7% | **+7.6%** |
+| blue_sky_1080p | 99 | 2706508 | 3046778 | 2717567 | 2505673 | 2466541 | −0.4% | **+9.7%** |
+| kristensara_720p | 60 | 154744 | 178239 | 140485 | 134388 | 128507 | +10.1% | **+20.4%** |
+| kristensara_720p | 75 | 234719 | 266443 | 221943 | 212802 | 205178 | +5.8% | **+14.4%** |
+| kristensara_720p | 85 | 459393 | 494785 | 448435 | 434809 | 425512 | +2.4% | **+8.0%** |
+| kristensara_720p | 90 | 553540 | 589585 | 543246 | 526234 | 515550 | +1.9% | **+7.4%** |
+| kristensara_720p | 95 | 754627 | 788047 | 744830 | 719524 | 705927 | +1.3% | **+6.9%** |
+| kristensara_720p | 99 | 1096849 | 1116122 | 1085841 | 1034747 | 1015450 | +1.0% | **+8.0%** |
+| touchdown_1080p | 60 | 580321 | 620017 | 555598 | 539522 | 530786 | +4.4% | **+9.3%** |
+| touchdown_1080p | 75 | 869457 | 936071 | 853639 | 824361 | 811019 | +1.9% | **+7.2%** |
+| touchdown_1080p | 85 | 1414760 | 1533618 | 1414616 | 1366126 | 1343118 | +0.0% | **+5.3%** |
+| touchdown_1080p | 90 | 1654434 | 1781410 | 1657647 | 1592331 | 1567245 | −0.2% | **+5.6%** |
+| touchdown_1080p | 95 | 2177323 | 2319915 | 2185159 | 2085296 | 2056766 | −0.4% | **+5.9%** |
+| touchdown_1080p | 99 | 3049198 | 3173557 | 3047035 | 2850827 | 2819373 | +0.1% | **+8.2%** |
+
+Mean headroom against the best bound, by q: **13.0% (60), 10.1% (75), 6.9% (85), 6.9% (90),
+7.1% (95), 9.0% (99)**. Mean over q ≥ 85, the contribution range: **7.49%**. Over all 24 points:
+8.84%.
+
+### The answer
+
+**Entropy coding can account for at most about 7.5 of the 27.1 points — 28% of the gap. About 72%,
+roughly 19.6 points, is upstream of the coder.** Taking every one of those 7.5 points out leaves
+GNC at **+17.6%** against J2K 9/7.
+
+That is below the pre-declared threshold, so **INTRA-1 goes down its step-2 branch.** Decision
+record `docs/decisions/0024`.
+
+### Challenging the result — three ways it could have been wrong
+
+- **The bound could be too weak.** It is not: `Hbig` reaches two coefficients further in both
+  directions with 4x the contexts and finds **nothing** — it lands *above* `Hnb` on the large bands
+  once its model cost is charged, and below it only in the tiny ones. The local-context model has
+  saturated, which is the direct evidence that another context refinement is not where 19 points
+  are hiding.
+- **The model cost could be doing the work.** It is not: `Hnb0` charges nothing at all for
+  signalling its tables — unreachable by any real coder — and buys only a further 1.6%.
+- **It could disagree with the existing offline estimate.** It agrees. RESEARCH_LOG's offline model
+  put EBCOT's full neighbourhood at −16.4% against abac's vertical-only −11.7% relative to Rice,
+  i.e. **5.3% apart**; this measures **4–7%** on real shipped coefficients by a completely different
+  method. Two methods agreeing to within two points is the best cross-check either number has, and
+  it is the *third* time this points the same way.
+
+### Where the 7.5% that *is* the coder's actually sits — and it is not the context model
+
+| | share of rate | shipped vs bound | share of the headroom |
+|---|---|---|---|
+| levels 1–2 (full 64x64 code-blocks) | 82% (q=90) | **+4.1%** | 46% |
+| LL + levels 3–5 (blocks smaller than 64px) | 18% (q=90) | **+25.9%** | 54% |
+
+Per q: levels 1–2 read +4.07% / +4.13% / +4.59% / +6.61% at q = 85/90/95/99; the small bands read
++23.1% / +25.9% / +28.9% / +34.2% while carrying only 19.6% / 18.2% / 16.2% / 14.2% of the rate.
+
+**Half the remaining coder headroom is cold-start, not modelling.** At tile 256 with 5 levels the LL
+and the level-3/4/5 bands are 32, 16 and 8 px square, so each becomes one short code-block — 64
+coefficients to adapt 18 context probabilities on, against 4096 in a full block. The worst rows are
+`Y HL5` at +47.3% and `Y LL` at +66.7% (bbb, q=90). On the bands where abac gets a full block it is
+within 4.1% of a bound that charges nothing for being generous.
+
+Filed as a follow-up rather than fixed here, because mixing a coder change into the measurement that
+says the coder is not the problem would have invalidated the measurement. Worth about 4% of the
+file: signalled initial probabilities per subband, or letting the deep subbands share one code-block.
+
+### Caveats
+
+- **+27.1% is a BD-rate over the ladder; the headroom here is a rate ratio at fixed q.** abac is
+  lossless recoding of the same coefficients, so an *x*% rate saving moves the BD-rate by
+  approximately *x* points — but they are not the same quantity and the arithmetic treats them as
+  if they were.
+- **The bounds pool statistics across a whole plane's worth of a subband**, which no real coder
+  has. That is deliberate: "even with priors it could never have, the coder is within 7.5%" is the
+  strong form of the claim.
+- **Only causal spatial neighbourhoods were tested.** A parent / cross-subband context (SPIHT, EZW)
+  is the one model class not covered. It is not plausibly worth 20 points when two more rings of
+  spatial neighbours are worth zero, but if step 2 comes back empty it is what to try next.
+- **This says nothing about the chroma allocation.** ENT-4's Y-PSNR gap (+48.3%) is larger than the
+  RGB one and an entropy coder cannot move bits between planes; that is MEAS-9's finding, untouched.
+
+**Gates:** `cargo test --release -- --test-threads=1` green (219 passed, 0 failed, 8 ignored);
+`cargo clippy --release` clean. `cargo clippy --release --target wasm32-unknown-unknown` fails on
+`src/main.rs` with 11 pre-existing `GpuContext::new()` errors — **verified pre-existing on `main` at
+`07c01b1` by stashing this branch's changes and re-running**; the wasm *library* target
+(`--lib`) is clean. Flagged in COORDINATION.
+
+
+---
+
 
 ## RATE-1 — the 8-bit precision question is a no, and the sweep found a worse defect (2026-09-07)
 

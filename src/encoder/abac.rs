@@ -53,7 +53,7 @@ const QUARTER: u32 = 1 << (STATE_BITS - 2);
 const THREE_QUARTER: u32 = HALF + QUARTER;
 
 /// Number of neighbourhood buckets a context is drawn from.
-const NUM_BUCKETS: usize = 6;
+pub(crate) const NUM_BUCKETS: usize = 6;
 /// Contexts: one bucket set per binary decision (significant, >1, >2).
 const NUM_CONTEXTS: usize = NUM_BUCKETS * 3;
 
@@ -291,7 +291,7 @@ impl<'a> Decoder<'a> {
 }
 
 /// Bucket the neighbourhood magnitude sum into a context index.
-fn bucket(nb: u32) -> usize {
+pub(crate) fn bucket(nb: u32) -> usize {
     if nb == 0 {
         0
     } else {
@@ -304,7 +304,7 @@ fn bucket(nb: u32) -> usize {
 /// Left, up, up-left and up-right — all decoded before (y, x) in a raster scan, so a decoder has
 /// them. Out-of-block positions count as zero rather than reaching into a neighbouring block,
 /// which keeps blocks genuinely independent and decodable in any order.
-fn neighbour_sum(mag: &[u32], w: usize, y: usize, x: usize) -> u32 {
+pub(crate) fn neighbour_sum(mag: &[u32], w: usize, y: usize, x: usize) -> u32 {
     let at = |yy: usize, xx: usize| -> u32 {
         if xx >= w {
             0

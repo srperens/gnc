@@ -77,8 +77,11 @@ measured advantage over x264 on any axis at this operating point.**
 
 0. **INTRA-1 — where is the remaining 27%?** Added 2026-09-07 after ENT-4. With `--abac` on, GNC
    needs 27.1% more bits than JPEG 2000 *using the same transform at the same depth*, and nothing in
-   this repository accounts for it. Largest known compression gap; step 1 is one cheap measurement
-   that splits it into "coder" or "upstream of the coder".
+   this repository accounts for it. Largest known compression gap. **Step 1 is done (2026-09-07):
+   GNC spends within 7.5% of the entropy of its own coefficients at q >= 85, so entropy coding can
+   account for at most ~7.5 of the 27.1 points and ~72% is upstream of the coder.** The item is now
+   its step-2 branch — whole-frame transform against 256px tiles, quantiser shape and per-subband
+   step, lifting normalisation, code-block geometry. Decision `docs/decisions/0024`.
 1. **Intra at contribution quality** — the whole remaining +90.5% lives here, per findings 1 and 5.
    Inter breaks even at this operating point for x264 too, so this is the only place the gap is.
    **First instalment paid 2026-09-07 (ABAC-SHIP): −17.3% of intra rate at q=90, opt-in.** Against
@@ -2626,7 +2629,31 @@ structural is costing a quarter of the bitrate and we cannot currently name it.
 - **Tile geometry, as far as it has been measured.** 512 over 256 is −0.91%, and six levels at tile
   512 is −0.1% (BUG-11/BUG-12). Note both stop at 512 and neither tested a whole-frame transform.
 
-### Step 1 — the measurement that splits the gap in two. Do this first; it is cheap.
+### Step 1 — **DONE 2026-09-07. The gap is upstream: entropy coding can account for at most 28% of it.**
+
+**Measured: GNC spends 7.5% more than the entropy of its own coefficients at q >= 85** (5.3%-10.3%
+across 16 points; 8.8% over all 24, including the lossy end where the coder is looser). The gap to
+J2K 9/7 is 27.1 points; taking every one of those 7.5 points out leaves **+17.6%**. So **entropy
+coding accounts for at most ~7.5 of the 27.1 points (28%) and ~19.6 points (72%) is upstream.**
+
+Tool: `src/encoder/coef_entropy_diag.rs`, `GNC_COEF_ENTROPY=1`. It decodes the **shipped** abac
+tiles and prices the coefficients they carry against six models, per plane and per subband —
+`H0`, abac's own context (`Hctx`), and three richer neighbourhood models. Four images, six quality
+points. Per-band rows cover 99.95% of the abac payload, which is the coverage canary.
+
+**Why the bound holds.** `Hbig` widens the context template 4x and finds **nothing**; `Hnb0`
+charges no model cost at all and buys 1.6%. And it agrees with the existing offline estimate by a
+completely different method (full-neighbourhood EBCOT −16.4% vs abac's −11.7% relative to Rice is
+5.3% apart; this measures 4-7%).
+
+**Where the coder's own 7.5% is**, and it is not the context model: on the bands that get a full
+64x64 code-block (82% of the rate) abac is within **+4.1%** of the bound; on LL and levels 3-5,
+whose blocks are 32/16/8px, it is **+25.9%** — 54% of the headroom on 18% of the rate. That is
+cold-start on blocks too small to adapt, filed as **ENT-6**, worth about 4% of the file.
+
+Full numbers in RESEARCH_LOG 2026-09-07 and `docs/decisions/0024`.
+
+### Step 1 — the measurement that splits the gap in two (as originally specified)
 
 **Compare what GNC spends against the entropy of GNC's own coefficients**, per subband, at a rate
 matched to J2K. Both quantities are computable from a single encode:
@@ -2643,7 +2670,7 @@ One number, and it decides which of two entirely different investigations to run
 has the machinery: `meas_ebcot_context.py` computes conditional entropy per subband against a
 faithful simulation of the shipped coder, and `GNC_DIAGNOSTICS=1` reports per-group counts.
 
-### Step 2, if the gap is upstream — the candidates, cheapest first
+### Step 2 — **this is the branch step 1 selected.** The candidates, cheapest first
 
 1. **Whole-frame transform vs 256px tiles.** GNC transforms 35 independent tiles on a 1080p frame;
    J2K transforms the whole picture. Each tile's LL is 8x8 at five levels, against a 60x34 LL for
@@ -2734,6 +2761,47 @@ much is left for coefficient modelling, which is the difference between "keep go
 and "the remaining gap is somewhere else". Decision 0018 makes that the leading question, since
 entropy coding is the one lever that pays on intra, inter, lossless and every chroma format at
 once.
+
+### ENT-6 — abac's deep subbands are one short code-block each, and they cost ~4% of the file (todo, P2)
+
+Filed 2026-09-07 by INTRA-1 step 1, which found it while measuring something else. **Not the answer
+to INTRA-1** — it is worth about 4% of the file and the J2K gap is 27 points — but it is the one
+concrete, cheap entropy-coding win that measurement turned up, and it is half of all the headroom
+abac has left.
+
+**The mechanism.** `code_blocks()` never lets a block straddle a subband boundary, which is right —
+the statistics either side differ. But at tile 256 with 5 levels the LL and the level-3/4/5 bands
+are 32, 16 and 8 px square, so each becomes **one short code-block**: 64 coefficients to adapt 18
+context probabilities on, against 4096 in a full 64x64 block. abac starts every block at p = 1/2.
+
+**Measured**, against the most generous entropy bound on the same coefficients
+(`GNC_COEF_ENTROPY=1`, four images, mean over the four):
+
+| | share of rate | shipped vs bound |
+|---|---|---|
+| levels 1-2 (full 64x64 blocks) | 82% | +4.1% (q=90) |
+| LL + levels 3-5 (blocks < 64px) | 18% | **+25.9%** (q=90) |
+
+Worst individual rows on bbb at q=90: `Y LL` **+66.7%**, `Y HL5` **+47.3%**, `Y HL4` +30.9%. The
+effect grows with quality: the small bands read +23.1% / +25.9% / +28.9% / +34.2% at q = 85/90/95/99.
+
+**Two candidate fixes, and they are not exclusive.**
+
+1. **Signalled initial probabilities per subband.** One byte per context per subband per tile, set
+   from the encoder's own statistics. `AbacTile` already carries a header; 18 bytes per subband is
+   ~0.3% of a tile at these rates. This is exactly what the offline work called `warm_start`, where
+   it moved the 256-stream variant from +2.4% to −0.7% — the same mechanism one scale up.
+2. **Let the deep subbands share one code-block.** LL + the three level-5 bands are 4x8x8 = 256
+   coefficients; the level-4 set is 4x16x16 = 1024. Cutting one block per *level* instead of one
+   per band gives the coder 4x the symbols. Costs the per-band homogeneity the current cut buys, so
+   it must be measured, not assumed — the orientation difference is real.
+
+**Success criterion:** ≥2% of total rate at q=90 on all four stills, at bit-identical decoded
+pixels (abac is lossless recoding; if quality moves at all, something else changed). Below 1%,
+close it — CLAUDE.md's "know when to stop".
+
+**Canary:** `GNC_COEF_ENTROPY=1` prints the per-band `vs Hnb` column; the LL and level-3/4/5 rows
+are the ones that must move, and levels 1-2 must not.
 
 ### ENT-5 — abac needs a GPU encoder, and it is what stands between abac and the default (todo, P1)
 

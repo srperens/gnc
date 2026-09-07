@@ -2669,6 +2669,26 @@ impl EncoderPipeline {
             });
         }
 
+        // === Coefficient-entropy diagnostic (GNC_COEF_ENTROPY=1) — INTRA-1 step 1 ===
+        // Prices the *shipped* abac tiles against the entropy of the coefficients they carry, so
+        // it must run after entropy coding and before `abac_tiles` is moved into `EntropyData`.
+        // Read-only; it cannot move the bitstream (docs/decisions/0010).
+        if !abac_tiles.is_empty() && std::env::var("GNC_COEF_ENTROPY").is_ok() {
+            use std::sync::OnceLock;
+            static COEF_ENTROPY_DONE: OnceLock<()> = OnceLock::new();
+            COEF_ENTROPY_DONE.get_or_init(|| {
+                super::coef_entropy_diag::run(
+                    &abac_tiles,
+                    [
+                        plane_tiles_x[0] * plane_tiles_y[0],
+                        plane_tiles_x[1] * plane_tiles_y[1],
+                        plane_tiles_x[2] * plane_tiles_y[2],
+                    ],
+                    config.quantization_step,
+                );
+            });
+        }
+
         let entropy = match entropy_mode {
             EntropyMode::Bitplane => EntropyData::Bitplane(bp_tiles),
             EntropyMode::SubbandRans | EntropyMode::SubbandRansCtx => {

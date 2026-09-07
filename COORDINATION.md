@@ -188,6 +188,7 @@ If this table and `scripts/claim list` disagree, the table is wrong.
 | `../gnc-nearlossless` | `nearlossless` | **done and merged 2026-09-07** — BUG-15 fixed, INTRA-NEARLOSSLESS closed by measurement, RATE-2 confirmed independently. Worktree removed. |
 | _(removed)_ | `abacship`, `bug18` | **ABAC-SHIP merged, both worktrees gone 2026-09-07** (`60bed17`, `378a0c7`, `436680e`, `6513bb6`). abac is a real entropy coder: `--abac`, entropy type 5, **GP18**, stills *and* sequences. **Standing figures: intra −16.6% to −18.8% at identical pixels, lossless −13.4%** (FFV1 gap +23.9% → +7.3%). ~~inter −14.4%~~ **retracted** — see the retraction section above. Rice stays the default (`docs/decisions/0017`). **Every frame this encoder writes now says GP18**; a GP18 Rice frame is a GP17 payload with a new label, proved by relabelling and decoding, and GP17 still reads. **Left open and unclaimed: BUG-18 (P1)** — the CPU-entropy P-frame path encodes every P-frame wrong; cause 1 fixed, cause 2 open, `tests/bug18_locate.rs` reproduces it in one command. |
 | `../gnc-rate1` | `rate1` | **DONE, merged, worktree removed.** RATE-1 answered **no** — a bit-depth-aware rate rule recovers **0.0% on all four photographic stills** (89.4% on the synthetic gradient, which is the trap). The sweep found **RATE-2 instead, filed P1**: above q≈95-98 the lossy ladder costs more bytes than bit-exact lossless on every real image, mean **+28.9% at q=99** (blue_sky +40.6%). LOSSLESS-1 made lossless cheap enough to undercut the top of the lossy ladder and nothing noticed. |
+| `../gnc-intra1` | `intra1` | **INTRA-1 — the largest known compression gap.** Step 1 answered 2026-09-07: `GNC_COEF_ENTROPY=1` prices the *shipped* abac tiles against the entropy of the coefficients they carry, and GNC spends within **7.5% of it at q >= 85**. So entropy coding can account for at most ~7.5 of the 27.1 points against JPEG 2000 9/7 and **~72% is upstream of the coder** — the item is now its step-2 branch (tiling, quantiser shape, lifting normalisation). Decision `0024`. Turned up **ENT-6** on the way: the deep subbands are one short code-block each and cost ~4% of the file. Adds one diagnostic module and two `pub(crate)` exports; **invalidates no measurement** — the encoder path is untouched and the diagnostic is env-gated and read-only. |
 | `../gnc-coord` | `coord` | **COORD-1 — the claim mechanism enforces the rules instead of restating them.** Docs and `scripts/claim` only; no codec change, invalidates no measurement. `scripts/claim next` makes the *pick* atomic, the shared-checkout and worktree preconditions are now refusals rather than prose, and the session identity bug that made `SESSION GONE` undetectable is fixed. See `docs/decisions/0019`. Claimed 2026-09-07. |
 
 ## The test material was missing entirely, and was refetched (2026-09-07) — RESOLVED
@@ -316,6 +317,19 @@ from the *start* of the file is what makes it cheap.
 **They are 24 frames, not 200.** QUAL-1 used 200 frames of old_town_cross and an unstated count of
 crowd_run, so a run against these reproduces the *content* but not the length, and BASELINE says
 17 frames where the QUAL-1 log says 24. Say which you used.
+
+## The wasm clippy gate is red on `main`, and it is the *binary*, not the library (2026-09-07, intra1)
+
+CLAUDE.md names `cargo clippy --release --target wasm32-unknown-unknown` as a gate that must be
+clean. **It does not compile on `main` at `07c01b1`** — 11 errors, all `src/main.rs` calling
+`GpuContext::new()`, which does not exist on that target. Verified pre-existing by stashing a
+branch's changes and re-running, so do not spend time believing it is yours.
+
+The **library** target is clean: `cargo clippy --release --target wasm32-unknown-unknown --lib`.
+That is the target that actually matters for the WASM story — `src/main.rs` is the CLI and is not
+part of a WASM build — so the useful gate is the `--lib` form until someone either gates the CLI's
+GPU paths behind `#[cfg(not(target_arch = "wasm32"))]` or drops the binary from that target.
+Not claimed by anyone; it is a small mechanical fix and wants an ID before it is worked on.
 
 ## `cargo test --release` is flaky on `main` right now — abac_bitstream races itself (2026-09-07)
 

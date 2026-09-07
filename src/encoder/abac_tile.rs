@@ -75,21 +75,52 @@ fn subbands(tile_size: usize, num_levels: u32) -> Vec<(usize, usize, usize, usiz
 /// block is homogeneous. Deep subbands smaller than `cb` become one short block each; at tile 256
 /// with 5 levels that is the 8×8 LL plus three 8×8 level-5 bands, 0.4% of the tile.
 pub fn code_blocks(tile_size: usize, num_levels: u32, cb: usize) -> Vec<(usize, usize, usize, usize)> {
+    code_blocks_banded(tile_size, num_levels, cb)
+        .into_iter()
+        .map(|(x, y, w, h, _)| (x, y, w, h))
+        .collect()
+}
+
+/// The same enumeration, with each block tagged by the index of the subband it was cut from.
+///
+/// The index is the position in the Mallat order [`subbands`] returns — 0 = LL, then HL/LH/HH per
+/// level from the coarsest outward. Diagnostics need the tag to attribute bytes to a band; the
+/// codec itself does not, which is why [`code_blocks`] stays the narrower signature.
+pub fn code_blocks_banded(
+    tile_size: usize,
+    num_levels: u32,
+    cb: usize,
+) -> Vec<(usize, usize, usize, usize, usize)> {
     let mut out = Vec::new();
-    for (sx, sy, sw, sh) in subbands(tile_size, num_levels) {
+    for (band, (sx, sy, sw, sh)) in subbands(tile_size, num_levels).into_iter().enumerate() {
         let mut by = 0;
         while by < sh {
             let bh = cb.min(sh - by);
             let mut bx = 0;
             while bx < sw {
                 let bw = cb.min(sw - bx);
-                out.push((sx + bx, sy + by, bw, bh));
+                out.push((sx + bx, sy + by, bw, bh, band));
                 bx += cb;
             }
             by += cb;
         }
     }
     out
+}
+
+/// Human-readable name of subband `band` at `num_levels`, in [`subbands`] order.
+pub fn band_name(band: usize, num_levels: u32) -> String {
+    if num_levels == 0 {
+        return "ALL".to_string();
+    }
+    if band == 0 {
+        return "LL".to_string();
+    }
+    // `subbands` pushes the finest level first (offset tile/2, size tile/2), so band 1..3 are
+    // level 1 — the highest-frequency bands — and the index grows toward the coarsest.
+    let level = (band - 1) / 3 + 1;
+    let orient = ["HL", "LH", "HH"][(band - 1) % 3];
+    format!("{orient}{level}")
 }
 
 /// Encode one tile's coefficients (row-major, `tile_size × tile_size`).

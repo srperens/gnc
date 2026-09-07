@@ -54,9 +54,11 @@ provably pointless; against 1.9x they accumulate into the target.** Every "this 
 bother with" judgement in this repo predating 2026-09-06 was made against the wrong denominator.
 
 Also settled: **never quote a VMAF BD-rate above about q=85** (widening the ladder moved it 47.5
-points on average, 110 on old_town, while PSNR moved 1.0), and **GNC leads x264 on colour at
-matched rate** (dE00 0.611 vs 0.684) while trailing 7.4–8.8 dB on luma — so quote both or the
-comparison misleads in whichever direction suits.
+points on average, 110 on old_town, while PSNR moved 1.0). ~~And **GNC leads x264 on colour at
+matched rate** (dE00 0.611 vs 0.684) while trailing 7.4–8.8 dB on luma~~ — **that colour lead is
+withdrawn (CHROMA-2, 2026-09-07, decision 0018): the rate-matched control has x264 ahead on 6 runs
+of 6, on five of them without needing a chroma-QP offset and while also leading luma. GNC has no
+measured advantage over x264 on any axis at this operating point.**
 
 ### Priority order
 
@@ -495,6 +497,7 @@ isolated gate; the shipped decoder has never been timed, and the machine was too
 (COORDINATION rule 1).
 
 ### CHROMA-1 — Is GNC's luma/chroma rate split on the frontier? (**DONE 2026-09-06**)
+**Withdrawn 2026-09-07 — see the CHROMA-2 entry above; x264 wins colour 6 of 6 at matched rate.**
 Falls out of QUAL-1. At rate matched to 1%, GNC beats x264 on dE00 on all three sequences while
 sitting **7.4–8.8 dB behind on luma**. The two codecs allocate rate differently between luma and
 chroma, so part of the +90.5% luma gap may be an allocation *choice* rather than a coding
@@ -677,7 +680,8 @@ mean of **47.5 points** (old_town: +81.1% → +191.4%) and the PSNR figure by **
 old_town VMAF reads 99.62–99.68 across a 6 dB PSNR spread — no signal left to integrate. This is
 COORDINATION rule 3 with a magnitude attached.
 
-**Colour reverses at matched rate.** CIEDE2000 on decoded RGB, rate matched to 1%: GNC 0.611 vs
+**Colour reverses at matched rate.** ~~(Withdrawn 2026-09-07 by CHROMA-2, decision 0018 — the
+control reverses it back: x264 ahead on 6 runs of 6.)~~ CIEDE2000 on decoded RGB, rate matched to 1%: GNC 0.611 vs
 x264 0.684 (bbb), 0.911 vs 0.949 (old_town) — GNC better on mean and 95th percentile on all three
 sequences, with fewer pixels past the JND, **while losing luma by 7.4–8.8 dB at the same points.**
 That is the two codecs allocating rate differently between luma and chroma, not GNC being better.
@@ -1888,7 +1892,37 @@ motion estimator (8x8/±16: 0.99→1.01x). Full measurement in RESEARCH_LOG 2026
 Reaches the same verdict as ICME 2006 and MPEG's deletion of the SVC temporal update step, from an
 independent direction.
 
-### CHROMA-2 — Is the colour result more than an allocation difference? (todo, P1)
+### CHROMA-2 — Is the colour result more than an allocation difference? (**DONE 2026-09-07** — no, and worse)
+
+**Answer: it is an allocation artefact, and the control found something stronger than that.**
+`scripts/meas_chroma2.py`, three sequences x {4:2:0, 4:4:4}, q=85, 24 frames, ki=9, x264's crf
+bisected to within 1% of GNC's bytes for each `--chroma-qp-offset` in {0,-2,-4,-6,-8}:
+
+| sequence | chroma | GNC dE00 | best x264 dE00 | offset | GNC luma (YCoCg-R) | x264 luma |
+|---|---|---|---|---|---|---|
+| bbb_extended | 420 | 1.183 | **1.107** | -8 | 46.73 | 46.59 |
+| bbb_extended | 444 | 0.537 | **0.464** | -6 | 46.81 | 48.91 |
+| old_town_cross | 420 | 0.916 | **0.550** | 0 | 46.22 | 53.32 |
+| old_town_cross | 444 | 0.923 | **0.385** | 0 | 46.22 | 53.59 |
+| crowd_run | 420 | 0.859 | **0.518** | -8 | 46.20 | 50.27 |
+| crowd_run | 444 | 0.839 | **0.348** | 0 | 46.22 | 53.54 |
+
+**x264 wins colour 6 of 6, and on five it needs no offset — it leads colour at offset 0 while also
+leading luma by 4.1-7.4 dB.** There is no trade to price. The README, GOALS, BASELINE, POSITIONING
+and CLAUDE.md rows are withdrawn; decision 0018 records it.
+
+**The harness control that mattered more.** RGB -> yuv -> RGB with no codec at all costs dE00
+**1.057** on bbb at 4:2:0 — ~90% of everything the codecs then scored — and on three of the six
+runs x264's dE00 equalled that floor to three decimals, meaning its coded colour error was nil.
+The floor is paid by the x264 arm only (GNC takes reference PNGs directly; YCoCg-R is reversible),
+so the comparison is conservative: the handicapped arm still wins. Any two-codec colour comparison
+here must state its floor.
+
+**QUAL-1's colour table does not reproduce** — same nominal config now gives 32% more bytes *and*
+worse dE00 — and it was taken an hour before CHROMA-1 changed q>=85 output, which COORDINATION
+already flagged as invalidating q>=85 figures. Its luma BD-rate is untouched.
+
+### Superseded statement of CHROMA-2 (todo, P1)
 
 The README's one claimed win over x264 is CIEDE2000 on all three sequences at rate matched to 1%,
 while trailing 7.4–8.8 dB on luma. Both halves are real, and together they say GNC spends a larger

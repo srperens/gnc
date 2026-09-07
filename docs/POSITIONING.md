@@ -255,7 +255,8 @@ Three consequences for this document's argument:
   costs about what the picture costs and the vectors are overhead. Both codecs break even here.
   Inter is a distribution-bitrate problem, and GNC is not a distribution codec.
 - **Colour is a genuine lead, and luma-only metrics hide it.** At rate matched to 1%, GNC beats
-  x264 on CIEDE2000 on all three sequences (0.611 vs 0.684 mean on bbb) with fewer pixels past the
+  x264 on CIEDE2000 on all three sequences (0.611 vs 0.684 mean on bbb) — **withdrawn 2026-09-07,
+  decision 0018: the rate-matched control reverses this on all six runs** — with fewer pixels past the
   JND, while sitting 7.4–8.8 dB behind on luma. For a codec sold on generation survival and colour
   fidelity that is the more relevant half, and no VMAF-based comparison can see it.
 - **And the luma gap is not an allocation choice.** The obvious cheap explanation — that GNC simply

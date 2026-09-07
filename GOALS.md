@@ -146,6 +146,14 @@ PSNR figure by 1.0. The +13.9% still-image figure is PSNR on stills, a third qua
 See [RESEARCH_LOG.md](RESEARCH_LOG.md), 2026-09-06, and the decision record
 [docs/decisions/0013](docs/decisions/0013-the-headline-gap-figure-was-the-wrong-operating-point.md).
 
+**The colour lead is withdrawn (CHROMA-2, decision 0018).** It read: at rate matched to 1%, GNC
+beats x264 on CIEDE2000 (0.611 vs 0.684 on bbb, 0.911 vs 0.949 on old_town). The control that
+settles it — hand x264 the same allocation via `--chroma-qp-offset`, re-match the rate — was run on
+2026-09-07 and **x264 wins on all six runs**, on five of them without needing the offset and while
+also leading luma by 4.1–7.4 dB. GNC has no measured advantage over x264 on any axis at this
+operating point. The superseded text follows.
+
+<!-- superseded 2026-09-07, kept so the reversal is visible rather than silent -->
 **And luma alone misleads here.** At rate matched to 1%, GNC beats x264 on CIEDE2000 (0.611 vs
 0.684 on bbb, 0.911 vs 0.949 on old_town, better 95th percentile on all three) while losing
 7.4-8.8 dB of luma PSNR. The two codecs allocate rate differently between luma and chroma, so a
@@ -201,7 +209,7 @@ GNC should become a **good, robust codec** — not optimized along a single axis
 | Chroma formats | 4:4:4, 4:2:2, 4:2:0 | keep all three working at 10-bit |
 | Compression (intra) | +46–55% vs H.264 all-I on video (VMAF); +13.9% on stills (PSNR) | ≤ H.264 all-I, measured at contribution quality |
 | Compression (video) | **+90.5% BD-rate on PSNR vs H.264 at contribution quality** (QUAL-1, 2026-09-06; +457% to +672% was distribution bitrates and is superseded) | ≤ +25%, and the remaining gap is intra |
-| Colour accuracy | **ahead of x264 on dE00 at matched rate** (0.611 vs 0.684 mean) while 7.4–8.8 dB behind on luma | keep the colour lead, close the luma gap |
+| Colour accuracy | **no lead — withdrawn 2026-09-07, decision 0018.** x264 wins dE00 on 6 of 6 rate-matched runs, on five without needing a chroma-QP offset and while also leading luma. GNC's dE00 0.54–0.92 mean is good in absolute terms, just not better | close the luma gap; there is no colour lead to keep |
 | Luma/chroma split | on the frontier as of CHROMA-1 (2026-09-06) — `chroma_weight` 1.2 is the largest value that costs nothing on MEAS-8's criterion | leave it; the remaining gap is not here |
 | Quality range | q=1–100 functional | smooth, predictable quality curve |
 | Robustness | basic test coverage | no artifacts, stable across q and content |

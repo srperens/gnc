@@ -9354,3 +9354,97 @@ scripts/build_jpegxs_arm64.sh                    # once, for the JPEG XS arms
     --images test_material/frames/{bbb_1080p,blue_sky_1080p,kristensara_720p,touchdown_1080p}.png \
     --arms gnc,jpegxs,jpegxs422,prores444,prores422,vc2,j2k,j2k_rev --csv meas9.csv
 ```
+---
+## 2026-09-07 — CHROMA-2: the colour row was an allocation artefact, and the control is worse than that
+
+**Hypothesis.** QUAL-1 measured that at rate matched to within 1%, GNC scores better mean CIEDE2000
+than x264 on three sequences while sitting 7.4–8.8 dB behind on luma, and read that as the two
+codecs *allocating* differently rather than GNC preserving colour better. The README carried it
+with that caveat attached and named the test that would settle it: hand x264 the same allocation
+via `--chroma-qp-offset` and re-measure dE00 at the same total rate.
+
+**Method.** `scripts/meas_chroma2.py`, new. For each sequence: encode GNC at q=85, then for each
+`--chroma-qp-offset` in {0, −2, −4, −6, −8} bisect x264's crf until the coded size is within 1% of
+GNC's, and score both decoded PNG sets against the same reference PNGs. dE00 via the validated
+CIEDE2000 in `chroma_metric.py` (`--selftest` passes 16/16 Sharma pairs). Luma in **YCoCg-R**, the
+plane GNC actually codes, with BT.709-from-RGB printed beside it as the contaminated cross-check.
+No VMAF: it is luma-only and saturated at this operating point, so it cannot answer this question.
+24 frames, ki=9, 8-bit, q=85, both 4:2:0 and 4:4:4. Sequences bbb_extended, old_town_cross,
+crowd_run — the three QUAL-1 used, refetched today because none of them was in the tree.
+
+### Result: x264 takes the colour win back on 6 runs out of 6
+
+| sequence | chroma | GNC dE00 | best x264 dE00 | at offset | GNC luma (YCoCg-R) | x264 luma |
+|---|---|---|---|---|---|---|
+| bbb_extended | 420 | 1.183 | **1.107** | −8 | 46.73 | 46.59 |
+| bbb_extended | 444 | 0.537 | **0.464** | −6 | 46.81 | 48.91 |
+| old_town_cross | 420 | 0.916 | **0.550** | 0 | 46.22 | 53.32 |
+| old_town_cross | 444 | 0.923 | **0.385** | 0 | 46.22 | 53.59 |
+| crowd_run | 420 | 0.859 | **0.518** | −8 | 46.20 | 50.27 |
+| crowd_run | 444 | 0.839 | **0.348** | 0 | 46.22 | 53.54 |
+
+**On five of the six, x264 does not need the offset at all** — it is already ahead on colour at
+offset 0, *while simultaneously leading luma by 4.1 to 7.4 dB*. The allocation control was built to
+test whether x264 could buy colour back by paying luma for it. On this material it does not have
+to trade: it is ahead on both axes at the same bitrate. Only bbb_extended at 4:2:0 behaves like a
+trade at all, and there the margin is 6.9% of dE00 for 0.14 dB.
+
+**Answer to CHROMA-2: the colour row is an allocation artefact. It comes out of the README.**
+
+### The control that mattered more than the control I set out to run
+
+Before trusting any of the above I measured what the *harness* costs with no codec in the loop —
+RGB → yuv → RGB, nothing encoded:
+
+| sequence | 4:2:0 floor | 4:4:4 floor |
+|---|---|---|
+| bbb_extended | **1.057** | 0.324 |
+| old_town_cross | 0.550 | 0.385 |
+| crowd_run | 0.445 | 0.348 |
+
+On bbb at 4:2:0 that floor is **1.057 against a total measured 1.107–1.183** — about 90% of
+everything the codecs appeared to score was chroma subsampling. Worse, on three of the six runs
+x264's measured dE00 equals the floor to three decimals (old_town 420: floor 0.5499, x264 0.550;
+old_town 444: 0.3854 / 0.385; crowd_run 444: 0.3481 / 0.348). Its coded colour error at those
+operating points is **nil**; the metric is reading the conversion and nothing else.
+
+This does not weaken the result, it hardens it, because **the floor is paid by one arm only**. The
+x264 arm goes RGB → yuv → encode → yuv → RGB. The GNC arm takes the reference PNGs directly and
+YCoCg-R is integer-reversible, so it pays nothing. The comparison therefore hands GNC a handicap
+worth up to 1.06 dE00 and GNC still loses. `meas_chroma2.py` now prints the floor before the table
+and warns when an arm lands on it, so nobody quotes x264's 0.348 as its colour fidelity — it is the
+harness's.
+
+### QUAL-1's colour table does not reproduce, and could not have
+
+Its bbb_extended row is GNC 11 782 280 bytes at q=85; the same nominal configuration here gives
+**15 551 218** — 32% more — with dE00 1.183 against its 0.611. More bytes and worse colour on the
+same content is not possible, so something differs, and three candidates are all documented in this
+repo already:
+
+1. **It predates CHROMA-1 by an hour.** QUAL-1 landed 18:25, CHROMA-1 at 19:16, and CHROMA-1
+   changes default output at **q ≥ 85 only** — exactly the operating point of QUAL-1's colour
+   table. COORDINATION already says "any q ≥ 85 file size measured before this is stale". That
+   applies to this table and nobody applied it.
+2. **The frame count is recorded two ways.** The QUAL-1 log says bbb_extended 24 frames;
+   BASELINE.md says 17 for the same comparison.
+3. **The sources were not in the tree.** bbb_extended, old_town_cross and crowd_run have never
+   been in `fetch_test_frames.sh` and were absent from the machine until today, so nothing since
+   has been checked against them.
+
+I am not retracting QUAL-1's *luma* BD-rate — that is a separate measurement and this run does not
+bear on it. But its colour table is unreproducible and superseded, and the conclusion drawn from it
+was the opposite of what the control now shows.
+
+### What this does and does not say
+
+- It does **not** say GNC's colour is bad in absolute terms. dE00 0.54–0.92 mean is below or near
+  the nominal JND of 1.0.
+- It does say the one row where GNC was recorded as beating x264 does not survive a rate-matched
+  control, and that **GNC has no measured advantage over x264 on any axis at this operating
+  point** — the +90.5% luma gap is the whole picture, not a trade.
+- The `chroma_weight` frontier CHROMA-1 measured is still real and still steep. What is gone is the
+  claim that GNC's position on it beats x264's.
+- **Rate/quality only. No throughput number is quoted here and none should be:** the machine ran at
+  load 57 with four other sessions for the whole sweep. Every figure above is bytes, dE00 or PSNR,
+  all deterministic and unaffected.

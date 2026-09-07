@@ -50,7 +50,7 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from chroma_metric import ciede2000, srgb_to_lab  # noqa: E402
-from meas1_vs_h264 import bd_rate  # noqa: E402  (same Bjontegaard code as the H.264 comparison)
+from meas1_vs_h264 import bd_rate as bd_rate_raw  # noqa: E402  (the H.264 comparison's Bjontegaard)
 
 
 def sh(cmd):
@@ -150,7 +150,25 @@ def arm_gnc(gnc_binary, src_png, orig_rgb, tmp, qualities):
     return rows
 
 
-def arm_ffmpeg(name, encoder, pix_fmt, container, rungs, src_png, orig_rgb, tmp):
+def requested_bpp(extra, pixels):
+    """The bpp a rate-driven rung asked for, from its own `-b:v`. None if it is quality-driven."""
+    for i, a in enumerate(extra):
+        if a == "-b:v" and i + 1 < len(extra):
+            return int(extra[i + 1]) / pixels
+    return None
+
+
+def arm_ffmpeg(name, encoder, pix_fmt, container, rungs, src_png, orig_rgb, tmp, pixels,
+               rate_tolerance=0.15):
+    """One ffmpeg arm. A rate-driven rung whose achieved bpp misses its request is DROPPED.
+
+    VC-2 low-delay assigns a fixed byte count per slice, and below a floor it cannot honour the
+    request at all: on kristensara_720p the 1.5, 2.5 and 3.5 bpp rungs all emitted the same
+    3.438 bpp and decoded to **10.3 dB / dE00 28** — visibly destroyed output. Scored naively that
+    reads as GNC winning by +36.7 dB, which is not a coding result, it is a broken encoder
+    configuration being quoted as a competitor. An arm may only contribute a point at a rate it
+    actually hit.
+    """
     rows = []
     for label, extra in rungs:
         stem = f"{name.replace(' ', '_')}_{label}"
@@ -162,26 +180,127 @@ def arm_ffmpeg(name, encoder, pix_fmt, container, rungs, src_png, orig_rgb, tmp)
         if not size or not ffmpeg_decode_png(enc, out_png):
             print(f"    {name} {label}: no packets or decode failed")
             continue
+        want = requested_bpp(extra, pixels)
+        got = size * 8 / pixels
+        if want is not None and abs(got - want) / want > rate_tolerance:
+            print(f"    {name} {label}: DROPPED — asked {want:.3f} bpp, encoder produced "
+                  f"{got:.3f} bpp ({(got - want) / want * 100:+.0f}%); rate not honoured")
+            continue
         rows.append((name, label, size, measure(orig_rgb, out_png)))
     return rows
 
 
-def arm_j2k(src_png, orig_rgb, tmp, rates):
+def arm_j2k(src_png, orig_rgb, tmp, rates, irreversible=True):
+    """OpenJPEG. `-I` selects the irreversible 9/7 transform, and it is not optional here.
+
+    opj_compress defaults to the **reversible 5/3** path, which is the wrong configuration for a
+    lossy comparison and costs JPEG 2000 2-3 dB at the same rate (bbb at 4.80 bpp: 45.55 dB
+    reversible against 48.58 dB irreversible). The first run of this harness used the default and
+    therefore flattered GNC by that margin. The reversible arm stays available because it is a
+    real J2K mode and it explains an otherwise baffling reading: reversible 5/3 + RCT codes a
+    luma numerically identical to YCoCg-R's, so once its luma subbands are fully coded Y-PSNR
+    runs off to 79-105 dB while colour error remains, which is what put a 105 dB point in the
+    first run's ladder.
+    """
     if shutil.which("opj_compress") is None:
         print("    JPEG 2000: opj_compress not in PATH, skipped")
         return []
+    name = "J2K 9/7" if irreversible else "J2K 5/3rev"
     rows = []
     for rate in rates:
-        j2k, out_png = tmp / f"j2k_r{rate}.j2k", tmp / f"j2k_r{rate}.png"
-        r = sh(["opj_compress", "-i", str(src_png), "-o", str(j2k), "-r", str(rate)])
+        stem = f"{name.replace(' ', '').replace('/', '')}_r{rate}"
+        j2k, out_png = tmp / f"{stem}.j2k", tmp / f"{stem}.png"
+        cmd = ["opj_compress", "-i", str(src_png), "-o", str(j2k), "-r", str(rate)]
+        if irreversible:
+            cmd.append("-I")
+        r = sh(cmd)
         if r.returncode != 0 or not os.path.exists(j2k):
-            print(f"    JPEG 2000 r={rate}: encode failed")
+            print(f"    {name} r={rate}: encode failed")
             continue
         r = sh(["opj_decompress", "-i", str(j2k), "-o", str(out_png)])
         if r.returncode != 0 or not os.path.exists(out_png):
-            print(f"    JPEG 2000 r={rate}: decode failed")
+            print(f"    {name} r={rate}: decode failed")
             continue
-        rows.append(("JPEG 2000", f"r{rate}", os.path.getsize(j2k), measure(orig_rgb, out_png)))
+        rows.append((name, f"r{rate}", os.path.getsize(j2k), measure(orig_rgb, out_png)))
+    return rows
+
+
+def jpegxs_binaries():
+    """Where scripts/build_jpegxs_arm64.sh leaves the apps, overridable for another host."""
+    root = Path(os.environ.get("GNC_JPEGXS_BIN",
+                               Path(os.environ.get("TMPDIR", "/tmp")) / "svt-jpegxs/Bin/Release"))
+    enc, dec = root / "SvtJpegxsEncApp", root / "SvtJpegxsDecApp"
+    return (enc, dec) if enc.exists() and dec.exists() else (None, None)
+
+
+def png_to_raw(src_png, pix_fmt, dst):
+    r = sh(["ffmpeg", "-nostdin", "-y", "-v", "error", "-i", str(src_png),
+            "-pix_fmt", pix_fmt, "-frames:v", "1", "-f", "rawvideo", str(dst)])
+    return r.returncode == 0 and os.path.exists(dst) and os.path.getsize(dst) > 0
+
+
+def raw_to_png(src_raw, pix_fmt, w, h, dst_png):
+    r = sh(["ffmpeg", "-nostdin", "-y", "-v", "error", "-f", "rawvideo",
+            "-pix_fmt", pix_fmt, "-s", f"{w}x{h}", "-i", str(src_raw),
+            "-pix_fmt", "rgb24", "-frames:v", "1", str(dst_png)])
+    return r.returncode == 0 and os.path.exists(dst_png)
+
+
+def arm_jpegxs(src_png, orig_rgb, tmp, w, h, bpps, colour_format="yuv444", depth=10):
+    """JPEG XS through SVT-JPEG-XS — the codec MEAS-9 was filed to measure.
+
+    Not in Homebrew and its CMake assumes x86 unconditionally; `scripts/build_jpegxs_arm64.sh`
+    plus `scripts/svt-jpegxs-arm64.patch` build it on arm64 by gating the nasm discovery and the
+    nine ASM object libraries, leaving the scalar C fallbacks that were always in the sources.
+    Verified there by round trip, not by linking: bbb at --bpp 3 gives PSNR y 44.48 dB.
+
+    **Rate and quality from this build are exact. Throughput is not** — every SIMD kernel is off
+    on this architecture, so nothing here may be quoted about JPEG XS speed. That matters because
+    speed is the whole reason the format exists (1-32 lines of latency, per EBU TR 092), and a
+    rate comparison against it is therefore only half the story.
+
+    `--bpp` is JPEG XS's CBR target and it hits it almost exactly, which is what its market
+    requires: constant bitrate is mandatory in live contribution, not a preference.
+    """
+    enc_bin, dec_bin = jpegxs_binaries()
+    if enc_bin is None:
+        print("    JPEG XS: SvtJpegxsEncApp not found "
+              "(run scripts/build_jpegxs_arm64.sh, or set GNC_JPEGXS_BIN), skipped")
+        return []
+    pix_fmt = {("yuv444", 10): "yuv444p10le", ("yuv444", 8): "yuv444p",
+               ("yuv422", 10): "yuv422p10le", ("yuv422", 8): "yuv422p"}[(colour_format, depth)]
+    name = f"JPEG XS {colour_format[3:]}"
+    raw = tmp / f"jxs_{colour_format}_{depth}.yuv"
+    if not png_to_raw(src_png, pix_fmt, raw):
+        print(f"    {name}: could not make {pix_fmt} raw input")
+        return []
+    rows = []
+    for bpp in bpps:
+        stem = f"jxs_{colour_format}_{bpp}"
+        jxs, out_raw, out_png = tmp / f"{stem}.jxs", tmp / f"{stem}.yuv", tmp / f"{stem}.png"
+        r = sh([str(enc_bin), "-i", str(raw), "-w", str(w), "-h", str(h),
+                "--colour-format", colour_format, "--input-depth", str(depth),
+                "--bpp", str(bpp), "-n", "1", "-b", str(jxs), "--no-progress", "1"])
+        if r.returncode != 0 or not os.path.exists(jxs) or os.path.getsize(jxs) == 0:
+            print(f"    {name} {bpp}bpp: encode failed "
+                  f"{r.stderr.strip().splitlines()[-1:] or r.stdout.strip().splitlines()[-1:]}")
+            continue
+        r = sh([str(dec_bin), "-i", str(jxs), "-o", str(out_raw)])
+        if r.returncode != 0 or not os.path.exists(out_raw):
+            print(f"    {name} {bpp}bpp: decode failed")
+            continue
+        if not raw_to_png(out_raw, pix_fmt, w, h, out_png):
+            print(f"    {name} {bpp}bpp: could not convert output back to PNG")
+            continue
+        size = os.path.getsize(jxs)
+        got = size * 8 / (w * h)
+        if abs(got - bpp) / bpp > 0.15:
+            print(f"    {name} {bpp}bpp: DROPPED — produced {got:.3f} bpp, rate not honoured")
+            continue
+        rows.append((name, f"{bpp}bpp", size, measure(orig_rgb, out_png)))
+        for f in (jxs, out_raw):
+            f.unlink(missing_ok=True)
+    raw.unlink(missing_ok=True)
     return rows
 
 
@@ -212,12 +331,13 @@ def vc2_rungs(w, h, qm="default"):
     tuned for a different metric is the mirror image of the VMAF/chroma error this repo keeps
     making against itself."""
     return [(f"{bpp}bpp", ["-slice_height", "8", "-qm", qm, "-b:v", str(int(bpp * w * h))])
-            for bpp in (1.5, 2.5, 3.5, 4.5, 6.0, 8.0, 10.0)]
+            for bpp in (3.5, 4.5, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0)]
 
 
 # ---------------------------------------------------------------------------
 
-ARM_ORDER = ["gnc", "prores444", "vc2", "j2k", "prores422"]
+ARM_ORDER = ["gnc", "jpegxs", "jpegxs422", "prores444", "vc2", "j2k", "j2k_rev", "prores422"]
+DEFAULT_ARMS = ["gnc", "jpegxs", "jpegxs422", "prores444", "j2k", "prores422"]
 
 
 def run_image(img_path, gnc_binary, arms, qualities, tmp, vc2_qm="default"):
@@ -238,15 +358,23 @@ def run_image(img_path, gnc_binary, arms, qualities, tmp, vc2_qm="default"):
         rows += arm_gnc(gnc_binary, img_path, orig, tmp, qualities)
     if "prores444" in arms:
         rows += arm_ffmpeg("ProRes 4444", "prores_ks", "yuv444p10le", "mov",
-                           prores444_rungs(), img_path, orig, tmp)
+                           prores444_rungs(), img_path, orig, tmp, w * h)
     if "vc2" in arms:
         rows += arm_ffmpeg(f"VC-2 {vc2_qm}", "vc2", "yuv444p10le", "matroska",
-                           vc2_rungs(w, h, vc2_qm), img_path, orig, tmp)
+                           vc2_rungs(w, h, vc2_qm), img_path, orig, tmp, w * h)
     if "j2k" in arms:
-        rows += arm_j2k(img_path, orig, tmp, (40, 20, 12, 8, 5, 3, 2))
+        rows += arm_j2k(img_path, orig, tmp, (40, 20, 12, 8, 5, 4, 3), irreversible=True)
+    if "j2k_rev" in arms:
+        rows += arm_j2k(img_path, orig, tmp, (40, 20, 12, 8, 5, 4, 3), irreversible=False)
+    if "jpegxs" in arms:
+        rows += arm_jpegxs(img_path, orig, tmp, w, h, (1.5, 2.5, 3.5, 4.5, 6.0, 8.0, 10.0),
+                           colour_format="yuv444", depth=10)
+    if "jpegxs422" in arms:
+        rows += arm_jpegxs(img_path, orig, tmp, w, h, (1.5, 2.5, 3.5, 4.5, 6.0, 8.0),
+                           colour_format="yuv422", depth=10)
     if "prores422" in arms:
         rows += arm_ffmpeg("ProRes 422", "prores_ks", "yuv422p10le", "mov",
-                           prores422_rungs(), img_path, orig, tmp)
+                           prores422_rungs(), img_path, orig, tmp, w * h)
 
     out = []
     for codec, label, size, m in rows:
@@ -265,23 +393,111 @@ def print_table(rows):
               f"{r['psnr_y']:>9.2f} {r['de00_mean']:>7.4f} {r['de00_p95']:>8.4f}")
 
 
-def bd_summary(rows, metric):
-    """BD-rate of GNC against each other arm, on `metric`. Negative = GNC needs fewer bits."""
+MIN_OVERLAP_DB = 3.0
+
+
+def saturation_warnings(rows):
+    """Arms whose quality stops responding to rate — an encoder limit, not a codec property.
+
+    ffmpeg's VC-2 encoder is why this exists: it saturates near 41-43 dB RGB PSNR on every
+    pixel format, bit depth and slice geometry tried, so 12 bpp buys 0.1 dB over 6 bpp. A
+    BD-rate against a saturated arm reports the encoder's ceiling and reads as a landslide for
+    whoever is not saturated. Anything flagged here cannot be quoted as a statement about the
+    *format*.
+    """
+    out = []
+    by_codec = {}
+    for r in rows:
+        by_codec.setdefault(r["codec"], []).append(r)
+    for codec, rs in sorted(by_codec.items()):
+        rs = sorted(rs, key=lambda r: r["bpp"])
+        if len(rs) < 2:
+            continue
+        a, b = rs[-2], rs[-1]
+        d_rate = (b["bpp"] - a["bpp"]) / a["bpp"] if a["bpp"] else 0.0
+        d_q = b["psnr_rgb"] - a["psnr_rgb"]
+        if d_rate > 0.20 and np.isfinite(d_q) and d_q < 0.5:
+            out.append(f"{codec}: +{d_rate * 100:.0f}% rate buys {d_q:+.2f} dB at the top of its "
+                       f"ladder ({a['bpp']:.2f} -> {b['bpp']:.2f} bpp) — rate-insensitive, so its "
+                       f"ceiling is the encoder's, not the format's")
+    return out
+
+
+def _window(pts, lo, hi):
+    """Points inside [lo, hi] on the quality axis, plus the nearest one on each side.
+
+    A cubic is fitted to whatever it is given, so points far outside the integration range bend
+    the curve *inside* it. Two arms here make that concrete: JPEG 2000 codes a reversible RCT
+    luma, so its top rung reaches 79-105 dB Y-PSNR, and ffmpeg's VC-2 emits 10 dB garbage below
+    ~4 bpp. Fitting either curve globally and integrating over a 15 dB window is not the same
+    quantity as fitting the window.
+    """
+    inside = [p for p in pts if lo <= p[1] <= hi]
+    below = [p for p in pts if p[1] < lo]
+    above = [p for p in pts if p[1] > hi]
+    if below:
+        inside.append(max(below, key=lambda p: p[1]))
+    if above:
+        inside.append(min(above, key=lambda p: p[1]))
+    return sorted(inside, key=lambda p: p[1])
+
+
+def bd_summary(rows, metric, min_overlap=MIN_OVERLAP_DB):
+    """BD-rate of GNC against each other arm on `metric`. Negative = GNC needs fewer bits.
+
+    Returns (codec, bd_percent_or_None, lo, hi, note) per arm. `note` says why a number is
+    missing, because a silent n/a reads as "no difference" and a BD-rate integrated over a
+    fraction of a dB reads as a landslide — the first run of this harness produced -58.6% and
+    -65.7% from overlaps of 0.1 and 2.5 dB.
+    """
     by_codec = {}
     for r in rows:
         if np.isfinite(r[metric]):
             by_codec.setdefault(r["codec"], []).append((r["bpp"], r[metric]))
     if "GNC" not in by_codec:
         return []
-    g = sorted(by_codec["GNC"])
+    g_all = sorted(by_codec["GNC"], key=lambda p: p[1])
     out = []
     for codec, pts in sorted(by_codec.items()):
-        if codec == "GNC" or len(pts) < 4 or len(g) < 4:
+        if codec == "GNC":
             continue
-        p = sorted(pts)
-        bd, (lo, hi) = bd_rate([x[0] for x in p], [x[1] for x in p],
-                               [x[0] for x in g], [x[1] for x in g])
-        out.append((codec, bd, lo, hi))
+        p_all = sorted(pts, key=lambda p: p[1])
+        lo = max(p_all[0][1], g_all[0][1])
+        hi = min(p_all[-1][1], g_all[-1][1])
+        if hi - lo < min_overlap:
+            out.append((codec, None, lo, hi,
+                        f"overlap {max(hi - lo, 0.0):.1f} dB < {min_overlap:.0f} dB required"))
+            continue
+        p, g = _window(p_all, lo, hi), _window(g_all, lo, hi)
+        if len(p) < 4 or len(g) < 4:
+            out.append((codec, None, lo, hi,
+                        f"only {min(len(p), len(g))} points in the overlap, 4 needed"))
+            continue
+        bd, _ = bd_rate_raw([x[0] for x in p], [x[1] for x in p],
+                            [x[0] for x in g], [x[1] for x in g])
+        out.append((codec, bd, lo, hi, ""))
+    return out
+
+
+def matched_rate_table(rows, gnc_rows):
+    """Each incumbent rung against GNC interpolated to the *same* bpp.
+
+    BD-rate cannot compare arms whose quality ranges barely overlap, and it cannot say anything
+    about colour at all. This can: it is the comparison CLAUDE.md asks for when the question is a
+    luma/chroma trade, and it is what the 4:2:2 arms have to be judged on, since their subsampling
+    ceiling sits below the range where a BD-rate against GNC would be computable.
+    """
+    if len(gnc_rows) < 2:
+        return []
+    g = sorted(gnc_rows, key=lambda r: r["bpp"])
+    bpps = [r["bpp"] for r in g]
+    out = []
+    for r in sorted(rows, key=lambda r: (r["codec"], r["bpp"])):
+        if r["codec"] == "GNC" or not (bpps[0] <= r["bpp"] <= bpps[-1]):
+            continue  # outside GNC's measured ladder: extrapolation, not measurement
+        at = {k: float(np.interp(r["bpp"], bpps, [x[k] for x in g]))
+              for k in ("psnr_y", "psnr_rgb", "de00_mean")}
+        out.append((r, at))
     return out
 
 
@@ -293,7 +509,8 @@ def main():
     ap.add_argument("--gnc-binary", default=str(root / "target/release/gnc"))
     ap.add_argument("--qualities", default="60,75,85,90,95,99",
                     help="GNC quality ladder (default spans the contribution operating point)")
-    ap.add_argument("--arms", default=",".join(ARM_ORDER))
+    ap.add_argument("--arms", default=",".join(DEFAULT_ARMS),
+                    help=f"any of: {', '.join(ARM_ORDER)}")
     ap.add_argument("--vc2-qm", default="default", choices=("default", "color", "flat"),
                     help="VC-2 quantisation matrix; 'flat' is its own optimise-for-PSNR setting")
     ap.add_argument("--csv", default=None)
@@ -315,18 +532,30 @@ def main():
             rows, _ = run_image(img, args.gnc_binary, arms, qualities, Path(tmpdir),
                                 vc2_qm=args.vc2_qm)
             print_table(rows)
+            for w in saturation_warnings(rows):
+                print(f"  CANARY  {w}")
             for metric, name in (("psnr_y", "Y-PSNR (YCoCg-R)"), ("psnr_rgb", "RGB PSNR")):
                 bds = bd_summary(rows, metric)
                 if bds:
                     print(f"  BD-rate on {name}, GNC vs:")
-                    for codec, bd, lo, hi in bds:
+                    for codec, bd, lo, hi, note in bds:
                         if bd is None:
-                            print(f"    {codec:<12} n/a (no overlap)")
+                            print(f"    {codec:<12} n/a — {note}")
                         else:
                             verdict = "fewer" if bd < 0 else "more"
                             print(f"    {codec:<12} {bd:+8.1f}%  "
                                   f"(GNC needs {abs(bd):.1f}% {verdict} bits, "
-                                  f"overlap {lo:.1f}-{hi:.1f} dB)")
+                                  f"fitted over {lo:.1f}-{hi:.1f} dB)")
+            matched = matched_rate_table(rows, [r for r in rows if r["codec"] == "GNC"])
+            if matched:
+                print("  At matched rate, GNC minus the incumbent "
+                      "(+dB and -dE00 mean GNC is better):")
+                print(f"    {'codec':<12} {'rung':<14} {'bpp':>7} {'dY':>7} {'dRGB':>7} {'ddE00':>8}")
+                for r, at in matched:
+                    print(f"    {r['codec']:<12} {r['rung']:<14} {r['bpp']:>7.3f} "
+                          f"{at['psnr_y'] - r['psnr_y']:>+7.2f} "
+                          f"{at['psnr_rgb'] - r['psnr_rgb']:>+7.2f} "
+                          f"{at['de00_mean'] - r['de00_mean']:>+8.4f}")
             all_rows += rows
 
         if len(args.images) > 1:
@@ -335,7 +564,7 @@ def main():
                 per_codec = {}
                 for img in args.images:
                     rows = [r for r in all_rows if r["image"] == Path(img).name]
-                    for codec, bd, _, _ in bd_summary(rows, metric):
+                    for codec, bd, _, _, _ in bd_summary(rows, metric):
                         if bd is not None:
                             per_codec.setdefault(codec, []).append(bd)
                 print(f"  on {name}:")

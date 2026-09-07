@@ -17,12 +17,15 @@
 //! downstream notices.
 //!
 //! Which limit binds is not a toss-up: on the per-subband path the tables always give out
-//! first. On kristensara_720p at q=15 the worst tile needs 4009 of 4097 entries at qstep 2.2
-//! with no stream anywhere near its slot, and 4101 at qstep 2.15, where it is refused. So the
-//! slot overflow that BUG-9 recorded was the *symptom* of coding with frequencies read from
-//! outside the table, not an independent limit — the entry's "this is not the symbol alphabet"
-//! has it backwards. The slot is reachable on its own only off that path, which is what the
-//! second test below does.
+//! first, and no stream is anywhere near its slot when they do. Measured with `--rans` at the
+//! default quantiser step, which is the configuration the backlog entry is actually about:
+//! kristensara_720p needs 4020 of 4097 entries at q=75 and 4165 at q=76, where it is refused;
+//! bbb_1080p still fits at q=76 with 4052 and goes at q=77. That reproduces the q=75/76/77
+//! content split ENT-2 measured by encoding, and says what causes it. So the slot overflow
+//! BUG-9 recorded was the *symptom* of coding with frequencies read from outside the table,
+//! not an independent limit — the entry's "this is not the symbol alphabet" has it backwards.
+//! The slot is reachable on its own only off the subband path, which is what the second test
+//! below does.
 //!
 //! The content here is low-frequency randomness — full-range and unpredictable in the LL band.
 //! That matters: neither uniform noise nor a full-contrast checkerboard reaches either limit at
@@ -105,7 +108,8 @@ fn a_cumfreq_table_that_does_not_fit_is_refused_by_name() {
 fn a_stream_that_does_not_fit_its_slot_is_refused_by_name() {
     // The single-table path caps its own tables at MAX_ALPHABET + 1, so they cannot be what
     // gives out; at qstep 0.5 they sit exactly at 4097 of 4097 and 32 of 128 streams still do
-    // not fit their 4 KB slots. That is the only configuration found where the slot goes first.
+    // not fit their 4 KB slots. That is the only configuration found where the slot goes first,
+    // which is the whole reason this test leaves the per-subband path.
     let mut config = gnc::quality_preset(15);
     config.per_subband_entropy = false;
     config.quantization_step = 0.5;

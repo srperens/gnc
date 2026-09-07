@@ -9992,3 +9992,113 @@ treatment rather than a guess (COORDINATION rule 1):
 
 Recommendation is (1) behind a switch, measured later on an idle machine against (2) — the pattern
 COORDINATION already prescribes for this situation.
+
+---
+
+## 2026-09-07 — BUG-9: the slot overflow was the symptom, and the cause was one workgroup array
+
+### Motivation
+
+BUG-9 was recorded as "rANS overflows its per-stream buffer at fine quantiser steps", diagnosed,
+guarded on the host, and closed as *not worth fixing further*. The item asked for the cheap half
+only: stop the wrapped-pointer crash, do not make rANS work at a fine step. Picking it up to do
+that turned up a second, larger defect underneath — and showed the recorded cause was backwards.
+
+### What was actually wrong
+
+**The slot bug, as recorded.** `rans_encode.wgsl` gives each of the 32 streams per tile a fixed
+4 KB slot and writes it backwards from the end, so `write_ptr` counts down. It was decremented
+with no bound check. `stream_base_byte + write_ptr` is u32, so a decrement past zero wrapped to
+`stream_base_byte - 1` and downwards — **inside the previous stream's slot** — and `write_byte`
+ORs, so it set bits in bytes that were already correct rather than overwriting them. The observed
+`write_ptr=4294963712` is 2^32 − 3584, i.e. 3584 bytes written outside the slot.
+
+**The cause, which was not recorded.** Every subband group's cumfreq table for a tile is loaded
+into *one* workgroup array. What must fit is the **sum** of `alphabet_size + 1` over the tile's
+groups, not any one group's alphabet. Past the end the shader read and wrote outside the array,
+and the streams it produced from those undefined frequencies are what then overran their slots.
+
+Measured with `--rans` at the **default** quantiser step — the configuration the entry is about,
+not a forced one — worst tile, Y plane, capacity 4097:
+
+| image | q=70 | q=75 | q=76 | q=77 | q=80 |
+|---|---|---|---|---|---|
+| kristensara_720p | 3504 | 4020 | **4165 refused** | 4317 | 4806 |
+| blue_sky_1080p | 3510 | 4025 | **4173 refused** | 4325 | 4810 |
+| bbb_1080p | 3406 | 3909 | 4052 | **4197 refused** | 4670 |
+| touchdown_1080p | 3360 | 3853 | 3993 | **4138 refused** | 4600 |
+
+**Not one stream overflowed its slot at any point that completed.** On the per-subband path the
+tables always give out first, on every content tried. So BACKLOG's "Stated cause was wrong. This
+is not the symbol alphabet" has it backwards: the alphabet is the cause, via the sum of the
+tables. Chroma is never close, at 600–2000 entries — it is the Y plane that crosses.
+
+This reproduces ENT-2's ceiling exactly, measured the same afternoon by a different method (they
+encoded and recorded success or failure; this counts table occupancy): q=75 encodes on all four,
+q=77 fails on all four, **q=76 splits by content**. The split now has a mechanism — it is the
+Y-plane alphabet crossing 4097 at different qualities — and two independent measurements agree.
+
+### Why the table limit is the worse of the two
+
+A slot overflow announces itself: the host sees a wrapped pointer and cannot miss it. A table
+overrun need not. A tile can overrun its tables and still emit streams that fit their slots, and
+then nothing downstream notices and the file is quietly wrong. **This is the failure mode the
+codebase has no defence against**, and it is why the fix is a host-side refusal and not only a
+shader clamp.
+
+It was also **not deterministic**. Two builds of near-identical source disagreed about whether the
+same input overflowed at qstep 1.5 — expected, since out-of-bounds workgroup access is undefined,
+but worth recording because it means any past rANS measurement near the ceiling is suspect in a
+way a reproducible bug would not be.
+
+### An off-by-one that had always been there
+
+A table of n symbols is n+1 cumulative frequencies. The array was `MAX_ALPHABET` entries, so the
+single-table path overran it by exactly one whenever the alphabet saturated — reachable with
+`--no-per-subband --qstep 1.0`, which asks for 4097. Sizing it `MAX_ALPHABET + 1` costs four bytes
+of the M1's 32 KB per threadgroup and lets that path use its own maximum alphabet.
+
+### Content matters more than the quantiser step, which is a testing trap
+
+No synthetic image reached either limit at any step: not uniform noise, not a 1-pixel
+full-contrast checkerboard, not per-channel decorrelated checkerboards, not full-range gradients,
+not full-contrast binary random. Real photographic content reaches them easily — kristensara at
+`-q 15 --qstep 1.0` overflows 256 of 480 streams.
+
+The mechanism is **LL magnitude times LL entropy**. Noise and checkerboards average to a flat LL;
+gradients give a large but predictable LL. Both are cheap. What is expensive is low-frequency
+randomness — a full-range random value per 16x16 block — which is unpredictable *and* full-range
+in LL, and overflows all 128 streams of a 512x512 image. That is what the regression test uses. A
+test written with the obvious "hard" content would have passed while testing nothing.
+
+### What was deliberately not done
+
+Runtime buffer sizing, so rANS still cannot encode above q=75. The backlog argued this from
+Rice-vs-rANS rate, and ENT-2 confirmed it from the other side the same day: rANS is 6–7% smaller
+than Rice at q<=20 and level at q=25–70. The range this would unlock is one where the coder
+measures level at best. Turning undefined behaviour into a sentence was the whole value.
+
+### Verification
+
+- **Byte-identical to the pinned parent commit `436680e`: 64/64.** 36/36 on the default ladder
+  (4 images x q=5,10,15,20,25,50,75,90,100) and 28/28 with `--rans` forced (q=1,5,10,15,20,50,75),
+  which includes q=75 at 4020 of 4097 entries — the tightest passing point there is.
+- `cargo test --release`: 201 passed, 0 failed, including three new tests in
+  `tests/rans_stream_overflow.rs`.
+- `cargo clippy --release` and `--target wasm32-unknown-unknown`: both clean, exit 0.
+- Canary: `GNC_DIAGNOSTICS=1` prints `rans_streams=N overflowed=M` and
+  `cumfreq_entries_max=N/4097` per plane. At q=15, where rANS is selected, the worst tile asks
+  for 361 of 4097 — an eleven-fold margin.
+
+### A methods failure worth recording
+
+The first byte-identity run used a *sibling worktree's* `target/release/gnc` as the "before"
+binary, on the grounds that its `src/` was verified identical to this branch's parent. It was, at
+the time. That session then rebased and rebuilt, and a re-run of the same check returned **0/36 —
+every point differing, including q=100, which is lossless and does not use rANS at all.** Nothing
+had changed in this branch; the baseline had been replaced underneath the measurement.
+
+COORDINATION rule 1 says a number is only valid against a commit. It is worth stating the sharper
+version: **a baseline binary must live in a worktree you own, pinned to a hash.** A sibling's
+build directory is not a baseline, however carefully you check it at the start — you do not control
+when it changes. Both figures above come from `git worktree add --detach <dir> <sha>` plus a build.

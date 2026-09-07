@@ -682,14 +682,21 @@ pub fn quality_preset(q: u32) -> CodecConfig {
         // below H.264 and passing it — at exactly the contribution operating point the codec
         // is positioned for (docs/POSITIONING.md).
         //
-        // rANS cannot reach a fine step at all, and two separate limits stop it (BUG-9): its
-        // 4 KB per-stream output slot, and the cumfreq table its encode shader holds in
-        // workgroup memory. Both are content-dependent, so neither is a qstep threshold — on
-        // 512x512 low-frequency random content the slot goes first, at qstep 1.4. Both are now
-        // refused by name rather than wrapping a pointer or indexing past a workgroup array.
-        // None of this is reachable from this table: rANS is only selected at q <= 20, where
-        // qstep is 32 or coarser. It is reachable with an explicit --qstep at q <= 20 — not
-        // with --rans, which is a no-op flag kept for compatibility.
+        // rANS cannot reach a fine step at all, and the limit is its encode shader's cumfreq
+        // table, not the quantiser (BUG-9). Every subband group's table for a tile shares one
+        // workgroup array of MAX_ALPHABET + 1 entries, and the Y plane's alphabet is what
+        // crosses it. Measured with `--rans` at the default step: the worst tile needs 4020
+        // entries at q=75 on kristensara and 4165 at q=76, where it is refused. That is why
+        // the ceiling splits by content at q=76 — bbb and touchdown still fit there at 4052
+        // and 3993 — which ENT-2 found independently by encoding. The 4 KB per-stream slot is
+        // the *second* limit and it never binds first on this path; it is reachable only with
+        // `--no-per-subband`, whose single table cannot exceed the array. Both are refused by
+        // name now rather than wrapping a pointer or indexing past the array.
+        //
+        // None of this is reachable from this table: rANS is selected at q <= 20, where qstep
+        // is 32 or coarser and the worst tile asks for 361 entries. It is reachable with
+        // `--rans`, which despite its help text is not a no-op — it sets the coder, and the
+        // bitstream's entropy_type confirms it.
         // q<=92 is deliberately left exactly as it was, so no existing quality point moves;
         // only the previously dead range above it changes.
         Anchor { q: 92,  qstep: 2.05, dead_zone: 0.05, cfl: false, per_subband: true },

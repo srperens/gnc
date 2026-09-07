@@ -88,7 +88,7 @@ measured advantage over x264 on any axis at this operating point.**
    1.9x, not the 5.6x recorded at distribution bitrates. ~~Follow-up: `GNC_CHROMA_WEIGHT`~~ — done
    too (CHROMA-1): the frontier is steep but intra-only, so it does **not** explain the video gap.
    That gap is genuine luma coding deficit, which is why item 1 is intra.
-5. Bugs: BUG-9 (rANS bounds, message now actionable), BUG-14. BUG-12 closed 2026-09-06.
+5. Bugs: BUG-14. BUG-9 closed 2026-09-07 (the cause was the cumfreq table, not the slot), BUG-12 closed 2026-09-06.
 
 **Do not re-test** (measured and closed this week): MCTF, GOP length, the B-pyramid at contribution
 quality, RD decisions, multi-reference, sub-pel filters, motion search, block transforms, sub-block
@@ -356,7 +356,7 @@ q=25/40/55/70, exactly rather than by BD-rate (both coders quantise identically 
 is lossless, so equal q is matched quality — verified end to end, bbb q=70 reads PSNR 44.25 under
 both). rANS went from 15–25% behind Rice to level or ahead on three of four images: mean −1.9% at
 q=70, but that is touchdown at −7.8% pulling three flat ones, kristensara regresses 1.2–6.3%
-everywhere, rANS costs ~15% decode (TUNE-3), and it crashes on every image from q=80 up (BUG-9).
+everywhere, rANS costs ~15% decode (TUNE-3), and it cannot encode above q=75 at all (BUG-9 — a named refusal since 2026-09-07, a crash before that).
 A content bet that is slower and cannot run at the operating point is not a new default.
 
 **Re-measured by ENT-2 (2026-09-07) on whole frames rather than padding-neutral crops: same
@@ -848,9 +848,65 @@ The rANS fused histogram shader (`quantize_histogram_fused.wgsl`) has the same s
 streams, but rANS *gains* 14–20% at tile 512, so its ordering is not costing it the same way. Not
 filed as a bug — noted so nobody mistakes it for one.
 
-### BUG-9 — rANS overflows its per-stream buffer at fine quantiser steps (**diagnosed, guard landed; full fix deliberately not done**, P3)
-The host now catches it and says so — `rANS stream 320 overflowed its 4096-byte output slot` —
-instead of panicking on a raw slice index. That is the right amount of fixing; see below.
+### BUG-9 — rANS's cumfreq table does not fit its shader, and the slot overflow was the symptom (**DONE 2026-09-07**)
+Both limits are now refused by name, no configuration writes out of bounds any more, and the
+capability itself is deliberately not extended. The entry below is kept because most of its
+reasoning was right and one central claim was not.
+
+**The recorded cause was backwards.** The entry said "this is not the symbol alphabet". It is —
+just not via any one group's alphabet limit. Every subband group's cumfreq table for a tile is
+loaded into *one* workgroup array in `rans_encode.wgsl`, so what has to fit is the **sum** of
+`alphabet_size + 1` over the tile's groups. Past the end the shader read and wrote outside the
+array, which is undefined, and the streams it then produced from those frequencies are what
+overran their 4 KB slots. Measured with `--rans` at the default step, worst tile, Y plane:
+
+| image | q=70 | q=75 | q=76 | q=77 | q=80 |
+|---|---|---|---|---|---|
+| kristensara_720p | 3504 | 4020 | **4165 refused** | 4317 | 4806 |
+| blue_sky_1080p | 3510 | 4025 | **4173 refused** | 4325 | 4810 |
+| bbb_1080p | 3406 | 3909 | 4052 | **4197 refused** | 4670 |
+| touchdown_1080p | 3360 | 3853 | 3993 | **4138 refused** | 4600 |
+
+The capacity is 4097. **Not one stream overflowed its slot at any point that completed** — on the
+per-subband path the tables always give out first. That reproduces ENT-2's independently measured
+ceiling exactly (q=75 encodes on all four, q=77 fails on all four, q=76 splits by content) and
+supplies the mechanism: the split is the Y-plane alphabet crossing 4097 at different qualities.
+Chroma is never close, at 600–2000 entries.
+
+**The slot bug was real too, and it corrupted a neighbour.** `write_ptr` was decremented with no
+bound check, and `stream_base_byte + write_ptr` is u32, so a decrement past zero wrapped to
+`stream_base_byte - 1` and downwards — inside the *previous* stream's slot, with `write_byte`
+ORing bits into data that was already correct. The shader now stops at the boundary and reports
+the stream instead.
+
+**Why the table limit is the worse of the two.** A slot overflow announces itself: the host sees a
+wrapped pointer. A table overrun need not — a tile can overrun its tables and still emit streams
+that fit, and then nothing downstream notices and the file is quietly wrong. The old behaviour was
+also not deterministic; two builds of near-identical source disagreed about whether the same input
+overflowed, which is what out-of-bounds workgroup access buys.
+
+**An off-by-one that was always there.** A table of n symbols is n+1 cumulative frequencies, so at
+`MAX_ALPHABET` the single-table path overran the array by exactly one entry — reachable with
+`--no-per-subband --qstep 1.0`, which asks for 4097. The array is now `MAX_ALPHABET + 1`, four
+bytes of the M1's 32 KB per threadgroup, so that path can use its own maximum alphabet.
+
+**Still not extending the capability, and ENT-2's numbers say so from the other side.** rANS is
+6–7% smaller than Rice at q<=20 and level at q=25–70, so the range runtime buffer sizing would
+unlock is one where the coder measures level at best. Turning undefined behaviour into a sentence
+was the whole value.
+
+**Canary:** `GNC_DIAGNOSTICS=1` prints `rans_streams=N overflowed=M` and
+`cumfreq_entries_max=N/4097` per plane. At q=15, where rANS is actually selected, the worst tile
+asks for 361 of 4097.
+
+**Verified:** byte-identical to the pinned parent commit on 4 images x q=1..100, `cargo test
+--release` green, both clippy targets clean. Regression tests in
+`tests/rans_stream_overflow.rs`. See decision record 0022.
+
+---
+
+Original entry, kept for its reasoning:
+
 
 **The threshold recorded here was wrong and understated it.** "OK at qstep 2.0 and 1.5, panics at
 1.0" came from `-q 15 --qstep 1.0`, whose preset carries 4 wavelet levels, different subband
@@ -859,8 +915,8 @@ weights and a different dead zone. In the **default** configuration bbb survives
 limit is a function of the whole configuration, not of qstep, so a static qstep guard would be the
 wrong fix and a fallback keyed on one would misfire.
 
-**Consequence:** rANS cannot be measured at all from q=80 up, which is the contribution operating
-point. Reaching it means threading a runtime buffer size through three encode shaders and six
+**Consequence:** rANS cannot be measured above **q=75** — not q=80; the ceiling was measured
+twice, by ENT-2 and above. That is below the contribution operating point. Reaching it means threading a runtime buffer size through three encode shaders and six
 allocation sites, the way Rice already sizes its own from qstep (`max_stream_bytes_for_tile`).
 
 **Not doing it, on purpose.** The crossover re-sweep (below) says nobody wants what it would buy:
@@ -868,11 +924,13 @@ rANS is 1.9% smaller than Rice at q=70 on the mean of four images, regresses up 
 them, and costs ~15% decode throughput. Recorded so the next person does not rediscover the crash
 and assume the fix is cheap.
 
-**Repro line corrected.** `--qstep 1.0 --rans` does *not* reproduce it — `--rans` is a no-op flag
-kept for backward compatibility, so that command encodes with Rice and succeeds. rANS is reached
-through the preset only, so the panic needs `gnc encode -q 15 --qstep 1.0`.
+**Repro line corrected — and then corrected again.** This said `--rans` was a no-op kept for
+backward compatibility. It is not: `src/main.rs` sets `EntropyCoder::Rans` and the bitstream's
+`entropy_type` confirms it on 40 of 40 points (ENT-2). Only the flag's help text was stale.
+`gnc encode -q 15 --qstep 1.0` reproduces it, and so does `--rans -q 77`.
 
-**Stated cause was wrong.** This is not the symbol alphabet. `rans_encode.wgsl` writes each stream
+**Stated cause was wrong — and this correction was itself wrong; see the top of the entry.**
+This is not *only* the output slot. `rans_encode.wgsl` writes each stream
 *backwards* from the end of a fixed 4 KB buffer (`MAX_STREAM_BYTES = 4096`, `write_ptr` starting at
 the top and decremented with no bound check). When a stream needs more than 4 KB the pointer
 underflows: 4294963272 is 2^32 − 4024, i.e. the stream overran by 4024 bytes. Rice survives the

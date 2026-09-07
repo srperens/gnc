@@ -50,7 +50,26 @@ Shader source is in `src/shaders/*.wgsl` (63 shaders). Rust host code is in `src
 
 ## Platform Notes
 
-- Dev machine: Apple M1 — 8 GPU cores, ~2.6 TFLOPS FP32, no FP64, 32KB threadgroup memory, max 1024 threads/workgroup
+- Dev machine: **Apple M5 Pro** — 20 GPU cores, 18 CPU cores, 64 GB, Metal 4. This line said
+  "Apple M1 — 8 GPU cores, ~2.6 TFLOPS FP32" until 2026-09-07 and **the changeover date is not
+  recorded anywhere**, so every throughput figure in this repository labelled M1 is of unknown
+  provenance (BUG-29). Run `gnc gpu-info` rather than trusting this line: it now prints the device
+  and its limits, which is what would have contradicted the wrong text months ago.
+- **GNC asks for wgpu's default limits, not the hardware's**, so the same shaders run under WebGPU
+  (rule 4). The gap is large and it is deliberate — from `gnc gpu-info` on this machine:
+
+  | | adapter has | GNC requests |
+  |---|---|---|
+  | workgroup storage | 32768 B | **16384 B** |
+  | invocations / workgroup | 1024 | **256** |
+  | storage buffers / stage | 31 | **10** |
+  | max buffer size | 39813 MiB | 256 MiB |
+
+  So "32KB threadgroup memory, max 1024 threads" was describing the *adapter* and was never what
+  the shaders could use. Any occupancy argument here is about the 16KB column. Whether raising the
+  request is worth losing WebGPU portability is unmeasured and would need a decision record, not a
+  commit.
+- No FP64 on Apple GPUs, and WGSL has no `f64` regardless
 - WASM target must work — avoid features not available in WebGPU (e.g. some storage texture formats, push constants)
 - WGSL shaders are the single source — transpiled per backend by naga
 
@@ -193,7 +212,7 @@ project:
    who understands the claim is never the one holding the code. None of the errors above would have
    been caught by a Critic reading a diff. They were caught by someone who knew the harness *and*
    the claim at the same time.
-3. **The hardware is one M1 with 8 GPU cores.** Parallel agents contend for the single resource
+3. **The hardware is one machine with one GPU.** Parallel agents contend for the single resource
    every measurement needs — the same fps run reads 20% slower with another session busy — and a
    shared working tree makes their numbers mutually invalid (COORDINATION.md rule 1).
 

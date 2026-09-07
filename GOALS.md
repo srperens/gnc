@@ -71,7 +71,7 @@ order rather than a format-specific feature.
 2. **GPU-first** — Everything runs in compute shaders. No CPU fallback paths. CPU reference implementations only for validation/testing.
 3. **Massive parallelism via tile independence** — No cross-tile dependencies at any stage. Each tile encodes/decodes in isolation. This is what enables thousands of parallel GPU threads.
 4. **Cross-platform** — Must work on Metal, Vulkan, DX12, and WebGPU (WASM). No backend-specific features. WGSL shaders are the single source.
-5. **No f64 in shaders** — Target hardware (M1, mobile GPUs) has no hardware double precision.
+5. **No f64 in shaders** — Apple and mobile GPUs have no hardware double precision, and WGSL has no `f64` in any case.
 6. **Open source only** — All dependencies must be open source.
 7. **English only** — All code, comments, docs, and commit messages in English.
 8. **Measure everything** — Every change benchmarked: PSNR, SSIM, bpp, encode/decode FPS. Compare against baseline and previous best. Optionally compare against relevant codecs (H.264, H.265, AV1, MJPEG, JPEG XS, ProRes) for context.
@@ -112,7 +112,7 @@ on a non-idle machine: GPU encode phase 12.2 fps, end to end 5.0 fps.
 - 33 WGSL compute shaders
 - WASM/WebGPU decoder builds (263 KB)
 
-**Key GPU architecture insight:** On M1, shared memory occupancy dominates performance. 16KB shared memory = 2 workgroups/core (full occupancy). Rice uses < 1KB shared → excellent occupancy.
+**Key GPU architecture insight:** shared-memory occupancy dominates performance. 16KB is the budget because that is what **GNC requests** (wgpu defaults, for WebGPU portability) — the adapter here offers 32KB, so this is a self-imposed ceiling, not the chip's (BUG-29). At 16KB, 2 workgroups/core is full occupancy; Rice uses < 1KB shared, so occupancy is excellent.
 
 **Known gaps:**
 - Sequence encode 31.7 fps → target 60 fps

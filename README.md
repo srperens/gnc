@@ -23,7 +23,7 @@ GNC is deliberately **broad**: intra and inter, 4:2:0 / 4:2:2 / 4:4:4 at 8 and 1
 - **Contribution quality: +90.5% BD-rate on PSNR** — about 1.9x the bitrate of x264 for the same luma quality, across three sequences.
 - **Colour: no advantage over x264, and the row that claimed one is withdrawn (CHROMA-2, 2026-09-07).** The control this README asked for has been run — give x264 the same allocation via `--chroma-qp-offset` and re-measure CIEDE2000 at the same total rate — and **x264 comes out ahead on all six runs** (three sequences x 4:2:0 and 4:4:4). On five of the six it does not need the offset at all: it leads on colour at offset 0 *while also leading luma by 4.1-7.4 dB*. The earlier row, which had GNC ahead on dE00, rested on a table measured an hour before CHROMA-1 changed q>=85 output and does not reproduce. GNC's colour is still good in absolute terms (dE00 0.54-0.92 mean, at or below the nominal JND) — it is just not better than x264's.
 - **Lossless: the best wavelet result in the field.** 1.99:1 at `q=100`, beating JPEG 2000 lossless by 10.8% and PNG by 7.8%; behind FFV1 by 27% and x264 `-qp 0` by 43%, both of which predict against the neighbouring pixel rather than across scales.
-- **Latency: ~80 ms round trip** intra or P-only, ~240 ms with the B-pyramid, 1080p on an M1
+- **Latency: ~80 ms round trip** intra or P-only, ~240 ms with the B-pyramid, 1080p on an Apple M5 Pro. On an NVIDIA RTX 4000 Ada over Vulkan the single-frame loop is **13.95 ms encode / 7.29 ms decode** (CANARY-1, 2026-09-07)
   (MEAS-6). That is the low-latency-HEVC band, **not** the JPEG XS band — JPEG XS codes 1–32
   lines and EBU measures it under one frame. The 256-line tile floor is not reachable today: the
   pipeline processes whole frames, so the practical floor is one full frame whatever the tile
@@ -54,7 +54,7 @@ GNC is deliberately **broad**: intra and inter, 4:2:0 / 4:2:2 / 4:4:4 at 8 and 1
 
 See [`RESEARCH_LOG.md`](RESEARCH_LOG.md) for every measurement, including the ones that failed — roughly two dozen ideas have been tested and rejected, and they are written up as carefully as the wins.
 
-## Current Results (1080p, bbb reference, M1 GPU)
+## Current Results (1080p, bbb reference, Apple M5 Pro GPU)
 
 ### Single-frame (Rice+ZRL entropy)
 
@@ -172,7 +172,7 @@ GNC has five entropy coding backends, all decoding as GPU compute shaders:
 abac encodes on the GPU as well as decoding there (ENT-5): one thread per code-block, bit-exact
 against the CPU coder in `abac.rs` — 98 of 98 whole-file comparisons byte-identical across four
 stills, q=60–100, both arithmetic engines, 4:4:4/4:2:2/4:2:0 and an 8-frame sequence.
-**Its encode time per frame is not measured**: four sessions were working this M1 when it landed,
+**Its encode time per frame is not measured**: four sessions were working this Mac when it landed,
 and a throughput figure taken under load is worth nothing here. `docs/decisions/0024`.
 | Huffman (parked) | 256 | 64-symbol + escape | not measured | not measured | None |
 | Bitplane (parked) | Per-block | Sign + magnitude bitplanes | not measured | not measured | None |
@@ -191,7 +191,7 @@ source for absolute figures.*
 from. The "1.5–2× faster" that stood here for Rice was neither: it contradicted the only throughput
 figure in the repository — TUNE-3 measured rANS at ~8% encode and ~15% decode behind Rice, not
 50–100% — so it is removed rather than corrected. abac's 1.69× is from an idle-machine bench;
-rANS's ~1.15× is TUNE-3's and was **not** re-measured, because up to eight sessions share this M1
+rANS's ~1.15× is TUNE-3's and was **not** re-measured, because up to eight sessions share this Mac
 and COORDINATION rule 1 forbids timing under load.*
 
 Rice is the default because it eliminates the sequential state chain that limits rANS. Each of the 256 streams encodes independently — no shared state, no synchronization, minimal shared memory (< 1 KB vs rANS's 16 KB frequency tables). That is a GPU-parallelism argument, and the rate figures above no longer argue against it: level with rANS where Rice is selected, and rANS keeps the range below q=20 where it is 6–7% smaller. Huffman and Bitplane are available but parked.

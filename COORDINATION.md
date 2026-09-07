@@ -306,7 +306,7 @@ before quoting a colour number, it costs a second.
 ## JPEG XS *is* measurable here — SVT-JPEG-XS now builds on arm64 (2026-09-07, chroma2)
 
 **MEAS-9 is recorded in two places as blocked on this, with VC-2 standing in. It is not blocked.**
-`scripts/build_jpegxs_arm64.sh` clones, patches and builds SVT-JPEG-XS on this M1, and verifies
+`scripts/build_jpegxs_arm64.sh` clones, patches and builds SVT-JPEG-XS on this Mac, and verifies
 the result: a 1920x1080 yuv422p frame at `--bpp 3` round-trips to **PSNR y 44.484343 dB**,
 reproduced exactly from a clean clone.
 
@@ -405,7 +405,7 @@ are equivalent", compare the pixels, not the summary.
 **The GPU ramps its clocks, and a repeat count chosen for a CPU benchmark will not outlast the
 ramp.** On a genuinely idle machine (load 3.8, GPU free), three consecutive *processes* on
 identical input read **66.5, 45.3 and 34.9 ms** — a 1.9× spread, monotonically decreasing. A
-freshly-idle M1 starts in a low power state and needs on the order of a second of sustained work
+freshly-idle Mac starts in a low power state and needs on the order of a second of sustained work
 to boost. `abac_bench` had a `spread` column that blamed a busy machine for exactly this, so the
 instrument was reporting the ramp *and* misattributing it.
 
@@ -427,7 +427,7 @@ trick works for any idempotent stage.
 
 ## Timing: the machine is shared, so throughput numbers are not measurable during a session
 
-Eight sessions compile and run GPU work on this one M1 at the same time. That makes every
+Eight sessions compile and run GPU work on this one Mac at the same time. That makes every
 wall-clock figure unreliable while anyone else is working — on 2026-09-06 the same abac decode
 input timed **25.2, 31.1 and 37.5 ms across three runs**, a 48% spread on identical work, and
 three targeted shader optimisations against three different suspected bottlenecks all returned

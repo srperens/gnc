@@ -86,9 +86,17 @@ See the section below before quoting any throughput number.
 
 ## How to read the fps figures in this file
 
+> **Every "M1" in this file is an unreliable label (BUG-29, 2026-09-07).** The dev machine is an
+> Apple M5 Pro (20 GPU cores); this file was written as if it were an M1 with 8, and when the
+> machine changed is recorded nowhere. The figures were really measured on *something*, so they are
+> not fabricated — but they cannot be compared with each other or reproduced from the label. Treat
+> any throughput number below as valid only against the commit and harness it names, and re-measure
+> before quoting one against another.
+
+
 Three different quantities have been called "encode fps" here. State which one, every time:
 
-| | what it times | measured 2026-09-06 (1080p, ki=8, Rice, M1, **machine not idle**) |
+| | what it times | measured 2026-09-06 (1080p, ki=8, Rice, **the Mac, labelled M1 — see above**, machine not idle) |
 |---|---|---|
 | **A — GPU encode phase** | `benchmark-sequence` with Y4M input | 12.2 fps median |
 | **B — encoder loop** | the figure `encode-sequence` prints | 5.6 fps median |
@@ -104,7 +112,7 @@ VMAF, dE00) are deterministic and unaffected; fps and latency are not.
 stated parameters are also inconsistent — "ki=8 ... I+P+B", but ki=8 is below the B-frame
 threshold of 9, and the encoder emits 2I+8P. Do not build a density claim on it.
 
-## A second GPU, and the first figures not taken on the M1 (2026-09-07)
+## A second GPU, and the first figures not taken on the Mac (2026-09-07)
 
 NVIDIA RTX 4000 Ada Generation, Ubuntu 24.04.3, driver 580.173.02, Vulkan, wgpu 24.0.5,
 `scripts/gpu_tier_bench.py --tier` on the pinned bbb_1080p (`f83f355f…02bf`). From `main` plus
@@ -114,15 +122,15 @@ BUG-25's lazy-pipeline change — GNC does not start on Vulkan without it.
 |---|---|---|---|
 | **RTX 4000 Ada (Vulkan)** | **13.95 ms** (71.7 fps) | **7.29 ms** (137.2 fps) | **21.2 ms** |
 | llvmpipe, CPU rasteriser (Vulkan) | 480.74 ms | 373.88 ms | 854.6 ms |
-| M1 (Metal), MEAS-6 2026-09-06 | ~47 ms | ~35 ms | ~80 ms |
+| Apple M5 Pro (Metal), MEAS-6 2026-09-06 — logged as "M1" | ~47 ms | ~35 ms | ~80 ms |
 
 Reproduced at a second commit under 2x the load: 14.01 / 7.27 ms. **This is CANARY-1's quantity —
 the single-frame encode/decode loop — and it is a fourth thing that has been called "encode fps" in
 this file.** It is nearest quantity **A** (GPU encode phase) and is not comparable to B or C.
 
-**Do not quote the M1 row against the RTX row as a speedup.** It is cross-machine, cross-backend,
-possibly at a different q, and the M1 figure was taken by a different harness. The controlled
-version is one command — this same harness on an idle M1 — and it has not been run.
+**Do not quote the Mac row against the RTX row as a speedup.** It is cross-machine, cross-backend,
+possibly at a different q, and the Mac figure was taken by a different harness. The controlled
+version is one command — this same harness on an idle Mac — and it has not been run.
 
 **Cross-backend output, measured for the first time.** Same commit, same input: q=100 lossless is
 **byte-identical** between Metal and Vulkan (`5c4539d8…`, 3 235 737 B), and q=75 lossy **differs by

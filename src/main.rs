@@ -1138,6 +1138,59 @@ fn main() {
                     "\nSelect one with GNC_GPU_ADAPTER=<substring of the name>, \
                      a backend with GNC_GPU_BACKEND=vulkan|dx12|metal|gl."
                 );
+
+                // The limits the shaders are written against, printed rather than
+                // remembered. CLAUDE.md's Platform Notes described an M1 with 8 GPU
+                // cores for an unrecorded length of time while the dev machine was an
+                // M5 Pro with 20 (BUG-29); nothing in the tree could contradict it,
+                // because nothing printed it.
+                match pollster::block_on(gnc::GpuContext::try_new_async()) {
+                    Ok(ctx) => {
+                        // Two columns, and the difference between them is the point:
+                        // `have` is what the silicon offers, `use` is what GNC asks for.
+                        // GNC requests wgpu's defaults so the same shaders run under
+                        // WebGPU (GOALS rule 4), so a big GPU does not raise these.
+                        let have = ctx.adapter.limits();
+                        let used = ctx.device.limits();
+                        println!("\nDevice in use: {}", gnc::describe_adapter(&ctx.adapter.get_info()));
+                        println!("{:<26}{:>12} {:>12}", "", "adapter has", "GNC requests");
+                        let row = |name: &str, h: u32, u: u32| {
+                            println!("  {name:<24}{h:>12} {u:>12}");
+                        };
+                        row(
+                            "workgroup storage (B)",
+                            have.max_compute_workgroup_storage_size,
+                            used.max_compute_workgroup_storage_size,
+                        );
+                        row(
+                            "invocations / workgroup",
+                            have.max_compute_invocations_per_workgroup,
+                            used.max_compute_invocations_per_workgroup,
+                        );
+                        row(
+                            "workgroup size x",
+                            have.max_compute_workgroup_size_x,
+                            used.max_compute_workgroup_size_x,
+                        );
+                        row(
+                            "storage buffers / stage",
+                            have.max_storage_buffers_per_shader_stage,
+                            used.max_storage_buffers_per_shader_stage,
+                        );
+                        row(
+                            "max texture 2d",
+                            have.max_texture_dimension_2d,
+                            used.max_texture_dimension_2d,
+                        );
+                        println!(
+                            "  {:<24}{:>12} {:>12}",
+                            "max buffer size (MiB)",
+                            have.max_buffer_size / (1024 * 1024),
+                            used.max_buffer_size / (1024 * 1024)
+                        );
+                    }
+                    Err(e) => println!("\nCould not open a device to report limits: {e}"),
+                }
             }
         }
 

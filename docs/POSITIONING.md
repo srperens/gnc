@@ -62,14 +62,14 @@ project has been claiming.**
   throughput grew just 14% from Turing to Blackwell** while shader FP32 grew roughly sixfold.
 
 **Claim B — "more aggregate throughput than the card's own NVENCs" — is unproven, and the first
-local measurement is sobering.** N concurrent 1080p encodes on the M1, two runs:
+local measurement is sobering.** N concurrent 1080p encodes on the Mac — recorded as an M1, actually an M5 Pro, changeover date unknown (BUG-29) — two runs:
 
 | instances | 1 | 2 | 4 | 8 |
 |---|---|---|---|---|
 | aggregate fps | 7.02 / 6.22 | 11.13 / 9.51 | 11.51 / 12.23 | 14.15 / 13.38 |
 
 **Roughly 2× aggregate at N=8, and most of it already reached at N=2.** A single 1080p encode does
-not saturate the M1, so there is real headroom — but nowhere near linear. The published
+not saturate the Mac, so there is real headroom — but nowhere near linear. The published
 multi-tenancy literature agrees: concurrency converts *idle* GPU into *useful* GPU; it does not
 create GPU. NVIDIA's own consolidation study measured time-slicing at 0.76 requests/s where MIG
 gave 1.00 — a 32% *reduction*.
@@ -183,7 +183,7 @@ matters is *"visually lossless at 6:1, still clean at the third generation."*
 | NDI High Bandwidth | < 16 ms at 1080p60 |
 | low-latency HEVC | EBU measured **120 ms – 3060 ms** across real vendors |
 
-**Measured 2026-09-06 (MEAS-6):** GNC's codec round trip at 1080p on an M1 is **~80 ms** — about
+**Measured 2026-09-06 (MEAS-6):** GNC's codec round trip at 1080p on the Mac is **~80 ms** — about
 47 ms encode plus 35 ms decode. On top of that, **the default B-pyramid costs 8 frames of
 lookahead**: `ki=17` encodes in the order `0[I] 4[B] 8[P] 2[B] 6[B] 1[B] ...`, so frame 1 cannot
 be coded until frame 8 has arrived. At 50 fps that is **160 ms of structural delay before any

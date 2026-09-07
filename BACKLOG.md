@@ -913,6 +913,47 @@ where **ARCH-3** and **BUG-18** live: if either is in flight, they land first an
 them. Nothing here changes the bitstream or any measurement, so it invalidates no result in
 RESEARCH_LOG — which is also why it must be able to prove that, by criterion 1.
 
+### BUG-29 — every throughput figure was labelled with the wrong machine (**FIXED 2026-09-07**)
+
+Found by accident: `examples/shader_probe.rs` prints the adapter it opened, and on the dev Mac it
+printed **Apple M5 Pro**. CLAUDE.md's Platform Notes had said *"Apple M1 — 8 GPU cores, ~2.6 TFLOPS
+FP32"*, and BASELINE, POSITIONING, GOALS, README and COORDINATION all repeated "M1".
+
+`system_profiler` confirms: **Apple M5 Pro, 20 GPU cores, 18 CPU cores, 64 GB, Metal 4.**
+
+**The figures are not fabricated — they were measured on *something*. What is gone is their
+provenance.** When the machine changed is recorded nowhere, so no throughput number in this
+repository can be reproduced from its label or compared against another one. Every affected file now
+carries that warning instead of a chip name it cannot support. Nothing was re-measured and nothing
+was deleted: deciding what is worth re-running is a separate call, and this item deliberately does
+not make it.
+
+**The larger finding, which the wrong label was hiding.** `gnc gpu-info` now prints device limits in
+two columns, and the gap is the point:
+
+| | adapter has | GNC requests |
+|---|---|---|
+| workgroup storage | 32768 B | **16384 B** |
+| invocations / workgroup | 1024 | **256** |
+| storage buffers / stage | 31 | **10** |
+| max buffer size | 39813 MiB | 256 MiB |
+
+So *"32KB threadgroup memory, max 1024 threads/workgroup"* was true of the **adapter** and was never
+what the shaders could use — GNC asks for wgpu's defaults so the same shaders run under WebGPU
+(GOALS rule 4). **GOALS' occupancy argument ("16KB shared memory = 2 workgroups/core") is therefore
+about a self-imposed ceiling, not the chip's**, which is a materially different statement from the
+one it appeared to make. Whether raising the request is worth losing WebGPU portability is
+**unmeasured** and needs a decision record rather than a commit.
+
+**Why it went unnoticed for months, and the fix for that rather than for the text:** nothing in the
+tree printed the device or its limits, so no run could contradict the prose. `gnc gpu-info` now
+does, and it is the first command `docs/GPU_TIER_TEST.md` tells you to run on a new machine.
+
+**Also corrected in passing:** CLAUDE.md said `src/shaders/*.wgsl` holds 32 shaders; it holds 62.
+The count is now simply not asserted. And CLAUDE.md's argument against parallel role-based agents
+rested on *"the hardware is one M1 with 8 GPU cores"* — the contention argument survives, the
+hardware claim in it does not, so it now says "one machine with one GPU".
+
 ### BUG-19 — decision-record numbers collide, and two pairs are live on `main` (todo, P3)
 
 `docs/decisions/` currently holds **two 0018s and two 0019s**:

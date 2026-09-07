@@ -11501,3 +11501,61 @@ than crashing, and the harness counted those as "did not crash", which biases th
   density sweep at ki=1 would run, but it measures intra concurrency rather than the shipped
   configuration and must be labelled that way.
 - **Not measured:** anything about NVENC, and any 4:2:2 or 10-bit behaviour on Vulkan.
+
+---
+## 2026-09-07 — The dev machine is not the machine in the docs, and the limits it runs at are not the limits it has
+
+Found by accident, which is the only reason it was found at all: `examples/shader_probe.rs` prints
+the adapter it opened, and on the dev Mac it printed **Apple M5 Pro**. Every document in this
+repository said M1.
+
+`system_profiler`: **Apple M5 Pro, 20 GPU cores, 18 CPU cores, 64 GB, Metal 4.** CLAUDE.md's
+Platform Notes said *"Apple M1 — 8 GPU cores, ~2.6 TFLOPS FP32"*, and BASELINE, POSITIONING, GOALS,
+README and COORDINATION all repeated it.
+
+**No figure is retracted, because none is wrong — what is gone is provenance.** The measurements
+happened on real hardware; nobody knows which, because the changeover date is recorded nowhere. The
+consequence is narrow and total: **a throughput number in this repo cannot be reproduced from its
+label, and two of them cannot be compared with each other.** Each affected file now says so instead
+of naming a chip it cannot support. Nothing was re-measured; choosing what is worth re-running is a
+separate decision and this item does not make it.
+
+### The part that is a measurement, not a correction
+
+`gnc gpu-info` now opens a device and prints its limits in two columns, `adapter has` against
+`GNC requests`:
+
+| | adapter has | GNC requests |
+|---|---|---|
+| workgroup storage | 32768 B | **16384 B** |
+| invocations / workgroup | 1024 | **256** |
+| workgroup size x | 1024 | **256** |
+| storage buffers / stage | 31 | **10** |
+| max texture 2d | 16384 | 8192 |
+| max buffer size | 39813 MiB | 256 MiB |
+
+**So the old note's "32KB threadgroup memory, max 1024 threads/workgroup" was true of the adapter
+and was never available to the shaders.** GNC requests wgpu's defaults so the same WGSL runs under
+WebGPU (GOALS rule 4). That is a deliberate and defensible choice, and it was invisible.
+
+It changes the meaning of something GOALS asserts. *"16KB shared memory = 2 workgroups/core (full
+occupancy)"* reads as a fact about Apple silicon; it is a fact about **a ceiling we set ourselves**,
+on a chip offering twice that. Every occupancy argument in this repo inherits that. Whether asking
+for more is worth losing WebGPU portability is **unmeasured** — and it is a decision record, not a
+commit, because rule 4 is a project commitment and the trade would weaken it.
+
+### Why it survived months of scrutiny, and what actually fixes that
+
+A project that retracts results as often as this one had a document asserting its own hardware
+wrongly, and no run could contradict it: **nothing in the tree printed the device or its limits.**
+The prose was unfalsifiable by construction. That is the same shape as CLAUDE.md's own rule about
+silent features — a claim with no way to check it is not a weak claim, it is not a claim — and the
+fix is the printing, not the correction. `gnc gpu-info` is the first command
+`docs/GPU_TIER_TEST.md` tells you to run on a new machine, so it is where the check belongs.
+
+Two smaller things fell out. CLAUDE.md said `src/shaders/*.wgsl` holds 32 shaders; it holds **62**,
+so the count is no longer asserted. And CLAUDE.md's case against the retired role-based agent team
+rested partly on *"the hardware is one M1 with 8 GPU cores"* — the contention argument survives
+intact, the hardware claim inside it does not.
+
+Filed and closed as **BUG-29**.

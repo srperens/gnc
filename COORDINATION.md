@@ -186,7 +186,7 @@ If this table and `scripts/claim list` disagree, the table is wrong.
 | `../gnc-abac`, `.claude/worktrees/abac` (`abac-gate`) | `abac` | **released — question answered, see BACKLOG Part 6.** The idle-machine bench is run. Range at cb=64 costs **1.69× frame decode for −16.7% rate** at q=90; Interval costs 3.99×. Rice's own entropy stage is 47% of frame decode, which caps any entropy work at 1.9×. What remains is a positioning call, not an engineering one. |
 | `../gnc-abac` | `abac` | same worktree, now on **BUG-8** — the encoder's local decode diverges from the real decoder down a GOP. |
 | `../gnc-nearlossless` | `nearlossless` | **done and merged 2026-09-07** — BUG-15 fixed, INTRA-NEARLOSSLESS closed by measurement, RATE-2 confirmed independently. Worktree removed. |
-| `../gnc-abacship` | `abacship` | **ABAC-SHIP done and merged 2026-09-07** (`60bed17`, `378a0c7`, `436680e`). abac is a real entropy coder: `--abac`, entropy type 5, **GP18**, on stills *and* sequences. Intra −16.6% to −18.8% at identical pixels, lossless −13.4% (FFV1 gap +23.9% → +7.3%), inter −14.4% at q=90. Rice stays the default (`docs/decisions/0017`). **Every frame this encoder writes now says GP18** — a GP18 Rice frame is a GP17 payload with a new label, proved by relabelling and decoding; GP17 still reads. Left behind: **BUG-18 (P1)**, the inter path's reconstruction depends on the entropy encode path. Worktree free to remove. |
+| `../gnc-abacship` | `abacship` | **ABAC-SHIP done and merged 2026-09-07** (`60bed17`, `378a0c7`, `436680e`). abac is a real entropy coder: `--abac`, entropy type 5, **GP18**, on stills *and* sequences. Intra −16.6% to −18.8% at identical pixels, lossless −13.4% (FFV1 gap +23.9% → +7.3%), inter −14.4% at q=90. Rice stays the default (`docs/decisions/0017`). **Every frame this encoder writes now says GP18** — a GP18 Rice frame is a GP17 payload with a new label, proved by relabelling and decoding; GP17 still reads. Left behind: **BUG-18 (P1)**, the inter path's reconstruction depends on the entropy encode path. Worktree free to remove. **Inter figure retracted — see the retraction section below.** |
 | `../gnc-rate1` | `rate1` | **DONE, merged, worktree removed.** RATE-1 answered **no** — a bit-depth-aware rate rule recovers **0.0% on all four photographic stills** (89.4% on the synthetic gradient, which is the trap). The sweep found **RATE-2 instead, filed P1**: above q≈95-98 the lossy ladder costs more bytes than bit-exact lossless on every real image, mean **+28.9% at q=99** (blue_sky +40.6%). LOSSLESS-1 made lossless cheap enough to undercut the top of the lossy ladder and nothing noticed. |
 | `../gnc-coord` | `coord` | **COORD-1 — the claim mechanism enforces the rules instead of restating them.** Docs and `scripts/claim` only; no codec change, invalidates no measurement. `scripts/claim next` makes the *pick* atomic, the shared-checkout and worktree preconditions are now refusals rather than prose, and the session identity bug that made `SESSION GONE` undetectable is fixed. See `docs/decisions/0019`. Claimed 2026-09-07. |
 
@@ -335,6 +335,26 @@ green on code that is not, depending on scheduling.
 device, or a lock around the GPU context) rather than everyone learning the workaround: a gate that
 is sometimes wrong stops being a gate. Flagged by the chroma2 session; the abac/abacship sessions
 own that file.
+
+## Two retractions worth knowing about, both 2026-09-07 (from `abacship` / `bug18`)
+
+**abac's inter rate figure (−14.4% at q=90) is withdrawn.** abac has no GPU encode path, so every
+abac video encode runs the *non-batched* P-frame path — and BUG-18 shows that path encodes every
+P-frame wrong: the first P after an I already diverges from the batched path by 28.8 (q=50) / 4.2
+(q=90) and costs 2.1–2.8× the bytes. The measurement put abac on a broken arm and Rice on a working
+one. **abac's intra and lossless figures are unaffected** and stand: −16.6% to −18.8% at identical
+pixels, −13.4% bit-exact lossless.
+
+**Anything encoded with `gpu_entropy_encode = false` on video is suspect**, which is abac *and*
+bitplane. Intra is fine — single-frame encodes go through `pipeline.rs` and were verified
+pixel-identical between coders.
+
+**And the general lesson, which cost three wrong published explanations in one afternoon: a matched
+aggregate is not evidence that two arms are comparable.** On crowd_run at q=85 the two encode paths
+agree on avg, min, max *and* stddev PSNR while the pixels differ by 8. This file already carries
+the mirror-image rule everywhere — aggregates *hiding* a real difference, the whole VMAF-saturation
+thread. This is the same failure with the roles swapped. If a comparison's premise is "these two
+are equivalent", compare the pixels, not the summary.
 
 ## Timing: an idle machine is necessary and NOT sufficient (added 2026-09-06, after an idle run still lied)
 

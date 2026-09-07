@@ -36,9 +36,20 @@ and leave Rice as the default at every quality preset.
    default. It is also fixable — the work is parallel across ~3000 code-blocks — but it is not
    fixed today, and defaults should not carry work that has not been done.
 
-3. **Inter frames are unmeasured.** All of the rate evidence is intra. Inter tiles go through the
-   same coder, but the contexts were tuned on intra coefficients and residual statistics differ. A
-   default has to be right for video, and the video half has not been measured.
+3. ~~**Inter frames are unmeasured.**~~ **Withdrawn the same day — inter was measured and this
+   reason does not hold.** Three sequences, 24 frames, ki=9, 4:4:4, q=90: the I+P bitstream is
+   −12.17% / −12.00% / −19.11%, mean **−14.43%**, against −12.79% for the all-intra control from
+   the same runs. The worry was that intra-tuned contexts would pay less on inter residuals; they
+   pay slightly more. **The decision stands on reasons 1, 2 and 4, which are untouched** — this
+   one is struck rather than quietly reworded, because it was a real argument and it turned out to
+   be wrong.
+
+   One caveat replaces it, and it does not carry the decision on its own: the inter figures are
+   quality-matched to ≤0.03 dB rather than pixel-exact, because on the inter path the two *encode
+   paths* never agree exactly (BUG-18) and abac is CPU-encoded where Rice is GPU-encoded. At q=75
+   that gap is large enough to be worth 0.54 dB, so that point is not comparable at all. The inter
+   evidence therefore covers q=90 and is slightly softer than the intra evidence — a gap in the
+   evidence rather than a result against abac.
 
 4. **A default change is the expensive kind of change to reverse.** Every measurement in the repo
    that quotes a file size would need re-checking against a new default. Rice output is currently

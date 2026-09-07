@@ -211,7 +211,7 @@ impl DecoderPipeline {
                             &bufs.entropy_var_b[p],
                             &bufs.scratch_a,
                             bufs.abac_blocks[p],
-                            bufs.abac_coder,
+                            bufs.abac_coder[p],
                         );
                     }
                     EntropyData::Huffman(_) => {

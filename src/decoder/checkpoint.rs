@@ -146,7 +146,7 @@ impl DecoderPipeline {
                             &bufs.entropy_var_b[0],
                             &bufs.scratch_a,
                             bufs.abac_blocks[0],
-                            bufs.abac_coder,
+                            bufs.abac_coder[0],
                         );
                     }
                     EntropyData::Bitplane(_) => {

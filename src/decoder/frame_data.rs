@@ -240,7 +240,7 @@ impl DecoderPipeline {
                     let p_tiles = &tiles[start..start + plane_tiles[p]];
                     let packed = GpuAbacDecoder::pack_decode_data(p_tiles, plane_info[p]);
                     bufs.abac_blocks[p] = packed.num_blocks;
-                    bufs.abac_coder = packed.coder;
+                    bufs.abac_coder[p] = packed.coder;
 
                     ctx.queue.write_buffer(
                         &bufs.entropy_params[p],

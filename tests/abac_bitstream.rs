@@ -11,6 +11,7 @@
 
 use gnc::decoder::pipeline::DecoderPipeline;
 use gnc::encoder::pipeline::EncoderPipeline;
+use gnc::encoder::abac::Coder;
 use gnc::{ChromaFormat, EntropyCoder, EntropyData, GpuContext};
 use std::sync::OnceLock;
 
@@ -184,14 +185,20 @@ fn both_arithmetic_engines_roundtrip_through_the_container() {
     let mut config = gnc::quality_preset(75);
     config.entropy_coder = EntropyCoder::Abac;
 
+    // Per-config, never `set_var`. Cargo runs tests in parallel threads and the environment is
+    // process-global, so setting GNC_ABAC_CODER here changed what *other* tests encoded with —
+    // which is how `abac_handles_subsampled_chroma` started failing with a max |diff| of 85321
+    // after this test was added. That race also found a real decoder bug (one `abac_coder` field
+    // for three planes, holding the last plane's engine), so it is worth naming rather than just
+    // fixing: shared mutable state in the encoder's configuration is the defect, and the config
+    // field is the fix.
     let mut sizes = Vec::new();
-    for engine in ["range", "interval"] {
-        std::env::set_var("GNC_ABAC_CODER", engine);
+    for engine in [Coder::Range, Coder::Interval] {
+        config.abac_coder = engine;
         let (px, size) = roundtrip(ctx, &img, w, h, &config);
-        assert!(px.iter().all(|v| v.is_finite()), "{engine}: decoded NaN or inf");
+        assert!(px.iter().all(|v| v.is_finite()), "{engine:?}: decoded NaN or inf");
         sizes.push((engine, px, size));
     }
-    std::env::remove_var("GNC_ABAC_CODER");
 
     let worst = sizes[0]
         .1
@@ -201,7 +208,7 @@ fn both_arithmetic_engines_roundtrip_through_the_container() {
         .fold(0.0f32, f32::max);
     assert_eq!(
         worst, 0.0,
-        "the two engines decoded different pixels: {} vs {}",
+        "the two engines decoded different pixels: {:?} vs {:?}",
         sizes[0].0, sizes[1].0
     );
 }
@@ -347,5 +354,87 @@ fn gp18_rice_frames_are_gp17_payloads_with_a_new_label() {
         "relabelling a Rice frame GP18 → GP17 changed the decode, so GP18 moved something other \
          than the magic — either the generation added a field it should not have, or the decoder \
          gates a field on gen >= 18 that older files also carry"
+    );
+}
+
+/// Also not abac (BUG-18): **on the inter path the two entropy encode paths never produce the
+/// same reconstruction.** Entropy coding is lossless and cannot legitimately affect a
+/// reconstruction at all, so one path is feeding the encoder something the other does not.
+///
+/// Both arms are Rice, so the coder is not the variable — only `gpu_entropy_encode` is.
+/// `abac_survives_a_p_frame_chain` is the other half: with both coders on the *same* path a chain
+/// is pixel-identical, so it is the path and not the coder.
+///
+/// **Two wrong explanations were published before this test was written, and both were killed by
+/// it.** First "the trigger is adaptive quantisation" (AQ is on for 30 ≤ q ≤ 80, and q=75 looked
+/// divergent where q=85 looked clean); then "AQ and B-frames are two triggers". Neither survives
+/// the grid below: the divergence is present at *every* quality, AQ or not, and it simply shrinks
+/// with the quantiser step. The reason both wrong stories looked right is that they were read off
+/// **PSNR averages printed to two decimals**, which a max |diff| of 8 on a handful of pixels does
+/// not move. Aggregate quality is not evidence of pixel identity.
+#[test]
+fn inter_reconstruction_depends_on_the_encode_path() {
+    let ctx = gpu();
+    let (w, h) = (256u32, 256u32);
+    let base = synth_image(w, h);
+    let shifted: Vec<Vec<f32>> = (0..4)
+        .map(|i| {
+            let mut f = vec![0.0f32; base.len()];
+            let dx = (i * 3) as usize;
+            for y in 0..h as usize {
+                for x in 0..w as usize {
+                    let sx = (x + dx) % w as usize;
+                    for c in 0..3 {
+                        f[(y * w as usize + x) * 3 + c] = base[(y * w as usize + sx) * 3 + c];
+                    }
+                }
+            }
+            f
+        })
+        .collect();
+    let refs: Vec<&[f32]> = shifted.iter().map(|f| f.as_slice()).collect();
+
+    let worst = |q: u32, ki: u32| -> f32 {
+        let mut decoded = Vec::new();
+        for gpu_encode in [true, false] {
+            let mut config = gnc::quality_preset(q);
+            config.entropy_coder = EntropyCoder::Rice;
+            config.keyframe_interval = ki;
+            config.gpu_entropy_encode = gpu_encode;
+            let mut encoder = EncoderPipeline::new(ctx);
+            let frames = encoder.encode_sequence(ctx, &refs, w, h, &config);
+            let decoder = DecoderPipeline::new(ctx);
+            decoded.push(decoder.decode_sequence(ctx, &frames));
+        }
+        decoded[0]
+            .iter()
+            .zip(decoded[1].iter())
+            .flat_map(|(a, b)| a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()))
+            .fold(0.0f32, f32::max)
+    };
+
+    // Measured 2026-09-07 on this content: 74.5 / 48.9 / 8.1 / 4.8. AQ is on at q=50 and q=75 and
+    // off at q=85 and q=90, and the series does not notice — it just tracks the quantiser step.
+    let grid: Vec<(u32, f32)> = [50u32, 75, 85, 90]
+        .iter()
+        .map(|&q| (q, worst(q, 9)))
+        .collect();
+    for (q, d) in &grid {
+        eprintln!("BUG-18 P-chain q={q}: max |diff| {d}");
+    }
+
+    assert!(
+        grid.iter().all(|&(_, d)| d > 0.0),
+        "the inter path now agrees between encode paths somewhere in {grid:?} — BUG-18 may be \
+         fixed. Check intra still agrees too (abac_decodes_to_the_same_pixels_as_rice_and_is_smaller) \
+         before deleting this test."
+    );
+    // Monotone in q is the one structural claim worth pinning: it is what says "quantiser step",
+    // not "some feature that switches on at a threshold" — which is what the two withdrawn
+    // explanations both assumed.
+    assert!(
+        grid.windows(2).all(|w| w[0].1 >= w[1].1),
+        "the divergence is no longer monotone in q: {grid:?}. That would mean a feature boundary \
+         is involved after all, which is what BUG-18 currently says it is not."
     );
 }

@@ -7248,6 +7248,8 @@ impl EncoderPipeline {
                 &mut rice_tiles,
                 &mut huffman_tiles,
                 &mut abac_tiles,
+                config.abac_coder,
+                config.abac_code_block,
             );
         }
 

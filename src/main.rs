@@ -541,6 +541,11 @@ enum Command {
         #[arg(long)]
         rice: bool,
 
+        /// Use the adaptive binary code-block coder (abac). Intra rate is measured; on inter it is
+        /// verified correct but its contexts were tuned on intra coefficients and never retuned.
+        #[arg(long)]
+        abac: bool,
+
         /// Enable per-frame encode diagnostics (also via GNC_DIAGNOSTICS=1)
         #[arg(long)]
         diagnostics: bool,
@@ -633,6 +638,11 @@ enum Command {
         /// above q=25, 6-7% larger at q<=20 (ENT-2, 2026-09-07)
         #[arg(long)]
         rice: bool,
+
+        /// Use the adaptive binary code-block coder (abac). Intra rate is measured; on inter it is
+        /// verified correct but its contexts were tuned on intra coefficients and never retuned.
+        #[arg(long)]
+        abac: bool,
 
         /// Enable per-frame encode diagnostics (also via GNC_DIAGNOSTICS=1)
         #[arg(long)]
@@ -873,7 +883,7 @@ fn csv_with_suffix(path: &str, suffix: &str) -> String {
 
 /// Build a `CodecConfig` from the common CLI parameters shared by both the
 /// streaming and non-streaming I+P+B encode paths.
-// All 8 parameters come directly from CLI args; a builder struct would be
+// Every parameter comes directly from CLI args; a builder struct would be
 // heavier than the duplication it avoids.
 #[allow(clippy::too_many_arguments)]
 fn build_ip_config(
@@ -882,6 +892,7 @@ fn build_ip_config(
     keyframe_interval: u32,
     rans: bool,
     rice: bool,
+    abac: bool,
     chroma_format: &str,
     bitrate: &Option<String>,
     rate_mode: &str,
@@ -903,6 +914,9 @@ fn build_ip_config(
     }
     if rice {
         config.entropy_coder = gnc::EntropyCoder::Rice;
+    }
+    if abac {
+        config.entropy_coder = gnc::EntropyCoder::Abac;
     }
     config.chroma_format = parse_chroma_format(chroma_format);
             config.normalize_for_chroma();
@@ -1474,6 +1488,7 @@ fn main() {
             fps,
             rans,
             rice,
+            abac,
             diagnostics,
             temporal_wavelet,
             tw_highpass_mul,
@@ -1585,6 +1600,9 @@ fn main() {
                 }
                 if rice {
                     config_tw.entropy_coder = gnc::EntropyCoder::Rice;
+                }
+                if abac {
+                    config_tw.entropy_coder = gnc::EntropyCoder::Abac;
                 }
                 config_tw.chroma_format = parse_chroma_format(&chroma_format);
             config_tw.normalize_for_chroma();
@@ -2111,6 +2129,7 @@ fn main() {
                     keyframe_interval,
                     rans,
                     rice,
+                    abac,
                     &chroma_format,
                     &bitrate,
                     &rate_mode,
@@ -2242,6 +2261,7 @@ fn main() {
                 keyframe_interval,
                 rans,
                 rice,
+                abac,
                 &chroma_format,
                 &bitrate,
                 &rate_mode,
@@ -2489,6 +2509,9 @@ fn main() {
                 }
                 if rice {
                     config_tw.entropy_coder = gnc::EntropyCoder::Rice;
+                }
+                if abac {
+                    config_tw.entropy_coder = gnc::EntropyCoder::Abac;
                 }
                 println!(
                     "Temporal config: qstep {:.3}, dead_zone {:.3}, entropy {:?}, adaptive_mul {}",
@@ -2986,6 +3009,7 @@ fn main() {
             rate_mode,
             rans,
             rice,
+            abac,
             diagnostics,
             temporal_wavelet,
             chroma_format,
@@ -3061,6 +3085,9 @@ fn main() {
             }
             if rice {
                 config.entropy_coder = gnc::EntropyCoder::Rice;
+            }
+            if abac {
+                config.entropy_coder = gnc::EntropyCoder::Abac;
             }
 
             config.chroma_format = parse_chroma_format(&chroma_format);

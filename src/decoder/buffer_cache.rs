@@ -89,7 +89,12 @@ pub(super) struct CachedBuffers {
     /// Blocks uploaded per plane for `EntropyData::Abac`, and the engine they were coded with.
     /// The dispatch needs both and neither is derivable from the buffers it binds.
     pub(super) abac_blocks: [u32; 3],
-    pub(super) abac_coder: crate::encoder::abac::Coder,
+    /// Per plane, not one for the frame: a single field silently held the *last* plane's coder,
+    /// so planes 0 and 1 would decode with the wrong pipeline the moment the planes disagreed.
+    /// They normally agree — one engine is chosen per encode — which is exactly what makes the
+    /// bug invisible until something makes them differ, and an adaptive coder decoded with the
+    /// wrong engine produces a plausible wrong image rather than an error.
+    pub(super) abac_coder: [crate::encoder::abac::Coder; 3],
     /// Per-plane CPU-decoded coefficient buffers (used for context-adaptive decode).
     pub(super) cpu_decoded_planes: [wgpu::Buffer; 3],
 
@@ -523,7 +528,7 @@ impl CachedBuffers {
             plane_alpha_cap,
             ctx_adaptive_decode: false,
             abac_blocks: [0; 3],
-            abac_coder: crate::encoder::abac::Coder::default(),
+            abac_coder: [crate::encoder::abac::Coder::default(); 3],
             cpu_decoded_planes: std::array::from_fn(|i| {
                 ctx.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some(["dec_cpu_plane0", "dec_cpu_plane1", "dec_cpu_plane2"][i]),

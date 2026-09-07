@@ -409,6 +409,16 @@ pub struct CodecConfig {
     /// saving ~24MB bandwidth at 1080p. Requires gpu_entropy_encode = true and
     /// non-CfL path (CfL needs separate quantize + dequantize for reconstruction).
     pub use_fused_quantize_histogram: bool,
+
+    /// Which arithmetic engine `EntropyCoder::Abac` encodes with, and its code-block edge.
+    ///
+    /// Config rather than environment. It used to be read from `GNC_ABAC_CODER` at encode time,
+    /// which is process-global state: `cargo test` runs tests in parallel threads, so one test
+    /// setting the variable changed what a concurrently running test encoded with. That is not a
+    /// test-only hazard — any embedder running two encodes on different threads had the same
+    /// problem. The environment now seeds the default and nothing reads it afterwards.
+    pub abac_coder: encoder::abac::Coder,
+    pub abac_code_block: u32,
     /// Transform type: Wavelet (default) or BlockDCT8 (fewer dispatches, faster).
     pub transform_type: TransformType,
     /// DCT frequency-dependent quantization strength.
@@ -497,6 +507,8 @@ impl Default for CodecConfig {
             target_bitrate: None,
             rate_mode: RateMode::VBR,
             use_fused_quantize_histogram: false,
+            abac_coder: encoder::entropy_helpers::abac_coder_from_env(),
+            abac_code_block: encoder::entropy_helpers::abac_cb_from_env(),
             transform_type: TransformType::Wavelet,
             dct_freq_strength: 7.0,
             intra_prediction: false,
@@ -825,6 +837,8 @@ pub fn quality_preset(q: u32) -> CodecConfig {
         aq_strength,
         context_adaptive: false, // CPU-only; enable explicitly when GPU implementation exists
         use_fused_quantize_histogram: true, // auto-disabled when CfL is active
+        abac_coder: encoder::entropy_helpers::abac_coder_from_env(),
+        abac_code_block: encoder::entropy_helpers::abac_cb_from_env(),
         transform_type: TransformType::Wavelet, // block DCT opt-in via config override
         dct_freq_strength: 7.0,
         // Intra prediction is off by default: measured at -11.76 dB / +29% bitrate on lossy

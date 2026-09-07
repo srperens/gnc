@@ -96,6 +96,8 @@ pub(super) fn encode_entropy(
             rice_tiles,
             huffman_tiles,
             abac_tiles,
+            config.abac_coder,
+            config.abac_code_block,
         );
     }
 }
@@ -170,14 +172,11 @@ pub(super) fn entropy_encode_tiles(
     rice_tiles: &mut Vec<rice::RiceTile>,
     huffman_tiles: &mut Vec<huffman::HuffmanTile>,
     abac_tiles: &mut Vec<AbacTile>,
+    // One engine for the whole encode, from the config: the two share a binarisation but not a
+    // bitstream, and it is recorded per tile so the decoder never has to guess.
+    abac_coder: Coder,
+    abac_cb: u32,
 ) {
-    // One engine for the whole encode: the two share a binarisation but not a bitstream, and it
-    // is recorded per tile so the decoder never has to consult the environment.
-    let (abac_coder, abac_cb) = if matches!(mode, EntropyMode::Abac) {
-        (abac_coder_from_env(), abac_cb_from_env())
-    } else {
-        (Coder::default(), abac_tile::DEFAULT_CB)
-    };
     for ty in 0..tiles_y {
         for tx in 0..tiles_x {
             let coeffs = extract_tile_coefficients(quantized, plane_width, tx, ty, tile_size);
@@ -276,7 +275,7 @@ fn extract_tile_coefficients(
 /// For a shipped encode the choice is settled: on real coefficients at q=90 Range costs 33.0 ms
 /// of entropy decode against Interval's 96.3 ms — 2.9x — for 0.7 points of rate (−13.8% vs
 /// −14.5% on bbb). Range at cb=64 dominates every other cell measured.
-pub(crate) fn abac_coder_from_env() -> Coder {
+pub fn abac_coder_from_env() -> Coder {
     match std::env::var("GNC_ABAC_CODER").as_deref() {
         Ok("interval") => Coder::Interval,
         _ => Coder::Range,
@@ -287,7 +286,7 @@ pub(crate) fn abac_coder_from_env() -> Coder {
 /// rows of neighbour magnitudes per thread in workgroup memory, sized for 64. A larger value
 /// would code better and then fail to decode on the GPU, so it is refused here rather than at
 /// dispatch.
-pub(crate) fn abac_cb_from_env() -> u32 {
+pub fn abac_cb_from_env() -> u32 {
     let cb = std::env::var("GNC_ABAC_CB")
         .ok()
         .and_then(|v| v.parse::<u32>().ok())

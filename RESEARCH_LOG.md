@@ -9026,6 +9026,22 @@ Note also that Rice-on-CPU is much *larger* than Rice-on-GPU (610 264 B vs 415 5
 q=25) because the CPU reference lacks per-stream k and the checkerboard k-context. Comparing abac
 against the CPU Rice would have read −44% and been nonsense. The baseline is the shipped encoder.
 
+### One more defect, mine this time: three planes, one coder field
+
+The env-var race above (a test setting `GNC_ABAC_CODER` while another test encoded) did not just
+break a test — it exposed a real decoder bug it was masking. `CachedBuffers` held **one**
+`abac_coder` for the whole frame, written per plane in a loop, so it ended up holding the *last*
+plane's engine and planes 0 and 1 were decoded with whatever plane 2 used. In every normal encode
+all three planes share one engine, so the field was right by accident; the moment they differed,
+two planes decoded with the wrong arithmetic engine — and an adaptive coder given the wrong engine
+does not fail, it produces a plausible wrong image. Now `[Coder; 3]`.
+
+Both halves are fixed at the source rather than worked around: the coder and code-block size moved
+from the environment into `CodecConfig` (`abac_coder`, `abac_code_block`, still seeded from
+`GNC_ABAC_CODER` / `GNC_ABAC_CB`), so the encoder's choice is no longer process-global state that
+one thread can change under another. That was never only a test hazard — any embedder running two
+encodes on different threads had it too.
+
 ### What shipped
 
 - `EntropyCoder::Abac` / `EntropyData::Abac` / `--abac`; `entropy_type = 5` behind a new **GP18**
@@ -9066,14 +9082,84 @@ decoder still reads GP17, which is what every file written before today says.
 change gives no reason to think it moved. Five sessions are on the machine, so a figure taken now
 would not be quotable anyway (COORDINATION, "the machine is shared").
 
-**Inter frames: correct, but unmeasured.** `abac_survives_a_p_frame_chain` encodes a 1I+3P chain
-both ways and asserts frame-by-frame pixel identity, so the inter path is not silently broken —
-worth having, because an adaptive coder that diverges on a P-frame residual would produce a
-plausible wrong frame and then feed it forward as a reference. What it does **not** establish is
-whether abac is *good* on inter: the contexts were tuned on intra coefficients and residual
-statistics differ. The test prints −28.2% on its own content, and that figure is worth nothing —
-it is a synthetic image translated by a few pixels, so the residual is far cleaner than any real
-motion. A real inter number needs real sequences and is the obvious next item on this row.
+**Inter frames: correct at ship time, measured shortly after.** `abac_survives_a_p_frame_chain`
+encodes a 1I+3P chain both ways and asserts frame-by-frame pixel identity, so the inter path was
+known not to be silently broken — worth having on its own, because an adaptive coder that diverges
+on a P residual produces a plausible wrong frame and then feeds it forward as a reference. It said
+nothing about whether abac is *good* there; the section below is that measurement. (The test also
+prints −28.2% on its own content. That figure is worth nothing — a synthetic image translated a few
+pixels has a far cleaner residual than any real motion — and is not the number below.)
+
+### Inter, measured (added later the same day)
+
+`--abac` reached only the single-frame commands; the sequence path had no entropy-coder flag at
+all, so it was added to `benchmark-sequence` and `encode-sequence`. Three sequences, 24 frames,
+ki=9, 4:4:4, I+P (no B — the pyramid is off by default, BUG-5):
+
+| sequence | q=90 ΔPSNR | q=90 I+P rate | all-intra control |
+|---|---|---|---|
+| crowd_run | 0.00 dB | **−12.17%** | −11.48% |
+| old_town_cross | 0.00 dB | **−12.00%** | −12.65% |
+| bbb_extended | +0.03 dB | **−19.11%** | −14.25% |
+| mean | | **−14.43%** | −12.79% |
+
+**Quality is matched to ≤0.03 dB here, not exactly** — unlike the intra rows above, where the two
+arms decode to identical pixels. On the inter path the two *encode* paths never agree exactly
+(BUG-18, below), and abac is CPU-encoded where Rice is GPU-encoded. 0.03 dB is far below anything
+that would move these conclusions, but it is a weaker claim than the intra one.
+
+**The concern this row was carrying does not materialise.** BACKLOG's note was that abac's
+contexts were tuned on intra coefficients and inter residual statistics differ, so the gain might
+shrink. On these three sequences the I+P stream saves *more* than the all-intra control from the
+same runs (−14.4% against −12.8%), not less. Two of the three are exactly PSNR-equal; bbb_extended
+differs by 0.03 dB, so its −19.11% carries a small caveat rather than being exact.
+
+Note in passing that at q=90 the I+P stream is *larger* than all-intra on crowd_run (81.9 MB vs
+79.5 MB), which is the already-established result that motion compensation does not pay at
+contribution quality — nothing to do with the entropy coder.
+
+**q=75 is not quoted, and chasing why turned up BUG-18 — after two wrong explanations.** The two
+arms differ by up to 0.54 dB there, in both directions. It is not abac: intra agrees pixel-exactly
+at q=50/75/90, so it is the *inter* path, and swapping which coder runs also swaps which **encode
+path** runs (abac is CPU-encoded, Rice GPU-encoded). Entropy coding is lossless and cannot affect
+a reconstruction, so one path is feeding the encoder something the other does not. Filed as
+**BUG-18, P1**.
+
+**What I published twice and had to withdraw twice.** First: "the trigger is adaptive
+quantisation" — the q sweep followed AQ exactly, q=75 and q=80 (AQ on) diverging while q=85 and
+q=90 (AQ off) agreed on avg, min, max *and* stddev. Then, after the regression test failed on its
+first run: "AQ and B-frames are two triggers". Measured pixel-wise, neither is true:
+
+| q | AQ | max abs pixel diff |
+|---|---|---|
+| 50 | on | 74.53 |
+| 75 | on | 48.92 |
+| 85 | off | 8.11 |
+| 90 | off | 4.84 |
+
+The divergence is present at every quality and is **monotone in q**, so it tracks the quantiser
+step, not a feature boundary. AQ was never involved; nor were B-frames — the "B-frame" cell
+returned numbers bit-identical to the P-only cell, because at ki=4 over 4 frames the pyramid is
+suppressed and it was another P-only run.
+
+**The error underneath both wrong stories is one thing: I read pixel identity off a PSNR average
+printed to two decimals.** A max |diff| of 8 on a handful of pixels does not move that average.
+This repo already has the mirror-image rule — aggregate metrics hiding a real difference, which is
+the whole VMAF-saturation thread — and this is the same failure with the roles swapped. It cost
+two published explanations in one afternoon. **Aggregate quality is not evidence of pixel
+identity. If the claim is "identical", compare the pixels.**
+
+**So the inter rate figures above are "quality matched to ≤0.03 dB", not "at identical pixels".**
+The intra figures are the exact kind; the inter ones are not, and are labelled accordingly. 0.03 dB
+is far below anything that would move the conclusion, so the comparison is still worth quoting —
+but it is a weaker claim and is now written as one.
+
+Two tests hold the shape: `abac_survives_a_p_frame_chain` (same encode path, both coders → pixel
+identity) and `inter_reconstruction_depends_on_the_encode_path` (same coder, both paths → the grid
+above, asserted non-zero and monotone in q).
+
+---
+
 ## 2026-09-07 — ENT-2: Rice against rANS on one commit, with the coder read out of the bitstream
 
 Decision record 0015 withdrew the README's Rice-vs-rANS compression column and recorded a

@@ -577,34 +577,86 @@ contaminated by chroma error and overstated the luma loss **3.7x** (−0.56 vs �
 taken in YCoCg-R. And VMAF read **97.08 before and after** the shipped change, on 6% fewer bits —
 the same illusion that made the 2026-09-05 sweep look like a free 15%.
 
-### BUG-17 — the abac chroma test fails only under test parallelism (todo, P2)
+### BUG-17 — `abac_bitstream` failed under test parallelism (**FIXED 2026-09-07**)
 
-`cargo test --release`, the gate CLAUDE.md prescribes, is **non-deterministic**. Measured
-2026-09-07 on a loaded machine:
+`cargo test --release`, the gate CLAUDE.md prescribes, was **non-deterministic** on this file:
+`abac_handles_subsampled_chroma` failed 2 runs in 4 at default parallelism, passed 4 of 4 with
+`--test-threads=1`, and passed alone. Another session saw a *different* test fail
+(`abac_survives_a_p_frame_chain`, `max |diff| 104745`) on its own runs.
 
-| how it is run | result |
-|---|---|
-| `abac_handles_subsampled_chroma` alone | ok |
-| whole `abac_bitstream` file, default parallelism | **2 failures in 4 runs** |
-| whole file, `--test-threads=1` | **ok, 4 of 4** |
+**The question this entry asked was the right one, and the answer is the uncomfortable option.**
+It asked: is the test wrong to share a GPU device with its neighbours, or is there shared state in
+the abac path that concurrency merely exposes — because if the second, `--test-threads=1` would
+hide a real bug rather than fix one. It is the second, twice over:
 
-Failure is `tests/abac_bitstream.rs:172` — `Yuv422: abac and Rice decoded different pixels`,
-`left: 85321.734  right: 0.0`. **The magnitude is identical on every failure**, so it is one
-specific corruption when the race lands, not noise. The test compares the two coders on the
-*same* CPU encode path precisely so the assertion is about the entropy coder rather than which
-quantise shader ran, which makes a clean "the test is just badly isolated" explanation less
-comfortable than it looks.
+1. **A test called `std::env::set_var("GNC_ABAC_CODER", …)`.** The environment is process-global
+   and cargo runs tests on parallel threads, so that test changed which arithmetic engine a
+   *concurrently running* test encoded with. That explains both the flake's signature (a different
+   test failing each run) and its magnitude (garbage, not a rounding difference — a plane decoded
+   with the wrong engine does not fail, it produces a plausible wrong image).
+2. **And it was masking a real decoder bug.** `CachedBuffers` held **one** `abac_coder` for the
+   whole frame, written per plane in a loop, so it ended up holding the *last* plane's engine and
+   planes 0 and 1 decoded with whatever plane 2 used. All three planes normally share an engine,
+   so the field was right by accident and no test could see it.
 
-**The question to answer, and it is not yet answered:** is the test wrong to share a GPU device
-with its six neighbours, or is there shared state in the abac/GPU path that concurrency merely
-exposes? If the second, `--test-threads=1` would hide a real bug rather than fix one — so
-establish which before changing the gate. `rice_gpu_and_cpu_encode_paths_differ_at_subsampled_chroma`
-sits in the same file and BUG-16 is in the same area.
+**Fixed at the source, not worked around.** The coder and code-block size moved from the
+environment into `CodecConfig` (`abac_coder`, `abac_code_block`, still seeded from
+`GNC_ABAC_CODER` / `GNC_ABAC_CB`), and `abac_coder` in the decoder is now `[Coder; 3]`. The env
+var was never only a test hazard: any embedder running two encodes on different threads had it.
 
-Found 2026-09-07 by the `coord` session while running the gates on a documentation-only change
-(no `.rs`, `.wgsl` or `.toml` in the diff), so it is inherited from the ABAC-SHIP merge rather
-than caused by it being observed. Everything else in that run was green: 175 + 6 tests,
-`cargo clippy --release` and the wasm target both clean.
+Three consecutive parallel runs of the file afterwards: **8 passed, 0 failed**, and the full suite
+is green at default parallelism. **So the gate stays `cargo test --release`, unqualified** — no
+`--test-threads=1` requirement and no serialising mutex, because a red gate on this file should
+mean something again.
+
+Worth keeping for the shape: the flake was the only visible symptom of a latent bug that no
+sequential test run could ever have caught, and the instinct to make it go away by serialising the
+suite would have preserved it.
+
+
+### BUG-18 — the inter path's reconstruction depends on the entropy encode path (todo, P1)
+
+Found 2026-09-07 while measuring abac on inter (ABAC-SHIP). **Not an abac defect** — both arms in
+the isolating test are Rice — and more serious than BUG-16, because entropy coding is a *lossless*
+stage that cannot legitimately affect a reconstruction at all. One of the two encode paths is
+feeding the encoder something the other does not.
+
+**The shape, measured pixel-wise** (`inter_reconstruction_depends_on_the_encode_path`: 1I+3P,
+256x256, 4:4:4, Rice on both sides, only `gpu_entropy_encode` varying):
+
+| q | AQ | max abs pixel diff |
+|---|---|---|
+| 50 | on | **74.53** |
+| 75 | on | **48.92** |
+| 85 | off | **8.11** |
+| 90 | off | **4.84** |
+
+**Intra agrees exactly** at q=50/75/90 (`abac_decodes_to_the_same_pixels_as_rice_and_is_smaller`
+asserts max |diff| 0 through the container), so this is the inter path specifically. The series is
+monotone in q and does not notice AQ switching off between 75 and 85: it tracks the **quantiser
+step**, not a feature boundary.
+
+**Two wrong explanations were published before the test existed, and the test killed both.** First
+"the trigger is adaptive quantisation"; then "AQ and B-frames are two triggers". Both were read
+off **PSNR averages printed to two decimals** — on crowd_run at q=85 the two arms agree on avg,
+min, max *and* stddev, and the pixels still differ by 8. **Aggregate quality is not evidence of
+pixel identity**, and it was used as such twice. (The B-frame cell was also not what it claimed:
+at ki=4 over 4 frames the pyramid is suppressed, so it was another P-only run — it returned
+bit-identical numbers to the P-only cell, which is what gave it away.)
+
+**Ruled out:** CfL (`GNC_NO_CFL=1` at q=75 changes nothing), chroma format (4:4:4), AQ, B-frames,
+and the entropy coder itself.
+
+**Why P1.** The GPU path is the default, so this is the *shipped* encoder, across the whole lossy
+inter range. It is invisible to any test that compares an encode against itself, and it silently
+degrades any experiment that compares a CPU-encoded arm against a GPU-encoded one on video —
+exactly what an entropy-coder comparison wants to do. It is why ABAC-SHIP's inter figures are
+quoted as "quality matched to ≤0.03 dB" rather than "at identical pixels", which is what the intra
+figures are.
+
+Possibly the same root cause as **BUG-16** (GPU vs CPU encode paths disagreeing at q ≤ 30 on
+intra); whoever takes one should read the other.
+
 
 ### BUG-16 — Rice's GPU and CPU encode paths disagree on the coefficients (todo, P2)
 
@@ -1498,13 +1550,18 @@ not re-found as an abac bug. It is why **q=25 is not quoted as a rate figure** a
 **Still open:**
 1. ~~GPU decode shader and honest fps against Rice on an idle machine.~~ Done — Part 6.
 2. ~~Bitstream integration.~~ Done — Part 7.
-3. **Inter frames — correct, unmeasured (todo, P2).** `abac_survives_a_p_frame_chain` encodes a
-   1I+3P chain both ways and asserts frame-by-frame pixel identity, so the path is not silently
-   broken. That matters on its own: a coder that diverged on a P residual would produce a
-   plausible wrong frame and then feed it forward as a reference. It says nothing about whether
-   abac is *good* there — the contexts were tuned on intra coefficients. The test's own −28.2% is
-   worthless as a figure (synthetic image, translated a few pixels, unrealistically clean
-   residual). A real number needs real sequences, and that is the obvious next item here.
+3. ~~**Inter frames.**~~ **Measured 2026-09-07: −14.4% mean at q=90, and the worry was wrong.**
+   Three sequences (crowd_run, old_town_cross, bbb_extended), 24 frames, ki=9, 4:4:4, I+P:
+   −12.17% / −12.00% / −19.11% on the I+P bitstream, against −11.48% / −12.65% / −14.25% for the
+   all-intra control from the same runs. The standing note here was that abac's contexts were
+   tuned on intra coefficients so inter might pay less; **it pays slightly more** (−14.4% vs
+   −12.8%). PSNR is exactly equal on two of three; bbb_extended differs 0.03 dB, so its −19.11%
+   carries a small caveat. `--abac` had to be added to `benchmark-sequence` / `encode-sequence`
+   first — the sequence path had no entropy-coder flag at all.
+   **These are quality-matched to ≤0.03 dB, not pixel-exact like the intra rows** — on the inter
+   path the two *encode paths* never agree exactly (BUG-18, filed from this measurement), and abac
+   is CPU-encoded where Rice is GPU-encoded. **q=75 is not quoted at all**: the gap is worth
+   0.54 dB there.
 4. **CPU encode is 129 ms/frame against Rice's 23 ms (todo, P3).** Serial per symbol by
    construction, but parallel across ~3000 code-blocks and currently single-threaded. This is what
    stands between abac and being a candidate default, more than the decode debt does.

@@ -1418,7 +1418,7 @@ now stops at 55 dB, above which the 8-bit grid dominates and two encodes within 
 can order either way. Verified that a plain gradient reconstructs *exactly* from q=92 up, so there
 is no defect behind that.
 
-### RATE-1 — Above ~q=90 on smooth content an 8-bit encode buys precision it cannot emit (todo, P2)
+### RATE-1 — Above ~q=90 on smooth content an 8-bit encode buys precision it cannot emit (in progress 2026-09-07, `rate1` worktree)
 On the test gradient, q=90 costs 0.275 bpp and q=95 costs **1.142 bpp** — four times the bits for
 output that is bit-identical at 8 bits. Not a bug: the anchor ladder halves qstep and zeroes the
 dead zone up there, as designed. But nothing tells it the output is 8-bit.

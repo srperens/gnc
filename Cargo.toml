@@ -7,6 +7,13 @@ description = "GPU-native broadcast video codec using wgpu compute shaders"
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features]
+# BUG-25 only. Enables wgpu's SPIR-V passthrough so `spirv_pipeline_probe` can hand the driver a
+# module wgpu did not generate — which is what `spirv-reduce` needs as an interestingness test.
+# Off by default: it is a diagnostic, it changes no codec behaviour, and the codec must keep
+# building for wasm, where passthrough is meaningless.
+bug25-spirv = ["wgpu/spirv"]
+
 [dependencies]
 wgpu = "24"
 bytemuck = { version = "1", features = ["derive"] }

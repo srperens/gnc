@@ -19,6 +19,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
 FRAMES_DIR="frames"
+FAILED=0
 mkdir -p "$FRAMES_DIR"
 
 for cmd in ffmpeg curl; do
@@ -27,6 +28,19 @@ for cmd in ffmpeg curl; do
         exit 1
     fi
 done
+
+# ffmpeg 5.1 renamed `-vsync` to `-fps_mode`, and ffmpeg 9 removed `-vsync` outright.
+# This script runs on more than one machine, so ask the installed binary which one it
+# takes rather than pinning either. Getting this wrong is not loud: on 2026-09-07 the
+# rejected option only produced "Unrecognized option 'vsync'" into a swallowed stream,
+# and the blue_sky sequence went missing while the script still exited 0.
+if ffmpeg -nostdin -hide_banner -loglevel quiet \
+        -f lavfi -i "testsrc=d=0.1" -fps_mode vfr -f null - </dev/null 2>/dev/null; then
+    VFR_OPT="-fps_mode vfr"
+else
+    VFR_OPT="-vsync vfr"
+fi
+echo "Using '${VFR_OPT}' for variable-frame-rate output"
 
 # Extract a single frame from a remote y4m by streaming just enough data.
 # We pipe curl into ffmpeg and grab frame N, then kill the download.
@@ -55,6 +69,7 @@ fetch_y4m_frame() {
     else
         echo "  [FAIL] Could not extract frame from ${url}"
         rm -f "$out_png"
+        FAILED=1
     fi
 }
 
@@ -76,6 +91,7 @@ fetch_png_frame() {
     else
         echo "  [FAIL] Download failed for ${url}"
         rm -f "$out_png"
+        FAILED=1
     fi
 }
 
@@ -150,13 +166,14 @@ else
     ffmpeg -nostdin -y -loglevel error \
         -i "${XIPH}/y4m/blue_sky_1080p25.y4m" \
         -vf "select=between(n\\,50\\,57)" \
-        -vsync vfr \
+        $VFR_OPT \
         -start_number 0 \
-        "${SEQ_DIR}/blue_sky/frame_%04d.png" </dev/null 2>&1 || true
+        "${SEQ_DIR}/blue_sky/frame_%04d.png" </dev/null || true
     if [ -f "$first_frame" ]; then
         echo "  [done] blue_sky sequence"
     else
         echo "  [FAIL] Could not extract blue_sky sequence"
+        FAILED=1
     fi
 fi
 # Generate Y4M for fast encoder input
@@ -171,6 +188,41 @@ if [ ! -f "${SEQ_DIR}/blue_sky/blue_sky.y4m" ] && [ -f "${SEQ_DIR}/blue_sky/fram
 fi
 
 echo ""
+echo "=== Verifying ==="
+echo ""
+
+# The script used to exit 0 even when a fetch failed: on 2026-09-07 ffmpeg 9 rejected
+# `-vsync` (removed upstream), the `|| true` swallowed it, and the blue_sky sequence was
+# silently absent while the script reported success. Check what actually landed.
+expect_file() {
+    local f="$1"
+    if [ -f "$f" ] && [ -s "$f" ]; then
+        echo "  [ok]   $f"
+    else
+        echo "  [MISS] $f"
+        FAILED=1
+    fi
+}
+
+for n in bbb_1080p blue_sky_1080p kristensara_720p touchdown_1080p; do
+    expect_file "${FRAMES_DIR}/${n}.png"
+done
+for i in 0 1 2 3 4 5 6 7; do
+    expect_file "${SEQ_DIR}/bbb/frame_000${i}.png"
+    expect_file "${SEQ_DIR}/blue_sky/frame_000${i}.png"
+done
+expect_file "${SEQ_DIR}/bbb/bbb.y4m"
+expect_file "${SEQ_DIR}/blue_sky/blue_sky.y4m"
+
+echo ""
+if [ "$FAILED" -ne 0 ]; then
+    echo "=== INCOMPLETE — some material is missing (see [MISS]/[FAIL] above) ==="
+    echo ""
+    echo "Re-run this script; it skips what is already present. A partial download"
+    echo "satisfies the skip check, so delete a suspect file before retrying."
+    exit 1
+fi
+
 echo "=== Done ==="
 echo ""
 ls -lh "${FRAMES_DIR}/"*.png 2>/dev/null || echo "No single frames downloaded"

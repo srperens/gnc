@@ -184,6 +184,14 @@ ki=9, 4:2:0, 8-bit, x264 at its defaults.
 
 **GNC needs about 1.9x the bitrate of H.264 for the same luma PSNR at contribution quality.**
 
+**Caveat added 2026-09-07: two of those four rungs are inside GNC's dominated range.** RATE-2
+found that above q≈95–98 the lossy path costs *more bytes than GNC's own bit-exact lossless*
+(+28.9% mean at q=99, +40.6% on blue_sky), and this ladder runs to q=96 and q=99. So the +90.5%
+scores GNC partly through rungs it should never operate on, which makes the figure **pessimistic
+against GNC by an unmeasured amount** — not wrong, but not a clean 1.9x either. The ladder is also
+not monotonic in rate (a rung's bpp can fall as q rises), so any interpolation by rate should flag
+that. Re-run it once RATE-2 is fixed before quoting 1.9x as settled.
+
 **Colour, at rate matched to 1%** — CIEDE2000 on decoded RGB, which VMAF cannot see:
 
 | | bbb_extended | old_town_cross | crowd_run |

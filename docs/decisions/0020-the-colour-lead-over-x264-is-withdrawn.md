@@ -70,6 +70,10 @@ worse dE00 on the same content, which cannot both be true of one measurement.
 - **GNC has no measured advantage over x264 on any axis at the contribution operating point.** The
   +90.5% is the whole picture, not one side of a trade. Prioritisation that treated colour as a
   banked win has to be redone; intra luma is the only thing on the board.
+  *The direction is settled; the magnitude is not.* RATE-2 (filed the same day) shows the q=96 and
+  q=99 rungs of that ladder sit above GNC's lossless crossover, so +90.5% is pessimistic against
+  GNC by an unmeasured amount. That does not give colour back — CHROMA-2 is measured at q=85,
+  well below the crossover, and is unaffected.
 - The `chroma_weight` frontier from 0014 is untouched and still steep. What is gone is the claim
   that GNC's position on it beats x264's.
 - **Any two-codec colour comparison in this repo must state its conversion floor.** Three of the

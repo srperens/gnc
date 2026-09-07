@@ -9532,7 +9532,10 @@ was the opposite of what the control now shows.
   the nominal JND of 1.0.
 - It does say the one row where GNC was recorded as beating x264 does not survive a rate-matched
   control, and that **GNC has no measured advantage over x264 on any axis at this operating
-  point** — the +90.5% luma gap is the whole picture, not a trade.
+  point** — the +90.5% luma gap is the whole picture, not a trade. *Direction settled, magnitude
+  not:* RATE-2, filed the same day, shows the q=96 and q=99 rungs of that ladder sit above GNC's
+  own lossless crossover, so +90.5% is pessimistic against GNC by an unmeasured amount. It does not
+  hand colour back — this run is at q=85, well below the crossover.
 - The `chroma_weight` frontier CHROMA-1 measured is still real and still steep. What is gone is the
   claim that GNC's position on it beats x264's.
 - **Rate/quality only. No throughput number is quoted here and none should be:** the machine ran at

@@ -549,13 +549,27 @@ fn main(
     // collects the total SAD. workgroupBarrier() is always at top level of each iteration.
 
     // Half-pel offsets (dx, dy) in quarter-pel units (1 QP unit = 0.25px, so 2 = half-pel)
-    let hpel_dx = array<i32, 8>(0, 0, -2, 2, -2, 2, -2, 2);
-    let hpel_dy = array<i32, 8>(-2, 2, 0, 0, -2, -2, 2, 2);
 
     // Round A: HBAND half-pel
     for (var cand = 0u; cand < 8u; cand++) {
-        let off_x = hpel_dx[cand];
-        let off_y = hpel_dy[cand];
+        var off_x: i32 = 0;
+        var off_y: i32 = 0;
+        // 8-point diamond, half-pel (2 QP units). Written as a switch, not as a dynamic index
+        // into an `array<i32, 8>` value: see BUG-25 — under the `Restrict` index bounds-check
+        // policy that wgpu always requests, naga 24 lowers such a lookup into a function-local
+        // temporary that it then fails to declare, and the resulting module kills two unrelated
+        // Vulkan drivers. The earlier half-pel search in this file was always written this way.
+        switch cand {
+            case 0u: { off_x =  0; off_y = -2; }
+            case 1u: { off_x =  0; off_y =  2; }
+            case 2u: { off_x = -2; off_y =  0; }
+            case 3u: { off_x =  2; off_y =  0; }
+            case 4u: { off_x = -2; off_y = -2; }
+            case 5u: { off_x =  2; off_y = -2; }
+            case 6u: { off_x = -2; off_y =  2; }
+            case 7u: { off_x =  2; off_y =  2; }
+            default: {}
+        }
 
         // Pixel within the 16×8 HBAND partition indexed by half_tid.
         let px_ = half_tid % 16u;
@@ -590,8 +604,24 @@ fn main(
 
     // Round B: VBAND half-pel
     for (var cand = 0u; cand < 8u; cand++) {
-        let off_x = hpel_dx[cand];
-        let off_y = hpel_dy[cand];
+        var off_x: i32 = 0;
+        var off_y: i32 = 0;
+        // 8-point diamond, half-pel (2 QP units). Written as a switch, not as a dynamic index
+        // into an `array<i32, 8>` value: see BUG-25 — under the `Restrict` index bounds-check
+        // policy that wgpu always requests, naga 24 lowers such a lookup into a function-local
+        // temporary that it then fails to declare, and the resulting module kills two unrelated
+        // Vulkan drivers. The earlier half-pel search in this file was always written this way.
+        switch cand {
+            case 0u: { off_x =  0; off_y = -2; }
+            case 1u: { off_x =  0; off_y =  2; }
+            case 2u: { off_x = -2; off_y =  0; }
+            case 3u: { off_x =  2; off_y =  0; }
+            case 4u: { off_x = -2; off_y = -2; }
+            case 5u: { off_x =  2; off_y = -2; }
+            case 6u: { off_x = -2; off_y =  2; }
+            case 7u: { off_x =  2; off_y =  2; }
+            default: {}
+        }
 
         // Pixel within the 8×16 VBAND partition indexed by half_tid.
         let px_ = half_tid % 8u;
@@ -625,13 +655,24 @@ fn main(
     }
 
     // ---- Quarter-pel refinement: 8-point diamond (±1 QP unit) for all 4 partitions ----
-    let qpel_dx = array<i32, 8>(0, 0, -1, 1, -1, 1, -1, 1);
-    let qpel_dy = array<i32, 8>(-1, 1, 0, 0, -1, -1, 1, 1);
 
     // Round A: HBAND quarter-pel
     for (var cand = 0u; cand < 8u; cand++) {
-        let off_x = qpel_dx[cand];
-        let off_y = qpel_dy[cand];
+        var off_x: i32 = 0;
+        var off_y: i32 = 0;
+        // 8-point diamond, quarter-pel (1 QP unit). Switch rather than a dynamic array index,
+        // for the reason given at the half-pel site above (BUG-25).
+        switch cand {
+            case 0u: { off_x =  0; off_y = -1; }
+            case 1u: { off_x =  0; off_y =  1; }
+            case 2u: { off_x = -1; off_y =  0; }
+            case 3u: { off_x =  1; off_y =  0; }
+            case 4u: { off_x = -1; off_y = -1; }
+            case 5u: { off_x =  1; off_y = -1; }
+            case 6u: { off_x = -1; off_y =  1; }
+            case 7u: { off_x =  1; off_y =  1; }
+            default: {}
+        }
 
         let px_ = half_tid % 16u;
         let py_ = half_tid / 16u;
@@ -664,8 +705,21 @@ fn main(
 
     // Round B: VBAND quarter-pel
     for (var cand = 0u; cand < 8u; cand++) {
-        let off_x = qpel_dx[cand];
-        let off_y = qpel_dy[cand];
+        var off_x: i32 = 0;
+        var off_y: i32 = 0;
+        // 8-point diamond, quarter-pel (1 QP unit). Switch rather than a dynamic array index,
+        // for the reason given at the half-pel site above (BUG-25).
+        switch cand {
+            case 0u: { off_x =  0; off_y = -1; }
+            case 1u: { off_x =  0; off_y =  1; }
+            case 2u: { off_x = -1; off_y =  0; }
+            case 3u: { off_x =  1; off_y =  0; }
+            case 4u: { off_x = -1; off_y = -1; }
+            case 5u: { off_x =  1; off_y = -1; }
+            case 6u: { off_x = -1; off_y =  1; }
+            case 7u: { off_x =  1; off_y =  1; }
+            default: {}
+        }
 
         let px_ = half_tid % 8u;
         let py_ = half_tid / 8u;

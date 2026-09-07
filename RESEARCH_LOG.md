@@ -4,6 +4,89 @@
 
 ---
 
+## BUG-25 — GNC ships invalid SPIR-V, and that is *not* what crashes the driver (2026-09-08)
+
+Two defects, found in one session, and the second is not the first. Recording both because the
+tempting move — fix the invalid module, see the validity gate go green, declare the bug closed —
+is available here and would be wrong.
+
+### The evidence that redirected the whole investigation
+
+BUG-25 rested on "naga converts all 62 shaders and **`spirv-val` passes all 62**", which made two
+unrelated drivers dying look like a driver problem. **That measurement was taken with the wrong
+compiler.** The `naga` on the box is the CLI at **30.0.1**; GNC ships **naga 24.0.0**, the version
+wgpu 24 depends on. The module that was validated is not the module that reaches the driver.
+
+Confirmed the cheap way: `spirv_pipeline_probe` (new) creates a compute pipeline from a raw `.spv`.
+The naga-30 CLI module for `block_match_split` builds a pipeline **fine**; the same shader through
+wgpu segfaults. So the offending artefact is naga 24's output specifically.
+
+### Defect A — naga 24 emits a variable it never declares
+
+Reconstructing wgpu's `spv::Options` from `wgpu-hal/src/vulkan/adapter.rs` and emitting through
+naga 24 (`examples/bug25_emit.rs`), the module fails validation:
+
+```
+error: line 1655: ID '1214[%1214]' has not been defined
+   OpStore %1214 %426
+   %1218 = OpAccessChain %_ptr_Function_int %1214 %1217
+```
+
+`%1214` is a function-local temporary naga materialises to dynamically index a **value-typed
+constant array**, and it emits the stores and access chains without ever emitting the
+`OpVariable`. The source construct is four `let hpel_dx = array<i32, 8>(...)` / `qpel_*`
+declarations indexed by a loop counter — and the discriminator nobody had found is exact:
+
+| shader | `let … = array<…>` with dynamic index | Vulkan |
+|---|---|---|
+| **block_match_split** | **4** | **dies** |
+| block_match_bidir | 0 | OK |
+| block_match | 0 | OK |
+
+**Swept the whole tree: 1 of 63 shaders is invalid under naga 24 with wgpu's options, and it is
+the one that crashes.** That is the control that says the emitter is sound and the shader is the
+trigger. It also explains four earlier results at once — why removing the quarter-pel section fixed
+it (the arrays live there), why "8 candidates → 4" still crashed (still a dynamic index), why H1
+"compiled in isolation" (naga 24 gets it right in a small module), and why size, barriers and
+workgroup-variable counts all failed to discriminate.
+
+**Fixed** by writing the 8-point diamond as a `switch`, which is how the *earlier* half-pel search
+in the same file was already written. **0 of 63 invalid** afterwards, and encoder output on Metal
+is **byte-identical** (`d07cd62d6ab4da43` before and after, 4 frames, ki=2, q=75) — the offsets map
+one-to-one, so this is a rewrite and not a change.
+
+### Defect B — the crash survives the fix, and it is `Restrict` bounds checking
+
+**The valid module still segfaults.** Emitting the fixed shader under each of wgpu's options
+separately isolates it:
+
+| configuration | valid | driver |
+|---|---|---|
+| `bounds_unchecked` | yes | **pipeline OK** |
+| naga default bounds | yes | **pipeline OK** |
+| `bounds_restrict` | yes | **CRASH** |
+| `wgpu_native` / `wgpu_polyfill` (both use Restrict) | yes | **CRASH** |
+
+`BoundsCheckPolicy::Restrict` on the `index` policy is the trigger, and **wgpu always requests it**
+(`adapter.rs`: `index: Restrict`, unconditionally). Debug names, `lang_version`, and the
+workgroup-memory zero-init mode all make no difference. So the crash is naga 24's `Restrict`
+codegen for this shader producing valid-but-pathological SPIR-V, and it is *not* the four arrays —
+removing them entirely leaves the crash exactly where it was.
+
+**So: fixing the validity defect does not fix BUG-25.** Both are real, they are independent, and
+only one is fixed. A `spirv-reduce` run against the valid crashing module is the next step; the
+interestingness test (`scripts/bug25_interesting.sh`) discriminates correctly in both directions,
+which was verified before trusting it.
+
+### What this costs the earlier write-up
+
+The line "two compilers sharing no code both die on SPIR-V that `spirv-val` passes, which points at
+naga's output shape" was right about naga and wrong about validity. The module GNC ships was never
+validated — a newer compiler's output was. **Validate the artefact you ship, with the compiler you
+ship**, is the rule; a tool on `PATH` is not the tool in `Cargo.lock`, and nothing in the earlier
+run could have revealed the difference because it never compared versions.
+
+
 ## BUG-25 — two more hypotheses dead, killed on a machine with no Vulkan (2026-09-07)
 
 **Hypothesis.** `block_match_split.wgsl` kills NVIDIA's driver and Mesa lavapipe, which share no

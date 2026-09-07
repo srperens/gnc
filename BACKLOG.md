@@ -724,7 +724,57 @@ sequential test run could ever have caught, and the instinct to make it go away 
 suite would have preserved it.
 
 
-### BUG-25 — `block_match_split.wgsl` kills two Vulkan drivers (**contained 2026-09-07**, shader bug open, P1)
+### BUG-25 — `block_match_split.wgsl` kills two Vulkan drivers (**contained**; cause found 2026-09-08, **not fixed**, P1)
+
+**The premise this item was built on was wrong, and correcting it found two defects.** The item
+said `spirv-val` passes all 62 shaders, so two unrelated drivers were dying on valid SPIR-V. That
+validation was run with the `naga` **CLI at 30.0.1**; GNC ships **naga 24.0.0** via wgpu 24. The
+module that was validated is not the module that reaches the driver. Rule that follows and outlives
+this bug: **validate the artefact you ship, with the compiler you ship** — a tool on `PATH` is not
+the one in `Cargo.lock`.
+
+**Defect A — GNC shipped invalid SPIR-V. FIXED.** Under wgpu's options, naga 24 emits
+`OpStore %1214` and `OpAccessChain … %1214` for a function-local temporary it never declares. The
+temporary is how it dynamically indexes a **value-typed constant array**; the source is four
+`let hpel_dx = array<i32, 8>(…)` / `qpel_*` tables indexed by a loop counter, and **only this
+shader has them (4 occurrences; both siblings have 0)**. Swept the tree: **1 of 63 invalid before,
+0 of 63 after.** Fixed by writing the 8-point diamond as a `switch`, which is how the earlier
+half-pel search in the same file was already written; Metal output is **byte-identical**
+(`d07cd62d6ab4da43`), because the offsets map one-to-one.
+
+This also explains four older results at once: why deleting the quarter-pel section fixed it (the
+arrays are there), why "8 candidates → 4" still crashed (still a dynamic index), why H1 compiled in
+isolation (naga 24 gets it right in a small module), and why size/barrier/workgroup-variable counts
+never discriminated.
+
+**Defect B — the crash. NOT fixed, and it is not defect A.** The now-valid module still segfaults.
+Emitting under each wgpu option separately isolates the trigger to
+**`BoundsCheckPolicy::Restrict`**, which wgpu requests unconditionally for array indices:
+
+| configuration | valid | driver |
+|---|---|---|
+| `bounds_unchecked` | yes | pipeline OK |
+| naga default bounds | yes | pipeline OK |
+| `bounds_restrict` | yes | **CRASH** |
+| `wgpu_native` / `wgpu_polyfill` | yes | **CRASH** |
+
+Debug names, `lang_version` and the workgroup zero-init mode make no difference, and removing the
+four arrays entirely leaves the crash untouched. **Do not close this item on defect A.**
+
+**Next step, and the tooling for it is committed and verified.** `spirv-reduce` against the valid
+crashing module, driven by `scripts/bug25_interesting.sh` — which was checked in both directions
+(exit 0 on the crashing module, exit 1 on the naga-30 one) before being trusted, because a
+reduction whose oracle says "interesting" for a module the driver never saw converges on garbage.
+Instruments: `examples/spirv_probe.rs` (offline module shape), `examples/bug25_emit.rs` (emit under
+wgpu's exact options, one knob at a time), `examples/spirv_pipeline_probe.rs` (one pipeline from
+raw SPIR-V, exit codes inverted for a reducer).
+
+**Two candidate fixes once B is characterised:** upgrade wgpu/naga past whatever fixed this, or
+find the construct `Restrict` mis-lowers and rewrite it as defect A was rewritten. The second is
+cheap to test now that emission and validation are one command.
+
+<details><summary>Superseded framing (kept: five of its hypotheses are still valid negatives)</summary>
+
 
 **Status: the blast radius is fixed, the shader is not.** `split_pipeline` is now built on first
 dispatch instead of in `MotionEstimator::new`, so intra encode, decode and CANARY-1 all work on
@@ -844,6 +894,8 @@ for it, is outside what implementations handle.
 far under any limit. What is left is the count of workgroup variables, or a barrier reached under
 non-uniform control flow — which WGSL forbids and naga does not fully diagnose. **Hypotheses, not
 findings.** Bisect the shader.
+
+</details>
 
 ### Two separable pieces of work — the second is **done**, the first is what remains
 

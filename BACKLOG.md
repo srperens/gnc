@@ -706,6 +706,79 @@ sequential test run could ever have caught, and the instinct to make it go away 
 suite would have preserved it.
 
 
+### BUG-25 — GNC does not run on Vulkan: one shader kills two independent drivers (todo, **P0**)
+
+Found 2026-09-07, the first time this project ever ran on non-Apple hardware. Full measurement in
+RESEARCH_LOG 2026-09-07.
+
+**GOALS rule 4, the README and the positioning all claim Metal, Vulkan, DX12 and WebGPU. On the
+only non-Metal hardware GNC has ever been run on, it does not start.** Portability is the one axis
+GNC is meant to win on outright (GOALS §1), so this is not a compatibility nit.
+
+**Machine:** Ubuntu 24.04.3, kernel 6.8.0-136, NVIDIA RTX 4000 Ada (20 GB), driver 580.173.02,
+Mesa lavapipe on LLVM 20.1.2 as a second Vulkan implementation. Built from `07c01b1`, cargo 1.97.1,
+**clean release build, zero warnings, 1m35s.** wgpu 24.0.5. Input the pinned `bbb_1080p.png`
+(`f83f355f…02bf`).
+
+| backend / adapter | result |
+|---|---|
+| Vulkan, RTX 4000 Ada | **SIGSEGV** (139), no Rust panic |
+| Vulkan, lavapipe | `Parent device is lost` |
+| GL, RTX 4000 Ada | no compute support — a real backend limitation, not this defect |
+
+**The offender is `src/shaders/block_match_split.wgsl`, and it was found by bisect.** A throwaway
+probe that creates a device and **one** compute pipeline per process, run over all 62 WGSL files:
+60 pass, `block_match_split` segfaults NVIDIA and loses the device on lavapipe. (`blit.wgsl` also
+"failed" — it is vertex/fragment only and that was the probe's own artefact, recorded so a 1-of-62
+result does not later get quoted as 2-of-62.)
+
+Do not trust the label in the wgpu error. lavapipe reports `Parent device is lost` against
+whichever pipeline is created *after* the loss, which is why three earlier readings blamed
+`block_match_split_pipeline` for a device that a previous call had already killed — the label was
+right by coincidence, not by evidence.
+
+**The SPIR-V is valid, which is the interesting part.** naga converts all 62 shaders without
+complaint and **`spirv-val` passes all 62**. Mesa's software Vulkan and NVIDIA's proprietary driver
+share no compiler code, and the same single shader kills both while its sibling
+`block_match.wgsl` compiles fine. Two independent compilers dying on the same valid input is weak
+evidence of two driver bugs and strong evidence that something in this shader, or in naga's codegen
+for it, is outside what implementations handle.
+
+**Size and complexity are ruled out:**
+
+| shader | lines | loops | barriers | `var<workgroup>` | Vulkan |
+|---|---|---|---|---|---|
+| **block_match_split** | 806 | 17 | 31 | **9** | **dies on both** |
+| block_match_bidir | 741 | 22 | 35 | 4 | OK |
+| block_match | 448 | 14 | 19 | 4 | OK |
+
+`block_match_bidir` has more loops and more barriers and compiles. Workgroup *memory* is ~2.1 KB,
+far under any limit. What is left is the count of workgroup variables, or a barrier reached under
+non-uniform control flow — which WGSL forbids and naga does not fully diagnose. **Hypotheses, not
+findings.** Bisect the shader.
+
+### Two separable pieces of work, and the second is the one that unblocks tonight
+
+1. **The shader.** Cut `block_match_split.wgsl` down until it compiles, name the construct, fix it,
+   and add the case to whatever guards it afterwards. If it turns out to be a driver bug on valid
+   SPIR-V, the workaround still belongs in GNC — "the driver is wrong" does not make the codec run.
+2. **Eager pipeline creation, which is our own doing and is the larger defect.**
+   `block_match_split` is variable-block-size motion estimation: encoder-only, inter-only, never
+   dispatched by a still-image encode. It is created **unconditionally in `MotionEstimator::new`**
+   (`src/encoder/motion.rs:456`), so a shader a still never uses stops a still from encoding.
+   **One broken shader becomes a dead codec.** Create it lazily, or behind the condition that
+   dispatches it, and intra encode, decode, CANARY-1 and MEAS-5 all become runnable on Vulkan while
+   piece 1 is diagnosed. This is also the general fix: the next shader that trips a driver should
+   cost its own feature, not the product.
+
+**Land the probe first.** `examples/shader_probe.rs` — ~30 lines, device plus one compute pipeline
+per process, no GPU work, no test material. It found this in one run and would have caught it the
+day the shader landed. It was deliberately **not** committed by the session that filed this, which
+was working in the shared checkout without a claim on any code; that is the first thing BUG-25's
+owner should bring in.
+
+**What this blocks.** CANARY-1 and MEAS-5, both of which finally have hardware. They are parked as
+`linux-nvidia` rather than free, and the reason has changed from "no second GPU" to this bug.
 ### BUG-19 — decision-record numbers collide, and two pairs are live on `main` (todo, P3)
 
 `docs/decisions/` currently holds **two 0018s and two 0019s**:

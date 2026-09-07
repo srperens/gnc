@@ -10663,3 +10663,108 @@ metric column alone ranks GNC against a 4:4:4 incumbent.
     --images test_material/frames/{bbb_1080p,blue_sky_1080p,kristensara_720p,touchdown_1080p}.png \
     --arms gnc,gnc_abac,jpegxs,prores444,j2k --csv ent4.csv
 ```
+
+---
+## 2026-09-07 — GNC does not run on Vulkan. One shader kills two independent drivers, and it is not even needed to encode a still.
+
+**GOALS rule 4 and the README both claim Metal, Vulkan, DX12 and WebGPU. Only Metal had ever been
+run.** `docs/GPU_TIER_TEST.md` said so plainly in September and nobody had the hardware. Tonight a
+Linux x86_64 box with an NVIDIA RTX 4000 Ada became available, which was supposed to unblock
+CANARY-1 and MEAS-5. Neither ran: **the codec does not start on Vulkan.**
+
+### The machine, stated so the result can be repeated
+
+Ubuntu 24.04.3, kernel 6.8.0-136, NVIDIA RTX 4000 Ada Generation (20475 MiB), driver 580.173.02,
+8 cores, Mesa lavapipe on LLVM 20.1.2 as a second Vulkan implementation. Built from `07c01b1`
+— the same commit the four concurrent macOS sessions branched from — with cargo 1.97.1,
+**zero warnings, zero errors, 1m35s.** wgpu 24.0.5.
+
+Input is the pinned `bbb_1080p.png`, `sha256 f83f355f…02bf`, matching `frames_pinned/SHA256SUMS`
+byte for byte, so both machines measure the same bytes (COORDINATION rule 1).
+
+### What happens
+
+`gnc gpu-info` works and enumerates three adapters — the RTX on Vulkan, lavapipe on Vulkan, and the
+RTX through the GL backend. Adapter selection works: `GNC_GPU_ADAPTER` and `GNC_GPU_BACKEND` both
+resolve correctly and print the `[gpu]` line. Then:
+
+| backend / adapter | result |
+|---|---|
+| Vulkan, RTX 4000 Ada | **SIGSEGV** (exit 139), no Rust panic, no output |
+| Vulkan, lavapipe | wgpu Validation Error: `Parent device is lost` |
+| GL, RTX 4000 Ada | `ComputePipeline(Internal("The selected version doesn't support Features(BUFFER_STORAGE \| COMPUTE_SHADER \| DYNAMIC_ARRAY_SIZE)"))` |
+
+Identical for `encode` and for `benchmark`, because every pipeline is created eagerly when the
+encoder is constructed. The GL row is a genuine backend limitation rather than a defect — that
+backend has no compute — and it is the reason GOALS rule 4's DX12/GL claims deserve the same
+scepticism the Vulkan one just failed.
+
+### Where it dies, established by bisect rather than by reading
+
+`RUST_LOG` does not reach wgpu here (the binary installs its own filter), and lavapipe's
+`Parent device is lost` names the *next* pipeline created after the loss rather than the one that
+caused it, so the label in the error is misleading. Instead: `examples/shader_probe.rs`, a
+throwaway that creates a device and **one** compute pipeline per process, so a driver crash kills
+only the run that caused it. Run over all 62 WGSL files:
+
+**60 of 62 pass. `block_match_split.wgsl` segfaults the NVIDIA driver.** The 62nd, `blit.wgsl`, is
+vertex/fragment only and its failure is the probe's own artefact — recorded because a 2-of-62 result
+that is really 1-of-62 is exactly the kind of thing that becomes a wrong number later.
+
+### The SPIR-V is valid, which is what makes this interesting
+
+Two checks, and they point the same way:
+
+- **naga converts all 62 shaders to SPIR-V without complaint**, and **`spirv-val` passes all 62.**
+  So this is not naga rejecting the source and not naga emitting structurally invalid SPIR-V.
+- **The same one shader kills lavapipe too.** Mesa's software Vulkan and NVIDIA's proprietary
+  driver share no compiler code. Its sibling `block_match.wgsl` compiles fine on lavapipe.
+
+Two independent compilers dying on the same valid input is weak evidence of two driver bugs and
+strong evidence that something in this shader, or in naga's codegen for it, is outside what
+implementations actually handle.
+
+### What distinguishes it, and what does not
+
+| shader | lines | loops | barriers | `var<workgroup>` | Vulkan |
+|---|---|---|---|---|---|
+| **block_match_split** | 806 | 17 | 31 | **9** | **dies on both** |
+| block_match_bidir | 741 | 22 | 35 | 4 | OK |
+| block_match | 448 | 14 | 19 | 4 | OK |
+
+**Size and complexity are ruled out by `block_match_bidir`**, which has more loops and more barriers
+and compiles. What is left is the nine workgroup variables — and note the *amount* of workgroup
+memory is not the issue either: 2×256×4 + 5×4×4 + 8 ≈ 2.1 KB, far under any limit. So it is the
+count, or a barrier reached under non-uniform control flow, which WGSL forbids and naga does not
+fully diagnose.
+
+### The blast radius is the whole codec, and that part is our own doing
+
+`block_match_split` is variable-block-size motion estimation: encoder-only, inter-only, unused by a
+still image. It is created **unconditionally in `MotionEstimator::new`**, so a shader a still-image
+encode never dispatches prevents a still-image encode from starting. **Eager pipeline creation turns
+one broken shader into a dead codec**, and it is why the intra path, the decoder and both throughput
+items are all blocked by an inter feature.
+
+That also means the cheap unblock is not a shader fix: create that one pipeline lazily, or behind
+the same condition that dispatches it, and intra encode, decode, CANARY-1 and MEAS-5 all become
+runnable on Vulkan while the real bug is diagnosed properly.
+
+### What this does and does not settle
+
+- **Settled: "runs on Metal, Vulkan, DX12 and WebGPU" is not true today**, on the only non-Metal
+  hardware this project has ever tested. README, GOALS rule 4 and the positioning all assert it.
+  Portability is the *one* thing GNC is meant to win on outright (GOALS §1), so this is not a
+  compatibility nit.
+- **Settled: the toolchain is fine.** Clean release build on Linux/x86_64, correct adapter
+  enumeration and selection, all 62 shaders through naga, all 62 through `spirv-val`. Everything up
+  to the driver's shader compiler works.
+- **Not settled: which construct.** Nine workgroup variables and a barrier in divergent control flow
+  are hypotheses, not findings. Bisecting the shader will name it.
+- **Not measured: anything about performance.** No throughput figure was taken and none should be
+  quoted from this session. CANARY-1 and MEAS-5 remain unmeasured, now for a better reason than
+  missing hardware.
+
+Filed as **BUG-25 (P0)**. The probe used to find it is `examples/shader_probe.rs` in the write-up
+and is worth keeping as a permanent per-shader portability check — 62 processes, no GPU work, and it
+would have caught this the day the shader landed.

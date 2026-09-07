@@ -123,6 +123,11 @@ scripts/claim take dr-0019 "the pick is the lock"   # non-zero: someone has it, 
 Reserving costs one command and is the difference between picking a number and being *given*
 one. Drop it once the record is merged.
 
+**Four records are already colliding and nobody has renumbered them: `0018` twice and `0019`
+twice** (a fifth case, `0020`, was renumbered by hand). Filed as **BUG-19** — the fix is
+mechanical but the inbound references are where it goes wrong, so it is a claimable item rather
+than something to do in passing.
+
 ## Builds queue on one lock, and that looks like a hang
 
 Each worktree has its own `target/`, so builds no longer block on each other's **target** lock —

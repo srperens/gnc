@@ -614,6 +614,62 @@ sequential test run could ever have caught, and the instinct to make it go away 
 suite would have preserved it.
 
 
+### BUG-19 — decision-record numbers collide, and two pairs are live on `main` (todo, P3)
+
+`docs/decisions/` currently holds **two 0018s and two 0019s**:
+
+```
+0018-gnc-is-broad-on-purpose.md
+0018-the-entropy-coders-are-level-and-0015s-prediction-was-wrong.md
+0019-the-inter-paths-saving-was-an-equal-setting-figure.md
+0019-the-pick-is-the-lock.md
+```
+
+A third case was already cleaned up by hand — `0020-the-colour-lead-over-x264-is-withdrawn.md`
+was renumbered from 0018.
+
+**Same mechanism as the MEAS-9 claim collision, on a resource nobody thought to lock.** Two
+sessions run `ls docs/decisions/`, both compute "next is 0018", and neither can see the other:
+reading, deciding and writing are three steps, and the number is only taken once the file is
+committed. Determinism is what makes it reliable rather than unlikely, exactly as in
+`docs/decisions/0019-the-pick-is-the-lock.md` — which is itself one of the duplicates, filed
+against a number a peer session took in the same window.
+
+**The mechanism already exists; it was documented one commit too late for these four.**
+`scripts/claim take dr-<NNNN> "<title>"` reserves the number before the file is written and is
+the same compare-and-swap as every other claim (COORDINATION.md, "The claim commands"). Nothing
+enforces it yet — `claim` does not know what a decision record is.
+
+**To close:** renumber the two later duplicates, fix every inbound reference (BACKLOG,
+COORDINATION, RESEARCH_LOG and any sibling record that cites them), and decide whether `claim`
+should learn to hand out the next free `dr-` number the way `next` hands out backlog items. The
+renumbering is the boring half and the references are where it goes wrong — 0020 was renumbered
+by hand and is worth checking for stale citations while here.
+
+Filed 2026-09-07 by the `coord` session.
+
+### BUG-20 — the clippy gate does not cover the test targets, and 88 warnings sit there (todo, P4)
+
+CLAUDE.md requires **zero clippy warnings** and names the gate as `cargo clippy --release` plus
+the wasm target. Both are clean. But `cargo clippy --release --all-targets` reports
+**`gnc` (lib test) generated 88 warnings**, 24 of them auto-fixable — the gate as written does
+not look at test code, so the rule and the check disagree about what "the code" means.
+
+Measured 2026-09-07, twice, on a tree whose diff was documentation only.
+
+**Not urgent, and not obviously a bug in the tests either** — some lints are noisier in test code
+than they are worth silencing. The decision to make is which of the two is wrong: widen the gate
+to `--all-targets` and clear the 88, or write down that the zero-warning rule covers shipped code
+and not tests. Doing neither means the next person to run `--all-targets` re-discovers this and
+has to decide it under time pressure.
+
+The one number worth keeping either way: `cargo clippy --release` and
+`cargo clippy --release --target wasm32-unknown-unknown --lib` are genuinely clean. The single
+remaining `warning:` line on the native target is the future-incompatibility notice for the
+third-party crate `block v0.1.6`, not a lint on this code.
+
+Filed 2026-09-07 by the `coord` session.
+
 ### BUG-18 — the inter path's reconstruction depends on the entropy encode path (todo, P1)
 
 Found 2026-09-07 while measuring abac on inter (ABAC-SHIP). **Not an abac defect** — both arms in

@@ -523,6 +523,15 @@ Three things to carry:
 - **q=100 verified bit-exact lossless** on all three entropy coders. GOALS' "no true lossless with
   Rice" was stale and is corrected. GNC beats JPEG 2000 lossless by 10.8% and PNG by 7.8%; loses to
   FFV1 by 27% and x264 `-qp 0` by 43%, both of which predict against the neighbour.
+- **BUG-17 and BUG-18 were assigned within minutes of each other on 2026-09-07, and it is
+  resolved.** The `coord` session filed BUG-17 for the `abac_bitstream` parallel flake; the
+  `abacship` session filed a different BUG-17 for an encode-path divergence on the inter path.
+  **BUG-17 keeps the flake** (it was on main first) and is now **FIXED** — the `abacship` commit
+  root-causes it as an `std::env::set_var` race that was masking a real decoder bug, which is the
+  second of the two possibilities BUG-17's own entry asked someone to distinguish. The inter-path
+  divergence is **BUG-18** (todo, P1). This is the second double-assignment in two days; read this
+  file *and* run `scripts/claim list` before taking a number.
+
 - **BUG-16 is taken** (2026-09-07, filed by `abacship`): Rice's GPU and CPU encode paths disagree
 on the coefficients at q≤30 and at subsampled chroma. Unclaimed, on the default path, P2.
 

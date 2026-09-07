@@ -364,7 +364,12 @@ wrong conclusions have come from this one error.
   **Use `CodecConfig::set_tile_size()`, never assign `tile_size` directly** — the level ceiling
   depends on it.
 
-- **BUG-13 filed** — `GNC_INTRA_PRED=1` (new knob) produces corrupt output at every quality: max
+- **BUG-13 — FIXED 2026-09-06, and this bullet said "filed" for a day after it was closed.**
+  BACKLOG is the current record: the reconstruction bug is fixed, block intra prediction was then
+  measured, and it **costs 4-8% at lossless** because it predicts *and then* transforms, handing
+  the wavelet a harder signal. That refutes prediction *before* a wavelet and says nothing about
+  prediction *instead of* one, which is what INTRA-NEARLOSSLESS is gating. Original text follows,
+  for the diagnosis in it: `GNC_INTRA_PRED=1` produced corrupt output at every quality: max
   error 197-255 from q=50 to q=100, and at q=100 it loses 62 dB against a bit-exact baseline.
   **The historical "-11.76 dB / +29%" measurement that set `intra_prediction: false` was measuring
   this bug**, not the idea. Error accumulates toward the bottom-right of every 32x32 block, which

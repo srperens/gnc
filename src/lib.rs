@@ -682,8 +682,14 @@ pub fn quality_preset(q: u32) -> CodecConfig {
         // below H.264 and passing it — at exactly the contribution operating point the codec
         // is positioned for (docs/POSITIONING.md).
         //
-        // rANS still panics below qstep 1.0 ("range start index out of range"); filed as BUG-9.
-        // It is unreachable from this table but reachable via an explicit --qstep with --rans.
+        // rANS cannot reach a fine step at all, and two separate limits stop it (BUG-9): its
+        // 4 KB per-stream output slot, and the cumfreq table its encode shader holds in
+        // workgroup memory. Both are content-dependent, so neither is a qstep threshold — on
+        // 512x512 low-frequency random content the slot goes first, at qstep 1.4. Both are now
+        // refused by name rather than wrapping a pointer or indexing past a workgroup array.
+        // None of this is reachable from this table: rANS is only selected at q <= 20, where
+        // qstep is 32 or coarser. It is reachable with an explicit --qstep at q <= 20 — not
+        // with --rans, which is a no-op flag kept for compatibility.
         // q<=92 is deliberately left exactly as it was, so no existing quality point moves;
         // only the previously dead range above it changes.
         Anchor { q: 92,  qstep: 2.05, dead_zone: 0.05, cfl: false, per_subband: true },

@@ -14,12 +14,25 @@ use wgpu;
 use wgpu::util::DeviceExt;
 
 use super::rans::{InterleavedRansTile, SubbandGroupFreqs, SubbandRansTile, STREAMS_PER_TILE};
+use super::diagnostics;
 use crate::{FrameInfo, GpuContext};
 
 const MAX_STREAM_BYTES: usize = 4096;
+
+/// Written by `rans_encode.wgsl` into a stream's `write_ptr` slot when that stream needed more
+/// than `MAX_STREAM_BYTES`. A real `write_ptr` is always `<= MAX_STREAM_BYTES`, so the two cannot
+/// be confused (BUG-9).
+const STREAM_OVERFLOW: u32 = u32::MAX;
 pub(super) const HIST_TILE_STRIDE: usize = 1 + MAX_GROUPS * (3 + MAX_GROUP_ALPHABET);
 const ENCODE_TILE_INFO_STRIDE: usize = 1 + MAX_GROUPS * 4;
 const MAX_ALPHABET: usize = 4096;
+
+/// Entries in `rans_encode.wgsl`'s `shared_cumfreq` workgroup array. Every group's cumfreq table
+/// for one tile is loaded into it cooperatively, so the *sum* of `alphabet_size + 1` over a
+/// tile's groups has to fit — not just one group's, which is what `MAX_GROUP_ALPHABET` bounds.
+/// The two constants must stay in step; this one is the smaller limit in practice, because a
+/// tile carries up to `MAX_GROUPS` groups.
+const SHARED_CUMFREQ_ENTRIES: usize = MAX_ALPHABET + 1;
 const MAX_GROUP_ALPHABET: usize = 4096;
 const MAX_GROUPS: usize = 12;
 
@@ -1781,6 +1794,94 @@ impl GpuRansEncoder {
         tile_freqs
     }
 
+    /// Refuse the frame if any tile's cumfreq tables do not fit the shader's workgroup array.
+    ///
+    /// Found while characterising BUG-9, and it is a second limit rather than a restatement of
+    /// the first. `rans_encode.wgsl` loads every group's table for one tile into a
+    /// `SHARED_CUMFREQ_ENTRIES`-entry workgroup array; the sum over a tile's groups is what has
+    /// to fit, and on 512x512 low-frequency random content at q=15 it reaches 5306 entries at
+    /// `--qstep 1.0`. Past the end the shader was reading and writing outside the array, so the
+    /// frequencies it coded with were undefined — and unlike a slot overflow that is not
+    /// self-announcing: a tile can overrun its tables and still emit streams that fit, in which
+    /// case nothing downstream notices and the file is quietly wrong. Measured onset on that
+    /// content: qstep 1.5 fits at 3541 entries, 1.4 at 3795, 1.25 already needs 4247.
+    fn check_cumfreq_capacity(tile_freqs: &[TileFreqs]) {
+        let entries = |tf: &TileFreqs| -> usize {
+            match tf {
+                TileFreqs::Single(s) => s.alphabet_size as usize + 1,
+                TileFreqs::Subband(sb) => sb
+                    .groups
+                    .iter()
+                    .map(|g| g.alphabet_size as usize + 1)
+                    .sum(),
+            }
+        };
+
+        let worst = tile_freqs
+            .iter()
+            .enumerate()
+            .map(|(t, tf)| (entries(tf), t))
+            .max();
+
+        if let Some((count, tile)) = worst {
+            if diagnostics::enabled() {
+                eprintln!(
+                    "[rans] cumfreq_entries_max={count}/{SHARED_CUMFREQ_ENTRIES} (tile {tile})"
+                );
+            }
+            assert!(
+                count <= SHARED_CUMFREQ_ENTRIES,
+                "rANS: tile {tile} needs {count} cumfreq entries but the encode shader's \
+                 workgroup table holds {SHARED_CUMFREQ_ENTRIES}. The symbol alphabet grows as \
+                 the quantiser step shrinks, so this configuration is out of reach for rANS \
+                 regardless of how long its streams come out. Use Rice (the default above \
+                 q=20), or a coarser --qstep."
+            );
+        }
+    }
+
+    /// Refuse the frame if any stream needed more than its fixed output slot (BUG-9).
+    ///
+    /// `rans_encode.wgsl` writes each stream backwards from the end of a `MAX_STREAM_BYTES`
+    /// slot, so a stream that does not fit cannot be truncated after the fact — the bytes it
+    /// did emit are the *tail* of the codestream and the head is missing. The shader therefore
+    /// stops writing at the slot boundary and flags the stream, and the frame is not codeable.
+    ///
+    /// The limit is a function of the whole configuration, not of `qstep` alone: on bbb in the
+    /// default configuration rANS survives q=78 (qstep 3.594) and fails at q=80 (qstep 3.347),
+    /// three times the step recorded when this was first seen. That is why this reports the
+    /// measured fact rather than predicting it from a parameter. rANS is only selected at
+    /// q <= 20, where 4 KB is ample, so no default configuration reaches this.
+    fn check_stream_overflow(meta_data: &[u32], num_tiles: usize) {
+        let total_streams = num_tiles * STREAMS_PER_TILE;
+        let overflowed: Vec<usize> = (0..total_streams)
+            .filter(|s| {
+                let write_ptr = meta_data[s * 2];
+                write_ptr == STREAM_OVERFLOW || write_ptr as usize > MAX_STREAM_BYTES
+            })
+            .collect();
+
+        if diagnostics::enabled() {
+            eprintln!(
+                "[rans] rans_streams={total_streams} overflowed={}",
+                overflowed.len()
+            );
+        }
+
+        if let Some(&first) = overflowed.first() {
+            panic!(
+                "rANS: {} of {total_streams} streams overflowed their {MAX_STREAM_BYTES}-byte \
+                 output slot, first at stream {first} (tile {}, stream {} of the tile). rANS \
+                 cannot encode this configuration; it happens at fine quantiser steps, and the \
+                 limit depends on the whole preset rather than on qstep alone. Use Rice (the \
+                 default above q=20), or a coarser --qstep.",
+                overflowed.len(),
+                first / STREAMS_PER_TILE,
+                first % STREAMS_PER_TILE,
+            );
+        }
+    }
+
     /// Read back encoded streams and pack into tile structs.
     #[allow(clippy::too_many_arguments)]
     fn pack_tiles(
@@ -1796,6 +1897,11 @@ impl GpuRansEncoder {
         let mut subband_tiles = Vec::new();
         let coefficients_per_tile = (info.tile_size * info.tile_size) as usize;
 
+        // Cause before symptom: a tile whose tables do not fit produces wrong frequencies, and
+        // wrong frequencies are one of the ways a stream then fails to fit its slot.
+        Self::check_cumfreq_capacity(tile_freqs);
+        Self::check_stream_overflow(meta_data, num_tiles);
+
         for (t, tile_freq) in tile_freqs.iter().enumerate().take(num_tiles) {
             let mut per_stream_data: Vec<Vec<u8>> = Vec::with_capacity(STREAMS_PER_TILE);
             let mut per_stream_state: Vec<u32> = Vec::with_capacity(STREAMS_PER_TILE);
@@ -1810,17 +1916,9 @@ impl GpuRansEncoder {
                 let final_state = meta_data[meta_base + 1];
 
                 let byte_base = stream_idx * MAX_STREAM_BYTES;
-                // The shader writes each stream *backwards* from the end of its fixed
-                // MAX_STREAM_BYTES slot, so write_ptr counts down. A stream needing more than
-                // the slot underflows and wraps to a huge u32, which used to surface as a
-                // cryptic "range start index 4297717596 out of range" (BUG-9). The alphabet is
-                // not the limit here — the output slot is.
-                assert!(
-                    write_ptr <= MAX_STREAM_BYTES,
-                    "rANS stream {stream_idx} overflowed its {MAX_STREAM_BYTES}-byte output \
-                     slot (write_ptr={write_ptr}). rANS cannot encode this configuration; it \
-                     happens at very fine quantiser steps. Use --rice, or a coarser --qstep."
-                );
+                // `check_stream_overflow` has already refused the frame if any write_ptr was out
+                // of range, so the slice below cannot be inverted or out of bounds.
+                debug_assert!(write_ptr <= MAX_STREAM_BYTES);
                 let bytes = stream_bytes[byte_base + write_ptr..byte_base + MAX_STREAM_BYTES].to_vec();
 
                 per_stream_data.push(bytes);

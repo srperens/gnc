@@ -19,6 +19,14 @@ const MAX_ALPHABET: u32 = 4096u;
 const MAX_STREAM_BYTES: u32 = 4096u;
 const MAX_ZERO_RUN: u32 = 256u;
 
+// Reported in stream_metadata[meta_base] instead of write_ptr when a stream needed more than
+// MAX_STREAM_BYTES. It cannot collide with a real write_ptr, which is always <= MAX_STREAM_BYTES.
+const STREAM_OVERFLOW: u32 = 0xFFFFFFFFu;
+
+// Set by rans_encode_sym when this stream ran out of slot. Streams are one thread each, so a
+// private var is per-stream state, the same way rice_encode.wgsl carries p_tile_id.
+var<private> p_overflow: bool;
+
 // Per-tile encode info stride in u32s.
 // Single-table: [0]=min_val, [1]=alphabet_size, [2]=cumfreq_offset, [3]=zrun_base
 // Per-subband:  [0]=num_groups, [1+g*4]=min_val, [2+g*4]=alphabet_size,
@@ -49,7 +57,24 @@ struct Params {
 @group(0) @binding(5) var<storage, read_write> stream_metadata: array<u32>;
 
 // Shared cumfreq table for the current tile (loaded cooperatively)
-var<workgroup> shared_cumfreq: array<u32, 4096>;
+// Entries in the tile's cumfreq table, summed over all its subband groups. The host refuses
+// any frame that needs more (check_cumfreq_capacity); the clamps below only make sure the
+// shader stays inside the array while it produces the output that gets thrown away.
+//
+// MAX_ALPHABET + 1, not MAX_ALPHABET: a table of n symbols is n+1 cumulative frequencies. The
+// array used to be MAX_ALPHABET entries, so the single-table path overran it by exactly one
+// whenever the alphabet saturated — which is reachable, `--no-per-subband --qstep 1.0` on
+// low-frequency random content asks for 4097. One more entry is 4 bytes of the 32 KB the M1
+// gives a threadgroup.
+const SHARED_CF_ENTRIES: u32 = MAX_ALPHABET + 1u;
+var<workgroup> shared_cumfreq: array<u32, SHARED_CF_ENTRIES>;
+
+// Reads and writes of the shared table go through this. A tile whose groups do not fit used to
+// index past the end, which is undefined and — unlike a stream that overruns its slot — need
+// not announce itself downstream (BUG-9).
+fn cf_index(idx: u32) -> u32 {
+    return min(idx, SHARED_CF_ENTRIES - 1u);
+}
 
 // --- EXPERIMENTAL: reciprocal multiplication (commented out — 45% slower on M1,
 //     root cause not fully isolated: occupancy loss? mulhi cost? extra barrier?)
@@ -121,6 +146,15 @@ fn rans_encode_sym(
     let x_max = ((RANS_BYTE_L >> RANS_PRECISION) << 8u) * freq;
     for (var r = 0u; r < 4u; r++) {
         if (state < x_max) { break; }
+        if (write_ptr == 0u) {
+            // Out of slot. Dropping the byte loses the stream, which is fine because the host
+            // refuses the whole encode on the flag — but writing it would be worse than losing
+            // it: `stream_base_byte + write_ptr` is u32, so a decrement past zero wraps to
+            // stream_base_byte - 1, i.e. the last byte of the *previous* stream's slot, and
+            // write_byte ORs bits into data that was already correct (BUG-9).
+            p_overflow = true;
+            break;
+        }
         write_ptr -= 1u;
         write_byte(stream_base_byte + write_ptr, state & 0xFFu);
         state >>= 8u;
@@ -179,6 +213,7 @@ fn main(
 
     // write_ptr starts at end, grows backward (renormalization bytes written right-to-left)
     var write_ptr = MAX_STREAM_BYTES;
+    p_overflow = false;
     var state: u32 = RANS_BYTE_L;
 
     if (params.per_subband != 0u) {
@@ -207,7 +242,9 @@ fn main(
 
             // Cooperatively load this group's cumfreqs into shared memory
             for (var i = thread_id; i < entries; i += STREAMS_PER_TILE) {
-                shared_cumfreq[total_cf_entries + i] = cumfreq_data[cf_global + i];
+                if (total_cf_entries + i < SHARED_CF_ENTRIES) {
+                    shared_cumfreq[total_cf_entries + i] = cumfreq_data[cf_global + i];
+                }
             }
             total_cf_entries += entries;
         }
@@ -276,8 +313,8 @@ fn main(
                 }
 
                 let cf_start = group_cf_start[g];
-                let start = shared_cumfreq[cf_start + sym];
-                let freq = shared_cumfreq[cf_start + sym + 1u] - start;
+                let start = shared_cumfreq[cf_index(cf_start + sym)];
+                let freq = shared_cumfreq[cf_index(cf_start + sym + 1u)] - start;
 
                 let result = rans_encode_sym(state, write_ptr, stream_base_byte, start, freq);
                 state = result.x;
@@ -305,8 +342,8 @@ fn main(
                 }
 
                 let cf_start = group_cf_start[g];
-                let start = shared_cumfreq[cf_start + sym];
-                let freq = shared_cumfreq[cf_start + sym + 1u] - start;
+                let start = shared_cumfreq[cf_index(cf_start + sym)];
+                let freq = shared_cumfreq[cf_index(cf_start + sym + 1u)] - start;
 
                 let result = rans_encode_sym(state, write_ptr, stream_base_byte, start, freq);
                 state = result.x;
@@ -324,7 +361,9 @@ fn main(
 
         // Cooperatively load cumfreq into shared memory
         for (var i = thread_id; i < alphabet_size_plus_one; i += STREAMS_PER_TILE) {
-            shared_cumfreq[i] = cumfreq_data[cumfreq_offset + i];
+            if (i < SHARED_CF_ENTRIES) {
+                shared_cumfreq[i] = cumfreq_data[cumfreq_offset + i];
+            }
         }
 
         workgroupBarrier();
@@ -372,8 +411,8 @@ fn main(
                 var sym = u32(zrl_sym_vals[si] - min_val);
                 if (sym >= alphabet_size) { sym = alphabet_size - 1u; }
 
-                let start = shared_cumfreq[sym];
-                let freq = shared_cumfreq[sym + 1u] - start;
+                let start = shared_cumfreq[cf_index(sym)];
+                let freq = shared_cumfreq[cf_index(sym + 1u)] - start;
 
                 let result = rans_encode_sym(state, write_ptr, stream_base_byte, start, freq);
                 state = result.x;
@@ -394,8 +433,8 @@ fn main(
                 let coeff = input[plane_idx];
                 let sym = u32(i32(round(coeff)) - min_val);
 
-                let start = shared_cumfreq[sym];
-                let freq = shared_cumfreq[sym + 1u] - start;
+                let start = shared_cumfreq[cf_index(sym)];
+                let freq = shared_cumfreq[cf_index(sym + 1u)] - start;
 
                 let result = rans_encode_sym(state, write_ptr, stream_base_byte, start, freq);
                 state = result.x;
@@ -406,6 +445,6 @@ fn main(
 
     // Write final state and write_ptr to metadata buffer
     let meta_base = (tile_id * STREAMS_PER_TILE + thread_id) * 2u;
-    stream_metadata[meta_base] = write_ptr;
+    stream_metadata[meta_base] = select(write_ptr, STREAM_OVERFLOW, p_overflow);
     stream_metadata[meta_base + 1u] = state;
 }

@@ -74,9 +74,47 @@ codegen for this shader producing valid-but-pathological SPIR-V, and it is *not*
 removing them entirely leaves the crash exactly where it was.
 
 **So: fixing the validity defect does not fix BUG-25.** Both are real, they are independent, and
-only one is fixed. A `spirv-reduce` run against the valid crashing module is the next step; the
-interestingness test (`scripts/bug25_interesting.sh`) discriminates correctly in both directions,
-which was verified before trusting it.
+only one is fixed.
+
+### Defect B reduced to 42 lines
+
+`spirv-reduce` against the valid crashing module, oracle verified in both directions first:
+**41 068 bytes → 524.** Kept in `docs/bug25/minimal_repro.spvasm` as text, so it is readable and
+reassemblable with `spirv-as`.
+
+```spirv
+OpSelectionMerge %1638 None
+OpBranchConditional %1897 %1553 %1554
+%1553 = OpLabel
+%1596 = OpArrayLength %uint %32 0     ; runtime-array length
+%1597 = OpISub %uint %1596 %uint_1    ; length - 1
+        OpBranch %1639
+%1639 = OpLabel
+        OpReturn                      ; returns instead of reaching the merge
+%1638 = OpLabel                       ; the merge block, unreached
+        OpReturn
+```
+
+`OpArrayLength` + `OpISub 1` **is** the `Restrict` storage-buffer check, `min(i, len - 1)`, and it
+sits in a selection branch that returns rather than reaching its merge. Splitting the policy
+confirms which half is responsible:
+
+| policy | driver |
+|---|---|
+| **`buffer: Restrict`**, index Unchecked | **CRASH** |
+| `index: Restrict`, buffer Unchecked | pipeline OK |
+| all Unchecked | pipeline OK |
+
+So the earlier "`Restrict` is the trigger" was right but too coarse: it is the **buffer** policy,
+not array indexing. wgpu requests it whenever the adapter does not report `robustBufferAccess2`,
+which is why nothing in GNC's own configuration avoids it.
+
+**Two further negatives from the same session.** Not driver stack exhaustion — reproduces at
+`ulimit -s` 8 MB, 64 MB and unlimited. And the full-size valid module segfaults **Mesa lavapipe as
+well**, which *restores* the original "two independent compilers" argument for defect B; it had
+only ever been tested on an invalid module. The 524-byte file is minimal for NVIDIA alone, because
+the reduction's oracle ran the default adapter — an honest limit of the artefact, not of the
+finding.
 
 ### What this costs the earlier write-up
 

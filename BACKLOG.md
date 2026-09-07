@@ -761,17 +761,56 @@ Emitting under each wgpu option separately isolates the trigger to
 Debug names, `lang_version` and the workgroup zero-init mode make no difference, and removing the
 four arrays entirely leaves the crash untouched. **Do not close this item on defect A.**
 
-**Next step, and the tooling for it is committed and verified.** `spirv-reduce` against the valid
-crashing module, driven by `scripts/bug25_interesting.sh` — which was checked in both directions
-(exit 0 on the crashing module, exit 1 on the naga-30 one) before being trusted, because a
-reduction whose oracle says "interesting" for a module the driver never saw converges on garbage.
-Instruments: `examples/spirv_probe.rs` (offline module shape), `examples/bug25_emit.rs` (emit under
-wgpu's exact options, one knob at a time), `examples/spirv_pipeline_probe.rs` (one pipeline from
-raw SPIR-V, exit codes inverted for a reducer).
+**Defect B is now characterised, down to 42 lines.** `spirv-reduce` took the valid crashing module
+from 41 068 bytes to **524**, and the result is in `docs/bug25/` with instructions to reassemble
+and reproduce:
 
-**Two candidate fixes once B is characterised:** upgrade wgpu/naga past whatever fixed this, or
-find the construct `Restrict` mis-lowers and rewrite it as defect A was rewritten. The second is
-cheap to test now that emission and validation are one command.
+```spirv
+OpSelectionMerge %1638 None
+OpBranchConditional %1897 %1553 %1554
+%1553 = OpLabel
+%1596 = OpArrayLength %uint %32 0     ; runtime-array length
+%1597 = OpISub %uint %1596 %uint_1    ; length - 1
+        OpBranch %1639
+%1639 = OpLabel
+        OpReturn                      ; returns instead of reaching the merge
+%1638 = OpLabel                       ; the merge block, unreached
+        OpReturn
+```
+
+`OpArrayLength` + `OpISub 1` **is** naga's `Restrict` storage-buffer check, `min(i, len - 1)`, and
+it sits in a selection branch that returns rather than reaching its merge block. Splitting the
+policy confirms which half:
+
+| policy | driver |
+|---|---|
+| **`buffer: Restrict`**, index Unchecked | **CRASH** |
+| `index: Restrict`, buffer Unchecked | pipeline OK |
+| all Unchecked | pipeline OK |
+
+wgpu requests `buffer: Restrict` whenever the adapter does not report `robustBufferAccess2`, so no
+configuration of GNC's own avoids it.
+
+**Also ruled out while reducing:** not driver stack exhaustion (reproduces at `ulimit -s` 8 MB,
+64 MB and unlimited); and the full-size valid module segfaults **Mesa lavapipe too**, so the
+"two independent compilers" argument is restored for defect B — it was simply measured on an
+invalid module before. The 524-byte file is minimal *for NVIDIA only*, because the reduction's
+oracle ran the default adapter; reduce again against lavapipe if a two-implementation reproducer
+is wanted.
+
+**Two candidate fixes, neither tried.** Upgrade wgpu/naga — naga 30 compiles this shader to
+something that builds a pipeline, though not under a controlled bounds policy, so that is
+suggestive and not measured. Or change the shader's control flow so the check does not land in a
+returning branch — but all three `block_match*` shaders have exactly one early `return` and only
+this one crashes, so the early return is necessary and not sufficient, and the interaction is
+unidentified. It is also a legitimate driver bug report in its own right: a valid module should be
+rejected or compiled, never segfault the compiler.
+
+**Instruments, all committed:** `examples/spirv_probe.rs` (module shape, no GPU),
+`examples/bug25_emit.rs` (emit under wgpu's options, one knob at a time),
+`examples/spirv_pipeline_probe.rs` (one pipeline from raw SPIR-V, exit codes inverted for a
+reducer), `scripts/bug25_interesting.sh` (the oracle, verified in both directions before use —
+a reduction whose oracle accepts modules the driver never saw converges on garbage).
 
 <details><summary>Superseded framing (kept: five of its hypotheses are still valid negatives)</summary>
 

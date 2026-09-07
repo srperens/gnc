@@ -80,6 +80,21 @@ fn configs() -> Vec<(&'static str, spv::Options<'static>)> {
         ("debug_off", mk(default_lang, default_flags - spv::WriterFlags::DEBUG, default_bounds, default_zero)),
         ("debug_on_restrict", mk(default_lang, default_flags | spv::WriterFlags::DEBUG, restrict, default_zero)),
         ("wgpu_native_debug", mk((1, 0), base_flags | spv::WriterFlags::DEBUG, restrict, Z::Native)),
+        // `Restrict` split by policy. The reduced reproducer is `OpArrayLength` + `OpISub`, which
+        // is the *buffer* check (`min(i, arrayLength(buf) - 1)`), not the index check — so these
+        // two separate a driver bug about storage-buffer bounds from one about array indexing.
+        ("index_restrict_only", mk((1, 0), base_flags, BoundsCheckPolicies {
+            index: BoundsCheckPolicy::Restrict,
+            buffer: BoundsCheckPolicy::Unchecked,
+            image_load: BoundsCheckPolicy::Unchecked,
+            binding_array: BoundsCheckPolicy::Unchecked,
+        }, Z::Native)),
+        ("buffer_restrict_only", mk((1, 0), base_flags, BoundsCheckPolicies {
+            index: BoundsCheckPolicy::Unchecked,
+            buffer: BoundsCheckPolicy::Restrict,
+            image_load: BoundsCheckPolicy::Unchecked,
+            binding_array: BoundsCheckPolicy::Unchecked,
+        }, Z::Native)),
     ]
 }
 

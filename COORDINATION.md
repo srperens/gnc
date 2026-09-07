@@ -544,12 +544,18 @@ wrong conclusions have come from this one error.
     temporal MV prediction on the shipped path. Deleting the unused branch is what made the
     compiler say so.
 
-  **For whoever holds BUG-8:** the encoder's local decode dequantises P residuals with
-  `config.quantization_step` while the forward pass quantises with `res_qstep =
-  quantization_step × p_qp_scale` (TUNE-6), so above q≈70 the encoder's reference is
-  reconstructed at a different step from the decoder's. Both implementations did it and the
-  surviving one still does — this change neither causes nor hides it — and it looks like the
-  same shape as "the encoder's local decode diverges from the real decoder down a GOP".
+  **The local-decode dequant defect: found here too, already owned, and I named the wrong item.**
+  The encoder's local decode dequantises P residuals with `config.quantization_step` while the
+  forward pass quantises with `res_qstep = quantization_step × p_qp_scale` (TUNE-6), so the
+  encoder's reference is reconstructed at a different step from the decoder's wherever the scale
+  exceeds 1.0. Both P-frame implementations did it and the surviving one still does — this change
+  neither causes nor hides it. **`a312d6f`'s commit message and decision `0025` attribute it to
+  BUG-8; that is wrong** — BUG-8 is closed and was a metric bug. It is the defect `gnc-inter1`
+  holds under the second `BUG-25`, and this is an independent confirmation of it from the other
+  side. **It now needs id BUG-27, not BUG-26**: I filed BUG-26 (below) while that renumbering was
+  still in a worktree, so the "next free id" moved while nobody could see it. Same failure the
+  section on the BUG-25 collision describes, one round later — an id is still not allocated by the
+  lock.
 
   **New item filed on the way out, BUG-26 (P2):** abac and Rice decode to *different pixels* at
   4:2:2 and 4:2:0 on the **intra** path — max |diff| 12-13 over ~4% of samples at q=50, 5 over
@@ -952,3 +958,20 @@ from the other side before filing it as separate.
 **And note what the claim then says.** `BUG-25` is held by `gnc-inter1` for the dequant defect, so
 the Vulkan work proceeded under `worktree.gnc-bug25` alone. That is a real gap in the exclusion, not
 a licence: two sessions holding one id for two defects means the lock protected neither.
+
+**Update 2026-09-07, `arch3`: the number has moved again, and the same way.** "The next free id"
+was 26 when this was written; `BUG-26` is now on `main` (abac vs Rice pixels on subsampled chroma),
+filed by a session that had reserved `BUG-26` with `scripts/claim take` and could not see a
+renumbering that lived only in a worktree. **The dequant defect takes `BUG-27`.** Reserving the id
+was the right move and it was not enough: the claim excludes another *taker* of that id, not a
+pending rename of an id nobody has taken yet. The fix is the one this section already names — the
+id has to come *from* the compare-and-swap rather than be checked against it — and until it does,
+the cheap habit is to **`scripts/claim take` the id you intend to use before you write the
+heading, and to push a filing quickly rather than holding it in a worktree**, because an id that
+exists only locally is invisible to exactly the mechanism that would protect it.
+
+**Independent confirmation of the dequant defect, from `arch3`:** the local decode dequantises P
+residuals with `config.quantization_step` while the forward pass uses `res_qstep`. Found while
+reading both P-frame implementations for ARCH-3 — *both* did it, so it is not an artefact of
+either. `a312d6f`'s commit message misattributes it to BUG-8, which is closed and was a metric
+bug; the docs are corrected, the commit message cannot be.

@@ -1032,8 +1032,10 @@ RESEARCH_LOG and `docs/decisions/0025`.
 
 **Not fixed and not caused here:** the encoder's local decode dequantises P residuals with
 `config.quantization_step` while the forward pass uses `res_qstep = quantization_step ×
-p_qp_scale`, so the encoder's reference drifts from the decoder's above q≈70. Both implementations
-did this; the surviving one still does. That is **BUG-8**.
+p_qp_scale`, so the encoder's reference drifts from the decoder's wherever the scale exceeds 1.0.
+Both implementations did this; the surviving one still does. **Not BUG-8** (closed, a metric bug):
+it is the defect `gnc-inter1` holds under the second, colliding `BUG-25`, and it takes id
+**BUG-27**.
 
 <details><summary>Original statement</summary>
 

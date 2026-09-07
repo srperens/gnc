@@ -401,8 +401,10 @@ decides on other grounds.
 - **Not fixed here, and it is not mine:** the encoder's local decode dequantises P residuals with
   `config.quantization_step` while the forward pass quantises with `res_qstep = quantization_step
   x p_qp_scale`, so the encoder's reference drifts from the decoder's wherever the scale exceeds
-  1.0 (q >= ~70). True on both implementations before and on the one that remains, so this change
-  neither causes nor hides it. That is **BUG-8**, held by another session.
+  1.0. True on both implementations before and on the one that remains, so this change neither
+  causes nor hides it. **The commit message calls this BUG-8 and that is wrong** — BUG-8 is closed
+  and was a metric bug. It is the defect `gnc-inter1` holds under the second, colliding `BUG-25`,
+  so this is an independent confirmation rather than a new find; it takes id **BUG-27**.
 
 ### Re-verified after rebasing onto `1d67d29`
 

@@ -123,5 +123,10 @@ which `0017` decides on other grounds.
 The encoder's local decode dequantises P-frame residuals with `config.quantization_step` while the
 forward pass quantises them with `res_qstep = quantization_step × p_qp_scale`, so above q≈70 the
 encoder's reference drifts from the decoder's by that factor. That was true on both implementations
-and is true on the one that remains, so it is untouched here and unaffected by this change. It
-belongs to **BUG-8**.
+and is true on the one that remains, so it is untouched here and unaffected by this change.
+
+**Correction, made the same day:** the commit message and an earlier draft of this record said it
+belongs to **BUG-8**. It does not — BUG-8 is closed and was a metric bug. It is the defect
+`gnc-inter1` holds under the second, colliding `BUG-25`, and the finding above is an independent
+confirmation of it. Per COORDINATION's resolution of that collision it takes the next free id,
+which is **BUG-27** now that BUG-26 is on `main`.

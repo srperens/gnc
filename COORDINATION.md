@@ -345,6 +345,13 @@ P-frame wrong: the first P after an I already diverges from the batched path by 
 one. **abac's intra and lossless figures are unaffected** and stand: −16.6% to −18.8% at identical
 pixels, −13.4% bit-exact lossless.
 
+**The mechanism is a design defect, filed as ARCH-3 (P1).** `gpu_entropy_encode` reads as
+"entropy-encode on the GPU"; in `sequence.rs` it also selects which whole-frame P pipeline runs.
+abac and bitplane are GPU-*decoded* and have no GPU *encoder* shader, so choosing either silently
+swaps the frame encoder for the defective one. Nothing about those coders is broken. **This will
+bite the next coder that lands decode-first, which is the natural order here** — decode is the side
+the product is judged on. Separating the concerns is the smallest fix and removes the class.
+
 **Anything encoded with `gpu_entropy_encode = false` on video is suspect**, which is abac *and*
 bitplane. Intra is fine — single-frame encodes go through `pipeline.rs` and were verified
 pixel-identical between coders.

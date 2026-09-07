@@ -759,7 +759,51 @@ third-party crate `block v0.1.6`, not a lint on this code.
 
 Filed 2026-09-07 by the `coord` session.
 
-### BUG-18 — the CPU-entropy P-frame path encodes every P-frame wrong (claimed, P1)
+### ARCH-3 — `gpu_entropy_encode` selects a whole P-frame pipeline, not just where entropy runs (todo, P1)
+
+Surfaced 2026-09-07 by the question "how can abac not have a GPU path in a GPU codec?" — it does,
+and naming the confusion found the design defect underneath BUG-18.
+
+**What the flag actually does.** It reads as "entropy-encode on the GPU". In `sequence.rs` it also
+picks which of **two independent whole-frame P-frame implementations** runs: a batched
+single-command-encoder pipeline ("forward + entropy + local decode", ~1460 lines) or a per-plane
+one (~360 lines), each with its own local decode. So a coder that merely lacks a GPU *entropy
+encoder* silently gets a different frame encoder — and BUG-18 shows that one encodes every P-frame
+wrong.
+
+**Which coders that hits, and why it is not about them.** Encode/decode shaders by coder:
+
+| coder | GPU encode | GPU decode |
+|---|---|---|
+| Rice | `rice_encode.wgsl` | `rice_decode.wgsl` |
+| rANS | `rans_encode.wgsl` (+ histogram, normalize) | `rans_decode.wgsl` |
+| Huffman | `huffman_encode.wgsl` (+ histogram) | `huffman_decode.wgsl` |
+| **abac** | **none** | `abac_decode.wgsl` |
+| **Bitplane** | **none** | `bitplane_decode.wgsl` |
+
+abac and bitplane are GPU-decoded — abac at one thread per code-block, ~3000 blocks per 1080p
+frame, verified bit-exact against the CPU coder across seven geometries. Nothing about either coder
+is broken. They are routed onto a defective *frame* encoder by a flag that should have had nothing
+to do with frame encoding.
+
+**The fix, and it is the smallest of the three available.** Separate the concerns: the entropy
+encode choice should select the entropy step and nothing else, with both arms running the batched
+pipeline. That removes the whole class of this bug rather than one instance of it, and it makes
+BUG-18's cause 2 a question about one implementation instead of a difference between two.
+
+The other two are worth doing for their own reasons and neither substitutes for this: **fix the
+non-batched implementation** (needed anyway if the path survives), and **give abac a GPU encoder**
+— no architectural obstacle, encode is as parallel as decode over the same code-blocks, the only
+real complication being that a block's output size is not known in advance (two passes, or
+worst-case allocation). That would also close the 129 ms/frame encode gap which is one of the
+three reasons abac is not the default (`docs/decisions/0017`).
+
+**Why P1 rather than a tidy-up.** It is the mechanism by which a missing shader becomes broken
+video, it silently invalidated a published rate figure (ABAC-SHIP's inter −14.4%), and it will do
+so again for the next coder that lands decode-first — which is the natural order for this project,
+since decode is the side the product is judged on.
+
+### BUG-18 — the CPU-entropy P-frame path encodes every P-frame wrong (todo, P1)
 
 Found 2026-09-07 while measuring abac on inter (ABAC-SHIP); **not an abac defect** — the isolating
 tests use Rice on both sides. One concrete cause found and fixed, at least one more open.
@@ -826,6 +870,10 @@ also close the 129 ms/frame encode gap that is one of the reasons abac is not th
 (−14.4% at q=90) is retracted for exactly this reason. Intra is unaffected: single-frame encodes go
 through `pipeline.rs` and were verified pixel-identical between the coders. Bitplane video is also
 on this path.
+
+**Consider ARCH-3 first.** If the entropy-encode choice stops selecting a P-frame pipeline, cause 2
+stops being "why do two implementations disagree" and becomes "is this one implementation correct",
+which is a smaller question — and the non-batched path may not need to survive at all.
 
 Possibly the same root cause as **BUG-16** (the two *intra* encode paths disagreeing at q ≤ 30),
 and it is worth checking against **BUG-8** ("the encoder's local decode diverges from the real

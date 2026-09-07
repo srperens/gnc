@@ -181,7 +181,7 @@ If this table and `scripts/claim list` disagree, the table is wrong.
 | `../gnc-nearlossless` | `nearlossless` | **INTRA at contribution quality (priority 1).** Gating whether MED prediction *instead of* the wavelet — LOSSLESS-1's mechanism, −14.9% at q=100 — survives into the lossy near-lossless range q=88–99, closed-loop with a quantised residual (JPEG-LS near-lossless). Offline gate first, no code change yet. |
 | `../gnc-chroma2` | `chroma2` | **CHROMA-2 — DONE, merged at 062f49e.** The colour lead over x264 is **withdrawn**: rate-matched, x264 wins dE00 on **6 runs of 6**, and on five it needs no chroma-QP offset at all — ahead on colour *and* luma at once. **GNC now has no measured advantage over x264 on any axis** at the contribution operating point, so the +90.5% is the whole picture rather than one side of a trade, and GOALS loses "keep the colour lead" as a target. Decision 0020. Also did the test-material refetch, the shared venv, and the arm64 JPEG XS build. |
 | `../gnc-abacship` | `abacship` | **ABAC-SHIP merged to main 2026-09-07** (`60bed17`, `378a0c7`). abac is a real entropy coder now: `--abac`, entropy type 5, **GP18**. −16.6% to −18.8% of rate against Rice at *identical pixels*, −13.4% at lossless (FFV1 gap +23.9% → +7.3%). Rice stays the default — `docs/decisions/0017`. **Every frame this encoder writes now says GP18**; a GP18 Rice frame is a GP17 payload with a new label, proved by relabelling and decoding, and GP17 still reads. Worktree kept: next on this row is a real inter measurement (correctness is tested, rate is not). |
-| `../gnc-rate1` | `rate1` | **RATE-1 — how much rate above q=90 an 8-bit output cannot emit.** BACKLOG's figure is on the test gradient alone (q=90 costs 0.275 bpp, q=95 costs 1.142 bpp for bit-identical 8-bit output), which is the best case by construction. Measuring the recoverable fraction per image — lowest q whose 8-bit decode is bit-exact to the original, and the softer within-1-LSB tier — on four synthetic patterns plus the four pinned stills, before building any rate-control rule. `scripts/meas_rate1_precision.py` only; no codec change yet. Claimed 2026-09-07. |
+| `../gnc-rate1` | `rate1` | **DONE, merged, worktree removed.** RATE-1 answered **no** — a bit-depth-aware rate rule recovers **0.0% on all four photographic stills** (89.4% on the synthetic gradient, which is the trap). The sweep found **RATE-2 instead, filed P1**: above q≈95-98 the lossy ladder costs more bytes than bit-exact lossless on every real image, mean **+28.9% at q=99** (blue_sky +40.6%). LOSSLESS-1 made lossless cheap enough to undercut the top of the lossy ladder and nothing noticed. |
 | `../gnc-coord` | `coord` | **COORD-1 — the claim mechanism enforces the rules instead of restating them.** Docs and `scripts/claim` only; no codec change, invalidates no measurement. `scripts/claim next` makes the *pick* atomic, the shared-checkout and worktree preconditions are now refusals rather than prose, and the session identity bug that made `SESSION GONE` undetectable is fixed. See `docs/decisions/0019`. Claimed 2026-09-07. |
 | `../gnc-meas9` | `meas9` | **MEAS-9 merged (`ed62de7`) — now on ENT-3.** MEAS-9's result: J2K in irreversible 9/7 mode uses **GNC's own transform at GNC's own depth** and needs **54.2% fewer bits on RGB PSNR / 79.7% on Y-PSNR**, so the intra gap is the entropy coder, not the transform. GNC is −10.2%/+29.4% against JPEG XS 4:4:4 and +20.2%/+29.3% against ProRes 4444. **ENT-3 is the inter half**: abac against Rice on P-frame residuals, which ABAC-SHIP explicitly left out of scope. Touches nothing another row owns — measurement first. |
 
@@ -399,6 +399,29 @@ the option that spends more bits. Use BD-rate, or compare at matched rate. At le
 wrong conclusions have come from this one error.
 
 ## Landed today, and what each one invalidates
+
+- **Correction to a diagnosis I committed: the `abac_bitstream` flake was NOT GPU contention.**
+  I read "a different test fails each run, all pass with `--test-threads=1`" and concluded two GPU
+  tests were contending for the device; that is in commit `4133f54`'s message and it is wrong. The
+  real mechanism, found by the ABAC-SHIP owner: a test called `std::env::set_var("GNC_ABAC_CODER")`,
+  the environment is process-global, and cargo runs `#[test]` functions as threads — so it changed
+  which arithmetic engine a *concurrently running* test encoded with. The concurrency half was
+  right, the shared resource was not. It also masked a real decoder bug: `CachedBuffers` held one
+  `abac_coder` for all three planes, so planes 0 and 1 decoded with whatever plane 2 used. Fixed at
+  the source by moving the coder and code-block size out of the environment into `CodecConfig`, so
+  `cargo test --release` stays the gate unqualified and no serialising mutex was needed. Worth
+  carrying: a symptom can fit a mechanism exactly and still have a different cause, and "it is
+  contention" is a comfortable answer that stops the search early.
+
+- **RATE-2 filed — above q≈95-98 GNC is dominated by its own lossless path.** No code change, so
+  no output moves, but it **invalidates how any BD-rate whose ladder reaches q=95-99 should be
+  read**: those rungs spend more bytes than bit-exact lossless for a worse picture (mean +28.9% at
+  q=99; blue_sky 3026470 bytes at 60.14 dB against 2153118 bit-exact, +40.6%). Crossover per image
+  q=98/95/96/96. Not universal — smoothramp, flat and noise are not dominated, because MED
+  prediction is poor there. Also from the same sweep: **RATE-1 is answered no** (0.0% recoverable
+  on photographic content), and **the ladder is not monotonic in rate** (flat512 costs 0.0450 bpp
+  at q=86 and 0.0370 at q=90), so anything interpolating GNC by rate should flag a rung whose rate
+  falls while q rises.
 
 - **MEAS-3 — the inter path's rate saving does not survive matched quality. Invalidates a GOALS
 figure; changes no default.** BD-rate of the shipped ki=9 configuration against all-intra, three

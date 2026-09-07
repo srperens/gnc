@@ -2672,6 +2672,42 @@ impl EncoderPipeline {
             });
         }
 
+        // === Per-tile rate diagnostic (GNC_TILE_RATE=1) — INTRA-1 step 2, cross-tile allocation ===
+        // One machine-readable line per tile per plane, so an offline oracle can ask what a
+        // per-tile quantiser would have been worth. GNC gives every tile the same step above q=80
+        // (AQ is 30-80), while untiled JPEG 2000 runs PCRD across the whole picture — that
+        // difference is the leading suspect for the gap INTRA-1 has left.
+        // Read-only, and it runs on every frame rather than the first, since a sequence's answer
+        // may differ from a still's.
+        if !abac_tiles.is_empty() && std::env::var("GNC_TILE_RATE").is_ok() {
+            let counts = [
+                plane_tiles_x[0] * plane_tiles_y[0],
+                plane_tiles_x[1] * plane_tiles_y[1],
+                plane_tiles_x[2] * plane_tiles_y[2],
+            ];
+            let mut idx = 0usize;
+            for (p, &count) in counts.iter().enumerate() {
+                for t in 0..count {
+                    if idx >= abac_tiles.len() {
+                        break;
+                    }
+                    let bytes = abac_tiles[idx].byte_size();
+                    idx += 1;
+                    eprintln!(
+                        "[tile_rate] plane={p} tx={} ty={} bytes={bytes}",
+                        t % plane_tiles_x[p],
+                        t / plane_tiles_x[p]
+                    );
+                }
+            }
+            eprintln!(
+                "[tile_rate] tile_size={} planes={} covered={idx}/{}",
+                tile_size,
+                counts.len(),
+                abac_tiles.len()
+            );
+        }
+
         // === Coefficient-entropy diagnostic (GNC_COEF_ENTROPY=1) — INTRA-1 step 1 ===
         // Prices the *shipped* abac tiles against the entropy of the coefficients they carry, so
         // it must run after entropy coding and before `abac_tiles` is moved into `EntropyData`.

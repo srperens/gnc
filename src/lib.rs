@@ -609,6 +609,20 @@ pub fn luma_mad(frame_a: &[f32], frame_b: &[f32]) -> f32 {
 /// - 10: maximum compression (qstep=32)
 ///
 /// Intermediate values interpolate between anchor points (log-scale for qstep).
+/// Smallest tile the pipeline supports. Below this the deepest subbands vanish entirely.
+pub const MIN_TILE_SIZE: u32 = 16;
+
+/// Largest tile the wavelet shader can transform.
+///
+/// `transform_97.wgsl` (and `transform_53.wgsl`) stage one line of the tile in workgroup memory as
+/// `array<f32, 512>` with 256 threads. A larger tile reads and writes past the end of that array,
+/// which WGSL does not trap: the transform returns nonsense and the result still round-trips
+/// through a valid bitstream. Measured on kristensara_720p at q=90: 504 -> 40.97 dB, **520 -> 24.80
+/// dB**, 640 -> 11.24 dB, 1024 -> 7.50 dB. Raising this means reworking the shader, and INTRA-1
+/// step 2 measured that GNC gains only 0.6% going from tile 256 to 512, so there is no rate case
+/// for it today.
+pub const MAX_TILE_SIZE: u32 = 512;
+
 impl CodecConfig {
     /// Deepest wavelet decomposition this tile size can carry.
     ///
@@ -624,10 +638,34 @@ impl CodecConfig {
     /// Always prefer this to assigning `tile_size` directly. The DWT runs per tile, so the tile
     /// size — not the image size — sets how deep the decomposition can go, and a change of tile
     /// size changes that ceiling in both directions (BUG-12).
+    ///
+    /// # Panics
+    ///
+    /// On a tile size the pipeline cannot serve. Both cases used to produce a *valid bitstream
+    /// carrying a destroyed picture*, with encode and decode both reporting success (BUG-26), so
+    /// they are refused loudly rather than clamped quietly — a clamp would silently encode
+    /// something other than what was asked for.
     pub fn set_tile_size(&mut self, tile_size: u32) {
+        assert!(
+            (MIN_TILE_SIZE..=MAX_TILE_SIZE).contains(&tile_size),
+            "tile size {tile_size} is outside the supported range {MIN_TILE_SIZE}..={MAX_TILE_SIZE}. \
+             The wavelet shader keeps one line of the tile in workgroup memory \
+             (`array<f32, 512>` in transform_97.wgsl), and WGSL out-of-bounds workgroup access \
+             does not trap — measured, tile 520 decodes to 24.8 dB and tile 1024 to 7.2 dB, both \
+             with encode and decode reporting success (BUG-26)"
+        );
         self.tile_size = tile_size;
         let requested = self.requested_wavelet_levels.max(self.wavelet_levels);
         self.wavelet_levels = requested.min(self.max_wavelet_levels());
+        assert!(
+            tile_size.is_multiple_of(1u32 << self.wavelet_levels),
+            "tile size {tile_size} cannot carry {} wavelet levels: it is not divisible by {}. \
+             Each level halves the tile, so an odd intermediate size drops coefficients and the \
+             picture is destroyed while the bitstream stays valid — measured, tile 260 decodes to \
+             20.1 dB (BUG-26)",
+            self.wavelet_levels,
+            1u32 << self.wavelet_levels
+        );
         self.normalize_for_entropy_group_limit();
     }
 

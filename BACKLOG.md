@@ -87,6 +87,10 @@ measured advantage over x264 on any axis at this operating point.**
    the entropy coder, lifting normalisation is clean (~0), and tiling costs *JPEG 2000* 12.4 points
    but GNC realises only 0.6% of it. **~9.8 points remain**, and the open question is why a bigger
    tile buys GNC nothing when it buys J2K 3.8%. Decision `docs/decisions/0026`.
+   **Step 2b done (2026-09-07): cross-tile rate allocation is rejected — a clairvoyant, free
+   per-tile allocator saves 0.95%**, about one point of the remaining ten, and on one image the
+   oracle picks the *same* q for every tile at q>=92. The obvious candidates are now spent;
+   ~9 points remain. Decision `docs/decisions/0027`.
 1. **Intra at contribution quality** — the whole remaining +90.5% lives here, per findings 1 and 5.
    Inter breaks even at this operating point for x264 too, so this is the only place the gap is.
    **First instalment paid 2026-09-07 (ABAC-SHIP): −17.3% of intra rate at q=90, opt-in.** Against
@@ -3061,8 +3065,25 @@ by padding — 1920x1080 pads to 2048x1280 at tile 256 and **2048x1536** at tile
 coefficients, reading **+6.1% for tile 512** at identical PSNR when the real effect is −0.6%. Use
 content that is a multiple of both tile sizes; this used centred 1024x512 crops.
 
-Full numbers in RESEARCH_LOG 2026-09-07 and `docs/decisions/0026`. Also found on the way:
-**BUG-26** — `--tile-size 1024` silently destroys the image.
+**Step 2b — cross-tile rate allocation, REJECTED 2026-09-07.** The asymmetry above had one obvious
+explanation: untiled J2K runs PCRD across the whole picture and GNC has no cross-tile allocation
+above q=80. Measured with an oracle (`scripts/meas_cross_tile_rd.py`, `GNC_TILE_RATE=1`): a
+clairvoyant allocator that sees the future, pays nothing to signal a per-tile q and may pick any
+rung for any tile saves **0.95% at q>=85** (bbb −1.60%, blue_sky −1.19%, kristensara −0.14%,
+touchdown −0.88%). Pre-declared floor was 3 points. **Rejected**, and the mechanism is visible: on
+kristensara the oracle picks a *single* q for all 15 tiles at q = 92/94/96/98. Uniform q is not
+close to optimal there, it is the optimum — EBCOT part 1's argument one scale up. Decision
+`docs/decisions/0027`.
+
+**Where the item stands: ~9 points remain and the obvious candidates are spent.** Untested and
+cheap: the deadzone and quantiser rounding rule against J2K's, and the wavelet's tile-boundary
+handling (`transform_97.wgsl` replicates the edge sample where J2K uses symmetric extension).
+Neither is obviously worth 9 points, which is worth saying out loud rather than assuming the next
+idea closes it.
+
+Full numbers in RESEARCH_LOG 2026-09-07 and `docs/decisions/0026`, `0027`. Also found on the way:
+**BUG-26** (fixed) — `--tile-size 1024` silently destroyed the image, and so did any tile size not
+divisible by `2^levels`.
 
 ### Step 2 — the candidates as originally specified, cheapest first
 
@@ -3156,7 +3177,7 @@ and "the remaining gap is somewhere else". Decision 0018 makes that the leading 
 entropy coding is the one lever that pays on intra, inter, lossless and every chroma format at
 once.
 
-### BUG-26 — `--tile-size 1024` silently destroys the image (todo, **P1**)
+### BUG-26 — `--tile-size 1024` silently destroys the image (**FIXED 2026-09-07**)
 
 Found 2026-09-07 by INTRA-1 step 2 while pricing the tiling candidate. **Nothing errors.**
 
@@ -3179,8 +3200,24 @@ transform quietly returns nonsense that still round-trips through a valid bitstr
 **Tile 512 is fine** — verified 50.07 dB against tile 256's 50.06 dB on the same input, and −0.6%
 RGB / −0.9% Y BD-rate on padding-free crops. So the ceiling is real but it is 512, not 256.
 
-**Fix**: reject a tile size the shader cannot serve, at config validation, with the limit named in
-the error. Raising the ceiling is a separate and much larger job (the shader would need a
+**FIXED 2026-09-07.** It was **two** silent defects, not one, and the boundary was measured rather
+than guessed (kristensara_720p at q=90): 64/96/128/160/192/256/320/384/448/512 all read 49.6-49.7 dB;
+**504 reads 41.0, 520 reads 24.8, 640 reads 11.2, 1024 reads 7.5, and 260 reads 20.1.**
+
+- **Above 512** the shader reads past `array<f32, 512>` in workgroup memory.
+- **Not divisible by `2^levels`**: `max_wavelet_levels()` derives its ceiling from `tile_size / 8`
+  under *integer* division, so 260 (= 4 x 65) is handed five levels when only two halvings are clean.
+
+`set_tile_size` now refuses both, naming the limit and the measured evidence — **refused, not
+clamped**, because a clamp encodes something other than what was asked for, just as quietly.
+`MIN_TILE_SIZE` / `MAX_TILE_SIZE` are public constants carrying the reason. Three tests in
+`tests/tile_size_levels.rs`, one of which asserts every measured-good tile size is still accepted so
+the guard cannot cost a working configuration. Tile 256 and 512 output byte-identical before and
+after. One existing test row — `(1024, 7)` in `ceiling_follows_the_tile_size_in_use` — was asserting
+the level arithmetic of a configuration that destroys the picture, and is removed.
+
+**Original fix note**: reject a tile size the shader cannot serve, at config validation, with the
+limit named in the error. Raising the ceiling is a separate and much larger job (the shader would need a
 multi-pass or a larger workgroup) and is **not** what this item asks for — INTRA-1 step 2 measured
 that GNC gains only 0.6% from 256 -> 512, so there is no rate case for chasing 1024 today.
 

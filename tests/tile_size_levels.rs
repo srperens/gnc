@@ -13,7 +13,12 @@ use gnc::{quality_preset, CodecConfig};
 #[test]
 fn ceiling_follows_the_tile_size_in_use() {
     // 8 samples is the floor per level: 512 carries 6 levels, 256 carries 5, 128 carries 4.
-    for (tile, expect) in [(128u32, 4u32), (256, 5), (512, 6), (1024, 7)] {
+    //
+    // `(1024, 7)` was in this list until BUG-26. It asserted a level count for a tile size the
+    // wavelet shader cannot transform at all — tile 1024 decodes to 7.5 dB with encode and decode
+    // both reporting success — so the row was asserting the arithmetic of a configuration that
+    // destroys the picture. `set_tile_size` now refuses it; see `refuses_a_tile_the_shader_cannot_transform`.
+    for (tile, expect) in [(128u32, 4u32), (256, 5), (512, 6)] {
         let mut cfg = CodecConfig {
             wavelet_levels: 9,
             ..Default::default()
@@ -83,4 +88,59 @@ fn lossless_uses_med_prediction_not_the_wavelet() {
     assert!(cfg.is_lossless(), "the MED path must still count as lossless");
     assert!(!cfg.adaptive_quantization);
     assert!(!cfg.cfl_enabled);
+}
+
+// ---------------------------------------------------------------------------
+// BUG-26 — a tile size the pipeline cannot serve must be refused, not encoded
+// ---------------------------------------------------------------------------
+//
+// Both cases below produced a *valid bitstream carrying a destroyed picture*, with `encode` and
+// `decode` each exiting 0. Measured on kristensara_720p at q=90, before the guard:
+//
+//   tile  504 -> 40.97 dB      tile  520 -> 24.80 dB
+//   tile  512 -> 49.66 dB      tile  640 -> 11.24 dB
+//   tile  260 -> 20.11 dB      tile 1024 ->  7.50 dB
+//
+// They are refused rather than clamped on purpose: a clamp encodes something other than what the
+// caller asked for, just as quietly.
+
+#[test]
+#[should_panic(expected = "outside the supported range")]
+fn refuses_a_tile_the_shader_cannot_transform() {
+    // transform_97.wgsl stages one tile line in `array<f32, 512>`, and WGSL out-of-bounds
+    // workgroup access does not trap — it reads whatever is there.
+    CodecConfig::default().set_tile_size(gnc::MAX_TILE_SIZE + 8);
+}
+
+#[test]
+#[should_panic(expected = "not divisible by")]
+fn refuses_a_tile_that_cannot_carry_its_own_levels() {
+    // 260 = 4 x 65. `max_wavelet_levels` derives its ceiling from `tile_size / 8` under integer
+    // division, so it hands 260 five levels; only two halvings are clean and the rest drop
+    // coefficients.
+    let mut cfg = CodecConfig {
+        wavelet_levels: 9,
+        ..Default::default()
+    };
+    cfg.set_tile_size(260);
+}
+
+#[test]
+fn every_tile_size_that_encodes_correctly_is_still_accepted() {
+    // The guard must not cost a working configuration. These are the sizes measured to round-trip
+    // at 49.6-49.7 dB on kristensara_720p at q=90, including the non-power-of-two ones.
+    for tile in [64u32, 96, 128, 160, 192, 256, 320, 384, 448, 512] {
+        let mut cfg = CodecConfig {
+            wavelet_levels: 9,
+            ..Default::default()
+        };
+        cfg.set_tile_size(tile);
+        assert_eq!(cfg.tile_size, tile);
+        assert!(
+            tile.is_multiple_of(1u32 << cfg.wavelet_levels),
+            "tile {tile} accepted with {} levels but is not divisible by {}",
+            cfg.wavelet_levels,
+            1u32 << cfg.wavelet_levels
+        );
+    }
 }

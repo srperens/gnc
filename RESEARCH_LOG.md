@@ -4,6 +4,115 @@
 
 ---
 
+## INTRA-1 step 2b — cross-tile rate allocation is worth 0.95%, and BUG-26 is fixed (2026-09-07)
+
+**Hypothesis.** Decision 0026 left an asymmetry unexplained: giving JPEG 2000 GNC's 256px tiling
+costs it 8.8–12.4 points, but doubling GNC's own tile to 512 is worth 0.6%. The leading explanation
+was **global rate allocation** — untiled J2K runs PCRD across the whole picture; GNC gives every tile
+the same quantiser step above q=80 (AQ is 30–80). EBCOT part 1 closed PCRD at code-block granularity
+*inside* a tile (0.00 dB); across tiles it had never been measured.
+
+**Success criterion, set before measuring:** the lever had to be worth ≥3 points of the remaining
+~9.8 to be worth building. Below ~1 point, reject it.
+
+**Method — an oracle, not an implementation.** `scripts/meas_cross_tile_rd.py`. Encode at every q on
+a 12-rung ladder with `--abac`; take per-tile rate (new `GNC_TILE_RATE=1` diagnostic, summed over
+three planes) and per-tile RGB squared error; then for a Lagrangian lambda give every tile
+independently the q minimising `D_t + lambda*R_t`, compared at **matched total distortion**. The
+oracle sees the future, pays nothing to signal a per-tile q (~1 byte/tile, 0.02%), and may pick any
+rung for any tile. If a free clairvoyant allocator cannot find the points, a built one will not.
+
+Per-tile distortion is scored on **visible pixels only** — the tile grid sits on the padded plane, so
+the right column and bottom row extend past the picture, and scoring the padding would credit those
+tiles with error they do not carry.
+
+### Result — rejected
+
+| image | tiles | vs rung, q≥85 | **vs ladder hull, q≥85 (spatial only)** |
+|---|---|---|---|
+| bbb_1080p | 40 | −2.64% | **−1.60%** |
+| blue_sky_1080p | 40 | −1.19% | **−1.19%** |
+| kristensara_720p | 15 | −0.14% | **−0.14%** |
+| touchdown_1080p | 40 | −0.88% | **−0.88%** |
+| **mean** | | −1.21% | **−0.95%** |
+
+**0.95% against a ~9.8-point remainder is about one point of ten.** Below the pre-declared floor.
+Rejected.
+
+**The mechanism is visible, not merely inferred.** On kristensara the oracle picks a *single* q for
+all 15 tiles at q = 92, 94, 96 and 98 — the spread column reads `92-92`, `94-94`, `96-96`, `98-98`.
+Uniform q is not close to optimal there, it *is* the optimum. That is EBCOT part 1's argument
+(uniform scalar quantisation of a near-orthonormal transform under MSE puts everything at the same
+RD slope) one scale up, and 0026 measured that GNC's transform really is near-orthonormal
+(synthesis norms 0.984–1.066). Same fact at two scales; nothing left for an allocator to move.
+
+### Two instrument faults, each of which produced a plausible wrong answer first
+
+**1. The oracle "lost" by +0.24%.** A clairvoyant allocator cannot do worse than fixed q — the
+all-tiles-same-q allocation is inside its own search space. Cause: fitting two curves and
+integrating between them. Replaced with exact matched-distortion comparison via a Lagrangian
+bracket, and a **dominance assertion** now fires instead of reporting an impossible saving. It fired
+twice more during development, each time on a real construction error.
+
+**2. The "purely spatial" column came out identical to the raw column across all 48 rows** — because
+the convex-envelope step was described in a comment and never written. Without it the interpolation
+walks the Pareto staircase itself, so a ladder rung sitting *above* its own chord is treated as
+reachable and its inefficiency is credited to the spatial lever. **bbb's q=90 rung is 5.3% above the
+chord between q=88 and q=92, and q=92 is 2.0% above** — mispriced rungs (RATE-2's territory), not a
+cross-tile gain. Fixing it moved the headline from −1.21% to −0.95%.
+
+The second is the more instructive: the comment was right, the code was wrong, and two columns
+agreeing *exactly* to the hundredth of a percent across 48 rows was the only symptom.
+
+### BUG-26 fixed — and it was two defects, not one
+
+`--tile-size 1024` silently destroyed the image. Measured the actual boundary rather than guessing
+it, on kristensara_720p at q=90:
+
+| tile | 64 | 96 | 128 | 160 | 192 | 256 | 320 | 384 | 448 | 504 | **512** | **520** | **640** | **1024** |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| dB | 49.6 | 49.7 | 49.6 | 49.7 | 49.7 | 49.7 | 49.7 | 49.7 | 49.7 | 41.0 | **49.7** | **24.8** | **11.2** | **7.5** |
+
+Two independent failures, both silent, both producing a valid bitstream:
+
+- **Above 512** the wavelet shader reads past `array<f32, 512>` in workgroup memory, and WGSL
+  out-of-bounds workgroup access does not trap.
+- **Not divisible by `2^levels`**: `max_wavelet_levels()` derives its ceiling from `tile_size / 8`
+  under *integer* division, so tile 260 (= 4 x 65) is handed five levels when only two halvings are
+  clean. **260 decodes to 20.1 dB.**
+
+`set_tile_size` now refuses both, loudly, naming the limit and the measured evidence — refused rather
+than clamped, because a clamp encodes something other than what was asked for, just as quietly.
+`MIN_TILE_SIZE` / `MAX_TILE_SIZE` are public constants carrying the reason. Three tests added,
+including one asserting that every tile size measured to round-trip correctly is still accepted, so
+the guard cannot cost a working configuration. **256 and 512 are byte-identical before and after**
+(700 670 B and 857 021 B).
+
+One existing test changed: `ceiling_follows_the_tile_size_in_use` asserted `(1024, 7)` — the level
+arithmetic for a tile size that destroys the picture. That row is removed, with the reason recorded
+in the test.
+
+### Where INTRA-1 stands
+
+| candidate | worth | record |
+|---|---|---|
+| entropy coding | ≤7.5 points | 0024 |
+| chroma allocation vs an RGB metric | 8.5 points, **not a deficiency** | 0026 |
+| lifting normalisation | ~0 | 0026 |
+| tiling, as wavelet reach | 0.6% realisable | 0026 |
+| cross-tile rate allocation | **0.95%** | 0027 |
+
+**~9 points remain and the obvious candidates are spent.** Untested and cheap: the deadzone and
+quantiser rounding rule against J2K's, and the wavelet's tile-boundary handling (`transform_97.wgsl`
+replicates the edge sample where J2K uses symmetric extension). Neither is obviously worth 9 points,
+which is worth saying out loud rather than assuming the next idea will close it.
+
+**Gates:** `cargo test --release -- --test-threads=1` green; `cargo clippy --release` clean; wasm
+`--lib` clean.
+
+
+---
+
 ## INTRA-1 step 2 — the gap decomposes: 8.5 points is chroma allocation, ≤7.5 is the coder, tiling does not transfer (2026-09-07)
 
 **Where step 2 started.** Step 1 (`docs/decisions/0024`) bounded the entropy coder at 7.5% of rate

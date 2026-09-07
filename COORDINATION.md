@@ -868,3 +868,30 @@ Newest first. If you have measurements taken before one of these, they are suspe
 - **Point measurements at fixed q cannot judge a rate/quality trade**, and they always flatter the
   option that spends more bits. Use BD-rate, or compare at matched rate. Three separate wrong
   conclusions today came from this one error.
+
+## `BUG-25` was used twice, by two sessions, for two different defects (2026-09-07)
+
+The claim mechanism excludes sessions from an *item*; it does not stop two sessions inventing the
+same *id*. Both read `main:BACKLOG.md`, saw BUG-24 as the highest, and numbered the next one 25.
+This is BUG-19's problem (colliding decision-record numbers) in a second namespace, and it will
+recur until an id is allocated by the same compare-and-swap that hands out work.
+
+| id | defect | state |
+|---|---|---|
+| **BUG-25 (on `main`, `92f4d3a`)** | GNC does not run on Vulkan; `block_match_split.wgsl` kills the NVIDIA driver and lavapipe | committed to `main`, referenced in RESEARCH_LOG and two commit messages |
+| **BUG-25 (worktree `gnc-inter1`)** | P-frame local-decode dequant uses the intra qstep, not `res_qstep`, so the encoder's reference diverges from the decoder whenever `p_qp_scale != 1.0` | claimed, not pushed |
+
+**Resolution: the one on `main` keeps the number; the dequant defect takes the next free id.** Not
+because it is more important — the dequant defect looks like the more valuable find, and it is
+adjacent to BUG-18's open cause 2 — but because renumbering text that is already public, and
+cross-referenced from a log and two commit messages, costs more than renumbering text that is still
+in a worktree. First-pushed wins, on the same reasoning as the RATE-2 reconciliation.
+
+**You will meet this as a merge conflict in `BACKLOG.md` on the `### BUG-25` heading**, which is the
+notification working correctly: it arrives when you push, not when someone guesses which terminal
+you are. Take both bodies, renumber the dequant one, and check whether it is BUG-18 cause 2 seen
+from the other side before filing it as separate.
+
+**And note what the claim then says.** `BUG-25` is held by `gnc-inter1` for the dequant defect, so
+the Vulkan work proceeded under `worktree.gnc-bug25` alone. That is a real gap in the exclusion, not
+a licence: two sessions holding one id for two defects means the lock protected neither.

@@ -59,8 +59,9 @@ the shared checkout** — no absolute paths, no session ids.
 |---|---|---|
 | `../gnc-abac`, `.claude/worktrees/abac` (`abac-gate`) | `abac` | **released — question answered, see BACKLOG Part 6.** The idle-machine bench is run. Range at cb=64 costs **1.69× frame decode for −16.7% rate** at q=90; Interval costs 3.99×. Rice's own entropy stage is 47% of frame decode, which caps any entropy work at 1.9×. What remains is a positioning call, not an engineering one. |
 | `../gnc-abac` | `abac` | same worktree, now on **BUG-8** — the encoder's local decode diverges from the real decoder down a GOP. |
+| `../gnc-nearlossless` | `nearlossless` | **INTRA at contribution quality (priority 1).** Gating whether MED prediction *instead of* the wavelet — LOSSLESS-1's mechanism, −14.9% at q=100 — survives into the lossy near-lossless range q=88–99, closed-loop with a quantised residual (JPEG-LS near-lossless). Offline gate first, no code change yet. |
 | `../gnc-chroma2` | `chroma2` | **CHROMA-2** — is the dE00 win over x264 an allocation artefact? Control: give x264 `--chroma-qp-offset` matching GNC's split, re-measure at matched total rate. Also **owns the test-material refetch** (see below). |
-| `../gnc-abacship` | `abacship` | (unclaimed row — added by the chroma2 session from `git worktree list`; whoever owns it, describe it.) |
+| `../gnc-abacship` | `abacship` | **Claimed 2026-09-07.** Shipping abac into the bitstream — the step BACKLOG EBCOT Part 6 leaves open: a GP18 generation with `EntropyCoder::Abac`, per-block length fields and code-block size in the tile header, Range coder at cb=64, GPU decode into `scratch_a`. Touches `lib.rs` (`EntropyCoder`/`EntropyData`), `format.rs`, `entropy_helpers.rs`, `decoder/gpu_work.rs`, `decoder/pipeline.rs`, `abac*.rs`. Intra only; inter is out of scope for this row. |
 | `../gnc-nearlossless` | `nearlossless` | (unclaimed row — added by the chroma2 session from `git worktree list`; whoever owns it, describe it.) |
 
 ## The test material was missing entirely, and the `chroma2` session is refetching it (2026-09-07)
@@ -79,6 +80,20 @@ what every worktree's symlink resolves to. Started 2026-09-07 ~19:10.
 second run will happily skip a truncated PNG. If you need the material and it is not there yet,
 wait, or ask the chroma2 session.
 
+**Checked 2026-09-07 19:10 by the `abacship` session: there are TWO fetch runs live, not one.**
+`ps` shows `bash ./fetch_test_frames.sh` (started 19:08:58, launched from the shared checkout's
+`test_material/` — this is the chroma2 session) *and* `bash test_material/fetch_test_frames.sh`
+(started 19:08:21, now orphaned, parent is `launchd`). A third exited at ~19:09. Because every
+worktree's `test_material/frames` is a symlink to the same shared directory, all of them write the
+same paths: two `ffmpeg` processes were writing `frames/blue_sky_1080p.png` **simultaneously**.
+No damage this time — `bbb_1080p`, `blue_sky_1080p` and `kristensara_720p` are all complete, valid
+PNGs at the right dimensions (checked header + `IEND`) — but they will collide again on
+`touchdown_1080p` and on the two 8-frame sequences. **Before using any frame written after 19:08,
+verify it**: `python3 -c "import sys;d=open(sys.argv[1],'rb').read();print(d[:8]==b'\x89PNG\r\n\x1a\n' and d[-8:-4]==b'IEND')" <file>`.
+Whoever owns the orphan should kill it; whoever owns the survivor should re-run the script once at
+the end, since its `[skip] already exists` guard will then leave the good files alone and refill
+only what is missing.
+
 **What the script does and does not restore.** It fetches four single frames (`bbb_1080p`,
 `blue_sky_1080p`, `kristensara_720p`, `touchdown_1080p`) and two 8-frame sequences (`bbb`,
 `blue_sky`, each with a generated `.y4m`). It does **not** fetch `old_town`, `aerial`, `crowd_run`,
@@ -89,6 +104,32 @@ never in the script. It does not restore `frames/hdr/` either; regenerate that w
 **So any measurement in this repo naming a sequence outside that list cannot currently be
 reproduced.** That is not a retraction of those numbers, but treat "re-measure X on old_town" as
 blocked until someone re-fetches it, and say which sequences a new result actually used.
+
+## Test material was missing from the machine entirely (2026-09-07)
+
+`test_material/frames` did not exist in the shared checkout at the start of the day, so **every
+worktree's symlink was dangling and no session could measure anything.** Refetched with
+`test_material/fetch_test_frames.sh`; the four stills (`bbb_1080p`, `blue_sky_1080p`,
+`kristensara_720p`, `touchdown_1080p`) and `sequences/bbb/` are back and every PNG verified to
+decode. `sequences/blue_sky/` and the `frames/hdr/` 10-bit material are still absent; another session is
+fixing the script's silent-failure path, and `frames/hdr/` regenerates with `scripts/png16.py`.
+
+Two things to carry from how that went:
+
+- **Three sessions ran the fetch script at the same time**, all writing the same output paths with
+  `ffmpeg -y` and `curl -o`. The script's `[ -f "$out" ]` guard is not a lock: it is checked before
+  the write, so simultaneous starts all miss it, and a half-written PNG looks complete to whoever
+  checks next. Nothing was corrupted this time (verified by decoding all 12 files), but that was
+  luck. **Check `ps` for a running fetch before starting one.**
+- **Copy the images you measure on into your own worktree and record their hashes.** Another
+  session's fetch overwrote `touchdown_1080p.png` while a measurement was being set up against it.
+  Rule 1 says a number is only valid against a commit; it is equally only valid against a known
+  input.
+
+**`python3` on this machine has neither `numpy` nor `pillow`**, so `scripts/lossless_gate.py`,
+`ypsnr_de00.py` and `chroma_metric.py` do not run out of the box. Make a venv
+(`python3 -m venv <dir> && <dir>/bin/pip install numpy pillow`) and call its interpreter
+explicitly.
 
 ## Timing: an idle machine is necessary and NOT sufficient (added 2026-09-06, after an idle run still lied)
 

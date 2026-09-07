@@ -222,7 +222,7 @@ impl GpuAbacDecoder {
         }
         let t0 = std::time::Instant::now();
         ctx.queue.submit(Some(cmd.finish()));
-        ctx.device.poll(wgpu::Maintain::Wait);
+        crate::gpu_util::poll_wait(ctx);
         let gpu_s = t0.elapsed().as_secs_f64();
 
         // The shader writes f32 because that is what `scratch_a` is downstream; coefficients are

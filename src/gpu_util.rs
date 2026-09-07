@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use wgpu;
 
 use crate::GpuContext;
@@ -21,6 +23,27 @@ pub fn ensure_var_buf(
         });
         *cap = new_cap;
     }
+}
+
+/// Count of `poll_wait` calls since process start.
+///
+/// A `poll(Maintain::Wait)` is a driver round trip, and they are the unit PERF-1 counts on the
+/// readback path — the machine is shared, so a wall-clock delta means nothing while a count
+/// means exactly what it says.
+static POLL_WAITS: AtomicUsize = AtomicUsize::new(0);
+
+/// `device.poll(Maintain::Wait)`, counted.
+///
+/// Use this rather than calling `poll` directly on any path that runs per frame, so
+/// [`poll_wait_count`] stays honest.
+pub fn poll_wait(ctx: &GpuContext) {
+    POLL_WAITS.fetch_add(1, Ordering::Relaxed);
+    ctx.device.poll(wgpu::Maintain::Wait);
+}
+
+/// How many counted waits have happened. Snapshot it around a frame to get that frame's count.
+pub fn poll_wait_count() -> usize {
+    POLL_WAITS.load(Ordering::Relaxed)
 }
 
 /// Read a GPU buffer back to CPU as Vec<f32>, using a staging buffer with copy + map.

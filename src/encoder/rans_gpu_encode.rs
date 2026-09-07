@@ -649,7 +649,7 @@ impl GpuRansEncoder {
                 });
         }
         drop(tx);
-        ctx.device.poll(wgpu::Maintain::Wait);
+        crate::gpu_util::poll_wait(ctx);
         for _ in 0..4 {
             rx.recv().unwrap().unwrap();
         }
@@ -894,7 +894,7 @@ impl GpuRansEncoder {
         }
         drop(tx);
         let t_map_async = t_gpu_start.elapsed();
-        ctx.device.poll(wgpu::Maintain::Wait);
+        crate::gpu_util::poll_wait(ctx);
         let t_poll = t_gpu_start.elapsed();
         for _ in 0..12 {
             rx.recv().unwrap().unwrap();
@@ -1160,7 +1160,7 @@ impl GpuRansEncoder {
             }
         }
         drop(tx);
-        ctx.device.poll(wgpu::Maintain::Wait);
+        crate::gpu_util::poll_wait(ctx);
         for _ in 0..12 {
             rx.recv().unwrap().unwrap();
         }
@@ -1389,7 +1389,7 @@ impl GpuRansEncoder {
         }
         drop(tx);
         let t_map_async = t_gpu_start.elapsed();
-        ctx.device.poll(wgpu::Maintain::Wait);
+        crate::gpu_util::poll_wait(ctx);
         let t_poll = t_gpu_start.elapsed();
         for _ in 0..12 {
             rx.recv().unwrap().unwrap();
@@ -1665,7 +1665,7 @@ impl GpuRansEncoder {
             }
         }
         drop(tx);
-        ctx.device.poll(wgpu::Maintain::Wait);
+        crate::gpu_util::poll_wait(ctx);
         for _ in 0..12 {
             rx.recv().unwrap().unwrap();
         }

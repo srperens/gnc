@@ -1589,6 +1589,10 @@ impl EncoderPipeline {
         );
         let bufs = self.cached.as_ref().unwrap();
 
+        // PERF-1 canary: driver round trips are what the readback items remove, and a count is
+        // the only honest instrument while other sessions hold the GPU.
+        let polls_at_entry = crate::gpu_util::poll_wait_count();
+
         let t_setup = t_start.elapsed();
 
         // Upload raw (unpadded) input directly to GPU — GPU shader handles padding
@@ -2367,6 +2371,9 @@ impl EncoderPipeline {
         if profile && use_gpu_rice_batch {
             // Stage 1: submit wavelet+quantize
             ctx.queue.submit(Some(cmd.finish()));
+            // Deliberately not `poll_wait`: this round trip exists only to time the stage, and
+            // counting it would make the canary describe the profiling path instead of the
+            // production one.
             ctx.device.poll(wgpu::Maintain::Wait);
             t_wq_end = t_start.elapsed();
 
@@ -2383,7 +2390,7 @@ impl EncoderPipeline {
                 config.quantization_step,
             );
             ctx.queue.submit(Some(cmd_rice.finish()));
-            ctx.device.poll(wgpu::Maintain::Wait);
+            ctx.device.poll(wgpu::Maintain::Wait); // profiling-only, not counted (see above)
             t_rice_end = t_start.elapsed();
         } else {
             // Production path: single submit for all GPU work (wavelet+quant + entropy if Rice)
@@ -2402,6 +2409,57 @@ impl EncoderPipeline {
             t_rice_end = t_wq_end;
         }
 
+        // ---- Ask for every small readback now, wait for them once (PERF-1 item 3) ----
+        //
+        // The weight map, the CfL alphas and the intra modes were each mapped and then waited
+        // for with their own `poll(Wait)`, after Rice had already waited for its nine staging
+        // buffers. Four driver round trips where one does: `map_async` only records the request,
+        // and a single `poll(Wait)` completes every outstanding one. The copies into these
+        // staging buffers are in the command buffer submitted above, so they are all in flight
+        // by now.
+        //
+        // `polled` tracks whether something has already waited. Rice's readback always polls, so
+        // on the default path nothing here polls at all; on the paths without GPU Rice (non-444,
+        // abac, CPU entropy) the first collector below does the single wait.
+        let mut polled = false;
+        let wm_bytes = (wm_total_blocks * std::mem::size_of::<f32>()) as u64;
+        let wm_rx = if aq_active && wm_total_blocks > 0 {
+            let bufs = self.cached.as_ref().unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            bufs.weight_map_staging
+                .slice(..wm_bytes)
+                .map_async(wgpu::MapMode::Read, move |result| {
+                    tx.send(result).unwrap();
+                });
+            Some(rx)
+        } else {
+            None
+        };
+        let alpha_rx = alpha_staging.as_ref().map(|staging| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            for stg in staging {
+                let tx_c = tx.clone();
+                stg.slice(..).map_async(wgpu::MapMode::Read, move |result| {
+                    tx_c.send(result).unwrap();
+                });
+            }
+            rx
+        });
+        let intra_bytes = (IntraPredictor::num_blocks(padded_w, padded_h) as u64) * 4;
+        let intra_rx = if config.intra_prediction {
+            let bufs = self.cached.as_ref().unwrap();
+            let intra_staging = bufs.intra_modes_staging.as_ref().unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            intra_staging
+                .slice(..intra_bytes)
+                .map_async(wgpu::MapMode::Read, move |result| {
+                    tx.send(result).unwrap();
+                });
+            Some(rx)
+        } else {
+            None
+        };
+
         // === Significance-context diagnostic (GNC_SIG_CONTEXT=1) ===
         // Runs on the first I-frame only. Reads quantized coefficient buffers (Y →
         // mc_out, Co → ref_upload, Cg → plane_b) after wavelet+quantize but before
@@ -2411,7 +2469,7 @@ impl EncoderPipeline {
         {
             use std::sync::OnceLock;
             static SIG_CTX_DONE: OnceLock<()> = OnceLock::new();
-            ctx.device.poll(wgpu::Maintain::Wait);
+            crate::gpu_util::poll_wait(ctx);
             SIG_CTX_DONE.get_or_init(|| {
                 let bufs = self.cached.as_ref().unwrap();
                 // For non-444 chroma, Co/Cg planes have smaller padded dimensions.
@@ -2440,7 +2498,7 @@ impl EncoderPipeline {
         {
             use std::sync::OnceLock;
             static CHECKER_CORR_DONE: OnceLock<()> = OnceLock::new();
-            ctx.device.poll(wgpu::Maintain::Wait);
+            crate::gpu_util::poll_wait(ctx);
             CHECKER_CORR_DONE.get_or_init(|| {
                 let bufs = self.cached.as_ref().unwrap();
                 super::checkerboard_corr_diag::run_multi_plane(
@@ -2506,6 +2564,8 @@ impl EncoderPipeline {
             let mut rt = self
                 .gpu_rice_encoder
                 .finish_3planes_readback(ctx, &info, entropy_levels);
+            // That call polls unconditionally, which also completes the maps issued above.
+            polled = true;
             rice_tiles.append(&mut rt);
         } else if use_gpu_rice && !use_gpu_rice_batch {
             // Non-444: each plane may have different tile counts — encode one at a time.
@@ -2521,6 +2581,8 @@ impl EncoderPipeline {
                 );
                 rice_tiles.append(&mut rt);
             }
+            // Each of those polls; the maps issued after the submit are complete too.
+            polled = true;
         } else if use_gpu_huffman_batch {
             // GPU Huffman encode: 2-pass (histogram → codebook → encode)
             let mut ht = self.gpu_huffman_encoder.encode_3planes_to_tiles(
@@ -2558,20 +2620,14 @@ impl EncoderPipeline {
         let t_entropy = t_start.elapsed();
 
         // Deferred weight map readback (data was copied to staging in cmd2, already
-        // submitted and completed as part of the wavelet+quantize + entropy GPU work)
-        let weight_map = if aq_active && wm_total_blocks > 0 {
+        // submitted and completed as part of the wavelet+quantize + entropy GPU work).
+        // Mapping was requested right after the submit; this only collects it.
+        let weight_map = if let Some(rx) = wm_rx {
             let bufs = self.cached.as_ref().unwrap();
-            let wm_bytes = (wm_total_blocks * std::mem::size_of::<f32>()) as u64;
-            let (tx, rx) = std::sync::mpsc::channel();
-            let tx_c = tx.clone();
-            bufs.weight_map_staging.slice(..wm_bytes).map_async(
-                wgpu::MapMode::Read,
-                move |result| {
-                    tx_c.send(result).unwrap();
-                },
-            );
-            drop(tx);
-            ctx.device.poll(wgpu::Maintain::Wait);
+            if !polled {
+                crate::gpu_util::poll_wait(ctx);
+                polled = true;
+            }
             rx.recv().unwrap().unwrap();
             let view = bufs.weight_map_staging.slice(..wm_bytes).get_mapped_range();
             let wm: Vec<f32> = bytemuck::cast_slice(&view).to_vec();
@@ -2582,17 +2638,12 @@ impl EncoderPipeline {
             None
         };
 
-        // Deferred CfL alpha readback
-        if let Some(ref alpha_staging) = alpha_staging {
-            let (tx, rx) = std::sync::mpsc::channel();
-            for stg in alpha_staging {
-                let tx_c = tx.clone();
-                stg.slice(..).map_async(wgpu::MapMode::Read, move |result| {
-                    tx_c.send(result).unwrap();
-                });
+        // Deferred CfL alpha readback — mapping was requested right after the submit.
+        if let (Some(alpha_staging), Some(rx)) = (alpha_staging.as_ref(), alpha_rx) {
+            if !polled {
+                crate::gpu_util::poll_wait(ctx);
+                polled = true;
             }
-            drop(tx);
-            ctx.device.poll(wgpu::Maintain::Wait);
             for _ in 0..2 {
                 rx.recv().unwrap().unwrap();
             }
@@ -2621,21 +2672,15 @@ impl EncoderPipeline {
             None
         };
 
-        // Deferred intra modes readback
-        let intra_modes = if config.intra_prediction {
+        // Deferred intra modes readback — mapping was requested right after the submit.
+        let intra_modes = if let Some(rx) = intra_rx {
             let bufs = self.cached.as_ref().unwrap();
             let intra_staging = bufs.intra_modes_staging.as_ref().unwrap();
-            let num_blocks = IntraPredictor::num_blocks(padded_w, padded_h);
-            let modes_bytes = (num_blocks as u64) * 4;
-            let (tx, rx) = std::sync::mpsc::channel();
-            let tx_c = tx.clone();
-            intra_staging
-                .slice(..modes_bytes)
-                .map_async(wgpu::MapMode::Read, move |result| {
-                    tx_c.send(result).unwrap();
-                });
-            drop(tx);
-            ctx.device.poll(wgpu::Maintain::Wait);
+            let modes_bytes = intra_bytes;
+            if !polled {
+                // Last collector, so nothing reads `polled` after this.
+                crate::gpu_util::poll_wait(ctx);
+            }
             rx.recv().unwrap().unwrap();
             let view = intra_staging.slice(..modes_bytes).get_mapped_range();
             let modes_u32: Vec<u32> = bytemuck::cast_slice(&view).to_vec();
@@ -2663,7 +2708,7 @@ impl EncoderPipeline {
                 .iter()
                 .map(|t| super::rice::serialize_tile_rice(t).len())
                 .sum();
-            ctx.device.poll(wgpu::Maintain::Wait);
+            crate::gpu_util::poll_wait(ctx);
             ABAC_DONE.get_or_init(|| {
                 let bufs = self.cached.as_ref().unwrap();
                 super::abac_compare::run_multi_plane(
@@ -2764,6 +2809,11 @@ impl EncoderPipeline {
                 (t_entropy - t_rice_end).as_secs_f64() * 1000.0,
                 t_total.as_secs_f64() * 1000.0,
             );
+            eprintln!(
+                "[encode profile] poll_waits={} (production path; the two profiling-only \
+                 round trips above are excluded)",
+                crate::gpu_util::poll_wait_count() - polls_at_entry
+            );
         }
 
         CompressedFrame {
@@ -2844,7 +2894,7 @@ impl EncoderPipeline {
         slice.map_async(wgpu::MapMode::Read, move |result| {
             tx.send(result).unwrap();
         });
-        ctx.device.poll(wgpu::Maintain::Wait);
+        crate::gpu_util::poll_wait(ctx);
         rx.recv().unwrap().unwrap();
 
         let data = slice.get_mapped_range();

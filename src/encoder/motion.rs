@@ -1614,7 +1614,7 @@ impl MotionEstimator {
         slice.map_async(wgpu::MapMode::Read, move |result| {
             tx.send(result).unwrap();
         });
-        ctx.device.poll(wgpu::Maintain::Wait);
+        crate::gpu_util::poll_wait(ctx);
         rx.recv().unwrap().unwrap();
 
         let data = slice.get_mapped_range();
@@ -1652,7 +1652,7 @@ impl MotionEstimator {
             });
         }
         drop(tx);
-        ctx.device.poll(wgpu::Maintain::Wait);
+        crate::gpu_util::poll_wait(ctx);
         for _ in 0..3 {
             rx.recv().unwrap().unwrap();
         }
@@ -1715,7 +1715,7 @@ impl MotionEstimator {
         slice.map_async(wgpu::MapMode::Read, move |result| {
             tx.send(result).unwrap();
         });
-        ctx.device.poll(wgpu::Maintain::Wait);
+        crate::gpu_util::poll_wait(ctx);
         rx.recv().unwrap().unwrap();
 
         let data = slice.get_mapped_range();
@@ -1791,7 +1791,7 @@ impl MotionEstimator {
         slice.map_async(wgpu::MapMode::Read, move |result| {
             tx.send(result).unwrap();
         });
-        ctx.device.poll(wgpu::Maintain::Wait);
+        crate::gpu_util::poll_wait(ctx);
         rx.recv().unwrap().unwrap();
 
         let data = slice.get_mapped_range();
@@ -1853,7 +1853,7 @@ impl MotionEstimator {
             });
         }
         drop(tx);
-        ctx.device.poll(wgpu::Maintain::Wait);
+        crate::gpu_util::poll_wait(ctx);
         for _ in 0..3 {
             rx.recv().unwrap().unwrap();
         }
@@ -1947,7 +1947,7 @@ impl MotionEstimator {
             .map_async(wgpu::MapMode::Read, move |r| {
                 tx3.send(r).unwrap();
             });
-        ctx.device.poll(wgpu::Maintain::Wait);
+        crate::gpu_util::poll_wait(ctx);
         rx1.recv().unwrap().unwrap();
         rx2.recv().unwrap().unwrap();
         rx3.recv().unwrap().unwrap();
@@ -2011,7 +2011,7 @@ impl MotionEstimator {
         slice.map_async(wgpu::MapMode::Read, move |result| {
             tx.send(result).unwrap();
         });
-        ctx.device.poll(wgpu::Maintain::Wait);
+        crate::gpu_util::poll_wait(ctx);
         rx.recv().unwrap().unwrap();
 
         let data = slice.get_mapped_range();
@@ -2065,7 +2065,7 @@ impl MotionEstimator {
             slice.map_async(wgpu::MapMode::Read, move |result| {
                 tx.send(result).unwrap();
             });
-            ctx.device.poll(wgpu::Maintain::Wait);
+            crate::gpu_util::poll_wait(ctx);
             rx.recv().unwrap().unwrap();
             let data = slice.get_mapped_range();
             let vals: Vec<u32> = bytemuck::cast_slice(&data).to_vec();
@@ -2689,7 +2689,7 @@ mod tests {
         slice.map_async(wgpu::MapMode::Read, move |result| {
             tx.send(result).unwrap();
         });
-        ctx.device.poll(wgpu::Maintain::Wait);
+        crate::gpu_util::poll_wait(ctx);
         rx.recv().unwrap().unwrap();
 
         let data = slice.get_mapped_range();

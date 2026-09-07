@@ -381,7 +381,7 @@ impl GpuHuffmanEncoder {
                         });
                 }
                 drop(tx);
-                ctx.device.poll(wgpu::Maintain::Wait);
+                crate::gpu_util::poll_wait(ctx);
                 for _ in 0..2 {
                     rx.recv().unwrap().unwrap();
                 }
@@ -544,7 +544,7 @@ impl GpuHuffmanEncoder {
                         });
                 }
                 drop(tx);
-                ctx.device.poll(wgpu::Maintain::Wait);
+                crate::gpu_util::poll_wait(ctx);
                 for _ in 0..2 {
                     rx.recv().unwrap().unwrap();
                 }

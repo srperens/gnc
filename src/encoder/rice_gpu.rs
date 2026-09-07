@@ -457,7 +457,7 @@ impl GpuRiceEncoder {
                 });
         }
         drop(tx);
-        ctx.device.poll(wgpu::Maintain::Wait);
+        crate::gpu_util::poll_wait(ctx);
         // 9 data buffers + 1 overflow
         for _ in 0..10 {
             rx.recv().unwrap().unwrap();
@@ -668,7 +668,7 @@ impl GpuRiceEncoder {
                 });
         }
         drop(tx);
-        ctx.device.poll(wgpu::Maintain::Wait);
+        crate::gpu_util::poll_wait(ctx);
         // 3 data buffers + 1 overflow
         for _ in 0..4 {
             rx.recv().unwrap().unwrap();
@@ -896,7 +896,7 @@ impl GpuRiceEncoder {
                 });
         }
         drop(tx);
-        ctx.device.poll(wgpu::Maintain::Wait);
+        crate::gpu_util::poll_wait(ctx);
         // 9 data buffers + 1 overflow
         for _ in 0..10 {
             rx.recv().unwrap().unwrap();
@@ -1190,7 +1190,7 @@ impl GpuRiceEncoder {
                 });
         }
         drop(tx);
-        ctx.device.poll(wgpu::Maintain::Wait);
+        crate::gpu_util::poll_wait(ctx);
         // 9 data callbacks per frame + 1 overflow
         for _ in 0..batch_size * 9 + 1 {
             rx.recv().unwrap().unwrap();
@@ -1608,7 +1608,7 @@ mod tests {
         slice.map_async(wgpu::MapMode::Read, move |result| {
             tx.send(result).unwrap();
         });
-        ctx.device.poll(wgpu::Maintain::Wait);
+        crate::gpu_util::poll_wait(ctx);
         rx.recv().unwrap().unwrap();
 
         let data = slice.get_mapped_range();
@@ -1758,7 +1758,7 @@ mod tests {
                 slice.map_async(wgpu::MapMode::Read, move |result| {
                     tx.send(result).unwrap();
                 });
-                ctx.device.poll(wgpu::Maintain::Wait);
+                crate::gpu_util::poll_wait(ctx);
                 rx.recv().unwrap().unwrap();
                 let data = slice.get_mapped_range();
                 let gpu_plane: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
@@ -1887,7 +1887,7 @@ mod tests {
             slice.map_async(wgpu::MapMode::Read, move |result| {
                 tx.send(result).unwrap();
             });
-            ctx.device.poll(wgpu::Maintain::Wait);
+            crate::gpu_util::poll_wait(ctx);
             rx.recv().unwrap().unwrap();
             let data = slice.get_mapped_range();
             let gpu_plane: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
@@ -2036,7 +2036,7 @@ mod tests {
         slice.map_async(wgpu::MapMode::Read, move |result| {
             tx.send(result).unwrap();
         });
-        ctx.device.poll(wgpu::Maintain::Wait);
+        crate::gpu_util::poll_wait(ctx);
         rx.recv().unwrap().unwrap();
 
         let data = slice.get_mapped_range();

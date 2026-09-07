@@ -132,7 +132,7 @@ pub fn dump_residual_plane(
     buf_slice.map_async(wgpu::MapMode::Read, move |result| {
         tx.send(result).ok();
     });
-    ctx.device.poll(wgpu::Maintain::Wait);
+    crate::gpu_util::poll_wait(ctx);
     if rx.recv().is_err() {
         return;
     }
@@ -168,7 +168,7 @@ pub fn compute_residual_stats(
     buf_slice.map_async(wgpu::MapMode::Read, move |result| {
         tx.send(result).ok();
     });
-    ctx.device.poll(wgpu::Maintain::Wait);
+    crate::gpu_util::poll_wait(ctx);
     rx.recv().unwrap().unwrap();
 
     let data = buf_slice.get_mapped_range();
@@ -911,7 +911,7 @@ pub fn read_plane_f32(
     buf_slice.map_async(wgpu::MapMode::Read, move |result| {
         tx.send(result).ok();
     });
-    ctx.device.poll(wgpu::Maintain::Wait);
+    crate::gpu_util::poll_wait(ctx);
     rx.recv().unwrap().unwrap();
 
     let data = buf_slice.get_mapped_range();

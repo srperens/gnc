@@ -2043,7 +2043,7 @@ impl EncoderPipeline {
                 }
                 ctx.queue.submit(Some(cmd.finish()));
                 if prof {
-                    ctx.device.poll(wgpu::Maintain::Wait);
+                    crate::gpu_util::poll_wait(ctx);
                 }
             }
 
@@ -2089,7 +2089,7 @@ impl EncoderPipeline {
                 }
                 ctx.queue.submit(Some(cmd.finish()));
                 if prof {
-                    ctx.device.poll(wgpu::Maintain::Wait);
+                    crate::gpu_util::poll_wait(ctx);
                 }
             }
 
@@ -2249,7 +2249,7 @@ impl EncoderPipeline {
                     });
             }
             drop(tx);
-            ctx.device.poll(wgpu::Maintain::Wait);
+            crate::gpu_util::poll_wait(ctx);
             // Drain channel (3 callbacks per frame: tile_muls + tile_energies + max_abs)
             for _ in 0..(n * 3) {
                 rx.recv().unwrap().2.unwrap();
@@ -3398,7 +3398,7 @@ impl EncoderPipeline {
             // Profiling: flush preprocess to isolate ME timing
             if profile {
                 ctx.queue.submit(Some(cmd.finish()));
-                ctx.device.poll(wgpu::Maintain::Wait);
+                crate::gpu_util::poll_wait(ctx);
                 eprintln!(
                     "    P preprocess: {:.1}ms",
                     _t_pf.elapsed().as_secs_f64() * 1000.0
@@ -3501,7 +3501,7 @@ impl EncoderPipeline {
             // Profiling: flush ME to isolate MC+wavelet+quantize timing
             if profile {
                 ctx.queue.submit(Some(cmd.finish()));
-                ctx.device.poll(wgpu::Maintain::Wait);
+                crate::gpu_util::poll_wait(ctx);
                 eprintln!(
                     "    P ME+split: {:.1}ms",
                     _t_me.elapsed().as_secs_f64() * 1000.0
@@ -3931,7 +3931,7 @@ impl EncoderPipeline {
         // Profiling: flush forward phase to measure GPU time
         if profile {
             ctx.queue.submit(Some(cmd.finish()));
-            ctx.device.poll(wgpu::Maintain::Wait);
+            crate::gpu_util::poll_wait(ctx);
             eprintln!(
                 "    P MC+wavelet+quant: {:.1}ms",
                 _t_mcwq.elapsed().as_secs_f64() * 1000.0
@@ -3977,7 +3977,7 @@ impl EncoderPipeline {
             {
                 let slice = staging.slice(..);
                 slice.map_async(wgpu::MapMode::Read, |_| {});
-                ctx.device.poll(wgpu::Maintain::Wait);
+                crate::gpu_util::poll_wait(ctx);
                 let data = slice.get_mapped_range();
                 let coefs: &[f32] = bytemuck::cast_slice(&data);
 
@@ -4095,7 +4095,7 @@ impl EncoderPipeline {
         let _t_after_entropy;
         if profile {
             ctx.queue.submit(Some(cmd.finish()));
-            ctx.device.poll(wgpu::Maintain::Wait);
+            crate::gpu_util::poll_wait(ctx);
             _t_after_entropy = _t_pf.elapsed();
             eprintln!(
                 "    P entropy+stg: {:.1}ms",
@@ -4402,7 +4402,7 @@ impl EncoderPipeline {
             let map_bytes = (map_count as u64) * 4;
             let slice = bufs.tile_skip_map_staging.slice(..map_bytes);
             slice.map_async(wgpu::MapMode::Read, |_| {});
-            ctx.device.poll(wgpu::Maintain::Wait);
+            crate::gpu_util::poll_wait(ctx);
             let data = slice.get_mapped_range();
             let skip_map: &[u32] = bytemuck::cast_slice(&data);
             let skip_count: u32 = skip_map.iter().sum();
@@ -4616,7 +4616,7 @@ impl EncoderPipeline {
             // are simply read back and coded here — the frame encoder above is the same
             // one the GPU stage uses. Canary: `GNC_DIAGNOSTICS=1` makes
             // `entropy_encode_tiles` print the per-plane tile and block counts.
-            ctx.device.poll(wgpu::Maintain::Wait);
+            crate::gpu_util::poll_wait(ctx);
             let quant_bufs: [&wgpu::Buffer; 3] = if is_non_444 {
                 [&bufs.recon_y, &bufs.ref_upload, &bufs.plane_b]
             } else {
@@ -4670,7 +4670,7 @@ impl EncoderPipeline {
             // Do luma + each chroma plane separately with correct FrameInfo.
             // encode_1plane_to_tiles does its own submit+poll internally.
             // The batch above only contained forward+local_decode+MV — poll it first.
-            ctx.device.poll(wgpu::Maintain::Wait);
+            crate::gpu_util::poll_wait(ctx);
             let mut luma_tiles = self.gpu_rice_encoder.encode_1plane_to_tiles(
                 ctx,
                 &bufs.recon_y,
@@ -4708,7 +4708,7 @@ impl EncoderPipeline {
         } else {
             // Non-444 with non-Rice entropy: unsupported (asserted in I-frame encoder).
             // Drain the GPU submit and fall through with empty tiles (will produce corrupt output).
-            ctx.device.poll(wgpu::Maintain::Wait);
+            crate::gpu_util::poll_wait(ctx);
         }
         if std::env::var("GNC_PROFILE").is_ok() {
             eprintln!(
@@ -5535,7 +5535,7 @@ impl EncoderPipeline {
             // CPU entropy stage — same frame encoder above, coefficients read back here.
             // Canary: `GNC_DIAGNOSTICS=1` makes `entropy_encode_tiles` print per-plane
             // tile and block counts, so an inactive coder is visible rather than silent.
-            ctx.device.poll(wgpu::Maintain::Wait);
+            crate::gpu_util::poll_wait(ctx);
             let quant_bufs: [&wgpu::Buffer; 3] = if is_non_444 {
                 [&bufs.recon_y, &bufs.ref_upload, &bufs.plane_b]
             } else {
@@ -5595,7 +5595,7 @@ impl EncoderPipeline {
             // Non-444: encode each plane separately with correct FrameInfo and buffer.
             // encode_1plane_to_tiles does its own submit+poll internally.
             // First drain the batch (MC + quant + MV copies).
-            ctx.device.poll(wgpu::Maintain::Wait);
+            crate::gpu_util::poll_wait(ctx);
             let ci = chroma_info_bf.as_ref().unwrap();
             let mut luma_tiles = self.gpu_rice_encoder.encode_1plane_to_tiles(
                 ctx,
@@ -5623,7 +5623,7 @@ impl EncoderPipeline {
             rice_tiles.append(&mut cg_tiles);
         } else {
             // Non-444 with non-Rice entropy: unsupported. Drain and fall through.
-            ctx.device.poll(wgpu::Maintain::Wait);
+            crate::gpu_util::poll_wait(ctx);
         }
         if std::env::var("GNC_PROFILE").is_ok() {
             eprintln!(
@@ -6205,7 +6205,7 @@ impl EncoderPipeline {
 
         ctx.queue.submit(Some(cmd.finish()));
         // Synchronize to ensure pyramid slot is ready before dependent B-frames use it
-        ctx.device.poll(wgpu::Maintain::Wait);
+        crate::gpu_util::poll_wait(ctx);
     }
 
     /// Diagnostic: compute quantized wavelet coefficients of the original signal.
@@ -6998,7 +6998,7 @@ impl EncoderPipeline {
                 });
             }
             drop(tx);
-            ctx.device.poll(wgpu::Maintain::Wait);
+            crate::gpu_util::poll_wait(ctx);
             for _ in 0..2 {
                 rx.recv().unwrap().unwrap();
             }
@@ -7152,7 +7152,7 @@ impl EncoderPipeline {
         slice.map_async(wgpu::MapMode::Read, move |result| {
             tx.send(result).unwrap();
         });
-        ctx.device.poll(wgpu::Maintain::Wait);
+        crate::gpu_util::poll_wait(ctx);
         rx.recv().unwrap().unwrap();
         let data = slice.get_mapped_range();
         let coeffs: &[f32] = bytemuck::cast_slice(&data);

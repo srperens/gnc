@@ -11649,8 +11649,30 @@ that is really 1-of-62 is exactly the kind of thing that becomes a wrong number 
 
 Two checks, and they point the same way:
 
-- **naga converts all 62 shaders to SPIR-V without complaint**, and **`spirv-val` passes all 62.**
-  So this is not naga rejecting the source and not naga emitting structurally invalid SPIR-V.
+- ~~**naga converts all 62 shaders to SPIR-V without complaint**, and **`spirv-val` passes all 62.**
+  So this is not naga rejecting the source and not naga emitting structurally invalid SPIR-V.~~
+  **Withdrawn 2026-09-08 — this measurement used the wrong compiler and its conclusion was the
+  opposite of the truth.** `naga` on that machine's `PATH` was the CLI at **30.0.1**, installed with
+  `cargo install naga-cli`; GNC ships **naga 24.0.0** via wgpu 24. So the modules I validated were
+  never the modules that reach the driver. **GNC was shipping invalid SPIR-V for exactly this
+  shader**: under wgpu's options naga 24 emits `OpStore`/`OpAccessChain` against a function-local
+  temporary it never declares, materialised to dynamically index a value-typed constant array — the
+  four `let hpel_dx = array<i32, 8>(…)` / `qpel_*` tables. 1 of 63 shaders invalid before the fix,
+  0 of 63 after (`51a9ac6`, found and fixed by the session holding BUG-25 after me).
+
+  **The rule this cost, and it outlives the bug: validate the artefact you ship, with the compiler
+  you ship.** A tool on `PATH` is not the one in `Cargo.lock`. It is the same shape as the M5-vs-M1
+  finding logged the same night — an environment fact nobody wrote down, quietly invalidating a
+  measurement that looked clean — and in both cases the measurement was of something *adjacent* to
+  what ships, reported as though it were the thing itself.
+
+  **What survives, and what it cost.** The localisation stands: 60 of 62 pass, `block_match_split`
+  is the one that fails, and E1 — deleting the quarter-pel section makes it compile — was pointing
+  at the right lines the whole time, because the arrays live there. Two of my five dead hypotheses
+  are now *explained* rather than merely dead: 8→4 candidates still crashed because it is still a
+  dynamic index, and H1 compiled in isolation because naga 24 gets the construct right in a small
+  module. What it cost is the sentence below, which sent the next reader looking for a driver bug on
+  valid input when the input was invalid.
 - **The same one shader kills lavapipe too.** Mesa's software Vulkan and NVIDIA's proprietary
   driver share no compiler code. Its sibling `block_match.wgsl` compiles fine on lavapipe.
 
@@ -11839,8 +11861,13 @@ loops and 31 barriers, while `block_match_bidir.wgsl` has 741, 22 and 35 and com
 crash needs the real shader's full complexity, and it reproduces on two Vulkan implementations that
 share no compiler code.
 
-That last fact is the useful one for whoever takes it: **two independent compilers dying on valid
-SPIR-V points at the shape of naga's output for this shader**, not at either driver. The next step
+That last fact is the useful one for whoever takes it: ~~**two independent compilers dying on valid
+SPIR-V points at the shape of naga's output for this shader**, not at either driver.~~ **The
+premise is withdrawn** (see above) — the SPIR-V was invalid. The *conclusion* happened to be right
+for the wrong reason: it was naga's output, and specifically naga 24's. And the crash outlived the
+fix: with valid SPIR-V the module still segfaults, and the trigger is
+`BoundsCheckPolicy::Restrict`, which wgpu requests unconditionally. **A validity gate going green
+was not this bug closing.** The next step
 is a proper reduction — `spirv-dis` the module and cut it down at the SPIR-V level rather than the
 WGSL level, since the WGSL-level bisect can only remove whole statements.
 

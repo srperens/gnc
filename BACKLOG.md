@@ -788,8 +788,15 @@ policy confirms which half:
 | `index: Restrict`, buffer Unchecked | pipeline OK |
 | all Unchecked | pipeline OK |
 
-wgpu requests `buffer: Restrict` whenever the adapter does not report `robustBufferAccess2`, so no
-configuration of GNC's own avoids it.
+**Correction to how that was first written.** This entry originally said wgpu requests
+`buffer: Restrict` "whenever the adapter does not report `robustBufferAccess2`" — but this adapter
+*does* report it (`vulkaninfo`: `robustBufferAccess2 = true`, extension present), so that reading of
+`wgpu-hal` does not explain the crash. **The conclusion survives on different evidence: elimination.**
+The real WGSL path crashes; a faithful reconstruction with `buffer: Unchecked` does **not** crash —
+with wgpu's real writer flags and with its capability list — and one with `buffer: Restrict` does.
+So the shipped module must carry `Restrict` on buffers. *Why* wgpu selects it here, given the
+device reports the feature, is unexplained and is the next thing to find out, because it decides
+whether the fix is upstream or a local patch.
 
 **Also ruled out while reducing:** not driver stack exhaustion (reproduces at `ulimit -s` 8 MB,
 64 MB and unlimited); and the full-size valid module segfaults **Mesa lavapipe too**, so the
@@ -798,13 +805,23 @@ invalid module before. The 524-byte file is minimal *for NVIDIA only*, because t
 oracle ran the default adapter; reduce again against lavapipe if a two-implementation reproducer
 is wanted.
 
-**Two candidate fixes, neither tried.** Upgrade wgpu/naga — naga 30 compiles this shader to
-something that builds a pipeline, though not under a controlled bounds policy, so that is
-suggestive and not measured. Or change the shader's control flow so the check does not land in a
-returning branch — but all three `block_match*` shaders have exactly one early `return` and only
-this one crashes, so the early return is necessary and not sufficient, and the interaction is
-unidentified. It is also a legitimate driver bug report in its own right: a valid module should be
-rejected or compiled, never segfault the compiler.
+### Four candidate fixes tested. Three are dead; one is proven.
+
+| candidate | result |
+|---|---|
+| **Upgrade wgpu/naga** | **DEAD.** naga **30** under wgpu's *identical* options crashes both drivers. The earlier naga-30 module that built a pipeline was emitted with the CLI's own bounds policy, so it compared two things at once and settled nothing. `examples/bug25_emit30.rs` holds the options fixed and moves only the compiler version. |
+| **Remove the `let`-array construct** | **DEAD** for the crash. It fixed the *validity* defect and nothing else. |
+| **Remove the early `return`** | **DEAD.** Deleting it outright still crashes, so the returning branch in the reduced module is an artefact of reduction, not the trigger. |
+| **`buffer: Unchecked`** | **WORKS.** Compiles and builds a pipeline, under wgpu's real flags and capability list. This is the only proven fix. |
+
+**So the fix is to stop wgpu asking for `Restrict` on buffers**, and the open question is why it
+asks on an adapter that reports `robustBufferAccess2 = true`. If that is a wgpu defect the fix is
+upstream and small; if it is deliberate, GNC needs a `[patch.crates-io]` pin. Either way the shader
+does not need to change, which is worth knowing before anyone rewrites it.
+
+It is also a legitimate driver bug report in its own right — a valid module should be rejected or
+compiled, never segfault the compiler — and worth filing against both NVIDIA and Mesa, since the
+full-size module takes down lavapipe too.
 
 **Instruments, all committed:** `examples/spirv_probe.rs` (module shape, no GPU),
 `examples/bug25_emit.rs` (emit under wgpu's options, one knob at a time),

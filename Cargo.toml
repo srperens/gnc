@@ -47,6 +47,11 @@ criterion = { version = "0.5", features = ["html_reports"] }
 # inspectable at that level rather than at WGSL level. Pinned to the version wgpu 24 already
 # resolves, so this adds no download and inspects exactly the bytes the runtime ships.
 naga = { version = "24", features = ["wgsl-in", "spv-out"] }
+# BUG-25: the same shader through a newer naga, under *identical* wgpu options. This is the
+# experiment that decides whether "upgrade wgpu" is the fix or merely a different crash — the
+# naga-30 module that built a pipeline earlier was emitted with the CLI's own bounds policy, not
+# wgpu's, so it settled nothing.
+naga30 = { package = "naga", version = "30", features = ["wgsl-in", "spv-out"] }
 
 [[test]]
 name = "quality_regression"

@@ -22,10 +22,27 @@
 use naga::back::spv;
 use naga::proc::{BoundsCheckPolicies, BoundsCheckPolicy};
 
+/// The base capability set wgpu 24 hands naga on Vulkan (`wgpu-hal/src/vulkan/adapter.rs`),
+/// before the feature-conditional additions, none of which GNC requests.
+fn wgpu_caps() -> naga::FastHashSet<spv::Capability> {
+    [
+        spv::Capability::Shader,
+        spv::Capability::Matrix,
+        spv::Capability::Sampled1D,
+        spv::Capability::Image1D,
+        spv::Capability::ImageQuery,
+        spv::Capability::DerivativeControl,
+        spv::Capability::StorageImageExtendedFormats,
+    ]
+    .into_iter()
+    .collect()
+}
+
 fn configs() -> Vec<(&'static str, spv::Options<'static>)> {
-    let base_flags = spv::WriterFlags::ADJUST_COORDINATE_SPACE
-        | spv::WriterFlags::LABEL_VARYINGS
-        | spv::WriterFlags::FORCE_POINT_SIZE;
+    // wgpu starts from `WriterFlags::empty()` and sets only these two for a non-Qualcomm adapter
+    // with InstanceFlags::DEBUG off (`wgpu-hal/src/vulkan/adapter.rs`). It does **not** set
+    // ADJUST_COORDINATE_SPACE, which an earlier version of this file wrongly included.
+    let base_flags = spv::WriterFlags::LABEL_VARYINGS | spv::WriterFlags::FORCE_POINT_SIZE;
 
     let restrict = BoundsCheckPolicies {
         index: BoundsCheckPolicy::Restrict,
@@ -95,6 +112,34 @@ fn configs() -> Vec<(&'static str, spv::Options<'static>)> {
             image_load: BoundsCheckPolicy::Unchecked,
             binding_array: BoundsCheckPolicy::Unchecked,
         }, Z::Native)),
+        // The last untested difference from wgpu: it passes `capabilities: Some([...])`, which
+        // constrains what the writer may emit and can change lowering. Everything above passes
+        // `None`. This adapter reports `robustBufferAccess2 = true`, so wgpu should be asking for
+        // `buffer: Unchecked` — and that configuration does *not* crash — yet the real WGSL path
+        // does. One of those two things is wrong, and this is the remaining candidate.
+        ("caps_index_restrict", spv::Options {
+            lang_version: (1, 0),
+            flags: base_flags,
+            capabilities: Some(wgpu_caps()),
+            bounds_check_policies: BoundsCheckPolicies {
+                index: BoundsCheckPolicy::Restrict,
+                buffer: BoundsCheckPolicy::Unchecked,
+                image_load: BoundsCheckPolicy::Unchecked,
+                binding_array: BoundsCheckPolicy::Unchecked,
+            },
+            zero_initialize_workgroup_memory: Z::Native,
+            binding_map: Default::default(),
+            debug_info: None,
+        }),
+        ("caps_wgpu_native", spv::Options {
+            lang_version: (1, 0),
+            flags: base_flags,
+            capabilities: Some(wgpu_caps()),
+            bounds_check_policies: restrict,
+            zero_initialize_workgroup_memory: Z::Native,
+            binding_map: Default::default(),
+            debug_info: None,
+        }),
     ]
 }
 

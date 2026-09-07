@@ -109,6 +109,29 @@ So the earlier "`Restrict` is the trigger" was right but too coarse: it is the *
 not array indexing. wgpu requests it whenever the adapter does not report `robustBufferAccess2`,
 which is why nothing in GNC's own configuration avoids it.
 
+### Four candidate fixes tested; three are dead and one is proven
+
+| candidate | result |
+|---|---|
+| **Upgrade wgpu/naga** | **DEAD.** naga **30** under wgpu's *identical* options crashes NVIDIA *and* lavapipe. The earlier naga-30 module that built a pipeline came from the CLI with its own bounds defaults, so it moved two variables at once and settled nothing; `examples/bug25_emit30.rs` moves only the version. |
+| **Remove the `let`-array construct** | **DEAD** for the crash — it fixed the validity defect and nothing else. |
+| **Remove the early `return`** | **DEAD.** Deleting it outright still crashes, so the returning branch in the reduced module is an artefact of the reduction, not the trigger. |
+| **`buffer: Unchecked`** | **WORKS** — under wgpu's real writer flags *and* its capability list. The only proven fix. |
+
+That first row matters most: "upgrade wgpu" was the obvious, expensive move, and it is measurably
+not the answer. The crash is a **driver** bug on SPIR-V that every naga version legitimately emits.
+
+**And a correction to this entry's own mechanism.** It first said wgpu asks for `buffer: Restrict`
+"whenever the adapter does not report `robustBufferAccess2`". This adapter *does* report it
+(`vulkaninfo`: `robustBufferAccess2 = true`, extension present), so that reading of `wgpu-hal` does
+not explain anything. **The conclusion survives by elimination instead:** the real path crashes, a
+faithful `buffer: Unchecked` reconstruction does not, a `buffer: Restrict` one does — so the
+shipped module carries `Restrict`. Why wgpu selects it on this adapter is unexplained, and it
+decides whether the fix is upstream or a local pin. Two other reconstruction errors were found and
+fixed on the way: wgpu starts from `WriterFlags::empty()` and never sets `ADJUST_COORDINATE_SPACE`,
+and it passes `capabilities: Some([...])` rather than `None`. Neither changed the outcome, which is
+why they are recorded as controls rather than as findings.
+
 **Two further negatives from the same session.** Not driver stack exhaustion — reproduces at
 `ulimit -s` 8 MB, 64 MB and unlimited. And the full-size valid module segfaults **Mesa lavapipe as
 well**, which *restores* the original "two independent compilers" argument for defect B; it had

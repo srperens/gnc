@@ -4513,6 +4513,7 @@ impl EncoderPipeline {
                     };
                 encode_entropy(
                     &mut self.gpu_encoder,
+                    &mut self.gpu_abac_encoder,
                     ctx,
                     quant_buf,
                     enc_pixels,
@@ -5431,6 +5432,7 @@ impl EncoderPipeline {
                     };
                 encode_entropy(
                     &mut self.gpu_encoder,
+                    &mut self.gpu_abac_encoder,
                     ctx,
                     quant_buf,
                     enc_pixels,

@@ -1,4 +1,5 @@
 use super::abac::Coder;
+use super::abac_gpu_encode::GpuAbacEncoder;
 use super::abac_tile::{self, AbacTile};
 use super::bitplane;
 use super::huffman;
@@ -17,7 +18,9 @@ pub(super) enum EntropyMode {
     Bitplane,
     Rice,
     Huffman,
-    /// Adaptive binary arithmetic coding over code-blocks. CPU encode, GPU decode.
+    /// Adaptive binary arithmetic coding over code-blocks. GPU encode (ENT-5) and GPU decode,
+    /// one thread per block on both sides; the CPU coder in `abac.rs` is the reference both are
+    /// verified byte-exact against, and the fallback for callers with no device.
     Abac,
 }
 
@@ -66,6 +69,7 @@ pub(super) fn inter_gpu_entropy_available(config: &CodecConfig) -> bool {
 #[allow(clippy::too_many_arguments)]
 pub(super) fn encode_entropy(
     gpu_encoder: &mut GpuRansEncoder,
+    abac_encoder: &mut GpuAbacEncoder,
     ctx: &GpuContext,
     quantized_buf: &wgpu::Buffer,
     padded_pixels: usize,
@@ -85,7 +89,33 @@ pub(super) fn encode_entropy(
     huffman_tiles: &mut Vec<huffman::HuffmanTile>,
     abac_tiles: &mut Vec<AbacTile>,
 ) {
-    if use_gpu_encode
+    // abac's own GPU encoder (ENT-5). Deliberately *not* folded into `use_gpu_encode`: that
+    // flag switches on the rANS histogram machinery and, in `sequence.rs`, which whole-frame
+    // P-frame pipeline runs — the conflation ARCH-3 exists to separate. abac needs neither, so
+    // it is routed on `gpu_entropy_encode` directly and nothing else moves.
+    if matches!(entropy_mode, EntropyMode::Abac) && config.gpu_entropy_encode {
+        assert_eq!(
+            padded_pixels,
+            padded_w * tiles_y * tile_size,
+            "abac GPU encode: plane is {padded_pixels} coefficients but its geometry says \
+             {padded_w} x {} — the encoder reads straight out of the quantised buffer and a \
+             mismatch would read past the plane",
+            tiles_y * tile_size,
+        );
+        let mut t = abac_encoder.encode_plane_to_tiles(
+            ctx,
+            quantized_buf,
+            padded_w,
+            tiles_x,
+            tiles_y,
+            config.tile_size,
+            entropy_levels,
+            config.abac_code_block,
+            config.abac_coder,
+            config.abac_gpu_sizing,
+        );
+        abac_tiles.append(&mut t);
+    } else if use_gpu_encode
         && !matches!(
             entropy_mode,
             EntropyMode::Rice | EntropyMode::Huffman | EntropyMode::Abac

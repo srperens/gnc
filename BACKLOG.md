@@ -3167,7 +3167,33 @@ close it — CLAUDE.md's "know when to stop".
 **Canary:** `GNC_COEF_ENTROPY=1` prints the per-band `vs Hnb` column; the LL and level-3/4/5 rows
 are the ones that must move, and levels 1-2 must not.
 
-### ENT-5 — abac needs a GPU encoder, and it is what stands between abac and the default (todo, P1)
+### ENT-5 — abac needs a GPU encoder, and it is what stands between abac and the default (**DONE 2026-09-07, one criterion outstanding**)
+
+**Shipped.** `src/shaders/abac_encode.wgsl` + `src/encoder/abac_gpu_encode.rs`, one thread per
+code-block, both arithmetic engines. **Bit-exact against the CPU encoder: 98 of 98 whole-file
+comparisons byte-identical** (`scripts/ent5_gpu_encode_gate.sh` — four stills at q=60/75/90/99/100,
+both engines, both output-sizing modes, 4:4:4/4:2:2/4:2:0, cb=16/32/64, plus an 8-frame bbb
+sequence at ki=1 and ki=9). GPU encode -> file -> GPU decode is **max |diff| 0** against the Rice
+decode of the same source at 1080p 4:4:4. Rate therefore cannot have moved, and did not.
+`tests/abac_gpu_encode.rs` asserts the same per block over eight geometries plus degenerate planes.
+
+**Criterion 3 — encode time per 1080p frame — is NOT measured.** Four sessions were on this M1 at
+load 10.2 and COORDINATION forbids a wall-clock figure under load. The instrument exists and is
+built to the same rules as the decode grid:
+`cargo test --release --test abac_bench -- --ignored --nocapture --test-threads=1`. Until it runs,
+**decision 0017's reason 2 has lost its mechanism and kept its 129 ms.** Whoever runs it should
+also settle the sizing mode: `CountThenEmit` (2 coder passes, exactly-sized scratch) is the default
+and `BoundedSlots` (1 coder pass, 22-29x scratch) is selectable with `GNC_ABAC_GPU_SIZING=slots`;
+the bytes are identical either way, so the default can flip on one run. `docs/decisions/0024`.
+
+**What it does not do:** abac is still opt-in (0017's reason 1, the 1.69x decode, is untouched;
+reason 3 is still ENT-3 blocked on BUG-18), and it does not touch `use_gpu_encode` or
+`sequence.rs` — abac is routed on `gpu_entropy_encode` directly, one condition inside
+`encode_entropy`, deliberately orthogonal to ARCH-3 and to the fused quantiser that BUG-16 says
+moves Rice's pixels.
+
+The original item follows.
+
 
 Filed 2026-09-07 after ENT-4. The mechanism has been named three times today — inside ARCH-3, inside
 BUG-18 and inside decision 0017 — and never as an item with an ID, so `scripts/claim next` cannot

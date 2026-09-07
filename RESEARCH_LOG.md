@@ -291,6 +291,168 @@ file: signalled initial probabilities per subband, or letting the deep subbands 
 ---
 
 
+## ENT-5 — abac has a GPU encoder, and it produces the CPU encoder's exact bytes (2026-09-07)
+
+**Hypothesis.** abac's encode is parallel across code-blocks in exactly the way its decode already
+is — one thread per block, ~3000 per padded 1080p 4:4:4 frame — so the CPU-only encoder was a
+missing shader rather than a structural limit. Writing it should (a) discharge decision 0017's
+reason 2, (b) remove the cause of the ARCH-3 / BUG-18 class of defect, and (c) move no rate figure
+at all, because a bit-exact encoder cannot.
+
+**Success criteria, set before implementation** (BACKLOG ENT-5): 1. byte-identical to the CPU
+encoder; 2. GPU encode -> file -> GPU decode, max |diff| 0 against the Rice decode of the same
+source; 3. encode time per 1080p frame on an idle machine; 4. rate unchanged. Plus a canary
+proving the shader ran, because criteria 1, 2 and 4 are all satisfied *by construction* by a
+silent fallback to the CPU coder.
+
+**Domain declaration.** The encoder operates on **quantised wavelet coefficients**, read straight
+out of the quantiser's output buffer as integral f32 (`i32(round(v))` in the shader against
+`.round() as i32` on the host — the quantiser emits `sign * floor(|v|/step + 0.5)`, so the round is
+a no-op on both sides and every other GPU entropy encoder here reads the same buffer the same way).
+Geometry comes from `abac_tile::code_blocks`, the one function the CPU encoder, the CPU decoder and
+the GPU decoder all call.
+
+### Criterion 1 and 4 — byte-identical, 98 of 98
+
+`scripts/ent5_gpu_encode_gate.sh`. Whole-file comparison of the default GPU path against
+`--cpu-encode`, which for abac differs in **nothing but where the entropy coding runs**: abac is
+routed on `config.gpu_entropy_encode` inside `encode_entropy` and is deliberately *not* added to
+`use_gpu_encode`, so `use_fused_qh` is false in both arms and the quantiser is untouched. That
+matters: BUG-16 records Rice's two encode paths disagreeing on the *picture* at q=25 (35.51 vs
+35.63 dB) because the fused quantiser runs on one of them, and folding abac in would have moved
+abac's pixels in the same commit that moved its encoder.
+
+| arm | points | result |
+|---|---|---|
+| 4 stills x q=60/75/90/99/100 x {Range, Interval} x {CountThenEmit, BoundedSlots} | 80 | byte-identical |
+| 4 stills at q=90, 4:2:2 and 4:2:0 | 8 | byte-identical |
+| 4 stills at q=90, cb=16 and cb=32 | 8 | byte-identical |
+| bbb 8-frame sequence, ki=1 (all-I) and ki=9 (I+P) | 2 | byte-identical |
+| **total** | **98** | **98 identical, 0 differing** |
+
+Byte identity discharges criterion 4 by construction: identical bytes are identical rate, so
+ENT-4's −16.0% over q=60-99 and the −13.4% lossless figure cannot have moved. The ki=9 row is the
+one that covers **P-frame residual coefficients**; both arms run the same (defective, BUG-18)
+non-batched P pipeline on purpose, so it verifies the coder without depending on anything BUG-18
+owns.
+
+`tests/abac_gpu_encode.rs` asserts the same thing per *block* rather than per file, over the eight
+geometries the decoder is verified on plus all-zero / all-one / all-minus-one / all-(-9999) planes,
+for both engines and both sizing modes — 4 x (8 + 4) = 48 verifications, each comparing every
+block's bytes against `abac_encode_tile`.
+
+### Criterion 2 — round trip
+
+`gnc encode --abac` at q=90 on bbb_1080p, decoded on the GPU, against the Rice decode of the same
+source at the same q: **max |diff| 0 over 1920x1080x3, 0 pixels differing.** Entropy coding is
+lossless and both coders quantise identically here, so this is the check ABAC-SHIP used and the one
+that caught a coder producing correct rate and no picture. `tests/abac_gpu_encode.rs` also runs
+GPU-encode -> GPU-decode with the CPU in neither path, max |diff| 0 for both engines and both
+sizing modes.
+
+### Criterion 3 — NOT MEASURED, and not for want of an instrument
+
+Four Claude sessions were working this M1 at load 10.2. COORDINATION's rule is that a wall-clock
+figure taken under load is worth nothing — the same abac input has read 25.2, 31.1 and 37.5 ms
+across three runs on this machine, a 48% spread on identical work, and three targeted shader
+optimisations against three suspected bottlenecks all measured exactly nothing as a result. So no
+number is recorded here rather than a number with a caveat.
+
+The instrument is `tests/abac_bench.rs::abac_encode_throughput_grid`, built to the same rules as
+the decode grid beside it: every variant timed back-to-back in one process on the same input, best
+of 24 repeats with `med/best` printed as the settled-or-not diagnostic, and the CPU arm timed in
+the same process so the ratio does not come from two runs.
+
+```text
+cargo test --release --test abac_bench -- --ignored --nocapture --test-threads=1
+gnc benchmark -i test_material/frames/bbb_1080p.png -q 90 --abac              # and --cpu-encode
+```
+
+**Until that runs, decision 0017's reason 2 has lost its mechanism and kept its number.** "abac
+encodes on the GPU" is a fact; "abac's encode is fast enough for a default" is not a claim.
+
+### What is load-independent, and what it says
+
+The structural cost of each sizing mode is exact and unaffected by load, so it is recorded even
+though the milliseconds are not. Padded 1080p luma plane, 8x5 tiles of 256 px, 1000 code-blocks,
+Range coder, q=90 on bbb:
+
+| mode | coder passes over the coefficients | scratch | scratch / output | round trips |
+|---|---|---|---|---|
+| CountThenEmit | 2 | 770 516 B | 1.00x | 2 |
+| BoundedSlots | 1 | 16 836 768 B | 21.9x | 3 |
+
+On the synthetic bench plane the ratio is 28.6x. The bound is 3 bytes per coefficient by
+derivation — 24 bits per context-coded decision, 8 per bypass, 256 bits of tail — which is loose
+by a factor of about 50 on a zero coefficient and is the whole of the 22-29x.
+
+**`CountThenEmit` is the default because it needs no bound at all**, and its overflow flag can
+therefore only fire if the two passes disagree with each other. `BoundedSlots` exists because one
+coder pass may well be worth 17 MB of scratch, and the point is that one idle-machine run can flip
+the default without touching a line of coder code: the bytes are identical either way, which is
+asserted rather than assumed. Decision
+[0024](docs/decisions/0024-the-gpu-abac-encoder-counts-before-it-writes.md) has the reasoning,
+including the two rejected alternatives — a heuristic slot with a panic behind it, which is BUG-22
+exactly (7.8-10.9 dB at q=90 when a Huffman stream spilled into its neighbour's 512-byte slot), and
+an atomic bump allocator with chunk chaining, which reintroduces the unbounded per-block structure
+it was meant to remove.
+
+### The canary
+
+`GNC_DIAGNOSTICS=1` on any abac encode, per plane:
+
+```text
+  [abac-gpu] plane 8x5 tiles: abac_blocks=1000 (empty=0) bytes=769006 scratch=770516
+             passes=2 coder=Range cb=64 sizing=CountThenEmit
+```
+
+Not a formality here. A shader that silently fell back to the CPU coder would pass criteria 1, 2
+and 4 *by construction*, so those three cannot detect the failure most likely to occur. The
+`EncodeStats` the line is built from is also asserted against the returned tiles in the test, so
+the canary cannot drift from what happened.
+
+### Two porting facts, both of which could have been silent bugs
+
+- **`low` is u64 in `abac.rs` and WGSL has no u64.** Emulated as (low 32 bits, carry *count*), with
+  every use in the Rust mapped term for term. `carry` is a count, not a flag: the argument that at
+  most one carry can be pending needs `shift_low` to run between two `low += bound`, and the
+  renormalisation loop does not run while `range` stays above `RC_TOP`. Counting costs one
+  instruction and is exact whether the argument holds or not. The all-minus-one and all-(-9999)
+  planes are what exercise the 0xFF-run carry propagation; nothing else does.
+- **The neighbourhood sum saturates on the CPU (`saturating_add`) and wraps in both shaders.**
+  `abac_decode.wgsl` has always used a plain add, so the encoder matches it and the GPU pair agrees
+  with itself; both diverge from the CPU reference only if four neighbour magnitudes sum past 2^32,
+  which needs a coefficient near 2^30 and cannot happen in this codec. The encode shader raises a
+  flag at 2^29 and the host panics on it, so this is **checked on every encode** rather than
+  argued. Making the decoder saturate would add four ops per coefficient to the hottest loop behind
+  a measured 1.69x decode figure, for a case that cannot occur — declined.
+
+### Also landed, and why it is not scope creep
+
+`encode-sequence` gained `--cpu-encode`. Without it there is no way to compare the GPU and CPU
+entropy encoders over the sequence path at all, and that path is two of the three `encode_entropy`
+call sites — including the only one that codes P-frame residuals. A GPU encoder whose only
+verification skipped two thirds of its call sites would be a silent feature in the sense CLAUDE.md
+means.
+
+### What this does not do
+
+- It does not make abac the default. 0017's reason 1 (1.69x frame decode) is untouched, reason 3
+  (inter) is still blocked on BUG-18 via ENT-3, and reason 2's figure is unmeasured.
+- It does not touch `use_gpu_encode` or `sequence.rs`'s frame-pipeline selection. ARCH-3 owns that,
+  was in flight in another session while this was built, and this is orthogonal to it by design
+  rather than by luck: after ARCH-3 lands, abac's video path picks up the correct frame pipeline
+  with no change here.
+- It changes no bitstream. `abac_gpu_sizing` is host-side only and never reaches the file.
+
+**Gates:** `cargo test --release --  --test-threads=1` — 222 tests pass, 0 failed (179 lib +
+43 integration, three of them new). `cargo clippy --release` clean,
+`cargo clippy --release --target wasm32-unknown-unknown --lib` clean. The full wasm target still
+fails with BUG-24's 11 pre-existing `GpuContext::new` errors in the bin target, unchanged in count
+and location.
+
+---
+
 ## ARCH-3 + BUG-18 — one frame encoder, and abac's inter figure is measurable again (2026-09-07)
 
 **Hypothesis.** `gpu_entropy_encode` reads as "entropy-encode on the GPU" and in `sequence.rs`

@@ -40,6 +40,7 @@ pub struct EncoderPipeline {
     pub(super) variance: VarianceAnalyzer,
     pub(super) motion: super::motion::MotionEstimator,
     pub(super) gpu_encoder: GpuRansEncoder,
+    pub(super) gpu_abac_encoder: super::abac_gpu_encode::GpuAbacEncoder,
     pub(super) gpu_rice_encoder: GpuRiceEncoder,
     pub(super) gpu_huffman_encoder: GpuHuffmanEncoder,
     pub(super) deinterleaver: PlaneDeinterleaver,
@@ -715,6 +716,7 @@ impl EncoderPipeline {
             variance: VarianceAnalyzer::new(ctx),
             motion: super::motion::MotionEstimator::new(ctx),
             gpu_encoder: GpuRansEncoder::new(ctx),
+            gpu_abac_encoder: super::abac_gpu_encode::GpuAbacEncoder::new(ctx),
             gpu_rice_encoder: GpuRiceEncoder::new(ctx),
             gpu_huffman_encoder: GpuHuffmanEncoder::new(ctx),
             deinterleaver: PlaneDeinterleaver::new(ctx),
@@ -2466,6 +2468,7 @@ impl EncoderPipeline {
             for p in 0..3 {
                 encode_entropy(
                     &mut self.gpu_encoder,
+                    &mut self.gpu_abac_encoder,
                     ctx,
                     qbufs[p],
                     plane_pixels[p],

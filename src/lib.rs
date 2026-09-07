@@ -427,6 +427,10 @@ pub struct CodecConfig {
     /// problem. The environment now seeds the default and nothing reads it afterwards.
     pub abac_coder: encoder::abac::Coder,
     pub abac_code_block: u32,
+    /// How the GPU abac encoder places its variable-length code-block streams. Host-side only:
+    /// both modes produce identical bytes, so this never reaches the bitstream. Config rather
+    /// than environment for the same reason as the two fields above.
+    pub abac_gpu_sizing: encoder::abac_gpu_encode::Sizing,
     /// Transform type: Wavelet (default) or BlockDCT8 (fewer dispatches, faster).
     pub transform_type: TransformType,
     /// DCT frequency-dependent quantization strength.
@@ -551,6 +555,7 @@ impl Default for CodecConfig {
             use_fused_quantize_histogram: false,
             abac_coder: encoder::entropy_helpers::abac_coder_from_env(),
             abac_code_block: encoder::entropy_helpers::abac_cb_from_env(),
+            abac_gpu_sizing: encoder::abac_gpu_encode::Sizing::from_env(),
             transform_type: TransformType::Wavelet,
             dct_freq_strength: 7.0,
             intra_prediction: false,
@@ -894,6 +899,7 @@ pub fn quality_preset(q: u32) -> CodecConfig {
         use_fused_quantize_histogram: true, // auto-disabled when CfL is active
         abac_coder: encoder::entropy_helpers::abac_coder_from_env(),
         abac_code_block: encoder::entropy_helpers::abac_cb_from_env(),
+        abac_gpu_sizing: encoder::abac_gpu_encode::Sizing::from_env(),
         transform_type: TransformType::Wavelet, // block DCT opt-in via config override
         dct_freq_strength: 7.0,
         // Intra prediction is off by default: measured at -11.76 dB / +29% bitrate on lossy

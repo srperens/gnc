@@ -168,6 +168,12 @@ GNC has five entropy coding backends, all decoding as GPU compute shaders:
 | **Rice+ZRL** (default above q=20) | 256 | Golomb-Rice + zero-run | — | — | None |
 | rANS (`--rans`, default at q≤20) | 32 | Range asymmetric numeral systems | −6.4% at q=10, +0.4% at q=25; cannot encode above q≈76 | ~1.15× (TUNE-3, not re-measured) | Possible (MS patent) |
 | abac (`--abac`) | 1 per 64px code-block | Adaptive binary arithmetic, context-modelled | −16.6% to −18.8% at q=50–90 | **1.69×** (idle-machine bench) | None known |
+
+abac encodes on the GPU as well as decoding there (ENT-5): one thread per code-block, bit-exact
+against the CPU coder in `abac.rs` — 98 of 98 whole-file comparisons byte-identical across four
+stills, q=60–100, both arithmetic engines, 4:4:4/4:2:2/4:2:0 and an 8-frame sequence.
+**Its encode time per frame is not measured**: four sessions were working this M1 when it landed,
+and a throughput figure taken under load is worth nothing here. `docs/decisions/0024`.
 | Huffman (parked) | 256 | 64-symbol + escape | not measured | not measured | None |
 | Bitplane (parked) | Per-block | Sign + magnitude bitplanes | not measured | not measured | None |
 

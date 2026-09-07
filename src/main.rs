@@ -370,7 +370,8 @@ enum Command {
         huffman: bool,
 
         /// Use the adaptive binary code-block coder (abac). Smallest files measured — −16.7% mean
-        /// against Rice at q=90 — at about 1.69x Rice's frame decode. CPU encode, GPU decode.
+        /// against Rice at q=90 — at about 1.69x Rice's frame decode. GPU encode and GPU decode
+        /// since ENT-5; encode time per frame is not yet measured on an idle machine.
         #[arg(long)]
         abac: bool,
 
@@ -452,7 +453,8 @@ enum Command {
         huffman: bool,
 
         /// Use the adaptive binary code-block coder (abac). Smallest files measured — −16.7% mean
-        /// against Rice at q=90 — at about 1.69x Rice's frame decode. CPU encode, GPU decode.
+        /// against Rice at q=90 — at about 1.69x Rice's frame decode. GPU encode and GPU decode
+        /// since ENT-5; encode time per frame is not yet measured on an idle machine.
         #[arg(long)]
         abac: bool,
 
@@ -645,6 +647,12 @@ enum Command {
         /// verified correct but its contexts were tuned on intra coefficients and never retuned.
         #[arg(long)]
         abac: bool,
+
+        /// Use CPU entropy encoding instead of GPU. Present here for the same reason as on
+        /// `encode`: it is the only way to check that a GPU entropy encoder produces the CPU
+        /// reference's exact bytes over the sequence path, which `encode` alone cannot reach.
+        #[arg(long)]
+        cpu_encode: bool,
 
         /// Enable per-frame encode diagnostics (also via GNC_DIAGNOSTICS=1)
         #[arg(long)]
@@ -3012,6 +3020,7 @@ fn main() {
             rans,
             rice,
             abac,
+            cpu_encode,
             diagnostics,
             temporal_wavelet,
             chroma_format,
@@ -3090,6 +3099,9 @@ fn main() {
             }
             if abac {
                 config.entropy_coder = gnc::EntropyCoder::Abac;
+            }
+            if cpu_encode {
+                config.gpu_entropy_encode = false;
             }
 
             config.chroma_format = parse_chroma_format(&chroma_format);

@@ -35,9 +35,13 @@ Modular pipeline with swappable stages:
    - **rANS** (`--rans`): 32 interleaved streams per tile, per-subband frequency tables
    - **Huffman** (parked): 64-symbol + escape
    - **Bitplane** (parked): block-based, fully parallel decode
-   - **abac** (`--abac`): adaptive binary arithmetic coding over 64px code-blocks, CPU encode,
-     GPU decode. −16.6% to −18.8% of rate against Rice at *identical pixels*, for ~1.69× frame
-     decode. Opt-in, intra-measured only — `docs/decisions/0017`
+   - **abac** (`--abac`): adaptive binary arithmetic coding over 64px code-blocks, GPU encode
+     *and* GPU decode (one thread per code-block on both sides, since ENT-5), with the CPU coder
+     in `abac.rs` as the reference both are verified byte-exact against. −16.6% to −18.8% of rate
+     against Rice at *identical pixels*, for ~1.69× frame decode. Opt-in, intra-measured only —
+     `docs/decisions/0017`, and `0024` for the encoder's two judgement calls. **Encode time per
+     frame is not yet measured on an idle machine**, so 0017's reason 2 has lost its mechanism but
+     kept its number.
 5. Video: I/P/B frames, half-pel motion estimation, hierarchical block matching, CBR/VBR rate control
 6. Container: GNV1 sequence format with frame index, keyframe seeking, error resilience (per-tile CRC-32)
 

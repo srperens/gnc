@@ -36,6 +36,15 @@ and leave Rice as the default at every quality preset.
    default. It is also fixable — the work is parallel across ~3000 code-blocks — but it is not
    fixed today, and defaults should not carry work that has not been done.
 
+   **Updated 2026-09-07 (ENT-5): the mechanism is gone, the number is not.** abac now encodes on
+   the GPU, one thread per code-block, bit-exact against `abac.rs` — 98 of 98 whole-file
+   comparisons byte-identical. So "encode is CPU-side and single-threaded" is no longer true.
+   **What has not been measured is how long the GPU encode takes**: the machine had four sessions
+   on it and COORDINATION forbids a wall-clock figure under load. Until that run happens this
+   reason has lost its cause and kept its 129 ms, which is not the same as being discharged.
+   `tests/abac_bench.rs::abac_encode_throughput_grid` is the instrument.
+   See [0024](0024-the-gpu-abac-encoder-counts-before-it-writes.md).
+
 3. **Inter frames are unmeasured.** This reason was withdrawn on 2026-09-07 when inter was
    measured at −14.4%, and then **reinstated the same day when that measurement was retracted**:
    abac's video path is the CPU-entropy P-frame path, and BUG-18 shows that path encodes every

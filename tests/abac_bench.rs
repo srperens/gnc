@@ -195,3 +195,121 @@ fn abac_cpu_decode_throughput() {
     }
     println!();
 }
+
+/// Encode throughput, which is what ENT-5 exists to change.
+///
+/// Decision 0017 keeps abac opt-in for three reasons and the second is this one: **129 ms of CPU
+/// encode per 1080p frame against Rice's 23 ms.** So the figure that matters is not Mcoeff/s in
+/// the abstract, it is the GPU encode step's cost per frame against that 129 ms — and the CPU arm
+/// is timed in the same process on the same input, because two numbers from two runs is how the
+/// earlier null results happened.
+///
+/// The GPU rows time the whole `encode_plane_to_tiles` call: dispatches, the lengths readback, the
+/// stream readback and the host-side cut into tiles. That is the honest unit — it is what the
+/// encoder pays — and it is why the CPU row times `abac_encode_tile` over the same plane rather
+/// than a bare `encode_block` loop.
+///
+/// Both output-sizing modes are here because which is faster is the open question ENT-5 was asked
+/// to measure rather than pick: `CountThenEmit` runs the coder twice into an exactly-sized buffer,
+/// `BoundedSlots` runs it once into a provably-bounded one and then compacts. The bytes are
+/// identical either way (`tests/abac_gpu_encode.rs`), so this is purely a throughput choice.
+#[test]
+#[ignore = "throughput bench: needs an idle machine, see COORDINATION.md"]
+fn abac_encode_throughput_grid() {
+    use gnc::encoder::abac_gpu_encode::{GpuAbacEncoder, Sizing};
+    use gnc::encoder::abac_tile::abac_encode_tile;
+    use wgpu::util::DeviceExt;
+
+    // 24, not 7: seven dispatches do not outlast the GPU's clock ramp.
+    const REPEATS: usize = 24;
+    // A padded 1080p luma plane at the shipped tile size: 8x5 tiles of 256 px, 1000 code-blocks.
+    let (ts, tx, ty, levels, cb) = (256u32, 8usize, 5usize, 5u32, 64u32);
+    let (w, h) = (tx * ts as usize, ty * ts as usize);
+    let plane = synth_plane(w, h, 17);
+    let mcoeff = (w * h) as f64 / 1e6;
+
+    let ctx = gpu();
+    let mut enc = GpuAbacEncoder::new(ctx);
+    let floats: Vec<f32> = plane.iter().map(|&v| v as f32).collect();
+    let input = ctx
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("bench_input"),
+            contents: bytemuck::cast_slice(&floats),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+
+    println!(
+        "\nabac encode throughput — one {w}x{h} plane ({mcoeff:.2} Mcoeff), best of {REPEATS}\n\
+         A 4:4:4 frame is 3 planes, so the frame column is 3 x the plane column.\n\
+         Reference: decision 0017 records 129 ms/frame of CPU encode against Rice's 23 ms.\n"
+    );
+    println!(
+        "  {:<26} {:>8} {:>10} {:>10} {:>11} {:>9}",
+        "path", "bytes", "plane ms", "frame ms", "Mcoeff/s", "med/best"
+    );
+
+    let row = |label: String, times: Vec<f64>, bytes: usize| {
+        let best = times.iter().cloned().fold(f64::MAX, f64::min);
+        let med = median(times);
+        println!(
+            "  {:<26} {:>8} {:>10.2} {:>10.2} {:>11.1} {:>8.2}x",
+            label,
+            bytes,
+            best * 1e3,
+            best * 3e3,
+            mcoeff / best,
+            med / best
+        );
+    };
+
+    for coder in [Coder::Range, Coder::Interval] {
+        for sizing in [Sizing::CountThenEmit, Sizing::BoundedSlots] {
+            // One untimed call so the cached buffers are at their final size and the shader is
+            // warm; without it the first repeat measures buffer creation.
+            let _ = enc.encode_plane_to_tiles(ctx, &input, w, tx, ty, ts, levels, cb, coder, sizing);
+            let mut times = Vec::with_capacity(REPEATS);
+            let mut bytes = 0usize;
+            for _ in 0..REPEATS {
+                let t0 = std::time::Instant::now();
+                let tiles =
+                    enc.encode_plane_to_tiles(ctx, &input, w, tx, ty, ts, levels, cb, coder, sizing);
+                times.push(t0.elapsed().as_secs_f64());
+                bytes = tiles.iter().map(|t| t.block_data.len()).sum();
+            }
+            row(format!("GPU {coder:?}/{sizing:?}"), times, bytes);
+        }
+    }
+
+    // The CPU arm: the same plane, the same tiles, the coder abac ships with. Fewer repeats
+    // because it is two orders of magnitude slower and the ramp argument does not apply to it.
+    for coder in [Coder::Range, Coder::Interval] {
+        let mut times = Vec::with_capacity(3);
+        let mut bytes = 0usize;
+        for _ in 0..3 {
+            let t0 = std::time::Instant::now();
+            let mut b = 0usize;
+            for tiy in 0..ty {
+                for tix in 0..tx {
+                    let mut coeffs = Vec::with_capacity(ts as usize * ts as usize);
+                    for y in 0..ts as usize {
+                        let r = (tiy * ts as usize + y) * w + tix * ts as usize;
+                        coeffs.extend_from_slice(&plane[r..r + ts as usize]);
+                    }
+                    b += abac_encode_tile(&coeffs, ts, levels, cb, coder)
+                        .block_data
+                        .len();
+                }
+            }
+            times.push(t0.elapsed().as_secs_f64());
+            bytes = b;
+        }
+        row(format!("CPU {coder:?} (1 thread)"), times, bytes);
+    }
+
+    println!(
+        "\n  med/best near 1.0 means the run was settled and the absolute numbers can be quoted.\n\
+         The bytes column must be identical across every row: the GPU encoder is bit-exact\n\
+         against the CPU one, so any difference here is a bug and not a trade-off.\n"
+    );
+}

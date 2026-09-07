@@ -2,6 +2,7 @@ pub mod abac;
 pub mod abac_compare;
 pub(crate) mod coef_entropy_diag;
 pub mod abac_gpu;
+pub mod abac_gpu_encode;
 pub mod abac_tile;
 pub mod adaptive;
 pub mod bitplane;

@@ -978,6 +978,83 @@ does, and it is the first command `docs/GPU_TIER_TEST.md` tells you to run on a 
 The count is now simply not asserted. And CLAUDE.md's argument against parallel role-based agents
 rested on *"the hardware is one M1 with 8 GPU cores"* — the contention argument survives, the
 hardware claim in it does not, so it now says "one machine with one GPU".
+### BUG-31 — abac's two GPU shaders ask for more workgroup memory than the device is created with (todo, P2)
+
+Filed 2026-09-08 by ENT-5, found by reading **BUG-29**'s new limits table rather than by hitting
+it. Nothing fails on this machine, and that is the whole point: the check that would fail is one
+this stack does not perform and a browser does.
+
+**The two numbers.** `abac_decode.wgsl` and `abac_encode.wgsl` each declare
+
+```wgsl
+var<workgroup> probs: array<u32, 576>;    //  2 304 B
+var<workgroup> rows:  array<u32, 4096>;   // 16 384 B
+```
+
+**18 688 B**, used by every entry point that codes (`main`, `main_rc` in both files). `GpuContext`
+requests `wgpu::Limits::default()` with only `max_storage_buffers_per_shader_stage` overridden, and
+`Limits::default()` sets `max_compute_workgroup_storage_size: 16384` (wgpu-types 24.0.0). So the
+shaders are **2 304 B over the limit the device was created with**, on both sides of the codec.
+
+**Why it runs anyway, and why that is not reassuring.** `max_compute_workgroup_storage_size`
+appears **zero** times in `wgpu-core-24.0.5`'s `validation.rs` and `device/resource.rs` — the
+limit is negotiated with the adapter and reported back, and never checked against a shader at
+pipeline creation. Native Metal therefore honours the 32 KB the hardware has and the requested
+16 KB is a number nobody enforces. A conformant WebGPU implementation *does* enforce it: it is a
+spec validation rule, and 16384 is the spec's guaranteed minimum, not an accident of wgpu's
+defaults.
+
+**The reachable consequence is bigger than abac.** `DecoderPipeline::new` constructs
+`GpuAbacDecoder::new(ctx)` unconditionally (`src/decoder/pipeline.rs:296`), and the WASM entry
+point `wasm::decode_gnc` builds a `DecoderPipeline` for every call. So if that validation bites,
+it bites at pipeline construction — **every WASM decode fails, not only abac ones.** Rice files
+included. `EncoderPipeline::new` now constructs `GpuAbacEncoder::new(ctx)` the same way, which is
+ENT-5's doing; the encoder is not exposed to JS today, so the decoder is the path that matters.
+
+**Unverified in a browser, and that is the first thing to do.** The chain above is four verified
+static facts and one spec rule. Run the WASM decode in a browser before designing a fix: if it
+passes, this is P3 documentation; if it fails, the failure will be at `DecoderPipeline::new` with a
+validation error naming the workgroup size, and nothing else in the repository has ever exercised
+that path.
+
+### Three fixes, and they are not equivalent
+
+1. **Ask for what we use** — `max_compute_workgroup_storage_size: 32768` in `required_limits`,
+   beside the `max_storage_buffers_per_shader_stage: 10` already there. One line, no shader change,
+   no bitstream change, and it makes the requirement honest rather than accidentally satisfied.
+   The cost is real: device creation then *fails* on any adapter offering only the spec minimum,
+   which is every conformant baseline device. GNC already requests above baseline for storage
+   buffers (10 against WebGPU's 8), so this is a decision the project has made once before — but
+   it makes it a second time and harder.
+2. **32 threads → 24 per workgroup** — 14 016 B, fits the baseline, no shader logic change.
+   **Read `abac_decode.wgsl`'s workgroup-memory comment before costing this**: both arrays are
+   indexed `[i * WG + tid]` precisely so lane `tid` lands in Metal bank `tid`, and the comment
+   records that getting that wrong is invisible — bit-exact and "dramatically slower". With
+   WG = 24 against 32 banks the bank-per-lane property is gone, so this trades a limits violation
+   for a bank-conflict pattern that no test can see. It needs the abac bench, on an idle machine.
+3. **Pack the magnitudes four to a word** — `rows` becomes 4 096 B and the total 6 400 B, well
+   inside the baseline, and the interleaving survives intact. Costs a shift-and-mask per
+   neighbour read in the hottest loop of both shaders. Also on the bench.
+
+**Success criterion:** both shaders' declared workgroup storage ≤ 16 384 B with
+`Limits::default()` *or* the requested limit raised deliberately with that trade recorded; and
+`tests/abac_gpu.rs` plus `tests/abac_gpu_encode.rs` still green, since any of these fixes must be
+bit-exact — abac's output is byte-identical between CPU and GPU on 98 of 98 files today and a fix
+here must not move a single byte.
+
+**Canary, and it cannot be a runtime check.** Native wgpu will not fail, so a test that builds the
+pipelines proves nothing. The assertion has to be static: parse `var<workgroup>` declarations out
+of the `.wgsl` files, sum them per file, and assert against
+`wgpu::Limits::default().max_compute_workgroup_storage_size`. That runs in CI on any machine,
+catches every shader rather than these two, and would have caught this on the day abac's decoder
+landed.
+
+**Why P2.** No measurement is invalidated, no shipped figure is wrong, and nothing fails on the
+machine the project runs on — the same reasons BUG-28 is P2. Against that: CLAUDE.md makes "WASM
+target must work" a hard requirement, the affected path is *every* decode on that target rather
+than an opt-in coder's, and fix 1 is one line. It is P1 if a browser run confirms the failure, and
+P3 if it shows the limit is not enforced there either.
+
 ### PERF-2 — the per-dispatch uniform buffers need dynamic offsets, not a cached UBO (todo, P3)
 
 Filed 2026-09-08 by PERF-1, which verified the sites and then declined the fix as specified.

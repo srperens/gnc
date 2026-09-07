@@ -46,7 +46,7 @@ Modular pipeline with swappable stages:
 5. Video: I/P/B frames, half-pel motion estimation, hierarchical block matching, CBR/VBR rate control
 6. Container: GNV1 sequence format with frame index, keyframe seeking, error resilience (per-tile CRC-32)
 
-Shader source is in `src/shaders/*.wgsl` (63 shaders). Rust host code is in `src/encoder/` and `src/decoder/`.
+Shader source is in `src/shaders/*.wgsl`. Rust host code is in `src/encoder/` and `src/decoder/`.
 
 ## Platform Notes
 

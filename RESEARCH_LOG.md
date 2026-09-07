@@ -9448,3 +9448,122 @@ was the opposite of what the control now shows.
 - **Rate/quality only. No throughput number is quoted here and none should be:** the machine ran at
   load 57 with four other sessions for the whole sweep. Every figure above is bytes, dE00 or PSNR,
   all deterministic and unaffected.
+
+---
+
+## 2026-09-07 — MEAS-3: the inter path's rate saving does not survive being measured at matched quality
+
+Every RD curve in this repository is a single still. The video path has only ever been compared at
+**equal settings** — "all-I 7.32 bpp against current 5.34 bpp, −27.0%" (2026-03-11 ablation) with
+VMAF 99.09 against 99.10 offered as evidence the quality matched. Both halves of that are the
+failure modes COORDINATION lists: a point comparison at fixed q cannot judge a rate/quality trade
+(rule 4), and VMAF at 99.1 has no signal left to prove anything with (rule 3).
+
+Measured as BD-rate instead, **the saving is not there.**
+
+### Setup
+
+`scripts/meas3_sequence_rd.py` over the shipped binary — `benchmark-sequence` already has
+`--vmaf` and `--chroma-format`, so MEAS-3's premise that "rd-curve lacks" them needed no encoder
+change, only a harness. Worktree `../gnc-meas3` at `41f983d`. Three sequences, **18 frames each =
+two exact GOPs at ki=9**, 4:4:4, q=25/40/55/70/85/95. Two arms: **ki=9** (the shipped inter
+configuration) and **ki=1** (all-intra). `park_joy` from the original item does not exist in the
+test material; `old_town_cross` stands in, which matches the QUAL-1 sequence set.
+
+Machine loaded (other sessions building) — irrelevant, as every figure here is a byte count or a
+quality score. **No throughput number was taken.**
+
+### The curves
+
+crowd_run — high motion:
+
+| q | ki=9 bpp | ki=9 PSNR avg / min | ki=1 bpp | ki=1 PSNR avg / min |
+|---|---|---|---|---|
+| 25 | 1.1199 | 28.82 / 27.78 | 2.4398 | 32.92 / 32.86 |
+| 40 | 1.8473 | 30.75 / 29.50 | 3.8823 | 35.73 / 35.68 |
+| 55 | 2.9790 | 32.63 / 30.90 | 5.5989 | 38.59 / 38.56 |
+| 70 | 4.7364 | 34.50 / 32.08 | 7.9580 | 42.07 / 42.06 |
+| 85 | 10.4909 | 44.99 / 44.61 | 11.6554 | 47.48 / 47.48 |
+| 95 | 15.4671 | 52.80 / 52.41 | 14.9954 | 52.41 / 52.41 |
+
+old_town_cross — camera pan:
+
+| q | ki=9 bpp | ki=9 PSNR avg / min | ki=1 bpp | ki=1 PSNR avg / min |
+|---|---|---|---|---|
+| 25 | 0.4883 | 30.95 / 30.43 | 1.4650 | 32.89 / 32.84 |
+| 40 | 0.9687 | 31.70 / 31.04 | 3.0321 | 35.27 / 35.25 |
+| 55 | 2.2658 | 33.37 / 32.65 | 5.0240 | 38.17 / 38.16 |
+| 70 | 4.3142 | 35.48 / 34.48 | 7.5061 | 41.85 / 41.84 |
+| 85 | 10.6406 | 44.99 / 44.66 | 11.1061 | 47.46 / 47.46 |
+| 95 | 15.4824 | 52.79 / 52.40 | 14.4776 | 52.40 / 52.40 |
+
+bbb_extended — animation, low motion:
+
+| q | ki=9 bpp | ki=9 PSNR avg / min | ki=1 bpp | ki=1 PSNR avg / min |
+|---|---|---|---|---|
+| 25 | 0.3956 | 32.64 / 31.52 | 1.5993 | 35.51 / 35.50 |
+| 40 | 0.5609 | 34.46 / 33.03 | 2.2134 | 38.55 / 38.54 |
+| 55 | 0.9709 | 36.40 / 34.95 | 3.0062 | 41.18 / 41.18 |
+| 70 | 1.6671 | 38.30 / 35.81 | 4.1289 | 43.96 / 43.95 |
+| 85 | 3.9817 | 46.04 / 44.97 | 6.5930 | 48.74 / 48.74 |
+| 95 | 8.6220 | 53.05 / 52.79 | 10.0776 | 52.80 / 52.79 |
+
+### BD-rate of the inter arm against all-intra — positive means inter needs *more* bits
+
+| sequence | on mean PSNR | on **worst-frame** PSNR | on VMAF (q≤85) | VMAF overlap |
+|---|---|---|---|---|
+| crowd_run | **+15.9%** | **+32.4%** | ~~+132.4%~~ | 99.55–99.84 — **saturated, discard** |
+| old_town_cross | **+22.2%** | **+35.4%** | +35.6% | 93.43–99.81 |
+| bbb_extended | **−24.2%** | **−10.5%** | −9.9% | 92.22–98.75 |
+| **mean** | **+4.6%** | **+19.1%** | — | |
+
+**Reproduced:** bbb_extended q=70, both arms, re-run in a second process — 1.6671 / 38.30 / 35.81
+and 4.1289 / 43.96 / 43.95, identical to every digit. Deterministic, motion estimation included.
+
+### What this says
+
+**1. At matched quality the inter path is a wash at best, and on two of three sequences it is a
+loss.** Mean +4.6% on mean PSNR. The −27% that GOALS §4 quotes as "saves 17–27% vs all-I" is an
+equal-setting rate figure: at the same q the inter arm codes P and B frames deliberately coarser
+(TUNE-6 scales their quantiser 1.25× at step ≥4.6), so on crowd_run at q=70 it buys 4.7 bpp
+against intra's 8.0 bpp **while sitting 7.6 dB lower**. That is not 40% cheaper, it is a different
+operating point, and the 2026-03 run judged the quality equal on VMAF 99.09 vs 99.10 — a metric
+with nothing left to say up there.
+
+**2. Judged on the frame that matters for contribution, it is clearly worse: +19.1% mean on
+worst-frame PSNR.** The inter arm's quality is uneven by construction — crowd_run at q=70 reads
+34.50 dB mean against a 32.08 dB worst frame, while all-intra reads 42.07 / 42.06, flat to a
+hundredth. A contribution codec's output gets re-encoded downstream, so the worst frame is the one
+that sets what survives; a mean hides exactly the cost this trade incurs.
+
+**3. Above q≈85 the inter path stops paying entirely, and at q=95 it costs more than all-intra**
+on two of three sequences (crowd_run 15.47 against 14.99 bpp at PSNR 52.80 against 52.41;
+old_town_cross 15.48 against 14.48). This sharpens the recorded "GNC's crossover sits between q=75
+and q=92" into a measured statement: **at the contribution operating point the inter machinery is
+not buying anything**, which is the range GOALS §1 says the project is for.
+
+**4. It pays on low-motion animation only.** bbb_extended is −24.2% on mean PSNR and −10.5% on the
+worst frame — a real win, and the one sequence where prediction is easy. Consistent with MEAS-4's
+finding that the inter gap is *prediction quality*, not the coding model.
+
+### What this does not say
+
+- **Not a recommendation to drop inter coding.** Three sequences, 18 frames, one keyframe interval.
+  What it justifies is filed as **INTER-1**, not acted on here.
+- **The q=25 rows sit on the path BUG-16 concerns** (Rice's GPU and CPU encode paths disagree on
+  coefficients at q≤30). Both arms use the same GPU path, so the comparison is internally
+  consistent, but the absolute q=25 figures may move when that is fixed.
+- **The magnitude depends on how far up the ladder you integrate, and by a lot.** The
+  saturation-gate canary run — crowd_run, 9 frames, q=25–85 — reads **+59.5%** on mean PSNR where
+  the full q=25–95 run reads +15.9%, because the inter arm's disadvantage is largest at low quality
+  and closes as q rises. Same sign, very different size. So quote the range with the number: this
+  entry's figures are over 32.9–52.4 dB and a ladder stopping at q=85 makes inter look far worse.
+  That is QUAL-1's lesson about widening ladders, arriving from the other direction. (The same run
+  is the canary for the VMAF gate below: it printed `DISCARDED — overlap 99.10–99.68 is saturated,
+  nothing to integrate (the arithmetic said +120.2%)`.)
+- **crowd_run's VMAF BD-rate is not a number and is struck out above.** Its overlap is
+  99.55–99.84: the all-intra arm is already saturated at q=25, so there is no range in which the
+  two curves can be compared on VMAF at all. Reporting +132.4% would have been the single most
+  dramatic figure in this entry and it means nothing. This is the third time a saturated VMAF has
+  offered a spectacular number here; the harness now prints the overlap next to every VMAF
+  BD-rate so the reader can see it, rather than trusting the q≤85 cap to be enough.

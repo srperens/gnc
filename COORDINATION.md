@@ -354,7 +354,41 @@ wrong conclusions have come from this one error.
 
 ## Landed today, and what each one invalidates
 
-- **GPU selection from the environment, and a tier/density harness — invalidates nothing.**
+- **MEAS-3 — the inter path's rate saving does not survive matched quality. Invalidates a GOALS
+figure; changes no default.** BD-rate of the shipped ki=9 configuration against all-intra, three
+sequences, 18 frames, q=25-95, 4:4:4: **+15.9% (crowd_run), +22.2% (old_town_cross), −24.2%
+(bbb_extended), mean +4.6% on mean PSNR — and mean +19.1% on worst-frame PSNR.** Positive means
+inter needs *more* bits. Above q≈85 the saving is gone; at q=95 inter costs more than all-intra on
+two of three sequences. Decision record 0019; the follow-up is BACKLOG **INTER-1**, unclaimed.
+
+Three things to carry:
+
+- **GOALS §4's "the inter path saves only 17-27% vs all-I" is annotated, not deleted** — it is an
+  equal-setting rate figure. At q=70 on crowd_run the inter arm spends 4.74 bpp against intra's
+  7.96 *while sitting 7.6 dB lower*, and the 2026-03 run judged that quality equal on VMAF 99.09
+  vs 99.10. **Any inter-vs-intra rate claim in this repo predating today is suspect** unless it
+  names a BD-rate or a matched-quality point.
+- **Quote worst-frame PSNR next to the mean for anything touching the inter path.** The mean says
+  +4.6%, which reads as neutral; the worst frame says +19.1%, and for a contribution codec the
+  worst frame is what survives downstream re-encoding. crowd_run q=70: inter 34.50 mean / 32.08
+  worst, all-intra 42.07 / 42.06.
+- **A q≤85 cap does not make a VMAF BD-rate safe.** crowd_run's overlap came out 99.55-99.84
+  because the *all-intra* arm is already saturated at q=25, and the arithmetic produced +132.4% —
+  the most dramatic number in the run and not a number at all. `meas3_sequence_rd.py` now prints
+  the overlap beside every VMAF BD-rate and discards one whose floor exceeds 99. Worth copying
+  into any harness that reports a VMAF BD-rate.
+- **`git checkout --theirs .` after resolving a stash-pop conflict silently threw away three other
+  sessions' work** — mine, in this worktree, on 2026-09-07. The two files were resolved correctly
+  in the working tree but still marked `UU`, so that command replaced them with the stash side
+  alone: RESEARCH_LOG lost the ABAC-SHIP, ENT-2 and MEAS-9 entries and COORDINATION reverted to a
+  base predating three merges. Nothing was pushed — it was caught by counting the other sessions'
+  headings before committing, and both files were rebuilt from `origin/main` plus the new block.
+  **After resolving a conflict, `git add` the file; never run a bulk `checkout --ours/--theirs` to
+  "clean up".** And when a conflict resolution touches a shared document, grep for the other
+  sessions' entries as a matter of course — a rebuilt file that compiles and reads fine can still
+  be missing 400 lines of someone else's day.
+
+**GPU selection from the environment, and a tier/density harness — invalidates nothing.**
   `GNC_GPU_ADAPTER` (name substring), `GNC_GPU_BACKEND`, `GNC_GPU_POWER` and `GNC_GPU_INFO` choose
   the device at context creation; `gnc gpu-info` lists what wgpu can see. Encoder output is
   unchanged and verified so — q=75 on bbb_1080p is still 44.84 dB / 4.53 bpp, matching BASELINE.

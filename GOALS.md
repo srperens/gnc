@@ -134,6 +134,15 @@ medium-cost incremental inter ideas. What it measured: the spatial layer is alre
 BD-rate +13.9% vs H.264 all-I, and *better* than H.264 all-I above ~36 dB — while the current
 I/P/B inter path saves only 17–27% vs all-I where H.264 saves 60–70%.
 
+> **Correction, MEAS-3 (2026-09-07): the 17–27% is an equal-setting rate figure and does not
+> survive as a saving.** Measured as BD-rate against all-intra on three sequences, the shipped
+> inter configuration needs **+4.6% more bits on mean PSNR and +19.1% more on worst-frame PSNR**,
+> winning only on low-motion animation (−24.2%). Above q≈85 the saving is gone and at q=95 inter
+> costs more than all-intra. The older figure compared rates at the same q, where the inter arm is
+> 7.6 dB worse on crowd_run — its quality evidence was VMAF 99.09 against 99.10, which is
+> saturated. The H.264 60–70% half of the sentence stands; it was not re-measured. See
+> `docs/decisions/0019` and BACKLOG INTER-1.
+
 **MEAS-1 (2026-09-05) measured the gap properly for the first time — at the wrong operating
 point. QUAL-1 (2026-09-06) re-measured it at the right one.** MEAS-1 found GNC needing **5-7x**
 the bitrate of H.264 (BD-rate +457% / +494% / +672%) at *distribution* bitrates, with the quality

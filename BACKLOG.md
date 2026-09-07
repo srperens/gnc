@@ -1836,9 +1836,50 @@ Systematic toggle measurement on crowd_run + park_joy, 10 frames, 4:4:4, q=75:
 - Rice vs rANS
 Each toggle: report bpp + VMAF delta. Goal: identify dead weight and negative features.
 
-### MEAS-3 — RD-curve on sequences (todo)
-Run rd-curve (q=25–90) on crowd_run and park_joy with 4:4:4, measure VMAF at each point.
-Current rd-curve lacks --chroma-format and --vmaf on sequences. A benchmark loop may suffice.
+### MEAS-3 — RD-curve on sequences (**DONE 2026-09-07**)
+
+No encoder change was needed: this item's premise ("rd-curve lacks --chroma-format and --vmaf on
+sequences") is stale, `benchmark-sequence` has both. `scripts/meas3_sequence_rd.py` loops it.
+`park_joy` is not in the test material; `old_town_cross` stood in, matching the QUAL-1 set.
+
+Three sequences, 18 frames (two exact GOPs at ki=9), 4:4:4, q=25–95, two arms: ki=9 (shipped
+inter) against ki=1 (all-intra). **BD-rate of inter against all-intra, positive meaning inter
+needs more bits:**
+
+| sequence | mean PSNR | worst-frame PSNR | VMAF (q≤85) |
+|---|---|---|---|
+| crowd_run | **+15.9%** | **+32.4%** | discarded — overlap 99.55–99.84, saturated |
+| old_town_cross | **+22.2%** | **+35.4%** | +35.6% |
+| bbb_extended | **−24.2%** | **−10.5%** | −9.9% |
+| **mean** | **+4.6%** | **+19.1%** | |
+
+**The inter path's rate saving does not survive being measured at matched quality.** GOALS §4's
+"saves 17–27% vs all-I" is an equal-setting figure whose quality evidence was VMAF 99.09 vs 99.10;
+at the same q the inter arm codes P and B frames coarser on purpose (TUNE-6), so on crowd_run at
+q=70 it spends 4.7 bpp against intra's 8.0 **while sitting 7.6 dB lower**. Above q≈85 it stops
+paying at all, and at q=95 it costs *more* than all-intra on two of three sequences. Full tables
+and caveats in RESEARCH_LOG; the reversal is decision record 0019.
+
+### INTER-1 — The inter path is a loss at contribution quality; decide what it is for (todo, P1)
+
+MEAS-3 measured the shipped I/P/B configuration against all-intra as BD-rate and found **+4.6% on
+mean PSNR, +19.1% on worst-frame PSNR**, winning only on low-motion animation (bbb_extended
+−24.2%). Above q≈85 the saving is gone; at q=95 inter costs more. GNC is a contribution codec
+(GOALS §1), so that is the operating point that matters.
+
+**This is a positioning question with an engineering half, and neither is settled by MEAS-3's three
+sequences at 18 frames.** What would settle it:
+
+1. **Sweep ki** (1, 2, 4, 9) at q=85–99 on the same sequences. If the win only appears at short
+   GOPs, the default is wrong rather than the feature.
+2. **Price the worst frame deliberately.** TUNE-6's 1.25× P-frame quantiser scale is what makes the
+   inter arm's quality uneven; at contribution quality the right scale may be 1.0. That is one
+   constant and a re-measure.
+3. **Then decide whether inter stays a default at all** for a contribution codec, or becomes an
+   opt-in for the low-motion case where it demonstrably pays — the shape ABAC-SHIP used.
+
+Do **not** start by deleting the inter path: it is −24.2% on animation, and MEAS-4 located the gap
+in prediction quality, which is a fixable thing rather than a wrong architecture.
 
 ### MEAS-4 — Inter-model gap decomposition (**SUPERSEDED — original run, on dumps corrupted by BUG-7. See the re-run above.**)
 **Answer: the inter gap is prediction quality, not the coding model.** Full method, numbers and

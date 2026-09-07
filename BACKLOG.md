@@ -56,7 +56,7 @@ bother with" judgement in this repo predating 2026-09-06 was made against the wr
 Also settled: **never quote a VMAF BD-rate above about q=85** (widening the ladder moved it 47.5
 points on average, 110 on old_town, while PSNR moved 1.0). ~~And **GNC leads x264 on colour at
 matched rate** (dE00 0.611 vs 0.684) while trailing 7.4–8.8 dB on luma~~ — **that colour lead is
-withdrawn (CHROMA-2, 2026-09-07, decision 0018): the rate-matched control has x264 ahead on 6 runs
+withdrawn (CHROMA-2, 2026-09-07, decision 0020): the rate-matched control has x264 ahead on 6 runs
 of 6, on five of them without needing a chroma-QP offset and while also leading luma. GNC has no
 measured advantage over x264 on any axis at this operating point.**
 
@@ -680,7 +680,7 @@ mean of **47.5 points** (old_town: +81.1% → +191.4%) and the PSNR figure by **
 old_town VMAF reads 99.62–99.68 across a 6 dB PSNR spread — no signal left to integrate. This is
 COORDINATION rule 3 with a magnitude attached.
 
-**Colour reverses at matched rate.** ~~(Withdrawn 2026-09-07 by CHROMA-2, decision 0018 — the
+**Colour reverses at matched rate.** ~~(Withdrawn 2026-09-07 by CHROMA-2, decision 0020 — the
 control reverses it back: x264 ahead on 6 runs of 6.)~~ CIEDE2000 on decoded RGB, rate matched to 1%: GNC 0.611 vs
 x264 0.684 (bbb), 0.911 vs 0.949 (old_town) — GNC better on mean and 95th percentile on all three
 sequences, with fewer pixels past the JND, **while losing luma by 7.4–8.8 dB at the same points.**
@@ -1909,7 +1909,7 @@ bisected to within 1% of GNC's bytes for each `--chroma-qp-offset` in {0,-2,-4,-
 
 **x264 wins colour 6 of 6, and on five it needs no offset — it leads colour at offset 0 while also
 leading luma by 4.1-7.4 dB.** There is no trade to price. The README, GOALS, BASELINE, POSITIONING
-and CLAUDE.md rows are withdrawn; decision 0018 records it.
+and CLAUDE.md rows are withdrawn; decision 0020 records it.
 
 **The harness control that mattered more.** RGB -> yuv -> RGB with no codec at all costs dE00
 **1.057** on bbb at 4:2:0 — ~90% of everything the codecs then scored — and on three of the six

@@ -114,7 +114,7 @@ A luma computed from decoded RGB is contaminated by chroma error and overstated 
   than a saturated reading. But at q>85, report it and lead with PSNR.
 - **A luma number alone cannot describe a rate/quality difference here.** At rate matched to 1%,
   GNC was recorded as beating x264 on dE00 while trailing 7.4–8.8 dB on luma. **The colour half
-  of that is withdrawn (CHROMA-2, decision 0018): the rate-matched control has x264 ahead on
+  of that is withdrawn (CHROMA-2, decision 0020): the rate-matched control has x264 ahead on
   colour in 6 runs of 6.** What survives is the rule, which is why it stays here — the two codecs
   allocate differently
   between luma and chroma. Quoting either half alone misleads in whichever direction suits.

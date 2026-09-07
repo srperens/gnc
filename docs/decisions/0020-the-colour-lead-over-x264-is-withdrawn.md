@@ -1,4 +1,4 @@
-# 0018 — The colour lead over x264 is withdrawn
+# 0020 — The colour lead over x264 is withdrawn
 
 **Date:** 2026-09-07
 **Status:** accepted

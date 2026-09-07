@@ -191,7 +191,7 @@ ki=9, 4:2:0, 8-bit, x264 at its defaults.
 | GNC dE00 mean / p95 | 0.611 / 1.304 | 0.911 / 1.943 | 0.837 / 1.844 |
 | x264 dE00 mean / p95 | 0.684 / 1.503 | 0.949 / 2.196 | 0.913 / 2.195 |
 
-**These two rows are withdrawn (CHROMA-2, 2026-09-07, decision 0018).** They do not reproduce —
+**These two rows are withdrawn (CHROMA-2, 2026-09-07, decision 0020).** They do not reproduce —
 the same nominal configuration now gives 32% more bytes *and* worse dE00, and the table was taken
 an hour before CHROMA-1 changed q>=85 output. The rate-matched control has **x264 ahead on colour
 in 6 runs of 6**. Do not quote them; the luma BD-rate above is unaffected.

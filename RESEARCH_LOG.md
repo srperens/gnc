@@ -8819,3 +8819,168 @@ Interval coder implied, and not the "free −20%" the early rate-only numbers im
 
 **Recommended if it is taken up:** Range, cb=64. It dominates Range at cb=32 (−13.8% vs −10.9%
 at 33.0 vs 31.4 ms) and dominates Interval on both axes at every size measured.
+
+---
+
+## 2026-09-07 — ABAC-SHIP: abac is in the bitstream. GP18, entropy type 5, −16.6% to −18.8% at identical pixels
+
+### What was open
+
+The abac track had resolved everything except shipping it. BACKLOG "EBCOT — evaluating in halves"
+Part 6 ends with three outstanding items: bitstream integration (a new generation with
+`EntropyCoder::Abac`, per-block length fields, block size in the tile header), inter frames, and a
+throughput debt of ~1.69× frame decode that GOALS §5 had already decided to accept. `abac` was a
+standalone module plus a diagnostic (`GNC_ABAC_COMPARE=1`); nothing it measured could be written
+to a file. This entry closes the first of the three. Inter is untouched.
+
+### The measurement is unusually clean, and it is worth saying why
+
+Entropy coding is **lossless**. Rice and abac code the identical quantised coefficients, so the
+two arms do not trade rate against quality — they produce the same picture at different sizes.
+Every rate figure below is therefore exact, not a BD-rate, and not subject to COORDINATION rule 4
+("a point measurement at fixed q cannot judge a rate/quality trade"). That rule exists because
+point comparisons flatter whichever arm spends more bits; here neither arm can, because PSNR is
+equal to the decimal at every point.
+
+It also makes correctness cheap to state: a divergence shows up as **different pixels**, not as
+worse ones. bbb at q=90, encoded to a file, decoded on the GPU, compared against the Rice decode
+of the same source: max |diff| **0** across 1920×1080×3.
+
+### Rate against shipped Rice, through encode → file → GPU decode
+
+Four images, PSNR identical between arms at every point (50.06 / 44.84 / 40.30 dB on bbb, etc.):
+
+| q | bbb | blue_sky | kristensara | touchdown | mean |
+|---|---|---|---|---|---|
+| 50 | −17.79% | −18.46% | −19.37% | −19.52% | **−18.78%** |
+| 75 | −14.66% | −15.75% | −19.26% | −16.83% | **−16.62%** |
+| 90 | −14.23% | −17.23% | −20.88% | −16.92% | **−17.32%** |
+| 100 (lossless) | −14.24% | −14.48% | −14.99% | −10.01% | **−13.43%** |
+
+**The prediction held.** `GNC_ABAC_COMPARE` on the same four images at q=90 predicted −16.7% mean
+(bbb −13.8, blue_sky −16.6, touchdown −16.3, kristensara −20.1). The real bitstream measures
+−17.32% (−14.2 / −17.2 / −16.9 / −20.9), i.e. every image within 0.8 points and the mean 0.6
+points *better*. The direction is right too: abac carries 25 two-byte block headers per tile where
+Rice carries a 16-byte tile header, per-group k values and 256 length fields, so integration was
+expected to gain a little rather than lose it. A shipped result landing slightly better than its
+own diagnostic — with the mechanism for the difference identified in advance — is the outcome
+that should raise the least suspicion.
+
+q=100 is the MED lossless path (`TransformType::MedPredict`, `num_levels = 0`), still bit-exact:
+PSNR `inf`, SSIM 1.0000. The predicted figure there was −14.3% mean; measured −13.4%.
+
+### The FFV1 gap, measured today rather than carried forward
+
+Lossless, against `ffmpeg -c:v ffv1 -level 3 -pix_fmt gbrp` run on the same four PNGs:
+
+| image | GNC q=100 Rice | GNC q=100 abac |
+|---|---|---|
+| bbb | +29.7% | **+11.2%** |
+| blue_sky | +25.8% | **+7.6%** |
+| kristensara | +21.0% | **+2.8%** |
+| touchdown | +19.3% | **+7.4%** |
+| mean | +23.9% | **+7.3%** |
+
+BACKLOG predicted +7.7% from the offline figures. FFV1 was re-encoded here rather than quoted,
+because the standing +25.8% was measured before LOSSLESS-1 landed and the arithmetic of carrying
+it forward would have hidden that.
+
+### A bug that produced correct rate and no picture
+
+The decode shader wrote its coefficients as `array<i32>`. Every other entropy decoder writes
+`scratch_a` as **f32**, which is what the dequantiser reads. The file was already the right size —
+the encoder was correct and the rate table above would have been unchanged — but PSNR came back
+`NaN`, because −1 as i32 is `0xFFFFFFFF`, a quiet NaN as f32. Positive coefficients decoded as
+denormals and negative ones as NaN.
+
+Worth keeping for the shape rather than the fix: **the rate was right while the picture was
+absent.** A benchmark that reported bpp and skipped quality would have recorded a −14.2% win.
+
+### Not abac: Rice's two encode paths do not agree (filed as BUG-16)
+
+Found while writing the subsampled-chroma test, and now pinned by
+`rice_gpu_and_cpu_encode_paths_differ_at_subsampled_chroma` so it is not re-found as an abac bug:
+
+| configuration | Rice GPU encode | Rice CPU encode |
+|---|---|---|
+| bbb, q=25, 4:4:4 | 35.51 dB, 415 544 B | **35.63 dB**, 610 264 B |
+| bbb, q=90, 4:4:4 | 50.06 dB, 2 091 447 B | 50.06 dB, 2 275 767 B |
+| synthetic, q=75, 4:2:2 | — | max abs pixel diff **1.69** against the GPU path |
+
+Both arms are Rice, so entropy coding is not the difference — **different PSNR means different
+coefficients**, not merely different coding of the same ones. Note the q=90 row: there the two
+paths agree to the decimal and differ only in size, which is the *expected* difference (the CPU
+reference lacks per-stream k and the checkerboard k-context, so it is simply a worse coder). At
+q=25 they disagree on the picture.
+
+**The obvious suspect is ruled out by the q=90 row.** The fused quantize+histogram shader runs
+only on the GPU encode path (`use_fused_qh = … && use_gpu_encode && !use_cfl`), so "fused is
+active" looked like the explanation — but CfL is already off at q=90 (`GNC_NO_CFL=1` there changes
+nothing: 8.07 bpp either way), so fused is active at q=90 too, and the paths agree. Being on the
+fused path is therefore necessary at most, not sufficient.
+
+What is left is the quantiser: dead zone 0.75 and step 16.0 at q=25, against ~0.05 and ~2.2 at
+q=90; q=50/75 have the wide dead zone but CfL on, which disables fused, so they cannot separate
+the two. The GPU path emits the *smaller and worse* file at q=25, i.e. it discards something the
+CPU path keeps — which fits a dead-zone or rounding difference between the fused shader and the
+separate quantise shader, and does not fit a coding difference. **Filed as BUG-16, not chased
+here**; it is a Rice-path defect on the default coder at low quality and deserves its own item.
+It is why the q=25 row is **absent** from the rate
+table above: abac takes the CPU encode path, so at q=25 the two arms differ by 0.12 dB and a
+percentage between them is not a rate figure. Both *configurations* favour abac there — smaller by
+13.97% to 18.39% and higher by 0.11 to 0.13 dB — but the dB is the CPU encode path's doing, not
+the entropy coder's, and attributing it to abac would be exactly the confounding this note exists
+to flag. The clean rows are q=50/75/90/100, where quality is equal.
+
+Note also that Rice-on-CPU is much *larger* than Rice-on-GPU (610 264 B vs 415 544 B on bbb at
+q=25) because the CPU reference lacks per-stream k and the checkerboard k-context. Comparing abac
+against the CPU Rice would have read −44% and been nonsense. The baseline is the shipped encoder.
+
+### What shipped
+
+- `EntropyCoder::Abac` / `EntropyData::Abac` / `--abac`; `entropy_type = 5` behind a new **GP18**
+  generation. GP18 adds nothing else — a GP18 frame using any older coder is byte-identical to the
+  GP17 one apart from four magic bytes — but a GP17 decoder rejects type 5 rather than
+  misinterpreting it.
+- `src/encoder/abac_tile.rs`: the tile container, and `code_blocks()` as the **single** definition
+  of the geometry. The encoder, the CPU decoder and the GPU packer all call it. A second copy of
+  that loop is how a coverage bug gets in, and a coverage bug here makes the file *smaller* while
+  every individual block still round-trips — no roundtrip test would catch it. Both the encoder and
+  a unit test assert exact coverage.
+- Block lengths are uvarints: block size spans three orders of magnitude inside one tile, and a
+  flat u32 table would cost ~120 KB per 1080p 4:4:4 frame.
+- The arithmetic engine is recorded **per tile**, one byte. The two engines share a binarisation
+  but not a bitstream, and a decoder that guesses wrong reconstructs a plausible wrong image
+  rather than failing.
+- Defaults: **Range at cb=64**. `GNC_ABAC_CODER=interval` and `GNC_ABAC_CB` override; `cb` is
+  rejected above 64 at encode time rather than at dispatch, because `abac_decode.wgsl` sizes its
+  workgroup scratch for 64.
+- Canary: `GNC_DIAGNOSTICS=1` prints `[abac] plane 8x5 tiles: abac_blocks=1000 (empty=0)
+  bytes=769006 coder=Range cb=64` per plane — 40 tiles × 25 blocks, no empty blocks.
+- Encode is CPU (a serial adaptive coder), decode is GPU, one thread per code-block, blocks sorted
+  by area at pack time so a SIMD group holds equal-sized work.
+
+### What did not move, and what is still open
+
+**Nothing in BASELINE.md changes.** Rice remains the default at every quality; abac is opt-in, and
+BASELINE reproduces exactly on this commit — q=75 at 44.84 dB / 4.53 bpp, q=90 at 50.06 dB /
+8.07 bpp.
+
+**That GP18 moved nothing but the label is proved, not assumed.** Take a Rice frame this encoder
+wrote, overwrite its four magic bytes with `GP17`, and decode it: identical picture, max |diff| 0
+on 1920×1080×3. That establishes both halves at once — the payload is unchanged from GP17, and the
+decoder still reads GP17, which is what every file written before today says.
+`gp18_rice_frames_are_gp17_payloads_with_a_new_label` in `tests/abac_bitstream.rs` keeps it true.
+
+**Decode throughput was not re-measured.** It is the logged ~1.69× debt from 2026-09-06 and this
+change gives no reason to think it moved. Five sessions are on the machine, so a figure taken now
+would not be quotable anyway (COORDINATION, "the machine is shared").
+
+**Inter frames: correct, but unmeasured.** `abac_survives_a_p_frame_chain` encodes a 1I+3P chain
+both ways and asserts frame-by-frame pixel identity, so the inter path is not silently broken —
+worth having, because an adaptive coder that diverges on a P-frame residual would produce a
+plausible wrong frame and then feed it forward as a reference. What it does **not** establish is
+whether abac is *good* on inter: the contexts were tuned on intra coefficients and residual
+statistics differ. The test prints −28.2% on its own content, and that figure is worth nothing —
+it is a synthetic image translated by a few pixels, so the residual is far cleaner than any real
+motion. A real inter number needs real sequences and is the obvious next item on this row.

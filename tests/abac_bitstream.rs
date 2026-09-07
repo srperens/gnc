@@ -243,3 +243,109 @@ fn rice_gpu_and_cpu_encode_paths_differ_at_subsampled_chroma() {
          this was found — that is a regression in the quantise stage, not the known gap"
     );
 }
+
+/// Inter frames. The rate result this coder shipped on is intra, and the contexts were tuned on
+/// intra coefficients, so nothing here claims abac is *good* on P-frames — only that the path is
+/// not silently broken. An adaptive coder that diverges reconstructs a plausible wrong image
+/// rather than failing, so "it ran and produced a file" is not evidence; the check is again that
+/// abac and Rice, coding identical residual coefficients, decode to identical pixels.
+#[test]
+fn abac_survives_a_p_frame_chain() {
+    let ctx = gpu();
+    let (w, h) = (256u32, 256u32);
+    // Four frames with real motion, so the P-frames carry a residual worth coding.
+    let base = synth_image(w, h);
+    let shifted: Vec<Vec<f32>> = (0..4)
+        .map(|i| {
+            let mut f = vec![0.0f32; base.len()];
+            let dx = (i * 3) as usize;
+            for y in 0..h as usize {
+                for x in 0..w as usize {
+                    let sx = (x + dx) % w as usize;
+                    for c in 0..3 {
+                        f[(y * w as usize + x) * 3 + c] = base[(y * w as usize + sx) * 3 + c];
+                    }
+                }
+            }
+            f
+        })
+        .collect();
+    let refs: Vec<&[f32]> = shifted.iter().map(|f| f.as_slice()).collect();
+
+    let mut decoded = Vec::new();
+    let mut sizes = Vec::new();
+    for coder in [EntropyCoder::Rice, EntropyCoder::Abac] {
+        let mut config = gnc::quality_preset(75);
+        config.entropy_coder = coder;
+        config.keyframe_interval = 4;
+        // Both arms on the CPU encode path: Rice's GPU encoder does not produce identical
+        // coefficients (see rice_gpu_and_cpu_encode_paths_differ_at_subsampled_chroma), which
+        // would make this assertion about the quantiser rather than the entropy coder.
+        config.gpu_entropy_encode = false;
+
+        let mut encoder = EncoderPipeline::new(ctx);
+        let frames = encoder.encode_sequence(ctx, &refs, w, h, &config);
+        assert_eq!(frames.len(), 4);
+        let round: Vec<gnc::CompressedFrame> = frames
+            .iter()
+            .map(|f| gnc::format::deserialize_compressed(&gnc::format::serialize_compressed(f)))
+            .collect();
+        sizes.push(
+            frames
+                .iter()
+                .map(|f| gnc::format::serialize_compressed(f).len())
+                .sum::<usize>(),
+        );
+        let decoder = DecoderPipeline::new(ctx);
+        decoded.push(decoder.decode_sequence(ctx, &round));
+    }
+
+    for (i, (rice, abac)) in decoded[0].iter().zip(decoded[1].iter()).enumerate() {
+        let worst = rice
+            .iter()
+            .zip(abac.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert_eq!(
+            worst, 0.0,
+            "frame {i} of a 1I+3P chain decoded differently under abac (max |diff| {worst})"
+        );
+    }
+    eprintln!(
+        "1I+3P at q=75: Rice {} B, abac {} B ({:+.1}%)",
+        sizes[0],
+        sizes[1],
+        100.0 * (sizes[1] as f64 / sizes[0] as f64 - 1.0)
+    );
+}
+
+/// GP18's only addition is entropy type 5, so a GP18 frame using any older coder must be a GP17
+/// frame with a different label. Asserting that directly is worth more than believing it: relabel
+/// the magic, decode, and require the identical picture. It also exercises the other half —
+/// that the decoder still reads GP17, which is what every file written before today says.
+#[test]
+fn gp18_rice_frames_are_gp17_payloads_with_a_new_label() {
+    let ctx = gpu();
+    let (w, h) = (256u32, 256u32);
+    let img = synth_image(w, h);
+    let mut config = gnc::quality_preset(75);
+    config.entropy_coder = EntropyCoder::Rice;
+
+    let mut encoder = EncoderPipeline::new(ctx);
+    let compressed = encoder.encode(ctx, &img, w, h, &config);
+    let mut bytes = gnc::format::serialize_compressed(&compressed);
+    assert_eq!(&bytes[0..4], b"GP18");
+
+    let decoder = DecoderPipeline::new(ctx);
+    let as_gp18 = decoder.decode(ctx, &gnc::format::deserialize_compressed(&bytes));
+
+    bytes[0..4].copy_from_slice(b"GP17");
+    let as_gp17 = decoder.decode(ctx, &gnc::format::deserialize_compressed(&bytes));
+
+    assert_eq!(
+        as_gp18, as_gp17,
+        "relabelling a Rice frame GP18 → GP17 changed the decode, so GP18 moved something other \
+         than the magic — either the generation added a field it should not have, or the decoder \
+         gates a field on gen >= 18 that older files also carry"
+    );
+}

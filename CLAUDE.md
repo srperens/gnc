@@ -23,11 +23,14 @@ Modular pipeline with swappable stages:
 1. Color space conversion (YCoCg-R, integer-exact lossless path available)
 2. Transform (CDF 9/7 wavelet for lossy q=1-99, LeGall 5/3 for lossless q=100; 5 levels at q≥25, 4 below)
 3. Quantization (adaptive with perceptual subband weights, CfL chroma prediction at q=50-85, fused quantize+histogram shader)
-4. Entropy coding — four backends:
+4. Entropy coding — five backends:
    - **Rice+ZRL** (default): 256 fully independent streams per tile, significance map + Golomb-Rice + zero-run-length
    - **rANS** (`--rans`): 32 interleaved streams per tile, per-subband frequency tables
    - **Huffman** (parked): 64-symbol + escape
    - **Bitplane** (parked): block-based, fully parallel decode
+   - **abac** (`--abac`): adaptive binary arithmetic coding over 64px code-blocks, CPU encode,
+     GPU decode. −16.6% to −18.8% of rate against Rice at *identical pixels*, for ~1.69× frame
+     decode. Opt-in, intra-measured only — `docs/decisions/0017`
 5. Video: I/P/B frames, half-pel motion estimation, hierarchical block matching, CBR/VBR rate control
 6. Container: GNV1 sequence format with frame index, keyframe seeking, error resilience (per-tile CRC-32)
 

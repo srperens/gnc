@@ -63,6 +63,9 @@ cost almost nothing, and today it does not.
 
 **Entropy coder: Rice+ZRL** (256 independent streams/tile, fully GPU-parallel, patent-free).
 rANS and Huffman exist in the codebase but are parked — Rice is the default for all paths.
+**abac** (adaptive binary code-blocks) shipped 2026-09-07 as an opt-in fifth backend: −16.6% to
+−18.8% of rate against Rice at *identical pixels* on intra, for ~1.69x frame decode. Opt-in and
+not a default — `docs/decisions/0017`.
 
 | q | PSNR | BPP | VMAF | levels |
 |---|------|-----|------|--------|
@@ -139,7 +142,11 @@ coding deficit, and intra is the only route** — by elimination now, not by ass
 **MEAS-4 (2026-09-05) located that gap.** It is *prediction quality*, not the coding model.
 Simulating both models on GNC's own motion-compensated residuals at matched distortion, an
 idealised per-block DCT with oracle block skip beats GNC's wavelet by only 4–23% at broadcast
-quality and *loses* by 3–18% at low bitrate; context-adaptive entropy coding is worth ≤3.4%; and
+quality and *loses* by 3–18% at low bitrate; context-adaptive entropy coding is worth ≤3.4%
+*(scope: **inter** residuals, and a two-signal context model — `GNC_SIG_CONTEXT`. It is not a
+verdict on context modelling in general. EBCOT's nine-context model over code-blocks measures
+−16.6% to −18.8% on **intra**, shipped 2026-09-07; see BACKLOG "EBCOT — evaluating in halves")*;
+and
 only 0–2% of blocks are skippable at q=75, meaning the prediction leaves error nearly everywhere.
 An x264 ablation on the same content agrees from the other side: H.264's largest inter lever is
 multi-reference and B-frame prediction (+29–32%), three times CABAC and thirty times sub-block
@@ -150,7 +157,11 @@ So meaningful temporal compression stays a goal, and the form is now much cleare
 the inter pipeline": GNC uses **single-reference P-frames**, and the lever the measurement says
 matters most is the one it does not have. Multi-reference prediction is ordinary and
 GPU-parallel. That is where the inter work goes next ([BACKLOG.md](BACKLOG.md) #25); per-block
-inter transforms, block skip and context entropy are ruled out by measurement.
+inter transforms and block skip are ruled out by measurement. **"Context entropy" is not** — that
+line was written from the ≤3.4% figure above, which measured a much weaker model on inter
+residuals. What is ruled out is *that* model; context modelling over code-blocks is now shipped
+and is the largest single-mechanism gain in the codebase. Whether it also pays on inter residuals
+is untested.
 
 GNC's distinguishing properties hold regardless — **patent-free + GPU-native + tile-independent +
 low-latency + WebGPU/WASM browser decode** (JPEG XS is patented, VC-2 is CPU-era, JPEG 2000 is

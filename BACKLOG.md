@@ -62,6 +62,9 @@ comparison misleads in whichever direction suits.
 
 1. **Intra at contribution quality** — the whole remaining +90.5% lives here, per findings 1 and 5.
    Inter breaks even at this operating point for x264 too, so this is the only place the gap is.
+   **First instalment paid 2026-09-07 (ABAC-SHIP): −17.3% of intra rate at q=90, opt-in.** Against
+   the corrected +90.5% denominator that is roughly a fifth of the gap, from one mechanism. The
+   next largest known intra lever is still unbuilt — see EBCOT Part 7's open items.
 2. **LOSSLESS-1** — both gates green (10–26% for ~5 ms/frame). The one lever this week that passed
    rather than failed. Buildable now.
 3. **MEAS-5 / CANARY-1** — blocked on a discrete GPU. The entire strategic thesis rests on MEAS-5
@@ -551,6 +554,44 @@ corner case for this codec.
 contaminated by chroma error and overstated the luma loss **3.7x** (−0.56 vs −0.15 dB); luma is now
 taken in YCoCg-R. And VMAF read **97.08 before and after** the shipped change, on 6% fewer bits —
 the same illusion that made the 2026-09-05 sweep look like a free 15%.
+
+### BUG-16 — Rice's GPU and CPU encode paths disagree on the coefficients (todo, P2)
+
+Found 2026-09-07 while shipping abac (ABAC-SHIP); **not an abac defect** and not chased there.
+Both arms are the Rice coder, so this is the quantise stage, and it is on the **default** path.
+
+| bbb, 4:4:4 | Rice GPU encode | Rice CPU encode |
+|---|---|---|
+| q=25 | 35.51 dB, 415 544 B | **35.63 dB**, 610 264 B |
+| q=90 | 50.06 dB, 2 091 447 B | 50.06 dB, 2 275 767 B |
+| synthetic q=75, 4:2:2 | — | max abs pixel diff **1.69** vs the GPU path |
+
+Read the two rows together. At q=90 the paths agree on the picture to the decimal and differ only
+in size — that is the *expected* difference, since the CPU reference lacks per-stream k and the
+checkerboard k-context and is simply a worse coder. At q=25 they disagree on the picture, which
+means **different coefficients**, and the GPU path emits the smaller *and* worse file: it is
+discarding something the CPU path keeps.
+
+**The obvious suspect is already ruled out.** The fused quantize+histogram shader runs only on the
+GPU encode path (`use_fused_qh = config.use_fused_quantize_histogram && use_gpu_encode &&
+!use_cfl`), so "fused is active" looked like the answer — but CfL is already off at q=90
+(`GNC_NO_CFL=1` there changes nothing, 8.07 bpp either way), so fused is active at q=90 as well and
+the paths still agree. Being on the fused path is necessary at most, not sufficient.
+
+The remaining variable is the quantiser itself: dead zone 0.75 / step 16.0 at q=25 against ~0.05 /
+~2.2 at q=90. q=50 and q=75 have the wide dead zone but CfL **on**, which disables fused, so they
+cannot separate the two — which is why this only ever shows up below about q=30 and at subsampled
+chroma. A dead-zone or rounding difference between the fused shader and the separate quantise
+shader fits every row; a coding difference fits none of them.
+
+**Why it matters beyond 0.12 dB:** the GPU path is the default, so the *shipped* encoder is the one
+losing the quality, and the loss is invisible to any test that compares an encode against itself.
+It also silently invalidates any experiment that compares a CPU-encoded arm against a GPU-encoded
+one at q ≤ 30 — which is exactly the comparison an entropy-coder experiment wants to make.
+
+**Repro:** `gnc benchmark -i <1080p png> -q 25 -n 1` against the same with `--cpu-encode`.
+Pinned by `rice_gpu_and_cpu_encode_paths_differ_at_subsampled_chroma` in `tests/abac_bitstream.rs`,
+which asserts the gap exists and is small, so a fix will fail that test and its comment says so.
 
 ### BUG-14 — Huffman's stream mapping has BUG-11 (todo, P4)
 `huffman_encode.wgsl`, `huffman_decode.wgsl` and `huffman_histogram.wgsl` all carry the same
@@ -1371,14 +1412,50 @@ about a mechanism, not about a measurement, and a "do not re-test" note is the m
 of wrong because it is written precisely so nobody checks it again. Scope such notes to what was
 actually varied.
 
-**Superseded next steps:**
-1. ~~GPU decode shader and honest fps against Rice on an idle machine.~~ Written; measured on real
-   coefficients against Rice in-process — see Part 6.
-2. Bitstream integration — a GP18 generation with `EntropyCoder::Abac`, code-block length fields,
-   block size in the tile header. Nothing is integrated yet; `abac` is standalone and
-   `abac_compare` is a diagnostic.
-3. Inter frames. All of the above is intra; residual statistics differ and contexts may need
-   re-tuning.
+**Part 7 — SHIPPED 2026-09-07 (ABAC-SHIP). GP18, entropy type 5, −16.6% to −18.8% at identical
+pixels.** `EntropyCoder::Abac` / `--abac`, `src/encoder/abac_tile.rs`, GPU decode into `scratch_a`.
+Measured through encode → file → GPU decode on four images; entropy coding is lossless, so both
+arms decode to the **same pixels** and the rate delta is exact rather than a rate/quality trade:
+
+| q | bbb | blue_sky | kristensara | touchdown | mean |
+|---|---|---|---|---|---|
+| 50 | −17.8% | −18.5% | −19.4% | −19.5% | **−18.8%** |
+| 75 | −14.7% | −15.8% | −19.3% | −16.8% | **−16.6%** |
+| 90 | −14.2% | −17.2% | −20.9% | −16.9% | **−17.3%** |
+| 100 (lossless, bit-exact) | −14.2% | −14.5% | −15.0% | −10.0% | **−13.4%** |
+
+The q=90 diagnostic predicted −16.7%; the real bitstream measures −17.3%, every image within 0.8
+points, the mean slightly *better* for the reason predicted in advance (25 two-byte block headers
+per tile against Rice's tile header plus 256 length fields). **Lossless takes the FFV1 gap from
++23.9% to +7.3%**, against an FFV1 level-3 gbrp encode run the same day rather than a figure
+carried forward.
+
+Rice stays the default and **BASELINE.md does not move** — BASELINE reproduces exactly on this
+commit (q=75 44.84 dB / 4.53 bpp, q=90 50.06 dB / 8.07 bpp), and Rice files are identical before
+and after apart from the four magic bytes, which is the whole of GP18. Reasoning in `docs/decisions/0017`. The ~1.69× decode debt is
+unchanged and was not re-measured.
+
+Two things found on the way. **The decode shader wrote `array<i32>` into `scratch_a`, which every
+other entropy decoder writes as f32** — the file was already the right size and PSNR came back
+`NaN`, because −1 as i32 is a quiet NaN as f32. Rate right, picture absent: a bpp-only benchmark
+would have recorded the win. And **Rice's GPU and CPU encode paths do not produce the same
+pixels** (35.51 vs 35.63 dB on bbb at q=25; max |diff| 1.69 at 4:2:2) — both arms are Rice, so it
+is the quantise stage, not entropy coding. Pre-existing, not chased, now pinned by a test so it is
+not re-found as an abac bug. It is why **q=25 is not quoted as a rate figure** above.
+
+**Still open:**
+1. ~~GPU decode shader and honest fps against Rice on an idle machine.~~ Done — Part 6.
+2. ~~Bitstream integration.~~ Done — Part 7.
+3. **Inter frames — correct, unmeasured (todo, P2).** `abac_survives_a_p_frame_chain` encodes a
+   1I+3P chain both ways and asserts frame-by-frame pixel identity, so the path is not silently
+   broken. That matters on its own: a coder that diverged on a P residual would produce a
+   plausible wrong frame and then feed it forward as a reference. It says nothing about whether
+   abac is *good* there — the contexts were tuned on intra coefficients. The test's own −28.2% is
+   worthless as a figure (synthetic image, translated a few pixels, unrealistically clean
+   residual). A real number needs real sequences, and that is the obvious next item here.
+4. **CPU encode is 129 ms/frame against Rice's 23 ms (todo, P3).** Serial per symbol by
+   construction, but parallel across ~3000 code-blocks and currently single-threaded. This is what
+   stands between abac and being a candidate default, more than the decode debt does.
 
 **Code-block size settled: 128px, i.e. one block per subband.** Swept on bbb at q=55: 16px
 **+1.1% — worse than Rice**, 32px −15.1%, 64px −19.2%, 128px −20.0%, 256px identical to 128 (no

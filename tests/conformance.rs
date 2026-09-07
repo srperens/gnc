@@ -123,8 +123,9 @@ fn conformance_gradient_q25() {
     assert!(psnr > 40.0, "PSNR too low: {psnr:.2}");
     assert!(serialized.len() > 100, "Bitstream too small");
 
-    // Verify GP17 magic (format bumped for Rice-coded stream-length tables)
-    assert_eq!(&serialized[0..4], b"GP17", "Expected GP17 magic");
+    // Verify GP18 magic. GP18 added entropy type 5 (the abac code-block coder) and nothing else,
+    // so a Rice frame's payload is unchanged from GP17 — only these four bytes moved.
+    assert_eq!(&serialized[0..4], b"GP18", "Expected GP18 magic");
 
     // Verify decode is deterministic (re-decode)
     let ctx = gpu();
@@ -183,8 +184,8 @@ fn conformance_lossless_q100() {
     let (serialized, hash, psnr) = conformance_roundtrip("lossless", &img, 512, 512, 100);
     assert!(psnr.is_infinite(), "Lossless mode should give infinite PSNR, got {psnr:.2}");
 
-    // Verify GP17 magic (format bumped for Rice-coded stream-length tables)
-    assert_eq!(&serialized[0..4], b"GP17");
+    // Verify GP18 magic — see the note in conformance_gradient_q25.
+    assert_eq!(&serialized[0..4], b"GP18");
 
     // Verify bit-exact round-trip
     let ctx = gpu();
@@ -259,6 +260,7 @@ fn conformance_crc_validates_all_tiles() {
         gnc::EntropyData::Bitplane(t) => t.len(),
         gnc::EntropyData::Rice(t) => t.len(),
         gnc::EntropyData::Huffman(t) => t.len(),
+        gnc::EntropyData::Abac(t) => t.len(),
     };
     assert_eq!(
         result.tile_crcs.len(),

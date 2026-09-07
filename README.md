@@ -143,7 +143,7 @@ Downloads representative broadcast frames from [Xiph.org](https://media.xiph.org
 
 ## Entropy Coders
 
-GNC has four entropy coding backends, all running as GPU compute shaders:
+GNC has five entropy coding backends, all decoding as GPU compute shaders:
 
 | Coder | Streams/tile | Coding | Speed | Patent risk |
 |-------|-------------|--------|-------|-------------|
@@ -151,6 +151,7 @@ GNC has four entropy coding backends, all running as GPU compute shaders:
 | rANS (`--rans`) | 32 | Range asymmetric numeral systems | Baseline | Possible (MS patent) |
 | Huffman (parked) | 256 | 64-symbol + escape | Moderate | None |
 | Bitplane (parked) | Per-block | Sign + magnitude bitplanes | Moderate | None |
+| abac (`--abac`) | 1 per 64px code-block | Adaptive binary arithmetic, context-modelled | **~0.6×** | None known |
 
 *No compression column: **the coders have never been measured against each other on one commit.**
 The figures that stood here (Rice 4.01 bpp, rANS 4.22 bpp @ q=75) were taken at an operating point
@@ -162,6 +163,27 @@ stream count and Rice runs 256 streams to rANS's 32 — but that is a prediction
 [BASELINE.md](BASELINE.md) carries Rice only.*
 
 Rice is the default because it eliminates the sequential state chain that limits rANS. Each of the 256 streams encodes independently — no shared state, no synchronization, minimal shared memory (< 1 KB vs rANS's 16 KB frequency tables). rANS, Huffman, and Bitplane are available but parked — they'll be revisited once speed targets are met.
+
+**abac is the exception to the "never measured against each other" note above**, because it does
+not need a BD-rate to be compared: entropy coding is lossless, so abac and Rice decode to the
+*identical picture* and the only difference is file size. Measured 2026-09-07 through the real
+bitstream on bbb, blue_sky, kristensara and touchdown — encode to a file, decode on the GPU,
+pixels compared:
+
+| q | mean rate vs Rice, at identical pixels |
+|---|---|
+| 50 | **−18.8%** |
+| 75 | **−16.6%** |
+| 90 | **−17.3%** |
+| 100 (bit-exact lossless) | **−13.4%** |
+
+At lossless that takes GNC from +23.9% behind FFV1 to **+7.3%**.
+
+It is opt-in rather than the default because it costs about **1.69× frame decode** — one serial
+adaptive coder per code-block, against Rice's 256 branch-free streams per tile — and because its
+CPU-side encoder is currently single-threaded (129 ms/frame against Rice's 23 ms). The rate result
+is intra only; inter frames use the same coder with contexts that were tuned on intra
+coefficients, and that has not been measured. See `docs/decisions/0017`.
 
 ## Quality Spectrum
 

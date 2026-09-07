@@ -173,10 +173,10 @@ pub(super) fn entropy_encode_tiles(
 ) {
     // One engine for the whole encode: the two share a binarisation but not a bitstream, and it
     // is recorded per tile so the decoder never has to consult the environment.
-    let abac_coder = if matches!(mode, EntropyMode::Abac) {
-        abac_coder_from_env()
+    let (abac_coder, abac_cb) = if matches!(mode, EntropyMode::Abac) {
+        (abac_coder_from_env(), abac_cb_from_env())
     } else {
-        Coder::default()
+        (Coder::default(), abac_tile::DEFAULT_CB)
     };
     for ty in 0..tiles_y {
         for tx in 0..tiles_x {
@@ -221,7 +221,7 @@ pub(super) fn entropy_encode_tiles(
                         &coeffs,
                         tile_size_u32,
                         num_levels,
-                        abac_cb_from_env(),
+                        abac_cb,
                         abac_coder,
                     ));
                 }
@@ -243,8 +243,7 @@ pub(super) fn entropy_encode_tiles(
         eprintln!(
             "  [abac] plane {tiles_x}x{tiles_y} tiles: abac_blocks={blocks} \
              (empty={empty}) bytes={bytes} coder={:?} cb={}",
-            abac_coder,
-            abac_cb_from_env(),
+            abac_coder, abac_cb,
         );
     }
 }

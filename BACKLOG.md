@@ -75,6 +75,10 @@ measured advantage over x264 on any axis at this operating point.**
 
 ### Priority order
 
+0. **INTRA-1 — where is the remaining 27%?** Added 2026-09-07 after ENT-4. With `--abac` on, GNC
+   needs 27.1% more bits than JPEG 2000 *using the same transform at the same depth*, and nothing in
+   this repository accounts for it. Largest known compression gap; step 1 is one cheap measurement
+   that splits it into "coder" or "upstream of the coder".
 1. **Intra at contribution quality** — the whole remaining +90.5% lives here, per findings 1 and 5.
    Inter breaks even at this operating point for x264 too, so this is the only place the gap is.
    **First instalment paid 2026-09-07 (ABAC-SHIP): −17.3% of intra rate at q=90, opt-in.** Against
@@ -2535,6 +2539,76 @@ independently.
 
 Note JPEG XS is patented (GOALS, docs/POSITIONING.md) — this is a comparison, not a target to
 adopt.
+
+### INTRA-1 — Where is the remaining 27%? (todo, **P0** — the largest known gap in the codec)
+
+**The question.** With `--abac` on, GNC needs **+27.1% more bits than JPEG 2000 in 9/7 mode** at
+matched RGB PSNR, and **+48.3%** at matched Y-PSNR (ENT-4, four images, one metric path). J2K uses
+**the same transform at the same depth** — CDF 9/7, five levels. Half the original 54.2% gap was the
+entropy coder and is now closed. **Nothing in this repository accounts for the other half.**
+
+That makes this the biggest known compression gap in GNC, and it is not a tuning item: something
+structural is costing a quarter of the bitrate and we cannot currently name it.
+
+**What is already ruled out, so nobody re-measures it:**
+
+- **PCRD / rate allocation.** 0.00 dB at code-block granularity, at every rate from 0.05 to 3.5 bpp,
+  with a structural reason (uniform scalar quantisation of a near-orthonormal transform under MSE
+  puts every coefficient at the same RD slope). EBCOT part 1, closed.
+- **Coefficient-level RDOQ.** +0.1%.
+- **A richer entropy context.** The offline model puts EBCOT's full neighbourhood at −16.4% against
+  abac's vertical-only −11.7%, so the remaining context headroom is single digits — and it costs the
+  256-way parallel decode. It cannot be 27 points. Worth doing eventually; not the answer.
+- **Tile geometry, as far as it has been measured.** 512 over 256 is −0.91%, and six levels at tile
+  512 is −0.1% (BUG-11/BUG-12). Note both stop at 512 and neither tested a whole-frame transform.
+
+### Step 1 — the measurement that splits the gap in two. Do this first; it is cheap.
+
+**Compare what GNC spends against the entropy of GNC's own coefficients**, per subband, at a rate
+matched to J2K. Both quantities are computable from a single encode:
+
+- **If GNC spends close to its own coefficients' entropy**, the coder is done and the problem is
+  *upstream*: the coefficients themselves are more expensive than J2K's. Then the suspects are
+  quantisation (deadzone shape, per-subband step derivation from band gain), the lifting
+  implementation's normalisation, and the tiling.
+- **If GNC spends materially more than that entropy**, there is coder headroom left after abac, and
+  the context model is worth more than the offline estimate suggested — which has now happened twice
+  (the offline model understated abac by 1.7x).
+
+One number, and it decides which of two entirely different investigations to run. `scripts/` already
+has the machinery: `meas_ebcot_context.py` computes conditional entropy per subband against a
+faithful simulation of the shipped coder, and `GNC_DIAGNOSTICS=1` reports per-group counts.
+
+### Step 2, if the gap is upstream — the candidates, cheapest first
+
+1. **Whole-frame transform vs 256px tiles.** GNC transforms 35 independent tiles on a 1080p frame;
+   J2K transforms the whole picture. Each tile's LL is 8x8 at five levels, against a 60x34 LL for
+   the frame — so GNC cannot exploit low-frequency correlation beyond 256 px, and codes 35
+   independent DC structures. Measured up to 512 the effect was ~1%, but nobody has measured a
+   single-tile frame. **Test without touching the architecture**: `CodecConfig::set_tile_size()` to
+   the frame size, at the level ceiling that then applies, and BD-rate it. If it is worth a lot, that
+   is a genuine conflict with GOALS rule 3 (no cross-tile dependencies) and belongs in a decision
+   record, not in a commit — tile independence is what buys the parallel decode, the error
+   resilience and the seeking.
+2. **Quantiser shape and per-subband step.** J2K derives each band's step from the band gain of the
+   irreversible 9/7 and uses a deadzone quantiser. GNC uses adaptive quantisation with perceptual
+   subband weights, which are tuned for perceived quality and are being scored here on PSNR. **That
+   mismatch alone could account for several points**, and it is measurable offline: re-quantise GNC's
+   coefficients with J2K's band-gain-derived steps and re-measure rate at matched PSNR. Careful — a
+   PSNR-optimal reweighting may be a perceptual regression, so any change needs dE00 and a VMAF
+   cross-check at q<=85 before it ships.
+3. **Lifting normalisation.** The 9/7 lifting steps must carry the correct scaling for the transform
+   to be near-orthonormal; an error costs rate directly and silently. This repo has been here before
+   ("an unnormalised lifting DWT loses to an orthonormal DCT on scaling alone" moved a result from
+   41% better to 4% better). Cheap to verify: transform a delta and check subband gains against the
+   published 9/7 values.
+4. **Code-block geometry inside abac.** cb=64 was chosen as the best of the sizes measured for the
+   rate/speed trade, not for rate alone. Re-sweep now that the coder is in the bitstream.
+
+**Success criterion for the item as a whole:** name where the 27% goes, with a number per cause that
+sums to roughly the measured gap. "We tried four things and got 3%" is an acceptable outcome only if
+it comes with an account of the missing 24 — an unexplained gap is a standing invitation to guess,
+and this repo has a long record of what guessing costs.
 
 ### ENT-4 — Re-run MEAS-9 with `--abac` (**DONE 2026-09-07** — abac closes half the JPEG 2000 gap)
 

@@ -79,7 +79,14 @@ Then add your row to the table below, for the prose the ref cannot carry.
 `test_material/` itself is tracked (it holds the fetch script), so symlink `frames` inside it
 rather than replacing the directory. Then work only in that directory, and add your row to the
 table below. Each worktree has its own
-`target/`, so builds no longer block on each other's cargo lock — that alone is worth the disk.
+`target/`, so builds no longer block on each other's **target** lock — that alone is worth the disk.
+
+**They do still block on the package-cache lock**, and that surprised the `abacship` session on
+2026-09-07: `cargo test --release` sat at `Blocking waiting for file lock on package cache` for
+minutes while other sessions compiled, with 35 `rustc` processes on the machine. The lock is in
+`~/.cargo`, which every worktree shares; a separate `target/` does not help. So **a build queued
+behind four other sessions is normal, not a hang** — check `pgrep -lf rustc` before assuming
+something is stuck, and start long test runs in the background rather than waiting on them.
 
 When your work is ready:
 

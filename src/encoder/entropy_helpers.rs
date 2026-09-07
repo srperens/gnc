@@ -48,16 +48,27 @@ impl EntropyMode {
 ///
 /// This answers "where does the entropy stage run", and nothing else. It must never be used to
 /// pick a frame encoder, a motion estimator or a local decode — ARCH-3 is the record of what
-/// happens when it is. abac and bitplane are GPU-*decoded* and have no GPU entropy encoder, and
-/// until 2026-09-07 selecting either swapped the whole P/B frame encoder for a second
-/// implementation that encoded every P-frame wrong (BUG-18).
+/// happens when it is. Until 2026-09-07, choosing a coder with no GPU entropy encoder swapped the
+/// whole P/B frame encoder for a second implementation that encoded every P-frame wrong (BUG-18).
 ///
-/// Rice and rANS have encode shaders wired into the inter path (`rice_encode.wgsl`,
-/// `rans_encode.wgsl`). Huffman has one, but only `pipeline.rs` (intra) dispatches it, so on the
-/// inter path it codes on the CPU like the rest — which is also why P-frames used to come out of
-/// the batched pipeline with an empty Huffman tile vector. Context-adaptive rANS has no GPU
-/// encoder at all; the same exclusion is in `pipeline.rs`, and without it the flag would silently
-/// drop the context modelling the caller asked for.
+/// **More precisely, this asks whether the *batched three-plane* GPU dispatch supports the
+/// configuration**, which is narrower than "a GPU encoder exists". Rice and rANS have encode
+/// shaders wired into that batch (`rice_encode.wgsl`, `rans_encode.wgsl`). Huffman has a shader
+/// but only `pipeline.rs` (intra) dispatches it, so on the inter path it codes on the CPU — which
+/// is also why P-frames used to come out of the batched pipeline with an empty Huffman tile
+/// vector. Context-adaptive rANS has no GPU encoder at all; the same exclusion is in
+/// `pipeline.rs`, and without it the flag would silently drop the context modelling the caller
+/// asked for.
+///
+/// **abac is the case where the two readings come apart, and it is `false` here on purpose.**
+/// Since ENT-5 abac *does* have a GPU encoder (`abac_encode.wgsl`), but it is a per-plane
+/// dispatch, not part of this batch — so returning `true` would route abac into a batched path
+/// with no abac arm. It reaches the GPU from inside [`encode_entropy`], which tests
+/// `config.gpu_entropy_encode` directly and branches on abac before it ever looks at the
+/// `use_gpu_encode` this function feeds. So a `false` here means "not in the batch", not "on the
+/// CPU": abac's entropy stage runs on the GPU either way. Deliberately kept separate — this flag
+/// also switches the fused quantize+histogram shader, and BUG-16 records that shader moving
+/// Rice's *pixels* at q=25. `docs/decisions/0024`.
 pub(super) fn inter_gpu_entropy_available(config: &CodecConfig) -> bool {
     matches!(
         config.entropy_coder,

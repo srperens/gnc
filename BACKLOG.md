@@ -3186,8 +3186,9 @@ also settle the sizing mode: `CountThenEmit` (2 coder passes, exactly-sized scra
 and `BoundedSlots` (1 coder pass, 22-29x scratch) is selectable with `GNC_ABAC_GPU_SIZING=slots`;
 the bytes are identical either way, so the default can flip on one run. `docs/decisions/0024`.
 
-**What it does not do:** abac is still opt-in (0017's reason 1, the 1.69x decode, is untouched;
-reason 3 is still ENT-3 blocked on BUG-18), and it does not touch `use_gpu_encode` or
+**What it does not do:** abac is still opt-in — 0017's reason 1, the 1.69x decode, is untouched,
+and reason 2's figure is unmeasured. (Reason 3 was discharged by ARCH-3, not here.) It does not
+touch `use_gpu_encode` or
 `sequence.rs` — abac is routed on `gpu_entropy_encode` directly, one condition inside
 `encode_entropy`, deliberately orthogonal to ARCH-3 and to the fused quantiser that BUG-16 says
 moves Rice's pixels.

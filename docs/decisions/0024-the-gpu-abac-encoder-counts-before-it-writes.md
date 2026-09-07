@@ -115,10 +115,11 @@ The encoder exists, runs one thread per code-block, and is bit-exact.
   unmeasured, because the machine was not idle. Until that run happens, "abac has a GPU encoder"
   is a fact and "abac's encode is fast enough to be a default" is not a claim.
 - **Reason 1**, the 1.69× frame decode, is untouched: nothing here changes the decoder.
-- **Reason 3**, abac on inter, is still blocked on BUG-18 (ENT-3). The GPU encoder is verified
-  byte-exact on P-frame residuals, but that verifies the *coder*, not the P-frame pipeline it sits
-  in — both arms of that comparison run the same defective pipeline on purpose, so it depends on
-  nothing BUG-18 owns.
+- **Reason 3**, abac on inter, was discharged by ARCH-3 rather than here: it landed while this was
+  in flight, replaced the two P/B encoders with one, and measured abac's inter rate at −12.0% to
+  −22.9% on three sequences at bit-identical pixels. What this item contributes there is only that
+  the GPU encoder is byte-exact on P-frame residuals too — it verifies the *coder*, not the
+  pipeline around it.
 
 So abac stays opt-in and Rice stays the default. This item removed one of three obstacles and one
 class of defect; it did not make the decision that 0017 declined to make.

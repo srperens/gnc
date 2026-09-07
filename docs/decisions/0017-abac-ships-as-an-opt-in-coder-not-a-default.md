@@ -60,8 +60,10 @@ and leave Rice as the default at every quality preset.
    routing and BUG-18 with it, and inter is measured: **−12.0% to −22.9% against Rice at
    bit-identical pixels**, nine of nine points across bbb_extended / crowd_run / old_town_cross at
    q=50/75/90 (`docs/decisions/0025`, RESEARCH_LOG). abac pays on inter in the same band as intra.
-   **The decision is unchanged** — reasons 1, 2 and 4 are untouched, and reason 2 (129 ms/frame of
-   CPU encode) is the binding one. Reason 3 should now be read as *answered yes*, not as
+   **The decision is unchanged** — reasons 1 and 4 are untouched, and reason 2 is the binding one.
+   (Reason 2 was annotated the same day by ENT-5, which landed the GPU encoder: the 129 ms is no
+   longer *CPU* encode time, it is simply the only encode time anyone has measured. Binding either
+   way, and for the same reason — nobody has been able to time the new path on an idle machine.) Reason 3 should now be read as *answered yes*, not as
    *unmeasured*: it no longer argues against a default, it simply stops arguing for one.
 
 4. **A default change is the expensive kind of change to reverse.** Every measurement in the repo

@@ -332,9 +332,11 @@ abac's pixels in the same commit that moved its encoder.
 
 Byte identity discharges criterion 4 by construction: identical bytes are identical rate, so
 ENT-4's −16.0% over q=60-99 and the −13.4% lossless figure cannot have moved. The ki=9 row is the
-one that covers **P-frame residual coefficients**; both arms run the same (defective, BUG-18)
-non-batched P pipeline on purpose, so it verifies the coder without depending on anything BUG-18
-owns.
+one that covers **P-frame residual coefficients**; both arms run the same P pipeline, so it
+verifies the coder rather than the pipeline around it. **Written before ARCH-3 landed and re-run
+after**, when there was one P encoder rather than two and abac was no longer on the defective one:
+98 of 98 either way, which is what a comparison of two arms of the same tree should do and is worth
+saying because it was not guaranteed — ARCH-3 rewrote 4830 lines of `sequence.rs` underneath this.
 
 `tests/abac_gpu_encode.rs` asserts the same thing per *block* rather than per file, over the eight
 geometries the decoder is verified on plus all-zero / all-one / all-minus-one / all-(-9999) planes,
@@ -437,16 +439,24 @@ means.
 
 ### What this does not do
 
-- It does not make abac the default. 0017's reason 1 (1.69x frame decode) is untouched, reason 3
-  (inter) is still blocked on BUG-18 via ENT-3, and reason 2's figure is unmeasured.
-- It does not touch `use_gpu_encode` or `sequence.rs`'s frame-pipeline selection. ARCH-3 owns that,
-  was in flight in another session while this was built, and this is orthogonal to it by design
-  rather than by luck: after ARCH-3 lands, abac's video path picks up the correct frame pipeline
-  with no change here.
+- It does not make abac the default. 0017's reason 1 (1.69x frame decode) is untouched and
+  reason 2's *figure* is unmeasured. **Reason 3 is no longer this item's to report**: ARCH-3
+  landed while this was in flight and discharged it, measuring abac's inter rate at −12.0% to
+  −22.9% on three sequences at bit-identical pixels — so of the three reasons 0017 gave, two are
+  now answered and the binding one is the encode time nobody has been able to time.
+- It does not touch `use_gpu_encode` or `sequence.rs`'s frame-pipeline selection. ARCH-3 owned
+  that and was in flight in another session while this was built. **The orthogonality held**: the
+  rebase onto ARCH-3 needed one markdown conflict resolved and one comment corrected — ARCH-3's
+  new `inter_gpu_entropy_available()` says abac has no GPU entropy encoder, which was true when it
+  was written and is not now. Its *logic* is still right and unchanged: it gates the batched
+  three-plane dispatch, which has no abac arm, and abac reaches the GPU from inside
+  `encode_entropy` instead. `false` there now means "not in the batch", not "on the CPU".
 - It changes no bitstream. `abac_gpu_sizing` is host-side only and never reaches the file.
 
-**Gates:** `cargo test --release --  --test-threads=1` — 222 tests pass, 0 failed (179 lib +
-43 integration, three of them new). `cargo clippy --release` clean,
+**Gates, re-run after the rebase onto ARCH-3** (which rewrote 4830 lines of `sequence.rs` under
+this item's two `encode_entropy` call sites, so this is not a formality): `cargo test --release --
+--test-threads=1` — **224 pass, 0 fail**; the 98-point byte-identity gate **98 identical, 0
+differing**; `cargo clippy --release` clean,
 `cargo clippy --release --target wasm32-unknown-unknown --lib` clean. The full wasm target still
 fails with BUG-24's 11 pre-existing `GpuContext::new` errors in the bin target, unchanged in count
 and location.

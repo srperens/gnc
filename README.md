@@ -63,13 +63,14 @@ as of 2026-09-08:
 | backend | status | evidence |
 |---|---|---|
 | **Metal** | measured end to end | every figure in this README |
-| **Vulkan** | intra encode and decode run; **inter coding does not** | CANARY-1 on an RTX 4000 Ada, 13.95 ms encode / 7.29 ms decode. `block_match_split.wgsl` segfaults the NVIDIA and lavapipe drivers, so P/B coding is unreachable there (BUG-25, open) |
-| **DX12** | **never run** | no measurement exists in this repository |
+| **Vulkan** | intra encode and decode run; **inter coding does not** | Measured on three real GPUs: RTX 4000 Ada 13.95 ms encode / 7.29 ms decode, and on Windows an Intel Arc Pro at 36.45 / 26.63 ms against an RTX 2000 Ada at 17.75 / 11.33 ms. `block_match_split.wgsl` crashes **three independent drivers** — NVIDIA, Mesa lavapipe and Intel Arc — so P/B coding is unreachable on any of them (BUG-25, open) |
+| **DX12** | **run once, on a software adapter, and it panicked** | Microsoft Basic Render Driver (WARP, CPU): exit 101 on a single frame, 2026-09-08. Adapter *enumeration* works across Vulkan/DX12/GL. **No DX12 hardware adapter has ever been tried** |
 | **WebGPU / WASM** | compiles; **not verified in a browser**, and one known blocker | both abac GPU shaders declare 18 688 B of workgroup storage against WebGPU's 16 384 B limit. Native wgpu does not enforce it; a conformant implementation must. The decoder builds the abac decoder unconditionally, so if it bites, *every* WASM decode fails, Rice files included (BUG-31, open) |
 
-Two of these four rows are open bugs and one is an untested claim, which is why the top of this
-file no longer states cross-platform support as a fact. GNC is *written* to be portable; it is
-*measured* on Metal.
+Not one of the three non-Metal rows is clean. That is why the top of this file no longer states
+cross-platform support as a fact: GNC is *written* to be portable and is *measured* on Metal.
+Platforms it has run on at all: macOS/Metal, Linux/Vulkan, and — since 2026-09-08 — Windows,
+where it builds clean and runs all-intra on both GPUs of a two-GPU laptop.
 
 Cross-backend output has been compared once (2026-09-07): at `q=100` Metal and Vulkan produce
 byte-identical files, and at `q=75` they differ by one byte in 1.17 MB. Every file decodes to

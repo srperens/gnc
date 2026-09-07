@@ -1823,7 +1823,7 @@ Metric rules apply: dE00 via `scripts/chroma_metric.py`, luma in YCoCg-R via `sc
 not luma computed from decoded RGB. Success criterion: state the offset, the matched rate, and the
 dE00 delta per sequence. Half an afternoon.
 
-### MEAS-9 — JPEG XS in `--compare-codecs` (todo, P1)
+### MEAS-9 — JPEG XS in `--compare-codecs` (in progress 2026-09-07, `meas9` worktree)
 
 `--compare-codecs` covers JPEG and JPEG 2000. The framing is contribution, and in that segment the
 incumbents are JPEG XS, J2K, VC-2 and ProRes (docs/POSITIONING.md) — x264 is a sanity anchor, not
@@ -1837,6 +1837,15 @@ than on its own.
 
 Note JPEG XS is patented (GOALS §, and docs/POSITIONING.md) — this is a comparison, not a target
 to adopt.
+
+**JPEG XS is not measurable on this machine — checked 2026-09-07, do not spend the ten minutes
+again.** ffmpeg knows the codec id but is built without an implementation (`ffmpeg -codecs` shows
+`..VILS jpegxs`, and `-h encoder=jpegxs` says no encoder is available); neither `libjxs` nor
+`svt-jpeg-xs` exists as a Homebrew formula, and SVT-JPEG-XS ships Linux/Windows build trees with
+x86 assembly. **VC-2 stands in as the nearest available relative** — intra-only, low-latency,
+broadcast contribution, 9/7 wavelet like GNC's own — alongside ProRes 4444/422 and JPEG 2000.
+So the item is being delivered as "GNC against the available contribution incumbents"; the JPEG XS
+row itself stays open until a machine or a build has it.
 
 ### ENT-2 — Rice vs rANS on one commit (todo, P2)
 

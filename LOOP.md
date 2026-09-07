@@ -32,6 +32,15 @@ project is for.
 
 1. Read [BACKLOG.md](BACKLOG.md). Pick the item with the best value-to-effort ratio that is not
    blocked — not necessarily the highest-numbered priority.
+
+   **Check the claims table in [COORDINATION.md](COORDINATION.md) before you pick, and mark the
+   item in BACKLOG itself once you have.** The two files disagree by construction: the claim is a
+   row in COORDINATION, but the pick is made from BACKLOG, where a taken item still reads
+   `(todo, P1)`. On 2026-09-07 that sent several sessions at MEAS-9 at once — with CANARY-1
+   hardware-blocked and CHROMA-2 taken, it was the only startable P1, so five sessions applying
+   this rule to the same list got the same answer within the same two minutes, before any row
+   could be written. Edit the heading to `(in progress <date>, <worktree>)`; the marker already
+   exists in BACKLOG and is used once in the whole file.
 2. **Measure the current state before changing anything.** A change with no before-number is not
    an improvement, it is a hope.
 3. Make the change.

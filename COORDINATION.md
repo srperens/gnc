@@ -160,6 +160,36 @@ It has numpy 2.5.3 and pillow 12.3.0, and it is gitignored. `chroma_metric.py --
 **16/16 Sharma reference pairs**, so the dE00 implementation itself is validated — run it once
 before quoting a colour number, it costs a second.
 
+## JPEG XS *is* measurable here — SVT-JPEG-XS now builds on arm64 (2026-09-07, chroma2)
+
+**MEAS-9 is recorded in two places as blocked on this, with VC-2 standing in. It is not blocked.**
+`scripts/build_jpegxs_arm64.sh` clones, patches and builds SVT-JPEG-XS on this M1, and verifies
+the result: a 1920x1080 yuv422p frame at `--bpp 3` round-trips to **PSNR y 44.484343 dB**,
+reproduced exactly from a clean clone.
+
+Only the *build system* assumes x86. The C sources already carry `#else /* ARCH_X86_64 */`
+fallbacks for every dispatch, so the scalar path was written and simply never selected;
+`scripts/svt-jpegxs-arm64.patch` gates the nasm discovery, `-DARCH_X86_64` and the nine ASM object
+libraries on a detected arch, gives non-x86 a `get_cpu_flags()` returning 0 (EncHandle/DecHandle
+call it unconditionally), and guards the SIMD headers that pull in `<immintrin.h>`.
+
+**Rate and quality from this build are exact — that is what MEAS-9 needs.** Throughput is not:
+every SIMD kernel is off, so the 9.17 fps encode it reports says nothing about JPEG XS and must
+never be quoted or compared against GNC's fps. The latency row in the README stands on MEAS-6, not
+on this.
+
+## Three more sequences are back: bbb_extended, old_town_cross, crowd_run (2026-09-07, chroma2)
+
+QUAL-1, MEAS-1 and BASELINE's BD-rate table are all measured on **bbb_extended, old_town_cross and
+crowd_run**, and none of the three was in the tree — the fetch script has never fetched them.
+`test_material/frames/sequences/` now has **24 frames of each** (1920x1080, PNG). Streaming the
+first 24 frames of a 1.55 GB Xiph y4m costs about 80 MB, so this is cheap to redo; taking them
+from the *start* of the file is what makes it cheap.
+
+**They are 24 frames, not 200.** QUAL-1 used 200 frames of old_town_cross and an unstated count of
+crowd_run, so a run against these reproduces the *content* but not the length, and BASELINE says
+17 frames where the QUAL-1 log says 24. Say which you used.
+
 ## Timing: an idle machine is necessary and NOT sufficient (added 2026-09-06, after an idle run still lied)
 
 **The GPU ramps its clocks, and a repeat count chosen for a CPU benchmark will not outlast the

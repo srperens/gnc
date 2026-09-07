@@ -501,11 +501,64 @@ def matched_rate_table(rows, gnc_rows):
     return out
 
 
+def selftest():
+    """Prove the BD-rate machinery on cases with known answers before trusting it on codecs.
+
+    chroma_metric.py validates dE00 against Sharma's reference pairs; this is the same idea for
+    the other half of the instrument. Three cases, and the third is the one that caught a real
+    defect: a curve fitted globally and integrated over a narrow window is not the same quantity
+    as one fitted to the window.
+    """
+    ok = True
+
+    def check(name, got, want, tol=0.15):
+        nonlocal ok
+        good = got is not None and abs(got - want) <= tol
+        ok = ok and good
+        print(f"  {'pass' if good else 'FAIL'}  {name}: got "
+              f"{'None' if got is None else f'{got:+.3f}%'}, expected {want:+.1f}%")
+
+    base = [(1.0, 40.0), (2.0, 44.0), (4.0, 48.0), (8.0, 52.0), (16.0, 56.0)]
+    rows = [{"codec": "GNC", "bpp": b, "psnr_y": q, "psnr_rgb": q, "de00_mean": 0.0}
+            for b, q in base]
+
+    # 1. A curve against itself is 0% by construction.
+    same = [dict(r, codec="Same") for r in rows]
+    bd = bd_summary(rows + same, "psnr_y")
+    check("identical curves", bd[0][1], 0.0, tol=1e-6)
+
+    # 2. Scaling every rate by 1.25 must read as exactly +25%: BD-rate is a ratio of integrated
+    #    log-rate, so a constant factor comes through untouched whatever the fit does.
+    cheap = [dict(r, codec="Cheap", bpp=r["bpp"] / 1.25) for r in rows]
+    bd = bd_summary(rows + cheap, "psnr_y")
+    check("reference 20% cheaper everywhere", bd[0][1], 25.0, tol=1e-6)
+
+    # 3. An arm that overlaps by less than 3 dB must return no number at all, not a landslide.
+    #    The first run of this harness reported -58.6% and -65.7% from overlaps of 0.1 and 2.5 dB.
+    narrow = [{"codec": "Narrow", "bpp": b, "psnr_y": q, "psnr_rgb": q, "de00_mean": 0.0}
+              for b, q in [(1.0, 55.0), (2.0, 55.5), (4.0, 56.0), (8.0, 56.4)]]
+    bd = bd_summary(rows + narrow, "psnr_y")
+    got = bd[0][1]
+    print(f"  {'pass' if got is None else 'FAIL'}  1.4 dB overlap: "
+          f"{'refused, ' + bd[0][4] if got is None else f'returned {got:+.1f}%'}")
+    ok = ok and got is None
+
+    # 4. Matched-rate interpolation must land on a measured point exactly when asked for its rate.
+    incumbent = [{"image": "x", "codec": "Other", "rung": "r", "bpp": 4.0,
+                  "psnr_y": 40.0, "psnr_rgb": 40.0, "de00_mean": 1.0}]
+    m = matched_rate_table(incumbent, [dict(r, image="x", rung="q") for r in rows])
+    at = m[0][1]["psnr_y"] if m else None
+    check("interpolation at a measured rate", at, 48.0, tol=1e-9)
+
+    print("selftest:", "all pass" if ok else "FAILURES — do not trust the BD-rate column")
+    return 0 if ok else 1
+
+
 def main():
     root = repo_root()
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--images", nargs="+", required=True)
+    ap.add_argument("--images", nargs="+", help="reference PNGs (not needed with --selftest)")
     ap.add_argument("--gnc-binary", default=str(root / "target/release/gnc"))
     ap.add_argument("--qualities", default="60,75,85,90,95,99",
                     help="GNC quality ladder (default spans the contribution operating point)")
@@ -515,7 +568,14 @@ def main():
                     help="VC-2 quantisation matrix; 'flat' is its own optimise-for-PSNR setting")
     ap.add_argument("--csv", default=None)
     ap.add_argument("--keep", action="store_true", help="keep the decoded PNGs for inspection")
+    ap.add_argument("--selftest", action="store_true",
+                    help="validate the BD-rate and interpolation machinery and exit")
     args = ap.parse_args()
+
+    if args.selftest:
+        sys.exit(selftest())
+    if not args.images:
+        ap.error("--images is required unless --selftest is given")
 
     arms = [a.strip() for a in args.arms.split(",") if a.strip()]
     unknown = set(arms) - set(ARM_ORDER)

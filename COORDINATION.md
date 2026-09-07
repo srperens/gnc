@@ -386,7 +386,10 @@ wrong conclusions have come from this one error.
 - **q=100 verified bit-exact lossless** on all three entropy coders. GOALS' "no true lossless with
   Rice" was stale and is corrected. GNC beats JPEG 2000 lossless by 10.8% and PNG by 7.8%; loses to
   FFV1 by 27% and x264 `-qp 0` by 43%, both of which predict against the neighbour.
-- **Note on numbering:** BUG-11 was assigned twice on 2026-09-06 (Rice tile width, and intra
+- **BUG-16 is taken** (2026-09-07, filed by `abacship`): Rice's GPU and CPU encode paths disagree
+on the coefficients at q≤30 and at subsampled chroma. Unclaimed, on the default path, P2.
+
+**Note on numbering:** BUG-11 was assigned twice on 2026-09-06 (Rice tile width, and intra
   prediction). The intra one has been renumbered **BUG-13**. Check this file before taking a number.
 
 Newest first. If you have measurements taken before one of these, they are suspect.

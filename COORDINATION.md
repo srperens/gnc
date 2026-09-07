@@ -59,6 +59,36 @@ the shared checkout** — no absolute paths, no session ids.
 |---|---|---|
 | `../gnc-abac`, `.claude/worktrees/abac` (`abac-gate`) | `abac` | **released — question answered, see BACKLOG Part 6.** The idle-machine bench is run. Range at cb=64 costs **1.69× frame decode for −16.7% rate** at q=90; Interval costs 3.99×. Rice's own entropy stage is 47% of frame decode, which caps any entropy work at 1.9×. What remains is a positioning call, not an engineering one. |
 | `../gnc-abac` | `abac` | same worktree, now on **BUG-8** — the encoder's local decode diverges from the real decoder down a GOP. |
+| `../gnc-chroma2` | `chroma2` | **CHROMA-2** — is the dE00 win over x264 an allocation artefact? Control: give x264 `--chroma-qp-offset` matching GNC's split, re-measure at matched total rate. Also **owns the test-material refetch** (see below). |
+| `../gnc-abacship` | `abacship` | (unclaimed row — added by the chroma2 session from `git worktree list`; whoever owns it, describe it.) |
+| `../gnc-nearlossless` | `nearlossless` | (unclaimed row — added by the chroma2 session from `git worktree list`; whoever owns it, describe it.) |
+
+## The test material was missing entirely, and the `chroma2` session is refetching it (2026-09-07)
+
+**`test_material/frames` did not exist anywhere on disk** at the start of 2026-09-07 — not in the
+shared checkout, not under any worktree. The 2026-09-06 `ln -sfn` accident is the likely cause: the
+link was restored that day, but the ~31 GB directory it pointed at is gone. Nothing on disk
+survived it.
+
+**Who is fetching: the `chroma2` session.** It is running `test_material/fetch_test_frames.sh`
+into the **shared checkout** (`test_material/frames`), which is where the directory belongs and
+what every worktree's symlink resolves to. Started 2026-09-07 ~19:10.
+
+**Do not start a second fetch.** Two concurrent runs write the same paths and the script's
+`[skip] already exists` guard checks for a file that a half-finished download also satisfies, so a
+second run will happily skip a truncated PNG. If you need the material and it is not there yet,
+wait, or ask the chroma2 session.
+
+**What the script does and does not restore.** It fetches four single frames (`bbb_1080p`,
+`blue_sky_1080p`, `kristensara_720p`, `touchdown_1080p`) and two 8-frame sequences (`bbb`,
+`blue_sky`, each with a generated `.y4m`). It does **not** fetch `old_town`, `aerial`, `crowd_run`,
+`rush_hour`, `stockholm` or anything else quoted in RESEARCH_LOG — those were multi-GB and were
+never in the script. It does not restore `frames/hdr/` either; regenerate that with
+`scripts/png16.py` if a 10-bit measurement is needed.
+
+**So any measurement in this repo naming a sequence outside that list cannot currently be
+reproduced.** That is not a retraction of those numbers, but treat "re-measure X on old_town" as
+blocked until someone re-fetches it, and say which sequences a new result actually used.
 
 ## Timing: an idle machine is necessary and NOT sufficient (added 2026-09-06, after an idle run still lied)
 

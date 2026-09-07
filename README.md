@@ -2,7 +2,7 @@
 
 Research project exploring what video compression looks like when designed from scratch for GPU parallelism, rather than adapting CPU-era algorithms.
 
-**Rust + wgpu compute shaders (WGSL). Cross-platform: Metal, Vulkan, DX12, WebGPU/WASM. Patent-free.**
+**Rust + wgpu compute shaders (WGSL). Written against the WebGPU feature set — Metal, Vulkan, DX12, WebGPU/WASM. Patent-free.** Metal is the only backend GNC is measured on end to end; see [Portability, as measured](#portability-as-measured) before relying on any of the others.
 
 ## Why
 
@@ -10,13 +10,13 @@ Traditional codecs (H.264, HEVC, AV1) are shaped by decades of CPU constraints �
 
 GNC asks: if you start from zero with a GPU-first mindset, what do you end up with?
 
-The answer so far: tile-independent processing, fully parallel entropy coding (256 independent streams per tile), and wavelet transforms that map naturally to GPU workgroups. It runs a full I/P/B video pipeline in real time at 1080p on an eight-core integrated GPU.
+The answer so far: tile-independent processing, fully parallel entropy coding (256 independent streams per tile), and wavelet transforms that map naturally to GPU workgroups. It runs a full I/P/B video pipeline at 1080p on an integrated GPU. *(This line claimed "in real time … on an eight-core integrated GPU" until 2026-09-08. The core count was the wrong-hardware label BUG-29 retired, and "real time" is not what this project's own figures say — 1080p end to end is 5.0 fps. See [Video sequence](#video-sequence).)*
 
 GNC is deliberately **broad**: intra and inter, 4:2:0 / 4:2:2 / 4:4:4 at 8 and 10 bits, and a quality range that runs from heavy compression through visually lossless to bit-exact lossless. The uses it is built for — contribution links, mezzanine and archival storage, low-latency preview, browser playback — encode about as often as they decode, which bounds how much encoder *search* is worth buying but not the compression target: that is roughly H.264-class across the whole range. Every figure below therefore names the operating point it was measured at, because several of this project's retracted results came from measuring one end and quoting it as if it described the codec.
 
 ## Status
 
-**Working end to end:** I/P/B video pipeline with motion estimation, 8- and 10-bit, 4:4:4 / 4:2:2 / 4:2:0, three interchangeable entropy coders, and bit-exact lossless at `q=100`. Runs on Metal, Vulkan, DX12 and WebGPU.
+**Working end to end:** I/P/B video pipeline with motion estimation, 8- and 10-bit, 4:4:4 / 4:2:2 / 4:2:0, five entropy coders of which three are selectable (Rice, `--rans`, `--abac`; Huffman and Bitplane are parked), and bit-exact lossless at `q=100`. **On Metal.** What runs on the other three backends is measured below and is less than this sentence used to claim.
 
 **Where it stands against H.264** (measured 2026-09-06, `scripts/meas1_vs_h264.py`, 1080p, ki=9, x264 at defaults):
 
@@ -44,7 +44,7 @@ GNC is deliberately **broad**: intra and inter, 4:2:0 / 4:2:2 / 4:4:4 at 8 and 1
   is the entropy coder: J2K's is EBCOT, and `--abac` closes **exactly half** of it (ENT-4, −16.0%
   of rate at bit-identical pixels on 24 of 24 rungs). With `--abac` GNC matches ProRes 4444 and is
   ahead of JPEG XS 4:4:4 on RGB PSNR, and stays behind both on luma — an entropy coder does not
-  move bits between planes. Where the remaining 27% lives is not yet known.
+  move bits between planes. **Where the remaining 27% lives is now mostly accounted for** (INTRA-1, 2026-09-08, decisions `0026`–`0028`): entropy coding ≤7.5 points, chroma rate allocation 8.5 and *not* a coding deficiency, tiling 0.6% realisable, cross-tile allocation 0.95%, tile-boundary handling 0, and a dead zone worth ~3 — intra-only, because on video it costs up to 1.93 dB of worst-frame PSNR. **~6 points remain unexplained**, with no candidate left on the list.
   The 4:2:2 arms — JPEG XS 4:2:2, ProRes 422 — cannot be BD-rate compared at all: chroma
   subsampling caps them at 39–45 dB RGB PSNR, below GNC's range, and at matched rate GNC beats
   both on luma and colour, which is what full chroma resolution buys rather than a coding result.
@@ -53,6 +53,28 @@ GNC is deliberately **broad**: intra and inter, 4:2:0 / 4:2:2 / 4:4:4 at 8 and 1
 **Off by default, and why:** the B-frame pyramid (costs 7–31% in rate on camera content and 160 ms in latency), temporal wavelet mode (loses 2–5 dB on high motion), and motion-compensated temporal filtering (measured 1.04–1.14x *worse* than a P-frame chain on every sequence tested).
 
 See [`RESEARCH_LOG.md`](RESEARCH_LOG.md) for every measurement, including the ones that failed — roughly two dozen ideas have been tested and rejected, and they are written up as carefully as the wins.
+
+## Portability, as measured
+
+GNC targets the WebGPU feature set and asks wgpu for its *default* limits rather than the
+adapter's, so the same WGSL is meant to run everywhere. That is the design. This is the evidence,
+as of 2026-09-08:
+
+| backend | status | evidence |
+|---|---|---|
+| **Metal** | measured end to end | every figure in this README |
+| **Vulkan** | intra encode and decode run; **inter coding does not** | CANARY-1 on an RTX 4000 Ada, 13.95 ms encode / 7.29 ms decode. `block_match_split.wgsl` segfaults the NVIDIA and lavapipe drivers, so P/B coding is unreachable there (BUG-25, open) |
+| **DX12** | **never run** | no measurement exists in this repository |
+| **WebGPU / WASM** | compiles; **not verified in a browser**, and one known blocker | both abac GPU shaders declare 18 688 B of workgroup storage against WebGPU's 16 384 B limit. Native wgpu does not enforce it; a conformant implementation must. The decoder builds the abac decoder unconditionally, so if it bites, *every* WASM decode fails, Rice files included (BUG-31, open) |
+
+Two of these four rows are open bugs and one is an untested claim, which is why the top of this
+file no longer states cross-platform support as a fact. GNC is *written* to be portable; it is
+*measured* on Metal.
+
+Cross-backend output has been compared once (2026-09-07): at `q=100` Metal and Vulkan produce
+byte-identical files, and at `q=75` they differ by one byte in 1.17 MB. Every file decodes to
+identical pixels on both. **The decoder is bit-exact across backends and the lossy encoder is
+not** — so conformance must require decoder bit-exactness, not encoder reproducibility.
 
 ## Current Results (1080p, bbb reference, Apple M5 Pro GPU)
 
@@ -243,7 +265,7 @@ nothing else in this file should.*
 
 ## WebGPU / WASM
 
-The full decoder compiles to WebAssembly (263 KB) and runs in browsers via WebGPU:
+The full decoder compiles to WebAssembly (263 KB) and is intended to run in browsers via WebGPU. **A browser render has never been verified** — see [Portability, as measured](#portability-as-measured), including BUG-31, which would fail every WASM decode if a conformant implementation enforces the workgroup-storage limit that native wgpu does not:
 
 ```bash
 wasm-pack build --target web --release

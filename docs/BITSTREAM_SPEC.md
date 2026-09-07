@@ -350,9 +350,11 @@ from the same symbols.
 **Block geometry is derived, not transmitted.** Both sides enumerate the tile's subbands in Mallat
 order (LL first, then HL/LH/HH per level outward) and cut each into `cb × cb` blocks in raster
 order; a subband smaller than `cb` becomes one short block. `abac_tile::code_blocks` is the single
-definition and the encoder, the CPU decoder and the GPU decoder all call it — a second copy of the
-loop is how a coverage bug gets in, and a coverage bug here makes the file *smaller* while every
-individual block still round-trips.
+definition and the CPU encoder, the GPU encoder, the CPU decoder and the GPU decoder all call it —
+a second copy of the loop is how a coverage bug gets in, and a coverage bug here makes the file
+*smaller* while every individual block still round-trips. The GPU encoder added by ENT-5
+(2026-09-07) does not re-derive the geometry in WGSL: it calls `code_blocks` on the host and
+uploads the result, which is what keeps the single-definition property true of a shader.
 
 Blocks never straddle a subband boundary: coefficients either side have different orientation and
 different statistics, and the context model assumes a block is homogeneous.

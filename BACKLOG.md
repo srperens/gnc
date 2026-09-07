@@ -121,6 +121,47 @@ masking, smaller tiles, prediction *before* the wavelet.
 
 ## Active priority list
 
+### DOC-1 — five stale prose claims in the public README (**DONE 2026-09-08**)
+
+Line numbers below are where each was **found**, before the edit shifted them; the two live pointers (`README.md:192`, `abac_gpu_encode.rs:381`) are post-edit and were re-checked.
+
+Found by auditing the top-level docs after BUG-29 and PERF-1 both swept them. The *numbers* were
+current — PERF-1 had just retired 31.7 fps everywhere and BUG-29 had replaced "M1" with "M5 Pro"
+in every labelled figure. **Every one of the five was prose that no measurement pointed at**,
+which is the same category BUG-29 itself was: a sentence nobody re-reads because it carries no
+number to check.
+
+1. **`README.md:13` — "in real time at 1080p on an eight-core integrated GPU".** Both halves
+   wrong. The core count is the hardware label BUG-29 retired; "real time" contradicts line 97 of
+   the same file (5.0 fps end to end). BUG-29 fixed the two places that named the chip and missed
+   this one *because* it names no figure.
+2. **`README.md:5` and `:19` — "Cross-platform: Metal, Vulkan, DX12, WebGPU/WASM" / "Runs on
+   Metal, Vulkan, DX12 and WebGPU", both stated as fact.** Of the four: Metal is measured; Vulkan
+   runs intra only (BUG-25's `block_match_split` crash makes P/B unreachable); DX12 has never been
+   run at all; WASM has never been verified in a browser and BUG-31 says a conformant WebGPU would
+   fail every decode. Replaced with a **Portability, as measured** section giving the four rows and
+   their evidence, plus the cross-backend bit-exactness result. This is the one that mattered: it
+   was the public README asserting support the repository's own open bugs contradict.
+3. **`README.md:19` — "three interchangeable entropy coders"** against line 192's "five entropy
+   coding backends", in the same file. Now: five implemented, three selectable.
+4. **`README.md:46` — "Where the remaining 27% lives is not yet known."** INTRA-1 decomposed it
+   the same evening (`0026`–`0028`): entropy ≤7.5, chroma allocation 8.5 and not a deficiency,
+   tiling 0.6%, cross-tile 0.95%, tile-boundary 0, dead zone ~3 intra-only. ~6 points remain.
+5. **`docs/BITSTREAM_SPEC.md` §2.6** listed "the encoder, the CPU decoder and the GPU decoder" as
+   the callers of `abac_tile::code_blocks`. ENT-5 added a fourth. Checked rather than assumed:
+   `abac_gpu_encode.rs:381` calls `code_blocks` on the host and uploads the geometry, so the
+   single-definition property the paragraph exists to assert is still true — the shader does not
+   re-derive it. Sentence corrected and the reason recorded, since "a shader calls a Rust function"
+   is exactly the claim a reader would doubt.
+
+Documentation only; no code, no shader and no bitstream touched, so no measurement moves and the
+GPU test suite was deliberately not run — it would have taken the GPU from seven sessions to prove
+something a `git diff --stat` of two `.md` files already proves.
+
+**No decision record.** Nothing was chosen; five claims were checked against evidence that already
+existed and four of them lost. The one judgement call — softening the portability claim rather than
+deleting it — is argued in the section itself.
+
 ### BUG-5 — B-frames stop paying on camera content (**FIXED 2026-09-06** — pyramid off by default)
 Measured 2026-09-05 on 17 byte-identical 1080p frames (bbb, 4:4:4, Rice, fixed qstep, rate
 control off) — content where the correct answer for every inter frame is "nothing changed".

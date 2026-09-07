@@ -81,14 +81,26 @@ not asserted. It passes.
   you claim to be. It excludes racing sessions, not sessions that ignore it. Mitigation is that
   LOOP step 1 and COORDINATION rule 0b now both put the `take` before the work, and the seeded
   claims mean `scripts/claim list` is informative from the first read.
-- **Stale claims.** A session that dies holding one leaves it held. There is no heartbeat daemon;
-  `list` shows an age, `touch` refreshes it, and `steal` requires an explicit reason and records
-  who it was taken from. Deliberately manual: expiring a claim automatically would eventually
-  expire a live one.
-- **Two sessions in one worktree**, which is the more damaging half of what happened today. A claim
-  on an *item* does not stop a second session `cd`-ing into your worktree. If that needs fixing it
-  is a separate mechanism — a claim on the worktree path, or rule 0 refusing to run where a claim
-  already exists.
+- **Stale claims, partly.** A session that dies holding an *item* leaves it held; `list` now marks
+  it `SESSION GONE, safe to steal`, but nothing frees it on its own. Deliberately manual for items
+  — automatic expiry would eventually expire a live one, and an item's claim carries a
+  half-finished train of thought. Worktrees are the exception and reclaim automatically, because
+  there the holder's death is unambiguous and the cost of waiting is a directory nobody can use.
+- ~~**Two sessions in one worktree**~~ — **fixed within the hour, because it bit immediately.**
+  Two things were wrong in the first version. Identity was `<worktree>@<branch>`, which makes two
+  sessions in one worktree *the same principal*: the other session's `touch` succeeded against my
+  claim, so the mechanism excluded every session except the one it needed to. And a claim on an
+  item does not protect a directory at all. Identity is now `<worktree>@<branch>#s<pid>` where the
+  pid is the session's own `claude` process — stable across calls, and the same number the peer
+  sockets already use as an address — and `scripts/claim worktree` claims the directory under the
+  same CAS. It refuses when a live other session holds it, takes over automatically when the
+  holder's session is gone (a finished session's worktree is free; that is the normal case), and
+  refuses to claim the shared checkout, which is shared on purpose. The pid also turns "stale
+  claim" from a guess into a check: `list` marks one `SESSION GONE, safe to steal` when `kill -0`
+  on the holder fails.
+
+  Worth recording that the first version's own bug was to lock the shared checkout — the one
+  directory every session legitimately meets in.
 
 ## Also corrected while here
 

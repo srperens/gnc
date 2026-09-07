@@ -9956,7 +9956,25 @@ Note what it is *not*: sub-unit qstep is not wasted precision in PSNR terms. qst
 RATE-1's framing — that the ladder buys precision an 8-bit output cannot show — is not what is
 happening here. The rungs are priced correctly against each other and mispriced against lossless.
 
-### Filed rather than fixed, with the options priced
+### Two sessions found this defect within the hour, and the other one filed it better
+
+Worth recording as a coordination fact, not just a codec one: the RATE-1 session's sweep hit the
+same dominance from the other side and landed `RATE-2` in BACKLOG (commit `c267a7f`) while this was
+being written. Both filings used the same number. **Their entry is the one that stands** — it
+locates the dominance per image in *q* and adds the synthetic counter-examples that bound it
+(smoothramp, flat and noise are not dominated, because MED is poor on ramps and on noise, so the
+dominance appears wherever MED does well, i.e. on every photographic image). This run's
+contribution to it is a second measurement on different inputs — crops rather than full frames,
++1.6% to +33.2% instead of their +9.3% to +40.6%, agreeing in sign and cause — plus the boundary in
+qstep terms and the observation below that sub-unit qstep is not the mechanism.
+
+Two independent measurements of one defect on different inputs is worth more than either alone, so
+the collision cost little here. It cost a duplicate BACKLOG entry and a duplicate number, which the
+CAS claim mechanism (`scripts/claim`) exists to prevent and neither of us used, because neither of
+us was looking for this item when we found it. **A claim taken when you pick an item does not cover
+what you trip over inside it.**
+
+### The options, priced
 
 Three ways to close it, and the cheapest correct one costs encode time, so it wants the idle-machine
 treatment rather than a guess (COORDINATION rule 1):

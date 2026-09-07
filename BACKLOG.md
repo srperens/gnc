@@ -450,28 +450,6 @@ Seen in passing, both at q=100 with MED active, both silent: **`--huffman` emits
 (BUG-14's session has this) and **`--rans` falls back to the wavelet path**, byte-identical to
 `GNC_MED=0`. Only the default coder (Rice) delivers the MED path.
 
-### RATE-2 — the top of the lossy ladder is dominated by lossless (todo, P1)
-On three of four images **every quality point above roughly q=96 costs more bits than bit-exact
-lossless**, which is also better on every axis. Ask for q=97 and the encoder spends 20-33% more
-than it needs to and returns a worse picture. Measured on the shipped encoder, not a model:
-
-| image | lossless (q=100) | q=99 (qstep 0.75) | first qstep that is *not* dominated |
-|---|---|---|---|
-| bbb | 2 415 436 | 2 454 001 @ 59.92 dB (+1.6%) | 0.9 (57.21 dB) |
-| blue_sky | 1 598 293 | 2 107 664 @ 60.28 dB (+31.9%) | 1.6 (52.51 dB) |
-| kristensara | 538 678 | 717 257 @ 59.83 dB (+33.2%) | 1.6 (52.30 dB) |
-| touchdown | 1 969 244 | 2 362 696 @ 59.82 dB (+20.0%) | 1.3 (53.58 dB) |
-
-Cause: LOSSLESS-1 moved q=100 by −14.9% and nobody re-measured the ladder above it. **Not**
-RATE-1's mechanism — sub-unit qstep is priced correctly against the other lossy rungs (qstep 0.75
-buys 3.9 dB over 1.0 for 13% more bits); it is mispriced only against lossless.
-
-Options, priced: (1) **RD decision at q >= 96, encode both and emit the smaller** — strictly
-correct since the lossless arm dominates on both axes, costs a second encode pass, throughput not
-measurable while the machine is shared; (2) **clamp the ladder** at about qstep 1.3 — free, but
-deletes operating points RATE-1 argues should stay for 10-bit; (3) document only — wrong. Build (1)
-behind a switch and measure it against (2) on an idle machine.
-
 ### INTRA-NEARLOSSLESS — MED instead of the wavelet does not survive into the lossy range (**CLOSED BY MEASUREMENT 2026-09-07**)
 Gate run and **failed on its criteria set beforehand** (pass: >=10% luma BD-rate, consistent in
 sign). Closed-loop JPEG-LS near-lossless model, calibrated per image against the real q=100 file
@@ -1826,6 +1804,30 @@ alternative is to stop advertising q=95-99.
 
 **Do not measure a contribution operating point at q=95-99 without knowing this.** Any BD-rate
 whose ladder includes those rungs has scored GNC through its dominated range.
+
+**Confirmed independently, different inputs, same day** (INTRA-NEARLOSSLESS session, found while
+measuring the ladder's top for a different item — the two sessions collided on this defect and
+both filed it as RATE-2; this entry is the one that stands). Padding-neutral crops (1536x1024,
+1024x512 for kristensara) rather than full frames, so the penalties differ in size while agreeing
+in sign and cause: q=99 against bit-exact q=100 is **+1.6% (bbb), +20.0% (touchdown), +31.9%
+(blue_sky), +33.2% (kristensara)**.
+
+That run adds the boundary in **qstep** terms, which is what a fix has to be written against.
+Sweeping `--qstep` at q=99, the coarsest-first rung that still costs *less* than bit-exact:
+
+| image | first non-dominated qstep | its quality |
+|---|---|---|
+| blue_sky | 1.6 | 52.51 dB |
+| kristensara | 1.6 | 52.30 dB |
+| touchdown | 1.3 | 53.58 dB |
+| bbb | 0.9 | 57.21 dB |
+
+The anchor ladder reaches qstep 1.30 at q=96 and 0.75 at q=99, so on three of four images the whole
+band above q≈96 is dominated. It also rules out one framing: **sub-unit qstep is not wasted
+precision in PSNR terms** — qstep 0.75 buys 3.9 dB over qstep 1.0 for 13% more bits on bbb
+(59.92 vs 56.01 dB), a normal RD slope. The lossy rungs are priced correctly against each other and
+mispriced only against lossless, which is what makes option (1) — compare and keep the smaller —
+the right shape of fix rather than a ladder clamp.
 
 ### MEAS-2 — Feature toggling: what contributes and how much? (todo, P3)
 

@@ -33,14 +33,24 @@ project is for.
 1. Read [BACKLOG.md](BACKLOG.md). Pick the item with the best value-to-effort ratio that is not
    blocked — not necessarily the highest-numbered priority.
 
-   **Check the claims table in [COORDINATION.md](COORDINATION.md) before you pick, and mark the
-   item in BACKLOG itself once you have.** The two files disagree by construction: the claim is a
-   row in COORDINATION, but the pick is made from BACKLOG, where a taken item still reads
-   `(todo, P1)`. On 2026-09-07 that sent several sessions at MEAS-9 at once — with CANARY-1
-   hardware-blocked and CHROMA-2 taken, it was the only startable P1, so five sessions applying
-   this rule to the same list got the same answer within the same two minutes, before any row
-   could be written. Edit the heading to `(in progress <date>, <worktree>)`; the marker already
-   exists in BACKLOG and is used once in the whole file.
+   **Then claim it atomically, and do not start until the claim succeeds:**
+
+   ```bash
+   scripts/claim list                        # what other sessions hold
+   scripts/claim take <ITEM> "why, briefly"  # non-zero means someone beat you to it: pick again
+   ```
+
+   A markdown table cannot exclude anyone. Reading it, deciding, and writing your row are three
+   steps, and eight instances run against this checkout — so sessions that start together all read
+   "free". On 2026-09-07 that sent several at MEAS-9 at once: with CANARY-1 hardware-blocked and
+   CHROMA-2 taken it was the only startable P1, so every session applying this rule to the same
+   list got the same answer inside the same two minutes, before any row could be written. Being
+   deterministic is exactly what makes the collision reliable rather than unlikely.
+
+   `scripts/claim` is a compare-and-swap on a ref in the shared `.git`, so it is atomic and
+   instantly visible to every worktree — see COORDINATION.md rule 0b. Also mark the heading in
+   BACKLOG `(in progress <date>, <worktree>)`, so the file you pick *from* stops advertising a
+   taken item, and `scripts/claim drop <ITEM>` when you are done.
 2. **Measure the current state before changing anything.** A change with no before-number is not
    an improvement, it is a hope.
 3. Make the change.

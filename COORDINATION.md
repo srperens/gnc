@@ -26,6 +26,40 @@ ln -s "$(readlink "$REPO/test_material/frames" || echo "$REPO/test_material/fram
       test_material/frames
 ```
 
+## Rule 0b — claim the item atomically, before you touch it
+
+**The table below is documentation. `scripts/claim` is the lock.** Eight instances now run
+against this one checkout, and reading the table, deciding, and writing your row are three
+separate steps — so sessions that start together all read "free" before any of them writes. That
+is not a hypothetical: on 2026-09-07 several sessions picked MEAS-9 at the same time and a
+duplicate row had to be cleaned up by hand.
+
+```bash
+scripts/claim list                       # what is held, by whom, for how long
+scripts/claim take MEAS-9 "why, briefly" # atomic: exactly one session can win this
+scripts/claim touch MEAS-9               # heartbeat, so the age in `list` stays honest
+scripts/claim drop MEAS-9                # when you are done
+```
+
+A refused `take` prints the current owner and exits non-zero, so it is safe in a script: if it
+fails, pick something else. **If it succeeds, the item is yours and no other session can take it.**
+
+Why this is atomic and needs no new infrastructure: every worktree shares one `.git`, so
+`refs/claims/*` is visible to all of them the instant it is written — no fetch, no daemon, no lock
+file in the working tree — and `git update-ref <ref> <new> <old>` is a compare-and-swap under
+git's own ref lock, where an empty `<old>` means "must not exist". `scripts/claim selftest` races
+16 processes for one claim and asserts exactly one wins; run it if you doubt it.
+
+Claims are metadata blobs — `git cat-file -p refs/claims/MEAS-9` shows the owner, the time and the
+commit it was taken against. Nothing is pushed; the contention is local to this machine.
+
+**If a session is gone and its claim is not:** `scripts/claim steal <ITEM> "<why>"`. It demands a
+reason, records who it was taken from, and is itself a compare-and-swap, so two sessions stealing
+at once cannot both win. Do not steal a claim whose age is minutes; do not leave one held for
+hours without a `touch`.
+
+Then add your row to the table below, for the prose the ref cannot carry.
+
 `test_material/` itself is tracked (it holds the fetch script), so symlink `frames` inside it
 rather than replacing the directory. Then work only in that directory, and add your row to the
 table below. Each worktree has its own
@@ -53,7 +87,8 @@ Clean up when the area is done: `git -C "$REPO" worktree remove "$REPO-$AREA"`.
 ## Worktrees currently out
 
 Add your row when you create one, remove it when you are done. Write the worktree **relative to
-the shared checkout** — no absolute paths, no session ids.
+the shared checkout** — no absolute paths, no session ids. **This table does not exclude anyone —
+`scripts/claim` does (rule 0b). Take the claim first; the row is the explanation, not the lock.**
 
 | worktree | branch | area |
 |---|---|---|

@@ -131,7 +131,9 @@ than something to do in passing.
 ## Builds queue on one lock, and that looks like a hang
 
 Each worktree has its own `target/`, so builds no longer block on each other's **target** lock —
-that alone is worth the disk. **They do still block on the package-cache lock**, and that
+that alone is worth the disk. It also used to mean each worktree compiled the same 264
+dependency crates from scratch; a shared sccache now covers that — see "Builds share one
+compilation cache" below. **They do still block on the package-cache lock**, and that
 surprised the `abacship` session on 2026-09-07: `cargo test --release` sat at `Blocking waiting for file lock on package cache` for
 minutes while other sessions compiled, with 35 `rustc` processes on the machine. The lock is in
 `~/.cargo`, which every worktree shares; a separate `target/` does not help. So **a build queued
@@ -379,6 +381,65 @@ So:
   that runs the whole set in one command. Then one idle-machine run settles it. `abac` does this:
   `GNC_ABAC_CODER` selects the entropy coder variant and
   `cargo test --release --test abac_bench -- --ignored --nocapture` times every combination.
+
+## Builds share one compilation cache, and cargo is capped at 6 jobs (2026-09-07, buildperf)
+
+**Two settings now live in `~/.cargo/config.toml`. Nothing is committed — they describe this
+machine, not the project — so a fresh clone elsewhere is unaffected.** Decision record
+[0021](docs/decisions/0021-builds-share-one-compilation-cache.md) has the full reasoning.
+
+```toml
+[build]
+rustc-wrapper = "sccache"   # shared artefacts across all ten worktrees
+jobs = 6                    # three concurrent builds fit 18 cores exactly
+```
+
+Why, in two numbers measured at 20:14 with five sessions in their gates: **load average 47.0 on 18
+cores**, and **no `.cargo/config.toml` anywhere on the machine**. Every cargo therefore took the
+default `-j` = 18, so five concurrent gate runs asked for 90 parallel rustc jobs. Separately, ten
+`target/` directories held **~10.6 GB** of the same 264 dependency crates compiled ten times.
+
+**What this changes for you:**
+
+- **A lone session now gets 6 of 18 cores** and builds slower than it used to. If you are genuinely
+  alone — rare at eight instances — use `cargo build -j18` or `CARGO_BUILD_JOBS=18`. Do not raise
+  the value in the config file; the next session to build will be sharing with you.
+- **Your existing warm `target/` is untouched** and you will notice nothing until a clean build or
+  a rebase that invalidates dependencies. A *new* worktree is where the cache pays: measured
+  **80.67 % hit rate** on an empty worktree at the same commit, a hit costing 0.077 s against
+  2.725 s to compile.
+- **Proc-macros and binaries are never cached** (`crate-type`), so a floor of per-worktree
+  compilation remains. 118 such calls in a full build.
+- **A shader edit is safe.** This was the one thing that could have made the cache dangerous: 61
+  `include_str!` sites pull the WGSL files into the Rust crates, and a cache that ignored them
+  would serve a stale object after a shader edit — you would measure a codec you had not written.
+  Tested before enabling: editing the `.wgsl` produces a cache **miss**, and the artefact carries
+  the new shader. `sccache --show-stats` is the canary if you ever doubt it.
+- **The cache is worth more the busier the machine is**, which is unintuitive and useful. Measured
+  at load ~36 and again at load ~70: `Average compiler` went 2.725 s -> **13.481 s** while
+  `Average cache read hit` went 0.077 s -> **0.086 s**. Compiling got 4.9x more expensive under
+  contention; reading the cache did not. So the cap and the cache are not substitutes — the cap
+  lowers contention, the cache makes what remains cheap — and the benefit peaks exactly when five
+  sessions hit their gates together.
+- **When a test goes red just after this landed, it will look like the cache.** It probably is not.
+  The first gate run here went red on `abac_handles_subsampled_chroma`, which turned out to be
+  BUG-17 on the old base, not a stale object. A serial re-run and `git log` settle it faster than
+  reasoning about the cache does.
+- **`sccache --show-stats` is machine-wide and cumulative**, so it mixes all sessions together.
+  `sccache --zero-stats` before a build you want to read in isolation.
+
+**`--offline` does not avoid the package-cache lock — do not re-test it.** It was the obvious
+candidate, since `Cargo.lock` is committed and every crate is already in the registry. Holding the
+lock from another process and running a no-op build both ways: plain `cargo build --release`
+blocked past 15 s and printed `Blocking waiting`, and `--offline` blocked past 15 s and printed it
+too, while both finished in 1–2 s with the lock free. Cargo takes the lock whether or not anything
+needs fetching. The paragraph above about queued builds stands unchanged.
+
+**If the load average still sits above ~30 with the cap in place**, the next step is a build
+semaphore — a `scripts/build` wrapper holding one of N slots, `flock` via `python3` since macOS has
+no `flock(1)`. It is deliberately not built yet: it binds only if every session calls it, and that
+is a convention rather than a lock. Rule 0b exists because this repository already learned what
+conventions are worth here.
 
 ## The four rules that have actually bitten us
 

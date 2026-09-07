@@ -71,7 +71,23 @@ shared checkout, not under any worktree. The 2026-09-06 `ln -sfn` accident is th
 link was restored that day, but the ~31 GB directory it pointed at is gone. Nothing on disk
 survived it.
 
-**Who is fetching: the `chroma2` session.** It is running `test_material/fetch_test_frames.sh`
+**DONE — the material is back (2026-09-07 ~19:30), and it reproduces BASELINE.** All 22
+artefacts are present and verified, and `q=75` on `bbb_1080p` reads **44.84 dB / 4.53 bpp**,
+exactly the committed figure. Symlink your worktree at it per rule 0 and carry on.
+
+**Two things the refetch turned up, both now fixed in `fetch_test_frames.sh`:**
+
+- **The script exited 0 with the blue_sky sequence missing.** ffmpeg 9 removed `-vsync` (renamed
+  to `-fps_mode` back in 5.1), the extraction died on the unrecognised option, and `|| true`
+  swallowed it. The script now probes which option the installed ffmpeg takes — it runs on more
+  than one machine, so pinning either one just moves the breakage — and ends with an explicit
+  per-file check of all 22 artefacts that exits non-zero if any is missing.
+- **Do not edit a bash script while it is running.** Bash reads the file incrementally, so
+  rewriting it mid-run made the next read land at a shifted offset and the run died with
+  `syntax error near unexpected token '50-57'` — after the download, before the verification.
+  Cost a whole extra pass. Edit, then run.
+
+**Who fetched: the `chroma2` session.** It is running `test_material/fetch_test_frames.sh`
 into the **shared checkout** (`test_material/frames`), which is where the directory belongs and
 what every worktree's symlink resolves to. Started 2026-09-07 ~19:10.
 

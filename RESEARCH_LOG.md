@@ -4,6 +4,112 @@
 
 ---
 
+## INTRA-1 step 2c — the dead zone is worth 3 points on stills and a regression on video; boundary handling closed; BUG-30 (2026-09-08)
+
+Two candidates were left after 0027, both cheap. Both are now settled, and one of them **corrects a
+claim I published in 0027**.
+
+### 1. Tile-boundary handling — closed, it was already correct, and 0027 said otherwise
+
+0027 and its log entry describe `transform_97.wgsl` as one that "replicates the edge sample where
+J2K uses symmetric extension". **Wrong, and withdrawn.**
+
+The shader's edge rules, in the *split* arrays, are `low[half] := low[half-1]` and
+`high[-1] := high[0]`. They look like replication, but the arrays are the polyphase split of the
+interleaved signal, and whole-sample symmetric extension says `x[-1] = x[1]`, `x[N] = x[N-2]` — which
+in split terms *is* `low[half] = low[half-1]` and `high[-1] = high[0]`. Same operation.
+
+Checked numerically rather than left as algebra: GNC's lifting against a textbook 9/7 on an
+explicitly symmetric-extended signal, **1000 random signals over five lengths, worst relative
+difference 0.000e+00** on both bands. Identical.
+
+It was already visible in 0026's own numbers and I did not read it that way: boundary synthesis
+norms came out within 1–6% of interior, which a wrong extension would not produce. **Worth 0 points.**
+
+### 2. The dead zone — GNC does not have one in its operating range
+
+GNC quantises as `floor(|v|/step + 0.5)` after a `|v| < dead_zone*step` test. `floor(x+0.5)` is
+already zero below `0.5*step`, so **any `dead_zone <= 0.5` is a no-op**. Production interpolates 0.5
+at q=85 → 0.05 at q=92 → 0.0 at q>=96. So GNC's zero bin is `1.0*step` throughout the contribution
+range. J2K's irreversible quantiser truncates, giving a `2.0*step` zero bin — twice as wide.
+
+Four stills, six q, `--abac`. Rate at fixed RGB PSNR, and the gap to J2K:
+
+| | 48 dB | 50 dB | 52 dB | gap to J2K (RGB) |
+|---|---|---|---|---|
+| production | — | — | — | **+27.2%** |
+| **dz 0.6** | **−3.1%** | **−2.2%** | **−2.5%** | **+24.1%** |
+| dz 0.75 | −1.0% | −0.6% | −2.0% | +24.9% |
+| dz 0.9 | +9.4% | +2.5% | +0.5% | +29.6% |
+| dz 1.0 | +13.8% | +4.5% | +2.9% | +33.1% |
+
+**dz ≈ 0.6 removes ~3 points of the gap**, and J2K's own width is much *worse* for GNC — because GNC
+reconstructs at the round-to-nearest bin centre, so widening the zero bin without moving the
+reconstruction point pays in distortion immediately.
+
+At matched rate, mean over four images, it is better on every axis at once: **+0.24 to +0.38 dB RGB
+PSNR and −2.9% to −4.5% dE00**. VMAF cross-check at the same q: **−8 to −9% rate for −0.01 VMAF**
+(worst −0.02, block threshold 0.5). VMAF reads 96.9–97.2 everywhere here, so it is a "no perceptual
+objection", not the lead — PSNR and dE00 lead at q>=85 and both improve.
+
+**A sign check worth recording.** The first BD-rate table said dz1.0 was −4.26% (better) while the
+gap-to-J2K table said it went +27.2% → +33.1% (worse). Both cannot hold. The BD-rate helper's sign
+convention was the opposite of my label. Settled by **interpolating raw bpp at fixed PSNR**, which
+needs no convention at all — and that is what every number above uses. Two tables disagreeing is
+cheap to catch; one table alone would have been published.
+
+### 3. And it must never be global — which is why sequences were measured
+
+The dead zone applies to **P-frame residuals too**. Three sequences, 16 frames, ki=9, 4:4:4, at
+**matched rate** against the production ladder:
+
+| sequence | mean PSNR, q=85/90/95 | worst-frame PSNR |
+|---|---|---|
+| bbb_extended | −0.62 / −0.21 / +0.30 | −1.10 / −0.85 / −1.53 |
+| old_town_cross | −0.83 / −0.41 / −0.55 | −1.60 / −1.62 / −1.87 |
+| crowd_run | −0.79 / −0.27 / −0.47 | −1.51 / −1.44 / −1.93 |
+
+**Worst-frame is negative on 9 of 9 points, by up to 1.93 dB** — and worst-frame is the metric a
+contribution codec is judged on (QUAL-1). Mechanism: a motion-compensated residual is already sparse
+and small, so a dead zone zeroes a much larger fraction of coefficients carrying real signal, and the
+error **propagates down the prediction chain** instead of staying in one picture.
+
+**Not shipped.** Filed as **INTRA-2 (P1)**: apply the dead zone to I-frames only, then re-gate on
+both. Had this shipped on the stills evidence it would have been a clean four-image win on three
+metrics that cost up to 1.93 dB of worst-frame quality on every sequence measured — all three stills
+metrics were measuring the wrong thing for the P path.
+
+### 4. BUG-30 — a dead zone could silently defeat bit-exact lossless
+
+`GNC_DEAD_ZONE=0.6` at q=100 produced a file **3.4% smaller and not bit-exact**, no warning.
+`is_lossless()` gates on `dead_zone == 0.0`, so a config with a dead zone reported *not lossless*,
+`normalized_for_lossless` skipped it, and the integer-exact colour and lifting paths were switched
+off — the guarantee gave way instead of the knob. BUG-15's hole, one knob over.
+
+Fixed by splitting **lossless intent** (transform + step) from **bit-exactness** (intent + the knobs
+that can spoil it) and normalising on intent: the dead zone is forced to 0.0 with a warning, exactly
+as `chroma_weight` already was. q=100 is byte-identical at 927 600 B and bit-exact with
+`GNC_DEAD_ZONE` at 0.6 or 1.0. Test asserts bit-exactness, not a PSNR threshold.
+
+### Where INTRA-1 stands
+
+| candidate | worth | record |
+|---|---|---|
+| entropy coding | ≤7.5 points | 0024 |
+| chroma allocation vs an RGB metric | 8.5 points, **not a deficiency** | 0026 |
+| lifting normalisation | ~0 | 0026 |
+| tiling, as wavelet reach | 0.6% realisable | 0026 |
+| cross-tile rate allocation | 0.95% | 0027 |
+| **tile-boundary handling** | **0 — already correct** | **0028** |
+| **dead zone** | **~3 points, intra only** | **0028** |
+
+**~6 points remain.** Every candidate the item listed has now been measured.
+
+**Gates:** `cargo test --release -- --test-threads=1` green; `cargo clippy --release` clean.
+
+
+---
+
 ## INTRA-1 step 2b — cross-tile rate allocation is worth 0.95%, and BUG-26 is fixed (2026-09-07)
 
 **Hypothesis.** Decision 0026 left an asymmetry unexplained: giving JPEG 2000 GNC's 256px tiling
@@ -103,9 +209,14 @@ in the test.
 | cross-tile rate allocation | **0.95%** | 0027 |
 
 **~9 points remain and the obvious candidates are spent.** Untested and cheap: the deadzone and
-quantiser rounding rule against J2K's, and the wavelet's tile-boundary handling (`transform_97.wgsl`
-replicates the edge sample where J2K uses symmetric extension). Neither is obviously worth 9 points,
+quantiser rounding rule against J2K's, and the wavelet's tile-boundary handling. Neither is obviously worth 9 points,
 which is worth saying out loud rather than assuming the next idea will close it.
+
+> **Correction (2026-09-08, step 2c):** this entry originally said `transform_97.wgsl` "replicates
+> the edge sample where J2K uses symmetric extension". That is wrong — the replication is in the
+> *polyphase split*, where it is exactly whole-sample symmetric extension of the interleaved signal,
+> and it verifies bit-identical against a textbook 9/7 on an explicitly extended signal. The
+> candidate is worth 0 points, not "untested".
 
 **Gates:** `cargo test --release -- --test-threads=1` green; `cargo clippy --release` clean; wasm
 `--lib` clean.

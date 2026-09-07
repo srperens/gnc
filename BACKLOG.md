@@ -91,6 +91,11 @@ measured advantage over x264 on any axis at this operating point.**
    per-tile allocator saves 0.95%**, about one point of the remaining ten, and on one image the
    oracle picks the *same* q for every tile at q>=92. The obvious candidates are now spent;
    ~9 points remain. Decision `docs/decisions/0027`.
+   **Step 2c done (2026-09-08): both remaining candidates settled.** Tile-boundary handling is
+   already correct symmetric extension (0 points, and it corrects a wrong claim in 0027); the dead
+   zone is worth **~3 points on stills** but is a **worst-frame regression on 9 of 9 sequence
+   points**, so it is filed as **INTRA-2** rather than shipped. **~6 points remain, and every
+   candidate the item listed has now been measured.** Decision `docs/decisions/0028`.
 1. **Intra at contribution quality** — the whole remaining +90.5% lives here, per findings 1 and 5.
    Inter breaks even at this operating point for x264 too, so this is the only place the gap is.
    **First instalment paid 2026-09-07 (ABAC-SHIP): −17.3% of intra rate at q=90, opt-in.** Against
@@ -3479,6 +3484,66 @@ comparison is confounded by padding. 1920x1080 pads to 2048x1280 at tile 256 and
 at tile 512 — 20% more coefficients — which reads as +6.1% rate for tile 512 that is entirely
 padding and reverses the sign of the real effect. Measure tile size on content that is a multiple
 of both sizes; `1024x512` centre crops are what INTRA-1 used.
+
+### INTRA-2 — apply the dead zone to I-frames only (todo, **P1**)
+
+Filed 2026-09-08 by INTRA-1 step 2c, which measured the lever and then measured why it cannot ship
+as a preset. **~3 points of the intra JPEG 2000 gap, blocked on the P path.** Decision
+`docs/decisions/0028`.
+
+**What is proven.** GNC quantises as `floor(|v|/step + 0.5)` after a `|v| < dead_zone*step` test, so
+any `dead_zone <= 0.5` is a no-op — and production interpolates 0.5 at q=85 to 0.0 at q>=96. **GNC
+has no dead zone at all in its own operating range.** Setting it to ~0.6 on four stills, six quality
+points, `--abac`:
+
+- rate at fixed RGB PSNR: **−3.1% / −2.2% / −2.5%** at 48 / 50 / 52 dB
+- gap to J2K 9/7 falls **+27.2% → +24.1%**
+- at matched rate: **+0.24 to +0.38 dB RGB PSNR *and* −2.9% to −4.5% dE00** — better on every axis
+- VMAF at the same q: **−8 to −9% rate for −0.01 VMAF** (worst −0.02, block threshold 0.5)
+
+J2K's own width (effectively 1.0) is much *worse* for GNC — +13.8% rate at 48 dB — because GNC
+reconstructs at the round-to-nearest bin centre, so a wider zero bin pays in distortion immediately.
+
+**What blocks it.** The dead zone also hits P-frame residuals. Three sequences, 16 frames, ki=9,
+4:4:4, at matched rate against the production ladder: mean PSNR −0.83 to +0.30 dB, and **worst-frame
+PSNR negative on 9 of 9 points, by up to 1.93 dB.** Worst-frame is what a contribution codec is
+judged on (QUAL-1). A motion-compensated residual is already sparse, so a dead zone zeroes far more
+real signal, and the error propagates down the prediction chain instead of staying in one picture.
+
+**The work.** Gate the dead zone on frame type. `sequence.rs` already varies quantiser parameters per
+frame type (`GNC_P_QP_SCALE`), so there is a place for it. Then re-gate on **both** stills and
+sequences — this item exists because the stills gate was green on three metrics and all three were
+measuring the wrong thing for the P path.
+
+**Worth scoping in at the same time:** J2K's actual quantiser is truncation plus a reconstruction
+offset at `(|q| + r) * step`. That is the principled version of this lever, and the sweep above shows
+the naive wide zero bin is the wrong half of it. It needs a decoder change.
+
+**Success criterion:** ≥2% rate at matched RGB PSNR on four stills at q>=85, with **no worst-frame
+regression on any of the three sequences** and dE00 no worse. Below that, close it.
+
+**Canary:** a per-frame log line showing the dead zone actually differs between I and P frames, and
+an assertion that a q=100 encode stays bit-exact (BUG-30).
+
+### BUG-30 — a dead zone could silently defeat bit-exact lossless (**FIXED 2026-09-08**)
+
+Found by INTRA-1 step 2c. **`GNC_DEAD_ZONE=0.6` at q=100 produced a file 3.4% smaller that was not
+bit-exact, with no warning from encode or decode.** BUG-15's hole, one knob over.
+
+**Cause.** `is_lossless()` gates on `dead_zone == 0.0`, so a configuration carrying a dead zone
+reported *not lossless*; `normalized_for_lossless` then skipped it entirely and the integer-exact
+colour conversion and lifting paths were switched off. The guarantee gave way instead of the knob —
+backwards, and it is the same shape as the `chroma_weight` case BUG-15 fixed.
+
+**Fix.** Split **lossless intent** (`is_lossless_intent()`: transform and step) from
+**bit-exactness** (`is_lossless()`: intent plus the knobs that can spoil it), and normalise on
+intent. The dead zone is forced to 0.0 with a printed warning, exactly as `chroma_weight` already
+was. Verified: q=100 is byte-identical at 927 600 B and bit-exact with `GNC_DEAD_ZONE` unset, 0.6 or
+1.0. Test `conformance_a_dead_zone_cannot_defeat_lossless` asserts **bit-exactness, not a PSNR
+threshold** — a threshold is what let 55 dB pass for lossless in BUG-15.
+
+**Invalidates:** any lossless figure taken with `GNC_DEAD_ZONE` set. No shipped default carried one,
+so no published number moves.
 
 ### ENT-6 — abac's deep subbands are one short code-block each, and they cost ~4% of the file (todo, P2)
 

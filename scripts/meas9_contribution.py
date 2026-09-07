@@ -365,7 +365,14 @@ def vc2_rungs(w, h, qm="default"):
 # ---------------------------------------------------------------------------
 
 CHROMA_WEIGHT_ARMS = ["1.0", "1.6", "2.0", "2.45"]
+# INTRA-1 step 2c. GNC quantises as `floor(|v|/step + 0.5)` after a `|v| < dead_zone*step` test,
+# so any dead_zone <= 0.5 is a no-op — the rounding already zeroes those. Production interpolates
+# 0.5 at q=85 to 0.0 at q>=96, which means **GNC has no dead zone at all in the contribution
+# range**: its zero bin is 1.0*step wide. JPEG 2000's irreversible quantiser truncates
+# (`floor(|v|/step)`), so its zero bin is **2.0*step** — twice as wide. These arms price that.
+DEAD_ZONE_ARMS = ["0.6", "0.75", "0.9", "1.0"]
 ARM_ORDER = (["gnc", "gnc_abac", "gnc_abac_t512"] + [f"gnc_abac_cw{c}" for c in CHROMA_WEIGHT_ARMS]
+             + [f"gnc_abac_dz{d}" for d in DEAD_ZONE_ARMS]
              + ["jpegxs", "jpegxs422", "prores444", "vc2", "j2k", "j2k_t256",
                 "j2k_t512", "j2k_rev", "prores422"])
 DEFAULT_ARMS = ["gnc", "jpegxs", "jpegxs422", "prores444", "j2k", "prores422"]
@@ -397,6 +404,11 @@ def run_image(img_path, gnc_binary, arms, qualities, tmp, vc2_qm="default"):
         # coefficients and reads as +6% rate that is entirely padding.
         rows += arm_gnc(gnc_binary, img_path, orig, tmp, qualities,
                         extra=["--abac", "-t", "512"], name="GNC abac t512")
+    for dz in DEAD_ZONE_ARMS:
+        if f"gnc_abac_dz{dz}" in arms:
+            rows += arm_gnc(gnc_binary, img_path, orig, tmp, qualities,
+                            extra=["--abac"], name=f"GNC abac dz{dz}",
+                            env={"GNC_DEAD_ZONE": dz})
     for cw in CHROMA_WEIGHT_ARMS:
         if f"gnc_abac_cw{cw}" in arms:
             # INTRA-1 step 2: GNC's YCoCg-R has synthesis norms (Y 1.732, Co 0.707, Cg 0.866), so

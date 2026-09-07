@@ -79,9 +79,16 @@ columns agreeing exactly to the hundredth of a percent across 48 rows was the on
 | **cross-tile rate allocation** | **0.95%** | **this record** |
 
 **~9 points remain and the obvious candidates are now spent.** What has *not* been tested: the
-deadzone and quantiser rounding rule against J2K's, and the wavelet's tile-boundary handling
-(`transform_97.wgsl` replicates the edge sample where J2K uses symmetric extension). Both are
-cheap. Neither is obviously worth 9 points, which is itself worth saying out loud.
+deadzone and quantiser rounding rule against J2K's, and the wavelet's tile-boundary handling. Both
+are cheap. Neither is obviously worth 9 points, which is itself worth saying out loud.
+
+> **Correction (2026-09-08, decision `0028`).** This paragraph originally read "…tile-boundary
+> handling (`transform_97.wgsl` replicates the edge sample where J2K uses symmetric extension)".
+> **That is wrong.** The replication is in the *polyphase split*, where `low[half] := low[half-1]`
+> and `high[-1] := high[0]` are exactly whole-sample symmetric extension of the interleaved signal;
+> verified bit-identical against a textbook 9/7 on an explicitly extended signal over 1000 random
+> signals. The candidate is worth **0 points**, and the dead zone turned out to be worth ~3 on
+> stills and a regression on video — both settled in `0028`.
 
 ## What was not chosen
 

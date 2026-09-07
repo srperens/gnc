@@ -180,6 +180,45 @@ fn conformance_checkerboard_q90() {
 
 /// The wavelet lossless arm, reached the way the CLI reaches it: `-q 99 --qstep 1 --wavelet 53`.
 ///
+/// BUG-30 — a dead zone must not be able to defeat bit-exactness, and it could.
+///
+/// Same shape as BUG-15 one knob over. `is_lossless()` gates on `dead_zone == 0.0`, so a config
+/// carrying a dead zone reported *not lossless*, `normalized_for_lossless` skipped it, and the
+/// integer-exact colour and lifting paths were switched off rather than the knob being corrected.
+/// Measured before the fix: `GNC_DEAD_ZONE=0.6` at q=100 produced a file 3.4% smaller that was not
+/// bit-exact, with no warning. The knob is what should give way, not the guarantee.
+///
+/// Asserted on bit-exactness, not a PSNR threshold — a threshold is what let 55 dB pass for
+/// lossless in BUG-15.
+#[test]
+fn conformance_a_dead_zone_cannot_defeat_lossless() {
+    let img = make_gradient(512, 512);
+    let ctx = gpu();
+    let mut encoder = EncoderPipeline::new(ctx);
+    let decoder = DecoderPipeline::new(ctx);
+
+    let clean = gnc::quality_preset(100);
+    assert_eq!(clean.dead_zone, 0.0, "q=100 is expected to carry no dead zone");
+
+    let mut spoiled = clean.clone();
+    spoiled.dead_zone = 0.6;
+    let spoiled = spoiled.normalized_for_lossless();
+    assert_eq!(
+        spoiled.dead_zone, 0.0,
+        "normalisation must strip a dead zone from a lossless-intent config"
+    );
+    assert!(spoiled.is_lossless(), "and the result must then report lossless");
+
+    for (label, config) in [("q=100 preset", clean), ("dead zone forced on", spoiled)] {
+        let encoded = encoder.encode(ctx, &img, 512, 512, &config);
+        let decoded = decoder.decode(ctx, &encoded);
+        assert_eq!(
+            decoded, img,
+            "{label}: lossless round trip must be bit-exact, not merely close"
+        );
+    }
+}
+
 /// BUG-15. Since LOSSLESS-1 routed q=100 to MED prediction, nothing exercised the wavelet
 /// lossless path, and CHROMA-1's `chroma_weight = 1.2` (applied from q >= 60) then quantised
 /// chroma at a step above 1. It was lossy for a day — 53-56 dB on real content, 49.2 dB with

@@ -487,8 +487,19 @@ impl CodecConfig {
     /// residual is a difference of integers) and needs the same reversible YCoCg-R in front of
     /// it. Leaving it out silently disabled that colour path and cost bit-exactness.
     pub fn is_lossless(&self) -> bool {
+        self.is_lossless_intent() && self.dead_zone == 0.0
+    }
+
+    /// Whether the *transform and step* say bit-exact, before the knobs that can spoil it.
+    ///
+    /// This exists because `is_lossless()` cannot be used to decide what to normalise: it gates on
+    /// `dead_zone`, so a configuration with a dead zone reports "not lossless" and
+    /// `normalized_for_lossless` then leaves it alone — which is backwards. The knob is the thing
+    /// that should give way, not the guarantee. `GNC_DEAD_ZONE=0.6` at q=100 produced a **lossy**
+    /// file, 3.4% smaller and not bit-exact, with no warning (BUG-30). Same shape as BUG-15, one
+    /// knob over.
+    fn is_lossless_intent(&self) -> bool {
         self.quantization_step <= 1.0
-            && self.dead_zone == 0.0
             && match self.transform_type {
                 TransformType::Wavelet => self.wavelet_type == WaveletType::LeGall53,
                 TransformType::MedPredict => true,
@@ -517,7 +528,7 @@ impl CodecConfig {
     #[must_use]
     pub fn normalized_for_lossless(&self) -> Self {
         let mut cfg = self.clone();
-        if cfg.is_lossless() {
+        if cfg.is_lossless_intent() {
             let levels = cfg.subband_weights.detail.len() as u32;
             let chroma = cfg.subband_weights.chroma_weight;
             cfg.subband_weights = SubbandWeights::uniform(levels);
@@ -525,6 +536,16 @@ impl CodecConfig {
                 eprintln!(
                     "GNC: lossless config had chroma_weight {chroma}; normalised to 1.0 (BUG-15)"
                 );
+            }
+            // A dead zone throws away small residuals outright, so it is the one knob that can
+            // defeat bit-exactness on its own. Forced rather than refused, to match the weight
+            // handling directly above (BUG-30).
+            if cfg.dead_zone != 0.0 {
+                eprintln!(
+                    "GNC: lossless config had dead_zone {}; normalised to 0.0 (BUG-30)",
+                    cfg.dead_zone
+                );
+                cfg.dead_zone = 0.0;
             }
         }
         cfg

@@ -110,6 +110,107 @@ which is worth saying out loud rather than assuming the next idea will close it.
 **Gates:** `cargo test --release -- --test-threads=1` green; `cargo clippy --release` clean; wasm
 `--lib` clean.
 
+## PERF-1 — the host-side perf scan was mostly right, and four of its twelve items are now landed (2026-09-08)
+
+**What this was.** `docs/SIMPLE_PERF_FIXES.md` arrived on `main` as a *scan*, and said so of
+itself: "not claimed as a BACKLOG item", "no throughput number in this file is a new measurement".
+Twelve ranked assertions about host-side waste, no ID, no priority, invisible to `scripts/claim
+next`, and read by every session as if established. PERF-1 was filed to make it either true or
+closed: verify the claims first, then land only the fixes that are bitstream-identical.
+
+**The GPU is shared by eight sessions, so nothing here is timed.** (And since BUG-29 the machine
+label is not trustworthy either — it is an M5 Pro, not the M1 every throughput figure claims.) Every number below is a count —
+loads, driver round trips, buffers, bytes — taken from the same instrument on both sides of the
+change. That is not a weaker claim than a wall-clock delta; on this machine it is a stronger one.
+
+### Step 1 — verification
+
+Every `file:line` in the document was checked against `e8a8a45`. **Twenty-three of twenty-four
+cited sites hold**, including all fourteen of item 4's `create_buffer_init` / `create_bind_group`
+sites at the exact line given. The one miss is cosmetic: item 10 cites `quantize.wgsl:170` for the
+dequant branch, which is at `:199`.
+
+The "already closed — do not re-propose" table also holds: #29 fused wavelet (level-0 fusion needs
+256 KB LDS against M1's 32 KB; Metal barriers ~150 µs), #33 fused quantize+Rice (0.35 ms against a
+30 ms gate, quantize+Rice measured ~19 ms), the Rice `to_vec` cut (4 ms → 0.6 ms) — all match
+RESEARCH_LOG and `docs/archive/BACKLOG_CLOSED.md`.
+
+**The documentation claim was true and worse than stated.** The scan says the 31.7 fps figure is
+not reproducible and that GOALS still cites it. Both true — and it was in three places, one of
+them public: `GOALS.md:118`, `GOALS.md:216` and **`README.md:75`** carried it as the headline
+video-sequence figure while `GOALS.md:103` and `BASELINE.md:103` retracted it four paragraphs
+above. Fixed: every remaining occurrence in the repository is now a retraction, and each
+replacement names which of BASELINE's A (12.2 fps GPU encode phase), B (5.6, encoder loop) or C
+(5.0, end to end) it is quoting.
+
+### Step 2 — what landed, with the counts
+
+| item | before | after | verified |
+|---|---|---|---|
+| 1 — frame loads per display index | **2.62** | **1.00** | 21 loads → 8 for 8 frames; 63 → 24 for 24 |
+| 3 — `poll(Wait)` per I-frame, q=75 4:4:4 | **3** | **1** | q=95: 1 → 1; 4:2:0: 4 → 3 |
+| 5 — CfL `MAP_READ` buffers per `encode()` with CfL off | **2** | **0** | plus one poll on the 4:2:0 CfL path |
+| 6 — `queue.submit` per `encode()`, production path | **2** | **1** | |
+| 7 — decode pack allocation per frame | **1.22 MB** allocated, zero-filled and dropped | reused | `rice_pack_scratch_grows` flat at 9 |
+
+**Item 1 is the one that matters.** On the PNG path each `load_frame` is a full image decode plus
+`u8→f32`, and the encoder was doing 2.62 of them per display index: scene-cut computed the MAD and
+then *dropped* the pixels unless the frame was a cut; look-ahead decoded `display_idx + 1` and the
+next iteration decoded it again; the B-group scan decoded every frame in `[display_idx, next_key)`.
+All pixel reads now go through one `FrameSource` with a two-slot MRU cache. Two supporting
+changes: `StreamingY4m` caches `Arc<Vec<f32>>` so a cache hit is a refcount bump instead of a
+24.9 MB memcpy, and `prev_frame_luma` stores a `luma_proxy` (~2 MB) instead of the whole
+interleaved RGB frame — which is what its comment already claimed it did.
+
+**Item 5 found a small live defect, not just waste.** The CfL staging pair labelled "Dummy buffers
+(never used)" *was* used: the readback was gated on `config.cfl_enabled` while the buffers were
+built from `use_cfl` (`cfl_enabled` AND 4:4:4), so a 4:2:0 or 4:2:2 encode with CfL on mapped both
+dummies, polled for them, and read two garbage alphas into `cfl_alphas_all` — which the `use_cfl`
+test then discarded. No bitstream effect, which is why nothing caught it.
+
+**Item 6 was checked before it was believed.** The scan calls it "obviously correct". It is
+correct, but not obviously: `rice_gpu.rs` already carries the comment "on Metal/wgpu,
+`queue.write_buffer` is staged: only the last write before `queue.submit` takes effect", so
+merging two submits changes which write wins for any parameter buffer written more than once
+between them. Checked: between the two phases there is no readback, no poll, and no `write_buffer`
+into anything the preprocess dispatches read. Merged, with the split retained under `GNC_PROFILE`.
+
+### Bitstream identity
+
+**24 artefacts, before against after, on every commit**: 6 `.gnv` (bbb, crowd_run, old_town_cross
+at q=75 and q=90), 8 stills (bbb, blue_sky, touchdown at both quality points, plus a 4:2:0 still
+and an `--abac` still), a 4:2:0 sequence, and 9 decoded PNGs. All hash identical, every time.
+The 4:2:0 pair is there specifically because item 5 changed the `cfl_enabled && !use_cfl` path,
+and the `--abac` still because it leaves `encode()` by the CPU entropy route. **No measurement in
+this log is affected by any of it.**
+
+### Canaries
+
+Three, all counts of the thing removed, so none can read "improved" while the old path still runs:
+
+- `[frame_source] N loads for M display indices` (GNC_PROFILE)
+- `[encode profile] poll_waits=N` — `gpu_util::poll_wait` wraps and counts
+  `device.poll(Maintain::Wait)` at 55 sites; the two profiling-only round trips in the
+  wavelet/Rice split are deliberately uncounted so the number describes the production path
+- `[decode profile] rice_pack_scratch_grows=N held=X MB` — flat at 9 from frame 1 onward
+
+### Item 4 is verified and deliberately not landed
+
+All fourteen sites are real and at the cited lines. It is still not a "simple fix", and the reason
+is the staging rule above: `quantize.rs:224` alone runs 6+ times per P-frame with *different*
+parameters, so replacing its per-dispatch `create_buffer_init` with one cached UBO plus
+`write_buffer` would give every one of those dispatches the **last** frame-slot's parameters. The
+wavelet already solved this — dynamic offsets into a persistent buffer — and that, not
+`write_buffer`, is what the other sites would need. The bind-group half is safe wherever the bound
+buffers are stable (crop, pack, colour convert), and worth microseconds. **Filed as PERF-2 rather
+than done badly here.**
+
+### Not in scope, and still open
+
+Items 2 (packed-u8 YUV upload — changes the encode input API), 8 (32-bit Rice bit window — a
+shader), 9, 10 and 11 (plane copies, folding dequant into the Rice store, fusing
+interleave/colour/crop/pack — all behind a switch plus an idle-machine bench). Their claims were
+verified in step 1; the work is PERF-2 and PERF-3.
 
 ---
 

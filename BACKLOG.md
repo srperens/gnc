@@ -829,7 +829,27 @@ owner should bring in.
 
 **What this blocks.** CANARY-1 and MEAS-5, both of which finally have hardware. They are parked as
 `linux-nvidia` rather than free, and the reason has changed from "no second GPU" to this bug.
-### PERF-1 — verify `docs/SIMPLE_PERF_FIXES.md` and land the fixes that are free (todo, P2)
+### PERF-1 — verify `docs/SIMPLE_PERF_FIXES.md` and land the fixes that are free (**DONE 2026-09-08**)
+
+**Result (2026-09-08).** 23 of the 24 cited `file:line` sites hold; the one miss is cosmetic
+(item 10 cites `quantize.wgsl:170`, the dequant branch is at `:199`). The "already closed" table
+checks out against RESEARCH_LOG and the archive. **Five items landed, each as a count, all
+bitstream-identical on 24 artefacts:**
+
+| item | before | after |
+|---|---|---|
+| 1 — `load_frame` calls per display index | 2.62 | **1.00** |
+| 3 — `poll(Wait)` per I-frame (q=75 4:4:4) | 3 | **1** |
+| 5 — CfL `MAP_READ` buffers per `encode()`, CfL off | 2 | **0** |
+| 6 — `queue.submit` per `encode()` | 2 | **1** |
+| 7 — decode pack allocation per frame | 1.22 MB zero-filled | **reused** |
+
+Item 5 also found a live defect: the buffers labelled "never used" were mapped and read on the
+`cfl_enabled && !use_cfl` path, and two garbage alphas were read back and then discarded. No
+bitstream effect, which is why nothing caught it. The 31.7 fps citation is retired from GOALS,
+README and POSITIONING. **Item 4 is verified and deliberately not landed — see PERF-2.** Items 2,
+8, 9, 10 and 11 were out of scope by construction and are PERF-2/PERF-3.
+RESEARCH_LOG 2026-09-08; decision `docs/decisions/0027`.
 
 Filed 2026-09-07. `docs/SIMPLE_PERF_FIXES.md` landed on `main` in `e8a8a45` as a **scan**, and says
 so itself: *"Not claimed as a BACKLOG item — this is a scan"*, and *"No throughput number in this
@@ -953,6 +973,58 @@ does, and it is the first command `docs/GPU_TIER_TEST.md` tells you to run on a 
 The count is now simply not asserted. And CLAUDE.md's argument against parallel role-based agents
 rested on *"the hardware is one M1 with 8 GPU cores"* — the contention argument survives, the
 hardware claim in it does not, so it now says "one machine with one GPU".
+### PERF-2 — the per-dispatch uniform buffers need dynamic offsets, not a cached UBO (todo, P3)
+
+Filed 2026-09-08 by PERF-1, which verified the sites and then declined the fix as specified.
+
+`docs/SIMPLE_PERF_FIXES.md` item 4 lists fourteen sites that build a uniform buffer and a bind
+group on every dispatch, and proposes caching them "the way Rice already does" — one persistent
+UBO written with `write_buffer`. **All fourteen sites are real and at the cited lines. The
+proposed fix is wrong for most of them**, and the reason is already written down in
+`rice_gpu.rs`: on Metal/wgpu `queue.write_buffer` is staged, so only the last write before
+`queue.submit` takes effect. `quantize.rs:224` runs 6+ times per P-frame with *different*
+parameters inside one submit; one cached UBO would give every one of those dispatches the last
+write's parameters. Same shape at the per-plane sites in `transform.rs`, `motion.rs` and
+`cfl.rs`.
+
+**What actually works is in the tree already:** the wavelet writes all its slots up front and
+binds with **dynamic offsets** into one persistent buffer. That is the port — a design change per
+site, not a substitution — and it is what this item is.
+
+Second, separable half: **bind-group caching where the bound buffers are stable** — crop, pack,
+colour convert, and `dispatch_decode`'s per-plane bind group. `CachedBuffers` already caches
+`buf_to_tex_bind_group` (`src/decoder/buffer_cache.rs:477`), so the pattern exists. Worth
+microseconds against a 25 ms frame; do it only alongside the first half.
+
+**Success criteria.** Bitstream identical on the 24-artefact set PERF-1 used. A count, not a time:
+`create_buffer_init` + `create_bind_group` calls on the steady-state I-frame path, before and
+after, printed under `GNC_PROFILE`. Below a 50% reduction in that count, close it — the scan's own
+estimate for the whole of item 4 was 0.6 ms of command recording.
+
+### PERF-3 — the decode-side bandwidth items, behind a switch and an idle machine (todo, P3)
+
+Filed 2026-09-08 by PERF-1 as the remainder of `docs/SIMPLE_PERF_FIXES.md`. Claims verified in
+step 1; none of the work started. These are the items that are *not* host-side bookkeeping, so
+none of them can be closed on a count alone — each needs a real throughput number, which needs an
+idle machine (COORDINATION).
+
+- **Item 2 — packed-u8 YUV upload.** Y4M is already YUV; GNC converts it to RGB f32 on the CPU
+  (scalar `row × col` loop, ~10 MB of f32 planes plus a 24.9 MB RGB allocation per frame) and then
+  back to YCoCg-R on the GPU. Uploading packed u8 and converting in a shader is 4× less DMA and no
+  CPU colour — but it changes the encode input API, which is why PERF-1 did not touch it. This is
+  the only remaining host change that can close BASELINE's A→C gap on the streaming path.
+- **Item 8 — 32-bit Rice bit window.** `rice_decode.wgsl` refills one *byte* at a time inside the
+  unary loop of a stage that is 47% of I-frame decode. Encode already accumulates words. No
+  bitstream change; mechanical but a shader.
+- **Item 9 — the extra full-plane copies** (`transform.rs:320` inverse preamble,
+  `gpu_work.rs:624/637/434/411/309`). Tens of MB per I-frame at 1080p.
+- **Item 10 — fold dequant into the Rice store.** One dispatch and ~48 MB of traffic per frame.
+  Not the closed encode-side fusion (#33); this is the decode dequant that runs *after* Rice has
+  produced floats.
+- **Item 11 — fuse interleave → inverse colour → crop → pack.** Four full-frame trips, ~100+ MB.
+
+**Do them behind a switch, the `GNC_ABAC_CODER` pattern**, and measure the set together on an idle
+machine rather than one at a time under load.
 
 ### BUG-19 — decision-record numbers collide, and two pairs are live on `main` (todo, P3)
 

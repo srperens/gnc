@@ -793,6 +793,90 @@ owner should bring in.
 
 **What this blocks.** CANARY-1 and MEAS-5, both of which finally have hardware. They are parked as
 `linux-nvidia` rather than free, and the reason has changed from "no second GPU" to this bug.
+### PERF-1 — verify `docs/SIMPLE_PERF_FIXES.md` and land the fixes that are free (todo, P2)
+
+Filed 2026-09-07. `docs/SIMPLE_PERF_FIXES.md` landed on `main` in `e8a8a45` as a **scan**, and says
+so itself: *"Not claimed as a BACKLOG item — this is a scan"*, and *"No throughput number in this
+file is a new measurement"*. So it is twelve ranked assertions about host-side waste with no ID, no
+priority and no verification — invisible to `scripts/claim next`, and read by every session as if it
+were established. This item is what makes it either true or closed.
+
+**Two halves, and the first is the point.** Verify the claims; then fix only the ones that are
+mechanical and bitstream-identical. A candidate that survives verification but needs a shader, an
+API change or a wall-clock number is *filed*, not done here — see "Not in scope".
+
+**Why P2 and not P1.** Throughput is not the headline gap — the +90.5% BD-rate against x264 is, and
+it is intra rate (INTRA-1, priority item 1). But verification costs no GPU at all, most of the fixes
+are byte-identical by construction, and the file is currently a standing invitation for the next
+session to act on unmeasured prose. Cheap, low-risk, and it stops a bad citation before it spreads.
+Not P1 because until step 1 runs, nobody knows which of the twelve are real.
+
+#### Step 1 — verify, and this needs no GPU and no idle machine
+
+Every `file:line`, every "already closed" row against RESEARCH_LOG and `docs/archive/`, and the
+three fps quantities against BASELINE's "How to read the fps figures". **Nine sites were spot-checked
+against `e8a8a45` while filing this and all nine hold** — `sequence.rs` `|i| frames[i].to_vec()`,
+`main.rs` `self.cache[i].clone()`, the scene-cut *"will call load_frame again"* comment, the
+`prev_frame_luma` comment that claims "just the R channel" against four assignments that all store
+the full interleaved RGB `frame_data`, the CfL `// Dummy buffers (never used)` `MAP_READ` pair,
+`rice_decode.wgsl`'s one-byte `load_byte`, the whole-plane `copy_buffer_to_buffer` preamble in
+`transform.rs`, and `color.rs`'s per-dispatch `create_buffer_init`. That is a good hit rate, not a
+pass: the *quantities* are unverified, and the quantities are what decide whether a fix is worth the
+diff.
+
+**One contradiction is already confirmed and is in scope.** The doc says the 31.7 fps figure is not
+reproducible and that GOALS still cites it. Both are true, and it is worse than one line:
+`GOALS.md:103` and `BASELINE.md:103` say the figure is not reproducible, while `GOALS.md:118`,
+`GOALS.md:216` and **`README.md:75`** still headline it. The public README carries a number this
+repository has already retracted internally. Fix the three, say which of A/B/C replaces it, or say
+"unmeasured on an idle machine" — do not quietly delete it.
+
+#### Step 2 — fix, and only where the bitstream cannot move
+
+Doc items **1** (`Arc<[f32]>`, stop the double `load_frame` after a non-cut, stop storing a second
+full RGB copy as a "luma proxy"), **3** (one poll for Rice + MV + AQ + CfL instead of two to four),
+**4** (cache uniforms and bind groups the way `GpuRiceEncoder::params_buf` already does), **5**
+(drop the dummy CfL `MAP_READ` buffers), **6** (fold the I-frame preprocess submit into the main
+encoder), **7** (reuse the decode `pack_decode_data` scratch). Land them as separate commits, not
+one — item 4 alone touches a dozen modules and will conflict with anything else in flight.
+
+#### Success criteria — counted, not timed
+
+1. **Byte-identical output.** `cmp` the `.gnv`/`.gnc` files before and after on ≥3 sequences at
+   q=75 and q=90. Every item in step 2 is bitstream-identical by construction; if a file moves by one
+   byte, that item is a behaviour change and leaves this item.
+2. **All three gates green** — `cargo test --release` and both clippy targets.
+3. **Counts, from `GNC_PROFILE`, because the machine is shared.** `load_frame` calls = 1 per display
+   index on the P-only path (the doc says 2–3 today); zero `create_buffer_init` on the steady-state
+   I-frame path; `poll(Wait)` per I-frame down to 1; bytes cloned per frame reported before and after.
+   **A candidate whose fix removes no counted copy, alloc or poll is closed with the count, not
+   polished** — CLAUDE.md, "know when to stop".
+4. **No fps claim without an idle machine**, and it must name which of A (12.2), B (5.6) or C (5.0)
+   it is. Eight sessions share this GPU and the counts above are the honest instrument; a wall-clock
+   delta taken under load is worth nothing (COORDINATION, and the 1.9x clock-ramp lesson).
+
+**Canary.** The doc specifies its own and they are the right ones: log `load_frame` call count
+against display index, and count `create_buffer_init` on the steady-state I-frame path in
+`GNC_PROFILE`. Both are counts of the thing being removed, so they cannot read "improved" while the
+old path still runs — CLAUDE.md, "no silent features".
+
+#### Not in scope, and say so in the write-up rather than silently skipping
+
+Doc item **2** (packed-u8 YUV upload — changes the encode input API), **8** (32-bit Rice bit window
+— a shader change, mechanical but still a shader), **9**/**10**/**11** (plane copies, folding
+dequant into the Rice store, fusing interleave/colour/crop/pack — all behind a switch plus an
+idle-machine bench, the `GNC_ABAC_CODER` pattern). If step 1 says they hold, file them as PERF-2+
+with the verified quantities; do not start them here. Likewise **do not re-propose** anything in the
+doc's "Already closed" table — fused wavelet (#29), fused quantize+Rice (#33), the three abac decode
+shader opts, `MEGA_KERNEL_PLAN.md`. The checkerboard two-pass Rice (item 12) is a product decision on
+a null compression feature, not a cleanup; leave it.
+
+**Coordination.** The worktree and branch already exist — `../gnc-perffix` on `perffix`, carrying
+only the doc commit. Reuse it. Item 1 and item 3 touch `sequence.rs` on the P-frame path, which is
+where **ARCH-3** and **BUG-18** live: if either is in flight, they land first and this rebases onto
+them. Nothing here changes the bitstream or any measurement, so it invalidates no result in
+RESEARCH_LOG — which is also why it must be able to prove that, by criterion 1.
+
 ### BUG-19 — decision-record numbers collide, and two pairs are live on `main` (todo, P3)
 
 `docs/decisions/` currently holds **two 0018s and two 0019s**:

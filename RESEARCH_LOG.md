@@ -12263,11 +12263,38 @@ version of the experiment is still owed" (CANARY-1 was NVIDIA-vs-CPU there), and
 density sweep at ki=1 would run" (MEAS-5 was blocked). Both are now done. NVENC is still owed, for
 a new reason.
 
-### Test 3 (portability) -- GNC runs on Windows, first time
+### Test 3 (portability) -- GNC runs on Windows, on Vulkan; DX12 does not compile
 
-`cargo build --release` builds clean, `gnc gpu-info` enumerates **6 adapters across Vulkan, DX12
-and GL**. Before today only Metal (dev M1) and Linux/Vulkan (2026-09-07) had ever run; Windows and
-the DX12/GL backends had never been exercised. The build and enumeration work.
+`cargo build --release` builds clean and `gnc gpu-info` enumerates **6 adapters across Vulkan, DX12
+and GL**. Before today only Metal (dev M1) and Linux/Vulkan (2026-09-07) had ever run. But
+enumeration is not execution, and pushed on that (the question "did we ever run a DX12 encode?"),
+the answer is no -- so it was run:
+
+| adapter | backend | single intra frame (q=90 bbb) |
+|---|---|---|
+| Intel Arc Pro | Vulkan | works -- 2091447 bytes, PSNR 50.06, 36.94 ms |
+| NVIDIA RTX 2000 Ada | Vulkan | works -- 2091447 bytes, PSNR 50.06, 20.11 ms |
+| Intel Arc Pro | **DX12** | **crash (exit 101) at shader compile** |
+| NVIDIA RTX 2000 Ada | **DX12** | **crash (exit 101) at shader compile** |
+
+Two things fall out of that table:
+
+- **Vulkan output is byte-identical across two different-vendor GPUs** (2091447 bytes on both Intel
+  and NVIDIA). That is a stronger cross-backend result than the Metal-vs-Vulkan comparison, which
+  differed by one byte -- though at a different operating point (this is q=90, near-lossless; the
+  1-byte diff was q=75), so it is not proof the lossy path is bit-exact, only that it was here.
+- **The DX12 backend does not run GNC at all.** Every DX12 encode dies at pipeline creation, before
+  a pixel is read, with an FXC HLSL compile error: `X3695: race condition writing to shared` in
+  **`block_match_bidir.wgsl`** (line 260). naga's generated HLSL for that shader trips FXC's
+  groupshared race check; the same WGSL compiles fine under Vulkan/naga-SPIR-V. The shader is a
+  motion-estimation (bidirectional/B-frame) kernel that is compiled eagerly -- so, exactly like
+  BUG-25 pre-workaround, an intra-only encode dies on a shader it never dispatches. This is
+  **distinct from BUG-25** (which is Vulkan, `block_match_split`, the Restrict buffer check): a
+  different backend, a different compiler, a different shader. It wants its own bug number.
+
+So the honest headline is: **GNC runs on Windows on Vulkan.** GOALS rule 4 also claims DX12, and
+DX12 enumerates but does not compile the shader set; GL enumerates but 2026-09-07 found it exposes
+no compute on this class of card. Vulkan is the one backend actually exercised end to end here.
 
 ### CANARY-1 -- two real GPUs, and the honest number is 2x, not 34x
 
@@ -12364,7 +12391,9 @@ GNC and a driver new enough for NVENC.
 
 ### State
 
-- **Test 3 (Windows portability): PASS.** Builds and runs across Vulkan/DX12/GL enumeration.
+- **Test 3 (Windows portability): PARTIAL.** Builds and runs on **Vulkan** (byte-identical output
+  across Intel and NVIDIA); **DX12 crashes at shader compile** (FXC X3695 in `block_match_bidir.wgsl`);
+  GL enumerates only. Vulkan is the sole backend exercised end to end.
 - **CANARY-1: PASS on two real GPUs, 2.05x** (Intel Arc Pro vs RTX 2000 Ada). The owed two-GPU
   version is done; quote 2x for real-GPU-to-real-GPU, not the 34x CPU figure.
 - **BUG-25: reproduced on Intel Arc Vulkan (Windows)** as a stack-buffer-overrun, in addition to the
@@ -12373,8 +12402,9 @@ GNC and a driver new enough for NVENC.
   memory-bound, not GPU-bound. N=2 = 2.01x is the only clean point.
 - **MEAS-5 vs fixed-function: QSV scales to 4.54x@N=8 and beats GNC on concurrency here**, with the
   not-quality-matched and least-favourable-hardware caveats. **NVENC still owed** (driver 13.0 < 13.1).
-- **Not fixed / still owed:** BUG-25 itself; the shipped-config (inter) density; NVENC; large-GPU
-  MEAS-5; 4:2:2 and 10-bit on Vulkan.
+- **Not fixed / still owed:** BUG-25 itself; the new DX12 FXC X3695 crash in `block_match_bidir.wgsl`
+  (needs its own bug number); the shipped-config (inter) density; NVENC; large-GPU MEAS-5; 4:2:2 and
+  10-bit on Vulkan.
 - **Tooling note for the next Windows session:** AppLocker on a managed machine can block
   executables run from the winget per-user install location -- Python and ffmpeg both had to be
   copied to a policy-allowed path to run at all. And if `CARGO_TARGET_DIR` is set, the harness's

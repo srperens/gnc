@@ -1365,6 +1365,37 @@ frequency 1 everywhere the alphabet is uniform and the depth is 6). Both change 
 codebook, and therefore its bitstream, wherever clamping currently occurs. Not done for a parked
 coder.
 
+### COORD-2 — An id must come *from* the compare-and-swap, not be checked against it (todo, P2)
+
+`scripts/claim` made picking *work* atomic and it did not make picking an *id* atomic. The cost so
+far, all on 2026-09-07: **`BUG-25` used twice** (Vulkan shader / P-frame dequant), **`BUG-26` used
+twice** (abac-vs-Rice chroma / `--tile-size 1024`, forcing a renumber to `BUG-28`), the dequant
+defect renumbered **twice** before landing as `BUG-27`, and decision records **0018, 0019 and 0024
+each duplicated**. COORDINATION diagnoses it exactly and in two places: read-decide-write is three
+steps, everyone reads the same `main:BACKLOG.md`, and the answer is deterministic — so being
+deterministic is what makes the collision reliable rather than unlikely.
+
+**`scripts/claim take BUG-NN` is not the fix and has been tried.** It excludes another *taker* of
+that id; it cannot see a renumbering that exists only in someone's worktree, which is exactly how
+`BUG-26` moved under a session that had reserved it correctly. Two sessions holding one id for two
+different defects means the lock protected neither.
+
+**What to build:** `scripts/claim bug "<why>"` and `scripts/claim dr "<why>"`, each allocating the
+next free number *as* the compare-and-swap that reserves it — the same mechanism `claim next`
+already uses for work items, which `claim selftest` proves with 16 processes racing for one item
+and 6 for one queue. The free-number scan has to read committed `main` (BACKLOG headings for bugs,
+`docs/decisions/` for records) *and* the live `refs/claims/*`, then CAS the winner; a number that
+loses the race retries rather than being handed out twice. Extend `claim selftest` with the
+analogous assertion: **N processes calling `claim bug` at the same instant get N distinct
+numbers.**
+
+**Why P2 and not P1:** it costs time and churn rather than correctness, and no measurement has
+been invalidated by it. But it has now bitten on five distinct ids in one day, the fix is
+mechanical, and every session pays the tax. Two cheap habits until it exists, both from
+COORDINATION: reserve the id before you write the heading, and **push a filing quickly rather than
+holding it in a worktree** — an id that exists only locally is invisible to the mechanism that
+would protect it.
+
 ### BUG-27 — the encoder's P-frame reference was dequantised with the intra qstep (**FIXED 2026-09-07**)
 
 Found and fixed inside INTER-1. **Filed as BUG-25 in the worktree and renumbered to 27** per

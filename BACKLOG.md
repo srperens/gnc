@@ -1501,6 +1501,45 @@ decoder down a GOP"), which may be this seen from the other side.
 
 </details>
 
+### BUG-33 — why does wgpu ask for `buffer: Restrict` on an adapter that reports `robustBufferAccess2`? (todo, P1)
+
+**This is the one question standing between BUG-25 and a fix, and it is a reading question, not a
+measurement one.** Filed separately because BUG-25 is now a *driver* bug — GNC's shader is fine and
+every naga version emits the same shape — while this is a question about our own dependency, with a
+different answer depending on what it turns out to be.
+
+**What is established** (BUG-25, `docs/bug25/`): `BoundsCheckPolicy::Restrict` on **buffers** makes
+naga emit `OpArrayLength` + `OpISub`, and NVIDIA's and Mesa lavapipe's compilers both segfault on
+the result for `block_match_split.wgsl`. `buffer: Unchecked` compiles and builds a pipeline —
+**the only proven fix**. Upgrading naga does not help (30 crashes identically); rewriting the shader
+does not help (two constructs removed, still crashes).
+
+**The contradiction.** `wgpu-hal/src/vulkan/adapter.rs` picks
+`buffer: if self.private_caps.robust_buffer_access2 { Unchecked } else { Restrict }`, and this
+adapter reports **`robustBufferAccess2 = true`** with `VK_EXT_robustness2` present
+(`vulkaninfo`). So wgpu should be choosing `Unchecked`, and then nothing would crash — but the real
+WGSL path does crash, and a faithful `Unchecked` reconstruction does not. **The shipped module
+carries `Restrict`; the source says it should not.**
+
+**Why it matters more than it looks.** The answer decides the shape of the fix:
+
+* **If wgpu is not enabling `VK_EXT_robustness2` when it could** — a defect or a gap on their side —
+  the fix is upstream and roughly one line, and GNC gets Vulkan inter coding by bumping a version
+  once it lands.
+* **If it is deliberate** (robustness2 requested only under some feature GNC does not ask for), GNC
+  needs a `[patch.crates-io]` pin or its own device-creation path, which is a maintenance
+  commitment worth deciding consciously rather than discovering.
+
+**How to answer it.** Read the path from `supports_extension(ext::robustness2::NAME)` (adapter.rs
+~998) through `private_caps.robust_buffer_access2` (~1595) to the `spv::Options` construction
+(~1899), and establish whether `phd_features.robustness2` is populated from *queried* or from
+*enabled* features at that point. Confirm behaviourally rather than by reading alone: the elimination
+argument above is currently the only evidence, and it is indirect. A Vulkan capture layer would
+settle it outright, but none is installed on the bench box — `VK_LAYER_LUNARG_api_dump` or
+GFXReconstruct would do it.
+
+**Do not start by rewriting the shader.** That has been tried twice and is not where the defect is.
+
 ### BUG-28 — abac and Rice decode to different pixels on subsampled chroma (todo, P2)
 
 **Filed as BUG-26 and renumbered to BUG-28 the same day** — `intra1` filed a different BUG-26

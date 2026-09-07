@@ -2,7 +2,9 @@
 
 ## 1. What GNC Is
 
-GNC is a patent-free **video codec** designed from scratch for GPU parallelism. Everything runs as wgpu compute shaders (WGSL) — cross-platform on Metal, Vulkan, DX12, and WebGPU/WASM. The core idea: tile-independent processing with thousands of parallel threads instead of sequential CPU-era algorithms.
+GNC is a patent-free **video codec** designed from scratch for GPU parallelism. Everything runs as wgpu compute shaders (WGSL), written against the WebGPU feature set so the same source targets Metal, Vulkan, DX12 and WebGPU/WASM. The core idea: tile-independent processing with thousands of parallel threads instead of sequential CPU-era algorithms.
+
+**That is the design, and it is not yet the measured state.** As of 2026-09-08 GNC is measured end to end on **Metal only**: on Vulkan intra encode and decode run but **inter coding does not** (BUG-25), DX12 has never been run, and the WASM path is unverified in a browser with one known limit breach (BUG-31). The README's *Portability, as measured* table is the current evidence and should be read before any claim of cross-platform support is repeated.
 
 ### GNC is broad on purpose — that is the decision, not an unresolved question (2026-09-07)
 
@@ -24,7 +26,7 @@ interesting. Concretely, all of the following are in scope at once and none of t
 | quality range | heavy compression through visually lossless to **bit-exact lossless** |
 | chroma | 4:2:0, 4:2:2 and 4:4:4, at 8 and 10 bits |
 | use cases | contribution, mezzanine, **archival**, low-latency preview, browser playback |
-| parallelism | massively parallel, and portable across every GPU with WebGPU/Vulkan/Metal/DX12 |
+| parallelism | massively parallel, and *designed* to be portable across every GPU with WebGPU/Vulkan/Metal/DX12 — measured on Metal, see §1 |
 | compression | roughly **H.264-class**, across that whole range |
 
 **Several internal strategies, selected by quality and bitrate, is a legitimate design — not a
@@ -38,7 +40,7 @@ Where GNC is meant to win outright is portability and scale, against fixed-funct
 
 | | fixed-function (NVENC/QSV/VideoToolbox) | GNC |
 |---|---|---|
-| where it runs | one vendor, specific silicon generations | any GPU with WebGPU/Vulkan/Metal/DX12 |
+| where it runs | one vendor, specific silicon generations | any GPU with WebGPU/Vulkan/Metal/DX12 — by design; measured on Metal, see §1 |
 | concurrent streams | a fixed number of encoder blocks per chip, plus driver session limits | limited by general compute, so it scales with the card |
 | 10-bit 4:2:2 | only on recent hardware (NVENC: Blackwell and later) | a design target from the start |
 | patents | licensed formats | patent-free |
@@ -70,7 +72,7 @@ order rather than a format-specific feature.
 1. **Patent-free** — No patented techniques, period. If it's patented, we don't use it.
 2. **GPU-first** — Everything runs in compute shaders. No CPU fallback paths. CPU reference implementations only for validation/testing.
 3. **Massive parallelism via tile independence** — No cross-tile dependencies at any stage. Each tile encodes/decodes in isolation. This is what enables thousands of parallel GPU threads.
-4. **Cross-platform** — Must work on Metal, Vulkan, DX12, and WebGPU (WASM). No backend-specific features. WGSL shaders are the single source.
+4. **Cross-platform** — Must work on Metal, Vulkan, DX12, and WebGPU (WASM). No backend-specific features. WGSL shaders are the single source. **This is a requirement GNC does not currently meet** — see §1. Portability is the axis the project claims to win on (§1), so a backend it cannot run on is a headline defect and not a compatibility nit.
 5. **No f64 in shaders** — Apple and mobile GPUs have no hardware double precision, and WGSL has no `f64` in any case.
 6. **Open source only** — All dependencies must be open source.
 7. **English only** — All code, comments, docs, and commit messages in English.

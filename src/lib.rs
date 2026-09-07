@@ -483,6 +483,40 @@ impl CodecConfig {
                 TransformType::BlockDCT8 => false,
             }
     }
+
+    /// Force every quantiser weight to 1.0 when the configuration claims to be lossless.
+    ///
+    /// `pack_weights()` and `pack_weights_chroma()` scale the quantiser step per subband and per
+    /// plane, so any weight above 1.0 quantises at a step above 1 and the round trip stops being
+    /// bit-exact — `is_lossless()` says nothing about them. Two settings reach q=100 that way and
+    /// both were measured lossy on this build (BUG-15, gradient512, `GNC_MED=0`):
+    ///
+    /// | weights | bytes | Y-PSNR |
+    /// |---|---|---|
+    /// | as configured (`chroma_weight` 1.2) | 53 751 | 74.83 dB |
+    /// | `GNC_PHYSICAL_WEIGHTS=1` | 6 255 | 49.21 dB |
+    /// | normalised to 1.0 | 53 811 | bit-exact |
+    ///
+    /// It stayed invisible because LOSSLESS-1 routed q=100 to MED the day before CHROMA-1 raised
+    /// `chroma_weight` to 1.2 for every q >= 60, so the only configuration it broke was the one
+    /// nothing exercised. Applied at the encoder entry as well as in `quality_preset`, because
+    /// `--qstep` and `--wavelet` land after the preset and can make a config lossless that the
+    /// preset did not.
+    #[must_use]
+    pub fn normalized_for_lossless(&self) -> Self {
+        let mut cfg = self.clone();
+        if cfg.is_lossless() {
+            let levels = cfg.subband_weights.detail.len() as u32;
+            let chroma = cfg.subband_weights.chroma_weight;
+            cfg.subband_weights = SubbandWeights::uniform(levels);
+            if chroma != 1.0 {
+                eprintln!(
+                    "GNC: lossless config had chroma_weight {chroma}; normalised to 1.0 (BUG-15)"
+                );
+            }
+        }
+        cfg
+    }
 }
 
 impl Default for CodecConfig {
@@ -887,7 +921,10 @@ pub fn quality_preset(q: u32) -> CodecConfig {
         cfg.cfl_enabled = false;
         eprintln!("GNC: MED prediction path active (LOSSLESS-1) — wavelet bypassed");
     }
-    cfg
+    // A lossless preset must not carry a quantiser weight above 1.0 (BUG-15). q=100 reaches this
+    // with chroma_weight 1.2 from CHROMA-1, and with the whole perceptual ladder under
+    // GNC_PHYSICAL_WEIGHTS.
+    cfg.normalized_for_lossless()
 }
 
 /// Entropy-coded tile data — rANS, per-subband rANS, or bitplane coded.

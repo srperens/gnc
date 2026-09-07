@@ -9746,3 +9746,99 @@ finding that the inter gap is *prediction quality*, not the coding model.
   dramatic figure in this entry and it means nothing. This is the third time a saturated VMAF has
   offered a spectacular number here; the harness now prints the overlap next to every VMAF
   BD-rate so the reader can see it, rather than trusting the q≤85 cap to be enough.
+---
+
+
+---
+
+## 2026-09-07 — BUG-15: the wavelet lossless arm stopped being lossless, and nothing noticed for a day
+
+Found while measuring the top of the RD ladder for INTRA-NEARLOSSLESS, not by looking for it. The
+control arm of that experiment is "lossless without MED" (`GNC_MED=0` at q=100), and it came back
+at **53–56 dB with dE00 0.5–0.9**. A path whose entire purpose is bit-exactness was lossy.
+
+Measured in `../gnc-nearlossless` pinned to `ac66321`, own `target/`, on padding-neutral crops
+(1536x1024, 1024x512 for kristensara) copied into the worktree and hashed, because another
+session's fetch was rewriting the shared images while this was being set up.
+
+### The mechanism
+
+`is_lossless()` checks the quantiser step, the dead zone and the wavelet type. It says nothing
+about the **subband weights**, and `pack_weights_chroma()` multiplies the quantiser step by
+`chroma_weight` for the Co/Cg planes. CHROMA-1 raised `chroma_weight` from 1.0 to **1.2 for every
+q >= 60**, which includes q=100, so chroma was quantised at step 1.2 and the round trip could not
+be exact. The same hole swallows the luma ladder: `GNC_PHYSICAL_WEIGHTS=1` reaches weights of ~3.5.
+
+Both measured, gradient512, `GNC_MED=0`, q=100:
+
+| weights | bytes | Y-PSNR (YCoCg-R) | dE00 |
+|---|---|---|---|
+| as shipped (`chroma_weight` 1.2) | 53 751 | 74.83 dB | 0.339 |
+| `GNC_PHYSICAL_WEIGHTS=1` | **6 255** | **49.21 dB** | 0.314 |
+| normalised to 1.0 (the fix) | 53 811 | **bit-exact** | 0.000 |
+
+Content dependence, `GNC_MED=0` before the fix: gradient 74.83 dB, noise512 53.03, kristensara
+crop 55.61, and a flat mid-grey field is bit-exact — which is why a smoke test on synthetic
+content would not have caught it either.
+
+### Why it was invisible, which is the part worth keeping
+
+**LOSSLESS-1 routed q=100 to MED prediction the day before CHROMA-1 raised the weight.** So the
+only configuration CHROMA-1 broke was the one that nothing exercised any more:
+`conformance_lossless_q100` still passed, because q=100 now takes the MED branch, and that branch
+sets `subband_weights = uniform(0)` for its own reasons — flattening the weight as a side effect.
+Every test was green, the default output was bit-exact, and a supported path was silently lossy.
+
+Two things follow, both cheap:
+
+- **A feature that stops being reachable by default stops being tested, even when its tests still
+  run.** The two changes were individually correct and neither review would have flagged the other.
+  What connects them is a shared invariant that lived in neither: *a lossless config must not scale
+  any quantiser weight*. It is now enforced in one place, `normalized_for_lossless()`, called from
+  `quality_preset` and again at the encoder entry — because `--qstep` and `--wavelet` land after
+  the preset and can make a config lossless that the preset did not.
+- **Assert bit-exactness, not a PSNR threshold.** `conformance_lossless_q100` asserts
+  `psnr.is_infinite()` and would have caught this; a `psnr > 45.0` style threshold, which most of
+  its neighbours in that file use, reads 55 dB as a pass. The new test compares pixels.
+
+### What it invalidates, and what it does not
+
+- **The default q=100 path is unaffected.** MED output is byte-identical before and after the fix
+  (bbb crop 2 415 436, kristensara crop 538 678), so **LOSSLESS-1's −14.9%, the FFV1 gap of +25.8%
+  and the −14.3% abac follow-up all stand.** They were measured against a wavelet arm that was
+  still bit-exact at the time, since CHROMA-1 landed afterwards.
+- **Any lossless figure taken with `GNC_MED=0` between CHROMA-1 (`cbfa17f`) and this fix is a
+  53–56 dB file mislabelled as lossless.** Nothing in BASELINE.md or the log appears to be, but
+  COORDINATION's line "q=100 verified bit-exact lossless on all three entropy coders" was false
+  for the wavelet arm in that window.
+- Confirmed by construction: with the fix, `GNC_MED=0` at q=100 returns **byte-identical output to
+  the pre-LOSSLESS-1 build `e872904`** — 671 507 (kristensara crop), 53 811 (gradient512),
+  937 420 (noise512), all `inf` PSNR. That is the strongest available check that the fix restores
+  the old behaviour rather than approximating it.
+- The lossy side is untouched: `quality_preset(90)` keeps `chroma_weight` 1.2, asserted in the new
+  unit test, so CHROMA-1's −5.2% luma BD-rate is not quietly undone.
+
+### The regression test that was missing
+
+`conformance_lossless_wavelet_arm_is_bit_exact` builds the config the way the CLI does — `q=99`
+(which carries `chroma_weight` 1.2) plus `--qstep 1 --wavelet 53` — and asserts pixel equality on
+both the chroma-weight and the perceptual-ladder route. **Verified to fail without the fix**
+(`left: 0.0, right: 0.20000005` at index 0) and pass with it, which is the only way to know a
+regression test is doing anything.
+
+A second test, `lossless_normalisation_strips_weights_and_leaves_lossy_alone`, was rewritten after
+it was written badly: the first version asserted unit weights on `quality_preset(100)` and passed
+**with and without the fix**, because the MED branch flattens the weights anyway. A test that
+cannot fail is worse than no test, since it reads as coverage.
+
+### Two more defects seen in passing, at q=100 with MED active
+
+Not filed here beyond this note — BUG-14's session is already on the Huffman one:
+
+| coder | bytes | Y-PSNR | |
+|---|---|---|---|
+| `--huffman` | 349 161 | **6.73 dB** | silent garbage |
+| `--rans` | 664 991 | 55.31 dB | silently produced the *wavelet* file, byte-identical to `GNC_MED=0` |
+
+So at q=100 only the default coder (Rice) actually delivers the MED path, and the other two fail
+without saying so.

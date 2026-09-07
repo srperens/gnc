@@ -424,6 +424,52 @@ and x264 `-qp 0` by 43% at q=100, and both win by decorrelating against the neig
 the scale. Whether that transfers here is **untested, not refuted** — it cannot be measured until
 this reconstructs.
 
+### BUG-15 — the wavelet lossless arm was not lossless (**FIXED 2026-09-07**)
+`GNC_MED=0` at q=100, and any `--qstep 1 --wavelet 53` config below it, returned **53–56 dB with
+dE00 0.5–0.9** instead of bit-exact output. `is_lossless()` checks the quantiser step, dead zone
+and wavelet type but not the **subband weights**, and `pack_weights_chroma()` scales the step by
+`chroma_weight` — which CHROMA-1 raised to 1.2 for every q >= 60, q=100 included.
+`GNC_PHYSICAL_WEIGHTS=1` is the same hole on luma: 6 255 bytes at 49.2 dB on gradient512.
+
+**Invisible because LOSSLESS-1 landed first.** q=100 had already been routed to MED, so the only
+config CHROMA-1 broke was one nothing exercised; `conformance_lossless_q100` stayed green because
+the MED branch flattens the weights for its own reasons. Neither change was wrong on its own — the
+invariant they share (*a lossless config must not scale any quantiser weight*) lived in neither.
+
+Fixed with `CodecConfig::normalized_for_lossless()`, called from `quality_preset` and again at the
+encoder entry (CLI overrides land after the preset). With it, `GNC_MED=0` at q=100 is
+**byte-identical to the pre-LOSSLESS-1 build `e872904`** — 671 507 / 53 811 / 937 420, all `inf`.
+MED output is unchanged, so **LOSSLESS-1's −14.9%, the +25.8% FFV1 gap and the −14.3% abac
+follow-up all stand**. The lossy side is untouched and asserted so (q=90 keeps 1.2).
+
+Regression test `conformance_lossless_wavelet_arm_is_bit_exact`, verified to fail without the fix.
+It asserts **pixel equality, not a PSNR threshold** — a `psnr > 45.0` assertion, which most tests
+in that file use, reads 55 dB as a pass.
+
+Seen in passing, both at q=100 with MED active, both silent: **`--huffman` emits 6.73 dB garbage**
+(BUG-14's session has this) and **`--rans` falls back to the wavelet path**, byte-identical to
+`GNC_MED=0`. Only the default coder (Rice) delivers the MED path.
+
+### INTRA-NEARLOSSLESS — q=99 is strictly dominated by q=100 (**in progress 2026-09-07**)
+Priority 1 is intra at contribution quality, and the first measurement of the ladder's top found a
+hole in it. Four crops, default coder, YCoCg-R luma:
+
+| image | q=99 | q=100 (MED, bit-exact) | |
+|---|---|---|---|
+| bbb | 2 454 001 B @ 59.92 dB | 2 415 436 B | **−1.6%** |
+| blue_sky | 2 107 664 B @ 60.28 dB | 1 598 293 B | **−24.2%** |
+| kristensara | 717 257 B @ 59.83 dB | 538 678 B | **−24.9%** |
+| touchdown | 2 362 696 B @ 59.82 dB | 1 969 244 B | **−16.7%** |
+
+**q=99 costs 1.6–24.9% more bits than bit-exact lossless and is 60 dB rather than perfect.** The
+anchor ladder puts qstep at 0.75 there (1.30 at q=96), so above about q=96 GNC quantises at a step
+below one — spending bits on precision an 8-bit output cannot show (which is RATE-1's mechanism)
+while a mode that spends nothing on it is cheaper. Nobody re-measured the top of the ladder after
+LOSSLESS-1 moved q=100 by −14.9%, which is what opened the hole.
+
+Open question this was filed for: does MED prediction *instead of* the wavelet keep paying at
+q=88–99 with a quantised closed-loop residual (JPEG-LS near-lossless)? Gate not yet run.
+
 ### LOSSLESS-1 — prediction-based lossless path (**BUILT AND MEASURED 2026-09-06**)
 GNC is 27% behind FFV1 and 43% behind x264 `-qp 0` at q=100, and both win the same way: a
 per-pixel median predictor whose error is entropy-coded **directly**, with no transform. GNC's own

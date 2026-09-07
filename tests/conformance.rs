@@ -178,6 +178,87 @@ fn conformance_checkerboard_q90() {
     assert_eq!(hash, hash_pixels(&decoded2), "Decode not deterministic");
 }
 
+/// The wavelet lossless arm, reached the way the CLI reaches it: `-q 99 --qstep 1 --wavelet 53`.
+///
+/// BUG-15. Since LOSSLESS-1 routed q=100 to MED prediction, nothing exercised the wavelet
+/// lossless path, and CHROMA-1's `chroma_weight = 1.2` (applied from q >= 60) then quantised
+/// chroma at a step above 1. It was lossy for a day — 53-56 dB on real content, 49.2 dB with
+/// `GNC_PHYSICAL_WEIGHTS=1` — with every test in this file still green, because the config that
+/// broke was the one no test built. Both weight routes are asserted here, and the assertion is
+/// bit-exactness rather than a PSNR threshold: a threshold is what let 55 dB pass for lossless.
+#[test]
+fn conformance_lossless_wavelet_arm_is_bit_exact() {
+    let img = make_gradient(512, 512);
+    let ctx = gpu();
+    let mut encoder = EncoderPipeline::new(ctx);
+    let decoder = DecoderPipeline::new(ctx);
+
+    // The preset at q=99 carries chroma_weight 1.2; the CLI overrides that follow make the
+    // config lossless without touching the weights. That is exactly the broken combination.
+    let mut config = gnc::quality_preset(99);
+    config.quantization_step = 1.0;
+    config.dead_zone = 0.0;
+    config.wavelet_type = gnc::WaveletType::LeGall53;
+    assert!(
+        config.is_lossless(),
+        "the CLI override route must produce a lossless config, else this test proves nothing"
+    );
+    assert_ne!(
+        config.subband_weights.chroma_weight, 1.0,
+        "q=99 is expected to carry a chroma weight above 1.0 — if that changes, this test needs \
+         another way to build the broken config"
+    );
+
+    for (label, weights) in [
+        ("chroma weight", config.subband_weights.clone()),
+        (
+            "perceptual ladder",
+            gnc::SubbandWeights::perceptual(config.wavelet_levels),
+        ),
+    ] {
+        let mut cfg = config.clone();
+        cfg.subband_weights = weights;
+        let compressed = encoder.encode(ctx, &img, 512, 512, &cfg);
+        let serialized = format::serialize_compressed(&compressed);
+        let frame = format::deserialize_compressed(&serialized);
+        let decoded = decoder.decode(ctx, &frame);
+        for (i, (&orig, &dec)) in img.iter().zip(decoded.iter()).enumerate() {
+            assert_eq!(
+                orig, dec,
+                "{label}: lossless wavelet arm is not bit-exact at index {i}"
+            );
+        }
+    }
+}
+
+/// A lossless config must not pack a quantiser weight above 1.0, and a lossy one must keep its
+/// weights (BUG-15). `quality_preset(100)` is not enough on its own to test this: the MED branch
+/// resets the weights for its own reasons, so it reads 1.0 whether the invariant is enforced or
+/// not — the assertion has to be made on a config that reaches lossless with weights already set.
+#[test]
+fn lossless_normalisation_strips_weights_and_leaves_lossy_alone() {
+    let mut cfg = gnc::quality_preset(99);
+    cfg.quantization_step = 1.0;
+    cfg.wavelet_type = gnc::WaveletType::LeGall53;
+    assert!(cfg.is_lossless());
+    let w = cfg.normalized_for_lossless().subband_weights.pack_weights_chroma();
+    assert!(
+        w.iter().all(|&v| v == 1.0),
+        "lossless config still packs a non-unit quantiser weight: {w:?}"
+    );
+
+    // Over-broad normalisation would silently undo CHROMA-1, which is worth 5.2% of luma rate at
+    // q >= 85, so check the lossy side too.
+    let lossy = gnc::quality_preset(90);
+    assert!(!lossy.is_lossless());
+    assert_eq!(
+        lossy.normalized_for_lossless().subband_weights.chroma_weight,
+        lossy.subband_weights.chroma_weight,
+        "normalisation must not touch a lossy config"
+    );
+    assert_eq!(lossy.subband_weights.chroma_weight, 1.2);
+}
+
 #[test]
 fn conformance_lossless_q100() {
     let img = make_gradient(512, 512);

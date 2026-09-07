@@ -1538,6 +1538,11 @@ impl EncoderPipeline {
         height: u32,
         config: &CodecConfig,
     ) -> CompressedFrame {
+        // BUG-15: `--qstep`/`--wavelet` are applied after `quality_preset`, so a config can
+        // become lossless here having kept a quantiser weight above 1.0. Normalise once, before
+        // the weights are packed for the GPU and written into the header.
+        let owned_config = config.normalized_for_lossless();
+        let config = &owned_config;
         let profile = std::env::var("GNC_PROFILE").is_ok();
         let t_start = std::time::Instant::now();
 

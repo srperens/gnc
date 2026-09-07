@@ -584,6 +584,71 @@ wrong conclusions have come from this one error.
   and no longer means touching a frame encoder. abac video is also correct now, so a new encoder
   can be checked bit-exact against the CPU coder on inter as well as intra.
 
+- **BUG-27 — the encoder's P-frame reference was dequantised with the *intra* quantiser step, so
+  every inter measurement at q <= 80 in this repository is wrong.** From INTER-1. **Filed as
+  BUG-25 in the worktree and renumbered to 27 per the collision section below** — the Vulkan
+  BUG-25 was pushed first and BUG-26 then went to abac/Rice subsampled chroma. `arch3` found
+  this defect independently while reading both P-frame implementations for ARCH-3; **neither of
+  us had fixed it, and this fixes it.** Six sites when found, three after `a312d6f` deleted the
+  second implementation — both had it, so it was an artefact of neither.
+  `encode_pframe` quantises P residuals at `res_qstep = quantization_step * p_qp_scale` (TUNE-6's
+  taper) and records that for the decoder; its six **local-decode dequantise** dispatches read
+  `config.quantization_step` — both encode paths, all three of luma / 4:2:0 / 4:2:2 chroma. The
+  encoder's reference therefore differed from the decoder's by `quantization_step / res_qstep`,
+  and every P predicting from another P inherited a picture no decoder holds.
+
+  **Whether it bit you depends entirely on q, and the boundary is sharp.** The taper is keyed on
+  the quantiser step and returns exactly 1.0 for every step at or below 2.8 — which is q=85 and
+  above. There the wrong value and the right one coincide, and output is **byte-identical** before
+  and after, verified against a pinned `07c01b1` build (crowd_run ki=9: q=85/90/99 give
+  27588358 / 34128220 / 49328550 bytes both ways). Below q=85 the taper leaves 1.0 and the defect
+  is live on the **default path**. crowd_run, 10 frames, ki=9, 4:4:4, mean/worst-frame PSNR:
+
+  | q | before | after | delta |
+  |---|---|---|---|
+  | 25 | 3233137 B, 29.18/27.78 dB | 3247396 B, 29.47/28.19 dB | +0.4% B, +0.29/+0.41 dB |
+  | 50 | 7201466 B, 32.49/30.37 dB | 7316803 B, 33.39/32.15 dB | +1.6% B, +0.90/+1.78 dB |
+  | 70 | 13161434 B, 35.20/32.08 dB | 13423148 B, 37.02/35.70 dB | +2.0% B, **+1.82/+3.62 dB** |
+  | 80 | 21595433 B, 40.77/38.91 dB | 21734608 B, 41.57/40.53 dB | +0.6% B, +0.80/+1.62 dB |
+
+  **What it invalidates.** Every inter figure taken at q <= 80, which is most of them:
+  **MEAS-3's +4.6% mean / +19.1% worst-frame** (ladder q=25-95) and **decision 0019**, which rests
+  on it — re-running now, and the worst-frame column is where the fix lands hardest, so expect it
+  to move most. **TUNE-6's own justification too**: its recorded "old_town q=99: -3.8 dB avg,
+  **-14.2 dB worst**" for scale 1.25 was measuring this defect and not the trade, so the taper's
+  shape is unjustified until re-measured, and "1.25 is bad at high q" is not currently a
+  supported claim. **Not invalidated:** anything at q >= 85 (byte-identical), every still, and
+  INTER-1's own ki sweep, which ran entirely at q=85-99.
+
+  Three things worth carrying beyond this bug:
+
+  - **A knob that is a no-op at the operating point you test hides bugs in itself.** `p_qp_scale`
+    is 1.0 for all q >= 85, so the contribution range was correct *by coincidence*. Nothing was
+    wrong with the taper; what was wrong was only reachable where the taper does something.
+  - **More bits for worse quality is not a trade, it is a broken arm** — and it was the tell here.
+    Forcing scale 0.90 spent 4% *more* bits and lost 5 dB. Coarser-and-worse (1.25) looked like a
+    plausible bad trade and nearly got written up as one; the sub-1.0 direction had no such
+    reading available, which is the argument for bounding a direction you expect to lose rather
+    than assuming it.
+  - **`cargo test` rewrites `target/release/gnc` and will do it underneath a running sweep.** Mine
+    was replaced 3.5 minutes into a 25-minute run by a comment-only edit, so the output was
+    certainly identical — and the run was still discarded and restarted against a **copied,
+    hash-recorded binary**, because "certainly identical" is not a measurement. If you background
+    a sweep, copy the binary first and point the harness at the copy.
+
+  Filed and fixed in one session; the number was reserved with `scripts/claim take BUG-27` before
+  being written down, per the bug-number collisions above. Regression test
+  `tests/pframe_reference_drift.rs` gates on drift magnitude down a GOP (4.04 dB with the defect,
+  0.86 dB from the inter dead zone alone, threshold 1.5) and uses **no environment variable** — it
+  reaches the taper through q=50, since a `set_var` in a `#[test]` is the race that masked a real
+  decoder bug in `abac_bitstream`.
+
+  **For the ARCH-3 / BUG-18 owner specifically:** this is in `encode_pframe`, the same function
+  you are splitting, and it is the same *class* as BUG-18 cause 1 — encoder and decoder disagreeing
+  about which quantiser step a P residual used — with the sides swapped: BUG-18 was the quantise
+  call, this is the dequantise that builds the reference. Both clusters of six are fixed
+  symmetrically, so a rebase onto `2224c50` should be mechanical, but expect a conflict.
+
 - **BUG-9 — the recorded cause was backwards, and a figure I gave another session needs its
   baseline attached.** `328e76a` + `2b120b1`. rANS's ceiling is not the 4 KB per-stream slot: it
   is the cumfreq table, where every subband group's table for a tile shares one workgroup array
@@ -956,7 +1021,7 @@ recur until an id is allocated by the same compare-and-swap that hands out work.
 | id | defect | state |
 |---|---|---|
 | **BUG-25 (on `main`, `92f4d3a`)** | GNC does not run on Vulkan; `block_match_split.wgsl` kills the NVIDIA driver and lavapipe | committed to `main`, referenced in RESEARCH_LOG and two commit messages |
-| **BUG-25 (worktree `gnc-inter1`)** | P-frame local-decode dequant uses the intra qstep, not `res_qstep`, so the encoder's reference diverges from the decoder whenever `p_qp_scale != 1.0` | claimed, not pushed |
+| **BUG-25 (worktree `gnc-inter1`)** | P-frame local-decode dequant uses the intra qstep, not `res_qstep`, so the encoder's reference diverges from the decoder whenever `p_qp_scale != 1.0` | **renumbered to BUG-27 and pushed 2026-09-07 — resolved, and fixed** |
 
 **Resolution: the one on `main` keeps the number; the dequant defect takes the next free id.** Not
 because it is more important — the dequant defect looks like the more valuable find, and it is
@@ -968,6 +1033,15 @@ in a worktree. First-pushed wins, on the same reasoning as the RATE-2 reconcilia
 notification working correctly: it arrives when you push, not when someone guesses which terminal
 you are. Take both bodies, renumber the dequant one, and check whether it is BUG-18 cause 2 seen
 from the other side before filing it as separate.
+
+**Done, 2026-09-07, by `gnc-inter1`: the dequant defect is `BUG-27`, and it is fixed.** The
+conflict arrived exactly as predicted — on this section, in `COORDINATION.md` and `BACKLOG.md`, at
+rebase time — and the recipe worked: both bodies kept, mine renumbered. It is **not** BUG-18 cause
+2: BUG-18 was the *forward quantise* on the path ARCH-3 has since deleted, this is the
+*dequantise* that rebuilds the encoder's reference, and it was present in **both** P-frame
+implementations, so deleting one did not remove it. `a312d6f` and this fix are the same defect
+found from two directions — by reading two implementations against each other, and by a
+measurement that refused to make physical sense — and neither of us had fixed it until now.
 
 **And note what the claim then says.** `BUG-25` is held by `gnc-inter1` for the dequant defect, so
 the Vulkan work proceeded under `worktree.gnc-bug25` alone. That is a real gap in the exclusion, not

@@ -600,6 +600,25 @@ Three things to carry:
   be missing 400 lines of someone else's day.
 
 **GPU selection from the environment, and a tier/density harness — invalidates nothing.**
+- **`scripts/claim` locks a session out of its own worktree if it registers during a rebase, and
+  its `--force` only works in one position.** Both cost me time on 2026-09-07 and will cost the
+  next session the same, because everyone rebases. `claim worktree` run from a detached HEAD — which
+  is where a rebase leaves you — records the holder as `<worktree>@detached#sNNNNN`. Finish the
+  rebase and you are `<worktree>@<branch>#sNNNNN`, a different identity, so `take`, `touch` and
+  `drop` all refuse with *"held by ...@detached..., not by ...@branch..."*, including on your own
+  worktree. The way out is **`claim drop --force <target>`, flag before target**:
+  `claim drop <target> --force` prints *"Use --force if you mean it"* and then ignores the flag,
+  and `claim --force drop <target>` is `unknown subcommand`. Two cheap fixes for whoever owns
+  COORD-1: accept the flag in either position, and leave the branch out of the holder identity.
+
+- **Bug numbers collided four times on one branch, so put them in the claim registry.** BUG-14's
+  branch filed 16-19, then 17-20, then 19-22, and landed on **21-24** — each rebase found the
+  numbers taken underneath it (`abacship` took 16, `coord` and `abacship` took 17/18 minutes apart,
+  `coord` took 19/20 while this branch was rebasing). Reserving them with `claim take BUG-NN` is
+  what finally held, and it works today with no code change. **A `claim bug` that allocates the
+  next free number atomically would end this class of churn**; reading COORDINATION first will not,
+  because read-decide-write is three steps and everyone is doing it at once.
+
 - **BUG-14 — Huffman's stream mapping is fixed, and Huffman was broken three further ways.
   Invalidates nothing that ships, and one thing that does not.** The mapping fix is byte-identical
   at the default 256 px tile on all 8 measured points and through both encoders, so no preset, no

@@ -1838,14 +1838,29 @@ than on its own.
 Note JPEG XS is patented (GOALS §, and docs/POSITIONING.md) — this is a comparison, not a target
 to adopt.
 
-**JPEG XS is not measurable on this machine — checked 2026-09-07, do not spend the ten minutes
-again.** ffmpeg knows the codec id but is built without an implementation (`ffmpeg -codecs` shows
-`..VILS jpegxs`, and `-h encoder=jpegxs` says no encoder is available); neither `libjxs` nor
-`svt-jpeg-xs` exists as a Homebrew formula, and SVT-JPEG-XS ships Linux/Windows build trees with
-x86 assembly. **VC-2 stands in as the nearest available relative** — intra-only, low-latency,
-broadcast contribution, 9/7 wavelet like GNC's own — alongside ProRes 4444/422 and JPEG 2000.
-So the item is being delivered as "GNC against the available contribution incumbents"; the JPEG XS
-row itself stays open until a machine or a build has it.
+**JPEG XS IS measurable on this machine — corrected 2026-09-07, and the paragraph this replaces
+was wrong.** What is true: ffmpeg here knows the codec id and has no implementation (`-codecs`
+shows `..VILS jpegxs`, `-h encoder=jpegxs` reports no encoder), and Homebrew has no `libjxs` or
+`svt-jpeg-xs` formula. The wrong inference was that SVT-JPEG-XS is therefore x86-only: **only its
+build system is.** The C sources carry `#else /* ARCH_X86_64 */` scalar fallbacks for every
+dispatch, so the portable path was written and merely never selected.
+
+`scripts/build_jpegxs_arm64.sh` + `scripts/svt-jpegxs-arm64.patch` (commit `bc851c7`) clone
+upstream at a pinned commit, gate the nasm discovery / `-DARCH_X86_64` / nine ASM object libraries
+on a detected `SVT_ARCH_X86`, and build. Nothing is prebuilt in the checkout — run the script; it
+installs to `${TMPDIR}/svt-jpegxs` by default and leaves the apps in `Bin/Release/`. It verifies
+rather than trusting the link: 1920x1080 yuv422p at `--bpp 3` round-trips to **PSNR y 44.484 dB**,
+reproduced from a clean clone by two sessions independently.
+
+**Rate and quality from that build are exact. Throughput is not, and must never be quoted from
+it** — every SIMD kernel is disabled on this arch. That splits this item: the bpp-at-matched-quality
+half is deliverable now, the "put it next to MEAS-6's latency row" half is not, and needs either a
+machine with the SIMD paths or an explicit note that no JPEG XS speed figure exists here.
+
+The arm is 4:2:2, so judge it on Y-PSNR and dE00 — `yuv422p10le` caps near 39 dB on RGB PSNR from
+subsampling alone, which is larger than any coding difference in the comparison. ProRes 4444/422,
+VC-2 and JPEG 2000 remain as the other arms; note the ffmpeg VC-2 encoder saturates at 41-43 dB
+regardless of rate, so it cannot be quoted as a statement about SMPTE VC-2 (see RESEARCH_LOG).
 
 ### ENT-2 — Rice vs rANS on one commit (todo, P2)
 

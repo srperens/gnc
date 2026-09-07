@@ -24,6 +24,7 @@
 #   scripts/claim touch MEAS-9          # heartbeat, so `list` ages stay honest
 #   scripts/claim drop MEAS-9
 #   scripts/claim steal MEAS-9 "abandoned, owner's worktree is gone"
+#   scripts/claim worktree              # claim the worktree you are standing in (rule 0)
 #   scripts/claim selftest              # proves the mutual exclusion, 16 racing processes
 
 set -u
@@ -37,8 +38,38 @@ COMMON=$(git rev-parse --git-common-dir 2>/dev/null) || { echo "not a git reposi
 SHARED=$(cd "$(dirname "$COMMON")" && pwd)
 here_branch() { git symbolic-ref --quiet --short HEAD 2>/dev/null || echo "detached"; }
 here_tree()   { local r; r=$(git rev-parse --show-toplevel); basename "$r"; }
+
+# The session, not the directory. Identity used to be worktree@branch, and on 2026-09-07 that
+# turned out to be the wrong principal: two sessions had cwd in the same worktree on the same
+# branch, so they were indistinguishable and one's `touch` succeeded against the other's claim.
+# The claim excluded every session except the one it needed to.
+#
+# A session's own `claude` process is the stable thing -- one per session, unchanged for its whole
+# life, while every Bash call is a fresh shell. Walk up from here to find it. It is also a liveness
+# oracle: `kill -0` on it says whether the holder still exists, which is what makes an abandoned
+# claim detectable rather than merely old.
+session_pid() {
+  local p=$$ ppid comm
+  for _ in 1 2 3 4 5 6 7 8; do
+    read -r ppid comm <<< "$(ps -o ppid=,comm= -p "$p" 2>/dev/null)"
+    [ -z "${ppid:-}" ] && break
+    [ "$(basename "${comm:-}")" = "claude" ] && { printf 's%s' "$ppid"; return; }
+    p=$ppid
+    [ "$p" = "1" ] && break
+  done
+  printf 's?'   # not under a session (a plain shell, or a nested wrapper): unidentifiable
+}
+
+session_alive() { # s<pid> -> 0 if that session's process still exists
+  case "$1" in
+    s\?|"") return 2 ;;                                  # unknown, cannot say
+    s*) kill -0 "${1#s}" 2>/dev/null ;;
+    *) return 2 ;;
+  esac
+}
+
 me() { [ -n "${CLAIM_AS:-}" ] && { printf '%s' "$CLAIM_AS"; return; }
-       printf '%s@%s' "$(here_tree)" "$(here_branch)"; }
+       printf '%s@%s#%s' "$(here_tree)" "$(here_branch)" "$(session_pid)"; }
 
 valid_item() {
   case "$1" in
@@ -74,11 +105,23 @@ age_of() { # blobsha -> human age
   else echo "$((d / 3600))h$(((d % 3600) / 60))m"; fi
 }
 
+owner_state() { # owner-string -> "" | " -- SESSION GONE, safe to steal"
+  local sess=${1##*#}
+  [ "$sess" = "$1" ] && return          # no session part (a seeded or --as claim)
+  session_alive "$sess"
+  case $? in
+    0) : ;;
+    1) printf ' -- SESSION GONE, safe to steal' ;;
+    *) : ;;
+  esac
+}
+
 describe() { # item -> "owner, age, note"
   local sha; sha=$(git rev-parse --quiet --verify "$(ref_of "$1")") || return 1
-  printf '%s (held %s' "$(field "$sha" owner)" "$(age_of "$sha")"
+  local o; o=$(field "$sha" owner)
+  printf '%s (held %s' "$o" "$(age_of "$sha")"
   local n; n=$(field "$sha" note); [ -n "$n" ] && printf ', %s' "$n"
-  printf ')\n'
+  printf ')%s\n' "$(owner_state "$o")"
 }
 
 # --- subcommands --------------------------------------------------------------------------------
@@ -148,8 +191,9 @@ cmd_list() {
   while read -r name sha; do
     [ -z "$name" ] && continue
     any=1
-    printf '  %-16s %-28s %6s  %s\n' "$name" "$(field "$sha" owner)" "$(age_of "$sha")" \
-      "$(field "$sha" note)"
+    local o; o=$(field "$sha" owner)
+    printf '  %-16s %-34s %6s%s  %s\n' "$name" "$o" "$(age_of "$sha")" \
+      "$(owner_state "$o")" "$(field "$sha" note)"
   done < <(git for-each-ref --format='%(refname:lstrip=2) %(objectname)' refs/claims/)
   [ "$any" -eq 1 ] || echo "  (nothing claimed)"
 }
@@ -174,8 +218,39 @@ cmd_selftest() {
   return "$rc"
 }
 
+# A claim on an *item* does not stop a second session cd-ing into your worktree, which is the more
+# damaging half of what happened on 2026-09-07: two sessions edited one file and one committed the
+# other's uncommitted work. So the worktree is claimable too, under the same CAS.
+#
+# A worktree whose holding session is gone is free -- taking it over is the normal case after a
+# session ends, not an exception -- so this reclaims automatically and says that it did. A worktree
+# held by a LIVE other session refuses.
+cmd_worktree() {
+  local base item sha o
+  if [ "$(git rev-parse --show-toplevel)" = "$SHARED" ]; then
+    echo "the shared checkout is shared on purpose -- not claimable." >&2
+    echo "  It is where the coordination files, the logs and the merges live (COORDINATION rule 0)." >&2
+    echo "  Claim a worktree of your own instead: git worktree add -b <area> ../<repo>-<area> main" >&2
+    return 2
+  fi
+  base=$(here_tree); item="worktree.$base"
+  sha=$(git rev-parse --quiet --verify "$(ref_of "$item")") || {
+    cmd_take "$item" "in use by this session"; return $?; }
+  o=$(field "$sha" owner)
+  if [ "$o" = "$(me)" ]; then echo "$base is already yours"; return 0; fi
+  if session_alive "${o##*#}"; then
+    echo "REFUSED: worktree $base is in use by a LIVE session -- $o (since $(age_of "$sha"))" >&2
+    echo "  Do not work here. 'git worktree add' your own, per COORDINATION rule 0." >&2
+    return 1
+  fi
+  local new; new=$(blob_for "$item" "in use by this session" "$o (session gone)")
+  git update-ref "$(ref_of "$item")" "$new" "$sha" &&
+    echo "took over worktree $base from $o (its session is gone)"
+}
+
 case "${1:-}" in
   take|claim)  shift; cmd_take "$@" ;;
+  worktree|wt) cmd_worktree ;;
   drop|release) shift; cmd_drop "$@" ;;
   touch)       shift; cmd_touch "$@" ;;
   steal)       shift; cmd_steal "$@" ;;

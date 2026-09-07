@@ -35,11 +35,27 @@ is not a hypothetical: on 2026-09-07 several sessions picked MEAS-9 at the same 
 duplicate row had to be cleaned up by hand.
 
 ```bash
+scripts/claim worktree                   # claim the worktree you are standing in (do this in rule 0)
 scripts/claim list                       # what is held, by whom, for how long
 scripts/claim take MEAS-9 "why, briefly" # atomic: exactly one session can win this
 scripts/claim touch MEAS-9               # heartbeat, so the age in `list` stays honest
 scripts/claim drop MEAS-9                # when you are done
 ```
+
+**Claim the worktree, not only the item.** A claim on an item does not stop a second session
+`cd`-ing into your directory, and that was the more damaging half of 2026-09-07: two sessions had
+cwd in `gnc-meas9`, both edited `scripts/meas9_contribution.py`, and one committed the other's
+uncommitted work. `scripts/claim worktree` refuses if a **live** other session holds it, and takes
+over automatically if the holder's session is gone — a finished session's worktree is free, that is
+the normal case and not an exception. The shared checkout is not claimable: it is shared on
+purpose.
+
+Identity is `<worktree>@<branch>#s<pid>`, where the pid is the session's own `claude` process — the
+same number the peer sockets use. It has to be the session, not the directory: identity was
+`<worktree>@<branch>` for the first hour and two sessions in one worktree were therefore *the same
+principal*, so one's `touch` succeeded against the other's claim. The claim excluded every session
+except the one it needed to. The pid also makes an abandoned claim detectable rather than merely
+old — `list` marks it `SESSION GONE, safe to steal`.
 
 A refused `take` prints the current owner and exits non-zero, so it is safe in a script: if it
 fails, pick something else. **If it succeeds, the item is yours and no other session can take it.**

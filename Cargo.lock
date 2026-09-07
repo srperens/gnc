@@ -794,6 +794,7 @@ dependencies = [
  "image",
  "js-sys",
  "log",
+ "naga",
  "pollster",
  "serde",
  "serde_json",

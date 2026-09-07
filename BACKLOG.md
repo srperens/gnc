@@ -728,8 +728,17 @@ suite would have preserved it.
 
 **Status: the blast radius is fixed, the shader is not.** `split_pipeline` is now built on first
 dispatch instead of in `MotionEstimator::new`, so intra encode, decode and CANARY-1 all work on
-Vulkan; inter still compiles the shader on every P-frame and still dies. Dropped from P0 to P1
-because nothing is blocked on it any more except MEAS-5. Full numbers in RESEARCH_LOG 2026-09-07.
+Vulkan. Dropped from P0 to P1 because nothing is blocked on it any more except MEAS-5. Full
+numbers in RESEARCH_LOG 2026-09-07.
+
+**Corrected 2026-09-07: inter on Vulkan does not die, it hangs.** This entry said P-frames "still
+compile the shader on every P-frame and still dies", which was written from reading the call sites
+rather than from running it. Measured on the box: `encode-sequence`, 4 frames, ki=2,
+Vulkan/NVIDIA, sat for 3 minutes at **0.00 CPU time** with no output file and had to be killed,
+while intra in the same run completed normally. **A zero-CPU hang is a different symptom from a
+SIGSEGV and may be a different cause** — a lost device that wgpu absorbed and then a fence that
+never signals, or something upstream of the shader entirely. Characterise it with one run before
+assuming the P-frame path fails for the same reason pipeline creation did.
 
 **Five hypotheses were tested and all five are wrong. Do not re-run these:**
 
@@ -740,6 +749,39 @@ because nothing is blocked on it any more except MEAS-5. Full numbers in RESEARC
 | H4 | nine workgroup variables live across many barriers | compiles in isolation |
 | E2 | loop unrolling (all 6 refinement bounds made opaque) | **still segfaults** |
 | E5 | iteration count (8 candidates → 4) | **still segfaults** |
+| H6 | naga duplicates a barrier-carrying block, so invocations reach *different* `OpControlBarrier` instructions | **dead — measured, not argued** |
+| H7 | the count of `var<workgroup>` (nine, against four in both siblings) | **dead — two shaders with 10 and 11 compile** |
+
+**H6 and H7 were killed on the Mac, with no Vulkan and no remote box**, by
+`examples/spirv_probe.rs` — it runs the same naga 24 that wgpu resolves, over all 64 shaders, and
+reports the shape of the SPIR-V that would have been shipped. Numbers:
+
+| shader | wgsl barriers | spv | in conditional blocks | blocks | merge depth | `var<workgroup>` | Vulkan |
+|---|---|---|---|---|---|---|---|
+| **block_match_split** | 29 | 30 | 18 | 268 | 6 | **9** | **dies** |
+| block_match_bidir | 35 | 36 | **24** | 343 | 6 | 4 | OK |
+| block_match | 18 | 19 | 12 | 188 | 6 | 4 | OK |
+| quantize_histogram_fused | 18 | 19 | 11 | **389** | **7** | **11** | OK |
+| rans_histogram | 15 | 16 | 8 | 300 | 7 | **10** | OK |
+
+**H6:** SPIR-V barrier count is source + 1 in *every* shader, so naga duplicates nothing; and
+barriers in conditionally-reached blocks do not discriminate — the two siblings that compile have
+24 and 12 against the offender's 18. **H7:** nine workgroup variables is not even the maximum;
+`quantize_histogram_fused` declares eleven and `rans_histogram` ten, and both compile on Vulkan.
+The entry-point interface list is also identical in shape across working and failing shaders.
+
+**So size, block count, merge depth, barrier count, barrier placement, workgroup-variable count
+and interface shape are all eliminated** — across the whole shader set, not by pairwise
+comparison. What survives is the quarter-pel section (E1 showed it is *required* for the crash)
+and the specific instruction sequence naga emits for it. That is where the SPIR-V reduction has to
+cut.
+
+**Do not assume you need the hardware.** Most of what has been eliminated so far was eliminated
+without it — `spirv_probe` reads the module that would have shipped, so hypotheses about naga's
+output, the shape of the SPIR-V, limits and shader structure are all answerable on any machine.
+What the box is needed for is the final step only: deciding whether a given *cut* still crashes.
+Exhaust the offline questions first; box time is contended and the WGSL round that preceded this
+spent five hypotheses' worth of it on questions that did not need it.
 
 Also ruled out: size and barrier count. `block_match_split` is 806 lines / 17 loops / 31 barriers;
 `block_match_bidir.wgsl` is 741 / 22 / 35 and compiles. Removing the quarter-pel section (E1) makes

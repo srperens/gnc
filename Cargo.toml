@@ -36,6 +36,10 @@ futures-channel = "0.3"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
+# BUG-25: the SPIR-V that wgpu hands the driver is naga's output, so the shader has to be
+# inspectable at that level rather than at WGSL level. Pinned to the version wgpu 24 already
+# resolves, so this adds no download and inspects exactly the bytes the runtime ships.
+naga = { version = "24", features = ["wgsl-in", "spv-out"] }
 
 [[test]]
 name = "quality_regression"

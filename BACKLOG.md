@@ -1551,7 +1551,14 @@ into 256 interleaved independent streams each charged a length field.
 
 Take qstep 4 as the headline: those luma rates (0.98-1.75 bpp) match GNC's real operating point.
 **~9% mean, 0-16% by content**, and roughly a third of the +28.3% intra gap to JPEG 2000 — which is
-unsurprising, since it *is* JPEG 2000's coder. Larger than everything shipped today put together
+unsurprising, since it *is* JPEG 2000's coder.
+
+> **Both halves of that sentence are corrected by ENT-4 (2026-09-07).** The **+28.3%** was measured
+> against OpenJPEG's *reversible 5/3* default, the wrong mode for a lossy comparison; measured with
+> `-I` the intra gap is **+54.2%** on RGB PSNR. And the **~9%** was an offline model: the shipped
+> coder measures **−16.0%** in-codec at identical pixels, 1.7x more. So the share is **a half, not a
+> third** — 54.2% → 27.1% with `--abac`. Both errors were real and they pointed in opposite
+> directions, which is why the answer had to be measured. Larger than everything shipped today put together
 (−5% BD-rate).
 
 **The parallelism objection is answered.** GNC's 256-way stream split costs under 1% at qstep 4 and
@@ -2529,7 +2536,36 @@ independently.
 Note JPEG XS is patented (GOALS, docs/POSITIONING.md) — this is a comparison, not a target to
 adopt.
 
-### ENT-4 — Re-run MEAS-9 with `--abac` (todo, P1, cheapest item on this list)
+### ENT-4 — Re-run MEAS-9 with `--abac` (**DONE 2026-09-07** — abac closes half the JPEG 2000 gap)
+
+**Result: −16.01% of rate at identical pixels (24/24 rungs bit-identical), and it closes exactly
+half the RGB gap to JPEG 2000 — 54.2% → 27.1%.** Full numbers in RESEARCH_LOG 2026-09-07.
+
+| arm | RGB, Rice | RGB, abac | Y, Rice | Y, abac |
+|---|---|---|---|---|
+| J2K 9/7 | +54.2% | **+27.1%** | +79.7% | **+48.3%** |
+| ProRes 4444 | +20.2% | **+1.3%** | +29.3% | **+9.1%** |
+| JPEG XS 4:4:4 | −10.2% | **−25.8%** | +29.4% | **+7.7%** |
+
+With abac GNC matches ProRes 4444 and beats JPEG XS 4:4:4 by 25.8% on RGB PSNR; it stays behind
+both on Y-PSNR, because an entropy coder does not move bits between planes and the luma/chroma
+allocation difference MEAS-9 measured is untouched. The saving decays with rate (−18.0% at q=60 to
+−10.7% at q=99), so **any single abac figure must name its q**. The q=90 mean is −17.32% against
+ABAC-SHIP's independently measured −17.3%, which is the best cross-check either number has.
+
+**Two recorded figures are corrected by this.** The EBCOT scoping said "~9% mean … roughly a third
+of the +28.3% intra gap to JPEG 2000". The +28.3% was measured against **OpenJPEG's default
+reversible 5/3** — provable, not suspected: the 2026-09-05 J2K ladder reads 3.00 bpp at 41.89 dB and
+4.80 at 45.55 on bbb, which today's `J2K 5/3rev` arm reproduces exactly, while `-I` gives 43.85 and
+48.58 dB at the same rates. And the offline model understated the coder by 1.7x (−9.2% modelled
+against −16.0% in-codec), the same direction as the 3-to-4 wavelet levels case. Gap bigger, coder
+better, "a third" → **a half**.
+
+**Successor, and it is now the sharpest open question in intra: where is the remaining +27.1%?**
+The offline work put EBCOT's full-neighbourhood context at −16.4% against abac's vertical-only
+−11.7%, so a richer context model is worth single digits and costs the 256-way parallel decode —
+nowhere near 27 points. The rest must be deadzone/quantisation detail, subband weighting, or
+code-block geometry. **Nothing in the record accounts for it.**
 
 **One flag on the GNC arm, ~25 minutes, and it replaces an extrapolation with a measurement.**
 MEAS-9 found that JPEG 2000 in irreversible 9/7 mode — GNC's own transform at GNC's own depth —

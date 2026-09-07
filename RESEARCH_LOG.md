@@ -10400,3 +10400,111 @@ the cost of rediscovering one is higher than the cost of this list.
 14. **A test that reproduces a bug also tests the *explanation* of the bug.** Written to pin "the
     trigger is AQ", it failed on its first run. Every explanation of BUG-18 that was written before
     a test existed was wrong; the one written after a measurement was not.
+## 2026-09-07 — ENT-4: abac halves the gap to JPEG 2000, and the gap it was scoped against was understated
+
+MEAS-9 left one number as an extrapolation: abac's −17.3% at q=90 was called "about a third" of the
+54.2% RGB gap to JPEG 2000 in 9/7 mode. That third was inferred from a single quality point. This
+measures it — same harness, same four images, same incumbent arms, with the GNC ladder run twice:
+default Rice and `--abac`.
+
+### The check that comes first: 24 of 24 rungs are pixel-identical
+
+abac re-codes the same quantised coefficients losslessly, so if any quality figure moves, the arm
+is measuring something other than the entropy coder and its rate saving is not a rate saving. New
+`entropy_identity_check` in the harness compares every quality figure between the two GNC arms:
+**24/24 rungs bit-identical in RGB PSNR, Y-PSNR, mean dE00 and p95 dE00**, to the last digit
+printed. Only then are the rates believed.
+
+### The rate saving, and a cross-check worth noticing
+
+| image | mean over q=60-99 | q60 | q75 | q85 | q90 | q95 | q99 |
+|---|---|---|---|---|---|---|---|
+| bbb | −13.80% | −16.4 | −14.7 | −15.7 | −14.2 | −12.3 | −9.5 |
+| blue_sky | −15.64% | −17.2 | −15.7 | −18.2 | −17.2 | −14.9 | −10.5 |
+| kristensara | −18.72% | −19.6 | −19.3 | −21.5 | −20.9 | −18.1 | −12.9 |
+| touchdown | −15.88% | −18.7 | −16.8 | −18.5 | −16.9 | −14.4 | −9.8 |
+| **mean** | **−16.01%** | −18.0 | −16.6 | −18.5 | **−17.3** | −14.9 | −10.7 |
+
+**The q=90 column means −17.32%, and ABAC-SHIP's independently measured headline is −17.3%.** Two
+harnesses, different code, different images in the original set, agreeing to the decimal at the same
+operating point. That is the strongest evidence either number is right.
+
+The saving decays with rate — −18.0% at q=60 to −10.7% at q=99 — which is the expected shape: as
+the quantiser step shrinks, coefficients get less skewed and there is less for a context-adaptive
+coder to exploit. Anyone quoting a single abac figure should say which q it came from.
+
+### BD-rate, with and without abac
+
+Mean over the four images. Positive = GNC needs more bits at matched quality.
+
+| arm | RGB, Rice | **RGB, abac** | Y, Rice | **Y, abac** |
+|---|---|---|---|---|
+| J2K 9/7 (irreversible) | +54.2% | **+27.1%** | +79.7% | **+48.3%** |
+| ProRes 4444 | +20.2% | **+1.3%** | +29.3% | **+9.1%** |
+| JPEG XS 4:4:4 | −10.2% | **−25.8%** | +29.4% | **+7.7%** |
+
+Per image, RGB, with abac: J2K 9/7 (+17.3, +32.5, +30.5, +28.3), ProRes 4444 (−17.2, −0.8, −5.8,
++28.8), JPEG XS 4:4:4 (−30.1, −24.6, −30.6, −17.8).
+
+**abac closes exactly half the JPEG 2000 gap on RGB PSNR: 54.2% → 27.1%.** It makes physical sense,
+which is worth checking rather than assuming: 1.542 × (1 − 0.16) = 1.295, against the measured
+1.271, the small difference being that BD-rate integrates in log-rate while the saving varies along
+the ladder.
+
+Two consequences that change the standing picture:
+
+- **With abac, GNC matches ProRes 4444** (+1.3% RGB, and ahead on two of four images) and **beats
+  JPEG XS 4:4:4 by 25.8% on RGB.** On Y-PSNR it is still behind both, by 9.1% and 7.7% — the
+  luma/chroma allocation difference MEAS-9 measured does not change, because the entropy coder does
+  not move bits between planes.
+- **JPEG 2000 remains ahead by +27.1% RGB and +48.3% Y**, with the same transform at the same
+  depth. So half the intra gap was the entropy coder, and half is still unexplained.
+
+### The correction: the gap the EBCOT work was scoped against was the wrong JPEG 2000
+
+BACKLOG's EBCOT section scoped part 2 as *"~9% mean … roughly a third of the +28.3% intra gap to
+JPEG 2000"*. **That +28.3% was measured against OpenJPEG's default reversible 5/3 transform**, and
+it is provable rather than suspected: the J2K ladder in the 2026-09-05 entry reads 3.00 bpp at
+41.89 dB and 4.80 bpp at 45.55 dB on bbb, and today's `J2K 5/3rev` arm reproduces both pairs
+exactly. With `-I` the same rates give 43.85 dB and 48.58 dB.
+
+So the scoping arithmetic was wrong in both directions at once, which is why the conclusion had to
+be measured rather than computed:
+
+| | recorded | measured |
+|---|---|---|
+| intra gap to JPEG 2000 | +28.3% (reversible 5/3) | **+54.2%** (irreversible 9/7, RGB PSNR) |
+| what an EBCOT-class coder is worth | −9.2% mean, offline model at qstep 4 | **−16.0%** in-codec |
+| share of the gap it closes | "roughly a third" | **half** |
+
+The offline model understated the real coder by 1.7x. That is the same direction and roughly the
+same magnitude as the 3-to-4 wavelet levels case (1.2% modelled, 6% in codec), and for the same
+reason: a model cannot see what the shipped coder adapts to. LOOP.md already carries the rule —
+*use offline models to decide what is worth building, not what it is worth* — and this is now its
+second confirmation.
+
+### What this does and does not settle
+
+**Settled:** an EBCOT-class entropy coder is worth −16% of rate in this codec at identical pixels,
+it closes half the gap to JPEG 2000, and the priority order that put entropy coding first was
+right for a better reason than the one recorded.
+
+**Not settled, and now the sharpest open question in intra:** the remaining +27.1%. The offline work
+measured EBCOT's full-neighbourhood context at −16.4% against the vertical-only context abac
+actually ships (−11.7%), so a richer context model is worth something, but nowhere near 27 points —
+and it costs the 256-way parallel decode. The rest has to be somewhere else: deadzone and
+quantisation detail, subband weighting, or the code-block geometry. **Nothing in the record accounts
+for it, and no measurement here narrows it.** Filed as the successor.
+
+**Unchanged:** every caveat from MEAS-9. Rice stays the default (decision 0017: 1.69x frame decode,
+129 ms CPU encode against 23 ms); the 4:2:2 arms and VC-2 still cannot be BD-rate compared; abac's
+inter behaviour is measured only at q=90 and only to ±0.03 dB quality match (BUG-18); and neither
+metric column alone ranks GNC against a 4:4:4 incumbent.
+
+### Reproducing it
+
+```bash
+"$(git rev-parse --show-toplevel)/.venv/bin/python" scripts/meas9_contribution.py \
+    --images test_material/frames/{bbb_1080p,blue_sky_1080p,kristensara_720p,touchdown_1080p}.png \
+    --arms gnc,gnc_abac,jpegxs,prores444,j2k --csv ent4.csv
+```

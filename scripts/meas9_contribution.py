@@ -134,19 +134,29 @@ def conversion_ceiling(src_png, pix_fmt, orig_rgb, tmp):
 # the arms
 # ---------------------------------------------------------------------------
 
-def arm_gnc(gnc_binary, src_png, orig_rgb, tmp, qualities):
+def arm_gnc(gnc_binary, src_png, orig_rgb, tmp, qualities, extra=(), name="GNC"):
+    """The GNC arm. `extra` selects a non-default coder — `["--abac"]` for the code-block
+    arithmetic coder shipped 2026-09-07.
+
+    abac re-codes the *same quantised coefficients* losslessly, so an abac arm must reproduce the
+    Rice arm's pixels exactly at every q. That is checked in `entropy_identity_check`, and it is
+    checked before any rate figure is believed: if quality moves at all, the arm is measuring
+    something other than the entropy coder and the rate saving is not a rate saving.
+    """
     rows = []
+    tag = name.replace(" ", "_")
     for q in qualities:
-        bs, out_png = tmp / f"gnc_q{q}.gnc", tmp / f"gnc_q{q}.png"
-        r = sh([str(gnc_binary), "encode", "-i", str(src_png), "-o", str(bs), "-q", str(q)])
+        bs, out_png = tmp / f"{tag}_q{q}.gnc", tmp / f"{tag}_q{q}.png"
+        r = sh([str(gnc_binary), "encode", "-i", str(src_png), "-o", str(bs), "-q", str(q),
+                *extra])
         if r.returncode != 0:
-            print(f"    GNC q={q} encode failed: {r.stderr.strip().splitlines()[-1:]}")
+            print(f"    {name} q={q} encode failed: {r.stderr.strip().splitlines()[-1:]}")
             continue
         r = sh([str(gnc_binary), "decode", "-i", str(bs), "-o", str(out_png)])
         if r.returncode != 0:
-            print(f"    GNC q={q} decode failed: {r.stderr.strip().splitlines()[-1:]}")
+            print(f"    {name} q={q} decode failed: {r.stderr.strip().splitlines()[-1:]}")
             continue
-        rows.append(("GNC", f"q{q}", os.path.getsize(bs), measure(orig_rgb, out_png)))
+        rows.append((name, f"q{q}", os.path.getsize(bs), measure(orig_rgb, out_png)))
 
     # The ffmpeg arms are checked for honouring their requested rate; this is the same guard for
     # the one arm whose rate is requested indirectly. GNC's ladder is not guaranteed monotonic in
@@ -154,7 +164,7 @@ def arm_gnc(gnc_binary, src_png, orig_rgb, tmp, qualities):
     # through an inversion is silent, so say it out loud.
     for a, b in zip(rows, rows[1:]):
         if b[2] < a[2]:
-            print(f"    GNC: rate falls as quality rises, {a[1]} -> {b[1]} "
+            print(f"    {name}: rate falls as quality rises, {a[1]} -> {b[1]} "
                   f"({a[2]} -> {b[2]} bytes) — the ladder is not monotonic here")
     return rows
 
@@ -345,7 +355,8 @@ def vc2_rungs(w, h, qm="default"):
 
 # ---------------------------------------------------------------------------
 
-ARM_ORDER = ["gnc", "jpegxs", "jpegxs422", "prores444", "vc2", "j2k", "j2k_rev", "prores422"]
+ARM_ORDER = ["gnc", "gnc_abac", "jpegxs", "jpegxs422", "prores444", "vc2", "j2k", "j2k_rev",
+             "prores422"]
 DEFAULT_ARMS = ["gnc", "jpegxs", "jpegxs422", "prores444", "j2k", "prores422"]
 
 
@@ -365,6 +376,9 @@ def run_image(img_path, gnc_binary, arms, qualities, tmp, vc2_qm="default"):
     rows = []
     if "gnc" in arms:
         rows += arm_gnc(gnc_binary, img_path, orig, tmp, qualities)
+    if "gnc_abac" in arms:
+        rows += arm_gnc(gnc_binary, img_path, orig, tmp, qualities,
+                        extra=["--abac"], name="GNC abac")
     if "prores444" in arms:
         rows += arm_ffmpeg("ProRes 4444", "prores_ks", "yuv444p10le", "mov",
                            prores444_rungs(), img_path, orig, tmp, w * h)
@@ -403,6 +417,38 @@ def print_table(rows):
 
 
 MIN_OVERLAP_DB = 3.0
+
+
+def entropy_identity_check(rows, a="GNC", b="GNC abac"):
+    """An entropy coder must not change a single pixel. Verify before believing its rate saving.
+
+    Both coders quantise identically and differ only in how the coefficients are serialised, so
+    every quality figure must match to the last digit. A mismatch means the arm is not isolating
+    the entropy stage — the exact failure mode that made three of this repo's retracted results
+    look like coding wins.
+    """
+    ra = {r["rung"]: r for r in rows if r["codec"] == a}
+    rb = {r["rung"]: r for r in rows if r["codec"] == b}
+    shared = sorted(set(ra) & set(rb), key=lambda k: int(k[1:]))
+    if not shared:
+        return []
+    out, bad = [], 0
+    for k in shared:
+        same = all(abs(ra[k][m] - rb[k][m]) < 1e-9
+                   for m in ("psnr_rgb", "psnr_y", "de00_mean", "de00_p95"))
+        if not same:
+            bad += 1
+            out.append(f"{b} {k}: pixels DIFFER from {a} "
+                       f"(Y {ra[k]['psnr_y']:.4f} vs {rb[k]['psnr_y']:.4f}) — "
+                       f"this arm is not measuring the entropy coder")
+        else:
+            out.append(f"{b} {k}: pixels identical to {a}, "
+                       f"rate {ra[k]['bpp']:.3f} -> {rb[k]['bpp']:.3f} bpp "
+                       f"({(rb[k]['bpp'] / ra[k]['bpp'] - 1) * 100:+.1f}%)")
+    out.insert(0, f"entropy identity {a} vs {b}: "
+                  f"{len(shared) - bad}/{len(shared)} rungs bit-identical in pixels"
+                  + ("" if not bad else f" — {bad} DIFFER, rate figures below are not comparable"))
+    return out
 
 
 def saturation_warnings(rows):
@@ -451,7 +497,7 @@ def _window(pts, lo, hi):
     return sorted(inside, key=lambda p: p[1])
 
 
-def bd_summary(rows, metric, min_overlap=MIN_OVERLAP_DB):
+def bd_summary(rows, metric, min_overlap=MIN_OVERLAP_DB, test="GNC"):
     """BD-rate of GNC against each other arm on `metric`. Negative = GNC needs fewer bits.
 
     Returns (codec, bd_percent_or_None, lo, hi, note) per arm. `note` says why a number is
@@ -463,12 +509,12 @@ def bd_summary(rows, metric, min_overlap=MIN_OVERLAP_DB):
     for r in rows:
         if np.isfinite(r[metric]):
             by_codec.setdefault(r["codec"], []).append((r["bpp"], r[metric]))
-    if "GNC" not in by_codec:
+    if test not in by_codec:
         return []
-    g_all = sorted(by_codec["GNC"], key=lambda p: p[1])
+    g_all = sorted(by_codec[test], key=lambda p: p[1])
     out = []
     for codec, pts in sorted(by_codec.items()):
-        if codec == "GNC":
+        if codec == test or codec.startswith("GNC"):
             continue
         p_all = sorted(pts, key=lambda p: p[1])
         lo = max(p_all[0][1], g_all[0][1])
@@ -504,7 +550,7 @@ def drop_gnc_above(rows, cap):
     """
     out = []
     for r in rows:
-        if r["codec"] == "GNC" and r["rung"].startswith("q"):
+        if r["codec"].startswith("GNC") and r["rung"].startswith("q"):
             try:
                 if int(r["rung"][1:]) > cap:
                     continue
@@ -528,7 +574,7 @@ def matched_rate_table(rows, gnc_rows):
     bpps = [r["bpp"] for r in g]
     out = []
     for r in sorted(rows, key=lambda r: (r["codec"], r["bpp"])):
-        if r["codec"] == "GNC" or not (bpps[0] <= r["bpp"] <= bpps[-1]):
+        if r["codec"].startswith("GNC") or not (bpps[0] <= r["bpp"] <= bpps[-1]):
             continue  # outside GNC's measured ladder: extrapolation, not measurement
         at = {k: float(np.interp(r["bpp"], bpps, [x[k] for x in g]))
               for k in ("psnr_y", "psnr_rgb", "de00_mean")}
@@ -633,12 +679,18 @@ def main():
             print_table(rows)
             for w in saturation_warnings(rows):
                 print(f"  CANARY  {w}")
+            for w in entropy_identity_check(rows):
+                print(f"  CANARY  {w}")
             capped = drop_gnc_above(rows, args.gnc_bdrate_cap)
+            tests = [t for t in ("GNC", "GNC abac") if any(r["codec"] == t for r in rows)]
             for metric, name in (("psnr_y", "Y-PSNR (YCoCg-R)"), ("psnr_rgb", "RGB PSNR")):
-                bds = bd_summary(rows, metric)
-                cap_bds = {c: bd for c, bd, _, _, _ in bd_summary(capped, metric)}
-                if bds:
-                    print(f"  BD-rate on {name}, GNC vs (full ladder | GNC q<="
+                for test in tests:
+                    bds = bd_summary(rows, metric, test=test)
+                    cap_bds = {c: bd for c, bd, _, _, _
+                               in bd_summary(capped, metric, test=test)}
+                    if not bds:
+                        continue
+                    print(f"  BD-rate on {name}, {test} vs (full ladder | q<="
                           f"{args.gnc_bdrate_cap} only, see RATE-2):")
                     for codec, bd, lo, hi, note in bds:
                         if bd is None:
@@ -663,24 +715,26 @@ def main():
         if len(args.images) > 1:
             print("\n=== mean BD-rate across images ===")
             for metric, name in (("psnr_y", "Y-PSNR (YCoCg-R)"), ("psnr_rgb", "RGB PSNR")):
-                per_codec, per_codec_cap = {}, {}
-                for img in args.images:
-                    rows = [r for r in all_rows if r["image"] == Path(img).name]
-                    for codec, bd, _, _, _ in bd_summary(rows, metric):
-                        if bd is not None:
-                            per_codec.setdefault(codec, []).append(bd)
-                    for codec, bd, _, _, _ in bd_summary(
-                            drop_gnc_above(rows, args.gnc_bdrate_cap), metric):
-                        if bd is not None:
-                            per_codec_cap.setdefault(codec, []).append(bd)
-                print(f"  on {name} (full ladder | GNC q<={args.gnc_bdrate_cap} only):")
-                for codec, vals in sorted(per_codec.items()):
-                    cap_vals = per_codec_cap.get(codec)
-                    cap_txt = f"{np.mean(cap_vals):+8.1f}%" if cap_vals else "     n/a"
-                    print(f"    {codec:<12} {np.mean(vals):+8.1f}% | {cap_txt}   "
-                          f"full: ({', '.join(f'{v:+.1f}' for v in vals)})"
-                          + (f"  capped: ({', '.join(f'{v:+.1f}' for v in cap_vals)})"
-                             if cap_vals else ""))
+                for test in [t for t in ("GNC", "GNC abac")
+                             if any(r["codec"] == t for r in all_rows)]:
+                    per_codec, per_codec_cap = {}, {}
+                    for img in args.images:
+                        rows = [r for r in all_rows if r["image"] == Path(img).name]
+                        for codec, bd, _, _, _ in bd_summary(rows, metric, test=test):
+                            if bd is not None:
+                                per_codec.setdefault(codec, []).append(bd)
+                        for codec, bd, _, _, _ in bd_summary(
+                                drop_gnc_above(rows, args.gnc_bdrate_cap), metric, test=test):
+                            if bd is not None:
+                                per_codec_cap.setdefault(codec, []).append(bd)
+                    print(f"  on {name}, {test} (full ladder | q<={args.gnc_bdrate_cap} only):")
+                    for codec, vals in sorted(per_codec.items()):
+                        cap_vals = per_codec_cap.get(codec)
+                        cap_txt = f"{np.mean(cap_vals):+8.1f}%" if cap_vals else "     n/a"
+                        print(f"    {codec:<12} {np.mean(vals):+8.1f}% | {cap_txt}   "
+                              f"full: ({', '.join(f'{v:+.1f}' for v in vals)})"
+                              + (f"  capped: ({', '.join(f'{v:+.1f}' for v in cap_vals)})"
+                                 if cap_vals else ""))
 
         if args.csv:
             import csv as csvmod

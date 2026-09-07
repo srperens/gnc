@@ -33,15 +33,18 @@ GNC is deliberately **broad**: intra and inter, 4:2:0 / 4:2:2 / 4:4:4 at 8 and 1
   `scripts/meas9_contribution.py`, four images, one metric path). BD-rate, positive = GNC needs
   more bits at matched quality; both columns are given because a single one reverses the ranking:
 
-  | | RGB PSNR | Y-PSNR (YCoCg-R) |
-  |---|---|---|
-  | JPEG XS 4:4:4 | **−10.2%** | +29.4% |
-  | ProRes 4444 | +20.2% | +29.3% |
-  | JPEG 2000 9/7 | +54.2% | +79.7% |
+  | | RGB PSNR | RGB, `--abac` | Y-PSNR (YCoCg-R) | Y, `--abac` |
+  |---|---|---|---|---|
+  | JPEG XS 4:4:4 | −10.2% | **−25.8%** | +29.4% | +7.7% |
+  | ProRes 4444 | +20.2% | **+1.3%** | +29.3% | +9.1% |
+  | JPEG 2000 9/7 | +54.2% | **+27.1%** | +79.7% | +48.3% |
 
   **JPEG 2000 uses the same transform as GNC — 9/7 wavelet, five levels — and still needs 54%
   fewer bits**, winning on CIEDE2000 at matched rate too. When the transform is the same, the gap
-  is the entropy coder: J2K's is EBCOT, and `--abac` (−17.3% at q=90) closes about a third of it.
+  is the entropy coder: J2K's is EBCOT, and `--abac` closes **exactly half** of it (ENT-4, −16.0%
+  of rate at bit-identical pixels on 24 of 24 rungs). With `--abac` GNC matches ProRes 4444 and is
+  ahead of JPEG XS 4:4:4 on RGB PSNR, and stays behind both on luma — an entropy coder does not
+  move bits between planes. Where the remaining 27% lives is not yet known.
   The 4:2:2 arms — JPEG XS 4:2:2, ProRes 422 — cannot be BD-rate compared at all: chroma
   subsampling caps them at 39–45 dB RGB PSNR, below GNC's range, and at matched rate GNC beats
   both on luma and colour, which is what full chroma resolution buys rather than a coding result.

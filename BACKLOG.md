@@ -715,7 +715,35 @@ sequential test run could ever have caught, and the instinct to make it go away 
 suite would have preserved it.
 
 
-### BUG-25 — GNC does not run on Vulkan: one shader kills two independent drivers (todo, **P0**)
+### BUG-25 — `block_match_split.wgsl` kills two Vulkan drivers (**contained 2026-09-07**, shader bug open, P1)
+
+**Status: the blast radius is fixed, the shader is not.** `split_pipeline` is now built on first
+dispatch instead of in `MotionEstimator::new`, so intra encode, decode and CANARY-1 all work on
+Vulkan; inter still compiles the shader on every P-frame and still dies. Dropped from P0 to P1
+because nothing is blocked on it any more except MEAS-5. Full numbers in RESEARCH_LOG 2026-09-07.
+
+**Five hypotheses were tested and all five are wrong. Do not re-run these:**
+
+| # | hypothesis | result |
+|---|---|---|
+| H1 | dynamic index into a `let`-declared array value | compiles in isolation |
+| H3 | `workgroupBarrier()` in a function called inside a loop | compiles in isolation |
+| H4 | nine workgroup variables live across many barriers | compiles in isolation |
+| E2 | loop unrolling (all 6 refinement bounds made opaque) | **still segfaults** |
+| E5 | iteration count (8 candidates → 4) | **still segfaults** |
+
+Also ruled out: size and barrier count. `block_match_split` is 806 lines / 17 loops / 31 barriers;
+`block_match_bidir.wgsl` is 741 / 22 / 35 and compiles. Removing the quarter-pel section (E1) makes
+it compile, so that section is *required* for the crash — but the WGSL-level bisect can only delete
+whole statements, and four truncated variants were rejected by naga rather than crashing and were
+counted as passes, so lines 666–697 are where the crash *appears*, not where it is proven to be.
+
+**The next step is a SPIR-V-level reduction**, not more WGSL guessing: `spirv-dis` the module and cut
+it down there. The one solid clue is that **two compilers sharing no code — NVIDIA's and Mesa
+lavapipe's — both die on SPIR-V that `spirv-val` passes**, which points at the shape of naga's
+output for this shader rather than at either driver.
+
+
 
 Found 2026-09-07, the first time this project ever ran on non-Apple hardware. Full measurement in
 RESEARCH_LOG 2026-09-07.
@@ -766,7 +794,7 @@ far under any limit. What is left is the count of workgroup variables, or a barr
 non-uniform control flow — which WGSL forbids and naga does not fully diagnose. **Hypotheses, not
 findings.** Bisect the shader.
 
-### Two separable pieces of work, and the second is the one that unblocks tonight
+### Two separable pieces of work — the second is **done**, the first is what remains
 
 1. **The shader.** Cut `block_match_split.wgsl` down until it compiles, name the construct, fix it,
    and add the case to whatever guards it afterwards. If it turns out to be a driver bug on valid
@@ -1515,7 +1543,40 @@ output-to-display are all unmeasured). Note the ~256-line tile floor is not curr
 the pipeline processes whole frames, so the practical floor is one full frame regardless of tile
 size.
 
-### CANARY-1 — Encode time must move across GPU tiers (todo, P1)
+### CANARY-1 — Encode time must move across GPU tiers (**DONE 2026-09-07 — PASSES at 34x**)
+
+**Answer: encode time moves 34.5x across device tiers.** The failure signal was the two devices
+landing within ~15% of each other. Measured on an NVIDIA RTX 4000 Ada (Ubuntu 24.04.3, driver
+580.173.02, wgpu 24.0.5), `scripts/gpu_tier_bench.py --tier`, bbb_1080p pinned at
+`f83f355f…02bf`, from `main` plus BUG-25's lazy-pipeline change:
+
+| device | backend | encode | decode | settle | spread |
+|---|---|---|---|---|---|
+| **NVIDIA RTX 4000 Ada** | Vulkan | **13.95 ms** (71.7 fps) | **7.29 ms** (137.2 fps) | 1.02 / 1.01 | **34.46x** |
+| llvmpipe (LLVM 20.1.2) | Vulkan | 480.74 ms (2.1 fps) | 373.88 ms (2.7 fps) | 1.00 / 1.01 | |
+| RTX 4000 Ada via GL | Gl | no compute support — dropped | | | |
+
+**Reproduced on a second commit and a different machine load**, which is what makes it a
+measurement rather than a reading: `07c01b1`+patch at load 3.67 gave 13.95 / 7.29 ms and 34.46x;
+`d7353c9`+patch at load 4.5–6.4 gave **14.01 / 7.27 ms and 34.31x**. Encode agrees to 0.4%, decode
+to 0.3%. `settle` is the harness's median/best ratio; at 1.00–1.02 these are not clock-ramp
+artefacts, and the agreement across a 2x load difference is why.
+
+**What it settles.** The 2011 BeHardware failure this canary exists for — shipping GPU H.264
+encoders performing identically on a 100 EUR and a 330 EUR card because they were never
+compute-bound — does not describe GNC. The work happens where we think it does.
+
+**What it does not settle, and both halves matter.** The slow arm is **lavapipe, a CPU
+rasterizer**, not a weaker GPU: this is a strong statement that GNC is compute-bound and a weak one
+about scaling across GPU *tiers*, so the two-real-GPU version is still owed. And it is not MEAS-5 —
+nothing here measures concurrency or compares against NVENC.
+
+**Do not quote the M1 comparison as a result.** MEAS-6's ~47 ms encode / ~35 ms decode against
+these numbers is ~3.8x on round trip, but that is cross-machine, cross-backend, at a possibly
+different q, on a box at load 4.5. The controlled version is one command — run this same harness on
+the M1 when the machine is idle — and it has not been run.
+
+
 
 **Harness built 2026-09-06, not yet run.** `scripts/gpu_tier_bench.py --tier` measures the
 single-frame encode/decode loop on every GPU a machine exposes, best of N processes, and says in

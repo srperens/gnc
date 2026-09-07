@@ -104,6 +104,33 @@ VMAF, dE00) are deterministic and unaffected; fps and latency are not.
 stated parameters are also inconsistent — "ki=8 ... I+P+B", but ki=8 is below the B-frame
 threshold of 9, and the encoder emits 2I+8P. Do not build a density claim on it.
 
+## A second GPU, and the first figures not taken on the M1 (2026-09-07)
+
+NVIDIA RTX 4000 Ada Generation, Ubuntu 24.04.3, driver 580.173.02, Vulkan, wgpu 24.0.5,
+`scripts/gpu_tier_bench.py --tier` on the pinned bbb_1080p (`f83f355f…02bf`). From `main` plus
+BUG-25's lazy-pipeline change — GNC does not start on Vulkan without it.
+
+| | encode | decode | round trip |
+|---|---|---|---|
+| **RTX 4000 Ada (Vulkan)** | **13.95 ms** (71.7 fps) | **7.29 ms** (137.2 fps) | **21.2 ms** |
+| llvmpipe, CPU rasteriser (Vulkan) | 480.74 ms | 373.88 ms | 854.6 ms |
+| M1 (Metal), MEAS-6 2026-09-06 | ~47 ms | ~35 ms | ~80 ms |
+
+Reproduced at a second commit under 2x the load: 14.01 / 7.27 ms. **This is CANARY-1's quantity —
+the single-frame encode/decode loop — and it is a fourth thing that has been called "encode fps" in
+this file.** It is nearest quantity **A** (GPU encode phase) and is not comparable to B or C.
+
+**Do not quote the M1 row against the RTX row as a speedup.** It is cross-machine, cross-backend,
+possibly at a different q, and the M1 figure was taken by a different harness. The controlled
+version is one command — this same harness on an idle M1 — and it has not been run.
+
+**Cross-backend output, measured for the first time.** Same commit, same input: q=100 lossless is
+**byte-identical** between Metal and Vulkan (`5c4539d8…`, 3 235 737 B), and q=75 lossy **differs by
+one byte** (1 173 797 vs 1 173 796). Every file decodes to identical pixels on both backends. So
+**the decoder is bit-exact across backends and the lossy encoder is not** — any regression test that
+hashes lossy encoder output will fail across backends, and a conformance suite must require decoder
+bit-exactness, not encoder reproducibility.
+
 ## Sequence Benchmarks (I+P+B, q=75, ki=9, 10 frames, 4:4:4)
 
 > **Stale as of 2026-09-06.** `quality_preset` now vetoes the hierarchical B-pyramid by default

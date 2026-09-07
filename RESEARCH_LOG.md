@@ -11244,3 +11244,151 @@ wrong.
 Filed as **BUG-25 (P0)**. The probe used to find it is `examples/shader_probe.rs` in the write-up
 and is worth keeping as a permanent per-shader portability check — 62 processes, no GPU work, and it
 would have caught this the day the shader landed.
+
+---
+## 2026-09-07 — BUG-25 worked around, and the first GNC measurement on a second GPU: CANARY-1 passes at 34x
+
+Three results, and the middle one is the one this project has been waiting for.
+
+1. **The Vulkan crash is contained** — one pipeline is now built on first dispatch instead of in
+   `MotionEstimator::new`, so a shader only inter coding uses stops killing everything else.
+2. **CANARY-1 passes.** Encode time moves **34.5x** across device tiers. The single assumption the
+   whole project rests on has its first measurement, and it is not a null result.
+3. **Cross-backend behaviour is measured, and the answer is two answers**: the decoder is bit-exact
+   on both backends, the lossless encoder is byte-identical, and the lossy encoder is not.
+
+The shader bug itself is **not fixed**. Five hypotheses were tested and all five are wrong; they are
+recorded below so nobody spends the evening re-running them.
+
+### The workaround, and the rule it encodes
+
+`block_match_split.wgsl` is variable-block-size motion estimation — encoder-only, inter-only, never
+dispatched by a still image. It was created unconditionally in `MotionEstimator::new`, and creating
+a pipeline is what hands the shader to the driver's compiler. So the driver crashed before a single
+pixel was read, and a still-image encode died on a shader it never runs.
+
+`split_pipeline` is now a `OnceLock` built by an accessor at the dispatch site. 34 lines in
+`src/encoder/motion.rs`. The rule it encodes outlives the bug and is worth stating without it: **a
+shader's cost, including the risk that it does not compile, is paid by the feature that uses it and
+not by everything else.** Decode-first is this project's natural order — abac and bitplane both
+landed that way — so the next shader that trips a driver should cost its own feature.
+
+**Verified on Metal:** 219 tests pass, both clippy targets clean, and single-frame output is
+unchanged (`1173797` bytes at q=75 on bbb, matching the committed figure). **Verified on Vulkan by
+the bug itself:** `gnc encode` now completes where it segfaulted, which is a stronger canary than
+any log line — the failure was the proof the pipeline was eager.
+
+One trap worth recording: the insertion first landed *between* `estimate_split`'s
+`#[allow(clippy::too_many_arguments)]` and the function it applied to, which silently moved the
+allow onto the new accessor and made clippy fail on the function that had been exempt for good
+reason. Caught by the gate; it would have been invisible in review.
+
+### CANARY-1 — the measurement, on an NVIDIA RTX 4000 Ada
+
+`scripts/gpu_tier_bench.py --tier`, bbb_1080p (pinned, `f83f355f…02bf`), Ubuntu 24.04.3, driver
+580.173.02, wgpu 24.0.5, built from `main` plus this change.
+
+| device | backend | encode | decode | settle |
+|---|---|---|---|---|
+| **NVIDIA RTX 4000 Ada** | Vulkan | **13.95 ms** (71.7 fps) | **7.29 ms** (137.2 fps) | 1.02 / 1.01 |
+| llvmpipe (LLVM 20.1.2, CPU) | Vulkan | 480.74 ms (2.1 fps) | 373.88 ms (2.7 fps) | 1.00 / 1.01 |
+| RTX 4000 Ada via the GL backend | Gl | no compute support — dropped | | |
+
+**Spread 34.46x**, and **reproduced**: re-run at a different commit (`d7353c9`+patch) under 2x the
+machine load gave **14.01 / 7.27 ms and 34.31x** — encode agreeing to 0.4%, decode to 0.3%. Two
+readings that agree across a load difference that large are a measurement; one would have been a
+reading.
+
+**Pass condition was "encode time drops substantially on the faster device"; failure was the two
+landing within ~15% of each other.** It is 34x. `settle` is the median/best ratio the harness prints
+for exactly this purpose: at 1.01–1.02 the numbers are quotable rather than clock-ramp artefacts.
+
+**What it proves.** The 2011 BeHardware result that this canary exists for — shipping GPU H.264
+encoders performing *identically* on a 100 EUR and a 330 EUR card, because they were never
+compute-bound — does not describe GNC. The work is where we think it is.
+
+**What it does not prove, and this matters.** The slow arm is **lavapipe, a CPU rasterizer**, not a
+weaker GPU. So this is a strong statement that GNC is compute-bound and a weak one about scaling
+across *GPU* tiers specifically; the two-real-GPU version of the experiment is still owed. And it is
+CANARY-1, not MEAS-5: nothing here compares GNC against NVENC or measures concurrency.
+
+**The absolute numbers are worth noticing but not banking.** MEAS-6 measured ~47 ms encode and
+~35 ms decode on the M1, so 1080p round trip goes from ~80 ms to ~21 ms — about 3.8x. That is
+cross-machine *and* cross-backend, on a box whose load average was 4.5 while the run was taken, so
+it is indicative and not a controlled comparison. Quote CANARY-1's ratio; do not quote 3.8x.
+
+### Cross-backend bit-exactness, which had never been checked
+
+GOALS rule 4 claims four backends and only Metal had ever run, so "does the same input produce the
+same file" had no answer. Same commit, same pinned PNG, both machines:
+
+| | Metal (M1) | Vulkan (RTX 4000 Ada) | |
+|---|---|---|---|
+| q=75 lossy | 1 173 797 B, `666f95b5…` | 1 173 796 B, `061766e5…` | **differs, by 1 byte** |
+| q=100 lossless | 3 235 737 B, `5c4539d8…` | 3 235 737 B, `5c4539d8…` | **byte-identical** |
+
+And the check that actually matters — decode every file on both backends and hash the pixels:
+
+| file | decoded on Metal | decoded on Vulkan |
+|---|---|---|
+| `metal_q75.gnc` | `277fc7eb…` | `277fc7eb…` |
+| `vk_q75.gnc` | `4008c9c5…` | `4008c9c5…` |
+| q=100 (one file) | `ac0ec8b3…` | `ac0ec8b3…` |
+
+**The decoder is bit-exact across backends.** Any `.gnc` decodes to identical pixels on Metal and
+Vulkan, which is the portability requirement a codec actually has to meet, and it holds. The
+lossless *encoder* is bit-exact too, as integer MED plus an integer transform should be.
+
+**The lossy encoder is not, and that needs to be written down rather than discovered.** One byte in
+1.17 MB — a single coefficient rounding the other way in the f32 wavelet, which is ordinary for
+floating-point compute across two shader compilers and is exactly what x264 does across its own SIMD
+paths. It is not a defect. But it breaks two things people assume: **any regression test that hashes
+encoder output will fail across backends**, and any future conformance suite must specify decoder
+bit-exactness, not encoder reproducibility. `frames_pinned/SHA256SUMS` pins inputs; there is no
+equivalent for outputs and there should not be one for the lossy path.
+
+### The shader bug: five hypotheses, five wrong
+
+`block_match_split.wgsl` segfaults the NVIDIA Vulkan driver and loses the device on Mesa lavapipe,
+while naga converts it and `spirv-val` passes it. Located with `examples/shader_probe.rs` — one
+device and one compute pipeline per process, so a driver crash costs one run — over all 62 WGSL
+files: **60 pass, and only this one fails** (`blit.wgsl`'s failure is the probe's artefact; it is
+vertex/fragment only).
+
+Bisected by truncating the entry function at brace-depth-1 statement boundaries: the crash arrives
+with the **quarter-pel refinement loop, lines 666–697**. Then, testing what about it matters:
+
+| # | hypothesis | test | result |
+|---|---|---|---|
+| H1 | dynamic index into a `let`-declared array value | 10-line shader doing exactly that | **compiles** |
+| H2 | same, as a module-level `const` | control for H1 | compiles |
+| H3 | `workgroupBarrier()` in a function called inside a loop | 20-line shader | **compiles** |
+| H4 | nine workgroup variables live across many barriers | 40-line shader mimicking the real one | **compiles** |
+| E1 | is the quarter-pel section required? | delete it from the real shader | **compiles** — so yes |
+| E2 | is it loop unrolling? | make all 6 refinement loop bounds opaque via `min(8u, params.width)` | **still segfaults** |
+| E5 | is it the iteration count? | 8 candidates → 4 | **still segfaults** |
+
+So it is **not** a single construct, **not** unrolling, **not** the trip count, **not** the number
+of workgroup variables, and **not** size or barrier count — `block_match_split` has 806 lines, 17
+loops and 31 barriers, while `block_match_bidir.wgsl` has 741, 22 and 35 and compiles fine. The
+crash needs the real shader's full complexity, and it reproduces on two Vulkan implementations that
+share no compiler code.
+
+That last fact is the useful one for whoever takes it: **two independent compilers dying on valid
+SPIR-V points at the shape of naga's output for this shader**, not at either driver. The next step
+is a proper reduction — `spirv-dis` the module and cut it down at the SPIR-V level rather than the
+WGSL level, since the WGSL-level bisect can only remove whole statements.
+
+One methodological caveat on the bisect: four truncated variants were rejected by naga/wgpu rather
+than crashing, and the harness counted those as "did not crash", which biases the boundary. Lines
+666–697 are where the crash *appears*; they are not proven to be where it *is*.
+
+### State
+
+- **BUG-25 workaround: landed.** The shader bug: open, and now with five ruled-out causes.
+- **CANARY-1: DONE**, and it passes.
+- **MEAS-5: still blocked.** `--density` runs `benchmark-sequence`, and both `estimate_split` call
+  sites are unconditional in the P-frame path, so video still compiles the shader. An all-intra
+  density sweep at ki=1 would run, but it measures intra concurrency rather than the shipped
+  configuration and must be labelled that way.
+- **Not measured:** anything about NVENC, and any 4:2:2 or 10-bit behaviour on Vulkan.

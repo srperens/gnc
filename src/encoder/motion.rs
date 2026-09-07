@@ -172,7 +172,10 @@ pub struct MotionEstimator {
     /// Chroma-dimension bidir MC pipeline (for 4:2:0 B-frame chroma planes).
     compensate_bidir_chroma_pipeline: wgpu::ComputePipeline,
     compensate_bidir_chroma_bgl: wgpu::BindGroupLayout,
-    split_pipeline: wgpu::ComputePipeline,
+    /// Built on first dispatch rather than in `new` — see `split_pipeline()`.
+    split_pipeline: std::sync::OnceLock<wgpu::ComputePipeline>,
+    split_shader: wgpu::ShaderModule,
+    split_pl: wgpu::PipelineLayout,
     split_bgl: wgpu::BindGroupLayout,
     /// MV scaling pipeline — derives chroma MVs from luma MVs via arithmetic right-shift.
     mv_scale_pipeline: wgpu::ComputePipeline,
@@ -450,17 +453,6 @@ impl MotionEstimator {
                 push_constant_ranges: &[],
             });
 
-        let split_pipeline = ctx
-            .device
-            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("block_match_split_pipeline"),
-                layout: Some(&split_pl),
-                module: &split_shader,
-                entry_point: Some("main"),
-                compilation_options: Default::default(),
-                cache: None,
-            });
-
         // --- MV scaling pipeline (luma → chroma MVs for subsampled formats) ---
         let mv_scale_shader = ctx
             .device
@@ -583,7 +575,9 @@ impl MotionEstimator {
             compensate_bidir_bgl,
             compensate_bidir_chroma_pipeline,
             compensate_bidir_chroma_bgl,
-            split_pipeline,
+            split_pipeline: std::sync::OnceLock::new(),
+            split_shader,
+            split_pl,
             split_bgl,
             mv_scale_pipeline,
             mv_scale_bgl,
@@ -1169,6 +1163,32 @@ impl MotionEstimator {
         }
     }
 
+    /// The variable-block-size pipeline, compiled on first dispatch.
+    ///
+    /// Deliberately not built in `new`. Creating a pipeline hands the shader to
+    /// the driver's compiler, and `block_match_split.wgsl` segfaults NVIDIA's
+    /// Vulkan driver and loses the device on lavapipe (BUG-25). Because it was
+    /// created eagerly, a shader that only inter coding dispatches stopped a
+    /// still-image encode — which never reaches it — from starting at all: one
+    /// broken shader killed the whole codec on Vulkan.
+    ///
+    /// The rule this encodes is general, and outlives the bug: a shader's cost,
+    /// including the risk that it does not compile, is paid by the feature that
+    /// uses it and not by everything else.
+    fn split_pipeline(&self, ctx: &GpuContext) -> &wgpu::ComputePipeline {
+        self.split_pipeline.get_or_init(|| {
+            ctx.device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("block_match_split_pipeline"),
+                    layout: Some(&self.split_pl),
+                    module: &self.split_shader,
+                    entry_point: Some("main"),
+                    compilation_options: Default::default(),
+                    cache: None,
+                })
+        })
+    }
+
     /// Dispatch 8x8 split decision shader.
     /// Takes 16x16 parent MVs + SADs, runs 4× 8x8 sub-block refinement with
     /// RD split decision. Returns 8x8-resolution MV buffer.
@@ -1286,7 +1306,7 @@ impl MotionEstimator {
                 label: Some("block_match_split_pass"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.split_pipeline);
+            pass.set_pipeline(self.split_pipeline(ctx));
             pass.set_bind_group(0, &bg, &[]);
             pass.dispatch_workgroups(total_macroblocks, 1, 1);
         }

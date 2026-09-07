@@ -27,5 +27,9 @@ examples/web/*.pem
 # Python bytecode
 __pycache__/
 *.pyc
+
+# The metric scripts need numpy and pillow, and the system python here is
+# externally managed. One shared venv in the shared checkout, gitignored.
+.venv/
 examples/web/*.log
 examples/web/demos.json

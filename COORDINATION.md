@@ -127,8 +127,9 @@ blocked until someone re-fetches it, and say which sequences a new result actual
 worktree's symlink was dangling and no session could measure anything.** Refetched with
 `test_material/fetch_test_frames.sh`; the four stills (`bbb_1080p`, `blue_sky_1080p`,
 `kristensara_720p`, `touchdown_1080p`) and `sequences/bbb/` are back and every PNG verified to
-decode. `sequences/blue_sky/` and the `frames/hdr/` 10-bit material are still absent; another session is
-fixing the script's silent-failure path, and `frames/hdr/` regenerates with `scripts/png16.py`.
+decode. **Updated later that day: `sequences/blue_sky/` is back too** — the `chroma2` session fixed
+the script's silent-failure path and refetched, and all 22 artefacts now verify. `frames/hdr/` is
+still absent; regenerate it with `scripts/png16.py` if a 10-bit measurement is needed.
 
 Two things to carry from how that went:
 
@@ -143,9 +144,20 @@ Two things to carry from how that went:
   input.
 
 **`python3` on this machine has neither `numpy` nor `pillow`**, so `scripts/lossless_gate.py`,
-`ypsnr_de00.py` and `chroma_metric.py` do not run out of the box. Make a venv
-(`python3 -m venv <dir> && <dir>/bin/pip install numpy pillow`) and call its interpreter
-explicitly.
+`ypsnr_de00.py` and `chroma_metric.py` do not run out of the box, and the system python is
+externally managed so `pip install` refuses outright.
+
+**There is now one shared venv in the shared checkout — use it, do not make your own.**
+
+```bash
+REPO=$(git rev-parse --show-toplevel)          # resolves to your worktree
+SHARED=$(git -C "$REPO" worktree list --porcelain | head -1 | cut -d' ' -f2)
+"$SHARED/.venv/bin/python" scripts/chroma_metric.py ...
+```
+
+It has numpy 2.5.3 and pillow 12.3.0, and it is gitignored. `chroma_metric.py --selftest` passes
+**16/16 Sharma reference pairs**, so the dE00 implementation itself is validated — run it once
+before quoting a colour number, it costs a second.
 
 ## Timing: an idle machine is necessary and NOT sufficient (added 2026-09-06, after an idle run still lied)
 

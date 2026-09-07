@@ -179,13 +179,12 @@ If this table and `scripts/claim list` disagree, the table is wrong.
 | `../gnc-abac`, `.claude/worktrees/abac` (`abac-gate`) | `abac` | **released — question answered, see BACKLOG Part 6.** The idle-machine bench is run. Range at cb=64 costs **1.69× frame decode for −16.7% rate** at q=90; Interval costs 3.99×. Rice's own entropy stage is 47% of frame decode, which caps any entropy work at 1.9×. What remains is a positioning call, not an engineering one. |
 | `../gnc-abac` | `abac` | same worktree, now on **BUG-8** — the encoder's local decode diverges from the real decoder down a GOP. |
 | `../gnc-nearlossless` | `nearlossless` | **INTRA at contribution quality (priority 1).** Gating whether MED prediction *instead of* the wavelet — LOSSLESS-1's mechanism, −14.9% at q=100 — survives into the lossy near-lossless range q=88–99, closed-loop with a quantised residual (JPEG-LS near-lossless). Offline gate first, no code change yet. |
-| `../gnc-chroma2` | `chroma2` | **CHROMA-2 — DONE, merged at 062f49e.** The colour lead over x264 is **withdrawn**: rate-matched, x264 wins dE00 on **6 runs of 6**, and on five it needs no chroma-QP offset at all — ahead on colour *and* luma at once. **GNC now has no measured advantage over x264 on any axis** at the contribution operating point, so the +90.5% is the whole picture rather than one side of a trade, and GOALS loses "keep the colour lead" as a target. Decision 0020. Also did the test-material refetch, the shared venv, and the arm64 JPEG XS build. |
 | `../gnc-abacship` | `abacship` | **ABAC-SHIP merged to main 2026-09-07** (`60bed17`, `378a0c7`). abac is a real entropy coder now: `--abac`, entropy type 5, **GP18**. −16.6% to −18.8% of rate against Rice at *identical pixels*, −13.4% at lossless (FFV1 gap +23.9% → +7.3%). Rice stays the default — `docs/decisions/0017`. **Every frame this encoder writes now says GP18**; a GP18 Rice frame is a GP17 payload with a new label, proved by relabelling and decoding, and GP17 still reads. Worktree kept: next on this row is a real inter measurement (correctness is tested, rate is not). |
 | `../gnc-rate1` | `rate1` | **DONE, merged, worktree removed.** RATE-1 answered **no** — a bit-depth-aware rate rule recovers **0.0% on all four photographic stills** (89.4% on the synthetic gradient, which is the trap). The sweep found **RATE-2 instead, filed P1**: above q≈95-98 the lossy ladder costs more bytes than bit-exact lossless on every real image, mean **+28.9% at q=99** (blue_sky +40.6%). LOSSLESS-1 made lossless cheap enough to undercut the top of the lossy ladder and nothing noticed. |
 | `../gnc-coord` | `coord` | **COORD-1 — the claim mechanism enforces the rules instead of restating them.** Docs and `scripts/claim` only; no codec change, invalidates no measurement. `scripts/claim next` makes the *pick* atomic, the shared-checkout and worktree preconditions are now refusals rather than prose, and the session identity bug that made `SESSION GONE` undetectable is fixed. See `docs/decisions/0019`. Claimed 2026-09-07. |
 | `../gnc-meas9` | `meas9` | **MEAS-9 merged (`ed62de7`) — now on ENT-3.** MEAS-9's result: J2K in irreversible 9/7 mode uses **GNC's own transform at GNC's own depth** and needs **54.2% fewer bits on RGB PSNR / 79.7% on Y-PSNR**, so the intra gap is the entropy coder, not the transform. GNC is −10.2%/+29.4% against JPEG XS 4:4:4 and +20.2%/+29.3% against ProRes 4444. **ENT-3 is the inter half**: abac against Rice on P-frame residuals, which ABAC-SHIP explicitly left out of scope. Touches nothing another row owns — measurement first. |
 
-## The test material was missing entirely, and the `chroma2` session is refetching it (2026-09-07)
+## The test material was missing entirely, and was refetched (2026-09-07) — RESOLVED
 
 **`test_material/frames` did not exist anywhere on disk** at the start of 2026-09-07 — not in the
 shared checkout, not under any worktree. The 2026-09-06 `ln -sfn` accident is the likely cause: the
@@ -208,14 +207,16 @@ exactly the committed figure. Symlink your worktree at it per "Start of session"
   `syntax error near unexpected token '50-57'` — after the download, before the verification.
   Cost a whole extra pass. Edit, then run.
 
-**Who fetched: the `chroma2` session.** It is running `test_material/fetch_test_frames.sh`
-into the **shared checkout** (`test_material/frames`), which is where the directory belongs and
-what every worktree's symlink resolves to. Started 2026-09-07 ~19:10.
+**Who fetched: the `chroma2` session** (worktree since removed), into the **shared checkout**
+(`test_material/frames`), which is where the directory belongs and what every worktree's symlink
+resolves to.
 
-**Do not start a second fetch.** Two concurrent runs write the same paths and the script's
-`[skip] already exists` guard checks for a file that a half-finished download also satisfies, so a
-second run will happily skip a truncated PNG. If you need the material and it is not there yet,
-wait, or ask the chroma2 session.
+**If you ever need to refetch: check `ps` for a running fetch first, and do not start a second
+one.** Two concurrent runs write the same paths, and the script's `[skip] already exists` guard is
+checked before the write, so simultaneous starts all miss it and a half-finished download looks
+complete to whoever checks next. That happened here — three runs at once — and nothing was
+corrupted only by luck. There is no session left to ask, so verify with the script's own
+per-file check rather than by asking anyone.
 
 **Checked 2026-09-07 19:10 by the `abacship` session: there are TWO fetch runs live, not one.**
 `ps` shows `bash ./fetch_test_frames.sh` (started 19:08:58, launched from the shared checkout's

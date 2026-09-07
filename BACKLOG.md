@@ -767,8 +767,17 @@ findings.** Bisect the shader.
    dispatched by a still-image encode. It is created **unconditionally in `MotionEstimator::new`**
    (`src/encoder/motion.rs:456`), so a shader a still never uses stops a still from encoding.
    **One broken shader becomes a dead codec.** Create it lazily, or behind the condition that
-   dispatches it, and intra encode, decode, CANARY-1 and MEAS-5 all become runnable on Vulkan while
-   piece 1 is diagnosed. This is also the general fix: the next shader that trips a driver should
+   dispatches it, and intra encode and decode start working on Vulkan while piece 1 is diagnosed.
+
+   **What that does and does not unblock, checked rather than assumed.** `estimate_split` is called
+   only from `sequence.rs`, never from `pipeline.rs`, so the still path never touches it — and
+   `gpu_tier_bench.py` runs `--tier` through `gnc benchmark` on a single image but `--density`
+   through `benchmark-sequence` on a clip. So **lazy creation unblocks CANARY-1 and leaves MEAS-5
+   blocked**: both `estimate_split` call sites are unconditional inside the P-frame path, so every
+   P-frame compiles the shader. (An all-intra density sweep at ki=1 would emit no P-frames and would
+   run — but it measures intra concurrency, not the shipped configuration, and must be labelled that
+   way if anyone quotes it.) CANARY-1 is the right first measurement regardless: until it passes, no
+   throughput number from any GPU means anything. This is also the general fix: the next shader that trips a driver should
    cost its own feature, not the product.
 
 **Land the probe first.** `examples/shader_probe.rs` — ~30 lines, device plus one compute pipeline

@@ -10747,8 +10747,15 @@ one broken shader into a dead codec**, and it is why the intra path, the decoder
 items are all blocked by an inter feature.
 
 That also means the cheap unblock is not a shader fix: create that one pipeline lazily, or behind
-the same condition that dispatches it, and intra encode, decode, CANARY-1 and MEAS-5 all become
-runnable on Vulkan while the real bug is diagnosed properly.
+the same condition that dispatches it, and intra encode and decode start working on Vulkan while the
+real bug is diagnosed properly.
+
+**It unblocks CANARY-1 and not MEAS-5, and that was checked rather than assumed.** `estimate_split`
+is called only from `sequence.rs` and never from `pipeline.rs`; `gpu_tier_bench.py` runs `--tier`
+through `gnc benchmark` on one image and `--density` through `benchmark-sequence` on a clip. Both
+`estimate_split` call sites are unconditional inside the P-frame path, so video still compiles the
+shader on every P-frame. An earlier draft of this entry claimed both items were unblocked; that was
+wrong.
 
 ### What this does and does not settle
 

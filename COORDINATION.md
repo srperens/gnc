@@ -467,6 +467,41 @@ wrong conclusions have come from this one error.
 
 ## Landed today, and what each one invalidates
 
+- **BUG-9 — the recorded cause was backwards, and a figure I gave another session needs its
+  baseline attached.** `328e76a` + `2b120b1`. rANS's ceiling is not the 4 KB per-stream slot: it
+  is the cumfreq table, where every subband group's table for a tile shares one workgroup array
+  of 4097 entries and the *sum* over the groups has to fit. With `--rans` at the default step,
+  worst tile, Y plane — kristensara 4020 at q=75 and 4165 at q=76 (refused), bbb 4052 at q=76 and
+  4197 at q=77 — and **no stream overflowed its slot at any point that completed.** That is
+  ENT-2's q=75/76/77 content split measured a second way, with the mechanism: the Y-plane alphabet
+  crosses 4097 at different qualities per image. The slot bug was real too (an unguarded
+  `write_ptr` decrement wrapped into the *previous* stream's slot and ORed bits into correct
+  data), but it was the symptom. **Invalidates nothing measured**: byte-identical to the parent on
+  64/64 points. Corrects BUG-9's "this is not the symbol alphabet", its q=80 ceiling, and its
+  "--rans is a no-op" — the last two were handed over by ENT-2. Decision record 0022.
+
+  Two things to carry that are not about rANS:
+
+  - **A sibling worktree's build is not a baseline.** I gave the MEAS-9 session "byte-identical
+    36/36" without naming the *before* binary. It was `gnc-meas9/target/release/gnc`, verified
+    src-identical to my branch point at the time. That session rebased and rebuilt, and a re-run
+    returned **0/36 — every point differing, including lossless q=100, which does not touch
+    rANS.** Nothing in my branch had changed. Rule 1 says a number is only valid against a commit;
+    the sharper form is that **the baseline binary lives in a worktree you own, pinned to a hash**
+    (`git worktree add --detach <dir> <sha>`, then build). If RESEARCH_LOG still carries that
+    36/36 as "reported, not verified here", the useful edit is to name the baseline: the figure
+    is now 64/64 against a pinned 436680e.
+  - **Out-of-bounds workgroup access is not deterministic, so old results near a limit are
+    suspect in a way a reproducible bug is not.** Two builds of near-identical source disagreed
+    about whether the same input overflowed.
+
+  And a note for whoever owns conventions: **decision-record numbers collided a third time
+  today.** I wrote 0021; main took 0021 for the shared-compilation-cache record while I was
+  pushing, so mine is 0022 and `2b120b1`'s commit message is wrong on that one detail. Two 0018s
+  and two 0019s already exist. It is the same read/decide/write race `scripts/claim` removed for
+  backlog items, on the same afternoon that script was written.
+
+
 - **BUG-15 — the wavelet lossless arm was not lossless, and it is fixed.** `GNC_MED=0` at q=100,
   and any `--qstep 1 --wavelet 53` config below it, returned **53–56 dB with dE00 0.5–0.9** instead
   of bit-exact output; `GNC_PHYSICAL_WEIGHTS=1` returned 6 255 bytes at 49.2 dB on a gradient.

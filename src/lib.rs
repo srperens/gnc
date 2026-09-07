@@ -390,8 +390,16 @@ pub struct CodecConfig {
     /// constructing a `CodecConfig` directly keeps the historical behaviour, but
     /// [`quality_preset`] turns it **off** — see the note there for the measurements.
     pub b_pyramid: bool,
-    /// Use GPU compute shaders for rANS entropy encoding (default: true).
-    /// When false, falls back to CPU entropy encoding.
+    /// Run the entropy stage on the GPU where the selected coder has an encode shader for it
+    /// (default: true). When false, or when the coder has no GPU encoder, the coefficients are
+    /// read back and coded on the CPU.
+    ///
+    /// **This chooses where entropy coding happens and nothing else.** Entropy coding is
+    /// lossless, so both settings must decode to bit-identical pixels and differ only in bytes;
+    /// `tests/arch3_entropy_stage.rs` asserts exactly that. Until 2026-09-07 it also selected
+    /// which of two whole-frame P/B encoders ran, and the one it selected for coders without a
+    /// GPU encoder encoded every P-frame wrong — see `docs/decisions/0025`. If you are tempted
+    /// to branch on this flag anywhere outside the entropy dispatch, that record is why not.
     pub gpu_entropy_encode: bool,
     /// Enable context-adaptive entropy coding (2 frequency tables per detail subband).
     /// When enabled with per_subband_entropy, each detail subband group gets 2 tables:

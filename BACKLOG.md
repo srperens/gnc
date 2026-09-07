@@ -100,7 +100,11 @@ measured advantage over x264 on any axis at this operating point.**
    1.9x, not the 5.6x recorded at distribution bitrates. ~~Follow-up: `GNC_CHROMA_WEIGHT`~~ — done
    too (CHROMA-1): the frontier is steep but intra-only, so it does **not** explain the video gap.
    That gap is genuine luma coding deficit, which is why item 1 is intra.
-5. Bugs: BUG-14. BUG-9 closed 2026-09-07 (the cause was the cumfreq table, not the slot), BUG-12 closed 2026-09-06.
+5. Bugs: BUG-14. BUG-9 closed 2026-09-07 (the cause was the cumfreq table, not the slot), BUG-12
+   closed 2026-09-06. **ARCH-3 and BUG-18 closed 2026-09-07** — one P/B frame encoder, so
+   `gpu_entropy_encode` chooses only where entropy runs. Default output byte-identical (54/54);
+   **abac's inter rate is measurable again at −12.0% to −22.9% against Rice at bit-identical
+   pixels**, replacing the retracted −14.4%. `docs/decisions/0025`.
 
 **Do not re-test** (measured and closed this week): MCTF, GOP length, the B-pyramid at contribution
 quality, RD decisions, multi-reference, sub-pel filters, motion search, block transforms, sub-block
@@ -933,7 +937,39 @@ third-party crate `block v0.1.6`, not a lint on this code.
 
 Filed 2026-09-07 by the `coord` session.
 
-### ARCH-3 — `gpu_entropy_encode` selects a whole P-frame pipeline, not just where entropy runs (todo, P1)
+### ARCH-3 — `gpu_entropy_encode` selected a whole P-frame pipeline, not just where entropy runs (**DONE 2026-09-07**)
+
+**Fixed by separating the concerns, which was the option this entry argued for.** There is one
+P-frame encoder and one B-frame encoder now — the batched pipeline — and `gpu_entropy_encode`
+picks the entropy step inside it. The second implementation is deleted, not repaired: ~1200 lines
+out against ~400 in (`git diff -w`). `docs/decisions/0025`, RESEARCH_LOG 2026-09-07.
+
+**Result:** the two arms decode to **bit-identical pixels** at all four (q, ki) points in
+`tests/bug18_locate.rs`, where they diverged by up to 62.9 before. The default configuration is
+**byte-identical on 54 of 54** encodes against a baseline pinned at `07c01b1`, so nothing measured
+is invalidated.
+
+**A second instance of the same defect was found by measuring and is fixed too.** The unit-test
+invariant held on synthetic content and failed on 5 of 9 points on 1080p:
+`dispatch_zero_skip_tiles_by_map` was gated on `entropy_mode == Rice` while
+`dispatch_tile_skip_motion` zeroed the same tiles' MVs for every coder, so abac paid skip mode's
+cost and collected none of its saving, and the two coders coded different coefficients for one
+frame. Ungated. **A full-frame pan has no static tiles, so a test written on convenient content
+certifies this class of fix as complete when it is not** — `tests/arch3_entropy_stage.rs` now runs
+a half-frozen frame as well.
+
+**It also fixed `--huffman` video, which was broken on `main`** and is not mentioned anywhere
+else: Huffman took the batched pipeline, which pushed nothing into `huffman_tiles`, so every
+P-frame carried an empty tile vector and decoding one panicked. Verified on the pinned baseline,
+so it was shipped. No test encoded Huffman video; `every_coder_codes_a_p_frame` does.
+
+**And it removed a capability that had already stopped existing.** `encode_pframe` took a
+`predictor_mvs` buffer and returned its own MVs for the caller to feed forward; only the deleted
+implementation read them. GNC has never done temporal MV prediction on the shipped path, and the
+signature no longer implies it might.
+
+<details><summary>Original statement</summary>
+
 
 Surfaced 2026-09-07 by the question "how can abac not have a GPU path in a GPU codec?" — it does,
 and naming the confusion found the design defect underneath BUG-18.
@@ -977,7 +1013,30 @@ video, it silently invalidated a published rate figure (ABAC-SHIP's inter −14.
 so again for the next coder that lands decode-first — which is the natural order for this project,
 since decode is the side the product is judged on.
 
-### BUG-18 — the CPU-entropy P-frame path encodes every P-frame wrong (todo, P1)
+</details>
+
+### BUG-18 — the CPU-entropy P-frame path encoded every P-frame wrong (**FIXED 2026-09-07**)
+
+**Closed by ARCH-3, by construction rather than by finding cause 2.** With one frame encoder there
+is no second implementation to disagree with, so "why do they diverge" stopped being a question.
+`tests/bug18_locate.rs` now reads **0.000 with zero differing samples** at all four (q, ki) points
+where it read 28.8 / 4.24 / 28.8 / 4.24 on the first P-frame, and the CPU arm's P-frames shrink
+down the GOP instead of growing. The assertion lives in
+`tests/arch3_entropy_stage.rs::entropy_stage_location_does_not_reach_the_pixels`; the test in
+`abac_bitstream.rs` that asserted the bug was *present* is retired, with its lessons kept in place.
+
+**abac's inter figure is measurable again and is not −14.4%.** At bit-identical pixels (decoded
+PNGs hashed, not inferred from PSNR), abac against Rice over 18 frames at ki=9, 4:4:4:
+**−12.0% to −22.9%** across bbb_extended / crowd_run / old_town_cross at q=50/75/90. See
+RESEARCH_LOG and `docs/decisions/0025`.
+
+**Not fixed and not caused here:** the encoder's local decode dequantises P residuals with
+`config.quantization_step` while the forward pass uses `res_qstep = quantization_step ×
+p_qp_scale`, so the encoder's reference drifts from the decoder's above q≈70. Both implementations
+did this; the surviving one still does. That is **BUG-8**.
+
+<details><summary>Original statement</summary>
+
 
 Found 2026-09-07 while measuring abac on inter (ABAC-SHIP); **not an abac defect** — the isolating
 tests use Rice on both sides. One concrete cause found and fixed, at least one more open.
@@ -1053,6 +1112,8 @@ Possibly the same root cause as **BUG-16** (the two *intra* encode paths disagre
 and it is worth checking against **BUG-8** ("the encoder's local decode diverges from the real
 decoder down a GOP"), which may be this seen from the other side.
 
+
+</details>
 
 ### BUG-16 — Rice's GPU and CPU encode paths disagree on the coefficients (todo, P2)
 
@@ -2092,7 +2153,15 @@ not re-found as an abac bug. It is why **q=25 is not quoted as a rate figure** a
 **Still open:**
 1. ~~GPU decode shader and honest fps against Rice on an idle machine.~~ Done — Part 6.
 2. ~~Bitstream integration.~~ Done — Part 7.
-3. **Inter frames — measured, then RETRACTED the same day (BUG-18).** ~~−14.4% mean at q=90~~ — abac's video path is the CPU-entropy P-frame path, and that path encodes every P-frame wrong (diverges from the GPU path on the *first* P after an I, and costs 2.1-3x the bytes). The comparison put abac on a broken arm. **Re-measure after BUG-18 is fixed.** The original text follows for the record:
+3. **Inter frames — retracted (BUG-18), and re-measured 2026-09-07 after ARCH-3 closed it.**
+   ~~−14.4% mean at q=90~~ — abac's video path was the CPU-entropy P-frame path, and that path
+   encoded every P-frame wrong. The comparison put abac on a broken arm.
+   **The replacement figure is −12.0% to −22.9%, on nine of nine points at bit-identical pixels**
+   (bbb_extended / crowd_run / old_town_cross, q=50/75/90, 18 frames, ki=9, 4:4:4; decoded PNGs
+   hashed rather than PSNR compared). With one frame encoder the two coders code the same
+   coefficients, so this is a pure rate delta with a quality delta of exactly zero — a stronger
+   claim than the retracted one, which was quality-matched to ≤0.03 dB. RESEARCH_LOG 2026-09-07,
+   `docs/decisions/0025`. The original retracted text follows for the record:
    Three sequences (crowd_run, old_town_cross, bbb_extended), 24 frames, ki=9, 4:4:4, I+P:
    −12.17% / −12.00% / −19.11% on the I+P bitstream, against −11.48% / −12.65% / −14.25% for the
    all-intra control from the same runs. The standing note here was that abac's contexts were
@@ -3108,9 +3177,13 @@ CLAUDE.md, "no silent features".
 two reasons re-priced — the 1.69x frame decode, and abac's inter behaviour (ENT-3, which BUG-18
 blocks). This item discharges one of three, and its write-up should say plainly which two remain.
 
-**Coordination.** Overlaps ARCH-3 in the entropy-encode dispatch. ARCH-3 owns which P-frame pipeline
-runs, in `sequence.rs`; this owns the abac encode step and the new shader. If both are in flight,
-ARCH-3 lands first and this rebases onto it.
+**Coordination.** Overlaps ARCH-3 in the entropy-encode dispatch. **ARCH-3 landed 2026-09-07 —
+rebase onto it.** What changed under this item: there is one P/B frame encoder now, and
+`inter_gpu_entropy_available()` in `entropy_helpers.rs` is the single place that says which coders
+have a GPU entropy encoder. Adding abac's shader means adding `EntropyCoder::Abac` to that
+predicate and a dispatch arm beside the Rice and rANS ones in `sequence.rs` — it no longer means
+touching a frame encoder, which is the whole point of ARCH-3. abac video is also *correct* now, so
+a GPU encoder can be checked against the CPU one for bit-exactness on inter, not only on intra.
 
 ### ENT-3 — Does abac pay on inter residuals? (todo, P1, claimed and released unmeasured 2026-09-07)
 
@@ -3119,8 +3192,25 @@ only; inter is out of scope for this row"). Nothing has been measured. Claimed a
 2026-09-07 session and released without a single number, so this entry is the hypothesis, not a
 result.
 
-**The question:** abac against Rice on **P-frame residual coefficients**, same pixels, same GOP
-structure, at q=75 and q=90 on ≥3 sequences. `GNC_ABAC_COMPARE=1` already reports rate on real
+**Substantially answered as a side effect of ARCH-3 on 2026-09-07 — read this before claiming.**
+Closing BUG-18 required proving that the entropy choice does not reach the pixels, which is exactly
+this comparison's premise, so the numbers fell out of that gate. abac against Rice, 18 frames,
+ki=9, 4:4:4, `.gnv` bytes, **bit-identical pixels on all nine points** (decoded PNGs hashed):
+
+| sequence | q=50 | q=75 | q=90 |
+|---|---|---|---|
+| bbb_extended | −16.3% | −22.9% | −19.7% |
+| crowd_run | −20.7% | −18.4% | −12.1% |
+| old_town_cross | −22.7% | −21.8% | −12.0% |
+
+So the answer to "does abac pay on inter residuals" is **yes, −12.0% to −22.9%**, in the same band
+as its intra −16.6% to −18.8% and wider at both ends. No BD-rate is needed: the quality delta is
+exactly zero, not small. **What is left of this item** is the contribution range proper — q=95-99,
+where RATE-2 says the ladder misbehaves anyway — and whether the contexts, tuned on intra
+coefficients, are worth retuning for residual statistics. Neither is answered above.
+
+**The original question:** abac against Rice on **P-frame residual coefficients**, same pixels, same
+GOP structure, at q=75 and q=90 on ≥3 sequences. `GNC_ABAC_COMPARE=1` already reports rate on real
 coefficients and was widened to see non-wavelet paths, so the instrument may need little work.
 
 **Expect a smaller number than intra's −17%, and treat that as an answer rather than a

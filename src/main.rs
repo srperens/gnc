@@ -382,7 +382,8 @@ enum Command {
         #[arg(long)]
         no_per_subband: bool,
 
-        /// Use CPU entropy encoding instead of GPU (for testing/debugging)
+        /// Entropy-code on the CPU instead of the GPU. Same coefficients either way, so the
+        /// decoded pixels are identical and only the bytes move
         #[arg(long)]
         cpu_encode: bool,
 
@@ -455,7 +456,8 @@ enum Command {
         #[arg(long)]
         abac: bool,
 
-        /// Use CPU entropy encoding instead of GPU
+        /// Entropy-code on the CPU instead of the GPU. Same coefficients either way, so the
+        /// decoded pixels are identical and only the bytes move
         #[arg(long)]
         cpu_encode: bool,
 

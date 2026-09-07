@@ -291,6 +291,125 @@ file: signalled initial probabilities per subband, or letting the deep subbands 
 ---
 
 
+## ARCH-3 + BUG-18 — one frame encoder, and abac's inter figure is measurable again (2026-09-07)
+
+**Hypothesis.** `gpu_entropy_encode` reads as "entropy-encode on the GPU" and in `sequence.rs`
+also selected which of two whole-frame P/B encoders ran. If the entropy choice stops selecting a
+frame encoder, BUG-18's open cause 2 — "why do these two implementations disagree" — stops being
+a question rather than getting an answer, because there is only one implementation left. Predicted
+consequence, stated before the change: the two `gpu_entropy_encode` arms decode to **bit-identical
+pixels**, since entropy coding is lossless and can only move bytes.
+
+**Is it the right experiment?** The alternative repairs — fix the second implementation, or give
+abac a GPU encoder — were both considered and rejected as substitutes; see
+`docs/decisions/0025`. Short form: the two implementations differed in *design*, not in a bug
+(pyramid ME vs a single-level search, tile-skip motion, MV smoothing, look-ahead — none of which
+the second one had), so reconciling them ends at one implementation anyway; and giving abac a
+GPU encoder removes abac from the list of coders that trip the defect while leaving the defect.
+
+**Success criteria, set before the change.** (1) `tests/bug18_locate.rs` reads 0.000 with zero
+differing samples at all four (q, ki) points, not a tolerance. (2) The default configuration is
+**byte-identical** to a pinned baseline. (3) `cargo test --release` and `cargo clippy --release`
+clean.
+
+### Before, at `07c01b1`
+
+`tests/bug18_locate.rs`, both arms Rice, only `gpu_entropy_encode` varying. Reproduces the figures
+BACKLOG recorded:
+
+| q | ki | frame 0 (I) | frame 1 (first P) | frame 2 | frame 3 |
+|---|---|---|---|---|---|
+| 50 | 9 | 0.000 | 28.8 | 55.8 | 62.9 |
+| 90 | 9 | 0.000 | 4.24 | 4.65 | 4.59 |
+| 50 | 2 | 0.000 | 28.8 | 0.000 | 26.8 |
+| 90 | 2 | 0.000 | 4.24 | 0.000 | 5.27 |
+
+Bytes at q=50, ki=9: GPU `[35366, 4504, 3997, 3461]`, CPU `[39974, 9373, 9341, 9578]`.
+
+### After
+
+**All 16 cells read 0.000, with 0 differing samples.** Bytes at q=50, ki=9: GPU `[35366, 4504,
+3997, 3461]` — unchanged — CPU `[39974, 9112, 8605, 8069]`, and the CPU P-frames now shrink down
+the GOP as the GPU path's do instead of growing.
+
+**Criterion 2: 54 of 54 configurations byte-identical** to a baseline binary built from `07c01b1`
+in a detached worktree I own (bbb 8 frames and bbb_extended 18, ki=2 and 9, q=50/75/90, 4:4:4 /
+4:2:2 / 4:2:0, B-pyramid on and off). **Criterion 3: 221 tests pass, serially and in parallel**
+— the `abac_bitstream` flake recorded in COORDINATION did not reproduce — and `cargo clippy
+--release` is clean. `clippy --target wasm32-unknown-unknown` still fails identically on the
+pinned baseline: that is BUG-24, not this.
+
+### The fix was not complete when the unit test said it was
+
+The predicted invariant — the entropy choice does not reach the pixels — held on 256x256 synthetic
+content and **failed on 5 of 9 points on real 1080p**. Cause: `dispatch_zero_skip_tiles_by_map`,
+which zeroes quantised coefficients for tiles the motion search flagged static, was gated on
+`entropy_mode == Rice`, while `dispatch_tile_skip_motion`, which zeroes those tiles' *motion
+vectors*, ran for every coder. abac and bitplane therefore paid skip mode's prediction cost and
+collected none of its rate saving, and Rice and abac coded **different coefficients for the same
+frame**. Same defect class, one level down; the gate is removed.
+
+**Why the unit test missed it: a full-frame pan has no static tiles, so skip mode never fires.**
+The test now runs a half-frozen frame as well as a pan. Worth carrying beyond this item — content
+chosen for convenience can certify a fix as complete when the mechanism it is supposed to remove
+was never exercised.
+
+### What it fixes that nobody asked for
+
+**`--huffman` video was broken on `main`.** Huffman has no GPU encoder wired into the inter path
+but was not on the list of coders forced onto the second implementation, so it took the batched
+pipeline, which pushed nothing into `huffman_tiles`. Every P-frame it wrote carried an empty tile
+vector; decoding one panics in `frame_data.rs:335` with `range end index 1 out of range for slice
+of length 0`. **Verified on the pinned baseline**, so it was shipped, not introduced. No test
+encoded Huffman video. `tests/arch3_entropy_stage.rs::every_coder_codes_a_p_frame` is the test
+that would have caught it, and all five coders pass it now.
+
+### abac on inter: the retracted figure, replaced
+
+The retraction stands as a retraction — `−14.4%` was abac on the broken frame encoder against Rice
+on the working one. With one frame encoder the comparison is available, and it is unusually clean:
+the two files decode to **bit-identical pixels**, so there is no rate/quality trade to argue about
+(COORDINATION rule 4 does not apply when the quality delta is exactly zero). Pixel identity is
+established by hashing the decoded PNGs, not inferred from matching PSNR — the "matched aggregate
+is not evidence" rule cuts both ways.
+
+18 frames, ki=9, 4:4:4, `.gnv` bytes, abac against Rice:
+
+| sequence | q=50 | q=75 | q=90 |
+|---|---|---|---|
+| bbb_extended | −16.3% | −22.9% | −19.7% |
+| crowd_run | −20.7% | −18.4% | −12.1% |
+| old_town_cross | −22.7% | −21.8% | −12.0% |
+
+**−12.0% to −22.9%, nine of nine at identical pixels.** For scale, abac's standing *intra* figure
+is −16.6% to −18.8%, so inter is in the same band, wider at both ends, and the saving narrows as q
+rises on the two camera sequences. This says nothing about throughput — abac still has no GPU
+encoder, which is ENT-5 — and nothing about whether abac should be the default, which `0017`
+decides on other grounds.
+
+### Failures and dead ends recorded
+
+- **The first abac measurement script reported "pixels identical" for nine points it had not
+  measured.** `cd "$(dirname $0)"` moved it out of the worktree, every encode failed, and two
+  empty directories hashed equal. A comparison whose inputs are missing is not a null result, and
+  `set -e` plus an explicit frame-count check is what turned it into an error.
+- **`predictor_mvs` was dead before this change and nothing said so.** `encode_pframe` took a
+  temporal MV predictor and returned its own MVs so the caller could feed the next frame; only
+  the deleted implementation read it. The shipped encoder has never done temporal MV prediction.
+  Removed with the code that could have used it, so that rebuilding it is a change with a
+  measurement rather than a parameter that quietly does nothing.
+- **Not fixed here, and it is not mine:** the encoder's local decode dequantises P residuals with
+  `config.quantization_step` while the forward pass quantises with `res_qstep = quantization_step
+  x p_qp_scale`, so the encoder's reference drifts from the decoder's wherever the scale exceeds
+  1.0 (q >= ~70). True on both implementations before and on the one that remains, so this change
+  neither causes nor hides it. That is **BUG-8**, held by another session.
+
+Commit: see below. Decision record `docs/decisions/0025-the-entropy-stage-is-not-a-frame-encoder.md`.
+
+
+---
+
+
 ## RATE-1 — the 8-bit precision question is a no, and the sweep found a worse defect (2026-09-07)
 
 **Hypothesis.** Above q~90 the anchor ladder halves qstep and zeroes the dead zone, and nothing

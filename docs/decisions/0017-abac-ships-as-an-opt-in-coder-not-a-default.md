@@ -47,6 +47,14 @@ and leave Rice as the default at every quality preset.
    to do with abac**. A default has to be right for video, and the video path has to be fixed
    before it can even be measured.
 
+   **Update 2026-09-07, later the same day — this reason is now discharged.** ARCH-3 fixed the
+   routing and BUG-18 with it, and inter is measured: **−12.0% to −22.9% against Rice at
+   bit-identical pixels**, nine of nine points across bbb_extended / crowd_run / old_town_cross at
+   q=50/75/90 (`docs/decisions/0025`, RESEARCH_LOG). abac pays on inter in the same band as intra.
+   **The decision is unchanged** — reasons 1, 2 and 4 are untouched, and reason 2 (129 ms/frame of
+   CPU encode) is the binding one. Reason 3 should now be read as *answered yes*, not as
+   *unmeasured*: it no longer argues against a default, it simply stops arguing for one.
+
 4. **A default change is the expensive kind of change to reverse.** Every measurement in the repo
    that quotes a file size would need re-checking against a new default. Rice output is currently
    byte-identical before and after this change at q=25/50/75/90/100, which means this commit

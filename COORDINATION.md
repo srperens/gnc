@@ -189,6 +189,7 @@ If this table and `scripts/claim list` disagree, the table is wrong.
 | _(removed)_ | `abacship`, `bug18` | **ABAC-SHIP merged, both worktrees gone 2026-09-07** (`60bed17`, `378a0c7`, `436680e`, `6513bb6`). abac is a real entropy coder: `--abac`, entropy type 5, **GP18**, stills *and* sequences. **Standing figures: intra −16.6% to −18.8% at identical pixels, lossless −13.4%** (FFV1 gap +23.9% → +7.3%). ~~inter −14.4%~~ **retracted** — see the retraction section above. Rice stays the default (`docs/decisions/0017`). **Every frame this encoder writes now says GP18**; a GP18 Rice frame is a GP17 payload with a new label, proved by relabelling and decoding, and GP17 still reads. **Left open and unclaimed: BUG-18 (P1)** — the CPU-entropy P-frame path encodes every P-frame wrong; cause 1 fixed, cause 2 open, `tests/bug18_locate.rs` reproduces it in one command. |
 | `../gnc-rate1` | `rate1` | **DONE, merged, worktree removed.** RATE-1 answered **no** — a bit-depth-aware rate rule recovers **0.0% on all four photographic stills** (89.4% on the synthetic gradient, which is the trap). The sweep found **RATE-2 instead, filed P1**: above q≈95-98 the lossy ladder costs more bytes than bit-exact lossless on every real image, mean **+28.9% at q=99** (blue_sky +40.6%). LOSSLESS-1 made lossless cheap enough to undercut the top of the lossy ladder and nothing noticed. |
 | `../gnc-intra1` | `intra1` | **INTRA-1 — the largest known compression gap. Step 2 first instalment landed 2026-09-07: the gap decomposes.** 8.5 of the 27.1 RGB points is chroma allocation against an RGB metric (YCoCg-R synthesis norms 1.73/0.71/0.87, spread 2.45, against J2K's ICT at 1.15 — **not** a coding deficiency, and it also explains why the Y gap was +48.3%: it falls to +13.5% when corrected). Lifting normalisation is clean. Tiling costs *J2K* 12.4 points but GNC realises 0.6%. **~9.8 points left; next test is cross-tile rate allocation.** Decision `0026`. **Two traps recorded: a full-frame tile-size comparison is confounded by padding (+6.1% that is really −0.6%), and `--tile-size 1024` silently destroys the image (BUG-26, P1).** Step 1 answered 2026-09-07: `GNC_COEF_ENTROPY=1` prices the *shipped* abac tiles against the entropy of the coefficients they carry, and GNC spends within **7.5% of it at q >= 85**. So entropy coding can account for at most ~7.5 of the 27.1 points against JPEG 2000 9/7 and **~72% is upstream of the coder** — the item is now its step-2 branch (tiling, quantiser shape, lifting normalisation). Decision `0024`. Turned up **ENT-6** on the way: the deep subbands are one short code-block each and cost ~4% of the file. Adds one diagnostic module and two `pub(crate)` exports; **invalidates no measurement** — the encoder path is untouched and the diagnostic is env-gated and read-only. |
+| `../gnc-arch3` | `arch3` | **ARCH-3 + BUG-18 — done 2026-09-07.** One P/B frame encoder; `gpu_entropy_encode` now picks the entropy step and nothing else. Default output **byte-identical, 54/54** against a baseline pinned at `07c01b1`, so no measurement is invalidated. `tests/bug18_locate.rs` reads 0.000 everywhere. **abac's inter figure is un-retracted: −12.0% to −22.9% against Rice at bit-identical pixels.** Also fixed, unasked: `--huffman` video, which shipped writing empty P-frame tile vectors. `docs/decisions/0025`. |
 | `../gnc-coord` | `coord` | **COORD-1 — the claim mechanism enforces the rules instead of restating them.** Docs and `scripts/claim` only; no codec change, invalidates no measurement. `scripts/claim next` makes the *pick* atomic, the shared-checkout and worktree preconditions are now refusals rather than prose, and the session identity bug that made `SESSION GONE` undetectable is fixed. See `docs/decisions/0019`. Claimed 2026-09-07. |
 
 ## The test material was missing entirely, and was refetched (2026-09-07) — RESOLVED
@@ -359,16 +360,24 @@ P-frame wrong: the first P after an I already diverges from the batched path by 
 one. **abac's intra and lossless figures are unaffected** and stand: −16.6% to −18.8% at identical
 pixels, −13.4% bit-exact lossless.
 
-**The mechanism is a design defect, filed as ARCH-3 (P1).** `gpu_entropy_encode` reads as
+**BOTH RETRACTIONS' CAUSE IS FIXED (2026-09-07, `arch3`). The inter figure is re-measured: abac is
+−12.0% to −22.9% against Rice at bit-identical pixels**, nine of nine points across bbb_extended /
+crowd_run / old_town_cross at q=50/75/90, 18 frames, ki=9, 4:4:4. Pixel identity established by
+hashing decoded PNGs, not inferred from PSNR. The retraction below stands as a description of what
+went wrong; the number it withdrew now has a replacement. `docs/decisions/0025`.
+
+**The mechanism was a design defect, filed as ARCH-3 (P1), now fixed.** `gpu_entropy_encode` reads as
 "entropy-encode on the GPU"; in `sequence.rs` it also selects which whole-frame P pipeline runs.
 abac and bitplane are GPU-*decoded* and have no GPU *encoder* shader, so choosing either silently
 swaps the frame encoder for the defective one. Nothing about those coders is broken. **This will
 bite the next coder that lands decode-first, which is the natural order here** — decode is the side
 the product is judged on. Separating the concerns is the smallest fix and removes the class.
 
-**Anything encoded with `gpu_entropy_encode = false` on video is suspect**, which is abac *and*
-bitplane. Intra is fine — single-frame encodes go through `pipeline.rs` and were verified
-pixel-identical between coders.
+**Anything encoded with `gpu_entropy_encode = false` on video before 2026-09-07 is suspect**, which
+is abac *and* bitplane. Intra is fine — single-frame encodes go through `pipeline.rs` and were
+verified pixel-identical between coders. **After ARCH-3 there is no such second path**: both arms
+run the same frame encoder and decode to bit-identical pixels, asserted by
+`tests/arch3_entropy_stage.rs`.
 
 **And the general lesson, which cost three wrong published explanations in one afternoon: a matched
 aggregate is not evidence that two arms are comparable.** On crowd_run at q=85 the two encode paths
@@ -506,6 +515,47 @@ the option that spends more bits. Use BD-rate, or compare at matched rate. At le
 wrong conclusions have come from this one error.
 
 ## Landed today, and what each one invalidates
+
+- **ARCH-3 + BUG-18 — one P/B frame encoder, and `gpu_entropy_encode` stopped choosing one.**
+  `docs/decisions/0025`. **Invalidates nothing**: the default configuration is byte-identical on
+  **54 of 54** encodes against a binary pinned at `07c01b1` (bbb 8 frames and bbb_extended 18,
+  ki=2 and 9, q=50/75/90, 4:4:4 / 4:2:2 / 4:2:0, B-pyramid on and off). What it *changes* is abac,
+  bitplane and Huffman on video, all of which were wrong before.
+
+  Four things worth carrying that are not about this item:
+
+  - **The unit test said the fix was complete and it was not.** The invariant — the entropy choice
+    cannot reach the pixels — held on 256x256 synthetic content and failed on **5 of 9 points on
+    1080p**. A second gate keyed on the coder (`dispatch_zero_skip_tiles_by_map`, Rice-only, while
+    the MV-zeroing beside it ran for every coder) was still making Rice and abac code different
+    coefficients for the same frame. **A full-frame pan has no static tiles, so skip mode never
+    fires and the mechanism under test is never exercised.** Content chosen for convenience
+    certifies this class of fix as complete. The test now runs a half-frozen frame too.
+  - **A measurement script reported "identical" for nine points it had not measured.** `cd
+    "$(dirname $0)"` moved it out of the worktree, every encode failed, and two empty directories
+    hashed equal. `set -e` and an explicit output-count check are cheap; a comparison whose inputs
+    are missing is a broken instrument, not a null result.
+  - **`--huffman` video was broken on `main` and no test encoded Huffman video.** Empty P-frame
+    tile vectors; decoding panics in `frame_data.rs:335`. Verified on the pinned baseline, so it
+    shipped. The class is "a coder that is not the default is not exercised end to end", and
+    bitplane was in the same state.
+  - **A dead parameter survived because only the unused path read it.** `encode_pframe` took a
+    temporal MV predictor; only the deleted implementation used it, so GNC has never done
+    temporal MV prediction on the shipped path. Deleting the unused branch is what made the
+    compiler say so.
+
+  **For whoever holds BUG-8:** the encoder's local decode dequantises P residuals with
+  `config.quantization_step` while the forward pass quantises with `res_qstep =
+  quantization_step × p_qp_scale` (TUNE-6), so above q≈70 the encoder's reference is
+  reconstructed at a different step from the decoder's. Both implementations did it and the
+  surviving one still does — this change neither causes nor hides it — and it looks like the
+  same shape as "the encoder's local decode diverges from the real decoder down a GOP".
+
+  **For whoever holds ENT-5 (abac GPU encoder):** rebase onto this. `inter_gpu_entropy_available()`
+  in `entropy_helpers.rs` is now the single place that says which coders have a GPU entropy
+  encoder; adding abac's shader means adding it there plus a dispatch arm beside Rice and rANS,
+  and no longer means touching a frame encoder. abac video is also correct now, so a new encoder
+  can be checked bit-exact against the CPU coder on inter as well as intra.
 
 - **BUG-9 — the recorded cause was backwards, and a figure I gave another session needs its
   baseline attached.** `328e76a` + `2b120b1`. rANS's ceiling is not the 4 KB per-stream slot: it

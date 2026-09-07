@@ -133,7 +133,7 @@ the shared checkout** — no absolute paths, no session ids. **This table does n
 | `../gnc-abac`, `.claude/worktrees/abac` (`abac-gate`) | `abac` | **released — question answered, see BACKLOG Part 6.** The idle-machine bench is run. Range at cb=64 costs **1.69× frame decode for −16.7% rate** at q=90; Interval costs 3.99×. Rice's own entropy stage is 47% of frame decode, which caps any entropy work at 1.9×. What remains is a positioning call, not an engineering one. |
 | `../gnc-abac` | `abac` | same worktree, now on **BUG-8** — the encoder's local decode diverges from the real decoder down a GOP. |
 | `../gnc-nearlossless` | `nearlossless` | **INTRA at contribution quality (priority 1).** Gating whether MED prediction *instead of* the wavelet — LOSSLESS-1's mechanism, −14.9% at q=100 — survives into the lossy near-lossless range q=88–99, closed-loop with a quantised residual (JPEG-LS near-lossless). Offline gate first, no code change yet. |
-| `../gnc-chroma2` | `chroma2` | **CHROMA-2** — is the dE00 win over x264 an allocation artefact? Control: give x264 `--chroma-qp-offset` matching GNC's split, re-measure at matched total rate. Also **owns the test-material refetch** (see below). |
+| `../gnc-chroma2` | `chroma2` | **CHROMA-2 — DONE, merged at 062f49e.** The colour lead over x264 is **withdrawn**: rate-matched, x264 wins dE00 on **6 runs of 6**, and on five it needs no chroma-QP offset at all — ahead on colour *and* luma at once. **GNC now has no measured advantage over x264 on any axis** at the contribution operating point, so the +90.5% is the whole picture rather than one side of a trade, and GOALS loses "keep the colour lead" as a target. Decision 0020. Also did the test-material refetch, the shared venv, and the arm64 JPEG XS build. |
 | `../gnc-abacship` | `abacship` | **ABAC-SHIP merged to main 2026-09-07** (`60bed17`, `378a0c7`). abac is a real entropy coder now: `--abac`, entropy type 5, **GP18**. −16.6% to −18.8% of rate against Rice at *identical pixels*, −13.4% at lossless (FFV1 gap +23.9% → +7.3%). Rice stays the default — `docs/decisions/0017`. **Every frame this encoder writes now says GP18**; a GP18 Rice frame is a GP17 payload with a new label, proved by relabelling and decoding, and GP17 still reads. Worktree kept: next on this row is a real inter measurement (correctness is tested, rate is not). |
 | `../gnc-rate1` | `rate1` | **RATE-1 — how much rate above q=90 an 8-bit output cannot emit.** BACKLOG's figure is on the test gradient alone (q=90 costs 0.275 bpp, q=95 costs 1.142 bpp for bit-identical 8-bit output), which is the best case by construction. Measuring the recoverable fraction per image — lowest q whose 8-bit decode is bit-exact to the original, and the softer within-1-LSB tier — on four synthetic patterns plus the four pinned stills, before building any rate-control rule. `scripts/meas_rate1_precision.py` only; no codec change yet. Claimed 2026-09-07. |
 | `../gnc-meas9` | `meas9` | **MEAS-9 merged (`ed62de7`) — now on ENT-3.** MEAS-9's result: J2K in irreversible 9/7 mode uses **GNC's own transform at GNC's own depth** and needs **54.2% fewer bits on RGB PSNR / 79.7% on Y-PSNR**, so the intra gap is the entropy coder, not the transform. GNC is −10.2%/+29.4% against JPEG XS 4:4:4 and +20.2%/+29.3% against ProRes 4444. **ENT-3 is the inter half**: abac against Rice on P-frame residuals, which ABAC-SHIP explicitly left out of scope. Touches nothing another row owns — measurement first. |
@@ -263,6 +263,25 @@ from the *start* of the file is what makes it cheap.
 **They are 24 frames, not 200.** QUAL-1 used 200 frames of old_town_cross and an unstated count of
 crowd_run, so a run against these reproduces the *content* but not the length, and BASELINE says
 17 frames where the QUAL-1 log says 24. Say which you used.
+
+## `cargo test --release` is flaky on `main` right now — abac_bitstream races itself (2026-09-07)
+
+**`abac_handles_subsampled_chroma` fails under the documented gate and passes with
+`--test-threads=1`.** 7/7 green serially, 6/7 in parallel, on `main` at 2c9e4d4, on a machine at
+load 57. It is not content-dependent and not a rebase artefact — the CHROMA-2 branch that surfaced
+it touches no `.rs`, `.wgsl` or `.toml` at all.
+
+This file already says benches need `--test-threads=1` because cargo runs `#[test]` bodies
+concurrently and two GPU tests contend for the device. That rule now applies to a **correctness**
+test in `tests/abac_bitstream.rs`, not just a bench, which is worse: the gate CLAUDE.md and LOOP
+both require (`cargo test --release`) can now go red on code that is fine, and — the real risk —
+green on code that is not, depending on scheduling.
+
+**So do not read a single red `abac_bitstream` run as your regression.** Re-run with
+`--test-threads=1` before you believe it. And if it is yours, this wants a real fix (serialise the
+device, or a lock around the GPU context) rather than everyone learning the workaround: a gate that
+is sometimes wrong stops being a gate. Flagged by the chroma2 session; the abac/abacship sessions
+own that file.
 
 ## Timing: an idle machine is necessary and NOT sufficient (added 2026-09-06, after an idle run still lied)
 

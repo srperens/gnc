@@ -805,6 +805,22 @@ estimation, motion compensation, or the buffers feeding them differ between the 
 batched branch runs ME on the GPU into `split_mv_buf`; the non-batched computes it separately.
 That is where to look next.
 
+**The flag conflates two things, and that is why a missing shader turns into broken video.**
+`gpu_entropy_encode` reads as "entropy-encode on the GPU". In `sequence.rs` it *also* selects which
+whole-frame P pipeline runs. abac and bitplane have a GPU **decoder** (`abac_decode.wgsl`,
+`bitplane_decode.wgsl`) but no GPU **encoder** shader, so selecting either coder silently swaps the
+entire frame encoder for the other implementation — the defective one. Nothing about abac is
+broken; a flag about entropy coding changes the encoder underneath it.
+
+Two ways out, and they are independent: **separate the concerns** so the entropy-encode choice
+stops selecting a P-frame pipeline (both coders should run the batched pipeline and differ only in
+the entropy step), or **fix the non-batched implementation**. The first is the smaller change and
+removes a whole class of this bug; the second is needed anyway if the path is to survive at all.
+A third option is to give abac a GPU encoder — there is no architectural obstacle, encode is as
+parallel as decode over the same ~3000 code-blocks, the only real complication being that a
+block's output size is not known in advance (two passes, or worst-case allocation). That would
+also close the 129 ms/frame encode gap that is one of the reasons abac is not the default.
+
 **What it invalidates.** Anything encoded with `gpu_entropy_encode = false` on video — which is
 **every abac video encode**, since abac has no GPU encode path. ABAC-SHIP's inter figure
 (−14.4% at q=90) is retracted for exactly this reason. Intra is unaffected: single-frame encodes go

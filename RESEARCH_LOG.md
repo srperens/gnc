@@ -10296,6 +10296,23 @@ without saying which code broke it is easy to read past — evidently.
 
 Worth **74.5 → 62.9** at q=50. Real, and not the main term.
 
+### The flag conflates two things, which is the part worth carrying
+
+`gpu_entropy_encode` reads as "entropy-encode on the GPU". It also selects which whole-frame
+P pipeline runs. abac and bitplane have a GPU **decoder** and no GPU **encoder** shader, so
+choosing either silently swaps the entire frame encoder for the other implementation.
+
+Worth stating plainly because the shorthand "abac has no GPU path" is wrong and misleading:
+abac decodes on the GPU, one thread per code-block, ~3000 blocks per 1080p frame, verified
+bit-exact against the CPU coder across seven geometries. Decode is the side the product is judged
+on and it is where the 1.69x figure comes from. What is missing is the *encoder* shader — not for
+any architectural reason (encode is as parallel as decode over the same blocks; the only real
+complication is that a block's output size is not known in advance) but because it was never
+written.
+
+So nothing about abac is broken here. A flag about entropy coding changes the frame encoder
+underneath it, and that is the defect worth fixing even before cause 2 is found.
+
 ### Cause 2, open
 
 After the fix the first P still diverges by 28.8 (q=50) / 4.2 (q=90) and still costs 2.1× the

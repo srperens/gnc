@@ -9090,7 +9090,21 @@ nothing about whether abac is *good* there; the section below is that measuremen
 prints −28.2% on its own content. That figure is worth nothing — a synthetic image translated a few
 pixels has a far cleaner residual than any real motion — and is not the number below.)
 
-### Inter, measured (added later the same day)
+### Inter, measured (added later the same day) — **WITHDRAWN, see the BUG-18 entry below**
+
+**The −14.4% figure in this section is retracted.** abac's video path *is* the CPU-entropy P-frame
+path, and that path is defective (BUG-18): every P-frame it encodes diverges from the GPU path's
+immediately — max |diff| 28.8 at q=50 and 4.2 at q=90 on the *first* P after an I, with no chain
+involved — and costs 2.1-3x the bytes. So the inter comparison put abac on a broken arm and Rice
+on a working one, and the rate delta is not attributable to the entropy coder. The ≤0.03 dB
+"quality matched" caveat did not save it: the aggregate PSNR barely moves while the frames are
+structurally different.
+
+**The intra and lossless figures are unaffected** — those are single-frame encodes through
+`pipeline.rs`, where the two coders were verified pixel-identical.
+
+The section is kept below as written, because the retraction is more useful next to the number
+than in place of it.
 
 `--abac` reached only the single-frame commands; the sequence path had no entropy-coder flag at
 all, so it was added to `benchmark-sequence` and `encode-sequence`. Three sequences, 24 frames,
@@ -9746,8 +9760,6 @@ finding that the inter gap is *prediction quality*, not the coding model.
   dramatic figure in this entry and it means nothing. This is the third time a saturated VMAF has
   offered a spectacular number here; the harness now prints the overlap next to every VMAF
   BD-rate so the reader can see it, rather than trusting the q≤85 cap to be enough.
----
-
 
 ---
 
@@ -9995,6 +10007,9 @@ COORDINATION already prescribes for this situation.
 
 ---
 
+
+---
+
 ## 2026-09-07 — BUG-9: the slot overflow was the symptom, and the cause was one workgroup array
 
 ### Motivation
@@ -10223,3 +10238,165 @@ measurement path, and it costs one expression in four places. The three loud fai
 parked coder that returns a wrong picture is worse than one that says it cannot. The two real
 fixes behind them, no, not for a coder nothing measures through; they are filed with the sizing
 and the algorithm named so the next person does not have to re-derive either.
+
+---
+
+## 2026-09-07 — BUG-18: the CPU-entropy P-frame path encodes every P-frame wrong, and it retracts a number I published an hour earlier
+
+### What the item turned out to be
+
+Filed from ABAC-SHIP as "the inter path's reconstruction depends on the entropy encode path",
+which was already the third framing of the day and still not right. Taking the item answered it in
+one grep: **`gpu_entropy_encode` does not move entropy coding between CPU and GPU. It selects
+between two independent implementations of the whole P-frame encode** — a batched
+single-command-encoder pipeline ("forward + entropy + local decode", ~1460 lines) and a per-plane
+one (~360 lines). Entropy coding was never affecting a reconstruction; two implementations of the
+same thing disagree, which is an ordinary bug with a very large surface.
+
+### Measured
+
+`tests/bug18_locate.rs` (`--ignored`): 1I+3P, 256×256, 4:4:4, **Rice on both sides**, only
+`gpu_entropy_encode` varying. Max abs pixel diff per frame:
+
+| q | ki | frame 0 (I) | frame 1 (first P) | frame 2 | frame 3 |
+|---|---|---|---|---|---|
+| 50 | 9 | **0.000** | 28.8 | 55.8 | 62.9 |
+| 90 | 9 | **0.000** | 4.24 | 4.65 | 4.59 |
+| 50 | 2 | **0.000** | 28.8 | **0.000** | 26.8 |
+| 90 | 2 | **0.000** | 4.24 | **0.000** | 5.27 |
+
+Bytes at q=50, ki=9: GPU `[35366, 4504, 3997, 3461]`, CPU `[39974, 9373, 9341, 9578]`.
+
+Three things fall straight out. **I-frames are identical**, at every q and both GOP structures — so
+the intra path is clean and this is P-frames only. **The CPU path's P-frames cost 2.1–2.8× the
+bytes** and do not shrink down the GOP the way the GPU path's do. And the ki=2 rows kill the
+obvious hypothesis: with I,P,I,P every P predicts from the I immediately before it, so a reference
+that never advances cannot matter — and the first P still diverges by the same 28.8. **This is not
+drift. Every P-frame is wrong on its own**, and ki=9 merely compounds it.
+
+That last control was worth running precisely because the obvious hypothesis looked so strong: the
+non-batched branch genuinely never writes a reconstructed P back to `gpu_ref_planes`, which reads
+like a smoking gun and is not the main term. Fourth wrong explanation of this defect in a day; the
+first one measured *before* being written down.
+
+### Cause 1, found and fixed
+
+The non-batched branch quantised P residuals with `config.quantization_step`, while `res_config` —
+which is what goes into the frame header, and what the decoder dequantises with — carried
+`res_qstep = quantization_step × p_qp_scale` (TUNE-6). Its P-frames therefore decoded **25% too
+large** wherever the scale exceeds 1.0.
+
+The comment immediately above the definition already stated the invariant:
+
+> `// The decoder dequantises from the stored config, so both must use this value.`
+
+Three dispatches in the other branch ignored it. Fixed; the comment now says the invariant binds
+every quantise call on *either* path, and names the bug, because a comment that states a rule
+without saying which code broke it is easy to read past — evidently.
+
+Worth **74.5 → 62.9** at q=50. Real, and not the main term.
+
+### Cause 2, open
+
+After the fix the first P still diverges by 28.8 (q=50) / 4.2 (q=90) and still costs 2.1× the
+bytes. A worse *quantisation* would not cost more bits; **a worse prediction would**, so the next
+place to look is motion estimation and compensation. The batched branch runs ME on the GPU into
+`split_mv_buf`; the non-batched computes it separately.
+
+### What this retracts
+
+**ABAC-SHIP's inter figure (−14.4% mean at q=90) is withdrawn.** abac has no GPU encode path, so
+**every abac video encode runs on the defective path**. The comparison put abac on a broken arm and
+Rice on a working one, and the rate delta cannot be attributed to the entropy coder. Bitplane video
+is on the same path.
+
+The "quality matched to ≤0.03 dB" caveat I attached to that number did not save it, and it is
+worth being precise about why: the caveat was true and irrelevant. Aggregate PSNR barely moves
+while the frames are structurally different — the same lesson as the two withdrawn BUG-18
+explanations, arriving a third time from a different direction. A matched aggregate is not evidence
+that two arms are comparable.
+
+**Intra and lossless are unaffected**: single-frame encodes go through `pipeline.rs`, and the two
+coders were verified pixel-identical there through the container (max |diff| 0). −16.6% to −18.8%
+at identical pixels, and −13.4% at bit-exact lossless, stand.
+
+### Decision record 0017 reason 3, reinstated
+
+"Inter frames are unmeasured" was one of four reasons abac ships opt-in rather than as the default.
+It was struck this afternoon when inter measured −14.4%; it is now reinstated, and stronger than
+when written — abac's video path is not merely unmeasured, it is known-defective for reasons that
+have nothing to do with abac. Struck and reinstated in the record rather than quietly restored.
+
+### Loose ends and oddities noticed on the way, written down rather than dropped
+
+None of these was chased. They are recorded because each is either unexplained or surprising, and
+the cost of rediscovering one is higher than the cost of this list.
+
+**In the codec**
+
+1. **The non-batched P branch never writes a reconstructed P-frame back to `gpu_ref_planes`.**
+   Verified by reading the whole else-branch: `gpu_ref_planes` appears four times there and every
+   one is a *read* (the backward-reference copy, and the MC reference in three places). The batched
+   branch has a "Phase 3: Local decode" that writes it. This looks like it must be a serious bug —
+   and the ki=2 control says it is not the main term, because a P that predicts only from the I
+   before it diverges by the same amount. Either it is masked by whatever cause 2 turns out to be,
+   or the reference is being maintained somewhere this reading missed. **Unresolved either way.**
+
+2. **B-frames never get a P-QP scale at all.** The B path builds its own `res_config` and leaves
+   `quantization_step` at the intra value, so header and quantiser agree and there is no BUG-18
+   there. But TUNE-6's whole argument — a predicted frame may be quantised more coarsely because
+   there is quantisation error to hide behind — applies to B-frames at least as strongly. Nothing
+   in the log says whether that was decided or just never done.
+
+3. **The 8.1 / 4.8 residual at q=85 / q=90 in the original BUG-18 grid.** Those were measured on a
+   *P-chain* where the P-QP scale is 1.0, so cause 1 cannot explain them. They are presumably the
+   same cause 2 that leaves the first P 2.1× too expensive, but that is an assumption, not a
+   measurement.
+
+4. **CfL is already off at q=90.** `GNC_NO_CFL=1` changes nothing there — 8.07 bpp either way. That
+   is consistent with the q=85/q=92 anchors, but it means "CfL at q=50–85" in CLAUDE.md is the
+   whole story and the q≥86 range has no chroma prediction at all. Worth knowing before anyone
+   attributes a q=90 chroma result to CfL.
+
+5. **`abac_survives_a_p_frame_chain` asserts equivalence on a path now known to be defective.** It
+   pins *both* coders to the CPU encode path, so it correctly proves "abac == Rice given the same
+   path" — but a reader could take it as "abac's inter works". Its comment now says so explicitly.
+
+**In the harness and the tooling**
+
+6. **`benchmark` has `--cpu-encode`; `benchmark-sequence` does not.** That asymmetry is why BUG-18
+   could not be isolated from the CLI at all and needed a library test. Adding the flag would have
+   made the whole investigation a two-command job.
+
+7. **`--abac` had to be added to the sequence commands** — the sequence path had *no* entropy-coder
+   selection beyond `--rans` / `--rice`, so bitplane and abac were unreachable on video from the
+   CLI. Anything that ships a new coder needs to check both command families.
+
+8. **Cargo's package-cache lock serialises every worktree**, despite each having its own `target/`.
+   A build queued behind four other sessions looks exactly like a hang. Recorded in COORDINATION
+   with the `lsof` incantation that names the holder.
+
+9. **Killing a backgrounded `cargo` by its command pattern kills the shell wrapper, not cargo.**
+   The orphan keeps the build-directory lock and every later build in that worktree blocks with no
+   other session at fault. Also in COORDINATION.
+
+10. **Two `fetch_test_frames.sh` runs were live at once**, one orphaned (ppid 1), with two `ffmpeg`
+    processes writing the same PNG. No damage that time; the files were verified complete.
+
+11. **BUG-17 was assigned twice within minutes**, the second double-assignment in two days, despite
+    the claim mechanism — because the claim ref namespace and the bug-number namespace are
+    different things and only the first is atomic.
+
+**Measurement traps hit today, all mine**
+
+12. **Aggregate PSNR is not evidence of pixel identity.** Cost two published explanations of
+    BUG-18 and one retracted rate figure. On crowd_run at q=85 the two arms agree on avg, min, max
+    *and* stddev while the pixels differ by 8.
+
+13. **A rate figure can be right while the picture is gone.** The abac decode shader wrote `i32`
+    into a buffer every other decoder writes as `f32`; file sizes were already correct and PSNR
+    came back `NaN`. A bpp-only benchmark would have recorded the win.
+
+14. **A test that reproduces a bug also tests the *explanation* of the bug.** Written to pin "the
+    trigger is AQ", it failed on its first run. Every explanation of BUG-18 that was written before
+    a test existed was wrong; the one written after a measurement was not.

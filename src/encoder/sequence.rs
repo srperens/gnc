@@ -3114,7 +3114,12 @@ impl EncoderPipeline {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(p_qp_scale_default);
-        // The decoder dequantises from the stored config, so both must use this value.
+        // The decoder dequantises from the stored config, so both must use this value — and
+        // "both" means every quantise dispatch on *either* P-frame encode path. Until 2026-09-07
+        // the non-batched (CPU-entropy) branch quantised residuals at `config.quantization_step`
+        // while `res_config` still told the decoder `res_qstep`, so its P-frames decoded 25% too
+        // large wherever the scale was above 1.0 (BUG-18). If you add a quantise call below,
+        // it takes `res_qstep`, not `config.quantization_step`.
         let res_qstep = (config.quantization_step * p_qp_scale).min(64.0);
         res_config.quantization_step = res_qstep;
 
@@ -4864,7 +4869,7 @@ impl EncoderPipeline {
                         &bufs.plane_c,
                         quant_out,
                         chroma_pixels as u32,
-                        config.quantization_step,
+                        res_qstep,
                         res_dead_zone,
                         true,
                         chroma_padded_w,
@@ -4922,7 +4927,7 @@ impl EncoderPipeline {
                         &bufs.plane_c,
                         quant_out,
                         chroma_pixels as u32,
-                        config.quantization_step,
+                        res_qstep,
                         res_dead_zone,
                         true,
                         chroma_padded_w,
@@ -4962,7 +4967,7 @@ impl EncoderPipeline {
                         &bufs.plane_c,
                         quant_out,
                         padded_pixels as u32,
-                        config.quantization_step,
+                        res_qstep,
                         res_dead_zone,
                         true,
                         padded_w,

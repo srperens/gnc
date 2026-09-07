@@ -252,8 +252,15 @@ fn rice_gpu_and_cpu_encode_paths_differ_at_subsampled_chroma() {
 }
 
 /// Inter frames. The rate result this coder shipped on is intra, and the contexts were tuned on
-/// intra coefficients, so nothing here claims abac is *good* on P-frames — only that the path is
-/// not silently broken. An adaptive coder that diverges reconstructs a plausible wrong image
+/// intra coefficients, so nothing here claims abac is *good* on P-frames — only that the two
+/// coders agree given the same encode path.
+///
+/// **Read that scope literally.** Both arms are pinned to the CPU encode path, and BUG-18 says
+/// that path encodes every P-frame wrong (the first P after an I diverges from the GPU path and
+/// costs 2.1x the bytes). So this test proves "abac == Rice on the CPU path"; it does **not**
+/// prove abac's inter works, and the ABAC-SHIP inter rate figure was retracted for exactly that
+/// confusion. It stays pinned to one path deliberately: comparing across paths would make the
+/// assertion about BUG-18 rather than about the entropy coder. An adaptive coder that diverges reconstructs a plausible wrong image
 /// rather than failing, so "it ran and produced a file" is not evidence; the check is again that
 /// abac and Rice, coding identical residual coefficients, decode to identical pixels.
 #[test]

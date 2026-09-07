@@ -220,19 +220,39 @@ fn clamp_code_lengths(lengths: &mut [u8], _freq: &[u32]) {
 
     // Redistribute: move symbols from longest lengths to shorter ones
     // Simple approach: increase counts at max_len, decrease at max_len-1
+    //
+    // The donor pool is finite and `excess_bits` is not bounded by it. Each donation takes one
+    // symbol from length j and puts two at j + 1, and only j < max_len may donate, so a chain
+    // starting at j yields at most 2^(max_len - 1 - j) donations — on the order of a hundred for
+    // a 64-symbol alphabet. A steeply skewed histogram (lengths 1, 2, 3, ... 63, which is what a
+    // MED residual plane produces) needs over a thousand. Without the `donated` check this loop
+    // spins forever: measured at 79% CPU for 8 minutes on `-q 100 -t 512 --huffman` before it was
+    // killed. It was unreachable only because `num_groups` was zero there, so no codebook was
+    // ever built (see BUG-21); fixing that exposed this.
+    //
+    // Failing loudly rather than shortening the codes anyway: with `excess_bits` still positive
+    // the length distribution violates Kraft's inequality, so `assign_canonical_codes` would
+    // hand out codewords that are not a prefix code and the tile would decode to noise. A
+    // length-limited construction (package-merge, or halving the frequencies and rebuilding)
+    // would code it properly; that is a change to a parked coder and is filed, not done.
     while excess_bits > 0 {
         // Find a non-zero count below max_len to donate
+        let mut donated = false;
         for j in (1..max_len as usize).rev() {
             if len_count[j] > 0 {
                 len_count[j] -= 1;
                 len_count[j + 1] += 2;
                 excess_bits -= 1;
+                donated = true;
                 break;
             }
         }
-        if excess_bits <= 0 {
-            break;
-        }
+        assert!(
+            donated,
+            "Huffman cannot limit this distribution to {max_len}-bit codes: {excess_bits} bits \
+             of excess left with no length below {max_len} to donate. The alphabet is too skewed \
+             for the redistribution step; use --rice for this material."
+        );
     }
 
     // Reassign lengths based on new counts (sort symbols by original length, then symbol)
@@ -513,6 +533,29 @@ fn optimal_k_zrl(values: &[u32]) -> u8 {
     (63 - mean.leading_zeros()).min(15) as u8
 }
 
+/// Tile-local raster index of symbol `s` in stream `stream_id`.
+///
+/// Streams walk the tile in **column-major** order, cut into `HUFFMAN_STREAMS_PER_TILE`
+/// contiguous segments, so the previous symbol in a stream is the coefficient directly above it.
+/// That vertical adjacency is what the ZRL runs and the adaptive `k_zrl` are tuned against.
+///
+/// BUG-14: this backend carried BUG-11's `stream_id + s * HUFFMAN_STREAMS_PER_TILE`, i.e.
+/// `i % 256`. At the default 256 px tile a segment is exactly one column and the two mappings
+/// agree coefficient for coefficient, so no shipped bitstream moves. At any other width `i % 256`
+/// interleaved columns `tile_size / 256` apart into one stream, which broke both the zero runs and
+/// the `k_zrl` they are coded with. Must stay in sync with the three `huffman_*.wgsl` shaders.
+#[inline]
+fn stream_coeff_index(
+    stream_id: usize,
+    s: usize,
+    symbols_per_stream: usize,
+    tile_size: usize,
+) -> usize {
+    // Column-major position within the tile: j = x * tile_size + y.
+    let j = stream_id * symbols_per_stream + s;
+    (j % tile_size) * tile_size + j / tile_size
+}
+
 /// Encode a tile of quantized coefficients using canonical Huffman with ZRL.
 ///
 /// Token encoding (per stream):
@@ -521,7 +564,10 @@ fn optimal_k_zrl(values: &[u32]) -> u8 {
 ///            if |val|-1 >= ESCAPE_SYM: followed by exp-Golomb(excess)
 pub fn huffman_encode_tile(coefficients: &[i32], tile_size: u32, num_levels: u32) -> HuffmanTile {
     let num_coefficients = coefficients.len();
-    let num_groups = (num_levels * 2) as usize;
+    // `.max(1)`, as in rice.rs: the MED lossless path (LOSSLESS-1) codes prediction
+    // residuals with `num_levels = 0`, which used to make this zero groups and panic on the
+    // first coefficient — `index out of bounds: the len is 0 but the index is 0`.
+    let num_groups = (num_levels * 2).max(1) as usize;
     let symbols_per_stream = num_coefficients / HUFFMAN_STREAMS_PER_TILE;
 
     // Phase 1: Build magnitude histograms per subband group
@@ -553,7 +599,8 @@ pub fn huffman_encode_tile(coefficients: &[i32], tile_size: u32, num_levels: u32
         let mut run = 0u32;
         let mut zrl_group = 0usize;
         for s in 0..symbols_per_stream {
-            let coeff_idx = stream_id + s * HUFFMAN_STREAMS_PER_TILE;
+            let coeff_idx =
+                stream_coeff_index(stream_id, s, symbols_per_stream, tile_size as usize);
             if coefficients[coeff_idx] == 0 {
                 if run == 0 {
                     let y = (coeff_idx / tile_size as usize) as u32;
@@ -581,7 +628,8 @@ pub fn huffman_encode_tile(coefficients: &[i32], tile_size: u32, num_levels: u32
         let mut s = 0;
 
         while s < symbols_per_stream {
-            let coeff_idx = stream_id + s * HUFFMAN_STREAMS_PER_TILE;
+            let coeff_idx =
+                stream_coeff_index(stream_id, s, symbols_per_stream, tile_size as usize);
             let coeff = coefficients[coeff_idx];
 
             if coeff == 0 {
@@ -594,7 +642,12 @@ pub fn huffman_encode_tile(coefficients: &[i32], tile_size: u32, num_levels: u32
                 let max_run = 32u32 << k;
                 let mut run = 1u32;
                 while s + (run as usize) < symbols_per_stream && run < max_run {
-                    let next_idx = stream_id + (s + run as usize) * HUFFMAN_STREAMS_PER_TILE;
+                    let next_idx = stream_coeff_index(
+                        stream_id,
+                        s + run as usize,
+                        symbols_per_stream,
+                        tile_size as usize,
+                    );
                     if coefficients[next_idx] != 0 {
                         break;
                     }
@@ -683,7 +736,12 @@ pub fn huffman_decode_tile(tile: &HuffmanTile) -> Vec<i32> {
             let token = reader.read_bit();
             if token == 0 {
                 // Zero run
-                let first_idx = stream_id + s * HUFFMAN_STREAMS_PER_TILE;
+                let first_idx = stream_coeff_index(
+                    stream_id,
+                    s,
+                    symbols_per_stream,
+                    tile.tile_size as usize,
+                );
                 let zy = (first_idx / tile.tile_size as usize) as u32;
                 let zx = (first_idx % tile.tile_size as usize) as u32;
                 let g_zrl = compute_subband_group(zx, zy, tile.tile_size, tile.num_levels);
@@ -692,7 +750,12 @@ pub fn huffman_decode_tile(tile: &HuffmanTile) -> Vec<i32> {
                 s += run as usize;
             } else {
                 // Non-zero coefficient
-                let coeff_idx = stream_id + s * HUFFMAN_STREAMS_PER_TILE;
+                let coeff_idx = stream_coeff_index(
+                    stream_id,
+                    s,
+                    symbols_per_stream,
+                    tile.tile_size as usize,
+                );
                 let sign = reader.read_bit();
 
                 let y = (coeff_idx / tile.tile_size as usize) as u32;
@@ -992,5 +1055,79 @@ mod tests {
             compressed_bytes,
             raw_bytes
         );
+    }
+
+    /// BUG-14: at 256 px the column-major mapping must agree with the legacy `i % 256` one,
+    /// coefficient for coefficient. That is what makes the fix bitstream-neutral at the default
+    /// tile size, so it is asserted rather than argued.
+    #[test]
+    fn test_stream_mapping_matches_legacy_at_256() {
+        let tile_size = HUFFMAN_STREAMS_PER_TILE;
+        let symbols_per_stream = tile_size * tile_size / HUFFMAN_STREAMS_PER_TILE;
+        for stream_id in 0..HUFFMAN_STREAMS_PER_TILE {
+            for s in 0..symbols_per_stream {
+                assert_eq!(
+                    stream_coeff_index(stream_id, s, symbols_per_stream, tile_size),
+                    stream_id + s * HUFFMAN_STREAMS_PER_TILE,
+                    "stream {stream_id} symbol {s}"
+                );
+            }
+        }
+    }
+
+    /// Every coefficient of the tile must be visited exactly once, at any width. A mapping that
+    /// dropped or doubled one would silently corrupt only part of the picture.
+    #[test]
+    fn test_stream_mapping_is_a_permutation() {
+        for tile_size in [128usize, 256, 512] {
+            let n = tile_size * tile_size;
+            let symbols_per_stream = n / HUFFMAN_STREAMS_PER_TILE;
+            let mut seen = vec![false; n];
+            for stream_id in 0..HUFFMAN_STREAMS_PER_TILE {
+                for s in 0..symbols_per_stream {
+                    let idx = stream_coeff_index(stream_id, s, symbols_per_stream, tile_size);
+                    assert!(idx < n, "tile {tile_size}: index {idx} out of range");
+                    assert!(!seen[idx], "tile {tile_size}: index {idx} visited twice");
+                    seen[idx] = true;
+                }
+            }
+            assert!(seen.iter().all(|&b| b), "tile {tile_size}: coefficients left unvisited");
+        }
+    }
+
+    /// A distribution too skewed to fit 8-bit codes must fail, not spin.
+    ///
+    /// `clamp_code_lengths` redistributes excess code length by moving one symbol from length j
+    /// to two at j + 1, and only lengths below the maximum may donate — a finite budget against
+    /// an unbounded `excess_bits`. A geometric histogram over 32 symbols exhausts it after 247
+    /// donations with 52 bits of excess still to place, at which point the original loop had
+    /// nothing left to do and did it forever (79% CPU, 8 minutes, killed). `should_panic` here is
+    /// the regression: before the fix this test does not fail, it hangs.
+    #[test]
+    #[should_panic(expected = "Huffman cannot limit this distribution")]
+    fn test_codebook_refuses_a_distribution_it_cannot_length_limit() {
+        let mut freq = vec![1u32; 32];
+        for (i, f) in freq.iter_mut().enumerate().skip(1) {
+            *f = 1u32 << (i - 1);
+        }
+        let _ = build_canonical_codebook(&freq);
+    }
+
+    /// The host encoder and decoder must agree at every tile width, not just the default one.
+    #[test]
+    fn test_huffman_roundtrip_across_tile_sizes() {
+        for tile_size in [128u32, 256, 512] {
+            let n = (tile_size * tile_size) as usize;
+            let mut coefficients = vec![0i32; n];
+            for (i, c) in coefficients.iter_mut().enumerate() {
+                let r = (i * 31 + 7) % 97;
+                if r < 30 {
+                    *c = (r as i32 % 12 + 1) * if r % 2 == 0 { 1 } else { -1 };
+                }
+            }
+            let tile = huffman_encode_tile(&coefficients, tile_size, 3);
+            let decoded = huffman_decode_tile(&tile);
+            assert_eq!(coefficients, decoded, "roundtrip failed at tile {tile_size}");
+        }
     }
 }

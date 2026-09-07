@@ -10102,3 +10102,124 @@ COORDINATION rule 1 says a number is only valid against a commit. It is worth st
 version: **a baseline binary must live in a worktree you own, pinned to a hash.** A sibling's
 build directory is not a baseline, however carefully you check it at the start — you do not control
 when it changes. Both figures above come from `git worktree add --detach <dir> <sha>` plus a build.
+## 2026-09-07 — BUG-14: Huffman's stream mapping, and the three defects that were hiding behind it
+
+**Item.** BACKLOG BUG-14, P4: `huffman_encode.wgsl`, `huffman_decode.wgsl` and
+`huffman_histogram.wgsl` all carried the `thread_id + s * STREAMS_PER_TILE` mapping that BUG-11
+fixed in Rice, as did the host `huffman.rs`. The entry says it was left alone deliberately —
+Huffman is not a default coder and nothing measures through it — with the note that the fix is the
+same `stream_coeff_index` expression if it ever matters.
+
+**Why it matters at all.** Not for shipped output: at the default 256 px tile the two mappings are
+the same permutation, so nothing in BASELINE moves. It matters because *any* future tile-size
+experiment run through Huffman would score the larger-tile arm through a penalty that has nothing
+to do with geometry — which is exactly the error BUG-11 corrected for Rice, and which invalidated
+every tile-size result in this repo including #47.
+
+### Method
+
+Four pinned stills, copied into the worktree with their MD5s recorded (`7622df6d`, `ef3d06eb`,
+`8b3caef1`, `dbd6a600`), tiles 128/256/512, q=75/90/100, encode → decode → PSNR and max error
+against the source. Two binaries in one run: **before** = `../gnc-chroma2/target/release/gnc` built
+at `73674cc`, **after** = this worktree. `src/` is byte-identical between `73674cc` and the base of
+this branch, so the pair differs only by the change under test.
+
+### The gate found the coder broken before it found anything about the mapping
+
+Baseline, before any change, GPU encoder:
+
+| | q=75 | q=90 | q=100 |
+|---|---|---|---|
+| tile 256 | 44.8 dB, fine | 50.1 dB, fine | **5.9–9.7 dB, max err 255** |
+| tile 512 | two of four images at 19–24 dB | **7.8–10.9 dB on all four** | **4.1–9.7 dB** |
+
+At q=100 the file was also *smaller* than at q=90 — 1.77 MB against 2.33 MB on bbb — which is the
+"a result that beats its own theoretical ceiling is a bug" canary, since q=100 is meant to be
+lossless. Three distinct defects, all pre-existing, none of them the mapping:
+
+- **BUG-21 — `num_groups = num_levels * 2` is zero on the lossless path.** LOSSLESS-1 codes MED
+  prediction residuals at `num_levels = 0`. `rice.rs` has `.max(1)` there; `huffman.rs` and
+  `huffman_gpu.rs` did not. The host encoder panicked outright (`index out of bounds: the len is 0
+  but the index is 0`), and the GPU encoder built no codebook at all, emitted no codes, and wrote
+  a small file that decoded to noise.
+- **BUG-22 — the GPU encoder's per-stream output slot has no bound.** `emit_byte` writes
+  `stream_output[p_stream_word_base + p_word_pos]` with nothing checking `p_word_pos` against
+  `MAX_STREAM_WORDS`, so a stream needing more than 512 bytes spills into its neighbour's slot and
+  the host packs the neighbour's bytes back out. That is the whole of the tile-512 corruption.
+  Same shape as BUG-9 in rANS.
+- **BUG-23 — `clamp_code_lengths` does not terminate.** It places excess code length by moving one
+  symbol from length *j* to two at *j*+1, and only lengths below the 8-bit maximum may donate. The
+  donor pool is finite (order 100 donations for a 64-symbol alphabet); `excess_bits` is not. A
+  steeply skewed histogram — which is what a MED residual plane is — needs over a thousand. It was
+  unreachable only because BUG-21 meant no codebook was ever built on that path; fixing BUG-21
+  exposed it, as an encode of bbb at `-q 100 -t 512` spinning at 79% CPU for 8 minutes before it
+  was killed.
+
+### BUG-14 itself: the mapping is worth up to −23%
+
+`stream_coeff_index(stream_id, s, symbols_per_stream, tile_size)` in `huffman.rs` and in all three
+shaders, identical to `rice.rs`. Measured through the **host** encoder, because the GPU encoder
+cannot code tile 512 at all until BUG-22 is fixed. PSNR is identical before and after at every
+single point — the change touches entropy coding only, and that is the check that says so:
+
+| image | tile 128, q=75 | tile 256 | tile 512, q=75 | tile 512, q=90 |
+|---|---|---|---|---|
+| bbb_1080p | −3.51% | **byte-identical** | **−18.85%** | −10.62% |
+| blue_sky_1080p | −2.26% | **byte-identical** | **−21.33%** | −11.42% |
+| kristensara_720p | −3.88% | **byte-identical** | **−23.16%** | −14.28% |
+| touchdown_1080p | −2.09% | **byte-identical** | **−17.17%** | −11.29% |
+| **mean** | **−2.94%** | **0.00%** | **−20.13%** | **−11.90%** |
+
+Byte-identical at 256 on all 8 points and through both encoders, which is the correctness proof
+and the reason no shipped preset moves. It is also asserted in a unit test rather than argued:
+`test_stream_mapping_matches_legacy_at_256` walks all 65 536 positions.
+
+Larger than Rice's equivalent (−12.9% to −18.6% at q=75). Huffman codes its zero runs with a
+per-group adaptive `k_zrl` on top of the codebook, so a stream that interleaves distant columns
+costs it twice.
+
+**What this does not change: 256 is still the right tile for Huffman.** After the fix 512 is still
++1.2% to +17.2% larger than 256 at q=75, and lower in PSNR — it loses on both axes, so the
+direction is safe to state without a BD-rate. The mapping was never the reason 256 won; it was the
+reason the margin looked like 28.8%.
+
+### The other three fixes, and what they are worth
+
+- **BUG-21 fixed** (`.max(1)`, both host and GPU). `--huffman -q 100` at tile 256 is now
+  **bit-exact lossless**, max error 0, and the host and GPU encoders agree byte for byte:
+  1 076 689 bytes on kristensara_720p. Before, that combination panicked on the host path and
+  produced a 634 452-byte file at 7.17 dB on the GPU path.
+  For scale: Rice codes the same image losslessly in 984 178 bytes (LOSSLESS-1), so Huffman is
+  **+9.4% behind Rice at q=100**. It is not a reason to un-park the coder.
+- **BUG-22 guarded, not fixed.** The host now asserts when a stream reports more than its 512-byte
+  slot and says which tile, which stream and how many bytes — `overflowed its 512-byte output slot
+  (563 bytes)`. Every tile-512 encode that used to return a corrupt picture now refuses. Fixing it
+  properly means sizing the slot from `symbols_per_stream` (about 4 bytes per symbol worst case,
+  so 4 KB per stream at tile 512, ~37 MB of scratch for 1080p 4:4:4), which is a real change to a
+  parked coder and is filed rather than done.
+- **BUG-23 bounded, not fixed.** The loop now asserts when the donor pool is exhausted with excess
+  left. bbb at `-q 100 -t 512` went from **8 minutes at 79% CPU to 0.148 s** with
+  `62 bits of excess left with no length below 8 to donate`. Failing loudly rather than shortening
+  the codes anyway is deliberate: with excess left the length distribution violates Kraft, so the
+  canonical assignment would hand out codewords that are not a prefix code and the tile would
+  decode to noise — trading a hang for silent corruption. A length-limited construction
+  (package-merge, or halving the frequencies and rebuilding) is the real fix.
+  `test_codebook_refuses_a_distribution_it_cannot_length_limit` is the regression, and it is a
+  `should_panic`: before the fix that test does not fail, it hangs.
+
+### Also found, not mine to fix
+
+**`cargo clippy --release --target wasm32-unknown-unknown` fails on `main`, and did before this
+branch.** 11 × `no associated function or constant named 'new' found for struct GpuContext`, all
+in the **bin** target: `GpuContext::new` is `#[cfg(not(target_arch = "wasm32"))]` and `main.rs`
+calls it unconditionally. Reproduced on a clean tree at `bc851c7`. The library — which is what
+WASM actually ships — is clean. Filed as BUG-24; CLAUDE.md's "both clippy targets must be clean"
+is currently failing against the CLI binary, which is not a WASM artifact in the first place.
+
+### Would we ship this?
+
+The mapping fix, yes: it is bitstream-neutral where anything ships, it removes a known-wrong
+measurement path, and it costs one expression in four places. The three loud failures, yes — a
+parked coder that returns a wrong picture is worse than one that says it cannot. The two real
+fixes behind them, no, not for a coder nothing measures through; they are filed with the sizing
+and the algorithm named so the next person does not have to re-derive either.

@@ -40,6 +40,19 @@ var<private> p_acc: u32;       // accumulator — valid bits are at the top
 var<private> p_bits: u32;      // number of valid bits in accumulator
 var<private> p_byte_off: u32;  // next byte offset to load from stream_data
 
+// Tile-local raster index of symbol `s` in stream `stream_id`.
+//
+// Streams walk the tile in column-major order, cut into STREAMS_PER_TILE contiguous segments, so
+// the previous symbol in a stream is the coefficient directly above it. At the default 256 px tile
+// a segment is exactly one column and this equals the old `thread_id + s * 256` coefficient for
+// coefficient; at any other width that modulus interleaved distant columns into one stream and
+// both the zero runs and their k_zrl tracked a mixture (BUG-14, BUG-11's twin). Must stay in sync
+// with huffman.rs stream_coeff_index().
+fn stream_coeff_index(stream_id: u32, s: u32, symbols_per_stream: u32) -> u32 {
+    let j = stream_id * symbols_per_stream + s;
+    return (j % params.tile_size) * params.tile_size + j / params.tile_size;
+}
+
 fn compute_subband_group(lx: u32, ly: u32) -> u32 {
     var region = params.tile_size;
     for (var level = 0u; level < params.num_levels; level++) {
@@ -177,13 +190,13 @@ fn main(
         let token = read_bits(1u);
         if (token == 0u) {
             // Zero run
-            let zi = thread_id + s * STREAMS_PER_TILE;
+            let zi = stream_coeff_index(thread_id, s, symbols_per_stream);
             let zr = zi / params.tile_size;
             let zc = zi % params.tile_size;
             let g_zrl = compute_subband_group(zc, zr);
             let run = read_rice(shared_k_zrl[g_zrl]) + 1u;
             for (var j = 0u; j < run; j++) {
-                let ci = thread_id + (s + j) * STREAMS_PER_TILE;
+                let ci = stream_coeff_index(thread_id, s + j, symbols_per_stream);
                 let cr = ci / params.tile_size;
                 let cc = ci % params.tile_size;
                 let pi = (tile_origin_y + cr) * params.plane_width + (tile_origin_x + cc);
@@ -192,7 +205,7 @@ fn main(
             s += run;
         } else {
             // Non-zero coefficient
-            let coeff_idx = thread_id + s * STREAMS_PER_TILE;
+            let coeff_idx = stream_coeff_index(thread_id, s, symbols_per_stream);
             let tile_row = coeff_idx / params.tile_size;
             let tile_col = coeff_idx % params.tile_size;
             let plane_idx = (tile_origin_y + tile_row) * params.plane_width

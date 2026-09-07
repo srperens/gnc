@@ -189,6 +189,7 @@ If this table and `scripts/claim list` disagree, the table is wrong.
 | `../gnc-abacship` | `abacship` | **ABAC-SHIP done and merged 2026-09-07** (`60bed17`, `378a0c7`, `436680e`). abac is a real entropy coder: `--abac`, entropy type 5, **GP18**, on stills *and* sequences. Intra −16.6% to −18.8% at identical pixels, lossless −13.4% (FFV1 gap +23.9% → +7.3%), inter −14.4% at q=90. Rice stays the default (`docs/decisions/0017`). **Every frame this encoder writes now says GP18** — a GP18 Rice frame is a GP17 payload with a new label, proved by relabelling and decoding; GP17 still reads. Left behind: **BUG-18 (P1)**, the inter path's reconstruction depends on the entropy encode path. Worktree free to remove. |
 | `../gnc-rate1` | `rate1` | **DONE, merged, worktree removed.** RATE-1 answered **no** — a bit-depth-aware rate rule recovers **0.0% on all four photographic stills** (89.4% on the synthetic gradient, which is the trap). The sweep found **RATE-2 instead, filed P1**: above q≈95-98 the lossy ladder costs more bytes than bit-exact lossless on every real image, mean **+28.9% at q=99** (blue_sky +40.6%). LOSSLESS-1 made lossless cheap enough to undercut the top of the lossy ladder and nothing noticed. |
 | `../gnc-coord` | `coord` | **COORD-1 — the claim mechanism enforces the rules instead of restating them.** Docs and `scripts/claim` only; no codec change, invalidates no measurement. `scripts/claim next` makes the *pick* atomic, the shared-checkout and worktree preconditions are now refusals rather than prose, and the session identity bug that made `SESSION GONE` undetectable is fixed. See `docs/decisions/0019`. Claimed 2026-09-07. |
+| `../gnc-bug14` | `bug14` | **BUG-14 merged to main 2026-09-07.** Huffman's stream mapping carried BUG-11; `stream_coeff_index` now matches `rice.rs` in the host encoder and all three shaders. Byte-identical at tile 256, **−20.1% at tile 512** / −2.9% at 128. Gating it turned up three more Huffman defects (**BUG-21/18/19**) and one broken project gate (**BUG-24**), all pre-existing, all filed. Worktree can be removed. |
 
 ## The test material was missing entirely, and was refetched (2026-09-07) — RESOLVED
 
@@ -564,6 +565,49 @@ Three things to carry:
   be missing 400 lines of someone else's day.
 
 **GPU selection from the environment, and a tier/density harness — invalidates nothing.**
+- **BUG-14 — Huffman's stream mapping is fixed, and Huffman was broken three further ways.
+  Invalidates nothing that ships, and one thing that does not.** The mapping fix is byte-identical
+  at the default 256 px tile on all 8 measured points and through both encoders, so no preset, no
+  BASELINE row and no committed figure moves. What it *does* invalidate: **any future tile-size
+  experiment run through Huffman before today** would have scored the larger-tile arm through a
+  13–23% penalty that has nothing to do with geometry — the same error BUG-11 corrected for Rice.
+  Worth −2.9% at tile 128 and −20.1% at tile 512 (q=75, four stills, PSNR identical at every
+  point). 256 is still Huffman's best tile: after the fix 512 is still larger *and* lower in PSNR.
+
+  Three defects the gate found before it found anything about the mapping, all pre-existing, none
+  of them the mapping, all in a coder nothing measures through — **so if you are about to route
+  anything through `--huffman`, read this first:**
+
+  - **BUG-21 (fixed)** — `num_groups = num_levels * 2` was zero on the MED lossless path, so
+    `--huffman -q 100` panicked on the host encoder and, on the GPU encoder, built no codebook and
+    wrote **4.1–9.7 dB output with max error 255 in a file smaller than the same image at q=90**.
+    `.max(1)`, as `rice.rs` has always had. q=100 Huffman is now bit-exact; it is +9.4% behind
+    Rice, which is not a reason to un-park it.
+  - **BUG-22 (guarded, not fixed)** — the GPU encoder writes each stream into a fixed 512-byte slot
+    with no bound check, so a longer stream silently overwrites its neighbour's. That is the whole
+    of the tile-512 corruption (7.8–10.9 dB at q=90 on all four stills). It now refuses with the
+    tile, the stream and the byte count. **Every Huffman tile-512 figure ever taken here is
+    suspect**, which in practice means none, because nobody took one.
+  - **BUG-23 (bounded, not fixed)** — `clamp_code_lengths` did not terminate. `-q 100 -t 512` on
+    bbb spun at 79% CPU for 8 minutes before it was killed; it now fails in 0.148 s. It was
+    unreachable only because BUG-21 meant no codebook was ever built.
+
+- **BUG-24 filed — `cargo clippy --release --target wasm32-unknown-unknown` already fails on
+  `main`, and has for a while.** 11 × `no associated function or constant named 'new' found for
+  struct GpuContext`, all in the **bin** target: `GpuContext::new` is `#[cfg(not(target_arch =
+  "wasm32"))]` and `main.rs` calls it unconditionally. Reproduced on a clean tree at `bc851c7`, so
+  it predates the BUG-14 branch; most likely arrived with `fcac02f`. **`--lib` is clean with no
+  warnings**, and the library is what WASM actually ships. So CLAUDE.md's "both clippy targets must
+  be clean" currently cannot be satisfied as written, and every session is hitting it on a CLI
+  binary that is never built for WASM. Whoever owns `fcac02f` is best placed to pick the fix.
+
+- **A second bug-number collision in one week.** This branch filed 16–19; ABAC-SHIP landed its own
+  **BUG-16** while it was in flight, and the clash only surfaced at rebase. Renumbered to 17–20.
+  Read/decide/write is three steps in a markdown table and the table cannot exclude anyone —
+  `scripts/claim` can, and it now holds the areas. **Bug numbers are not in it.** Until they are,
+  take the next number *and rebase before you write it down*.
+
+- **GPU selection from the environment, and a tier/density harness — invalidates nothing.**
   `GNC_GPU_ADAPTER` (name substring), `GNC_GPU_BACKEND`, `GNC_GPU_POWER` and `GNC_GPU_INFO` choose
   the device at context creation; `gnc gpu-info` lists what wgpu can see. Encoder output is
   unchanged and verified so — q=75 on bbb_1080p is still 44.84 dB / 4.53 bpp, matching BASELINE.
@@ -629,13 +673,13 @@ Three things to carry:
 - **q=100 verified bit-exact lossless** on all three entropy coders. GOALS' "no true lossless with
   Rice" was stale and is corrected. GNC beats JPEG 2000 lossless by 10.8% and PNG by 7.8%; loses to
   FFV1 by 27% and x264 `-qp 0` by 43%, both of which predict against the neighbour.
-- **BUG-17 and BUG-18 were assigned within minutes of each other on 2026-09-07, and it is
-  resolved.** The `coord` session filed BUG-17 for the `abac_bitstream` parallel flake; the
-  `abacship` session filed a different BUG-17 for an encode-path divergence on the inter path.
-  **BUG-17 keeps the flake** (it was on main first) and is now **FIXED** — the `abacship` commit
+- **BUG-21 and BUG-22 were assigned within minutes of each other on 2026-09-07, and it is
+  resolved.** The `coord` session filed BUG-21 for the `abac_bitstream` parallel flake; the
+  `abacship` session filed a different BUG-21 for an encode-path divergence on the inter path.
+  **BUG-21 keeps the flake** (it was on main first) and is now **FIXED** — the `abacship` commit
   root-causes it as an `std::env::set_var` race that was masking a real decoder bug, which is the
-  second of the two possibilities BUG-17's own entry asked someone to distinguish. The inter-path
-  divergence is **BUG-18** (todo, P1). This is the second double-assignment in two days; read this
+  second of the two possibilities BUG-21's own entry asked someone to distinguish. The inter-path
+  divergence is **BUG-22** (todo, P1). This is the second double-assignment in two days; read this
   file *and* run `scripts/claim list` before taking a number.
 
 - **BUG-16 is taken** (2026-09-07, filed by `abacship`): Rice's GPU and CPU encode paths disagree

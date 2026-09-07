@@ -289,7 +289,10 @@ impl GpuHuffmanEncoder {
     ) -> Vec<HuffmanTile> {
         let num_tiles = (info.tiles_x() * info.tiles_y()) as usize;
         let total_streams = num_tiles * HUFFMAN_STREAMS_PER_TILE;
-        let num_groups = (num_levels * 2) as usize;
+        // `.max(1)`: with `num_levels = 0` (the MED lossless path) there is still one
+        // region to code, and zero groups meant no codebook at all — the GPU encoder wrote
+        // a stream of empty codes and the picture came back at 4-10 dB.
+        let num_groups = (num_levels * 2).max(1) as usize;
 
         self.ensure_buffers(ctx, num_tiles);
         let bufs = self.cached.as_ref().unwrap();
@@ -570,6 +573,19 @@ impl GpuHuffmanEncoder {
                     let slot_offset =
                         (t * HUFFMAN_STREAMS_PER_TILE + s) * MAX_STREAM_BYTES;
                     let len = len as usize;
+                    // The shader writes each stream into a fixed MAX_STREAM_BYTES slot with no
+                    // bound of its own, so a stream that needs more spills into its neighbour's
+                    // slot and the packing below reads it back — silent corruption, no error.
+                    // That is what a q=100 or tile-512 Huffman encode was doing: 4-20 dB output
+                    // with max error 255 and nothing said. Same shape as BUG-9 in rANS, and the
+                    // same amount of fixing: refuse the configuration instead of coding it wrong.
+                    assert!(
+                        len <= MAX_STREAM_BYTES,
+                        "Huffman tile {t} stream {s} overflowed its {MAX_STREAM_BYTES}-byte \
+                         output slot ({len} bytes). The Huffman GPU encoder cannot code this \
+                         configuration; it happens at q=100 and at tile sizes above 256. Use \
+                         --rice, or a smaller --tile-size."
+                    );
                     packed_data
                         .extend_from_slice(&stream_data[slot_offset..slot_offset + len]);
                 }

@@ -837,7 +837,7 @@ one at q ≤ 30 — which is exactly the comparison an entropy-coder experiment 
 Pinned by `rice_gpu_and_cpu_encode_paths_differ_at_subsampled_chroma` in `tests/abac_bitstream.rs`,
 which asserts the gap exists and is small, so a fix will fail that test and its comment says so.
 
-### BUG-14 — Huffman's stream mapping has BUG-11 (todo, P4)
+### BUG-14 — Huffman's stream mapping had BUG-11 (**DONE 2026-09-07**)
 `huffman_encode.wgsl`, `huffman_decode.wgsl` and `huffman_histogram.wgsl` all carry the same
 `thread_id + s * STREAMS_PER_TILE` mapping that BUG-11 fixed in Rice, so a Huffman stream is one
 tile column only at 256 px. Left alone deliberately: Huffman is not a default coder, is capped at
@@ -847,6 +847,87 @@ it ever matters.
 The rANS fused histogram shader (`quantize_histogram_fused.wgsl`) has the same shape over 32
 streams, but rANS *gains* 14–20% at tile 512, so its ordering is not costing it the same way. Not
 filed as a bug — noted so nobody mistakes it for one.
+
+**Fixed 2026-09-07.** `stream_coeff_index` in `huffman.rs` and in all three shaders, identical to
+`rice.rs`. Four stills, host encoder (the GPU one cannot reach tile 512 — BUG-22), PSNR identical
+at every point:
+
+| tile | q=75 | q=90 |
+|---|---|---|
+| 128 | **−2.94%** mean (−2.09 to −3.88) | −1.48% |
+| 256 | **byte-identical, 8/8 points, both encoders** | byte-identical |
+| 512 | **−20.13%** mean (−17.17 to −23.16) | −11.90% |
+
+Larger than Rice's −12.9 to −18.6%: Huffman also codes its zero runs with a per-group adaptive
+`k_zrl`, so a stream that interleaves distant columns costs it twice. **256 is still the right
+tile for Huffman** — after the fix 512 is +1.2% to +17.2% larger *and* lower in PSNR — the mapping
+was never why 256 won, only why the margin read 28.8%. Byte-identity at 256 is asserted in
+`test_stream_mapping_matches_legacy_at_256` rather than argued. Full numbers in RESEARCH_LOG.
+
+The gate that measured this found the coder broken three ways first: **BUG-21**, **BUG-22** and
+**BUG-23** below, all pre-existing, none of them the mapping.
+
+### BUG-21 — Huffman built no codebook on the lossless path (**FIXED 2026-09-07**)
+LOSSLESS-1 codes MED prediction residuals with `num_levels = 0`, so `num_groups = num_levels * 2`
+was zero. `rice.rs` has `.max(1)` there; `huffman.rs` and `huffman_gpu.rs` did not. The host
+encoder panicked (`index out of bounds: the len is 0 but the index is 0`); the GPU encoder built
+no codebook, emitted no codes, and wrote a file that decoded at **4.1–9.7 dB with max error 255**
+on all four stills at every tile size — and which was *smaller* than the same image at q=90, the
+"beats its own theoretical ceiling" canary.
+
+Fixed with `.max(1)` in both. `--huffman -q 100` at tile 256 is now **bit-exact lossless**, max
+error 0, host and GPU encoders byte-identical: 1 076 689 bytes on kristensara_720p against Rice's
+984 178, so Huffman is **+9.4% behind Rice at q=100**. Not a reason to un-park the coder.
+
+### BUG-22 — Huffman's GPU per-stream output slot has no bound (**guarded 2026-09-07, not fixed**, P3)
+`emit_byte` in `huffman_encode.wgsl` writes `stream_output[p_stream_word_base + p_word_pos]` with
+nothing checking `p_word_pos` against `MAX_STREAM_WORDS`. A stream needing more than its 512-byte
+slot spills into its neighbour's, and the host packs the neighbour's bytes back out. That is the
+whole of the tile-512 corruption: **7.8–10.9 dB at q=90 on all four stills**, and 19–24 dB at
+q=75 on two of them. Exactly BUG-9's shape in rANS, and guarded the same way — the host now
+asserts with the tile, the stream and the byte count (`overflowed its 512-byte output slot
+(563 bytes)`) instead of returning a picture.
+
+**The real fix** is to size the slot from `symbols_per_stream` rather than fix it at 512 bytes:
+worst case is about 4 bytes per symbol (significance + sign + an 8-bit code + exp-Golomb escape),
+so 4 KB per stream at tile 512, about 37 MB of scratch for 1080p 4:4:4 — affordable, but it means
+making `MAX_STREAM_WORDS` a parameter across the shader and the host. Not done: this is a parked
+coder and **BUG-14's tile-512 arm is the only thing that wants it**, which the host encoder can
+measure instead.
+
+### BUG-23 — `clamp_code_lengths` does not terminate (**bounded 2026-09-07, not fixed**, P3)
+It places excess code length by moving one symbol from length *j* to two at *j*+1, and only
+lengths below the 8-bit maximum may donate — a donor pool of order 100 donations for a 64-symbol
+alphabet, against an `excess_bits` that is not bounded by it. A steeply skewed histogram needs
+over a thousand: simulated, a geometric distribution over 32 symbols exhausts the pool after 247
+donations with 52 bits still to place. Measured, an encode of bbb_1080p at `-q 100 -t 512` spun at
+**79% CPU for 8 minutes** before it was killed.
+
+Unreachable until now only because BUG-21 meant no codebook was ever built on that path. The loop
+now asserts when the pool is exhausted; the same encode fails in **0.148 s** with `62 bits of
+excess left with no length below 8 to donate`. Failing rather than shortening the codes anyway is
+deliberate — with excess left the lengths violate Kraft, so `assign_canonical_codes` would emit
+codewords that are not a prefix code and the tile would decode to noise, trading a hang for silent
+corruption.
+
+**The real fix** is a length-limited construction: package-merge, or the cheap standard trick of
+halving all frequencies and rebuilding until the natural depth fits (guaranteed to terminate — at
+frequency 1 everywhere the alphabet is uniform and the depth is 6). Both change Huffman's
+codebook, and therefore its bitstream, wherever clamping currently occurs. Not done for a parked
+coder.
+
+### BUG-24 — `clippy --target wasm32-unknown-unknown` fails on `main` (todo, P3)
+11 × `no associated function or constant named 'new' found for struct GpuContext`, all in the
+**bin** target: `GpuContext::new` is `#[cfg(not(target_arch = "wasm32"))]` and `main.rs` calls it
+unconditionally. Reproduced on a clean tree at `bc851c7`, so it predates BUG-14's branch; it most
+likely arrived with the GPU-selection work (`fcac02f`).
+
+`cargo clippy --release --target wasm32-unknown-unknown --lib` is **clean, no warnings** — the
+library is what WASM ships, and it is fine. So the failure is a CLI binary being type-checked for
+a target it is never built for. Two honest resolutions: exclude the bin from the wasm target
+(`required-features`, or a `#![cfg(not(target_arch = "wasm32"))]` on `main.rs`), or make the CLI's
+context creation cfg-aware. Until one of them lands, CLAUDE.md's "both clippy targets must be
+clean" cannot be satisfied as written, and every session hits it.
 
 ### BUG-9 — rANS's cumfreq table does not fit its shader, and the slot overflow was the symptom (**DONE 2026-09-07**)
 Both limits are now refused by name, no configuration writes out of bounds any more, and the
@@ -1758,7 +1839,7 @@ not re-found as an abac bug. It is why **q=25 is not quoted as a rate figure** a
    carries a small caveat. `--abac` had to be added to `benchmark-sequence` / `encode-sequence`
    first — the sequence path had no entropy-coder flag at all.
    **These are quality-matched to ≤0.03 dB, not pixel-exact like the intra rows** — on the inter
-   path the two *encode paths* never agree exactly (BUG-18, filed from this measurement), and abac
+   path the two *encode paths* never agree exactly (BUG-22, filed from this measurement), and abac
    is CPU-encoded where Rice is GPU-encoded. **q=75 is not quoted at all**: the gap is worth
    0.54 dB there.
 4. **CPU encode is 129 ms/frame against Rice's 23 ms (todo, P3).** Serial per symbol by

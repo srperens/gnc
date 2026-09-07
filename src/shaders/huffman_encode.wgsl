@@ -48,6 +48,19 @@ var<private> p_word_pos: u32;
 var<private> p_stream_word_base: u32;
 var<private> p_total_bytes: u32;
 
+// Tile-local raster index of symbol `s` in stream `stream_id`.
+//
+// Streams walk the tile in column-major order, cut into STREAMS_PER_TILE contiguous segments, so
+// the previous symbol in a stream is the coefficient directly above it. At the default 256 px tile
+// a segment is exactly one column and this equals the old `thread_id + s * 256` coefficient for
+// coefficient; at any other width that modulus interleaved distant columns into one stream and
+// both the zero runs and their k_zrl tracked a mixture (BUG-14, BUG-11's twin). Must stay in sync
+// with huffman.rs stream_coeff_index().
+fn stream_coeff_index(stream_id: u32, s: u32, symbols_per_stream: u32) -> u32 {
+    let j = stream_id * symbols_per_stream + s;
+    return (j % params.tile_size) * params.tile_size + j / params.tile_size;
+}
+
 fn compute_subband_group(lx: u32, ly: u32) -> u32 {
     var region = params.tile_size;
     for (var level = 0u; level < params.num_levels; level++) {
@@ -163,7 +176,7 @@ fn main(
 
     var s = 0u;
     while (s < symbols_per_stream) {
-        let coeff_idx = thread_id + s * STREAMS_PER_TILE;
+        let coeff_idx = stream_coeff_index(thread_id, s, symbols_per_stream);
         let tile_row = coeff_idx / params.tile_size;
         let tile_col = coeff_idx % params.tile_size;
         let plane_idx = (tile_origin_y + tile_row) * params.plane_width
@@ -178,7 +191,7 @@ fn main(
             var run = 1u;
             var ns = s + 1u;
             while (ns < symbols_per_stream && run < max_run) {
-                let ni = thread_id + ns * STREAMS_PER_TILE;
+                let ni = stream_coeff_index(thread_id, ns, symbols_per_stream);
                 let nr = ni / params.tile_size;
                 let nc = ni % params.tile_size;
                 let np = (tile_origin_y + nr) * params.plane_width + (tile_origin_x + nc);

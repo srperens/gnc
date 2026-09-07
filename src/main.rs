@@ -350,19 +350,22 @@ enum Command {
         #[arg(long)]
         no_cfl: bool,
 
-        /// Use bitplane entropy coder instead of rANS (default)
+        /// Use the bitplane entropy coder (parked — never measured against the defaults)
         #[arg(long)]
         bitplane: bool,
 
-        /// Use rANS entropy coder (default; this flag is now a no-op kept for backward compat)
+        /// Use the rANS entropy coder. Default at q<=20 only — Rice is the default above.
+        /// Measured level with Rice on rate above q=25 and it cannot encode above q=76 (BUG-9)
         #[arg(long)]
         rans: bool,
 
-        /// Use Rice+ZRL entropy coder instead of rANS (default) — faster but ~30% worse compression
+        /// Use the Rice+ZRL entropy coder. Default above q=20; level with rANS on rate
+        /// above q=25, 6-7% larger at q<=20 (ENT-2, 2026-09-07)
         #[arg(long)]
         rice: bool,
 
-        /// Use canonical Huffman entropy coder instead of rANS (default)
+        /// Use the canonical Huffman entropy coder (parked — carries BUG-14, and caps the
+        /// decomposition at 4 wavelet levels)
         #[arg(long)]
         huffman: bool,
 
@@ -428,19 +431,22 @@ enum Command {
         #[arg(short = 'q', long, default_value = "75")]
         quality: u32,
 
-        /// Use bitplane entropy coder instead of rANS (default)
+        /// Use the bitplane entropy coder (parked — never measured against the defaults)
         #[arg(long)]
         bitplane: bool,
 
-        /// Use rANS entropy coder (default; this flag is now a no-op kept for backward compat)
+        /// Use the rANS entropy coder. Default at q<=20 only — Rice is the default above.
+        /// Measured level with Rice on rate above q=25 and it cannot encode above q=76 (BUG-9)
         #[arg(long)]
         rans: bool,
 
-        /// Use Rice+ZRL entropy coder instead of rANS (default) — faster but ~30% worse compression
+        /// Use the Rice+ZRL entropy coder. Default above q=20; level with rANS on rate
+        /// above q=25, 6-7% larger at q<=20 (ENT-2, 2026-09-07)
         #[arg(long)]
         rice: bool,
 
-        /// Use canonical Huffman entropy coder instead of rANS (default)
+        /// Use the canonical Huffman entropy coder (parked — carries BUG-14, and caps the
+        /// decomposition at 4 wavelet levels)
         #[arg(long)]
         huffman: bool,
 
@@ -525,11 +531,13 @@ enum Command {
         #[arg(long, default_value = "30")]
         fps: f64,
 
-        /// Use rANS entropy coder (default; this flag is now a no-op kept for backward compat)
+        /// Use the rANS entropy coder. Default at q<=20 only — Rice is the default above.
+        /// Measured level with Rice on rate above q=25 and it cannot encode above q=76 (BUG-9)
         #[arg(long)]
         rans: bool,
 
-        /// Use Rice+ZRL entropy coder instead of rANS (default) — faster but ~30% worse compression
+        /// Use the Rice+ZRL entropy coder. Default above q=20; level with rANS on rate
+        /// above q=25, 6-7% larger at q<=20 (ENT-2, 2026-09-07)
         #[arg(long)]
         rice: bool,
 
@@ -616,11 +624,13 @@ enum Command {
         #[arg(long, default_value = "vbr")]
         rate_mode: String,
 
-        /// Use rANS entropy coder (default; this flag is now a no-op kept for backward compat)
+        /// Use the rANS entropy coder. Default at q<=20 only — Rice is the default above.
+        /// Measured level with Rice on rate above q=25 and it cannot encode above q=76 (BUG-9)
         #[arg(long)]
         rans: bool,
 
-        /// Use Rice+ZRL entropy coder instead of rANS (default) — faster but ~30% worse compression
+        /// Use the Rice+ZRL entropy coder. Default above q=20; level with rANS on rate
+        /// above q=25, 6-7% larger at q<=20 (ENT-2, 2026-09-07)
         #[arg(long)]
         rice: bool,
 

@@ -790,11 +790,28 @@ pub fn quality_preset(q: u32) -> CodecConfig {
             WaveletType::CDF97
         },
         // Rice: 256 fully independent GPU-parallel streams per tile — matches our architecture.
-        // rANS below q=20, Rice above. Measured on bbb, touchdown and kristensara: rANS is
-        // 5-19% smaller at q<=20 at identical PSNR, neutral-to-worse above, and the crossover is
-        // content-dependent (kristensara turns at q=20, the other two not until q>40). It costs
-        // ~8% encode and ~15% decode throughput, which the bitrate buys back several times over
-        // at low rates — and low rate is where MEAS-1 measured GNC furthest behind.
+        // rANS at q<=20, Rice above.
+        //
+        // Re-measured on one commit by ENT-2 (2026-09-07), four stills, equal q verified to decode
+        // to the same picture, so the rate comparison is exact rather than a BD-rate estimate.
+        // rANS against Rice, negative meaning rANS is smaller:
+        //
+        //   q=10  −6.4% mean   q=15  −7.1%   q=20  −6.7%   |   q=25  +0.4%   q=40/55  +0.1%
+        //
+        // So the cutoff earns its place on the mean, but the spread is −11.2% to +11.1%:
+        // kristensara *regresses* at every point below q=25, and at q=5 the mean collapses to
+        // −0.5%. The earlier justification for this line ("5-19% smaller at q<=20", TUNE-3) is not
+        // reproducible; it is a bet that pays on three of four images, which is still the right bet
+        // at these rates.
+        //
+        // Why the cutoff sits here rather than anywhere else: it is where `default_levels` below
+        // goes from 4 to 5. Every image jumps in the same direction across that boundary, because
+        // rANS pays a frequency table per subband group while Rice adapts its k per subband almost
+        // for free — rANS's advantage is an advantage *at 4 levels*. **The two constants must move
+        // together if either moves.**
+        //
+        // Throughput is not re-measured here: TUNE-3's ~8% encode / ~15% decode penalty for rANS
+        // stands as the only figure, and COORDINATION rule 1 forbids timing under session load.
         //
         // Only 4:4:4: the rANS GPU path assumes all three planes share the luma tile layout.
         // `normalize_for_chroma` falls back to Rice for subsampled formats.

@@ -145,28 +145,36 @@ Downloads representative broadcast frames from [Xiph.org](https://media.xiph.org
 
 GNC has five entropy coding backends, all decoding as GPU compute shaders:
 
-| Coder | Streams/tile | Coding | Speed | Patent risk |
-|-------|-------------|--------|-------|-------------|
-| **Rice+ZRL** (default) | 256 | Golomb-Rice + zero-run | **1.5–2× faster** | None |
-| rANS (`--rans`) | 32 | Range asymmetric numeral systems | Baseline | Possible (MS patent) |
-| Huffman (parked) | 256 | 64-symbol + escape | Moderate | None |
-| Bitplane (parked) | Per-block | Sign + magnitude bitplanes | Moderate | None |
-| abac (`--abac`) | 1 per 64px code-block | Adaptive binary arithmetic, context-modelled | **~0.6×** | None known |
+| Coder | Streams/tile | Coding | Rate vs Rice | Decode vs Rice | Patent risk |
+|-------|-------------|--------|--------------|----------------|-------------|
+| **Rice+ZRL** (default above q=20) | 256 | Golomb-Rice + zero-run | — | — | None |
+| rANS (`--rans`, default at q≤20) | 32 | Range asymmetric numeral systems | −6.4% at q=10, +0.4% at q=25; cannot encode above q≈76 | ~1.15× (TUNE-3, not re-measured) | Possible (MS patent) |
+| abac (`--abac`) | 1 per 64px code-block | Adaptive binary arithmetic, context-modelled | −16.6% to −18.8% at q=50–90 | **1.69×** (idle-machine bench) | None known |
+| Huffman (parked) | 256 | 64-symbol + escape | not measured | not measured | None |
+| Bitplane (parked) | Per-block | Sign + magnitude bitplanes | not measured | not measured | None |
 
-*No compression column: **the coders have never been measured against each other on one commit.**
-The figures that stood here (Rice 4.01 bpp, rANS 4.22 bpp @ q=75) were taken at an operating point
-that no longer exists — q=75 has since moved from 42.17 dB / 3.83 bpp to 44.84 dB / 4.53 bpp with
-uniform weights and 5 levels — and GP17 (Rice-coded stream-length tables) shrank Rice's headers at
-bit-identical output without touching rANS. Quoting 4.53 against 4.22 would compare three changes
-at once. Rice is expected to still win, and by more than before, since header overhead scales with
-stream count and Rice runs 256 streams to rANS's 32 — but that is a prediction, not a measurement.
-[BASELINE.md](BASELINE.md) carries Rice only.*
+*Rate column measured by ENT-2 (2026-09-07) on four stills at one commit, mean across images,
+negative meaning rANS is smaller. Entropy coding is lossless and both coders quantise identically,
+so equal q decodes to the same picture — verified, 0 of 40 points differ in PSNR — which makes this
+an exact rate comparison rather than a BD-rate estimate. **The mean hides the spread**: at q=25 the
+same setting runs from −3.5% (touchdown) to +8.2% (kristensara), so which coder wins is
+content-dependent at every quality point. rANS overflows a fixed 4 KB per-stream buffer above
+q≈76 (BUG-9), which is below the contribution operating point. Full ladder in
+[RESEARCH_LOG.md](RESEARCH_LOG.md); [BASELINE.md](BASELINE.md) remains Rice-only and is the single
+source for absolute figures.*
 
-Rice is the default because it eliminates the sequential state chain that limits rANS. Each of the 256 streams encodes independently — no shared state, no synchronization, minimal shared memory (< 1 KB vs rANS's 16 KB frequency tables). rANS, Huffman, and Bitplane are available but parked — they'll be revisited once speed targets are met.
+*The Decode column carries only figures someone actually timed, and says which run they came
+from. The "1.5–2× faster" that stood here for Rice was neither: it contradicted the only throughput
+figure in the repository — TUNE-3 measured rANS at ~8% encode and ~15% decode behind Rice, not
+50–100% — so it is removed rather than corrected. abac's 1.69× is from an idle-machine bench;
+rANS's ~1.15× is TUNE-3's and was **not** re-measured, because up to eight sessions share this M1
+and COORDINATION rule 1 forbids timing under load.*
 
-**abac is the exception to the "never measured against each other" note above**, because it does
-not need a BD-rate to be compared: entropy coding is lossless, so abac and Rice decode to the
-*identical picture* and the only difference is file size. Measured 2026-09-07 through the real
+Rice is the default because it eliminates the sequential state chain that limits rANS. Each of the 256 streams encodes independently — no shared state, no synchronization, minimal shared memory (< 1 KB vs rANS's 16 KB frequency tables). That is a GPU-parallelism argument, and the rate figures above no longer argue against it: level with rANS where Rice is selected, and rANS keeps the range below q=20 where it is 6–7% smaller. Huffman and Bitplane are available but parked.
+
+**abac needs no BD-rate either**, for the same reason the rANS column above is exact: entropy
+coding is lossless, so abac and Rice decode to the *identical picture* and the only difference is
+file size. Measured 2026-09-07 through the real
 bitstream on bbb, blue_sky, kristensara and touchdown — encode to a file, decode on the GPU,
 pixels compared:
 

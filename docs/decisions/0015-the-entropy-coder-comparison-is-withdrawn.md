@@ -1,7 +1,10 @@
 # 0015 — The Rice-vs-rANS compression comparison is withdrawn, not updated
 
 **Date:** 2026-09-06
-**Status:** Accepted (ENT-2 opened to re-measure; the default is unaffected)
+**Status:** Accepted, but **its prediction was falsified** — ENT-2 measured the coders level
+above q=25 and rANS 6–7% ahead below q=20. See
+[0018](0018-the-entropy-coders-are-level-and-0015s-prediction-was-wrong.md). The withdrawal
+itself stands, and the default is unaffected.
 
 ## The decision
 

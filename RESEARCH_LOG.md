@@ -8984,3 +8984,140 @@ whether abac is *good* on inter: the contexts were tuned on intra coefficients a
 statistics differ. The test prints −28.2% on its own content, and that figure is worth nothing —
 it is a synthetic image translated by a few pixels, so the residual is far cleaner than any real
 motion. A real inter number needs real sequences and is the obvious next item on this row.
+## 2026-09-07 — ENT-2: Rice against rANS on one commit, with the coder read out of the bitstream
+
+Decision record 0015 withdrew the README's Rice-vs-rANS compression column and recorded a
+falsifiable prediction in its place: *"Rice still wins, and by more than 4.01 vs 4.22 suggested,
+because header overhead scales with stream count and Rice runs 256 streams per tile to rANS's 32."*
+
+**The prediction is wrong.** Above q=25 the two coders are level on the mean, and below q=20 rANS
+is 6–7% smaller. What is real is the *spread*: which coder wins is content-dependent at every
+quality point measured, and on one image it reverses.
+
+### Setup, stated so it can be repeated
+
+Worktree `../gnc-ent2` pinned; binary built at `c0dd27f`, and **no file under `src/` changed
+between `c0dd27f` and `edf56bc`** (verified with `git diff --name-only -- src/`). Between writing
+this up and committing it, the abac session landed a fifth coder and bitstream generation GP18 —
+which touches `src/` but neither coder measured here: a Rice or rANS file differs only in its four
+magic bytes, so the byte counts are unchanged. **Spot-checked rather than assumed** (below), so the
+figures apply to the commit this entry lands in. Harness `scripts/ent2_rice_vs_rans.py`, four stills copied into
+`frames_pinned/` with SHA-256 recorded there — COORDINATION's "a number is only valid against a
+known input" rule, after another session's refetch overwrote an image under a measurement.
+Machine load 21–53 throughout (four other sessions building): irrelevant here, because every
+figure below is a byte count or a PSNR, and **no throughput number is quoted or was taken.**
+
+### Three controls, because the measurement is worth more than the result
+
+- **Which coder actually ran, read from the file rather than from the flag.** `entropy_type` is a
+  u32 in the GP17 frame header; the harness walks the header and reads it. **40 of 40 points carry
+  the coder that was requested** (`Rice` / `rANS-subband`), 0 mismatches. This was not a formality:
+  BACKLOG's BUG-9 entry records `--rans` as *"a no-op flag kept for backward compatibility"*, and if
+  that were true every row here would be Rice against Rice. It is not true — `src/main.rs:1018`
+  sets `EntropyCoder::Rans`, `encode` defaults to 4:4:4 so `normalize_for_chroma()` does not revert
+  it, and `normalize_for_entropy_group_limit()` only touches Huffman. What *is* stale is the flag's
+  own `--help` text, which still calls rANS the default.
+- **Equal q is equal picture, verified rather than assumed.** Entropy coding is lossless and both
+  coders quantise identically, so the same q must decode to the same image. **0 of 40 points differ
+  in Y-PSNR between the coders** (identical to the two decimals printed, and to f64 within 5e-3).
+  So bpp is directly comparable and no BD-rate integration is needed — this comparison is exact,
+  not an estimate.
+- **Reproduced, twice, the second time across a bitstream generation.** Six points re-run in a
+  second process: **0 byte-count differences.** Then, after GP18 and the abac coder landed under a
+  rebase, four points re-run on a rebuilt binary: bbb q=15/70 and touchdown q=15/70 read
+  1.1129 / 0.9973 and 4.1307 / 4.1868, 0.6434 / 0.5719 and 3.5860 / 3.3863 — **identical to four
+  decimals** (`results/ent2_postabac_spotcheck.csv`). So the new coder and the new magic bytes cost
+  neither of the measured coders a byte, which was the other session's claim and is now also a
+  measurement. Determinism confirmed: a 0.5% delta here is signal, not noise.
+
+### rANS against Rice, bpp, negative means rANS is smaller
+
+| q | bbb_1080p | blue_sky_1080p | kristensara_720p | touchdown_1080p | mean |
+|---|---|---|---|---|---|
+| 5 | −9.0% | −0.8% | **+11.1%** | −3.5% | −0.5% |
+| 10 | −11.1% | −7.3% | **+3.1%** | −10.4% | **−6.4%** |
+| 15 | −10.4% | −7.4% | **+0.6%** | −11.1% | **−7.1%** |
+| 20 | −9.0% | −7.4% | **+0.8%** | −11.2% | **−6.7%** |
+| 25 | −3.3% | +0.1% | **+8.2%** | −3.5% | +0.4% |
+| 40 | −0.9% | +1.3% | **+5.3%** | −5.4% | +0.1% |
+| 55 | +0.5% | +1.6% | **+4.1%** | −5.9% | +0.1% |
+| 70 | +1.4% | +1.8% | −0.1% | −5.6% | −0.6% |
+| ≥77 | crash | crash | crash | crash | — |
+
+Raw bpp, Rice / rANS, for the two ends of the ladder and the crossover:
+
+| image | q=15 | q=20 | q=25 | q=70 |
+|---|---|---|---|---|
+| bbb_1080p | 1.1129 / 0.9973 | 1.3548 / 1.2333 | 1.6032 / 1.5510 | 4.1307 / 4.1868 |
+| blue_sky_1080p | 0.7828 / 0.7251 | 0.9555 / 0.8847 | 1.1174 / 1.1182 | 3.2998 / 3.3577 |
+| kristensara_720p | 0.5280 / 0.5309 | 0.6127 / 0.6174 | 0.6795 / 0.7354 | 2.2194 / 2.2163 |
+| touchdown_1080p | 0.6434 / 0.5719 | 0.7881 / 0.6997 | 0.9305 / 0.8976 | 3.5860 / 3.3863 |
+
+Full ladder including RGB PSNR in `results/ent2_rice_vs_rans.csv`; the repeat in
+`results/ent2_repeat.csv`.
+
+### What the numbers say
+
+**1. The q≤20 default is justified, but not by the figure that justifies it.** `quality_preset`
+selects rANS at q≤20 and cites TUNE-3's *"5–19% smaller at q≤20"*. Measured on one commit after
+ENT-1: the mean is **−6.4% to −7.1%** at q=10–20, so the default earns its place — but the range is
+**−11.2% to +11.1%**, not 5–19% smaller, because **kristensara regresses at every point below
+q=25** and at q=5 the mean collapses to −0.5%. The default is a bet that pays on three of four
+images. It is the right bet at these rates; the recorded justification overstates it and hides the
+losing case.
+
+**2. Above q=25 the coders are level, and the ordering is content-dependent.** Mean +0.4 / +0.1 /
++0.1 / −0.6% at q=25/40/55/70, with the spread running from −5.9% (touchdown) to +8.2%
+(kristensara) on the *same* commit and the *same* quality. This reproduces the **conclusion** of the
+2026-09-06 re-sweep — do not move the crossover — while not reproducing its **numbers** (it read
+−1.7% to −1.9% on the mean). That entry measured padding-neutral crops; this one measures whole
+frames with hashes recorded. Two harnesses, same verdict, different magnitudes: quote the setup,
+not just the delta.
+
+**3. The discontinuity is the wavelet-level rule, and it lands exactly on the crossover.** Every
+image jumps in the same direction between q=20 and q=25 — bbb −9.0 → −3.3, blue_sky −7.4 → +0.1,
+kristensara +0.8 → +8.2, touchdown −11.2 → −3.5 — which is where `quality_preset` goes from 4
+decomposition levels to 5. More levels means more subbands, and rANS pays a frequency table per
+subband group while Rice adapts its k per subband almost for free. So rANS's advantage is an
+advantage *at 4 levels*, and the preset's own comment already notes that the 5th level's deep
+subbands are pure overhead below q=25. **The crossover at q=20 is not an arbitrary constant: it is
+where the transform changes shape.** That is a better reason for it than the one recorded, and it
+means the two settings must move together if either moves.
+
+**4. rANS's ceiling is lower than BUG-9 records, and it is content-dependent.** BUG-9 says bbb
+survives q=78 and fails at q=80. Measured: **q=75 encodes on all four images, q=77 fails on all
+four**, and q=76 splits — bbb and touchdown encode, blue_sky and kristensara do not. The panic is
+the one BUG-9 diagnoses, with two details corrected: `rANS stream 32 overflowed its 4096-byte
+output slot (write_ptr=4294963584)` — stream **32**, not 320, and 4294963584 = 2³² − 3712, so the
+overrun is 3712 bytes. BUG-9 is claimed by another session as a code fix; **the entry's text is
+left to its owner** and these thresholds were handed over directly. When that guard lands, the
+q≥77 row above becomes a statement about `edf56bc`, not a property of the coder.
+
+**Reported by that session while this was being written, and not verified here:** their fix leaves
+encoder output byte-identical (36/36 md5 matches over four images × q=1..100) and changes only the
+failure mode — a clean refusal naming the overflowing streams, rather than a wrapped-pointer panic.
+If that holds, **no rate in this entry moves**; the q≥77 rows become "refused" rather than "crash",
+and rANS's honest ladder still stops below the contribution operating point, because they are
+deliberately not adding runtime buffer sizing.
+
+**5. A harness bug worth recording, because it produced four confident empty rows.** The first run
+reported the q≥80 failures as `note: run with RUST_BACKTRACE=1` — it took the last non-empty stderr
+line, which for a Rust panic is the backtrace note. The fix reads the line *after* the
+`thread '…' panicked at …` header, because the panic header carries the location and the next line
+carries the reason. LOOP.md's "suspect the measurement before the codec" applies to the error path
+too: the run had already found the real threshold and was throwing the evidence away.
+
+### Would we ship anything?
+
+**No default changes, and the comparison no longer contradicts the default.** Rice stays the coder
+above q=20 for the reason 0015 gives — 256 independent streams, no sequential state chain, <1 KB of
+shared memory against rANS's 16 KB of tables — and the rate figure that used to be quoted against
+it (4.01 vs 4.22) is now measured at level. rANS stays at q≤20, where it wins 6–7% on the mean.
+What ships is documentation: the `--help` text in five subcommands, the README's Entropy Coders
+table, the preset comment's justification, and 0015's falsified prediction.
+
+**What ENT-2 does not answer:** the throughput half. TUNE-3's ~8% encode / ~15% decode penalty for
+rANS is quoted, not re-measured — four sessions were building on this machine and COORDINATION
+rule 1 forbids timing under load. The README's "1.5–2× faster" for Rice is inconsistent with
+TUNE-3's own 15% and is not supported by anything in the repository; it is removed rather than
+replaced, and re-timing it on an idle machine is filed as the remaining piece.

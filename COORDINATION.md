@@ -392,6 +392,32 @@ on the coefficients at q≤30 and at subsampled chroma. Unclaimed, on the defaul
 **Note on numbering:** BUG-11 was assigned twice on 2026-09-06 (Rice tile width, and intra
   prediction). The intra one has been renumbered **BUG-13**. Check this file before taking a number.
 
+**ENT-2 — the entropy coders are measured against each other on one commit, and the answer is
+"level". Invalidates no measurement; corrects four documents.** rANS against Rice, mean of four
+stills, negative meaning rANS is smaller: **−6.4% at q=10, −7.1% at q=15, −6.7% at q=20, then
++0.4% at q=25 and +0.1% at q=40/55**. Above q=25 they are level and *which* coder wins is
+content-dependent (−5.9% touchdown to +8.2% kristensara at the same setting). **No default moves**;
+decision record 0018 records why, and 0015's prediction that "Rice still wins, and by more" is
+falsified.
+
+Four things to carry:
+
+- **`--rans` is not a no-op**, contrary to BUG-9's entry — only the flag's `--help` text was stale,
+  and that text (in five subcommands) called rANS the default and Rice "~30% worse compression".
+  Verified at bitstream level: the harness parses `entropy_type` out of the GP17 header rather than
+  trusting the flag, 40/40 points correct. **If a measurement of yours picked a coder with that
+  flag, it did take effect.**
+- **rANS's ceiling is q=75, not q=78.** q=75 encodes on all four images, q=77 on none, q=76 splits
+  by content. The panic names stream **32** and a 3712-byte overrun, not stream 320. Handed to the
+  BUG-9 owner; they report their fix is byte-identical on output (36/36 md5) and changes only the
+  failure mode, so **no ENT-2 rate moves** — the q≥77 rows become a clean refusal rather than a
+  crash, and rANS still stops below the operating point by design.
+- **The q=20 coder cutoff and the 4→5 wavelet-level rule are coupled.** Every image's delta jumps
+  in the same direction across q=25, because rANS pays a frequency table per subband group. Change
+  one constant and the other is wrong.
+- **The README's "1.5–2× faster" for Rice is gone, not corrected.** It contradicted TUNE-3's own
+  ~15% by 3–6x, and re-timing needs an idle machine. That run is the one piece of ENT-2 left open.
+
 Newest first. If you have measurements taken before one of these, they are suspect.
 
 - **For the abac track, a result you did not ask for.** The `GNC_ABAC_COMPARE=1` harness was gated

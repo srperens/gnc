@@ -344,6 +344,12 @@ q=70, but that is touchdown at −7.8% pulling three flat ones, kristensara regr
 everywhere, rANS costs ~15% decode (TUNE-3), and it crashes on every image from q=80 up (BUG-9).
 A content bet that is slower and cannot run at the operating point is not a new default.
 
+**Re-measured by ENT-2 (2026-09-07) on whole frames rather than padding-neutral crops: same
+verdict, different magnitudes.** The mean at q=25/40/55/70 reads +0.4 / +0.1 / +0.1 / −0.6% rather
+than −1.5 / −1.4 / −1.5 / −1.9%, and the overflow starts at **q=77, not q=80**. Two harnesses
+agreeing on the conclusion while disagreeing on the numbers is the reason to quote the setup and
+not just the delta.
+
 **Original follow-up text:** rANS is pinned to q ≤ 20 because Rice
 measured better above it. With the tables packed, rANS at q=70 is level with Rice on bbb, ahead on
 blue_sky (3.04 vs 3.07) and touchdown (3.18 vs 3.45), and 1% behind on kristensara — where it used
@@ -1740,8 +1746,10 @@ Also fixed: subsampled chroma combined with rANS/Huffman/Bitplane panicked in th
 legal configuration should degrade, not abort; `CodecConfig::normalize_for_chroma()` falls back to
 Rice.
 
-**Follow-up:** the `--rice` CLI help says Rice is "~30% worse compression". Measured, Rice is
-*better* above q≈25 and by 8-12% at q=70. Text needs correcting.
+**Follow-up (done by ENT-2, 2026-09-07):** the `--rice` CLI help said Rice is "~30% worse
+compression"; the text is corrected in five subcommands. Note this entry's own figure — "Rice is
+better above q≈25 and by 8-12% at q=70" — did not survive re-measurement either: after ENT-1 the
+two coders are level above q=25 (mean +0.1%), and Rice is 6-7% *larger* at q<=20.
 
 ### TUNE-2 — Wavelet levels default (**DONE 2026-09-05**)
 The quality preset used 3 levels below q=50. Measured 5-17% worse bitrate at equal or better
@@ -1939,23 +1947,49 @@ subsampling alone, which is larger than any coding difference in the comparison.
 VC-2 and JPEG 2000 remain as the other arms; note the ffmpeg VC-2 encoder saturates at 41-43 dB
 regardless of rate, so it cannot be quoted as a statement about SMPTE VC-2 (see RESEARCH_LOG).
 
-### ENT-2 — Rice vs rANS on one commit (todo, P2)
+### ENT-2 — Rice vs rANS on one commit (**DONE 2026-09-07**)
 
-**The entropy coders have never been compared on a single commit.** The README carried Rice
-4.01 bpp against rANS 4.22 bpp @ q=75 until 2026-09-06; that pair was taken at an operating point
-that no longer exists — q=75 has moved from 42.17 dB / 3.83 bpp to 44.84 dB / 4.53 bpp with uniform
-weights and 5 levels — and GP17 (Rice-coded stream-length tables) shrank Rice's headers at
-bit-identical output without touching rANS. Quoting today's 4.53 against that 4.22 would compare
-three changes at once, so the compression column is gone from the README and BASELINE.md carries
-Rice only.
+Measured, four stills, one commit (`c0dd27f`; no `src/` change through `edf56bc`). Harness
+`scripts/ent2_rice_vs_rans.py`, images pinned with SHA-256 in `frames_pinned/`. rANS against Rice,
+negative meaning rANS is smaller:
 
-**Measure both coders on one commit, at q=25/50/75/90, on ≥3 sequences.** Rice is expected to still
-win and by more than before — header overhead scales with stream count and Rice runs 256 streams to
-rANS's 32 — but that is a prediction. Watch BUG-9: rANS overflows its per-stream buffer at fine
-quantiser steps, so q=90 may not complete.
+| q | bbb | blue_sky | kristensara | touchdown | mean |
+|---|---|---|---|---|---|
+| 5 | −9.0% | −0.8% | +11.1% | −3.5% | −0.5% |
+| 10 | −11.1% | −7.3% | +3.1% | −10.4% | **−6.4%** |
+| 15 | −10.4% | −7.4% | +0.6% | −11.1% | **−7.1%** |
+| 20 | −9.0% | −7.4% | +0.8% | −11.2% | **−6.7%** |
+| 25 | −3.3% | +0.1% | +8.2% | −3.5% | +0.4% |
+| 40 | −0.9% | +1.3% | +5.3% | −5.4% | +0.1% |
+| 55 | +0.5% | +1.6% | +4.1% | −5.9% | +0.1% |
+| 70 | +1.4% | +1.8% | −0.1% | −5.6% | −0.6% |
+| ≥77 | crash | crash | crash | crash | — |
 
-This is a documentation-integrity item, not a performance one: the default is Rice for the
-sequential-state-chain reason, which no bpp figure changes.
+**The prediction in decision record 0015 is falsified.** It said Rice still wins and by more than
+the withdrawn 4.01-vs-4.22 pair suggested. Above q=25 the coders are level on the mean; below q=20
+rANS is 6–7% smaller. Decision record 0018 records the correction.
+
+**No default moves.** Rice stays above q=20 on the parallelism argument, which no rate figure was
+ever going to change; rANS stays at q≤20, where the mean supports it. What changed is the
+documentation: the `--help` text in five subcommands (it called rANS the default and Rice "~30%
+worse compression"), the README's Entropy Coders table (rate column restored, unsupported
+"1.5–2× faster" removed), and `quality_preset`'s justification comment.
+
+Three findings worth carrying:
+
+- **`--rans` is not a no-op.** BUG-9's entry records it as one. `src/main.rs:1018` sets
+  `EntropyCoder::Rans`, `encode` defaults to 4:4:4 so `normalize_for_chroma()` does not revert it,
+  and the harness confirms it at bitstream level — it parses `entropy_type` out of the GP17 header,
+  and 40 of 40 points carry the requested coder. Only the flag's help text was stale.
+- **The q=20 cutoff is where `default_levels` goes 4 → 5**, and every image jumps in the same
+  direction across it. rANS pays a frequency table per subband group; Rice adapts k per subband
+  nearly free. The two constants must move together if either moves.
+- **rANS's ceiling is q=75, not q=78.** q=75 encodes on all four images, q=77 fails on all four,
+  q=76 splits by content. Handed to the BUG-9 owner; that entry's text is theirs to correct.
+
+**Left open: the throughput half.** TUNE-3's ~8% encode / ~15% decode is quoted, not re-measured —
+COORDINATION rule 1 forbids timing while other sessions build. Worth one idle-machine run, which
+would also settle whether the removed "1.5–2×" was ever true.
 
 ## Noted — revisit only if conditions change
 

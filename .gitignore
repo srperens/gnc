@@ -33,3 +33,10 @@ __pycache__/
 .venv/
 examples/web/*.log
 examples/web/demos.json
+
+# Pinned measurement inputs. A session copies the frames it measures on into its own worktree so
+# another session's refetch cannot change them mid-run (COORDINATION, "record their hashes"). The
+# images are test material and stay out of git; the hash list beside them is the record, and does
+# not.
+frames_pinned/*
+!frames_pinned/SHA256SUMS

@@ -2155,6 +2155,68 @@ independently.
 Note JPEG XS is patented (GOALS, docs/POSITIONING.md) — this is a comparison, not a target to
 adopt.
 
+### ENT-4 — Re-run MEAS-9 with `--abac` (todo, P1, cheapest item on this list)
+
+**One flag on the GNC arm, ~25 minutes, and it replaces an extrapolation with a measurement.**
+MEAS-9 found that JPEG 2000 in irreversible 9/7 mode — GNC's own transform at GNC's own depth —
+needs **54.2% fewer bits on RGB PSNR and 79.7% on Y-PSNR**. ABAC-SHIP measured abac at −17.3% at
+q=90, and RESEARCH_LOG currently says that is "about a third of the gap". **That third is an
+extrapolation from a single quality point, not a BD-rate**, and it is the number the entropy-coding
+priority rests on. Measure it:
+
+```bash
+"$(git rev-parse --show-toplevel)/.venv/bin/python" scripts/meas9_contribution.py \
+    --images test_material/frames/{bbb_1080p,blue_sky_1080p,kristensara_720p,touchdown_1080p}.png \
+    --arms gnc,jpegxs,prores444,j2k --csv meas9_abac.csv
+```
+
+The GNC arm needs `--abac` added to its `encode` invocation in `arm_gnc()` — a two-line change, or
+an `--gnc-extra-args` option if it should be selectable. Everything else is already in place: the
+harness validates itself (`--selftest`), the incumbent arms are deterministic and their published
+rows can be reused, and the ceilings and canaries are unchanged.
+
+**Success criteria, stated in advance.** abac is *lossless* re-coding of the same coefficients, so
+pixels must be identical to the Rice run at every q — check that first, because if quality moves at
+all the arm is measuring something other than the entropy coder. Then the BD-rate against J2K 9/7
+should fall from +54.2% by roughly the measured rate saving. If it falls by much less, the −17.3%
+does not hold across the ladder; if by much more, suspect the harness before celebrating.
+
+**Why it matters beyond one number:** it says how much of the intra gap is entropy coding and how
+much is left for coefficient modelling, which is the difference between "keep going down this road"
+and "the remaining gap is somewhere else". Decision 0018 makes that the leading question, since
+entropy coding is the one lever that pays on intra, inter, lossless and every chroma format at
+once.
+
+### ENT-3 — Does abac pay on inter residuals? (todo, P1, claimed and released unmeasured 2026-09-07)
+
+**The inter half of the entropy question, which ABAC-SHIP explicitly left out of scope** ("intra
+only; inter is out of scope for this row"). Nothing has been measured. Claimed at the end of the
+2026-09-07 session and released without a single number, so this entry is the hypothesis, not a
+result.
+
+**The question:** abac against Rice on **P-frame residual coefficients**, same pixels, same GOP
+structure, at q=75 and q=90 on ≥3 sequences. `GNC_ABAC_COMPARE=1` already reports rate on real
+coefficients and was widened to see non-wavelet paths, so the instrument may need little work.
+
+**Expect a smaller number than intra's −17%, and treat that as an answer rather than a
+disappointment.** After motion compensation the residual is noise-like at high quality (Girod), so
+there is less statistical structure for a context-adaptive coder to exploit than in an intra
+subband. Two outcomes, both useful:
+
+- **It pays comparably.** Then entropy coding is the whole entropy story, intra and inter, and the
+  case for it is stronger than MEAS-9 alone makes it.
+- **It pays much less.** Then the inter gap against H.264 lives in the *motion model* — subpel,
+  block partitioning, OBMC — and not in the coder. That contradicts the standing assumption that
+  entropy coding is the biggest inter gap, which is worth knowing before more effort goes there.
+
+**Do not skip the domain declaration.** State whether the measurement operates on quantised
+wavelet coefficients of the motion-compensated residual, or on something else, and check that the
+implementation matches — five conclusions in this repo turned on that exact question.
+
+Note the 2026-09-06 finding that inter breaks even at contribution quality is correct *at that
+operating point* and must not be read as "inter does not matter": under decision 0018 inter has to
+work across the whole range, and the low end is where inter earns its keep.
+
 ### ENT-2 — Rice vs rANS on one commit (**DONE 2026-09-07**)
 
 Measured, four stills, one commit (`c0dd27f`; no `src/` change through `edf56bc`). Harness

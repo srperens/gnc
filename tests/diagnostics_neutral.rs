@@ -53,7 +53,7 @@ fn encode_all(diagnostics: bool, w: u32, h: u32, n: usize) -> Vec<u8> {
     let frames = encoder.encode_sequence_streaming(
         ctx,
         n,
-        |i| synth_frame(i, w, h),
+        |i| std::sync::Arc::new(synth_frame(i, w, h)),
         w,
         h,
         &config,

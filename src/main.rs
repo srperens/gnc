@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+use std::sync::Arc;
+
 use clap::{Parser, Subcommand};
 use gnc::bench::bdrate;
 use gnc::bench::codec_compare;
@@ -942,7 +944,9 @@ fn build_ip_config(
 /// window are freed; frames past EOF repeat the last valid frame.
 struct StreamingY4m {
     reader: Y4mReader,
-    cache: Vec<Option<Vec<f32>>>,
+    /// `Arc` because the encoder asks for the same index more than once and a 1080p RGB f32
+    /// frame is 24.9 MB — a cache hit used to be a memcpy of all of it (PERF-1).
+    cache: Vec<Option<Arc<Vec<f32>>>>,
     next_pos: usize,
     released_up_to: usize,
     ki_window: usize,
@@ -953,11 +957,11 @@ struct StreamingY4m {
 }
 
 impl StreamingY4m {
-    fn load(&mut self, i: usize) -> Vec<f32> {
+    fn load(&mut self, i: usize) -> Arc<Vec<f32>> {
         // Advance reader to cover frame i
         while self.next_pos <= i && self.next_pos < self.frame_count {
             if let Some(rgb) = self.reader.read_frame_rgb() {
-                self.cache[self.next_pos] = Some(rgb);
+                self.cache[self.next_pos] = Some(Arc::new(rgb));
                 self.next_pos += 1;
             } else {
                 // Y4M EOF: record where the file ended
@@ -3184,7 +3188,7 @@ fn main() {
                         w,
                         h
                     );
-                    rgb
+                    Arc::new(rgb)
                 },
                 w,
                 h,

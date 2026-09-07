@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use wgpu;
 
 use super::adaptive::{self, AQ_LL_BLOCK_SIZE};
@@ -16,6 +18,68 @@ use crate::{
     ChromaFormat, CodecConfig, CompressedFrame, EntropyData, FrameInfo, FrameType, GpuContext,
     MotionField, TemporalEncodedSequence, TemporalGroup, TemporalTransform,
 };
+
+/// Number of decoded frames `FrameSource` keeps.
+///
+/// Two is what the access pattern needs and no more: the look-ahead loads `i + 1` while
+/// encoding `i`, and scene-cut detection re-reads `i` right after loading it for the MAD.
+/// A third slot would buy nothing and cost 24.9 MB at 1080p.
+const FRAME_CACHE_SLOTS: usize = 2;
+
+/// The one place `encode_sequence_streaming` gets pixels from.
+///
+/// Frames used to be pulled straight from the caller's closure, and the same display index
+/// was pulled two or three times: once for the scene-cut MAD, once to encode, once as the
+/// next frame's look-ahead. On the PNG path that closure is a full image decode, so the
+/// duplicates were not bookkeeping — they were the largest host-side cost in the encoder.
+///
+/// `load_frame(i)` is a pure function of `i` on every path that exists (PNG decode, Y4M
+/// cache), so a small most-recently-used cache is sound and needs no invalidation.
+struct FrameSource<F: FnMut(usize) -> Arc<Vec<f32>>> {
+    load: F,
+    /// Most-recently-used first.
+    cache: Vec<(usize, Arc<Vec<f32>>)>,
+    requests: usize,
+    loads: usize,
+}
+
+impl<F: FnMut(usize) -> Arc<Vec<f32>>> FrameSource<F> {
+    fn new(load: F) -> Self {
+        FrameSource { load, cache: Vec::with_capacity(FRAME_CACHE_SLOTS), requests: 0, loads: 0 }
+    }
+
+    /// Pixels for display index `i`, from the cache when they are already here.
+    fn get(&mut self, i: usize) -> Arc<Vec<f32>> {
+        self.requests += 1;
+        if let Some(pos) = self.cache.iter().position(|(idx, _)| *idx == i) {
+            let hit = self.cache.remove(pos);
+            let frame = Arc::clone(&hit.1);
+            self.cache.insert(0, hit);
+            return frame;
+        }
+        self.loads += 1;
+        let frame = (self.load)(i);
+        self.cache.insert(0, (i, Arc::clone(&frame)));
+        self.cache.truncate(FRAME_CACHE_SLOTS);
+        frame
+    }
+
+    /// Canary for PERF-1: the point of this type is that `loads` tracks the number of
+    /// display indices, not the number of requests. Measured before the cache existed:
+    /// 2.62 requests per display index, every one of them a decode.
+    fn report(&self, n: usize) {
+        if std::env::var("GNC_PROFILE").is_ok() {
+            eprintln!(
+                "[frame_source] {} loads for {} display indices ({:.2} per frame), \
+                 {} requests served",
+                self.loads,
+                n,
+                self.loads as f64 / n.max(1) as f64,
+                self.requests
+            );
+        }
+    }
+}
 
 /// Default frame rate assumed when rate control is active but no explicit fps is set.
 const DEFAULT_FPS: f64 = 30.0;
@@ -139,7 +203,7 @@ impl EncoderPipeline {
         self.encode_sequence_streaming(
             ctx,
             frames.len(),
-            |i| frames[i].to_vec(),
+            |i| Arc::new(frames[i].to_vec()),
             width,
             height,
             config,
@@ -155,12 +219,14 @@ impl EncoderPipeline {
         &mut self,
         ctx: &GpuContext,
         frame_count: usize,
-        mut load_frame: impl FnMut(usize) -> Vec<f32>,
+        load_frame: impl FnMut(usize) -> Arc<Vec<f32>>,
         width: u32,
         height: u32,
         config: &CodecConfig,
         fps: f64,
     ) -> Vec<CompressedFrame> {
+        // Every pixel read in this function goes through here; see `FrameSource`.
+        let mut frames = FrameSource::new(load_frame);
         let ki = config.keyframe_interval as usize;
         // Need ki > group_size = B_FRAMES_PER_GROUP + 1 so that at least one full group
         // fits between I-frames (remaining = ki - 1 >= group_size requires ki >= group_size + 1).
@@ -218,8 +284,9 @@ impl EncoderPipeline {
         let diag_enabled = diagnostics::enabled();
         let mut last_iframe_bytes: Option<usize> = None;
 
-        // Scene cut detection: luma of the most recently encoded frame (RGB f32 interleaved).
-        // We store just the R channel (luma proxy) to reduce memory.
+        // Scene cut detection: a `luma_proxy` of the most recently encoded frame — the R
+        // channel of every 4th pixel, which is exactly what the MAD reads. The comment used
+        // to say this while the code kept the whole interleaved RGB frame (PERF-1).
         // Populated after every encoded frame; used to compute MAD before the next frame.
         let mut prev_frame_luma: Option<Vec<f32>> = None;
 
@@ -250,9 +317,10 @@ impl EncoderPipeline {
         // (B-frame groups use a different submit pattern).
         let mut pending_me: Option<PrecomputedPFrameME> = None;
 
-        // Cached frame pixels loaded during scene cut detection; reused so we don't
-        // call load_frame(display_idx) twice when a cut is detected.
-        let mut preloaded_frame: Option<Vec<f32>> = None;
+        // Set by the B-frame scan when it has already identified `display_idx` as a cut, so
+        // the loop skips the MAD re-check. It carried the pixels too until PERF-1; caching
+        // them is `FrameSource`'s job now, and one owner for the pixels is the point.
+        let mut precut_confirmed = false;
 
         let mut display_idx = 0;
         while display_idx < n {
@@ -270,26 +338,22 @@ impl EncoderPipeline {
                 && ki > 1
                 && display_idx % ki != 0
             {
-                if preloaded_frame.is_some() {
+                if std::mem::take(&mut precut_confirmed) {
                     // Pre-identified by B-frame scan; already a confirmed cut.
                     true
                 } else if let Some(ref prev_luma) = prev_frame_luma {
-                    let frame_data_for_cut = load_frame(display_idx);
-                    let mad = crate::luma_mad(&frame_data_for_cut, prev_luma);
+                    let frame_data_for_cut = frames.get(display_idx);
+                    let mad = crate::luma_proxy_mad(&crate::luma_proxy(&frame_data_for_cut), prev_luma);
                     let is_cut = mad > config.scene_cut_threshold;
-                    if is_cut {
-                        if std::env::var("GNC_DEBUG").is_ok() {
-                            eprintln!(
-                                "[scene_cut] frame {}: MAD={:.1} > threshold={:.1}, forcing I-frame",
-                                display_idx, mad, config.scene_cut_threshold
-                            );
-                        }
-                        // Cache the loaded frame so the keyframe path can reuse it.
-                        preloaded_frame = Some(frame_data_for_cut);
+                    if is_cut && std::env::var("GNC_DEBUG").is_ok() {
+                        eprintln!(
+                            "[scene_cut] frame {}: MAD={:.1} > threshold={:.1}, forcing I-frame",
+                            display_idx, mad, config.scene_cut_threshold
+                        );
                     }
-                    // If not a cut, preloaded_frame remains None — the P/B-frame path
-                    // will call load_frame again. The frame data is not stored to avoid
-                    // holding stale pixels across iterations.
+                    // Cut or not, the pixels stay in `FrameSource` and the encode below is a
+                    // cache hit. This used to drop them on the not-a-cut path and decode the
+                    // frame again — 2.62 loads per display index, measured.
                     is_cut
                 } else {
                     false
@@ -315,7 +379,7 @@ impl EncoderPipeline {
 
             if is_keyframe {
                 let _t_iframe = std::time::Instant::now();
-                let frame_data = preloaded_frame.take().unwrap_or_else(|| load_frame(display_idx));
+                let frame_data = frames.get(display_idx);
                 let mut compressed = self.encode(ctx, &frame_data, width, height, &frame_config);
                 compressed.frame_type = FrameType::Intra;
 
@@ -396,7 +460,7 @@ impl EncoderPipeline {
                     }
                 }
                 if config.scene_cut_threshold > 0.0 {
-                    prev_frame_luma = Some(frame_data);
+                    prev_frame_luma = Some(crate::luma_proxy(&frame_data));
                 }
                 results[display_idx] = Some(compressed);
                 display_idx += 1;
@@ -407,13 +471,13 @@ impl EncoderPipeline {
                 // P-frame only mode — skip local decode if next frame is keyframe or EOSequence
                 let next_is_key_or_end =
                     display_idx + 1 >= n || (ki > 1 && (display_idx + 1) % ki == 0);
-                let frame_data = load_frame(display_idx);
+                let frame_data = frames.get(display_idx);
 
                 // Look-ahead: load next frame's pixels now so encode_pframe can submit
                 // its ME-only command before the poll, hiding Metal sync latency.
                 // Only when next frame is a P-frame (not keyframe, not end of sequence).
-                let next_pframe_pixels: Option<Vec<f32>> = if !next_is_key_or_end {
-                    Some(load_frame(display_idx + 1))
+                let next_pframe_pixels: Option<Arc<Vec<f32>>> = if !next_is_key_or_end {
+                    Some(frames.get(display_idx + 1))
                 } else {
                     None
                 };
@@ -440,7 +504,7 @@ impl EncoderPipeline {
                     } else {
                         pending_me.take()
                     },
-                    next_pframe_pixels.as_deref(),
+                    next_pframe_pixels.as_ref().map(|f| f.as_slice()),
                     // P-only mode: no B-frames between look-ahead and next P-frame,
                     // so preprocess results are safe to cache.
                     true,
@@ -509,7 +573,7 @@ impl EncoderPipeline {
                     }
                 }
                 if config.scene_cut_threshold > 0.0 {
-                    prev_frame_luma = Some(frame_data);
+                    prev_frame_luma = Some(crate::luma_proxy(&frame_data));
                 }
                 results[display_idx] = Some(compressed);
                 display_idx += 1;
@@ -530,8 +594,8 @@ impl EncoderPipeline {
                 // We compare consecutive frames to catch the actual cut boundary.
                 let mut scan_prev = prev_luma.clone();
                 for scan_idx in display_idx..next_key {
-                    let scan_frame = load_frame(scan_idx);
-                    let mad = crate::luma_mad(&scan_frame, &scan_prev);
+                    let scan_proxy = crate::luma_proxy(&frames.get(scan_idx));
+                    let mad = crate::luma_proxy_mad(&scan_proxy, &scan_prev);
                     if mad > config.scene_cut_threshold {
                         if std::env::var("GNC_DEBUG").is_ok() {
                             eprintln!(
@@ -539,12 +603,12 @@ impl EncoderPipeline {
                                 config.scene_cut_threshold
                             );
                         }
-                        // Cache this frame so the next iteration reuses it.
-                        preloaded_frame = Some(scan_frame);
+                        // The pixels are in `FrameSource`; this only says "already decided".
+                        precut_confirmed = true;
                         next_key = scan_idx;
                         break;
                     }
-                    scan_prev = scan_frame;
+                    scan_prev = scan_proxy;
                 }
             }
 
@@ -567,7 +631,7 @@ impl EncoderPipeline {
                 } else {
                     config.clone()
                 };
-                let p_frame_data = load_frame(p_display);
+                let p_frame_data = frames.get(p_display);
 
                 // #49 gate diagnostic: compare per-tile SAD against I₀ (current ref) vs B₄ proxy.
                 // GNC_PYRAMID_REF=1 → load raw source frames for I₀ and B₄ midpoint, compute
@@ -586,8 +650,8 @@ impl EncoderPipeline {
                     let b4_display = i0_display + b_count.div_ceil(2);
 
                     if i0_display < n && b4_display < n {
-                        let i0_data = load_frame(i0_display);
-                        let b4_data = load_frame(b4_display);
+                        let i0_data = frames.get(i0_display);
+                        let b4_data = frames.get(b4_display);
 
                         let tile_sz = config.tile_size as usize;
                         let w = width as usize;
@@ -684,7 +748,7 @@ impl EncoderPipeline {
                     } else {
                         config.clone()
                     };
-                    let b4_frame_data = load_frame(b4_display);
+                    let b4_frame_data = frames.get(b4_display);
                     // Encode B₄ as P-frame (ref=I₀, no temporal MV predictor, no look-ahead).
                     // save_bwd_ref=false: don't overwrite bwd yet (P₈ will do that).
                     // needs_decode=true: update gpu_ref_planes with decoded B₄.
@@ -738,9 +802,9 @@ impl EncoderPipeline {
                 // Look-ahead: pre-compute ME for the NEXT group's anchor P-frame
                 // so it overlaps with this frame's Metal sync latency.
                 let next_anchor_display = group_start + group_size + b_count;
-                let next_anchor_pixels: Option<Vec<f32>> =
+                let next_anchor_pixels: Option<Arc<Vec<f32>>> =
                     if g + 1 < full_groups && next_anchor_display < n {
-                        Some(load_frame(next_anchor_display))
+                        Some(frames.get(next_anchor_display))
                     } else {
                         None
                     };
@@ -763,7 +827,7 @@ impl EncoderPipeline {
                     true,
                     true, // anchor P always needs decode (bwd ref for B-frames)
                     p8_pending_me,
-                    next_anchor_pixels.as_deref(),
+                    next_anchor_pixels.as_ref().map(|f| f.as_slice()),
                     // B-frame mode: B-frames run between look-ahead and next anchor P,
                     // so preprocess results would be overwritten — not safe to cache.
                     false,
@@ -886,7 +950,7 @@ impl EncoderPipeline {
                         cfg.quantization_step = (cfg.quantization_step * l2_qp_scale).min(64.0);
                         cfg
                     };
-                    let b_frame_data = load_frame(b2_display);
+                    let b_frame_data = frames.get(b2_display);
                     let (mut compressed, fwd_mv, bwd_mv, _) = self.encode_bframe(
                         ctx,
                         &b_frame_data,
@@ -957,7 +1021,7 @@ impl EncoderPipeline {
                         cfg.quantization_step = (cfg.quantization_step * l2_qp_scale).min(64.0);
                         cfg
                     };
-                    let b_frame_data = load_frame(b6_display);
+                    let b_frame_data = frames.get(b6_display);
                     let (mut compressed, fwd_mv, bwd_mv, _) = self.encode_bframe(
                         ctx,
                         &b_frame_data,
@@ -1062,7 +1126,7 @@ impl EncoderPipeline {
                         cfg.quantization_step = (cfg.quantization_step * l3_qp_scale).min(64.0);
                         cfg
                     };
-                    let b_frame_data = load_frame(b_display);
+                    let b_frame_data = frames.get(b_display);
                     let (mut compressed, fwd_mv, bwd_mv, _) = self.encode_bframe(
                         ctx,
                         &b_frame_data,
@@ -1144,11 +1208,11 @@ impl EncoderPipeline {
                 // Skip decode if next frame is keyframe or end of sequence
                 let next_is_rem_pframe = j + 1 < next_key && j + 1 < n;
                 let rem_needs_decode = next_is_rem_pframe;
-                let rem_frame_data = load_frame(j);
+                let rem_frame_data = frames.get(j);
 
                 // Look-ahead: pre-compute ME for the next remainder P-frame if available.
-                let next_rem_pixels: Option<Vec<f32>> = if next_is_rem_pframe {
-                    Some(load_frame(j + 1))
+                let next_rem_pixels: Option<Arc<Vec<f32>>> = if next_is_rem_pframe {
+                    Some(frames.get(j + 1))
                 } else {
                     None
                 };
@@ -1166,7 +1230,7 @@ impl EncoderPipeline {
                     false,
                     rem_needs_decode,
                     pending_me.take(),
-                    next_rem_pixels.as_deref(),
+                    next_rem_pixels.as_ref().map(|f| f.as_slice()),
                     // Consecutive remainder P-frames within the same GOP have no B-frames
                     // between them, so preprocess results are safe to cache.
                     next_is_rem_pframe,
@@ -1235,7 +1299,7 @@ impl EncoderPipeline {
                     }
                 }
                 if config.scene_cut_threshold > 0.0 {
-                    prev_frame_luma = Some(rem_frame_data);
+                    prev_frame_luma = Some(crate::luma_proxy(&rem_frame_data));
                 }
                 results[j] = Some(compressed);
             }
@@ -1247,12 +1311,13 @@ impl EncoderPipeline {
                 // No remainder frames: the last display frame is next_key - 1, inside
                 // the last B-group. Load it now so the next group boundary check works.
                 // (This load is cheap — only done once per GOP transition.)
-                prev_frame_luma = Some(load_frame(next_key - 1));
+                prev_frame_luma = Some(crate::luma_proxy(&frames.get(next_key - 1)));
             }
 
             display_idx = next_key;
         }
 
+        frames.report(n);
         results.into_iter().map(|o| o.unwrap()).collect()
     }
 

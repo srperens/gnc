@@ -597,6 +597,42 @@ pub fn luma_mad(frame_a: &[f32], frame_b: &[f32]) -> f32 {
     (sum / count as f64) as f32
 }
 
+/// Compact a frame into the samples `luma_mad` actually reads.
+///
+/// `luma_mad` strides 12 f32 at a time (every 4th pixel, R channel only), so a caller that
+/// keeps a frame *only* to compare it against the next one is holding ~24.9 MB at 1080p to
+/// read 1/12 of it. This returns those samples, in the same order, as a ~2 MB proxy.
+///
+/// `luma_proxy_mad` over two proxies sums the same values in the same order as `luma_mad`
+/// over the two full frames, so the result is bit-identical, not merely close.
+pub fn luma_proxy(frame: &[f32]) -> Vec<f32> {
+    if frame.len() < 3 {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(frame.len() / 12 + 1);
+    let mut i = 0usize;
+    while i + 2 < frame.len() {
+        out.push(frame[i]);
+        i += 12;
+    }
+    out
+}
+
+/// Mean absolute difference between two [`luma_proxy`] outputs.
+///
+/// Equivalent to [`luma_mad`] on the frames the proxies came from, for frames of equal length.
+pub fn luma_proxy_mad(proxy_a: &[f32], proxy_b: &[f32]) -> f32 {
+    let count = proxy_a.len().min(proxy_b.len());
+    if count == 0 {
+        return 0.0;
+    }
+    let mut sum = 0.0f64;
+    for i in 0..count {
+        sum += (proxy_a[i] - proxy_b[i]).abs() as f64;
+    }
+    (sum / count as f64) as f32
+}
+
 /// Map a quality value (1–100) to codec parameters.
 ///
 /// Higher values = better quality, larger files. Lower = more compression.

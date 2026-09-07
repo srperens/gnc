@@ -303,13 +303,18 @@ At BASELINE's own stated parameters (bbb, q=75, Rice, ki=8, 10 frames), this ses
 |---|---|
 | `benchmark-sequence`, GPU encode phase only | 13.6 |
 | `encode-sequence`, end to end incl. PNG decode and container write | 7.8 |
-| BASELINE.md, stated | 31.7 |
+| BASELINE.md as it then stood | 31.7 — **withdrawn**, see below |
 
 The binary used was built at this session's start and HEAD has moved since, so this is not yet a
 regression claim. But **three different numbers are in circulation for "GNC encode fps" and GOALS
 quotes one of them without saying which** — and the CLI's own help text concedes that PNG input
 inflates the cost. For a codec whose thesis is real-time density, that ambiguity is not
 survivable. Pin the definition before any density claim rests on it.
+
+**Settled since (BASELINE, 2026-09-06):** the three quantities are named A (GPU encode phase, 12.2
+fps), B (encoder loop, 5.6) and C (end to end, 5.0), and every quote must say which. The 31.7 row
+above is retracted — it reproduces as none of them. GOALS and the README were still carrying it as
+their headline figure a day later; corrected under PERF-1 (2026-09-07).
 
 Either way: contribution is 50 or 59.94 fps real time, concurrency multiplies throughput by about
 two rather than by eight, and **the primary use case does not yet function on the reference

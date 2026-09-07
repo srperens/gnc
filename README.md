@@ -72,13 +72,19 @@ fps" exists.*
 
 ### Video sequence
 
-**31.7 fps** (1080p, q=75, keyframe interval 8, I+P+B frames)
+**12.2 fps** GPU encode phase, **5.0 fps** end to end (1080p, q=75, keyframe interval 8, Rice,
+measured 2026-09-06 on a machine that was not idle).
+
+*The 31.7 fps this line used to carry is withdrawn: it is not reproducible, it matches none of the
+three quantities below, and its stated parameters are internally inconsistent — ki=8 cannot produce
+B-frames. See [BASELINE.md](BASELINE.md), "How to read the fps figures in this file".*
 
 > **On the throughput figures above.** Three different quantities have been called "encode fps" in
 > this project and they differ by 2.4x — the GPU encode phase, the encoder loop, and end-to-end
 > wall clock. The figures here are the encoder loop. They were also measured on a machine that is
 > not reliably idle: the same workload has timed 25.2, 31.1 and 37.5 ms across three runs, a 48%
-> spread on identical work. **Treat every fps number in this README as indicative to about ±25%.**
+> spread on identical work. **Treat every fps number in this README as indicative to about ±25%**,
+> and say which of the three quantities you mean whenever you quote one.
 > The compression figures (bpp, PSNR, CIEDE2000) are deterministic and carry no such caveat.
 
 ## Architecture

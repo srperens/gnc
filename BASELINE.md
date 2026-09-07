@@ -108,7 +108,7 @@ Three different quantities have been called "encode fps" here. State which one, 
 `cargo test` measured 20% slower than the same run taken after it. Compression figures (bpp,
 VMAF, dE00) are deterministic and unaffected; fps and latency are not.
 
-**The 31.7 fps figure quoted in GOALS is not reproducible** and matches none of the three. Its
+**The 31.7 fps figure GOALS and the README quoted until 2026-09-07 is not reproducible** and matches none of the three. Its
 stated parameters are also inconsistent — "ki=8 ... I+P+B", but ki=8 is below the B-frame
 threshold of 9, and the encoder emits 2I+8P. Do not build a density claim on it.
 

@@ -115,7 +115,9 @@ on a non-idle machine: GPU encode phase 12.2 fps, end to end 5.0 fps.
 **Key GPU architecture insight:** shared-memory occupancy dominates performance. 16KB is the budget because that is what **GNC requests** (wgpu defaults, for WebGPU portability) — the adapter here offers 32KB, so this is a self-imposed ceiling, not the chip's (BUG-29). At 16KB, 2 workgroups/core is full occupancy; Rice uses < 1KB shared, so occupancy is excellent.
 
 **Known gaps:**
-- Sequence encode 31.7 fps → target 60 fps
+- Sequence encode: **12.2 fps GPU encode phase, 5.0 fps end to end** (BASELINE's A and C,
+  1080p q=75, non-idle machine) → target 60 fps. The 31.7 fps this line used to carry is the
+  figure retracted four paragraphs above; it stood here for a day after being withdrawn.
 - Single-frame encode 40 fps → target 60 fps
 - 8-bit only (10-bit not implemented) — the main format gap for broadcast contribution
 - 4:4:4 / 4:2:2 / 4:2:0 all implemented (`--chroma-format`)
@@ -223,7 +225,7 @@ GNC should become a **good, robust codec** — not optimized along a single axis
 |----------|---------|--------|
 | **Concurrent streams per GPU** | **never measured** | beat NVENC's session/block ceiling on the same machine |
 | **Latency per frame** | never measured | sub-frame, end to end |
-| Encode speed | 31.7 fps (seq, 1080p q=75) | 60 fps |
+| Encode speed | 12.2 fps GPU encode phase / 5.0 fps end to end (seq, 1080p q=75, non-idle; BASELINE A and C) | 60 fps |
 | Bit depth | 8-bit | 10-bit, in the format from the start |
 | Chroma formats | 4:4:4, 4:2:2, 4:2:0 | keep all three working at 10-bit |
 | Compression (intra) | +46–55% vs H.264 all-I on video (VMAF); +13.9% on stills (PSNR) | ≤ H.264 all-I, measured at contribution quality |

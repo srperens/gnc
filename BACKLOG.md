@@ -1145,7 +1145,13 @@ decoder down a GOP"), which may be this seen from the other side.
 
 </details>
 
-### BUG-26 — abac and Rice decode to different pixels on subsampled chroma (todo, P2)
+### BUG-28 — abac and Rice decode to different pixels on subsampled chroma (todo, P2)
+
+**Filed as BUG-26 and renumbered to BUG-28 the same day** — `intra1` filed a different BUG-26
+(`--tile-size 1024` silently destroys the image, P1) minutes later, and one `scripts/claim take
+BUG-26` then covered both headings, so neither could be claimed on its own. Mine moves because
+theirs is held and being worked on; renumbering the held one would collide inside a live worktree.
+BUG-27 stays reserved for the P-frame dequant defect, per COORDINATION.
 
 Found 2026-09-07 while closing ARCH-3, on the intra path, **and reproduced identically on `main`
 at `1d67d29`** — so it is not caused by ARCH-3 and it is not about inter. Filing it because it

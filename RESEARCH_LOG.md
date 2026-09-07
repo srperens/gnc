@@ -590,7 +590,7 @@ tests pass, clippy clean.
 −20.5% (4:4:4), −18.9% (4:2:2), −18.3% (4:2:0) against Rice, and at 4:4:4 the decoded pixels are
 bit-identical.
 
-### Found on the way, filed as BUG-26 (P2), not caused here
+### Found on the way, filed as BUG-26 and renumbered to BUG-28 (P2), not caused here
 
 At **4:2:2 and 4:2:0 the abac and Rice decodes differ**, on the *intra* path, and reproduce
 identically on `main` — so this predates ARCH-3 and is unrelated to the inter work. Single frame

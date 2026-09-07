@@ -123,6 +123,11 @@ scripts/claim take dr-0019 "the pick is the lock"   # non-zero: someone has it, 
 Reserving costs one command and is the difference between picking a number and being *given*
 one. Drop it once the record is merged.
 
+**`0024` is now colliding too** — `0024-the-gpu-abac-encoder-counts-before-it-writes.md` (ENT-5)
+and `0024-the-jpeg-2000-gap-is-upstream-of-the-entropy-coder.md` (INTRA-1), both on `main`, both
+referenced from BACKLOG and a commit message. Third pair, same afternoon, same mechanism. Noted
+rather than fixed: renumbering is BUG-19's job and the inbound references are where it goes wrong.
+
 **Four records are already colliding and nobody has renumbered them: `0018` twice and `0019`
 twice** (a fifth case, `0020`, was renumbered by hand). Filed as **BUG-19** — the fix is
 mechanical but the inbound references are where it goes wrong, so it is a claimable item rather
@@ -191,7 +196,7 @@ If this table and `scripts/claim list` disagree, the table is wrong.
 | `../gnc-intra1` | `intra1` | **INTRA-1 — the largest known compression gap. Step 2 first instalment landed 2026-09-07: the gap decomposes.** 8.5 of the 27.1 RGB points is chroma allocation against an RGB metric (YCoCg-R synthesis norms 1.73/0.71/0.87, spread 2.45, against J2K's ICT at 1.15 — **not** a coding deficiency, and it also explains why the Y gap was +48.3%: it falls to +13.5% when corrected). Lifting normalisation is clean. Tiling costs *J2K* 12.4 points but GNC realises 0.6%. **~9.8 points left; next test is cross-tile rate allocation.** Decision `0026`. **Two traps recorded: a full-frame tile-size comparison is confounded by padding (+6.1% that is really −0.6%), and `--tile-size 1024` silently destroys the image (BUG-26, P1).** Step 1 answered 2026-09-07: `GNC_COEF_ENTROPY=1` prices the *shipped* abac tiles against the entropy of the coefficients they carry, and GNC spends within **7.5% of it at q >= 85**. So entropy coding can account for at most ~7.5 of the 27.1 points against JPEG 2000 9/7 and **~72% is upstream of the coder** — the item is now its step-2 branch (tiling, quantiser shape, lifting normalisation). Decision `0024`. Turned up **ENT-6** on the way: the deep subbands are one short code-block each and cost ~4% of the file. Adds one diagnostic module and two `pub(crate)` exports; **invalidates no measurement** — the encoder path is untouched and the diagnostic is env-gated and read-only. |
 | _(removed)_ | `arch3` | **ARCH-3 + BUG-18 — merged 2026-09-07** (`a312d6f`, `e35d3b2`, `66c9a2e`), worktree removed. One P/B frame encoder; `gpu_entropy_encode` now picks the entropy step and nothing else. Default output **byte-identical, 54/54** against a baseline pinned at `07c01b1`, so no measurement is invalidated. `tests/bug18_locate.rs` reads 0.000 everywhere. **abac's inter figure is un-retracted: −12.0% to −22.9% against Rice at bit-identical pixels.** Also fixed, unasked: `--huffman` video, which shipped writing empty P-frame tile vectors. `docs/decisions/0025`. |
 | `../gnc-coord` | `coord` | **COORD-1 — the claim mechanism enforces the rules instead of restating them.** Docs and `scripts/claim` only; no codec change, invalidates no measurement. `scripts/claim next` makes the *pick* atomic, the shared-checkout and worktree preconditions are now refusals rather than prose, and the session identity bug that made `SESSION GONE` undetectable is fixed. See `docs/decisions/0019`. Claimed 2026-09-07. |
-| `../gnc-abacgpu` | `abacgpu` | **ENT-5 — abac now encodes on the GPU, one thread per code-block, and it is the CPU encoder's exact bytes** (98 of 98 whole-file comparisons; `scripts/ent5_gpu_encode_gate.sh`). **Invalidates no measurement and moves no bitstream** — byte identity is what is asserted, so ENT-4's −16.0% and the −13.4% lossless figure are unchanged by construction. Deliberately does *not* touch `use_gpu_encode` or `sequence.rs`'s frame-pipeline selection: abac routes on `gpu_entropy_encode` directly inside `encode_entropy`, so this is orthogonal to **ARCH-3** rather than racing it, and it keeps abac off the fused quantiser that BUG-16 says moves Rice's pixels. **One criterion outstanding: encode time per 1080p frame is NOT measured** — the machine had three other sessions on it, one of them running `encode-sequence`. Instrument: `cargo test --release --test abac_bench -- --ignored --nocapture --test-threads=1`. Until it runs, decision 0017's reason 2 has lost its mechanism and kept its 129 ms. See `docs/decisions/0024`. **Merged 2026-09-07 (`a2405d7`), claim dropped, worktree removed.** Rebased onto ARCH-3 after it landed — one markdown conflict, no code change, gates re-run (224 tests, identity gate 98/98). Two notes for whoever picks up the leftovers: **abac's 4:2:2 and 4:2:0 output is byte-identical between the GPU and CPU encoders**, so whatever BUG-26 is, it is not in abac's encoder; and ARCH-3's `inter_gpu_entropy_available()` returning `false` for abac now means "not in the batched dispatch", not "on the CPU" — its comment says so. |
+| `../gnc-abacgpu` | `abacgpu` | **ENT-5 — abac now encodes on the GPU, one thread per code-block, and it is the CPU encoder's exact bytes** (98 of 98 whole-file comparisons; `scripts/ent5_gpu_encode_gate.sh`). **Invalidates no measurement and moves no bitstream** — byte identity is what is asserted, so ENT-4's −16.0% and the −13.4% lossless figure are unchanged by construction. Deliberately does *not* touch `use_gpu_encode` or `sequence.rs`'s frame-pipeline selection: abac routes on `gpu_entropy_encode` directly inside `encode_entropy`, so this is orthogonal to **ARCH-3** rather than racing it, and it keeps abac off the fused quantiser that BUG-16 says moves Rice's pixels. **One criterion outstanding: encode time per 1080p frame is NOT measured** — the machine had three other sessions on it, one of them running `encode-sequence`. Instrument: `cargo test --release --test abac_bench -- --ignored --nocapture --test-threads=1`. Until it runs, decision 0017's reason 2 has lost its mechanism and kept its 129 ms. See `docs/decisions/0024`. **Merged 2026-09-07 (`a2405d7`), claim dropped, worktree removed.** Rebased onto ARCH-3 after it landed — one markdown conflict, no code change, gates re-run (224 tests, identity gate 98/98). Two notes for whoever picks up the leftovers: **abac's 4:2:2 and 4:2:0 output is byte-identical between the GPU and CPU encoders**, so whatever BUG-28 is (filed as BUG-26 and renumbered — see below), it is not in abac's encoder; and ARCH-3's `inter_gpu_entropy_available()` returning `false` for abac now means "not in the batched dispatch", not "on the CPU" — its comment says so. |
 
 ## The test material was missing entirely, and was refetched (2026-09-07) — RESOLVED
 
@@ -553,12 +558,12 @@ wrong conclusions have come from this one error.
   neither causes nor hides it. **`a312d6f`'s commit message and decision `0025` attribute it to
   BUG-8; that is wrong** — BUG-8 is closed and was a metric bug. It is the defect `gnc-inter1`
   holds under the second `BUG-25`, and this is an independent confirmation of it from the other
-  side. **It now needs id BUG-27, not BUG-26**: I filed BUG-26 (below) while that renumbering was
-  still in a worktree, so the "next free id" moved while nobody could see it. Same failure the
+  side. **It now needs id BUG-27**: I filed a BUG-26 (below, since renumbered to BUG-28) while
+  that renumbering was still in a worktree, so the "next free id" moved while nobody could see it. Same failure the
   section on the BUG-25 collision describes, one round later — an id is still not allocated by the
   lock.
 
-  **New item filed on the way out, BUG-26 (P2):** abac and Rice decode to *different pixels* at
+  **New item filed on the way out, BUG-28 — filed as BUG-26, renumbered (P2):** abac and Rice decode to *different pixels* at
   4:2:2 and 4:2:0 on the **intra** path — max |diff| 12-13 over ~4% of samples at q=50, 5 over
   ~1% at q=75, identical at q=90. **Reproduces on `main` at `1d67d29`, so it is not this change.**
   No published figure is wrong (every abac measurement in the repo is 4:4:4), but abac's "at
@@ -961,9 +966,17 @@ the Vulkan work proceeded under `worktree.gnc-bug25` alone. That is a real gap i
 a licence: two sessions holding one id for two defects means the lock protected neither.
 
 **Update 2026-09-07, `arch3`: the number has moved again, and the same way.** "The next free id"
-was 26 when this was written; `BUG-26` is now on `main` (abac vs Rice pixels on subsampled chroma),
+was 26 when this was written; a `BUG-26` went to `main` (abac vs Rice pixels on subsampled chroma),
 filed by a session that had reserved `BUG-26` with `scripts/claim take` and could not see a
-renumbering that lived only in a worktree. **The dequant defect takes `BUG-27`.** Reserving the id
+renumbering that lived only in a worktree. **The dequant defect takes `BUG-27`.**
+
+**And then 26 collided again, within the hour.** `intra1` filed its own `BUG-26` (`--tile-size
+1024` silently destroys the image, P1) and claimed it, at which point one `scripts/claim take
+BUG-26` covered *two* headings on `main` and neither defect could be claimed on its own — the
+lock stopped excluding, which is worse than the duplicate heading. **Resolved by renumbering the
+abac/Rice one to `BUG-28`**, on a different tiebreak from the one above: both were public, so
+"first-pushed wins" no longer separates them, and what did separate them is that intra1's was
+*held and being worked on*. Renumber the idle one; never renumber inside a live worktree. Reserving the id
 was the right move and it was not enough: the claim excludes another *taker* of that id, not a
 pending rename of an id nobody has taken yet. The fix is the one this section already names — the
 id has to come *from* the compare-and-swap rather than be checked against it — and until it does,

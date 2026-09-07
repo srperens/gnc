@@ -129,4 +129,4 @@ and is true on the one that remains, so it is untouched here and unaffected by t
 belongs to **BUG-8**. It does not — BUG-8 is closed and was a metric bug. It is the defect
 `gnc-inter1` holds under the second, colliding `BUG-25`, and the finding above is an independent
 confirmation of it. Per COORDINATION's resolution of that collision it takes the next free id,
-which is **BUG-27** now that BUG-26 is on `main`.
+which is **BUG-27**.

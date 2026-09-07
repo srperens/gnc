@@ -3063,28 +3063,48 @@ impl EncoderPipeline {
         // there are reused across the GOP and bits spent on a P-frame are not. x264 runs P about
         // 4 QP steps coarser (~1.6x).
         //
-        // Why it has to taper. TUNE-5 measured a flat 1.25 at q=15-50 and found -3.3% BD-rate at
-        // ki=9 and about -20% at ki=17. Those are *distribution* bitrates. At contribution
-        // quality the same lever inverts, because each P-frame inherits its predecessor's error
-        // and there is no quantisation floor left to hide it. Compared at matched rate:
+        // Why it has to taper — **re-derived 2026-09-07 (INTER-1), because the figures that used
+        // to be here were measuring BUG-27 and not this lever.** TUNE-6 justified the taper with
+        // "old_town q=99: -3.8 dB avg, -14.2 dB worst for 1.25"; that was a prediction loop
+        // diverging because the local decode dequantised with the intra step (see the BUG-27
+        // paragraph below), which happens for *any* scale != 1.0 and in both directions. TUNE-5's
+        // low-range "-3.3% BD-rate at q=15-50" went through the same defect. Both endpoints were
+        // therefore unjustified until re-measured; both survived, for different reasons, which is
+        // why this is a taper and not a constant. Three sequences, 24 frames, 4:4:4, ki=9,
+        // BD-rate against all-intra over one common interval per sequence (negative = fewer bits):
         //
-        //   old_town  q=65: 1.25 is +0.94 dB avg, −0.06 dB on the worst frame — clear win
-        //   old_town  q=85: +0.40 dB avg, **−2.2 dB** worst
-        //   old_town  q=99: **−3.8 dB** avg, **−14.2 dB** worst
-        //   aerial    q=80: +0.81 dB avg, −0.52 dB worst
-        //   aerial    q=90: −0.21 dB avg, **−2.75 dB** worst
+        //            scale 1.00   taper   1.25    1.50
+        //   q=25-70 mean   -0.8%   -4.5%  -4.5%   -5.3%
+        //   q=25-70 worst +18.0%  +13.7% +13.8%  +18.7%
+        //   q=85-99 mean   -3.0%   -3.0%  -3.4%   -3.6%
+        //   q=85-99 worst  -1.2%   -1.2%  -2.3%   -1.5%
         //
-        // Both sequences turn between q=80 and q=90, and it is the *worst frame* that pays, which
-        // matters more than the average for a contribution codec. A taper rather than a step so
-        // the RD curve has no cliff at the boundary.
+        // Low end: 1.25 is worth 3.7 points of mean BD-rate over a flat 1.0, and 1.50 overshoots
+        // on the worst frame. Pure efficiency, and it re-derives TUNE-5's conclusion on fixed code.
+        //
+        // High end: efficiency actually favours 1.25 by 1.1 points of worst-frame BD-rate, and it
+        // is **deliberately declined**, because the reason to be at 1.0 up here is a *ceiling*
+        // guarantee rather than a rate/quality trade. At 1.0 the P-frames sit at or above the
+        // I-frame, so the I-frame is the floor and that floor is exactly the all-intra result;
+        // above 1.0 the P-frames drop below it. crowd_run q=99, worst-frame PSNR, against
+        // all-intra's 59.49 dB: scale 1.0 -> 59.50, 1.25 -> 57.05, 1.50 -> 54.99 (identical to two
+        // decimals on old_town_cross and bbb_extended). A contribution codec's output is
+        // re-encoded downstream, so never being worse than your own all-intra mode is worth more
+        // than 1.1 points. Note this is invisible to a BD-rate taken over a common interval: the
+        // interval is common *because* the coarse arms cannot reach higher.
+        //
+        // The breakpoints (4.6 / 2.8) are **not** measured — the sweep tested scale values at the
+        // two ends of the ladder, not where the transition belongs. The ceiling argument only
+        // requires 1.0 by the time near-lossless output is asked for; it does not say q=85 is the
+        // right place to arrive there. Decision record 0023.
         //
         // Note on metrics: VMAF is useless here. On old_town at q>=85 it reads 99.64/96.80 for
         // both settings while the rate differs by 14% and PSNR differs by 4.8 dB on the worst
         // frame — it has saturated. Above about q=80 PSNR has to lead and VMAF is the cross-check,
-        // the reverse of the usual rule.
+        // the reverse of the usual rule. Every VMAF BD-rate in the INTER-1 sweep was discarded by
+        // the harness's own saturation guard (overlaps 99.21-99.89).
         //
-        // Found by the concurrent session as BUG-10; TUNE-5's measurement was sound for the range
-        // it covered and simply did not cover this one.
+        // Originally found by the concurrent session as BUG-10.
         //
         // Keyed on the quantiser step rather than on `q`, for two reasons: the step is the
         // physically relevant quantity — how coarse a P-frame may be depends on how much
@@ -3112,8 +3132,48 @@ impl EncoderPipeline {
         // while `res_config` still told the decoder `res_qstep`, so its P-frames decoded 25% too
         // large wherever the scale was above 1.0 (BUG-18). If you add a quantise call below,
         // it takes `res_qstep`, not `config.quantization_step`.
+        //
+        // **And "every dispatch" includes the three DEQUANTISE calls that build the encoder's own
+        // reference plane** — the local decode, in luma / 4:2:0 chroma / 4:2:2 chroma. Those read
+        // `config.quantization_step` until BUG-27 (2026-09-07, INTER-1), and did so in *both*
+        // P-frame implementations before ARCH-3 deleted one of them, so it was never an artefact
+        // of either. The encoder reconstructed its reference with the intra step while the
+        // bitstream carried the residual at `res_qstep`, so its reference disagreed with the
+        // decoder's by `config.quantization_step / res_qstep` and every P-frame that predicted
+        // from another P did so from a picture no decoder holds.
+        //
+        // Why it hid, and why it is worth a paragraph: the two values are *equal at scale 1.0*,
+        // which is exactly where the taper sits for all q >= 85. So the entire contribution range
+        // was correct by coincidence and the defect was live only where the taper leaves 1.0 —
+        // q <= 80, the shipped default there. Output is byte-identical at q >= 85 before and
+        // after, 27/27 verified; at q=70 the fix is worth +1.82 dB mean and +3.62 dB worst-frame
+        // for +2.0% bytes.
+        //
+        // The signature is a monotone PSNR ramp down a GOP that resets at each I-frame, with the
+        // *first* P-frame correct in both directions — a mismatch against an I reference cannot
+        // occur, only a P predicting from a P inherits the wrong reference. crowd_run q=90 ki=9
+        // forced to scale 1.25 read 47.95 / 41.10 / 38.27 / … / 34.14 and then 49.24 at the next
+        // I. A plain quantiser cannot accumulate error in a closed loop at all; the inter dead
+        // zone *can* drift slowly, because a coefficient it zeroes leaves an error the loop cannot
+        // correct and re-zeroes next frame, so the signature is magnitude — on the synthetic input
+        // in `tests/pframe_reference_drift.rs` the defect drifts 4.04 dB over eight P-frames where
+        // the dead zone alone drifts 0.86 dB.
         let res_qstep = (config.quantization_step * p_qp_scale).min(64.0);
         res_config.quantization_step = res_qstep;
+        // Canary (CLAUDE.md, "No silent features"): the taper above is the only thing that decides
+        // how coarse a P-frame is, and INTER-1 needed to price it. Both the value and whether it
+        // came from the environment are printed, because "the knob did nothing" and "the knob was
+        // not read" are the two outcomes a P-scale sweep has to tell apart — at q >= 85 the
+        // default is already 1.0, so an override to 1.0 is *correctly* a no-op and must not be
+        // mistaken for a dead code path.
+        if diagnostics::enabled() {
+            let src = if std::env::var("GNC_P_QP_SCALE").is_ok() { "env" } else { "taper" };
+            println!(
+                "  p_qp_scale={p_qp_scale:.4} ({src}, default {p_qp_scale_default:.4}), \
+                 intra_qstep={:.4} res_qstep={res_qstep:.4} inter_dz_mul={inter_dz_mul:.2}",
+                config.quantization_step
+            );
+        }
 
         let entropy_mode = EntropyMode::from_config(config);
         let tile_size = config.tile_size as usize;
@@ -4026,7 +4086,7 @@ impl EncoderPipeline {
                         quant_buf,
                         chroma_scratch,
                         chroma_pixels as u32,
-                        config.quantization_step,
+                        res_qstep,
                         res_dead_zone,
                         false,
                         chroma_padded_w,
@@ -4118,7 +4178,7 @@ impl EncoderPipeline {
                         quant_buf,
                         chroma_scratch,
                         chroma_pixels as u32,
-                        config.quantization_step,
+                        res_qstep,
                         res_dead_zone,
                         false,
                         chroma_padded_w,
@@ -4185,7 +4245,7 @@ impl EncoderPipeline {
                         quant_buf,
                         &bufs.cg_plane,
                         padded_pixels as u32,
-                        config.quantization_step,
+                        res_qstep,
                         res_dead_zone,
                         false,
                         padded_w,

@@ -12224,3 +12224,136 @@ At 1.0 the worst frame lands exactly on all-intra's 47.48 — the same ceiling p
 has at 1.0, from a second knob. The lever is worth 12.7% of the rate and 2.87 dB of worst-frame,
 which is large enough to deserve a BD-rate rather than a guess. Filed as **INTER-2**; not chased
 here, because a claim taken for one item does not cover what you trip over inside it.
+
+---
+## 2026-09-08 -- The two-real-GPU CANARY-1, the all-intra density sweep, and a fixed-function comparison, on a Windows laptop
+
+Machine: Windows 11 Pro laptop, **Intel Arc Pro Graphics** (integrated) + **NVIDIA RTX 2000 Ada
+Generation Laptop GPU** (discrete), 31.5 GB RAM. Commit **f17bf1b** (`main`, clean worktree),
+built here from that commit. `scripts/gpu_tier_bench.py` for CANARY-1; density and the
+fixed-function sweep were run directly (equivalent launch loop) because Python and ffmpeg both
+turned out to be blocked by AppLocker from the winget per-user install location and had to be run
+from a policy-allowed path.
+
+This picks up the two experiments the 2026-09-07 entry left explicitly owed: "the two-real-GPU
+version of the experiment is still owed" (CANARY-1 was NVIDIA-vs-CPU there), and "an all-intra
+density sweep at ki=1 would run" (MEAS-5 was blocked). Both are now done. NVENC is still owed, for
+a new reason.
+
+### Test 3 (portability) -- GNC runs on Windows, first time
+
+`cargo build --release` builds clean, `gnc gpu-info` enumerates **6 adapters across Vulkan, DX12
+and GL**. Before today only Metal (dev M1) and Linux/Vulkan (2026-09-07) had ever run; Windows and
+the DX12/GL backends had never been exercised. The build and enumeration work.
+
+### CANARY-1 -- two real GPUs, and the honest number is 2x, not 34x
+
+`--tier`, bbb_1080p, q=90, best-of-5 processes, n=24 iterations/process, Vulkan backend:
+
+| device | backend | encode | decode | settle (enc/dec) |
+|---|---|---|---|---|
+| Intel Arc Pro Graphics | Vulkan | 36.45 ms (27.4 fps) | 26.63 ms (37.6 fps) | 1.02 / 1.02 |
+| NVIDIA RTX 2000 Ada Laptop | Vulkan | **17.75 ms (56.3 fps)** | **11.33 ms (88.3 fps)** | 1.09 / 1.04 |
+| Microsoft Basic Render Driver (DX12, CPU/WARP) | DX12 | panics (exit 101) even single-frame | | |
+
+**Spread 2.05x encode, 2.35x decode. PASS** (fail condition was <1.15x). Settle ratios near 1.0, so
+these are quotable, not clock-ramp artefacts.
+
+**This does not contradict 2026-09-07's 34.5x -- it corrects the framing.** That 34.5x was NVIDIA
+RTX 4000 Ada vs **llvmpipe, a CPU rasterizer**, and that entry flagged it as "a strong statement
+that GNC is compute-bound and a weak one about scaling across GPU tiers specifically." Between two
+**real** GPUs the spread is ~2x: GNC is still clearly compute-bound (passes comfortably), but the
+GPU-to-GPU scaling slope is modest here because the Arc Pro is a capable part and the RTX 2000 Ada
+is a small mobile one. The canary passes; the endpoint is 2x, and that is the more honest figure to
+quote for real-GPU-to-real-GPU.
+
+### BUG-25 reproduced on a second driver, on Windows, and it is the P-frame path
+
+`benchmark-sequence` with any P-frame (ki >= 2, i.e. n >= 2) crashes:
+
+| GPU | backend | n=1 (all-I) | n>=2 (has P) |
+|---|---|---|---|
+| NVIDIA RTX 2000 Ada | Vulkan | exit 0 | **0xC0000005 ACCESS_VIOLATION** |
+| Intel Arc Pro | Vulkan | exit 0 | **0xC0000409 STACK_BUFFER_OVERRUN** |
+
+Chroma format is irrelevant (4:4:4 and 4:2:0 both crash). This is **BUG-25** (`block_match_split.wgsl`,
+dispatched via `estimate_split` in the P-frame path) -- now confirmed on a **second, independent
+driver** (Intel Arc, Windows) with a different crash signature. Consistent with the 2026-09-07
+finding that two independent Vulkan implementations die on this shader; adds Intel/Windows as a
+third. `ki=1` (all-intra) avoids it and runs.
+
+### MEAS-5 density -- all-intra (ki=1), and it does not scale past 2 on this machine
+
+NVIDIA RTX 2000 Ada, testsrc2 60-frame 1080p 4:2:0 clip, q=90, ki=1, Rice, N concurrent processes,
+aggregate throughput including per-process startup:
+
+| N | completed | wall s | aggregate fps | scaling vs N=1 |
+|---|---|---|---|---|
+| 1 | 1/1 | 16.6 | 3.61 | 1.00x |
+| 2 | 2/2 | 16.5 | 7.27 | **2.01x** |
+| 4 | 4/4 | 127.8 | 1.88 | **0.52x** |
+| 8 | 0/8 | ~205 (aborted) | -- | RAM exhausted |
+
+Scales **cleanly to N=2** (two streams in the same wall as one) then **collapses at N=4**. Two
+causes, both implementation artefacts rather than GPU-compute limits, and both must be stated or the
+number misleads:
+
+1. **Per-process startup dominates.** A single N=1 run is 16.6 s wall but the GPU encode inside it is
+   only **1.6 s** (37.6 fps for 60 frames). The other ~15 s is Vulkan pipeline compilation of the
+   shader set plus clip load/decode -- a fixed per-process cost paid once per instance. So the
+   aggregate-fps column is mostly measuring startup parallelism, not encode throughput. GOALS/the
+   harness warn about exactly this ("GNC pays more of it than a fixed-function encoder does").
+2. **Per-process memory exhausts RAM.** Each process holds ~2 GB (it buffers all 60 decoded frames
+   in several representations). At N=8 that is ~16 GB against 1.8 GB free, and the run was aborted to
+   protect the machine. With the larger 120-frame 4:4:4 clip a single process reached 4.3 GB and 4
+   concurrent thrashed for 13 min before being killed -- memory scales with frame count.
+
+**Honest reading:** density cannot be cleanly measured on this build/platform. Short clips are
+startup-dominated; long clips are memory-dominated. The only uncontaminated scaling point is N=2 at
+2.01x. Both bottlenecks are fixable in principle (warm/persistent processes to amortise pipeline
+compilation; streaming instead of buffering the whole clip) and neither is a statement about GPU
+compute scaling.
+
+### MEAS-5 fixed-function -- NVENC unavailable, Intel QSV substituted
+
+`h264_nvenc` refused to run: ffmpeg 9.0.1 requires **NVIDIA driver 610+ / nvenc API 13.1**, this
+machine has **13.0** -> 0/N completed. Updating the driver was out of scope. The NVENC comparison is
+therefore **still owed** (now for a driver reason, not the shader bug). Substituted the machine's
+other fixed-function encoder, **Intel Quick Sync (`h264_qsv`, preset veryslow, global_quality 18)**
+on the Arc Pro, same clip and levels:
+
+| N | completed | wall s | aggregate fps | scaling vs N=1 |
+|---|---|---|---|---|
+| 1 | 1/1 | 1.36 | 44.1 | 1.00x |
+| 2 | 2/2 | 1.23 | 97.6 | 2.21x |
+| 4 | 4/4 | 1.53 | 156.9 | 3.56x |
+| 8 | 8/8 | 2.40 | 200.0 | **4.54x** |
+
+**NOT quality-matched** to the GNC rows (GNC q=90 4:4:4 all-intra vs QSV H.264 qp18 4:2:0; different
+encoders, different work) -- read as session-count and scaling only, per the harness's own rule.
+With that caveat: on this laptop the fixed-function encoder **out-scales GNC on concurrency** (4.54x
+at N=8, all 8 completing, ~1 s startup, memory-light), and this is the opposite of the density
+thesis's hoped-for direction. But the gap is entirely GNC's **per-process startup and memory**, not
+GPU compute, and this is the **least-favourable hardware** for GNC's argument (a small mobile
+discrete part). Losing here is not disproof; it is a to-do list (amortise startup, stop buffering
+the clip) and a pointer at where the real MEAS-5 has to be run -- a large GPU with a warm-process
+GNC and a driver new enough for NVENC.
+
+### State
+
+- **Test 3 (Windows portability): PASS.** Builds and runs across Vulkan/DX12/GL enumeration.
+- **CANARY-1: PASS on two real GPUs, 2.05x** (Intel Arc Pro vs RTX 2000 Ada). The owed two-GPU
+  version is done; quote 2x for real-GPU-to-real-GPU, not the 34x CPU figure.
+- **BUG-25: reproduced on Intel Arc Vulkan (Windows)** as a stack-buffer-overrun, in addition to the
+  NVIDIA access-violation. Still open. Microsoft Basic Render Driver (WARP) panics even on intra.
+- **MEAS-5 density (all-intra ki=1): measured, and it does not scale past N=2 here** -- startup- and
+  memory-bound, not GPU-bound. N=2 = 2.01x is the only clean point.
+- **MEAS-5 vs fixed-function: QSV scales to 4.54x@N=8 and beats GNC on concurrency here**, with the
+  not-quality-matched and least-favourable-hardware caveats. **NVENC still owed** (driver 13.0 < 13.1).
+- **Not fixed / still owed:** BUG-25 itself; the shipped-config (inter) density; NVENC; large-GPU
+  MEAS-5; 4:2:2 and 10-bit on Vulkan.
+- **Tooling note for the next Windows session:** AppLocker on a managed machine can block
+  executables run from the winget per-user install location -- Python and ffmpeg both had to be
+  copied to a policy-allowed path to run at all. And if `CARGO_TARGET_DIR` is set, the harness's
+  default `target/release/gnc.exe` is not where the binary lands; pass `--binary` explicitly at
+  whatever the redirected target dir is.

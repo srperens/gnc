@@ -159,6 +159,16 @@ not drift — but VMAF on a shared reference is the measurement to quote.
 fundamentally different design. Unlike the inter gap, intra has an existence proof that the rate
 is reachable.
 
+**Superseded and made worse by MEAS-9 (2026-09-07).** Two corrections. The 1.79x above was scored
+on **VMAF**, which is luma-only and saturated at this operating point — do not quote it. And
+`opj_compress` defaults to the **reversible 5/3** transform, so that arm was JPEG 2000 with the
+wrong transform for a lossy comparison: `-I` gains it 2-3 dB at matched rate. Measured correctly,
+on four images through one metric path, **GNC needs +54.2% BD-rate on RGB PSNR and +79.7% on
+Y-PSNR against JPEG 2000 in 9/7 mode** — a larger gap than this section implies, and larger than
+GNC's gap to ProRes 4444 (+20.2% / +29.3%) or JPEG XS 4:4:4 (**−10.2%** / +29.4%). The conclusion
+that the rate is reachable stands and is now stronger: the transform is the same, so what is left
+is the entropy coder. See RESEARCH_LOG 2026-09-07 and `scripts/meas9_contribution.py`.
+
 ## Video vs H.264 — the headline number (QUAL-1, 2026-09-06)
 
 `scripts/meas1_vs_h264.py`: one normalised reference through PNG for both codecs, the same `vmaf`

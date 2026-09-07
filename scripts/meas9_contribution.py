@@ -147,6 +147,15 @@ def arm_gnc(gnc_binary, src_png, orig_rgb, tmp, qualities):
             print(f"    GNC q={q} decode failed: {r.stderr.strip().splitlines()[-1:]}")
             continue
         rows.append(("GNC", f"q{q}", os.path.getsize(bs), measure(orig_rgb, out_png)))
+
+    # The ffmpeg arms are checked for honouring their requested rate; this is the same guard for
+    # the one arm whose rate is requested indirectly. GNC's ladder is not guaranteed monotonic in
+    # rate: RATE-1 measured flat512 at 0.0450 bpp for q=86 and 0.0370 for q=90. Interpolating
+    # through an inversion is silent, so say it out loud.
+    for a, b in zip(rows, rows[1:]):
+        if b[2] < a[2]:
+            print(f"    GNC: rate falls as quality rises, {a[1]} -> {b[1]} "
+                  f"({a[2]} -> {b[2]} bytes) — the ladder is not monotonic here")
     return rows
 
 
@@ -479,6 +488,32 @@ def bd_summary(rows, metric, min_overlap=MIN_OVERLAP_DB):
     return out
 
 
+def drop_gnc_above(rows, cap):
+    """The same rows with GNC's rungs above q=`cap` removed.
+
+    GNC's top rungs are **dominated by its own lossless path**: LOSSLESS-1 made q=100 code MED
+    residuals instead of wavelet coefficients and 14.9% cheaper, which moved the bit-exact price
+    *below* the top of the lossy ladder. Measured on these four stills (RATE-2, another session):
+    q=99 costs +9.3% (bbb), +40.6% (blue_sky), +35.9% (kristensara), +29.6% (touchdown) more than
+    q=100 for output that is worse than bit-exact, and domination starts at q=98/95/96/96.
+
+    So a BD-rate integrated over the full ladder scores GNC partly through settings a user should
+    never choose. The rungs stay in the table — they are what the encoder produces, and removing
+    them would flatter GNC — but the BD-rate is reported twice, and the difference between the two
+    is the self-inflicted part.
+    """
+    out = []
+    for r in rows:
+        if r["codec"] == "GNC" and r["rung"].startswith("q"):
+            try:
+                if int(r["rung"][1:]) > cap:
+                    continue
+            except ValueError:
+                pass
+        out.append(r)
+    return out
+
+
 def matched_rate_table(rows, gnc_rows):
     """Each incumbent rung against GNC interpolated to the *same* bpp.
 
@@ -564,6 +599,10 @@ def main():
                     help="GNC quality ladder (default spans the contribution operating point)")
     ap.add_argument("--arms", default=",".join(DEFAULT_ARMS),
                     help=f"any of: {', '.join(ARM_ORDER)}")
+    ap.add_argument("--gnc-bdrate-cap", type=int, default=94,
+                    help="also report BD-rate with GNC rungs above this q removed; above it GNC "
+                         "is dominated by its own q=100 lossless path (RATE-2), so the full-ladder "
+                         "figure scores it through settings nobody should choose")
     ap.add_argument("--vc2-qm", default="default", choices=("default", "color", "flat"),
                     help="VC-2 quantisation matrix; 'flat' is its own optimise-for-PSNR setting")
     ap.add_argument("--csv", default=None)
@@ -594,18 +633,21 @@ def main():
             print_table(rows)
             for w in saturation_warnings(rows):
                 print(f"  CANARY  {w}")
+            capped = drop_gnc_above(rows, args.gnc_bdrate_cap)
             for metric, name in (("psnr_y", "Y-PSNR (YCoCg-R)"), ("psnr_rgb", "RGB PSNR")):
                 bds = bd_summary(rows, metric)
+                cap_bds = {c: bd for c, bd, _, _, _ in bd_summary(capped, metric)}
                 if bds:
-                    print(f"  BD-rate on {name}, GNC vs:")
+                    print(f"  BD-rate on {name}, GNC vs (full ladder | GNC q<="
+                          f"{args.gnc_bdrate_cap} only, see RATE-2):")
                     for codec, bd, lo, hi, note in bds:
                         if bd is None:
                             print(f"    {codec:<12} n/a — {note}")
-                        else:
-                            verdict = "fewer" if bd < 0 else "more"
-                            print(f"    {codec:<12} {bd:+8.1f}%  "
-                                  f"(GNC needs {abs(bd):.1f}% {verdict} bits, "
-                                  f"fitted over {lo:.1f}-{hi:.1f} dB)")
+                            continue
+                        cb = cap_bds.get(codec)
+                        cb_txt = f"{cb:+8.1f}%" if cb is not None else "     n/a"
+                        print(f"    {codec:<12} {bd:+8.1f}% | {cb_txt}  "
+                              f"(fitted over {lo:.1f}-{hi:.1f} dB)")
             matched = matched_rate_table(rows, [r for r in rows if r["codec"] == "GNC"])
             if matched:
                 print("  At matched rate, GNC minus the incumbent "
@@ -621,16 +663,24 @@ def main():
         if len(args.images) > 1:
             print("\n=== mean BD-rate across images ===")
             for metric, name in (("psnr_y", "Y-PSNR (YCoCg-R)"), ("psnr_rgb", "RGB PSNR")):
-                per_codec = {}
+                per_codec, per_codec_cap = {}, {}
                 for img in args.images:
                     rows = [r for r in all_rows if r["image"] == Path(img).name]
                     for codec, bd, _, _, _ in bd_summary(rows, metric):
                         if bd is not None:
                             per_codec.setdefault(codec, []).append(bd)
-                print(f"  on {name}:")
+                    for codec, bd, _, _, _ in bd_summary(
+                            drop_gnc_above(rows, args.gnc_bdrate_cap), metric):
+                        if bd is not None:
+                            per_codec_cap.setdefault(codec, []).append(bd)
+                print(f"  on {name} (full ladder | GNC q<={args.gnc_bdrate_cap} only):")
                 for codec, vals in sorted(per_codec.items()):
-                    print(f"    {codec:<12} {np.mean(vals):+8.1f}%   "
-                          f"({', '.join(f'{v:+.1f}' for v in vals)})")
+                    cap_vals = per_codec_cap.get(codec)
+                    cap_txt = f"{np.mean(cap_vals):+8.1f}%" if cap_vals else "     n/a"
+                    print(f"    {codec:<12} {np.mean(vals):+8.1f}% | {cap_txt}   "
+                          f"full: ({', '.join(f'{v:+.1f}' for v in vals)})"
+                          + (f"  capped: ({', '.join(f'{v:+.1f}' for v in cap_vals)})"
+                             if cap_vals else ""))
 
         if args.csv:
             import csv as csvmod

@@ -9121,3 +9121,236 @@ rANS is quoted, not re-measured — four sessions were building on this machine 
 rule 1 forbids timing under load. The README's "1.5–2× faster" for Rice is inconsistent with
 TUNE-3's own 15% and is not supported by anything in the repository; it is removed rather than
 replaced, and re-timing it on an idle machine is filed as the remaining piece.
+
+---
+
+## 2026-09-07 — MEAS-9: GNC against the five codecs it actually competes with, on one metric path
+
+Every cross-codec number in this repository has been against x264. `docs/POSITIONING.md` calls
+x264 a sanity anchor rather than a competitor, and nothing else had ever been measured. MEAS-9
+closes that: **JPEG XS, JPEG 2000, ProRes and VC-2, in seven arms, on four images, through one
+metric path.** New harness, `scripts/meas9_contribution.py`.
+
+This lands the same day as decision 0018 (GNC is broad on purpose), and the two are connected: a
+codec meant to be good at many things has to be measured against the incumbents of every segment
+it touches, not against one opponent at one operating point.
+
+### The instrument was validated before the codecs were measured
+
+Four checks, because half of this project's dramatic findings have been harness bugs:
+
+- **One metric path for every arm.** Each arm decodes to an 8-bit RGB PNG and every figure is
+  computed from that PNG against the original. No arm reports its own quality. Rate is coded bytes
+  — ffprobe packet sizes for the ffmpeg arms, so MOV/Matroska overhead is excluded; the `.gnc` file
+  for GNC; the `.j2k` codestream for JPEG 2000; the `.jxs` for JPEG XS.
+- **A conversion ceiling per pixel format, measured through lossless FFV1, not assumed.**
+  `rgb24 -> yuv444p10le -> rgb24` is **exact** (PSNR inf, dE00 0.0000), so every 4:4:4 arm is clean.
+  `yuv422p10le` caps at **39.16 / 44.85 / 44.76 / 44.46 dB** RGB PSNR on bbb / blue_sky /
+  kristensara / touchdown. That is chroma subsampling alone, and it is larger than any coding
+  difference in this comparison.
+- **`--selftest` on the BD-rate machinery.** Identical curves → +0.000%; a reference 20% cheaper at
+  every point → exactly +25.000%; a 1.4 dB overlap → refused rather than answered; interpolation at
+  a measured rate → exact. All pass.
+- **Reproducibility.** 24 GNC rows compared across two independent runs, 20 minutes apart, under
+  different machine load and under two different Python interpreters: **byte-identical**, and every
+  quality figure identical to the last digit.
+- **Valid against a commit, checked rather than assumed.** The GNC arm was measured with a binary
+  built from `ac66321`, and ABAC-SHIP landed in `src/` while the sweep was running. Re-encoding
+  after rebasing onto that merge gives **1 173 797 bytes at q=75 and 2 091 447 at q=90 on bbb —
+  byte-identical to the measured rows**, so the figures hold for main as it stands and abac is
+  genuinely opt-in.
+
+### The result
+
+Mean BD-rate over the four images, GNC against each arm. **Positive means GNC needs more bits for
+the same quality.** Per-image values in parentheses, bbb / blue_sky / kristensara / touchdown.
+
+| arm | Y-PSNR (YCoCg-R) | RGB PSNR |
+|---|---|---|
+| **J2K 9/7** (irreversible, OpenJPEG) | **+79.7%** (65.3 / 77.3 / 96.4 / 79.8) | **+54.2%** (38.0 / 59.5 / 63.8 / 55.5) |
+| J2K 5/3 reversible (opj default) | +67.9% (59.9 / 66.8 / 77.1 / 67.9) | +20.2% (6.0 / 33.1 / 24.5 / 17.0) |
+| **JPEG XS 4:4:4** (SVT, 10-bit) | +29.4% (23.8 / 30.9 / 29.2 / 33.8) | **−10.2%** (−17.8 / −9.4 / −13.2 / −0.6) |
+| **ProRes 4444** | +29.3% (4.8 / 25.5 / 24.1 / 62.9) | +20.2% (−4.3 / 17.3 / 15.5 / 52.4) |
+| JPEG XS 4:2:2, ProRes 422, VC-2 | not computable — see below | not computable |
+
+And at matched rate, the rung nearest 5.0 bpp against GNC interpolated to the same rate:
+
+| image | arm | bpp | Y-PSNR | RGB PSNR | dE00 |
+|---|---|---|---|---|---|
+| bbb | GNC | 5.00 | 46.98 | 45.73 | 0.5953 |
+| | J2K 9/7 | 4.80 | **51.14** | **48.58** | **0.4614** |
+| | JPEG XS 444 | 4.50 | 47.84 | 42.34 | 0.8928 |
+| | ProRes 4444 | 4.74 | 47.07 | 44.74 | 0.6750 |
+| | ProRes 422 hq | 3.75 | 42.23 | 37.44 | 1.3150 |
+| touchdown | GNC | 5.00 | 46.48 | 45.42 | 0.7506 |
+| | J2K 9/7 | 4.80 | **51.36** | **49.09** | **0.5761** |
+| | JPEG XS 444 | 4.50 | 48.75 | 44.60 | 0.9882 |
+| | ProRes 4444 | 4.46 | 50.91 | 49.42 | 0.5081 |
+| | ProRes 422 hq | 3.75 | 44.51 | 43.21 | 0.9341 |
+
+### GNC's top rungs are dominated by its own lossless path, and that turns out not to move the BD-rate
+
+Raised by the RATE-1 session while this was being written up, and it is a real defect: LOSSLESS-1
+made q=100 code MED residuals instead of wavelet coefficients and 14.9% cheaper, which moved the
+**bit-exact** price *below* the top of the lossy ladder. On these four stills, q=99 costs **+9.3%
+(bbb), +40.6% (blue_sky), +35.9% (kristensara), +29.6% (touchdown)** more than q=100 for output
+that is worse than bit-exact, and domination begins at q=98 / 95 / 96 / 96. Mean **+28.9%**. Filed
+as RATE-2. Their q=99 rungs and mine were produced by different harnesses at different commits and
+agree to four decimals (bbb 13.6439 against 13.644 bpp at 59.59 dB), which is what makes the
+figure believable rather than surprising.
+
+The suggestion was to report the BD-rate twice, over q=60-99 and over q=60-94, and call the
+difference the self-inflicted part. **Measured, that is not what the difference is.** Truncating
+the ladder also moves the *integration window*, because the window is the overlap of the two
+curves — so the two figures are integrals over different quality ranges, and comparing them
+conflates two effects. Naively done it looks large: ProRes 4444 goes +20.2% → +31.2% on RGB.
+
+Holding the window fixed at the truncated ladder's overlap and changing only which GNC rungs the
+fit may use:
+
+| arm | RGB, full ladder | RGB, q≤94 | shift | Y, full | Y, q≤94 | shift |
+|---|---|---|---|---|---|---|
+| J2K 9/7 | +54.1% | +54.4% | **+0.2** | +84.9% | +85.7% | **+0.8** |
+| ProRes 4444 | +29.1% | +31.2% | **+2.0** | +41.8% | +42.1% | **+0.3** |
+| JPEG XS 4:4:4 | −11.1% | −12.3% | **−1.3** | +29.4% | +28.4% | **−1.0** |
+| J2K 5/3 rev | +12.3% | +10.2% | **−2.2** | +49.7% | +47.1% | **−2.6** |
+
+**So the domination is worth at most 2.6 points of BD-rate, not eleven.** The headline figures
+stand. What the exercise did catch is that *"report it over two ladders"* is itself an instance of
+COORDINATION rule 4 — a BD-rate over a different range is a different quantity — which is the
+fourth time today that a proposed cross-check needed its own cross-check.
+
+Two things worth keeping from it. The comparison **is** rate-range dependent in a way worth stating:
+GNC is +20.2% behind ProRes 4444 over the full 42-60 dB window and +29.1% over the narrower
+42-49 dB one, so GNC closes on ProRes at high rates and is further behind at moderate ones. And the
+harness now flags a **non-monotonic** GNC ladder — a rung whose rate falls as q rises — because
+RATE-1 found exactly that on synthetic content (flat512: 0.0450 bpp at q=86, 0.0370 at q=90) and
+interpolating through an inversion is otherwise silent.
+
+**Not done, and why:** the truncated fit uses four GNC rungs (q=60/75/85/90), the bare minimum. A
+denser sub-95 ladder would tighten it, and it would not change a conclusion that survives a 2.6
+point perturbation.
+
+Three things fall out, and the first is the one worth acting on.
+
+### 1. JPEG 2000 beats GNC with the same transform, so the gap is the entropy coder
+
+OpenJPEG in irreversible mode is a **9/7 wavelet at five levels** — the same transform, the same
+depth, the same family as GNC. It needs **54% fewer bits on RGB PSNR and 80% fewer on Y-PSNR** at
+matched quality, and it wins on dE00 at matched rate too, so this is not an allocation artefact
+like the sign flips below. It runs on a CPU.
+
+**When the transform is the same, the gap is not the transform.** What differs is what happens
+after it: J2K uses EBCOT — context-adaptive binary arithmetic coding over bit-planes with
+rate-distortion optimal truncation — where GNC used Rice+ZRL.
+
+That makes the abac work (shipped hours earlier, GP18, `--abac`) the right lever and puts a number
+on how far it goes: **−17.3% of rate at q=90 is about a third of the 54% RGB gap, not all of it.**
+The rest is in the parts of EBCOT abac does not implement: PCRD truncation (measured at 0.00 dB
+for GNC in EBCOT part 1, so probably not this), and coefficient context modelling across
+bit-planes. Worth re-measuring this comparison with `--abac` on, which is now a one-flag change to
+the GNC arm.
+
+### 2. GNC's luma/chroma allocation is the outlier, and it is what flips the ranking
+
+Against JPEG XS 4:4:4, GNC needs **10.2% fewer** bits on RGB PSNR and **29.4% more** on Y-PSNR.
+Both are correct. The reason is measurable — take each codec's Y-PSNR minus its RGB PSNR at the
+~4.5 bpp rung on bbb, which says how hard it favours luma:
+
+| codec | Y − RGB |
+|---|---|
+| **GNC** | **+1.39 dB** |
+| VC-2 (saturated, but its allocation is still informative) | +1.99 dB |
+| ProRes 4444 | +2.33 dB |
+| J2K 9/7 | +2.56 dB |
+| JPEG XS 4:4:4 | **+5.50 dB** |
+
+**GNC protects chroma more than any of the five.** That is consistent with CHROMA-1 (chroma_weight
+1.2 at q ≥ 60) and with the x264 result where GNC won dE00 while losing 7.4–8.8 dB of luma — but it
+is now measured against five independent codecs instead of one, all in the same direction, so it is
+a property of GNC's allocation and not an artefact of any single comparison.
+
+Consequence for how results are quoted: **a single number cannot rank GNC against a 4:4:4
+incumbent.** Y-PSNR alone puts GNC 29% behind JPEG XS; RGB PSNR alone puts it 10% ahead. Both
+halves, always.
+
+### 3. Content matters more than the codec choice, and touchdown is where GNC is weakest
+
+ProRes 4444 ranges from **−4.3% to +52.4%** RGB BD-rate across four images. The outlier is
+touchdown (sports, dense crowd and grass texture), where GNC is behind on all three figures at
+matched rate — Y −5.2 dB, RGB −4.8 dB, dE00 +0.30. On bbb (animation, large flat regions) GNC is
+slightly *ahead* of ProRes 4444 on RGB and dE00. A block DCT handles that high-detail texture
+better than this wavelet does, and a four-image mean hides a 57-point spread. Any future
+single-image result on this axis is an anecdote.
+
+### The 4:2:2 arms, and two encoders that cannot be quoted
+
+No BD-rate is computable against JPEG XS 4:2:2, ProRes 422 or VC-2, and the reason is not a
+harness limitation — their quality ranges do not reach GNC's:
+
+- **All three are capped by chroma subsampling**, at 39–45 dB RGB PSNR depending on content, which
+  is below GNC's operating range. Comparing them to a 4:4:4 codec on RGB PSNR measures the format,
+  not the codec. At matched rate GNC beats ProRes 422 HQ (+2.02 dB Y, +5.53 dB RGB, dE00 −0.53 on
+  bbb) and JPEG XS 4:2:2 (+2.76 dB Y, +6.55 dB RGB, dE00 −0.54), which is the expected result of
+  giving one codec full chroma resolution rather than a statement about either codec's coding.
+- **ffmpeg's VC-2 encoder saturates near 41–43 dB RGB PSNR** on every configuration tried:
+  yuv422p10le, yuv444p10le, yuv444p12le and 8-bit, slice heights 8/16/32, `-tolerance 0`, wavelet
+  depths 3 and 4. 12 bpp buys **+0.1 dB** over 6 bpp. Below about 4 bpp it ignores `-b:v`
+  altogether — 1.5, 2.5 and 3.5 bpp requests all emit 3.46 bpp and decode to **10.9 dB / dE00
+  27**, which naively scored reads as GNC winning by +31 dB. That is a broken encoder
+  configuration, not a coding result. **This is a limit of ffmpeg's encoder, not of SMPTE VC-2**,
+  which has a lossless mode ffmpeg does not implement.
+- **JPEG XS 4:2:2 saturates too**, at its subsampling ceiling: +33% rate buys +0.26 dB at the top
+  of its ladder.
+
+The harness now enforces both lessons rather than leaving them to a reader: any arm where a >20%
+rate increase buys <0.5 dB prints a `CANARY` line, and any rate-driven rung whose achieved bpp
+misses its request by >15% is dropped (the second check came from the session that briefly shared
+this worktree).
+
+### Three instrument errors, and all three flattered GNC
+
+Worth recording together, because the pattern is the same one this repo keeps finding:
+
+1. **BD-rate integrated over a 0.1 dB overlap.** The first run reported **−58.6%** against
+   ProRes 422 and **−65.7%** against VC-2 — GNC winning by a landslide — from overlaps of 0.1 and
+   2.5 dB, with a cubic fitted through points far outside the window. Now ≥3 dB of overlap is
+   required and the fit uses only points inside the window plus one either side. This is
+   COORDINATION rule 4 turned into something the harness enforces.
+2. **The competitor was given the weaker transform.** `opj_compress` defaults to **reversible
+   5/3**, which is the wrong configuration for a lossy comparison. `-I` costs nothing and gains
+   J2K 2–3 dB at matched rate (bbb at 4.80 bpp: 45.55 → 48.58 dB). Measured with the default, J2K
+   is +20.2% behind on RGB; measured correctly it is **+54.2% ahead**. That single flag is the
+   difference between "GNC is comfortably ahead of J2K" and "J2K is the codec to beat". **Any J2K
+   figure in this repo taken without `-I` understates it.**
+3. **A saturated arm read as a landslide.** Covered above; the VC-2 rows would have supported
+   "GNC beats VC-2 by 60%" on a global fit.
+
+The reversible-5/3 arm is kept, because it explains an otherwise baffling reading: its RCT luma is
+numerically identical to YCoCg-R's, so once its luma subbands are fully coded, Y-PSNR runs off to
+**79.5–104.8 dB** while colour error remains. That is real, not a bug, and it is why its Y-PSNR
+column cannot be compared with anyone else's.
+
+### What is not measured
+
+- **Throughput and latency, deliberately.** The arm64 JPEG XS build has every SIMD kernel disabled,
+  so no speed figure from it means anything, and BACKLOG's request to put the JPEG XS rate figure
+  next to MEAS-6's latency row cannot be honoured from this build. Rate and quality are exact.
+- **Inter.** Every arm here is all-intra, on stills. The entropy gap on inter residuals is
+  unmeasured and is the obvious successor to this item, especially under decision 0018.
+- **q=100.** No lossless arm: BUG-15 (the wavelet lossless path was not bit-exact on main until
+  today, because CHROMA-1 raised chroma_weight to 1.2 for all q ≥ 60 including 100). Every GNC arm
+  here is q=60–99 on the default MED path. `--huffman` and `--rans` are not used in any arm; both
+  have open defects at high q.
+- **VMAF, deliberately.** Luma-only and saturated at this operating point, where widening a ladder
+  moved it 47.5 points on average (QUAL-1).
+
+### Reproducing it
+
+```bash
+scripts/build_jpegxs_arm64.sh                    # once, for the JPEG XS arms
+"$(git rev-parse --show-toplevel)/.venv/bin/python" scripts/meas9_contribution.py --selftest
+"$(git rev-parse --show-toplevel)/.venv/bin/python" scripts/meas9_contribution.py \
+    --images test_material/frames/{bbb_1080p,blue_sky_1080p,kristensara_720p,touchdown_1080p}.png \
+    --arms gnc,jpegxs,jpegxs422,prores444,prores422,vc2,j2k,j2k_rev --csv meas9.csv
+```

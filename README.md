@@ -28,8 +28,23 @@ GNC is deliberately **broad**: intra and inter, 4:2:0 / 4:2:2 / 4:4:4 at 8 and 1
   lines and EBU measures it under one frame. The 256-line tile floor is not reachable today: the
   pipeline processes whole frames, so the practical floor is one full frame whatever the tile
   size. See [`docs/POSITIONING.md`](docs/POSITIONING.md) for where that leaves GNC against the
-  incumbents in this segment, and note that the +90.5% figure above is measured against x264,
-  which is a sanity anchor rather than a competitor here — JPEG XS, J2K, VC-2 and ProRes are.
+  incumbents in this segment.
+- **Against the intra codecs it actually competes with** (MEAS-9, 2026-09-07,
+  `scripts/meas9_contribution.py`, four images, one metric path). BD-rate, positive = GNC needs
+  more bits at matched quality; both columns are given because a single one reverses the ranking:
+
+  | | RGB PSNR | Y-PSNR (YCoCg-R) |
+  |---|---|---|
+  | JPEG XS 4:4:4 | **−10.2%** | +29.4% |
+  | ProRes 4444 | +20.2% | +29.3% |
+  | JPEG 2000 9/7 | +54.2% | +79.7% |
+
+  **JPEG 2000 uses the same transform as GNC — 9/7 wavelet, five levels — and still needs 54%
+  fewer bits**, winning on CIEDE2000 at matched rate too. When the transform is the same, the gap
+  is the entropy coder: J2K's is EBCOT, and `--abac` (−17.3% at q=90) closes about a third of it.
+  The 4:2:2 arms — JPEG XS 4:2:2, ProRes 422 — cannot be BD-rate compared at all: chroma
+  subsampling caps them at 39–45 dB RGB PSNR, below GNC's range, and at matched rate GNC beats
+  both on luma and colour, which is what full chroma resolution buys rather than a coding result.
 - At *distribution* bitrates the gap is much larger. GNC is not built for that operating point.
 
 **Off by default, and why:** the B-frame pyramid (costs 7–31% in rate on camera content and 160 ms in latency), temporal wavelet mode (loses 2–5 dB on high motion), and motion-compensated temporal filtering (measured 1.04–1.14x *worse* than a P-frame chain on every sequence tested).

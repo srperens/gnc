@@ -1908,44 +1908,78 @@ Metric rules apply: dE00 via `scripts/chroma_metric.py`, luma in YCoCg-R via `sc
 not luma computed from decoded RGB. Success criterion: state the offset, the matched rate, and the
 dE00 delta per sequence. Half an afternoon.
 
-### MEAS-9 — JPEG XS in `--compare-codecs` (in progress 2026-09-07, `meas9` worktree)
+### MEAS-9 — GNC against the codecs it actually competes with (**DONE 2026-09-07**)
 
-`--compare-codecs` covers JPEG and JPEG 2000. The framing is contribution, and in that segment the
-incumbents are JPEG XS, J2K, VC-2 and ProRes (docs/POSITIONING.md) — x264 is a sanity anchor, not
-a competitor. **JPEG XS is the one that decides the positioning** and it is not measured.
+Filed as "JPEG XS in `--compare-codecs`". Delivered as `scripts/meas9_contribution.py`: seven arms
+— GNC, JPEG XS 4:4:4 and 4:2:2, ProRes 4444 and 422, VC-2, JPEG 2000 in both transform modes — on
+four images, through **one metric path** (each arm decodes to an 8-bit RGB PNG; every figure comes
+from that PNG, so no arm reports its own quality). Full numbers in RESEARCH_LOG 2026-09-07.
 
-Three implementations are available to compare against; the ISO reference (libjxs) and Intel's
-SVT-JPEG-XS with its ffmpeg plugin are the practical routes. Measure at the contribution operating
-point, report bpp at matched PSNR-Y and dE00, and put the number next to the latency row from
-MEAS-6 — +90.5% against x264 is far easier to defend beside a JPEG XS figure and a latency figure
-than on its own.
+**Mean BD-rate, GNC vs each arm. Positive = GNC needs more bits at matched quality.**
 
-Note JPEG XS is patented (GOALS §, and docs/POSITIONING.md) — this is a comparison, not a target
-to adopt.
+| arm | Y-PSNR (YCoCg-R) | RGB PSNR |
+|---|---|---|
+| **J2K 9/7** (irreversible) | **+79.7%** | **+54.2%** |
+| J2K 5/3 reversible (opj default) | +67.9% | +20.2% |
+| JPEG XS 4:4:4 | +29.4% | **−10.2%** |
+| ProRes 4444 | +29.3% | +20.2% |
+| JPEG XS 4:2:2, ProRes 422, VC-2 | not computable — their ranges do not reach GNC's | |
 
-**JPEG XS IS measurable on this machine — corrected 2026-09-07, and the paragraph this replaces
-was wrong.** What is true: ffmpeg here knows the codec id and has no implementation (`-codecs`
-shows `..VILS jpegxs`, `-h encoder=jpegxs` reports no encoder), and Homebrew has no `libjxs` or
-`svt-jpeg-xs` formula. The wrong inference was that SVT-JPEG-XS is therefore x86-only: **only its
-build system is.** The C sources carry `#else /* ARCH_X86_64 */` scalar fallbacks for every
-dispatch, so the portable path was written and merely never selected.
+**The load-bearing result: JPEG 2000 uses the same transform as GNC — 9/7 wavelet, five levels —
+and needs 54% fewer bits on RGB and 80% fewer on luma, winning on dE00 at matched rate too.** When
+the transform is the same, the gap is not the transform; it is the entropy coder and coefficient
+modelling. J2K's is EBCOT. abac (shipped the same day, GP18, `--abac`, −17.3% at q=90) is about a
+third of the RGB gap, so it is the right lever and not the whole answer. **Re-run this comparison
+with `--abac` on** — one flag on the GNC arm — before deciding what else EBCOT-ish is worth
+building.
 
+Two results that change how figures must be quoted:
+
+- **GNC protects chroma more than any of the five.** Y-PSNR minus RGB PSNR at ~4.5 bpp on bbb:
+  GNC +1.39 dB, VC-2 +1.99, ProRes 4444 +2.33, J2K 9/7 +2.56, JPEG XS 4:4:4 **+5.50**. That single
+  allocation difference flips the ranking against JPEG XS between the two metrics, so **neither
+  number alone ranks GNC against a 4:4:4 incumbent.** Measured now against five independent codecs
+  in the same direction, so it is a property of GNC, not of one comparison.
+- **Content spread exceeds the codec difference.** ProRes 4444 ranges −4.3% to +52.4% RGB across
+  four images; GNC is ahead on bbb (animation) and clearly behind on touchdown (crowd and grass
+  texture, −4.8 dB RGB at matched rate). A single-image result on this axis is an anecdote.
+
+**Three instrument errors, all of which flattered GNC**, and all now guarded in the harness:
+BD-rate integrated over 0.1 dB of overlap read as −58.6% (now ≥3 dB required, fit windowed);
+`opj_compress` defaults to **reversible 5/3**, the wrong mode for a lossy comparison, worth 2-3 dB
+to J2K — with the default J2K looks 20% *behind*, with `-I` it is 54% ahead (**any J2K figure in
+this repo taken without `-I` understates it**); and a saturated arm reads as a landslide. Validated
+with `--selftest` (identical curves +0.000%, a uniformly 20%-cheaper reference exactly +25.000%,
+narrow overlap refused) and byte-identical across two runs and two Python interpreters.
+
+**Still open from this item, and each is a successor rather than a gap in the result:**
+
+1. **Re-measure with `--abac`.** Cheapest and highest-value: it directly tests how much of the J2K
+   gap the shipped coder closes.
+2. **Inter.** Every arm here is all-intra on stills. The entropy gap on inter residuals is
+   unmeasured and is where the H.264 gap is largest.
+3. **Latency, which cannot come from this build.** The arm64 JPEG XS build has every SIMD kernel
+   disabled, so rate and quality are exact and **no speed figure from it means anything.** The
+   original request to sit the JPEG XS figure next to MEAS-6's latency row needs a machine with the
+   SIMD paths, or an explicit note that no JPEG XS speed figure exists here.
+4. **q=100 / lossless arms.** Excluded because of BUG-15 (the wavelet lossless path was not
+   bit-exact on main until 2026-09-07). Every GNC arm here is q=60-99 on the default MED path;
+   `--huffman` and `--rans` are unused, both having open defects at high q.
+
+**How to build the JPEG XS arms** (kept, because the correction cost two sessions a wrong
+conclusion). ffmpeg here knows the codec id and has no implementation (`-codecs` shows
+`..VILS jpegxs`), and Homebrew has no `libjxs` or `svt-jpeg-xs` formula — but **only SVT-JPEG-XS's
+build system is x86-only.** Its C sources carry `#else /* ARCH_X86_64 */` scalar fallbacks for
+every dispatch, so the portable path was written and merely never selected.
 `scripts/build_jpegxs_arm64.sh` + `scripts/svt-jpegxs-arm64.patch` (commit `bc851c7`) clone
 upstream at a pinned commit, gate the nasm discovery / `-DARCH_X86_64` / nine ASM object libraries
-on a detected `SVT_ARCH_X86`, and build. Nothing is prebuilt in the checkout — run the script; it
-installs to `${TMPDIR}/svt-jpegxs` by default and leaves the apps in `Bin/Release/`. It verifies
-rather than trusting the link: 1920x1080 yuv422p at `--bpp 3` round-trips to **PSNR y 44.484 dB**,
-reproduced from a clean clone by two sessions independently.
+on a detected `SVT_ARCH_X86`, and build to `${TMPDIR}/svt-jpegxs/Bin/Release/`. Nothing is
+prebuilt — run the script. It verifies rather than trusting the link: 1920x1080 yuv422p at
+`--bpp 3` round-trips to **PSNR y 44.484 dB**, reproduced from a clean clone by two sessions
+independently.
 
-**Rate and quality from that build are exact. Throughput is not, and must never be quoted from
-it** — every SIMD kernel is disabled on this arch. That splits this item: the bpp-at-matched-quality
-half is deliverable now, the "put it next to MEAS-6's latency row" half is not, and needs either a
-machine with the SIMD paths or an explicit note that no JPEG XS speed figure exists here.
-
-The arm is 4:2:2, so judge it on Y-PSNR and dE00 — `yuv422p10le` caps near 39 dB on RGB PSNR from
-subsampling alone, which is larger than any coding difference in the comparison. ProRes 4444/422,
-VC-2 and JPEG 2000 remain as the other arms; note the ffmpeg VC-2 encoder saturates at 41-43 dB
-regardless of rate, so it cannot be quoted as a statement about SMPTE VC-2 (see RESEARCH_LOG).
+Note JPEG XS is patented (GOALS, docs/POSITIONING.md) — this is a comparison, not a target to
+adopt.
 
 ### ENT-2 — Rice vs rANS on one commit (**DONE 2026-09-07**)
 

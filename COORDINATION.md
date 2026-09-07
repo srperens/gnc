@@ -551,6 +551,13 @@ wrong conclusions have come from this one error.
   surviving one still does — this change neither causes nor hides it — and it looks like the
   same shape as "the encoder's local decode diverges from the real decoder down a GOP".
 
+  **New item filed on the way out, BUG-26 (P2):** abac and Rice decode to *different pixels* at
+  4:2:2 and 4:2:0 on the **intra** path — max |diff| 12-13 over ~4% of samples at q=50, 5 over
+  ~1% at q=75, identical at q=90. **Reproduces on `main` at `1d67d29`, so it is not this change.**
+  No published figure is wrong (every abac measurement in the repo is 4:4:4), but abac's "at
+  identical pixels" and decision `0018`'s "every chroma format at once" are 4:4:4 claims, and
+  nothing said so. Small differences over a large area is the shape a PSNR average hides.
+
   **For whoever holds ENT-5 (abac GPU encoder):** rebase onto this. `inter_gpu_entropy_available()`
   in `entropy_helpers.rs` is now the single place that says which coders have a GPU entropy
   encoder; adding abac's shader means adding it there plus a dispatch arm beside Rice and rANS,

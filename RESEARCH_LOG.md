@@ -404,6 +404,34 @@ decides on other grounds.
   1.0 (q >= ~70). True on both implementations before and on the one that remains, so this change
   neither causes nor hides it. That is **BUG-8**, held by another session.
 
+### Re-verified after rebasing onto `1d67d29`
+
+main moved during the session (INTRA-1 step 1, BUG-25). Rebased and re-measured rather than
+carrying figures taken against the branch point (rule 1): **54 of 54 byte-identical** against a
+binary pinned at `1d67d29`, and the nine abac inter points reproduce byte-for-byte
+(3 241 421 / 7 270 828 / …), so INTRA-1's abac changes did not move abac's output either. 221
+tests pass, clippy clean.
+
+**B-frames, all three chroma formats, both coders**: 18 frames encode and decode. abac is
+−20.5% (4:4:4), −18.9% (4:2:2), −18.3% (4:2:0) against Rice, and at 4:4:4 the decoded pixels are
+bit-identical.
+
+### Found on the way, filed as BUG-26 (P2), not caused here
+
+At **4:2:2 and 4:2:0 the abac and Rice decodes differ**, on the *intra* path, and reproduce
+identically on `main` — so this predates ARCH-3 and is unrelated to the inter work. Single frame
+of bbb_extended: max |diff| 12-13 over 3.9-4.3% of samples at q=50, 5 over 0.6-1.1% at q=75, and
+**identical at q=90**. Entropy coding is lossless, so this is two coders coding different
+coefficients, not a coder bug in the ordinary sense.
+
+Two things it costs, and both are about scope rather than about a wrong number: abac's standing
+"−16.6% to −18.8% **at identical pixels**" and decision `0018`'s "every chroma format at once" are
+both 4:4:4 measurements, and the q boundary (differs at 50 and 75, agrees at 90) points at
+adaptive quantisation or CfL side data indexed with the luma tile count on planes that have a
+different tile grid. The magnitude — small differences over a large area — is precisely what a
+PSNR average to two decimals cannot see, which is the third time that shape has appeared in this
+repository this week.
+
 Commit: see below. Decision record `docs/decisions/0025-the-entropy-stage-is-not-a-frame-encoder.md`.
 
 

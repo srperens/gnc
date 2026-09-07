@@ -1115,6 +1115,50 @@ decoder down a GOP"), which may be this seen from the other side.
 
 </details>
 
+### BUG-26 — abac and Rice decode to different pixels on subsampled chroma (todo, P2)
+
+Found 2026-09-07 while closing ARCH-3, on the intra path, **and reproduced identically on `main`
+at `1d67d29`** — so it is not caused by ARCH-3 and it is not about inter. Filing it because it
+contradicts a standing claim, not because it was hit.
+
+**The claim it contradicts.** abac's headline is "−16.6% to −18.8% **at identical pixels**", and
+decision `0018` says abac "pays on intra, inter, lossless and every chroma format at once". Entropy
+coding is lossless, so Rice and abac must decode a frame to the same bytes. At 4:4:4 they do, at
+every quality tried. **At 4:2:2 and 4:2:0 they do not.**
+
+**Measured**, single all-intra frame of bbb_extended, 1920x1080:
+
+| chroma | q | pixels | max \|diff\| | differing samples | rice bytes | abac bytes |
+|---|---|---|---|---|---|---|
+| 4:2:2 | 50 | **DIFFER** | 12 | 266 151 (4.28%) | 612 776 | 514 311 |
+| 4:2:2 | 75 | **DIFFER** | 5 | 68 187 (1.10%) | 1 005 253 | 871 762 |
+| 4:2:2 | 90 | identical | 0 | 0 | 1 562 781 | 1 360 681 |
+| 4:2:0 | 50 | **DIFFER** | 13 | 242 574 (3.90%) | 530 700 | 447 710 |
+| 4:2:0 | 75 | **DIFFER** | 5 | 36 332 (0.58%) | 865 324 | 755 090 |
+| 4:2:0 | 90 | identical | 0 | 0 | 1 327 234 | 1 161 662 |
+
+Mean magnitude over the differing samples is 1.2-1.6, so this is a *small* difference over a
+*large* area — the shape that PSNR to two decimals hides, which is how BUG-18's first two
+explanations went wrong. It is not visible corruption; it is two coders coding different
+coefficients.
+
+**Where to look first.** The q boundary is the tell: it differs at q=50 and q=75 and agrees at
+q=90. Two features switch off between those points — **adaptive quantisation** (on for
+30 ≤ q ≤ 80) and **CfL** (on for 50 ≤ q ≤ 85) — and both write per-tile side data whose layout is
+tile-count-dependent. On non-444 the chroma planes have a *different tile grid* from luma, and
+`pipeline.rs` already carries an assert saying the rANS and Huffman batch dispatches cannot handle
+that; Rice and abac each have their own per-plane path. One of the two is very likely indexing
+that side data with the luma tile count. Read `use_cfl` and the AQ weight-map indexing in
+`pipeline.rs` against the abac per-plane dispatch before anything else.
+
+**Why P2 and not P1.** Nothing shipped is measured at non-444 with abac: every abac figure in the
+repository (intra, lossless, and the inter figures added 2026-09-07) is 4:4:4. So no published
+number is wrong. What is wrong is the *scope* claimed for them, and the next person to quote abac
+on a 4:2:0 mezzanine would be quoting a coder that changes the picture.
+
+**Do not close this by widening a tolerance.** The correct assertion is bit-exactness — a
+`psnr > 45.0` check reads 55 dB as a pass, which is exactly how BUG-15 survived a day.
+
 ### BUG-16 — Rice's GPU and CPU encode paths disagree on the coefficients (todo, P2)
 
 Found 2026-09-07 while shipping abac (ABAC-SHIP); **not an abac defect** and not chased there.

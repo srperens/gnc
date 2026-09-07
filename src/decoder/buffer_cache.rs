@@ -82,6 +82,10 @@ pub(super) struct CachedBuffers {
     pub(super) plane_alpha_bufs: [wgpu::Buffer; 2],
     pub(super) plane_alpha_cap: u64,
 
+    /// Per-plane CPU scratch for packing Rice streams before upload. Reused every frame; see
+    /// `RiceDecodeScratch` (PERF-1 item 7).
+    pub(super) rice_pack_scratch: [crate::encoder::rice_gpu::RiceDecodeScratch; 3],
+
     /// When true, entropy decoding was done on CPU (context-adaptive mode).
     /// `encode_gpu_work` should copy from `cpu_decoded_planes` instead of GPU decode.
     pub(super) ctx_adaptive_decode: bool,
@@ -526,6 +530,7 @@ impl CachedBuffers {
             cfl_alpha_cap,
             plane_alpha_bufs,
             plane_alpha_cap,
+            rice_pack_scratch: Default::default(),
             ctx_adaptive_decode: false,
             abac_blocks: [0; 3],
             abac_coder: [crate::encoder::abac::Coder::default(); 3],

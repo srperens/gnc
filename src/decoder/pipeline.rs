@@ -403,10 +403,23 @@ impl DecoderPipeline {
         let result: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
         drop(data);
         bufs.staging.unmap();
+        // PERF-1 item 7 canary: the pack scratch is reused, so this must stop rising. A count
+        // that keeps climbing frame after frame means it is being reallocated every frame.
+        let pack_grows: usize = bufs.rice_pack_scratch.iter().map(|s| s.grows).sum();
+        let pack_bytes: usize = bufs
+            .rice_pack_scratch
+            .iter()
+            .map(|s| (s.k_values.len() + s.stream_data.len() + s.stream_offsets.len()) * 4)
+            .sum();
         drop(cached);
 
         if profile {
             let t_total = t_start.elapsed();
+            eprintln!(
+                "[decode profile] rice_pack_scratch_grows={pack_grows} held={:.2}MB \
+                 (was allocated, zero-filled and dropped every frame)",
+                pack_bytes as f64 / (1024.0 * 1024.0)
+            );
             eprintln!(
                 "[decode profile] alloc={:.2}ms prepare={:.2}ms cmd={:.2}ms submit={:.2}ms readback={:.2}ms total={:.2}ms",
                 t_alloc.as_secs_f64() * 1000.0,

@@ -176,17 +176,25 @@ impl DecoderPipeline {
                 for p in 0..3 {
                     let start = plane_offset[p];
                     let p_tiles = &tiles[start..start + plane_tiles[p]];
-                    let packed = GpuRiceDecoder::pack_decode_data(p_tiles, plane_info[p]);
+                    // Packed into scratch held by the buffer cache, not into three fresh Vecs:
+                    // at 1080p 4:4:4 that was ~3 MB allocated, zero-filled and dropped per
+                    // frame (PERF-1 item 7). `lens` says how much of the scratch is this
+                    // frame's — the vectors themselves stay at high-water mark.
+                    let scratch = &mut bufs.rice_pack_scratch[p];
+                    let lens = GpuRiceDecoder::pack_decode_data_into(p_tiles, plane_info[p], scratch);
+                    let k_values = &scratch.k_values[..lens.k_len];
+                    let stream_data = &scratch.stream_data[..lens.stream_words];
+                    let stream_offsets = &scratch.stream_offsets[..lens.offsets_len];
 
                     // Params → entropy_params (uniform-sized buffer, write directly)
                     ctx.queue.write_buffer(
                         &bufs.entropy_params[p],
                         0,
-                        bytemuck::bytes_of(&packed.params),
+                        bytemuck::bytes_of(&lens.params),
                     );
 
                     // k_values → entropy_tile_info
-                    let k_size = (packed.k_values.len() * 4) as u64;
+                    let k_size = (k_values.len() * 4) as u64;
                     ensure_var_buf(
                         ctx,
                         &mut bufs.entropy_tile_info[p],
@@ -198,11 +206,11 @@ impl DecoderPipeline {
                     ctx.queue.write_buffer(
                         &bufs.entropy_tile_info[p],
                         0,
-                        bytemuck::cast_slice(&packed.k_values),
+                        bytemuck::cast_slice(k_values),
                     );
 
                     // stream_data → entropy_var_a
-                    let stream_size = (packed.stream_data.len() * 4) as u64;
+                    let stream_size = (stream_data.len() * 4) as u64;
                     ensure_var_buf(
                         ctx,
                         &mut bufs.entropy_var_a[p],
@@ -214,11 +222,11 @@ impl DecoderPipeline {
                     ctx.queue.write_buffer(
                         &bufs.entropy_var_a[p],
                         0,
-                        bytemuck::cast_slice(&packed.stream_data),
+                        bytemuck::cast_slice(stream_data),
                     );
 
                     // stream_offsets → entropy_var_b
-                    let offsets_size = (packed.stream_offsets.len() * 4) as u64;
+                    let offsets_size = (stream_offsets.len() * 4) as u64;
                     ensure_var_buf(
                         ctx,
                         &mut bufs.entropy_var_b[p],
@@ -230,7 +238,7 @@ impl DecoderPipeline {
                     ctx.queue.write_buffer(
                         &bufs.entropy_var_b[p],
                         0,
-                        bytemuck::cast_slice(&packed.stream_offsets),
+                        bytemuck::cast_slice(stream_offsets),
                     );
                 }
             }

@@ -1388,10 +1388,17 @@ impl GpuRiceDecoder {
     }
 
     /// Pack RiceTile data for GPU decode. Returns (k_values, stream_data, stream_offsets) buffers.
-    pub fn pack_decode_data(
+    /// Pack into caller-owned scratch instead of three fresh `Vec`s.
+    ///
+    /// Same bytes as [`pack_decode_data`](Self::pack_decode_data) — it is now written in terms
+    /// of this — but on the decode hot path the vectors are reused frame to frame.
+    ///
+    /// Returns the params; the data is in `scratch`.
+    pub fn pack_decode_data_into(
         tiles: &[RiceTile],
         info: &FrameInfo,
-    ) -> RiceDecodeData {
+        scratch: &mut RiceDecodeScratch,
+    ) -> RicePackedLens {
         let num_tiles = tiles.len();
         let total_streams = num_tiles * RICE_STREAMS_PER_TILE;
 
@@ -1399,35 +1406,43 @@ impl GpuRiceDecoder {
         // Layout: [k_mag ×8][k_zrl_nz ×8][k_zrl_z ×8][skip_bitmap ×1] = 25 entries
         // Checkerboard ctx: odd-stream k is derived by GPU decoder from decoded even-stream
         // EMA via workgroup shared memory — no bitstream storage needed.
-        let mut k_values = vec![0u32; num_tiles * K_STRIDE];
+        let k_len = num_tiles * K_STRIDE;
+        resize_scratch(&mut scratch.k_values, k_len, &mut scratch.grows);
+        scratch.k_values[..k_len].fill(0);
         for (t, tile) in tiles.iter().enumerate() {
             for (g, &k) in tile.k_values.iter().enumerate() {
-                k_values[t * K_STRIDE + g] = k as u32;
+                scratch.k_values[t * K_STRIDE + g] = k as u32;
             }
             for (g, &k) in tile.k_zrl_nz_values.iter().enumerate() {
-                k_values[t * K_STRIDE + MAX_GROUPS + g] = k as u32;
+                scratch.k_values[t * K_STRIDE + MAX_GROUPS + g] = k as u32;
             }
             for (g, &k) in tile.k_zrl_z_values.iter().enumerate() {
-                k_values[t * K_STRIDE + MAX_GROUPS * 2 + g] = k as u32;
+                scratch.k_values[t * K_STRIDE + MAX_GROUPS * 2 + g] = k as u32;
             }
-            k_values[t * K_STRIDE + K_STRIDE - 1] = tile.skip_bitmap as u32;
+            scratch.k_values[t * K_STRIDE + K_STRIDE - 1] = tile.skip_bitmap as u32;
         }
 
         // Compute total stream data size and stream offsets
-        let mut stream_offsets = vec![0u32; total_streams];
+        resize_scratch(&mut scratch.stream_offsets, total_streams, &mut scratch.grows);
         let mut total_bytes = 0u32;
         for (t, tile) in tiles.iter().enumerate() {
             for s in 0..RICE_STREAMS_PER_TILE {
-                stream_offsets[t * RICE_STREAMS_PER_TILE + s] = total_bytes;
+                scratch.stream_offsets[t * RICE_STREAMS_PER_TILE + s] = total_bytes;
                 total_bytes += tile.stream_lengths[s];
             }
         }
 
         // Pack stream data (allocate as u32 for alignment, then copy bytes in)
         let padded_words = (total_bytes as usize).div_ceil(4);
-        let mut stream_data_u32 = vec![0u32; padded_words];
+        resize_scratch(&mut scratch.stream_data, padded_words, &mut scratch.grows);
         {
-            let stream_data_bytes: &mut [u8] = bytemuck::cast_slice_mut(&mut stream_data_u32);
+            let words = &mut scratch.stream_data[..padded_words];
+            // Only the tail can keep stale bytes from a previous frame, and the shader reads
+            // `total_bytes`, not the padding — but zero it so the upload is deterministic.
+            if let Some(last) = words.last_mut() {
+                *last = 0;
+            }
+            let stream_data_bytes: &mut [u8] = bytemuck::cast_slice_mut(words);
             let mut write_pos = 0usize;
             for tile in tiles {
                 stream_data_bytes[write_pos..write_pos + tile.stream_data.len()]
@@ -1436,7 +1451,7 @@ impl GpuRiceDecoder {
             }
         }
 
-        RiceDecodeData {
+        RicePackedLens {
             params: RiceParams {
                 num_tiles: num_tiles as u32,
                 coefficients_per_tile: info.tile_size * info.tile_size,
@@ -1448,9 +1463,27 @@ impl GpuRiceDecoder {
                 max_stream_bytes: 0,
                 _pad0: 0,
             },
-            k_values,
-            stream_data: stream_data_u32,
-            stream_offsets,
+            k_len,
+            stream_words: padded_words,
+            offsets_len: total_streams,
+        }
+    }
+
+    /// Pack for a one-off upload, allocating fresh vectors.
+    ///
+    /// The decode hot path uses [`pack_decode_data_into`](Self::pack_decode_data_into) with
+    /// reusable scratch; this wrapper is for tests and the one-shot decode helpers.
+    pub fn pack_decode_data(tiles: &[RiceTile], info: &FrameInfo) -> RiceDecodeData {
+        let mut scratch = RiceDecodeScratch::default();
+        let lens = Self::pack_decode_data_into(tiles, info, &mut scratch);
+        scratch.k_values.truncate(lens.k_len);
+        scratch.stream_data.truncate(lens.stream_words);
+        scratch.stream_offsets.truncate(lens.offsets_len);
+        RiceDecodeData {
+            params: lens.params,
+            k_values: scratch.k_values,
+            stream_data: scratch.stream_data,
+            stream_offsets: scratch.stream_offsets,
         }
     }
 
@@ -1504,12 +1537,45 @@ impl GpuRiceDecoder {
     }
 }
 
+/// What [`GpuRiceDecoder::pack_decode_data_into`] wrote, and how much of the scratch it used.
+///
+/// The scratch is kept at high-water mark, so its `len()` is not the length to upload.
+pub struct RicePackedLens {
+    pub params: RiceParams,
+    pub k_len: usize,
+    pub stream_words: usize,
+    pub offsets_len: usize,
+}
+
+/// Grow `v` to at least `len` without shrinking it, counting the growths.
+fn resize_scratch(v: &mut Vec<u32>, len: usize, grows: &mut usize) {
+    if v.len() < len {
+        v.resize(len, 0);
+        *grows += 1;
+    }
+}
+
 /// Packed data ready for GPU Rice decode upload.
 pub struct RiceDecodeData {
     pub params: RiceParams,
     pub k_values: Vec<u32>,
     pub stream_data: Vec<u32>,
     pub stream_offsets: Vec<u32>,
+}
+
+/// Reusable CPU scratch for [`GpuRiceDecoder::pack_decode_data_into`].
+///
+/// The same three vectors every frame, kept at high-water mark. Decoding a 1080p 4:4:4 frame
+/// used to allocate and zero-fill roughly 3 MB of them per frame and drop it again (PERF-1
+/// item 7); one of these per plane in the decoder's cache reuses the allocation instead.
+#[derive(Default)]
+pub struct RiceDecodeScratch {
+    pub k_values: Vec<u32>,
+    pub stream_data: Vec<u32>,
+    pub stream_offsets: Vec<u32>,
+    /// Times a vector had to grow. Steady state is 0 after the first frame — the canary that
+    /// says the scratch is being reused rather than silently reallocated every frame.
+    pub grows: usize,
 }
 
 #[cfg(test)]
@@ -1608,7 +1674,7 @@ mod tests {
         slice.map_async(wgpu::MapMode::Read, move |result| {
             tx.send(result).unwrap();
         });
-        crate::gpu_util::poll_wait(ctx);
+        crate::gpu_util::poll_wait(&ctx);
         rx.recv().unwrap().unwrap();
 
         let data = slice.get_mapped_range();
@@ -1758,7 +1824,7 @@ mod tests {
                 slice.map_async(wgpu::MapMode::Read, move |result| {
                     tx.send(result).unwrap();
                 });
-                crate::gpu_util::poll_wait(ctx);
+                crate::gpu_util::poll_wait(&ctx);
                 rx.recv().unwrap().unwrap();
                 let data = slice.get_mapped_range();
                 let gpu_plane: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
@@ -1887,7 +1953,7 @@ mod tests {
             slice.map_async(wgpu::MapMode::Read, move |result| {
                 tx.send(result).unwrap();
             });
-            crate::gpu_util::poll_wait(ctx);
+            crate::gpu_util::poll_wait(&ctx);
             rx.recv().unwrap().unwrap();
             let data = slice.get_mapped_range();
             let gpu_plane: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
@@ -2036,7 +2102,7 @@ mod tests {
         slice.map_async(wgpu::MapMode::Read, move |result| {
             tx.send(result).unwrap();
         });
-        crate::gpu_util::poll_wait(ctx);
+        crate::gpu_util::poll_wait(&ctx);
         rx.recv().unwrap().unwrap();
 
         let data = slice.get_mapped_range();

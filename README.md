@@ -12,7 +12,7 @@ GNC asks: if you start from zero with a GPU-first mindset, what do you end up wi
 
 The answer so far: tile-independent processing, fully parallel entropy coding (256 independent streams per tile), and wavelet transforms that map naturally to GPU workgroups. It runs a full I/P/B video pipeline in real time at 1080p on an eight-core integrated GPU.
 
-GNC targets **contribution** — the high-quality, low-latency link between a camera or a production facility and whatever comes next — not distribution to viewers. That choice sets the operating point everything below is measured at, and it is why the comparisons are against H.264 near lossless rather than at streaming bitrates.
+GNC is deliberately **broad**: intra and inter, 4:2:0 / 4:2:2 / 4:4:4 at 8 and 10 bits, and a quality range that runs from heavy compression through visually lossless to bit-exact lossless. The uses it is built for — contribution links, mezzanine and archival storage, low-latency preview, browser playback — encode about as often as they decode, which bounds how much encoder *search* is worth buying but not the compression target: that is roughly H.264-class across the whole range. Every figure below therefore names the operating point it was measured at, because several of this project's retracted results came from measuring one end and quoting it as if it described the codec.
 
 ## Status
 

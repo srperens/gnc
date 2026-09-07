@@ -4,19 +4,37 @@
 
 GNC is a patent-free **video codec** designed from scratch for GPU parallelism. Everything runs as wgpu compute shaders (WGSL) — cross-platform on Metal, Vulkan, DX12, and WebGPU/WASM. The core idea: tile-independent processing with thousands of parallel threads instead of sequential CPU-era algorithms.
 
-### GNC is a contribution codec, not a distribution codec
+### GNC is broad on purpose — that is the decision, not an unresolved question (2026-09-07)
 
-This is the decision that sets every target below, so it comes first. The full reasoning, the
-market requirements it rests on, and the measurements behind it are in
-**[docs/POSITIONING.md](docs/POSITIONING.md)** — read that before changing any target here.
+This is the decision that sets every target below, so it comes first, and it was **re-affirmed
+explicitly on 2026-09-07** after the repository had drifted into narrowing it. The market
+requirements, the sourced external facts and the measurements are in
+**[docs/POSITIONING.md](docs/POSITIONING.md)** — read that before changing any target here, but
+read §2 knowing its "commit to one segment" recommendation was **rejected**.
 
-A distribution codec (H.264, HEVC, AV1) is encoded once and decoded a billion times. Spending
-enormous encoder effort to shave a percent off the bitrate is rational there, because the bitrate
-is paid a billion times over. **That is not what GNC is for.** GNC encodes and decodes roughly as
-often as each other: contribution links, mezzanine storage, low-latency preview, browser playback.
+**The goal is a codec that is good at many things, not excellent at one.** A codec built for a
+single niche is one of many; there are already dozens. A codec that spans the range is
+interesting. Concretely, all of the following are in scope at once and none of them is the
+"primary" one:
 
-So GNC does **not** try to beat H.264 or AV1 on compression. The target is to be *about as good as
-H.264* while winning on the axes that matter for contribution:
+| axis | the target |
+|---|---|
+| intra | strong — the same picture quality per bit as H.264 intra |
+| inter | strong — a static studio shot should cost almost nothing, and today it does not |
+| quality range | heavy compression through visually lossless to **bit-exact lossless** |
+| chroma | 4:2:0, 4:2:2 and 4:4:4, at 8 and 10 bits |
+| use cases | contribution, mezzanine, **archival**, low-latency preview, browser playback |
+| parallelism | massively parallel, and portable across every GPU with WebGPU/Vulkan/Metal/DX12 |
+| compression | roughly **H.264-class**, across that whole range |
+
+**Several internal strategies, selected by quality and bitrate, is a legitimate design — not a
+failure to find one.** If no single mechanism covers the range, the codec picks per operating
+point, and it already does: MED prediction replaces the wavelet entirely at q=100, the entropy
+coder follows quality, and the wavelet depth follows the tile size. Adding to that set is normal
+engineering here, not an admission of defeat. What is *not* acceptable is a strategy that only
+works at one end and is quietly measured only there.
+
+Where GNC is meant to win outright is portability and scale, against fixed-function silicon:
 
 | | fixed-function (NVENC/QSV/VideoToolbox) | GNC |
 |---|---|---|
@@ -28,22 +46,24 @@ H.264* while winning on the axes that matter for contribution:
 The structural argument is that the number of hardware encoder blocks in a chip is roughly
 constant no matter how large and expensive the GPU is, while shader throughput scales with the
 card. A bigger GPU should therefore buy more GNC instances; it does not buy more NVENC blocks.
-**That claim is currently unproven and is the single most important thing to measure.**
+**That claim is currently unproven and is the single most important thing to measure** (MEAS-5).
 
-Consequences that follow from this positioning:
+Two things that follow, and they are about *measurement discipline*, not about narrowing scope:
 
-- The interesting operating point is **contribution quality** (high bitrate, visually lossless to
-  near-lossless), not streaming bitrates. Historical BD-rate numbers measured at distribution
-  bitrates describe an operating point GNC is not built for.
-- The headline throughput metric is **concurrent streams per GPU** and **latency per frame**, not
-  fps on a single stream.
-- Low latency, frame-accurate seeking and per-tile error resilience are features, not overhead —
-  they are what a contribution link needs, and tile independence is what buys them.
+- **Every operating point is in scope, so a result must say which one it was measured at.** The
+  expensive lessons behind this stay: TUNE-5 was measured at q=15-50, shipped, and cost 10.3 dB at
+  q=99; the headline gap figure was 3x wrong because it was taken at distribution bitrates. A
+  ladder that stops at q=50 has not tested this codec, and neither has one that starts at q=85.
+- **Encoder effort is not free here.** GNC encodes and decodes about as often as each other, so
+  the distribution-codec trade — burn unbounded encoder time to shave a percent, because the
+  bitrate is paid a billion times over — does not apply. That bounds how much *search* is worth
+  buying; it does not lower the compression target.
 
-**GNC is still both intra and inter.** Most established contribution formats are all-intra, and
-going all-intra would be the easy answer here — it is explicitly rejected. Strong intra *and*
-strong inter is the goal. Inter matters at contribution quality too: a static studio shot should
-cost almost nothing, and today it does not.
+**GNC is both intra and inter, and going all-intra is explicitly rejected.** Most established
+contribution formats are all-intra and it would be the easy answer. Entropy coding is the biggest
+single gap against H.264 on inter, and it is the one lever that pays in every row of the table
+above at once — intra, inter, lossless, every chroma format — which is why it leads the priority
+order rather than a format-specific feature.
 
 ## 2. Design Rules
 
@@ -267,7 +287,8 @@ When a diagnostic output exists (--diagnostics, per-frame PSNR, tile energy logs
 
 ## 6. Non-Goals
 
-- **Beating AV1/H.265 on compression ratio** — We occupy a different design point: parallel, low-latency, patent-free. We compete on speed and simplicity, not maximum compression.
+- **Beating AV1/H.265 on compression ratio** — H.264-class across the whole range is the target (§1); matching the codecs a generation beyond it is not. The design point is parallel, low-latency and patent-free, and the compression target is set by what that design can reach, not by the best number in the field. This is *not* licence to dismiss single-digit gains: against the corrected ~1.9x gap they accumulate, and every "too small to bother with" judgement in this repo predating 2026-09-06 was made against a denominator that was 3x wrong.
+- **Narrowing GNC to one segment** — Rejected 2026-09-07, and docs/POSITIONING.md §2's recommendation to do so is superseded. A codec for one niche is one of many; spanning the range is the point.
 - **CPU decode path** — GPU-only by design. No software fallback.
 - **Backward compatibility** — No legacy bitstreams to support (rule 10).
 - **Neural/ML compression** — Extreme complexity for marginal gains. Not worth it for GPU-native design.

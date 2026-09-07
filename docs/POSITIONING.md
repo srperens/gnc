@@ -1,7 +1,10 @@
 # GNC — Positioning, Market Reality, and What To Do About It
 
-**Status:** current as of 2026-09-05. Supersedes nothing; it is the reasoning behind
-[GOALS.md](../GOALS.md) §1 and the priority order in [BACKLOG.md](../BACKLOG.md).
+**Status:** market facts and measurements current as of 2026-09-06. **Its central recommendation
+— "pick one segment" — was rejected by an explicit project decision on 2026-09-07**; see the box in
+§2 and [GOALS.md](../GOALS.md) §1, which is now the authority on what GNC is for. Everything else
+here still stands: the requirements, the sourced external claims and the measurements are what they
+were, and they are why the *engineering* targets are what they are.
 
 **Shareable version:** <https://claude.ai/code/artifact/d8b12c5b-8437-40c9-9a1e-42b2fbb5bfa0>
 (same content, formatted for reading outside the repo).
@@ -15,16 +18,21 @@ measurement is named.
 
 ## 1. What GNC is
 
-**GNC is a contribution codec, not a distribution codec.**
+**GNC is broad on purpose: contribution, mezzanine, archival, preview and browser playback, from
+heavy compression through to bit-exact lossless, intra and inter, 4:2:0/4:2:2/4:4:4 at 8 and 10
+bits.** ([GOALS.md](../GOALS.md) §1 is the authority; this paragraph was rewritten 2026-09-07 to
+match the project decision rather than the earlier draft's recommendation.)
 
-A distribution codec (H.264, HEVC, AV1) is encoded once and decoded a billion times. Spending
-enormous encoder effort to shave a percent off the bitrate is rational there, because the bitrate
-is paid a billion times over. GNC is not that. GNC encodes and decodes roughly as often as each
-other: contribution links, mezzanine storage, low-latency preview, browser playback.
+What survives from that draft is a real asymmetry, and it bounds *encoder effort* rather than
+scope: a distribution codec (H.264, HEVC, AV1) is encoded once and decoded a billion times, so
+burning unbounded encoder time to shave a percent is rational there because the bitrate is paid a
+billion times over. GNC encodes and decodes about as often as each other, so that trade does not
+apply. It does not follow that the compression target is lower — the target is roughly
+**H.264-class across the whole range** — only that buying it with unbounded search is not the way.
 
-So GNC does **not** try to beat H.264 or AV1 on compression. It aims for roughly H.264-class
-quality that runs on **any** GPU and scales with the card, against fixed-function encoders that
-are vendor-locked and session-limited.
+Where GNC is meant to win outright is portability and scale: roughly H.264-class quality that runs
+on **any** GPU and scales with the card, against fixed-function encoders that are vendor-locked and
+session-limited.
 
 The structural argument: the number of hardware video-encoder blocks in a chip is roughly constant
 regardless of how large and expensive the GPU is, and driver session limits cap it further, while
@@ -112,8 +120,27 @@ silicon, multi-vendor interop, a VSF interop recommendation, JT-NM certification
 EBU TR 091 states as an entry condition that a codec must be purchasable or rentable and must use
 SDI or ST 2110 interfaces — GNC cannot currently be entered into the industry's own evaluation.
 
-**Recommendation: commit to cloud mezzanine, proxy and preview. Stop claiming both.**
-GOALS.md currently claims both, and the requirements diverge by years of work.
+> ### That recommendation was rejected (2026-09-07)
+>
+> The draft above concluded: *commit to cloud mezzanine, proxy and preview; stop claiming both.*
+> **The project decided the opposite, deliberately.** A codec built for one niche is one of many —
+> the field is full of them — and the value of GNC is precisely that it spans the range: intra and
+> inter, every chroma format at 10 bits, heavy compression through bit-exact lossless, massively
+> parallel, GPU-portable, H.264-class throughout. Where one strategy cannot cover that, the codec
+> is allowed to select between several by quality and bitrate, which it already does.
+>
+> **What the table above is still good for.** It is an accurate statement of *requirements*, and
+> it separates two kinds of entry cost that the "pick one" framing had conflated:
+>
+> - **Format requirements are engineering, and they are in scope:** 10-bit, 4:2:2, constant
+>   bitrate, sub-frame latency, multi-generation robustness. Each is a measurable target.
+> - **Channel requirements are not engineering, and they are not being pursued now:** SDI or
+>   ST 2110 I/O, an NMOS IS-04/IS-05 control plane, JT-NM Tested certification. These gate entry
+>   into EBU TR 091's evaluation, and no amount of codec work substitutes for them. Not a reason
+>   to narrow the codec; a reason not to claim a live-contribution *product*.
+>
+> So: build the broad codec, measure against the incumbents of every segment it touches (MEAS-9
+> does exactly that), and keep the two costs apart when describing it.
 
 ---
 

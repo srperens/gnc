@@ -85,8 +85,23 @@ table below. Each worktree has its own
 2026-09-07: `cargo test --release` sat at `Blocking waiting for file lock on package cache` for
 minutes while other sessions compiled, with 35 `rustc` processes on the machine. The lock is in
 `~/.cargo`, which every worktree shares; a separate `target/` does not help. So **a build queued
-behind four other sessions is normal, not a hang** — check `pgrep -lf rustc` before assuming
-something is stuck, and start long test runs in the background rather than waiting on them.
+behind four other sessions is normal, not a hang** — start long test runs in the background rather
+than waiting on them, and before assuming something is stuck, ask *who holds the lock*:
+
+```bash
+lsof ~/.cargo/.package-cache                     # the shared one: another session is building
+lsof "$PWD/target/release/.cargo-lock"           # your own: see the trap below
+```
+
+`lsof -p <pid> -a -d cwd` then says which worktree the holder is in, which is usually enough to
+tell "another session is working" from "something of mine is wedged".
+
+**The trap, hit on 2026-09-07: killing a backgrounded `cargo` by its shell leaves `cargo` alive
+holding your build lock.** A background Bash call is `zsh -c '… cargo test …'`, so `pkill -f` on
+the command text matches the *wrapper*, not the cargo underneath it. The wrapper dies, cargo keeps
+running with its parent reparented to launchd, and every later build in that worktree blocks on
+`file lock on build directory` — with no other session at fault and nothing in `ps` that looks
+wrong unless you go looking for the lock holder. Kill the pid `lsof` names, not the pattern.
 
 When your work is ready:
 

@@ -82,6 +82,11 @@ measured advantage over x264 on any axis at this operating point.**
    account for at most ~7.5 of the 27.1 points and ~72% is upstream of the coder.** The item is now
    its step-2 branch — whole-frame transform against 256px tiles, quantiser shape and per-subband
    step, lifting normalisation, code-block geometry. Decision `docs/decisions/0024`.
+   **Step 2, first instalment done (2026-09-07): the gap decomposes.** 8.5 points is chroma
+   allocation against an RGB metric (YCoCg-R's synthesis norms, not a coding deficiency), ≤7.5 is
+   the entropy coder, lifting normalisation is clean (~0), and tiling costs *JPEG 2000* 12.4 points
+   but GNC realises only 0.6% of it. **~9.8 points remain**, and the open question is why a bigger
+   tile buys GNC nothing when it buys J2K 3.8%. Decision `docs/decisions/0026`.
 1. **Intra at contribution quality** — the whole remaining +90.5% lives here, per findings 1 and 5.
    Inter breaks even at this operating point for x264 too, so this is the only place the gap is.
    **First instalment paid 2026-09-07 (ABAC-SHIP): −17.3% of intra rate at q=90, opt-in.** Against
@@ -2752,7 +2757,48 @@ One number, and it decides which of two entirely different investigations to run
 has the machinery: `meas_ebcot_context.py` computes conditional entropy per subband against a
 faithful simulation of the shipped coder, and `GNC_DIAGNOSTICS=1` reports per-group counts.
 
-### Step 2 — **this is the branch step 1 selected.** The candidates, cheapest first
+### Step 2 — **first instalment DONE 2026-09-07. Three of four candidates measured; ~9.8 points left.**
+
+**The harness reproduces ENT-4's headline exactly** (`J2K 9/7` reads +27.1% RGB, +48.3% Y), so the
+baseline is reproduced rather than assumed.
+
+| cause | RGB points | status |
+|---|---|---|
+| chroma allocation against an RGB metric | **8.5** | measured; a deliberate perceptual trade, **not** a coding deficiency |
+| entropy coder headroom | **≤7.5** | decision 0024; half is ENT-6's small-block cold start |
+| tiling, 256px vs whole picture | **≤12.4 for J2K, 0.6 realisable in GNC** | measured in both codecs |
+| lifting normalisation | **~0** | closed — synthesis norms 0.984–1.066, uniform steps within ~5% of MSE-optimal |
+| remainder | **~9.8** | tiling is the leading suspect; GNC does not collect it |
+
+In sequence: +27.2% → +18.7% (chroma) → **+9.8%** (entropy ceiling).
+
+**The colour transform is where the normalisation error is.** YCoCg-R synthesis norms are
+(Y 1.7321, Co 0.7071, Cg 0.8660), spread **2.45**, so RGB-MSE-optimal chroma steps are 2.45x/2.00x
+the luma step; production uses **1.2**. J2K's ICT has spread 1.15 and is therefore near-optimal for
+the metric for free. Measured: cw 2.0 is −7.0% RGB / −19.3% Y BD-rate and takes the gap to +18.7%
+RGB / +21.5% Y; the RGB gain **saturates at 2.0–2.45**, exactly where the norms put the optimum, and
+the Y gap collapses from +48.2% to **+13.5%** — which is what explains why the luma gap always
+exceeded the RGB gap. **Not a proposal to change the default:** mean dE00 at q=90 goes 0.445 → 0.585
+(+31%), and CHROMA-1 chose 1.2 on a colour-aware criterion. What it changes is how the gap is
+*quoted* — "+27.1%" overstates the coding deficiency by about a third, "+48.3%" by more than two
+thirds.
+
+**Tiling does not transfer.** J2K given GNC's 256px tiling goes +27.1% → +14.7%; GNC given a 512px
+tile gains **−0.6% RGB / −0.9% Y** against J2K's 3.8% for the same step — a 6x asymmetry. The
+leading hypothesis for the difference is **global rate allocation**, not wavelet reach: untiled J2K
+runs PCRD over the whole picture, GNC has no cross-tile allocation at all above q=80 (AQ is 30–80).
+EBCOT part 1 closed PCRD *inside* a tile at code-block granularity (0.00 dB); cross-tile allocation
+is a different lever and has never been measured. **That is the next test, and it is cheap.**
+
+**Measurement trap, recorded so nobody repeats it:** a full-frame tile-size comparison is confounded
+by padding — 1920x1080 pads to 2048x1280 at tile 256 and **2048x1536** at tile 512, 20% more
+coefficients, reading **+6.1% for tile 512** at identical PSNR when the real effect is −0.6%. Use
+content that is a multiple of both tile sizes; this used centred 1024x512 crops.
+
+Full numbers in RESEARCH_LOG 2026-09-07 and `docs/decisions/0026`. Also found on the way:
+**BUG-26** — `--tile-size 1024` silently destroys the image.
+
+### Step 2 — the candidates as originally specified, cheapest first
 
 1. **Whole-frame transform vs 256px tiles.** GNC transforms 35 independent tiles on a 1080p frame;
    J2K transforms the whole picture. Each tile's LL is 8x8 at five levels, against a 60x34 LL for
@@ -2843,6 +2889,43 @@ much is left for coefficient modelling, which is the difference between "keep go
 and "the remaining gap is somewhere else". Decision 0018 makes that the leading question, since
 entropy coding is the one lever that pays on intra, inter, lossless and every chroma format at
 once.
+
+### BUG-26 — `--tile-size 1024` silently destroys the image (todo, **P1**)
+
+Found 2026-09-07 by INTRA-1 step 2 while pricing the tiling candidate. **Nothing errors.**
+
+```
+gnc encode -i bbb_1080p.png -o t1024.gnc -q 90 --abac -t 1024   # exit 0
+gnc decode -i t1024.gnc     -o t1024.png                        # exit 0
+```
+
+The result is **7.19 dB RGB PSNR at 901 865 bytes**, against 50.06 dB at 1 793 794 bytes for the
+default tile 256. Half the bytes, and the picture is gone. No warning, no clamp, no assertion — the
+CLI advertises `-t <TILE_SIZE>` with no documented range.
+
+**Cause.** `src/shaders/transform_97.wgsl` declares `var<workgroup> shared_data: array<f32, 512>`
+with `shared_low`/`shared_high` at 256, and says so in a comment sized for tile 256:
+"MAX_OVERLAP = tile_size/2 - 1 = 127; physical_tile_size_max = 510. Workgroup size 256 covers
+half_max=255 with one thread to spare." A 1024px tile needs 1024 elements and 512 threads. WGSL
+out-of-bounds workgroup access is not a trap, so it reads and writes whatever is there and the
+transform quietly returns nonsense that still round-trips through a valid bitstream.
+
+**Tile 512 is fine** — verified 50.07 dB against tile 256's 50.06 dB on the same input, and −0.6%
+RGB / −0.9% Y BD-rate on padding-free crops. So the ceiling is real but it is 512, not 256.
+
+**Fix**: reject a tile size the shader cannot serve, at config validation, with the limit named in
+the error. Raising the ceiling is a separate and much larger job (the shader would need a
+multi-pass or a larger workgroup) and is **not** what this item asks for — INTRA-1 step 2 measured
+that GNC gains only 0.6% from 256 -> 512, so there is no rate case for chasing 1024 today.
+
+**Canary:** the same encode must exit non-zero with a message naming 512, and `cargo test --release`
+must carry a test that asserts it.
+
+**Related, and worth knowing before measuring any tile-size question:** a full-frame tile-size
+comparison is confounded by padding. 1920x1080 pads to 2048x1280 at tile 256 and to **2048x1536**
+at tile 512 — 20% more coefficients — which reads as +6.1% rate for tile 512 that is entirely
+padding and reverses the sign of the real effect. Measure tile size on content that is a multiple
+of both sizes; `1024x512` centre crops are what INTRA-1 used.
 
 ### ENT-6 — abac's deep subbands are one short code-block each, and they cost ~4% of the file (todo, P2)
 

@@ -4,6 +4,154 @@
 
 ---
 
+## INTRA-1 step 2 — the gap decomposes: 8.5 points is chroma allocation, ≤7.5 is the coder, tiling does not transfer (2026-09-07)
+
+**Where step 2 started.** Step 1 (`docs/decisions/0024`) bounded the entropy coder at 7.5% of rate
+and sent the item upstream with ~19.6 of the +27.1% RGB gap to JPEG 2000 9/7 unexplained. Step 2's
+candidates, in the item's order: tiling, quantiser shape and per-subband step, lifting
+normalisation, code-block geometry. Three are now measured.
+
+**Instrument check first.** The `J2K 9/7` arm of `scripts/meas9_contribution.py` reproduces ENT-4's
+headline exactly — **+27.1% RGB and +48.3% Y** — on the same four images. The baseline is
+reproduced, not assumed, and every figure below is against that same run.
+
+### The decomposition
+
+| cause | RGB points | status |
+|---|---|---|
+| chroma allocation against an RGB metric | **8.5** | measured; a deliberate perceptual trade, not a deficiency |
+| entropy coder headroom | **≤7.5** | decision 0024; half of it is ENT-6's small-block cold start |
+| tiling, 256px vs a whole picture | **≤12.4 for J2K, 0.6 realisable in GNC** | measured in both codecs |
+| lifting normalisation | **~0** | closed |
+| remainder | **~9.8** | tiling is the leading suspect; GNC does not collect it |
+
+In sequence: **+27.2% → +18.7%** (chroma) **→ +9.8%** (entropy ceiling).
+
+### 1. Lifting normalisation — closed, the wavelet is correct
+
+`transform_97.wgsl` is the Daubechies factorisation with `low *= K, high *= 1/K`, K = 1.149604398.
+Mirroring that lifting exactly, building the analysis matrix on 256 samples at 5 levels and
+inverting it:
+
+```
+   band  count  synth L2 norm   band  n    min     max    edge/interior
+     LL      8        1.02959     LL   8  0.7437  1.3313      1.0103
+     H5      8        1.06619     H5   8  0.9838  1.2437      1.0604
+     H4     16        1.03719     H4  16  0.9951  1.2263      1.0237
+     H3     32        1.01975     H3  32  1.0051  1.1877      1.0248
+     H2     64        0.98353     H2  64  0.9777  1.1013      1.0246
+     H1    128        1.02003     H1 128  0.9401  1.1192      1.0071
+```
+
+All within 0.984–1.066, boundaries within 1–6% of interior. The transform is near-orthonormal, so
+**uniform steps are within ~5% of MSE-optimal** — a fraction of a percent of rate. Production
+already uses uniform weights (`SubbandWeights::uniform`; the perceptual ladder is opt-in behind
+`GNC_PHYSICAL_WEIGHTS`, and its gradient was found inverted and worse than uniform). Closed.
+
+### 2. The normalisation error is in the *colour* transform, and it is worth 8.5 points
+
+The same check on YCoCg-R is not clean.
+
+| | Y | Co / Cb | Cg / Cr | spread |
+|---|---|---|---|---|
+| GNC, YCoCg-R synthesis norms | 1.7321 | **0.7071** | **0.8660** | **2.45** |
+| J2K, ICT synthesis norms | 1.7321 | 1.8051 | 1.5734 | 1.15 |
+
+RGB-MSE-optimal steps scale as 1/norm, so GNC's chroma steps should be **2.45x (Co)** and **2.00x
+(Cg)** the luma step. Production uses **1.2** (CHROMA-1). J2K's ICT is nearly norm-balanced, so its
+uniform steps are automatically near-RGB-MSE-optimal — it gets for free what GNC must apply
+explicitly.
+
+**Measured** — four images, q = 60/75/85/90/95/99, `--abac`, BD-rate against production:
+
+| chroma weight | RGB PSNR | Y-PSNR | gap to J2K, RGB | gap to J2K, Y |
+|---|---|---|---|---|
+| 1.2 (production) | — | — | **+27.2%** | **+48.2%** |
+| 1.6 | −4.9% | −10.5% | +21.0% | +32.0% |
+| 2.0 | −7.0% | −19.3% | **+18.7%** | +21.5% |
+| 2.45 | −7.4% | −27.4% | +18.4% | **+13.5%** |
+
+Per image at cw 2.0, RGB: −5.1, −7.3, −8.0, −7.5. Sign-consistent on all four.
+
+Two things make this more than a sweep. **The RGB gain saturates at 2.0–2.45**, exactly where the
+synthesis norms put the optimum — the theory named the operating point before the sweep found it.
+And **the Y-PSNR gap collapses from +48.2% to +13.5%**, which explains the one feature of ENT-4's
+numbers nobody had accounted for: the luma gap was larger than the RGB gap *because* GNC spends bits
+on chroma that a luma metric cannot see.
+
+**This is not a proposal to change the default, and the colour cost is measured.** Mean dE00,
+averaged over the four images:
+
+| q | cw 1.2 | cw 2.0 | cw 2.45 |
+|---|---|---|---|
+| 85 | 0.524 | 0.671 | 0.737 |
+| 90 | 0.445 | 0.585 | 0.649 |
+| 95 | 0.305 | 0.429 | 0.486 |
+| 99 | 0.077 | 0.172 | 0.227 |
+
++31% dE00 at q=90. CHROMA-1 chose 1.2 as the largest value costing nothing on MEAS-8's criterion,
+and CLAUDE.md's rule that chroma questions need a chroma-aware metric cuts both ways — this is a
+luma-metric argument for a chroma change and cannot settle it alone.
+
+**What it does settle is how the gap should be quoted.** 8.5 of the 27.1 RGB points, and 34.7 of the
+48.2 Y points, are a deliberate allocation the metric is blind to. "+27.1% intra coding gap"
+overstates the coding deficiency by about a third; "+48.3%" overstates it by more than two thirds.
+
+### 3. Tiling — real for J2K, and it does not transfer to GNC
+
+Give OpenJPEG GNC's tiling (`-t 256,256`, same transform, same five levels):
+
+| arm | RGB gap | Y gap |
+|---|---|---|
+| J2K 9/7, whole picture | **+27.1%** | +48.3% |
+| J2K 9/7, 256px tiles | **+14.7%** | +35.2% |
+| J2K 9/7, 512px tiles | +18.1% | +39.7% |
+
+So 256px tiling costs *JPEG 2000* **12.4 points** (8.8 on padding-free crops, where the whole-image
+arm is a single 1024x512 tile).
+
+**GNC does not collect the same thing.** Doubling GNC's own tile to 512 is worth **−0.6% RGB /
+−0.9% Y**, against **3.8%** for J2K over the identical step on identical content — a **6x
+asymmetry**. Whatever the whole-picture configuration buys J2K, GNC is not currently able to take.
+The leading hypothesis is that much of it is **global rate allocation** rather than wavelet reach:
+untiled J2K runs PCRD across the whole image; GNC has no cross-tile allocation at all above q=80,
+since AQ is 30–80. EBCOT part 1 closed PCRD at code-block granularity **inside** a tile (0.00 dB) —
+cross-tile allocation is a different lever and has never been measured. **That is the next thing to
+test.**
+
+### The confounder that reverses the naive experiment
+
+A full-frame tile-size comparison charges the larger tile for padding. 1920x1080 pads to 2048x1280
+at tile 256 and to **2048x1536** at tile 512 — 20% more coefficients — and reads **+6.1% rate for
+tile 512** at identical PSNR (1 903 875 B vs 1 793 794 B, 50.07 vs 50.06 dB on bbb at q=90). The
+real effect is −0.6%. Measure tile size only on content that is a multiple of both sizes; this used
+centred 1024x512 crops, which tile exactly at 256 (4x2) and 512 (2x1).
+
+### Found on the way: `--tile-size 1024` silently destroys the image
+
+`encode -t 1024` exits 0, `decode` exits 0, and the result is **7.19 dB RGB PSNR at 901 865 bytes**
+against 50.06 dB at 1 793 794 bytes for tile 256. Half the bytes and no picture, with no warning
+anywhere. `transform_97.wgsl` keeps `array<f32, 512>` in workgroup memory and WGSL out-of-bounds
+workgroup access does not trap. **Tile 512 is fine** (50.07 dB, verified). Filed **BUG-26 (P1)**;
+any earlier measurement taken above tile 512 is void.
+
+### What is still open
+
+**~9.8 points.** Tiling is the leading suspect and GNC realises 0.6% of it at the one doubling the
+shader can serve, so the question is not "make the tile bigger" but "why does a bigger tile buy GNC
+nothing when it buys J2K 3.8%". Cross-tile rate allocation is the first hypothesis to test, and it
+is cheap: AQ machinery already exists, it is simply switched off above q=80.
+
+**Tooling added, reusable:** `meas9_contribution.py` gains `j2k_t256` / `j2k_t512` (the same codec
+with GNC's tiling), `gnc_abac_t512`, and `gnc_abac_cw{1.0,1.6,2.0,2.45}`; `sh()` now takes an `env`
+overlay so an arm can set an encoder env var per subprocess without leaking it to every other arm.
+
+**Gates:** `cargo test --release -- --test-threads=1` green; `cargo clippy --release` clean; wasm
+`--lib` clean (the wasm *binary* target is red on main, pre-existing, flagged in COORDINATION).
+
+
+---
+
 ## INTRA-1 step 1 — GNC spends within 7.5% of the entropy of its own coefficients, so ~72% of the JPEG 2000 gap is upstream (2026-09-07)
 
 **Hypothesis and the fork it settles.** ENT-4 left GNC at **+27.1% of rate against JPEG 2000 in

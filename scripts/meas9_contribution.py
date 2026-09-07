@@ -53,8 +53,14 @@ from chroma_metric import ciede2000, srgb_to_lab  # noqa: E402
 from meas1_vs_h264 import bd_rate as bd_rate_raw  # noqa: E402  (the H.264 comparison's Bjontegaard)
 
 
-def sh(cmd):
-    return subprocess.run(cmd, capture_output=True, text=True)
+def sh(cmd, env=None):
+    """`env` adds to the inherited environment rather than replacing it — a replaced environment
+    loses PATH and every arm that shells out to a tool stops working."""
+    e = None
+    if env:
+        e = dict(os.environ)
+        e.update({k: str(v) for k, v in env.items()})
+    return subprocess.run(cmd, capture_output=True, text=True, env=e)
 
 
 def repo_root():
@@ -134,7 +140,7 @@ def conversion_ceiling(src_png, pix_fmt, orig_rgb, tmp):
 # the arms
 # ---------------------------------------------------------------------------
 
-def arm_gnc(gnc_binary, src_png, orig_rgb, tmp, qualities, extra=(), name="GNC"):
+def arm_gnc(gnc_binary, src_png, orig_rgb, tmp, qualities, extra=(), name="GNC", env=None):
     """The GNC arm. `extra` selects a non-default coder — `["--abac"]` for the code-block
     arithmetic coder shipped 2026-09-07.
 
@@ -148,7 +154,7 @@ def arm_gnc(gnc_binary, src_png, orig_rgb, tmp, qualities, extra=(), name="GNC")
     for q in qualities:
         bs, out_png = tmp / f"{tag}_q{q}.gnc", tmp / f"{tag}_q{q}.png"
         r = sh([str(gnc_binary), "encode", "-i", str(src_png), "-o", str(bs), "-q", str(q),
-                *extra])
+                *extra], env=env)
         if r.returncode != 0:
             print(f"    {name} q={q} encode failed: {r.stderr.strip().splitlines()[-1:]}")
             continue
@@ -209,7 +215,7 @@ def arm_ffmpeg(name, encoder, pix_fmt, container, rungs, src_png, orig_rgb, tmp,
     return rows
 
 
-def arm_j2k(src_png, orig_rgb, tmp, rates, irreversible=True):
+def arm_j2k(src_png, orig_rgb, tmp, rates, irreversible=True, tile=None, name=None):
     """OpenJPEG. `-I` selects the irreversible 9/7 transform, and it is not optional here.
 
     opj_compress defaults to the **reversible 5/3** path, which is the wrong configuration for a
@@ -224,7 +230,8 @@ def arm_j2k(src_png, orig_rgb, tmp, rates, irreversible=True):
     if shutil.which("opj_compress") is None:
         print("    JPEG 2000: opj_compress not in PATH, skipped")
         return []
-    name = "J2K 9/7" if irreversible else "J2K 5/3rev"
+    if name is None:
+        name = "J2K 9/7" if irreversible else "J2K 5/3rev"
     rows = []
     for rate in rates:
         stem = f"{name.replace(' ', '').replace('/', '')}_r{rate}"
@@ -232,6 +239,8 @@ def arm_j2k(src_png, orig_rgb, tmp, rates, irreversible=True):
         cmd = ["opj_compress", "-i", str(src_png), "-o", str(j2k), "-r", str(rate)]
         if irreversible:
             cmd.append("-I")
+        if tile:
+            cmd += ["-t", f"{tile},{tile}"]
         r = sh(cmd)
         if r.returncode != 0 or not os.path.exists(j2k):
             print(f"    {name} r={rate}: encode failed")
@@ -355,8 +364,10 @@ def vc2_rungs(w, h, qm="default"):
 
 # ---------------------------------------------------------------------------
 
-ARM_ORDER = ["gnc", "gnc_abac", "jpegxs", "jpegxs422", "prores444", "vc2", "j2k", "j2k_rev",
-             "prores422"]
+CHROMA_WEIGHT_ARMS = ["1.0", "1.6", "2.0", "2.45"]
+ARM_ORDER = (["gnc", "gnc_abac", "gnc_abac_t512"] + [f"gnc_abac_cw{c}" for c in CHROMA_WEIGHT_ARMS]
+             + ["jpegxs", "jpegxs422", "prores444", "vc2", "j2k", "j2k_t256",
+                "j2k_t512", "j2k_rev", "prores422"])
 DEFAULT_ARMS = ["gnc", "jpegxs", "jpegxs422", "prores444", "j2k", "prores422"]
 
 
@@ -379,6 +390,23 @@ def run_image(img_path, gnc_binary, arms, qualities, tmp, vc2_qm="default"):
     if "gnc_abac" in arms:
         rows += arm_gnc(gnc_binary, img_path, orig, tmp, qualities,
                         extra=["--abac"], name="GNC abac")
+    if "gnc_abac_t512" in arms:
+        # INTRA-1 step 2 candidate 1, measured inside GNC. Only meaningful on content whose
+        # dimensions are a multiple of *both* tile sizes: 1920x1080 pads to 2048x1280 at tile 256
+        # and to 2048x1536 at tile 512, so a full-frame comparison charges tile 512 for 20% more
+        # coefficients and reads as +6% rate that is entirely padding.
+        rows += arm_gnc(gnc_binary, img_path, orig, tmp, qualities,
+                        extra=["--abac", "-t", "512"], name="GNC abac t512")
+    for cw in CHROMA_WEIGHT_ARMS:
+        if f"gnc_abac_cw{cw}" in arms:
+            # INTRA-1 step 2: GNC's YCoCg-R has synthesis norms (Y 1.732, Co 0.707, Cg 0.866), so
+            # RGB-MSE-optimal chroma steps are 2.45x / 2.00x the luma step. Production runs 1.2
+            # (CHROMA-1, chosen on a colour-aware criterion). These arms price that difference on
+            # the RGB-PSNR metric the JPEG 2000 comparison is scored with. Decoding needs no
+            # matching env — the weight is carried in the bitstream's quantiser, not re-derived.
+            rows += arm_gnc(gnc_binary, img_path, orig, tmp, qualities,
+                            extra=["--abac"], name=f"GNC abac cw{cw}",
+                            env={"GNC_CHROMA_WEIGHT": cw})
     if "prores444" in arms:
         rows += arm_ffmpeg("ProRes 4444", "prores_ks", "yuv444p10le", "mov",
                            prores444_rungs(), img_path, orig, tmp, w * h)
@@ -387,6 +415,17 @@ def run_image(img_path, gnc_binary, arms, qualities, tmp, vc2_qm="default"):
                            vc2_rungs(w, h, vc2_qm), img_path, orig, tmp, w * h)
     if "j2k" in arms:
         rows += arm_j2k(img_path, orig, tmp, (40, 20, 12, 8, 5, 4, 3), irreversible=True)
+    if "j2k_t256" in arms:
+        # The same codec, the same transform, the same five levels — but cut into GNC's 256px
+        # tiles instead of one tile over the whole picture. INTRA-1 step 2 candidate 1: this
+        # prices the tiling difference in an implementation that does tiling properly, which is
+        # far cheaper than making GNC's wavelet shader span a frame (its shared memory is sized
+        # for a 510px region, so tile 512 is its hard ceiling).
+        rows += arm_j2k(img_path, orig, tmp, (40, 20, 12, 8, 5, 4, 3), irreversible=True,
+                        tile=256, name="J2K 9/7 t256")
+    if "j2k_t512" in arms:
+        rows += arm_j2k(img_path, orig, tmp, (40, 20, 12, 8, 5, 4, 3), irreversible=True,
+                        tile=512, name="J2K 9/7 t512")
     if "j2k_rev" in arms:
         rows += arm_j2k(img_path, orig, tmp, (40, 20, 12, 8, 5, 4, 3), irreversible=False)
     if "jpegxs" in arms:

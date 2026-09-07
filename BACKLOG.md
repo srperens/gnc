@@ -2735,6 +2735,66 @@ and "the remaining gap is somewhere else". Decision 0018 makes that the leading 
 entropy coding is the one lever that pays on intra, inter, lossless and every chroma format at
 once.
 
+### ENT-5 — abac needs a GPU encoder, and it is what stands between abac and the default (todo, P1)
+
+Filed 2026-09-07 after ENT-4. The mechanism has been named three times today — inside ARCH-3, inside
+BUG-18 and inside decision 0017 — and never as an item with an ID, so `scripts/claim next` cannot
+offer it. It is the third of the three reasons abac is opt-in, and the only one that is a missing
+shader rather than a trade.
+
+**Why it is P1 now rather than a tidy-up.** ENT-4 measured what abac is worth: **−16.0% of rate over
+q=60-99 at identical pixels** (24/24 rungs bit-identical), closing **half** the RGB gap to JPEG 2000
+and taking GNC level with ProRes 4444. That is the largest single compression lever in the codec, it
+pays on intra, inter, lossless and every chroma format at once (decision 0018), and it is behind a
+flag partly because of 129 ms/frame of CPU encode against Rice's 23 ms (`docs/decisions/0017`).
+
+It is also the *cause* of the ARCH-3 / BUG-18 class of defect, not merely a neighbour of it: abac has
+no GPU encode shader, so selecting abac flips `gpu_entropy_encode` and silently swaps the entire
+P-frame encoder for the defective non-batched implementation. **ARCH-3 fixes the routing; this
+removes what the routing is routing around.** Both are worth doing and neither substitutes for the
+other.
+
+**No architectural obstacle, and this is measured rather than asserted.** `abac_decode.wgsl` already
+runs one thread per code-block — ~3000 blocks per 1080p frame — and is bit-exact against the CPU
+coder across seven geometries. Encode is as parallel as decode over the same blocks, and abac's
+per-symbol serial chain is confined to a block, which CLAUDE.md's bounded-dependency rule already
+accepts and prices.
+
+**The one real complication:** a block's coded size is not known before it is coded. Two ways, and
+the item should measure rather than pick by taste — (a) worst-case allocation per block plus a
+compaction pass, (b) two passes, count then emit. State which, and what the other would have cost.
+BUG-22 is the standing example of what an unbounded per-stream output slot does, so whichever way it
+goes, the bound must be explicit.
+
+### Success criteria, stated before implementation
+
+1. **Bit-exact against the CPU encoder.** The GPU encoder's bytes must be identical to the shipped
+   CPU abac output, per block and per file, on the same seven geometries the decoder was verified
+   across. Anything less is a different coder, not a faster one.
+2. **Round trip.** GPU encode → file → GPU decode → max |diff| **0** against the Rice decode of the
+   same source, at 1080p 4:4:4. That is the check ABAC-SHIP used and it caught a coder that produced
+   correct rate and no picture.
+3. **Encode time per 1080p frame, on an idle machine**, reported as one of BASELINE's three named fps
+   quantities and saying which. Rice is 23 ms, abac on CPU is 129 ms. Report the number whatever it
+   is: it is what decides whether reason 1 of decision 0017 is discharged, and four sessions share
+   this GPU, so a figure taken under load is worth nothing (COORDINATION, and the 1.9x clock-ramp
+   lesson).
+4. **Rate unchanged.** −16.0% mean over q=60-99 must reproduce exactly. A bit-exact encoder cannot
+   move it; if it moves, criterion 1 has failed and the rate figure is not the finding.
+
+**Canary, and it is not a formality here.** A log line proving the GPU encoder ran — dispatched block
+count and bytes emitted. A shader that silently falls back to the CPU coder passes criteria 1, 2 and
+4 *by construction*, so those three cannot detect the one failure mode most likely to occur.
+CLAUDE.md, "no silent features".
+
+**Not in scope: making abac the default.** That is a separate decision needing decision 0017's other
+two reasons re-priced — the 1.69x frame decode, and abac's inter behaviour (ENT-3, which BUG-18
+blocks). This item discharges one of three, and its write-up should say plainly which two remain.
+
+**Coordination.** Overlaps ARCH-3 in the entropy-encode dispatch. ARCH-3 owns which P-frame pipeline
+runs, in `sequence.rs`; this owns the abac encode step and the new shader. If both are in flight,
+ARCH-3 lands first and this rebases onto it.
+
 ### ENT-3 — Does abac pay on inter residuals? (todo, P1, claimed and released unmeasured 2026-09-07)
 
 **The inter half of the entropy question, which ABAC-SHIP explicitly left out of scope** ("intra

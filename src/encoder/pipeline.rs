@@ -1597,7 +1597,14 @@ impl EncoderPipeline {
 
         let t_pad = t_start.elapsed();
 
-        // ---- Submit 1: GPU pad + color convert + deinterleave ----
+        // ---- Preprocess: GPU pad + color convert + deinterleave ----
+        // Recorded into the same encoder as wavelet+quant+entropy below and submitted once
+        // (PERF-1 item 6). It was its own submit; the P-frame path already batched preprocess
+        // with the rest, so this only brought the I-frame path in line with it. Dispatches in
+        // one encoder are ordered, which is what the wavelet already relies on.
+        //
+        // Under GNC_PROFILE the split is kept, because a phase you cannot time separately is a
+        // phase you cannot profile — same pattern as the wavelet/Rice split further down.
         let mut cmd = ctx
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -1682,7 +1689,14 @@ impl EncoderPipeline {
             );
         }
 
-        ctx.queue.submit(Some(cmd.finish()));
+        if profile {
+            ctx.queue.submit(Some(cmd.finish()));
+            cmd = ctx
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("encode_preprocess_tail"),
+                });
+        }
 
         let t_preprocess = t_start.elapsed();
 
@@ -1781,14 +1795,10 @@ impl EncoderPipeline {
 
         let bufs = self.cached.as_ref().unwrap();
 
-        // ---- Single command encoder for all 3 planes: wavelet + AQ + quantize ----
+        // ---- One command encoder for preprocess and all 3 planes: wavelet + AQ + quantize ----
         // Dispatches execute sequentially within the encoder, so CfL dependencies
-        // (chroma needs reconstructed Y) are naturally satisfied.
-        let mut cmd = ctx
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("encode_3plane"),
-            });
+        // (chroma needs reconstructed Y) are naturally satisfied. `cmd` was opened above,
+        // before the preprocess dispatches, and is submitted once at the end.
 
         // CfL alpha staging buffers (created on demand, tiny ~2KB each)
         let total_tiles_u32 = (tiles_x * tiles_y) as u32;
@@ -1799,7 +1809,13 @@ impl EncoderPipeline {
         };
         let alpha_bytes = (alpha_count * std::mem::size_of::<f32>()) as u64;
         let mr = wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST;
-        let alpha_staging: [wgpu::Buffer; 2] = if use_cfl {
+        // None when CfL is off, which is the default and every q >= 92. The `else` arm used to
+        // build two MAP_READ buffers labelled "never used" — and they were used: the readback
+        // below was gated on `config.cfl_enabled` rather than `use_cfl`, so a 4:2:0 or 4:2:2
+        // encode with CfL enabled mapped both dummies and read two garbage alphas into
+        // `cfl_alphas_all`, which the `use_cfl` test then discarded. Same bitstream, two fewer
+        // buffers per encode(), and one fewer poll(Wait) on the non-444 path (PERF-1 item 5).
+        let alpha_staging: Option<[wgpu::Buffer; 2]> = use_cfl.then(|| {
             std::array::from_fn(|i| {
                 ctx.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some(["alpha_stg_co", "alpha_stg_cg"][i]),
@@ -1808,17 +1824,7 @@ impl EncoderPipeline {
                     mapped_at_creation: false,
                 })
             })
-        } else {
-            // Dummy buffers (never used)
-            std::array::from_fn(|_| {
-                ctx.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("alpha_stg_dummy"),
-                    size: 4,
-                    usage: mr,
-                    mapped_at_creation: false,
-                })
-            })
-        };
+        });
 
         // AQ is only possible with wavelet transform (needs LL subband)
         let aq_active = config.adaptive_quantization
@@ -2147,7 +2153,9 @@ impl EncoderPipeline {
                     wm_param,
                     0.0,
                 );
-                cmd.copy_buffer_to_buffer(&bufs.raw_alpha, 0, &alpha_staging[0], 0, alpha_bytes);
+                // use_cfl is true in this branch, so the staging pair exists.
+                let stg = alpha_staging.as_ref().expect("CfL staging missing while use_cfl");
+                cmd.copy_buffer_to_buffer(&bufs.raw_alpha, 0, &stg[0], 0, alpha_bytes);
             } else if use_fused_qh {
                 let hist_bufs = bufs.fused_hist_bufs.as_ref().unwrap();
                 self.fused_qh.dispatch(
@@ -2262,7 +2270,8 @@ impl EncoderPipeline {
                     wm_param,
                     0.0,
                 );
-                cmd.copy_buffer_to_buffer(&bufs.raw_alpha, 0, &alpha_staging[1], 0, alpha_bytes);
+                let stg = alpha_staging.as_ref().expect("CfL staging missing while use_cfl");
+                cmd.copy_buffer_to_buffer(&bufs.raw_alpha, 0, &stg[1], 0, alpha_bytes);
             } else if use_fused_qh {
                 let hist_bufs = bufs.fused_hist_bufs.as_ref().unwrap();
                 self.fused_qh.dispatch(
@@ -2574,9 +2583,9 @@ impl EncoderPipeline {
         };
 
         // Deferred CfL alpha readback
-        if config.cfl_enabled {
+        if let Some(ref alpha_staging) = alpha_staging {
             let (tx, rx) = std::sync::mpsc::channel();
-            for stg in &alpha_staging {
+            for stg in alpha_staging {
                 let tx_c = tx.clone();
                 stg.slice(..).map_async(wgpu::MapMode::Read, move |result| {
                     tx_c.send(result).unwrap();
@@ -2587,7 +2596,7 @@ impl EncoderPipeline {
             for _ in 0..2 {
                 rx.recv().unwrap().unwrap();
             }
-            for stg in &alpha_staging {
+            for stg in alpha_staging {
                 let view = stg.slice(..).get_mapped_range();
                 let raw_alphas: &[i32] = bytemuck::cast_slice(&view);
                 let q_alphas: Vec<i16> = raw_alphas.iter().map(|&a| a as i16).collect();
@@ -2601,7 +2610,8 @@ impl EncoderPipeline {
         // use_cfl = config.cfl_enabled && chroma_format == ChromaFormat::Yuv444.
         // If config.cfl_enabled is true but use_cfl is false (non-444), cfl_alphas_all is
         // empty — writing Some(CflAlphas { alphas: [] }) would confuse the decoder which
-        // expects 2*tiles*nsb i16 values when cfl_flag=1.
+        // expects 2*tiles*nsb i16 values when cfl_flag=1. It is now empty because nothing
+        // filled it; before PERF-1 item 5 it held two garbage values that this test dropped.
         let cfl_alphas = if use_cfl {
             Some(CflAlphas {
                 alphas: cfl_alphas_all,

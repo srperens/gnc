@@ -9842,3 +9842,135 @@ Not filed here beyond this note — BUG-14's session is already on the Huffman o
 
 So at q=100 only the default coder (Rice) actually delivers the MED path, and the other two fail
 without saying so.
+
+---
+
+## 2026-09-07 — INTRA-NEARLOSSLESS: MED instead of the wavelet does *not* survive into the lossy range, and the top of the ladder is dominated by lossless
+
+Priority 1 in BACKLOG is intra at the contribution operating point, where the whole remaining
++90.5% BD-rate lives. LOSSLESS-1 showed the largest single win of the week comes from replacing the
+wavelet with a per-pixel median predictor at q=100 (−14.9%). The obvious question — and the one
+this item was filed for — is whether that mechanism keeps paying at q=88–99, where the codec still
+has to be lossy.
+
+**It does not.** But measuring it turned up something the real codec does that matters more.
+
+Measured in `../gnc-nearlossless` rebased onto `4d69fdd`, own `target/`. Four padding-neutral
+crops (1536x1024; 1024x512 for kristensara) **copied out of the shared frames directory and
+hashed**, because another session's fetch was rewriting those files while this was being set up.
+Default entropy coder (Rice at these q), 4:4:4, PSNR leads and luma is YCoCg-R per CLAUDE.md,
+dE00 alongside because nothing about chroma is visible to a luma metric.
+
+### The gate, and the criteria set before running it
+
+Pass: the calibrated model beats the real encoder by **≥10% BD-rate on luma**, consistently in
+sign. Fail: under 5%, or sign-varying across the four images.
+
+The model is JPEG-LS near-lossless: MED prediction, uniform quantisation of the residual, and the
+reconstruction fed back into the predictor — a **closed loop**, marched as the same anti-diagonal
+wavefront the shipped decoder uses (`med_reconstruct.wgsl`), reset per 256px tile. Predicting from
+originals and quantising afterwards is what BUG-13 turned out to be, so the open-loop version was
+never a candidate. Rate is the zeroth-order entropy of the quantised residuals, **calibrated per
+image** against the real q=100 file at delta=1: 1.078–1.123x, i.e. the real coder spends 8–12%
+more than H0. `scripts/nearlossless_gate.py`.
+
+### Result: sign-varying on luma, uniformly worse on colour
+
+| image | BD-rate luma | BD-rate dE00 |
+|---|---|---|
+| bbb | **+14.12%** | +106.25% |
+| blue_sky | −27.19% | +59.66% |
+| kristensara | −26.42% | +31.60% |
+| touchdown | −22.46% | +54.37% |
+| mean | −15.49% | +62.97% |
+
+**The gate fails on its own criteria.** The mean looks like a win and is not one: bbb reverses, and
+the colour column is bad everywhere by a margin no luma gain buys back. bbb reversing is not a
+surprise in hindsight — it was also LOSSLESS-1's weakest image (−5.8% against blue_sky's −21.8%),
+so animation is where prediction against the neighbour has least to offer.
+
+At the one operating point where the model is competitive, matched on colour rather than luma
+(kristensara, MED delta=2 at dE00 0.575 against GNC q=90 at 0.570): **330 987 B / 51.15 dB against
+407 248 B / 50.36 dB**, so 18.7% fewer bits and +0.79 dB. That is a real point win, and it is the
+*only* rung where the model is ahead on both axes. One rung is not a coding path.
+
+### Why it fails, which is a property of DPCM and not of this model
+
+Quantised closed-loop DPCM does not trade rate for distortion the way a transform codec does. The
+quantisation error goes back into the predictor, the neighbourhood gets noisier, the next
+prediction is worse, and the residual grows roughly in step with the quantiser. So rate falls far
+more slowly than the step coarsens: on kristensara, delta 1 → 2 → 3 → 4 gives 538 678 → 330 987 →
+253 428 → 234 743 B while quality goes exact → 51.1 → 49.9 → 46.4 dB. **The usable ladder is
+delta=1 and delta=2 and nothing in between** — bit-exact, or about 51 dB, with no way to ask for
+55 dB. A contribution codec needs that range, and this mechanism structurally cannot rung it.
+
+### Two modelling artefacts found by disbelieving the numbers, both mine
+
+Worth recording because both produced *plausible-looking* results that were wrong, and neither was
+in the mechanism:
+
+- **A fractional quantiser step does not divide the integer pixel lattice.** With a step of 1.2 or
+  2.5 the residual alphabet grows with the step's denominator, and the modelled rate *rose* as the
+  quantiser coarsened — δ=3 cost 20% more than δ=2. Physically impossible, and it was the
+  instrument. Integer step per plane fixed it; the codec's `chroma_weight` is applied as a rounded
+  integer step instead. The first four runs of this gate are void because of it.
+- **The calibration point must actually be lossless.** Applying the chroma multiplier at delta=1
+  made the "lossless" rung lossy (dE00 0.029, max error 2), so the calibration ratio was measuring
+  a quantisation loss as coder overhead. Calibration is now computed separately at step 1 on every
+  plane.
+
+The general lesson is the one already in CLAUDE.md and it keeps being right: **a coarser quantiser
+producing more bits is a broken instrument, not a finding.** Both artefacts were caught by checking
+monotonicity, which costs nothing and should be a standing check on any rate model.
+
+### What the real codec does at the top of its ladder, and this is the part to act on
+
+Measured on the shipped encoder — no model. The anchor ladder puts qstep at 1.30 at q=96 and 0.75
+at q=99, and q=100 is bit-exact MED. Comparing every lossy rung against the bit-exact file:
+
+| image | lossless (q=100) | q=99 (qstep 0.75) | q=99 vs lossless |
+|---|---|---|---|
+| bbb | 2 415 436 | 2 454 001 @ 59.92 dB | **+1.6%** |
+| blue_sky | 1 598 293 | 2 107 664 @ 60.28 dB | **+31.9%** |
+| kristensara | 538 678 | 717 257 @ 59.83 dB | **+33.2%** |
+| touchdown | 1 969 244 | 2 362 696 @ 59.82 dB | **+20.0%** |
+
+And the dominated band is wider than the top rung. Sweeping `--qstep` at q=99, the cheapest rung
+that still costs less than bit-exact lossless:
+
+| image | first non-dominated qstep | its quality |
+|---|---|---|
+| blue_sky | 1.6 | 52.51 dB |
+| kristensara | 1.6 | 52.30 dB |
+| touchdown | 1.3 | 53.58 dB |
+| bbb | 0.9 | 57.21 dB |
+
+**On three of four images every quality point above roughly q=96 costs more bits than bit-exact
+lossless, which is also better on every axis.** The encoder will, if asked for q=97, spend 20–33%
+more than it needs to and return a worse picture. Nobody re-measured the top of the ladder after
+LOSSLESS-1 moved q=100 by −14.9% — that is what opened the hole, and it is a hole in the shipped
+product, not in a model.
+
+Note what it is *not*: sub-unit qstep is not wasted precision in PSNR terms. qstep 0.75 buys
+3.9 dB over qstep 1.0 for 13% more bits (bbb: 59.92 vs 56.01 dB), which is a normal RD slope.
+RATE-1's framing — that the ladder buys precision an 8-bit output cannot show — is not what is
+happening here. The rungs are priced correctly against each other and mispriced against lossless.
+
+### Filed rather than fixed, with the options priced
+
+Three ways to close it, and the cheapest correct one costs encode time, so it wants the idle-machine
+treatment rather than a guess (COORDINATION rule 1):
+
+1. **Encoder-side RD decision at q >= 96: encode both, emit the smaller.** Strictly correct — the
+   lossless arm dominates on both rate and quality, so this is never worse on either axis. Costs a
+   second encode pass at the top of the ladder, which is a real throughput cost for a contribution
+   codec and is not measurable while five sessions share one M1.
+2. **Clamp the lossy ladder's top** so it never descends past about qstep 1.3. Free, but it deletes
+   achievable operating points — and RATE-1 argues the sub-unit rungs should stay for 10-bit
+   output, where the precision is visible. This trade is bit-depth dependent and the clamp would
+   have to be too.
+3. **Leave it and document it.** Cheapest, and wrong: an encoder that silently returns a larger,
+   worse file than the mode next door is a defect however well documented.
+
+Recommendation is (1) behind a switch, measured later on an idle machine against (2) — the pattern
+COORDINATION already prescribes for this situation.

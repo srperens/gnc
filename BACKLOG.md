@@ -450,7 +450,68 @@ Seen in passing, both at q=100 with MED active, both silent: **`--huffman` emits
 (BUG-14's session has this) and **`--rans` falls back to the wavelet path**, byte-identical to
 `GNC_MED=0`. Only the default coder (Rice) delivers the MED path.
 
-### INTRA-NEARLOSSLESS — q=99 is strictly dominated by q=100 (**in progress 2026-09-07**)
+### RATE-2 — the top of the lossy ladder is dominated by lossless (todo, P1)
+On three of four images **every quality point above roughly q=96 costs more bits than bit-exact
+lossless**, which is also better on every axis. Ask for q=97 and the encoder spends 20-33% more
+than it needs to and returns a worse picture. Measured on the shipped encoder, not a model:
+
+| image | lossless (q=100) | q=99 (qstep 0.75) | first qstep that is *not* dominated |
+|---|---|---|---|
+| bbb | 2 415 436 | 2 454 001 @ 59.92 dB (+1.6%) | 0.9 (57.21 dB) |
+| blue_sky | 1 598 293 | 2 107 664 @ 60.28 dB (+31.9%) | 1.6 (52.51 dB) |
+| kristensara | 538 678 | 717 257 @ 59.83 dB (+33.2%) | 1.6 (52.30 dB) |
+| touchdown | 1 969 244 | 2 362 696 @ 59.82 dB (+20.0%) | 1.3 (53.58 dB) |
+
+Cause: LOSSLESS-1 moved q=100 by −14.9% and nobody re-measured the ladder above it. **Not**
+RATE-1's mechanism — sub-unit qstep is priced correctly against the other lossy rungs (qstep 0.75
+buys 3.9 dB over 1.0 for 13% more bits); it is mispriced only against lossless.
+
+Options, priced: (1) **RD decision at q >= 96, encode both and emit the smaller** — strictly
+correct since the lossless arm dominates on both axes, costs a second encode pass, throughput not
+measurable while the machine is shared; (2) **clamp the ladder** at about qstep 1.3 — free, but
+deletes operating points RATE-1 argues should stay for 10-bit; (3) document only — wrong. Build (1)
+behind a switch and measure it against (2) on an idle machine.
+
+### INTRA-NEARLOSSLESS — MED instead of the wavelet does not survive into the lossy range (**CLOSED BY MEASUREMENT 2026-09-07**)
+Gate run and **failed on its criteria set beforehand** (pass: >=10% luma BD-rate, consistent in
+sign). Closed-loop JPEG-LS near-lossless model, calibrated per image against the real q=100 file
+(1.078-1.123x), `scripts/nearlossless_gate.py`:
+
+| image | BD-rate luma | BD-rate dE00 |
+|---|---|---|
+| bbb | **+14.12%** | +106.25% |
+| blue_sky | −27.19% | +59.66% |
+| kristensara | −26.42% | +31.60% |
+| touchdown | −22.46% | +54.37% |
+| mean | −15.49% | +62.97% |
+
+The mean reads as a win and is not one: bbb reverses (as in LOSSLESS-1, where animation was also
+the weakest image at −5.8%) and colour is worse everywhere by more than the luma gain buys back.
+
+**Mechanism, and it is a property of DPCM rather than of this implementation:** quantisation error
+feeds back through the predictor, so the residual grows with the step and rate falls far more
+slowly than quality does. kristensara, delta 1→2→3→4: 538 678 → 330 987 → 253 428 → 234 743 B for
+exact → 51.1 → 49.9 → 46.4 dB. **The usable ladder is delta=1 or delta=2 and nothing between** —
+bit-exact or ~51 dB, with no way to ask for 55 dB. A contribution codec needs that range.
+
+**Do not re-test** the quantised-MED-instead-of-wavelet path. Scoped deliberately narrowly, after
+the abac near-miss: what is closed is *replacing the wavelet with a quantised closed-loop MED
+predictor in the lossy range*. Prediction as a **residual-domain** tool, context modelling on
+wavelet coefficients (abac, now shipped), and MED at q=100 (LOSSLESS-1, shipped) are all
+untouched by this.
+
+The one point win, matched on colour rather than luma: kristensara delta=2 at dE00 0.575 against
+GNC q=90 at 0.570 — 330 987 B / 51.15 dB against 407 248 B / 50.36 dB, so 18.7% fewer bits and
++0.79 dB. One rung is not a coding path, but it is why the gate was worth running.
+
+Two modelling artefacts, both caught by checking monotonicity, both mine: a **fractional quantiser
+step does not divide the integer pixel lattice** (rate *rose* as the step coarsened — δ=3 cost 20%
+more than δ=2), and the **calibration point must actually be lossless** (the chroma multiplier made
+the δ=1 rung lossy, folding a quantisation loss into the coder-overhead ratio). Four runs void
+before that was found. A coarser quantiser producing more bits is a broken instrument, not a
+finding.
+
+### Superseded — INTRA-NEARLOSSLESS as filed (the q=99 observation that opened it)
 Priority 1 is intra at contribution quality, and the first measurement of the ladder's top found a
 hole in it. Four crops, default coder, YCoCg-R luma:
 

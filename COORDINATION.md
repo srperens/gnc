@@ -183,7 +183,7 @@ If this table and `scripts/claim list` disagree, the table is wrong.
 |---|---|---|
 | `../gnc-abac`, `.claude/worktrees/abac` (`abac-gate`) | `abac` | **released — question answered, see BACKLOG Part 6.** The idle-machine bench is run. Range at cb=64 costs **1.69× frame decode for −16.7% rate** at q=90; Interval costs 3.99×. Rice's own entropy stage is 47% of frame decode, which caps any entropy work at 1.9×. What remains is a positioning call, not an engineering one. |
 | `../gnc-abac` | `abac` | same worktree, now on **BUG-8** — the encoder's local decode diverges from the real decoder down a GOP. |
-| `../gnc-nearlossless` | `nearlossless` | **INTRA at contribution quality (priority 1).** Gating whether MED prediction *instead of* the wavelet — LOSSLESS-1's mechanism, −14.9% at q=100 — survives into the lossy near-lossless range q=88–99, closed-loop with a quantised residual (JPEG-LS near-lossless). Offline gate first, no code change yet. |
+| `../gnc-nearlossless` | `nearlossless` | **done and merged 2026-09-07** — BUG-15 fixed, INTRA-NEARLOSSLESS closed by measurement, RATE-2 confirmed independently. Worktree removed. |
 | `../gnc-abacship` | `abacship` | **ABAC-SHIP done and merged 2026-09-07** (`60bed17`, `378a0c7`, `436680e`). abac is a real entropy coder: `--abac`, entropy type 5, **GP18**, on stills *and* sequences. Intra −16.6% to −18.8% at identical pixels, lossless −13.4% (FFV1 gap +23.9% → +7.3%), inter −14.4% at q=90. Rice stays the default (`docs/decisions/0017`). **Every frame this encoder writes now says GP18** — a GP18 Rice frame is a GP17 payload with a new label, proved by relabelling and decoding; GP17 still reads. Left behind: **BUG-18 (P1)**, the inter path's reconstruction depends on the entropy encode path. Worktree free to remove. |
 | `../gnc-rate1` | `rate1` | **DONE, merged, worktree removed.** RATE-1 answered **no** — a bit-depth-aware rate rule recovers **0.0% on all four photographic stills** (89.4% on the synthetic gradient, which is the trap). The sweep found **RATE-2 instead, filed P1**: above q≈95-98 the lossy ladder costs more bytes than bit-exact lossless on every real image, mean **+28.9% at q=99** (blue_sky +40.6%). LOSSLESS-1 made lossless cheap enough to undercut the top of the lossy ladder and nothing noticed. |
 | `../gnc-coord` | `coord` | **COORD-1 — the claim mechanism enforces the rules instead of restating them.** Docs and `scripts/claim` only; no codec change, invalidates no measurement. `scripts/claim next` makes the *pick* atomic, the shared-checkout and worktree preconditions are now refusals rather than prose, and the session identity bug that made `SESSION GONE` undetectable is fixed. See `docs/decisions/0019`. Claimed 2026-09-07. |
@@ -404,6 +404,46 @@ the option that spends more bits. Use BD-rate, or compare at matched rate. At le
 wrong conclusions have come from this one error.
 
 ## Landed today, and what each one invalidates
+
+- **BUG-15 — the wavelet lossless arm was not lossless, and it is fixed.** `GNC_MED=0` at q=100,
+  and any `--qstep 1 --wavelet 53` config below it, returned **53–56 dB with dE00 0.5–0.9** instead
+  of bit-exact output; `GNC_PHYSICAL_WEIGHTS=1` returned 6 255 bytes at 49.2 dB on a gradient.
+  `is_lossless()` never checked the **subband weights**, and `pack_weights_chroma()` scales the
+  quantiser step by `chroma_weight`, which CHROMA-1 raised to 1.2 for every q >= 60 — q=100
+  included. Invisible because LOSSLESS-1 had routed q=100 to MED the day before, so the only
+  configuration CHROMA-1 broke was the one no test built.
+  **What it invalidates:** any lossless figure taken with `GNC_MED=0` between `cbfa17f` and
+  `d399a99` is a 53–56 dB file mislabelled lossless. COORDINATION's own line "q=100 verified
+  bit-exact lossless on all three entropy coders" was false for the wavelet arm in that window.
+  **What it does not:** the default q=100 path (MED) was and is bit-exact — output is
+  byte-identical before and after the fix — so **LOSSLESS-1's −14.9%, the +25.8% FFV1 gap and the
+  −14.3% abac follow-up all stand**, and so does CHROMA-1's −5.2% (the lossy side is untouched and
+  asserted so). Fix is `CodecConfig::normalized_for_lossless()`, called from `quality_preset` and
+  again at the encoder entry because `--qstep`/`--wavelet` land after the preset.
+  Two conventions worth carrying: **a feature that stops being reachable by default stops being
+  tested even when its tests still run**, and **assert bit-exactness, not a PSNR threshold** — a
+  `psnr > 45.0` assertion reads 55 dB as a pass, which is how this survived a day.
+
+- **INTRA-NEARLOSSLESS — closed by measurement; MED instead of the wavelet does not survive into
+  the lossy range.** Gate failed on criteria set beforehand: BD-rate luma is **sign-varying**
+  (bbb +14.1%, blue_sky −27.2%, kristensara −26.4%, touchdown −22.5%) and colour is worse
+  everywhere (+31.6% to +106.3%). The mechanism is DPCM's, not the implementation's — quantisation
+  error feeds back through the predictor, so rate falls far more slowly than quality and **the
+  usable ladder is delta=1 or delta=2 with nothing between** (bit-exact or ~51 dB, no way to ask
+  for 55 dB). Scoped narrowly on purpose, after the abac near-miss: what is closed is *replacing
+  the wavelet with a quantised closed-loop MED predictor in the lossy range*. `scripts/nearlossless_gate.py`.
+  Two modelling artefacts recorded there, both caught by checking monotonicity: **a fractional
+  quantiser step does not divide the integer pixel lattice** (modelled rate *rose* as the step
+  coarsened) and **the calibration point must actually be lossless**. Four runs void before that
+  was found. A coarser quantiser producing more bits is a broken instrument, not a finding.
+
+- **RATE-2 was found twice within the hour, by two sessions, from opposite directions.** The
+  RATE-1 sweep filed it and that entry stands; this session's numbers fold in as an independent
+  confirmation on different inputs (crops, +1.6% to +33.2% against their +9.3% to +40.6%) plus the
+  boundary in **qstep** terms. Also rules out one framing: sub-unit qstep is not wasted precision —
+  qstep 0.75 buys 3.9 dB over 1.0 for 13% more bits, a normal RD slope, so the rungs are mispriced
+  only against lossless. **A claim taken when you pick an item does not cover what you trip over
+  inside it**, which is why `scripts/claim` did not prevent this one.
 
 - **Correction to a diagnosis I committed: the `abac_bitstream` flake was NOT GPU contention.**
   I read "a different test fails each run, all pass with `--test-threads=1`" and concluded two GPU

@@ -1012,6 +1012,28 @@ Newest first. If you have measurements taken before one of these, they are suspe
   option that spends more bits. Use BD-rate, or compare at matched rate. Three separate wrong
   conclusions today came from this one error.
 
+## Every session commits as the same git user, so authorship attributes nothing (2026-09-07)
+
+Found by the session holding `gnc-bug25@bug25#s52348`, after I credited two of its findings to the
+wrong sessions in one message — the `0024` decision-record collision (it is ENT-5's and INTRA-1's,
+not theirs) and abac's 4:2:2/4:2:0 GPU-vs-CPU byte identity (ENT-5's).
+
+**`git log --author` cannot separate us, and neither can a decision record's byline.** Eight
+sessions, one git identity, one machine. The only reliable attribution is **the claim ref**
+(`gnc-abacgpu@abacgpu#s53810`, `gnc-bug25@bug25#s52348`) or **the item id in the commit subject**.
+Use one of those when you attribute a finding, and never a session's chat name — names are assigned
+per connection and do not survive.
+
+This is the id-collision problem in a third namespace: a field that looks like it identifies
+someone and does not. The cost is not credit, it is that the next reader asks the wrong session to
+expand on a measurement it never took, and starts their trail in the wrong file.
+
+**And the practical habit that fell out of it: write the artefact first, then write the message
+from it.** The two misattributions above were wrong in a chat message and right in the committed
+file, from the same session in the same minute — because the file was written while looking at
+`ls docs/decisions/` and the message was written from memory. Prose composed from recall is where
+this fails; prose composed from the artefact is not.
+
 ## `BUG-25` was used twice, by two sessions, for two different defects (2026-09-07)
 
 The claim mechanism excludes sessions from an *item*; it does not stop two sessions inventing the

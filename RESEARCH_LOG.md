@@ -4,6 +4,67 @@
 
 ---
 
+## BUG-25 — two more hypotheses dead, killed on a machine with no Vulkan (2026-09-07)
+
+**Hypothesis.** `block_match_split.wgsl` kills NVIDIA's driver and Mesa lavapipe, which share no
+compiler code, on SPIR-V that `spirv-val` passes. That combination indicts **naga's output**
+rather than the WGSL or either driver — so the object to inspect is the SPIR-V, and inspecting it
+needs no GPU at all. wgpu 24 resolves naga 24, so a probe linking the same naga reads exactly the
+bytes the runtime would have shipped.
+
+**H6: naga duplicates a barrier-carrying block.** SPIR-V requires every invocation to reach the
+*same* `OpControlBarrier` instruction. A structurizer that duplicates a block containing a barrier
+breaks that dynamically while leaving the module statically valid — exactly what would kill two
+unrelated drivers and still pass `spirv-val`.
+
+**H7: the count of `var<workgroup>`.** BUG-25's own closing line named this ("what is left is the
+count of workgroup variables, or a barrier reached under non-uniform control flow"), and
+`block_match_split` declares nine against four in both siblings. H4 tested nine *in isolation*;
+nine inside this module was untested.
+
+**Instrument.** `examples/spirv_probe.rs` — 64 shaders, no GPU, no remote box, no contention. Walks
+the SPIR-V word stream (each instruction is `[opcode | wordcount<<16]`, so no operand table is
+needed) and reports barrier counts, barriers inside structured constructs, barriers in
+conditionally-reached blocks, block counts, merge depth, workgroup variables and entry-point
+interface size.
+
+| shader | wgsl barriers | spv | cond blocks | blocks | depth | `var<workgroup>` | Vulkan |
+|---|---|---|---|---|---|---|---|
+| **block_match_split** | 29 | 30 | 18 | 268 | 6 | **9** | **dies** |
+| block_match_bidir | 35 | 36 | **24** | 343 | 6 | 4 | OK |
+| block_match | 18 | 19 | 12 | 188 | 6 | 4 | OK |
+| quantize_histogram_fused | 18 | 19 | 11 | **389** | **7** | **11** | OK |
+| rans_histogram | 15 | 16 | 8 | 300 | 7 | **10** | OK |
+
+**Both hypotheses are dead.** H6: the SPIR-V barrier count is the source count **+1 in every one of
+the 64 shaders**, so naga duplicates no barrier-carrying block; and barriers in
+conditionally-reached blocks discriminate in the wrong direction — the two siblings that *compile*
+have 24 and 12 against the offender's 18. H7: nine workgroup variables is not even the maximum in
+the tree. `quantize_histogram_fused` declares **eleven** and `rans_histogram` **ten**, and both
+compile on Vulkan.
+
+**What this eliminates, and why it is stronger than the previous round.** Size, block count, merge
+depth, barrier count, barrier placement, workgroup-variable count and entry-point interface shape
+are all out — measured across the whole shader set rather than by comparing the offender against
+one sibling. The earlier WGSL bisect could only delete whole statements and counted four
+naga-rejected variants as passes; this reads the artefact that actually reaches the driver.
+
+**What survives:** the quarter-pel section, which E1 showed is *required* for the crash, and the
+specific instruction sequence naga emits for it. That cut has to be made at SPIR-V level on a
+machine that can reproduce the crash. Nothing further can be eliminated from here.
+
+**Also corrected, from the session that did the containment** (claim ref `gnc-bug25@bug25#s52348`;
+sessions all commit as the same git user, so the claim ref is the only reliable attribution):
+BUG-25 said inter "still dies" on Vulkan. It does not — it **hangs at 0.00 CPU time** for three
+minutes with no output file, while intra in the same run completes. That sentence was written from
+reading call sites rather than from running it, and a zero-CPU hang may be a different defect from
+the SIGSEGV. Not yet characterised.
+
+**A negative result with a reusable instrument is the point.** Five hypotheses died before these
+two, all by editing WGSL and re-running on the box. This round cost no GPU, no ssh and no
+contention, and it rules out a class rather than one construct at a time.
+
+
 ## INTRA-1 step 2b — cross-tile rate allocation is worth 0.95%, and BUG-26 is fixed (2026-09-07)
 
 **Hypothesis.** Decision 0026 left an asymmetry unexplained: giving JPEG 2000 GNC's 256px tiling

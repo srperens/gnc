@@ -1505,15 +1505,65 @@ now stops at 55 dB, above which the 8-bit grid dominates and two encodes within 
 can order either way. Verified that a plain gradient reconstructs *exactly* from q=92 up, so there
 is no defect behind that.
 
-### RATE-1 — Above ~q=90 on smooth content an 8-bit encode buys precision it cannot emit (in progress 2026-09-07, `rate1` worktree)
-On the test gradient, q=90 costs 0.275 bpp and q=95 costs **1.142 bpp** — four times the bits for
-output that is bit-identical at 8 bits. Not a bug: the anchor ladder halves qstep and zeroes the
-dead zone up there, as designed. But nothing tells it the output is 8-bit.
+### RATE-1 — Above ~q=90 an 8-bit encode buys precision it cannot emit (**ANSWERED NO 2026-09-07 — do not build the rule**)
+**Measured across content, and the premise does not survive it.** The item said the gradient is
+the best case and real content would show less. It shows *nothing*: **no real image reaches
+bit-exactness anywhere below q=100**, and on bbb and blue_sky nothing gets within even 1 LSB. Every
+rung above q=90 is still buying 8-bit-visible improvement — max error falls 6 -> 4 -> 2 -> 1 and the
+share of differing pixels falls from ~54% at q=86 to ~7% at q=99. Recoverable share of the top
+rate: **89.4% on the gradient, 91.8% on a two-axis ramp, 5.6% flat, 0.0% on all four photographic
+stills.** A bit-depth-aware rate rule would recover nothing on the content this codec is for.
 
-For a contribution codec that may emit 10-bit the extra precision is real, which is why the ladder
-should stay. A rate-control rule that knows the output bit depth could stop spending on it when the
-target is 8-bit. Measure how much is recoverable across content before building anything — the
-gradient is the best case for this and real content will show less.
+Original premise, kept for the record: on the test gradient q=90 costs 0.275 bpp and q=95 costs
+1.142 bpp for bit-identical 8-bit output. That is real, and it is a synthetic axis-aligned ramp.
+
+**The synthetic number is the trap, and it is worth naming.** A bit-depth rate rule validated on
+flat512 or the gradient would have shown a large win and delivered nothing on any real image. That
+is the same shape as two errors already in this log — VMAF validating a chroma decision, and
+`opj_compress`'s reversible 5/3 default scoring JPEG 2000 in a lossy comparison: the instrument
+agreed with the hypothesis because the content was chosen in a way that let it. Content selection
+is part of the instrument.
+
+Two things worth keeping from the sweep. The ladder is **not monotonic in rate** — flat512 costs
+0.0450 bpp at q=86 and 0.0370 at q=90 — so "the first q that qualifies" is the wrong statistic
+anywhere this is re-measured, and anything interpolating GNC by rate should flag a rung whose rate
+falls while q rises (MEAS-9's harness now does). And for a 10-bit target the extra precision is real, so the ladder
+itself was never the problem. Harness: `scripts/meas_rate1_precision.py`, measured at `fa32a26`.
+Numbers in RESEARCH_LOG.
+
+### RATE-2 — Above q≈95-98 the lossy ladder costs more than bit-exact lossless (todo, P1)
+
+**On every real image measured, the top of the wavelet ladder spends more bytes than lossless while
+delivering worse output.** Found by the RATE-1 sweep; it is a different defect and a bigger one.
+
+| image | q=100 (MED, bit-exact) | q=99 (wavelet) | q=99 penalty | dominated from |
+|---|---|---|---|---|
+| bbb_1080p | 12.4836 bpp | 13.6439 bpp @ 59.59 dB | **+9.3%** | q=98 |
+| blue_sky_1080p | 8.3068 | 11.6762 @ 60.14 dB | **+40.6%** | q=95 |
+| kristensara_720p | 8.0521 | 10.9428 @ 59.59 dB | **+35.9%** | q=96 |
+| touchdown_1080p | 10.0713 | 13.0570 @ 59.56 dB | **+29.6%** | q=96 |
+
+Mean penalty at q=99: **+28.9% of the bitrate for a worse picture than bit-exact.** Measured at
+`fa32a26` and verified outside the harness — blue_sky q=100 is 2153118 bytes whose decoded pixels
+hash identically to the original (`ffmpeg -f rawvideo` md5 `46839b0e...`), against q=99's 3026470
+bytes at 60.14 dB. Encoding is deterministic (two runs, identical md5).
+
+**Cause, and it was created by an improvement.** LOSSLESS-1 made q=100 14.9% cheaper by coding MED
+residuals instead of wavelet coefficients. COORDINATION notes it invalidated every lossless figure;
+nothing noticed it moved the lossless price *below* the top of the lossy ladder. The two paths are
+never compared, because one is "lossy" and the other "lossless", and no test covers the crossover.
+Not universal — smoothramp512 (1.8024 bpp), flat512 (0.0865) and noise512 (29.9438) are **not**
+dominated, because MED is poor on ramps and on noise. The dominance appears wherever MED does well,
+i.e. on every photographic image.
+
+**Cheapest fix:** at q>=95, encode both ways host-side and keep the smaller. That is the PCRD logic
+already used within a tile, lifted to the transform choice, and it costs two encodes at the top of
+the ladder. It has a bitstream-visible consequence to decide deliberately — a q=97 file would then
+carry `transform_type = 2` — so it wants a decision record, not just a patch. The honest
+alternative is to stop advertising q=95-99.
+
+**Do not measure a contribution operating point at q=95-99 without knowing this.** Any BD-rate
+whose ladder includes those rungs has scored GNC through its dominated range.
 
 ### MEAS-2 — Feature toggling: what contributes and how much? (in progress 2026-09-06)
 First toggle measured: **`GNC_REF_DEBLOCK` — neutral to negative, default flipped off.** Its own

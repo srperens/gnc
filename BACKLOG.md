@@ -1186,6 +1186,9 @@ that path.
    inside the baseline, and the interleaving survives intact. Costs a shift-and-mask per
    neighbour read in the hottest loop of both shaders. Also on the bench.
 
+A fourth path — replacing the coder outright with BPC-PaCo, which would delete both shaders — is
+filed as **ENT-7**. It is speculative and must not gate this fix; ENT-7's own step 1 is this bug.
+
 **Success criterion:** both shaders' declared workgroup storage ≤ 16 384 B with
 `Limits::default()` *or* the requested limit raised deliberately with that trade recorded; and
 `tests/abac_gpu.rs` plus `tests/abac_gpu_encode.rs` still green, since any of these fixes must be
@@ -3810,6 +3813,60 @@ threshold** — a threshold is what let 55 dB pass for lossless in BUG-15.
 
 **Invalidates:** any lossless figure taken with `GNC_DEAD_ZONE` set. No shipped default carried one,
 so no published number moves.
+
+### ENT-7 — fix the WGSL that breaks WebGPU's limits, or replace the coder with BPC-PaCo (todo, P2)
+
+Filed 2026-09-08. Two halves; the second, if it pays, deletes the first.
+
+**1. The broken WGSL.** BUG-31 is the concrete defect: `abac_encode.wgsl` and `abac_decode.wgsl`
+each declare **18 688 B** of workgroup storage against the **16 384 B** the device is created with.
+Native wgpu never checks it, a conformant WebGPU implementation must, and the reachable failure is
+every WASM decode (`DecoderPipeline::new` builds the abac decoder unconditionally). The three
+in-place fixes are priced in BUG-31 and are not restated here — this item exists because there is a
+fourth option BUG-31 does not consider: stop patching abac's shaders and ask whether the coder
+itself is the right one to carry forward.
+
+**2. The candidate replacement: BPC-PaCo** (Bitplane Coding with Parallel Coefficient processing —
+Aulí-Llinàs, Enfedaque, Moure; IEEE TIP 2017, plus their GPU implementation paper). It differs from
+abac in exactly the two places that have cost us:
+
+- **Stationary, offline-trained probabilities per context** instead of per-symbol adaptation.
+  No adaptation means no per-symbol serial chain, so coefficients *within* a code-block code in
+  parallel — abac is one thread per block walking a serial chain on both sides (legal under the
+  Hard Rules, bounded per block, but it is why frame decode is 1.69x and why encode time per frame
+  is still unmeasured on an idle machine, the hole 0017 has carried since ENT-5).
+- Stationary probabilities also delete ENT-6's cold start outright: ENT-6 measured the short
+  blocks at **+25.9% over the entropy bound at q=90** because abac opens every block at p = 1/2,
+  and its fix 1 (signalled initial probabilities) is this mechanism in one-tile form. The offline
+  `warm_start` result — +2.4% → −0.7% — is the same idea already measured once in this repo.
+
+The literature figure is roughly 2–5% rate loss against an adaptive J2K-class coder in exchange for
+much higher GPU throughput. Whether that holds on GNC's subbands and contexts must be measured, not
+assumed — and abac's measured −16.6% to −18.8% against Rice is the bar, so a BPC-PaCo that gives
+half of that back may still lose on rate what it wins on speed.
+
+**Order of work.**
+
+1. **BUG-31's browser check and cheapest fix first.** Whatever coder wins must fit 16 384 B, and
+   the WASM target is a hard requirement today; ENT-7's part 2 is speculative and must not gate it.
+   BUG-31's static canary (sum `var<workgroup>` declarations per `.wgsl` file in a test) covers any
+   new shader this item adds, so land that with the fix.
+2. **CPU reference BPC-PaCo first, GPU port verified byte-exact against it** — the abac pattern
+   (98 of 98 whole-file matches) is the standard, and `abac.rs` shows the shape.
+3. Measure rate at identical pixels (it is lossless recoding of the same coefficients, same rule as
+   ENT-6), then throughput on an idle machine, encode *and* decode.
+
+**Success criteria, stated before implementation:** shaders' declared workgroup storage
+≤ 16 384 B under `Limits::default()`; rate within **+2% of abac** at identical decoded pixels on
+the four stills and ≥3 sequences at q = 85 and 90 (worse than that, keep abac and only BUG-31's
+fix ships); decode ≥ **1.3x** abac's throughput at 1080p 4:4:4 measured idle, else the added coder
+is not paying for its maintenance. Bit-exact CPU/GPU on the full artefact set, like abac.
+
+**Canary:** a `coder=bpc-paco` line with per-tile code-block and symbol counts on encode and
+decode, and the BUG-31 static workgroup-storage assertion in CI.
+
+**Decision record required either way** — a shipped coder is a default-adjacent choice, and a
+rejection is a recorded conclusion with numbers (the EBCOT entry is the template).
 
 ### ENT-6 — abac's deep subbands are one short code-block each, and they cost ~4% of the file (todo, P2)
 

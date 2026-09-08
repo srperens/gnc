@@ -32,10 +32,10 @@ Four stills, q = 85/90/95/99, 4:4:4, tile 256, 5 levels, cb 64, `--abac` — the
 `0024`, which is what makes this comparable to it.
 
 **Canary.** The cold arm must land on what the bitstream really spent, and it does: 1.16% under,
-which decomposes into 0.29% of per-block length fields and **41.4 bits per code-block** of coder
+which decomposes into 0.29% of per-block length fields and **41.2 bits per code-block** of coder
 overhead. That per-block figure is checked against the real encoders in a unit test over 240
 engine/geometry/spread/density combinations: the simulation is a strict lower bound on both
-engines in all 240, and the worst overhead is **81.3 bits** — the range coder at 64×64. 41.4 sits
+engines in all 240, and the worst overhead is **81.3 bits** — the range coder at 64×64. 41.2 sits
 inside a band that was measured rather than chosen.
 
 ## The numbers, as a percentage of what abac's bitstream actually spent

@@ -42,10 +42,10 @@ which is what makes this comparable to it. Two candidates:
   cut makes ten. No header of any kind; only the partition changes.
 
 **Instrument checks.** The cold arm lands 1.16% under what the bitstream spent, decomposing into
-0.29% of per-block length fields and **41.4 bits per code-block** of coder overhead. A unit test
+0.29% of per-block length fields and **41.2 bits per code-block** of coder overhead. A unit test
 puts a measured band on that: over **240 engine/geometry/spread/density combinations** the
 simulation is a strict lower bound on **both** arithmetic engines, and the worst per-block overhead
-is **81.3 bits** (the range coder at 64×64). 41.4 is inside a band that was measured, not chosen.
+is **81.3 bits** (the range coder at 64×64). 41.2 is inside a band that was measured, not chosen.
 The `0024` columns print in the same run and reproduce byte-for-byte.
 
 **One instrument bug, caught by that check.** The first version of the canary compared against
@@ -103,7 +103,7 @@ Three things turn "in the ambiguous band" into "no":
 
 - **The simulation could be measuring a different coder.** It is not: it imports `Prob::update`
   rather than restating it, it is a strict lower bound on both real engines over 240 combinations,
-  and its cold arm sits 41.4 bits per block under the real bitstream inside a measured 81.3-bit
+  and its cold arm sits 41.2 bits per block under the real bitstream inside a measured 81.3-bit
   band.
 - **The warm table could be an oracle.** It is not — per-(plane, subband) statistics of the image
   being coded are exactly what a two-pass encoder computes. It *is* the ceiling for that design,

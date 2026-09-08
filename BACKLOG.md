@@ -4362,6 +4362,18 @@ frame today; this would be ~96 000 invocations.
    at `@workgroup_size(32)` is the shape that is legal without masking. That is 32 of 256
    invocations, which wastes 7/8 of the workgroup unless the tail is filled with something.
 
+4. **The workgroup-storage budget is now known and it is generous — but it is also enforced.**
+   BUG-31 (merged 2026-09-08, `9424405`) repacked `rows` in both abac shaders to one clamped byte
+   per magnitude, four to a word: **18 688 B → 6 400 B per entry point**, so this item has about
+   **9 984 B** of headroom under `Limits::default()`'s 16 384 B. The stripe exchange needs one bit
+   per coefficient per step across stripe boundaries, which is nothing against that. **The
+   enforcement is new too:** `tests/workgroup_storage_limit.rs` parses every `src/shaders/*.wgsl`
+   with naga, sums `var<workgroup>` per compute entry point and asserts against
+   `Limits::default()`, with each known offender's *exact* size in an exception list — so a size
+   that moves in either direction fails. Adding a workgroup array here will trip it deliberately;
+   update the exception list only with a number, never with a tolerance. (BUG-31's sweep also
+   found five more offenders, filed as **BUG-35**, one of them in the *default* encoder path.)
+
 **Success criteria.** Bit-exact CPU/GPU on the full artefact set, like ENT-5 (98 of 98 whole
 files). Rate within **1%** of today's abac at q=85 and 90 on the four stills at bit-identical
 decoded pixels — abac is lossless recoding, so if quality moves the measurement is wrong. Decode

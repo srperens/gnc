@@ -4,6 +4,78 @@
 
 ---
 
+## COORD-8 — the orphan count is arithmetic, and the obvious oracle was unsound (2026-09-08)
+
+**What was open.** `0069` reported the holder's worktree when liveness could not be tested, which
+made an untestable claim actionable. It still said *"verify before trusting"* **without saying
+how**, and `0071` had removed one cause without answering the question. A peer session raised the
+gap and supplied the correction, which is the part worth recording.
+
+**`pgrep -x claude` is unsound for this.** It omitted a live session whose own
+`ps -o comm= -p 8815` reads `claude` — this session, absent from `pgrep -x claude` output taken
+minutes earlier, reproducibly. The peer hit it independently and **nearly concluded four holders
+were gone from a listing that had missed itself.** `kill -0` plus `ps -o comm=` is sound, which is
+what `session_alive` already does, so the fix was never in the pid test — it was in what the
+listing tells you to do next.
+
+**The row-by-row question is unanswerable and the aggregate is not.** Measured on the day:
+
+| | |
+|---|---|
+| worktree claims | 17 |
+| held by a live, testable session | **8 distinct sessions** |
+| identity cannot be tested | 6 |
+| live sessions in this repo (`ListAgents`; socket registry agreed 16/16, every pid alive) | **9** |
+
+9 − 8 = **one live session unaccounted for**, so **at least 5 of the 6 untestable claims are
+orphaned** and at most one is real. Claim age narrows which: all six are over two hours old, so a
+session started an hour ago cannot own one.
+
+**That is deliberately weaker than the reading it replaced.** The peer's summary was "almost
+certainly gone" for four holders; the arithmetic supports at least five of six, not six of six,
+and does not say which five. **Four steals on an inference is the move today has punished twice**
+(BUG-41/BUG-42's triple filing, and the aborted merge), so the bound is reported and nothing is
+taken.
+
+**The instrument got its own arithmetic wrong first, and using it is what caught that.** The
+summary counted worktree *rows* rather than distinct sessions, so it reported 9 holders where the
+truth was 8 — one session (pid 19376) held two worktrees while this was being written. I read my
+own output, walked the subtraction, and got a wrong bound out of it one paragraph after shipping
+the line. Now deduplicated, with `claim selftest` asserting the **delta** (two worktrees taken by
+one new session raise the count by exactly one) because the repository this runs in has real
+claims of its own and an absolute assertion is not testable there. Mutation-tested: removing the
+dedupe makes it read `9 -> 11`.
+
+**Third instrument in this session whose first version was wrong in a way only use exposed** —
+`0069`'s worktree evidence, `0071`'s walk diagnostic that set a global inside a command
+substitution, and this one's row-vs-session count. All three read correctly and all three were
+wrong. **In a shell script with no test framework, the assertion is not the check — breaking the
+feature and watching it fail is.**
+
+**What was not chosen.** Reading the harness's socket registry from `scripts/claim`: it works, and
+it is rejected because **it is not the repository's business how its sessions are supervised** — a
+lock that hardcodes one supervisor's private layout fails silently the day that layout changes,
+and silently in the direction of calling live sessions dead. Failing closed on an untestable
+identity, again. And stealing the orphans, which is a decision about someone's work rather than
+about a diagnostic.
+
+**Left open, and it is the substantive half: 16 uncommitted files sit in six orphaned worktrees**
+— `next2` 8, `g41232` 7, `bug35rans` 1, plus `bug32`, `coord2`, `rebaseline`. Read from their
+diffs, the work is coherent and not scratch: `next2` carries PERF-2's dynamic-offset UBO slots
+with a `[perf2] uniform_buffers=` canary, `g41232` an env-gated `GNC_MC_CLAMP_VISIBLE` motion-comp
+clamp, `bug35rans` a packed histogram in `quantize_histogram_fused.wgsl` that is net −46 lines,
+`tile1` (since inherited by a peer) a `PLANE_PAD_ALIGN` / `tile_extent` padding rework across
+three shaders. **Preserving it behind a ref via `git stash create` — which touches no worktree,
+index or branch — was attempted and refused by the permission layer**, so it is not done and was
+not smuggled in another way. It is the cheapest known way to make that work survive and it needs
+the project owner's decision.
+
+**Gates.** Shell only: no Rust, no WGSL, no bitstream, so the cargo gates cannot be affected and
+were not re-run (DOC-1 / ENT-7 precedent). `scripts/claim selftest` passes all ten cases.
+Decision `0076`.
+
+---
+
 ## ENT-9 step 2 — abac context-codes the Exp-Golomb prefix, and the bound was honest (2026-09-08)
 
 **Hypothesis.** `0063` measured that abac bypasses 46.7–74.8% of its own bits at q=99 and priced

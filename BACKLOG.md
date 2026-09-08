@@ -2297,6 +2297,56 @@ is no before-number and a guessed fix would be exactly the change this project's
 Filed as **COORD-7**. Shell only — no Rust, no shader, no bitstream, so the cargo gates cannot be
 affected and were not re-run (DOC-1 / ENT-7 precedent); `claim selftest` passes.
 
+### COORD-8 — `verify before trusting` now says how, and `pgrep` was the wrong how (**FIXED 2026-09-08**)
+
+`0069` made an untestable claim actionable by reporting the holder's worktree and left the
+question it could not answer: is the holder still there? The listing said
+`OWNER UNIDENTIFIABLE … verify before trusting` **without saying how**, and the obvious how is
+wrong. Decision `docs/decisions/0076`.
+
+**`pgrep -x claude` is unsound, and it fails in the direction that loses work.** It omitted a live
+session whose own `ps -o comm= -p <pid>` reads `claude` — pid 8815, this session, absent from
+`pgrep` output taken minutes earlier. A peer session hit the same thing and nearly concluded four
+holders were gone from a listing that had missed *itself*. **`kill -0` plus `ps -o comm=` is
+sound**, and is what `session_alive` already does.
+
+**The row-by-row question is unanswerable; the count is arithmetic.** `claim list` now closes with
+its own half:
+
+```
+17 worktree claim(s): 8 distinct live session(s) hold one or more, 6 with an identity that cannot be tested.
+Count the sessions actually running and subtract: anything above 8 live session(s) is
+the most that could still own those 6 rows. Do NOT use `pgrep -x claude` (COORD-8).
+```
+
+Worked through on the day: 17 worktree claims, 8 distinct live testable holders, 6 untestable, and
+**9** live sessions in this repo (`ListAgents`, and a socket registry that matched it 16 of 16 with
+every pid alive). 9 − 8 = one live session unaccounted, so **at least 5 of the 6 untestable claims
+are orphaned** and at most one is real. Claim age narrows which: all six are 2 h+ old, so a
+session started an hour ago cannot own one.
+
+**Distinct sessions, not rows — and the first version of this got it wrong.** One session can hold
+several worktrees (pid 19376 held two while this was written), so counting rows overstates how many
+holders are accounted for, which is the one number the summary exists to get right. It reported 9
+where the truth was 8 and was caught by *using* it a paragraph after writing it. `claim selftest`
+asserts the delta — two worktrees taken by one new session raise the count by exactly one — and the
+assertion is mutation-tested: removing the dedupe makes it read `9 -> 11`.
+
+**Deliberately not done:** reading the harness's socket path from `scripts/claim` (it works, but a
+lock that hardcodes one supervisor's private layout fails silently the day it changes, in the
+direction of calling live sessions dead — the session count belongs to whoever runs the sessions);
+failing closed on an untestable identity; and stealing the orphans, which is a decision about
+someone's work rather than about a diagnostic.
+
+**Left open and worth someone's attention: 16 uncommitted files across six orphaned worktrees**
+(`bug35rans` 1, `g41232` 7, `next2` 8, plus `bug32`, `coord2`, `rebaseline`). Preserving them
+behind a ref via `git stash create` — which touches no worktree, index or branch — was attempted
+and **refused by the permission layer**, so it is not done. It is the cheapest known way to make
+that work survive and it needs an owner's decision, not a session's.
+
+Shell only — no Rust, no shader, no bitstream, so the cargo gates cannot be affected and were not
+re-run (DOC-1 / ENT-7 precedent). `claim selftest` passes all ten cases.
+
 ### COORD-7 — the `#g…` identity came through `--as`, and `CLAUDE_PID` is the oracle (**FIXED 2026-09-08**)
 
 Two loose ends from COORD-5 / `0069`. Both investigated before anything was changed; decision

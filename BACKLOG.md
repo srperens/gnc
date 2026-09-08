@@ -4090,6 +4090,45 @@ same PNG four times) codes `q=100` P-frames bit-exact at 3 198 bytes **before** 
 `all_skip_tiles=120/120`, so it went down the motion-skip path and never asked the transform for
 anything. A zero-residual probe cannot test a residual path.
 
+### BUG-44 — `read_reference_planes` reads a different stage on the two pipelines at `q=100` (todo, P3)
+
+**The instrument disagrees where the pictures do not, and it has already cost one session an
+afternoon's hypothesis.** RATE-4 diffed the encoder's reference against the decoder's on a
+256×256 gradient with `GNC_REF_DEBLOCK=0` and got:
+
+| case | max \|enc − dec\| on Y | pixels differing |
+|---|---|---|
+| q=95..99, bit-exact sibling kept | 0.0000 | 0 / 65 536 |
+| q=100, MED | **254.0039** | 65 535 / 65 536 |
+| q=100, `GNC_MED=0` | 7.3965 | 65 535 / 65 536 |
+
+with the encoder side *fractional* (`-0.5019531, -0.00390625, 0.49414063, …`) and the decoder side
+*integral* (`-1.0, -1.0, -1.0, …`). That reads as "the decoder predicts from a picture it does not
+decode", which would be a defect upstream of everything BUG-39 fixed.
+
+**It is not, and the evidence is decisive.** Since BUG-39 closed (`0064`), a `q=100` sequence is
+**bit-exact on every frame**, verified outside the harness with raw-RGB md5 through the real
+container: 48 of 48 frames on 3 sequences at ki=2 and ki=9. A P-frame cannot be md5-identical to
+its source while predicting from a picture the decoder does not hold — the residual is computed
+against the encoder's reference and added to the decoder's, so any difference between them lands
+in the output. So the two buffers `read_reference_planes` returns are **not the same stage of the
+pipeline** in this configuration, and the readback is what needs fixing.
+
+**Why it is worth an item rather than a comment.** This function is the repository's instrument of
+record for "do the two sides agree" — `0042` used it to find two causes, `0044` and RATE-4 used it
+after that, and CLAUDE.md's own lesson from `0040` is *diff the two things that must be equal
+before theorising*. An instrument that answers a different question in one configuration turns
+that lesson into a trap, and the trap only fires at `q=100`, which is the configuration nobody
+exercised until this week.
+
+**Where to look:** the encoder's side is fractional, which is the shape of colour-converted source
+*before* whatever rounds it, and the decoder's is integral, which is the shape of a reconstructed
+picture. One of the two is reading a buffer earlier in the chain than the other.
+
+**Success criterion:** at `q=100` MED, the two sides agree to 0.0000 on a frame that is known
+bit-exact end to end — or the function documents, in one sentence per pipeline, which stage it
+returns and why they differ.
+
 ### LOSSLESS-2 — at `q=100` inter costs +38% on camera content and wins 1.6% on animation (todo, P2)
 
 **Measured at identical pixels, which is the cleanest form this comparison can take.** Both arms

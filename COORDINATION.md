@@ -142,6 +142,27 @@ INTRA-1 session held `dr-0027` through `scripts/claim` before writing, the other
 two pairs in two days where the reserved file was not the one at fault, which is about as clear as
 the evidence for the rule is going to get.
 
+**But do not read the rule as sufficient — later the same day it produced a wrong number while
+being followed correctly.** A live session held `dr-0029` through `scripts/claim` while
+`0029-bug-25-was-one-defect-and-the-second-was-never-reachable.md` was already on `main`, merged in
+`fcc3d33` hours earlier. No race, no second reserver, nothing worktree-local: `take dr-NNNN` is a
+CAS on `refs/claims/dr-NNNN`, and **nothing in it ever reads `docs/decisions/`**, so a number that
+has been committed all afternoon reserves cleanly. Reserving is what handed out the collision.
+
+So the rule earns its keep against *other sessions* and does nothing against the *namespace*. One
+more habit closes that, and it is the cheap half of what COORD-2 will automate:
+
+```bash
+git fetch && git log --oneline -1 origin/main   # a reservation against a stale checkout reserves
+ls docs/decisions/                              # whatever was free when you last pulled
+scripts/claim take dr-00NN "why"
+```
+
+Caught this time by reading `scripts/claim list` against `ls docs/decisions/` during unrelated
+cleanup, before the file was written — which is luck, not process. **COORD-2 is the fix**; its
+build spec already says the free-number scan must read committed `main` *and* `refs/claims/*`, and
+today's case is now recorded there as the instance the interim habits cannot cover.
+
 **Four more records are colliding and nobody has renumbered them: `0018` twice and `0019`
 twice** (a fifth case, `0020`, was renumbered by hand). Filed as **BUG-19** — the fix is
 mechanical but the inbound references are where it goes wrong, so it is a claimable item rather

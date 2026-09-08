@@ -1904,6 +1904,23 @@ that id; it cannot see a renumbering that exists only in someone's worktree, whi
 `BUG-26` moved under a session that had reserved it correctly. Two sessions holding one id for two
 different defects means the lock protected neither.
 
+**And it is worse than "insufficient against a race" — 2026-09-08 shows it hands out a number that
+has been committed for hours.** A live session reserved `dr-0029` while
+`docs/decisions/0029-bug-25-was-one-defect-and-the-second-was-never-reachable.md` was already on
+`main`, merged in `fcc3d33`. There was no race, no worktree-local renumbering and no second
+reserver: `take dr-NNNN` is a CAS on `refs/claims/dr-NNNN` and **nothing in it ever looks at the
+namespace it is reserving in**, so a number sitting in the shared checkout for hours reserves
+cleanly. Caught by reading `scripts/claim list` against `ls docs/decisions/` during unrelated
+cleanup, before the file was written.
+
+**That matters because it is the case the interim habits do not cover.** COORDINATION's mitigation
+is "reserve the number before you write the file", and this session did exactly that; reserving is
+what produced the wrong number. So the two habits below protect against sessions racing each other
+and not against the namespace itself. Until `claim dr` exists, the third habit is the one that
+actually works here: **`git fetch && ls docs/decisions/` on up-to-date `main` immediately before
+writing the file**, because a reservation taken against a stale checkout is a reservation of
+whatever was free when you last pulled.
+
 **What to build:** `scripts/claim bug "<why>"` and `scripts/claim dr "<why>"`, each allocating the
 next free number *as* the compare-and-swap that reserves it — the same mechanism `claim next`
 already uses for work items, which `claim selftest` proves with 16 processes racing for one item
@@ -1914,11 +1931,17 @@ analogous assertion: **N processes calling `claim bug` at the same instant get N
 numbers.**
 
 **Why P2 and not P1:** it costs time and churn rather than correctness, and no measurement has
-been invalidated by it. But it has now bitten on five distinct ids in one day, the fix is
-mechanical, and every session pays the tax. Two cheap habits until it exists, both from
-COORDINATION: reserve the id before you write the heading, and **push a filing quickly rather than
+been invalidated by it — still true on 2026-09-08. But it has now bitten on five distinct ids in
+one day plus `0027` and `dr-0029` since, the fix is mechanical, and every session pays the tax.
+**Left at P2 deliberately rather than bumped:** GOALS §4 says pick by value now and not by the
+P-number, and the honest read is that this is cheap, frequent churn — the argument for doing it is
+the tax and the `dr-0029` class the habits cannot cover, not a correctness risk that appeared. Three cheap habits until it exists, all from
+COORDINATION: reserve the id before you write the heading; **push a filing quickly rather than
 holding it in a worktree** — an id that exists only locally is invisible to the mechanism that
-would protect it.
+would protect it; and **re-read the namespace on fresh `main` just before you write**, since
+reserving does not consult it. Also worth pairing with the BUG-32 lesson: commit the heading or the
+record stub *with* the reservation, so a reserved id that outlives its session is a filed item
+rather than a claim on nothing.
 
 ### BUG-27 — the encoder's P-frame reference was dequantised with the intra qstep (**FIXED 2026-09-07**)
 

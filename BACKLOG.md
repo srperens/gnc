@@ -5615,7 +5615,73 @@ is an afternoon with an existing harness. Against that: the throughput half cann
 a shared machine at all (COORDINATION), and the rate gate may kill it before the shader work
 starts — which is why the gate is first.
 
-### ENT-9 — abac context-codes three decisions and bypasses the rest; at q>=95 the rest is where the file is (todo, P2)
+### ENT-9 — abac context-codes three decisions and bypasses the rest (**step 1 DONE 2026-09-08**, step 2 todo, P2)
+
+**Step 1 is answered and the item is not small. Decision record `0063`.** At q=99, **75.1% /
+75.5% / 43.6% of abac's own bits are bypassed** — sent at p=1/2 with no model at all — so the
+context model touches a quarter of the file on two of three sequences. Share of `Hctx` bypassed,
+first P frame, ki=9, 4:4:4:
+
+| sequence | q=75 | q=90 | q=95 | q=99 |
+|---|---|---|---|---|
+| crowd_run | 34.7% | 50.1% | 60.0% | **75.1%** |
+| bbb_extended | — | 29.9% | — | **43.6%** |
+| old_town_cross | — | 47.3% | — | **75.5%** |
+
+Broken out at crowd_run q=99: significant 7.1%, `>1` 9.6%, `>2` 8.2% coded; **Exp-Golomb 58.5%**,
+sign 16.6% bypassed. The suffix, not the sign, is the mass. Intra behaves the same (73.7% / 61.6%
+/ 72.4% at q=99), so this is not an inter finding.
+
+**Step 1b — both candidates are priced, before either is built** (ideal-adaptive bounds, no
+signalling or adaptation loss charged, the same convention as `Hnb`):
+
+| sequence | q | A: prefix ctx (6x4) | B: sign ctx (3x3) | A+B |
+|---|---|---|---|---|
+| crowd_run | 90 | −2.79% | −2.00% | −4.79% |
+| crowd_run | 99 | **−8.31%** | −1.18% | −9.49% |
+| bbb_extended | 90 | −0.55% | −0.81% | −1.36% |
+| bbb_extended | 99 | **−1.84%** | −0.50% | −2.34% |
+| old_town_cross | 90 | −2.85% | −2.33% | −5.18% |
+| old_town_cross | 99 | **−9.35%** | −1.31% | −10.66% |
+
+**Two of the three candidates this entry filed turned out to be one.** The Exp-Golomb prefix is a
+unary code, so its bit `i` *is* the decision "is the magnitude past threshold `i`" — "a context
+for the first suffix bit" and "more `>k` decisions" are the same lever, and **candidate A is its
+general form**. The mantissa stays bypassed on purpose: it is the low bits of a magnitude with no
+causal information about it.
+
+**The mechanism is confirmed twice.** The bypass share predicts which sequence keeps its
+advantage against Rice — bbb_extended bypasses 43.6% and keeps −14.5% (`0045`), crowd_run 75.1%
+and keeps −4.3%, old_town_cross 75.5% and keeps −3.7%, monotone across all three — and candidate
+A is largest on exactly the two sequences whose saving collapsed. The bounds also agree once put
+on one denominator: `0045`'s "shipped +12.5% over `Hnb`" is `Hnb` sitting **11.1% below shipped**
+(12.5/112.5), and A's −8.31% of `Hctx` is **−8.28% of shipped** — so A recovers 8.28 of the 11.1
+points a whole-magnitude model could, with 24 contexts against 50, *less* as it must be. B's
+−1.18% sits **outside** that bound, since `hnb_bits()` adds `sign_bits` unmodelled, so the ceiling
+is ≈12.3 points of shipped and nothing here had priced the sign before today.
+
+**Every figure here is the *first* P frame, and that is a real limitation.** The diagnostic
+fires once, through a `OnceLock`, so it prices a P frame predicting from an I frame. Later P
+frames predict from P frames and their residual statistics differ — reference drift is the whole
+subject of BUG-27 and RATE-3 — so the bypass share deeper in a GOP is unmeasured. The direction is
+not obvious either way, and step 2's gate is on whole-file rate, which does not inherit the
+limitation.
+
+**Step 2 — build candidate A. Not started, and it is its own claim.** It changes the bitstream, so
+`abac.rs`, `abac_encode.wgsl` and `abac_decode.wgsl` move together and must be re-verified
+byte-exact three ways; that is ENT-5-scale. Gate stays **≥2% of total rate at q=99 on ≥3
+sequences at bit-identical pixels** — A clears it on two of three and reaches 1.84% on the third,
+and the bound is generous, so expect the realisable figure lower. **Candidate B is below the gate
+on all three sequences** (−0.50% to −1.31%) and should not be spent on its own; re-price it after
+A lands, since A moves the denominator.
+
+**Why still P2.** abac is opt-in and `0045` weakened `0017`'s case for it at the top of the range,
+so this improves a non-default coder where it is least convincing. What changed is that the size
+is now known rather than guessed.
+
+<details>
+<summary>The entry as filed, before step 1 was measured</summary>
+
 
 **Filed 2026-09-08 by the ENT-3 session, from its own numbers.** ENT-3 measured abac's saving
 against Rice on P-frame bytes decaying monotonically with quality — bbb_extended −20.6% at q=90 to
@@ -5660,6 +5726,8 @@ an afternoon; it is not filed as urgent.
 **Do not confuse this with ENT-6 or ENT-8.** ENT-6 priced the *initialisation* of the existing
 contexts (1.3%, closed). ENT-8 prices *parallelising* the existing contexts at fixed rate. This
 prices *which symbols get a context at all*, which neither touches.
+
+</details>
 
 ### ENT-6 — abac's cold start is worth 1.3%, not 4% (**CLOSED by measurement 2026-09-08**)
 

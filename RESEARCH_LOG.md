@@ -4,6 +4,103 @@
 
 ---
 
+## ENT-9 step 1 — abac bypasses three quarters of its own bits at q=99 (2026-09-08)
+
+**Hypothesis, straight out of ENT-3.** `0045` measured abac's saving against Rice decaying
+monotonically with quality (P-frame bytes −20.6% → −14.5% on bbb_extended, −12.2% → −4.3% and
+−11.9% → −3.7% on crowd_run and old_town_cross, q=90 → q=99) and could not say why. Two readings,
+opposite consequences: abac is out of structure to exploit (nothing to do), or abac is coding a
+shrinking *share* of the file (a lever). abac context-codes three decisions per coefficient —
+significant, `>1`, `>2` — and bypasses the Exp-Golomb order-0 remainder and the sign at p=1/2, so
+the two are distinguishable by counting.
+
+**It cost a `printf`.** Every term was already accumulated in `coef_entropy_diag` for `Hctx`, and
+the bypass is exact rather than estimated: a p=1/2 bit costs one bit. Read-only, inside the
+existing gates.
+
+**Domain declaration.** Quantised wavelet coefficients decoded back out of the *shipped* abac
+tiles — not a re-encode and not a simulation — of the first I frame (`GNC_COEF_ENTROPY=1`) and the
+first P frame (`GNC_COEF_ENTROPY_INTER=1`). ki=9, 4:4:4, `--abac`.
+
+### The split: share of `Hctx` that abac bypasses
+
+| sequence | q=75 | q=90 | q=95 | q=99 |
+|---|---|---|---|---|
+| crowd_run, inter | 34.7% | 50.1% | 60.0% | **75.1%** |
+| crowd_run, intra | 43.1% | 52.7% | 60.6% | **73.7%** |
+| bbb_extended, inter | — | 29.9% | — | **43.6%** |
+| bbb_extended, intra | — | 49.6% | — | **61.6%** |
+| old_town_cross, inter | — | 47.3% | — | **75.5%** |
+| old_town_cross, intra | — | 46.3% | — | **72.4%** |
+
+Broken out, crowd_run q=99 inter: significant 7.1%, `>1` 9.6%, `>2` 8.2% context-coded;
+**Exp-Golomb 58.5%**, sign 16.6% bypassed. **The suffix is the mass, not the sign.** Intra behaves
+the same, so this is a coder finding and not an inter one.
+
+### Step 1b: the candidates, priced before either is built
+
+Ideal-adaptive bounds with no signalling and no adaptation loss charged — the same convention as
+`Hnb`/`Hbig`, deliberately generous, so a candidate that fails here fails. Inter, negative =
+smaller:
+
+| sequence | q | bypassed | A: prefix ctx (6x4) | B: sign ctx (3x3) | A+B |
+|---|---|---|---|---|---|
+| crowd_run | 90 | 50.1% | −2.79% | −2.00% | −4.79% |
+| crowd_run | 99 | 75.1% | **−8.31%** | −1.18% | −9.49% |
+| bbb_extended | 90 | 29.9% | −0.55% | −0.81% | −1.36% |
+| bbb_extended | 99 | 43.6% | **−1.84%** | −0.50% | −2.34% |
+| old_town_cross | 90 | 47.3% | −2.85% | −2.33% | −5.18% |
+| old_town_cross | 99 | 75.5% | **−9.35%** | −1.31% | −10.66% |
+
+**Two of ENT-9's three filed candidates are one candidate.** The Exp-Golomb prefix is unary, so
+its bit `i` *is* the decision "is the magnitude past threshold `i`" — "a context for the first
+suffix bit" and "more `>k` decisions" are the same lever, and A is its general form (every prefix
+position, keyed on `(bucket, min(i,3))`). The mantissa stays bypassed on purpose: low bits of a
+magnitude, no causal information, and modelling it would buy contexts for noise.
+
+### Three things that make this a mechanism rather than a coincidence
+
+- **The bypass share predicts which sequence keeps its advantage.** q=99 inter: bbb_extended
+  bypasses 43.6% and keeps −14.5% against Rice; crowd_run 75.1% and keeps −4.3%; old_town_cross
+  75.5% and keeps −3.7%. Monotone on all three, and the ordering is the one `0045` measured
+  independently the same afternoon.
+- **The lever is biggest where the deficit is.** Candidate A is worth −8.31% and −9.35% on the two
+  sequences whose saving collapsed and −1.84% on the one that held. A fix that is largest exactly
+  where the problem is largest is the shape being looked for.
+- **The bounds constrain each other correctly, once put on one denominator.** `0045`'s
+  "shipped +12.5% over `Hnb`" is `Hnb` sitting **11.1% below shipped** (12.5/112.5), and A's
+  −8.31% of `Hctx` is **−8.28% of shipped** (`Hctx` is 0.997 of shipped here). So A recovers 8.28
+  of the 11.1 points a whole-magnitude model could, with 24 contexts against 50 — *less*, as it
+  must be, and three quarters of it. **The two as printed are not comparable**, and "8.31 against
+  12.5" would have been a share of the coder's bits against a ratio of two bounds. B's −1.18%
+  then sits **outside** that bound rather than inside, because `hnb_bits()` adds `sign_bits`
+  unmodelled: the ceiling is ≈12.3 points of shipped, not 11.1, and nothing here had priced the
+  sign before today.
+
+### What this does not settle
+
+**Candidate B is below its own gate** — −0.50% to −1.31% at q=99 on three of three, against ENT-9's
+≥2%, which is the bar ENT-6 was closed at 1.3% against. It is real rather than zero, which is more
+than was known this morning, and it should be re-priced after A lands because A moves the
+denominator. Not worth 9 contexts and a signed neighbour array in two shaders on its own.
+
+**Every figure here is the *first* P frame, and that is a real limitation.** The diagnostic
+fires once, through a `OnceLock`, so it prices a P frame predicting from an I frame. Later P
+frames predict from P frames and their residual statistics differ — reference drift is the whole
+subject of BUG-27 and RATE-3 — so the bypass share deeper in a GOP is unmeasured. The direction is
+not obvious either way, and step 2's gate is on whole-file rate, which does not inherit the
+limitation.
+
+**Step 2 is not started and is its own claim.** Building A changes the bitstream, so `abac.rs`,
+`abac_encode.wgsl` and `abac_decode.wgsl` move together and get re-verified byte-exact three ways
+— ENT-5-scale. The point of step 1 was to decide whether that is worth starting; it is.
+
+**Nothing shipped moved.** Verified rather than asserted: same input with the gate set and unset
+both hash `756c0cbd…`, and so does the pre-ENT-9 build. Gates: 261 passed, 0 failed, both clippy
+targets clean. Decision record `0063`.
+
+---
+
 ## ENT-3 — abac's inter saving is real, decays with quality, and the contexts are not the inter question (2026-09-08)
 
 **What was open.** Not the headline — ARCH-3 answered "does abac pay on inter" as a side effect

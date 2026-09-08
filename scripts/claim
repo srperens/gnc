@@ -59,7 +59,7 @@ TOP=$(git rev-parse --show-toplevel)
 STALE_AFTER=${CLAIM_STALE_AFTER:-3600}      # seconds without a touch before `list` says STALE
 
 here_branch() { git symbolic-ref --quiet --short HEAD 2>/dev/null || echo "detached"; }
-here_tree()   { basename "$TOP"; }
+here_tree()   { basename -- "$TOP"; }
 
 # The session, not the directory. Identity used to be worktree@branch, and on 2026-09-07 that
 # turned out to be the wrong principal: two sessions had cwd in the same worktree on the same
@@ -75,16 +75,49 @@ here_tree()   { basename "$TOP"; }
 # identity was the terminal claude was launched from: two sessions started from one shell were
 # again the same principal, and `kill -0` tested a shell that outlives the session, so SESSION GONE
 # could never fire. Print $p, not $ppid.
+# `CLAUDE_PID` is set in the environment of the shells a session runs, and it is the session's own
+# `claude` pid -- exactly what the walk below is trying to find, without the walk. Measured in
+# `gnc-loopa` on 2026-09-08: `CLAUDE_PID=8815` and the walk independently arrived at 8815, with
+# `ps` confirming pid 8815 is `claude`. It is preferred over the walk rather than replacing it,
+# because three claims on that day recorded `s?` from sessions whose environments cannot now be
+# inspected, so it is not known whether they set it (COORD-7).
+#
+# Trust it only if it still names a live `claude`: a stale exported value would otherwise make a
+# dead session look alive, which is the one direction that loses work.
 session_pid() {
   local p=$$ ppid comm
+  if [ -n "${CLAUDE_PID:-}" ]; then
+    case "$CLAUDE_PID" in
+      ''|*[!0-9]*) ;;
+      *) [ "$(basename -- "$(ps -o comm= -p "$CLAUDE_PID" 2>/dev/null)")" = "claude" ] &&
+           { printf 's%s' "$CLAUDE_PID"; return; } ;;
+    esac
+  fi
   for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
     read -r ppid comm <<< "$(ps -o ppid=,comm= -p "$p" 2>/dev/null)"
     [ -z "${ppid:-}" ] && break
-    [ "$(basename "${comm:-}")" = "claude" ] && { printf 's%s' "$p"; return; }
+    [ "$(basename -- "${comm:-}")" = "claude" ] && { printf 's%s' "$p"; return; }
     if [ "$ppid" = "1" ] || [ "$ppid" = "0" ]; then break; fi
     p=$ppid
   done
   printf 's?'   # not under a session (a plain shell, or a nested wrapper): unidentifiable
+}
+
+# The diagnostic for an `s?`, recorded in the claim so the next one is a reading rather than the
+# guess COORD-7 was filed to avoid. It **recomputes** the walk rather than having `session_pid`
+# leave it in a variable: `me()` calls `session_pid` inside a command substitution, so a global
+# set there never reaches `blob_for` -- the first version of this did exactly that and would have
+# recorded nothing, forever, while looking like it worked.
+session_chain() {
+  local p=$$ ppid comm chain=''
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    read -r ppid comm <<< "$(ps -o ppid=,comm= -p "$p" 2>/dev/null)"
+    [ -z "${ppid:-}" ] && break
+    chain="$chain $p:$(basename -- "${comm:-?}")"
+    if [ "$ppid" = "1" ] || [ "$ppid" = "0" ]; then break; fi
+    p=$ppid
+  done
+  printf 'claude-pid=%s chain:%s' "${CLAUDE_PID:-unset}" "${chain:- none}"
 }
 
 ancestor_pids() { # this process's ancestors, nearest first
@@ -145,6 +178,8 @@ blob_for() { # item note prev -> writes metadata blob, prints sha
     printf 'commit:  %s\n' "$(git rev-parse --short HEAD 2>/dev/null || echo none)"
     [ -n "$note" ] && printf 'note:    %s\n' "$note"
     [ -n "$prev" ] && printf 'taken-from: %s\n' "$prev"
+    # Only written when the identity came out `s?`, which is the case COORD-7 needs data for.
+    case "$(me)" in *'#s?') printf 'walk:    %s\n' "$(session_chain)" ;; esac
     :
   } | git hash-object -w --stdin
 }
@@ -332,9 +367,36 @@ try_take() { # item note -> 0 if the CAS won. Silent; no guards. The one place t
   git update-ref "$(ref_of "$1")" "$sha" "" 2>/dev/null
 }
 
+# `--as` takes any string, and on 2026-09-08 that let a **session-shaped identity this script
+# cannot produce** into the lock: `gnc-next2@next2#g01a08196` held PERF-2, dr-0051 and its
+# worktree. `me()` only ever prints `s<pid>` or `s?`, and no committed version of this file has
+# ever emitted a `g` prefix, so it came through here. The cost is precise: `#` makes
+# `claim_state` treat the owner as a session identity, and `session_alive` cannot parse `g…`, so
+# the claim reads as OWNER UNIDENTIFIABLE forever instead of being testable.
+#
+# So an `--as` value may either name no session at all -- `blocked-idle-machine`, a reason rather
+# than a directory -- or name one the liveness test can actually evaluate. Handing an area over to
+# a real session still works; inventing a session does not.
+valid_as() {
+  case "$1" in
+    *'#'*) ;;
+    *) return 0 ;;                       # no session part: a parked or seeded owner. Fine.
+  esac
+  case "${1##*#}" in
+    's?') return 0 ;;
+    s) ;;
+    s*[!0-9]*) ;;
+    s*) return 0 ;;
+  esac
+  echo "REFUSED: --as '$1' has a session part '${1##*#}' that the liveness test cannot read." >&2
+  echo "  Use 's<pid>' of the session you are handing to, 's?' if it is genuinely unknown, or an" >&2
+  echo "  owner with no '#' at all to park it (blocked-<reason>). See docs/decisions/0069." >&2
+  return 1
+}
+
 cmd_take() {
   local as=""
-  if [ "${1:-}" = "--as" ]; then as=${2:-}; shift 2; fi
+  if [ "${1:-}" = "--as" ]; then as=${2:-}; shift 2; valid_as "$as" || return 2; fi
   local item=${1:-}; shift || true; local note="$*"
   valid_item "$item" || exit 2
   # --as exists to seed claims, to hand an area over, and to park a blocked item. It is a
@@ -671,6 +733,35 @@ cmd_selftest() {
   "$0" drop --force "$pk" >/dev/null 2>&1
   [ "$rc" -eq 0 ] &&
     echo "unverifiable owner: reports the holder's worktree; a parked owner is not a directory"
+
+  # COORD-7: --as must not be able to invent a session the liveness test cannot read. That is how
+  # `gnc-next2@next2#g01a08196` got in, and it made three claims permanently untestable.
+  local as_ok=1
+  "$0" take --as "gnc-x@x#g01a08196" "ASX$$-1" "selftest" >/dev/null 2>"$out/as.err"
+  grep -q 'liveness test cannot read' "$out/as.err" \
+    || { echo "FAIL: --as accepted a session part it cannot evaluate"; as_ok=0; rc=1; }
+  held_now=$("$0" list 2>/dev/null | grep -c "^  ASX$$-1 ")
+  [ "$held_now" -eq 0 ] || { echo "FAIL: the refused --as still took the claim"; as_ok=0; rc=1; }
+  for a in "blocked-selftest" "gnc-x@x#s123" "gnc-x@x#s?"; do
+    "$0" take --as "$a" "ASY$$-1" "selftest" >/dev/null 2>&1 \
+      || { echo "FAIL: --as '$a' was refused and should not be"; as_ok=0; rc=1; }
+    "$0" drop --force "ASY$$-1" >/dev/null 2>&1
+  done
+  [ "$as_ok" -eq 1 ] && echo "--as: refuses an unreadable session part, accepts a park and a real one"
+
+  # COORD-7: the `s?` diagnostic must actually be recorded. The first version of it set a global
+  # inside a command substitution, so it would have written nothing forever while looking right.
+  local wt_item="WK$$-1"
+  "$0" take --as "$(here_tree)@$(here_branch)#s?" "$wt_item" "selftest" >/dev/null 2>&1
+  git cat-file -p "$(git rev-parse "$(ref_of "$wt_item")")" 2>/dev/null | grep -q '^walk: .*chain:' \
+    || { echo "FAIL: an s? claim recorded no walk diagnostic"; rc=1; }
+  "$0" drop --force "$wt_item" >/dev/null 2>&1
+  local ok_item="WK$$-2"
+  "$0" take --as "gnc-x@x#s123" "$ok_item" "selftest" >/dev/null 2>&1
+  git cat-file -p "$(git rev-parse "$(ref_of "$ok_item")")" 2>/dev/null | grep -q '^walk:' \
+    && { echo "FAIL: a claim with a readable session part recorded a walk diagnostic"; rc=1; }
+  "$0" drop --force "$ok_item" >/dev/null 2>&1
+  [ "$rc" -eq 0 ] && echo "s? claims record the walked chain; identifiable ones do not"
 
   rm -rf "$out"
   [ "$rc" -eq 0 ] && echo "PASS: claims are atomic, the pick is atomic, and so is id allocation"

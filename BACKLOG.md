@@ -2201,32 +2201,49 @@ is no before-number and a guessed fix would be exactly the change this project's
 Filed as **COORD-7**. Shell only — no Rust, no shader, no bitstream, so the cargo gates cannot be
 affected and were not re-run (DOC-1 / ENT-7 precedent); `claim selftest` passes.
 
-### COORD-7 — why does `session_pid` return `s?`, and what writes a `#g…` identity? (todo, P3)
+### COORD-7 — the `#g…` identity came through `--as`, and `CLAUDE_PID` is the oracle (**FIXED 2026-09-08**)
 
-Two loose ends from COORD-5 / `docs/decisions/0069`, both about how a claim's identity is
-computed rather than about the lock itself. `0069` fixed the *diagnostic* (an unverifiable claim
-now reports its holder's worktree) and deliberately left the *cause* alone, because there was no
-way to measure it after the fact.
+Two loose ends from COORD-5 / `0069`. Both investigated before anything was changed; decision
+`docs/decisions/0071`.
 
-1. **`session_pid` printed `s?` for three of fifteen live claims.** It walks up to twelve
-   ancestors looking for a process whose `comm` basename is `claude`. It works in some sessions —
-   the chain observed in `gnc-loopa` was `zsh → claude(8815) → zsh → login → ghostty` — and
-   returns `s?` in others. Candidates, none measured: a session whose `claude` is spawned under a
-   different `comm` (a `node` wrapper, an IDE extension host), a sandbox or launcher that
-   reparents the shell so the chain reaches pid 1 first, or a chain longer than twelve hops.
-   **Do not guess.** Instrument it: have `claim` record the ancestor chain it walked when the
-   walk fails, in the claim blob, and wait for the next `s?`. One line, and it turns a guess into
-   a reading.
-2. **`gnc-next2@next2#g01a08196` cannot have come from this script.** `me()` prints
-   `<tree>@<branch>#s<pid>` or `…#s?`, and `CLAIM_AS` replaces the identity whole. So either a
-   session set `CLAIM_AS` to something shaped like an identity, or something other than
-   `scripts/claim` is writing `refs/claims/*`. The second would matter a great deal — the lock's
-   guarantees are the script's guarantees — so it is worth ruling out before anything else here.
-   `git reflog` on the ref and the claim blob's own `commit:` field are where to start.
+**1. `gnc-next2@next2#g01a08196` came through `--as`, and `--as` accepting it is the defect.**
+Checked mechanically over every commit that touched `scripts/claim`: **no version has ever emitted
+a `g` prefix** (the only match is `0069`'s own commit, quoting it). `me()` prints `s<pid>` or `s?`,
+so `CLAIM_AS` is the only other route. `--as` took any string, and the cost is precise —
+`claim_state` treats an owner containing `#` as a session identity, `session_alive` cannot parse
+`g01a08196`, so `PERF-2`, `dr-0051` and `worktree.gnc-next2` were **permanently untestable**
+rather than merely held. `--as` now refuses a session part the liveness test cannot read: name no
+session (`blocked-<reason>`), or name one that can be evaluated (`s<pid>` or `s?`). Handover still
+works. `01a08196` matches no session directory for this project, so its provenance is unresolved
+and left that way — it cannot recur, which is the part that mattered.
 
-Neither blocks anything today: `0069` means an unverifiable claim is now actionable rather than
-opaque. But the pid is the thing COORD-1 built the identity around, and it is currently unreliable
-for a fifth of live claims.
+**2. `CLAUDE_PID` is set in a session's shells and is exactly what the walk hunts for.** Measured:
+`CLAUDE_PID=8815`, the twelve-hop walk independently reached 8815, `ps -o comm= -p 8815` prints
+`claude`. Now preferred over the walk — but only if it still names a live `claude`, since a stale
+exported value would make a dead session look alive, and the walk stays as fallback because it is
+not known whether the sessions that recorded `s?` set it at all.
+
+**3. An `s?` claim now records the chain it walked** — `walk: claude-pid=unset chain: 86265:zsh`
+— so the next one is a reading. Also fixed a latent bug the instrument's own output exposed: a
+login shell's `comm` is `-/bin/zsh` and `basename` read the `-` as an option, printing an empty
+name. Four call sites, now `basename --`.
+
+**The instrument's first version was wrong, and the mutation test is why that is known.** It set a
+global inside `session_pid`, which `me()` calls in a command substitution — so `blob_for` would
+have recorded nothing, forever, while reading as if it worked. Both new behaviours are asserted in
+`claim selftest` and both assertions were mutation-tested: disabling `valid_as` gives `FAIL: --as
+accepted a session part it cannot evaluate`, removing the `walk:` line gives `FAIL: an s? claim
+recorded no walk diagnostic`.
+
+**Still open, and it is now the only half: why a session's ancestry sometimes contains no
+`claude`.** No longer open-ended — any future `s?` carries `claude-pid=…` plus the walked chain,
+which separates the three candidates (no `CLAUDE_PID` with a reparented shell, a `claude` under a
+different `comm`, a chain over twelve hops) without guessing. If `CLAUDE_PID` proves universal the
+walk becomes dead code and can go. Not filed as a new item: there is nothing to do until a claim
+carries the data.
+
+Shell only — no Rust, no shader, no bitstream, so the cargo gates cannot be affected and were not
+re-run (DOC-1 / ENT-7 precedent). `claim selftest` passes all nine cases.
 
 ### BUG-42 — `ENT-9` is filed twice (**CLOSED 2026-09-08 — duplicate of COORD-3, which is now FIXED**)
 

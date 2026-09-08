@@ -4,6 +4,77 @@
 
 ---
 
+## COORD-7 — the answer was in the file's own history, and `CLAUDE_PID` was in the environment all along (2026-09-08)
+
+**What was open.** `0069` fixed the diagnostic for an unverifiable claim and left the cause,
+deliberately, because there was nothing to measure: the walk worked in the session that fixed it,
+and the three `s?` claims came from process trees that no longer existed. Two questions were filed
+with an instrument attached rather than a hypothesis — why `session_pid` returns `s?`, and what
+writes `gnc-next2@next2#g01a08196`, which `me()` cannot produce.
+
+**Both were investigated before anything was changed. One is answered, one is now measurable.**
+
+**Answered: the `#g…` identity came through `--as`, and `--as` accepting it is the defect.**
+Checked mechanically across every commit that has ever touched `scripts/claim` — **no version has
+ever emitted a `g` prefix**; the only match in the whole history is `0069`'s own commit, quoting
+the string in a comment. `me()` prints `s<pid>` or `s?`, so `CLAIM_AS` is the only other route
+into that field, and `--as` set it without validating. **The cost is precise, not cosmetic:**
+`claim_state` treats an owner containing `#` as a session identity, `session_alive` cannot parse
+`g01a08196`, so `PERF-2`, `dr-0051` and `worktree.gnc-next2` were **permanently untestable**
+rather than merely held. An owner with *no* `#` was always handled right; it is the
+session-*shaped* value that slips through. `--as` now refuses one it cannot evaluate.
+
+**The generalisable bit: before theorising about who else writes your refs, ask whether the thing
+that does could have produced the value.** COORD-7 was filed saying *"if something other than
+`scripts/claim` writes `refs/claims/*` then the lock's guarantees are not the script's
+guarantees"*, which is true and was the alarming reading. One `git log` over the file's history
+closed it. `01a08196` matches no session directory for this project, so its provenance is
+unresolved and stays that way — it cannot recur, which is the part that mattered.
+
+**Measurable: `CLAUDE_PID` is set in every shell a session runs, and it is exactly what the walk
+hunts for.** `CLAUDE_PID=8815`; the twelve-hop walk independently reached 8815; `ps -o comm= -p
+8815` prints `claude`. Two methods, one answer. It is now preferred over the walk, **checked
+against `ps` first** — a stale exported value would make a dead session look alive, which is the
+one direction that loses work — and the walk is kept as fallback, because the sessions that
+produced `s?` cannot be asked whether they set the variable. An `s?` claim now records
+`walk: claude-pid=unset chain: 86265:zsh`, so **the remaining unknown is no longer open-ended**:
+the next `s?` separates its three candidates (no `CLAUDE_PID` plus a reparented shell, a `claude`
+under a different `comm`, a chain over twelve hops) without guessing.
+
+**A latent bug, found by reading the instrument's own first output.** It printed `30357:` with an
+empty name, because a login shell's `comm` is `-/bin/zsh` and `basename` reads the leading `-` as
+an option. Four call sites, now `basename --`. It caused none of the `s?` — the comparison it
+feeds is against `claude`, never a login shell — but it was making the new diagnostic lossy in
+exactly the place it exists to be read. **The instrument earned its keep before it was even used
+for its purpose.**
+
+**And the instrument's own first version was broken, which is the entry's real lesson.** It set a
+global inside `session_pid`. `me()` calls `session_pid` in a command substitution — a subshell —
+so `blob_for` would have written **nothing, forever, while the code read as if it worked.** Caught
+by breaking the feature and watching the new assertion fail; the diagnostic now recomputes the
+walk in its own function.
+
+**That is the third time in one session** that a check had to be shown to fail before it could be
+trusted: `0062`'s two runtime assertions over compile-time constants, `0069`'s worktree evidence,
+and this. Three for three suggests it is not luck. **In a shell script with no test framework,
+write the assertion, then break the feature and watch it fail** — it is two commands, and every
+one of the three would otherwise have shipped as a decoration.
+
+**Canaries.** `claim selftest` gained two cases, both mutation-tested. Disabling `valid_as` gives
+`FAIL: --as accepted a session part it cannot evaluate` and `FAIL: the refused --as still took the
+claim`; removing the `walk:` line gives `FAIL: an s? claim recorded no walk diagnostic`. Nine
+cases pass on restore.
+
+**Not chosen:** replacing the walk with `CLAUDE_PID` outright (one measurement in one session, and
+the fallback is what protects the sessions that produced `s?`); rewriting the three existing `#g…`
+claims (held by a possibly-live session, and `0069` already makes them actionable); refusing `#`
+in `--as` altogether (breaks handover, one of its three stated purposes). Decision `0071`.
+
+**Gates.** Shell only: no Rust, no WGSL, no bitstream, so the cargo gates cannot be affected and
+were not re-run (DOC-1 / ENT-7 precedent). `scripts/claim selftest` passes all nine cases.
+
+---
+
 ## COORD-5 — the lock could not say whether 4 of 15 holders existed, and that emptied the queue (2026-09-08)
 
 **How this was found.** Not by looking for it. `scripts/claim next` reported *"every startable

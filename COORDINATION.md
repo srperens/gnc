@@ -980,6 +980,29 @@ wrong conclusions have come from this one error.
 
 ## Landed today, and what each one invalidates
 
+- **ENT-9 filed and half-measured — abac bypasses three quarters of its own bits at q=99.**
+  `docs/decisions/0063`. **Invalidates nothing** — read-only, env-gated
+  (`GNC_COEF_ENTROPY_INTER`), bitstream byte-identical with the variable unset and verified so.
+  Three things worth carrying, two of which are not about this item:
+
+  - **abac context-codes three decisions per coefficient and bypasses everything else, and at
+    q=99 "everything else" is 74.6% / 74.8% / 46.7% of its own bits.** Significant, `>1` and `>2`
+    are modelled; the Exp-Golomb remainder and the sign go out at p=1/2. **This is the mechanism
+    behind ENT-3's decay** and it bears directly on **ENT-10** ("should abac be the default"),
+    which currently prices that question on intra stills at q≤90 where the bypass share is far
+    lower. Whoever picks up ENT-8 should also know the coder's context model only touches a
+    quarter of the file at contribution quality.
+  - **A pooled entropy bound is not evidence about a change to context *count*, and the check is
+    cheap.** Step 1b priced 24 new contexts on statistics pooled per plane and subband; the same
+    change run through abac's real engine, cold-started per code-block, came back within ±0.4
+    points and *larger* on three of six points. That was worth doing because abac's own
+    256-stream variant died of exactly this effect (−6.6% → −0.7%), and the precedent turned out
+    not to transfer — 4096 coefficients per block, not 256 per stream.
+  - **"% of the coder's own bits" is not "% of total rate", and the difference runs against you.**
+    Adding the per-block length fields moved these figures by ≤0.01 points, but frame headers and
+    motion vectors are still uncounted. A bound cleared is not a gate cleared; both were stated
+    separately rather than blurred.
+
 - **COORD-5 — `claim list` reports the holder's worktree when it cannot say whether the holder
   exists.** `docs/decisions/0069`. **Invalidates nothing** — `scripts/claim` only; no Rust, no
   shader, no bitstream. **What changes is the thing you read before stealing an item**, so read

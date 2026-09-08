@@ -794,10 +794,11 @@ pub const MAX_TILE_SIZE: u32 = 512;
 ///   sequence at ki=1 loses nothing at all (-5.65% of rate, PSNR identical), which is what
 ///   pins the cause to the reference rather than to the coding.
 ///
-/// `GNC_PAD_FILL=decay` / `=replicate` forces either mode on every path, overriding both
+/// `GNC_PAD_FILL=decay` / `=replicate` / `=zero` forces a mode on every path, overriding both
 /// defaults. That is not a tuning knob: it is what `scripts/meas_intra1_padding.py` and
-/// `scripts/meas_pad1_inter.py` need to run both arms, and forcing `decay` on a P-chain is
-/// measured to be a bad trade.
+/// `scripts/meas_pad1_inter.py` need to run the arms. Forcing `decay` on a P-chain is
+/// measured to be a bad trade. `zero` is PAD-2's Dirac/Schroedinger candidate (inter
+/// zero-extend) and is not a default.
 ///
 /// This is an **encoder-side choice with no bitstream implication**: `pad.wgsl` is compiled only
 /// in `src/encoder/pipeline.rs`, the decoder reconstructs whatever was coded, and both sides
@@ -810,7 +811,11 @@ pub fn pad_fill_mode(default_decay: bool) -> u32 {
         // still-image path, false is the shared buffer every sequence path uses as-is.
         eprintln!(
             "GNC: pad fill = {} (path default {}, {})",
-            if mode == 1 { "decay" } else { "replicate" },
+            match mode {
+                1 => "decay",
+                2 => "zero",
+                _ => "replicate",
+            },
             if default_decay { "decay/intra" } else { "replicate/sequence" },
             match std::env::var("GNC_PAD_FILL") {
                 Ok(v) => format!("GNC_PAD_FILL={v}"),
@@ -825,10 +830,11 @@ fn pad_fill_mode_inner(default_decay: bool) -> u32 {
     match std::env::var("GNC_PAD_FILL").as_deref() {
         Ok("replicate") => 0,
         Ok("decay") => 1,
+        Ok("zero") => 2,
         Err(_) => u32::from(default_decay),
         Ok(other) => {
             eprintln!(
-                "GNC: unknown GNC_PAD_FILL={other:?}; expected \"decay\" or \"replicate\". \
+                "GNC: unknown GNC_PAD_FILL={other:?}; expected \"decay\", \"replicate\" or \"zero\". \
                  Using the per-path default."
             );
             u32::from(default_decay)

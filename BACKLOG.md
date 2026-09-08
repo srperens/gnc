@@ -1798,6 +1798,15 @@ where two different pieces of work share a startable id.
 
 ### BUG-35 — five more compute entry points are over the workgroup budget; the default path is done, the rANS half is not (todo, P2)
 
+**A committed starting point exists on branch `bug35rans` (`c698d1c`), and `claim next` cannot
+tell you that.** The session holding this item was gone for 2h26m with the work uncommitted; it
+was committed by the ENT-3 session on 2026-09-08 so it would survive, and the item was left free
+rather than stolen (`0069`: an `OWNER UNIDENTIFIABLE` claim must not be taken without reading the
+diff). **Read that branch before starting from scratch.** It moves the fused quantize+histogram
+accumulation out of a 5120-entry workgroup arena — 20 KB against the 16 KB device request — into
+`hist_output` storage atomics, leaving the binding layout alone so BUG-34's count stays at 9.
+**Reviewed for coherence, not verified: not gated, not measured, canary not run.**
+
 **The default encode path is off the over-budget entry point, and the histogram it was computing
 turned out to be dead work.** `quantize_histogram_fused.wgsl` gained
 `main_quantize_only` — same quantiser, no `shared_hist`, **3264 B measured** against `main`'s
@@ -2004,6 +2013,16 @@ than an opt-in coder's, and fix 1 is one line. It is P1 if a browser run confirm
 P3 if it shows the limit is not enforced there either.
 
 ### PERF-2 — the per-dispatch uniform buffers need dynamic offsets, not a cached UBO (todo, P3)
+
+**A committed starting point exists on branch `next2` (`20bb41b`), and `claim next` cannot tell
+you that.** Same story as BUG-35: session gone 2h26m, 8 files uncommitted, committed by the ENT-3
+session so it would survive, item left free rather than stolen. **Read that branch first.** It
+replaces per-dispatch `create_buffer_init` with one persistent uniform buffer addressed by dynamic
+offsets, plus a slot allocator (`reset_slots` per submit) and a documented fallback when slots run
+out rather than reusing a live one. Its comment names the hazard: Metal/wgpu stages
+`write_buffer`, so one cached UBO at offset 0 hands every dispatch in a shared submit the last
+write. **Reviewed for coherence, not verified** — and note this item's payoff is a throughput
+claim, which COORDINATION rule 1 forbids reading while other sessions are live.
 
 Filed 2026-09-08 by PERF-1, which verified the sites and then declined the fix as specified.
 
@@ -5349,6 +5368,21 @@ wherever the candidate wins — verified outside the harness by md5 on a real `e
 `decode-sequence` round trip. Stills are byte-identical. Two of twelve points regress (bbb q=99,
 +0.58% / +0.40%) and that is RATE-4.
 
+**Scope, and it is load-bearing: −6.09% is a 4:4:4 figure.** BUG-46 found `lossless_sibling`
+dropping the caller's `chroma_format`, so on subsampled input the comparison was against a 4:4:4
+arm and the fallback could essentially never fire; `0078` now refuses it there outright, because
+BUG-49 has `q=100` luma coming back 47–52 dB instead of exact at 4:2:2/4:2:0. **The sequence sweep
+at those formats is not an open corner of this item — it cannot be run meaningfully until BUG-49
+is fixed.**
+
+**The mechanism behind this item's cost is a measured property, not an anecdote.** A P-frame costs
+more against a bit-exact reference than against a lossy reconstruction — this item saw crowd_run's
+P-frames go 4 990 303 → 5 274 377 B (+5.7%) and recorded it as a curiosity of one sequence;
+`0073` has it four-of-four on separate content (+4.86% / +4.51% / +5.10% / +9.86%) and shows it
+**ratchets**, each swap inflating the next frame's candidate. That is why per-frame switching needs
+a ledger and cannot be tuned, and it is the reason `0068`'s per-GOP design was retired unbuilt
+rather than refuted.
+
 **Both figures moved on the same day and in this item's favour: RATE-4 found that the two
 regressions were BUG-47** — `lossless_sibling` not carrying `pad_fill_decay`, so the bit-exact
 candidate was coded with a still's padding while acting as a reference. Fixed, the same twelve
@@ -6553,6 +6587,17 @@ needs a bitstream version.
 
 ### PAD-2 — collect the padding fill on inter, by re-replicating in the decoder (todo, **P2**)
 
+**The finished half is now on `main`; the unfinished half is on branch `g41232` (`8872707`).**
+`6397188` — the Dirac zero-extend result, 8 of 12 worst-frame points regressing and −4.960 dB at
+worst — was committed in that worktree and never merged, and its session has been gone since. It
+was merged to `main` by the ENT-3 session because a measured negative result stranded on a dead
+branch is precisely what CLAUDE.md's logging rule exists to prevent. **What is still on the branch
+is this item's own "next step"** from that RESEARCH_LOG entry: `GNC_MC_CLAMP_VISIBLE=1` clamps
+motion-compensation reference reads to the visible picture instead of the padded plane, threading
+`orig_w`/`orig_h` through to `motion_compensate.wgsl`. Default off, so nothing shipped moves; it
+is a decode-process change if it ever does. **Reviewed for coherence, not verified.** The item is
+free.
+
 Filed 2026-09-08 by PAD-1, which shipped the still half and measured exactly why the inter half
 does not follow. **Worth roughly −7% to −10% of sequence rate** (that is what forcing the fill on
 already measures), blocked on a bitstream-visible change.
@@ -6575,20 +6620,14 @@ first figures understated it. Plus the ki=1 control that isolates the cause. **S
 the rate win of the forced-on arm with worst-frame PSNR within 0.3 dB of replication on all three
 sequences, both chroma formats.
 
-**And there is prior art for exactly this split, which is worth trying before the decoder change.**
-The Dirac specification (v2.2.3, §13.1.2 Note) recommends **edge extension for intra pictures and
-*zero* extension for inter pictures**, and Schroedinger implements precisely that — it calls
-`schro_frame_zero_extend` on the inter path and edge-extends on intra
-(`schroencoder.c:2442-2453`). VC-2's copy of that Note dropped the inter clause only because VC-2
-is intra-only. So a codec in this family already treats the two cases differently, which is what
-PAD-1 concluded from measurement.
-
-The mechanism is not the one PAD-1 tested, and that is why it is interesting: PAD-1 asked "which
-fill predicts best", and zero extension instead makes the **padding's own residual** vanish, since
-a zero-padded reference against a zero-padded current frame differences to exactly nothing. It says
-nothing about visible edge blocks whose motion vectors reach outward, which is where PAD-1's 4.03 dB
-went — so it may well not help, but it is cheap to measure with `GNC_PAD_FILL` extended by a
-`zero` arm and it is the one candidate here with a shipping implementation behind it.
+**Dirac zero-extend: measured and rejected 2026-09-08.** `GNC_PAD_FILL=zero` (`pad.wgsl`
+`fill_mode=2`). Same harness as PAD-1, ki=9, 17 frames, three sequences, q=85/92, 4:4:4 and 4:2:0.
+**8 of 12 points regress > 0.3 dB** (decay: 6 of 12). Worst: bbb_extended 4:4:4 q=92 **−4.960 dB**
+against decay's −4.030 dB. old_town q=92, which decay left at 0.000, goes to −1.61 / −0.98 dB.
+Mean rate −10.21% vs decay −8.80% — the extra saving is the worse prediction. Default vs
+replicate stayed +0.00% / +0.000 dB on all 12. The caveat in the filing was the result: vanishing
+padding residual does not help visible edge blocks whose MVs point outward. Do not re-test zero
+as an inter default. The env arm stays for the harness.
 
 **Cheaper thing to check first, and it may make PAD-2 unnecessary for most content:** the loss is
 concentrated on one clip. If it is edge blocks with outward motion vectors specifically, then

@@ -76,10 +76,17 @@ count by exactly one — and the assertion was mutation-tested: removing the ded
   is a decision about someone's work rather than about a diagnostic. It wants a person, or a
   session that has read the diff, which is what `0069` said and still says.
 - **Preserving the orphaned work behind a ref** (`git stash create` into `refs/wip/<area>`, which
-  touches no worktree, index or branch). This was attempted and **refused by the permission
-  layer**, so it is not done and is not smuggled in another way. It is recorded here because it is
-  the cheapest known way to make 16 files of unowned work survive, and it needs a decision from
-  the project owner rather than from a session.
+  touches no worktree, index or branch). Attempted and **refused by the permission layer**, so it
+  was not done and was not routed around.
+
+  **Superseded the same evening, and by a better answer than the one this record was holding out
+  for.** Another session committed each dead session's WIP **onto its own branch** and left the
+  items free — `bug35rans` at `c698d1c`, `next2` at `20bb41b`, `g41232` at `8872707`. That is
+  strictly better than a stash ref on two counts: a branch is findable by anyone, and leaving the
+  item free means the work is preserved without anybody being stolen from. The gap it leaves is
+  the one that section records: **the lock reads `main`, so a branch is not discoverable from the
+  queue** — hence the pointers added to those three items' entries. Nothing here needs an owner's
+  decision any more.
 
 ## What this leaves open
 

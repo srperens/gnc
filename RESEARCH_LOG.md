@@ -66,8 +66,11 @@ was redundant and went — and the five `compressed`/`psnr` sites already had an
 `assert_eq!(len, 9)` above them. Net: the tests state four invariants they previously only
 implied.
 
-**Gates.** `cargo test --release -- --test-threads=1`: **261 passed, 0 failed, 9 ignored**. `cargo clippy --release
---all-targets` clean; `cargo clippy --release --target wasm32-unknown-unknown --lib` clean.
+**Gates.** `cargo test --release -- --test-threads=1`: **261 passed, 0 failed, 9 ignored** on the
+branch, **263 passed, 0 failed, 9 ignored** after merging `main` (which brought two tests and
+BUG-19's renumbering). `cargo clippy --release --all-targets` clean and
+`cargo clippy --release --target wasm32-unknown-unknown --lib` clean, both before and after the
+merge. The only `warning:` line either way is the `block v0.1.6` future-incompatibility notice.
 
 **No codec figure moves, and that is checked rather than assumed.** Every edit is inside
 `#[cfg(test)]` code or an integration test target. Of the eleven `src/` files touched, **nine**

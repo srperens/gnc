@@ -2714,13 +2714,13 @@ fn main() {
                 // Sanity: compare wavelet coeff roundtrip for first GOP
                 let gop = encoded_tw.gop_size.min(frames_data.len());
                 if gop >= 2 {
-                    let info = gnc::FrameInfo {
-                        width: w,
-                        height: h,
-                        bit_depth: 8,
-                        tile_size: config_tw.tile_size,
-                        chroma_format: gnc::ChromaFormat::Yuv444,
-                    };
+                    let info = gnc::FrameInfo::new(
+                        w,
+                        h,
+                        8,
+                        config_tw.tile_size,
+                        gnc::ChromaFormat::Yuv444,
+                    );
                     let mut originals: Vec<[Vec<f32>; 3]> = Vec::new();
                     for fd in &frames_data[..gop] {
                         originals.push(encoder.debug_wavelet_prequant(

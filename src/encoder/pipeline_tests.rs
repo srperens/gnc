@@ -2816,7 +2816,7 @@ fn test_temporal_wavelet_planes_are_distinct() {
     config.temporal_transform = TemporalTransform::None;
     config.cfl_enabled = false;
 
-    let info = FrameInfo { width: w, height: h, bit_depth: 8, tile_size: config.tile_size, chroma_format: crate::ChromaFormat::Yuv444 };
+    let info = FrameInfo::new(w, h, 8, config.tile_size, crate::ChromaFormat::Yuv444);
     let prequant = enc.debug_wavelet_prequant(&ctx, &frame, &info, &config);
 
     // Y and Co should differ for a gradient frame.

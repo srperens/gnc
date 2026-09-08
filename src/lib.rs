@@ -55,6 +55,13 @@ impl ChromaFormat {
     }
 }
 
+/// Plane padding alignment for TILE-1 stage 1: `2^levels` at five wavelet levels.
+///
+/// Interior tiles stay `tile_size` (256). The last row and column are shorter, but every
+/// extent is a multiple of 32, so `half = extent / 2` stays valid. GP18 and older pad to
+/// `tile_size` instead (`FrameInfo::plane_pad_align`).
+pub const PLANE_PAD_ALIGN: u32 = 32;
+
 /// Frame dimensions and format info
 #[derive(Debug, Clone, Copy)]
 pub struct FrameInfo {
@@ -63,15 +70,41 @@ pub struct FrameInfo {
     pub bit_depth: u32, // 8 or 10
     pub tile_size: u32, // e.g., 256
     pub chroma_format: ChromaFormat,
+    /// Round the padded plane up to this, not to `tile_size`. 32 since GP19 (TILE-1);
+    /// equal to `tile_size` for GP18 and older so those files keep their original grid.
+    pub plane_pad_align: u32,
 }
 
 impl FrameInfo {
+    /// Current encoder grid (GP19 / TILE-1 stage 1).
+    pub fn new(
+        width: u32,
+        height: u32,
+        bit_depth: u32,
+        tile_size: u32,
+        chroma_format: ChromaFormat,
+    ) -> Self {
+        Self {
+            width,
+            height,
+            bit_depth,
+            tile_size,
+            chroma_format,
+            plane_pad_align: PLANE_PAD_ALIGN,
+        }
+    }
+
+    fn align_dim(dim: u32, align: u32) -> u32 {
+        let a = align.max(1);
+        dim.div_ceil(a) * a
+    }
+
     pub fn tiles_x(&self) -> u32 {
-        self.width.div_ceil(self.tile_size)
+        self.padded_width().div_ceil(self.tile_size)
     }
 
     pub fn tiles_y(&self) -> u32 {
-        self.height.div_ceil(self.tile_size)
+        self.padded_height().div_ceil(self.tile_size)
     }
 
     pub fn total_tiles(&self) -> u32 {
@@ -82,13 +115,23 @@ impl FrameInfo {
         self.width * self.height
     }
 
-    /// Padded dimensions (rounded up to tile_size)
+    /// Padded plane width (rounded up to `plane_pad_align`, 32 since GP19).
     pub fn padded_width(&self) -> u32 {
-        self.tiles_x() * self.tile_size
+        Self::align_dim(self.width, self.plane_pad_align)
     }
 
     pub fn padded_height(&self) -> u32 {
-        self.tiles_y() * self.tile_size
+        Self::align_dim(self.height, self.plane_pad_align)
+    }
+
+    /// Visible-plus-pad extent of tile `(tx, ty)`, never larger than `tile_size`.
+    pub fn tile_extent(&self, tx: u32, ty: u32) -> (u32, u32) {
+        let ox = tx * self.tile_size;
+        let oy = ty * self.tile_size;
+        (
+            self.padded_width().saturating_sub(ox).min(self.tile_size),
+            self.padded_height().saturating_sub(oy).min(self.tile_size),
+        )
     }
 
     /// Chroma plane width (after subsampling)
@@ -101,24 +144,24 @@ impl FrameInfo {
         self.height >> self.chroma_format.vert_shift()
     }
 
-    /// Chroma padded width (rounded up to tile_size)
+    /// Chroma padded width — per plane, not luma/2 (Dirac's trap, TILE-1).
     pub fn chroma_padded_width(&self) -> u32 {
-        self.chroma_width().div_ceil(self.tile_size) * self.tile_size
+        Self::align_dim(self.chroma_width(), self.plane_pad_align)
     }
 
-    /// Chroma padded height (rounded up to tile_size)
+    /// Chroma padded height — per plane, not luma/2.
     pub fn chroma_padded_height(&self) -> u32 {
-        self.chroma_height().div_ceil(self.tile_size) * self.tile_size
+        Self::align_dim(self.chroma_height(), self.plane_pad_align)
     }
 
     /// Number of chroma tiles in X direction
     pub fn chroma_tiles_x(&self) -> u32 {
-        self.chroma_width().div_ceil(self.tile_size)
+        self.chroma_padded_width().div_ceil(self.tile_size)
     }
 
     /// Number of chroma tiles in Y direction
     pub fn chroma_tiles_y(&self) -> u32 {
-        self.chroma_height().div_ceil(self.tile_size)
+        self.chroma_padded_height().div_ceil(self.tile_size)
     }
 
     /// Total chroma tiles per plane

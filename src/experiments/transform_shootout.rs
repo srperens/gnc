@@ -330,13 +330,7 @@ pub fn run_shootout(
     {
         let levels = 4u32;
         let wtype = WaveletType::CDF97;
-        let info = FrameInfo {
-            width: pad_w,
-            height: pad_h,
-            bit_depth: 8,
-            tile_size: 256,
-            chroma_format: crate::ChromaFormat::Yuv444,
-        };
+        let info = FrameInfo::new(pad_w, pad_h, 8, 256, crate::ChromaFormat::Yuv444);
 
         println!("  Testing CDF-9/7 wavelet (4 levels)...");
 

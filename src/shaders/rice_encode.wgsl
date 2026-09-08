@@ -35,7 +35,7 @@ struct Params {
     // Per-stream byte ceiling; must be divisible by 4.
     // Set by CPU via max_stream_bytes_for_tile(): 1024 for 128×128, 4096 for 256×256.
     max_stream_bytes: u32,
-    _pad0: u32,
+    plane_height: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -53,9 +53,12 @@ struct Params {
 // a segment is exactly one column and this equals the old `stream_id + s * 256` coefficient for
 // coefficient; at any other width that modulus interleaved distant columns into one stream and the
 // adaptive k tracked the mixture (BUG-11). Must stay in sync with rice.rs stream_coeff_index().
-fn stream_coeff_index(stream_id: u32, s: u32, symbols_per_stream: u32) -> u32 {
+fn stream_coeff_index(stream_id: u32, s: u32, symbols_per_stream: u32, th: u32) -> u32 {
+    // Column-major over the *actual* tile extent (TILE-1): j = col * th + row.
     let j = stream_id * symbols_per_stream + s;
-    return (j % params.tile_size) * params.tile_size + j / params.tile_size;
+    let col = j / th;
+    let row = j % th;
+    return row * params.tile_size + col;
 }
 
 // Shared memory for Phase 1: k computation
@@ -193,8 +196,10 @@ fn main(
     let tile_y = tile_id / params.tiles_x;
     let tile_origin_x = tile_x * params.tile_size;
     let tile_origin_y = tile_y * params.tile_size;
+    let tw = min(params.tile_size, params.plane_width - tile_origin_x);
+    let th = min(params.tile_size, params.plane_height - tile_origin_y);
 
-    let symbols_per_stream = params.coefficients_per_tile / STREAMS_PER_TILE;
+    let symbols_per_stream = (tw * th) / STREAMS_PER_TILE;
     let num_groups = max(1u, params.num_levels * 2u);
 
     // === Phase 1: Compute optimal k per subband group + 2-state k_zrl ===
@@ -231,7 +236,7 @@ fn main(
         var zrl_ctx_large: bool = false; // context at start of current zero run
         var last_mag_large: bool = false; // true after a "large" nonzero coeff
         for (var s = 0u; s < symbols_per_stream; s++) {
-            let coeff_idx = stream_coeff_index(thread_id, s, symbols_per_stream);
+            let coeff_idx = stream_coeff_index(thread_id, s, symbols_per_stream, th);
             let tile_row = coeff_idx / params.tile_size;
             let tile_col = coeff_idx % params.tile_size;
             let plane_idx = (tile_origin_y + tile_row) * params.plane_width
@@ -389,7 +394,7 @@ fn main(
         var last_mag_large_e: bool = false;
         var se = 0u;
         while (se < symbols_per_stream) {
-            let coeff_idx_e = stream_coeff_index(thread_id, se, symbols_per_stream);
+            let coeff_idx_e = stream_coeff_index(thread_id, se, symbols_per_stream, th);
             let tile_row_e = coeff_idx_e / params.tile_size;
             let tile_col_e = coeff_idx_e % params.tile_size;
 
@@ -410,7 +415,7 @@ fn main(
                 var run_e = 1u;
                 var ns_e = se + 1u;
                 while (ns_e < symbols_per_stream) {
-                    let ni_e = stream_coeff_index(thread_id, ns_e, symbols_per_stream);
+                    let ni_e = stream_coeff_index(thread_id, ns_e, symbols_per_stream, th);
                     let nr_e = ni_e / params.tile_size;
                     let nc_e = ni_e % params.tile_size;
                     let ns_ge = compute_subband_group(nc_e, nr_e);
@@ -533,7 +538,7 @@ fn main(
         var last_mag_large_o: bool = false;
         var so = 0u;
         while (so < symbols_per_stream) {
-            let coeff_idx_o = stream_coeff_index(thread_id, so, symbols_per_stream);
+            let coeff_idx_o = stream_coeff_index(thread_id, so, symbols_per_stream, th);
             let tile_row_o = coeff_idx_o / params.tile_size;
             let tile_col_o = coeff_idx_o % params.tile_size;
 
@@ -554,7 +559,7 @@ fn main(
                 var run_o = 1u;
                 var ns_o = so + 1u;
                 while (ns_o < symbols_per_stream) {
-                    let ni_o = stream_coeff_index(thread_id, ns_o, symbols_per_stream);
+                    let ni_o = stream_coeff_index(thread_id, ns_o, symbols_per_stream, th);
                     let nr_o = ni_o / params.tile_size;
                     let nc_o = ni_o % params.tile_size;
                     let ns_go = compute_subband_group(nc_o, nr_o);

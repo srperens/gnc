@@ -50,8 +50,21 @@ fn main(
     let tile_origin_x = tile_x * params.tile_size;
     let tile_origin_y = tile_y * params.tile_size;
 
-    // Physical region size (= tile_size + 2*overlap for level-0 forward; tile_size>>level otherwise).
-    let ts = params.region_size;
+    // TILE-1 stage 1: border tiles are shorter, still a multiple of 32.
+    let full_w = min(params.tile_size, params.width - tile_origin_x);
+    let full_h = min(params.tile_size, params.height - tile_origin_y);
+    var ts = params.region_size;
+    if params.overlap == 0u && params.region_size > 0u && params.region_size <= params.tile_size {
+        let scale = params.tile_size / params.region_size;
+        if params.pass_mode == 0u {
+            ts = full_w / scale;
+        } else {
+            ts = full_h / scale;
+        }
+    }
+    if line_in_tile >= ts {
+        return;
+    }
     let half = ts / 2u;
 
     if params.direction == 0u {

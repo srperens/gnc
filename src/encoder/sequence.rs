@@ -248,13 +248,13 @@ impl EncoderPipeline {
         let mut results: Vec<Option<CompressedFrame>> = (0..n).map(|_| None).collect();
         let mut has_reference = false;
 
-        let info = FrameInfo {
+        let info = FrameInfo::new(
             width,
             height,
-            bit_depth: config.bit_depth,
-            tile_size: config.tile_size,
-            chroma_format: config.chroma_format,
-        };
+            config.bit_depth,
+            config.tile_size,
+            config.chroma_format,
+        );
         // padded_w/h are luma dimensions — chroma_format does not affect luma padding.
         let padded_w = info.padded_width();
         let padded_h = info.padded_height();
@@ -1408,13 +1408,13 @@ impl EncoderPipeline {
         cfg.temporal_transform = TemporalTransform::None;
 
         let mut i = 0usize;
-        let info = FrameInfo {
+        let info = FrameInfo::new(
             width,
             height,
-            bit_depth: config.bit_depth,
-            tile_size: cfg.tile_size,
-            chroma_format: ChromaFormat::Yuv444,
-        };
+            config.bit_depth,
+            cfg.tile_size,
+            ChromaFormat::Yuv444,
+        );
         let padded_w = info.padded_width();
         let padded_h = info.padded_height();
         let padded_pixels = (padded_w * padded_h) as usize;
@@ -1961,13 +1961,13 @@ impl EncoderPipeline {
         cfg.keyframe_interval = 1;
         cfg.temporal_transform = TemporalTransform::None;
 
-        let info = FrameInfo {
+        let info = FrameInfo::new(
             width,
             height,
-            bit_depth: config.bit_depth,
-            tile_size: cfg.tile_size,
-            chroma_format: ChromaFormat::Yuv444,
-        };
+            config.bit_depth,
+            cfg.tile_size,
+            ChromaFormat::Yuv444,
+        );
         let padded_w = info.padded_width();
         let padded_h = info.padded_height();
         let padded_pixels = (padded_w * padded_h) as usize;

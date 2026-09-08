@@ -23,7 +23,7 @@ const K_STRIDE: usize = MAX_GROUPS * 3 + 1; // 37
 
 // Field order must stay in sync with shaders/rice_encode.wgsl Params struct (bytemuck::Pod).
 // Fields in order: num_tiles, coefficients_per_tile, plane_width, tile_size, tiles_x,
-//                  num_levels, max_stream_bytes, _pad0.
+//                  num_levels, max_stream_bytes, plane_height.
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 pub struct RiceParams {
@@ -35,7 +35,7 @@ pub struct RiceParams {
     num_levels: u32,
     /// Per-stream byte ceiling passed to the shader; set via max_stream_bytes_for_tile().
     max_stream_bytes: u32,
-    _pad0: u32,
+    plane_height: u32,
 }
 
 /// Pre-allocated GPU buffers for Rice encode, reused across calls.
@@ -347,7 +347,7 @@ impl GpuRiceEncoder {
             tiles_x: info.tiles_x(),
             num_levels,
             max_stream_bytes: msb as u32,
-            _pad0: 0,
+            plane_height: info.padded_height(),
         };
         ctx.queue
             .write_buffer(&bufs.params_buf, 0, bytemuck::bytes_of(&params));
@@ -578,7 +578,7 @@ impl GpuRiceEncoder {
             tiles_x: info.tiles_x(),
             num_levels,
             max_stream_bytes: msb as u32,
-            _pad0: 0,
+            plane_height: info.padded_height(),
         };
         ctx.queue
             .write_buffer(&bufs.params_buf, 0, bytemuck::bytes_of(&params));
@@ -780,7 +780,7 @@ impl GpuRiceEncoder {
             tiles_x: info.tiles_x(),
             num_levels,
             max_stream_bytes: msb as u32,
-            _pad0: 0,
+            plane_height: info.padded_height(),
         };
         ctx.queue
             .write_buffer(&bufs.params_buf, 0, bytemuck::bytes_of(&params));
@@ -1043,7 +1043,7 @@ impl GpuRiceEncoder {
             tiles_x: info.tiles_x(),
             num_levels,
             max_stream_bytes: msb as u32,
-            _pad0: 0,
+            plane_height: info.padded_height(),
         };
         ctx.queue.write_buffer(&bufs.params_buf, 0, bytemuck::bytes_of(&params));
     }
@@ -1459,9 +1459,8 @@ impl GpuRiceDecoder {
                 tile_size: info.tile_size,
                 tiles_x: info.tiles_x(),
                 num_levels: tiles.first().map_or(3, |t| t.num_levels),
-                // Decode shader maps this field to _pad0 (unused).
                 max_stream_bytes: 0,
-                _pad0: 0,
+                plane_height: info.padded_height(),
             },
             k_len,
             stream_words: padded_words,
@@ -1611,13 +1610,13 @@ mod tests {
         assert_eq!(coefficients, cpu_decoded, "CPU roundtrip failed");
 
         // GPU decode: pack tile data for GPU
-        let info = crate::FrameInfo {
-            width: tile_size,
-            height: tile_size,
-            bit_depth: 8,
+        let info = crate::FrameInfo::new(
             tile_size,
-            chroma_format: crate::ChromaFormat::Yuv444,
-        };
+            tile_size,
+            8,
+            tile_size,
+            crate::ChromaFormat::Yuv444,
+        );
         let packed = GpuRiceDecoder::pack_decode_data(&[tile], &info);
 
         // Create GPU buffers
@@ -2043,13 +2042,13 @@ mod tests {
         }
 
         // GPU decode
-        let info = crate::FrameInfo {
-            width: padded_w,
-            height: padded_h,
-            bit_depth: 8,
+        let info = crate::FrameInfo::new(
+            padded_w,
+            padded_h,
+            8,
             tile_size,
-            chroma_format: crate::ChromaFormat::Yuv444,
-        };
+            crate::ChromaFormat::Yuv444,
+        );
         let packed = GpuRiceDecoder::pack_decode_data(&all_tiles, &info);
 
         let params_buf = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {

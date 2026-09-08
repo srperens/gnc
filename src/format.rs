@@ -677,7 +677,7 @@ pub fn serialize_compressed(frame: &crate::CompressedFrame) -> Vec<u8> {
     // GP15 splits Rice k_zrl into k_zrl_nz + k_zrl_z per subband (K_STRIDE 17→25 per tile, #53).
     // GP14 adds fwd_ref_idx + bwd_ref_idx for hierarchical pyramid B-frames.
     // GP13 is GP12 + chroma_format byte.
-    out.extend_from_slice(b"GP18");
+    out.extend_from_slice(b"GP19");
     // Common header fields (includes chroma_format byte for GP13)
     serialize_frame_header(frame, &mut out);
     // Motion field — GP12 uses delta-coded varint MVs
@@ -946,8 +946,10 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
         b"GP17" => 17,
         // GP18: entropy type 5, the adaptive binary code-block coder.
         b"GP18" => 18,
+        // GP19: TILE-1 stage 1 — plane padded to 32, not to tile_size.
+        b"GP19" => 19,
         _ => panic!(
-            "Invalid magic (expected GPC8..GP18; older files must be re-encoded)"
+            "Invalid magic (expected GPC8..GP19; older files must be re-encoded)"
         ),
     };
 
@@ -1320,6 +1322,11 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
                 bit_depth,
                 tile_size,
                 chroma_format: chroma_format_decoded,
+                plane_pad_align: if gen >= 19 {
+                    crate::PLANE_PAD_ALIGN
+                } else {
+                    tile_size
+                },
             },
             config: crate::CodecConfig {
                 tile_size,
@@ -1956,13 +1963,13 @@ mod tests {
         let tiles = vec![tile; num_tiles];
 
         crate::CompressedFrame {
-            info: crate::FrameInfo {
+            info: crate::FrameInfo::new(
                 width,
                 height,
-                bit_depth: 8,
+                8,
                 tile_size,
-                chroma_format: crate::ChromaFormat::Yuv444,
-            },
+                crate::ChromaFormat::Yuv444,
+            ),
             config: crate::CodecConfig {
                 tile_size,
                 quantization_step: 4.0,

@@ -29,8 +29,8 @@ struct Params {
     tile_size: u32,
     tiles_x: u32,
     num_levels: u32,
-    _pad0: u32,
-    _pad1: u32,
+    _pad0: u32, // encode's max_stream_bytes; unused here
+    plane_height: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -65,9 +65,11 @@ var<private> p_ema: array<u32, 12>;
 // a segment is exactly one column and this equals the old `stream_id + s * 256` coefficient for
 // coefficient; at any other width that modulus interleaved distant columns into one stream and the
 // adaptive k tracked the mixture (BUG-11). Must stay in sync with rice.rs stream_coeff_index().
-fn stream_coeff_index(stream_id: u32, s: u32, symbols_per_stream: u32) -> u32 {
+fn stream_coeff_index(stream_id: u32, s: u32, symbols_per_stream: u32, th: u32) -> u32 {
     let j = stream_id * symbols_per_stream + s;
-    return (j % params.tile_size) * params.tile_size + j / params.tile_size;
+    let col = j / th;
+    let row = j % th;
+    return row * params.tile_size + col;
 }
 
 fn compute_subband_group(lx: u32, ly: u32) -> u32 {
@@ -148,11 +150,12 @@ fn decode_stream_body(
     tile_origin_x: u32,
     tile_origin_y: u32,
     symbols_per_stream: u32,
+    th: u32,
 ) {
     var last_mag_large: bool = false;
     var s = 0u;
     while (s < symbols_per_stream) {
-        let ci0 = stream_coeff_index(thread_id, s, symbols_per_stream);
+        let ci0 = stream_coeff_index(thread_id, s, symbols_per_stream, th);
         let cr0 = ci0 / params.tile_size;
         let cc0 = ci0 % params.tile_size;
 
@@ -175,7 +178,7 @@ fn decode_stream_body(
             var written = 0u;
             var ws = s;
             while (written < run && ws < symbols_per_stream) {
-                let ci = stream_coeff_index(thread_id, ws, symbols_per_stream);
+                let ci = stream_coeff_index(thread_id, ws, symbols_per_stream, th);
                 let cr = ci / params.tile_size;
                 let cc = ci % params.tile_size;
                 let pi = (tile_origin_y + cr) * params.plane_width + (tile_origin_x + cc);
@@ -237,8 +240,10 @@ fn main(
     let tile_y = tile_id / params.tiles_x;
     let tile_origin_x = tile_x * params.tile_size;
     let tile_origin_y = tile_y * params.tile_size;
+    let tw = min(params.tile_size, params.plane_width - tile_origin_x);
+    let th = min(params.tile_size, params.plane_height - tile_origin_y);
 
-    let symbols_per_stream = params.coefficients_per_tile / STREAMS_PER_TILE;
+    let symbols_per_stream = (tw * th) / STREAMS_PER_TILE;
     let num_groups = max(1u, params.num_levels * 2u);
 
     // Cooperatively load k values into shared memory.
@@ -269,7 +274,7 @@ fn main(
         p_bit_pos = 8u;
         p_current_byte = 0u;
         // Decode this stream
-        decode_stream_body(thread_id, tile_origin_x, tile_origin_y, symbols_per_stream);
+        decode_stream_body(thread_id, tile_origin_x, tile_origin_y, symbols_per_stream, th);
         // Expose final EMA to odd neighbor
         let even_idx = thread_id / 2u;
         for (var gi2 = 0u; gi2 < MAX_GROUPS; gi2++) {
@@ -299,6 +304,6 @@ fn main(
         p_bit_pos = 8u;
         p_current_byte = 0u;
         // Decode this stream
-        decode_stream_body(thread_id, tile_origin_x, tile_origin_y, symbols_per_stream);
+        decode_stream_body(thread_id, tile_origin_x, tile_origin_y, symbols_per_stream, th);
     }
 }

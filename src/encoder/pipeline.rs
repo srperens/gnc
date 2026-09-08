@@ -1650,13 +1650,13 @@ impl EncoderPipeline {
         );
 
         let chroma_format = config.chroma_format;
-        let info = FrameInfo {
+        let info = FrameInfo::new(
             width,
             height,
-            bit_depth: config.bit_depth,
-            tile_size: config.tile_size,
+            config.bit_depth,
+            config.tile_size,
             chroma_format,
-        };
+        );
 
         let padded_w = info.padded_width();
         let padded_h = info.padded_height();

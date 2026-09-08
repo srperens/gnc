@@ -4,6 +4,11 @@
 **Status:** Accepted. Supersedes the prediction in
 [0015](0015-the-entropy-coder-comparison-is-withdrawn.md); no default changes.
 
+> **This number collided.** A second `0018` — GNC is broad on purpose — sat on `main` beside this
+> one from 2026-09-07 to 2026-09-08 and is now
+> [0055](0055-gnc-is-broad-on-purpose.md) (BUG-19). A citation of `0018` written on either of
+> those days may mean that record; this one is the ENT-2 rate measurement.
+
 ## The decision
 
 The README's Entropy Coders table gets a **rate column back**, measured on one commit, and the

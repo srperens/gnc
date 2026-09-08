@@ -49,9 +49,22 @@ var<workgroup> shared_skip_bitmap: u32;
 // Odd threads read their left neighbor's EMA to derive adjusted k warm-start.
 var<workgroup> shared_ctx_even: array<array<u32, 12>, 128>;
 
-// Per-thread bit-reader state
-var<private> p_current_byte: u32;
-var<private> p_bit_pos: u32;     // 0..8, position within current byte
+// Per-thread bit-reader state.
+//
+// A 32-bit window, MSB-first: bit 31 of `p_window` is the next bit out, and
+// `p_win_bits` counts how many of the high bits are still valid. Refilling takes a
+// whole `u32` of `stream_data` at once instead of one byte at a time, which is the
+// point — the unary Rice loop is `while (read_bit())` inside a stage that is ~47% of
+// I-frame decode, and the byte-at-a-time reader issued a storage load per 8 bits.
+//
+// The refill deliberately takes only the bytes remaining in the word that holds
+// `p_byte_offset`, never the next word. That keeps the set of words this shader
+// touches **exactly** what the byte-at-a-time version touched: `load_byte` already
+// read the whole containing `u32` to extract one byte, so caching the rest of it is
+// free, while reading ahead into the following word would be a new access past the
+// end of the last stream. 1..4 bytes per refill, so `p_win_bits` is 8..32 after one.
+var<private> p_window: u32;      // next bits, left-aligned at bit 31
+var<private> p_win_bits: u32;    // valid high bits in p_window, 0..32
 var<private> p_byte_offset: u32; // absolute byte offset in stream_data
 
 // Per-thread EMA state for adaptive k (fixed-point ×16, window ≈ 8 coefficients)
@@ -88,43 +101,53 @@ fn compute_subband_group(lx: u32, ly: u32) -> u32 {
     return 0u;
 }
 
-// Read one byte from the packed u32 stream data buffer.
-fn load_byte(byte_off: u32) -> u32 {
-    let word_idx = byte_off >> 2u;
-    let byte_pos = byte_off & 3u;
-    return (stream_data[word_idx] >> (byte_pos * 8u)) & 0xFFu;
+// Refill the window from the one `u32` of `stream_data` that holds `p_byte_offset`.
+//
+// `stream_data` packs bytes little-endian within each word (byte 0 is the low 8 bits)
+// while bits run MSB-first within a byte, so the word has to be byte-swapped to put
+// the earliest byte at the top of the window. Shifting by `byte_pos * 8` then drops
+// the bytes of this word that were already consumed. Never reads the next word: see
+// the note on `p_window`.
+fn refill() {
+    let word_idx = p_byte_offset >> 2u;
+    let byte_pos = p_byte_offset & 3u;
+    let word = stream_data[word_idx];
+    let swapped = ((word & 0xFFu) << 24u)
+                | (((word >> 8u) & 0xFFu) << 16u)
+                | (((word >> 16u) & 0xFFu) << 8u)
+                | ((word >> 24u) & 0xFFu);
+    let avail = 4u - byte_pos;              // 1..4 bytes left in this word
+    p_window = swapped << (byte_pos * 8u);  // shift is 0, 8, 16 or 24
+    p_win_bits = avail * 8u;
+    p_byte_offset += avail;
 }
 
-// Read a single bit (MSB-first within each byte).
+// Read a single bit (MSB-first).
 fn read_bit() -> u32 {
-    if (p_bit_pos == 8u) {
-        p_current_byte = load_byte(p_byte_offset);
-        p_byte_offset += 1u;
-        p_bit_pos = 0u;
+    if (p_win_bits == 0u) {
+        refill();
     }
-    let bit = (p_current_byte >> (7u - p_bit_pos)) & 1u;
-    p_bit_pos += 1u;
+    let bit = p_window >> 31u;
+    p_window = p_window << 1u;
+    p_win_bits -= 1u;
     return bit;
 }
 
-// Read multiple bits (MSB-first). count must be <= 15.
-// Bulk extraction: grabs remaining bits from current byte before loading next.
+// Read multiple bits (MSB-first). count must be <= 15, which is what bounds every
+// shift below: `take` is at most 15, so neither `32u - take` nor `p_window << take`
+// can reach 32 and become undefined.
 fn read_bits(count: u32) -> u32 {
     var value = 0u;
     var remaining = count;
     while (remaining > 0u) {
-        if (p_bit_pos == 8u) {
-            p_current_byte = load_byte(p_byte_offset);
-            p_byte_offset += 1u;
-            p_bit_pos = 0u;
+        if (p_win_bits == 0u) {
+            refill();
         }
-        let avail = 8u - p_bit_pos;
-        let take = min(remaining, avail);
-        // Extract 'take' MSB-first bits from current position
-        let shift = avail - take;
-        let bits = (p_current_byte >> shift) & ((1u << take) - 1u);
+        let take = min(remaining, p_win_bits);
+        let bits = p_window >> (32u - take);
         value = (value << take) | bits;
-        p_bit_pos += take;
+        p_window = p_window << take;
+        p_win_bits -= take;
         remaining -= take;
     }
     return value;
@@ -141,7 +164,7 @@ fn read_rice(k: u32) -> u32 {
 }
 
 // Decode all symbols for the current thread's stream into the output plane.
-// Uses per-thread private state: p_ema, p_byte_offset, p_bit_pos, p_current_byte.
+// Uses per-thread private state: p_ema, p_byte_offset, p_window, p_win_bits.
 // Also reads shared: shared_k_zrl_nz, shared_k_zrl_z, shared_skip_bitmap.
 fn decode_stream_body(
     thread_id: u32,
@@ -266,8 +289,8 @@ fn main(
         }
         // Initialize bit reader
         p_byte_offset = stream_offsets[tile_id * STREAMS_PER_TILE + thread_id];
-        p_bit_pos = 8u;
-        p_current_byte = 0u;
+        p_window = 0u;
+        p_win_bits = 0u;
         // Decode this stream
         decode_stream_body(thread_id, tile_origin_x, tile_origin_y, symbols_per_stream);
         // Expose final EMA to odd neighbor
@@ -296,8 +319,8 @@ fn main(
         }
         // Initialize bit reader
         p_byte_offset = stream_offsets[tile_id * STREAMS_PER_TILE + thread_id];
-        p_bit_pos = 8u;
-        p_current_byte = 0u;
+        p_window = 0u;
+        p_win_bits = 0u;
         // Decode this stream
         decode_stream_body(thread_id, tile_origin_x, tile_origin_y, symbols_per_stream);
     }

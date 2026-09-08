@@ -208,7 +208,7 @@ abac encodes on the GPU as well as decoding there (ENT-5): one thread per code-b
 against the CPU coder in `abac.rs` — 98 of 98 whole-file comparisons byte-identical across four
 stills, q=60–100, both arithmetic engines, 4:4:4/4:2:2/4:2:0 and an 8-frame sequence.
 **Its encode time per frame is not measured**: four sessions were working this Mac when it landed,
-and a throughput figure taken under load is worth nothing here. `docs/decisions/0024`.
+and a throughput figure taken under load is worth nothing here. `docs/decisions/0057`.
 | Huffman (parked) | 256 | 64-symbol + escape | not measured | not measured | None |
 | Bitplane (parked) | Per-block | Sign + magnitude bitplanes | not measured | not measured | None |
 

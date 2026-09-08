@@ -3910,6 +3910,12 @@ today's −4.28%, worst P within 0.1 dB. **Canary:** the two existing ones — R
 candidate line and RATE-3's repair line — plus a count of frames where the sequence-level choice
 differs from the frame-level one.
 
+**One gap to close on the way in, raised by the BUG-39 session:** both existing canaries are
+*per-frame* lines. They prove the path ran; they do not say a sequence paid the third encode 47
+times, which is the number anyone weighing the encode cost actually wants. A run-level count
+belongs with whichever change makes that cost matter — this item, if the source-copy route removes
+it, or a real encode-time measurement on an idle machine if it does not.
+
 ### RATE-3 — a bit-exact I-frame is a drop-in reference now (**DONE 2026-09-08**, mean −4.28% of sequence bytes)
 
 **`0036`'s sequence gate is lifted and the fallback now runs on sequence I-frames at q = 95..=99.**

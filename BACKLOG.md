@@ -4822,6 +4822,21 @@ version and old streams must keep the old behaviour.
 the rate win of the forced-on arm with worst-frame PSNR within 0.3 dB of replication on all three
 sequences, both chroma formats.
 
+**And there is prior art for exactly this split, which is worth trying before the decoder change.**
+The Dirac specification (v2.2.3, §13.1.2 Note) recommends **edge extension for intra pictures and
+*zero* extension for inter pictures**, and Schroedinger implements precisely that — it calls
+`schro_frame_zero_extend` on the inter path and edge-extends on intra
+(`schroencoder.c:2442-2453`). VC-2's copy of that Note dropped the inter clause only because VC-2
+is intra-only. So a codec in this family already treats the two cases differently, which is what
+PAD-1 concluded from measurement.
+
+The mechanism is not the one PAD-1 tested, and that is why it is interesting: PAD-1 asked "which
+fill predicts best", and zero extension instead makes the **padding's own residual** vanish, since
+a zero-padded reference against a zero-padded current frame differences to exactly nothing. It says
+nothing about visible edge blocks whose motion vectors reach outward, which is where PAD-1's 4.03 dB
+went — so it may well not help, but it is cheap to measure with `GNC_PAD_FILL` extended by a
+`zero` arm and it is the one candidate here with a shipping implementation behind it.
+
 **Cheaper thing to check first, and it may make PAD-2 unnecessary for most content:** the loss is
 concentrated on one clip. If it is edge blocks with outward motion vectors specifically, then
 clamping MC's reads to the *visible* bounds instead of the padded ones is a much smaller change
@@ -4957,6 +4972,38 @@ That was solving a self-inflicted problem — short tiles only lose depth becaus
 at *full* depth and neither reduces the level count. The old plan's arithmetic still stands as a
 warning, though: a per-tile level count would have been a lottery on how the remainder factorises,
 giving NTSC one level over 47% of its rows and an odd remainder none at all.
+
+**The design principle, from three shipping wavelet codecs that all arrived at it independently:
+the alignment belongs in the buffer allocation and the boundary filter, never in the coded sample
+count.**
+
+* **DjVu's IW44** rounds its buffer up to 32 (`bw = (w+0x1f) & ~0x1f`, `IW44Image.cpp:596`) but
+  passes the **true** dimensions to the transform with the padded width used **only as row stride**
+  (`forward(data16, iw, ih, bw, 1, 32)`, `IW44EncodeCodec.cpp:958`). The pad strip is never touched
+  and stays zero. Same 5-level maximum as GNC. Its boundary handling is *degraded taps* — a 2-tap
+  average near edges — rather than extension at all.
+* **VC-5 / CineForm's successor** keeps no pad buffer whatsoever and handles the odd case inside
+  the boundary filter: `input[column] + input[column]` under the comment "Duplicate the value in
+  the last column" (`vc5_encoder/forward.c:654`), with dedicated top-row / bottom-row / middle-row
+  variants. GoPro deliberately migrated to this from CineForm's `ROUNDUP(height, 8)` plus a
+  signalled crop.
+* **Indeo 4/5** clips tiles outright — `tile->width = FFMIN(band->width - x, t_width)`
+  (FFmpeg `ivi.c:368`) — with band sizing by ceiling and `FFALIGN` used only as pitch. A shipped
+  wavelet *video* codec doing exactly what Stage 2 proposes. Its tile size is a bitstream field
+  with four legal values (64/128/256 or whole picture) and odd tile dimensions are refused.
+
+**Implementation gotcha, and GNC has been bitten here before:** Dirac rounds **luma and chroma
+independently** against the same `2^depth` (§13.5.5.1 says so explicitly), so the chroma pad is
+*not* the luma pad halved. That is the same trap as BUG-3 — each plane pads to a tile multiple
+independently — so whatever Stage 1 does must be derived per plane, not by shifting the luma
+figure.
+
+**Two mechanisms ruled out before anyone finds them:** MrSID's overlap-add (US5710835A) reconstructs
+a seamless whole-image DWT but couples neighbouring tiles, which GOALS rule 3 forbids; and VC-5
+Part 5's tiles-as-layers requires every tile to be identically sized, which forbids ragged edges by
+construction. Also dead ends, checked: ADV601 has no sub-blocking at all (whole-field, fixed
+geometry), REDCODE's patent contains no wavelet geometry, and ECW is line-streaming rather than
+tiled.
 
 **Worth checking one level down while in here:** abac's 64px code-blocks are anchored at the
 subband origin, and T.800 truncates *its* border code-blocks the same way rather than padding them.

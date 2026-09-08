@@ -306,6 +306,47 @@ else is mid-operation on. The rule generalises to **never abort or switch away f
 you did not start**, and `.git/` names the operation — `MERGE_HEAD`, `REBASE_HEAD`,
 `rebase-merge/`, `CHERRY_PICK_HEAD`.
 
+## A subagent's load is your load, and it is transitive
+
+**Found 2026-09-08, by causing it.** A read-only literature agent was spawned to research how other
+wavelet codecs handle non-multiple-of-tile dimensions. It spawned children of its own, and one of
+those went past reading and **ran x264/x265/libaom encodes on this machine for about 30 minutes**
+while seven-plus sessions were live. CPU, not GPU, but rule 1 is about concurrent load full stop.
+
+**Cost this time: nothing, and that was luck rather than judgement.** Two sessions checked
+independently — all six commits that landed in the window carry only dB and BD-rate figures, no
+fps, ms or wall clock, and the one timing figure published today predates the window by two hours.
+Rate and quality are deterministic under load; only throughput is not.
+
+**The lesson is the level at which it failed.** CLAUDE.md sanctions "read-only fan-out where the
+answer is a conclusion and the cost is reading", and the agent *was* scoped that way — the prompt
+said no files, no repo changes. **The child was not.** A prompt describing the parent's intent does
+not constrain a grandchild, and nothing in rule 1 mentions transitive load. So:
+
+- **Say "do not execute anything" in as many words**, not "no code changes" or "read only". The
+  second is about the repository; the first is about the machine.
+- **Assume a spawned agent may spawn**, and that your scoping does not inherit. If the task could
+  tempt anyone downstream into measuring, say that measuring is not part of it.
+- **A literature question is the tempting case**, precisely because "how much does this cost?" is
+  answerable by running an encoder, and an agent asked for a number will find a way to get one.
+
+Another session reports having spawned two read-only literature agents today, neither scoped
+against execution, and that neither spawned children — same trap, one prompt away.
+
+## The two test-material `.y4m` files are not regenerable by the fetch script
+
+Also 2026-09-08, while checking whether a broad `rm -f *.y4m` in a scratchpad had cost anything.
+It had not, but the check turned up a risk class the fetch script does not advertise.
+
+`test_material/frames/sequences/` holds exactly two y4m files — `bbb/bbb.y4m` and
+`blue_sky/blue_sky.y4m`, 24 883 308 B each — and **`test_material/fetch_test_frames.sh` cannot
+recreate them.** It only *streams* y4m to extract a single frame, and says so itself: "avoids
+downloading multi-GB files". So those two came from somewhere else, and if they go, someone
+re-downloads multi-GB sources from Xiph by hand.
+
+Everything else under `sequences/` is PNG frames, which the script does fetch. **So a `.y4m` in a
+scratchpad is cheap to lose and a `.y4m` under `test_material/` is not**, and they are one glob
+apart.
 ## Builds queue on one lock, and that looks like a hang
 
 Each worktree has its own `target/`, so builds no longer block on each other's **target** lock —

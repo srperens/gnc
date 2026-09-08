@@ -2048,27 +2048,30 @@ Every edit is in `#[cfg(test)]` code or an integration test target, checked file
 each file's `#[cfg(test)]` marker, so the shipped build is unchanged by construction and no
 figure in BASELINE moves.
 
-### BUG-42 — `ENT-9` is filed twice (**CLOSED 2026-09-08 — duplicate of COORD-3, and the third filing of it**)
+### BUG-42 — `ENT-9` is filed twice (**CLOSED 2026-09-08 — duplicate of COORD-3, which is now FIXED**)
 
-Filed and closed within the same hour by the `loopa` session, which found the two live `### ENT-9`
-headings on `main` while merging BUG-20 and did not know **BUG-41** had already been filed and
-closed against **COORD-3** for exactly this. COORD-3 holds it, with `ENT-10` for the renumber,
-`dr-0065` for the record, and a tested allocator plus duplicate-id refusal on `drnum-mech`. Read
-COORD-3, not this.
+Filed and closed inside the same hour by the `loopa` session, which found the two live `### ENT-9`
+headings on `main` while merging BUG-20. **BUG-41 had already been filed and closed against
+COORD-3 for exactly this, and COORD-3 shipped while this entry was being written** — `ENT-9` is
+renumbered to `ENT-10`, `scripts/claim` gained the item-id allocator and a
+`warn_duplicate_ids` check, decision `0065`. The awk duplicate scan this entry originally proposed
+is that check; read COORD-3 and `0065`, not this.
 
-**What this instance adds is the count: three sessions filed the same finding in one hour**, and
-the third did it *after* COORD-3's stub was on `main`. That is not the stub failing — the stub is
-what closed BUG-41 — it is the **stale base**: `loopa`'s worktree was branched before the stub
-landed, so its own `BACKLOG.md` did not contain COORD-3, and nothing in filing a bug reads
-committed `main`. Same shape as the `dr-0029` case COORDINATION already records for decision
-numbers: *reserving from a stale base is indistinguishable from reserving a free one.*
+**What the instance adds is the count: three sessions filed one finding in one hour**, and the
+third did it *after* COORD-3's stub was on `main`. Two distinct causes, and neither is a lock
+failing:
 
-`scripts/claim bug` cannot catch this, and it is worth being precise about why: it walks
-`main:BACKLOG.md` and `refs/claims/*` for a free **id**, which it correctly gave (BUG-42 was
-free). Nothing anywhere compares the **subject**. So the id allocator is not the missing check —
-`git show main:BACKLOG.md | grep -i <subject>` plus `scripts/claim list` for a held item whose
-heading does not exist yet is, and the second half is what both BUG-41 and this missed, because a
-held item with no heading is invisible to every read except `claim list`.
+- **`scripts/claim bug` gives a free *id*, and nothing anywhere compares the *subject*.** BUG-42
+  was genuinely free; the allocator did its job. An id allocator cannot be the check for "has
+  someone already filed this".
+- **A stale base hides a stub.** This worktree was branched before COORD-3's stub landed, so its
+  own `BACKLOG.md` did not contain it, and filing a bug reads no committed ref. Same shape as the
+  `dr-0029` case in COORDINATION: *reserving from a stale base is indistinguishable from reserving
+  a free one.*
+
+The two reads that would have caught it are now in COORDINATION, above the shared-checkout merge
+section. The second is what BUG-41 and BUG-42 had in common: **an item held with no heading yet is
+invisible to `grep`, to `next` and to `items`, and visible only to `scripts/claim list`.**
 
 ### BUG-38 — `cargo fmt --check` is red across the tree, and GOALS §9 names it as a gate (todo, P4)
 

@@ -4,6 +4,182 @@
 
 ---
 
+## COORD-5 — the lock could not say whether 4 of 15 holders existed, and that emptied the queue (2026-09-08)
+
+**How this was found.** Not by looking for it. `scripts/claim next` reported *"every startable
+BACKLOG item is claimed (15 of them). Nothing to hand out."* Six were parked on preconditions and
+nine were held, so the question was whether any of the nine was abandoned — and COORDINATION's
+answer is `claim list`, which marks an abandoned claim `SESSION GONE, safe to steal`.
+
+**It could not answer for four of them.** `session_alive` returned "cannot say":
+
+| item | owner | held | worktree, checked by hand |
+|---|---|---|---|
+| BUG-35 | `gnc-bug35rans@bug35rans#s?` | 74m | 1 file uncommitted, last edit 67m ago |
+| PAD-2 | `gnc-g41232@g41232#s?` | 75m | 7 files uncommitted, last edit 67m ago |
+| TILE-1 | `gnc-tile1@tile1#s?` | 75m | 13 files uncommitted, last edit 68m ago |
+| PERF-2 | `gnc-next2@next2#g01a08196` | 69m | 8 files uncommitted, last edit 67m ago |
+
+All four claimed between 17:47 and 17:52, all four with their newest source edit at 17:53–17:55,
+checked at 18:58. Three recorded `s?`, which is what `session_pid` prints when its twelve-hop walk
+finds no `claude` ancestor. The fourth recorded `g01a08196`, which **`scripts/claim` cannot
+produce**: `me()` prints `s<pid>` or `s?`.
+
+**This is the property COORD-1 built the identity around, failing in the case it was built for.**
+Its own words: *"the pid also makes an abandoned claim detectable rather than merely old."* Here it
+made it *undetectable in a new way* — not "healthy", which the pre-COORD-1 identity would have
+said, but "unknown", which a session equally cannot act on. Stealing risks destroying up to 13
+files of someone's work; not stealing leaves four items and that work idle. It is the MEAS-5 shape
+(a session gone with 145 uncommitted lines nobody looked at for eleven hours) with a shrug where
+the diagnosis should be.
+
+**Change.** `claim list` now reports the holder's worktree whenever liveness cannot be
+established. This is not new information — it is COORDINATION's own instruction, *"When you see
+`SESSION GONE`, look in the worktree before you steal the item"* — mechanised, because the
+identity already contains the worktree name and `git worktree list` resolves it to a path. Three
+outputs, and the difference between them is what decides a steal:
+
+```
+SESSION GONE, safe to steal, worktree clean                        -> take it
+OWNER UNIDENTIFIABLE, 13 file(s) uncommitted, newest edit 69m ago   -> read the diff first
+no session recorded, verify before trusting                        -> parked: a reason, not a directory
+```
+
+**Canary, and it was mutation-tested rather than trusted.** `claim selftest` gained a case that
+claims an item under an unidentifiable owner naming a real worktree and asserts the evidence
+appears, plus a parked owner and asserts it is *not* described as a directory. Breaking
+`worktree_evidence` to return nothing makes it print `FAIL: an unidentifiable owner naming a real
+worktree reported no evidence`; restoring it passes. Written that way because `0062`, an hour
+earlier, found two runtime assertions in this repository over compile-time constants — **a new
+assertion should be shown to fail before it is trusted**, and this one now has been.
+
+**What was deliberately not done, and why it is the interesting half.** The real repair is
+`session_pid` itself, and it is not attempted. The walk works in the session that fixed this
+(`zsh → claude(8815) → zsh → login → ghostty`) and the three `s?` claims were written over an
+hour earlier by process trees that no longer exist to inspect. **There is no before-number
+available**, so any fix — match `node`, widen the hop limit, read an env var — would be a change
+shipped on a guess, which is the thing this project's protocol exists to refuse. Filed as
+**COORD-7 (P3)** with an instrument instead of a hypothesis: record the ancestor chain in the
+claim blob when the walk fails, and wait for the next `s?`. The `g01a08196` identity is filed with
+it, because if something other than `scripts/claim` writes `refs/claims/*` then the lock's
+guarantees are not the script's guarantees, and that is worth ruling out before touching the walk.
+
+**Also declined: making `s?` fail closed** — treating "cannot say" as `SESSION GONE`. It would
+have freed all four items immediately, which is exactly why it is tempting, and it would have
+handed a session TILE-1 with 13 uncommitted files in another worktree and called it safe. COORD-1
+separated `GONE` from `STALE` because they need different actions; collapsing "unknown" into
+"gone" undoes that in the direction that loses work. Decision `0069` carries both, and the four
+items are **still held** — this changes what `list` says, not who holds what.
+
+**Gates.** Shell only: no Rust, no WGSL, no bitstream, so the cargo gates cannot be affected and
+were not re-run (DOC-1 / ENT-7 precedent). `scripts/claim selftest` passes all seven cases,
+including the new one.
+
+## RATE-4 — the I-frame ledger is one frame deep, not one GOP deep, and the penalty is paid once (2026-09-08)
+
+**What was open.** RATE-3 keeps whichever I-frame candidate is smaller *on that frame's own bytes*,
+and measured the cost of doing so: bbb q=99 regresses +0.58% (ki=2) and +0.40% (ki=9), the only two
+regressions in its twelve-point table (`0044`). RATE-4 said the fix "needs the GOP encoded both ways
+or a model of the residual cost" and banned a margin constant. **This is the measurement of which of
+those it is. No code shipped; the encoder is unchanged.**
+
+**Domain declaration.** Coded bytes of whole sequences, per frame, from the container the encoder
+actually writes — not coefficients and not a model. Both arms are existing code paths from one
+binary differing only in `GNC_LOSSLESS_FALLBACK`, so every delta below is exact.
+
+**Harness** `scripts/meas_rate4.py`. RATE-3's parameters unchanged: bbb (8), crowd_run (10),
+old_town_cross (10), q ∈ {95, 99}, ki ∈ {2, 9}, `benchmark-sequence`, I+P+B arm only. Binary
+hash-recorded before the sweep (`948d7fc5…`). **The whole sweep was run twice and every number is
+byte-identical**, which is CLAUDE.md's rule 8 discharged rather than asserted.
+
+### The premise was checked first, because everything rests on it
+
+A GOP must be closed for GOP bytes to be the right unit. Confirmed by the RATE-3 session: no
+B-frames at ki=2 or ki=9 (`5I+5P+0B`, `2I+8P+0B`), `rate_ctrl` is `None` unless `--bitrate` is
+passed, `pending_me` is reset at every keyframe, `gpu_ref_planes` is overwritten rather than
+accumulated. The harness adds two assertions it can fail on: both arms must produce the identical
+frame-type partition before being differenced — scene-cut detection runs before the keyframe
+decision, and if it ever read reconstructed pixels the arms could disagree about where a GOP starts
+— and any GOP whose I bytes agree across arms while its totals differ makes the script **refuse to
+print an oracle**. **0 of 38 GOPs disagreed.**
+
+### 1. The exact per-GOP ledger is worth 0.09 points of mean
+
+| | mean of 12 | worst point | worse than control |
+|---|---|---|---|
+| today, per-frame ledger | **−4.28%** | **+0.58%** | 2 of 12 |
+| exact per-GOP ledger | **−4.37%** | +0.00% | 0 of 12 |
+
+The −4.28% reproduces `0044` exactly, which is the harness validating itself against a published
+figure before its new column is believed. The per-GOP arm cannot be worse than the control at any
+point because the control is one of its two arms — the property RATE-4's ban on a margin constant
+was reaching for. It changes the choice on 5 of 38 GOPs, **all five in bbb q=99**.
+
+### 2. The penalty is paid by the first P-frame, and P2 onwards is noise
+
+Per-frame bytes inside each ki=9 GOP whose arms chose differently, bit-exact minus lossy:
+
+| sequence | q | I | P1 | P2 | P3 | P4 | P5 | P6 | P7 | P8 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| bbb | 99 | −279 336 | **+321 525** | +20 104 | +10 539 | +9 967 | +7 003 | +4 823 | +2 877 | |
+| crowd_run | 95 | −645 809 | **+212 583** | +6 768 | +725 | −3 698 | −802 | −375 | −672 | +2 154 |
+| crowd_run | 99 | −1 549 505 | **+284 074** | +16 754 | +1 705 | +5 803 | −1 903 | +1 486 | −3 027 | −6 351 |
+| old_town_cross | 95 | −575 709 | **+187 647** | +7 328 | +2 931 | +3 363 | +1 517 | +1 496 | −79 | +5 051 |
+| old_town_cross | 99 | −1 489 769 | **+249 662** | +10 385 | +6 955 | +3 943 | −5 186 | +2 043 | +2 687 | +790 |
+
+P2 is 2–6% of P1; P2..P8 together are 1–17% of it. **P2's reference is P1's reconstruction, which is
+lossy in both arms**, so the extra detail a bit-exact I-frame carries is re-coded once and gone. It
+never becomes a property of the GOP.
+
+So the item's own framing was wrong in a useful direction: **a one-frame lookahead — compare
+`I + P1` under each candidate's reference — reaches the exact per-GOP decision on 33 of 33 GOPs**,
+at one extra P-frame encode per GOP rather than the losing arm's whole GOP. At ki=2 they are the
+same computation; at ki=9 it is an eightfold difference. The approximation's size is in the table:
+the one-frame ledger is optimistic about bit-exact by the sum of P2.., 4 100 B to 55 313 B on GOPs
+of ~20 MB, so it can misjudge only a GOP whose true delta lies inside that band. Evidence, not a
+guarantee.
+
+### 3. A margin constant would have passed all twelve points — and must still be refused
+
+The P1 penalty is nearly **independent of the I-frame saving**: 187 647–321 525 B across six
+sequence/q pairs, against savings spanning 279 336–1 549 505 B. So "keep the bit-exact frame iff its
+saving exceeds T" reproduces every one of the twelve points for any T in **(279 336, 575 709) B**.
+
+That is the fit RATE-4 forbids, and the reason to keep forbidding it is visible in the same numbers:
+the window's two ends come from two of the three sequences, the penalty varies 1.7× inside this
+small set, every sequence here is 1080p so the constant is untested against resolution, and the
+point setting the lower bound is the single regression the item exists to remove. **A twelve-point
+sweep is not enough to license a constant, and this is the sweep that proves it** — it passes.
+
+### Would we ship it? Not yet, and the reason is a price rather than a doubt
+
+RATE-4 is demoted **P2 → P3**. The mean is 0.09 points; the regressions are one sequence at one
+quality point; and the implementation has to hold **two live I-frame references** — build reference
+A, encode P1, build reference B, encode P1, restore the winner's for P2 — through the
+`encode_once` → `local_decode_iframe_gpu` side channel that has already produced four separate
+defects (`0040`, `0042`, RATE-3's gate, and the ordering constraint in `encode`'s own comment). The
+cheap version snapshots `gpu_ref_planes` (~24 MB at 1080p 4:4:4) instead of re-encoding, so the
+marginal cost is one extra I and one extra P per GOP.
+
+**And the item's other half should go first, because it changes this price.** If a bit-exact frame's
+reference is its colour-converted source, RATE-3's third encode disappears and the ledger's marginal
+cost roughly halves. That route is refuted at q=100 and **unexplained at q=95..99, where the
+encoder's and decoder's references match to 0.0000** — which is exactly the case this ledger cares
+about.
+
+**Rejected on the way:** the whole-sequence double encode (exact, breaks streaming, and finding 2
+says almost nothing it buys lies past P1); deciding once per sequence from the first GOP (collects
+the entire win here, because the choice never varies within a sequence — but that uniformity is
+measured on 8- and 10-frame clips with no scene change); and extrapolating the GOP from the measured
+P1 penalty as `saving + n_P × penalty`, which the data that suggested it refutes — on crowd_run q=95
+ki=9 it prefers lossy by a wide margin where the exact GOP prefers bit-exact (−429 126).
+
+**No encode-time figure and no quality figure.** Seven other sessions were on this machine, so every
+cost above is a count of encodes rather than a measurement of them (COORDINATION rule 1); and no
+pixels moved, because the encoder is untouched. Decision `docs/decisions/0068`.
+
+---
+
 ## BUG-38 — no rustfmt config fits the tree, and the dirty files are the hot files (2026-09-08)
 
 **Hypothesis.** GOALS §9 requires `cargo fmt` clean and `cargo fmt --check` reports 573 diffs in
@@ -288,6 +464,9 @@ limitation.
 **Nothing shipped moved.** Verified rather than asserted: same input with the gate set and unset
 both hash `756c0cbd…`, and so does the pre-ENT-9 build. Gates: 261 passed, 0 failed, both clippy
 targets clean. Decision record `0063`.
+
+---
+
 ## BUG-20 — the clippy gate never read a test, and 91 warnings sat behind it (2026-09-08)
 
 **Hypothesis.** CLAUDE.md requires zero clippy warnings and named the gate as

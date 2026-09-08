@@ -1673,15 +1673,14 @@ machine — but the affected claim is a documented project rule, and step 1 may 
 > look before filing. That is COORDINATION.md's "Reserving an id is not filing the item" a third
 > time, and it is what this entry is now evidence for.
 >
-> **The mechanism half is written and tested — take it, do not rewrite it.** Worktree `gnc-drnum`,
-> branch **`drnum-mech`** (`git log --all --oneline --grep 'BUG-41 mechanism'`), one file
-> (`scripts/claim`): the `claim item <PREFIX>` allocator, the
-> duplicate-startable-id detection in `items`/`next`, and two new `selftest` properties. **`scripts/claim
-> selftest` passes all six.** It is deliberately **not merged to `main`** — COORD-3 holds the work,
-> and two sessions editing `scripts/claim` for the same reason is the failure this file exists to
-> prevent. Cherry-pick it, or ignore it and say so.
+> **The mechanism landed — COORD-3 shipped it, not this branch.** `1b1f8f6`,
+> `docs/decisions/0065`: `scripts/claim item <PREFIX>` allocates from the same union of committed
+> `main:BACKLOG.md` and live `refs/claims/*`, and `warn_duplicate_ids` reports an id with two
+> startable headings. The `drnum-mech` branch that held this session's independent implementation
+> of the same two things is **deleted**; standing down rather than racing it cost one unmerged
+> commit and duplicated nothing on `main`.
 >
-> What is *not* done anywhere: the ENT-9 renumber itself (COORD-3 holds `ENT-10` for it).
+> What COORD-3 also carried: the ENT-9 renumber itself, under `ENT-10`.
 
 `main:BACKLOG.md` carries two startable `### ENT-9` headings for **different work**:
 
@@ -2162,6 +2161,72 @@ alternative lost.
 Every edit is in `#[cfg(test)]` code or an integration test target, checked file by file against
 each file's `#[cfg(test)]` marker, so the shipped build is unchanged by construction and no
 figure in BASELINE moves.
+
+### COORD-5 — `claim list` could not say whether 4 of 15 holders existed (**FIXED 2026-09-08**)
+
+COORD-1 put the pid in a claim's identity so *"an abandoned claim is detectable rather than merely
+old"*. On 2026-09-08 at 18:58, with `claim next` reporting **every** startable item claimed, that
+property was not holding for **4 of the 15 item claims** — and those four were the whole difference
+between a working queue and an empty one:
+
+| item | owner | held | what was actually in the worktree |
+|---|---|---|---|
+| BUG-35 | `gnc-bug35rans@bug35rans#s?` | 74m | 1 file uncommitted, last edit 67m ago |
+| PAD-2 | `gnc-g41232@g41232#s?` | 75m | 7 files uncommitted, last edit 67m ago |
+| TILE-1 | `gnc-tile1@tile1#s?` | 75m | 13 files uncommitted, last edit 68m ago |
+| PERF-2 | `gnc-next2@next2#g01a08196` | 69m | 8 files uncommitted, last edit 67m ago |
+
+Three recorded `s?`; the fourth recorded `g01a08196`, which **`scripts/claim` cannot produce** —
+`me()` prints `s<pid>` or `s?`. `session_alive` says "cannot say" for all four and `list` printed
+`OWNER UNIDENTIFIABLE` with nothing after it, which no session can act on: stealing risks
+destroying up to 13 files of work, not stealing leaves four items idle. **Same shape as the MEAS-5
+loss**, which is what the pid was added to prevent.
+
+**Fixed by reporting the holder's worktree whenever liveness cannot be established** — the check
+COORDINATION already asks a session to run by hand before a steal, mechanised. `claim list` now
+prints `SESSION GONE, safe to steal, worktree clean` (take it), `OWNER UNIDENTIFIABLE, 13 file(s)
+uncommitted, newest edit 69m ago` (read the diff first), or `no session recorded, verify before
+trusting` for a parked owner, which names a reason rather than a directory. Decision
+`docs/decisions/0069`.
+
+**Verified by mutation:** `claim selftest` gained a case for both the evidence and the parked
+owner, and breaking `worktree_evidence` makes it print `FAIL: an unidentifiable owner naming a
+real worktree reported no evidence`. Written that way because `0062` had just found two runtime
+assertions over compile-time constants in this repo — a new assertion should be shown to fail
+before it is trusted.
+
+**Deliberately not attempted: repairing `session_pid` itself.** The walk works in the session that
+fixed this and the three `s?` claims were written by process trees that no longer exist, so there
+is no before-number and a guessed fix would be exactly the change this project's protocol refuses.
+Filed as **COORD-7**. Shell only — no Rust, no shader, no bitstream, so the cargo gates cannot be
+affected and were not re-run (DOC-1 / ENT-7 precedent); `claim selftest` passes.
+
+### COORD-7 — why does `session_pid` return `s?`, and what writes a `#g…` identity? (todo, P3)
+
+Two loose ends from COORD-5 / `docs/decisions/0069`, both about how a claim's identity is
+computed rather than about the lock itself. `0069` fixed the *diagnostic* (an unverifiable claim
+now reports its holder's worktree) and deliberately left the *cause* alone, because there was no
+way to measure it after the fact.
+
+1. **`session_pid` printed `s?` for three of fifteen live claims.** It walks up to twelve
+   ancestors looking for a process whose `comm` basename is `claude`. It works in some sessions —
+   the chain observed in `gnc-loopa` was `zsh → claude(8815) → zsh → login → ghostty` — and
+   returns `s?` in others. Candidates, none measured: a session whose `claude` is spawned under a
+   different `comm` (a `node` wrapper, an IDE extension host), a sandbox or launcher that
+   reparents the shell so the chain reaches pid 1 first, or a chain longer than twelve hops.
+   **Do not guess.** Instrument it: have `claim` record the ancestor chain it walked when the
+   walk fails, in the claim blob, and wait for the next `s?`. One line, and it turns a guess into
+   a reading.
+2. **`gnc-next2@next2#g01a08196` cannot have come from this script.** `me()` prints
+   `<tree>@<branch>#s<pid>` or `…#s?`, and `CLAIM_AS` replaces the identity whole. So either a
+   session set `CLAIM_AS` to something shaped like an identity, or something other than
+   `scripts/claim` is writing `refs/claims/*`. The second would matter a great deal — the lock's
+   guarantees are the script's guarantees — so it is worth ruling out before anything else here.
+   `git reflog` on the ref and the claim blob's own `commit:` field are where to start.
+
+Neither blocks anything today: `0069` means an unverifiable claim is now actionable rather than
+opaque. But the pid is the thing COORD-1 built the identity around, and it is currently unreliable
+for a fifth of live claims.
 
 ### BUG-42 — `ENT-9` is filed twice (**CLOSED 2026-09-08 — duplicate of COORD-3, which is now FIXED**)
 
@@ -2867,7 +2932,79 @@ frequency 1 everywhere the alphabet is uniform and the depth is 6). Both change 
 codebook, and therefore its bitstream, wherever clamping currently occurs. Not done for a parked
 coder.
 
-### COORD-4 — a number quoted across sessions does not carry its tree (todo, P4)
+### COORD-6 — `main` moves under an in-flight measurement and nothing says so (todo, P4)
+
+**Filed as an open question, not as work, which is the whole point of the heading.** COORD-4
+counted six instances of a number being read against the wrong tree and refused the tool it was
+filed to consider (`claim measured`: 1 of 6). **Four of those six are this shape instead** —
+PAD-1 / `0039`, ENT-3 / `0025`, ARCH-3 / BUG-18, and the build-artefact near-miss — one session
+measuring correctly while `main` moves underneath, so a table's early rows and late rows come from
+different codecs. Nothing errors. The numbers are simply from two encoders and read as one.
+
+**The first step is to decide whether a cheap mechanism exists, and to close this if it does not.**
+It is deliberately not "build a mechanism". Known difficulties, so nobody rediscovers them:
+
+- The signal is not "`main` moved" — it moves constantly and most moves are irrelevant. It is
+  "`main` moved *in a way that changes encoder output*", and the only honest test of that today is
+  running the thing twice, which is what the check would exist to avoid.
+- A cheap proxy is whether the merge touched `src/` or `src/shaders/` at all. That over-warns
+  (`0045`'s diagnostic-only change is byte-identical with the env var unset) but a false warning
+  costs one `git diff` and a missed one cost a re-run of a 12-point gate.
+- It cannot live in `scripts/claim`: a claim is taken when an item is picked up, and a measurement
+  happens somewhere else entirely — that is exactly why COORD-4 refused the claim-time stamp at
+  0 of 6.
+- The measurement is usually a shell loop, not a program, so anything requiring the harness to
+  cooperate will not be adopted. Whatever this is, it has to work for `python3 scripts/meas_*.py`
+  and for a bare `for q in ...; do ./target/release/gnc ...; done`.
+
+**Success criterion:** either a mechanism a session will actually run without being told twice, or
+a written finding that none exists and the prose in COORDINATION's "Every number carries a tree" is
+the answer. **Both outcomes close this item.** A third round of prose does not.
+
+**Do not let this rot into an obligation.** If nobody has found a cheap mechanism the next time
+someone reads this, close it as answered-no and cite COORD-4's table.
+
+### COORD-4 — priced, tool refused 1-of-6, consolidation shipped instead (**ANSWERED 2026-09-08**)
+
+**The doubt attached to this item at filing was the right one, and the measurement it asked for
+settles it — but not by rarity.** The class is the most frequent measurement failure in the repo
+right now: **six instances**, five of them in the two days of eight-session concurrency.
+
+| # | instance | shape | caught by a claim-time stamp? |
+|---|---|---|---|
+| 1 | BUG-44 — 254.0039 vs 0.0000, patched vs shipped tree | cross-session | **yes** |
+| 2 | PAD-1 / `0039` (`c109128`) — q=85 pre-INTER-2, q=92 post | `main` moved mid-table | no |
+| 3 | ENT-3 / `0025` (`0045`) — two of nine published points superseded | `main` moved | no |
+| 4 | the build-artefact near-miss — rebuild during a 36-run sweep | own `target/` | no |
+| 5 | ARCH-3 / BUG-18 (2026-09-07) — `main` moved mid-item | `main` moved | no |
+| 6 | quarter-pel #15 (2026-03-09) — "−0.63 dB vs stale baseline `617d8e6`" | stale record | no |
+
+**Both candidate shapes are refused on these numbers.** `claim measured` (stamp `HEAD` + dirty bit)
+would have caught **1 of 6** — only the cross-session one. Printing each claim's commit in
+`claim list` would have caught **0 of 6**: a claim's commit is not a measurement's commit, and
+instance 1's difference was uncommitted anyway. Five of six are one session's own table decaying
+because `main` moved under it, which no claim-time stamp can see.
+
+**What the evidence supports instead, and it is shipped:** the rule was already written **four
+times on one afternoon, by four sessions, under four names** — this entry's own COORDINATION
+section, "Do not swap a shared build artefact while someone is measuring", ENT-3's "a figure that
+reproduces exactly on its own pinned commit and not on `main` is a change log, not an error", and
+PAD-1's "a table whose q=85 and q=92 came from different binaries is unreadable". The failure is
+**discoverability, not absence**: each session met the class fresh and none could see the others'
+wording. COORDINATION's "Every number carries a tree" section is now the class's home, indexes all
+four, and states the three habits they add up to — state the tree with the number, a table is one
+binary, ask which tree before filing or reversing.
+
+**What would reopen this.** A seventh instance of the *cross-session* shape specifically —
+instance 1 is the only one of its kind, and one instance does not buy a tool. If two more appear,
+`claim measured` is worth building and the dirty bit is the half that matters. Instances 2, 3, 4 and 5 argue
+for something different, now filed as **COORD-6**: warn when `main` moves under an in-flight
+measurement. Better hit rate (4 of 6), no obvious cheap implementation, so it is filed as the open
+question rather than as work — and closing it answered-no is an accepted outcome.
+
+*Original filing, kept because the doubt in it was correct:*
+
+### COORD-4 — a number quoted across sessions does not carry its tree (original filing)
 
 **Filed from a worked example that cost two sessions about an hour**, recorded in COORDINATION's
 "Two sessions' numbers that disagree may both be right — ask which tree" and in RATE-4 and BUG-44.
@@ -3054,8 +3191,8 @@ The owner's scope, quoted from `git cat-file -p refs/claims/COORD-3`:
 It holds `ENT-10` for the renumber and `dr-0065` for the record. **Everything BUG-41 found is
 evidence for this item** — the ENT-9 timestamps, the audit that says 11 of the 12 duplicate ids in
 BACKLOG are the harmless "status entry plus original filing" convention, and a tested
-implementation of the allocator and the duplicate-id refusal on branch `drnum-mech` (one commit,
-`scripts/claim` only).
+the audit that says 11 of the 12 duplicate ids in BACKLOG are the harmless "status entry plus
+original filing" convention.
 Correct or replace this stub freely; it exists so the item outlives its session.
 
 ### BUG-27 — the encoder's P-frame reference was dequantised with the intra qstep (**FIXED 2026-09-07**)
@@ -4466,9 +4603,44 @@ every frame prints it.
 **Why P1.** It is a shipped codec producing 12 dB video at its highest quality setting. It also
 gates RATE-3, and RATE-3 gates the inter half of RATE-2's 21.66%.
 
-### RATE-4 — the candidate is chosen on one frame's bytes and paid for by the next one's (todo, P2)
+### RATE-4 — the candidate is chosen on one frame's bytes and paid for by the next one's (todo, P3 — **measured 2026-09-08, the design is settled and the fix is priced, not built**)
 
 Filed 2026-09-08 by RATE-3, which shipped the win and measured this as its cost.
+**Measured 2026-09-08 by the `drnum` session** — `scripts/meas_rate4.py`, RESEARCH_LOG, decision
+`docs/decisions/0068`. Three results, and they change the item rather than close it:
+
+1. **The prize is 0.09 points of mean.** An exact per-GOP ledger takes RATE-3's twelve points from
+   **−4.28% to −4.37%** and removes both regressions (worst point +0.58% → +0.00%). It cannot be
+   worse than the control anywhere, because the control is one of its two arms — which is what this
+   entry's ban on a margin constant was reaching for. It changes 5 of 38 GOPs, all in bbb q=99.
+2. **The ledger does not need the GOP encoded both ways — it needs one frame.** The penalty is paid
+   by the **first** P-frame and does not propagate: P2 is 2–6% of P1, P2..P8 together 1–17%, because
+   P2's reference is P1's reconstruction, which is lossy in both arms. A one-frame lookahead
+   (`I + P1` under each candidate's reference) reaches the exact per-GOP decision on **33 of 33**
+   GOPs, at one extra P-frame encode per GOP instead of the losing arm's whole GOP — the same
+   computation at ki=2, an eightfold saving at ki=9. It carries evidence rather than a construction
+   guarantee: it is optimistic about bit-exact by 4 100–55 313 B on GOPs of ~20 MB.
+3. **A margin constant would have passed all twelve points.** The P1 penalty is nearly independent
+   of the I-frame saving (187 647–321 525 B against savings of 279 336–1 549 505 B), so a threshold
+   anywhere in **(279 336, 575 709) B** reproduces the whole table. **The ban below is right and is
+   now measured** — that window's two ends come from two of the three sequences, the penalty varies
+   1.7× inside this small set, every sequence here is 1080p, and the point setting the lower bound is
+   the one regression the item exists to remove.
+
+**Why P3 and not built.** 0.09 points of mean, two regressions on one sequence at one quality point,
+against an implementation that must hold **two live I-frame references** through the
+`encode_once` → `local_decode_iframe_gpu` side channel that has already produced four defects
+(`0040`, `0042`, RATE-3's gate, the ordering constraint in `encode`'s comment). **Do the other half
+first**: if the source-copy reference holds at q = 95..99 — where the encoder's and decoder's
+references match to 0.0000 and nobody can yet say why — RATE-3's third encode disappears and this
+ledger's marginal cost roughly halves.
+
+**What is settled, so nobody re-derives it:** GOP independence holds in these configs (no B-frames
+at ki=2 or ki=9, `rate_ctrl` is `None` without `--bitrate`, `pending_me` reset at each keyframe,
+`gpu_ref_planes` overwritten not accumulated) — **and `--bitrate` is the one input that breaks it**,
+so a sweep that passes it is measuring something else. The harness asserts both arms produce the
+same frame-type partition and refuses to print an oracle if any GOP's I bytes agree while its totals
+differ; 0 of 38 disagreed, twice, byte-identically.
 
 `encode` keeps the smaller of two candidates by comparing **that frame's** bytes. Inside a sequence
 that is the wrong ledger: a bit-exact I-frame carries detail a lossy one had already quantised away,

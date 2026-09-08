@@ -6251,6 +6251,53 @@ worst-frame penalty was BUG-27. What remains is content-specific (old_town_cross
 worst-frame) and MEAS-4 already located it in prediction quality, not the coding model.
 Harnesses: `scripts/meas_inter1_ki.py`, `scripts/meas_inter1_pscale.py`. Follow-up: **INTER-2**.
 
+### INTER-3 — deringing the reference, not deblocking it: the ringing note has been waiting with a number (todo, **P2**)
+
+**Proposed 2026-09-08 by an external review** as a CDEF-style in-loop filter, classified there as
+halo-compatible and therefore cheap for tile independence. That classification is right, and it is
+the second half that makes the item worth filing: **the motivation was already measured and left
+unclaimed.**
+
+**The existing evidence, from MEAS-4's own notes** (BACKLOG, "Reference quality", marked *"This is
+the more promising of the two"*): *"No in-loop deblocking; references carry wavelet ringing spread
+over the tile. The inter residual's mean |value| (2.63) sits near the ~2.0 noise floor the reference
+itself imposes — so much of each inter frame is re-coded reference noise. If that holds, the fix is
+better references, not better residual coding."* And MEAS-4's verdict on the whole inter gap is that
+it is **prediction quality, not the coding model** (`0005`). Reference quality *is* prediction
+quality.
+
+**Why this is not the filter GNC already tried and removed.** `GNC_REF_DEBLOCK` exists, and turning
+reference **deblocking** off was a win on every axis at once: worst B-frame **+4.6 dB (bbb) /
++3.7 dB (touchdown)**, VMAF min **+2.58 / +2.10**, bpp **−1.4% / −0.4%**. That result stands and is
+not being reopened. But deblocking targets **block-edge discontinuity**, and the stated defect here
+is **ringing spread over the tile** — a wavelet artefact, not a block artefact. A directional
+deringing filter is a different tool aimed at the defect that was actually measured. **Whoever takes
+this must say in one sentence why their filter is not the one that was removed**, or it will be.
+
+**Two hard gates, both from bugs this repo has already paid for:**
+
+1. **It must not touch the lossless path.** A filter in the reference loop at `q=100` destroys
+   bit-exactness, and that exact shape has bitten twice — `BUG-30` (`GNC_DEAD_ZONE` silently
+   defeated lossless, one knob over) and `BUG-39` cause 4 (quarter-pel interpolation made the
+   residual fractional). Gate it on `is_lossless()` and assert bit-exactness on ≥3 sequences at
+   ki=2 and 9, verified outside the harness.
+2. **Encoder and decoder must apply it identically, or the references diverge.** `BUG-27` was a
+   reference dequantised with the wrong step; `BUG-39` cause 1 was a reference built with the wrong
+   inverse transform. The instrument for this already exists on both pipelines —
+   `read_reference_planes`, which `test_pframe_reference_matches_decoder` diffs. **Diff it before
+   theorising**, which is the lesson `0064` recorded after two hours of mechanism hypotheses lost to
+   ten minutes of diffing.
+
+**Success criterion:** **worst-frame** PSNR at q=85–99 on ≥3 sequences, because worst-frame is the
+contribution metric (INTER-2, `0043`) and a filter that improves the mean while hurting the worst
+frame is not a win here. Rate must not rise. State the halo cost in dispatch terms — the serial-
+dependency rule prices tools, it does not refuse them, and a small fixed halo is exactly the
+"bounded, not absent" case GOALS §5b allows.
+
+**Cheap pre-step before writing a shader:** the 2.63-against-2.0 figure is one diagnostic re-run.
+If the reference noise floor is no longer near the residual after INTER-2, INTRA-2 and BUG-39
+changed the P path this month, the premise is gone and the item closes for a tenth of the cost.
+
 ### INTER-2 — The inter dead zone is a large unpriced lever at the q=85 rung (**DONE 2026-09-08 — default 2.0 → 1.0, BD-rate −4.77%**)
 
 Found inside INTER-1, not chased there. The q=85 rung behaves unlike every rung above it: the
@@ -6382,6 +6429,41 @@ motion estimator (8x8/±16: 0.99→1.01x). Full measurement in RESEARCH_LOG 2026
 
 Reaches the same verdict as ICME 2006 and MPEG's deletion of the SVC temporal update step, from an
 independent direction.
+
+### CHROMA-4 — temporal CfL, and the gate is whether a P-frame has any chroma residual at all (todo, **P4**)
+
+**Proposed 2026-09-08 by an external review**: predict a tile's chroma from its own
+motion-compensated luma residual, correctly noted as introducing no cross-tile dependency beyond
+what MC already requires. Nothing in RESEARCH_LOG or this file measures it, so it is genuinely new
+here.
+
+**But there is a measured headwind, and it is the reason this is P4 rather than P2.** CHROMA-1
+(2026-09-06) found `chroma_weight` moves the file by **1.5%** and luma by **0.01 dB** in the shipped
+4:2:0 P-chain, *"because motion compensation leaves almost no chroma residual to reclaim"*. The same
+knob is worth **−20.8% on an all-intra sequence** and **−2.9% on a ki=9 P-chain**. **If motion
+compensation has already removed the chroma residual, a temporal chroma predictor has nothing left
+to predict.** Spatial CfL is worth ~9% on bbb intra (MEAS-2) precisely because intra chroma
+coefficients are still there.
+
+**So this item is a gate first and a feature second, and the gate needs no shader:**
+
+**Step 1 — measure the headroom.** Per-frame chroma residual energy in P-frames at q=85/90/99 on
+≥3 sequences, as a fraction of the frame's coded bits and against the intra case. `GNC_DIAGNOSTICS`
+and the existing coefficient diagnostics should get this without new GPU code. **If P-frame chroma
+is under a few percent of the bits, close the item** — and record the number, because it also
+retires the same question for any future temporal-chroma idea rather than leaving it to be asked a
+third time.
+
+**Step 2, only if step 1 leaves headroom.** Then it is worth pricing against the existing spatial
+CfL, which is already per tile *and* per subband, and against CHROMA-3's open question about where
+that gain sits. The two interact: if spatial CfL's gain turns out to be LL-concentrated, temporal
+CfL's would likely be too, and the alpha-signalling cost applies to both.
+
+**Measure with a chroma-aware metric or do not measure.** VMAF scores the luma plane only and has
+produced a confident wrong answer on exactly this class of question twice — the 2026-09-05
+`chroma_weight` sweep that looked like a free 15% and direction-reversed, and CHROMA-1, where VMAF
+read **97.08 before and 97.08 after** a 6% rate move. `scripts/ypsnr_de00.py` reports YCoCg-R luma
+plus dE00, and YCoCg-R is the plane GNC actually codes.
 
 ### CHROMA-3 — where is CfL's gain, per subband? And the deep subbands pay alpha either way (todo, **P3**)
 

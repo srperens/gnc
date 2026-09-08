@@ -1449,11 +1449,55 @@ that is not a shader it does not use. **Why P2:** it invalidates no measurement 
 nothing on Vulkan or Metal, but GOALS rule 4 claims DX12 and step 1 is close to free. Step 1
 alone converts "DX12 does not run GNC" into a measurement.
 
-### ROBUST-1 — should the decoder reject malformed input, or is panicking the contract? (todo, P2)
+### ROBUST-2 — put the frame parser on a checked cursor, additively (todo, P2)
 
-**The two contained defects are fixed and the denial of service is closed; what is left is one
-choice.** Read the "what is still open" paragraph at the end — the panic surface is untouched, and
-the item is now a decision record with an implementation, not an audit.
+The implementation `docs/decisions/0067` decided and deliberately did not do. **The decision is
+made; this is the diff.**
+
+1. `Cursor<'a> { data, pos }` in `format.rs` with `u8() / u32() / f32() / bytes(n) ->
+   Result<_, DecodeError>`, bounds-checking in one place instead of at 100-odd call sites.
+2. `try_deserialize_compressed(data) -> Result<CompressedFrame, DecodeError>` — the parser,
+   rewritten onto the cursor. Mechanical, ~400 lines of one function.
+3. `deserialize_compressed` **stays**, as `try_deserialize_compressed(data).expect(...)`, so
+   **all 33 existing call sites compile untouched** and the change is provably
+   behaviour-preserving for them. That is the property that makes this landable at all.
+
+**Do the same for the other three deserialisers afterwards, not in the same commit:**
+`deserialize_sequence_header`, `deserialize_temporal_sequence`, and the GNV container index.
+`abac.rs`'s `vec![0i32; count]` and the rANS deserialiser were named as unaudited in ROBUST-1 and
+are still unaudited.
+
+**Verification, and it is unusually cheap for a change this size:** encode a set of frames,
+decode with both the old and new binary, and require **byte-identical output** — the parser's
+job is deterministic, so a rewrite that changes any pixel is wrong. ROBUST-1 used 4 images x
+q=40/75/90/100 for exactly this and it caught nothing, which is the point. Then a corrupt-input
+test per public entry point: truncate at every length, and flip the four count fields to
+`u32::MAX`.
+
+**Why P2 and not P1:** nothing is broken for well-formed streams, the allocation amplification is
+already closed, and the remaining exposure is a panic rather than memory unsafety — Rust's slice
+indexing is checked, which is why this is a robustness item and not a security one. **Why not
+P3:** it is a decided design defect in the public API of a codec whose decoder eats other
+people's bytes, and the cost only grows as the format gains generations.
+
+**Warning about the merge, not the code:** `format.rs` is edited by several sessions at once. This
+is a whole-function rewrite, so take it when the file is quiet and merge it quickly, or it will
+be rebased more than it is written.
+
+### ROBUST-1 — should the decoder reject malformed input, or is panicking the contract? (**DECIDED 2026-09-08 — reject; see `docs/decisions/0067`**)
+
+**Answered: reject, via a checked cursor and an additive API.** The implementation is **ROBUST-2**,
+filed above with the diff specified. Three defects found by this item were fixed under it
+(BUG-43's `k` clamp, `read_tile_varint`'s unbounded shift, and the four unbounded wire counts), so
+**the allocation amplification is closed and only the panic remains** — a malformed frame now runs
+off the end of its buffer instead of aborting the process on a huge allocation.
+
+Rejected alternatives, with what they cost: a validating pre-pass (a second parser that has to
+agree with the first — a new class of bug, and its failure mode is a validator accepting what the
+parser misreads); `catch_unwind` (cannot tell malformed input from our own bug, and is inert under
+`panic = "abort"`); documenting panic-on-malformed as the contract (free and honest, but it makes
+every embedder reimplement the parser outside the library). `0067` has the reasoning and the
+33-call-site count that makes the additive shape work.
 
 The audit BUG-43 left open: which other decoder inputs reach a shift, an index or an allocation
 unvalidated. Run 2026-09-08. **One contained defect found and fixed; the larger finding is a

@@ -618,8 +618,27 @@ construction — and the 16 byte-identical decodes were re-run to show it rather
 packet-sized hostile file can no longer become a multi-gigabyte allocation; it now runs off the
 end of the buffer into the same panic the parser has everywhere else.
 
-**What is left open is only the contract** — (a) versus (c) — because the panic surface is
-untouched. That is a decision record, not a commit.
+### The contract, decided: reject (`docs/decisions/0067`)
+
+(a) versus (c), settled in favour of rejecting, with the mechanism named so the implementation is
+a specified job rather than an open question: a `Cursor` with checked `u8/u32/f32/bytes` readers,
+a `try_deserialize_compressed -> Result`, and `deserialize_compressed` kept as a panicking wrapper
+over it. **That last part is what makes it landable, and it rests on a count rather than a hope:
+`deserialize_compressed` has 33 call sites** (`lib.rs` x10, `main.rs` x2, the rest tests). Changing
+its signature makes all 33 decide what to do with an error inside the same diff that rewrites the
+parser; keeping the wrapper leaves all 33 untouched and makes the rewrite provably
+behaviour-preserving for existing callers.
+
+**`catch_unwind` was the tempting one and it is wrong twice:** it cannot distinguish "this input is
+malformed" from "this decoder has a bug", so it would convert our own defects into `Err` — exactly
+what the project's rules exist to surface — and it is inert under `panic = "abort"`, which an
+embedder may set.
+
+Filed as **ROBUST-2**, with the verification that makes a 400-line mechanical rewrite cheap to
+trust: byte-identical decodes before and after, since the parser is deterministic and any pixel
+that moves means the rewrite is wrong. **Not started here** — it is a whole-function rewrite of
+`format.rs`, which several sessions edit at once, and starting it at the end of a session is how
+it gets rebased more than it gets written.
 
 **Not audited and not claimed:** `abac.rs` (`vec![0i32; count]`), the rANS deserialiser, the GNV
 container index. Same class of question; "probably the same answer" is not a result.

@@ -8,6 +8,14 @@ q = 95..=99, where `0036` refused it. Stills are untouched. Base commit `f3f7254
 (post-INTRA-2, so the q=95 rung already carries `0041`'s dead-zone floor and its
 `dead_zone_referenced` split).
 
+> **Every rate figure below is superseded by `0072` (2026-09-08).** The two regressions this record
+> reports — bbb q=99, +0.58% at ki=2 and +0.40% at ki=9 — were **not** the cost of the choice it
+> shipped. `lossless_sibling` did not carry `pad_fill_decay`, so the bit-exact candidate was coded
+> with decay-filled padding while the sequence encoder had cleared that flag for referenced frames.
+> One line, and the same twelve points read **mean −6.09%, best −16.19%, worst point +0.00%, 0 of 12
+> worse than the control** (BUG-47). The *decision* here stands unchanged: the reference must belong
+> to the candidate that was kept. Only its numbers moved, and they moved in its favour.
+
 ## What this had to decide
 
 `0036` shipped RATE-2's lossless fallback for stills only. Letting it reach sequence I-frames made

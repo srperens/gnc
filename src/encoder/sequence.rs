@@ -425,11 +425,21 @@ impl EncoderPipeline {
             if is_keyframe {
                 let _t_iframe = std::time::Instant::now();
                 let frame_data = frames.get(display_idx);
+                // RATE-4/BUG-45: one linear pass, and it decides two things — whether the
+                // reference can come from the source below, and therefore whether
+                // `encode_as_reference` has to pay a third encode to repair the side channel.
+                let source_integral = crate::source_is_integral(&frame_data);
                 // RATE-3: `encode_as_reference`, not `encode` — this frame is what the
                 // P-frames predict from, and the fallback's two candidates leave only one of
                 // their two sets of quantised planes behind for `local_decode_iframe_gpu`.
-                let mut compressed =
-                    self.encode_as_reference(ctx, &frame_data, width, height, &frame_config);
+                let mut compressed = self.encode_as_reference(
+                    ctx,
+                    &frame_data,
+                    width,
+                    height,
+                    &frame_config,
+                    source_integral,
+                );
                 compressed.frame_type = FrameType::Intra;
 
                 if let Some(ref mut rc) = rate_ctrl {
@@ -438,7 +448,14 @@ impl EncoderPipeline {
 
                 // GPU local decode: quantized data is on GPU from encode()
                 // (Y→mc_out, Co→ref_upload, Cg→plane_b). No CPU entropy decode needed.
-                self.local_decode_iframe_gpu(ctx, &compressed, padded_w, padded_h, padded_pixels);
+                self.local_decode_iframe_gpu(
+                    ctx,
+                    &compressed,
+                    padded_w,
+                    padded_h,
+                    padded_pixels,
+                    source_integral,
+                );
                 if std::env::var("GNC_PROFILE").is_ok() {
                     eprintln!(
                         "  I-frame total: {:.1}ms",
@@ -607,12 +624,17 @@ impl EncoderPipeline {
                              {i_bytes} B ({delta:+.2}%), {verdict}"
                         );
                         if p_bytes > i_bytes {
+                            // RATE-4/BUG-45: same scan as the keyframe branch, and for the same
+                            // two reasons — whether the reference can come from the source, and
+                            // therefore whether the third encode is needed at all.
+                            let source_integral = crate::source_is_integral(&frame_data);
                             let mut again = self.encode_as_reference(
                                 ctx,
                                 &frame_data,
                                 width,
                                 height,
                                 &frame_config,
+                                source_integral,
                             );
                             again.frame_type = FrameType::Intra;
                             // Same two steps the keyframe branch takes, in the same order: the
@@ -627,6 +649,7 @@ impl EncoderPipeline {
                                 padded_w,
                                 padded_h,
                                 padded_pixels,
+                                source_integral,
                             );
                             // The look-ahead ME belongs to the P encode that was just discarded.
                             // Dropping it forces fresh motion estimation for the next frame
@@ -2895,6 +2918,7 @@ impl EncoderPipeline {
         padded_w: u32,
         padded_h: u32,
         padded_pixels: usize,
+        source_integral: bool,
     ) {
         let config = &frame.config;
         let info = &frame.info;
@@ -2985,6 +3009,93 @@ impl EncoderPipeline {
         } else {
             None
         };
+
+        // **RATE-4: a bit-exact frame's reference is its colour-converted source.**
+        //
+        // Measured rather than assumed, by `a_bit_exact_frames_reference_is_its_colour_converted_source`:
+        // the decoder's reference equals the CPU YCoCg-R forward of the source **exactly** — 0 of
+        // 65 536 pixels differing on all three planes — at q=100 MED and at q=99 with the bit-exact
+        // sibling kept. Those two are the same configuration (`lossless_sibling` is
+        // `quality_preset(100)` with only how-to-code fields carried over), which is why one row
+        // cannot hold while the other fails.
+        //
+        // So for a bit-exact frame there is nothing to reconstruct: colour-convert the source and
+        // deinterleave straight into the reference, instead of dequantising, inverting the
+        // predictor and copying.
+        //
+        // **It reads `input_buf`, and that is the whole point.** `plane_a` / `co_plane` / `cg_plane`
+        // belong to whichever candidate ran *last*, so at q = 95..=99 they hold the lossy
+        // candidate's **plain** YCoCg — fractional values, not the reversible integers the
+        // reference is made of. Two earlier attempts at this route (`0040` point 4, and RATE-4's
+        // own first try) read candidate-dependent buffers and measured a picture that was not the
+        // reference. The source RGB is identical for both candidates, so `input_buf` is the one
+        // buffer whose contents do not depend on the order of the encodes.
+        //
+        // Consequently the frames that take this path do not need RATE-3's third encode: the
+        // reference no longer comes from the side channel at all. `encode_as_reference` still
+        // repairs the side channel for any bit-exact frame this branch refuses.
+        //
+        // Refused for subsampled chroma: there the reference holds nearest-neighbour-**upsampled**
+        // chroma planes, so the source planes genuinely are not equal to it and the reconstruct
+        // path below is the only correct one.
+        // One predicate, so `GNC_REF_FROM_SOURCE=0` restores the whole of the old behaviour --
+        // this path *and* RATE-3's third encode -- rather than half of it.
+        let ref_from_source = source_integral
+            && crate::reference_from_source(config)
+            && info.chroma_format == ChromaFormat::Yuv444;
+        if ref_from_source {
+            let mut cmd = ctx
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("local_decode_ref_from_source"),
+                });
+            // Forward, reversible: the same two dispatches `encode_once` runs on this buffer, so
+            // the padded region is filled exactly as the coded planes were.
+            self.color.dispatch(
+                ctx,
+                &mut cmd,
+                &bufs.input_buf,
+                &bufs.color_out,
+                padded_w,
+                padded_h,
+                true,
+                true,
+            );
+            self.deinterleaver.dispatch(
+                ctx,
+                &mut cmd,
+                &bufs.color_out,
+                &bufs.gpu_ref_planes[0],
+                &bufs.gpu_ref_planes[1],
+                &bufs.gpu_ref_planes[2],
+                padded_pixels as u32,
+            );
+            ctx.queue.submit(std::iter::once(cmd.finish()));
+            for p in 0..3 {
+                // Encoder-internal only, and off unless `GNC_REF_DEBLOCK=1`; applied here so the
+                // two paths differ in how the reference is built and in nothing else.
+                self.dispatch_deblock_reference(
+                    ctx,
+                    &bufs.gpu_ref_planes[p],
+                    padded_w,
+                    padded_h,
+                    config.tile_size,
+                    config.quantization_step,
+                );
+            }
+            // The canary (CLAUDE.md, "No silent features"). It prints per I-frame that takes the
+            // route, so "the source built the reference" is distinguishable from "the reconstruct
+            // path ran and happened to agree".
+            self.ref_from_source_frames += 1;
+            if diagnostics::enabled() {
+                println!(
+                    "  RATE-4: reference built from the colour-converted source \
+                     ({:?}, bit-exact), no dequant/inverse — frame {} of this sequence",
+                    config.transform_type, self.ref_from_source_frames,
+                );
+            }
+            return;
+        }
 
         // Quantized planes persisted by encode():
         //   Y → mc_out, Co → ref_upload, Cg → plane_b

@@ -351,13 +351,22 @@ interpolation by rate should flag that.
 fix was intra-only. RATE-3 landed the same day (`docs/decisions/0044`) and does move it.** A still
 at q=95–99 codes both ways and keeps the smaller (mean −21.66% at q=99), and since RATE-3 a
 **sequence I-frame does too**: the gate that refused the fallback inside a sequence is lifted, worth
-mean **−4.28%** of sequence bytes over three sequences at q ∈ {95, 99} and ki ∈ {2, 9}, up to
-**−13.16%**, at a worst quality move of −0.01 dB.
+mean **−6.09%** of sequence bytes over three sequences at q ∈ {95, 99} and ki ∈ {2, 9}, up to
+**−16.19%**, at a worst quality move of −0.01 dB.
+
+**Those two figures were −4.28% and −13.16% until 2026-09-08 and moved for a fix, not a re-take**
+(BUG-47, `docs/decisions/0072`): `lossless_sibling` did not carry `pad_fill_decay`, so the bit-exact
+candidate was coded with a still's decay-filled padding while acting as a sequence reference. The
+same twelve points now have **0 of 12 worse than the control**, where RATE-3 recorded two
+regressions of +0.58% and +0.40%. The 4:2:0 ladder below is affected in the same direction and by
+an unmeasured amount — the fix applies wherever the bit-exact sibling is used, and only 4:4:4 was
+measured.
 
 **So the ladder's top two rungs are stale.** It is q=85/92/96/99 and `quality_preset` sets the
 fallback for q = 95..=99 only, so **q=96 and q=99 move; q=85/92 do not.** The direction favours GNC
 and the size is not guessable from RATE-3's sweep: this ladder is 4:2:0 at ki=9, where RATE-3
-measured −2.4% to −5.7%, not the −13% of its best point. **+89.2% stands as recorded until
+measured −2.4% to −5.7%, not the −13% of its best point — and both ends of that range predate
+BUG-47, so they are floors rather than estimates now. **+89.2% stands as recorded until
 `meas1_vs_h264.py` is run again** — as with the INTER-2 note above, a predicted direction is not a
 measurement. Two of the four rungs have now moved for two independent reasons (INTER-2 at q=85,
 RATE-3 at q=96 and q=99), which makes re-running this ladder the highest-value measurement in the

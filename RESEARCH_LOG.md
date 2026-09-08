@@ -27,7 +27,16 @@ q=99 on ≥3 sequences, at bit-identical pixels.
 | old_town_cross | −9.07% | −8.70% | **−8.76%** | 0.31 |
 
 18 frames, ki=9, 4:4:4, whole container including the headers and motion vectors abac does not
-code. Before/after on one binary pair built from the same tree, so nothing else moved.
+code. Before/after on one binary pair **both built from `f871a33`**, differing only by this
+change, so nothing else moved.
+
+**Name the tree, because two things landed on `main` between the measurement and the merge.**
+RATE-4 (`ec931e7`) and LOSSLESS-2's re-code fix-up (`d10e414`) both touch the encode path at
+q ≥ 95 — the range these figures live in. They do not invalidate the *delta*, which is a
+controlled before/after on one tree, but they will move the **absolute** byte counts, so the
+container sizes above reproduce at `f871a33` and are not expected to on today's `main`. That is
+`0045`'s lesson applied in advance rather than discovered afterwards: a figure that reproduces on
+its own commit and not on `main` is a change log, not an error.
 
 **The 0.16–0.37 point shortfall is the result worth keeping.** The bound was ideal-adaptive with
 no signalling charged, and `0063` said to "expect the realisable figure lower". It is lower, by
@@ -95,6 +104,100 @@ on a pinned commit, with both rows on one binary. The Rice row is unaffected.
 `cargo clippy --release --all-targets` clean; `cargo clippy --release --target
 wasm32-unknown-unknown --lib` clean. Decision `0074`. **No timing figure was taken** — the machine
 had seven other sessions on it, and every figure above is bytes or a hash.
+
+## RATE-4 — the regression was the sibling's padding, and a bit-exact frame's reference is its source (2026-09-08)
+
+**What was open.** `0068` (this morning, same session) measured RATE-4's ledger theory and priced
+the fix: an exact per-GOP ledger removes RATE-3's two regressions and is worth **0.09 points of
+mean**, so it recommended doing the item's *other* half first — the source-built reference, whose
+only blocker was an unexplained `254.0039` row. Doing that half found the real cause of the
+regressions, and it was neither half.
+
+**Domain declaration.** Two things, kept separable on purpose. (1) A field assignment in
+`lossless_sibling` — a **bitstream** change at q = 95..=99 wherever the bit-exact candidate wins.
+(2) How `local_decode_iframe_gpu` builds an I-frame reference — **not** a bitstream change, and
+asserted byte-identical rather than assumed.
+
+### 1. The premise, tested at last without a patch
+
+`0040` point 4 and RATE-4's first attempt both tested a *patch* that claimed to exploit "a
+bit-exact frame's reference is its colour-converted source", then argued about the readback. This
+tests the claim: compute YCoCg-R forward on the CPU from the source, compare against the reference
+the decoder holds (`a_bit_exact_frames_reference_is_its_colour_converted_source`).
+
+**Same picture, exactly — 0 of 65 536 pixels differing on all three planes** — at q=100 MED and at
+q=99 with the sibling kept. Those two had to agree: `lossless_sibling` is `quality_preset(100)`
+with only how-to-code fields carried over, so they are the same transform, the same reversible
+colour path and the same branch of the local decode. **Any measurement that separates them is
+measuring the instrument**, which is what the contradictory rows in RATE-4's entry were.
+
+### 2. The 254.0039 row explained: `is_lossless()` is a claim about the settings (BUG-45)
+
+It was measured on `make_gradient_frame`, whose samples are `x / 256 * 255` — **fractional**. At
+q=100 the step is 1.0 and MED's residual is a difference of *integers*; fractional input is rounded,
+so the reconstruction leaves the source and the file is **lossy while `is_lossless()` reports
+true**. Both halves pinned in `lossless_at_q100_is_a_claim_about_integer_input`: integer input
+**0.0000**, fractional input **254.0039**. Same family as BUG-15 and BUG-30; invisible because PNG
+and Y4M input is integral, so only an API caller passing `&[f32]` reaches it. **Now warned, not
+refused** — samples cannot be normalised without changing the picture. BUG-45 filed, open.
+
+### 3. The route worked at q=100 and moved bytes at q=95..99 — which found BUG-47
+
+First byte-identity run: identical on all q=100 and all 4:2:0 points, **10 of 24 moved**, and every
+mover was a fallback case. The two candidates were leaving *differently padded* sources in
+`input_buf`. Forcing `GNC_PAD_FILL=replicate` made **all 24 identical**, which named the cause in
+one run.
+
+**`lossless_sibling` did not carry `pad_fill_decay`.** `quality_preset(100)` sets it back to
+`true`, and the sequence encoder clears it for every frame something predicts from (`0039`, and the
+INTRA-2 reasoning beside it) — so **the one frame in a sequence most likely to be a reference was
+padded as if it were a still.** Decay-filled padding flattens the edge detail the next frame then
+has to re-code, and at 1080p the padded region is large enough for motion compensation near the
+frame edge to feel it. One line: `out.pad_fill_decay = cfg.pad_fill_decay;`
+
+### 4. What that one line is worth — and it retires `0068`'s design
+
+`scripts/meas_rate3.py`, RATE-3's own harness, parameters unchanged:
+
+| | mean of 12 | best | worst point | worst P move | worse than control |
+|---|---|---|---|---|---|
+| before (`0044`) | −4.28% | −13.16% | **+0.58%** | −0.01 dB | **2 of 12** |
+| after | **−6.09%** | **−16.19%** | **+0.00%** | −0.01 dB | **0 of 12** |
+
+Per point, ON against the control: bbb q=99 **−4.67% / −1.30%** (was **+0.58% / +0.40%** — both
+regressions gone), crowd_run **−8.55 / −3.41 / −16.19 / −6.40%**, old_town_cross **−7.69 / −3.00 /
+−15.72 / −6.14%**. bbb q=95 stays at 0.00% both ways, where the sibling loses and nothing changes.
+
+**RATE-4's success criterion is met in full** and by a field assignment, not by the machinery
+`0068` priced. And `0068`'s ledger is now worth **nothing measurable**: re-running
+`scripts/meas_rate4.py` after the fix, the per-GOP oracle changes the choice on **0 of 38 GOPs**
+and its mean equals today's to the byte (−6.09% both). The per-frame ledger is already optimal
+here. **Retired unbuilt** — the second time in this item that finding the cause beat implementing
+the fix for a mis-attributed one.
+
+### 5. The reference change ships as a count, not a number
+
+With the padding fixed, `scripts/rate4_ref_source_gate.py` is **24 of 24 points byte-identical**,
+per frame and in total (three sequences × {95, 99, 100} × {ki 2, 9}, plus 4:2:0 at q=99 and q=100).
+The route **fired 52 times** and the gate fails if it fires where it must not — 4:2:0 (0), the
+forced-off arm (0) — or if q=100 4:4:4 ever fires 0 times, which would make the run vacuous.
+So **RATE-3's third encode is gone on qualifying I-frames**: three intra encodes become two. Per
+`0058`, that is a count and stays one; encode time cannot be measured with seven other sessions on
+the machine (COORDINATION rule 1).
+
+**It reads `input_buf`, not `plane_a`, and that is the whole design.** The intermediate planes
+belong to whichever candidate ran last — in the fallback case the lossy one's *plain* YCoCg,
+fractional where the reference is reversible integers. Both earlier attempts read
+candidate-dependent buffers. The source RGB is the same for both candidates. Its **padding** was
+not, and that is BUG-47.
+
+**Not claimed:** no encode-time figure; 4:2:2 and 4:2:0 rate is unmeasured (the padding fix applies
+there too and should move the same way, but only 4:4:4 was measured); and **stills are checked, not
+argued** — both configs carry `pad_fill_decay = true` for a still, and bbb 1080p at q=95 and q=99
+is byte-identical with the fill forced either way (2 336 979 B, 3 257 157 B).
+
+**Gates:** `cargo test --release` **269 passed, 0 failed**; `cargo clippy --release --all-targets`
+and the wasm `--lib` target both clean. Decision `docs/decisions/0072`.
 
 ---
 

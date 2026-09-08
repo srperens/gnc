@@ -7,6 +7,20 @@ unchanged and every RATE-3 figure stands.**
 **Builds on:** `0044` (RATE-3 shipped the fallback on sequence I-frames and measured this as its
 cost), `0036` (the still-image version), RATE-2
 
+> **The design below is retired unbuilt, and the cause it was priced against was the wrong one —
+> `0072`, the same day.** RATE-4's regressions were `lossless_sibling` not carrying
+> `pad_fill_decay`, so the bit-exact candidate was coded with a still's padding while acting as a
+> reference (BUG-47). With that one line fixed, the exact per-GOP ledger measured here changes the
+> choice on **0 of 38 GOPs** and its mean equals the per-frame ledger's to the byte. There is
+> nothing left for a lookahead to win.
+>
+> What survives is not the recommendation but the three measurements, and they are worth keeping
+> for the next ledger question in this codec: the penalty is paid by the **first** P-frame and does
+> not propagate; a one-frame lookahead reproduced the exact per-GOP decision on 33 of 33 GOPs; and
+> **a margin constant would have passed all twelve points**, which is still the strongest argument
+> against fitting one. The recommendation to settle the source-copy half first is what led to
+> BUG-47, so it was right for a reason it did not know.
+
 ## The question
 
 RATE-3 lets a sequence I-frame keep whichever of two candidates is smaller — a lossy wavelet frame

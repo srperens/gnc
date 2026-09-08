@@ -1663,6 +1663,71 @@ CLAUDE.md's portability prose corrected either way.
 **Why P2.** Same reasoning as BUG-31 — no measurement is invalidated and nothing fails on this
 machine — but the affected claim is a documented project rule, and step 1 may well be free.
 
+### BUG-47 — `lossless_sibling` dropped `pad_fill_decay`, so a referenced bit-exact I-frame was padded like a still (**FIXED 2026-09-08**)
+
+`lossless_sibling` starts from `quality_preset(100)` and carries over the fields that say **how**
+to code rather than **how much**. `pad_fill_decay` was not in that list, and `quality_preset(100)`
+sets it to `true` — while the sequence encoder clears it for every I-frame something predicts from
+(`sequence.rs`, and `docs/decisions/0039`, which made the fill a still-image lever). So at
+q = 95..=99, whenever the bit-exact candidate won, **the frame in the sequence most likely to be a
+reference was the one padded as if it were a still.**
+
+A decayed pad flattens the edge detail the next frame then has to re-code, and at 1080p the padded
+region is large enough for motion compensation near the frame edge to feel it. One line —
+`out.pad_fill_decay = cfg.pad_fill_decay;` — and RATE-3's twelve points go from **mean −4.28%,
+worst +0.58%, 2 of 12 worse than the control** to **mean −6.09%, worst +0.00%, 0 of 12**, with the
+worst P-frame move unchanged at −0.01 dB. That is RATE-4's whole success criterion.
+
+**How it was found, because the route matters:** RATE-4's source-built reference was byte-identical
+at q=100 and moved bytes on 10 of 24 sequence points at q = 95..=99 — every mover a fallback case.
+The two candidates were leaving *differently padded* sources in `input_buf`.
+`GNC_PAD_FILL=replicate` made all 24 identical and named the cause in one run. **Nothing before
+this had ever compared the two candidates' preprocessing**, which is why a field that mattered this
+much could go missing for a day without a single test noticing.
+
+**Stills are unaffected and it is checked, not argued:** both configs carry `pad_fill_decay = true`
+for a still, so the inheritance changes nothing — bbb 1080p at q=95 and q=99 is byte-identical with
+the fill forced either way (2 336 979 B, 3 257 157 B). **4:2:2 and 4:2:0 sequence rate is
+unmeasured**; the fix applies wherever the sibling is used and should move them the same way.
+
+Decision `docs/decisions/0072`. Fixed 2026-09-08 by the `drnum` session while closing RATE-4.
+
+### BUG-45 — `is_lossless()` is a claim about the settings, not about the input (todo, P3)
+
+At q=100 the quantiser step is 1.0 and MED's residual is a difference of **integers**. Feed the
+encoder fractional `f32` samples and the step-1 quantiser rounds them, so the reconstruction leaves
+the source and the file is **lossy while every `is_lossless()` in the codec reports true**.
+Measured both ways in `lossless_at_q100_is_a_claim_about_integer_input`, comparing the decoder's
+reference against a CPU YCoCg-R forward of the source:
+
+| input | max \|decoder reference − YCoCg-R(source)\| on Y |
+|---|---|
+| integer-valued | **0.0000** |
+| `make_gradient_frame` (`x / 256 * 255`) | **254.0039** |
+
+**This is the whole content of RATE-4's `254.0039` row**, which blocked its source-copy half for a
+day and was read as evidence about q=100. It is evidence about the *input*.
+
+Same family as **BUG-15** (`chroma_weight` 1.2 at q=100) and **BUG-30** (`GNC_DEAD_ZONE` at
+q=100): a setting outside the guarantee, silently taken. It stayed invisible because PNG and Y4M
+input is integral — only an API caller passing `&[f32]` can reach it, and
+`make_gradient_frame` does, which means **the tests that use it as a lossless input are not
+testing bit-exactness.**
+
+**Now warned, not refused** (`encode_once`), because samples cannot be normalised without changing
+the picture and rejecting a frame a caller may legitimately want coded lossily is worse than
+telling them what they got. `crate::reference_from_source` uses the same predicate to decline
+building a reference the reconstruction does not equal.
+
+**To close:** decide whether a lossless request with non-integer input should be an error rather
+than a warning, and audit the tests that pass fractional data to a lossless configuration —
+`lossless_iframe_reference_matches_the_decoders` is one, and it is comparing the encoder's
+reference with the decoder's rather than either with the source, so it passes either way.
+**Why P3:** no shipped path reaches it (PNG and Y4M are integral) and it is now loud rather than
+silent.
+
+Filed 2026-09-08 by the `drnum` session, from RATE-4's leftovers.
+
 ### BUG-41 — ENT-9 is filed twice with two different subjects, and item ids have no allocator (**CLOSED 2026-09-08 — the work is COORD-3's; the implementation is on branch `drnum`**)
 
 > **Closed as a duplicate, and the duplication is the same bug.** `COORD-3` was claimed by
@@ -4736,7 +4801,29 @@ every frame prints it.
 **Why P1.** It is a shipped codec producing 12 dB video at its highest quality setting. It also
 gates RATE-3, and RATE-3 gates the inter half of RATE-2's 21.66%.
 
-### RATE-4 — the candidate is chosen on one frame's bytes and paid for by the next one's (todo, P3 — **measured 2026-09-08, the design is settled and the fix is priced, not built**)
+### RATE-4 — the candidate is chosen on one frame's bytes and paid for by the next one's (**DONE 2026-09-08** — the cause was the sibling's padding; mean −4.28% → **−6.09%**, both regressions gone)
+
+**CLOSED 2026-09-08, and the ledger was the wrong cause.** `lossless_sibling` did not carry
+`pad_fill_decay`, so a bit-exact I-frame kept at q = 95..=99 was coded with **decay-filled**
+padding while the sequence encoder had deliberately cleared that flag for every frame something
+predicts from (`0039`). One line fixes it, and RATE-3's own harness reads:
+
+| | mean of 12 | best | worst point | worst P | worse than control |
+|---|---|---|---|---|---|
+| before (`0044`) | −4.28% | −13.16% | **+0.58%** | −0.01 dB | **2 of 12** |
+| after | **−6.09%** | **−16.19%** | **+0.00%** | −0.01 dB | **0 of 12** |
+
+**The success criterion below is met in full.** Filed as **BUG-47**. Also shipped: a bit-exact
+frame's reference is now built from its colour-converted source, so **RATE-3's third encode is
+gone** on those frames — 24 of 24 sequence points byte-identical, route fired 52 times
+(`scripts/rate4_ref_source_gate.py`). Also found: **BUG-45**, `is_lossless()` is a claim about the
+settings and not about the input, which is the whole content of the `254.0039` row below. Decision
+`docs/decisions/0072`; numbers in RESEARCH_LOG.
+
+**The per-GOP ledger of `0068` is retired unbuilt** — after the padding fix it changes the choice
+on **0 of 38 GOPs** and its mean equals today's to the byte. Everything below is kept as taken,
+because the item's two wrong turns are the reusable part: a mis-attributed cause priced carefully
+(`0068`) and a premise argued about through two patches instead of being measured once.
 
 Filed 2026-09-08 by RATE-3, which shipped the win and measured this as its cost.
 **Measured 2026-09-08 by the `drnum` session** — `scripts/meas_rate4.py`, RESEARCH_LOG, decision
@@ -4856,7 +4943,7 @@ times, which is the number anyone weighing the encode cost actually wants. A run
 belongs with whichever change makes that cost matter — this item, if the source-copy route removes
 it, or a real encode-time measurement on an idle machine if it does not.
 
-### RATE-3 — a bit-exact I-frame is a drop-in reference now (**DONE 2026-09-08**, mean −4.28% of sequence bytes)
+### RATE-3 — a bit-exact I-frame is a drop-in reference now (**DONE 2026-09-08**, mean −4.28% → **−6.09%** of sequence bytes after BUG-47)
 
 **`0036`'s sequence gate is lifted and the fallback now runs on sequence I-frames at q = 95..=99.**
 `docs/decisions/0044`; numbers in RESEARCH_LOG. Three sequences × q ∈ {95, 99} × ki ∈ {2, 9}:
@@ -4864,6 +4951,12 @@ it, or a real encode-time measurement on an idle machine if it does not.
 wherever the candidate wins — verified outside the harness by md5 on a real `encode-sequence` →
 `decode-sequence` round trip. Stills are byte-identical. Two of twelve points regress (bbb q=99,
 +0.58% / +0.40%) and that is RATE-4.
+
+**Both figures moved on the same day and in this item's favour: RATE-4 found that the two
+regressions were BUG-47** — `lossless_sibling` not carrying `pad_fill_decay`, so the bit-exact
+candidate was coded with a still's padding while acting as a reference. Fixed, the same twelve
+points read **mean −6.09%, best −16.19%, worst point +0.00%, 0 of 12 worse than the control**.
+`docs/decisions/0072`. The decision this entry shipped is unchanged; only its price was wrong.
 
 **The gate was hiding the mirror image of the bug `0040` fixed.** `encode_once` leaves the quantised
 planes on the GPU as the side channel `local_decode_iframe_gpu` reads, and only the **last** encode's

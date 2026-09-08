@@ -1485,6 +1485,27 @@ never produced a single frame, so this is the cheapest remaining portability res
 `GPU_TIER_TEST.md` both say a still encode on `GNC_GPU_BACKEND=dx12` would be **the first real DX12
 measurement this project has.**
 
+**A named candidate fix, contributed 2026-09-08 by an external reviewer and verified in the
+dependency's own source: GNC has always used FXC, and has never said so.** Both
+`wgpu::Instance::new` calls in `src/lib.rs` (1745 and 1934) pass `..Default::default()`, and in
+`wgpu-types-24.0.0/src/instance.rs:274` the `Dx12Compiler` enum carries `#[default] Fxc` with the
+comment *"The Fxc compiler (default) is old, slow and unmaintained."* The alternative in the same
+enum is `Dxc`, *"new, fast and maintained"*, reachable through
+`InstanceDescriptor.backend_options.dx12.shader_compiler` and requiring `dxcompiler.dll` and
+`dxil.dll` to be shipped.
+
+The reviewer's mechanism fits what round 3 saw: FXC is known for pathological compile times on
+large unrolled loops and dynamic array indexing inside loops, which is what a wavelet or entropy
+compute shader looks like, while DXC (LLVM-based) handles the same shaders in seconds — matching
+naga-SPIR-V and Metal. **Corroborating evidence already in this repository:** BUG-25's defect A was
+naga 24 emitting a bad temporary for four `let … = array<i32,8>` tables *indexed dynamically*, so
+GNC demonstrably has that pattern.
+
+**So try this before bisecting shaders:** set `Dx12Compiler::Dxc { .. }`, ship the two DLLs, re-run
+a still encode. If it still stalls, the reviewer's second suggestion isolates it cheaply — build
+with FXC's `/Od` to switch optimisation off, which tells you whether unrolling is the trigger
+without needing a diagnostic out of a killed process.
+
 **What it needs, and the first question is which shader.** Round 3 reports the wall without naming
 the entry point, and that is the whole investigation:
 
@@ -2158,6 +2179,48 @@ microseconds against a 25 ms frame; do it only alongside the first half.
 `create_buffer_init` + `create_bind_group` calls on the steady-state I-frame path, before and
 after, printed under `GNC_PROFILE`. Below a 50% reduction in that count, close it — the scan's own
 estimate for the whole of item 4 was 0.6 ms of command recording.
+
+### PERF-4 — one device with N queues instead of N processes: the density sweep measures process duplication (todo, **P1**)
+
+**Diagnosed 2026-09-08 by an external reviewer, from MEAS-5's own numbers**, and correctly framed
+as a question rather than a recommendation: *"är arkitekturen en process per ström, var och en med
+egen device-context? Om så, är 1,8 GB/process och 15 s pipeline-kompilering per instans nästan
+garanterat en konsekvens av att pipeline-objekt och buffertar dupliceras N gånger istället för att
+delas."*
+
+**It is process-per-stream.** `scripts/gpu_tier_bench.py --density-still` launches N concurrent
+`gnc` processes, each building its own device, its own pipelines and its own buffers. So the answer
+to their question is yes, and their diagnosis follows.
+
+**Why this is P1 rather than a tuning item.** MEAS-5 Claim B — that a bigger GPU buys more GNC
+instances while it does not buy more fixed-function encoder blocks — is what GOALS calls *"the
+single most important thing to measure"*, and **the sweep that is supposed to measure it is
+measuring instance setup instead.** The evidence that compute is not the constraint is already in
+the record and comes from two machines:
+
+- **Windows round 3:** GPU power *never exceeds ~49 W and falls to 2 W at N=8*, with a ceiling of
+  **~1.8 GB per process**. The GPU idles while the sweep saturates.
+- **Round 2:** the N=1 run is 16.6 s of wall clock of which the GPU encode is **1.6 s** — the other
+  ~15 s is pipeline compilation and clip load, paid once per instance.
+- **Mac, 2026-09-08:** 8/8 complete, saturating at **1.69x** from N=4. Windows *inter* reads 1.85x
+  at N=4. **Two machines, two quantities, two vendors, one number** — that is an overhead ceiling,
+  not a GPU one.
+
+**What to build:** one device and one set of compiled pipelines, N command queues or N submissions
+in flight, inside a single process. Compile once, share the buffers that can be shared. That is a
+different measurement from N processes and it is the one that actually tests the structural claim.
+
+**Ask before assuming it is allowed.** The reviewer flagged this themselves: process isolation may
+be a requirement rather than an accident — crash containment, or tenancy separation between
+customers on a shared card. **Neither GOALS nor POSITIONING states a position on multi-tenancy**,
+so that is a question for the owner and it belongs in the item rather than in the code. If
+isolation is required, the finding is still valuable: it means the per-process cost is a *product*
+constraint and Claim B has to be argued with it included, not measured around it.
+
+**Success criterion:** aggregate 1080p throughput against N for a shared-device build, on the same
+input and q as the `--density-still` rows, with GPU power sampled alongside. **If power still tops
+out near 49 W the bottleneck is elsewhere again** and the next suspect is the submission path, not
+the codec.
 
 ### PERF-3 — the decode side is **not** bandwidth-bound; item 8 is a wash and items 9–11 are mispriced (**item 8 answered 2026-09-08**, P3)
 
@@ -7521,6 +7584,49 @@ threshold** — a threshold is what let 55 dB pass for lossless in BUG-15.
 
 **Invalidates:** any lossless figure taken with `GNC_DEAD_ZONE` set. No shipped default carried one,
 so no published number moves.
+
+### ENT-12 — abac buckets the neighbourhood *sum*; EBCOT keys on the *pattern*. Is that the other half of the J2K gap? (todo, **P2**)
+
+**Proposed 2026-09-08 by an external reviewer**, whose framing was half wrong about the current
+state and whose surviving half is a good hypothesis with its own falsification test.
+
+**Wrong half:** the proposal assumed abac is *"a per-subband context scheme [that] captures the
+magnitude distribution but not the spatial clustering within a subband"*. It is not — `abac.rs`
+buckets a **neighbourhood magnitude sum** into a context index (`NEIGHBOURHOOD buckets`, *"one
+bucket set per binary decision (significant, >1, >2)"*), and `abac_decode.wgsl` keeps two rows of
+neighbour magnitudes per thread precisely to make that available. Spatial context is already there.
+
+**Surviving half, and it is a real distinction:** abac conditions on the neighbourhood **sum**;
+EBCOT conditions on the **pattern**, with nine zero-coding contexts *separated by band
+orientation*, plus sign contexts from the horizontal and vertical neighbours' signs. **A sum
+discards direction.** A horizontal edge and a vertical edge with the same neighbour-magnitude total
+land in the same abac context, where EBCOT separates them — and edge orientation is exactly what a
+wavelet subband's own orientation makes informative. ENT-4 measured abac closing **exactly half**
+of the +54% RGB gap to JPEG 2000 9/7 at the same transform, so roughly half is unaccounted for, and
+this is a candidate for part of it.
+
+**The reviewer's own proposed form is the parallelism-safe one, and that matters here:** not online
+adaptation (EBCOT's next-bit probability depends on the just-decoded neighbour bit, which is the
+same serial tension RDO had), but a **static, offline-trained context table** indexed on
+`(subband, magnitude bucket, quantised neighbour-significance pattern)`. One table lookup per
+coefficient, no dependency chain, and it keeps GNC's code-block independence intact.
+
+**Falsification test, theirs, and the harness already exists.** `scripts/meas_ebcot_context.py`
+already computes conditional entropy under EBCOT's nine-context model on GNC's own quantised
+coefficients. Add a column for the static pattern table and one for abac's current sum-bucketing,
+train the table offline, and **measure entropy rather than building a bitstream.** Their criterion,
+adopted: *"if it does not move more than a few percent of the remaining 27 points, the hypothesis
+is wrong and the gap is somewhere else."*
+
+**One of their caveats is already closed.** They suggested distinguishing per-tile truncation from
+the finer per-code-block truncation EBCOT does. GNC's PCRD result is already **0.00 dB at
+code-block granularity**, at every rate from 0.05 to 3.5 bpp, so that is not where the residue is.
+
+**Bounds worth knowing before starting:** EBCOT part 2 measured the whole nine-context engine at
+**−9.2% mean at qstep 4** against what GNC actually codes, and H0 — the memoryless ideal, the
+ceiling for any context-free coder — at only 4–7% below rice split. So a *third* of the available
+gain needs no contexts at all and the rest needs them; a static table can only reach part of the
+context share, which is why the entropy measurement has to come before any shader.
 
 ### ENT-11 — is a rejection's instrument worth 458 lines? `bpc_paco_diag` (todo, **P3**)
 

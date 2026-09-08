@@ -4688,14 +4688,32 @@ exactly zero, not small. **What is left of this item** is the contribution range
 where RATE-2 says the ladder misbehaves anyway — and whether the contexts, tuned on intra
 coefficients, are worth retuning for residual statistics. Neither is answered above.
 
-**Wait for MEAS-6 before taking this (noted 2026-09-08).** MEAS-6 is in flight and holds `dr-0033`
-with the note "MEAS-6 reverses a recorded conclusion: the default is no longer the B-pyramid".
-**Everything left in this item is measured over a GOP structure**, so a before-number taken against
-today's default would be against a configuration that is about to stop being the default —
-COORDINATION rule 1, in the one form the rule cannot catch, because the tree has not changed yet.
-Check `git log --oneline main` and `scripts/claim list` for MEAS-6 first; if it has landed, measure
-against the new default and say which one, since the −12.0% to −22.9% above was taken with the
-pyramid on.
+**The table above does not say which frame mix produced it, and at ki=9 there are two (noted
+2026-09-08).** `quality_preset()` sets `b_pyramid: false` unless `GNC_B_PYRAMID=1`
+(`src/lib.rs:1021`, since 2026-09-06), while `CodecConfig::default()` sets it `true`
+(`src/lib.rs:571`). So ki=9 codes either **2I+16P+0B** or **2I+2P+14B** depending on how the
+config was built — very different residual statistics — and `0025` does not record which. Its
+`0025:90` byte-identity sweep covered "B-pyramid on and off", but that is the 54-config identity
+check, not the nine-point rate table. **Settle it by reading the run rather than reasoning:**
+`benchmark-sequence` prints `2I+16P+0B` or `2I+2P+14B` on stdout, and emits
+`GNC: B-pyramid suppressed (ki=9 would allow it)` on stderr only when it vetoes.
+
+Two traps in that check, both found 2026-09-08 by the MEAS-6 session:
+
+- **`benchmark-sequence`'s `-q` is `Option<u32>` with no default** (`src/main.rs:515`), unlike
+  `benchmark`, `encode-sequence` and `benchmark-suite`. Without `-q` it falls through to
+  `CodecConfig::default()` — so it codes the **pyramid**, at qstep 4.0 and LeGall 5/3 rather than a
+  preset. **BUG-37.** Every harness in `scripts/` passes `-q`, so nothing recorded is contaminated;
+  a hand-run reproduction of `0025` must pass it too.
+- **`--vmaf` had a fixed temp filename**, so two concurrent sessions scored each other's frames —
+  measured at 1.0–1.3 VMAF points in either direction, 2–2.5x the 0.5 BLOCK threshold, silent.
+  **BUG-36**, fixed 2026-09-08. Rate figures here are byte ratios at bit-identical pixels and were
+  never exposed; anything scored with VMAF before that fix was.
+
+**An earlier version of this note said to wait for MEAS-6 because it was "reversing the GOP
+default". That was wrong and is withdrawn** — the default moved on 2026-09-06 and MEAS-6 is
+correcting the *documents* that still call the pyramid current, not changing a code path. Nothing
+gates this item.
 
 **The original question:** abac against Rice on **P-frame residual coefficients**, same pixels, same
 GOP structure, at q=75 and q=90 on ≥3 sequences. `GNC_ABAC_COMPARE=1` already reports rate on real

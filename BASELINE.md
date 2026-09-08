@@ -38,10 +38,24 @@ Re-measured 2026-09-06 after BUG-6 made 5 wavelet levels the default at q ≥ 25
 
 | q   | PSNR     | BPP  | VMAF  | levels |
 |-----|----------|------|-------|--------|
-| 25  | 35.51 dB | 1.60 | 90.25 | 5 |
+| 25  | 35.63 dB | 1.64 | 90.31 | 5 |
 | 50  | 40.30 dB | 2.73 | 95.02 | 5 |
 | 75  | 44.84 dB | 4.53 | 96.58 | 5 |
 | 90  | 50.06 dB | 8.07 | 97.08 | 5 |
+
+**The q=25 row moved on 2026-09-08 (BUG-16) and the others did not.** It read
+**35.51 dB / 1.60 bpp / VMAF 90.25**; both sets reproduce on demand, because the change is a
+default and not a rewrite — `GNC_SPARSE_DZ=1` gives the old row exactly.
+
+What moved: the fused quantiser applied a sparse dead-zone expansion that no other quantise path
+had, so the same configuration produced different coefficients depending on which quantiser ran.
+It is now off by default. Priced with the same entropy coder in both arms over three stills at
+q=15/25/30, it saved 2.17-4.12% of rate for 0.094-0.214 dB — **BD-rate +1.02% and
+direction-inconsistent** (-0.35%, +4.20%, -0.79%), so it bought nothing. VMAF moved **+0.06**, an
+improvement and far inside the 0.5-point tolerance.
+
+**Only q <= 30 is affected.** q=40 and above are byte-identical either way, verified at
+40/50/75/85/90/100, which is why the other three rows are untouched rather than re-measured.
 
 **PSNR figures recorded before BUG-8 (2026-09-06) are not comparable to these.** The metric used
 to compare the encoder's `f32` reconstruction; it now compares what the decoder actually emits,

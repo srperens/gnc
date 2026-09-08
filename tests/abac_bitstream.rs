@@ -213,14 +213,23 @@ fn both_arithmetic_engines_roundtrip_through_the_container() {
     );
 }
 
-/// Not an abac property, recorded because it was found while testing one and it would otherwise
-/// be re-found as an abac bug: at subsampled chroma, Rice's **GPU** encode path and its CPU
-/// encode path do not produce identical pixels. Both are Rice, so the entropy coding is not the
-/// difference; the quantise stage is (the fused quantize+histogram shader runs only on the GPU
-/// encode path). The gap is small and pre-existing, and it is why `abac_handles_subsampled_chroma`
-/// pins Rice to the CPU path before comparing.
+/// Not an abac property, kept because it was found while testing one and would otherwise be
+/// re-found as an abac bug: at subsampled chroma, Rice's **GPU** encode path and its CPU encode
+/// path must produce identical pixels.
+///
+/// **This test asserted the opposite until 2026-09-08.** It was written when the two paths
+/// differed by about 1.7 (BUG-16) and its job was to pin that gap down so a regression could be
+/// told from the known defect. The cause was the fused quantiser's sparse dead-zone expansion,
+/// which existed on that one quantiser and no other; it is now off by default (decision `0038`),
+/// so the paths agree and the assertion is inverted. `GNC_SPARSE_DZ=1` brings the divergence back,
+/// which is why the failure message below points at it.
+///
+/// Note for whoever closes **BUG-28**: `abac_handles_subsampled_chroma` pins Rice to the CPU path
+/// as a workaround for this gap. That workaround is now *probably* unnecessary — but BUG-28 is a
+/// separate open defect about abac and Rice disagreeing at subsampled chroma, so check rather than
+/// assume, and unpin it as part of that item rather than in passing.
 #[test]
-fn rice_gpu_and_cpu_encode_paths_differ_at_subsampled_chroma() {
+fn rice_gpu_and_cpu_encode_paths_agree_at_subsampled_chroma() {
     let ctx = gpu();
     let (w, h) = (512u32, 512u32);
     let img = synth_image(w, h);
@@ -239,15 +248,12 @@ fn rice_gpu_and_cpu_encode_paths_differ_at_subsampled_chroma() {
         .zip(px_cpu.iter())
         .map(|(a, b)| (a - b).abs())
         .fold(0.0f32, f32::max);
-    assert!(
-        worst > 0.0,
-        "the two Rice encode paths now agree at 4:2:2 — if that is deliberate, delete this test \
-         and the workaround it documents in abac_handles_subsampled_chroma"
-    );
-    assert!(
-        worst < 8.0,
-        "Rice GPU vs CPU encode differ by {worst} at 4:2:2, far more than the ~1.7 observed when \
-         this was found — that is a regression in the quantise stage, not the known gap"
+    assert_eq!(
+        worst, 0.0,
+        "Rice's GPU and CPU encode paths differ by {worst} at 4:2:2. Both are Rice, so this is \
+         the quantise stage, not the entropy coder. If GNC_SPARSE_DZ is set, that is the expected \
+         cause (BUG-16, decision 0038); if it is not, a second divergence has appeared between \
+         the fused quantiser and the separate one."
     );
 }
 

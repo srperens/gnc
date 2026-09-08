@@ -39,7 +39,7 @@ struct Params {
     tiles_x: u32,
     per_subband: u32,
     num_levels: u32,
-    flags: u32,        // bit 0: disable ZRL
+    flags: u32,        // bit 0: disable ZRL, bit 1: enable the sparse dead-zone expansion (BUG-16)
 
     // -- Quantize params --
     total_count: u32,
@@ -431,12 +431,28 @@ fn quantize_phases(lid: u32, tile_origin_x: u32, tile_origin_y: u32, coeffs_per_
         }
         workgroupBarrier();
 
+        // BUG-16: this expansion exists only on the fused path, so the same configuration
+        // produces different coefficients depending on which quantiser ran. Bit 1 turns it off so
+        // the two can be compared with the *same* entropy coder — comparing the GPU arm against
+        // the CPU arm cannot price it, because the CPU Rice coder is independently worse.
+        // BUG-16: **off by default since 2026-09-08.** This expansion existed on the fused path
+        // and on no other quantiser, so the same configuration produced different coefficients
+        // depending on which one ran — which made a GPU-encoded arm and a CPU-encoded arm
+        // incomparable, and it is the whole of BUG-16's 0.12 dB.
+        //
+        // Priced with the same entropy coder in both arms (`GNC_SPARSE_DZ`, three stills,
+        // q=15/25/30): it saves 2.17-4.12% of rate for 0.094-0.214 dB, which is **BD-rate +1.02%
+        // on average and direction-inconsistent** (-0.35%, +4.20%, -0.79%). So it buys nothing,
+        // and one quantiser is worth more than a wash. Kept behind bit 1 rather than deleted
+        // because three points is a thin ladder. It only fires at q <= 30 — q=40 and above are
+        // byte-identical either way.
+        let sparse_dz_enabled = (params.flags & 2u) != 0u;
         for (var g = 0u; g < num_groups; g++) {
             // Re-reduce zero counts (local arrays still hold per-thread values).
             let tot_z = reduce_sum(lid, local_zero_count[g]);
             let tot_c = reduce_sum(lid, local_total_count[g]);
             if (lid == 0u) {
-                if (g > 0u && tot_c > 0u) {
+                if (sparse_dz_enabled && g > 0u && tot_c > 0u) {
                     let zero_frac_x100 = tot_z * 100u / tot_c;
                     if (zero_frac_x100 >= 95u) {
                         let t = f32(zero_frac_x100 - 95u) / 5.0;

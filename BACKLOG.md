@@ -2061,7 +2061,59 @@ on a 4:2:0 mezzanine would be quoting a coder that changes the picture.
 **Do not close this by widening a tolerance.** The correct assertion is bit-exactness — a
 `psnr > 45.0` check reads 55 dB as a pass, which is exactly how BUG-15 survived a day.
 
-### BUG-16 — Rice's GPU and CPU encode paths disagree on the coefficients (**ROOT CAUSE FOUND AND PROVED 2026-09-08**, fix is a design decision — todo, P2)
+### BUG-16 — Rice's GPU and CPU encode paths disagree on the coefficients (**FIXED 2026-09-08**)
+
+**Scope corrected 2026-09-08, and the correction is not mine.** This section first said "only
+q <= 30 is affected", from a 4:4:4 sweep. The `intrasym` session, which found the same root cause
+independently while working BUG-28, measured it on a **grayscale** source where chroma is exactly
+zero and got the real answer: **4:4:4 differs at q <= 35, but 4:2:2 and 4:2:0 differ at q <= 86.**
+Confirmed here on bbb_1080p with the flag on and off — 4:2:2 and 4:2:0 differ at q=50/75/85/86
+(-0.70% down to -0.00%) and are byte-identical at q=90. So the claim that GNC's home range was
+untouched holds only for 4:4:4 and only from q=90; my own 4:2:2 q=75 check was already evidence
+against it and I did not connect the two.
+
+**Cause: the fused quantiser had a sparse dead-zone expansion that no other quantise path had.**
+Phase 1.5 of `quantize_histogram_fused.wgsl` re-quantised the remaining ±1 values to zero in
+non-LL subband groups already ≥95% zero, up to 1.25× dead zone. `quantize.wgsl` and the CPU
+quantiser have nothing of the kind, so the same `CodecConfig` produced different coefficients
+depending on which quantiser ran — and the entry's own hypothesis ("a dead-zone or rounding
+difference between the fused shader and the separate quantise shader") was right.
+
+**All three rows of the table above are that one feature:**
+
+| | recorded | now |
+|---|---|---|
+| q=25 GPU | 35.51 dB, 415 544 B | **35.63 dB, 425 944 B** |
+| q=25 CPU | 35.63 dB, 610 264 B | unchanged |
+| 4:2:2 q=75, GPU vs CPU pixels | max abs diff 1.69 | **max abs diff 0**, zero differing pixels |
+
+The two arms now agree on the picture to three decimals. **The remaining 43% size difference is
+expected, not a defect** — the CPU reference Rice coder lacks per-stream *k* and the checkerboard
+*k*-context, which is what the entry already said about the q=90 row.
+
+**Priced before deciding, with the same coder in both arms** (new `flags` bit 1; comparing against
+`--cpu-encode` cannot price it, because that arm is independently worse). Three stills, q=15/25/30:
+saves 2.17-4.12% of rate for 0.094-0.214 dB, i.e. **BD-rate −0.35% / +4.20% / −0.79%, mean
++1.02%** and direction-inconsistent. It buys nothing, so it is **off by default** and kept behind
+`GNC_SPARSE_DZ=1` rather than deleted (three points is a thin ladder) or ported to the other two
+quantisers (porting a wash). Decision `0038`.
+
+**Scope is measured: only q ≤ 30.** Byte-identical either way at q=40/50/75/85/90/100 — above
+q≈30 the dead zone is too narrow for a subband to reach 95% zeros. So GNC's home range is
+untouched, and **BASELINE's q=25 row moved** to 35.63 dB / 1.64 bpp / VMAF 90.31 (from 35.51 /
+1.60 / 90.25). VMAF moved **+0.06, an improvement**, far inside the 0.5-point tolerance. GOALS's
+copy of that table is updated too.
+
+Original entry follows.
+
+#### BUG-16, as originally filed
+
+#### BUG-16 — the root-cause proof, from the session that found it independently
+
+Written by `intrasym` while working BUG-28, and kept in full: it proves the cause by a different
+route, corrects this entry's scope, and its third-coder arbitration is a better argument for
+turning the expansion off than the BD-rate above.
+
 
 > **Found 2026-09-08 while working BUG-28, which is a duplicate of this and is now closed.**
 >

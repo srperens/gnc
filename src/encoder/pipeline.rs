@@ -1819,6 +1819,13 @@ impl EncoderPipeline {
         // arm, while Huffman *without* the 4:4:4 batch layout falls through to it and does
         // consume the tables. Approximating this as "coder == rANS" would quietly stop feeding
         // that case.
+        // BUG-16: the fused quantiser's sparse dead-zone expansion is **off by default**, because
+        // it existed on no other quantise path and so made a GPU-encoded arm and a CPU-encoded arm
+        // produce different coefficients. Priced at BD-rate +1.02% and direction-inconsistent, so
+        // it buys nothing; `GNC_SPARSE_DZ=1` turns it back on for anyone re-pricing it on a wider
+        // ladder than the three points that retired it. It only ever fires at q <= 30.
+        let fused_qh_flags: u32 =
+            1 | if std::env::var("GNC_SPARSE_DZ").is_ok() { 2 } else { 0 };
         let is_444 = chroma_format == ChromaFormat::Yuv444;
         let fused_qh_needs_hist =
             use_fused_qh && is_444 && use_gpu_encode && !use_gpu_rice && !(use_gpu_huffman && is_444);
@@ -2127,7 +2134,7 @@ impl EncoderPipeline {
                     config.dead_zone,
                     &weights_luma,
                     config.per_subband_entropy,
-                    1,
+                    fused_qh_flags,
                     wm_param,
                     fused_qh_needs_hist,
                 );
@@ -2249,7 +2256,7 @@ impl EncoderPipeline {
                     config.dead_zone,
                     &weights_chroma,
                     config.per_subband_entropy,
-                    1,
+                    fused_qh_flags,
                     wm_param,
                     fused_qh_needs_hist,
                 );
@@ -2366,7 +2373,7 @@ impl EncoderPipeline {
                     config.dead_zone,
                     &weights_chroma,
                     config.per_subband_entropy,
-                    1,
+                    fused_qh_flags,
                     wm_param,
                     fused_qh_needs_hist,
                 );

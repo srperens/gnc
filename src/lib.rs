@@ -715,6 +715,34 @@ pub const MIN_TILE_SIZE: u32 = 16;
 /// dB**, 640 -> 11.24 dB, 1024 -> 7.50 dB. Raising this means reworking the shader, and INTRA-1
 /// step 2 measured that GNC gains only 0.6% going from tile 256 to 512, so there is no rate case
 /// for it today.
+///
+/// **And no tile size makes the padding go away** — the question comes up here, so the answer
+/// lives here.
+///
+/// The tile grid pads every plane up to a whole multiple of `tile_size`, so a 1920x1080 frame is
+/// coded as 2048x1280 and 20.9% of the coded samples land outside the picture (PAD-1, `0039`).
+/// The obvious escape is a tile size that divides the frame exactly, and one exists for each
+/// common resolution — `gcd(W, H)`, i.e. **120 at 1080p, 80 at 720p, 240 at 2160p**.
+///
+/// **None of them can carry five wavelet levels**, because a tile must be divisible by
+/// `2^levels`, and **no multiple of 32 divides 1080, 720 or 2160 at all**: broadcast heights are
+/// not power-of-two friendly (1080 = 8 x 135, 720 = 16 x 45, 2160 = 16 x 135), so the factors of
+/// two run out after three or four. The choice is therefore a deep wavelet with padding against a
+/// shallow one without, and it is not close — measured on bbb_1080p at q=90 with `--abac`, tile
+/// 120 at three levels costs **+81% of rate** against tile 256 at five levels, for the same PSNR.
+///
+/// Nor does a *second*, smaller tile size at the border help in general. A clipped border tile can
+/// only be transformed as deep as its own extent allows, and that extent is `W mod tile_size` —
+/// a lottery on how the remainder factorises. 1080p draws well (56 = 8 x 7, three levels over 5.2%
+/// of the picture); **720x486 gets one level over 47% of its rows, 1366x768 gets one level in
+/// width, and an odd remainder would give none at all.** The padding tax itself ranges from 0.7%
+/// at 4320p to **29.7% at PAL**, so this is not a 1080p-shaped problem either.
+///
+/// So the way out is not a tile size at all: it is **incomplete border tiles at full depth**, the
+/// way JPEG 2000 has them, which decouple tile size from frame size and allow both. That is an
+/// architecture change (tile origins, the tile grid, every shader deriving a position from
+/// `tile_size`, the per-tile CRC and seek structures), filed as **TILE-1**; the +81% above is
+/// what says it would be worth scoping.
 pub const MAX_TILE_SIZE: u32 = 512;
 
 /// Which fill goes into the tile-alignment padding (PAD-1, decision `0039`).

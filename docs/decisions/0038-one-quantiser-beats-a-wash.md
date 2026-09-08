@@ -46,7 +46,18 @@ Three stills, q=15/25/30, GPU both arms:
 about a percent on average and does not agree with itself on the sign. Three points per arm is a
 thin ladder and `blue_sky` dominates the mean, so the honest reading is *neutral*, not *harmful*.
 
-Either way it does not pay for a divergence.
+**And a second thin measurement disagrees with mine on the sign.** The `intrasym` session converted
+the PSNR loss into rate using each image's own local RD slope and got a *marginal net win of 0–1%*
+on bbb and touchdown, neutral on blue_sky. Two methods, both thin, opposite signs: the honest
+conclusion is that this trade is inside the noise and neither of us has the ladder to settle it.
+
+**So the decision does not rest on the rate figure, and it should not.** What settles it is
+third-coder arbitration, which is that session's finding and is a better argument than either
+BD-rate: **CPU-Rice and abac — independent coders, abac verified bit-exact against its own CPU
+reference — agree in 10 of 10 configurations, and every divergence is GPU-Rice against both.** The
+shipped default encoder was the outlier, not the reference. Turning the expansion off makes the
+default agree with two independent coders; leaving it on keeps one quantiser disagreeing with
+everything else for a rate effect nobody can measure the sign of.
 
 ## What was chosen
 
@@ -68,10 +79,25 @@ already has a list of retracted results that came from harness asymmetries rathe
 
 ## Scope, measured rather than assumed
 
-**Only q ≤ 30 is affected.** Output is byte-identical either way at q=40, 50, 75, 85, 90 and 100 —
-the dead zone above q≈30 is too narrow for a subband to reach 95% zeros. Two consequences: GNC's
-stated home range (q > 85, contribution) is untouched, and BASELINE's q=50/75/90 rows did not need
-re-measuring.
+**Corrected: it is q ≤ 35 at 4:4:4 but q ≤ 86 at 4:2:2 and 4:2:0.** This record first said "only
+q ≤ 30", from a 4:4:4 sweep, and that was wrong. The `intrasym` session — which found the same root
+cause independently while working BUG-28 — measured it on a **grayscale** source, where chroma is
+exactly zero so every difference is pure luma, and got the real window. Confirmed here on
+bbb_1080p with the flag on and off:
+
+| | fires at |
+|---|---|
+| 4:4:4 | q ≤ 35; byte-identical q ≥ 40 |
+| 4:2:2 | q ≤ 86 (−0.70% at q=50, −0.05% at q=85, −0.00% at q=86); byte-identical q ≥ 90 |
+| 4:2:0 | q ≤ 86 (−0.56% at q=50, −0.06% at q=85); byte-identical q ≥ 90 |
+
+So **the home range is untouched only at 4:4:4, and only from q=90.** The magnitudes above q≈75 are
+tiny, but they are not zero, and the original claim was wrong rather than imprecise. My own 4:2:2
+q=75 check was already evidence against it — the two arms agreed there *after* the fix, which only
+means anything if the feature had been firing — and I did not connect the two measurements.
+
+BASELINE's q=50/75/90 rows are 4:4:4, so they genuinely did not need re-measuring; that part
+survives.
 
 **BASELINE's q=25 row moved** from 35.51 dB / 1.60 bpp / VMAF 90.25 to **35.63 dB / 1.64 bpp /
 VMAF 90.31**. VMAF is the leading metric at this operating point (CLAUDE.md), and it moved **+0.06

@@ -2116,7 +2116,29 @@ Fixed with `.max(1)` in both. `--huffman -q 100` at tile 256 is now **bit-exact 
 error 0, host and GPU encoders byte-identical: 1 076 689 bytes on kristensara_720p against Rice's
 984 178, so Huffman is **+9.4% behind Rice at q=100**. Not a reason to un-park the coder.
 
-### BUG-22 — Huffman's GPU per-stream output slot has no bound (**guarded 2026-09-07, not fixed**, P3)
+### BUG-22 — Huffman's GPU per-stream output slot has no bound (**FIXED 2026-09-08**)
+
+**Fixed by sizing the slot from the work, and bounding the shader's writes as well.**
+`STREAMS_PER_TILE` threads split a tile's coefficients evenly, and the worst case per symbol is
+four bytes — significance bit, sign bit, an 8-bit code, an exp-Golomb escape — so four bytes per
+symbol is an upper bound rather than an estimate. The host computes it, passes it as
+`max_stream_words`, and **both** `stream_output` writes in `huffman_encode.wgsl` are bounded by it.
+Correct sizing makes the configuration work; the shader bound makes a *wrong* size truncate one
+stream instead of corrupting the next one. 4 KiB per stream at tile 512, ~37 MB of scratch for
+1080p 4:4:4. The slot size is now part of the buffer cache's key.
+
+**Measured recovery on the arm this bug defined** — q=90, tile 512, where it read 7.8-10.9 dB:
+bbb 50.08 dB, blue_sky 49.95, kristensara 49.66, touchdown 49.57, max error 4 on all four.
+BASELINE puts q=90 at 50.06 dB, so these are the operating point, not merely better — about
+**+40 dB**. Decision `0037`.
+
+**Why now, when the entry declined this fix.** It declined it because "BUG-14's tile-512 arm is the
+only thing that wants it", which was true while the alternative was a guard. Once the guard is the
+only thing between an ordinary command line and a crash, it stops being true.
+
+Original entry follows.
+
+#### BUG-22, as originally filed
 `emit_byte` in `huffman_encode.wgsl` writes `stream_output[p_stream_word_base + p_word_pos]` with
 nothing checking `p_word_pos` against `MAX_STREAM_WORDS`. A stream needing more than its 512-byte
 slot spills into its neighbour's, and the host packs the neighbour's bytes back out. That is the
@@ -2132,7 +2154,32 @@ making `MAX_STREAM_WORDS` a parameter across the shader and the host. Not done: 
 coder and **BUG-14's tile-512 arm is the only thing that wants it**, which the host encoder can
 measure instead.
 
-### BUG-23 — `clamp_code_lengths` does not terminate (**bounded 2026-09-07, not fixed**, P3)
+### BUG-23 — `clamp_code_lengths` does not terminate (**FIXED 2026-09-08**)
+
+**Fixed by building a real tree on scaled frequencies instead of patching a length histogram.**
+While the natural tree is deeper than the 8-bit limit, halve every non-zero frequency and rebuild.
+It terminates because 32 halvings take any `u32` to 1 and a uniform 64-symbol alphabet has depth 6
+— an assert names that bound rather than trusting it — and **the result satisfies Kraft by
+construction**, which is the property that matters: the old code could return with excess unplaced,
+after which `assign_canonical_codes` would emit codewords that are not a prefix code. Rounding up
+on the halving is load-bearing; a live symbol that scaled to zero would lose its code entirely.
+`clamp_code_lengths` is gone. Decision `0037`.
+
+**Rejected: package-merge.** Optimal, and a few hundred lines. Frequency scaling is not optimal —
+it discards histogram resolution — but it is fifteen lines, terminates for a reason a reader can
+check, and is what zlib and JPEG implementations do. For a parked coder, a construction nobody has
+to audit is worth more than an optimal codebook. It is the upgrade if Huffman is ever unparked.
+
+**These two bugs are one configuration failing twice.** `--huffman -q 100 -t 512` on bbb_1080p hit
+this one first (hang, then refusal); fixing it produced a codebook and the encode hit BUG-22
+immediately. That configuration now encodes in **0.63 s** and decodes **bit-exact lossless — max
+error 0, zero wrong pixels**. The `should_panic` test became two tests: the skewed histogram is
+length-limited and Kraft-complete, and a second one asserts its unconstrained tree really is deeper
+than the limit so the first cannot pass for the wrong reason.
+
+Original entry follows.
+
+#### BUG-23, as originally filed
 It places excess code length by moving one symbol from length *j* to two at *j*+1, and only
 lengths below the 8-bit maximum may donate — a donor pool of order 100 donations for a 64-symbol
 alphabet, against an `excess_bits` that is not bounded by it. A steeply skewed histogram needs

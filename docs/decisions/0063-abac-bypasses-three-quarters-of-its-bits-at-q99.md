@@ -133,12 +133,49 @@ Two things collapsed on inspection, and both save work:
   causal information about it, so modelling it would add contexts for noise. The measurement
   charges it as bypass in every arm.
 
+### Step 2 milestone 1 — candidate A survives real per-block adaptation
+
+`0063` named this the first thing step 2 must check, and named the reason: step 1b's bound pools
+statistics per plane and subband, so it charges no adaptation and lets every block share one set
+of counts, while a real implementation cold-starts **24 new contexts per 64×64 code-block** on the
+same 4096 symbols the existing 18 learn from. That is the effect that collapsed abac's own
+256-stream variant from −6.6% to −0.7%, so the pooled figure was not evidence about it either way.
+
+`adapt_bits_prefix_ctx` runs abac's **real probability engine** over the real shipped code-blocks —
+same `Prob`, same `ADAPT_SHIFT`, same cold start, charging −log2 p per decision — with the
+Exp-Golomb prefix context-coded instead of bypassed. Both arms cold, so only the binarisation
+differs:
+
+| sequence | q | step 1b, pooled | **milestone 1, adaptation charged** |
+|---|---|---|---|
+| crowd_run | 90 | −2.79% | **−2.83%** |
+| crowd_run | 99 | −8.20% | **−8.37%** |
+| bbb_extended | 90 | −0.55% | **−0.39%** |
+| bbb_extended | 99 | −2.44% | **−2.49%** |
+| old_town_cross | 90 | −2.85% | **−2.63%** |
+| old_town_cross | 99 | −9.07% | **−8.70%** |
+
+**The win survives intact — within ±0.4 points everywhere, and larger with adaptation charged on
+three of the six points.** The 256-stream precedent does not transfer, and the reason it does not
+is worth keeping: that case gave each coder ~256 symbols to learn 18 contexts on, whereas here the
+24 new contexts sit inside a 4096-coefficient block and are exercised only by coefficients with
+|v| > 2 — still hundreds to thousands of decisions each at the qualities that matter. Where the
+adaptive arm *beats* the pooled bound, it is doing something a pooled estimate cannot: tracking
+statistics that vary within the block.
+
+**What this clears, precisely.** It clears the *bound* on three of three sequences at q=99
+(−2.49% / −8.37% / −8.70%). It does **not** yet clear ENT-9's gate, which is ≥2% of **total rate**
+at bit-identical pixels — that is a real encode, and total rate carries the per-block length
+fields and container overhead these figures exclude. The remaining risk is now implementation
+cost, not whether the signal is there.
+
 ## What was not chosen
 
-**Building candidate A in this session.** It changes the bitstream, so it needs the CPU coder,
-`abac_encode.wgsl` and `abac_decode.wgsl` moved together and re-verified byte-exact three ways,
-which is ENT-5-scale work and its own claim. The bound is what decides whether that is worth
-starting, and it is; step 2 is filed with this ordering.
+**Building candidate A into the bitstream.** It changes the format, so the CPU coder,
+`abac_encode.wgsl` and `abac_decode.wgsl` move together and get re-verified byte-exact three ways
+— ENT-5-scale work and its own claim. Milestone 1 above is deliberately the cheap half: it uses
+the real engine on real blocks and answers the only question that could have killed the item, for
+no bitstream risk at all.
 
 **Candidate B, for now.** −0.50% to −1.31% at q=99 is below ENT-9's own ≥2% gate, and it is a
 gate this repository has already used to close ENT-6 at 1.3%. It costs 9 contexts and a signed

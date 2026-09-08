@@ -87,6 +87,38 @@ residual holds larger magnitudes, and larger magnitudes are exactly what falls o
 coded decisions into the bypassed suffix. **B is below the gate three of three either way.** The
 pre-RATE-3 figures stay correct for `f3f7254`; where the two disagree, these are current.
 
+### Step 2 milestone 1 — candidate A survives real per-block adaptation (2026-09-08)
+
+`0063` named this the first thing step 2 must check: step 1b's bound pools statistics per plane
+and subband, charging no adaptation, while a real implementation cold-starts **24 new contexts per
+64×64 code-block** on the same 4096 symbols the existing 18 learn from — the effect that collapsed
+abac's own 256-stream variant from −6.6% to −0.7%.
+
+`adapt_bits_prefix_ctx` runs abac's **real probability engine** over the real shipped code-blocks
+(same `Prob`, same `ADAPT_SHIFT`, same cold start, −log2 p per decision), with the Exp-Golomb
+prefix context-coded instead of bypassed. Both arms cold, so only the binarisation differs:
+
+| sequence | q | step 1b, pooled | **adaptation charged** |
+|---|---|---|---|
+| crowd_run | 90 | −2.79% | **−2.83%** |
+| crowd_run | 99 | −8.20% | **−8.37%** |
+| bbb_extended | 90 | −0.55% | **−0.39%** |
+| bbb_extended | 99 | −2.44% | **−2.49%** |
+| old_town_cross | 90 | −2.85% | **−2.63%** |
+| old_town_cross | 99 | −9.07% | **−8.70%** |
+
+**It survives within ±0.4 points, and is larger with adaptation charged on three of six points.**
+The 256-stream precedent does not transfer, and why matters: there each coder had ~256 symbols for
+18 contexts; here the 24 new contexts sit inside a 4096-coefficient block and are exercised only
+by coefficients with |v| > 2 — still hundreds to thousands of decisions each. Where the adaptive
+arm *beats* the pooled bound it is tracking statistics that vary within the block, which a pooled
+estimate cannot.
+
+**What it clears, precisely.** The *bound*, on three of three at q=99. **Not** ENT-9's gate, which
+is ≥2% of **total rate** at bit-identical pixels — a real encode, and total rate carries the
+per-block length fields and container overhead these figures exclude. What is left is
+implementation cost, not whether the signal is there.
+
 ### Three things that make this a mechanism rather than a coincidence
 
 - **The bypass share predicts which sequence keeps its advantage.** q=99 inter: bbb_extended

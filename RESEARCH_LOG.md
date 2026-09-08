@@ -269,6 +269,60 @@ link checker over every `.md` in the tree now reports zero broken relative links
 `gnc` warnings** on both (the one line clippy prints is a future-incompat notice about the `block
 v0.1.6` dependency, present before this change).
 
+## ROBUST-1 — the decoder panics on malformed input by design, and the CRC-32 is not input validation (2026-09-08)
+
+The audit BUG-43 left open. Swept the decode paths for bitstream values reaching a shift, an index
+or an allocation without validation.
+
+### Fixed: one contained defect, in the one place that promised it would not happen
+
+`read_tile_varint` (`src/encoder/rice.rs`) returns a `u16` — three bytes at most for a well-formed
+varint — but looped until the *data* ended. Demonstrated standalone before touching it:
+
+```
+12 bytes of 0x80  ->  panicked at 'attempt to shift left with overflow'
+```
+
+`shift` reaches 77. With overflow checks off it wraps silently instead, and either way `*pos` has
+already run to the end of the buffer, so the rest of the tile parse reads from the wrong place.
+Bounded to `VARINT_MAX_BYTES = 3`. The test asserts the **consumed position**, not just the value,
+because a release build wraps rather than panics and the position is the part that is wrong in both
+profiles — which is exactly why `cargo test --release`, the project's gate, could never have caught
+this.
+
+**What is worth taking from it:** the function's own comment said it would "stop rather than panic
+and let the tile CRC reject it". The comment was written about running out of *data*. A corrupt
+tile does not run out of data — it runs out of *format*, and the loop had no bound on that.
+
+### The larger finding, which is a contract and not a bug
+
+`deserialize_compressed_validated` (`src/format.rs:928`) **opens with**
+`assert!(data.len() >= 37, "File too small")`. That is the contract, stated in code: malformed
+input panics. Downstream of it the frame-header parser indexes with
+`data[pos..pos + 4].try_into().unwrap()` throughout, and sizes allocations from wire `u32`s —
+`num_detail` (`:997`), `wm_len` (`:1043`), `num_tiles` (`:1175`), each reaching
+`Vec::with_capacity(n)` for an `n` that can be four billion.
+
+**And the per-tile CRC-32 does not cover any of this, because it is checked after parsing.** CRC is
+error resilience for bit rot in a stream that is otherwise well-formed. It is not input validation,
+and the presence of the feature should not be read as saying malformed input is handled.
+
+**So this is a decision, not a fix**, and ROBUST-1 carries it: (a) a `Result` boundary, which
+breaks `deserialize_compressed`'s signature; (b) a validating pre-pass that bounds every length
+against `data.len()` before the parser runs, which breaks nothing and is the cheapest; (c) document
+panic-on-malformed and require callers to sandbox. Not chosen here, because choosing it without
+pricing (b) would be guessing.
+
+**Not audited and not claimed:** `abac.rs` (`vec![0i32; count]`), the rANS deserialiser, the GNV
+container index. Same class of question; "probably the same answer" is not a result.
+
+### The rule
+
+**A gate that runs only in one profile cannot see bugs that only exist in the other.** The varint
+overflow is a panic with overflow checks on and a silent wrong answer with them off. GNC's gate is
+`cargo test --release`, so the panic was invisible and the wrong answer was untested. Where a
+defect changes shape between profiles, assert the thing that is wrong in both.
+
 ## PERF-3 item 8 — the 32-bit Rice window is bit-exact and its throughput claim is unmeasured (2026-09-08)
 
 `docs/SIMPLE_PERF_FIXES.md` item 8: `rice_decode.wgsl` refilled its bit reader **one byte at a

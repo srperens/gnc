@@ -1449,6 +1449,52 @@ that is not a shader it does not use. **Why P2:** it invalidates no measurement 
 nothing on Vulkan or Metal, but GOALS rule 4 claims DX12 and step 1 is close to free. Step 1
 alone converts "DX12 does not run GNC" into a measurement.
 
+### ROBUST-1 — the decoder's contract on malformed input is "panic", and one place promised otherwise (partly done 2026-09-08, P2)
+
+The audit BUG-43 left open: which other decoder inputs reach a shift, an index or an allocation
+unvalidated. Run 2026-09-08. **One contained defect found and fixed; the larger finding is a
+design contract, not a bug, and it is what makes this a P2 rather than a P4.**
+
+**Fixed: `read_tile_varint` shifted without bound.** `src/encoder/rice.rs`. It returns a `u16`,
+so three bytes is the most a well-formed varint can take, but the loop ran until the *data* ended.
+**12 bytes of `0x80` drove `shift` to 77 and panicked** — "attempt to shift left with overflow" —
+in any build with overflow checks on, and wrapped silently in one without, having already run
+`*pos` to the end of the buffer and taken the rest of the tile parse with it. Demonstrated
+standalone before fixing. Now bounded to `VARINT_MAX_BYTES = 3`, which is what `varint_size` can
+emit. The interesting part is that the function's **own comment** said it would "stop rather than
+panic and let the tile CRC reject it": the stopping condition was "ran out of data", and a corrupt
+tile does not run out of data, it runs out of *format*. Test asserts the consumed position, not
+just the value, because release builds wrapped and only the position is wrong in both profiles.
+
+**The larger finding, and it is not a bug: `deserialize_compressed_validated` panics on malformed
+input by design, and the per-tile CRC-32 does not cover that.** `src/format.rs:928` opens with
+`assert!(data.len() >= 37, "File too small")`, and from there the frame-header parser
+- indexes with `data[pos..pos + 4].try_into().unwrap()` throughout, which panics past the end, and
+- sizes allocations straight from wire `u32`s: `num_detail` (`:997`), `wm_len` (`:1043`),
+  `num_tiles` (`:1175`) each reach `Vec::with_capacity(n)` where `n` can be 4 billion.
+
+**The CRC cannot help, because it is checked after parsing.** Per-tile CRC-32 is error resilience
+for bit rot in an otherwise well-formed stream; it is not input validation, and GOALS should not be
+read as claiming it is.
+
+**Why this is a decision and not a fix.** Making the parser reject rather than panic means a
+`Result`-returning boundary — an API break for `deserialize_compressed`, and a choice about what a
+decoder should do with a stream it cannot parse. That belongs in a decision record with the
+alternatives priced: (a) `Result` at the public boundary, (b) a validating pre-pass that bounds
+every length against `data.len()` before the parser runs, (c) document panic-on-malformed as the
+contract and require callers to sandbox. **(b) is the cheapest and does not break the API**, and it
+is worth pricing first.
+
+**Not audited:** `abac.rs` (`vec![0i32; count]` at `:395`, `:636`), the rANS deserialiser, and the
+GNV container index. Same class of question, and the same answer probably applies, but "probably"
+is not a result.
+
+**Success criterion:** either a decision record choosing one of (a)/(b)/(c) with a test that feeds
+truncated and hostile buffers to the public entry points, or evidence that malformed input cannot
+reach them in any shipped configuration. **Why P2:** nothing is broken for well-formed streams and
+no measurement is invalidated, but a contribution codec's decoder eats files from elsewhere, and
+the project already ships a feature (CRC-32) whose name suggests this is handled.
+
 ### BUG-43 — the decoder took Rice `k` off the wire and used it as a shift distance (**FIXED** 2026-09-08)
 
 Found while implementing PERF-3 item 8, by asking what bounds `read_bits(count)` now that the

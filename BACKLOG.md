@@ -4224,7 +4224,7 @@ At 1.0 the worst frame lands exactly on all-intra's 47.48 — the same ceiling p
 has at 1.0, arrived at from a second knob, which is the interesting part. 12.7% of the rate and
 2.87 dB of worst-frame is worth a BD-rate.
 
-> **Priced 2026-09-08 and shipped: `inter_dz_mul` is now 1.0.** `docs/decisions/0041`. The point
+> **Priced 2026-09-08 and shipped: `inter_dz_mul` is now 1.0.** `docs/decisions/0043`. The point
 > above reproduces byte-for-byte on today's `main`, and the ladder says the same thing everywhere.
 >
 > 4 rungs (q=70/75/80/85) x 3 sequences x 4 arms, 24 frames, ki=9, 4:4:4. BD-rate on PSNR against
@@ -5075,6 +5075,49 @@ tiled.
 subband origin, and T.800 truncates *its* border code-blocks the same way rather than padding them.
 
 ### INTRA-2 — apply the dead zone to I-frames only (todo, **P1**)
+### INTRA-2 — apply the dead zone to I-frames only (**DONE 2026-09-08**)
+
+**Shipped as: `dead_zone` floored at 0.6 over q=85..95, plus a new `dead_zone_referenced`
+carrying the ladder's own value for the two places that must not see the raised one — an I-frame
+inside a P-chain, and the inter residual path.** Decision `0041`.
+
+**The criterion is met on all three clauses:**
+
+| clause | result |
+|---|---|
+| ≥2% rate at matched RGB PSNR, four stills, q≥85 | **BD-rate −5.01%** (−3.31 / −4.67 / −6.96 / −5.09) |
+| no worst-frame regression on any of the three sequences | **byte-identical** — regression is structurally impossible |
+| dE00 no worse | **−5.2% mean** at matched rate, p95 better on 11 of 12, Y-PSNR **+0.39 dB** |
+
+**What 0028's blocker was actually measuring.** `GNC_DEAD_ZONE=0.6` moved two things, because
+`res_dead_zone = config.dead_zone * inter_dz_mul` with the multiplier at 2.0. It took the *inter*
+dead zone from the ladder's 1.0 / 0.357 / 0.025 at q=85/90/95 to **1.2 at all three**, turning a
+dormant no-op into a strongly active one at q=90 and q=95. With the inter dead zone held at the
+ladder's value, worst-frame goes from −0.85…−1.93 dB to **0.00/+0.03 dB at q=85 and −0.12…−0.19 dB
+at q=90/95.** So ~90% of the blocker was the inter dead zone, not the intra lever.
+
+**And the residue decided the design.** Even with inter held, a referenced I-frame costs −0.19 dB
+of worst-frame for −0.33% of rate at q=90 — arithmetic, not tuning: at ki=9 the I-frame is one
+frame in sixteen so its saving dilutes 16:1, while worst-frame PSNR is *fully* exposed to it
+because **the worst frame is the I-frame**. So the gate is on **being referenced**, not on being
+intra — which is why the item's own title understates it, and it is the same conclusion PAD-1
+reached one commit earlier from a different lever (`0039`), on the line directly above.
+
+**Rejected:** gating on frame type alone (leaves the raised value on a referenced I-frame — the
+−0.19 dB case); lowering the floor to 0.52, where the sequence cost is −0.01 dB but most of the
+stills win is gone too; and the principled `(|q| + r) * step` truncation-plus-offset, which is
+still the right long-term answer and still needs a decoder change.
+
+**BASELINE's q=90 row moves** to 49.89 dB / 7.21 bpp / VMAF 97.06 (VMAF −0.01 against a 0.5
+threshold). Its q=25/50/75 rows are outside the floor's range and unaffected.
+
+**Two harness errors are recorded in `0041`** and are worth reading before the next sweep: a floor
+applied *after* an env override silently disarms the override, and `np.interp` clamping compared
+two different rates and flipped the sign of the dE00 result.
+
+Original entry follows.
+
+#### INTRA-2, as originally filed
 
 Filed 2026-09-08 by INTRA-1 step 2c, which measured the lever and then measured why it cannot ship
 as a preset. **~3 points of the intra JPEG 2000 gap, blocked on the P path.** Decision

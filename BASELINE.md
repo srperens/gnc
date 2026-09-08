@@ -41,7 +41,18 @@ Re-measured 2026-09-06 after BUG-6 made 5 wavelet levels the default at q ≥ 25
 | 25  | 35.63 dB | 1.64 | 90.31 | 5 |
 | 50  | 40.30 dB | 2.73 | 95.02 | 5 |
 | 75  | 44.84 dB | 4.53 | 96.58 | 5 |
-| 90  | 50.06 dB | 8.07 | 97.08 | 5 |
+| 90  | 49.89 dB | 7.21 | 97.06 | 5 |
+
+**The q=90 row moved on 2026-09-08 (INTRA-2).** It read **50.06 dB / 8.07 bpp / VMAF 97.08**.
+The dead zone is now 0.6 over q=85..95 where the ladder had 0.5 down to 0.0 — values the quantiser
+treats as no dead zone at all — which is worth **BD-rate −5.01% on four stills** and, at matched
+rate, **−5.2% dE00 and +0.39 dB of YCoCg-R Y-PSNR**. VMAF moved **−0.01**. `GNC_DEAD_ZONE` still
+overrides it in both directions. Decision `0041`.
+
+Two things this row does *not* say. **The bpp move is larger than INTRA-2's own −5.3%** at this
+point, because PAD-1 (`0039`) landed the same day and this row had not been re-taken since; the
+pre-INTRA-2 build measures 7.62 bpp at 50.06 dB here, not 8.07. And **sequences did not move at
+all** — an I-frame that others predict from keeps the ladder's dead zone, verified byte-identical.
 
 **The q=25 row moved on 2026-09-08 (BUG-16) and the others did not.** It read
 **35.51 dB / 1.60 bpp / VMAF 90.25**; both sets reproduce on demand, because the change is a

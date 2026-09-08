@@ -395,6 +395,34 @@ impl EncoderPipeline {
                 // crowd_run and old_town_cross — and 0.000 dB on bbb_extended itself at ki=1,
                 // which is what pins it to the reference. Decision 0039.
                 cfg.pad_fill_decay = false;
+                // INTRA-2: the same reasoning as `pad_fill_decay` directly above, reached from a
+                // different lever. The dead zone is worth BD-rate −5.0% on stills at q=85..95, and
+                // on a referenced I-frame it is a bad trade by construction: at ki=9 that frame is
+                // one in sixteen, so its saving is diluted to 0.05–0.33% of the sequence while
+                // worst-frame PSNR is fully exposed to it — the worst frame *is* the I-frame.
+                // Measured −0.19 dB worst-frame for −0.33% rate at q=90 on three sequences, and
+                // 0.00 dB at q=85 where the step from today's 0.5 is small.
+                //
+                // At ki=1 nothing predicts from anything, so the still result applies unchanged and
+                // the lever stays on — which is why this is gated rather than unconditional.
+                if ki > 1 {
+                    // Canary (CLAUDE.md, "No silent features"): print both values and whether the
+                    // gate fired. Printing it *after* the assignment would show two identical
+                    // numbers and prove nothing, which is what a first attempt at this line did.
+                    if diagnostics::enabled() && display_idx == 0 {
+                        println!(
+                            "  INTRA-2: I-frame is a reference (ki={ki}), dead zone {:.3} -> {:.3}",
+                            cfg.dead_zone, config.dead_zone_referenced
+                        );
+                    }
+                    cfg.dead_zone = config.dead_zone_referenced;
+                } else if diagnostics::enabled() && display_idx == 0 {
+                    println!(
+                        "  INTRA-2: all-intra (ki={ki}), nothing predicts from this frame, \
+                         dead zone {:.3} kept",
+                        cfg.dead_zone
+                    );
+                }
                 cfg
             };
 
@@ -3166,10 +3194,18 @@ impl EncoderPipeline {
         let uniform_weights = crate::SubbandWeights::uniform(config.wavelet_levels);
         let weights_luma = uniform_weights.pack_weights();
         let weights_chroma = uniform_weights.pack_weights_chroma();
-        // Inter residuals take the same dead zone as intra (INTER-2, docs/decisions/0041).
+        // Inter residuals take the same dead zone as intra (INTER-2, `docs/decisions/0043`).
         // One source of truth: this factor used to be inlined at all three of these sites.
+        //
+        // **`dead_zone_referenced`, not `dead_zone` — and that distinction is what keeps INTER-2's
+        // measurement valid** (INTRA-2, `docs/decisions/0041`). "The same dead zone as intra" was
+        // measured where `config.dead_zone` *was* the ladder's value. It no longer is: it is
+        // floored at 0.6 over q=85..95 for frames nothing predicts from, so reading it here would
+        // hand the inter path a 0.6 dead zone at those points — a configuration INTER-2 never
+        // priced. `dead_zone_referenced` is the ladder's own value, so the two changes compose and
+        // this line still means what INTER-2 measured.
         let inter_dz_mul: f32 = crate::inter_dead_zone_mul();
-        let res_dead_zone = config.dead_zone * inter_dz_mul;
+        let res_dead_zone = config.dead_zone_referenced * inter_dz_mul;
 
         // Config stored in CompressedFrame must match encoder parameters so decoder
         // uses the same dequantization.
@@ -3298,8 +3334,11 @@ impl EncoderPipeline {
             let src = if std::env::var("GNC_P_QP_SCALE").is_ok() { "env" } else { "taper" };
             println!(
                 "  p_qp_scale={p_qp_scale:.4} ({src}, default {p_qp_scale_default:.4}), \
-                 intra_qstep={:.4} res_qstep={res_qstep:.4} inter_dz_mul={inter_dz_mul:.2}",
-                config.quantization_step
+                 intra_qstep={:.4} res_qstep={res_qstep:.4} inter_dz_mul={inter_dz_mul:.2} \
+                 dz_intra={:.3} dz_referenced={:.3} dz_res={res_dead_zone:.3}",
+                config.quantization_step,
+                config.dead_zone,
+                config.dead_zone_referenced
             );
         }
 
@@ -4962,10 +5001,18 @@ impl EncoderPipeline {
         let uniform_weights = crate::SubbandWeights::uniform(config.wavelet_levels);
         let weights_luma = uniform_weights.pack_weights();
         let weights_chroma = uniform_weights.pack_weights_chroma();
-        // Inter residuals take the same dead zone as intra (INTER-2, docs/decisions/0041).
+        // Inter residuals take the same dead zone as intra (INTER-2, `docs/decisions/0043`).
         // One source of truth: this factor used to be inlined at all three of these sites.
+        //
+        // **`dead_zone_referenced`, not `dead_zone` — and that distinction is what keeps INTER-2's
+        // measurement valid** (INTRA-2, `docs/decisions/0041`). "The same dead zone as intra" was
+        // measured where `config.dead_zone` *was* the ladder's value. It no longer is: it is
+        // floored at 0.6 over q=85..95 for frames nothing predicts from, so reading it here would
+        // hand the inter path a 0.6 dead zone at those points — a configuration INTER-2 never
+        // priced. `dead_zone_referenced` is the ladder's own value, so the two changes compose and
+        // this line still means what INTER-2 measured.
         let inter_dz_mul: f32 = crate::inter_dead_zone_mul();
-        let res_dead_zone = config.dead_zone * inter_dz_mul;
+        let res_dead_zone = config.dead_zone_referenced * inter_dz_mul;
 
         let mut res_config = config.clone();
         res_config.subband_weights = uniform_weights;
@@ -5904,10 +5951,18 @@ impl EncoderPipeline {
         let uniform_weights = crate::SubbandWeights::uniform(config.wavelet_levels);
         let weights_luma = uniform_weights.pack_weights();
         let weights_chroma = uniform_weights.pack_weights_chroma();
-        // Inter residuals take the same dead zone as intra (INTER-2, docs/decisions/0041).
+        // Inter residuals take the same dead zone as intra (INTER-2, `docs/decisions/0043`).
         // One source of truth: this factor used to be inlined at all three of these sites.
+        //
+        // **`dead_zone_referenced`, not `dead_zone` — and that distinction is what keeps INTER-2's
+        // measurement valid** (INTRA-2, `docs/decisions/0041`). "The same dead zone as intra" was
+        // measured where `config.dead_zone` *was* the ladder's value. It no longer is: it is
+        // floored at 0.6 over q=85..95 for frames nothing predicts from, so reading it here would
+        // hand the inter path a 0.6 dead zone at those points — a configuration INTER-2 never
+        // priced. `dead_zone_referenced` is the ladder's own value, so the two changes compose and
+        // this line still means what INTER-2 measured.
         let inter_dz_mul: f32 = crate::inter_dead_zone_mul();
-        let res_dead_zone = config.dead_zone * inter_dz_mul;
+        let res_dead_zone = config.dead_zone_referenced * inter_dz_mul;
 
         let is_non_444 = info.chroma_format != ChromaFormat::Yuv444;
         let is_420 = info.chroma_format == ChromaFormat::Yuv420;

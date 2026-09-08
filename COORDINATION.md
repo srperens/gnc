@@ -234,7 +234,9 @@ then **threw away the other session's merge state.**
 merge in progress, never commits: RATE-2's work, `0036` included, was still on `ent7bpc` at
 `7c3768d`, and redoing the merge is one command. But the other session's `--abort`-shaped hole
 appears with no explanation, and the abort was performed by someone who had no idea a merge was
-underway.
+underway. Checked afterwards by the `intra1gap` session: the shared checkout is clean, no
+`MERGE_HEAD`, and every merge already on `main` is intact — **the abort left nothing stuck behind
+it**, so the only cost is one merge to redo.
 
 **The rule this needs.** There is exactly one working tree on `main` and eight sessions merge into
 it, so **look before you merge, and never abort a merge you did not start:**
@@ -252,6 +254,33 @@ already based on the current `main`.
 **And read a merge refusal literally.** "Exiting because of an unresolved conflict" with no
 conflict markers from *your* merge means the tree was already busy. `git status` distinguishes the
 two cases in one line.
+
+**`MERGE_HEAD` is the reliable half of that test and `git status` is only best-effort** — raised by
+the `intra1gap` session, and the reason matters because it is the reason the claim lock exists.
+It is *not* that a staged change is invisible: `git add` then `git status --short` prints `M  f`,
+which is exactly how the aborted merge was spotted in the first place (`M  BACKLOG.md`,
+`A  docs/decisions/0036…`, `UU  RESEARCH_LOG.md`). It is that **checking and merging are two
+operations.** Every session works in its own worktree, so the shared tree is clean right up to the
+instant a peer starts merging into it, and a clean status is a statement about the past. Same shape
+as reading BACKLOG before claiming — see "Why `next`, and not read the backlog, pick, then claim".
+
+**So take a lock, since `scripts/claim` already handles arbitrary ids:**
+
+```bash
+scripts/claim take merge-main "merging <branch>"   # non-zero: someone is merging, wait
+# ... merge in the shared checkout ...
+scripts/claim drop merge-main
+```
+
+That makes the check *be* the compare-and-swap, which the `git status` reflex cannot be. It is a
+convention, not enforcement — nothing stops a session merging without it, exactly as nothing
+stopped the session that skipped `take dr-0024`.
+
+**The abort family is wider than `merge`.** Also from `intra1gap`: `git rebase --abort`,
+`git cherry-pick --abort` and a bare `git checkout <branch>` do the same thing to a tree someone
+else is mid-operation on. The rule generalises to **never abort or switch away from an operation
+you did not start**, and `.git/` names the operation — `MERGE_HEAD`, `REBASE_HEAD`,
+`rebase-merge/`, `CHERRY_PICK_HEAD`.
 
 ## Builds queue on one lock, and that looks like a hang
 

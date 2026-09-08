@@ -2932,6 +2932,38 @@ frequency 1 everywhere the alphabet is uniform and the depth is 6). Both change 
 codebook, and therefore its bitstream, wherever clamping currently occurs. Not done for a parked
 coder.
 
+### COORD-6 — `main` moves under an in-flight measurement and nothing says so (todo, P4)
+
+**Filed as an open question, not as work, which is the whole point of the heading.** COORD-4
+counted six instances of a number being read against the wrong tree and refused the tool it was
+filed to consider (`claim measured`: 1 of 6). **Four of those six are this shape instead** —
+PAD-1 / `0039`, ENT-3 / `0025`, ARCH-3 / BUG-18, and the build-artefact near-miss — one session
+measuring correctly while `main` moves underneath, so a table's early rows and late rows come from
+different codecs. Nothing errors. The numbers are simply from two encoders and read as one.
+
+**The first step is to decide whether a cheap mechanism exists, and to close this if it does not.**
+It is deliberately not "build a mechanism". Known difficulties, so nobody rediscovers them:
+
+- The signal is not "`main` moved" — it moves constantly and most moves are irrelevant. It is
+  "`main` moved *in a way that changes encoder output*", and the only honest test of that today is
+  running the thing twice, which is what the check would exist to avoid.
+- A cheap proxy is whether the merge touched `src/` or `src/shaders/` at all. That over-warns
+  (`0045`'s diagnostic-only change is byte-identical with the env var unset) but a false warning
+  costs one `git diff` and a missed one cost a re-run of a 12-point gate.
+- It cannot live in `scripts/claim`: a claim is taken when an item is picked up, and a measurement
+  happens somewhere else entirely — that is exactly why COORD-4 refused the claim-time stamp at
+  0 of 6.
+- The measurement is usually a shell loop, not a program, so anything requiring the harness to
+  cooperate will not be adopted. Whatever this is, it has to work for `python3 scripts/meas_*.py`
+  and for a bare `for q in ...; do ./target/release/gnc ...; done`.
+
+**Success criterion:** either a mechanism a session will actually run without being told twice, or
+a written finding that none exists and the prose in COORDINATION's "Every number carries a tree" is
+the answer. **Both outcomes close this item.** A third round of prose does not.
+
+**Do not let this rot into an obligation.** If nobody has found a cheap mechanism the next time
+someone reads this, close it as answered-no and cite COORD-4's table.
+
 ### COORD-4 — priced, tool refused 1-of-6, consolidation shipped instead (**ANSWERED 2026-09-08**)
 
 **The doubt attached to this item at filing was the right one, and the measurement it asked for
@@ -2965,10 +2997,10 @@ binary, ask which tree before filing or reversing.
 
 **What would reopen this.** A seventh instance of the *cross-session* shape specifically —
 instance 1 is the only one of its kind, and one instance does not buy a tool. If two more appear,
-`claim measured` is worth building and the dirty bit is the half that matters. Instances 2, 3 and 5
-argue for something different if anyone wants it: a check that warns when `main` has moved since a
-worktree's base *while a measurement is in flight*, which is a different tool with a better hit
-rate (4 of 6) and no obvious cheap implementation.
+`claim measured` is worth building and the dirty bit is the half that matters. Instances 2, 3, 4 and 5 argue
+for something different, now filed as **COORD-6**: warn when `main` moves under an in-flight
+measurement. Better hit rate (4 of 6), no obvious cheap implementation, so it is filed as the open
+question rather than as work — and closing it answered-no is an accepted outcome.
 
 *Original filing, kept because the doubt in it was correct:*
 

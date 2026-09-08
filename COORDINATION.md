@@ -435,6 +435,7 @@ If this table and `scripts/claim list` disagree, the table is wrong.
 
 | worktree | branch | area |
 |---|---|---|
+| `../gnc-loopa` | `loopa` | **BUG-20 FIXED 2026-09-08 — the native clippy gate is `--all-targets` and the 91 warnings are cleared, not exempted.** `cargo clippy --release` reads the lib and the bins and never a test; `--all-targets` reported **91** (90 lib-test + 1 `tests/requested_limits.rs`), 88 on 2026-09-07 and 90 later that day, so the count drifts on its own. Now **0**, with no `#[allow]` added at any level. **Two of the eight lints were substantive**: `assertions_on_constants` was BUG-35's guard test asserting relations between three `const usize` values at *run* time (now `const _: () = assert!(…)`, so an arena shrink fails the build), and `unused_variables` found a dead `BufferUsages` binding in `rice_gpu.rs`. The other 89 are style, and the 27 `needless_range_loop` are the honest case for the alternative — exempting tests — which lost because there is no CI here, so step 5's clippy command is the only thing that reads this code mechanically. Decision `0062`. **Invalidates no measurement**: every edit is inside `#[cfg(test)]` code or an integration test target — nine of the eleven `src/` files have their first changed line below their own `#[cfg(test)]` marker, and the other two *are* test files (`{encoder,decoder}/pipeline_tests.rs`, included only under `#[cfg(test)]`) — so the shipped build is unchanged by construction. Filed **BUG-38** on the way — `cargo fmt --check` is red the same way and worse (566 diffs, 61 files, **504 of them in 44 files under `src/`**), heading committed with the reserved id. |
 | `../gnc-nextitem` | `nextitem` | **BUG-35 (partial) 2026-09-08.** Left a three-session pile-up on BUG-32; `claim next` handed this. Guarded the fused/rANS histogram arena (`check_hist_arena_capacity`, 5120). Measured `--rans` stills: q=15 fits at 313–335 bins; q=70 fits at 3428; q≥85 refuses at 5322–7004 (was silent corruption). **Shrinking to ≤3266 rejected** — it would refuse the q=70 `--rans` point `0035` shipped. Five over-budget rANS entry points remain. Decision `0048`. |
 | `../gnc-dx12bidir` | `dx12bidir` | **BUG-34 DONE 2026-09-08.** Storage-buffer request 10 → **9** (`gnc::required_limits()`). `block_match_bidir.wgsl` binds 9, nothing else above 7, so 10 was slack; 8 still needs a merge in that file, refused because BUG-40 holds it, B-frames are off, and it is BUG-25's crash site. Decision `0047`. Test `tests/requested_limits.rs` asserts the whole `Limits` struct against default plus that one field. No shader change, no measurement moved. Worktree name predates the claim (`next` handed BUG-34 after a multi-session BUG-32 pile-up). |
 | `../gnc-coord2` | `coord2` | **COORD-2 — `claim bug` / `claim dr` allocate the next id as the CAS.** First gap over committed `main` plus `refs/claims/*`; lost races retry. `selftest` 8+8 distinct. Record `0050` (0049 collided with BUG-40's merge). No codec change. |
@@ -822,6 +823,30 @@ the option that spends more bits. Use BD-rate, or compare at matched rate. At le
 wrong conclusions have come from this one error.
 
 ## Landed today, and what each one invalidates
+
+- **BUG-20 — test code is code, and the native clippy gate is now `--all-targets`.**
+  `docs/decisions/0062`. **Invalidates nothing measured** — every edit is inside `#[cfg(test)]`
+  code or an integration test target, so the shipped build is unchanged by construction rather
+  than by comparison. What it changes is **the gate you must run**: step 5's native command is
+  `cargo clippy --release --all-targets`, not `cargo clippy --release`. The wasm form stays
+  `--lib` (BUG-24) — the asymmetry is deliberate and CLAUDE.md now says why.
+
+  Two things worth carrying that are not about this item:
+
+  - **A gate that cannot see a class of code will accumulate warnings in it at a rate nobody
+    notices.** BUG-20 counted 88 on 2026-09-07; a later entry recorded 90; it was **91** when the
+    item was picked up two days later. Nothing regressed — the drift is just what an unread
+    directory does. The general shape: a rule enforced by a command is only as wide as the
+    command's target selection, and `--all-targets` versus the default is exactly that kind of
+    invisible narrowing.
+  - **The two findings worth having were in the two lints nobody would call noisy, and the noisy
+    lint was the bulk.** 27 of 91 were `needless_range_loop`, which is genuinely arguable in test
+    code; 2 were `assertions_on_constants`, pointing at a guard test that asserted compile-time
+    constants at run time. If the decision had been made by counting warnings it would have gone
+    the other way. **Count what the warnings are, not how many.**
+  - **And the same defect is live one gate over, unfixed: `cargo fmt --check` is red on 566 diffs
+    in 61 files, 504 of them under `src/`.** GOALS §9 requires it; no gate list mentions it.
+    Filed **BUG-38 (P4)**, deliberately not fixed while eight sessions hold those files.
 
 - **RATE-2 — a still at q = 95..=99 may now come back bit-exact, and it is smaller.**
   `docs/decisions/0036`. **This one changes output**: mean **−21.66% at q=99** on four stills, 12

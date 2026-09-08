@@ -943,9 +943,9 @@ mod tests {
     fn test_huffman_roundtrip_varied() {
         let mut coefficients = vec![0i32; 256 * 64];
         // Mix of magnitudes
-        for i in 0..coefficients.len() {
+        for (i, c) in coefficients.iter_mut().enumerate() {
             let v = (i % 256) as i32;
-            coefficients[i] = if v < 128 { 0 } else { (v - 128) * if i % 3 == 0 { -1 } else { 1 } };
+            *c = if v < 128 { 0 } else { (v - 128) * if i % 3 == 0 { -1 } else { 1 } };
         }
         let tile = huffman_encode_tile(&coefficients, 128, 3);
         let decoded = huffman_decode_tile(&tile);
@@ -983,10 +983,10 @@ mod tests {
     fn test_huffman_compression_vs_raw() {
         let mut coefficients = vec![0i32; 256 * 64];
         // Geometric-like distribution (many small values)
-        for i in 0..coefficients.len() {
+        for (i, c) in coefficients.iter_mut().enumerate() {
             let r = (i * 7 + 13) % 256;
             if r < 40 {
-                coefficients[i] = (r as i32 % 10 + 1) * if r % 2 == 0 { 1 } else { -1 };
+                *c = (r as i32 % 10 + 1) * if r % 2 == 0 { 1 } else { -1 };
             }
         }
         let tile = huffman_encode_tile(&coefficients, 128, 3);

@@ -1817,7 +1817,7 @@ by hand and is worth checking for stale citations while here.
 
 Filed 2026-09-07 by the `coord` session.
 
-### BUG-20 — the clippy gate does not cover the test targets, and 88 warnings sit there (todo, P4)
+### BUG-20 — the clippy gate does not cover the test targets, and 88 warnings sit there (**FIXED 2026-09-08**)
 
 CLAUDE.md requires **zero clippy warnings** and names the gate as `cargo clippy --release` plus
 the wasm target. Both are clean. But `cargo clippy --release --all-targets` reports
@@ -1838,6 +1838,25 @@ remaining `warning:` line on the native target is the future-incompatibility not
 third-party crate `block v0.1.6`, not a lint on this code.
 
 Filed 2026-09-07 by the `coord` session.
+
+**Fixed 2026-09-08 by the `loopa` session — the gate widened and the warnings cleared, not
+exempted.** It was **91** by the time the item was picked up (88 on 2026-09-07, 90 later that
+day): 90 in `gnc (lib test)` plus 1 in `tests/requested_limits.rs`. The native gate in CLAUDE.md
+and LOOP.md step 5 is now `cargo clippy --release --all-targets`; the wasm gate stays `--lib`
+(BUG-24). `--all-targets` reports **0**, and no `#[allow]` was added at any level.
+
+By lint: 38 `field_reassign_with_default`, 27 `needless_range_loop`, 17 `unnecessary_cast`, 4
+`unused_variables`, 2 `assertions_on_constants`, 1 each `needless_borrow`, `manual_div_ceil`,
+`manual_range_contains`. **Two of the eight were substantive** — `assertions_on_constants` was
+BUG-35's guard test asserting relations between three `const usize` values at *run* time (now
+`const _: () = assert!(…)`, so an arena shrink fails the build), and `unused_variables` found one
+dead `BufferUsages` binding in `rice_gpu.rs`. The remaining 89 are style, and the 27
+`needless_range_loop` are the strongest case for the alternative. Decision `0062` records why the
+alternative lost.
+
+Every edit is in `#[cfg(test)]` code or an integration test target, checked file by file against
+each file's `#[cfg(test)]` marker, so the shipped build is unchanged by construction and no
+figure in BASELINE moves.
 
 ### BUG-38 — `cargo fmt --check` is red across the tree, and GOALS §9 names it as a gate (todo, P4)
 

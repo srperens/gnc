@@ -62,8 +62,10 @@ project is for.
 3. Make the change.
 4. Measure again, on **≥3 sequences or images** and at **≥2 quality points**. One data point is
    an anecdote.
-5. Run `cargo test --release`, `cargo clippy --release`, and
+5. Run `cargo test --release`, `cargo clippy --release --all-targets`, and
    `cargo clippy --release --target wasm32-unknown-unknown --lib`. All three clean, every time.
+   **The native form is `--all-targets`** — plain `cargo clippy --release` never reads a test, and
+   91 warnings sat behind that for an unknown length of time (BUG-20, `docs/decisions/0062`).
 6. Write the numbers into [RESEARCH_LOG.md](RESEARCH_LOG.md) — including the failures. Update
    [BACKLOG.md](BACKLOG.md) and [BASELINE.md](BASELINE.md) if the picture changed.
 7. Commit with the numbers in the message. Push.

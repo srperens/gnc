@@ -88,6 +88,16 @@ pub struct EncoderPipeline {
     /// could not give: "the path ran once" and "a sequence took it 47 times" are different facts,
     /// and only the second one prices the encode it removes.
     pub(super) ref_from_source_frames: u32,
+    /// Serialised size of the **bit-exact** candidate the last `encode` coded, win or lose
+    /// (LOSSLESS-3, `0073`).
+    ///
+    /// `encode` codes that candidate at q = 95..=99 for RATE-2's own comparison and then throws
+    /// the number away. The sequence encoder uses it as a cheap trigger: `n` times this is what a
+    /// bit-exact all-intra encode of the whole clip costs to within a per-frame ±0.4%, so it says
+    /// whether the second pass is worth coding at all. The *decision* is then taken on two
+    /// measured totals, never on this estimate. Kept here rather than widening `encode`'s return
+    /// type, which every existing caller would have to change.
+    pub(super) last_lossless_candidate_bytes: Option<usize>,
 }
 
 impl EncoderPipeline {
@@ -760,6 +770,7 @@ impl EncoderPipeline {
             tw_cached_b: None,
             sp_cached_b: None,
             ref_from_source_frames: 0,
+            last_lossless_candidate_bytes: None,
         }
     }
 
@@ -1615,6 +1626,9 @@ impl EncoderPipeline {
             crate::format::serialize_compressed(&lossy).len(),
             crate::format::serialize_compressed(&lossless).len(),
         );
+        // LOSSLESS-3: publish the bit-exact candidate's size even when it loses, so the sequence
+        // encoder can tell whether a whole bit-exact arm is worth coding without coding it.
+        self.last_lossless_candidate_bytes = Some(lossless_bytes);
         // The canary. It prints on every frame that takes this path, whichever way it goes, so
         // "the fallback ran and chose the lossy file" is distinguishable from "the fallback did
         // not run" — a silent feature is worse than no feature (CLAUDE.md).

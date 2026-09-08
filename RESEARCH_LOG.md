@@ -723,6 +723,105 @@ theatre.
 reformatting 44 modules that eight live sessions are editing conflicts with all of them and
 carries no behaviour. It wants a quiet tree and one commit that changes nothing else.
 
+## LOSSLESS-3 — above q=95 a camera sequence is dominated by its own lossless encode, and the swap is a sequence choice, not a frame choice (2026-09-08)
+
+**Hypothesis, from LOSSLESS-2's own numbers.** RATE-2 (`0036`) found a *still* above q~95 costs
+more as a wavelet encode than as a bit-exact MED encode; RATE-3 lifted that into sequences for
+I-frames only. The P-frames were never compared against anything bit-exact, and LOSSLESS-2 had
+just taken `q=100` on crowd_run from 43.0 MB to 25.9 MB without the ladder above it moving.
+
+**Domain declaration.** Whole coded frames, container payload, compared as totals over the clip.
+The bit-exact candidate is better on *both* axes when it is smaller — fewer bytes and exact pixels
+— so there is no rate/quality trade and CLAUDE.md's metric table does not arbitrate. What still
+has to be checked is that no frame gets *worse*, because replacing frames changes what later
+frames predict from; the harness reports per-frame PSNR against source for both arms and flags any
+frame that falls.
+
+**Tree, stated because it moved under this item.** Everything below is `d10e414` + this change,
+**after BUG-47 (`0072`)**. The first take of the table predated it, and BUG-47 changed exactly the
+q=95..99 bytes: the margins came down 1-3 points and the bbb row reversed. Flagged by the RATE-4
+session mid-item, re-taken rather than adjusted. COORDINATION, "Every number carries a tree".
+
+### The defect, 8 frames, ki=9, 4:4:4
+
+| sequence | q=95 | q=97 | q=99 | bit-exact | q=99 costs |
+|---|---|---|---|---|---|
+| crowd_run | 31 427 614 | 34 374 105 | 37 984 009 | **25 856 146** | **+46.9%** |
+| old_town_cross | 31 440 634 | 34 391 448 | 38 010 958 | **25 247 023** | **+50.5%** |
+| blue_sky | 19 231 299 | 21 659 527 | 24 812 142 | **17 294 725** | **+43.5%** |
+| bbb (animation) | 17 896 639 | 20 924 647 | 24 290 268 | 25 885 896 (est.) | −6.2% |
+
+Every rung from q=95 up is dominated on camera content: more bytes than bit-exact, for pixels that
+are not exact. Animation is not dominated at any rung.
+
+### The per-frame version was built first, and it is a ratchet
+
+It is what LOSSLESS-2 does, so it was the obvious shape. Measured over 24 points: **22 improved by
+7.9-33.6%, and bbb at q=99 ki=9 came out 5.51% larger** — failing the criterion this item filed
+before implementing ("the container never larger than today's").
+
+**Why, measured rather than reasoned about.** A P-frame costs *more* when it predicts from a
+bit-exact reference than from a lossy P-frame reconstruction. Mean over frames 2-7, q=99 ki=9:
+
+| sequence | lossy reference | exact reference | |
+|---|---|---|---|
+| crowd_run | 4 968 556 | 5 210 086 | **+4.86%** |
+| old_town_cross | 4 986 250 | 5 210 913 | **+4.51%** |
+| blue_sky | 3 238 448 | 3 403 731 | **+5.10%** |
+| bbb | 3 021 205 | 3 318 982 | **+9.86%** |
+
+Four of four, so it is a mechanism: a quantised reference carries error the next frame's own
+quantiser lands on, and an exact one does not. **Replacing frame k inflates frame k+1's
+candidate**, so each greedy step makes the next likelier — every step a local win, the whole
+worse. Reverted rather than tuned: a margin big enough to protect bbb (its P-frames exceeded the
+bit-exact I by only 1.68-2.08%) would be a constant fitted to one clip, which is the thing RATE-2
+concluded cannot be done.
+
+**This is also why LOSSLESS-2 is sound at `q=100`:** there every reference is exact, so the
+coupling cannot exist and the per-frame minimum is exactly achievable. The two items are the same
+comparison and only one of them is local.
+
+### What shipped: whole arms, decided on measured totals
+
+| sequence | ki=2 (q=95/97/99) | ki=9 (q=95/97/99) |
+|---|---|---|
+| crowd_run | −10.81% / −15.68% / −20.96% | −17.73% / −24.78% / **−31.93%** |
+| old_town_cross | −12.04% / −16.90% / −22.15% | −19.70% / −26.59% / **−33.58%** |
+| blue_sky | −5.95% / −12.67% / −19.97% | −10.07% / −20.15% / **−30.30%** |
+| bbb | ±0.00% | ±0.00% |
+
+**24 of 24 points: never larger, no frame worse, no PSNR regression.** Every switched point is
+bit-exact — 8 of 8 frames md5-identical to the source PNGs through
+`encode-sequence` → `.gnv` → `decode-sequence` — and the switched file is **byte-identical to the
+`q=100` encode** of the same frames on all three camera sequences. That is the cleanest way to say
+what this does: above q≈95 on camera content, GNC now emits its lossless encode.
+
+**bbb pays nothing at all**, because the trigger does not even fire: 8 × 3 235 737 = 25 885 896
+against lossy totals of 24 943 006 (ki=2) and 24 290 268 (ki=9). No second arm is coded there.
+
+**Controls:** q=90 and q=94 sequences, q=100 sequences, and stills at q=90/97/100 are all
+byte-identical with the feature on and off. Refused when a bitrate target is set — the bit-exact
+arm ignores it. Canary prints both totals whenever the second arm is coded.
+
+### Two bugs found on the way, filed rather than folded in
+
+**BUG-46** — `lossless_sibling` drops the caller's chroma format. The RATE-2 canary reports the
+*same* bit-exact candidate at `--chroma-format 444` and `420` (3 257 157 B both), so on subsampled
+input the comparison is against a 4:4:4 arm with three times the chroma and can essentially never
+fire. LOSSLESS-3 is gated to 4:4:4 because its trigger reads that number.
+
+**BUG-48** — `quality_preset(100)` keeps PAD-1's decay padding fill, and at q=100 that is a
+**loss**: crowd_run frame 0 3 240 148 vs 3 214 874 replicate (**−0.78%**), bbb frame 0 3 257 157 vs
+3 235 737 (**−0.66%**). PAD-1's −4.63% was gated on q=80..94. Found because this item's arm was
+0.78% larger than a plain `q=100` encode of the same frames until the flag was cleared — and the
+first explanation offered for that gap, "the fill is worth 0.77% here", was **tested and wrong in
+the other direction**: at q=100 on the *sequence* path the fill makes no difference at all, because
+that path already clears it.
+
+Decision `docs/decisions/0073`.
+
+---
+
 ## LOSSLESS-2 — a lossless P-frame competes with an I-frame of the same picture, and on camera content it loses by 75-80% (2026-09-08)
 
 **Hypothesis, and it was the item's own question.** BUG-39 (`0064`) made `q=100` video bit-exact,

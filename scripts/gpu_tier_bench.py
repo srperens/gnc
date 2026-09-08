@@ -20,12 +20,18 @@ makes a reading slower, so the *minimum* over repeats is the least contaminated
 estimate. `median / best` is printed beside it as a free settled-or-not diagnostic:
 near 1.0 means the number is quotable, well above means keep only the ratios.
 
+`-i` is a still frame (PNG) and `--clip` is a Y4M sequence. They are different inputs
+because the modes need different ones: `--tier` and `--density-still` loop the GPU on one
+frame, `--density` and `--hwenc` sweep a clip. `--all` needs both, and before 2026-09-08 it
+passed one `-i` to every mode, so it could not run.
+
 Examples
 --------
     python scripts/gpu_tier_bench.py --list
-    python scripts/gpu_tier_bench.py --tier   -i frames/bbb_1080p.png
-    python scripts/gpu_tier_bench.py --density -i clip.y4m --adapter nvidia
-    python scripts/gpu_tier_bench.py --hwenc  -i clip.y4m --encoder h264_nvenc
+    python scripts/gpu_tier_bench.py --tier          -i frames/bbb_1080p.png
+    python scripts/gpu_tier_bench.py --density-still -i frames/bbb_1080p.png --adapter nvidia
+    python scripts/gpu_tier_bench.py --hwenc  --clip clip.y4m --encoder h264_nvenc
+    python scripts/gpu_tier_bench.py --all -i frames/bbb_1080p.png --clip clip.y4m
 """
 
 from __future__ import annotations
@@ -359,16 +365,24 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--binary", type=Path, default=default_binary())
-    ap.add_argument("-i", "--input", type=Path, help="PNG frame for --tier, Y4M clip otherwise")
+    ap.add_argument("-i", "--input", type=Path,
+                    help="still frame (PNG) for --tier and --density-still")
+    ap.add_argument("--clip", type=Path,
+                    help="Y4M sequence for --density and --hwenc. Defaults to --input, which "
+                         "is wrong for every mode that needs a clip — pass it explicitly")
     ap.add_argument("--list", action="store_true", help="list adapters and exit")
     ap.add_argument("--tier", action="store_true", help="CANARY-1: encode time per GPU")
-    ap.add_argument("--density", action="store_true", help="MEAS-5: concurrent GNC encodes")
+    ap.add_argument("--density", action="store_true",
+                    help="MEAS-5 through `benchmark-sequence`. BUG-32: 86%% of that wall clock is "
+                         "CPU quality metrics, so swept concurrently it measures how well N SSIM "
+                         "computations share the CPU. Prefer --density-still")
     ap.add_argument("--density-still", action="store_true",
                     help="MEAS-5 through `benchmark` on one frame: no CPU quality metrics, "
                          "so it measures GPU encode rather than SSIM throughput")
     ap.add_argument("--hwenc", action="store_true", help="MEAS-5: the same sweep through NVENC/QSV")
-    ap.add_argument("--all", action="store_true", help="tier, then density, then hwenc")
-    ap.add_argument("--adapter", help="GNC_GPU_ADAPTER substring for --density")
+    ap.add_argument("--all", action="store_true",
+                    help="tier, then density-still, then hwenc. Not --density: see BUG-32")
+    ap.add_argument("--adapter", help="GNC_GPU_ADAPTER substring for the density sweeps")
     ap.add_argument("--encoder", default="h264_nvenc", help="ffmpeg hardware encoder for --hwenc")
     ap.add_argument("--preset", default="p7", help="hardware encoder preset (p7 = slowest/best)")
     ap.add_argument("--qp", type=int, default=18, help="hardware encoder constant QP")
@@ -397,6 +411,16 @@ def main() -> None:
         return
 
     levels = [int(x) for x in args.levels.split(",") if x.strip()]
+    # A still frame handed to the clip modes is not a fallback, it is a silent wrong
+    # answer: ffmpeg fails on every instance and `hwenc_density` reports 0 completions,
+    # which prints as "stopped completing at N=1" — indistinguishable from the driver
+    # session cap this harness exists to find.
+    clip = args.clip or (args.input if args.input
+                         and args.input.suffix.lower() in (".y4m", ".yuv") else None)
+    if (args.density or args.hwenc or args.all) and not clip:
+        sys.exit("--density, --hwenc and --all need --clip <y4m>. "
+                 f"-i {args.input} is a still frame, and a still frame handed to the "
+                 "fixed-function arm reads as a session cap rather than as an error.")
     if (args.density or args.hwenc or args.all) and args.frames < 60:
         print(f"\n**--frames {args.frames} is short for a density measurement.** Per-process "
               "startup is a fixed cost paid once per instance, and GNC pays more of it than a "
@@ -407,7 +431,7 @@ def main() -> None:
                     "processor": platform.processor()},
         "adapters": adapters,
         "params": vars(args) | {"binary": str(args.binary), "input": str(args.input),
-                                "json": str(args.json)},
+                                "clip": str(clip), "json": str(args.json)},
     }
 
     print(f"# GNC GPU tier report — {platform.system()} {platform.release()}")
@@ -429,10 +453,14 @@ def main() -> None:
                                  args.repeats, args.iterations, args.quality)
         print_tier(out["tier"])
 
-    if args.density or args.all:
-        if not args.input:
-            sys.exit("--density needs -i <y4m clip>")
-        out["density"] = density(args.binary, args.input, args.frames, args.quality,
+    if args.density:
+        print("\n**--density is the instrument BUG-32 characterised, not the GPU.** "
+              "`benchmark-sequence` spends 86% of its wall clock on CPU-side PSNR and SSIM "
+              "for two encode arms, and retains the whole decoded sequence, so `frames / wall` "
+              "swept concurrently measures how well N metric computations share the CPU. It is "
+              "kept because the inter path is the shipped configuration and --density-still "
+              "cannot reach it; read the rows as completion counts, not as throughput.")
+        out["density"] = density(args.binary, clip, args.frames, args.quality,
                                  args.keyframe_interval, levels, args.adapter)
         print_density(f"MEAS-5 — GNC, {args.frames} frames at q={args.quality}"
                       + (f", adapter={args.adapter}" if args.adapter else ""),
@@ -441,9 +469,9 @@ def main() -> None:
                       "Sub-linear scaling is expected — the question is how far it goes before "
                       "it flattens.")
 
-    if args.density_still:
+    if args.density_still or args.all:
         if not args.input:
-            sys.exit("--density-still needs -i <image>")
+            sys.exit("--density-still needs -i <still frame>")
         rows = density_still(args.binary, args.input, args.iterations, args.quality,
                              levels, args.adapter)
         out["density_still"] = rows
@@ -465,10 +493,8 @@ def main() -> None:
         ffmpeg = shutil.which("ffmpeg")
         if not ffmpeg:
             print("\n(skipping --hwenc: no ffmpeg on PATH)")
-        elif not args.input:
-            sys.exit("--hwenc needs -i <y4m clip>")
         else:
-            out["hwenc"] = hwenc_density(ffmpeg, args.input, args.encoder, args.preset,
+            out["hwenc"] = hwenc_density(ffmpeg, clip, args.encoder, args.preset,
                                          args.qp, args.frames, levels,
                                          args.keyframe_interval)
             uses_preset = "nvenc" in args.encoder or "qsv" in args.encoder

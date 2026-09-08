@@ -1340,6 +1340,43 @@ preset and manual paths agree and that the library default still permits B-frame
 No decision record: no default changed. The shipped default was already P-only since 2026-09-06;
 this makes four CLI paths actually honour it.
 
+### BUG-40 — the eager `block_match_bidir` pipeline is BUG-25's shape on DX12 (todo, P2)
+
+Filed 2026-09-08 while updating `docs/GPU_TIER_TEST.md` for a third laptop round. Not a new
+measurement — the crash was recorded on 2026-09-08 and never given an id.
+
+**Every DX12 encode dies at pipeline creation**, before a pixel is read, with an FXC HLSL compile
+error: `X3695: race condition writing to shared` in **`block_match_bidir.wgsl`** (line 260) —
+on both Intel Arc Pro and NVIDIA RTX 2000 Ada. naga's generated HLSL trips FXC's groupshared
+race check; the same WGSL compiles under Vulkan/naga-SPIR-V. Distinct from BUG-25: different
+backend, different compiler, different shader.
+
+**The reason it stops an *intra* encode is a pipeline-creation choice, not the shader.**
+`split_pipeline` is lazy (`OnceCell`, `src/encoder/motion.rs:1183`) and stayed lazy after BUG-25
+was fixed, on the rule rather than the bug — *a shader's cost, including the risk that it does
+not compile, is paid by the feature that uses it and not by everything else.*
+`match_bidir_pipeline` never got that treatment: `MotionEstimator::new` creates it eagerly
+(`src/encoder/motion.rs:317`). B-frames have been off by default since BUG-5 and the pyramid has
+been suppressed since 2026-09-06, so **the default path compiles a bidirectional
+motion-estimation shader it will never dispatch, and one backend dies on it.** That is exactly
+the failure BUG-25's laziness was introduced to stop.
+
+**Two halves, and the cheap one comes first.**
+
+1. **Make `match_bidir_pipeline` lazy**, mirroring `split_pipeline` — the pattern, the layout
+   and the doc comment already exist a thousand lines below it. Also `compensate_bidir_pipeline`
+   (`:364`), which is on the same feature. Costs nothing on any working backend and is testable
+   here: Metal must stay byte-identical.
+2. **Then the shader.** Whether FXC's complaint is a real groupshared race or an
+   over-conservative check is unknown and is the part that needs a Windows machine. Note
+   `block_match_bidir.wgsl` is also the file BUG-34 wants to shed a storage buffer from — three
+   open reasons for caution in one low-traffic file.
+
+**Success criterion:** an intra DX12 encode on Windows either completes or fails on something
+that is not a shader it does not use. **Why P2:** it invalidates no measurement and blocks
+nothing on Vulkan or Metal, but GOALS rule 4 claims DX12 and step 1 is close to free. Step 1
+alone converts "DX12 does not run GNC" into a measurement.
+
 ### BUG-34 — GNC requests 10 storage buffers per stage against a default of 8 (todo, P2)
 
 Filed 2026-09-08 by ENT-7, found while checking a literature brief's claim about the WebGPU

@@ -149,19 +149,33 @@ being followed correctly.** A live session held `dr-0029` through `scripts/claim
 CAS on `refs/claims/dr-NNNN`, and **nothing in it ever reads `docs/decisions/`**, so a number that
 has been committed all afternoon reserves cleanly. Reserving is what handed out the collision.
 
-So the rule earns its keep against *other sessions* and does nothing against the *namespace*. One
-more habit closes that, and it is the cheap half of what COORD-2 will automate:
+**And the second half of it, from the session that hit it:** its worktree was based on `1437d72`,
+so `docs/decisions/` *in that worktree* listed only up to `0028`. The BUG-25 record landed after
+its base. **Reserving from a stale base is indistinguishable from reserving a free number** — the
+session checked, and what it checked was its own working tree.
+
+So the rule earns its keep against *other sessions* and does nothing against the *namespace*, and
+`ls docs/decisions/` is the wrong oracle for the namespace. **`git ls-tree` is the right one**, and
+it needs no fetch and no rebase, because every worktree shares one `.git`:
 
 ```bash
-git fetch && git log --oneline -1 origin/main   # a reservation against a stale checkout reserves
-ls docs/decisions/                              # whatever was free when you last pulled
+git ls-tree --name-only main docs/decisions/   # what is taken on committed main, from anywhere
+scripts/claim list                             # what other sessions hold but have not written
 scripts/claim take dr-00NN "why"
 ```
 
+`ls` answers "what is in my working tree", which is neither of those two questions. Demonstrated
+both ways in `gnc-ent7bpc` on 2026-09-08: `git ls-tree main` showed `0029` while the worktree's own
+`ls` did not, and later `ls` showed a `0030` that was not yet on `main`. **This habit would also
+have caught the `0018`, `0024` and `0027` pairs**, where the other session had already committed —
+so it is strictly better than the "reserve first" rule above, not an addition to it, and it is the
+cheap half of what COORD-2 will automate.
+
 Caught this time by reading `scripts/claim list` against `ls docs/decisions/` during unrelated
-cleanup, before the file was written — which is luck, not process. **COORD-2 is the fix**; its
-build spec already says the free-number scan must read committed `main` *and* `refs/claims/*`, and
-today's case is now recorded there as the instance the interim habits cannot cover.
+cleanup, before the file was written — luck, not process. The right-oracle correction came from the
+ENT-7 session, which renumbered to `0030` before anything referenced `0029`. **COORD-2 is the
+fix**; its build spec already says the free-number scan must read committed `main` *and*
+`refs/claims/*`, and today's case is recorded there as the instance the interim habits cannot cover.
 
 **Four more records are colliding and nobody has renumbered them: `0018` twice and `0019`
 twice** (a fifth case, `0020`, was renumbered by hand). Filed as **BUG-19** — the fix is

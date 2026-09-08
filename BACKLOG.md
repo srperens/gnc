@@ -1951,11 +1951,16 @@ cleanup, before the file was written.
 
 **That matters because it is the case the interim habits do not cover.** COORDINATION's mitigation
 is "reserve the number before you write the file", and this session did exactly that; reserving is
-what produced the wrong number. So the two habits below protect against sessions racing each other
-and not against the namespace itself. Until `claim dr` exists, the third habit is the one that
-actually works here: **`git fetch && ls docs/decisions/` on up-to-date `main` immediately before
-writing the file**, because a reservation taken against a stale checkout is a reservation of
-whatever was free when you last pulled.
+what produced the wrong number. Its worktree was based on `1437d72`, so `docs/decisions/` *there*
+listed only up to `0028` — **reserving from a stale base is indistinguishable from reserving a free
+number.**
+
+Until `claim dr` exists, the habit that actually works is **`git ls-tree --name-only main
+docs/decisions/`**, which reads committed `main` from any worktree with no fetch and no rebase,
+since every worktree shares one `.git`. `ls docs/decisions/` is the wrong oracle in both
+directions: it misses records committed after your base and shows records that are not on `main`
+yet. That command would also have caught the `0018`, `0024` and `0027` pairs, where the other
+session had already committed — so it supersedes "reserve first" rather than adding to it.
 
 **What to build:** `scripts/claim bug "<why>"` and `scripts/claim dr "<why>"`, each allocating the
 next free number *as* the compare-and-swap that reserves it — the same mechanism `claim next`
@@ -1974,8 +1979,9 @@ P-number, and the honest read is that this is cheap, frequent churn — the argu
 the tax and the `dr-0029` class the habits cannot cover, not a correctness risk that appeared. Three cheap habits until it exists, all from
 COORDINATION: reserve the id before you write the heading; **push a filing quickly rather than
 holding it in a worktree** — an id that exists only locally is invisible to the mechanism that
-would protect it; and **re-read the namespace on fresh `main` just before you write**, since
-reserving does not consult it. Also worth pairing with the BUG-32 lesson: commit the heading or the
+would protect it; and **read the namespace with `git ls-tree --name-only main
+docs/decisions/` just before you write**, since reserving does not consult it and your working tree
+is not it. Also worth pairing with the BUG-32 lesson: commit the heading or the
 record stub *with* the reservation, so a reserved id that outlives its session is a filed item
 rather than a claim on nothing.
 

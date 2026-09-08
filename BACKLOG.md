@@ -4508,7 +4508,46 @@ peer's number is not the same as reading their tree.
 frame's reference is *not* simply its colour-converted source, because that buffer is at a
 different stage and scale. RATE-4 records the refutation.
 
-### LOSSLESS-2 — at `q=100` inter costs +38% on camera content and wins 1.6% on animation (todo, P2)
+### LOSSLESS-3 — above q=95 a camera sequence costs more than bit-exact lossless, for worse pixels (todo, **P1**)
+
+Filed 2026-09-08 by LOSSLESS-2, which is what exposed it: `q=100` on crowd_run went from 43.0 MB
+to 25.9 MB, and the lossy ladder above it did not move. 8 frames, ki=9, 4:4:4, container bytes:
+
+| sequence | q=95 | q=97 | q=99 | q=100 (bit-exact) | q=99 costs |
+|---|---|---|---|---|---|
+| crowd_run | 31 697 550 | 34 672 332 | 38 326 055 | **25 856 146** | **+48.2%** |
+| old_town_cross | 31 669 932 | 34 646 281 | 38 297 084 | **25 247 023** | **+51.7%** |
+| bbb (animation) | 17 896 639 | 20 924 647 | 24 708 560 | 25 183 470 | −1.9% |
+
+On camera content **every rung from q=95 up is dominated**: more bytes than bit-exact lossless for
+pixels that are not exact. q=95 is already +22.6% (crowd_run) and +25.4% (old_town_cross).
+Animation is not dominated — bbb's q=99 is 1.9% cheaper than lossless — which is the same content
+split as LOSSLESS-2 and `0023`.
+
+**This is RATE-2 (`0036`) one level up.** RATE-2 found the same thing on *stills* (+28.9% mean at
+q=99) and fixed it by coding both ways and keeping the smaller file; RATE-3 lifted that into
+sequences **for I-frames only**. A sequence's P-frames at q=95-99 are still wavelet-coded and
+nothing compares them against a bit-exact alternative.
+
+**The shape that follows from LOSSLESS-2, and why it is the same two-axis win RATE-2 had.**
+Compare a lossy P-frame against a **bit-exact I-frame of the same picture**
+(`lossless_sibling`, already built). If the bit-exact candidate is smaller it wins on *both* axes
+— fewer bytes and exact pixels — so again no BD-rate and no metric arbitration. It also improves
+what later frames predict from, since a bit-exact reference cannot drift, so the saving should
+compound down the GOP rather than dilute. **That last part is a prediction and must be measured,
+not assumed.**
+
+**What must be checked before believing it:** RATE-3 (`0040`) found that a bit-exact I-frame is
+*not* a drop-in reference — it broke the P-frames that referenced it until the encoder's local
+decode was fixed to invert what it coded (`0042`). Read `0040` and `0042` first; the failure mode
+is that encoder and decoder end up holding different references.
+
+**Success criteria:** at q=95/97/99 on ≥3 sequences and both ki, the container never larger than
+today's, worst-frame PSNR never lower, and every frame the encoder marks bit-exact verified
+outside the harness (md5 against source, the `0036` standard). Report the animation case
+separately — it is the one that can regress.
+
+### LOSSLESS-2 — at `q=100` a P-frame competes with an I-frame of the same picture, and loses on camera content (**DONE 2026-09-08**)
 
 **Measured at identical pixels, which is the cleanest form this comparison can take.** Both arms
 are bit-exact since BUG-39 closed, so this is exact bytes at equal quality, not a BD-rate
@@ -4531,6 +4570,52 @@ worst-frame) — past the wash into a loss.
 **The question:** should a lossless configuration code P-frames at all, or fall back to all-intra
 (per frame, on an RD decision, or per sequence)? It bears on a GOALS §1 row, and the honest
 answer may be that `q=100` video is all-intra by construction — which is what FFV1 does.
+
+**SHIPPED 2026-09-08. `q=100` re-codes a P-frame as an I-frame when it is larger; the shipped
+encoder equals the per-frame minimum to the byte on 8 of 8 points.** Decision `0070`,
+`docs/decisions/0070-a-lossless-p-frame-competes-with-an-i-frame-and-usually-loses.md`.
+
+| sequence | ki | before | shipped | | mix |
+|---|---|---|---|---|---|
+| crowd_run | 2 | 35 712 641 | 25 855 950 | **−27.6%** | 4I+4P → 8I+0P |
+| crowd_run | 9 | 43 003 751 | 25 855 950 | **−39.9%** | 1I+7P → 8I+0P |
+| old_town_cross | 2 | 35 209 443 | 25 246 827 | **−28.3%** | 4I+4P → 8I+0P |
+| old_town_cross | 9 | 42 778 003 | 25 246 827 | **−41.0%** | 1I+7P → 8I+0P |
+| blue_sky | 2 | 23 911 136 | 17 294 529 | **−27.7%** | 4I+4P → 8I+0P |
+| blue_sky | 9 | 28 942 166 | 17 294 529 | **−40.2%** | 1I+7P → 8I+0P |
+| bbb | 2 | 25 484 805 | 25 484 805 | ±0 | 4I+4P unchanged |
+| bbb | 9 | 25 183 274 | 25 183 274 | ±0 | 1I+7P unchanged |
+
+**Still bit-exact, verified outside the harness:** 32 of 32 frames md5-identical to their source
+PNGs through `encode-sequence` → `.gnv` → `decode-sequence` (ffmpeg rawvideo), on both the
+re-coded path (old_town_cross) and the kept-P path (bbb), ki=2 and ki=9. **Nothing below q=100
+moved** — crowd_run q=90 and q=99 at ki=2 and 9 are byte-identical with the feature on and off.
+
+**The answer to the item's question is "per frame", and the two rejected shapes are priced.**
+A per-*sequence* latch captures 100% of the gain on all eight points above, because the sign never
+varies inside a shot — but on a synthetic shot cut (4 frames bbb + 4 frames crowd_run, ki=9) the
+per-frame rule gives **25 562 037 B** against **32 938 051 B** for the keep-P latch and
+**25 879 801 B** for all-intra: it beats *both* per-sequence answers by keeping the animation
+shot's P-frames and refusing the camera shot's. And coding both ways per frame (RATE-2's shape)
+buys **0.00%** over comparing against the previous I-frame, whose size varies ±0.4% inside a shot,
+for double the encode.
+
+**Why not "q=100 is all-intra by construction", which is what FFV1 does:** a lossless P-frame over
+a *static* picture is **156 B against the I-frame's 61 414 B** (`tests/lossless2_intra_recode.rs`),
+394x cheaper. Refusing P-frames outright would inflate locked-off camera and graphics content by
+orders of magnitude.
+
+**Canary** — `GNC: LOSSLESS-2 frame N — P … B vs previous I … B (±…%), re-coding as I | keeping
+the P-frame`, printed on every lossless P-frame whichever way it goes.
+`GNC_LOSSLESS_INTRA_RECODE=0` restores the old behaviour, which is how the "before" column above
+was taken from the same binary. Harness: `scripts/meas_lossless2_inter.py`.
+
+**Noticed on the way, and filed rather than folded in: LOSSLESS-3.** Now that `q=100` is
+25.9 MB on crowd_run, the whole top of the *lossy* sequence ladder is dominated on camera content
+— q=95 costs +22.6%, q=99 **+48.2%**, for pixels that are not exact. That is RATE-2's still-image
+finding one level up, and this change is what exposed it.
+
+**The original filing follows.**
 
 **Startable now** — BUG-39 is closed and these numbers are taken after it.
 
@@ -6716,6 +6801,16 @@ The 256-stream precedent does not transfer, and why matters: there each coder ha
 by coefficients with |v| > 2 — still hundreds to thousands of decisions each. Where the adaptive
 arm *beats* the pooled bound it is tracking statistics that vary within the block, which a pooled
 estimate cannot.
+
+**The denominator was checked rather than assumed, and it barely moves.** Every candidate-A figure
+above is a share of *the coder's own bits*, while ENT-9's gate is a share of **total rate** — not
+the same denominator, and the difference runs against the item. Adding the per-block length
+fields, which ride along unchanged in both arms, moves it by **≤0.01 points** (crowd_run −8.37% →
+−8.37%, bbb_extended −2.49% → −2.49%, old_town_cross −8.70% → −8.69%): the fields are a few KB
+against 2.9–5.0 MB of abac tile bytes per frame. What is still uncounted is frame headers and
+motion vectors, which abac does not code — at q=99 the tiles dominate the frame, so the total-rate
+figure will be close but strictly smaller, and only a real encode settles it. **The gate is still
+not cleared; the bound is.**
 
 **What it clears, precisely.** The *bound*, on three of three at q=99. **Not** ENT-9's gate, which
 is ≥2% of **total rate** at bit-identical pixels — a real encode, and total rate carries the

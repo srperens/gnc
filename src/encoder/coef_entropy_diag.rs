@@ -908,9 +908,16 @@ fn abac_init_table(
 /// the 18 they join. If the pooled win survives per-block cold starts, the shader work is worth
 /// starting; if it evaporates, ENT-9 closes here and cheaply.
 fn prefix_ctx_summary(stats: &[Vec<BandStats>]) {
-    let (cold, prefix, blocks) = stats.iter().flatten().fold((0.0, 0.0, 0u64), |(c, p, n), st| {
-        (c + st.adapt_cold, p + st.adapt_prefix, n + st.blocks)
-    });
+    let (cold, prefix, len_bytes, shipped, blocks) =
+        stats.iter().flatten().fold((0.0, 0.0, 0.0, 0.0, 0u64), |(c, p, l, s, n), st| {
+            (
+                c + st.adapt_cold,
+                p + st.adapt_prefix,
+                l + (st.shipped_bytes - st.payload_bytes),
+                s + st.shipped_bytes,
+                n + st.blocks,
+            )
+        });
     if blocks == 0 || cold <= 0.0 {
         return;
     }
@@ -921,8 +928,19 @@ fn prefix_ctx_summary(stats: &[Vec<BandStats>]) {
         prefix / 8.0,
         100.0 * (prefix - cold) / cold,
     );
+    // ENT-9's gate is a share of *total* rate and the coder's own bits are not that. The
+    // per-block length fields ride along unchanged, so adding them to both arms moves the
+    // denominator the right way. The frame still carries headers and, on a P frame, motion
+    // vectors that abac does not code, so even this overstates the share of the whole file.
+    let with_len = 100.0 * (prefix - cold) / (cold + len_bytes * 8.0);
     eprintln!(
-        "    (step 1b's pooled bound for the same change is printed above as \"candidate A\";          a pooled figure that does not survive this is not a win)"
+        "    plus the {len_bytes:.0} B of per-block length fields, unchanged in both arms: {with_len:+.2}% of the frame's {shipped:.0} B of abac tile bytes"
+    );
+    eprintln!(
+        "    (still not the gate: a frame carries headers and MVs abac does not code, so the share of total file rate is smaller again)"
+    );
+    eprintln!(
+        "    (step 1b's pooled bound for the same change is printed above as \"candidate A\"; a pooled figure that does not survive this is not a win)"
     );
 }
 

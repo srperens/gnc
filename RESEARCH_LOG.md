@@ -480,6 +480,16 @@ by coefficients with |v| > 2 — still hundreds to thousands of decisions each. 
 arm *beats* the pooled bound it is tracking statistics that vary within the block, which a pooled
 estimate cannot.
 
+**The denominator was checked rather than assumed, and it barely moves.** Every candidate-A figure
+above is a share of *the coder's own bits*, while ENT-9's gate is a share of **total rate** — not
+the same denominator, and the difference runs against the item. Adding the per-block length
+fields, which ride along unchanged in both arms, moves it by **≤0.01 points** (crowd_run −8.37% →
+−8.37%, bbb_extended −2.49% → −2.49%, old_town_cross −8.70% → −8.69%): the fields are a few KB
+against 2.9–5.0 MB of abac tile bytes per frame. What is still uncounted is frame headers and
+motion vectors, which abac does not code — at q=99 the tiles dominate the frame, so the total-rate
+figure will be close but strictly smaller, and only a real encode settles it. **The gate is still
+not cleared; the bound is.**
+
 **What it clears, precisely.** The *bound*, on three of three at q=99. **Not** ENT-9's gate, which
 is ≥2% of **total rate** at bit-identical pixels — a real encode, and total rate carries the
 per-block length fields and container overhead these figures exclude. What is left is
@@ -616,6 +626,111 @@ theatre.
 **BUG-38 (P4)** with the heading committed alongside the reserved id, not fixed here:
 reformatting 44 modules that eight live sessions are editing conflicts with all of them and
 carries no behaviour. It wants a quiet tree and one commit that changes nothing else.
+
+## LOSSLESS-2 — a lossless P-frame competes with an I-frame of the same picture, and on camera content it loses by 75-80% (2026-09-08)
+
+**Hypothesis, and it was the item's own question.** BUG-39 (`0064`) made `q=100` video bit-exact,
+which turned "should a lossless configuration code P-frames at all" from an unanswerable
+rate/quality trade into an exact byte comparison. The item asked whether the answer belongs to the
+sequence or to the frame.
+
+**Domain declaration.** Whole coded frames — container payload per frame as the encoder reports it
+(`byte_size()`, which serialises since the 2026-09-05 correction) — at identical pixels. Not a
+BD-rate: both candidates for a frame decode to the *source*, so bytes are the only axis, and
+CLAUDE.md's metric table does not apply because there is no quality difference to measure.
+
+**The property the whole item rests on, stated before measuring and then checked.** At `q=100` a
+frame's reconstruction is its source frame whichever way it was coded, so **a P-frame predicts from
+the same pixels no matter what the frames before it chose** and its byte count is independent of
+those choices. That makes `sum_i min(I_i, P_i)` *achievable by a real encoder* rather than an
+oracle bound. Checked rather than assumed: `scripts/meas_lossless2_inter.py` compares the
+all-intra arm's frame *i* against the I-frames the I+P arm codes at the same index and voids the
+run on any mismatch. It never fired.
+
+### Before: what coding a lossless P-frame costs
+
+8 frames, `q=100`, 4:4:4, `GNC_LOSSLESS_INTRA_RECODE=0` against `-k 1`, one binary
+(`676b25d3…`):
+
+| sequence | ki | I+P | all-intra | I+P costs | P-frames that beat their own I-frame |
+|---|---|---|---|---|---|
+| crowd_run | 2 / 9 | 35 712 641 / 43 003 751 | 25 855 950 | **+38.1% / +66.3%** | 0 of 4 / 0 of 7 |
+| old_town_cross | 2 / 9 | 35 209 443 / 42 778 003 | 25 246 827 | **+39.5% / +69.4%** | 0 of 4 / 0 of 7 |
+| blue_sky | 2 / 9 | 23 911 136 / 28 942 166 | 17 294 529 | **+38.3% / +67.4%** | 0 of 4 / 0 of 7 |
+| bbb | 2 / 9 | 25 484 805 / 25 183 274 | 25 899 452 | −1.6% / −2.8% | 4 of 4 / 7 of 7 |
+
+Per frame the margin is **+74.6% to +80.8%** on camera content and **−2.8% to −3.3%** on
+animation. The first three sequences reproduce BACKLOG's table to the byte.
+
+### The finding that decided the shape: inside a shot there is no per-frame variation
+
+**Every P-frame in a sequence goes the same way, by a wide and uniform margin.** So
+`sum_i min(I_i, P_i)` equals `min(all-intra, I+P)` on 8 of 8 points — a per-frame rule buys
+**0.00%** over a per-sequence one on homogeneous content. The split is a content property, not a
+frame property, which is the same shape `0023` found for the B-pyramid.
+
+**That is an argument for per-sequence, and it is wrong, because content is not homogeneous.** A
+synthetic shot cut — 4 frames bbb followed by 4 frames crowd_run, ki=9, one 1080p clip:
+
+| arm | bytes | |
+|---|---|---|
+| keep every P (what a first-P probe latches onto here) | 32 938 051 | |
+| all-intra | 25 879 801 | |
+| **per-frame** | **25 562 037** | **−22.4% / −1.2%** |
+
+Per-frame beats *both* per-sequence answers: it keeps the animation shot's P-frames and refuses
+the camera shot's. The scene-cut detector inserts the keyframe at the cut on its own; what the
+per-frame rule adds is the three frames after it.
+
+### What shipped, and why the estimate is the previous I-frame rather than a second encode
+
+**Code the P-frame; if it serialises larger than the previous I-frame, re-code the frame as an
+I-frame and keep that.** One extra encode, only on frames that lose. RATE-2's shape (`0036`) —
+code both ways every time — would double every P-frame encode to buy **0.00%**: I-frame sizes vary
+**±0.4%** inside a shot, and at a shot change the scene-cut detector refreshes the estimate by
+inserting a keyframe.
+
+Shipped result, same eight points: **equal to the per-frame minimum to the byte on 8 of 8.**
+−27.6% / −39.9% (crowd_run), −28.3% / −41.0% (old_town_cross), −27.7% / −40.2% (blue_sky), **±0 on
+bbb, which keeps every P-frame.**
+
+### Controls
+
+- **Still bit-exact:** 32 of 32 frames md5-identical to their source PNGs through
+  `encode-sequence` → `.gnv` → `decode-sequence` (ffmpeg rawvideo, the `0036` standard), on the
+  re-coded path (old_town_cross) and the kept-P path (bbb), ki=2 and 9.
+- **Nothing below q=100 moved:** crowd_run q=90 and q=99, ki=2 and 9, byte-identical with the
+  feature on and off. The gate is `is_lossless()`.
+- **Canary** on every lossless P-frame, both directions:
+  `GNC: LOSSLESS-2 frame 3 — P 5635309 B vs previous I 3165573 B (+78.02%), re-coding as I`.
+
+### Two things the tests taught, both of which were wrong in the first draft
+
+1. **Pure uniform noise is a tie, not a loss.** The first regression test used fresh 0..255 noise
+   per frame expecting the P-frame to lose; it measured **245 309 B against 245 382 B, ±0.03%** —
+   both paths hit the same incompressible floor. The camera mechanism needs a *predictable* picture
+   with independent grain: MED predicts the smooth part, so intra pays one grain field and inter
+   pays the difference of two. Re-written that way the margin is a consistent +0.37% to +0.50%.
+2. **The first version of the noise test passed for the wrong reason.** Independent noise is a
+   scene cut at every frame, so the detector was forcing keyframes and the assertion "all Intra"
+   held without the new code running at all. `scene_cut_threshold = 0.0` in the test config is what
+   makes it test this item. A canary that cannot fail is not a canary.
+
+`tests/lossless2_intra_recode.rs`: three tests — grainy → all-intra and bit-exact, static → keeps
+its P-frames and bit-exact, q=99 → frame types untouched. The static one carries the number that
+kills the simplest alternative: **a lossless P-frame over a static picture is 156 B against the
+I-frame's 61 414 B, 394x cheaper.** "q=100 is all-intra by construction", which is what FFV1 does,
+would inflate locked-off camera and graphics content by orders of magnitude.
+
+### Noticed, not caused — filed as LOSSLESS-3 (P1)
+
+With `q=100` on crowd_run down from 43.0 MB to 25.9 MB, the top of the *lossy* sequence ladder is
+now dominated on camera content: q=95 **+22.6%**, q=97 +34.1%, q=99 **+48.2%** against bit-exact,
+for pixels that are not exact (old_town_cross: +25.4% / +37.2% / +51.7%). Animation is not
+dominated — bbb q=99 is 1.9% cheaper than lossless. That is RATE-2's still-image finding one level
+up, and this change is what exposed it. Decision `docs/decisions/0070`.
+
+---
 
 ## BUG-39 — lossless video works: a fractional prediction cannot survive a step-1.0 quantiser (2026-09-08)
 

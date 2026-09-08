@@ -163,6 +163,16 @@ is worth keeping: that case gave each coder ~256 symbols to learn 18 contexts on
 adaptive arm *beats* the pooled bound, it is doing something a pooled estimate cannot: tracking
 statistics that vary within the block.
 
+**The denominator was checked rather than assumed, and it barely moves.** Every candidate-A figure
+above is a share of *the coder's own bits*, while ENT-9's gate is a share of **total rate** — not
+the same denominator, and the difference runs against the item. Adding the per-block length
+fields, which ride along unchanged in both arms, moves it by **≤0.01 points** (crowd_run −8.37% →
+−8.37%, bbb_extended −2.49% → −2.49%, old_town_cross −8.70% → −8.69%): the fields are a few KB
+against 2.9–5.0 MB of abac tile bytes per frame. What is still uncounted is frame headers and
+motion vectors, which abac does not code — at q=99 the tiles dominate the frame, so the total-rate
+figure will be close but strictly smaller, and only a real encode settles it. **The gate is still
+not cleared; the bound is.**
+
 **What this clears, precisely.** It clears the *bound* on three of three sequences at q=99
 (−2.49% / −8.37% / −8.70%). It does **not** yet clear ENT-9's gate, which is ≥2% of **total rate**
 at bit-identical pixels — that is a real encode, and total rate carries the per-block length

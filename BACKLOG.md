@@ -1214,6 +1214,73 @@ does, and it is the first command `docs/GPU_TIER_TEST.md` tells you to run on a 
 The count is now simply not asserted. And CLAUDE.md's argument against parallel role-based agents
 rested on *"the hardware is one M1 with 8 GPU cores"* — the contention argument survives, the
 hardware claim in it does not, so it now says "one machine with one GPU".
+### BUG-36 — concurrent `--vmaf` runs scored each other's frames, through a fixed temp filename (**FIXED 2026-09-08**)
+
+Found 2026-09-08 while reading the VMAF path under MEAS-6. Every VMAF call site wrote its
+reference and distorted Y4M to a **fixed** name under `std::env::temp_dir()` — `gnc_vmaf_ref.y4m`,
+`gnc_ip_vmaf_ref.y4m`, `gnc_bench_vmaf_ref.y4m`, `gnc_rdcurve_vmaf_ref.y4m`, and the
+`gnc_j2k_compare` directory. `TMPDIR` is per *user*, not per process, and COORDINATION.md's
+working mode is **eight sessions on one machine**. Two concurrent `--vmaf` runs of the same
+subcommand therefore opened the same two files and each scored whatever frames won the race.
+
+**Measured, not inferred.** `benchmark-sequence --vmaf`, 9 frames, q=75, ki=9, two sequences whose
+serial scores are bit-stable across repeated runs:
+
+| run | old_town_cross | bbb_extended |
+|---|---|---|
+| serial, twice | 97.39 | 95.91 |
+| concurrent, twice | 97.39 | **97.19** (+1.28) |
+| concurrent, once | **96.37** (−1.02) | 95.91 |
+
+**Exactly one of the pair is wrong in every concurrent run**, in whichever direction the race
+decided. The error is 1.02–1.28 VMAF points against the **>0.5-point move CLAUDE.md calls a
+BLOCK** — 2–2.5x the threshold, from nothing but another session existing.
+
+**What makes it the bad kind of bug:** it is silent, and the wrong number is plausible. No error,
+no warning, no implausible value — 97.19 reads as a perfectly ordinary score. VMAF is the lead
+metric at q≤85 (CLAUDE.md), so this is the project's primary number being quietly replaced by
+another session's clip. Nothing in a log distinguishes a contaminated run from a clean one.
+
+**Fixed** by routing all nine sites through `gnc::session_temp_path()`, which stamps the process id
+into the filename. Verified with the same canary: **6 of 6** concurrent runs now return the serial
+values exactly, against 3 of 6 before. `tests/temp_path_collision.rs` scans `src/` and fails on any
+`temp_dir()` outside the helper, so it cannot be reintroduced by writing a literal.
+
+**What this does and does not invalidate.** It cannot be reconstructed after the fact — no run
+records whether another session was in its VMAF window — so no specific past result is retracted
+here. Two things bound the exposure: the four filenames are per-subcommand, so `benchmark` and
+`benchmark-sequence` never collided with each other, and only the *overlap* of two VMAF windows
+does damage. Longer windows are the higher risk: `rd-curve --vmaf` scores every quality point in
+one process. **Rate figures are immune** — bytes are bytes; this reaches only what VMAF scored.
+
+### BUG-37 — `benchmark-sequence` without `-q` silently codes the B-pyramid (todo, P2)
+
+Found 2026-09-08 under MEAS-6. `benchmark-sequence`'s quality argument is `Option<u32>` with **no
+default** (`src/main.rs:515`), where `benchmark` (:436), `encode-sequence` (:606) and
+`benchmark-suite` (:765) all carry `default_value = "75"`. `build_ip_config` only calls
+`quality_preset()` when quality is `Some`, and `quality_preset()` is the *only* place the B-pyramid
+veto lives (`src/lib.rs:1021`). `CodecConfig::default()` still has `b_pyramid: true`.
+
+So `benchmark-sequence -k 9` with no `-q` codes **`2I+2P+14B`** — the hierarchical pyramid that two
+independent measurements rejected as a default on 2026-09-06 — while the same command with `-q 75`
+codes `2I+16P+0B`. Verified both ways on the current build; the `B-pyramid suppressed` canary fires
+only in the second. It also silently selects qstep 4.0 and LeGall 5/3 rather than a preset, so two
+things move at once.
+
+**Nothing recorded is contaminated:** every harness in `scripts/` passes `-q` — checked all five
+that invoke `benchmark-sequence` (`meas1_vs_h264.py`, `gpu_tier_bench.py`, `meas_inter1_ki.py`,
+`meas3_sequence_rd.py`, `meas_chroma2.py`). The exposure is interactive use, and the trap is that
+the flag named *quality* is also the only thing selecting the *GOP structure*.
+
+**Do not fix it by giving the argument `default_value = "75"` and stopping there.** That closes
+this instance and leaves the mechanism: the veto would still live in `quality_preset`, one
+`Option` away from diverging again. `CodecConfig::default()` cannot simply be flipped either —
+`src/encoder/pipeline_tests.rs:87` and `:278` construct a `Default` config specifically to exercise
+the B-frame path, and flipping it would leave those tests passing while silently testing P-only,
+which is worse than the bug. The honest fix separates "the library's non-vetoing default" from
+"the CLI's shipped configuration" so the two cannot drift, and it changes a default, so it wants a
+decision record.
+
 ### BUG-34 — GNC requests 10 storage buffers per stage against a default of 8 (todo, P2)
 
 Filed 2026-09-08 by ENT-7, found while checking a literature brief's claim about the WebGPU
@@ -2391,26 +2458,42 @@ The honest next step is neither of those: it is **amortising per-process startup
 clip instead of buffering it**, because those are what the two density runs actually measured. Until
 they are fixed, a density number on any hardware measures pipeline compilation.
 
-### MEAS-6 — Latency per frame (first pass done 2026-09-06, P1)
+### MEAS-6 — Latency per frame (second pass 2026-09-08, P1)
 
-**The B-pyramid costs 8 frames of lookahead before any coding runs.** From the encoder's own
-diagnostics, `ki=17` encodes in the order `0[I] 4[B] 8[P] 2[B] 6[B] 1[B] 3[B] ...` — frame 1
-cannot be encoded until frame 8 has arrived. At 50 fps that is **160 ms of structural delay**.
-`ki=8` (P-only) encodes in display order: **zero reordering delay**. This is not a tuning
-parameter; it is what a hierarchical pyramid is.
+**The default is no longer the B-pyramid, and three documents said it was for two days.** Found
+2026-09-08: `quality_preset()` has vetoed the pyramid since **2026-09-06**
+(`b_pyramid: … .unwrap_or(false)`, `src/lib.rs:1021`), on the two measurements below — but
+POSITIONING, the README and this entry all still called it the "current default" and quoted
+~240 ms as GNC's latency. **GNC's default latency is ~80 ms, and it is below the low-latency-HEVC
+band (120 ms floor), not inside it.** See `docs/decisions/0033`.
 
-Coding time, 1080p, M1, all-intra: GPU encode ~47 ms/frame, decode ~35 ms/frame (upper bound,
-includes PNG write), **codec round trip ~80 ms**.
+Verified on the current build rather than read off the source, at the default `ki=9`:
+
+| configuration | frame mix | canary | reordering delay |
+|---|---|---|---|
+| `benchmark-sequence -q 75` (default) | `2I+16P+0B` | `B-pyramid suppressed … zero reordering latency` | **0 frames** |
+| `GNC_B_PYRAMID=1` | `2I+2P+14B` | silent | **8 frames** (160 ms at 50 fps) |
+
+**The two halves of the latency figure have very different standing, and quoting them together
+hides that.** The reordering delay is *structural* — 0 frames or 8, read from the encoder's own
+frame-type output, unmovable by machine load. The coding time is a 2026-09-06 wall-clock
+measurement on a **non-idle** machine, labelled M1 when it was the M5 Pro (BUG-29): GPU encode
+~47 ms/frame, decode ~35 ms/frame (upper bound, includes PNG write), **round trip ~80 ms**.
 
 | | latency |
 |---|---|
 | JPEG XS | 1-32 lines; EBU measured < 1 frame |
 | NDI High Bandwidth | < 16 ms |
-| **GNC, intra or P-only** | **~80 ms** |
-| **GNC, B-pyramid (default)** | **~240 ms** |
+| **GNC, default (P-only, zero reordering)** | **~80 ms** |
 | low-latency HEVC | 120-3060 ms (EBU, real vendors) |
+| GNC, `GNC_B_PYRAMID=1` (opt-in) | ~240 ms |
 
-**GNC's default configuration sits in the low-latency-HEVC band, not the JPEG XS band.**
+**Still to do, and the first one is cheap.** Re-take the ~80 ms on an **idle** machine — BASELINE
+already records that a run taken during a `cargo test` reads 20% slow, and this figure was taken
+on a loaded box. It was not re-taken on 2026-09-08 either: the machine sat at load 21-39 with
+other sessions running the test suite for the whole session, which is exactly why the structural
+half was pinned instead. Then glass-to-glass, which needs instrumentation nobody has:
+capture-to-input, output-to-network and output-to-display are all unmeasured.
 
 **Converges with BUG-5.** The B-pyramid already measured as *costing* 7-31% at contribution
 quality on camera content. It now also costs 160 ms. Two independent measurements, one

@@ -79,7 +79,7 @@ pub fn jpeg2000_rd_curve(input_png: &str, rates: &[f32]) -> Option<Vec<(f32, RdP
 
     let original_f32: Vec<f32> = rgb8.as_raw().iter().map(|&v| v as f32).collect();
 
-    let tmp_dir = std::env::temp_dir().join("gnc_j2k_compare");
+    let tmp_dir = crate::session_temp_path("gnc_j2k_compare");
     std::fs::create_dir_all(&tmp_dir).ok();
 
     // Save input as PPM (raw format OpenJPEG can read)

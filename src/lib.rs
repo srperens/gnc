@@ -1226,6 +1226,46 @@ pub fn describe_adapter(info: &wgpu::AdapterInfo) -> String {
     format!("{} [{:?}, {:?}]", info.name, info.backend, info.device_type)
 }
 
+/// A temp-file path that no other concurrently running GNC process will pick.
+///
+/// Eight sessions share this machine and therefore one `TMPDIR` (COORDINATION.md), so a *fixed*
+/// temp filename is a cross-session data race, not a tidiness question: two `--vmaf` runs of the
+/// same subcommand write the same reference/distorted Y4M and each scores whatever frames won the
+/// race. It fails silently and plausibly — no error, no warning, a believable score.
+///
+/// Measured 2026-09-08 (BUG-36), `benchmark-sequence --vmaf`, 9 frames, q=75, two sequences whose
+/// serial scores are bit-stable at 97.39 and 95.91:
+///
+/// | run | old_town_cross | bbb_extended |
+/// |---|---|---|
+/// | serial (x2) | 97.39 | 95.91 |
+/// | concurrent x2 | 97.39 | **97.19** (+1.28) |
+/// | concurrent x1 | **96.37** (-1.02) | 95.91 |
+///
+/// One of the two is wrong in every concurrent run, in either direction, by 2-2.5x the
+/// >0.5-point VMAF regression threshold that CLAUDE.md calls a BLOCK.
+///
+/// The pid is enough: two live processes cannot share one. On wasm there is no process id and no
+/// second process to collide with, so the name is returned unchanged.
+pub fn session_temp_path(name: &str) -> std::path::PathBuf {
+    let suffix = process_suffix();
+    let stamped = match name.rsplit_once('.') {
+        Some((stem, ext)) => format!("{stem}{suffix}.{ext}"),
+        None => format!("{name}{suffix}"),
+    };
+    std::env::temp_dir().join(stamped)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn process_suffix() -> String {
+    format!("_p{}", std::process::id())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn process_suffix() -> String {
+    String::new()
+}
+
 /// Every adapter wgpu can see, across every backend. Used by the `gpu-info`
 /// subcommand and by `scripts/gpu_tier_bench.py` to discover what a machine has
 /// before it measures anything on it.

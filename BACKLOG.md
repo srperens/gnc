@@ -4688,6 +4688,15 @@ exactly zero, not small. **What is left of this item** is the contribution range
 where RATE-2 says the ladder misbehaves anyway — and whether the contexts, tuned on intra
 coefficients, are worth retuning for residual statistics. Neither is answered above.
 
+**Wait for MEAS-6 before taking this (noted 2026-09-08).** MEAS-6 is in flight and holds `dr-0033`
+with the note "MEAS-6 reverses a recorded conclusion: the default is no longer the B-pyramid".
+**Everything left in this item is measured over a GOP structure**, so a before-number taken against
+today's default would be against a configuration that is about to stop being the default —
+COORDINATION rule 1, in the one form the rule cannot catch, because the tree has not changed yet.
+Check `git log --oneline main` and `scripts/claim list` for MEAS-6 first; if it has landed, measure
+against the new default and say which one, since the −12.0% to −22.9% above was taken with the
+pyramid on.
+
 **The original question:** abac against Rice on **P-frame residual coefficients**, same pixels, same
 GOP structure, at q=75 and q=90 on ≥3 sequences. `GNC_ABAC_COMPARE=1` already reports rate on real
 coefficients and was widened to see non-wavelet paths, so the instrument may need little work.

@@ -4271,6 +4271,21 @@ ran:
 | q=100, MED | **254.0039** | 65 535 / 65 536 |
 | q=100, `GNC_MED=0` (lossless wavelet) | 7.3965 | 65 535 / 65 536 |
 
+**CORRECTION 2026-09-08, and it inverts the conclusion: the two q=100 rows are an instrument
+artefact.** BUG-39 closed the same afternoon (`docs/decisions/0064`, `0f1d303`) with `q=100` video
+bit-exact on every frame — 48 of 48 md5-identical against source through a real container round
+trip, three sequences at ki=2 and ki=9. A P-frame cannot be md5-identical to its source if it
+predicted from a picture the decoder does not hold, so the two references *are* the same picture
+and **`read_reference_planes` returns a different stage on the two pipelines for the MED case**.
+The diff was measuring the readback.
+
+**What survives is the 0.0000 row, and it is the case the change targets.** The free half is
+therefore **not refuted** — re-apply `reference_is_the_source`, verify against
+`fallback_iframe_reference_matches_the_decoders` only, and treat any q=100 MED row from
+`read_reference_planes` as unreadable until that readback is fixed. If it holds, RATE-3's third
+encode goes away and `encode_as_reference` can be deleted. The paragraph below is kept because the
+observation in it is real; the conclusion drawn from it is withdrawn.
+
 **So the source planes are not the picture the decoder reconstructs, and the tell is in the
 values**: the encoder's are fractional (`0.0, −0.5019531, −0.00390625, 0.49414063, …`) where the
 decoder's reference is integral (`0.0, −1.0, −1.0, −1.0, …`) — identical on both q=100 runs, so it
@@ -4280,10 +4295,10 @@ makes the reconstructed picture integral, and the raw source planes have not bee
 0.0000 while both q=100 cases do not, and that is where this restarts — not with another mechanism
 guess.
 
-**Related, and not this item's to fix:** if the decoder's own reference at q=100 is integral where
-its *output* is bit-exact, those are two different pictures and the P-frames predict from the
-first. BUG-39 owns that surface (its cause 4 is sub-pel rounding in the prediction path); this is a
-separate question about the reference, raised there rather than acted on here.
+**~~Related, and not this item's to fix:~~ WITHDRAWN.** This entry raised a possible fifth BUG-39
+cause — the decoder holding two different pictures. It does not: BUG-39's 48-of-48 md5 result
+closes it, and the asymmetry that suggested it ("why does the fallback case match while q=100 does
+not") dissolves into the readback difference above. **There is no fifth cause; do not chase it.**
 
 **Success criterion:** no point in RATE-3's table larger than the control arm, mean no worse than
 today's −4.28%, worst P within 0.1 dB. **Canary:** the two existing ones — RATE-2's per-frame

@@ -127,7 +127,7 @@ measured advantage over x264 on any axis at this operating point.**
    **And the next largest intra lever is not unbuilt — it is built and behind a flag:** making
    `--abac` the default is worth −16.6% to −18.8% of intra rate at identical pixels, to everyone,
    with nothing left to implement. It was never filed with an ID, so `scripts/claim next` could not
-   offer it; it is now **ENT-9**. The largest genuinely *unbuilt* levers are **PAD-2** (−7% to
+   offer it; it is now **ENT-10**. The largest genuinely *unbuilt* levers are **PAD-2** (−7% to
    −10% of sequence rate) and **TILE-1**.
 2. **LOSSLESS-1** — both gates green (10–26% for ~5 ms/frame). The one lever this week that passed
    rather than failed. ~~Buildable now.~~ **Built and measured 2026-09-06** — see the entry below;
@@ -176,19 +176,23 @@ largest known intra lever", and the thing it pointed at is not an unbuilt lever 
 **`--abac`, shipped, bit-exact, and worth −16.6% to −18.8% of intra rate at identical pixels to
 anyone who passes a flag.** Making it the default has been named in ENT-5's out-of-scope note, in
 `0017`, and in this pointer, and **never once as a heading with an ID**, so `scripts/claim next`
-could not offer the largest built lever in the codec. Filed as **ENT-9** and parked
+could not offer the largest built lever in the codec. Filed as **ENT-10** and parked
 `blocked-idle-machine`, since deciding it needs two wall-clock figures and eight sessions share
 one GPU. Decision `docs/decisions/0060`.
 
-**The canary for this item is that it was taken.** ENT-9 was claimed by another session **six
-minutes after the heading landed on `main`** — before DOC-3 could park it — which is the whole
-argument of `0060` measured rather than asserted: the work was equally available for two days as
-prose and nobody could pick it up, because `scripts/claim` cannot see prose.
+**The canary claimed for this item is WITHDRAWN, and the reason it is withdrawn is COORD-3.**
+DOC-3 recorded "ENT-9 was claimed by another session six minutes after the heading landed", read
+off `refs/claims/ENT-9` and offered as `0060`'s argument measured rather than asserted. **It cannot
+be read off that ref.** The ENT-3 session had filed a *different* `### ENT-9` sixteen minutes
+earlier (context coding, not the default question) and its claim note says "ENT-9 filed", so the
+ref almost certainly locks theirs. One ref, two headings, no way to tell them apart — so the
+observation is not evidence for anything and is withdrawn rather than reworded. This item is
+**ENT-10** as of COORD-3; theirs keeps ENT-9, being first and held.
 
 **Why this is worth an item rather than a drive-by edit.** Every one of the five stale lines was
 written *correctly* and went stale when someone else finished the work — which is the normal case
 here, not negligence, and it is why the fix is structural: **a pointer to work that has no ID has
-nothing to keep it honest.** ENT-9 exists so that item 1 can point at a heading whose status
+nothing to keep it honest.** ENT-10 exists so that item 1 can point at a heading whose status
 `scripts/claim` maintains. Same lesson as COORD-2 (`0050`), one level up: an id is the only thing
 another session can see.
 
@@ -2656,6 +2660,69 @@ frequency 1 everywhere the alphabet is uniform and the depth is 6). Both change 
 codebook, and therefore its bitstream, wherever clamping currently occurs. Not done for a parked
 coder.
 
+### COORD-3 — item ids had no allocator, so two different `### ENT-9` headings are live on `main` (**FIXED 2026-09-08**)
+
+**COORD-2 (`0050`) fixed this for `BUG-N` and `dr-NNNN` and left every other prefix alone.** On
+2026-09-08 the gap collected: the ENT-3 session filed `### ENT-9 — abac context-codes three
+decisions ...` at 18:12, DOC-3 filed `### ENT-9 — should abac be the default?` at 18:29, neither
+could see the other, and both are on `main`. **Fifth instance of one mechanism** (0018 twice, 0020
+renumbered by hand, 0024 twice, now an item id) and the first inside BACKLOG rather than
+`docs/decisions/`.
+
+**Why an item id is worse than a decision-record number.** A duplicate `0024` is a confusing
+reference. A duplicate `ENT-9` is a **degraded lock**: `refs/claims/ENT-9` can hold one of the two
+headings, `claim items` printed the id twice, and whoever claims it makes the *other* item
+invisible to `claim next` — silently, and for as long as nobody renumbers. Nothing can be
+double-granted, so the failure is unavailability, not two sessions on one item.
+
+**The fix, and it is the same shape as COORD-2's:**
+
+```bash
+scripts/claim id ENT "why, briefly"     # prints ENT-N; the id comes out of the CAS
+scripts/claim bug "why, briefly"        # now a shorthand for `claim id BUG`
+```
+
+`used_prefix_numbers` unions every `PREFIX-<n>` **mentioned anywhere in committed `main:BACKLOG.md`**
+with live `refs/claims/*` and CAS-reserves the first gap, retrying on a lost race. Mentions count,
+not only headings, because all five collisions were "someone filed it and I could not see it".
+`claim bug` lost its private copy of that logic rather than gaining a second one.
+
+**And `claim items` / `claim next` now warn when two startable headings share an id** — the symptom
+that was on screen for half an hour and read as a display quirk. Not a refusal: refusing to hand
+out a duplicated id would remove two items from the queue to punish one filing mistake, and the
+renumber is a one-line fix. The warning names the prefix to allocate from.
+
+**Canary, and it is the tool's own first case.** `scripts/claim id ENT` was used to move DOC-3's
+heading off the collision: it answered **ENT-10**, having seen ENT-1..ENT-9 in committed BACKLOG.
+`scripts/claim selftest` grew two properties — 4 racing `claim id` processes get 4 distinct ids and
+**none of them gets a number the synthetic backlog merely mentions in prose**, and a two-heading
+fixture must produce the duplicate warning while a clean one must not. Full run:
+
+```
+one item, 16 racing processes: 1 won
+one queue of 6, 6 racing pickers: 6 claimed, 6 distinct
+claim bug, 8 racing processes: 8 claimed, 8 distinct
+claim dr, 8 racing processes: 8 claimed, 8 distinct
+claim id SELFID, 4 racing processes: 4 claimed, 4 distinct
+duplicate item ids: reported when present, silent when absent
+PASS: claims are atomic, the pick is atomic, and so is id allocation
+```
+
+**Which ENT-9 moved, and why that direction.** Theirs stays: it was filed 16 minutes first and it
+is **held by a live session**, so renumbering it would break a claim someone is working under.
+DOC-3's is now **ENT-10**, with its four inbound references (priority order item 1, the DOC-3
+entry, EBCOT Part 7's closing note, RESEARCH_LOG, COORDINATION's row, `0060`) moved in the same
+commit — which is the part BUG-19 says goes wrong, done here while the references are still six.
+
+**One retraction came out of this.** DOC-3 had recorded a canary — "ENT-9 was claimed by another
+session six minutes after the heading landed" — read off `refs/claims/ENT-9`. **That ref cannot
+say which heading it means**, and the note on it ("ENT-9 filed") points at theirs. Withdrawn in
+the DOC-3 entry rather than reworded: an observation that the collision makes unreadable is not
+weak evidence, it is none.
+
+**Not fixed here:** the duplicate `0018` and `0024` decision-record pairs. Those are BUG-19, held
+by another session, and `claim dr` already prevents new ones.
+
 ### COORD-2 — An id must come *from* the compare-and-swap, not be checked against it (**DONE 2026-09-08**)
 
 **Built.** `scripts/claim bug "<why>"` and `scripts/claim dr "<why>"`. Each unions committed
@@ -3855,7 +3922,7 @@ not re-found as an abac bug. It is why **q=25 is not quoted as a rate figure** a
 
 **Still open:** ~~nothing~~ — **all four are closed as of 2026-09-08, and the priority order's
 "see EBCOT Part 7's open items" pointer was retired with them (DOC-3).** What is left of this
-family is **ENT-9** (should abac be the default) and **ENT-8 step 2** (stripes), both parked on an
+family is **ENT-10** (should abac be the default) and **ENT-8 step 2** (stripes), both parked on an
 idle machine. Item by item:
 1. ~~GPU decode shader and honest fps against Rice on an idle machine.~~ Done — Part 6.
 2. ~~Bitstream integration.~~ Done — Part 7.
@@ -3888,7 +3955,7 @@ idle machine. Item by item:
    98 of 98 whole-file comparisons. The prediction in this line ("parallel across ~3000
    code-blocks") is exactly what shipped. **What it leaves behind is a number, not a mechanism:**
    the GPU encoder has never been timed on an idle machine, so 0017's reason 2 kept the 129 ms it no
-   longer measures. That is ENT-5's outstanding criterion 3, and it is now ENT-9's gate.
+   longer measures. That is ENT-5's outstanding criterion 3, and it is now ENT-10's gate.
 
 **Code-block size settled: 128px, i.e. one block per subband.** Swept on bbb at q=55: 16px
 **+1.1% — worse than Rice**, 32px −15.1%, 64px −19.2%, 128px −20.0%, 256px identical to 128 (no
@@ -5839,7 +5906,7 @@ decode, and the BUG-31 static workgroup-storage assertion in CI.
 **Decision record required either way** — a shipped coder is a default-adjacent choice, and a
 rejection is a recorded conclusion with numbers (the EBCOT entry is the template).
 
-### ENT-9 — should abac be the default? The largest built lever in the codec has never been an item (todo, **P2**)
+### ENT-10 — should abac be the default? The largest built lever in the codec has never been an item (todo, **P2**)
 
 Filed 2026-09-08 by DOC-3, which found the priority order pointing at "the next largest known intra
 lever is still unbuilt". It is not unbuilt. It shipped on 2026-09-07 and it is behind a flag.

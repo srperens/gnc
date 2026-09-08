@@ -26,7 +26,7 @@ decision `0017`, and this pointer — and never once as a `### NAME-<n> ... (tod
 **When a document points forward at work, the work gets an ID first; the pointer cites the ID.**
 
 Concretely, for DOC-3: the five stale lines are corrected with their evidence, and the destination
-of the sixth is filed as **ENT-9 — should abac be the default?**, parked `blocked-idle-machine`
+of the sixth is filed as **ENT-10 — should abac be the default?**, parked `blocked-idle-machine`
 because deciding it needs two wall-clock figures that cannot be taken on a machine shared by eight
 sessions.
 
@@ -45,10 +45,10 @@ item" were handed P3 documentation work.
 
 ## What was not chosen
 
-- **Reword item 1 without filing ENT-9.** Cheapest, and it is what produced the defect: the
+- **Reword item 1 without filing ENT-10.** Cheapest, and it is what produced the defect: the
   sentence would go stale again the moment the abac question moved, and `next` would still be unable
   to offer it.
-- **File ENT-9 as open at P1.** Its value argues for it — larger than everything shipped to date
+- **File ENT-10 as open at P1.** Its value argues for it — larger than everything shipped to date
   put together. Refused because it is gated on `abac_bench` on an idle GPU and on a re-take of the
   1.69x decode debt (the same abac decode has read 25.2 / 31.1 / 37.5 ms across three runs under
   load). An open P1 nobody can execute removes a slot from seven other sessions, which is what

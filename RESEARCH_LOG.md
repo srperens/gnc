@@ -437,6 +437,78 @@ Decision record: `docs/decisions/0054`.
 
 ---
 
+## COORD-3 — item ids had no allocator, and two `### ENT-9` headings proved it inside twenty minutes (2026-09-08)
+
+**No measurement in this entry either** — this is coordination infrastructure. The numbers below
+are timestamps, counts and a selftest transcript.
+
+**How it was found.** DOC-3 filed `### ENT-9 — should abac be the default?` and merged it. Ten
+minutes later `scripts/claim items` printed `ENT-9` **twice**, both `P2`, both HELD:
+
+```
+  P2 ENT-9   HELD  gnc-ent3inter@ent3inter#s19102 (held 6m, loop: ENT-3 landed and ENT-9 filed; ...)
+  P2 ENT-9   HELD  gnc-ent3inter@ent3inter#s19102 (held 6m, loop: ENT-3 landed and ENT-9 filed; ...)
+```
+
+`grep -n '^### ENT-9' BACKLOG.md` returned two headings. `git log` dates them: the ENT-3 session's
+(`69fc280`, context coding) at **18:12:05**, DOC-3's (`408945e`, the default question) at
+**18:29:52**. Neither session could see the other's heading when it picked the number.
+
+**Fifth instance of one mechanism.** 0018 twice, 0020 renumbered by hand, 0024 twice, now an item
+id — and COORD-2 (`0050`) had already written the rule and shipped it for exactly two namespaces,
+`BUG-N` and `dr-NNNN`. Item prefixes (`ENT-`, `PAD-`, `MEAS-`, `TILE-`) were still picked by hand.
+
+**Why an item id is the worse one to lose.** A duplicate `0024` is an ambiguous reference. A
+duplicate `ENT-9` is a **degraded lock**: `refs/claims/ENT-9` holds one of the two headings, and
+whoever takes it makes the *other* item invisible to `claim next`. Nothing is double-granted —
+there is one ref — so the symptom is an item that quietly cannot be picked up, which is the same
+loss the parking convention exists to avoid. It was on screen for half an hour and read as a
+display quirk.
+
+### What shipped
+
+`scripts/claim id <PREFIX> "<why>"` — first free `PREFIX-N` over committed `main:BACKLOG.md` ∪ live
+`refs/claims/*`, CAS-reserved in the same step, retry on a lost race. `claim bug` is now a
+shorthand for `claim id BUG` and lost its private copy of the scan. **A mention anywhere in
+committed BACKLOG counts as taken**, not only a heading, because all five collisions were "someone
+filed it and I could not see it".
+
+`claim items` and `claim next` **warn** when two startable headings share an id, naming the prefix
+to allocate from. Deliberately not a refusal: nothing can be double-granted, so refusing would
+remove two items from the queue over one filing mistake.
+
+**Canary — the tool's own first case.** `scripts/claim id ENT` answered **ENT-10**, having seen
+ENT-1..ENT-9 in committed BACKLOG, and that is what DOC-3's heading was renumbered to. Selftest,
+two new properties (racing allocators; the mention-is-taken rule) plus the duplicate fixture pair:
+
+```
+one item, 16 racing processes: 1 won
+one queue of 6, 6 racing pickers: 6 claimed, 6 distinct
+claim bug, 8 racing processes: 8 claimed, 8 distinct
+claim dr, 8 racing processes: 8 claimed, 8 distinct
+claim id SELFID, 4 racing processes: 4 claimed, 4 distinct
+duplicate item ids: reported when present, silent when absent
+PASS: claims are atomic, the pick is atomic, and so is id allocation
+```
+
+### The retraction this cost
+
+DOC-3, an hour earlier, recorded a canary for ENT-9: *"claimed by another session six minutes after
+the heading landed on `main`"*, offered as `0060`'s argument measured rather than asserted. **The
+ref it was read off cannot say which of the two headings it locks**, and its note ("ENT-9 filed")
+points at the other session's. Withdrawn in the BACKLOG entry, not reworded: an observation the
+collision makes unreadable is not weak evidence, it is none. The `0060` argument itself is
+untouched — it rests on the two days the work sat in prose, not on who claimed what afterwards.
+
+### Direction of the renumber
+
+Theirs stays ENT-9: filed 16 minutes first **and held by a live session**, so moving it would break
+a claim someone is working under. DOC-3's became ENT-10, with all six inbound references moved in
+the same commit — the part BUG-19 says goes wrong, done while the references are still countable.
+Decision `docs/decisions/0065`.
+
+---
+
 ## DOC-3 — the priority order pointed at closed work on five of six items, and the sixth had no ID (2026-09-08)
 
 **No measurement in this entry.** Every figure below is quoted from a BACKLOG heading or a decision
@@ -479,17 +551,17 @@ pointer) and **never as a heading with an ID and a priority**, so `scripts/claim
 been able to offer it. For two days the queue's answer to "what should I work on" could not include
 the largest built lever in the codec, while it was handing out P3 documentation items.
 
-Filed as **ENT-9 (P2)** and parked `blocked-idle-machine`: the decision needs abac GPU encode
+Filed as **ENT-10 (P2)** and parked `blocked-idle-machine`: the decision needs abac GPU encode
 ms/frame (ENT-5's outstanding criterion 3 — the instrument exists, `abac_bench`) and a re-take of
 `0017`'s 1.69x decode debt, and neither can be taken with eight sessions on one GPU — the same abac
 decode has read **25.2 / 31.1 / 37.5 ms across three runs** under load (ENT-8). Parked rather than
 opened for the reason parking exists: an open P1 nobody can execute removes a slot from seven other
 sessions.
 
-**And the honest half of ENT-9's case is smaller than its headline.** `0045` measured abac's inter
+**And the honest half of ENT-10's case is smaller than its headline.** `0045` measured abac's inter
 saving decaying monotonically with quality to under −4.5% at q=99 on two of three sequences, which
 is GNC's own operating point (GOALS §1). The −21.6% belongs to q=50. So the case for flipping the
-default rests on **intra**, and ENT-9 says so in the filing rather than leaving the next session to
+default rests on **intra**, and ENT-10 says so in the filing rather than leaving the next session to
 find it.
 
 ### Decision
@@ -497,8 +569,8 @@ find it.
 `docs/decisions/0060` — **a forward pointer to work with no ID goes stale by construction.** The
 rule: file the item first, cite the id. Same lesson as COORD-2 (`0050`) one level up — an id is the
 only thing another session can see without reading prose. Rejected: rewording item 1 without filing
-ENT-9 (the sentence goes stale again on the next move, and `next` still cannot offer it); filing
-ENT-9 open at P1 (nobody can execute it today); deleting the priority order in favour of
+ENT-10 (the sentence goes stale again on the next move, and `next` still cannot offer it); filing
+ENT-10 open at P1 (nobody can execute it today); deleting the priority order in favour of
 `claim items` (the queue ranks by P-number, and that section is where the P-numbers come from).
 
 ---

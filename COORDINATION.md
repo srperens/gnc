@@ -166,10 +166,23 @@ scripts/claim take dr-00NN "why"
 
 `ls` answers "what is in my working tree", which is neither of those two questions. Demonstrated
 both ways in `gnc-ent7bpc` on 2026-09-08: `git ls-tree main` showed `0029` while the worktree's own
-`ls` did not, and later `ls` showed a `0030` that was not yet on `main`. **This habit would also
-have caught the `0018`, `0024` and `0027` pairs**, where the other session had already committed —
-so it is strictly better than the "reserve first" rule above, not an addition to it, and it is the
-cheap half of what COORD-2 will automate.
+`ls` did not, and later `ls` showed a `0030` that was not yet on `main`.
+
+**The two commands cover different failures and you need both — an earlier version of this section
+said `ls-tree` was "strictly better" than reserving, which is wrong and would have cost someone the
+reservation.** `git ls-tree main` covers a number that is *already committed*, including one that
+landed after your worktree's base. `scripts/claim list` plus taking the id covers a number that is
+*held but not yet written*. Neither covers the third case: **two sessions reading "0031 is free"
+inside the same minute still both get it**, which is the original `0018` race and is exactly what
+`take dr-NNNN` cannot fix, because the read and the reservation are two operations. Whether these
+habits would have caught the `0018`, `0024` and `0027` pairs therefore depends on whether the
+winner had committed by the time the loser looked — unknown for those three, so do not read them as
+evidence for either habit.
+
+**Only COORD-2's build closes the third case**, and its title is the design: the number must come
+*out* of the compare-and-swap rather than be checked against it — walk `git ls-tree main
+docs/decisions/` and `refs/claims/dr-*` together and CAS the first gap, so reading and reserving
+are one operation. Until then these two commands are mitigation, not a fix.
 
 Caught this time by reading `scripts/claim list` against `ls docs/decisions/` during unrelated
 cleanup, before the file was written — luck, not process. The right-oracle correction came from the

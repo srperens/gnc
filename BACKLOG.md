@@ -1970,8 +1970,16 @@ Until `claim dr` exists, the habit that actually works is **`git ls-tree --name-
 docs/decisions/`**, which reads committed `main` from any worktree with no fetch and no rebase,
 since every worktree shares one `.git`. `ls docs/decisions/` is the wrong oracle in both
 directions: it misses records committed after your base and shows records that are not on `main`
-yet. That command would also have caught the `0018`, `0024` and `0027` pairs, where the other
-session had already committed — so it supersedes "reserve first" rather than adding to it.
+yet.
+
+**But it is mitigation and not a fix, and it does not replace reserving** — a claim this item's own
+text made in an earlier revision and which is withdrawn here. `ls-tree` covers a number already
+committed; `claim list` plus taking the id covers a number held but not written; **neither covers
+two sessions reading "0031 is free" inside the same minute**, which is the original `0018` race and
+the case this item exists to close. Whether the habits would have caught the `0018`, `0024` and
+`0027` pairs depends on whether the winner had committed before the loser looked, which is not
+recorded — so those three are not evidence for either habit. The build below is the fix, and the
+title is the design: the number comes *out* of the compare-and-swap.
 
 **What to build:** `scripts/claim bug "<why>"` and `scripts/claim dr "<why>"`, each allocating the
 next free number *as* the compare-and-swap that reserves it — the same mechanism `claim next`

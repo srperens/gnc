@@ -4202,7 +4202,7 @@ worst-frame penalty was BUG-27. What remains is content-specific (old_town_cross
 worst-frame) and MEAS-4 already located it in prediction quality, not the coding model.
 Harnesses: `scripts/meas_inter1_ki.py`, `scripts/meas_inter1_pscale.py`. Follow-up: **INTER-2**.
 
-### INTER-2 — The inter dead zone is a large unpriced lever at the q=85 rung (todo, P2)
+### INTER-2 — The inter dead zone is a large unpriced lever at the q=85 rung (**DONE 2026-09-08 — default 2.0 → 1.0, BD-rate −4.77%**)
 
 Found inside INTER-1, not chased there. The q=85 rung behaves unlike every rung above it: the
 inter arm goes *cheap and worse* (10.50 bpp against all-intra's 11.64, 2.9 dB down on the worst
@@ -4223,6 +4223,32 @@ the options (COORDINATION rule 4):
 At 1.0 the worst frame lands exactly on all-intra's 47.48 — the same ceiling property the P-scale
 has at 1.0, arrived at from a second knob, which is the interesting part. 12.7% of the rate and
 2.87 dB of worst-frame is worth a BD-rate.
+
+> **Priced 2026-09-08 and shipped: `inter_dz_mul` is now 1.0.** `docs/decisions/0041`. The point
+> above reproduces byte-for-byte on today's `main`, and the ladder says the same thing everywhere.
+>
+> 4 rungs (q=70/75/80/85) x 3 sequences x 4 arms, 24 frames, ki=9, 4:4:4. BD-rate on PSNR against
+> the old 2.0, integrated over each sequence's common interval across all arms:
+>
+> | sequence | mul=1.5 | **mul=1.0** | mul=0.0 |
+> |---|---|---|---|
+> | bbb_extended | −2.70% | −2.13% | **+12.48%** |
+> | crowd_run | −3.01% | **−6.04%** | −2.40% |
+> | old_town_cross | −2.76% | **−6.14%** | −3.34% |
+> | mean | −2.82% | **−4.77%** | +2.25% |
+>
+> **Worst-frame improves at 12 of 12 points, by +2.44 to +5.23 dB**, and 1.0 beats both
+> neighbours, so the optimum is bracketed. **0.0 is worse than shipped on animation (+12.48%)** —
+> the inter dead zone earns its place, 2.0 just overshot.
+>
+> **VMAF could not decide this and said so.** crowd_run's four rungs span 99.86–99.88 — a
+> 0.02-point interval across a 5.5 dB PSNR spread — and a BD-rate over it returns +35.41%. The
+> q≤85 "VMAF leads" rule is a stills rule; this ladder runs at 4.9–12.0 bpp.
+>
+> **Scope measured, not argued: q ≤ 88 moves, q ≥ 89 is byte-identical**, and q=100 is byte-identical
+> both ways. Also consolidated three inlined copies of the factor into
+> `gnc::inter_dead_zone_mul()`, guarded by a test — it was one `unwrap_or` from BUG-37's shape.
+
 
 **What to do:** BD-rate `inter_dz_mul` in {1.0, 1.5, 2.0, 3.0} against all-intra on the three
 sequences at q=85-99 *and* q=25-70, mean and worst-frame, via `scripts/meas_inter1_pscale.py`

@@ -1393,6 +1393,45 @@ pub fn decode_order(frames: &[CompressedFrame]) -> Vec<usize> {
 }
 
 /// One line describing an adapter: name, backend and what kind of device it is.
+/// The inter dead zone, as a multiple of the intra one: **1.0** — the same dead zone, not double.
+///
+/// `GNC_INTER_DZ_MUL` overrides it. Read this rather than the variable: the factor lived inline at
+/// **three** sites in `sequence.rs` (the P-frame path and two B-frame paths), which is one
+/// `unwrap_or` away from the divergence BUG-37 actually shipped.
+///
+/// **It was 2.0 until 2026-09-08, and 2.0 was measurably the wrong number** (INTER-2,
+/// `docs/decisions/0041`). The rationale for doubling was that a motion-compensated residual is
+/// mostly the reference's own quantisation noise, so coding it finely spends bits on nothing a
+/// viewer asked for. That reasoning is sound and is why this is 1.0 and not 0.0 — removing the
+/// inter dead zone entirely measures **+12.48%** BD-rate on animation. Doubling simply overshot.
+///
+/// Measured over a 4-rung ladder (q=70/75/80/85), three sequences, 24 frames, ki=9, 4:4:4,
+/// BD-rate on PSNR against the old 2.0, integrated over a common quality interval per sequence:
+///
+/// | | mul=1.5 | **mul=1.0** | mul=0.0 |
+/// |---|---|---|---|
+/// | bbb_extended | −2.70% | −2.13% | +12.48% |
+/// | crowd_run | −3.01% | **−6.04%** | −2.40% |
+/// | old_town_cross | −2.76% | **−6.14%** | −3.34% |
+/// | mean | −2.82% | **−4.77%** | +2.25% |
+///
+/// and **worst-frame PSNR — the metric a contribution codec is judged on — improves at 12 of 12
+/// points**, by +2.44 to +5.23 dB. 1.0 beats both of its neighbours, so the optimum is bracketed
+/// rather than assumed.
+///
+/// **Why 1.0 exactly, rather than a tuned constant near it:** at 1.0 the inter dead zone *is* the
+/// intra dead zone, so the special case disappears instead of becoming a second magic number.
+///
+/// The change is confined to q ≲ 88 and that is asserted, not argued: a dead zone ≤ 0.5 is a no-op
+/// because GNC quantises as `floor(|v|/step + 0.5)` after a `|v| < dz*step` test, the preset
+/// anchors put `dead_zone` at 0.05 by q=92, and every arm is **byte-identical** at q=92.
+pub fn inter_dead_zone_mul() -> f32 {
+    std::env::var("GNC_INTER_DZ_MUL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1.0)
+}
+
 /// Whether the hierarchical B-pyramid is permitted, as GNC *ships* it: off, unless
 /// `GNC_B_PYRAMID=1`.
 ///

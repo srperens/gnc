@@ -174,6 +174,11 @@ bit-exactness, not encoder reproducibility.
 > bpp and PSNR figures were taken through a diverging prediction loop. Whoever re-measures them
 > for the B-pyramid change gets both corrections at once. Nothing at q >= 85 in this file is
 > affected — verified byte-identical, 27/27. See `docs/decisions/0023`.
+>
+> **And stale for a third reason as of 2026-09-08: INTER-2.** The inter dead zone went from twice
+> the intra dead zone to the same as it (`inter_dz_mul` 2.0 → 1.0, BD-rate −4.77% on PSNR,
+> worst-frame better at 12 of 12 points). q=75 with inter frames is inside the affected range;
+> **q ≤ 88 moves and q ≥ 89 is byte-identical**, measured. `docs/decisions/0041`.
 
 | sequence   | bpp  | PSNR avg | VMAF  | notes                                                        |
 |------------|------|----------|-------|--------------------------------------------------------------|
@@ -266,6 +271,13 @@ ki=9, 4:2:0, 8-bit, x264 at its defaults.
 | curve overlap | 49.4–55.9 dB | 50.0–56.2 dB | 49.9–56.3 dB | |
 
 **GNC needs about 1.9x the bitrate of H.264 for the same luma PSNR at contribution quality.**
+
+> **One of these four rungs moved on 2026-09-08 (INTER-2).** The ladder is q=85/92/96/99, and the
+> inter dead-zone default changed for **q ≤ 88 only** — so **q=85 moves and 92/96/99 do not**,
+> measured byte-identical at q ≥ 89. The direction should favour GNC, because the change improves
+> the inter RD curve by −4.77% BD-rate on PSNR, but **that is a prediction and this figure has not
+> been re-measured**: +90.5% stands as recorded until `meas1_vs_h264.py` is run again.
+> `docs/decisions/0041`.
 
 **Caveat added 2026-09-07, and RATE-2's fix does NOT lift it (updated 2026-09-08).** Two of those
 four rungs are inside GNC's dominated range: above q≈95–98 the lossy path costs *more bytes than

@@ -175,6 +175,9 @@ struct BandStats {
     adapt_cold: f64,
     /// ENT-6: the same engine started from this band's own signalled table.
     adapt_warm: f64,
+    /// ENT-9 step 2 milestone 1: the same engine, cold, with candidate A's 24 prefix contexts
+    /// active — cold-started per block like the 18 they join, so adaptation is charged.
+    adapt_prefix: f64,
     /// ENT-8: the same engine, cold, under the lockstep scan at three stripe widths — 32, 16 and
     /// 8 threads per 64px code-block against abac's one today. Only the first column of each
     /// stripe loses its left neighbour, so the rate cost falls as the width grows and the
@@ -555,6 +558,7 @@ sign bits modelled  =>  {:+.2}% of Hctx",
                 }
                 let st = &mut stats[p][band];
                 st.adapt_cold += abac_init_diag::adapt_bits(&blk, bw, &cold);
+                st.adapt_prefix += abac_init_diag::adapt_bits_prefix_ctx(&blk, bw, &cold);
                 st.adapt_warm += abac_init_diag::adapt_bits(&blk, bw, &warm[p][band]);
                 for (slot, k) in LOCKSTEP_WIDTHS.iter().enumerate() {
                     st.adapt_lockstep[slot] += abac_init_diag::adapt_bits_scan(
@@ -594,6 +598,7 @@ sign bits modelled  =>  {:+.2}% of Hctx",
     }
 
     abac_init_table(&stats, &planes, num_levels, tiles.len());
+    prefix_ctx_summary(&stats);
     merged_blocks_summary(&stats, merged, merged_blocks, merged_len_bytes);
 
     bpc_paco_table(&stats, &planes, num_levels);
@@ -895,6 +900,32 @@ fn abac_init_table(
 /// three are in the comparison: the coder's own bits, the number of blocks (and therefore the
 /// length fields the container spends), and the loss of per-band homogeneity that the current cut
 /// buys. The first two are counted; the third is whatever remains.
+/// ENT-9 step 2 milestone 1: candidate A charged real adaptation on real code-blocks.
+///
+/// Step 1b priced the prefix contexts on statistics pooled per plane and subband — no adaptation,
+/// every block sharing one set of counts. `0063` recorded that as generous and named this the
+/// first thing step 2 must check, because 24 new contexts learn on the same 4096-symbol block as
+/// the 18 they join. If the pooled win survives per-block cold starts, the shader work is worth
+/// starting; if it evaporates, ENT-9 closes here and cheaply.
+fn prefix_ctx_summary(stats: &[Vec<BandStats>]) {
+    let (cold, prefix, blocks) = stats.iter().flatten().fold((0.0, 0.0, 0u64), |(c, p, n), st| {
+        (c + st.adapt_cold, p + st.adapt_prefix, n + st.blocks)
+    });
+    if blocks == 0 || cold <= 0.0 {
+        return;
+    }
+    eprintln!("  --- ENT-9 step 2 milestone 1: candidate A with adaptation charged ---");
+    eprintln!(
+        "    {blocks} blocks, same engine, cold start both arms: shipped binarisation          {:.0} B, prefix context-coded {:.0} B  =>  {:+.2}% of the coder's own bits",
+        cold / 8.0,
+        prefix / 8.0,
+        100.0 * (prefix - cold) / cold,
+    );
+    eprintln!(
+        "    (step 1b's pooled bound for the same change is printed above as \"candidate A\";          a pooled figure that does not survive this is not a win)"
+    );
+}
+
 fn merged_blocks_summary(
     stats: &[Vec<BandStats>],
     merged: [f64; 2],

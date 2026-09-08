@@ -1449,7 +1449,55 @@ that is not a shader it does not use. **Why P2:** it invalidates no measurement 
 nothing on Vulkan or Metal, but GOALS rule 4 claims DX12 and step 1 is close to free. Step 1
 alone converts "DX12 does not run GNC" into a measurement.
 
-### ROBUST-1 — the decoder's contract on malformed input is "panic", and one place promised otherwise (partly done 2026-09-08, P2)
+### ROBUST-2 — put the frame parser on a checked cursor, additively (todo, P2)
+
+The implementation `docs/decisions/0067` decided and deliberately did not do. **The decision is
+made; this is the diff.**
+
+1. `Cursor<'a> { data, pos }` in `format.rs` with `u8() / u32() / f32() / bytes(n) ->
+   Result<_, DecodeError>`, bounds-checking in one place instead of at 100-odd call sites.
+2. `try_deserialize_compressed(data) -> Result<CompressedFrame, DecodeError>` — the parser,
+   rewritten onto the cursor. Mechanical, ~400 lines of one function.
+3. `deserialize_compressed` **stays**, as `try_deserialize_compressed(data).expect(...)`, so
+   **all 33 existing call sites compile untouched** and the change is provably
+   behaviour-preserving for them. That is the property that makes this landable at all.
+
+**Do the same for the other three deserialisers afterwards, not in the same commit:**
+`deserialize_sequence_header`, `deserialize_temporal_sequence`, and the GNV container index.
+`abac.rs`'s `vec![0i32; count]` and the rANS deserialiser were named as unaudited in ROBUST-1 and
+are still unaudited.
+
+**Verification, and it is unusually cheap for a change this size:** encode a set of frames,
+decode with both the old and new binary, and require **byte-identical output** — the parser's
+job is deterministic, so a rewrite that changes any pixel is wrong. ROBUST-1 used 4 images x
+q=40/75/90/100 for exactly this and it caught nothing, which is the point. Then a corrupt-input
+test per public entry point: truncate at every length, and flip the four count fields to
+`u32::MAX`.
+
+**Why P2 and not P1:** nothing is broken for well-formed streams, the allocation amplification is
+already closed, and the remaining exposure is a panic rather than memory unsafety — Rust's slice
+indexing is checked, which is why this is a robustness item and not a security one. **Why not
+P3:** it is a decided design defect in the public API of a codec whose decoder eats other
+people's bytes, and the cost only grows as the format gains generations.
+
+**Warning about the merge, not the code:** `format.rs` is edited by several sessions at once. This
+is a whole-function rewrite, so take it when the file is quiet and merge it quickly, or it will
+be rebased more than it is written.
+
+### ROBUST-1 — should the decoder reject malformed input, or is panicking the contract? (**DECIDED 2026-09-08 — reject; see `docs/decisions/0067`**)
+
+**Answered: reject, via a checked cursor and an additive API.** The implementation is **ROBUST-2**,
+filed above with the diff specified. Three defects found by this item were fixed under it
+(BUG-43's `k` clamp, `read_tile_varint`'s unbounded shift, and the four unbounded wire counts), so
+**the allocation amplification is closed and only the panic remains** — a malformed frame now runs
+off the end of its buffer instead of aborting the process on a huge allocation.
+
+Rejected alternatives, with what they cost: a validating pre-pass (a second parser that has to
+agree with the first — a new class of bug, and its failure mode is a validator accepting what the
+parser misreads); `catch_unwind` (cannot tell malformed input from our own bug, and is inert under
+`panic = "abort"`); documenting panic-on-malformed as the contract (free and honest, but it makes
+every embedder reimplement the parser outside the library). `0067` has the reasoning and the
+33-call-site count that makes the additive shape work.
 
 The audit BUG-43 left open: which other decoder inputs reach a shift, an index or an allocation
 unvalidated. Run 2026-09-08. **One contained defect found and fixed; the larger finding is a
@@ -1625,15 +1673,14 @@ machine — but the affected claim is a documented project rule, and step 1 may 
 > look before filing. That is COORDINATION.md's "Reserving an id is not filing the item" a third
 > time, and it is what this entry is now evidence for.
 >
-> **The mechanism half is written and tested — take it, do not rewrite it.** Worktree `gnc-drnum`,
-> branch **`drnum-mech`** (`git log --all --oneline --grep 'BUG-41 mechanism'`), one file
-> (`scripts/claim`): the `claim item <PREFIX>` allocator, the
-> duplicate-startable-id detection in `items`/`next`, and two new `selftest` properties. **`scripts/claim
-> selftest` passes all six.** It is deliberately **not merged to `main`** — COORD-3 holds the work,
-> and two sessions editing `scripts/claim` for the same reason is the failure this file exists to
-> prevent. Cherry-pick it, or ignore it and say so.
+> **The mechanism landed — COORD-3 shipped it, not this branch.** `1b1f8f6`,
+> `docs/decisions/0065`: `scripts/claim item <PREFIX>` allocates from the same union of committed
+> `main:BACKLOG.md` and live `refs/claims/*`, and `warn_duplicate_ids` reports an id with two
+> startable headings. The `drnum-mech` branch that held this session's independent implementation
+> of the same two things is **deleted**; standing down rather than racing it cost one unmerged
+> commit and duplicated nothing on `main`.
 >
-> What is *not* done anywhere: the ENT-9 renumber itself (COORD-3 holds `ENT-10` for it).
+> What COORD-3 also carried: the ENT-9 renumber itself, under `ENT-10`.
 
 `main:BACKLOG.md` carries two startable `### ENT-9` headings for **different work**:
 
@@ -2885,6 +2932,73 @@ frequency 1 everywhere the alphabet is uniform and the depth is 6). Both change 
 codebook, and therefore its bitstream, wherever clamping currently occurs. Not done for a parked
 coder.
 
+### COORD-4 — priced, tool refused 1-of-6, consolidation shipped instead (**ANSWERED 2026-09-08**)
+
+**The doubt attached to this item at filing was the right one, and the measurement it asked for
+settles it — but not by rarity.** The class is the most frequent measurement failure in the repo
+right now: **six instances**, five of them in the two days of eight-session concurrency.
+
+| # | instance | shape | caught by a claim-time stamp? |
+|---|---|---|---|
+| 1 | BUG-44 — 254.0039 vs 0.0000, patched vs shipped tree | cross-session | **yes** |
+| 2 | PAD-1 / `0039` (`c109128`) — q=85 pre-INTER-2, q=92 post | `main` moved mid-table | no |
+| 3 | ENT-3 / `0025` (`0045`) — two of nine published points superseded | `main` moved | no |
+| 4 | the build-artefact near-miss — rebuild during a 36-run sweep | own `target/` | no |
+| 5 | ARCH-3 / BUG-18 (2026-09-07) — `main` moved mid-item | `main` moved | no |
+| 6 | quarter-pel #15 (2026-03-09) — "−0.63 dB vs stale baseline `617d8e6`" | stale record | no |
+
+**Both candidate shapes are refused on these numbers.** `claim measured` (stamp `HEAD` + dirty bit)
+would have caught **1 of 6** — only the cross-session one. Printing each claim's commit in
+`claim list` would have caught **0 of 6**: a claim's commit is not a measurement's commit, and
+instance 1's difference was uncommitted anyway. Five of six are one session's own table decaying
+because `main` moved under it, which no claim-time stamp can see.
+
+**What the evidence supports instead, and it is shipped:** the rule was already written **four
+times on one afternoon, by four sessions, under four names** — this entry's own COORDINATION
+section, "Do not swap a shared build artefact while someone is measuring", ENT-3's "a figure that
+reproduces exactly on its own pinned commit and not on `main` is a change log, not an error", and
+PAD-1's "a table whose q=85 and q=92 came from different binaries is unreadable". The failure is
+**discoverability, not absence**: each session met the class fresh and none could see the others'
+wording. COORDINATION's "Every number carries a tree" section is now the class's home, indexes all
+four, and states the three habits they add up to — state the tree with the number, a table is one
+binary, ask which tree before filing or reversing.
+
+**What would reopen this.** A seventh instance of the *cross-session* shape specifically —
+instance 1 is the only one of its kind, and one instance does not buy a tool. If two more appear,
+`claim measured` is worth building and the dirty bit is the half that matters. Instances 2, 3 and 5
+argue for something different if anyone wants it: a check that warns when `main` has moved since a
+worktree's base *while a measurement is in flight*, which is a different tool with a better hit
+rate (4 of 6) and no obvious cheap implementation.
+
+*Original filing, kept because the doubt in it was correct:*
+
+### COORD-4 — a number quoted across sessions does not carry its tree (original filing)
+
+**Filed from a worked example that cost two sessions about an hour**, recorded in COORDINATION's
+"Two sessions' numbers that disagree may both be right — ask which tree" and in RATE-4 and BUG-44.
+Two correctly-measured results could not coexist: `q=100` video bit-exact on 48 of 48 frames, and
+an encoder-vs-decoder reference diff of 254.0039 at the same operating point. **No measurement was
+wrong and the instrument was fine** — one was taken on a patched tree. Neither session asked which
+commit, and both then wrote a wrong inference into `main` before a twenty-second test settled it.
+
+**The mechanical version of the rule.** `scripts/claim` already takes claims against a commit —
+they are metadata blobs, and `git cat-file -p refs/claims/<ITEM>` prints it — so the information
+exists and is simply never surfaced where numbers are exchanged. Candidate shapes, cheapest first:
+
+- `scripts/claim list` / `items` print the commit each claim was taken against, so "which tree" is
+  answerable without asking.
+- A `scripts/claim measured <ITEM>` that stamps `HEAD` **plus whether the tree was dirty** at the
+  moment a measurement is taken — the dirty bit is the half that matters here, because the patched
+  tree in the worked example was uncommitted.
+
+**The honest doubt, from the session that raised it and declined to file it:** it may not be worth
+a tool. The failure needs two sessions, disagreeing numbers, and enough confidence to act before
+re-running — and the prose rule may be enough on its own. **Whoever takes this should price that
+first**: a grep of RESEARCH_LOG for retracted results says how often a wrong tree, rather than a
+wrong harness, was the cause. If the answer is once, close it as answered-no and keep the prose.
+
+**Not startable as "build it".** Startable as "measure whether it has happened before".
+
 ### COORD-3 — item ids had no allocator, so two different `### ENT-9` headings are live on `main` (**FIXED 2026-09-08**)
 
 **COORD-2 (`0050`) fixed this for `BUG-N` and `dr-NNNN` and left every other prefix alone.** On
@@ -3045,8 +3159,8 @@ The owner's scope, quoted from `git cat-file -p refs/claims/COORD-3`:
 It holds `ENT-10` for the renumber and `dr-0065` for the record. **Everything BUG-41 found is
 evidence for this item** — the ENT-9 timestamps, the audit that says 11 of the 12 duplicate ids in
 BACKLOG are the harmless "status entry plus original filing" convention, and a tested
-implementation of the allocator and the duplicate-id refusal on branch `drnum-mech` (one commit,
-`scripts/claim` only).
+the audit that says 11 of the 12 duplicate ids in BACKLOG are the harmless "status entry plus
+original filing" convention.
 Correct or replace this stub freely; it exists so the item outlives its session.
 
 ### BUG-27 — the encoder's P-frame reference was dequantised with the intra qstep (**FIXED 2026-09-07**)
@@ -4457,9 +4571,44 @@ every frame prints it.
 **Why P1.** It is a shipped codec producing 12 dB video at its highest quality setting. It also
 gates RATE-3, and RATE-3 gates the inter half of RATE-2's 21.66%.
 
-### RATE-4 — the candidate is chosen on one frame's bytes and paid for by the next one's (todo, P2)
+### RATE-4 — the candidate is chosen on one frame's bytes and paid for by the next one's (todo, P3 — **measured 2026-09-08, the design is settled and the fix is priced, not built**)
 
 Filed 2026-09-08 by RATE-3, which shipped the win and measured this as its cost.
+**Measured 2026-09-08 by the `drnum` session** — `scripts/meas_rate4.py`, RESEARCH_LOG, decision
+`docs/decisions/0068`. Three results, and they change the item rather than close it:
+
+1. **The prize is 0.09 points of mean.** An exact per-GOP ledger takes RATE-3's twelve points from
+   **−4.28% to −4.37%** and removes both regressions (worst point +0.58% → +0.00%). It cannot be
+   worse than the control anywhere, because the control is one of its two arms — which is what this
+   entry's ban on a margin constant was reaching for. It changes 5 of 38 GOPs, all in bbb q=99.
+2. **The ledger does not need the GOP encoded both ways — it needs one frame.** The penalty is paid
+   by the **first** P-frame and does not propagate: P2 is 2–6% of P1, P2..P8 together 1–17%, because
+   P2's reference is P1's reconstruction, which is lossy in both arms. A one-frame lookahead
+   (`I + P1` under each candidate's reference) reaches the exact per-GOP decision on **33 of 33**
+   GOPs, at one extra P-frame encode per GOP instead of the losing arm's whole GOP — the same
+   computation at ki=2, an eightfold saving at ki=9. It carries evidence rather than a construction
+   guarantee: it is optimistic about bit-exact by 4 100–55 313 B on GOPs of ~20 MB.
+3. **A margin constant would have passed all twelve points.** The P1 penalty is nearly independent
+   of the I-frame saving (187 647–321 525 B against savings of 279 336–1 549 505 B), so a threshold
+   anywhere in **(279 336, 575 709) B** reproduces the whole table. **The ban below is right and is
+   now measured** — that window's two ends come from two of the three sequences, the penalty varies
+   1.7× inside this small set, every sequence here is 1080p, and the point setting the lower bound is
+   the one regression the item exists to remove.
+
+**Why P3 and not built.** 0.09 points of mean, two regressions on one sequence at one quality point,
+against an implementation that must hold **two live I-frame references** through the
+`encode_once` → `local_decode_iframe_gpu` side channel that has already produced four defects
+(`0040`, `0042`, RATE-3's gate, the ordering constraint in `encode`'s comment). **Do the other half
+first**: if the source-copy reference holds at q = 95..99 — where the encoder's and decoder's
+references match to 0.0000 and nobody can yet say why — RATE-3's third encode disappears and this
+ledger's marginal cost roughly halves.
+
+**What is settled, so nobody re-derives it:** GOP independence holds in these configs (no B-frames
+at ki=2 or ki=9, `rate_ctrl` is `None` without `--bitrate`, `pending_me` reset at each keyframe,
+`gpu_ref_planes` overwritten not accumulated) — **and `--bitrate` is the one input that breaks it**,
+so a sweep that passes it is measuring something else. The harness asserts both arms produce the
+same frame-type partition and refuses to print an oracle if any GOP's I bytes agree while its totals
+differ; 0 of 38 disagreed, twice, byte-identically.
 
 `encode` keeps the smaller of two candidates by comparing **that frame's** bytes. Inside a sequence
 that is the wrong ledger: a bit-exact I-frame carries detail a lossy one had already quantised away,
@@ -6411,7 +6560,7 @@ is an afternoon with an existing harness. Against that: the throughput half cann
 a shared machine at all (COORDINATION), and the rate gate may kill it before the shader work
 starts — which is why the gate is first.
 
-### ENT-9 — abac context-codes three decisions and bypasses the rest (**step 1 DONE 2026-09-08**, step 2 todo, P2)
+### ENT-9 — abac context-codes three decisions and bypasses the rest (**step 1 + step 2 milestone 1 DONE 2026-09-08**, bitstream half todo, P2)
 
 **Step 1 is answered and the item is not small. Decision record `0063`.** At q=99, **75.1% /
 75.5% / 43.6% of abac's own bits are bypassed** — sent at p=1/2 with no model at all — so the
@@ -6492,7 +6641,39 @@ subject of BUG-27 and RATE-3 — so the bypass share deeper in a GOP is unmeasur
 not obvious either way, and step 2's gate is on whole-file rate, which does not inherit the
 limitation.
 
-**Step 2 — build candidate A. Not started, and it is its own claim.** It changes the bitstream, so
+### Step 2 milestone 1 — candidate A survives real per-block adaptation (2026-09-08)
+
+`0063` named this the first thing step 2 must check: step 1b's bound pools statistics per plane
+and subband, charging no adaptation, while a real implementation cold-starts **24 new contexts per
+64×64 code-block** on the same 4096 symbols the existing 18 learn from — the effect that collapsed
+abac's own 256-stream variant from −6.6% to −0.7%.
+
+`adapt_bits_prefix_ctx` runs abac's **real probability engine** over the real shipped code-blocks
+(same `Prob`, same `ADAPT_SHIFT`, same cold start, −log2 p per decision), with the Exp-Golomb
+prefix context-coded instead of bypassed. Both arms cold, so only the binarisation differs:
+
+| sequence | q | step 1b, pooled | **adaptation charged** |
+|---|---|---|---|
+| crowd_run | 90 | −2.79% | **−2.83%** |
+| crowd_run | 99 | −8.20% | **−8.37%** |
+| bbb_extended | 90 | −0.55% | **−0.39%** |
+| bbb_extended | 99 | −2.44% | **−2.49%** |
+| old_town_cross | 90 | −2.85% | **−2.63%** |
+| old_town_cross | 99 | −9.07% | **−8.70%** |
+
+**It survives within ±0.4 points, and is larger with adaptation charged on three of six points.**
+The 256-stream precedent does not transfer, and why matters: there each coder had ~256 symbols for
+18 contexts; here the 24 new contexts sit inside a 4096-coefficient block and are exercised only
+by coefficients with |v| > 2 — still hundreds to thousands of decisions each. Where the adaptive
+arm *beats* the pooled bound it is tracking statistics that vary within the block, which a pooled
+estimate cannot.
+
+**What it clears, precisely.** The *bound*, on three of three at q=99. **Not** ENT-9's gate, which
+is ≥2% of **total rate** at bit-identical pixels — a real encode, and total rate carries the
+per-block length fields and container overhead these figures exclude. What is left is
+implementation cost, not whether the signal is there.
+
+**Step 2 — milestone 1 done (above); the bitstream half is not started and is its own claim.** It changes the bitstream, so
 `abac.rs`, `abac_encode.wgsl` and `abac_decode.wgsl` move together and must be re-verified
 byte-exact three ways; that is ENT-5-scale. Gate stays **≥2% of total rate at q=99 on ≥3
 sequences at bit-identical pixels** — A clears it on three of three post-RATE-3

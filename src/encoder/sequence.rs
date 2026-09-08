@@ -624,12 +624,17 @@ impl EncoderPipeline {
                              {i_bytes} B ({delta:+.2}%), {verdict}"
                         );
                         if p_bytes > i_bytes {
+                            // RATE-4/BUG-45: same scan as the keyframe branch, and for the same
+                            // two reasons — whether the reference can come from the source, and
+                            // therefore whether the third encode is needed at all.
+                            let source_integral = crate::source_is_integral(&frame_data);
                             let mut again = self.encode_as_reference(
                                 ctx,
                                 &frame_data,
                                 width,
                                 height,
                                 &frame_config,
+                                source_integral,
                             );
                             again.frame_type = FrameType::Intra;
                             // Same two steps the keyframe branch takes, in the same order: the
@@ -644,6 +649,7 @@ impl EncoderPipeline {
                                 padded_w,
                                 padded_h,
                                 padded_pixels,
+                                source_integral,
                             );
                             // The look-ahead ME belongs to the P encode that was just discarded.
                             // Dropping it forces fresh motion estimation for the next frame

@@ -4712,49 +4712,70 @@ peer's number is not the same as reading their tree.
 frame's reference is *not* simply its colour-converted source, because that buffer is at a
 different stage and scale. RATE-4 records the refutation.
 
-### BUG-49 — `q=100` on subsampled chroma is not lossless, and not even in luma (todo, **P1**)
+### BUG-49 — `q=100` chroma is 3-20x worse than `q=99` on subsampled input, and only there does 4:2:2 lose to 4:2:0 (todo, **P1**)
+**RETRACTION FIRST, because the filing was wrong about which plane.** This was filed as "not
+lossless even in luma" on per-plane PSNR taken from the decoded **RGB** converted to `yuv444p`.
+CLAUDE.md says exactly why that is invalid — *"a luma computed from decoded RGB is contaminated by
+chroma error"*, measured there at 3.7x overstatement — and it is invalid here by **13 dB**:
 
-Found 2026-09-08 by BUG-46, which needed the bit-exact candidate at 4:2:2 / 4:2:0 to be
-equivalent-quality and measured that it is not. Per-plane PSNR against the source, `gnc encode`
-→ `gnc decode`, ffmpeg `psnr` over `yuv444p`:
-
-| still | format | q | y | u | v |
+| still | format | metric | q=95 | q=99 | q=100 |
 |---|---|---|---|---|---|
-| blue_sky | 4:2:0 | **100** | **51.16** | 43.23 | 44.74 |
-| blue_sky | 4:2:0 | 95 | 53.09 | 56.73 | 57.88 |
-| kristensara | 4:2:2 | **100** | **51.04** | 43.63 | 43.54 |
-| kristensara | 4:2:0 | **100** | **51.85** | 45.76 | 44.31 |
-| bbb | 4:2:2 | **100** | **47.34** | 37.10 | 38.71 |
-| bbb | 4:2:0 | **100** | **47.66** | 37.43 | 39.30 |
+| blue_sky | 4:2:0 | **Y-PSNR in YCoCg-R** (valid) | 52.54 | 57.70 | **64.18** |
+| blue_sky | 4:2:0 | Y-PSNR from RGB (contaminated) | 53.76 | 59.63 | **48.48** |
 
-**4:4:4 at q=100 is exact — PSNR `inf`.** At 4:2:2 and 4:2:0 it is not, and the plane that damns
-it is **luma**: subsampling does not touch luma, so a lossless configuration must return it
-bit-exact. It returns 47–52 dB. Worse, q=95 at the same format has *better* luma than q=100
-(53.09 against 51.16 on blue_sky 4:2:0), which no quantiser story explains.
+**Luma at `q=100` is the best of the three, not the worst.** 57.4-66.9 dB across images and formats
+against 52.3-52.7 at q=95. The filed "y 51.16 / 47.34" figures were chroma error leaking into a
+luma number, and they are withdrawn. `scripts/ypsnr_de00.py` (needs the project venv for numpy) is
+the metric CLAUDE.md prescribes and it is what should have been used first.
 
-**In RGB the whole-image figures invert too.** q=100 reads **below** q=95 at the same format on
-every image measured: blue_sky 4:2:2 38.90 vs 52.05, 4:2:0 40.38 vs 51.60; kristensara 4:2:2 40.19
-vs 51.72; touchdown 4:2:2 40.72 vs 51.75; bbb 4:2:0 34.73 vs 38.56. And **4:2:2 is worse than
-4:2:0** on three of four images (blue_sky 38.90 vs 40.38, kristensara 40.19 vs 41.59, bbb 34.30 vs
-34.73), which is backwards: 4:2:2 keeps twice the chroma.
+**What survives is a colour defect, and it is larger than the retracted one.** dE00 against the
+source, `GNC_LOSSLESS_FALLBACK=0` so each row is the arm it claims to be:
 
-**Why it matters beyond neatness.** It is the reason BUG-46's fix had to be refused rather than
-shipped (`0078`), it scopes every RATE-2 / RATE-3 / LOSSLESS-3 figure to 4:4:4, and "lossless" is a
-claim this codec makes in GOALS §1 — at 4:2:2 and 4:2:0 it is currently false in the one plane
-subsampling leaves alone.
+| still | format | dE00 mean q=95 | q=99 | **q=100** | p95 q=99 | **p95 q=100** |
+|---|---|---|---|---|---|---|
+| blue_sky | 4:2:2 | 0.333 | 0.115 | **2.307** | 0.664 | **7.358** |
+| blue_sky | 4:2:0 | 0.354 | 0.139 | **1.949** | 0.727 | **5.742** |
+| bbb | 4:2:2 | 0.801 | 0.735 | **2.723** | 2.348 | **6.575** |
+| bbb | 4:2:0 | 1.017 | 0.960 | **2.557** | 3.210 | **6.146** |
+| kristensara | 4:2:2 | 0.408 | 0.140 | **2.142** | 0.716 | **5.649** |
+| kristensara | 4:2:0 | 0.423 | 0.160 | **1.888** | 0.746 | **4.850** |
 
-**Where to look first**, in the order the evidence suggests: the luma damage is the surprising half
-and it is *format-dependent*, so the fault is likely in how the MED path handles a plane geometry
-it only sees when chroma is subsampled — `chroma_padded_width()` / `chroma_padded_height()` and the
-tile grid derived from them, which is exactly the class BUG-11 and BUG-14 were (stream mapping
-against plane geometry). The 4:2:2-worse-than-4:2:0 inversion is the sharpest clue: 4:2:2 halves
-width only, so anything that assumes both dimensions shift together will read wrong there and
-"right" at 4:2:0.
+**q=100 is 2.7x to 20x worse in colour than q=99 at the same chroma format**, on 6 of 6 points, with
+p95 dE00 above 4.8 everywhere — well past a just-noticeable difference. A *lossless* mode is losing
+to a lossy one on the axis lossless is supposed to own. 4:4:4 at q=100 is exact (dE00 0.0000), so
+this is specific to subsampled input.
 
-**Success criterion:** `q=100` at 4:2:2 and 4:2:0 returns **luma bit-exact** (max |diff| 0 on Y,
-verified outside the harness) on ≥3 stills and ≥1 sequence, chroma within the subsampling bound,
-and 4:2:2 never worse than 4:2:0. Then re-run BUG-46's sweep: the refusal in `encode` comes off
-with the numbers that justified it.
+**And the inversion survives, now in a metric that can see colour.** 4:2:2 keeps twice the chroma
+of 4:2:0, so it must be better. At q=95 and q=99 it is (0.333 vs 0.354, 0.115 vs 0.139 on
+blue_sky). **At q=100 it is worse, on all three images** — 2.307 vs 1.949, 2.723 vs 2.557, 2.142 vs
+1.888. Whatever is wrong is wrong *specifically* at q=100 and *more* wrong when only one dimension
+is halved.
+
+**Two facts that narrow it a long way.** (1) The defect is q=100-only, and q=100 is the *only*
+rung that uses `TransformType::MedPredict` — so it is the MED path, not the wavelet. (2) Quantising
+chroma cannot *improve* it, so a q=99 encode being 20x better in dE00 means the two paths are not
+subsampling or reconstructing the same way; the difference is in the resample, not in the coding.
+File sizes rule out the crude explanation: bbb 4:2:0 q=100 is 1 847 304 B against 3 257 157 B at
+4:4:4, a ratio of 0.567 against the 0.5 the sample count predicts, so chroma really is being coded
+at reduced resolution.
+
+**Where to look, in order:** `chroma_resample.rs` and its call sites for an `is_lossless()` /
+`MedPredict` branch that changes the filter or skips a pass; then the encoder/decoder pair for
+*asymmetry* (a downsample that the upsample does not invert). The plane-extent class is a live
+alternative and the TILE-1 session flagged it independently:
+`entropy_helpers.rs:110` computes a plane extent as `padded_w * (tiles_y * tile_size)` while the
+buffer is `padded_w * padded_h`, and those two derivations agree for luma at 4:4:4 but need not
+agree for chroma at 4:2:2 — which is exactly the dimension asymmetry the inversion points at. Grep
+for `tiles_x() *` / `tiles_y() *` used as an *extent* rather than a count.
+
+**Success criterion:** at 4:2:2 and 4:2:0, `q=100` dE00 no worse than `q=99` at the same format on
+≥3 stills, and 4:2:2 never worse than 4:2:0. Report YCoCg-R luma alongside — it is currently
+*better* at q=100 and must stay that way. Then BUG-46's refusal in `encode` comes off (`0078`), and
+the sequence sweep at 4:2:2 / 4:2:0 that LOSSLESS-3 could not run becomes measurable.
+
+**Why P1 rather than P2:** GOALS §1 claims lossless as a mode, and on subsampled input the mode is
+currently worse in colour than the lossy rung below it. It also blocks three shipped mechanisms
+from reaching 4:2:2 / 4:2:0 at all (RATE-2, LOSSLESS-3, and the refusal in `0078`).
 
 ### BUG-46 — `lossless_sibling` did not carry the caller's chroma format (**FIXED 2026-09-08**, and the fix had to be refused)
 
@@ -5269,7 +5290,9 @@ wherever the candidate wins — verified outside the harness by md5 on a real `e
 **Scope, and it is load-bearing: −6.09% is a 4:4:4 figure.** BUG-46 found `lossless_sibling`
 dropping the caller's `chroma_format`, so on subsampled input the comparison was against a 4:4:4
 arm and the fallback could essentially never fire; `0078` now refuses it there outright, because
-BUG-49 has `q=100` luma coming back 47–52 dB instead of exact at 4:2:2/4:2:0. **The sequence sweep
+BUG-49 has `q=100` **colour** 2.7×–20× worse than q=99 at 4:2:2/4:2:0, 6 of 6 points (its luma
+half was retracted — measured through decoded RGB, and in YCoCg-R q=100 luma is the *best* rung).
+**The sequence sweep
 at those formats is not an open corner of this item — it cannot be run meaningfully until BUG-49
 is fixed.**
 
@@ -6591,11 +6614,19 @@ shaders. The original session was in `rice_decode.wgsl`, `rice_gpu.rs` and `rice
 17:52-17:53, which is where it stopped.
 
 **Cross-link worth having: BUG-49 is plausibly the same class.** It reports q=100 luma at 4:2:2/4:2:0
-coming back 47-52 dB instead of exact, with 4:2:2 *worse* than 4:2:0 — an inversion whose filer
-pins on "anything assuming both dimensions shift together", pointing at `chroma_padded_width()` /
-`chroma_padded_height()` and the tile grid derived from them. That is the same shape as the defect
-above: **a plane dimension derived two ways in one pipeline.** TILE-1 rewrites exactly that grid, so
-the two items should be read together — this may fix it, or share a root cause with it.
+degrading **colour** at 4:2:2/4:2:0 — dE00 2.7×–20× worse at q=100 than at q=99, 6 of 6 points,
+while 4:4:4 stays exact. Its original luma claim was retracted: it came from decoded RGB, and in
+YCoCg-R q=100 luma is the *best* rung (57.4–66.9 dB against 52.3–52.7 at q=95).
+
+The reason to read the two items together is the **inversion**: 4:2:2 beats 4:2:0 at q=95 and q=99,
+as more chroma must, and loses to it at q=100 on all three images. A plane dimension derived two
+ways is one candidate for that. **But the constraint is sharp and cuts against the simplest
+version:** the inversion is q=100-only, i.e. `MedPredict`-only, so `padded_w * (tiles_y *
+tile_size)` cannot be the whole story unless the MED path is the only one reading that extent —
+worth checking rather than assuming. Its filer also notes the difference looks like *resampling*
+rather than coding, since quantising chroma cannot improve it and q=99 is 20× better. TILE-1
+rewrites this grid, so it may subsume BUG-49 or share a cause with it; pre-TILE-1 `main`-pinned
+numbers are in that entry so the before is uncontaminated.
 
 **Also fixed on the way in, and it is not a TILE-1 defect:** the inherited work called its format
 **GP19**, which `main` had already given to ENT-9's abac prefix coding (`0074`). Renumbered to

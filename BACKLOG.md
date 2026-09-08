@@ -4745,9 +4745,8 @@ so none of them can carry five wavelet levels. Broadcast heights are not power-o
 (1080 = 8 x 135). Measured on bbb_1080p at q=90: tile 120 with zero padding and three levels costs
 **+81% of rate** against tile 256 with 20.9% padding and five levels. So the padding is by far the
 cheaper evil, and **having to choose at all is the defect** — partial border tiles the way JPEG
-2000 has them decouple tile size from frame size and give both. That is a bigger item than PAD-2
-and should be filed separately when someone is ready to scope it; the number above is what
-justifies scoping it.
+2000 has them decouple tile size from frame size and give both. That is a bigger item than PAD-2, and it is
+filed as **TILE-1**; the number above is what justifies scoping it.
 
 **The original filing** — the pre-shipping version of PAD-1, with the three candidate shapes and
 the oracle figure of −4.5% — is superseded by the two decision records that came out of it
@@ -4755,6 +4754,117 @@ the oracle figure of −4.5% — is superseded by the two decision records that 
 here because two of its claims are now wrong: the intra figure is −4.63% measured on the shipped
 encoder rather than −4.5% from an oracle, and it said the still-path fill would need a bitstream
 version, which it does not — `pad.wgsl` is compiled only in the encoder.
+
+### TILE-1 — partial border tiles, so tile size and frame size stop being alternatives (todo, **P2**)
+
+Filed 2026-09-08 by PAD-1, which shipped 4.6 of the 6.6 points the padding costs and then measured
+why the obvious cheaper escape does not exist. **Worth the remaining ~2 points on stills and the
+whole ~6.6 on any content, and it removes a choice the codec should not have to make.**
+
+**The constraint, measured rather than reasoned about.** The tile grid pads every plane up to a
+whole multiple of `tile_size`, so 1920x1080 is coded as 2048x1280 and **20.9% of the coded samples
+are outside the picture** (`0034`). A tile size that divides the frame exactly does exist —
+`gcd(W, H)`, so **120 at 1080p, 80 at 720p, 240 at 2160p** — but a tile must be divisible by
+`2^levels`, and **no tile size divisible by 32 divides 1080, 720 or 2160 at all**. Broadcast
+heights are not power-of-two friendly: 1080 = 8 x 135, 720 = 16 x 45, 2160 = 16 x 135.
+
+So today the choice is a deep wavelet with padding or a shallow one without, and it is not close —
+bbb_1080p at q=90 with `--abac`, tile 120 at three levels costs **+81% of rate** against tile 256
+at five levels, at the same PSNR (3 056 603 B against 1 689 447 B). **The padding is by far the
+cheaper evil, and having to choose at all is the defect.**
+
+**What this item is.** Let the border tiles be *incomplete*, the way JPEG 2000 does: **one** tile
+size as today, and the last row and column are simply clipped to what is left of the picture.
+Tile size and frame size decouple, five levels and zero padding stop being alternatives, and the
+padding tax goes to zero at every resolution rather than being reduced for stills.
+
+**Prefer that framing over "use a second, smaller tile size at the border", because it needs
+nothing signalled.** The frame header already carries `width` and `height` (`format.rs:80`) — it
+has to, in order to crop the padding away — so the border extents are just `W mod tile_size` and
+`H mod tile_size` and **both sides derive them with no bitstream change and no new config field**.
+The two-tile-size phrasing describes the same grid while adding a value to choose, store and keep
+consistent. It is the same mechanism with extra machinery.
+
+**What it touches, which is why it is P2 and not P1.** Tile origins and the tile grid; every
+shader that derives a position from `tile_size` (the wavelet's `region_size`, the quantiser's
+subband walk, the entropy coders' per-tile stream mapping); the per-tile CRC and the seek
+structures in the container. `transform_97.wgsl` also sizes its workgroup arrays from the tile, and
+BUG-26 is the standing reminder that WGSL does not trap an out-of-bounds workgroup access.
+
+**Success criterion.** Zero padded samples with five wavelet levels at **every** resolution in the
+table above — including 720x486 and 1366x768, which are the ones that break a
+remainder-factorisation approach and are therefore the real test; **>= 5% of intra rate** against today's default on the four stills (PAD-1 already collected
+4.6 of the 6.6 on stills, so the incremental win there is small — the case is that it also applies
+to video, where PAD-1 is refused); decoded output bit-exact against today's on any resolution that
+is already a whole number of tiles, which is the regression guard that says the grid rework did not
+change coding.
+
+**The tax is resolution-dependent and 1080p is not the worst case.** Raised in review: there are
+far too many resolutions for a 1080p-shaped fix to be worth anything. Correct, and the spread is
+wider than the headline suggests — `W mod 256` / `H mod 256`, and how deep a *clipped* border tile
+could go on today's shader:
+
+| | remainder W | levels | remainder H | levels | padding today |
+|---|---|---|---|---|---|
+| 1920x1080 | 128 | 7 | 56 | **3** | 20.9% |
+| 1280x720 | 0 | full | 208 | 4 | 6.2% |
+| 3840x2160 | 0 | full | 112 | 4 | 6.2% |
+| 2048x1080 (DCI 2K) | 0 | full | 56 | 3 | 15.6% |
+| 720x576 (PAL) | 208 | 4 | 64 | 6 | **29.7%** |
+| 720x486 (NTSC) | 208 | 4 | 230 | **1** | 11.0% |
+| 1366x768 | 86 | **1** | 0 | full | 11.1% |
+| 1920x818 (scope crop) | 128 | 7 | 50 | **1** | 25.1% |
+| 7680x4320 | 0 | full | 224 | 5 | 0.7% |
+
+**0.7% to 29.7%, worst on the small and odd formats** — PAL pads 720x576 to 768x768 and throws
+away nearly a third. Also worth knowing: 720p, 2160p, DCI 4K, 1440p and 4320p have a zero
+remainder in *width*, so for them only the height is a problem, which is a smaller job than the
+general case.
+
+**There are two stages, and the first one is a probe rather than a solution.**
+
+*Stage A — clipped border tiles with a per-tile level count.* First, the variant that does **not**
+work, because it is worth knowing why: a grid in which *every* tile still carries five levels is
+arithmetically impossible, since every tile extent would have to be divisible by 32 and a sum of
+multiples of 32 is a multiple of 32 — 1080 is not (1080 = 32 x 33 + 24). But allowing the border
+tiles **fewer levels** goes up exactly:
+
+| 1920x1080, interior tile 256 | |
+|---|---|
+| width | 7 full tiles (1792) + a remainder of **128** — 7 clean halvings, so five levels is free |
+| height | 4 full tiles (1024) + a remainder of **56** — 3 clean halvings, so three levels |
+| the short bottom strip | **5.2% of the picture** |
+
+At 1080p that is three levels instead of five on 5.2% of the picture, against saving the whole 6.6
+points — a far better trade than the uniform tile 120 measured above (+81%), where the shallow
+wavelet applied to *all* of the picture and brought 3.6x the tile count with it.
+
+**But 1080p is a lucky draw and this does not generalise, which is the point of the table above.**
+The border tile's depth is a lottery on how the remainder factorises: NTSC gets **one level over
+230 of its 486 rows — 47% of the picture** — and 1366x768 gets one level in width. A height of
+1081 would leave a remainder of 57, odd, so **zero halvings and no transform at all** in the strip.
+So Stage A is worth building only as the probe that de-risks the grid rework; **it is not the fix.**
+Needs: tile origins from a prefix sum rather than `index * tile_size`, a per-tile level count
+through the quantiser's subband walk and the entropy coders' stream mapping, and tiles below
+`MIN_TILE_SIZE` (56 < 64) to be allowed for border tiles specifically. The workgroup arrays in
+`transform_97.wgsl` are sized for 512 and so already cover a smaller tile.
+
+*Stage B — drop the divisibility requirement. **This is the item**; Stage A is scaffolding.* Only
+this is general across resolutions, and **the constraint is GNC's, not the wavelet's.** `transform_97.wgsl:67` is `let half = ts / 2u` — the
+shader assumes an even extent and clean halvings all the way down. A 9/7 lifting DWT works on any
+length: lowpass gets `ceil(N/2)`, highpass `floor(N/2)`, and whole-point symmetric extension
+handles the odd end. That is exactly how JPEG 2000 transforms a short border tile at full depth.
+Relaxing it means odd-length handling in the lifting steps and subband sizes that are no longer a
+clean power-of-two split. It is the harder half and the only half that works at every resolution,
+so the success criterion below is Stage B's.
+
+**The reason this outranks both PAD items in reach:** removing the padding removes the *reference*
+problem with it. There is nothing outside the picture to predict from, so PAD-1's 4.03 dB inter
+failure and PAD-2's bitstream version both simply do not arise, and the win applies to video, where
+PAD-1 is switched off. **Start with Stage A on one resolution and one code path** — an intra still
+at 1920x1080, 256 interior with 128-wide and 56-tall border tiles, interior tiles checked
+byte-exact against today's output. If the shader sizing fights it, that is the real cost and it is
+better known early.
 
 ### INTRA-2 — apply the dead zone to I-frames only (todo, **P1**)
 

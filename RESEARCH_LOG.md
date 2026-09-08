@@ -149,11 +149,31 @@ default. Indicative rather than a BD-rate: one image, one q, and it mixes two ef
 120 also means 144 tiles instead of 40 and therefore more per-tile overhead and more of ENT-6's
 code-block cold start. The margin is far too large for either to move the conclusion.
 
-**What the question actually exposes is that having to choose is the defect.** Partial border tiles
-— JPEG 2000's answer — decouple tile size from frame size and give five levels *and* zero padding.
-That is the whole 6.6 points rather than the 4.6 shipped here, it is an architecture change, and
-the +81% above is what says it would be worth scoping. Recorded next to `MAX_TILE_SIZE`, which is
-where someone wondering about tile sizes lands.
+**And a follow-up in the same review kept it honest: there are far too many resolutions for a
+1080p-shaped answer to be worth anything.** `W mod 256` / `H mod 256` across common formats, with
+how deep a *clipped* border tile could go on today's shader:
+
+| | rem W | levels | rem H | levels | padding today |
+|---|---|---|---|---|---|
+| 1920x1080 | 128 | 7 | 56 | **3** | 20.9% |
+| 720x576 (PAL) | 208 | 4 | 64 | 6 | **29.7%** |
+| 720x486 (NTSC) | 208 | 4 | 230 | **1** | 11.0% |
+| 1366x768 | 86 | **1** | 0 | full | 11.1% |
+| 1920x818 (scope) | 128 | 7 | 50 | **1** | 25.1% |
+| 7680x4320 | 0 | full | 224 | 5 | 0.7% |
+
+Two things fall out. **The tax is 0.7% to 29.7%, worst on the small and odd formats** — PAL pads
+720x576 to 768x768 and throws away nearly a third, so 1080p's 20.9% is not a worst case. And
+**1080p's remainder is a lucky draw**: 56 = 8 x 7 gives three levels over 5.2% of the picture,
+where NTSC would get **one level over 47% of its rows** and a height of 1081 would leave an odd
+remainder, so zero halvings and no transform at all.
+
+**So the answer is not a tile size, nor a second tile size at the border, but dropping the
+divisibility requirement** — which is GNC's own (`transform_97.wgsl:67`, `let half = ts / 2u`) and
+not the wavelet's. A 9/7 lifting DWT works on any length with `ceil(N/2)` / `floor(N/2)` subbands,
+which is how JPEG 2000 transforms a short border tile at full depth. Filed as **TILE-1** with the
++81% as the reason to scope it and the table above as the reason it cannot be done per resolution.
+Also recorded next to `MAX_TILE_SIZE`, where someone wondering about tile sizes lands.
 
 ### Failures and dead ends
 

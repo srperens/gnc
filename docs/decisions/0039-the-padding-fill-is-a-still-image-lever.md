@@ -146,7 +146,8 @@ the raw input buffer. Five chances of a silent per-path bug, to buy 0.19 points.
   and the per-tile CRC and seek structures. The ceiling above a fill change is 6.6, not 27.
   **This is what the tile-size row above actually argues for**: partial border tiles decouple tile
   size from frame size, so the deep wavelet and zero padding stop being alternatives. Having to
-  choose between them is the defect; the fill shipped here only makes the choice cheaper.
+  choose between them is the defect; the fill shipped here only makes the choice cheaper. Filed as
+  **TILE-1**, with the +81% as its justification for being scoped at all.
 - **A 32 px ramp instead of 8.** −4.08% against −4.63%: a longer fade leaves more of the edge
   line's detail in the padding.
 - **Mirroring the picture into the padding**, the textbook alternative: **+11.4%**, i.e. 16 points

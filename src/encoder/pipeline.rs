@@ -81,6 +81,23 @@ pub struct EncoderPipeline {
     /// Minimal intermediate buffers for spatial wavelet pre-compute (B set).
     /// Allows next GOP's spatial wavelet to run concurrently with current GOP's high_enc.
     pub(super) sp_cached_b: Option<super::buffer_cache::SpatialPrecomputeBuffers>,
+    /// RATE-4: I-frames whose reference was built from the colour-converted source rather than
+    /// by dequantising and inverting the coefficients.
+    ///
+    /// A **run-level** count, which is the thing RATE-4 asked for and the per-frame canary lines
+    /// could not give: "the path ran once" and "a sequence took it 47 times" are different facts,
+    /// and only the second one prices the encode it removes.
+    pub(super) ref_from_source_frames: u32,
+    /// Serialised size of the **bit-exact** candidate the last `encode` coded, win or lose
+    /// (LOSSLESS-3, `0073`).
+    ///
+    /// `encode` codes that candidate at q = 95..=99 for RATE-2's own comparison and then throws
+    /// the number away. The sequence encoder uses it as a cheap trigger: `n` times this is what a
+    /// bit-exact all-intra encode of the whole clip costs to within a per-frame ±0.4%, so it says
+    /// whether the second pass is worth coding at all. The *decision* is then taken on two
+    /// measured totals, never on this estimate. Kept here rather than widening `encode`'s return
+    /// type, which every existing caller would have to change.
+    pub(super) last_lossless_candidate_bytes: Option<usize>,
 }
 
 impl EncoderPipeline {
@@ -752,6 +769,8 @@ impl EncoderPipeline {
             tw_cached: None,
             tw_cached_b: None,
             sp_cached_b: None,
+            ref_from_source_frames: 0,
+            last_lossless_candidate_bytes: None,
         }
     }
 
@@ -1582,6 +1601,36 @@ impl EncoderPipeline {
             return self.encode_once(ctx, rgb_data, width, height, config);
         }
 
+        // **A fourth refusal, and it is a refusal to compare rather than a refusal to code.**
+        // This whole decision rests on the bit-exact candidate being better on *both* axes when
+        // it is smaller. On subsampled chroma it is not: `q=100` at 4:2:2 / 4:2:0 is **not
+        // lossless even in luma**, which subsampling does not touch. Measured against the source,
+        // per plane, at q=100 — 4:4:4 is exact (PSNR inf) and the subsampled formats are not:
+        //
+        //   blue_sky   4:2:0   y 51.16  u 43.23  v 44.74     (q=95 at 4:2:0: y 53.09, u 56.73)
+        //   kristensara 4:2:2  y 51.04  u 43.63  v 43.54
+        //   bbb        4:2:2   y 47.34  u 37.10  v 38.71
+        //
+        // So the candidate is 8.5-13.1 dB *worse* in RGB than the lossy arm it would replace, and
+        // taking it on bytes alone would trade 3.9 dB for 2.7% of rate at 4:2:0 — measured on bbb
+        // at q=99, which is exactly what BUG-46's one-line fix turned on before this refusal was
+        // added. That defect is **BUG-49**; until it is fixed there is no two-axis win to collect
+        // here, and this must stay a refusal rather than become a rate/quality trade.
+        //
+        // Before BUG-46 the same input was refused *by accident*: `lossless_sibling` did not carry
+        // `chroma_format`, so the candidate was always a 4:4:4 encode and never won. The sibling
+        // is honest now and the refusal is explicit.
+        if config.chroma_format != crate::ChromaFormat::Yuv444 {
+            // Canary: it prints on exactly the encodes that would otherwise have compared two
+            // candidates of different quality (CLAUDE.md, "no silent features").
+            eprintln!(
+                "GNC: RATE-2 lossless fallback refused — {:?} chroma, where q=100 is \
+not lossless even in luma (BUG-49). Coding the wavelet candidate only.",
+                config.chroma_format
+            );
+            return self.encode_once(ctx, rgb_data, width, height, config);
+        }
+
         // **The order of these two encodes is load-bearing. Do not swap them back.**
         //
         // `encode_once` leaves state on the GPU that the sequence encoder reads as a side channel:
@@ -1607,6 +1656,9 @@ impl EncoderPipeline {
             crate::format::serialize_compressed(&lossy).len(),
             crate::format::serialize_compressed(&lossless).len(),
         );
+        // LOSSLESS-3: publish the bit-exact candidate's size even when it loses, so the sequence
+        // encoder can tell whether a whole bit-exact arm is worth coding without coding it.
+        self.last_lossless_candidate_bytes = Some(lossless_bytes);
         // The canary. It prints on every frame that takes this path, whichever way it goes, so
         // "the fallback ran and chose the lossy file" is distinguishable from "the fallback did
         // not run" — a silent feature is worse than no feature (CLAUDE.md).
@@ -1650,8 +1702,18 @@ impl EncoderPipeline {
         width: u32,
         height: u32,
         config: &CodecConfig,
+        source_integral: bool,
     ) -> CompressedFrame {
         let chosen = self.encode(ctx, rgb_data, width, height, config);
+        // **RATE-4: the third encode is only needed when the reference comes from the side
+        // channel, and for a bit-exact frame it no longer does.** `local_decode_iframe_gpu`
+        // builds that reference by colour-converting the source, which is measurably the same
+        // picture (`crate::reference_from_source`), so there is nothing to repair. The repair
+        // stays for every frame that predicate refuses — subsampled chroma, and fractional input
+        // where q=100 is not bit-exact at all (BUG-45).
+        if source_integral && crate::reference_from_source(&chosen.config) {
+            return chosen;
+        }
         // The side channel is the second encode's, which is the configured path. It is already
         // the right one unless the sibling won — and the sibling is the only candidate that can
         // differ from `config` here, because `encode` refuses the fallback for anything else.
@@ -1689,6 +1751,24 @@ impl EncoderPipeline {
         // the weights are packed for the GPU and written into the header.
         let owned_config = config.normalized_for_lossless();
         let config = &owned_config;
+        // **BUG-45.** `is_lossless()` is a statement about the settings; bit-exactness also needs
+        // integer samples. At q=100 the step is 1.0 and MED's residual is a difference of
+        // integers, so fractional f32 input is rounded and the file is lossy while every
+        // `is_lossless()` in the codec still reports true. Same family as BUG-15 and BUG-30 — a
+        // setting outside the guarantee, silently taken — and the reason it stayed invisible is
+        // that PNG and Y4M input is integral, so only an API caller can reach it.
+        //
+        // Warned rather than refused: the samples cannot be normalised without changing the
+        // picture, so the honest options are to say so or to reject the frame, and rejecting a
+        // frame the caller can legitimately want coded lossily is worse than telling them what
+        // they got. `local_decode_iframe_gpu` uses the same predicate to decline building a
+        // reference from a source the reconstruction does not equal.
+        if config.is_lossless() && !crate::source_is_integral(rgb_data) {
+            eprintln!(
+                "GNC: lossless settings (q=100 / qstep<=1) with non-integer input samples — the \
+                 step-1 quantiser rounds, so this frame is NOT bit-exact (BUG-45)"
+            );
+        }
         let profile = std::env::var("GNC_PROFILE").is_ok();
         let t_start = std::time::Instant::now();
 

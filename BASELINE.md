@@ -231,6 +231,23 @@ up to **+69% for identical pixels**. `GNC_LOSSLESS_INTRA_RECODE=0` reproduces th
 Animation keeps its P-frames and its rows are unchanged. **No fps is quoted: eight sessions shared
 the GPU.**
 
+## Lossless sequences at q = 95..=99 (8 frames, 4:4:4, Rice)
+
+New section 2026-09-08 (LOSSLESS-3, `0073`). Above q≈95 a camera sequence is emitted **bit-exact**
+when that is smaller, so these rows are the same files as the q=100 rows above — byte-identical on
+all three camera sequences, which is the regression check:
+
+| sequence | q=95 | q=97 | q=99 | what it was |
+|---|---|---|---|---|
+| crowd_run (ki=9) | 25 856 146 | 25 856 146 | 25 856 146 | 31 427 614 / 34 374 105 / 37 984 009 |
+| old_town_cross (ki=9) | 25 247 023 | 25 247 023 | 25 247 023 | 31 440 634 / 34 391 448 / 38 010 958 |
+| blue_sky (ki=9) | 17 294 725 | 17 294 725 | 17 294 725 | 19 231 299 / 21 659 527 / 24 812 142 |
+| bbb (ki=9, animation) | 17 896 639 | 20 924 647 | 24 290 268 | unchanged — the fallback does not fire |
+
+−10.07% to −33.58% at ki=9 and −5.95% to −22.15% at ki=2, at *exact* pixels rather than 53-61 dB.
+`GNC_LOSSLESS_SEQUENCE_FALLBACK=0` reproduces the old column. 4:4:4 only until BUG-46; refused when
+a bitrate target is set. **No fps is quoted: eight sessions shared the GPU.**
+
 ## Reported bitrate correction (2026-09-05)
 
 `CompressedFrame::byte_size()` counted motion vectors as 4 raw bytes per block while the
@@ -311,15 +328,48 @@ q=85,92,96,99 against crf=1,2,4,8.
 | | bbb_extended | old_town_cross | crowd_run | **mean** |
 |---|---|---|---|---|
 | full video (ki=9), Rice | **+128.5%** | **+70.2%** | **+68.8%** | **+89.2%** |
-| full video (ki=9), `--abac` | **+91.8%** | **+53.1%** | **+53.0%** | **+66.0%** |
+| full video (ki=9), `--abac` | **+89.0%** | **+47.4%** | **+46.6%** | **+61.0%** |
 | curve overlap | 49.9–56.0 dB | 49.8–55.9 dB | 49.8–56.0 dB | |
+| `--abac` before ENT-9 (MEAS-10) | +91.8% | +53.1% | +53.0% | +66.0% |
 | QUAL-1 (2026-09-06), Rice | +129.0% | +71.9% | +70.6% | +90.5% |
 
+**The `--abac` row is MEAS-11 (2026-09-08), re-taken at `a0880c7`; the Rice row reproduced there
+exactly and is unchanged.** Both arms on one binary, which is what makes them comparable.
+
 **GNC Rice needs about 1.9x the bitrate of H.264 for the same luma PSNR at contribution quality.
-`--abac` is 1.66x** — same pixels as Rice at every rung (PSNR-Y identical to two decimals),
-only the bytes moved. That is the canary the path ran. Saving vs Rice decays with quality
-(crowd_run −12.2% at q=85 to −3.7% at q=99), which is ENT-3's finding on this ladder.
+`--abac` is 1.61x** — same pixels as Rice at every rung, and MEAS-11 measured that canary rather
+than inheriting it: the PSNR-Y delta is **+0.0000 dB at all 12 rungs**, i.e. bit-identical, not
+merely equal to two decimals as this line used to say. Only the bytes moved.
 Rice stays the default; quote **+89.2%** unless the command included `--abac`.
+
+**ENT-9 also flattened the decay, which is the part worth noticing.** The saving over Rice used to
+collapse as quality rose — crowd_run −12.2% at q=85 to −3.7% at q=99, an 8.5-point fall, and that
+was ENT-3's headline finding on this ladder. Measured at `a0880c7` it is **−14.10% at q=85 to
+−11.78% at q=99: a 2.3-point fall.** The mechanism agrees — `0074` context-codes the Exp-Golomb
+prefix and is worth −6.29% mean at q=99 against −2.06% at q=90, so it helps most exactly where the
+old decay hurt. **So "abac's advantage decays with quality" is much weaker than recorded, not
+merely smaller.** Per-rung saving vs Rice at `a0880c7`:
+
+| q | bbb_extended | old_town_cross | crowd_run |
+|---|---|---|---|
+| 85 | −20.12% | −13.82% | −14.10% |
+| 92 | −18.56% | −13.57% | −13.41% |
+| 96 | −16.14% | −13.27% | −12.91% |
+| 99 | −14.26% | −12.24% | −11.78% |
+
+> **Both rows are conservative again, and this time it is not abac. LOSSLESS-3 (`ab3e2d2`) landed
+> after `a0880c7`** and emits a camera sequence bit-exact above q=95, worth −5.95% to −33.58% of
+> container bytes at exact pixels. **This ladder has rungs at q=96 and q=99**, and two of its three
+> sequences are camera content, so both the Rice and the `--abac` rows are cheaper on today's HEAD
+> by an unmeasured amount concentrated in the top half of the ladder. The change is
+> coder-independent, so it does **not** disturb the abac-vs-Rice comparison above — both arms were
+> measured on the same binary at the same commit, which is exactly why MEAS-11 required that.
+>
+> **This is the second consecutive re-take invalidated by a landing during or just after it, and
+> that is now a pattern rather than bad luck.** ENT-9 made MEAS-10's row conservative; LOSSLESS-3
+> made MEAS-11's conservative before it was written up. With eight sessions merging, "current HEAD"
+> is not a thing a hand-run four-rung ladder can describe. **Do not re-take this chasing HEAD** —
+> quote it with its commit, as the rows above now do.
 
 The move from QUAL-1's +90.5% to +89.2% is **1.3 points**, all in the direction INTER-2
 predicted: only q=85 of this ladder sits in the inter-dead-zone change (q ≤ 88), so a
@@ -342,13 +392,22 @@ interpolation by rate should flag that.
 fix was intra-only. RATE-3 landed the same day (`docs/decisions/0044`) and does move it.** A still
 at q=95–99 codes both ways and keeps the smaller (mean −21.66% at q=99), and since RATE-3 a
 **sequence I-frame does too**: the gate that refused the fallback inside a sequence is lifted, worth
-mean **−4.28%** of sequence bytes over three sequences at q ∈ {95, 99} and ki ∈ {2, 9}, up to
-**−13.16%**, at a worst quality move of −0.01 dB.
+mean **−6.09%** of sequence bytes over three sequences at q ∈ {95, 99} and ki ∈ {2, 9}, up to
+**−16.19%**, at a worst quality move of −0.01 dB.
+
+**Those two figures were −4.28% and −13.16% until 2026-09-08 and moved for a fix, not a re-take**
+(BUG-47, `docs/decisions/0072`): `lossless_sibling` did not carry `pad_fill_decay`, so the bit-exact
+candidate was coded with a still's decay-filled padding while acting as a sequence reference. The
+same twelve points now have **0 of 12 worse than the control**, where RATE-3 recorded two
+regressions of +0.58% and +0.40%. The 4:2:0 ladder below is affected in the same direction and by
+an unmeasured amount — the fix applies wherever the bit-exact sibling is used, and only 4:4:4 was
+measured.
 
 **So the ladder's top two rungs are stale.** It is q=85/92/96/99 and `quality_preset` sets the
 fallback for q = 95..=99 only, so **q=96 and q=99 move; q=85/92 do not.** The direction favours GNC
 and the size is not guessable from RATE-3's sweep: this ladder is 4:2:0 at ki=9, where RATE-3
-measured −2.4% to −5.7%, not the −13% of its best point. **+89.2% stands as recorded until
+measured −2.4% to −5.7%, not the −13% of its best point — and both ends of that range predate
+BUG-47, so they are floors rather than estimates now. **+89.2% stands as recorded until
 `meas1_vs_h264.py` is run again** — as with the INTER-2 note above, a predicted direction is not a
 measurement. Two of the four rungs have now moved for two independent reasons (INTER-2 at q=85,
 RATE-3 at q=96 and q=99), which makes re-running this ladder the highest-value measurement in the

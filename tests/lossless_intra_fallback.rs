@@ -1,0 +1,282 @@
+//! LOSSLESS-2 & LOSSLESS-3 — a P-frame competes with an I-frame of the same picture.
+//!
+//! At `q=100` every frame decodes bit-exact (BUG-39, `docs/decisions/0064`), so the two
+//! candidates for one frame are the *same picture* and the choice between them is bytes alone.
+//! Measured on real content: a P-frame costs **+74.6% to +80.8%** of its own I-frame on camera
+//! content and **−2.8% to −3.3%** on animation. The encoder now re-codes the losing case as an
+//! I-frame.
+//!
+//! What is verified here, on synthetic content chosen so the two directions are unambiguous:
+//!   1. A smooth picture with fresh grain per frame — the P residual is the difference of two
+//!      independent grain fields, so it costs more than intra-predicting the smooth picture —
+//!      must come out **all-Intra**, and still bit-exact.
+//!   2. A static sequence — the P residual is zero — must **keep its P-frames**, which is the
+//!      half that proves the rule is a comparison and not a blanket "no P-frames at q=100".
+//!   3. The gate: at q=99 the *per-frame* comparison is not free — the candidates differ in
+//!      quality — so the frame types must be unchanged whatever the sizes are.
+//!   4. LOSSLESS-3 (`0073`), the sequence-level half: at q = 95..=99 the clip is never larger
+//!      than a bit-exact all-intra encode of itself. That is the invariant, and it is asserted
+//!      against an arm the test codes itself rather than against a recorded number.
+
+use gnc::decoder::pipeline::DecoderPipeline;
+use gnc::encoder::pipeline::EncoderPipeline;
+use gnc::{EntropyCoder, GpuContext};
+use std::sync::OnceLock;
+
+static GPU: OnceLock<GpuContext> = OnceLock::new();
+
+fn gpu() -> &'static GpuContext {
+    GPU.get_or_init(GpuContext::new)
+}
+
+/// A smooth picture plus a *fresh* small noise field per frame — the camera-content mechanism
+/// in miniature. MED predicts the smooth part almost exactly, so an I-frame costs about one
+/// noise field; the temporal difference of two independent fields has twice the variance, so a
+/// P-frame costs about half a bit per sample more. That is why real camera content pays +75% to
+/// +80% for a lossless P-frame.
+///
+/// **Not full-amplitude noise.** A first draft used uniform 0..255 per frame and the two
+/// candidates came out within **±0.03%** of each other (245 309 B against 245 382 B): both paths
+/// hit the same incompressible floor, so pure noise is a *tie* and cannot test a direction.
+fn grainy(w: u32, h: u32, seed: u32) -> Vec<f32> {
+    let mut s = seed.wrapping_mul(2_654_435_761).wrapping_add(1);
+    let mut out = ramp(w, h);
+    for v in out.iter_mut() {
+        s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        let n = (((s >> 24) & 0x0f) as f32) - 7.5;
+        *v = (*v + n).clamp(0.0, 255.0).round();
+    }
+    out
+}
+
+/// Something with structure, so the still path is not coding pure noise in the static test.
+fn ramp(w: u32, h: u32) -> Vec<f32> {
+    let mut out = vec![0.0f32; (w * h * 3) as usize];
+    for y in 0..h as usize {
+        for x in 0..w as usize {
+            let i = (y * w as usize + x) * 3;
+            out[i] = ((x * 255) / w as usize) as f32;
+            out[i + 1] = ((y * 255) / h as usize) as f32;
+            out[i + 2] = (((x + y) * 255) / (w + h) as usize) as f32;
+        }
+    }
+    out
+}
+
+fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max)
+}
+
+fn encode(frames: &[Vec<f32>], w: u32, h: u32, q: u32) -> Vec<gnc::CompressedFrame> {
+    let refs: Vec<&[f32]> = frames.iter().map(|f| f.as_slice()).collect();
+    let mut config = gnc::quality_preset(q);
+    config.entropy_coder = EntropyCoder::Rice;
+    config.keyframe_interval = 9;
+    // Independent noise is a scene cut at every frame, and the detector would force keyframes
+    // for a reason that has nothing to do with this item — the first draft of this test passed
+    // on that instead of on the rule it claims to check. Off, so the P path is actually taken.
+    config.scene_cut_threshold = 0.0;
+    let mut enc = EncoderPipeline::new(gpu());
+    enc.encode_sequence(gpu(), &refs, w, h, &config)
+}
+
+#[test]
+fn a_grainy_sequence_is_coded_all_intra_at_q100() {
+    let (w, h) = (256u32, 256u32);
+    let frames: Vec<Vec<f32>> = (0..5).map(|i| grainy(w, h, 7 + i)).collect();
+    let cf = encode(&frames, w, h, 100);
+
+    let types: Vec<gnc::FrameType> = cf.iter().map(|f| f.frame_type).collect();
+    assert!(
+        types.iter().all(|t| *t == gnc::FrameType::Intra),
+        "a P-frame whose residual is the difference of two independent grain fields costs more \
+         than an I-frame of the same picture, so every frame should have been re-coded as \
+         Intra; got {types:?}"
+    );
+
+    // The guarantee that makes the choice free must survive the re-code.
+    let dec = DecoderPipeline::new(gpu());
+    let decoded = dec.decode_sequence(gpu(), &cf);
+    for (i, (d, o)) in decoded.iter().zip(&frames).enumerate() {
+        assert_eq!(
+            max_abs_diff(o, d),
+            0.0,
+            "frame {i} is not bit-exact after the LOSSLESS-2 re-code"
+        );
+    }
+}
+
+#[test]
+fn a_static_sequence_keeps_its_p_frames_at_q100() {
+    let (w, h) = (256u32, 256u32);
+    let base = ramp(w, h);
+    let frames: Vec<Vec<f32>> = (0..5).map(|_| base.clone()).collect();
+    let cf = encode(&frames, w, h, 100);
+
+    assert_eq!(
+        cf[0].frame_type,
+        gnc::FrameType::Intra,
+        "frame 0 is the keyframe"
+    );
+    let inter: Vec<gnc::FrameType> = cf[1..].iter().map(|f| f.frame_type).collect();
+    assert!(
+        inter.iter().all(|t| *t == gnc::FrameType::Predicted),
+        "a P-frame over a static picture codes a zero residual and must win, or LOSSLESS-2 has \
+         become a blanket refusal of lossless P-frames rather than a comparison; got {inter:?}"
+    );
+
+    let dec = DecoderPipeline::new(gpu());
+    let decoded = dec.decode_sequence(gpu(), &cf);
+    for (i, (d, o)) in decoded.iter().zip(&frames).enumerate() {
+        assert_eq!(max_abs_diff(o, d), 0.0, "frame {i} is not bit-exact");
+    }
+}
+
+#[test]
+fn below_q100_the_choice_is_the_sequences_and_never_a_mixture() {
+    let (w, h) = (256u32, 256u32);
+    let frames: Vec<Vec<f32>> = (0..5).map(|i| grainy(w, h, 7 + i)).collect();
+    let cf = encode(&frames, w, h, 99);
+
+    // Below q=100 the two candidates for a frame are *not* the same picture, so the per-frame
+    // comparison is not free and must not run: a P-frame swapped for a bit-exact I-frame makes
+    // the next P-frame 4.5-9.9% more expensive (`0073`), which is what made the greedy version a
+    // ratchet. What may happen is the *sequence*-level fallback, and that is all-or-nothing.
+    // So the frame types must be one of two shapes, never a mixture.
+    let types: Vec<gnc::FrameType> = cf.iter().map(|f| f.frame_type).collect();
+    let all_intra = types.iter().all(|t| *t == gnc::FrameType::Intra);
+    let lossy_shape = types[0] == gnc::FrameType::Intra
+        && types[1..].iter().all(|t| *t == gnc::FrameType::Predicted);
+    assert!(
+        all_intra || lossy_shape,
+        "q=99 must produce either the lossy arm (I then all P) or the bit-exact all-intra arm, \
+         never a per-frame mixture; got {types:?}"
+    );
+    // And if it went all-intra it went there by being bit-exact, not by re-coding frames lossily.
+    if all_intra {
+        assert!(
+            cf.iter().all(|f| f.config.is_lossless()),
+            "an all-intra result below q=100 is the bit-exact fallback, so every frame must \
+             carry a lossless config"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LOSSLESS-3 — the same question one level up, decided on the whole sequence
+// ---------------------------------------------------------------------------
+
+/// A bit-exact all-intra encode of the same frames, coded here rather than trusted: it is the
+/// arm the sequence encoder is supposed to fall back to.
+fn bit_exact_all_intra_bytes(frames: &[Vec<f32>], w: u32, h: u32, q: u32) -> usize {
+    let mut sibling = gnc::lossless_sibling(&gnc::quality_preset(q));
+    sibling.entropy_coder = EntropyCoder::Rice;
+    // What the encoder's own arm uses: the decay padding fill is a loss at q=100 (BUG-48), so
+    // comparing against a sibling that kept it would make this assertion 0.78% too generous.
+    sibling.pad_fill_decay = false;
+    let mut enc = EncoderPipeline::new(gpu());
+    frames
+        .iter()
+        .map(|f| enc.encode(gpu(), f, w, h, &sibling).byte_size())
+        .sum()
+}
+
+#[test]
+fn a_q95_to_q99_sequence_is_never_larger_than_bit_exact_all_intra() {
+    let (w, h) = (256u32, 256u32);
+    // Grain on a ramp is the camera mechanism in miniature (see `grainy`): the wavelet ladder
+    // spends heavily on the grain while MED predicts the ramp, which is the case where the
+    // bit-exact arm should win outright.
+    let frames: Vec<Vec<f32>> = (0..5).map(|i| grainy(w, h, 31 + i)).collect();
+    for q in [95u32, 97, 99] {
+        let cf = encode(&frames, w, h, q);
+        let shipped: usize = cf.iter().map(|f| f.byte_size()).sum();
+        let bit_exact = bit_exact_all_intra_bytes(&frames, w, h, q);
+        assert!(
+            shipped <= bit_exact,
+            "q={q}: the shipped sequence is {shipped} B and a bit-exact all-intra encode of the \
+             same frames is {bit_exact} B — the sequence fallback should have taken the smaller"
+        );
+    }
+}
+
+#[test]
+fn a_sequence_the_lossy_ladder_wins_keeps_its_p_frames() {
+    let (w, h) = (256u32, 256u32);
+    // A static smooth picture: the lossy arm codes almost nothing after the first frame, so the
+    // bit-exact arm cannot win and the fallback must not fire. Without this the test above would
+    // pass on an encoder that had simply become all-intra at q >= 95.
+    let base = ramp(w, h);
+    let frames: Vec<Vec<f32>> = (0..5).map(|_| base.clone()).collect();
+    let cf = encode(&frames, w, h, 97);
+    let inter: Vec<gnc::FrameType> = cf[1..].iter().map(|f| f.frame_type).collect();
+    assert!(
+        inter.iter().all(|t| *t == gnc::FrameType::Predicted),
+        "the lossy arm wins on static content, so the sequence must keep its P-frames; \
+         got {inter:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// BUG-46 / BUG-49 — the candidate's format, and the refusal that follows from it
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_bit_exact_sibling_is_coded_in_the_callers_chroma_format() {
+    // BUG-46: `lossless_sibling` built from `quality_preset(100)` (4:4:4) and did not carry
+    // `chroma_format`, so RATE-2 compared a 4:2:0 wavelet encode against a 4:4:4 lossless one —
+    // three times the chroma samples, and the same candidate size reported for every request
+    // (3 257 157 B on bbb at q=97 whether the caller asked for 4:4:4 or 4:2:0).
+    for fmt in [
+        gnc::ChromaFormat::Yuv444,
+        gnc::ChromaFormat::Yuv422,
+        gnc::ChromaFormat::Yuv420,
+    ] {
+        let mut cfg = gnc::quality_preset(97);
+        cfg.chroma_format = fmt;
+        let sibling = gnc::lossless_sibling(&cfg);
+        assert_eq!(
+            sibling.chroma_format, fmt,
+            "the bit-exact candidate must be coded in the format the caller asked for, or the \
+             two candidates are not comparable"
+        );
+        assert!(
+            sibling.is_lossless(),
+            "the sibling must still be bit-exact in that format"
+        );
+    }
+}
+
+#[test]
+fn subsampled_chroma_refuses_the_fallback_rather_than_trading_quality_for_rate() {
+    // BUG-49: at 4:2:2 / 4:2:0 `q=100` is not lossless even in *luma*, which subsampling does
+    // not touch — measured per plane against the source, blue_sky 4:2:0 reads y 51.16 / u 43.23
+    // where q=95 reads y 53.09 / u 56.73. So the bit-exact candidate is 8.5-13.1 dB worse in RGB
+    // than the arm it would replace, and RATE-2's "better on both axes" does not hold. The
+    // fallback must refuse, not trade: with BUG-46 fixed and no refusal, bbb at 4:2:0 q=99 took
+    // the bit-exact file for −2.70% of rate and −3.9 dB.
+    let (w, h) = (256u32, 256u32);
+    let img = ramp(w, h);
+    let mut enc = EncoderPipeline::new(gpu());
+    for fmt in [gnc::ChromaFormat::Yuv422, gnc::ChromaFormat::Yuv420] {
+        let mut cfg = gnc::quality_preset(99);
+        cfg.entropy_coder = EntropyCoder::Rice;
+        cfg.chroma_format = fmt;
+        let kept = enc.encode(gpu(), &img, w, h, &cfg);
+        assert!(
+            !kept.config.is_lossless(),
+            "{fmt:?}: the fallback must refuse on subsampled chroma while BUG-49 stands, so the \
+             kept candidate is the wavelet one"
+        );
+    }
+    // And the 4:4:4 path is untouched by that refusal: the comparison still runs there.
+    let mut cfg = gnc::quality_preset(99);
+    cfg.entropy_coder = EntropyCoder::Rice;
+    assert!(
+        cfg.lossless_fallback,
+        "q=99 must still carry the flag, or this test proves nothing about the refusal"
+    );
+}

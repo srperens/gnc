@@ -4,6 +4,7 @@ pub mod bench;
 pub mod decoder;
 pub mod encoder;
 pub mod experiments;
+pub mod fingerprint;
 pub mod format;
 pub mod gpu_util;
 pub mod image_util;
@@ -917,6 +918,47 @@ impl CodecConfig {
     }
 }
 
+/// RATE-4: whether a frame's reference can be built from its colour-converted source instead of
+/// by dequantising and inverting what was coded.
+///
+/// Measured, not assumed (`a_bit_exact_frames_reference_is_its_colour_converted_source`): where
+/// this returns true the decoder's reference equals the YCoCg-R forward of the source **exactly**,
+/// 0 of 65 536 pixels differing on all three planes, at q=100 and at q=99 with the bit-exact
+/// sibling kept — those two being the same configuration.
+///
+/// Three conditions, and each one is a case where the equality fails rather than a precaution:
+///
+/// * **bit-exact settings**, or the reconstruction is a quantised picture and not the source;
+/// * **4:4:4**, because for subsampled chroma the reference holds nearest-neighbour-*upsampled*
+///   chroma planes, which the source planes are genuinely not equal to;
+/// * **integer-valued input** — see [`source_is_integral`]. At q=100 the step is 1.0 and MED's
+///   residual is a difference of *integers*; feed it fractional f32 and the quantiser rounds, so
+///   the reconstruction leaves the source (measured: max 254.0039 on Y). That third condition is
+///   BUG-45, and it is the whole content of RATE-4's `254.0039` row.
+///
+/// `GNC_REF_FROM_SOURCE=0` forces the reconstruct path *and* RATE-3's third encode back, so the
+/// A/B restores the whole of the old behaviour rather than half of it. Splitting that check across
+/// two call sites is how the first version of this gate measured a broken arm: the reference came
+/// from the coefficients while the repair that makes those coefficients the kept candidate's had
+/// already been skipped.
+#[must_use]
+pub fn reference_from_source(cfg: &CodecConfig) -> bool {
+    cfg.is_lossless()
+        && cfg.chroma_format == ChromaFormat::Yuv444
+        && std::env::var("GNC_REF_FROM_SOURCE").as_deref() != Ok("0")
+}
+
+/// Whether every sample is integer-valued, which is what makes q=100 bit-exact (BUG-45).
+///
+/// One linear pass over the source, which is cheap next to what it can save — a whole extra
+/// intra encode of the frame (RATE-3's third encode). It is a scan and not an assumption because
+/// the encoder's entry point takes `&[f32]`: a caller *can* pass fractional samples, and when it
+/// does, every bit-exactness claim in this codec is void for that frame.
+#[must_use]
+pub fn source_is_integral(rgb_data: &[f32]) -> bool {
+    rgb_data.iter().all(|v| v.fract() == 0.0)
+}
+
 /// RATE-2: the bit-exact sibling of a near-lossless configuration.
 ///
 /// Starts from `quality_preset(100)` — the MED lossless path, with its own coherent settings
@@ -934,11 +976,30 @@ pub fn lossless_sibling(cfg: &CodecConfig) -> CodecConfig {
         EntropyCoder::Rans => EntropyCoder::Rice,
         other => other,
     };
+    // **BUG-46: the chroma format is a "how", not a "how much".** Without this the sibling was
+    // always `quality_preset(100)`'s 4:4:4, so on subsampled input RATE-2 compared a 4:2:0 wavelet
+    // encode against a **4:4:4** lossless one — three times the chroma samples — and reported the
+    // same candidate size for both requests (3 257 157 B on bbb at q=97, whether the caller asked
+    // for 4:4:4 or 4:2:0). The fallback could therefore essentially never fire off 4:4:4, and if
+    // it ever had, the output would have carried a chroma format the caller did not ask for.
+    // "Bit-exact" here means exact in the domain the caller chose to code in, which is what makes
+    // the two candidates comparable at all.
+    out.chroma_format = cfg.chroma_format;
     out.gpu_entropy_encode = cfg.gpu_entropy_encode;
     out.abac_coder = cfg.abac_coder;
     out.abac_code_block = cfg.abac_code_block;
     out.abac_gpu_sizing = cfg.abac_gpu_sizing;
     out.set_tile_size(cfg.tile_size);
+    // **The padding fill is one of those choices, and dropping it was a defect.** `0039` made
+    // `pad_fill_decay` a still-image lever and the sequence encoder clears it for every I-frame
+    // something predicts from; `quality_preset(100)` sets it back to `true`, so a sibling that
+    // did not inherit it was coded with *decay*-filled padding while the frame it stands in for
+    // was replicate-filled. Two consequences, and neither was visible before RATE-4 built a
+    // reference from the source: the kept bit-exact I-frame contradicted the sequence encoder's
+    // own decision, and the two candidates left *different* padded sources in `input_buf`.
+    // Measured: forcing both fills to agree makes 24 of 24 sequence points byte-identical
+    // between the source-built and reconstructed reference; without it, 10 move.
+    out.pad_fill_decay = cfg.pad_fill_decay;
     // Without this the sibling would ask for a sibling of its own.
     out.lossless_fallback = false;
     out
@@ -1269,6 +1330,29 @@ pub fn quality_preset(q: u32) -> CodecConfig {
         cfg.subband_weights = SubbandWeights::uniform(0);
         cfg.adaptive_quantization = false;
         cfg.cfl_enabled = false;
+        // BUG-48: PAD-1's decay fill is a *wavelet* lever and it reverses sign under MED.
+        //
+        // `0039` fades the padding flat so its detail subbands go to zero, worth −4.63% RGB on
+        // four stills at q=80..94. MED has no subbands: it predicts each pixel from its left and
+        // upper neighbours, so a fade is something the residual has to *code* across, where plain
+        // edge replication predicts exactly. Same four stills, same binary, both arms via
+        // `GNC_PAD_FILL`, at q=100:
+        //
+        //   |                  | decay (was shipped) | replicate |         |
+        //   |------------------|--------------------:|----------:|--------:|
+        //   | bbb_1080p        |           3 257 157 | 3 235 737 | −0.657% |
+        //   | blue_sky_1080p   |           2 166 911 | 2 153 118 | −0.637% |
+        //   | kristensara_720p |             931 263 |   927 600 | −0.393% |
+        //   | touchdown_1080p  |           2 627 186 | 2 610 478 | −0.636% |
+        //
+        // **It belongs here and not on `q == 100`**, which is where the item filing put it: with
+        // `GNC_MED=0` the same q=100 is a lossless *wavelet* encode, and there decay is worth
+        // **−4.64%** on the same four stills — PAD-1's figure, reproduced at the top of the
+        // ladder. Keying this on the quality would have handed that arm a 4.6% regression.
+        //
+        // Pixels are untouched either way: the fill writes padding outside the visible area, and
+        // `pad_fill_mode` notes it is an encoder-side choice with no bitstream implication.
+        cfg.pad_fill_decay = false;
         eprintln!("GNC: MED prediction path active (LOSSLESS-1) — wavelet bypassed");
     }
     // A lossless preset must not carry a quantiser weight above 1.0 (BUG-15). q=100 reaches this

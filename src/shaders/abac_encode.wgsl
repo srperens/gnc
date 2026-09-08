@@ -53,6 +53,16 @@ const THREE_QUARTER: u32 = 0xC000u;
 
 const NUM_BUCKETS: u32 = 6u;
 const NUM_CONTEXTS: u32 = 18u;
+// ENT-9 candidate A: the Exp-Golomb unary prefix is context-coded on (position, bucket) rather
+// than bypassed. Must match `abac.rs`'s PREFIX_POSITIONS / PREFIX_BASE / NUM_CONTEXTS_ALL, and
+// `prefix_ctx` there is `PREFIX_BASE + min(position, 3) * NUM_BUCKETS + bucket`.
+const PREFIX_POSITIONS: u32 = 4u;
+const PREFIX_BASE: u32 = NUM_CONTEXTS;
+const NUM_CONTEXTS_ALL: u32 = NUM_CONTEXTS + NUM_BUCKETS * PREFIX_POSITIONS;   // 42
+
+fn prefix_ctx(position: u32, ctx: u32) -> u32 {
+    return PREFIX_BASE + min(position, PREFIX_POSITIONS - 1u) * NUM_BUCKETS + ctx;
+}
 
 const RC_PROB_BITS: u32 = 11u;
 const RC_PROB_ONE: u32 = 2048u;
@@ -105,7 +115,7 @@ const MAX_BLOCK_W: u32 = 64u;
 // per-thread-contiguous layout puts all 32 lanes of a SIMD group in one of Metal's 32 banks on
 // every neighbour read. `[i * WG + tid]` puts lane `tid` in bank `tid`. Budget: 576 + 4096 words
 // = 18.3 KB of the M1's 32 KB.
-var<workgroup> probs: array<u32, 576>;
+var<workgroup> probs: array<u32, 1344>;
 var<workgroup> rows: array<u32, 1024>;              // WG * ROW_WORDS
 
 // `rows` packs four magnitudes per word, one byte each, because the full u32 was 16 KB on its own
@@ -307,7 +317,7 @@ fn main(
     }
     let info = blocks[blk];
 
-    for (var i = 0u; i < NUM_CONTEXTS; i++) {
+    for (var i = 0u; i < NUM_CONTEXTS_ALL; i++) {
         probs[i * WG + tid] = PROB_HALF;
     }
     for (var i = 0u; i < ROW_WORDS; i++) {
@@ -361,13 +371,16 @@ fn main(
                 if (a > 1u) {
                     e_encode(&e, u32(a > 2u), (2u * NUM_BUCKETS + ctx) * WG + tid);
                     if (a > 2u) {
-                        // Exp-Golomb order 0 of (a - 3), MSB-first, as bypass bits.
+                        // Exp-Golomb order 0 of (a - 3): context-coded unary prefix, bypassed mantissa.
                         let n = a - 2u;
                         let len = 32u - countLeadingZeros(n);
-                        for (var k = 0u; k + 1u < len; k++) {
-                            e_encode_bypass(&e, 0u);
+                        // Unary prefix: `len - 1` "keep going" then one "stop", each in its own
+                        // (position, bucket) context instead of at p = 1/2.
+                        for (var k = 0u; k < len; k++) {
+                            e_encode(&e, u32(k + 1u == len), prefix_ctx(k, ctx) * WG + tid);
                         }
-                        for (var k = len; k > 0u; k--) {
+                        // Mantissa: the low `len - 1` bits of `n`, MSB-first, still bypassed.
+                        for (var k = len - 1u; k > 0u; k--) {
                             e_encode_bypass(&e, (n >> (k - 1u)) & 1u);
                         }
                     }
@@ -525,7 +538,7 @@ fn main_rc(
     }
     let info = blocks[blk];
 
-    for (var i = 0u; i < NUM_CONTEXTS; i++) {
+    for (var i = 0u; i < NUM_CONTEXTS_ALL; i++) {
         probs[i * WG + tid] = RC_PROB_HALF;
     }
     for (var i = 0u; i < ROW_WORDS; i++) {
@@ -579,10 +592,13 @@ fn main_rc(
                     if (a > 2u) {
                         let n = a - 2u;
                         let len = 32u - countLeadingZeros(n);
-                        for (var k = 0u; k + 1u < len; k++) {
-                            r_encode_bypass(&e, 0u);
+                        // Unary prefix: `len - 1` "keep going" then one "stop", each in its own
+                        // (position, bucket) context instead of at p = 1/2.
+                        for (var k = 0u; k < len; k++) {
+                            r_encode(&e, u32(k + 1u == len), prefix_ctx(k, ctx) * WG + tid);
                         }
-                        for (var k = len; k > 0u; k--) {
+                        // Mantissa: the low `len - 1` bits of `n`, MSB-first, still bypassed.
+                        for (var k = len - 1u; k > 0u; k--) {
                             r_encode_bypass(&e, (n >> (k - 1u)) & 1u);
                         }
                     }

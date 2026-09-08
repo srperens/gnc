@@ -425,11 +425,21 @@ impl EncoderPipeline {
             if is_keyframe {
                 let _t_iframe = std::time::Instant::now();
                 let frame_data = frames.get(display_idx);
+                // RATE-4/BUG-45: one linear pass, and it decides two things — whether the
+                // reference can come from the source below, and therefore whether
+                // `encode_as_reference` has to pay a third encode to repair the side channel.
+                let source_integral = crate::source_is_integral(&frame_data);
                 // RATE-3: `encode_as_reference`, not `encode` — this frame is what the
                 // P-frames predict from, and the fallback's two candidates leave only one of
                 // their two sets of quantised planes behind for `local_decode_iframe_gpu`.
-                let mut compressed =
-                    self.encode_as_reference(ctx, &frame_data, width, height, &frame_config);
+                let mut compressed = self.encode_as_reference(
+                    ctx,
+                    &frame_data,
+                    width,
+                    height,
+                    &frame_config,
+                    source_integral,
+                );
                 compressed.frame_type = FrameType::Intra;
 
                 if let Some(ref mut rc) = rate_ctrl {
@@ -438,7 +448,14 @@ impl EncoderPipeline {
 
                 // GPU local decode: quantized data is on GPU from encode()
                 // (Y→mc_out, Co→ref_upload, Cg→plane_b). No CPU entropy decode needed.
-                self.local_decode_iframe_gpu(ctx, &compressed, padded_w, padded_h, padded_pixels);
+                self.local_decode_iframe_gpu(
+                    ctx,
+                    &compressed,
+                    padded_w,
+                    padded_h,
+                    padded_pixels,
+                    source_integral,
+                );
                 if std::env::var("GNC_PROFILE").is_ok() {
                     eprintln!(
                         "  I-frame total: {:.1}ms",
@@ -607,12 +624,17 @@ impl EncoderPipeline {
                              {i_bytes} B ({delta:+.2}%), {verdict}"
                         );
                         if p_bytes > i_bytes {
+                            // RATE-4/BUG-45: same scan as the keyframe branch, and for the same
+                            // two reasons — whether the reference can come from the source, and
+                            // therefore whether the third encode is needed at all.
+                            let source_integral = crate::source_is_integral(&frame_data);
                             let mut again = self.encode_as_reference(
                                 ctx,
                                 &frame_data,
                                 width,
                                 height,
                                 &frame_config,
+                                source_integral,
                             );
                             again.frame_type = FrameType::Intra;
                             // Same two steps the keyframe branch takes, in the same order: the
@@ -627,6 +649,7 @@ impl EncoderPipeline {
                                 padded_w,
                                 padded_h,
                                 padded_pixels,
+                                source_integral,
                             );
                             // The look-ahead ME belongs to the P encode that was just discarded.
                             // Dropping it forces fresh motion estimation for the next frame
@@ -1446,8 +1469,106 @@ impl EncoderPipeline {
             display_idx = next_key;
         }
 
+        let mut out: Vec<CompressedFrame> = results.into_iter().map(|o| o.unwrap()).collect();
+
+        // --- LOSSLESS-3: at q = 95..=99 the whole clip competes with a bit-exact all-intra
+        // encode of itself, and on camera content the clip loses ------------------------------
+        //
+        // RATE-2 (`0036`) found that above q~95 a *still* costs more as a wavelet encode than as
+        // a bit-exact MED encode, and RATE-3 lifted that into sequences for I-frames. The
+        // P-frames were left out, and they are where the rate is: measured at q=99, ki=9, 8
+        // frames, a crowd_run P-frame costs 4.95-5.27 MB against a bit-exact I-frame of the same
+        // picture at 3.24 MB.
+        //
+        // **Why this is a whole-sequence choice and not a per-frame one, which is the finding
+        // that shaped it.** The per-frame version was built first and measured: 22 of 24 points
+        // improved by 7.9-33.6% and **bbb at q=99 ki=9 got 5.5% larger**. A P-frame costs
+        // *more* when it predicts from a bit-exact reference than from a lossy P-frame
+        // reconstruction — **+4.86% / +4.51% / +5.10% / +9.86%** on crowd_run / old_town_cross /
+        // blue_sky / bbb, four of four. So replacing one frame inflates the next frame's
+        // candidate, which makes the greedy rule **self-reinforcing**: each step looks like a
+        // win, the whole is worse. Per-frame is safe at `q=100` (LOSSLESS-2, `0070`) precisely
+        // because every reference there is exact and the coupling cannot exist.
+        //
+        // A whole-sequence comparison has no such coupling: the two arms are each internally
+        // consistent, and the winner is decided on **measured totals**, never on an estimate.
+        // `last_lossless_candidate_bytes` is only the trigger that says whether the second arm
+        // is worth coding — `n` times a bit-exact I-frame, less 1%. The 1% is slack for the
+        // estimate, not a correction: I-frame sizes vary ±0.4% inside a shot, and the arm this
+        // trigger stands for is coded with the replicate padding fill while the estimate comes
+        // from `encode`'s still-path candidate, which uses decay (BUG-48, +0.78%; `0072` made the sibling inherit it). A wrong
+        // trigger costs a wasted pass or a missed sub-1% win; it cannot pick the wrong arm,
+        // because the decision below is taken on two measured totals.
+        //
+        // Refused when a bitrate target is set: choosing lossless would blow it silently.
+        // `GNC_LOSSLESS_SEQUENCE_FALLBACK=0` turns it off, which is the measurement arm.
+        //
+        // **4:4:4 only, deliberately, and the obstacle is BUG-49 rather than the trigger.**
+        // BUG-46 made `lossless_sibling` carry the caller's chroma format, so the trigger's number
+        // is honest now — but on subsampled chroma `q=100` is **not lossless even in luma**
+        // (blue_sky 4:2:0: y 51.16, u 43.23, against q=95's y 53.09, u 56.73), so the bit-exact
+        // arm is 8.5-13.1 dB worse in RGB than the arm it would replace. There is no two-axis win
+        // to collect until that is fixed, which is why `encode` refuses the same comparison for
+        // stills (`0078`). This gate comes off with **BUG-49**, and the sequence sweep at 4:2:2
+        // and 4:2:0 is part of that item, not this one.
+        let sequence_fallback = config.lossless_fallback
+            && !config.is_lossless()
+            && rate_ctrl.is_none()
+            && n > 1
+            && config.chroma_format == crate::ChromaFormat::Yuv444
+            && std::env::var("GNC_LOSSLESS_SEQUENCE_FALLBACK")
+                .map(|v| v != "0")
+                .unwrap_or(true);
+        if sequence_fallback {
+            if let Some(bit_exact_frame) = self.last_lossless_candidate_bytes {
+                let lossy_total: usize = out.iter().map(|f| f.byte_size()).sum();
+                let estimate = bit_exact_frame * n;
+                if lossy_total * 100 > estimate * 99 {
+                    let mut sibling = crate::lossless_sibling(config);
+                    // `lossless_sibling` builds from `quality_preset(100)`, which is 4:4:4.
+                    // Carrying the caller's chroma format is what makes the two arms comparable
+                    // — and its absence is BUG-46 on the still path.
+                    sibling.chroma_format = config.chroma_format;
+                    // And the padding fill. BUG-47 (`0072`) made `lossless_sibling` carry the
+                    // caller's `pad_fill_decay`, which for this call is the sequence config's —
+                    // and the preset sets it. That is wrong for this arm twice over: nothing
+                    // predicts from an all-intra arm, and the decay fill is a **loss** at q=100
+                    // anyway. Measured against `GNC_PAD_FILL=replicate` on two stills, decay
+                    // costs **+0.78%** (crowd_run frame 0: 3 240 148 vs 3 214 874) and
+                    // **+0.66%** (bbb frame 0: 3 257 157 vs 3 235 737) — PAD-1's −4.63% was
+                    // gated on q=80..94 and the preset applies the fill at every q, which is
+                    // **BUG-48**. Cleared here so this arm is byte-for-byte the `q=100` encode
+                    // of the same frames, which is the property the sweep checks.
+                    sibling.pad_fill_decay = false;
+                    let mut intra: Vec<CompressedFrame> = Vec::with_capacity(n);
+                    for i in 0..n {
+                        let f = frames.get(i);
+                        let mut cf = self.encode(ctx, &f, width, height, &sibling);
+                        cf.frame_type = FrameType::Intra;
+                        intra.push(cf);
+                    }
+                    let intra_total: usize = intra.iter().map(|f| f.byte_size()).sum();
+                    // The canary (CLAUDE.md, "no silent features"): it prints whenever the second
+                    // arm was coded, whichever way the comparison goes.
+                    let delta = (intra_total as f64 / lossy_total as f64 - 1.0) * 100.0;
+                    let verdict = if intra_total < lossy_total {
+                        "keeping the bit-exact one"
+                    } else {
+                        "keeping the lossy one"
+                    };
+                    eprintln!(
+                        "GNC: LOSSLESS-3 sequence — lossy {lossy_total} B vs bit-exact all-intra \
+{intra_total} B ({delta:+.2}%), {verdict}"
+                    );
+                    if intra_total < lossy_total {
+                        out = intra;
+                    }
+                }
+            }
+        }
+
         frames.report(n);
-        results.into_iter().map(|o| o.unwrap()).collect()
+        out
     }
 
     /// Encode a sequence using a temporal wavelet transform (in-memory only).
@@ -2895,6 +3016,7 @@ impl EncoderPipeline {
         padded_w: u32,
         padded_h: u32,
         padded_pixels: usize,
+        source_integral: bool,
     ) {
         let config = &frame.config;
         let info = &frame.info;
@@ -2985,6 +3107,93 @@ impl EncoderPipeline {
         } else {
             None
         };
+
+        // **RATE-4: a bit-exact frame's reference is its colour-converted source.**
+        //
+        // Measured rather than assumed, by `a_bit_exact_frames_reference_is_its_colour_converted_source`:
+        // the decoder's reference equals the CPU YCoCg-R forward of the source **exactly** — 0 of
+        // 65 536 pixels differing on all three planes — at q=100 MED and at q=99 with the bit-exact
+        // sibling kept. Those two are the same configuration (`lossless_sibling` is
+        // `quality_preset(100)` with only how-to-code fields carried over), which is why one row
+        // cannot hold while the other fails.
+        //
+        // So for a bit-exact frame there is nothing to reconstruct: colour-convert the source and
+        // deinterleave straight into the reference, instead of dequantising, inverting the
+        // predictor and copying.
+        //
+        // **It reads `input_buf`, and that is the whole point.** `plane_a` / `co_plane` / `cg_plane`
+        // belong to whichever candidate ran *last*, so at q = 95..=99 they hold the lossy
+        // candidate's **plain** YCoCg — fractional values, not the reversible integers the
+        // reference is made of. Two earlier attempts at this route (`0040` point 4, and RATE-4's
+        // own first try) read candidate-dependent buffers and measured a picture that was not the
+        // reference. The source RGB is identical for both candidates, so `input_buf` is the one
+        // buffer whose contents do not depend on the order of the encodes.
+        //
+        // Consequently the frames that take this path do not need RATE-3's third encode: the
+        // reference no longer comes from the side channel at all. `encode_as_reference` still
+        // repairs the side channel for any bit-exact frame this branch refuses.
+        //
+        // Refused for subsampled chroma: there the reference holds nearest-neighbour-**upsampled**
+        // chroma planes, so the source planes genuinely are not equal to it and the reconstruct
+        // path below is the only correct one.
+        // One predicate, so `GNC_REF_FROM_SOURCE=0` restores the whole of the old behaviour --
+        // this path *and* RATE-3's third encode -- rather than half of it.
+        let ref_from_source = source_integral
+            && crate::reference_from_source(config)
+            && info.chroma_format == ChromaFormat::Yuv444;
+        if ref_from_source {
+            let mut cmd = ctx
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("local_decode_ref_from_source"),
+                });
+            // Forward, reversible: the same two dispatches `encode_once` runs on this buffer, so
+            // the padded region is filled exactly as the coded planes were.
+            self.color.dispatch(
+                ctx,
+                &mut cmd,
+                &bufs.input_buf,
+                &bufs.color_out,
+                padded_w,
+                padded_h,
+                true,
+                true,
+            );
+            self.deinterleaver.dispatch(
+                ctx,
+                &mut cmd,
+                &bufs.color_out,
+                &bufs.gpu_ref_planes[0],
+                &bufs.gpu_ref_planes[1],
+                &bufs.gpu_ref_planes[2],
+                padded_pixels as u32,
+            );
+            ctx.queue.submit(std::iter::once(cmd.finish()));
+            for p in 0..3 {
+                // Encoder-internal only, and off unless `GNC_REF_DEBLOCK=1`; applied here so the
+                // two paths differ in how the reference is built and in nothing else.
+                self.dispatch_deblock_reference(
+                    ctx,
+                    &bufs.gpu_ref_planes[p],
+                    padded_w,
+                    padded_h,
+                    config.tile_size,
+                    config.quantization_step,
+                );
+            }
+            // The canary (CLAUDE.md, "No silent features"). It prints per I-frame that takes the
+            // route, so "the source built the reference" is distinguishable from "the reconstruct
+            // path ran and happened to agree".
+            self.ref_from_source_frames += 1;
+            if diagnostics::enabled() {
+                println!(
+                    "  RATE-4: reference built from the colour-converted source \
+                     ({:?}, bit-exact), no dequant/inverse — frame {} of this sequence",
+                    config.transform_type, self.ref_from_source_frames,
+                );
+            }
+            return;
+        }
 
         // Quantized planes persisted by encode():
         //   Y → mc_out, Co → ref_upload, Cg → plane_b

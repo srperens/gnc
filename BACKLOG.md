@@ -3587,14 +3587,14 @@ lossless", the FFV1 gap — and the one sentence that implied video (README's "b
 `q=100`", in a paragraph about the I/P/B pipeline) is prose carrying no figure, which is exactly
 the class DOC-1's two sweeps missed. That sentence is now corrected.
 
-**What is already established** (RATE-3, `docs/decisions/0039`), so this does not start from zero:
+**What is already established** (RATE-3, `docs/decisions/0040`), so this does not start from zero:
 
 - The reference's *quality* is not the limit. A perfect reference yields 52.17 dB P-frames, a
   deliberately broken 34.30 dB reference yields 34.17 dB, and the ordinary 59.5 dB lossy reference
   yields 60.62 dB. **A better reference producing a worse P-frame means the encoder and decoder
   disagree about the reference**, not that quantisation caps it.
 - Two mechanisms are refuted with numbers: the colour transform's `floor` vs fractional lifting,
-  and a geometry difference at `wavelet_levels = 0`. See `0039` before re-deriving either.
+  and a geometry difference at `wavelet_levels = 0`. See `0040` before re-deriving either.
 - Taking the reference from the colour-converted source instead of inverting the wrong transform
   moves this from 12.45 to 21.37 dB — broken either way, and reverted.
 
@@ -3616,7 +3616,7 @@ gates RATE-3, and RATE-3 gates the inter half of RATE-2's 21.66%.
 ### RATE-3 — a bit-exact I-frame is not a drop-in reference (**investigated 2026-09-08, not fixed**, P1)
 
 **Three attempts, two refuted hypotheses, one real fix kept, and a named next measurement.**
-`docs/decisions/0039`. The gate `0036` shipped stays; the tree is byte-identical to it on stills
+`docs/decisions/0040`. The gate `0036` shipped stays; the tree is byte-identical to it on stills
 and back to 60.64/60.62 dB P-frames on sequences.
 
 **Kept from this item:** `encode`'s two candidate encodes now run **sibling first, configured path
@@ -4771,7 +4771,7 @@ and its forced-on arm is **expected to regress**, as the standing guard on this 
 Two defects were found by verifying rather than assuming, and both would have shipped the 4 dB
 loss: the pad uniform is shared and persistent so a sequence inherited `decay` from a previous
 still (`benchmark-sequence` calls the still path several times per run), and sequence configs built
-from `quality_preset` inherited the flag. Decision `docs/decisions/0039`.
+from `quality_preset` inherited the flag. Decision `docs/decisions/0040`.
 
 **Still open, filed as PAD-2:** the inter half. Having the decoder re-replicate the picture edge
 after reconstruction would let the encoder write a cheap fill while the reference stays

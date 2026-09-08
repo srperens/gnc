@@ -139,7 +139,7 @@ stops regressing, the inter half is worth re-opening. The default arm must read 
   as separate verdicts.
 
 **Harnesses:** `scripts/meas_pad1_inter.py` (new), `scripts/meas_intra1_padding.py` (`--canary`,
-`--canary-fill`, the fill sweep in `--part 3`). Decision `docs/decisions/0039`.
+`--canary-fill`, the fill sweep in `--part 3`). Decision `docs/decisions/0040`.
 
 ## BUG-16 — the fused quantiser had a dead zone the other two did not, and it priced out at +1% (2026-09-08)
 
@@ -355,7 +355,7 @@ work with an unambiguous answer, unlike another round of mechanism-guessing.
 Three attempts, two refuted hypotheses and one insufficient fix is the pattern CLAUDE.md's "if the
 same bug resurfaces after two fix attempts, stop and diagnose the root cause properly" exists for.
 So the tree goes back to what `0036` shipped and the knowledge is written down instead.
-`docs/decisions/0039`.
+`docs/decisions/0040`.
 
 **BUG-39 is the better place to continue**: same cause, seen at q=100 with no fallback involved and
 no rate to win, so nothing about it is entangled with RATE-2. Take it first; if it is fixed,

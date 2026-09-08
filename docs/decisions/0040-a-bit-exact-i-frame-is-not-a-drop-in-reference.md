@@ -1,4 +1,4 @@
-# 0039 — RATE-3: a bit-exact I-frame is not a drop-in reference, and the source-copy shortcut is rejected
+# 0040 — RATE-3: a bit-exact I-frame is not a drop-in reference, and the source-copy shortcut is rejected
 
 **Date:** 2026-09-08
 **Status:** accepted

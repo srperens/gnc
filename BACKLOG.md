@@ -3736,7 +3736,72 @@ falls while q rises (MEAS-9's harness now does). And for a 10-bit target the ext
 itself was never the problem. Harness: `scripts/meas_rate1_precision.py`, measured at `fa32a26`.
 Numbers in RESEARCH_LOG.
 
-### BUG-39 — `q=100` video: two causes fixed, 12.45 → 26.30 dB, still not lossless (**partly fixed 2026-09-08**, P1)
+### BUG-39 — `q=100` video: three causes fixed, 12.45 → 51.54 dB, still not bit-exact (todo, P1)
+
+**Third cause found and fixed, and it was not the one `0042` predicted.** `docs/decisions/0054`;
+numbers in RESEARCH_LOG. 3 sequences, 8 frames, ki=2 and ki=9, 4:4:4, shipped defaults — inter
+PSNR **26.30–26.76 → 51.54–53.62** (crowd_run ki=2), **21.77–26.51 → 50.41–51.54** (ki=9, drift
+down the GOP 4.74 → 1.13 dB), and the same shape on old_town_cross (29.7 → 51.8–52.5) and bbb
+(33.0 → 58.1). **q=99 is identical to the byte and to two decimals of PSNR on all six points**,
+because the fix cannot be reached wherever `wavelet_levels >= 1`.
+
+**Cause 3, fixed: a zero-level `forward` wrote nothing.** `WaveletTransform::forward` runs
+`for level in 0..levels`, so at `levels == 0` it dispatches nothing and never writes
+`output_buf`; `inverse` copies input to output before its own loop, so the decoder's zero-level
+case *is* the identity. `encode_pframe` quantises `plane_c`, so the encoder transmitted whatever
+the **previous frame** left there and the decoder added it to its prediction. Reached by every
+P/B frame of a `q=100` sequence (MED sets `wavelet_levels = 0`) and of a `--dct` one.
+
+**`0042`'s cause 3 was wrong about the mechanism and is corrected in place** (the original text
+kept visible): the P-scale taper is already 1.0 at `q=100` and the dead zone already 0.000, both
+printed by the encoder's own canary since INTER-1, so there was nothing to suppress.
+
+**Cause 4, open, and it has a named fix rather than a hypothesis.** 51.54 dB is **sub-pel
+prediction rounding**: bilinear quarter-pel interpolation makes the prediction fractional, so
+`cur - pred` is fractional and step 1.0 rounds it (≤ 0.5 per sample in YCoCg-R, amplified into
+RGB by the inverse colour transform — and bbb reads 58 dB because more of its blocks are full-pel
+or zero). The fix is H.264 lossless's: round the prediction to an integer in a lossless
+configuration, on both sides, so the residual is an integer and step 1.0 is exact. A `round()` in
+`motion_compensate.wgsl` behind a params flag gated on `config.is_lossless()`, which the decoder
+derives from the frame header it already carries — **no new bitstream field**. Needs a rate
+number too, since rounding the prediction changes the residual. Untried.
+
+**Success criterion unchanged:** every frame bit-exact at `q=100` on ≥3 sequences at ki=2 and 9,
+verified outside the harness. **Not met.**
+
+**Canary:** `zero_level_forward_is_an_identity_not_a_no_op` (verified to fail without the fix).
+
+**Probe that looks decisive and is not**, recorded so nobody repeats it: a static sequence (the
+same PNG four times) codes `q=100` P-frames bit-exact at 3 198 bytes **before** the fix too —
+`all_skip_tiles=120/120`, so it went down the motion-skip path and never asked the transform for
+anything. A zero-residual probe cannot test a residual path.
+
+### LOSSLESS-2 — at `q=100` the inter path costs 36% more than all-intra (todo, P2)
+
+**Measured, not argued.** crowd_run, 4 frames, ki=2, `q=100`, after BUG-39's cause-3 fix:
+
+| | bytes |
+|---|---|
+| I+P | **17 584 089** |
+| all-intra | 12 932 312 |
+
+**+36%, and the P-frames are not bit-exact either** (51.5 dB against the I-frames' `inf`). Before
+the fix the same comparison read −12%, but that saving was bought by transmitting a stale buffer
+instead of the residual, so it was never real.
+
+**Why it goes this way.** With no quantiser to discard anything, a quarter-pel MC residual is
+noise-like and costs more to code than the MED-predicted frame it replaces. This extends
+INTER-1 / `0023`'s line — the inter saving is already a wash at q=85–99 (−1.9% mean, −0.2%
+worst-frame) — past the wash into a loss.
+
+**The question:** should a lossless configuration code P-frames at all, or fall back to all-intra
+(per frame, on an RD decision, or per sequence)? It bears on a GOALS §1 row, and the honest
+answer may be that `q=100` video is all-intra by construction — which is what FFV1 does.
+
+**Not startable before BUG-39's cause 4**, because rounding the prediction changes the residual
+and therefore this number. Take it after, or take both.
+
+### BUG-39 — `q=100` video: two causes fixed, 12.45 → 26.30 dB (superseded 2026-09-08)
 
 **Two of three causes found, fixed and proven.** `docs/decisions/0042`; numbers in RESEARCH_LOG.
 crowd_run, 10 frames, `q=100`: P-frames go from **9.06–21.37 dB to 21.63–26.51 dB** at ki=9 and
@@ -5657,6 +5722,52 @@ candidate 2 becomes a free follow-on to ENT-8 and should be re-priced as part of
 is an afternoon with an existing harness. Against that: the throughput half cannot be measured on
 a shared machine at all (COORDINATION), and the rate gate may kill it before the shader work
 starts — which is why the gate is first.
+
+### ENT-9 — abac context-codes three decisions and bypasses the rest; at q>=95 the rest is where the file is (todo, P2)
+
+**Filed 2026-09-08 by the ENT-3 session, from its own numbers.** ENT-3 measured abac's saving
+against Rice on P-frame bytes decaying monotonically with quality — bbb_extended −20.6% at q=90 to
+−14.5% at q=99, crowd_run −12.2% to −4.3%, old_town_cross −11.9% to −3.7% (`0045`). The same
+run's entropy bound says the shortfall is the **context template**, not adaptation: shipped sits
++12.5% over `Hnb` on inter at q=99 while adaptation loss is under 0.7%.
+
+**Hypothesis.** abac context-codes exactly three binary decisions per coefficient — significant,
+`>1`, `>2` — and sends the Exp-Golomb order-0 remainder of `(|v| - 3)` and the sign as **bypass**
+bits at p=0.5 (`abac.rs`, `encode_block`). As the quantiser fines, magnitudes grow and the
+population moves out of the three context-coded decisions and into the bypassed suffix. So the
+decay is not abac running out of structure; it is abac coding a shrinking share of the file. Rice
+codes exactly that population well, which is why the two converge.
+
+**Step 1, and nothing should be built before it: measure the split.** What fraction of the shipped
+bits at q=90 / 95 / 99 are (a) the three context-coded decisions, (b) the Exp-Golomb suffix, (c)
+the sign? **This is not yet measured and the hypothesis above stands or falls on it.** If the
+suffix is 15% of the file at q=99 the ceiling on this item is small; if it is 60% the item is the
+largest thing left in the coder. `coef_entropy_diag` already walks abac's binarisation and
+`abac_decode_tile` gives the coefficients back, so this is a counter in an existing read-only
+diagnostic, not new coder work.
+
+**Step 2, only if step 1 justifies it.** The cheap candidates, in ascending cost:
+
+- **A context for the first suffix bit**, conditioned on the same magnitude bucket. One extra
+  context set of 6; the bit is far from uniform when the neighbourhood is large.
+- **A sign context** from the signs of the left and up neighbours. Wavelet subband signs are not
+  independent along the direction of the band — HL is horizontally correlated, LH vertically —
+  and this is the standard JPEG 2000 sign-context argument, which GNC has never priced.
+- **More `>k` decisions** before the bypass starts (`>3`, `>4`), which is a straight
+  context-count-for-rate trade and the one most likely to be a wash.
+
+**Success criterion.** ≥2% of total rate at q=99 on ≥3 sequences at bit-identical pixels, which is
+the same gate ENT-6 was closed against and the same bar its 1.3% failed. Below that, close it:
+a context experiment worth 1% is not worth the decode dependency it adds.
+
+**Why it is P2 and not P1.** abac is opt-in and `0017`'s case for it is *weaker* at the top of the
+range after `0045`, so this improves a non-default coder in the range where it is least
+convincing. It is filed because the mechanism is specific, the instrument exists, and step 1 is
+an afternoon; it is not filed as urgent.
+
+**Do not confuse this with ENT-6 or ENT-8.** ENT-6 priced the *initialisation* of the existing
+contexts (1.3%, closed). ENT-8 prices *parallelising* the existing contexts at fixed rate. This
+prices *which symbols get a context at all*, which neither touches.
 
 ### ENT-6 — abac's cold start is worth 1.3%, not 4% (**CLOSED by measurement 2026-09-08**)
 

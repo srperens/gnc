@@ -85,6 +85,130 @@ reference held. The source-copy route is *free* where the repair costs an encode
 refutation does not survive its own cause being fixed. Not re-tested here; it is RATE-4's other
 half.
 
+## BUG-39 — the encoder's zero-level transform wrote nothing, so P-frames carried the previous frame's buffer (2026-09-08)
+
+**Hypothesis, from the item.** 0042 fixed two of three causes and left cause 3 as a design
+question: `q=100` P-frames are lossy by construction because the residual is quantised at the
+P-frame taper (up to 1.25x the intra step) with a dead zone, so a lossless configuration must
+suppress both and pay for it in rate.
+
+**The first thing measured was that hypothesis, and it is false.** `--diagnostics` on crowd_run at
+`q=100` prints the two levers it names:
+
+```
+p_qp_scale=1.0000 (taper, default 1.0000), intra_qstep=1.0000 res_qstep=1.0000
+  inter_dz_mul=1.00 dz_intra=0.000 dz_referenced=0.000 dz_res=0.000
+```
+
+The taper is 1.0 (it is keyed on the step, and 1.0 is below the 2.8 breakpoint) and the dead zone
+is 0.0 (`normalized_for_lossless`, BUG-30). Both were already where a lossless configuration wants
+them, so neither could account for 26 dB. **The canary that refutes cause 3 has been in the
+default diagnostics output since INTER-1.** 0042's own lesson — diff the two things that must be
+equal instead of theorising — applied one level up: it diffed the references, fixed what that
+found, and then wrote a mechanism for the *remaining* gap without reading the numbers the encoder
+prints.
+
+### What it actually was
+
+`WaveletTransform::forward` runs `for level in 0..levels`. At `levels == 0` it dispatches nothing
+and **never writes `output_buf`**. `WaveletTransform::inverse` copies `input_buf` into
+`output_buf` before its loop, so the decoder's zero-level case *is* the identity.
+
+`encode_pframe` calls `transform.forward(mc_out -> plane_b -> plane_c)` and then quantises
+`plane_c`. So at `levels == 0` the encoder quantised and transmitted whatever the previous frame
+left in `plane_c`, and the decoder added that leftover to its own motion prediction. Every P and B
+frame of a `q=100` sequence goes through it, because LOSSLESS-1 sets `wavelet_levels = 0` for MED
+and a residual is always wavelet-coded whatever the sequence's transform is. `--dct` sequences hit
+it identically.
+
+Fixed by giving `forward` the identity copy `inverse` already had, plus the matching early return
+in `inverse`, which also removes a `levels - 1` underflow that panics in a debug build.
+
+### Two probes on the way, one of which is a trap worth recording
+
+A **static** sequence (the same PNG four times) codes `q=100` P-frames **bit-exact** at 3 198
+bytes, before the fix as well as after. That looks like proof the reference chain and the residual
+path are sound, and it is not: `--diagnostics` shows `all_skip_tiles=120/120`, so the frame went
+down the motion-skip path and the transform was never asked for anything. **A zero-residual probe
+cannot test a residual path.** The informative probe was the opposite one — content whose residual
+is large, where the fix moves the number by 25 dB.
+
+The second probe was `GNC_MED=0` at `q=100`, which RATE-3 had already recorded at 44.18/46.15 dB
+against MED's 12.45. That gap is the whole finding in hindsight: `GNC_MED=0` keeps
+`wavelet_levels = 5`, so it never enters the broken branch, and *being better with a transform
+than without one* is the signature of a missing identity.
+
+### Raw numbers — 3 sequences, 8 frames, ki=2 and ki=9, 4:4:4, shipped defaults
+
+Inter-frame PSNR range across the GOP. I-frames are `inf` (bit-exact) in both arms.
+
+| | before | after | drift down the GOP |
+|---|---|---|---|
+| crowd_run ki=2 | 26.30 - 26.76 | **51.54 - 53.62** | |
+| crowd_run ki=9 | 21.77 - 26.51 | **50.41 - 51.54** | 4.74 dB -> **1.13 dB** |
+| old_town_cross ki=2 | 29.69 - 29.91 | **51.83 - 52.52** | |
+| old_town_cross ki=9 | 27.04 - 29.91 | **50.58 - 51.83** | 2.87 dB -> **1.25 dB** |
+| bbb ki=2 | 32.92 - 33.15 | **58.10 - 58.23** | |
+| bbb ki=9 | 24.76 - 32.99 | **56.22 - 58.12** | 8.23 dB -> **1.90 dB** |
+
+PSNR leads and VMAF is not quoted: `q=100` is above the q>85 line where VMAF is saturated, and
+these are 50+ dB frames.
+
+**No effect at lossy quality**, which is the gate that matters most: at q=99 all six points are
+identical **to the byte** and to two decimals of PSNR (crowd_run ki=9: 39 570 472 B, 60.61-60.64,
+both arms). The fix cannot be reached wherever `wavelet_levels >= 1`, i.e. q=1..99.
+
+### The rate half, which says the opposite of what was expected
+
+crowd_run, 4 frames, ki=2, total bytes:
+
+| | bytes |
+|---|---|
+| I+P before | 11 369 827 |
+| I+P after | **17 584 089** |
+| all-intra (unchanged) | 12 932 312 |
+
+**At `q=100` the inter path is now 36% larger than coding every frame intra**, where before the
+fix it looked 12% *smaller*. That 12% saving was bought by transmitting a stale buffer instead of
+the residual. With no quantiser to discard any of it, a quarter-pel MC residual is noise-like and
+costs more than the MED-predicted frame it replaces. So the rate number cause 3 was said to need
+exists now, and it asks a different question: whether `q=100` video should use P-frames at all.
+Recorded, not acted on.
+
+### What is left, and it is one named mechanism
+
+51.54 dB is not `inf`, so the success criterion is **not met** and BUG-39 stays open. The residual
+is **sub-pel prediction rounding**: bilinear interpolation at quarter-pel makes the prediction
+fractional, so `cur - pred` is fractional, and step 1.0 rounds it — error <= 0.5 per sample in
+YCoCg-R, amplified into RGB by the inverse colour transform. 51.5 dB is the right magnitude for
+that, and bbb reads 58 dB because more of its blocks are full-pel or zero.
+
+The fix is H.264 lossless's: round the prediction to an integer in a lossless configuration, on
+both sides, so the residual is an integer and step 1.0 is exact. A `round()` in
+`motion_compensate.wgsl` behind a params flag gated on `config.is_lossless()`, which the decoder
+derives from the frame header it already carries — no new bitstream field. Untried.
+
+### Canary
+
+`zero_level_forward_is_an_identity_not_a_no_op` pre-fills the output buffer with a sentinel and
+asserts a zero-level `forward` overwrites all of it. **Verified to fail without the fix** (the
+whole plane mismatches), so it asserts something rather than decorating the commit.
+
+### Caveats
+
+- **`--dct` video is corrected and unmeasured**, the same flag 0042 left on cause 2.
+- **B-frames are unmeasured** — off by default, same `forward` call, so the fix applies to them
+  untested.
+- **4:2:0 is not in scope for bit-exactness**: chroma-domain MC box-filters both planes, which is
+  fractional by construction.
+
+**Gates:** `cargo test --release -- --test-threads=1`, `cargo clippy --release` and the wasm
+`--lib` clippy target — see the commit.
+
+Decision record: `docs/decisions/0054`.
+
+---
+
 ## ENT-3 — abac's inter saving is real, decays with quality, and the contexts are not the inter question (2026-09-08)
 
 **What was open.** Not the headline — ARCH-3 answered "does abac pay on inter" as a side effect

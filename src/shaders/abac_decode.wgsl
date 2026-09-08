@@ -25,7 +25,17 @@ const QUARTER: u32 = 0x4000u;
 const THREE_QUARTER: u32 = 0xC000u;
 
 const NUM_BUCKETS: u32 = 6u;
-const NUM_CONTEXTS: u32 = 18u;    // NUM_BUCKETS * 3
+const NUM_CONTEXTS: u32 = 18u;
+// ENT-9 candidate A: the Exp-Golomb unary prefix is context-coded on (position, bucket) rather
+// than bypassed. Must match `abac.rs`'s PREFIX_POSITIONS / PREFIX_BASE / NUM_CONTEXTS_ALL, and
+// `prefix_ctx` there is `PREFIX_BASE + min(position, 3) * NUM_BUCKETS + bucket`.
+const PREFIX_POSITIONS: u32 = 4u;
+const PREFIX_BASE: u32 = NUM_CONTEXTS;
+const NUM_CONTEXTS_ALL: u32 = NUM_CONTEXTS + NUM_BUCKETS * PREFIX_POSITIONS;   // 42
+
+fn prefix_ctx(position: u32, ctx: u32) -> u32 {
+    return PREFIX_BASE + min(position, PREFIX_POSITIONS - 1u) * NUM_BUCKETS + ctx;
+}
 
 // Per-block geometry. `byte_offset` is into `stream` counted in bytes; `out_offset`, `stride`
 // place the block inside its plane.
@@ -192,7 +202,7 @@ fn bucket(nb: u32) -> u32 {
 const WG: u32 = 32u;
 const MAX_BLOCK_W: u32 = 64u;
 
-var<workgroup> probs: array<u32, 576>;              // WG * NUM_CONTEXTS
+var<workgroup> probs: array<u32, 1344>;              // WG * NUM_CONTEXTS_ALL
 var<workgroup> rows: array<u32, 1024>;              // WG * ROW_WORDS
 
 // `rows` packs four magnitudes per word, one byte each, because the full u32 was 16 KB on its own
@@ -235,7 +245,7 @@ fn main(
     let info = blocks[blk];
 
     // Thread-interleaved indexing: context `i` for this thread lives at `i * WG + tid`.
-    for (var i = 0u; i < NUM_CONTEXTS; i++) {
+    for (var i = 0u; i < NUM_CONTEXTS_ALL; i++) {
         probs[i * WG + tid] = PROB_HALF;
     }
     // Two row buffers per thread, alternated by row parity so no copy is needed between rows.
@@ -286,19 +296,20 @@ fn main(
                 if (decode_bit(&d, (NUM_BUCKETS + ctx) * WG + tid) == 1u) {
                     a = 2u;
                     if (decode_bit(&d, (2u * NUM_BUCKETS + ctx) * WG + tid) == 1u) {
-                        // Exp-Golomb order 0, bypass-coded.
-                        var zeros = 0u;
+                        // Exp-Golomb order 0: context-coded unary prefix, bypassed mantissa.
+                        // Unary prefix, context-coded; the stop bit ends it.
+                        var len = 1u;
                         loop {
-                            if (decode_bypass(&d) == 1u) {
+                            if (decode_bit(&d, prefix_ctx(len - 1u, ctx) * WG + tid) == 1u) {
                                 break;
                             }
-                            zeros = zeros + 1u;
-                            if (zeros > 32u) {
+                            len = len + 1u;
+                            if (len > 32u) {
                                 break; // corrupt or truncated
                             }
                         }
                         var n = 1u;
-                        for (var k = 0u; k < zeros; k++) {
+                        for (var k = 0u; k + 1u < len; k++) {
                             n = (n << 1u) | decode_bypass(&d);
                         }
                         a = n - 1u + 3u;
@@ -408,7 +419,7 @@ fn main_rc(
     }
     let info = blocks[blk];
 
-    for (var i = 0u; i < NUM_CONTEXTS; i++) {
+    for (var i = 0u; i < NUM_CONTEXTS_ALL; i++) {
         probs[i * WG + tid] = RC_PROB_HALF;
     }
     for (var i = 0u; i < ROW_WORDS; i++) {
@@ -452,18 +463,19 @@ fn main_rc(
                 if (rc_decode_bit(&d, (NUM_BUCKETS + ctx) * WG + tid) == 1u) {
                     a = 2u;
                     if (rc_decode_bit(&d, (2u * NUM_BUCKETS + ctx) * WG + tid) == 1u) {
-                        var zeros = 0u;
+                        // Unary prefix, context-coded; the stop bit ends it.
+                        var len = 1u;
                         loop {
-                            if (rc_decode_bypass(&d) == 1u) {
+                            if (rc_decode_bit(&d, prefix_ctx(len - 1u, ctx) * WG + tid) == 1u) {
                                 break;
                             }
-                            zeros = zeros + 1u;
-                            if (zeros > 32u) {
+                            len = len + 1u;
+                            if (len > 32u) {
                                 break;
                             }
                         }
                         var n = 1u;
-                        for (var k = 0u; k < zeros; k++) {
+                        for (var k = 0u; k + 1u < len; k++) {
                             n = (n << 1u) | rc_decode_bypass(&d);
                         }
                         a = n - 1u + 3u;

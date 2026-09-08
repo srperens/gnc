@@ -5,6 +5,11 @@
 **Item:** BACKLOG INTRA-1 (P0), step 1
 **Supersedes nothing. Redirects INTRA-1 to its step-2 branch.**
 
+> **This number collided.** A second `0024` — the GPU abac encoder counts before it writes — sat
+> on `main` beside this one from 2026-09-07 to 2026-09-08 and is now
+> [0057](0057-the-gpu-abac-encoder-counts-before-it-writes.md) (BUG-19). A citation of `0024`
+> written on either of those days may mean that record; this one is INTRA-1 step 1.
+
 ## The question this had to answer
 
 ENT-4 measured GNC with `--abac` at **+27.1% of rate against JPEG 2000 in irreversible 9/7 mode**

@@ -37,12 +37,24 @@ Modular pipeline with swappable stages:
    - **Bitplane** (parked): block-based, fully parallel decode
    - **abac** (`--abac`): adaptive binary arithmetic coding over 64px code-blocks, GPU encode
      *and* GPU decode (one thread per code-block on both sides, since ENT-5), with the CPU coder
-     in `abac.rs` as the reference both are verified byte-exact against. −16.6% to −18.8% of rate
-     against Rice at *identical pixels*, for ~1.69× frame decode, and **−12.0% to −22.9% on inter**
-     since ARCH-3 gave the two coders one frame encoder. Opt-in —
-     `docs/decisions/0017`, `0024` for the encoder's two judgement calls, `0025` for the inter figure. **Encode time per
+     in `abac.rs` as the reference both are verified byte-exact against. Since **ENT-9 (`0074`)
+     the Exp-Golomb unary prefix is context-coded** on (position, bucket) rather than bypassed —
+     bitstream generation **GP19**, and a GP18 abac frame is refused rather than misread. That was
+     worth **−2.07% to −8.76% of total rate at q=99**, −1.26% to −4.56% at q=95 and −0.85% to
+     −2.75% at q=90, measured before/after on one binary pair at bit-identical pixels.
+     **Against Rice on today's `main`, total rate: −12.3% to −16.0% at q=99**, −13.6% to −18.5%
+     at q=95, −14.3% to −20.4% at q=90 (three sequences, 18 frames, ki=9, 4:4:4), for ~1.69×
+     frame decode.
+     **`0045`'s "the saving decays monotonically with quality, under −4.5% at q=99" is
+     superseded** — P-frame bytes at q=99 now read −12.1% / −15.8% / −12.3%. Attribute that
+     carefully: ENT-9's own controlled contribution is the first figure above, and the rest of
+     the distance from `0045` is everything else that landed between (RATE-3, INTER-2, BUG-39,
+     LOSSLESS-2) plus a different denominator — `0045` reproduces on its own commit, which makes
+     it a change log rather than an error, its own lesson. Opt-in —
+     `docs/decisions/0017`, `0057` for the encoder's two judgement calls, `0074` for the prefix
+     contexts, `0045` for the inter figure it superseded (`0025`'s). **Encode time per
      frame is not yet measured on an idle machine**, so 0017's reason 2 has lost its mechanism but
-     kept its number.
+     kept its number, and only the *rate* half of its case has moved.
 5. Video: I/P/B frames, half-pel motion estimation, hierarchical block matching, CBR/VBR rate control
 6. Container: GNV1 sequence format with frame index, keyframe seeking, error resilience (per-tile CRC-32)
 
@@ -82,7 +94,7 @@ Shader source is in `src/shaders/*.wgsl`. Rust host code is in `src/encoder/` an
 ## Code Style
 
 - Rust, edition 2021. Keep shader code (WGSL) simple and readable — comment non-obvious GPU-specific tricks.
-- **Zero clippy warnings** — `cargo clippy --release` and `cargo clippy --release --target wasm32-unknown-unknown --lib` must both be clean. The wasm gate is `--lib` because **the CLI is not a wasm artifact**: `GpuContext::new` is `#[cfg(not(target_arch = "wasm32"))]` and `pollster` cannot block there, so type-checking a command-line tool for wasm produced 11 errors about the tool and none about the codec (BUG-24, fixed 2026-09-08). The binary now carries `required-features = ["cli"]`, so `--no-default-features` is the equivalent whole-target form and no target builds the CLI for wasm by accident. Fix warnings before committing. Prefer fixing the code over suppressing; `#[allow(clippy::…)]` is OK on individual items with justification but **blanket allows** (module-level `#![allow(…)]`, `dead_code` on entire impls, etc.) are **not acceptable**.
+- **Zero clippy warnings** — `cargo clippy --release --all-targets` and `cargo clippy --release --target wasm32-unknown-unknown --lib` must both be clean. **`--all-targets` is the native gate, not `cargo clippy --release`** (BUG-20, `docs/decisions/0062`): the plain form reads the lib and the bins and never looks at a test, and 91 warnings had accumulated behind it — cleared, not exempted, on 2026-09-08. So test code is code here, and the two commands are asymmetric on purpose. The wasm gate is `--lib` because **the CLI is not a wasm artifact**: `GpuContext::new` is `#[cfg(not(target_arch = "wasm32"))]` and `pollster` cannot block there, so type-checking a command-line tool for wasm produced 11 errors about the tool and none about the codec (BUG-24, fixed 2026-09-08). The binary now carries `required-features = ["cli"]`, so `--no-default-features` is the equivalent whole-target form and no target builds the CLI for wasm by accident. Fix warnings before committing. Prefer fixing the code over suppressing; `#[allow(clippy::…)]` is OK on individual items with justification but **blanket allows** (module-level `#![allow(…)]`, `dead_code` on entire impls, etc.) are **not acceptable**.
 - **No `unsafe`** unless absolutely unavoidable. Prefer safe abstractions.
 - Each pipeline stage is a separate module; new experiments go in `src/experiments/`.
 - Don't commit test material to git (it's in `.gitignore`).
@@ -236,7 +248,7 @@ without an org chart:
 - Separate GPU buffer per plane (Y/Cb/Cr) — no aliased write_buffer calls
 - Single command encoder per GOP for spatial wavelet dispatches — no inter-frame races
 - All tests must pass after every change
-- Zero clippy warnings after every change
+- Zero clippy warnings after every change — `--all-targets` on native, `--lib` on wasm (see Code Style)
 - If the same bug resurfaces after two fix attempts — stop, diagnose root cause properly, do not loop
 - **No silent features** — every new code path must have a way to verify it actually executes
 - **Serial dependencies must be bounded, not absent.** A dependency chain whose length grows with

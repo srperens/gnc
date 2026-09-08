@@ -123,9 +123,9 @@ fn conformance_gradient_q25() {
     assert!(psnr > 40.0, "PSNR too low: {psnr:.2}");
     assert!(serialized.len() > 100, "Bitstream too small");
 
-    // Verify GP18 magic. GP18 added entropy type 5 (the abac code-block coder) and nothing else,
-    // so a Rice frame's payload is unchanged from GP17 — only these four bytes moved.
-    assert_eq!(&serialized[0..4], b"GP18", "Expected GP18 magic");
+    // Verify GP19 magic. GP19 changed only how entropy type 5 (abac) codes its Exp-Golomb
+    // prefix, so a Rice frame's payload is unchanged from GP18 — only these four bytes moved.
+    assert_eq!(&serialized[0..4], b"GP19", "Expected GP19 magic");
 
     // Verify decode is deterministic (re-decode)
     let ctx = gpu();
@@ -304,8 +304,8 @@ fn conformance_lossless_q100() {
     let (serialized, hash, psnr) = conformance_roundtrip("lossless", &img, 512, 512, 100);
     assert!(psnr.is_infinite(), "Lossless mode should give infinite PSNR, got {psnr:.2}");
 
-    // Verify GP18 magic — see the note in conformance_gradient_q25.
-    assert_eq!(&serialized[0..4], b"GP18");
+    // Verify GP19 magic — see the note in conformance_gradient_q25.
+    assert_eq!(&serialized[0..4], b"GP19");
 
     // Verify bit-exact round-trip
     let ctx = gpu();

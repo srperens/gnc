@@ -141,6 +141,12 @@ pub(crate) fn adapt_bits(coefficients: &[i32], width: usize, init: &[u32]) -> f6
 }
 
 /// [`adapt_bits`] with the visit order named explicitly — ENT-8's step 1.
+///
+/// **This models the pre-ENT-9 binarisation**, with the Exp-Golomb prefix bypassed at `2*len - 1`
+/// bits. It is deliberately not updated to the shipped coder: ENT-8's published scan figures
+/// (`k=2 +0.74%/+0.65%`, and the rest of that table) were taken on this binarisation, and they
+/// stay reproducible only while it does. For a model of what the coder does *now*, use
+/// [`adapt_bits_prefix_ctx`].
 pub(crate) fn adapt_bits_scan(
     coefficients: &[i32],
     width: usize,
@@ -166,6 +172,57 @@ pub(crate) fn adapt_bits_scan(
                     let n = a - 3 + 1;
                     let len = 32 - n.leading_zeros();
                     bits += f64::from(2 * len - 1);
+                }
+            }
+            bits += 1.0; // sign, bypassed
+        }
+        mag[y * width + x] = a;
+    }
+    bits
+}
+
+/// The shipped binarisation since ENT-9 candidate A: the Exp-Golomb unary prefix
+/// **context-coded** rather than bypassed. Was step 2 milestone 1's instrument; it is now the
+/// model of the real coder, which is why the canary below compares against it.
+///
+/// This is the check `0063` said had to come before any shader work. Step 1b priced candidate A
+/// on statistics pooled per plane and subband, which is generous by construction: it charges no
+/// adaptation and lets every block share one set of counts. Here the 24 new contexts are
+/// **cold-started per code-block**, exactly like the 18 they join, and learn on the same 4096
+/// symbols. That is the effect that collapsed abac's 256-stream variant from −6.6% to −0.7%, so
+/// a pooled bound is not evidence about it either way.
+///
+/// The mantissa and the sign stay bypassed, as in the shipped coder — candidate B is not modelled
+/// here.
+pub(crate) fn adapt_bits_prefix_ctx(coefficients: &[i32], width: usize, init: &[u32]) -> f64 {
+    let height = coefficients.len() / width;
+    // 18 shipped contexts, then 24 for the prefix: (bucket, min(position, 3)).
+    let mut probs: Vec<Prob> = init.iter().map(|&p| Prob::from_p_zero(p)).collect();
+    probs.extend((0..NUM_BUCKETS * 4).map(|_| Prob::from_p_zero(PROB_ONE / 2)));
+    let base = init.len();
+    let mut mag = vec![0u32; coefficients.len()];
+    let mut bits = 0.0;
+
+    for (y, x) in Scan::Raster.order(width, height) {
+        let v = coefficients[y * width + x];
+        let a = v.unsigned_abs();
+        let ctx = bucket(neighbour_sum(&mag, width, y, x));
+        code(&mut bits, &mut probs, ctx, a > 0);
+        if a > 0 {
+            code(&mut bits, &mut probs, NUM_BUCKETS + ctx, a > 1);
+            if a > 1 {
+                code(&mut bits, &mut probs, 2 * NUM_BUCKETS + ctx, a > 2);
+                if a > 2 {
+                    let n = a - 3 + 1;
+                    let len = 32 - n.leading_zeros();
+                    // The prefix is `len - 1` "keep going" bits then one "stop", each coded in
+                    // its own (bucket, position) context instead of at p = 1/2.
+                    for i in 0..len {
+                        let slot = (i as usize).min(3);
+                        code(&mut bits, &mut probs, base + slot * NUM_BUCKETS + ctx, i == len - 1);
+                    }
+                    // Mantissa: `len - 1` bypass bits, unchanged.
+                    bits += f64::from(len - 1);
                 }
             }
             bits += 1.0; // sign, bypassed
@@ -220,7 +277,14 @@ mod tests {
                         }
                     })
                     .collect();
-                let sim_bits = adapt_bits(&coefficients, w, &cold);
+                // **The model must be of the *shipped* binarisation, which since ENT-9 is
+                // `adapt_bits_prefix_ctx`.** `adapt_bits` still models the pre-ENT-9 coder — it
+                // is ENT-8's instrument and its published scan figures were taken on that
+                // binarisation, so it stays as it was. Pointing this canary at it after the
+                // prefix became context-coded made it fail with `real 344 < simulated 366`,
+                // which is the canary doing its job: the coder had got *cheaper* than the model
+                // of a binarisation it no longer uses.
+                let sim_bits = adapt_bits_prefix_ctx(&coefficients, w, &cold);
                 // **Both engines.** They share this binarisation and this probability model but
                 // not a bitstream, and their per-block flush differs — the range coder's is
                 // several bytes where the interval coder's is one. Testing only one is how the

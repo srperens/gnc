@@ -81,6 +81,23 @@ pub struct EncoderPipeline {
     /// Minimal intermediate buffers for spatial wavelet pre-compute (B set).
     /// Allows next GOP's spatial wavelet to run concurrently with current GOP's high_enc.
     pub(super) sp_cached_b: Option<super::buffer_cache::SpatialPrecomputeBuffers>,
+    /// RATE-4: I-frames whose reference was built from the colour-converted source rather than
+    /// by dequantising and inverting the coefficients.
+    ///
+    /// A **run-level** count, which is the thing RATE-4 asked for and the per-frame canary lines
+    /// could not give: "the path ran once" and "a sequence took it 47 times" are different facts,
+    /// and only the second one prices the encode it removes.
+    pub(super) ref_from_source_frames: u32,
+    /// Serialised size of the **bit-exact** candidate the last `encode` coded, win or lose
+    /// (LOSSLESS-3, `0073`).
+    ///
+    /// `encode` codes that candidate at q = 95..=99 for RATE-2's own comparison and then throws
+    /// the number away. The sequence encoder uses it as a cheap trigger: `n` times this is what a
+    /// bit-exact all-intra encode of the whole clip costs to within a per-frame ±0.4%, so it says
+    /// whether the second pass is worth coding at all. The *decision* is then taken on two
+    /// measured totals, never on this estimate. Kept here rather than widening `encode`'s return
+    /// type, which every existing caller would have to change.
+    pub(super) last_lossless_candidate_bytes: Option<usize>,
 }
 
 impl EncoderPipeline {
@@ -752,6 +769,8 @@ impl EncoderPipeline {
             tw_cached: None,
             tw_cached_b: None,
             sp_cached_b: None,
+            ref_from_source_frames: 0,
+            last_lossless_candidate_bytes: None,
         }
     }
 
@@ -1607,6 +1626,9 @@ impl EncoderPipeline {
             crate::format::serialize_compressed(&lossy).len(),
             crate::format::serialize_compressed(&lossless).len(),
         );
+        // LOSSLESS-3: publish the bit-exact candidate's size even when it loses, so the sequence
+        // encoder can tell whether a whole bit-exact arm is worth coding without coding it.
+        self.last_lossless_candidate_bytes = Some(lossless_bytes);
         // The canary. It prints on every frame that takes this path, whichever way it goes, so
         // "the fallback ran and chose the lossy file" is distinguishable from "the fallback did
         // not run" — a silent feature is worse than no feature (CLAUDE.md).
@@ -1623,6 +1645,69 @@ impl EncoderPipeline {
         }
     }
 
+    /// Encode an intra frame **that something will predict from**, and leave the GPU side
+    /// channel belonging to the candidate that was kept.
+    ///
+    /// **RATE-3.** `encode` codes two candidates at q = 95..=99 and returns the smaller file,
+    /// but `encode_once` also leaves the quantised planes on the GPU (`Y → mc_out,
+    /// Co → ref_upload, Cg → plane_b`) and that is how `local_decode_iframe_gpu` builds a
+    /// reference without a CPU entropy decode. Only the *last* encode's planes survive, so when
+    /// the bit-exact sibling wins, the reference is reconstructed from the *lossy* candidate's
+    /// coefficients — with `0042`'s MED branch now in place, that means running `med.inverse`
+    /// over wavelet coefficients. Measured on crowd_run q=99 ki=2 with the sequence gate lifted
+    /// and this method absent: I-frames bit-exact at −32.3%, and the P-frames referencing them
+    /// at **5.93 dB** while growing from 4.99 MB to 8.89 MB.
+    ///
+    /// The fix is to re-run whichever candidate was kept, so the side channel is always its own.
+    /// It costs a **third** encode of that frame, and only on the frames where the bit-exact
+    /// candidate actually wins — which is why this is a separate entry point rather than
+    /// behaviour inside `encode`: a still has no reference to build and must not pay for one.
+    ///
+    /// The re-encode is deterministic, so the returned frame is the same bytes as the one
+    /// `encode` chose; `debug_assert` checks that rather than trusting it.
+    pub fn encode_as_reference(
+        &mut self,
+        ctx: &GpuContext,
+        rgb_data: &[f32],
+        width: u32,
+        height: u32,
+        config: &CodecConfig,
+        source_integral: bool,
+    ) -> CompressedFrame {
+        let chosen = self.encode(ctx, rgb_data, width, height, config);
+        // **RATE-4: the third encode is only needed when the reference comes from the side
+        // channel, and for a bit-exact frame it no longer does.** `local_decode_iframe_gpu`
+        // builds that reference by colour-converting the source, which is measurably the same
+        // picture (`crate::reference_from_source`), so there is nothing to repair. The repair
+        // stays for every frame that predicate refuses — subsampled chroma, and fractional input
+        // where q=100 is not bit-exact at all (BUG-45).
+        if source_integral && crate::reference_from_source(&chosen.config) {
+            return chosen;
+        }
+        // The side channel is the second encode's, which is the configured path. It is already
+        // the right one unless the sibling won — and the sibling is the only candidate that can
+        // differ from `config` here, because `encode` refuses the fallback for anything else.
+        if !config.is_lossless() && chosen.config.is_lossless() {
+            let sibling = crate::lossless_sibling(config);
+            let again = self.encode_once(ctx, rgb_data, width, height, &sibling);
+            debug_assert_eq!(
+                crate::format::serialize_compressed(&again).len(),
+                crate::format::serialize_compressed(&chosen).len(),
+                "the re-encode that repairs the reference side channel is not the frame `encode` \
+                 chose, so one of the two is not deterministic"
+            );
+            // The canary: it prints only on the frames that pay the third encode, so
+            // "the repair ran" is distinguishable from "the sibling never won".
+            eprintln!(
+                "GNC: RATE-3 reference repair — bit-exact candidate kept, re-encoded so the \
+                 reference side channel is its own ({} B)",
+                crate::format::serialize_compressed(&again).len(),
+            );
+            return again;
+        }
+        chosen
+    }
+
     fn encode_once(
         &mut self,
         ctx: &GpuContext,
@@ -1636,6 +1721,24 @@ impl EncoderPipeline {
         // the weights are packed for the GPU and written into the header.
         let owned_config = config.normalized_for_lossless();
         let config = &owned_config;
+        // **BUG-45.** `is_lossless()` is a statement about the settings; bit-exactness also needs
+        // integer samples. At q=100 the step is 1.0 and MED's residual is a difference of
+        // integers, so fractional f32 input is rounded and the file is lossy while every
+        // `is_lossless()` in the codec still reports true. Same family as BUG-15 and BUG-30 — a
+        // setting outside the guarantee, silently taken — and the reason it stayed invisible is
+        // that PNG and Y4M input is integral, so only an API caller can reach it.
+        //
+        // Warned rather than refused: the samples cannot be normalised without changing the
+        // picture, so the honest options are to say so or to reject the frame, and rejecting a
+        // frame the caller can legitimately want coded lossily is worse than telling them what
+        // they got. `local_decode_iframe_gpu` uses the same predicate to decline building a
+        // reference from a source the reconstruction does not equal.
+        if config.is_lossless() && !crate::source_is_integral(rgb_data) {
+            eprintln!(
+                "GNC: lossless settings (q=100 / qstep<=1) with non-integer input samples — the \
+                 step-1 quantiser rounds, so this frame is NOT bit-exact (BUG-45)"
+            );
+        }
         let profile = std::env::var("GNC_PROFILE").is_ok();
         let t_start = std::time::Instant::now();
 

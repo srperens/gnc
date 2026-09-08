@@ -86,7 +86,12 @@ worth knowing:
   marker in its heading. An idea with no ID and no priority is invisible to `next` — that is why
   `ARCH-1`, `EBCOT` part 2 and the numbered legacy entries are not offered.
 - **To take an item out of rotation without holding it as a session**, park it:
-  `scripts/claim take --as blocked-<reason> <ITEM> "why"`. `CANARY-1` and `MEAS-5` are parked
+  `scripts/claim take --as blocked-<reason> <ITEM> "why"`. **`--as` will refuse a value whose
+  session part it cannot evaluate** (COORD-7, `docs/decisions/0071`): either name no session at
+  all — `blocked-<reason>`, a reason rather than a directory — or name one that can be tested,
+  `s<pid>` for a handover or `s?` when it is genuinely unknown. A session-*shaped* value the
+  liveness test cannot parse is how three claims became permanently untestable.
+  `CANARY-1` and `MEAS-5` are parked
   this way — both need a second GPU — so `next` skips them instead of handing out work nobody
   can do.
 
@@ -110,10 +115,12 @@ taken against. Nothing is pushed; the contention is local to this machine. See
 parked item is invisible to `next`, so an abandoned claim removes work from seven other sessions.
 
 **Decision-record numbers are a shared resource too, and they collided the same way.** `main`
-currently carries **two** files numbered `0018` — `0018-gnc-is-broad-on-purpose.md` and
+carried **two** files numbered `0018` — `0018-gnc-is-broad-on-purpose.md` and
 `0018-the-entropy-coders-are-level-and-0015s-prediction-was-wrong.md` — plus an 0020 that had to
 be renumbered from 0018 by hand. Same mechanism as the MEAS-9 collision: two sessions read
-`ls docs/decisions/`, both computed "next is 0018", and neither could see the other. The lock
+`ls docs/decisions/`, both computed "next is 0018", and neither could see the other. **All four
+live pairs were renumbered on 2026-09-08 (BUG-19, `docs/decisions/0059`); the numbers below are
+the collision as it happened, not the current state of `docs/decisions/`.** The lock
 already handles this — **do not pick a number**. `scripts/claim dr` (and `claim bug`) walk
 committed `main` *and* live `refs/claims/*` and CAS the first gap, so the id comes *out* of
 the compare-and-swap (COORD-2, `docs/decisions/0050`):
@@ -121,23 +128,41 @@ the compare-and-swap (COORD-2, `docs/decisions/0050`):
 ```bash
 scripts/claim dr "the pick is the lock"    # prints dr-NNNN; that is the reservation
 scripts/claim bug "why, briefly"          # prints BUG-N
+scripts/claim id ENT "why, briefly"       # prints ENT-N -- any item prefix, same CAS
 ```
+
+**And item ids collided the same way on 2026-09-08, which is what `claim id` is for.** COORD-2 gave
+`BUG-N` and `dr-NNNN` an allocator and left every other prefix — `ENT-`, `PAD-`, `MEAS-`, `TILE-` —
+to be picked by hand off `ls`-equivalent reading. Two sessions filed **two different `### ENT-9`
+headings sixteen minutes apart**, and `refs/claims/ENT-9` can only lock one of them: the claim note
+on the ref says "ENT-9 filed", and there is no way to tell from the ref which heading that meant.
+`scripts/claim id <PREFIX> "<why>"` allocates the first free `PREFIX-N` over committed `main` plus
+live `refs/claims/*` and CAS-reserves it in the same step; `claim bug` is now a shorthand for
+`claim id BUG`. **Anything mentioned in committed BACKLOG counts as taken**, not only a heading,
+because every one of these collisions was "someone filed it and I could not see it".
+COORD-3, `docs/decisions/0065`.
+
+`claim items` and `claim next` now **warn when two startable headings share an id**. Nothing can be
+double-granted — there is still exactly one ref — so the damage is quieter than that: whoever
+claims first makes the other item **invisible to `next`**, and it stays invisible until someone
+renumbers it. If you see that warning, renumber the *unclaimed* one (`claim id <PREFIX>`), and
+leave a held id where it is.
 
 `take dr-NNNN` still exists for a number you already hold. It is not how you get one. Drop
 the claim once the record is merged.
 
 **`0024` is now colliding too** — `0024-the-gpu-abac-encoder-counts-before-it-writes.md` (ENT-5)
 and `0024-the-jpeg-2000-gap-is-upstream-of-the-entropy-coder.md` (INTRA-1), both on `main`, both
-referenced from BACKLOG and a commit message. Third pair, same afternoon, same mechanism. Noted
-rather than fixed: renumbering is BUG-19's job and the inbound references are where it goes wrong.
+referenced from BACKLOG and a commit message. Third pair, same afternoon, same mechanism. **Fixed
+2026-09-08 by BUG-19: the ENT-5 record is now `0057` and INTRA-1 keeps `0024`.**
 
 **And this pair is the first one that happened *after* the reserve-first rule was written, which
 says something the other three could not.** The INTRA-1 session held `dr-0024` through
 `scripts/claim` before writing its file; the other did not. The rule works — it just has to be
 used, and one session skipping it is enough to produce the collision, because a reservation only
-excludes people who ask. **CLAUDE.md also cites "`0024`" for abac's encoder judgement calls, and
-that reference is now ambiguous.** When BUG-19 gets picked up, the unreserved record is the one that
-should move.
+excludes people who ask. **CLAUDE.md also cited "`0024`" for abac's encoder judgement calls, and
+that reference was ambiguous for a day; it now says `0057`.** BUG-19 moved the unreserved record,
+which is the rule this paragraph argues for.
 
 **`0027` then collided the same way on 2026-09-08** — `0027-a-simple-perf-fix-is-one-whose-win-is-a-count.md`
 and `0027-cross-tile-rate-allocation-is-worth-one-point-not-ten.md`. Same asymmetry as `0024`: the
@@ -194,10 +219,66 @@ ENT-7 session, which renumbered to `0030` before anything referenced `0029`. **C
 fix**; its build spec already says the free-number scan must read committed `main` *and*
 `refs/claims/*`, and today's case is recorded there as the instance the interim habits cannot cover.
 
-**Four more records are colliding and nobody has renumbered them: `0018` twice and `0019`
-twice** (a fifth case, `0020`, was renumbered by hand). Filed as **BUG-19** — the fix is
-mechanical but the inbound references are where it goes wrong, so it is a claimable item rather
-than something to do in passing.
+**Four pairs were colliding and all four are now renumbered — BUG-19, 2026-09-08,
+`docs/decisions/0059`.** The later-written half of each pair moved and the earlier one kept the
+number, which in `0024` and `0027` is also the half that never reserved it:
+
+| collided | kept by | moved to |
+|---|---|---|
+| `0018` | ENT-2, the entropy coders are level | **`0055`** — GNC is broad on purpose |
+| `0019` | COORD-1, the pick is the lock | **`0056`** — the inter path's saving was an equal-setting figure |
+| `0024` | INTRA-1 step 1, the J2K gap is upstream | **`0057`** — the GPU abac encoder counts before it writes |
+| `0027` | INTRA-1 step 2b, cross-tile allocation | **`0058`** — a simple perf fix is one whose win is a count |
+
+(A fifth case, `0020`, was renumbered by hand on 2026-09-07.) Both files in every pair now carry a
+note naming the other, because **a commit message cannot be renumbered** and the ambiguous
+citations that predate the fix are the part that outlives it.
+
+## Four worktrees are holding 29 uncommitted files and their sessions are gone (2026-09-08, 20:0x)
+
+**Snapshot taken read-only, and it is the BUG-32 lesson at 4x scale, two hours in rather than
+eleven.** All four hold a startable item and none has a live session behind it.
+
+| worktree / item | base | uncommitted | unmerged commits | newest edit |
+|---|---|---|---|---|
+| `../gnc-tile1` — **TILE-1** (P2) | `a73e0a2` | **13**, incl. `format.rs`, `pipeline.rs`, `sequence.rs`, `rice_gpu.rs` | 0 | ~2h4m |
+| `../gnc-next2` — **PERF-2** (P3) | `a73e0a2` | 8, incl. `color.rs`, `quantize.rs`, `interleave.rs` | 0 | ~2h |
+| `../gnc-g41232` — **PAD-2** (P2) | `6397188` | 7, incl. `motion.rs`, `gpu_work.rs`, `checkpoint.rs` | **1** | ~2h3m |
+| `../gnc-bug35rans` — **BUG-35** (P2) | `a73e0a2` | 1, `quantize_histogram_fused.wgsl` | 0 | ~2h3m |
+
+**A fifth item is parked behind the first.** ROBUST-2 (P2) is `blocked-format-rs-in-flight` because
+"gnc-tile1 holds uncommitted edits to `deserialize_compressed_validated` in 4 hunks". If that
+session is gone the park's premise is void — but a park is invisible to `claim next` by design, so
+nothing will notice on its own. **Whoever confirms tile1 is dead should unpark ROBUST-2 in the same
+breath.**
+
+**Before you steal any of them, read the worktree** — that rule is two sections up and it is what
+this table is for. Each of these is someone's half-finished item, not a free id: inheriting beats
+repeating, and `git -C "$REPO-<area>" diff` is the whole cost.
+
+### Checking whether a holder is alive: use the socket directory, not the process table
+
+**`pgrep -x claude` is not sound for this and will tell you a live session is dead.** Measured while
+building the table above: it missed `19376`, a live session, which `ps -p 19376 -o comm` reports as
+`claude`. Cross-referencing it with `lsof -d cwd` does not help either — sessions launched from the
+shared checkout all report *its* path as their cwd, not their worktree's, so cwd does not identify
+a worktree at all.
+
+What is sound:
+
+```bash
+ls /tmp/cc-socks/                # one socket per live session, named by pid
+```
+
+Nine gnc sockets existed when this was written and all nine map to named sessions; none of the four
+above had one. `ListAgents` agrees with the socket list, which is expected — it is the same
+registry. **Caveat:** a live session that never registered a socket would look dead by this test. No
+example of one has been seen, but the test is "has a socket", not "is alive", and the difference is
+worth remembering before a `steal`.
+
+This is COORD-5's subject: `claim list` now annotates a holder with its uncommitted-file count and
+edit age, which is what made this table a one-liner, but it still says "verify before trusting"
+without saying how — and the obvious how is wrong.
 
 ## Reserving an id is not filing the item, and a dead session takes the difference with it
 
@@ -224,6 +305,32 @@ Two habits, both cheap:
   "$REPO-<area>" status --short` is one command and it is the difference between inheriting the
   work and repeating it. Three of the rows in the table above were written by sessions that are
   gone; that is normal here, so this check belongs in the takeover, not in an incident.
+
+**And the same gap makes sessions file the same finding repeatedly. Three did, in one hour, on
+2026-09-08.** Two `### ENT-9` headings went live on `main` minutes apart; the owner claimed
+**COORD-3** to repair it and held it for four minutes with no heading, so a second session filed
+**BUG-41** for the same thing, and a third filed **BUG-42** for it *after* COORD-3's stub was on
+`main`.
+
+The third one is the instructive one, and `scripts/claim bug` is not what failed: it walks
+`main:BACKLOG.md` and `refs/claims/*` for a free **id**, and BUG-42 *was* a free id. **Nothing
+anywhere compares the subject.** The third session had also branched its worktree before the stub
+landed, so its own `BACKLOG.md` did not contain COORD-3 — the same **stale base** that handed out
+`dr-0029` above, one namespace over. So before filing anything, two reads, neither of which is
+your working tree:
+
+```bash
+git show main:BACKLOG.md | grep -i '<the subject, not the id>'   # already filed on committed main?
+scripts/claim list                                               # held with no heading yet?
+```
+
+The second is the one both misses had in common: **a held item whose heading does not exist yet is
+invisible to every read except `claim list`** — not to `grep`, not to `next`, not to `items`.
+
+**COORD-3 shipped the id half the same afternoon** (`docs/decisions/0065`): `scripts/claim` now
+allocates item ids through the same CAS as `dr` and `bug`, warns on duplicate startable ids, and
+`ENT-9` is renumbered to `ENT-10`. The two reads above remain the *subject* half, which no
+allocator can cover.
 
 ## Two sessions cannot merge in the shared checkout at the same time
 
@@ -309,6 +416,100 @@ stopped the session that skipped `take dr-0024`.
 else is mid-operation on. The rule generalises to **never abort or switch away from an operation
 you did not start**, and `.git/` names the operation — `MERGE_HEAD`, `REBASE_HEAD`,
 `rebase-merge/`, `CHERRY_PICK_HEAD`.
+
+## Every number carries a tree, and this is the class's home
+
+**COORD-4 priced this on 2026-09-08 and the answer changed what to do about it.** The question was
+whether `scripts/claim` should stamp the commit a measurement was taken on. It should not — but
+only because the evidence points somewhere cheaper, not because the failure is rare. It is the
+most frequent measurement failure in this repository right now.
+
+**Six instances, and one of them is the only one a claim-time stamp would have caught:**
+
+| # | instance | shape | would `claim measured` have caught it? |
+|---|---|---|---|
+| 1 | **BUG-44** (2026-09-08) — 254.0039 against 0.0000, patched tree vs shipped | cross-session | **yes** |
+| 2 | **PAD-1 / `0039`** (2026-09-08, `c109128`) — q=85 rows pre-INTER-2, q=92 rows post | intra-session, `main` moved | no |
+| 3 | **ENT-3 / `0025`** (2026-09-08, `0045`) — nine published points, two superseded by INTER-2 | intra-session, `main` moved | no |
+| 4 | **the build-artefact near-miss** (2026-09-08, section below) — a rebuild during a 36-run sweep | intra-session, own `target/` | no |
+| 5 | **ARCH-3 / BUG-18** (2026-09-07) — `main` moved mid-item; rebased and re-measured | intra-session, `main` moved | no |
+| 6 | **quarter-pel #15** (2026-03-09) — "−0.63 dB vs stale baseline (`617d8e6`)" | comparison against a stale record | no |
+
+**So the tool is refused on its own numbers: 1 of 6.** The cheaper variant — printing the commit
+each *claim* was taken against — would have caught **0 of 6**, because a claim's commit is not a
+measurement's commit and instance 1's difference was uncommitted anyway. COORD-4 closed on this.
+
+**What the six actually say is that the rule is already written four times, by four sessions, on
+one afternoon, under four names — and that is why it keeps not being applied:**
+
+- *this section* — ask which tree, when two sessions' numbers cannot coexist
+- *"Do not swap a shared build artefact while someone is measuring"*, below — the same failure
+  inside one session, where nothing errors and the numbers quietly come from two codecs
+- *ENT-3's bullet in the merge log* — **"a figure that reproduces exactly on its own pinned commit
+  and not on `main` is a change log, not an error"**, and its instruction to *pin the old commit
+  before attributing*. That one is the most valuable of the four and the hardest to find.
+- *PAD-1's `c109128`* — "a table whose q=85 and q=92 came from different binaries is unreadable —
+  the same failure mode as a before-number and an after-number taken across a rebase"
+
+They are one rule: **a number is incomplete without the tree it was measured on, and `main` moves
+under you.** Four articulations exist because each session met the class fresh and none could see
+the others' wording. Read the four together; do not write a fifth.
+
+**The three habits they add up to**, cheapest first:
+
+```bash
+git -C "$REPO" rev-parse --short HEAD   # say this next to any number you publish or send
+```
+
+- **State the tree with the number.** `main` at `<sha>`, or "my branch with X applied, `src/`
+  otherwise identical to `<sha>`". `RESEARCH_LOG` already has good examples of this done right
+  (`ent2` pinned at `c0dd27f`; the Huffman-mapping gate naming both binaries and asserting `src/`
+  byte-identity between them) — those are the model, and neither is one of the six.
+- **A table is one binary.** If `main` moves mid-table, re-run the table, do not patch the rows.
+  Instances 2 and 3 are both published tables split across a merge.
+- **When two results cannot both be true, ask which tree before you file, correct, or reverse.**
+  Instance 1 cost two sessions an hour and put two wrong inferences into `main`; the refuting test
+  was on disk the whole time and takes twenty seconds.
+
+**Why now, and why it is not a competence problem.** Five of the six are from the two days this
+repository has run eight concurrent sessions. Concurrency is what makes a published figure decay
+between measurement and reading, and the cost scales with how many sessions merge into one `main`,
+not with how careful any one of them is. A seventh instance is likelier than any of the four
+rule-writings preventing it, which is why COORD-4's answer is consolidation rather than another
+paragraph.
+
+### The worked example, kept because it shows all three habits failing at once
+
+**Found 2026-09-08, by both sides of it.** A RATE-4 measurement said the encoder's reference and
+the decoder's differ by 254.0039 at `q=100`. The BUG-39 session had just shown `q=100` video
+decoding bit-exact on 48 of 48 frames, which cannot be true of a codec predicting from a reference
+the decoder does not hold. Two results, both correctly measured, apparently contradictory.
+
+**They were taken on different trees.** The 254.0039 came from a *patched* encoder — a source-copy
+reference under test — so the encoder side of the diff was a colour-converted source plane rather
+than a reference. The shipped tree reads 0.0000 on the same instrument, same content. There was no
+bug in either measurement and no bug in the instrument.
+
+**The cost was an hour of writing and two rounds of corrections into `main`**, including a
+conclusion inverted and then re-inverted in the same entry — because each side reasoned about the
+other's number instead of asking one question:
+
+> **"Which commit was that measured on?"**
+
+Both cheap fixes went unreached. One side had a twenty-second test that settles it
+(`cargo test --release --lib <the oracle> -- --test-threads=1`); the other had one line of
+`git diff` they never asked for. Neither is expensive; both were skipped in favour of an
+explanation.
+
+**So: a number quoted across sessions is incomplete without its tree**, exactly as a claim is not a
+measurement. When you send one, say what it was measured on — `main` at `<sha>`, or "my branch with
+X applied". When you receive one that cannot coexist with yours, ask that before you file a bug,
+write a correction, or reverse a conclusion. And **never invert your own measured result on someone
+else's inference** — an inference is not a measurement no matter how good the reasoning is, and the
+session that inverted here had the refuting test on disk the whole time.
+
+Filed and closed the same hour as **BUG-44** (not-a-bug); the worked example lives in BACKLOG's
+RATE-4 entry, which carries both corrections struck in place rather than deleted.
 
 ## A subagent's load is your load, and it is transitive
 
@@ -435,7 +636,14 @@ If this table and `scripts/claim list` disagree, the table is wrong.
 
 | worktree | branch | area |
 |---|---|---|
+| `../gnc-loopa` | `loopa` | **BUG-20 FIXED 2026-09-08 — the native clippy gate is `--all-targets` and the 91 warnings are cleared, not exempted.** `cargo clippy --release` reads the lib and the bins and never a test; `--all-targets` reported **91** (90 lib-test + 1 `tests/requested_limits.rs`), 88 on 2026-09-07 and 90 later that day, so the count drifts on its own. Now **0**, with no `#[allow]` added at any level. **Two of the eight lints were substantive**: `assertions_on_constants` was BUG-35's guard test asserting relations between three `const usize` values at *run* time (now `const _: () = assert!(…)`, so an arena shrink fails the build), and `unused_variables` found a dead `BufferUsages` binding in `rice_gpu.rs`. The other 89 are style, and the 27 `needless_range_loop` are the honest case for the alternative — exempting tests — which lost because there is no CI here, so step 5's clippy command is the only thing that reads this code mechanically. Decision `0062`. **Invalidates no measurement**: every edit is inside `#[cfg(test)]` code or an integration test target — nine of the eleven `src/` files have their first changed line below their own `#[cfg(test)]` marker, and the other two *are* test files (`{encoder,decoder}/pipeline_tests.rs`, included only under `#[cfg(test)]`) — so the shipped build is unchanged by construction. Filed **BUG-38** on the way — `cargo fmt --check` is red the same way and worse (566 diffs, 61 files, **504 of them in 44 files under `src/`**), heading committed with the reserved id. **ENT-9 DONE** (`0074`): abac context-codes the Exp-Golomb unary prefix — bitstream **GP19**, GP18 abac frames refused. **−2.07% to −8.76% of total rate at q=99** at bit-identical pixels (98/98 GPU-vs-CPU identity, 6/6 pixel arms, workgroup storage 6400 → 9472 B of 16384). Every figure lands just under `0063`'s bound by 0.16–0.37 points. BASELINE's `--abac` row annotated conservative; re-take is **MEAS-11**. **COORD-7 FIXED** (`0071`): the `#g…` identity came through `--as` — no committed version of `scripts/claim` can emit a `g` prefix — so `--as` now refuses a session part `session_alive` cannot read; `CLAUDE_PID` (verified against `ps`) is preferred over the twelve-hop walk; an `s?` claim records `walk: claude-pid=… chain: …` so the next one is a reading; `basename --` at four sites, found by reading the instrument's own output. **COORD-5 FIXED** (`0069`): `claim list` reports the holder's worktree when liveness cannot be established — at 18:58, with `next` reporting all 15 startable items claimed, **4 could not be tested** (`s?` x3 and one `g01a08196` that `me()` cannot produce), all idle ~67m holding 1/7/13/8 uncommitted files. Cause left to **COORD-7** with an instrument rather than a guess; "cannot say" is deliberately not collapsed into `SESSION GONE`. New `selftest` case mutation-tested. **BUG-38 DECIDED, reformat parked** (`0066`): no rustfmt config fits (default is best of seven at **573** diffs; `"Max"` 1114, `max_width = 90` 964), **44 of the 61 dirty files were changed on `main` in 24 h**, so both the big-bang and the per-touched-file rule cost the same conflicts and the cold subset is only 10%. Rule kept, one atomic `cargo fmt` commit owed on a quiet tree with its sha in `.git-blame-ignore-revs`. Also filed and closed **BUG-42** in the same hour: the *third* filing of the ENT-9 duplicate-id finding after BUG-41 and COORD-3 (which then shipped, `0065`), from a worktree branched before COORD-3's stub landed — `claim bug` gives a free id and nothing compares the subject. See the note above the shared-checkout merge section. |
+
+| `../gnc-refdiff` | `refdiff` | **RATE-4 half done, dropped 2026-09-08.** The free half — `0040` point 4's source-copy reference — is **refuted by a direct buffer diff** rather than by 0040's confounded PSNR: 0.0000 in RATE-3's q=95..99 fallback case, **254.0039** at q=100 MED, 7.3965 at q=100 lossless wavelet. Encoder's source planes are fractional where the decoder's reference is integral, and identical between the MED and wavelet runs, so it is not the transform. Reverted; tree unchanged. **The unexplained half is why the fallback case matches exactly** — start there. The other half (choose the candidate on sequence bytes, which is what makes bbb q=99 regress) is untouched. |
+| `../gnc-refdiff` | `refdiff` | **RATE-3 DONE 2026-09-08.** `0036`'s sequence gate lifted; mean **−4.28%** of sequence bytes (3 sequences × q ∈ {95,99} × ki ∈ {2,9}), best −13.16%, worst ΔP −0.01 dB, I-frames bit-exact through a real `encode-sequence` → `decode-sequence` md5 round trip. The gate was hiding the *mirror image* of `0040`'s bug: `encode_once` leaves only the **last** candidate's quantised planes in the side channel `local_decode_iframe_gpu` reads, so a kept *bit-exact* frame got the lossy candidate's — P-frames at 5.93 dB. `encode_as_reference` re-runs whichever was kept, at a third encode on those frames. Stills byte-identical. bbb q=99 regresses +0.4/+0.58% → **RATE-4** (with `0040` point 4's source-copy reference, whose refutation is confounded by BUG-39 cause 2). Decision `0044`.  **Its mean is now −6.09%, not −4.28%, and its two regressions are gone — RATE-4 found they were BUG-47** (`lossless_sibling` did not carry `pad_fill_decay`, so the bit-exact candidate was coded with a still's padding while acting as a reference). `docs/decisions/0072`. The decision is unchanged; only the price was wrong. |
+| `../gnc-next3` | `next3` | **DOC-3 DONE 2026-09-08.** `claim next` reported all 14 startable items held by *live* sessions (eight started within minutes; every holder's pid alive, so nothing stealable), so this went to the section that decides what the queue contains: BACKLOG's **priority order**, stale on **5 of 6** items — PAD-1/INTRA-2 both shipped, LOSSLESS-1 "buildable now" built two days earlier, CANARY-1 "never measured" DONE at 34x, BUG-14 DONE, abac's inter figure superseded by `0045`. GOALS/README/BASELINE/LOOP/CLAUDE carry **none** of the six. The one finding that is not a correction: item 1's "next largest known intra lever is still unbuilt" pointed at `--abac`, which is **built** and worth −16.6% to −18.8% of intra rate — and *making it the default had never been a heading with an ID*, so `claim next` could not offer the largest built lever in the codec. Filed **ENT-10 (P2)**, parked `blocked-idle-machine` (needs abac GPU encode ms/frame — ENT-5's criterion 3 — and a re-take of `0017`'s 1.69× decode). Documentation only; no code, no shader, no measurement. Decision `0060`. **Then COORD-3, caused by that filing:** the ENT-3 session had filed a *different* `### ENT-9` 16 min earlier, so two startable headings shared one id and `refs/claims/ENT-9` could lock only one — the other goes invisible to `next`. Fifth instance of the `0050` mechanism, first inside BACKLOG. Shipped **`scripts/claim id <PREFIX>`** (any prefix, mention-counts-as-taken; `claim bug` is now its shorthand) plus a duplicate-id warning in `items`/`next`, selftest extended 2 → 4 properties, **DOC-3's heading renumbered ENT-9 → ENT-10** (theirs was first and is held) and DOC-3's ENT-9 canary **withdrawn** as unreadable off an ambiguous ref. Touches `scripts/claim` — **overlaps BUG-19** (`gnc-drnum`), which is renumbering the `0018`/`0024` decision-record pairs; nothing here changes `docs/decisions/` numbering. Decision `0065`. **Then LOSSLESS-2 (DONE):** at `q=100` a P-frame that serialises larger than the previous I-frame is re-coded as an I-frame — camera content **−27.6% to −41.0%** of sequence rate at identical (bit-exact) pixels, animation **±0** (bbb keeps every P-frame), shipped output equal to the per-frame minimum on 8 of 8 points. 32/32 frames still md5-identical to source through the container; q=90 and q=99 byte-identical. Per-frame beats *both* per-sequence answers on a synthetic shot cut (25 562 037 B against 32 938 051 / 25 879 801). Touches `src/encoder/sequence.rs` (P-only branch) — **overlaps nothing held**, but RATE-4/`refdiff` and BUG-39/`losslessp` are in the same file's neighbourhood. New BASELINE section (lossless sequences). Filed then **did LOSSLESS-3 (DONE)**: at q=95-99, 4:4:4, no bitrate target, a sequence is emitted bit-exact when that is smaller — camera content **−5.95% to −33.58%** at exact pixels (the switched file is byte-identical to the q=100 encode), animation **±0.00%** on all six points and the second arm never even coded there. 24/24 never larger, no frame worse; q≤94, q=100, subsampled chroma and stills byte-identical. **The per-frame shape was built first and reverted:** a P-frame costs +4.5% to +9.9% more against a bit-exact reference than against a lossy one (4 of 4 sequences), so greedy swapping is a ratchet — bbb q=99 ki=9 came out +5.51%. Table re-taken on `d10e414` after the RATE-4 session flagged that BUG-47 moved exactly those columns. Filed **BUG-46** (`lossless_sibling` drops chroma format — why this is 4:4:4-only) and **BUG-48** (q=100 keeps PAD-1's decay fill, +0.78%/+0.66%). Decisions `0070`, `0073`. |
 | `../gnc-nextitem` | `nextitem` | **BUG-35 (partial) 2026-09-08.** Left a three-session pile-up on BUG-32; `claim next` handed this. Guarded the fused/rANS histogram arena (`check_hist_arena_capacity`, 5120). Measured `--rans` stills: q=15 fits at 313–335 bins; q=70 fits at 3428; q≥85 refuses at 5322–7004 (was silent corruption). **Shrinking to ≤3266 rejected** — it would refuse the q=70 `--rans` point `0035` shipped. Five over-budget rANS entry points remain. Decision `0048`. |
+| `../gnc-drnum` | `drnum` | **RATE-4 DONE 2026-09-08 — the regression was the sibling's padding, not the ledger.** `docs/decisions/0072`. **BUG-47:** `lossless_sibling` did not carry `pad_fill_decay`, so a bit-exact I-frame kept at q = 95..=99 was coded with **decay-filled** padding while the sequence encoder had cleared that flag for every frame something predicts from (`0039`). One line, and RATE-3's twelve points go from **mean −4.28% / worst +0.58% / 2 of 12 worse than control** to **mean −6.09% / best −16.19% / worst +0.00% / 0 of 12**, worst P move unchanged at −0.01 dB — **RATE-4's criterion met in full.** **Invalidates RATE-3's and `0044`'s rate figures** (noted in both, plus BASELINE); 4:2:2 and 4:2:0 move the same way by an unmeasured amount; **stills are byte-identical** and that is checked, not argued. Also shipped: a bit-exact frame's reference is built from its **colour-converted source**, so RATE-3's third encode is gone — **24 of 24 sequence points byte-identical**, route fired 52×, refused on 4:2:0 and in the forced-off arm (`scripts/rate4_ref_source_gate.py`); the win is a count, not a time (`0058`). **How BUG-47 was found:** that route was the first thing ever to compare the two candidates' preprocessing — it was byte-identical at q=100 and moved bytes on 10 of 24 fallback points, and `GNC_PAD_FILL=replicate` named the cause in one run. **`0068`'s per-GOP ledger is retired unbuilt** (0 of 38 flips after the fix). Also filed: **BUG-45** — `is_lossless()` is a claim about the settings, not the input; fractional `f32` at q=100 is silently lossy (max 254.0039 against the source), which is the whole content of RATE-4's blocking row. Warned, not refused. Earlier in this worktree: BUG-19 fixed (four colliding decision-record numbers renumbered, `0059`), BUG-41 filed and closed as a COORD-3 duplicate, RATE-4's ledger measured (`0068`). |
+| `../gnc-drnum` | `drnum` | **BUG-19 FIXED 2026-09-08 — the four colliding decision-record numbers are renumbered.** `0018`→**`0055`**, `0019`→**`0056`**, `0024`→**`0057`**, `0027`→**`0058`**; the earlier-committed half of each pair kept the number, which in `0024` and `0027` is also the half that reserved it. **Invalidates no measurement** — prose plus one `///` comment in `entropy_helpers.rs`; gates run to prove it still compiles. 31 citation sites repointed and about as many left alone deliberately, because **the keepers are the more-cited half in every pair**: nearly every `0024` in the tree is INTRA-1's ≤7.5% bound, not ENT-5's encoder, so a blind replace would have broken 30 correct citations to fix 31 wrong ones. **Two citations were already wrong before this started** — RESEARCH_LOG's MEAS-9 entry cited "decision 0020 (GNC is broad on purpose)" twice, and `0020` is the colour-lead withdrawal; the number had been vacated by the hand renumbering hours earlier and nobody noticed for a day. Commit messages keep the old numbers and are **not** rewritten; instead all eight files carry a header note naming the other half and the dates the collision was live. Decision `docs/decisions/0059`. Also fixed one pre-existing broken markdown link; a link check over every `.md` now reports zero. |
 | `../gnc-dx12bidir` | `dx12bidir` | **BUG-34 DONE 2026-09-08.** Storage-buffer request 10 → **9** (`gnc::required_limits()`). `block_match_bidir.wgsl` binds 9, nothing else above 7, so 10 was slack; 8 still needs a merge in that file, refused because BUG-40 holds it, B-frames are off, and it is BUG-25's crash site. Decision `0047`. Test `tests/requested_limits.rs` asserts the whole `Limits` struct against default plus that one field. No shader change, no measurement moved. Worktree name predates the claim (`next` handed BUG-34 after a multi-session BUG-32 pile-up). |
 | `../gnc-coord2` | `coord2` | **COORD-2 — `claim bug` / `claim dr` allocate the next id as the CAS.** First gap over committed `main` plus `refs/claims/*`; lost races retry. `selftest` 8+8 distinct. Record `0050` (0049 collided with BUG-40's merge). No codec change. |
 | `../gnc-g41232` | `g41232` | **BUG-40 step 1 DONE 2026-09-08.** Bidir pipelines are lazy, same rule as `split_pipeline`. Metal byte-identical (still q=75 `0b5cc743…`, 9-frame I+P `d75c72ee…`). Intra does not compile `block_match_bidir`; `GNC_B_PYRAMID=1` does (`[bug40] match_bidir_pipeline=1`). DX12 intra is owed on the laptop. Decision `0049`. Worktree name is the session pid, not the item — `next` handed BUG-40 after a three-session pile-up on BUG-32. |
@@ -450,8 +658,8 @@ If this table and `scripts/claim list` disagree, the table is wrong.
 | _(removed)_ | `intrasym` | **INTRA-1 step 3 — DONE and merged 2026-09-08; worktree and branch gone.** The accounting closes: the remaining ~6 points are tile-alignment padding.** GNC pads every plane to whole tiles with edge replication (`pad.wgsl`) and codes the padded plane, so a 1920x1080 frame is coded as **2048x1280 — 20.9% of the coded samples outside the picture** and the decoder crops them; J2K in whole-picture mode codes none, and both arms are divided by the visible pixel count. **Two methods, means agreeing to 0.02 points: +6.60% projected from a content-controlled crop pair (quality held to 0.005 dB), +6.58 points as the drop in the cross-codec gap from native to padding-free content on one ladder (26.76 -> 20.17 RGB, 51.09 -> 40.54 Y).** Per-image the two scatter by ±2.2 points, which is the content change from a frame to its centre crop — the cross-codec arm carries it and the content-controlled arm does not, so the former corroborates the mean and is not a per-image second opinion. **A trap found while fixing my own first version, and it is general: do not difference a BD-rate against one taken on a different q ladder.** The first Part 2 read this harness's q=80-98 crop gap against ENT-4's q=60-99 native +27.1% and called the difference padding. On this ladder bbb's native gap is +19.46% where ENT-4 reads +17.3% — **2.2 points of pure ladder artefact per image**, the size of the effect, even though the four-image means nearly coincide (26.76 vs 27.1). It gave 6.98 and "agree to 0.4": the right answer for the wrong reason, withdrawn and re-measured. **Part 1's control is measured, not argued: JPEG 2000 reads −0.13% to +0.02% between the same two crops where GNC reads +11.6% to +25.2%**, so the extra row and column of content are under 1% of the effect. **Canary: the Python-rebuilt padded plane encodes byte-identically to production** (bbb q=90 `--abac`, 1 793 794 B both ways, which is the figure BACKLOG already records). **Two thirds is a fill choice** — replicate-then-fade is −4.48% RGB at unchanged visible quality, a mirror of the picture into the padding is +11.41%, so replication was already the better textbook extension. **Not shipped: the reference buffer keeps the padding and MC reads it for edge blocks**, so the gate is an inter measurement — filed as **PAD-1 (P1)** with three shapes and a worst-frame criterion. Also re-derived, agreeing with step 2c: `transform_97.wgsl` is **already whole-point symmetric extension**, and BACKLOG's stale "replicates the edge sample" candidate is now corrected in place. **INTRA-1 is closed as a queue entry** — its success criterion ("a number per cause that sums to roughly the measured gap") is met at 26.2 of 27.1, so it loses its priority marker rather than sending the next session after 0.9 points of residue; the work that is left is PAD-1 (P1) and INTRA-2 (P1), both filed with numbers and gates. Decision `0034`; harness `scripts/meas_intra1_padding.py`. **Re-measured on `c84fbd5` after RATE-2 landed, because RATE-2 codes q=95..99 both ways and this harness's first ladder was q=80..98.** One rung of eight moved and it moved badly: the padded arms come back **bit-exact lossless**, `psnr()` returns `inf`, and a Bjontegaard fit over an infinity is a silent non-number — `bd()` now refuses a non-finite rung and the default ladder is q=80/85/90/94. **Every part was re-measured, not only Part 1**, because Part 3's figure is what PAD-1 will be planned against: the projection is identical at **+6.60%** (it reads q=90, byte-identical across RATE-2), Part 2's drop goes 6.58 -> **6.70**, and Part 3's fill goes −4.62% -> **−4.48%** — in the predicted direction, since RATE-2's own reclaim leaves the ladder. **No figure moves by more than 0.15 points and no conclusion moves.** **Two things for others:** RATE-2 already reclaims part of the padding tax for free above q=95 and reaches the *padded* arm first (bbb q=98: padded −5.78%, aligned unchanged), which concentrates PAD-1's value below q=95 and is why the fill figure is quoted at −4.5% rather than −4.6%; and **any still figure here taken on a ladder reaching q>=95 before `a7273ab` is pinned to that code**, INTRA-1's own steps 1 and 2 included — not retracted, just not reproducible byte for byte today. **Invalidates no measurement** — no Rust changed; `cargo test --release`, `clippy --release` and `clippy --target wasm32-unknown-unknown --lib` (BUG-24's new form) all clean. |
 | `../gnc-intra1` | `intra1` | **RELEASED 2026-09-08 — everything merged (`f1b6b68`), all claims dropped, INTRA-1 is free to take.** It is *not* finished: **~6 of the 27.1 points remain and the item's own candidate list is exhausted**, so the next step needs a new hypothesis rather than another sweep. Two things left ready to build, both fully measured: **INTRA-2 (P1)** — the dead zone on I-frames only, ~3 points — and **ENT-6 (P2)** — abac's short code-blocks in the deep subbands, ~4% of the file. Step 2c (2026-09-08): every candidate the item listed is now measured; ~6 points remain.** Tile-boundary handling is **already correct symmetric extension** (0 points — and it corrects a wrong claim I put in `0027`; the replication is in the polyphase split, which *is* WSS, verified bit-identical over 1000 signals). The **dead zone** is worth **~3 points on stills** (+0.24 to +0.38 dB RGB *and* −2.9 to −4.5% dE00 at matched rate, VMAF −0.01) but is a **worst-frame regression on 9 of 9 sequence points, up to −1.93 dB** — filed as **INTRA-2 (P1)**, not shipped, because the dead zone hits P-frame residuals and the error propagates. **BUG-30 fixed**: `GNC_DEAD_ZONE` silently defeated bit-exact lossless at q=100 (BUG-15's hole, one knob over). Decision `0028`. Step 2b (2026-09-07): cross-tile rate allocation REJECTED — a clairvoyant, free per-tile allocator saves **0.95%**, about one point of the remaining ten, and on kristensara the oracle picks the *same* q for all 15 tiles at q>=92. Uniform q is not near-optimal there, it is optimal. Decision `0027`. **BUG-26 fixed**: it was two silent defects — tile > 512 (shader workgroup array) and tile not divisible by `2^levels` (`max_wavelet_levels` uses integer division, so 260 gets 5 levels and decodes to 20.1 dB). Both now refused, not clamped; 256/512 output byte-identical. **~9 points of the gap remain and the obvious candidates are spent.** Step 2 first instalment landed 2026-09-07: the gap decomposes. 8.5 of the 27.1 RGB points is chroma allocation against an RGB metric (YCoCg-R synthesis norms 1.73/0.71/0.87, spread 2.45, against J2K's ICT at 1.15 — **not** a coding deficiency, and it also explains why the Y gap was +48.3%: it falls to +13.5% when corrected). Lifting normalisation is clean. Tiling costs *J2K* 12.4 points but GNC realises 0.6%. **~9.8 points left; next test is cross-tile rate allocation.** Decision `0026`. **Two traps recorded: a full-frame tile-size comparison is confounded by padding (+6.1% that is really −0.6%), and `--tile-size 1024` silently destroys the image (BUG-26, P1).** Step 1 answered 2026-09-07: `GNC_COEF_ENTROPY=1` prices the *shipped* abac tiles against the entropy of the coefficients they carry, and GNC spends within **7.5% of it at q >= 85**. So entropy coding can account for at most ~7.5 of the 27.1 points against JPEG 2000 9/7 and **~72% is upstream of the coder** — the item is now its step-2 branch (tiling, quantiser shape, lifting normalisation). Decision `0024`. Turned up **ENT-6** on the way: the deep subbands are one short code-block each and cost ~4% of the file. Adds one diagnostic module and two `pub(crate)` exports; **invalidates no measurement** — the encoder path is untouched and the diagnostic is env-gated and read-only. |
 | _(removed)_ | `arch3` | **ARCH-3 + BUG-18 — merged 2026-09-07** (`a312d6f`, `e35d3b2`, `66c9a2e`), worktree removed. One P/B frame encoder; `gpu_entropy_encode` now picks the entropy step and nothing else. Default output **byte-identical, 54/54** against a baseline pinned at `07c01b1`, so no measurement is invalidated. `tests/bug18_locate.rs` reads 0.000 everywhere. **abac's inter figure is un-retracted: −12.0% to −22.9% against Rice at bit-identical pixels.** Also fixed, unasked: `--huffman` video, which shipped writing empty P-frame tile vectors. `docs/decisions/0025`. |
-| `../gnc-inter1` | `inter1` | **INTER-1 done and merged 2026-09-08 (`ee286c2`); worktree removed.** No default changed — ki stays 9 (best of four at q=85-99, BD-rate monotone in GOP length), the P-scale taper stays with both endpoints re-justified, and inter stays a default. **Found and fixed BUG-27** (P-frame local-decode dequant used the intra qstep): live at all q <= 80, byte-identical at q >= 85 (27/27 against two pinned baselines), +1.82/+3.62 dB at q=70. Corrected MEAS-3 and decision 0019 (mean +4.6% -> −0.3%, worst-frame +19.1% -> +8.0%), and TUNE-5/TUNE-6's justifications. Filed **INTER-2** (the inter dead zone is a large unpriced lever at q=85) and **COORD-2** (ids must come *from* the compare-and-swap). Decision `0023`. |
-| `../gnc-perffix` | `perffix` | **PERF-1 — DONE 2026-09-08, merged.** Verified `docs/SIMPLE_PERF_FIXES.md` and landed 5 of its 12 items. **Invalidates no measurement: 24 artefacts (4:4:4 and 4:2:0, Rice and abac, stills and sequences, encode and decode) hash identical to `origin/main` after the rebase**, which is the whole point of the item — every win is a count, not a time. Counts: frame loads per display index 2.62 → 1.00, `poll(Wait)` per I-frame 3 → 1, `queue.submit` per `encode()` 2 → 1, two dummy CfL buffers gone, 1.22 MB/frame of decode pack allocation reused. Three permanent canaries under `GNC_PROFILE`. The retracted 31.7 fps is gone from GOALS, README and POSITIONING. **Item 4 verified and deliberately not landed — PERF-2 says why** (the scan's cached-UBO fix collides with Metal's `write_buffer` staging at every site whose params vary within a submit). Rest is PERF-3. Decision `0027`. |
+| `../gnc-inter1` | `inter1` | **INTER-1 done and merged 2026-09-08 (`ee286c2`); worktree removed.** No default changed — ki stays 9 (best of four at q=85-99, BD-rate monotone in GOP length), the P-scale taper stays with both endpoints re-justified, and inter stays a default. **Found and fixed BUG-27** (P-frame local-decode dequant used the intra qstep): live at all q <= 80, byte-identical at q >= 85 (27/27 against two pinned baselines), +1.82/+3.62 dB at q=70. Corrected MEAS-3 and decision 0056 (mean +4.6% -> −0.3%, worst-frame +19.1% -> +8.0%), and TUNE-5/TUNE-6's justifications. Filed **INTER-2** (the inter dead zone is a large unpriced lever at q=85) and **COORD-2** (ids must come *from* the compare-and-swap). Decision `0023`. |
+| `../gnc-perffix` | `perffix` | **PERF-1 — DONE 2026-09-08, merged.** Verified `docs/SIMPLE_PERF_FIXES.md` and landed 5 of its 12 items. **Invalidates no measurement: 24 artefacts (4:4:4 and 4:2:0, Rice and abac, stills and sequences, encode and decode) hash identical to `origin/main` after the rebase**, which is the whole point of the item — every win is a count, not a time. Counts: frame loads per display index 2.62 → 1.00, `poll(Wait)` per I-frame 3 → 1, `queue.submit` per `encode()` 2 → 1, two dummy CfL buffers gone, 1.22 MB/frame of decode pack allocation reused. Three permanent canaries under `GNC_PROFILE`. The retracted 31.7 fps is gone from GOALS, README and POSITIONING. **Item 4 verified and deliberately not landed — PERF-2 says why** (the scan's cached-UBO fix collides with Metal's `write_buffer` staging at every site whose params vary within a submit). Rest is PERF-3. Decision `0058`. |
 | `../gnc-meas5` | `meas5` | **BUG-32 filed and merged 2026-09-08 (`b9e3d9b`) — a rescue, not a measurement.** The MEAS-5 session was gone with **145 lines uncommitted in this worktree, nothing in RESEARCH_LOG, and `BUG-32` reserved through `scripts/claim` against a heading it never wrote**; this session took both claims over, reviewed the diff and filed it. The finding: `benchmark-sequence` spends **86% of its wall clock on CPU quality metrics**, so `gpu_tier_bench.py --density`'s `frames / wall` measures **how well N SSIM computations share the CPU**. It had never been run, so **nothing is retracted** — what it removes is the instrument MEAS-5 was going to use. Worked around with `--density-still` plus GPU power sampling (`utilization.gpu` reads 100% at 43 W of 130 W). Second harness defect also fixed: the `--hwenc` arm passed no GOP length, so NVENC used its own 250-frame default against whatever `-k` GNC got. **POSITIONING's M-series density table is flagged as a candidate, not retracted** — wrong date to be this code path. **No Rust, no WGSL, no bitstream; GPU suite deliberately not run** (DOC-1/ENT-7 precedent). **MEAS-5 itself is dropped back to free and still unmeasured** — it is runnable now via `--density-still` on the bench box, and the proper fix (a metrics-off flag on `benchmark-sequence`) is left in BUG-32. |
 | `../gnc-intra1gap` | `intra1gap` | **MEAS-6 second pass + BUG-36 FIXED, merged 2026-09-08.** Worktree name predates the claim (`next` handed me MEAS-5, then MEAS-6, never INTRA-1). **MEAS-6: GNC's default latency is ~80 ms, not ~240 ms.** `quality_preset()` has vetoed the B-pyramid since **2026-09-06** (`src/lib.rs:1021`) — the item's own 2026-09-06 conclusion was invalidated by the change that conclusion caused, and POSITIONING, README and MEAS-6's entry carried it for two days. Default `ki=9` codes `2I+16P+0B` with zero reordering delay; `GNC_B_PYRAMID=1` codes `2I+2P+14B`, 8 frames, 160 ms. So ~80 ms sits **below** the low-latency-HEVC band (120 ms floor), not inside it, and ~240 ms describes an opt-in config. Decision `0033`. **The ~80 ms itself was NOT re-taken** — load 21-39 all session, BASELINE's 20% rule — and that is MEAS-6's cheapest remaining step; the correction does not depend on it, because the half that moved is structural. **BUG-36 FIXED — the one to know about: concurrent `--vmaf` runs scored each other's frames.** Every VMAF site wrote a *fixed* `TMPDIR` filename; eight sessions share one `TMPDIR`. Serial 97.39/95.91 bit-stable; concurrent gave **97.19 (+1.28)** and **96.37 (−1.02)**, one of the pair wrong in every run, 2-2.5x the >0.5 BLOCK threshold, silent and plausible. Now pid-stamped via `gnc::session_temp_path()`; **6/6 concurrent runs correct after, 3/6 before**; `tests/temp_path_collision.rs` blocks reintroduction. **Nothing retracted** — no run records whether another session was in its VMAF window. Rate figures immune; `rd-curve --vmaf` was the highest-risk caller. Filed **BUG-37** (`benchmark-sequence`'s `-q` is an `Option` with no default, so without it the command still codes the pyramid — all five `scripts/` harnesses pass `-q`, so nothing recorded is contaminated). **MEAS-5 corrected and parked** as `blocked-idle-machine-or-nvenc`: its "fix this first" blocker was resolved 2026-09-06, and what remains needs a discrete NVIDIA card with driver 610+/nvenc 13.1 or an idle Mac — it was being handed to every fresh session as the top P0. Flagged to ENT-3 that `0025`'s inter table does not say which frame mix produced it. |
 | `../gnc-meas6` | `meas6` | **BUG-25 FIXED and BUG-33 CLOSED 2026-09-08 — GNC runs inter on Vulkan.** It was fixed by `51a9ac6` (the defect-A commit) hours before this session started, and nobody re-ran the failing path. Measured at `766196a` on the bench box: `encode-sequence` codes **1I + 2P on NVIDIA/Vulkan**, `decode-sequence` round-trips it, and **lavapipe gives byte-identical frame sizes**; `shader_probe` compiles **62 of 63** shaders (the miss is `blit.wgsl`, no `@compute` entry point). **All four recorded driver crashes were the invalid module** — the two Windows ones that read as independent confirmation were built from `f17bf1b`, which *predates* the fix by 66 deleted lines of that shader. Defect B is real in a `buffer: Restrict` module but wgpu never asks for one here (both adapters report `robustBufferAccess2`), so GNC does not reach it; `docs/bug25/` is relabelled an upstream report. Also: **defect A is upstream `gfx-rs/wgpu#7048`, closed by PR #7239**. Docs, one probe flag, one `.spvasm`, one code comment; **no codec code, no shader, no bitstream — invalidates no measurement.** Decision `0029`. **Owed: an inter throughput figure on Vulkan, now measurable for the first time; Intel Arc not re-run since the fix.** Older text follows. |
@@ -460,7 +668,7 @@ If this table and `scripts/claim list` disagree, the table is wrong.
 | _(superseded)_ | `meas6` | **BUG-25 — cause found, one of two defects fixed** (`332aab4`, `a27e082`, `51a9ac6`, `bc742a3`). Worktree name predates the claim; `scripts/claim next` handed me BUG-25, not MEAS-6. **The item's premise was wrong**: "spirv-val passes all 62" was measured with the `naga` CLI at **30.0.1** while GNC ships **naga 24.0.0** — the validated module is not the shipped one. **Defect A, fixed:** naga 24 emitted an undeclared function-local temporary for four `let … = array<i32,8>` tables indexed dynamically; 1 of 63 shaders invalid before, 0 after, Metal output byte-identical. **Defect B, open:** the valid module still segfaults NVIDIA *and* lavapipe; reduced to **42 lines** (`docs/bug25/`) and isolated to `BoundsCheckPolicy::Restrict` on **buffers** (`OpArrayLength`/`ISub` in a branch that returns instead of reaching its merge). Not fixed — inter on Vulkan still hangs. |
 | `../gnc-coord` | `coord` | **COORD-1 — the claim mechanism enforces the rules instead of restating them.** Docs and `scripts/claim` only; no codec change, invalidates no measurement. `scripts/claim next` makes the *pick* atomic, the shared-checkout and worktree preconditions are now refusals rather than prose, and the session identity bug that made `SESSION GONE` undetectable is fixed. See `docs/decisions/0019`. Claimed 2026-09-07. |
 | _(removed)_ | `docfix` | **DOC-1 — DONE and merged 2026-09-08 (`6d99907`).** Five stale prose claims in the public README, four of them wrong. **Documentation only; no code, no shader, no bitstream, no measurement moved.** The numbers were already current — PERF-1 had retired 31.7 fps and BUG-29 had replaced every labelled "M1" — and all five defects were sentences carrying no figure, which is why both sweeps missed them. The one that mattered: README stated "Runs on Metal, Vulkan, DX12 and WebGPU" as fact while **Vulkan is intra-only (BUG-25 open), DX12 has never been run at all, and WASM has never been verified in a browser (BUG-31 open)**. Replaced with a **Portability, as measured** section giving the four rows and their evidence. Also: the "eight-core integrated GPU / real time" line BUG-29 missed, "three" entropy coders against the same file's "five", the "remaining 27%" that INTRA-1 had since decomposed to ~6, and `BITSTREAM_SPEC` §2.6's list of `code_blocks` callers, which ENT-5 made incomplete — checked, and the single-definition property survives because the GPU encoder calls it on the host (`abac_gpu_encode.rs:381`). **The GPU suite was deliberately not run**: a two-file `.md` diff does not justify taking the one GPU from seven sessions. |
-| `../gnc-abacgpu` | `abacgpu` | **ENT-5 — abac now encodes on the GPU, one thread per code-block, and it is the CPU encoder's exact bytes** (98 of 98 whole-file comparisons; `scripts/ent5_gpu_encode_gate.sh`). **Invalidates no measurement and moves no bitstream** — byte identity is what is asserted, so ENT-4's −16.0% and the −13.4% lossless figure are unchanged by construction. Deliberately does *not* touch `use_gpu_encode` or `sequence.rs`'s frame-pipeline selection: abac routes on `gpu_entropy_encode` directly inside `encode_entropy`, so this is orthogonal to **ARCH-3** rather than racing it, and it keeps abac off the fused quantiser that BUG-16 says moves Rice's pixels. **One criterion outstanding: encode time per 1080p frame is NOT measured** — the machine had three other sessions on it, one of them running `encode-sequence`. Instrument: `cargo test --release --test abac_bench -- --ignored --nocapture --test-threads=1`. Until it runs, decision 0017's reason 2 has lost its mechanism and kept its 129 ms. See `docs/decisions/0024`. **Merged 2026-09-07 (`a2405d7`), claim dropped, worktree removed.** Rebased onto ARCH-3 after it landed — one markdown conflict, no code change, gates re-run (224 tests, identity gate 98/98). Two notes for whoever picks up the leftovers: **abac's 4:2:2 and 4:2:0 output is byte-identical between the GPU and CPU encoders**, so whatever BUG-28 is (filed as BUG-26 and renumbered — see below), it is not in abac's encoder; and ARCH-3's `inter_gpu_entropy_available()` returning `false` for abac now means "not in the batched dispatch", not "on the CPU" — its comment says so. |
+| `../gnc-abacgpu` | `abacgpu` | **ENT-5 — abac now encodes on the GPU, one thread per code-block, and it is the CPU encoder's exact bytes** (98 of 98 whole-file comparisons; `scripts/ent5_gpu_encode_gate.sh`). **Invalidates no measurement and moves no bitstream** — byte identity is what is asserted, so ENT-4's −16.0% and the −13.4% lossless figure are unchanged by construction. Deliberately does *not* touch `use_gpu_encode` or `sequence.rs`'s frame-pipeline selection: abac routes on `gpu_entropy_encode` directly inside `encode_entropy`, so this is orthogonal to **ARCH-3** rather than racing it, and it keeps abac off the fused quantiser that BUG-16 says moves Rice's pixels. **One criterion outstanding: encode time per 1080p frame is NOT measured** — the machine had three other sessions on it, one of them running `encode-sequence`. Instrument: `cargo test --release --test abac_bench -- --ignored --nocapture --test-threads=1`. Until it runs, decision 0017's reason 2 has lost its mechanism and kept its 129 ms. See `docs/decisions/0057` (renumbered from `0024` by BUG-19). **Merged 2026-09-07 (`a2405d7`), claim dropped, worktree removed.** Rebased onto ARCH-3 after it landed — one markdown conflict, no code change, gates re-run (224 tests, identity gate 98/98). Two notes for whoever picks up the leftovers: **abac's 4:2:2 and 4:2:0 output is byte-identical between the GPU and CPU encoders**, so whatever BUG-28 is (filed as BUG-26 and renumbered — see below), it is not in abac's encoder; and ARCH-3's `inter_gpu_entropy_available()` returning `false` for abac now means "not in the batched dispatch", not "on the CPU" — its comment says so. |
 | `../gnc-ent7bpc` | `ent7bpc` | **RATE-2 FIXED 2026-09-08 — the top of the lossy ladder codes both ways and keeps the smaller. `docs/decisions/0036`.** **This one DOES change output**, and only in one place: a still at q = 95..=99 may now come back **bit-exact**. Mean rate against the file the same command produced before, four stills: **−1.33% / −4.67% / −10.39% / −15.65% / −21.66% at q = 95/96/97/98/99**, with **12 of 20 points becoming bit-exact** from 52.5–60.1 dB. Below q=95, at q=100, with `--dct`, and **inside any sequence**, output is byte-identical. **No format change and no GP version** — `transform_type` is a header byte independent of the quality byte, so a q=97 file with `transform_type = 2` decodes on every existing build (verified through the shipped `gnc decode` + raw RGB md5). **Three things a later session needs.** (1) **RATE-3, filed P1:** letting the fallback reach sequence I-frames makes the P-frames referencing them decode at **9.80 dB against 60.69 dB** and *grows* the sequence 13.08 → 15.28 MB, because a MED I-frame has `wavelet_levels = 0` and the P-frame reference cannot reconstruct from it. The flag is cleared in `build_ip_config`, the three temporal-wavelet config sites in `main.rs`, **and** inside `encode_sequence` — three places rather than one because the GPU warm-up encodes call `encode` directly with the sequence config. (2) **Do not compare a BD-rate across this commit:** ladders reaching q≥95 now flatten at the top (correctly — it is the convex hull) so `bd_rate` drops those points, and QUAL-1 measured that changing a ladder's extent moves the figure 1.0 PSNR points by itself. (3) **BASELINE's 1.9x-against-H.264 caveat is updated, not lifted** — that ladder is video, this fix is intra, so it reproduces exactly; the rung to re-run it against is RATE-3. Earlier text for this worktree follows. |
 | `../gnc-intra2` | `intra2` | **Merged after INTER-2, and the resolution mattered.** INTER-2 landed mid-verification and touches the same three lines. Taking its line verbatim — `config.dead_zone * inter_dead_zone_mul()` — would have handed the inter path a **0.6** dead zone at q=85..95, where INTER-2 priced the ladder's 0.179 and 0.0125: its conclusion was measured where `config.dead_zone` *was* the ladder value, which is now `dead_zone_referenced`. The merge keeps its refactor and this change's source, and **every sequence is byte-identical to `main` afterwards**. Also: INTER-2's record took **0041**, reserved here through `scripts/claim` at 13:38:33Z before the file was written — sixth collision, same asymmetry as `0024`/`0027`, so the unreserved record moved to **0043** with its five inbound references updated. |
 | `../gnc-intra2` | `intra2` | **INTRA-2 DONE 2026-09-08 — 90% of its blocker was a knob that moved two things.** 0028 could not ship the dead zone because worst-frame went negative on 9 of 9 sequence points; but `res_dead_zone = config.dead_zone * inter_dz_mul` with the multiplier at **2.0**, so `GNC_DEAD_ZONE=0.6` took the *inter* dead zone from the ladder's 0.357/0.025 at q=90/95 — **no-ops** — to 1.2. Holding inter at the ladder's value: worst-frame **0.00/+0.03 dB at q=85**, −0.12…−0.19 at q=90/95. Shipped as `dead_zone` floored at 0.6 over **q=85..95 only**, plus `dead_zone_referenced` for the two places that must not see it: a **referenced** I-frame and the inter path. The gate is on *being referenced*, not on being intra — the residue is arithmetic (at ki=9 the I-frame is 1 of 16, so its saving dilutes 16:1 while worst-frame is fully exposed, because **the worst frame is the I-frame**). Same conclusion and adjacent line to PAD-1's `pad_fill_decay` (`0039`). **Criterion met on all three clauses: stills BD-rate −5.01%, sequences byte-identical, dE00 −5.2% at matched rate with Y-PSNR +0.39 dB.** q=100 bit-exact, VMAF −0.01, **BASELINE q=90 -> 49.89 dB / 7.21 bpp / 97.06**. Decision `0041`. **For INTER-2, in flight:** removing the inter dead zone entirely measured **+2.5 dB of worst-frame at q=85** here, and your "the inter dead zone is the intra one" was taken where `config.dead_zone` was the ladder value — that is now `dead_zone_referenced`, which is what `res_dead_zone` multiplies. |
@@ -823,6 +1031,196 @@ wrong conclusions have come from this one error.
 
 ## Landed today, and what each one invalidates
 
+- **ENT-9 — abac context-codes the Exp-Golomb prefix; bitstream is now GP19.**
+  `docs/decisions/0074`. **This one changes output**, and only for `--abac`: total rate
+  **−2.07% to −8.76% at q=99**, −1.26% to −4.56% at q=95, −0.85% to −2.75% at q=90, at
+  **bit-identical pixels** (6 of 6 arms, 108 frames, GPU encode → GPU decode). **Unchanged:**
+  every other coder, byte-for-byte — `gp19_rice_frames_are_gp18_payloads_with_a_new_label`
+  asserts it. **A GP18 abac frame is now refused**, deliberately: the two binarisations differ
+  only in how bits are modelled, so misreading one as the other gives a plausible wrong image, not
+  an error. Re-encode any `--abac` file you were keeping.
+
+  Three things worth carrying that are not about this item:
+
+  - **The bound was honest, and that is a result about the instrument.** `0063` priced this at
+    −2.44 / −8.20 / −9.07% before anything was built; it shipped at **−2.07 / −8.04 / −8.76%** of
+    total rate — every figure *just under* its bound, by 0.16 to 0.37 points, which is the only
+    direction that means the model was right. Compare the offline DWT-levels model that said 1.2%
+    where the codec gave 6%: that one could not see Rice adapting per subband. **An ideal-adaptive
+    bound over the real coder's own engine, with adaptation charged, predicted the shipped figure
+    to a third of a point.** That instrument is now trustworthy for candidate B.
+  - **The constraint that could have killed the design was measured before a line was written.**
+    `probs` lives in workgroup storage at `WG * NUM_CONTEXTS`, so 18 → 42 contexts took
+    **6400 B → 9472 B** of the 16384 B budget. Had that not fit, the answer was a different context
+    layout, not a patch. **Ask what the change costs the budget before you spend the day on it.**
+  - **A published figure moved and only part of the move is this item's.** Against Rice, q=99 P
+    bytes now read −12.1% / −15.8% / −12.3% where `0045` recorded under −4.5% — but ENT-9's own
+    controlled contribution is the before/after above, and the rest is RATE-3, INTER-2, BUG-39 and
+    LOSSLESS-2 landing in between. **Do not quote the difference between two figures taken on
+    different trees as one change's effect.** BASELINE's `--abac` row is annotated conservative
+    rather than re-taken, and the re-take is **MEAS-11** on a pinned commit — re-taking it today
+    would have credited all of that to ENT-9, which is COORD-6's failure, filed the same
+    afternoon.
+
+- **COORD-7 — the `#g…` identity came through `--as`, `CLAUDE_PID` is the oracle, and an `s?`
+  now records why.** `docs/decisions/0071`. **Invalidates nothing** — `scripts/claim` only.
+  Behaviour you will notice: **`--as` now refuses a session part the liveness test cannot read**,
+  so park with `blocked-<reason>` (no `#`) or hand over with a real `s<pid>`.
+
+  Three things worth carrying that are not about this item:
+
+  - **The answer was in the file's own history, and it took one loop to get.** *No committed
+    version of `scripts/claim` has ever emitted a `g` prefix* — so `gnc-next2@next2#g01a08196`
+    could only have come through `CLAIM_AS`, and `--as` accepting any string is the defect rather
+    than a mystery writer. Before theorising about who else writes `refs/claims/*`, ask whether
+    the thing that does could have produced the value.
+  - **`CLAUDE_PID` is set in every shell a session runs and it is exactly what `session_pid`
+    walks the process tree to find.** `CLAUDE_PID=8815`; the walk independently reached 8815.
+    It is now preferred, *checked against `ps` first* — a stale exported value would make a dead
+    session look alive, which is the one direction that loses work — with the walk kept as
+    fallback because the sessions that produced `s?` cannot be asked whether they set it.
+  - **Third check in one session that had to be shown to fail before it could be trusted.**
+    `0062`'s two runtime assertions over compile-time constants, `0069`'s worktree evidence, and
+    now this: the `s?` diagnostic's first version set a global inside a command substitution, so
+    it would have recorded nothing forever while reading as if it worked. In a shell script with
+    no test framework, **write the assertion, then break the feature and watch it fail.** It is
+    two commands.
+
+- **ENT-9 filed and half-measured — abac bypasses three quarters of its own bits at q=99.**
+  `docs/decisions/0063`. **Invalidates nothing** — read-only, env-gated
+  (`GNC_COEF_ENTROPY_INTER`), bitstream byte-identical with the variable unset and verified so.
+  Three things worth carrying, two of which are not about this item:
+
+  - **abac context-codes three decisions per coefficient and bypasses everything else, and at
+    q=99 "everything else" is 74.6% / 74.8% / 46.7% of its own bits.** Significant, `>1` and `>2`
+    are modelled; the Exp-Golomb remainder and the sign go out at p=1/2. **This is the mechanism
+    behind ENT-3's decay** and it bears directly on **ENT-10** ("should abac be the default"),
+    which currently prices that question on intra stills at q≤90 where the bypass share is far
+    lower. Whoever picks up ENT-8 should also know the coder's context model only touches a
+    quarter of the file at contribution quality.
+  - **A pooled entropy bound is not evidence about a change to context *count*, and the check is
+    cheap.** Step 1b priced 24 new contexts on statistics pooled per plane and subband; the same
+    change run through abac's real engine, cold-started per code-block, came back within ±0.4
+    points and *larger* on three of six points. That was worth doing because abac's own
+    256-stream variant died of exactly this effect (−6.6% → −0.7%), and the precedent turned out
+    not to transfer — 4096 coefficients per block, not 256 per stream.
+  - **"% of the coder's own bits" is not "% of total rate", and the difference runs against you.**
+    Adding the per-block length fields moved these figures by ≤0.01 points, but frame headers and
+    motion vectors are still uncounted. A bound cleared is not a gate cleared; both were stated
+    separately rather than blurred.
+
+- **COORD-5 — `claim list` reports the holder's worktree when it cannot say whether the holder
+  exists.** `docs/decisions/0069`. **Invalidates nothing** — `scripts/claim` only; no Rust, no
+  shader, no bitstream. **What changes is the thing you read before stealing an item**, so read
+  the new line rather than the old habit:
+
+  ```
+  SESSION GONE, safe to steal, worktree clean                       -> take it
+  OWNER UNIDENTIFIABLE, 13 file(s) uncommitted, newest edit 69m ago  -> read the diff first
+  no session recorded, verify before trusting                       -> parked: a reason, not a directory
+  ```
+
+  Three things worth carrying that are not about this item:
+
+  - **The pid stopped being a liveness oracle for a fifth of live claims, and it did so silently.**
+    At 18:58, with `next` reporting all 15 startable items claimed, **4 of them could not be
+    tested**: `BUG-35`, `PAD-2`, `TILE-1` recorded `s?`, and `PERF-2` recorded `g01a08196`, which
+    `me()` cannot produce. All four had been idle for ~67 minutes holding 1, 7, 13 and 8
+    uncommitted files. COORD-1 added the pid so an abandoned claim would be *detectable rather
+    than merely old*; unknown is not detectable either. **Cause not diagnosed and deliberately not
+    guessed at** — filed as **COORD-7** with an instrument (record the walked chain when the walk
+    fails) rather than a hypothesis.
+  - **"Cannot say" must not be collapsed into "gone", however much the empty queue argues for
+    it.** Failing closed would have freed all four items in one command and handed the next
+    session TILE-1 with 13 uncommitted files in someone else's worktree, called safe. The
+    `GONE`/`STALE` split exists because the two need different actions; a third state needs a
+    third answer, not to be rounded to whichever one is convenient.
+  - **A new assertion was mutation-tested before it was trusted**, one hour after `0062` found two
+    runtime assertions over compile-time constants in this tree. Breaking `worktree_evidence`
+    makes `claim selftest` print `FAIL: an unidentifiable owner naming a real worktree reported no
+    evidence`. **Do this for every check added to `selftest`** — it is two commands and it is the
+    difference between a gate and a decoration.
+
+- **BUG-38 — decided, not done: no rustfmt config fits the tree, and the dirty files are the hot
+  files.** `docs/decisions/0066`. **Invalidates nothing** — no `.rs` content changed; the
+  `rustfmt.toml` files used for the sweep were written and deleted in the worktree and none is
+  committed. The rule in GOALS §9 is **kept**, the reformat is **one atomic commit on a quiet
+  tree**, and the item is parked `blocked-quiet-tree` with a checkable unpark condition rather
+  than left free, so the next session under load does not either impose seven merge conflicts or
+  re-derive the whole thing.
+
+  Three things worth carrying that are not about this item:
+
+  - **The cheap hypothesis was worth testing and it died in one command.** "The tree has a wider
+    house style, so a `rustfmt.toml` collapses this" is falsified *in the opposite direction*:
+    rustfmt's default is the best of seven configs at **573** diffs and every deviation is worse
+    (`"Max"` 1114, `max_width = 90` 964, +120 cols 1518). **Do not add a `rustfmt.toml`.** Cost to
+    find out: four `cargo fmt --check` runs, no compilation.
+  - **When the dirty set is the hot set, "incremental" is not the safe option — it is the same
+    cost, distributed.** 44 of the 61 fmt-dirty files were changed on `main` in 24 h. A
+    per-touched-file rule therefore hits exactly the same files, spread over time, and mixes a
+    reformat into every semantic commit that touches one — the hazard the rule exists to prevent.
+    It read as obviously safer than a big-bang until the overlap was measured, and it is not.
+    Generalise: **before preferring incremental, measure whether the increments are the contended
+    part.**
+  - **A partial answer is worth nothing when the value is binary.** The genuinely cold subset — no
+    `main` commit in 24 h, dirty in no worktree — is 16 files and **10%** of the diffs. Taking it
+    leaves `cargo fmt --check` red, so the gate still cannot be adopted, which is the entire
+    point. Priced and declined rather than banked as progress.
+
+- **BUG-20 — test code is code, and the native clippy gate is now `--all-targets`.**
+  `docs/decisions/0062`. **Invalidates nothing measured** — every edit is inside `#[cfg(test)]`
+  code or an integration test target, so the shipped build is unchanged by construction rather
+  than by comparison. What it changes is **the gate you must run**: step 5's native command is
+  `cargo clippy --release --all-targets`, not `cargo clippy --release`. The wasm form stays
+  `--lib` (BUG-24) — the asymmetry is deliberate and CLAUDE.md now says why.
+
+  Two things worth carrying that are not about this item:
+
+  - **A gate that cannot see a class of code will accumulate warnings in it at a rate nobody
+    notices.** BUG-20 counted 88 on 2026-09-07; a later entry recorded 90; it was **91** when the
+    item was picked up two days later. Nothing regressed — the drift is just what an unread
+    directory does. The general shape: a rule enforced by a command is only as wide as the
+    command's target selection, and `--all-targets` versus the default is exactly that kind of
+    invisible narrowing.
+  - **The two findings worth having were in the two lints nobody would call noisy, and the noisy
+    lint was the bulk.** 27 of 91 were `needless_range_loop`, which is genuinely arguable in test
+    code; 2 were `assertions_on_constants`, pointing at a guard test that asserted compile-time
+    constants at run time. If the decision had been made by counting warnings it would have gone
+    the other way. **Count what the warnings are, not how many.**
+  - **And the same defect is live one gate over, unfixed: `cargo fmt --check` is red on 566 diffs
+    in 61 files, 504 of them under `src/`.** GOALS §9 requires it; no gate list mentions it.
+    Filed **BUG-38 (P4)**, deliberately not fixed while eight sessions hold those files.
+
+- **ENT-3 — abac's inter saving decays with quality, and two of `0025`'s nine points are
+  superseded.** `docs/decisions/0045`. **Invalidates nothing measured** — the only code is one
+  read-only env-gated diagnostic (`GNC_COEF_ENTROPY_INTER`) and output is byte-identical with it
+  unset. What it *does* invalidate is a **published table**: `0025`'s q=50 and q=75 columns, and
+  the "−12.0% to −22.9% on inter" figure CLAUDE.md carried from them (corrected there).
+
+  Three things worth carrying that are not about this item:
+
+  - **A container ratio over a mixed-frame-type file is not a figure about either type.** `0025`
+    measured abac against Rice over whole `.gnv` files at ki=9 — 2 I-frames and 16 P-frames — and
+    was read as an inter result, including by this entry's own title. `encode-sequence` has been
+    printing `[I]`/`[P]` byte counts the whole time, so the split cost nothing but asking for it.
+    Split, the P and I halves differ by up to 6.4 points and **inter is the stronger half on two
+    of three sequences** — the opposite of what the item predicted.
+  - **A figure that reproduces exactly on its own pinned commit and not on `main` is a change
+    log, not an error.** All nine of `0025`'s points reproduce to the digit at `a312d6f`, so
+    nothing was mismeasured; on today's `main` the q=90 column still reproduces exactly and q=50
+    and q=75 move by up to 7.2 points. The boundary named the cause: I-frame bytes are **equal
+    integers** at all nine points and P-frame bytes are equal integers at q=90 only, so it is
+    inter-only and inactive at q=90 — INTER-2 (`0043`) halving `inter_dz_mul`, because the
+    ladder's dead zone is 0.75 at q=50/75 and interpolates to ≈0.18 at q=90 where both the old
+    and new inter values are below the 0.5 at which a dead zone stops doing anything. **Pin the
+    old commit before attributing**: the fit to BUG-27's q≥85 boundary was clean, confident and
+    wrong about the magnitude by two orders.
+  - **A measured range decays across the operating range and the single number you quote should
+    be the one from your own range.** abac buys −20.6% of P bytes at q=90 on bbb_extended and
+    −3.7% at q=99 on old_town_cross. GNC is a contribution codec; anything quoting one abac rate
+    figure without its q is quoting the flattering end.
+
 - **RATE-2 — a still at q = 95..=99 may now come back bit-exact, and it is smaller.**
   `docs/decisions/0036`. **This one changes output**: mean **−21.66% at q=99** on four stills, 12
   of 20 points bit-exact. **Unchanged**: everything below q=95, q=100, `--dct`, and every
@@ -927,7 +1325,7 @@ wrong conclusions have come from this one error.
   4:2:2 and 4:2:0 on the **intra** path — max |diff| 12-13 over ~4% of samples at q=50, 5 over
   ~1% at q=75, identical at q=90. **Reproduces on `main` at `1d67d29`, so it is not this change.**
   No published figure is wrong (every abac measurement in the repo is 4:4:4), but abac's "at
-  identical pixels" and decision `0018`'s "every chroma format at once" are 4:4:4 claims, and
+  identical pixels" and decision `0055`'s "every chroma format at once" are 4:4:4 claims, and
   nothing said so. Small differences over a large area is the shape a PSNR average hides.
 
   **For whoever holds ENT-5 (abac GPU encoder):** rebase onto this. `inter_gpu_entropy_available()`
@@ -964,7 +1362,7 @@ wrong conclusions have come from this one error.
   | 80 | 21595433 B, 40.77/38.91 dB | 21734608 B, 41.57/40.53 dB | +0.6% B, +0.80/+1.62 dB |
 
   **What it invalidates.** Every inter figure taken at q <= 80, which is most of them:
-  **MEAS-3's +4.6% mean / +19.1% worst-frame** (ladder q=25-95) and **decision 0019**, which rests
+  **MEAS-3's +4.6% mean / +19.1% worst-frame** (ladder q=25-95) and **decision 0056**, which rests
   on it — re-running now, and the worst-frame column is where the fix lands hardest, so expect it
   to move most. **TUNE-6's own justification too**: its recorded "old_town q=99: -3.8 dB avg,
   **-14.2 dB worst**" for scale 1.25 was measuring this defect and not the trade, so the taper's
@@ -1104,7 +1502,7 @@ figure; changes no default.** BD-rate of the shipped ki=9 configuration against 
 sequences, 18 frames, q=25-95, 4:4:4: **+15.9% (crowd_run), +22.2% (old_town_cross), −24.2%
 (bbb_extended), mean +4.6% on mean PSNR — and mean +19.1% on worst-frame PSNR.** Positive means
 inter needs *more* bits. Above q≈85 the saving is gone; at q=95 inter costs more than all-intra on
-two of three sequences. Decision record 0019; the follow-up is BACKLOG **INTER-1**, unclaimed.
+two of three sequences. Decision record 0056; the follow-up is BACKLOG **INTER-1**, unclaimed.
 
 Three things to carry:
 

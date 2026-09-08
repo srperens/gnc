@@ -669,15 +669,21 @@ fn deserialize_mvs_delta(
 /// MV overhead by 50-80% for typical content.
 pub fn serialize_compressed(frame: &crate::CompressedFrame) -> Vec<u8> {
     let mut out = Vec::new();
-    // Magic: GP18 adds entropy type 5, the adaptive binary code-block coder (`EntropyData::Abac`).
-    // Nothing else moved, so a GP18 frame using any older coder is byte-identical to the GP17 one
-    // apart from these four bytes — but a GP17 decoder would reject type 5 rather than
-    // misinterpret it, which is what the generation is for.
+    // Magic: GP19 context-codes abac's Exp-Golomb unary prefix instead of bypassing it (ENT-9
+    // candidate A). Only entropy type 5 changes, so a GP19 frame using any other coder is
+    // byte-identical to the GP18 one apart from these four bytes — and a GP18 abac frame is
+    // *refused* below rather than decoded with the new binarisation, because the two differ only
+    // in how bits are modelled and misreading one as the other yields a plausible wrong image
+    // rather than an error.
+    // GP18 adds entropy type 5, the adaptive binary code-block coder (`EntropyData::Abac`).
     // GP17 added Golomb-Rice stream-length tables (tile flag 0x08).
     // GP15 splits Rice k_zrl into k_zrl_nz + k_zrl_z per subband (K_STRIDE 17→25 per tile, #53).
     // GP14 adds fwd_ref_idx + bwd_ref_idx for hierarchical pyramid B-frames.
     // GP13 is GP12 + chroma_format byte.
-    out.extend_from_slice(b"GP19");
+    // GP20 adds TILE-1's padding grid on top of GP19 — see the generation table in
+    // `deserialize_compressed`. It is a superset: a GP20 frame also carries GP19's abac
+    // binarisation, which is why the number goes up rather than branching.
+    out.extend_from_slice(b"GP20");
     // Common header fields (includes chroma_format byte for GP13)
     serialize_frame_header(frame, &mut out);
     // Motion field — GP12 uses delta-coded varint MVs
@@ -711,7 +717,7 @@ pub fn serialize_compressed(frame: &crate::CompressedFrame) -> Vec<u8> {
         }
     }
     // Entropy coder type: 0 = rANS, 1 = bitplane, 2 = per-subband rANS, 3 = Rice, 4 = Huffman,
-    // 5 = abac code-blocks (GP18)
+    // 5 = abac code-blocks (GP18; GP19 context-codes their Exp-Golomb prefix)
     let entropy_type: u32 = match &frame.entropy {
         crate::EntropyData::Rans(_) => 0,
         crate::EntropyData::SubbandRans(_) => 2,
@@ -918,6 +924,25 @@ fn make_zero_subband_tile(
 /// Deserialize a CompressedFrame from GP12/GP11/GP10/GPC9/GPC8 binary format.
 /// Returns the frame without CRC validation. Use `deserialize_compressed_validated`
 /// for GP12/GP11 CRC checking.
+/// Cap a wire-supplied element count at what the rest of the buffer could possibly hold.
+///
+/// Every count this is applied to is immediately followed by that many fixed-size records, so
+/// a count above `remaining / stride` cannot be honest whatever the header says. Without the
+/// cap a four-byte field asking for four billion records reaches `Vec::with_capacity` and
+/// **aborts the process** on a file small enough to fit in a packet; with it, the parse runs
+/// off the end of the buffer and hits the same panic the parser already has everywhere else.
+///
+/// That is a strict improvement and not a fix: the decoder's contract on malformed input is
+/// still "panic", stated by the `assert!` at the top of `deserialize_compressed_validated`.
+/// **ROBUST-1 carries the decision** about rejecting instead — a `Result` boundary, a
+/// validating pre-pass, or documenting the contract. This only removes the cheapest denial of
+/// service, where a tiny hostile file turns into a huge allocation.
+///
+/// Well-formed streams are unaffected: their counts always satisfy the bound by construction.
+fn wire_count(count: usize, stride: usize, data_len: usize, pos: usize) -> usize {
+    count.min(data_len.saturating_sub(pos) / stride.max(1))
+}
+
 pub fn deserialize_compressed(data: &[u8]) -> crate::CompressedFrame {
     deserialize_compressed_validated(data).frame
 }
@@ -946,10 +971,21 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
         b"GP17" => 17,
         // GP18: entropy type 5, the adaptive binary code-block coder.
         b"GP18" => 18,
-        // GP19: TILE-1 stage 1 — plane padded to 32, not to tile_size.
+        // GP19: abac context-codes the Exp-Golomb unary prefix (ENT-9 candidate A). Only type 5
+        // moved; every other coder is byte-identical to GP18.
         b"GP19" => 19,
+        // GP20: TILE-1 stage 1 — the plane is padded to `PLANE_PAD_ALIGN` (32, i.e. `2^levels`)
+        // instead of up to a whole `tile_size`, so the last tile row and column are short.
+        //
+        // **This was written as GP19 and had to be renumbered (BUG-51).** ENT-9 took GP19 on
+        // `main` for a different format while this change was uncommitted in an orphaned
+        // worktree, and the two collided under one number — which is worse than the decision-record
+        // and item-id collisions that preceded it, because a generation decides how a *file* is
+        // read: `gen >= 19` gates would have been true for both formats and misreading one as the
+        // other yields a plausible wrong image rather than an error, exactly as `0074` warns.
+        b"GP20" => 20,
         _ => panic!(
-            "Invalid magic (expected GPC8..GP19; older files must be re-encoded)"
+            "Invalid magic (expected GPC8..GP20; older files must be re-encoded)"
         ),
     };
 
@@ -996,6 +1032,7 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
     let ll = f32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
     let num_detail = u32::from_le_bytes(data[pos + 4..pos + 8].try_into().unwrap()) as usize;
     pos += 8;
+    let num_detail = wire_count(num_detail, 12, data.len(), pos);
     let mut detail = Vec::with_capacity(num_detail);
     for _ in 0..num_detail {
         let lh = f32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
@@ -1015,7 +1052,12 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
         pos += 4;
         let num_cfl_tiles = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
         pos += 4;
-        let alpha_count = (2 * num_cfl_tiles * nsb) as usize;
+        // `2 * num_cfl_tiles * nsb` in u32 wrapped in release and panicked in debug before
+        // it was ever compared to anything; widen first, then bound.
+        let alpha_count = (num_cfl_tiles as usize)
+            .saturating_mul(nsb as usize)
+            .saturating_mul(2);
+        let alpha_count = wire_count(alpha_count, 2, data.len(), pos);
         let mut alphas = Vec::with_capacity(alpha_count);
         for _ in 0..alpha_count {
             let v = i16::from_le_bytes(data[pos..pos + 2].try_into().unwrap());
@@ -1041,6 +1083,7 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
     let adaptive_quantization = aq_flag != 0;
     let wm_len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
     pos += 4;
+    let wm_len = wire_count(wm_len, 4, data.len(), pos);
     let weight_map = if wm_len > 0 {
         let mut wm = Vec::with_capacity(wm_len);
         for _ in 0..wm_len {
@@ -1171,6 +1214,13 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
     pos += 4;
     let num_tiles = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
     pos += 4;
+    // Stride 1, not 8. The gen>=11 index table is 8 bytes per tile, but `num_tiles` is reused
+    // below for the tile vectors on every generation, and a pre-GP11 tile blob has no
+    // guaranteed minimum size of 8 — capping at remaining/8 could shrink a *legitimate*
+    // count and corrupt a well-formed file, which is worse than the problem. One byte per
+    // tile is the bound that cannot be wrong, and it still ties the allocation to the input
+    // size, which is the property that matters here.
+    let num_tiles = wire_count(num_tiles, 1, data.len(), pos);
 
     // GP11/GP12/GP13/GP14: tile index table with sizes + CRC-32s
     let (tile_sizes, tile_crcs) = if gen >= 11 {
@@ -1289,9 +1339,13 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
             )
         }
         5 => {
+            // GP19, not GP18: the binarisation changed under the same entropy type, so a GP18
+            // abac frame decoded here would come back as a plausible wrong image rather than an
+            // error. Refusing it is the whole point of the generation number.
             assert!(
-                gen >= 18,
-                "entropy type 5 (abac) requires GP18 or later, got GP{gen}"
+                gen >= 19,
+                "entropy type 5 (abac) requires GP19 or later, got GP{gen} — GP18 abac frames \
+                 predate ENT-9's context-coded Exp-Golomb prefix and must be re-encoded"
             );
             let mut tiles = Vec::with_capacity(num_tiles);
             for i in 0..num_tiles {
@@ -1322,7 +1376,9 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
                 bit_depth,
                 tile_size,
                 chroma_format: chroma_format_decoded,
-                plane_pad_align: if gen >= 19 {
+                // BUG-51: gated on 20, not 19. A GP19 file is ENT-9's abac change and still
+                // uses the tile-size grid; only GP20 padded to `PLANE_PAD_ALIGN`.
+                plane_pad_align: if gen >= 20 {
                     crate::PLANE_PAD_ALIGN
                 } else {
                     tile_size
@@ -1900,6 +1956,30 @@ pub fn seek_to_temporal_keyframe(header: &TemporalSequenceHeader, target_pts: u3
 
 #[cfg(test)]
 mod tests {
+    /// A wire count cannot ask for more records than the buffer could hold.
+    ///
+    /// Four of these counts reach `Vec::with_capacity` straight off the wire, so before
+    /// `wire_count` a four-byte field saying `u32::MAX` turned a packet-sized file into a
+    /// multi-gigabyte allocation and aborted the process. This asserts the bound directly
+    /// rather than through the parser, because the parser's contract on malformed input is
+    /// still to panic (ROBUST-1) and a test that has to catch a panic cannot tell an
+    /// intended one from an abort.
+    #[test]
+    fn a_wire_count_is_bounded_by_what_the_buffer_could_hold() {
+        // 64 bytes left, 12 bytes per record: at most 5 records however large the field is.
+        assert_eq!(super::wire_count(u32::MAX as usize, 12, 100, 36), 5);
+        assert_eq!(super::wire_count(usize::MAX, 2, 100, 36), 32);
+
+        // A well-formed count passes through untouched — the property that makes this safe
+        // to apply to a valid stream.
+        assert_eq!(super::wire_count(3, 12, 100, 36), 3);
+        assert_eq!(super::wire_count(5, 12, 100, 36), 5);
+
+        // Degenerate inputs must not divide by zero or wrap: `pos` past the end, zero stride.
+        assert_eq!(super::wire_count(9, 12, 10, 40), 0);
+        assert_eq!(super::wire_count(9, 0, 100, 0), 9);
+    }
+
     /// Exp-Golomb motion-vector coding must round-trip exactly, including the values that
     /// dominate a well-predicted field: zero deltas, and long runs of them.
     #[test]

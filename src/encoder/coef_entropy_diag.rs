@@ -159,12 +159,25 @@ struct BandStats {
     big: HashMap<usize, HashMap<i64, u64>>,
     /// One sign bit per significant coefficient; signs are not modelled by either bound.
     sign_bits: f64,
+    /// ENT-9 candidate A: the Exp-Golomb *unary prefix* bits, which abac bypasses, modelled as
+    /// context-coded decisions instead. Prefix bit `i` of a coefficient is the decision
+    /// "is the magnitude past threshold `i`" — the same kind of decision as `>1` and `>2`, just
+    /// past where abac stops asking. Context is `(bucket, min(i, 3))`: 6 x 4.
+    eg_prefix_ctx: Vec<BinCount>,
+    /// How many prefix bits there are, so the win is (count - modelled) and not a ratio of ratios.
+    eg_prefix_bits: f64,
+    /// ENT-9 candidate B: the sign, modelled on the signs of the left and up neighbours —
+    /// `(3 x 3)` contexts. This is JPEG 2000's sign-context argument, which GNC has never priced.
+    sign_ctx: Vec<BinCount>,
     /// ENT-7 step 3: BPC-PaCo's parallel-context bitplane model on the same coefficients.
     bpc: BpcStats,
     /// ENT-6: abac's real engine, cold-started at p = 1/2 — the canary against `shipped`.
     adapt_cold: f64,
     /// ENT-6: the same engine started from this band's own signalled table.
     adapt_warm: f64,
+    /// ENT-9 step 2 milestone 1: the same engine, cold, with candidate A's 24 prefix contexts
+    /// active — cold-started per block like the 18 they join, so adaptation is charged.
+    adapt_prefix: f64,
     /// ENT-8: the same engine, cold, under the lockstep scan at three stripe widths — 32, 16 and
     /// 8 threads per 64px code-block against abac's one today. Only the first column of each
     /// stripe loses its left neighbour, so the rate cost falls as the width grows and the
@@ -176,6 +189,8 @@ impl BandStats {
     fn new() -> Self {
         Self {
             ctx: vec![BinCount::default(); NUM_BUCKETS * 3],
+            eg_prefix_ctx: vec![BinCount::default(); NUM_BUCKETS * 4],
+            sign_ctx: vec![BinCount::default(); 9],
             ..Default::default()
         }
     }
@@ -215,6 +230,10 @@ fn accumulate_block(st: &mut BandStats, coefficients: &[i32], width: usize) {
     bpc_paco_diag::accumulate_block(&mut st.bpc, coefficients, width);
     let height = coefficients.len() / width;
     let mut mag = vec![0u32; coefficients.len()];
+    // ENT-9 candidate B needs the *signs* of already-coded neighbours, which `mag` has thrown
+    // away. -1 / 0 / +1, and out-of-block reads as 0 exactly as `neighbour_sum` does, so the
+    // context stays inside the code-block and blocks stay independently decodable.
+    let mut sgn = vec![0i32; coefficients.len()];
     for y in 0..height {
         for x in 0..width {
             let v = coefficients[y * width + x];
@@ -234,11 +253,32 @@ fn accumulate_block(st: &mut BandStats, coefficients: &[i32], width: usize) {
                         let n = a - 3 + 1;
                         let len = 32 - n.leading_zeros();
                         st.bypass_bits += f64::from(2 * len - 1);
+                        // ENT-9 candidate A: the unary prefix is `len - 1` zeros then a one, so
+                        // as decisions it is `len - 1` "keep going" bits followed by one "stop".
+                        // The mantissa (len - 1 bits) is left bypassed — it is the low bits of a
+                        // magnitude and there is no causal information about it.
+                        for i in 0..len {
+                            let slot = (i as usize).min(3);
+                            st.eg_prefix_ctx[slot * NUM_BUCKETS + c].push(i == len - 1);
+                            st.eg_prefix_bits += 1.0;
+                        }
                     }
                 }
                 st.bypass_bits += 1.0; // sign
                 st.sign_bits += 1.0;
+                // ENT-9 candidate B: sign given the left and up neighbours' signs.
+                let at = |yy: i64, xx: i64| -> i32 {
+                    if yy < 0 || xx < 0 || xx >= width as i64 {
+                        return 0;
+                    }
+                    sgn[yy as usize * width + xx as usize]
+                };
+                let l = at(y as i64, x as i64 - 1);
+                let u = at(y as i64 - 1, x as i64);
+                let idx = ((l + 1) * 3 + (u + 1)) as usize;
+                st.sign_ctx[idx].push(v < 0);
             }
+            sgn[y * width + x] = v.signum();
 
             // --- the richer bounds, on the same causal information ---
             let (rc, bc) = rich_context(&mag, width, y, x);
@@ -386,6 +426,85 @@ pub fn run(tiles: &[AbacTile], plane_tile_counts: [usize; 3], qstep: f32) {
         (t[0] / t[5].max(1e-9) - 1.0) * 100.0,
     );
 
+    // === ENT-9 step 1: which symbols get a context at all ===
+    // abac context-codes exactly three binary decisions per coefficient — significant, >1, >2 —
+    // and sends the Exp-Golomb order-0 remainder of (|v| - 3) and the sign as *bypass* bits at
+    // p = 1/2. ENT-3 measured abac's saving against Rice decaying monotonically with quality
+    // (`0045`), and the candidate mechanism is that the file moves out of the coded decisions and
+    // into the bypass as magnitudes grow. That is a split of `Hctx`, and every term of it is
+    // already accumulated above: the bypass is countable exactly (a p = 1/2 bit costs one bit),
+    // so the only thing missing was printing it.
+    //
+    // The ceiling on ENT-9 is the bypass share: no context added to the three decisions can
+    // recover anything from bits that are not modelled at all.
+    {
+        let mut dec = [0.0f64; 3]; // significant, >1, >2
+        let mut eg = 0.0f64;
+        let mut sign = 0.0f64;
+        for bands in &stats {
+            for st in bands {
+                for (i, c) in st.ctx.iter().enumerate() {
+                    dec[i / NUM_BUCKETS] += c.bits();
+                }
+                // `bypass_bits` carries the suffix *and* the sign; `sign_bits` is the sign alone.
+                eg += st.bypass_bits - st.sign_bits;
+                sign += st.sign_bits;
+            }
+        }
+        let coded: f64 = dec.iter().sum();
+        let hctx = coded + eg + sign;
+        let pc = |x: f64| 100.0 * x / hctx.max(1e-9);
+        eprintln!(
+            "  --- ENT-9 step 1: which symbols abac gives a context, as a share of Hctx ---"
+        );
+        eprintln!(
+            "    context-coded  significant {:>11.0} b ({:>5.1}%)  >1 {:>11.0} b ({:>5.1}%)  \
+>2 {:>11.0} b ({:>5.1}%)",
+            dec[0], pc(dec[0]), dec[1], pc(dec[1]), dec[2], pc(dec[2])
+        );
+        eprintln!(
+            "    bypassed       Exp-Golomb  {:>11.0} b ({:>5.1}%)  sign {:>9.0} b ({:>5.1}%)",
+            eg, pc(eg), sign, pc(sign)
+        );
+        eprintln!(
+            "    => coded {:.1}% of Hctx, bypassed {:.1}% — the bypass share is the ceiling on \
+any context added to the three decisions (ENT-9)",
+            pc(coded),
+            pc(eg + sign)
+        );
+
+        // ENT-9 step 1b: price the two candidates the split implies, before either is built.
+        // Both are ideal-adaptive bounds with no signalling and no adaptation loss charged, i.e.
+        // generous in the same direction as `Hnb` — so a candidate that fails here fails.
+        let mut prefix_n = 0.0f64;
+        let mut prefix_modelled = 0.0f64;
+        let mut sign_modelled = 0.0f64;
+        for bands in &stats {
+            for st in bands {
+                prefix_n += st.eg_prefix_bits;
+                prefix_modelled += st.eg_prefix_ctx.iter().map(BinCount::bits).sum::<f64>();
+                sign_modelled += st.sign_ctx.iter().map(BinCount::bits).sum::<f64>();
+            }
+        }
+        let win_a = prefix_n - prefix_modelled;
+        let win_b = sign - sign_modelled;
+        eprintln!(
+            "    candidate A, context the Exp-Golomb unary prefix (6x4 ctx): {:.0} of {:.0} \
+prefix bits modelled  =>  {:+.2}% of Hctx",
+            prefix_modelled, prefix_n, -pc(win_a)
+        );
+        eprintln!(
+            "    candidate B, context the sign on left/up signs (3x3 ctx):  {:.0} of {:.0} \
+sign bits modelled  =>  {:+.2}% of Hctx",
+            sign_modelled, sign, -pc(win_b)
+        );
+        eprintln!(
+            "    => ENT-9 gate is >=2% of total rate at q=99 on >=3 sequences; A+B bound \
+{:+.2}% of Hctx here",
+            -pc(win_a + win_b)
+        );
+    }
+
     // === ENT-6 second pass: abac's real engine, cold start against warm ===
     // Pass 1 above measured each (plane, subband, context)'s empirical P(bit = 0); a signalled
     // initialisation table is exactly that, quantised to a byte. Pricing it needs a second walk,
@@ -439,6 +558,7 @@ pub fn run(tiles: &[AbacTile], plane_tile_counts: [usize; 3], qstep: f32) {
                 }
                 let st = &mut stats[p][band];
                 st.adapt_cold += abac_init_diag::adapt_bits(&blk, bw, &cold);
+                st.adapt_prefix += abac_init_diag::adapt_bits_prefix_ctx(&blk, bw, &cold);
                 st.adapt_warm += abac_init_diag::adapt_bits(&blk, bw, &warm[p][band]);
                 for (slot, k) in LOCKSTEP_WIDTHS.iter().enumerate() {
                     st.adapt_lockstep[slot] += abac_init_diag::adapt_bits_scan(
@@ -478,6 +598,7 @@ pub fn run(tiles: &[AbacTile], plane_tile_counts: [usize; 3], qstep: f32) {
     }
 
     abac_init_table(&stats, &planes, num_levels, tiles.len());
+    prefix_ctx_summary(&stats);
     merged_blocks_summary(&stats, merged, merged_blocks, merged_len_bytes);
 
     bpc_paco_table(&stats, &planes, num_levels);
@@ -779,6 +900,50 @@ fn abac_init_table(
 /// three are in the comparison: the coder's own bits, the number of blocks (and therefore the
 /// length fields the container spends), and the loss of per-band homogeneity that the current cut
 /// buys. The first two are counted; the third is whatever remains.
+/// ENT-9 step 2 milestone 1: candidate A charged real adaptation on real code-blocks.
+///
+/// Step 1b priced the prefix contexts on statistics pooled per plane and subband — no adaptation,
+/// every block sharing one set of counts. `0063` recorded that as generous and named this the
+/// first thing step 2 must check, because 24 new contexts learn on the same 4096-symbol block as
+/// the 18 they join. If the pooled win survives per-block cold starts, the shader work is worth
+/// starting; if it evaporates, ENT-9 closes here and cheaply.
+fn prefix_ctx_summary(stats: &[Vec<BandStats>]) {
+    let (cold, prefix, len_bytes, shipped, blocks) =
+        stats.iter().flatten().fold((0.0, 0.0, 0.0, 0.0, 0u64), |(c, p, l, s, n), st| {
+            (
+                c + st.adapt_cold,
+                p + st.adapt_prefix,
+                l + (st.shipped_bytes - st.payload_bytes),
+                s + st.shipped_bytes,
+                n + st.blocks,
+            )
+        });
+    if blocks == 0 || cold <= 0.0 {
+        return;
+    }
+    eprintln!("  --- ENT-9 candidate A, now shipped: prefix context-coded vs the old bypass ---");
+    eprintln!(
+        "    {blocks} blocks, same engine, cold start both arms: pre-ENT-9 bypassed prefix     {:.0} B, shipped (context-coded) {:.0} B  =>  {:+.2}% of the coder's own bits",
+        cold / 8.0,
+        prefix / 8.0,
+        100.0 * (prefix - cold) / cold,
+    );
+    // ENT-9's gate is a share of *total* rate and the coder's own bits are not that. The
+    // per-block length fields ride along unchanged, so adding them to both arms moves the
+    // denominator the right way. The frame still carries headers and, on a P frame, motion
+    // vectors that abac does not code, so even this overstates the share of the whole file.
+    let with_len = 100.0 * (prefix - cold) / (cold + len_bytes * 8.0);
+    eprintln!(
+        "    plus the {len_bytes:.0} B of per-block length fields, unchanged in both arms: {with_len:+.2}% of the frame's {shipped:.0} B of abac tile bytes"
+    );
+    eprintln!(
+        "    (still not the gate: a frame carries headers and MVs abac does not code, so the share of total file rate is smaller again)"
+    );
+    eprintln!(
+        "    (step 1b's pooled bound for the same change is printed above as \"candidate A\". Both are now *history*: candidate A shipped, so the right-hand column is the coder and the left-hand one is what it replaced. Measured end to end at -2.07% to -8.76% of total rate at q=99; see `0074`.)"
+    );
+}
+
 fn merged_blocks_summary(
     stats: &[Vec<BandStats>],
     merged: [f64; 2],

@@ -16,11 +16,11 @@ GNC is deliberately **broad**: intra and inter, 4:2:0 / 4:2:2 / 4:4:4 at 8 and 1
 
 ## Status
 
-**Working end to end:** I/P/B video pipeline with motion estimation, 8- and 10-bit, 4:4:4 / 4:2:2 / 4:2:0, five entropy coders of which three are selectable (Rice, `--rans`, `--abac`; Huffman and Bitplane are parked), and bit-exact lossless at `q=100` **for stills** — a `q=100` *sequence* codes bit-exact I-frames and then P-frames that decode at **26.30 dB** (BUG-39: two causes fixed 2026-09-08, `docs/decisions/0042`, down from 12.45 dB; the third is that nothing asks a P-frame to be lossless when the sequence is), so lossless video still does not work. **On Metal**, and — for correctness, not for throughput — **on Vulkan** since 2026-09-08. What runs on DX12 and in a browser is measured below and is less than this sentence used to claim.
+**Working end to end:** I/P/B video pipeline with motion estimation, 8- and 10-bit, 4:4:4 / 4:2:2 / 4:2:0, five entropy coders of which three are selectable (Rice, `--rans`, `--abac`; Huffman and Bitplane are parked), and bit-exact lossless at `q=100` **for stills and for 4:4:4 video** — a `q=100` sequence decodes bit-exact on every frame, I and P alike, verified through the container with raw-RGB md5 on 48 frames (BUG-39, four causes, `docs/decisions/0042`, `0054` and `0064`, from 12.45 dB through 26.30 and 51.54 to exact; B-frames and 4:2:0 are not covered and say why). At `q=100` the inter path costs **38% more bytes than coding every frame intra** on camera content and wins 1.6% on animation — an exact comparison, since both arms are bit-exact (LOSSLESS-2). **On Metal**, and — for correctness, not for throughput — **on Vulkan** since 2026-09-08. What runs on DX12 and in a browser is measured below and is less than this sentence used to claim.
 
 **Where it stands against H.264** (measured 2026-09-06, `scripts/meas1_vs_h264.py`, 1080p, ki=9, x264 at defaults):
 
-- **Contribution quality: +89.2% BD-rate on PSNR** with the default Rice coder — about 1.9x the bitrate of x264 for the same luma quality, across three sequences (MEAS-10, 2026-09-08; QUAL-1's +90.5% was the same ladder before INTER-2). **`--abac` on the same ladder is +66.0%** (1.66x), at bit-identical pixels to Rice.
+- **Contribution quality: +89.2% BD-rate on PSNR** with the default Rice coder — about 1.9x the bitrate of x264 for the same luma quality, across three sequences (MEAS-10, 2026-09-08; QUAL-1's +90.5% was the same ladder before INTER-2). **`--abac` on the same ladder is +61.0%** (1.61x), at bit-identical pixels to Rice (MEAS-11, re-taken at `a0880c7` after ENT-9; +66.0% was the same ladder before it).
 - **Colour: no advantage over x264, and the row that claimed one is withdrawn (CHROMA-2, 2026-09-07).** The control this README asked for has been run — give x264 the same allocation via `--chroma-qp-offset` and re-measure CIEDE2000 at the same total rate — and **x264 comes out ahead on all six runs** (three sequences x 4:2:0 and 4:4:4). On five of the six it does not need the offset at all: it leads on colour at offset 0 *while also leading luma by 4.1-7.4 dB*. The earlier row, which had GNC ahead on dE00, rested on a table measured an hour before CHROMA-1 changed q>=85 output and does not reproduce. GNC's colour is still good in absolute terms (dE00 0.54-0.92 mean, at or below the nominal JND) — it is just not better than x264's.
 - **Lossless: the best wavelet result in the field.** 1.99:1 at `q=100`, beating JPEG 2000 lossless by 10.8% and PNG by 7.8%; behind FFV1 by 27% and x264 `-qp 0` by 43%, both of which predict against the neighbouring pixel rather than across scales.
 - **Latency: ~80 ms round trip** at the default configuration, 1080p on an Apple M5 Pro
@@ -208,7 +208,7 @@ abac encodes on the GPU as well as decoding there (ENT-5): one thread per code-b
 against the CPU coder in `abac.rs` — 98 of 98 whole-file comparisons byte-identical across four
 stills, q=60–100, both arithmetic engines, 4:4:4/4:2:2/4:2:0 and an 8-frame sequence.
 **Its encode time per frame is not measured**: four sessions were working this Mac when it landed,
-and a throughput figure taken under load is worth nothing here. `docs/decisions/0024`.
+and a throughput figure taken under load is worth nothing here. `docs/decisions/0057`.
 | Huffman (parked) | 256 | 64-symbol + escape | not measured | not measured | None |
 | Bitplane (parked) | Per-block | Sign + magnitude bitplanes | not measured | not measured | None |
 

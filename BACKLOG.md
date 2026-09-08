@@ -4632,7 +4632,53 @@ decision (`0036`) is stated over 4:4:4 stills. It needs the still sweep re-run a
 before the default moves. **LOSSLESS-3 is gated to 4:4:4 for this reason** and the gate comes off
 here.
 
-### BUG-48 — `quality_preset(100)` keeps PAD-1's decay padding fill, which is a loss at q=100 (todo, **P3**)
+### BUG-48 — the padding fill is a wavelet lever, not a quality one (**FIXED 2026-09-08**)
+
+**Fixed, and the fix is not where the filing put it.** `docs/decisions/0077`. `pad_fill_decay` is
+now cleared **inside `quality_preset`'s MED branch**, so the fade-to-flat fill is off exactly when
+the transform is MED. Four stills at q=100: **−0.393% to −0.658%** (bbb 3 257 157 → 3 235 737).
+
+**The filing's own one-liner (`pad_fill_decay: q != 100`) would have cost 4.6%.** q=100 is not
+always MED: with `GNC_MED=0` it is a lossless *wavelet* encode, and there the fill is worth
+**−4.64%** on the same four stills — `0039`'s −4.63%, reproduced at the top of the ladder. The
+fill is a property of what codes the padding, not of how hard the picture is squeezed.
+
+**Gate:** `scripts/gate_bug48.py`, 40 encodes across two binaries. Only the four q=100 MED cells
+move; q=85/90/95/97/99, the `GNC_MED=0` arm, and 8 sequence points are byte-identical.
+
+**Canary:** `GNC_DIAGNOSTICS=1` — q=100 reads `pad fill = replicate`, q=100 `GNC_MED=0` reads
+`decay`, q=90 reads `decay`.
+
+**Left on the table, filed as BUG-50:** the still path's bit-exact sibling at q=95..99 is a MED
+encode that still carries decay padding, and it is shipped output on 3 of 4 stills at q=97/99.
+
+### BUG-50 — the still path's bit-exact sibling is a MED encode with wavelet padding (todo, P3)
+
+**Worth 0.4–0.7% of shipped bytes, on rungs where the sibling is what ships.** BUG-48 (`0077`)
+established that the decay padding fill reverses sign under MED. `lossless_sibling` is a MED
+encode by construction — and on the still path it inherits the *caller's* `pad_fill_decay`, which
+`quality_preset(95..99)` sets to `true`. So the bit-exact candidate is coded with the fill that
+costs it 0.4–0.7%.
+
+**This is not hypothetical.** In BUG-48's own gate table, q=97 and q=99 emit byte-identical files
+on blue_sky (2 166 911), kristensara (931 263) and touchdown (2 627 186) — that is the sibling
+winning and being kept, at both rungs, on 3 of 4 stills. Those are the files that would shrink.
+
+**Why it was not done in BUG-48, and what to check first.** `0072` (BUG-47) *deliberately* made
+`lossless_sibling` inherit the caller's fill, so that the two candidates leave the **same** padded
+source in `input_buf` — with the measurement that forcing them to agree makes 24 of 24 sequence
+points byte-identical, where 10 moved without it. Clearing the fill on the still path breaks that
+agreement again, in the still direction. Nothing in `0072` says the invariant is *only* about
+sequences, and `encode()` is shared between both paths, so **re-measure `0072`'s 24 points before
+believing the still path is independent** — that is the whole item.
+
+The sequence path needs nothing: `0039` clears the flag for referenced I-frames and LOSSLESS-3's
+all-intra arm clears it explicitly, citing BUG-48.
+
+**Success criterion:** the four stills at q=95..99 no larger on any point, `0072`'s 24 sequence
+points still byte-identical, and the q=97/99 sibling files smaller by the predicted 0.4–0.7%.
+
+### BUG-48 — `quality_preset(100)` keeps PAD-1's decay padding fill, which is a loss at q=100 (original filing)
 
 Found 2026-09-08 by LOSSLESS-3, measured on two stills against `GNC_PAD_FILL=replicate`:
 

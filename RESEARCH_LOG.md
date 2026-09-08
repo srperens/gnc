@@ -4,6 +4,83 @@
 
 ---
 
+## BUG-48 — the padding fill is a wavelet lever, and keying the fix on quality would have cost 4.6% (2026-09-08)
+
+**Hypothesis, from the filing.** `quality_preset(100)` keeps PAD-1's decay padding fill, which
+LOSSLESS-3 measured as a **loss** at q=100 on two stills (crowd_run frame 0 +0.78%, bbb frame 0
++0.66%). The filing proposed one line in `quality_preset` — `pad_fill_decay: q != 100` — and asked
+for a four-image sweep to justify it.
+
+**The premise reproduces on all four of PAD-1's stills, and the proposed fix is wrong.**
+
+### Step 1 — reproduce, on the images the original lever was measured on
+
+One binary, both arms via `GNC_PAD_FILL`, `q=100` (there is no RATE-2 sibling at q=100, so the env
+var isolates the lever exactly):
+
+| still | decay (shipped) | replicate | |
+|---|---|---|---|
+| bbb_1080p | 3 257 157 | 3 235 737 | **−0.658%** |
+| blue_sky_1080p | 2 166 911 | 2 153 118 | **−0.637%** |
+| kristensara_720p | 931 263 | 927 600 | **−0.393%** |
+| touchdown_1080p | 2 627 186 | 2 610 478 | **−0.636%** |
+
+### Step 2 — the measurement the filing did not ask for, and it changes the fix
+
+**q=100 is not always MED.** `GNC_MED=0` makes the same preset a lossless *wavelet* encode. Same
+four stills, same binary:
+
+| still | decay | replicate | |
+|---|---|---|---|
+| bbb_1080p | 3 260 563 | 3 436 337 | +5.391% |
+| blue_sky_1080p | 2 744 873 | 2 866 708 | +4.439% |
+| kristensara_720p | 1 169 457 | 1 178 520 | +0.775% |
+| touchdown_1080p | 2 967 518 | 3 131 749 | +5.534% |
+| **total** | | | **+4.643%** |
+
+**−4.64% against `0039`'s −4.63%**, same four images, and `0039` took its figure over q=80..94
+with `--abac`. So the fill is worth exactly what PAD-1 said at the very top of the ladder *when a
+wavelet is what codes the padding* — and the reversal belongs to **MED**, which has no subbands to
+zero and has to code a gradient the fade puts in front of its spatial predictor.
+
+`pad_fill_decay: q != 100` would therefore have bought 0.6% on one arm by giving up 4.6% on the
+other. The gate went inside `quality_preset`'s MED branch instead.
+
+**Why this was cheap to catch and worth writing down:** the filing's mechanism paragraph already
+said "at q=100 the transform is MED, not the wavelet". The mechanism named the right variable and
+the proposed fix keyed on a different one. Reading a filing's *reason* against its *patch* is a
+ten-minute check that does not need a hypothesis of its own.
+
+### Gate
+
+`scripts/gate_bug48.py`, 40 encodes across a before and an after binary. **Only the four q=100 MED
+cells move.** Byte-identical: all four stills at q=85, 90, 95, 97 and 99; all four at q=100 under
+`GNC_MED=0`; and 8 sequence points (crowd_run and bbb, q=99 and 100, ki=2 and 9). The sequences
+were never at risk — `0039` clears the flag for referenced I-frames and LOSSLESS-3's all-intra arm
+clears it explicitly, citing BUG-48 before it existed as a fix.
+
+**Canary:** `pad_fill_mode` under `GNC_DIAGNOSTICS` names the mode and the path default. q=100 →
+`replicate`, q=100 `GNC_MED=0` → `decay`, q=90 → `decay`.
+
+### Left on the table, filed as BUG-50
+
+The gate table shows q=97 and q=99 emitting **byte-identical files** on three of four stills
+(blue_sky 2 166 911, kristensara 931 263, touchdown 2 627 186). That is RATE-2's bit-exact sibling
+winning and being kept — and the sibling is a MED encode that inherits the *caller's*
+`pad_fill_decay`, which the q=95..99 presets set to `true`. So the same 0.4–0.7% is sitting in
+shipped output on the rungs where the sibling is what ships.
+
+Not taken here, for a reason with a measurement behind it rather than caution: `0072` made that
+inheritance deliberate, so both candidates leave the same padded source in `input_buf`, and its
+own figure is that forcing the fills to agree makes 24 of 24 sequence points byte-identical where
+10 moved otherwise. `encode()` is shared between the still and sequence paths, so the still path
+is not obviously independent — re-measuring `0072`'s 24 points is the whole of BUG-50.
+
+**Gates:** `cargo test --release -- --test-threads=1`, `cargo clippy --release`, wasm `--lib` — see
+the commit. Decision record: `docs/decisions/0077`.
+
+---
+
 ## ENT-9 step 2 — abac context-codes the Exp-Golomb prefix, and the bound was honest (2026-09-08)
 
 **Hypothesis.** `0063` measured that abac bypasses 46.7–74.8% of its own bits at q=99 and priced

@@ -1985,7 +1985,7 @@ moves with it and every Metal figure in this repository is invalidated.
 
 **Do not start by rewriting the shader.** That has been tried twice and is not where the defect is.
 
-### BUG-28 — abac and Rice decode to different pixels on subsampled chroma (todo, P2)
+### BUG-28 — ~~abac and Rice decode to different pixels on subsampled chroma~~ (**CLOSED 2026-09-08 — duplicate of BUG-16, and the blame was backwards**)
 
 **Filed as BUG-26 and renumbered to BUG-28 the same day** — `intra1` filed a different BUG-26
 (`--tile-size 1024` silently destroys the image, P1) minutes later, and one `scripts/claim take
@@ -2028,6 +2028,31 @@ that; Rice and abac each have their own per-plane path. One of the two is very l
 that side data with the luma tile count. Read `use_cfl` and the AQ weight-map indexing in
 `pipeline.rs` against the abac per-plane dispatch before anything else.
 
+> **CLOSED 2026-09-08 as a duplicate of [BUG-16](#bug-16--rices-gpu-and-cpu-encode-paths-disagree-on-the-coefficients-todo-p2), whose root cause is now found and proved.**
+> The entry below is kept because it is the better *symptom* description, but it is wrong on all
+> three of its substantive claims and nobody should chase them:
+>
+> 1. **The blame is backwards. abac is correct; GPU Rice is wrong.** Adding a third coder settles
+>    it: **CPU-Rice and abac agree with each other in 10 configurations out of 10**, across
+>    q ∈ {25, 35, 40, 75, 90} × {4:4:4, 4:2:2}. Every divergence is GPU-Rice against both of them.
+> 2. **It is not "on subsampled chroma".** At q ≤ 35 it happens at **4:4:4 too** — this entry only
+>    missed it because 4:4:4 was tried at q ≥ 50, where CfL is on and hides it.
+> 3. **It is not CfL or AQ side-data indexing**, which is what "where to look first" below sends
+>    you at. CfL matters only because CfL-on *disables* the fused quantiser; it is otherwise
+>    uninvolved.
+>
+> **Root cause: `src/shaders/quantize_histogram_fused.wgsl:441`**, the Phase-2 sparse-group
+> dead-zone expansion — for non-LL groups that are ≥95% zero it re-quantises the surviving ±1
+> coefficients to 0. `quantize.wgsl` has no such step, so the two quantisers are not equivalent and
+> the fused one is *lossier by design*. Proved by disabling that one branch: **GPU-Rice then equals
+> CPU-Rice at all 10 points, and every hash equals abac's.** Full evidence and the measured trade
+> are in BUG-16.
+>
+> **A much sharper reproducer than the one below**, for whoever fixes BUG-16: encode a **grayscale**
+> image (`ffmpeg -i in.png -vf format=gray,format=rgb24 gray.png`). Chroma is then exactly zero, so
+> subsampling is lossless and any difference is pure luma — and the 4:2:2 failure window widens from
+> the two points below (q=50, 75) to **every q ≤ 86**.
+
 **Why P2 and not P1.** Nothing shipped is measured at non-444 with abac: every abac figure in the
 repository (intra, lossless, and the inter figures added 2026-09-07) is 4:4:4. So no published
 number is wrong. What is wrong is the *scope* claimed for them, and the next person to quote abac
@@ -2036,7 +2061,86 @@ on a 4:2:0 mezzanine would be quoting a coder that changes the picture.
 **Do not close this by widening a tolerance.** The correct assertion is bit-exactness — a
 `psnr > 45.0` check reads 55 dB as a pass, which is exactly how BUG-15 survived a day.
 
-### BUG-16 — Rice's GPU and CPU encode paths disagree on the coefficients (todo, P2)
+### BUG-16 — Rice's GPU and CPU encode paths disagree on the coefficients (**ROOT CAUSE FOUND AND PROVED 2026-09-08**, fix is a design decision — todo, P2)
+
+> **Found 2026-09-08 while working BUG-28, which is a duplicate of this and is now closed.**
+>
+> **The cause is `src/shaders/quantize_histogram_fused.wgsl:441`** — the Phase-2 *sparse-group
+> dead-zone expansion*. For every non-LL subband group that is ≥95% zero after the first
+> quantisation pass, it re-quantises the surviving `|q| == 1` coefficients to 0:
+>
+> ```wgsl
+> if (zero_frac_x100 >= 95u) {
+>     let t = f32(zero_frac_x100 - 95u) / 5.0;
+>     shared_group_dz_mul[g] = 1.0 + 0.25 * clamp(t, 0.0, 1.0);
+> ```
+>
+> **`quantize.wgsl` has no such step.** The two shaders are therefore not two implementations of
+> one quantiser — the fused one is deliberately lossier, and which one runs is decided by
+> `use_fused_qh = use_fused_quantize_histogram && use_gpu_encode && !use_cfl`. Nothing tells the
+> user which quantiser coded their frame.
+>
+> **Proved, not inferred.** Changing that one threshold to `>= 101u` so the branch can never fire
+> makes **GPU-Rice equal CPU-Rice at all 10 points measured** (q ∈ {25,35,40,75,90} × {4:4:4,
+> 4:2:2}), and every resulting hash equals abac's. Restored afterwards; no source change is
+> committed with this entry.
+>
+> **This entry's own reasoning was one step from it.** It said "being on the fused path is
+> necessary at most, not sufficient" — correct. The sufficient condition is *sparsity*: a subband
+> group crossing 95% zeros. That is why q=90 agrees with fused active, and why the failure follows
+> coefficient statistics rather than any feature flag.
+>
+> **Third-coder arbitration says which side is wrong.** CPU-Rice and abac — independent coders,
+> abac verified bit-exact against its own CPU reference — **agree in 10 of 10 configurations**.
+> Every divergence is GPU-Rice against both. The shipped default encoder is the wrong one.
+>
+> **Corrected scope: this is not "below about q=30 and at subsampled chroma".** Measured on a
+> grayscale 1080p frame, where chroma is exactly zero so subsampling is lossless and every
+> difference is pure luma:
+>
+> | | GPU-Rice vs CPU-Rice |
+> |---|---|
+> | 4:4:4 | **differs at q ≤ 35**, agrees q ≥ 40 |
+> | 4:2:2 / 4:2:0 | **differs at q ≤ 86**, agrees q ≥ 90 |
+>
+> A grayscale source is the reproducer to use: it widens the 4:2:2 window from two points to
+> everything below q=90.
+>
+> **What the expansion is worth**, three 1080p stills, PSNR and size with the branch on (shipped)
+> against off. The last column converts the PSNR loss into rate using each image's *own* local RD
+> slope, measured between the two nearest points on its ladder, so the two halves are comparable:
+>
+> | image | point | PSNR on → off | size on → off | net |
+> |---|---|---|---|---|
+> | bbb | q=25 4:4:4 | 35.51 → 35.63 (+0.12 dB) | +2.50% | ~+1.1% win |
+> | blue_sky | q=25 4:4:4 | 37.24 → 37.37 (+0.13 dB) | +2.40% | ~neutral |
+> | touchdown | q=25 4:4:4 | 35.44 → 35.55 (+0.11 dB) | +3.69% | ~+0.6% win |
+> | all three | q=40 4:4:4 | **0.00 dB** | **0.00%** | does not fire |
+> | bbb / blue_sky / touchdown | q=50–75 4:2:2 | +0.03 to +0.06 dB | +0.14 to +1.85% | small win |
+>
+> **So the expansion is a marginal net win (0–1%), not free and not harmful — which is exactly why
+> the fix is a decision and not a repair.** Three options, and the cheap one is not obviously
+> right:
+>
+> 1. **Delete it from the fused shader.** Paths agree immediately, the shipped encoder stops being
+>    worse than its own reference, and it costs the 0–1%. Needs a BD-rate ladder to confirm the
+>    single-point arithmetic above, not four points.
+> 2. **Implement it in `quantize.wgsl` too.** Keeps the win and makes the paths agree, but the
+>    separate quantiser has no per-group zero counts — the fused shader only has them because it is
+>    also building a histogram — so it means a second pass. It also changes **abac's** output, and
+>    abac's published −16.6% to −18.8% would have to be re-measured.
+> 3. **Gate it in config and apply it uniformly**, so "GNC's quantiser" has one definition and the
+>    expansion is a named, documented tool rather than a side effect of which entropy coder was
+>    picked.
+>
+> Whichever is chosen changes shipped rate/quality, so it wants a decision record and a real
+> BD-rate ladder. **Not done here** — this session found and proved the cause and measured the
+> trade; it did not pick the answer.
+>
+> Note `tests/abac_bitstream.rs::rice_gpu_and_cpu_encode_paths_differ_at_subsampled_chroma` pins
+> the *current* disagreement, so any of the three fixes will fail it. That is intended, and its
+> comment says so.
+
 
 Found 2026-09-07 while shipping abac (ABAC-SHIP); **not an abac defect** and not chased there.
 Both arms are the Rice coder, so this is the quantise stage, and it is on the **default** path.

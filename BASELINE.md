@@ -166,7 +166,8 @@ shader's cost is paid by the feature that uses it. `docs/decisions/0029`.)*
 |---|---|---|---|
 | **RTX 4000 Ada (Vulkan)** | **13.95 ms** (71.7 fps) | **7.29 ms** (137.2 fps) | **21.2 ms** |
 | llvmpipe, CPU rasteriser (Vulkan) | 480.74 ms | 373.88 ms | 854.6 ms |
-| Apple M5 Pro (Metal), MEAS-6 2026-09-06 — logged as "M1" | ~47 ms | ~35 ms | ~80 ms |
+| **Apple M5 Pro (Metal), idle, 2026-09-08** | **15.34 ms** (65.2 fps) | **9.87 ms** (101.3 fps) | **25.2 ms** |
+| Apple M5 Pro (Metal), MEAS-6 2026-09-06, non-idle — logged as "M1" | ~47 ms | ~35 ms | ~80 ms |
 
 Reproduced at a second commit under 2x the load: 14.01 / 7.27 ms. **This is CANARY-1's quantity —
 the single-frame encode/decode loop — and it is a fourth thing that has been called "encode fps" in
@@ -174,7 +175,10 @@ this file.** It is nearest quantity **A** (GPU encode phase) and is not comparab
 
 **Do not quote the Mac row against the RTX row as a speedup.** It is cross-machine, cross-backend,
 possibly at a different q, and the Mac figure was taken by a different harness. The controlled
-version is one command — this same harness on an idle Mac — and it has not been run.
+version is one command — this same harness on an idle Mac — and **it was run on 2026-09-08**: the
+row above. Same script, same `--quality 90` default, same pinned input (`f83f355f…`), settle
+1.01/1.03. **The Mac is 1.19x slower than the RTX 4000 Ada** — the uncontrolled rows would have
+implied 3.8x, which is why this file said not to quote them against each other.
 
 **Cross-backend output, measured for the first time.** Same commit, same input: q=100 lossless is
 **byte-identical** between Metal and Vulkan (`5c4539d8…`, 3 235 737 B), and q=75 lossy **differs by

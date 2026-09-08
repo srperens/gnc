@@ -234,7 +234,7 @@ GNC should become a **good, robust codec** — not optimized along a single axis
 | Property | Current | Target |
 |----------|---------|--------|
 | **Concurrent streams per GPU** | **never measured** | beat NVENC's session/block ceiling on the same machine |
-| **Latency per frame** | **~80 ms round trip at the default**, of which **0 frames** are reordering delay (MEAS-6, `docs/decisions/0033`). Below the low-latency-HEVC band's 120 ms floor, above JPEG XS. The structural half is exact; the ~80 ms coding half is a non-idle measurement and is owed on an idle machine, and glass-to-glass is still unmeasured | sub-frame, end to end — at 50 fps that is 20 ms, so ~80 ms is four frames short |
+| **Latency per frame** | **25.2 ms round trip at the default** — 15.34 ms encode / 9.87 ms decode, idle machine 2026-09-08 — of which **0 frames** are reordering delay (MEAS-6, `docs/decisions/0033`). Below the low-latency-HEVC band's 120 ms floor, above JPEG XS. **The ~80 ms this row carried until 2026-09-08 was about 3.2x inflated by a shared machine**; the structural half was never a timing measurement and is unchanged. Glass-to-glass is still unmeasured and needs capture hardware | sub-frame, end to end — at 50 fps that is 20 ms, so 25.2 ms is **1.26 frames** — essentially at target |
 | Encode speed | 12.2 fps GPU encode phase / 5.0 fps end to end (seq, 1080p q=75, non-idle; BASELINE A and C) | 60 fps |
 | Bit depth | **8-bit and 10-bit, both shipping** (FMT-1, 2026-09-06; 10-bit lossless re-verified 2026-09-08) | met — keep it met as the format changes |
 | Chroma formats | 4:4:4, 4:2:2, 4:2:0 | keep all three working at 10-bit |
@@ -252,7 +252,7 @@ the whole positioning rests on. They come before further compression work." One 
 measured and the other cannot be, so as written it directs every session at work that is either
 done or impossible:
 
-- **Latency per frame is measured** (MEAS-6, ~80 ms, 0 frames of reordering). What is left is the
+- **Latency per frame is measured** (MEAS-6, **25.2 ms** on an idle machine, 0 frames of reordering). What is left is the
   cheap half — re-take the coding time on an idle machine — and glass-to-glass instrumentation
   that nobody has built.
 - **Concurrent streams per GPU is parked, not skipped.** Claim A (no session cap, and it runs

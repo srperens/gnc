@@ -23,13 +23,18 @@ GNC is deliberately **broad**: intra and inter, 4:2:0 / 4:2:2 / 4:4:4 at 8 and 1
 - **Contribution quality: +89.2% BD-rate on PSNR** with the default Rice coder — about 1.9x the bitrate of x264 for the same luma quality, across three sequences (MEAS-10, 2026-09-08; QUAL-1's +90.5% was the same ladder before INTER-2). **`--abac` on the same ladder is +61.0%** (1.61x), at bit-identical pixels to Rice (MEAS-11, re-taken at `a0880c7` after ENT-9; +66.0% was the same ladder before it).
 - **Colour: no advantage over x264, and the row that claimed one is withdrawn (CHROMA-2, 2026-09-07).** The control this README asked for has been run — give x264 the same allocation via `--chroma-qp-offset` and re-measure CIEDE2000 at the same total rate — and **x264 comes out ahead on all six runs** (three sequences x 4:2:0 and 4:4:4). On five of the six it does not need the offset at all: it leads on colour at offset 0 *while also leading luma by 4.1-7.4 dB*. The earlier row, which had GNC ahead on dE00, rested on a table measured an hour before CHROMA-1 changed q>=85 output and does not reproduce. GNC's colour is still good in absolute terms (dE00 0.54-0.92 mean, at or below the nominal JND) — it is just not better than x264's.
 - **Lossless: the best wavelet result in the field.** 1.99:1 at `q=100`, beating JPEG 2000 lossless by 10.8% and PNG by 7.8%; behind FFV1 by 27% and x264 `-qp 0` by 43%, both of which predict against the neighbouring pixel rather than across scales.
-- **Latency: ~80 ms round trip** at the default configuration, 1080p on an Apple M5 Pro
-  (MEAS-6). The default codes P-only with **zero reordering delay**; the hierarchical B-pyramid,
-  which adds 8 frames of lookahead and takes the round trip to ~240 ms, has been **off by default
-  since 2026-09-06** and is opt-in via `GNC_B_PYRAMID=1`. This bullet described the pyramid as the
-  default until 2026-09-08. On an NVIDIA RTX 4000 Ada over Vulkan the single-frame loop is
-  **13.95 ms encode / 7.29 ms decode** (CANARY-1, 2026-09-07). At ~80 ms GNC sits **below** the
-  low-latency-HEVC band (EBU: 120–3060 ms) and well above the JPEG XS band — JPEG XS codes 1–32
+- **Latency: 25.2 ms round trip** at the default configuration, 1080p on an Apple M5 Pro —
+  **15.34 ms encode / 9.87 ms decode**, re-taken on an *idle* machine 2026-09-08 (MEAS-6).
+  *This bullet read ~80 ms until then, and that figure was about 3.2x inflated by a shared
+  machine*: eight sessions were working this Mac when it was taken. The default codes P-only with
+  **zero reordering delay** — that half is structural, not timed, and is unaffected; the
+  hierarchical B-pyramid, which adds 8 frames of lookahead, has been **off by default since
+  2026-09-06** and is opt-in via `GNC_B_PYRAMID=1`. On an NVIDIA RTX 4000 Ada over Vulkan the
+  same harness and operating point reads **13.95 ms encode / 7.29 ms decode**, 21.2 ms round trip
+  (CANARY-1, 2026-09-07) — so the Mac is **1.19x slower than the RTX 4000 Ada**, which is the
+  first *controlled* cross-machine figure this project has: same script, same `--quality 90`
+  default, same pinned input (`f83f355f…`). The uncontrolled rows would have implied 3.8x.
+  At 25.2 ms GNC sits **below** the low-latency-HEVC band (EBU: 120–3060 ms) and well above the JPEG XS band — JPEG XS codes 1–32
   lines and EBU measures it under one frame. The 256-line tile floor is not reachable today: the
   pipeline processes whole frames, so the practical floor is one full frame whatever the tile
   size. See [`docs/POSITIONING.md`](docs/POSITIONING.md) for where that leaves GNC against the
@@ -202,13 +207,16 @@ GNC has five entropy coding backends, all decoding as GPU compute shaders:
 |-------|-------------|--------|--------------|----------------|-------------|
 | **Rice+ZRL** (default above q=20) | 256 | Golomb-Rice + zero-run | — | — | None |
 | rANS (`--rans`, default at q≤20) | 32 | Range asymmetric numeral systems | −6.4% at q=10, +0.4% at q=25; cannot encode above q≈76 | ~1.15× (TUNE-3, not re-measured) | Possible (MS patent) |
-| abac (`--abac`) | 1 per 64px code-block | Adaptive binary arithmetic, context-modelled | −16.6% to −18.8% at q=50–90 | **1.69×** (idle-machine bench) | None known |
+| abac (`--abac`) | 1 per 64px code-block | Adaptive binary arithmetic, context-modelled | −16.6% to −18.8% at q=50–90 | **3.19×** decode, **5.57×** encode (idle machine, 2026-09-08) | None known |
 
 abac encodes on the GPU as well as decoding there (ENT-5): one thread per code-block, bit-exact
 against the CPU coder in `abac.rs` — 98 of 98 whole-file comparisons byte-identical across four
 stills, q=60–100, both arithmetic engines, 4:4:4/4:2:2/4:2:0 and an 8-frame sequence.
-**Its encode time per frame is not measured**: four sessions were working this Mac when it landed,
-and a throughput figure taken under load is worth nothing here. `docs/decisions/0057`.
+**Its encode time per frame is now measured**, on an idle machine 2026-09-08: **84.40 ms/frame
+against Rice's 15.16 ms — 5.57x**, with the abac encode *stage* alone at 50.87 ms/frame
+(`GPU Range/BoundedSlots`, the shipped path). `0017` recorded 129 ms against Rice's 23 ms, a ratio
+of 5.61x: **the ratio reproduces almost exactly, and its 129 ms was the `CPU Interval` variant**,
+which reads 127.15 ms/frame today and is not what ships. `docs/decisions/0057`.
 | Huffman (parked) | 256 | 64-symbol + escape | not measured | not measured | None |
 | Bitplane (parked) | Per-block | Sign + magnitude bitplanes | not measured | not measured | None |
 
@@ -225,7 +233,7 @@ source for absolute figures.*
 *The Decode column carries only figures someone actually timed, and says which run they came
 from. The "1.5–2× faster" that stood here for Rice was neither: it contradicted the only throughput
 figure in the repository — TUNE-3 measured rANS at ~8% encode and ~15% decode behind Rice, not
-50–100% — so it is removed rather than corrected. abac's 1.69× is from an idle-machine bench;
+50–100% — so it is removed rather than corrected. **abac's decode cost is 3.19×, not the 1.69× this file and `0017` carried until 2026-09-08** — re-taken on an idle machine, and about a tenth of the move is ENT-9, which bought −2.07% to −8.76% of rate for +9.5% decode and +10.0% encode without logging either;
 rANS's ~1.15× is TUNE-3's and was **not** re-measured, because up to eight sessions share this Mac
 and COORDINATION rule 1 forbids timing under load.*
 

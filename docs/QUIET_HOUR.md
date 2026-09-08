@@ -36,7 +36,9 @@ scripts/claim list
 # 2. Every worktree clean. Not a formality — on 2026-09-08 three worktrees held uncommitted
 #    files under claims marked OWNER UNIDENTIFIABLE.
 git -C "$REPO" worktree list --porcelain | awk '/^worktree /{print $2}' \
-  | while read -r w; do printf '%s: ' "$w"; git -C "$w" status --short | wc -l; done
+  | while read -r w; do printf '%s: ' "$w"; git -C "$w" status --short --untracked-files=no | wc -l; done
+# `--untracked-files=no` is load-bearing: without it this counts results directories like
+# `meas10_out/` and blocks BUG-38 forever. That happened on 2026-09-08.
 
 # 3. No stray load, CPU or GPU. COORDINATION rule 1 is about concurrent load full stop,
 #    and the x264 window above was CPU-only.

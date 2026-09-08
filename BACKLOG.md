@@ -2050,7 +2050,30 @@ microseconds against a 25 ms frame; do it only alongside the first half.
 after, printed under `GNC_PROFILE`. Below a 50% reduction in that count, close it — the scan's own
 estimate for the whole of item 4 was 0.6 ms of command recording.
 
-### PERF-3 — the decode-side bandwidth items, behind a switch and an idle machine (todo, P3)
+### PERF-3 — the decode side is **not** bandwidth-bound; item 8 is a wash and items 9–11 are mispriced (**item 8 answered 2026-09-08**, P3)
+
+**The A/B ran on an idle machine and the answer is no.** `GNC_RICE_DISPATCH_REPEAT`, slice as
+`(t(k)−t(1))/(k−1)`, k ∈ {1,8}, n=3, against a build of item 8's parent `ff6276d`:
+
+| | frame decode | isolated Rice slice | share |
+|---|---|---|---|
+| item 8 **in** | 10.27 ms | **4.730 ms** | 46% |
+| item 8 **out** | 10.87 ms | **4.737 ms** | 44% |
+
+**Item 8 moves the isolated slice by −0.15%.** It removed 3 of every 4 storage loads from the Rice
+inner loop and the stage did not notice. Two consequences, both this item's own words made binding:
+
+1. **Revert item 8** — *"if it measures neutral or worse, revert it; the diff is one shader and
+   bit-exactness makes a revert free."* Not done in the measurement hour; it is a code change and is
+   this item's next step.
+2. **Items 9, 10 and 11 are each priced on bytes of bus traffic saved, and the stage that dominates
+   decode is not bus-bound.** Re-price or close them; do not build them on the old premise.
+
+**The whole-frame column is not a −5.5% win**, tempting as it looks: HEAD's own k=1 spread is 1.13×
+over six runs (9.82–11.07 ms), which brackets the difference, and a change confined to the Rice inner
+loop cannot speed up the rest of frame decode. The slice is the instrument whose noise divides by 7.
+Independent confirmation on the way past: the slice is 44–46% of frame decode against GOALS' recorded
+47% for the entropy stage. RESEARCH_LOG 2026-09-08, "The quiet hour".
 
 Filed 2026-09-08 by PERF-1 as the remainder of `docs/SIMPLE_PERF_FIXES.md`. Claims verified in
 step 1; none of the work started. These are the items that are *not* host-side bookkeeping, so
@@ -2517,7 +2540,13 @@ The two reads that would have caught it are now in COORDINATION, above the share
 section. The second is what BUG-41 and BUG-42 had in common: **an item held with no heading yet is
 invisible to `grep`, to `next` and to `items`, and visible only to `scripts/claim list`.**
 
-### BUG-38 — `cargo fmt --check` is red across the tree; decided, the reformat wants a quiet tree (todo, P4)
+### BUG-38 — `cargo fmt --check` is red across the tree (**DONE 2026-09-08** — 63 files, one atomic commit)
+
+**Done in the quiet hour.** 63 files, +3895/−2235, behaviour-neutral. Gates on the landed tree:
+**279 tests passed, 0 failed**, both clippy targets clean. **The precondition was a false positive** —
+`claim list` reported an uncommitted file in `gnc-rebaseline` for four hours and it was
+`?? meas10_out/`, an untracked MEAS-10 results directory. `QUIET_HOUR.md`'s check 2 now passes
+`--untracked-files=no`, without which this item could never have started.
 
 GOALS §9 requires `cargo fmt` clean. `cargo fmt --check` reports **573 diffs in 61 of the 90
 `.rs` files**, 504 of them under `src/`. Neither CLAUDE.md nor LOOP.md ever named it as a gate,
@@ -3786,7 +3815,34 @@ explicitly and MD5-confirmed distinct: bbb_extended (24 frames), old_town_cross 
 whether moving bits from chroma to luma closes part of the +90.5%. Judge on luma PSNR **and** dE00
 together — that sweep was run once on VMAF, looked like a free 15%, and reversed sign on dE00.
 
-### MEAS-5 — Concurrent streams per GPU vs NVENC (partly answered 2026-09-05, P0)
+### MEAS-5 — Concurrent streams per GPU vs fixed-function: Claim A on a third machine, and a red flag against Claim B (P0)
+
+**`--density-still` ran on an idle Mac 2026-09-08.** q=90, 24 iterations per instance:
+
+| instances | completed | aggregate fps | scaling |
+|---|---|---|---|
+| 1 | 1/1 | 23.38 | 1.00× |
+| 2 | 2/2 | 36.12 | 1.55× |
+| 4 | 4/4 | 39.58 | **1.69×** |
+| 8 | 8/8 | 39.53 | **1.69×** |
+
+**8 of 8 complete — no session cap, no driver limit.** Claim A on a third machine, and it is what this
+harness exists to detect: the laptop round's 0/8 printed as a session cap and was a harness defect.
+**GNC saturates the M5 Pro's 20 GPU cores at N≈4.**
+
+**And the first fixed-function row on this machine points the wrong way.** `--hwenc` against
+`h264_videotoolbox`: N=1 237.35 fps, **N=8 2288.15 fps at 9.64× scaling, 8/8 complete** — so
+VideoToolbox scales 9.64× where GNC scales 1.69×, has no session cap either, and reaches ~58× GNC's
+aggregate. That is the opposite direction to GOALS §1's structural argument.
+
+**It does not settle Claim B and must not be quoted as if it did.** Not quality-matched (q 18 against
+q=90; the harness prints this warning itself); not the same quantity (GNC's rows are one still frame
+looped, **intra by construction**, against an 8-frame clip through ffmpeg at g=9); and the absolute
+numbers are incoherent at that clip length — **N=1 takes 0.5 s of wall clock and N=2 takes 0.2 s**, more
+work in less time, so startup dominates and the fps column is not measuring encoding. **What it
+establishes is that the comparison has to be done properly before the positioning is strengthened**:
+quality-matched, same quantity, on a clip long enough to amortise startup. Claim B still needs a
+discrete NVIDIA card with driver 610+/nvenc 13.1 for the NVENC column.
 
 **The thesis was never one claim. It is two, and they are not equally strong.**
 
@@ -3867,7 +3923,16 @@ The honest next step is neither of those: it is **amortising per-process startup
 clip instead of buffering it**, because those are what the two density runs actually measured. Until
 they are fixed, a density number on any hardware measures pipeline compilation.
 
-### MEAS-6 — Latency per frame (second pass 2026-09-08, P1)
+### MEAS-6 — Latency per frame: **25.2 ms, not ~80 ms** (**coding half DONE 2026-09-08**; glass-to-glass owed, P1)
+
+**The ~80 ms was load.** Re-taken on an idle machine through the same harness and operating point
+as the RTX row (`gpu_tier_bench.py --tier`, `--quality 90`, pinned `f83f355f…`): **15.34 ms encode /
+9.87 ms decode = 25.2 ms round trip**, settle 1.01/1.03. The earlier figure was about **3.2× inflated**
+by a shared Mac. The structural half — 0 frames of reordering, `0033` — was never a timing measurement
+and is unchanged. **GOALS' latency row moves from "four frames short" of the 20 ms sub-frame target to
+1.26 frames.** This also runs BASELINE's named-missing control: **the Mac is 1.19× slower than the
+RTX 4000 Ada**, where the uncontrolled rows would have implied 3.8×. **Still owed: glass-to-glass**,
+which needs capture hardware rather than a quiet hour.
 
 **The default is no longer the B-pyramid, and three documents said it was for two days.** Found
 2026-09-08: `quality_preset()` has vetoed the pyramid since **2026-09-06**
@@ -7310,7 +7375,31 @@ decode, and the BUG-31 static workgroup-storage assertion in CI.
 **Decision record required either way** — a shipped coder is a default-adjacent choice, and a
 rejection is a recorded conclusion with numbers (the EBCOT entry is the template).
 
-### ENT-10 — should abac be the default? The largest built lever in the codec has never been an item (todo, **P2**)
+### ENT-10 — should abac be the default? **The cost side is measured and it is twice what `0017` says** (todo, **P2**)
+
+**Unparked and measured in the quiet hour, 2026-09-08.** Median of 3+ at `19354a4`,
+`codec-fingerprint v1 9e2b1202`, idle machine:
+
+| | Rice | abac | ratio | `0017` records |
+|---|---|---|---|---|
+| frame decode | 10.25 ms | 32.69 ms | **3.19×** | **1.69×** |
+| frame encode | 15.16 ms | 84.40 ms | **5.57×** | 129/23 = **5.61×** |
+
+**Reason 2 survives as a ratio and its number is explained.** 129 ms was the `CPU Interval` variant
+(127.15 ms/frame today); the shipped `GPU Range/BoundedSlots` encode stage is 50.87 ms/frame. The
+ratio to Rice is 5.57× against 5.61× then — not discharged, and encode is now the larger debt.
+
+**Reason 1 does not reproduce, and 1.65× was itself an idle-machine figure**, so load does not explain
+it. **ENT-9 is about a tenth of the move and its cost was never logged**: built `a05dc7c^` to attribute
+it, and abac decode goes 29.86 → 32.69 ms (**+9.5%**) with encode 76.73 → 84.40 ms (**+10.0%**) for its
+−2.07% to −8.76% of rate. GOALS §5 consequence 2 requires that cost to be logged with the win.
+**Pre-ENT-9 abac is still 2.91×, so 1.65× → 2.91× is unattributed** — candidates ENT-5's GPU decode,
+ABAC-SHIP, `0031`, `0032`, ENT-8 step 1. That bisect is this item's remaining measurement.
+
+**What is left is the decision, not a number.** The rate side is +89.2% → +61.0% BD-rate (MEAS-11) but
+decays to −3.7% on inter at q=99, GNC's own range (`0045`). Argue it from intra; and the likely shape is
+**per operating point rather than a global flip**, which GOALS §1 blesses and the codec already does in
+three places. Whoever takes it owes a decision record either way.
 
 Filed 2026-09-08 by DOC-3, which found the priority order pointing at "the next largest known intra
 lever is still unbuilt". It is not unbuilt. It shipped on 2026-09-07 and it is behind a flag.

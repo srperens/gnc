@@ -4,6 +4,79 @@
 
 ---
 
+## COORD-5 — the lock could not say whether 4 of 15 holders existed, and that emptied the queue (2026-09-08)
+
+**How this was found.** Not by looking for it. `scripts/claim next` reported *"every startable
+BACKLOG item is claimed (15 of them). Nothing to hand out."* Six were parked on preconditions and
+nine were held, so the question was whether any of the nine was abandoned — and COORDINATION's
+answer is `claim list`, which marks an abandoned claim `SESSION GONE, safe to steal`.
+
+**It could not answer for four of them.** `session_alive` returned "cannot say":
+
+| item | owner | held | worktree, checked by hand |
+|---|---|---|---|
+| BUG-35 | `gnc-bug35rans@bug35rans#s?` | 74m | 1 file uncommitted, last edit 67m ago |
+| PAD-2 | `gnc-g41232@g41232#s?` | 75m | 7 files uncommitted, last edit 67m ago |
+| TILE-1 | `gnc-tile1@tile1#s?` | 75m | 13 files uncommitted, last edit 68m ago |
+| PERF-2 | `gnc-next2@next2#g01a08196` | 69m | 8 files uncommitted, last edit 67m ago |
+
+All four claimed between 17:47 and 17:52, all four with their newest source edit at 17:53–17:55,
+checked at 18:58. Three recorded `s?`, which is what `session_pid` prints when its twelve-hop walk
+finds no `claude` ancestor. The fourth recorded `g01a08196`, which **`scripts/claim` cannot
+produce**: `me()` prints `s<pid>` or `s?`.
+
+**This is the property COORD-1 built the identity around, failing in the case it was built for.**
+Its own words: *"the pid also makes an abandoned claim detectable rather than merely old."* Here it
+made it *undetectable in a new way* — not "healthy", which the pre-COORD-1 identity would have
+said, but "unknown", which a session equally cannot act on. Stealing risks destroying up to 13
+files of someone's work; not stealing leaves four items and that work idle. It is the MEAS-5 shape
+(a session gone with 145 uncommitted lines nobody looked at for eleven hours) with a shrug where
+the diagnosis should be.
+
+**Change.** `claim list` now reports the holder's worktree whenever liveness cannot be
+established. This is not new information — it is COORDINATION's own instruction, *"When you see
+`SESSION GONE`, look in the worktree before you steal the item"* — mechanised, because the
+identity already contains the worktree name and `git worktree list` resolves it to a path. Three
+outputs, and the difference between them is what decides a steal:
+
+```
+SESSION GONE, safe to steal, worktree clean                        -> take it
+OWNER UNIDENTIFIABLE, 13 file(s) uncommitted, newest edit 69m ago   -> read the diff first
+no session recorded, verify before trusting                        -> parked: a reason, not a directory
+```
+
+**Canary, and it was mutation-tested rather than trusted.** `claim selftest` gained a case that
+claims an item under an unidentifiable owner naming a real worktree and asserts the evidence
+appears, plus a parked owner and asserts it is *not* described as a directory. Breaking
+`worktree_evidence` to return nothing makes it print `FAIL: an unidentifiable owner naming a real
+worktree reported no evidence`; restoring it passes. Written that way because `0062`, an hour
+earlier, found two runtime assertions in this repository over compile-time constants — **a new
+assertion should be shown to fail before it is trusted**, and this one now has been.
+
+**What was deliberately not done, and why it is the interesting half.** The real repair is
+`session_pid` itself, and it is not attempted. The walk works in the session that fixed this
+(`zsh → claude(8815) → zsh → login → ghostty`) and the three `s?` claims were written over an
+hour earlier by process trees that no longer exist to inspect. **There is no before-number
+available**, so any fix — match `node`, widen the hop limit, read an env var — would be a change
+shipped on a guess, which is the thing this project's protocol exists to refuse. Filed as
+**COORD-7 (P3)** with an instrument instead of a hypothesis: record the ancestor chain in the
+claim blob when the walk fails, and wait for the next `s?`. The `g01a08196` identity is filed with
+it, because if something other than `scripts/claim` writes `refs/claims/*` then the lock's
+guarantees are not the script's guarantees, and that is worth ruling out before touching the walk.
+
+**Also declined: making `s?` fail closed** — treating "cannot say" as `SESSION GONE`. It would
+have freed all four items immediately, which is exactly why it is tempting, and it would have
+handed a session TILE-1 with 13 uncommitted files in another worktree and called it safe. COORD-1
+separated `GONE` from `STALE` because they need different actions; collapsing "unknown" into
+"gone" undoes that in the direction that loses work. Decision `0069` carries both, and the four
+items are **still held** — this changes what `list` says, not who holds what.
+
+**Gates.** Shell only: no Rust, no WGSL, no bitstream, so the cargo gates cannot be affected and
+were not re-run (DOC-1 / ENT-7 precedent). `scripts/claim selftest` passes all seven cases,
+including the new one.
+
+---
+
 ## BUG-38 — no rustfmt config fits the tree, and the dirty files are the hot files (2026-09-08)
 
 **Hypothesis.** GOALS §9 requires `cargo fmt` clean and `cargo fmt --check` reports 573 diffs in

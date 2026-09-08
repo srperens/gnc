@@ -2115,6 +2115,72 @@ Every edit is in `#[cfg(test)]` code or an integration test target, checked file
 each file's `#[cfg(test)]` marker, so the shipped build is unchanged by construction and no
 figure in BASELINE moves.
 
+### COORD-5 — `claim list` could not say whether 4 of 15 holders existed (**FIXED 2026-09-08**)
+
+COORD-1 put the pid in a claim's identity so *"an abandoned claim is detectable rather than merely
+old"*. On 2026-09-08 at 18:58, with `claim next` reporting **every** startable item claimed, that
+property was not holding for **4 of the 15 item claims** — and those four were the whole difference
+between a working queue and an empty one:
+
+| item | owner | held | what was actually in the worktree |
+|---|---|---|---|
+| BUG-35 | `gnc-bug35rans@bug35rans#s?` | 74m | 1 file uncommitted, last edit 67m ago |
+| PAD-2 | `gnc-g41232@g41232#s?` | 75m | 7 files uncommitted, last edit 67m ago |
+| TILE-1 | `gnc-tile1@tile1#s?` | 75m | 13 files uncommitted, last edit 68m ago |
+| PERF-2 | `gnc-next2@next2#g01a08196` | 69m | 8 files uncommitted, last edit 67m ago |
+
+Three recorded `s?`; the fourth recorded `g01a08196`, which **`scripts/claim` cannot produce** —
+`me()` prints `s<pid>` or `s?`. `session_alive` says "cannot say" for all four and `list` printed
+`OWNER UNIDENTIFIABLE` with nothing after it, which no session can act on: stealing risks
+destroying up to 13 files of work, not stealing leaves four items idle. **Same shape as the MEAS-5
+loss**, which is what the pid was added to prevent.
+
+**Fixed by reporting the holder's worktree whenever liveness cannot be established** — the check
+COORDINATION already asks a session to run by hand before a steal, mechanised. `claim list` now
+prints `SESSION GONE, safe to steal, worktree clean` (take it), `OWNER UNIDENTIFIABLE, 13 file(s)
+uncommitted, newest edit 69m ago` (read the diff first), or `no session recorded, verify before
+trusting` for a parked owner, which names a reason rather than a directory. Decision
+`docs/decisions/0069`.
+
+**Verified by mutation:** `claim selftest` gained a case for both the evidence and the parked
+owner, and breaking `worktree_evidence` makes it print `FAIL: an unidentifiable owner naming a
+real worktree reported no evidence`. Written that way because `0062` had just found two runtime
+assertions over compile-time constants in this repo — a new assertion should be shown to fail
+before it is trusted.
+
+**Deliberately not attempted: repairing `session_pid` itself.** The walk works in the session that
+fixed this and the three `s?` claims were written by process trees that no longer exist, so there
+is no before-number and a guessed fix would be exactly the change this project's protocol refuses.
+Filed as **COORD-7**. Shell only — no Rust, no shader, no bitstream, so the cargo gates cannot be
+affected and were not re-run (DOC-1 / ENT-7 precedent); `claim selftest` passes.
+
+### COORD-7 — why does `session_pid` return `s?`, and what writes a `#g…` identity? (todo, P3)
+
+Two loose ends from COORD-5 / `docs/decisions/0069`, both about how a claim's identity is
+computed rather than about the lock itself. `0069` fixed the *diagnostic* (an unverifiable claim
+now reports its holder's worktree) and deliberately left the *cause* alone, because there was no
+way to measure it after the fact.
+
+1. **`session_pid` printed `s?` for three of fifteen live claims.** It walks up to twelve
+   ancestors looking for a process whose `comm` basename is `claude`. It works in some sessions —
+   the chain observed in `gnc-loopa` was `zsh → claude(8815) → zsh → login → ghostty` — and
+   returns `s?` in others. Candidates, none measured: a session whose `claude` is spawned under a
+   different `comm` (a `node` wrapper, an IDE extension host), a sandbox or launcher that
+   reparents the shell so the chain reaches pid 1 first, or a chain longer than twelve hops.
+   **Do not guess.** Instrument it: have `claim` record the ancestor chain it walked when the
+   walk fails, in the claim blob, and wait for the next `s?`. One line, and it turns a guess into
+   a reading.
+2. **`gnc-next2@next2#g01a08196` cannot have come from this script.** `me()` prints
+   `<tree>@<branch>#s<pid>` or `…#s?`, and `CLAIM_AS` replaces the identity whole. So either a
+   session set `CLAIM_AS` to something shaped like an identity, or something other than
+   `scripts/claim` is writing `refs/claims/*`. The second would matter a great deal — the lock's
+   guarantees are the script's guarantees — so it is worth ruling out before anything else here.
+   `git reflog` on the ref and the claim blob's own `commit:` field are where to start.
+
+Neither blocks anything today: `0069` means an unverifiable claim is now actionable rather than
+opaque. But the pid is the thing COORD-1 built the identity around, and it is currently unreliable
+for a fifth of live claims.
+
 ### BUG-42 — `ENT-9` is filed twice (**CLOSED 2026-09-08 — duplicate of COORD-3, which is now FIXED**)
 
 Filed and closed inside the same hour by the `loopa` session, which found the two live `### ENT-9`

@@ -524,7 +524,7 @@ If this table and `scripts/claim list` disagree, the table is wrong.
 
 | worktree | branch | area |
 |---|---|---|
-| `../gnc-loopa` | `loopa` | **BUG-20 FIXED 2026-09-08 — the native clippy gate is `--all-targets` and the 91 warnings are cleared, not exempted.** `cargo clippy --release` reads the lib and the bins and never a test; `--all-targets` reported **91** (90 lib-test + 1 `tests/requested_limits.rs`), 88 on 2026-09-07 and 90 later that day, so the count drifts on its own. Now **0**, with no `#[allow]` added at any level. **Two of the eight lints were substantive**: `assertions_on_constants` was BUG-35's guard test asserting relations between three `const usize` values at *run* time (now `const _: () = assert!(…)`, so an arena shrink fails the build), and `unused_variables` found a dead `BufferUsages` binding in `rice_gpu.rs`. The other 89 are style, and the 27 `needless_range_loop` are the honest case for the alternative — exempting tests — which lost because there is no CI here, so step 5's clippy command is the only thing that reads this code mechanically. Decision `0062`. **Invalidates no measurement**: every edit is inside `#[cfg(test)]` code or an integration test target — nine of the eleven `src/` files have their first changed line below their own `#[cfg(test)]` marker, and the other two *are* test files (`{encoder,decoder}/pipeline_tests.rs`, included only under `#[cfg(test)]`) — so the shipped build is unchanged by construction. Filed **BUG-38** on the way — `cargo fmt --check` is red the same way and worse (566 diffs, 61 files, **504 of them in 44 files under `src/`**), heading committed with the reserved id. **BUG-38 DECIDED, reformat parked** (`0066`): no rustfmt config fits (default is best of seven at **573** diffs; `"Max"` 1114, `max_width = 90` 964), **44 of the 61 dirty files were changed on `main` in 24 h**, so both the big-bang and the per-touched-file rule cost the same conflicts and the cold subset is only 10%. Rule kept, one atomic `cargo fmt` commit owed on a quiet tree with its sha in `.git-blame-ignore-revs`. Also filed and closed **BUG-42** in the same hour: the *third* filing of the ENT-9 duplicate-id finding after BUG-41 and COORD-3 (which then shipped, `0065`), from a worktree branched before COORD-3's stub landed — `claim bug` gives a free id and nothing compares the subject. See the note above the shared-checkout merge section. |
+| `../gnc-loopa` | `loopa` | **BUG-20 FIXED 2026-09-08 — the native clippy gate is `--all-targets` and the 91 warnings are cleared, not exempted.** `cargo clippy --release` reads the lib and the bins and never a test; `--all-targets` reported **91** (90 lib-test + 1 `tests/requested_limits.rs`), 88 on 2026-09-07 and 90 later that day, so the count drifts on its own. Now **0**, with no `#[allow]` added at any level. **Two of the eight lints were substantive**: `assertions_on_constants` was BUG-35's guard test asserting relations between three `const usize` values at *run* time (now `const _: () = assert!(…)`, so an arena shrink fails the build), and `unused_variables` found a dead `BufferUsages` binding in `rice_gpu.rs`. The other 89 are style, and the 27 `needless_range_loop` are the honest case for the alternative — exempting tests — which lost because there is no CI here, so step 5's clippy command is the only thing that reads this code mechanically. Decision `0062`. **Invalidates no measurement**: every edit is inside `#[cfg(test)]` code or an integration test target — nine of the eleven `src/` files have their first changed line below their own `#[cfg(test)]` marker, and the other two *are* test files (`{encoder,decoder}/pipeline_tests.rs`, included only under `#[cfg(test)]`) — so the shipped build is unchanged by construction. Filed **BUG-38** on the way — `cargo fmt --check` is red the same way and worse (566 diffs, 61 files, **504 of them in 44 files under `src/`**), heading committed with the reserved id. **COORD-5 FIXED** (`0069`): `claim list` reports the holder's worktree when liveness cannot be established — at 18:58, with `next` reporting all 15 startable items claimed, **4 could not be tested** (`s?` x3 and one `g01a08196` that `me()` cannot produce), all idle ~67m holding 1/7/13/8 uncommitted files. Cause left to **COORD-7** with an instrument rather than a guess; "cannot say" is deliberately not collapsed into `SESSION GONE`. New `selftest` case mutation-tested. **BUG-38 DECIDED, reformat parked** (`0066`): no rustfmt config fits (default is best of seven at **573** diffs; `"Max"` 1114, `max_width = 90` 964), **44 of the 61 dirty files were changed on `main` in 24 h**, so both the big-bang and the per-touched-file rule cost the same conflicts and the cold subset is only 10%. Rule kept, one atomic `cargo fmt` commit owed on a quiet tree with its sha in `.git-blame-ignore-revs`. Also filed and closed **BUG-42** in the same hour: the *third* filing of the ENT-9 duplicate-id finding after BUG-41 and COORD-3 (which then shipped, `0065`), from a worktree branched before COORD-3's stub landed — `claim bug` gives a free id and nothing compares the subject. See the note above the shared-checkout merge section. |
 
 | `../gnc-refdiff` | `refdiff` | **RATE-4 half done, dropped 2026-09-08.** The free half — `0040` point 4's source-copy reference — is **refuted by a direct buffer diff** rather than by 0040's confounded PSNR: 0.0000 in RATE-3's q=95..99 fallback case, **254.0039** at q=100 MED, 7.3965 at q=100 lossless wavelet. Encoder's source planes are fractional where the decoder's reference is integral, and identical between the MED and wavelet runs, so it is not the transform. Reverted; tree unchanged. **The unexplained half is why the fallback case matches exactly** — start there. The other half (choose the candidate on sequence bytes, which is what makes bbb q=99 regress) is untouched. |
 | `../gnc-refdiff` | `refdiff` | **RATE-3 DONE 2026-09-08.** `0036`'s sequence gate lifted; mean **−4.28%** of sequence bytes (3 sequences × q ∈ {95,99} × ki ∈ {2,9}), best −13.16%, worst ΔP −0.01 dB, I-frames bit-exact through a real `encode-sequence` → `decode-sequence` md5 round trip. The gate was hiding the *mirror image* of `0040`'s bug: `encode_once` leaves only the **last** candidate's quantised planes in the side channel `local_decode_iframe_gpu` reads, so a kept *bit-exact* frame got the lossy candidate's — P-frames at 5.93 dB. `encode_as_reference` re-runs whichever was kept, at a third encode on those frames. Stills byte-identical. bbb q=99 regresses +0.4/+0.58% → **RATE-4** (with `0040` point 4's source-copy reference, whose refutation is confounded by BUG-39 cause 2). Decision `0044`. |
@@ -917,6 +917,38 @@ the option that spends more bits. Use BD-rate, or compare at matched rate. At le
 wrong conclusions have come from this one error.
 
 ## Landed today, and what each one invalidates
+
+- **COORD-5 — `claim list` reports the holder's worktree when it cannot say whether the holder
+  exists.** `docs/decisions/0069`. **Invalidates nothing** — `scripts/claim` only; no Rust, no
+  shader, no bitstream. **What changes is the thing you read before stealing an item**, so read
+  the new line rather than the old habit:
+
+  ```
+  SESSION GONE, safe to steal, worktree clean                       -> take it
+  OWNER UNIDENTIFIABLE, 13 file(s) uncommitted, newest edit 69m ago  -> read the diff first
+  no session recorded, verify before trusting                       -> parked: a reason, not a directory
+  ```
+
+  Three things worth carrying that are not about this item:
+
+  - **The pid stopped being a liveness oracle for a fifth of live claims, and it did so silently.**
+    At 18:58, with `next` reporting all 15 startable items claimed, **4 of them could not be
+    tested**: `BUG-35`, `PAD-2`, `TILE-1` recorded `s?`, and `PERF-2` recorded `g01a08196`, which
+    `me()` cannot produce. All four had been idle for ~67 minutes holding 1, 7, 13 and 8
+    uncommitted files. COORD-1 added the pid so an abandoned claim would be *detectable rather
+    than merely old*; unknown is not detectable either. **Cause not diagnosed and deliberately not
+    guessed at** — filed as **COORD-7** with an instrument (record the walked chain when the walk
+    fails) rather than a hypothesis.
+  - **"Cannot say" must not be collapsed into "gone", however much the empty queue argues for
+    it.** Failing closed would have freed all four items in one command and handed the next
+    session TILE-1 with 13 uncommitted files in someone else's worktree, called safe. The
+    `GONE`/`STALE` split exists because the two need different actions; a third state needs a
+    third answer, not to be rounded to whichever one is convenient.
+  - **A new assertion was mutation-tested before it was trusted**, one hour after `0062` found two
+    runtime assertions over compile-time constants in this tree. Breaking `worktree_evidence`
+    makes `claim selftest` print `FAIL: an unidentifiable owner naming a real worktree reported no
+    evidence`. **Do this for every check added to `selftest`** — it is two commands and it is the
+    difference between a gate and a decoration.
 
 - **BUG-38 — decided, not done: no rustfmt config fits the tree, and the dirty files are the hot
   files.** `docs/decisions/0066`. **Invalidates nothing** — no `.rs` content changed; the

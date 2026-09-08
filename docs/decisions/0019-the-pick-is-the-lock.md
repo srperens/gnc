@@ -6,6 +6,11 @@
 **Scope:** coordination between concurrent sessions. No effect on the codec, the bitstream or any
 measurement.
 
+> **This number collided.** A second `0019` — the inter path's saving was an equal-setting figure
+> — sat on `main` beside this one from 2026-09-07 to 2026-09-08 and is now
+> [0056](0056-the-inter-paths-saving-was-an-equal-setting-figure.md) (BUG-19). A citation of
+> `0019` written on either of those days may mean that record; this one is COORD-1.
+
 ## The problem 0016 left open
 
 0016 made `take` atomic and was right about the cause: LOOP step 1 is a *deterministic* rule

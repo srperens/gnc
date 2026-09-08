@@ -286,6 +286,72 @@ Decision record: `docs/decisions/0054`.
 
 ---
 
+## DOC-3 — the priority order pointed at closed work on five of six items, and the sixth had no ID (2026-09-08)
+
+**No measurement in this entry.** Every figure below is quoted from a BACKLOG heading or a decision
+record; the work was checking each claim in the priority order against the entry it came from. It is
+logged because CLAUDE.md asks for all items, and because the *audit* is the result.
+
+**Why this item at all.** `scripts/claim next` reported all 14 startable items held by live sessions
+(eight sessions had started within the same few minutes; every holder's pid was alive, so nothing was
+stealable). Rather than take held work, the queue-exhausted case was spent on the thing that decides
+what the queue *contains*.
+
+**What was checked.** BACKLOG's `### Priority order`, item by item, against the `### NAME-<n>`
+heading each item names, plus the "Still open" list in EBCOT Part 7 and the same pointers in GOALS,
+README, BASELINE, LOOP and CLAUDE.
+
+| priority-order line | heading it names says |
+|---|---|
+| 0: "remaining work is **PAD-1 (P1)** ... and **INTRA-2 (P1)**" | PAD-1 **DONE 2026-09-08** (−4.63% RGB / −4.60% Y intra rate, stills, `0039`); INTRA-2 **DONE 2026-09-08** (BD-rate −5.01%, `0041`) |
+| 1: "next largest known intra lever is **still unbuilt** — see EBCOT Part 7's open items" | Part 7's four open items: 1 closed by Part 6, 2 by Part 7, 3 by **ENT-3** (`0045`), 4 by **ENT-5**'s GPU encoder. Zero open |
+| 2: "**LOSSLESS-1** ... **Buildable now**" | **BUILT AND MEASURED 2026-09-06** |
+| 3: "**MEAS-5 / CANARY-1** — blocked on a discrete GPU ... never been measured" | CANARY-1 **DONE 2026-09-07 — PASSES at 34x**; MEAS-5 Claim A holds and is fully sourced, only Claim B is open |
+| 5: "Bugs: **BUG-14**" | **DONE 2026-09-07** |
+| 5: abac inter "**−12.0% to −22.9%**" | **superseded 2026-09-08** by ENT-3: −21.6% to −3.7% over q=50-99, decaying with quality (`0045`) |
+
+Five of six. **GOALS, README, BASELINE, LOOP and CLAUDE carry none of these six** — README already
+quotes PAD-1's shipped −4.63% and CANARY-1's 13.95/7.29 ms, and CLAUDE.md was corrected for `0045`
+the same morning. So the drift is confined to the one file whose top section nothing maintains,
+which is the finding: **DOC-1 fixed README, DOC-2 fixed GOALS, and BACKLOG's own priority order was
+the last of the three.**
+
+### The one finding that is not a correction
+
+Item 1 pointed for two days at "the next largest known intra lever", and that lever is **not
+unbuilt**. It is `--abac`: shipped 2026-09-07, bit-exact on 98 of 98 whole-file comparisons,
+**−16.6% to −18.8% of intra rate at identical pixels**, −13.4% on bit-exact lossless, FFV1 gap
++23.9% → +7.3%. Nothing has to be implemented to collect any of it — only a default has to move.
+
+Making it the default had been named three times (ENT-5's "not in scope" note, `0017`, this
+pointer) and **never as a heading with an ID and a priority**, so `scripts/claim next` has never
+been able to offer it. For two days the queue's answer to "what should I work on" could not include
+the largest built lever in the codec, while it was handing out P3 documentation items.
+
+Filed as **ENT-9 (P2)** and parked `blocked-idle-machine`: the decision needs abac GPU encode
+ms/frame (ENT-5's outstanding criterion 3 — the instrument exists, `abac_bench`) and a re-take of
+`0017`'s 1.69x decode debt, and neither can be taken with eight sessions on one GPU — the same abac
+decode has read **25.2 / 31.1 / 37.5 ms across three runs** under load (ENT-8). Parked rather than
+opened for the reason parking exists: an open P1 nobody can execute removes a slot from seven other
+sessions.
+
+**And the honest half of ENT-9's case is smaller than its headline.** `0045` measured abac's inter
+saving decaying monotonically with quality to under −4.5% at q=99 on two of three sequences, which
+is GNC's own operating point (GOALS §1). The −21.6% belongs to q=50. So the case for flipping the
+default rests on **intra**, and ENT-9 says so in the filing rather than leaving the next session to
+find it.
+
+### Decision
+
+`docs/decisions/0060` — **a forward pointer to work with no ID goes stale by construction.** The
+rule: file the item first, cite the id. Same lesson as COORD-2 (`0050`) one level up — an id is the
+only thing another session can see without reading prose. Rejected: rewording item 1 without filing
+ENT-9 (the sentence goes stale again on the next move, and `next` still cannot offer it); filing
+ENT-9 open at P1 (nobody can execute it today); deleting the priority order in favour of
+`claim items` (the queue ranks by P-number, and that section is where the P-numbers come from).
+
+---
+
 ## ENT-3 — abac's inter saving is real, decays with quality, and the contexts are not the inter question (2026-09-08)
 
 **What was open.** Not the headline — ARCH-3 answered "does abac pay on inter" as a side effect

@@ -2970,6 +2970,36 @@ impl EncoderPipeline {
                     config.wavelet_type,
                     p,
                 );
+            } else if config.transform_type == crate::TransformType::MedPredict {
+                // **BUG-39.** This branch did not exist, and its absence is why a `q=100`
+                // sequence decoded its P-frames at 12.45 dB while its I-frames were bit-exact:
+                // the reference was built by running the inverse *wavelet* over a MED residual.
+                // Measured before the fix, encoder reference against the decoder's own for the
+                // same frame: **Y differed by up to 33.0 and Cg by up to 64.0** on 63 029 and
+                // 64 266 of 65 536 pixels, while the q=99 wavelet control was bit-identical.
+                //
+                // The decoder has always done this correctly (`decoder/gpu_work.rs:350`, `:373`)
+                // and `med.inverse` has always existed. Only the encoder's local decode was
+                // missing the branch, so encoder and decoder disagreed about the reference and
+                // every P-frame started from a different picture than the decoder had.
+                //
+                // MED needs no scratch buffer: it is a per-pixel predictor, not a lifting
+                // cascade. And it never coexists with CfL — `quality_preset(100)` and
+                // `lossless_sibling` both disable CfL — which is why this sits beside the CfL
+                // branch rather than inside it.
+                debug_assert!(
+                    !has_cfl,
+                    "MED with CfL: the reference path has no combined case and none is reachable"
+                );
+                self.med.inverse(
+                    ctx,
+                    &mut cmd,
+                    &bufs.cg_plane,
+                    &bufs.plane_a,
+                    p_padded_w,
+                    p_padded_h,
+                    config.tile_size,
+                );
             } else {
                 // Standard path: cg_plane → plane_c(scratch) → plane_a
                 self.transform.inverse(
@@ -3136,14 +3166,9 @@ impl EncoderPipeline {
         let uniform_weights = crate::SubbandWeights::uniform(config.wavelet_levels);
         let weights_luma = uniform_weights.pack_weights();
         let weights_chroma = uniform_weights.pack_weights_chroma();
-        // Inter residuals get twice the intra dead zone. GNC_INTER_DZ_MUL exposes that factor:
-        // on a pure pan the residual is essentially the reference's own quantisation noise, and
-        // GNC codes it finely enough to end up *better* than the I-frame it predicts from, which
-        // is bits spent on nothing a viewer asked for.
-        let inter_dz_mul: f32 = std::env::var("GNC_INTER_DZ_MUL")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(2.0);
+        // Inter residuals take the same dead zone as intra (INTER-2, docs/decisions/0041).
+        // One source of truth: this factor used to be inlined at all three of these sites.
+        let inter_dz_mul: f32 = crate::inter_dead_zone_mul();
         let res_dead_zone = config.dead_zone * inter_dz_mul;
 
         // Config stored in CompressedFrame must match encoder parameters so decoder
@@ -3151,6 +3176,13 @@ impl EncoderPipeline {
         let mut res_config = config.clone();
         res_config.subband_weights = uniform_weights;
         res_config.dead_zone = res_dead_zone;
+        // BUG-39: a P-frame's residual is **always** wavelet-coded — `encode_pframe` calls
+        // `transform.forward` and never `med.forward` — so the frame it emits must not advertise
+        // a transform it did not use. A `q=100` sequence carries `transform_type = MedPredict`,
+        // and cloning that verbatim told the decoder to invert a MED prediction over a wavelet
+        // residual. The decoder branches on this byte (`decoder/gpu_work.rs:349`) for P-frames as
+        // well as I-frames, so it obeyed, and the error accumulated down the GOP.
+        res_config.transform_type = crate::TransformType::Wavelet;
 
         // P-frames are quantised coarser than intra, by a factor that follows the operating
         // point: 1.25x at coarse steps, tapering to 1.0 as the step gets fine.
@@ -4930,19 +4962,21 @@ impl EncoderPipeline {
         let uniform_weights = crate::SubbandWeights::uniform(config.wavelet_levels);
         let weights_luma = uniform_weights.pack_weights();
         let weights_chroma = uniform_weights.pack_weights_chroma();
-        // Inter residuals get twice the intra dead zone. GNC_INTER_DZ_MUL exposes that factor:
-        // on a pure pan the residual is essentially the reference's own quantisation noise, and
-        // GNC codes it finely enough to end up *better* than the I-frame it predicts from, which
-        // is bits spent on nothing a viewer asked for.
-        let inter_dz_mul: f32 = std::env::var("GNC_INTER_DZ_MUL")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(2.0);
+        // Inter residuals take the same dead zone as intra (INTER-2, docs/decisions/0041).
+        // One source of truth: this factor used to be inlined at all three of these sites.
+        let inter_dz_mul: f32 = crate::inter_dead_zone_mul();
         let res_dead_zone = config.dead_zone * inter_dz_mul;
 
         let mut res_config = config.clone();
         res_config.subband_weights = uniform_weights;
         res_config.dead_zone = res_dead_zone;
+        // BUG-39: a P-frame's residual is **always** wavelet-coded — `encode_pframe` calls
+        // `transform.forward` and never `med.forward` — so the frame it emits must not advertise
+        // a transform it did not use. A `q=100` sequence carries `transform_type = MedPredict`,
+        // and cloning that verbatim told the decoder to invert a MED prediction over a wavelet
+        // residual. The decoder branches on this byte (`decoder/gpu_work.rs:349`) for P-frames as
+        // well as I-frames, so it obeyed, and the error accumulated down the GOP.
+        res_config.transform_type = crate::TransformType::Wavelet;
 
         let entropy_mode = EntropyMode::from_config(config);
         let tile_size = config.tile_size as usize;
@@ -5870,14 +5904,9 @@ impl EncoderPipeline {
         let uniform_weights = crate::SubbandWeights::uniform(config.wavelet_levels);
         let weights_luma = uniform_weights.pack_weights();
         let weights_chroma = uniform_weights.pack_weights_chroma();
-        // Inter residuals get twice the intra dead zone. GNC_INTER_DZ_MUL exposes that factor:
-        // on a pure pan the residual is essentially the reference's own quantisation noise, and
-        // GNC codes it finely enough to end up *better* than the I-frame it predicts from, which
-        // is bits spent on nothing a viewer asked for.
-        let inter_dz_mul: f32 = std::env::var("GNC_INTER_DZ_MUL")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(2.0);
+        // Inter residuals take the same dead zone as intra (INTER-2, docs/decisions/0041).
+        // One source of truth: this factor used to be inlined at all three of these sites.
+        let inter_dz_mul: f32 = crate::inter_dead_zone_mul();
         let res_dead_zone = config.dead_zone * inter_dz_mul;
 
         let is_non_444 = info.chroma_format != ChromaFormat::Yuv444;

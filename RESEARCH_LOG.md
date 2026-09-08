@@ -418,6 +418,113 @@ baseline taken at the start of this session's work.
 
 ---
 
+## BUG-39 — `q=100` video: the encoder inverted a transform it had not used, and the P-frames advertised one they had not used either (2026-09-08)
+
+**Where this started.** RATE-3 found that a `q=100` sequence codes bit-exact I-frames and then
+P-frames that decode at **12.45 dB**, on `main`, with no flags. It spent three attempts on
+mechanism hypotheses, refuted two of them, and named the one measurement that would settle it
+(`0040`). This is that measurement and what it found.
+
+**Success criterion, unchanged from the item:** every frame bit-exact at `q=100` on ≥3 sequences at
+ki=2 and 9, verified outside the harness. **Not met.** Two of three causes are fixed and the
+figure moves 12.45 → 26.30 dB.
+
+### The measurement, and why it was available all along
+
+`read_reference_planes` exists on **both** the encoder and the decoder pipeline, and
+`test_pframe_reference_matches_decoder` has been diffing them since before this bug was filed —
+with `CodecConfig::default()`, which is qstep 4.0 and the wavelet. **The lossless case had never
+been run through it.** The tool was not missing; its configuration was the untested axis.
+
+Encoder reference against decoder reference, same I-frame, 256×256 gradient, reference deblocking
+off (it is encoder-only by design, as the existing lossy check also notes):
+
+| | max \|enc − dec\| | pixels differing |
+|---|---|---|
+| q=99, wavelet — control | **0.0000** all planes | 0 / 65 536 |
+| q=100, MED — Y | **33.0000** | 63 029 / 65 536 |
+| q=100, MED — Co | 0.0000 | 0 |
+| q=100, MED — Cg | **64.0000** | 64 266 / 65 536 |
+
+Ten minutes, against two hours of hypotheses. Worth writing down as a habit: **when two components
+must agree and one of them is wrong, diff them before theorising about why.**
+
+### Cause 1 — the encoder's local decode had no MED inverse
+
+`local_decode_iframe_gpu` dequantised and called `transform.inverse` unconditionally, so a MED
+frame's reference was the inverse **wavelet** of a MED residual. The decoder has always branched
+correctly (`decoder/gpu_work.rs:350`, `:373`) and `med.inverse` has always existed — only the
+encoder's copy of the reconstruction lacked the branch, which is why the I-frames themselves were
+perfect and everything downstream was not.
+
+Fixed. The table above now reads **0.0000 on every plane at q=100 as well as q=99**, asserted by
+`lossless_iframe_reference_matches_the_decoders`, which keeps the q=99 wavelet case as its control
+so a future regression cannot pass by breaking both arms equally.
+
+### Cause 2 — a P-frame advertised a transform it had not used
+
+`encode_pframe` codes its residual with `transform.forward` **always** — it never calls
+`med.forward` — but it cloned the sequence config into the frame it emitted. So a `q=100` P-frame
+carried `transform_type = MedPredict`, the decoder branches on that byte for P-frames too, and it
+dutifully inverted a MED prediction over a wavelet residual. The error compounded down the GOP.
+
+Fixed where the residual config is built: `res_config.transform_type = Wavelet`. The label now
+describes what the code does.
+
+**A wrong first attempt worth recording:** I put the same correction in
+`encode_from_wavelet_coeffs` and `encode_from_gpu_wavelet_planes_weighted` first, on the strength
+of their names, and it changed **nothing** — a P-frame's config comes from `res_config`, not from
+those emitters. Reverted rather than left in as an inert change with a confident comment on it.
+
+### Raw numbers — crowd_run, 10 frames, `q=100`
+
+| | ki=2 P-frames | ki=9 P-frames |
+|---|---|---|
+| before | 21.35 – 21.48 dB | **9.06 – 21.37 dB** |
+| cause 1 only | 21.35 – 21.48 | 9.06 – 21.37 |
+| both causes | **26.30 – 26.76** | **21.63 – 26.51** |
+
+The ki=9 span collapsing from **12.3 dB to 4.9 dB** is the drift disappearing: every P-frame's
+reference is now the one the decoder has, so error stops accumulating along the chain. That cause 1
+alone moved nothing at ki=9 is the reason it was not shipped alone — a partial number that reads as
+progress and hides a second cause.
+
+**No regression at lossy quality**, which is the gate that matters most here: crowd_run q=99 ki=9
+is **byte-identical** at 49 328 550 B with P-frames 60.61–60.64 dB, and q=85 reads 44.63–44.72 dB.
+
+### Cause 3 — open, and it is a design question rather than a patch
+
+P-frames at `q=100` are **26 dB, not bit-exact**, and they are lossy *by construction*: the residual
+is quantised at the P-frame taper (up to 1.25× the intra step) with a dead zone, and
+`wavelet_levels` is 0 there. **Nothing in the P-frame path asks to be lossless when the sequence
+is.** So "bit-exact lossless at q=100" remains true of a still and false of a sequence, for a
+reason unrelated to the two bugs above.
+
+Fixing it means suppressing the P-scale taper and the dead zone for a lossless configuration, and
+it needs a **rate** number as well as a quality one — a lossless P-frame is much larger, and
+whether `q=100` video should pay that is exactly the kind of choice that wants a decision record.
+BUG-39 stays open on it.
+
+### Also corrected, and not measured
+
+`--dct` sequences had their P-frames mislabelled the same way and are also wavelet-coded, so the
+same one-line fix corrects them. **No DCT video measurement was taken** — flagged rather than
+claimed.
+
+### Caveats
+
+- **Only the reference planes are proven equal**, at 256×256 on a gradient. The test asserts the
+  invariant that must hold; it does not sweep content or geometry.
+- **The README figure is updated, not deleted**: it now says 26.30 dB and names cause 3.
+- **`0040`'s refuted hypotheses stand refuted** — the colour transform's rounding mode and a
+  geometry difference at `wavelet_levels = 0` were both wrong, and neither is what this was.
+
+**Gates:** `cargo test --release -- --test-threads=1` green (244 passed, 0 failed, 9 ignored);
+`cargo clippy --release` clean; wasm `--lib` clean.
+
+
+---
+
 ## RATE-3 — a bit-exact I-frame is not a drop-in reference, and `q=100` video decodes at 12.45 dB (2026-09-08)
 
 **Hypothesis.** `0036` shipped RATE-2's lossless fallback for stills only, because letting it reach
@@ -14703,3 +14810,103 @@ larger than filed. The same instinct nearly stopped this one at "abac and Rice d
 expert". The general lesson is not "always fix" — BUG-16's fix genuinely is a design decision — it
 is that **"this needs its own item" is a claim about the work, and it should be made after looking,
 not instead of looking.**
+
+## 2026-09-08 — INTER-2: the inter dead zone was double the intra one, and double was the wrong number
+
+### The mechanism, before any measurement
+
+`res_dead_zone = config.dead_zone * inter_dz_mul` with `inter_dz_mul = 2.0`. The inter dead zone
+was never tuned — it *inherited* the intra curve's shape and doubled it. Combined with INTRA-1's
+finding that any dead zone ≤ 0.5 is a no-op (GNC quantises as `floor(|v|/step + 0.5)` after a
+`|v| < dz*step` test), the preset anchors make that:
+
+| q | intra dz | intra active? | inter dz (×2.0) | inter active? |
+|---|---|---|---|---|
+| 25–75 | 0.75 | yes | 1.5 | yes |
+| **85** | **0.5** | **no** | **1.0** | **yes** |
+| 92 | 0.05 | no | 0.1 | no |
+
+So **q=85 is the last rung where the inter dead zone is the only dead zone still running**, which
+is exactly the anomaly INTER-2 was filed for — the q=85 rung going *cheap and worse* while every
+rung above it goes dearer and better. The item's single point sized the lever; this is why it is
+there.
+
+### Reproduced first
+
+The filed point reproduces **byte-for-byte** on today's `main` — crowd_run q=85 ki=9 24 frames:
+65293226 B / 45.02 / 44.61 at mul=2.0, 74831067 B / 47.89 / 47.48 at mul=1.0, all-intra 72379589 B.
+So PAD-1 and the BUG-16 fix, both of which landed today, left the sequence path alone as claimed.
+
+### The ladder
+
+4 rungs (q=70/75/80/85) x 3 sequences x 4 arms, 24 frames, ki=9, 4:4:4. BD-rate on PSNR against
+shipped 2.0, integrated per sequence over the intersection of all arms' quality ranges:
+
+| sequence | mul=1.5 | **mul=1.0** | mul=0.0 |
+|---|---|---|---|
+| bbb_extended (animation) | −2.70% | −2.13% | **+12.48%** |
+| crowd_run (high motion) | −3.01% | **−6.04%** | −2.40% |
+| old_town_cross (camera) | −2.76% | **−6.14%** | −3.34% |
+| **mean** | −2.82% | **−4.77%** | +2.25% |
+
+**Worst-frame PSNR improves at 12 of 12 points, +2.44 to +5.23 dB.** 1.0 beats both neighbours, so
+the optimum is bracketed rather than picked. **0.0 is worse than shipped on animation**, so the
+feature earns its place — the rationale for having an inter dead zone (a residual is largely the
+reference's own quantisation noise) was right; only the factor was wrong.
+
+Shipped 1.0 rather than fitting something between 1.0 and 1.5: at exactly 1.0 the special case
+*disappears* instead of becoming a second magic number that has to be re-tuned whenever the intra
+anchors move. The remaining value is under a point of BD-rate on one content type.
+
+### A built-in consistency check, and it passed
+
+At q=85 the intra dead zone is exactly 0.5, so mul=1.0 lands precisely on the no-op boundary and
+**mul=1.0 must equal mul=0.0 there**. It does, on all three sequences, byte-identically —
+74831067 / 74465815 / 35377914 B with identical PSNR. The arithmetic model of the whole item is
+therefore not just plausible, it is confirmed by an equality nobody arranged.
+
+### VMAF could not decide this, and that is the reportable part
+
+CLAUDE.md puts VMAF in the lead at q ≤ 85. **On this ladder it is saturated and returns nonsense.**
+crowd_run's four rungs span **99.86 to 99.88** — a 0.02-point interval — across a **5.5 dB** PSNR
+spread, and a BD-rate integrated over that interval reads **+35.41%**. That is the "not a weak
+number, it is not a number" failure the repo documents for q > 85, occurring at q = 70–85.
+
+The reason is that the q≤85 rule was written for **stills**. GNC's inter ladder at 4:4:4 runs at
+4.9–12.0 bpp, which is far above the rate where VMAF discriminates. It is not uniform across
+content: old_town_cross reads 96.45 at q=70 mul=2.0 and is *not* saturated at the bottom, and
+there VMAF gives −6.82% and agrees with PSNR. **So the rule needs a rate qualifier, not just a q
+one** — worth carrying into CLAUDE.md if another item hits the same wall.
+
+### Scope, measured
+
+crowd_run, 12 frames, ki=9, new default against `GNC_INTER_DZ_MUL=2.0`:
+
+| q | 84 | 85 | 86 | 87 | 88 | 89 | 90 |
+|---|---|---|---|---|---|---|---|
+| | differs | differs | differs | differs | differs | **identical** | **identical** |
+
+**q ≥ 89 byte-identical; q=100 byte-identical both ways** (15710346 B — `dead_zone` is 0.0 there);
+the still path is untouched by construction. So the blast radius is inter frames at q ≤ 88.
+
+### What it invalidates
+
+BASELINE's q=75 sequence table (already stale for two other reasons; noted there), the q=85 rung —
+**one of four** — of BASELINE's headline +90.5% against x264, and `0025`'s abac-versus-Rice inter
+columns at q=50 and q=75 but not q=90. The +90.5% should improve, since this improves the inter RD
+curve, but that is a prediction and the figure stands as recorded until re-run.
+
+### Three copies of the default, again
+
+The factor was inlined at **three** sites in `sequence.rs` — the P path and two B paths — each with
+its own `unwrap_or(2.0)`. Changing two of three would have been a frame-type-dependent quantiser
+difference, i.e. BUG-16's failure mode arriving by BUG-37's route. Now `gnc::inter_dead_zone_mul()`,
+with a test that fails if `sequence.rs` reads the variable again. **This is the third time today
+that a shipped default turned out to have more than one home** (BUG-37's five CLI sites, BUG-16's
+two quantisers, these three). It is worth treating as a pattern rather than three coincidences.
+
+### Noticed, not caused
+
+q=100 sequences decode to a worst-frame **7.91 dB** on crowd_run. That is **BUG-39**, already
+reserved by the RATE-3 session; byte-identical under both multipliers here, so this change neither
+causes nor fixes it. Mentioned because it is a lossless mode reading 7.91 dB.

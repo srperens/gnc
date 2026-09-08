@@ -3593,7 +3593,44 @@ falls while q rises (MEAS-9's harness now does). And for a 10-bit target the ext
 itself was never the problem. Harness: `scripts/meas_rate1_precision.py`, measured at `fa32a26`.
 Numbers in RESEARCH_LOG.
 
-### BUG-39 — `q=100` video decodes at 12.45 dB: lossless sequences have never worked (todo, **P1**)
+### BUG-39 — `q=100` video: two causes fixed, 12.45 → 26.30 dB, still not lossless (**partly fixed 2026-09-08**, P1)
+
+**Two of three causes found, fixed and proven.** `docs/decisions/0042`; numbers in RESEARCH_LOG.
+crowd_run, 10 frames, `q=100`: P-frames go from **9.06–21.37 dB to 21.63–26.51 dB** at ki=9 and
+from 21.35–21.48 to **26.30–26.76** at ki=2, and the drift down the GOP is gone (the ki=9 span
+collapses from 12.3 dB to 4.9 dB). Nothing moved at lossy quality — crowd_run q=99 ki=9 is
+byte-identical at 49 328 550 B with P-frames 60.61–60.64.
+
+**Cause 1, fixed:** `local_decode_iframe_gpu` called `transform.inverse` unconditionally, so a MED
+I-frame's reference was built by inverting a transform it was not coded with. The decoder always
+did this right and `med.inverse` always existed; only the encoder's copy lacked the branch.
+Measured before: encoder reference against decoder reference differed by up to **33.0 on Y and
+64.0 on Cg**, on 63 029 and 64 266 of 65 536 pixels, while the q=99 wavelet control was
+bit-identical. Now 0.0000 on every plane, asserted by
+`lossless_iframe_reference_matches_the_decoders`.
+
+**Cause 2, fixed:** `encode_pframe` codes its residual with `transform.forward` **always**, but
+cloned the sequence config, so a `q=100` P-frame advertised `transform_type = MedPredict` and the
+decoder inverted a MED prediction over a wavelet residual. The label now says what the code does.
+**This also corrects `--dct` sequences**, mislabelled the same way — not measured, flagged.
+
+**Cause 3, open, and it is a design question rather than a patch.** P-frames at `q=100` are lossy
+*by construction*: the residual is quantised at the P-frame taper (up to 1.25× the intra step) with
+a dead zone, and `wavelet_levels` is 0. **Nothing in the P-frame path asks to be lossless when the
+sequence is.** Fixing it means suppressing the taper and the dead zone for a lossless
+configuration, and it needs a rate number as well as a quality one — a lossless P-frame is much
+larger. Success criterion unchanged: every frame bit-exact at `q=100` on ≥3 sequences at ki=2 and
+9, verified outside the harness.
+
+**The instrument to use, and the reason the first two causes hid for so long:**
+`read_reference_planes` exists on **both** pipelines and `test_pframe_reference_matches_decoder`
+has been diffing them all along — with `CodecConfig::default()`, qstep 4.0, wavelet. The lossless
+case was the untested axis, not a missing tool. Two hours of mechanism hypotheses (`0040`) against
+ten minutes of diffing the two things that must be equal.
+
+The original filing follows.
+
+### BUG-39 — `q=100` video decodes at 12.45 dB: lossless sequences have never worked (original filing)
 
 Filed 2026-09-08 by RATE-3, which found it while investigating something else and confirmed it is
 **not** caused by RATE-2.
@@ -4165,7 +4202,7 @@ worst-frame penalty was BUG-27. What remains is content-specific (old_town_cross
 worst-frame) and MEAS-4 already located it in prediction quality, not the coding model.
 Harnesses: `scripts/meas_inter1_ki.py`, `scripts/meas_inter1_pscale.py`. Follow-up: **INTER-2**.
 
-### INTER-2 — The inter dead zone is a large unpriced lever at the q=85 rung (todo, P2)
+### INTER-2 — The inter dead zone is a large unpriced lever at the q=85 rung (**DONE 2026-09-08 — default 2.0 → 1.0, BD-rate −4.77%**)
 
 Found inside INTER-1, not chased there. The q=85 rung behaves unlike every rung above it: the
 inter arm goes *cheap and worse* (10.50 bpp against all-intra's 11.64, 2.9 dB down on the worst
@@ -4186,6 +4223,32 @@ the options (COORDINATION rule 4):
 At 1.0 the worst frame lands exactly on all-intra's 47.48 — the same ceiling property the P-scale
 has at 1.0, arrived at from a second knob, which is the interesting part. 12.7% of the rate and
 2.87 dB of worst-frame is worth a BD-rate.
+
+> **Priced 2026-09-08 and shipped: `inter_dz_mul` is now 1.0.** `docs/decisions/0041`. The point
+> above reproduces byte-for-byte on today's `main`, and the ladder says the same thing everywhere.
+>
+> 4 rungs (q=70/75/80/85) x 3 sequences x 4 arms, 24 frames, ki=9, 4:4:4. BD-rate on PSNR against
+> the old 2.0, integrated over each sequence's common interval across all arms:
+>
+> | sequence | mul=1.5 | **mul=1.0** | mul=0.0 |
+> |---|---|---|---|
+> | bbb_extended | −2.70% | −2.13% | **+12.48%** |
+> | crowd_run | −3.01% | **−6.04%** | −2.40% |
+> | old_town_cross | −2.76% | **−6.14%** | −3.34% |
+> | mean | −2.82% | **−4.77%** | +2.25% |
+>
+> **Worst-frame improves at 12 of 12 points, by +2.44 to +5.23 dB**, and 1.0 beats both
+> neighbours, so the optimum is bracketed. **0.0 is worse than shipped on animation (+12.48%)** —
+> the inter dead zone earns its place, 2.0 just overshot.
+>
+> **VMAF could not decide this and said so.** crowd_run's four rungs span 99.86–99.88 — a
+> 0.02-point interval across a 5.5 dB PSNR spread — and a BD-rate over it returns +35.41%. The
+> q≤85 "VMAF leads" rule is a stills rule; this ladder runs at 4.9–12.0 bpp.
+>
+> **Scope measured, not argued: q ≤ 88 moves, q ≥ 89 is byte-identical**, and q=100 is byte-identical
+> both ways. Also consolidated three inlined copies of the factor into
+> `gnc::inter_dead_zone_mul()`, guarded by a test — it was one `unwrap_or` from BUG-37's shape.
+
 
 **What to do:** BD-rate `inter_dz_mul` in {1.0, 1.5, 2.0, 3.0} against all-intra on the three
 sequences at q=85-99 *and* q=25-70, mean and worst-frame, via `scripts/meas_inter1_pscale.py`

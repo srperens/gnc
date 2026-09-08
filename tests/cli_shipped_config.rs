@@ -17,6 +17,12 @@
 //! three more sequence sites already diverging and nothing stopping a sixth. So the invariant is
 //! structural instead: **`main.rs` constructs no config from `Default::default()`.** Everything
 //! goes through `quality_preset` or `manual_config`, and both ask `b_pyramid_enabled()`.
+//!
+//! The same invariant now covers the **inter dead zone** (INTER-2, `docs/decisions/0041`), which
+//! had the identical shape before it was consolidated: `GNC_INTER_DZ_MUL ... unwrap_or(2.0)`
+//! written out at three separate sites in `sequence.rs` — the P-frame path and two B-frame
+//! paths. Changing the default at two of three would have been a silent, frame-type-dependent
+//! quantiser difference, which is BUG-16 all over again.
 
 use std::path::Path;
 
@@ -82,5 +88,65 @@ fn the_library_default_still_permits_b_frames() {
         gnc::CodecConfig::default().b_pyramid,
         "CodecConfig::default() must keep b_pyramid = true (do not veto); the shipped veto \
          belongs in b_pyramid_enabled(), which quality_preset() and manual_config() apply"
+    );
+}
+
+/// The inter dead-zone factor must have exactly one source, and it must be 1.0.
+///
+/// 2.0 was the shipped value until 2026-09-08 and measured as the wrong number: BD-rate on PSNR
+/// −4.77% mean for 1.0 across three sequences on a 4-rung ladder, with worst-frame PSNR — the
+/// contribution metric — better at 12 of 12 points. 1.0 beats both neighbours (1.5 gives −2.82%,
+/// 0.0 gives +2.25% and is *worse* than shipped on animation), so the optimum is bracketed.
+#[test]
+fn the_inter_dead_zone_has_one_source_and_it_is_one() {
+    assert_eq!(
+        gnc::inter_dead_zone_mul(),
+        1.0,
+        "the inter dead zone is the intra dead zone (INTER-2); 2.0 measured worse on every \
+         sequence and at every worst-frame point"
+    );
+
+    // No site may re-read the variable. Three inline copies is what this replaced.
+    let seq = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/encoder/sequence.rs");
+    let text = std::fs::read_to_string(&seq).expect("read sequence.rs");
+    let offenders: Vec<String> = text
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| l.contains("GNC_INTER_DZ_MUL"))
+        .map(|(i, l)| format!("src/encoder/sequence.rs:{}: {}", i + 1, l.trim()))
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "the inter dead-zone factor must come from gnc::inter_dead_zone_mul(), not from a second \
+         read of the environment — it lived at three sites before INTER-2. Offenders:\n  {}",
+        offenders.join("\n  ")
+    );
+}
+
+/// A dead zone of 0.5 or less is arithmetically a no-op, which is why this change stops at q~88.
+///
+/// GNC quantises as `floor(|v|/step + 0.5)` *after* a `|v| < dz*step` test, so for `dz <= 0.5`
+/// the test only zeroes values the rounding would have zeroed anyway. This is the property the
+/// whole q-boundary argument rests on, and it is cheap to assert directly rather than trust.
+#[test]
+fn a_dead_zone_of_half_a_step_changes_nothing() {
+    let step = 2.8_f32;
+    for i in 0..4000 {
+        let v = i as f32 * step / 1000.0;
+        let plain = (v / step + 0.5).floor();
+        for dz in [0.0_f32, 0.25, 0.5] {
+            let gated = if v < dz * step { 0.0 } else { (v / step + 0.5).floor() };
+            assert_eq!(
+                gated, plain,
+                "dz={dz} changed the quantiser at |v|={v}: {gated} vs {plain}"
+            );
+        }
+    }
+    // And 0.75 — the anchor value at q<=75 — genuinely is not a no-op, or the item is vacuous.
+    let v = 0.6 * step;
+    assert_ne!(
+        if v < 0.75 * step { 0.0 } else { (v / step + 0.5).floor() },
+        (v / step + 0.5).floor(),
+        "dz=0.75 should zero a value the plain quantiser keeps"
     );
 }

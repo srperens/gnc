@@ -94,8 +94,7 @@ impl Module {
     fn workgroup_variables(&self) -> usize {
         self.instructions()
             .filter(|(opcode, operands)| {
-                *opcode == op::VARIABLE
-                    && operands.get(2).copied() == Some(STORAGE_CLASS_WORKGROUP)
+                *opcode == op::VARIABLE && operands.get(2).copied() == Some(STORAGE_CLASS_WORKGROUP)
             })
             .count()
     }
@@ -261,8 +260,9 @@ fn source_barrier_count(path: &Path) -> usize {
         .map(|s| {
             s.lines()
                 .filter(|l| !l.trim_start().starts_with("//"))
-                .map(|l| l.matches("workgroupBarrier()").count()
-                    + l.matches("storageBarrier()").count())
+                .map(|l| {
+                    l.matches("workgroupBarrier()").count() + l.matches("storageBarrier()").count()
+                })
                 .sum()
         })
         .unwrap_or(0)

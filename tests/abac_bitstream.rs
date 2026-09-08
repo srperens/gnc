@@ -10,8 +10,8 @@
 //! Synthesises its own images so these run without test material.
 
 use gnc::decoder::pipeline::DecoderPipeline;
-use gnc::encoder::pipeline::EncoderPipeline;
 use gnc::encoder::abac::Coder;
+use gnc::encoder::pipeline::EncoderPipeline;
 use gnc::{ChromaFormat, EntropyCoder, EntropyData, GpuContext};
 use std::sync::OnceLock;
 
@@ -31,7 +31,11 @@ fn synth_image(w: u32, h: u32) -> Vec<f32> {
             rng ^= rng >> 17;
             rng ^= rng << 5;
             let noise = (rng % 24) as f32 - 12.0;
-            let fine = if ((x / 2) + (y / 3)) % 2 == 0 { 18.0 } else { 0.0 };
+            let fine = if ((x / 2) + (y / 3)) % 2 == 0 {
+                18.0
+            } else {
+                0.0
+            };
             let coarse = ((x / 40) * 37 % 200) as f32;
             let ramp = y as f32 / h as f32 * 120.0;
             let r = (coarse + ramp + fine + noise).clamp(0.0, 255.0).round();
@@ -60,7 +64,8 @@ fn roundtrip(
     let bytes = gnc::format::serialize_compressed(&compressed);
     let back = gnc::format::deserialize_compressed(&bytes);
     assert!(
-        matches!(back.entropy, EntropyData::Abac(_)) == matches!(compressed.entropy, EntropyData::Abac(_)),
+        matches!(back.entropy, EntropyData::Abac(_))
+            == matches!(compressed.entropy, EntropyData::Abac(_)),
         "the container changed which entropy coder the frame uses"
     );
     (decoder.decode(ctx, &back), bytes.len())
@@ -127,7 +132,10 @@ fn abac_frames_are_gp19_and_carry_entropy_type_5() {
     assert_eq!(tiles.len(), 3, "256x256 at tile 256 is one tile per plane");
     for t in tiles {
         assert_eq!(t.tile_size, config.tile_size);
-        assert!(!t.block_lengths.is_empty(), "a tile with no blocks decodes to nothing");
+        assert!(
+            !t.block_lengths.is_empty(),
+            "a tile with no blocks decodes to nothing"
+        );
         assert_eq!(
             t.block_data.len(),
             t.block_lengths.iter().sum::<u32>() as usize,
@@ -170,7 +178,10 @@ fn abac_handles_subsampled_chroma() {
             .zip(px_abac.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
-        assert_eq!(worst, 0.0, "{fmt:?}: abac and Rice decoded different pixels");
+        assert_eq!(
+            worst, 0.0,
+            "{fmt:?}: abac and Rice decoded different pixels"
+        );
     }
 }
 
@@ -196,7 +207,10 @@ fn both_arithmetic_engines_roundtrip_through_the_container() {
     for engine in [Coder::Range, Coder::Interval] {
         config.abac_coder = engine;
         let (px, size) = roundtrip(ctx, &img, w, h, &config);
-        assert!(px.iter().all(|v| v.is_finite()), "{engine:?}: decoded NaN or inf");
+        assert!(
+            px.iter().all(|v| v.is_finite()),
+            "{engine:?}: decoded NaN or inf"
+        );
         sizes.push((engine, px, size));
     }
 

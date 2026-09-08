@@ -221,7 +221,10 @@ impl RateController {
         self.frame_count += n_frames as u64;
 
         // Add ONE representative sample to avoid degenerate R-Q regression.
-        let sample = RqSample { qstep, bpp: avg_bpp };
+        let sample = RqSample {
+            qstep,
+            bpp: avg_bpp,
+        };
         self.history.push(sample);
         if self.history.len() > self.max_history {
             self.history.remove(0);

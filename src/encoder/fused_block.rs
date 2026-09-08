@@ -81,21 +81,19 @@ impl FusedBlock {
                     ],
                 });
 
-        let pipeline_layout =
-            ctx.device
-                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("fused_block_pl"),
-                    bind_group_layouts: &[&bind_group_layout],
-                    push_constant_ranges: &[],
-                });
+        let pipeline_layout = ctx
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("fused_block_pl"),
+                bind_group_layouts: &[&bind_group_layout],
+                push_constant_ranges: &[],
+            });
 
         let shader = ctx
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("dct8_fused"),
-                source: wgpu::ShaderSource::Wgsl(
-                    include_str!("../shaders/dct8_fused.wgsl").into(),
-                ),
+                source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/dct8_fused.wgsl").into()),
             });
 
         let pipeline = ctx

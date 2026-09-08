@@ -39,8 +39,8 @@ use super::abac_init_diag;
 
 /// Stripe widths ENT-8 step 1 prices, in columns. 2 is BPC-PaCo's own and the most parallel.
 const LOCKSTEP_WIDTHS: [usize; 3] = [2, 4, 8];
-use super::bpc_paco_diag::{self, BpcStats, BpcTable};
 use super::abac_tile::{abac_decode_tile, band_name, code_blocks_banded, AbacTile};
+use super::bpc_paco_diag::{self, BpcStats, BpcTable};
 
 /// Binary counts for one adaptive context: how many decisions, how many of them were 1.
 #[derive(Default, Clone, Copy)]
@@ -282,8 +282,16 @@ fn accumulate_block(st: &mut BandStats, coefficients: &[i32], width: usize) {
 
             // --- the richer bounds, on the same causal information ---
             let (rc, bc) = rich_context(&mag, width, y, x);
-            *st.rich.entry(rc).or_default().entry(i64::from(a)).or_insert(0) += 1;
-            *st.big.entry(bc).or_default().entry(i64::from(a)).or_insert(0) += 1;
+            *st.rich
+                .entry(rc)
+                .or_default()
+                .entry(i64::from(a))
+                .or_insert(0) += 1;
+            *st.big
+                .entry(bc)
+                .or_default()
+                .entry(i64::from(a))
+                .or_insert(0) += 1;
 
             mag[y * width + x] = a;
         }
@@ -312,7 +320,11 @@ pub fn run(tiles: &[AbacTile], plane_tile_counts: [usize; 3], qstep: f32) {
     }
     let num_levels = tiles[0].num_levels;
     let cb = tiles[0].cb_size as usize;
-    let nbands = if num_levels == 0 { 1 } else { 1 + 3 * num_levels as usize };
+    let nbands = if num_levels == 0 {
+        1
+    } else {
+        1 + 3 * num_levels as usize
+    };
     eprintln!(
         "[coef-entropy] GNC_COEF_ENTROPY active: qstep={qstep}, {} tiles, tile {}px, {num_levels} \
          levels, cb {cb}px, coder {:?}",
@@ -363,8 +375,17 @@ pub fn run(tiles: &[AbacTile], plane_tile_counts: [usize; 3], qstep: f32) {
 
     eprintln!(
         "  {:>5} {:>5} {:>10} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>8} {:>8}",
-        "plane", "band", "coeffs", "shipped B", "H0 B", "Hctx B", "Hnb B", "Hnb0 B", "Hbig B",
-        "vs Hnb", "vs Hbig"
+        "plane",
+        "band",
+        "coeffs",
+        "shipped B",
+        "H0 B",
+        "Hctx B",
+        "Hnb B",
+        "Hnb0 B",
+        "Hbig B",
+        "vs Hnb",
+        "vs Hbig"
     );
     let mut t = [0.0f64; 6];
     let mut t_n = 0u64;
@@ -409,7 +430,13 @@ pub fn run(tiles: &[AbacTile], plane_tile_counts: [usize; 3], qstep: f32) {
         eprintln!(
             "  {plane:>5} {:>5} {pcnt:>10} {:>11.0} {:>11.0} {:>11.0} {:>11.0} {:>11.0} \
              {:>11.0} {:>+7.1}% {:>+7.1}%",
-            "ALL", pt[0], pt[1], pt[2], pt[3], pt[4], pt[5],
+            "ALL",
+            pt[0],
+            pt[1],
+            pt[2],
+            pt[3],
+            pt[4],
+            pt[5],
             (pt[0] / pt[3].max(1e-9) - 1.0) * 100.0,
             (pt[0] / pt[5].max(1e-9) - 1.0) * 100.0,
         );
@@ -421,7 +448,14 @@ pub fn run(tiles: &[AbacTile], plane_tile_counts: [usize; 3], qstep: f32) {
     eprintln!(
         "  {:>5} {:>5} {t_n:>10} {:>11.0} {:>11.0} {:>11.0} {:>11.0} {:>11.0} {:>11.0} \
          {:>+7.1}% {:>+7.1}%",
-        "TOTAL", "", t[0], t[1], t[2], t[3], t[4], t[5],
+        "TOTAL",
+        "",
+        t[0],
+        t[1],
+        t[2],
+        t[3],
+        t[4],
+        t[5],
         (t[0] / t[3].max(1e-9) - 1.0) * 100.0,
         (t[0] / t[5].max(1e-9) - 1.0) * 100.0,
     );
@@ -454,17 +488,23 @@ pub fn run(tiles: &[AbacTile], plane_tile_counts: [usize; 3], qstep: f32) {
         let coded: f64 = dec.iter().sum();
         let hctx = coded + eg + sign;
         let pc = |x: f64| 100.0 * x / hctx.max(1e-9);
-        eprintln!(
-            "  --- ENT-9 step 1: which symbols abac gives a context, as a share of Hctx ---"
-        );
+        eprintln!("  --- ENT-9 step 1: which symbols abac gives a context, as a share of Hctx ---");
         eprintln!(
             "    context-coded  significant {:>11.0} b ({:>5.1}%)  >1 {:>11.0} b ({:>5.1}%)  \
 >2 {:>11.0} b ({:>5.1}%)",
-            dec[0], pc(dec[0]), dec[1], pc(dec[1]), dec[2], pc(dec[2])
+            dec[0],
+            pc(dec[0]),
+            dec[1],
+            pc(dec[1]),
+            dec[2],
+            pc(dec[2])
         );
         eprintln!(
             "    bypassed       Exp-Golomb  {:>11.0} b ({:>5.1}%)  sign {:>9.0} b ({:>5.1}%)",
-            eg, pc(eg), sign, pc(sign)
+            eg,
+            pc(eg),
+            sign,
+            pc(sign)
         );
         eprintln!(
             "    => coded {:.1}% of Hctx, bypassed {:.1}% — the bypass share is the ceiling on \
@@ -491,12 +531,16 @@ any context added to the three decisions (ENT-9)",
         eprintln!(
             "    candidate A, context the Exp-Golomb unary prefix (6x4 ctx): {:.0} of {:.0} \
 prefix bits modelled  =>  {:+.2}% of Hctx",
-            prefix_modelled, prefix_n, -pc(win_a)
+            prefix_modelled,
+            prefix_n,
+            -pc(win_a)
         );
         eprintln!(
             "    candidate B, context the sign on left/up signs (3x3 ctx):  {:.0} of {:.0} \
 sign bits modelled  =>  {:+.2}% of Hctx",
-            sign_modelled, sign, -pc(win_b)
+            sign_modelled,
+            sign,
+            -pc(win_b)
         );
         eprintln!(
             "    => ENT-9 gate is >=2% of total rate at q=99 on >=3 sequences; A+B bound \
@@ -511,7 +555,12 @@ sign bits modelled  =>  {:+.2}% of Hctx",
     // because the table cannot be known until the first walk has finished.
     let warm: Vec<Vec<Vec<u32>>> = stats
         .iter()
-        .map(|bands| bands.iter().map(|st| abac_init_diag::warm_init(&st.ctx)).collect())
+        .map(|bands| {
+            bands
+                .iter()
+                .map(|st| abac_init_diag::warm_init(&st.ctx))
+                .collect()
+        })
         .collect();
     let cold = abac_init_diag::cold_init();
     // ENT-6 candidate 2: stop cutting code-blocks on subband boundaries below `cb`. At tile 256
@@ -645,16 +694,21 @@ sign bits modelled  =>  {:+.2}% of Hctx",
 /// somewhere else, which is what a stationary coder actually ships.
 fn bpc_paco_table(stats: &[Vec<BandStats>], planes: &[&str; 3], num_levels: u32) {
     let table = match std::env::var("GNC_BPC_TABLE") {
-        Ok(path) => match BpcTable::load(&path) {
-            Ok(t) => {
-                eprintln!("[coef-entropy] BPC-PaCo fixed table loaded from {}", t.source);
-                Some(t)
+        Ok(path) => {
+            match BpcTable::load(&path) {
+                Ok(t) => {
+                    eprintln!(
+                        "[coef-entropy] BPC-PaCo fixed table loaded from {}",
+                        t.source
+                    );
+                    Some(t)
+                }
+                Err(e) => {
+                    eprintln!("[coef-entropy] WARNING: GNC_BPC_TABLE={path} unreadable ({e}); Hbpcf omitted");
+                    None
+                }
             }
-            Err(e) => {
-                eprintln!("[coef-entropy] WARNING: GNC_BPC_TABLE={path} unreadable ({e}); Hbpcf omitted");
-                None
-            }
-        },
+        }
         Err(_) => None,
     };
 
@@ -664,8 +718,17 @@ fn bpc_paco_table(stats: &[Vec<BandStats>], planes: &[&str; 3], num_levels: u32)
     );
     eprintln!(
         "  {:>5} {:>5} {:>11} {:>11} {:>11} {:>11} {:>11} {:>9} {:>9} {:>9} {:>7}",
-        "plane", "band", "shipped B", "Hctx B", "Hbpc B", "Hbpcn B", "Hbpcf B", "flw B",
-        "bpc/ctx", "+flw/ctx", "miss%"
+        "plane",
+        "band",
+        "shipped B",
+        "Hctx B",
+        "Hbpc B",
+        "Hbpcn B",
+        "Hbpcf B",
+        "flw B",
+        "bpc/ctx",
+        "+flw/ctx",
+        "miss%"
     );
 
     let mut t = [0.0f64; 6];
@@ -715,7 +778,13 @@ fn bpc_paco_table(stats: &[Vec<BandStats>], planes: &[&str; 3], num_levels: u32)
         eprintln!(
             "  {plane:>5} {:>5} {:>11.0} {:>11.0} {:>11.0} {:>11.0} {:>11.0} {:>9.0} \
              {:>+8.1}% {:>+8.1}% {:>6.2}%",
-            "ALL", pt[0], pt[1], pt[2], pt[3], pt[4], pt[5],
+            "ALL",
+            pt[0],
+            pt[1],
+            pt[2],
+            pt[3],
+            pt[4],
+            pt[5],
             (pt[2] / pt[1].max(1e-9) - 1.0) * 100.0,
             ((pt[2] + pt[5]) / pt[1].max(1e-9) - 1.0) * 100.0,
             pmiss.0 as f64 / pmiss.1.max(1) as f64 * 100.0,
@@ -728,7 +797,14 @@ fn bpc_paco_table(stats: &[Vec<BandStats>], planes: &[&str; 3], num_levels: u32)
     eprintln!(
         "  {:>5} {:>5} {:>11.0} {:>11.0} {:>11.0} {:>11.0} {:>11.0} {:>9.0} {:>+8.1}% \
          {:>+8.1}% {:>6.2}%",
-        "TOTAL", "", t[0], t[1], t[2], t[3], t[4], t[5],
+        "TOTAL",
+        "",
+        t[0],
+        t[1],
+        t[2],
+        t[3],
+        t[4],
+        t[5],
         (t[2] / t[1].max(1e-9) - 1.0) * 100.0,
         ((t[2] + t[5]) / t[1].max(1e-9) - 1.0) * 100.0,
         t_miss.0 as f64 / t_miss.1.max(1) as f64 * 100.0,
@@ -745,8 +821,10 @@ fn bpc_paco_table(stats: &[Vec<BandStats>], planes: &[&str; 3], num_levels: u32)
     );
 
     if let Ok(path) = std::env::var("GNC_BPC_DUMP") {
-        let bpc: Vec<Vec<BpcStats>> =
-            stats.iter().map(|b| b.iter().map(|st| st.bpc.clone()).collect()).collect();
+        let bpc: Vec<Vec<BpcStats>> = stats
+            .iter()
+            .map(|b| b.iter().map(|st| st.bpc.clone()).collect())
+            .collect();
         match std::fs::write(&path, bpc_paco_diag::dump(&bpc)) {
             Ok(()) => eprintln!("[coef-entropy] BPC-PaCo context counts written to {path}"),
             Err(e) => eprintln!("[coef-entropy] WARNING: GNC_BPC_DUMP={path} not written: {e}"),
@@ -773,8 +851,16 @@ fn abac_init_table(
     );
     eprintln!(
         "  {:>5} {:>5} {:>11} {:>11} {:>11} {:>11} {:>7} {:>9} {:>9} {:>9}",
-        "plane", "band", "shipped B", "Ahalf B", "Awarm B", "Alock B", "hdr B", "canary",
-        "warm win", "lockstep"
+        "plane",
+        "band",
+        "shipped B",
+        "Ahalf B",
+        "Awarm B",
+        "Alock B",
+        "hdr B",
+        "canary",
+        "warm win",
+        "lockstep"
     );
     let mut t = [0.0f64; 5];
     let mut t_lock = [0.0f64; LOCKSTEP_WIDTHS.len()];
@@ -819,7 +905,12 @@ fn abac_init_table(
         eprintln!(
             "  {plane:>5} {:>5} {:>11.0} {:>11.0} {:>11.0} {:>11.0} {:>7.0} {:>+8.2}% \
              {:>+8.2}% {:>+8.2}%",
-            "ALL", pt[0], pt[1], pt[2], pt[4], pt[3],
+            "ALL",
+            pt[0],
+            pt[1],
+            pt[2],
+            pt[4],
+            pt[3],
             (pt[1] / pt[0].max(1e-9) - 1.0) * 100.0,
             ((pt[2] + pt[3]) / pt[0].max(1e-9) - 1.0) * 100.0,
             (pt[4] / pt[1].max(1e-9) - 1.0) * 100.0,
@@ -831,7 +922,13 @@ fn abac_init_table(
     eprintln!(
         "  {:>5} {:>5} {:>11.0} {:>11.0} {:>11.0} {:>11.0} {:>7.0} {:>+8.2}% {:>+8.2}% \
          {:>+8.2}%",
-        "TOTAL", "", t[0], t[1], t[2], t[4], t[3],
+        "TOTAL",
+        "",
+        t[0],
+        t[1],
+        t[2],
+        t[4],
+        t[3],
         (t[1] / t[0].max(1e-9) - 1.0) * 100.0,
         ((t[2] + t[3]) / t[0].max(1e-9) - 1.0) * 100.0,
         (t[4] / t[1].max(1e-9) - 1.0) * 100.0,
@@ -909,15 +1006,18 @@ fn abac_init_table(
 /// starting; if it evaporates, ENT-9 closes here and cheaply.
 fn prefix_ctx_summary(stats: &[Vec<BandStats>]) {
     let (cold, prefix, len_bytes, shipped, blocks) =
-        stats.iter().flatten().fold((0.0, 0.0, 0.0, 0.0, 0u64), |(c, p, l, s, n), st| {
-            (
-                c + st.adapt_cold,
-                p + st.adapt_prefix,
-                l + (st.shipped_bytes - st.payload_bytes),
-                s + st.shipped_bytes,
-                n + st.blocks,
-            )
-        });
+        stats
+            .iter()
+            .flatten()
+            .fold((0.0, 0.0, 0.0, 0.0, 0u64), |(c, p, l, s, n), st| {
+                (
+                    c + st.adapt_cold,
+                    p + st.adapt_prefix,
+                    l + (st.shipped_bytes - st.payload_bytes),
+                    s + st.shipped_bytes,
+                    n + st.blocks,
+                )
+            });
     if blocks == 0 || cold <= 0.0 {
         return;
     }
@@ -950,26 +1050,25 @@ fn merged_blocks_summary(
     merged_blocks: u64,
     merged_len_bytes: f64,
 ) {
-    let (banded_cold, banded_warm, banded_len, banded_blocks) = stats.iter().flatten().fold(
-        (0.0, 0.0, 0.0, 0u64),
-        |(c, w, l, n), st| {
-            (
-                c + st.adapt_cold,
-                w + st.adapt_warm,
-                l + (st.shipped_bytes - st.payload_bytes),
-                n + st.blocks,
-            )
-        },
-    );
+    let (banded_cold, banded_warm, banded_len, banded_blocks) =
+        stats
+            .iter()
+            .flatten()
+            .fold((0.0, 0.0, 0.0, 0u64), |(c, w, l, n), st| {
+                (
+                    c + st.adapt_cold,
+                    w + st.adapt_warm,
+                    l + (st.shipped_bytes - st.payload_bytes),
+                    n + st.blocks,
+                )
+            });
     if banded_blocks == 0 || merged_blocks == 0 {
         return;
     }
     let banded_total = banded_cold / 8.0 + banded_len;
     let merged_total = merged[0] / 8.0 + merged_len_bytes;
     let merged_warm_total = merged[1] / 8.0 + merged_len_bytes + 3.0 * NUM_BUCKETS as f64 * 3.0;
-    eprintln!(
-        "  --- ENT-6 candidate 2: drop the subband-aligned code-block cut below cb ---"
-    );
+    eprintln!("  --- ENT-6 candidate 2: drop the subband-aligned code-block cut below cb ---");
     eprintln!(
         "  band-aligned: {banded_blocks} blocks, {:.0} B coder + {banded_len:.0} B length \
          fields = {banded_total:.0} B",

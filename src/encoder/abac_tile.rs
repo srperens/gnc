@@ -74,7 +74,11 @@ fn subbands(tile_size: usize, num_levels: u32) -> Vec<(usize, usize, usize, usiz
 /// statistics and different orientations, and the context model is built on the assumption that a
 /// block is homogeneous. Deep subbands smaller than `cb` become one short block each; at tile 256
 /// with 5 levels that is the 8×8 LL plus three 8×8 level-5 bands, 0.4% of the tile.
-pub fn code_blocks(tile_size: usize, num_levels: u32, cb: usize) -> Vec<(usize, usize, usize, usize)> {
+pub fn code_blocks(
+    tile_size: usize,
+    num_levels: u32,
+    cb: usize,
+) -> Vec<(usize, usize, usize, usize)> {
     code_blocks_banded(tile_size, num_levels, cb)
         .into_iter()
         .map(|(x, y, w, h, _)| (x, y, w, h))
@@ -370,7 +374,11 @@ mod tests {
             let blob = serialize_tile_abac(&tile);
             assert_eq!(blob.len(), tile.byte_size());
             let (back, consumed) = deserialize_tile_abac(&blob);
-            assert_eq!(consumed, blob.len(), "deserialiser must consume the whole blob");
+            assert_eq!(
+                consumed,
+                blob.len(),
+                "deserialiser must consume the whole blob"
+            );
             assert_eq!(back, tile);
             assert_eq!(abac_decode_tile(&back), coeffs);
         }

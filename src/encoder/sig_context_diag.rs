@@ -54,16 +54,21 @@ fn h_flat(n_sig: u64, n_total: u64) -> f64 {
 /// Conditional entropy H(sig | context) given the two context buckets.
 /// Weighted average: w0 * H(p0) + w1 * H(p1) where w = fraction of coeffs
 /// in that context bucket.
-fn h_conditional(
-    n_sig_c0: u64, n_total_c0: u64,
-    n_sig_c1: u64, n_total_c1: u64,
-) -> f64 {
+fn h_conditional(n_sig_c0: u64, n_total_c0: u64, n_sig_c1: u64, n_total_c1: u64) -> f64 {
     let n_total = n_total_c0 + n_total_c1;
     if n_total == 0 {
         return 0.0;
     }
-    let p0 = if n_total_c0 > 0 { n_sig_c0 as f64 / n_total_c0 as f64 } else { 0.0 };
-    let p1 = if n_total_c1 > 0 { n_sig_c1 as f64 / n_total_c1 as f64 } else { 0.0 };
+    let p0 = if n_total_c0 > 0 {
+        n_sig_c0 as f64 / n_total_c0 as f64
+    } else {
+        0.0
+    };
+    let p1 = if n_total_c1 > 0 {
+        n_sig_c1 as f64 / n_total_c1 as f64
+    } else {
+        0.0
+    };
     let w0 = n_total_c0 as f64 / n_total as f64;
     let w1 = n_total_c1 as f64 / n_total as f64;
     w0 * h2(p0) + w1 * h2(p1)
@@ -225,14 +230,23 @@ fn analyze_tile(
             Some((ax, ay)) => coeffs[ay as usize * ts + ax as usize] != 0.0,
         };
 
-        debug_assert!(group < stats.len(), "group {} out of range for {} stats entries", group, stats.len());
+        debug_assert!(
+            group < stats.len(),
+            "group {} out of range for {} stats entries",
+            group,
+            stats.len()
+        );
         let st = &mut stats[group];
         if above_sig {
             st.n_total_above_sig += 1;
-            if is_sig { st.n_sig_given_above_sig += 1; }
+            if is_sig {
+                st.n_sig_given_above_sig += 1;
+            }
         } else {
             st.n_total_above_zero += 1;
-            if is_sig { st.n_sig_given_above_zero += 1; }
+            if is_sig {
+                st.n_sig_given_above_zero += 1;
+            }
         }
 
         // --- Parent context (skip LL and deepest merged) ---
@@ -240,10 +254,14 @@ fn analyze_tile(
             let parent_sig = coeffs[py as usize * ts + px as usize] != 0.0;
             if parent_sig {
                 st.n_total_parent_sig += 1;
-                if is_sig { st.n_sig_given_parent_sig += 1; }
+                if is_sig {
+                    st.n_sig_given_parent_sig += 1;
+                }
             } else {
                 st.n_total_parent_zero += 1;
-                if is_sig { st.n_sig_given_parent_zero += 1; }
+                if is_sig {
+                    st.n_sig_given_parent_zero += 1;
+                }
             }
         }
     }
@@ -296,26 +314,40 @@ fn analyze_plane(
 }
 
 /// Print the diagnostic table to stderr.
-fn print_table(plane_label: &str, stats: &[SubbandContextStats], padded_w: u32, padded_h: u32, tile_size: u32) {
+fn print_table(
+    plane_label: &str,
+    stats: &[SubbandContextStats],
+    padded_w: u32,
+    padded_h: u32,
+    tile_size: u32,
+) {
     let total_pixels = (padded_w * padded_h) as f64;
 
     // Aggregate across all groups
     let mut agg_n_sig = 0u64;
     let mut agg_n_total = 0u64;
-    let mut agg_above_sig_c0 = 0u64; let mut agg_above_total_c0 = 0u64;
-    let mut agg_above_sig_c1 = 0u64; let mut agg_above_total_c1 = 0u64;
-    let mut agg_parent_sig_c0 = 0u64; let mut agg_parent_total_c0 = 0u64;
-    let mut agg_parent_sig_c1 = 0u64; let mut agg_parent_total_c1 = 0u64;
+    let mut agg_above_sig_c0 = 0u64;
+    let mut agg_above_total_c0 = 0u64;
+    let mut agg_above_sig_c1 = 0u64;
+    let mut agg_above_total_c1 = 0u64;
+    let mut agg_parent_sig_c0 = 0u64;
+    let mut agg_parent_total_c0 = 0u64;
+    let mut agg_parent_sig_c1 = 0u64;
+    let mut agg_parent_total_c1 = 0u64;
 
     for st in stats {
         let n_total = st.n_total_above_sig + st.n_total_above_zero;
         let n_sig = st.n_sig_given_above_sig + st.n_sig_given_above_zero;
         agg_n_sig += n_sig;
         agg_n_total += n_total;
-        agg_above_sig_c0 += st.n_sig_given_above_zero; agg_above_total_c0 += st.n_total_above_zero;
-        agg_above_sig_c1 += st.n_sig_given_above_sig;  agg_above_total_c1 += st.n_total_above_sig;
-        agg_parent_sig_c0 += st.n_sig_given_parent_zero; agg_parent_total_c0 += st.n_total_parent_zero;
-        agg_parent_sig_c1 += st.n_sig_given_parent_sig;  agg_parent_total_c1 += st.n_total_parent_sig;
+        agg_above_sig_c0 += st.n_sig_given_above_zero;
+        agg_above_total_c0 += st.n_total_above_zero;
+        agg_above_sig_c1 += st.n_sig_given_above_sig;
+        agg_above_total_c1 += st.n_total_above_sig;
+        agg_parent_sig_c0 += st.n_sig_given_parent_zero;
+        agg_parent_total_c0 += st.n_total_parent_zero;
+        agg_parent_sig_c1 += st.n_sig_given_parent_sig;
+        agg_parent_total_c1 += st.n_total_parent_sig;
     }
 
     eprintln!();
@@ -336,16 +368,20 @@ fn print_table(plane_label: &str, stats: &[SubbandContextStats], padded_w: u32, 
         let h_flat = h_flat(n_sig, n_total);
 
         let h_above = h_conditional(
-            st.n_sig_given_above_zero, st.n_total_above_zero,
-            st.n_sig_given_above_sig, st.n_total_above_sig,
+            st.n_sig_given_above_zero,
+            st.n_total_above_zero,
+            st.n_sig_given_above_sig,
+            st.n_total_above_sig,
         );
         let gain_above = h_flat - h_above;
 
         let has_parent = st.n_total_parent_sig + st.n_total_parent_zero > 0;
         let (h_parent_str, gain_parent_str) = if has_parent {
             let h_p = h_conditional(
-                st.n_sig_given_parent_zero, st.n_total_parent_zero,
-                st.n_sig_given_parent_sig, st.n_total_parent_sig,
+                st.n_sig_given_parent_zero,
+                st.n_total_parent_zero,
+                st.n_sig_given_parent_sig,
+                st.n_total_parent_sig,
             );
             let gain_p = h_flat - h_p;
             (format!("{:.4}", h_p), format!("{:+.4}", gain_p))
@@ -355,14 +391,7 @@ fn print_table(plane_label: &str, stats: &[SubbandContextStats], padded_w: u32, 
 
         eprintln!(
             "{:<18} | {:>8} | {:>6.3} | {:>7.4} | {:>7.4} | {} | {:>+10.4} | {}",
-            st.label,
-            n_total,
-            f_sig,
-            h_flat,
-            h_above,
-            h_parent_str,
-            gain_above,
-            gain_parent_str,
+            st.label, n_total, f_sig, h_flat, h_above, h_parent_str, gain_above, gain_parent_str,
         );
     }
 
@@ -372,11 +401,21 @@ fn print_table(plane_label: &str, stats: &[SubbandContextStats], padded_w: u32, 
     if agg_n_total > 0 {
         let agg_f_sig = agg_n_sig as f64 / agg_n_total as f64;
         let agg_h_flat = h_flat(agg_n_sig, agg_n_total);
-        let agg_h_above = h_conditional(agg_above_sig_c0, agg_above_total_c0, agg_above_sig_c1, agg_above_total_c1);
+        let agg_h_above = h_conditional(
+            agg_above_sig_c0,
+            agg_above_total_c0,
+            agg_above_sig_c1,
+            agg_above_total_c1,
+        );
         let agg_gain_above = agg_h_flat - agg_h_above;
         let agg_has_parent = agg_parent_total_c0 + agg_parent_total_c1 > 0;
         let (agg_h_parent_str, agg_gain_parent_str) = if agg_has_parent {
-            let h_p = h_conditional(agg_parent_sig_c0, agg_parent_total_c0, agg_parent_sig_c1, agg_parent_total_c1);
+            let h_p = h_conditional(
+                agg_parent_sig_c0,
+                agg_parent_total_c0,
+                agg_parent_sig_c1,
+                agg_parent_total_c1,
+            );
             let gain_p = agg_h_flat - h_p;
             (format!("{:.4}", h_p), format!("{:+.4}", gain_p))
         } else {
@@ -401,7 +440,12 @@ fn print_table(plane_label: &str, stats: &[SubbandContextStats], padded_w: u32, 
         let sig_bits_per_pixel = agg_n_total as f64 / total_pixels;
         let bpp_gain_above = agg_gain_above * sig_bits_per_pixel;
         let bpp_gain_parent = if agg_has_parent {
-            let h_p_val = h_conditional(agg_parent_sig_c0, agg_parent_total_c0, agg_parent_sig_c1, agg_parent_total_c1);
+            let h_p_val = h_conditional(
+                agg_parent_sig_c0,
+                agg_parent_total_c0,
+                agg_parent_sig_c1,
+                agg_parent_total_c1,
+            );
             (agg_h_flat - h_p_val) * sig_bits_per_pixel
         } else {
             0.0
@@ -410,8 +454,21 @@ fn print_table(plane_label: &str, stats: &[SubbandContextStats], padded_w: u32, 
         eprintln!();
         eprintln!(
             "  H_flat={:.4}  H_above={:.4}  H_parent={}  gain_above={:.4} bits/sig-check",
-            agg_h_flat, agg_h_above,
-            if agg_has_parent { format!("{:.4}", h_conditional(agg_parent_sig_c0, agg_parent_total_c0, agg_parent_sig_c1, agg_parent_total_c1)) } else { "N/A".to_string() },
+            agg_h_flat,
+            agg_h_above,
+            if agg_has_parent {
+                format!(
+                    "{:.4}",
+                    h_conditional(
+                        agg_parent_sig_c0,
+                        agg_parent_total_c0,
+                        agg_parent_sig_c1,
+                        agg_parent_total_c1
+                    )
+                )
+            } else {
+                "N/A".to_string()
+            },
             agg_gain_above,
         );
         eprintln!(

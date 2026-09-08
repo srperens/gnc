@@ -24,7 +24,11 @@ fn synth(w: u32, h: u32) -> Vec<f32> {
             rng ^= rng >> 17;
             rng ^= rng << 5;
             let n = (rng % 24) as f32 - 12.0;
-            let fine = if ((x / 2) + (y / 3)) % 2 == 0 { 18.0 } else { 0.0 };
+            let fine = if ((x / 2) + (y / 3)) % 2 == 0 {
+                18.0
+            } else {
+                0.0
+            };
             let coarse = ((x / 40) * 37 % 200) as f32;
             let ramp = y as f32 / h as f32 * 120.0;
             d.push((coarse + ramp + fine + n).clamp(0.0, 255.0).round());

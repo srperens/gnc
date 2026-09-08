@@ -229,11 +229,16 @@ pub fn run_shootout(
         let fwd_time = measure_gpu_time(ctx, iterations, || {
             let mut enc = ctx
                 .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("fwd"),
-                });
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("fwd") });
             block_transform.dispatch(
-                ctx, &mut enc, &input_buf, &output_buf, pad_w, pad_h, true, tt,
+                ctx,
+                &mut enc,
+                &input_buf,
+                &output_buf,
+                pad_w,
+                pad_h,
+                true,
+                tt,
             );
             ctx.queue.submit(Some(enc.finish()));
         });
@@ -242,11 +247,16 @@ pub fn run_shootout(
         let inv_time = measure_gpu_time(ctx, iterations, || {
             let mut enc = ctx
                 .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("inv"),
-                });
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("inv") });
             block_transform.dispatch(
-                ctx, &mut enc, &output_buf, &temp_buf, pad_w, pad_h, false, tt,
+                ctx,
+                &mut enc,
+                &output_buf,
+                &temp_buf,
+                pad_w,
+                pad_h,
+                false,
+                tt,
             );
             ctx.queue.submit(Some(enc.finish()));
         });
@@ -259,10 +269,24 @@ pub fn run_shootout(
                     label: Some("roundtrip"),
                 });
             block_transform.dispatch(
-                ctx, &mut enc, &input_buf, &output_buf, pad_w, pad_h, true, tt,
+                ctx,
+                &mut enc,
+                &input_buf,
+                &output_buf,
+                pad_w,
+                pad_h,
+                true,
+                tt,
             );
             block_transform.dispatch(
-                ctx, &mut enc, &output_buf, &temp_buf, pad_w, pad_h, false, tt,
+                ctx,
+                &mut enc,
+                &output_buf,
+                &temp_buf,
+                pad_w,
+                pad_h,
+                false,
+                tt,
             );
             ctx.queue.submit(Some(enc.finish()));
             ctx.device.poll(wgpu::Maintain::Wait);
@@ -279,7 +303,14 @@ pub fn run_shootout(
                 label: Some("fwd_rd"),
             });
         block_transform.dispatch(
-            ctx, &mut enc, &input_buf, &output_buf, pad_w, pad_h, true, tt,
+            ctx,
+            &mut enc,
+            &input_buf,
+            &output_buf,
+            pad_w,
+            pad_h,
+            true,
+            tt,
         );
         ctx.queue.submit(Some(enc.finish()));
         ctx.device.poll(wgpu::Maintain::Wait);
@@ -300,7 +331,14 @@ pub fn run_shootout(
                     label: Some("inv_rd"),
                 });
             block_transform.dispatch(
-                ctx, &mut enc, &output_buf, &temp_buf, pad_w, pad_h, false, tt,
+                ctx,
+                &mut enc,
+                &output_buf,
+                &temp_buf,
+                pad_w,
+                pad_h,
+                false,
+                tt,
             );
             ctx.queue.submit(Some(enc.finish()));
             ctx.device.poll(wgpu::Maintain::Wait);
@@ -482,10 +520,7 @@ pub fn print_results(results: &[TransformResult]) {
     // RD table per qstep
     if let Some(first) = results.first() {
         for (i, pt) in first.rd_points.iter().enumerate() {
-            println!(
-                "\n--- RD @ qstep={:.0} ---\n",
-                pt.qstep
-            );
+            println!("\n--- RD @ qstep={:.0} ---\n", pt.qstep);
             println!(
                 "{:<16} {:>10} {:>10} {:>12}",
                 "Transform", "PSNR(dB)", "NZ(%)", "BPP(est)"
@@ -542,11 +577,14 @@ pub fn run_fused_benchmark(
     println!("\n--- Fused pipeline (1 dispatch) ---");
 
     let fused_time = measure_gpu_time(ctx, iterations, || {
-        let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("fused"),
-        });
-        fused.dispatch(ctx, &mut enc, &input_buf, &quant_buf, &recon_buf,
-            pad_w, pad_h, 4.0, 0.5, 7.0);
+        let mut enc = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("fused"),
+            });
+        fused.dispatch(
+            ctx, &mut enc, &input_buf, &quant_buf, &recon_buf, pad_w, pad_h, 4.0, 0.5, 7.0,
+        );
         ctx.queue.submit(Some(enc.finish()));
     });
     println!("  Fused time: {:.3} ms (1 dispatch)", fused_time);
@@ -556,35 +594,62 @@ pub fn run_fused_benchmark(
     println!("\n--- Separate pipeline (3 dispatches) ---");
 
     let separate_time = measure_gpu_time(ctx, iterations, || {
-        let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("separate"),
-        });
+        let mut enc = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("separate"),
+            });
         // Forward DCT
-        block_transform.dispatch(ctx, &mut enc, &input_buf, &quant_buf,
-            pad_w, pad_h, true, BlockTransformType::DCT8);
+        block_transform.dispatch(
+            ctx,
+            &mut enc,
+            &input_buf,
+            &quant_buf,
+            pad_w,
+            pad_h,
+            true,
+            BlockTransformType::DCT8,
+        );
         // Note: in the real pipeline, quantize is another GPU dispatch.
         // Here we just show 2 dispatches (fwd + inv) as a lower bound.
         // The fused kernel also does quantize + dequantize + IDCT in one.
-        block_transform.dispatch(ctx, &mut enc, &quant_buf, &recon_buf,
-            pad_w, pad_h, false, BlockTransformType::DCT8);
+        block_transform.dispatch(
+            ctx,
+            &mut enc,
+            &quant_buf,
+            &recon_buf,
+            pad_w,
+            pad_h,
+            false,
+            BlockTransformType::DCT8,
+        );
         ctx.queue.submit(Some(enc.finish()));
     });
-    println!("  Separate time: {:.3} ms (2 dispatches, no quant)", separate_time);
+    println!(
+        "  Separate time: {:.3} ms (2 dispatches, no quant)",
+        separate_time
+    );
     println!("  Speedup: {:.2}x", separate_time / fused_time);
 
     // ---- RD comparison ----
     println!("\n--- RD Performance ---\n");
-    println!("{:<10} {:>10} {:>10} {:>12}", "qstep", "PSNR(dB)", "NZ(%)", "BPP(est)");
+    println!(
+        "{:<10} {:>10} {:>10} {:>12}",
+        "qstep", "PSNR(dB)", "NZ(%)", "BPP(est)"
+    );
     println!("{}", "-".repeat(46));
 
     for &qs in qsteps {
         // Run fused
         {
-            let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("fused_rd"),
-            });
-            fused.dispatch(ctx, &mut enc, &input_buf, &quant_buf, &recon_buf,
-                pad_w, pad_h, qs, 0.5, 7.0);
+            let mut enc = ctx
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("fused_rd"),
+                });
+            fused.dispatch(
+                ctx, &mut enc, &input_buf, &quant_buf, &recon_buf, pad_w, pad_h, qs, 0.5, 7.0,
+            );
             ctx.queue.submit(Some(enc.finish()));
             ctx.device.poll(wgpu::Maintain::Wait);
         }
@@ -596,16 +661,25 @@ pub fn run_fused_benchmark(
         let indices: Vec<i32> = quant_vals.iter().map(|&v| v as i32).collect();
         let (bpp, nz_frac) = estimate_bpp(&indices, total_px);
 
-        println!("{:<10.1} {:>10.2} {:>9.1}% {:>12.3}", qs, psnr, nz_frac * 100.0, bpp);
+        println!(
+            "{:<10.1} {:>10.2} {:>9.1}% {:>12.3}",
+            qs,
+            psnr,
+            nz_frac * 100.0,
+            bpp
+        );
     }
 
     // Verify roundtrip with near-lossless qstep
     {
-        let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("fused_rt"),
-        });
-        fused.dispatch(ctx, &mut enc, &input_buf, &quant_buf, &recon_buf,
-            pad_w, pad_h, 0.001, 0.0, 0.0);
+        let mut enc = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("fused_rt"),
+            });
+        fused.dispatch(
+            ctx, &mut enc, &input_buf, &quant_buf, &recon_buf, pad_w, pad_h, 0.001, 0.0, 0.0,
+        );
         ctx.queue.submit(Some(enc.finish()));
         ctx.device.poll(wgpu::Maintain::Wait);
 
@@ -694,12 +768,12 @@ fn cpu_haar_inverse_level(data: &mut [f32], stride: u32, size: u32) {
 /// CPU reference: full 2-level Haar forward (16×16 → level 0 → level 1 on 8×8 LL)
 fn cpu_haar_forward_2level(block: &mut [f32]) {
     cpu_haar_forward_level(block, 16, 16); // Level 0: full 16×16
-    cpu_haar_forward_level(block, 16, 8);  // Level 1: top-left 8×8
+    cpu_haar_forward_level(block, 16, 8); // Level 1: top-left 8×8
 }
 
 /// CPU reference: full 2-level Haar inverse
 fn cpu_haar_inverse_2level(block: &mut [f32]) {
-    cpu_haar_inverse_level(block, 16, 8);  // Level 1 inverse: top-left 8×8
+    cpu_haar_inverse_level(block, 16, 8); // Level 1 inverse: top-left 8×8
     cpu_haar_inverse_level(block, 16, 16); // Level 0 inverse: full 16×16
 }
 
@@ -723,12 +797,21 @@ pub fn diagnose_haar(ctx: &GpuContext) {
     // ===== Test 1-level roundtrip =====
     println!("  == 1-level Haar roundtrip ==");
     {
-        let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("haar_1l_fwd"),
-        });
+        let mut enc = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("haar_1l_fwd"),
+            });
         block_transform.dispatch_with_levels(
-            ctx, &mut enc, &input_buf, &output_buf, 16, 16, true,
-            BlockTransformType::HaarBlock, 1,
+            ctx,
+            &mut enc,
+            &input_buf,
+            &output_buf,
+            16,
+            16,
+            true,
+            BlockTransformType::HaarBlock,
+            1,
         );
         ctx.queue.submit(Some(enc.finish()));
         ctx.device.poll(wgpu::Maintain::Wait);
@@ -743,12 +826,21 @@ pub fn diagnose_haar(ctx: &GpuContext) {
 
     // 1-level inverse
     {
-        let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("haar_1l_inv"),
-        });
+        let mut enc = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("haar_1l_inv"),
+            });
         block_transform.dispatch_with_levels(
-            ctx, &mut enc, &output_buf, &inv_output_buf, 16, 16, false,
-            BlockTransformType::HaarBlock, 1,
+            ctx,
+            &mut enc,
+            &output_buf,
+            &inv_output_buf,
+            16,
+            16,
+            false,
+            BlockTransformType::HaarBlock,
+            1,
         );
         ctx.queue.submit(Some(enc.finish()));
         ctx.device.poll(wgpu::Maintain::Wait);
@@ -760,12 +852,21 @@ pub fn diagnose_haar(ctx: &GpuContext) {
     // ===== Test 2-level roundtrip =====
     println!("  == 2-level Haar roundtrip ==");
     {
-        let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("haar_2l_fwd"),
-        });
+        let mut enc = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("haar_2l_fwd"),
+            });
         block_transform.dispatch_with_levels(
-            ctx, &mut enc, &input_buf, &output_buf, 16, 16, true,
-            BlockTransformType::HaarBlock, 2,
+            ctx,
+            &mut enc,
+            &input_buf,
+            &output_buf,
+            16,
+            16,
+            true,
+            BlockTransformType::HaarBlock,
+            2,
         );
         ctx.queue.submit(Some(enc.finish()));
         ctx.device.poll(wgpu::Maintain::Wait);
@@ -779,12 +880,21 @@ pub fn diagnose_haar(ctx: &GpuContext) {
 
     // 2-level inverse
     {
-        let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("haar_2l_inv"),
-        });
+        let mut enc = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("haar_2l_inv"),
+            });
         block_transform.dispatch_with_levels(
-            ctx, &mut enc, &output_buf, &inv_output_buf, 16, 16, false,
-            BlockTransformType::HaarBlock, 2,
+            ctx,
+            &mut enc,
+            &output_buf,
+            &inv_output_buf,
+            16,
+            16,
+            false,
+            BlockTransformType::HaarBlock,
+            2,
         );
         ctx.queue.submit(Some(enc.finish()));
         ctx.device.poll(wgpu::Maintain::Wait);
@@ -803,7 +913,10 @@ pub fn diagnose_haar(ctx: &GpuContext) {
         let mut after_cpu_l1_inv = gpu_fwd_2l.clone();
         cpu_haar_inverse_level(&mut after_cpu_l1_inv, 16, 8);
         let l1_inv_diff = max_abs_diff(&after_cpu_l1_inv, &gpu_fwd_1l);
-        println!("    CPU L1-inv of 2L-fwd vs 1L-fwd max diff: {:.6}", l1_inv_diff);
+        println!(
+            "    CPU L1-inv of 2L-fwd vs 1L-fwd max diff: {:.6}",
+            l1_inv_diff
+        );
 
         // Now test: upload 2-level forward, run GPU inverse with levels=2
         // and compare with: CPU level-1-inverse followed by GPU level-0-inverse
@@ -815,12 +928,21 @@ pub fn diagnose_haar(ctx: &GpuContext) {
         dc_only[0] = 100.0; // LL2 DC
         let dc_buf = create_storage_buf(ctx, &dc_only);
         {
-            let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("haar_dc_inv"),
-            });
+            let mut enc = ctx
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("haar_dc_inv"),
+                });
             block_transform.dispatch_with_levels(
-                ctx, &mut enc, &dc_buf, &inv_output_buf, 16, 16, false,
-                BlockTransformType::HaarBlock, 2,
+                ctx,
+                &mut enc,
+                &dc_buf,
+                &inv_output_buf,
+                16,
+                16,
+                false,
+                BlockTransformType::HaarBlock,
+                2,
             );
             ctx.queue.submit(Some(enc.finish()));
             ctx.device.poll(wgpu::Maintain::Wait);
@@ -831,9 +953,18 @@ pub fn diagnose_haar(ctx: &GpuContext) {
         cpu_haar_inverse_2level(&mut cpu_dc_inv);
 
         println!("    DC-only inverse test:");
-        println!("      GPU[0,0]={:.4}, CPU[0,0]={:.4}", gpu_dc_inv[0], cpu_dc_inv[0]);
-        println!("      GPU[0,1]={:.4}, CPU[0,1]={:.4}", gpu_dc_inv[1], cpu_dc_inv[1]);
-        println!("      GPU[1,0]={:.4}, CPU[1,0]={:.4}", gpu_dc_inv[16], cpu_dc_inv[16]);
+        println!(
+            "      GPU[0,0]={:.4}, CPU[0,0]={:.4}",
+            gpu_dc_inv[0], cpu_dc_inv[0]
+        );
+        println!(
+            "      GPU[0,1]={:.4}, CPU[0,1]={:.4}",
+            gpu_dc_inv[1], cpu_dc_inv[1]
+        );
+        println!(
+            "      GPU[1,0]={:.4}, CPU[1,0]={:.4}",
+            gpu_dc_inv[16], cpu_dc_inv[16]
+        );
         let dc_inv_diff = max_abs_diff(&gpu_dc_inv, &cpu_dc_inv);
         println!("      Max diff: {:.6}", dc_inv_diff);
 
@@ -851,16 +982,24 @@ pub fn diagnose_haar(ctx: &GpuContext) {
     // Print first row of 2L results for visual inspection
     println!("\n  First row comparison (2-level):");
     print!("    Input:   ");
-    for val in test_input.iter().take(16) { print!("{:7.2} ", val); }
+    for val in test_input.iter().take(16) {
+        print!("{:7.2} ", val);
+    }
     println!();
     print!("    GPU fwd: ");
-    for val in gpu_fwd_2l.iter().take(16) { print!("{:7.2} ", val); }
+    for val in gpu_fwd_2l.iter().take(16) {
+        print!("{:7.2} ", val);
+    }
     println!();
     print!("    CPU fwd: ");
-    for val in cpu_fwd_2l.iter().take(16) { print!("{:7.2} ", val); }
+    for val in cpu_fwd_2l.iter().take(16) {
+        print!("{:7.2} ", val);
+    }
     println!();
     print!("    GPU inv: ");
-    for val in gpu_rt_2l.iter().take(16) { print!("{:7.2} ", val); }
+    for val in gpu_rt_2l.iter().take(16) {
+        print!("{:7.2} ", val);
+    }
     println!();
 
     // CPU roundtrip sanity check
@@ -871,5 +1010,8 @@ pub fn diagnose_haar(ctx: &GpuContext) {
 }
 
 fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max)
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max)
 }

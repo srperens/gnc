@@ -26,7 +26,9 @@ fn make_gradient(w: u32, h: u32) -> Vec<f32> {
         for x in 0..w {
             let r = (x as f32 / w as f32 * 255.0).round().clamp(0.0, 255.0);
             let g = (y as f32 / h as f32 * 255.0).round().clamp(0.0, 255.0);
-            let b = ((x + y) as f32 / (w + h) as f32 * 255.0).round().clamp(0.0, 255.0);
+            let b = ((x + y) as f32 / (w + h) as f32 * 255.0)
+                .round()
+                .clamp(0.0, 255.0);
             data.push(r);
             data.push(g);
             data.push(b);
@@ -198,7 +200,10 @@ fn conformance_a_dead_zone_cannot_defeat_lossless() {
     let decoder = DecoderPipeline::new(ctx);
 
     let clean = gnc::quality_preset(100);
-    assert_eq!(clean.dead_zone, 0.0, "q=100 is expected to carry no dead zone");
+    assert_eq!(
+        clean.dead_zone, 0.0,
+        "q=100 is expected to carry no dead zone"
+    );
 
     let mut spoiled = clean.clone();
     spoiled.dead_zone = 0.6;
@@ -207,7 +212,10 @@ fn conformance_a_dead_zone_cannot_defeat_lossless() {
         spoiled.dead_zone, 0.0,
         "normalisation must strip a dead zone from a lossless-intent config"
     );
-    assert!(spoiled.is_lossless(), "and the result must then report lossless");
+    assert!(
+        spoiled.is_lossless(),
+        "and the result must then report lossless"
+    );
 
     for (label, config) in [("q=100 preset", clean), ("dead zone forced on", spoiled)] {
         let encoded = encoder.encode(ctx, &img, 512, 512, &config);
@@ -280,7 +288,10 @@ fn lossless_normalisation_strips_weights_and_leaves_lossy_alone() {
     cfg.quantization_step = 1.0;
     cfg.wavelet_type = gnc::WaveletType::LeGall53;
     assert!(cfg.is_lossless());
-    let w = cfg.normalized_for_lossless().subband_weights.pack_weights_chroma();
+    let w = cfg
+        .normalized_for_lossless()
+        .subband_weights
+        .pack_weights_chroma();
     assert!(
         w.iter().all(|&v| v == 1.0),
         "lossless config still packs a non-unit quantiser weight: {w:?}"
@@ -291,7 +302,10 @@ fn lossless_normalisation_strips_weights_and_leaves_lossy_alone() {
     let lossy = gnc::quality_preset(90);
     assert!(!lossy.is_lossless());
     assert_eq!(
-        lossy.normalized_for_lossless().subband_weights.chroma_weight,
+        lossy
+            .normalized_for_lossless()
+            .subband_weights
+            .chroma_weight,
         lossy.subband_weights.chroma_weight,
         "normalisation must not touch a lossy config"
     );
@@ -302,7 +316,10 @@ fn lossless_normalisation_strips_weights_and_leaves_lossy_alone() {
 fn conformance_lossless_q100() {
     let img = make_gradient(512, 512);
     let (serialized, hash, psnr) = conformance_roundtrip("lossless", &img, 512, 512, 100);
-    assert!(psnr.is_infinite(), "Lossless mode should give infinite PSNR, got {psnr:.2}");
+    assert!(
+        psnr.is_infinite(),
+        "Lossless mode should give infinite PSNR, got {psnr:.2}"
+    );
 
     // Verify GP19 magic — see the note in conformance_gradient_q25.
     assert_eq!(&serialized[0..4], b"GP19");
@@ -418,10 +435,7 @@ fn conformance_corrupt_tile_recovery() {
     // Deserialize with validation — should detect corruption
     let mut result = format::deserialize_compressed_validated(&serialized);
     let corrupt_tiles = result.corrupt_tiles();
-    assert!(
-        !corrupt_tiles.is_empty(),
-        "CRC should detect corruption"
-    );
+    assert!(!corrupt_tiles.is_empty(), "CRC should detect corruption");
     eprintln!(
         "Detected {} corrupt tile(s): {:?}",
         corrupt_tiles.len(),
@@ -442,9 +456,15 @@ fn conformance_corrupt_tile_recovery() {
 
     // PSNR should be finite (not NaN or garbage)
     let psnr = quality::psnr(&img, &recovered, 255.0);
-    assert!(psnr.is_finite(), "Recovered frame PSNR should be finite, got {psnr}");
+    assert!(
+        psnr.is_finite(),
+        "Recovered frame PSNR should be finite, got {psnr}"
+    );
     // With only one corrupt tile substituted, PSNR should still be reasonable
-    eprintln!("Recovered frame PSNR={psnr:.2} dB (with {} tile(s) substituted)", substituted.len());
+    eprintln!(
+        "Recovered frame PSNR={psnr:.2} dB (with {} tile(s) substituted)",
+        substituted.len()
+    );
 }
 
 // ---- Generate conformance bitstreams (run with --ignored) ----
@@ -459,8 +479,20 @@ fn generate_conformance_bitstreams() {
     let test_cases: Vec<(&str, Vec<f32>, u32, u32, u32)> = vec![
         ("gradient_q25", make_gradient(512, 512), 512, 512, 25),
         ("gradient_q75", make_gradient(512, 512), 512, 512, 75),
-        ("checkerboard_q50", make_checkerboard(512, 512), 512, 512, 50),
-        ("checkerboard_q90", make_checkerboard(512, 512), 512, 512, 90),
+        (
+            "checkerboard_q50",
+            make_checkerboard(512, 512),
+            512,
+            512,
+            50,
+        ),
+        (
+            "checkerboard_q90",
+            make_checkerboard(512, 512),
+            512,
+            512,
+            90,
+        ),
         ("lossless_q100", make_gradient(512, 512), 512, 512, 100),
     ];
 

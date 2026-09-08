@@ -8,14 +8,18 @@
 //!
 //! Usage: `bug25_emit30 <shader.wgsl> <out.spv>`
 
-use naga30 as naga;
 use naga::back::spv;
 use naga::proc::{BoundsCheckPolicies, BoundsCheckPolicy};
+use naga30 as naga;
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let shader = args.next().expect("usage: bug25_emit30 <shader.wgsl> <out.spv>");
-    let out = args.next().expect("usage: bug25_emit30 <shader.wgsl> <out.spv>");
+    let shader = args
+        .next()
+        .expect("usage: bug25_emit30 <shader.wgsl> <out.spv>");
+    let out = args
+        .next()
+        .expect("usage: bug25_emit30 <shader.wgsl> <out.spv>");
 
     let src = std::fs::read_to_string(&shader).expect("read shader");
     let module = naga::front::wgsl::parse_str(&src).expect("wgsl parse");

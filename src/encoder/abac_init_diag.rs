@@ -36,7 +36,7 @@
 //! Read-only on data the encoder has already produced — it cannot move the bitstream
 //! (`docs/decisions/0010`).
 
-use super::abac::{bucket, neighbour_sum, Prob, PROB_ONE, NUM_BUCKETS};
+use super::abac::{bucket, neighbour_sum, Prob, NUM_BUCKETS, PROB_ONE};
 use super::coef_entropy_diag::BinCount;
 
 /// Contexts abac carries: one bucket set per binary decision.
@@ -147,12 +147,7 @@ pub(crate) fn adapt_bits(coefficients: &[i32], width: usize, init: &[u32]) -> f6
 /// (`k=2 +0.74%/+0.65%`, and the rest of that table) were taken on this binarisation, and they
 /// stay reproducible only while it does. For a model of what the coder does *now*, use
 /// [`adapt_bits_prefix_ctx`].
-pub(crate) fn adapt_bits_scan(
-    coefficients: &[i32],
-    width: usize,
-    init: &[u32],
-    scan: Scan,
-) -> f64 {
+pub(crate) fn adapt_bits_scan(coefficients: &[i32], width: usize, init: &[u32], scan: Scan) -> f64 {
     let height = coefficients.len() / width;
     let mut probs: Vec<Prob> = init.iter().map(|&p| Prob::from_p_zero(p)).collect();
     let mut mag = vec![0u32; coefficients.len()];
@@ -219,7 +214,12 @@ pub(crate) fn adapt_bits_prefix_ctx(coefficients: &[i32], width: usize, init: &[
                     // its own (bucket, position) context instead of at p = 1/2.
                     for i in 0..len {
                         let slot = (i as usize).min(3);
-                        code(&mut bits, &mut probs, base + slot * NUM_BUCKETS + ctx, i == len - 1);
+                        code(
+                            &mut bits,
+                            &mut probs,
+                            base + slot * NUM_BUCKETS + ctx,
+                            i == len - 1,
+                        );
                     }
                     // Mantissa: `len - 1` bypass bits, unchanged.
                     bits += f64::from(len - 1);
@@ -263,51 +263,59 @@ mod tests {
         // costs most: the ideal cost of the frequent symbol falls below what a quantised
         // probability can express, so the gap to `−log2 p` widens. Dense content hides it —
         // measured here at 8 bits per block dense against ~10x that at 1-in-64 density.
-        for &(w, h) in &[(8usize, 8usize), (16, 16), (32, 32), (64, 64), (64, 17), (5, 3)] {
+        for &(w, h) in &[
+            (8usize, 8usize),
+            (16, 16),
+            (32, 32),
+            (64, 64),
+            (64, 17),
+            (5, 3),
+        ] {
             for &spread in &[1i32, 7, 64, 1000] {
                 for &density in &[1usize, 4, 11, 64, 512] {
-                let coefficients: Vec<i32> = (0..w * h)
-                    .map(|i| {
-                        // Deterministic, structured, and not all one sign: a plausible subband.
-                        let v = ((i * 2654435761usize) % (spread as usize * 2 + 1)) as i32 - spread;
-                        if i % density != 1 % density.max(2) {
-                            0
-                        } else {
-                            v
-                        }
-                    })
-                    .collect();
-                // **The model must be of the *shipped* binarisation, which since ENT-9 is
-                // `adapt_bits_prefix_ctx`.** `adapt_bits` still models the pre-ENT-9 coder — it
-                // is ENT-8's instrument and its published scan figures were taken on that
-                // binarisation, so it stays as it was. Pointing this canary at it after the
-                // prefix became context-coded made it fail with `real 344 < simulated 366`,
-                // which is the canary doing its job: the coder had got *cheaper* than the model
-                // of a binarisation it no longer uses.
-                let sim_bits = adapt_bits_prefix_ctx(&coefficients, w, &cold);
-                // **Both engines.** They share this binarisation and this probability model but
-                // not a bitstream, and their per-block flush differs — the range coder's is
-                // several bytes where the interval coder's is one. Testing only one is how the
-                // first version of this canary came to disagree with the diagnostic by 5 bytes
-                // per block: the shipped tiles are `Coder::Range` and the test was measuring
-                // `Coder::Interval`.
-                for (engine, real) in [
-                    (Coder::Interval, encode_block(&coefficients, w)),
-                    (Coder::Range, encode_block_rc(&coefficients, w)),
-                ] {
-                    let real_bits = (real.len() * 8) as f64;
-                    assert!(
-                        real_bits >= sim_bits,
-                        "{engine:?} {w}x{h} spread {spread} density 1/{density}: real \
+                    let coefficients: Vec<i32> = (0..w * h)
+                        .map(|i| {
+                            // Deterministic, structured, and not all one sign: a plausible subband.
+                            let v =
+                                ((i * 2654435761usize) % (spread as usize * 2 + 1)) as i32 - spread;
+                            if i % density != 1 % density.max(2) {
+                                0
+                            } else {
+                                v
+                            }
+                        })
+                        .collect();
+                    // **The model must be of the *shipped* binarisation, which since ENT-9 is
+                    // `adapt_bits_prefix_ctx`.** `adapt_bits` still models the pre-ENT-9 coder — it
+                    // is ENT-8's instrument and its published scan figures were taken on that
+                    // binarisation, so it stays as it was. Pointing this canary at it after the
+                    // prefix became context-coded made it fail with `real 344 < simulated 366`,
+                    // which is the canary doing its job: the coder had got *cheaper* than the model
+                    // of a binarisation it no longer uses.
+                    let sim_bits = adapt_bits_prefix_ctx(&coefficients, w, &cold);
+                    // **Both engines.** They share this binarisation and this probability model but
+                    // not a bitstream, and their per-block flush differs — the range coder's is
+                    // several bytes where the interval coder's is one. Testing only one is how the
+                    // first version of this canary came to disagree with the diagnostic by 5 bytes
+                    // per block: the shipped tiles are `Coder::Range` and the test was measuring
+                    // `Coder::Interval`.
+                    for (engine, real) in [
+                        (Coder::Interval, encode_block(&coefficients, w)),
+                        (Coder::Range, encode_block_rc(&coefficients, w)),
+                    ] {
+                        let real_bits = (real.len() * 8) as f64;
+                        assert!(
+                            real_bits >= sim_bits,
+                            "{engine:?} {w}x{h} spread {spread} density 1/{density}: real \
                          {real_bits} < simulated {sim_bits} — the simulation is supposed to be a \
                          lower bound, so the walk has diverged from the coder"
-                    );
-                    if real_bits - sim_bits > worst {
-                        worst = real_bits - sim_bits;
-                        worst_case =
-                            format!("{engine:?} {w}x{h} spread {spread} density 1/{density}");
+                        );
+                        if real_bits - sim_bits > worst {
+                            worst = real_bits - sim_bits;
+                            worst_case =
+                                format!("{engine:?} {w}x{h} spread {spread} density 1/{density}");
+                        }
                     }
-                }
                 }
             }
         }
@@ -332,11 +340,16 @@ mod tests {
     #[test]
     fn lockstep_costs_abacs_template_half_a_neighbour() {
         let (w, h) = (16usize, 16usize);
-        for (scan, want_even, want_odd) in
-            [(Scan::Raster, 4usize, 4usize), (Scan::Lockstep { stripe_cols: 2 }, 3, 4)]
-        {
+        for (scan, want_even, want_odd) in [
+            (Scan::Raster, 4usize, 4usize),
+            (Scan::Lockstep { stripe_cols: 2 }, 3, 4),
+        ] {
             let order = scan.order(w, h);
-            assert_eq!(order.len(), w * h, "{scan:?} must visit each position exactly once");
+            assert_eq!(
+                order.len(),
+                w * h,
+                "{scan:?} must visit each position exactly once"
+            );
             let mut visited = vec![false; w * h];
             let mut per_parity = [Vec::new(), Vec::new()];
             for &(y, x) in &order {

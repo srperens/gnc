@@ -52,9 +52,11 @@ impl WaveletTransform {
                             ty: wgpu::BindingType::Buffer {
                                 ty: wgpu::BufferBindingType::Uniform,
                                 has_dynamic_offset: true,
-                                min_binding_size: wgpu::BufferSize::new(
-                                    std::mem::size_of::<TransformParams>() as u64,
-                                ),
+                                min_binding_size: wgpu::BufferSize::new(std::mem::size_of::<
+                                    TransformParams,
+                                >(
+                                )
+                                    as u64),
                             },
                             count: None,
                         },
@@ -94,7 +96,9 @@ impl WaveletTransform {
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("transform_53"),
-                source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/transform_53.wgsl").into()),
+                source: wgpu::ShaderSource::Wgsl(
+                    include_str!("../shaders/transform_53.wgsl").into(),
+                ),
             });
 
         let pipeline_53 = ctx
@@ -168,9 +172,7 @@ impl WaveletTransform {
                     resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                         buffer: &self.dyn_params_buf,
                         offset: 0,
-                        size: wgpu::BufferSize::new(
-                            std::mem::size_of::<TransformParams>() as u64,
-                        ),
+                        size: wgpu::BufferSize::new(std::mem::size_of::<TransformParams>() as u64),
                     }),
                 },
                 wgpu::BindGroupEntry {

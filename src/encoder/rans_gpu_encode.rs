@@ -13,8 +13,8 @@ use bytemuck::{Pod, Zeroable};
 use wgpu;
 use wgpu::util::DeviceExt;
 
-use super::rans::{InterleavedRansTile, SubbandGroupFreqs, SubbandRansTile, STREAMS_PER_TILE};
 use super::diagnostics;
+use super::rans::{InterleavedRansTile, SubbandGroupFreqs, SubbandRansTile, STREAMS_PER_TILE};
 use crate::{FrameInfo, GpuContext};
 
 const MAX_STREAM_BYTES: usize = 4096;
@@ -365,14 +365,14 @@ impl GpuRansEncoder {
                 });
 
         // --- Lean encode pipeline (no ZRL, avoids 16 KB/thread register spilling) ---
-        let enc_lean_shader =
-            ctx.device
-                .create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some("rans_encode_lean"),
-                    source: wgpu::ShaderSource::Wgsl(
-                        include_str!("../shaders/rans_encode_lean.wgsl").into(),
-                    ),
-                });
+        let enc_lean_shader = ctx
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("rans_encode_lean"),
+                source: wgpu::ShaderSource::Wgsl(
+                    include_str!("../shaders/rans_encode_lean.wgsl").into(),
+                ),
+            });
 
         let encode_lean_pipeline =
             ctx.device
@@ -386,14 +386,14 @@ impl GpuRansEncoder {
                 });
 
         // --- Fused normalize+encode pipeline ---
-        let fused_ne_shader =
-            ctx.device
-                .create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some("rans_normalize_encode_fused"),
-                    source: wgpu::ShaderSource::Wgsl(
-                        include_str!("../shaders/rans_normalize_encode_fused.wgsl").into(),
-                    ),
-                });
+        let fused_ne_shader = ctx
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("rans_normalize_encode_fused"),
+                source: wgpu::ShaderSource::Wgsl(
+                    include_str!("../shaders/rans_normalize_encode_fused.wgsl").into(),
+                ),
+            });
 
         let fused_norm_enc_bgl =
             ctx.device
@@ -410,13 +410,13 @@ impl GpuRansEncoder {
                     ],
                 });
 
-        let fused_ne_pl =
-            ctx.device
-                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("rans_fused_ne_pl"),
-                    bind_group_layouts: &[&fused_norm_enc_bgl],
-                    push_constant_ranges: &[],
-                });
+        let fused_ne_pl = ctx
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("rans_fused_ne_pl"),
+                bind_group_layouts: &[&fused_norm_enc_bgl],
+                push_constant_ranges: &[],
+            });
 
         let fused_norm_enc_pipeline =
             ctx.device
@@ -1347,13 +1347,7 @@ impl GpuRansEncoder {
             }
 
             // Copy results to staging
-            cmd.copy_buffer_to_buffer(
-                &bufs.stream_buf,
-                0,
-                &bufs.stream_staging[p],
-                0,
-                stream_size,
-            );
+            cmd.copy_buffer_to_buffer(&bufs.stream_buf, 0, &bufs.stream_staging[p], 0, stream_size);
             cmd.copy_buffer_to_buffer(&bufs.meta_buf, 0, &bufs.meta_staging[p], 0, meta_size);
             cmd.copy_buffer_to_buffer(
                 &bufs.cumfreq_buf,
@@ -1535,10 +1529,8 @@ impl GpuRansEncoder {
             });
 
         // Dispatch all 3 planes: copy hist -> normalize -> encode -> copy results
-        for (p, (quantized_buf, hist_src)) in quantized_bufs
-            .iter()
-            .zip(hist_bufs.iter())
-            .enumerate()
+        for (p, (quantized_buf, hist_src)) in
+            quantized_bufs.iter().zip(hist_bufs.iter()).enumerate()
         {
             // Copy pre-computed histogram into internal hist_buf
             cmd.copy_buffer_to_buffer(hist_src, 0, &bufs.hist_buf, 0, hist_size);
@@ -1625,13 +1617,7 @@ impl GpuRansEncoder {
             }
 
             // Copy results to this plane's staging buffers
-            cmd.copy_buffer_to_buffer(
-                &bufs.stream_buf,
-                0,
-                &bufs.stream_staging[p],
-                0,
-                stream_size,
-            );
+            cmd.copy_buffer_to_buffer(&bufs.stream_buf, 0, &bufs.stream_staging[p], 0, stream_size);
             cmd.copy_buffer_to_buffer(&bufs.meta_buf, 0, &bufs.meta_staging[p], 0, meta_size);
             cmd.copy_buffer_to_buffer(
                 &bufs.cumfreq_buf,
@@ -1768,7 +1754,9 @@ impl GpuRansEncoder {
                 if std::env::var("GNC_RANS_DIAG").is_ok() && t < 2 {
                     let total: usize = groups.iter().map(|g| g.alphabet_size as usize + 1).sum();
                     let sizes: Vec<u32> = groups.iter().map(|g| g.alphabet_size).collect();
-                    eprintln!("[rans] tile {t}: groups={num_groups} cf_entries={total} asizes={sizes:?}");
+                    eprintln!(
+                        "[rans] tile {t}: groups={num_groups} cf_entries={total} asizes={sizes:?}"
+                    );
                 }
                 tile_freqs.push(TileFreqs::Subband(NormalizedSubbandTileFreqs {
                     num_groups: num_groups as u32,
@@ -1802,11 +1790,7 @@ impl GpuRansEncoder {
     fn hist_arena_entries(tf: &TileFreqs) -> usize {
         match tf {
             TileFreqs::Single(s) => s.alphabet_size as usize,
-            TileFreqs::Subband(sb) => sb
-                .groups
-                .iter()
-                .map(|g| g.alphabet_size as usize)
-                .sum(),
+            TileFreqs::Subband(sb) => sb.groups.iter().map(|g| g.alphabet_size as usize).sum(),
         }
     }
 
@@ -1829,9 +1813,7 @@ impl GpuRansEncoder {
 
         if let Some((count, tile)) = worst {
             if diagnostics::enabled() || std::env::var("GNC_PROFILE").is_ok() {
-                eprintln!(
-                    "[rans] hist_arena_max={count}/{SHARED_HIST_ENTRIES} (tile {tile})"
-                );
+                eprintln!("[rans] hist_arena_max={count}/{SHARED_HIST_ENTRIES} (tile {tile})");
             }
             assert!(
                 count <= SHARED_HIST_ENTRIES,
@@ -1859,11 +1841,9 @@ impl GpuRansEncoder {
         let entries = |tf: &TileFreqs| -> usize {
             match tf {
                 TileFreqs::Single(s) => s.alphabet_size as usize + 1,
-                TileFreqs::Subband(sb) => sb
-                    .groups
-                    .iter()
-                    .map(|g| g.alphabet_size as usize + 1)
-                    .sum(),
+                TileFreqs::Subband(sb) => {
+                    sb.groups.iter().map(|g| g.alphabet_size as usize + 1).sum()
+                }
             }
         };
 
@@ -1972,7 +1952,8 @@ impl GpuRansEncoder {
                 // `check_stream_overflow` has already refused the frame if any write_ptr was out
                 // of range, so the slice below cannot be inverted or out of bounds.
                 debug_assert!(write_ptr <= MAX_STREAM_BYTES);
-                let bytes = stream_bytes[byte_base + write_ptr..byte_base + MAX_STREAM_BYTES].to_vec();
+                let bytes =
+                    stream_bytes[byte_base + write_ptr..byte_base + MAX_STREAM_BYTES].to_vec();
 
                 per_stream_data.push(bytes);
                 per_stream_state.push(final_state);

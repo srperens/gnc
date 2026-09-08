@@ -193,7 +193,11 @@ impl SubbandWeights {
         for i in 0..levels as usize {
             let j = if physical { levels as usize - 1 - i } else { i };
             let lh_hl = 1.0 + 0.5 * j as f32;
-            let is_target = if physical { i == 0 } else { i == levels as usize - 1 };
+            let is_target = if physical {
+                i == 0
+            } else {
+                i == levels as usize - 1
+            };
             let hh = (lh_hl + if is_target { 1.0 } else { 0.5 }) * hh_scale;
             detail.push([lh_hl, lh_hl, hh]);
         }
@@ -816,7 +820,11 @@ pub fn pad_fill_mode(default_decay: bool) -> u32 {
                 2 => "zero",
                 _ => "replicate",
             },
-            if default_decay { "decay/intra" } else { "replicate/sequence" },
+            if default_decay {
+                "decay/intra"
+            } else {
+                "replicate/sequence"
+            },
             match std::env::var("GNC_PAD_FILL") {
                 Ok(v) => format!("GNC_PAD_FILL={v}"),
                 Err(_) => "no override".to_string(),
@@ -1027,12 +1035,48 @@ pub fn quality_preset(q: u32) -> CodecConfig {
     let anchors: &[Anchor] = &[
         // CfL disabled at extreme compression: alpha precision hurts more than
         // chroma prediction helps at high qstep
-        Anchor { q: 1,   qstep: 64.0, dead_zone: 1.0,  cfl: false, per_subband: true },
-        Anchor { q: 10,  qstep: 32.0, dead_zone: 0.75, cfl: false, per_subband: true }, // CfL alpha precision too coarse at high qstep
-        Anchor { q: 25,  qstep: 16.0, dead_zone: 0.75, cfl: false, per_subband: true }, // CfL alpha too coarse at qstep=16; hurts gradients
-        Anchor { q: 50,  qstep: 8.0,  dead_zone: 0.75, cfl: true,  per_subband: true },
-        Anchor { q: 75,  qstep: 4.0,  dead_zone: 0.75, cfl: true,  per_subband: true },
-        Anchor { q: 85,  qstep: 2.8,  dead_zone: 0.5,  cfl: true,  per_subband: true },
+        Anchor {
+            q: 1,
+            qstep: 64.0,
+            dead_zone: 1.0,
+            cfl: false,
+            per_subband: true,
+        },
+        Anchor {
+            q: 10,
+            qstep: 32.0,
+            dead_zone: 0.75,
+            cfl: false,
+            per_subband: true,
+        }, // CfL alpha precision too coarse at high qstep
+        Anchor {
+            q: 25,
+            qstep: 16.0,
+            dead_zone: 0.75,
+            cfl: false,
+            per_subband: true,
+        }, // CfL alpha too coarse at qstep=16; hurts gradients
+        Anchor {
+            q: 50,
+            qstep: 8.0,
+            dead_zone: 0.75,
+            cfl: true,
+            per_subband: true,
+        },
+        Anchor {
+            q: 75,
+            qstep: 4.0,
+            dead_zone: 0.75,
+            cfl: true,
+            per_subband: true,
+        },
+        Anchor {
+            q: 85,
+            qstep: 2.8,
+            dead_zone: 0.5,
+            cfl: true,
+            per_subband: true,
+        },
         // The ladder used to flatten here: q=92 and q=99 both sat at qstep ~2.0, so q=92, 96
         // and 99 produced the *same picture* and the entire top of the lossy range was
         // unreachable. The floor came from rANS — its GPU alphabet cannot represent the symbol
@@ -1064,11 +1108,35 @@ pub fn quality_preset(q: u32) -> CodecConfig {
         // bitstream's entropy_type confirms it.
         // q<=92 is deliberately left exactly as it was, so no existing quality point moves;
         // only the previously dead range above it changes.
-        Anchor { q: 92,  qstep: 2.05, dead_zone: 0.05, cfl: false, per_subband: true },
-        Anchor { q: 96,  qstep: 1.30, dead_zone: 0.0,  cfl: false, per_subband: true },
-        Anchor { q: 99,  qstep: 0.75, dead_zone: 0.0,  cfl: false, per_subband: true },
+        Anchor {
+            q: 92,
+            qstep: 2.05,
+            dead_zone: 0.05,
+            cfl: false,
+            per_subband: true,
+        },
+        Anchor {
+            q: 96,
+            qstep: 1.30,
+            dead_zone: 0.0,
+            cfl: false,
+            per_subband: true,
+        },
+        Anchor {
+            q: 99,
+            qstep: 0.75,
+            dead_zone: 0.0,
+            cfl: false,
+            per_subband: true,
+        },
         // Lossless: LeGall 5/3 with integer-exact lifting
-        Anchor { q: 100, qstep: 1.0,  dead_zone: 0.0,  cfl: false, per_subband: true },
+        Anchor {
+            q: 100,
+            qstep: 1.0,
+            dead_zone: 0.0,
+            cfl: false,
+            per_subband: true,
+        },
     ];
 
     // Find surrounding anchors and interpolation factor
@@ -1283,7 +1351,9 @@ pub fn quality_preset(q: u32) -> CodecConfig {
         // every image measured, so the second encode would be pure cost. `GNC_LOSSLESS_FALLBACK=0`
         // restores the old behaviour for measurement.
         lossless_fallback: (95..100).contains(&q)
-            && std::env::var("GNC_LOSSLESS_FALLBACK").map(|v| v != "0").unwrap_or(true),
+            && std::env::var("GNC_LOSSLESS_FALLBACK")
+                .map(|v| v != "0")
+                .unwrap_or(true),
         // PAD-1: this preset serves the still-image path, where there is no reference frame and
         // fading the padding flat is worth -4.63% RGB of rate at identical visible quality. The
         // sequence encoder clears it for the I-frames it codes, because those *are* references.
@@ -1296,7 +1366,9 @@ pub fn quality_preset(q: u32) -> CodecConfig {
         // would find. That measurement says nothing about q=100, where there is no quantiser,
         // the transform is reversible, and prediction is exactly the tool FFV1 and x264-lossless
         // use to beat this codec by 27-43%. GNC_INTRA_PRED=1 exposes it for measurement.
-        intra_prediction: std::env::var("GNC_INTRA_PRED").map(|v| v == "1").unwrap_or(false),
+        intra_prediction: std::env::var("GNC_INTRA_PRED")
+            .map(|v| v == "1")
+            .unwrap_or(false),
         // Hierarchical B-pyramid off by default, on two independent measurements (2026-09-06).
         //
         // Rate: at matched VMAF the pyramid costs *more* than P-only coding on every camera
@@ -1601,7 +1673,9 @@ pub fn inter_dead_zone_mul() -> f32 {
 /// 50 fps — before any coding runs (MEAS-6, `docs/decisions/0033`). It *wins* 34–39% on animation,
 /// so it is kept as an opt-in rather than deleted.
 pub fn b_pyramid_enabled() -> bool {
-    std::env::var("GNC_B_PYRAMID").map(|v| v == "1").unwrap_or(false)
+    std::env::var("GNC_B_PYRAMID")
+        .map(|v| v == "1")
+        .unwrap_or(false)
 }
 
 /// GNC's shipped configuration at an explicit `qstep`, for callers that do not select a quality
@@ -2234,12 +2308,16 @@ pub mod wasm {
 
                 // Check for an I-frame at this exact PTS (scene-cut or tail I-frame).
                 // Extract offset/size as copies so the borrow ends before mutable ops.
-                let iframe_offsets: Option<(usize, usize)> = th.index.iter()
+                let iframe_offsets: Option<(usize, usize)> = th
+                    .index
+                    .iter()
                     .find(|e| e.frame_role == 2 && e.pts == current_pts)
                     .map(|e| (e.offset as usize, e.offset as usize + e.size as usize));
 
                 let gop_idx = self.current_frame / gop_size;
-                let max_gop_idx = th.index.iter()
+                let max_gop_idx = th
+                    .index
+                    .iter()
                     .filter(|e| e.frame_role != 2)
                     .map(|e| e.gop_index as usize)
                     .max()
@@ -2253,12 +2331,16 @@ pub mod wasm {
                 }
 
                 if gop_idx <= max_gop_idx {
-                    let group = crate::format::deserialize_temporal_group(
-                        &self.data, th, gop_idx,
-                    );
-                    let frames = self.decoder.decode_temporal_group_rgba_wasm(
-                        &self.ctx, &group, th.temporal_transform, gop_size,
-                    ).await;
+                    let group = crate::format::deserialize_temporal_group(&self.data, th, gop_idx);
+                    let frames = self
+                        .decoder
+                        .decode_temporal_group_rgba_wasm(
+                            &self.ctx,
+                            &group,
+                            th.temporal_transform,
+                            gop_size,
+                        )
+                        .await;
 
                     let base = gop_idx * gop_size;
                     for (i, rgba) in frames.into_iter().enumerate() {
@@ -2271,7 +2353,9 @@ pub mod wasm {
                     // Past end of all frames — wrap to start.
                     self.current_frame = 0;
                     self.buffered_frames.clear();
-                    return Err(JsValue::from_str("End of GNV2 sequence, rewound to frame 0"));
+                    return Err(JsValue::from_str(
+                        "End of GNV2 sequence, rewound to frame 0",
+                    ));
                 }
             }
 
@@ -2293,29 +2377,26 @@ pub mod wasm {
                 // first, then decode the B-frame group.
                 let b_start = idx;
                 let mut b_end = idx;
-                while b_end < self.frame_count as usize
-                    && header.index[b_end].frame_type == 2
-                {
+                while b_end < self.frame_count as usize && header.index[b_end].frame_type == 2 {
                     b_end += 1;
                 }
 
                 if b_end < self.frame_count as usize {
                     // Save past ref, decode future anchor P, swap for B-frames
                     self.decoder.swap_forward_to_backward_ref(&self.ctx);
-                    let anchor_frame = crate::format::deserialize_sequence_frame(
-                        &self.data, header, b_end,
-                    );
-                    let anchor_rgba =
-                        self.decoder.decode_rgba_wasm(&self.ctx, &anchor_frame).await;
+                    let anchor_frame =
+                        crate::format::deserialize_sequence_frame(&self.data, header, b_end);
+                    let anchor_rgba = self
+                        .decoder
+                        .decode_rgba_wasm(&self.ctx, &anchor_frame)
+                        .await;
                     self.decoder.swap_references(); // ref=past, bwd=future
 
                     // Decode all B-frames in this group
                     for b_idx in b_start..b_end {
-                        let b_frame = crate::format::deserialize_sequence_frame(
-                            &self.data, header, b_idx,
-                        );
-                        let b_rgba =
-                            self.decoder.decode_rgba_wasm(&self.ctx, &b_frame).await;
+                        let b_frame =
+                            crate::format::deserialize_sequence_frame(&self.data, header, b_idx);
+                        let b_rgba = self.decoder.decode_rgba_wasm(&self.ctx, &b_frame).await;
                         self.buffered_frames.insert(b_idx, b_rgba);
                     }
 
@@ -2328,9 +2409,7 @@ pub mod wasm {
                     return Ok(rgba);
                 } else {
                     // No anchor available (end of sequence), fallback
-                    let frame = crate::format::deserialize_sequence_frame(
-                        &self.data, header, idx,
-                    );
+                    let frame = crate::format::deserialize_sequence_frame(&self.data, header, idx);
                     let rgba = self.decoder.decode_rgba_wasm(&self.ctx, &frame).await;
                     self.current_frame += 1;
                     return Ok(rgba);
@@ -2339,9 +2418,7 @@ pub mod wasm {
 
             // I/P frame: just decode it. If B-frames follow, they'll be
             // handled when current_frame advances to them.
-            let frame = crate::format::deserialize_sequence_frame(
-                &self.data, header, idx,
-            );
+            let frame = crate::format::deserialize_sequence_frame(&self.data, header, idx);
             let rgba = self.decoder.decode_rgba_wasm(&self.ctx, &frame).await;
             self.current_frame += 1;
             Ok(rgba)
@@ -2417,10 +2494,7 @@ pub mod wasm {
         /// Configure zero-copy rendering to a canvas element.
         /// After this, use `decode_and_present()` instead of `decode_next_frame()`.
         /// The canvas must NOT have a 2D context — WebGPU and 2D contexts are mutually exclusive.
-        pub fn set_canvas(
-            &mut self,
-            canvas: web_sys::HtmlCanvasElement,
-        ) -> Result<(), JsValue> {
+        pub fn set_canvas(&mut self, canvas: web_sys::HtmlCanvasElement) -> Result<(), JsValue> {
             let surface = self
                 .ctx
                 .instance
@@ -2429,58 +2503,50 @@ pub mod wasm {
 
             let config = surface
                 .get_default_config(&self.ctx.adapter, self.width, self.height)
-                .ok_or_else(|| {
-                    JsValue::from_str("Surface format not compatible with adapter")
-                })?;
+                .ok_or_else(|| JsValue::from_str("Surface format not compatible with adapter"))?;
             surface.configure(&self.ctx.device, &config);
 
-            let shader =
-                self.ctx
-                    .device
-                    .create_shader_module(wgpu::ShaderModuleDescriptor {
-                        label: Some("blit"),
-                        source: wgpu::ShaderSource::Wgsl(
-                            include_str!("shaders/blit.wgsl").into(),
-                        ),
-                    });
+            let shader = self
+                .ctx
+                .device
+                .create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("blit"),
+                    source: wgpu::ShaderSource::Wgsl(include_str!("shaders/blit.wgsl").into()),
+                });
 
-            let bgl =
-                self.ctx
-                    .device
-                    .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                        label: Some("blit_bgl"),
-                        entries: &[
-                            wgpu::BindGroupLayoutEntry {
-                                binding: 0,
-                                visibility: wgpu::ShaderStages::FRAGMENT,
-                                ty: wgpu::BindingType::Texture {
-                                    sample_type: wgpu::TextureSampleType::Float {
-                                        filterable: true,
-                                    },
-                                    view_dimension: wgpu::TextureViewDimension::D2,
-                                    multisampled: false,
-                                },
-                                count: None,
+            let bgl = self
+                .ctx
+                .device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("blit_bgl"),
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                multisampled: false,
                             },
-                            wgpu::BindGroupLayoutEntry {
-                                binding: 1,
-                                visibility: wgpu::ShaderStages::FRAGMENT,
-                                ty: wgpu::BindingType::Sampler(
-                                    wgpu::SamplerBindingType::Filtering,
-                                ),
-                                count: None,
-                            },
-                        ],
-                    });
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                            count: None,
+                        },
+                    ],
+                });
 
-            let pl =
-                self.ctx
-                    .device
-                    .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                        label: Some("blit_pl"),
-                        bind_group_layouts: &[&bgl],
-                        push_constant_ranges: &[],
-                    });
+            let pl = self
+                .ctx
+                .device
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("blit_pl"),
+                    bind_group_layouts: &[&bgl],
+                    push_constant_ranges: &[],
+                });
 
             let pipeline =
                 self.ctx
@@ -2544,8 +2610,7 @@ pub mod wasm {
             if let Some(texture) = self.buffered_textures.remove(&self.current_frame) {
                 self.last_seek_ms = 0.0;
                 let t_dec = Self::now_ms();
-                let view =
-                    texture.create_view(&wgpu::TextureViewDescriptor::default());
+                let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
                 blit_to_surface(
                     &self.ctx.device,
                     &self.ctx.queue,
@@ -2570,19 +2635,25 @@ pub mod wasm {
 
                 // Check for an I-frame at this exact PTS (scene-cut or tail I-frame).
                 // Extract offset/size as copies so the borrow ends before mutable ops.
-                let iframe_offsets: Option<(usize, usize)> = th.index.iter()
+                let iframe_offsets: Option<(usize, usize)> = th
+                    .index
+                    .iter()
                     .find(|e| e.frame_role == 2 && e.pts == current_pts)
                     .map(|e| (e.offset as usize, e.offset as usize + e.size as usize));
 
                 let gop_idx = self.current_frame / gop_size;
-                let max_gop_idx = th.index.iter()
+                let max_gop_idx = th
+                    .index
+                    .iter()
                     .filter(|e| e.frame_role != 2)
                     .map(|e| e.gop_index as usize)
                     .max()
                     .unwrap_or(0);
                 // Pre-extract index entries as owned tuples so the th borrow can end before
                 // the mutable self.ensure_tw_bufs() call; used for prefetch computation.
-                let index_entries: Vec<(u8, u32, u16)> = th.index.iter()
+                let index_entries: Vec<(u8, u32, u16)> = th
+                    .index
+                    .iter()
                     .map(|e| (e.frame_role, e.pts, e.gop_index))
                     .collect();
 
@@ -2621,9 +2692,8 @@ pub mod wasm {
                             self.last_seek_ms = 0.0;
                         } else {
                             let t_seek = Self::now_ms();
-                            let group = crate::format::deserialize_temporal_group(
-                                &self.data, th, gop_idx,
-                            );
+                            let group =
+                                crate::format::deserialize_temporal_group(&self.data, th, gop_idx);
                             let padded_w = group.low_frame.info.padded_width();
                             let padded_h = group.low_frame.info.padded_height();
                             let gop_info = group.low_frame.info;
@@ -2633,8 +2703,12 @@ pub mod wasm {
                             self.tw_gop_config = Some(gop_config);
                             let set = &self.tw_buf_sets[self.tw_active];
                             self.decoder.decode_temporal_gop_into(
-                                &self.ctx, &group, temporal_transform, gop_size,
-                                &set.frame_bufs, &set.snapshot_bufs,
+                                &self.ctx,
+                                &group,
+                                temporal_transform,
+                                gop_size,
+                                &set.frame_bufs,
+                                &set.snapshot_bufs,
                             );
                             self.tw_gop_base = gop_base;
                             self.tw_prefetch_base = usize::MAX;
@@ -2673,11 +2747,11 @@ pub mod wasm {
                         && self.tw_prefetch_base != gop_base + gop_size
                     {
                         let next_gop_base = (gop_idx + 1) * gop_size;
-                        index_entries.iter()
+                        index_entries
+                            .iter()
                             .filter(|(role, pts, _)| *role == 0 && *pts >= next_gop_base as u32)
                             .map(|(_, _, gop_index)| *gop_index as usize)
                             .min()
-
                     } else {
                         None
                     };
@@ -2726,30 +2800,23 @@ pub mod wasm {
                 let t_seek = Self::now_ms();
                 let b_start = idx;
                 let mut b_end = idx;
-                while b_end < self.frame_count as usize
-                    && header.index[b_end].frame_type == 2
-                {
+                while b_end < self.frame_count as usize && header.index[b_end].frame_type == 2 {
                     b_end += 1;
                 }
 
                 if b_end < self.frame_count as usize {
                     self.decoder.swap_forward_to_backward_ref(&self.ctx);
-                    let anchor_frame = crate::format::deserialize_sequence_frame(
-                        &self.data, header, b_end,
-                    );
-                    let (anchor_tex, _) = self.decoder.decode_to_owned_texture(
-                        &self.ctx,
-                        &anchor_frame,
-                    );
+                    let anchor_frame =
+                        crate::format::deserialize_sequence_frame(&self.data, header, b_end);
+                    let (anchor_tex, _) = self
+                        .decoder
+                        .decode_to_owned_texture(&self.ctx, &anchor_frame);
                     self.decoder.swap_references();
 
                     for b_idx in b_start..b_end {
-                        let b_frame = crate::format::deserialize_sequence_frame(
-                            &self.data, header, b_idx,
-                        );
-                        let (b_tex, _) = self.decoder.decode_to_owned_texture(
-                            &self.ctx, &b_frame,
-                        );
+                        let b_frame =
+                            crate::format::deserialize_sequence_frame(&self.data, header, b_idx);
+                        let (b_tex, _) = self.decoder.decode_to_owned_texture(&self.ctx, &b_frame);
                         self.buffered_textures.insert(b_idx, b_tex);
                     }
 
@@ -2758,10 +2825,8 @@ pub mod wasm {
                     self.last_seek_ms = Self::now_ms() - t_seek;
 
                     let t_dec = Self::now_ms();
-                    let texture =
-                        self.buffered_textures.remove(&idx).unwrap();
-                    let view = texture
-                        .create_view(&wgpu::TextureViewDescriptor::default());
+                    let texture = self.buffered_textures.remove(&idx).unwrap();
+                    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
                     blit_to_surface(
                         &self.ctx.device,
                         &self.ctx.queue,
@@ -2778,9 +2843,7 @@ pub mod wasm {
                     // No anchor available — decode as-is
                     self.last_seek_ms = 0.0;
                     let t_dec = Self::now_ms();
-                    let frame = crate::format::deserialize_sequence_frame(
-                        &self.data, header, idx,
-                    );
+                    let frame = crate::format::deserialize_sequence_frame(&self.data, header, idx);
                     self.decoder.decode_to_texture(&self.ctx, &frame);
                     let view = self.decoder.output_texture_view().unwrap();
                     blit_to_surface(
@@ -2801,8 +2864,7 @@ pub mod wasm {
             // I/P frame: decode to cached texture and present
             self.last_seek_ms = 0.0;
             let t_dec = Self::now_ms();
-            let frame =
-                crate::format::deserialize_sequence_frame(&self.data, header, idx);
+            let frame = crate::format::deserialize_sequence_frame(&self.data, header, idx);
             self.decoder.decode_to_texture(&self.ctx, &frame);
             let view = self.decoder.output_texture_view().unwrap();
             blit_to_surface(
@@ -2879,9 +2941,7 @@ pub mod wasm {
                     // Phase 1: decode GOP wavelet bufs
                     let t_seek = Self::now_ms();
                     let th = self.temporal_header.as_ref().unwrap();
-                    let group = crate::format::deserialize_temporal_group(
-                        &self.data, th, gop_idx,
-                    );
+                    let group = crate::format::deserialize_temporal_group(&self.data, th, gop_idx);
                     self.tw_gop_info = Some(group.low_frame.info);
                     self.tw_gop_config = Some(group.low_frame.config.clone());
                     let padded_w = group.low_frame.info.padded_width();
@@ -2889,8 +2949,12 @@ pub mod wasm {
                     self.ensure_tw_bufs(padded_w, padded_h, gop_size);
                     let set = &self.tw_buf_sets[self.tw_active];
                     self.decoder.decode_temporal_gop_into(
-                        &self.ctx, &group, temporal_transform, gop_size,
-                        &set.frame_bufs, &set.snapshot_bufs,
+                        &self.ctx,
+                        &group,
+                        temporal_transform,
+                        gop_size,
+                        &set.frame_bufs,
+                        &set.snapshot_bufs,
                     );
                     self.tw_gop_base = gop_base;
                     self.tw_prefetch_base = usize::MAX;
@@ -2957,8 +3021,7 @@ pub mod wasm {
                 return self.decode_and_present();
             }
 
-            let target =
-                (target_frame as usize).min(self.frame_count as usize - 1);
+            let target = (target_frame as usize).min(self.frame_count as usize - 1);
             let keyframe_idx = {
                 let header = self.header.as_ref().unwrap();
                 crate::format::seek_to_keyframe(header, target as u64)
@@ -2970,9 +3033,7 @@ pub mod wasm {
 
             // Decode forward from keyframe, discarding intermediate frames
             let t_seek = Self::now_ms();
-            while self.current_frame < target
-                && !self.buffered_textures.contains_key(&target)
-            {
+            while self.current_frame < target && !self.buffered_textures.contains_key(&target) {
                 self.gpu_advance_one();
             }
             self.last_seek_ms = Self::now_ms() - t_seek;
@@ -2980,8 +3041,7 @@ pub mod wasm {
             // Present the target
             let t_dec = Self::now_ms();
             if let Some(texture) = self.buffered_textures.remove(&target) {
-                let view =
-                    texture.create_view(&wgpu::TextureViewDescriptor::default());
+                let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
                 blit_to_surface(
                     &self.ctx.device,
                     &self.ctx.queue,
@@ -3054,16 +3114,18 @@ pub mod wasm {
         /// Prefetch a GOP into the inactive buffer set.
         fn prefetch_next_gop(&mut self, gop_idx: usize, gop_size: usize) {
             let th = self.temporal_header.as_ref().unwrap();
-            let group = crate::format::deserialize_temporal_group(
-                &self.data, th, gop_idx,
-            );
+            let group = crate::format::deserialize_temporal_group(&self.data, th, gop_idx);
             self.tw_gop_info = Some(group.low_frame.info);
             self.tw_gop_config = Some(group.low_frame.config.clone());
             let prefetch_set = 1 - self.tw_active;
             let set = &self.tw_buf_sets[prefetch_set];
             self.decoder.decode_temporal_gop_into(
-                &self.ctx, &group, th.temporal_transform, gop_size,
-                &set.frame_bufs, &set.snapshot_bufs,
+                &self.ctx,
+                &group,
+                th.temporal_transform,
+                gop_size,
+                &set.frame_bufs,
+                &set.snapshot_bufs,
             );
             self.tw_prefetch_base = gop_idx * gop_size;
         }
@@ -3091,28 +3153,21 @@ pub mod wasm {
             if ft == 2 {
                 let b_start = idx;
                 let mut b_end = idx;
-                while b_end < self.frame_count as usize
-                    && header.index[b_end].frame_type == 2
-                {
+                while b_end < self.frame_count as usize && header.index[b_end].frame_type == 2 {
                     b_end += 1;
                 }
 
                 if b_end < self.frame_count as usize {
                     self.decoder.swap_forward_to_backward_ref(&self.ctx);
-                    let anchor = crate::format::deserialize_sequence_frame(
-                        &self.data, header, b_end,
-                    );
-                    let (anchor_tex, _) =
-                        self.decoder.decode_to_owned_texture(&self.ctx, &anchor);
+                    let anchor =
+                        crate::format::deserialize_sequence_frame(&self.data, header, b_end);
+                    let (anchor_tex, _) = self.decoder.decode_to_owned_texture(&self.ctx, &anchor);
                     self.decoder.swap_references();
 
                     for b_idx in b_start..b_end {
-                        let b_frame = crate::format::deserialize_sequence_frame(
-                            &self.data, header, b_idx,
-                        );
-                        let (b_tex, _) = self
-                            .decoder
-                            .decode_to_owned_texture(&self.ctx, &b_frame);
+                        let b_frame =
+                            crate::format::deserialize_sequence_frame(&self.data, header, b_idx);
+                        let (b_tex, _) = self.decoder.decode_to_owned_texture(&self.ctx, &b_frame);
                         self.buffered_textures.insert(b_idx, b_tex);
                     }
 
@@ -3123,16 +3178,12 @@ pub mod wasm {
                     self.buffered_textures.remove(&idx);
                     self.current_frame = idx + 1;
                 } else {
-                    let frame = crate::format::deserialize_sequence_frame(
-                        &self.data, header, idx,
-                    );
+                    let frame = crate::format::deserialize_sequence_frame(&self.data, header, idx);
                     self.decoder.decode_to_texture(&self.ctx, &frame);
                     self.current_frame += 1;
                 }
             } else {
-                let frame = crate::format::deserialize_sequence_frame(
-                    &self.data, header, idx,
-                );
+                let frame = crate::format::deserialize_sequence_frame(&self.data, header, idx);
                 self.decoder.decode_to_texture(&self.ctx, &frame);
                 self.current_frame += 1;
             }

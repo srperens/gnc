@@ -85,12 +85,7 @@ fn group_label(group: usize, num_levels: u32) -> String {
 /// For each row, iterates all columns in steps of 2, forming pairs (lx, lx+1).
 /// Both elements must fall in the same subband group; if the subband boundary
 /// falls on an odd column the trailing element is skipped.
-fn analyze_tile(
-    coeffs: &[f32],
-    tile_size: u32,
-    num_levels: u32,
-    stats: &mut [SubbandCorrStats],
-) {
+fn analyze_tile(coeffs: &[f32], tile_size: u32, num_levels: u32, stats: &mut [SubbandCorrStats]) {
     let ts = tile_size as usize;
 
     for ly in 0..tile_size {
@@ -202,7 +197,9 @@ fn print_table(plane_label: &str, stats: &[SubbandCorrStats]) {
     if n_pass >= 3 {
         eprintln!("  *** GATE PASSED *** checkerboard k-context is worth implementing.");
     } else {
-        eprintln!("  *** GATE FAILED *** spatial correlation too weak; EMA already captures variance.");
+        eprintln!(
+            "  *** GATE FAILED *** spatial correlation too weak; EMA already captures variance."
+        );
     }
 }
 

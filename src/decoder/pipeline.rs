@@ -4,23 +4,26 @@ use wgpu;
 use super::buffer_cache::CachedBuffers;
 use crate::encoder::adaptive::{self, AQ_LL_BLOCK_SIZE};
 use crate::encoder::bitplane::GpuBitplaneDecoder;
+use crate::encoder::block_transform::BlockTransform;
 use crate::encoder::cfl::CflPredictor;
+use crate::encoder::chroma_resample::ChromaResampler;
 use crate::encoder::color::ColorConverter;
+use crate::encoder::diagnostics;
+use crate::encoder::huffman_gpu::GpuHuffmanDecoder;
 use crate::encoder::interleave::PlaneInterleaver;
+use crate::encoder::intra::IntraPredictor;
 use crate::encoder::motion::MotionEstimator;
 use crate::encoder::quantize::Quantizer;
 use crate::encoder::rans_gpu::GpuRansDecoder;
 use crate::encoder::rice_gpu::GpuRiceDecoder;
-use crate::encoder::huffman_gpu::GpuHuffmanDecoder;
-use crate::encoder::block_transform::BlockTransform;
-use crate::encoder::chroma_resample::ChromaResampler;
-use crate::encoder::intra::IntraPredictor;
 use crate::encoder::temporal_53::Temporal53Gpu;
 use crate::encoder::temporal_haar::TemporalHaarGpu;
 use crate::encoder::transform::WaveletTransform;
-use crate::encoder::diagnostics;
 use crate::temporal;
-use crate::{CompressedFrame, EntropyData, FrameInfo, FrameType, GpuContext, TemporalEncodedSequence, TemporalTransform};
+use crate::{
+    CompressedFrame, EntropyData, FrameInfo, FrameType, GpuContext, TemporalEncodedSequence,
+    TemporalTransform,
+};
 
 /// Handle returned by `decode_to_texture` with metadata about the decoded frame.
 /// The actual texture view is accessible via `DecoderPipeline::output_texture_view()`.
@@ -55,7 +58,7 @@ pub struct DecoderPipeline {
     pub(super) chroma_down: ChromaResampler,
     pub(super) crop_pipeline: wgpu::ComputePipeline,
     pub(super) crop_bgl: wgpu::BindGroupLayout,
-    pub(super) pack_pipeline: wgpu::ComputePipeline,    // 8-bit: 4 components per u32
+    pub(super) pack_pipeline: wgpu::ComputePipeline, // 8-bit: 4 components per u32
     pub(super) pack_u16_pipeline: wgpu::ComputePipeline, // 10/16-bit: 2 components per u32
     pub(super) pack_bgl: wgpu::BindGroupLayout,
     pub(super) buf_to_tex_pipeline: wgpu::ComputePipeline,
@@ -203,20 +206,18 @@ impl DecoderPipeline {
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("pack_u16"),
-                source: wgpu::ShaderSource::Wgsl(
-                    include_str!("../shaders/pack_u16.wgsl").into(),
-                ),
+                source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/pack_u16.wgsl").into()),
             });
-        let pack_u16_pipeline = ctx
-            .device
-            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("pack_u16_pipeline"),
-                layout: Some(&pack_pl), // same bind group layout as pack_pipeline
-                module: &pack_u16_shader,
-                entry_point: Some("main"),
-                compilation_options: Default::default(),
-                cache: None,
-            });
+        let pack_u16_pipeline =
+            ctx.device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("pack_u16_pipeline"),
+                    layout: Some(&pack_pl), // same bind group layout as pack_pipeline
+                    module: &pack_u16_shader,
+                    entry_point: Some("main"),
+                    compilation_options: Default::default(),
+                    cache: None,
+                });
 
         // Buffer-to-texture shader (f32 RGB buffer → rgba8unorm texture)
         let buf_to_tex_shader = ctx
@@ -740,14 +741,14 @@ impl DecoderPipeline {
                 if pyramid_b4_first {
                     // Save I₀ (current reference_planes) to pyr[4] before it is overwritten.
                     self.save_fwd_ref_to_pyramid_slot_dec(ctx, 4); // I₀ → pyr[4]
-                    // Decode B₄ as forward-only P-frame (reference_planes = I₀).
-                    // gpu_work treats backward_vectors=None Bidirectional as P-frame,
-                    // so reference_planes is updated to B₄ after this call.
+                                                                   // Decode B₄ as forward-only P-frame (reference_planes = I₀).
+                                                                   // gpu_work treats backward_vectors=None Bidirectional as P-frame,
+                                                                   // so reference_planes is updated to B₄ after this call.
                     let b4_idx = order[b_start_i_peek];
                     results[b4_idx] = Some(self.decode(ctx, &frames[b4_idx]));
                     // Save B₄ (now in reference_planes) to pyr[0].
                     self.save_fwd_ref_to_pyramid_slot_dec(ctx, 0); // B₄ → pyr[0]
-                    // reference_planes = B₄ → P₈ will use B₄ as its forward reference.
+                                                                   // reference_planes = B₄ → P₈ will use B₄ as its forward reference.
                 }
 
                 // Standard anchor decode (reference_planes = B₄ in #49 mode, I₀ otherwise).
@@ -807,9 +808,7 @@ impl DecoderPipeline {
                         let b_frame = &frames[b_idx];
 
                         // In #49 mode, B₄ was already decoded before the anchor; skip it here.
-                        if pyramid_b4_first
-                            && b_idx - b_display_base == 3
-                        {
+                        if pyramid_b4_first && b_idx - b_display_base == 3 {
                             if diag {
                                 eprintln!("[pyramid_dec] Frame {} (display+3) decoded as fwd-only ref (#49), skipping loop", b_idx);
                             }
@@ -975,18 +974,22 @@ impl DecoderPipeline {
                     // Snapshot inputs before each level to avoid read-after-write aliasing
                     #[allow(clippy::needless_range_loop)]
                     for p in 0..3 {
-                        let mut cmd = ctx
-                            .device
-                            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                                label: Some("tw_dec_temporal_haar"),
-                            });
+                        let mut cmd =
+                            ctx.device
+                                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                    label: Some("tw_dec_temporal_haar"),
+                                });
                         let mut current_count = 1usize;
                         for _level in (0..num_levels).rev() {
                             let pairs = current_count;
                             // Snapshot lows + highs for this level
                             for j in 0..(2 * current_count) {
                                 cmd.copy_buffer_to_buffer(
-                                    &tw_frame_bufs[j][p], 0, &tw_snapshot[j], 0, plane_size,
+                                    &tw_frame_bufs[j][p],
+                                    0,
+                                    &tw_snapshot[j],
+                                    0,
+                                    plane_size,
                                 );
                             }
                             // Read from snapshot, write directly to tw_frame_bufs
@@ -1070,7 +1073,11 @@ impl DecoderPipeline {
                     self.decode_wavelet_coeffs_to_gpu(
                         ctx,
                         &group.low_frame,
-                        [&tw_coeff_bufs[0][0], &tw_coeff_bufs[0][1], &tw_coeff_bufs[0][2]],
+                        [
+                            &tw_coeff_bufs[0][0],
+                            &tw_coeff_bufs[0][1],
+                            &tw_coeff_bufs[0][2],
+                        ],
                     );
 
                     // Decode s1, d0, d1 from high_frames[0][0..2]
@@ -1165,21 +1172,19 @@ impl DecoderPipeline {
                         }
                     }
 
-                    let y_frames = temporal::haar_multilevel_inverse(
-                        &low_coeffs[0],
-                        &highs_per_level[0],
-                    );
-                    let co_frames = temporal::haar_multilevel_inverse(
-                        &low_coeffs[1],
-                        &highs_per_level[1],
-                    );
-                    let cg_frames = temporal::haar_multilevel_inverse(
-                        &low_coeffs[2],
-                        &highs_per_level[2],
-                    );
+                    let y_frames =
+                        temporal::haar_multilevel_inverse(&low_coeffs[0], &highs_per_level[0]);
+                    let co_frames =
+                        temporal::haar_multilevel_inverse(&low_coeffs[1], &highs_per_level[1]);
+                    let cg_frames =
+                        temporal::haar_multilevel_inverse(&low_coeffs[2], &highs_per_level[2]);
 
                     for i in 0..y_frames.len() {
-                        out.push([y_frames[i].clone(), co_frames[i].clone(), cg_frames[i].clone()]);
+                        out.push([
+                            y_frames[i].clone(),
+                            co_frames[i].clone(),
+                            cg_frames[i].clone(),
+                        ]);
                     }
                 }
                 TemporalTransform::LeGall53 => {
@@ -1238,7 +1243,14 @@ impl DecoderPipeline {
         let blocks_per_tile_side = info.tile_size as usize / 32;
         let blocks_per_tile = blocks_per_tile_side * blocks_per_tile_side;
 
-        self.ensure_cached(ctx, padded_w, padded_h, info.width, info.height, info.tile_size);
+        self.ensure_cached(
+            ctx,
+            padded_w,
+            padded_h,
+            info.width,
+            info.height,
+            info.tile_size,
+        );
 
         // Upload entropy data to GPU buffers
         self.prepare_frame_data(ctx, frame);
@@ -1259,10 +1271,20 @@ impl DecoderPipeline {
 
             // GPU entropy decode
             self.dispatch_entropy_decode(
-                ctx, &mut cmd, frame, bufs, p, tiles_per_plane, blocks_per_tile,
+                ctx,
+                &mut cmd,
+                frame,
+                bufs,
+                p,
+                tiles_per_plane,
+                blocks_per_tile,
             );
 
-            let weights = if p == 0 { &weights_luma } else { &weights_chroma };
+            let weights = if p == 0 {
+                &weights_luma
+            } else {
+                &weights_chroma
+            };
             self.quantize.dispatch_adaptive(
                 ctx,
                 &mut cmd,
@@ -1325,7 +1347,14 @@ impl DecoderPipeline {
         let blocks_per_tile_side = info.tile_size as usize / 32;
         let blocks_per_tile = blocks_per_tile_side * blocks_per_tile_side;
 
-        self.ensure_cached(ctx, padded_w, padded_h, info.width, info.height, info.tile_size);
+        self.ensure_cached(
+            ctx,
+            padded_w,
+            padded_h,
+            info.width,
+            info.height,
+            info.tile_size,
+        );
 
         // Upload entropy data to GPU buffers
         self.prepare_frame_data(ctx, frame);
@@ -1345,7 +1374,10 @@ impl DecoderPipeline {
         // Set up weight map for adaptive dequantization (temporal highpass per-tile weights)
         let wm_param = if frame.weight_map.is_some() {
             let (_, ll_bx, _, tx) = adaptive::weight_map_dims(
-                padded_w, padded_h, config.tile_size, config.wavelet_levels,
+                padded_w,
+                padded_h,
+                config.tile_size,
+                config.wavelet_levels,
             );
             let ll_size = config.tile_size >> config.wavelet_levels;
             let ll_block_size = AQ_LL_BLOCK_SIZE.min(ll_size);
@@ -1366,7 +1398,13 @@ impl DecoderPipeline {
         for (p, dest_buf) in dest_bufs.iter().enumerate() {
             // GPU entropy decode → scratch_a
             self.dispatch_entropy_decode(
-                ctx, &mut cmd, frame, bufs, p, tiles_per_plane, blocks_per_tile,
+                ctx,
+                &mut cmd,
+                frame,
+                bufs,
+                p,
+                tiles_per_plane,
+                blocks_per_tile,
             );
 
             // GPU dequantize → scratch_b
@@ -1396,7 +1434,13 @@ impl DecoderPipeline {
             // CfL handling: save Y reference, apply inverse prediction for chroma
             if p == 0 && has_cfl {
                 // Save dequantized Y as reference for chroma prediction
-                cmd.copy_buffer_to_buffer(&bufs.scratch_b, 0, &bufs.y_ref_wavelet_buf, 0, plane_size);
+                cmd.copy_buffer_to_buffer(
+                    &bufs.scratch_b,
+                    0,
+                    &bufs.y_ref_wavelet_buf,
+                    0,
+                    plane_size,
+                );
             }
 
             if p > 0 && has_cfl {
@@ -1552,7 +1596,14 @@ impl DecoderPipeline {
         let output_pixels = info.width * info.height;
         let output_size = (output_pixels as u64) * 3 * 4;
 
-        self.ensure_cached(ctx, padded_w, padded_h, info.width, info.height, info.tile_size);
+        self.ensure_cached(
+            ctx,
+            padded_w,
+            padded_h,
+            info.width,
+            info.height,
+            info.tile_size,
+        );
         let cached = self.cached.borrow();
         let bufs = cached.as_ref().unwrap();
 
@@ -1576,13 +1627,7 @@ impl DecoderPipeline {
                 config.wavelet_type,
                 0, // single-plane cmd encoder, no slot collision
             );
-            cmd.copy_buffer_to_buffer(
-                &bufs.scratch_a,
-                0,
-                &bufs.plane_results[p],
-                0,
-                plane_size,
-            );
+            cmd.copy_buffer_to_buffer(&bufs.scratch_a, 0, &bufs.plane_results[p], 0, plane_size);
             ctx.queue.submit(Some(cmd.finish()));
         }
 
@@ -1674,7 +1719,14 @@ impl DecoderPipeline {
         let output_pixels = info.width * info.height;
         let output_size = (output_pixels as u64) * 3 * 4;
 
-        self.ensure_cached(ctx, padded_w, padded_h, info.width, info.height, info.tile_size);
+        self.ensure_cached(
+            ctx,
+            padded_w,
+            padded_h,
+            info.width,
+            info.height,
+            info.tile_size,
+        );
         let cached = self.cached.borrow();
         let bufs = cached.as_ref().unwrap();
 
@@ -1697,13 +1749,7 @@ impl DecoderPipeline {
                 config.wavelet_type,
                 0, // single-plane cmd encoder, no slot collision
             );
-            cmd.copy_buffer_to_buffer(
-                &bufs.scratch_a,
-                0,
-                &bufs.plane_results[p],
-                0,
-                plane_size,
-            );
+            cmd.copy_buffer_to_buffer(&bufs.scratch_a, 0, &bufs.plane_results[p], 0, plane_size);
             ctx.queue.submit(Some(cmd.finish()));
         }
 
@@ -2079,7 +2125,12 @@ impl DecoderPipeline {
     }
 
     /// Read back reference planes for debugging.
-    pub fn read_reference_planes(&self, ctx: &GpuContext, width: u32, height: u32) -> Option<Vec<f32>> {
+    pub fn read_reference_planes(
+        &self,
+        ctx: &GpuContext,
+        width: u32,
+        height: u32,
+    ) -> Option<Vec<f32>> {
         let cached = self.cached.borrow();
         let bufs = cached.as_ref()?;
         let padded_w = (width + 255) & !255;
@@ -2096,12 +2147,18 @@ impl DecoderPipeline {
                 usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
-            let mut cmd = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("copy_ref") });
+            let mut cmd = ctx
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("copy_ref"),
+                });
             cmd.copy_buffer_to_buffer(buf, 0, &staging, 0, plane_size as u64);
             ctx.queue.submit(Some(cmd.finish()));
             let slice = staging.slice(..);
             let (tx, rx) = std::sync::mpsc::channel();
-            slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).ok(); });
+            slice.map_async(wgpu::MapMode::Read, move |r| {
+                tx.send(r).ok();
+            });
             ctx.device.poll(wgpu::Maintain::Wait);
             rx.recv().unwrap().unwrap();
             let data = slice.get_mapped_range();
@@ -2291,7 +2348,11 @@ impl DecoderPipeline {
                 self.decode_wavelet_coeffs_to_gpu(
                     ctx,
                     &group.low_frame,
-                    [&tw_frame_bufs[0][0], &tw_frame_bufs[0][1], &tw_frame_bufs[0][2]],
+                    [
+                        &tw_frame_bufs[0][0],
+                        &tw_frame_bufs[0][1],
+                        &tw_frame_bufs[0][2],
+                    ],
                 );
 
                 // Decode high frames -> appropriate buffer positions
@@ -2315,17 +2376,21 @@ impl DecoderPipeline {
                 // GPU temporal Haar inverse, per plane
                 #[allow(clippy::needless_range_loop)]
                 for p in 0..3 {
-                    let mut cmd = ctx
-                        .device
-                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                            label: Some("tw_wasm_temporal_haar"),
-                        });
+                    let mut cmd =
+                        ctx.device
+                            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                label: Some("tw_wasm_temporal_haar"),
+                            });
                     let mut current_count = 1usize;
                     for _level in (0..num_levels).rev() {
                         let pairs = current_count;
                         for j in 0..(2 * current_count) {
                             cmd.copy_buffer_to_buffer(
-                                &tw_frame_bufs[j][p], 0, &tw_snapshot[j], 0, plane_size,
+                                &tw_frame_bufs[j][p],
+                                0,
+                                &tw_snapshot[j],
+                                0,
+                                plane_size,
                             );
                         }
                         for pair in 0..pairs {
@@ -2364,7 +2429,11 @@ impl DecoderPipeline {
                 self.decode_wavelet_coeffs_to_gpu(
                     ctx,
                     &group.low_frame,
-                    [&tw_coeff_bufs[0][0], &tw_coeff_bufs[0][1], &tw_coeff_bufs[0][2]],
+                    [
+                        &tw_coeff_bufs[0][0],
+                        &tw_coeff_bufs[0][1],
+                        &tw_coeff_bufs[0][2],
+                    ],
                 );
 
                 // Decode s1, d0, d1 from high_frames[0][0..2]
@@ -2420,8 +2489,11 @@ impl DecoderPipeline {
             {
                 let cached = self.cached.borrow();
                 let bufs = cached.as_ref().unwrap();
-                ctx.queue
-                    .write_buffer(&bufs.pack_params_buf, 4, bytemuck::bytes_of(&wasm_pack_peak));
+                ctx.queue.write_buffer(
+                    &bufs.pack_params_buf,
+                    4,
+                    bytemuck::bytes_of(&wasm_pack_peak),
+                );
             }
 
             let receiver = {
@@ -2430,13 +2502,17 @@ impl DecoderPipeline {
 
                 // Inverse wavelet per plane
                 for p in 0..3 {
-                    let mut cmd = ctx.device.create_command_encoder(
-                        &wgpu::CommandEncoderDescriptor {
-                            label: Some("tw_wasm_inv_wavelet"),
-                        },
-                    );
+                    let mut cmd =
+                        ctx.device
+                            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                label: Some("tw_wasm_inv_wavelet"),
+                            });
                     cmd.copy_buffer_to_buffer(
-                        &tw_frame_bufs[fi][p], 0, &bufs.scratch_b, 0, plane_size,
+                        &tw_frame_bufs[fi][p],
+                        0,
+                        &bufs.scratch_b,
+                        0,
+                        plane_size,
                     );
                     self.transform.inverse(
                         ctx,
@@ -2450,17 +2526,21 @@ impl DecoderPipeline {
                         p,
                     );
                     cmd.copy_buffer_to_buffer(
-                        &bufs.scratch_a, 0, &bufs.plane_results[p], 0, plane_size,
+                        &bufs.scratch_a,
+                        0,
+                        &bufs.plane_results[p],
+                        0,
+                        plane_size,
                     );
                     ctx.queue.submit(Some(cmd.finish()));
                 }
 
                 // Interleave + inverse color + crop + pack
-                let mut cmd = ctx.device.create_command_encoder(
-                    &wgpu::CommandEncoderDescriptor {
+                let mut cmd = ctx
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                         label: Some("tw_wasm_postprocess"),
-                    },
-                );
+                    });
                 self.interleaver.dispatch(
                     ctx,
                     &mut cmd,
@@ -2539,7 +2619,11 @@ impl DecoderPipeline {
                     pass.dispatch_workgroups(workgroups, 1, 1);
                 }
                 cmd.copy_buffer_to_buffer(
-                    &bufs.packed_u8_buf, 0, &bufs.staging_u8, 0, packed_byte_size,
+                    &bufs.packed_u8_buf,
+                    0,
+                    &bufs.staging_u8,
+                    0,
+                    packed_byte_size,
                 );
                 ctx.queue.submit(Some(cmd.finish()));
 
@@ -2632,7 +2716,14 @@ impl DecoderPipeline {
                         })
                     })
                     .collect();
-                self.decode_temporal_gop_into(ctx, group, mode, gop_size, &tw_frame_bufs, &tw_snapshot);
+                self.decode_temporal_gop_into(
+                    ctx,
+                    group,
+                    mode,
+                    gop_size,
+                    &tw_frame_bufs,
+                    &tw_snapshot,
+                );
             }
             TemporalTransform::LeGall53 => {
                 let empty: Vec<wgpu::Buffer> = Vec::new();
@@ -2667,30 +2758,57 @@ impl DecoderPipeline {
 
             // Inverse wavelet per plane
             for p in 0..3 {
-                let mut cmd = ctx.device.create_command_encoder(
-                    &wgpu::CommandEncoderDescriptor { label: Some("tw_tex_inv_wavelet") },
-                );
+                let mut cmd = ctx
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("tw_tex_inv_wavelet"),
+                    });
                 cmd.copy_buffer_to_buffer(&tw_frame_bufs[fi][p], 0, &bufs.scratch_b, 0, plane_size);
                 self.transform.inverse(
-                    ctx, &mut cmd, &bufs.scratch_b, &bufs.scratch_c, &bufs.scratch_a,
-                    info, config.wavelet_levels, config.wavelet_type, p,
+                    ctx,
+                    &mut cmd,
+                    &bufs.scratch_b,
+                    &bufs.scratch_c,
+                    &bufs.scratch_a,
+                    info,
+                    config.wavelet_levels,
+                    config.wavelet_type,
+                    p,
                 );
-                cmd.copy_buffer_to_buffer(&bufs.scratch_a, 0, &bufs.plane_results[p], 0, plane_size);
+                cmd.copy_buffer_to_buffer(
+                    &bufs.scratch_a,
+                    0,
+                    &bufs.plane_results[p],
+                    0,
+                    plane_size,
+                );
                 ctx.queue.submit(Some(cmd.finish()));
             }
 
             // Interleave + inverse color + crop + buf_to_tex
-            let mut cmd = ctx.device.create_command_encoder(
-                &wgpu::CommandEncoderDescriptor { label: Some("tw_tex_postprocess") },
-            );
+            let mut cmd = ctx
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("tw_tex_postprocess"),
+                });
             self.interleaver.dispatch(
-                ctx, &mut cmd,
-                &bufs.plane_results[0], &bufs.plane_results[1], &bufs.plane_results[2],
-                &bufs.ycocg_buf, padded_pixels as u32,
+                ctx,
+                &mut cmd,
+                &bufs.plane_results[0],
+                &bufs.plane_results[1],
+                &bufs.plane_results[2],
+                &bufs.ycocg_buf,
+                padded_pixels as u32,
             );
             self.color.dispatch(
-                ctx, &mut cmd, &bufs.ycocg_buf, &bufs.rgb_out_buf,
-                padded_w, padded_h, false, config.is_lossless(),
+                ctx,
+                &mut cmd,
+                &bufs.ycocg_buf,
+                &bufs.rgb_out_buf,
+                padded_w,
+                padded_h,
+                false,
+                config.is_lossless(),
             );
             // Crop
             {
@@ -2698,14 +2816,24 @@ impl DecoderPipeline {
                     label: Some("crop_bg_tw_tex"),
                     layout: &self.crop_bgl,
                     entries: &[
-                        wgpu::BindGroupEntry { binding: 0, resource: bufs.crop_params_buf.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 1, resource: bufs.rgb_out_buf.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 2, resource: bufs.cropped_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: bufs.crop_params_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: bufs.rgb_out_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: bufs.cropped_buf.as_entire_binding(),
+                        },
                     ],
                 });
                 let workgroups = output_pixels.div_ceil(256);
                 let mut pass = cmd.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("crop_tw_tex"), timestamp_writes: None,
+                    label: Some("crop_tw_tex"),
+                    timestamp_writes: None,
                 });
                 pass.set_pipeline(&self.crop_pipeline);
                 pass.set_bind_group(0, &crop_bg, &[]);
@@ -2716,7 +2844,8 @@ impl DecoderPipeline {
                 let wg_x = w.div_ceil(16);
                 let wg_y = h.div_ceil(16);
                 let mut pass = cmd.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("buf_to_tex_tw"), timestamp_writes: None,
+                    label: Some("buf_to_tex_tw"),
+                    timestamp_writes: None,
                 });
                 pass.set_pipeline(&self.buf_to_tex_pipeline);
                 pass.set_bind_group(0, &bufs.buf_to_tex_bind_group, &[]);
@@ -2727,7 +2856,11 @@ impl DecoderPipeline {
             // Copy cached texture to owned texture
             let owned = ctx.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("tw_owned_texture"),
-                size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                size: wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
@@ -2735,9 +2868,11 @@ impl DecoderPipeline {
                 usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
                 view_formats: &[],
             });
-            let mut copy_cmd = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("copy_tw_to_owned"),
-            });
+            let mut copy_cmd = ctx
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("copy_tw_to_owned"),
+                });
             copy_cmd.copy_texture_to_texture(
                 wgpu::TexelCopyTextureInfo {
                     texture: &bufs.output_texture,
@@ -2751,7 +2886,11 @@ impl DecoderPipeline {
                     origin: wgpu::Origin3d::ZERO,
                     aspect: wgpu::TextureAspect::All,
                 },
-                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
             );
             ctx.queue.submit(Some(copy_cmd.finish()));
             drop(cached);
@@ -2854,9 +2993,11 @@ impl DecoderPipeline {
                 }
 
                 // Temporal Haar inverse — all 3 planes in a single submit
-                let mut cmd = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("tw_wb_temporal_haar"),
-                });
+                let mut cmd = ctx
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("tw_wb_temporal_haar"),
+                    });
                 #[allow(clippy::needless_range_loop)]
                 for p in 0..3 {
                     let mut current_count = 1usize;
@@ -2864,7 +3005,11 @@ impl DecoderPipeline {
                         let pairs = current_count;
                         for j in 0..(2 * current_count) {
                             cmd.copy_buffer_to_buffer(
-                                &frame_bufs[j][p], 0, &snapshot_bufs[j], 0, plane_size,
+                                &frame_bufs[j][p],
+                                0,
+                                &snapshot_bufs[j],
+                                0,
+                                plane_size,
                             );
                         }
                         for pair in 0..pairs {
@@ -2912,7 +3057,11 @@ impl DecoderPipeline {
                     self.decode_wavelet_coeffs_to_gpu(
                         ctx,
                         cf,
-                        [&coeff_bufs[1 + idx][0], &coeff_bufs[1 + idx][1], &coeff_bufs[1 + idx][2]],
+                        [
+                            &coeff_bufs[1 + idx][0],
+                            &coeff_bufs[1 + idx][1],
+                            &coeff_bufs[1 + idx][2],
+                        ],
                     );
                 }
 
@@ -2970,39 +3119,68 @@ impl DecoderPipeline {
         let bufs = cached.as_ref().unwrap();
 
         // Inverse wavelet per plane + postprocess — single submit
-        let mut cmd = ctx.device.create_command_encoder(
-            &wgpu::CommandEncoderDescriptor { label: Some("tw_pres") },
-        );
+        let mut cmd = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("tw_pres"),
+            });
         for (p, plane_buf) in plane_bufs.iter().enumerate() {
             cmd.copy_buffer_to_buffer(plane_buf, 0, &bufs.scratch_b, 0, plane_size);
             self.transform.inverse(
-                ctx, &mut cmd, &bufs.scratch_b, &bufs.scratch_c, &bufs.scratch_a,
-                info, config.wavelet_levels, config.wavelet_type, p,
+                ctx,
+                &mut cmd,
+                &bufs.scratch_b,
+                &bufs.scratch_c,
+                &bufs.scratch_a,
+                info,
+                config.wavelet_levels,
+                config.wavelet_type,
+                p,
             );
             cmd.copy_buffer_to_buffer(&bufs.scratch_a, 0, &bufs.plane_results[p], 0, plane_size);
         }
         self.interleaver.dispatch(
-            ctx, &mut cmd,
-            &bufs.plane_results[0], &bufs.plane_results[1], &bufs.plane_results[2],
-            &bufs.ycocg_buf, padded_pixels as u32,
+            ctx,
+            &mut cmd,
+            &bufs.plane_results[0],
+            &bufs.plane_results[1],
+            &bufs.plane_results[2],
+            &bufs.ycocg_buf,
+            padded_pixels as u32,
         );
         self.color.dispatch(
-            ctx, &mut cmd, &bufs.ycocg_buf, &bufs.rgb_out_buf,
-            padded_w, padded_h, false, config.is_lossless(),
+            ctx,
+            &mut cmd,
+            &bufs.ycocg_buf,
+            &bufs.rgb_out_buf,
+            padded_w,
+            padded_h,
+            false,
+            config.is_lossless(),
         );
         {
             let crop_bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("crop_bg_tw_pres"),
                 layout: &self.crop_bgl,
                 entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: bufs.crop_params_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: bufs.rgb_out_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: bufs.cropped_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: bufs.crop_params_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: bufs.rgb_out_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: bufs.cropped_buf.as_entire_binding(),
+                    },
                 ],
             });
             let workgroups = output_pixels.div_ceil(256);
             let mut pass = cmd.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("crop_tw_pres"), timestamp_writes: None,
+                label: Some("crop_tw_pres"),
+                timestamp_writes: None,
             });
             pass.set_pipeline(&self.crop_pipeline);
             pass.set_bind_group(0, &crop_bg, &[]);
@@ -3012,7 +3190,8 @@ impl DecoderPipeline {
             let wg_x = w.div_ceil(16);
             let wg_y = h.div_ceil(16);
             let mut pass = cmd.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("buf_to_tex_tw_pres"), timestamp_writes: None,
+                label: Some("buf_to_tex_tw_pres"),
+                timestamp_writes: None,
             });
             pass.set_pipeline(&self.buf_to_tex_pipeline);
             pass.set_bind_group(0, &bufs.buf_to_tex_bind_group, &[]);

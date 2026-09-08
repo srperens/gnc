@@ -71,22 +71,92 @@ fn matrix() -> [Case; 10] {
     use crate::ChromaFormat::{Yuv420, Yuv444};
     use EntropyCoder::{Abac, Rans, Rice};
     [
-        Case { name: "still q50 rice 444",  q: 50,  chroma: Yuv444, coder: Rice, frames: 1, ki: 1 },
-        Case { name: "still q90 rice 444",  q: 90,  chroma: Yuv444, coder: Rice, frames: 1, ki: 1 },
-        Case { name: "still q90 rice 420",  q: 90,  chroma: Yuv420, coder: Rice, frames: 1, ki: 1 },
-        Case { name: "still q90 abac 444",  q: 90,  chroma: Yuv444, coder: Abac, frames: 1, ki: 1 },
-        Case { name: "still q10 rans 444",  q: 10,  chroma: Yuv444, coder: Rans, frames: 1, ki: 1 },
-        Case { name: "still q100 med 444",  q: 100, chroma: Yuv444, coder: Rice, frames: 1, ki: 1 },
-        Case { name: "seq   q90 rice 444",  q: 90,  chroma: Yuv444, coder: Rice, frames: 3, ki: 2 },
-        Case { name: "seq   q90 rice 420",  q: 90,  chroma: Yuv420, coder: Rice, frames: 3, ki: 2 },
-        Case { name: "seq   q99 rice 444",  q: 99,  chroma: Yuv444, coder: Rice, frames: 3, ki: 2 },
+        Case {
+            name: "still q50 rice 444",
+            q: 50,
+            chroma: Yuv444,
+            coder: Rice,
+            frames: 1,
+            ki: 1,
+        },
+        Case {
+            name: "still q90 rice 444",
+            q: 90,
+            chroma: Yuv444,
+            coder: Rice,
+            frames: 1,
+            ki: 1,
+        },
+        Case {
+            name: "still q90 rice 420",
+            q: 90,
+            chroma: Yuv420,
+            coder: Rice,
+            frames: 1,
+            ki: 1,
+        },
+        Case {
+            name: "still q90 abac 444",
+            q: 90,
+            chroma: Yuv444,
+            coder: Abac,
+            frames: 1,
+            ki: 1,
+        },
+        Case {
+            name: "still q10 rans 444",
+            q: 10,
+            chroma: Yuv444,
+            coder: Rans,
+            frames: 1,
+            ki: 1,
+        },
+        Case {
+            name: "still q100 med 444",
+            q: 100,
+            chroma: Yuv444,
+            coder: Rice,
+            frames: 1,
+            ki: 1,
+        },
+        Case {
+            name: "seq   q90 rice 444",
+            q: 90,
+            chroma: Yuv444,
+            coder: Rice,
+            frames: 3,
+            ki: 2,
+        },
+        Case {
+            name: "seq   q90 rice 420",
+            q: 90,
+            chroma: Yuv420,
+            coder: Rice,
+            frames: 3,
+            ki: 2,
+        },
+        Case {
+            name: "seq   q99 rice 444",
+            q: 99,
+            chroma: Yuv444,
+            coder: Rice,
+            frames: 3,
+            ki: 2,
+        },
         // ki=9, not 2, and the reason is recorded because the assertion below found it: on the
         // tree this matrix was written, q=99 ki=2 and q=100 ki=2 coded to *different* bytes on
         // this content, and one merge later they were identical -- the q=99 fallback had started
         // keeping the bit-exact candidate on every frame. Content luck is not a distinct sample.
         // ki=9 differs structurally (one GOP of I+P+P against I,P,I) and no encoder change can
         // collapse it, and it is the matrix's only long-GOP row.
-        Case { name: "seq  q100 rice 444 ki9", q: 100, chroma: Yuv444, coder: Rice, frames: 3, ki: 9 },
+        Case {
+            name: "seq  q100 rice 444 ki9",
+            q: 100,
+            chroma: Yuv444,
+            coder: Rice,
+            frames: 3,
+            ki: 9,
+        },
     ]
 }
 
@@ -168,9 +238,17 @@ pub fn compute(ctx: &GpuContext) -> Fingerprint {
         let crc = format::crc32(&bytes);
         digest_input.extend_from_slice(&crc.to_le_bytes());
         digest_input.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
-        rows.push(Row { name: case.name, bytes: bytes.len(), crc, composition });
+        rows.push(Row {
+            name: case.name,
+            bytes: bytes.len(),
+            crc,
+            composition,
+        });
     }
-    Fingerprint { digest: format::crc32(&digest_input), rows }
+    Fingerprint {
+        digest: format::crc32(&digest_input),
+        rows,
+    }
 }
 
 #[cfg(test)]

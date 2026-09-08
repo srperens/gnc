@@ -427,7 +427,11 @@ fn test_fused_quantize_histogram_matches_separate() {
     let compressed_fused = enc.encode(&ctx, &frame, w, h, &config_fused);
     let decoded_fused = dec.decode(&ctx, &compressed_fused);
 
-    assert_eq!(decoded_sep.len(), decoded_fused.len(), "decoded length mismatch");
+    assert_eq!(
+        decoded_sep.len(),
+        decoded_fused.len(),
+        "decoded length mismatch"
+    );
 
     // Compute PSNR between separate and fused decoded output.
     let mse: f32 = decoded_sep
@@ -443,7 +447,7 @@ fn test_fused_quantize_histogram_matches_separate() {
     // Fused path should produce quality within 1.0 dB of separate path
     // (adaptive dead zone is conservative: only expands for ≥95% sparse subbands).
     assert!(
-        mse < 255.0 * 255.0 * 0.01,  // max ~1% of signal range squared
+        mse < 255.0 * 255.0 * 0.01, // max ~1% of signal range squared
         "Fused vs separate quality too different: mse={mse:.4}"
     );
     // Fused path should use at most slightly more bits than separate path
@@ -1009,7 +1013,10 @@ fn test_block_dct_noisy_content() {
             );
 
             // Decode plane 0 (Y) from the compressed frame's Rice tiles
-            assert!(tiles.len() >= tiles_per_plane, "fewer tiles than one plane needs");
+            assert!(
+                tiles.len() >= tiles_per_plane,
+                "fewer tiles than one plane needs"
+            );
             let mut cpu_decoded_plane = vec![0.0f32; sz];
             for (t, tile) in tiles.iter().enumerate().take(tiles_per_plane) {
                 let tx_i = t % tiles_x;
@@ -2330,9 +2337,7 @@ fn test_pframe_divergence_checkpoints() {
         config_i.keyframe_interval = 1;
         let _ = enc2.encode_sequence(&ctx, &[&f0], w, h, &config_i);
         std::env::remove_var("GNC_REF_DEBLOCK");
-        let enc_ref_iframe = enc2
-            .read_reference_planes(&ctx, w, h)
-            .expect("enc2 ref");
+        let enc_ref_iframe = enc2.read_reference_planes(&ctx, w, h).expect("enc2 ref");
         let enc_ref_y_iframe = &enc_ref_iframe[..padded_pixels];
         let iframe_diff = compute_diff(enc_ref_y_iframe, dec_ref_y_iframe, padded_pixels);
         eprintln!(
@@ -2394,7 +2399,8 @@ fn test_pframe_divergence_checkpoints() {
     // (encoder's recon_y buffer is overwritten by later frames, so we can't compare directly)
     let quant_diff = {
         // CPU-decode the P-frame's entropy data for Y plane and compare with GPU decode
-        let tiles_per_plane = compressed[1].info.tiles_x() as usize * compressed[1].info.tiles_y() as usize;
+        let tiles_per_plane =
+            compressed[1].info.tiles_x() as usize * compressed[1].info.tiles_y() as usize;
         let cpu_decoded = crate::encoder::entropy_helpers::entropy_decode_plane(
             &compressed[1].entropy,
             0, // Y plane
@@ -2423,7 +2429,8 @@ fn test_pframe_divergence_checkpoints() {
     eprintln!("\nCheckpoint 4: After dequantization");
     {
         // Re-decode quantized Y from entropy data for replay
-        let tiles_per_plane = compressed[1].info.tiles_x() as usize * compressed[1].info.tiles_y() as usize;
+        let tiles_per_plane =
+            compressed[1].info.tiles_x() as usize * compressed[1].info.tiles_y() as usize;
         let cpu_quant_y = crate::encoder::entropy_helpers::entropy_decode_plane(
             &compressed[1].entropy,
             0,
@@ -2431,11 +2438,13 @@ fn test_pframe_divergence_checkpoints() {
             compressed[1].info.tile_size as usize,
             padded_w as usize,
         );
-        let enc_quant_buf = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("enc_quant_y_upload"),
-            contents: bytemuck::cast_slice(&cpu_quant_y),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        });
+        let enc_quant_buf = ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("enc_quant_y_upload"),
+                contents: bytemuck::cast_slice(&cpu_quant_y),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            });
         let enc_dequant_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("enc_dequant_y"),
             size: (padded_pixels * 4) as u64,
@@ -2491,7 +2500,8 @@ fn test_pframe_divergence_checkpoints() {
     eprintln!("\nCheckpoint 5: After IDWT");
     {
         // Re-decode quantized Y from entropy data for replay
-        let tiles_per_plane = compressed[1].info.tiles_x() as usize * compressed[1].info.tiles_y() as usize;
+        let tiles_per_plane =
+            compressed[1].info.tiles_x() as usize * compressed[1].info.tiles_y() as usize;
         let cpu_quant_y = crate::encoder::entropy_helpers::entropy_decode_plane(
             &compressed[1].entropy,
             0,
@@ -2499,11 +2509,13 @@ fn test_pframe_divergence_checkpoints() {
             compressed[1].info.tile_size as usize,
             padded_w as usize,
         );
-        let enc_quant_buf = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("enc_quant_y_upload2"),
-            contents: bytemuck::cast_slice(&cpu_quant_y),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        });
+        let enc_quant_buf = ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("enc_quant_y_upload2"),
+                contents: bytemuck::cast_slice(&cpu_quant_y),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            });
         let buf_usage = wgpu::BufferUsages::STORAGE
             | wgpu::BufferUsages::COPY_SRC
             | wgpu::BufferUsages::COPY_DST;
@@ -2565,8 +2577,7 @@ fn test_pframe_divergence_checkpoints() {
         );
         ctx.queue.submit(Some(cmd.finish()));
         ctx.device.poll(wgpu::Maintain::Wait);
-        let enc_residual =
-            crate::gpu_util::read_buffer_f32(&ctx, &enc_residual_buf, padded_pixels);
+        let enc_residual = crate::gpu_util::read_buffer_f32(&ctx, &enc_residual_buf, padded_pixels);
         let idwt_diff = compute_diff(&enc_residual, &checkpoints.spatial_residual, padded_pixels);
         let status5 = if idwt_diff.max_diff > 0.001 {
             "DIVERGED"
@@ -2675,11 +2686,13 @@ fn test_pframe_divergence_checkpoints() {
         };
 
         // Upload I-frame ref to a fresh buffer
-        let ref_buf = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("test_ref_buf"),
-            contents: bytemuck::cast_slice(dec2_ref_y),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
+        let ref_buf = ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("test_ref_buf"),
+                contents: bytemuck::cast_slice(dec2_ref_y),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
         let pred_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("test_pred_buf"),
             size: (padded_pixels * 4) as u64,
@@ -2714,8 +2727,7 @@ fn test_pframe_divergence_checkpoints() {
 
         // Compare this fresh MC prediction with encoder's prediction
         let test_pred_diff = compute_diff(&enc_pred, &test_pred, padded_pixels);
-        eprintln!(
-            "  Fresh MC pred (from compressed MVs + I-ref) vs encoder pred:");
+        eprintln!("  Fresh MC pred (from compressed MVs + I-ref) vs encoder pred:");
         eprintln!(
             "    max={:.4} mean={:.6} nonzero={}/{}",
             test_pred_diff.max_diff,
@@ -2724,7 +2736,9 @@ fn test_pframe_divergence_checkpoints() {
             test_pred_diff.total_count,
         );
         if test_pred_diff.max_diff > 0.001 {
-            eprintln!("    → CONFIRMED: Compressed MVs produce different prediction than encoder's MVs");
+            eprintln!(
+                "    → CONFIRMED: Compressed MVs produce different prediction than encoder's MVs"
+            );
             eprintln!("    → i32→i16 truncation or MV readback bug in encoder");
         } else {
             eprintln!("    → Compressed MVs match encoder's prediction exactly");
@@ -2740,7 +2754,11 @@ fn test_pframe_divergence_checkpoints() {
         let raw_i32 = enc
             .read_raw_split_mvs_i32(&ctx)
             .expect("should have raw split MVs");
-        eprintln!("  raw_i32.len()={} compressed_mvs.len()={}", raw_i32.len() / 2, mf.vectors.len());
+        eprintln!(
+            "  raw_i32.len()={} compressed_mvs.len()={}",
+            raw_i32.len() / 2,
+            mf.vectors.len()
+        );
 
         let mut mismatches = 0usize;
         let mut max_i32_abs: i32 = 0;
@@ -2758,8 +2776,14 @@ fn test_pframe_divergence_checkpoints() {
                 }
             }
         }
-        eprintln!("  Max absolute MV (raw i32): {max_i32_abs} half-pels ({:.1} pixels)", max_i32_abs as f32 / 2.0);
-        eprintln!("  Mismatches after i32→i16→i32 roundtrip: {mismatches}/{}", mf.vectors.len());
+        eprintln!(
+            "  Max absolute MV (raw i32): {max_i32_abs} half-pels ({:.1} pixels)",
+            max_i32_abs as f32 / 2.0
+        );
+        eprintln!(
+            "  Mismatches after i32→i16→i32 roundtrip: {mismatches}/{}",
+            mf.vectors.len()
+        );
         if let Some((idx, gdx, gdy, rdx, rdy)) = first_mismatch {
             let bx = idx % (padded_w as usize / mf.block_size as usize);
             let by = idx / (padded_w as usize / mf.block_size as usize);
@@ -2808,7 +2832,15 @@ fn test_temporal_wavelet_roundtrip_per_plane() {
     };
 
     let frames: Vec<&[f32]> = vec![&f0, &f1];
-    let seq = enc.encode_sequence_temporal_wavelet(&ctx, &frames, w, h, &config, TemporalTransform::Haar, 2);
+    let seq = enc.encode_sequence_temporal_wavelet(
+        &ctx,
+        &frames,
+        w,
+        h,
+        &config,
+        TemporalTransform::Haar,
+        2,
+    );
     let decoded = dec.decode_temporal_sequence(&ctx, &seq);
 
     assert_eq!(decoded.len(), 2, "should decode 2 frames");
@@ -2849,7 +2881,13 @@ fn test_temporal_wavelet_planes_are_distinct() {
         ..Default::default()
     };
 
-    let info = FrameInfo { width: w, height: h, bit_depth: 8, tile_size: config.tile_size, chroma_format: crate::ChromaFormat::Yuv444 };
+    let info = FrameInfo {
+        width: w,
+        height: h,
+        bit_depth: 8,
+        tile_size: config.tile_size,
+        chroma_format: crate::ChromaFormat::Yuv444,
+    };
     let prequant = enc.debug_wavelet_prequant(&ctx, &frame, &info, &config);
 
     // Y and Co should differ for a gradient frame.
@@ -2932,7 +2970,10 @@ fn test_yuv422_encode_decode_roundtrip() {
     eprintln!("YUV 4:2:2 PSNR = {psnr:.2} dB");
     // 4:2:2 halves horizontal chroma resolution.  With correct padding the wavelet
     // transform sees valid data everywhere; PSNR should be close to 4:4:4.
-    assert!(psnr > 35.0, "4:2:2 PSNR too low: {psnr:.2} dB (chroma padding bug?)");
+    assert!(
+        psnr > 35.0,
+        "4:2:2 PSNR too low: {psnr:.2} dB (chroma padding bug?)"
+    );
 }
 
 #[test]
@@ -2940,7 +2981,10 @@ fn test_yuv420_encode_decode_roundtrip() {
     let psnr = chroma_roundtrip(crate::ChromaFormat::Yuv420);
     eprintln!("YUV 4:2:0 PSNR = {psnr:.2} dB");
     // 4:2:0 quarters chroma resolution; slightly more loss than 4:2:2.
-    assert!(psnr > 34.0, "4:2:0 PSNR too low: {psnr:.2} dB (chroma padding bug?)");
+    assert!(
+        psnr > 34.0,
+        "4:2:0 PSNR too low: {psnr:.2} dB (chroma padding bug?)"
+    );
 }
 
 #[test]
@@ -2966,7 +3010,10 @@ fn test_yuv420_encode_decode_roundtrip_512() {
     let compressed = encoder.encode(&ctx, &rgb, w, h, &config);
     let decoded = decoder.decode(&ctx, &compressed);
     let psnr = compute_psnr(&rgb, &decoded);
-    eprintln!("YUV 4:2:0 512×512 PSNR = {psnr:.2} dB chroma_format={:?}", compressed.info.chroma_format);
+    eprintln!(
+        "YUV 4:2:0 512×512 PSNR = {psnr:.2} dB chroma_format={:?}",
+        compressed.info.chroma_format
+    );
 
     // Also test 4:4:4 at same settings to verify encoder/decoder work
     let config2 = crate::CodecConfig {
@@ -3040,7 +3087,7 @@ fn pframe_chroma_sequence_psnr(chroma_fmt: crate::ChromaFormat) -> (f64, f64) {
     let config = crate::CodecConfig {
         chroma_format: chroma_fmt,
         quantization_step: 4.0,
-        cfl_enabled: false, // CfL requires 444
+        cfl_enabled: false,    // CfL requires 444
         keyframe_interval: 10, // I P P …
         ..Default::default()
     };
@@ -3048,15 +3095,31 @@ fn pframe_chroma_sequence_psnr(chroma_fmt: crate::ChromaFormat) -> (f64, f64) {
     let frames: Vec<&[f32]> = vec![&f0, &f1, &f2];
     let compressed = encoder.encode_sequence(&ctx, &frames, w, h, &config);
 
-    assert_eq!(compressed.len(), 3, "{chroma_fmt:?}: expected 3 compressed frames");
-    assert_eq!(compressed[0].frame_type, crate::FrameType::Intra,     "{chroma_fmt:?}: frame 0 should be I");
-    assert_eq!(compressed[1].frame_type, crate::FrameType::Predicted, "{chroma_fmt:?}: frame 1 should be P");
-    assert_eq!(compressed[2].frame_type, crate::FrameType::Predicted, "{chroma_fmt:?}: frame 2 should be P");
+    assert_eq!(
+        compressed.len(),
+        3,
+        "{chroma_fmt:?}: expected 3 compressed frames"
+    );
+    assert_eq!(
+        compressed[0].frame_type,
+        crate::FrameType::Intra,
+        "{chroma_fmt:?}: frame 0 should be I"
+    );
+    assert_eq!(
+        compressed[1].frame_type,
+        crate::FrameType::Predicted,
+        "{chroma_fmt:?}: frame 1 should be P"
+    );
+    assert_eq!(
+        compressed[2].frame_type,
+        crate::FrameType::Predicted,
+        "{chroma_fmt:?}: frame 2 should be P"
+    );
 
     // Decode and measure PSNR for the two P-frames
     let _dec0 = decoder.decode(&ctx, &compressed[0]);
-    let dec1  = decoder.decode(&ctx, &compressed[1]);
-    let dec2  = decoder.decode(&ctx, &compressed[2]);
+    let dec1 = decoder.decode(&ctx, &compressed[1]);
+    let dec2 = decoder.decode(&ctx, &compressed[2]);
 
     let psnr1 = compute_psnr(&f1, &dec1);
     let psnr2 = compute_psnr(&f2, &dec2);
@@ -3120,9 +3183,7 @@ fn bframe_yuv420_quality_check(w: u32, h: u32) {
     let mut encoder = EncoderPipeline::new(&ctx);
     let decoder = crate::decoder::pipeline::DecoderPipeline::new(&ctx);
 
-    let frames_rgb: Vec<Vec<f32>> = (0..9)
-        .map(|i| make_moving_texture_frame(w, h, i))
-        .collect();
+    let frames_rgb: Vec<Vec<f32>> = (0..9).map(|i| make_moving_texture_frame(w, h, i)).collect();
     let frame_refs: Vec<&[f32]> = frames_rgb.iter().map(|f| f.as_slice()).collect();
 
     let config = crate::CodecConfig {
@@ -3139,8 +3200,16 @@ fn bframe_yuv420_quality_check(w: u32, h: u32) {
     // The test is only meaningful if true (bidirectionally predicted) B-frames were actually
     // produced. Scene-cut detection turning the sequence into I/P frames would make this pass
     // vacuously, so check the structure before measuring quality.
-    assert_eq!(compressed[0].frame_type, crate::FrameType::Intra, "frame 0 should be I");
-    assert_eq!(compressed[8].frame_type, crate::FrameType::Predicted, "frame 8 should be P");
+    assert_eq!(
+        compressed[0].frame_type,
+        crate::FrameType::Intra,
+        "frame 0 should be I"
+    );
+    assert_eq!(
+        compressed[8].frame_type,
+        crate::FrameType::Predicted,
+        "frame 8 should be P"
+    );
     for (i, cf) in compressed.iter().enumerate().take(8).skip(1) {
         assert_eq!(
             cf.frame_type,
@@ -3528,16 +3597,28 @@ fn test_pframe_yuv422_sequence_roundtrip() {
     let (psnr1, psnr2) = pframe_chroma_sequence_psnr(crate::ChromaFormat::Yuv422);
     eprintln!("P-frame 4:2:2 PSNR: P1={psnr1:.2} dB  P2={psnr2:.2} dB");
     // The flickering bug produced PSNR < 20 dB on P-frames; correct decode should be > 30 dB.
-    assert!(psnr1 > 30.0, "4:2:2 P-frame 1 PSNR too low ({psnr1:.2} dB) — chroma tile mismatch?");
-    assert!(psnr2 > 30.0, "4:2:2 P-frame 2 PSNR too low ({psnr2:.2} dB) — chroma tile mismatch?");
+    assert!(
+        psnr1 > 30.0,
+        "4:2:2 P-frame 1 PSNR too low ({psnr1:.2} dB) — chroma tile mismatch?"
+    );
+    assert!(
+        psnr2 > 30.0,
+        "4:2:2 P-frame 2 PSNR too low ({psnr2:.2} dB) — chroma tile mismatch?"
+    );
 }
 
 #[test]
 fn test_pframe_yuv420_sequence_roundtrip() {
     let (psnr1, psnr2) = pframe_chroma_sequence_psnr(crate::ChromaFormat::Yuv420);
     eprintln!("P-frame 4:2:0 PSNR: P1={psnr1:.2} dB  P2={psnr2:.2} dB");
-    assert!(psnr1 > 30.0, "4:2:0 P-frame 1 PSNR too low ({psnr1:.2} dB) — chroma tile mismatch?");
-    assert!(psnr2 > 30.0, "4:2:0 P-frame 2 PSNR too low ({psnr2:.2} dB) — chroma tile mismatch?");
+    assert!(
+        psnr1 > 30.0,
+        "4:2:0 P-frame 1 PSNR too low ({psnr1:.2} dB) — chroma tile mismatch?"
+    );
+    assert!(
+        psnr2 > 30.0,
+        "4:2:0 P-frame 2 PSNR too low ({psnr2:.2} dB) — chroma tile mismatch?"
+    );
 }
 
 /// Verify that 128×128 tiles encode and decode correctly with the Rice encoder.
@@ -3612,7 +3693,10 @@ fn test_bilinear_chroma_upsample_tile_boundary_422() {
     let decoded = dec.decode(&ctx, &compressed[0]);
     let psnr = compute_psnr_single(&frame, &decoded);
     eprintln!("4:2:2 tile boundary PSNR: {psnr:.2} dB");
-    assert!(psnr > 35.0, "4:2:2 tile boundary PSNR too low: {psnr:.2} dB");
+    assert!(
+        psnr > 35.0,
+        "4:2:2 tile boundary PSNR too low: {psnr:.2} dB"
+    );
 }
 
 /// 4:2:0 encode/decode roundtrip crossing tile boundaries (x=256, y=256).
@@ -3640,7 +3724,10 @@ fn test_bilinear_chroma_upsample_tile_boundary_420() {
     let decoded = dec.decode(&ctx, &compressed[0]);
     let psnr = compute_psnr_single(&frame, &decoded);
     eprintln!("4:2:0 tile boundary PSNR: {psnr:.2} dB");
-    assert!(psnr > 34.0, "4:2:0 tile boundary PSNR too low: {psnr:.2} dB");
+    assert!(
+        psnr > 34.0,
+        "4:2:0 tile boundary PSNR too low: {psnr:.2} dB"
+    );
 }
 
 #[test]
@@ -3687,9 +3774,16 @@ fn test_10bit_roundtrip() {
 
     // --- Test f32 decode path ---
     let decoded_f32 = dec.decode(&ctx, &compressed);
-    assert_eq!(decoded_f32.len(), (w * h * 3) as usize, "f32 decoded length mismatch");
+    assert_eq!(
+        decoded_f32.len(),
+        (w * h * 3) as usize,
+        "f32 decoded length mismatch"
+    );
 
-    let max_val = decoded_f32.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let max_val = decoded_f32
+        .iter()
+        .cloned()
+        .fold(f32::NEG_INFINITY, f32::max);
     assert!(
         max_val > 255.0,
         "f32 decoded max value {max_val:.1} is ≤ 255: values appear clipped to 8-bit range"
@@ -3881,7 +3975,6 @@ fn test_scene_cut_disabled_at_zero_threshold() {
     );
 }
 
-
 /// BUG-35: the default encode path must not dispatch the over-budget histogram entry point.
 ///
 /// Byte-identical output cannot prove this on its own — a `write_histogram` flag stuck at `true`
@@ -3916,7 +4009,8 @@ fn fused_qh_does_not_build_the_histogram_pipeline_on_the_default_path() {
     let (after_qo, after_hist) = enc.fused_qh.dispatch_counts();
 
     assert_eq!(
-        after_hist, before_hist,
+        after_hist,
+        before_hist,
         "the Rice path dispatched the histogram entry point {} time(s); it is 23800 B against a \
          {} B device and nothing on this path reads its output",
         after_hist - before_hist,
@@ -3992,11 +4086,15 @@ fn fallback_iframe_reference_matches_the_decoders() {
         if compressed[0].config.is_lossless() {
             kept_bit_exact += 1;
         }
-        let enc_ref = enc.read_reference_planes(&ctx, w, h).expect("encoder reference");
+        let enc_ref = enc
+            .read_reference_planes(&ctx, w, h)
+            .expect("encoder reference");
 
         let dec = DecoderPipeline::new(&ctx);
         let _ = dec.decode(&ctx, &compressed[0]);
-        let dec_ref = dec.read_reference_planes(&ctx, w, h).expect("decoder reference");
+        let dec_ref = dec
+            .read_reference_planes(&ctx, w, h)
+            .expect("decoder reference");
 
         for (p, name) in ["Y", "Co", "Cg"].iter().enumerate() {
             let a = &enc_ref[p * padded_pixels..(p + 1) * padded_pixels];
@@ -4063,11 +4161,15 @@ fn lossless_iframe_reference_matches_the_decoders() {
         let mut enc = EncoderPipeline::new(&ctx);
         let compressed = enc.encode_sequence(&ctx, &[&f0], w, h, &cfg);
         assert_eq!(compressed.len(), 1);
-        let enc_ref = enc.read_reference_planes(&ctx, w, h).expect("encoder reference");
+        let enc_ref = enc
+            .read_reference_planes(&ctx, w, h)
+            .expect("encoder reference");
 
         let dec = DecoderPipeline::new(&ctx);
         let _ = dec.decode(&ctx, &compressed[0]);
-        let dec_ref = dec.read_reference_planes(&ctx, w, h).expect("decoder reference");
+        let dec_ref = dec
+            .read_reference_planes(&ctx, w, h)
+            .expect("decoder reference");
 
         for (p, name) in ["Y", "Co", "Cg"].iter().enumerate() {
             let a = &enc_ref[p * padded_pixels..(p + 1) * padded_pixels];
@@ -4147,7 +4249,10 @@ fn lossless_at_q100_is_a_claim_about_integer_input() {
     let pixels = (w * h) as usize;
     std::env::set_var("GNC_REF_DEBLOCK", "0");
     let mut seen = Vec::new();
-    for (name, f0) in [("integer", &integer_content), ("fractional", &fractional_content)] {
+    for (name, f0) in [
+        ("integer", &integer_content),
+        ("fractional", &fractional_content),
+    ] {
         let mut cfg = crate::quality_preset(100);
         cfg.tile_size = 256;
         cfg.keyframe_interval = 1;
@@ -4158,7 +4263,9 @@ fn lossless_at_q100_is_a_claim_about_integer_input() {
         let compressed = enc.encode_sequence(&ctx, &[f0], w, h, &cfg);
         let dec = DecoderPipeline::new(&ctx);
         let _ = dec.decode(&ctx, &compressed[0]);
-        let dec_ref = dec.read_reference_planes(&ctx, w, h).expect("decoder reference");
+        let dec_ref = dec
+            .read_reference_planes(&ctx, w, h)
+            .expect("decoder reference");
 
         let mut max = 0.0f32;
         for i in 0..pixels {
@@ -4268,7 +4375,9 @@ fn a_bit_exact_frames_reference_is_its_colour_converted_source() {
 
         let dec = DecoderPipeline::new(&ctx);
         let _ = dec.decode(&ctx, &compressed[0]);
-        let dec_ref = dec.read_reference_planes(&ctx, w, h).expect("decoder reference");
+        let dec_ref = dec
+            .read_reference_planes(&ctx, w, h)
+            .expect("decoder reference");
 
         for (p, name) in ["Y", "Co", "Cg"].iter().enumerate() {
             let got = &dec_ref[p * padded_pixels..(p + 1) * padded_pixels];
@@ -4339,7 +4448,10 @@ fn lossless_sequence_is_bit_exact_on_every_frame() {
     let mut config = crate::quality_preset(100);
     config.tile_size = 256;
     config.keyframe_interval = 30; // frames 1 and 2 are P-frames
-    assert!(config.is_lossless(), "q=100 must be a lossless configuration");
+    assert!(
+        config.is_lossless(),
+        "q=100 must be a lossless configuration"
+    );
 
     let worst = |frames: &Vec<&[f32]>, compressed: &[crate::CompressedFrame]| {
         let dec = DecoderPipeline::new(&ctx);

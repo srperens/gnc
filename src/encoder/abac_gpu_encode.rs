@@ -280,12 +280,30 @@ impl GpuAbacEncoder {
             label: Some("abac_encode_bind"),
             layout: &self.bgl,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: self.params_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: input.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: self.blocks_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: out.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: self.lengths_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 5, resource: self.flags_buf.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: input.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.blocks_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: out.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: self.lengths_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: self.flags_buf.as_entire_binding(),
+                },
             ],
         })
     }
@@ -323,7 +341,11 @@ impl GpuAbacEncoder {
     }
 
     fn set_params(&self, ctx: &GpuContext, num_blocks: u32, emit: u32) {
-        let p = Params { num_blocks, emit, _pad: [0; 2] };
+        let p = Params {
+            num_blocks,
+            emit,
+            _pad: [0; 2],
+        };
         ctx.queue
             .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&p));
     }
@@ -444,7 +466,14 @@ impl GpuAbacEncoder {
             // which is how a sizing mode gets chosen for the wrong reason.
             Sizing::CountThenEmit => {
                 let bind = self.bind(ctx, quantized, &self.dummy_out);
-                self.run(ctx, &self.coder[coder as usize], &bind, groups, true, "abac_count");
+                self.run(
+                    ctx,
+                    &self.coder[coder as usize],
+                    &bind,
+                    groups,
+                    true,
+                    "abac_count",
+                );
                 let counts = read_buffer_u32(ctx, &self.lengths_buf, num_blocks);
                 (counts.iter().map(|&c| align4(c)).collect::<Vec<u32>>(), 2)
             }
@@ -490,7 +519,14 @@ impl GpuAbacEncoder {
         self.set_params(ctx, num_blocks as u32, 1);
         {
             let bind = self.bind(ctx, quantized, &self.slots_buf);
-            self.run(ctx, &self.coder[coder as usize], &bind, groups, true, "abac_emit");
+            self.run(
+                ctx,
+                &self.coder[coder as usize],
+                &bind,
+                groups,
+                true,
+                "abac_emit",
+            );
         }
         self.check_flags(ctx, sizing);
         let lengths = read_buffer_u32(ctx, &self.lengths_buf, num_blocks);
@@ -523,8 +559,8 @@ impl GpuAbacEncoder {
                 let mut packed_off = Vec::with_capacity(num_blocks);
                 let mut acc: u64 = 0;
                 for (&src, &len) in slot_off.iter().zip(lengths.iter()) {
-                    let dst = u32::try_from(acc)
-                        .expect("abac GPU encode: packed output exceeds 4 GiB");
+                    let dst =
+                        u32::try_from(acc).expect("abac GPU encode: packed output exceeds 4 GiB");
                     packed_off.push(dst);
                     jobs.push(CopyJob {
                         src_byte: src,
@@ -705,7 +741,8 @@ pub fn verify_against_cpu_encoder(
                 let row = (ty * ts + y) * plane_width + tx * ts;
                 coeffs.extend_from_slice(&plane[row..row + ts]);
             }
-            let want = super::abac_tile::abac_encode_tile(&coeffs, tile_size, num_levels, cb, coder);
+            let want =
+                super::abac_tile::abac_encode_tile(&coeffs, tile_size, num_levels, cb, coder);
             let g = &got[t];
             assert_eq!(
                 g.block_lengths, want.block_lengths,

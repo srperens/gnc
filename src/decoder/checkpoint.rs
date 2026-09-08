@@ -85,7 +85,14 @@ impl DecoderPipeline {
         let weights_luma = config.subband_weights.pack_weights();
 
         // Upload frame data (entropy data, MVs, etc.)
-        self.ensure_cached(ctx, padded_w, padded_h, info.width, info.height, info.tile_size);
+        self.ensure_cached(
+            ctx,
+            padded_w,
+            padded_h,
+            info.width,
+            info.height,
+            info.tile_size,
+        );
         self.prepare_frame_data(ctx, frame);
 
         let cached = self.cached.borrow();

@@ -183,12 +183,21 @@ pub fn psnr_tile_boundary(
     let peak = peak_val as f64;
     let peak_sq = peak * peak;
     let to_psnr = |mse: f64, n: usize| -> f64 {
-        if n == 0 { return f64::NAN; }
+        if n == 0 {
+            return f64::NAN;
+        }
         let m = mse / n as f64;
-        if m < 1e-10 { f64::INFINITY } else { 10.0 * (peak_sq / m).log10() }
+        if m < 1e-10 {
+            f64::INFINITY
+        } else {
+            10.0 * (peak_sq / m).log10()
+        }
     };
 
-    (to_psnr(mse_boundary, n_boundary), to_psnr(mse_interior, n_interior))
+    (
+        to_psnr(mse_boundary, n_boundary),
+        to_psnr(mse_interior, n_interior),
+    )
 }
 
 /// Result of quality measurement

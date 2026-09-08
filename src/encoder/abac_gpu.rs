@@ -198,10 +198,22 @@ impl GpuAbacDecoder {
             label: Some("abac_decode_bind"),
             layout: &self.bgl,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: param_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: stream_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: info_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: out_buf.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: param_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: stream_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: info_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: out_buf.as_entire_binding(),
+                },
             ],
         });
 
@@ -308,7 +320,10 @@ impl GpuAbacDecoder {
         }
         let num_blocks = infos.len() as u32;
         AbacPacked {
-            params: Params { num_blocks, _pad: [0; 3] },
+            params: Params {
+                num_blocks,
+                _pad: [0; 3],
+            },
             block_info: bytemuck::cast_slice(&infos).to_vec(),
             stream_data,
             coder,
@@ -333,10 +348,22 @@ impl GpuAbacDecoder {
             label: Some("abac_decode_bind"),
             layout: &self.bgl,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: stream.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: block_info.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: out.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: params.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: stream.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: block_info.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: out.as_entire_binding(),
+                },
             ],
         });
         let mut pass = cmd.begin_compute_pass(&wgpu::ComputePassDescriptor {

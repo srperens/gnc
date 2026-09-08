@@ -98,13 +98,13 @@ impl BlockTransform {
                     ],
                 });
 
-        let pipeline_layout =
-            ctx.device
-                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("block_transform_pl"),
-                    bind_group_layouts: &[&bind_group_layout],
-                    push_constant_ranges: &[],
-                });
+        let pipeline_layout = ctx
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("block_transform_pl"),
+                bind_group_layouts: &[&bind_group_layout],
+                push_constant_ranges: &[],
+            });
 
         fn make_pipeline(
             ctx: &GpuContext,
@@ -172,7 +172,17 @@ impl BlockTransform {
         forward: bool,
         transform_type: BlockTransformType,
     ) {
-        self.dispatch_with_levels(ctx, encoder, input, output, width, height, forward, transform_type, 2)
+        self.dispatch_with_levels(
+            ctx,
+            encoder,
+            input,
+            output,
+            width,
+            height,
+            forward,
+            transform_type,
+            2,
+        )
     }
 
     /// Dispatch with explicit level count (only meaningful for HaarBlock).

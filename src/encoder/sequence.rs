@@ -45,7 +45,12 @@ struct FrameSource<F: FnMut(usize) -> Arc<Vec<f32>>> {
 
 impl<F: FnMut(usize) -> Arc<Vec<f32>>> FrameSource<F> {
     fn new(load: F) -> Self {
-        FrameSource { load, cache: Vec::with_capacity(FRAME_CACHE_SLOTS), requests: 0, loads: 0 }
+        FrameSource {
+            load,
+            cache: Vec::with_capacity(FRAME_CACHE_SLOTS),
+            requests: 0,
+            loads: 0,
+        }
     }
 
     /// Pixels for display index `i`, from the cache when they are already here.
@@ -296,20 +301,19 @@ impl EncoderPipeline {
         // makes every following P-frame encode far worse — the encoder produced a 32% larger
         // file with diagnostics on than off. Off by default until that is fixed; set
         // GNC_DIAG_TWAV=1 to opt in and accept the corruption. See RESEARCH_LOG 2026-09-06.
-        let diag_twav_staging: Option<[wgpu::Buffer; 3]> = if diag_enabled
-            && std::env::var("GNC_DIAG_TWAV").is_ok()
-        {
-            Some(std::array::from_fn(|i| {
-                ctx.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some(["diag_twav_y", "diag_twav_co", "diag_twav_cg"][i]),
-                    size: (padded_pixels * std::mem::size_of::<f32>()) as u64,
-                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                })
-            }))
-        } else {
-            None
-        };
+        let diag_twav_staging: Option<[wgpu::Buffer; 3]> =
+            if diag_enabled && std::env::var("GNC_DIAG_TWAV").is_ok() {
+                Some(std::array::from_fn(|i| {
+                    ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some(["diag_twav_y", "diag_twav_co", "diag_twav_cg"][i]),
+                        size: (padded_pixels * std::mem::size_of::<f32>()) as u64,
+                        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    })
+                }))
+            } else {
+                None
+            };
         let mut prev_twav_coeffs: Option<[Vec<f32>; 3]> = None;
 
         // Look-ahead ME pipelining: pre-compute ME for the next P-frame while the
@@ -343,7 +347,8 @@ impl EncoderPipeline {
                     true
                 } else if let Some(ref prev_luma) = prev_frame_luma {
                     let frame_data_for_cut = frames.get(display_idx);
-                    let mad = crate::luma_proxy_mad(&crate::luma_proxy(&frame_data_for_cut), prev_luma);
+                    let mad =
+                        crate::luma_proxy_mad(&crate::luma_proxy(&frame_data_for_cut), prev_luma);
                     let is_cut = mad > config.scene_cut_threshold;
                     if is_cut && std::env::var("GNC_DEBUG").is_ok() {
                         eprintln!(
@@ -362,7 +367,8 @@ impl EncoderPipeline {
                 false
             };
 
-            let is_keyframe = ki <= 1 || display_idx % ki == 0 || !has_reference || scene_cut_forced;
+            let is_keyframe =
+                ki <= 1 || display_idx % ki == 0 || !has_reference || scene_cut_forced;
 
             // Build per-frame config: override qstep if rate control is active.
             // A quantiser *cascade* down the GOP (step growing with distance from the keyframe)
@@ -421,7 +427,6 @@ impl EncoderPipeline {
                 cfg
             };
 
-
             if is_keyframe {
                 let _t_iframe = std::time::Instant::now();
                 let frame_data = frames.get(display_idx);
@@ -464,8 +469,8 @@ impl EncoderPipeline {
                 }
                 has_reference = true;
                 pending_me = None; // discard look-ahead ME on keyframe boundary
-                // LOSSLESS-2 needs this outside `diag_enabled`: it is the estimate of what an
-                // I-frame of the *next* picture would cost, and the decision runs in every build.
+                                   // LOSSLESS-2 needs this outside `diag_enabled`: it is the estimate of what an
+                                   // I-frame of the *next* picture would cost, and the decision runs in every build.
                 last_iframe_bytes = Some(compressed.byte_size());
                 if diag_enabled {
                     let d = diagnostics::collect(
@@ -790,7 +795,8 @@ impl EncoderPipeline {
                 // CPU-side per-tile |P − ref| sum, report fraction of tiles preferring B₄.
                 // Gate passes if > 20% of tiles prefer B₄ (B₄ is closer in time = less residual).
                 if std::env::var_os("GNC_PYRAMID_REF").is_some() {
-                    static PYRAMID_REF_PRINTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                    static PYRAMID_REF_PRINTED: std::sync::OnceLock<()> =
+                        std::sync::OnceLock::new();
                     PYRAMID_REF_PRINTED.get_or_init(|| {
                         eprintln!("[pyramid_ref] diagnostic active (GNC_PYRAMID_REF)");
                     });
@@ -842,10 +848,8 @@ impl EncoderPipeline {
                                             break;
                                         }
                                         let idx = (y * w + x) * ch_stride;
-                                        sad_i0 +=
-                                            (p_frame_data[idx] - i0_data[idx]).abs() as f64;
-                                        sad_b4 +=
-                                            (p_frame_data[idx] - b4_data[idx]).abs() as f64;
+                                        sad_i0 += (p_frame_data[idx] - i0_data[idx]).abs() as f64;
+                                        sad_b4 += (p_frame_data[idx] - b4_data[idx]).abs() as f64;
                                         cnt += 1;
                                     }
                                 }
@@ -861,8 +865,7 @@ impl EncoderPipeline {
 
                         if total_tiles > 0 {
                             let frac = b4_wins as f32 / total_tiles as f32;
-                            let mean_ratio =
-                                (total_sad_ratio / total_tiles as f64) as f32;
+                            let mean_ratio = (total_sad_ratio / total_tiles as f64) as f32;
                             eprintln!(
                                 "[pyramid_ref] P₈(frame {}) vs I₀(frame {}) / B₄_src(frame {}): {}/{} tiles prefer B₄ ({:.1}%) | mean_SAD_ratio={:.3} | gate: {}",
                                 p_display, i0_display, b4_display,
@@ -964,7 +967,11 @@ impl EncoderPipeline {
                 // In pyramid mode: P₈ now references B₄ (gpu_ref_planes = decoded B₄).
                 // Precomputed ME from the previous group was against the old I₀ reference,
                 // so it cannot be reused here. Pass None to force fresh ME against B₄.
-                let p8_pending_me = if pyramid_enabled { None } else { pending_me.take() };
+                let p8_pending_me = if pyramid_enabled {
+                    None
+                } else {
+                    pending_me.take()
+                };
 
                 let (compressed, next_precomputed) = self.encode_pframe(
                     ctx,
@@ -1077,7 +1084,7 @@ impl EncoderPipeline {
                 if pyramid_enabled {
                     // Save P₈ permanently into slot 4 before any bwd manipulation
                     self.copy_bwd_ref_to_pyramid_slot(ctx, 4, plane_size); // P₈ → slot 4
-                    // Load I₀ from slot 3 for B₂'s forward reference
+                                                                           // Load I₀ from slot 3 for B₂'s forward reference
                     self.copy_pyramid_slot_to_fwd_ref(ctx, 3, plane_size); // I₀ → fwd
                     self.copy_pyramid_slot_to_bwd_ref(ctx, 0, plane_size); // B₄ → bwd
                 }
@@ -1124,8 +1131,15 @@ impl EncoderPipeline {
                             mf.bwd_ref_idx = Some(2);
                         }
                         self.local_decode_bframe_to_pyramid_slot(
-                            ctx, &info, &b_config, &fwd_mv, &bwd_mv,
-                            padded_w, padded_h, padded_pixels, 1,
+                            ctx,
+                            &info,
+                            &b_config,
+                            &fwd_mv,
+                            &bwd_mv,
+                            padded_w,
+                            padded_h,
+                            padded_pixels,
+                            1,
                         );
                         if std::env::var("GNC_BFRAME_PYRAMID").is_ok() {
                             eprintln!(
@@ -1195,8 +1209,15 @@ impl EncoderPipeline {
                             mf.bwd_ref_idx = Some(1);
                         }
                         self.local_decode_bframe_to_pyramid_slot(
-                            ctx, &info, &b_config, &fwd_mv, &bwd_mv,
-                            padded_w, padded_h, padded_pixels, 2,
+                            ctx,
+                            &info,
+                            &b_config,
+                            &fwd_mv,
+                            &bwd_mv,
+                            padded_w,
+                            padded_h,
+                            padded_pixels,
+                            2,
                         );
                         if std::env::var("GNC_BFRAME_PYRAMID").is_ok() {
                             eprintln!(
@@ -1229,10 +1250,10 @@ impl EncoderPipeline {
                 //
                 // Layer 3 B-frames encoding
                 let layer3_order = [
-                    (group_start, 0u8, 3u8),     // B₁: fwd=0(past_anchor/slot3), bwd=3(B₂/slot1)
-                    (group_start + 2, 3, 2),      // B₃: fwd=3(B₂/slot1), bwd=2(B₄/slot0)
-                    (group_start + 4, 2, 4),      // B₅: fwd=2(B₄/slot0), bwd=4(B₆/slot2)
-                    (group_start + 6, 4, 1),      // B₇: fwd=4(B₆/slot2), bwd=1(future_P/bwd buf)
+                    (group_start, 0u8, 3u8), // B₁: fwd=0(past_anchor/slot3), bwd=3(B₂/slot1)
+                    (group_start + 2, 3, 2), // B₃: fwd=3(B₂/slot1), bwd=2(B₄/slot0)
+                    (group_start + 4, 2, 4), // B₅: fwd=2(B₄/slot0), bwd=4(B₆/slot2)
+                    (group_start + 6, 4, 1), // B₇: fwd=4(B₆/slot2), bwd=1(future_P/bwd buf)
                 ];
 
                 for (b_display, fwd_idx, bwd_idx) in layer3_order {
@@ -2683,14 +2704,23 @@ impl EncoderPipeline {
             use wgpu::util::DeviceExt;
 
             let num_tiles = (info.tiles_x() * info.tiles_y()) as usize;
-            self.gpu_rice_encoder
-                .prepare_batch_staging(ctx, num_tiles, info.tile_size, batch_size, high_cfg.quantization_step);
+            self.gpu_rice_encoder.prepare_batch_staging(
+                ctx,
+                num_tiles,
+                info.tile_size,
+                batch_size,
+                high_cfg.quantization_step,
+            );
             // Write params_buf ONCE before the batch loop.  On Metal/wgpu write_buffer is
             // staged: only the last write before queue.submit takes effect.  All high frames
             // in a GOP share the same FrameInfo (same tile layout, same wavelet_levels),
             // so a single pre-write is both correct and sufficient.
-            self.gpu_rice_encoder
-                .write_params_buf_for_batch(ctx, &info, high_cfg.wavelet_levels, high_cfg.quantization_step);
+            self.gpu_rice_encoder.write_params_buf_for_batch(
+                ctx,
+                &info,
+                high_cfg.wavelet_levels,
+                high_cfg.quantization_step,
+            );
 
             let weights_luma = high_cfg.subband_weights.pack_weights();
             let weights_chroma = high_cfg.subband_weights.pack_weights_chroma();
@@ -3617,8 +3647,7 @@ impl EncoderPipeline {
         } else if step <= P_SCALE_FINE_STEP {
             1.0
         } else {
-            1.0 + 0.25 * (step - P_SCALE_FINE_STEP)
-                / (P_SCALE_COARSE_STEP - P_SCALE_FINE_STEP)
+            1.0 + 0.25 * (step - P_SCALE_FINE_STEP) / (P_SCALE_COARSE_STEP - P_SCALE_FINE_STEP)
         };
         let p_qp_scale: f32 = std::env::var("GNC_P_QP_SCALE")
             .ok()
@@ -3665,14 +3694,16 @@ impl EncoderPipeline {
         // default is already 1.0, so an override to 1.0 is *correctly* a no-op and must not be
         // mistaken for a dead code path.
         if diagnostics::enabled() {
-            let src = if std::env::var("GNC_P_QP_SCALE").is_ok() { "env" } else { "taper" };
+            let src = if std::env::var("GNC_P_QP_SCALE").is_ok() {
+                "env"
+            } else {
+                "taper"
+            };
             println!(
                 "  p_qp_scale={p_qp_scale:.4} ({src}, default {p_qp_scale_default:.4}), \
                  intra_qstep={:.4} res_qstep={res_qstep:.4} inter_dz_mul={inter_dz_mul:.2} \
                  dz_intra={:.3} dz_referenced={:.3} dz_res={res_dead_zone:.3}",
-                config.quantization_step,
-                config.dead_zone,
-                config.dead_zone_referenced
+                config.quantization_step, config.dead_zone, config.dead_zone_referenced
             );
         }
 
@@ -3817,9 +3848,7 @@ impl EncoderPipeline {
             // frame's Metal sync ran. Reuse the pre-computed MV buffers directly.
             if profile {
                 if skip_preprocess {
-                    eprintln!(
-                        "[me_pipeline] used precomputed ME (skipping phases 0b/1a/1b/2)"
-                    );
+                    eprintln!("[me_pipeline] used precomputed ME (skipping phases 0b/1a/1b/2)");
                 } else {
                     eprintln!("[me_pipeline] used precomputed ME (skipping phase 2 only)");
                 }
@@ -3856,7 +3885,12 @@ impl EncoderPipeline {
             let pyr_h = padded_h / 4;
             // Stage 1: downsample current + reference Y to pyramid resolution.
             self.motion.dispatch_downsample_4x(
-                ctx, &mut cmd, &bufs.plane_a, &bufs.pyr_plane_a, padded_w, padded_h,
+                ctx,
+                &mut cmd,
+                &bufs.plane_a,
+                &bufs.pyr_plane_a,
+                padded_w,
+                padded_h,
             );
             self.motion.dispatch_downsample_4x(
                 ctx,
@@ -4011,13 +4045,7 @@ impl EncoderPipeline {
             );
             // Copy smoothed MVs back into split_mv_buf so downstream MC uses them.
             // split_mv_buf has COPY_DST (added to estimate_split output_mv_buf).
-            cmd.copy_buffer_to_buffer(
-                smooth_scratch,
-                0,
-                &split_mv_buf,
-                0,
-                smooth_scratch.size(),
-            );
+            cmd.copy_buffer_to_buffer(smooth_scratch, 0, &split_mv_buf, 0, smooth_scratch.size());
         }
 
         // BUG-39 cause 4: a lossless configuration has to predict from integers.
@@ -4041,7 +4069,9 @@ impl EncoderPipeline {
         // `GNC_LOSSLESS_FULLPEL=0` restores sub-pel vectors for measurement — the arm that says
         // what full-pel costs in rate.
         let lossless_fullpel = config.is_lossless()
-            && std::env::var("GNC_LOSSLESS_FULLPEL").map(|v| v != "0").unwrap_or(true);
+            && std::env::var("GNC_LOSSLESS_FULLPEL")
+                .map(|v| v != "0")
+                .unwrap_or(true);
         if lossless_fullpel {
             self.motion.dispatch_mv_round_fullpel(
                 ctx,
@@ -4449,9 +4479,11 @@ impl EncoderPipeline {
             });
             cmd.copy_buffer_to_buffer(&bufs.recon_y, 0, &staging, 0, buf_bytes);
             ctx.queue.submit(Some(cmd.finish()));
-            cmd = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("pf_after_ll_spatial"),
-            });
+            cmd = ctx
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("pf_after_ll_spatial"),
+                });
 
             // Readback
             {
@@ -4499,8 +4531,7 @@ impl EncoderPipeline {
                                 let x_curr = tx * tile_size + col;
                                 let x_left = (tx - 1) * tile_size + col;
                                 diff_sum +=
-                                    (coefs[y * pw + x_curr] - coefs[y * pw + x_left])
-                                        .abs() as f64;
+                                    (coefs[y * pw + x_curr] - coefs[y * pw + x_left]).abs() as f64;
                                 n += 1;
                             }
                         }
@@ -5006,7 +5037,12 @@ impl EncoderPipeline {
                 let la_pyr_w = padded_w / 4;
                 let la_pyr_h = padded_h / 4;
                 self.motion.dispatch_downsample_4x(
-                    ctx, &mut me_cmd, &bufs.plane_a, &bufs.pyr_plane_a, padded_w, padded_h,
+                    ctx,
+                    &mut me_cmd,
+                    &bufs.plane_a,
+                    &bufs.pyr_plane_a,
+                    padded_w,
+                    padded_h,
                 );
                 self.motion.dispatch_downsample_4x(
                     ctx,
@@ -5052,8 +5088,7 @@ impl EncoderPipeline {
                     &bufs.me_sad_buf,
                     &bufs.me_dummy_pred,
                 );
-                let next_lambda_sad =
-                    (config.quantization_step * 16.0 + 128.0).round() as u32;
+                let next_lambda_sad = (config.quantization_step * 16.0 + 128.0).round() as u32;
                 let next_split_mv = self.motion.estimate_split(
                     ctx,
                     &mut me_cmd,
@@ -5103,19 +5138,19 @@ impl EncoderPipeline {
                 [&bufs.recon_y, &bufs.co_plane, &bufs.plane_b]
             };
             for (p, quant_buf) in quant_bufs.iter().enumerate() {
-                let (enc_pixels, enc_w, enc_tiles_x, enc_tiles_y, enc_info) =
-                    if p > 0 && is_non_444 {
-                        let ci = chroma_info_pf.as_ref().unwrap();
-                        (
-                            chroma_pixels,
-                            chroma_padded_w,
-                            ci.tiles_x() as usize,
-                            ci.tiles_y() as usize,
-                            ci as &FrameInfo,
-                        )
-                    } else {
-                        (padded_pixels, padded_w, tiles_x, tiles_y, info)
-                    };
+                let (enc_pixels, enc_w, enc_tiles_x, enc_tiles_y, enc_info) = if p > 0 && is_non_444
+                {
+                    let ci = chroma_info_pf.as_ref().unwrap();
+                    (
+                        chroma_pixels,
+                        chroma_padded_w,
+                        ci.tiles_x() as usize,
+                        ci.tiles_y() as usize,
+                        ci as &FrameInfo,
+                    )
+                } else {
+                    (padded_pixels, padded_w, tiles_x, tiles_y, info)
+                };
                 encode_entropy(
                     &mut self.gpu_encoder,
                     &mut self.gpu_abac_encoder,
@@ -5222,9 +5257,7 @@ impl EncoderPipeline {
                 });
             c.copy_buffer_to_buffer(&bufs.gpu_ref_planes[0], 0, &stg_ref, 0, plane_size);
             ctx.queue.submit(Some(c.finish()));
-            diagnostics::dump_residual_plane(
-                ctx, &stg_ref, plane_size, padded_w, padded_h, "Pref",
-            );
+            diagnostics::dump_residual_plane(ctx, &stg_ref, plane_size, padded_w, padded_h, "Pref");
 
             // ... and the current luma plane, so the oracle sees exactly the pair GNC saw.
             let stg_cur = ctx.device.create_buffer(&wgpu::BufferDescriptor {
@@ -5240,9 +5273,7 @@ impl EncoderPipeline {
                 });
             c2.copy_buffer_to_buffer(&bufs.plane_a, 0, &stg_cur, 0, plane_size);
             ctx.queue.submit(Some(c2.finish()));
-            diagnostics::dump_residual_plane(
-                ctx, &stg_cur, plane_size, padded_w, padded_h, "Pcur",
-            );
+            diagnostics::dump_residual_plane(ctx, &stg_cur, plane_size, padded_w, padded_h, "Pcur");
         }
 
         // MEAS-4: dump the spatial-domain MC residual (post-MC, pre-transform) for the
@@ -5332,7 +5363,7 @@ impl EncoderPipeline {
             EntropyMode::Rans => EntropyData::Rans(rans_tiles),
             EntropyMode::Rice => EntropyData::Rice(rice_tiles),
             EntropyMode::Huffman => EntropyData::Huffman(huffman_tiles),
-        EntropyMode::Abac => EntropyData::Abac(abac_tiles),
+            EntropyMode::Abac => EntropyData::Abac(abac_tiles),
         };
 
         (
@@ -5387,7 +5418,12 @@ impl EncoderPipeline {
         // Pixel data for the *next* B-frame in the group (if any).
         // When Some and use_rice+!is_non_444, submits look-ahead ME before Rice readback poll.
         next_frame_pixels: Option<&[f32]>,
-    ) -> (CompressedFrame, wgpu::Buffer, wgpu::Buffer, Option<PrecomputedBFrameME>) {
+    ) -> (
+        CompressedFrame,
+        wgpu::Buffer,
+        wgpu::Buffer,
+        Option<PrecomputedBFrameME>,
+    ) {
         let plane_size = (padded_pixels * std::mem::size_of::<f32>()) as u64;
 
         self.ensure_cached(
@@ -5612,11 +5648,11 @@ impl EncoderPipeline {
         // Y-plane drives the skip decision; chroma follows via the MV scaling path.
         {
             let skip_thr = tile_skip_motion_threshold(config.quantization_step);
-            let mut skip_cmd =
-                ctx.device
-                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                        label: Some("bf_skip_bidir"),
-                    });
+            let mut skip_cmd = ctx
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("bf_skip_bidir"),
+                });
             self.dispatch_tile_skip_bidir(
                 ctx,
                 &mut skip_cmd,
@@ -5995,11 +6031,8 @@ impl EncoderPipeline {
             // for the next frame, and co_plane holds this frame's quantised Co coefficients,
             // which the CPU entropy stage has not read yet.
             if gpu_entropy && use_rice && !is_non_444 {
-                ctx.queue.write_buffer(
-                    &bufs.raw_input_buf,
-                    0,
-                    bytemuck::cast_slice(next_pixels),
-                );
+                ctx.queue
+                    .write_buffer(&bufs.raw_input_buf, 0, bytemuck::cast_slice(next_pixels));
                 let mut me_cmd =
                     ctx.device
                         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -6070,19 +6103,19 @@ impl EncoderPipeline {
                 [&bufs.recon_y, &bufs.co_plane, &bufs.plane_b]
             };
             for (p, quant_buf) in quant_bufs.iter().enumerate() {
-                let (enc_pixels, enc_w, enc_tiles_x, enc_tiles_y, enc_info) =
-                    if p > 0 && is_non_444 {
-                        let ci = chroma_info_bf.as_ref().unwrap();
-                        (
-                            chroma_pixels,
-                            chroma_padded_w,
-                            ci.tiles_x() as usize,
-                            ci.tiles_y() as usize,
-                            ci as &FrameInfo,
-                        )
-                    } else {
-                        (padded_pixels, padded_w, tiles_x, tiles_y, info)
-                    };
+                let (enc_pixels, enc_w, enc_tiles_x, enc_tiles_y, enc_info) = if p > 0 && is_non_444
+                {
+                    let ci = chroma_info_bf.as_ref().unwrap();
+                    (
+                        chroma_pixels,
+                        chroma_padded_w,
+                        ci.tiles_x() as usize,
+                        ci.tiles_y() as usize,
+                        ci as &FrameInfo,
+                    )
+                } else {
+                    (padded_pixels, padded_w, tiles_x, tiles_y, info)
+                };
                 encode_entropy(
                     &mut self.gpu_encoder,
                     &mut self.gpu_abac_encoder,
@@ -6216,7 +6249,7 @@ impl EncoderPipeline {
             EntropyMode::Rans => EntropyData::Rans(rans_tiles),
             EntropyMode::Rice => EntropyData::Rice(rice_tiles),
             EntropyMode::Huffman => EntropyData::Huffman(huffman_tiles),
-        EntropyMode::Abac => EntropyData::Abac(abac_tiles),
+            EntropyMode::Abac => EntropyData::Abac(abac_tiles),
         };
 
         (
@@ -6382,8 +6415,11 @@ impl EncoderPipeline {
 
         let is_non_444 = info.chroma_format != ChromaFormat::Yuv444;
         let is_420 = info.chroma_format == ChromaFormat::Yuv420;
-        let chroma_info_opt: Option<FrameInfo> =
-            if is_non_444 { Some(info.make_chroma_info()) } else { None };
+        let chroma_info_opt: Option<FrameInfo> = if is_non_444 {
+            Some(info.make_chroma_info())
+        } else {
+            None
+        };
         let chroma_shift_x = info.chroma_format.horiz_shift();
         let chroma_shift_y = info.chroma_format.vert_shift();
         let (chroma_padded_w, chroma_padded_h, chroma_pixels) =
@@ -6515,7 +6551,7 @@ impl EncoderPipeline {
                     &bufs.mv_chroma_buf,     // scaled fwd MVs
                     &bufs.mv_chroma_buf_bwd, // scaled bwd MVs
                     &bufs.bidir_modes_scratch,
-                    chroma_scratch,          // output: reconstructed at chroma dims
+                    chroma_scratch, // output: reconstructed at chroma dims
                     chroma_padded_w,
                     chroma_padded_h,
                     false, // inverse: recon = residual + prediction

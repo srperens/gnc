@@ -511,14 +511,14 @@ impl MotionEstimator {
                 });
 
         // --- Pyramid ME: 4× downsample ---
-        let downsample_4x_shader =
-            ctx.device
-                .create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some("downsample_4x"),
-                    source: wgpu::ShaderSource::Wgsl(
-                        include_str!("../shaders/downsample_4x.wgsl").into(),
-                    ),
-                });
+        let downsample_4x_shader = ctx
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("downsample_4x"),
+                source: wgpu::ShaderSource::Wgsl(
+                    include_str!("../shaders/downsample_4x.wgsl").into(),
+                ),
+            });
 
         // 3 bindings: uniform params, input (ro), output (rw)
         let downsample_4x_bgl =
@@ -528,13 +528,13 @@ impl MotionEstimator {
                     entries: &[bgl_uniform(0), bgl_storage_ro(1), bgl_storage_rw(2)],
                 });
 
-        let downsample_4x_pl =
-            ctx.device
-                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("downsample_4x_pl"),
-                    bind_group_layouts: &[&downsample_4x_bgl],
-                    push_constant_ranges: &[],
-                });
+        let downsample_4x_pl = ctx
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("downsample_4x_pl"),
+                bind_group_layouts: &[&downsample_4x_bgl],
+                push_constant_ranges: &[],
+            });
 
         let downsample_4x_pipeline =
             ctx.device
@@ -548,14 +548,14 @@ impl MotionEstimator {
                 });
 
         // --- Pyramid ME: spread MVs ×4 to full-res predictor ---
-        let mv_spread_4x_shader =
-            ctx.device
-                .create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some("mv_spread_4x"),
-                    source: wgpu::ShaderSource::Wgsl(
-                        include_str!("../shaders/mv_spread_4x.wgsl").into(),
-                    ),
-                });
+        let mv_spread_4x_shader = ctx
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("mv_spread_4x"),
+                source: wgpu::ShaderSource::Wgsl(
+                    include_str!("../shaders/mv_spread_4x.wgsl").into(),
+                ),
+            });
 
         // 3 bindings: uniform params, pyramid_mvs (ro), full_pred (rw)
         let mv_spread_4x_bgl =
@@ -565,13 +565,13 @@ impl MotionEstimator {
                     entries: &[bgl_uniform(0), bgl_storage_ro(1), bgl_storage_rw(2)],
                 });
 
-        let mv_spread_4x_pl =
-            ctx.device
-                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("mv_spread_4x_pl"),
-                    bind_group_layouts: &[&mv_spread_4x_bgl],
-                    push_constant_ranges: &[],
-                });
+        let mv_spread_4x_pl = ctx
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("mv_spread_4x_pl"),
+                bind_group_layouts: &[&mv_spread_4x_bgl],
+                push_constant_ranges: &[],
+            });
 
         let mv_spread_4x_pipeline =
             ctx.device
@@ -2195,7 +2195,11 @@ impl MotionEstimator {
             let by_mb = mb_idx / bx;
 
             // 32×32 requires 2×2 macroblock group aligned to even (bx, by)
-            let sad_32x32 = if bx_mb.is_multiple_of(2) && by_mb.is_multiple_of(2) && bx_mb + 1 < bx && by_mb + 1 < by {
+            let sad_32x32 = if bx_mb.is_multiple_of(2)
+                && by_mb.is_multiple_of(2)
+                && bx_mb + 1 < bx
+                && by_mb + 1 < by
+            {
                 let i00 = by_mb * bx + bx_mb;
                 let i10 = by_mb * bx + bx_mb + 1;
                 let i01 = (by_mb + 1) * bx + bx_mb;
@@ -2429,7 +2433,12 @@ impl MotionEstimator {
             out_w: u32,
             out_h: u32,
         }
-        let params = Params { in_w, in_h, out_w, out_h };
+        let params = Params {
+            in_w,
+            in_h,
+            out_w,
+            out_h,
+        };
         let params_buf = ctx
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -2442,9 +2451,18 @@ impl MotionEstimator {
             label: Some("downsample_4x_bg"),
             layout: &self.downsample_4x_bgl,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: params_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: input.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: output.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: input.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: output.as_entire_binding(),
+                },
             ],
         });
 
@@ -2483,7 +2501,12 @@ impl MotionEstimator {
             full_blocks_x: u32,
             full_blocks_y: u32,
         }
-        let params = Params { pyr_blocks_x, pyr_blocks_y, full_blocks_x, full_blocks_y };
+        let params = Params {
+            pyr_blocks_x,
+            pyr_blocks_y,
+            full_blocks_x,
+            full_blocks_y,
+        };
         let params_buf = ctx
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -2496,9 +2519,18 @@ impl MotionEstimator {
             label: Some("mv_spread_4x_bg"),
             layout: &self.mv_spread_4x_bgl,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: params_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: pyramid_mvs.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: full_pred.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: pyramid_mvs.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: full_pred.as_entire_binding(),
+                },
             ],
         });
 

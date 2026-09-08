@@ -349,7 +349,7 @@ fn serialize_frame_header(frame: &crate::CompressedFrame, out: &mut Vec<u8>) {
     if let Some(ref modes) = frame.intra_modes {
         out.push(1u8); // intra_flag
         let num_blocks = modes.len() as u32 * 4; // approximate: 4 modes per byte
-        // Store exact block count from dimensions
+                                                 // Store exact block count from dimensions
         let blocks_x = frame.info.padded_width() / 8;
         let blocks_y = frame.info.padded_height() / 8;
         let exact_blocks = blocks_x * blocks_y;
@@ -378,12 +378,11 @@ fn serialize_tile_blobs(entropy: &crate::EntropyData) -> Vec<Vec<u8>> {
         crate::EntropyData::SubbandRans(tiles) => {
             tiles.iter().map(rans::serialize_tile_subband).collect()
         }
-        crate::EntropyData::Bitplane(tiles) => {
-            tiles.iter().map(bitplane::serialize_tile_bitplane).collect()
-        }
-        crate::EntropyData::Rice(tiles) => {
-            tiles.iter().map(rice::serialize_tile_rice).collect()
-        }
+        crate::EntropyData::Bitplane(tiles) => tiles
+            .iter()
+            .map(bitplane::serialize_tile_bitplane)
+            .collect(),
+        crate::EntropyData::Rice(tiles) => tiles.iter().map(rice::serialize_tile_rice).collect(),
         crate::EntropyData::Huffman(tiles) => {
             tiles.iter().map(huffman::serialize_tile_huffman).collect()
         }
@@ -420,7 +419,11 @@ fn median3(a: i16, b: i16, c: i16) -> i16 {
 fn mv_predictor(vectors: &[[i16; 2]], bx: usize, by: usize, blocks_x: usize) -> [i16; 2] {
     let idx = by * blocks_x + bx;
     let left = if bx > 0 { vectors[idx - 1] } else { [0, 0] };
-    let above = if by > 0 { vectors[idx - blocks_x] } else { [0, 0] };
+    let above = if by > 0 {
+        vectors[idx - blocks_x]
+    } else {
+        [0, 0]
+    };
     let above_right = if by > 0 && bx + 1 < blocks_x {
         vectors[idx - blocks_x + 1]
     } else {
@@ -503,7 +506,11 @@ pub(crate) struct BitReader<'a> {
 
 impl<'a> BitReader<'a> {
     pub(crate) fn new(data: &'a [u8], start: usize) -> Self {
-        Self { data, byte: start, bit: 0 }
+        Self {
+            data,
+            byte: start,
+            bit: 0,
+        }
     }
 
     pub(crate) fn get_bit(&mut self) -> u32 {
@@ -806,11 +813,8 @@ pub fn substitute_tiles(frame: &mut crate::CompressedFrame, tile_indices: &[usiz
             crate::EntropyData::SubbandRans(ref mut tiles) => {
                 if idx < tiles.len() {
                     let t = &tiles[idx];
-                    tiles[idx] = make_zero_subband_tile(
-                        t.num_coefficients,
-                        t.tile_size,
-                        t.num_levels,
-                    );
+                    tiles[idx] =
+                        make_zero_subband_tile(t.num_coefficients, t.tile_size, t.num_levels);
                 }
             }
             crate::EntropyData::Bitplane(ref mut tiles) => {
@@ -865,7 +869,10 @@ pub fn substitute_tiles(frame: &mut crate::CompressedFrame, tile_indices: &[usiz
                         tile_size: t.tile_size,
                         num_levels: t.num_levels,
                         num_groups: t.num_groups,
-                        code_lengths: vec![vec![0u8; huffman::HUFFMAN_ALPHABET_SIZE]; t.num_groups as usize],
+                        code_lengths: vec![
+                            vec![0u8; huffman::HUFFMAN_ALPHABET_SIZE];
+                            t.num_groups as usize
+                        ],
                         k_zrl_values: vec![0; t.num_groups as usize],
                         stream_lengths: vec![0; huffman::HUFFMAN_STREAMS_PER_TILE],
                         stream_data: Vec::new(),
@@ -971,9 +978,7 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
         // GP19: abac context-codes the Exp-Golomb unary prefix (ENT-9 candidate A). Only type 5
         // moved; every other coder is byte-identical to GP18.
         b"GP19" => 19,
-        _ => panic!(
-            "Invalid magic (expected GPC8..GP19; older files must be re-encoded)"
-        ),
+        _ => panic!("Invalid magic (expected GPC8..GP19; older files must be re-encoded)"),
     };
 
     // --- Common header (same layout for GPC9/GP10/GP11; GPC8 lacks per-subband flag) ---
@@ -1007,8 +1012,7 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
 
     // Chroma format byte (GP13/GP14; older formats default to 4:4:4)
     let chroma_format_decoded = if gen >= 13 {
-        let cf = crate::ChromaFormat::from_u8(data[pos])
-            .unwrap_or(crate::ChromaFormat::Yuv444);
+        let cf = crate::ChromaFormat::from_u8(data[pos]).unwrap_or(crate::ChromaFormat::Yuv444);
         pos += 1;
         cf
     } else {
@@ -1111,8 +1115,7 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
         let mf = if ft == crate::FrameType::Predicted || ft == crate::FrameType::Bidirectional {
             let block_size = u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap()) as u32;
             pos += 2;
-            let num_blocks =
-                u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+            let num_blocks = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
             pos += 4;
             let vectors = if gen >= 12 {
                 // GP12/GP13/GP14: delta-coded zigzag varint MVs
@@ -1131,54 +1134,57 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
                 vecs
             };
             // GP11/GP12/GP13/GP14 B-frames: backward vectors + block modes
-            let (backward_vectors, block_modes, fwd_ref_idx, bwd_ref_idx) =
-                if (gen >= 11) && ft == crate::FrameType::Bidirectional {
-                    let bwd_count =
-                        u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
-                    pos += 4;
-                    let bwd = if bwd_count > 0 {
-                        if gen >= 12 {
-                            let padded_w = width.div_ceil(tile_size) * tile_size;
-                            let bwd_blocks_x = (padded_w / 16) as usize;
-                            Some(deserialize_mvs_delta(data, &mut pos, bwd_count, bwd_blocks_x))
-                        } else {
-                            let mut bv = Vec::with_capacity(bwd_count);
-                            for _ in 0..bwd_count {
-                                let dx =
-                                    i16::from_le_bytes(data[pos..pos + 2].try_into().unwrap());
-                                let dy =
-                                    i16::from_le_bytes(data[pos + 2..pos + 4].try_into().unwrap());
-                                bv.push([dx, dy]);
-                                pos += 4;
-                            }
-                            Some(bv)
+            let (backward_vectors, block_modes, fwd_ref_idx, bwd_ref_idx) = if (gen >= 11)
+                && ft == crate::FrameType::Bidirectional
+            {
+                let bwd_count = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+                pos += 4;
+                let bwd = if bwd_count > 0 {
+                    if gen >= 12 {
+                        let padded_w = width.div_ceil(tile_size) * tile_size;
+                        let bwd_blocks_x = (padded_w / 16) as usize;
+                        Some(deserialize_mvs_delta(
+                            data,
+                            &mut pos,
+                            bwd_count,
+                            bwd_blocks_x,
+                        ))
+                    } else {
+                        let mut bv = Vec::with_capacity(bwd_count);
+                        for _ in 0..bwd_count {
+                            let dx = i16::from_le_bytes(data[pos..pos + 2].try_into().unwrap());
+                            let dy = i16::from_le_bytes(data[pos + 2..pos + 4].try_into().unwrap());
+                            bv.push([dx, dy]);
+                            pos += 4;
                         }
-                    } else {
-                        None
-                    };
-                    let modes_count =
-                        u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
-                    pos += 4;
-                    let modes = if modes_count > 0 {
-                        let m = data[pos..pos + modes_count].to_vec();
-                        pos += modes_count;
-                        Some(m)
-                    } else {
-                        None
-                    };
-                    // GP14+: ref pool indices (1 byte each); older formats default to 0/1
-                    let (fwd_idx, bwd_idx) = if gen >= 14 {
-                        let f = data[pos];
-                        let b = data[pos + 1];
-                        pos += 2;
-                        (Some(f), Some(b))
-                    } else {
-                        (None, None)
-                    };
-                    (bwd, modes, fwd_idx, bwd_idx)
+                        Some(bv)
+                    }
                 } else {
-                    (None, None, None, None)
+                    None
                 };
+                let modes_count =
+                    u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+                pos += 4;
+                let modes = if modes_count > 0 {
+                    let m = data[pos..pos + modes_count].to_vec();
+                    pos += modes_count;
+                    Some(m)
+                } else {
+                    None
+                };
+                // GP14+: ref pool indices (1 byte each); older formats default to 0/1
+                let (fwd_idx, bwd_idx) = if gen >= 14 {
+                    let f = data[pos];
+                    let b = data[pos + 1];
+                    pos += 2;
+                    (Some(f), Some(b))
+                } else {
+                    (None, None)
+                };
+                (bwd, modes, fwd_idx, bwd_idx)
+            } else {
+                (None, None, None, None)
+            };
             Some(crate::MotionField {
                 vectors,
                 block_size,
@@ -1251,7 +1257,11 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
                 tiles.push(tile);
                 pos += consumed;
             }
-            (crate::EntropyCoder::Rans, crate::EntropyData::Rans(tiles), false)
+            (
+                crate::EntropyCoder::Rans,
+                crate::EntropyData::Rans(tiles),
+                false,
+            )
         }
         1 => {
             let mut tiles = Vec::with_capacity(num_tiles);
@@ -1341,8 +1351,7 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
                 } else {
                     &data[pos..]
                 };
-                let (tile, consumed) =
-                    crate::encoder::abac_tile::deserialize_tile_abac(slice);
+                let (tile, consumed) = crate::encoder::abac_tile::deserialize_tile_abac(slice);
                 tiles.push(tile);
                 pos += consumed;
             }
@@ -1835,8 +1844,11 @@ pub fn deserialize_temporal_group(
     // Collect highpass entries (frame_role=1), grouped by temporal_level
     // Entries are stored deepest-first in the file, but high_frames vec
     // is indexed [0] = finest level, so we need to reconstruct that ordering.
-    let hp_entries: Vec<&TemporalFrameIndexEntry> =
-        gop_entries.iter().filter(|e| e.frame_role == 1).copied().collect();
+    let hp_entries: Vec<&TemporalFrameIndexEntry> = gop_entries
+        .iter()
+        .filter(|e| e.frame_role == 1)
+        .copied()
+        .collect();
 
     if hp_entries.is_empty() {
         return crate::TemporalGroup {
@@ -2014,7 +2026,7 @@ mod tests {
             k_values: vec![0; num_groups as usize],
             k_zrl_nz_values: vec![0; num_groups as usize],
             k_zrl_z_values: vec![0; num_groups as usize],
-            skip_bitmap: 0xFF, // all groups skipped (all zeros)
+            skip_bitmap: 0xFF,        // all groups skipped (all zeros)
             k_stream_odd: Vec::new(), // no checkerboard ctx for all-skip tile
             stream_lengths: vec![0; rice::RICE_STREAMS_PER_TILE],
             stream_data: Vec::new(),
@@ -2067,7 +2079,10 @@ mod tests {
             low_frame: make_test_frame(width, height),
             high_frames: vec![
                 // level 0 (finest): 2 frames
-                vec![make_test_frame(width, height), make_test_frame(width, height)],
+                vec![
+                    make_test_frame(width, height),
+                    make_test_frame(width, height),
+                ],
                 // level 1 (deepest): 1 frame
                 vec![make_test_frame(width, height)],
             ],
@@ -2158,8 +2173,7 @@ mod tests {
             for (li, level_frames) in group.high_frames.iter().enumerate() {
                 for (fi, frame) in level_frames.iter().enumerate() {
                     let hp_bytes = serialize_compressed(frame);
-                    let orig_hp_bytes =
-                        serialize_compressed(&orig_group.high_frames[li][fi]);
+                    let orig_hp_bytes = serialize_compressed(&orig_group.high_frames[li][fi]);
                     assert_eq!(
                         hp_bytes, orig_hp_bytes,
                         "Highpass frame mismatch in GOP {gi}, level {li}, frame {fi}"

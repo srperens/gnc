@@ -13,14 +13,14 @@ use crate::GpuContext;
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 struct ChromaResampleParams {
-    src_width:         u32,
-    src_height:        u32,
-    dst_width:         u32,
-    dst_height:        u32,
-    dst_stride:        u32,  // tile-aligned row stride (= chroma_padded_width for downsample)
-    dst_height_padded: u32,  // tile-aligned height     (= chroma_padded_height for downsample)
-    shift_x:           u32,
-    shift_y:           u32,
+    src_width: u32,
+    src_height: u32,
+    dst_width: u32,
+    dst_height: u32,
+    dst_stride: u32, // tile-aligned row stride (= chroma_padded_width for downsample)
+    dst_height_padded: u32, // tile-aligned height     (= chroma_padded_height for downsample)
+    shift_x: u32,
+    shift_y: u32,
 }
 
 /// GPU pipeline for chroma resampling (either downsample or upsample).
@@ -30,16 +30,18 @@ struct ChromaResampleParams {
 /// layout (uniform params + two storage buffers) and differ only in the
 /// shader used.
 pub struct ChromaResampler {
-    pipeline:          wgpu::ComputePipeline,
+    pipeline: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
 }
 
 impl ChromaResampler {
     fn new_with_shader(ctx: &GpuContext, shader_src: &str, label: &str) -> Self {
-        let shader = ctx.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some(label),
-            source: wgpu::ShaderSource::Wgsl(shader_src.into()),
-        });
+        let shader = ctx
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some(label),
+                source: wgpu::ShaderSource::Wgsl(shader_src.into()),
+            });
 
         let bind_group_layout =
             ctx.device
@@ -79,26 +81,29 @@ impl ChromaResampler {
                     ],
                 });
 
-        let pipeline_layout =
-            ctx.device
-                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some(&format!("{label}_pl")),
-                    bind_group_layouts: &[&bind_group_layout],
-                    push_constant_ranges: &[],
-                });
+        let pipeline_layout = ctx
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some(&format!("{label}_pl")),
+                bind_group_layouts: &[&bind_group_layout],
+                push_constant_ranges: &[],
+            });
 
-        let pipeline =
-            ctx.device
-                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some(&format!("{label}_pipeline")),
-                    layout: Some(&pipeline_layout),
-                    module: &shader,
-                    entry_point: Some("main"),
-                    compilation_options: Default::default(),
-                    cache: None,
-                });
+        let pipeline = ctx
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(&format!("{label}_pipeline")),
+                layout: Some(&pipeline_layout),
+                module: &shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
 
-        Self { pipeline, bind_group_layout }
+        Self {
+            pipeline,
+            bind_group_layout,
+        }
     }
 
     /// Create a downsampler (box-filter average).
@@ -145,9 +150,20 @@ impl ChromaResampler {
         dst_height_padded: u32,
     ) {
         // Valid dst dims are derived from the source dims and shift factors.
-        self.dispatch_raw(ctx, cmd, src_buf, dst_buf, src_w, src_h,
-            src_w >> shift_x, src_h >> shift_y, shift_x, shift_y,
-            dst_stride, dst_height_padded);
+        self.dispatch_raw(
+            ctx,
+            cmd,
+            src_buf,
+            dst_buf,
+            src_w,
+            src_h,
+            src_w >> shift_x,
+            src_h >> shift_y,
+            shift_x,
+            shift_y,
+            dst_stride,
+            dst_height_padded,
+        );
     }
 
     /// Dispatch upsample: src is chroma-sized (padded), dst is luma-sized.
@@ -170,11 +186,11 @@ impl ChromaResampler {
         // stride/padded-height fields.  Pass them as 0 so there are no dummy
         // sentinel values, and dispatch exactly dst_w * dst_h invocations.
         let params = ChromaResampleParams {
-            src_width:         src_w,
-            src_height:        src_h,
-            dst_width:         dst_w,
-            dst_height:        dst_h,
-            dst_stride:        0, // unused by upsample shader
+            src_width: src_w,
+            src_height: src_h,
+            dst_width: dst_w,
+            dst_height: dst_h,
+            dst_stride: 0,        // unused by upsample shader
             dst_height_padded: 0, // unused by upsample shader
             shift_x,
             shift_y,
@@ -200,9 +216,9 @@ impl ChromaResampler {
         dst_height_padded: u32,
     ) {
         let params = ChromaResampleParams {
-            src_width:  src_w,
+            src_width: src_w,
             src_height: src_h,
-            dst_width:  dst_w,
+            dst_width: dst_w,
             dst_height: dst_h,
             dst_stride,
             dst_height_padded,
@@ -226,13 +242,13 @@ impl ChromaResampler {
         params: &ChromaResampleParams,
         total_dst: u32,
     ) {
-        let params_buf =
-            ctx.device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("chroma_resample_params"),
-                    contents: bytemuck::bytes_of(params),
-                    usage: wgpu::BufferUsages::UNIFORM,
-                });
+        let params_buf = ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("chroma_resample_params"),
+                contents: bytemuck::bytes_of(params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
 
         let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("chroma_resample_bg"),

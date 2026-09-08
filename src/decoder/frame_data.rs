@@ -1,14 +1,14 @@
 use wgpu;
 
 use super::pipeline::DecoderPipeline;
+use crate::encoder::abac_gpu::GpuAbacDecoder;
 use crate::encoder::bitplane::GpuBitplaneDecoder;
 use crate::encoder::cfl;
 use crate::encoder::entropy_helpers;
+use crate::encoder::huffman_gpu::GpuHuffmanDecoder;
 use crate::encoder::motion::MotionEstimator;
-use crate::encoder::abac_gpu::GpuAbacDecoder;
 use crate::encoder::rans_gpu::GpuRansDecoder;
 use crate::encoder::rice_gpu::GpuRiceDecoder;
-use crate::encoder::huffman_gpu::GpuHuffmanDecoder;
 use crate::gpu_util::ensure_var_buf;
 use crate::{ChromaFormat, CompressedFrame, EntropyData, FrameInfo, GpuContext};
 
@@ -127,7 +127,8 @@ impl DecoderPipeline {
                     for p in 0..3 {
                         let start = plane_offset[p];
                         let plane_tiles = &tiles[start..start + plane_tiles[p]];
-                        let packed = GpuRansDecoder::pack_decode_data_subband(plane_tiles, plane_info[p]);
+                        let packed =
+                            GpuRansDecoder::pack_decode_data_subband(plane_tiles, plane_info[p]);
                         let a_size = (packed.cumfreq.len() * 4) as u64;
                         let b_size = (packed.stream_data.len() * 4) as u64;
 
@@ -181,7 +182,8 @@ impl DecoderPipeline {
                     // frame (PERF-1 item 7). `lens` says how much of the scratch is this
                     // frame's — the vectors themselves stay at high-water mark.
                     let scratch = &mut bufs.rice_pack_scratch[p];
-                    let lens = GpuRiceDecoder::pack_decode_data_into(p_tiles, plane_info[p], scratch);
+                    let lens =
+                        GpuRiceDecoder::pack_decode_data_into(p_tiles, plane_info[p], scratch);
                     let k_values = &scratch.k_values[..lens.k_len];
                     let stream_data = &scratch.stream_data[..lens.stream_words];
                     let stream_offsets = &scratch.stream_offsets[..lens.offsets_len];
@@ -426,11 +428,8 @@ impl DecoderPipeline {
                 "dec_intra_modes",
                 storage_dst,
             );
-            ctx.queue.write_buffer(
-                &bufs.intra_modes_buf,
-                0,
-                bytemuck::cast_slice(&modes_u32),
-            );
+            ctx.queue
+                .write_buffer(&bufs.intra_modes_buf, 0, bytemuck::cast_slice(&modes_u32));
         }
 
         // --- CfL alphas ---

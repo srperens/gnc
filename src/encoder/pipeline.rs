@@ -13,14 +13,14 @@ use super::huffman;
 use super::huffman_gpu::GpuHuffmanEncoder;
 use super::interleave::PlaneDeinterleaver;
 use super::intra::IntraPredictor;
-use super::temporal_53::Temporal53Gpu;
-use super::temporal_haar::TemporalHaarGpu;
 use super::quantize::Quantizer;
 use super::quantize_histogram_fused::FusedQuantizeHistogram;
 use super::rans;
 use super::rans_gpu_encode::GpuRansEncoder;
 use super::rice;
 use super::rice_gpu::GpuRiceEncoder;
+use super::temporal_53::Temporal53Gpu;
+use super::temporal_haar::TemporalHaarGpu;
 use super::transform::WaveletTransform;
 use crate::gpu_util::ensure_var_buf;
 use crate::{
@@ -258,39 +258,37 @@ impl EncoderPipeline {
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("tile_skip"),
-                source: wgpu::ShaderSource::Wgsl(
-                    include_str!("../shaders/tile_skip.wgsl").into(),
-                ),
+                source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/tile_skip.wgsl").into()),
             });
-        let tile_skip_bgl =
-            ctx.device
-                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                    label: Some("ts_bgl"),
-                    entries: &[
-                        // binding 0: uniform params
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 0,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Uniform,
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
+        let tile_skip_bgl = ctx
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("ts_bgl"),
+                entries: &[
+                    // binding 0: uniform params
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
                         },
-                        // binding 1: coeffs (read_write storage)
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 1,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Storage { read_only: false },
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
+                        count: None,
+                    },
+                    // binding 1: coeffs (read_write storage)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
                         },
-                    ],
-                });
+                        count: None,
+                    },
+                ],
+            });
         let ts_pl = ctx
             .device
             .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -789,7 +787,11 @@ impl EncoderPipeline {
         };
         if needs_alloc {
             self.tw_cached = Some(CachedTemporalWaveletBuffers::new(
-                ctx, padded_w, padded_h, group_size, raw_input_size,
+                ctx,
+                padded_w,
+                padded_h,
+                group_size,
+                raw_input_size,
             ));
         }
     }
@@ -809,7 +811,11 @@ impl EncoderPipeline {
         };
         if needs_alloc {
             self.tw_cached_b = Some(CachedTemporalWaveletBuffers::new(
-                ctx, padded_w, padded_h, group_size, raw_input_size,
+                ctx,
+                padded_w,
+                padded_h,
+                group_size,
+                raw_input_size,
             ));
         }
     }
@@ -899,9 +905,13 @@ impl EncoderPipeline {
             bytemuck::bytes_of(&crate::pad_fill_mode(false)),
         );
         self.dispatch_gpu_pad_with(
-            ctx, cmd,
-            &bufs.pad_params_buf, &bufs.raw_input_buf, &bufs.input_buf,
-            padded_w, padded_h,
+            ctx,
+            cmd,
+            &bufs.pad_params_buf,
+            &bufs.raw_input_buf,
+            &bufs.input_buf,
+            padded_w,
+            padded_h,
         );
     }
 
@@ -1065,12 +1075,7 @@ impl EncoderPipeline {
         //   offset 4:  padded_h       u32
         //   offset 8:  tile_size      u32
         //   offset 12: skip_threshold f32  (stored as bits in u32 array)
-        let params_data: [u32; 4] = [
-            padded_w,
-            padded_h,
-            tile_size,
-            skip_threshold.to_bits(),
-        ];
+        let params_data: [u32; 4] = [padded_w, padded_h, tile_size, skip_threshold.to_bits()];
         let params_buf = ctx
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1371,7 +1376,9 @@ impl EncoderPipeline {
             tile_size,
             block_size,
             skip_threshold.to_bits(),
-            0, 0, 0, // padding
+            0,
+            0,
+            0, // padding
         ];
         let params_buf = ctx
             .device
@@ -1475,12 +1482,7 @@ impl EncoderPipeline {
         //   offset  4: padded_h  u32
         //   offset  8: tile_size u32
         //   offset 12: qstep     f32
-        let params_data: [u32; 4] = [
-            padded_w,
-            padded_h,
-            tile_size,
-            qstep.to_bits(),
-        ];
+        let params_data: [u32; 4] = [padded_w, padded_h, tile_size, qstep.to_bits()];
         let params_buf = ctx
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1525,9 +1527,11 @@ impl EncoderPipeline {
         // main_h workgroup_size(256, 1, 1): 256 threads cover one 256-pixel column segment.
         // dispatch_workgroups(tiles_x, horiz_boundaries, 1)
         if horiz_boundaries > 0 {
-            let mut cmd_h = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("deblock_h"),
-            });
+            let mut cmd_h = ctx
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("deblock_h"),
+                });
             {
                 let mut pass = cmd_h.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("deblock_ref_h_pass"),
@@ -1544,9 +1548,11 @@ impl EncoderPipeline {
         // main_v workgroup_size(1, 256, 1): 256 threads cover one 256-pixel row segment.
         // dispatch_workgroups(vert_boundaries, tiles_y, 1)
         if vert_boundaries > 0 {
-            let mut cmd_v = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("deblock_v"),
-            });
+            let mut cmd_v = ctx
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("deblock_v"),
+                });
             {
                 let mut pass = cmd_v.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("deblock_ref_v_pass"),
@@ -1670,7 +1676,11 @@ not lossless even in luma (BUG-49). Coding the wavelet candidate only.",
             "GNC: RATE-2 lossless fallback — lossy {lossy_bytes} B vs bit-exact \
              {lossless_bytes} B ({:+.2}%), keeping the {}",
             (lossless_bytes as f64 / lossy_bytes as f64 - 1.0) * 100.0,
-            if lossless_bytes < lossy_bytes { "bit-exact one" } else { "lossy one" },
+            if lossless_bytes < lossy_bytes {
+                "bit-exact one"
+            } else {
+                "lossy one"
+            },
         );
         if lossless_bytes < lossy_bytes {
             lossless
@@ -1937,19 +1947,38 @@ not lossless even in luma (BUG-49). Coding the wavelet candidate only.",
             // so the shader fills the entire padded buffer (valid region + padding zone)
             // with edge-replicated values before the wavelet transform runs.
             self.chroma_down.dispatch(
-                ctx, &mut cmd,
-                &bufs.co_plane, &bufs.co_plane_ds,
-                padded_w, padded_h, shift_x, shift_y, chroma_padded_w, chroma_padded_h,
+                ctx,
+                &mut cmd,
+                &bufs.co_plane,
+                &bufs.co_plane_ds,
+                padded_w,
+                padded_h,
+                shift_x,
+                shift_y,
+                chroma_padded_w,
+                chroma_padded_h,
             );
             self.chroma_down.dispatch(
-                ctx, &mut cmd,
-                &bufs.cg_plane, &bufs.cg_plane_ds,
-                padded_w, padded_h, shift_x, shift_y, chroma_padded_w, chroma_padded_h,
+                ctx,
+                &mut cmd,
+                &bufs.cg_plane,
+                &bufs.cg_plane_ds,
+                padded_w,
+                padded_h,
+                shift_x,
+                shift_y,
+                chroma_padded_w,
+                chroma_padded_h,
             );
             log::debug!(
                 "chroma_downsample: {:?} {}x{} -> {}x{} shift=({},{})",
-                chroma_format, padded_w, padded_h,
-                chroma_padded_w, chroma_padded_h, shift_x, shift_y
+                chroma_format,
+                padded_w,
+                padded_h,
+                chroma_padded_w,
+                chroma_padded_h,
+                shift_x,
+                shift_y
             );
         }
 
@@ -2008,8 +2037,7 @@ not lossless even in luma (BUG-49). Coding the wavelet candidate only.",
         // Fused quantize+histogram: saves one full buffer read+write per plane.
         // Only applicable when GPU entropy encoding is active and CfL is off
         // (CfL needs separate quantize+dequantize for Y reconstruction).
-        let use_fused_qh =
-            config.use_fused_quantize_histogram && use_gpu_encode && !use_cfl;
+        let use_fused_qh = config.use_fused_quantize_histogram && use_gpu_encode && !use_cfl;
 
         // BUG-35: the fused shader's histogram is read by exactly one consumer — the rANS batch
         // encoder's `encode_3planes_skip_histogram`. Everywhere else it was dead work written to
@@ -2026,11 +2054,17 @@ not lossless even in luma (BUG-49). Coding the wavelet candidate only.",
         // produce different coefficients. Priced at BD-rate +1.02% and direction-inconsistent, so
         // it buys nothing; `GNC_SPARSE_DZ=1` turns it back on for anyone re-pricing it on a wider
         // ladder than the three points that retired it. It only ever fires at q <= 30.
-        let fused_qh_flags: u32 =
-            1 | if std::env::var("GNC_SPARSE_DZ").is_ok() { 2 } else { 0 };
+        let fused_qh_flags: u32 = 1 | if std::env::var("GNC_SPARSE_DZ").is_ok() {
+            2
+        } else {
+            0
+        };
         let is_444 = chroma_format == ChromaFormat::Yuv444;
-        let fused_qh_needs_hist =
-            use_fused_qh && is_444 && use_gpu_encode && !use_gpu_rice && !(use_gpu_huffman && is_444);
+        let fused_qh_needs_hist = use_fused_qh
+            && is_444
+            && use_gpu_encode
+            && !use_gpu_rice
+            && !(use_gpu_huffman && is_444);
 
         let weights_luma = config.subband_weights.pack_weights();
         let weights_chroma = config.subband_weights.pack_weights_chroma();
@@ -2120,12 +2154,21 @@ not lossless even in luma (BUG-49). Coding the wavelet candidate only.",
         // These are needed in both the wavelet block and the entropy section below.
         // active_chroma_info_storage holds the non-444 FrameInfo so the reference lives long enough.
         let active_chroma_info_storage = chroma_info;
-        let (active_chroma_info, active_chroma_w, active_chroma_h, active_chroma_px): (&FrameInfo, u32, u32, usize) =
-            if chroma_format == ChromaFormat::Yuv444 {
-                (&info, padded_w, padded_h, padded_pixels)
-            } else {
-                (&active_chroma_info_storage, chroma_padded_w, chroma_padded_h, chroma_pixels)
-            };
+        let (active_chroma_info, active_chroma_w, active_chroma_h, active_chroma_px): (
+            &FrameInfo,
+            u32,
+            u32,
+            usize,
+        ) = if chroma_format == ChromaFormat::Yuv444 {
+            (&info, padded_w, padded_h, padded_pixels)
+        } else {
+            (
+                &active_chroma_info_storage,
+                chroma_padded_w,
+                chroma_padded_h,
+                chroma_pixels,
+            )
+        };
 
         let wm_total_blocks;
 
@@ -2223,7 +2266,7 @@ not lossless even in luma (BUG-49). Coding the wavelet candidate only.",
                     &info,
                     config.wavelet_levels,
                     config.wavelet_type,
-                    0, // plane_idx: Y
+                    0,                     // plane_idx: Y
                     config.overlap_pixels, // overlap
                 );
             }
@@ -2391,7 +2434,7 @@ not lossless even in luma (BUG-49). Coding the wavelet candidate only.",
                     active_chroma_info,
                     config.wavelet_levels,
                     config.wavelet_type,
-                    1, // plane_idx: Co
+                    1,                     // plane_idx: Co
                     config.overlap_pixels, // overlap
                 );
             }
@@ -2440,7 +2483,9 @@ not lossless even in luma (BUG-49). Coding the wavelet candidate only.",
                     0.0,
                 );
                 // use_cfl is true in this branch, so the staging pair exists.
-                let stg = alpha_staging.as_ref().expect("CfL staging missing while use_cfl");
+                let stg = alpha_staging
+                    .as_ref()
+                    .expect("CfL staging missing while use_cfl");
                 cmd.copy_buffer_to_buffer(&bufs.raw_alpha, 0, &stg[0], 0, alpha_bytes);
             } else if use_fused_qh {
                 let hist_bufs = bufs.fused_hist_bufs.as_ref().unwrap();
@@ -2509,7 +2554,7 @@ not lossless even in luma (BUG-49). Coding the wavelet candidate only.",
                     active_chroma_info,
                     config.wavelet_levels,
                     config.wavelet_type,
-                    2, // plane_idx: Cg
+                    2,                     // plane_idx: Cg
                     config.overlap_pixels, // overlap
                 );
             }
@@ -2557,7 +2602,9 @@ not lossless even in luma (BUG-49). Coding the wavelet candidate only.",
                     wm_param,
                     0.0,
                 );
-                let stg = alpha_staging.as_ref().expect("CfL staging missing while use_cfl");
+                let stg = alpha_staging
+                    .as_ref()
+                    .expect("CfL staging missing while use_cfl");
                 cmd.copy_buffer_to_buffer(&bufs.raw_alpha, 0, &stg[1], 0, alpha_bytes);
             } else if use_fused_qh {
                 let hist_bufs = bufs.fused_hist_bufs.as_ref().unwrap();
@@ -2662,9 +2709,11 @@ not lossless even in luma (BUG-49). Coding the wavelet candidate only.",
             t_wq_end = t_start.elapsed();
 
             // Stage 2: Rice encode in separate command encoder
-            let mut cmd_rice = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("encode_rice_profile"),
-            });
+            let mut cmd_rice = ctx
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("encode_rice_profile"),
+                });
             self.gpu_rice_encoder.dispatch_3planes_to_cmd(
                 ctx,
                 &mut cmd_rice,
@@ -2710,11 +2759,12 @@ not lossless even in luma (BUG-49). Coding the wavelet candidate only.",
         let wm_rx = if aq_active && wm_total_blocks > 0 {
             let bufs = self.cached.as_ref().unwrap();
             let (tx, rx) = std::sync::mpsc::channel();
-            bufs.weight_map_staging
-                .slice(..wm_bytes)
-                .map_async(wgpu::MapMode::Read, move |result| {
+            bufs.weight_map_staging.slice(..wm_bytes).map_async(
+                wgpu::MapMode::Read,
+                move |result| {
                     tx.send(result).unwrap();
-                });
+                },
+            );
             Some(rx)
         } else {
             None
@@ -2801,15 +2851,23 @@ not lossless even in luma (BUG-49). Coding the wavelet candidate only.",
         }
 
         // Per-plane infos for entropy encoding — chroma planes differ when non-444
-        let plane_infos: [&FrameInfo; 3] = [
-            &info,
-            active_chroma_info,
-            active_chroma_info,
-        ];
+        let plane_infos: [&FrameInfo; 3] = [&info, active_chroma_info, active_chroma_info];
         let plane_pixels = [padded_pixels, active_chroma_px, active_chroma_px];
-        let plane_w = [padded_w as usize, active_chroma_w as usize, active_chroma_w as usize];
-        let plane_tiles_x = [tiles_x, info.chroma_tiles_x() as usize, info.chroma_tiles_x() as usize];
-        let plane_tiles_y = [tiles_y, info.chroma_tiles_y() as usize, info.chroma_tiles_y() as usize];
+        let plane_w = [
+            padded_w as usize,
+            active_chroma_w as usize,
+            active_chroma_w as usize,
+        ];
+        let plane_tiles_x = [
+            tiles_x,
+            info.chroma_tiles_x() as usize,
+            info.chroma_tiles_x() as usize,
+        ];
+        let plane_tiles_y = [
+            tiles_y,
+            info.chroma_tiles_y() as usize,
+            info.chroma_tiles_y() as usize,
+        ];
 
         // CPU entropy encode path: each plane reads from its persisted buffer.
         // Must not run when GPU Rice per-plane path will handle encoding (non-444 + GPU Rice).
@@ -3161,7 +3219,13 @@ not lossless even in luma (BUG-49). Coding the wavelet candidate only.",
         tile_size: usize,
         padded_w: usize,
     ) -> Vec<f32> {
-        entropy_helpers::entropy_decode_plane(entropy, plane_idx * tiles_per_plane, tiles_per_plane, tile_size, padded_w)
+        entropy_helpers::entropy_decode_plane(
+            entropy,
+            plane_idx * tiles_per_plane,
+            tiles_per_plane,
+            tile_size,
+            padded_w,
+        )
     }
 
     /// Read back the raw i32 motion vectors from the encoder's split MV staging buffer.

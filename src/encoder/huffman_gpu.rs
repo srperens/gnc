@@ -8,8 +8,8 @@ use wgpu;
 use wgpu::util::DeviceExt;
 
 use super::huffman::{
-    self, build_decode_table, reconstruct_codes_from_lengths, HuffmanTile,
-    HUFFMAN_ALPHABET_SIZE, HUFFMAN_STREAMS_PER_TILE,
+    self, build_decode_table, reconstruct_codes_from_lengths, HuffmanTile, HUFFMAN_ALPHABET_SIZE,
+    HUFFMAN_STREAMS_PER_TILE,
 };
 use crate::{FrameInfo, GpuContext};
 
@@ -29,9 +29,11 @@ const MIN_STREAM_BYTES: usize = 512;
 /// At tile 512 that is 4 KiB per stream and about 37 MB of scratch for 1080p 4:4:4, which is the
 /// price of the configuration working at all.
 fn stream_slot_bytes(tile_size: u32) -> usize {
-    let symbols_per_stream = (tile_size as usize * tile_size as usize)
-        .div_ceil(HUFFMAN_STREAMS_PER_TILE);
-    (symbols_per_stream * 4).max(MIN_STREAM_BYTES).next_multiple_of(4)
+    let symbols_per_stream =
+        (tile_size as usize * tile_size as usize).div_ceil(HUFFMAN_STREAMS_PER_TILE);
+    (symbols_per_stream * 4)
+        .max(MIN_STREAM_BYTES)
+        .next_multiple_of(4)
 }
 const MAX_GROUPS: usize = 8;
 const HIST_STRIDE: usize = MAX_GROUPS * HUFFMAN_ALPHABET_SIZE; // 512
@@ -143,9 +145,7 @@ impl CachedHuffmanEncodeBuffers {
             }),
             stream_staging: std::array::from_fn(|i| {
                 ctx.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some(
-                        ["huff_stream_stg0", "huff_stream_stg1", "huff_stream_stg2"][i],
-                    ),
+                    label: Some(["huff_stream_stg0", "huff_stream_stg1", "huff_stream_stg2"][i]),
                     size: stream_size.max(4),
                     usage: mr,
                     mapped_at_creation: false,
@@ -154,7 +154,11 @@ impl CachedHuffmanEncodeBuffers {
             lengths_staging: std::array::from_fn(|i| {
                 ctx.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some(
-                        ["huff_lengths_stg0", "huff_lengths_stg1", "huff_lengths_stg2"][i],
+                        [
+                            "huff_lengths_stg0",
+                            "huff_lengths_stg1",
+                            "huff_lengths_stg2",
+                        ][i],
                     ),
                     size: lengths_size.max(4),
                     usage: mr,
@@ -212,25 +216,25 @@ impl GpuHuffmanEncoder {
                 ),
             });
 
-        let histogram_bgl =
-            ctx.device
-                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                    label: Some("huffman_hist_bgl"),
-                    entries: &[
-                        make_uniform_entry(0),       // params
-                        make_storage_entry(1, true),  // input coefficients
-                        make_storage_entry(2, false), // hist_output
-                        make_storage_entry(3, false), // zrl_output
-                    ],
-                });
+        let histogram_bgl = ctx
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("huffman_hist_bgl"),
+                entries: &[
+                    make_uniform_entry(0),        // params
+                    make_storage_entry(1, true),  // input coefficients
+                    make_storage_entry(2, false), // hist_output
+                    make_storage_entry(3, false), // zrl_output
+                ],
+            });
 
-        let hist_layout =
-            ctx.device
-                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("huffman_hist_layout"),
-                    bind_group_layouts: &[&histogram_bgl],
-                    push_constant_ranges: &[],
-                });
+        let hist_layout = ctx
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("huffman_hist_layout"),
+                bind_group_layouts: &[&histogram_bgl],
+                push_constant_ranges: &[],
+            });
 
         let histogram_pipeline =
             ctx.device
@@ -253,27 +257,27 @@ impl GpuHuffmanEncoder {
                 ),
             });
 
-        let encode_bgl =
-            ctx.device
-                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                    label: Some("huffman_enc_bgl"),
-                    entries: &[
-                        make_uniform_entry(0),       // params
-                        make_storage_entry(1, true),  // input coefficients
-                        make_storage_entry(2, true),  // codebook
-                        make_storage_entry(3, true),  // k_zrl
-                        make_storage_entry(4, false), // stream_output
-                        make_storage_entry(5, false), // stream_lengths
-                    ],
-                });
+        let encode_bgl = ctx
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("huffman_enc_bgl"),
+                entries: &[
+                    make_uniform_entry(0),        // params
+                    make_storage_entry(1, true),  // input coefficients
+                    make_storage_entry(2, true),  // codebook
+                    make_storage_entry(3, true),  // k_zrl
+                    make_storage_entry(4, false), // stream_output
+                    make_storage_entry(5, false), // stream_lengths
+                ],
+            });
 
-        let enc_layout =
-            ctx.device
-                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("huffman_enc_layout"),
-                    bind_group_layouts: &[&encode_bgl],
-                    push_constant_ranges: &[],
-                });
+        let enc_layout = ctx
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("huffman_enc_layout"),
+                bind_group_layouts: &[&encode_bgl],
+                push_constant_ranges: &[],
+            });
 
         let encode_pipeline =
             ctx.device
@@ -340,13 +344,13 @@ impl GpuHuffmanEncoder {
             max_stream_words: (slot_bytes / 4) as u32,
             _pad1: 0,
         };
-        let params_buf =
-            ctx.device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("huff_params"),
-                    contents: bytemuck::bytes_of(&params),
-                    usage: wgpu::BufferUsages::UNIFORM,
-                });
+        let params_buf = ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("huff_params"),
+                contents: bytemuck::bytes_of(&params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
 
         let mut all_tiles = Vec::new();
 
@@ -449,8 +453,7 @@ impl GpuHuffmanEncoder {
                     let cb_base = t * CB_STRIDE + g * HUFFMAN_ALPHABET_SIZE;
                     for s in 0..HUFFMAN_ALPHABET_SIZE {
                         if s < cb.0.len() && cb.0[s] > 0 {
-                            codebook_data[cb_base + s] =
-                                ((cb.0[s] as u32) << 16) | cb.1[s];
+                            codebook_data[cb_base + s] = ((cb.0[s] as u32) << 16) | cb.1[s];
                         }
                     }
 
@@ -480,16 +483,10 @@ impl GpuHuffmanEncoder {
             }
 
             // === Upload codebooks + k_zrl ===
-            ctx.queue.write_buffer(
-                &bufs.codebook_buf,
-                0,
-                bytemuck::cast_slice(&codebook_data),
-            );
-            ctx.queue.write_buffer(
-                &bufs.k_zrl_buf,
-                0,
-                bytemuck::cast_slice(&k_zrl_data),
-            );
+            ctx.queue
+                .write_buffer(&bufs.codebook_buf, 0, bytemuck::cast_slice(&codebook_data));
+            ctx.queue
+                .write_buffer(&bufs.k_zrl_buf, 0, bytemuck::cast_slice(&k_zrl_data));
 
             // === Pass 2: GPU encode ===
             let mut cmd = ctx
@@ -543,13 +540,7 @@ impl GpuHuffmanEncoder {
             }
 
             // Copy to staging
-            cmd.copy_buffer_to_buffer(
-                &bufs.stream_buf,
-                0,
-                &bufs.stream_staging[p],
-                0,
-                stream_size,
-            );
+            cmd.copy_buffer_to_buffer(&bufs.stream_buf, 0, &bufs.stream_staging[p], 0, stream_size);
             cmd.copy_buffer_to_buffer(
                 &bufs.lengths_buf,
                 0,
@@ -615,8 +606,7 @@ impl GpuHuffmanEncoder {
                          upper bound, so this is a defect in that bound rather than an \
                          unsupported configuration."
                     );
-                    packed_data
-                        .extend_from_slice(&stream_data[slot_offset..slot_offset + len]);
+                    packed_data.extend_from_slice(&stream_data[slot_offset..slot_offset + len]);
                 }
 
                 all_tiles.push(HuffmanTile {
@@ -653,27 +643,27 @@ impl GpuHuffmanDecoder {
                 ),
             });
 
-        let decode_bgl =
-            ctx.device
-                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                    label: Some("huffman_decode_bgl"),
-                    entries: &[
-                        make_uniform_entry(0),       // params
-                        make_storage_entry(1, true),  // decode_table
-                        make_storage_entry(2, true),  // k_zrl
-                        make_storage_entry(3, true),  // stream_data
-                        make_storage_entry(4, true),  // stream_offsets
-                        make_storage_entry(5, false), // output
-                    ],
-                });
+        let decode_bgl = ctx
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("huffman_decode_bgl"),
+                entries: &[
+                    make_uniform_entry(0),        // params
+                    make_storage_entry(1, true),  // decode_table
+                    make_storage_entry(2, true),  // k_zrl
+                    make_storage_entry(3, true),  // stream_data
+                    make_storage_entry(4, true),  // stream_offsets
+                    make_storage_entry(5, false), // output
+                ],
+            });
 
-        let layout =
-            ctx.device
-                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("huffman_decode_layout"),
-                    bind_group_layouts: &[&decode_bgl],
-                    push_constant_ranges: &[],
-                });
+        let layout = ctx
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("huffman_decode_layout"),
+                bind_group_layouts: &[&decode_bgl],
+                push_constant_ranges: &[],
+            });
 
         let decode_pipeline =
             ctx.device

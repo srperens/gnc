@@ -97,7 +97,9 @@ impl CachedRiceEncodeBuffers {
             overflow_buf: ctx.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("rice_overflow"),
                 size: overflow_size.max(4),
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }),
             overflow_staging: ctx.device.create_buffer(&wgpu::BufferDescriptor {
@@ -114,9 +116,7 @@ impl CachedRiceEncodeBuffers {
             }),
             stream_staging: std::array::from_fn(|i| {
                 ctx.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some(
-                        ["rice_stream_stg0", "rice_stream_stg1", "rice_stream_stg2"][i],
-                    ),
+                    label: Some(["rice_stream_stg0", "rice_stream_stg1", "rice_stream_stg2"][i]),
                     size: stream_size.max(4),
                     usage: mr,
                     mapped_at_creation: false,
@@ -125,7 +125,11 @@ impl CachedRiceEncodeBuffers {
             lengths_staging: std::array::from_fn(|i| {
                 ctx.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some(
-                        ["rice_lengths_stg0", "rice_lengths_stg1", "rice_lengths_stg2"][i],
+                        [
+                            "rice_lengths_stg0",
+                            "rice_lengths_stg1",
+                            "rice_lengths_stg2",
+                        ][i],
                     ),
                     size: lengths_size.max(4),
                     usage: mr,
@@ -207,87 +211,87 @@ impl GpuRiceEncoder {
                 ),
             });
 
-        let encode_bgl =
-            ctx.device
-                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                    label: Some("rice_encode_bgl"),
-                    entries: &[
-                        // binding 0: uniform params
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 0,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Uniform,
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
+        let encode_bgl = ctx
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("rice_encode_bgl"),
+                entries: &[
+                    // binding 0: uniform params
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
                         },
-                        // binding 1: input coefficients (read-only)
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 1,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Storage { read_only: true },
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
+                        count: None,
+                    },
+                    // binding 1: input coefficients (read-only)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
                         },
-                        // binding 2: stream_output (read-write)
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 2,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Storage { read_only: false },
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
+                        count: None,
+                    },
+                    // binding 2: stream_output (read-write)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
                         },
-                        // binding 3: stream_lengths (read-write)
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 3,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Storage { read_only: false },
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
+                        count: None,
+                    },
+                    // binding 3: stream_lengths (read-write)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
                         },
-                        // binding 4: k_output (read-write)
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 4,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Storage { read_only: false },
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
+                        count: None,
+                    },
+                    // binding 4: k_output (read-write)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
                         },
-                        // binding 5: overflow_flags (read-write, atomic u32 per tile)
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 5,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Storage { read_only: false },
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
+                        count: None,
+                    },
+                    // binding 5: overflow_flags (read-write, atomic u32 per tile)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 5,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
                         },
-                    ],
-                });
+                        count: None,
+                    },
+                ],
+            });
 
-        let pipeline_layout =
-            ctx.device
-                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("rice_encode_layout"),
-                    bind_group_layouts: &[&encode_bgl],
-                    push_constant_ranges: &[],
-                });
+        let pipeline_layout = ctx
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("rice_encode_layout"),
+                bind_group_layouts: &[&encode_bgl],
+                push_constant_ranges: &[],
+            });
 
         let encode_pipeline =
             ctx.device
@@ -309,9 +313,10 @@ impl GpuRiceEncoder {
 
     fn ensure_buffers(&mut self, ctx: &GpuContext, num_tiles: usize, tile_size: u32, qstep: f32) {
         let msb = max_stream_bytes_for_tile(tile_size, qstep);
-        let needs_realloc = self.cached.as_ref().is_none_or(|c| {
-            c.num_tiles != num_tiles || c.max_stream_bytes != msb
-        });
+        let needs_realloc = self
+            .cached
+            .as_ref()
+            .is_none_or(|c| c.num_tiles != num_tiles || c.max_stream_bytes != msb);
         if needs_realloc {
             self.cached = Some(CachedRiceEncodeBuffers::new(ctx, num_tiles, msb));
         }
@@ -362,7 +367,6 @@ impl GpuRiceEncoder {
         cmd.clear_buffer(&bufs.overflow_buf, 0, Some(overflow_size));
 
         for (p, quantized_buf) in quantized_bufs.iter().enumerate() {
-
             let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("rice_encode_bg"),
                 layout: &self.encode_bgl,
@@ -405,13 +409,7 @@ impl GpuRiceEncoder {
             }
 
             // Copy to staging
-            cmd.copy_buffer_to_buffer(
-                &bufs.stream_buf,
-                0,
-                &bufs.stream_staging[p],
-                0,
-                stream_size,
-            );
+            cmd.copy_buffer_to_buffer(&bufs.stream_buf, 0, &bufs.stream_staging[p], 0, stream_size);
             cmd.copy_buffer_to_buffer(
                 &bufs.lengths_buf,
                 0,
@@ -514,8 +512,7 @@ impl GpuRiceEncoder {
                 let total_packed: usize = stream_lengths.iter().map(|&l| l as usize).sum();
                 let mut packed_data = Vec::with_capacity(total_packed);
                 for (s, &len) in stream_lengths.iter().enumerate() {
-                    let slot_byte_offset =
-                        (tile_idx * RICE_STREAMS_PER_TILE + s) * msb;
+                    let slot_byte_offset = (tile_idx * RICE_STREAMS_PER_TILE + s) * msb;
                     let len = len as usize;
                     packed_data
                         .extend_from_slice(&stream_view[slot_byte_offset..slot_byte_offset + len]);
@@ -634,7 +631,13 @@ impl GpuRiceEncoder {
 
         // Copy to staging slot 0
         cmd.copy_buffer_to_buffer(&bufs.stream_buf, 0, &bufs.stream_staging[0], 0, stream_size);
-        cmd.copy_buffer_to_buffer(&bufs.lengths_buf, 0, &bufs.lengths_staging[0], 0, lengths_size);
+        cmd.copy_buffer_to_buffer(
+            &bufs.lengths_buf,
+            0,
+            &bufs.lengths_staging[0],
+            0,
+            lengths_size,
+        );
         cmd.copy_buffer_to_buffer(&bufs.k_buf, 0, &bufs.k_staging[0], 0, k_size);
         cmd.copy_buffer_to_buffer(
             &bufs.overflow_buf,
@@ -788,7 +791,6 @@ impl GpuRiceEncoder {
         cmd.clear_buffer(&bufs.overflow_buf, 0, Some(overflow_size));
 
         for (p, quantized_buf) in quantized_bufs.iter().enumerate() {
-
             let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("rice_encode_bg"),
                 layout: &self.encode_bgl,
@@ -831,13 +833,7 @@ impl GpuRiceEncoder {
             }
 
             // Copy to per-plane staging
-            cmd.copy_buffer_to_buffer(
-                &bufs.stream_buf,
-                0,
-                &bufs.stream_staging[p],
-                0,
-                stream_size,
-            );
+            cmd.copy_buffer_to_buffer(&bufs.stream_buf, 0, &bufs.stream_staging[p], 0, stream_size);
             cmd.copy_buffer_to_buffer(
                 &bufs.lengths_buf,
                 0,
@@ -922,7 +918,10 @@ impl GpuRiceEncoder {
         }
 
         if profile {
-            eprintln!("    Rice map+poll: {:.1}ms", _t0.elapsed().as_secs_f64() * 1000.0);
+            eprintln!(
+                "    Rice map+poll: {:.1}ms",
+                _t0.elapsed().as_secs_f64() * 1000.0
+            );
         }
         let _t1 = std::time::Instant::now();
 
@@ -954,8 +953,7 @@ impl GpuRiceEncoder {
                 let total_packed: usize = stream_lengths.iter().map(|&l| l as usize).sum();
                 let mut packed_data = Vec::with_capacity(total_packed);
                 for (s, &len) in stream_lengths.iter().enumerate() {
-                    let slot_byte_offset =
-                        (tile_idx * RICE_STREAMS_PER_TILE + s) * msb;
+                    let slot_byte_offset = (tile_idx * RICE_STREAMS_PER_TILE + s) * msb;
                     let len = len as usize;
                     packed_data
                         .extend_from_slice(&stream_view[slot_byte_offset..slot_byte_offset + len]);
@@ -987,11 +985,13 @@ impl GpuRiceEncoder {
         if profile {
             let actual_bytes: usize = all_tiles.iter().map(|t| t.stream_data.len()).sum();
             let staging_bytes = num_tiles * RICE_STREAMS_PER_TILE * msb * 3;
-            eprintln!("    Rice pack: {:.1}ms (actual {:.1}MB / staging {:.1}MB = {:.1}% utilization)",
+            eprintln!(
+                "    Rice pack: {:.1}ms (actual {:.1}MB / staging {:.1}MB = {:.1}% utilization)",
                 _t1.elapsed().as_secs_f64() * 1000.0,
                 actual_bytes as f64 / 1_048_576.0,
                 staging_bytes as f64 / 1_048_576.0,
-                actual_bytes as f64 / staging_bytes as f64 * 100.0);
+                actual_bytes as f64 / staging_bytes as f64 * 100.0
+            );
         }
 
         all_tiles
@@ -1028,7 +1028,10 @@ impl GpuRiceEncoder {
         num_levels: u32,
         qstep: f32,
     ) {
-        let bufs = self.cached.as_ref().expect("prepare_batch_staging must be called first");
+        let bufs = self
+            .cached
+            .as_ref()
+            .expect("prepare_batch_staging must be called first");
         let num_tiles = (info.tiles_x() * info.tiles_y()) as usize;
         debug_assert_eq!(
             num_tiles, bufs.num_tiles,
@@ -1045,7 +1048,8 @@ impl GpuRiceEncoder {
             max_stream_bytes: msb as u32,
             _pad0: 0,
         };
-        ctx.queue.write_buffer(&bufs.params_buf, 0, bytemuck::bytes_of(&params));
+        ctx.queue
+            .write_buffer(&bufs.params_buf, 0, bytemuck::bytes_of(&params));
     }
 
     /// Dispatch Rice encode for 3 planes into an external command encoder,
@@ -1220,8 +1224,12 @@ impl GpuRiceEncoder {
         for slot in 0..batch_size {
             let mut frame_tiles = Vec::with_capacity(num_tiles * 3);
             for p in 0..3 {
-                let stream_view = bufs.stream_staging_batch[slot][p].slice(..).get_mapped_range();
-                let lengths_view = bufs.lengths_staging_batch[slot][p].slice(..).get_mapped_range();
+                let stream_view = bufs.stream_staging_batch[slot][p]
+                    .slice(..)
+                    .get_mapped_range();
+                let lengths_view = bufs.lengths_staging_batch[slot][p]
+                    .slice(..)
+                    .get_mapped_range();
                 let k_view = bufs.k_staging_batch[slot][p].slice(..).get_mapped_range();
                 let lengths_data: &[u32] = bytemuck::cast_slice(&lengths_view);
                 let k_data: &[u32] = bytemuck::cast_slice(&k_view);
@@ -1245,8 +1253,7 @@ impl GpuRiceEncoder {
                     let total_packed: usize = stream_lengths.iter().map(|&l| l as usize).sum();
                     let mut packed_data = Vec::with_capacity(total_packed);
                     for (s, &len) in stream_lengths.iter().enumerate() {
-                        let slot_byte_offset =
-                            (tile_idx * RICE_STREAMS_PER_TILE + s) * msb;
+                        let slot_byte_offset = (tile_idx * RICE_STREAMS_PER_TILE + s) * msb;
                         let len = len as usize;
                         packed_data.extend_from_slice(
                             &stream_view[slot_byte_offset..slot_byte_offset + len],
@@ -1299,76 +1306,76 @@ impl GpuRiceDecoder {
                 ),
             });
 
-        let decode_bgl =
-            ctx.device
-                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                    label: Some("rice_decode_bgl"),
-                    entries: &[
-                        // binding 0: uniform params
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 0,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Uniform,
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
+        let decode_bgl = ctx
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("rice_decode_bgl"),
+                entries: &[
+                    // binding 0: uniform params
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
                         },
-                        // binding 1: k_values (read-only)
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 1,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Storage { read_only: true },
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
+                        count: None,
+                    },
+                    // binding 1: k_values (read-only)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
                         },
-                        // binding 2: stream_data (read-only)
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 2,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Storage { read_only: true },
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
+                        count: None,
+                    },
+                    // binding 2: stream_data (read-only)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
                         },
-                        // binding 3: stream_offsets (read-only)
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 3,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Storage { read_only: true },
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
+                        count: None,
+                    },
+                    // binding 3: stream_offsets (read-only)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
                         },
-                        // binding 4: output coefficients (read-write)
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 4,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Storage { read_only: false },
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
+                        count: None,
+                    },
+                    // binding 4: output coefficients (read-write)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
                         },
-                    ],
-                });
+                        count: None,
+                    },
+                ],
+            });
 
-        let pipeline_layout =
-            ctx.device
-                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("rice_decode_layout"),
-                    bind_group_layouts: &[&decode_bgl],
-                    push_constant_ranges: &[],
-                });
+        let pipeline_layout = ctx
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("rice_decode_layout"),
+                bind_group_layouts: &[&decode_bgl],
+                push_constant_ranges: &[],
+            });
 
         let decode_pipeline =
             ctx.device
@@ -1423,7 +1430,11 @@ impl GpuRiceDecoder {
         }
 
         // Compute total stream data size and stream offsets
-        resize_scratch(&mut scratch.stream_offsets, total_streams, &mut scratch.grows);
+        resize_scratch(
+            &mut scratch.stream_offsets,
+            total_streams,
+            &mut scratch.grows,
+        );
         let mut total_bytes = 0u32;
         for (t, tile) in tiles.iter().enumerate() {
             for s in 0..RICE_STREAMS_PER_TILE {
@@ -1621,26 +1632,34 @@ mod tests {
         let packed = GpuRiceDecoder::pack_decode_data(&[tile], &info);
 
         // Create GPU buffers
-        let params_buf = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("test_params"),
-            contents: bytemuck::bytes_of(&packed.params),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
-        let k_buf = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("test_k"),
-            contents: bytemuck::cast_slice(&packed.k_values),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-        let stream_buf = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("test_stream"),
-            contents: bytemuck::cast_slice(&packed.stream_data),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-        let offsets_buf = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("test_offsets"),
-            contents: bytemuck::cast_slice(&packed.stream_offsets),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
+        let params_buf = ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("test_params"),
+                contents: bytemuck::bytes_of(&packed.params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let k_buf = ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("test_k"),
+                contents: bytemuck::cast_slice(&packed.k_values),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+        let stream_buf = ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("test_stream"),
+                contents: bytemuck::cast_slice(&packed.stream_data),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+        let offsets_buf = ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("test_offsets"),
+                contents: bytemuck::cast_slice(&packed.stream_offsets),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
         let output_size = (coeffs_per_tile * 4) as u64;
         let output_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("test_output"),
@@ -1650,11 +1669,20 @@ mod tests {
         });
 
         // Dispatch GPU decode
-        let mut cmd = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("test_decode"),
-        });
+        let mut cmd = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("test_decode"),
+            });
         decoder.dispatch_decode(
-            &ctx, &mut cmd, &params_buf, &k_buf, &stream_buf, &offsets_buf, &output_buf, 1,
+            &ctx,
+            &mut cmd,
+            &params_buf,
+            &k_buf,
+            &stream_buf,
+            &offsets_buf,
+            &output_buf,
+            1,
         );
 
         // Copy output to staging
@@ -1772,42 +1800,60 @@ mod tests {
 
                 // GPU decode same tiles
                 let packed = GpuRiceDecoder::pack_decode_data(plane_tiles, info);
-                let params_buf = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("test_params"),
-                    contents: bytemuck::bytes_of(&packed.params),
-                    usage: wgpu::BufferUsages::UNIFORM,
-                });
-                let k_buf = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("test_k"),
-                    contents: bytemuck::cast_slice(&packed.k_values),
-                    usage: wgpu::BufferUsages::STORAGE,
-                });
-                let stream_buf = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("test_stream"),
-                    contents: bytemuck::cast_slice(&packed.stream_data),
-                    usage: wgpu::BufferUsages::STORAGE,
-                });
-                let offsets_buf = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("test_offsets"),
-                    contents: bytemuck::cast_slice(&packed.stream_offsets),
-                    usage: wgpu::BufferUsages::STORAGE,
-                });
+                let params_buf = ctx
+                    .device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("test_params"),
+                        contents: bytemuck::bytes_of(&packed.params),
+                        usage: wgpu::BufferUsages::UNIFORM,
+                    });
+                let k_buf = ctx
+                    .device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("test_k"),
+                        contents: bytemuck::cast_slice(&packed.k_values),
+                        usage: wgpu::BufferUsages::STORAGE,
+                    });
+                let stream_buf = ctx
+                    .device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("test_stream"),
+                        contents: bytemuck::cast_slice(&packed.stream_data),
+                        usage: wgpu::BufferUsages::STORAGE,
+                    });
+                let offsets_buf =
+                    ctx.device
+                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("test_offsets"),
+                            contents: bytemuck::cast_slice(&packed.stream_offsets),
+                            usage: wgpu::BufferUsages::STORAGE,
+                        });
                 let output_size = (padded_pixels * 4) as u64;
                 let output_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("test_output"),
                     size: output_size,
-                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+                    usage: wgpu::BufferUsages::STORAGE
+                        | wgpu::BufferUsages::COPY_SRC
+                        | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false,
                 });
 
                 let dec = GpuRiceDecoder::new(&ctx);
-                let mut cmd = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("test_decode"),
-                });
+                let mut cmd = ctx
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("test_decode"),
+                    });
                 // Clear output buffer to isolate uninitialized-memory issues
                 cmd.clear_buffer(&output_buf, 0, None);
                 dec.dispatch_decode(
-                    &ctx, &mut cmd, &params_buf, &k_buf, &stream_buf, &offsets_buf, &output_buf,
+                    &ctx,
+                    &mut cmd,
+                    &params_buf,
+                    &k_buf,
+                    &stream_buf,
+                    &offsets_buf,
+                    &output_buf,
                     tiles_per_plane as u32,
                 );
                 let staging = ctx.device.create_buffer(&wgpu::BufferDescriptor {
@@ -1856,13 +1902,22 @@ mod tests {
                         mismatches += 1;
                     }
                 }
-                eprintln!("GPU vs CPU decode: {mismatches} mismatches / {padded_pixels} ({:.2}%)",
-                    mismatches as f64 / padded_pixels as f64 * 100.0);
+                eprintln!(
+                    "GPU vs CPU decode: {mismatches} mismatches / {padded_pixels} ({:.2}%)",
+                    mismatches as f64 / padded_pixels as f64 * 100.0
+                );
                 if let Some(tid) = first_mismatch_tile {
-                    eprintln!("First mismatch in tile {tid}: k_values={:?} k_zrl_nz={:?} k_zrl_z={:?}",
-                        plane_tiles[tid].k_values, plane_tiles[tid].k_zrl_nz_values, plane_tiles[tid].k_zrl_z_values);
+                    eprintln!(
+                        "First mismatch in tile {tid}: k_values={:?} k_zrl_nz={:?} k_zrl_z={:?}",
+                        plane_tiles[tid].k_values,
+                        plane_tiles[tid].k_zrl_nz_values,
+                        plane_tiles[tid].k_zrl_z_values
+                    );
                 }
-                assert_eq!(mismatches, 0, "GPU decode of real image differs from CPU decode");
+                assert_eq!(
+                    mismatches, 0,
+                    "GPU decode of real image differs from CPU decode"
+                );
             }
         }
     }
@@ -1902,26 +1957,34 @@ mod tests {
             // GPU decode the same data
             let packed = GpuRiceDecoder::pack_decode_data(plane_tiles, info);
 
-            let params_buf = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("test_params"),
-                contents: bytemuck::bytes_of(&packed.params),
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
-            let k_buf = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("test_k"),
-                contents: bytemuck::cast_slice(&packed.k_values),
-                usage: wgpu::BufferUsages::STORAGE,
-            });
-            let stream_buf = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("test_stream"),
-                contents: bytemuck::cast_slice(&packed.stream_data),
-                usage: wgpu::BufferUsages::STORAGE,
-            });
-            let offsets_buf = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("test_offsets"),
-                contents: bytemuck::cast_slice(&packed.stream_offsets),
-                usage: wgpu::BufferUsages::STORAGE,
-            });
+            let params_buf = ctx
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("test_params"),
+                    contents: bytemuck::bytes_of(&packed.params),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                });
+            let k_buf = ctx
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("test_k"),
+                    contents: bytemuck::cast_slice(&packed.k_values),
+                    usage: wgpu::BufferUsages::STORAGE,
+                });
+            let stream_buf = ctx
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("test_stream"),
+                    contents: bytemuck::cast_slice(&packed.stream_data),
+                    usage: wgpu::BufferUsages::STORAGE,
+                });
+            let offsets_buf = ctx
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("test_offsets"),
+                    contents: bytemuck::cast_slice(&packed.stream_offsets),
+                    usage: wgpu::BufferUsages::STORAGE,
+                });
             let padded_pixels = (info.padded_width() * info.padded_height()) as usize;
             let output_size = (padded_pixels * 4) as u64;
             let output_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
@@ -1932,11 +1995,19 @@ mod tests {
             });
 
             let dec = GpuRiceDecoder::new(&ctx);
-            let mut cmd = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("test_decode"),
-            });
+            let mut cmd = ctx
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("test_decode"),
+                });
             dec.dispatch_decode(
-                &ctx, &mut cmd, &params_buf, &k_buf, &stream_buf, &offsets_buf, &output_buf,
+                &ctx,
+                &mut cmd,
+                &params_buf,
+                &k_buf,
+                &stream_buf,
+                &offsets_buf,
+                &output_buf,
                 tiles_per_plane as u32,
             );
             let staging = ctx.device.create_buffer(&wgpu::BufferDescriptor {
@@ -1993,7 +2064,10 @@ mod tests {
                 }
             }
             eprintln!("GPU encode→GPU decode vs GPU encode→CPU decode: {mismatches} mismatches / {padded_pixels}");
-            assert_eq!(mismatches, 0, "GPU decode of GPU-encoded data differs from CPU decode");
+            assert_eq!(
+                mismatches, 0,
+                "GPU decode of GPU-encoded data differs from CPU decode"
+            );
         } else {
             panic!("Expected Rice entropy data");
         }
@@ -2054,26 +2128,34 @@ mod tests {
         };
         let packed = GpuRiceDecoder::pack_decode_data(&all_tiles, &info);
 
-        let params_buf = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("test_params"),
-            contents: bytemuck::bytes_of(&packed.params),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
-        let k_buf = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("test_k"),
-            contents: bytemuck::cast_slice(&packed.k_values),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-        let stream_buf = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("test_stream"),
-            contents: bytemuck::cast_slice(&packed.stream_data),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-        let offsets_buf = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("test_offsets"),
-            contents: bytemuck::cast_slice(&packed.stream_offsets),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
+        let params_buf = ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("test_params"),
+                contents: bytemuck::bytes_of(&packed.params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let k_buf = ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("test_k"),
+                contents: bytemuck::cast_slice(&packed.k_values),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+        let stream_buf = ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("test_stream"),
+                contents: bytemuck::cast_slice(&packed.stream_data),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+        let offsets_buf = ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("test_offsets"),
+                contents: bytemuck::cast_slice(&packed.stream_offsets),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
         let output_size = (total_pixels * 4) as u64;
         let output_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("test_output"),
@@ -2082,11 +2164,19 @@ mod tests {
             mapped_at_creation: false,
         });
 
-        let mut cmd = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("test_decode"),
-        });
+        let mut cmd = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("test_decode"),
+            });
         decoder.dispatch_decode(
-            &ctx, &mut cmd, &params_buf, &k_buf, &stream_buf, &offsets_buf, &output_buf,
+            &ctx,
+            &mut cmd,
+            &params_buf,
+            &k_buf,
+            &stream_buf,
+            &offsets_buf,
+            &output_buf,
             num_tiles as u32,
         );
 
@@ -2132,6 +2222,9 @@ mod tests {
             }
         }
         eprintln!("Total mismatches: {mismatches} / {total_pixels}");
-        assert_eq!(mismatches, 0, "GPU multi-tile decode doesn't match CPU decode");
+        assert_eq!(
+            mismatches, 0,
+            "GPU multi-tile decode doesn't match CPU decode"
+        );
     }
 }

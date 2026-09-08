@@ -23,9 +23,15 @@ fn generation_table(src: &str) -> Vec<(String, u32)> {
     for line in src.lines() {
         let line = line.trim();
         // Only the table's arms: `b"GP18" => 18,`. Comments mentioning GP18 are not arms.
-        let Some(rest) = line.strip_prefix("b\"") else { continue };
-        let Some((magic, tail)) = rest.split_once('"') else { continue };
-        let Some(num) = tail.trim().strip_prefix("=>") else { continue };
+        let Some(rest) = line.strip_prefix("b\"") else {
+            continue;
+        };
+        let Some((magic, tail)) = rest.split_once('"') else {
+            continue;
+        };
+        let Some(num) = tail.trim().strip_prefix("=>") else {
+            continue;
+        };
         let num = num.trim().trim_end_matches(',').trim();
         if let Ok(gen) = num.parse::<u32>() {
             out.push((magic.to_string(), gen));

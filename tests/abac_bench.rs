@@ -154,7 +154,10 @@ fn abac_cpu_decode_throughput() {
     let mcoeff = (w * h) as f64 / 1e6;
 
     println!("\nabac CPU decode (single thread) — {w}x{h} ({mcoeff:.2} Mcoeff)\n");
-    println!("  {:<10} {:>4} {:>10} {:>11}", "coder", "cb", "ms", "Mcoeff/s");
+    println!(
+        "  {:<10} {:>4} {:>10} {:>11}",
+        "coder", "cb", "ms", "Mcoeff/s"
+    );
     for cb in [32usize, 64] {
         for coder in [Coder::Interval, Coder::Range] {
             // Encode once, then time the decode of every block.
@@ -267,13 +270,14 @@ fn abac_encode_throughput_grid() {
         for sizing in [Sizing::CountThenEmit, Sizing::BoundedSlots] {
             // One untimed call so the cached buffers are at their final size and the shader is
             // warm; without it the first repeat measures buffer creation.
-            let _ = enc.encode_plane_to_tiles(ctx, &input, w, tx, ty, ts, levels, cb, coder, sizing);
+            let _ =
+                enc.encode_plane_to_tiles(ctx, &input, w, tx, ty, ts, levels, cb, coder, sizing);
             let mut times = Vec::with_capacity(REPEATS);
             let mut bytes = 0usize;
             for _ in 0..REPEATS {
                 let t0 = std::time::Instant::now();
-                let tiles =
-                    enc.encode_plane_to_tiles(ctx, &input, w, tx, ty, ts, levels, cb, coder, sizing);
+                let tiles = enc
+                    .encode_plane_to_tiles(ctx, &input, w, tx, ty, ts, levels, cb, coder, sizing);
                 times.push(t0.elapsed().as_secs_f64());
                 bytes = tiles.iter().map(|t| t.block_data.len()).sum();
             }

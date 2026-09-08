@@ -489,10 +489,7 @@ impl DecoderPipeline {
                     // The MVs live on the luma split grid, whose stride is padded_w/block_size
                     // — not this chroma plane's own p_padded_w/(block_size/2), which differs
                     // whenever chroma pads to a different tile count than luma. (BUG-3)
-                    Some((
-                        padded_w / bufs.mc_block_size,
-                        padded_h / bufs.mc_block_size,
-                    )),
+                    Some((padded_w / bufs.mc_block_size, padded_h / bufs.mc_block_size)),
                 );
                 // Step 3: NN-upsample chroma_recon_buf → plane_results[p] (luma dims).
                 self.chroma_up.dispatch_upsample(

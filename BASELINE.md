@@ -54,8 +54,14 @@ q=15/25/30, it saved 2.17-4.12% of rate for 0.094-0.214 dB — **BD-rate +1.02% 
 direction-inconsistent** (-0.35%, +4.20%, -0.79%), so it bought nothing. VMAF moved **+0.06**, an
 improvement and far inside the 0.5-point tolerance.
 
-**Only q <= 30 is affected.** q=40 and above are byte-identical either way, verified at
-40/50/75/85/90/100, which is why the other three rows are untouched rather than re-measured.
+**These rows are 4:4:4, where the change is confined to q <= 35** — q=40 and above are
+byte-identical either way, verified at 40/50/75/85/90/100. That is why the other three rows are
+untouched rather than re-measured.
+
+**Do not generalise that to subsampled chroma.** At 4:2:2 and 4:2:0 the expansion fires up to
+**q=86** (-0.70% at q=50, -0.05% at q=85, byte-identical from q=90), so any 4:2:2 or 4:2:0 figure
+recorded before 2026-09-08 at q <= 86 was measured with it on. An earlier version of this note
+said "only q <= 30", which was a 4:4:4 sweep mistaken for the whole answer.
 
 **PSNR figures recorded before BUG-8 (2026-09-06) are not comparable to these.** The metric used
 to compare the encoder's `f32` reconstruction; it now compares what the decoder actually emits,

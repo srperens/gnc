@@ -1378,8 +1378,8 @@ fn main() {
 
             // VMAF perceptual quality scoring (single-frame)
             if vmaf {
-                let tmp_ref  = std::env::temp_dir().join("gnc_bench_vmaf_ref.y4m");
-                let tmp_dist = std::env::temp_dir().join("gnc_bench_vmaf_dist.y4m");
+                let tmp_ref  = gnc::session_temp_path("gnc_bench_vmaf_ref.y4m");
+                let tmp_dist = gnc::session_temp_path("gnc_bench_vmaf_dist.y4m");
                 {
                     let mut ref_wr = Y4mWriter::create(tmp_ref.to_str().unwrap(), w as usize, h as usize, 1, 1);
                     ref_wr.write_frame(&rgb_data);
@@ -1782,8 +1782,8 @@ fn main() {
                 let mut diag_steady_fps: Vec<f64> = Vec::new(); // per-GOP fps, excl GOP 0 warmup
 
                 // VMAF Y4M writers: reference and distorted streams.
-                let tmp_ref  = std::env::temp_dir().join("gnc_vmaf_ref.y4m");
-                let tmp_dist = std::env::temp_dir().join("gnc_vmaf_dist.y4m");
+                let tmp_ref  = gnc::session_temp_path("gnc_vmaf_ref.y4m");
+                let tmp_dist = gnc::session_temp_path("gnc_vmaf_dist.y4m");
                 let mut vmaf_ref_writer: Option<Y4mWriter> = if vmaf {
                     Some(Y4mWriter::create(
                         tmp_ref.to_str().unwrap(), w as usize, h as usize,
@@ -2403,8 +2403,8 @@ fn main() {
 
             // VMAF scoring for I+P+B sequence.
             if vmaf {
-                let tmp_ref  = std::env::temp_dir().join("gnc_ip_vmaf_ref.y4m");
-                let tmp_dist = std::env::temp_dir().join("gnc_ip_vmaf_dist.y4m");
+                let tmp_ref  = gnc::session_temp_path("gnc_ip_vmaf_ref.y4m");
+                let tmp_dist = gnc::session_temp_path("gnc_ip_vmaf_dist.y4m");
                 let fps_int = fps.round() as u32;
                 let mut ref_wr = Y4mWriter::create(tmp_ref.to_str().unwrap(), w as usize, h as usize, fps_int, 1);
                 let mut dist_wr = Y4mWriter::create(tmp_dist.to_str().unwrap(), w as usize, h as usize, fps_int, 1);
@@ -3484,8 +3484,8 @@ fn main() {
                 }
 
                 // Temp Y4M paths for per-point VMAF scoring (reused across quality points)
-                let vmaf_tmp_ref  = std::env::temp_dir().join("gnc_rdcurve_vmaf_ref.y4m");
-                let vmaf_tmp_dist = std::env::temp_dir().join("gnc_rdcurve_vmaf_dist.y4m");
+                let vmaf_tmp_ref  = gnc::session_temp_path("gnc_rdcurve_vmaf_ref.y4m");
+                let vmaf_tmp_dist = gnc::session_temp_path("gnc_rdcurve_vmaf_dist.y4m");
 
                 for &q in &q_vals {
                     let mut config = gnc::quality_preset(q);

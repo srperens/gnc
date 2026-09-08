@@ -1403,6 +1403,62 @@ preset and manual paths agree and that the library default still permits B-frame
 No decision record: no default changed. The shipped default was already P-only since 2026-09-06;
 this makes four CLI paths actually honour it.
 
+### BUG-52 — DX12: BUG-40 removed the crash and exposed an FXC compile-time wall (todo, **P2**)
+
+**Filed 2026-09-08 by the session that ran the Mac's quiet hour, on an observation it did not
+take.** The measurement is the Windows GPU tier round 3, commit `1e41e8d`, and that commit is the
+only source cited here — machine, driver and shader set are whatever it names, and nothing in this
+entry is a second opinion. It is filed because **it was unfiled**: `BUG-40`'s heading still
+describes the old crash, and an observation that lives only in a RESEARCH_LOG paragraph is
+invisible to `scripts/claim next`. That is the ENT-7 / COORD-3 defect class, in prose instead of
+on an unmerged branch.
+
+**What round 3 reports, verbatim:** *"DX12: the fast FXC X3695 crash is gone, but FXC now compiles
+for >4.5 min at 95% CPU with no output before being killed. DX12 still not usable, now for compile
+time."*
+
+**Why this is a different defect and not the same one continuing.** `BUG-40` step 1 made
+`match_bidir_pipeline` and the two bidir MC pipelines lazy, and `0049` predicted exactly this:
+*"An intra DX12 encode should now fail on a shader it actually uses, or complete."* It no longer
+fails on `block_match_bidir.wgsl` — so step 1 did what it was for, and `X3695: race condition
+writing to shared` is no longer the blocker. What replaced it is a **compile-time** problem in a
+named compiler on a shader set that Vulkan/naga-SPIR-V and Metal both compile in seconds. Leaving
+it inside BUG-40 would file a compile-time wall under a race-condition heading.
+
+**Why it is worth a P2 rather than a note.** GOALS rule 4 claims Metal, Vulkan, DX12 and WebGPU,
+and GOALS §1 calls a backend GNC cannot run on *"a headline defect and not a compatibility nit"* —
+portability is the axis the project claims to win on. DX12 is also the only backend where GNC has
+never produced a single frame, so this is the cheapest remaining portability result: `0049` and
+`GPU_TIER_TEST.md` both say a still encode on `GNC_GPU_BACKEND=dx12` would be **the first real DX12
+measurement this project has.**
+
+**What it needs, and the first question is which shader.** Round 3 reports the wall without naming
+the entry point, and that is the whole investigation:
+
+1. **Which shader, and is it one or many.** `>4.5 min at 95% CPU with no output` was killed, so
+   there is no compiler diagnostic yet. Compile the shader set through FXC one entry point at a
+   time, or raise the kill timeout, and name the offender before theorising.
+2. **Whether it is naga's HLSL or the WGSL.** The same WGSL compiles under naga-SPIR-V and Metal.
+   If naga 24 emits HLSL that FXC cannot handle in reasonable time, that is an upstream report in
+   the shape BUG-25 already established (`gfx-rs/wgpu#7048`) — and BUG-25's lesson applies
+   directly: **validate the module the shipped naga emits, not the one a newer CLI emits.**
+3. **Whether DXC is an option.** wgpu can use DXC instead of FXC. That is a configuration question
+   with a licensing and distribution answer, not just a technical one, so it wants a decision
+   record rather than a commit.
+
+**Success criterion:** one 1080p intra still encoded under `GNC_GPU_BACKEND=dx12` on real hardware,
+and its output compared byte-for-byte against the Metal and Vulkan encodes of the same input at the
+same q. BASELINE already records that **the decoder is bit-exact across backends while the lossy
+encoder differs by one byte**, so the comparison to require is decoder bit-exactness — a
+third backend agreeing is worth more than the throughput number.
+
+**Not in scope:** B-frame dispatch on DX12, which may still meet `X3695` in
+`block_match_bidir.wgsl` — that is BUG-40's step 2 and is a different shader from whatever this
+turns out to be.
+
+**Whoever takes this needs the Windows laptop.** It cannot be started on the Mac: there is no DX12
+adapter here (`gnc gpu-info` lists one, Metal). Park it if the machine is not available.
+
 ### BUG-40 — the eager `block_match_bidir` pipeline is BUG-25's shape on DX12 (**FIXED 2026-09-08**, step 1)
 
 **Step 1 landed 2026-09-08.** `match_bidir_pipeline`, `compensate_bidir_pipeline` and

@@ -6550,7 +6550,72 @@ here because two of its claims are now wrong: the intra figure is −4.63% measu
 encoder rather than −4.5% from an oracle, and it said the still-path fill would need a bitstream
 version, which it does not — `pad.wgsl` is compiled only in the encoder.
 
-### TILE-1 — partial border tiles, so tile size and frame size stop being alternatives (todo, **P2**)
+### TILE-1 — stage 1 inherited, diagnosed, and red on its own target case (**in progress 2026-09-08**, P2)
+
+**Taken over from a session that vanished holding 13 uncommitted files.** They are now committed
+unmodified on branch `tile1` (`1878bf6`) so the work is in git rather than in an orphaned worktree
+— the BUG-32 lesson, applied at 2h rather than 11h. What follows is what running it establishes,
+not what it claims.
+
+**The geometry layer is correct.** `tests/tile1_pad_align.rs` passes 5/5: planes round up to
+`PLANE_PAD_ALIGN = 32` instead of `tile_size`, whole-tile resolutions do not grow, chroma pads
+independently, and GP18 files keep the old grid. At 1080p this is 1920x1088 coded instead of
+2048x1280 — **padding falls from 20.9% of coded samples to 0.73%**, which is the whole of `0034`'s
+6.6-point tax.
+
+**The pipeline is broken on exactly the case the change exists to create.** Partial border tiles
+(1920 = 7x256 + 128, 1088 = 4x256 + 64):
+
+| coder | 1080p, q=50 | control on `main` |
+|---|---|---|
+| Rice | **5.75 dB, 13 611 B** (0.05 bpp) | — |
+| rANS | **panics**: "tile 31 needs 4106 cumfreq entries but the workgroup table holds 4097" | **40.25 dB, 669 464 B** |
+| abac | **panics**: "plane is 2088960 coefficients but its geometry says 1920 x 1280" | — |
+
+`full_pipeline_rice_roundtrip` reads **4.95 dB at 1920x1088 against 56.21 dB at 256x256**, and
+reproduces to the digit after merging `main` and renumbering the generation, so it is not an
+artefact of either.
+
+**The abac canary names the defect outright, and it is one bug, not three.** 2088960 = 1920x1088,
+the new grid; 2457600 = 1920x1280, the old one — `tiles_y * tile_size`. **The entropy path still
+treats the quantised plane as `padded_w * (tiles_y * tile_size)`** (`entropy_helpers.rs:110`,
+`abac_gpu_encode.rs:353`) while the buffer is now `padded_w * padded_h`. Rice does not assert, so it
+reads past the plane and emits 13 kB of nothing; rANS's alphabet blows its workgroup table on the
+garbage; abac has an assertion and fires it. **rANS is fine on `main` at the same command**, so
+none of this is pre-existing.
+
+**What stage 1 actually requires, which the inherited work had not reached:** the entropy coders'
+tile addressing must become *extent-aware* — a border tile is short and its coefficient count is
+`tile_extent()`, not `tile_size^2`. That means `entropy_helpers`, the three encoders and their
+shaders. The original session was in `rice_decode.wgsl`, `rice_gpu.rs` and `rice_encode.wgsl` at
+17:52-17:53, which is where it stopped.
+
+**Cross-link worth having: BUG-49 is plausibly the same class.** It reports q=100 luma at 4:2:2/4:2:0
+coming back 47-52 dB instead of exact, with 4:2:2 *worse* than 4:2:0 — an inversion whose filer
+pins on "anything assuming both dimensions shift together", pointing at `chroma_padded_width()` /
+`chroma_padded_height()` and the tile grid derived from them. That is the same shape as the defect
+above: **a plane dimension derived two ways in one pipeline.** TILE-1 rewrites exactly that grid, so
+the two items should be read together — this may fix it, or share a root cause with it.
+
+**Also fixed on the way in, and it is not a TILE-1 defect:** the inherited work called its format
+**GP19**, which `main` had already given to ENT-9's abac prefix coding (`0074`). Renumbered to
+**GP20**, reserved through `scripts/claim` first, with `plane_pad_align` gated on `gen >= 20` — it
+was `gen >= 19`, which would have applied this grid to every ENT-9 file. **BUG-51**; the merge could
+not have caught it, because the writer line and the table entry are textually identical on both
+sides and auto-merge clean.
+
+**Success criterion for stage 1**, unchanged: all three coders round-trip at 1920x1080 and
+2048x1280 with PSNR within 0.05 dB of `main` at the same q, plus a rate figure showing the padding
+saving. **Canary:** the abac assertion above is already the right one — it must stop firing rather
+than be relaxed.
+
+The original filing follows.
+
+**The code is on branch `tile1` (pushed), not on `main`, and must not be merged until the
+defect below is fixed — it produces 5 dB pictures.** This entry is on `main` so the diagnosis
+is inheritable without the breakage.
+
+### TILE-1 — partial border tiles, so tile size and frame size stop being alternatives (original filing, **P2**)
 
 Filed 2026-09-08 by PAD-1, which shipped 4.6 of the 6.6 points the padding costs and then measured
 why the obvious cheaper escape does not exist. **Worth the remaining ~2 points on stills and the

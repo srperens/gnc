@@ -1673,15 +1673,14 @@ machine — but the affected claim is a documented project rule, and step 1 may 
 > look before filing. That is COORDINATION.md's "Reserving an id is not filing the item" a third
 > time, and it is what this entry is now evidence for.
 >
-> **The mechanism half is written and tested — take it, do not rewrite it.** Worktree `gnc-drnum`,
-> branch **`drnum-mech`** (`git log --all --oneline --grep 'BUG-41 mechanism'`), one file
-> (`scripts/claim`): the `claim item <PREFIX>` allocator, the
-> duplicate-startable-id detection in `items`/`next`, and two new `selftest` properties. **`scripts/claim
-> selftest` passes all six.** It is deliberately **not merged to `main`** — COORD-3 holds the work,
-> and two sessions editing `scripts/claim` for the same reason is the failure this file exists to
-> prevent. Cherry-pick it, or ignore it and say so.
+> **The mechanism landed — COORD-3 shipped it, not this branch.** `1b1f8f6`,
+> `docs/decisions/0065`: `scripts/claim item <PREFIX>` allocates from the same union of committed
+> `main:BACKLOG.md` and live `refs/claims/*`, and `warn_duplicate_ids` reports an id with two
+> startable headings. The `drnum-mech` branch that held this session's independent implementation
+> of the same two things is **deleted**; standing down rather than racing it cost one unmerged
+> commit and duplicated nothing on `main`.
 >
-> What is *not* done anywhere: the ENT-9 renumber itself (COORD-3 holds `ENT-10` for it).
+> What COORD-3 also carried: the ENT-9 renumber itself, under `ENT-10`.
 
 `main:BACKLOG.md` carries two startable `### ENT-9` headings for **different work**:
 
@@ -3126,8 +3125,8 @@ The owner's scope, quoted from `git cat-file -p refs/claims/COORD-3`:
 It holds `ENT-10` for the renumber and `dr-0065` for the record. **Everything BUG-41 found is
 evidence for this item** — the ENT-9 timestamps, the audit that says 11 of the 12 duplicate ids in
 BACKLOG are the harmless "status entry plus original filing" convention, and a tested
-implementation of the allocator and the duplicate-id refusal on branch `drnum-mech` (one commit,
-`scripts/claim` only).
+the audit that says 11 of the 12 duplicate ids in BACKLOG are the harmless "status entry plus
+original filing" convention.
 Correct or replace this stub freely; it exists so the item outlives its session.
 
 ### BUG-27 — the encoder's P-frame reference was dequantised with the intra qstep (**FIXED 2026-09-07**)
@@ -4538,9 +4537,44 @@ every frame prints it.
 **Why P1.** It is a shipped codec producing 12 dB video at its highest quality setting. It also
 gates RATE-3, and RATE-3 gates the inter half of RATE-2's 21.66%.
 
-### RATE-4 — the candidate is chosen on one frame's bytes and paid for by the next one's (todo, P2)
+### RATE-4 — the candidate is chosen on one frame's bytes and paid for by the next one's (todo, P3 — **measured 2026-09-08, the design is settled and the fix is priced, not built**)
 
 Filed 2026-09-08 by RATE-3, which shipped the win and measured this as its cost.
+**Measured 2026-09-08 by the `drnum` session** — `scripts/meas_rate4.py`, RESEARCH_LOG, decision
+`docs/decisions/0068`. Three results, and they change the item rather than close it:
+
+1. **The prize is 0.09 points of mean.** An exact per-GOP ledger takes RATE-3's twelve points from
+   **−4.28% to −4.37%** and removes both regressions (worst point +0.58% → +0.00%). It cannot be
+   worse than the control anywhere, because the control is one of its two arms — which is what this
+   entry's ban on a margin constant was reaching for. It changes 5 of 38 GOPs, all in bbb q=99.
+2. **The ledger does not need the GOP encoded both ways — it needs one frame.** The penalty is paid
+   by the **first** P-frame and does not propagate: P2 is 2–6% of P1, P2..P8 together 1–17%, because
+   P2's reference is P1's reconstruction, which is lossy in both arms. A one-frame lookahead
+   (`I + P1` under each candidate's reference) reaches the exact per-GOP decision on **33 of 33**
+   GOPs, at one extra P-frame encode per GOP instead of the losing arm's whole GOP — the same
+   computation at ki=2, an eightfold saving at ki=9. It carries evidence rather than a construction
+   guarantee: it is optimistic about bit-exact by 4 100–55 313 B on GOPs of ~20 MB.
+3. **A margin constant would have passed all twelve points.** The P1 penalty is nearly independent
+   of the I-frame saving (187 647–321 525 B against savings of 279 336–1 549 505 B), so a threshold
+   anywhere in **(279 336, 575 709) B** reproduces the whole table. **The ban below is right and is
+   now measured** — that window's two ends come from two of the three sequences, the penalty varies
+   1.7× inside this small set, every sequence here is 1080p, and the point setting the lower bound is
+   the one regression the item exists to remove.
+
+**Why P3 and not built.** 0.09 points of mean, two regressions on one sequence at one quality point,
+against an implementation that must hold **two live I-frame references** through the
+`encode_once` → `local_decode_iframe_gpu` side channel that has already produced four defects
+(`0040`, `0042`, RATE-3's gate, the ordering constraint in `encode`'s comment). **Do the other half
+first**: if the source-copy reference holds at q = 95..99 — where the encoder's and decoder's
+references match to 0.0000 and nobody can yet say why — RATE-3's third encode disappears and this
+ledger's marginal cost roughly halves.
+
+**What is settled, so nobody re-derives it:** GOP independence holds in these configs (no B-frames
+at ki=2 or ki=9, `rate_ctrl` is `None` without `--bitrate`, `pending_me` reset at each keyframe,
+`gpu_ref_planes` overwritten not accumulated) — **and `--bitrate` is the one input that breaks it**,
+so a sweep that passes it is measuring something else. The harness asserts both arms produce the
+same frame-type partition and refuses to print an oracle if any GOP's I bytes agree while its totals
+differ; 0 of 38 disagreed, twice, byte-identically.
 
 `encode` keeps the smaller of two candidates by comparing **that frame's** bytes. Inside a sequence
 that is the wrong ledger: a bit-exact I-frame carries detail a lossy one had already quantised away,

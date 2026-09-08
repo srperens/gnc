@@ -5852,7 +5852,73 @@ predicate and a dispatch arm beside the Rice and rANS ones in `sequence.rs` — 
 touching a frame encoder, which is the whole point of ARCH-3. abac video is also *correct* now, so
 a GPU encoder can be checked against the CPU one for bit-exactness on inter, not only on intra.
 
-### ENT-3 — abac on inter: the headline is answered, q=95-99 and context retuning are not (todo, P1)
+### ENT-3 — abac on inter: answered end to end (**DONE 2026-09-08**)
+
+**All three open questions are closed. Decision record `0045`, harness
+`scripts/ent3_abac_inter.py`, log entry in RESEARCH_LOG.** Binary pinned and hash-recorded
+(`364e6aaf…` at `f3f7254`), 18 frames, ki=9, 4:4:4, and every point decodes both arms and hashes
+all 18 PNGs — **18 of 18 identical at all 18 points**, so no BD-rate is quoted and none is needed.
+
+**1. The frame mix is `2I+16P+0B`.** Read out of three places, not reasoned about:
+`benchmark-sequence` prints it on stdout and emits `GNC: B-pyramid suppressed (ki=9 would allow
+it)` on stderr; `encode-sequence` prints `Encoded 18 frames (2I + 16P)` on all 36 encodes; and
+`encode-sequence`'s `-q` defaults to 75, so that path cannot reach `CodecConfig::default()` at
+all. `-q` was passed everywhere (BUG-37).
+
+**2. The container ratio was never an inter figure — the halves are separable and now separated.**
+At ki=9 a whole-file ratio mixes abac's known intra saving in. `encode-sequence` tags each frame
+`[I]`/`[P]`, so **P-frames only**, abac against Rice:
+
+| sequence | q=50 | q=75 | q=90 | q=95 | q=97 | q=99 |
+|---|---|---|---|---|---|---|
+| bbb_extended | −16.1% | −21.1% | −20.6% | −18.2% | −16.6% | −14.5% |
+| crowd_run | −18.3% | −14.3% | −12.2% | −9.6% | −7.5% | −4.3% |
+| old_town_cross | −21.6% | −14.7% | −11.9% | −9.5% | −7.2% | −3.7% |
+
+I-frames from the same runs, for the contrast: −17.8/−14.7/−14.2/−12.3/−11.1/−9.5,
+−16.0/−12.7/−11.4/−8.6/−6.4/−3.3, −20.2/−14.5/−12.7/−10.2/−8.0/−4.7.
+
+**This entry's own prediction is falsified.** It said to expect a *smaller* number on inter than
+intra's −17% because a motion-compensated residual is noise-like. Measured inside the same run,
+**inter is the stronger half on two of three sequences** (bbb_extended −20.6% vs −14.2% at q=90),
+and P −11.3% vs I −9.4% over all 18 points. So the entry's second branch — "then the inter gap
+lives in the motion model, not the coder" — is **not** supported and must not be read out of this.
+
+**The new finding is the decay.** Monotonic in q everywhere: two of three sequences lose two
+thirds of the saving between q=90 and q=99. GNC's home range is q=95-99, so **the figure that
+matters for positioning is the smallest one**, not the −12.0%-to−22.9% band `0025` published.
+
+**3. Retuning the contexts for residual statistics: rejected, with a number.** New read-only
+diagnostic `GNC_COEF_ENTROPY_INTER=1` prices the first P frame's shipped abac tiles the way
+`GNC_COEF_ENTROPY=1` prices a still's. crowd_run, `TOTAL` rows — shipped above `Hnb` (50-context
+richer neighbourhood): **q=95 intra +7.7% vs inter +6.7%; q=99 intra +12.8% vs inter +12.5%.**
+Inter's headroom is *smaller*, so the 6 magnitude buckets leave the same amount on a residual as
+on an intra subband and there is nothing inter-specific to collect. Adaptation loss is under 0.7%
+throughout, so the gap is the **template**, not the cold start — an INTRA-1/ENT-6 question over
+both populations, not an inter one.
+
+**4. Correction that fell out of the reproduction — `0025`'s q=50 and q=75 columns are
+superseded.** A detached worktree pinned at `a312d6f` (0025's own commit) reproduces its container
+column **9 of 9 exactly**, so the harness is the same measurement and the mix behind it was
+`2I+16P+0B`. Across the two commits, I-frame bytes are equal integers at all nine points and
+P-frame bytes are equal integers **at q=90** but +51.9% to +217.1% at q=50 and +52.4% to +59.9% at
+q=75 (Rice; abac similar). Inter-only, no-op at q=90, and far too large for BUG-27 (+0.4% to
++2.0%): **the dominant cause is INTER-2 (`0043`) halving `inter_dz_mul` 2.0 → 1.0.** The ladder's
+dead zone is 0.75 at q=50 and q=75, so the inter dead zone went 1.5 → 0.75 and stopped zeroing a
+large population of small residual coefficients; at q=90 it interpolates to ≈0.18, so the inter
+value went ≈0.36 → ≈0.18 and **both are no-ops** — the quantiser is `floor(|v|/step + 0.5)` after
+the dead-zone test, so anything at or below 0.5 changes nothing. Not bisected against BUG-27 and
+INTRA-2's `dead_zone_referenced` split, which are in the same window; the magnitude says the dead
+zone carries it. CLAUDE.md's abac range is corrected.
+
+**Nothing shipped changes.** The only code is the env-gated diagnostic, and output is
+byte-identical with the variable unset. abac stays opt-in and `0045` moves it no closer: a −3.7%
+saving at q=99 is not an argument for a 1.69× frame decode, so `0017`'s inter reason is priced
+*down* in the range GNC is for.
+
+<details>
+<summary>The entry as it stood before this was measured (kept for provenance)</summary>
+
 
 **Retitled 2026-09-08 (DOC-2), because the old title asked a question this entry answers.** It read
 "Does abac pay on inter residuals? (todo, P1, claimed and released unmeasured 2026-09-07)", which
@@ -5887,6 +5953,9 @@ ki=9, 4:4:4, `.gnv` bytes, **bit-identical pixels on all nine points** (decoded 
 | bbb_extended | −16.3% | −22.9% | −19.7% |
 | crowd_run | −20.7% | −18.4% | −12.1% |
 | old_town_cross | −22.7% | −21.8% | −12.0% |
+
+**Superseded 2026-09-08 for q=50 and q=75 (`0045`).** q=90 reproduces exactly; the other two
+columns were taken before INTER-2 halved the inter dead zone.
 
 So the answer to "does abac pay on inter residuals" is **yes, −12.0% to −22.9%**, in the same band
 as its intra −16.6% to −18.8% and wider at both ends. No BD-rate is needed: the quality delta is
@@ -5943,6 +6012,8 @@ implementation matches — five conclusions in this repo turned on that exact qu
 Note the 2026-09-06 finding that inter breaks even at contribution quality is correct *at that
 operating point* and must not be read as "inter does not matter": under decision 0018 inter has to
 work across the whole range, and the low end is where inter earns its keep.
+
+</details>
 
 ### ENT-2 — Rice vs rANS on one commit (**DONE 2026-09-07**)
 

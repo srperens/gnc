@@ -824,6 +824,35 @@ wrong conclusions have come from this one error.
 
 ## Landed today, and what each one invalidates
 
+- **ENT-3 — abac's inter saving decays with quality, and two of `0025`'s nine points are
+  superseded.** `docs/decisions/0045`. **Invalidates nothing measured** — the only code is one
+  read-only env-gated diagnostic (`GNC_COEF_ENTROPY_INTER`) and output is byte-identical with it
+  unset. What it *does* invalidate is a **published table**: `0025`'s q=50 and q=75 columns, and
+  the "−12.0% to −22.9% on inter" figure CLAUDE.md carried from them (corrected there).
+
+  Three things worth carrying that are not about this item:
+
+  - **A container ratio over a mixed-frame-type file is not a figure about either type.** `0025`
+    measured abac against Rice over whole `.gnv` files at ki=9 — 2 I-frames and 16 P-frames — and
+    was read as an inter result, including by this entry's own title. `encode-sequence` has been
+    printing `[I]`/`[P]` byte counts the whole time, so the split cost nothing but asking for it.
+    Split, the P and I halves differ by up to 6.4 points and **inter is the stronger half on two
+    of three sequences** — the opposite of what the item predicted.
+  - **A figure that reproduces exactly on its own pinned commit and not on `main` is a change
+    log, not an error.** All nine of `0025`'s points reproduce to the digit at `a312d6f`, so
+    nothing was mismeasured; on today's `main` the q=90 column still reproduces exactly and q=50
+    and q=75 move by up to 7.2 points. The boundary named the cause: I-frame bytes are **equal
+    integers** at all nine points and P-frame bytes are equal integers at q=90 only, so it is
+    inter-only and inactive at q=90 — INTER-2 (`0043`) halving `inter_dz_mul`, because the
+    ladder's dead zone is 0.75 at q=50/75 and interpolates to ≈0.18 at q=90 where both the old
+    and new inter values are below the 0.5 at which a dead zone stops doing anything. **Pin the
+    old commit before attributing**: the fit to BUG-27's q≥85 boundary was clean, confident and
+    wrong about the magnitude by two orders.
+  - **A measured range decays across the operating range and the single number you quote should
+    be the one from your own range.** abac buys −20.6% of P bytes at q=90 on bbb_extended and
+    −3.7% at q=99 on old_town_cross. GNC is a contribution codec; anything quoting one abac rate
+    figure without its q is quoting the flattering end.
+
 - **RATE-2 — a still at q = 95..=99 may now come back bit-exact, and it is smaller.**
   `docs/decisions/0036`. **This one changes output**: mean **−21.66% at q=99** on four stills, 12
   of 20 points bit-exact. **Unchanged**: everything below q=95, q=100, `--dct`, and every

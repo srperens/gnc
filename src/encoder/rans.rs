@@ -1931,9 +1931,9 @@ mod tests {
         let mut coefficients = Vec::new();
         for i in 0..65536 {
             let v = if i % 7 == 0 {
-                (i % 50) as i32 - 25
+                (i % 50) - 25
             } else if i % 3 == 0 {
-                (i % 10) as i32 - 5
+                (i % 10) - 5
             } else {
                 0
             };
@@ -1989,9 +1989,9 @@ mod tests {
         let mut coefficients = Vec::new();
         for i in 0..65536 {
             let v = if i % 7 == 0 {
-                (i % 50) as i32 - 25
+                (i % 50) - 25
             } else if i % 3 == 0 {
-                (i % 10) as i32 - 5
+                (i % 10) - 5
             } else {
                 0
             };
@@ -2022,7 +2022,7 @@ mod tests {
     fn test_interleaved_serialize_roundtrip() {
         let mut coefficients = Vec::new();
         for i in 0..65536 {
-            coefficients.push(if i % 4 == 0 { (i % 10) as i32 - 5 } else { 0 });
+            coefficients.push(if i % 4 == 0 { (i % 10) - 5 } else { 0 });
         }
         let tile = rans_encode_tile_interleaved(&coefficients);
         let serialized = serialize_tile_interleaved(&tile);
@@ -2106,9 +2106,9 @@ mod tests {
         let mut coefficients = Vec::new();
         for i in 0..65536 {
             let v = if i % 7 == 0 {
-                (i % 50) as i32 - 25
+                (i % 50) - 25
             } else if i % 3 == 0 {
-                (i % 10) as i32 - 5
+                (i % 10) - 5
             } else {
                 0
             };
@@ -2133,7 +2133,7 @@ mod tests {
     fn test_zrl_serialize_roundtrip() {
         let mut coefficients = Vec::new();
         for i in 0..65536 {
-            coefficients.push(if i % 4 == 0 { (i % 10) as i32 - 5 } else { 0 });
+            coefficients.push(if i % 4 == 0 { (i % 10) - 5 } else { 0 });
         }
         let tile = rans_encode_tile_interleaved_zrl(&coefficients);
         let serialized = serialize_tile_interleaved(&tile);
@@ -2231,11 +2231,11 @@ mod tests {
     fn test_subband_roundtrip_varied() {
         // Simulate realistic wavelet output: LL large, detail mostly zeros
         let mut coefficients = vec![0i32; 65536];
-        for i in 0..65536 {
+        for (i, c) in coefficients.iter_mut().enumerate() {
             let y = i / 256;
             let x = i % 256;
             let g = compute_subband_group(x as u32, y as u32, 256, 3);
-            coefficients[i] = match g {
+            *c = match g {
                 0 => ((x + y) % 40) as i32 + 10, // LL: large positive
                 1 => {
                     // Level 0 detail: mostly zeros
@@ -2312,11 +2312,11 @@ mod tests {
             }
         }
         // Detail: mostly zeros with occasional small values
-        for i in 0..65536 {
+        for (i, c) in coefficients.iter_mut().enumerate() {
             let y = i / 256;
             let x = i % 256;
             if compute_subband_group(x as u32, y as u32, 256, 3) > 0 && i % 10 == 0 {
-                coefficients[i] = (i % 5) as i32 - 2;
+                *c = (i % 5) as i32 - 2;
             }
         }
 
@@ -2347,11 +2347,11 @@ mod tests {
             }
         }
         // Detail subbands: wide range (-15..15) but mostly zeros (95%)
-        for i in 0..65536 {
+        for (i, c) in coefficients.iter_mut().enumerate() {
             let y = i / 256;
             let x = i % 256;
             if compute_subband_group(x as u32, y as u32, 256, 3) > 0 && i % 20 == 0 {
-                coefficients[i] = ((i as i32 * 7) % 31) - 15;
+                *c = ((i as i32 * 7) % 31) - 15;
             }
         }
 
@@ -2382,11 +2382,11 @@ mod tests {
             }
         }
         // Wide-range, high zero density detail coefficients
-        for i in 0..65536 {
+        for (i, c) in coefficients.iter_mut().enumerate() {
             let y = i / 256;
             let x = i % 256;
             if compute_subband_group(x as u32, y as u32, 256, 3) > 0 && i % 20 == 0 {
-                coefficients[i] = ((i as i32 * 7) % 31) - 15;
+                *c = ((i as i32 * 7) % 31) - 15;
             }
         }
 
@@ -2426,11 +2426,11 @@ mod tests {
             }
         }
         // Detail: values -2..2 (alphabet=5, below 16 threshold)
-        for i in 0..65536 {
+        for (i, c) in coefficients.iter_mut().enumerate() {
             let y = i / 256;
             let x = i % 256;
             if compute_subband_group(x as u32, y as u32, 256, 3) > 0 && i % 10 == 0 {
-                coefficients[i] = (i % 5) as i32 - 2;
+                *c = (i % 5) as i32 - 2;
             }
         }
 
@@ -2484,11 +2484,11 @@ mod tests {
     fn test_ctx_adaptive_roundtrip_varied() {
         // Realistic wavelet output
         let mut coefficients = vec![0i32; 65536];
-        for i in 0..65536 {
+        for (i, c) in coefficients.iter_mut().enumerate() {
             let y = i / 256;
             let x = i % 256;
             let g = compute_subband_group(x as u32, y as u32, 256, 3);
-            coefficients[i] = match g {
+            *c = match g {
                 0 => ((x + y) % 40) as i32 + 10,
                 1 => {
                     if i % 5 == 0 {
@@ -2527,11 +2527,11 @@ mod tests {
                 coefficients[y * 256 + x] = 50 + ((x + y) % 10) as i32;
             }
         }
-        for i in 0..65536 {
+        for (i, c) in coefficients.iter_mut().enumerate() {
             let y = i / 256;
             let x = i % 256;
             if compute_subband_group(x as u32, y as u32, 256, 3) > 0 && i % 10 == 0 {
-                coefficients[i] = ((i as i32 * 3) % 21) - 10;
+                *c = ((i as i32 * 3) % 21) - 10;
             }
         }
 
@@ -2555,7 +2555,7 @@ mod tests {
         }
         // Detail subbands: spatially correlated sparsity — rows of zeros followed by rows
         // with values. This pattern benefits from above-neighbor context.
-        for i in 0..65536 {
+        for (i, c) in coefficients.iter_mut().enumerate() {
             let y = i / 256;
             let x = i % 256;
             let g = compute_subband_group(x as u32, y as u32, 256, 3);
@@ -2564,10 +2564,10 @@ mod tests {
                 let local_y = y % 32; // position within subband region
                 if local_y % 4 < 2 {
                     // Zero rows
-                    coefficients[i] = 0;
+                    *c = 0;
                 } else {
                     // Value rows: small coefficients
-                    coefficients[i] = ((x + y) % 7) as i32 - 3;
+                    *c = ((x + y) % 7) as i32 - 3;
                 }
             }
         }

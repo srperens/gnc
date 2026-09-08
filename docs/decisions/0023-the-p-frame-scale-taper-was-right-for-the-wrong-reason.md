@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-07
 **Status:** Accepted. Closes BACKLOG **INTER-1**. Changes **no default**. Corrects the
-justification for TUNE-6's taper, corrects the figures in [0019](0019-the-inter-paths-saving-was-an-equal-setting-figure.md),
+justification for TUNE-6's taper, corrects the figures in [0056](0056-the-inter-paths-saving-was-an-equal-setting-figure.md),
 and records **BUG-27** as the reason both needed correcting. Files **INTER-2**.
 
 > **On BUG-27's number and its two discoverers.** Filed as BUG-25 in this worktree and renumbered
@@ -93,20 +93,20 @@ bytes** (crowd_run q=70).
 
 ## What this corrects elsewhere
 
-**Decision 0019 and MEAS-3.** Their ladder is q=25–95, so most of it ran through the defect.
+**Decision 0056 and MEAS-3.** Their ladder is q=25–95, so most of it ran through the defect.
 Re-run on the same harness, same 18 frames, same sequences:
 
-| sequence | mean: 0019 → now | worst-frame: 0019 → now |
+| sequence | mean: 0056 → now | worst-frame: 0056 → now |
 |---|---|---|
 | crowd_run | +15.9% → **+6.5%** | +32.4% → **+12.0%** |
 | old_town_cross | +22.2% → **+19.3%** | +35.4% → **+28.7%** |
 | bbb_extended | −24.2% → **−26.8%** | −10.5% → **−16.5%** |
 | **mean** | **+4.6% → −0.3%** | **+19.1% → +8.0%** |
 
-0019's *shape* survives — inter still costs +8% on the worst frame, nearly all of it
+0056's *shape* survives — inter still costs +8% on the worst frame, nearly all of it
 old_town_cross — but its magnitude does not, and **INTER-1's own title ("the inter path is a loss
 at contribution quality") does not survive at all**: at q=85–99 the shipped configuration is
-−1.9% mean / −0.2% worst-frame. 0019's stated reasons for the *old* figure being wrong remain
+−1.9% mean / −0.2% worst-frame. 0056's stated reasons for the *old* figure being wrong remain
 correct and untouched; it simply also had a bug underneath it.
 
 **TUNE-5.** Its flat-1.25 "−3.3% BD-rate at ki=9" was measured at q=15–50, entirely inside the
@@ -121,7 +121,7 @@ re-measuring.
 ## What was not chosen
 
 - **Making inter opt-in, or all-intra the default.** Rejected on the corrected measurement, not on
-  principle. The case for it was 0019's +4.6%/+19.1%; about 60% of the worst-frame penalty was
+  principle. The case for it was 0056's +4.6%/+19.1%; about 60% of the worst-frame penalty was
   BUG-27, and at the contribution operating point the shipped configuration is a wash tilted
   slightly *toward* inter. It also wins −12.7% on animation. Separately, GOALS §1 rejects going
   all-intra as a positioning matter and LOOP.md reserves that for escalation — but the measurement

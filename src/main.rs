@@ -547,8 +547,10 @@ enum Command {
         #[arg(long)]
         rice: bool,
 
-        /// Use the adaptive binary code-block coder (abac). Intra rate is measured; on inter it is
-        /// verified correct but its contexts were tuned on intra coefficients and never retuned.
+        /// Use the adaptive binary code-block coder (abac). Saves rate at identical pixels, and
+        /// the saving decays with quality: on P-frame bytes -21.6% to -3.7% over q=50-99 (ENT-3,
+        /// docs/decisions/0045). Its contexts were tuned on intra coefficients; retuning them for
+        /// residuals was priced and rejected — inter's headroom is smaller than intra's.
         #[arg(long)]
         abac: bool,
 
@@ -651,8 +653,10 @@ enum Command {
         #[arg(long)]
         rice: bool,
 
-        /// Use the adaptive binary code-block coder (abac). Intra rate is measured; on inter it is
-        /// verified correct but its contexts were tuned on intra coefficients and never retuned.
+        /// Use the adaptive binary code-block coder (abac). Saves rate at identical pixels, and
+        /// the saving decays with quality: on P-frame bytes -21.6% to -3.7% over q=50-99 (ENT-3,
+        /// docs/decisions/0045). Its contexts were tuned on intra coefficients; retuning them for
+        /// residuals was priced and rejected — inter's headroom is smaller than intra's.
         #[arg(long)]
         abac: bool,
 
@@ -920,12 +924,11 @@ fn build_ip_config(
     } else {
         gnc::manual_config(qstep.unwrap_or(4.0))
     };
-    // RATE-2's lossless fallback is intra-only and this is one of the two funnels that refuse it.
-    // RATE-3 investigated lifting this and could not: see its BACKLOG entry for what is
-    // established and the one measurement that would settle it. This line also stops the
-    // throwaway GPU warm-up encodes from paying for a second encode on a path that will not
-    // take it.
-    config.lossless_fallback = false;
+    // RATE-3 lifted the refusal that used to sit here: an I-frame inside a sequence codes both
+    // ways and keeps the smaller file, like a still. `quality_preset` still decides *where* —
+    // q = 95..=99 only — and `GNC_LOSSLESS_FALLBACK=0` restores the old behaviour, which is the
+    // control arm `scripts/meas_rate3.py` reads. The cost this line used to avoid is real and
+    // unchanged: the throwaway GPU warm-up encodes now pay for a second encode too.
     // PAD-1 is refused through the same funnel and for a parallel reason: fading the tile padding
     // flat is worth -4.63% RGB on a still, but an I-frame in a chain is a *reference* and motion
     // compensation predicts edge blocks from its padding — measured at up to 4.03 dB of

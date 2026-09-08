@@ -1596,9 +1596,9 @@ mod tests {
 
         // Create a test pattern with a mix of zeros and non-zeros
         let mut coefficients = vec![0i32; coeffs_per_tile];
-        for i in 0..coeffs_per_tile {
+        for (i, c) in coefficients.iter_mut().enumerate() {
             let v = (i % 13) as i32 - 6; // values from -6 to 6
-            coefficients[i] = v;
+            *c = v;
         }
 
         // CPU encode
@@ -1621,7 +1621,6 @@ mod tests {
         let packed = GpuRiceDecoder::pack_decode_data(&[tile], &info);
 
         // Create GPU buffers
-        let storage_dst = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
         let params_buf = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("test_params"),
             contents: bytemuck::bytes_of(&packed.params),
@@ -1758,15 +1757,16 @@ mod tests {
                 let mut cpu_plane = vec![0f32; padded_pixels];
                 for (t, tile) in plane_tiles.iter().enumerate() {
                     let cpu_decoded = rice::rice_decode_tile(tile);
+                    assert_eq!(cpu_decoded.len(), tile_sz * tile_sz);
                     let tx_pos = t % tiles_x_count;
                     let ty_pos = t / tiles_x_count;
                     let origin_x = tx_pos * tile_sz;
                     let origin_y = ty_pos * tile_sz;
-                    for ci in 0..tile_sz * tile_sz {
+                    for (ci, &cd) in cpu_decoded.iter().enumerate() {
                         let row = ci / tile_sz;
                         let col = ci % tile_sz;
                         let pi = (origin_y + row) * padded_w + origin_x + col;
-                        cpu_plane[pi] = cpu_decoded[ci] as f32;
+                        cpu_plane[pi] = cd as f32;
                     }
                 }
 
@@ -1964,15 +1964,16 @@ mod tests {
             let mut cpu_plane = vec![0f32; padded_pixels];
             for (t, tile) in plane_tiles.iter().enumerate() {
                 let cpu_decoded = rice::rice_decode_tile(tile);
+                assert_eq!(cpu_decoded.len(), tile_sz * tile_sz);
                 let tx_pos = t % tiles_x;
                 let ty_pos = t / tiles_x;
                 let origin_x = tx_pos * tile_sz;
                 let origin_y = ty_pos * tile_sz;
-                for ci in 0..tile_sz * tile_sz {
+                for (ci, &cd) in cpu_decoded.iter().enumerate() {
                     let row = ci / tile_sz;
                     let col = ci % tile_sz;
                     let pi = (origin_y + row) * padded_w + origin_x + col;
-                    cpu_plane[pi] = cpu_decoded[ci] as f32;
+                    cpu_plane[pi] = cd as f32;
                 }
             }
 
@@ -2018,9 +2019,9 @@ mod tests {
         let mut all_tiles = Vec::new();
         for t in 0..num_tiles {
             let mut coefficients = vec![0i32; coeffs_per_tile];
-            for i in 0..coeffs_per_tile {
+            for (i, c) in coefficients.iter_mut().enumerate() {
                 let v = ((i + t * 7) % 13) as i32 - 6;
-                coefficients[i] = v;
+                *c = v;
             }
             let tile = rice::rice_encode_tile(&coefficients, tile_size, num_levels);
             all_tiles.push(tile);
@@ -2030,15 +2031,16 @@ mod tests {
         let mut cpu_plane = vec![0i32; total_pixels];
         for (t, tile) in all_tiles.iter().enumerate() {
             let decoded = rice::rice_decode_tile(tile);
+            assert_eq!(decoded.len(), coeffs_per_tile);
             let tx = (t as u32) % tiles_x;
             let ty = (t as u32) / tiles_x;
             let origin_x = tx * tile_size;
             let origin_y = ty * tile_size;
-            for ci in 0..coeffs_per_tile {
+            for (ci, &d) in decoded.iter().enumerate() {
                 let row = ci / tile_size as usize;
                 let col = ci % tile_size as usize;
                 let pi = (origin_y as usize + row) * padded_w as usize + origin_x as usize + col;
-                cpu_plane[pi] = decoded[ci];
+                cpu_plane[pi] = d;
             }
         }
 

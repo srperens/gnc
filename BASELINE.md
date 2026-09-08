@@ -208,6 +208,46 @@ The I-only column is the comparison that survives: on camera content at q=90, **
 than all-intra**. Animation still saves. That is INTER-1's finding on current HEAD, not a new one.
 No fps is quoted — the machine was not idle.
 
+## Lossless sequences (q=100, 8 frames, 4:4:4, Rice)
+
+New section 2026-09-08 (LOSSLESS-2). There was no lossless *sequence* row here before, because
+until BUG-39 (`0064`) `q=100` video was not bit-exact and there was nothing to regress against.
+Container bytes, `encode-sequence`, and every frame md5-identical to its source PNG through
+`decode-sequence`:
+
+| sequence | ki=2 | ki=9 | mix at ki=9 |
+|---|---|---|---|
+| crowd_run | 25 856 146 | 25 856 146 | **8I+0P** |
+| old_town_cross | 25 247 023 | 25 247 023 | **8I+0P** |
+| blue_sky | 17 294 725 | 17 294 725 | **8I+0P** |
+| bbb (animation) | 25 485 001 | 25 183 470 | 1I+7P |
+
+**ki does not change the camera rows, and that is the feature, not a copy-paste.** A `q=100`
+P-frame that costs more than an I-frame of the same picture is re-coded as an I-frame (`0070`), so
+camera content converges to all-intra whatever the keyframe interval says. Before that change the
+same rows read 35 712 641 / 43 003 751 (crowd_run) and 35 209 443 / 42 778 003 (old_town_cross) —
+up to **+69% for identical pixels**. `GNC_LOSSLESS_INTRA_RECODE=0` reproduces the old numbers.
+
+Animation keeps its P-frames and its rows are unchanged. **No fps is quoted: eight sessions shared
+the GPU.**
+
+## Lossless sequences at q = 95..=99 (8 frames, 4:4:4, Rice)
+
+New section 2026-09-08 (LOSSLESS-3, `0073`). Above q≈95 a camera sequence is emitted **bit-exact**
+when that is smaller, so these rows are the same files as the q=100 rows above — byte-identical on
+all three camera sequences, which is the regression check:
+
+| sequence | q=95 | q=97 | q=99 | what it was |
+|---|---|---|---|---|
+| crowd_run (ki=9) | 25 856 146 | 25 856 146 | 25 856 146 | 31 427 614 / 34 374 105 / 37 984 009 |
+| old_town_cross (ki=9) | 25 247 023 | 25 247 023 | 25 247 023 | 31 440 634 / 34 391 448 / 38 010 958 |
+| blue_sky (ki=9) | 17 294 725 | 17 294 725 | 17 294 725 | 19 231 299 / 21 659 527 / 24 812 142 |
+| bbb (ki=9, animation) | 17 896 639 | 20 924 647 | 24 290 268 | unchanged — the fallback does not fire |
+
+−10.07% to −33.58% at ki=9 and −5.95% to −22.15% at ki=2, at *exact* pixels rather than 53-61 dB.
+`GNC_LOSSLESS_SEQUENCE_FALLBACK=0` reproduces the old column. 4:4:4 only until BUG-46; refused when
+a bitrate target is set. **No fps is quoted: eight sessions shared the GPU.**
+
 ## Reported bitrate correction (2026-09-05)
 
 `CompressedFrame::byte_size()` counted motion vectors as 4 raw bytes per block while the
@@ -298,6 +338,15 @@ only the bytes moved. That is the canary the path ran. Saving vs Rice decays wit
 (crowd_run −12.2% at q=85 to −3.7% at q=99), which is ENT-3's finding on this ladder.
 Rice stays the default; quote **+89.2%** unless the command included `--abac`.
 
+> **The `--abac` row and the 1.66x are conservative as of 2026-09-08 — ENT-9 (`0074`) made abac
+> cheaper across this whole ladder.** Measured on that change: total rate **−2.07% to −8.76% at
+> q=99**, −1.26% to −4.56% at q=95, −0.85% to −2.75% at q=90 (three sequences, 18 frames, ki=9,
+> 4:4:4). Every rung here sits inside that range, so the direction is known and only the size is
+> not. **The Rice row is unaffected** — ENT-9 touches entropy type 5 only. Not re-taken with the
+> change, because today's `main` also carries RATE-3, BUG-39, INTER-2 and LOSSLESS-2, and a ladder
+> taken now would credit all of it to ENT-9 (the failure COORD-6 was filed for). Re-take is
+> **MEAS-11**, on a pinned commit.
+
 The move from QUAL-1's +90.5% to +89.2% is **1.3 points**, all in the direction INTER-2
 predicted: only q=85 of this ladder sits in the inter-dead-zone change (q ≤ 88), so a
 −4.77% GNC-vs-GNC BD-rate on that one rung dilutes to about a point against x264. VMAF
@@ -315,12 +364,30 @@ makes the figure **pessimistic against GNC by an unmeasured amount** — not wro
 1.9x either. The ladder is also not monotonic in rate (a rung's bpp can fall as q rises), so any
 interpolation by rate should flag that.
 
-**RATE-2 shipped on 2026-09-08 (`docs/decisions/0036`) and does not move this figure, because the
-fix is intra-only.** A still at q=95–99 now codes both ways and keeps the smaller — mean −21.66%
-at q=99 — but the fallback is *refused* inside a sequence: a MED I-frame carries
-`wavelet_levels = 0` and the P-frame path's reference cannot reconstruct from it, measured at
-**9.80 dB against 60.69 dB** (filed as RATE-3). MEAS-10's +89.2% is INTER-2, not RATE-2.
-**The next re-run is against RATE-3**, if that sequence gate ever lifts.
+**RATE-2 shipped on 2026-09-08 (`docs/decisions/0036`) and did not move this figure, because that
+fix was intra-only. RATE-3 landed the same day (`docs/decisions/0044`) and does move it.** A still
+at q=95–99 codes both ways and keeps the smaller (mean −21.66% at q=99), and since RATE-3 a
+**sequence I-frame does too**: the gate that refused the fallback inside a sequence is lifted, worth
+mean **−6.09%** of sequence bytes over three sequences at q ∈ {95, 99} and ki ∈ {2, 9}, up to
+**−16.19%**, at a worst quality move of −0.01 dB.
+
+**Those two figures were −4.28% and −13.16% until 2026-09-08 and moved for a fix, not a re-take**
+(BUG-47, `docs/decisions/0072`): `lossless_sibling` did not carry `pad_fill_decay`, so the bit-exact
+candidate was coded with a still's decay-filled padding while acting as a sequence reference. The
+same twelve points now have **0 of 12 worse than the control**, where RATE-3 recorded two
+regressions of +0.58% and +0.40%. The 4:2:0 ladder below is affected in the same direction and by
+an unmeasured amount — the fix applies wherever the bit-exact sibling is used, and only 4:4:4 was
+measured.
+
+**So the ladder's top two rungs are stale.** It is q=85/92/96/99 and `quality_preset` sets the
+fallback for q = 95..=99 only, so **q=96 and q=99 move; q=85/92 do not.** The direction favours GNC
+and the size is not guessable from RATE-3's sweep: this ladder is 4:2:0 at ki=9, where RATE-3
+measured −2.4% to −5.7%, not the −13% of its best point — and both ends of that range predate
+BUG-47, so they are floors rather than estimates now. **+89.2% stands as recorded until
+`meas1_vs_h264.py` is run again** — as with the INTER-2 note above, a predicted direction is not a
+measurement. Two of the four rungs have now moved for two independent reasons (INTER-2 at q=85,
+RATE-3 at q=96 and q=99), which makes re-running this ladder the highest-value measurement in the
+file.
 
 **Colour, at rate matched to 1%** — CIEDE2000 on decoded RGB, which VMAF cannot see:
 

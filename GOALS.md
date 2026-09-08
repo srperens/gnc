@@ -77,7 +77,7 @@ order rather than a format-specific feature.
 6. **Open source only** — All dependencies must be open source.
 7. **English only** — All code, comments, docs, and commit messages in English.
 8. **Measure everything** — Every change benchmarked: PSNR, SSIM, bpp, encode/decode FPS. Compare against baseline and previous best. Optionally compare against relevant codecs (H.264, H.265, AV1, MJPEG, JPEG XS, ProRes) for context.
-9. **No code duplication** — Extract shared logic. Code must pass `cargo fmt` and `cargo clippy` with zero warnings.
+9. **No code duplication** — Extract shared logic. Code must pass `cargo fmt` and `cargo clippy` with zero warnings. The exact clippy commands are in CLAUDE.md, "Code Style": `--all-targets` on native since BUG-20 (`docs/decisions/0062`), `--lib` on wasm. **The `cargo fmt` half of this rule is currently false** — 566 diffs in 61 files, 504 of them under `src/` — filed as **BUG-38**, not yet decided.
 10. **No legacy** — Nobody runs GNC in production. We can break the bitstream format, change the container, rename fields, restructure anything. No backward compatibility constraints.
 11. **Video codec first** — GNC is a video codec, not an image codec. Sequence encode/decode performance is the primary metric. Single-frame performance only matters as a component of video throughput.
 
@@ -127,6 +127,12 @@ on a non-idle machine: GPU encode phase 12.2 fps, end to end 5.0 fps.
   on every entropy coder (Rice, rANS, default), verified on two 1080p images: max error 0, zero
   wrong pixels. At 1.99:1 it beats JPEG 2000 lossless by 10.8% and PNG by 7.8%, and loses to FFV1
   by 27% and x264 `-qp 0` by 43% — both of which use spatial prediction
+- ~~Lossless is a *still* claim: `q=100` sequences decode their P-frames at 12–51 dB~~ — **closed
+  2026-09-08 (BUG-39, four causes, `docs/decisions/0042`, `0054`, `0064`).** A `q=100` 4:4:4
+  sequence is now bit-exact on every frame, verified outside the harness with raw-RGB md5 through
+  the container on 48 frames at ki=2 and 9. **B-frames and 4:2:0 are still not bit-exact**, each
+  for one stated reason (bidir MC averages two predictions; chroma-domain MC box-filters), and
+  at `q=100` inter coding costs +38% against all-intra on camera content (LOSSLESS-2)
 
 ## 4. Where We Stand & Goals
 
@@ -145,7 +151,7 @@ I/P/B inter path saves only 17–27% vs all-I where H.264 saves 60–70%.
 > costs more than all-intra. The older figure compared rates at the same q, where the inter arm is
 > 7.6 dB worse on crowd_run — its quality evidence was VMAF 99.09 against 99.10, which is
 > saturated. The H.264 60–70% half of the sentence stands; it was not re-measured. See
-> `docs/decisions/0019` and BACKLOG INTER-1.
+> `docs/decisions/0056` and BACKLOG INTER-1.
 >
 > **Corrected again, INTER-1 (2026-09-07): those figures were themselves measuring BUG-27** — the
 > encoder's P-frame reference was dequantised with the intra quantiser step, so its reference

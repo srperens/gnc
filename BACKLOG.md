@@ -1482,8 +1482,29 @@ read as claiming it is.
 decoder should do with a stream it cannot parse. That belongs in a decision record with the
 alternatives priced: (a) `Result` at the public boundary, (b) a validating pre-pass that bounds
 every length against `data.len()` before the parser runs, (c) document panic-on-malformed as the
-contract and require callers to sandbox. **(b) is the cheapest and does not break the API**, and it
-is worth pricing first.
+contract and require callers to sandbox.
+
+**Priced (b) and did the part of it that needs no pre-pass, 2026-09-08.** A separate validating
+pass would be a *second* parser that has to agree with the first — a new class of bug, and not
+cheap after all. But the DoS half of (b) needs no second parse: the four counts that reach
+`Vec::with_capacity` are each followed immediately by that many fixed-size records, so
+`wire_count(count, stride, data.len(), pos)` caps them at what the remaining buffer could hold, at
+the point they are read. Landed for `num_detail` (stride 12), CfL `alpha_count` (2), `wm_len` (4)
+and `num_tiles` (**1**, not 8 — the gen>=11 index table is 8 bytes per tile, but the same count is
+reused for the tile vectors on every generation and a pre-GP11 tile blob has no guaranteed 8-byte
+minimum, so capping at remaining/8 could shrink a *legitimate* count and corrupt a well-formed
+file; one byte per tile is the bound that cannot be wrong). **`alpha_count` also fixed an
+overflow**: `2 * num_cfl_tiles * nsb` was computed in `u32` and wrapped in release, panicked in
+debug, before being compared to anything.
+
+**Well-formed streams are provably unaffected** — their counts satisfy the bound by construction —
+and item 8's 16 byte-identical decodes were re-run to show it. So a tiny hostile file can no longer
+turn into a multi-gigabyte allocation; it now runs off the end of the buffer and hits the same
+panic the parser already has everywhere else. **That is the DoS, not the contract.**
+
+**What is still open is only the contract**: whether the decoder should reject rather than panic,
+i.e. (a) versus (c). The panic surface is unchanged and is still `assert!` plus `unwrap()`
+throughout, so pick one and write the record.
 
 **Not audited:** `abac.rs` (`vec![0i32; count]` at `:395`, `:636`), the rANS deserialiser, and the
 GNV container index. Same class of question, and the same answer probably applies, but "probably"
@@ -2119,26 +2140,53 @@ The two reads that would have caught it are now in COORDINATION, above the share
 section. The second is what BUG-41 and BUG-42 had in common: **an item held with no heading yet is
 invisible to `grep`, to `next` and to `items`, and visible only to `scripts/claim list`.**
 
-### BUG-38 — `cargo fmt --check` is red across the tree, and GOALS §9 names it as a gate (todo, P4)
+### BUG-38 — `cargo fmt --check` is red across the tree; decided, the reformat wants a quiet tree (todo, P4)
 
-GOALS §9 says code "must pass `cargo fmt` and `cargo clippy` with zero warnings". `cargo fmt
---check` reports **566 diffs in 61 files** — **504 in 44 files under `src/`**, 53 in 14 files
-under `tests/`, 9 in 3 under `examples/`. So unlike BUG-20, this is not a test-code question:
-the shipped code is the bulk of it.
+GOALS §9 requires `cargo fmt` clean. `cargo fmt --check` reports **573 diffs in 61 of the 90
+`.rs` files**, 504 of them under `src/`. Neither CLAUDE.md nor LOOP.md ever named it as a gate,
+so nothing ran it. Filed 2026-09-08 by the `loopa` session while doing BUG-20 — same defect shape,
+one gate over.
 
-Measured 2026-09-08 on `main` at `a73e0a2`, by the `loopa` session while doing BUG-20 — same
-defect shape (a written rule and an unrun check disagreeing), found because BUG-20's entry asks
-which of the two is wrong and the same question applies one gate over.
+**The decision is made: keep the rule, do the reformat as one atomic commit on a quiet tree, and
+add the gate only then.** Decision `docs/decisions/0066`. What remains is mechanical and is parked
+as `blocked-quiet-tree`, not free, because doing it under seven live sessions is one merge conflict
+per session for zero behaviour.
 
-**Not fixed in passing, deliberately.** `cargo fmt` over 44 `src/` files is a diff that touches
-almost every module eight sessions are editing right now, and it would conflict with all of them
-while carrying no behaviour. The fix wants a quiet tree and one commit that changes nothing else,
-so it is a claimable item rather than something to do while holding another.
+Measured before deciding, and two of the four options died on the numbers:
 
-**The decision to make is the same one BUG-20 has:** run `cargo fmt` once and add it to the gate
-list in CLAUDE.md and LOOP.md (neither of which mentions it today — only GOALS §9 does), or drop
-the `cargo fmt` half of GOALS §9 and say the project does not check formatting. Doing neither
-leaves a rule that has been false for an unknown length of time.
+- **No rustfmt config fits the tree.** The hypothesis that a `rustfmt.toml` matching a house style
+  would collapse this into a one-file change is **falsified in the opposite direction**: rustfmt's
+  default is the best of seven configurations at 573, and every deviation is worse —
+  `fn_call_width = 80` 646, `max_width = 90` 964, `use_small_heuristics = "Off"` 1053, `"Max"`
+  1114, `"Max"` + 110 cols 1358, + 120 cols 1518. **Do not add a `rustfmt.toml`.**
+- **The dirty files are the hot files.** 44 of the 61 were changed on `main` in the last 24 h
+  (72%), and 19 `.rs` files are uncommitted in some worktree right now. `src/main.rs` (55 diffs)
+  and `src/decoder/pipeline.rs` (52) lead, with `pipeline_tests.rs` (37) and `rice.rs` (22) — both
+  committed to by other sessions *during* this item.
+- **A per-touched-file rule is refuted by that overlap.** It was the most attractive option before
+  the numbers: incremental, no big bang, converges. But it does not avoid the conflicts, it
+  distributes them over the same files, and it mixes a reformat into every semantic commit that
+  touches a dirty file — the exact hazard the rule exists to prevent.
+- **The cold subset is 10% and not worth taking.** Excluding everything changed on `main` in 24 h
+  and everything dirty in any worktree leaves 16 files carrying 59 of the 573 diffs. The gate stays
+  red either way, so it buys nothing and adds a third state.
+- **The drift is live:** 566 diffs when this was filed, **573** seventy-five minutes later. Same
+  mechanism as clippy's 88 → 90 → 91 (`0062`).
+
+**Unpark condition, and it is checkable rather than a feeling:**
+
+```bash
+scripts/claim list | grep -v '^  worktree\.'    # nothing held but this item
+for wt in $(git worktree list --porcelain | awk '/^worktree /{print $2}'); do
+  git -C "$wt" status --porcelain; done          # must print nothing
+```
+
+**Then, in one commit that changes nothing else:** `cargo fmt` (no config), both clippy targets and
+the full suite to prove rustfmt changed no semantics, the commit, **and its sha appended to
+`.git-blame-ignore-revs`** — a 573-diff commit across 61 files otherwise becomes the blame answer
+for a quarter of the codebase, and this project reads history constantly. Add the gate to CLAUDE.md
+and LOOP.md step 5 in the same commit; `cargo fmt --check` needs no compilation and costs about a
+second.
 
 ### ARCH-3 — `gpu_entropy_encode` selected a whole P-frame pipeline, not just where entropy runs (**DONE 2026-09-07**)
 

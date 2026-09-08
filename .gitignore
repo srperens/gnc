@@ -30,7 +30,10 @@ __pycache__/
 
 # The metric scripts need numpy and pillow, and the system python here is
 # externally managed. One shared venv in the shared checkout, gitignored.
+# Both spellings: a worktree reaches it by `ln -s ../gnc/.venv .venv`, and a `.venv/`
+# pattern does not match a symlink, so the link showed up as untracked in every worktree.
 .venv/
+.venv
 examples/web/*.log
 examples/web/demos.json
 

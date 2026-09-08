@@ -4,6 +4,55 @@
 
 ---
 
+## PAD-2 — Dirac zero-extend on inter is worse than the fill PAD-1 already refused (2026-09-08)
+
+**Hypothesis.** PAD-2's cheaper-first candidate: zero-extend the tile padding on inter, as
+Dirac §13.1.2 Note / Schroedinger `schro_frame_zero_extend`. A zero-padded current against a
+zero-padded reference differences to nothing *in the padding*, so the padding's own residual
+vanishes. That is a different mechanism from PAD-1, which asked which fill predicts best.
+
+**Domain.** Encoder pad fill (`pad.wgsl` `fill_mode=2`, `GNC_PAD_FILL=zero`). Not the
+decoder, not MC, not a bitstream version. Default is unchanged.
+
+**Canary.** `GNC_DIAGNOSTICS=1 GNC_PAD_FILL=zero` prints `pad fill = zero` on both the
+sequence-buffer write and the still path. Default still prints `decay` / sequence `replicate`.
+
+**Measured**, `scripts/meas_pad1_inter.py`, ki=9, 17 frames, three sequences, q=85/92, 4:4:4 and
+4:2:0, against `GNC_PAD_FILL=replicate`. Not idle; bpp/PSNR are deterministic.
+
+| sequence | chroma | q | decay rate / dWORST | **zero rate / dWORST** |
+|---|---|---|---|---|
+| crowd_run | 444 | 85 | −6.92% / +0.000 | −8.66% / +0.000 |
+| crowd_run | 444 | 92 | −6.92% / +0.000 | −8.72% / +0.000 |
+| crowd_run | 420 | 85 | −9.02% / +0.000 | −11.09% / +0.000 |
+| crowd_run | 420 | 92 | −9.04% / +0.000 | −11.15% / +0.000 |
+| old_town_cross | 444 | 85 | −7.81% / −0.900 | −9.10% / **−2.110** |
+| old_town_cross | 444 | 92 | −7.75% / +0.000 | −8.65% / **−1.610** |
+| old_town_cross | 420 | 85 | −10.20% / −0.490 | −11.49% / **−1.360** |
+| old_town_cross | 420 | 92 | −10.09% / +0.000 | −11.13% / **−0.980** |
+| bbb_extended | 444 | 85 | −8.70% / −2.470 | −9.68% / −2.470 |
+| bbb_extended | 444 | 92 | −9.14% / −4.030 | −10.75% / **−4.960** |
+| bbb_extended | 420 | 85 | −9.80% / −0.360 | −10.64% / −0.380 |
+| bbb_extended | 420 | 92 | −10.24% / −0.350 | −11.49% / −0.470 |
+
+Default vs replicate: **+0.00% rate, +0.000 dB on all 12** — the shipped inter path did not move.
+
+**Verdict: FAIL.** Zero-extend regresses **8 of 12** points > 0.3 dB (decay: 6 of 12). Worst is
+bbb_extended 4:4:4 q=92 at **−4.960 dB**, worse than decay's −4.030 dB. Mean rate −10.21% vs
+decay's −8.80%: the extra saving *is* the worse prediction. old_town at q=92, which decay left
+at 0.000 dB, goes to −1.61 / −0.98 dB.
+
+The filing's caveat holds: vanishing padding residual says nothing about visible edge blocks
+whose MVs point outward, and that is where the 4 dB went. **Do not ship zero as an inter
+default.** `GNC_PAD_FILL=zero` stays as a harness arm.
+
+**Next on this item**, the other cheap check: clamp MC's reference reads to the *visible* bounds
+instead of the padded ones (`motion_compensate.wgsl` currently clamps to `params.width/height`,
+which are the padded dimensions). That is a decode-process change if it ships; measuring it
+does not require a bitstream bump.
+
+---
+
 ## BUG-40 — bidir pipelines are paid by B-frames, not by everything else (2026-09-08)
 
 **Hypothesis.** `MotionEstimator::new` compiles `block_match_bidir.wgsl` (and the two bidir MC

@@ -4995,20 +4995,14 @@ first figures understated it. Plus the ki=1 control that isolates the cause. **S
 the rate win of the forced-on arm with worst-frame PSNR within 0.3 dB of replication on all three
 sequences, both chroma formats.
 
-**And there is prior art for exactly this split, which is worth trying before the decoder change.**
-The Dirac specification (v2.2.3, §13.1.2 Note) recommends **edge extension for intra pictures and
-*zero* extension for inter pictures**, and Schroedinger implements precisely that — it calls
-`schro_frame_zero_extend` on the inter path and edge-extends on intra
-(`schroencoder.c:2442-2453`). VC-2's copy of that Note dropped the inter clause only because VC-2
-is intra-only. So a codec in this family already treats the two cases differently, which is what
-PAD-1 concluded from measurement.
-
-The mechanism is not the one PAD-1 tested, and that is why it is interesting: PAD-1 asked "which
-fill predicts best", and zero extension instead makes the **padding's own residual** vanish, since
-a zero-padded reference against a zero-padded current frame differences to exactly nothing. It says
-nothing about visible edge blocks whose motion vectors reach outward, which is where PAD-1's 4.03 dB
-went — so it may well not help, but it is cheap to measure with `GNC_PAD_FILL` extended by a
-`zero` arm and it is the one candidate here with a shipping implementation behind it.
+**Dirac zero-extend: measured and rejected 2026-09-08.** `GNC_PAD_FILL=zero` (`pad.wgsl`
+`fill_mode=2`). Same harness as PAD-1, ki=9, 17 frames, three sequences, q=85/92, 4:4:4 and 4:2:0.
+**8 of 12 points regress > 0.3 dB** (decay: 6 of 12). Worst: bbb_extended 4:4:4 q=92 **−4.960 dB**
+against decay's −4.030 dB. old_town q=92, which decay left at 0.000, goes to −1.61 / −0.98 dB.
+Mean rate −10.21% vs decay −8.80% — the extra saving is the worse prediction. Default vs
+replicate stayed +0.00% / +0.000 dB on all 12. The caveat in the filing was the result: vanishing
+padding residual does not help visible edge blocks whose MVs point outward. Do not re-test zero
+as an inter default. The env arm stays for the harness.
 
 **Cheaper thing to check first, and it may make PAD-2 unnecessary for most content:** the loss is
 concentrated on one clip. If it is edge blocks with outward motion vectors specifically, then

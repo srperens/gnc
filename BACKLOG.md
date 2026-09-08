@@ -5247,6 +5247,21 @@ wherever the candidate wins — verified outside the harness by md5 on a real `e
 `decode-sequence` round trip. Stills are byte-identical. Two of twelve points regress (bbb q=99,
 +0.58% / +0.40%) and that is RATE-4.
 
+**Scope, and it is load-bearing: −6.09% is a 4:4:4 figure.** BUG-46 found `lossless_sibling`
+dropping the caller's `chroma_format`, so on subsampled input the comparison was against a 4:4:4
+arm and the fallback could essentially never fire; `0078` now refuses it there outright, because
+BUG-49 has `q=100` luma coming back 47–52 dB instead of exact at 4:2:2/4:2:0. **The sequence sweep
+at those formats is not an open corner of this item — it cannot be run meaningfully until BUG-49
+is fixed.**
+
+**The mechanism behind this item's cost is a measured property, not an anecdote.** A P-frame costs
+more against a bit-exact reference than against a lossy reconstruction — this item saw crowd_run's
+P-frames go 4 990 303 → 5 274 377 B (+5.7%) and recorded it as a curiosity of one sequence;
+`0073` has it four-of-four on separate content (+4.86% / +4.51% / +5.10% / +9.86%) and shows it
+**ratchets**, each swap inflating the next frame's candidate. That is why per-frame switching needs
+a ledger and cannot be tuned, and it is the reason `0068`'s per-GOP design was retired unbuilt
+rather than refuted.
+
 **Both figures moved on the same day and in this item's favour: RATE-4 found that the two
 regressions were BUG-47** — `lossless_sibling` not carrying `pad_fill_decay`, so the bit-exact
 candidate was coded with a still's padding while acting as a reference. Fixed, the same twelve

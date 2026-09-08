@@ -59,9 +59,10 @@ convenient one.
 
 ### 5. The headline gap figure was wrong by 3x, and the target is now reachable (QUAL-1)
 
-At the contribution operating point GNC needs **+90.5% BD-rate on PSNR** against x264 — about
+At the contribution operating point GNC needs **+89.2% BD-rate on PSNR** against x264 — about
 1.9x — not the 5.6x recorded from MEAS-1, which was measured at distribution bitrates with the
-quality ladder above q=92 dead. Nothing in the coder changed between the two measurements. This
+quality ladder above q=92 dead. (QUAL-1's +90.5% was the same ladder on 2026-09-06; MEAS-10
+re-took it after INTER-2.) Nothing in the coder changed between the two measurements. This
 matters for prioritisation more than for pride: **against 5–7x, single-digit improvements were
 provably pointless; against 1.9x they accumulate into the target.** Every "this is too small to
 bother with" judgement in this repo predating 2026-09-06 was made against the wrong denominator.
@@ -112,7 +113,7 @@ measured advantage over x264 on any axis at this operating point.**
    this is **not** a coding deficiency —
    but unlike it, **two thirds is recoverable: a fill change is worth −4.5% of shipped intra rate**
    at unchanged visible quality, filed as **PAD-1**. Decision `docs/decisions/0034`.
-1. **Intra at contribution quality** — the whole remaining +90.5% lives here, per findings 1 and 5.
+1. **Intra at contribution quality** — the whole remaining +89.2% lives here, per findings 1 and 5.
    Inter breaks even at this operating point for x264 too, so this is the only place the gap is.
    **First instalment paid 2026-09-07 (ABAC-SHIP): −17.3% of intra rate at q=90, opt-in.** Against
    the corrected +90.5% denominator that is roughly a fifth of the gap, from one mechanism. The
@@ -1340,7 +1341,65 @@ preset and manual paths agree and that the library default still permits B-frame
 No decision record: no default changed. The shipped default was already P-only since 2026-09-06;
 this makes four CLI paths actually honour it.
 
-### BUG-34 — GNC requests 10 storage buffers per stage against a default of 8 (todo, P2)
+### BUG-40 — the eager `block_match_bidir` pipeline is BUG-25's shape on DX12 (**FIXED 2026-09-08**, step 1)
+
+**Step 1 landed 2026-09-08.** `match_bidir_pipeline`, `compensate_bidir_pipeline` and
+`compensate_bidir_chroma_pipeline` are `OnceLock`s, compiled on first dispatch, same pattern as
+`split_pipeline`. Decision `0049`. Metal byte-identical on a q=75 still (`0b5cc743…`) and a
+9-frame ki=9 I+P sequence (`d75c72ee…`). Intra `GNC_PROFILE` is silent; a B-pyramid encode
+prints `[bug40] match_bidir_pipeline=1`. DX12 intra is not re-run here — that is the laptop
+round's measurement. **Step 2 (the FXC X3695 in `block_match_bidir.wgsl` on an actual B-frame
+dispatch) is unfixed and needs Windows;** it is not a startable item of its own until someone
+is on that machine.
+
+Filed 2026-09-08 while updating `docs/GPU_TIER_TEST.md` for a third laptop round. Not a new
+measurement — the crash was recorded on 2026-09-08 and never given an id.
+
+**Every DX12 encode dies at pipeline creation**, before a pixel is read, with an FXC HLSL compile
+error: `X3695: race condition writing to shared` in **`block_match_bidir.wgsl`** (line 260) —
+on both Intel Arc Pro and NVIDIA RTX 2000 Ada. naga's generated HLSL trips FXC's groupshared
+race check; the same WGSL compiles under Vulkan/naga-SPIR-V. Distinct from BUG-25: different
+backend, different compiler, different shader.
+
+**The reason it stops an *intra* encode is a pipeline-creation choice, not the shader.**
+`split_pipeline` is lazy (`OnceCell`, `src/encoder/motion.rs:1183`) and stayed lazy after BUG-25
+was fixed, on the rule rather than the bug — *a shader's cost, including the risk that it does
+not compile, is paid by the feature that uses it and not by everything else.*
+`match_bidir_pipeline` never got that treatment: `MotionEstimator::new` creates it eagerly
+(`src/encoder/motion.rs:317`). B-frames have been off by default since BUG-5 and the pyramid has
+been suppressed since 2026-09-06, so **the default path compiles a bidirectional
+motion-estimation shader it will never dispatch, and one backend dies on it.** That is exactly
+the failure BUG-25's laziness was introduced to stop.
+
+**Two halves, and the cheap one comes first.**
+
+1. **Make `match_bidir_pipeline` lazy**, mirroring `split_pipeline` — the pattern, the layout
+   and the doc comment already exist a thousand lines below it. Also `compensate_bidir_pipeline`
+   (`:364`), which is on the same feature. Costs nothing on any working backend and is testable
+   here: Metal must stay byte-identical.
+2. **Then the shader.** Whether FXC's complaint is a real groupshared race or an
+   over-conservative check is unknown and is the part that needs a Windows machine. Note
+   `block_match_bidir.wgsl` is also the file BUG-34 wants to shed a storage buffer from — three
+   open reasons for caution in one low-traffic file.
+
+**Success criterion:** an intra DX12 encode on Windows either completes or fails on something
+that is not a shader it does not use. **Why P2:** it invalidates no measurement and blocks
+nothing on Vulkan or Metal, but GOALS rule 4 claims DX12 and step 1 is close to free. Step 1
+alone converts "DX12 does not run GNC" into a measurement.
+
+### BUG-34 — GNC requests 10 storage buffers per stage against a default of 8 (**DONE 2026-09-08**)
+
+Request is now **9**, via `gnc::required_limits()`. 10 was unused slack: naga counts
+`block_match_bidir.wgsl:main` alone at 9 storage buffers, next heaviest at 7
+(`motion_compensate_bidir` and `_chroma`). 9 is still an
+override of `Limits::default()`'s 8 (and the WebGPU spec). Recorded in `docs/decisions/0047`.
+`tests/requested_limits.rs` asserts the whole `Limits` struct against default plus that one
+field, and that the heaviest entry point is still `block_match_bidir` at 9 — so a tenth
+binding, or a new override, fails the test rather than a browser. **Not done: merging two
+bindings to reach 8.** B-frames are off by default, the shader is BUG-25's crash site, and
+BUG-40 holds the file. Canary: `[bug34] … max block_match_bidir.wgsl:… at 9 storage buffers;
+request 9`. `gnc gpu-info` prints the override against default 8. No codec change; no
+measurement moved.
 
 Filed 2026-09-08 by ENT-7, found while checking a literature brief's claim about the WebGPU
 default rather than by looking for it.
@@ -1416,24 +1475,37 @@ ki=1 and ki=9. The Rice arm being identical *is* the proof the histogram was dea
 dispatches on Rice **and** that the quantise path ran, so it cannot pass by asserting nothing —
 byte-identity alone would not have caught a flag stuck at `true`. Decision `0035`.
 
-**What is still open, and it is the harder half.** `main` is unchanged at 23800 B, so rANS at
-4:4:4 still creates an over-budget pipeline and still cannot run in a browser. Shrinking
-`shared_hist` to fit needs the arena from 5120 to <=3266 entries — and **that makes an existing
-hazard worse:**
+**Guard landed, shrink refused (2026-09-08).** `check_hist_arena_capacity` is the encode-side
+twin of `check_cumfreq_capacity`: it sums per-group `alphabet_size` (not +1) and refuses a
+tile over 5120. The shaders skip out-of-range atomics so naga's clamp is not the only bound.
+Canary: `GNC_PROFILE=1` prints `[rans] hist_arena_max=N/5120 (tile T)` on every rANS encode;
+Rice still prints `with_histogram=0` and never hits the check. Decision `0048`.
 
-> `total_hist_entries` is the sum of up to 12 per-group alphabets, each clamped at
-> `MAX_GROUP_ALPHABET = 4096`, so it can reach 49152. **Nothing compares it to 5120.**
-> `atomicStore`/`atomicAdd` past the end are clamped by naga's bounds policy, so an overflow
-> silently corrupts frequencies instead of failing. A smaller arena overflows sooner, so **the
-> guard has to come first.** Worth knowing: the neighbouring rANS *encode* shader does have such a
-> guard, on the host, and it says "tile 13 needs 6658 cumfreq entries but the encode shader's
-> workgroup table holds 4097". The fused histogram arena has no equivalent.
+Measured on four stills, `--rans`, 4:4:4, this Mac, not idle:
 
-So the order for the rest of this item is: **guard the arena, measure how large it actually gets,
-then size it.** Two more findings from the sweep worth carrying: `rans_decode.wgsl:main` and
-`rans_encode_lean.wgsl:main` both sit at **exactly 16384 B** — inside the budget with zero
-headroom, so any addition to either is an instant defect — and `rans_encode.wgsl:main` is at
-**16388 B**, over by 4.
+| image | q=15 | q=25 | q=50 | q=70 | q=85 | q=90 |
+|---|---|---|---|---|---|---|
+| bbb_1080p | 313 | 940 | 1972 | 3428 | **5322 refuse** | **6648 refuse** |
+| blue_sky_1080p | 320 | — | — | — | — | **6843 refuse** |
+| touchdown_1080p | 335 | — | — | — | — | **6575 refuse** |
+| kristensara_720p | — | — | — | — | — | **7004 refuse** |
+
+q=15 is rANS's default range (preset picks it at q≤20) and sits at **6% of the arena**.
+q=70 `--rans` (in 0035's identity gate) still fits at 3428. q≥85 `--rans` was already
+silently corrupting the last bins; the check makes that a named refusal instead of a
+wrong file. `--rans` at contribution quality was never a supported operating point
+(BUG-9's cumfreq table refuses kristensara at q=76 for a smaller array).
+
+**Shrinking 5120 → ≤3266 is rejected.** That is what would put `main` under 16384 B, and
+it would refuse bbb at q=70 (3428 > 3266) — a configuration 0035 shipped as byte-identical.
+Growing the arena to 7004 would take `main` to ~31 KB, which is the raise-the-limit option
+`0032` already refused.
+
+**What is still open.** The five over-budget rANS entry points, including `main` at 23800 B.
+A browser still cannot create the histogram pipeline. Packing, a storage-buffer histogram,
+or parking those shaders explicitly are the remaining answers; shrinking is not one of them.
+`rans_decode.wgsl:main` and `rans_encode_lean.wgsl:main` sit at **exactly 16384 B**.
+`rans_encode.wgsl:main` is **16388 B** (+4 B), which is the extra cumfreq slot BUG-9 added.
 
 Original entry follows.
 
@@ -1634,7 +1706,26 @@ idle machine (COORDINATION).
 **Do them behind a switch, the `GNC_ABAC_CODER` pattern**, and measure the set together on an idle
 machine rather than one at a time under load.
 
-### BUG-32 — `benchmark-sequence` spends 86% of its wall clock on CPU quality metrics, so any throughput figure derived from it measures SSIM (todo, P2)
+### BUG-32 — `benchmark-sequence` spends 86% of its wall clock on CPU quality metrics, so any throughput figure derived from it measures SSIM (**FIXED 2026-09-08**)
+
+**Fixed with `--throughput`.** Default path unchanged (still prints PSNR/SSIM, still runs the
+all-I arm). The flag skips CPU metrics, the second encode, and `decode_sequence` retention.
+Canary: `[bug32] throughput=1 metrics=0 i_only=0 decode_retained=0`. `--vmaf` conflicts.
+`gpu_tier_bench.py --density` now passes the flag. Decision `0046`.
+
+Measured on this Mac, bbb_extended, n=8, q=90, Rice, not idle (so no fps quoted):
+
+| | k=1 wall | k=1 encode printed | k=9 wall |
+|---|---|---|---|
+| default | 2.467 s | 142.5 ms + 142.4 ms I-only | 1.434 s |
+| `--throughput` | **0.541 s** | 144.1 ms (no second arm) | **0.720 s** |
+
+k=1 wall **4.56×**; bytes identical (15 825 673). The 86% RTX figure was the same shape.
+Tests: `tests/bug32_throughput.rs`.
+
+Original filing follows.
+
+### BUG-32 — `benchmark-sequence` spends 86% of its wall clock on CPU quality metrics, so any throughput figure derived from it measures SSIM (original filing)
 
 Found 2026-09-08 while running MEAS-5. Measured on an RTX 4000 Ada, Vulkan, `-q 90 -k 1 --rice`,
 120-frame crowd_run clip:
@@ -2379,7 +2470,18 @@ frequency 1 everywhere the alphabet is uniform and the depth is 6). Both change 
 codebook, and therefore its bitstream, wherever clamping currently occurs. Not done for a parked
 coder.
 
-### COORD-2 — An id must come *from* the compare-and-swap, not be checked against it (todo, P2)
+### COORD-2 — An id must come *from* the compare-and-swap, not be checked against it (**DONE 2026-09-08**)
+
+**Built.** `scripts/claim bug "<why>"` and `scripts/claim dr "<why>"`. Each unions committed
+`main` (BACKLOG `BUG-N`, `git ls-tree main docs/decisions/`) with live `refs/claims/*`, CAS
+the first gap, retries on a lost race. `take dr-NNNN` remains for a number you already hold.
+`claim selftest` now races 8 `bug` allocators and 8 `dr` allocators: **8 claimed, 8 distinct**
+both times. Record `0050` (`0049` collided with BUG-40's merge after they dropped the
+reservation). Decision `0050`.
+
+Original filing follows.
+
+### COORD-2 — An id must come *from* the compare-and-swap, not be checked against it (original filing)
 
 `scripts/claim` made picking *work* atomic and it did not make picking an *id* atomic. The cost so
 far, all on 2026-09-07: **`BUG-25` used twice** (Vulkan shader / P-frame dequant), **`BUG-26` used
@@ -2787,6 +2889,47 @@ coding — P-frames have zero reordering delay and were the better performer at 
 output-to-display are all unmeasured). Note the ~256-line tile floor is not currently reachable:
 the pipeline processes whole frames, so the practical floor is one full frame regardless of tile
 size.
+
+### MEAS-10 — Re-take BASELINE against current HEAD (**DONE 2026-09-08**)
+
+Pinned to `0a1b055`. Compression only; fps not quoted (load 2.6–3.9). Harness:
+`scripts/meas10_rebaseline.sh` plus `scripts/meas1_vs_h264.py` on 17-frame y4m derived from the
+PNG sequences. Canary: `GNC_PAD_FILL=replicate` reproduces the previous still rows exactly.
+
+**Stills, bbb_1080p 4:4:4 Rice** — PAD-1 is why q=25/50/75 moved; q=90 already included it:
+
+| q | before (BASELINE) | MEAS-10 | bpp |
+|---|---|---|---|
+| 25 | 35.63 dB / 1.64 / 90.31 | 35.63 / **1.57** / 90.31 | −4.3% |
+| 50 | 40.30 dB / 2.73 / 95.02 | **40.25** / **2.60** / **95.07** | −4.8% |
+| 75 | 44.84 dB / 4.53 / 96.58 | **44.64** / **4.31** / **96.55** | −4.9% |
+| 90 | 49.89 dB / 7.21 / 97.06 | 49.89 / 7.21 / 97.06 | 0 |
+| 100 | — | **PSNR inf** / 12.57 / 97.43 | bit-exact |
+
+Four images at four q, plus q=100 on bbb. At q=75 RGB PSNR is −0.20 dB under PAD-1's decay
+fill; PAD-1's own gate was q=80–94 (−0.001 dB). VMAF −0.03. Under both tolerances.
+
+**Sequences, 10 frames ki=9 4:4:4, shipped default `2I+8P+0B`:**
+
+| sequence | q=75 bpp / PSNR / VMAF | q=90 | vs I-only q=90 |
+|---|---|---|---|
+| crowd_run | 8.39 / 42.47 dB / 99.68 | 13.17 / 49.60 / 99.72 | **+5.3%** |
+| old_town_cross | 8.39 / 42.36 dB / 99.38 | 13.04 / 49.59 / 99.70 | **+9.2%** |
+| bbb_extended | 3.07 / 43.55 dB / 97.88 | 6.77 / 50.28 / 99.16 | −11.3% |
+
+The withdrawn q=75 I+P+B rows (crowd_run 5.55 bpp / 39.04 dB) are not comparable. On camera
+content at q=90, inter costs more than all-intra.
+
+**QUAL-1 ladder re-run, 17 frames, 4:2:0, q=85/92/96/99 vs crf=1/2/4/8:**
+
+| | bbb_extended | old_town_cross | crowd_run | **mean** |
+|---|---|---|---|---|
+| MEAS-10 | +128.5% | +70.2% | +68.8% | **+89.2%** |
+| QUAL-1 | +129.0% | +71.9% | +70.6% | +90.5% |
+
+−1.3 points, direction INTER-2 predicted (only q=85 of four rungs moved). VMAF BD-rate on
+old_town is +2548% at 99.8–99.8 — not quoted. RATE-3 is still in flight; this is HEAD without
+it. No codec change. No fps.
 
 ### CANARY-1 — Encode time must move across GPU tiers (**DONE 2026-09-07 — PASSES at 34x**)
 

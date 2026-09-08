@@ -87,10 +87,7 @@ fn main() {
                 &wgpu::DeviceDescriptor {
                     label: Some("spirv_probe"),
                     required_features: wgpu::Features::SPIRV_SHADER_PASSTHROUGH,
-                    required_limits: wgpu::Limits {
-                        max_storage_buffers_per_shader_stage: 10,
-                        ..wgpu::Limits::default()
-                    },
+                    required_limits: gnc::required_limits(),
                     ..Default::default()
                 },
                 None,

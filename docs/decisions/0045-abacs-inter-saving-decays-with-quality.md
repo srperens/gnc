@@ -186,6 +186,13 @@ is an untested one (CLAUDE.md, "no silent features"), so it is P-frames only and
 
 ## Cost
 
-One read-only env-gated diagnostic (`GNC_COEF_ENTROPY_INTER`, 38 lines in `encode_pframe`, with a
-canary that prints on both outcomes) and one harness. No shipped code path changes; output is
-byte-identical with the variable unset.
+One read-only env-gated diagnostic (`GNC_COEF_ENTROPY_INTER`, 38 lines in `encode_pframe`) and one
+harness. Both halves of "no silent features" are checked rather than asserted:
+
+- **The canary fires on both outcomes.** With `--abac` it prints
+  `[coef-entropy-inter] first P frame, 120 tiles, intra qstep=… res_qstep=…`; with `--rice` it
+  prints `[coef-entropy-inter] no abac tiles on this P frame — run with --abac`. A success-only
+  canary would have made "wrong coder" indistinguishable from "no headroom".
+- **The variable does not move the bitstream.** Same input, `-q 95 -n 3 -k 9 --abac`, with
+  `GNC_COEF_ENTROPY_INTER=1` and without: both `.gnv` files hash `756c0cbd…`. With the variable
+  unset the diagnostic prints nothing at all (grep count 0).

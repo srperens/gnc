@@ -35,6 +35,11 @@ const MAX_ALPHABET: usize = 4096;
 const SHARED_CUMFREQ_ENTRIES: usize = MAX_ALPHABET + 1;
 const MAX_GROUP_ALPHABET: usize = 4096;
 const MAX_GROUPS: usize = 12;
+/// Entries in `quantize_histogram_fused.wgsl` / `rans_histogram.wgsl` `shared_hist`.
+/// That is the sum of per-group `alphabet_size` for one tile, not `alphabet_size + 1`
+/// (the encode table). The theoretical max is `MAX_GROUPS * MAX_GROUP_ALPHABET` =
+/// 49152; nothing compared the two until BUG-35.
+const SHARED_HIST_ENTRIES: usize = 5120;
 
 fn cumfreq_stride(per_subband: bool) -> usize {
     if per_subband {
@@ -1794,6 +1799,51 @@ impl GpuRansEncoder {
         tile_freqs
     }
 
+    fn hist_arena_entries(tf: &TileFreqs) -> usize {
+        match tf {
+            TileFreqs::Single(s) => s.alphabet_size as usize,
+            TileFreqs::Subband(sb) => sb
+                .groups
+                .iter()
+                .map(|g| g.alphabet_size as usize)
+                .sum(),
+        }
+    }
+
+    /// Refuse the frame if any tile's histograms do not fit `shared_hist` (BUG-35).
+    ///
+    /// `quantize_histogram_fused.wgsl:main` and `rans_histogram.wgsl:main` pack every group's
+    /// histogram for one tile into a 5120-entry workgroup array. `total_hist_entries` is the
+    /// sum of those alphabets and can reach 49152; naga clamps `atomicAdd` past the end, so an
+    /// overflow used to silently corrupt frequencies. The shader now skips out-of-range bins;
+    /// this check is the actual guard — clamp-and-continue would be the defect again.
+    ///
+    /// Printed on every rANS encode under `GNC_PROFILE` or diagnostics so a shrink can be sized
+    /// from a number rather than from the theoretical max.
+    fn check_hist_arena_capacity(tile_freqs: &[TileFreqs]) {
+        let worst = tile_freqs
+            .iter()
+            .enumerate()
+            .map(|(t, tf)| (Self::hist_arena_entries(tf), t))
+            .max();
+
+        if let Some((count, tile)) = worst {
+            if diagnostics::enabled() || std::env::var("GNC_PROFILE").is_ok() {
+                eprintln!(
+                    "[rans] hist_arena_max={count}/{SHARED_HIST_ENTRIES} (tile {tile})"
+                );
+            }
+            assert!(
+                count <= SHARED_HIST_ENTRIES,
+                "rANS: tile {tile} needs {count} histogram bins but the fused/histogram \
+                 shader's workgroup table holds {SHARED_HIST_ENTRIES}. The symbol alphabet \
+                 grows as the quantiser step shrinks. Use Rice (the default above q=20), or \
+                 a coarser --qstep. Do not shrink the arena until this check is in and the \
+                 measured max on real content is known."
+            );
+        }
+    }
+
     /// Refuse the frame if any tile's cumfreq tables do not fit the shader's workgroup array.
     ///
     /// Found while characterising BUG-9, and it is a second limit rather than a restatement of
@@ -1899,6 +1949,9 @@ impl GpuRansEncoder {
 
         // Cause before symptom: a tile whose tables do not fit produces wrong frequencies, and
         // wrong frequencies are one of the ways a stream then fails to fit its slot.
+        // Histogram arena first (BUG-35): it is the earlier pass, and shrinking it without
+        // this check makes the existing overflow fire sooner.
+        Self::check_hist_arena_capacity(tile_freqs);
         Self::check_cumfreq_capacity(tile_freqs);
         Self::check_stream_overflow(meta_data, num_tiles);
 
@@ -1972,5 +2025,64 @@ impl GpuRansEncoder {
         }
 
         (rans_tiles, subband_tiles)
+    }
+}
+
+#[cfg(test)]
+mod hist_arena_tests {
+    use super::*;
+
+    fn subband(asizes: &[u32]) -> TileFreqs {
+        TileFreqs::Subband(NormalizedSubbandTileFreqs {
+            num_groups: asizes.len() as u32,
+            groups: asizes
+                .iter()
+                .map(|&a| NormalizedGroupFreqs {
+                    min_val: 0,
+                    alphabet_size: a,
+                    zrun_base: 0,
+                    freqs: vec![0; a as usize],
+                    cumfreqs: vec![0; a as usize + 1],
+                })
+                .collect(),
+        })
+    }
+
+    fn single(asize: u32) -> TileFreqs {
+        TileFreqs::Single(NormalizedTileFreqs {
+            min_val: 0,
+            alphabet_size: asize,
+            zrun_base: 0,
+            freqs: vec![0; asize as usize],
+            cumfreqs: vec![0; asize as usize + 1],
+        })
+    }
+
+    #[test]
+    fn hist_arena_counts_the_sum_of_group_alphabets_not_plus_one() {
+        let tf = subband(&[10, 20, 30]);
+        assert_eq!(GpuRansEncoder::hist_arena_entries(&tf), 60);
+        assert_eq!(GpuRansEncoder::hist_arena_entries(&single(17)), 17);
+    }
+
+    #[test]
+    fn hist_arena_accepts_a_tile_that_exactly_fills_it() {
+        GpuRansEncoder::check_hist_arena_capacity(&[subband(&[5120])]);
+        GpuRansEncoder::check_hist_arena_capacity(&[single(5120)]);
+    }
+
+    #[test]
+    #[should_panic(expected = "histogram bins")]
+    fn hist_arena_refuses_past_the_end() {
+        GpuRansEncoder::check_hist_arena_capacity(&[subband(&[4096, 4096])]);
+    }
+
+    #[test]
+    fn theoretical_max_overflows_the_arena_and_a_budget_shrink_is_smaller_still() {
+        assert!(MAX_GROUPS * MAX_GROUP_ALPHABET > SHARED_HIST_ENTRIES);
+        // 16384 minus the rest of the fused shader (~3320) leaves ~3266 bins.
+        // That shrink is why the guard has to land first: it overflows sooner.
+        assert!(3266 < SHARED_HIST_ENTRIES);
+        assert_eq!(SHARED_HIST_ENTRIES, 5120);
     }
 }

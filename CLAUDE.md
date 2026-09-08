@@ -60,22 +60,26 @@ Shader source is in `src/shaders/*.wgsl`. Rust host code is in `src/encoder/` an
   recorded anywhere**, so every throughput figure in this repository labelled M1 is of unknown
   provenance (BUG-29). Run `gnc gpu-info` rather than trusting this line: it now prints the device
   and its limits, which is what would have contradicted the wrong text months ago.
-- **GNC asks for wgpu's default limits, not the hardware's — with one override it does not
-  admit to**, so *almost* the same shaders run under WebGPU (rule 4). The gap to the adapter is
-  large and deliberate — from `gnc gpu-info` on this machine:
+- **GNC asks for wgpu's default limits, not the hardware's — with one named override**, so
+  *almost* the same shaders run under WebGPU (rule 4). The gap to the adapter is large and
+  deliberate — from `gnc gpu-info` on this machine:
 
   | | adapter has | GNC requests | `Limits::default()` |
   |---|---|---|---|
   | workgroup storage | 32768 B | **16384 B** | 16384 B |
   | invocations / workgroup | 1024 | **256** | 256 |
-  | storage buffers / stage | 31 | **10** | **8 — GNC overrides this** |
+  | storage buffers / stage | 31 | **9** | **8 — named override, BUG-34 / `docs/decisions/0047`** |
   | max buffer size | 39813 MiB | 256 MiB | 256 MiB |
 
   So "32KB threadgroup memory, max 1024 threads" was describing the *adapter* and was never what
   the shaders could use. Any occupancy argument here is about the 16KB column. **The storage-buffer
-  row is an override, not a default** (`src/lib.rs:1431`, against 8 in `wgpu-types-24.0.0` and in
-  the WebGPU specification) and it is undocumented and unmeasured — BUG-34. Raising a request is
-  worth a decision record, not a commit; this one got the commit.
+  row is an override**: `block_match_bidir.wgsl` binds 9 storage buffers and is the only shader
+  above the spec's 8. The request used to be 10 (one of unused slack) and is now 9, via
+  `gnc::required_limits()`. `tests/requested_limits.rs` compares that struct to
+  `Limits::default()` field-for-field, so a third override cannot land as a silent extra.
+  Raising a request is a decision record, not a commit. Getting to 8 means merging two
+  bindings in `block_match_bidir.wgsl`; 0047 refused that merge (B-frames off, BUG-25 crash
+  site, BUG-40 holds the file).
 - No FP64 on Apple GPUs, and WGSL has no `f64` regardless
 - WASM target must work — avoid features not available in WebGPU (e.g. some storage texture formats, push constants)
 - WGSL shaders are the single source — transpiled per backend by naga

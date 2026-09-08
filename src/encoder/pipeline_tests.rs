@@ -3858,6 +3858,109 @@ fn fused_qh_does_not_build_the_histogram_pipeline_on_the_default_path() {
     );
 }
 
+/// RATE-3: with `0036`'s sequence gate lifted, the reference must belong to the candidate that
+/// `encode` actually kept.
+///
+/// `lossless_iframe_reference_matches_the_decoders` below covers a frame coded **one** way. This
+/// covers the case that gate existed for: at q = 95..=99 the fallback codes the frame twice, and
+/// `encode_once` leaves only the *last* candidate's quantised planes in the GPU side channel that
+/// `local_decode_iframe_gpu` reads. When the bit-exact sibling wins, that side channel belongs to
+/// the lossy candidate, and — with `0042`'s MED branch in place — the reference is built by
+/// running `med.inverse` over wavelet coefficients. Measured without the repair on crowd_run q=99
+/// ki=2: I-frames bit-exact, P-frames **5.93 dB** and +78% bytes.
+///
+/// The assertion is the same one BUG-39 uses, because it is the same contract: whatever the
+/// encoder predicts from must be the picture the decoder holds.
+#[test]
+fn fallback_iframe_reference_matches_the_decoders() {
+    let ctx = GpuContext::new();
+    let (w, h) = (256u32, 256u32);
+    // Not the gradient the BUG-39 test uses, and not `make_textured_frame` either: the bit-exact
+    // candidate has to *win* for this test to be about anything, and it only wins where the
+    // wavelet cannot cheapen the content. Measured while writing this: the gradient loses by
+    // 1043% (2685 B against 30 689 B) and the 40%-noise texture by 17.6% — both caught by the
+    // canary at the bottom, which is what it is for. Detail-dominated content is the case, and
+    // it is also the real one: on crowd_run at q=99 the bit-exact candidate wins by 32%.
+    let f0: Vec<f32> = (0..w * h * 3)
+        .map(|i| {
+            let hash = i.wrapping_mul(2_654_435_761) ^ (i >> 3).wrapping_mul(40_503);
+            f32::from((hash >> 7) as u8)
+        })
+        .collect();
+    let padded_pixels = (((w + 255) & !255) * ((h + 255) & !255)) as usize;
+
+    std::env::set_var("GNC_REF_DEBLOCK", "0");
+    let mut worst = Vec::new();
+    let mut kept_bit_exact = 0;
+    // The third arm is the one that *guarantees* the case: a quantiser fine enough that the lossy
+    // candidate cannot be the smaller file, so the sibling wins by construction rather than by
+    // luck of content. The two preset arms are the realistic ones and may go either way — on a
+    // 1080p camera frame at q=99 the sibling wins by 32%, but no 256x256 synthetic frame found
+    // here reproduces that (gradient +1043%, textured +17.6%, noise +3.1%).
+    for (q, fine_step) in [(95u32, None), (99, None), (99, Some(0.05f32))] {
+        let mut cfg = crate::quality_preset(q);
+        cfg.tile_size = 256;
+        cfg.keyframe_interval = 1;
+        if let Some(step) = fine_step {
+            cfg.quantization_step = step;
+        }
+        assert!(
+            cfg.lossless_fallback,
+            "q={q}: `quality_preset` no longer sets `lossless_fallback`, so this test codes one \
+             candidate and asserts nothing about the two-candidate case it exists for"
+        );
+
+        let mut enc = EncoderPipeline::new(&ctx);
+        let compressed = enc.encode_sequence(&ctx, &[&f0], w, h, &cfg);
+        assert_eq!(compressed.len(), 1);
+        assert!(
+            compressed[0].config.lossless_fallback || compressed[0].config.is_lossless(),
+            "q={q}: the sequence path is refusing the fallback again, so the gate this test \
+             guards has been put back and the test is vacuous"
+        );
+        if compressed[0].config.is_lossless() {
+            kept_bit_exact += 1;
+        }
+        let enc_ref = enc.read_reference_planes(&ctx, w, h).expect("encoder reference");
+
+        let dec = DecoderPipeline::new(&ctx);
+        let _ = dec.decode(&ctx, &compressed[0]);
+        let dec_ref = dec.read_reference_planes(&ctx, w, h).expect("decoder reference");
+
+        for (p, name) in ["Y", "Co", "Cg"].iter().enumerate() {
+            let a = &enc_ref[p * padded_pixels..(p + 1) * padded_pixels];
+            let b = &dec_ref[p * padded_pixels..(p + 1) * padded_pixels];
+            let max = a
+                .iter()
+                .zip(b)
+                .fold(0.0f32, |m, (x, y)| m.max((x - y).abs()));
+            eprintln!(
+                "q={q} kept={:?} plane {name}: max |enc-dec| = {max:.4}",
+                compressed[0].config.transform_type,
+            );
+            worst.push((q, *name, max));
+        }
+    }
+    std::env::remove_var("GNC_REF_DEBLOCK");
+
+    // The canary. If the sibling never wins, every point above went down the ordinary path and
+    // the repair in `encode_as_reference` was never exercised — green for the wrong reason.
+    assert!(
+        kept_bit_exact > 0,
+        "the bit-exact candidate did not win at either quality point, so the case this test is \
+         about never occurred; pick content where it does rather than deleting the test"
+    );
+
+    for (q, name, max) in worst {
+        assert!(
+            max < 1.0e-3,
+            "q={q} plane {name}: the encoder's reference differs from the decoder's by {max}, so \
+             every P-frame predicting from it starts from a different picture than the decoder \
+             has (RATE-3: the side channel belongs to the candidate that was not kept)"
+        );
+    }
+}
+
 /// BUG-39: the encoder's I-frame reference and the decoder's must be the same numbers.
 ///
 /// `test_pframe_reference_matches_decoder` already checks this — with

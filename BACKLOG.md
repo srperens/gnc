@@ -1693,9 +1693,24 @@ idle machine (COORDINATION).
   back to YCoCg-R on the GPU. Uploading packed u8 and converting in a shader is 4× less DMA and no
   CPU colour — but it changes the encode input API, which is why PERF-1 did not touch it. This is
   the only remaining host change that can close BASELINE's A→C gap on the streaming path.
-- **Item 8 — 32-bit Rice bit window.** `rice_decode.wgsl` refills one *byte* at a time inside the
-  unary loop of a stage that is 47% of I-frame decode. Encode already accumulates words. No
-  bitstream change; mechanical but a shader.
+- **Item 8 — 32-bit Rice bit window. IMPLEMENTED 2026-09-08, and its throughput claim is
+  unmeasured.** The window is in, refilling a whole `u32` at a time and taking only the bytes left
+  in the word that holds the read offset, so the shader touches exactly the words it touched
+  before. **Bit-exact: 16 of 16 decodes byte-identical on bitstreams encoded before the change**
+  (4 images x q=40/75/90/100), suite green, both clippy targets clean. **No throughput change was
+  measurable**, and the run that says so is not trustworthy: the direction reversed between images
+  and load average went 18 -> 43 mid-run. RESEARCH_LOG 2026-09-08.
+  **Two things this owes.** The idle-machine A/B — `GNC_RICE_DISPATCH_REPEAT` isolates the slice
+  as `(t(k)-t(1))/(k-1)`, the command is in the log entry — and **if it measures neutral or worse,
+  revert it**; the diff is one shader and bit-exactness makes a revert free. And it raises the
+  question below, which is worth settling *before* items 9-11.
+- **Settle first, on item 8, because item 8 is already written: is the decode side bandwidth-bound
+  at all?** Items 9, 10 and 11 are each priced on bytes of bus traffic saved. Item 8 removed 3 of
+  every 4 storage loads in the Rice inner loop and moved nothing measurable. Either the noise
+  floor swamped it (load 43) or the stage was never load-bound — the word is in L1 after its first
+  byte is touched, so the old reader's four loads per word were one miss and three hits, and the
+  byte-swap that replaced them costs about as much ALU as it saves. One idle-machine A/B of a
+  change that already exists answers this for three changes that do not.
 - **Item 9 — the extra full-plane copies** (`transform.rs:320` inverse preamble,
   `gpu_work.rs:624/637/434/411/309`). Tens of MB per I-frame at 1080p.
 - **Item 10 — fold dequant into the Rice store.** One dispatch and ~48 MB of traffic per frame.
@@ -3736,7 +3751,72 @@ falls while q rises (MEAS-9's harness now does). And for a 10-bit target the ext
 itself was never the problem. Harness: `scripts/meas_rate1_precision.py`, measured at `fa32a26`.
 Numbers in RESEARCH_LOG.
 
-### BUG-39 — `q=100` video: two causes fixed, 12.45 → 26.30 dB, still not lossless (**partly fixed 2026-09-08**, P1)
+### BUG-39 — `q=100` video: three causes fixed, 12.45 → 51.54 dB, still not bit-exact (todo, P1)
+
+**Third cause found and fixed, and it was not the one `0042` predicted.** `docs/decisions/0054`;
+numbers in RESEARCH_LOG. 3 sequences, 8 frames, ki=2 and ki=9, 4:4:4, shipped defaults — inter
+PSNR **26.30–26.76 → 51.54–53.62** (crowd_run ki=2), **21.77–26.51 → 50.41–51.54** (ki=9, drift
+down the GOP 4.74 → 1.13 dB), and the same shape on old_town_cross (29.7 → 51.8–52.5) and bbb
+(33.0 → 58.1). **q=99 is identical to the byte and to two decimals of PSNR on all six points**,
+because the fix cannot be reached wherever `wavelet_levels >= 1`.
+
+**Cause 3, fixed: a zero-level `forward` wrote nothing.** `WaveletTransform::forward` runs
+`for level in 0..levels`, so at `levels == 0` it dispatches nothing and never writes
+`output_buf`; `inverse` copies input to output before its own loop, so the decoder's zero-level
+case *is* the identity. `encode_pframe` quantises `plane_c`, so the encoder transmitted whatever
+the **previous frame** left there and the decoder added it to its prediction. Reached by every
+P/B frame of a `q=100` sequence (MED sets `wavelet_levels = 0`) and of a `--dct` one.
+
+**`0042`'s cause 3 was wrong about the mechanism and is corrected in place** (the original text
+kept visible): the P-scale taper is already 1.0 at `q=100` and the dead zone already 0.000, both
+printed by the encoder's own canary since INTER-1, so there was nothing to suppress.
+
+**Cause 4, open, and it has a named fix rather than a hypothesis.** 51.54 dB is **sub-pel
+prediction rounding**: bilinear quarter-pel interpolation makes the prediction fractional, so
+`cur - pred` is fractional and step 1.0 rounds it (≤ 0.5 per sample in YCoCg-R, amplified into
+RGB by the inverse colour transform — and bbb reads 58 dB because more of its blocks are full-pel
+or zero). The fix is H.264 lossless's: round the prediction to an integer in a lossless
+configuration, on both sides, so the residual is an integer and step 1.0 is exact. A `round()` in
+`motion_compensate.wgsl` behind a params flag gated on `config.is_lossless()`, which the decoder
+derives from the frame header it already carries — **no new bitstream field**. Needs a rate
+number too, since rounding the prediction changes the residual. Untried.
+
+**Success criterion unchanged:** every frame bit-exact at `q=100` on ≥3 sequences at ki=2 and 9,
+verified outside the harness. **Not met.**
+
+**Canary:** `zero_level_forward_is_an_identity_not_a_no_op` (verified to fail without the fix).
+
+**Probe that looks decisive and is not**, recorded so nobody repeats it: a static sequence (the
+same PNG four times) codes `q=100` P-frames bit-exact at 3 198 bytes **before** the fix too —
+`all_skip_tiles=120/120`, so it went down the motion-skip path and never asked the transform for
+anything. A zero-residual probe cannot test a residual path.
+
+### LOSSLESS-2 — at `q=100` the inter path costs 36% more than all-intra (todo, P2)
+
+**Measured, not argued.** crowd_run, 4 frames, ki=2, `q=100`, after BUG-39's cause-3 fix:
+
+| | bytes |
+|---|---|
+| I+P | **17 584 089** |
+| all-intra | 12 932 312 |
+
+**+36%, and the P-frames are not bit-exact either** (51.5 dB against the I-frames' `inf`). Before
+the fix the same comparison read −12%, but that saving was bought by transmitting a stale buffer
+instead of the residual, so it was never real.
+
+**Why it goes this way.** With no quantiser to discard anything, a quarter-pel MC residual is
+noise-like and costs more to code than the MED-predicted frame it replaces. This extends
+INTER-1 / `0023`'s line — the inter saving is already a wash at q=85–99 (−1.9% mean, −0.2%
+worst-frame) — past the wash into a loss.
+
+**The question:** should a lossless configuration code P-frames at all, or fall back to all-intra
+(per frame, on an RD decision, or per sequence)? It bears on a GOALS §1 row, and the honest
+answer may be that `q=100` video is all-intra by construction — which is what FFV1 does.
+
+**Not startable before BUG-39's cause 4**, because rounding the prediction changes the residual
+and therefore this number. Take it after, or take both.
+
+### BUG-39 — `q=100` video: two causes fixed, 12.45 → 26.30 dB (superseded 2026-09-08)
 
 **Two of three causes found, fixed and proven.** `docs/decisions/0042`; numbers in RESEARCH_LOG.
 crowd_run, 10 frames, `q=100`: P-frames go from **9.06–21.37 dB to 21.63–26.51 dB** at ki=9 and
@@ -3816,11 +3896,60 @@ every frame prints it.
 **Why P1.** It is a shipped codec producing 12 dB video at its highest quality setting. It also
 gates RATE-3, and RATE-3 gates the inter half of RATE-2's 21.66%.
 
-### RATE-3 — a bit-exact I-frame is not a drop-in reference (**investigated 2026-09-08, not fixed**, P1)
+### RATE-4 — the candidate is chosen on one frame's bytes and paid for by the next one's (todo, P2)
 
-**Three attempts, two refuted hypotheses, one real fix kept, and a named next measurement.**
-`docs/decisions/0040`. The gate `0036` shipped stays; the tree is byte-identical to it on stills
-and back to 60.64/60.62 dB P-frames on sequences.
+Filed 2026-09-08 by RATE-3, which shipped the win and measured this as its cost.
+
+`encode` keeps the smaller of two candidates by comparing **that frame's** bytes. Inside a sequence
+that is the wrong ledger: a bit-exact I-frame carries detail a lossy one had already quantised away,
+so the P-residual predicted from it is larger. Measured on crowd_run q=99 ki=2, where the trade is
+strongly favourable, the P-frames still grow 4 990 303 → 5 274 377 B. On **bbb q=99 the downstream
+cost exceeds the I-frame saving**: the sequence grows +0.58% at ki=2 and +0.40% at ki=9, the only
+two regressions in RATE-3's twelve-point table (`docs/decisions/0044`).
+
+**Do not fix this with a margin constant.** Three sequences is not enough to fit one, and RATE-2's
+own comment says why: the boundary is content-dependent — q=95 on blue_sky, q=98 on bbb — which is
+the reason the fallback codes both ways instead of guessing. The honest fix compares *sequence*
+bytes, which needs the GOP encoded both ways or a model of the residual cost.
+
+**Its other half is free and is a correction to `0040`.** A bit-exact frame's reference *is* its
+colour-converted source, which both forward transforms only read — so `local_decode_iframe_gpu`
+could copy it instead of re-running the encode `encode_as_reference` now pays for. `0040` point 4
+measured that route at 21.37 dB and reverted it, **but BUG-39 cause 2 was live at the time**, so the
+P-frames were decoding a wavelet residual as a MED prediction regardless of the reference. The
+refutation does not survive its own cause being fixed, and the instrument to settle it already
+exists: `fallback_iframe_reference_matches_the_decoders`.
+
+**Success criterion:** no point in RATE-3's table larger than the control arm, mean no worse than
+today's −4.28%, worst P within 0.1 dB. **Canary:** the two existing ones — RATE-2's per-frame
+candidate line and RATE-3's repair line — plus a count of frames where the sequence-level choice
+differs from the frame-level one.
+
+**One gap to close on the way in, raised by the BUG-39 session:** both existing canaries are
+*per-frame* lines. They prove the path ran; they do not say a sequence paid the third encode 47
+times, which is the number anyone weighing the encode cost actually wants. A run-level count
+belongs with whichever change makes that cost matter — this item, if the source-copy route removes
+it, or a real encode-time measurement on an idle machine if it does not.
+
+### RATE-3 — a bit-exact I-frame is a drop-in reference now (**DONE 2026-09-08**, mean −4.28% of sequence bytes)
+
+**`0036`'s sequence gate is lifted and the fallback now runs on sequence I-frames at q = 95..=99.**
+`docs/decisions/0044`; numbers in RESEARCH_LOG. Three sequences × q ∈ {95, 99} × ki ∈ {2, 9}:
+**mean −4.28% of sequence bytes, best −13.16%**, worst P-frame move −0.01 dB, I-frames bit-exact
+wherever the candidate wins — verified outside the harness by md5 on a real `encode-sequence` →
+`decode-sequence` round trip. Stills are byte-identical. Two of twelve points regress (bbb q=99,
++0.58% / +0.40%) and that is RATE-4.
+
+**The gate was hiding the mirror image of the bug `0040` fixed.** `encode_once` leaves the quantised
+planes on the GPU as the side channel `local_decode_iframe_gpu` reads, and only the **last** encode's
+survive. `0040` fixed *sibling second, lossy kept*; the gate made *sibling first, bit-exact kept*
+unreachable, and with `0042`'s branch in place that one runs `med.inverse` over wavelet coefficients
+— P-frames at **5.93 dB** and the sequence +24.9%. No ordering fixes it, because either candidate
+can win. `encode_as_reference` re-runs whichever was kept, at the cost of a third encode on those
+frames only; the still path does not have it and does not pay.
+
+The original investigation follows, and its two refuted hypotheses still stand — but **its point 4
+is confounded**: the source-copy reference was measured while BUG-39 cause 2 was live. See RATE-4.
 
 **Kept from this item:** `encode`'s two candidate encodes now run **sibling first, configured path
 second**. `local_decode_iframe_gpu` builds an I-frame's reference from the quantised planes

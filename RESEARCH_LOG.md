@@ -98,6 +98,285 @@ limitation.
 **Nothing shipped moved.** Verified rather than asserted: same input with the gate set and unset
 both hash `756c0cbd…`, and so does the pre-ENT-9 build. Gates: 261 passed, 0 failed, both clippy
 targets clean. Decision record `0063`.
+## PERF-3 item 8 — the 32-bit Rice window is bit-exact and its throughput claim is unmeasured (2026-09-08)
+
+`docs/SIMPLE_PERF_FIXES.md` item 8: `rice_decode.wgsl` refilled its bit reader **one byte at a
+time** inside `while (read_bit())`, the unary loop of a stage the doc puts at ~47% of I-frame
+decode. Replaced with a 32-bit MSB-first window refilled a whole `u32` at a time.
+
+**The refill deliberately takes only the bytes left in the word holding `p_byte_offset`, never
+the next word.** That is what makes the change safe rather than merely fast: `load_byte` already
+read the entire containing `u32` to extract one byte, so keeping the rest is free, while reading
+ahead into the following word would be a **new** access past the end of the last stream. The set
+of words the shader touches is therefore exactly what it was. The alternative — clamping with
+`arrayLength(&stream_data)` — was rejected on top of that, because `docs/bug25/` is an upstream
+report about an `OpArrayLength` clamp segfaulting NVIDIA's compiler, and this is a hot decode
+shader.
+
+### Correctness: 16 of 16 byte-identical, on bitstreams encoded before the change
+
+Only the decoder changed, so the strong form of the check is available: decode the **same**
+pre-change `.gnc` files with both binaries and compare output bytes.
+
+| | bbb_1080p | blue_sky_1080p | kristensara_720p | touchdown_1080p |
+|---|---|---|---|---|
+| q=40 / 75 / 90 / 100 | identical | identical | identical | identical |
+
+Full suite green (`cargo test --release`, 0 failed), both clippy targets clean. **This is also the
+canary:** `p_bit_pos` and `p_current_byte` no longer exist, so a build that did not use `refill()`
+would not compile — and 16 identical decodes across a 4x span of quantiser, including q=100 where
+the unary runs are longest, is the new reader consuming real bitstreams correctly.
+
+### Throughput: no measurable change, and the measurement is not trustworthy either
+
+`GNC_RICE_DISPATCH_REPEAT=k` isolates the entropy slice as `(t(k) - t(1)) / (k-1)`. Interleaved
+A/B, best of 3-4 processes per point, `benchmark -n 12`:
+
+| image | q | rice stage, before | rice stage, after |
+|---|---|---|---|
+| bbb_1080p | 90 | 4.761 / 4.776 ms | **4.682 / 4.621 ms** |
+| touchdown_1080p | 40 | 4.841 / 4.907 ms | 4.848 / **4.998** ms |
+| kristensara_720p | 100 | 2.622 / 2.986 ms | 2.702 / 2.766 ms |
+
+**The direction reverses between images, so bbb's −2% is noise and there is no win here to
+report.** Whole-frame decode is indistinguishable throughout (12.2-13.6 ms before, 12.2-12.4 ms
+after, overlapping).
+
+**And the instrument could not have seen a 2% effect anyway.** Load average went from **18 to 43
+during the run** — eight sessions share this machine — and the same binary on the same image read
+9.36 ms then 7.30 ms between two passes, a 28% spread. BACKLOG's PERF-3 entry says these items
+need an idle machine; this is what it looks like when you ignore that.
+
+**Demanded an explanation of myself rather than accepting the null (CLAUDE.md quality rules), and
+there are two candidates.** Not "the code did not run" — the compile-time canary above rules that
+out. Either (a) the noise floor is an order of magnitude above the effect, which the load numbers
+support on their own, or (b) **the stage was never bound by those loads.** (b) is physically
+plausible and would make item 8's premise wrong: the word is in L1 after the first byte of it is
+touched, so the old reader's 4 loads per word were 1 miss and 3 hits, and the new byte-swap costs
+~7 ALU ops per word against the 3 shift/mask pairs it saves. On a cache-friendly GPU those
+roughly cancel. If (b) is true the same reasoning weakens items 9-11, which are also
+bandwidth-reduction arguments.
+
+### State
+
+- **Landed as a bit-exact refactor, explicitly not as a measured win.** Nothing goes into
+  BASELINE, GOALS or POSITIONING from this.
+- **Owed: the idle-machine A/B.** `gnc-before` is any build of the parent commit; the command is
+  in this entry. **If it measures neutral or worse, revert it** — the diff is one shader and the
+  bit-exactness result means a revert costs nothing.
+- **Question raised for the rest of PERF-3:** settle (a) vs (b) before implementing items 9-11,
+  because all three are priced on bandwidth. One idle-machine run of this A/B answers it, and
+  answering it on the change that is already written is cheaper than on three that are not.
+
+### The rule
+
+**An interleaved A/B does not rescue a measurement from a machine at load 43.** Interleaving
+controls for drift between arms; it does nothing about a noise floor 10x the effect. The first
+result agreed with the hypothesis, the second and third did not, and the only reason that was
+caught is that the second and third were run at all.
+
+## RATE-3 — the gate was hiding the mirror image of the bug `0040` fixed (2026-09-08)
+
+**Hypothesis.** `0036` refuses RATE-2's lossless fallback inside a sequence because the P-frames
+referencing a bit-exact I-frame decoded at 9.80 dB. BUG-39 cause 1 (`0042`) fixed the encoder's
+local decode inverting a transform it had not coded with, which is the defect that produced that
+number. So the refusal should now be unnecessary, and a bit-exact reference — no drift, nothing
+propagated — should pay on inter as well as intra.
+
+**It was still broken when the gate came off, and the reason is worth more than the rate number.**
+`encode` codes two candidates; `encode_once` leaves the quantised planes on the GPU as the side
+channel `local_decode_iframe_gpu` reads to build a reference; only the **last** encode's planes
+survive. `0040` found this in one direction — sibling second, lossy frame kept, wrong reference —
+and fixed it by running the sibling first. The other direction is the same bug with the candidates
+swapped, and the gate made it unreachable: sibling first, **bit-exact** frame kept, and the
+reference is built from the *lossy* candidate's coefficients. With `0042`'s branch in place that
+means `med.inverse` over wavelet coefficients.
+
+crowd_run q=99 ki=2, gate lifted, nothing else changed:
+
+| | I-frame bytes | P-frame bytes | worst P PSNR | sequence |
+|---|---|---|---|---|
+| shipped (`f3f7254`) | 4 789 653 | 4 990 303 | 60.62 dB | 48 799 611 |
+| gate lifted, no repair | 3 240 148 (−32.3%) | 8 885 779 | **5.93 dB** | 60 946 220 (+24.9%) |
+| gate lifted, repair | 3 240 148 (−32.3%) | 5 274 377 | 60.62 dB | **42 377 516 (−13.16%)** |
+
+The fix is `encode_as_reference`: when the sibling wins, re-run it so the side channel is its own.
+Deterministic, so the returned frame is the same bytes; a `debug_assert` checks that rather than
+trusting it. It costs a **third** encode on the frames that take it, which is why it is a separate
+entry point — a still has no reference to build and must not pay for one. Stills are byte-identical.
+
+**The full sweep**, `scripts/meas_rate3.py`, three sequences × q ∈ {95, 99} × ki ∈ {2, 9}, both arms
+from one binary and one command (`GNC_LOSSLESS_FALLBACK` is the only difference), off arm verified
+byte-identical to the shipped binary first:
+
+```
+       sequence    q  ki  bytes off   bytes on   Δbytes  worst P off  worst P on      ΔP  I bit-exact
+            bbb   95   2   19110162   19110162   +0.00%        53.12       53.12   +0.00        False
+            bbb   95   9   17896443   17896443   +0.00%        53.00       53.00   +0.00        False
+            bbb   99   2   26165418   26316852   +0.58%        60.68       60.68   +0.00         True
+            bbb   99   9   24610862   24708364   +0.40%        60.67       60.67   +0.00         True
+      crowd_run   95   2   39627016   37399616   -5.62%        52.84       52.84   +0.00         True
+      crowd_run   95   9   40034340   38966554   -2.67%        52.84       52.84   +0.00         True
+      crowd_run   99   2   48799611   42377516  -13.16%        60.62       60.62   +0.00         True
+      crowd_run   99   9   49328550   46535419   -5.66%        60.61       60.61   +0.00         True
+ old_town_cross   95   2   38866054   37010354   -4.77%        52.84       52.84   +0.00         True
+ old_town_cross   95   9   39839530   38898505   -2.36%        52.83       52.84   +0.01         True
+ old_town_cross   99   2   48088416   42012499  -12.63%        60.61       60.61   +0.00         True
+ old_town_cross   99   9   49173140   46466028   -5.51%        60.61       60.60   -0.01         True
+           MEAN                                  -4.28%                            +0.00
+```
+
+**Mean −4.28% of sequence bytes at unchanged quality** (worst ΔP −0.01 dB, which is the run-to-run
+floor), and bit-exact I-frames wherever the candidate wins. PSNR leads because q > 85 and VMAF is
+saturated against a bit-exact frame by construction; there is no chroma question because the kept
+candidate improves every plane at once or is not kept.
+
+**Verified outside the harness**, `0036`'s standard: `encode-sequence` → `decode-sequence` on
+crowd_run q=99 ki=2, decoded PNGs md5-compared as raw RGB against the sources. Frames 0 and 2 (I)
+are bit-exact; 1 and 3 (P) are not, which is BUG-39 cause 3, not this item.
+
+**The failure in the table, reported rather than smoothed:** bbb q=99 gets **larger**, +0.58% and
++0.40%. The candidate is chosen on the I-frame's own size, but a bit-exact reference imposes a
+downstream cost — it carries detail a lossy reference had already quantised away, so the P-residual
+against it is bigger (visible above: crowd_run's P-frames go 4.99 → 5.27 MB even in the winning
+arm). On bbb the I-frame saving is small enough that the downstream cost exceeds it. Choosing on
+sequence bytes rather than frame bytes is the real fix and needs a second pass; a margin constant
+would be fitted to three sequences, which is the mistake RATE-2's own comment warns about. Filed as
+RATE-4. Shipped anyway: 10 of 12 points improve, 2 regress by under 0.6%, and the mean is −4.28%.
+
+**Not measured: encode time.** The repaired frames cost three encodes instead of two. The observed
+34.6 → 6.6 fps on crowd_run is under seven other live sessions and COORDINATION rule 1 forbids
+reading it; the structural statement is 3× intra encode at q = 95..=99 on the frames that take the
+repair, decode unchanged.
+
+**One correction to `0040`.** Its point 4 rejected taking a bit-exact frame's reference from the
+colour-converted source, on a measurement of 21.37 dB. That measurement is confounded — BUG-39
+cause 2 was live, so the P-frames were decoding a wavelet residual as a MED prediction whatever the
+reference held. The source-copy route is *free* where the repair costs an encode, and its
+refutation does not survive its own cause being fixed. Not re-tested here; it is RATE-4's other
+half.
+
+## BUG-39 — the encoder's zero-level transform wrote nothing, so P-frames carried the previous frame's buffer (2026-09-08)
+
+**Hypothesis, from the item.** 0042 fixed two of three causes and left cause 3 as a design
+question: `q=100` P-frames are lossy by construction because the residual is quantised at the
+P-frame taper (up to 1.25x the intra step) with a dead zone, so a lossless configuration must
+suppress both and pay for it in rate.
+
+**The first thing measured was that hypothesis, and it is false.** `--diagnostics` on crowd_run at
+`q=100` prints the two levers it names:
+
+```
+p_qp_scale=1.0000 (taper, default 1.0000), intra_qstep=1.0000 res_qstep=1.0000
+  inter_dz_mul=1.00 dz_intra=0.000 dz_referenced=0.000 dz_res=0.000
+```
+
+The taper is 1.0 (it is keyed on the step, and 1.0 is below the 2.8 breakpoint) and the dead zone
+is 0.0 (`normalized_for_lossless`, BUG-30). Both were already where a lossless configuration wants
+them, so neither could account for 26 dB. **The canary that refutes cause 3 has been in the
+default diagnostics output since INTER-1.** 0042's own lesson — diff the two things that must be
+equal instead of theorising — applied one level up: it diffed the references, fixed what that
+found, and then wrote a mechanism for the *remaining* gap without reading the numbers the encoder
+prints.
+
+### What it actually was
+
+`WaveletTransform::forward` runs `for level in 0..levels`. At `levels == 0` it dispatches nothing
+and **never writes `output_buf`**. `WaveletTransform::inverse` copies `input_buf` into
+`output_buf` before its loop, so the decoder's zero-level case *is* the identity.
+
+`encode_pframe` calls `transform.forward(mc_out -> plane_b -> plane_c)` and then quantises
+`plane_c`. So at `levels == 0` the encoder quantised and transmitted whatever the previous frame
+left in `plane_c`, and the decoder added that leftover to its own motion prediction. Every P and B
+frame of a `q=100` sequence goes through it, because LOSSLESS-1 sets `wavelet_levels = 0` for MED
+and a residual is always wavelet-coded whatever the sequence's transform is. `--dct` sequences hit
+it identically.
+
+Fixed by giving `forward` the identity copy `inverse` already had, plus the matching early return
+in `inverse`, which also removes a `levels - 1` underflow that panics in a debug build.
+
+### Two probes on the way, one of which is a trap worth recording
+
+A **static** sequence (the same PNG four times) codes `q=100` P-frames **bit-exact** at 3 198
+bytes, before the fix as well as after. That looks like proof the reference chain and the residual
+path are sound, and it is not: `--diagnostics` shows `all_skip_tiles=120/120`, so the frame went
+down the motion-skip path and the transform was never asked for anything. **A zero-residual probe
+cannot test a residual path.** The informative probe was the opposite one — content whose residual
+is large, where the fix moves the number by 25 dB.
+
+The second probe was `GNC_MED=0` at `q=100`, which RATE-3 had already recorded at 44.18/46.15 dB
+against MED's 12.45. That gap is the whole finding in hindsight: `GNC_MED=0` keeps
+`wavelet_levels = 5`, so it never enters the broken branch, and *being better with a transform
+than without one* is the signature of a missing identity.
+
+### Raw numbers — 3 sequences, 8 frames, ki=2 and ki=9, 4:4:4, shipped defaults
+
+Inter-frame PSNR range across the GOP. I-frames are `inf` (bit-exact) in both arms.
+
+| | before | after | drift down the GOP |
+|---|---|---|---|
+| crowd_run ki=2 | 26.30 - 26.76 | **51.54 - 53.62** | |
+| crowd_run ki=9 | 21.77 - 26.51 | **50.41 - 51.54** | 4.74 dB -> **1.13 dB** |
+| old_town_cross ki=2 | 29.69 - 29.91 | **51.83 - 52.52** | |
+| old_town_cross ki=9 | 27.04 - 29.91 | **50.58 - 51.83** | 2.87 dB -> **1.25 dB** |
+| bbb ki=2 | 32.92 - 33.15 | **58.10 - 58.23** | |
+| bbb ki=9 | 24.76 - 32.99 | **56.22 - 58.12** | 8.23 dB -> **1.90 dB** |
+
+PSNR leads and VMAF is not quoted: `q=100` is above the q>85 line where VMAF is saturated, and
+these are 50+ dB frames.
+
+**No effect at lossy quality**, which is the gate that matters most: at q=99 all six points are
+identical **to the byte** and to two decimals of PSNR (crowd_run ki=9: 39 570 472 B, 60.61-60.64,
+both arms). The fix cannot be reached wherever `wavelet_levels >= 1`, i.e. q=1..99.
+
+### The rate half, which says the opposite of what was expected
+
+crowd_run, 4 frames, ki=2, total bytes:
+
+| | bytes |
+|---|---|
+| I+P before | 11 369 827 |
+| I+P after | **17 584 089** |
+| all-intra (unchanged) | 12 932 312 |
+
+**At `q=100` the inter path is now 36% larger than coding every frame intra**, where before the
+fix it looked 12% *smaller*. That 12% saving was bought by transmitting a stale buffer instead of
+the residual. With no quantiser to discard any of it, a quarter-pel MC residual is noise-like and
+costs more than the MED-predicted frame it replaces. So the rate number cause 3 was said to need
+exists now, and it asks a different question: whether `q=100` video should use P-frames at all.
+Recorded, not acted on.
+
+### What is left, and it is one named mechanism
+
+51.54 dB is not `inf`, so the success criterion is **not met** and BUG-39 stays open. The residual
+is **sub-pel prediction rounding**: bilinear interpolation at quarter-pel makes the prediction
+fractional, so `cur - pred` is fractional, and step 1.0 rounds it — error <= 0.5 per sample in
+YCoCg-R, amplified into RGB by the inverse colour transform. 51.5 dB is the right magnitude for
+that, and bbb reads 58 dB because more of its blocks are full-pel or zero.
+
+The fix is H.264 lossless's: round the prediction to an integer in a lossless configuration, on
+both sides, so the residual is an integer and step 1.0 is exact. A `round()` in
+`motion_compensate.wgsl` behind a params flag gated on `config.is_lossless()`, which the decoder
+derives from the frame header it already carries — no new bitstream field. Untried.
+
+### Canary
+
+`zero_level_forward_is_an_identity_not_a_no_op` pre-fills the output buffer with a sentinel and
+asserts a zero-level `forward` overwrites all of it. **Verified to fail without the fix** (the
+whole plane mismatches), so it asserts something rather than decorating the commit.
+
+### Caveats
+
+- **`--dct` video is corrected and unmeasured**, the same flag 0042 left on cause 2.
+- **B-frames are unmeasured** — off by default, same `forward` call, so the fix applies to them
+  untested.
+- **4:2:0 is not in scope for bit-exactness**: chroma-domain MC box-filters both planes, which is
+  fractional by construction.
+
+**Gates:** `cargo test --release -- --test-threads=1`, `cargo clippy --release` and the wasm
+`--lib` clippy target — see the commit.
+
+Decision record: `docs/decisions/0054`.
 
 ---
 

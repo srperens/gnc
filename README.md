@@ -1,129 +1,82 @@
 # GNC — GPU-Native Codec
 
-Research project exploring what video compression looks like when designed from scratch for GPU parallelism, rather than adapting CPU-era algorithms.
+A patent-free video codec designed from scratch for GPU parallelism. Everything runs as wgpu
+compute shaders (WGSL), written against the WebGPU feature set so one source targets Metal,
+Vulkan, DX12 and the browser.
 
-**Rust + wgpu compute shaders (WGSL). Written against the WebGPU feature set — Metal, Vulkan, DX12, WebGPU/WASM. Patent-free.** Metal is the backend every figure in this file is measured on. **Vulkan runs intra *and* inter end to end on two independent implementations** as of 2026-09-08; see [Portability, as measured](#portability-as-measured) before relying on any backend but those two.
+## The idea
 
-## Why
+Established codecs were designed for CPUs and carry sequential algorithms that a GPU cannot
+exploit. GNC starts from the opposite constraint: **every 256x256 tile is fully independent, at
+every stage.** That single rule buys parallelism, random access, low-latency decode and error
+resilience at the same time.
 
-Traditional codecs (H.264, HEVC, AV1) are shaped by decades of CPU constraints — sequential processing, complex prediction modes, intricate entropy coding with state chains. GPUs offer thousands of parallel threads, but these codecs can't exploit them.
+Where GNC is meant to win is not bitrate — it is **portability and scale**. A chip's
+fixed-function encoder blocks stay roughly constant however large and expensive the GPU is, while
+shader throughput scales with the card. A bigger GPU should therefore buy more GNC instances. It
+should also run where no hardware encoder exists at all, in a browser, and on any vendor.
 
-GNC asks: if you start from zero with a GPU-first mindset, what do you end up with?
+GNC is deliberately **broad**: intra and inter, 4:2:0 / 4:2:2 / 4:4:4 at 8 and 10 bits, and a
+quality range from heavy compression through visually lossless to bit-exact lossless. The target
+is roughly H.264-class compression across that whole range, not a record at one point of it. Its
+uses — contribution links, mezzanine and archival storage, low-latency preview, browser playback —
+encode about as often as they decode, which bounds how much encoder search is worth buying.
 
-The answer so far: tile-independent processing, fully parallel entropy coding (256 independent streams per tile), and wavelet transforms that map naturally to GPU workgroups. It runs a full I/P/B video pipeline at 1080p on an integrated GPU. *(This line claimed "in real time … on an eight-core integrated GPU" until 2026-09-08. The core count was the wrong-hardware label BUG-29 retired, and "real time" is not what this project's own figures say — 1080p end to end is 15.4 fps on an idle machine, and the 5.0 fps this line first carried was a shared one. See [Video sequence](#video-sequence).)*
+**Several internal strategies selected by quality and bitrate is the design, not a failure to pick
+one.** MED prediction replaces the wavelet entirely at `q=100`, the entropy coder follows quality,
+and the wavelet depth follows the tile size.
 
-GNC is deliberately **broad**: intra and inter, 4:2:0 / 4:2:2 / 4:4:4 at 8 and 10 bits, and a quality range that runs from heavy compression through visually lossless to bit-exact lossless. The uses it is built for — contribution links, mezzanine and archival storage, low-latency preview, browser playback — encode about as often as they decode, which bounds how much encoder *search* is worth buying but not the compression target: that is roughly H.264-class across the whole range. Every figure below therefore names the operating point it was measured at, because several of this project's retracted results came from measuring one end and quoting it as if it described the codec.
+## Where it stands
 
-## Status
+Honestly: **the compression is close on stills and about 1.6x off H.264 on video, and the two
+claims the positioning rests on are the ones with the least evidence.**
 
-**Working end to end:** I/P/B video pipeline with motion estimation, 8- and 10-bit, 4:4:4 / 4:2:2 / 4:2:0, five entropy coders of which three are selectable (Rice, `--rans`, `--abac`; Huffman and Bitplane are parked), and bit-exact lossless at `q=100` **for stills and for 4:4:4 video** — a `q=100` sequence decodes bit-exact on every frame, I and P alike, verified through the container with raw-RGB md5 on 48 frames (BUG-39, four causes, `docs/decisions/0042`, `0054` and `0064`, from 12.45 dB through 26.30 and 51.54 to exact; B-frames and 4:2:0 are not covered and say why). At `q=100` the inter path costs **38% more bytes than coding every frame intra** on camera content and wins 1.6% on animation — an exact comparison, since both arms are bit-exact (LOSSLESS-2). **On Metal**, and — for correctness, not for throughput — **on Vulkan** since 2026-09-08. What runs on DX12 and in a browser is measured below and is less than this sentence used to claim.
+- **Stills** are competitive — level with ProRes 4444 and ahead of JPEG XS with the `--abac`
+  coder, and about 14% behind H.264 all-intra. JPEG 2000 uses the *same* wavelet and still needs
+  54% fewer bits, so the remaining intra gap is the entropy coder and the rate is demonstrably
+  reachable.
+- **Video** needs about 1.6x the bitrate of x264 at contribution quality with `--abac`, 1.9x with
+  the default coder.
+- **Lossless** is bit-exact and beats JPEG 2000 lossless and PNG, while losing to FFV1.
+- **Latency** is 25.2 ms round trip with zero frames of reordering delay — below the
+  low-latency-HEVC band, above JPEG XS.
+- **Throughput** is roughly 4x short of the 60 fps target, and about half of the per-frame cost is
+  not GPU coding work.
+- **Portability is half met.** Metal and Vulkan both run the whole codec with byte-identical
+  output across independent implementations. **DX12 has never produced a single frame, and the
+  browser path has never been verified in a browser.** That is a headline defect, not a
+  compatibility nit, because portability is the axis the project claims to win on.
+- **Scale is unmeasured.** "A bigger GPU buys more GNC instances than it buys hardware encoder
+  blocks" is the central structural claim and it has no number yet. Concurrency currently saturates
+  on host memory and per-process startup, not on the GPU.
 
-**Where it stands against H.264** (measured 2026-09-06, `scripts/meas1_vs_h264.py`, 1080p, ki=9, x264 at defaults):
+Every figure, with its caveats and its corrections, is in **[BASELINE.md](BASELINE.md)** —
+including which quantity each throughput number is and whether the machine was idle when it was
+taken. Do not quote a number from this file without reading its row there.
 
-- **Contribution quality: +89.2% BD-rate on PSNR** with the default Rice coder — about 1.9x the bitrate of x264 for the same luma quality, across three sequences (MEAS-10, 2026-09-08; QUAL-1's +90.5% was the same ladder before INTER-2). **`--abac` on the same ladder is +61.0%** (1.61x), at bit-identical pixels to Rice (MEAS-11, re-taken at `a0880c7` after ENT-9; +66.0% was the same ladder before it).
-- **Colour: no advantage over x264, and the row that claimed one is withdrawn (CHROMA-2, 2026-09-07).** The control this README asked for has been run — give x264 the same allocation via `--chroma-qp-offset` and re-measure CIEDE2000 at the same total rate — and **x264 comes out ahead on all six runs** (three sequences x 4:2:0 and 4:4:4). On five of the six it does not need the offset at all: it leads on colour at offset 0 *while also leading luma by 4.1-7.4 dB*. The earlier row, which had GNC ahead on dE00, rested on a table measured an hour before CHROMA-1 changed q>=85 output and does not reproduce. GNC's colour is still good in absolute terms (dE00 0.54-0.92 mean, at or below the nominal JND) — it is just not better than x264's.
-- **Lossless: the best wavelet result in the field.** 1.99:1 at `q=100`, beating JPEG 2000 lossless by 10.8% and PNG by 7.8%; behind FFV1 by 27% and x264 `-qp 0` by 43%, both of which predict against the neighbouring pixel rather than across scales.
-- **Latency: 25.2 ms round trip** at the default configuration, 1080p on an Apple M5 Pro —
-  **15.34 ms encode / 9.87 ms decode**, re-taken on an *idle* machine 2026-09-08 (MEAS-6).
-  *This bullet read ~80 ms until then, and that figure was about 3.2x inflated by a shared
-  machine*: eight sessions were working this Mac when it was taken. The default codes P-only with
-  **zero reordering delay** — that half is structural, not timed, and is unaffected; the
-  hierarchical B-pyramid, which adds 8 frames of lookahead, has been **off by default since
-  2026-09-06** and is opt-in via `GNC_B_PYRAMID=1`. On an NVIDIA RTX 4000 Ada over Vulkan the
-  same harness and operating point reads **13.95 ms encode / 7.29 ms decode**, 21.2 ms round trip
-  (CANARY-1, 2026-09-07) — so the Mac is **1.19x slower than the RTX 4000 Ada**, which is the
-  first *controlled* cross-machine figure this project has: same script, same `--quality 90`
-  default, same pinned input (`f83f355f…`). The uncontrolled rows would have implied 3.8x.
-  At 25.2 ms GNC sits **below** the low-latency-HEVC band (EBU: 120–3060 ms) and well above the JPEG XS band — JPEG XS codes 1–32
-  lines and EBU measures it under one frame. The 256-line tile floor is not reachable today: the
-  pipeline processes whole frames, so the practical floor is one full frame whatever the tile
-  size. See [`docs/POSITIONING.md`](docs/POSITIONING.md) for where that leaves GNC against the
-  incumbents in this segment.
-- **Against the intra codecs it actually competes with** (MEAS-9, 2026-09-07,
-  `scripts/meas9_contribution.py`, four images, one metric path). BD-rate, positive = GNC needs
-  more bits at matched quality; both columns are given because a single one reverses the ranking:
+## Build & run
 
-  | | RGB PSNR | RGB, `--abac` | Y-PSNR (YCoCg-R) | Y, `--abac` |
-  |---|---|---|---|---|
-  | JPEG XS 4:4:4 | −10.2% | **−25.8%** | +29.4% | +7.7% |
-  | ProRes 4444 | +20.2% | **+1.3%** | +29.3% | +9.1% |
-  | JPEG 2000 9/7 | +54.2% | **+27.1%** | +79.7% | +48.3% |
+```bash
+cargo build --release
+cargo test --release
 
-  **JPEG 2000 uses the same transform as GNC — 9/7 wavelet, five levels — and still needs 54%
-  fewer bits**, winning on CIEDE2000 at matched rate too. When the transform is the same, the gap
-  is the entropy coder: J2K's is EBCOT, and `--abac` closes **exactly half** of it (ENT-4, −16.0%
-  of rate at bit-identical pixels on 24 of 24 rungs). With `--abac` GNC matches ProRes 4444 and is
-  ahead of JPEG XS 4:4:4 on RGB PSNR, and stays behind both on luma — an entropy coder does not
-  move bits between planes. **Where the remaining 27% lives is now accounted for** (INTRA-1, 2026-09-08, decisions `0026`–`0028`, `0034`): entropy coding ≤7.5 points, chroma rate allocation 8.5 and *not* a coding deficiency, **tile-alignment padding 6.6 and also not a coding deficiency**, tiling 0.6% realisable, cross-tile allocation 0.95%, tile-boundary handling 0, and a dead zone worth ~3 — intra-only, because on video it costs up to 1.93 dB of worst-frame PSNR. **The padding is the one that changes how this table should be read:** GNC pads every plane to whole tiles and codes it, so a 1920x1080 frame is coded as 2048x1280 — 20.9% of the coded samples are outside the picture, and JPEG 2000 in whole-picture mode codes none. On padding-free content the same arms read **+19.8% RGB / +40.7% Y**. Two thirds of that tax was a fill choice, and **PAD-1 shipped it on 2026-09-08: −4.63% RGB / −4.60% Y of intra rate on stills at unchanged visible quality**, so the still-image rows above are about 4.6 points better than they read here. It is deliberately *not* applied to any frame something predicts from — motion compensation reads the padding for edge blocks, where fading it flat costs up to 4.03 dB of worst-frame PSNR (decision `0039`); video is byte-identical. The inter half is PAD-2.
-  The 4:2:2 arms — JPEG XS 4:2:2, ProRes 422 — cannot be BD-rate compared at all: chroma
-  subsampling caps them at 39–45 dB RGB PSNR, below GNC's range, and at matched rate GNC beats
-  both on luma and colour, which is what full chroma resolution buys rather than a coding result.
-- At *distribution* bitrates the gap is much larger. GNC is not built for that operating point.
+gnc encode -i in.png -o out.gpuc -q 75            # stills
+gnc decode -i out.gpuc -o out.png
 
-**Off by default, and why:** the B-frame pyramid (costs 7–31% in rate on camera content and 160 ms in latency), temporal wavelet mode (loses 2–5 dB on high motion), and motion-compensated temporal filtering (measured 1.04–1.14x *worse* than a P-frame chain on every sequence tested).
+gnc encode-sequence -i "frames/%04d.png" -o v.gnv -q 75 --keyframe-interval 8
+gnc decode-sequence -i v.gnv -o "out/%04d.png" --seek 5.0
 
-See [`RESEARCH_LOG.md`](RESEARCH_LOG.md) for every measurement, including the ones that failed — roughly two dozen ideas have been tested and rejected, and they are written up as carefully as the wins.
+gnc benchmark -i in.png -q 75 --vmaf              # measurement
+gnc benchmark-sequence -i clip.y4m --throughput   # Y4M: no image decode in the timer
+gnc rd-curve -i in.png --compare-codecs
+gnc gpu-info                                      # device, and the limits GNC requests
+gnc fingerprint                                   # what this binary produces
 
-## Portability, as measured
+cd test_material && bash fetch_test_frames.sh     # Xiph.org frames; needs ffmpeg + curl
+wasm-pack build --target web --release            # browser decoder
+```
 
-GNC targets the WebGPU feature set and asks wgpu for its *default* limits rather than the
-adapter's, so the same WGSL is meant to run everywhere. That is the design. This is the evidence,
-as of 2026-09-08:
-
-| backend | status | evidence |
-|---|---|---|
-| **Metal** | measured end to end | every figure in this README |
-| **Vulkan** | **intra and inter both run**, on two independent implementations | Intra throughput measured on three real GPUs: RTX 4000 Ada 13.95 ms encode / 7.29 ms decode, and on Windows an Intel Arc Pro at 36.45 / 26.63 ms against an RTX 2000 Ada at 17.75 / 11.33 ms. **Inter added 2026-09-08**: `encode-sequence` codes 1I + 2P and `decode-sequence` round-trips it on an RTX 4000 Ada, and Mesa lavapipe produces **byte-identical** frame sizes — two Vulkan implementations sharing no compiler code. *(This row said `block_match_split.wgsl` crashes three independent drivers and that P/B coding was unreachable. All four recorded crashes were on invalid SPIR-V from an upstream naga defect, fixed in `51a9ac6`; the Windows builds that looked like independent confirmation predate that commit. BUG-25 **fixed**, `docs/decisions/0029`.)* **Both caveats retired 2026-09-08 by round 3** (`1e41e8d`): inter P-frames run on *both* Windows GPUs — Intel Arc Pro included, re-run since the fix — and the first clean inter throughput figure exists, a concurrency sweep scaling **1.00 → 1.55× → 1.85×** at N=1,2,4, monotonic. Read that as aggregate scaling, not a single-stream figure; and note the ceiling is **~1.8 GB per process**, not the GPU — power never exceeds ~49 W and falls to 2 W at N=8, so the sweep measures instance setup rather than compute (MEAS-5) |
-| **DX12** | **tried on two hardware adapters and still produces no frame — now a compile-time wall, not a crash** | *This row said "no DX12 hardware adapter has ever been tried" until 2026-09-08; three attempts on the Windows laptop had already been made.* Intel Arc Pro and RTX 2000 Ada both died at pipeline creation with FXC `X3695: race condition writing to shared` in `block_match_bidir.wgsl` — a shader an intra encode never uses. **BUG-40 made the bidir pipelines lazy and that crash is gone** (`docs/decisions/0049`); what replaced it is FXC compiling **>4.5 min at 95% CPU with no output** before being killed, so there is still no diagnostic and no frame (round 3, `1e41e8d`; filed as **BUG-52**, open). Microsoft Basic Render Driver (WARP, CPU) panics on a single frame, exit 101. Adapter *enumeration* works across Vulkan/DX12/GL. **GNC has never produced one frame on DX12** |
-| **WebGPU / WASM** | compiles; **not verified in a browser**, and one known blocker | both abac GPU shaders declare 18 688 B of workgroup storage against WebGPU's 16 384 B limit. Native wgpu does not enforce it; a conformant implementation must. The decoder builds the abac decoder unconditionally, so if it bites, *every* WASM decode fails, Rice files included (BUG-31, open) |
-
-**Two of the three non-Metal rows are still not clean** — DX12 has never produced a frame and the browser is unverified — which is why the top of this file states
-Metal and Vulkan and stops there: GNC is *written* to be portable, is *measured* end to end on
-Metal, and is measured *correct* — not yet fast — on Vulkan.
-Platforms it has run on at all: macOS/Metal, Linux/Vulkan, and — since 2026-09-08 — Windows,
-where it builds clean and runs all-intra on both GPUs of a two-GPU laptop.
-
-Cross-backend output has been compared once (2026-09-07): at `q=100` Metal and Vulkan produce
-byte-identical files, and at `q=75` they differ by one byte in 1.17 MB. Every file decodes to
-identical pixels on both. **The decoder is bit-exact across backends and the lossy encoder is
-not** — so conformance must require decoder bit-exactness, not encoder reproducibility.
-
-## Current Results (1080p, bbb reference, Apple M5 Pro GPU)
-
-### Single-frame (Rice+ZRL entropy)
-
-| q | PSNR | BPP | VMAF | levels |
-|---|------|-----|------|--------|
-| 25 | 35.63 dB | 1.57 | 90.31 | 5 |
-| 50 | 40.25 dB | 2.60 | 95.07 | 5 |
-| 75 | 44.64 dB | 4.31 | 96.55 | 5 |
-| 90 | 49.89 dB | 7.21 | 97.06 | 5 |
-
-*Single-frame, 1080p bbb reference, Rice, 4:4:4. **[BASELINE.md](BASELINE.md) is the single source
-for these** — this table was three separate copies from 2026-02-27 and had drifted more than 2 dB.
-Throughput columns are deliberately absent: see BASELINE's fps section for why no single "encode
-fps" exists.*
-
-### Video sequence
-
-**27.8 fps** GPU encode phase, **15.4 fps** end to end (1080p, q=75, keyframe interval 8, Rice,
-measured 2026-09-06 on a machine that was not idle).
-
-*The 31.7 fps this line used to carry is withdrawn: it is not reproducible, it matches none of the
-three quantities below, and its stated parameters are internally inconsistent — ki=8 cannot produce
-B-frames. See [BASELINE.md](BASELINE.md), "How to read the fps figures in this file".*
-
-> **On the throughput figures above.** Three different quantities have been called "encode fps" in
-> this project and they differ by 2.4x — the GPU encode phase, the encoder loop, and end-to-end
-> wall clock. The figures here are the encoder loop. They were also measured on a machine that is
-> not reliably idle: the same workload has timed 25.2, 31.1 and 37.5 ms across three runs, a 48%
-> spread on identical work. **Treat every fps number in this README as indicative to about ±25%**,
-> and say which of the three quantities you mean whenever you quote one.
-> The compression figures (bpp, PSNR, CIEDE2000) are deterministic and carry no such caveat.
-
-## Architecture
-
-Everything runs as wgpu compute shaders. The pipeline:
+## Pipeline
 
 ```
 RGB → YCoCg-R → Wavelet → Quantize → Entropy Code → Bitstream
@@ -132,207 +85,29 @@ RGB → YCoCg-R → Wavelet → Quantize → Entropy Code → Bitstream
       integer)   or 5/3)     CfL, AQ)    256 streams)
 ```
 
-Each tile (256x256) is fully independent — no cross-tile dependencies. This gives parallelism, random access, and error resilience for free. See [`docs/PIPELINE.md`](docs/PIPELINE.md) for a detailed stage-by-stage breakdown.
+Video adds half-pel motion compensation with hierarchical block matching, CBR/VBR rate control and
+the GNV1 container with keyframe seek and per-tile CRC-32. Five entropy backends exist, all
+decoding as GPU compute shaders; Rice is the default everywhere, `--abac` trades roughly 3x decode
+time for 17–19% of the rate, and `--rans` is kept for experiments below q=20.
 
-### Pipeline stages
-
-1. **Color space** — YCoCg-R via lifting (integer-exact, lossless-capable)
-2. **Wavelet transform** — CDF 9/7 for lossy (q=1–99), LeGall 5/3 for lossless (q=100), 5 decomposition levels at q≥25, 4 below
-3. **Adaptive quantization** — Per-block variance analysis on LL subband, geometric mean normalization, 3×3 spatial smoothing
-4. **Quantization** — Uniform scalar with perceptual subband weights, dead zone, adaptive QP from AQ weight map. Fused quantize+histogram kernel when CfL is off.
-5. **Chroma-from-Luma (CfL)** — Per-tile per-subband least-squares alpha (14-bit), active at q=50–85. Encodes chroma residuals instead of raw coefficients.
-6. **Entropy coding** — Rice+ZRL (default): significance map + Golomb-Rice + zero-run-length, 256 independent streams per tile. rANS (32 streams), Huffman (64-symbol), and Bitplane also available but parked.
-
-### Video features
-
-- **I/P/B frames** — motion-compensated prediction with half-pel bilinear interpolation
-- **Motion estimation** — hierarchical coarse-to-fine block matching (16x16, ±32px search)
-- **Container** — GNV1 format with frame index table, keyframe seeking
-- **Error resilience** — per-tile CRC-32 checksums, corrupt tile detection and recovery
-
-## Build & Run
-
-```bash
-cargo build --release
-```
-
-### Encode / decode a single image
-
-```bash
-gnc encode -i input.png -o output.gpuc -q 75
-gnc decode -i output.gpuc -o output.png
-```
-
-### Benchmark
-
-```bash
-gnc benchmark -i input.png -q 75              # Rice+ZRL (default)
-gnc benchmark -i input.png -q 75 --rans       # rANS entropy (see Entropy Coders)
-```
-
-### Rate-distortion curve
-
-```bash
-gnc rd-curve -i input.png                     # sweep q=10..100, output CSV
-gnc rd-curve -i input.png --compare-codecs    # also compare vs JPEG, JPEG 2000
-```
-
-### Encode / decode video sequence
-
-```bash
-gnc encode-sequence -i "frames/%04d.png" -o video.gnv -q 75 --keyframe-interval 8
-gnc decode-sequence -i video.gnv -o "output/%04d.png"
-gnc decode-sequence -i video.gnv -o "output/%04d.png" --seek 5.0  # seek to 5s
-```
-
-### Run tests
-
-```bash
-cargo test --release    # 148 tests: unit, regression, conformance
-```
-
-## Test Material
-
-```bash
-cd test_material && bash fetch_test_frames.sh
-```
-
-Downloads representative broadcast frames from [Xiph.org](https://media.xiph.org/) (requires ffmpeg and curl).
-
-## Entropy Coders
-
-GNC has five entropy coding backends, all decoding as GPU compute shaders:
-
-| Coder | Streams/tile | Coding | Rate vs Rice | Decode vs Rice | Patent risk |
-|-------|-------------|--------|--------------|----------------|-------------|
-| **Rice+ZRL** (default above q=20) | 256 | Golomb-Rice + zero-run | — | — | None |
-| rANS (`--rans`, default at q≤20) | 32 | Range asymmetric numeral systems | −6.4% at q=10, +0.4% at q=25; cannot encode above q≈76 | ~1.15× (TUNE-3, not re-measured) | Possible (MS patent) |
-| abac (`--abac`) | 1 per 64px code-block | Adaptive binary arithmetic, context-modelled | −16.6% to −18.8% at q=50–90 | **3.19×** decode, **5.57×** encode (idle machine, 2026-09-08) | None known |
-
-abac encodes on the GPU as well as decoding there (ENT-5): one thread per code-block, bit-exact
-against the CPU coder in `abac.rs` — 98 of 98 whole-file comparisons byte-identical across four
-stills, q=60–100, both arithmetic engines, 4:4:4/4:2:2/4:2:0 and an 8-frame sequence.
-**Its encode time per frame is now measured**, on an idle machine 2026-09-08: **84.40 ms/frame
-against Rice's 15.16 ms — 5.57x**, with the abac encode *stage* alone at 50.87 ms/frame
-(`GPU Range/BoundedSlots`, the shipped path). `0017` recorded 129 ms against Rice's 23 ms, a ratio
-of 5.61x: **the ratio reproduces almost exactly, and its 129 ms was the `CPU Interval` variant**,
-which reads 127.15 ms/frame today and is not what ships. `docs/decisions/0057`.
-| Huffman (parked) | 256 | 64-symbol + escape | not measured | not measured | None |
-| Bitplane (parked) | Per-block | Sign + magnitude bitplanes | not measured | not measured | None |
-
-*Rate column measured by ENT-2 (2026-09-07) on four stills at one commit, mean across images,
-negative meaning rANS is smaller. Entropy coding is lossless and both coders quantise identically,
-so equal q decodes to the same picture — verified, 0 of 40 points differ in PSNR — which makes this
-an exact rate comparison rather than a BD-rate estimate. **The mean hides the spread**: at q=25 the
-same setting runs from −3.5% (touchdown) to +8.2% (kristensara), so which coder wins is
-content-dependent at every quality point. rANS overflows a fixed 4 KB per-stream buffer above
-q≈76 (BUG-9), which is below the contribution operating point. Full ladder in
-[RESEARCH_LOG.md](RESEARCH_LOG.md); [BASELINE.md](BASELINE.md) remains Rice-only and is the single
-source for absolute figures.*
-
-*The Decode column carries only figures someone actually timed, and says which run they came
-from. The "1.5–2× faster" that stood here for Rice was neither: it contradicted the only throughput
-figure in the repository — TUNE-3 measured rANS at ~8% encode and ~15% decode behind Rice, not
-50–100% — so it is removed rather than corrected. **abac's decode cost is 3.19×, not the 1.69× this file and `0017` carried until 2026-09-08** — re-taken on an idle machine, and about a tenth of the move is ENT-9, which bought −2.07% to −8.76% of rate for +9.5% decode and +10.0% encode without logging either;
-rANS's ~1.15× is TUNE-3's and was **not** re-measured, because up to eight sessions share this Mac
-and COORDINATION rule 1 forbids timing under load.*
-
-Rice is the default because it eliminates the sequential state chain that limits rANS. Each of the 256 streams encodes independently — no shared state, no synchronization, minimal shared memory (< 1 KB vs rANS's 16 KB frequency tables). That is a GPU-parallelism argument, and the rate figures above no longer argue against it: level with rANS where Rice is selected, and rANS keeps the range below q=20 where it is 6–7% smaller. Huffman and Bitplane are available but parked.
-
-**abac needs no BD-rate either**, for the same reason the rANS column above is exact: entropy
-coding is lossless, so abac and Rice decode to the *identical picture* and the only difference is
-file size. Measured 2026-09-07 through the real
-bitstream on bbb, blue_sky, kristensara and touchdown — encode to a file, decode on the GPU,
-pixels compared:
-
-| q | mean rate vs Rice, at identical pixels |
-|---|---|
-| 50 | **−18.8%** |
-| 75 | **−16.6%** |
-| 90 | **−17.3%** |
-| 100 (bit-exact lossless) | **−13.4%** |
-
-At lossless that takes GNC from +23.9% behind FFV1 to **+7.3%**.
-
-It is opt-in rather than the default because it costs about **1.69× frame decode** — one serial
-adaptive coder per code-block, against Rice's 256 branch-free streams per tile — and because its
-CPU-side encoder is currently single-threaded (129 ms/frame against Rice's 23 ms). The rate result
-is intra only; inter frames use the same coder with contexts that were tuned on intra
-coefficients, and that has not been measured. See `docs/decisions/0017`.
-
-## Quality Spectrum
-
-Smooth, monotonic quality scaling from lossless to extreme compression:
-
-```
-q=100  Lossless     — bit-exact round-trip (LeGall 5/3 integer wavelet)
-q=90   High quality — near-transparent
-q=75   Production   — good general-purpose quality
-q=50   Balanced     — CfL + adaptive quantization
-q=25   Compressed   — broadcast-suitable
-q=5    Extreme      — preview/thumbnail
-```
-
-*Deliberately without dB figures. This block used to carry its own set (q=75 → 42 dB, q=50 → 37,
-q=25 → 33) which was a third copy of the 2026-02-27 numbers and had drifted 2–3 dB from the table
-above. [BASELINE.md](BASELINE.md) is the single source; the Current Results table quotes it, and
-nothing else in this file should.*
-
-## WebGPU / WASM
-
-The full decoder compiles to WebAssembly (263 KB) and is intended to run in browsers via WebGPU. **A browser render has never been verified** — see [Portability, as measured](#portability-as-measured), including BUG-31, which would fail every WASM decode if a conformant implementation enforces the workgroup-storage limit that native wgpu does not:
-
-```bash
-wasm-pack build --target web --release
-```
-
-Browser demo in `examples/web/index.html`.
-
-## Project Structure
-
-```
-src/
-├── lib.rs              Core types, quality_preset(), codec config
-├── main.rs             CLI (encode, decode, benchmark, rd-curve, ...)
-├── format.rs           Bitstream serialization (GP11 frame, GNV1 sequence)
-├── encoder/
-│   ├── pipeline.rs     Encoder orchestration
-│   ├── sequence.rs     Video sequence, B-frames, rate control
-│   ├── rice.rs         CPU Rice encoder/decoder (reference)
-│   ├── rice_gpu.rs     GPU Rice encoder/decoder
-│   ├── rans.rs         CPU rANS encoder/decoder
-│   ├── rans_gpu_encode.rs  GPU rANS encoder
-│   ├── huffman_gpu.rs  GPU Huffman encoder
-│   ├── motion.rs       Motion estimation and compensation
-│   ├── cfl.rs          Chroma-from-Luma prediction
-│   ├── adaptive.rs     Adaptive quantization
-│   ├── fused_block.rs  Block DCT-8×8 mega-kernel
-│   └── ...
-├── decoder/
-│   ├── pipeline.rs     Decoder orchestration
-│   ├── frame_data.rs   Frame data upload
-│   └── gpu_work.rs     GPU dispatch
-├── shaders/            WGSL compute shaders
-│   ├── rice_encode.wgsl, rice_decode.wgsl
-│   ├── rans_encode.wgsl, rans_decode.wgsl
-│   ├── transform_97.wgsl, transform_53.wgsl
-│   ├── block_match.wgsl, motion_compensate.wgsl
-│   └── ...
-├── bench/              BD-rate, codec comparison, quality metrics
-└── experiments/        Experimental features
-
-tests/
-├── quality_regression.rs   Golden-baseline regression (q=25/50/75/90)
-├── conformance.rs          5 conformance bitstreams + corruption tests
-└── golden_baselines.toml   Reference PSNR/SSIM/bpp values
-```
+Stage-by-stage detail is in [`docs/PIPELINE.md`](docs/PIPELINE.md); the format is in
+[`docs/BITSTREAM_SPEC.md`](docs/BITSTREAM_SPEC.md).
 
 ## Documentation
 
-- [`docs/PIPELINE.md`](docs/PIPELINE.md) — Detailed encode pipeline description
-- [`docs/BITSTREAM_SPEC.md`](docs/BITSTREAM_SPEC.md) — Complete bitstream format specification (GP11 frame, GNV1 sequence)
-- [`RESEARCH_LOG.md`](RESEARCH_LOG.md) — Experiment log with hypotheses, results, analysis
+| | |
+|---|---|
+| [GOALS.md](GOALS.md) | rules, priorities, current state, non-goals — the source of truth |
+| [BASELINE.md](BASELINE.md) | every benchmark figure, with its caveats |
+| [BACKLOG.md](BACKLOG.md) | open items, each with its measurements attached |
+| [RESEARCH_LOG.md](RESEARCH_LOG.md) | every experiment, including the failures |
+| [`docs/POSITIONING.md`](docs/POSITIONING.md) | what GNC is for, and where it stands against the market |
+| [`docs/decisions/`](docs/decisions/) | why each choice was made, and what was rejected |
+
+**This file states the current position only.** Many figures here have been corrected or withdrawn
+along the way; that history is kept deliberately visible in BASELINE, RESEARCH_LOG and the decision
+records rather than in the front door.
 
 ## License
 
-All code is patent-free. No H.264/5/6 patent pool or MPEG-LA encumbered techniques. All dependencies are open source.
+Patent-free: no H.264/5/6 pool or MPEG-LA encumbered techniques. All dependencies are open source.

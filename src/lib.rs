@@ -738,8 +738,17 @@ pub const MIN_TILE_SIZE: u32 = 16;
 /// width, and an odd remainder would give none at all.** The padding tax itself ranges from 0.7%
 /// at 4320p to **29.7% at PAL**, so this is not a 1080p-shaped problem either.
 ///
-/// So the way out is not a tile size at all: it is **incomplete border tiles at full depth**, the
-/// way JPEG 2000 has them, which decouple tile size from frame size and allow both. That is an
+/// **The cheap way out is to pad to a multiple of `2^levels` rather than of `tile_size`.** Border
+/// tiles then merely become shorter while every extent stays a multiple of 32, so `half =
+/// extent / 2` keeps working and there is no odd-length arithmetic — and the tax falls from a 14.1%
+/// mean across common formats to **1.8%** (1080p: 20.9% -> 0.7%, since 1080 rounds to 1088 and the
+/// last tile row is 64 tall). This is what SMPTE ST 2042 (VC-2) does, rounding to `2^depth` and
+/// stripping the padding on decode, and what JPEG XR does at its 16x16 macroblock. **Padding is a
+/// recognised design; padding to a 256-sample tile is not** — VC-2 pads at most 31 samples per
+/// axis, GNC up to 255.
+///
+/// Removing the rest needs **incomplete border tiles at full depth**, the JPEG 2000 way, which
+/// decouples tile size from frame size entirely. That is an
 /// architecture change (tile origins, the tile grid, every shader deriving a position from
 /// `tile_size`, the per-tile CRC and seek structures), filed as **TILE-1**; the +81% above is
 /// what says it would be worth scoping.

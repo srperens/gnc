@@ -227,6 +227,68 @@ Two things fall out. **The tax is 0.7% to 29.7%, worst on the small and odd form
 where NTSC would get **one level over 47% of its rows** and a height of 1081 would leave an odd
 remainder, so zero halvings and no transform at all.
 
+### Then read what other wavelet codecs do, and both my answers were beaten
+
+Asked in review, and it changed the plan. Sourced research (2026-09-08), primary sources where
+reachable — OpenJPEG and SVT-JPEG-XS source, the BBC VC-2 conformance pseudocode, FFmpeg's VC-2
+encoder, Michael Adams' JPEG 2000 report. The T.800 text itself was **not** obtained, so its Annex
+F extension table and Annex B equation numbers are unverified.
+
+**1. JPEG 2000 and JPEG XS both clip and never pad, and J2K's trick is absolute coordinates.** A
+tile is the *intersection* of the grid cell with the image region — `tx1 = min(tx0 + XTsiz, Xsiz)`
+— and a tile-component is never re-based to zero, so subband bounds fall out of ceil-division on
+the reference grid: `tbx0 = ceil((tcx0 - 2^(nb-1)*xob) / 2^nb)`. OpenJPEG's line is literally
+`int64_ceildivpow2(tilec->x0 - (x0b << level_no), level_no + 1)`.
+
+**2. The arbitrary-length rule, which is what I would have to implement.** For a signal on the
+absolute interval `[i0, i1)`, lowpass samples are those at **even absolute coordinates**:
+`sn = ceil(i1/2) - ceil(i0/2)`, `dn = floor(i1/2) - floor(i0/2)`. With `i0` even that is
+`ceil(N/2)` / `floor(N/2)`; with `i0` odd the two swap. Extension is whole-sample symmetric about
+the boundary *samples*, and the GPU-friendly form is not pre-extension but **index clamping inside
+each lifting step** — each 9/7 step reaches only ±1 in the split domain, so clamping reproduces
+pre-extension exactly. `N = 1` has an explicit rule: on an even coordinate the sample passes
+through unchanged; on an odd one the forward transform is `Y = 2X`.
+
+**3. And the parity apparatus collapses for GNC.** Tile origins are multiples of 256, so the start
+coordinate is divisible by 2^5 and even at every level — J2K's `cas` is always 0 here. So Stage 2
+is the per-level `ceil` split plus the `N = 1` rule, not the general machinery.
+
+**4. No codec reduces the level count for a short border tile.** J2K transforms them at full depth
+and tolerates 1- and 2-sample subbands; empty subbands are legal and OpenJPEG has
+`opj_tcd_is_band_empty` for them. At 1080p the 56-row strip runs 56 → 28 → 14 → 7 → 4 → 2 and
+nothing degenerates. **So my Stage A — border tiles giving up levels — was solving a problem GNC
+inflicted on itself with `half = ts / 2u`.** Withdrawn.
+
+**5. My implication that no serious codec pads was wrong, and the correction points at a much
+cheaper fix.** **SMPTE ST 2042 (VC-2) pads** — it *defines* subband dimensions by rounding the
+picture up to `2^depth` (BBC conformance `subband_width`, clause 13.2.3) and strips the padding on
+decode (`idwt_pad_removal`, clause 15.4.5); FFmpeg's encoder does `FFALIGN(width, 1 << depth)` and
+zero-fills. **JPEG XR pads to its 16x16 macroblock** and crops with a windowing margin. So padding
+is recognised and defensible — **bounded by the transform.** VC-2 pads at most 31 samples per axis,
+JPEG XR at most 15; GNC pads up to 255, and *that* is what has no precedent.
+
+**Which hands over the stage I had not considered: pad to a multiple of `2^levels`, not of
+`tile_size`.** Same tile grid, border tiles merely shorter, every extent still a multiple of 32 —
+so `half = extent / 2` stays valid and there is no odd-length or parity work at all:
+
+| | pad to 256 (today) | pad to 32 |
+|---|---|---|
+| 1920x1080 | 20.9% | **0.7%** |
+| 2048x1080 | 15.6% | **0.7%** |
+| 720x576 (PAL) | **29.7%** | 2.2% |
+| 720x486 (NTSC) | 11.0% | 7.1% |
+| 1920x818 | 25.1% | 1.7% |
+| **mean over 9 formats** | **14.1%** | **1.8%** |
+
+**About 87% of the tax, for letting each tile's extent drive the arithmetic instead of the global
+tile size.** At 1080p the last tile row becomes 64 tall, which halves cleanly six times. That is
+now TILE-1 Stage 1, and full clipping is Stage 2 for the remaining 1.8%.
+
+One caveat the research raised and this entry can already answer: "20.9% of samples is not 20.9% of
+bits". Agreed, and it was measured rather than assumed — 6.6 points of BD-rate, `0034`. The other
+caveat stands as stated: VC-2 *zero*-fills its padding, which is worse than edge replication, so
+GNC's scheme was at least the better of the two padding variants even before PAD-1 improved it.
+
 **So the answer is not a tile size, nor a second tile size at the border, but dropping the
 divisibility requirement** — which is GNC's own (`transform_97.wgsl:67`, `let half = ts / 2u`) and
 not the wavelet's. A 9/7 lifting DWT works on any length with `ceil(N/2)` / `floor(N/2)` subbands,

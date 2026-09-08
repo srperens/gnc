@@ -141,7 +141,11 @@ the raw input buffer. Five chances of a silent per-path bug, to buy 0.19 points.
   q, and it mixes two effects, since tile 120 also means 144 tiles instead of 40 and therefore
   more per-tile overhead and more of ENT-6's code-block cold start. The margin is far too large
   for either to change the conclusion.
-- **Recovering the whole 6.6 points** — that needs partial border tiles the way JPEG 2000 has
+- **Recovering the whole 6.6 points.** Most of it turns out to be cheap, which was not known when
+  this record was first written: **padding to a multiple of `2^levels` instead of `tile_size`**
+  takes the tax from a 14.1% mean across common formats to 1.8% (1080p 20.9% -> 0.7%) with no
+  odd-length arithmetic, because every tile extent stays a multiple of 32. That is what VC-2 and
+  JPEG XR do. The rest needs partial border tiles the way JPEG 2000 has
   them, touching tile origins, the tile grid, every shader deriving a position from `tile_size`,
   and the per-tile CRC and seek structures. The ceiling above a fill change is 6.6, not 27.
   **This is what the tile-size row above actually argues for**: partial border tiles decouple tile

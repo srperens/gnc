@@ -4,6 +4,7 @@ pub mod bench;
 pub mod decoder;
 pub mod encoder;
 pub mod experiments;
+pub mod fingerprint;
 pub mod format;
 pub mod gpu_util;
 pub mod image_util;

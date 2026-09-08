@@ -81,6 +81,116 @@ the commit. Decision record: `docs/decisions/0077`.
 
 ---
 ---
+---
+
+## COORD-6 — a cheap mechanism does exist, and it is what the encoder produces rather than what it is (2026-09-08)
+
+**What was open.** COORD-4 priced the two obvious mechanisms against six instances of a number read
+against the wrong tree and **refused both** — a claim-time `HEAD` stamp catches 1, printing each
+claim's commit catches 0 — then shipped consolidated prose. COORD-6 asked one question: **is there a
+cheap mechanism, or is this an accepted cost of eight-session concurrency?** Both answers close it;
+a third round of prose does not.
+
+**Domain declaration.** A CLI subcommand and two lines in a harness. No encoder path is touched and
+the fingerprint of the shipped encoder is unchanged by this work — which the tool itself asserts,
+and is the neatest available demonstration of what it is for.
+
+### Instance 7 arrived while the item sat in the queue, after the prose was consolidated
+
+LOSSLESS-3 (`0070`) published a q=95/97/99 sequence table against a bit-exact q=100 column and
+concluded camera content is dominated from q=95 up. **Those lossy columns contain bit-exact
+I-frames** — RATE-3 put them there — so BUG-47 (`0072`) moved every one of them by roughly 1.8
+points hours later, while q=100 stayed put because there is no sibling at q=100. Its P1 conclusion
+survives; every margin is overstated. Found and reported by the RATE-3 session, flagged to
+LOSSLESS-3's owner rather than edited.
+
+Tally: **5 of 7 for the `main`-moved-under-a-table shape**, against 1 of 7 for the cross-session
+shape COORD-4 refused a tool for.
+
+**And it was caught before publication — by people, not by a mechanism**, which is the less
+convenient half and the one that shapes the decision. This session noticed BUG-47 moved the
+sibling's bytes and said so, the RATE-3 session relayed it, and LOSSLESS-3's owner re-took the
+sweep on `d10e414`. Nothing was published wrong. The re-take showed the stakes were not a stale
+margin either: bbb was the cell predicted to flip *toward* domination and moved the other way, from
+−1.9% as filed to ±0.00% at all six points with the trigger not firing at all.
+
+So the honest statement is **the class recurred after the prose was consolidated, and the prose plus
+one attentive peer was sufficient that once.** The mechanism below is justified on price — half a
+second — as a **backstop**, not because the peer chain failed.
+
+### The mechanism, and the measurement that says it is the right one
+
+```
+$ gnc fingerprint
+codec-fingerprint v1 700d5f8a  (10 configurations)
+```
+
+(`abf86a50` while this was written, `700d5f8a` one merge later — ENT-9 step 2 moved abac's output.
+Quoting a digest dates the quote, which is the point.)
+
+A pinned, versioned matrix of ten configurations — Rice/rANS/abac, 4:4:4 and 4:2:0, q=10/50/90/99/100,
+stills and 3-frame sequences at ki=2 — encoded and digested. **0.52 s**, against the minutes a real
+sweep costs. It runs the only honest test of "did the output move", which the item had assumed was
+too expensive to be the answer; it is not, at 384×384.
+
+**The proxy to beat is `shasum target/release/gnc`, which several harnesses already print — and the
+pair that beats it was produced while building this.** Adding an entire module and editing
+`main.rs` moved the binary hash from `94f25712…` to `333e2c62…` and left the fingerprint at
+`abf86a50`, because the encoder's output had not moved. A check that fires on every rebuild trains
+its reader to skip it.
+
+Sensitivity, against knobs whose effect was already measured elsewhere:
+
+| knob | does output move? | fingerprint |
+|---|---|---|
+| `GNC_REF_FROM_SOURCE=0` | **no** — 24 of 24 points byte-identical (`0072`) | **unchanged** |
+| `GNC_PAD_FILL=decay` | yes (`0039`) | changed |
+| `GNC_DEAD_ZONE=0.3` | yes (`0028`) | changed |
+| `GNC_REF_DEBLOCK=1` | yes | changed |
+
+Silent on the one knob known to be output-neutral, firing on all three known to move output. That
+is what the item's own suggested proxy — "did the merge touch `src/`?" — cannot be: `0045`'s
+diagnostic-only change is byte-identical with its env var unset, and a `src/` proxy warns on it.
+
+**Against the seven instances:** 2, 3, 5, 6 and 7 are published tables whose rows came from
+different encoders — caught, *if the rows carry the fingerprint*, which is why two harnesses were
+changed and not only the docs. 4 is a mid-sweep rebuild — caught mechanically by the before/after
+check, with no reader involved. 1 is the cross-session patched tree — caught, a patched encoder
+digests differently. Better than either refused tool on the same list, and that is the optimistic
+reading; the pessimistic one is that none of it fires unless a number carries the token.
+
+### Two things the implementation had to get right, and both were wrong first
+
+- **Determinism is the whole product**, so it is asserted rather than assumed:
+  `fingerprint_is_deterministic_and_every_row_is_a_distinct_sample` runs the matrix twice in one
+  process and compares every row.
+- **Every row must be a distinct sample.** The first input generator was hash noise, on which the
+  bit-exact candidate wins every frame — so the **q=99 and q=100 sequence rows coded to identical
+  bytes** and one of the ten configurations was measuring what another already had. The test fails
+  on a row collision, and **it fired again on the very next merge**: those two rows had differed on
+  the tree the matrix was written on and were identical one merge later. That is the assertion
+  earning its keep before the tool shipped.
+- **A "sequence" row must contain a P-frame, and a byte count cannot show that it does.** The input
+  frames were three different pictures, which fired the scene-cut detector every frame: both
+  sequence rows were **all-intra**, testing no inter path — and at q=99 every I-frame then keeps
+  the bit-exact sibling, which *is* `quality_preset(100)`, so those two rows were byte-identical for
+  a reason unrelated to either configuration. The input is now **one scene panned 3 px per frame**,
+  every row prints its composition (`2I+1P+0B`), and the test asserts at least three sequence rows
+  contain a P. `seq q100 ki9` reports `3I+0P` **on purpose** — LOSSLESS-2 re-codes a lossless
+  P-frame costing more than the previous I — and that is asserted separately, so the row is
+  coverage rather than an accident.
+
+  The content is integer-valued because BUG-45: a fractional source makes a lossless configuration
+  quietly lossy, and a fingerprint whose lossless rows were secretly lossy would measure that
+  instead.
+
+**Not made mandatory**, and deliberately: nothing enforces it and nothing should yet. The matrix's
+coverage is unproven outside the four knobs above, and a mandatory check believed past its range is
+worse than an optional one read with judgement.
+
+**Gates:** `cargo test --release` and both clippy targets. Decision `docs/decisions/0075`.
+
+---
 
 ## MEAS-11 — the abac ladder re-taken: +66.0% -> +61.0%, and ENT-9 flattened the decay (2026-09-08)
 

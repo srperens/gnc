@@ -3075,7 +3075,58 @@ frequency 1 everywhere the alphabet is uniform and the depth is 6). Both change 
 codebook, and therefore its bitstream, wherever clamping currently occurs. Not done for a parked
 coder.
 
-### COORD-6 — `main` moves under an in-flight measurement and nothing says so (todo, P4)
+### COORD-6 — `main` moves under an in-flight measurement and nothing says so (**ANSWERED 2026-09-08 — a mechanism exists and ships: `gnc fingerprint`**)
+
+**ANSWERED with a mechanism, not with prose. `gnc fingerprint`, `docs/decisions/0075`.**
+
+```
+$ gnc fingerprint
+codec-fingerprint v1 abf86a50  (10 configurations)
+```
+
+It encodes a pinned, versioned 10-configuration matrix and digests the bytes, so it answers *would
+this binary produce different output?* by running the encoder — **0.52 s**, against the minutes a
+real sweep costs. Two numbers carrying the same fingerprint are comparable; two carrying different
+ones are not. Print it beside the numbers (instances 2, 3, 5, 6, 7 of COORD-4's table) and take it
+before *and* after a sweep so a mid-run rebuild is a refusal (instance 4). `scripts/fingerprint.py`
+is the harness helper; `scripts/meas_rate4.py` and `scripts/rate4_ref_source_gate.py` do both
+already; a bare shell loop needs no helper and COORDINATION shows the two lines.
+
+**Each difficulty this entry listed, answered:**
+
+- *"the only honest test is running the thing twice"* — **yes, and that is what this is.** The trick
+  is running it on a 384×384 matrix instead of a 12-point 1080p sweep.
+- *"a `src/`-touched proxy over-warns"* — it does, and so does hashing the binary. Measured while
+  building this: a whole new module moved `shasum` from `94f25712…` to `333e2c62…` and left the
+  fingerprint unchanged, because output had not moved. It is also **silent** under
+  `GNC_REF_FROM_SOURCE=0` (byte-identical by measurement, `0072`) and **fires** under
+  `GNC_PAD_FILL`, `GNC_DEAD_ZONE` and `GNC_REF_DEBLOCK`.
+- *"it cannot live in `scripts/claim`"* — it does not. It is a CLI subcommand and two lines in a
+  harness.
+- *"the measurement is usually a shell loop"* — one `grep -o 'v1 [0-9a-f]*'` before and after.
+
+**A seventh instance arrived while this sat in the queue**, after COORD-4's prose was consolidated
+onto `main`: LOSSLESS-3's lossy columns (`0070`) hold bit-exact I-frames, which BUG-47 (`0072`)
+moved by ~1.8 points hours later while its q=100 column stayed put. The tally is now **5 of 7 for
+the `main`-moved-under-a-table shape** against 1 of 7 for the cross-session shape COORD-4 refused a
+tool for.
+
+**It was caught before publication, by people rather than by a mechanism, and that is the half that
+shapes this answer.** The RATE-4 session noticed BUG-47 moved the sibling's bytes, the RATE-3
+session relayed it, and LOSSLESS-3's owner re-took the sweep on `d10e414` — nothing was published
+wrong, and the re-take showed the stakes were not a stale margin: bbb was the cell predicted to flip
+*toward* domination and moved the other way, −1.9% as filed to ±0.00% with the trigger not firing.
+So: **the class recurred, and the prose plus one attentive peer was enough that once.** The
+mechanism ships on price — half a second — as a **backstop for that chain, not a replacement for
+it**, and the case for closing answered-no was real rather than a straw man.
+
+**What it does not do**, because a check believed past its range is worse than none: it cannot say
+*why* two fingerprints differ; it says nothing about a path outside its matrix (entropy coder,
+chroma format, the lossless boundary, inter — not exhaustive, and the output says so every time);
+it protects only numbers that carry it; and the matrix is **pinned**, so changing it is a decision
+record and not a commit.
+
+**Original filing follows.**
 
 **Filed as an open question, not as work, which is the whole point of the heading.** COORD-4
 counted six instances of a number being read against the wrong tree and refused the tool it was
@@ -3111,7 +3162,7 @@ someone reads this, close it as answered-no and cite COORD-4's table.
 
 **The doubt attached to this item at filing was the right one, and the measurement it asked for
 settles it — but not by rarity.** The class is the most frequent measurement failure in the repo
-right now: **six instances**, five of them in the two days of eight-session concurrency.
+right now: **seven instances** (a seventh was found by COORD-6 — see below), six of them in the two days of eight-session concurrency.
 
 | # | instance | shape | caught by a claim-time stamp? |
 |---|---|---|---|
@@ -3121,12 +3172,20 @@ right now: **six instances**, five of them in the two days of eight-session conc
 | 4 | the build-artefact near-miss — rebuild during a 36-run sweep | own `target/` | no |
 | 5 | ARCH-3 / BUG-18 (2026-09-07) — `main` moved mid-item | `main` moved | no |
 | 6 | quarter-pel #15 (2026-03-09) — "−0.63 dB vs stale baseline `617d8e6`" | stale record | no |
+| 7 | LOSSLESS-3 / `0070` (2026-09-08) — lossy columns hold bit-exact I-frames that BUG-47 moved hours later | `main` moved, between filing and reading | no |
 
 **Both candidate shapes are refused on these numbers.** `claim measured` (stamp `HEAD` + dirty bit)
-would have caught **1 of 6** — only the cross-session one. Printing each claim's commit in
-`claim list` would have caught **0 of 6**: a claim's commit is not a measurement's commit, and
+would have caught **1 of 7** — only the cross-session one. Printing each claim's commit in
+`claim list` would have caught **0 of 7**: a claim's commit is not a measurement's commit, and
 instance 1's difference was uncommitted anyway. Five of six are one session's own table decaying
 because `main` moved under it, which no claim-time stamp can see.
+
+**Superseded in its conclusion by COORD-6 (`docs/decisions/0075`), which found the mechanism this
+item could not.** COORD-4 was right to refuse *both tools it priced* and right that the failure is
+frequent; it was wrong that consolidation was the answer, and instance 7 above is the proof — it
+happened after the consolidated section was on `main`. The mechanism is `gnc fingerprint`: encode a
+pinned matrix, digest the bytes, 0.52 s. It is not a proxy for an output change, it *is* the output
+change, which is the property both tools priced here lacked.
 
 **What the evidence supports instead, and it is shipped:** the rule was already written **four
 times on one afternoon, by four sessions, under four names** — this entry's own COORDINATION

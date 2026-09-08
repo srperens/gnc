@@ -13279,3 +13279,114 @@ GNC and a driver new enough for NVENC.
   copied to a policy-allowed path to run at all. And if `CARGO_TARGET_DIR` is set, the harness's
   default `target/release/gnc.exe` is not where the binary lands; pass `--binary` explicitly at
   whatever the redirected target dir is.
+
+## 2026-09-08 — MEAS-6 second pass: the default stopped being the B-pyramid two days ago, and three documents did not notice
+
+### What was actually wrong
+
+MEAS-6's first pass (2026-09-06) concluded *"GNC's default configuration sits in the
+low-latency-HEVC band, not the JPEG XS band."* That was true when written. Later the same day, on
+that very finding plus BUG-5's rate numbers, `quality_preset()` was changed to veto the pyramid
+(`src/lib.rs:1021`, `b_pyramid: … .unwrap_or(false)`). **The item's own conclusion was invalidated
+by the change the item caused**, and POSITIONING §3, README and MEAS-6's BACKLOG entry carried the
+dead claim until today.
+
+**GNC's default latency is ~80 ms, not ~240 ms**, and ~80 ms is *below* the low-latency-HEVC band
+(EBU floor 120 ms) rather than inside it. `docs/decisions/0033`.
+
+### Verified from the encoder, not from the source
+
+Default `ki=9`, current build, 18 frames, old_town_cross:
+
+| configuration | frame mix | canary on stderr | reordering delay |
+|---|---|---|---|
+| `-q 75` (default) | `2I+16P+0B` | `B-pyramid suppressed … zero reordering latency` | **0 frames** |
+| `GNC_B_PYRAMID=1` | `2I+2P+14B` | silent | **8 frames** = 160 ms @ 50 fps |
+
+### The rate matrix, and why it is a canary and not a result
+
+3 sequences x 2 quality points x pyramid on/off, 18 frames, ki=9, 4:4:4, Rice. `canary` is the
+count of `B-pyramid suppressed` lines — 1 for default, 0 for pyramid, in all 12 runs:
+
+| sequence | q | default bpp / PSNR | pyramid bpp / PSNR | mix (default → pyramid) |
+|---|---|---|---|---|
+| old_town_cross | 75 | 5.77 / 37.32 | 5.06 / 36.86 | `2I+16P+0B` → `2I+2P+14B` |
+| old_town_cross | 90 | 13.14 / 49.63 | 11.99 / 48.20 | ″ |
+| crowd_run | 75 | 5.89 / 37.88 | 5.50 / 37.47 | ″ |
+| crowd_run | 90 | 13.18 / 49.64 | 12.24 / 48.21 | ″ |
+| bbb_extended | 75 | 2.02 / 40.29 | 1.46 / 41.59 | ″ |
+| bbb_extended | 90 | 6.63 / 50.29 | 4.94 / 49.48 | ″ |
+
+**This does not say the pyramid saves rate, and reading it that way is the trap.** At *matched q*
+the pyramid is both cheaper and worse on 5 of 6 points — lower bpp *and* lower PSNR — so the
+columns are not comparable. Only a matched-quality comparison answers the rate question, and BUG-5
+already ran it: +5.7 to +19.7% on old_town, +0.8 to +7.3% on touchdown, +4.0 to +26.7% on
+speed_bag, against −34 to −39% (a win) on animation. bbb_extended is the animation row here and is
+the one point where the pyramid improves PSNR *and* bpp together, which is consistent with BUG-5's
+content split. The matrix is recorded as proof that both code paths are live and distinct, which
+is what MEAS-6 needed; it is not re-litigating BUG-5.
+
+**VMAF is deliberately absent from that table.** The parse failed (the CLI prints
+`VMAF: computing... mean=…`, not `VMAF: …`), and by the time it was noticed there was a better
+reason to leave it out — see BUG-36 below, which was found in the same code path and would have
+made any concurrently-taken VMAF number untrustworthy anyway.
+
+### BUG-36 — concurrent `--vmaf` runs scored each other's frames (found and FIXED today)
+
+Reading the VMAF path turned up every call site writing its reference and distorted Y4M to a
+**fixed** filename under `std::env::temp_dir()`. `TMPDIR` is per user, not per process, and this
+project's documented working mode is **eight sessions on one machine**.
+
+Measured, `benchmark-sequence --vmaf`, 9 frames, q=75, ki=9. Serial scores are bit-stable across
+repeated invocations, which is the control:
+
+| run | old_town_cross | bbb_extended |
+|---|---|---|
+| serial, twice | 97.39 | 95.91 |
+| concurrent, twice | 97.39 | **97.19** (+1.28) |
+| concurrent, once | **96.37** (−1.02) | 95.91 |
+
+**Exactly one of the pair is wrong in every concurrent run**, in whichever direction the race
+decided, by 1.02–1.28 points against the **>0.5-point BLOCK threshold** — 2–2.5x, caused by
+nothing but another session existing. It is silent and the wrong value is plausible; 97.19 reads
+as an ordinary score. VMAF is the lead metric at q≤85.
+
+Fixed by routing all nine sites through `gnc::session_temp_path()`, which stamps the process id in.
+**Same canary after the fix: 6 of 6 concurrent runs return the serial values exactly**, against 3
+of 6 before. `tests/temp_path_collision.rs` scans `src/` and fails on any `temp_dir()` outside the
+helper, so it cannot come back as a literal.
+
+**Nothing is retracted.** No run records whether another session was in its VMAF window, so this
+cannot be reconstructed after the fact. What bounds it: the filenames are per-subcommand, so
+`benchmark` and `benchmark-sequence` never collided with each other; only overlapping VMAF windows
+do damage; and rate figures are untouched because bytes are bytes. `rd-curve --vmaf` is the
+highest-risk caller, scoring every quality point inside one long-lived process.
+
+### BUG-37 — `benchmark-sequence` without `-q` still codes the pyramid (filed, not fixed)
+
+`benchmark-sequence`'s quality argument is `Option<u32>` with **no default** (`src/main.rs:515`),
+where `benchmark`, `encode-sequence` and `benchmark-suite` all default to 75. `quality_preset()` is
+the only place the veto lives, so without `-q` the command falls through to `CodecConfig::default()`
+— `b_pyramid: true` — and codes `2I+2P+14B`. Verified both ways.
+
+**No recorded measurement is contaminated:** all five `scripts/` harnesses that invoke
+`benchmark-sequence` pass `-q`. Filed rather than fixed because the obvious one-line fix
+(`default_value = "75"`) leaves the mechanism in place, and the alternative — flipping
+`CodecConfig::default()` — would leave `pipeline_tests.rs:87` and `:278` passing while silently
+no longer testing the B-frame path, which is worse than the bug.
+
+### What was not done, and why
+
+**The ~80 ms coding time was not re-taken.** It is a 2026-09-06 reading on a non-idle machine,
+labelled M1 when the box was the M5 Pro (BUG-29), and re-taking it on an idle machine is MEAS-6's
+cheapest remaining step. The machine sat at load 21–39 all session with two other sessions running
+the test suite; BASELINE's own rule is that a run taken during a `cargo test` reads 20% slow. The
+240→80 ms correction does not depend on it — the part that moved is the reordering delay, which is
+0 or 8 frames and immune to load. Glass-to-glass remains unmeasured and needs instrumentation
+nobody has.
+
+**MEAS-5 was claimed first and dropped without measuring**, for the same reason plus hardware: its
+"fix this first" blocker had already been resolved on 2026-09-06 (BASELINE's A/B/C), and what is
+left needs a discrete NVIDIA card with driver 610+/nvenc 13.1 or an idle Mac. Its entry was
+corrected and it is parked as `blocked-idle-machine-or-nvenc` so it stops being handed to every
+fresh session as the top P0.

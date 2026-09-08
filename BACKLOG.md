@@ -1261,7 +1261,57 @@ CLAUDE.md's portability prose corrected either way.
 **Why P2.** Same reasoning as BUG-31 — no measurement is invalidated and nothing fails on this
 machine — but the affected claim is a documented project rule, and step 1 may well be free.
 
-### BUG-35 — five more compute entry points are over the workgroup budget, one on the default encode path (todo, P2)
+### BUG-35 — five more compute entry points are over the workgroup budget; the default path is done, the rANS half is not (todo, P2)
+
+**The default encode path is off the over-budget entry point, and the histogram it was computing
+turned out to be dead work.** `quantize_histogram_fused.wgsl` gained
+`main_quantize_only` — same quantiser, no `shared_hist`, **3264 B measured** against `main`'s
+23800 B — and the histogram pipeline is now created **lazily**, because it is pipeline *creation*
+a conformant WebGPU implementation refuses, not dispatch. On a Rice encode it is never created.
+
+**The histogram had exactly one consumer** — the rANS batch encoder's
+`encode_3planes_skip_histogram` — and the entropy branch tests Rice first, so the Rice path never
+reached it. Everywhere else the shader was filling a 20 KB workgroup histogram with atomics,
+writing it to device memory, and nobody read it. Counted, not argued (`GNC_PROFILE`):
+
+| configuration | fused dispatches | of which with histogram |
+|---|---|---|
+| q=90 / q=100, Rice, 4:4:4 (**the default**) | 3 | **0** |
+| q=90, Rice, 4:2:0 | 3 | **0** |
+| q=15, rANS, 4:4:4 | 3 | **3** |
+| q=15, rANS, 4:2:0 | 3 | **0** |
+| q=50 / q=70 (CfL on, no fusion) | 0 | 0 |
+| q=90, abac | 0 | 0 |
+
+**Invalidates no measurement: 10 of 10 encodes byte-identical** before and after — Rice
+q=50/90/100 4:4:4, Rice q=90 4:2:0, q=15, `--rans` q=50 and q=70, `--abac` q=90, and sequences at
+ki=1 and ki=9. The Rice arm being identical *is* the proof the histogram was dead. Permanent canary:
+`fused_qh_does_not_build_the_histogram_pipeline_on_the_default_path` asserts zero histogram
+dispatches on Rice **and** that the quantise path ran, so it cannot pass by asserting nothing —
+byte-identity alone would not have caught a flag stuck at `true`. Decision `0035`.
+
+**What is still open, and it is the harder half.** `main` is unchanged at 23800 B, so rANS at
+4:4:4 still creates an over-budget pipeline and still cannot run in a browser. Shrinking
+`shared_hist` to fit needs the arena from 5120 to <=3266 entries — and **that makes an existing
+hazard worse:**
+
+> `total_hist_entries` is the sum of up to 12 per-group alphabets, each clamped at
+> `MAX_GROUP_ALPHABET = 4096`, so it can reach 49152. **Nothing compares it to 5120.**
+> `atomicStore`/`atomicAdd` past the end are clamped by naga's bounds policy, so an overflow
+> silently corrupts frequencies instead of failing. A smaller arena overflows sooner, so **the
+> guard has to come first.** Worth knowing: the neighbouring rANS *encode* shader does have such a
+> guard, on the host, and it says "tile 13 needs 6658 cumfreq entries but the encode shader's
+> workgroup table holds 4097". The fused histogram arena has no equivalent.
+
+So the order for the rest of this item is: **guard the arena, measure how large it actually gets,
+then size it.** Two more findings from the sweep worth carrying: `rans_decode.wgsl:main` and
+`rans_encode_lean.wgsl:main` both sit at **exactly 16384 B** — inside the budget with zero
+headroom, so any addition to either is an instant defect — and `rans_encode.wgsl:main` is at
+**16388 B**, over by 4.
+
+Original entry follows.
+
+#### BUG-35, as originally filed
 
 Found 2026-09-08 by `tests/workgroup_storage_limit.rs`, the check written for BUG-31. That item
 was filed as "abac's two GPU shaders"; the sweep found **nine** entry points over budget across

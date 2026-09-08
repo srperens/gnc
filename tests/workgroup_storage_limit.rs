@@ -94,6 +94,7 @@ fn every_compute_entry_point_fits_the_requested_workgroup_budget() {
     let mut seen_known: Vec<(&str, &str, u32)> = Vec::new();
     let mut checked = 0usize;
     let mut worst = (0u32, String::new());
+    let mut notable: Vec<(String, String, u32)> = Vec::new();
 
     for path in shader_paths() {
         let src = std::fs::read_to_string(&path).expect("read shader");
@@ -102,6 +103,9 @@ fn every_compute_entry_point_fits_the_requested_workgroup_budget() {
             checked += 1;
             if bytes > worst.0 {
                 worst = (bytes, format!("{name}:{ep}"));
+            }
+            if bytes >= 1024 {
+                notable.push((name.clone(), ep.clone(), bytes));
             }
             let known = KNOWN_OVER_BUDGET
                 .iter()
@@ -149,6 +153,12 @@ fn every_compute_entry_point_fits_the_requested_workgroup_budget() {
         worst.1,
         worst.0
     );
+    // The shaders that actually use workgroup memory, so a change in any of them is visible in
+    // the test log rather than only when it crosses the budget.
+    println!("entry points using >= 1 KiB:");
+    for (name, ep, bytes) in &notable {
+        println!("  {bytes:>6} B  {name}:{ep}");
+    }
 
     assert!(
         problems.is_empty(),

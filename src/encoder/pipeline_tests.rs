@@ -3810,3 +3810,50 @@ fn test_scene_cut_disabled_at_zero_threshold() {
     );
 }
 
+
+/// BUG-35: the default encode path must not dispatch the over-budget histogram entry point.
+///
+/// Byte-identical output cannot prove this on its own — a `write_histogram` flag stuck at `true`
+/// would also be byte-identical, because the histogram phases only ever *read* the quantised
+/// buffer and write `hist_output`, which nothing but the rANS batch encoder reads. So the check has
+/// to be a count, and it has to be a test rather than the `GNC_PROFILE` print, so that a later
+/// change to the branch order cannot quietly put the 23800 B pipeline back on the default path.
+///
+/// Rice with 4:4:4 and CfL off is the contribution operating point (q > 85): fusion is on, three
+/// planes are dispatched, and none of them needs frequency tables.
+#[test]
+fn fused_qh_does_not_build_the_histogram_pipeline_on_the_default_path() {
+    let ctx = GpuContext::new();
+    let mut enc = EncoderPipeline::new(&ctx);
+
+    let w = 256u32;
+    let h = 256u32;
+    let frame = make_gradient_frame(w, h, 42.0);
+
+    let config = CodecConfig {
+        use_fused_quantize_histogram: true,
+        gpu_entropy_encode: true,
+        per_subband_entropy: true,
+        entropy_coder: crate::EntropyCoder::Rice,
+        cfl_enabled: false,
+        quantization_step: 4.0,
+        ..Default::default()
+    };
+
+    let (before_qo, before_hist) = enc.fused_qh.dispatch_counts();
+    let _ = enc.encode(&ctx, &frame, w, h, &config);
+    let (after_qo, after_hist) = enc.fused_qh.dispatch_counts();
+
+    assert_eq!(
+        after_hist, before_hist,
+        "the Rice path dispatched the histogram entry point {} time(s); it is 23800 B against a \
+         {} B device and nothing on this path reads its output",
+        after_hist - before_hist,
+        wgpu::Limits::default().max_compute_workgroup_storage_size
+    );
+    assert!(
+        after_qo > before_qo,
+        "the fused quantise path did not run at all ({before_qo} -> {after_qo}), so this test \
+         asserted nothing — check that fusion is still enabled for this configuration"
+    );
+}

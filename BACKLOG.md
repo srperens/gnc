@@ -3736,7 +3736,36 @@ falls while q rises (MEAS-9's harness now does). And for a 10-bit target the ext
 itself was never the problem. Harness: `scripts/meas_rate1_precision.py`, measured at `fa32a26`.
 Numbers in RESEARCH_LOG.
 
-### BUG-39 — `q=100` video: three causes fixed, 12.45 → 51.54 dB, still not bit-exact (todo, P1)
+### BUG-39 — `q=100` video is bit-exact on every frame (**FIXED 2026-09-08**)
+
+**Four causes, all fixed. 48 of 48 frames md5-identical to their source**, verified outside the
+harness through the real container (`encode-sequence` → `.gnv` → `decode-sequence`), 3 sequences
+× ki=2 and ki=9 × 8 frames. The success criterion as filed is met.
+
+| | 12.45 dB | → 26.30 (`0042`) | → 51.54 (`0054`) | → **bit-exact** (`0064`) |
+|---|---|---|---|---|
+| cause 1 | encoder's local decode inverted a transform it had not used | ✓ | | |
+| cause 2 | P-frames advertised a transform they had not used | ✓ | | |
+| cause 3 | zero-level `forward` wrote nothing — P-frames carried the previous frame's buffer | | ✓ | |
+| cause 4 | quarter-pel prediction is fractional and cannot survive a step-1.0 quantiser | | | ✓ |
+
+**Cause 4's fix:** motion vectors are rounded to full-pel when `config.is_lossless()`, in place,
+where the vector field is final — so MC and the MV entropy coding cannot disagree. The **decoder
+is unchanged**: full-pel vectors take `bilinear_ref`'s exact-sample path. Costs **+1.83% of bytes
+on average, +2.97% worst** (`GNC_LOSSLESS_FULLPEL=0` is the sub-pel arm), and q=99 is identical to
+the byte on all six points.
+
+**Canary:** `lossless_sequence_is_bit_exact_on_every_frame`, which cannot pass with sub-pel
+vectors, and which prints the sub-pel arm's failure without asserting it.
+
+**Not covered, both stated rather than discovered later:** 4:2:0 (chroma-domain MC box-filters,
+fractional by construction, and 4:2:0 is not a lossless format), and B-frames (bidir MC averages
+two predictions, so `(p₀+p₁)/2` is half-integer even at full-pel — off by default).
+
+**The rate question that falls out is LOSSLESS-2**, now with an exact comparison at identical
+pixels rather than a BD-rate estimate.
+
+### BUG-39 — `q=100` video: three causes fixed, 12.45 → 51.54 dB (superseded 2026-09-08)
 
 **Third cause found and fixed, and it was not the one `0042` predicted.** `docs/decisions/0054`;
 numbers in RESEARCH_LOG. 3 sequences, 8 frames, ki=2 and ki=9, 4:4:4, shipped defaults — inter
@@ -3776,18 +3805,20 @@ same PNG four times) codes `q=100` P-frames bit-exact at 3 198 bytes **before** 
 `all_skip_tiles=120/120`, so it went down the motion-skip path and never asked the transform for
 anything. A zero-residual probe cannot test a residual path.
 
-### LOSSLESS-2 — at `q=100` the inter path costs 36% more than all-intra (todo, P2)
+### LOSSLESS-2 — at `q=100` inter costs +38% on camera content and wins 1.6% on animation (todo, P2)
 
-**Measured, not argued.** crowd_run, 4 frames, ki=2, `q=100`, after BUG-39's cause-3 fix:
+**Measured at identical pixels, which is the cleanest form this comparison can take.** Both arms
+are bit-exact since BUG-39 closed, so this is exact bytes at equal quality, not a BD-rate
+estimate. 8 frames, ki=2, `q=100`:
 
-| | bytes |
-|---|---|
-| I+P | **17 584 089** |
-| all-intra | 12 932 312 |
+| | I+P | all-intra | |
+|---|---|---|---|
+| crowd_run | 35 712 641 | 25 855 950 | **+38.1%** |
+| old_town_cross | 35 209 443 | 25 246 827 | **+39.5%** |
+| bbb | 25 484 805 | 25 899 452 | **−1.6%** |
 
-**+36%, and the P-frames are not bit-exact either** (51.5 dB against the I-frames' `inf`). Before
-the fix the same comparison read −12%, but that saving was bought by transmitting a stale buffer
-instead of the residual, so it was never real.
+Before BUG-39's cause-3 fix the same comparison read −12%, but that saving was bought by
+transmitting a stale buffer instead of the residual, so it was never real.
 
 **Why it goes this way.** With no quantiser to discard anything, a quarter-pel MC residual is
 noise-like and costs more to code than the MED-predicted frame it replaces. This extends
@@ -3798,8 +3829,13 @@ worst-frame) — past the wash into a loss.
 (per frame, on an RD decision, or per sequence)? It bears on a GOALS §1 row, and the honest
 answer may be that `q=100` video is all-intra by construction — which is what FFV1 does.
 
-**Not startable before BUG-39's cause 4**, because rounding the prediction changes the residual
-and therefore this number. Take it after, or take both.
+**Startable now** — BUG-39 is closed and these numbers are taken after it.
+
+**The likely answer, and what would settle it:** the split is the same one the B-pyramid decision
+found (`0023`) — animation wins, camera content loses — so a per-sequence or per-frame RD choice
+between "code this P-frame" and "code an I-frame instead" is the shape of the fix, and the
+all-intra byte count is already computed by `benchmark-sequence`. FFV1, the codec GNC loses to at
+lossless, is all-intra by construction.
 
 ### BUG-39 — `q=100` video: two causes fixed, 12.45 → 26.30 dB (superseded 2026-09-08)
 

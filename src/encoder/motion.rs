@@ -187,6 +187,8 @@ pub struct MotionEstimator {
     /// MV scaling pipeline — derives chroma MVs from luma MVs via arithmetic right-shift.
     mv_scale_pipeline: wgpu::ComputePipeline,
     mv_scale_bgl: wgpu::BindGroupLayout,
+    mv_round_pipeline: wgpu::ComputePipeline,
+    mv_round_bgl: wgpu::BindGroupLayout,
     /// Pyramid ME: 4× average downscale of a luma plane.
     downsample_4x_pipeline: wgpu::ComputePipeline,
     downsample_4x_bgl: wgpu::BindGroupLayout,
@@ -469,6 +471,45 @@ impl MotionEstimator {
                     cache: None,
                 });
 
+        // --- Full-pel MV rounding pipeline (lossless configurations only) ---
+        // Sub-pel vectors make the prediction fractional, and a fractional prediction cannot
+        // survive a step-1.0 quantiser. See mv_round_fullpel.wgsl (BUG-39 cause 4).
+        let mv_round_shader = ctx
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("mv_round_fullpel"),
+                source: wgpu::ShaderSource::Wgsl(
+                    include_str!("../shaders/mv_round_fullpel.wgsl").into(),
+                ),
+            });
+
+        // 2 bindings: uniform params, mvs (rw, rounded in place).
+        let mv_round_bgl = ctx
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("mv_round_bgl"),
+                entries: &[bgl_uniform(0), bgl_storage_rw(1)],
+            });
+
+        let mv_round_pl = ctx
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("mv_round_pl"),
+                bind_group_layouts: &[&mv_round_bgl],
+                push_constant_ranges: &[],
+            });
+
+        let mv_round_pipeline =
+            ctx.device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("mv_round_pipeline"),
+                    layout: Some(&mv_round_pl),
+                    module: &mv_round_shader,
+                    entry_point: Some("main"),
+                    compilation_options: Default::default(),
+                    cache: None,
+                });
+
         // --- Pyramid ME: 4× downsample ---
         let downsample_4x_shader =
             ctx.device
@@ -566,6 +607,8 @@ impl MotionEstimator {
             split_bgl,
             mv_scale_pipeline,
             mv_scale_bgl,
+            mv_round_pipeline,
+            mv_round_bgl,
             downsample_4x_pipeline,
             downsample_4x_bgl,
             mv_spread_4x_pipeline,
@@ -2227,6 +2270,65 @@ impl MotionEstimator {
             .collect();
         ctx.queue
             .write_buffer(buf, 0, bytemuck::cast_slice(&i32_data));
+    }
+
+    /// Round every motion vector to full-pel, in place (BUG-39 cause 4).
+    ///
+    /// Only a lossless configuration should call this. A sub-pel vector makes
+    /// `motion_compensate.wgsl` interpolate, the prediction comes out fractional, and the
+    /// residual then cannot survive a step-1.0 quantiser — 51.5 dB instead of bit-exact. At
+    /// full-pel the interpolator returns a reference sample unchanged.
+    ///
+    /// The decoder needs no counterpart: it uses the vectors the bitstream carries, so it takes
+    /// the same exact path. Which also means calling this changes the *bitstream*, not the
+    /// decoder — the vectors it codes are simply all multiples of 4.
+    pub fn dispatch_mv_round_fullpel(
+        &self,
+        ctx: &GpuContext,
+        cmd: &mut wgpu::CommandEncoder,
+        mvs: &wgpu::Buffer,
+        total_blocks: u32,
+    ) {
+        #[repr(C)]
+        #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+        struct MvRoundParams {
+            total_blocks: u32,
+            _pad: [u32; 3],
+        }
+        let params = MvRoundParams {
+            total_blocks,
+            _pad: [0; 3],
+        };
+        let params_buf = ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("mv_round_params"),
+                contents: bytemuck::bytes_of(&params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+
+        let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("mv_round_bg"),
+            layout: &self.mv_round_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: mvs.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut pass = cmd.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("mv_round_pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.mv_round_pipeline);
+        pass.set_bind_group(0, &bg, &[]);
+        pass.dispatch_workgroups(total_blocks.div_ceil(256), 1, 1);
     }
 
     /// Scale motion vectors for chroma subsampling by arithmetic right-shift.

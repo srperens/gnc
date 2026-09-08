@@ -3686,6 +3686,50 @@ impl EncoderPipeline {
             );
         }
 
+        // BUG-39 cause 4: a lossless configuration has to predict from integers.
+        //
+        // `motion_compensate.wgsl` interpolates the reference bilinearly at quarter-pel, so a
+        // sub-pel vector makes the prediction fractional, the residual `cur - pred` fractional
+        // with it, and `res_qstep` is 1.0 here — so the quantiser rounds the one thing that must
+        // not be rounded. Measured before this: `q=100` P-frames at 51.5 dB with the residual
+        // *exactly* zero wherever the vector happened to land on full-pel (an 8-px integer-shift
+        // sequence read 75.6 dB, and its non-full-pel blocks were the entire error).
+        //
+        // Rounding here rather than in the search: this is the point where the vector field is
+        // final for *both* consumers — MC below and the MV entropy coding later — so there is one
+        // place to change and no way for the two to disagree. It costs prediction quality (the
+        // sub-pel refinement in `block_match_split.wgsl` is thrown away), which is a real trade
+        // and is why it is gated on the configuration rather than applied always.
+        //
+        // The decoder is unchanged and needs to be: it uses the vectors the bitstream carries, so
+        // full-pel vectors take `bilinear_ref`'s exact-sample path there too.
+        //
+        // `GNC_LOSSLESS_FULLPEL=0` restores sub-pel vectors for measurement — the arm that says
+        // what full-pel costs in rate.
+        let lossless_fullpel = config.is_lossless()
+            && std::env::var("GNC_LOSSLESS_FULLPEL").map(|v| v != "0").unwrap_or(true);
+        if lossless_fullpel {
+            self.motion.dispatch_mv_round_fullpel(
+                ctx,
+                &mut cmd,
+                &split_mv_buf,
+                bufs.split_total_blocks,
+            );
+            // Canary (CLAUDE.md, "No silent features"): says the path ran and on how many
+            // vectors, so "the gate never fired" and "it fired and did nothing" stay distinct.
+            // The stronger canary is `lossless_sequence_is_bit_exact_on_every_frame`, which
+            // asserts the property this exists for.
+            static FULLPEL_PRINTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            FULLPEL_PRINTED.get_or_init(|| {
+                eprintln!(
+                    "GNC: lossless MC — motion vectors rounded to full-pel ({} blocks/frame), \
+                     because a fractional prediction cannot survive a step-1.0 quantiser \
+                     (BUG-39). GNC_LOSSLESS_FULLPEL=0 restores sub-pel.",
+                    bufs.split_total_blocks
+                );
+            });
+        }
+
         // 4:2:0 chroma-domain MC: scale luma MVs → chroma MVs once before the plane loop.
         // Both chroma planes (Co, Cg) share the same scaled MV buffer.
         // For 4:2:2 and 4:4:4, this is skipped (luma-domain MC used instead).

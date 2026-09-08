@@ -127,6 +127,12 @@ on a non-idle machine: GPU encode phase 12.2 fps, end to end 5.0 fps.
   on every entropy coder (Rice, rANS, default), verified on two 1080p images: max error 0, zero
   wrong pixels. At 1.99:1 it beats JPEG 2000 lossless by 10.8% and PNG by 7.8%, and loses to FFV1
   by 27% and x264 `-qp 0` by 43% — both of which use spatial prediction
+- ~~Lossless is a *still* claim: `q=100` sequences decode their P-frames at 12–51 dB~~ — **closed
+  2026-09-08 (BUG-39, four causes, `docs/decisions/0042`, `0054`, `0064`).** A `q=100` 4:4:4
+  sequence is now bit-exact on every frame, verified outside the harness with raw-RGB md5 through
+  the container on 48 frames at ki=2 and 9. **B-frames and 4:2:0 are still not bit-exact**, each
+  for one stated reason (bidir MC averages two predictions; chroma-domain MC box-filters), and
+  at `q=100` inter coding costs +38% against all-intra on camera content (LOSSLESS-2)
 
 ## 4. Where We Stand & Goals
 

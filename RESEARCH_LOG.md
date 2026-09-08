@@ -4,6 +4,142 @@
 
 ---
 
+## RATE-2 — the top of the lossy ladder now codes both ways and keeps the smaller: −21.66% at q=99, bit-exact on 12 of 20 points (2026-09-08)
+
+**Hypothesis.** On every photographic image measured, above q≈95–98 the wavelet ladder spends more
+bytes than GNC's own MED lossless path *and* delivers worse pixels. If that reproduces on the
+current tree, the fix is not a tuning change but a comparison the encoder never makes: code both
+and keep the smaller.
+
+**Success criteria, set before implementing.** The chosen file must never be larger than either
+candidate at any q; the output must be **bit-exact, verified outside the harness**, wherever the
+lossless candidate is chosen; sequence output must be **byte-identical** to the previous build,
+because this is an intra defect and a sequence regression would be a new one; and all three gates
+green.
+
+### Before — reproduced on this commit, four stills
+
+| image | q=100 (bit-exact) | q=99 (wavelet) | penalty | dominated from |
+|---|---|---|---|---|
+| bbb_1080p | 3 235 737 | 3 536 493 @ 59.59 dB | **+9.29%** | q=98 |
+| blue_sky_1080p | 2 153 118 | 3 026 470 @ 60.14 dB | **+40.56%** | q=95 |
+| kristensara_720p | 927 600 | 1 260 606 @ 59.59 dB | **+35.90%** | q=96 |
+| touchdown_1080p | 2 610 478 | 3 384 366 @ 59.56 dB | **+29.65%** | q=96 |
+
+Mean at q=99: **+28.85%**. Every figure matches RATE-2's filing at `fa32a26`, so nothing that
+landed in between moved it. The four boundaries span q=95 to q=98, which is the finding that
+decides the shape of the fix.
+
+### The change
+
+`EncoderPipeline::encode` codes the configured wavelet path, then codes `lossless_sibling(config)`
+— `quality_preset(100)`'s MED path carrying the caller's `--abac`, `--cpu-encode` and
+`--tile-size` — and returns whichever serialises smaller. `quality_preset` sets the flag for
+q = 95..=99 only; `GNC_LOSSLESS_FALLBACK=0` restores the old behaviour.
+
+**No format change and no GP version.** `transform_type` is a frame-header byte
+(`format.rs:301`, read at `:969`) and is not tied to the quality byte, so a q=97 file carrying
+`transform_type = 2` decodes on every existing build.
+
+**Why "keep the smaller" needs no metric rule**, unlike every other choice in this codec: when the
+lossless candidate wins it wins on *both* axes at once — fewer bytes and bit-exact pixels — so
+there is nothing to trade and CLAUDE.md's metric table does not apply.
+
+**Why it cannot be a preset constant:** the boundary is where MED does well, so it is
+content-dependent. `smoothramp512`, `flat512` and `noise512` are not dominated at all.
+
+### After — rate against the file the same command produced before
+
+| | q=95 | q=96 | q=97 | q=98 | q=99 |
+|---|---|---|---|---|---|
+| bbb_1080p | 0.00% | 0.00% | 0.00% | −1.39% | −8.50% |
+| blue_sky_1080p | −5.34% | −10.24% | −17.26% | −23.48% | −28.86% |
+| kristensara_720p | 0.00% | −5.30% | −13.51% | −20.41% | −26.42% |
+| touchdown_1080p | 0.00% | −3.12% | −10.79% | −17.31% | −22.87% |
+| **mean** | **−1.33%** | **−4.67%** | **−10.39%** | **−15.65%** | **−21.66%** |
+
+**On 12 of those 20 points the output became bit-exact**, from 52.5–60.1 dB. The switch points are
+per image and land exactly on the measured dominance boundaries: bbb at q=98, blue_sky at q=95,
+kristensara and touchdown at q=96 — 20 of 20 points choose correctly.
+
+**Verified outside the harness**, which the item's own standard requires: `gnc encode` →
+`gnc decode` → `ffmpeg -f rawvideo -pix_fmt rgb24` md5 against the source. Identical on every
+point that switched (blue_sky, kristensara, touchdown at q=97 and 99; bbb at q=99), and
+**correctly not identical on bbb q=97**, where the lossy file is genuinely smaller and is kept.
+The decoder used was the shipped one, unmodified.
+
+### Three refusals, and two of them were found by things going wrong
+
+- **Already lossless** — nothing to compare against.
+- **Not the wavelet.** `--dct` is an explicit request for a third transform. **Found by
+  `test_block_dct_quality_preset` going red**, which is precisely what that test is for: it
+  asserts a DCT config at q=99 stays a DCT config, and my first version silently returned a MED
+  file instead.
+- **Inside a sequence**, below.
+
+### The sequence regression, which is the most useful thing measured today
+
+With the fallback reaching sequence I-frames — bbb, 4 frames, ki=2, q=99 — the I-frames came out
+bit-exact as intended and **the P-frames referencing them decoded at 9.80 dB against 60.69 dB**,
+while the sequence *grew* from 13 078 463 B to 15 276 618 B. A MED I-frame carries
+`wavelet_levels = 0` and `transform_type = 2`, and the P-frame path's reference cannot reconstruct
+from it.
+
+**This is why "a bit-exact reference must be a better reference" is a reasonable thought and not a
+measurement.** It is filed as **RATE-3** rather than fixed here, and the flag is now cleared in
+three places: `build_ip_config`, the three temporal-wavelet config sites in `main.rs`, and again
+inside `encode_sequence`. Three rather than one because the **GPU warm-up encodes call `encode`
+directly with the sequence config** — a single gate inside `encode_sequence` would still have paid
+for a second encode and printed a canary for a path that would not take it. Sequence output is now
+byte-identical to the previous build (13 078 463 B, P-frames 60.69 dB), which is the criterion.
+
+### Canary
+
+`GNC: RATE-2 lossless fallback — lossy N B vs bit-exact M B (±x%), keeping the …` prints on every
+frame that takes the path, **whichever way it goes**, so "the fallback ran and kept the lossy file"
+is distinguishable from "the fallback did not run at all". That distinction is what caught the
+warm-up leak: a canary firing during `benchmark-sequence` was the only visible sign that a
+throwaway encode was taking the path.
+
+### Cost
+
+**A count, not a time:** two encodes instead of one, at q = 95..=99 only, on the intra path only.
+The second is the MED path, which is the cheaper of the two — 8.35 ms against the wavelet's
+21–24 ms in the same `rd-curve` run — so the increment is a fraction rather than a doubling.
+**Those milliseconds are load-contaminated and are not a throughput claim** (COORDINATION); they
+are quoted only to bound the ratio.
+
+### Two consequences for measurement, and the second is a trap
+
+- **RD ladders flatten at the top, correctly.** `rd-curve` on kristensara at q = 90,95,97,99,100
+  now returns 8.052083 bpp with infinite PSNR for the last three points — the lower convex hull,
+  which is what an RD curve is supposed to be.
+- **A BD-rate over a ladder that reaches q≥95 now integrates over fewer points than it used to.**
+  `bd_rate` already filters non-finite PSNR (`bench/bdrate.rs:34`) and returns `None` below four
+  usable points, so nothing computes silently wrong — but QUAL-1 measured that changing a ladder's
+  extent moves the figure by 1.0 PSNR points by itself. **Do not compare a BD-rate across this
+  commit**, and state the q values with any BD-rate above q=90.
+- **BASELINE's 1.9x-against-H.264 caveat is updated rather than lifted.** That figure is a *video*
+  ladder at q=85,92,96,99, and this fix is intra-only, so it reproduces exactly. The rung to
+  re-run it against is **RATE-3**, not RATE-2. Anyone reading "RATE-2 is fixed" and re-quoting
+  1.9x as settled would be wrong, which is why the caveat now says so explicitly.
+
+### Caveats
+
+- **`-q 97` can now return a file with no distortion at all.** A strict improvement, but it does
+  change what q means: a ceiling on distortion, not a target.
+- **4:4:4 photographic stills only.** Subsampled chroma is untested here. The synthetic images are
+  known *not* to be dominated, so the fallback should never fire on them — a prediction, not a
+  measurement.
+- **The inter half of the defect is untouched.** RATE-3.
+
+**Gates:** `cargo test --release -- --test-threads=1` green (235 passed, 0 failed, 9 ignored);
+`cargo clippy --release` clean; `cargo clippy --release --target wasm32-unknown-unknown --lib`
+clean.
+
+
+---
+
 ## ENT-8 step 1 — the lockstep scan is affordable on abac's template, and the stripe width is a dial (2026-09-08)
 
 **Hypothesis, and the reason it needed its own measurement.** `0030` found that BPC-PaCo buys

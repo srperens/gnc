@@ -433,6 +433,15 @@ pub struct CodecConfig {
     pub abac_gpu_sizing: encoder::abac_gpu_encode::Sizing,
     /// Transform type: Wavelet (default) or BlockDCT8 (fewer dispatches, faster).
     pub transform_type: TransformType,
+    /// RATE-2: at the top of the lossy ladder, also encode bit-exact and keep the smaller file.
+    ///
+    /// Above q≈95-98 the wavelet ladder spends **more** bytes than the MED lossless path while
+    /// delivering worse pixels — mean **+28.9% at q=99** on four photographic stills, and the
+    /// boundary is content-dependent (q=95 on blue_sky, q=98 on bbb), so it cannot be a preset
+    /// constant. When this is set, [`encoder::pipeline::EncoderPipeline::encode`] codes both ways
+    /// and keeps the smaller, which is a strict improvement on both axes: the lossless file is
+    /// smaller *and* bit-exact. Costs a second encode at the rungs where it is set.
+    pub lossless_fallback: bool,
     /// DCT frequency-dependent quantization strength.
     /// Controls how aggressively high-frequency DCT coefficients are quantized.
     /// 0.0 = flat (all frequencies equal), 3.0 = typical (highest freq gets 4× coarser step).
@@ -578,6 +587,10 @@ impl Default for CodecConfig {
             abac_code_block: encoder::entropy_helpers::abac_cb_from_env(),
             abac_gpu_sizing: encoder::abac_gpu_encode::Sizing::from_env(),
             transform_type: TransformType::Wavelet,
+            // RATE-2 is opt-in from `quality_preset`, not from here: `CodecConfig::default()` is
+            // what the sequence path and several tests build from, and a lossless I-frame inside
+            // a rate-controlled stream is a different question from a lossless still.
+            lossless_fallback: false,
             dct_freq_strength: 7.0,
             intra_prediction: false,
             temporal_transform: TemporalTransform::None,
@@ -754,6 +767,33 @@ impl CodecConfig {
             self.wavelet_levels = HUFFMAN_MAX_LEVELS;
         }
     }
+}
+
+/// RATE-2: the bit-exact sibling of a near-lossless configuration.
+///
+/// Starts from `quality_preset(100)` — the MED lossless path, with its own coherent settings
+/// (no subbands, uniform weights, no AQ, no CfL) — and carries over the choices that describe
+/// **how** to code rather than **how much**, so that `--abac`, `--cpu-encode` and `--tile-size`
+/// mean the same thing in both candidates. Anything that describes *how much* would defeat the
+/// point: the sibling is lossless by construction.
+///
+/// rANS is replaced by Rice, because its encode shader cannot reach a fine step at all (BUG-9)
+/// and the sibling is at the finest step there is.
+#[must_use]
+pub fn lossless_sibling(cfg: &CodecConfig) -> CodecConfig {
+    let mut out = quality_preset(100);
+    out.entropy_coder = match cfg.entropy_coder {
+        EntropyCoder::Rans => EntropyCoder::Rice,
+        other => other,
+    };
+    out.gpu_entropy_encode = cfg.gpu_entropy_encode;
+    out.abac_coder = cfg.abac_coder;
+    out.abac_code_block = cfg.abac_code_block;
+    out.abac_gpu_sizing = cfg.abac_gpu_sizing;
+    out.set_tile_size(cfg.tile_size);
+    // Without this the sibling would ask for a sibling of its own.
+    out.lossless_fallback = false;
+    out
 }
 
 pub fn quality_preset(q: u32) -> CodecConfig {
@@ -996,6 +1036,12 @@ pub fn quality_preset(q: u32) -> CodecConfig {
         abac_code_block: encoder::entropy_helpers::abac_cb_from_env(),
         abac_gpu_sizing: encoder::abac_gpu_encode::Sizing::from_env(),
         transform_type: TransformType::Wavelet, // block DCT opt-in via config override
+        // RATE-2: only the rungs that are actually dominated, and only where "bit-exact instead"
+        // is a coherent answer. q=100 is already lossless; below 95 the lossy file is smaller on
+        // every image measured, so the second encode would be pure cost. `GNC_LOSSLESS_FALLBACK=0`
+        // restores the old behaviour for measurement.
+        lossless_fallback: (95..100).contains(&q)
+            && std::env::var("GNC_LOSSLESS_FALLBACK").map(|v| v != "0").unwrap_or(true),
         dct_freq_strength: 7.0,
         // Intra prediction is off by default: measured at -11.76 dB / +29% bitrate on lossy
         // content, where the wavelet has already removed most of the correlation a predictor

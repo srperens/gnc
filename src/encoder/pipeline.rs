@@ -1532,7 +1532,65 @@ impl EncoderPipeline {
     /// Encode an RGB frame.
     /// Input: &[f32] of length width * height * 3 (interleaved R,G,B).
     /// Values in [0, 255] for 8-bit or [0, 1023] for 10-bit.
+    /// Encode one intra frame, and at the top of the lossy ladder keep whichever of the two
+    /// transforms produces the smaller file.
+    ///
+    /// **RATE-2.** Above q≈95-98 the wavelet ladder spends more bytes than the MED lossless path
+    /// while delivering worse pixels — mean **+28.9% at q=99** on four photographic stills. The
+    /// boundary is content-dependent (q=95 on blue_sky, q=98 on bbb) because it is exactly where
+    /// MED does well, so no preset constant can find it and the only honest answer is to code
+    /// both and measure. When the lossless candidate wins it wins on both axes at once: fewer
+    /// bytes *and* bit-exact pixels, which is why this needs no rate/quality trade-off rule.
+    ///
+    /// Costs a second encode at the rungs where `lossless_fallback` is set — `quality_preset`
+    /// sets it for q = 95..=99 only, and `GNC_LOSSLESS_FALLBACK=0` turns it off.
+    ///
+    /// The decoder needs nothing: `transform_type` is a frame-header byte (`format.rs:301`,
+    /// read back at `:969`) and is not tied to the quality byte, so a q=97 file carrying
+    /// `transform_type = 2` is decodable by every existing build.
     pub fn encode(
+        &mut self,
+        ctx: &GpuContext,
+        rgb_data: &[f32],
+        width: u32,
+        height: u32,
+        config: &CodecConfig,
+    ) -> CompressedFrame {
+        let lossy = self.encode_once(ctx, rgb_data, width, height, config);
+        // Three refusals. Already lossless: there is nothing to compare against. Not the wavelet:
+        // `--dct` is an explicit request for a third transform, and swapping it for MED would
+        // make the flag mean something else — this one was caught by
+        // `test_block_dct_quality_preset` going red, which is what that test is for. And the flag
+        // itself, which `quality_preset` sets only for q = 95..=99 and the sequence paths clear.
+        if !config.lossless_fallback
+            || config.is_lossless()
+            || config.transform_type != crate::TransformType::Wavelet
+        {
+            return lossy;
+        }
+        let sibling = crate::lossless_sibling(config);
+        let lossless = self.encode_once(ctx, rgb_data, width, height, &sibling);
+        let (lossy_bytes, lossless_bytes) = (
+            crate::format::serialize_compressed(&lossy).len(),
+            crate::format::serialize_compressed(&lossless).len(),
+        );
+        // The canary. It prints on every frame that takes this path, whichever way it goes, so
+        // "the fallback ran and chose the lossy file" is distinguishable from "the fallback did
+        // not run" — a silent feature is worse than no feature (CLAUDE.md).
+        eprintln!(
+            "GNC: RATE-2 lossless fallback — lossy {lossy_bytes} B vs bit-exact \
+             {lossless_bytes} B ({:+.2}%), keeping the {}",
+            (lossless_bytes as f64 / lossy_bytes as f64 - 1.0) * 100.0,
+            if lossless_bytes < lossy_bytes { "bit-exact one" } else { "lossy one" },
+        );
+        if lossless_bytes < lossy_bytes {
+            lossless
+        } else {
+            lossy
+        }
+    }
+
+    fn encode_once(
         &mut self,
         ctx: &GpuContext,
         rgb_data: &[f32],

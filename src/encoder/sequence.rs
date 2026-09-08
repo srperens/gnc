@@ -368,12 +368,26 @@ impl EncoderPipeline {
             // A quantiser *cascade* down the GOP (step growing with distance from the keyframe)
             // was measured here and rejected — see RESEARCH_LOG 2026-09-06. It is the flat step
             // in encode_pframe that pays; making it grow collapses the GOP tail.
-            let frame_config = if let Some(ref rc) = rate_ctrl {
-                let mut cfg = config.clone();
-                cfg.quantization_step = rc.estimate_qstep();
+            // RATE-2's lossless fallback is **intra-only, and this is where it is refused.**
+            // Measured 2026-09-08 on bbb, 4 frames, ki=2, q=99: with the fallback active the
+            // I-frames come out bit-exact as intended, and the P-frames that reference them
+            // decode at **9.80 dB against 60.69 dB** with it off, while the sequence *grows*
+            // from 13.08 MB to 15.28 MB. A MED I-frame carries `wavelet_levels = 0` and
+            // `transform_type = 2`, and the P-frame path's reference cannot reconstruct from it.
+            //
+            // A bit-exact reference ought to be the *best* reference there is, so this is worth
+            // fixing rather than avoiding — filed as RATE-3. Until then the flag does not cross
+            // into a sequence, and the still-image path keeps its 8.5-28.9%.
+            let frame_config = {
+                let mut cfg = if let Some(ref rc) = rate_ctrl {
+                    let mut cfg = config.clone();
+                    cfg.quantization_step = rc.estimate_qstep();
+                    cfg
+                } else {
+                    config.clone()
+                };
+                cfg.lossless_fallback = false;
                 cfg
-            } else {
-                config.clone()
             };
 
 
@@ -1853,7 +1867,12 @@ impl EncoderPipeline {
             i += group_size;
         }
 
-        // Tail: encode remaining frames as I-frames (no temporal transform)
+        // Tail: encode remaining frames as I-frames (no temporal transform).
+        // RATE-2's fallback is refused here too: these frames are references for nothing in this
+        // path, but the same config feeds the temporal groups above and one rule is easier to
+        // reason about than two. See RATE-3.
+        let mut cfg = cfg.clone();
+        cfg.lossless_fallback = false;
         while i < frames.len() {
             let cf = self.encode(ctx, frames[i], width, height, &cfg);
             tail_iframe_pts.push(i as u32);

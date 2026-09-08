@@ -917,6 +917,12 @@ fn build_ip_config(
             ..Default::default()
         }
     };
+    // RATE-2's lossless fallback is intra-only and this is one of the two funnels that refuse it.
+    // A MED I-frame carries `wavelet_levels = 0` and the P-frame path's reference cannot
+    // reconstruct from it — measured at 9.80 dB against 60.69 dB (RATE-3). The sequence encoder
+    // clears it again internally; this line is what stops the throwaway GPU warm-up encodes from
+    // paying for a second encode and printing a canary for a path that will not take it.
+    config.lossless_fallback = false;
     if let Some(qs) = qstep {
         config.quantization_step = qs;
     }
@@ -1639,6 +1645,7 @@ fn main() {
                 let effective_fps = y4m_fps.unwrap_or(fps);
                 let gop_size = temporal_gop_size;
 
+                // RATE-2: intra-only, refused here for the same reason as `build_ip_config`.
                 let mut config_tw = if let Some(q) = quality {
                     gnc::quality_preset(q)
                 } else {
@@ -1647,6 +1654,7 @@ fn main() {
                         ..Default::default()
                     }
                 };
+                config_tw.lossless_fallback = false; // RATE-2 is intra-only (RATE-3)
                 if let Some(qs) = qstep {
                     config_tw.quantization_step = qs;
                 }
@@ -2551,6 +2559,7 @@ fn main() {
 
             if run_temporal {
                 // --- Temporal wavelet encoding (in-memory) ---
+                // RATE-2: intra-only, refused here for the same reason as `build_ip_config`.
                 let mut config_tw = if let Some(q) = quality {
                     gnc::quality_preset(q)
                 } else {
@@ -2559,6 +2568,7 @@ fn main() {
                         ..Default::default()
                     }
                 };
+                config_tw.lossless_fallback = false; // RATE-2 is intra-only (RATE-3)
                 if let Some(qs) = qstep {
                     config_tw.quantization_step = qs;
                 }
@@ -3825,6 +3835,7 @@ fn main() {
                 let first_path = format!("{}/frame_0000.png", seq_dir);
                 let (first_rgb, w, h) = load_image_rgb_f32(&first_path);
                 let mut config_tw = gnc::quality_preset(quality);
+                config_tw.lossless_fallback = false; // RATE-2 is intra-only (RATE-3)
                 config_tw.temporal_transform = temporal_mode;
                 // Rate control not wired for this subcommand (benchmark-sequence non-streaming path).
                 // Use benchmark-sequence with --bitrate for rate-controlled encoding.

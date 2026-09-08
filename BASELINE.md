@@ -228,13 +228,21 @@ ki=9, 4:2:0, 8-bit, x264 at its defaults.
 
 **GNC needs about 1.9x the bitrate of H.264 for the same luma PSNR at contribution quality.**
 
-**Caveat added 2026-09-07: two of those four rungs are inside GNC's dominated range.** RATE-2
-found that above q≈95–98 the lossy path costs *more bytes than GNC's own bit-exact lossless*
-(+28.9% mean at q=99, +40.6% on blue_sky), and this ladder runs to q=96 and q=99. So the +90.5%
-scores GNC partly through rungs it should never operate on, which makes the figure **pessimistic
-against GNC by an unmeasured amount** — not wrong, but not a clean 1.9x either. The ladder is also
-not monotonic in rate (a rung's bpp can fall as q rises), so any interpolation by rate should flag
-that. Re-run it once RATE-2 is fixed before quoting 1.9x as settled.
+**Caveat added 2026-09-07, and RATE-2's fix does NOT lift it (updated 2026-09-08).** Two of those
+four rungs are inside GNC's dominated range: above q≈95–98 the lossy path costs *more bytes than
+GNC's own bit-exact lossless* (+28.9% mean at q=99, +40.6% on blue_sky), and this ladder runs to
+q=96 and q=99. So the +90.5% scores GNC partly through rungs it should never operate on, which
+makes the figure **pessimistic against GNC by an unmeasured amount** — not wrong, but not a clean
+1.9x either. The ladder is also not monotonic in rate (a rung's bpp can fall as q rises), so any
+interpolation by rate should flag that.
+
+**RATE-2 shipped on 2026-09-08 (`docs/decisions/0036`) and this figure is unchanged, because the
+fix is intra-only.** A still at q=95–99 now codes both ways and keeps the smaller — mean −21.66%
+at q=99 — but the fallback is *refused* inside a sequence: a MED I-frame carries
+`wavelet_levels = 0` and the P-frame path's reference cannot reconstruct from it, measured at
+**9.80 dB against 60.69 dB** (filed as RATE-3). Sequence output is byte-identical either side of
+that commit, so re-running this ladder today reproduces +90.5% exactly. **The rung to re-run it
+against is RATE-3, not RATE-2.**
 
 **Colour, at rate matched to 1%** — CIEDE2000 on decoded RGB, which VMAF cannot see:
 

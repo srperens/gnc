@@ -3228,7 +3228,71 @@ falls while q rises (MEAS-9's harness now does). And for a 10-bit target the ext
 itself was never the problem. Harness: `scripts/meas_rate1_precision.py`, measured at `fa32a26`.
 Numbers in RESEARCH_LOG.
 
-### RATE-2 — Above q≈95-98 the lossy ladder costs more than bit-exact lossless (todo, P1)
+### RATE-3 — a bit-exact I-frame breaks the P-frames that reference it (todo, P1)
+
+Filed 2026-09-08 by RATE-2, which found it by shipping its fix and testing the sequence path
+before believing it.
+
+**Measured.** bbb, 4 frames, ki=2, q=99, with RATE-2's lossless fallback reaching the I-frames:
+the I-frames come out **bit-exact as intended** and the P-frames referencing them decode at
+**9.80 dB against 60.69 dB** with the fallback off, while the sequence *grows* from 13 078 463 B to
+15 276 618 B. A MED I-frame carries `wavelet_levels = 0` and `transform_type = 2`, and the P-frame
+path's reference cannot reconstruct from it. RATE-2 therefore refuses the fallback inside every
+sequence path, and the intra win stops at the sequence boundary.
+
+**Why this is worth fixing rather than avoiding.** A bit-exact reference is the *best* reference
+there is — no drift, no propagated error — so the inter half of RATE-2's win should be larger than
+the intra half, not zero. And the defect is not really about RATE-2: it says the P-frame path
+assumes its reference came from the wavelet, which is an assumption nothing else states and no
+test covers.
+
+**Where to look first.** The 9.80 dB says the reference is garbage rather than merely different, so
+this is a wrong-buffer or wrong-geometry bug, not a quality loss. `wavelet_levels = 0` is the
+likeliest trigger: the local decode in `encode_pframe`'s neighbourhood reconstructs from
+coefficients, and with no subbands there are none to reconstruct from. Check whether the reference
+is taken from the *decoded pixels* or from the encoder's coefficient buffer — if the latter, that
+is the bug, and it is the same class as BUG-27 (the P-frame local decode used the intra qstep).
+
+**Success criteria.** With the fallback allowed inside sequences: P-frame PSNR within 0.1 dB of
+today's on bbb/crowd_run/old_town_cross at q=95 and 99, ki=2 and 9; total sequence bytes **not
+larger** than today's on any of those six points; and the I-frames still bit-exact where the
+fallback chooses them. Below that, keep the gate.
+
+**Canary:** RATE-2's existing `GNC: RATE-2 lossless fallback` line already prints per frame; add
+the frame index and type to it so an I-frame taking the path inside a sequence is visible in the
+log rather than inferred from the byte count.
+
+**Why P1.** It is the difference between RATE-2 being a stills fix and a codec fix, it unblocks
+BASELINE's 1.9x-against-H.264 re-run (which is *not* unblocked by RATE-2 — see that entry), and
+the 9.80 dB shape suggests a bug with a single cause rather than a tuning problem.
+
+### RATE-2 — the top of the ladder codes both ways and keeps the smaller (**FIXED 2026-09-08**)
+
+**Shipped.** `docs/decisions/0036`, numbers in RESEARCH_LOG "RATE-2 — the top of the lossy ladder
+now codes both ways". At q = 95..=99 a still encode codes the wavelet path *and*
+`lossless_sibling(config)` and returns whichever is smaller. Rate against the file the same
+command produced before, mean of the four stills: **−1.33% / −4.67% / −10.39% / −15.65% / −21.66%
+at q = 95/96/97/98/99**, and **12 of those 20 points became bit-exact** from 52.5–60.1 dB. All 20
+choose correctly against the measured dominance boundaries (bbb q=98, blue_sky q=95, kristensara
+and touchdown q=96). Verified outside the harness with `gnc encode` → `gnc decode` → raw RGB md5,
+including the point where the lossy file is correctly kept.
+
+**No format change and no GP version:** `transform_type` is a header byte independent of the
+quality byte, so a q=97 file carrying `transform_type = 2` decodes on every existing build.
+
+**It is intra-only, and RATE-3 says why.** Two things it does not do, both deliberate: `--dct` is
+refused (an explicit third transform, caught by `test_block_dct_quality_preset` going red), and so
+is any frame inside a sequence — a MED I-frame breaks the P-frame reference at **9.80 dB against
+60.69 dB**. Sequence output is byte-identical either side of the commit.
+
+**Two measurement consequences.** RD ladders now flatten at the top, correctly; and a BD-rate over
+a ladder reaching q≥95 integrates over fewer points than before, so **do not compare a BD-rate
+across this commit**. BASELINE's 1.9x-against-H.264 caveat is *updated, not lifted* — that ladder
+is video, and the rung to re-run it against is RATE-3.
+
+The original filing follows.
+
+### RATE-2 — Above q≈95-98 the lossy ladder costs more than bit-exact lossless (original filing)
 
 **On every real image measured, the top of the wavelet ladder spends more bytes than lossless while
 delivering worse output.** Found by the RATE-1 sweep; it is a different defect and a bigger one.

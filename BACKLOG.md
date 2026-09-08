@@ -5201,6 +5201,25 @@ the right shape of fix rather than a ladder clamp.
 
 ### MEAS-2 — Feature toggling: what contributes and how much? (todo, P3)
 
+**Sixth and seventh toggles measured 2026-09-08 — the pyramid's two layer quantiser scales.**
+`GNC_PYRAMID_L3_QP_SCALE` **is now a taper, not a constant 1.5** (`docs/decisions/0061`): the
+right value depends on the operating point, and one number cannot hold both ends. Over q=30-75 a
+1.5x leaf is the best of 1.0/1.5/2.0 on **both** VMAF (−12.1% BD-rate against the pyramid off,
+where 1.0x reaches −3.9%) and worst-frame PSNR (+1.8% against +10.0%). Over q=85-94 the same 1.5x
+is a move along the curve — mean PSNR cannot separate the five arms at all (−4.6% to −5.0%) while
+the worst frame spreads them by 22 points, and on the two camera clips no coarse arm overlaps the
+pyramid-off arm's worst-frame range anywhere on the ladder. So: 1.5 at step >= 4.0 (q=75), 1.0 at
+step <= 2.8 (q=85), interpolated between, keyed on the quantiser step for `p_qp_scale`'s reasons.
+**`GNC_PYRAMID_L2_QP_SCALE` stays 1.0** — its "off until validated" comment is now validated at
+contribution quality, where 1.25 and 1.5 buy 0.1-0.2 points of mean PSNR and cost 7-9 points of
+the tail. **Nothing ships differently by default** (the pyramid is off since BUG-5), verified
+byte-exact at four points. Harness `scripts/meas2_pyramid_qp.py`; the layer-2 knob also got the
+canary it never had — the diagnostic printed the reference indices and not the quantiser, so the
+variable could not be observed at all.
+
+**Remaining: the lossy half of the l2 scale** (the q=30-75 grid was l3-only). That is all that is
+left of the item.
+
 **Back in the queue 2026-09-07.** This heading read `(in progress 2026-09-06)` for a day
 with nobody holding a claim on it — the stale-marker failure that COORD-1 removed the
 instruction for. Four toggles are measured below and the sweep is not finished, so it is
@@ -5243,8 +5262,10 @@ boundary is clean (rANS loses 5.7-8.2% on kristensara throughout its own range).
 −0.66 min, i.e. trading tail quality for average, essentially on the curve. At matched *q* it looks
 dramatic (12-31% rate for 0.2-1.7 VMAF) but that is movement along the curve.
 
-Remaining: pyramid QP scales and B-pyramid (both behind BUG-5's pyramid-off default, so lower
-value). MEAS-2's main finding is that three of five toggles were mis-tuned or mis-measured.
+Remaining: the lossy half of `GNC_PYRAMID_L2_QP_SCALE`. The layer-3 scale and the pyramid toggle
+itself are measured (see the head of this entry, `docs/decisions/0061`). **MEAS-2's main finding is
+now that four of seven toggles were mis-tuned or mis-measured**, and the fourth is the one whose
+correct value turned out to be two values.
 
 ### MEAS-4 — Inter-model gap decomposition (**RE-RUN AND CLOSED 2026-09-06** on clean data)
 Reopened because its residual dumps were taken with `GNC_DIAGNOSTICS=1` (BUG-7), which clobbered

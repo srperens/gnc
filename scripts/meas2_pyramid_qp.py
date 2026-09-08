@@ -36,6 +36,7 @@ Usage:
 
 import argparse
 import csv as csvmod
+import math
 import os
 import re
 import subprocess
@@ -93,7 +94,12 @@ def canary(gnc, pattern, arm, ki, q, chroma):
         return "suppressed"
     seen = {}
     for layer in (2, 3):
-        m = re.search(rf"layer={layer}\b[^\n]*qstep=([0-9.]+) \(l{layer}_scale=([0-9.]+)x\)", out)
+        # The layer-3 line also reports whether the scale came from the env var or the taper
+        # (`0061`), so the source token is optional here rather than assumed away.
+        m = re.search(
+            rf"layer={layer}\b[^\n]*qstep=([0-9.]+) \((?:[a-z]+, )?l{layer}_scale=([0-9.]+)x",
+            out,
+        )
         if not m:
             sys.exit(f"canary: no layer={layer} line with a scale under GNC_BFRAME_PYRAMID=1 — "
                      f"cannot prove GNC_PYRAMID_L{layer}_QP_SCALE was read")
@@ -104,6 +110,23 @@ def canary(gnc, pattern, arm, ki, q, chroma):
                      f"the sweep would measure the wrong thing")
         seen[layer] = (qstep, scale)
     return " ".join(f"l{k}: qstep={v[0]:.2f} ({v[1]:.2f}x)" for k, v in sorted(seen.items()))
+
+
+def finite_or_die(seq, arm, pts, key):
+    """Drop and report a rung whose metric is not finite.
+
+    LOSSLESS-3 (`0073`) emits a q=95..99 4:4:4 camera sequence bit-exact, so `psnr()` returns
+    `inf` up there and a Bjontegaard fit over an infinity is a silent non-number — the trap
+    INTRA-1 hit and guarded in its own harness. Worse here than there: a bit-exact encode is
+    all-intra, so every arm's rung is the *same bytes*, and the toggle under test is not even in
+    the output being compared.
+    """
+    ok = [p for p in pts if p.get(key) is not None and math.isfinite(p[key])]
+    for p in pts:
+        if p.get(key) is not None and not math.isfinite(p[key]):
+            print(f"    !! {seq} {arm} q={p['q']}: {key} is not finite — bit-exact output "
+                  f"(LOSSLESS-3), rung dropped; a BD-rate spanning it is not a number")
+    return ok
 
 
 def monotonic_flags(pts):
@@ -201,8 +224,8 @@ def main():
               f"over one common interval per sequence ===")
         table = {}
         for seq in sequences:
-            ref = [p for p in data[(seq, OFF)] if p.get(key) is not None]
-            got = {a: [p for p in data.get((seq, a), []) if p.get(key) is not None]
+            ref = finite_or_die(seq, arm_label(OFF), data[(seq, OFF)], key)
+            got = {a: finite_or_die(seq, arm_label(a), data.get((seq, a), []), key)
                    for a in arms if a != OFF}
             got = {a: v for a, v in got.items() if len(v) >= 4}
             if len(ref) < 4 or not got:

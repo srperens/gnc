@@ -1258,15 +1258,49 @@ impl EncoderPipeline {
                             _ => {}
                         }
                     }
-                    // Layer-3 B-frames are leaf nodes (never used as references).
-                    // Apply QP scale to reduce their size; decoder reads qstep from frame header.
-                    // Layer-3 leaf B-frames (B₁,B₃,B₅,B₇) are never used as references.
-                    // Default 1.5× matches H.264 QP+4 practice for inner B-frames.
-                    // Disable with GNC_PYRAMID_L3_QP_SCALE=1.0.
+                    // Layer-3 leaf B-frames (B₁,B₃,B₅,B₇) are never used as references, so a
+                    // coarser quantiser for them propagates nowhere — which is why H.264 runs
+                    // inner B-frames at about QP+4 and why 1.5x was the shipped default here.
+                    //
+                    // MEAS-2 measured it, and the right value depends on the operating point
+                    // (`docs/decisions/0061`). Below the fine end the leaf's error is dominated
+                    // by prediction, so coarsening it is nearly free: over q=30-75, 1.5x is the
+                    // best of 1.0/1.5/2.0 on **both** VMAF (−12.1% BD-rate against the pyramid
+                    // off, where 1.0x reaches only −3.9%) and worst-frame PSNR (+1.8% against
+                    // +10.0%). At contribution quality the leaf's error is set by its own
+                    // quantiser instead, so the same 1.5x is a pure move along the RD curve: on
+                    // crowd_run at q=85 it saves 5.7% of the bytes for 2.83 dB of worst-frame
+                    // PSNR, and 1.0x is the only setting that beats the pyramid being off on
+                    // both metrics at once.
+                    //
+                    // Keyed on the quantiser step for the reasons `p_qp_scale` is (see below):
+                    // the step is the physically relevant quantity, and `q` is not available
+                    // here at all under `--qstep` or rate control. The breakpoints are the
+                    // measured ones — 4.0 is q=75 and 2.8 is q=85 — and the ramp between them is
+                    // interpolation, since nothing was measured in that gap. The step read is
+                    // the one actually being scaled, so rate control keys on its own estimate
+                    // rather than on the config the sequence started with.
+                    const L3_SCALE_COARSE_STEP: f32 = 4.0;
+                    const L3_SCALE_FINE_STEP: f32 = 2.8;
+                    let leaf_step = rate_ctrl
+                        .as_ref()
+                        .map(|rc| rc.estimate_qstep())
+                        .unwrap_or(config.quantization_step);
+                    let l3_default: f32 = if leaf_step >= L3_SCALE_COARSE_STEP {
+                        1.5
+                    } else if leaf_step <= L3_SCALE_FINE_STEP {
+                        1.0
+                    } else {
+                        1.0 + 0.5 * (leaf_step - L3_SCALE_FINE_STEP)
+                            / (L3_SCALE_COARSE_STEP - L3_SCALE_FINE_STEP)
+                    };
+                    // GNC_PYRAMID_L3_QP_SCALE overrides the taper, and the canary below says
+                    // which of the two the encoder read — "the knob did nothing" and "the knob
+                    // was never read" must not be confusable (INTER-1's rule for `p_qp_scale`).
                     let l3_qp_scale: f32 = std::env::var("GNC_PYRAMID_L3_QP_SCALE")
                         .ok()
                         .and_then(|s| s.parse().ok())
-                        .unwrap_or(1.5_f32);
+                        .unwrap_or(l3_default);
                     let b_config = {
                         let mut cfg = if let Some(ref rc) = rate_ctrl {
                             let mut c = config.clone();
@@ -1301,8 +1335,18 @@ impl EncoderPipeline {
                         }
                         if std::env::var("GNC_BFRAME_PYRAMID").is_ok() {
                             eprintln!(
-                                "[pyramid_b] Frame {} (display) layer=3 fwd_ref={} bwd_ref={} qstep={:.2} (l3_scale={:.2}x)",
-                                b_display, fwd_idx, bwd_idx, b_config.quantization_step, l3_qp_scale
+                                "[pyramid_b] Frame {} (display) layer=3 fwd_ref={} bwd_ref={} qstep={:.2} ({}, l3_scale={:.2}x, taper default {:.2})",
+                                b_display,
+                                fwd_idx,
+                                bwd_idx,
+                                b_config.quantization_step,
+                                if std::env::var_os("GNC_PYRAMID_L3_QP_SCALE").is_some() {
+                                    "env"
+                                } else {
+                                    "taper"
+                                },
+                                l3_qp_scale,
+                                l3_default
                             );
                         }
                     }

@@ -2047,6 +2047,113 @@ not an argument for a 1.69× frame decode. Decision record `0045`.
 
 ---
 
+## MEAS-2, the last two toggles: the pyramid's leaf scale is right below q≈80 and wrong above it (2026-09-08)
+
+**Hypothesis.** MEAS-2 left two of its five toggles unmeasured, both behind BUG-5's pyramid-off
+default: `GNC_PYRAMID_L3_QP_SCALE` (1.5, justified in a comment as "matches H.264 QP+4 practice
+for inner B-frames" — true, and not a measurement) and `GNC_PYRAMID_L2_QP_SCALE` (1.0, commented
+"off until validated"). Expected the leaf scale to earn its keep, because nothing references a
+leaf B-frame, and the layer-2 scale to be roughly neutral, following TUNE-5's shape for P-frames.
+
+**Domain.** Quantiser step per frame, applied to the wavelet coefficients of one B-frame before
+entropy coding. The decoder reads the step from the frame header, so no decoder change is
+possible or needed.
+
+**Why the knob could not be validated before.** `[pyramid_b] … layer=2` printed the reference
+indices and *not* the quantiser, while the layer-3 line printed both. There was no way to observe
+whether the encoder had read `GNC_PYRAMID_L2_QP_SCALE` at all — which is how "off until validated"
+survives a week. Both layer-2 sites now print `qstep=… (l2_scale=…x)`, and layer 3 additionally
+reports whether the value came from the env var or the taper.
+
+**Shape of the run** (`scripts/meas2_pyramid_qp.py`): six arms — the pyramid suppressed, plus five
+l2:l3 pairs — on crowd_run, old_town_cross and bbb_extended, 24 frames, 4:4:4, **ki=17 in every
+arm**. The reference is the pyramid *off at the same keyframe interval*: BUG-5 compared
+ki=17-with-B against ki=8-P-only, which moves GOP length and the pyramid together, so nothing here
+is comparable with BUG-5's figures. Every arm is integrated over one common quality interval per
+sequence and metric (QUAL-1), since a coarser leaf lowers the top of its own ladder.
+
+### The two halves disagree, and both are right
+
+q=30/50/65/75 — VMAF leads (CLAUDE.md's table). BD-rate against the pyramid off, negative = fewer
+bits:
+
+| | l3=1.0 | **l3=1.5** | l3=2.0 |
+|---|---|---|---|
+| VMAF | −3.9% | **−12.1%** | −11.5% |
+| worst-frame PSNR | +10.0% | **+1.8%** | +13.4% |
+| mean PSNR | −7.9% | −10.3% | −11.1% |
+
+The convincing part is that VMAF and the worst frame *agree* down here: 1.5× is not buying the
+mean at the tail's expense, it is better on the tail than either neighbour. crowd_run's VMAF was
+discarded by the saturation guard (overlap 99.53–99.87); old_town_cross reads −5.1% and
+bbb_extended −19.0%.
+
+q=85/88/90/92/94 — PSNR leads, VMAF discarded on all three sequences (overlaps 99.21–99.89):
+
+| | l3=1.0 | l3=1.5 | l3=2.0 | l2=1.25 l3=1.5 | l2=1.5 l3=1.5 |
+|---|---|---|---|---|---|
+| mean PSNR | −4.6% | −5.0% | −4.9% | −4.9% | −4.8% |
+| worst-frame, bbb_extended | **−14.4%** | −5.6% | +7.3% | −7.4% | −5.7% |
+| worst-frame, camera clips | — | — | — | — | — |
+
+**Mean PSNR cannot referee this knob**: 0.4 points of spread across five arms. The worst frame
+spreads them by 22 points — and on the two camera clips there is *no overlap to integrate*, which
+says more than a BD-rate would. On crowd_run the pyramid-off arm's worst rung still reaches 47.48
+dB on its worst frame, while the l3=1.5 arm's *best* rung over the whole q=85–94 ladder reaches
+46.71. The tail penalty is larger than the ladder's entire quality span.
+
+Matched q, crowd_run q=85, no fitting involved:
+
+| arm | bytes | mean PSNR | worst frame |
+|---|---|---|---|
+| pyramid off | 74 997 760 | 47.91 | **47.48** |
+| l3=1.0 | 74 809 828 | 47.91 | **47.48** |
+| l3=1.5 (was the default) | 70 692 750 | 46.82 | 44.65 |
+| l3=2.0 | 67 875 419 | 46.03 | 42.29 |
+
+−5.7% of the bytes for −2.83 dB on the worst frame.
+
+**Mechanism for the flip.** At q=30 the leaf's step is 13.9 and its error is dominated by what
+bi-prediction failed to predict, so coarsening adds little to an error that large and the rate
+saving is nearly free. At q=90 the step is 2.24 and the leaf's error *is* its own quantiser, so
+1.5× converts directly into 2.8 dB on that frame. Same knob, opposite regimes — the same shape as
+AQ (off below q=30) and Rice-vs-rANS (boundary at q=20).
+
+**Shipped:** `GNC_PYRAMID_L3_QP_SCALE` becomes a taper on the quantiser step — 1.5 at step ≥ 4.0
+(q=75), 1.0 at step ≤ 2.8 (q=85), linear between, keyed on the step for `p_qp_scale`'s two reasons
+(the step is the physical quantity; `q` does not exist at that site under `--qstep` or rate
+control). The breakpoints are the measured ones and the ramp is interpolation. `GNC_PYRAMID_L2_QP_SCALE`
+stays 1.0 — validated, and off is right at contribution quality. Decision `0061`.
+
+**Nothing ships differently by default**, because the pyramid is off by default. Verified byte-exact
+against the measured arms: default pyramid-off q=90 = 82 057 506 (unchanged), taper at q=50 =
+26 688 057 (= the l3=1.5 arm), taper at q=90 = 81 869 091 (= the l3=1.0 arm), env override 1.5 at
+q=90 = 77 632 449 (= the old default).
+
+### Two things found on the way, both worth more than the toggle
+
+**A measurement was superseded mid-flight, and the guard for it did not exist.** The first q ≥ 85
+table was taken at q=85/90/92/95/99 on `a73e0a2`. LOSSLESS-3 (`0073`) then landed and emits a
+q=95..99 4:4:4 camera sequence bit-exact when the lossy encode is larger, so on the current tree
+those two rungs return `psnr = inf` — and a Bjontegaard fit over an infinity is a silent
+non-number, INTRA-1's trap. It is worse here than there: a bit-exact encode is all-intra, so every
+arm's rung is *the same bytes* and the toggle under test is not in the output being compared.
+`finite_or_die` now drops and reports a non-finite rung, and the re-taken ladder stops at q=94.
+The re-take also proves the merge changed nothing in range — all 30 q ≤ 94 rungs are byte-identical
+across it, and so are four q ≤ 75 points from the lossy half, which is why that half was not re-run.
+
+**At matched ki, part of what BUG-5 measured was GOP length.** With the leaf scale off the pyramid
+is cheaper than P-only on all three clips on both metrics (bbb_extended −12.2% mean, −14.4%
+worst-frame). This changes no default: the pyramid still costs 8 frames of reordering latency
+(`0033`), BUG-5's own figures were taken lower down the ladder, and on this content inter is itself
+losing — crowd_run at q=85 costs 69 919 536 bytes all-intra against 74 997 760 for I+P, so every
+arm above sits inside a configuration 7.3% behind not coding inter at all.
+
+**Left open:** the lossy half of the l2 scale (the q=30–75 grid was l3-only), which is what remains
+of MEAS-2.
+
+---
+
 ## BUG-35 — the histogram arena is guarded; shrinking it is refused (2026-09-08)
 
 **Hypothesis.** `shared_hist` is 5120 bins. `total_hist_entries` can reach 49152. naga clamps

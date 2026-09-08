@@ -29,20 +29,28 @@ elsewhere", but *unreachable* elsewhere.
 subsampled input: bbb at 4:2:0 q=99 takes the bit-exact file, 1 847 304 B against 1 898 635 B,
 **−2.70% of rate**.
 
-**And −3.9 dB of picture.** RATE-2's whole justification is that the bit-exact candidate wins on
-*both* axes when it wins at all. On subsampled chroma it does not, because `q=100` there is **not
-lossless — not even in luma**, which subsampling does not touch. Per plane against the source:
+**And a large colour regression.** RATE-2's whole justification is that the bit-exact candidate
+wins on *both* axes when it wins at all. On subsampled chroma it does not. Measured with the metric
+CLAUDE.md prescribes for anything touching chroma — `scripts/ypsnr_de00.py`, dE00 against the
+source, each arm forced with `GNC_LOSSLESS_FALLBACK=0`:
 
-| still | format | q | y | u | v |
+| still | format | dE00 mean q=99 | dE00 mean **q=100** | p95 q=99 | p95 **q=100** |
 |---|---|---|---|---|---|
-| blue_sky | 4:2:0 | 100 | **51.16** | 43.23 | 44.74 |
-| blue_sky | 4:2:0 | 95 | 53.09 | 56.73 | 57.88 |
-| kristensara | 4:2:2 | 100 | **51.04** | 43.63 | 43.54 |
-| bbb | 4:2:2 | 100 | **47.34** | 37.10 | 38.71 |
+| blue_sky | 4:2:2 | 0.115 | **2.307** | 0.664 | **7.358** |
+| blue_sky | 4:2:0 | 0.139 | **1.949** | 0.727 | **5.742** |
+| bbb | 4:2:0 | 0.960 | **2.557** | 3.210 | **6.146** |
+| kristensara | 4:2:2 | 0.140 | **2.142** | 0.716 | **5.649** |
 
-4:4:4 at q=100 is exact (`inf`). In whole-image RGB, q=100 reads **8.5–13.1 dB below q=95** at the
-same format on every image measured, and 4:2:2 comes out worse than 4:2:0 on three of four — an
-inversion, since 4:2:2 keeps twice the chroma. That is **BUG-49**, filed P1 with the places to look.
+**2.7x to 20x worse in colour**, p95 dE00 above 4.8 everywhere, and 4:2:2 — which keeps twice the
+chroma — comes out *worse* than 4:2:0 at q=100 while being better at q=95 and q=99. 4:4:4 at q=100
+is exact (dE00 0.0000). That is **BUG-49**, filed P1.
+
+**An earlier version of this record cited a luma defect ("y 51.16 … not lossless even in luma") and
+that is withdrawn.** Those numbers came from the decoded RGB converted to `yuv444p`, which
+CLAUDE.md warns is contaminated by chroma error; in YCoCg-R, the plane GNC actually codes, luma at
+q=100 is **the best of the three rungs** (57.4–66.9 dB against 52.3–52.7 at q=95). The refusal
+below does not depend on which plane is damaged — only on the candidate not being better on both
+axes — so the decision stands on the colour table above.
 
 ## The decision
 
@@ -58,12 +66,14 @@ exactly the behaviour the missing field produced by accident.
 
 ## Why refuse rather than take the rate
 
-Because −2.70% for −3.9 dB is a rate/quality trade, and RATE-2 (`0036`) exists precisely because
+Because −2.70% of rate for 2.7x the colour error is a rate/quality trade, and RATE-2 (`0036`)
+exists precisely because
 its own trade needs no metric: *"when the lossless candidate wins it wins on both axes at once,
 which is why this needs no rate/quality trade-off rule."* Shipping the fix without the refusal
 would smuggle a trade into a mechanism whose licence to act without a metric comes from there not
-being one. CLAUDE.md's tolerance for a PSNR regression is 0.3 dB "flag and investigate"; this is 13
-times that.
+being one. And the axis it trades on is the one VMAF cannot see at all, which is why CLAUDE.md
+sends chroma questions to dE00: mean 0.96 → 2.56 on bbb at 4:2:0 crosses a just-noticeable
+difference, for 2.7% of rate.
 
 The same reasoning is why LOSSLESS-3 (`0073`) is gated to 4:4:4. That gate cited BUG-46; it now
 cites BUG-49, which is the actual obstacle.

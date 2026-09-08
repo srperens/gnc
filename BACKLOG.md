@@ -4737,87 +4737,12 @@ concentrated on one clip. If it is edge blocks with outward motion vectors speci
 clamping MC's reads to the *visible* bounds instead of the padded ones is a much smaller change
 than a bitstream version — and it is a question about `motion_compensate.wgsl`, not about padding.
 
-
-
-Filed 2026-09-08 by INTRA-1 step 3, which measured the tax and then measured how much of it a fill
-change returns. **−4.5% of intra rate at 1080p, at unchanged visible quality, from ~20 lines of
-`pad.wgsl` — gated on inter, which is unmeasured.** Decision `docs/decisions/0034`.
-
-**What is proven.** `src/shaders/pad.wgsl` edge-replicates every plane up to a whole multiple of
-`tile_size` and the codec then codes the padded plane. A 1920x1080 frame is coded as **2048x1280 —
-26.4% more coefficients, 20.9% of the coded samples outside the picture**, which the decoder crops
-and no metric ever sees.
-
-- **It is really coded**, and byte for byte: rebuild the padded plane in Python, encode it as a
-  picture in its own right, and bbb_1080p at q=90 with `--abac` gives **1 793 794 B against
-  1 793 794 B** — the same figure this file records for the production encode.
-- **It costs 6.60% of rate** (projected from a content-controlled crop pair, quality held to
-  0.005 dB) or **6.70 points** (drop in the cross-codec gap to J2K 9/7, native against
-  padding-free, on one ladder). Per image
-  2.65–8.30% projected, and it tracks the padding fraction: kristensara_720p pads only 720 -> 768
-  and reads a third of the 1080p figure. The content term is measured, not assumed: JPEG 2000 reads
-  **−0.13% to +0.02%** between the same two crops where GNC reads +11.6% to +25.2%.
-- **A fill change returns two thirds of it.** BD-rate against the shipped edge replication, on the
-  four ENT-4 stills at q=80–94 with `--abac`: replicate-then-fade-to-a-scalar over 8 px is
-  **−4.48% RGB / −4.52% Y**, a flat scalar is −4.34%, the same fade over 32 px is −4.12%, and a
-  whole-point mirror of the picture into the padding is **+11.41%** — so replication was already
-  the better of the two textbook extensions, and what matters is being flat in the *direction of
-  extension* rather than smooth at the seam.
-- **Visible quality does not move**: bbb at q=90 reads 50.060 dB under a flat fill against
-  50.061 dB under replication, so the step discontinuity a flat fill puts at the picture edge costs
-  less than the detail it saves.
-
-**Why it is not already done, and this is the whole content of the item.** The decoder keeps the
-padded region in the **reference buffer**, and motion compensation reads it for blocks at the frame
-edge — edge replication is the standard choice there precisely because it extends the picture
-plausibly. Nothing in the intra measurement says what a flat or faded fill does to inter
-prediction, and a change that pays 4.6% on stills and loses more than that on a P-chain is not a
-change. **So the gate is an inter measurement, not an intra one.**
-
-Three shapes, and they are not equivalent:
-
-1. **Change the fill unconditionally.** Cheapest to write, and it puts the whole risk on inter.
-   Needs the P-chain measurement first: ki=9 and all-intra, ≥3 sequences, at q=85 and q=92, on both
-   4:4:4 and 4:2:0, with **worst-frame** PSNR reported and not just the mean — that is the figure
-   the dead zone failed on (INTRA-2, up to −1.93 dB), and an edge-block prediction change has the
-   same shape of risk.
-2. **Change the fill on I-frames only.** Same split INTRA-2 arrived at, and for the same reason.
-   But an I-frame is also a reference, so this narrows the exposure rather than removing it.
-3. **Have the decoder re-replicate the picture edge into the padding after reconstruction.** The
-   encoder may then write whatever is cheapest while the reference stays MC-friendly, so the intra
-   win is collected with no inter risk at all. It changes the **decoding process**, so it needs a
-   bitstream version and old streams keep the old behaviour — a design decision, and the reason
-   this is a P1 item rather than a shader tweak.
-
-**Success criteria, stated in advance.** ≥3% of intra rate at q=90 on ≥3 stills (the measured
-figure is 4.5%, so this is a floor not a target), **and** no worst-frame regression above 0.3 dB on
-any of ≥3 sequences at ki=9 in either chroma format. If inter loses more than intra gains, shape 3
-or nothing.
-
-**RATE-2 already reclaims part of this for free above q=95, so price PAD-1 below it.** Found while
-re-checking step 3 against `a7273ab`: RATE-2 codes q=95..99 both ways and keeps the smaller, and it
-reaches the **padded** arm first — on bbb at q=98 the padded crop came back 5.78% smaller while the
-tile-aligned crop did not move at all, because a flat padding region is cheap to code losslessly.
-So a padded picture crosses RATE-2's threshold at a lower q than the same picture aligned, and the
-tax it is crossing is the one PAD-1 removes. **Two consequences for whoever takes this:** the
-remaining value is concentrated at q<95, and **a BD-rate ladder for it must stay at q<=94** —
-above that the padded arms come back bit-exact lossless, quality is `inf`, and a Bjontegaard fit
-over an infinity is a silent non-number. `scripts/meas_intra1_padding.py` now refuses a non-finite
-rung rather than integrating it, and defaults to q=80/85/90/94.
-
-**Ceiling, so nobody over-invests.** A fill change tops out at ~4.5 of the 6.6 points. Recovering
-all 6.6 means **not padding at all** — partial border tiles the way JPEG 2000 has them — which
-touches tile origins, the tile grid, every shader deriving a position from `tile_size`, and the
-per-tile CRC and seek structures. Knowing the ceiling is 6.6 and not 27 is the useful part; the
-cost of that change is not estimated.
-
-**Canary.** The fill is a silent feature by construction — it writes pixels nobody looks at — so it
-needs one that does not depend on quality: `scripts/meas_intra1_padding.py --canary` must show the
-production encode and the Python-rebuilt padded plane **still byte-identical** under the new fill,
-which is the only thing that proves the shader and the model of it agree.
-
-**Harness already built:** `scripts/meas_intra1_padding.py` (`--canary`, `--part 3` for the fill
-sweep, `--project-from` for the projection with no GPU).
+**The original filing** — the pre-shipping version of PAD-1, with the three candidate shapes and
+the oracle figure of −4.5% — is superseded by the two decision records that came out of it
+(`0034` for the measurement, `0039` for the decision) and is in git history. It is not reproduced
+here because two of its claims are now wrong: the intra figure is −4.63% measured on the shipped
+encoder rather than −4.5% from an oracle, and it said the still-path fill would need a bitstream
+version, which it does not — `pad.wgsl` is compiled only in the encoder.
 
 ### INTRA-2 — apply the dead zone to I-frames only (todo, **P1**)
 

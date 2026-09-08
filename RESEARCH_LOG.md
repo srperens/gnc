@@ -4,6 +4,48 @@
 
 ---
 
+## BUG-44 — filed and closed in the same hour: the instrument was fine, the tree it was measured on was not (2026-09-08)
+
+**What was filed.** RATE-4 reported the encoder's reference against the decoder's at `q=100` MED
+as **max |enc − dec| = 254.0039 on 65 535 of 65 536 pixels**, encoder side fractional and decoder
+side integral, and could not reconcile it with `q=95..99` matching at 0.0000. I filed it as
+BUG-44, reasoning that it could not coexist with my own result — a `q=100` sequence that is
+bit-exact on 48 of 48 frames through the container — because a P-frame cannot be md5-identical to
+its source while predicting from a picture the decoder does not hold.
+
+**That reasoning was right and the conclusion was wrong.** The shipped instrument agrees exactly.
+`lossless_iframe_reference_matches_the_decoders`, on the same 256×256 gradient with
+`GNC_REF_DEBLOCK=0`:
+
+```
+q=99  transform=Wavelet     plane Y/Co/Cg: max |enc-dec| = 0.0000, nonzero 0/65536
+q=100 transform=MedPredict  plane Y/Co/Cg: max |enc-dec| = 0.0000, nonzero 0/65536
+```
+
+It is in the suite, it is green, and it has asserted this since `0042`.
+
+**The 254.0039 was measured on a patched encoder** — RATE-4 had implemented `0040` point 4's
+source-copy reference before taking the diff, so the encoder side was a colour-converted *source*
+plane rather than a reference: a buffer that has not been through the stage that produces one, and
+in a different scale (the reported values are a ramp in steps of 0.498 ≈ 127.5/256, against a
+reference in 0..255). True of that patch, silent about the shipped pair.
+
+**The lesson is about reading a peer's number, and it is cheap to state.** Two sessions'
+measurements that cannot both be true is a genuine signal, and it was worth chasing. But the
+question "which one is wrong" has a third answer neither of us listed: *neither, because they were
+taken on different trees*. I had the peer's numbers and not their diff, and filed on the numbers.
+One `cargo test --release --lib lossless_iframe_reference_matches_the_decoders` closed it ten
+minutes after it got an id — and would have closed it before, had I run the assertion that already
+existed for exactly this question.
+
+**Kept:** `0040` point 4's route fails for a reason worth writing down — a lossless frame's
+reference is *not* simply its colour-converted source, because that buffer is at a different stage
+and a different scale. RATE-4 holds the refutation.
+
+**Gates:** no code changed; documentation only.
+
+---
+
 ## BUG-39 — lossless video works: a fractional prediction cannot survive a step-1.0 quantiser (2026-09-08)
 
 **Hypothesis, named in this log an hour earlier and now tested.** After cause 3, `q=100` inter

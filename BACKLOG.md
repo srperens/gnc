@@ -5074,7 +5074,6 @@ tiled.
 **Worth checking one level down while in here:** abac's 64px code-blocks are anchored at the
 subband origin, and T.800 truncates *its* border code-blocks the same way rather than padding them.
 
-### INTRA-2 — apply the dead zone to I-frames only (todo, **P1**)
 ### INTRA-2 — apply the dead zone to I-frames only (**DONE 2026-09-08**)
 
 **Shipped as: `dead_zone` floored at 0.6 over q=85..95, plus a new `dead_zone_referenced`

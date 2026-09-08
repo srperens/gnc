@@ -431,6 +431,7 @@ If this table and `scripts/claim list` disagree, the table is wrong.
 
 | worktree | branch | area |
 |---|---|---|
+| `../gnc-rebaseline` | `rebaseline` | **MEAS-10 DONE 2026-09-08.** Re-took BASELINE at `0a1b055`. Stills q=25/50/75 bpp −4.3/−4.8/−4.9% from PAD-1 (`GNC_PAD_FILL=replicate` reproduces the old rows); q=90 unchanged. Sequences replaced the withdrawn I+P+B/BUG-27 rows; on camera content at q=90 inter costs more than all-intra. QUAL-1 ladder **+90.5% → +89.2%** (bbb +128.5, old_town +70.2, crowd_run +68.8). No fps. No codec change. |
 | `../gnc-abac`, `.claude/worktrees/abac` (`abac-gate`) | `abac` | **released — question answered, see BACKLOG Part 6.** The idle-machine bench is run. Range at cb=64 costs **1.69× frame decode for −16.7% rate** at q=90; Interval costs 3.99×. Rice's own entropy stage is 47% of frame decode, which caps any entropy work at 1.9×. What remains is a positioning call, not an engineering one. |
 | `../gnc-abac` | `abac` | same worktree, now on **BUG-8** — the encoder's local decode diverges from the real decoder down a GOP. |
 | `../gnc-nearlossless` | `nearlossless` | **done and merged 2026-09-07** — BUG-15 fixed, INTRA-NEARLOSSLESS closed by measurement, RATE-2 confirmed independently. Worktree removed. |

@@ -59,9 +59,10 @@ convenient one.
 
 ### 5. The headline gap figure was wrong by 3x, and the target is now reachable (QUAL-1)
 
-At the contribution operating point GNC needs **+90.5% BD-rate on PSNR** against x264 — about
+At the contribution operating point GNC needs **+89.2% BD-rate on PSNR** against x264 — about
 1.9x — not the 5.6x recorded from MEAS-1, which was measured at distribution bitrates with the
-quality ladder above q=92 dead. Nothing in the coder changed between the two measurements. This
+quality ladder above q=92 dead. (QUAL-1's +90.5% was the same ladder on 2026-09-06; MEAS-10
+re-took it after INTER-2.) Nothing in the coder changed between the two measurements. This
 matters for prioritisation more than for pride: **against 5–7x, single-digit improvements were
 provably pointless; against 1.9x they accumulate into the target.** Every "this is too small to
 bother with" judgement in this repo predating 2026-09-06 was made against the wrong denominator.
@@ -112,7 +113,7 @@ measured advantage over x264 on any axis at this operating point.**
    this is **not** a coding deficiency —
    but unlike it, **two thirds is recoverable: a fill change is worth −4.5% of shipped intra rate**
    at unchanged visible quality, filed as **PAD-1**. Decision `docs/decisions/0034`.
-1. **Intra at contribution quality** — the whole remaining +90.5% lives here, per findings 1 and 5.
+1. **Intra at contribution quality** — the whole remaining +89.2% lives here, per findings 1 and 5.
    Inter breaks even at this operating point for x264 too, so this is the only place the gap is.
    **First instalment paid 2026-09-07 (ABAC-SHIP): −17.3% of intra rate at q=90, opt-in.** Against
    the corrected +90.5% denominator that is roughly a fifth of the gap, from one mechanism. The
@@ -2824,6 +2825,47 @@ coding — P-frames have zero reordering delay and were the better performer at 
 output-to-display are all unmeasured). Note the ~256-line tile floor is not currently reachable:
 the pipeline processes whole frames, so the practical floor is one full frame regardless of tile
 size.
+
+### MEAS-10 — Re-take BASELINE against current HEAD (**DONE 2026-09-08**)
+
+Pinned to `0a1b055`. Compression only; fps not quoted (load 2.6–3.9). Harness:
+`scripts/meas10_rebaseline.sh` plus `scripts/meas1_vs_h264.py` on 17-frame y4m derived from the
+PNG sequences. Canary: `GNC_PAD_FILL=replicate` reproduces the previous still rows exactly.
+
+**Stills, bbb_1080p 4:4:4 Rice** — PAD-1 is why q=25/50/75 moved; q=90 already included it:
+
+| q | before (BASELINE) | MEAS-10 | bpp |
+|---|---|---|---|
+| 25 | 35.63 dB / 1.64 / 90.31 | 35.63 / **1.57** / 90.31 | −4.3% |
+| 50 | 40.30 dB / 2.73 / 95.02 | **40.25** / **2.60** / **95.07** | −4.8% |
+| 75 | 44.84 dB / 4.53 / 96.58 | **44.64** / **4.31** / **96.55** | −4.9% |
+| 90 | 49.89 dB / 7.21 / 97.06 | 49.89 / 7.21 / 97.06 | 0 |
+| 100 | — | **PSNR inf** / 12.57 / 97.43 | bit-exact |
+
+Four images at four q, plus q=100 on bbb. At q=75 RGB PSNR is −0.20 dB under PAD-1's decay
+fill; PAD-1's own gate was q=80–94 (−0.001 dB). VMAF −0.03. Under both tolerances.
+
+**Sequences, 10 frames ki=9 4:4:4, shipped default `2I+8P+0B`:**
+
+| sequence | q=75 bpp / PSNR / VMAF | q=90 | vs I-only q=90 |
+|---|---|---|---|
+| crowd_run | 8.39 / 42.47 dB / 99.68 | 13.17 / 49.60 / 99.72 | **+5.3%** |
+| old_town_cross | 8.39 / 42.36 dB / 99.38 | 13.04 / 49.59 / 99.70 | **+9.2%** |
+| bbb_extended | 3.07 / 43.55 dB / 97.88 | 6.77 / 50.28 / 99.16 | −11.3% |
+
+The withdrawn q=75 I+P+B rows (crowd_run 5.55 bpp / 39.04 dB) are not comparable. On camera
+content at q=90, inter costs more than all-intra.
+
+**QUAL-1 ladder re-run, 17 frames, 4:2:0, q=85/92/96/99 vs crf=1/2/4/8:**
+
+| | bbb_extended | old_town_cross | crowd_run | **mean** |
+|---|---|---|---|---|
+| MEAS-10 | +128.5% | +70.2% | +68.8% | **+89.2%** |
+| QUAL-1 | +129.0% | +71.9% | +70.6% | +90.5% |
+
+−1.3 points, direction INTER-2 predicted (only q=85 of four rungs moved). VMAF BD-rate on
+old_town is +2548% at 99.8–99.8 — not quoted. RATE-3 is still in flight; this is HEAD without
+it. No codec change. No fps.
 
 ### CANARY-1 — Encode time must move across GPU tiers (**DONE 2026-09-07 — PASSES at 34x**)
 

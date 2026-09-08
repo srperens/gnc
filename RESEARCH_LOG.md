@@ -4,6 +4,79 @@
 
 ---
 
+## MEAS-10 — BASELINE re-taken at `0a1b055` (2026-09-08)
+
+**Hypothesis.** PAD-1, INTRA-2, INTER-2, BUG-16 and RATE-2 all landed after the last whole-table
+take (2026-09-06, `e872904`). Individual rows were patched; q=50/75 stills, every sequence row,
+and QUAL-1's +90.5% were stale. Re-measure compression (not fps — load 2.6–3.9) on current HEAD.
+
+**Pinned:** `0a1b055`. Binary built in `../gnc-rebaseline`. `vmaf` 3.2.0. Four stills × q=25/50/75/90
+plus q=100 on bbb; three sequences × q=75/90, 10 frames, ki=9, 4:4:4; QUAL-1 ladder 17 frames,
+4:2:0, q=85/92/96/99 vs x264 crf=1/2/4/8. Harness `scripts/meas10_rebaseline.sh` and
+`scripts/meas1_vs_h264.py`.
+
+### Stills (Rice, 4:4:4)
+
+bbb_1080p, the BASELINE table:
+
+| q | PSNR | bpp | VMAF | vs previous row |
+|---|---|---|---|---|
+| 25 | 35.63 dB | 1.57 | 90.31 | bpp −4.3%; PSNR/VMAF identical |
+| 50 | 40.25 dB | 2.60 | 95.07 | −0.05 dB, bpp −4.8%, VMAF +0.05 |
+| 75 | 44.64 dB | 4.31 | 96.55 | **−0.20 dB**, bpp −4.9%, VMAF −0.03 |
+| 90 | 49.89 dB | 7.21 | 97.06 | unchanged (already PAD-1 + INTRA-2) |
+| 100 | inf | 12.57 | 97.43 | bit-exact; VMAF saturated |
+
+**Canary.** `GNC_PAD_FILL=replicate` at q=50 and q=75 reprints the previous BASELINE columns
+exactly (40.30 / 2.73 / 95.02 and 44.84 / 4.53 / 96.58). So the bpp drop *is* PAD-1. The
+−0.20 dB RGB PSNR at q=75 is PAD-1 at an operating point below its own q=80–94 gate, where it
+measured −0.001 dB. VMAF −0.03. Under both tolerances (0.3 dB / 0.5 VMAF).
+
+The other three images, same q points:
+
+| image | q=25 PSNR/bpp/VMAF | q=50 | q=75 | q=90 |
+|---|---|---|---|---|
+| blue_sky_1080p | 37.36 / 1.12 / 92.91 | 41.32 / 2.05 / 95.91 | 44.93 / 3.54 / 96.89 | 49.64 / 6.07 / 97.18 |
+| touchdown_1080p | 35.55 / 0.93 / 89.50 | 39.32 / 1.97 / 94.99 | 43.98 / 3.84 / 96.53 | 49.31 / 6.69 / 97.00 |
+| kristensara_720p | 38.54 / 0.70 / 92.82 | 41.55 / 1.26 / 95.92 | 44.73 / 2.52 / 96.90 | 49.34 / 5.36 / 97.20 |
+
+### Sequences (Rice, 4:4:4, ki=9, 10 frames, `2I+8P+0B`)
+
+| sequence | q | bpp | PSNR avg | PSNR min | VMAF | I-only bpp | I+P vs I |
+|---|---|---|---|---|---|---|---|
+| crowd_run | 75 | 8.39 | 42.47 | 42.27 | 99.68 | 8.76 | −4.2% |
+| crowd_run | 90 | 13.17 | 49.60 | 49.23 | 99.72 | 12.51 | **+5.3%** |
+| old_town_cross | 75 | 8.39 | 42.36 | 42.17 | 99.38 | 8.25 | **+1.7%** |
+| old_town_cross | 90 | 13.04 | 49.59 | 49.22 | 99.70 | 11.94 | **+9.2%** |
+| bbb_extended | 75 | 3.07 | 43.55 | 42.37 | 97.88 | 4.53 | −32.3% |
+| bbb_extended | 90 | 6.77 | 50.28 | 50.06 | 99.16 | 7.63 | −11.3% |
+
+The withdrawn crowd_run q=75 row was 5.55 bpp / 39.04 dB / VMAF 99.36, I+P+B through BUG-27.
+Not comparable. On camera content at q=90, inter is a rate *cost*. Animation still saves.
+Confirms INTER-1 on current HEAD.
+
+### QUAL-1 ladder vs x264
+
+Same parameters as 2026-09-06: 17 frames, ki=9, 4:2:0, 8-bit, `--tune psnr`.
+
+| | bbb_extended | old_town_cross | crowd_run | **mean** |
+|---|---|---|---|---|
+| BD-rate PSNR-Y | +128.5% | +70.2% | +68.8% | **+89.2%** |
+| overlap dB | 49.9–56.0 | 49.8–55.9 | 49.8–56.0 | |
+| QUAL-1 | +129.0% | +71.9% | +70.6% | +90.5% |
+| BD-rate VMAF | +122.7% | **+2548.6%** | +135.1% | — |
+
+**Use +89.2%.** 1.3 points against QUAL-1, all in INTER-2's predicted direction (q=85 of four
+rungs). Still ~1.9x. VMAF BD-rate is not a number at this end — old_town's overlap is 99.8–99.8.
+RATE-3 is in flight on another worktree; this ladder does not include it. Sequence I-frames at
+q=95–99 still refuse RATE-2's lossless fallback.
+
+Raw GNC bpp / PSNR-Y: crowd_run 6.54/49.60, 7.38/51.48, 8.69/53.99, 10.24/58.14; old_town
+6.35/49.60, 7.24/51.48, 8.57/54.01, 10.11/58.27; bbb 3.71/49.88, 4.42/51.64, 5.47/54.05,
+6.85/58.29.
+
+No codec change. No fps claimed.
+
 ## INTRA-2 — 90% of the blocker was a knob that moved two things (2026-09-08)
 
 **Hypothesis.** GNC's dead zone is a no-op in its own operating range — the quantiser is

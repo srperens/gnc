@@ -75,7 +75,12 @@ measured advantage over x264 on any axis at this operating point.**
 
 ### Priority order
 
-0. **INTRA-1 — where is the remaining 27%?** Added 2026-09-07 after ENT-4. With `--abac` on, GNC
+0. ~~**INTRA-1 — where is the remaining 27%?**~~ — **ANSWERED 2026-09-08 by step 3, and closed as
+   a queue entry.** 26.2 of the 27.1 points are named and **15.1 of them are not coding
+   deficiencies** (8.5 chroma allocation, 6.6 tile padding), so the intra coding gap on these four
+   images is closer to **+12%** than +27%. The remaining work is **PAD-1 (P1)** — the padding fill,
+   −4.6% of shipped intra rate, gated on inter — and **INTRA-2 (P1)** — the dead zone on I-frames
+   only, ~3 points. History below. Added 2026-09-07 after ENT-4. With `--abac` on, GNC
    needs 27.1% more bits than JPEG 2000 *using the same transform at the same depth*, and nothing in
    this repository accounts for it. Largest known compression gap. **Step 1 is done (2026-09-07):
    GNC spends within 7.5% of the entropy of its own coefficients at q >= 85, so entropy coding can
@@ -4076,7 +4081,23 @@ independently.
 Note JPEG XS is patented (GOALS, docs/POSITIONING.md) — this is a comparison, not a target to
 adopt.
 
-### INTRA-1 — Where is the remaining 27%? (todo, **P0** — the largest known gap in the codec)
+### INTRA-1 — Where is the remaining 27%? (**ANSWERED 2026-09-08** — 26.2 of the 27.1 points named)
+
+**Closed as a queue entry, not as a subject.** The item's own success criterion was "name where the
+27% goes, with a number per cause that sums to roughly the measured gap", and step 3 met it: 8.5
+chroma allocation + ≤7.5 entropy + 6.6 padding + ~3 dead zone + 0.6 tiling = **26.2 of 27.1**, with
+~0.9 unexplained. It loses its priority marker so `next` stops offering a P0 whose remaining work
+is 0.9 points of residue — **the work that is left lives in its two descendants, both filed with
+numbers and gates:**
+
+- **PAD-1 (P1)** — the fill change, −4.6% of shipped intra rate, gated on an inter measurement.
+- **INTRA-2 (P1)** — the dead zone on I-frames only, ~3 points, blocked on the P path.
+
+**15.1 of the 27.1 points are not coding deficiencies at all** (8.5 chroma allocation, 6.6
+padding), so the honest form of the intra coding gap on these four images is **closer to +12% than
++27%**. Anyone re-opening this should start from that number, not the headline one.
+
+Decisions `0024`, `0026`, `0027`, `0028`, `0034`.
 
 **The question.** With `--abac` on, GNC needs **+27.1% more bits than JPEG 2000 in 9/7 mode** at
 matched RGB PSNR, and **+48.3%** at matched Y-PSNR (ENT-4, four images, one metric path). J2K uses

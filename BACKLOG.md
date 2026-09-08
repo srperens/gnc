@@ -1504,7 +1504,25 @@ CLAUDE.md's portability prose corrected either way.
 **Why P2.** Same reasoning as BUG-31 — no measurement is invalidated and nothing fails on this
 machine — but the affected claim is a documented project rule, and step 1 may well be free.
 
-### BUG-41 — ENT-9 is filed twice with two different subjects, and item ids have no allocator (todo, P2)
+### BUG-41 — ENT-9 is filed twice with two different subjects, and item ids have no allocator (**CLOSED 2026-09-08 — the work is COORD-3's; the implementation is on branch `drnum`**)
+
+> **Closed as a duplicate, and the duplication is the same bug.** `COORD-3` was claimed by
+> `gnc-next3@next3` at 16:31Z — four minutes before this was filed — covering both halves: the
+> ENT-9 renumber (it holds `ENT-10` for it) and the allocator (`dr-0065`). **COORD-3 has no BACKLOG
+> heading**, so `scripts/claim` could not offer it, `items` could not show it and a grep of the tree
+> found nothing: it was visible only in `refs/claims/*`, which is the one place this session did not
+> look before filing. That is COORDINATION.md's "Reserving an id is not filing the item" a third
+> time, and it is what this entry is now evidence for.
+>
+> **The mechanism half is written and tested — take it, do not rewrite it.** Worktree `gnc-drnum`,
+> branch **`drnum-mech`** (`git log --all --oneline --grep 'BUG-41 mechanism'`), one file
+> (`scripts/claim`): the `claim item <PREFIX>` allocator, the
+> duplicate-startable-id detection in `items`/`next`, and two new `selftest` properties. **`scripts/claim
+> selftest` passes all six.** It is deliberately **not merged to `main`** — COORD-3 holds the work,
+> and two sessions editing `scripts/claim` for the same reason is the failure this file exists to
+> prevent. Cherry-pick it, or ignore it and say so.
+>
+> What is *not* done anywhere: the ENT-9 renumber itself (COORD-3 holds `ENT-10` for it).
 
 `main:BACKLOG.md` carries two startable `### ENT-9` headings for **different work**:
 
@@ -2676,6 +2694,28 @@ docs/decisions/` just before you write**, since reserving does not consult it an
 is not it. Also worth pairing with the BUG-32 lesson: commit the heading or the
 record stub *with* the reservation, so a reserved id that outlives its session is a filed item
 rather than a claim on nothing.
+
+### COORD-3 — item ids need the allocator that `dr` and `BUG` already have (in flight, held by `next3`)
+
+**Heading filed 2026-09-08 by the `drnum` session on the holder's behalf, not by its owner.** The
+work is `gnc-next3@next3`'s, claimed 16:31Z, and it was held for four minutes with no heading — so
+`scripts/claim` could not offer it, `items` could not show it, and BUG-41 was filed as a duplicate
+of it by a session that had read BACKLOG and the tree and neither of them said so. **A four-line
+stub is the whole fix for that**, and it is COORDINATION.md's own advice ("Commit the heading with
+the reservation, not after the work"), so it is written here rather than reported.
+
+The owner's scope, quoted from `git cat-file -p refs/claims/COORD-3`:
+
+> two ENT-9 headings are live on main (mine and the ENT-3 session's, filed minutes apart) — the id
+> collision that 0050 fixed for dr and BUG has no allocator for item ids, so it just happened
+> inside BACKLOG. My own commit is half of it, so it is mine to repair.
+
+It holds `ENT-10` for the renumber and `dr-0065` for the record. **Everything BUG-41 found is
+evidence for this item** — the ENT-9 timestamps, the audit that says 11 of the 12 duplicate ids in
+BACKLOG are the harmless "status entry plus original filing" convention, and a tested
+implementation of the allocator and the duplicate-id refusal on branch `drnum-mech` (one commit,
+`scripts/claim` only).
+Correct or replace this stub freely; it exists so the item outlives its session.
 
 ### BUG-27 — the encoder's P-frame reference was dequantised with the intra qstep (**FIXED 2026-09-07**)
 

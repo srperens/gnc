@@ -4670,7 +4670,74 @@ at tile 512 — 20% more coefficients — which reads as +6.1% rate for tile 512
 padding and reverses the sign of the real effect. Measure tile size on content that is a multiple
 of both sizes; `1024x512` centre crops are what INTRA-1 used.
 
-### PAD-1 — GNC codes its own tile padding, and 4.5% of intra rate is a fill choice (todo, **P1**)
+### PAD-1 — GNC codes its own tile padding (**DONE 2026-09-08** — shipped for stills, refused on references)
+
+**Shipped: −4.63% RGB / −4.60% Y of intra rate on stills, at unchanged visible quality, and
+nothing changes for video.** `pad.wgsl` now replicates the picture edge and fades to flat over
+8 px; the fade target is 8 strided samples of the edge line, which reproduces that line's exact
+mean while needing no reduction, no per-frame uniform and no host pass. Measured on the *shipped
+encoder* against `GNC_PAD_FILL=replicate`, four stills, q=80..94, `--abac`: bbb −5.86%, blue_sky
+−4.99%, kristensara −1.75%, touchdown −5.90%. **The offline oracle predicted −4.63% / −4.60% —
+agreement to two decimals on both metrics from independent implementations.**
+
+**The inter gate failed and that is why this is not the default everywhere.** At ki=9 with the fill
+forced on: crowd_run and old_town_cross move worst-frame PSNR by **+0.000 dB** for −6.9% to −10.1%
+of rate, but **bbb_extended loses 1.30 dB of worst-frame PSNR at q=85 and 4.03 dB at q=92** — the
+same shape as INTRA-2's dead zone, mean −2.28 dB against worst −4.03 dB. The control: **the same
+clip at ki=1 loses nothing** (−5.65% of rate, PSNR identical), which pins the cause to the MC
+reference rather than to the coding. Motion compensation is handed the *padded* dimensions and
+clamps its reads to them (`src/decoder/gpu_work.rs:478`), so an edge block whose motion vector
+points outward predicts from the fill.
+
+So the policy is per-path and fail-safe: `quality_preset` opts in, `CodecConfig::default()`
+refuses (the sequence path builds from it), all four `main.rs` funnels that already refuse RATE-2's
+`lossless_fallback` refuse this too, both sites where the sequence encoder codes an I-frame through
+`EncoderPipeline::encode` clear it, and every other padding dispatch there asserts replication.
+**Sequence output is byte-identical to the pre-PAD-1 encoder.**
+
+**Canaries, because a fill writes pixels nobody looks at and is silent by construction.**
+`GNC_DIAGNOSTICS=1` prints which fill each path took and why;
+`scripts/meas_intra1_padding.py --canary` checks the shader byte-for-byte against an independent
+Python reimplementation and passes in *both* modes; `scripts/meas_pad1_inter.py` keeps three arms
+and its forced-on arm is **expected to regress**, as the standing guard on this decision.
+
+Two defects were found by verifying rather than assuming, and both would have shipped the 4 dB
+loss: the pad uniform is shared and persistent so a sequence inherited `decay` from a previous
+still (`benchmark-sequence` calls the still path several times per run), and sequence configs built
+from `quality_preset` inherited the flag. Decision `docs/decisions/0039`.
+
+**Still open, filed as PAD-2:** the inter half. Having the decoder re-replicate the picture edge
+after reconstruction would let the encoder write a cheap fill while the reference stays
+MC-friendly, collecting the remaining ~4.6% on video too — but it changes the decoding process and
+needs a bitstream version.
+
+### PAD-2 — collect the padding fill on inter, by re-replicating in the decoder (todo, **P2**)
+
+Filed 2026-09-08 by PAD-1, which shipped the still half and measured exactly why the inter half
+does not follow. **Worth roughly −7% to −10% of sequence rate** (that is what forcing the fill on
+already measures), blocked on a bitstream-visible change.
+
+**The problem in one line.** The fill is cheap to *code* and bad to *predict from*, and today both
+sides use the same padded plane for both purposes.
+
+**The shape that resolves it.** Let the encoder write the cheap fill, and have **both** sides
+overwrite the padding with edge replication of the *decoded* picture before it is used as a
+reference. Encoder and decoder then agree, the coded padding stays cheap, and motion compensation
+sees a plausibly extended picture again. It changes the decoding process, so it needs a bitstream
+version and old streams must keep the old behaviour.
+
+**What is already measured, so nobody re-derives it:** the forced-on arm of
+`scripts/meas_pad1_inter.py` (crowd_run and old_town_cross +0.000 dB, bbb_extended −1.30 and
+−4.03 dB, mean rate −8.64%), and the ki=1 control that isolates the cause. **Success criterion:**
+the rate win of the forced-on arm with worst-frame PSNR within 0.3 dB of replication on all three
+sequences, both chroma formats.
+
+**Cheaper thing to check first, and it may make PAD-2 unnecessary for most content:** the loss is
+concentrated on one clip. If it is edge blocks with outward motion vectors specifically, then
+clamping MC's reads to the *visible* bounds instead of the padded ones is a much smaller change
+than a bitstream version — and it is a question about `motion_compensate.wgsl`, not about padding.
+
+
 
 Filed 2026-09-08 by INTRA-1 step 3, which measured the tax and then measured how much of it a fill
 change returns. **−4.5% of intra rate at 1080p, at unchanged visible quality, from ~20 lines of

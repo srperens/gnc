@@ -865,6 +865,20 @@ impl EncoderPipeline {
         padded_h: u32,
     ) {
         let bufs = self.cached.as_ref().expect("cached buffers must exist");
+        // PAD-1: assert the fill mode here rather than trusting the value the buffer was built
+        // with. `pad_params_buf` is shared and persistent, and `benchmark-sequence` calls the
+        // still-image path (`encode_once`, which raises the mode) several times per run — so a
+        // sequence encode was inheriting `decay` from a previous still, which is the one
+        // configuration measured to cost up to 4.03 dB of worst-frame PSNR. Caught by the
+        // `GNC_DIAGNOSTICS` fill canary, which is why it exists.
+        //
+        // Only the `fill_mode` field is written (offset 16); the four dimensions above it are
+        // constant for the life of the buffer.
+        ctx.queue.write_buffer(
+            &bufs.pad_params_buf,
+            16,
+            bytemuck::bytes_of(&crate::pad_fill_mode(false)),
+        );
         self.dispatch_gpu_pad_with(
             ctx, cmd,
             &bufs.pad_params_buf, &bufs.raw_input_buf, &bufs.input_buf,
@@ -1673,8 +1687,40 @@ impl EncoderPipeline {
                 label: Some("encode_preprocess"),
             });
 
-        // GPU pad: raw_input_buf -> input_buf (edge-replicate to tile alignment)
+        // GPU pad: raw_input_buf -> input_buf (tile alignment)
         {
+            // PAD-1: this is the **still-image path, which has no reference frame**, so the
+            // padding may be faded flat — worth -4.63% RGB of intra rate at identical visible
+            // quality (decision 0039). The cached buffer is built with plain replication because
+            // every *sequence* path takes it as-is, and fading it there costs up to 4.03 dB of
+            // worst-frame PSNR by changing what edge blocks predict from. This is the only place
+            // the mode is raised, which is also why the sequence encoder needed no change.
+            #[repr(C)]
+            #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+            struct PadParams {
+                width: u32,
+                height: u32,
+                padded_w: u32,
+                padded_h: u32,
+                fill_mode: u32,
+                _pad0: u32,
+                _pad1: u32,
+                _pad2: u32,
+            }
+            ctx.queue.write_buffer(
+                &bufs.pad_params_buf,
+                0,
+                bytemuck::bytes_of(&PadParams {
+                    width,
+                    height,
+                    padded_w,
+                    padded_h,
+                    fill_mode: crate::pad_fill_mode(config.pad_fill_decay),
+                    _pad0: 0,
+                    _pad1: 0,
+                    _pad2: 0,
+                }),
+            );
             let pad_bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("pad_bg"),
                 layout: &self.pad_bgl,

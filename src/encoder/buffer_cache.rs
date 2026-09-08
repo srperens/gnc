@@ -599,18 +599,35 @@ impl CachedEncodeBuffers {
                     height: u32,
                     padded_w: u32,
                     padded_h: u32,
+                    // PAD-1: 0 = plain replication, 1 = replicate then fade flat.
+                    fill_mode: u32,
+                    _pad0: u32,
+                    _pad1: u32,
+                    _pad2: u32,
                 }
                 let p = PadParams {
                     width: orig_w,
                     height: orig_h,
                     padded_w,
                     padded_h,
+                    // Replication is the create-time value because **every sequence path
+                    // dispatches padding through `dispatch_gpu_pad_cached` and takes this buffer
+                    // exactly as built**, and fading the padding flat costs up to 4.03 dB of
+                    // worst-frame PSNR on a P-chain (PAD-1, decision 0039). The still-image path
+                    // overwrites it in `encode_once`, where there is no reference frame to
+                    // predict from. `GNC_PAD_FILL` still forces either mode, for the two
+                    // harnesses that need both arms.
+                    fill_mode: crate::pad_fill_mode(false),
+                    _pad0: 0,
+                    _pad1: 0,
+                    _pad2: 0,
                 };
                 ctx.device
                     .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                         label: Some("enc_pad_params"),
                         contents: bytemuck::bytes_of(&p),
-                        usage: wgpu::BufferUsages::UNIFORM,
+                        // COPY_DST so the still-image path can raise the fill mode; see above.
+                        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                     })
             },
 

@@ -920,6 +920,12 @@ fn build_ip_config(
     // clears it again internally; this line is what stops the throwaway GPU warm-up encodes from
     // paying for a second encode and printing a canary for a path that will not take it.
     config.lossless_fallback = false;
+    // PAD-1 is refused through the same funnel and for a parallel reason: fading the tile padding
+    // flat is worth -4.63% RGB on a still, but an I-frame in a chain is a *reference* and motion
+    // compensation predicts edge blocks from its padding — measured at up to 4.03 dB of
+    // worst-frame PSNR on bbb_extended at ki=9, and 0.000 dB on the same clip at ki=1. Decision
+    // 0039.
+    config.pad_fill_decay = false;
     if let Some(qs) = qstep {
         config.quantization_step = qs;
     }
@@ -1648,6 +1654,7 @@ fn main() {
                     gnc::manual_config(qstep.unwrap_or(4.0))
                 };
                 config_tw.lossless_fallback = false; // RATE-2 is intra-only (RATE-3)
+                config_tw.pad_fill_decay = false; // PAD-1 is still-only (decision 0039)
                 if let Some(qs) = qstep {
                     config_tw.quantization_step = qs;
                 }
@@ -2556,6 +2563,7 @@ fn main() {
                     gnc::manual_config(qstep.unwrap_or(4.0))
                 };
                 config_tw.lossless_fallback = false; // RATE-2 is intra-only (RATE-3)
+                config_tw.pad_fill_decay = false; // PAD-1 is still-only (decision 0039)
                 if let Some(qs) = qstep {
                     config_tw.quantization_step = qs;
                 }
@@ -3823,6 +3831,7 @@ fn main() {
                 let (first_rgb, w, h) = load_image_rgb_f32(&first_path);
                 let mut config_tw = gnc::quality_preset(quality);
                 config_tw.lossless_fallback = false; // RATE-2 is intra-only (RATE-3)
+                config_tw.pad_fill_decay = false; // PAD-1 is still-only (decision 0039)
                 config_tw.temporal_transform = temporal_mode;
                 // Rate control not wired for this subcommand (benchmark-sequence non-streaming path).
                 // Use benchmark-sequence with --bitrate for rate-controlled encoding.

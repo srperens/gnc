@@ -765,7 +765,24 @@ sequential test run could ever have caught, and the instinct to make it go away 
 suite would have preserved it.
 
 
-### BUG-25 — `block_match_split.wgsl` kills two Vulkan drivers (**contained**; cause found 2026-09-08, **not fixed**, P1)
+### BUG-25 — `block_match_split.wgsl` kills two Vulkan drivers (**contained**; cause **withdrawn** 2026-09-08, **not fixed**, P1)
+
+**Correction 2026-09-08 — the second one on this item. Defect B's *cause* is withdrawn; its
+*measurements* are not.** Every driver result below was measured and stands. What is withdrawn is
+the attribution. `wgpu-hal` 24.0.4's own rule is `buffer: robust_buffer_access2 ? Unchecked :
+Restrict` (`adapter.rs:1899`), the cap is read from a **queried** `VK_EXT_robustness2`
+(`adapter.rs:1595`, `:1372`), and **both** Vulkan implementations on the bench box report the
+feature — the RTX per `vulkaninfo`, lavapipe since Mesa 22.2. So wgpu should be shipping
+`buffer: Unchecked` here. Measured on the dev machine with no GPU: the faithful reconstruction of
+that configuration (`caps_index_restrict`) is **byte-identical** to `index_restrict_only`, which was
+measured **pipeline OK**, and it contains **zero `OpArrayLength`** where every crashing
+configuration contains **48**. `docs/bug25/minimal_repro.spvasm` is nothing but an `OpArrayLength`
+clamp, so on that reading it is **not a reduction of GNC's crash**. See **BUG-33** (rewritten) for
+the four propositions and the single run that settles it, and RESEARCH_LOG 2026-09-08 for the
+numbers. Also established there: **defect A is upstream `gfx-rs/wgpu#7048`, closed by PR #7239** —
+our local `switch` rewrite duplicates a fix that already exists, which is worth knowing the next
+time "upgrade wgpu" is priced.
+
 
 **The premise this item was built on was wrong, and correcting it found two defects.** The item
 said `spirv-val` passes all 62 shaders, so two unrelated drivers were dying on valid SPIR-V. That
@@ -1545,42 +1562,60 @@ decoder down a GOP"), which may be this seen from the other side.
 
 </details>
 
-### BUG-33 — why does wgpu ask for `buffer: Restrict` on an adapter that reports `robustBufferAccess2`? (todo, P1)
+### BUG-33 — does wgpu ship `buffer: Restrict` here at all? Its own source says it does not (todo, P1)
 
-**This is the one question standing between BUG-25 and a fix, and it is a reading question, not a
-measurement one.** Filed separately because BUG-25 is now a *driver* bug — GNC's shader is fine and
-every naga version emits the same shape — while this is a question about our own dependency, with a
-different answer depending on what it turns out to be.
+**Rewritten 2026-09-08 after the premise inverted.** This item was filed as "why does wgpu ask for
+`buffer: Restrict` on an adapter that reports `robustBufferAccess2`?". Reading the path it asked to
+have read answers it: **wgpu does not ask for it.** The remaining question is which of four
+propositions is false, and that is a sharper and cheaper item than the original.
 
-**What is established** (BUG-25, `docs/bug25/`): `BoundsCheckPolicy::Restrict` on **buffers** makes
-naga emit `OpArrayLength` + `OpISub`, and NVIDIA's and Mesa lavapipe's compilers both segfault on
-the result for `block_match_split.wgsl`. `buffer: Unchecked` compiles and builds a pipeline —
-**the only proven fix**. Upgrading naga does not help (30 crashes identically); rewriting the shader
-does not help (two constructs removed, still crashes).
+**The rule, read at all three sites** (`wgpu-hal` 24.0.4, the version in `Cargo.lock`):
 
-**The contradiction.** `wgpu-hal/src/vulkan/adapter.rs` picks
-`buffer: if self.private_caps.robust_buffer_access2 { Unchecked } else { Restrict }`, and this
-adapter reports **`robustBufferAccess2 = true`** with `VK_EXT_robustness2` present
-(`vulkaninfo`). So wgpu should be choosing `Unchecked`, and then nothing would crash — but the real
-WGSL path does crash, and a faithful `Unchecked` reconstruction does not. **The shipped module
-carries `Restrict`; the source says it should not.**
+* `vulkan/adapter.rs:1899`, in `device_from_raw` — the options every user shader is compiled with:
+  `index: Restrict`, `buffer: robust_buffer_access2 ? Unchecked : Restrict`.
+* `vulkan/device.rs:1831` and `:916` — all four policies `Unchecked` when
+  `runtime_checks.bounds_checks` is false.
 
-**Why it matters more than it looks.** The answer decides the shape of the fix:
+And `private_caps.robust_buffer_access2` (`adapter.rs:1595`) comes from **querying**
+`VkPhysicalDeviceRobustness2FeaturesEXT`, which wgpu pushes into its `features2` chain whenever the
+device *supports* the extension (`adapter.rs:1372`). Support decides it, not enablement. The RTX
+4000 Ada reports the feature, and lavapipe has implemented `VK_EXT_robustness2` since Mesa 22.2 —
+so **both** of the bench box's Vulkan implementations should be getting `buffer: Unchecked`.
 
-* **If wgpu is not enabling `VK_EXT_robustness2` when it could** — a defect or a gap on their side —
-  the fix is upstream and roughly one line, and GNC gets Vulkan inter coding by bumping a version
-  once it lands.
-* **If it is deliberate** (robustness2 requested only under some feature GNC does not ask for), GNC
-  needs a `[patch.crates-io]` pin or its own device-creation path, which is a maintenance
-  commitment worth deciding consciously rather than discovering.
+**Measured on the dev machine, no GPU** (RESEARCH_LOG, 2026-09-08): the faithful reconstruction of
+that configuration, `caps_index_restrict`, is **byte-identical** to `index_restrict_only`
+(`sha256 537e7329…`), which was measured on the box as **pipeline OK** — so `capabilities:
+Some([…])`, the previous "last untested candidate", is dead. And it contains **zero
+`OpArrayLength`**, while every configuration that crashed contains **48**. `docs/bug25/minimal_repro.spvasm`
+is nothing but an `OpArrayLength` clamp.
 
-**How to answer it.** Read the path from `supports_extension(ext::robustness2::NAME)` (adapter.rs
-~998) through `private_caps.robust_buffer_access2` (~1595) to the `spv::Options` construction
-(~1899), and establish whether `phd_features.robustness2` is populated from *queried* or from
-*enabled* features at that point. Confirm behaviourally rather than by reading alone: the elimination
-argument above is currently the only evidence, and it is indirect. A Vulkan capture layer would
-settle it outright, but none is installed on the bench box — `VK_LAYER_LUNARG_api_dump` or
-GFXReconstruct would do it.
+**So one of these four is false:**
+
+1. the adapter reports `robustBufferAccess2` — recorded from `vulkaninfo`, never confirmed to be the
+   physical device wgpu selected;
+2. wgpu-hal chooses as read above;
+3. `spirv_pipeline_probe` reproduces GNC's pipeline creation faithfully — it passes `layout: None`
+   and lets wgpu derive the layout, while GNC binds an explicit one;
+4. the crash is at compute-pipeline creation of this module at all.
+
+**How to answer it — one run, and it ends the argument.** Dump the module wgpu hands
+`vkCreateShaderModule` and `sha256` it against the 19 emitted configurations. Six lines in
+`compile_stage` behind a `[patch.crates-io]` git pin, or GFXReconstruct's `gfxrecon-extract` if it
+installs on the box.
+
+* hash `537e7329…` → production is the module already measured **OK**, the crash is not in the
+  module bytes, and the search moves to the pipeline layout. Note in that case that an NVIDIA report
+  from August 2026 has `vkCreateComputePipeline` segfaulting with no validation output **when the
+  descriptor set layout's first binding is not 0**, which is exactly the reduced reproducer's shape
+  (its only binding is `Binding 4`).
+* hash `3fe91fe0…` → `robustBufferAccess2` is not reaching wgpu, the original question is real, and
+  the fix is roughly one line upstream.
+
+**If a local switch is needed after all, it is not a `[patch.crates-io]` pin.** wgpu exposes the
+knob: `Device::create_shader_module_trusted(desc, ShaderRuntimeChecks { bounds_checks: false,
+force_loop_bounding: true })` reaches the `device.rs:1831` site and sets all four policies
+`Unchecked`. Costs one `unsafe` call, and **must be gated to the Vulkan backend** or Metal codegen
+moves with it and every Metal figure in this repository is invalidated.
 
 **Do not start by rewriting the shader.** That has been tried twice and is not where the defect is.
 

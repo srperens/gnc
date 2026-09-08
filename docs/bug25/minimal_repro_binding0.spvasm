@@ -1,0 +1,42 @@
+; SPIR-V
+; Version: 1.0
+; Generator: Khronos; 28
+; Bound: 1898
+; Schema: 0
+               OpCapability Shader
+               OpExtension "SPV_KHR_storage_buffer_storage_class"
+          %1 = OpExtInstImport "GLSL.std.450"
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint GLCompute %404 "main"
+               OpExecutionMode %404 LocalSize 256 1 1
+               OpDecorate %_runtimearr_uint ArrayStride 4
+               OpDecorate %32 NonWritable
+               OpDecorate %32 DescriptorSet 0
+               OpDecorate %32 Binding 0
+               OpDecorate %_struct_33 Block
+               OpMemberDecorate %_struct_33 0 Offset 0
+       %void = OpTypeVoid
+       %uint = OpTypeInt 32 0
+%_runtimearr_uint = OpTypeRuntimeArray %uint
+ %_struct_33 = OpTypeStruct %_runtimearr_uint
+%_ptr_StorageBuffer__struct_33 = OpTypePointer StorageBuffer %_struct_33
+         %32 = OpVariable %_ptr_StorageBuffer__struct_33 StorageBuffer
+     %uint_1 = OpConstant %uint 1
+       %bool = OpTypeBool
+        %405 = OpTypeFunction %void
+       %1897 = OpUndef %bool
+        %404 = OpFunction %void None %405
+        %398 = OpLabel
+               OpSelectionMerge %1638 None
+               OpBranchConditional %1897 %1553 %1554
+       %1553 = OpLabel
+       %1596 = OpArrayLength %uint %32 0
+       %1597 = OpISub %uint %1596 %uint_1
+               OpBranch %1639
+       %1639 = OpLabel
+               OpReturn
+       %1638 = OpLabel
+               OpReturn
+       %1554 = OpLabel
+               OpReturn
+               OpFunctionEnd

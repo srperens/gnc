@@ -4,6 +4,143 @@
 
 ---
 
+## BUG-25 / BUG-33 — the module we characterised is probably not the module that crashes (2026-09-08)
+
+**Yesterday's session closed with an elimination argument and a 42-line reproducer, and both rest
+on one premise: that the module wgpu hands the driver carries `BoundsCheckPolicy::Restrict` on
+buffers. Read against wgpu-hal's source and measured against naga on this machine, it almost
+certainly does not.** Every result below was obtained on the dev machine with no GPU and no Vulkan
+— a source read, 19 emitted SPIR-V modules and an instruction count — which is why it is worth
+writing down before the bench box is booked again.
+
+### What wgpu-hal 24.0.4 actually does — three sites, not one
+
+| site | function | policies it sets |
+|---|---|---|
+| `vulkan/adapter.rs:1899` | `device_from_raw` — the options **every user shader** is compiled with | `index: Restrict`, `buffer: robust_buffer_access2 ? Unchecked : Restrict` |
+| `vulkan/device.rs:1831` | `create_shader_module`, when `runtime_checks.bounds_checks == false` | all four `Unchecked` |
+| `vulkan/device.rs:916` | `compile_stage`, same condition | all four `Unchecked` |
+
+And the cap that decides the first row:
+
+```rust
+robust_buffer_access2: phd_features.robustness2.as_ref()
+    .map(|r| r.robust_buffer_access2 == 1).unwrap_or_default()   // adapter.rs:1595
+```
+
+`phd_features` is the struct wgpu fills by **querying** `VkPhysicalDeviceRobustness2FeaturesEXT`,
+which it pushes into the `features2` chain whenever the device *supports* the extension
+(`adapter.rs:1372`). Support, not enablement, is what decides the policy — so `buffer: Unchecked`
+on any device that reports the feature. **Both of the bench box's Vulkan implementations report
+it**: the RTX 4000 Ada does (`vulkaninfo`, recorded yesterday), and lavapipe has implemented
+`VK_EXT_robustness2` since **Mesa 22.2** (2022 — the box runs LLVM 20.1.2).
+
+One fidelity worry closed on the way: `binding_map` is not a variable. The Vulkan backend passes
+`desc.layout.binding_arrays` (`device.rs:2126`), which is empty on a device created with
+`Features::empty()`, as GNC's is (`src/lib.rs:1429`).
+
+### The 19 modules, and the one number that matters
+
+`examples/bug25_emit` writes `block_match_split.wgsl` once per configuration. Counting
+`OpArrayLength` (opcode 68) in each:
+
+| configuration | `OpArrayLength` | in a loop | bytes | driver, measured 2026-09-08 |
+|---|---:|---:|---:|---|
+| `bounds_restrict` | 48 | 14 | 42 520 | **CRASH** |
+| `buffer_restrict_only` | 48 | 14 | 39 848 | **CRASH** |
+| `wgpu_native`, `caps_wgpu_native` | 48 | 14 | 42 300 | **CRASH** |
+| `wgpu_polyfill` | 48 | 14 | 42 520 | **CRASH** |
+| `debug_on_restrict`, `wgpu_native_debug` | 48 | 14 | 44 356 / 44 136 | not recorded |
+| **`caps_index_restrict`, `index_restrict_only`** | **0** | 0 | 39 036 | **pipeline OK** |
+| `bounds_unchecked`, `naga_default`, `flags_wgpu`, `lang_1_0`, `lang_1_3`, `debug_on/off`, `zero_*` | 0 | 0 | 36 512–38 640 | OK where recorded |
+
+Two things fall out of the table, and neither needed the box:
+
+- **`caps_index_restrict` is byte-identical to `index_restrict_only`** — `sha256
+  537e73294518101d13521288d3e1d1029d01e6e1aaae3093235df60eee1ea3a6`. So `capabilities: Some([…])`,
+  which the previous entry named as "the last untested candidate", changes *nothing whatsoever* for
+  this shader. It is dead, and it was killable on a Mac.
+- **The faithful reconstruction contains zero `OpArrayLength`**, and `docs/bug25/minimal_repro.spvasm`
+  is nothing *but* an `OpArrayLength` clamp. If wgpu ships `buffer: Unchecked` on this adapter — and
+  its own source says it must — then that shape cannot occur in the module that crashes, and the
+  524-byte file reproduces **a different bug** from the one GNC has.
+
+The elimination argument therefore now reads the other way round: the configuration production
+should be shipping is byte-identical to one measured as **pipeline OK**, and production crashes
+anyway. So **at least one of these four is false**, and establishing which is BUG-33's real job:
+
+1. the adapter reports `robustBufferAccess2` — recorded from `vulkaninfo`, but never confirmed to
+   be the physical device wgpu actually selected;
+2. wgpu-hal 24.0.4 chooses the policy as read above;
+3. `spirv_pipeline_probe` reproduces GNC's pipeline creation faithfully;
+4. the crash is at compute-pipeline creation of this module at all.
+
+**Point 3 is the one the literature put a name to.** The probe passes `layout: None`
+(`spirv_pipeline_probe.rs:122`), so wgpu derives a bind group layout from the module; GNC binds an
+explicit one. An NVIDIA report from **August 2026** has `vkCreateComputePipeline` segfaulting
+inside the driver with no validation-layer output **when the descriptor set layout's first binding
+is not 0** — which is exactly the shape of our reduced file, whose only binding is `Binding 4`
+(`spirv-reduce` deleted bindings 0–3, and the oracle never noticed because the auto layout follows
+the module). Renumbering that to `Binding 0` and re-probing is a one-line test of whether the
+reproducer reproduces anything of ours.
+
+### What the literature says about the rest of it
+
+Searched because "two independent compilers segfault on valid SPIR-V" is a claim other people
+would have made before us, and they have:
+
+| finding | bearing on BUG-25 |
+|---|---|
+| **`gfx-rs/wgpu#7048`** — naga generates invalid SPIR-V when a by-value constant array is dynamically indexed more than once: it copies the array into a generated temporary and takes an `OpAccessChain` on it, and the temporary is referenced before it is declared. Reported Feb 2025 against wgpu 24.0.1, **closed by PR #7239**. Duplicates: `#7236`, `#7198`. | **This is defect A**, which we found independently and worked around by rewriting the 8-point diamond as a `switch`. It is an upstream bug with an upstream fix, so "upgrade wgpu" *would* have fixed defect A — it just does not fix defect B, which is what `b5a909c` measured. Worth knowing that our local rewrite duplicates a fix that already exists. |
+| `#7198`'s symptoms for the same defect: **segfault in `radv_shader_spirv_to_nir`** on RADV, and on **llvmpipe a wgpu validation error, "Parent device is lost"** | The second is verbatim what lavapipe printed on 2026-09-07 (RESEARCH_LOG, "What happens"). The lavapipe half of the original "two independent compilers" argument was very likely **defect A all along**, not defect B. |
+| **`gfx-rs/wgpu#6329`** — AMD's Windows driver takes an access violation inside pipeline creation on valid naga SPIR-V, no validation errors; **adding `OpLine` debug instructions makes the crash disappear**. Open, classified as a driver bug. | A precedent for our exact failure mode, and a cheap discriminator we already have configs for: `debug_on_restrict` and `wgpu_native_debug` were emitted and never probed. If debug info dodges it, that is a driver-optimiser bug and it names a workaround wgpu can be asked to apply. |
+| **Intel's compiler segfaults on SPIR-V with an `OpArrayLength` sourced from a StorageBuffer variable** (Mesa release notes; `seanbaxter/segfault_intel`), and RADV has had a bug with `NonUniform OpArrayLength` on SSBOs | Three vendors, one instruction. If the shipped module *does* carry the clamp after all, this is the company our bug is in, and the shape of the report is already established practice. |
+
+### A local fix that needs no fork — and is probably not needed
+
+BUG-33 framed the local option as a `[patch.crates-io]` pin. That is not necessary: wgpu exposes
+the knob itself. `Device::create_shader_module_trusted(desc, ShaderRuntimeChecks { bounds_checks:
+false, force_loop_bounding: true })` routes to the `device.rs:1831` site above and emits all four
+policies `Unchecked`, while keeping the loop bounding that stops a driver from concluding things
+about unreachable code. Two costs, both real: it is an `unsafe` call, and it must be **gated to the
+Vulkan backend** or Metal codegen changes with it and every Metal figure in this repository is
+invalidated. The SAFETY argument is honest — with `robustBufferAccess2` enabled the *hardware*
+clamps, which is exactly why wgpu drops the software checks on that path itself.
+
+Recorded, not implemented, because if the reading above holds there is nothing left to switch off.
+
+### One local discriminator, offered with its caveat
+
+Under `buffer: Restrict`, `block_match_split` carries **more `OpArrayLength` than any other shader
+in the tree** — 48, against 37 for the runner-up (`rans_normalize_encode_fused`) and **18 for its
+own sibling `block_match`, which compiles fine on both drivers**. Swept all 63 shaders under
+`--wgpu-only` to get that. The caveat that keeps it from being an explanation: the `rans_*` shaders
+are only built with `--rans` and were probably never compiled on the box at all, so "highest count
+crashes" is consistent with the data but not tested against it.
+
+### Next, in order, and the first two need no GPU
+
+1. **Renumber `minimal_repro.spvasm`'s `Binding 4` to `Binding 0`, reassemble, re-probe.** If it
+   stops crashing, the 524-byte artefact is a reproducer of an NVIDIA descriptor-layout bug and not
+   of ours, and it should be relabelled rather than shipped as evidence.
+2. **Probe `caps_index_restrict.spv`** — expected OK, since it is byte-identical to a module already
+   measured OK. It is the control for step 3, and it costs one run.
+3. **Dump the module wgpu actually hands `vkCreateShaderModule`** and `sha256` it against the 19
+   configs. A six-line `eprintln`/`fs::write` in `compile_stage` behind a `[patch.crates-io]` git
+   pin does it; GFXReconstruct's `gfxrecon-extract` would too, if it is installable on the box.
+   **This is the experiment that ends the argument**: if the hash is `537e7329…` the crash is not in
+   the module bytes at all and the search moves to the pipeline layout; if it is `3fe91fe0…` then
+   `robustBufferAccess2` is somehow not reaching wgpu and BUG-33 is a genuine dependency question
+   with a one-line upstream answer.
+
+**What is retracted by this entry.** Not a measurement — every driver result from yesterday stands
+as measured. What is withdrawn is the *attribution*: "defect B is `BoundsCheckPolicy::Restrict` on
+buffers" and "`buffer: Unchecked` is the only proven fix" were inferred by elimination from a
+reconstruction that is now known to differ from production in the one dimension the conclusion
+rested on. The same sentence has been wrong twice in two days for the same reason — a claim about
+what the driver receives, argued from something other than what the driver received.
+
+
 ## BUG-25 — GNC ships invalid SPIR-V, and that is *not* what crashes the driver (2026-09-08)
 
 Two defects, found in one session, and the second is not the first. Recording both because the

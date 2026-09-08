@@ -1,5 +1,12 @@
 # BUG-25 — the minimal reproducer
 
+> **Standing, 2026-09-08: this file reproduces *a* driver crash, and it is no longer clear it is
+> ours.** The shape it isolates is naga's `buffer: Restrict` clamp — and `wgpu-hal`'s own rule
+> (`adapter.rs:1899`) gives `buffer: Unchecked` on any adapter that reports `robustBufferAccess2`,
+> which both of the bench box's Vulkan implementations do. The faithful reconstruction of what wgpu
+> should be shipping here contains **zero `OpArrayLength`**. Two independent caveats are below.
+> See **BUG-33** and RESEARCH_LOG 2026-09-08 before citing this file as evidence.
+
 `minimal_repro.spvasm` is 42 lines of SPIR-V that **segfaults NVIDIA's Vulkan driver at pipeline
 creation** and passes `spirv-val`. It was produced by `spirv-reduce` from
 `src/shaders/block_match_split.wgsl` as naga 24 compiles it under wgpu's options — 41 068 bytes
@@ -43,9 +50,16 @@ Emitting the same shader with one policy changed at a time (`examples/bug25_emit
 | `index: Restrict`, buffer Unchecked | pipeline OK |
 | everything Unchecked | pipeline OK |
 
-So it is the **buffer** policy, not array indexing. wgpu requests `buffer: Restrict` whenever the
-adapter does not report `robustBufferAccess2` (`wgpu-hal/src/vulkan/adapter.rs`), which is why
-every GNC build hits it and no configuration of GNC's own avoids it.
+So within this set of emitted modules it is the **buffer** policy, not array indexing.
+
+**Corrected 2026-09-08.** This section used to continue "wgpu requests `buffer: Restrict` whenever
+the adapter does not report `robustBufferAccess2`, which is why every GNC build hits it". The rule
+is right and the conclusion is backwards: this adapter *does* report `robustBufferAccess2`
+(`vulkaninfo`), so wgpu's own source says it requests `buffer: **Unchecked**` here, and no GNC build
+should be hitting the clamp at all. The configuration wgpu should actually be shipping,
+`caps_index_restrict`, is byte-identical to `index_restrict_only`
+(`sha256 537e7329…`) — measured **pipeline OK** — and carries **0** `OpArrayLength` against **48**
+in every configuration that crashed.
 
 ## What it is not
 
@@ -57,19 +71,49 @@ every GNC build hits it and no configuration of GNC's own avoids it.
   The reduced module does not, because the reduction's interestingness test only ran the default
   adapter — so this file is minimal *for NVIDIA*. Reduce again against lavapipe if a
   two-implementation reproducer is wanted.
+* **Possibly not even GNC's crash.** `spirv-reduce` deleted bindings 0-3, leaving `Binding 4` as
+  the module's only binding, and `spirv_pipeline_probe` passes `layout: None` so wgpu derives the
+  descriptor set layout from the module — first binding 4. An NVIDIA report from August 2026 has
+  `vkCreateComputePipeline` segfaulting inside the driver, with no validation output, **when the
+  descriptor set layout's first binding is not 0**. Renumbering this file's `Binding 4` to `0` and
+  re-probing is a one-line test of whether this file reproduces anything of ours. The variant is
+  committed as `minimal_repro_binding0.spvasm` — identical but for that one decoration — so the
+  test is two commands. **It has not been run: no Vulkan on the dev machine.**
 * **Not fixed.** GNC still cannot run inter coding on Vulkan. `split_pipeline` is built lazily so
   the shader is only compiled when inter runs, which is what keeps intra, decode and CANARY-1
   alive.
 
 ## Where to take it
 
-Two candidate fixes, neither tried:
+Both original candidates are now **measured dead** (`b5a909c`):
 
-1. **Upgrade wgpu/naga.** naga 30 compiles this shader to SPIR-V that builds a pipeline fine,
-   though not under a controlled bounds policy, so this is suggestive rather than measured.
-2. **Change the shader's control flow** so the bounds check does not land in a branch that
-   returns. All three `block_match*` shaders have exactly one early `return`, and only this one
-   crashes, so the early return is necessary and not sufficient — the interaction is unidentified.
+1. ~~Upgrade wgpu/naga~~ — **DEAD.** naga 30 under wgpu's identical options crashes NVIDIA *and*
+   lavapipe. The earlier naga-30 module that built a pipeline came from the CLI with its own bounds
+   defaults and moved two variables at once.
+2. ~~Change the shader's control flow~~ — **DEAD.** Deleting the early `return` outright still
+   crashes, so the returning branch in this file is an artefact of the reduction.
+
+What is left, in order, and the first two need no GPU:
+
+1. **Probe `minimal_repro_binding0.spvasm`** (see the caveat above):
+
+   ```bash
+   spirv-as docs/bug25/minimal_repro_binding0.spvasm -o /tmp/repro0.spv && spirv-val /tmp/repro0.spv
+   WGPU_BACKEND=vulkan ./target/release/examples/spirv_pipeline_probe /tmp/repro0.spv main
+   ```
+
+   Exit 139 means the binding number is irrelevant and the file still isolates the clamp. Exit 1
+   (`OK`) means it was the descriptor layout all along and this reproducer is not ours.
+2. **Probe `caps_index_restrict.spv`** — expected OK, as the control for step 3.
+3. **Dump the module wgpu actually hands `vkCreateShaderModule`** and `sha256` it against the 19
+   emitted configurations. That is the experiment that ends the argument; **BUG-33** carries the two
+   hashes and what each one would mean.
+
+For the report itself, when it is time: defect A turned out to be upstream `gfx-rs/wgpu#7048`
+(closed by PR #7239), `#6329` is the same failure mode on AMD with valid SPIR-V — where adding
+`OpLine` debug instructions makes it disappear, a discriminator we have configs for and have not
+probed — and `OpArrayLength` sourced from a StorageBuffer variable has segfaulted Intel's compiler
+before (Mesa release notes). Three vendors, one instruction.
 
 It is also a legitimate driver bug report: a valid module should be rejected or compiled, never
 segfault the compiler. Two independent implementations crashing says the shape is unusual, not

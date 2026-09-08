@@ -16,6 +16,13 @@
 //! This emits one module per named configuration so each knob can be tested on the box
 //! separately. That turns "which of five differences is it" into five runs instead of a guess.
 //!
+//! **Which configuration is "wgpu's" depends on the adapter, and getting that wrong is what cost
+//! BUG-25 a day.** `wgpu_native` assumes the adapter does *not* report `robustBufferAccess2`, so it
+//! carries the `buffer: Restrict` clamp; `caps_index_restrict` assumes it *does*, and carries none.
+//! The bench box reports it on both of its Vulkan implementations, which makes
+//! `caps_index_restrict` the faithful one there — see BUG-33. `--wgpu-only` therefore emits **both**
+//! rather than picking for you.
+//!
 //! Usage: `bug25_emit <shader.wgsl> <out_dir>` — writes `<out_dir>/<config>.spv` for every
 //! configuration below and prints the list.
 
@@ -147,8 +154,10 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let shader = args.next().expect("usage: bug25_emit <shader.wgsl> <out_dir> [--wgpu-only]");
     let out_dir = args.next().expect("usage: bug25_emit <shader.wgsl> <out_dir> [--wgpu-only]");
-    // `--wgpu-only` emits a single module under wgpu's Vulkan options, named after the shader, so
-    // the whole tree can be swept in one pass instead of one directory of variants per shader.
+    // `--wgpu-only` emits wgpu's two possible Vulkan configurations, named after the shader, so the
+    // whole tree can be swept in one pass instead of one directory of variants per shader. Both,
+    // not one: which of them wgpu ships depends on whether the adapter reports
+    // `robustBufferAccess2`, and assuming the answer is how BUG-25's cause came to be misattributed.
     let wgpu_only = args.any(|a| a == "--wgpu-only");
     std::fs::create_dir_all(&out_dir).expect("create out_dir");
 
@@ -167,10 +176,15 @@ fn main() {
     .expect("naga validate");
 
     let selected: Vec<(String, spv::Options<'static>)> = if wgpu_only {
+        // `<stem>` is the no-robustness2 module (with the clamp); `<stem>.robust2` is the one wgpu
+        // ships on an adapter that reports the feature (without it).
         configs()
             .into_iter()
-            .filter(|(n, _)| *n == "wgpu_native")
-            .map(|(_, o)| (stem.clone(), o))
+            .filter_map(|(n, o)| match n {
+                "wgpu_native" => Some((stem.clone(), o)),
+                "caps_index_restrict" => Some((format!("{stem}.robust2"), o)),
+                _ => None,
+            })
             .collect()
     } else {
         configs()

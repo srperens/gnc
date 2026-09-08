@@ -1,9 +1,15 @@
-# 0027 — A simple perf fix is one whose win is a count
+# 0058 — A simple perf fix is one whose win is a count
 
 **Date:** 2026-09-08
 **Status:** accepted
 **Items:** PERF-1 (P2)
 **Supersedes nothing. Retires the 31.7 fps figure from every place that still asserted it.**
+
+> **Renumbered 0058 from 0027 by BUG-19 on 2026-09-08.** `0027` was taken by INTRA-1's
+> [cross-tile rate allocation is worth one point, not ten](0027-cross-tile-rate-allocation-is-worth-one-point-not-ten.md),
+> which reserved the number through `scripts/claim` and was committed twenty-six minutes earlier,
+> so two files carried `0027` on `main` for a day. Nothing in the record below changed. Commit
+> messages, and any citation older than this date, call it `0027`.
 
 ## The decision
 

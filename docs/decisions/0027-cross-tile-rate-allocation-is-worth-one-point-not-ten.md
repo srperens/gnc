@@ -5,6 +5,11 @@
 **Item:** BACKLOG INTRA-1 (P0), step 2, second instalment
 **Builds on:** `0026` (the gap decomposes), `0024` (the gap is upstream of the entropy coder)
 
+> **This number collided.** A second `0027` — a simple perf fix is one whose win is a count —
+> sat on `main` beside this one from 2026-09-08 and is now
+> [0058](0058-a-simple-perf-fix-is-one-whose-win-is-a-count.md) (BUG-19). A citation of `0027`
+> written that day may mean that record; this one is INTRA-1 step 2b.
+
 ## The hypothesis, and why it was worth testing
 
 Decision `0026` found an asymmetry it could not explain. Giving JPEG 2000 GNC's 256px tiling costs

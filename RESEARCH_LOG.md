@@ -67,8 +67,10 @@ was redundant and went — and the five `compressed`/`psnr` sites already had an
 implied.
 
 **Gates.** `cargo test --release -- --test-threads=1`: **261 passed, 0 failed, 9 ignored** on the
-branch, **263 passed, 0 failed, 9 ignored** after merging `main` (which brought two tests and
-BUG-19's renumbering). `cargo clippy --release --all-targets` clean and
+branch, **264 passed, 0 failed, 9 ignored** on the tree that landed, after merging `main` twice —
+`main` moved under this item three times while it was being written, and the second sync brought
+BUG-43's change to `src/encoder/rice.rs`, a file this branch also touches (test code only), which
+is why the gates were re-run rather than assumed. `cargo clippy --release --all-targets` clean and
 `cargo clippy --release --target wasm32-unknown-unknown --lib` clean, both before and after the
 merge. The only `warning:` line either way is the `block v0.1.6` future-incompatibility notice.
 

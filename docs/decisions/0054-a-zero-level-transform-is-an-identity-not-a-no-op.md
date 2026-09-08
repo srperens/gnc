@@ -45,6 +45,13 @@ Reached by every P and B frame in a `q=100` sequence, because LOSSLESS-1 sets
 `wavelet_levels = 0` for the MED path, and a residual is always wavelet-coded whatever the
 sequence's own transform is (0042 cause 2). `--dct` sequences hit it for the same reason.
 
+**The intra path at `levels == 0` is unaffected, and it is worth saying so explicitly** — a MED
+I-frame carries `wavelet_levels = 0` too, so the same exposure looks like it should be there. It
+is not: MED calls `med.forward` / `med.inverse` and never reaches the wavelet at all, which is
+why `q=100` I-frames were always bit-exact (through a real `encode-sequence` → `decode-sequence`
+md5 round trip) while every P-frame that referenced them was not. Raised by the RATE-3 session,
+which had the round trip in front of it.
+
 **Fixed** by giving `forward` the same identity copy `inverse` already had. The early return in
 `inverse` is the same change from the other side: it also removes a `levels - 1` underflow that
 panics in a debug build.

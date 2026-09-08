@@ -1482,8 +1482,29 @@ read as claiming it is.
 decoder should do with a stream it cannot parse. That belongs in a decision record with the
 alternatives priced: (a) `Result` at the public boundary, (b) a validating pre-pass that bounds
 every length against `data.len()` before the parser runs, (c) document panic-on-malformed as the
-contract and require callers to sandbox. **(b) is the cheapest and does not break the API**, and it
-is worth pricing first.
+contract and require callers to sandbox.
+
+**Priced (b) and did the part of it that needs no pre-pass, 2026-09-08.** A separate validating
+pass would be a *second* parser that has to agree with the first — a new class of bug, and not
+cheap after all. But the DoS half of (b) needs no second parse: the four counts that reach
+`Vec::with_capacity` are each followed immediately by that many fixed-size records, so
+`wire_count(count, stride, data.len(), pos)` caps them at what the remaining buffer could hold, at
+the point they are read. Landed for `num_detail` (stride 12), CfL `alpha_count` (2), `wm_len` (4)
+and `num_tiles` (**1**, not 8 — the gen>=11 index table is 8 bytes per tile, but the same count is
+reused for the tile vectors on every generation and a pre-GP11 tile blob has no guaranteed 8-byte
+minimum, so capping at remaining/8 could shrink a *legitimate* count and corrupt a well-formed
+file; one byte per tile is the bound that cannot be wrong). **`alpha_count` also fixed an
+overflow**: `2 * num_cfl_tiles * nsb` was computed in `u32` and wrapped in release, panicked in
+debug, before being compared to anything.
+
+**Well-formed streams are provably unaffected** — their counts satisfy the bound by construction —
+and item 8's 16 byte-identical decodes were re-run to show it. So a tiny hostile file can no longer
+turn into a multi-gigabyte allocation; it now runs off the end of the buffer and hits the same
+panic the parser already has everywhere else. **That is the DoS, not the contract.**
+
+**What is still open is only the contract**: whether the decoder should reject rather than panic,
+i.e. (a) versus (c). The panic surface is unchanged and is still `assert!` plus `unwrap()`
+throughout, so pick one and write the record.
 
 **Not audited:** `abac.rs` (`vec![0i32; count]` at `:395`, `:636`), the rANS deserialiser, and the
 GNV container index. Same class of question, and the same answer probably applies, but "probably"
@@ -2119,26 +2140,53 @@ The two reads that would have caught it are now in COORDINATION, above the share
 section. The second is what BUG-41 and BUG-42 had in common: **an item held with no heading yet is
 invisible to `grep`, to `next` and to `items`, and visible only to `scripts/claim list`.**
 
-### BUG-38 — `cargo fmt --check` is red across the tree, and GOALS §9 names it as a gate (todo, P4)
+### BUG-38 — `cargo fmt --check` is red across the tree; decided, the reformat wants a quiet tree (todo, P4)
 
-GOALS §9 says code "must pass `cargo fmt` and `cargo clippy` with zero warnings". `cargo fmt
---check` reports **566 diffs in 61 files** — **504 in 44 files under `src/`**, 53 in 14 files
-under `tests/`, 9 in 3 under `examples/`. So unlike BUG-20, this is not a test-code question:
-the shipped code is the bulk of it.
+GOALS §9 requires `cargo fmt` clean. `cargo fmt --check` reports **573 diffs in 61 of the 90
+`.rs` files**, 504 of them under `src/`. Neither CLAUDE.md nor LOOP.md ever named it as a gate,
+so nothing ran it. Filed 2026-09-08 by the `loopa` session while doing BUG-20 — same defect shape,
+one gate over.
 
-Measured 2026-09-08 on `main` at `a73e0a2`, by the `loopa` session while doing BUG-20 — same
-defect shape (a written rule and an unrun check disagreeing), found because BUG-20's entry asks
-which of the two is wrong and the same question applies one gate over.
+**The decision is made: keep the rule, do the reformat as one atomic commit on a quiet tree, and
+add the gate only then.** Decision `docs/decisions/0066`. What remains is mechanical and is parked
+as `blocked-quiet-tree`, not free, because doing it under seven live sessions is one merge conflict
+per session for zero behaviour.
 
-**Not fixed in passing, deliberately.** `cargo fmt` over 44 `src/` files is a diff that touches
-almost every module eight sessions are editing right now, and it would conflict with all of them
-while carrying no behaviour. The fix wants a quiet tree and one commit that changes nothing else,
-so it is a claimable item rather than something to do while holding another.
+Measured before deciding, and two of the four options died on the numbers:
 
-**The decision to make is the same one BUG-20 has:** run `cargo fmt` once and add it to the gate
-list in CLAUDE.md and LOOP.md (neither of which mentions it today — only GOALS §9 does), or drop
-the `cargo fmt` half of GOALS §9 and say the project does not check formatting. Doing neither
-leaves a rule that has been false for an unknown length of time.
+- **No rustfmt config fits the tree.** The hypothesis that a `rustfmt.toml` matching a house style
+  would collapse this into a one-file change is **falsified in the opposite direction**: rustfmt's
+  default is the best of seven configurations at 573, and every deviation is worse —
+  `fn_call_width = 80` 646, `max_width = 90` 964, `use_small_heuristics = "Off"` 1053, `"Max"`
+  1114, `"Max"` + 110 cols 1358, + 120 cols 1518. **Do not add a `rustfmt.toml`.**
+- **The dirty files are the hot files.** 44 of the 61 were changed on `main` in the last 24 h
+  (72%), and 19 `.rs` files are uncommitted in some worktree right now. `src/main.rs` (55 diffs)
+  and `src/decoder/pipeline.rs` (52) lead, with `pipeline_tests.rs` (37) and `rice.rs` (22) — both
+  committed to by other sessions *during* this item.
+- **A per-touched-file rule is refuted by that overlap.** It was the most attractive option before
+  the numbers: incremental, no big bang, converges. But it does not avoid the conflicts, it
+  distributes them over the same files, and it mixes a reformat into every semantic commit that
+  touches a dirty file — the exact hazard the rule exists to prevent.
+- **The cold subset is 10% and not worth taking.** Excluding everything changed on `main` in 24 h
+  and everything dirty in any worktree leaves 16 files carrying 59 of the 573 diffs. The gate stays
+  red either way, so it buys nothing and adds a third state.
+- **The drift is live:** 566 diffs when this was filed, **573** seventy-five minutes later. Same
+  mechanism as clippy's 88 → 90 → 91 (`0062`).
+
+**Unpark condition, and it is checkable rather than a feeling:**
+
+```bash
+scripts/claim list | grep -v '^  worktree\.'    # nothing held but this item
+for wt in $(git worktree list --porcelain | awk '/^worktree /{print $2}'); do
+  git -C "$wt" status --porcelain; done          # must print nothing
+```
+
+**Then, in one commit that changes nothing else:** `cargo fmt` (no config), both clippy targets and
+the full suite to prove rustfmt changed no semantics, the commit, **and its sha appended to
+`.git-blame-ignore-revs`** — a 573-diff commit across 61 files otherwise becomes the blame answer
+for a quarter of the codebase, and this project reads history constantly. Add the gate to CLAUDE.md
+and LOOP.md step 5 in the same commit; `cargo fmt --check` needs no compilation and costs about a
+second.
 
 ### ARCH-3 — `gpu_entropy_encode` selected a whole P-frame pipeline, not just where entropy runs (**DONE 2026-09-07**)
 
@@ -2770,6 +2818,33 @@ halving all frequencies and rebuilding until the natural depth fits (guaranteed 
 frequency 1 everywhere the alphabet is uniform and the depth is 6). Both change Huffman's
 codebook, and therefore its bitstream, wherever clamping currently occurs. Not done for a parked
 coder.
+
+### COORD-4 — a number quoted across sessions does not carry its tree (todo, P4)
+
+**Filed from a worked example that cost two sessions about an hour**, recorded in COORDINATION's
+"Two sessions' numbers that disagree may both be right — ask which tree" and in RATE-4 and BUG-44.
+Two correctly-measured results could not coexist: `q=100` video bit-exact on 48 of 48 frames, and
+an encoder-vs-decoder reference diff of 254.0039 at the same operating point. **No measurement was
+wrong and the instrument was fine** — one was taken on a patched tree. Neither session asked which
+commit, and both then wrote a wrong inference into `main` before a twenty-second test settled it.
+
+**The mechanical version of the rule.** `scripts/claim` already takes claims against a commit —
+they are metadata blobs, and `git cat-file -p refs/claims/<ITEM>` prints it — so the information
+exists and is simply never surfaced where numbers are exchanged. Candidate shapes, cheapest first:
+
+- `scripts/claim list` / `items` print the commit each claim was taken against, so "which tree" is
+  answerable without asking.
+- A `scripts/claim measured <ITEM>` that stamps `HEAD` **plus whether the tree was dirty** at the
+  moment a measurement is taken — the dirty bit is the half that matters here, because the patched
+  tree in the worked example was uncommitted.
+
+**The honest doubt, from the session that raised it and declined to file it:** it may not be worth
+a tool. The failure needs two sessions, disagreeing numbers, and enough confidence to act before
+re-running — and the prose rule may be enough on its own. **Whoever takes this should price that
+first**: a grep of RESEARCH_LOG for retracted results says how often a wrong tree, rather than a
+wrong harness, was the cause. If the answer is once, close it as answered-no and keep the prose.
+
+**Not startable as "build it".** Startable as "measure whether it has happened before".
 
 ### COORD-3 — item ids had no allocator, so two different `### ENT-9` headings are live on `main` (**FIXED 2026-09-08**)
 
@@ -4201,44 +4276,35 @@ same PNG four times) codes `q=100` P-frames bit-exact at 3 198 bytes **before** 
 `all_skip_tiles=120/120`, so it went down the motion-skip path and never asked the transform for
 anything. A zero-residual probe cannot test a residual path.
 
-### BUG-44 — `read_reference_planes` reads a different stage on the two pipelines at `q=100` (todo, P3)
+### BUG-44 — `read_reference_planes` is symmetric at `q=100`; the 254.0039 row was a patched encoder (**CLOSED not-a-bug 2026-09-08**)
 
-**The instrument disagrees where the pictures do not, and it has already cost one session an
-afternoon's hypothesis.** RATE-4 diffed the encoder's reference against the decoder's on a
-256×256 gradient with `GNC_REF_DEBLOCK=0` and got:
+**Filed and closed the same hour, by measuring the thing the filing asserted.** The shipped
+instrument agrees exactly. `lossless_iframe_reference_matches_the_decoders`, on the same 256×256
+gradient with `GNC_REF_DEBLOCK=0` that produced the alarming row:
 
-| case | max \|enc − dec\| on Y | pixels differing |
-|---|---|---|
-| q=95..99, bit-exact sibling kept | 0.0000 | 0 / 65 536 |
-| q=100, MED | **254.0039** | 65 535 / 65 536 |
-| q=100, `GNC_MED=0` | 7.3965 | 65 535 / 65 536 |
+```
+q=99  transform=Wavelet     plane Y/Co/Cg: max |enc-dec| = 0.0000, nonzero 0/65536
+q=100 transform=MedPredict  plane Y/Co/Cg: max |enc-dec| = 0.0000, nonzero 0/65536
+```
 
-with the encoder side *fractional* (`-0.5019531, -0.00390625, 0.49414063, …`) and the decoder side
-*integral* (`-1.0, -1.0, -1.0, …`). That reads as "the decoder predicts from a picture it does not
-decode", which would be a defect upstream of everything BUG-39 fixed.
+That test is in the suite and green, and it has asserted this since `0042`.
 
-**It is not, and the evidence is decisive.** Since BUG-39 closed (`0064`), a `q=100` sequence is
-**bit-exact on every frame**, verified outside the harness with raw-RGB md5 through the real
-container: 48 of 48 frames on 3 sequences at ki=2 and ki=9. A P-frame cannot be md5-identical to
-its source while predicting from a picture the decoder does not hold — the residual is computed
-against the encoder's reference and added to the decoder's, so any difference between them lands
-in the output. So the two buffers `read_reference_planes` returns are **not the same stage of the
-pipeline** in this configuration, and the readback is what needs fixing.
+**Where the 254.0039 came from:** RATE-4 had *implemented `0040` point 4's source-copy reference*
+before taking that diff, so the encoder side was a colour-converted **source** plane rather than a
+reference — a buffer that has not been through the stage that produces one, in a different scale
+(the values are a ramp in steps of 0.498, i.e. ~127.5/256, against a reference in 0..255). The
+diff is a true statement about that patch and says nothing about the shipped pair.
 
-**Why it is worth an item rather than a comment.** This function is the repository's instrument of
-record for "do the two sides agree" — `0042` used it to find two causes, `0044` and RATE-4 used it
-after that, and CLAUDE.md's own lesson from `0040` is *diff the two things that must be equal
-before theorising*. An instrument that answers a different question in one configuration turns
-that lesson into a trap, and the trap only fires at `q=100`, which is the configuration nobody
-exercised until this week.
+**What I got wrong, since it is the reusable part.** I filed this from a peer's report plus my own
+bit-exactness result and reasoned that the two could not both be true, which was correct — and
+then picked the wrong one to blame. **The report was of a modified tree, and I did not check that
+before filing.** One `cargo test --release --lib lossless_iframe_reference_matches_the_decoders`
+would have closed it before it ever had an id; it is what closed it ten minutes later. Reading a
+peer's number is not the same as reading their tree.
 
-**Where to look:** the encoder's side is fractional, which is the shape of colour-converted source
-*before* whatever rounds it, and the decoder's is integral, which is the shape of a reconstructed
-picture. One of the two is reading a buffer earlier in the chain than the other.
-
-**Success criterion:** at `q=100` MED, the two sides agree to 0.0000 on a frame that is known
-bit-exact end to end — or the function documents, in one sentence per pipeline, which stage it
-returns and why they differ.
+**What stands from it:** `0040` point 4's route fails for a reason worth keeping — a lossless
+frame's reference is *not* simply its colour-converted source, because that buffer is at a
+different stage and scale. RATE-4 records the refutation.
 
 ### LOSSLESS-2 — at `q=100` inter costs +38% on camera content and wins 1.6% on animation (todo, P2)
 
@@ -4382,20 +4448,35 @@ ran:
 | q=100, MED | **254.0039** | 65 535 / 65 536 |
 | q=100, `GNC_MED=0` (lossless wavelet) | 7.3965 | 65 535 / 65 536 |
 
-**CORRECTION 2026-09-08, and it inverts the conclusion: the two q=100 rows are an instrument
-artefact.** BUG-39 closed the same afternoon (`docs/decisions/0064`, `0f1d303`) with `q=100` video
-bit-exact on every frame — 48 of 48 md5-identical against source through a real container round
-trip, three sequences at ki=2 and ki=9. A P-frame cannot be md5-identical to its source if it
-predicted from a picture the decoder does not hold, so the two references *are* the same picture
-and **`read_reference_planes` returns a different stage on the two pipelines for the MED case**.
-The diff was measuring the readback.
+**This entry was corrected twice on 2026-09-08 and the second correction reinstates the first
+reading. Both corrections are kept in place, because the way it went wrong is the reusable part.**
 
-**What survives is the 0.0000 row, and it is the case the change targets.** The free half is
-therefore **not refuted** — re-apply `reference_is_the_source`, verify against
-`fallback_iframe_reference_matches_the_decoders` only, and treat any q=100 MED row from
-`read_reference_planes` as unreadable until that readback is fixed. If it holds, RATE-3's third
-encode goes away and `encode_as_reference` can be deleted. The paragraph below is kept because the
-observation in it is real; the conclusion drawn from it is withdrawn.
+*Correction 1 (withdrawn):* said the two q=100 rows were an instrument artefact — that
+`read_reference_planes` returns a different stage on the two pipelines for MED — and therefore that
+the source-copy route was **not** refuted. That was an inference offered by the BUG-39 session and
+accepted here without re-deriving it. **It is wrong**, and its author retracted it (BUG-44, filed
+and closed not-a-bug the same hour).
+
+*Correction 2, measured:* on the **clean** tree the reconstruct path and the decoder agree exactly —
+`lossless_iframe_reference_matches_the_decoders` reads 0.0000 on every plane at q=99 *and* q=100
+MED, re-run by hand. On the **patched** tree the same instrument read 254.0039 at q=100. Both runs,
+same content, same `GNC_REF_DEBLOCK=0`. So the reference the decoder holds is the reconstruction,
+and **the colour-converted source planes are not equal to it at q=100.** The route is refuted
+there, on a measurement, and the rows below stand as taken.
+
+*What survives from correction 1, and it stands on its own evidence:* the **fifth-cause paragraph
+is still withdrawn**. That one never depended on the readback inference — BUG-39's 48-of-48 md5
+result refutes it directly, because a P-frame cannot be md5-identical to its source if it predicted
+from a picture the decoder does not hold.
+
+*The live question is unchanged from the original entry:* why the q=95..99 fallback case reads
+**0.0000** under the same patch. That is the row that would make this shippable — gated to the
+fallback case rather than as a universal replacement — and it is where a resumption starts.
+
+**Process note, because it cost two flips in one hour.** A peer's numbers and yours can both be
+right and still disagree: they were taken on different trees. Neither of us asked "on which tree?"
+— they filed on my numbers without my diff, and I inverted a conclusion of my own on their
+inference without re-running the one test that settles it. Re-run it. It took twenty seconds.
 
 **So the source planes are not the picture the decoder reconstructs, and the tell is in the
 values**: the encoder's are fractional (`0.0, −0.5019531, −0.00390625, 0.49414063, …`) where the

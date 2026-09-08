@@ -4,6 +4,125 @@
 
 ---
 
+## BUG-38 — no rustfmt config fits the tree, and the dirty files are the hot files (2026-09-08)
+
+**Hypothesis.** GOALS §9 requires `cargo fmt` clean and `cargo fmt --check` reports 573 diffs in
+61 of 90 `.rs` files. The cheap explanation is that the tree is written in a consistent *wider*
+style, so a `rustfmt.toml` matching it would collapse the whole thing into a one-file config
+change with no conflicts. Success criterion stated before measuring: a config that takes 573 below
+about 50.
+
+**Domain.** No codec domain. Formatting and two markdown rule definitions. No shipped code, no
+shader, no bitstream — the only `.rs` content that would move is whitespace, by construction.
+
+**Falsified, and in the opposite direction.** rustfmt's **default is the best of seven
+configurations** and every deviation is worse:
+
+| config | diffs |
+|---|---|
+| **none (rustfmt default)** | **573** |
+| `max_width = 100` (= the default) | 573 |
+| `fn_call_width = 80` | 646 |
+| `max_width = 90` | 964 |
+| `use_small_heuristics = "Off"` | 1053 |
+| `use_small_heuristics = "Max"` | 1114 |
+| `"Max"` + `max_width = 110` | 1358 |
+| `"Max"` + `max_width = 120` | 1518 |
+
+So there is no house style to codify: the 573 is genuine drift and **`rustfmt.toml` should not be
+added.** The hypothesis was worth an hour precisely because it would have made the item free; it
+cost four `cargo fmt --check` runs and no compilation to kill.
+
+**The finding that decided the item was the second measurement, not the first.** Of the 61
+fmt-dirty files, **44 were changed on `main` in the last 24 hours — 72%** — and 19 `.rs` files are
+uncommitted in some worktree right now. The dirtiest two are `src/main.rs` (55 diffs) and
+`src/decoder/pipeline.rs` (52); `src/encoder/pipeline_tests.rs` (37) and `src/encoder/rice.rs`
+(22) are also dirty and **both were committed to by other sessions while this item was open**.
+
+That overlap is what refutes the option that looked best on paper. **A per-touched-file rule** —
+"the files you change must be `cargo fmt` clean" — is incremental, has no big bang, and converges,
+which is why it was the working plan for about twenty minutes. But with dirty ≈ hot it does not
+*avoid* the conflicts, it **distributes** them across the same files, and it does so by mixing a
+reformat into every semantic commit that touches a dirty file — the exact hazard the rule exists
+to prevent. It would have hit BUG-20 itself: three of the twelve files that item touched are
+fmt-dirty and all three had concurrent commits from other sessions.
+
+**The cold subset was priced and declined.** Excluding everything `main` touched in 24 h and
+everything dirty in any worktree leaves 16 files carrying **59 of the 573 diffs — 10%**. The value
+of this item is binary: `cargo fmt --check` is clean and can enter LOOP.md step 5, or it is red and
+the rule stays decorative. Ten per cent leaves it red, and adds a third state to the tree for no
+stated invariant.
+
+**Drift is live and quantified: 566 diffs when BUG-38 was filed, 573 seventy-five minutes later**,
+with `main` moving five times in between. Nothing regressed — that is what an unread gate does,
+and it is the same mechanism as clippy's 88 → 90 → 91 in `0062`. It also does not make waiting
+worse: rustfmt is idempotent, so a later reformat is not harder for being larger.
+
+**Decided, not done.** Keep the rule; do the reformat as **one atomic commit on a quiet tree**,
+with its sha appended to `.git-blame-ignore-revs` — 573 diffs across 61 files would otherwise
+become the blame answer for a quarter of the codebase, and this project reads history constantly.
+Add the gate in the same commit; `cargo fmt --check` needs no compilation and costs about a
+second. Parked as `blocked-quiet-tree` with a checkable unpark condition rather than left free,
+because the next session to pick it up under load would either impose seven merge conflicts or
+re-derive all of the above. Decision `0066`.
+
+**Dropping the `cargo fmt` half of GOALS §9 was the close alternative and is recorded in `0066`
+with what it would have cost.** The short version: `0062`'s argument does not transfer, because
+clippy found two real defects in test code and **rustfmt cannot find a defect by construction**.
+The case for keeping the rule is diff legibility — a session with format-on-save silently mixes
+whitespace into a semantic commit — and in a project where the diff *is* the evidence, that is
+enough.
+
+**Gates.** No code changed, so the suite was not re-run for this item; the figures that stand are
+BUG-20's, taken on the same tree an hour earlier (**265 passed, 0 failed, 9 ignored**; `cargo
+clippy --release --all-targets` and wasm `--lib` clean). The `rustfmt.toml` files used for the
+sweep were written and deleted in the worktree and none is committed — verified with
+`git status`.
+
+---
+
+## BUG-44 — filed and closed in the same hour: the instrument was fine, the tree it was measured on was not (2026-09-08)
+
+**What was filed.** RATE-4 reported the encoder's reference against the decoder's at `q=100` MED
+as **max |enc − dec| = 254.0039 on 65 535 of 65 536 pixels**, encoder side fractional and decoder
+side integral, and could not reconcile it with `q=95..99` matching at 0.0000. I filed it as
+BUG-44, reasoning that it could not coexist with my own result — a `q=100` sequence that is
+bit-exact on 48 of 48 frames through the container — because a P-frame cannot be md5-identical to
+its source while predicting from a picture the decoder does not hold.
+
+**That reasoning was right and the conclusion was wrong.** The shipped instrument agrees exactly.
+`lossless_iframe_reference_matches_the_decoders`, on the same 256×256 gradient with
+`GNC_REF_DEBLOCK=0`:
+
+```
+q=99  transform=Wavelet     plane Y/Co/Cg: max |enc-dec| = 0.0000, nonzero 0/65536
+q=100 transform=MedPredict  plane Y/Co/Cg: max |enc-dec| = 0.0000, nonzero 0/65536
+```
+
+It is in the suite, it is green, and it has asserted this since `0042`.
+
+**The 254.0039 was measured on a patched encoder** — RATE-4 had implemented `0040` point 4's
+source-copy reference before taking the diff, so the encoder side was a colour-converted *source*
+plane rather than a reference: a buffer that has not been through the stage that produces one, and
+in a different scale (the reported values are a ramp in steps of 0.498 ≈ 127.5/256, against a
+reference in 0..255). True of that patch, silent about the shipped pair.
+
+**The lesson is about reading a peer's number, and it is cheap to state.** Two sessions'
+measurements that cannot both be true is a genuine signal, and it was worth chasing. But the
+question "which one is wrong" has a third answer neither of us listed: *neither, because they were
+taken on different trees*. I had the peer's numbers and not their diff, and filed on the numbers.
+One `cargo test --release --lib lossless_iframe_reference_matches_the_decoders` closed it ten
+minutes after it got an id — and would have closed it before, had I run the assertion that already
+existed for exactly this question.
+
+**Kept:** `0040` point 4's route fails for a reason worth writing down — a lossless frame's
+reference is *not* simply its colour-converted source, because that buffer is at a different stage
+and a different scale. RATE-4 holds the refutation.
+
+**Gates:** no code changed; documentation only.
+
+---
+
 ## ENT-9 step 1 — abac bypasses three quarters of its own bits at q=99 (2026-09-08)
 
 **Hypothesis, straight out of ENT-3.** `0045` measured abac's saving against Rice decaying
@@ -412,22 +531,36 @@ matches to **0.0000** under the same code. Two lossless MED frames, one matching
 exactly and one off by 254, is not a difference the "fractional versus integral" story accounts for
 on its own. Anyone resuming should start there rather than with the q=100 rows.
 
-**CORRECTION, same day, and it inverts this entry's conclusion.** BUG-39 closed with `q=100` video
-bit-exact on every frame — 48 of 48 frames md5-identical against source through a real container
-round trip, three sequences at ki=2 and ki=9 (`docs/decisions/0064`). A P-frame cannot be
-md5-identical to its source if it predicted from a picture the decoder does not hold: the residual
-is computed against the encoder's reference and added to the decoder's, so any difference between
-the two lands in the output. It does not. **The two q=100 rows above are therefore measuring
-`read_reference_planes`, which returns a different stage on the two pipelines for the MED case, and
-not the pictures.**
+**CORRECTION 1, withdrawn.** It said the two q=100 rows were an instrument artefact —
+`read_reference_planes` returning a different stage on the two pipelines for MED — and therefore
+that the source-copy route was not refuted. That was an inference from the BUG-39 session, accepted
+here without re-deriving it, and its author retracted it within the hour (BUG-44, closed
+not-a-bug).
 
-The uncontaminated row is the **0.0000** one — which is exactly the case the change targets — so
-**the source-copy route is not refuted and this entry had it backwards.** The
-fractional-versus-integral observation stands as an observation; the conclusion drawn from it does
-not, and the asymmetry flagged above ("why does the fallback case match while q=100 does not")
-dissolves into the readback difference rather than needing an explanation. Whoever resumes should
-verify against `fallback_iframe_reference_matches_the_decoders` alone until that readback is fixed;
-if the route holds, RATE-3's third encode goes away and `encode_as_reference` can be deleted.
+**CORRECTION 2, measured, and it reinstates this entry's original reading.** On the **clean** tree
+`lossless_iframe_reference_matches_the_decoders` reads **0.0000 on every plane at q=99 and at q=100
+MED** — re-run by hand on the same 256×256 gradient with `GNC_REF_DEBLOCK=0`. On the **patched**
+tree the same instrument read **254.0039** at q=100. So the decoder's reference *is* the
+reconstruction, the instrument is sound in both trees, and what the patched run measured is exactly
+what it was asked to measure: **the colour-converted source planes are not equal to the
+reconstruction at q=100.** The route is refuted there. The rows above stand as taken.
+
+The tell in the values is also explained rather than mysterious: the source-plane row ramps in steps
+of ~0.498 ≈ 127.5/256 against a reference in 0..255, so the two are not even in the same scale —
+which is a stronger statement than "they differ" and a better starting point than the
+fractional-versus-integral wording above.
+
+**What survives from correction 1** is the withdrawal below, and it never depended on the readback
+inference: BUG-39's 48-of-48 md5 result refutes a fifth cause on its own evidence.
+
+**The live question is unchanged:** why the q=95..99 fallback case reads 0.0000 under the same
+patch. That row is what would make the route shippable *gated to the fallback case* rather than as
+a universal replacement, and it is where a resumption starts.
+
+**Process note.** Two peers' numbers that cannot both be true have a third answer beyond "one is
+wrong": they were taken on different trees. Neither side asked which tree — the BUG-39 session
+filed a bug on my numbers without my diff, and I inverted my own conclusion on their inference
+without re-running the twenty-second test that settles it. The instrument was never at fault.
 
 **~~Raised with the BUG-39 session rather than acted on:~~ WITHDRAWN — there is no fifth cause.**
 This entry suggested the decoder might hold two different pictures at q=100. BUG-39's md5 evidence
@@ -553,9 +686,44 @@ and the presence of the feature should not be read as saying malformed input is 
 
 **So this is a decision, not a fix**, and ROBUST-1 carries it: (a) a `Result` boundary, which
 breaks `deserialize_compressed`'s signature; (b) a validating pre-pass that bounds every length
-against `data.len()` before the parser runs, which breaks nothing and is the cheapest; (c) document
-panic-on-malformed and require callers to sandbox. Not chosen here, because choosing it without
-pricing (b) would be guessing.
+against `data.len()` before the parser runs; (c) document panic-on-malformed and require callers to
+sandbox.
+
+### Priced (b), and it split in two
+
+A separate validating pass turns out **not** to be the cheap option: it is a *second* parser that
+has to agree with the first, which is a new class of bug rather than the absence of one. But (b)
+was answering two questions at once, and only one of them needs a second parse.
+
+**The denial of service does not.** Each of the four counts that reach `Vec::with_capacity` is
+followed immediately by that many fixed-size records, so the bound is available at the point the
+count is read:
+
+```rust
+fn wire_count(count: usize, stride: usize, data_len: usize, pos: usize) -> usize {
+    count.min(data_len.saturating_sub(pos) / stride.max(1))
+}
+```
+
+Applied to `num_detail` (stride 12), CfL `alpha_count` (2), `wm_len` (4) and `num_tiles`. **The
+stride on `num_tiles` is 1, not 8, and that is the one judgement call here:** the gen>=11 index
+table is 8 bytes per tile, but the same count is reused for the tile vectors on every generation,
+and a pre-GP11 tile blob has no guaranteed 8-byte minimum. Capping at `remaining / 8` could shrink
+a **legitimate** count and corrupt a well-formed file, which is worse than the problem being
+solved. One byte per tile cannot be wrong, and it still ties the allocation to the input size,
+which is the property that matters.
+
+`alpha_count` carried a second defect: `2 * num_cfl_tiles * nsb` was computed in `u32` and wrapped
+in release / panicked in debug **before** it was compared to anything. Widened to `usize` with
+`saturating_mul` first, then bounded.
+
+**Well-formed streams are provably unaffected**, since their counts satisfy the bound by
+construction — and the 16 byte-identical decodes were re-run to show it rather than assert it. A
+packet-sized hostile file can no longer become a multi-gigabyte allocation; it now runs off the
+end of the buffer into the same panic the parser has everywhere else.
+
+**What is left open is only the contract** — (a) versus (c) — because the panic surface is
+untouched. That is a decision record, not a commit.
 
 **Not audited and not claimed:** `abac.rs` (`vec![0i32; count]`), the rANS deserialiser, the GNV
 container index. Same class of question; "probably the same answer" is not a result.
@@ -2353,7 +2521,6 @@ are quoted only to bound the ratio.
 clean.
 
 
----
 ---
 
 ## INTRA-1 — the last ~6 points of the JPEG 2000 gap are padding nobody looks at (2026-09-08)
@@ -13564,7 +13731,6 @@ chroma leaking into an RGB metric — the codec's own luma moves **0.055 dB** (5
 dE00 goes 0.325 → 0.353 mean, 0.721 → 0.772 p95, both far under the JND. A fixed-q point cannot
 judge a rate/quality trade; the −5.2% BD-rate is the measurement that can, and it says the same
 quality is now cheaper. Recorded here per BASELINE's regression rule.
----
 ---
 ---
 ## 2026-09-06 — abac measured on REAL coefficients at the contribution operating point: the range coder changes the answer

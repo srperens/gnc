@@ -547,8 +547,10 @@ enum Command {
         #[arg(long)]
         rice: bool,
 
-        /// Use the adaptive binary code-block coder (abac). Intra rate is measured; on inter it is
-        /// verified correct but its contexts were tuned on intra coefficients and never retuned.
+        /// Use the adaptive binary code-block coder (abac). Saves rate at identical pixels, and
+        /// the saving decays with quality: on P-frame bytes -21.6% to -3.7% over q=50-99 (ENT-3,
+        /// docs/decisions/0045). Its contexts were tuned on intra coefficients; retuning them for
+        /// residuals was priced and rejected — inter's headroom is smaller than intra's.
         #[arg(long)]
         abac: bool,
 
@@ -645,8 +647,10 @@ enum Command {
         #[arg(long)]
         rice: bool,
 
-        /// Use the adaptive binary code-block coder (abac). Intra rate is measured; on inter it is
-        /// verified correct but its contexts were tuned on intra coefficients and never retuned.
+        /// Use the adaptive binary code-block coder (abac). Saves rate at identical pixels, and
+        /// the saving decays with quality: on P-frame bytes -21.6% to -3.7% over q=50-99 (ENT-3,
+        /// docs/decisions/0045). Its contexts were tuned on intra coefficients; retuning them for
+        /// residuals was priced and rejected — inter's headroom is smaller than intra's.
         #[arg(long)]
         abac: bool,
 

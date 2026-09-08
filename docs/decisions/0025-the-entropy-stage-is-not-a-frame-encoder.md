@@ -112,6 +112,13 @@ from matching PSNR:
 | crowd_run | −20.7% | −18.4% | −12.1% |
 | old_town_cross | −22.7% | −21.8% | −12.0% |
 
+> **q=50 and q=75 are superseded — see `0045` (ENT-3, 2026-09-08).** Re-run on a pinned build of
+> this commit, all nine points reproduce exactly, so nothing here was mismeasured. On today's
+> `main` the q=90 column still reproduces exactly and the other two do not: INTER-2 (`0043`)
+> halved the inter dead zone, which is active at q=50 and q=75 and a no-op at q=90. `0045` also
+> records the frame mix this table does not — `2I+16P+0B` — and splits the container ratio into
+> its I and P halves.
+
 **−12.0% to −22.9% at bit-identical pixels.** There is no rate/quality trade to argue about here:
 the two files decode to the same bytes. The retracted figure was measured with abac on the broken
 frame encoder and Rice on the working one; this replaces it. It says nothing about throughput —

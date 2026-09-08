@@ -4,6 +4,162 @@
 
 ---
 
+## ENT-3 — abac's inter saving is real, decays with quality, and the contexts are not the inter question (2026-09-08)
+
+**What was open.** Not the headline — ARCH-3 answered "does abac pay on inter" as a side effect
+(`0025`: −12.0% to −22.9% at bit-identical pixels), and DOC-2 retitled the entry to say so. Three
+things were left: which frame mix produced that table, the contribution range q=95-99, and whether
+abac's contexts — tuned on intra coefficients — are worth retuning for residual statistics.
+
+**Domain declaration.** Both arms quantise identically and differ only in the entropy stage, so
+the comparison is the coded size of the *same* quantised wavelet coefficients: of the
+motion-compensated residual on a P frame, of the frame itself on an I frame. Since ARCH-3 the
+entropy choice cannot reach the pixels, and that premise is checked rather than assumed — every
+point decodes both arms and hashes all 18 PNGs. **18 of 18 frames identical at all 18 points**, so
+the quality delta is exactly zero and no BD-rate is quoted.
+
+**Harness** `scripts/ent3_abac_inter.py`. Binary copied out of `target/` and hash-recorded before
+the sweep (`364e6aaf…` at `f3f7254`) — the BUG-27 session lost a 25-minute run to `cargo test`
+rewriting the binary underneath it. 18 frames, ki=9, 4:4:4, `.gnv` container bytes.
+
+### 1. The frame mix is `2I+16P+0B`
+
+Three readings, all agreeing. `benchmark-sequence -q 90 -n 18 -k 9` prints `2I+16P+0B` and emits
+`GNC: B-pyramid suppressed (ki=9 would allow it)` on stderr — the veto firing, not inferred.
+`encode-sequence` prints `Encoded 18 frames (2I + 16P)` on all 36 encodes. And
+`encode-sequence`'s `-q` **defaults to 75**, so that path cannot reach `CodecConfig::default()`'s
+`b_pyramid: true` at all. `-q` was passed everywhere, since BUG-37 is exactly that trap.
+
+### 2. The container ratio was never an inter figure — split it
+
+At ki=9 the file is 2 I-frames and 16 P-frames, so `0025`'s whole-file ratio mixes abac's
+already-known intra saving into the answer. `encode-sequence` tags every frame `[I]` or `[P]`, so
+here the two halves are summed separately. abac against Rice, negative = abac smaller:
+
+**P-frames only** — ENT-3's actual question:
+
+| sequence | q=50 | q=75 | q=90 | q=95 | q=97 | q=99 |
+|---|---|---|---|---|---|---|
+| bbb_extended | −16.1% | −21.1% | −20.6% | −18.2% | −16.6% | −14.5% |
+| crowd_run | −18.3% | −14.3% | −12.2% | −9.6% | −7.5% | −4.3% |
+| old_town_cross | −21.6% | −14.7% | −11.9% | −9.5% | −7.2% | −3.7% |
+
+**I-frames only**, same runs:
+
+| sequence | q=50 | q=75 | q=90 | q=95 | q=97 | q=99 |
+|---|---|---|---|---|---|---|
+| bbb_extended | −17.8% | −14.7% | −14.2% | −12.3% | −11.1% | −9.5% |
+| crowd_run | −16.0% | −12.7% | −11.4% | −8.6% | −6.4% | −3.3% |
+| old_town_cross | −20.2% | −14.5% | −12.7% | −10.2% | −8.0% | −4.7% |
+
+**Whole container**, the column comparable to `0025`:
+
+| sequence | q=50 | q=75 | q=90 | q=95 | q=97 | q=99 |
+|---|---|---|---|---|---|---|
+| bbb_extended | −16.6% | −20.0% | −19.7% | −17.5% | −15.9% | −13.9% |
+| crowd_run | −18.0% | −14.1% | −12.1% | −9.5% | −7.3% | −4.2% |
+| old_town_cross | −21.5% | −14.6% | −12.0% | −9.6% | −7.3% | −3.8% |
+
+**ENT-3's own prediction is falsified.** The entry said to expect a smaller number on inter than
+intra's −17%, because a motion-compensated residual is noise-like and offers a context coder less
+structure. Measured *inside the same run*, inter is the **stronger** half on two of three
+sequences (bbb_extended −20.6% vs −14.2% at q=90; crowd_run −12.2% vs −11.4%) and 0.8 points
+behind on the third. Over all 18 points: P −11.3% mean, I −9.4%. The entry's alternative reading —
+"then the inter gap lives in the motion model, not the coder" — is **not** supported by these
+numbers and must not be taken from them.
+
+**The new finding is the decay.** Monotonic in q on every sequence and both frame types. Two of
+three sequences lose two thirds of the saving between q=90 and q=99 (−12.2% → −4.3%, −11.9% →
+−3.7%); bbb_extended loses a third. GNC is a contribution codec and q=95-99 is its home range, so
+**the figure that matters for positioning is the smallest one, not `0025`'s −12.0%-to−22.9%
+band.** Mechanism, not a defect: as the quantiser fines, significance density rises, the
+neighbourhood context saturates towards "everything significant", and more of the file moves into
+the bypassed Exp-Golomb suffix and sign bits abac does not context-code at all — which Rice codes
+well.
+
+### 3. Context retuning for residuals: rejected, with a number
+
+New read-only diagnostic `GNC_COEF_ENTROPY_INTER=1` (38 lines in `encode_pframe`), which prices
+the shipped abac tiles of the **first P frame** exactly the way `GNC_COEF_ENTROPY=1` already prices
+a still's. A separate variable on purpose: the existing gate fires on a sequence's first frame,
+which is an I-frame, so one gate could not tell the two populations apart. Canary prints on both
+outcomes — with any coder but abac there are no tiles and a success-only canary would read as "no
+headroom". crowd_run, all three planes, `TOTAL` rows:
+
+| | q=95 intra | q=95 inter | q=99 intra | q=99 inter |
+|---|---|---|---|---|
+| shipped over `Hnb` (50 ctx) | +7.7% | **+6.7%** | +12.8% | **+12.5%** |
+| shipped over `Hbig` (200 ctx) | +8.3% | +7.0% | +13.1% | +12.7% |
+| shipped over `Hctx` (abac's own model) | +0.05% | +0.33% | +0.56% | +0.70% |
+
+**Inter's headroom is smaller than intra's at both quality points.** Whatever abac's 6 magnitude
+buckets leave on the table, they leave the same amount on a residual as on an intra subband, so
+retuning them *for residual statistics* has nothing to collect that one retune for both
+populations would not — and that is a context-template question (INTRA-1 / ENT-6), not an inter
+one. Third row against the first: adaptation loss is under 0.7% everywhere, consistent with
+ENT-6's 1.3%, so the 6-7% (12-13% at q=99) is the **template**, not the cold start. That is where
+a context experiment should aim, and it is not inter-specific.
+
+Scope of this one honestly: one sequence, two quality points, first P frame, statistics pooled per
+plane and subband — the same pooling `coef_entropy_diag` uses, which makes `Hnb` a *lower* bound
+on any real implementation and therefore generous to the alternative. A generous bound that still
+shows no inter-specific gap is the strong form of the conclusion.
+
+### 4. `0025`'s q=50 and q=75 columns do not reproduce; its q=90 column reproduces exactly
+
+| sequence | `0025` q=50 | here | `0025` q=75 | here | `0025` q=90 | here |
+|---|---|---|---|---|---|---|
+| bbb_extended | −16.3% | −16.6% | −22.9% | −20.0% | −19.7% | **−19.7%** |
+| crowd_run | −20.7% | −18.0% | −18.4% | −14.1% | −12.1% | **−12.1%** |
+| old_town_cross | −22.7% | −21.5% | −21.8% | −14.6% | −12.0% | **−12.0%** |
+
+Three of three exact at q=90, up to 7.2 points adrift at q=75. **That boundary is BUG-27's.**
+`p_qp_scale` returns exactly 1.0 for every quantiser step at or below 2.8 — q=85 and above — so
+the encoder's local-decode dequantise defect was byte-identical there and live on the default path
+below it, and `0025` predates the fix.
+
+**Attributed by re-running on `0025`'s own commit rather than left as a fit.** A detached worktree
+pinned at `a312d6f` (ARCH-3, the commit that landed `0025`), built and hash-recorded
+(`fd793751…`). The same harness reproduces `0025`'s container column **9 of 9 exactly** there —
+−16.3 / −22.9 / −19.7, −20.7 / −18.4 / −12.1, −22.7 / −21.8 / −12.0 — which settles two things at
+once: this harness *is* `0025`'s measurement, and the mix behind it was `2I+16P+0B` (that binary
+prints it too). So the q=50/75 difference is a change in the codec, not in the instrument.
+
+Raw byte counts across the two commits say where:
+
+| | q=50 | q=75 | q=90 |
+|---|---|---|---|
+| I-frame bytes, both coders, all 3 sequences | **identical** | **identical** | **identical** |
+| P-frame bytes, Rice | +51.9% / +88.7% / +217.1% | +59.1% / +52.4% / +59.9% | **0.00%** |
+| P-frame bytes, abac | +50.6% / +97.7% / +225.5% | +68.8% / +62.3% / +77.7% | **0.00%** |
+
+(bbb_extended / crowd_run / old_town_cross; "identical" and "0.00%" are equal integers, not a
+tolerance.) Inter-only, and a no-op at q=90 — but the magnitude is far too large for BUG-27, whose
+own table moved P bytes by +0.4% to +2.0%. **The dominant cause is INTER-2 (`0043`, `8993d41`),
+which halved `inter_dz_mul` from 2.0 to 1.0**, and the two boundaries coincide for an independent
+reason: the quality ladder's dead zone is 0.75 at both q=50 and q=75, so the inter dead zone went
+1.5 → 0.75 and stopped zeroing a large population of small residual coefficients — while at q=90
+the ladder interpolates to ≈0.18 between its q=85 (0.5) and q=92 (0.05) anchors, so the inter dead
+zone went ≈0.36 → ≈0.18 and **both values are no-ops**: the quantiser is
+`floor(|v|/step + 0.5)` after the dead-zone test, so anything at or below 0.5 changes nothing.
+BUG-27 (`p_qp_scale` exactly 1.0 for every step ≤ 2.8, i.e. q ≥ 85) and INTRA-2's
+`dead_zone_referenced` split are in the same window and are inter-affecting below q=85 too; this
+was not bisected between them, and the shape of the numbers says the dead zone carries it.
+
+So **`0025`'s q=50 and q=75 columns are superseded by the tables above**, and the
+"−12.0% to −22.9%" range that `0025`, BACKLOG and CLAUDE.md all carry no longer describes those
+two operating points. COORDINATION's BUG-27 note already says every inter figure at q ≤ 80 is
+invalidated; this was one of them and nobody had been back for it.
+
+### What did not move
+
+No default, no shipped code path. The only code is the env-gated diagnostic, and output is
+byte-identical with the variable unset. abac is still opt-in: `0017`'s three reasons stand at two,
+and this record prices the inter one **down** in the range GNC is for — a −3.7% saving at q=99 is
+not an argument for a 1.69× frame decode. Decision record `0045`.
+
+---
+
 ## INTRA-2 — 90% of the blocker was a knob that moved two things (2026-09-08)
 
 **Hypothesis.** GNC's dead zone is a no-op in its own operating range — the quantiser is

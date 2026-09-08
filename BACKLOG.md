@@ -2565,6 +2565,62 @@ for a quarter of the codebase, and this project reads history constantly. Add th
 and LOOP.md step 5 in the same commit; `cargo fmt --check` needs no compilation and costs about a
 second.
 
+### ARCH-4 — `sequence.rs` is one impl block of 7 590 lines, and it is where the reference bugs live (todo, **P2**)
+
+**Measured, not impressionistic.** `src/encoder/sequence.rs` is 7 828 lines, of which **7 590 are a
+single `impl EncoderPipeline`** running from line 166 to 7753; `#[cfg(test)]` is only the last 75
+lines. It holds **29 methods**, and three of them are 4 178 lines between them — **54% of the file
+in three functions**:
+
+| function | lines | span |
+|---|---|---|
+| `encode_pframe` | **~1 895** | 3476–5371 |
+| `encode_sequence_streaming` | **~1 403** | 218–1621 |
+| `encode_bframe` | ~880 | 5371–6251 |
+
+**The argument is not tidiness — it is that this file is where today's whole reference-contract bug
+cluster lived, and two of the causes hid inside those functions specifically.** BUG-39 cause 1 was
+`local_decode_iframe_gpu` calling `transform.inverse` unconditionally, so a MED I-frame's reference
+inverted a transform it was not coded with; cause 2 was `encode_pframe` cloning the sequence config
+so a `q=100` P-frame advertised `transform_type = MedPredict` over a wavelet residual. RATE-3,
+RATE-4 and BUG-44 are all the same surface. **A 1 900-line function is where a mislabelled
+transform hides for a day**, and `0064`'s own note is that the instrument to catch it
+(`read_reference_planes`) existed on both pipelines the whole time.
+
+**Churn is the second argument and the blocker at once: 30 commits touched this file in 24 hours,
+from 18 distinct items** — ARCH-3, BUG-18, BUG-27, BUG-39, BUG-46, BUG-49, ENT-3, ENT-5, INTER-2,
+INTRA-2, LOSSLESS-2, LOSSLESS-3, MEAS-2, PAD-1, PERF-1, RATE-2, RATE-3, RATE-4. That is the
+contention case for splitting it, and the reason a split cannot land under live sessions: it is one
+conflict per session, exactly as `0066` argued for BUG-38's 573 fmt diffs.
+
+**Precondition: a quiet tree, and after BUG-38, not before.** Park it
+`blocked-quiet-tree` and take it in the same window BUG-38 uses — formatting first, then the move,
+so the fmt diff does not collide with the relocation. See [QUIET_HOUR.md](docs/QUIET_HOUR.md).
+
+**Proposed seams, in value order.** The first one is worth doing even if nothing else is, because it
+is the only one with a bug history behind it:
+
+1. **`sequence_reference.rs` (~1 000 lines)** — the reference contract: `local_decode_iframe_gpu`,
+   `local_decode_bframe_to_pyramid_slot`, `swap_ref_planes` and the four
+   `copy_*_pyramid_slot_*` methods. This is the surface BUG-39, RATE-3, RATE-4 and BUG-44 share.
+2. **`sequence_temporal.rs` (~1 400 lines)** — `encode_sequence_temporal_wavelet`,
+   `encode_temporal_wavelet_gop_haar`, `encode_temporal_wavelet_gop`. **Live, not dead code** —
+   5 call sites in `src/main.rs` plus `tests/scene_cut_sequence.rs` and `pipeline_tests.rs`. Move
+   it, do not delete it.
+3. **`sequence_diag.rs` (~280 lines)** — `diag_original_wavelet_coefficients`,
+   `diag_original_wavelet_prequant`, `debug_wavelet_prequant`, `debug_quantize_wavelet_coeffs`.
+4. **`encode_pframe` on its own** is a sub-item, not part of the move: splitting a 1 900-line
+   function is a behaviour risk in a way relocating one is not.
+
+**Success criterion — the whole item turns on this: byte-identical output.** A file move must
+change no byte. Gate it the way PERF-1 gated its own no-behaviour claim: **24 artefacts (4:4:4 and
+4:2:0, Rice and abac, stills and sequences, encode and decode) hashing identical to `main`**, plus
+`cargo test --release` and both clippy targets. **If any byte moves, the split changed behaviour and
+is wrong** — that is the finding, not a nuisance.
+
+**Not in scope:** rewriting anything, splitting `encode_pframe`'s body, any bitstream or default
+change. Filed 2026-09-08 at the project owner's request.
+
 ### ARCH-3 — `gpu_entropy_encode` selected a whole P-frame pipeline, not just where entropy runs (**DONE 2026-09-07**)
 
 **Fixed by separating the concerns, which was the option this entry argued for.** There is one
@@ -7050,6 +7106,41 @@ threshold** — a threshold is what let 55 dB pass for lossless in BUG-15.
 
 **Invalidates:** any lossless figure taken with `GNC_DEAD_ZONE` set. No shipped default carried one,
 so no published number moves.
+
+### ENT-11 — is a rejection's instrument worth 458 lines? `bpc_paco_diag` (todo, **P3**)
+
+Filed 2026-09-08 at the project owner's request, as "remove `bpc_paco_diag`". **The finding that
+reframes it: it is not orphaned scaffolding.** `src/encoder/bpc_paco_diag.rs` (458 lines) is the
+instrument that produced **ENT-7 part 2's rejection**, and it is wired into the live
+`GNC_COEF_ENTROPY=1` harness as a seventh model column — `coef_entropy_diag.rs` imports
+`BpcStats`/`BpcTable`, calls `accumulate_block` per block, and reads `GNC_BPC_TABLE` and
+`GNC_BPC_DUMP`. So removal is not `rm`; it is a change to a diagnostic that **INTRA-1 step 1 and
+ENT-7 both cite for their numbers**.
+
+**So the item is to decide, not to presume, and either answer is a decision record.**
+
+**For removing it:** `0030` rejected BPC-PaCo as the sixth entropy coder and ENT-7 part 2 is
+REJECTED, so this is 458 lines serving a closed question. GOALS rule 9 (no code duplication) and
+rule 10 (no legacy — nobody runs GNC in production, restructure anything) both point at deletion.
+It compiles under two clippy targets in every refactor and appears in every grep of the encoder.
+
+**For keeping it:** ENT-2 is the counter-precedent and it is a strong one. That measurement was
+possible *because* a parked coder still existed, and it **overturned a documented prediction**
+(`0015`: "Rice still wins, and by more than 4.01 vs 4.22 suggested" — wrong; the coders are level
+above q=25 and rANS is 6–7% smaller below q=20). **A rejection you cannot re-derive stops being a
+measurement and becomes a claim you have to trust**, which is the failure mode this repository has
+retracted more results to than any other. ENT-7's WGSL half is also still open as BUG-31.
+
+**Criterion.** Whichever way it goes, it must not leave the record ambiguous:
+
+- **If deleted:** record in `0030` and ENT-7's entry that the ≤7.5%-of-bound figure is no longer
+  reproducible from this tree, so a later reader knows it is testimony rather than an instrument.
+- **If kept:** say so once, in ENT-7's entry, with the reason — so the next session sizing the
+  codebase stops re-asking. This is the third time diagnostic weight has been raised without a
+  decision.
+
+**Cost to run: no GPU, no measurement, no shader.** Reading and a decision record. The line count is
+the smallest thing at stake.
 
 ### ENT-7 — replace abac with BPC-PaCo? No (**part 2 REJECTED 2026-09-08**; the WGSL half is BUG-31)
 

@@ -4,6 +4,115 @@
 
 ---
 
+## ENT-8 step 1 — the lockstep scan is affordable on abac's template, and the stripe width is a dial (2026-09-08)
+
+**Hypothesis, and the reason it needed its own measurement.** `0030` found that BPC-PaCo buys
+coefficient-level parallelism by *scheduling* rather than by weakening its context: two-column
+stripes stepped in lockstep give a left-column coefficient 3 already-coded neighbours and a
+right-column one 5, averaging **4 — exactly what a raster scan gets** (TIP 2016 §III-A), and the
+authors' own ablation confirms it costs essentially nothing. ENT-8 asks whether abac can take that
+schedule and become 32 threads per code-block instead of one.
+
+**It does not inherit the result, and the arithmetic says why.** BPC-PaCo reads all eight
+neighbours, so a stripe schedule redistributes which four are available without changing how many.
+abac reads **four and they are all causal** — left, up, up-left, up-right. Under the lockstep scan
+the first column of each stripe loses its *left* neighbour, because that position is a later phase
+of the previous stripe, while every other column keeps all four. So the average falls from 4 of 4
+to 3.5 of 4 at stripe width 2, and the cost had to be measured on abac's own template.
+
+**Success criterion, from the item, set before measuring:** stop if this costs more than **1% of
+total rate** at q=85/90 on the four stills — 1% is roughly a quarter of everything abac has left
+(`0024`: +4.1% against the bound on the 82% of rate in full blocks).
+
+### Method
+
+`src/encoder/abac_init_diag.rs` gains `Scan`, and the walk takes its visit order from it. **Only
+the order changes.** `mag` is zero-initialised and written when a position is visited, so which
+neighbours `neighbour_sum` can see follows from the order alone — exactly as it would for a
+decoder, which is what makes this a valid simulation rather than an approximation of one.
+
+The stripe width is a parameter, not a constant, because the mechanism makes it a dial: with
+stripes `k` columns wide only the **first column of each stripe** pays, so the cost should fall as
+`1/k` while the thread count falls as `w/k`. Priced at k = 2, 4, 8 against the same cold start,
+four stills, q=85 and 90, `0024`'s parameters, on the shipped abac tiles.
+
+**Canaries.** A unit test asserts the neighbour arithmetic rather than trusting the reasoning: for
+`Scan::Raster` every interior position has 4 coded neighbours, for `Scan::Lockstep { 2 }` even
+columns have **3** and odd columns **4**, every position is visited exactly once, and a 64-wide
+block yields 32 threads. If that test ever reads 4 of 4 for the lockstep scan, the thing being
+priced is not the scan that makes 32 threads possible. Separately, the cold arm still lands 1.16%
+under the real bitstream inside the measured 81.3-bit-per-block flush band, and `0024`'s six
+columns reproduce byte-for-byte in the same run.
+
+### Raw numbers — percentage of total rate, against the same coder with a raster scan
+
+| image | q | k=2 (32 threads) | k=4 (16 threads) | k=8 (8 threads) |
+|---|---|---|---|---|
+| bbb_1080p | 85 | +0.96% | +0.55% | +0.29% |
+| blue_sky_1080p | 85 | **+1.00%** | +0.58% | +0.30% |
+| kristensara_720p | 85 | +0.61% | +0.34% | +0.17% |
+| touchdown_1080p | 85 | +0.39% | +0.18% | +0.15% |
+| bbb_1080p | 90 | +0.83% | +0.48% | +0.26% |
+| blue_sky_1080p | 90 | +0.89% | +0.54% | +0.27% |
+| kristensara_720p | 90 | +0.53% | +0.30% | +0.15% |
+| touchdown_1080p | 90 | +0.33% | +0.15% | +0.12% |
+| **mean, q=85** | | **+0.74%** | **+0.41%** | **+0.23%** |
+| **mean, q=90** | | **+0.65%** | **+0.37%** | **+0.20%** |
+
+**The shape is the second canary.** Cost against width reads 0.74 / 0.41 / 0.23 — a factor of
+0.55 per doubling against the 0.50 that "1 in k columns pays" predicts. It is slightly worse than
+1/k because the columns that pay are not a random sample: the first column of a stripe is where
+the left neighbour carries most, and the residual is the difference between the average
+neighbour's value and that column's. A curve that had come out flat, or steeper than 1/k, would
+have meant the mechanism was not the one being measured.
+
+Per band at bbb q=90, k=2: the loss is remarkably uniform, +0.10% to +1.65%, and **the worst rows
+are the LH bands** (`Y LH1` +1.65% against `Y HL1` +0.46%). That is the right direction and worth
+recording: LH is horizontally lowpass, so horizontal correlation is highest there and the *left*
+neighbour is precisely the one it loses.
+
+### The answer
+
+**Step 1 passes, and the recommended width is 4, not BPC-PaCo's 2.**
+
+- k=2 reaches **+1.00% at blue_sky q=85 — exactly the gate**, on 1 of 8 points. Taking it would
+  spend the whole budget for the last doubling of threads.
+- **k=4 gives 16 threads per 64px code-block for +0.41% of rate** at q=85 and +0.37% at q=90, and
+  its worst point is +0.58%. Sixteen times today's parallelism for two-fifths of the budget.
+- k=8 gives 8 threads for +0.23%, which is the conservative option if step 2 finds the exchange
+  cheap enough that 8 threads already saturate.
+
+**abac has ~3000 code-blocks per padded 1080p 4:4:4 frame, so this is ~48 000 invocations at k=4
+against 3000 today.** Whether that converts into throughput is step 2 and is *not* answered here.
+
+### What is not measured, and what it needs
+
+**Step 2 — the WGSL cost — is the real question and it is untouched.** The exchange of one
+significance byte across a stripe boundary needs workgroup storage and a `workgroupBarrier()` per
+phase, 64 rows x k phases per block. BUG-31 (2026-09-08) left abac at 6 400 B per entry point
+against `Limits::default()`'s 16 384 B, so there is ~9 984 B of headroom and the exchange is
+nothing against it — but `tests/workgroup_storage_limit.rs` now asserts every entry point exactly,
+so the addition must be a number in its exception list, never a tolerance. The authors' own
+shuffle-to-shared-memory substitution cost **~20% on their DWT kernel**, which is far less
+exchange-dense and pays no barriers, so 20% is a floor on the loss rather than an estimate.
+
+**And it cannot be measured on this machine.** Eight sessions share one GPU; COORDINATION forbids
+a wall-clock figure under load, and the same abac decode input has read 25.2 / 31.1 / 37.5 ms
+across three runs. Step 2 is an implementation item — a CPU coder variant, both shaders, and a
+byte-exactness gate on the scale of ENT-5's 98-of-98 — whose entire payoff is a number nobody can
+take today. It is left specified rather than started, which is the same call `0017` reason 2 is
+still living with.
+
+**No decision record.** Nothing shipped, no default moved, no recorded conclusion reversed. The
+choice of stripe width becomes a decision when step 2 ships, and it belongs to whoever ships it —
+with this curve as its input.
+
+**Gates:** `cargo test --release -- --test-threads=1` green; `cargo clippy --release` clean; wasm
+`--lib` clean (the wasm *binary* target is red on `main`, pre-existing, BUG-24).
+
+
+---
+
 ## ENT-6 — abac's cold start is worth 1.3% of rate, not 4%: a bound cannot price an initialisation (2026-09-08)
 
 **Hypothesis and the fork.** `0024` measured abac's short code-blocks — the LL and level-3/4/5

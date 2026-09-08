@@ -36,6 +36,9 @@ use std::collections::HashMap;
 
 use super::abac::{bucket, neighbour_sum, NUM_BUCKETS};
 use super::abac_init_diag;
+
+/// Stripe widths ENT-8 step 1 prices, in columns. 2 is BPC-PaCo's own and the most parallel.
+const LOCKSTEP_WIDTHS: [usize; 3] = [2, 4, 8];
 use super::bpc_paco_diag::{self, BpcStats, BpcTable};
 use super::abac_tile::{abac_decode_tile, band_name, code_blocks_banded, AbacTile};
 
@@ -162,6 +165,11 @@ struct BandStats {
     adapt_cold: f64,
     /// ENT-6: the same engine started from this band's own signalled table.
     adapt_warm: f64,
+    /// ENT-8: the same engine, cold, under the lockstep scan at three stripe widths — 32, 16 and
+    /// 8 threads per 64px code-block against abac's one today. Only the first column of each
+    /// stripe loses its left neighbour, so the rate cost falls as the width grows and the
+    /// parallelism with it.
+    adapt_lockstep: [f64; 3],
 }
 
 impl BandStats {
@@ -432,6 +440,14 @@ pub fn run(tiles: &[AbacTile], plane_tile_counts: [usize; 3], qstep: f32) {
                 let st = &mut stats[p][band];
                 st.adapt_cold += abac_init_diag::adapt_bits(&blk, bw, &cold);
                 st.adapt_warm += abac_init_diag::adapt_bits(&blk, bw, &warm[p][band]);
+                for (slot, k) in LOCKSTEP_WIDTHS.iter().enumerate() {
+                    st.adapt_lockstep[slot] += abac_init_diag::adapt_bits_scan(
+                        &blk,
+                        bw,
+                        &cold,
+                        abac_init_diag::Scan::Lockstep { stripe_cols: *k },
+                    );
+                }
             }
 
             // Candidate 2, same tile, same coefficients, plain cb grid.
@@ -635,12 +651,14 @@ fn abac_init_table(
         "  --- ENT-6: abac's own engine, cold start (p=1/2) against a signalled warm start ---"
     );
     eprintln!(
-        "  {:>5} {:>5} {:>11} {:>11} {:>11} {:>7} {:>9} {:>9}",
-        "plane", "band", "shipped B", "Ahalf B", "Awarm B", "hdr B", "canary", "warm win"
+        "  {:>5} {:>5} {:>11} {:>11} {:>11} {:>11} {:>7} {:>9} {:>9} {:>9}",
+        "plane", "band", "shipped B", "Ahalf B", "Awarm B", "Alock B", "hdr B", "canary",
+        "warm win", "lockstep"
     );
-    let mut t = [0.0f64; 4];
+    let mut t = [0.0f64; 5];
+    let mut t_lock = [0.0f64; LOCKSTEP_WIDTHS.len()];
     for (p, plane) in planes.iter().enumerate() {
-        let mut pt = [0.0f64; 4];
+        let mut pt = [0.0f64; 5];
         let mut any = false;
         for (band, st) in stats[p].iter().enumerate() {
             if st.coefficients == 0 {
@@ -652,39 +670,50 @@ fn abac_init_table(
                 st.adapt_cold / 8.0,
                 st.adapt_warm / 8.0,
                 abac_init_diag::TABLE_BYTES_PER_BAND,
+                st.adapt_lockstep[0] / 8.0,
             ];
             eprintln!(
-                "  {plane:>5} {:>5} {:>11.0} {:>11.0} {:>11.0} {:>7.0} {:>+8.2}% {:>+8.2}%",
+                "  {plane:>5} {:>5} {:>11.0} {:>11.0} {:>11.0} {:>11.0} {:>7.0} {:>+8.2}% \
+                 {:>+8.2}% {:>+8.2}%",
                 band_name(band, num_levels),
                 row[0],
                 row[1],
                 row[2],
+                row[4],
                 row[3],
                 (row[1] / row[0].max(1e-9) - 1.0) * 100.0,
                 ((row[2] + row[3]) / row[0].max(1e-9) - 1.0) * 100.0,
+                (row[4] / row[1].max(1e-9) - 1.0) * 100.0,
             );
-            for i in 0..4 {
+            for i in 0..5 {
                 pt[i] += row[i];
+            }
+            for (slot, acc) in t_lock.iter_mut().enumerate() {
+                *acc += st.adapt_lockstep[slot] / 8.0;
             }
         }
         if !any {
             continue;
         }
         eprintln!(
-            "  {plane:>5} {:>5} {:>11.0} {:>11.0} {:>11.0} {:>7.0} {:>+8.2}% {:>+8.2}%",
-            "ALL", pt[0], pt[1], pt[2], pt[3],
+            "  {plane:>5} {:>5} {:>11.0} {:>11.0} {:>11.0} {:>11.0} {:>7.0} {:>+8.2}% \
+             {:>+8.2}% {:>+8.2}%",
+            "ALL", pt[0], pt[1], pt[2], pt[4], pt[3],
             (pt[1] / pt[0].max(1e-9) - 1.0) * 100.0,
             ((pt[2] + pt[3]) / pt[0].max(1e-9) - 1.0) * 100.0,
+            (pt[4] / pt[1].max(1e-9) - 1.0) * 100.0,
         );
-        for i in 0..4 {
+        for i in 0..5 {
             t[i] += pt[i];
         }
     }
     eprintln!(
-        "  {:>5} {:>5} {:>11.0} {:>11.0} {:>11.0} {:>7.0} {:>+8.2}% {:>+8.2}%",
-        "TOTAL", "", t[0], t[1], t[2], t[3],
+        "  {:>5} {:>5} {:>11.0} {:>11.0} {:>11.0} {:>11.0} {:>7.0} {:>+8.2}% {:>+8.2}% \
+         {:>+8.2}%",
+        "TOTAL", "", t[0], t[1], t[2], t[4], t[3],
         (t[1] / t[0].max(1e-9) - 1.0) * 100.0,
         ((t[2] + t[3]) / t[0].max(1e-9) - 1.0) * 100.0,
+        (t[4] / t[1].max(1e-9) - 1.0) * 100.0,
     );
     // The canary, decomposed rather than asserted. The simulation charges `−log2 p` per
     // decision; the real coder additionally flushes each block's stream to a whole byte with
@@ -715,6 +744,21 @@ fn abac_init_table(
     );
     // The decisive number: warm against cold *inside the simulation*, so every per-block cost
     // the simulation does not model is present on both sides and cancels.
+    eprintln!(
+        "  => ENT-8 step 1, the rate gate. abac keeps 3.5 of its 4 causal neighbours at stripe \
+         width 2, not the 4 of 4 BPC-PaCo's eight-neighbour template keeps, so it does **not** \
+         inherit their free-parallelism result. Only the first column of each stripe pays, so \
+         the cost is a dial against the thread count (gate: stop above +1% of total rate):"
+    );
+    for (slot, k) in LOCKSTEP_WIDTHS.iter().enumerate() {
+        eprintln!(
+            "       stripe {k:>2} cols, {:>2} threads per 64px block: {:+.2}% of total rate \
+             ({:+.2}% of the coder's own bits)",
+            abac_init_diag::Scan::Lockstep { stripe_cols: *k }.threads_per_block(64),
+            (t_lock[slot] - t[1]) / t[0].max(1e-9) * 100.0,
+            (t_lock[slot] / t[1].max(1e-9) - 1.0) * 100.0,
+        );
+    }
     let win = (t[2] + t[3] - t[1]) / t[0].max(1e-9) * 100.0;
     let win_per_tile = (t[2] + t[3] * num_tiles as f64 / 3.0 - t[1]) / t[0].max(1e-9) * 100.0;
     eprintln!(

@@ -4342,7 +4342,44 @@ decode, and the BUG-31 static workgroup-storage assertion in CI.
 **Decision record required either way** — a shipped coder is a default-adjacent choice, and a
 rejection is a recorded conclusion with numbers (the EBCOT entry is the template).
 
-### ENT-8 — abac could code 32 stripes per code-block instead of one, at no context cost (todo, P2)
+### ENT-8 — abac could code 16 stripes per code-block instead of one (**step 1 DONE 2026-09-08**, step 2 todo, P2)
+
+**Step 1 passes and the recommended stripe width is 4, not BPC-PaCo's 2.** Numbers in RESEARCH_LOG
+"ENT-8 step 1". Priced offline on the shipped abac tiles with `abac_init_diag`'s `Scan`, four
+stills, q=85 and 90, as a percentage of total rate against the same coder in raster order:
+
+| | k=2 (32 threads/block) | k=4 (16 threads) | k=8 (8 threads) |
+|---|---|---|---|
+| mean, q=85 | +0.74% | **+0.41%** | +0.23% |
+| mean, q=90 | +0.65% | **+0.37%** | +0.20% |
+| worst single point | +1.00% (blue_sky q=85) | +0.58% | +0.30% |
+
+The gate was 1% of total rate. **k=2 hits exactly 1.00% on 1 of 8 points**, so the last doubling of
+threads costs as much as the first four together; **k=4 buys 16x today's parallelism for two-fifths
+of the budget** and is the recommendation. The cost falls as 0.55 per doubling against the 0.50
+that "only the first column of a stripe pays" predicts — the residual is that the paying column is
+where the left neighbour carries most, which is also why the **LH bands are the worst rows**
+(`Y LH1` +1.65% against `Y HL1` +0.46% at k=2): LH is horizontally lowpass, so the left neighbour
+is exactly the informative one there.
+
+**Step 2 is untouched and it is the whole question.** What step 1 changes about it: the width is
+settled, the rate cost is known, and BUG-31 left ~9 984 B of workgroup headroom so the exchange
+buffer is not a constraint — but `tests/workgroup_storage_limit.rs` now asserts every entry point's
+exact size, so an addition goes in its exception list as a number, never as a tolerance. What step
+1 does **not** change: the exchange needs a `workgroupBarrier()` per phase, 64 rows x k phases per
+block, and the authors' own shuffle-to-shared-memory substitution cost ~20% on a far less
+exchange-dense kernel, so 20% is a floor on the loss. **Step 2 is an implementation item on the
+scale of ENT-5** — a CPU coder variant, both shaders, and a byte-exactness gate — **whose entire
+payoff is a throughput number that cannot be taken on this machine** (eight sessions, one GPU; the
+same abac decode has read 25.2 / 31.1 / 37.5 ms across three runs). Do not start it without an
+idle box.
+
+**The decision record belongs to whoever ships step 2**, with the curve above as its input.
+Nothing shipped here: no default moved and no conclusion reversed, so step 1 has none.
+
+Original filing follows.
+
+### ENT-8 — abac could code 32 stripes per code-block instead of one, at no context cost (original filing)
 
 Filed 2026-09-08 by ENT-7 step 3, which found it while rejecting the coder it came from. **This is
 a throughput item with a rate gate, not a rate item.**

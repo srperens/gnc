@@ -70,6 +70,66 @@ pub(crate) fn cold_init() -> Vec<u32> {
     vec![PROB_ONE / 2; NUM_CONTEXTS]
 }
 
+/// Which order the coder visits a code-block's coefficients in.
+///
+/// The distinction is ENT-8's whole question. `Raster` is what abac does: one thread per
+/// code-block walking rows left to right, so all four of `neighbour_sum`'s causal neighbours —
+/// left, up, up-left, up-right — are always available. `Lockstep` is BPC-PaCo's schedule ported
+/// to abac's template: the block is cut into two-column stripes with a thread each, and every
+/// thread codes the left column of row *y* before any thread codes a right column, which is what
+/// makes 32 threads per block possible.
+///
+/// **abac does not inherit BPC-PaCo's "the parallelism is free" result, and this is why.**
+/// BPC-PaCo reads all eight neighbours, so its stripe schedule still averages 4 already-coded
+/// ones (3 on a left column, 5 on a right), the same as a raster scan. abac reads four and they
+/// are all on the causal side: a left-column coefficient loses the *left* neighbour, because
+/// `x - 1` is a right column visited later in the same row, and a right-column one keeps all
+/// four. So the average falls from 4 of 4 to **3.5 of 4** and the cost has to be measured on
+/// abac's own template.
+/// The stripe width is a dial, not a constant. With stripes `k` columns wide, only the *first*
+/// column of each stripe loses its left neighbour — every other column's left neighbour sits in
+/// an earlier phase of the same stripe and is already coded — so **1 in k** coefficients pays,
+/// against `w / k` threads per block. `k = 2` is BPC-PaCo's own width and the most parallel;
+/// `k = w` is a single stripe and is exactly [`Scan::Raster`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Scan {
+    Raster,
+    Lockstep { stripe_cols: usize },
+}
+
+impl Scan {
+    /// The visit order for a `w x h` block. Nothing else about the walk changes between scans:
+    /// `mag` is zero-initialised and written only when a position is visited, so which neighbours
+    /// `neighbour_sum` can see follows from the order alone — exactly as it would for a decoder.
+    fn order(self, w: usize, h: usize) -> Vec<(usize, usize)> {
+        let mut out = Vec::with_capacity(w * h);
+        for y in 0..h {
+            match self {
+                Scan::Raster => out.extend((0..w).map(|x| (y, x))),
+                Scan::Lockstep { stripe_cols } => {
+                    let k = stripe_cols.max(1);
+                    for phase in 0..k {
+                        let mut x = phase;
+                        while x < w {
+                            out.push((y, x));
+                            x += k;
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Threads a `w`-wide code-block would get under this scan — one per stripe.
+    pub(crate) fn threads_per_block(self, w: usize) -> usize {
+        match self {
+            Scan::Raster => 1,
+            Scan::Lockstep { stripe_cols } => w.div_ceil(stripe_cols.max(1)),
+        }
+    }
+}
+
 /// Bits abac's real engine spends on one code-block, started from `init`.
 ///
 /// The walk is [`super::abac::encode_block`]'s, decision for decision, and the probability update
@@ -77,32 +137,40 @@ pub(crate) fn cold_init() -> Vec<u32> {
 /// drift away from the coder it is modelling. Bypassed bits (the Exp-Golomb remainder and the
 /// sign) are charged at one bit each, which is exactly what `encode_bypass` costs.
 pub(crate) fn adapt_bits(coefficients: &[i32], width: usize, init: &[u32]) -> f64 {
+    adapt_bits_scan(coefficients, width, init, Scan::Raster)
+}
+
+/// [`adapt_bits`] with the visit order named explicitly — ENT-8's step 1.
+pub(crate) fn adapt_bits_scan(
+    coefficients: &[i32],
+    width: usize,
+    init: &[u32],
+    scan: Scan,
+) -> f64 {
     let height = coefficients.len() / width;
     let mut probs: Vec<Prob> = init.iter().map(|&p| Prob::from_p_zero(p)).collect();
     let mut mag = vec![0u32; coefficients.len()];
     let mut bits = 0.0;
 
-    for y in 0..height {
-        for x in 0..width {
-            let v = coefficients[y * width + x];
-            let a = v.unsigned_abs();
-            let ctx = bucket(neighbour_sum(&mag, width, y, x));
-            code(&mut bits, &mut probs, ctx, a > 0);
-            if a > 0 {
-                code(&mut bits, &mut probs, NUM_BUCKETS + ctx, a > 1);
-                if a > 1 {
-                    code(&mut bits, &mut probs, 2 * NUM_BUCKETS + ctx, a > 2);
-                    if a > 2 {
-                        // Exp-Golomb order 0 of (a - 3) as bypass bits: 2*len - 1 of them.
-                        let n = a - 3 + 1;
-                        let len = 32 - n.leading_zeros();
-                        bits += f64::from(2 * len - 1);
-                    }
+    for (y, x) in scan.order(width, height) {
+        let v = coefficients[y * width + x];
+        let a = v.unsigned_abs();
+        let ctx = bucket(neighbour_sum(&mag, width, y, x));
+        code(&mut bits, &mut probs, ctx, a > 0);
+        if a > 0 {
+            code(&mut bits, &mut probs, NUM_BUCKETS + ctx, a > 1);
+            if a > 1 {
+                code(&mut bits, &mut probs, 2 * NUM_BUCKETS + ctx, a > 2);
+                if a > 2 {
+                    // Exp-Golomb order 0 of (a - 3) as bypass bits: 2*len - 1 of them.
+                    let n = a - 3 + 1;
+                    let len = 32 - n.leading_zeros();
+                    bits += f64::from(2 * len - 1);
                 }
-                bits += 1.0; // sign, bypassed
             }
-            mag[y * width + x] = a;
+            bits += 1.0; // sign, bypassed
         }
+        mag[y * width + x] = a;
     }
     bits
 }
@@ -190,5 +258,47 @@ mod tests {
             "worst per-block overhead is {worst} bits at {worst_case}, above the 400-bit band \
              this test establishes — re-derive the band before trusting the ENT-6 columns"
         );
+    }
+
+    /// ENT-8's premise, asserted rather than reasoned about: under the lockstep scan abac's
+    /// **four**-neighbour causal template loses the left neighbour on even columns and keeps all
+    /// four on odd ones, averaging **3.5 of 4** — not the 4 of 4 that BPC-PaCo's eight-neighbour
+    /// template keeps under the same schedule. If this ever reads 4.0 for `Lockstep`, the scan
+    /// being priced is not the one that makes 32 threads per block possible.
+    #[test]
+    fn lockstep_costs_abacs_template_half_a_neighbour() {
+        let (w, h) = (16usize, 16usize);
+        for (scan, want_even, want_odd) in
+            [(Scan::Raster, 4usize, 4usize), (Scan::Lockstep { stripe_cols: 2 }, 3, 4)]
+        {
+            let order = scan.order(w, h);
+            assert_eq!(order.len(), w * h, "{scan:?} must visit each position exactly once");
+            let mut visited = vec![false; w * h];
+            let mut per_parity = [Vec::new(), Vec::new()];
+            for &(y, x) in &order {
+                // Interior only; the block edge legitimately has fewer neighbours. abac's
+                // template is left, up, up-left, up-right.
+                if y > 0 && x > 0 && x + 1 < w {
+                    let n = usize::from(visited[y * w + x - 1])
+                        + usize::from(visited[(y - 1) * w + x])
+                        + usize::from(visited[(y - 1) * w + x - 1])
+                        + usize::from(visited[(y - 1) * w + x + 1]);
+                    per_parity[x % 2].push(n);
+                }
+                visited[y * w + x] = true;
+            }
+            assert_eq!(
+                scan.threads_per_block(64),
+                if scan == Scan::Raster { 1 } else { 32 },
+                "{scan:?} thread count"
+            );
+            for (parity, want) in [(0usize, want_even), (1, want_odd)] {
+                assert!(
+                    per_parity[parity].iter().all(|&n| n == want),
+                    "{scan:?} parity {parity}: wanted {want} coded neighbours, got {:?}",
+                    per_parity[parity]
+                );
+            }
+        }
     }
 }

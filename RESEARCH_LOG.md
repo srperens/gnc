@@ -199,6 +199,32 @@ bandwidth-reduction arguments.
   because all three are priced on bandwidth. One idle-machine run of this A/B answers it, and
   answering it on the change that is already written is cheaper than on three that are not.
 
+### BUG-43, found by the same change: the decoder used a bitstream byte as a shift distance
+
+Asking what bounds `read_bits(count)` now that `take` can exceed 8 found that **nothing did**,
+and that the old reader had been safe by accident. Every `k` a valid stream can carry is 0..=15
+(`optimal_k` clamps), but `deserialize_tile_rice` takes all four k arrays as raw bytes, so a
+corrupt stream can say 255 — and `k` is a shift on both paths (`1u32 << k`, `read_bits(k)`,
+`1u << shared_k[g]`). A WGSL shift of >= 32 is undefined.
+
+The byte-at-a-time reader capped `take` at the bits left in a byte, so it could never shift past
+8 whatever `k` said. **The 32-bit window removed that accidental bound**, which makes item 8 a
+robustness regression on malformed input in the same commit that made it faster on valid input.
+The two `1 << k` sites are older and were never bounded.
+
+Fixed at the single point both decode paths cross: `RICE_MAX_K = 15` named in `rice.rs`, all four
+arrays clamped in `deserialize_tile_rice`, and `MAX_TAKE = 16u` in the shader as the belt to that
+braces. **Clamping cannot change a well-formed stream** — 15 is the most the format can express —
+so a bad byte becomes wrong pixels for the per-tile CRC-32 to catch instead of undefined
+behaviour. Test corrupts every header byte to `0xFF`/`0x80`/`0x20` and asserts the invariant
+without hard-coding an offset. The 16 byte-identical decodes were re-run after the clamp, because
+the clamp is on the CPU path too: still 16 of 16. BACKLOG BUG-43.
+
+**Worth the second reading:** this was found by a question, not by a test or a crash, and the
+question only got asked because the change forced it. The general form is open — which other
+decoder inputs reach a shift, an index or an allocation unvalidated — and GNC ships per-tile
+CRC-32 precisely because malformed input is expected to arrive.
+
 ### The rule
 
 **An interleaved A/B does not rescue a measurement from a machine at load 43.** Interleaving

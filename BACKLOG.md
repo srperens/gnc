@@ -1445,6 +1445,46 @@ that is not a shader it does not use. **Why P2:** it invalidates no measurement 
 nothing on Vulkan or Metal, but GOALS rule 4 claims DX12 and step 1 is close to free. Step 1
 alone converts "DX12 does not run GNC" into a measurement.
 
+### BUG-43 — the decoder took Rice `k` off the wire and used it as a shift distance (**FIXED** 2026-09-08)
+
+Found while implementing PERF-3 item 8, by asking what bounds `read_bits(count)` now that the
+32-bit window let `take` grow past 8. Answer: nothing did.
+
+**Every `k` in a GNC bitstream is 0..=15** — all four k arrays go through `optimal_k`, which ends
+`.min(15)`. But `deserialize_tile_rice` reads them with `take_bytes`, so **a corrupt or hostile
+stream can say 255**, and `k` is a shift distance on both decode paths: `1u32 << k` in
+`rice.rs`, and `read_bits(k)` plus `1u << shared_k[g]` in `rice_decode.wgsl`. **A WGSL shift of
+32 or more is undefined**, and in Rust it panics in debug and is masked in release.
+
+**Two things were true and only one of them was mine.** The byte-at-a-time reader capped `take`
+at "bits left in this byte", so it could never shift by more than 8 whatever `k` said — safe by
+accident. The 32-bit window removed that accident: `take = min(remaining, p_win_bits)` reaches 32
+on a bad `k`, and `p_window << 32u` is undefined. So item 8 introduced a real regression on
+malformed input, in the same commit that made the reader faster on well-formed input. The
+GPU's `1u << shared_k[g]` and the CPU's `1u32 << k` were unbounded **before** item 8 and are the
+pre-existing half.
+
+**Fixed in the one place both decode paths pass through.** `RICE_MAX_K = 15` is now named in
+`rice.rs` with the reasoning, `deserialize_tile_rice` clamps all four k arrays (`k_values`,
+`k_zrl_nz_values`, `k_zrl_z_values`, `k_stream_odd`) on the way in, and the shader caps `take` at
+`MAX_TAKE = 16u` so the shift stays in range even if something upstream of it ever does not
+clamp. Clamping **cannot change a well-formed stream**, because 15 is already the maximum the
+format can express — so a bad byte now produces wrong pixels that the per-tile CRC-32 catches,
+which is what that CRC is for, instead of undefined behaviour inside the decoder.
+
+**Verified:** `a_corrupt_k_byte_is_clamped_and_never_becomes_a_shift_of_32` corrupts every byte of
+the tile header to `0xFF`, `0x80` and `0x20` in turn and asserts no k exceeds `RICE_MAX_K` and
+nothing panics — it does not hard-code where the k blocks sit, so it cannot go stale when the
+header changes. Plus the 16 of 16 byte-identical decodes from item 8, re-run after the clamp
+because the clamp is on the CPU path too. Suite green, both clippy targets clean.
+
+**Not audited, and it is the reason this is worth reading twice:** `k` is not the only bitstream
+field used as a shift or a length. `deserialize_tile_rice` also reads `len_k` with `br.get(4)`
+(bounded to 15 by the field width, so fine) and stream lengths as Rice codes. **The general
+question — which other decoder inputs reach a shift, an index or an allocation unvalidated — is
+open and is not this item's.** GNC ships per-tile CRC-32 as an error-resilience feature, which
+means malformed input is a case the format explicitly expects to meet.
+
 ### BUG-34 — GNC requests 10 storage buffers per stage against a default of 8 (**DONE 2026-09-08**)
 
 Request is now **9**, via `gnc::required_limits()`. 10 was unused slack: naga counts

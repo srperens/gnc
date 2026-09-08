@@ -133,9 +133,18 @@ fn read_bit() -> u32 {
     return bit;
 }
 
-// Read multiple bits (MSB-first). count must be <= 15, which is what bounds every
-// shift below: `take` is at most 15, so neither `32u - take` nor `p_window << take`
-// can reach 32 and become undefined.
+// Read multiple bits (MSB-first). A well-formed stream always asks for <= 15: every k
+// in the bitstream comes from `optimal_k`, which clamps to 0..15.
+//
+// `MAX_TAKE` does not trust that. `k` is deserialised straight out of the bitstream as
+// a byte and can be up to 255 in a corrupt or hostile one, and a WGSL shift by >= 32 is
+// undefined — so an unbounded `take` would turn a bad `k` into undefined behaviour
+// inside the decoder. Capping it keeps `32u - take` and `p_window << take` in range for
+// any input at all: a bad `k` then reads garbage bits and terminates, which is what the
+// per-tile CRC is there to catch. The byte-at-a-time reader this replaced had the same
+// property for free, because its `take` could never exceed the 8 bits left in a byte.
+const MAX_TAKE: u32 = 16u;
+
 fn read_bits(count: u32) -> u32 {
     var value = 0u;
     var remaining = count;
@@ -143,7 +152,7 @@ fn read_bits(count: u32) -> u32 {
         if (p_win_bits == 0u) {
             refill();
         }
-        let take = min(remaining, p_win_bits);
+        let take = min(min(remaining, p_win_bits), MAX_TAKE);
         let bits = p_window >> (32u - take);
         value = (value << take) | bits;
         p_window = p_window << take;

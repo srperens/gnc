@@ -4835,7 +4835,7 @@ agreement to two decimals on both metrics from independent implementations.**
 
 **The inter gate failed and that is why this is not the default everywhere.** At ki=9 with the fill
 forced on: crowd_run and old_town_cross move worst-frame PSNR by **+0.000 dB** for −6.9% to −10.1%
-of rate, but **bbb_extended loses 1.30 dB of worst-frame PSNR at q=85 and 4.03 dB at q=92** — the
+of rate, but **bbb_extended loses 2.47 dB of worst-frame PSNR at q=85 and 4.03 dB at q=92** — the
 same shape as INTRA-2's dead zone, mean −2.28 dB against worst −4.03 dB. The control: **the same
 clip at ki=1 loses nothing** (−5.65% of rate, PSNR identical), which pins the cause to the MC
 reference rather than to the coding. Motion compensation is handed the *padded* dimensions and
@@ -4880,8 +4880,11 @@ sees a plausibly extended picture again. It changes the decoding process, so it 
 version and old streams must keep the old behaviour.
 
 **What is already measured, so nobody re-derives it:** the forced-on arm of
-`scripts/meas_pad1_inter.py` (crowd_run and old_town_cross +0.000 dB, bbb_extended −1.30 and
-−4.03 dB, mean rate −8.64%), and the ki=1 control that isolates the cause. **Success criterion:**
+`scripts/meas_pad1_inter.py`, re-measured on `main` with INTER-2: crowd_run +0.000 dB at both q,
+old_town_cross −0.900 / −0.490 at q=85 and +0.000 at q=92, bbb_extended −2.470 at q=85 and
+**−4.030 at q=92**, mean rate −8.80%. **6 of 12 points regress, up from 3 before INTER-2** — a
+lower inter dead zone stopped quantising away part of the prediction error the fill causes, so the
+first figures understated it. Plus the ki=1 control that isolates the cause. **Success criterion:**
 the rate win of the forced-on arm with worst-frame PSNR within 0.3 dB of replication on all three
 sequences, both chroma formats.
 

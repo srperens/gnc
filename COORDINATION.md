@@ -344,9 +344,38 @@ recreate them.** It only *streams* y4m to extract a single frame, and says so it
 downloading multi-GB files". So those two came from somewhere else, and if they go, someone
 re-downloads multi-GB sources from Xiph by hand.
 
-Everything else under `sequences/` is PNG frames, which the script does fetch. **So a `.y4m` in a
-scratchpad is cheap to lose and a `.y4m` under `test_material/` is not**, and they are one glob
-apart.
+Everything else under `sequences/` is PNG frames, which the script does fetch. So a `.y4m` under
+`test_material/` is expensive to lose and one in a scratchpad is cheap — **but "cheap" was too
+quick, and the correction came from the session that fixed BUG-36.**
+
+**`--vmaf` writes its inputs as `.y4m` straight into `TMPDIR`.** BUG-36's fix pid-stamps them
+(`gnc_ip_vmaf_ref_p<pid>.y4m` and friends) so concurrent runs stop scoring each other's frames —
+but **pid-stamping defends against collision and not at all against a wildcard delete.** A
+`rm -f *.y4m` in `TMPDIR` takes live VMAF inputs out from under any session mid-run, and
+`rd-curve --vmaf` has by far the widest exposure because it holds its Y4M across every quality
+point.
+
+The one reassurance is that this class fails **loudly**, unlike BUG-36 itself: the files are
+written, flushed and handed to the `vmaf` binary, so deleting them in that gap makes vmaf error out
+and GNC print `failed (is vmaf in PATH?)`. The score comes back *empty* rather than
+plausible-and-wrong. So check for blank VMAF cells rather than for implausible ones.
+
+## Do not swap a shared build artefact while someone is measuring
+
+Same day, and adjacent to the subagent scoping above rather than to it. One session stopped itself
+rebuilding `target/release/gnc` while a 36-run sweep was reading that binary — **which would have
+mixed two encoders across the rungs of one ladder and produced a perfectly plausible BD-rate.**
+Worktrees have their own `target/`, so this is a hazard *within* a session, not between them, and
+it is the one that does not announce itself: nothing errors, the numbers just quietly come from two
+different codecs.
+
+I nearly did the same and cannot fully rule out that I did: `cargo test --release` rebuilds, and I
+launched a gate run concurrently with a measurement run earlier today. What saves that particular
+case is evidence rather than care — the still-image byte count at q=90 is identical across every
+commit `main` moved through today (1 793 794 B with `GNC_PAD_FILL=replicate`), so a binary swap
+mid-run could not have changed those figures. **The lesson is to serialise anyway**, because next
+time the intervening change will not be one that leaves the output byte-identical.
+
 ## Builds queue on one lock, and that looks like a hang
 
 Each worktree has its own `target/`, so builds no longer block on each other's **target** lock —

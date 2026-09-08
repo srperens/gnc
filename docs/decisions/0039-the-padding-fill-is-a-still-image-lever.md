@@ -41,6 +41,9 @@ implementations — that agreement is the main reason to believe either number.
 **And it is refused wherever the padding is a reference**, because there it is a large loss.
 `benchmark-sequence`, ki=9, 17 frames, forcing the fill on:
 
+As first run, before INTER-2 landed — superseded by the table in the next paragraph, and kept only
+because the decision was taken on it:
+
 | sequence | chroma | q | rate | worst-frame PSNR |
 |---|---|---|---|---|
 | crowd_run | 444 / 420 | 85, 92 | −6.9% to −9.2% | **+0.000 dB** |
@@ -48,6 +51,34 @@ implementations — that agreement is the main reason to believe either number.
 | bbb_extended | 444 | 85 | −7.42% | **−1.300 dB** |
 | bbb_extended | 444 | 92 | −9.14% | **−4.030 dB** |
 | bbb_extended | 420 | 92 | −10.24% | **−0.350 dB** |
+
+**Re-measured on `main` with INTER-2 (`a069e55`, merged after this gate first ran), and the hazard
+got *worse*.** INTER-2 lowered the inter dead zone (`inter_dz_mul` 2.0 -> 1.0), which changes inter
+output for q <= 88 — so the q=85 rows above are from the older path and the table below is the
+current one. Regressing points go from **3 of 12 to 6 of 12**:
+
+| sequence | chroma | q | rate | dWORST before | **dWORST now** |
+|---|---|---|---|---|---|
+| crowd_run | 444 / 420 | 85 | −6.9% / −9.0% | +0.000 | **+0.000** |
+| old_town_cross | 444 | 85 | −7.81% | +0.000 | **−0.900** |
+| old_town_cross | 420 | 85 | −10.20% | +0.000 | **−0.490** |
+| bbb_extended | 444 | 85 | −8.70% | −1.300 | **−2.470** |
+| bbb_extended | 420 | 85 | −9.80% | −0.250 | **−0.360** |
+
+The mechanism is coherent: a larger dead zone was quantising away part of the prediction error the
+fill causes, so **the old figures understated the hazard.** Refusing the fill on inter is more
+clearly right after INTER-2, not less.
+
+**The q=92 rows are unchanged to the last digit**, including the −4.030 dB the verdict rests on,
+and that is a property rather than a coincidence — verified independently by the INTER-2 session in
+this exact configuration (bbb_extended, 24 frames, ki=9, q=92, fill forced on, byte-identical at
+both multipliers). The reason is arithmetic and content-independent: `res_dead_zone = dead_zone *
+mul`, the anchors put `dead_zone` at 0.05 by q=92, so both 0.05 and 0.10 sit below the **0.5 no-op
+threshold** — GNC quantises as `floor(|v|/step + 0.5)` after a `|v| < dz*step` test, so under 0.5
+the test only zeroes what the rounding already zeroed. Asserted over 4000 values in
+`tests/cli_shipped_config.rs::a_dead_zone_of_half_a_step_changes_nothing`.
+
+**The shipped default is unaffected in every row: +0.000 dB and 0.0000% of rate at all 12 points.**
 
 **Pre-declared criterion was 0.3 dB of worst-frame PSNR. It failed at 4.03 dB on one of three
 sequences** — the same shape as INTRA-2's dead zone, and the reason worst-frame rather than mean is

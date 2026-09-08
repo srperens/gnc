@@ -270,10 +270,16 @@ the session that remembers to run it, and it still loses the race:
 
 ```bash
 # in YOUR worktree: take main's changes and resolve conflicts where your gates can be re-run
-git -C "$REPO-$AREA" fetch origin && git -C "$REPO-$AREA" merge origin/main
+git -C "$REPO-$AREA" merge main
 # then in the shared checkout, where a conflict is now impossible
 git -C "$REPO" merge --ff-only "$AREA"
 ```
+
+**Merge `main`, not `origin/main`.** Sessions merge into the *local* `main` and push it only
+occasionally, so `origin/main` lags — it was 3 merges behind local `main` while this was being
+written. `git merge origin/main` therefore reports "Already up to date" while `--ff-only` in the
+shared checkout still refuses, which reads as a contradiction and is not one. Everything is local
+to this machine and `.git` is shared, so no fetch is needed to see another session's merge.
 
 **`--ff-only` cannot leave a merge in progress**: it either succeeds or refuses and changes nothing,
 so the failure this whole section is about becomes unreachable rather than guarded. When it refuses,

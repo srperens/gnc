@@ -3844,6 +3844,20 @@ establishes is that the comparison has to be done properly before the positionin
 quality-matched, same quantity, on a clip long enough to amortise startup. Claim B still needs a
 discrete NVIDIA card with driver 610+/nvenc 13.1 for the NVENC column.
 
+**Reconciled with the Windows round-3 entry, which landed the same hour and cuts the other way on
+the most important point.** Round 3 measured GPU **power** during its sweep: it *never exceeds
+~49 W and falls to 2 W at N=8*, with the ceiling at **~1.8 GB per process**. So the 1.69x is **not
+GNC saturating the GPU** — it is GNC running out of host memory and per-process overhead while the
+GPU idles. That reframes the VideoToolbox row: it is still a red flag against quoting Claim B, but
+it is **not** evidence that GNC's compute does not scale, because compute was never the binding
+constraint in either sweep. **The two machines also agree on the number from different quantities**
+— Mac intra `--density-still` 1.69x at N=4, Windows *inter* `--density` 1.85x at N=4, monotonic —
+which is a consistent per-process-overhead ceiling rather than a GPU one. And the divergence is
+explained by the same finding: the Mac completed **8/8** where the Windows box collapsed at N=4 and
+OOM'd at N=8, on 64 GB against a laptop's RAM. **So the actionable item ahead of any NVENC column is
+per-process memory and startup** — at ~1.8 GB and ~15 s of pipeline compilation per instance, the
+density sweep is measuring the wrong thing on both machines.
+
 **The thesis was never one claim. It is two, and they are not equally strong.**
 
 **Claim A — "no session cap, and it runs where NVENC does not" — HOLDS. Fully sourced.**

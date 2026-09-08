@@ -2044,52 +2044,27 @@ Every edit is in `#[cfg(test)]` code or an integration test target, checked file
 each file's `#[cfg(test)]` marker, so the shipped build is unchanged by construction and no
 figure in BASELINE moves.
 
-### BUG-42 — `ENT-9` is two different startable items, and the second one can never be claimed (todo, P3)
+### BUG-42 — `ENT-9` is filed twice (**CLOSED 2026-09-08 — duplicate of COORD-3, and the third filing of it**)
 
-`main:BACKLOG.md` carries **two** `### ENT-9` headings, both startable, both P2, and they are not
-two drafts of one idea:
+Filed and closed within the same hour by the `loopa` session, which found the two live `### ENT-9`
+headings on `main` while merging BUG-20 and did not know **BUG-41** had already been filed and
+closed against **COORD-3** for exactly this. COORD-3 holds it, with `ENT-10` for the renumber,
+`dr-0065` for the record, and a tested allocator plus duplicate-id refusal on `drnum-mech`. Read
+COORD-3, not this.
 
-- line 5762 — *should abac be the default? The largest built lever in the codec has never been an
-  item* (DOC-3, 2026-09-08)
-- line 5935 — *abac context-codes three decisions and bypasses the rest; at q>=95 the rest is
-  where the file is*
+**What this instance adds is the count: three sessions filed the same finding in one hour**, and
+the third did it *after* COORD-3's stub was on `main`. That is not the stub failing — the stub is
+what closed BUG-41 — it is the **stale base**: `loopa`'s worktree was branched before the stub
+landed, so its own `BACKLOG.md` did not contain COORD-3, and nothing in filing a bug reads
+committed `main`. Same shape as the `dr-0029` case COORDINATION already records for decision
+numbers: *reserving from a stale base is indistinguishable from reserving a free one.*
 
-`scripts/claim`'s `candidates()` emits **one queue line per matching heading**, so `claim items`
-lists ENT-9 twice — but the claim is `refs/claims/ENT-9`, one ref for the id. So the first session
-to take ENT-9 marks *both* lines held, and **which of the two items it actually works on depends
-on which heading it reads**. The other is invisible to the queue for good: it can never be handed
-out separately, and it never shows as free again.
-
-Found 2026-09-08 by the `loopa` session while merging BUG-20, by scanning `main:BACKLOG.md` for
-duplicate startable ids. It is the only duplicate today. The scan is three lines and belongs in
-`claim selftest`:
-
-```bash
-git show main:BACKLOG.md | awk '/^### /{h=substr($0,5); if (match(h,/^[A-Z][A-Z0-9]*-[0-9]+/)!=1) next; \
-  id=substr(h,RSTART,RLENGTH); if (h ~ /\*\*(DONE|CLOSED|FIXED|REJECTED|WITHDRAWN|SUPERSEDED|CORRECTED)/) next; \
-  if (match(h,/P[0-9]/) || h ~ /\(todo/) print id}' | sort | uniq -d
-```
-
-**This is the `0018` mechanism in the one namespace COORD-2 did not close.** `scripts/claim dr`
-and `scripts/claim bug` allocate their ids *out of* the compare-and-swap (`docs/decisions/0050`),
-so decision numbers and BUG ids cannot collide any more. Every other item prefix — `ENT-`,
-`PERF-`, `RATE-`, `TILE-`, `MEAS-`, `PAD-`, `COORD-` — is still **picked by hand from a read of
-BACKLOG**, which is three steps and races exactly the way reading-then-claiming does. Two sessions
-filing an ENT item within the same minute both compute "the next one is 9".
-
-So there are two halves, and the second is the one that stops it recurring:
-
-1. **Renumber one of the two.** The DOC-3 entry is the later filing and is referenced from
-   COORDINATION's `../gnc-next3` row and from `docs/decisions/0060`; the other is referenced from
-   BACKLOG's own priority list. BUG-19 (`0059`) is the precedent for which half moves and how the
-   inbound references are handled — its finding was that the keeper should be the more-cited half,
-   and that a blind replace breaks more citations than it fixes.
-2. **`scripts/claim item <PREFIX>`**, the same CAS as `claim bug`: walk `main:BACKLOG.md` and
-   `refs/claims/*` for `<PREFIX>-<n>`, CAS the first gap, print the id. Then no prefix is
-   allocated by hand and this class is closed rather than fixed once.
-
-Worth doing together: renumbering without (2) leaves the next pair one concurrent filing away, and
-(2) without the renumber leaves an item nobody can claim.
+`scripts/claim bug` cannot catch this, and it is worth being precise about why: it walks
+`main:BACKLOG.md` and `refs/claims/*` for a free **id**, which it correctly gave (BUG-42 was
+free). Nothing anywhere compares the **subject**. So the id allocator is not the missing check —
+`git show main:BACKLOG.md | grep -i <subject>` plus `scripts/claim list` for a held item whose
+heading does not exist yet is, and the second half is what both BUG-41 and this missed, because a
+held item with no heading is invisible to every read except `claim list`.
 
 ### BUG-38 — `cargo fmt --check` is red across the tree, and GOALS §9 names it as a gate (todo, P4)
 

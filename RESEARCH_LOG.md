@@ -4,6 +4,206 @@
 
 ---
 
+## ENT-7 steps 2–3 — BPC-PaCo's model is *better* than abac's by 7.9%, and every way of collecting it costs more than 7.9% (2026-09-08)
+
+**Hypothesis and the fork.** ENT-7 asks whether GNC should replace abac with BPC-PaCo (bitplane
+coding with parallel coefficient processing; Aulí-Llinàs, Enfedaque, Moure, Sanchez, *IEEE TIP*
+25(1) 2016, GPU implementation *IEEE TPDS* 28(8) 2017). Two halves: a stationary probability
+model, which would delete abac's cold start (ENT-6: +25.9% over the bound on the short blocks at
+q=90), and coefficient-level parallelism, which would attack the 1.69x frame decode abac costs.
+Step 2 is the papers; step 3 prices the model on GNC's own shipped coefficients, offline, with no
+GPU and no new coder. Both are done here. **Step 1 (BUG-31's WGSL fix) was deliberately not
+touched — it is a separate free item and does not depend on this answer.**
+
+**Success criteria, from BACKLOG, set before measuring:** rate within **+2% of abac** at identical
+decoded pixels, or keep abac. Plus a threshold for *preferring a sixth backend over folding the
+mechanism into abac*: **≥3% of total rate beyond what abac + ENT-6 reach**, or ≥1.3x decode.
+
+### Method
+
+Seventh model in the `GNC_COEF_ENTROPY=1` harness — `src/encoder/bpc_paco_diag.rs`, called from
+`coef_entropy_diag.rs`, read-only on data the encoder has already produced (decision `0010`). It
+takes the **shipped** abac tiles, decodes them back to the coefficients the bitstream really
+carries, and re-codes those same coefficients as BPC-PaCo would:
+
+| column | model |
+|---|---|
+| `shipped` | what abac's bitstream actually spent, per code-block, plus each block's length field |
+| `Hctx` | abac's own binarisation under abac's own 18 contexts, pooled per plane and subband |
+| `Hbpc` | BPC-PaCo's two-column lockstep scan, 14 contexts (9 significance + 4 sign + 1 refinement) **per bitplane per subband**, probabilities pooled over this image |
+| `Hbpcn` | the same model with the neighbourhood frozen at each plane boundary — a WGSL port with no cross-lane exchange |
+| `Hbpcf` | `Hbpc`'s model against a table trained on the **other three images** at the same q — leave-one-image-out, which is what a stationary coder ships |
+| `flw` | the excess bits in the final codeword of each stripe's coder, `⌈w/2⌉ × W/2` per block at W = 16 |
+
+Same four stills, same six-point convention and same parameters as decision `0024` — 4:4:4, tile
+256, 5 levels, cb 64, `--abac` — because anything else is not a comparison. Sweep:
+`scripts/meas_ent7_bpc.py`, two passes (dump, then price against the other three).
+
+**Instrument canaries.** Three unit tests in the module, and the first one is the one that matters:
+BPC-PaCo's whole claim is that its scan sees as many already-coded neighbours as a raster scan, so
+the test asserts **3 visited neighbours for a left-column coefficient, 5 for a right-column one,
+AVNP exactly 4** — JPEG 2000's number. If that fails the module is pricing some other coder. The
+second asserts `Hbpcn ≥ Hbpc` (a less informed context cannot be cheaper), the third that the
+codeword excess scales with stripe count. Separately, the six columns of `0024` are printed by the
+same run and **reproduce byte-for-byte** (bbb q=90: shipped 1 791 863, `Hctx` 1 790 424, `Hnb`
+1 696 020, `Hnb0` 1 669 242), so the coefficients priced here are the ones `0024` priced.
+
+### Raw numbers — bytes, whole frame, all three planes, as a percentage of what abac shipped
+
+| image | q | shipped | `Hbpc` | `Hbpc`+flw | `Hbpcf` | **`Hbpcf`+flw** | no-exchange |
+|---|---|---|---|---|---|---|---|
+| bbb_1080p | 85 | 1436965 | −7.09% | −2.70% | +1.82% | **+6.21%** | +10.28% |
+| blue_sky_1080p | 85 | 1260905 | −9.05% | −4.29% | −3.77% | **+0.99%** | +11.86% |
+| kristensara_720p | 85 | 459393 | −8.78% | −3.34% | −4.09% | **+1.34%** | +8.25% |
+| touchdown_1080p | 85 | 1414760 | −6.14% | −1.65% | −1.80% | **+2.69%** | +7.02% |
+| bbb_1080p | 90 | 1791863 | −7.47% | −3.92% | +0.52% | **+4.07%** | +9.68% |
+| blue_sky_1080p | 90 | 1472179 | −9.34% | −5.13% | −3.79% | **+0.42%** | +11.19% |
+| kristensara_720p | 90 | 553540 | −8.22% | −3.61% | −3.13% | **+1.49%** | +7.24% |
+| touchdown_1080p | 90 | 1654434 | −6.45% | −2.60% | −2.42% | **+1.43%** | +6.43% |
+| **mean** | **85** | | **−7.76%** | **−2.99%** | **−1.96%** | **+2.81%** | +9.35% |
+| **mean** | **90** | | **−7.87%** | **−3.81%** | **−2.20%** | **+1.85%** | +8.63% |
+
+The "no-exchange" column is relative to `Hbpc`, not to shipped.
+
+### The answer, in one decomposition
+
+BPC-PaCo's *model* beats abac by **7.8–7.9%** on GNC's own coefficients. Then:
+
+| what is added | costs | leaves, vs abac |
+|---|---|---|
+| the model, oracle table trained on this image | — | **−7.9%** |
+| a table trained on other images instead (stationarity) | **5.7 pts** | −2.2% |
+| the 32 independent fixed-length codeword streams per block | **4.0 pts** | **+1.85%** |
+| *(alternatively)* dropping the cross-lane exchange, which core WebGPU has no primitive for | 8.6 pts | +6.4% |
+
+**A complete BPC-PaCo is +1.85% of abac's rate at q=90 and +2.81% at q=85.** That is inside the
++2% criterion at one quality point and outside it at the other, on a mean over four images, with
+bbb — the sequence GNC is regression-tested on — the worst of the four at **+4.07% / +6.21%**.
+There is no reading of this in which a sixth backend buys rate.
+
+**Where the model's 7.9% actually is** (bbb, q=90, leave-one-out table):
+
+| band group | share of rate | `Hbpc` vs shipped |
+|---|---|---|
+| Y LL | 0.4% | **−50.4%** |
+| levels 1–2 (full 64×64 blocks) | 82% | −4.0% to −11.4% |
+| LL + levels 3–5 (blocks < 64px) | 18% | −12.0% to −28.8% |
+
+It is abac's cold start, and it is exactly the distribution ENT-6 measured from the other side.
+`Y LL` at −50.4% against `Y LL` at +66.7% over the entropy bound in `0024` is the same defect
+counted twice. **This is a measurement of ENT-6's size, not of BPC-PaCo's.**
+
+**Where the stationary table fails is chroma, and it fails hard.** The leave-one-out misses — a
+context the table never saw, charged at p = 1/2 — are 0.00–0.31% on Y and up to **2.44% on Co**
+(bbb `Co HL2`), and the bands where `Hbpcf` comes out *worse* than what abac shipped are all
+chroma level-1 bands (`Co HH1` +3.7% with the codeword excess). Four images is a small training
+set, and that is the honest reading: the papers say so themselves — "coding images of a different
+type from that used to construct a given LUT may decrease the coding performance significantly"
+(Aulí-Llinàs & Marcellin, *IEEE TM* 16(4) 2014, §IV), and a single LUT pooled over all corpora
+degrades every corpus.
+
+### What the papers say, and two things in them that change the shape of the item
+
+Step 2, read from the authors' own PDFs (full texts, not abstracts):
+
+- **The parallelism is free, and ENT-7's premise that it costs context quality was wrong.**
+  BPC-PaCo splits a code-block into 2-column stripes and steps them in lockstep; a left-column
+  coefficient has 3 already-coded neighbours, a right-column one 5, **average 4 — identical to
+  JPEG 2000's sequential scan** (TIP 2016 §III-A). Their own ablation confirms it: swap the coder
+  for the MQ coder and BPC-PaCo lands "almost the same as JPEG 2000".
+- **The rate penalty is entirely the multi-codeword bitstream.** Force a single codeword stream and
+  BPC-PaCo *improves* by 0.25–0.5 dB and ends above JPEG 2000 on every corpus except natural
+  images; lossless, averaged over 18 images, stationary + single stream is **+0.01 bps** against
+  JPEG 2000 while substituting the MQ coder is +0.02 (TIP 2016 §IV, Table I). The published
+  headline "less than 2% efficiency loss" is the cost of 32 coders, not of stationary probabilities.
+- **On short code-blocks the stationary model wins, decisively** — the reverse of what ENT-7
+  predicted. Lossless, natural corpus, against JPEG 2000: **+0.04 bps at 64×64, 0.00 at 32×32,
+  −0.10 at 16×16**, and its 64×64→16×16 degradation is 0.07–0.11 bps against JPEG 2000's 0.21
+  (*IEEE TM* 2014 Table II). Independent confirmation of ENT-6 from a completely different
+  direction.
+- **The authors retired the stationary model in 2023.** A 14-context *adaptive* sliding window
+  (W = 256, updated once per 32 coefficients) beats both JPEG 2000 and HTJ2K at medium and high
+  rates for ~10% more compute (*SPIC* 112, 2023). Implementing the 2016 LUT is implementing the
+  version its own authors replaced — and "update once per 32 coefficients" is much closer to abac
+  with a prior than to a new coder.
+- **The throughput is real, and the WebGPU limits are not what stops it.** 4096×4096 entropy
+  coding in 11.4 ms encode / 12.45 ms decode on a GTX TITAN X, 27.4x/25.1x over Kakadu on 32 Xeon
+  threads. Read off the released CUDA, it uses **20 bytes** of shared memory per 128-thread block,
+  3 storage buffers, and a **2.6 KB** probability table — none of the limits in CLAUDE.md's
+  portability table binds. What binds is **512 B of dynamically-indexed private state per
+  invocation** (128 coefficients in registers; their own figure is 251 MB read for 32 MB of data,
+  8x amplification, and the workgroup-storage alternative measured 3.5–9x slower in their thesis),
+  and two cross-lane operations — `__shfl` for the cross-stripe neighbour fetch, on the order of
+  1000 times per thread per block, and `__ballot`+`__popc` for the codeword-slot reservation. The
+  authors' own shuffle→shared-memory substitution cost **~20% on their DWT kernel**, which is far
+  less shuffle-dense and pays no barriers.
+- **Subgroups would not rescue it, and this is the sharpest portability finding of the item.** The
+  ballot in the codeword reservation *is* the bitstream ordering rule — left stripes take priority,
+  for determinism (TIP 2016 §III-C). WGSL §15.5 defines **no relationship** between
+  `subgroup_invocation_id` and `local_invocation_index`, and subgroup size is only guaranteed to be
+  a power of two in [4, 128] chosen by the device compiler, so a ballot-based port has a
+  **device-dependent bitstream**. For a coder gated on byte-exactness that is a correctness
+  failure. The deterministic `atomicOr` + `countOneBits` emulation is the right implementation and
+  it is the one that spends the throughput.
+- **The code cannot be ported anyway, and nobody has checked the numbers.** The only released
+  implementation has **no licence file and no copyright header**, one commit from 2016-11-01; the
+  authors' BOI framework is GPL to 1.8 and non-commercial thereafter. **No independent measurement
+  of BPC-PaCo exists** — every figure traces to the same group, 8 of 19 citers of the GPU paper are
+  self-citations, and no GPU-BPC-PaCo vs GPU-HTJ2K comparison has ever been run. Which is an
+  argument for having measured it on our own coefficients, not for having believed it.
+- **One external critique lands on GNC as much as on them.** Rossinelli et al. (*IEEE TMI* 40(2),
+  2021): the 25x over Kakadu confounds the algorithm with the CPU→GPU move — "it remains unclear
+  why the authors did not compare against the CPU implementation of BPC-PaCo". Any GNC throughput
+  claim comparing coders across substrates has the same hole; abac's are stated against Rice on the
+  same GPU, and should stay that way.
+- **A defect found by checking one of these claims: BUG-34.** GNC requests
+  `max_storage_buffers_per_shader_stage: 10` (`src/lib.rs:1431`) against `Limits::default()`'s
+  **8** (verified in `wgpu-types-24.0.0`), so CLAUDE.md's "GNC asks for wgpu's default limits" is
+  not true for storage buffers. Same class as BUG-31, on a limit nobody was watching.
+
+### The decision
+
+**BPC-PaCo is not GNC's sixth entropy coder.** Decision record `docs/decisions/0030`. Rate fails
+the +2% criterion at q=85 and passes it only barely at q=90; the throughput half's mechanism needs
+three CUDA primitives core WebGPU does not have; and the part that *does* pay is a property of
+abac's cold start, which ENT-6 can collect without a new bitstream, a new entropy type, a CPU
+reference coder, two shaders, a byte-exactness gate or a permanent maintenance surface across two
+command families.
+
+**Three transplants are worth taking, and they are now backed by numbers rather than by a
+literature claim:**
+
+1. **Stationary per-bitplane, per-subband initial probabilities for abac's contexts** — ENT-6
+   candidate 3, now with a size: the model gap is 7.9% and 5.7 points of it are what stationarity
+   *costs*, which an adaptive coder using the table only as a **prior** does not pay. Chroma needs
+   its own tables or none.
+2. **The two-column lockstep scan**, filed as **ENT-8**. abac is one thread per code-block today;
+   the same scan gives one thread per stripe — 32x more parallelism *inside* a block — and the
+   AVNP arithmetic says a 4-neighbour causal template loses only the left neighbour on even
+   columns. That is a hypothesis with a cheap measurement, and this harness can price it.
+3. **Not** the fixed-length multi-codeword coder. It costs 4.0 points here and buys a parallel
+   bitstream abac does not need.
+
+### The first version of this measurement was wrong, and it was wrong in the interesting direction
+
+The first `Hbpc` implementation froze the significance state at each bitplane boundary, on the
+assumption — ENT-7's own words, "no adaptation means no per-symbol serial chain, so coefficients
+*within* a code-block code in parallel" — that a coefficient-parallel coder cannot see its
+neighbours in the current plane. It measured BPC-PaCo at **+10.2% of abac's rate at q=90 and
++17.9% worse than a causal context**, and that number was reported to a colleague before the
+papers came back. It is withdrawn. BPC-PaCo achieves AVNP 4 *with* full parallelism, by scheduling
+rather than by weakening the context, and the frozen variant is not BPC-PaCo — it is the naive
+WGSL port, which is why it was kept as the `Hbpcn` column, where it prices what dropping the
+cross-lane exchange would cost us: **+8.6%**. Two lessons, and the second is the expensive one:
+a plausible mechanism attributed to a paper nobody has read yet is a guess, and it will be a guess
+that flatters whatever the reader already suspected.
+
+**Gates:** `cargo test --release -- --test-threads=1` green; `cargo clippy --release` clean; wasm
+`--lib` clean (the wasm *binary* target is red on `main`, pre-existing, BUG-24).
+
+
+---
+
 ## BUG-32 — the density harness measures SSIM throughput, not GPU encode (2026-09-08)
 
 **Provenance first, because it decides how much these numbers are worth.** This entry is a rescue.

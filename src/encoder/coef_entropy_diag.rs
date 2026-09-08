@@ -35,23 +35,24 @@
 use std::collections::HashMap;
 
 use super::abac::{bucket, neighbour_sum, NUM_BUCKETS};
+use super::bpc_paco_diag::{self, BpcStats, BpcTable};
 use super::abac_tile::{abac_decode_tile, band_name, code_blocks_banded, AbacTile};
 
 /// Binary counts for one adaptive context: how many decisions, how many of them were 1.
 #[derive(Default, Clone, Copy)]
-struct BinCount {
-    n: u64,
-    ones: u64,
+pub(crate) struct BinCount {
+    pub(crate) n: u64,
+    pub(crate) ones: u64,
 }
 
 impl BinCount {
-    fn push(&mut self, bit: bool) {
+    pub(crate) fn push(&mut self, bit: bool) {
         self.n += 1;
         self.ones += u64::from(bit);
     }
 
     /// n * H(p) — what an ideal adaptive coder converges to on this context.
-    fn bits(&self) -> f64 {
+    pub(crate) fn bits(&self) -> f64 {
         if self.n == 0 {
             return 0.0;
         }
@@ -151,6 +152,8 @@ struct BandStats {
     big: HashMap<usize, HashMap<i64, u64>>,
     /// One sign bit per significant coefficient; signs are not modelled by either bound.
     sign_bits: f64,
+    /// ENT-7 step 3: BPC-PaCo's parallel-context bitplane model on the same coefficients.
+    bpc: BpcStats,
 }
 
 impl BandStats {
@@ -191,8 +194,9 @@ impl BandStats {
     }
 }
 
-/// Walk one code-block exactly as `abac::encode_block` does, accumulating both models.
+/// Walk one code-block exactly as `abac::encode_block` does, accumulating every model.
 fn accumulate_block(st: &mut BandStats, coefficients: &[i32], width: usize) {
+    bpc_paco_diag::accumulate_block(&mut st.bpc, coefficients, width);
     let height = coefficients.len() / width;
     let mut mag = vec![0u32; coefficients.len()];
     for y in 0..height {
@@ -365,6 +369,8 @@ pub fn run(tiles: &[AbacTile], plane_tile_counts: [usize; 3], qstep: f32) {
         (t[0] / t[5].max(1e-9) - 1.0) * 100.0,
     );
 
+    bpc_paco_table(&stats, &planes, num_levels);
+
     // The decisive comparison. ENT-4: GNC with abac needs +27.1% of JPEG 2000's bits at matched
     // RGB PSNR. Split that gap at the entropy coder: what would this frame have to cost to match
     // J2K, and can *any* neighbourhood-context coder over these coefficients get there?
@@ -394,4 +400,124 @@ pub fn run(tiles: &[AbacTile], plane_tile_counts: [usize; 3], qstep: f32) {
         (shipped - target - headroom).max(0.0),
         (shipped - target - headroom).max(0.0) / (shipped - target).max(1e-9) * 100.0,
     );
+}
+
+/// ENT-7 step 3: the BPC-PaCo columns, printed as their own table so the six columns above stay
+/// byte-identical to the run decision `0024` was written from.
+///
+/// `Hbpc` is BPC-PaCo's coefficient-parallel context (previous-bitplane state only) with
+/// probabilities pooled per plane and subband *of this image* — the generous reading, an oracle
+/// table trained on the image being coded. `Hbpcs` is the same coder given EBCOT's causal raster
+/// context, so `Hbpc − Hbpcs` is the price of the parallelism alone. `Hbpcf`, printed only when
+/// `GNC_BPC_TABLE` names a table, prices the parallel context against probabilities trained
+/// somewhere else, which is what a stationary coder actually ships.
+fn bpc_paco_table(stats: &[Vec<BandStats>], planes: &[&str; 3], num_levels: u32) {
+    let table = match std::env::var("GNC_BPC_TABLE") {
+        Ok(path) => match BpcTable::load(&path) {
+            Ok(t) => {
+                eprintln!("[coef-entropy] BPC-PaCo fixed table loaded from {}", t.source);
+                Some(t)
+            }
+            Err(e) => {
+                eprintln!("[coef-entropy] WARNING: GNC_BPC_TABLE={path} unreadable ({e}); Hbpcf omitted");
+                None
+            }
+        },
+        Err(_) => None,
+    };
+
+    eprintln!(
+        "  --- ENT-7 step 3: BPC-PaCo's stationary, coefficient-parallel model on the same \
+         coefficients ---"
+    );
+    eprintln!(
+        "  {:>5} {:>5} {:>11} {:>11} {:>11} {:>11} {:>11} {:>9} {:>9} {:>9} {:>7}",
+        "plane", "band", "shipped B", "Hctx B", "Hbpc B", "Hbpcn B", "Hbpcf B", "flw B",
+        "bpc/ctx", "+flw/ctx", "miss%"
+    );
+
+    let mut t = [0.0f64; 6];
+    let mut t_miss = (0u64, 0u64);
+    for (p, plane) in planes.iter().enumerate() {
+        let mut pt = [0.0f64; 6];
+        let mut pmiss = (0u64, 0u64);
+        for (band, st) in stats[p].iter().enumerate() {
+            if st.coefficients == 0 {
+                continue;
+            }
+            let (fixed, misses) = match &table {
+                Some(tb) => st.bpc.fixed_bits(tb, (p, band)),
+                None => (f64::NAN, 0),
+            };
+            let decisions: u64 = st.bpc.decisions();
+            let row = [
+                st.shipped_bytes,
+                st.hctx_bits() / 8.0,
+                st.bpc.lockstep_bits() / 8.0,
+                st.bpc.frozen_bits() / 8.0,
+                fixed / 8.0,
+                st.bpc.flw_bits / 8.0,
+            ];
+            eprintln!(
+                "  {plane:>5} {:>5} {:>11.0} {:>11.0} {:>11.0} {:>11.0} {:>11.0} {:>9.0} \
+                 {:>+8.1}% {:>+8.1}% {:>6.2}%",
+                band_name(band, num_levels),
+                row[0],
+                row[1],
+                row[2],
+                row[3],
+                row[4],
+                row[5],
+                (row[2] / row[1].max(1e-9) - 1.0) * 100.0,
+                ((row[2] + row[5]) / row[1].max(1e-9) - 1.0) * 100.0,
+                misses as f64 / decisions.max(1) as f64 * 100.0,
+            );
+            for i in 0..6 {
+                pt[i] += row[i];
+            }
+            pmiss = (pmiss.0 + misses, pmiss.1 + decisions);
+        }
+        if pmiss.1 == 0 {
+            continue;
+        }
+        eprintln!(
+            "  {plane:>5} {:>5} {:>11.0} {:>11.0} {:>11.0} {:>11.0} {:>11.0} {:>9.0} \
+             {:>+8.1}% {:>+8.1}% {:>6.2}%",
+            "ALL", pt[0], pt[1], pt[2], pt[3], pt[4], pt[5],
+            (pt[2] / pt[1].max(1e-9) - 1.0) * 100.0,
+            ((pt[2] + pt[5]) / pt[1].max(1e-9) - 1.0) * 100.0,
+            pmiss.0 as f64 / pmiss.1.max(1) as f64 * 100.0,
+        );
+        for i in 0..6 {
+            t[i] += pt[i];
+        }
+        t_miss = (t_miss.0 + pmiss.0, t_miss.1 + pmiss.1);
+    }
+    eprintln!(
+        "  {:>5} {:>5} {:>11.0} {:>11.0} {:>11.0} {:>11.0} {:>11.0} {:>9.0} {:>+8.1}% \
+         {:>+8.1}% {:>6.2}%",
+        "TOTAL", "", t[0], t[1], t[2], t[3], t[4], t[5],
+        (t[2] / t[1].max(1e-9) - 1.0) * 100.0,
+        ((t[2] + t[5]) / t[1].max(1e-9) - 1.0) * 100.0,
+        t_miss.0 as f64 / t_miss.1.max(1) as f64 * 100.0,
+    );
+    eprintln!(
+        "  against what abac shipped: oracle-table BPC-PaCo {:+.1}%, +its codeword excess \
+         {:+.1}%, trained-elsewhere {:+.1}% (+excess {:+.1}%); dropping the cross-lane exchange \
+         costs a further {:+.1}%.",
+        (t[2] / t[0].max(1e-9) - 1.0) * 100.0,
+        ((t[2] + t[5]) / t[0].max(1e-9) - 1.0) * 100.0,
+        (t[4] / t[0].max(1e-9) - 1.0) * 100.0,
+        ((t[4] + t[5]) / t[0].max(1e-9) - 1.0) * 100.0,
+        (t[3] / t[2].max(1e-9) - 1.0) * 100.0,
+    );
+
+    if let Ok(path) = std::env::var("GNC_BPC_DUMP") {
+        let bpc: Vec<Vec<BpcStats>> =
+            stats.iter().map(|b| b.iter().map(|st| st.bpc.clone()).collect()).collect();
+        match std::fs::write(&path, bpc_paco_diag::dump(&bpc)) {
+            Ok(()) => eprintln!("[coef-entropy] BPC-PaCo context counts written to {path}"),
+            Err(e) => eprintln!("[coef-entropy] WARNING: GNC_BPC_DUMP={path} not written: {e}"),
+        }
+    }
 }

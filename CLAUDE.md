@@ -55,20 +55,22 @@ Shader source is in `src/shaders/*.wgsl`. Rust host code is in `src/encoder/` an
   recorded anywhere**, so every throughput figure in this repository labelled M1 is of unknown
   provenance (BUG-29). Run `gnc gpu-info` rather than trusting this line: it now prints the device
   and its limits, which is what would have contradicted the wrong text months ago.
-- **GNC asks for wgpu's default limits, not the hardware's**, so the same shaders run under WebGPU
-  (rule 4). The gap is large and it is deliberate — from `gnc gpu-info` on this machine:
+- **GNC asks for wgpu's default limits, not the hardware's — with one override it does not
+  admit to**, so *almost* the same shaders run under WebGPU (rule 4). The gap to the adapter is
+  large and deliberate — from `gnc gpu-info` on this machine:
 
-  | | adapter has | GNC requests |
-  |---|---|---|
-  | workgroup storage | 32768 B | **16384 B** |
-  | invocations / workgroup | 1024 | **256** |
-  | storage buffers / stage | 31 | **10** |
-  | max buffer size | 39813 MiB | 256 MiB |
+  | | adapter has | GNC requests | `Limits::default()` |
+  |---|---|---|---|
+  | workgroup storage | 32768 B | **16384 B** | 16384 B |
+  | invocations / workgroup | 1024 | **256** | 256 |
+  | storage buffers / stage | 31 | **10** | **8 — GNC overrides this** |
+  | max buffer size | 39813 MiB | 256 MiB | 256 MiB |
 
   So "32KB threadgroup memory, max 1024 threads" was describing the *adapter* and was never what
-  the shaders could use. Any occupancy argument here is about the 16KB column. Whether raising the
-  request is worth losing WebGPU portability is unmeasured and would need a decision record, not a
-  commit.
+  the shaders could use. Any occupancy argument here is about the 16KB column. **The storage-buffer
+  row is an override, not a default** (`src/lib.rs:1431`, against 8 in `wgpu-types-24.0.0` and in
+  the WebGPU specification) and it is undocumented and unmeasured — BUG-34. Raising a request is
+  worth a decision record, not a commit; this one got the commit.
 - No FP64 on Apple GPUs, and WGSL has no `f64` regardless
 - WASM target must work — avoid features not available in WebGPU (e.g. some storage texture formats, push constants)
 - WGSL shaders are the single source — transpiled per backend by naga

@@ -39,9 +39,9 @@ Two measurements, by different methods, on the four ENT-4 images:
 | | method | mean over 4 images |
 |---|---|---|
 | projected from a content-controlled crop pair | GNC only, content fixed | **+6.60%** |
-| drop in the cross-codec gap, native against padding-free | GNC vs J2K 9/7, one ladder | **+6.58 points** (26.76 → 20.17) |
+| drop in the cross-codec gap, native against padding-free | GNC vs J2K 9/7, one ladder | **+6.70 points** (26.54 → 19.83) |
 
-**The means agree to 0.02 points; the per-image figures scatter by ±2.2 in both directions.** That
+**The means agree to 0.10 points; the per-image figures scatter by ±2.2 in both directions.** That
 scatter is the content change between a frame and its centre crop, which the cross-codec arm
 carries and the content-controlled arm does not — so the cross-codec arm corroborates the mean and
 is not a per-image second opinion. **The content-controlled measurement is the one this decision
@@ -127,19 +127,19 @@ here). A BD-rate is integrated over the **overlapping** quality range, so two la
 different figures on identical content: bbb's native gap reads **+19.46%** here against ENT-4's
 +17.3%, and blue_sky **+30.66%** against +32.5%. **Per image the artefact is up to 2.2 points, the
 same size as the effect being measured**, even though the four-image means nearly coincide (26.76
-against 27.1). It gave 6.98 points and "the two methods agree to 0.4" — the right answer for the
+on that first run, 26.54 on today's, against ENT-4's 27.1). It gave 6.98 points and "the two methods agree to 0.4" — the right answer for the
 wrong reason. So the native arm is re-run here rather than cited, same ladder, same rates, same
 metric path, only the picture changing.
 
 | image | native gap | padding-free gap | drop | Part 1 projection |
 |---|---|---|---|---|
-| bbb_1080p | +19.46% | +9.86% | 9.60 | 7.90 |
-| blue_sky_1080p | +30.66% | +23.82% | 6.84 | 7.54 |
-| kristensara_720p | +28.66% | +28.25% | 0.41 | 2.65 |
-| touchdown_1080p | +28.25% | +18.77% | 9.48 | 8.30 |
-| **mean** | **+26.76%** | **+20.17%** | **+6.58** | **+6.60** |
+| bbb_1080p | +18.41% | +8.60% | 9.81 | 7.90 |
+| blue_sky_1080p | +30.63% | +23.83% | 6.80 | 7.54 |
+| kristensara_720p | +28.87% | +28.13% | 0.74 | 2.65 |
+| touchdown_1080p | +28.24% | +18.77% | 9.47 | 8.30 |
+| **mean** | **+26.54%** | **+19.83%** | **+6.70** | **+6.60** |
 
-Y-PSNR moves the same way: **+51.09% → +40.54%, a drop of 10.55 points.** This arm carries the
+Y-PSNR moves the same way: **+51.17% → +40.66%, a drop of 10.51 points.** This arm carries the
 content change from a frame to its centre crop and Part 1 does not, which is why the means agree
 and the per-image figures do not.
 
@@ -155,12 +155,12 @@ BD-rate against the shipped edge-replicate fill, negative = cheaper at the same 
 
 | fill | bbb | blue_sky | kristensara | touchdown | mean RGB | mean Y |
 |---|---|---|---|---|---|---|
-| `decay8` — replicate, then fade to one scalar over 8 px | −5.74% | −5.00% | −1.61% | −6.13% | **−4.62%** | −4.71% |
-| `flat` — one scalar everywhere outside the picture | −5.64% | −5.05% | −1.44% | −6.29% | −4.60% | −4.72% |
-| `decay32` — the same fade over 32 px | −5.27% | −4.56% | −1.03% | −5.45% | −4.08% | −4.12% |
-| `mirror` — whole-point symmetric extension of the picture | +12.33% | +15.80% | +3.14% | +14.88% | **+11.54%** | +11.48% |
+| `decay8` — replicate, then fade to one scalar over 8 px | −5.67% | −4.74% | −1.62% | −5.88% | **−4.48%** | −4.52% |
+| `flat` — one scalar everywhere outside the picture | −5.41% | −4.70% | −1.29% | −5.97% | −4.34% | −4.42% |
+| `decay32` — the same fade over 32 px | −5.33% | −4.52% | −1.24% | −5.38% | −4.12% | −4.14% |
+| `mirror` — whole-point symmetric extension of the picture | +12.10% | +15.78% | +3.00% | +14.74% | **+11.41%** | +11.28% |
 
-**A fill change alone recovers 4.62 of the 6.60 points — 61–74% per image.** Visible-pixel quality
+**A fill change alone recovers 4.48 of the 6.60 points — 61–72% per image.** Visible-pixel quality
 does not move: bbb q=90 reads 50.060 dB under `flat` against 50.061 dB under `replicate`, so the
 step discontinuity a flat fill puts at the picture edge costs less than the detail it saves. Note
 also that **replication was already the better of the two textbook extensions** — mirroring the
@@ -177,8 +177,10 @@ ladder is **q=80/85/90/94**, clear of the dual-path range.
 
 On that ladder the `C` rows read +8.07 / +8.45 / +18.06 / +8.29 against the original
 +8.32 / +8.52 / +18.04 / +8.41, **within 0.25 points**, and the projection is **identical at
-+6.60%** — it reads the q=90 rung, which is byte-identical across RATE-2. **The decision does not
-move.**
++6.60%** — it reads the q=90 rung, which is byte-identical across RATE-2. Every part was
+re-measured, not only Part 1: Part 2's drop goes 6.58 -> **6.70** and Part 3's `decay8` fill goes
+−4.62% -> **−4.48%**, the latter in the direction predicted (RATE-2's own reclaim leaves the
+ladder). **No figure moves by more than 0.15 points and the decision does not move.**
 
 Two things follow. **RATE-2 already reclaims part of the padding tax for free above q=95**, and it
 reaches the padded arm first, which concentrates PAD-1's value below q=95 — recorded there. And
@@ -214,7 +216,7 @@ reproduce byte for byte today.
   chroma allocation in `0026`, this is a **quoting** correction as much as a defect: "+27.1% intra
   coding gap" contains 6.6 points of samples GNC codes and JPEG 2000 does not, on top of the 8.5
   points of deliberate chroma allocation. **The honest form of the intra coding gap on these four
-  images is closer to +12% than to +27%**, and unlike the chroma half, this one is also 4.6 points
+  images is closer to +12% than to +27%**, and unlike the chroma half, this one is also 4.5 points
   of *shipped* rate that a fill change would return.
 
 ## Also settled on the way

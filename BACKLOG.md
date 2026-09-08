@@ -79,7 +79,7 @@ measured advantage over x264 on any axis at this operating point.**
    a queue entry.** 26.2 of the 27.1 points are named and **15.1 of them are not coding
    deficiencies** (8.5 chroma allocation, 6.6 tile padding), so the intra coding gap on these four
    images is closer to **+12%** than +27%. The remaining work is **PAD-1 (P1)** — the padding fill,
-   −4.6% of shipped intra rate, gated on inter — and **INTRA-2 (P1)** — the dead zone on I-frames
+   −4.5% of shipped intra rate, gated on inter — and **INTRA-2 (P1)** — the dead zone on I-frames
    only, ~3 points. History below. Added 2026-09-07 after ENT-4. With `--abac` on, GNC
    needs 27.1% more bits than JPEG 2000 *using the same transform at the same depth*, and nothing in
    this repository accounts for it. Largest known compression gap. **Step 1 is done (2026-09-07):
@@ -106,11 +106,11 @@ measured advantage over x264 on any axis at this operating point.**
    padded plane, so a 1920x1080 frame is coded as **2048x1280 — 20.9% of the coded samples outside
    the picture**, while J2K in whole-picture mode codes none, and both arms are divided by the
    visible pixel count. Two methods agree: **+6.60%** projected from a content-controlled crop pair
-   (quality held to 0.005 dB), **+6.58 points** as the drop in the cross-codec gap from native to
-   padding-free content on one ladder (26.76 → 20.17 RGB, 51.09 → 40.54 Y) — means agreeing to
-   0.02 points, per-image figures scattering ±2.2 with the content change. Like the chroma 8.5,
+   (quality held to 0.005 dB), **+6.70 points** as the drop in the cross-codec gap from native to
+   padding-free content on one ladder (26.54 → 19.83 RGB, 51.17 → 40.66 Y) — means agreeing to
+   0.10 points, per-image figures scattering ±2.2 with the content change. Like the chroma 8.5,
    this is **not** a coding deficiency —
-   but unlike it, **two thirds is recoverable: a fill change is worth −4.6% of shipped intra rate**
+   but unlike it, **two thirds is recoverable: a fill change is worth −4.5% of shipped intra rate**
    at unchanged visible quality, filed as **PAD-1**. Decision `docs/decisions/0034`.
 1. **Intra at contribution quality** — the whole remaining +90.5% lives here, per findings 1 and 5.
    Inter breaks even at this operating point for x264 too, so this is the only place the gap is.
@@ -4261,7 +4261,7 @@ chroma allocation + ≤7.5 entropy + 6.6 padding + ~3 dead zone + 0.6 tiling = *
 is 0.9 points of residue — **the work that is left lives in its two descendants, both filed with
 numbers and gates:**
 
-- **PAD-1 (P1)** — the fill change, −4.6% of shipped intra rate, gated on an inter measurement.
+- **PAD-1 (P1)** — the fill change, −4.5% of shipped intra rate, gated on an inter measurement.
 - **INTRA-2 (P1)** — the dead zone on I-frames only, ~3 points, blocked on the P path.
 
 **15.1 of the 27.1 points are not coding deficiencies at all** (8.5 chroma allocation, 6.6
@@ -4443,7 +4443,7 @@ against GNC's +11.6% to +25.2% on the same pair. Under 1% of the effect.
 | | method | mean over the 4 ENT-4 images |
 |---|---|---|
 | projected from a content-controlled crop pair | GNC only, content fixed, quality held to 0.005 dB | **+6.60%** |
-| drop in the cross-codec gap, native against padding-free | GNC `--abac` vs J2K 9/7, one ladder | **+6.58 points** (26.76 -> 20.17 RGB, 51.09 -> 40.54 Y) |
+| drop in the cross-codec gap, native against padding-free | GNC `--abac` vs J2K 9/7, one ladder | **+6.70 points** (26.54 -> 19.83 RGB, 51.17 -> 40.66 Y) |
 
 Per image, projected against measured: bbb 7.90/7.44, blue_sky 7.54/8.68, kristensara 2.65/2.25,
 touchdown 8.30/9.53. **kristensara is the discriminating case** — it pads only 720 -> 768 and reads
@@ -4456,10 +4456,10 @@ shipped fill at unchanged visible quality (bbb q=90: 50.060 dB flat against 50.0
 
 | fill | mean RGB | mean Y |
 |---|---|---|
-| replicate, then fade to one scalar over 8 px | **−4.62%** | −4.71% |
-| one scalar everywhere outside the picture | −4.60% | −4.72% |
-| the same fade over 32 px | −4.08% | −4.12% |
-| whole-point mirror of the picture into the padding | **+11.54%** | +11.48% |
+| replicate, then fade to one scalar over 8 px | **−4.48%** | −4.52% |
+| one scalar everywhere outside the picture | −4.34% | −4.42% |
+| the same fade over 32 px | −4.12% | −4.14% |
+| whole-point mirror of the picture into the padding | **+11.41%** | +11.28% |
 
 So **replication was already the better of the two textbook extensions** — mirroring copies real
 detail into the padding and costs 11.5 points more. What matters is being *flat in the direction of
@@ -4618,10 +4618,10 @@ at tile 512 — 20% more coefficients — which reads as +6.1% rate for tile 512
 padding and reverses the sign of the real effect. Measure tile size on content that is a multiple
 of both sizes; `1024x512` centre crops are what INTRA-1 used.
 
-### PAD-1 — GNC codes its own tile padding, and 4.6% of intra rate is a fill choice (todo, **P1**)
+### PAD-1 — GNC codes its own tile padding, and 4.5% of intra rate is a fill choice (todo, **P1**)
 
 Filed 2026-09-08 by INTRA-1 step 3, which measured the tax and then measured how much of it a fill
-change returns. **−4.6% of intra rate at 1080p, at unchanged visible quality, from ~20 lines of
+change returns. **−4.5% of intra rate at 1080p, at unchanged visible quality, from ~20 lines of
 `pad.wgsl` — gated on inter, which is unmeasured.** Decision `docs/decisions/0034`.
 
 **What is proven.** `src/shaders/pad.wgsl` edge-replicates every plane up to a whole multiple of
@@ -4633,15 +4633,15 @@ and no metric ever sees.
   picture in its own right, and bbb_1080p at q=90 with `--abac` gives **1 793 794 B against
   1 793 794 B** — the same figure this file records for the production encode.
 - **It costs 6.60% of rate** (projected from a content-controlled crop pair, quality held to
-  0.005 dB) or **6.58 points** (drop in the cross-codec gap to J2K 9/7, native against
+  0.005 dB) or **6.70 points** (drop in the cross-codec gap to J2K 9/7, native against
   padding-free, on one ladder). Per image
   2.65–8.30% projected, and it tracks the padding fraction: kristensara_720p pads only 720 -> 768
   and reads a third of the 1080p figure. The content term is measured, not assumed: JPEG 2000 reads
   **−0.13% to +0.02%** between the same two crops where GNC reads +11.6% to +25.2%.
 - **A fill change returns two thirds of it.** BD-rate against the shipped edge replication, on the
-  four ENT-4 stills at q=80–98 with `--abac`: replicate-then-fade-to-a-scalar over 8 px is
-  **−4.62% RGB / −4.71% Y**, a flat scalar is −4.60%, the same fade over 32 px is −4.08%, and a
-  whole-point mirror of the picture into the padding is **+11.54%** — so replication was already
+  four ENT-4 stills at q=80–94 with `--abac`: replicate-then-fade-to-a-scalar over 8 px is
+  **−4.48% RGB / −4.52% Y**, a flat scalar is −4.34%, the same fade over 32 px is −4.12%, and a
+  whole-point mirror of the picture into the padding is **+11.41%** — so replication was already
   the better of the two textbook extensions, and what matters is being flat in the *direction of
   extension* rather than smooth at the seam.
 - **Visible quality does not move**: bbb at q=90 reads 50.060 dB under a flat fill against
@@ -4671,7 +4671,7 @@ Three shapes, and they are not equivalent:
    this is a P1 item rather than a shader tweak.
 
 **Success criteria, stated in advance.** ≥3% of intra rate at q=90 on ≥3 stills (the measured
-figure is 4.6%, so this is a floor not a target), **and** no worst-frame regression above 0.3 dB on
+figure is 4.5%, so this is a floor not a target), **and** no worst-frame regression above 0.3 dB on
 any of ≥3 sequences at ki=9 in either chroma format. If inter loses more than intra gains, shape 3
 or nothing.
 
@@ -4686,7 +4686,7 @@ above that the padded arms come back bit-exact lossless, quality is `inf`, and a
 over an infinity is a silent non-number. `scripts/meas_intra1_padding.py` now refuses a non-finite
 rung rather than integrating it, and defaults to q=80/85/90/94.
 
-**Ceiling, so nobody over-invests.** A fill change tops out at ~4.6 of the 6.6 points. Recovering
+**Ceiling, so nobody over-invests.** A fill change tops out at ~4.5 of the 6.6 points. Recovering
 all 6.6 means **not padding at all** — partial border tiles the way JPEG 2000 has them — which
 touches tile origins, the tile grid, every shader deriving a position from `tile_size`, and the
 per-tile CRC and seek structures. Knowing the ceiling is 6.6 and not 27 is the useful part; the

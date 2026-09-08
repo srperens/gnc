@@ -218,7 +218,7 @@ every plane to whole tiles and codes the padding, so a 1920x1080 frame is coded 
 **20.9% of the coded samples are outside the picture**, while JPEG 2000 in whole-picture mode codes
 none — and both arms are divided by the visible pixel count. That is worth **~6.6 of the points**
 in any GNC-vs-J2K figure taken at native resolution: measured on one q ladder, with `--abac`, the
-gap reads **+26.8% RGB / +51.1% Y on native frames and +20.2% / +40.5% on padding-free crops**. No
+gap reads **+26.5% RGB / +51.2% Y on native frames and +19.8% / +40.7% on padding-free crops**. No
 number here is retracted; every cross-codec figure taken at a resolution that is not a whole
 number of tiles carries the tax. **A caution that came out of the same run: those native figures
 are not ENT-4's +27.1% / +48.3% even though they are close on the mean** — ENT-4 used a q=60–99

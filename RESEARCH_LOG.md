@@ -168,7 +168,7 @@ coded.
 **Success criteria, set before measuring.** ≥2 RGB points of the 27.1, on ≥3 of the 4 ENT-4 images,
 by two methods that agree — one content-controlled and one cross-codec. Under 0.5, close it.
 
-**Result: 6.60% projected content-controlled, 6.58 points measured cross-codec. The accounting closes.**
+**Result: 6.60% projected content-controlled, 6.70 points measured cross-codec. The accounting closes.**
 
 ### The canary comes first, because everything rests on one mechanism
 
@@ -269,22 +269,23 @@ GNC ladder — q=60–99 there against q=80–98 here. A BD-rate is integrated o
 quality range, so two ladders give two different figures on identical content: on this ladder
 bbb's native gap reads **+19.46%** where ENT-4 reads +17.3%, and blue_sky **+30.66%** against
 +32.5%. Per image the artefact is up to **2.2 points — the same size as the effect being
-measured** — even though the four-image means very nearly coincide (26.76 against 27.1). **Do not
+measured** — even though the four-image means very nearly coincide (26.76 on that first run,
+26.54 on today's, against ENT-4's 27.1). **Do not
 difference a BD-rate against one taken on another ladder.** So the native arm is re-run here rather
 than cited, with the same q ladder, the same J2K rates and the same metric path, and only the
 picture changing.
 
 | image | native gap | padding-free gap | drop | Part 1 projection |
 |---|---|---|---|---|
-| bbb_1080p | +19.46% | +9.86% | 9.60 | 7.90 |
-| blue_sky_1080p | +30.66% | +23.82% | 6.84 | 7.54 |
-| kristensara_720p | +28.66% | +28.25% | 0.41 | 2.65 |
-| touchdown_1080p | +28.25% | +18.77% | 9.48 | 8.30 |
-| **mean** | **+26.76%** | **+20.17%** | **+6.58** | **+6.60** |
+| bbb_1080p | +18.41% | +8.60% | 9.81 | 7.90 |
+| blue_sky_1080p | +30.63% | +23.83% | 6.80 | 7.54 |
+| kristensara_720p | +28.87% | +28.13% | 0.74 | 2.65 |
+| touchdown_1080p | +28.24% | +18.77% | 9.47 | 8.30 |
+| **mean** | **+26.54%** | **+19.83%** | **+6.70** | **+6.60** |
 
-Y-PSNR moves the same way: **+51.09% → +40.54%, a drop of 10.55 points.**
+Y-PSNR moves the same way: **+51.17% → +40.66%, a drop of 10.51 points.**
 
-**The means agree to 0.02 points and the per-image figures do not**, scattering ±2.2 in both
+**The means agree to 0.10 points and the per-image figures do not**, scattering ±2.2 in both
 directions. That scatter is the content change between a frame and its centre crop, which Part 2
 carries and Part 1 does not. So **Part 2 is a corroboration of the mean, not a per-image second
 opinion**, and Part 1 stays the measurement. The two are worth running together because Part 1
@@ -302,12 +303,12 @@ BD-rate against the shipped fill, negative = cheaper at the same visible quality
 
 | fill | bbb | blue_sky | kristensara | touchdown | mean RGB | mean Y |
 |---|---|---|---|---|---|---|
-| `decay8` — replicate, then fade to one scalar over 8 px | −5.74% | −5.00% | −1.61% | −6.13% | **−4.62%** | −4.71% |
-| `flat` — one scalar everywhere outside the picture | −5.64% | −5.05% | −1.44% | −6.29% | −4.60% | −4.72% |
-| `decay32` — the same fade over 32 px | −5.27% | −4.56% | −1.03% | −5.45% | −4.08% | −4.12% |
-| `mirror` — whole-point symmetric extension of the picture | +12.33% | +15.80% | +3.14% | +14.88% | **+11.54%** | +11.48% |
+| `decay8` — replicate, then fade to one scalar over 8 px | −5.67% | −4.74% | −1.62% | −5.88% | **−4.48%** | −4.52% |
+| `flat` — one scalar everywhere outside the picture | −5.41% | −4.70% | −1.29% | −5.97% | −4.34% | −4.42% |
+| `decay32` — the same fade over 32 px | −5.33% | −4.52% | −1.24% | −5.38% | −4.12% | −4.14% |
+| `mirror` — whole-point symmetric extension of the picture | +12.10% | +15.78% | +3.00% | +14.74% | **+11.41%** | +11.28% |
 
-**A fill change alone recovers 4.62 of the 6.60 points — 61% to 74% per image.** Visible quality
+**A fill change alone recovers 4.48 of the 6.60 points — 61% to 72% per image.** Visible quality
 does not move: bbb at q=90 reads **50.060 dB under `flat` against 50.061 dB under `replicate`**, so
 the step discontinuity a flat fill puts at the picture edge costs less than the detail it saves.
 `decay8` and `flat` are within 0.02 points of each other, and `decay8` is the safer of the two
@@ -408,6 +409,21 @@ therefore already reclaims part of the padding tax for free at q>=95**, which co
 remaining value below q=95 and is worth knowing before anyone prices PAD-1 at the top of the
 ladder.
 
+**Every part was re-measured, not just Part 1**, because Part 3's figure is the one PAD-1 will be
+planned against and a ladder spanning the dual-path range necessarily overstates what a fill change
+is worth. On q=80/85/90/94 at `c84fbd5`, with zero lossless rungs in any arm:
+
+| | first run (q=80..98, `0bc4816`) | today (q=80..94, `c84fbd5`) |
+|---|---|---|
+| Part 1 projection | +6.60% | **+6.60%** |
+| Part 2 drop, native against padding-free | +6.58 | **+6.70** |
+| Part 3 `decay8` fill | −4.62% | **−4.48%** |
+| Part 3 `mirror` fill | +11.54% | **+11.41%** |
+
+**Every figure moves by less than 0.15 points and no conclusion moves at all.** The fill change was
+predicted to look slightly *less* valuable once RATE-2's own reclaim was out of the ladder, and it
+does — −4.62% to −4.48%, in the predicted direction and about a tenth the size of the effect.
+
 **The general form, since it is not specific to this item:** any still figure in this repository
 taken on a ladder reaching q>=95 before `a7273ab` is pinned to that code. INTRA-1's own step 1 and
 step 2 used q=85..99 ladders on stills and are in that category. Nothing is retracted — they were
@@ -418,7 +434,7 @@ right for the code they ran on — but they will not reproduce byte for byte tod
 - **Part 2's first version differenced BD-rates across two different q ladders**, reading this
   harness's padding-free gap (q=80–98) against ENT-4's native gap (q=60–99) and calling the
   difference padding. It gave 6.98 points and "the two methods agree to 0.4" — close to the right
-  answer for the wrong reason. Re-running the native arm on this harness's own ladder gives 6.58,
+  answer for the wrong reason. Re-running the native arm on this harness's own ladder gives 6.70,
   and it also shows the artefact is up to **2.2 points per image**, which is the size of the whole
   effect. **Withdrawn and replaced.** The general form is worth keeping: a BD-rate is only
   comparable to another BD-rate over the same overlapping quality range.

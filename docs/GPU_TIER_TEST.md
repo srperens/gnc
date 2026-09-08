@@ -252,17 +252,13 @@ GOALS rule 4 claims Metal, Vulkan, DX12 and WebGPU. **Partly answered, and the a
   groupshared race check; the same WGSL compiles fine under Vulkan/naga-SPIR-V. This is distinct
   from BUG-25 — different backend, different compiler, different shader.
 
-**And DX12 will fail the same way this round, on a shader the default path never dispatches.**
-`block_match_split`'s pipeline was made lazy under BUG-25 and stayed lazy on the rule rather
-than the bug — "a shader's cost, including the risk that it does not compile, is paid by the
-feature that uses it and not by everything else". `match_bidir_pipeline` did **not** get that
-treatment: it is still created eagerly in `MotionEstimator::new`
-(`src/encoder/motion.rs:317`), and B-frames have been off by default since BUG-5 with the
-pyramid suppressed since 2026-09-06 — so the default path compiles a bidirectional
-motion-estimation shader it will never run, and DX12 dies on it. That is BUG-25's shape exactly,
-on a different backend. Filed as **BUG-40**. If it lands before this round, DX12 becomes
-testable for the first time; if it does not, the DX12 rows are a re-confirmation and nothing
-more.
+**BUG-40 step 1 landed 2026-09-08:** `match_bidir_pipeline` (and the two bidir MC pipelines) are
+lazy, same rule as `split_pipeline`. An intra DX12 encode should now fail on a shader it
+actually uses, or complete. **That has not been re-run on Windows.** If this round predates
+the merge, the DX12 rows are the old crash and nothing more. If it includes the fix, a still
+encode on `GNC_GPU_BACKEND=dx12` is the first real DX12 measurement this project has. B-frame
+dispatch on DX12 may still die on FXC `X3695` in `block_match_bidir.wgsl` — that is step 2,
+and it is not this round's default path.
 
 `GNC_GPU_BACKEND=vulkan` against `GNC_GPU_BACKEND=dx12` on the same card remains the comparison
 worth having — two backends of the same shaders on identical hardware, where any divergence in

@@ -1341,7 +1341,16 @@ preset and manual paths agree and that the library default still permits B-frame
 No decision record: no default changed. The shipped default was already P-only since 2026-09-06;
 this makes four CLI paths actually honour it.
 
-### BUG-40 — the eager `block_match_bidir` pipeline is BUG-25's shape on DX12 (todo, P2)
+### BUG-40 — the eager `block_match_bidir` pipeline is BUG-25's shape on DX12 (**FIXED 2026-09-08**, step 1)
+
+**Step 1 landed 2026-09-08.** `match_bidir_pipeline`, `compensate_bidir_pipeline` and
+`compensate_bidir_chroma_pipeline` are `OnceLock`s, compiled on first dispatch, same pattern as
+`split_pipeline`. Decision `0049`. Metal byte-identical on a q=75 still (`0b5cc743…`) and a
+9-frame ki=9 I+P sequence (`d75c72ee…`). Intra `GNC_PROFILE` is silent; a B-pyramid encode
+prints `[bug40] match_bidir_pipeline=1`. DX12 intra is not re-run here — that is the laptop
+round's measurement. **Step 2 (the FXC X3695 in `block_match_bidir.wgsl` on an actual B-frame
+dispatch) is unfixed and needs Windows;** it is not a startable item of its own until someone
+is on that machine.
 
 Filed 2026-09-08 while updating `docs/GPU_TIER_TEST.md` for a third laptop round. Not a new
 measurement — the crash was recorded on 2026-09-08 and never given an id.

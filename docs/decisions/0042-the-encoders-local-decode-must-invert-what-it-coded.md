@@ -68,7 +68,23 @@ is now the one the decoder has, so the error stops accumulating.
 **This also corrects `--dct` sequences**, whose P-frames were mislabelled the same way and are also
 wavelet-coded. **Not measured** — flagged rather than claimed.
 
-## Cause 3 — not fixed, and it is a design question
+## Cause 3 — **this section's mechanism was wrong; see `0054`** (superseded 2026-09-08)
+
+**Kept visible rather than rewritten, because being wrong in a specific way is the useful part.**
+The frames *were* broken, and the number below is right. The mechanism is not: at `q=100` the
+P-scale taper is already **1.0** (it is keyed on the quantiser step, and 1.0 is below the 2.8
+breakpoint) and the dead zone is already **0.000** (`normalized_for_lossless`, BUG-30). The
+encoder prints both, and has since INTER-1, so nothing in this section needed suppressing and
+suppressing it would have been inert.
+
+What it actually was: `WaveletTransform::forward` dispatches nothing at `wavelet_levels == 0` and
+never writes its output buffer, while `inverse` copies input to output first — so the encoder
+transmitted the *previous frame's* leftover buffer as this frame's residual. `0054`. Fixed;
+`q=100` inter PSNR 26.30 → 51.54 dB. Still not bit-exact, for a fourth reason named there.
+
+The original text follows.
+
+### Cause 3 — not fixed, and it is a design question (original)
 
 P-frames at `q=100` are still **26 dB, not bit-exact.** They are lossy by construction: the
 residual is quantised at the P-frame taper (up to 1.25× the intra step) with a dead zone, and at

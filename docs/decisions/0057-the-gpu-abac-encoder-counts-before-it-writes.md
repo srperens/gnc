@@ -1,8 +1,14 @@
-# 0024 — The GPU abac encoder counts before it writes, and abac is not folded into `gpu_entropy_encode`'s other job
+# 0057 — The GPU abac encoder counts before it writes, and abac is not folded into `gpu_entropy_encode`'s other job
 
 Date: 2026-09-07
 Item: ENT-5
 Status: accepted (one criterion outstanding — see "What this does not discharge")
+
+> **Renumbered 0057 from 0024 by BUG-19 on 2026-09-08.** `0024` was taken by INTRA-1's
+> [the JPEG 2000 gap is upstream of the entropy coder](0024-the-jpeg-2000-gap-is-upstream-of-the-entropy-coder.md),
+> which reserved the number through `scripts/claim` and was committed twenty-two minutes earlier,
+> so two files carried `0024` on `main` for a day. Nothing in the record below changed. Commit
+> messages, and any citation older than this date, call it `0024`.
 
 ## Context
 

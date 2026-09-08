@@ -16,7 +16,7 @@ GNC is deliberately **broad**: intra and inter, 4:2:0 / 4:2:2 / 4:4:4 at 8 and 1
 
 ## Status
 
-**Working end to end:** I/P/B video pipeline with motion estimation, 8- and 10-bit, 4:4:4 / 4:2:2 / 4:2:0, five entropy coders of which three are selectable (Rice, `--rans`, `--abac`; Huffman and Bitplane are parked), and bit-exact lossless at `q=100` **for stills** — a `q=100` *sequence* codes bit-exact I-frames and then P-frames that decode at **26.30 dB** (BUG-39: two causes fixed 2026-09-08, `docs/decisions/0042`, down from 12.45 dB; the third is that nothing asks a P-frame to be lossless when the sequence is), so lossless video still does not work. **On Metal**, and — for correctness, not for throughput — **on Vulkan** since 2026-09-08. What runs on DX12 and in a browser is measured below and is less than this sentence used to claim.
+**Working end to end:** I/P/B video pipeline with motion estimation, 8- and 10-bit, 4:4:4 / 4:2:2 / 4:2:0, five entropy coders of which three are selectable (Rice, `--rans`, `--abac`; Huffman and Bitplane are parked), and bit-exact lossless at `q=100` **for stills** — a `q=100` *sequence* codes bit-exact I-frames and then P-frames that decode at **51.54 dB** (BUG-39: three causes fixed 2026-09-08, `docs/decisions/0042` and `0054`, up from 12.45 and then 26.30 dB; the fourth is that quarter-pel prediction is fractional, so the residual does not survive a step-1.0 quantiser), so lossless video still does not work. At `q=100` the inter path also costs **36% more than coding every frame intra** (LOSSLESS-2). **On Metal**, and — for correctness, not for throughput — **on Vulkan** since 2026-09-08. What runs on DX12 and in a browser is measured below and is less than this sentence used to claim.
 
 **Where it stands against H.264** (measured 2026-09-06, `scripts/meas1_vs_h264.py`, 1080p, ki=9, x264 at defaults):
 
@@ -208,7 +208,7 @@ abac encodes on the GPU as well as decoding there (ENT-5): one thread per code-b
 against the CPU coder in `abac.rs` — 98 of 98 whole-file comparisons byte-identical across four
 stills, q=60–100, both arithmetic engines, 4:4:4/4:2:2/4:2:0 and an 8-frame sequence.
 **Its encode time per frame is not measured**: four sessions were working this Mac when it landed,
-and a throughput figure taken under load is worth nothing here. `docs/decisions/0024`.
+and a throughput figure taken under load is worth nothing here. `docs/decisions/0057`.
 | Huffman (parked) | 256 | 64-symbol + escape | not measured | not measured | None |
 | Bitplane (parked) | Per-block | Sign + magnitude bitplanes | not measured | not measured | None |
 

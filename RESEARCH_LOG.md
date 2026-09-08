@@ -88,6 +88,585 @@ carries no behaviour. It wants a quiet tree and one commit that changes nothing 
 
 ---
 
+## BUG-19 — the four colliding decision-record numbers are renumbered, and one of the citations was wrong about its own record (2026-09-08)
+
+**What was open.** `docs/decisions/` carried four pairs of records sharing a number on `main`:
+`0018`, `0019`, `0024`, `0027`. The item was filed as mechanical with a warning attached — *"the
+renumbering is the boring half and the references are where it goes wrong"*.
+
+**Domain declaration.** Prose and one doc comment. Four file renames, citation edits in BACKLOG,
+COORDINATION, RESEARCH_LOG, GOALS, README, CLAUDE.md, `docs/decisions/0017` and `0023`, and one
+`///` comment in `src/encoder/entropy_helpers.rs`. **No encoder, decoder, shader or test path is
+touched, so this invalidates no measurement** — and that claim is checked by the gates below rather
+than asserted, since a doc-comment edit is exactly the kind of change that can still fail to
+compile.
+
+### Which half of each pair moves
+
+| collided | kept by | moved to |
+|---|---|---|
+| `0018` | ENT-2 — the entropy coders are level | **`0055`** — GNC is broad on purpose |
+| `0019` | COORD-1 — the pick is the lock | **`0056`** — the inter path's saving was an equal-setting figure |
+| `0024` | INTRA-1 step 1 — the J2K gap is upstream | **`0057`** — the GPU abac encoder counts before it writes |
+| `0027` | INTRA-1 step 2b — cross-tile allocation | **`0058`** — a simple perf fix is one whose win is a count |
+
+Two rules were available and **both give the same four answers**, which is the only reason this
+needed no judgement call per pair. "The half that never reserved the number moves" decides `0024`
+and `0027` (INTRA-1 held `dr-0024` and `dr-0027` through `scripts/claim`; the other sessions did
+not) and is silent on `0018` and `0019`, where nobody reserved. "The later add-commit moves"
+decides all four: 19:59 vs 20:00, 20:23 vs 20:35, 22:09 vs 22:31, 23:49 vs 00:15. Decision
+`docs/decisions/0059` records why the first rule leads and the second fills in.
+
+New numbers came from `scripts/claim dr` — `dr-0055`..`dr-0059`, all five reserved before a file
+was touched, which is COORD-2's mechanism (`0050`) used in anger for the first time.
+
+### The references were indeed where it went wrong — in both directions
+
+**31 citation sites repointed, and about as many deliberately left alone.** The trap is that the
+*keepers* are the more-cited half in every pair: nearly every `` `0024` `` in the tree is INTRA-1's
+≤7.5% entropy bound, and nearly every `` `0027` `` is cross-tile allocation. A blind
+search-and-replace on the numbers would have corrupted 30-odd correct citations to fix 31 wrong
+ones. Each site was classified by what the sentence around it claims — "`0024`'s six columns
+reproduce byte-for-byte" is INTRA-1's diagnostic; "a throughput figure taken under load is worth
+nothing here" is ENT-5's.
+
+**Two citations were wrong before this item started, and finding them is the item's real result.**
+The BACKLOG entry asked for `0020` to be checked because it had been renumbered by hand a day
+earlier. RESEARCH_LOG's MEAS-9 entry says, twice:
+
+> This lands the same day as decision 0020 (GNC is broad on purpose) …
+> … the obvious successor to this item, especially under decision 0020.
+
+`0020` is *the colour lead over x264 is withdrawn*. "GNC is broad on purpose" was `0018` at the
+time and is `0055` now. The MEAS-9 session cited a number that had been vacated by the hand
+renumbering hours earlier — **a citation to a wrong-but-existing record reads exactly like a
+correct one**, which is why it survived a day and why the number namespace needed the lock rather
+than a habit. Both now point at `0055`.
+
+**What cannot be fixed and what stands in for it.** Commit messages cite the old numbers (`192267c`
+announces the ENT-5 record as 0024) and rewriting history to fix a citation is not worth the risk.
+Instead **all eight files now carry a header note naming the other half of their pair and the dates
+the collision was live**, so a citation written on 2026-09-07 or 2026-09-08 is resolvable from
+either landing point. That is the half of the fix that outlives it.
+
+### Also fixed while here
+
+One broken markdown link, pre-existing and unrelated: RESEARCH_LOG's inter-gap section linked
+`[docs/POSITIONING.md]` to `../GOALS.md` — wrong target *and* wrong label, from the root of the
+repo. A
+link checker over every `.md` in the tree now reports zero broken relative links.
+
+### Gates
+
+`cargo test --release`: **261 passed, 0 failed, 3 ignored** across 23 test binaries.
+`cargo clippy --release` and `cargo clippy --release --target wasm32-unknown-unknown --lib`: **zero
+`gnc` warnings** on both (the one line clippy prints is a future-incompat notice about the `block
+v0.1.6` dependency, present before this change).
+
+## PERF-3 item 8 — the 32-bit Rice window is bit-exact and its throughput claim is unmeasured (2026-09-08)
+
+`docs/SIMPLE_PERF_FIXES.md` item 8: `rice_decode.wgsl` refilled its bit reader **one byte at a
+time** inside `while (read_bit())`, the unary loop of a stage the doc puts at ~47% of I-frame
+decode. Replaced with a 32-bit MSB-first window refilled a whole `u32` at a time.
+
+**The refill deliberately takes only the bytes left in the word holding `p_byte_offset`, never
+the next word.** That is what makes the change safe rather than merely fast: `load_byte` already
+read the entire containing `u32` to extract one byte, so keeping the rest is free, while reading
+ahead into the following word would be a **new** access past the end of the last stream. The set
+of words the shader touches is therefore exactly what it was. The alternative — clamping with
+`arrayLength(&stream_data)` — was rejected on top of that, because `docs/bug25/` is an upstream
+report about an `OpArrayLength` clamp segfaulting NVIDIA's compiler, and this is a hot decode
+shader.
+
+### Correctness: 16 of 16 byte-identical, on bitstreams encoded before the change
+
+Only the decoder changed, so the strong form of the check is available: decode the **same**
+pre-change `.gnc` files with both binaries and compare output bytes.
+
+| | bbb_1080p | blue_sky_1080p | kristensara_720p | touchdown_1080p |
+|---|---|---|---|---|
+| q=40 / 75 / 90 / 100 | identical | identical | identical | identical |
+
+Full suite green (`cargo test --release`, 0 failed), both clippy targets clean. **This is also the
+canary:** `p_bit_pos` and `p_current_byte` no longer exist, so a build that did not use `refill()`
+would not compile — and 16 identical decodes across a 4x span of quantiser, including q=100 where
+the unary runs are longest, is the new reader consuming real bitstreams correctly.
+
+### Throughput: no measurable change, and the measurement is not trustworthy either
+
+`GNC_RICE_DISPATCH_REPEAT=k` isolates the entropy slice as `(t(k) - t(1)) / (k-1)`. Interleaved
+A/B, best of 3-4 processes per point, `benchmark -n 12`:
+
+| image | q | rice stage, before | rice stage, after |
+|---|---|---|---|
+| bbb_1080p | 90 | 4.761 / 4.776 ms | **4.682 / 4.621 ms** |
+| touchdown_1080p | 40 | 4.841 / 4.907 ms | 4.848 / **4.998** ms |
+| kristensara_720p | 100 | 2.622 / 2.986 ms | 2.702 / 2.766 ms |
+
+**The direction reverses between images, so bbb's −2% is noise and there is no win here to
+report.** Whole-frame decode is indistinguishable throughout (12.2-13.6 ms before, 12.2-12.4 ms
+after, overlapping).
+
+**And the instrument could not have seen a 2% effect anyway.** Load average went from **18 to 43
+during the run** — eight sessions share this machine — and the same binary on the same image read
+9.36 ms then 7.30 ms between two passes, a 28% spread. BACKLOG's PERF-3 entry says these items
+need an idle machine; this is what it looks like when you ignore that.
+
+**Demanded an explanation of myself rather than accepting the null (CLAUDE.md quality rules), and
+there are two candidates.** Not "the code did not run" — the compile-time canary above rules that
+out. Either (a) the noise floor is an order of magnitude above the effect, which the load numbers
+support on their own, or (b) **the stage was never bound by those loads.** (b) is physically
+plausible and would make item 8's premise wrong: the word is in L1 after the first byte of it is
+touched, so the old reader's 4 loads per word were 1 miss and 3 hits, and the new byte-swap costs
+~7 ALU ops per word against the 3 shift/mask pairs it saves. On a cache-friendly GPU those
+roughly cancel. If (b) is true the same reasoning weakens items 9-11, which are also
+bandwidth-reduction arguments.
+
+### State
+
+- **Landed as a bit-exact refactor, explicitly not as a measured win.** Nothing goes into
+  BASELINE, GOALS or POSITIONING from this.
+- **Owed: the idle-machine A/B.** `gnc-before` is any build of the parent commit; the command is
+  in this entry. **If it measures neutral or worse, revert it** — the diff is one shader and the
+  bit-exactness result means a revert costs nothing.
+- **Question raised for the rest of PERF-3:** settle (a) vs (b) before implementing items 9-11,
+  because all three are priced on bandwidth. One idle-machine run of this A/B answers it, and
+  answering it on the change that is already written is cheaper than on three that are not.
+
+### The rule
+
+**An interleaved A/B does not rescue a measurement from a machine at load 43.** Interleaving
+controls for drift between arms; it does nothing about a noise floor 10x the effect. The first
+result agreed with the hypothesis, the second and third did not, and the only reason that was
+caught is that the second and third were run at all.
+
+## RATE-3 — the gate was hiding the mirror image of the bug `0040` fixed (2026-09-08)
+
+**Hypothesis.** `0036` refuses RATE-2's lossless fallback inside a sequence because the P-frames
+referencing a bit-exact I-frame decoded at 9.80 dB. BUG-39 cause 1 (`0042`) fixed the encoder's
+local decode inverting a transform it had not coded with, which is the defect that produced that
+number. So the refusal should now be unnecessary, and a bit-exact reference — no drift, nothing
+propagated — should pay on inter as well as intra.
+
+**It was still broken when the gate came off, and the reason is worth more than the rate number.**
+`encode` codes two candidates; `encode_once` leaves the quantised planes on the GPU as the side
+channel `local_decode_iframe_gpu` reads to build a reference; only the **last** encode's planes
+survive. `0040` found this in one direction — sibling second, lossy frame kept, wrong reference —
+and fixed it by running the sibling first. The other direction is the same bug with the candidates
+swapped, and the gate made it unreachable: sibling first, **bit-exact** frame kept, and the
+reference is built from the *lossy* candidate's coefficients. With `0042`'s branch in place that
+means `med.inverse` over wavelet coefficients.
+
+crowd_run q=99 ki=2, gate lifted, nothing else changed:
+
+| | I-frame bytes | P-frame bytes | worst P PSNR | sequence |
+|---|---|---|---|---|
+| shipped (`f3f7254`) | 4 789 653 | 4 990 303 | 60.62 dB | 48 799 611 |
+| gate lifted, no repair | 3 240 148 (−32.3%) | 8 885 779 | **5.93 dB** | 60 946 220 (+24.9%) |
+| gate lifted, repair | 3 240 148 (−32.3%) | 5 274 377 | 60.62 dB | **42 377 516 (−13.16%)** |
+
+The fix is `encode_as_reference`: when the sibling wins, re-run it so the side channel is its own.
+Deterministic, so the returned frame is the same bytes; a `debug_assert` checks that rather than
+trusting it. It costs a **third** encode on the frames that take it, which is why it is a separate
+entry point — a still has no reference to build and must not pay for one. Stills are byte-identical.
+
+**The full sweep**, `scripts/meas_rate3.py`, three sequences × q ∈ {95, 99} × ki ∈ {2, 9}, both arms
+from one binary and one command (`GNC_LOSSLESS_FALLBACK` is the only difference), off arm verified
+byte-identical to the shipped binary first:
+
+```
+       sequence    q  ki  bytes off   bytes on   Δbytes  worst P off  worst P on      ΔP  I bit-exact
+            bbb   95   2   19110162   19110162   +0.00%        53.12       53.12   +0.00        False
+            bbb   95   9   17896443   17896443   +0.00%        53.00       53.00   +0.00        False
+            bbb   99   2   26165418   26316852   +0.58%        60.68       60.68   +0.00         True
+            bbb   99   9   24610862   24708364   +0.40%        60.67       60.67   +0.00         True
+      crowd_run   95   2   39627016   37399616   -5.62%        52.84       52.84   +0.00         True
+      crowd_run   95   9   40034340   38966554   -2.67%        52.84       52.84   +0.00         True
+      crowd_run   99   2   48799611   42377516  -13.16%        60.62       60.62   +0.00         True
+      crowd_run   99   9   49328550   46535419   -5.66%        60.61       60.61   +0.00         True
+ old_town_cross   95   2   38866054   37010354   -4.77%        52.84       52.84   +0.00         True
+ old_town_cross   95   9   39839530   38898505   -2.36%        52.83       52.84   +0.01         True
+ old_town_cross   99   2   48088416   42012499  -12.63%        60.61       60.61   +0.00         True
+ old_town_cross   99   9   49173140   46466028   -5.51%        60.61       60.60   -0.01         True
+           MEAN                                  -4.28%                            +0.00
+```
+
+**Mean −4.28% of sequence bytes at unchanged quality** (worst ΔP −0.01 dB, which is the run-to-run
+floor), and bit-exact I-frames wherever the candidate wins. PSNR leads because q > 85 and VMAF is
+saturated against a bit-exact frame by construction; there is no chroma question because the kept
+candidate improves every plane at once or is not kept.
+
+**Verified outside the harness**, `0036`'s standard: `encode-sequence` → `decode-sequence` on
+crowd_run q=99 ki=2, decoded PNGs md5-compared as raw RGB against the sources. Frames 0 and 2 (I)
+are bit-exact; 1 and 3 (P) are not, which is BUG-39 cause 3, not this item.
+
+**The failure in the table, reported rather than smoothed:** bbb q=99 gets **larger**, +0.58% and
++0.40%. The candidate is chosen on the I-frame's own size, but a bit-exact reference imposes a
+downstream cost — it carries detail a lossy reference had already quantised away, so the P-residual
+against it is bigger (visible above: crowd_run's P-frames go 4.99 → 5.27 MB even in the winning
+arm). On bbb the I-frame saving is small enough that the downstream cost exceeds it. Choosing on
+sequence bytes rather than frame bytes is the real fix and needs a second pass; a margin constant
+would be fitted to three sequences, which is the mistake RATE-2's own comment warns about. Filed as
+RATE-4. Shipped anyway: 10 of 12 points improve, 2 regress by under 0.6%, and the mean is −4.28%.
+
+**Not measured: encode time.** The repaired frames cost three encodes instead of two. The observed
+34.6 → 6.6 fps on crowd_run is under seven other live sessions and COORDINATION rule 1 forbids
+reading it; the structural statement is 3× intra encode at q = 95..=99 on the frames that take the
+repair, decode unchanged.
+
+**One correction to `0040`.** Its point 4 rejected taking a bit-exact frame's reference from the
+colour-converted source, on a measurement of 21.37 dB. That measurement is confounded — BUG-39
+cause 2 was live, so the P-frames were decoding a wavelet residual as a MED prediction whatever the
+reference held. The source-copy route is *free* where the repair costs an encode, and its
+refutation does not survive its own cause being fixed. Not re-tested here; it is RATE-4's other
+half.
+
+## BUG-39 — the encoder's zero-level transform wrote nothing, so P-frames carried the previous frame's buffer (2026-09-08)
+
+**Hypothesis, from the item.** 0042 fixed two of three causes and left cause 3 as a design
+question: `q=100` P-frames are lossy by construction because the residual is quantised at the
+P-frame taper (up to 1.25x the intra step) with a dead zone, so a lossless configuration must
+suppress both and pay for it in rate.
+
+**The first thing measured was that hypothesis, and it is false.** `--diagnostics` on crowd_run at
+`q=100` prints the two levers it names:
+
+```
+p_qp_scale=1.0000 (taper, default 1.0000), intra_qstep=1.0000 res_qstep=1.0000
+  inter_dz_mul=1.00 dz_intra=0.000 dz_referenced=0.000 dz_res=0.000
+```
+
+The taper is 1.0 (it is keyed on the step, and 1.0 is below the 2.8 breakpoint) and the dead zone
+is 0.0 (`normalized_for_lossless`, BUG-30). Both were already where a lossless configuration wants
+them, so neither could account for 26 dB. **The canary that refutes cause 3 has been in the
+default diagnostics output since INTER-1.** 0042's own lesson — diff the two things that must be
+equal instead of theorising — applied one level up: it diffed the references, fixed what that
+found, and then wrote a mechanism for the *remaining* gap without reading the numbers the encoder
+prints.
+
+### What it actually was
+
+`WaveletTransform::forward` runs `for level in 0..levels`. At `levels == 0` it dispatches nothing
+and **never writes `output_buf`**. `WaveletTransform::inverse` copies `input_buf` into
+`output_buf` before its loop, so the decoder's zero-level case *is* the identity.
+
+`encode_pframe` calls `transform.forward(mc_out -> plane_b -> plane_c)` and then quantises
+`plane_c`. So at `levels == 0` the encoder quantised and transmitted whatever the previous frame
+left in `plane_c`, and the decoder added that leftover to its own motion prediction. Every P and B
+frame of a `q=100` sequence goes through it, because LOSSLESS-1 sets `wavelet_levels = 0` for MED
+and a residual is always wavelet-coded whatever the sequence's transform is. `--dct` sequences hit
+it identically.
+
+Fixed by giving `forward` the identity copy `inverse` already had, plus the matching early return
+in `inverse`, which also removes a `levels - 1` underflow that panics in a debug build.
+
+### Two probes on the way, one of which is a trap worth recording
+
+A **static** sequence (the same PNG four times) codes `q=100` P-frames **bit-exact** at 3 198
+bytes, before the fix as well as after. That looks like proof the reference chain and the residual
+path are sound, and it is not: `--diagnostics` shows `all_skip_tiles=120/120`, so the frame went
+down the motion-skip path and the transform was never asked for anything. **A zero-residual probe
+cannot test a residual path.** The informative probe was the opposite one — content whose residual
+is large, where the fix moves the number by 25 dB.
+
+The second probe was `GNC_MED=0` at `q=100`, which RATE-3 had already recorded at 44.18/46.15 dB
+against MED's 12.45. That gap is the whole finding in hindsight: `GNC_MED=0` keeps
+`wavelet_levels = 5`, so it never enters the broken branch, and *being better with a transform
+than without one* is the signature of a missing identity.
+
+### Raw numbers — 3 sequences, 8 frames, ki=2 and ki=9, 4:4:4, shipped defaults
+
+Inter-frame PSNR range across the GOP. I-frames are `inf` (bit-exact) in both arms.
+
+| | before | after | drift down the GOP |
+|---|---|---|---|
+| crowd_run ki=2 | 26.30 - 26.76 | **51.54 - 53.62** | |
+| crowd_run ki=9 | 21.77 - 26.51 | **50.41 - 51.54** | 4.74 dB -> **1.13 dB** |
+| old_town_cross ki=2 | 29.69 - 29.91 | **51.83 - 52.52** | |
+| old_town_cross ki=9 | 27.04 - 29.91 | **50.58 - 51.83** | 2.87 dB -> **1.25 dB** |
+| bbb ki=2 | 32.92 - 33.15 | **58.10 - 58.23** | |
+| bbb ki=9 | 24.76 - 32.99 | **56.22 - 58.12** | 8.23 dB -> **1.90 dB** |
+
+PSNR leads and VMAF is not quoted: `q=100` is above the q>85 line where VMAF is saturated, and
+these are 50+ dB frames.
+
+**No effect at lossy quality**, which is the gate that matters most: at q=99 all six points are
+identical **to the byte** and to two decimals of PSNR (crowd_run ki=9: 39 570 472 B, 60.61-60.64,
+both arms). The fix cannot be reached wherever `wavelet_levels >= 1`, i.e. q=1..99.
+
+### The rate half, which says the opposite of what was expected
+
+crowd_run, 4 frames, ki=2, total bytes:
+
+| | bytes |
+|---|---|
+| I+P before | 11 369 827 |
+| I+P after | **17 584 089** |
+| all-intra (unchanged) | 12 932 312 |
+
+**At `q=100` the inter path is now 36% larger than coding every frame intra**, where before the
+fix it looked 12% *smaller*. That 12% saving was bought by transmitting a stale buffer instead of
+the residual. With no quantiser to discard any of it, a quarter-pel MC residual is noise-like and
+costs more than the MED-predicted frame it replaces. So the rate number cause 3 was said to need
+exists now, and it asks a different question: whether `q=100` video should use P-frames at all.
+Recorded, not acted on.
+
+### What is left, and it is one named mechanism
+
+51.54 dB is not `inf`, so the success criterion is **not met** and BUG-39 stays open. The residual
+is **sub-pel prediction rounding**: bilinear interpolation at quarter-pel makes the prediction
+fractional, so `cur - pred` is fractional, and step 1.0 rounds it — error <= 0.5 per sample in
+YCoCg-R, amplified into RGB by the inverse colour transform. 51.5 dB is the right magnitude for
+that, and bbb reads 58 dB because more of its blocks are full-pel or zero.
+
+The fix is H.264 lossless's: round the prediction to an integer in a lossless configuration, on
+both sides, so the residual is an integer and step 1.0 is exact. A `round()` in
+`motion_compensate.wgsl` behind a params flag gated on `config.is_lossless()`, which the decoder
+derives from the frame header it already carries — no new bitstream field. Untried.
+
+### Canary
+
+`zero_level_forward_is_an_identity_not_a_no_op` pre-fills the output buffer with a sentinel and
+asserts a zero-level `forward` overwrites all of it. **Verified to fail without the fix** (the
+whole plane mismatches), so it asserts something rather than decorating the commit.
+
+### Caveats
+
+- **`--dct` video is corrected and unmeasured**, the same flag 0042 left on cause 2.
+- **B-frames are unmeasured** — off by default, same `forward` call, so the fix applies to them
+  untested.
+- **4:2:0 is not in scope for bit-exactness**: chroma-domain MC box-filters both planes, which is
+  fractional by construction.
+
+**Gates:** `cargo test --release -- --test-threads=1`, `cargo clippy --release` and the wasm
+`--lib` clippy target — see the commit.
+
+Decision record: `docs/decisions/0054`.
+
+---
+
+## DOC-3 — the priority order pointed at closed work on five of six items, and the sixth had no ID (2026-09-08)
+
+**No measurement in this entry.** Every figure below is quoted from a BACKLOG heading or a decision
+record; the work was checking each claim in the priority order against the entry it came from. It is
+logged because CLAUDE.md asks for all items, and because the *audit* is the result.
+
+**Why this item at all.** `scripts/claim next` reported all 14 startable items held by live sessions
+(eight sessions had started within the same few minutes; every holder's pid was alive, so nothing was
+stealable). Rather than take held work, the queue-exhausted case was spent on the thing that decides
+what the queue *contains*.
+
+**What was checked.** BACKLOG's `### Priority order`, item by item, against the `### NAME-<n>`
+heading each item names, plus the "Still open" list in EBCOT Part 7 and the same pointers in GOALS,
+README, BASELINE, LOOP and CLAUDE.
+
+| priority-order line | heading it names says |
+|---|---|
+| 0: "remaining work is **PAD-1 (P1)** ... and **INTRA-2 (P1)**" | PAD-1 **DONE 2026-09-08** (−4.63% RGB / −4.60% Y intra rate, stills, `0039`); INTRA-2 **DONE 2026-09-08** (BD-rate −5.01%, `0041`) |
+| 1: "next largest known intra lever is **still unbuilt** — see EBCOT Part 7's open items" | Part 7's four open items: 1 closed by Part 6, 2 by Part 7, 3 by **ENT-3** (`0045`), 4 by **ENT-5**'s GPU encoder. Zero open |
+| 2: "**LOSSLESS-1** ... **Buildable now**" | **BUILT AND MEASURED 2026-09-06** |
+| 3: "**MEAS-5 / CANARY-1** — blocked on a discrete GPU ... never been measured" | CANARY-1 **DONE 2026-09-07 — PASSES at 34x**; MEAS-5 Claim A holds and is fully sourced, only Claim B is open |
+| 5: "Bugs: **BUG-14**" | **DONE 2026-09-07** |
+| 5: abac inter "**−12.0% to −22.9%**" | **superseded 2026-09-08** by ENT-3: −21.6% to −3.7% over q=50-99, decaying with quality (`0045`) |
+
+Five of six. **GOALS, README, BASELINE, LOOP and CLAUDE carry none of these six** — README already
+quotes PAD-1's shipped −4.63% and CANARY-1's 13.95/7.29 ms, and CLAUDE.md was corrected for `0045`
+the same morning. So the drift is confined to the one file whose top section nothing maintains,
+which is the finding: **DOC-1 fixed README, DOC-2 fixed GOALS, and BACKLOG's own priority order was
+the last of the three.**
+
+### The one finding that is not a correction
+
+Item 1 pointed for two days at "the next largest known intra lever", and that lever is **not
+unbuilt**. It is `--abac`: shipped 2026-09-07, bit-exact on 98 of 98 whole-file comparisons,
+**−16.6% to −18.8% of intra rate at identical pixels**, −13.4% on bit-exact lossless, FFV1 gap
++23.9% → +7.3%. Nothing has to be implemented to collect any of it — only a default has to move.
+
+Making it the default had been named three times (ENT-5's "not in scope" note, `0017`, this
+pointer) and **never as a heading with an ID and a priority**, so `scripts/claim next` has never
+been able to offer it. For two days the queue's answer to "what should I work on" could not include
+the largest built lever in the codec, while it was handing out P3 documentation items.
+
+Filed as **ENT-9 (P2)** and parked `blocked-idle-machine`: the decision needs abac GPU encode
+ms/frame (ENT-5's outstanding criterion 3 — the instrument exists, `abac_bench`) and a re-take of
+`0017`'s 1.69x decode debt, and neither can be taken with eight sessions on one GPU — the same abac
+decode has read **25.2 / 31.1 / 37.5 ms across three runs** under load (ENT-8). Parked rather than
+opened for the reason parking exists: an open P1 nobody can execute removes a slot from seven other
+sessions.
+
+**And the honest half of ENT-9's case is smaller than its headline.** `0045` measured abac's inter
+saving decaying monotonically with quality to under −4.5% at q=99 on two of three sequences, which
+is GNC's own operating point (GOALS §1). The −21.6% belongs to q=50. So the case for flipping the
+default rests on **intra**, and ENT-9 says so in the filing rather than leaving the next session to
+find it.
+
+### Decision
+
+`docs/decisions/0060` — **a forward pointer to work with no ID goes stale by construction.** The
+rule: file the item first, cite the id. Same lesson as COORD-2 (`0050`) one level up — an id is the
+only thing another session can see without reading prose. Rejected: rewording item 1 without filing
+ENT-9 (the sentence goes stale again on the next move, and `next` still cannot offer it); filing
+ENT-9 open at P1 (nobody can execute it today); deleting the priority order in favour of
+`claim items` (the queue ranks by P-number, and that section is where the P-numbers come from).
+
+---
+
+## ENT-3 — abac's inter saving is real, decays with quality, and the contexts are not the inter question (2026-09-08)
+
+**What was open.** Not the headline — ARCH-3 answered "does abac pay on inter" as a side effect
+(`0025`: −12.0% to −22.9% at bit-identical pixels), and DOC-2 retitled the entry to say so. Three
+things were left: which frame mix produced that table, the contribution range q=95-99, and whether
+abac's contexts — tuned on intra coefficients — are worth retuning for residual statistics.
+
+**Domain declaration.** Both arms quantise identically and differ only in the entropy stage, so
+the comparison is the coded size of the *same* quantised wavelet coefficients: of the
+motion-compensated residual on a P frame, of the frame itself on an I frame. Since ARCH-3 the
+entropy choice cannot reach the pixels, and that premise is checked rather than assumed — every
+point decodes both arms and hashes all 18 PNGs. **18 of 18 frames identical at all 18 points**, so
+the quality delta is exactly zero and no BD-rate is quoted.
+
+**Harness** `scripts/ent3_abac_inter.py`. Binary copied out of `target/` and hash-recorded before
+the sweep (`364e6aaf…` at `f3f7254`) — the BUG-27 session lost a 25-minute run to `cargo test`
+rewriting the binary underneath it. 18 frames, ki=9, 4:4:4, `.gnv` container bytes.
+
+### 1. The frame mix is `2I+16P+0B`
+
+Three readings, all agreeing. `benchmark-sequence -q 90 -n 18 -k 9` prints `2I+16P+0B` and emits
+`GNC: B-pyramid suppressed (ki=9 would allow it)` on stderr — the veto firing, not inferred.
+`encode-sequence` prints `Encoded 18 frames (2I + 16P)` on all 36 encodes. And
+`encode-sequence`'s `-q` **defaults to 75**, so that path cannot reach `CodecConfig::default()`'s
+`b_pyramid: true` at all. `-q` was passed everywhere, since BUG-37 is exactly that trap.
+
+### 2. The container ratio was never an inter figure — split it
+
+At ki=9 the file is 2 I-frames and 16 P-frames, so `0025`'s whole-file ratio mixes abac's
+already-known intra saving into the answer. `encode-sequence` tags every frame `[I]` or `[P]`, so
+here the two halves are summed separately. abac against Rice, negative = abac smaller:
+
+**P-frames only** — ENT-3's actual question:
+
+| sequence | q=50 | q=75 | q=90 | q=95 | q=97 | q=99 |
+|---|---|---|---|---|---|---|
+| bbb_extended | −16.1% | −21.1% | −20.6% | −18.2% | −16.6% | −14.5% |
+| crowd_run | −18.3% | −14.3% | −12.2% | −9.6% | −7.5% | −4.3% |
+| old_town_cross | −21.6% | −14.7% | −11.9% | −9.5% | −7.2% | −3.7% |
+
+**I-frames only**, same runs:
+
+| sequence | q=50 | q=75 | q=90 | q=95 | q=97 | q=99 |
+|---|---|---|---|---|---|---|
+| bbb_extended | −17.8% | −14.7% | −14.2% | −12.3% | −11.1% | −9.5% |
+| crowd_run | −16.0% | −12.7% | −11.4% | −8.6% | −6.4% | −3.3% |
+| old_town_cross | −20.2% | −14.5% | −12.7% | −10.2% | −8.0% | −4.7% |
+
+**Whole container**, the column comparable to `0025`:
+
+| sequence | q=50 | q=75 | q=90 | q=95 | q=97 | q=99 |
+|---|---|---|---|---|---|---|
+| bbb_extended | −16.6% | −20.0% | −19.7% | −17.5% | −15.9% | −13.9% |
+| crowd_run | −18.0% | −14.1% | −12.1% | −9.5% | −7.3% | −4.2% |
+| old_town_cross | −21.5% | −14.6% | −12.0% | −9.6% | −7.3% | −3.8% |
+
+**ENT-3's own prediction is falsified.** The entry said to expect a smaller number on inter than
+intra's −17%, because a motion-compensated residual is noise-like and offers a context coder less
+structure. Measured *inside the same run*, inter is the **stronger** half on two of three
+sequences (bbb_extended −20.6% vs −14.2% at q=90; crowd_run −12.2% vs −11.4%) and 0.8 points
+behind on the third. Over all 18 points: P −11.3% mean, I −9.4%. The entry's alternative reading —
+"then the inter gap lives in the motion model, not the coder" — is **not** supported by these
+numbers and must not be taken from them.
+
+**The new finding is the decay.** Monotonic in q on every sequence and both frame types. Two of
+three sequences lose two thirds of the saving between q=90 and q=99 (−12.2% → −4.3%, −11.9% →
+−3.7%); bbb_extended loses a third. GNC is a contribution codec and q=95-99 is its home range, so
+**the figure that matters for positioning is the smallest one, not `0025`'s −12.0%-to−22.9%
+band.** Mechanism, not a defect: as the quantiser fines, significance density rises, the
+neighbourhood context saturates towards "everything significant", and more of the file moves into
+the bypassed Exp-Golomb suffix and sign bits abac does not context-code at all — which Rice codes
+well.
+
+### 3. Context retuning for residuals: rejected, with a number
+
+New read-only diagnostic `GNC_COEF_ENTROPY_INTER=1` (38 lines in `encode_pframe`), which prices
+the shipped abac tiles of the **first P frame** exactly the way `GNC_COEF_ENTROPY=1` already prices
+a still's. A separate variable on purpose: the existing gate fires on a sequence's first frame,
+which is an I-frame, so one gate could not tell the two populations apart. Canary prints on both
+outcomes — with any coder but abac there are no tiles and a success-only canary would read as "no
+headroom". crowd_run, all three planes, `TOTAL` rows:
+
+| | q=95 intra | q=95 inter | q=99 intra | q=99 inter |
+|---|---|---|---|---|
+| shipped over `Hnb` (50 ctx) | +7.7% | **+6.7%** | +12.8% | **+12.5%** |
+| shipped over `Hbig` (200 ctx) | +8.3% | +7.0% | +13.1% | +12.7% |
+| shipped over `Hctx` (abac's own model) | +0.05% | +0.33% | +0.56% | +0.70% |
+
+**Inter's headroom is smaller than intra's at both quality points.** Whatever abac's 6 magnitude
+buckets leave on the table, they leave the same amount on a residual as on an intra subband, so
+retuning them *for residual statistics* has nothing to collect that one retune for both
+populations would not — and that is a context-template question (INTRA-1 / ENT-6), not an inter
+one. Third row against the first: adaptation loss is under 0.7% everywhere, consistent with
+ENT-6's 1.3%, so the 6-7% (12-13% at q=99) is the **template**, not the cold start. That is where
+a context experiment should aim, and it is not inter-specific.
+
+Scope of this one honestly: one sequence, two quality points, first P frame, statistics pooled per
+plane and subband — the same pooling `coef_entropy_diag` uses, which makes `Hnb` a *lower* bound
+on any real implementation and therefore generous to the alternative. A generous bound that still
+shows no inter-specific gap is the strong form of the conclusion.
+
+### 4. `0025`'s q=50 and q=75 columns do not reproduce; its q=90 column reproduces exactly
+
+| sequence | `0025` q=50 | here | `0025` q=75 | here | `0025` q=90 | here |
+|---|---|---|---|---|---|---|
+| bbb_extended | −16.3% | −16.6% | −22.9% | −20.0% | −19.7% | **−19.7%** |
+| crowd_run | −20.7% | −18.0% | −18.4% | −14.1% | −12.1% | **−12.1%** |
+| old_town_cross | −22.7% | −21.5% | −21.8% | −14.6% | −12.0% | **−12.0%** |
+
+Three of three exact at q=90, up to 7.2 points adrift at q=75. **That boundary is BUG-27's.**
+`p_qp_scale` returns exactly 1.0 for every quantiser step at or below 2.8 — q=85 and above — so
+the encoder's local-decode dequantise defect was byte-identical there and live on the default path
+below it, and `0025` predates the fix.
+
+**Attributed by re-running on `0025`'s own commit rather than left as a fit.** A detached worktree
+pinned at `a312d6f` (ARCH-3, the commit that landed `0025`), built and hash-recorded
+(`fd793751…`). The same harness reproduces `0025`'s container column **9 of 9 exactly** there —
+−16.3 / −22.9 / −19.7, −20.7 / −18.4 / −12.1, −22.7 / −21.8 / −12.0 — which settles two things at
+once: this harness *is* `0025`'s measurement, and the mix behind it was `2I+16P+0B` (that binary
+prints it too). So the q=50/75 difference is a change in the codec, not in the instrument.
+
+Raw byte counts across the two commits say where:
+
+| | q=50 | q=75 | q=90 |
+|---|---|---|---|
+| I-frame bytes, both coders, all 3 sequences | **identical** | **identical** | **identical** |
+| P-frame bytes, Rice | +51.9% / +88.7% / +217.1% | +59.1% / +52.4% / +59.9% | **0.00%** |
+| P-frame bytes, abac | +50.6% / +97.7% / +225.5% | +68.8% / +62.3% / +77.7% | **0.00%** |
+
+(bbb_extended / crowd_run / old_town_cross; "identical" and "0.00%" are equal integers, not a
+tolerance.) Inter-only, and a no-op at q=90 — but the magnitude is far too large for BUG-27, whose
+own table moved P bytes by +0.4% to +2.0%. **The dominant cause is INTER-2 (`0043`, `8993d41`),
+which halved `inter_dz_mul` from 2.0 to 1.0**, and the two boundaries coincide for an independent
+reason: the quality ladder's dead zone is 0.75 at both q=50 and q=75, so the inter dead zone went
+1.5 → 0.75 and stopped zeroing a large population of small residual coefficients — while at q=90
+the ladder interpolates to ≈0.18 between its q=85 (0.5) and q=92 (0.05) anchors, so the inter dead
+zone went ≈0.36 → ≈0.18 and **both values are no-ops**: the quantiser is
+`floor(|v|/step + 0.5)` after the dead-zone test, so anything at or below 0.5 changes nothing.
+BUG-27 (`p_qp_scale` exactly 1.0 for every step ≤ 2.8, i.e. q ≥ 85) and INTRA-2's
+`dead_zone_referenced` split are in the same window and are inter-affecting below q=85 too; this
+was not bisected between them, and the shape of the numbers says the dead zone carries it.
+
+So **`0025`'s q=50 and q=75 columns are superseded by the tables above**, and the
+"−12.0% to −22.9%" range that `0025`, BACKLOG and CLAUDE.md all carry no longer describes those
+two operating points. COORDINATION's BUG-27 note already says every inter figure at q ≤ 80 is
+invalidated; this was one of them and nobody had been back for it.
+
+### What did not move
+
+No default, no shipped code path. The only code is the env-gated diagnostic, and output is
+byte-identical with the variable unset. abac is still opt-in: `0017`'s three reasons stand at two,
+and this record prices the inter one **down** in the range GNC is for — a −3.7% saving at q=99 is
+not an argument for a 1.69× frame decode. Decision record `0045`.
+
+---
+
 ## BUG-35 — the histogram arena is guarded; shrinking it is refused (2026-09-08)
 
 **Hypothesis.** `shared_hist` is 5120 bins. `total_hist_entries` can reach 49152. naga clamps
@@ -3527,7 +4106,7 @@ therefore only fire if the two passes disagree with each other. `BoundedSlots` e
 coder pass may well be worth 17 MB of scratch, and the point is that one idle-machine run can flip
 the default without touching a line of coder code: the bytes are identical either way, which is
 asserted rather than assumed. Decision
-[0024](docs/decisions/0024-the-gpu-abac-encoder-counts-before-it-writes.md) has the reasoning,
+[0057](docs/decisions/0057-the-gpu-abac-encoder-counts-before-it-writes.md) has the reasoning,
 including the two rejected alternatives — a heuristic slot with a panic behind it, which is BUG-22
 exactly (7.8-10.9 dB at q=90 when a Huffman stream spilled into its neighbour's 512-byte slot), and
 an atomic bump allocator with chunk chaining, which reintroduces the unbounded per-block structure
@@ -3733,7 +4312,7 @@ of bbb_extended: max |diff| 12-13 over 3.9-4.3% of samples at q=50, 5 over 0.6-1
 coefficients, not a coder bug in the ordinary sense.
 
 Two things it costs, and both are about scope rather than about a wrong number: abac's standing
-"−16.6% to −18.8% **at identical pixels**" and decision `0018`'s "every chroma format at once" are
+"−16.6% to −18.8% **at identical pixels**" and decision `0055`'s "every chroma format at once" are
 both 4:4:4 measurements, and the q boundary (differs at 50 and 75, agrees at 90) points at
 adaptive quantisation or CfL side data indexed with the luma tile count on planes that have a
 different tile grid. The magnitude — small differences over a large area — is precisely what a
@@ -11010,7 +11589,7 @@ codecs hit the same wall; they just hit it at different quality levels.
 
 **The inter gap is real at distribution bitrates**, where x264 earns +64% and GNC earns
 substantially less at matched quality. That is a genuine deficiency, but it is at the operating
-point [docs/POSITIONING.md](../GOALS.md) says GNC is not built for.
+point [docs/POSITIONING.md](docs/POSITIONING.md) says GNC is not built for.
 
 ### Consequence for where effort goes
 
@@ -13062,7 +13641,7 @@ x264 a sanity anchor rather than a competitor, and nothing else had ever been me
 closes that: **JPEG XS, JPEG 2000, ProRes and VC-2, in seven arms, on four images, through one
 metric path.** New harness, `scripts/meas9_contribution.py`.
 
-This lands the same day as decision 0020 (GNC is broad on purpose), and the two are connected: a
+This lands the same day as decision 0055 (GNC is broad on purpose), and the two are connected: a
 codec meant to be good at many things has to be measured against the incumbents of every segment
 it touches, not against one opponent at one operating point.
 
@@ -13268,7 +13847,7 @@ column cannot be compared with anyone else's.
   so no speed figure from it means anything, and BACKLOG's request to put the JPEG XS rate figure
   next to MEAS-6's latency row cannot be honoured from this build. Rate and quality are exact.
 - **Inter.** Every arm here is all-intra, on stills. The entropy gap on inter residuals is
-  unmeasured and is the obvious successor to this item, especially under decision 0020.
+  unmeasured and is the obvious successor to this item, especially under decision 0055.
 - **q=100.** No lossless arm: BUG-15 (the wavelet lossless path was not bit-exact on main until
   today, because CHROMA-1 raised chroma_weight to 1.2 for all q ≥ 60 including 100). Every GNC arm
   here is q=60–99 on the default MED path. `--huffman` and `--rans` are not used in any arm; both
@@ -14697,12 +15276,12 @@ q=85/90/99, both ways). Below q=85 it was live on the shipped default:
 
 (crowd_run, 10 frames, ki=9, 4:4:4, mean/worst-frame PSNR.)
 
-### What that costs the record: MEAS-3 and decision 0019 are corrected
+### What that costs the record: MEAS-3 and decision 0056 are corrected
 
 MEAS-3's ladder is q=25–95, so most of it ran with the defect live. Re-run on the same harness,
 same 18 frames, same sequences, against `2224c50`:
 
-| sequence | mean: 0019 → now | worst-frame: 0019 → now |
+| sequence | mean: 0056 → now | worst-frame: 0056 → now |
 |---|---|---|
 | crowd_run | +15.9% → **+6.5%** | +32.4% → **+12.0%** |
 | old_town_cross | +22.2% → **+19.3%** | +35.4% → **+28.7%** |

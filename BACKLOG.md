@@ -3859,6 +3859,16 @@ so no published number moves.
 
 Filed 2026-09-08. Two halves; the second, if it pays, deletes the first.
 
+**This item was filed twice on the same day by two sessions, and this is the merged version.**
+The first filing (branch `claude/wgsl-bpc-paco-encoder-tvws1m`, pushed and unmerged, which is why
+`scripts/claim` could not see it and why the second session found nothing) is everything above and
+below under "Order of work", "Success criteria", "Canary" and "Decision record"; the second
+filing's contribution is the four blocks that follow — what `0024` already bounds, the throughput
+ceiling, the two things this must not be bought for, and steps 0 and 1, which are cheap and can
+settle the item without a GPU. Same mechanism as the `0018` decision-record collision: both
+sessions read the tree, neither could see the other. If the original branch is merged later,
+expect a duplicate-content conflict in this section and keep *this* version.
+
 **1. The broken WGSL.** BUG-31 is the concrete defect: `abac_encode.wgsl` and `abac_decode.wgsl`
 each declare **18 688 B** of workgroup storage against the **16 384 B** the device is created with.
 Native wgpu never checks it, a conformant WebGPU implementation must, and the reachable failure is
@@ -3886,15 +3896,59 @@ much higher GPU throughput. Whether that holds on GNC's subbands and contexts mu
 assumed — and abac's measured −16.6% to −18.8% against Rice is the bar, so a BPC-PaCo that gives
 half of that back may still lose on rate what it wins on speed.
 
+**What `0024` already bounds, and it should be read before anything is built.** Decision `0024`
+priced the *shipped* abac tiles against the entropy of the coefficients they carry: GNC spends
+within **7.5%** of it at q >= 85, `Hbig` widens the context template 4x and finds **nothing**, and
+`Hnb0` charges no model cost at all and buys **1.6%**. So there is no double-digit rate win
+available to *any* entropy coder here. Worse for part 2: a stationary model is strictly weaker than
+an adaptive one wherever there are enough symbols to adapt on, and that is where **82% of the rate
+lives — the full 64x64 blocks, where abac is already within +4.1% of the bound.** On those bands
+BPC-PaCo should be expected to **lose**. That is exactly why the success criterion below is
+"+2% of abac" rather than a gain, and it is the criterion most likely to bind.
+
+**The throughput prize has a ceiling, and it must be quoted next to the 1.3x.** Rice's own entropy
+stage is **47% of frame decode**, which caps *any* entropy work at **1.9x** (BACKLOG Part 6,
+idle-machine bench) — a free entropy coder buys 1.9x and no more, against abac's measured
+**1.69x frame decode for −16.7% rate** at q=90 / cb=64. So "decode >= 1.3x abac" is asking for a
+large fraction of everything that is physically there, which makes it a good criterion and an
+unlikely one. Quote both numbers or the 1.3x reads as modest.
+
+**It is not the parked `Bitplane` backend.** That one is GNC's own sign-plus-magnitude bitplane
+coder with no context modelling, and it measured **2.2-2.6x worse rate than Rice** (RESEARCH_LOG
+2026-09-06). Its failure is not evidence about BPC-PaCo and BPC-PaCo's claims are not a defence of
+it. What may be reusable is scaffolding, not conclusions: `src/shaders/bitplane_decode.wgsl`
+already walks bitplanes on the GPU.
+
+**Two things this must not be bought for.** *Truncatable embedded streams*, which BPC-PaCo keeps
+along with the bitplane passes: worth **0.00 dB** here, at every rate from 0.05 to 3.5 bpp, with a
+structural reason (EBCOT part 1 — uniform scalar quantisation of a near-orthonormal transform
+under MSE puts every coefficient at the same RD slope). And *closing the JPEG 2000 gap*: INTRA-1
+step 1 put **~72% of the remaining 27.1 points upstream of the coder entirely.**
+
 **Order of work.**
 
 1. **BUG-31's browser check and cheapest fix first.** Whatever coder wins must fit 16 384 B, and
    the WASM target is a hard requirement today; ENT-7's part 2 is speculative and must not gate it.
    BUG-31's static canary (sum `var<workgroup>` declarations per `.wgsl` file in a test) covers any
    new shader this item adds, so land that with the fix.
-2. **CPU reference BPC-PaCo first, GPU port verified byte-exact against it** — the abac pattern
+2. **Read the papers and extract two numbers — no GPU, no code.** The exact probability model
+   (which neighbours, quantised into how many contexts, tables truly fixed or trained per image),
+   the reported rate delta against an adaptive J2K-class coder on 9/7 *lossy* data, and the
+   reported GPU throughput with the hardware it was measured on. Read-only fan-out, the kind of
+   subagent CLAUDE.md says to spawn freely. **Gate:** if the reported rate loss exceeds the ~2-5%
+   quoted above, part 2's rate half is dead on arrival and only throughput survives — which then
+   has to argue against the 1.9x ceiling before a line is written.
+3. **Price BPC-PaCo's model on GNC's own shipped coefficients, offline.** This is the decisive
+   cheap measurement and the harness exists: `src/encoder/coef_entropy_diag.rs`
+   (`GNC_COEF_ENTROPY=1`) decodes the shipped abac tiles and prices their coefficients against six
+   models per plane and per subband, four images, six quality points, per-band rows covering
+   99.95% of the payload. **Add a seventh model: BPC-PaCo's local-average stationary contexts**,
+   and read the per-band rows against `Hctx` (abac's own). The LL and level-3/4/5 rows decide this
+   item; levels 1-2 are where the loss is expected. Same images, same points, same parameters as
+   `0024`, or it is not a comparison.
+4. **CPU reference BPC-PaCo first, GPU port verified byte-exact against it** — the abac pattern
    (98 of 98 whole-file matches) is the standard, and `abac.rs` shows the shape.
-3. Measure rate at identical pixels (it is lossless recoding of the same coefficients, same rule as
+5. Measure rate at identical pixels (it is lossless recoding of the same coefficients, same rule as
    ENT-6), then throughput on an idle machine, encode *and* decode.
 
 **Success criteria, stated before implementation:** shaders' declared workgroup storage
@@ -3903,8 +3957,31 @@ the four stills and ≥3 sequences at q = 85 and 90 (worse than that, keep abac 
 fix ships); decode ≥ **1.3x** abac's throughput at 1080p 4:4:4 measured idle, else the added coder
 is not paying for its maintenance. Bit-exact CPU/GPU on the full artefact set, like abac.
 
+**The likely outcome, said in advance so it is not a disappointment.** If step 3 shows the short
+blocks improving, the cheap way to collect that is to give *abac* neighbourhood-derived initial
+probabilities — ENT-6's item, one initialisation change, no new bitstream, no shader pair, no new
+entropy type. **A sixth backend has to earn itself against that alternative**, because it costs a
+GP version, an entropy type, a CPU reference coder, GPU encode *and* decode shaders, a
+byte-exactness gate and a permanent maintenance surface across two command families. Threshold for
+preferring the backend over folding the mechanism into abac: **>=3% of total rate beyond what
+abac + ENT-6 reach**, or the 1.3x decode above. Below both, the right answer is ENT-6's fix and a
+decision record explaining why the coder was not added.
+
 **Canary:** a `coder=bpc-paco` line with per-tile code-block and symbol counts on encode and
 decode, and the BUG-31 static workgroup-storage assertion in CI.
+
+**Traps, each already paid for by someone here.**
+
+- **No VMAF BD-rate above q≈85** — widening the ladder moved it 47.5 points on average, 110 at
+  worst, while PSNR moved 1.0. This item lives at q >= 85: PSNR leads, and dE00
+  (`scripts/ypsnr_de00.py`) answers anything touching chroma.
+- **abac is lossless recoding of the same coefficients.** If decoded quality moves at all, the
+  measurement is wrong, not the coder.
+- **A new coder must be checked on both command families.** `--rans` was unreachable on video for
+  a while and nobody noticed; stills and sequences select coders through different paths.
+- **The WebGPU limits are the budget, not the adapter's** — 16 384 B workgroup storage, 256
+  invocations per workgroup, 10 storage buffers per stage. A coefficient-parallel design that wants
+  1024 threads or 32 KB of tables does not run here, which is part 1's whole point.
 
 **Decision record required either way** — a shipped coder is a default-adjacent choice, and a
 rejection is a recorded conclusion with numbers (the EBCOT entry is the template).
@@ -3942,6 +4019,10 @@ effect grows with quality: the small bands read +23.1% / +25.9% / +28.9% / +34.2
    coefficients; the level-4 set is 4x16x16 = 1024. Cutting one block per *level* instead of one
    per band gives the coder 4x the symbols. Costs the per-band homogeneity the current cut buys, so
    it must be measured, not assumed — the orientation difference is real.
+3. **Neighbourhood-derived initial probabilities rather than signalled ones** — BPC-PaCo's
+   stationary model, filed as **ENT-7** because it also raises the sixth-backend question. Same
+   mechanism as candidate 1 with no header bits, and ENT-7's step 3 reports exactly the rows this
+   item cares about. If it measures positive, this is the cheapest of the three.
 
 **Success criterion:** ≥2% of total rate at q=90 on all four stills, at bit-identical decoded
 pixels (abac is lossless recoding; if quality moves at all, something else changed). Below 1%,

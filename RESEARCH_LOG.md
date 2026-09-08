@@ -77,6 +77,20 @@ Raw GNC bpp / PSNR-Y: crowd_run 6.54/49.60, 7.38/51.48, 8.69/53.99, 10.24/58.14;
 
 No codec change. No fps claimed.
 
+### Same ladder, `--abac` (same session)
+
+Canary in the log: `GNC abac`. PSNR-Y matches the Rice table to two decimals on all 12 rungs,
+so the entropy coder is the only thing that moved. `scripts/meas1_vs_h264.py --abac`.
+
+| | bbb_extended | old_town_cross | crowd_run | **mean** |
+|---|---|---|---|---|
+| Rice | +128.5% | +70.2% | +68.8% | **+89.2%** |
+| `--abac` | +91.8% | +53.1% | +53.0% | **+66.0%** |
+
+Rate vs Rice at matched pixels, q=85/92/96/99: crowd_run −12.2/−10.7/−8.3/−3.7%;
+old_town −12.3/−11.3/−9.1/−3.8%; bbb −19.5/−17.6/−14.6/−11.5%. The saving **decays
+with quality**. Rice remains the default figure.
+
 ## INTRA-2 — 90% of the blocker was a knob that moved two things (2026-09-08)
 
 **Hypothesis.** GNC's dead zone is a no-op in its own operating range — the quantiser is

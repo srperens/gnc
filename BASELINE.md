@@ -284,15 +284,22 @@ q=85,92,96,99 against crf=1,2,4,8.
 
 | | bbb_extended | old_town_cross | crowd_run | **mean** |
 |---|---|---|---|---|
-| full video (ki=9), MEAS-10 | **+128.5%** | **+70.2%** | **+68.8%** | **+89.2%** |
+| full video (ki=9), Rice | **+128.5%** | **+70.2%** | **+68.8%** | **+89.2%** |
+| full video (ki=9), `--abac` | **+91.8%** | **+53.1%** | **+53.0%** | **+66.0%** |
 | curve overlap | 49.9–56.0 dB | 49.8–55.9 dB | 49.8–56.0 dB | |
-| QUAL-1 (2026-09-06) | +129.0% | +71.9% | +70.6% | +90.5% |
+| QUAL-1 (2026-09-06), Rice | +129.0% | +71.9% | +70.6% | +90.5% |
 
-**GNC needs about 1.9x the bitrate of H.264 for the same luma PSNR at contribution quality.**
-The move from +90.5% to +89.2% is **1.3 points**, all in the direction INTER-2 predicted:
-only q=85 of this ladder sits in the inter-dead-zone change (q ≤ 88), so a −4.77% GNC-vs-GNC
-BD-rate on that one rung dilutes to about a point against x264. VMAF BD-rate on the same
-data is not a number (old_town **+2548%** at VMAF 99.8–99.8). Do not quote it.
+**GNC Rice needs about 1.9x the bitrate of H.264 for the same luma PSNR at contribution quality.
+`--abac` is 1.66x** — same pixels as Rice at every rung (PSNR-Y identical to two decimals),
+only the bytes moved. That is the canary the path ran. Saving vs Rice decays with quality
+(crowd_run −12.2% at q=85 to −3.7% at q=99), which is ENT-3's finding on this ladder.
+Rice stays the default; quote **+89.2%** unless the command included `--abac`.
+
+The move from QUAL-1's +90.5% to +89.2% is **1.3 points**, all in the direction INTER-2
+predicted: only q=85 of this ladder sits in the inter-dead-zone change (q ≤ 88), so a
+−4.77% GNC-vs-GNC BD-rate on that one rung dilutes to about a point against x264. VMAF
+BD-rate on the same data is not a number (old_town **+2548%** Rice / **+2289%** abac at
+VMAF 99.8–99.8). Do not quote it.
 
 > **INTER-2's prediction is now a measurement.** The 2026-09-06 +90.5% stands as the QUAL-1
 > record. Quote **+89.2%** for current HEAD. `docs/decisions/0041`.

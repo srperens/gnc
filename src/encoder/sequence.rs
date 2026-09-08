@@ -4908,6 +4908,44 @@ impl EncoderPipeline {
                 (None, None, None)
             };
 
+        // === Coefficient-entropy diagnostic on inter (GNC_COEF_ENTROPY_INTER=1) — ENT-3 step 3 ===
+        // The same pricing `coef_entropy_diag` does for a still, on the coefficients of a
+        // motion-compensated residual instead. That is the whole of ENT-3's third question:
+        // abac's 6 magnitude buckets were tuned on intra subbands, and `Hctx` (its own model)
+        // against `Hnb`/`Hbig` (richer causal neighbourhoods) is what says whether retuning them
+        // for residual statistics has anything to collect.
+        //
+        // A separate variable from `GNC_COEF_ENTROPY` on purpose: that one fires on the first
+        // frame of a sequence, which is an I-frame, so one gate could not tell the two
+        // populations apart. Fires once, on the first P frame, read-only on tiles the encoder has
+        // already produced — it cannot move the bitstream (docs/decisions/0010).
+        if std::env::var("GNC_COEF_ENTROPY_INTER").is_ok() {
+            use std::sync::OnceLock;
+            static COEF_ENTROPY_INTER_DONE: OnceLock<()> = OnceLock::new();
+            COEF_ENTROPY_INTER_DONE.get_or_init(|| {
+                // Canary on both outcomes: with any coder but abac there are no tiles to price,
+                // and a diagnostic that printed only on success would read as "no headroom".
+                if abac_tiles.is_empty() {
+                    eprintln!(
+                        "[coef-entropy-inter] no abac tiles on this P frame — run with --abac"
+                    );
+                    return;
+                }
+                let cw = info.chroma_tiles_x() as usize * info.chroma_tiles_y() as usize;
+                eprintln!(
+                    "[coef-entropy-inter] first P frame, {} tiles, intra qstep={}, res_qstep={}",
+                    abac_tiles.len(),
+                    config.quantization_step,
+                    res_config.quantization_step
+                );
+                super::coef_entropy_diag::run(
+                    &abac_tiles,
+                    [tiles_x * tiles_y, cw, cw],
+                    res_config.quantization_step,
+                );
+            });
+        }
+
         let entropy = match entropy_mode {
             EntropyMode::Bitplane => EntropyData::Bitplane(bp_tiles),
             EntropyMode::SubbandRans | EntropyMode::SubbandRansCtx => {

@@ -1018,7 +1018,12 @@ pub fn quality_preset(q: u32) -> CodecConfig {
         // directly for the contribution use case (docs/POSITIONING.md).
         //
         // Set GNC_B_PYRAMID=1 to restore it — worth it on animation and at low bitrate.
-        b_pyramid: std::env::var("GNC_B_PYRAMID").map(|v| v == "1").unwrap_or(false),
+        //
+        // The policy itself lives in `b_pyramid_enabled()` rather than inline here, because
+        // being inline here is exactly how BUG-37 happened: this was the *only* place it was
+        // applied, so every CLI path that did not go through a quality preset silently got
+        // `CodecConfig::default()`'s opposite answer.
+        b_pyramid: b_pyramid_enabled(),
         ..Default::default()
     };
     // The DWT runs per tile, so the tile size, not the image size, sets the ceiling. Record the
@@ -1222,6 +1227,42 @@ pub fn decode_order(frames: &[CompressedFrame]) -> Vec<usize> {
 }
 
 /// One line describing an adapter: name, backend and what kind of device it is.
+/// Whether the hierarchical B-pyramid is permitted, as GNC *ships* it: off, unless
+/// `GNC_B_PYRAMID=1`.
+///
+/// This is deliberately a function and not a constant on [`CodecConfig`]. `CodecConfig::default()`
+/// answers `true` — "do not veto" — because a library caller constructing a config directly is
+/// asking for the historical behaviour, and because `encoder::pipeline_tests` builds a `Default`
+/// config specifically to exercise the B-frame path. Flipping that default would leave those tests
+/// green while silently testing P-only, which is worse than the bug it would close.
+///
+/// So there are legitimately two answers, and the defect (BUG-37) was that only one caller knew
+/// the shipped one. Every entry point that represents *GNC as configured for users* — the quality
+/// presets and [`manual_config`] — must ask this function; nothing should re-read the variable.
+///
+/// Off by default on two independent measurements from 2026-09-06: the pyramid costs 7–31% in rate
+/// at contribution quality on camera content (BUG-5), and 8 frames of reordering — 160 ms at
+/// 50 fps — before any coding runs (MEAS-6, `docs/decisions/0033`). It *wins* 34–39% on animation,
+/// so it is kept as an opt-in rather than deleted.
+pub fn b_pyramid_enabled() -> bool {
+    std::env::var("GNC_B_PYRAMID").map(|v| v == "1").unwrap_or(false)
+}
+
+/// GNC's shipped configuration at an explicit `qstep`, for callers that do not select a quality
+/// preset.
+///
+/// The counterpart to [`quality_preset`]: same shipped policy, quantiser chosen by hand. It exists
+/// so that "the user did not pass `-q`" cannot mean "silently get different coding tools", which
+/// is what BUG-37 was — `benchmark-sequence -k 9` with no `-q` coded `2I+2P+14B` where the same
+/// command with `-q 75` coded `2I+16P+0B`.
+pub fn manual_config(qstep: f32) -> CodecConfig {
+    CodecConfig {
+        quantization_step: qstep,
+        b_pyramid: b_pyramid_enabled(),
+        ..Default::default()
+    }
+}
+
 pub fn describe_adapter(info: &wgpu::AdapterInfo) -> String {
     format!("{} [{:?}, {:?}]", info.name, info.backend, info.device_type)
 }

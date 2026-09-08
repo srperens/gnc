@@ -13464,18 +13464,40 @@ cannot be reconstructed after the fact. What bounds it: the filenames are per-su
 do damage; and rate figures are untouched because bytes are bytes. `rd-curve --vmaf` is the
 highest-risk caller, scoring every quality point inside one long-lived process.
 
-### BUG-37 — `benchmark-sequence` without `-q` still codes the pyramid (filed, not fixed)
+### BUG-37 — `benchmark-sequence` without `-q` still codes the pyramid (found, then FIXED)
 
 `benchmark-sequence`'s quality argument is `Option<u32>` with **no default** (`src/main.rs:515`),
 where `benchmark`, `encode-sequence` and `benchmark-suite` all default to 75. `quality_preset()` is
 the only place the veto lives, so without `-q` the command falls through to `CodecConfig::default()`
 — `b_pyramid: true` — and codes `2I+2P+14B`. Verified both ways.
 
-**No recorded measurement is contaminated:** all five `scripts/` harnesses that invoke
-`benchmark-sequence` pass `-q`. Filed rather than fixed because the obvious one-line fix
-(`default_value = "75"`) leaves the mechanism in place, and the alternative — flipping
-`CodecConfig::default()` — would leave `pipeline_tests.rs:87` and `:278` passing while silently
-no longer testing the B-frame path, which is worse than the bug.
+**I filed this rather than fixing it, and that was the wrong call.** The stated reason was that
+both obvious fixes are bad — `default_value = "75"` leaves the mechanism, and flipping
+`CodecConfig::default()` would leave `pipeline_tests.rs:87` and `:278` green while silently no
+longer testing B-frames. Both true, and neither is a reason to stop: I listed two bad options and
+did not look for a third. Fixed the same day when challenged.
+
+**Looking properly first showed the bug was five times bigger than filed.** `main.rs` had five
+`if let Some(q) { quality_preset(q) } else { CodecConfig { …, ..Default::default() } }` sites —
+`build_ip_config` (:911) and the temporal-wavelet and warmup paths at :1643, :1698, :2555, plus the
+still-image `Encode` path at :1042. **Four of the five code sequences.** A `default_value` patch
+would have fixed one and left three, which is the strongest argument against having shipped it.
+
+**The fix.** `gnc::b_pyramid_enabled()` is the single statement of the shipped policy;
+`quality_preset()` and a new `gnc::manual_config(qstep)` both ask it, and all five CLI sites route
+through one of the two. `CodecConfig::default()` stays `true` on purpose, so the pipeline tests
+keep testing B-frames. The invariant is then structural rather than per-site:
+`tests/cli_shipped_config.rs` fails if `main.rs` builds *any* config from `Default::default()`.
+
+| invocation, `-k 9`, 18 frames | before | after |
+|---|---|---|
+| no `-q` | `2I+2P+14B`, silent | **`2I+16P+0B`, canary fires** |
+| `-q 75` | `2I+16P+0B` | `2I+16P+0B`, **26911589 bytes both times** |
+| `GNC_B_PYRAMID=1`, no `-q` | `2I+2P+14B` | `2I+2P+14B` (opt-in preserved) |
+
+**Invalidates no measurement:** the `-q` path is byte-identical and all five `scripts/` harnesses
+pass `-q`. No decision record — no default changed; four CLI paths now honour the default that has
+been shipped since 2026-09-06.
 
 ### What was not done, and why
 

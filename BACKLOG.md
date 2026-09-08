@@ -1253,7 +1253,7 @@ here. Two things bound the exposure: the four filenames are per-subcommand, so `
 does damage. Longer windows are the higher risk: `rd-curve --vmaf` scores every quality point in
 one process. **Rate figures are immune** — bytes are bytes; this reaches only what VMAF scored.
 
-### BUG-37 — `benchmark-sequence` without `-q` silently codes the B-pyramid (todo, P2)
+### BUG-37 — `benchmark-sequence` without `-q` silently codes the B-pyramid (**FIXED 2026-09-08**)
 
 Found 2026-09-08 under MEAS-6. `benchmark-sequence`'s quality argument is `Option<u32>` with **no
 default** (`src/main.rs:515`), where `benchmark` (:436), `encode-sequence` (:606) and
@@ -1272,14 +1272,34 @@ that invoke `benchmark-sequence` (`meas1_vs_h264.py`, `gpu_tier_bench.py`, `meas
 `meas3_sequence_rd.py`, `meas_chroma2.py`). The exposure is interactive use, and the trap is that
 the flag named *quality* is also the only thing selecting the *GOP structure*.
 
-**Do not fix it by giving the argument `default_value = "75"` and stopping there.** That closes
-this instance and leaves the mechanism: the veto would still live in `quality_preset`, one
-`Option` away from diverging again. `CodecConfig::default()` cannot simply be flipped either —
-`src/encoder/pipeline_tests.rs:87` and `:278` construct a `Default` config specifically to exercise
-the B-frame path, and flipping it would leave those tests passing while silently testing P-only,
-which is worse than the bug. The honest fix separates "the library's non-vetoing default" from
-"the CLI's shipped configuration" so the two cannot drift, and it changes a default, so it wants a
-decision record.
+**It was five sites, not one.** `main.rs` had five `if let Some(q) { quality_preset(q) } else
+{ CodecConfig { …, ..Default::default() } }` constructions — `build_ip_config` (:911) plus the
+temporal-wavelet and warmup paths at :1643, :1698 and :2555, and the still-image `Encode` path at
+:1042. Four of the five code sequences. So `default_value = "75"` would have closed one instance,
+left the mechanism, and left three more already diverging.
+
+**Fixed at the root instead.** `gnc::b_pyramid_enabled()` is now the single statement of the
+shipped policy; `quality_preset()` and the new `gnc::manual_config(qstep)` both ask it, and all
+five CLI sites go through one or the other. `CodecConfig::default()` is deliberately **unchanged**
+at `b_pyramid: true` — `src/encoder/pipeline_tests.rs:87` and `:278` build a `Default` config
+precisely to exercise the B-frame path, and flipping it would leave those tests green while
+silently testing P-only, which is worse than the bug.
+
+Verified on the command that was broken, `-k 9`, 18 frames:
+
+| invocation | before | after |
+|---|---|---|
+| no `-q` | `2I+2P+14B`, silent | **`2I+16P+0B`, canary fires** |
+| `-q 75` | `2I+16P+0B` | `2I+16P+0B`, **26911589 bytes both times** |
+| `GNC_B_PYRAMID=1`, no `-q` | `2I+2P+14B` | `2I+2P+14B` (opt-in preserved) |
+
+**Invalidates no measurement:** the `-q` path is byte-identical, and all five `scripts/` harnesses
+pass `-q`. `tests/cli_shipped_config.rs` asserts the structural invariant — `main.rs` builds no
+config from `Default::default()` — so a sixth site cannot quietly reintroduce it, plus that the
+preset and manual paths agree and that the library default still permits B-frames.
+
+No decision record: no default changed. The shipped default was already P-only since 2026-09-06;
+this makes four CLI paths actually honour it.
 
 ### BUG-34 — GNC requests 10 storage buffers per stage against a default of 8 (todo, P2)
 

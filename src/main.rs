@@ -912,10 +912,7 @@ fn build_ip_config(
     let mut config = if let Some(q) = quality {
         gnc::quality_preset(q)
     } else {
-        CodecConfig {
-            quantization_step: qstep.unwrap_or(4.0),
-            ..Default::default()
-        }
+        gnc::manual_config(qstep.unwrap_or(4.0))
     };
     if let Some(qs) = qstep {
         config.quantization_step = qs;
@@ -1042,11 +1039,10 @@ fn main() {
                 gnc::quality_preset(q)
             } else {
                 CodecConfig {
-                    quantization_step: qstep.unwrap_or(4.0),
                     wavelet_type: parse_wavelet_type(wavelet.as_deref().unwrap_or("97")),
                     cfl_enabled: true,
                     per_subband_entropy: true,
-                    ..Default::default()
+                    ..gnc::manual_config(qstep.unwrap_or(4.0))
                 }
             };
 
@@ -1642,10 +1638,7 @@ fn main() {
                 let mut config_tw = if let Some(q) = quality {
                     gnc::quality_preset(q)
                 } else {
-                    CodecConfig {
-                        quantization_step: qstep.unwrap_or(4.0),
-                        ..Default::default()
-                    }
+                    gnc::manual_config(qstep.unwrap_or(4.0))
                 };
                 if let Some(qs) = qstep {
                     config_tw.quantization_step = qs;
@@ -1697,10 +1690,7 @@ fn main() {
                 let warmup_cfg = if let Some(q) = quality {
                     gnc::quality_preset(q)
                 } else {
-                    CodecConfig {
-                        quantization_step: qstep.unwrap_or(4.0),
-                        ..Default::default()
-                    }
+                    gnc::manual_config(qstep.unwrap_or(4.0))
                 };
 
                 // Read enough frames for warmup (gop_size frames for temporal warmup)
@@ -2554,10 +2544,7 @@ fn main() {
                 let mut config_tw = if let Some(q) = quality {
                     gnc::quality_preset(q)
                 } else {
-                    CodecConfig {
-                        quantization_step: qstep.unwrap_or(4.0),
-                        ..Default::default()
-                    }
+                    gnc::manual_config(qstep.unwrap_or(4.0))
                 };
                 if let Some(qs) = qstep {
                     config_tw.quantization_step = qs;

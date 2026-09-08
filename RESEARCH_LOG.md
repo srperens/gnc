@@ -38,6 +38,25 @@ on this adapter (31 storage buffers) cannot tell 9 from 10.
 
 ---
 
+## COORD-2 — `claim bug` / `claim dr` (2026-09-08)
+
+**Hypothesis.** `take dr-NNNN` cannot close the 0018-race because the read and the reservation
+are two operations, and it cannot see numbers already on `main` because it never looks there.
+Making the pick *be* the CAS, the way `claim next` already does for work items, should hand N
+racing callers N distinct ids.
+
+**What changed.** `scripts/claim bug` and `scripts/claim dr`. First gap over `git show
+main:BACKLOG.md` / `git ls-tree main docs/decisions/` union `refs/claims/*`. Lost CAS retries.
+Record **`0050`**: the first `claim dr` printed 0049, then BUG-40 merged
+`0049-bidir-pipelines-are-paid-by-b-frames.md` (they had dropped the reservation). Retry
+allocated 0050. The CAS was fair; a dropped claim loses to a branch that already wrote the
+file.
+
+**selftest.** 8 processes on `claim bug`: 8 claimed, 8 distinct. 8 on `claim dr`: 8 claimed,
+8 distinct. Combined with the existing 16-racer / 6-picker tests: PASS.
+
+No codec change. No measurement moved.
+
 ## BUG-40 — bidir pipelines are paid by B-frames, not by everything else (2026-09-08)
 
 **Hypothesis.** `MotionEstimator::new` compiles `block_match_bidir.wgsl` (and the two bidir MC

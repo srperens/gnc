@@ -13,8 +13,26 @@ use super::huffman::{
 };
 use crate::{FrameInfo, GpuContext};
 
-const MAX_STREAM_BYTES: usize = 512;
-const _MAX_STREAM_WORDS: usize = MAX_STREAM_BYTES / 4;
+/// Floor on a stream's output slot. Small tiles need far less than this; the floor exists so a
+/// tiny tile still has room for a codebook-sized burst.
+const MIN_STREAM_BYTES: usize = 512;
+
+/// Bytes to reserve per stream, from the number of symbols that stream can carry (BUG-22).
+///
+/// The slot was a fixed 512 B with nothing checking it, so a stream needing more spilled into its
+/// neighbour's slot and the host packed the neighbour's bytes back out — 7.8-10.9 dB at q=90 on
+/// all four stills at tile 512, with no error. Sizing it from the work instead:
+/// `STREAMS_PER_TILE` threads split a tile's coefficients evenly, and the worst case per symbol is
+/// four bytes — significance bit, sign bit, an 8-bit code, and an exp-Golomb escape — so four
+/// bytes per symbol is an upper bound rather than an estimate.
+///
+/// At tile 512 that is 4 KiB per stream and about 37 MB of scratch for 1080p 4:4:4, which is the
+/// price of the configuration working at all.
+fn stream_slot_bytes(tile_size: u32) -> usize {
+    let symbols_per_stream = (tile_size as usize * tile_size as usize)
+        .div_ceil(HUFFMAN_STREAMS_PER_TILE);
+    (symbols_per_stream * 4).max(MIN_STREAM_BYTES).next_multiple_of(4)
+}
 const MAX_GROUPS: usize = 8;
 const HIST_STRIDE: usize = MAX_GROUPS * HUFFMAN_ALPHABET_SIZE; // 512
 const ZRL_STRIDE: usize = MAX_GROUPS * 2; // 16
@@ -30,13 +48,18 @@ pub struct HuffmanParams {
     tile_size: u32,
     tiles_x: u32,
     num_levels: u32,
-    _pad0: u32,
+    /// Words per stream slot — `stream_slot_bytes() / 4`. The encode shader bounds its writes
+    /// with this; the decode shader ignores it.
+    max_stream_words: u32,
     _pad1: u32,
 }
 
 /// Pre-allocated GPU buffers for Huffman encode (reused across calls).
 struct CachedHuffmanEncodeBuffers {
     num_tiles: usize,
+    /// Slot size these buffers were allocated for. A different tile size at the same tile count
+    /// needs a different allocation, so it is part of the cache key.
+    slot_bytes: usize,
     // Histogram pass outputs
     hist_buf: wgpu::Buffer,
     hist_staging: wgpu::Buffer,
@@ -53,9 +76,9 @@ struct CachedHuffmanEncodeBuffers {
 }
 
 impl CachedHuffmanEncodeBuffers {
-    fn new(ctx: &GpuContext, num_tiles: usize) -> Self {
+    fn new(ctx: &GpuContext, num_tiles: usize, slot_bytes: usize) -> Self {
         let total_streams = num_tiles * HUFFMAN_STREAMS_PER_TILE;
-        let stream_size = (total_streams * MAX_STREAM_BYTES) as u64;
+        let stream_size = (total_streams * slot_bytes) as u64;
         let lengths_size = (total_streams * 4) as u64;
         let hist_size = (num_tiles * HIST_STRIDE * 4) as u64;
         let zrl_size = (num_tiles * ZRL_STRIDE * 4) as u64;
@@ -68,6 +91,7 @@ impl CachedHuffmanEncodeBuffers {
         let sd = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
 
         Self {
+            slot_bytes,
             num_tiles,
             hist_buf: ctx.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("huff_hist"),
@@ -271,10 +295,13 @@ impl GpuHuffmanEncoder {
         }
     }
 
-    fn ensure_buffers(&mut self, ctx: &GpuContext, num_tiles: usize) {
-        let needs_realloc = self.cached.as_ref().is_none_or(|c| c.num_tiles != num_tiles);
+    fn ensure_buffers(&mut self, ctx: &GpuContext, num_tiles: usize, slot_bytes: usize) {
+        let needs_realloc = self
+            .cached
+            .as_ref()
+            .is_none_or(|c| c.num_tiles != num_tiles || c.slot_bytes != slot_bytes);
         if needs_realloc {
-            self.cached = Some(CachedHuffmanEncodeBuffers::new(ctx, num_tiles));
+            self.cached = Some(CachedHuffmanEncodeBuffers::new(ctx, num_tiles, slot_bytes));
         }
     }
 
@@ -294,10 +321,11 @@ impl GpuHuffmanEncoder {
         // a stream of empty codes and the picture came back at 4-10 dB.
         let num_groups = (num_levels * 2).max(1) as usize;
 
-        self.ensure_buffers(ctx, num_tiles);
+        let slot_bytes = stream_slot_bytes(info.tile_size);
+        self.ensure_buffers(ctx, num_tiles, slot_bytes);
         let bufs = self.cached.as_ref().unwrap();
 
-        let stream_size = (total_streams * MAX_STREAM_BYTES) as u64;
+        let stream_size = (total_streams * slot_bytes) as u64;
         let lengths_size = (total_streams * 4) as u64;
         let hist_size = (num_tiles * HIST_STRIDE * 4) as u64;
         let zrl_size = (num_tiles * ZRL_STRIDE * 4) as u64;
@@ -309,7 +337,7 @@ impl GpuHuffmanEncoder {
             tile_size: info.tile_size,
             tiles_x: info.tiles_x(),
             num_levels,
-            _pad0: 0,
+            max_stream_words: (slot_bytes / 4) as u32,
             _pad1: 0,
         };
         let params_buf =
@@ -570,21 +598,22 @@ impl GpuHuffmanEncoder {
 
                 let mut packed_data = Vec::new();
                 for (s, &len) in stream_lengths.iter().enumerate() {
-                    let slot_offset =
-                        (t * HUFFMAN_STREAMS_PER_TILE + s) * MAX_STREAM_BYTES;
+                    let slot_offset = (t * HUFFMAN_STREAMS_PER_TILE + s) * slot_bytes;
                     let len = len as usize;
-                    // The shader writes each stream into a fixed MAX_STREAM_BYTES slot with no
-                    // bound of its own, so a stream that needs more spills into its neighbour's
-                    // slot and the packing below reads it back — silent corruption, no error.
-                    // That is what a q=100 or tile-512 Huffman encode was doing: 4-20 dB output
-                    // with max error 255 and nothing said. Same shape as BUG-9 in rANS, and the
-                    // same amount of fixing: refuse the configuration instead of coding it wrong.
+                    // The slot is now sized from `symbols_per_stream` at four bytes per symbol,
+                    // which is an upper bound on what a stream can emit, and the shader bounds
+                    // its own writes with the same number. So this cannot trip on well-formed
+                    // input; it stays because the previous version of this code had no bound at
+                    // all and spilled into the neighbouring slot, which the packing below read
+                    // back as if it were data — 7.8-10.9 dB at q=90, with nothing reported
+                    // (BUG-22). If it ever fires, the four-bytes-per-symbol bound is wrong, not
+                    // the configuration.
                     assert!(
-                        len <= MAX_STREAM_BYTES,
-                        "Huffman tile {t} stream {s} overflowed its {MAX_STREAM_BYTES}-byte \
-                         output slot ({len} bytes). The Huffman GPU encoder cannot code this \
-                         configuration; it happens at q=100 and at tile sizes above 256. Use \
-                         --rice, or a smaller --tile-size."
+                        len <= slot_bytes,
+                        "Huffman tile {t} stream {s} wrote {len} bytes into a {slot_bytes}-byte \
+                         slot. The slot is sized at four bytes per symbol, which should be an \
+                         upper bound, so this is a defect in that bound rather than an \
+                         unsupported configuration."
                     );
                     packed_data
                         .extend_from_slice(&stream_data[slot_offset..slot_offset + len]);
@@ -712,7 +741,8 @@ impl GpuHuffmanDecoder {
                 tile_size: info.tile_size,
                 tiles_x: info.tiles_x(),
                 num_levels: tiles.first().map_or(3, |t| t.num_levels),
-                _pad0: 0,
+                // Decode does not use it; the field is shared with the encode params.
+                max_stream_words: 0,
                 _pad1: 0,
             },
             decode_table,

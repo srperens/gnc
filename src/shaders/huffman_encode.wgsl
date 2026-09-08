@@ -10,7 +10,12 @@
 
 const STREAMS_PER_TILE: u32 = 256u;
 const MAX_STREAM_BYTES: u32 = 512u;
-const MAX_STREAM_WORDS: u32 = 128u;
+// The per-stream output slot is sized by the host from `symbols_per_stream` and arrives in
+// `params.max_stream_words` (BUG-22). It used to be this constant, a fixed 128 words = 512 bytes,
+// with nothing checking it: a stream needing more wrote straight into its neighbour's slot and the
+// host packed those bytes back out as data — 7.8-10.9 dB at q=90 on all four stills at tile 512,
+// and nothing reported. Both writes below are now bounded, so a slot that is somehow too small
+// truncates one stream instead of corrupting the next one.
 const ALPHABET_SIZE: u32 = 64u;
 const ESCAPE_SYM: u32 = 63u;
 const MAX_GROUPS: u32 = 8u;
@@ -23,7 +28,7 @@ struct Params {
     tile_size: u32,
     tiles_x: u32,
     num_levels: u32,
-    _pad0: u32,
+    max_stream_words: u32,
     _pad1: u32,
 }
 
@@ -84,7 +89,9 @@ fn emit_byte(byte_val: u32) {
     p_bytes_in_word += 1u;
     p_total_bytes += 1u;
     if (p_bytes_in_word == 4u) {
-        stream_output[p_stream_word_base + p_word_pos] = p_word_buffer;
+        if (p_word_pos < params.max_stream_words) {
+            stream_output[p_stream_word_base + p_word_pos] = p_word_buffer;
+        }
         p_word_pos += 1u;
         p_word_buffer = 0u;
         p_bytes_in_word = 0u;
@@ -131,7 +138,9 @@ fn flush_remaining() {
         emit_byte(byte_val);
     }
     if (p_bytes_in_word > 0u) {
-        stream_output[p_stream_word_base + p_word_pos] = p_word_buffer;
+        if (p_word_pos < params.max_stream_words) {
+            stream_output[p_stream_word_base + p_word_pos] = p_word_buffer;
+        }
     }
 }
 
@@ -166,7 +175,7 @@ fn main(
     workgroupBarrier();
 
     // Phase 2: Encode stream
-    p_stream_word_base = (tile_id * STREAMS_PER_TILE + thread_id) * MAX_STREAM_WORDS;
+    p_stream_word_base = (tile_id * STREAMS_PER_TILE + thread_id) * params.max_stream_words;
     p_bit_buffer = 0u;
     p_bits_in_buffer = 0u;
     p_word_buffer = 0u;

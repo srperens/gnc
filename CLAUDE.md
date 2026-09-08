@@ -78,7 +78,7 @@ Shader source is in `src/shaders/*.wgsl`. Rust host code is in `src/encoder/` an
 ## Code Style
 
 - Rust, edition 2021. Keep shader code (WGSL) simple and readable — comment non-obvious GPU-specific tricks.
-- **Zero clippy warnings** — `cargo clippy --release` and `cargo clippy --release --target wasm32-unknown-unknown` must both be clean. Fix warnings before committing. Prefer fixing the code over suppressing; `#[allow(clippy::…)]` is OK on individual items with justification but **blanket allows** (module-level `#![allow(…)]`, `dead_code` on entire impls, etc.) are **not acceptable**.
+- **Zero clippy warnings** — `cargo clippy --release` and `cargo clippy --release --target wasm32-unknown-unknown --lib` must both be clean. The wasm gate is `--lib` because **the CLI is not a wasm artifact**: `GpuContext::new` is `#[cfg(not(target_arch = "wasm32"))]` and `pollster` cannot block there, so type-checking a command-line tool for wasm produced 11 errors about the tool and none about the codec (BUG-24, fixed 2026-09-08). The binary now carries `required-features = ["cli"]`, so `--no-default-features` is the equivalent whole-target form and no target builds the CLI for wasm by accident. Fix warnings before committing. Prefer fixing the code over suppressing; `#[allow(clippy::…)]` is OK on individual items with justification but **blanket allows** (module-level `#![allow(…)]`, `dead_code` on entire impls, etc.) are **not acceptable**.
 - **No `unsafe`** unless absolutely unavoidable. Prefer safe abstractions.
 - Each pipeline stage is a separate module; new experiments go in `src/experiments/`.
 - Don't commit test material to git (it's in `.gitignore`).

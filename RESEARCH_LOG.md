@@ -435,6 +435,91 @@ right for the code they ran on — but they will not reproduce byte for byte tod
 **Harness:** `scripts/meas_intra1_padding.py`. `--canary` proves the mechanism, `--part 1,2,3`
 selects the measurements, `--project-from CSV` carries Part 1 to native geometry with no GPU.
 Decision record `docs/decisions/0034`.
+## Three bugs that were one command line: BUG-24, BUG-23, BUG-22 (2026-09-08)
+
+Working through "everything broken" rather than one item. These three are grouped because the
+second and third are the *same configuration failing twice in a row*, and the first was blocking a
+gate every session had to skip.
+
+### BUG-24 — the wasm clippy gate was red on `main`, and it was the CLI
+
+11 errors, all `src/main.rs` calling `GpuContext::new`, which is
+`#[cfg(not(target_arch = "wasm32"))]`. The library was clean all along.
+
+**Fixed by excluding the binary rather than making it compile.** There was no `[[bin]]` section, so
+the binary was auto-discovered and built for *every* target — which is why no command-line
+convention could have fixed it. It now carries `required-features = ["cli"]` with `cli` in the
+default set: native builds unchanged, `--no-default-features` gives a genuinely bin-free wasm
+build. CLAUDE.md's gate now reads `--lib`, which is what LOOP.md had already drifted to; the two
+documents disagreed and CLAUDE.md was the one naming a command that cannot pass.
+
+Rejected: making the CLI's context creation cfg-aware. `pollster` cannot block on wasm and the CLI
+needs an adapter, a filesystem and ffmpeg — that is wasm-specific dead code written to satisfy a
+gate that was asking the wrong question.
+
+### BUG-23 and BUG-22 — `--huffman -q 100 -t 512` failed three different ways
+
+The single command `gnc encode -i bbb_1080p.png -q 100 -t 512 --huffman` walked through all of it:
+
+| attempt | outcome |
+|---|---|
+| before 2026-09-07 | **hang** — 79% CPU for 8 minutes, killed |
+| after BUG-23's guard | **refuses** — "62 bits of excess left with no length below 8 to donate" |
+| after fixing BUG-23 | **slot overflow** — "stream 0 overflowed its 512-byte output slot (753 bytes)" |
+| after fixing BUG-22 | **0.63 s, 3412338 B, and bit-exact lossless** |
+
+**BUG-23: length limiting.** The old `clamp_code_lengths` placed excess code length by moving one
+symbol from length *j* to two at *j*+1, only from lengths below the maximum — a donor pool of order
+a hundred against an excess that is not bounded by it. Replaced with a real tree on scaled
+frequencies: while it is too deep, halve every non-zero frequency and rebuild. It terminates (32
+halvings take any `u32` to 1; a uniform 64-symbol alphabet has depth 6) and **satisfies Kraft by
+construction**, which is the property that mattered — the old path could return with excess
+unplaced and then emit codewords that were not a prefix code. Rounding up on the halving is
+load-bearing: a live symbol scaled to zero would lose its code entirely. Package-merge is optimal
+and was rejected as a few hundred lines against fifteen for a parked coder; it is the upgrade if
+Huffman is unparked.
+
+**BUG-22: the output slot.** `MAX_STREAM_WORDS` was a fixed 128 words with nothing checking
+`p_word_pos` against it, so a stream needing more wrote into its neighbour's slot and the host
+packed those bytes back out as data. Now sized from the work — four bytes per symbol is an *upper*
+bound (significance bit, sign bit, 8-bit code, exp-Golomb escape), not an estimate — passed in as
+`max_stream_words`, and **both** shader writes bounded by it. Sizing makes the configuration work;
+the bound makes a wrong size truncate one stream instead of corrupting the next.
+
+**The arm BUG-22 defined, re-measured.** q=90, tile 512, where it read 7.8-10.9 dB:
+
+| image | PSNR now | max error |
+|---|---|---|
+| bbb_1080p | **50.08 dB** | 4 |
+| blue_sky_1080p | **49.95 dB** | 4 |
+| kristensara_720p | **49.66 dB** | 4 |
+| touchdown_1080p | **49.57 dB** | 4 |
+
+BASELINE puts q=90 at 50.06 dB, so these are the operating point rather than merely better —
+about **+40 dB on all four**. And q=100 at tile 512 is now bit-exact lossless: **max error 0, zero
+wrong pixels** over 1920x1080x3, which is the strongest available check that the slot corruption
+is gone.
+
+### Gates and what did not move
+
+- **239 tests pass, 0 failures.** Two new: the skewed histogram is length-limited and
+  Kraft-complete rather than refused, and a second test asserts its unconstrained tree really is
+  deeper than the limit, so the first cannot pass for the wrong reason. The old `should_panic` test
+  is gone — it asserted the refusal, which was never the goal.
+- `cargo clippy --release` clean; `--target wasm32-unknown-unknown --lib` clean. One
+  `manual_div_ceil` I introduced was fixed rather than left.
+- **The default path did not move: Rice at q=90 is byte-identical** to the baseline taken before
+  this session's earlier work. Only Huffman files and `Cargo.toml` changed.
+
+### Not measured
+
+**Huffman against the other coders.** It is parked and unmeasured against the defaults, and this
+does not change that — it makes two configurations run that previously could not. Whether Huffman
+is worth unparking has no number behind it yet.
+
+Decision `0037` for BUG-22 and BUG-23; BUG-24 is a plain fix with its reasoning in the entry.
+
+---
 
 ## ENT-8 step 1 — the lockstep scan is affordable on abac's template, and the stripe width is a dial (2026-09-08)
 

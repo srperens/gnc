@@ -123,25 +123,74 @@ fn build_canonical_codebook(freq: &[u32]) -> Codebook {
         };
     }
 
-    // Build Huffman tree using a simple priority queue (Vec-based min-heap).
-    // Node: (frequency, node_id). Leaf nodes = 0..n-1, internal = n..
+    // Length-limited Huffman by frequency scaling (BUG-23).
+    //
+    // The natural tree can be far deeper than `HUFFMAN_MAX_CODE_LEN` — a geometric histogram over
+    // 32 symbols reaches depth 32 — and the previous approach redistributed the excess by moving
+    // one symbol from length j to two at j + 1. That donor pool is finite and the excess is not
+    // bounded by it, so the loop could not always finish: it spun at 79% CPU for 8 minutes before
+    // an assert was added, after which it refused the material instead of coding it.
+    //
+    // Build a *real* tree on scaled frequencies instead. While the tree is too deep, halve every
+    // non-zero frequency and rebuild. Two properties carry it:
+    //
+    //   * **It terminates.** 32 halvings take any `u32` to 1, and a uniform alphabet of
+    //     `HUFFMAN_ALPHABET_SIZE` = 64 symbols has depth 6 — inside the 8-bit limit. The assert
+    //     below checks that bound rather than trusting it.
+    //   * **The result satisfies Kraft by construction**, because it is an actual Huffman tree and
+    //     not a patched length histogram. That is what makes `assign_canonical_codes` safe; the
+    //     old path could leave excess in place and hand out codewords that were not a prefix code,
+    //     which decodes to noise.
+    //
+    // Rounding up on the halving matters: a live symbol must never scale to zero and drop out of
+    // the alphabet, because it would then have no code at all.
+    let mut scaled: Vec<u32> = freq[..n].to_vec();
+    let mut code_lengths = natural_code_lengths(&scaled, &active, n);
+    let mut halvings = 0u32;
+    while code_lengths.iter().any(|&l| l > HUFFMAN_MAX_CODE_LEN) {
+        for f in scaled.iter_mut() {
+            if *f > 1 {
+                *f = (*f).div_ceil(2);
+            }
+        }
+        halvings += 1;
+        assert!(
+            halvings <= 32,
+            "length-limited Huffman did not converge after {halvings} halvings over {} active              symbols; every non-zero frequency should be 1 by now, and a uniform alphabet that              size fits {HUFFMAN_MAX_CODE_LEN}-bit codes",
+            active.len(),
+        );
+        code_lengths = natural_code_lengths(&scaled, &active, n);
+    }
+
+    // Assign canonical codes
+    let codewords = assign_canonical_codes(&code_lengths);
+
+    Codebook {
+        code_lengths,
+        codewords,
+    }
+}
+
+/// Code lengths from an unconstrained Huffman tree over `freq`, for the symbols in `active`.
+///
+/// Split out of `build_canonical_codebook` so the length-limiting loop can rebuild the tree on
+/// scaled frequencies. Callers guarantee `active.len() >= 2`.
+fn natural_code_lengths(freq: &[u32], active: &[usize], n: usize) -> Vec<u8> {
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+
+    // Node: leaves are 0..n-1, internal nodes n.. in creation order.
     let mut node_freq: Vec<u64> = Vec::with_capacity(2 * n);
     let mut children: Vec<(usize, usize)> = Vec::with_capacity(n);
-
-    // Initialize leaf nodes with their frequencies
     for &f in freq.iter().take(n) {
         node_freq.push(f as u64);
     }
 
-    // Min-heap of (freq, node_id) — use BinaryHeap with Reverse for min
-    use std::cmp::Reverse;
-    use std::collections::BinaryHeap;
     let mut heap: BinaryHeap<Reverse<(u64, usize)>> = BinaryHeap::new();
-    for &sym in &active {
+    for &sym in active {
         heap.push(Reverse((freq[sym] as u64, sym)));
     }
 
-    // Build tree by merging two lowest-frequency nodes
     while heap.len() > 1 {
         let Reverse((f1, n1)) = heap.pop().unwrap();
         let Reverse((f2, n2)) = heap.pop().unwrap();
@@ -152,7 +201,6 @@ fn build_canonical_codebook(freq: &[u32]) -> Codebook {
         heap.push(Reverse((combined, new_id)));
     }
 
-    // Extract code lengths via DFS
     let mut code_lengths = vec![0u8; n];
     let root = heap.pop().unwrap().0 .1;
 
@@ -164,7 +212,6 @@ fn build_canonical_codebook(freq: &[u32]) -> Codebook {
         code_lengths: &mut [u8],
     ) {
         if node < n_leaves {
-            // Leaf node
             code_lengths[node] = depth.max(1); // minimum 1 bit
         } else {
             let (left, right) = children[node - n_leaves];
@@ -172,112 +219,8 @@ fn build_canonical_codebook(freq: &[u32]) -> Codebook {
             assign_lengths(right, depth + 1, n_leaves, children, code_lengths);
         }
     }
-
     assign_lengths(root, 0, n, &children, &mut code_lengths);
-
-    // Clamp max code length to HUFFMAN_MAX_CODE_LEN
-    clamp_code_lengths(&mut code_lengths, freq);
-
-    // Assign canonical codes
-    let codewords = assign_canonical_codes(&code_lengths);
-
-    Codebook {
-        code_lengths,
-        codewords,
-    }
-}
-
-/// Clamp code lengths to max_len by redistributing excess length.
-/// Uses the algorithm from JPEG: iteratively shorten longest codes.
-fn clamp_code_lengths(lengths: &mut [u8], _freq: &[u32]) {
-    let max_len = HUFFMAN_MAX_CODE_LEN;
-
-    // Count lengths
-    let mut len_count = vec![0u32; (max_len as usize) + 2];
-    let mut overflow = false;
-    for &l in lengths.iter() {
-        if l > 0 {
-            if l > max_len {
-                overflow = true;
-                len_count[max_len as usize] += 1;
-            } else {
-                len_count[l as usize] += 1;
-            }
-        }
-    }
-
-    if !overflow {
-        return;
-    }
-
-    // Count how many symbols exceeded max_len
-    let mut excess_bits: i32 = 0;
-    for &l in lengths.iter() {
-        if l > max_len {
-            excess_bits += (l as i32) - (max_len as i32);
-        }
-    }
-
-    // Redistribute: move symbols from longest lengths to shorter ones
-    // Simple approach: increase counts at max_len, decrease at max_len-1
-    //
-    // The donor pool is finite and `excess_bits` is not bounded by it. Each donation takes one
-    // symbol from length j and puts two at j + 1, and only j < max_len may donate, so a chain
-    // starting at j yields at most 2^(max_len - 1 - j) donations — on the order of a hundred for
-    // a 64-symbol alphabet. A steeply skewed histogram (lengths 1, 2, 3, ... 63, which is what a
-    // MED residual plane produces) needs over a thousand. Without the `donated` check this loop
-    // spins forever: measured at 79% CPU for 8 minutes on `-q 100 -t 512 --huffman` before it was
-    // killed. It was unreachable only because `num_groups` was zero there, so no codebook was
-    // ever built (see BUG-21); fixing that exposed this.
-    //
-    // Failing loudly rather than shortening the codes anyway: with `excess_bits` still positive
-    // the length distribution violates Kraft's inequality, so `assign_canonical_codes` would
-    // hand out codewords that are not a prefix code and the tile would decode to noise. A
-    // length-limited construction (package-merge, or halving the frequencies and rebuilding)
-    // would code it properly; that is a change to a parked coder and is filed, not done.
-    while excess_bits > 0 {
-        // Find a non-zero count below max_len to donate
-        let mut donated = false;
-        for j in (1..max_len as usize).rev() {
-            if len_count[j] > 0 {
-                len_count[j] -= 1;
-                len_count[j + 1] += 2;
-                excess_bits -= 1;
-                donated = true;
-                break;
-            }
-        }
-        assert!(
-            donated,
-            "Huffman cannot limit this distribution to {max_len}-bit codes: {excess_bits} bits \
-             of excess left with no length below {max_len} to donate. The alphabet is too skewed \
-             for the redistribution step; use --rice for this material."
-        );
-    }
-
-    // Reassign lengths based on new counts (sort symbols by original length, then symbol)
-    let mut syms: Vec<usize> = (0..lengths.len())
-        .filter(|&i| lengths[i] > 0)
-        .collect();
-    syms.sort_by_key(|&i| (lengths[i], i));
-
-    // Clamp all to max_len first
-    for &s in &syms {
-        if lengths[s] > max_len {
-            lengths[s] = max_len;
-        }
-    }
-
-    // Assign new lengths from len_count
-    let mut sym_idx = 0;
-    for (l, &count) in len_count.iter().enumerate().take(max_len as usize + 1).skip(1) {
-        for _ in 0..count {
-            if sym_idx < syms.len() {
-                lengths[syms[sym_idx]] = l as u8;
-                sym_idx += 1;
-            }
-        }
-    }
+    code_lengths
 }
 
 /// Assign canonical codes from code lengths.
@@ -1095,22 +1038,63 @@ mod tests {
         }
     }
 
-    /// A distribution too skewed to fit 8-bit codes must fail, not spin.
+    /// A distribution too skewed for the natural tree must be *coded*, not refused, and not spun.
     ///
-    /// `clamp_code_lengths` redistributes excess code length by moving one symbol from length j
-    /// to two at j + 1, and only lengths below the maximum may donate — a finite budget against
-    /// an unbounded `excess_bits`. A geometric histogram over 32 symbols exhausts it after 247
-    /// donations with 52 bits of excess still to place, at which point the original loop had
-    /// nothing left to do and did it forever (79% CPU, 8 minutes, killed). `should_panic` here is
-    /// the regression: before the fix this test does not fail, it hangs.
+    /// History, because this test has meant three different things. The original
+    /// `clamp_code_lengths` redistributed excess length by moving one symbol from length j to two
+    /// at j + 1 — a finite donor pool against an unbounded excess — and on this histogram it had
+    /// nothing left to donate and did it forever (79% CPU, 8 minutes, killed). BUG-23 then made it
+    /// assert, and this test asserted the panic. Neither coded the material. The length-limited
+    /// construction does, so the assertion is now about the codebook being usable.
     #[test]
-    #[should_panic(expected = "Huffman cannot limit this distribution")]
-    fn test_codebook_refuses_a_distribution_it_cannot_length_limit() {
+    fn test_codebook_length_limits_a_steeply_skewed_distribution() {
         let mut freq = vec![1u32; 32];
         for (i, f) in freq.iter_mut().enumerate().skip(1) {
             *f = 1u32 << (i - 1);
         }
-        let _ = build_canonical_codebook(&freq);
+        let cb = build_canonical_codebook(&freq);
+
+        // Every active symbol has a code, and no code exceeds the limit the decoder reads.
+        for (sym, &f) in freq.iter().enumerate() {
+            if f > 0 {
+                assert!(
+                    cb.code_lengths[sym] >= 1 && cb.code_lengths[sym] <= HUFFMAN_MAX_CODE_LEN,
+                    "symbol {sym} has length {}, outside 1..={HUFFMAN_MAX_CODE_LEN}",
+                    cb.code_lengths[sym]
+                );
+            }
+        }
+
+        // Kraft equality: a canonical prefix code over these lengths exists and is complete.
+        // This is the property the old redistribution could violate while still returning, which
+        // would have made `assign_canonical_codes` emit a non-prefix code and decode to noise.
+        let kraft: f64 = cb
+            .code_lengths
+            .iter()
+            .filter(|&&l| l > 0)
+            .map(|&l| 2f64.powi(-(l as i32)))
+            .sum();
+        assert!(
+            (kraft - 1.0).abs() < 1e-9,
+            "Kraft sum is {kraft}, so these lengths are not a complete prefix code"
+        );
+    }
+
+    /// The natural tree for this histogram is deeper than the limit, so the scaling loop must
+    /// actually run. Without that, the test above would pass for the wrong reason.
+    #[test]
+    fn test_length_limiting_is_actually_exercised() {
+        let mut freq = vec![1u32; 32];
+        for (i, f) in freq.iter_mut().enumerate().skip(1) {
+            *f = 1u32 << (i - 1);
+        }
+        let active: Vec<usize> = (0..freq.len()).filter(|&i| freq[i] > 0).collect();
+        let natural = natural_code_lengths(&freq, &active, freq.len());
+        let deepest = natural.iter().copied().max().unwrap_or(0);
+        assert!(
+            deepest > HUFFMAN_MAX_CODE_LEN,
+            "the unconstrained tree is only {deepest} deep, so this histogram no longer tests              length limiting — pick a more skewed one"
+        );
     }
 
     /// The host encoder and decoder must agree at every tile width, not just the default one.

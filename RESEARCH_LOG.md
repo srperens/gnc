@@ -4,6 +4,43 @@
 
 ---
 
+## BUG-35 — the histogram arena is guarded; shrinking it is refused (2026-09-08)
+
+**Hypothesis.** `shared_hist` is 5120 bins. `total_hist_entries` can reach 49152. naga clamps
+out-of-range atomics, so an overflow silently corrupts frequencies. Guard first, measure how
+large the arena actually gets on real content, then decide whether it can shrink to ≤3266
+(the size that would put `quantize_histogram_fused.wgsl:main` under the 16384 B WebGPU
+budget).
+
+**Domain.** Quantized coefficients / rANS frequency tables. Rice never reaches this array
+(`0035`).
+
+**Change.** `check_hist_arena_capacity` before `check_cumfreq_capacity`. Shaders skip
+out-of-range atomics. Canary: `[rans] hist_arena_max=N/5120 (tile T)` under `GNC_PROFILE`.
+
+**Before (Rice q=90, default, canary).** Nine `main_quantize_only` dispatches,
+`with_histogram=0`, no `hist_arena_max` line.
+
+**After, `--rans`, 4:4:4, worst tile, this Mac, not idle:**
+
+| image | q=15 | q=25 | q=50 | q=70 | q=85 | q=90 |
+|---|---|---|---|---|---|---|
+| bbb_1080p | 313 | 940 | 1972 | 3428 | **5322 refuse** | **6648 refuse** |
+| blue_sky_1080p | 320 | — | — | — | — | **6843 refuse** |
+| touchdown_1080p | 335 | — | — | — | — | **6575 refuse** |
+| kristensara_720p | — | — | — | — | — | **7004 refuse** |
+
+q=15 (preset rANS, q≤20) uses **6% of the arena** and produces a file. q=70 `--rans` (in
+`0035`'s identity gate) still fits. q≥85 `--rans` overflows on every image; that path was
+already writing naga-clamped frequencies.
+
+**Shrink 5120 → ≤3266 is rejected.** It would refuse bbb at q=70 (3428 > 3266). Growing to
+7004 takes `main` to ~31 KB, which is the raise-the-limit option `0032` refused.
+
+**Not closed.** The five over-budget rANS entry points remain. Decision `0048`.
+
+---
+
 ## BUG-34 — storage-buffer request 10 → 9, named and asserted (2026-09-08)
 
 **Hypothesis.** `GpuContext` asks for `max_storage_buffers_per_shader_stage: 10` against
@@ -56,6 +93,8 @@ file.
 8 distinct. Combined with the existing 16-racer / 6-picker tests: PASS.
 
 No codec change. No measurement moved.
+
+---
 
 ## BUG-40 — bidir pipelines are paid by B-frames, not by everything else (2026-09-08)
 
@@ -112,6 +151,8 @@ k=1 wall **4.56×**. Remaining wall on the flag is GPU init + PNG load, which am
 frame count; the SSIM tax does not. Tests: `tests/bug32_throughput.rs`.
 
 No codec path changed. No BASELINE compression figure moved.
+
+---
 
 ## MEAS-10 — BASELINE re-taken at `0a1b055` (2026-09-08)
 

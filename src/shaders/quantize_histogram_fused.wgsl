@@ -79,7 +79,17 @@ var<workgroup> shared_max: array<i32, 256>;
 var<workgroup> shared_reduce_u: array<u32, 256>;
 
 // ---- Shared memory for histogram building (atomic) ----
-var<workgroup> shared_hist: array<atomic<u32>, 5120>;
+// Sum of per-group alphabets can reach MAX_GROUPS * MAX_GROUP_ALPHABET = 49152.
+// Nothing used to compare that to 5120; naga clamps out-of-range atomics, so an
+// overflow silently corrupted the last bins (BUG-35). The host refuses the frame
+// when the sum does not fit; these helpers only keep the shader inside the array
+// while that output is thrown away. Do not treat the clamp as the guard.
+const SHARED_HIST_ENTRIES: u32 = 5120u;
+var<workgroup> shared_hist: array<atomic<u32>, SHARED_HIST_ENTRIES>;
+
+fn hist_in_arena(idx: u32) -> bool {
+    return idx < SHARED_HIST_ENTRIES;
+}
 
 // Per-group metadata broadcast from thread 0
 var<workgroup> shared_group_min: array<i32, 12>;
@@ -595,10 +605,12 @@ fn histogram_phases(lid: u32, tile_origin_x: u32, tile_origin_y: u32, coeffs_per
         }
         workgroupBarrier();
 
-        // Initialize histogram to zero
+        // Initialize histogram to zero. total_hist_entries can exceed the arena;
+        // the host refuses that frame. Cap the loop so naga is not the only bound.
         let total_hist_entries = shared_group_hist_off[num_groups - 1u]
                                + shared_group_asize[num_groups - 1u];
-        for (var i = lid; i < total_hist_entries; i += WG_SIZE) {
+        let hist_cap = min(total_hist_entries, SHARED_HIST_ENTRIES);
+        for (var i = lid; i < hist_cap; i += WG_SIZE) {
             atomicStore(&shared_hist[i], 0u);
         }
         workgroupBarrier();
@@ -643,14 +655,18 @@ fn histogram_phases(lid: u32, tile_origin_x: u32, tile_origin_y: u32, coeffs_per
                             sym = shared_group_asize[g] - 1u;
                         }
                         let hist_idx = shared_group_hist_off[g] + sym;
-                        atomicAdd(&shared_hist[hist_idx], 1u);
+                        if (hist_in_arena(hist_idx)) {
+                            atomicAdd(&shared_hist[hist_idx], 1u);
+                        }
                     } else {
                         var sym = u32(c - shared_group_min[g]);
                         if (sym >= shared_group_asize[g]) {
                             sym = shared_group_asize[g] - 1u;
                         }
                         let hist_idx = shared_group_hist_off[g] + sym;
-                        atomicAdd(&shared_hist[hist_idx], 1u);
+                        if (hist_in_arena(hist_idx)) {
+                            atomicAdd(&shared_hist[hist_idx], 1u);
+                        }
                         i += 1u;
                     }
                 }
@@ -671,7 +687,9 @@ fn histogram_phases(lid: u32, tile_origin_x: u32, tile_origin_y: u32, coeffs_per
                     sym = shared_group_asize[g] - 1u;
                 }
                 let hist_idx = shared_group_hist_off[g] + sym;
-                atomicAdd(&shared_hist[hist_idx], 1u);
+                if (hist_in_arena(hist_idx)) {
+                    atomicAdd(&shared_hist[hist_idx], 1u);
+                }
             }
         }
         workgroupBarrier();
@@ -690,7 +708,12 @@ fn histogram_phases(lid: u32, tile_origin_x: u32, tile_origin_y: u32, coeffs_per
             }
             let hist_base = shared_group_hist_off[g];
             for (var i = lid; i < asize; i += WG_SIZE) {
-                hist_output[out_base + write_off + 3u + i] = atomicLoad(&shared_hist[hist_base + i]);
+                let src = hist_base + i;
+                var bin = 0u;
+                if (hist_in_arena(src)) {
+                    bin = atomicLoad(&shared_hist[src]);
+                }
+                hist_output[out_base + write_off + 3u + i] = bin;
             }
             write_off += 3u + asize;
         }
@@ -701,7 +724,8 @@ fn histogram_phases(lid: u32, tile_origin_x: u32, tile_origin_y: u32, coeffs_per
         let zrun_base = shared_group_zrun[0];
 
         // Initialize histogram to zero
-        for (var i = lid; i < alphabet_size; i += WG_SIZE) {
+        let single_cap = min(alphabet_size, SHARED_HIST_ENTRIES);
+        for (var i = lid; i < single_cap; i += WG_SIZE) {
             atomicStore(&shared_hist[i], 0u);
         }
         workgroupBarrier();
@@ -737,11 +761,15 @@ fn histogram_phases(lid: u32, tile_origin_x: u32, tile_origin_y: u32, coeffs_per
                         let run_sym_val = zrun_base + i32(run_len) - 1;
                         var sym = u32(run_sym_val - min_val);
                         if (sym >= alphabet_size) { sym = alphabet_size - 1u; }
-                        atomicAdd(&shared_hist[sym], 1u);
+                        if (hist_in_arena(sym)) {
+                            atomicAdd(&shared_hist[sym], 1u);
+                        }
                     } else {
                         var sym = u32(c - min_val);
                         if (sym >= alphabet_size) { sym = alphabet_size - 1u; }
-                        atomicAdd(&shared_hist[sym], 1u);
+                        if (hist_in_arena(sym)) {
+                            atomicAdd(&shared_hist[sym], 1u);
+                        }
                         i += 1u;
                     }
                 }
@@ -756,7 +784,9 @@ fn histogram_phases(lid: u32, tile_origin_x: u32, tile_origin_y: u32, coeffs_per
                 let c = i32(round(output[plane_idx]));
                 var sym = u32(c - min_val);
                 if (sym >= alphabet_size) { sym = alphabet_size - 1u; }
-                atomicAdd(&shared_hist[sym], 1u);
+                if (hist_in_arena(sym)) {
+                    atomicAdd(&shared_hist[sym], 1u);
+                }
             }
         }
         workgroupBarrier();
@@ -768,7 +798,11 @@ fn histogram_phases(lid: u32, tile_origin_x: u32, tile_origin_y: u32, coeffs_per
             hist_output[out_base + 2u] = bitcast<u32>(zrun_base);
         }
         for (var i = lid; i < alphabet_size; i += WG_SIZE) {
-            hist_output[out_base + 3u + i] = atomicLoad(&shared_hist[i]);
+            var bin = 0u;
+            if (hist_in_arena(i)) {
+                bin = atomicLoad(&shared_hist[i]);
+            }
+            hist_output[out_base + 3u + i] = bin;
         }
     }
 }

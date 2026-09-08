@@ -1475,24 +1475,37 @@ ki=1 and ki=9. The Rice arm being identical *is* the proof the histogram was dea
 dispatches on Rice **and** that the quantise path ran, so it cannot pass by asserting nothing —
 byte-identity alone would not have caught a flag stuck at `true`. Decision `0035`.
 
-**What is still open, and it is the harder half.** `main` is unchanged at 23800 B, so rANS at
-4:4:4 still creates an over-budget pipeline and still cannot run in a browser. Shrinking
-`shared_hist` to fit needs the arena from 5120 to <=3266 entries — and **that makes an existing
-hazard worse:**
+**Guard landed, shrink refused (2026-09-08).** `check_hist_arena_capacity` is the encode-side
+twin of `check_cumfreq_capacity`: it sums per-group `alphabet_size` (not +1) and refuses a
+tile over 5120. The shaders skip out-of-range atomics so naga's clamp is not the only bound.
+Canary: `GNC_PROFILE=1` prints `[rans] hist_arena_max=N/5120 (tile T)` on every rANS encode;
+Rice still prints `with_histogram=0` and never hits the check. Decision `0048`.
 
-> `total_hist_entries` is the sum of up to 12 per-group alphabets, each clamped at
-> `MAX_GROUP_ALPHABET = 4096`, so it can reach 49152. **Nothing compares it to 5120.**
-> `atomicStore`/`atomicAdd` past the end are clamped by naga's bounds policy, so an overflow
-> silently corrupts frequencies instead of failing. A smaller arena overflows sooner, so **the
-> guard has to come first.** Worth knowing: the neighbouring rANS *encode* shader does have such a
-> guard, on the host, and it says "tile 13 needs 6658 cumfreq entries but the encode shader's
-> workgroup table holds 4097". The fused histogram arena has no equivalent.
+Measured on four stills, `--rans`, 4:4:4, this Mac, not idle:
 
-So the order for the rest of this item is: **guard the arena, measure how large it actually gets,
-then size it.** Two more findings from the sweep worth carrying: `rans_decode.wgsl:main` and
-`rans_encode_lean.wgsl:main` both sit at **exactly 16384 B** — inside the budget with zero
-headroom, so any addition to either is an instant defect — and `rans_encode.wgsl:main` is at
-**16388 B**, over by 4.
+| image | q=15 | q=25 | q=50 | q=70 | q=85 | q=90 |
+|---|---|---|---|---|---|---|
+| bbb_1080p | 313 | 940 | 1972 | 3428 | **5322 refuse** | **6648 refuse** |
+| blue_sky_1080p | 320 | — | — | — | — | **6843 refuse** |
+| touchdown_1080p | 335 | — | — | — | — | **6575 refuse** |
+| kristensara_720p | — | — | — | — | — | **7004 refuse** |
+
+q=15 is rANS's default range (preset picks it at q≤20) and sits at **6% of the arena**.
+q=70 `--rans` (in 0035's identity gate) still fits at 3428. q≥85 `--rans` was already
+silently corrupting the last bins; the check makes that a named refusal instead of a
+wrong file. `--rans` at contribution quality was never a supported operating point
+(BUG-9's cumfreq table refuses kristensara at q=76 for a smaller array).
+
+**Shrinking 5120 → ≤3266 is rejected.** That is what would put `main` under 16384 B, and
+it would refuse bbb at q=70 (3428 > 3266) — a configuration 0035 shipped as byte-identical.
+Growing the arena to 7004 would take `main` to ~31 KB, which is the raise-the-limit option
+`0032` already refused.
+
+**What is still open.** The five over-budget rANS entry points, including `main` at 23800 B.
+A browser still cannot create the histogram pipeline. Packing, a storage-buffer histogram,
+or parking those shaders explicitly are the remaining answers; shrinking is not one of them.
+`rans_decode.wgsl:main` and `rans_encode_lean.wgsl:main` sit at **exactly 16384 B**.
+`rans_encode.wgsl:main` is **16388 B** (+4 B), which is the extra cumfreq slot BUG-9 added.
 
 Original entry follows.
 

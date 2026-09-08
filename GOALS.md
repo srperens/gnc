@@ -94,7 +94,7 @@ not a default — `docs/decisions/0017`.
 | 25 | 35.63 dB | 1.64 | 90.31 | 5 |
 | 50 | 40.30 dB | 2.73 | 95.02 | 5 |
 | 75 | 44.84 dB | 4.53 | 96.58 | 5 |
-| 90 | 50.06 dB | 8.07 | 97.08 | 5 |
+| 90 | 49.89 dB | 7.21 | 97.06 | 5 |
 
 *Single-frame, 1080p bbb reference, Rice, 4:4:4. **[BASELINE.md](BASELINE.md) is the single source
 for these** — this table was three separate copies from 2026-02-27 and had drifted more than 2 dB.

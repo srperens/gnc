@@ -4,6 +4,111 @@
 
 ---
 
+## INTRA-2 — 90% of the blocker was a knob that moved two things (2026-09-08)
+
+**Hypothesis.** GNC's dead zone is a no-op in its own operating range — the quantiser is
+`floor(|v|/step + 0.5)` after a `|v| < dead_zone * step` test, so anything at or below 0.5 changes
+nothing, and the ladder ran 0.5 at q=85 down to 0.0 at q>=96. Raising it is worth ~3 points of the
+JPEG 2000 gap on stills. 0028 measured it and could not ship it: worst-frame PSNR negative on 9 of
+9 sequence points, by up to 1.93 dB.
+
+**First question asked, before writing any code: was that blocker measuring the thing it named?**
+It was not, or not mostly. `res_dead_zone = config.dead_zone * inter_dz_mul` with the multiplier
+defaulting to **2.0**, so `GNC_DEAD_ZONE=0.6` took the *inter* dead zone from the ladder's
+1.0 / 0.357 / 0.025 at q=85/90/95 to **1.2 at all three** — and at q=90 and q=95 the ladder's value
+is below 0.5, i.e. a no-op. The experiment woke a dormant lever on the P path and attributed the
+result to the intra one.
+
+Three arms, three sequences, 16 frames, ki=9, 4:4:4, worst-frame PSNR against production:
+
+| arm | q=85 | q=90 | q=95 |
+|---|---|---|---|
+| `GNC_DEAD_ZONE=0.6` (0028's) | −1.10 / −1.60 / −1.51 | −0.85 / −1.62 / −1.44 | −1.53 / −1.87 / −1.93 |
+| no inter dead zone at all | **+2.45 / +2.56 / +2.62** | −0.16 / −0.19 / −0.19 | −0.16 / −0.12 / −0.13 |
+| inter **held at the ladder's value** | **0.00 / 0.00 / +0.03** | −0.16 / −0.19 / −0.19 | −0.12 / −0.13 / −0.16 |
+
+The middle row is not INTRA-2's business but is worth recording: **removing the inter dead zone
+entirely is worth +2.5 dB of worst-frame at q=85**, which is INTER-2's territory and appears to be
+a large lever.
+
+### The residue is arithmetic, and it is what decided the design
+
+Even with inter held, a referenced I-frame costs **−0.19 dB of worst-frame for −0.33% of rate** at
+q=90. That is structural: at ki=9 the I-frame is **one frame in sixteen**, so its rate saving
+dilutes 16:1 across the sequence while worst-frame PSNR is *fully* exposed to it — because **the
+worst frame is the I-frame** (49.23 dB against the P-frames' 49.69 on crowd_run q=90). Sweeping the
+value confirms it scales: −0.01 dB at 0.52, −0.05 at 0.55, −0.19 at 0.60, for 0.05 / 0.16 / 0.33%
+of rate.
+
+So the gate is on **being referenced**, not on being intra — the item's title understates it. A
+frame others predict from must be *better* than its own rate suggests. Same conclusion PAD-1
+reached one commit earlier from a different lever, and the new line sits directly above its
+`pad_fill_decay = false` for the same reason (`0039`).
+
+### Result against the item's own criterion
+
+| clause | result |
+|---|---|
+| ≥2% rate at matched RGB PSNR, four stills, q≥85 | **BD-rate −5.01%** (−3.31 / −4.67 / −6.96 / −5.09) |
+| no worst-frame regression on any of three sequences | **byte-identical** — structurally impossible |
+| dE00 no worse | **−5.2% mean** at matched rate, p95 better 11 of 12, Y-PSNR **+0.39 dB** |
+
+Also: q=100 still bit-exact (max error 0, BUG-30's guard holds), a q=75 still byte-identical
+(outside the floor's range), an all-intra ki=1 sequence **−2.51%** — less than any of the four
+stills, so the lever is content-dependent and high-motion detail benefits least — and VMAF at q=90
+**97.06 against 97.07**.
+
+### Two harness errors, both caught by a canary rather than by review
+
+**A floor applied after an env override silently disarms the override.** `.max(0.6)` sat after
+`GNC_DEAD_ZONE`, so the knob could not set anything *below* 0.6 in the range — which would have
+disarmed the one control BUG-30 exists to keep honest. Caught because two arms that had to differ
+produced identical files.
+
+**`np.interp` clamps, and clamping flipped a sign.** The new arm's file at q=85 is smaller than the
+old arm's *smallest* file, so interpolating the old arm onto that rate returns its endpoint and
+compares two different rates. It read **+3% dE00 and −0.25 dB** — a loss — where extending the old
+ladder to q=78..82 and skipping out-of-range rows gives **−3% and +0.26 dB**. Out-of-range rows are
+now skipped and labelled.
+
+And the canary itself had to be moved: printed *after* the assignment it showed two identical
+numbers and proved nothing. It now prints
+`INTRA-2: I-frame is a reference (ki=9), dead zone 0.600 -> 0.179` before the gate fires.
+
+### INTER-2 landed mid-verification, and the merge is the interesting part
+
+INTER-2 reached `main` while this was being re-verified, and it changes the same three lines: it
+folded the multiplier into `crate::inter_dead_zone_mul()` and set it to 1.0, on the finding that
+"the inter dead zone is the intra one, not double it".
+
+**The naive resolution would have silently undone their measurement.** Taking their line verbatim
+gives `res_dead_zone = config.dead_zone * 1.0`, and `config.dead_zone` is no longer the ladder's
+value — it is floored at 0.6 over q=85..95. That would hand the inter path a 0.6 dead zone at
+exactly the operating points INTER-2 priced at the ladder's 0.179 and 0.0125. Their conclusion was
+measured where `config.dead_zone` *was* the ladder value, which in this change's terms is
+`dead_zone_referenced` — so the correct merge keeps their refactor and this change's source:
+`crate::inter_dead_zone_mul()` times `dead_zone_referenced`. Verified: every sequence is
+byte-identical to `main` after the merge.
+
+Two independent measurements also agree, which is worth recording: the middle arm of the three-arm
+table above — no inter dead zone at all — reads **+2.5 dB of worst-frame at q=85**, and INTER-2
+independently measured BD-rate −4.77% with worst-frame better on 12 of 12. Same lever, two routes.
+
+### And a sixth decision-record collision, this time with the reservation held
+
+INTER-2's record took **0041**, which this session had reserved through `scripts/claim` at
+13:38:33Z before writing its file. Same asymmetry as the `0024` and `0027` pairs — the session that
+reserved was not the one that collided — so COORDINATION's rule applied and **the unreserved record
+moved to `0043`**, with its five inbound references updated and a provenance note in its header.
+Fixed here rather than left for BUG-19 because three of those five references were being edited for
+this merge anyway.
+
+Decision `0041`. **250 tests, 0 failures; both clippy targets clean; `clippy --tests` unchanged at
+90. No timing figure was taken here, so the 15:11–15:41 CPU-load window another session reported
+touches nothing above — every number is bytes, PSNR, dE00 or VMAF.**
+
+---
+
 ## DOC-2 — the source of truth had drifted while the public document stayed right (2026-09-08)
 
 Asked to re-evaluate what mattered most, and the answer was not an engineering item: **GOALS.md was

@@ -1,4 +1,11 @@
-# 0041 — The inter dead zone is the intra dead zone, not double it
+# 0043 — The inter dead zone is the intra dead zone, not double it
+
+> **Renumbered from 0041 to 0043 on 2026-09-08, and the measurement is untouched.** `dr-0041` was
+> reserved through `scripts/claim` at 13:38:33Z by the INTRA-2 session before it wrote its file;
+> this record took the number without reserving it. Same asymmetry as the `0024` and `0027` pairs
+> COORDINATION records, and the resolution it prescribes — the unreserved record moves. Fixed here
+> rather than left for BUG-19 because there were five inbound references and three of them were
+> being edited anyway for the INTRA-2 merge.
 
 **Date:** 2026-09-08
 **Item:** INTER-2

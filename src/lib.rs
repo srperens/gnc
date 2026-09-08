@@ -354,6 +354,21 @@ pub struct CodecConfig {
     pub tile_size: u32,
     pub quantization_step: f32,
     pub dead_zone: f32,
+    /// Dead zone for a frame that **other frames predict from** — an I-frame inside a P-chain.
+    ///
+    /// INTRA-2: the dead zone is worth **BD-rate −3.3% to −7.0% on stills at q=85..95** (mean
+    /// −5.0%), and on a P-chain it is a bad trade by construction. At ki=9 an I-frame is one
+    /// frame in sixteen, so its rate saving is diluted to 0.05–0.33% of the sequence, while
+    /// worst-frame PSNR — the metric a contribution codec is judged on — is *fully* exposed to
+    /// it, because the worst frame **is** the I-frame. Measured on three sequences: −0.19 dB of
+    /// worst-frame for −0.33% of rate at q=90, scaling with the dead zone (−0.01 dB at 0.52,
+    /// −0.05 at 0.55, −0.19 at 0.60) and **0.00 dB at q=85**, where today's value is already 0.5
+    /// and the step is small.
+    ///
+    /// A referenced I-frame has to be *better* than its own rate suggests, not worse, because its
+    /// error propagates down the chain. Same reasoning and same place as PAD-1's
+    /// `pad_fill_decay` (decision `0039`), reached independently.
+    pub dead_zone_referenced: f32,
     pub wavelet_levels: u32,
     /// Wavelet levels asked for, before any tile-size ceiling was applied.
     ///
@@ -574,6 +589,7 @@ impl CodecConfig {
                     cfg.dead_zone
                 );
                 cfg.dead_zone = 0.0;
+                cfg.dead_zone_referenced = 0.0;
             }
         }
         cfg
@@ -586,6 +602,7 @@ impl Default for CodecConfig {
             tile_size: 256,
             quantization_step: 4.0,
             dead_zone: 0.0,
+            dead_zone_referenced: 0.0,
             wavelet_levels: 3,
             requested_wavelet_levels: 0,
             subband_weights: SubbandWeights::uniform(3),
@@ -991,10 +1008,11 @@ pub fn quality_preset(q: u32) -> CodecConfig {
     // Log-interpolate qstep for perceptually uniform spacing
     let qstep = (lo.qstep.ln() + t * (hi.qstep.ln() - lo.qstep.ln())).exp();
     // Linear-interpolate dead zone
+    let dead_zone_ladder = lo.dead_zone + t * (hi.dead_zone - lo.dead_zone);
     let dead_zone = std::env::var("GNC_DEAD_ZONE")
         .ok()
         .and_then(|s| s.parse::<f32>().ok())
-        .unwrap_or(lo.dead_zone + t * (hi.dead_zone - lo.dead_zone));
+        .unwrap_or(dead_zone_ladder);
 
     // Discrete settings: use lower-quality anchor until midpoint
     let disc = if t < 0.5 { lo } else { hi };
@@ -1098,9 +1116,33 @@ pub fn quality_preset(q: u32) -> CodecConfig {
         } else {
             1.2
         });
+    // INTRA-2: the dead zone GNC ships is a no-op in its own operating range — the quantiser is
+    // `floor(|v|/step + 0.5)` after a `|v| < dead_zone*step` test, so anything <= 0.5 changes
+    // nothing, and the ladder interpolates 0.5 at q=85 down to 0.0 at q>=96. Raising it to 0.6 is
+    // worth **BD-rate −5.0% on four stills over q=85..95** (−3.3% to −7.0%).
+    //
+    // The floor is applied only over the range it was measured in. Above q=95 RATE-2 codes both
+    // ways and keeps the smaller, and three of four stills go bit-exact there, so the lever is
+    // mostly inert and there is no data; at q=100 a dead zone would defeat bit-exact lossless
+    // outright (BUG-30). Below q=85 the interpolated value is already above 0.5 and active.
+    //
+    // The floor belongs to the *preset*, so `GNC_DEAD_ZONE` still overrides it in both directions.
+    // Applying it after the override made the knob unable to set anything below 0.6 in this range,
+    // which would have silently disarmed the one control BUG-30 exists to keep honest.
+    const INTRA_DEAD_ZONE_FLOOR: f32 = 0.6;
+    let dead_zone_intra = if std::env::var("GNC_DEAD_ZONE").is_ok() {
+        dead_zone
+    } else if (85..=95).contains(&q) {
+        dead_zone_ladder.max(INTRA_DEAD_ZONE_FLOOR)
+    } else {
+        dead_zone_ladder
+    };
     let mut cfg = CodecConfig {
         quantization_step: qstep,
-        dead_zone,
+        dead_zone: dead_zone_intra,
+        // What a referenced I-frame and the inter residual path use: the ladder's own value,
+        // unchanged, so raising the intra floor above cannot reach either of them.
+        dead_zone_referenced: dead_zone,
         wavelet_levels,
         subband_weights: weights,
         // CfL: use anchor's setting (disabled at q>=99 to avoid chroma artifacts near lossless).
@@ -1400,7 +1442,7 @@ pub fn decode_order(frames: &[CompressedFrame]) -> Vec<usize> {
 /// `unwrap_or` away from the divergence BUG-37 actually shipped.
 ///
 /// **It was 2.0 until 2026-09-08, and 2.0 was measurably the wrong number** (INTER-2,
-/// `docs/decisions/0041`). The rationale for doubling was that a motion-compensated residual is
+/// `docs/decisions/0043`). The rationale for doubling was that a motion-compensated residual is
 /// mostly the reference's own quantisation noise, so coding it finely spends bits on nothing a
 /// viewer asked for. That reasoning is sound and is why this is 1.0 and not 0.0 — removing the
 /// inter dead zone entirely measures **+12.48%** BD-rate on animation. Doubling simply overshot.

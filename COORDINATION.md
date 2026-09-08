@@ -445,13 +445,18 @@ each *claim* was taken against — would have caught **0 of 7**, because a claim
 measurement's commit and instance 1's difference was uncommitted anyway. COORD-4 closed on this.
 **Five of the seven are the `main`-moved-under-a-table shape**, which is the one COORD-6 went after.
 
-**Instance 7 is the one that settles the argument, because it happened *after* this section was
-consolidated onto `main`.** LOSSLESS-3 published a q=95/97/99 table against a bit-exact q=100
-column and concluded camera content is dominated from q=95 up; those lossy columns contain
-bit-exact I-frames, so BUG-47 moved every one of them and left q=100 alone. The P1 conclusion
-survives; every margin in the table is overstated. **The prose did not prevent it** — which is the
-case for a mechanism, and would have been the case for closing this class as an accepted cost of
-concurrency had no cheap mechanism existed.
+**Instance 7 happened *after* this section was consolidated onto `main`, and it was caught before
+publication — by people, not by a mechanism.** LOSSLESS-3 had a q=95/97/99 table against a
+bit-exact q=100 column concluding camera content is dominated from q=95 up; those lossy columns
+contain bit-exact I-frames, so BUG-47 moved every one of them and left q=100 alone. The RATE-4
+session flagged it, the RATE-3 session relayed it, and LOSSLESS-3's owner re-took the sweep on
+`d10e414` before shipping. **Nothing was published wrong** — and the re-take showed the stakes were
+not just a stale margin: bbb was the cell predicted to flip *toward* domination and moved the other
+way, −1.9% as filed to ±0.00% with the trigger not firing at all.
+
+So the fair reading is narrower than "the prose failed": **the class recurred, and the prose plus
+one attentive peer was enough that once.** COORD-6 ships a mechanism anyway, on price — half a
+second — as a **backstop for the peer chain, not a replacement for it**.
 
 **What the six actually say is that the rule is already written four times, by four sessions, on
 one afternoon, under four names — and that is why it keeps not being applied:**
@@ -502,8 +507,12 @@ or an explicit "no mechanism exists; this is a cost of concurrency". **It is a m
 half a second:**
 
 ```bash
-gnc fingerprint                       # codec-fingerprint v1 abf86a50  (10 configurations)
+gnc fingerprint                       # codec-fingerprint v1 700d5f8a  (10 configurations)
 ```
+
+The digest is of a tree, not of the tool: it read `abf86a50` while `0075` was being written and
+`700d5f8a` one merge later, because ENT-9 step 2 moved abac's output. **Quoting a digest dates the
+quote, which is the point.**
 
 It encodes a **pinned, versioned** 10-configuration matrix and digests the bytes, so it answers the
 only question that matters — *would this binary produce different output?* — by running the encoder
@@ -543,6 +552,10 @@ FP=$(gnc fingerprint 2>/dev/null | grep -o 'v1 [0-9a-f]*')      # a shell loop n
 ```
 
 `scripts/meas_rate4.py` and `scripts/rate4_ref_source_gate.py` do both already; copy from either.
+
+**It is a backstop, not a substitute for asking.** Instance 7 was caught by a peer noticing that a
+fix moved someone else's inputs, hours before any mechanism would have been consulted. Keep doing
+that; this just means a table that slips through still says which encoder produced it.
 
 **What it does not do, stated because a check believed past its range is worse than none.** It
 cannot say *why* two fingerprints differ. It says nothing about a path outside its matrix — the

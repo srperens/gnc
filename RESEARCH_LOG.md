@@ -26,16 +26,28 @@ survives; every margin is overstated. Found and reported by the RATE-3 session, 
 LOSSLESS-3's owner rather than edited.
 
 Tally: **5 of 7 for the `main`-moved-under-a-table shape**, against 1 of 7 for the cross-session
-shape COORD-4 refused a tool for. And it happened *after* COORDINATION's consolidated section
-landed, which cuts both ways — the best argument for a mechanism if one is cheap, and the best
-argument for closing answered-no if none is.
+shape COORD-4 refused a tool for.
+
+**And it was caught before publication — by people, not by a mechanism**, which is the less
+convenient half and the one that shapes the decision. This session noticed BUG-47 moved the
+sibling's bytes and said so, the RATE-3 session relayed it, and LOSSLESS-3's owner re-took the
+sweep on `d10e414`. Nothing was published wrong. The re-take showed the stakes were not a stale
+margin either: bbb was the cell predicted to flip *toward* domination and moved the other way, from
+−1.9% as filed to ±0.00% at all six points with the trigger not firing at all.
+
+So the honest statement is **the class recurred after the prose was consolidated, and the prose plus
+one attentive peer was sufficient that once.** The mechanism below is justified on price — half a
+second — as a **backstop**, not because the peer chain failed.
 
 ### The mechanism, and the measurement that says it is the right one
 
 ```
 $ gnc fingerprint
-codec-fingerprint v1 abf86a50  (10 configurations)
+codec-fingerprint v1 700d5f8a  (10 configurations)
 ```
+
+(`abf86a50` while this was written, `700d5f8a` one merge later — ENT-9 step 2 moved abac's output.
+Quoting a digest dates the quote, which is the point.)
 
 A pinned, versioned matrix of ten configurations — Rice/rANS/abac, 4:4:4 and 4:2:0, q=10/50/90/99/100,
 stills and 3-frame sequences at ki=2 — encoded and digested. **0.52 s**, against the minutes a real
@@ -75,10 +87,23 @@ reading; the pessimistic one is that none of it fires unless a number carries th
   process and compares every row.
 - **Every row must be a distinct sample.** The first input generator was hash noise, on which the
   bit-exact candidate wins every frame — so the **q=99 and q=100 sequence rows coded to identical
-  bytes** and one of the ten configurations was measuring what another already had. Content is now
-  smooth-plus-texture and the test fails if any two rows collide. It is integer-valued because
-  BUG-45: a fractional source makes a lossless configuration quietly lossy, and a fingerprint whose
-  lossless rows were secretly lossy would be measuring that instead.
+  bytes** and one of the ten configurations was measuring what another already had. The test fails
+  on a row collision, and **it fired again on the very next merge**: those two rows had differed on
+  the tree the matrix was written on and were identical one merge later. That is the assertion
+  earning its keep before the tool shipped.
+- **A "sequence" row must contain a P-frame, and a byte count cannot show that it does.** The input
+  frames were three different pictures, which fired the scene-cut detector every frame: both
+  sequence rows were **all-intra**, testing no inter path — and at q=99 every I-frame then keeps
+  the bit-exact sibling, which *is* `quality_preset(100)`, so those two rows were byte-identical for
+  a reason unrelated to either configuration. The input is now **one scene panned 3 px per frame**,
+  every row prints its composition (`2I+1P+0B`), and the test asserts at least three sequence rows
+  contain a P. `seq q100 ki9` reports `3I+0P` **on purpose** — LOSSLESS-2 re-codes a lossless
+  P-frame costing more than the previous I — and that is asserted separately, so the row is
+  coverage rather than an accident.
+
+  The content is integer-valued because BUG-45: a fractional source makes a lossless configuration
+  quietly lossy, and a fingerprint whose lossless rows were secretly lossy would measure that
+  instead.
 
 **Not made mandatory**, and deliberately: nothing enforces it and nothing should yet. The matrix's
 coverage is unproven outside the four knobs above, and a mandatory check believed past its range is

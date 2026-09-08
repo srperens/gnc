@@ -43,6 +43,10 @@ pub struct Row {
     pub name: &'static str,
     pub bytes: usize,
     pub crc: u32,
+    /// Frame composition, e.g. `2I+1P`. The matrix's own canary: a "sequence" row that reports
+    /// `3I+0P` is testing no inter path, and the first version of the input generator did exactly
+    /// that — the frames differed enough to fire the scene-cut detector every frame.
+    pub composition: String,
 }
 
 /// The compound digest and the rows it was built from.
@@ -76,31 +80,48 @@ fn matrix() -> [Case; 10] {
         Case { name: "seq   q90 rice 444",  q: 90,  chroma: Yuv444, coder: Rice, frames: 3, ki: 2 },
         Case { name: "seq   q90 rice 420",  q: 90,  chroma: Yuv420, coder: Rice, frames: 3, ki: 2 },
         Case { name: "seq   q99 rice 444",  q: 99,  chroma: Yuv444, coder: Rice, frames: 3, ki: 2 },
-        Case { name: "seq  q100 rice 444",  q: 100, chroma: Yuv444, coder: Rice, frames: 3, ki: 2 },
+        // ki=9, not 2, and the reason is recorded because the assertion below found it: on the
+        // tree this matrix was written, q=99 ki=2 and q=100 ki=2 coded to *different* bytes on
+        // this content, and one merge later they were identical -- the q=99 fallback had started
+        // keeping the bit-exact candidate on every frame. Content luck is not a distinct sample.
+        // ki=9 differs structurally (one GOP of I+P+P against I,P,I) and no encoder change can
+        // collapse it, and it is the matrix's only long-GOP row.
+        Case { name: "seq  q100 rice 444 ki9", q: 100, chroma: Yuv444, coder: Rice, frames: 3, ki: 9 },
     ]
 }
 
 const W: u32 = 384;
 const H: u32 = 384;
 
-/// Smooth-plus-texture, generated here rather than loaded.
+/// One scene, panned by `dx` pixels. Generated here rather than loaded.
 ///
-/// Generated because a fingerprint that depends on `test_material/` is not portable between
-/// machines. Integer-valued because BUG-45: a fractional source makes a lossless configuration
-/// quietly lossy, so a fractional fingerprint would be measuring that instead. Smooth rather than
-/// hash noise because on pure noise the bit-exact candidate wins every frame — the q=99 and q=100
-/// sequence rows then coded to identical bytes and one of the ten configurations measured nothing.
-fn frame(seed: u32) -> Vec<f32> {
+/// Three properties, and each one was arrived at by the matrix failing without it:
+///
+/// * **Generated**, because a fingerprint that depends on `test_material/` is not portable between
+///   machines, and this one has to be comparable across them.
+/// * **Integer-valued**, because BUG-45: a fractional source makes a lossless configuration quietly
+///   lossy, so a fractional fingerprint's lossless rows would be measuring that instead.
+/// * **Smooth-plus-texture rather than hash noise.** On pure noise the bit-exact candidate wins
+///   every frame, and the q=99 and q=100 sequence rows coded to identical bytes.
+///
+/// **And a pan rather than three unrelated pictures**, which is the one that mattered most. The
+/// first version varied the content between frames, and that fired the scene-cut detector on every
+/// frame: both sequence arms became all-intra, so the "sequence" rows tested no inter path at all
+/// — and at q=99 every I-frame then kept the bit-exact sibling, which *is* `quality_preset(100)`,
+/// so the q=99 and q=100 rows were byte-identical for a reason that had nothing to do with either.
+/// A pan is what a sequence looks like, and it keeps the P-frames P-frames.
+fn frame(dx: u32) -> Vec<f32> {
     let mut out = Vec::with_capacity((W * H * 3) as usize);
     for y in 0..H {
         for x in 0..W {
+            let sx = (x + dx) % W;
             let jitter = |k: u32| {
-                let v = (x * 7 + y * 13 + k * 101 + seed * 31).wrapping_mul(2_654_435_761);
+                let v = (sx * 7 + y * 13 + k * 101).wrapping_mul(2_654_435_761);
                 ((v >> 27) & 7) as i32
             };
             let px = [
-                (x + y + seed) as i32 / 2 + jitter(0),
-                (x * 2 + seed * 3) as i32 / 3 + jitter(1),
+                (sx + y) as i32 / 2 + jitter(0),
+                (sx * 2) as i32 / 3 + jitter(1),
                 (y * 3) as i32 / 2 + jitter(2),
             ];
             for c in px {
@@ -114,7 +135,8 @@ fn frame(seed: u32) -> Vec<f32> {
 /// Encode the pinned matrix and digest what came out.
 #[must_use]
 pub fn compute(ctx: &GpuContext) -> Fingerprint {
-    let (f0, f1, f2) = (frame(0), frame(7), frame(19));
+    // A 3-pixel pan per frame: full-pel, so motion estimation can actually find it.
+    let (f0, f1, f2) = (frame(0), frame(3), frame(6));
     let mut digest_input: Vec<u8> = MATRIX_VERSION.as_bytes().to_vec();
     let mut rows = Vec::new();
     for case in matrix() {
@@ -126,19 +148,27 @@ pub fn compute(ctx: &GpuContext) -> Fingerprint {
         };
         config.set_tile_size(256);
         let mut encoder = crate::encoder::pipeline::EncoderPipeline::new(ctx);
-        let bytes = if case.frames == 1 {
-            format::serialize_compressed(&encoder.encode(ctx, &f0, W, H, &config))
+        let (bytes, composition) = if case.frames == 1 {
+            (
+                format::serialize_compressed(&encoder.encode(ctx, &f0, W, H, &config)),
+                "1I".to_string(),
+            )
         } else {
             let refs: Vec<&[f32]> = vec![&f0, &f1, &f2];
-            format::serialize_sequence(
-                &encoder.encode_sequence(ctx, &refs, W, H, &config),
-                (30, 1),
-            )
+            let frames = encoder.encode_sequence(ctx, &refs, W, H, &config);
+            let count = |k: crate::FrameType| frames.iter().filter(|f| f.frame_type == k).count();
+            let composition = format!(
+                "{}I+{}P+{}B",
+                count(crate::FrameType::Intra),
+                count(crate::FrameType::Predicted),
+                count(crate::FrameType::Bidirectional),
+            );
+            (format::serialize_sequence(&frames, (30, 1)), composition)
         };
         let crc = format::crc32(&bytes);
         digest_input.extend_from_slice(&crc.to_le_bytes());
         digest_input.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
-        rows.push(Row { name: case.name, bytes: bytes.len(), crc });
+        rows.push(Row { name: case.name, bytes: bytes.len(), crc, composition });
     }
     Fingerprint { digest: format::crc32(&digest_input), rows }
 }
@@ -167,6 +197,31 @@ mod tests {
         for (x, y) in a.rows.iter().zip(&b.rows) {
             assert_eq!((x.name, x.crc, x.bytes), (y.name, y.crc, y.bytes));
         }
+        // At least one sequence row must actually contain a P-frame, or the matrix tests no
+        // inter path at all. The first input generator failed exactly here: its frames differed
+        // enough to fire the scene-cut detector every frame, so both "sequence" rows were stills
+        // wearing a sequence's name — and that is invisible in a byte count.
+        //
+        // Not every sequence row: `seq q100 rice 444 ki9` reports `3I+0P` on purpose, because
+        // LOSSLESS-2 re-codes a lossless P-frame as an I-frame when it costs more than the
+        // previous I, and on this content it does. That row is this matrix's coverage of that
+        // path, and its composition is the canary proving the path ran.
+        let with_p = a
+            .rows
+            .iter()
+            .filter(|r| r.name.starts_with("seq") && !r.composition.starts_with("3I+0P"))
+            .count();
+        assert!(
+            with_p >= 3,
+            "only {with_p} sequence row(s) contain a P-frame, so this matrix has almost no inter \
+             coverage — check the scene-cut detector is not firing on the panned input, and pan \
+             the same scene rather than varying it"
+        );
+        assert!(
+            a.rows.iter().any(|r| r.composition.starts_with("3I+0P")),
+            "no row exercises LOSSLESS-2's lossless P-to-I re-code any more; either that path \
+             changed or the q=100 ki=9 row stopped reaching it"
+        );
         let mut seen = std::collections::HashMap::new();
         for row in &a.rows {
             if let Some(prev) = seen.insert(row.crc, row.name) {

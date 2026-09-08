@@ -3075,13 +3075,20 @@ already; a bare shell loop needs no helper and COORDINATION shows the two lines.
   harness.
 - *"the measurement is usually a shell loop"* — one `grep -o 'v1 [0-9a-f]*'` before and after.
 
-**A seventh instance arrived while this sat in the queue, and it is the one that settles the
-argument** because it happened *after* COORD-4's prose was consolidated onto `main`: LOSSLESS-3's
-lossy columns (`0070`) hold bit-exact I-frames, which BUG-47 (`0072`) moved by ~1.8 points hours
-later while its q=100 column stayed put. Its P1 conclusion survives; every margin is overstated.
-Filed by the RATE-3 session and flagged to LOSSLESS-3's owner rather than edited. The tally is now
-**5 of 7 for the `main`-moved-under-a-table shape** against 1 of 7 for the cross-session shape
-COORD-4 refused a tool for.
+**A seventh instance arrived while this sat in the queue**, after COORD-4's prose was consolidated
+onto `main`: LOSSLESS-3's lossy columns (`0070`) hold bit-exact I-frames, which BUG-47 (`0072`)
+moved by ~1.8 points hours later while its q=100 column stayed put. The tally is now **5 of 7 for
+the `main`-moved-under-a-table shape** against 1 of 7 for the cross-session shape COORD-4 refused a
+tool for.
+
+**It was caught before publication, by people rather than by a mechanism, and that is the half that
+shapes this answer.** The RATE-4 session noticed BUG-47 moved the sibling's bytes, the RATE-3
+session relayed it, and LOSSLESS-3's owner re-took the sweep on `d10e414` — nothing was published
+wrong, and the re-take showed the stakes were not a stale margin: bbb was the cell predicted to flip
+*toward* domination and moved the other way, −1.9% as filed to ±0.00% with the trigger not firing.
+So: **the class recurred, and the prose plus one attentive peer was enough that once.** The
+mechanism ships on price — half a second — as a **backstop for that chain, not a replacement for
+it**, and the case for closing answered-no was real rather than a straw man.
 
 **What it does not do**, because a check believed past its range is worse than none: it cannot say
 *why* two fingerprints differ; it says nothing about a path outside its matrix (entropy coder,

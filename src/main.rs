@@ -1170,7 +1170,10 @@ fn main() {
             let fp = gnc::fingerprint::compute(&ctx);
             if verbose {
                 for row in &fp.rows {
-                    println!("  {:<20} {:>9} B  {:08x}", row.name, row.bytes, row.crc);
+                    println!(
+                        "  {:<24} {:>9} B  {:08x}  {}",
+                        row.name, row.bytes, row.crc, row.composition
+                    );
                 }
             }
             println!(

@@ -22,10 +22,20 @@ them by roughly 1.8 points hours later while the q=100 column stayed put, becaus
 sibling at q=100. Its P1 conclusion survives; every margin in the published table is overstated.
 
 That puts the tally at **5 of 7 for one shape** — a correct measurement decaying because `main`
-moved under it — against 1 of 7 for the cross-session shape COORD-4 refused a tool for. And it
-demonstrates that the prose does not prevent the class, which cuts both ways: it is the strongest
-argument for a mechanism *if* a cheap one exists, and the strongest argument for closing
-answered-no if none does.
+moved under it — against 1 of 7 for the cross-session shape COORD-4 refused a tool for.
+
+**And instance 7 was caught before publication, which is the honest and less convenient version of
+it.** Not by a mechanism: by a chain of people. This session noticed BUG-47 moved the sibling's
+bytes and said so; the RATE-3 session relayed it; LOSSLESS-3's owner re-took the sweep on `d10e414`
+and shipped corrected numbers. **Nothing was published wrong.** The re-take also showed the stakes
+were not merely a stale margin — bbb was the cell predicted to flip *toward* domination and it moved
+the opposite way, from −1.9% as filed to ±0.00% at all six points with the trigger not firing at
+all. A row pointing the wrong direction, caught, but not trivially.
+
+So the fair statement is: **the class recurred after the prose was consolidated, and the prose plus
+one attentive peer was sufficient that once.** Whether that generalises across eight sessions is
+exactly what this item had to decide, and it is why the decision below rests on the mechanism's
+*price* rather than on the prose having failed.
 
 ## The decision
 
@@ -34,8 +44,12 @@ resulting bytes:
 
 ```
 $ gnc fingerprint
-codec-fingerprint v1 abf86a50  (10 configurations)
+codec-fingerprint v1 700d5f8a  (10 configurations)
 ```
+
+The digest in that line is of a tree, not of the tool: it read `abf86a50` while this was being
+written and `700d5f8a` one merge later, because ENT-9 step 2 moved abac's output. **Quoting a
+digest anywhere therefore dates the quote, which is the point.**
 
 **Two numbers carrying the same fingerprint are comparable; two carrying different ones are not.**
 It answers the only question that matters — *would this binary produce different output?* — by
@@ -93,10 +107,12 @@ carries the token.
   it covers.
 - **Hashing the binary** — see above. Over-warns to the point of being ignored, and this session
   produced the demonstrating pair while building the alternative.
-- **Closing answered-no.** That was the live option and instance 7 is its best argument: prose had
-  just been consolidated and did not prevent it. It is refused because the mechanism turned out to
-  cost half a second, which is below the threshold at which "accepted cost of concurrency" is an
-  honest description.
+- **Closing answered-no.** That was the live option, and instance 7 argues for it more than
+  against: the prose plus an attentive peer caught that one *before publication*. It is refused on
+  price rather than on the prose failing — half a second is below the threshold at which "accepted
+  cost of concurrency" is an honest description of anything, and a backstop that costs that little
+  does not have to out-perform a person to be worth having. **It is a backstop, not a replacement
+  for the peer chain that actually caught instance 7.**
 - **Making the check mandatory** — a hook, or a `claim` refusal. Nothing enforces it and nothing
   should yet: the matrix's coverage is unproven outside the four knobs above, and a mandatory check
   believed past its range is worse than an optional one read with judgement.
@@ -117,14 +133,35 @@ carries the token.
   and mostly redundant instrument, since a moved decoder that still decodes the same bytes to the
   same pixels is not what makes two tables incomparable.
 
-## Two things the implementation had to get right, recorded because both were wrong first
+## Adjacent, and not this record's: BUG-48
+
+`gnc-next3` filed **BUG-48** off the back of `0072`: `quality_preset(100)` keeps PAD-1's decay fill,
+measured at a 0.66–0.78% loss at q=100. Same family as BUG-47 — a padding lever applied where the
+frame is a reference — and a different config, so it is a separate fix. (Its filing credits `0072`
+to the RATE-3 session; the record is this one's, and that has been corrected between the two
+sessions rather than in their entry.)
+
+## Three things the implementation had to get right, recorded because all three were wrong first
 
 - **Determinism is the whole product.** Asserted, not assumed:
   `fingerprint_is_deterministic_and_every_row_is_a_distinct_sample` runs the matrix twice in one
   process and compares every row.
 - **Every row must be a distinct sample.** The first input generator was hash noise, on which the
   bit-exact candidate wins every frame — so the q=99 and q=100 sequence rows coded to *identical
-  bytes* and one of the ten configurations was measuring what another already had. The content is
-  now smooth-plus-texture, and the test fails if any two rows collide. It is also integer-valued,
-  because BUG-45: a fractional source makes a lossless configuration quietly lossy, and a
-  fingerprint whose lossless rows are secretly lossy would be measuring that instead.
+  bytes* and one of the ten configurations was measuring what another already had. The test now
+  fails if any two rows collide, and **it fired again on the next merge**, which is the best
+  evidence available that the assertion is not decoration: q=99 and q=100 had differed on the tree
+  the matrix was written on and were identical one merge later.
+- **A "sequence" row has to contain a P-frame, and byte counts cannot show that it does.** The
+  input frames were three different pictures, which fired the scene-cut detector on every frame:
+  both sequence rows were all-intra, testing no inter path, and at q=99 every I-frame then kept the
+  bit-exact sibling — which *is* `quality_preset(100)` — so those rows were byte-identical for a
+  reason unrelated to either configuration. The input is now **one scene panned 3 px per frame**,
+  every row reports its composition (`2I+1P+0B`), and the test asserts at least three sequence rows
+  contain a P. The `seq q100 ki9` row reports `3I+0P` **on purpose** — LOSSLESS-2 re-codes a
+  lossless P-frame that costs more than the previous I, and that row is the matrix's coverage of
+  it, asserted separately.
+
+  It is also integer-valued, because BUG-45: a fractional source makes a lossless configuration
+  quietly lossy, and a fingerprint whose lossless rows were secretly lossy would be measuring that
+  instead.

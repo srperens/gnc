@@ -4654,16 +4654,106 @@ peer's number is not the same as reading their tree.
 frame's reference is *not* simply its colour-converted source, because that buffer is at a
 different stage and scale. RATE-4 records the refutation.
 
-### LOSSLESS-3 — above q=95 a camera sequence costs more than bit-exact lossless, for worse pixels (todo, **P1**)
+### BUG-46 — `lossless_sibling` does not carry the caller's chroma format, so RATE-2 compares 4:2:0 against 4:4:4 (todo, **P3**)
+
+Found 2026-09-08 by LOSSLESS-3. `lossless_sibling` builds from `quality_preset(100)`, which is
+4:4:4, and copies `entropy_coder`, `gpu_entropy_encode`, the abac knobs, `tile_size` and (since
+BUG-47) `pad_fill_decay` — but **not `chroma_format`**. Measured on bbb_1080p at q=97, the RATE-2
+canary reports the same bit-exact candidate either way:
+
+```
+--chroma-format 444:  lossy 2 843 371 B vs bit-exact 3 257 157 B (+14.55%), keeping the lossy one
+--chroma-format 420:  lossy 1 660 019 B vs bit-exact 3 257 157 B (+96.21%), keeping the lossy one
+```
+
+**3 257 157 B in both rows.** So on subsampled input RATE-2 compares a 4:2:0 wavelet encode against
+a **4:4:4** lossless one — three times the chroma samples — and the fallback can essentially never
+fire. Two consequences: the q=95..99 win RATE-2 exists to collect is unreachable at 4:2:0 and
+4:2:2, and if the candidate ever did win the output would silently carry a chroma format the caller
+did not ask for.
+
+**The apples-to-apples comparison is a lossless encode in the requested format** — exact in the
+coded (subsampled) domain, which is what the caller asked for by choosing 4:2:0, and the same
+two-axis win RATE-2 relies on: fewer bytes *and* exact coded samples.
+
+**Why it is P3 rather than a one-line fix.** The line is `out.chroma_format = cfg.chroma_format;`,
+but it turns the fallback on for a whole class of input that has never been measured, and RATE-2's
+decision (`0036`) is stated over 4:4:4 stills. It needs the still sweep re-run at 4:2:2 and 4:2:0
+before the default moves. **LOSSLESS-3 is gated to 4:4:4 for this reason** and the gate comes off
+here.
+
+### BUG-48 — `quality_preset(100)` keeps PAD-1's decay padding fill, which is a loss at q=100 (todo, **P3**)
+
+Found 2026-09-08 by LOSSLESS-3, measured on two stills against `GNC_PAD_FILL=replicate`:
+
+| still | decay (shipped) | replicate | |
+|---|---|---|---|
+| crowd_run frame 0 | 3 240 148 | 3 214 874 | **−0.78%** |
+| bbb frame 0 | 3 257 157 | 3 235 737 | **−0.66%** |
+
+PAD-1 (`0039`) measured the decay fill at **−4.63% RGB on stills over q=80..94** and the preset
+applies it at every q. At q=100 the transform is MED, not the wavelet, and a fill that fades to a
+flat value is *worse* to predict across than plain edge replication — the residual at the picture
+edge has to code the fade. So the lever reverses sign at the top of the range, where it was never
+measured.
+
+**Small, and it compounds:** every bit-exact still, and every bit-exact candidate RATE-2 codes, is
+0.7% larger than it needs to be. LOSSLESS-3's own arm clears the flag for this reason
+(`sequence.rs`, and it says so with these numbers).
+
+**What to measure before changing the preset:** the same four stills PAD-1 used, at q=100 and at
+q=95..99 through the RATE-2 candidate, plus the sequence path (which already clears the flag for
+referenced I-frames, so it should not move). The fix is one line in `quality_preset`; the number
+that justifies it is a four-image sweep, not these two.
+
+### LOSSLESS-3 — above q=95 a camera sequence costs more than bit-exact lossless, for worse pixels (**DONE 2026-09-08**)
+
+**SHIPPED 2026-09-08: at q = 95..=99, 4:4:4, no bitrate target, a sequence is emitted bit-exact
+when that is smaller — camera content −5.95% to −33.58% at exact pixels, animation ±0.00% on all
+six points.** Decision `0073`. Harness `scripts/meas_lossless3_ladder.py`, tests in
+`tests/lossless_intra_fallback.rs`.
 
 Filed 2026-09-08 by LOSSLESS-2, which is what exposed it: `q=100` on crowd_run went from 43.0 MB
-to 25.9 MB, and the lossy ladder above it did not move. 8 frames, ki=9, 4:4:4, container bytes:
+to 25.9 MB, and the lossy ladder above it did not move. 8 frames, ki=9, 4:4:4, container bytes,
+**re-taken on `d10e414` after BUG-47 (`0072`) moved exactly these columns** — the first take was
+1-3 points higher and its bbb row pointed the other way:
 
-| sequence | q=95 | q=97 | q=99 | q=100 (bit-exact) | q=99 costs |
+| sequence | q=95 | q=97 | q=99 | bit-exact | q=99 costs |
 |---|---|---|---|---|---|
-| crowd_run | 31 697 550 | 34 672 332 | 38 326 055 | **25 856 146** | **+48.2%** |
-| old_town_cross | 31 669 932 | 34 646 281 | 38 297 084 | **25 247 023** | **+51.7%** |
-| bbb (animation) | 17 896 639 | 20 924 647 | 24 708 560 | 25 183 470 | −1.9% |
+| crowd_run | 31 427 614 | 34 374 105 | 37 984 009 | **25 856 146** | **+46.9%** |
+| old_town_cross | 31 440 634 | 34 391 448 | 38 010 958 | **25 247 023** | **+50.5%** |
+| blue_sky | 19 231 299 | 21 659 527 | 24 812 142 | **17 294 725** | **+43.5%** |
+| bbb (animation) | 17 896 639 | 20 924 647 | 24 290 268 | 25 885 896 (est.) | −6.2% |
+
+**What shipped, all 24 points, never larger and no frame worse:**
+
+| sequence | ki=2 (q=95/97/99) | ki=9 (q=95/97/99) |
+|---|---|---|
+| crowd_run | −10.81% / −15.68% / −20.96% | −17.73% / −24.78% / **−31.93%** |
+| old_town_cross | −12.04% / −16.90% / −22.15% | −19.70% / −26.59% / **−33.58%** |
+| blue_sky | −5.95% / −12.67% / −19.97% | −10.07% / −20.15% / **−30.30%** |
+| bbb | ±0.00% | ±0.00% |
+
+Every switched point is **bit-exact, 8 of 8 frames md5-identical to source** through the container,
+and the switched file is **byte-identical to the `q=100` encode** of the same frames on all three
+camera sequences. q≤94, q=100, subsampled chroma and every still are byte-identical with the
+feature on and off.
+
+**The finding that shaped it: a per-frame rule is a ratchet.** The per-frame version was built
+first — it is what LOSSLESS-2 does — and measured 22 of 24 points better with **bbb q=99 ki=9
+5.51% larger**, failing the success criterion below. Cause: a P-frame costs **more** against a
+bit-exact reference than against a lossy P-frame reconstruction — **+4.86% / +4.51% / +5.10% /
++9.86%** on crowd_run / old_town_cross / blue_sky / bbb, four of four — so each swap inflates the
+next frame's candidate and every greedy step makes the next likelier. Reverted, not tuned. Whole
+arms have no such coupling, and the decision is taken on two measured totals with the estimate used
+only to decide whether the second arm is worth coding.
+
+**Two bugs found on the way, filed not folded in:** **BUG-46** (`lossless_sibling` drops the
+caller's chroma format, so the comparison on subsampled input is against a 4:4:4 arm — which is why
+this ships 4:4:4-only) and **BUG-48** (`quality_preset(100)` keeps PAD-1's decay padding fill,
++0.78% / +0.66% against replicate on two stills at q=100; PAD-1's gate was q=80..94).
+
+**The original filing follows.**
 
 On camera content **every rung from q=95 up is dominated**: more bytes than bit-exact lossless for
 pixels that are not exact. q=95 is already +22.6% (crowd_run) and +25.4% (old_town_cross).

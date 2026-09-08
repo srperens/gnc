@@ -231,6 +231,23 @@ up to **+69% for identical pixels**. `GNC_LOSSLESS_INTRA_RECODE=0` reproduces th
 Animation keeps its P-frames and its rows are unchanged. **No fps is quoted: eight sessions shared
 the GPU.**
 
+## Lossless sequences at q = 95..=99 (8 frames, 4:4:4, Rice)
+
+New section 2026-09-08 (LOSSLESS-3, `0073`). Above q≈95 a camera sequence is emitted **bit-exact**
+when that is smaller, so these rows are the same files as the q=100 rows above — byte-identical on
+all three camera sequences, which is the regression check:
+
+| sequence | q=95 | q=97 | q=99 | what it was |
+|---|---|---|---|---|
+| crowd_run (ki=9) | 25 856 146 | 25 856 146 | 25 856 146 | 31 427 614 / 34 374 105 / 37 984 009 |
+| old_town_cross (ki=9) | 25 247 023 | 25 247 023 | 25 247 023 | 31 440 634 / 34 391 448 / 38 010 958 |
+| blue_sky (ki=9) | 17 294 725 | 17 294 725 | 17 294 725 | 19 231 299 / 21 659 527 / 24 812 142 |
+| bbb (ki=9, animation) | 17 896 639 | 20 924 647 | 24 290 268 | unchanged — the fallback does not fire |
+
+−10.07% to −33.58% at ki=9 and −5.95% to −22.15% at ki=2, at *exact* pixels rather than 53-61 dB.
+`GNC_LOSSLESS_SEQUENCE_FALLBACK=0` reproduces the old column. 4:4:4 only until BUG-46; refused when
+a bitrate target is set. **No fps is quoted: eight sessions shared the GPU.**
+
 ## Reported bitrate correction (2026-09-05)
 
 `CompressedFrame::byte_size()` counted motion vectors as 4 raw bytes per block while the

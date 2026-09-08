@@ -717,6 +717,26 @@ pub const MIN_TILE_SIZE: u32 = 16;
 /// for it today.
 pub const MAX_TILE_SIZE: u32 = 512;
 
+/// Why no tile size makes the padding go away, and what choosing one would cost.
+///
+/// The tile grid pads every plane up to a whole multiple of `tile_size`, so a 1920x1080 frame is
+/// coded as 2048x1280 and 20.9% of the coded samples land outside the picture (PAD-1, `0039`).
+/// The obvious escape is a tile size that divides the frame exactly, and one exists for each
+/// common resolution — `gcd(W, H)`, i.e. **120 at 1080p, 80 at 720p, 240 at 2160p**.
+///
+/// **None of them can carry five wavelet levels**, because a tile must be divisible by
+/// `2^levels`, and **no multiple of 32 divides 1080, 720 or 2160 at all**: broadcast heights are
+/// not power-of-two friendly (1080 = 8 x 135, 720 = 16 x 45, 2160 = 16 x 135), so the factors of
+/// two run out after three or four. The choice is therefore a deep wavelet with padding against a
+/// shallow one without, and it is not close — measured on bbb_1080p at q=90 with `--abac`, tile
+/// 120 at three levels costs **+81% of rate** against tile 256 at five levels, for the same PSNR.
+///
+/// So the padding stays, and the way out is not a tile size: it is **partial border tiles**, the
+/// way JPEG 2000 has them, which decouple tile size from frame size and allow both. That is an
+/// architecture change (tile origins, the tile grid, every shader deriving a position from
+/// `tile_size`, the per-tile CRC and seek structures) and it is unfiled; the +81% above is what
+/// says it would be worth scoping.
+
 /// Which fill goes into the tile-alignment padding (PAD-1, decision `0039`).
 ///
 /// GNC pads every plane up to a whole multiple of `tile_size` and codes the padded plane, so a

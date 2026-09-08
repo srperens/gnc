@@ -124,6 +124,37 @@ forced-on arm is expected to regress** and is retained as the guard on this deci
 stops regressing, the inter half is worth re-opening. The default arm must read +0.00% rate and
 +0.000 dB, which is the assertion that the policy holds.
 
+### Asked afterwards: why not a tile size that divides the frame?
+
+Fair question, and `0034` had only the arithmetic. The answer is a measurement.
+
+Such a size exists for every common resolution — it is `gcd(W, H)` clamped to
+`[MIN_TILE_SIZE, MAX_TILE_SIZE]`: **120 at 1080p** (16x9 tiles, zero padding), **80 at 720p**,
+**240 at 2160p**. But a tile must be divisible by `2^levels`, and **no tile size divisible by 32
+divides 1080, 720 or 2160 at all**, so none of them can carry five levels. The root cause is not
+GNC's: broadcast heights are not power-of-two friendly. 1080 = 8 x 135, 720 = 16 x 45,
+2160 = 16 x 135 — three or four factors of two and then an odd factor.
+
+So the real choice is a deep wavelet with padding against a shallow one without. bbb_1080p, q=90,
+`--abac`:
+
+| | padding | levels | bytes | RGB PSNR |
+|---|---|---|---|---|
+| tile 256, the default | 20.9% | 5 | **1 689 447** | 50.062 dB |
+| tile 120, zero padding | **0%** | 3 | 3 056 603 | 50.036 dB |
+
+**Zero padding costs +81% of rate** — about twelve times the wrong direction against padding's 6.6
+points, so the shipped choice is right by a wide margin and now for a stated reason rather than by
+default. Indicative rather than a BD-rate: one image, one q, and it mixes two effects, since tile
+120 also means 144 tiles instead of 40 and therefore more per-tile overhead and more of ENT-6's
+code-block cold start. The margin is far too large for either to move the conclusion.
+
+**What the question actually exposes is that having to choose is the defect.** Partial border tiles
+— JPEG 2000's answer — decouple tile size from frame size and give five levels *and* zero padding.
+That is the whole 6.6 points rather than the 4.6 shipped here, it is an architecture change, and
+the +81% above is what says it would be worth scoping. Recorded next to `MAX_TILE_SIZE`, which is
+where someone wondering about tile sizes lands.
+
 ### Failures and dead ends
 
 - **`blue_sky` and `bbb` cannot carry this gate at all** — 8 PNG frames each, against ki=9. My

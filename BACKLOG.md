@@ -4737,6 +4737,18 @@ concentrated on one clip. If it is edge blocks with outward motion vectors speci
 clamping MC's reads to the *visible* bounds instead of the padded ones is a much smaller change
 than a bitstream version — and it is a question about `motion_compensate.wgsl`, not about padding.
 
+**And the bigger prize behind both of these is partial border tiles, which is now priced from the
+other side.** "Why not just use a tile size that divides the frame?" is the obvious question, and
+it has a measured answer as of 2026-09-08 (`0039`): such a size exists — `gcd(W, H)` is 120 for
+1080p, 80 for 720p, 240 for 2160p — but **no tile size divisible by 32 divides 1080, 720 or 2160**,
+so none of them can carry five wavelet levels. Broadcast heights are not power-of-two friendly
+(1080 = 8 x 135). Measured on bbb_1080p at q=90: tile 120 with zero padding and three levels costs
+**+81% of rate** against tile 256 with 20.9% padding and five levels. So the padding is by far the
+cheaper evil, and **having to choose at all is the defect** — partial border tiles the way JPEG
+2000 has them decouple tile size from frame size and give both. That is a bigger item than PAD-2
+and should be filed separately when someone is ready to scope it; the number above is what
+justifies scoping it.
+
 **The original filing** — the pre-shipping version of PAD-1, with the three candidate shapes and
 the oracle figure of −4.5% — is superseded by the two decision records that came out of it
 (`0034` for the measurement, `0039` for the decision) and is in git history. It is not reproduced

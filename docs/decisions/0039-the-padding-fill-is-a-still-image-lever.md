@@ -111,9 +111,42 @@ the raw input buffer. Five chances of a silent per-path bug, to buy 0.19 points.
   needing versioning; that was right about this variant and wrong to imply the still-path fill
   needed it, since **`pad.wgsl` is compiled only in `src/encoder/pipeline.rs`** and the decoder
   reconstructs whatever was coded.
+- **A tile size that divides the frame exactly, so there is no padding to fill.** The obvious
+  question, and the answer is a measurement rather than the arithmetic `0034` stopped at. Such a
+  size does exist for each common resolution — it is `gcd(W, H)`, constrained to
+  `[MIN_TILE_SIZE, MAX_TILE_SIZE]`:
+
+  | resolution | divides both exactly | clean halvings, so max levels |
+  |---|---|---|
+  | 1920x1080 | **120** | 3 |
+  | 1280x720 | **80** | 4 |
+  | 3840x2160 | 80, 120, **240** | 4 |
+
+  **But none of them can carry five levels, and no tile size divisible by 32 divides 1080, 720 or
+  2160 at all.** The root cause is not GNC: broadcast heights are not power-of-two friendly.
+  1080 = 8 x 135, 720 = 16 x 45, 2160 = 16 x 135 — the factors of two run out after three or four
+  and an odd factor is left. So the choice is genuinely between a deep wavelet with padding and a
+  shallow one without.
+
+  Measured on bbb_1080p at q=90 with `--abac`, which nobody had done:
+
+  | | padding | levels | bytes | RGB PSNR |
+  |---|---|---|---|---|
+  | tile 256 (default) | 20.9% | 5 | **1 689 447** | 50.062 dB |
+  | tile 120 (zero padding) | **0%** | 3 | 3 056 603 | 50.036 dB |
+
+  **Zero padding costs +81% of rate.** Against padding's 6.6 points that is about twelve times the
+  wrong direction, so the existing choice is right by a wide margin — and now for a stated reason.
+  Two caveats kept because the figure is indicative rather than a BD-rate: it is one image at one
+  q, and it mixes two effects, since tile 120 also means 144 tiles instead of 40 and therefore
+  more per-tile overhead and more of ENT-6's code-block cold start. The margin is far too large
+  for either to change the conclusion.
 - **Recovering the whole 6.6 points** — that needs partial border tiles the way JPEG 2000 has
   them, touching tile origins, the tile grid, every shader deriving a position from `tile_size`,
   and the per-tile CRC and seek structures. The ceiling above a fill change is 6.6, not 27.
+  **This is what the tile-size row above actually argues for**: partial border tiles decouple tile
+  size from frame size, so the deep wavelet and zero padding stop being alternatives. Having to
+  choose between them is the defect; the fill shipped here only makes the choice cheaper.
 - **A 32 px ramp instead of 8.** −4.08% against −4.63%: a longer fade leaves more of the edge
   line's detail in the padding.
 - **Mirroring the picture into the padding**, the textbook alternative: **+11.4%**, i.e. 16 points

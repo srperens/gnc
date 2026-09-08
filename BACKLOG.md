@@ -2313,12 +2313,33 @@ quality-matched** — `meas1_vs_h264.py` is the harness for that.
 both P1 and P7 presets (P7 is nearer GNC's quality target and roughly 4x easier to win), and on an
 H100 where the NVENC column is a zero.
 
-**Blocked on a definition problem — fix this first.** At BASELINE's own stated parameters this
-session measured **13.6 fps** for the GPU encode phase (`benchmark-sequence`) and **7.8 fps** end
-to end (`encode-sequence`, incl. PNG decode and container write), against BASELINE's stated
-**31.7 fps**. The CLI's own help concedes PNG input inflates the cost. Three numbers are in
-circulation for "GNC encode fps" and GOALS quotes one without saying which. **Pin the definition
-before any density claim rests on it.**
+**~~Blocked on a definition problem — fix this first.~~ RESOLVED 2026-09-06, and this entry was
+still carrying it as a live blocker on 2026-09-08.** The three numbers are now named and pinned in
+[BASELINE.md](BASELINE.md): **A** — GPU encode phase (`benchmark-sequence`), 12.2 fps; **B** — the
+encoder loop figure `encode-sequence` prints, 5.6 fps; **C** — end to end incl. PNG decode and
+container write, 5.0 fps. A is 2.4x C. The 31.7 fps figure is retracted — it reproduces as none of
+the three and its stated parameters are internally inconsistent (ki=8 is below the B-frame
+threshold of 9) — and GOALS and the README were corrected under PERF-1 on 2026-09-07. CANARY-1's
+single-frame encode/decode loop is a **fourth** quantity, nearest A and not comparable to B or C.
+**Every quote must say which letter it is.** Nothing in MEAS-5 is blocked on this any more.
+
+**What MEAS-5 still needs, and why it is not "free to pick up".** Claim A is closed. Claim B is a
+pure throughput measurement, and it needs one of two things this project does not have on demand:
+
+1. **A discrete NVIDIA card with a driver new enough for NVENC.** The 2026-09-08 Windows session
+   got as far as the RTX 2000 Ada and was stopped by ffmpeg 9.0.1 requiring driver 610+ / nvenc API
+   13.1 against the machine's 13.0. Intel QSV was substituted and **out-scaled GNC** (4.54x@N=8 vs
+   GNC's 2.01x@N=2) — on the least-favourable hardware for GNC's argument, and entirely on GNC's
+   per-process **startup and memory**, not on GPU compute.
+2. **An idle Mac**, for the one part runnable here: re-taking the 2026-09-05 M-series density table
+   with `--density-still`, which BUG-32 flags as a candidate and POSITIONING still quotes. Eight
+   sessions share this machine; at load 39.5 an fps number is not a number (BASELINE, "Timing runs
+   require an idle machine"). This is why the item was claimed and dropped again on 2026-09-08
+   without a measurement — **nothing is retracted and nothing was run.**
+
+The honest next step is neither of those: it is **amortising per-process startup and streaming the
+clip instead of buffering it**, because those are what the two density runs actually measured. Until
+they are fixed, a density number on any hardware measures pipeline compilation.
 
 ### MEAS-6 — Latency per frame (first pass done 2026-09-06, P1)
 

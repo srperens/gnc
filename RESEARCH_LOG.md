@@ -582,9 +582,44 @@ and the presence of the feature should not be read as saying malformed input is 
 
 **So this is a decision, not a fix**, and ROBUST-1 carries it: (a) a `Result` boundary, which
 breaks `deserialize_compressed`'s signature; (b) a validating pre-pass that bounds every length
-against `data.len()` before the parser runs, which breaks nothing and is the cheapest; (c) document
-panic-on-malformed and require callers to sandbox. Not chosen here, because choosing it without
-pricing (b) would be guessing.
+against `data.len()` before the parser runs; (c) document panic-on-malformed and require callers to
+sandbox.
+
+### Priced (b), and it split in two
+
+A separate validating pass turns out **not** to be the cheap option: it is a *second* parser that
+has to agree with the first, which is a new class of bug rather than the absence of one. But (b)
+was answering two questions at once, and only one of them needs a second parse.
+
+**The denial of service does not.** Each of the four counts that reach `Vec::with_capacity` is
+followed immediately by that many fixed-size records, so the bound is available at the point the
+count is read:
+
+```rust
+fn wire_count(count: usize, stride: usize, data_len: usize, pos: usize) -> usize {
+    count.min(data_len.saturating_sub(pos) / stride.max(1))
+}
+```
+
+Applied to `num_detail` (stride 12), CfL `alpha_count` (2), `wm_len` (4) and `num_tiles`. **The
+stride on `num_tiles` is 1, not 8, and that is the one judgement call here:** the gen>=11 index
+table is 8 bytes per tile, but the same count is reused for the tile vectors on every generation,
+and a pre-GP11 tile blob has no guaranteed 8-byte minimum. Capping at `remaining / 8` could shrink
+a **legitimate** count and corrupt a well-formed file, which is worse than the problem being
+solved. One byte per tile cannot be wrong, and it still ties the allocation to the input size,
+which is the property that matters.
+
+`alpha_count` carried a second defect: `2 * num_cfl_tiles * nsb` was computed in `u32` and wrapped
+in release / panicked in debug **before** it was compared to anything. Widened to `usize` with
+`saturating_mul` first, then bounded.
+
+**Well-formed streams are provably unaffected**, since their counts satisfy the bound by
+construction — and the 16 byte-identical decodes were re-run to show it rather than assert it. A
+packet-sized hostile file can no longer become a multi-gigabyte allocation; it now runs off the
+end of the buffer into the same panic the parser has everywhere else.
+
+**What is left open is only the contract** — (a) versus (c) — because the panic surface is
+untouched. That is a decision record, not a commit.
 
 **Not audited and not claimed:** `abac.rs` (`vec![0i32; count]`), the rANS deserialiser, the GNV
 container index. Same class of question; "probably the same answer" is not a result.

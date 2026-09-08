@@ -1482,8 +1482,29 @@ read as claiming it is.
 decoder should do with a stream it cannot parse. That belongs in a decision record with the
 alternatives priced: (a) `Result` at the public boundary, (b) a validating pre-pass that bounds
 every length against `data.len()` before the parser runs, (c) document panic-on-malformed as the
-contract and require callers to sandbox. **(b) is the cheapest and does not break the API**, and it
-is worth pricing first.
+contract and require callers to sandbox.
+
+**Priced (b) and did the part of it that needs no pre-pass, 2026-09-08.** A separate validating
+pass would be a *second* parser that has to agree with the first — a new class of bug, and not
+cheap after all. But the DoS half of (b) needs no second parse: the four counts that reach
+`Vec::with_capacity` are each followed immediately by that many fixed-size records, so
+`wire_count(count, stride, data.len(), pos)` caps them at what the remaining buffer could hold, at
+the point they are read. Landed for `num_detail` (stride 12), CfL `alpha_count` (2), `wm_len` (4)
+and `num_tiles` (**1**, not 8 — the gen>=11 index table is 8 bytes per tile, but the same count is
+reused for the tile vectors on every generation and a pre-GP11 tile blob has no guaranteed 8-byte
+minimum, so capping at remaining/8 could shrink a *legitimate* count and corrupt a well-formed
+file; one byte per tile is the bound that cannot be wrong). **`alpha_count` also fixed an
+overflow**: `2 * num_cfl_tiles * nsb` was computed in `u32` and wrapped in release, panicked in
+debug, before being compared to anything.
+
+**Well-formed streams are provably unaffected** — their counts satisfy the bound by construction —
+and item 8's 16 byte-identical decodes were re-run to show it. So a tiny hostile file can no longer
+turn into a multi-gigabyte allocation; it now runs off the end of the buffer and hits the same
+panic the parser already has everywhere else. **That is the DoS, not the contract.**
+
+**What is still open is only the contract**: whether the decoder should reject rather than panic,
+i.e. (a) versus (c). The panic surface is unchanged and is still `assert!` plus `unwrap()`
+throughout, so pick one and write the record.
 
 **Not audited:** `abac.rs` (`vec![0i32; count]` at `:395`, `:636`), the rANS deserialiser, and the
 GNV container index. Same class of question, and the same answer probably applies, but "probably"

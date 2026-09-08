@@ -4,6 +4,7 @@ pub mod bench;
 pub mod decoder;
 pub mod encoder;
 pub mod experiments;
+pub mod fingerprint;
 pub mod format;
 pub mod gpu_util;
 pub mod image_util;
@@ -793,10 +794,11 @@ pub const MAX_TILE_SIZE: u32 = 512;
 ///   sequence at ki=1 loses nothing at all (-5.65% of rate, PSNR identical), which is what
 ///   pins the cause to the reference rather than to the coding.
 ///
-/// `GNC_PAD_FILL=decay` / `=replicate` forces either mode on every path, overriding both
+/// `GNC_PAD_FILL=decay` / `=replicate` / `=zero` forces a mode on every path, overriding both
 /// defaults. That is not a tuning knob: it is what `scripts/meas_intra1_padding.py` and
-/// `scripts/meas_pad1_inter.py` need to run both arms, and forcing `decay` on a P-chain is
-/// measured to be a bad trade.
+/// `scripts/meas_pad1_inter.py` need to run the arms. Forcing `decay` on a P-chain is
+/// measured to be a bad trade. `zero` is PAD-2's Dirac/Schroedinger candidate (inter
+/// zero-extend) and is not a default.
 ///
 /// This is an **encoder-side choice with no bitstream implication**: `pad.wgsl` is compiled only
 /// in `src/encoder/pipeline.rs`, the decoder reconstructs whatever was coded, and both sides
@@ -809,7 +811,11 @@ pub fn pad_fill_mode(default_decay: bool) -> u32 {
         // still-image path, false is the shared buffer every sequence path uses as-is.
         eprintln!(
             "GNC: pad fill = {} (path default {}, {})",
-            if mode == 1 { "decay" } else { "replicate" },
+            match mode {
+                1 => "decay",
+                2 => "zero",
+                _ => "replicate",
+            },
             if default_decay { "decay/intra" } else { "replicate/sequence" },
             match std::env::var("GNC_PAD_FILL") {
                 Ok(v) => format!("GNC_PAD_FILL={v}"),
@@ -824,10 +830,11 @@ fn pad_fill_mode_inner(default_decay: bool) -> u32 {
     match std::env::var("GNC_PAD_FILL").as_deref() {
         Ok("replicate") => 0,
         Ok("decay") => 1,
+        Ok("zero") => 2,
         Err(_) => u32::from(default_decay),
         Ok(other) => {
             eprintln!(
-                "GNC: unknown GNC_PAD_FILL={other:?}; expected \"decay\" or \"replicate\". \
+                "GNC: unknown GNC_PAD_FILL={other:?}; expected \"decay\", \"replicate\" or \"zero\". \
                  Using the per-path default."
             );
             u32::from(default_decay)
@@ -969,6 +976,15 @@ pub fn lossless_sibling(cfg: &CodecConfig) -> CodecConfig {
         EntropyCoder::Rans => EntropyCoder::Rice,
         other => other,
     };
+    // **BUG-46: the chroma format is a "how", not a "how much".** Without this the sibling was
+    // always `quality_preset(100)`'s 4:4:4, so on subsampled input RATE-2 compared a 4:2:0 wavelet
+    // encode against a **4:4:4** lossless one — three times the chroma samples — and reported the
+    // same candidate size for both requests (3 257 157 B on bbb at q=97, whether the caller asked
+    // for 4:4:4 or 4:2:0). The fallback could therefore essentially never fire off 4:4:4, and if
+    // it ever had, the output would have carried a chroma format the caller did not ask for.
+    // "Bit-exact" here means exact in the domain the caller chose to code in, which is what makes
+    // the two candidates comparable at all.
+    out.chroma_format = cfg.chroma_format;
     out.gpu_entropy_encode = cfg.gpu_entropy_encode;
     out.abac_coder = cfg.abac_coder;
     out.abac_code_block = cfg.abac_code_block;
@@ -1314,6 +1330,29 @@ pub fn quality_preset(q: u32) -> CodecConfig {
         cfg.subband_weights = SubbandWeights::uniform(0);
         cfg.adaptive_quantization = false;
         cfg.cfl_enabled = false;
+        // BUG-48: PAD-1's decay fill is a *wavelet* lever and it reverses sign under MED.
+        //
+        // `0039` fades the padding flat so its detail subbands go to zero, worth −4.63% RGB on
+        // four stills at q=80..94. MED has no subbands: it predicts each pixel from its left and
+        // upper neighbours, so a fade is something the residual has to *code* across, where plain
+        // edge replication predicts exactly. Same four stills, same binary, both arms via
+        // `GNC_PAD_FILL`, at q=100:
+        //
+        //   |                  | decay (was shipped) | replicate |         |
+        //   |------------------|--------------------:|----------:|--------:|
+        //   | bbb_1080p        |           3 257 157 | 3 235 737 | −0.657% |
+        //   | blue_sky_1080p   |           2 166 911 | 2 153 118 | −0.637% |
+        //   | kristensara_720p |             931 263 |   927 600 | −0.393% |
+        //   | touchdown_1080p  |           2 627 186 | 2 610 478 | −0.636% |
+        //
+        // **It belongs here and not on `q == 100`**, which is where the item filing put it: with
+        // `GNC_MED=0` the same q=100 is a lossless *wavelet* encode, and there decay is worth
+        // **−4.64%** on the same four stills — PAD-1's figure, reproduced at the top of the
+        // ladder. Keying this on the quality would have handed that arm a 4.6% regression.
+        //
+        // Pixels are untouched either way: the fill writes padding outside the visible area, and
+        // `pad_fill_mode` notes it is an encoder-side choice with no bitstream implication.
+        cfg.pad_fill_decay = false;
         eprintln!("GNC: MED prediction path active (LOSSLESS-1) — wavelet bypassed");
     }
     // A lossless preset must not carry a quantiser weight above 1.0 (BUG-15). q=100 reaches this

@@ -494,15 +494,57 @@ cmd_owner() {
 }
 
 cmd_list() {
-  local any=0 name sha o
+  local any=0 name sha o wt_total=0 wt_untestable=0 sess live_pids=' '
   while read -r name sha; do
     [ -z "$name" ] && continue
     any=1
     o=$(field "$sha" owner)
     printf '  %-20s %-30s %6s%s  %s\n' "$name" "$o" "$(age_of "$sha")" \
       "$(claim_state "$sha")" "$(field "$sha" note)"
+    case "$name" in
+      worktree.*)
+        wt_total=$((wt_total + 1))
+        sess=${o##*#}
+        if [ "$sess" = "$o" ]; then wt_untestable=$((wt_untestable + 1))
+        else
+          session_alive "$sess"
+          case $? in
+            # Count distinct *sessions*, not rows: one session can hold several worktrees, and
+            # counting rows overstates how many are accounted for -- which is the arithmetic this
+            # summary exists to get right. Caught by using it: pid 19376 held two.
+            0) case "$live_pids" in *" $sess "*) ;; *) live_pids="$live_pids$sess " ;; esac ;;
+            2) wt_untestable=$((wt_untestable + 1)) ;;
+          esac
+        fi
+        ;;
+    esac
   done < <(git for-each-ref --format='%(refname:lstrip=2) %(objectname)' refs/claims/)
-  [ "$any" -eq 1 ] || echo "  (nothing claimed)"
+  [ "$any" -eq 1 ] || { echo "  (nothing claimed)"; return; }
+  local wt_live=0 pid
+  for pid in $live_pids; do wt_live=$((wt_live + 1)); done
+  orphan_summary "$wt_total" "$wt_live" "$wt_untestable"
+}
+
+# How many worktrees are held by sessions that no longer exist? Individually unanswerable for an
+# untestable identity -- that is COORD-5 -- but the *count* is answerable by arithmetic, and that
+# is the check that actually settled it on 2026-09-08: **17 worktree claims against 9 live
+# sessions**, 8 of them testable and alive, so at least 8 were orphaned and every one of the
+# untestable rows but one had to be.
+#
+# `scripts/claim` cannot count the sessions itself -- that is the agent harness's business, not
+# the repository's -- so it prints its own half and names the other. **Do not use `pgrep -x
+# claude` for the session count: it is unsound.** On 2026-09-08 it omitted a live session whose
+# own `ps -o comm=` reads `claude`, which is how a peer session nearly concluded four holders were
+# gone on a listing that had missed itself. `kill -0` plus `ps -o comm=` is sound, and that is what
+# `session_alive` already does.
+orphan_summary() {
+  local total=$1 live=$2 untestable=$3
+  [ "$total" -gt 0 ] || return 0
+  printf '  --\n  %s worktree claim(s): %s distinct live session(s) hold one or more, %s with an identity that cannot be tested.\n' \
+    "$total" "$live" "$untestable"
+  [ "$untestable" -gt 0 ] || return 0
+  printf '  Count the sessions actually running and subtract: anything above %s live session(s) is\n' "$live"
+  printf '  the most that could still own those %s rows. Do NOT use `pgrep -x claude` (COORD-8).\n' "$untestable"
 }
 
 # A claim on an *item* does not stop a second session cd-ing into your worktree, which is the more
@@ -762,6 +804,26 @@ cmd_selftest() {
     && { echo "FAIL: a claim with a readable session part recorded a walk diagnostic"; rc=1; }
   "$0" drop --force "$ok_item" >/dev/null 2>&1
   [ "$rc" -eq 0 ] && echo "s? claims record the walked chain; identifiable ones do not"
+
+  # COORD-8: the orphan summary counts distinct sessions, not rows. One session holding two
+  # worktrees must count once -- counting rows overstates how many holders are accounted for, and
+  # that is the whole arithmetic the summary exists to get right.
+  # Asserted as a *delta*, because the repository this runs in has real claims of its own: two
+  # worktrees taken by one new session must raise the distinct-holder count by exactly one.
+  distinct_holders() { "$0" list 2>/dev/null | sed -n 's/.* \([0-9][0-9]*\) distinct live session.*/\1/p'; }
+  local before after me_live="wt$$-a@b#s$$"
+  before=$(distinct_holders)
+  "$0" take --as "$me_live" "worktree.WA$$" "selftest" >/dev/null 2>&1
+  "$0" take --as "$me_live" "worktree.WB$$" "selftest" >/dev/null 2>&1
+  after=$(distinct_holders)
+  if [ "$after" = "$((before + 1))" ]; then
+    echo "orphan summary counts sessions, not rows ($before -> $after for two worktrees)"
+  else
+    echo "FAIL: one session holding two worktrees moved the distinct count $before -> $after"
+    rc=1
+  fi
+  "$0" drop --force "worktree.WA$$" >/dev/null 2>&1
+  "$0" drop --force "worktree.WB$$" >/dev/null 2>&1
 
   rm -rf "$out"
   [ "$rc" -eq 0 ] && echo "PASS: claims are atomic, the pick is atomic, and so is id allocation"

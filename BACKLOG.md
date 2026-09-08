@@ -2227,6 +2227,89 @@ Every edit is in `#[cfg(test)]` code or an integration test target, checked file
 each file's `#[cfg(test)]` marker, so the shipped build is unchanged by construction and no
 figure in BASELINE moves.
 
+### COORD-5 — `claim list` could not say whether 4 of 15 holders existed (**FIXED 2026-09-08**)
+
+COORD-1 put the pid in a claim's identity so *"an abandoned claim is detectable rather than merely
+old"*. On 2026-09-08 at 18:58, with `claim next` reporting **every** startable item claimed, that
+property was not holding for **4 of the 15 item claims** — and those four were the whole difference
+between a working queue and an empty one:
+
+| item | owner | held | what was actually in the worktree |
+|---|---|---|---|
+| BUG-35 | `gnc-bug35rans@bug35rans#s?` | 74m | 1 file uncommitted, last edit 67m ago |
+| PAD-2 | `gnc-g41232@g41232#s?` | 75m | 7 files uncommitted, last edit 67m ago |
+| TILE-1 | `gnc-tile1@tile1#s?` | 75m | 13 files uncommitted, last edit 68m ago |
+| PERF-2 | `gnc-next2@next2#g01a08196` | 69m | 8 files uncommitted, last edit 67m ago |
+
+Three recorded `s?`; the fourth recorded `g01a08196`, which **`scripts/claim` cannot produce** —
+`me()` prints `s<pid>` or `s?`. `session_alive` says "cannot say" for all four and `list` printed
+`OWNER UNIDENTIFIABLE` with nothing after it, which no session can act on: stealing risks
+destroying up to 13 files of work, not stealing leaves four items idle. **Same shape as the MEAS-5
+loss**, which is what the pid was added to prevent.
+
+**Fixed by reporting the holder's worktree whenever liveness cannot be established** — the check
+COORDINATION already asks a session to run by hand before a steal, mechanised. `claim list` now
+prints `SESSION GONE, safe to steal, worktree clean` (take it), `OWNER UNIDENTIFIABLE, 13 file(s)
+uncommitted, newest edit 69m ago` (read the diff first), or `no session recorded, verify before
+trusting` for a parked owner, which names a reason rather than a directory. Decision
+`docs/decisions/0069`.
+
+**Verified by mutation:** `claim selftest` gained a case for both the evidence and the parked
+owner, and breaking `worktree_evidence` makes it print `FAIL: an unidentifiable owner naming a
+real worktree reported no evidence`. Written that way because `0062` had just found two runtime
+assertions over compile-time constants in this repo — a new assertion should be shown to fail
+before it is trusted.
+
+**Deliberately not attempted: repairing `session_pid` itself.** The walk works in the session that
+fixed this and the three `s?` claims were written by process trees that no longer exist, so there
+is no before-number and a guessed fix would be exactly the change this project's protocol refuses.
+Filed as **COORD-7**. Shell only — no Rust, no shader, no bitstream, so the cargo gates cannot be
+affected and were not re-run (DOC-1 / ENT-7 precedent); `claim selftest` passes.
+
+### COORD-7 — the `#g…` identity came through `--as`, and `CLAUDE_PID` is the oracle (**FIXED 2026-09-08**)
+
+Two loose ends from COORD-5 / `0069`. Both investigated before anything was changed; decision
+`docs/decisions/0071`.
+
+**1. `gnc-next2@next2#g01a08196` came through `--as`, and `--as` accepting it is the defect.**
+Checked mechanically over every commit that touched `scripts/claim`: **no version has ever emitted
+a `g` prefix** (the only match is `0069`'s own commit, quoting it). `me()` prints `s<pid>` or `s?`,
+so `CLAIM_AS` is the only other route. `--as` took any string, and the cost is precise —
+`claim_state` treats an owner containing `#` as a session identity, `session_alive` cannot parse
+`g01a08196`, so `PERF-2`, `dr-0051` and `worktree.gnc-next2` were **permanently untestable**
+rather than merely held. `--as` now refuses a session part the liveness test cannot read: name no
+session (`blocked-<reason>`), or name one that can be evaluated (`s<pid>` or `s?`). Handover still
+works. `01a08196` matches no session directory for this project, so its provenance is unresolved
+and left that way — it cannot recur, which is the part that mattered.
+
+**2. `CLAUDE_PID` is set in a session's shells and is exactly what the walk hunts for.** Measured:
+`CLAUDE_PID=8815`, the twelve-hop walk independently reached 8815, `ps -o comm= -p 8815` prints
+`claude`. Now preferred over the walk — but only if it still names a live `claude`, since a stale
+exported value would make a dead session look alive, and the walk stays as fallback because it is
+not known whether the sessions that recorded `s?` set it at all.
+
+**3. An `s?` claim now records the chain it walked** — `walk: claude-pid=unset chain: 86265:zsh`
+— so the next one is a reading. Also fixed a latent bug the instrument's own output exposed: a
+login shell's `comm` is `-/bin/zsh` and `basename` read the `-` as an option, printing an empty
+name. Four call sites, now `basename --`.
+
+**The instrument's first version was wrong, and the mutation test is why that is known.** It set a
+global inside `session_pid`, which `me()` calls in a command substitution — so `blob_for` would
+have recorded nothing, forever, while reading as if it worked. Both new behaviours are asserted in
+`claim selftest` and both assertions were mutation-tested: disabling `valid_as` gives `FAIL: --as
+accepted a session part it cannot evaluate`, removing the `walk:` line gives `FAIL: an s? claim
+recorded no walk diagnostic`.
+
+**Still open, and it is now the only half: why a session's ancestry sometimes contains no
+`claude`.** No longer open-ended — any future `s?` carries `claude-pid=…` plus the walked chain,
+which separates the three candidates (no `CLAUDE_PID` with a reparented shell, a `claude` under a
+different `comm`, a chain over twelve hops) without guessing. If `CLAUDE_PID` proves universal the
+walk becomes dead code and can go. Not filed as a new item: there is nothing to do until a claim
+carries the data.
+
+Shell only — no Rust, no shader, no bitstream, so the cargo gates cannot be affected and were not
+re-run (DOC-1 / ENT-7 precedent). `claim selftest` passes all nine cases.
+
 ### BUG-42 — `ENT-9` is filed twice (**CLOSED 2026-09-08 — duplicate of COORD-3, which is now FIXED**)
 
 Filed and closed inside the same hour by the `loopa` session, which found the two live `### ENT-9`
@@ -2931,6 +3014,38 @@ frequency 1 everywhere the alphabet is uniform and the depth is 6). Both change 
 codebook, and therefore its bitstream, wherever clamping currently occurs. Not done for a parked
 coder.
 
+### COORD-6 — `main` moves under an in-flight measurement and nothing says so (todo, P4)
+
+**Filed as an open question, not as work, which is the whole point of the heading.** COORD-4
+counted six instances of a number being read against the wrong tree and refused the tool it was
+filed to consider (`claim measured`: 1 of 6). **Four of those six are this shape instead** —
+PAD-1 / `0039`, ENT-3 / `0025`, ARCH-3 / BUG-18, and the build-artefact near-miss — one session
+measuring correctly while `main` moves underneath, so a table's early rows and late rows come from
+different codecs. Nothing errors. The numbers are simply from two encoders and read as one.
+
+**The first step is to decide whether a cheap mechanism exists, and to close this if it does not.**
+It is deliberately not "build a mechanism". Known difficulties, so nobody rediscovers them:
+
+- The signal is not "`main` moved" — it moves constantly and most moves are irrelevant. It is
+  "`main` moved *in a way that changes encoder output*", and the only honest test of that today is
+  running the thing twice, which is what the check would exist to avoid.
+- A cheap proxy is whether the merge touched `src/` or `src/shaders/` at all. That over-warns
+  (`0045`'s diagnostic-only change is byte-identical with the env var unset) but a false warning
+  costs one `git diff` and a missed one cost a re-run of a 12-point gate.
+- It cannot live in `scripts/claim`: a claim is taken when an item is picked up, and a measurement
+  happens somewhere else entirely — that is exactly why COORD-4 refused the claim-time stamp at
+  0 of 6.
+- The measurement is usually a shell loop, not a program, so anything requiring the harness to
+  cooperate will not be adopted. Whatever this is, it has to work for `python3 scripts/meas_*.py`
+  and for a bare `for q in ...; do ./target/release/gnc ...; done`.
+
+**Success criterion:** either a mechanism a session will actually run without being told twice, or
+a written finding that none exists and the prose in COORDINATION's "Every number carries a tree" is
+the answer. **Both outcomes close this item.** A third round of prose does not.
+
+**Do not let this rot into an obligation.** If nobody has found a cheap mechanism the next time
+someone reads this, close it as answered-no and cite COORD-4's table.
+
 ### COORD-4 — priced, tool refused 1-of-6, consolidation shipped instead (**ANSWERED 2026-09-08**)
 
 **The doubt attached to this item at filing was the right one, and the measurement it asked for
@@ -2964,10 +3079,10 @@ binary, ask which tree before filing or reversing.
 
 **What would reopen this.** A seventh instance of the *cross-session* shape specifically —
 instance 1 is the only one of its kind, and one instance does not buy a tool. If two more appear,
-`claim measured` is worth building and the dirty bit is the half that matters. Instances 2, 3 and 5
-argue for something different if anyone wants it: a check that warns when `main` has moved since a
-worktree's base *while a measurement is in flight*, which is a different tool with a better hit
-rate (4 of 6) and no obvious cheap implementation.
+`claim measured` is worth building and the dirty bit is the half that matters. Instances 2, 3, 4 and 5 argue
+for something different, now filed as **COORD-6**: warn when `main` moves under an in-flight
+measurement. Better hit rate (4 of 6), no obvious cheap implementation, so it is filed as the open
+question rather than as work — and closing it answered-no is an accepted outcome.
 
 *Original filing, kept because the doubt in it was correct:*
 
@@ -4458,7 +4573,46 @@ peer's number is not the same as reading their tree.
 frame's reference is *not* simply its colour-converted source, because that buffer is at a
 different stage and scale. RATE-4 records the refutation.
 
-### LOSSLESS-2 — at `q=100` inter costs +38% on camera content and wins 1.6% on animation (todo, P2)
+### LOSSLESS-3 — above q=95 a camera sequence costs more than bit-exact lossless, for worse pixels (todo, **P1**)
+
+Filed 2026-09-08 by LOSSLESS-2, which is what exposed it: `q=100` on crowd_run went from 43.0 MB
+to 25.9 MB, and the lossy ladder above it did not move. 8 frames, ki=9, 4:4:4, container bytes:
+
+| sequence | q=95 | q=97 | q=99 | q=100 (bit-exact) | q=99 costs |
+|---|---|---|---|---|---|
+| crowd_run | 31 697 550 | 34 672 332 | 38 326 055 | **25 856 146** | **+48.2%** |
+| old_town_cross | 31 669 932 | 34 646 281 | 38 297 084 | **25 247 023** | **+51.7%** |
+| bbb (animation) | 17 896 639 | 20 924 647 | 24 708 560 | 25 183 470 | −1.9% |
+
+On camera content **every rung from q=95 up is dominated**: more bytes than bit-exact lossless for
+pixels that are not exact. q=95 is already +22.6% (crowd_run) and +25.4% (old_town_cross).
+Animation is not dominated — bbb's q=99 is 1.9% cheaper than lossless — which is the same content
+split as LOSSLESS-2 and `0023`.
+
+**This is RATE-2 (`0036`) one level up.** RATE-2 found the same thing on *stills* (+28.9% mean at
+q=99) and fixed it by coding both ways and keeping the smaller file; RATE-3 lifted that into
+sequences **for I-frames only**. A sequence's P-frames at q=95-99 are still wavelet-coded and
+nothing compares them against a bit-exact alternative.
+
+**The shape that follows from LOSSLESS-2, and why it is the same two-axis win RATE-2 had.**
+Compare a lossy P-frame against a **bit-exact I-frame of the same picture**
+(`lossless_sibling`, already built). If the bit-exact candidate is smaller it wins on *both* axes
+— fewer bytes and exact pixels — so again no BD-rate and no metric arbitration. It also improves
+what later frames predict from, since a bit-exact reference cannot drift, so the saving should
+compound down the GOP rather than dilute. **That last part is a prediction and must be measured,
+not assumed.**
+
+**What must be checked before believing it:** RATE-3 (`0040`) found that a bit-exact I-frame is
+*not* a drop-in reference — it broke the P-frames that referenced it until the encoder's local
+decode was fixed to invert what it coded (`0042`). Read `0040` and `0042` first; the failure mode
+is that encoder and decoder end up holding different references.
+
+**Success criteria:** at q=95/97/99 on ≥3 sequences and both ki, the container never larger than
+today's, worst-frame PSNR never lower, and every frame the encoder marks bit-exact verified
+outside the harness (md5 against source, the `0036` standard). Report the animation case
+separately — it is the one that can regress.
+
+### LOSSLESS-2 — at `q=100` a P-frame competes with an I-frame of the same picture, and loses on camera content (**DONE 2026-09-08**)
 
 **Measured at identical pixels, which is the cleanest form this comparison can take.** Both arms
 are bit-exact since BUG-39 closed, so this is exact bytes at equal quality, not a BD-rate
@@ -4481,6 +4635,52 @@ worst-frame) — past the wash into a loss.
 **The question:** should a lossless configuration code P-frames at all, or fall back to all-intra
 (per frame, on an RD decision, or per sequence)? It bears on a GOALS §1 row, and the honest
 answer may be that `q=100` video is all-intra by construction — which is what FFV1 does.
+
+**SHIPPED 2026-09-08. `q=100` re-codes a P-frame as an I-frame when it is larger; the shipped
+encoder equals the per-frame minimum to the byte on 8 of 8 points.** Decision `0070`,
+`docs/decisions/0070-a-lossless-p-frame-competes-with-an-i-frame-and-usually-loses.md`.
+
+| sequence | ki | before | shipped | | mix |
+|---|---|---|---|---|---|
+| crowd_run | 2 | 35 712 641 | 25 855 950 | **−27.6%** | 4I+4P → 8I+0P |
+| crowd_run | 9 | 43 003 751 | 25 855 950 | **−39.9%** | 1I+7P → 8I+0P |
+| old_town_cross | 2 | 35 209 443 | 25 246 827 | **−28.3%** | 4I+4P → 8I+0P |
+| old_town_cross | 9 | 42 778 003 | 25 246 827 | **−41.0%** | 1I+7P → 8I+0P |
+| blue_sky | 2 | 23 911 136 | 17 294 529 | **−27.7%** | 4I+4P → 8I+0P |
+| blue_sky | 9 | 28 942 166 | 17 294 529 | **−40.2%** | 1I+7P → 8I+0P |
+| bbb | 2 | 25 484 805 | 25 484 805 | ±0 | 4I+4P unchanged |
+| bbb | 9 | 25 183 274 | 25 183 274 | ±0 | 1I+7P unchanged |
+
+**Still bit-exact, verified outside the harness:** 32 of 32 frames md5-identical to their source
+PNGs through `encode-sequence` → `.gnv` → `decode-sequence` (ffmpeg rawvideo), on both the
+re-coded path (old_town_cross) and the kept-P path (bbb), ki=2 and ki=9. **Nothing below q=100
+moved** — crowd_run q=90 and q=99 at ki=2 and 9 are byte-identical with the feature on and off.
+
+**The answer to the item's question is "per frame", and the two rejected shapes are priced.**
+A per-*sequence* latch captures 100% of the gain on all eight points above, because the sign never
+varies inside a shot — but on a synthetic shot cut (4 frames bbb + 4 frames crowd_run, ki=9) the
+per-frame rule gives **25 562 037 B** against **32 938 051 B** for the keep-P latch and
+**25 879 801 B** for all-intra: it beats *both* per-sequence answers by keeping the animation
+shot's P-frames and refusing the camera shot's. And coding both ways per frame (RATE-2's shape)
+buys **0.00%** over comparing against the previous I-frame, whose size varies ±0.4% inside a shot,
+for double the encode.
+
+**Why not "q=100 is all-intra by construction", which is what FFV1 does:** a lossless P-frame over
+a *static* picture is **156 B against the I-frame's 61 414 B** (`tests/lossless2_intra_recode.rs`),
+394x cheaper. Refusing P-frames outright would inflate locked-off camera and graphics content by
+orders of magnitude.
+
+**Canary** — `GNC: LOSSLESS-2 frame N — P … B vs previous I … B (±…%), re-coding as I | keeping
+the P-frame`, printed on every lossless P-frame whichever way it goes.
+`GNC_LOSSLESS_INTRA_RECODE=0` restores the old behaviour, which is how the "before" column above
+was taken from the same binary. Harness: `scripts/meas_lossless2_inter.py`.
+
+**Noticed on the way, and filed rather than folded in: LOSSLESS-3.** Now that `q=100` is
+25.9 MB on crowd_run, the whole top of the *lossy* sequence ladder is dominated on camera content
+— q=95 costs +22.6%, q=99 **+48.2%**, for pixels that are not exact. That is RATE-2's still-image
+finding one level up, and this change is what exposed it.
+
+**The original filing follows.**
 
 **Startable now** — BUG-39 is closed and these numbers are taken after it.
 
@@ -6694,6 +6894,16 @@ The 256-stream precedent does not transfer, and why matters: there each coder ha
 by coefficients with |v| > 2 — still hundreds to thousands of decisions each. Where the adaptive
 arm *beats* the pooled bound it is tracking statistics that vary within the block, which a pooled
 estimate cannot.
+
+**The denominator was checked rather than assumed, and it barely moves.** Every candidate-A figure
+above is a share of *the coder's own bits*, while ENT-9's gate is a share of **total rate** — not
+the same denominator, and the difference runs against the item. Adding the per-block length
+fields, which ride along unchanged in both arms, moves it by **≤0.01 points** (crowd_run −8.37% →
+−8.37%, bbb_extended −2.49% → −2.49%, old_town_cross −8.70% → −8.69%): the fields are a few KB
+against 2.9–5.0 MB of abac tile bytes per frame. What is still uncounted is frame headers and
+motion vectors, which abac does not code — at q=99 the tiles dominate the frame, so the total-rate
+figure will be close but strictly smaller, and only a real encode settles it. **The gate is still
+not cleared; the bound is.**
 
 **What it clears, precisely.** The *bound*, on three of three at q=99. **Not** ENT-9's gate, which
 is ≥2% of **total rate** at bit-identical pixels — a real encode, and total rate carries the

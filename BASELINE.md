@@ -208,6 +208,29 @@ The I-only column is the comparison that survives: on camera content at q=90, **
 than all-intra**. Animation still saves. That is INTER-1's finding on current HEAD, not a new one.
 No fps is quoted — the machine was not idle.
 
+## Lossless sequences (q=100, 8 frames, 4:4:4, Rice)
+
+New section 2026-09-08 (LOSSLESS-2). There was no lossless *sequence* row here before, because
+until BUG-39 (`0064`) `q=100` video was not bit-exact and there was nothing to regress against.
+Container bytes, `encode-sequence`, and every frame md5-identical to its source PNG through
+`decode-sequence`:
+
+| sequence | ki=2 | ki=9 | mix at ki=9 |
+|---|---|---|---|
+| crowd_run | 25 856 146 | 25 856 146 | **8I+0P** |
+| old_town_cross | 25 247 023 | 25 247 023 | **8I+0P** |
+| blue_sky | 17 294 725 | 17 294 725 | **8I+0P** |
+| bbb (animation) | 25 485 001 | 25 183 470 | 1I+7P |
+
+**ki does not change the camera rows, and that is the feature, not a copy-paste.** A `q=100`
+P-frame that costs more than an I-frame of the same picture is re-coded as an I-frame (`0070`), so
+camera content converges to all-intra whatever the keyframe interval says. Before that change the
+same rows read 35 712 641 / 43 003 751 (crowd_run) and 35 209 443 / 42 778 003 (old_town_cross) —
+up to **+69% for identical pixels**. `GNC_LOSSLESS_INTRA_RECODE=0` reproduces the old numbers.
+
+Animation keeps its P-frames and its rows are unchanged. **No fps is quoted: eight sessions shared
+the GPU.**
+
 ## Reported bitrate correction (2026-09-05)
 
 `CompressedFrame::byte_size()` counted motion vectors as 4 raw bytes per block while the

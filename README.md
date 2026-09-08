@@ -10,7 +10,7 @@ Traditional codecs (H.264, HEVC, AV1) are shaped by decades of CPU constraints �
 
 GNC asks: if you start from zero with a GPU-first mindset, what do you end up with?
 
-The answer so far: tile-independent processing, fully parallel entropy coding (256 independent streams per tile), and wavelet transforms that map naturally to GPU workgroups. It runs a full I/P/B video pipeline at 1080p on an integrated GPU. *(This line claimed "in real time … on an eight-core integrated GPU" until 2026-09-08. The core count was the wrong-hardware label BUG-29 retired, and "real time" is not what this project's own figures say — 1080p end to end is 5.0 fps. See [Video sequence](#video-sequence).)*
+The answer so far: tile-independent processing, fully parallel entropy coding (256 independent streams per tile), and wavelet transforms that map naturally to GPU workgroups. It runs a full I/P/B video pipeline at 1080p on an integrated GPU. *(This line claimed "in real time … on an eight-core integrated GPU" until 2026-09-08. The core count was the wrong-hardware label BUG-29 retired, and "real time" is not what this project's own figures say — 1080p end to end is 15.4 fps on an idle machine, and the 5.0 fps this line first carried was a shared one. See [Video sequence](#video-sequence).)*
 
 GNC is deliberately **broad**: intra and inter, 4:2:0 / 4:2:2 / 4:4:4 at 8 and 10 bits, and a quality range that runs from heavy compression through visually lossless to bit-exact lossless. The uses it is built for — contribution links, mezzanine and archival storage, low-latency preview, browser playback — encode about as often as they decode, which bounds how much encoder *search* is worth buying but not the compression target: that is roughly H.264-class across the whole range. Every figure below therefore names the operating point it was measured at, because several of this project's retracted results came from measuring one end and quoting it as if it described the codec.
 
@@ -106,7 +106,7 @@ fps" exists.*
 
 ### Video sequence
 
-**12.2 fps** GPU encode phase, **5.0 fps** end to end (1080p, q=75, keyframe interval 8, Rice,
+**27.8 fps** GPU encode phase, **15.4 fps** end to end (1080p, q=75, keyframe interval 8, Rice,
 measured 2026-09-06 on a machine that was not idle).
 
 *The 31.7 fps this line used to carry is withdrawn: it is not reproducible, it matches none of the

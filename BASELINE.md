@@ -136,11 +136,24 @@ Three different quantities have been called "encode fps" here. State which one, 
 
 | | what it times | measured 2026-09-06 (1080p, ki=8, Rice, **the Mac, labelled M1 — see above**, machine not idle) |
 |---|---|---|
-| **A — GPU encode phase** | `benchmark-sequence` with Y4M input | 12.2 fps median |
-| **B — encoder loop** | the figure `encode-sequence` prints | 5.6 fps median |
-| **C — end to end** | wall clock around `encode-sequence`, PNG input | 5.0 fps median |
+| **A — GPU encode phase** | `benchmark-sequence` with Y4M input | **27.8 fps** (was 12.2) |
+| **B — encoder loop** | the figure `encode-sequence` prints | **19.4 fps** (was 5.6) |
+| **C — end to end** | wall clock around `encode-sequence`, PNG input | **15.4 fps** (was 5.0) |
 
-**A is 2.4x C.** Use A to compare against another codec's encoder, C to claim throughput.
+**Re-taken 2026-09-08 on an idle machine (MEAS-12), median of 3, same parameters — 1080p, 8 frames,
+`--keyframe-interval 8`, q=75, Rice.** The old column was measured on 2026-09-06 with up to eight
+sessions on this Mac and **every quantity was understated by 2.3x to 3.5x**. `--throughput`
+(BUG-32) changes quantity A by under 1%: the CPU metrics were always outside the encode timer, so
+BUG-32's 86% finding applies to the command's wall clock and not to this table's figures.
+
+**A is 1.8x C**, not 2.4x. Use A to compare against another codec's encoder, C to claim throughput.
+
+**The decomposition is the useful part, because it says where the time is not going.** Per frame:
+GPU encode phase **36 ms**, encoder loop **51 ms**, end to end **65 ms** — so **29 of the 65 ms is
+not GPU coding work.** And doubling the chroma sample count costs **1%**: quantity C reads 15.41 fps
+at 4:4:4 against 15.61 fps at 4:2:0, which on its own establishes that end-to-end sequence
+throughput is host-bound rather than coding-bound. Against the 60 fps target (16.7 ms/frame) the
+GPU phase alone is 2.2x short, so both halves need work — but they are different work.
 `benchmark-sequence --throughput` (BUG-32, 2026-09-08) is the CLI form of A without the CPU
 PSNR/SSIM tax that used to be 86% of that command's wall clock. Default `benchmark-sequence`
 still scores every frame; do not time it.

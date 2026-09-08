@@ -4,6 +4,67 @@
 
 ---
 
+## MEAS-12 — every sequence throughput figure was understated 2.3x to 3.5x, and 29 of 65 ms per frame is not coding (2026-09-08)
+
+**Why this was run.** The project owner observed that GNC has "massive performance issues", and the
+figure behind that is BASELINE's **5.0 fps end to end** against a 60 fps target. But 5.0 fps
+disagreed with a number taken an hour earlier in the same quiet hour: single-frame encode is
+15.34 ms, i.e. 65 fps. **A frame cannot cost 15 ms alone and 200 ms in a sequence** — P-frames carry
+less residual than I-frames, so the sequence figure should be *cheaper* per frame, not 13x dearer.
+That discrepancy is the hypothesis: the 5.0 fps is an artefact.
+
+**It is.** Same parameters as BASELINE's A/B/C table — 1080p, 8 frames, `--keyframe-interval 8`,
+q=75, Rice — median of 3, idle machine, `e190ce4`:
+
+| quantity | what it times | 2026-09-06, shared | **2026-09-08, idle** | factor |
+|---|---|---|---|---|
+| **A** | `benchmark-sequence`, Y4M in | 12.2 fps | **27.8 fps** | **2.3x** |
+| **B** | the figure `encode-sequence` prints | 5.6 fps | **19.4 fps** | **3.5x** |
+| **C** | wall clock around `encode-sequence`, PNG in | 5.0 fps | **15.4 fps** | **3.1x** |
+
+So the headline performance number was understated by 3.1x, and **A is 1.8x C**, not the 2.4x this
+table recorded.
+
+**`--throughput` is not what fixed it, and that is worth stating because it was my hypothesis.**
+BUG-32 found `benchmark-sequence` spending 86% of its wall clock on CPU PSNR/SSIM, and I expected
+that to be most of quantity A. It is not: with `--throughput` A reads 288.1 ms and without it the
+same run reads 291.0 ms — **under 1%.** The metrics were always *outside* the encode timer, so
+BUG-32's finding applies to the command's wall clock and to `gpu_tier_bench --density`, which
+divided frames by that wall clock, but **not to this table's figures.** The whole 2.3–3.5x is the
+machine.
+
+### The decomposition, which is the part worth keeping
+
+Per frame, from the three quantities: GPU encode phase **36 ms**, encoder loop **51 ms**, end to
+end **65 ms**. So **29 of the 65 ms is not GPU coding work** — 15 ms of host-side encoder loop and
+14 ms of PNG decode, container writing and process startup.
+
+**And an independent check that the end-to-end figure is host-bound, not coding-bound:** quantity C
+reads **15.41 fps at 4:4:4 and 15.61 fps at 4:2:0**. Doubling the chroma sample count costs **1%**.
+A coding-bound pipeline cannot do that. (Noted on the way past: `encode-sequence --chroma-format`
+defaults to **444** while the Y4M path is 4:2:0, so BASELINE's A and C were never coding the same
+chroma either — it turns out not to matter, but the table did not say so.)
+
+Against the 60 fps target (16.7 ms/frame) **the GPU phase alone is 2.2x short**, so this is not
+"the performance problem was imaginary". It is two problems of comparable size, and only one of
+them is the codec.
+
+### What this does to the record
+
+Four documents carried 12.2 / 5.0 and now carry 27.8 / 15.4: BASELINE's A/B/C table, GOALS §3's
+known-gaps bullet and §4's encode-speed row, and README's two throughput sites. **Nothing about the
+codec changed** — this is the fifth quantity re-taken in one quiet hour, after MEAS-6's ~80 ms → 25.2 ms,
+ENT-10's abac ratios, PERF-3's slice and MEAS-5's density, and it moved by about as much as the
+others.
+
+**The pattern is now the finding.** Five figures, all measured on a machine shared by eight
+sessions, all understated by 1.5x to 3.5x, and the two largest errors were in the two numbers the
+project quotes most: its latency and its throughput. BASELINE's own rule said timing runs require
+an idle machine and estimated the penalty at 20%; the real penalty was up to **3.5x**. That rule
+should say so.
+
+---
+
 ## The quiet hour: five parked items collected, and `0017`'s decode debt is twice what it says (2026-09-08)
 
 The project owner stopped the other sessions. `QUIET_HOUR.md`'s five-check gate passed —

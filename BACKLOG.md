@@ -3993,6 +3993,36 @@ The honest next step is neither of those: it is **amortising per-process startup
 clip instead of buffering it**, because those are what the two density runs actually measured. Until
 they are fixed, a density number on any hardware measures pipeline compilation.
 
+### MEAS-12 — the sequence throughput figures were understated 2.3–3.5x (**DONE 2026-09-08**)
+
+Run because 5.0 fps end to end could not be reconciled with the 15.34 ms single-frame encode taken
+an hour earlier: a P-frame cannot cost 13x an I-frame. Same parameters as BASELINE's A/B/C table,
+median of 3, idle machine, `e190ce4`:
+
+| quantity | shared machine | **idle** | factor |
+|---|---|---|---|
+| A — `benchmark-sequence`, Y4M | 12.2 fps | **27.8 fps** | 2.3x |
+| B — what `encode-sequence` prints | 5.6 fps | **19.4 fps** | 3.5x |
+| C — wall clock, PNG in | 5.0 fps | **15.4 fps** | 3.1x |
+
+**`--throughput` is not what moved it.** With it quantity A reads 288.1 ms, without it 291.0 ms —
+under 1%. BUG-32's 86%-on-metrics finding applies to the command's wall clock and to
+`gpu_tier_bench --density`, not to this table. The whole 2.3–3.5x is the machine.
+
+**The decomposition is what to work from:** per frame, GPU encode phase **36 ms**, encoder loop
+**51 ms**, end to end **65 ms** — **29 of 65 ms is not GPU coding work.** Independent check that
+this is host-bound: quantity C is 15.41 fps at 4:4:4 against 15.61 at 4:2:0, so **doubling the
+chroma sample count costs 1%**. Against 60 fps (16.7 ms/frame) the GPU phase alone is still 2.2x
+short, so there are two problems of comparable size and only one is the codec.
+
+Also found: `encode-sequence --chroma-format` defaults to **444** while the Y4M path is 4:2:0, so
+BASELINE's A and C never coded the same chroma. It does not change the figures, but the table did
+not say so and now does.
+
+Updated: BASELINE's A/B/C table, GOALS §3 and §4, README's two throughput sites. RESEARCH_LOG
+2026-09-08. **Follow-up worth an item: BASELINE's rule estimates the shared-machine penalty at
+20%; five figures re-taken in one quiet hour moved by 1.5–3.5x.**
+
 ### MEAS-6 — Latency per frame: **25.2 ms, not ~80 ms** (**coding half DONE 2026-09-08**; glass-to-glass owed, P1)
 
 **The ~80 ms was load.** Re-taken on an idle machine through the same harness and operating point

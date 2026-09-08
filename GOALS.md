@@ -104,7 +104,9 @@ fps" exists.*
 **Sequence encode: see [BASELINE.md](BASELINE.md) — three different quantities have been called
 "encode fps" and they differ by 2.4x.** The previously quoted 31.7 fps is not reproducible and its
 stated parameters are internally inconsistent (ki=8 cannot produce B-frames). Measured 2026-09-06
-on a non-idle machine: GPU encode phase 12.2 fps, end to end 5.0 fps.
+on a non-idle machine: GPU encode phase 12.2 fps, end to end 5.0 fps. **Both re-taken on an idle
+machine 2026-09-08 (MEAS-12): 27.8 fps and 15.4 fps** — the earlier figures were understated 2.3x
+and 3.1x by a shared machine.
 
 **What works:**
 - Full I/P/B frame video pipeline with motion estimation, rate control, GNV1 container
@@ -117,7 +119,10 @@ on a non-idle machine: GPU encode phase 12.2 fps, end to end 5.0 fps.
 **Key GPU architecture insight:** shared-memory occupancy dominates performance. 16KB is the budget because that is what **GNC requests** (wgpu defaults, for WebGPU portability) — the adapter here offers 32KB, so this is a self-imposed ceiling, not the chip's (BUG-29). At 16KB, 2 workgroups/core is full occupancy; Rice uses < 1KB shared, so occupancy is excellent.
 
 **Known gaps:**
-- Sequence encode: **12.2 fps GPU encode phase, 5.0 fps end to end** (BASELINE's A and C,
+- Sequence encode: **27.8 fps GPU encode phase, 15.4 fps end to end** — re-taken on an idle machine
+  2026-09-08 (MEAS-12); the 12.2 / 5.0 this line carried were understated 2.3x and 3.1x by a shared
+  Mac. **29 of the 65 ms per frame is not GPU coding work**, and doubling the chroma sample count
+  costs 1%, so the end-to-end figure is host-bound. (BASELINE's A and C,
   1080p q=75, non-idle machine) → target 60 fps. The 31.7 fps this line used to carry is the
   figure retracted four paragraphs above; it stood here for a day after being withdrawn.
 - Single-frame encode 40 fps → target 60 fps
@@ -235,7 +240,7 @@ GNC should become a **good, robust codec** — not optimized along a single axis
 |----------|---------|--------|
 | **Concurrent streams per GPU** | **never measured** | beat NVENC's session/block ceiling on the same machine |
 | **Latency per frame** | **25.2 ms round trip at the default** — 15.34 ms encode / 9.87 ms decode, idle machine 2026-09-08 — of which **0 frames** are reordering delay (MEAS-6, `docs/decisions/0033`). Below the low-latency-HEVC band's 120 ms floor, above JPEG XS. **The ~80 ms this row carried until 2026-09-08 was about 3.2x inflated by a shared machine**; the structural half was never a timing measurement and is unchanged. Glass-to-glass is still unmeasured and needs capture hardware | sub-frame, end to end — at 50 fps that is 20 ms, so 25.2 ms is **1.26 frames** — essentially at target |
-| Encode speed | 12.2 fps GPU encode phase / 5.0 fps end to end (seq, 1080p q=75, non-idle; BASELINE A and C) | 60 fps |
+| Encode speed | **27.8 fps GPU encode phase / 15.4 fps end to end** (seq, 1080p q=75, **idle machine**, MEAS-12 2026-09-08; BASELINE A and C). The 12.2 / 5.0 this row carried was a shared machine. 29 of the 65 ms per frame is not coding | 60 fps — the GPU phase alone is 2.2x short, and the host-side half is nearly as large |
 | Bit depth | **8-bit and 10-bit, both shipping** (FMT-1, 2026-09-06; 10-bit lossless re-verified 2026-09-08) | met — keep it met as the format changes |
 | Chroma formats | 4:4:4, 4:2:2, 4:2:0 | keep all three working at 10-bit |
 | Compression (intra) | **Read these three numbers with their caveats, they are not one quantity.** +46–55% vs H.264 all-I on video is **VMAF, predates the high-q ladder fix and has not been re-run** (BASELINE says so); +13.9% on stills is PSNR against H.264 all-I; and against JPEG 2000 9/7 the gap is +27.1% of which **15.1 points are not coding deficiencies at all**, so the intra *coding* gap is nearer **+12%** (INTRA-1, answered 2026-09-08) | ≤ H.264 all-I, measured at contribution quality — and re-run the VMAF figure as PSNR |

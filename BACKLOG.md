@@ -1672,7 +1672,26 @@ idle machine (COORDINATION).
 **Do them behind a switch, the `GNC_ABAC_CODER` pattern**, and measure the set together on an idle
 machine rather than one at a time under load.
 
-### BUG-32 — `benchmark-sequence` spends 86% of its wall clock on CPU quality metrics, so any throughput figure derived from it measures SSIM (todo, P2)
+### BUG-32 — `benchmark-sequence` spends 86% of its wall clock on CPU quality metrics, so any throughput figure derived from it measures SSIM (**FIXED 2026-09-08**)
+
+**Fixed with `--throughput`.** Default path unchanged (still prints PSNR/SSIM, still runs the
+all-I arm). The flag skips CPU metrics, the second encode, and `decode_sequence` retention.
+Canary: `[bug32] throughput=1 metrics=0 i_only=0 decode_retained=0`. `--vmaf` conflicts.
+`gpu_tier_bench.py --density` now passes the flag. Decision `0046`.
+
+Measured on this Mac, bbb_extended, n=8, q=90, Rice, not idle (so no fps quoted):
+
+| | k=1 wall | k=1 encode printed | k=9 wall |
+|---|---|---|---|
+| default | 2.467 s | 142.5 ms + 142.4 ms I-only | 1.434 s |
+| `--throughput` | **0.541 s** | 144.1 ms (no second arm) | **0.720 s** |
+
+k=1 wall **4.56×**; bytes identical (15 825 673). The 86% RTX figure was the same shape.
+Tests: `tests/bug32_throughput.rs`.
+
+Original filing follows.
+
+### BUG-32 — `benchmark-sequence` spends 86% of its wall clock on CPU quality metrics, so any throughput figure derived from it measures SSIM (original filing)
 
 Found 2026-09-08 while running MEAS-5. Measured on an RTX 4000 Ada, Vulkan, `-q 90 -k 1 --rice`,
 120-frame crowd_run clip:

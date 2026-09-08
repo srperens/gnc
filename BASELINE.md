@@ -141,6 +141,9 @@ Three different quantities have been called "encode fps" here. State which one, 
 | **C — end to end** | wall clock around `encode-sequence`, PNG input | 5.0 fps median |
 
 **A is 2.4x C.** Use A to compare against another codec's encoder, C to claim throughput.
+`benchmark-sequence --throughput` (BUG-32, 2026-09-08) is the CLI form of A without the CPU
+PSNR/SSIM tax that used to be 86% of that command's wall clock. Default `benchmark-sequence`
+still scores every frame; do not time it.
 
 **Timing runs require an idle machine.** Two agents share this Mac; a run taken during a
 `cargo test` measured 20% slower than the same run taken after it. Compression figures (bpp,

@@ -2819,6 +2819,33 @@ frequency 1 everywhere the alphabet is uniform and the depth is 6). Both change 
 codebook, and therefore its bitstream, wherever clamping currently occurs. Not done for a parked
 coder.
 
+### COORD-4 — a number quoted across sessions does not carry its tree (todo, P4)
+
+**Filed from a worked example that cost two sessions about an hour**, recorded in COORDINATION's
+"Two sessions' numbers that disagree may both be right — ask which tree" and in RATE-4 and BUG-44.
+Two correctly-measured results could not coexist: `q=100` video bit-exact on 48 of 48 frames, and
+an encoder-vs-decoder reference diff of 254.0039 at the same operating point. **No measurement was
+wrong and the instrument was fine** — one was taken on a patched tree. Neither session asked which
+commit, and both then wrote a wrong inference into `main` before a twenty-second test settled it.
+
+**The mechanical version of the rule.** `scripts/claim` already takes claims against a commit —
+they are metadata blobs, and `git cat-file -p refs/claims/<ITEM>` prints it — so the information
+exists and is simply never surfaced where numbers are exchanged. Candidate shapes, cheapest first:
+
+- `scripts/claim list` / `items` print the commit each claim was taken against, so "which tree" is
+  answerable without asking.
+- A `scripts/claim measured <ITEM>` that stamps `HEAD` **plus whether the tree was dirty** at the
+  moment a measurement is taken — the dirty bit is the half that matters here, because the patched
+  tree in the worked example was uncommitted.
+
+**The honest doubt, from the session that raised it and declined to file it:** it may not be worth
+a tool. The failure needs two sessions, disagreeing numbers, and enough confidence to act before
+re-running — and the prose rule may be enough on its own. **Whoever takes this should price that
+first**: a grep of RESEARCH_LOG for retracted results says how often a wrong tree, rather than a
+wrong harness, was the cause. If the answer is once, close it as answered-no and keep the prose.
+
+**Not startable as "build it".** Startable as "measure whether it has happened before".
+
 ### COORD-3 — item ids had no allocator, so two different `### ENT-9` headings are live on `main` (**FIXED 2026-09-08**)
 
 **COORD-2 (`0050`) fixed this for `BUG-N` and `dr-NNNN` and left every other prefix alone.** On

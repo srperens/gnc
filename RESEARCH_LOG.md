@@ -65,6 +65,213 @@ rather than edited.
 
 ---
 
+
+## BUG-51 — `GP19` is claimed twice, and the namespace where that corrupts data had no guard (2026-09-08)
+
+**How it was found.** Not by looking. A peer session, having inherited the orphaned `gnc-tile1`
+worktree (COORD-8), mentioned in passing that its uncommitted work "carries a GP18→GP19 bitstream
+bump". ENT-9 had taken **GP19** for abac's context-coded prefix an hour earlier. Verified in both
+trees rather than assumed:
+
+- `main`: `b"GP19" => 19`, and the entropy-type-5 gate is `gen >= 19` (`0074`).
+- `gnc-tile1`, uncommitted, based on `a73e0a2`: `b"GP19" => 19`, *"TILE-1 stage 1 — plane padded
+  to 32, not to tile_size"*.
+
+**This is the `0018` mechanism in the one namespace where it corrupts data rather than annoying
+someone.** A duplicated decision number is a documentation nuisance; a duplicated item id is a
+queue nuisance (COORD-3); a duplicated *generation* means **a file at GP19 can be either format
+while `deserialize_compressed_validated`'s `gen >= N` gates are right for only one of them.**
+`0074` had already written the failure mode down for exactly this pair of binarisations: they
+differ only in how bits are modelled, so misreading one as the other gives a **plausible wrong
+image rather than an error**. Filed P1 where COORD-3 was P2, for that reason alone.
+
+**The trap is that a clean textual resolution hides it.** Merging `main` into tile1 conflicts in
+`src/format.rs`; keeping either side alone looks like a resolution and leaves the semantic clash
+intact. TILE-1's padding needs GP20, its own table entry and its own gate.
+
+**Guard landed, race not closed, and the split is deliberate.** `tests/bitstream_generation.rs`
+asserts two things over the table in `deserialize_compressed_validated`, which is the single
+source: no generation number is claimed by two magics, and the magic `serialize_compressed` stamps
+is the newest generation in the table. **Mutation-tested both ways** — injecting a second arm at
+19 reproduces the real message (`two magics claim one generation: [(19, ["GP19", "GP1X"])]`), and
+bumping the writer without a table entry fails the second test. What it buys is that the collision
+**fails at `cargo test` instead of at a merge**. What it does not buy is exclusion: two sessions
+can still both read `format.rs` and pick the next number, which is precisely how `0018`, `0024`
+and `0027` happened. That wants the allocator the other three namespaces now have (`claim gen`
+beside `claim dr` / `claim bug` / `claim id`, per `0050` and `0065`), and it is still open.
+
+**The renumber is not done and is not mine to do** — it is another session's worktree and its owner
+is mid-debug in it. Flagged to them directly, with one thing worth repeating here: their
+`full_pipeline_rice_roundtrip` reads **4.95 dB at 1920x1088** against 56.21 dB at 256x256, which is
+the border-tile bug TILE-1 exists to fix, but it was taken on a tree whose `format.rs` disagrees
+with `main` about what GP19 means. Re-take it after the renumber rather than debug two faults as
+one.
+
+**The general lesson, and it is about scope rather than about ids.** `0050` and `0065` closed the
+decision-number and item-id namespaces and both records framed the problem as "ids". Neither asked
+**which other numbers in this repository are picked by reading a file and adding one** — and the
+answer included the bitstream generation, the only one of the three whose collision produces a
+wrong picture instead of a wrong label. When a fix is framed as closing a class, enumerate the
+class.
+
+**Gates.** `cargo test --release --test bitstream_generation`: 2 passed, and both fail on the
+mutations above. Full suite on the merged tree before this test was added: **274 passed, 0 failed,
+9 ignored**; `cargo clippy --release --all-targets` and wasm `--lib` clean; `claim selftest`
+passes. No codec behaviour changed — this adds a test and one BACKLOG entry.
+
+---
+
+## COORD-8 — the orphan count is arithmetic, and the obvious oracle was unsound (2026-09-08)
+
+**What was open.** `0069` reported the holder's worktree when liveness could not be tested, which
+made an untestable claim actionable. It still said *"verify before trusting"* **without saying
+how**, and `0071` had removed one cause without answering the question. A peer session raised the
+gap and supplied the correction, which is the part worth recording.
+
+**`pgrep -x claude` is unsound for this.** It omitted a live session whose own
+`ps -o comm= -p 8815` reads `claude` — this session, absent from `pgrep -x claude` output taken
+minutes earlier, reproducibly. The peer hit it independently and **nearly concluded four holders
+were gone from a listing that had missed itself.** `kill -0` plus `ps -o comm=` is sound, which is
+what `session_alive` already does, so the fix was never in the pid test — it was in what the
+listing tells you to do next.
+
+**The row-by-row question is unanswerable and the aggregate is not.** Measured on the day:
+
+| | |
+|---|---|
+| worktree claims | 17 |
+| held by a live, testable session | **8 distinct sessions** |
+| identity cannot be tested | 6 |
+| live sessions in this repo (`ListAgents`; socket registry agreed 16/16, every pid alive) | **9** |
+
+9 − 8 = **one live session unaccounted for**, so **at least 5 of the 6 untestable claims are
+orphaned** and at most one is real. Claim age narrows which: all six are over two hours old, so a
+session started an hour ago cannot own one.
+
+**That is deliberately weaker than the reading it replaced.** The peer's summary was "almost
+certainly gone" for four holders; the arithmetic supports at least five of six, not six of six,
+and does not say which five. **Four steals on an inference is the move today has punished twice**
+(BUG-41/BUG-42's triple filing, and the aborted merge), so the bound is reported and nothing is
+taken.
+
+**The instrument got its own arithmetic wrong first, and using it is what caught that.** The
+summary counted worktree *rows* rather than distinct sessions, so it reported 9 holders where the
+truth was 8 — one session (pid 19376) held two worktrees while this was being written. I read my
+own output, walked the subtraction, and got a wrong bound out of it one paragraph after shipping
+the line. Now deduplicated, with `claim selftest` asserting the **delta** (two worktrees taken by
+one new session raise the count by exactly one) because the repository this runs in has real
+claims of its own and an absolute assertion is not testable there. Mutation-tested: removing the
+dedupe makes it read `9 -> 11`.
+
+**Third instrument in this session whose first version was wrong in a way only use exposed** —
+`0069`'s worktree evidence, `0071`'s walk diagnostic that set a global inside a command
+substitution, and this one's row-vs-session count. All three read correctly and all three were
+wrong. **In a shell script with no test framework, the assertion is not the check — breaking the
+feature and watching it fail is.**
+
+**What was not chosen.** Reading the harness's socket registry from `scripts/claim`: it works, and
+it is rejected because **it is not the repository's business how its sessions are supervised** — a
+lock that hardcodes one supervisor's private layout fails silently the day that layout changes,
+and silently in the direction of calling live sessions dead. Failing closed on an untestable
+identity, again. And stealing the orphans, which is a decision about someone's work rather than
+about a diagnostic.
+
+**Left open, and it is the substantive half: 16 uncommitted files sit in six orphaned worktrees**
+— `next2` 8, `g41232` 7, `bug35rans` 1, plus `bug32`, `coord2`, `rebaseline`. Read from their
+diffs, the work is coherent and not scratch: `next2` carries PERF-2's dynamic-offset UBO slots
+with a `[perf2] uniform_buffers=` canary, `g41232` an env-gated `GNC_MC_CLAMP_VISIBLE` motion-comp
+clamp, `bug35rans` a packed histogram in `quantize_histogram_fused.wgsl` that is net −46 lines,
+`tile1` (since inherited by a peer) a `PLANE_PAD_ALIGN` / `tile_extent` padding rework across
+three shaders. **Preserving it behind a ref via `git stash create` — which touches no worktree,
+index or branch — was attempted and refused by the permission layer**, so it is not done and was
+not smuggled in another way. It is the cheapest known way to make that work survive and it needs
+the project owner's decision.
+
+**Gates.** Shell only: no Rust, no WGSL, no bitstream, so the cargo gates cannot be affected and
+were not re-run (DOC-1 / ENT-7 precedent). `scripts/claim selftest` passes all ten cases.
+Decision `0076`.
+
+---
+
+## BUG-48 — the padding fill is a wavelet lever, and keying the fix on quality would have cost 4.6% (2026-09-08)
+
+**Hypothesis, from the filing.** `quality_preset(100)` keeps PAD-1's decay padding fill, which
+LOSSLESS-3 measured as a **loss** at q=100 on two stills (crowd_run frame 0 +0.78%, bbb frame 0
++0.66%). The filing proposed one line in `quality_preset` — `pad_fill_decay: q != 100` — and asked
+for a four-image sweep to justify it.
+
+**The premise reproduces on all four of PAD-1's stills, and the proposed fix is wrong.**
+
+### Step 1 — reproduce, on the images the original lever was measured on
+
+One binary, both arms via `GNC_PAD_FILL`, `q=100` (there is no RATE-2 sibling at q=100, so the env
+var isolates the lever exactly):
+
+| still | decay (shipped) | replicate | |
+|---|---|---|---|
+| bbb_1080p | 3 257 157 | 3 235 737 | **−0.658%** |
+| blue_sky_1080p | 2 166 911 | 2 153 118 | **−0.637%** |
+| kristensara_720p | 931 263 | 927 600 | **−0.393%** |
+| touchdown_1080p | 2 627 186 | 2 610 478 | **−0.636%** |
+
+### Step 2 — the measurement the filing did not ask for, and it changes the fix
+
+**q=100 is not always MED.** `GNC_MED=0` makes the same preset a lossless *wavelet* encode. Same
+four stills, same binary:
+
+| still | decay | replicate | |
+|---|---|---|---|
+| bbb_1080p | 3 260 563 | 3 436 337 | +5.391% |
+| blue_sky_1080p | 2 744 873 | 2 866 708 | +4.439% |
+| kristensara_720p | 1 169 457 | 1 178 520 | +0.775% |
+| touchdown_1080p | 2 967 518 | 3 131 749 | +5.534% |
+| **total** | | | **+4.643%** |
+
+**−4.64% against `0039`'s −4.63%**, same four images, and `0039` took its figure over q=80..94
+with `--abac`. So the fill is worth exactly what PAD-1 said at the very top of the ladder *when a
+wavelet is what codes the padding* — and the reversal belongs to **MED**, which has no subbands to
+zero and has to code a gradient the fade puts in front of its spatial predictor.
+
+`pad_fill_decay: q != 100` would therefore have bought 0.6% on one arm by giving up 4.6% on the
+other. The gate went inside `quality_preset`'s MED branch instead.
+
+**Why this was cheap to catch and worth writing down:** the filing's mechanism paragraph already
+said "at q=100 the transform is MED, not the wavelet". The mechanism named the right variable and
+the proposed fix keyed on a different one. Reading a filing's *reason* against its *patch* is a
+ten-minute check that does not need a hypothesis of its own.
+
+### Gate
+
+`scripts/gate_bug48.py`, 40 encodes across a before and an after binary. **Only the four q=100 MED
+cells move.** Byte-identical: all four stills at q=85, 90, 95, 97 and 99; all four at q=100 under
+`GNC_MED=0`; and 8 sequence points (crowd_run and bbb, q=99 and 100, ki=2 and 9). The sequences
+were never at risk — `0039` clears the flag for referenced I-frames and LOSSLESS-3's all-intra arm
+clears it explicitly, citing BUG-48 before it existed as a fix.
+
+**Canary:** `pad_fill_mode` under `GNC_DIAGNOSTICS` names the mode and the path default. q=100 →
+`replicate`, q=100 `GNC_MED=0` → `decay`, q=90 → `decay`.
+
+### Left on the table, filed as BUG-50
+
+The gate table shows q=97 and q=99 emitting **byte-identical files** on three of four stills
+(blue_sky 2 166 911, kristensara 931 263, touchdown 2 627 186). That is RATE-2's bit-exact sibling
+winning and being kept — and the sibling is a MED encode that inherits the *caller's*
+`pad_fill_decay`, which the q=95..99 presets set to `true`. So the same 0.4–0.7% is sitting in
+shipped output on the rungs where the sibling is what ships.
+
+Not taken here, for a reason with a measurement behind it rather than caution: `0072` made that
+inheritance deliberate, so both candidates leave the same padded source in `input_buf`, and its
+own figure is that forcing the fills to agree makes 24 of 24 sequence points byte-identical where
+10 moved otherwise. `encode()` is shared between the still and sequence paths, so the still path
+is not obviously independent — re-measuring `0072`'s 24 points is the whole of BUG-50.
+
+**Gates:** `cargo test --release -- --test-threads=1`, `cargo clippy --release`, wasm `--lib` — see
+the commit. Decision record: `docs/decisions/0077`.
+
+---
+---
+---
+
 ## COORD-6 — a cheap mechanism does exist, and it is what the encoder produces rather than what it is (2026-09-08)
 
 **What was open.** COORD-4 priced the two obvious mechanisms against six instances of a number read
@@ -1087,6 +1294,80 @@ theatre.
 **BUG-38 (P4)** with the heading committed alongside the reserved id, not fixed here:
 reformatting 44 modules that eight live sessions are editing conflicts with all of them and
 carries no behaviour. It wants a quiet tree and one commit that changes nothing else.
+
+## BUG-46 — the bit-exact candidate was always 4:4:4, and fixing that exposed a lossless path that is not lossless (2026-09-08)
+
+**What was filed.** `lossless_sibling` builds RATE-2's bit-exact candidate from
+`quality_preset(100)` and copies the choices that say *how* to code — coder, GPU/CPU, abac knobs,
+tile size, and since BUG-47 the padding fill — but not `chroma_format`. The canary showed it
+plainly, bbb at q=97:
+
+```
+--chroma-format 444:  lossy 2 843 371 B vs bit-exact 3 257 157 B (+14.55%), keeping the lossy one
+--chroma-format 420:  lossy 1 660 019 B vs bit-exact 3 257 157 B (+96.21%), keeping the lossy one
+```
+
+**The same 3 257 157 B for both requests.** So on subsampled input RATE-2 compared a 4:2:0 wavelet
+encode against a 4:4:4 lossless one — three times the chroma samples — and could essentially never
+fire. Every RATE-2 / RATE-3 / LOSSLESS-3 figure is a 4:4:4 figure as a result: not "unmeasured
+elsewhere", *unreachable* elsewhere. That scope was not previously written down anywhere.
+
+**Domain declaration.** Whole coded stills, bytes from the encoder and per-plane PSNR from the
+decoded PNG against the source. The question is not "is the fix smaller" but "are the two
+candidates the same picture", which is what makes RATE-2 metric-free — so quality is the measured
+quantity here, not a control.
+
+### The one-line fix works, and it must not ship
+
+`out.chroma_format = cfg.chroma_format` makes the candidate honest, and the fallback then fires:
+bbb 4:2:0 q=99 takes the bit-exact file at 1 847 304 B against 1 898 635 B, **−2.70%**.
+
+**And a large colour regression.** The reason is not the fix: `q=100` on subsampled chroma is much
+worse in *colour* than `q=99`. dE00 against the source, each arm forced with
+`GNC_LOSSLESS_FALLBACK=0`:
+
+| still | format | dE00 mean q=95 | q=99 | **q=100** | p95 q=99 | **p95 q=100** |
+|---|---|---|---|---|---|---|
+| blue_sky | 4:2:2 | 0.333 | 0.115 | **2.307** | 0.664 | **7.358** |
+| blue_sky | 4:2:0 | 0.354 | 0.139 | **1.949** | 0.727 | **5.742** |
+| bbb | 4:2:2 | 0.801 | 0.735 | **2.723** | 2.348 | **6.575** |
+| bbb | 4:2:0 | 1.017 | 0.960 | **2.557** | 3.210 | **6.146** |
+| kristensara | 4:2:2 | 0.408 | 0.140 | **2.142** | 0.716 | **5.649** |
+| kristensara | 4:2:0 | 0.423 | 0.160 | **1.888** | 0.746 | **4.850** |
+
+**2.7x to 20x worse, 6 of 6 points**, p95 above 4.8 everywhere, and 4:4:4 at q=100 is exact (dE00
+0.0000). The inversion survives in this metric and is *specific to q=100*: 4:2:2 beats 4:2:0 at
+q=95 and q=99 as it must (0.333 vs 0.354, 0.115 vs 0.139 on blue_sky) and loses to it at q=100 on
+all three images. Filed as **BUG-49 (P1)**.
+
+**Retracted on the way, and it is CLAUDE.md's own example.** The first version of this entry and of
+BUG-49 said "`q=100` is not lossless *even in luma*", from per-plane PSNR on the decoded RGB
+converted to `yuv444p` — 47-52 dB. That is the contaminated measurement CLAUDE.md warns about
+("a luma computed from decoded RGB is contaminated by chroma error", recorded there at 3.7x
+overstatement). In **YCoCg-R**, the plane GNC actually codes, luma at q=100 is **the best of the
+three rungs**: 57.4-66.9 dB against 52.3-52.7 at q=95. The luma claim is withdrawn; the colour
+defect above is what is real, and it is larger than the thing that was retracted. Cost of the
+error: one wrong filing, live on `main` for about an hour, corrected in the same session by running
+`scripts/ypsnr_de00.py` — which the rule says to use first for anything touching chroma.
+
+### What shipped: an honest candidate and an explicit refusal
+
+The sibling carries the format, and `encode` refuses the comparison on subsampled chroma with a
+canary naming the format and BUG-49. **Byte-identical to `main`** on bbb at 4:4:4 / 4:2:2 / 4:2:0,
+q=97 and q=99 — the refusal restores exactly what the missing field was producing by accident,
+which is the point: the accident and the intention agree today and stop agreeing the moment BUG-49
+is fixed.
+
+Refusing rather than taking the −2.70% is not conservatism for its own sake. `0036`'s licence to
+act without a metric is that its candidate wins on both axes at once; a trade of −3.9 dB for 2.7%
+of rate is 13x CLAUDE.md's 0.3 dB "flag and investigate" threshold, and smuggling it in under that
+licence would make "q=99" mean something different at 4:2:0 without saying so.
+
+Decision `docs/decisions/0078`. Harness `scripts/meas_bug46_chroma_sibling.py` — it reports both
+arms' bytes *and* PSNR and flags any point that is not better on both axes, which is what caught
+this on the first run.
+
+---
 
 ## LOSSLESS-3 — above q=95 a camera sequence is dominated by its own lossless encode, and the swap is a sequence choice, not a frame choice (2026-09-08)
 
@@ -2311,6 +2592,113 @@ not an argument for a 1.69× frame decode. Decision record `0045`.
 
 ---
 
+## MEAS-2, the last two toggles: the pyramid's leaf scale is right below q≈80 and wrong above it (2026-09-08)
+
+**Hypothesis.** MEAS-2 left two of its five toggles unmeasured, both behind BUG-5's pyramid-off
+default: `GNC_PYRAMID_L3_QP_SCALE` (1.5, justified in a comment as "matches H.264 QP+4 practice
+for inner B-frames" — true, and not a measurement) and `GNC_PYRAMID_L2_QP_SCALE` (1.0, commented
+"off until validated"). Expected the leaf scale to earn its keep, because nothing references a
+leaf B-frame, and the layer-2 scale to be roughly neutral, following TUNE-5's shape for P-frames.
+
+**Domain.** Quantiser step per frame, applied to the wavelet coefficients of one B-frame before
+entropy coding. The decoder reads the step from the frame header, so no decoder change is
+possible or needed.
+
+**Why the knob could not be validated before.** `[pyramid_b] … layer=2` printed the reference
+indices and *not* the quantiser, while the layer-3 line printed both. There was no way to observe
+whether the encoder had read `GNC_PYRAMID_L2_QP_SCALE` at all — which is how "off until validated"
+survives a week. Both layer-2 sites now print `qstep=… (l2_scale=…x)`, and layer 3 additionally
+reports whether the value came from the env var or the taper.
+
+**Shape of the run** (`scripts/meas2_pyramid_qp.py`): six arms — the pyramid suppressed, plus five
+l2:l3 pairs — on crowd_run, old_town_cross and bbb_extended, 24 frames, 4:4:4, **ki=17 in every
+arm**. The reference is the pyramid *off at the same keyframe interval*: BUG-5 compared
+ki=17-with-B against ki=8-P-only, which moves GOP length and the pyramid together, so nothing here
+is comparable with BUG-5's figures. Every arm is integrated over one common quality interval per
+sequence and metric (QUAL-1), since a coarser leaf lowers the top of its own ladder.
+
+### The two halves disagree, and both are right
+
+q=30/50/65/75 — VMAF leads (CLAUDE.md's table). BD-rate against the pyramid off, negative = fewer
+bits:
+
+| | l3=1.0 | **l3=1.5** | l3=2.0 |
+|---|---|---|---|
+| VMAF | −3.9% | **−12.1%** | −11.5% |
+| worst-frame PSNR | +10.0% | **+1.8%** | +13.4% |
+| mean PSNR | −7.9% | −10.3% | −11.1% |
+
+The convincing part is that VMAF and the worst frame *agree* down here: 1.5× is not buying the
+mean at the tail's expense, it is better on the tail than either neighbour. crowd_run's VMAF was
+discarded by the saturation guard (overlap 99.53–99.87); old_town_cross reads −5.1% and
+bbb_extended −19.0%.
+
+q=85/88/90/92/94 — PSNR leads, VMAF discarded on all three sequences (overlaps 99.21–99.89):
+
+| | l3=1.0 | l3=1.5 | l3=2.0 | l2=1.25 l3=1.5 | l2=1.5 l3=1.5 |
+|---|---|---|---|---|---|
+| mean PSNR | −4.6% | −5.0% | −4.9% | −4.9% | −4.8% |
+| worst-frame, bbb_extended | **−14.4%** | −5.6% | +7.3% | −7.4% | −5.7% |
+| worst-frame, camera clips | — | — | — | — | — |
+
+**Mean PSNR cannot referee this knob**: 0.4 points of spread across five arms. The worst frame
+spreads them by 22 points — and on the two camera clips there is *no overlap to integrate*, which
+says more than a BD-rate would. On crowd_run the pyramid-off arm's worst rung still reaches 47.48
+dB on its worst frame, while the l3=1.5 arm's *best* rung over the whole q=85–94 ladder reaches
+46.71. The tail penalty is larger than the ladder's entire quality span.
+
+Matched q, crowd_run q=85, no fitting involved:
+
+| arm | bytes | mean PSNR | worst frame |
+|---|---|---|---|
+| pyramid off | 74 997 760 | 47.91 | **47.48** |
+| l3=1.0 | 74 809 828 | 47.91 | **47.48** |
+| l3=1.5 (was the default) | 70 692 750 | 46.82 | 44.65 |
+| l3=2.0 | 67 875 419 | 46.03 | 42.29 |
+
+−5.7% of the bytes for −2.83 dB on the worst frame.
+
+**Mechanism for the flip.** At q=30 the leaf's step is 13.9 and its error is dominated by what
+bi-prediction failed to predict, so coarsening adds little to an error that large and the rate
+saving is nearly free. At q=90 the step is 2.24 and the leaf's error *is* its own quantiser, so
+1.5× converts directly into 2.8 dB on that frame. Same knob, opposite regimes — the same shape as
+AQ (off below q=30) and Rice-vs-rANS (boundary at q=20).
+
+**Shipped:** `GNC_PYRAMID_L3_QP_SCALE` becomes a taper on the quantiser step — 1.5 at step ≥ 4.0
+(q=75), 1.0 at step ≤ 2.8 (q=85), linear between, keyed on the step for `p_qp_scale`'s two reasons
+(the step is the physical quantity; `q` does not exist at that site under `--qstep` or rate
+control). The breakpoints are the measured ones and the ramp is interpolation. `GNC_PYRAMID_L2_QP_SCALE`
+stays 1.0 — validated, and off is right at contribution quality. Decision `0061`.
+
+**Nothing ships differently by default**, because the pyramid is off by default. Verified byte-exact
+against the measured arms: default pyramid-off q=90 = 82 057 506 (unchanged), taper at q=50 =
+26 688 057 (= the l3=1.5 arm), taper at q=90 = 81 869 091 (= the l3=1.0 arm), env override 1.5 at
+q=90 = 77 632 449 (= the old default).
+
+### Two things found on the way, both worth more than the toggle
+
+**A measurement was superseded mid-flight, and the guard for it did not exist.** The first q ≥ 85
+table was taken at q=85/90/92/95/99 on `a73e0a2`. LOSSLESS-3 (`0073`) then landed and emits a
+q=95..99 4:4:4 camera sequence bit-exact when the lossy encode is larger, so on the current tree
+those two rungs return `psnr = inf` — and a Bjontegaard fit over an infinity is a silent
+non-number, INTRA-1's trap. It is worse here than there: a bit-exact encode is all-intra, so every
+arm's rung is *the same bytes* and the toggle under test is not in the output being compared.
+`finite_or_die` now drops and reports a non-finite rung, and the re-taken ladder stops at q=94.
+The re-take also proves the merge changed nothing in range — all 30 q ≤ 94 rungs are byte-identical
+across it, and so are four q ≤ 75 points from the lossy half, which is why that half was not re-run.
+
+**At matched ki, part of what BUG-5 measured was GOP length.** With the leaf scale off the pyramid
+is cheaper than P-only on all three clips on both metrics (bbb_extended −12.2% mean, −14.4%
+worst-frame). This changes no default: the pyramid still costs 8 frames of reordering latency
+(`0033`), BUG-5's own figures were taken lower down the ladder, and on this content inter is itself
+losing — crowd_run at q=85 costs 69 919 536 bytes all-intra against 74 997 760 for I+P, so every
+arm above sits inside a configuration 7.3% behind not coding inter at all.
+
+**Left open:** the lossy half of the l2 scale (the q=30–75 grid was l3-only), which is what remains
+of MEAS-2.
+
+---
+
 ## BUG-35 — the histogram arena is guarded; shrinking it is refused (2026-09-08)
 
 **Hypothesis.** `shared_hist` is 5120 bins. `total_hist_entries` can reach 49152. naga clamps
@@ -2400,6 +2788,52 @@ file.
 8 distinct. Combined with the existing 16-racer / 6-picker tests: PASS.
 
 No codec change. No measurement moved.
+## PAD-2 — Dirac zero-extend on inter is worse than the fill PAD-1 already refused (2026-09-08)
+
+**Hypothesis.** PAD-2's cheaper-first candidate: zero-extend the tile padding on inter, as
+Dirac §13.1.2 Note / Schroedinger `schro_frame_zero_extend`. A zero-padded current against a
+zero-padded reference differences to nothing *in the padding*, so the padding's own residual
+vanishes. That is a different mechanism from PAD-1, which asked which fill predicts best.
+
+**Domain.** Encoder pad fill (`pad.wgsl` `fill_mode=2`, `GNC_PAD_FILL=zero`). Not the
+decoder, not MC, not a bitstream version. Default is unchanged.
+
+**Canary.** `GNC_DIAGNOSTICS=1 GNC_PAD_FILL=zero` prints `pad fill = zero` on both the
+sequence-buffer write and the still path. Default still prints `decay` / sequence `replicate`.
+
+**Measured**, `scripts/meas_pad1_inter.py`, ki=9, 17 frames, three sequences, q=85/92, 4:4:4 and
+4:2:0, against `GNC_PAD_FILL=replicate`. Not idle; bpp/PSNR are deterministic.
+
+| sequence | chroma | q | decay rate / dWORST | **zero rate / dWORST** |
+|---|---|---|---|---|
+| crowd_run | 444 | 85 | −6.92% / +0.000 | −8.66% / +0.000 |
+| crowd_run | 444 | 92 | −6.92% / +0.000 | −8.72% / +0.000 |
+| crowd_run | 420 | 85 | −9.02% / +0.000 | −11.09% / +0.000 |
+| crowd_run | 420 | 92 | −9.04% / +0.000 | −11.15% / +0.000 |
+| old_town_cross | 444 | 85 | −7.81% / −0.900 | −9.10% / **−2.110** |
+| old_town_cross | 444 | 92 | −7.75% / +0.000 | −8.65% / **−1.610** |
+| old_town_cross | 420 | 85 | −10.20% / −0.490 | −11.49% / **−1.360** |
+| old_town_cross | 420 | 92 | −10.09% / +0.000 | −11.13% / **−0.980** |
+| bbb_extended | 444 | 85 | −8.70% / −2.470 | −9.68% / −2.470 |
+| bbb_extended | 444 | 92 | −9.14% / −4.030 | −10.75% / **−4.960** |
+| bbb_extended | 420 | 85 | −9.80% / −0.360 | −10.64% / −0.380 |
+| bbb_extended | 420 | 92 | −10.24% / −0.350 | −11.49% / −0.470 |
+
+Default vs replicate: **+0.00% rate, +0.000 dB on all 12** — the shipped inter path did not move.
+
+**Verdict: FAIL.** Zero-extend regresses **8 of 12** points > 0.3 dB (decay: 6 of 12). Worst is
+bbb_extended 4:4:4 q=92 at **−4.960 dB**, worse than decay's −4.030 dB. Mean rate −10.21% vs
+decay's −8.80%: the extra saving *is* the worse prediction. old_town at q=92, which decay left
+at 0.000 dB, goes to −1.61 / −0.98 dB.
+
+The filing's caveat holds: vanishing padding residual says nothing about visible edge blocks
+whose MVs point outward, and that is where the 4 dB went. **Do not ship zero as an inter
+default.** `GNC_PAD_FILL=zero` stays as a harness arm.
+
+**Next on this item**, the other cheap check: clamp MC's reference reads to the *visible* bounds
+instead of the padded ones (`motion_compensate.wgsl` currently clamps to `params.width/height`,
+which are the padded dimensions). That is a decode-process change if it ships; measuring it
+does not require a bitstream bump.
 
 ---
 
@@ -14173,8 +14607,6 @@ five-byte flush are the next two steps, in that order.
 
 ---
 
----
-
 ## 2026-09-06 — Web demo repaired, and the temporal wavelet is not what we assumed
 
 ### BUG-15: the GNV2 decode path ignored the output pattern
@@ -14403,8 +14835,6 @@ halves now exist in this repo.
 Decode throughput on the real path. Four sessions were building on this machine and COORDINATION
 rule 1 forbids timing under load; the 201 fps figure is the isolated gate, not the shipped
 decoder. Measure on an idle machine before quoting any lossless fps.
-
----
 
 ---
 

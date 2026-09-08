@@ -30,11 +30,12 @@ import subprocess
 import sys
 from pathlib import Path
 
-# Three arms, because two of them answer different questions since PAD-1 shipped:
-#   "replicate"  forced off — the pre-PAD-1 reference
+# Arms:
+#   "replicate"  forced off — the pre-PAD-1 / shipped-inter reference
 #   "decay"      forced on  — the *hazard*, which this gate exists to keep measuring
+#   "zero"       PAD-2 candidate (Dirac/Schroedinger inter zero-extend)
 #   None         no override — what the codec actually does, and it must equal "replicate"
-FILLS = ("replicate", "decay", None)
+FILLS = ("replicate", "decay", "zero", None)
 
 
 def repo_root():
@@ -91,13 +92,13 @@ def main():
     chromas = args.chroma.split(",")
     rows, worst = [], []
 
-    print("PAD-1 inter gate — GNC_PAD_FILL=decay against replicate, ki="
+    print("PAD-1/PAD-2 inter gate — decay and zero against replicate, ki="
           f"{args.ki}, {args.frames} frames")
     print("The column that decides it is dWORST, not dAVG.\n")
     print(f"  {'':<16} {'':>6} {'':>3} {'--- forced decay ---':>19}   "
-          f"{'--- default ---':>18}")
+          f"{'--- zero (PAD-2) ---':>19}   {'--- default ---':>18}")
     print(f"  {'sequence':<16} {'chroma':>6} {'q':>3} {'rate':>8} {'dWORST dB':>10}   "
-          f"{'rate':>8} {'dWORST':>9}")
+          f"{'rate':>8} {'dWORST dB':>10}   {'rate':>8} {'dWORST':>9}")
 
     for seq in args.sequences:
         pattern = str(root / f"test_material/frames/sequences/{seq}/frame_%04d.png")
@@ -124,21 +125,26 @@ def main():
                     continue
                 (b_rep, a_rep, w_rep) = res["replicate"]
                 (b_dec, a_dec, w_dec) = res["decay"]
+                (b_zro, a_zro, w_zro) = res["zero"]
                 (b_def, a_def, w_def) = res[None]
                 d_rate, d_worst = b_dec / b_rep - 1.0, w_dec - w_rep
+                z_rate, z_worst = b_zro / b_rep - 1.0, w_zro - w_rep
                 f_rate, f_worst = b_def / b_rep - 1.0, w_def - w_rep
-                worst.append((seq, chroma, q, d_worst, f_worst, f_rate, d_rate))
+                worst.append((seq, chroma, q, d_worst, f_worst, f_rate, d_rate,
+                              z_rate, z_worst))
                 rows.append({"sequence": seq, "chroma": chroma, "q": q, "ki": args.ki,
                              "frames": frames,
                              "bytes_replicate": b_rep, "bytes_forced_decay": b_dec,
-                             "bytes_default": b_def,
+                             "bytes_zero": b_zro, "bytes_default": b_def,
                              "avg_replicate": a_rep, "avg_forced_decay": a_dec,
-                             "avg_default": a_def,
+                             "avg_zero": a_zro, "avg_default": a_def,
                              "worst_replicate": w_rep, "worst_forced_decay": w_dec,
-                             "worst_default": w_def,
+                             "worst_zero": w_zro, "worst_default": w_def,
                              "forced_d_rate": d_rate, "forced_d_worst": d_worst,
+                             "zero_d_rate": z_rate, "zero_d_worst": z_worst,
                              "default_d_rate": f_rate, "default_d_worst": f_worst})
                 print(f"  {seq:<16} {chroma:>6} {q:>3} {d_rate:>+8.2%} {d_worst:>+10.3f}"
+                      f"   {z_rate:>+8.2%} {z_worst:>+9.3f}"
                       f"   {f_rate:>+8.2%} {f_worst:>+9.3f}")
 
     if not worst:
@@ -166,6 +172,17 @@ def main():
           f"({big[0]}, {big[1]}, q={big[2]})")
     print(f"  mean forced rate change:         {sum(w[6] for w in worst) / len(worst):+.2%}")
     print(f"  hazard still present: {'YES — refusing it is still right' if forced else 'NO — re-open PAD-1s inter half'}")
+
+    print("\n--- PAD-2 candidate: GNC_PAD_FILL=zero (Dirac inter zero-extend) ---")
+    print("  criterion: rate of the forced-on arm, worst-frame PSNR within 0.3 dB of replicate")
+    z_bad = [w for w in worst if w[8] < -0.3]
+    z_big = min(worst, key=lambda w: w[8])
+    print(f"  points regressing > 0.3 dB:      {len(z_bad)} of {len(worst)}")
+    print(f"  worst zero dWORST:               {z_big[8]:+.3f} dB "
+          f"({z_big[0]}, {z_big[1]}, q={z_big[2]})")
+    print(f"  mean zero rate change:           {sum(w[7] for w in worst) / len(worst):+.2%}")
+    print(f"  VERDICT: {'FAILS' if z_bad else 'PASSES'} — zero-extend "
+          f"{'is not' if z_bad else 'is'} a drop-in for replication on inter")
 
     if args.csv and rows:
         import csv as _csv

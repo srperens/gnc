@@ -6,6 +6,21 @@
 **Supersedes** BUG-47's `pad_fill_decay` inheritance in `lossless_sibling` (`0072`), with the same
 guarantee reached a stronger way
 
+> **Corrected on landing, by a peer's measurement, and the correction is the useful part.** This
+> record first put the switch on `is_lossless_intent()`. A session working the same item in parallel
+> measured the case that rule assumed away: with `GNC_MED=0` a q=100 encode is a lossless **wavelet**
+> encode, and there decay is still worth **−4.64%** on the same four stills — PAD-1's figure
+> reproduced at the top of the ladder. Reproduced here at **+5.39%** on bbb when replicate is
+> forced. So `is_lossless_intent()` would have handed that arm a ~5% regression, and the switch
+> belongs where they put it: inside the **MED** branch of `quality_preset`.
+>
+> `lossless_sibling` therefore does **not** force `false` either — it takes `&=`, so decay survives
+> only where the preset asks for it *and* the caller allows it. That keeps all three cases right:
+> MED replicate, a lossless-wavelet still keeping its −4.64%, and a sequence keyframe replicate in
+> both candidates, which is what `0072`'s source-built reference needs. Everything below about
+> *why* the fill follows the candidate stands; the mechanism for detecting "bit-exact" was wrong,
+> and it was wrong in the direction of a regression nobody would have seen on the default path.
+
 ## The decision
 
 Two lines, one rule: **a bit-exact picture is padded by replication, never by PAD-1's fade.**

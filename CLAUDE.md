@@ -293,5 +293,7 @@ At every natural checkpoint (feature complete, priority item done):
 - **[BASELINE.md](BASELINE.md)** — Benchmark regression baseline
 - **[docs/BITSTREAM_SPEC.md](docs/BITSTREAM_SPEC.md)** — Bitstream format specification
 - **[RESEARCH_LOG.md](RESEARCH_LOG.md)** — Experiment log
+- **[docs/QUIET_HOUR.md](docs/QUIET_HOUR.md)** — The run list for the five items parked on an idle
+  GPU, in the order to collect them. Read it *before* stopping the other sessions, not after
 - **[README.md](README.md)** — Public project description
 - **[docs/archive/](docs/archive/)** — Historical documents (MILESTONES.md, INSTRUCTION.md, etc.)

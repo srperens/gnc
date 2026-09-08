@@ -298,13 +298,19 @@ makes the figure **pessimistic against GNC by an unmeasured amount** — not wro
 1.9x either. The ladder is also not monotonic in rate (a rung's bpp can fall as q rises), so any
 interpolation by rate should flag that.
 
-**RATE-2 shipped on 2026-09-08 (`docs/decisions/0036`) and this figure is unchanged, because the
-fix is intra-only.** A still at q=95–99 now codes both ways and keeps the smaller — mean −21.66%
-at q=99 — but the fallback is *refused* inside a sequence: a MED I-frame carries
-`wavelet_levels = 0` and the P-frame path's reference cannot reconstruct from it, measured at
-**9.80 dB against 60.69 dB** (filed as RATE-3). Sequence output is byte-identical either side of
-that commit, so re-running this ladder today reproduces +90.5% exactly. **The rung to re-run it
-against is RATE-3, not RATE-2.**
+**RATE-2 shipped on 2026-09-08 (`docs/decisions/0036`) and left this figure unchanged, because
+that fix was intra-only. RATE-3 landed the same day (`docs/decisions/0044`) and this figure is now
+stale for the top two rungs.** A still at q=95–99 codes both ways and keeps the smaller (mean
+−21.66% at q=99), and since RATE-3 a **sequence I-frame does too**: mean **−4.28%** of sequence
+bytes over three sequences at q ∈ {95, 99} and ki ∈ {2, 9}, up to **−13.16%**, at a worst quality
+move of −0.01 dB. The ladder here is q=85/92/96/99, so **q=96 and q=99 move and q=85/92 do not** —
+`quality_preset` sets the fallback for q = 95..=99 only.
+
+The direction favours GNC and the size is not guessable from the sweep above: this ladder is 4:2:0
+at ki=9, where RATE-3 measured −2.4% to −5.7%, not the −13% of its best point. **+90.5% stands as
+recorded until `meas1_vs_h264.py` is run again** — as with the INTER-2 note above, a predicted
+direction is not a measurement. Two of the four rungs have now moved for two independent reasons,
+which makes re-running this ladder the highest-value measurement in the file.
 
 **Colour, at rate matched to 1%** — CIEDE2000 on decoded RGB, which VMAF cannot see:
 

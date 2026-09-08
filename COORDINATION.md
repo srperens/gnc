@@ -431,6 +431,7 @@ If this table and `scripts/claim list` disagree, the table is wrong.
 
 | worktree | branch | area |
 |---|---|---|
+| `../gnc-refdiff` | `refdiff` | **RATE-3** — lifting `0036`'s sequence gate now that BUG-39 cause 1 is fixed. Touches `sequence.rs`'s I-frame config, `build_ip_config`, and adds `encode_as_reference` in `pipeline.rs`. The gate's real defect was never the fallback: `encode`'s two candidates leave only the *last* one's quantised planes in the GPU side channel `local_decode_iframe_gpu` reads, so when the bit-exact sibling wins the reference is built from the lossy candidate's coefficients. Not the ordering bug `0040` fixed — the other half of it. |
 | `../gnc-abac`, `.claude/worktrees/abac` (`abac-gate`) | `abac` | **released — question answered, see BACKLOG Part 6.** The idle-machine bench is run. Range at cb=64 costs **1.69× frame decode for −16.7% rate** at q=90; Interval costs 3.99×. Rice's own entropy stage is 47% of frame decode, which caps any entropy work at 1.9×. What remains is a positioning call, not an engineering one. |
 | `../gnc-abac` | `abac` | same worktree, now on **BUG-8** — the encoder's local decode diverges from the real decoder down a GOP. |
 | `../gnc-nearlossless` | `nearlossless` | **done and merged 2026-09-07** — BUG-15 fixed, INTRA-NEARLOSSLESS closed by measurement, RATE-2 confirmed independently. Worktree removed. |

@@ -4,6 +4,87 @@
 
 ---
 
+## RATE-3 — the gate was hiding the mirror image of the bug `0040` fixed (2026-09-08)
+
+**Hypothesis.** `0036` refuses RATE-2's lossless fallback inside a sequence because the P-frames
+referencing a bit-exact I-frame decoded at 9.80 dB. BUG-39 cause 1 (`0042`) fixed the encoder's
+local decode inverting a transform it had not coded with, which is the defect that produced that
+number. So the refusal should now be unnecessary, and a bit-exact reference — no drift, nothing
+propagated — should pay on inter as well as intra.
+
+**It was still broken when the gate came off, and the reason is worth more than the rate number.**
+`encode` codes two candidates; `encode_once` leaves the quantised planes on the GPU as the side
+channel `local_decode_iframe_gpu` reads to build a reference; only the **last** encode's planes
+survive. `0040` found this in one direction — sibling second, lossy frame kept, wrong reference —
+and fixed it by running the sibling first. The other direction is the same bug with the candidates
+swapped, and the gate made it unreachable: sibling first, **bit-exact** frame kept, and the
+reference is built from the *lossy* candidate's coefficients. With `0042`'s branch in place that
+means `med.inverse` over wavelet coefficients.
+
+crowd_run q=99 ki=2, gate lifted, nothing else changed:
+
+| | I-frame bytes | P-frame bytes | worst P PSNR | sequence |
+|---|---|---|---|---|
+| shipped (`f3f7254`) | 4 789 653 | 4 990 303 | 60.62 dB | 48 799 611 |
+| gate lifted, no repair | 3 240 148 (−32.3%) | 8 885 779 | **5.93 dB** | 60 946 220 (+24.9%) |
+| gate lifted, repair | 3 240 148 (−32.3%) | 5 274 377 | 60.62 dB | **42 377 516 (−13.16%)** |
+
+The fix is `encode_as_reference`: when the sibling wins, re-run it so the side channel is its own.
+Deterministic, so the returned frame is the same bytes; a `debug_assert` checks that rather than
+trusting it. It costs a **third** encode on the frames that take it, which is why it is a separate
+entry point — a still has no reference to build and must not pay for one. Stills are byte-identical.
+
+**The full sweep**, `scripts/meas_rate3.py`, three sequences × q ∈ {95, 99} × ki ∈ {2, 9}, both arms
+from one binary and one command (`GNC_LOSSLESS_FALLBACK` is the only difference), off arm verified
+byte-identical to the shipped binary first:
+
+```
+       sequence    q  ki  bytes off   bytes on   Δbytes  worst P off  worst P on      ΔP  I bit-exact
+            bbb   95   2   19110162   19110162   +0.00%        53.12       53.12   +0.00        False
+            bbb   95   9   17896443   17896443   +0.00%        53.00       53.00   +0.00        False
+            bbb   99   2   26165418   26316852   +0.58%        60.68       60.68   +0.00         True
+            bbb   99   9   24610862   24708364   +0.40%        60.67       60.67   +0.00         True
+      crowd_run   95   2   39627016   37399616   -5.62%        52.84       52.84   +0.00         True
+      crowd_run   95   9   40034340   38966554   -2.67%        52.84       52.84   +0.00         True
+      crowd_run   99   2   48799611   42377516  -13.16%        60.62       60.62   +0.00         True
+      crowd_run   99   9   49328550   46535419   -5.66%        60.61       60.61   +0.00         True
+ old_town_cross   95   2   38866054   37010354   -4.77%        52.84       52.84   +0.00         True
+ old_town_cross   95   9   39839530   38898505   -2.36%        52.83       52.84   +0.01         True
+ old_town_cross   99   2   48088416   42012499  -12.63%        60.61       60.61   +0.00         True
+ old_town_cross   99   9   49173140   46466028   -5.51%        60.61       60.60   -0.01         True
+           MEAN                                  -4.28%                            +0.00
+```
+
+**Mean −4.28% of sequence bytes at unchanged quality** (worst ΔP −0.01 dB, which is the run-to-run
+floor), and bit-exact I-frames wherever the candidate wins. PSNR leads because q > 85 and VMAF is
+saturated against a bit-exact frame by construction; there is no chroma question because the kept
+candidate improves every plane at once or is not kept.
+
+**Verified outside the harness**, `0036`'s standard: `encode-sequence` → `decode-sequence` on
+crowd_run q=99 ki=2, decoded PNGs md5-compared as raw RGB against the sources. Frames 0 and 2 (I)
+are bit-exact; 1 and 3 (P) are not, which is BUG-39 cause 3, not this item.
+
+**The failure in the table, reported rather than smoothed:** bbb q=99 gets **larger**, +0.58% and
++0.40%. The candidate is chosen on the I-frame's own size, but a bit-exact reference imposes a
+downstream cost — it carries detail a lossy reference had already quantised away, so the P-residual
+against it is bigger (visible above: crowd_run's P-frames go 4.99 → 5.27 MB even in the winning
+arm). On bbb the I-frame saving is small enough that the downstream cost exceeds it. Choosing on
+sequence bytes rather than frame bytes is the real fix and needs a second pass; a margin constant
+would be fitted to three sequences, which is the mistake RATE-2's own comment warns about. Filed as
+RATE-4. Shipped anyway: 10 of 12 points improve, 2 regress by under 0.6%, and the mean is −4.28%.
+
+**Not measured: encode time.** The repaired frames cost three encodes instead of two. The observed
+34.6 → 6.6 fps on crowd_run is under seven other live sessions and COORDINATION rule 1 forbids
+reading it; the structural statement is 3× intra encode at q = 95..=99 on the frames that take the
+repair, decode unchanged.
+
+**One correction to `0040`.** Its point 4 rejected taking a bit-exact frame's reference from the
+colour-converted source, on a measurement of 21.37 dB. That measurement is confounded — BUG-39
+cause 2 was live, so the P-frames were decoding a wavelet residual as a MED prediction whatever the
+reference held. The source-copy route is *free* where the repair costs an encode, and its
+refutation does not survive its own cause being fixed. Not re-tested here; it is RATE-4's other
+half.
+
 ## INTRA-2 — 90% of the blocker was a knob that moved two things (2026-09-08)
 
 **Hypothesis.** GNC's dead zone is a no-op in its own operating range — the quantiser is

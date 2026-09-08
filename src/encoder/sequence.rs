@@ -368,16 +368,11 @@ impl EncoderPipeline {
             // A quantiser *cascade* down the GOP (step growing with distance from the keyframe)
             // was measured here and rejected — see RESEARCH_LOG 2026-09-06. It is the flat step
             // in encode_pframe that pays; making it grow collapses the GOP tail.
-            // RATE-2's lossless fallback is **intra-only, and this is where it is refused.**
-            // Measured 2026-09-08 on bbb, 4 frames, ki=2, q=99: with the fallback active the
-            // I-frames come out bit-exact as intended, and the P-frames that reference them
-            // decode at **9.80 dB against 60.69 dB** with it off, while the sequence *grows*
-            // from 13.08 MB to 15.28 MB. A MED I-frame carries `wavelet_levels = 0` and
-            // `transform_type = 2`, and the P-frame path's reference cannot reconstruct from it.
-            //
-            // A bit-exact reference ought to be the *best* reference there is, so this is worth
-            // fixing rather than avoiding — filed as RATE-3. Until then the flag does not cross
-            // into a sequence, and the still-image path keeps its 8.5-28.9%.
+            // RATE-3: RATE-2's lossless fallback **does** cross into a sequence now, and the
+            // defect that used to stop it is fixed rather than avoided. It was never about the
+            // fallback: `local_decode_iframe_gpu` inverted a MED I-frame with the wavelet it was
+            // not coded with, so the encoder and the decoder held different references and the
+            // P-frames decoded at 9.80 dB. BUG-39 cause 1 fixed that (`docs/decisions/0042`).
             let frame_config = {
                 let mut cfg = if let Some(ref rc) = rate_ctrl {
                     let mut cfg = config.clone();
@@ -386,9 +381,9 @@ impl EncoderPipeline {
                 } else {
                     config.clone()
                 };
-                // RATE-2's lossless fallback does not cross into a sequence. RATE-3 established
-                // why, and it is not the reason RATE-2 guessed: see its BACKLOG entry.
-                cfg.lossless_fallback = false;
+                // RATE-3: `lossless_fallback` is carried from the caller — `quality_preset`
+                // sets it for q = 95..=99 — so an I-frame inside a sequence codes both ways and
+                // keeps the smaller file, exactly as a still does.
                 // PAD-1: an I-frame inside a chain is a **reference**, and motion compensation
                 // predicts edge blocks from its padding. Fading that padding flat is measured at
                 // up to 4.03 dB of worst-frame PSNR on bbb_extended at ki=9, against 0.000 dB on
@@ -430,7 +425,11 @@ impl EncoderPipeline {
             if is_keyframe {
                 let _t_iframe = std::time::Instant::now();
                 let frame_data = frames.get(display_idx);
-                let mut compressed = self.encode(ctx, &frame_data, width, height, &frame_config);
+                // RATE-3: `encode_as_reference`, not `encode` — this frame is what the
+                // P-frames predict from, and the fallback's two candidates leave only one of
+                // their two sets of quantised planes behind for `local_decode_iframe_gpu`.
+                let mut compressed =
+                    self.encode_as_reference(ctx, &frame_data, width, height, &frame_config);
                 compressed.frame_type = FrameType::Intra;
 
                 if let Some(ref mut rc) = rate_ctrl {
@@ -1904,9 +1903,11 @@ impl EncoderPipeline {
         }
 
         // Tail: encode remaining frames as I-frames (no temporal transform).
-        // RATE-2's fallback is refused here too: these frames are references for nothing in this
-        // path, but the same config feeds the temporal groups above and one rule is easier to
-        // reason about than two. See RATE-3.
+        // RATE-2's fallback stays refused on this path. RATE-3 lifted it for the I/P sequence
+        // encoder, where it is worth a mean −4.28% of sequence bytes (`docs/decisions/0044`), and
+        // deliberately did not lift it here: the temporal-wavelet mode is off by default and was
+        // not in that sweep, so turning it on would be an unmeasured default. The same config
+        // feeds the temporal groups above, which is why this is one line and not two.
         let mut cfg = cfg.clone();
         cfg.lossless_fallback = false;
         // PAD-1, and here the comment above applies verbatim: these tail frames reference

@@ -3673,11 +3673,54 @@ every frame prints it.
 **Why P1.** It is a shipped codec producing 12 dB video at its highest quality setting. It also
 gates RATE-3, and RATE-3 gates the inter half of RATE-2's 21.66%.
 
-### RATE-3 — a bit-exact I-frame is not a drop-in reference (**investigated 2026-09-08, not fixed**, P1)
+### RATE-4 — the candidate is chosen on one frame's bytes and paid for by the next one's (todo, P2)
 
-**Three attempts, two refuted hypotheses, one real fix kept, and a named next measurement.**
-`docs/decisions/0040`. The gate `0036` shipped stays; the tree is byte-identical to it on stills
-and back to 60.64/60.62 dB P-frames on sequences.
+Filed 2026-09-08 by RATE-3, which shipped the win and measured this as its cost.
+
+`encode` keeps the smaller of two candidates by comparing **that frame's** bytes. Inside a sequence
+that is the wrong ledger: a bit-exact I-frame carries detail a lossy one had already quantised away,
+so the P-residual predicted from it is larger. Measured on crowd_run q=99 ki=2, where the trade is
+strongly favourable, the P-frames still grow 4 990 303 → 5 274 377 B. On **bbb q=99 the downstream
+cost exceeds the I-frame saving**: the sequence grows +0.58% at ki=2 and +0.40% at ki=9, the only
+two regressions in RATE-3's twelve-point table (`docs/decisions/0044`).
+
+**Do not fix this with a margin constant.** Three sequences is not enough to fit one, and RATE-2's
+own comment says why: the boundary is content-dependent — q=95 on blue_sky, q=98 on bbb — which is
+the reason the fallback codes both ways instead of guessing. The honest fix compares *sequence*
+bytes, which needs the GOP encoded both ways or a model of the residual cost.
+
+**Its other half is free and is a correction to `0040`.** A bit-exact frame's reference *is* its
+colour-converted source, which both forward transforms only read — so `local_decode_iframe_gpu`
+could copy it instead of re-running the encode `encode_as_reference` now pays for. `0040` point 4
+measured that route at 21.37 dB and reverted it, **but BUG-39 cause 2 was live at the time**, so the
+P-frames were decoding a wavelet residual as a MED prediction regardless of the reference. The
+refutation does not survive its own cause being fixed, and the instrument to settle it already
+exists: `fallback_iframe_reference_matches_the_decoders`.
+
+**Success criterion:** no point in RATE-3's table larger than the control arm, mean no worse than
+today's −4.28%, worst P within 0.1 dB. **Canary:** the two existing ones — RATE-2's per-frame
+candidate line and RATE-3's repair line — plus a count of frames where the sequence-level choice
+differs from the frame-level one.
+
+### RATE-3 — a bit-exact I-frame is a drop-in reference now (**DONE 2026-09-08**, mean −4.28% of sequence bytes)
+
+**`0036`'s sequence gate is lifted and the fallback now runs on sequence I-frames at q = 95..=99.**
+`docs/decisions/0044`; numbers in RESEARCH_LOG. Three sequences × q ∈ {95, 99} × ki ∈ {2, 9}:
+**mean −4.28% of sequence bytes, best −13.16%**, worst P-frame move −0.01 dB, I-frames bit-exact
+wherever the candidate wins — verified outside the harness by md5 on a real `encode-sequence` →
+`decode-sequence` round trip. Stills are byte-identical. Two of twelve points regress (bbb q=99,
++0.58% / +0.40%) and that is RATE-4.
+
+**The gate was hiding the mirror image of the bug `0040` fixed.** `encode_once` leaves the quantised
+planes on the GPU as the side channel `local_decode_iframe_gpu` reads, and only the **last** encode's
+survive. `0040` fixed *sibling second, lossy kept*; the gate made *sibling first, bit-exact kept*
+unreachable, and with `0042`'s branch in place that one runs `med.inverse` over wavelet coefficients
+— P-frames at **5.93 dB** and the sequence +24.9%. No ordering fixes it, because either candidate
+can win. `encode_as_reference` re-runs whichever was kept, at the cost of a third encode on those
+frames only; the still path does not have it and does not pay.
+
+The original investigation follows, and its two refuted hypotheses still stand — but **its point 4
+is confounded**: the source-copy reference was measured while BUG-39 cause 2 was live. See RATE-4.
 
 **Kept from this item:** `encode`'s two candidate encodes now run **sibling first, configured path
 second**. `local_decode_iframe_gpu` builds an I-frame's reference from the quantised planes

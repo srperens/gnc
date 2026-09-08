@@ -169,8 +169,17 @@ fn bucket(nb: u32) -> u32 {
 // blocks. Moving both into workgroup memory is the difference between "a GPU port exists" and
 // "a GPU port is worth shipping".
 //
-// Budget on an M1 (32 KB per workgroup): 32 threads x 18 probabilities = 2.3 KB, plus two rows
-// of magnitudes per thread at MAX_BLOCK_W = 64 => 32 x 2 x 64 x 4 B = 16 KB. Total 18.3 KB.
+// Budget: **16384 B, because that is what `GpuContext` requests** (wgpu's default limits, for
+// WebGPU portability) — not the 32 KB this adapter happens to offer. 32 threads x 18
+// probabilities = 2304 B, plus two rows of magnitudes per thread at MAX_BLOCK_W = 64, packed one
+// byte each => 32 x 2 x 64 x 1 B = 4096 B. Total **6400 B**.
+//
+// It was 18688 B until 2026-09-08 (BUG-31), one u32 per magnitude, which is 2304 B *over* the
+// requested limit. Nothing enforced it: `max_compute_workgroup_storage_size` is never checked
+// against a shader by wgpu, native Metal honours the hardware's 32 KB, and a conformant WebGPU
+// implementation would have refused the pipeline. `tests/workgroup_storage_limit.rs` is the check
+// that does enforce it. The packing also brings the shader inside the 2-workgroups-per-core
+// occupancy point that 16 KB implies, which the old layout could not reach.
 // This is why the code-block width is capped at 64 and the host asserts it.
 //
 // **Both arrays are thread-interleaved, and that is the whole performance story.** The obvious
@@ -184,7 +193,34 @@ const WG: u32 = 32u;
 const MAX_BLOCK_W: u32 = 64u;
 
 var<workgroup> probs: array<u32, 576>;              // WG * NUM_CONTEXTS
-var<workgroup> rows: array<u32, 4096>;              // WG * 2 * MAX_BLOCK_W
+var<workgroup> rows: array<u32, 1024>;              // WG * ROW_WORDS
+
+// `rows` packs four magnitudes per word, one byte each, because the full u32 was 16 KB on its own
+// and put the shader over the workgroup budget the device is created with (BUG-31).
+//
+// **Clamping at ROW_CLAMP cannot change a single context, which is why this is bit-exact and not
+// an approximation.** `bucket` saturates: any `nb >= 1 << (NUM_BUCKETS - 2)` returns
+// `NUM_BUCKETS - 1`. So for a contributor `a`:
+//   * `a < ROW_CLAMP` is stored exactly, and a sum of such contributors is exact;
+//   * `a >= ROW_CLAMP` stores ROW_CLAMP, and both the clamped and the true sum are then
+//     `>= ROW_CLAMP` and both bucket to `NUM_BUCKETS - 1`.
+// Either way `bucket(nb)` is identical, so the coder sees the same context sequence and emits the
+// same bytes. Asserted rather than argued: the abac identity gates compare whole files against the
+// CPU coder in `abac.rs`, which stores true magnitudes.
+const ROW_CLAMP: u32 = 1u << (NUM_BUCKETS - 2u);
+const ROW_WORDS: u32 = 2u * MAX_BLOCK_W / 4u;       // 32 words of 4 magnitudes per thread
+
+fn row_get(i: u32, tid: u32) -> u32 {
+    let w = rows[(i >> 2u) * WG + tid];
+    return (w >> ((i & 3u) * 8u)) & 0xFFu;
+}
+
+fn row_set(i: u32, tid: u32, a: u32) {
+    let idx = (i >> 2u) * WG + tid;
+    let sh = (i & 3u) * 8u;
+    rows[idx] = (rows[idx] & ~(0xFFu << sh)) | (min(a, ROW_CLAMP) << sh);
+}
+
 
 @compute @workgroup_size(32)
 fn main(
@@ -203,7 +239,7 @@ fn main(
         probs[i * WG + tid] = PROB_HALF;
     }
     // Two row buffers per thread, alternated by row parity so no copy is needed between rows.
-    for (var i = 0u; i < 2u * MAX_BLOCK_W; i++) {
+    for (var i = 0u; i < ROW_WORDS; i++) {
         rows[i * WG + tid] = 0u;
     }
 
@@ -230,15 +266,15 @@ fn main(
         for (var x = 0u; x < info.width; x++) {
             var nb = 0u;
             if (x > 0u) {
-                nb = nb + rows[(cur + x - 1u) * WG + tid];
+                nb = nb + row_get(cur + x - 1u, tid);
             }
             if (y > 0u) {
-                nb = nb + rows[(prev + x) * WG + tid];
+                nb = nb + row_get(prev + x, tid);
                 if (x > 0u) {
-                    nb = nb + rows[(prev + x - 1u) * WG + tid];
+                    nb = nb + row_get(prev + x - 1u, tid);
                 }
                 if (x + 1u < info.width) {
-                    nb = nb + rows[(prev + x + 1u) * WG + tid];
+                    nb = nb + row_get(prev + x + 1u, tid);
                 }
             }
             let ctx = bucket(nb);
@@ -276,7 +312,7 @@ fn main(
                 }
             }
             out[info.out_offset + y * info.stride + x] = f32(v);
-            rows[(cur + x) * WG + tid] = a;
+            row_set(cur + x, tid, a);
         }
     }
 }
@@ -375,7 +411,7 @@ fn main_rc(
     for (var i = 0u; i < NUM_CONTEXTS; i++) {
         probs[i * WG + tid] = RC_PROB_HALF;
     }
-    for (var i = 0u; i < 2u * MAX_BLOCK_W; i++) {
+    for (var i = 0u; i < ROW_WORDS; i++) {
         rows[i * WG + tid] = 0u;
     }
 
@@ -396,15 +432,15 @@ fn main_rc(
         for (var x = 0u; x < info.width; x++) {
             var nb = 0u;
             if (x > 0u) {
-                nb = nb + rows[(cur + x - 1u) * WG + tid];
+                nb = nb + row_get(cur + x - 1u, tid);
             }
             if (y > 0u) {
-                nb = nb + rows[(prev + x) * WG + tid];
+                nb = nb + row_get(prev + x, tid);
                 if (x > 0u) {
-                    nb = nb + rows[(prev + x - 1u) * WG + tid];
+                    nb = nb + row_get(prev + x - 1u, tid);
                 }
                 if (x + 1u < info.width) {
-                    nb = nb + rows[(prev + x + 1u) * WG + tid];
+                    nb = nb + row_get(prev + x + 1u, tid);
                 }
             }
             let ctx = bucket(nb);
@@ -440,7 +476,7 @@ fn main_rc(
                 }
             }
             out[info.out_offset + y * info.stride + x] = f32(v);
-            rows[(cur + x) * WG + tid] = a;
+            row_set(cur + x, tid, a);
         }
     }
 }

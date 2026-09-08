@@ -144,6 +144,109 @@ than filed: below the 1% floor by construction.
 **Gates:** `cargo test --release -- --test-threads=1` green; `cargo clippy --release` clean; wasm
 `--lib` clean (the wasm *binary* target is red on `main`, pre-existing, BUG-24).
 
+## BUG-31 — abac was 2304 B over a limit nobody checks, and the sweep found eight more (2026-09-08)
+
+**Hypothesis.** `abac_decode.wgsl` and `abac_encode.wgsl` declare 18688 B of workgroup memory
+against a device created with `max_compute_workgroup_storage_size: 16384`, so a conformant WebGPU
+implementation would refuse the pipeline — and because `DecoderPipeline::new` builds
+`GpuAbacDecoder` unconditionally, that would fail *every* WASM decode, Rice files included.
+
+**Success criteria, set before the change:** every compute entry point at or under 16384 B; abac's
+emitted bytes unchanged, asserted by whole-file comparison rather than by decoding to the same
+picture; full suite and both clippy targets clean.
+
+### The item's own first step, questioned
+
+BUG-31 said to run the WASM decode in a browser first, and "if it passes, this is P3
+documentation". **That inference does not hold.** A browser that happens not to validate would not
+make 18688 B against a 16384 B device conformant — it would hide the defect behind one
+implementation's leniency, and the spec rule stays there for the next implementation. So the
+browser run was kept as owed evidence and *not* used as the gate.
+
+The gate instead is `tests/workgroup_storage_limit.rs`: it parses every `src/shaders/*.wgsl` with
+naga, sums `var<workgroup>` sizes **per compute entry point** (per entry point, not per module —
+charging a pipeline for memory its entry point never touches would invent defects), and asserts
+against `wgpu::Limits::default().max_compute_workgroup_storage_size`. The budget is read from the
+same place the device request reads it, so raising the request moves the test with it.
+
+Method check before trusting it: it computes 18688 B for `abac_decode:main`, which is exactly the
+hand-derived figure in BUG-31. Agreement with a known-correct number by a different route.
+
+### What it found: nine entry points, not four
+
+| shader:entry point | declares | over by |
+|---|---|---|
+| `rans_normalize_encode_fused.wgsl:main` | 33816 B | +17432 B |
+| `quantize_histogram_fused.wgsl:main` | **23800 B** | **+7416 B** |
+| `rans_histogram.wgsl:main` | 23752 B | +7368 B |
+| `abac_decode.wgsl:main`, `:main_rc` | 18688 B | +2304 B |
+| `abac_encode.wgsl:main`, `:main_rc` | 18688 B | +2304 B |
+| `rans_normalize.wgsl:main` | 18460 B | +2076 B |
+| `rans_encode.wgsl:main` | 16388 B | **+4 B** |
+
+**`quantize_histogram_fused` is not opt-in** — `EncoderPipeline::new` constructs it
+unconditionally, and it is the fused quantise+histogram stage in CLAUDE.md's architecture list. So
+the default *encoder* is 7416 B over the budget it asked for. BUG-31 was filed as "abac's two GPU
+shaders" and understated its own finding by more than half. The five non-abac entry points are
+filed as **BUG-35**.
+
+### The fix: pack, don't narrow
+
+`rows` now stores one clamped byte per magnitude, four to a word: **18688 B -> 6400 B**.
+
+The clamp is exact. `bucket` saturates — any `nb >= 1 << (NUM_BUCKETS - 2)` (= 16) returns
+`NUM_BUCKETS - 1` — so with `ROW_CLAMP = 16`, a contributor below 16 is stored exactly and a sum of
+such contributors is exact, while a contributor at or above 16 stores 16 and both the clamped and
+the true sum are `>= 16` and bucket identically. `bucket(nb)` therefore never differs, so the
+context sequence and the bytes cannot. Written as `1u << (NUM_BUCKETS - 2u)` so it cannot drift.
+Bank interleaving survives: magnitude `i` for thread `t` is word `(i >> 2) * WG + t`, so lane `t`
+is still bank `t`.
+
+**Rejected, with what each would have cost** (full reasoning in `docs/decisions/0032`):
+`WG` 32 -> 28 fits at 16352 B and is byte-identical with no argument needed, but idles 12.5% of the
+SIMD lanes on the codec's slowest stage and *still* fits only one workgroup per core;
+`MAX_BLOCK_W` 64 -> 48 fits but invalidates every abac rate figure on record; raising the request
+to 32768 trades the portability axis GOALS says the project wins on; moving `probs` back to
+function scope is the regression the shader's own comment was written to explain.
+
+### Verification — the bytes did not move
+
+- **98 of 98 whole-file byte comparisons identical** (`scripts/ent5_gpu_encode_gate.sh`): both
+  arithmetic engines, both sizing modes, 4:4:4/4:2:2/4:2:0, lossy through bit-exact lossless, four
+  stills and two sequences. The CPU encoder is untouched, so GPU == CPU before and after means the
+  emitted bytes are unchanged.
+- **Decoded output hashed before and after** — `bbb_1080p` q=50/90/100 and `kristensara_720p` q=90
+  4:2:0, rebuilt from stashed shaders for the "before" arm: all four SHA-256s equal, and the four
+  `.gnc` files compare equal.
+- **234 tests pass, 0 failures.** Native clippy clean;
+  `--target wasm32-unknown-unknown --lib` clean and builds. The wasm `bin` target still fails —
+  that is **BUG-24**, and a `.wgsl` diff cannot affect it.
+- The canary was itself tested: perturbing a recorded size fails the test, and removing an offender
+  from the record fails it. Both restored.
+- **Re-verified after rebasing onto ENT-6, which touched `src/encoder/abac.rs` — the CPU reference
+  the whole byte-identity argument rests on.** Its change is `pub(crate)` visibility plus two
+  methods only the new diagnostic calls, so the coder's behaviour is unchanged, but the argument is
+  only as good as the gate: **98 of 98 identical again on the rebased tree**, 234 tests, clippy
+  clean. COORDINATION's "a rebase can break things silently" is the reason to re-run rather than
+  to reason about the diff.
+
+### Not measured, and deliberately
+
+**Throughput.** 6400 B is inside the two-workgroups-per-core point CLAUDE.md names as full
+occupancy at 16 KB, which the old 18688 B layout could not reach — but that is a structural
+argument, not a number. Another session was active, and this repository has retracted wall-clock
+figures taken on a loaded machine before. Owed on an idle machine via
+`cargo test --release --test abac_bench -- --ignored`; note BUG-32 first, since
+`benchmark-sequence`'s wall clock is 86% CPU quality metrics. **This entry claims conformance and
+byte-identity, both verified, and does not claim a speedup.**
+
+### One thing the day's own coordination fix earned back immediately
+
+Reserving the decision-record number used `git ls-tree --name-only main docs/decisions/`, per the
+habit committed hours earlier. It returned `0031`; this worktree's own `ls docs/decisions/` showed
+only `0030`, because `0031` landed on `main` after the worktree's base. The stale oracle would have
+handed out a colliding `dr-0031` — the exact failure recorded that morning, reproduced within the
+hour, and prevented by the one command.
 
 ---
 

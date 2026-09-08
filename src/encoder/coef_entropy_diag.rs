@@ -35,6 +35,7 @@
 use std::collections::HashMap;
 
 use super::abac::{bucket, neighbour_sum, NUM_BUCKETS};
+use super::abac_init_diag;
 use super::bpc_paco_diag::{self, BpcStats, BpcTable};
 use super::abac_tile::{abac_decode_tile, band_name, code_blocks_banded, AbacTile};
 
@@ -139,6 +140,9 @@ struct BandStats {
     coefficients: u64,
     /// Bytes the shipped bitstream actually spends here, including each block's length field.
     shipped_bytes: f64,
+    /// The same without the length field — the coder's own output, which is what ENT-6's
+    /// simulation is comparable to.
+    payload_bytes: f64,
     blocks: u64,
     /// Signed-symbol histogram for `H0`.
     h0: HashMap<i64, u64>,
@@ -154,6 +158,10 @@ struct BandStats {
     sign_bits: f64,
     /// ENT-7 step 3: BPC-PaCo's parallel-context bitplane model on the same coefficients.
     bpc: BpcStats,
+    /// ENT-6: abac's real engine, cold-started at p = 1/2 — the canary against `shipped`.
+    adapt_cold: f64,
+    /// ENT-6: the same engine started from this band's own signalled table.
+    adapt_warm: f64,
 }
 
 impl BandStats {
@@ -286,6 +294,7 @@ pub fn run(tiles: &[AbacTile], plane_tile_counts: [usize; 3], qstep: f32) {
                 let st = &mut stats[p][band];
                 let len = tile.block_lengths[b];
                 st.shipped_bytes += f64::from(len) + length_field_bytes(len);
+                st.payload_bytes += f64::from(len);
                 st.blocks += 1;
                 let mut blk = Vec::with_capacity(bw * bh);
                 for y in 0..bh {
@@ -368,6 +377,92 @@ pub fn run(tiles: &[AbacTile], plane_tile_counts: [usize; 3], qstep: f32) {
         (t[0] / t[3].max(1e-9) - 1.0) * 100.0,
         (t[0] / t[5].max(1e-9) - 1.0) * 100.0,
     );
+
+    // === ENT-6 second pass: abac's real engine, cold start against warm ===
+    // Pass 1 above measured each (plane, subband, context)'s empirical P(bit = 0); a signalled
+    // initialisation table is exactly that, quantised to a byte. Pricing it needs a second walk,
+    // because the table cannot be known until the first walk has finished.
+    let warm: Vec<Vec<Vec<u32>>> = stats
+        .iter()
+        .map(|bands| bands.iter().map(|st| abac_init_diag::warm_init(&st.ctx)).collect())
+        .collect();
+    let cold = abac_init_diag::cold_init();
+    // ENT-6 candidate 2: stop cutting code-blocks on subband boundaries below `cb`. At tile 256
+    // with 5 levels and cb 64 the tile's top-left 64x64 block then carries LL *and* all of levels
+    // 3, 4 and 5 — one block where the band-aligned cut makes ten — so the coder sees 4096
+    // coefficients instead of 64 to 1024, and the tile spends nine fewer length fields. No
+    // header, no signalled table, no bitstream table of any kind: only the partition changes.
+    //
+    // Its warm table cannot be per subband, because a merged block spans subbands, so it is
+    // pooled per plane — 18 bytes per plane, 54 per frame, cheaper still than the per-band one.
+    let plane_warm: Vec<Vec<u32>> = stats
+        .iter()
+        .map(|bands| {
+            let mut pooled = vec![BinCount::default(); NUM_BUCKETS * 3];
+            for st in bands {
+                for (acc, c) in pooled.iter_mut().zip(&st.ctx) {
+                    acc.n += c.n;
+                    acc.ones += c.ones;
+                }
+            }
+            abac_init_diag::warm_init(&pooled)
+        })
+        .collect();
+    let mut merged = [0.0f64; 2]; // cold, warm
+    let mut merged_blocks = 0u64;
+    let mut merged_len_bytes = 0.0f64;
+    let mut idx = 0usize;
+    for (p, &count) in plane_tile_counts.iter().enumerate() {
+        for _ in 0..count {
+            if idx >= tiles.len() {
+                break;
+            }
+            let tile = &tiles[idx];
+            idx += 1;
+            let ts = tile.tile_size as usize;
+            let coefficients = abac_decode_tile(tile);
+            for &(bx, by, bw, bh, band) in
+                &code_blocks_banded(ts, tile.num_levels, tile.cb_size as usize)
+            {
+                let mut blk = Vec::with_capacity(bw * bh);
+                for y in 0..bh {
+                    let row = (by + y) * ts + bx;
+                    blk.extend_from_slice(&coefficients[row..row + bw]);
+                }
+                let st = &mut stats[p][band];
+                st.adapt_cold += abac_init_diag::adapt_bits(&blk, bw, &cold);
+                st.adapt_warm += abac_init_diag::adapt_bits(&blk, bw, &warm[p][band]);
+            }
+
+            // Candidate 2, same tile, same coefficients, plain cb grid.
+            let cb = tile.cb_size as usize;
+            let mut by = 0;
+            while by < ts {
+                let bh = cb.min(ts - by);
+                let mut bx = 0;
+                while bx < ts {
+                    let bw = cb.min(ts - bx);
+                    let mut blk = Vec::with_capacity(bw * bh);
+                    for y in 0..bh {
+                        let row = (by + y) * ts + bx;
+                        blk.extend_from_slice(&coefficients[row..row + bw]);
+                    }
+                    let cold_bits = abac_init_diag::adapt_bits(&blk, bw, &cold);
+                    merged[0] += cold_bits;
+                    merged[1] += abac_init_diag::adapt_bits(&blk, bw, &plane_warm[p]);
+                    merged_blocks += 1;
+                    // The length field this block would cost, sized from its own simulated
+                    // output so the comparison against the band-aligned cut is like for like.
+                    merged_len_bytes += length_field_bytes((cold_bits / 8.0).ceil() as u32);
+                    bx += cb;
+                }
+                by += cb;
+            }
+        }
+    }
+
+    abac_init_table(&stats, &planes, num_levels, tiles.len());
+    merged_blocks_summary(&stats, merged, merged_blocks, merged_len_bytes);
 
     bpc_paco_table(&stats, &planes, num_levels);
 
@@ -520,4 +615,168 @@ fn bpc_paco_table(stats: &[Vec<BandStats>], planes: &[&str; 3], num_levels: u32)
             Err(e) => eprintln!("[coef-entropy] WARNING: GNC_BPC_DUMP={path} not written: {e}"),
         }
     }
+}
+
+/// ENT-6: abac's cold start, priced by simulating the coder rather than bounding it.
+///
+/// `Ahalf` starts every context at p = 1/2 as abac does today and is the **canary**: it models
+/// the shipped update rule on the shipped coefficients, so it has to land on `shipped`. `Awarm`
+/// starts from the band's own empirical P(bit = 0) quantised to one byte, which is what a
+/// signalled table carries, and `hdr` is what signalling it costs **once per frame** — 18 bytes
+/// per (plane, subband). Per *tile* instead, as BACKLOG's candidate 1 proposes, that column is
+/// `tiles / bands` times larger, which is the difference between 0.05% and 1.9% of a 1080p frame.
+fn abac_init_table(
+    stats: &[Vec<BandStats>],
+    planes: &[&str; 3],
+    num_levels: u32,
+    num_tiles: usize,
+) {
+    eprintln!(
+        "  --- ENT-6: abac's own engine, cold start (p=1/2) against a signalled warm start ---"
+    );
+    eprintln!(
+        "  {:>5} {:>5} {:>11} {:>11} {:>11} {:>7} {:>9} {:>9}",
+        "plane", "band", "shipped B", "Ahalf B", "Awarm B", "hdr B", "canary", "warm win"
+    );
+    let mut t = [0.0f64; 4];
+    for (p, plane) in planes.iter().enumerate() {
+        let mut pt = [0.0f64; 4];
+        let mut any = false;
+        for (band, st) in stats[p].iter().enumerate() {
+            if st.coefficients == 0 {
+                continue;
+            }
+            any = true;
+            let row = [
+                st.shipped_bytes,
+                st.adapt_cold / 8.0,
+                st.adapt_warm / 8.0,
+                abac_init_diag::TABLE_BYTES_PER_BAND,
+            ];
+            eprintln!(
+                "  {plane:>5} {:>5} {:>11.0} {:>11.0} {:>11.0} {:>7.0} {:>+8.2}% {:>+8.2}%",
+                band_name(band, num_levels),
+                row[0],
+                row[1],
+                row[2],
+                row[3],
+                (row[1] / row[0].max(1e-9) - 1.0) * 100.0,
+                ((row[2] + row[3]) / row[0].max(1e-9) - 1.0) * 100.0,
+            );
+            for i in 0..4 {
+                pt[i] += row[i];
+            }
+        }
+        if !any {
+            continue;
+        }
+        eprintln!(
+            "  {plane:>5} {:>5} {:>11.0} {:>11.0} {:>11.0} {:>7.0} {:>+8.2}% {:>+8.2}%",
+            "ALL", pt[0], pt[1], pt[2], pt[3],
+            (pt[1] / pt[0].max(1e-9) - 1.0) * 100.0,
+            ((pt[2] + pt[3]) / pt[0].max(1e-9) - 1.0) * 100.0,
+        );
+        for i in 0..4 {
+            t[i] += pt[i];
+        }
+    }
+    eprintln!(
+        "  {:>5} {:>5} {:>11.0} {:>11.0} {:>11.0} {:>7.0} {:>+8.2}% {:>+8.2}%",
+        "TOTAL", "", t[0], t[1], t[2], t[3],
+        (t[1] / t[0].max(1e-9) - 1.0) * 100.0,
+        ((t[2] + t[3]) / t[0].max(1e-9) - 1.0) * 100.0,
+    );
+    // The canary, decomposed rather than asserted. The simulation charges `−log2 p` per
+    // decision; the real coder additionally flushes each block's stream to a whole byte with
+    // terminating bits, and the container spends a length field per block. Both are per-block
+    // costs a warm start pays too, so they cancel in the warm-vs-cold comparison — but they have
+    // to be *shown* to cancel, or a 1% disagreement looks like a broken model.
+    let (payload, blocks): (f64, u64) = stats
+        .iter()
+        .flatten()
+        .fold((0.0, 0), |(b, n), st| (b + st.payload_bytes, n + st.blocks));
+    let per_block = (payload - t[1]) * 8.0 / blocks.max(1) as f64;
+    let canary = (t[1] / t[0].max(1e-9) - 1.0).abs() * 100.0;
+    eprintln!(
+        "  canary: the simulated cold coder is {canary:.2}% under what the bitstream spent, \
+         which is {per_block:.1} bits per code-block over {blocks} blocks — the coder's \
+         per-block flush and terminating bits, plus {:.0} B of length fields ({:.2}% of rate). \
+         {}",
+        t[0] - payload,
+        (t[0] - payload) / t[0].max(1e-9) * 100.0,
+        if per_block > 0.0 && per_block < 96.0 {
+            "Within the per-block flush band measured against both real engines in \
+             `abac_init_diag`'s test (worst 81.3 bits, the range coder at 64x64); both variants \
+             pay it, so it cancels in the warm-vs-cold column."
+        } else {
+            "OUTSIDE the measured per-block flush band — this model is wrong, do not read the \
+             warm column."
+        }
+    );
+    // The decisive number: warm against cold *inside the simulation*, so every per-block cost
+    // the simulation does not model is present on both sides and cancels.
+    let win = (t[2] + t[3] - t[1]) / t[0].max(1e-9) * 100.0;
+    let win_per_tile = (t[2] + t[3] * num_tiles as f64 / 3.0 - t[1]) / t[0].max(1e-9) * 100.0;
+    eprintln!(
+        "  => ENT-6, warm vs cold at equal overheads: **{win:+.2}% of total rate** with the \
+         table signalled once per frame ({:.0} B), and {win_per_tile:+.2}% with it signalled \
+         per tile ({num_tiles} tiles, {:.0} B) — BACKLOG candidate 1's design. Criterion is \
+         >=2%, close below 1%.",
+        t[3],
+        t[3] * num_tiles as f64 / 3.0,
+    );
+}
+
+/// ENT-6 candidate 2: what the band-aligned code-block cut costs, and what dropping it below
+/// `cb` would buy.
+///
+/// Attribution has to be per frame rather than per band here, because a merged block spans
+/// subbands by construction — that is the whole change. Three quantities move together and all
+/// three are in the comparison: the coder's own bits, the number of blocks (and therefore the
+/// length fields the container spends), and the loss of per-band homogeneity that the current cut
+/// buys. The first two are counted; the third is whatever remains.
+fn merged_blocks_summary(
+    stats: &[Vec<BandStats>],
+    merged: [f64; 2],
+    merged_blocks: u64,
+    merged_len_bytes: f64,
+) {
+    let (banded_cold, banded_warm, banded_len, banded_blocks) = stats.iter().flatten().fold(
+        (0.0, 0.0, 0.0, 0u64),
+        |(c, w, l, n), st| {
+            (
+                c + st.adapt_cold,
+                w + st.adapt_warm,
+                l + (st.shipped_bytes - st.payload_bytes),
+                n + st.blocks,
+            )
+        },
+    );
+    if banded_blocks == 0 || merged_blocks == 0 {
+        return;
+    }
+    let banded_total = banded_cold / 8.0 + banded_len;
+    let merged_total = merged[0] / 8.0 + merged_len_bytes;
+    let merged_warm_total = merged[1] / 8.0 + merged_len_bytes + 3.0 * NUM_BUCKETS as f64 * 3.0;
+    eprintln!(
+        "  --- ENT-6 candidate 2: drop the subband-aligned code-block cut below cb ---"
+    );
+    eprintln!(
+        "  band-aligned: {banded_blocks} blocks, {:.0} B coder + {banded_len:.0} B length \
+         fields = {banded_total:.0} B",
+        banded_cold / 8.0,
+    );
+    eprintln!(
+        "  plain cb grid: {merged_blocks} blocks, {:.0} B coder + {merged_len_bytes:.0} B length \
+         fields = {merged_total:.0} B  =>  {:+.2}% of the band-aligned total",
+        merged[0] / 8.0,
+        (merged_total / banded_total - 1.0) * 100.0,
+    );
+    eprintln!(
+        "  plain cb grid + a per-plane warm table (54 B/frame): {merged_warm_total:.0} B  =>  \
+         {:+.2}%, against {:+.2}% for the band-aligned cut with its per-band warm table",
+        (merged_warm_total / banded_total - 1.0) * 100.0,
+        ((banded_warm / 8.0 + banded_len + 3.0 * NUM_BUCKETS as f64 * 16.0) / banded_total - 1.0)
+            * 100.0,
+    );
 }

@@ -4322,12 +4322,59 @@ non-GPU work, so 24% overhead at the default `--iterations` — run it large; an
 that is not evidence of an idle GPU. The rate half of this item is unaffected by all of it — bytes
 are deterministic.
 
+**A second thing rides on this item, from ENT-6 (2026-09-08, decision `0031`).** ENT-6's candidate
+2 — stop cutting code-blocks on subband boundaries below `cb` — measures **−0.40% of rate** and is
+also a simplification: 3000 → 1920 blocks per 1080p 4:4:4 frame, 36% fewer length fields,
+`code_blocks_banded` collapsing into a plain grid, and at tile 256 with cb 64 only each tile's
+top-left block changes at all. It was **not** taken, on one objection: fewer blocks is less
+parallelism, and abac is one thread per code-block. **If this item lands, that objection is gone** —
+a block would be 32 threads and block size would stop being the parallelism knob. So ENT-6's
+candidate 2 becomes a free follow-on to ENT-8 and should be re-priced as part of it.
+
 **Why P2.** It is the only remaining idea with a credible path to abac's decode cost, and step 1
 is an afternoon with an existing harness. Against that: the throughput half cannot be measured on
 a shared machine at all (COORDINATION), and the rate gate may kill it before the shader work
 starts — which is why the gate is first.
 
-### ENT-6 — abac's deep subbands are one short code-block each, and they cost ~4% of the file (todo, P2)
+### ENT-6 — abac's cold start is worth 1.3%, not 4% (**CLOSED by measurement 2026-09-08**)
+
+**Closed. Neither candidate ships.** Decision record
+[0031](docs/decisions/0031-abacs-cold-start-is-worth-one-point-three-not-four.md), numbers in
+RESEARCH_LOG "ENT-6 — abac's cold start is worth 1.3% of rate, not 4%".
+
+**Why the ~4% below is wrong, and it is the transferable part.** That figure is a *bound* ratio.
+`coef_entropy_diag`'s columns pool their probabilities over a whole plane's worth of a subband, so
+on a short block "shipped vs bound" mixes the cold start — which an initialisation fixes — with the
+gap between a per-block adaptive model and a plane-wide oracle, which nothing fixes. **The pooling
+is the thing being priced. A bound cannot price a change to initialisation.**
+
+Measured instead by *simulating* the coder — `src/encoder/abac_init_diag.rs`, the shipped
+`Prob::update` driven over the shipped coefficients, only the initialisation changing between arms
+— on the four stills at q=85/90/95/99, as a percentage of what abac's bitstream really spent:
+
+| | q=85 | q=90 | q=95 | q=99 |
+|---|---|---|---|---|
+| candidate 1, signalled table **once per frame** (864 B) | −1.48% | −1.25% | −0.93% | −0.61% |
+| candidate 1, signalled **per tile** — the design below | +1.2% … +0.4% (a **loss**) | | | |
+| candidate 2, drop the band-aligned cut below `cb` | −0.47% | −0.42% | −0.37% | −0.31% |
+| both together | no better than candidate 1 alone — they are **substitutes** | | | |
+
+Against the criterion below (≥2% at q=90, close under 1%) the best variant reaches **1.07–1.52%**.
+Three things settle it: the effect **shrinks with quality** while the bound ratio grows, which is
+the artefact itself; candidate 1 makes the entropy encode **two-pass**; and the per-tile design the
+item proposed costs 34.5 kB of header against a 2% target, so it is larger files.
+
+**What survives:** candidate 2 is a −0.40% rate win *and* a simplification (3000 → 1920 blocks per
+1080p frame, 36% fewer length fields, `code_blocks_banded` collapses to a plain grid, and only each
+tile's top-left block actually changes) whose one objection is that fewer blocks is less
+parallelism. **ENT-8 removes that objection** — see its entry. And one untested variant is cheaper
+than either: a two-speed `ADAPT_SHIFT`, faster for a block's first symbols, needs no header, no
+partition change and no second pass. It cannot beat the −1.48% ceiling, so it is recorded in `0031`
+rather than filed.
+
+The original filing follows, unchanged, including the ~4% that this closes.
+
+### ENT-6 — abac's deep subbands are one short code-block each (original filing, ~4% figure withdrawn)
 
 Filed 2026-09-07 by INTRA-1 step 1, which found it while measuring something else. **Not the answer
 to INTRA-1** — it is worth about 4% of the file and the J2K gap is 27 points — but it is the one

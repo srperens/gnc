@@ -1,5 +1,6 @@
 pub mod abac;
 pub mod abac_compare;
+pub(crate) mod abac_init_diag;
 pub(crate) mod bpc_paco_diag;
 pub(crate) mod coef_entropy_diag;
 pub mod abac_gpu;

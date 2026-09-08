@@ -30,7 +30,7 @@
 
 /// Probability precision. 12 bits keeps the arithmetic in u32 without renormalisation surprises.
 const PROB_BITS: u32 = 12;
-const PROB_ONE: u32 = 1 << PROB_BITS;
+pub(crate) const PROB_ONE: u32 = 1 << PROB_BITS;
 /// Adaptation rate. 5 is the usual compromise: fast enough to track a 4096-symbol block, slow
 /// enough not to thrash on noise.
 const ADAPT_SHIFT: u32 = 5;
@@ -59,14 +59,26 @@ const NUM_CONTEXTS: usize = NUM_BUCKETS * 3;
 
 /// One adaptive binary probability, as P(bit == 0) scaled to `PROB_ONE`.
 #[derive(Clone, Copy)]
-struct Prob(u32);
+pub(crate) struct Prob(u32);
 
 impl Prob {
     fn new() -> Self {
         Prob(PROB_ONE / 2)
     }
 
-    fn update(&mut self, bit: bool) {
+    /// Start from a given P(bit == 0), for ENT-6's initialisation diagnostic. The clamp is the
+    /// coder's own, so a simulation cannot start somewhere the coder could not.
+    pub(crate) fn from_p_zero(scaled: u32) -> Self {
+        Prob(scaled.clamp(1, PROB_ONE - 1))
+    }
+
+    /// P(bit == 0) as a probability. Only the diagnostic needs this; the coder works in the
+    /// scaled integer.
+    pub(crate) fn p_zero(&self) -> f64 {
+        f64::from(self.0) / f64::from(PROB_ONE)
+    }
+
+    pub(crate) fn update(&mut self, bit: bool) {
         if bit {
             self.0 -= self.0 >> ADAPT_SHIFT;
         } else {

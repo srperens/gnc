@@ -1504,6 +1504,57 @@ CLAUDE.md's portability prose corrected either way.
 **Why P2.** Same reasoning as BUG-31 — no measurement is invalidated and nothing fails on this
 machine — but the affected claim is a documented project rule, and step 1 may well be free.
 
+### BUG-41 — ENT-9 is filed twice with two different subjects, and item ids have no allocator (todo, P2)
+
+`main:BACKLOG.md` carries two startable `### ENT-9` headings for **different work**:
+
+```
+5691: ENT-9 — should abac be the default? (filed 18:29 by DOC-3)
+5864: ENT-9 — abac context-codes three decisions and bypasses the rest (filed 18:12 by ENT-3)
+```
+
+**Why this is worse than the decision-record collisions BUG-19 just fixed.** A duplicate `0018`
+misdirects a *reader*. A duplicate item id misdirects the **lock**: `refs/claims/ENT-9` is keyed on
+the string, so one claim covers both items. `scripts/claim items` prints ENT-9 twice, both `HELD` by
+the session that is in fact working only one of them, and `next` will never offer the other — so
+the second ENT-9 is **work that looks claimed and is not being done**, which is the failure mode
+COORDINATION.md's "Reserving an id is not filing the item" section is about, arriving by a different
+route.
+
+**Mechanism: `claim` allocates `BUG-N` and `dr-NNNN` and nothing else.** COORD-2 (`0050`) made the
+id come *out* of the compare-and-swap for exactly those two namespaces. Every other prefix — ENT,
+MEAS, RATE, TUNE, PERF, COORD, INTRA, PAD, TILE, DOC — is still picked by reading a file and
+choosing, which is the `0018` race one level up. Both ENT-9 filings did that and neither could see
+the other; they are 17 minutes apart.
+
+**And the session that collided was the one filing ids on purpose.** DOC-3's whole item was to give
+unnamed ideas an `ID (todo, P<n>)` so `next` can offer them (`docs/decisions/0060`); it picked ENT-9
+seventeen minutes after ENT-9 was taken. That is the strongest available argument that this is not
+a carelessness bug.
+
+**To close:**
+
+1. Renumber the later-filed, unclaimed heading — DOC-3's — to the first free `ENT-` id, and repoint
+   its inbound references. It is the later of the two *and* the one no session holds, so both of
+   `0059`'s rules agree; the tie-breaker that matters here is that the other id is a **live claim
+   ref**, and renaming a held item silently orphans it.
+2. Teach `claim` an allocator for any item prefix (`scripts/claim item ENT "<why>"`), built the
+   same way as `claim bug`: union committed `main:BACKLOG.md` with live `refs/claims/*`, CAS the
+   first gap, retry on a lost race.
+3. Make `claim items` **refuse** on a duplicate startable id rather than printing it twice, and add
+   the assertion to `claim selftest`. A queue that lists the same id twice is the observable
+   symptom, and it was visible for an hour before anyone read it as a defect.
+
+**Success criterion:** one startable heading per id on `main`, `scripts/claim item <PREFIX>` racing
+N processes to N distinct ids in `selftest`, and a `claim items` that fails loudly on a duplicate.
+
+**Why P2.** Invalidates no measurement — no codec path is involved — but it is losing work, which
+is what the `BUG-32` incident cost eleven hours to discover. Filed 2026-09-08 by the `drnum`
+session, immediately after BUG-19, while checking whether the same class of collision existed
+elsewhere in the id namespace. It does: 12 ids have duplicate headings, and **11 of the 12 are the
+documented "status entry plus original filing" convention and are fine** — ENT-9 is the only pair
+where two different pieces of work share a startable id.
+
 ### BUG-35 — five more compute entry points are over the workgroup budget; the default path is done, the rANS half is not (todo, P2)
 
 **The default encode path is off the over-budget entry point, and the histogram it was computing

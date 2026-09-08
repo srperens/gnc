@@ -121,7 +121,7 @@ on a non-idle machine: GPU encode phase 12.2 fps, end to end 5.0 fps.
   1080p q=75, non-idle machine) → target 60 fps. The 31.7 fps this line used to carry is the
   figure retracted four paragraphs above; it stood here for a day after being withdrawn.
 - Single-frame encode 40 fps → target 60 fps
-- 8-bit only (10-bit not implemented) — the main format gap for broadcast contribution
+- ~~8-bit only (10-bit not implemented) — the main format gap for broadcast contribution~~ — **wrong, corrected 2026-09-08. 10-bit shipped on 2026-09-06 (FMT-1).** `--bit-depth 10` on `encode` and `encode-sequence`; 10-bit samples live in the high bits of 16-bit PNG channels. Verified end to end on a genuine 10-bit 1080p source: **q=100 is bit-exact — max error 0 over 6 220 800 samples** — and q=90 reads 61.33 dB. This line stood for two days after the gap closed, and it was the gap FMT-1 called *"the first-order problem"*, so it was the most misleading sentence in this file
 - 4:4:4 / 4:2:2 / 4:2:0 all implemented (`--chroma-format`)
 - ~~No true lossless with Rice~~ — **wrong, corrected 2026-09-06.** `q=100` is bit-exact lossless
   on every entropy coder (Rice, rANS, default), verified on two 1080p images: max error 0, zero
@@ -226,11 +226,11 @@ GNC should become a **good, robust codec** — not optimized along a single axis
 | Property | Current | Target |
 |----------|---------|--------|
 | **Concurrent streams per GPU** | **never measured** | beat NVENC's session/block ceiling on the same machine |
-| **Latency per frame** | never measured | sub-frame, end to end |
+| **Latency per frame** | **~80 ms round trip at the default**, of which **0 frames** are reordering delay (MEAS-6, `docs/decisions/0033`). Below the low-latency-HEVC band's 120 ms floor, above JPEG XS. The structural half is exact; the ~80 ms coding half is a non-idle measurement and is owed on an idle machine, and glass-to-glass is still unmeasured | sub-frame, end to end — at 50 fps that is 20 ms, so ~80 ms is four frames short |
 | Encode speed | 12.2 fps GPU encode phase / 5.0 fps end to end (seq, 1080p q=75, non-idle; BASELINE A and C) | 60 fps |
-| Bit depth | 8-bit | 10-bit, in the format from the start |
+| Bit depth | **8-bit and 10-bit, both shipping** (FMT-1, 2026-09-06; 10-bit lossless re-verified 2026-09-08) | met — keep it met as the format changes |
 | Chroma formats | 4:4:4, 4:2:2, 4:2:0 | keep all three working at 10-bit |
-| Compression (intra) | +46–55% vs H.264 all-I on video (VMAF); +13.9% on stills (PSNR) | ≤ H.264 all-I, measured at contribution quality |
+| Compression (intra) | **Read these three numbers with their caveats, they are not one quantity.** +46–55% vs H.264 all-I on video is **VMAF, predates the high-q ladder fix and has not been re-run** (BASELINE says so); +13.9% on stills is PSNR against H.264 all-I; and against JPEG 2000 9/7 the gap is +27.1% of which **15.1 points are not coding deficiencies at all**, so the intra *coding* gap is nearer **+12%** (INTRA-1, answered 2026-09-08) | ≤ H.264 all-I, measured at contribution quality — and re-run the VMAF figure as PSNR |
 | Compression (video) | **+90.5% BD-rate on PSNR vs H.264 at contribution quality** (QUAL-1, 2026-09-06; +457% to +672% was distribution bitrates and is superseded) | ≤ +25%, and the remaining gap is intra |
 | Colour accuracy | **no lead — withdrawn 2026-09-07, decision 0020.** x264 wins dE00 on 6 of 6 rate-matched runs, on five without needing a chroma-QP offset and while also leading luma. GNC's dE00 0.54–0.92 mean is good in absolute terms, just not better | close the luma gap; there is no colour lead to keep |
 | Luma/chroma split | on the frontier as of CHROMA-1 (2026-09-06) — `chroma_weight` 1.2 is the largest value that costs nothing on MEAS-8's criterion | leave it; the remaining gap is not here |
@@ -238,8 +238,25 @@ GNC should become a **good, robust codec** — not optimized along a single axis
 | Robustness | basic test coverage | no artifacts, stable across q and content |
 | Bitstream | GNV1/GNV2 defined | well-specified, documented |
 
-The two metrics at the top of that table have never been measured, and they are the ones the
-whole positioning rests on. They come before further compression work.
+**Updated 2026-09-08 — this ordering has to be restated, because it no longer says anything.**
+It read: "The two metrics at the top of that table have never been measured, and they are the ones
+the whole positioning rests on. They come before further compression work." One of the two is now
+measured and the other cannot be, so as written it directs every session at work that is either
+done or impossible:
+
+- **Latency per frame is measured** (MEAS-6, ~80 ms, 0 frames of reordering). What is left is the
+  cheap half — re-take the coding time on an idle machine — and glass-to-glass instrumentation
+  that nobody has built.
+- **Concurrent streams per GPU is parked, not skipped.** Claim A (no session cap, and it runs
+  where NVENC does not) is closed and sourced. Claim B (more aggregate throughput than the card's
+  own NVENCs) needs hardware this project does not have — a discrete NVIDIA card with a current
+  driver, or an idle Mac for the `--density-still` re-take. It is still the single most important
+  thing to measure, and it is blocked on a machine rather than on effort.
+
+**So the ordering is: unblock what is blocked when the hardware appears, finish the cheap half of
+latency, and otherwise pick by value — which now means compression again**, since the gate that
+was holding it back is a hardware queue and not a question of priority. `docs/decisions/0033` and
+MEAS-5's entry carry the detail.
 
 **On the compression numbers:** both objections to the +457% to +672% figures have now been
 settled rather than merely noted. B-frames were defective (BUG-5) and are off by default; the

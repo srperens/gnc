@@ -137,6 +137,29 @@ masking, smaller tiles, prediction *before* the wavelet.
 
 ## Active priority list
 
+### DOC-2 — GOALS's target table was stale on the rows that set every session's priority (**FIXED 2026-09-08**)
+
+**The internal source of truth had drifted while the public one stayed current**, which is the
+dangerous direction: CLAUDE.md points every session at GOALS for priorities, and README — fixed by
+DOC-1 — was already right about all of it.
+
+**Four rows and one sentence, all corrected:**
+
+| what GOALS said | what is true |
+|---|---|
+| "8-bit only (10-bit not implemented) — **the main format gap** for broadcast contribution" | **FMT-1 shipped 10-bit on 2026-09-06.** Verified here end to end on a genuine 10-bit 1080p source: **q=100 is bit-exact, max error 0 over 6 220 800 samples**, and q=90 reads 61.33 dB. FMT-1 had called bit depth *"the first-order problem"*, so this was the most misleading sentence in the file |
+| Target table: "Latency per frame — **never measured**" | MEAS-6 measured it twice; **~80 ms round trip, 0 frames of reordering**, below the low-latency-HEVC band. `docs/decisions/0033` |
+| "Bit depth: 8-bit → 10-bit, in the format from the start" | both ship; the target is met and the row now says so |
+| "Compression (intra): +46–55% vs H.264 all-I (VMAF)" | presented uncaveated, while **BASELINE says that figure predates the high-q ladder fix and has not been re-run** — and it is a VMAF BD-rate, which BASELINE forbids quoting at the contribution end one line earlier. Now carries its caveats plus INTRA-1's better framing: the intra *coding* gap is nearer **+12%** than +27% |
+| "The two metrics at the top of that table have never been measured … **They come before further compression work**" | the operative sentence, and it had stopped meaning anything: one metric is measured, the other is **parked on hardware, not on effort**. Restated so the ordering is actionable |
+
+**Also retitled ENT-3**, whose heading asked a question its own body answers with nine measured
+points. Not closed — q=95-99 and context retuning are genuinely open, and the frame mix behind the
+table is unrecorded.
+
+**Documentation only.** No code, no shader, no bitstream. The one measurement taken was the 10-bit
+verification above, which confirms an existing claim rather than making a new one.
+
 ### DOC-1 — five stale prose claims in the public README (**DONE 2026-09-08**)
 
 Line numbers below are where each was **found**, before the edit shifted them; the two live pointers (`README.md:192`, `abac_gpu_encode.rs:381`) are post-edit and were re-checked.
@@ -3570,7 +3593,74 @@ falls while q rises (MEAS-9's harness now does). And for a 10-bit target the ext
 itself was never the problem. Harness: `scripts/meas_rate1_precision.py`, measured at `fa32a26`.
 Numbers in RESEARCH_LOG.
 
-### RATE-3 — a bit-exact I-frame breaks the P-frames that reference it (todo, P1)
+### BUG-39 — `q=100` video decodes at 12.45 dB: lossless sequences have never worked (todo, **P1**)
+
+Filed 2026-09-08 by RATE-3, which found it while investigating something else and confirmed it is
+**not** caused by RATE-2.
+
+**Measured on `main`, no flags, shipped defaults:** crowd_run, 4 frames, ki=2, `-q 100`. The
+I-frames are bit-exact (`PSNR inf`) and the **P-frames that reference them decode at 12.45 and
+12.53 dB.** With `GNC_MED=0`, so the I-frames are lossless *wavelet* frames instead of MED, the
+same case reads **44.18 and 46.15 dB** — still wrong, and differently wrong, so part of this is
+MED-specific and part is not.
+
+**Nothing in the repository recorded it**, and the reason it stayed invisible is worth keeping:
+every lossless claim GNC makes is about **stills** — 1.99:1, "10.8% better than JPEG 2000
+lossless", the FFV1 gap — and the one sentence that implied video (README's "bit-exact lossless at
+`q=100`", in a paragraph about the I/P/B pipeline) is prose carrying no figure, which is exactly
+the class DOC-1's two sweeps missed. That sentence is now corrected.
+
+**What is already established** (RATE-3, `docs/decisions/0040`), so this does not start from zero:
+
+- The reference's *quality* is not the limit. A perfect reference yields 52.17 dB P-frames, a
+  deliberately broken 34.30 dB reference yields 34.17 dB, and the ordinary 59.5 dB lossy reference
+  yields 60.62 dB. **A better reference producing a worse P-frame means the encoder and decoder
+  disagree about the reference**, not that quantisation caps it.
+- Two mechanisms are refuted with numbers: the colour transform's `floor` vs fractional lifting,
+  and a geometry difference at `wavelet_levels = 0`. See `0040` before re-deriving either.
+- Taking the reference from the colour-converted source instead of inverting the wrong transform
+  moves this from 12.45 to 21.37 dB — broken either way, and reverted.
+
+**The decisive measurement, and it has not been run:** read back the encoder's `gpu_ref_planes`
+after a lossless I-frame and diff them against the decoder's own reference for the same frame.
+Needs readback plumbing on both sides; gives an unambiguous answer.
+
+**Success criterion:** `-q 100` on ≥3 sequences at ki=2 and 9 decodes **bit-exact on every frame**,
+I and P alike, verified outside the harness (raw md5 against the source, the standard `0036` used).
+Anything less than bit-exact at q=100 is a failure, not a partial win — there is no quantiser in
+that configuration to blame.
+
+**Canary:** the per-frame PSNR line already prints `inf` for a bit-exact frame; the gate is that
+every frame prints it.
+
+**Why P1.** It is a shipped codec producing 12 dB video at its highest quality setting. It also
+gates RATE-3, and RATE-3 gates the inter half of RATE-2's 21.66%.
+
+### RATE-3 — a bit-exact I-frame is not a drop-in reference (**investigated 2026-09-08, not fixed**, P1)
+
+**Three attempts, two refuted hypotheses, one real fix kept, and a named next measurement.**
+`docs/decisions/0040`. The gate `0036` shipped stays; the tree is byte-identical to it on stills
+and back to 60.64/60.62 dB P-frames on sequences.
+
+**Kept from this item:** `encode`'s two candidate encodes now run **sibling first, configured path
+second**. `local_decode_iframe_gpu` builds an I-frame's reference from the quantised planes
+`encode()` leaves on the GPU, so whichever candidate ran *last* decided the reference — with the
+sibling second, bbb q=95 (where the lossy file is correctly kept) gave P-frames at **9.83 dB** and
+**+40.55%** bytes. That was a latent bug in RATE-2 reachable the moment the gate is lifted.
+
+**What is established and what is refuted is in `0039` and summarised in BUG-39 above. Read one of
+them before touching this.** The short version: the reference's quality is not the limit, so the
+encoder and decoder disagree about the reference, and the diff between them is the measurement that
+settles it. Everything else tried was mechanism-guessing.
+
+**This item is now downstream of BUG-39.** BUG-39 is the same cause seen at q=100 with no fallback
+involved and no rate to win, so it is the cleaner place to find it. Take BUG-39 first; if it is
+fixed, re-run `scripts/meas_rate3.py` (written for this item) and this becomes a rate question
+again.
+
+The original filing follows.
+
+### RATE-3 — a bit-exact I-frame breaks the P-frames that reference it (original filing)
 
 Filed 2026-09-08 by RATE-2, which found it by shipping its fix and testing the sequence path
 before believing it.
@@ -4704,7 +4794,7 @@ and its forced-on arm is **expected to regress**, as the standing guard on this 
 Two defects were found by verifying rather than assuming, and both would have shipped the 4 dB
 loss: the pad uniform is shared and persistent so a sequence inherited `decay` from a previous
 still (`benchmark-sequence` calls the still path several times per run), and sequence configs built
-from `quality_preset` inherited the flag. Decision `docs/decisions/0039`.
+from `quality_preset` inherited the flag. Decision `docs/decisions/0040`.
 
 **Still open, filed as PAD-2:** the inter half. Having the decoder re-replicate the picture edge
 after reconstruction would let the encoder write a cheap fill while the reference stays
@@ -5416,7 +5506,25 @@ predicate and a dispatch arm beside the Rice and rANS ones in `sequence.rs` — 
 touching a frame encoder, which is the whole point of ARCH-3. abac video is also *correct* now, so
 a GPU encoder can be checked against the CPU one for bit-exactness on inter, not only on intra.
 
-### ENT-3 — Does abac pay on inter residuals? (todo, P1, claimed and released unmeasured 2026-09-07)
+### ENT-3 — abac on inter: the headline is answered, q=95-99 and context retuning are not (todo, P1)
+
+**Retitled 2026-09-08 (DOC-2), because the old title asked a question this entry answers.** It read
+"Does abac pay on inter residuals? (todo, P1, claimed and released unmeasured 2026-09-07)", which
+was wrong twice over: ARCH-3 measured it as a side effect — **yes, −12.0% to −22.9% at bit-identical
+pixels on nine points** — and "unmeasured" stopped being true on 2026-09-07. A session picking this
+off the queue was being handed a solved question with the solution in its own body.
+
+**What is actually open, in the order it should be done:**
+
+1. **Which frame mix produced the nine-point table.** At ki=9 there are two (`2I+16P+0B` or
+   `2I+2P+14B`) and `0025` does not record which. Settle it by reading `benchmark-sequence`'s own
+   stdout, not by reasoning — and pass `-q`, since BUG-37 was exactly that trap.
+2. **The contribution range proper, q=95-99**, which is GNC's home range and is where RATE-2 says
+   the ladder misbehaves anyway.
+3. **Whether the contexts are worth retuning for residual statistics** — they were tuned on intra
+   coefficients.
+
+Nothing below is retracted; the numbers stand for the range they were taken in.
 
 **The inter half of the entropy question, which ABAC-SHIP explicitly left out of scope** ("intra
 only; inter is out of scope for this row"). Nothing has been measured. Claimed at the end of the

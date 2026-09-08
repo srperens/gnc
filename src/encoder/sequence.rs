@@ -386,6 +386,8 @@ impl EncoderPipeline {
                 } else {
                     config.clone()
                 };
+                // RATE-2's lossless fallback does not cross into a sequence. RATE-3 established
+                // why, and it is not the reason RATE-2 guessed: see its BACKLOG entry.
                 cfg.lossless_fallback = false;
                 // PAD-1: an I-frame inside a chain is a **reference**, and motion compensation
                 // predicts edge blocks from its padding. Fading that padding flat is measured at

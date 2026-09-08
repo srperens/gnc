@@ -4,6 +4,65 @@
 
 ---
 
+## DOC-2 — the source of truth had drifted while the public document stayed right (2026-09-08)
+
+Asked to re-evaluate what mattered most, and the answer was not an engineering item: **GOALS.md was
+stale on four rows of the table that sets every session's priority order**, including the one
+sentence that states the ordering. CLAUDE.md designates GOALS as *"the single source of truth"* and
+tells all eight sessions to read it first.
+
+**The direction of the drift is the notable part.** README — corrected by DOC-1 — was already right
+about every one of these: "8 and 10 bits" in two places, and "At ~80 ms GNC sits below the
+low-latency-HEVC band". The *public* document was current and the *internal* one was two days
+behind. That is the more expensive direction, because work is picked from the internal one.
+
+### What was wrong
+
+| GOALS said | true |
+|---|---|
+| "8-bit only (10-bit not implemented) — **the main format gap** for broadcast contribution" | FMT-1 shipped 10-bit **2026-09-06** |
+| "Latency per frame — **never measured**" | MEAS-6 measured it twice; ~80 ms, 0 frames of reordering |
+| "Bit depth: 8-bit → 10-bit" | both ship; target met |
+| "Compression (intra): +46–55% vs H.264 all-I (VMAF)" | uncaveated, and BASELINE says that figure predates the high-q ladder fix and has not been re-run |
+| "The two metrics … have never been measured … **They come before further compression work**" | one is measured, the other is parked on *hardware*, not effort — so the ordering had stopped meaning anything |
+
+### The one measurement: 10-bit, verified rather than taken from the backlog
+
+The backlog said FMT-1 was DONE. Checking it is cheap and the whole point of this repository's
+protocol, so a genuine 10-bit source was built (`scripts/png16.py`, 10-bit samples in the high bits
+of 16-bit PNG channels, 8→10 by bit replication so the full 0–1023 range is used):
+
+| | result |
+|---|---|
+| `--bit-depth 10 -q 100`, 1080p | **bit-exact: max error 0, 0 wrong samples of 6 220 800** |
+| `--bit-depth 10 -q 90`, 1080p | 61.33 dB, 14.26 bpp |
+
+So the claim GOALS denied is not only implemented, it is lossless. FMT-1 had called bit depth *"the
+first-order problem"* for a contribution codec, which is what made that line the most misleading
+sentence in the file.
+
+### ENT-3 retitled, not closed — and a correction to my own assessment
+
+I first reported ENT-3 as "already answered, should be closed". That came from reading the first
+sixteen lines of its entry, and it is wrong. The **headline** is answered — ARCH-3 measured abac on
+inter as −12.0% to −22.9% at bit-identical pixels, nine points — but three things are genuinely
+open: which frame mix produced that table (at ki=9 there are two, `2I+16P+0B` or `2I+2P+14B`, and
+`0025` does not record which), the q=95-99 contribution range, and whether contexts tuned on intra
+coefficients are worth retuning for residual statistics.
+
+So it keeps P1 and gets a title that describes what is open. The old title asked a question its own
+body answers, which hands a session a solved problem.
+
+**That is the second time today I generalised from a partial read** — the first was reporting
+BUG-16's scope from a 4:4:4-only sweep when subsampled chroma reaches q=86. Both were caught, one
+by another session and one by re-reading. The pattern is the same: measure or read one arm, report
+it as the whole.
+
+**Documentation only.** No code, no shader, no bitstream, no figure moved. Tests and clippy
+untouched by construction.
+
+---
+
 ## PAD-1 — the padding fill is a still-image lever, because the padding is a reference (2026-09-08)
 
 **Hypothesis and the item's own gate.** `0034` measured that GNC codes 20.9% of a 1080p frame's
@@ -190,7 +249,7 @@ Also recorded next to `MAX_TILE_SIZE`, where someone wondering about tile sizes 
   as separate verdicts.
 
 **Harnesses:** `scripts/meas_pad1_inter.py` (new), `scripts/meas_intra1_padding.py` (`--canary`,
-`--canary-fill`, the fill sweep in `--part 3`). Decision `docs/decisions/0039`.
+`--canary-fill`, the fill sweep in `--part 3`). Decision `docs/decisions/0040`.
 
 ## BUG-16 — the fused quantiser had a dead zone the other two did not, and it priced out at +1% (2026-09-08)
 
@@ -294,6 +353,134 @@ belongs to that item.
 
 **Gates:** 243 tests pass, 0 failures; both clippy targets clean; q=90 byte-identical to the
 baseline taken at the start of this session's work.
+
+---
+
+## RATE-3 — a bit-exact I-frame is not a drop-in reference, and `q=100` video decodes at 12.45 dB (2026-09-08)
+
+**Hypothesis.** `0036` shipped RATE-2's lossless fallback for stills only, because letting it reach
+sequence I-frames made the P-frames referencing them decode at 9.80 dB against 60.69 dB. A
+bit-exact reference ought to be the *best* reference there is — no drift, no propagated error — so
+the inter half of RATE-2's win should be **larger** than the intra half rather than zero. This item
+asked whether the gate can be lifted.
+
+**Success criteria, from the item, set before implementing:** with the fallback allowed inside
+sequences, P-frame PSNR within 0.1 dB of today's on bbb/crowd_run/old_town_cross at q=95 and 99,
+ki=2 and 9; total bytes not larger on any of those twelve points; I-frames still bit-exact where
+the fallback chooses them.
+
+**The answer is no, the gate stays, and the item found something bigger on the way.**
+
+### Instrument
+
+`scripts/meas_rate3.py`. Both arms come from the same binary and the same command with only
+`GNC_LOSSLESS_FALLBACK` differing, so the comparison is exact rather than a BD-rate estimate. It
+reads the **I+P+B** arm only — `benchmark-sequence` also prints an all-intra baseline, which is
+RATE-2's intra win applied to every frame and a different question. bbb ships 8 PNGs, and the first
+version of this sweep asked for 10 with `2>/dev/null`, which silently dropped a whole sequence; the
+script now carries the frame count per sequence and fails loudly.
+
+### Finding 1 — `q=100` video is broken on `main`, and RATE-2 has nothing to do with it
+
+crowd_run, 4 frames, ki=2, `-q 100`, no flags, shipped defaults:
+
+| | I-frames | P-frames |
+|---|---|---|
+| default (MED lossless) | `inf` (bit-exact) | **12.45 / 12.53 dB** |
+| `GNC_MED=0` (lossless wavelet) | `inf` | **44.18 / 46.15 dB** |
+
+Filed as **BUG-39 (P1)**. Part of it is MED-specific and part is not. **Nothing in the repository
+recorded this**, and the reason is worth keeping: every lossless claim GNC makes is about *stills*
+— 1.99:1, +10.8% on JPEG 2000 lossless, the FFV1 gap — and the one sentence that implied video was
+README's "bit-exact lossless at `q=100`" sitting in a paragraph about the I/P/B pipeline. Prose
+carrying no figure, which is exactly the class DOC-1's two sweeps missed. Corrected in this commit.
+
+### Finding 2 — RATE-2's double encode clobbers a GPU side channel, and that was a latent bug
+
+`local_decode_iframe_gpu` builds an I-frame's reference from the quantised planes `encode()` leaves
+behind (`Y → mc_out, Co → ref_upload, Cg → plane_b`) rather than from a decode. Two encodes in a
+row therefore leave the **second** one's state behind, and if that is not the candidate returned,
+the reference is reconstructed from coefficients belonging to a different transform. Measured with
+the sibling running second, on bbb q=95 — where the *lossy* file is the smaller one and is
+correctly kept:
+
+| | bytes | worst P |
+|---|---|---|
+| fallback off | 19 110 162 | 53.12 dB |
+| fallback on, sibling second | 26 859 135 (**+40.55%**) | **9.83 dB** |
+
+**Fixed, and kept:** the sibling now runs *first* and the configured path second, so the side
+channel is always the wavelet encode's, which is what that path expects. This is the one change
+this item leaves in the tree. It is byte-neutral today — the fallback never reaches a sequence —
+and it is what stops the trap from firing the moment anyone lifts the gate.
+
+### Finding 3 — taking the reference from the source is not sufficient
+
+A bit-exact frame decodes to its input, so the reference can be the colour-converted source, which
+both forward transforms only *read* (`transform.forward` writes `plane_c` with `plane_b` as temp;
+`med.forward` writes `plane_c`). Implemented, measured, **reverted**:
+
+- q=100 / MED: 12.45 dB → **21.37 dB**. Broken either way.
+- RATE-2's own window, twelve points: P-frames **51.8–52.2 dB** against **60.6** for the ordinary
+  lossy reference, while bytes fell 1.4–16.2%. Fails the 0.1 dB criterion by two orders of
+  magnitude.
+- Where the old path is already correct — a lossless *wavelet* I-frame — the two agree exactly
+  (44.18 dB both ways), which is the one thing that says the branch itself was right.
+
+### Finding 4 — the reference's quality is not the limit, and this is the finding that matters
+
+Same sequence, same q=99 P-frame coding, only the reference differing:
+
+| reference | P-frame PSNR |
+|---|---|
+| bit-exact (`inf`) | **52.17 dB** |
+| deliberately broken (34.30 dB) | 34.17 dB |
+| ordinary lossy (59.5 dB) | **60.62 dB** |
+
+P-frames track a *poor* reference faithfully and are capped near 52 dB when the reference is
+perfect. **A better reference producing a worse P-frame cannot be a quantisation ceiling — it means
+the encoder and the decoder disagree about what the reference is.** Everything else in this item is
+downstream of that sentence.
+
+### Two mechanisms refuted, so the afternoon is not spent twice
+
+- **The colour transform's rounding mode.** `color_convert.wgsl` switches its lifting between
+  `floor(x/2)` and `x*0.5` on `config.is_lossless()`, which predicts a ~0.5 LSB chroma error and
+  therefore ~54 dB — close enough to the observed 52 to be worth testing, and it was the best
+  hypothesis I had. **Refuted twice.** Forcing the fractional lifting for a lossless config drops
+  the I-frames to 34.30 dB and the P-frames follow at 34.17, so it does not lift the cap. And a MED
+  sibling and a lossless-*wavelet* sibling give **identical** P-frame PSNR (52.17 / 52.04) although
+  only one of them uses MED at all.
+- **A geometry difference at `wavelet_levels = 0`.** Refuted by reading:
+  `padded_width = tiles_x * tile_size` (`lib.rs:86`), independent of the level count, and
+  `lossless_sibling` carries the caller's tile size.
+
+### What is left, and why it stopped here
+
+**The decisive measurement has not been run:** read back the encoder's `gpu_ref_planes` after a
+lossless I-frame and diff them against the decoder's own reference for the same frame. Finding 4
+says they differ; nothing measured says *how*. It needs readback plumbing on both sides — bounded
+work with an unambiguous answer, unlike another round of mechanism-guessing.
+
+Three attempts, two refuted hypotheses and one insufficient fix is the pattern CLAUDE.md's "if the
+same bug resurfaces after two fix attempts, stop and diagnose the root cause properly" exists for.
+So the tree goes back to what `0036` shipped and the knowledge is written down instead.
+`docs/decisions/0040`.
+
+**BUG-39 is the better place to continue**: same cause, seen at q=100 with no fallback involved and
+no rate to win, so nothing about it is entangled with RATE-2. Take it first; if it is fixed,
+re-run `scripts/meas_rate3.py` and RATE-3 becomes a rate question again.
+
+### Verification that the tree is back where it started
+
+Stills, unchanged from `0036`: blue_sky q=99 **2 153 118 B**, bbb q=97 **3 021 283 B**,
+kristensara q=96 **927 600 B** — byte-identical. Sequences, crowd_run q=99 ki=2: P-frames
+**60.64 / 60.62 dB**, the pre-RATE-3 values. q=100 sequences still read 12.45 / 12.53 dB, which is
+BUG-39 and is deliberately untouched.
+
+**Gates:** `cargo test --release -- --test-threads=1` green; `cargo clippy --release` clean; wasm
+`--lib` clean.
+
 
 ---
 

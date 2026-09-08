@@ -486,6 +486,25 @@ pub struct CodecConfig {
     /// The bitstream format is unchanged — overlap is a purely encoder-side quality choice.
     /// Default: 0 (disabled, no change to current behavior).
     pub overlap_pixels: u32,
+
+    /// May the tile-alignment padding be faded flat instead of edge-replicated? (PAD-1)
+    ///
+    /// Worth **-4.63% RGB / -4.60% Y** of intra rate at identical visible quality, and like
+    /// `overlap_pixels` it is **purely an encoder-side choice** — the bitstream is unchanged and
+    /// the decoder reconstructs whatever was coded.
+    ///
+    /// **False whenever the frame will be used as a reference**, which is the whole subtlety:
+    /// motion compensation samples the padded plane with its reads clamped to the *padded* bounds,
+    /// so an edge block whose motion vector points outward predicts from the fill. At ki=9 that
+    /// costs bbb_extended up to **4.03 dB of worst-frame PSNR**, while the same sequence at ki=1
+    /// loses nothing. So the sequence encoder clears this for the I-frames it codes through
+    /// `EncoderPipeline::encode`, and every other padding dispatch in that encoder forces
+    /// replication directly.
+    ///
+    /// Default: true, because the common case for this entry point is a single still with no
+    /// reference at all. `GNC_PAD_FILL` overrides it either way, for the harnesses that need
+    /// both arms.
+    pub pad_fill_decay: bool,
 }
 
 impl CodecConfig {
@@ -591,6 +610,11 @@ impl Default for CodecConfig {
             // what the sequence path and several tests build from, and a lossless I-frame inside
             // a rate-controlled stream is a different question from a lossless still.
             lossless_fallback: false,
+            // PAD-1 takes the same shape and for a sharper reason: `CodecConfig::default()` is
+            // what the sequence path builds from, and an I-frame inside a chain is a *reference*
+            // — fading its padding flat is measured at up to 4.03 dB of worst-frame PSNR
+            // (decision 0039). Opt-in from `quality_preset`, which serves the still path.
+            pad_fill_decay: false,
             dct_freq_strength: 7.0,
             intra_prediction: false,
             temporal_transform: TemporalTransform::None,
@@ -692,6 +716,70 @@ pub const MIN_TILE_SIZE: u32 = 16;
 /// step 2 measured that GNC gains only 0.6% going from tile 256 to 512, so there is no rate case
 /// for it today.
 pub const MAX_TILE_SIZE: u32 = 512;
+
+/// Which fill goes into the tile-alignment padding (PAD-1, decision `0039`).
+///
+/// GNC pads every plane up to a whole multiple of `tile_size` and codes the padded plane, so a
+/// 1920x1080 frame is coded as 2048x1280 and **20.9% of the coded samples are outside the
+/// picture**. The decoder crops all of them, which makes their content a free choice worth 6.6 of
+/// the 27.1-point intra gap to JPEG 2000 (INTRA-1 step 3, decision `0034`).
+///
+/// Fading the padding flat is **-4.63% RGB / -4.60% Y** of intra rate against plain replication
+/// at identical visible quality (four stills, q=80..94, `--abac`), and `pad.wgsl` carries the
+/// mechanism. But **it is only safe where nothing predicts from the padding**, which is why
+/// `default_decay` is a per-path argument rather than a constant:
+///
+/// * **`true` for the still-image path** (`encode_once`) — there is no reference frame at all.
+/// * **`false` for every sequence path** — the decoder keeps the padded plane in the reference
+///   buffer and motion compensation samples it with reads clamped to the *padded* bounds
+///   (`src/decoder/gpu_work.rs:478`), so an edge block whose motion vector points outward
+///   predicts from the fill. Measured at ki=9 on three sequences: crowd_run and old_town_cross
+///   are unaffected (worst-frame PSNR moves 0.000 dB for -6.9% to -10.1% of rate), but
+///   **bbb_extended loses 1.30 dB of worst-frame PSNR at q=85 and 4.03 dB at q=92**. The same
+///   sequence at ki=1 loses nothing at all (-5.65% of rate, PSNR identical), which is what
+///   pins the cause to the reference rather than to the coding.
+///
+/// `GNC_PAD_FILL=decay` / `=replicate` forces either mode on every path, overriding both
+/// defaults. That is not a tuning knob: it is what `scripts/meas_intra1_padding.py` and
+/// `scripts/meas_pad1_inter.py` need to run both arms, and forcing `decay` on a P-chain is
+/// measured to be a bad trade.
+///
+/// This is an **encoder-side choice with no bitstream implication**: `pad.wgsl` is compiled only
+/// in `src/encoder/pipeline.rs`, the decoder reconstructs whatever was coded, and both sides
+/// therefore agree about the padded reference without any versioning.
+pub fn pad_fill_mode(default_decay: bool) -> u32 {
+    let mode = pad_fill_mode_inner(default_decay);
+    if std::env::var("GNC_DIAGNOSTICS").is_ok() {
+        // A fill that writes pixels nobody looks at is a silent feature by construction, so the
+        // path has to say which mode it took. `default_decay` identifies the caller: true is the
+        // still-image path, false is the shared buffer every sequence path uses as-is.
+        eprintln!(
+            "GNC: pad fill = {} (path default {}, {})",
+            if mode == 1 { "decay" } else { "replicate" },
+            if default_decay { "decay/intra" } else { "replicate/sequence" },
+            match std::env::var("GNC_PAD_FILL") {
+                Ok(v) => format!("GNC_PAD_FILL={v}"),
+                Err(_) => "no override".to_string(),
+            }
+        );
+    }
+    mode
+}
+
+fn pad_fill_mode_inner(default_decay: bool) -> u32 {
+    match std::env::var("GNC_PAD_FILL").as_deref() {
+        Ok("replicate") => 0,
+        Ok("decay") => 1,
+        Err(_) => u32::from(default_decay),
+        Ok(other) => {
+            eprintln!(
+                "GNC: unknown GNC_PAD_FILL={other:?}; expected \"decay\" or \"replicate\". \
+                 Using the per-path default."
+            );
+            u32::from(default_decay)
+        }
+    }
+}
 
 impl CodecConfig {
     /// Deepest wavelet decomposition this tile size can carry.
@@ -1042,6 +1130,10 @@ pub fn quality_preset(q: u32) -> CodecConfig {
         // restores the old behaviour for measurement.
         lossless_fallback: (95..100).contains(&q)
             && std::env::var("GNC_LOSSLESS_FALLBACK").map(|v| v != "0").unwrap_or(true),
+        // PAD-1: this preset serves the still-image path, where there is no reference frame and
+        // fading the padding flat is worth -4.63% RGB of rate at identical visible quality. The
+        // sequence encoder clears it for the I-frames it codes, because those *are* references.
+        pad_fill_decay: true,
         dct_freq_strength: 7.0,
         // Intra prediction is off by default: measured at -11.76 dB / +29% bitrate on lossy
         // content, where the wavelet has already removed most of the correlation a predictor

@@ -389,6 +389,12 @@ impl EncoderPipeline {
                 // RATE-2's lossless fallback does not cross into a sequence. RATE-3 established
                 // why, and it is not the reason RATE-2 guessed: see its BACKLOG entry.
                 cfg.lossless_fallback = false;
+                // PAD-1: an I-frame inside a chain is a **reference**, and motion compensation
+                // predicts edge blocks from its padding. Fading that padding flat is measured at
+                // up to 4.03 dB of worst-frame PSNR on bbb_extended at ki=9, against 0.000 dB on
+                // crowd_run and old_town_cross — and 0.000 dB on bbb_extended itself at ki=1,
+                // which is what pins it to the reference. Decision 0039.
+                cfg.pad_fill_decay = false;
                 cfg
             };
 
@@ -1875,6 +1881,10 @@ impl EncoderPipeline {
         // reason about than two. See RATE-3.
         let mut cfg = cfg.clone();
         cfg.lossless_fallback = false;
+        // PAD-1, and here the comment above applies verbatim: these tail frames reference
+        // nothing, but the same config feeds the groups above, and one rule is easier to reason
+        // about than two.
+        cfg.pad_fill_decay = false;
         while i < frames.len() {
             let cf = self.encode(ctx, frames[i], width, height, &cfg);
             tail_iframe_pts.push(i as u32);

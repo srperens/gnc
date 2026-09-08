@@ -4,6 +4,143 @@
 
 ---
 
+## PAD-1 — the padding fill is a still-image lever, because the padding is a reference (2026-09-08)
+
+**Hypothesis and the item's own gate.** `0034` measured that GNC codes 20.9% of a 1080p frame's
+samples outside the picture and that a better fill for that don't-care region was worth ~4.6 of the
+6.6 points it costs. It filed PAD-1 rather than shipping, on one reason: the decoder keeps the
+padded plane in the reference buffer and motion compensation reads it for edge blocks. **That
+reason was asserted, not verified.**
+
+**Verified first, because the whole item rests on it.** MC is handed the *padded* dimensions
+(`p_padded_w/h`, `src/decoder/gpu_work.rs:478`) and clamps its reads to them, so an edge block whose
+motion vector points outward really does predict from the fill. Also corrected while looking:
+`pad.wgsl` is compiled **only** in `src/encoder/pipeline.rs`, so the fill is an encoder-side choice
+like `overlap_pixels` — the decoder reconstructs whatever was coded and there is **no bitstream
+implication**, which deletes one of the three shapes `0034` filed.
+
+**Success criteria, from BACKLOG, set before measuring:** >=3% of intra rate at q=90 on >=3 stills,
+**and** no worst-frame regression above 0.3 dB on >=3 sequences at ki=9 in either chroma format.
+
+### Measure the target before building it, or pay a bandwidth pass for 0.19 points
+
+The fade needs a value to fade *to*. The obvious one — the picture's mean — needs a full reduction
+over the plane on the encode path of every frame, and the pad uniform is created once with
+`UNIFORM` usage, so a per-frame target also means making it writable and threading a value through
+all five sites that fill the raw input buffer. Priced in the oracle first, four stills, q=80..94:
+
+| fade target | mean RGB | cost to compute |
+|---|---|---|
+| **8 strided samples of the edge line** | **−4.63%** | **nothing** |
+| that line's exact mean | −4.63% | 1-D reduction |
+| the picture's mean | −4.48% | full 2-D reduction |
+| a hardcoded mid-grey | −4.44% | nothing |
+| one sample of the edge line | −4.38% | nothing |
+
+**The value barely matters; flatness does** — a constant that reads nothing from the picture gets
+96% of the best result, which says the win is about killing the padding's *detail bands*, not about
+matching the picture. Eight strided samples reproduce the exact line mean to two decimals and their
+positions are a pure function of the plane dimensions, so the shipped version needs no reduction,
+no per-frame uniform and no host pass. A 32 px ramp instead of 8 gives back half a point (−4.08%),
+and mirroring the picture into the padding — the textbook alternative — costs **+11.4%**.
+
+### What the shipped encoder delivers on stills
+
+Not the oracle: `gnc encode` against itself with `GNC_PAD_FILL=replicate`, q=80..94, `--abac`.
+
+| image | RGB BD-rate | Y BD-rate | dRGB@q90 | dbytes@q90 |
+|---|---|---|---|---|
+| bbb_1080p | −5.86% | −5.72% | −0.001 dB | −5.82% |
+| blue_sky_1080p | −4.99% | −4.90% | −0.001 dB | −4.95% |
+| kristensara_720p | −1.75% | −1.79% | −0.002 dB | −1.81% |
+| touchdown_1080p | −5.90% | −6.01% | +0.000 dB | −6.06% |
+| **mean** | **−4.63%** | **−4.60%** | | |
+
+**The oracle predicted −4.63% / −4.60%.** Two decimals, both metrics, independent implementations.
+That agreement is the main reason to believe either figure, and it is what a canary is for.
+
+### The inter gate failed, on the third sequence, at 4.03 dB
+
+`benchmark-sequence`, ki=9, 17 frames, fill forced on:
+
+| sequence | chroma | q | rate | dAVG | **dWORST** |
+|---|---|---|---|---|---|
+| crowd_run | 444 | 85 | −7.12% | +0.000 | **+0.000** |
+| crowd_run | 420 | 92 | −9.04% | +0.010 | **+0.000** |
+| old_town_cross | 444 | 85 | −7.79% | +0.000 | **+0.000** |
+| old_town_cross | 420 | 92 | −10.09% | −0.010 | **+0.000** |
+| bbb_extended | 444 | 85 | −7.42% | −1.020 | **−1.300** |
+| bbb_extended | 444 | 92 | −9.14% | −2.280 | **−4.030** |
+| bbb_extended | 420 | 85 | −8.90% | −0.170 | **−0.250** |
+| bbb_extended | 420 | 92 | −10.24% | −0.170 | **−0.350** |
+
+Same shape as INTRA-2's dead zone: clean on two sequences, and on the third the mean moves −2.28 dB
+while **the worst frame moves −4.03 dB**. That is why the criterion names the worst frame — an
+error in a reference propagates until the next keyframe.
+
+**The control that makes it a cause rather than a correlation.** Same clip, same q, same fill, only
+the references removed:
+
+| bbb_extended, q=92, 4:4:4 | bytes | avg PSNR | worst PSNR |
+|---|---|---|---|
+| ki=1, replicate | 37 235 924 | 50.64 | 50.63 |
+| ki=1, decay | 35 132 893 | 50.64 | 50.63 |
+| ki=9, replicate | 30 942 014 | 50.87 | 50.64 |
+| ki=9, decay | 28 114 133 | 48.59 | 46.61 |
+
+**At ki=1 the fill is a clean −5.65% and costs nothing.** The loss is entirely in what the padding
+predicts, not in what it codes.
+
+### So it ships where nothing predicts from it
+
+`quality_preset` opts in (the still path); `CodecConfig::default()` refuses, because the sequence
+path builds from it; all four `main.rs` funnels that already refuse RATE-2's `lossless_fallback`
+refuse this too; both sites where the sequence encoder codes an I-frame through
+`EncoderPipeline::encode` clear it, because an I-frame in a chain is a reference; and every other
+padding dispatch there goes through `dispatch_gpu_pad_cached`, which asserts replication before
+each dispatch. **Sequence output is byte-identical to the pre-PAD-1 encoder on every figure
+`benchmark-sequence` prints.**
+
+### Two defects found by verifying instead of assuming — both would have shipped the 4 dB loss
+
+1. **The pad uniform is shared and persistent, and `benchmark-sequence` calls the still path
+   several times per run.** A sequence encode therefore inherited `decay` from a previous still.
+   The first "sequences are unaffected" check caught it: quality was restored but rate was +0.85%,
+   because the I-frames were faded and the P-frames referencing them paid for it. Fixed by writing
+   the fill mode before *every* cached dispatch, which makes cross-path leakage impossible rather
+   than unlikely.
+2. **Sequence configs built from `quality_preset` inherited the flag.** Found by the
+   `GNC_DIAGNOSTICS` fill canary, as a single stray `decay` line among five `replicate` — in a run
+   whose byte counts happened to be identical, so nothing else would have shown it.
+
+**A fill is a silent feature by construction**, since it writes pixels nobody ever looks at. Two
+instruments, both kept: `GNC_DIAGNOSTICS=1` prints which fill each path took and why, and
+`scripts/meas_intra1_padding.py --canary` checks the shader byte-for-byte against an independent
+Python reimplementation. It passes in **both** modes, and exactly rather than approximately: every
+term in the blend is a multiple of 1/64 for 8-bit input, so f32 and f64 agree bit for bit.
+
+`scripts/meas_pad1_inter.py` keeps three arms — forced off, forced on, and the default. **The
+forced-on arm is expected to regress** and is retained as the guard on this decision; if it ever
+stops regressing, the inter half is worth re-opening. The default arm must read +0.00% rate and
++0.000 dB, which is the assertion that the policy holds.
+
+### Failures and dead ends
+
+- **`blue_sky` and `bbb` cannot carry this gate at all** — 8 PNG frames each, against ki=9. My
+  first run asked for 17 and got a bare `NotFound` panic from `image_util.rs`, which the harness
+  reported as eight identical `failed:` lines with no reason. **A silently dropped sequence is how
+  a gate gets declared on two sequences when it asked for three**, and the two that ran both said
+  +0.000 dB — so the harness now reads the frame count off disk, clamps, and refuses a sequence
+  shorter than the keyframe interval with the reason stated. Third sequence is `bbb_extended`, and
+  it is the one that failed.
+- **The first gate report said "VERDICT: FAILS" after the fix was in**, because it forces both arms
+  and its `decay` arm is deliberately the hazardous configuration. True of what it measured and
+  badly misleading about what ships. Reworded to report the shipped default and the guarded hazard
+  as separate verdicts.
+
+**Harnesses:** `scripts/meas_pad1_inter.py` (new), `scripts/meas_intra1_padding.py` (`--canary`,
+`--canary-fill`, the fill sweep in `--part 3`). Decision `docs/decisions/0039`.
+
 ## BUG-16 — the fused quantiser had a dead zone the other two did not, and it priced out at +1% (2026-09-08)
 
 **Hypothesis, taken from the entry's own guess and confirmed:** Rice's GPU and CPU encode paths

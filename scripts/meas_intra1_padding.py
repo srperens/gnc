@@ -143,15 +143,23 @@ def bd(ref, test, metric):
     return bd_rate_raw(ra, qa, rb, qb)
 
 
-def canary(gnc, img_path, tmp, q, extra):
-    """Prove the padded plane is what GNC codes, by coding it as a picture in its own right."""
+def canary(gnc, img_path, tmp, q, extra, fill="production"):
+    """Prove the padded plane is what GNC codes, by coding it as a picture in its own right.
+
+    `fill` selects which model to compare against: `"replicate"` is the pre-PAD-1 shader (still
+    reachable with `GNC_PAD_FILL=replicate`), and `"production"` is whatever `pad.wgsl` does by
+    default today — since PAD-1 that is `d8_edge8`. **This is the canary for the shader**: the
+    encoder's padding is invisible by construction, so a byte-count match against an independent
+    reimplementation is the only thing that can catch the two drifting apart.
+    """
     im = np.array(Image.open(img_path).convert("RGB"))
     h, w = im.shape[:2]
     pw, ph = ceil_tile(w), ceil_tile(h)
     if (pw, ph) == (w, h):
         return None
+    model = replicate_pad if fill == "replicate" else FILLS["d8_edge8"]
     pre = tmp / "canary_prepadded.png"
-    Image.fromarray(replicate_pad(im, pw, ph)).save(pre)
+    Image.fromarray(model(im, pw, ph)).save(pre)
     a = gnc_point(gnc, img_path, im, tmp, q, extra, "canary_crop")
     b = gnc_point(gnc, pre, np.array(Image.open(pre)), tmp, q, extra, "canary_pre")
     if a is None or b is None:
@@ -503,12 +511,78 @@ def fill_flat(vis, pw, ph):
     return out
 
 
+def fill_decay_target(vis, pw, ph, ramp, target):
+    """Replicate, then fade over `ramp` px toward a scalar chosen by `target`.
+
+    The scalar only has to make the padding *flat in both axes* — that is what sends its detail
+    bands to zero. *Which* flat value is a free choice, and the choices differ in how big a step
+    is left at the picture seam and, decisively, in **what they cost to compute in a shader**:
+
+      "mean"     the visible picture's mean per channel — what the first oracle used, and the only
+                 one here needing a full reduction over the plane, i.e. an extra pass reading
+                 W*H*3 floats on the encode path of every frame
+      "edgemean" the mean of the edge *line* the strip replicates — a 1-D reduction, far cheaper,
+                 and conceptually the right target: the strip fades to the DC of the line it
+                 extends, which is the smallest step the seam can have
+      "center"   one visible pixel from the middle of the picture — free, no reduction
+      "grey"     the constant 128 — free, and reads nothing from the picture
+
+    Measured before implementing, because adding a bandwidth pass to the encode path to earn 0.1
+    points would be a bad trade and there is no way to know which case this is without numbers.
+    """
+    out = replicate_pad(vis, pw, ph).astype(np.float64)
+    h, w = vis.shape[:2]
+    flat = vis.reshape(-1, vis.shape[2]).mean(axis=0)
+    if target == "center":
+        flat = vis[h // 2, w // 2].astype(np.float64)
+    elif target == "grey":
+        flat = np.full(vis.shape[2], 128.0)
+    if ph > h:
+        t = np.clip((np.arange(ph - h) + 1) / ramp, 0.0, 1.0)[:, None, None]
+        tgt = vis[h - 1].mean(axis=0) if target == "edgemean" else flat
+        out[h:] = out[h:] * (1 - t) + tgt[None, None, :] * t
+    if pw > w:
+        t = np.clip((np.arange(pw - w) + 1) / ramp, 0.0, 1.0)[None, :, None]
+        tgt = vis[:, w - 1].mean(axis=0) if target == "edgemean" else flat
+        out[:, w:] = out[:, w:] * (1 - t) + tgt[None, None, :] * t
+    return np.rint(out).clip(0, 255).astype(np.uint8)
+
+
+def fill_decay_edge_samples(vis, pw, ph, ramp, n):
+    """Fade toward the average of `n` evenly spaced samples of the edge line being extended.
+
+    The point of this variant is what it costs in the shader: **nothing but `n` extra reads per
+    padding pixel, and no plumbing at all.** `pad.wgsl` already reads the visible plane, the sample
+    positions are a pure function of the plane dimensions, and `n` is a compile-time constant — so
+    unlike a true line mean it needs no reduction, no per-frame uniform and no host-side pass. The
+    pad params buffer is created once with `UNIFORM` usage and no `COPY_DST`, so a per-frame target
+    would mean making it writable and threading the value through all five sites that fill the raw
+    input buffer, which is where a silent per-path bug would come from.
+
+    `n = 1` is the midpoint of the edge; larger `n` trades reads for a better estimate of the
+    line's DC, which is what `edgemean` computes exactly.
+    """
+    out = replicate_pad(vis, pw, ph).astype(np.float64)
+    h, w = vis.shape[:2]
+    xs = [(2 * i + 1) * w // (2 * n) for i in range(n)]
+    ys = [(2 * i + 1) * h // (2 * n) for i in range(n)]
+    if ph > h:
+        t = np.clip((np.arange(ph - h) + 1) / ramp, 0.0, 1.0)[:, None, None]
+        tgt = vis[h - 1, xs].astype(np.float64).mean(axis=0)
+        out[h:] = out[h:] * (1 - t) + tgt[None, None, :] * t
+    if pw > w:
+        t = np.clip((np.arange(pw - w) + 1) / ramp, 0.0, 1.0)[None, :, None]
+        tgt = vis[ys, w - 1].astype(np.float64).mean(axis=0)
+        out[:, w:] = out[:, w:] * (1 - t) + tgt[None, None, :] * t
+    return np.rint(out).clip(0, 255).astype(np.uint8)
+
+
 FILLS = {
     "replicate": fill_replicate,          # production (pad.wgsl)
-    "decay32": lambda v, pw, ph: fill_decay(v, pw, ph, 32),
-    "decay8": lambda v, pw, ph: fill_decay(v, pw, ph, 8),
-    "flat": fill_flat,
-    "mirror": fill_mirror,
+    "d8_edgemean": lambda v, pw, ph: fill_decay_target(v, pw, ph, 8, "edgemean"),
+    "d8_grey": lambda v, pw, ph: fill_decay_target(v, pw, ph, 8, "grey"),
+    "d8_edge1": lambda v, pw, ph: fill_decay_edge_samples(v, pw, ph, 8, 1),
+    "d8_edge8": lambda v, pw, ph: fill_decay_edge_samples(v, pw, ph, 8, 8),
 }
 
 
@@ -601,6 +675,10 @@ def main():
                          "1's rate difference is not all padding.")
     ap.add_argument("--canary", action="store_true",
                     help="only prove that the padded plane is what GNC codes, then exit")
+    ap.add_argument("--canary-fill", default="production", choices=["production", "replicate"],
+                    help="which padding model the canary compares against: `production` is what "
+                         "pad.wgsl does today (d8_edge8 since PAD-1), `replicate` is the "
+                         "pre-PAD-1 shader, still reachable with GNC_PAD_FILL=replicate")
     ap.add_argument("--csv", default=None)
     ap.add_argument("--project-from", default=None, metavar="CSV",
                     help="skip every encode and only carry a previous run's Part 1 to the native "
@@ -626,7 +704,8 @@ def main():
         if args.canary:
             print("=== Canary — is the padded plane really what GNC codes? ===")
             for img in args.images:
-                c = canary(gnc, img, tmp, qualities[len(qualities) // 2], extra)
+                c = canary(gnc, img, tmp, qualities[len(qualities) // 2], extra,
+                           fill=args.canary_fill)
                 if c is None:
                     print(f"  {Path(img).stem}: already tile-aligned, nothing to check")
                     continue

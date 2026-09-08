@@ -245,6 +245,13 @@ are not ENT-4's +27.1% / +48.3% even though they are close on the mean** — ENT
 ladder against q=80–98 here, and a BD-rate is only comparable to another over the same overlapping
 quality range. Per image the ladder alone moves the figure up to 2.2 points.
 
+**And every still figure in this section predates PAD-1 (2026-09-08, decision `0039`), which
+returned −4.63% RGB / −4.60% Y of intra rate** by fading the tile padding flat instead of
+replicating it. So the GNC-vs-J2K intra gap on stills is about 4.6 points smaller than the numbers
+here, and any still byte count taken before that commit is reproducible only with
+`GNC_PAD_FILL=replicate`. **Sequence figures are untouched and byte-identical** — the fill is
+refused on anything a frame predicts from.
+
 ## Video vs H.264 — the headline number (QUAL-1, 2026-09-06)
 
 `scripts/meas1_vs_h264.py`: one normalised reference through PNG for both codecs, the same `vmaf`

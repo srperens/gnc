@@ -1,8 +1,7 @@
 # GNC Benchmark Baseline
 
-Last updated: 2026-09-06 (compression columns; fps columns are older — see below)
-Baseline commit: `e872904` — after ENT-1 (packed frequency tables), BUG-11 (Rice stream mapping),
-BUG-12, BUG-13 (intra prediction bit-exact) and QUAL-1.
+Last updated: 2026-09-08 (compression columns; fps columns are older — see below)
+Baseline commit: `0a1b055` — MEAS-10 re-take after PAD-1, INTRA-2, INTER-2, BUG-16 and RATE-2.
 Mode: Spatial-only, Rice entropy, uniform subband weights. P-only by default since BUG-5.
 
 **Tile size 256 is unchanged by BUG-11 — byte-identical at all 12 measured points** — so every
@@ -38,10 +37,18 @@ Re-measured 2026-09-06 after BUG-6 made 5 wavelet levels the default at q ≥ 25
 
 | q   | PSNR     | BPP  | VMAF  | levels |
 |-----|----------|------|-------|--------|
-| 25  | 35.63 dB | 1.64 | 90.31 | 5 |
-| 50  | 40.30 dB | 2.73 | 95.02 | 5 |
-| 75  | 44.84 dB | 4.53 | 96.58 | 5 |
+| 25  | 35.63 dB | 1.57 | 90.31 | 5 |
+| 50  | 40.25 dB | 2.60 | 95.07 | 5 |
+| 75  | 44.64 dB | 4.31 | 96.55 | 5 |
 | 90  | 49.89 dB | 7.21 | 97.06 | 5 |
+
+**MEAS-10 re-took every row on 2026-09-08 at `0a1b055`.** q=90 is unchanged from INTRA-2's
+patch (already included PAD-1). q=25/50/75 moved because PAD-1's decay fill is now the still
+default: bpp −4.3% / −4.8% / −4.9%. Canary: `GNC_PAD_FILL=replicate` reproduces the previous
+rows **byte-for-byte in the printed columns** (q=50 40.30 dB / 2.73 / 95.02; q=75 44.84 dB /
+4.53 / 96.58). At q=75 RGB PSNR drops **0.20 dB** under decay — PAD-1's own gate was q=80–94
+where it measured −0.001 dB; VMAF moves −0.03, well under the 0.5 BLOCK. q=100 on this image
+is bit-exact (`PSNR inf`, 12.57 bpp, VMAF 97.43 — VMAF is saturated and cannot see lossless).
 
 **The q=90 row moved on 2026-09-08 (INTRA-2).** It read **50.06 dB / 8.07 bpp / VMAF 97.08**.
 The dead zone is now 0.6 over q=85..95 where the ladder had 0.5 down to 0.0 — values the quantiser
@@ -134,6 +141,9 @@ Three different quantities have been called "encode fps" here. State which one, 
 | **C — end to end** | wall clock around `encode-sequence`, PNG input | 5.0 fps median |
 
 **A is 2.4x C.** Use A to compare against another codec's encoder, C to claim throughput.
+`benchmark-sequence --throughput` (BUG-32, 2026-09-08) is the CLI form of A without the CPU
+PSNR/SSIM tax that used to be 86% of that command's wall clock. Default `benchmark-sequence`
+still scores every frame; do not time it.
 
 **Timing runs require an idle machine.** Two agents share this Mac; a run taken during a
 `cargo test` measured 20% slower than the same run taken after it. Compression figures (bpp,
@@ -173,32 +183,30 @@ one byte** (1 173 797 vs 1 173 796). Every file decodes to identical pixels on b
 hashes lossy encoder output will fail across backends, and a conformance suite must require decoder
 bit-exactness, not encoder reproducibility.
 
-## Sequence Benchmarks (I+P+B, q=75, ki=9, 10 frames, 4:4:4)
+## Sequence Benchmarks (I+P, ki=9, 10 frames, 4:4:4)
 
-> **Stale as of 2026-09-06.** `quality_preset` now vetoes the hierarchical B-pyramid by default
-> (BUG-5: it costs +3 to +19% at matched VMAF on camera content and 160 ms of reordering
-> latency). Any `-q` run now produces I+P, not I+P+B. Set `GNC_B_PYRAMID=1` to reproduce the
-> figures below. These numbers need re-measuring against the new default.
->
-> **And stale for a second reason as of 2026-09-07: BUG-27.** q=75 is inside the range where the
-> encoder's P-frame reference was dequantised with the intra quantiser step (any q <= 80), so these
-> bpp and PSNR figures were taken through a diverging prediction loop. Whoever re-measures them
-> for the B-pyramid change gets both corrections at once. Nothing at q >= 85 in this file is
-> affected — verified byte-identical, 27/27. See `docs/decisions/0023`.
->
-> **And stale for a third reason as of 2026-09-08: INTER-2.** The inter dead zone went from twice
-> the intra dead zone to the same as it (`inter_dz_mul` 2.0 → 1.0, BD-rate −4.77% on PSNR,
-> worst-frame better at 12 of 12 points). q=75 with inter frames is inside the affected range;
-> **q ≤ 88 moves and q ≥ 89 is byte-identical**, measured. `docs/decisions/0041`.
+The pre-2026-09-08 rows (crowd_run 5.55 bpp / 39.04 dB / VMAF 99.36, park_joy 4.43 bpp /
+VMAF 99.37, both at q=75) are withdrawn. They were I+P+B through three defects at once:
+the B-pyramid that `quality_preset` has vetoed since BUG-5, BUG-27's intra-qstep P-frame
+reference (live at q ≤ 80), and INTER-2's double inter dead zone (live at q ≤ 88).
+`park_joy` is not in the tree. `GNC_B_PYRAMID=1` reproduces the pyramid mix, not those numbers.
 
-| sequence   | bpp  | PSNR avg | VMAF  | notes                                                        |
-|------------|------|----------|-------|--------------------------------------------------------------|
-| crowd_run  | 5.55 | 39.04 dB | 99.36 | uniform weights (pre: 5.34 bpp / VMAF 99.12, perceptual)    |
-| park_joy   | 4.43 | —        | 99.37 | uniform weights (pre: 4.22 bpp / VMAF 99.12, perceptual)    |
-| bbb        | —    | —        | —     | Y4M too short (8 frames) for ki=9                            |
+**Re-taken 2026-09-08 (MEAS-10) against the shipped default** — I+P, no B-pyramid, INTER-2's
+inter dead zone, PAD-1 refused on references. 10 frames, ki=9, 4:4:4, Rice, `2I+8P+0B`.
+Sources: crowd_run, old_town_cross, bbb_extended PNG sequences.
 
-Note: bpp increased at q=75 because quality also increased (+0.25 VMAF, +2.28 dB PSNR for single-frame).
-BD-rate vs equal-VMAF comparison: uniform weights save ~18% bpp at matched VMAF.
+| sequence        | q  | bpp  | PSNR avg | PSNR min | VMAF  | I-only bpp | vs I-only |
+|-----------------|----|------|----------|----------|-------|------------|-----------|
+| crowd_run       | 75 | 8.39 | 42.47 dB | 42.27 dB | 99.68 | 8.76       | −4.2%     |
+| crowd_run       | 90 | 13.17| 49.60 dB | 49.23 dB | 99.72 | 12.51      | **+5.3%** |
+| old_town_cross  | 75 | 8.39 | 42.36 dB | 42.17 dB | 99.38 | 8.25       | **+1.7%** |
+| old_town_cross  | 90 | 13.04| 49.59 dB | 49.22 dB | 99.70 | 11.94      | **+9.2%** |
+| bbb_extended    | 75 | 3.07 | 43.55 dB | 42.37 dB | 97.88 | 4.53       | −32.3%    |
+| bbb_extended    | 90 | 6.77 | 50.28 dB | 50.06 dB | 99.16 | 7.63       | −11.3%    |
+
+The I-only column is the comparison that survives: on camera content at q=90, **inter costs more
+than all-intra**. Animation still saves. That is INTER-1's finding on current HEAD, not a new one.
+No fps is quoted — the machine was not idle.
 
 ## Reported bitrate correction (2026-09-05)
 
@@ -268,27 +276,36 @@ here, and any still byte count taken before that commit is reproducible only wit
 `GNC_PAD_FILL=replicate`. **Sequence figures are untouched and byte-identical** — the fill is
 refused on anything a frame predicts from.
 
-## Video vs H.264 — the headline number (QUAL-1, 2026-09-06)
+## Video vs H.264 — the headline number (MEAS-10, 2026-09-08)
 
 `scripts/meas1_vs_h264.py`: one normalised reference through PNG for both codecs, the same `vmaf`
 binary and arguments for every score, rate from the actual coded bitstream. 1920x1080, 17 frames,
-ki=9, 4:2:0, 8-bit, x264 at its defaults.
+ki=9, 4:2:0, 8-bit, x264 at its defaults. Pinned to `0a1b055`. Same ladder as QUAL-1:
+q=85,92,96,99 against crf=1,2,4,8.
 
-**BD-rate on PSNR-Y at contribution quality** — q=85,92,96,99 against crf=1,2,4,8:
+**BD-rate on PSNR-Y at contribution quality:**
 
 | | bbb_extended | old_town_cross | crowd_run | **mean** |
 |---|---|---|---|---|
-| full video (ki=9) | **+129.0%** | **+71.9%** | **+70.6%** | **+90.5%** |
-| curve overlap | 49.4–55.9 dB | 50.0–56.2 dB | 49.9–56.3 dB | |
+| full video (ki=9), Rice | **+128.5%** | **+70.2%** | **+68.8%** | **+89.2%** |
+| full video (ki=9), `--abac` | **+91.8%** | **+53.1%** | **+53.0%** | **+66.0%** |
+| curve overlap | 49.9–56.0 dB | 49.8–55.9 dB | 49.8–56.0 dB | |
+| QUAL-1 (2026-09-06), Rice | +129.0% | +71.9% | +70.6% | +90.5% |
 
-**GNC needs about 1.9x the bitrate of H.264 for the same luma PSNR at contribution quality.**
+**GNC Rice needs about 1.9x the bitrate of H.264 for the same luma PSNR at contribution quality.
+`--abac` is 1.66x** — same pixels as Rice at every rung (PSNR-Y identical to two decimals),
+only the bytes moved. That is the canary the path ran. Saving vs Rice decays with quality
+(crowd_run −12.2% at q=85 to −3.7% at q=99), which is ENT-3's finding on this ladder.
+Rice stays the default; quote **+89.2%** unless the command included `--abac`.
 
-> **One of these four rungs moved on 2026-09-08 (INTER-2).** The ladder is q=85/92/96/99, and the
-> inter dead-zone default changed for **q ≤ 88 only** — so **q=85 moves and 92/96/99 do not**,
-> measured byte-identical at q ≥ 89. The direction should favour GNC, because the change improves
-> the inter RD curve by −4.77% BD-rate on PSNR, but **that is a prediction and this figure has not
-> been re-measured**: +90.5% stands as recorded until `meas1_vs_h264.py` is run again.
-> `docs/decisions/0041`.
+The move from QUAL-1's +90.5% to +89.2% is **1.3 points**, all in the direction INTER-2
+predicted: only q=85 of this ladder sits in the inter-dead-zone change (q ≤ 88), so a
+−4.77% GNC-vs-GNC BD-rate on that one rung dilutes to about a point against x264. VMAF
+BD-rate on the same data is not a number (old_town **+2548%** Rice / **+2289%** abac at
+VMAF 99.8–99.8). Do not quote it.
+
+> **INTER-2's prediction is now a measurement.** The 2026-09-06 +90.5% stands as the QUAL-1
+> record. Quote **+89.2%** for current HEAD. `docs/decisions/0041`.
 
 **Caveat added 2026-09-07, and RATE-2's fix does NOT lift it (updated 2026-09-08).** Two of those
 four rungs are inside GNC's dominated range: above q≈95–98 the lossy path costs *more bytes than
@@ -298,19 +315,21 @@ makes the figure **pessimistic against GNC by an unmeasured amount** — not wro
 1.9x either. The ladder is also not monotonic in rate (a rung's bpp can fall as q rises), so any
 interpolation by rate should flag that.
 
-**RATE-2 shipped on 2026-09-08 (`docs/decisions/0036`) and left this figure unchanged, because
-that fix was intra-only. RATE-3 landed the same day (`docs/decisions/0044`) and this figure is now
-stale for the top two rungs.** A still at q=95–99 codes both ways and keeps the smaller (mean
-−21.66% at q=99), and since RATE-3 a **sequence I-frame does too**: mean **−4.28%** of sequence
-bytes over three sequences at q ∈ {95, 99} and ki ∈ {2, 9}, up to **−13.16%**, at a worst quality
-move of −0.01 dB. The ladder here is q=85/92/96/99, so **q=96 and q=99 move and q=85/92 do not** —
-`quality_preset` sets the fallback for q = 95..=99 only.
+**RATE-2 shipped on 2026-09-08 (`docs/decisions/0036`) and did not move this figure, because that
+fix was intra-only. RATE-3 landed the same day (`docs/decisions/0044`) and does move it.** A still
+at q=95–99 codes both ways and keeps the smaller (mean −21.66% at q=99), and since RATE-3 a
+**sequence I-frame does too**: the gate that refused the fallback inside a sequence is lifted, worth
+mean **−4.28%** of sequence bytes over three sequences at q ∈ {95, 99} and ki ∈ {2, 9}, up to
+**−13.16%**, at a worst quality move of −0.01 dB.
 
-The direction favours GNC and the size is not guessable from the sweep above: this ladder is 4:2:0
-at ki=9, where RATE-3 measured −2.4% to −5.7%, not the −13% of its best point. **+90.5% stands as
-recorded until `meas1_vs_h264.py` is run again** — as with the INTER-2 note above, a predicted
-direction is not a measurement. Two of the four rungs have now moved for two independent reasons,
-which makes re-running this ladder the highest-value measurement in the file.
+**So the ladder's top two rungs are stale.** It is q=85/92/96/99 and `quality_preset` sets the
+fallback for q = 95..=99 only, so **q=96 and q=99 move; q=85/92 do not.** The direction favours GNC
+and the size is not guessable from RATE-3's sweep: this ladder is 4:2:0 at ki=9, where RATE-3
+measured −2.4% to −5.7%, not the −13% of its best point. **+89.2% stands as recorded until
+`meas1_vs_h264.py` is run again** — as with the INTER-2 note above, a predicted direction is not a
+measurement. Two of the four rungs have now moved for two independent reasons (INTER-2 at q=85,
+RATE-3 at q=96 and q=99), which makes re-running this ladder the highest-value measurement in the
+file.
 
 **Colour, at rate matched to 1%** — CIEDE2000 on decoded RGB, which VMAF cannot see:
 

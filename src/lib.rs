@@ -1702,6 +1702,29 @@ fn report_adapter(info: &wgpu::AdapterInfo) {
 #[cfg(target_arch = "wasm32")]
 fn report_adapter(_info: &wgpu::AdapterInfo) {}
 
+/// Storage buffers per shader stage GNC actually needs.
+///
+/// `wgpu::Limits::default()` (and the WebGPU spec) is **8**. `block_match_bidir.wgsl` binds **9**
+/// storage buffers and is the only shader above 8; the previous request of 10 was one of unused
+/// slack. 9 is still an override — recorded as BUG-34 / `docs/decisions/0047`. Getting to 8 means
+/// merging two bindings in that file, which this item refused: B-frames are off by default, the
+/// same shader is BUG-25's crash site and BUG-40's DX12 layout, and a low-traffic merge there is
+/// the wrong first edit.
+pub const MAX_STORAGE_BUFFERS_PER_SHADER_STAGE: u32 = 9;
+
+/// Limits passed to `request_device`. `Limits::default()` except for
+/// [`MAX_STORAGE_BUFFERS_PER_SHADER_STAGE`].
+///
+/// Any further override has to go through this function *and* the equality test in
+/// `tests/requested_limits.rs`, which compares the two structs field-for-field. Raising a
+/// request is a decision record, not a commit (GOALS rule 4).
+pub fn required_limits() -> wgpu::Limits {
+    wgpu::Limits {
+        max_storage_buffers_per_shader_stage: MAX_STORAGE_BUFFERS_PER_SHADER_STAGE,
+        ..wgpu::Limits::default()
+    }
+}
+
 /// GPU context shared across encoder/decoder
 pub struct GpuContext {
     pub instance: wgpu::Instance,
@@ -1764,10 +1787,7 @@ impl GpuContext {
                 &wgpu::DeviceDescriptor {
                     label: Some("gpu-codec device"),
                     required_features: wgpu::Features::empty(),
-                    required_limits: wgpu::Limits {
-                        max_storage_buffers_per_shader_stage: 10,
-                        ..wgpu::Limits::default()
-                    },
+                    required_limits: required_limits(),
                     ..Default::default()
                 },
                 None,

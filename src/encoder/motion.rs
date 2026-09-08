@@ -165,12 +165,19 @@ pub struct MotionEstimator {
     match_bgl: wgpu::BindGroupLayout,
     compensate_pipeline: wgpu::ComputePipeline,
     compensate_bgl: wgpu::BindGroupLayout,
-    match_bidir_pipeline: wgpu::ComputePipeline,
+    /// Built on first B-frame dispatch rather than in `new` — see `match_bidir_pipeline()`.
+    match_bidir_pipeline: std::sync::OnceLock<wgpu::ComputePipeline>,
+    match_bidir_shader: wgpu::ShaderModule,
+    match_bidir_pl: wgpu::PipelineLayout,
     match_bidir_bgl: wgpu::BindGroupLayout,
-    compensate_bidir_pipeline: wgpu::ComputePipeline,
+    compensate_bidir_pipeline: std::sync::OnceLock<wgpu::ComputePipeline>,
+    compensate_bidir_shader: wgpu::ShaderModule,
+    compensate_bidir_pl: wgpu::PipelineLayout,
     compensate_bidir_bgl: wgpu::BindGroupLayout,
     /// Chroma-dimension bidir MC pipeline (for 4:2:0 B-frame chroma planes).
-    compensate_bidir_chroma_pipeline: wgpu::ComputePipeline,
+    compensate_bidir_chroma_pipeline: std::sync::OnceLock<wgpu::ComputePipeline>,
+    compensate_bidir_chroma_shader: wgpu::ShaderModule,
+    compensate_bidir_chroma_pl: wgpu::PipelineLayout,
     compensate_bidir_chroma_bgl: wgpu::BindGroupLayout,
     /// Built on first dispatch rather than in `new` — see `split_pipeline()`.
     split_pipeline: std::sync::OnceLock<wgpu::ComputePipeline>,
@@ -313,17 +320,9 @@ impl MotionEstimator {
                 bind_group_layouts: &[&match_bidir_bgl],
                 push_constant_ranges: &[],
             });
-
-        let match_bidir_pipeline =
-            ctx.device
-                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some("block_match_bidir_pipeline"),
-                    layout: Some(&match_bidir_pl),
-                    module: &match_bidir_shader,
-                    entry_point: Some("main"),
-                    compilation_options: Default::default(),
-                    cache: None,
-                });
+        // Pipeline itself is lazy: see `match_bidir_pipeline()`. Creating it here is
+        // what made every DX12 encode die on a B-frame shader the default path
+        // never dispatches (BUG-40).
 
         // --- Bidirectional motion compensation ---
         let compensate_bidir_shader =
@@ -360,17 +359,7 @@ impl MotionEstimator {
                     bind_group_layouts: &[&compensate_bidir_bgl],
                     push_constant_ranges: &[],
                 });
-
-        let compensate_bidir_pipeline =
-            ctx.device
-                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some("motion_compensate_bidir_pipeline"),
-                    layout: Some(&compensate_bidir_pl),
-                    module: &compensate_bidir_shader,
-                    entry_point: Some("main"),
-                    compilation_options: Default::default(),
-                    cache: None,
-                });
+        // Lazy with `match_bidir_pipeline` — same feature, same rule.
 
         // --- Chroma-dimension bidir MC pipeline (for 4:2:0 B-frame chroma) ---
         let compensate_bidir_chroma_shader =
@@ -405,17 +394,7 @@ impl MotionEstimator {
                     bind_group_layouts: &[&compensate_bidir_chroma_bgl],
                     push_constant_ranges: &[],
                 });
-
-        let compensate_bidir_chroma_pipeline =
-            ctx.device
-                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some("motion_compensate_bidir_chroma_pipeline"),
-                    layout: Some(&compensate_bidir_chroma_pl),
-                    module: &compensate_bidir_chroma_shader,
-                    entry_point: Some("main"),
-                    compilation_options: Default::default(),
-                    cache: None,
-                });
+        // Lazy with the other bidir pipelines — 4:2:0 B-frame chroma is the same feature.
 
         // --- Split (variable block size) pipeline ---
         let split_shader = ctx
@@ -569,11 +548,17 @@ impl MotionEstimator {
             match_bgl,
             compensate_pipeline,
             compensate_bgl,
-            match_bidir_pipeline,
+            match_bidir_pipeline: std::sync::OnceLock::new(),
+            match_bidir_shader,
+            match_bidir_pl,
             match_bidir_bgl,
-            compensate_bidir_pipeline,
+            compensate_bidir_pipeline: std::sync::OnceLock::new(),
+            compensate_bidir_shader,
+            compensate_bidir_pl,
             compensate_bidir_bgl,
-            compensate_bidir_chroma_pipeline,
+            compensate_bidir_chroma_pipeline: std::sync::OnceLock::new(),
+            compensate_bidir_chroma_shader,
+            compensate_bidir_chroma_pl,
             compensate_bidir_chroma_bgl,
             split_pipeline: std::sync::OnceLock::new(),
             split_shader,
@@ -925,7 +910,7 @@ impl MotionEstimator {
                 label: Some("block_match_bidir_pass"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.match_bidir_pipeline);
+            pass.set_pipeline(self.match_bidir_pipeline(ctx));
             pass.set_bind_group(0, &bg, &[]);
             // One workgroup per block
             pass.dispatch_workgroups(total_blocks, 1, 1);
@@ -1027,7 +1012,7 @@ impl MotionEstimator {
                 label: Some("mc_bidir_pass"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.compensate_bidir_pipeline);
+            pass.set_pipeline(self.compensate_bidir_pipeline(ctx));
             pass.set_bind_group(0, &bg, &[]);
             pass.dispatch_workgroups(workgroups, 1, 1);
         }
@@ -1187,6 +1172,65 @@ impl MotionEstimator {
                     label: Some("block_match_split_pipeline"),
                     layout: Some(&self.split_pl),
                     module: &self.split_shader,
+                    entry_point: Some("main"),
+                    compilation_options: Default::default(),
+                    cache: None,
+                })
+        })
+    }
+
+    /// Bidirectional block-match pipeline, compiled on first B-frame dispatch.
+    ///
+    /// Same rule as `split_pipeline()`: a shader's cost, including the risk that
+    /// it does not compile, is paid by the feature that uses it. B-frames have
+    /// been off by default since BUG-5, and on DX12 naga's HLSL for
+    /// `block_match_bidir.wgsl` fails FXC with X3695 — so creating this
+    /// pipeline in `new` made every encode, including intra, die on a shader
+    /// the default path never runs (BUG-40).
+    fn match_bidir_pipeline(&self, ctx: &GpuContext) -> &wgpu::ComputePipeline {
+        self.match_bidir_pipeline.get_or_init(|| {
+            if std::env::var("GNC_PROFILE").is_ok() {
+                eprintln!("[bug40] match_bidir_pipeline=1");
+            }
+            ctx.device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("block_match_bidir_pipeline"),
+                    layout: Some(&self.match_bidir_pl),
+                    module: &self.match_bidir_shader,
+                    entry_point: Some("main"),
+                    compilation_options: Default::default(),
+                    cache: None,
+                })
+        })
+    }
+
+    fn compensate_bidir_pipeline(&self, ctx: &GpuContext) -> &wgpu::ComputePipeline {
+        self.compensate_bidir_pipeline.get_or_init(|| {
+            if std::env::var("GNC_PROFILE").is_ok() {
+                eprintln!("[bug40] compensate_bidir_pipeline=1");
+            }
+            ctx.device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("motion_compensate_bidir_pipeline"),
+                    layout: Some(&self.compensate_bidir_pl),
+                    module: &self.compensate_bidir_shader,
+                    entry_point: Some("main"),
+                    compilation_options: Default::default(),
+                    cache: None,
+                })
+        })
+    }
+
+    fn compensate_bidir_chroma_pipeline(&self, ctx: &GpuContext) -> &wgpu::ComputePipeline {
+        self.compensate_bidir_chroma_pipeline.get_or_init(|| {
+            if std::env::var("GNC_PROFILE").is_ok() {
+                eprintln!("[bug40] compensate_bidir_chroma_pipeline=1");
+            }
+            ctx.device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("motion_compensate_bidir_chroma_pipeline"),
+                    layout: Some(&self.compensate_bidir_chroma_pl),
+                    module: &self.compensate_bidir_chroma_shader,
                     entry_point: Some("main"),
                     compilation_options: Default::default(),
                     cache: None,
@@ -1434,7 +1478,7 @@ impl MotionEstimator {
                 label: Some("block_match_bidir_pass"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.match_bidir_pipeline);
+            pass.set_pipeline(self.match_bidir_pipeline(ctx));
             pass.set_bind_group(0, &bg, &[]);
             pass.dispatch_workgroups(total_blocks, 1, 1);
         }
@@ -1506,7 +1550,7 @@ impl MotionEstimator {
                 label: Some("mc_bidir_pass"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.compensate_bidir_pipeline);
+            pass.set_pipeline(self.compensate_bidir_pipeline(ctx));
             pass.set_bind_group(0, &bg, &[]);
             pass.dispatch_workgroups(workgroups, 1, 1);
         }
@@ -1599,7 +1643,7 @@ impl MotionEstimator {
                 label: Some("mc_bidir_chroma_pass"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.compensate_bidir_chroma_pipeline);
+            pass.set_pipeline(self.compensate_bidir_chroma_pipeline(ctx));
             pass.set_bind_group(0, &bg, &[]);
             pass.dispatch_workgroups(workgroups, 1, 1);
         }
@@ -2413,6 +2457,66 @@ fn bgl_storage_rw(binding: u32) -> wgpu::BindGroupLayoutEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bidir_pipelines_are_lazy_until_dispatched() {
+        let ctx = GpuContext::new();
+        let me = MotionEstimator::new(&ctx);
+        assert!(
+            me.match_bidir_pipeline.get().is_none()
+                && me.compensate_bidir_pipeline.get().is_none()
+                && me.compensate_bidir_chroma_pipeline.get().is_none(),
+            "BUG-40: bidir pipelines must not compile in MotionEstimator::new"
+        );
+
+        let width = 64u32;
+        let height = 64u32;
+        let pixels = (width * height) as usize;
+        let frame_data: Vec<f32> = (0..pixels).map(|i| (i % 256) as f32).collect();
+        let current_buf = ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("bug40_current"),
+                contents: bytemuck::cast_slice(&frame_data),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+        let reference_buf = ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("bug40_ref"),
+                contents: bytemuck::cast_slice(&frame_data),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+
+        let mut cmd = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("bug40_p_estimate"),
+            });
+        let _ = me.estimate(
+            &ctx,
+            &mut cmd,
+            &current_buf,
+            &reference_buf,
+            width,
+            height,
+            None,
+        );
+        ctx.queue.submit(Some(cmd.finish()));
+        assert!(
+            me.match_bidir_pipeline.get().is_none(),
+            "BUG-40: a P-frame estimate must not compile the bidir shader"
+        );
+
+        // The getter is what a B-frame dispatch calls. Invoking it is enough to
+        // prove the pipeline compiles on this backend, without needing valid
+        // bidir bind groups.
+        let _ = me.match_bidir_pipeline(&ctx);
+        assert!(
+            me.match_bidir_pipeline.get().is_some(),
+            "BUG-40: first bidir dispatch must compile match_bidir"
+        );
+    }
 
     #[test]
     fn test_motion_estimation_zero_motion() {

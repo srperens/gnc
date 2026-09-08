@@ -16,16 +16,16 @@
 //! tile can overrun its tables and still emit streams that fit their slots, and then nothing
 //! downstream notices.
 //!
-//! Which limit binds is not a toss-up: on the per-subband path the tables always give out
-//! first, and no stream is anywhere near its slot when they do. Measured with `--rans` at the
-//! default quantiser step, which is the configuration the backlog entry is actually about:
-//! kristensara_720p needs 4020 of 4097 entries at q=75 and 4165 at q=76, where it is refused;
-//! bbb_1080p still fits at q=76 with 4052 and goes at q=77. That reproduces the q=75/76/77
-//! content split ENT-2 measured by encoding, and says what causes it. So the slot overflow
-//! BUG-9 recorded was the *symptom* of coding with frequencies read from outside the table,
-//! not an independent limit — the entry's "this is not the symbol alphabet" has it backwards.
-//! The slot is reachable on its own only off the subband path, which is what the second test
-//! below does.
+//! Which limit binds is not a toss-up. On the per-subband path the **histogram arena** (5120
+//! bins, BUG-35) and the **cumfreq table** (4097 entries, BUG-9) both bind before any stream
+//! slot: a tile that overruns either still emits streams that fit, and then nothing downstream
+//! notices. Histogram is checked first because it is the earlier pass. The window where only
+//! cumfreq fires is real — qstep 1.25 on this content needs 4247 cumfreq entries against a
+//! histogram that still fits. Measured with `--rans` at the default step on photographic
+//! stills: kristensara_720p needs 4020 of 4097 cumfreq entries at q=75 and 4165 at q=76, where
+//! it is refused; bbb_1080p still fits at q=76 with 4052 and goes at q=77. The histogram arena
+//! overflows later (bbb q=85 at 5322/5120). The slot is reachable on its own only off the
+//! subband path, which is what the third test below does.
 //!
 //! The content here is low-frequency randomness — full-range and unpredictable in the LL band.
 //! That matters: neither uniform noise nor a full-contrast checkerboard reaches either limit at
@@ -93,13 +93,24 @@ fn the_quality_range_that_selects_rans_fits_both_limits() {
 }
 
 #[test]
-#[should_panic(expected = "cumfreq entries but the encode shader")]
-fn a_cumfreq_table_that_does_not_fit_is_refused_by_name() {
-    // Per-subband tables at qstep 1.5 on this content ask for 5675 entries. On the subband path
-    // this is the limit that binds first at every step and on every content tried, which is why
-    // the slot case below has to leave that path to be reachable at all.
+#[should_panic(expected = "histogram bins")]
+fn a_histogram_arena_that_does_not_fit_is_refused_by_name() {
+    // BUG-35: `shared_hist` holds 5120 bins, the sum of per-group alphabets. At qstep 1.5 this
+    // content asks for ~6040, so the histogram check fires *before* the cumfreq one (5120 <
+    // 4097+groups). That used to be silent corruption via naga's atomic clamp.
     let mut config = gnc::quality_preset(15);
     config.quantization_step = 1.5;
+    encode_with(config);
+}
+
+#[test]
+#[should_panic(expected = "cumfreq entries but the encode shader")]
+fn a_cumfreq_table_that_does_not_fit_is_refused_by_name() {
+    // Window where cumfreq overflows 4097 but the histogram still fits 5120: qstep 1.25 on this
+    // content needs 4247 cumfreq entries (hist ≈ 4235). Coarser (1.5) overflows the histogram
+    // first; finer overshoots both. The slot case below still has to leave the subband path.
+    let mut config = gnc::quality_preset(15);
+    config.quantization_step = 1.25;
     encode_with(config);
 }
 

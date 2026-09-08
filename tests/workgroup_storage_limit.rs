@@ -13,8 +13,9 @@
 //! — it would only hide the defect behind one implementation's leniency.
 //!
 //! The budget is read from `wgpu::Limits::default()` rather than written as 16384, because that
-//! is literally what `GpuContext` requests (`src/lib.rs`, which overrides only
-//! `max_storage_buffers_per_shader_stage`). If someone raises the request, this test follows.
+//! is literally what `required_limits()` requests for this field. The one override GNC *does*
+//! make is storage buffers per stage (BUG-34, `tests/requested_limits.rs`). If someone raises
+//! the workgroup request, this test follows.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

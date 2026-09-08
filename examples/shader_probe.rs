@@ -64,10 +64,7 @@ fn main() {
                 &wgpu::DeviceDescriptor {
                     label: Some("probe"),
                     required_features: wgpu::Features::empty(),
-                    required_limits: wgpu::Limits {
-                        max_storage_buffers_per_shader_stage: 10,
-                        ..wgpu::Limits::default()
-                    },
+                    required_limits: gnc::required_limits(),
                     ..Default::default()
                 },
                 None,

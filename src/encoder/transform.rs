@@ -440,13 +440,9 @@ mod tests {
     #[test]
     fn zero_level_forward_is_an_identity_not_a_no_op() {
         let ctx = GpuContext::new();
-        let info = FrameInfo {
-            width: 256,
-            height: 256,
-            bit_depth: 8,
-            tile_size: 256,
-            chroma_format: ChromaFormat::Yuv444,
-        };
+        // `FrameInfo::new`, not a literal: TILE-1 added `plane_pad_align` and the constructor is
+        // what keeps a test on the current grid. At 256x256 the two grids coincide anyway.
+        let info = FrameInfo::new(256, 256, 8, 256, ChromaFormat::Yuv444);
         let count = (info.padded_width() * info.padded_height()) as usize;
         let bytes = (count * std::mem::size_of::<f32>()) as u64;
 

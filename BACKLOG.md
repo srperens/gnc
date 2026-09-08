@@ -1347,6 +1347,64 @@ idle machine (COORDINATION).
 **Do them behind a switch, the `GNC_ABAC_CODER` pattern**, and measure the set together on an idle
 machine rather than one at a time under load.
 
+### BUG-32 — `benchmark-sequence` spends 86% of its wall clock on CPU quality metrics, so any throughput figure derived from it measures SSIM (todo, P2)
+
+Found 2026-09-08 while running MEAS-5. Measured on an RTX 4000 Ada, Vulkan, `-q 90 -k 1 --rice`,
+120-frame crowd_run clip:
+
+| | wall | of which encode | not encode |
+|---|---|---|---|
+| `benchmark-sequence -n 8` | **2726 ms** | 208.7 ms (I+P) + 167.7 ms (I-only) | **86%** |
+| `benchmark -n 8` | 934 ms | 175 ms GPU work | 759 ms, mostly fixed startup |
+
+**Cause.** Per frame it runs `quality::psnr` and `quality::ssim_approx` on the CPU, for *both* its
+I+P arm and its I-only arm, and `decoder.decode_sequence` decodes and retains the entire sequence.
+Both arms run unconditionally on the default path: `run_baseline = !run_temporal || ab`, and
+`--temporal-wavelet none` makes `run_temporal` false, so `--ab` is not needed to get the second
+encode. That is four passes of work per measured frame.
+
+**It degrades superlinearly with length**, because the retained sequence is ~3 GB per arm at 120
+frames of 1080p f32: **341 ms/frame at 8 frames, 6.9 s/frame at 120**, where a single instance ran
+**13m52s** for 120 frames against ~1.7 s of actual GPU encode. The same pathology, unexplained at
+the time, is why a 24-frame `encode-sequence` run on the Mac took 54 minutes at 100% of one core
+earlier the same night.
+
+**What it invalidates.** `gpu_tier_bench.py --density` computes `aggregate_fps = frames / wall`, so
+swept concurrently it measures **how well N SSIM computations share the CPU**, not GPU encode. The
+GPU sat at **43–46 W of a 130 W limit** throughout, while `nvidia-smi` reported
+`utilization.gpu 100%` — a activity flag, not saturation, and worth its own line in any future
+throughput work.
+
+**What it does not invalidate.** The encoder's *own printed* fps (208.7 ms for 8 frames here) times
+the encode phase and is fine — that is BASELINE's quantity **A**. Compression figures from this
+command are untouched: bytes, bpp and pixel identity are deterministic and do not care what the
+wall clock did. Checked with the session that landed ARCH-3/BUG-18: none of its published numbers
+are throughput, and decision 0025 says so explicitly.
+
+**Candidate, not a finding: POSITIONING's M-series density table** (7.02 → 14.15 fps, "~2x at N=8,
+most of it already at N=2") has exactly the shape CPU-bound work on N cores produces. But it was
+taken 2026-09-05 by a method BACKLOG itself records as unrecorded, and this harness was built the
+day after, so **it cannot be attributed to this code path.** Do not write it up as though it can.
+
+**Worked around, not fixed.** `--density-still` (added with this item) sweeps `benchmark` instead:
+no per-frame CPU metrics, ~705 ms fixed startup plus 6.8 ms/iteration of non-GPU work against
+21.3 ms of GPU work — 24% overhead, and the fixed part amortises, so run large `--iterations`. It
+also samples GPU power per level, because power is the occupancy signal utilisation is not.
+
+**The fix proper** is a flag on `benchmark-sequence` that skips the metrics, the second arm and the
+whole-sequence decode retention, so a throughput sweep can use the same clip as the hardware-encoder
+arm. That was deliberately not done here: it touches a 4000-line handler whose blocks feed each
+other's summaries, and MEAS-5 did not need it once the instrument was characterised. Whoever takes
+it should keep the metrics on by default — the default should stay the honest one.
+
+**A second defect in the same harness, fixed here.** `hwenc_density` never passed a GOP length, so
+the fixed-function arm used its own default — 250 frames on NVENC — against whatever `-k` GNC was
+given. An all-intra GNC arm against a 250-frame-GOP NVENC arm is a comparison of GOP lengths
+wearing a throughput label. `--keyframe-interval` now goes through as ffmpeg's `-g`, and the row
+label prints it so the two arms cannot silently drift apart again. Nothing was ever published from
+that arm, so this invalidates no result — it would have invalidated the head-to-head MEAS-5 exists
+to run.
+
 ### BUG-19 — decision-record numbers collide, and two pairs are live on `main` (todo, P3)
 
 `docs/decisions/` currently holds **two 0018s and two 0019s**:
@@ -2084,7 +2142,20 @@ M1, so there is real headroom — but it is far from linear, and the published m
 literature agrees: concurrency converts *idle* GPU into *useful* GPU, it does not create GPU.
 NVIDIA's own consolidation study measured time-slicing at 0.76 req/s where MIG gave 1.00.
 
-**Harness built 2026-09-06, not yet run.** `scripts/gpu_tier_bench.py --density` and `--hwenc`
+**Read that table with BUG-32 in hand.** It has exactly the shape CPU-bound work on N cores
+produces, and the harness that would produce that shape spends 86% of its wall clock on CPU quality
+metrics. But this table was taken 2026-09-05 by a method BACKLOG itself records as unrecorded, and
+`gpu_tier_bench.py` was built the day after — so **the defect cannot be attributed to it.** That
+makes it a candidate, not a retraction. It needs re-taking before it is quoted again, and
+POSITIONING quotes it today.
+
+**Harness built 2026-09-06; first run 2026-09-08, and that run characterised the instrument
+rather than the GPU — see BUG-32.** `--density` computes `frames / wall` from `benchmark-sequence`,
+which spends 86% of that wall on CPU-side quality metrics, so swept concurrently it measures how
+well N SSIM computations share the CPU. **Use `--density-still` instead**: it sweeps `benchmark`,
+which runs no per-frame metrics (24% non-GPU overhead, and the fixed part amortises across
+`--iterations`), and it samples GPU power, because `utilization.gpu` reads 100% while the card draws
+43 W of a 130 W budget. `--density` and `--hwenc`
 sweep concurrent instances of GNC and of the machine's fixed-function encoder over the same clip.
 Two things to know before reading its NVENC rows: the 12-session cap is a GeForce driver
 restriction and will not appear on a professional Ada part, and the rows are **not

@@ -4106,6 +4106,210 @@ fn lossless_iframe_reference_matches_the_decoders() {
     }
 }
 
+/// RATE-4 / BUG-45: **`is_lossless()` is a statement about the settings, not about the input.**
+///
+/// At q=100 the quantiser step is 1.0 and MED's residual is a difference of *integers* — which is
+/// only true if the input is integer-valued. Feed it fractional f32 and the step-1.0 quantiser
+/// rounds, so the reconstruction is integral where the source is not, and the file is **lossy
+/// while `is_lossless()` reports true**. Same family as BUG-15 (`chroma_weight` 1.2 at q=100) and
+/// BUG-30 (`GNC_DEAD_ZONE` at q=100): a setting outside the guarantee, silently taken.
+///
+/// This is also the whole explanation of RATE-4's `254.0039` row, which blocked its source-copy
+/// half for a day and was measured on `make_gradient_frame` — whose values are `x / 256 * 255`,
+/// fractional. The row is real and is not about q=100: it is this.
+///
+/// The test pins both halves, because only the pair is informative: on integer input the source,
+/// the encoder's reference and the decoder's reference are **one picture**; on fractional input
+/// the reconstruction leaves the source, which is what makes a source-built reference wrong there
+/// and a bit-exactness claim wrong with it.
+#[test]
+fn lossless_at_q100_is_a_claim_about_integer_input() {
+    let ctx = GpuContext::new();
+    let (w, h) = (256u32, 256u32);
+    let half = |x: f32| (x * 0.5).floor();
+    let integer_content: Vec<f32> = (0..w * h * 3)
+        .map(|i| {
+            let hash = i.wrapping_mul(2_654_435_761) ^ (i >> 3).wrapping_mul(40_503);
+            f32::from((hash >> 7) as u8)
+        })
+        .collect();
+    let fractional_content = make_gradient_frame(w, h, 0.0);
+    assert!(
+        integer_content.iter().all(|v| v.fract() == 0.0),
+        "the integer arm's content is not integer-valued, so it tests nothing"
+    );
+    assert!(
+        fractional_content.iter().any(|v| v.fract() != 0.0),
+        "`make_gradient_frame` is now integer-valued, so the fractional arm tests nothing — and \
+         the tests that use it as a lossless input are no longer measuring what this records"
+    );
+
+    let pixels = (w * h) as usize;
+    std::env::set_var("GNC_REF_DEBLOCK", "0");
+    let mut seen = Vec::new();
+    for (name, f0) in [("integer", &integer_content), ("fractional", &fractional_content)] {
+        let mut cfg = crate::quality_preset(100);
+        cfg.tile_size = 256;
+        cfg.keyframe_interval = 1;
+        cfg.lossless_fallback = false;
+        assert!(cfg.is_lossless(), "q=100 no longer reports is_lossless()");
+
+        let mut enc = EncoderPipeline::new(&ctx);
+        let compressed = enc.encode_sequence(&ctx, &[f0], w, h, &cfg);
+        let dec = DecoderPipeline::new(&ctx);
+        let _ = dec.decode(&ctx, &compressed[0]);
+        let dec_ref = dec.read_reference_planes(&ctx, w, h).expect("decoder reference");
+
+        let mut max = 0.0f32;
+        for i in 0..pixels {
+            let (r, g, b) = (f0[i * 3], f0[i * 3 + 1], f0[i * 3 + 2]);
+            let co = r - b;
+            let tt = b + half(co);
+            let cg = g - tt;
+            max = max.max((dec_ref[i] - (tt + half(cg))).abs());
+        }
+        eprintln!("{name} input: max |decoder reference - YCoCg-R(source)| on Y = {max:.4}");
+        seen.push((name, max));
+    }
+    std::env::remove_var("GNC_REF_DEBLOCK");
+
+    let integer = seen.iter().find(|(n, _)| *n == "integer").unwrap().1;
+    let fractional = seen.iter().find(|(n, _)| *n == "fractional").unwrap().1;
+    assert!(
+        integer < 1.0e-3,
+        "integer input at q=100: the decoder's reference is {integer} away from the \
+         colour-converted source, so bit-exactness itself is broken (BUG-39's contract)"
+    );
+    assert!(
+        fractional > 1.0,
+        "fractional input at q=100 now reconstructs its source to within {fractional}. If that is \
+         a real fix, BUG-45 is closed and RATE-4's source-built reference no longer needs its \
+         integrality gate — check which, and do not just relax this bound"
+    );
+}
+
+/// RATE-4, the source-copy half: **is a bit-exact frame's reference actually its colour-converted
+/// source?** That is the premise `0040` point 4 and RATE-4's "free half" both rest on, and it has
+/// never been tested directly — both attempts tested a *patch* that claimed to exploit it, and
+/// then argued about the readback.
+///
+/// This tests the premise instead, and needs no patch: compute YCoCg-R forward on the CPU from the
+/// source and compare it with the reference the decoder actually holds. If they are equal, copying
+/// the colour-converted source *is* a legal way to build the reference and RATE-3's third encode is
+/// removable. If they are not, the route is dead and the difference says which stage is missing.
+///
+/// Both bit-exact cases are covered, and the reason to cover both is that they are the **same
+/// configuration**: `lossless_sibling` is `quality_preset(100)` with only how-to-code fields
+/// carried over, so a q=99 frame whose sibling was kept and a q=100 frame are the same transform,
+/// the same reversible colour path and the same branch of `local_decode_iframe_gpu`. Any
+/// measurement that separates them is measuring the instrument, not the codec — which is exactly
+/// what RATE-4's entry recorded two contradictory readings about.
+///
+/// The content is integer-valued on purpose: YCoCg-R is integer-exact, and a fractional source
+/// would make the CPU model disagree for a reason that has nothing to do with the reference.
+#[test]
+fn a_bit_exact_frames_reference_is_its_colour_converted_source() {
+    let ctx = GpuContext::new();
+    let (w, h) = (256u32, 256u32);
+    // Detail-dominated and integer-valued, so the bit-exact candidate can win at q=99 (the
+    // gradient loses by 1043% -- see `fallback_iframe_reference_matches_the_decoders`).
+    let f0: Vec<f32> = (0..w * h * 3)
+        .map(|i| {
+            let hash = i.wrapping_mul(2_654_435_761) ^ (i >> 3).wrapping_mul(40_503);
+            f32::from((hash >> 7) as u8)
+        })
+        .collect();
+    let padded_pixels = ((((w + 255) & !255) * ((h + 255) & !255)) as usize).max(1);
+
+    // The shader's forward YCoCg-R, `color_convert.wgsl` with `lossless == 1`: `half` is
+    // `floor(x * 0.5)`, which is what makes it reversible over the integers.
+    let half = |x: f32| (x * 0.5).floor();
+    let mut src_y = Vec::with_capacity(padded_pixels);
+    let mut src_co = Vec::with_capacity(padded_pixels);
+    let mut src_cg = Vec::with_capacity(padded_pixels);
+    for i in 0..(w * h) as usize {
+        let (r, g, b) = (f0[i * 3], f0[i * 3 + 1], f0[i * 3 + 2]);
+        let co = r - b;
+        let t = b + half(co);
+        let cg = g - t;
+        src_y.push(t + half(cg));
+        src_co.push(co);
+        src_cg.push(cg);
+    }
+    let cpu = [src_y, src_co, src_cg];
+
+    std::env::set_var("GNC_REF_DEBLOCK", "0");
+    let mut results = Vec::new();
+    let mut bit_exact_cases = 0;
+    // Arm 1 is q=100 outright. Arm 2 is the fallback with a step fine enough that the lossy
+    // candidate cannot be the smaller file, so the sibling wins by construction rather than by
+    // luck of content -- the same device `fallback_iframe_reference_matches_the_decoders` uses.
+    for (q, fine_step, fallback) in [(100u32, None, false), (99, Some(0.05f32), true)] {
+        let mut cfg = crate::quality_preset(q);
+        cfg.tile_size = 256;
+        cfg.keyframe_interval = 1;
+        cfg.lossless_fallback = fallback;
+        if let Some(step) = fine_step {
+            cfg.quantization_step = step;
+        }
+
+        let mut enc = EncoderPipeline::new(&ctx);
+        let compressed = enc.encode_sequence(&ctx, &[&f0], w, h, &cfg);
+        assert_eq!(compressed.len(), 1);
+        if !compressed[0].config.is_lossless() {
+            // Not the case under test: say so rather than passing quietly.
+            eprintln!(
+                "q={q}: kept a lossy candidate ({:?}), skipping -- this arm asserts nothing",
+                compressed[0].config.transform_type
+            );
+            continue;
+        }
+        bit_exact_cases += 1;
+
+        let dec = DecoderPipeline::new(&ctx);
+        let _ = dec.decode(&ctx, &compressed[0]);
+        let dec_ref = dec.read_reference_planes(&ctx, w, h).expect("decoder reference");
+
+        for (p, name) in ["Y", "Co", "Cg"].iter().enumerate() {
+            let got = &dec_ref[p * padded_pixels..(p + 1) * padded_pixels];
+            let mut max = 0.0f32;
+            let mut nonzero = 0usize;
+            for (i, want) in cpu[p].iter().enumerate() {
+                let d = (got[i] - want).abs();
+                if d > 0.0 {
+                    nonzero += 1;
+                }
+                if d > max {
+                    max = d;
+                }
+            }
+            eprintln!(
+                "q={q} transform={:?} plane {name}: max |decoder ref - CPU YCoCg-R(source)| = \
+                 {max:.4}, nonzero {nonzero}/{}",
+                compressed[0].config.transform_type,
+                cpu[p].len(),
+            );
+            results.push((q, *name, max));
+        }
+    }
+    std::env::remove_var("GNC_REF_DEBLOCK");
+
+    assert!(
+        bit_exact_cases > 0,
+        "neither arm kept a bit-exact frame, so the premise this test exists to check was never \
+         reached; fix the arms rather than deleting the test"
+    );
+
+    for (q, name, max) in results {
+        assert!(
+            max < 1.0e-3,
+            "q={q} plane {name}: the decoder's reference differs from the colour-converted source \
+             by {max}, so `local_decode_iframe_gpu` cannot be replaced by copying the source \
+             planes and RATE-3's third encode is not removable that way (RATE-4)"
+        );
+    }
+}
+
 /// BUG-39: a `q=100` *sequence* must decode bit-exact on every frame, not just its I-frames.
 ///
 /// This is the item's success criterion as a test. It cannot pass with sub-pel motion vectors:

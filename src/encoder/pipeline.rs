@@ -81,6 +81,13 @@ pub struct EncoderPipeline {
     /// Minimal intermediate buffers for spatial wavelet pre-compute (B set).
     /// Allows next GOP's spatial wavelet to run concurrently with current GOP's high_enc.
     pub(super) sp_cached_b: Option<super::buffer_cache::SpatialPrecomputeBuffers>,
+    /// RATE-4: I-frames whose reference was built from the colour-converted source rather than
+    /// by dequantising and inverting the coefficients.
+    ///
+    /// A **run-level** count, which is the thing RATE-4 asked for and the per-frame canary lines
+    /// could not give: "the path ran once" and "a sequence took it 47 times" are different facts,
+    /// and only the second one prices the encode it removes.
+    pub(super) ref_from_source_frames: u32,
 }
 
 impl EncoderPipeline {
@@ -752,6 +759,7 @@ impl EncoderPipeline {
             tw_cached: None,
             tw_cached_b: None,
             sp_cached_b: None,
+            ref_from_source_frames: 0,
         }
     }
 
@@ -1650,8 +1658,18 @@ impl EncoderPipeline {
         width: u32,
         height: u32,
         config: &CodecConfig,
+        source_integral: bool,
     ) -> CompressedFrame {
         let chosen = self.encode(ctx, rgb_data, width, height, config);
+        // **RATE-4: the third encode is only needed when the reference comes from the side
+        // channel, and for a bit-exact frame it no longer does.** `local_decode_iframe_gpu`
+        // builds that reference by colour-converting the source, which is measurably the same
+        // picture (`crate::reference_from_source`), so there is nothing to repair. The repair
+        // stays for every frame that predicate refuses — subsampled chroma, and fractional input
+        // where q=100 is not bit-exact at all (BUG-45).
+        if source_integral && crate::reference_from_source(&chosen.config) {
+            return chosen;
+        }
         // The side channel is the second encode's, which is the configured path. It is already
         // the right one unless the sibling won — and the sibling is the only candidate that can
         // differ from `config` here, because `encode` refuses the fallback for anything else.
@@ -1689,6 +1707,24 @@ impl EncoderPipeline {
         // the weights are packed for the GPU and written into the header.
         let owned_config = config.normalized_for_lossless();
         let config = &owned_config;
+        // **BUG-45.** `is_lossless()` is a statement about the settings; bit-exactness also needs
+        // integer samples. At q=100 the step is 1.0 and MED's residual is a difference of
+        // integers, so fractional f32 input is rounded and the file is lossy while every
+        // `is_lossless()` in the codec still reports true. Same family as BUG-15 and BUG-30 — a
+        // setting outside the guarantee, silently taken — and the reason it stayed invisible is
+        // that PNG and Y4M input is integral, so only an API caller can reach it.
+        //
+        // Warned rather than refused: the samples cannot be normalised without changing the
+        // picture, so the honest options are to say so or to reject the frame, and rejecting a
+        // frame the caller can legitimately want coded lossily is worse than telling them what
+        // they got. `local_decode_iframe_gpu` uses the same predicate to decline building a
+        // reference from a source the reconstruction does not equal.
+        if config.is_lossless() && !crate::source_is_integral(rgb_data) {
+            eprintln!(
+                "GNC: lossless settings (q=100 / qstep<=1) with non-integer input samples — the \
+                 step-1 quantiser rounds, so this frame is NOT bit-exact (BUG-45)"
+            );
+        }
         let profile = std::env::var("GNC_PROFILE").is_ok();
         let t_start = std::time::Instant::now();
 

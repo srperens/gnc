@@ -447,8 +447,10 @@ impl EncoderPipeline {
                 }
                 has_reference = true;
                 pending_me = None; // discard look-ahead ME on keyframe boundary
+                // LOSSLESS-2 needs this outside `diag_enabled`: it is the estimate of what an
+                // I-frame of the *next* picture would cost, and the decision runs in every build.
+                last_iframe_bytes = Some(compressed.byte_size());
                 if diag_enabled {
-                    last_iframe_bytes = Some(compressed.byte_size());
                     let d = diagnostics::collect(
                         display_idx,
                         &compressed,
@@ -531,7 +533,7 @@ impl EncoderPipeline {
                     None
                 };
 
-                let (compressed, next_precomputed) = self.encode_pframe(
+                let (mut compressed, next_precomputed) = self.encode_pframe(
                     ctx,
                     &frame_data,
                     width,
@@ -559,6 +561,84 @@ impl EncoderPipeline {
                     true,
                 );
                 pending_me = next_precomputed;
+
+                // --- LOSSLESS-2: a lossless P-frame that costs more than an I-frame is not
+                // worth coding, and at `q=100` that comparison is exact ------------------------
+                //
+                // Since BUG-39 (`0064`) every frame at `q=100` decodes bit-exact, so **both
+                // candidates for this frame are the same picture** and the choice is bytes
+                // alone — no rate/quality trade, no BD-rate, nothing for CLAUDE.md's metric
+                // table to arbitrate. It is also a *local* choice: the reference every later
+                // frame predicts from is the source frame either way, so a frame's cost does not
+                // depend on what the frames before it chose.
+                //
+                // Measured at `q=100`, 8 frames, four sequences: a P-frame costs **+74.6% to
+                // +80.8%** of its own I-frame on camera content (crowd_run, old_town_cross,
+                // blue_sky) and **−2.8% to −3.3%** on animation (bbb), with no frame-to-frame
+                // variation inside a shot. So this is a content property, not a tuning question,
+                // and coding the P-frame anyway cost 28.3–41.0% of the whole sequence.
+                //
+                // **The estimate of "an I-frame of this picture" is the previous I-frame's
+                // size.** On the same runs, I-frame sizes inside one shot vary by ±0.4%, and at a
+                // shot change the scene-cut detector inserts a keyframe, which refreshes the
+                // estimate. The alternative — code both ways per frame, RATE-2's shape — buys
+                // 0.00% over this on all eight measured points and doubles the encode.
+                //
+                // `GNC_LOSSLESS_INTRA_RECODE=0` keeps the P-frame whatever it costs; that is the
+                // measurement arm and the way to reproduce the numbers above.
+                if frame_config.is_lossless()
+                    && std::env::var("GNC_LOSSLESS_INTRA_RECODE")
+                        .map(|v| v != "0")
+                        .unwrap_or(true)
+                {
+                    if let Some(i_bytes) = last_iframe_bytes {
+                        let p_bytes = compressed.byte_size();
+                        // The canary (CLAUDE.md, "no silent features"): it prints on every
+                        // lossless P-frame, whichever way the comparison goes, so "kept the
+                        // P-frame" is distinguishable from "the check never ran".
+                        let delta = (p_bytes as f64 / i_bytes as f64 - 1.0) * 100.0;
+                        let verdict = if p_bytes > i_bytes {
+                            "re-coding as I"
+                        } else {
+                            "keeping the P-frame"
+                        };
+                        eprintln!(
+                            "GNC: LOSSLESS-2 frame {display_idx} — P {p_bytes} B vs previous I \
+                             {i_bytes} B ({delta:+.2}%), {verdict}"
+                        );
+                        if p_bytes > i_bytes {
+                            let mut again = self.encode_as_reference(
+                                ctx,
+                                &frame_data,
+                                width,
+                                height,
+                                &frame_config,
+                            );
+                            again.frame_type = FrameType::Intra;
+                            // Same two steps the keyframe branch takes, in the same order: the
+                            // reference is rebuilt from the frame that is actually being kept.
+                            // Both candidates decode to the source here, so this cannot change
+                            // the *picture* a later frame predicts from — it keeps the buffers
+                            // owned by the frame in the bitstream, which is what RATE-3 found
+                            // goes wrong when they diverge.
+                            self.local_decode_iframe_gpu(
+                                ctx,
+                                &again,
+                                padded_w,
+                                padded_h,
+                                padded_pixels,
+                            );
+                            // The look-ahead ME belongs to the P encode that was just discarded.
+                            // Dropping it forces fresh motion estimation for the next frame
+                            // rather than reusing vectors from a candidate that is not in the
+                            // file — the same reason the keyframe branch drops it.
+                            pending_me = None;
+                            last_iframe_bytes = Some(again.byte_size());
+                            compressed = again;
+                        }
+                    }
+                }
+
                 if let Some(ref mut rc) = rate_ctrl {
                     rc.update(frame_config.quantization_step, compressed.bpp());
                 }

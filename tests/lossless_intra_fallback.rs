@@ -219,3 +219,64 @@ fn a_sequence_the_lossy_ladder_wins_keeps_its_p_frames() {
          got {inter:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// BUG-46 / BUG-49 — the candidate's format, and the refusal that follows from it
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_bit_exact_sibling_is_coded_in_the_callers_chroma_format() {
+    // BUG-46: `lossless_sibling` built from `quality_preset(100)` (4:4:4) and did not carry
+    // `chroma_format`, so RATE-2 compared a 4:2:0 wavelet encode against a 4:4:4 lossless one —
+    // three times the chroma samples, and the same candidate size reported for every request
+    // (3 257 157 B on bbb at q=97 whether the caller asked for 4:4:4 or 4:2:0).
+    for fmt in [
+        gnc::ChromaFormat::Yuv444,
+        gnc::ChromaFormat::Yuv422,
+        gnc::ChromaFormat::Yuv420,
+    ] {
+        let mut cfg = gnc::quality_preset(97);
+        cfg.chroma_format = fmt;
+        let sibling = gnc::lossless_sibling(&cfg);
+        assert_eq!(
+            sibling.chroma_format, fmt,
+            "the bit-exact candidate must be coded in the format the caller asked for, or the \
+             two candidates are not comparable"
+        );
+        assert!(
+            sibling.is_lossless(),
+            "the sibling must still be bit-exact in that format"
+        );
+    }
+}
+
+#[test]
+fn subsampled_chroma_refuses_the_fallback_rather_than_trading_quality_for_rate() {
+    // BUG-49: at 4:2:2 / 4:2:0 `q=100` is not lossless even in *luma*, which subsampling does
+    // not touch — measured per plane against the source, blue_sky 4:2:0 reads y 51.16 / u 43.23
+    // where q=95 reads y 53.09 / u 56.73. So the bit-exact candidate is 8.5-13.1 dB worse in RGB
+    // than the arm it would replace, and RATE-2's "better on both axes" does not hold. The
+    // fallback must refuse, not trade: with BUG-46 fixed and no refusal, bbb at 4:2:0 q=99 took
+    // the bit-exact file for −2.70% of rate and −3.9 dB.
+    let (w, h) = (256u32, 256u32);
+    let img = ramp(w, h);
+    let mut enc = EncoderPipeline::new(gpu());
+    for fmt in [gnc::ChromaFormat::Yuv422, gnc::ChromaFormat::Yuv420] {
+        let mut cfg = gnc::quality_preset(99);
+        cfg.entropy_coder = EntropyCoder::Rice;
+        cfg.chroma_format = fmt;
+        let kept = enc.encode(gpu(), &img, w, h, &cfg);
+        assert!(
+            !kept.config.is_lossless(),
+            "{fmt:?}: the fallback must refuse on subsampled chroma while BUG-49 stands, so the \
+             kept candidate is the wavelet one"
+        );
+    }
+    // And the 4:4:4 path is untouched by that refusal: the comparison still runs there.
+    let mut cfg = gnc::quality_preset(99);
+    cfg.entropy_coder = EntropyCoder::Rice;
+    assert!(
+        cfg.lossless_fallback,
+        "q=99 must still carry the flag, or this test proves nothing about the refusal"
+    );
+}

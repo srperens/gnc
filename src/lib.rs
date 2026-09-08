@@ -970,6 +970,15 @@ pub fn lossless_sibling(cfg: &CodecConfig) -> CodecConfig {
         EntropyCoder::Rans => EntropyCoder::Rice,
         other => other,
     };
+    // **BUG-46: the chroma format is a "how", not a "how much".** Without this the sibling was
+    // always `quality_preset(100)`'s 4:4:4, so on subsampled input RATE-2 compared a 4:2:0 wavelet
+    // encode against a **4:4:4** lossless one — three times the chroma samples — and reported the
+    // same candidate size for both requests (3 257 157 B on bbb at q=97, whether the caller asked
+    // for 4:4:4 or 4:2:0). The fallback could therefore essentially never fire off 4:4:4, and if
+    // it ever had, the output would have carried a chroma format the caller did not ask for.
+    // "Bit-exact" here means exact in the domain the caller chose to code in, which is what makes
+    // the two candidates comparable at all.
+    out.chroma_format = cfg.chroma_format;
     out.gpu_entropy_encode = cfg.gpu_entropy_encode;
     out.abac_coder = cfg.abac_coder;
     out.abac_code_block = cfg.abac_code_block;

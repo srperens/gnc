@@ -4,6 +4,83 @@
 
 ---
 
+## PERF-3 item 8 — the 32-bit Rice window is bit-exact and its throughput claim is unmeasured (2026-09-08)
+
+`docs/SIMPLE_PERF_FIXES.md` item 8: `rice_decode.wgsl` refilled its bit reader **one byte at a
+time** inside `while (read_bit())`, the unary loop of a stage the doc puts at ~47% of I-frame
+decode. Replaced with a 32-bit MSB-first window refilled a whole `u32` at a time.
+
+**The refill deliberately takes only the bytes left in the word holding `p_byte_offset`, never
+the next word.** That is what makes the change safe rather than merely fast: `load_byte` already
+read the entire containing `u32` to extract one byte, so keeping the rest is free, while reading
+ahead into the following word would be a **new** access past the end of the last stream. The set
+of words the shader touches is therefore exactly what it was. The alternative — clamping with
+`arrayLength(&stream_data)` — was rejected on top of that, because `docs/bug25/` is an upstream
+report about an `OpArrayLength` clamp segfaulting NVIDIA's compiler, and this is a hot decode
+shader.
+
+### Correctness: 16 of 16 byte-identical, on bitstreams encoded before the change
+
+Only the decoder changed, so the strong form of the check is available: decode the **same**
+pre-change `.gnc` files with both binaries and compare output bytes.
+
+| | bbb_1080p | blue_sky_1080p | kristensara_720p | touchdown_1080p |
+|---|---|---|---|---|
+| q=40 / 75 / 90 / 100 | identical | identical | identical | identical |
+
+Full suite green (`cargo test --release`, 0 failed), both clippy targets clean. **This is also the
+canary:** `p_bit_pos` and `p_current_byte` no longer exist, so a build that did not use `refill()`
+would not compile — and 16 identical decodes across a 4x span of quantiser, including q=100 where
+the unary runs are longest, is the new reader consuming real bitstreams correctly.
+
+### Throughput: no measurable change, and the measurement is not trustworthy either
+
+`GNC_RICE_DISPATCH_REPEAT=k` isolates the entropy slice as `(t(k) - t(1)) / (k-1)`. Interleaved
+A/B, best of 3-4 processes per point, `benchmark -n 12`:
+
+| image | q | rice stage, before | rice stage, after |
+|---|---|---|---|
+| bbb_1080p | 90 | 4.761 / 4.776 ms | **4.682 / 4.621 ms** |
+| touchdown_1080p | 40 | 4.841 / 4.907 ms | 4.848 / **4.998** ms |
+| kristensara_720p | 100 | 2.622 / 2.986 ms | 2.702 / 2.766 ms |
+
+**The direction reverses between images, so bbb's −2% is noise and there is no win here to
+report.** Whole-frame decode is indistinguishable throughout (12.2-13.6 ms before, 12.2-12.4 ms
+after, overlapping).
+
+**And the instrument could not have seen a 2% effect anyway.** Load average went from **18 to 43
+during the run** — eight sessions share this machine — and the same binary on the same image read
+9.36 ms then 7.30 ms between two passes, a 28% spread. BACKLOG's PERF-3 entry says these items
+need an idle machine; this is what it looks like when you ignore that.
+
+**Demanded an explanation of myself rather than accepting the null (CLAUDE.md quality rules), and
+there are two candidates.** Not "the code did not run" — the compile-time canary above rules that
+out. Either (a) the noise floor is an order of magnitude above the effect, which the load numbers
+support on their own, or (b) **the stage was never bound by those loads.** (b) is physically
+plausible and would make item 8's premise wrong: the word is in L1 after the first byte of it is
+touched, so the old reader's 4 loads per word were 1 miss and 3 hits, and the new byte-swap costs
+~7 ALU ops per word against the 3 shift/mask pairs it saves. On a cache-friendly GPU those
+roughly cancel. If (b) is true the same reasoning weakens items 9-11, which are also
+bandwidth-reduction arguments.
+
+### State
+
+- **Landed as a bit-exact refactor, explicitly not as a measured win.** Nothing goes into
+  BASELINE, GOALS or POSITIONING from this.
+- **Owed: the idle-machine A/B.** `gnc-before` is any build of the parent commit; the command is
+  in this entry. **If it measures neutral or worse, revert it** — the diff is one shader and the
+  bit-exactness result means a revert costs nothing.
+- **Question raised for the rest of PERF-3:** settle (a) vs (b) before implementing items 9-11,
+  because all three are priced on bandwidth. One idle-machine run of this A/B answers it, and
+  answering it on the change that is already written is cheaper than on three that are not.
+
+### The rule
+
+**An interleaved A/B does not rescue a measurement from a machine at load 43.** Interleaving
+controls for drift between arms; it does nothing about a noise floor 10x the effect. The first
+result agreed with the hypothesis, the second and third did not, and the only reason that was
+caught is that the second and third were run at all.
+
 ## RATE-3 — the gate was hiding the mirror image of the bug `0040` fixed (2026-09-08)
 
 **Hypothesis.** `0036` refuses RATE-2's lossless fallback inside a sequence because the P-frames

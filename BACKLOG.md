@@ -1693,9 +1693,24 @@ idle machine (COORDINATION).
   back to YCoCg-R on the GPU. Uploading packed u8 and converting in a shader is 4× less DMA and no
   CPU colour — but it changes the encode input API, which is why PERF-1 did not touch it. This is
   the only remaining host change that can close BASELINE's A→C gap on the streaming path.
-- **Item 8 — 32-bit Rice bit window.** `rice_decode.wgsl` refills one *byte* at a time inside the
-  unary loop of a stage that is 47% of I-frame decode. Encode already accumulates words. No
-  bitstream change; mechanical but a shader.
+- **Item 8 — 32-bit Rice bit window. IMPLEMENTED 2026-09-08, and its throughput claim is
+  unmeasured.** The window is in, refilling a whole `u32` at a time and taking only the bytes left
+  in the word that holds the read offset, so the shader touches exactly the words it touched
+  before. **Bit-exact: 16 of 16 decodes byte-identical on bitstreams encoded before the change**
+  (4 images x q=40/75/90/100), suite green, both clippy targets clean. **No throughput change was
+  measurable**, and the run that says so is not trustworthy: the direction reversed between images
+  and load average went 18 -> 43 mid-run. RESEARCH_LOG 2026-09-08.
+  **Two things this owes.** The idle-machine A/B — `GNC_RICE_DISPATCH_REPEAT` isolates the slice
+  as `(t(k)-t(1))/(k-1)`, the command is in the log entry — and **if it measures neutral or worse,
+  revert it**; the diff is one shader and bit-exactness makes a revert free. And it raises the
+  question below, which is worth settling *before* items 9-11.
+- **Settle first, on item 8, because item 8 is already written: is the decode side bandwidth-bound
+  at all?** Items 9, 10 and 11 are each priced on bytes of bus traffic saved. Item 8 removed 3 of
+  every 4 storage loads in the Rice inner loop and moved nothing measurable. Either the noise
+  floor swamped it (load 43) or the stage was never load-bound — the word is in L1 after its first
+  byte is touched, so the old reader's four loads per word were one miss and three hits, and the
+  byte-swap that replaced them costs about as much ALU as it saves. One idle-machine A/B of a
+  change that already exists answers this for three changes that do not.
 - **Item 9 — the extra full-plane copies** (`transform.rs:320` inverse preamble,
   `gpu_work.rs:624/637/434/411/309`). Tens of MB per I-frame at 1080p.
 - **Item 10 — fold dequant into the Rice store.** One dispatch and ~48 MB of traffic per frame.

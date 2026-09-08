@@ -4,6 +4,83 @@
 
 ---
 
+## BUG-38 — no rustfmt config fits the tree, and the dirty files are the hot files (2026-09-08)
+
+**Hypothesis.** GOALS §9 requires `cargo fmt` clean and `cargo fmt --check` reports 573 diffs in
+61 of 90 `.rs` files. The cheap explanation is that the tree is written in a consistent *wider*
+style, so a `rustfmt.toml` matching it would collapse the whole thing into a one-file config
+change with no conflicts. Success criterion stated before measuring: a config that takes 573 below
+about 50.
+
+**Domain.** No codec domain. Formatting and two markdown rule definitions. No shipped code, no
+shader, no bitstream — the only `.rs` content that would move is whitespace, by construction.
+
+**Falsified, and in the opposite direction.** rustfmt's **default is the best of seven
+configurations** and every deviation is worse:
+
+| config | diffs |
+|---|---|
+| **none (rustfmt default)** | **573** |
+| `max_width = 100` (= the default) | 573 |
+| `fn_call_width = 80` | 646 |
+| `max_width = 90` | 964 |
+| `use_small_heuristics = "Off"` | 1053 |
+| `use_small_heuristics = "Max"` | 1114 |
+| `"Max"` + `max_width = 110` | 1358 |
+| `"Max"` + `max_width = 120` | 1518 |
+
+So there is no house style to codify: the 573 is genuine drift and **`rustfmt.toml` should not be
+added.** The hypothesis was worth an hour precisely because it would have made the item free; it
+cost four `cargo fmt --check` runs and no compilation to kill.
+
+**The finding that decided the item was the second measurement, not the first.** Of the 61
+fmt-dirty files, **44 were changed on `main` in the last 24 hours — 72%** — and 19 `.rs` files are
+uncommitted in some worktree right now. The dirtiest two are `src/main.rs` (55 diffs) and
+`src/decoder/pipeline.rs` (52); `src/encoder/pipeline_tests.rs` (37) and `src/encoder/rice.rs`
+(22) are also dirty and **both were committed to by other sessions while this item was open**.
+
+That overlap is what refutes the option that looked best on paper. **A per-touched-file rule** —
+"the files you change must be `cargo fmt` clean" — is incremental, has no big bang, and converges,
+which is why it was the working plan for about twenty minutes. But with dirty ≈ hot it does not
+*avoid* the conflicts, it **distributes** them across the same files, and it does so by mixing a
+reformat into every semantic commit that touches a dirty file — the exact hazard the rule exists
+to prevent. It would have hit BUG-20 itself: three of the twelve files that item touched are
+fmt-dirty and all three had concurrent commits from other sessions.
+
+**The cold subset was priced and declined.** Excluding everything `main` touched in 24 h and
+everything dirty in any worktree leaves 16 files carrying **59 of the 573 diffs — 10%**. The value
+of this item is binary: `cargo fmt --check` is clean and can enter LOOP.md step 5, or it is red and
+the rule stays decorative. Ten per cent leaves it red, and adds a third state to the tree for no
+stated invariant.
+
+**Drift is live and quantified: 566 diffs when BUG-38 was filed, 573 seventy-five minutes later**,
+with `main` moving five times in between. Nothing regressed — that is what an unread gate does,
+and it is the same mechanism as clippy's 88 → 90 → 91 in `0062`. It also does not make waiting
+worse: rustfmt is idempotent, so a later reformat is not harder for being larger.
+
+**Decided, not done.** Keep the rule; do the reformat as **one atomic commit on a quiet tree**,
+with its sha appended to `.git-blame-ignore-revs` — 573 diffs across 61 files would otherwise
+become the blame answer for a quarter of the codebase, and this project reads history constantly.
+Add the gate in the same commit; `cargo fmt --check` needs no compilation and costs about a
+second. Parked as `blocked-quiet-tree` with a checkable unpark condition rather than left free,
+because the next session to pick it up under load would either impose seven merge conflicts or
+re-derive all of the above. Decision `0066`.
+
+**Dropping the `cargo fmt` half of GOALS §9 was the close alternative and is recorded in `0066`
+with what it would have cost.** The short version: `0062`'s argument does not transfer, because
+clippy found two real defects in test code and **rustfmt cannot find a defect by construction**.
+The case for keeping the rule is diff legibility — a session with format-on-save silently mixes
+whitespace into a semantic commit — and in a project where the diff *is* the evidence, that is
+enough.
+
+**Gates.** No code changed, so the suite was not re-run for this item; the figures that stand are
+BUG-20's, taken on the same tree an hour earlier (**265 passed, 0 failed, 9 ignored**; `cargo
+clippy --release --all-targets` and wasm `--lib` clean). The `rustfmt.toml` files used for the
+sweep were written and deleted in the worktree and none is committed — verified with
+`git status`.
+
+---
+
 ## BUG-20 — the clippy gate never read a test, and 91 warnings sat behind it (2026-09-08)
 
 **Hypothesis.** CLAUDE.md requires zero clippy warnings and named the gate as

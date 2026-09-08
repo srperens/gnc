@@ -1601,6 +1601,36 @@ impl EncoderPipeline {
             return self.encode_once(ctx, rgb_data, width, height, config);
         }
 
+        // **A fourth refusal, and it is a refusal to compare rather than a refusal to code.**
+        // This whole decision rests on the bit-exact candidate being better on *both* axes when
+        // it is smaller. On subsampled chroma it is not: `q=100` at 4:2:2 / 4:2:0 is **not
+        // lossless even in luma**, which subsampling does not touch. Measured against the source,
+        // per plane, at q=100 — 4:4:4 is exact (PSNR inf) and the subsampled formats are not:
+        //
+        //   blue_sky   4:2:0   y 51.16  u 43.23  v 44.74     (q=95 at 4:2:0: y 53.09, u 56.73)
+        //   kristensara 4:2:2  y 51.04  u 43.63  v 43.54
+        //   bbb        4:2:2   y 47.34  u 37.10  v 38.71
+        //
+        // So the candidate is 8.5-13.1 dB *worse* in RGB than the lossy arm it would replace, and
+        // taking it on bytes alone would trade 3.9 dB for 2.7% of rate at 4:2:0 — measured on bbb
+        // at q=99, which is exactly what BUG-46's one-line fix turned on before this refusal was
+        // added. That defect is **BUG-49**; until it is fixed there is no two-axis win to collect
+        // here, and this must stay a refusal rather than become a rate/quality trade.
+        //
+        // Before BUG-46 the same input was refused *by accident*: `lossless_sibling` did not carry
+        // `chroma_format`, so the candidate was always a 4:4:4 encode and never won. The sibling
+        // is honest now and the refusal is explicit.
+        if config.chroma_format != crate::ChromaFormat::Yuv444 {
+            // Canary: it prints on exactly the encodes that would otherwise have compared two
+            // candidates of different quality (CLAUDE.md, "no silent features").
+            eprintln!(
+                "GNC: RATE-2 lossless fallback refused — {:?} chroma, where q=100 is \
+not lossless even in luma (BUG-49). Coding the wavelet candidate only.",
+                config.chroma_format
+            );
+            return self.encode_once(ctx, rgb_data, width, height, config);
+        }
+
         // **The order of these two encodes is load-bearing. Do not swap them back.**
         //
         // `encode_once` leaves state on the GPU that the sequence encoder reads as a side channel:

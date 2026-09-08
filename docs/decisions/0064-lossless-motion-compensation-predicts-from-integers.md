@@ -116,6 +116,13 @@ better codec and the numbers to beat are in the table above.
 - **4:4:4 only.** 4:2:0 box-filters both planes in chroma-domain MC, which is fractional by
   construction, and 4:2:0 is not a lossless format anyway.
 - **B-frames are not bit-exact**, above.
+- **`read_reference_planes` is comparable across the two pipelines, and BUG-44 is the worked
+  example of how that gets doubted.** A peer measured max |enc − dec| = 254 at `q=100` MED and it
+  looked like a fifth cause; the diff was taken on a *patched* encoder, so the encoder side was a
+  colour-converted source plane rather than a reference. On the shipped tree
+  `lossless_iframe_reference_matches_the_decoders` reads 0.0000 on all three planes at that
+  configuration. What is not comparable is a patched encoder's buffer against an unpatched
+  decoder's — the instrument is fine.
 - **The rate question this exposes is `LOSSLESS-2`**, not this record: at `q=100` the inter path
   costs **+38.1% (crowd_run) and +39.5% (old_town_cross)** against coding every frame intra, and
   **−1.6% on bbb**. Both arms are now bit-exact, so that is an exact rate comparison at identical

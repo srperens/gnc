@@ -1482,8 +1482,29 @@ read as claiming it is.
 decoder should do with a stream it cannot parse. That belongs in a decision record with the
 alternatives priced: (a) `Result` at the public boundary, (b) a validating pre-pass that bounds
 every length against `data.len()` before the parser runs, (c) document panic-on-malformed as the
-contract and require callers to sandbox. **(b) is the cheapest and does not break the API**, and it
-is worth pricing first.
+contract and require callers to sandbox.
+
+**Priced (b) and did the part of it that needs no pre-pass, 2026-09-08.** A separate validating
+pass would be a *second* parser that has to agree with the first — a new class of bug, and not
+cheap after all. But the DoS half of (b) needs no second parse: the four counts that reach
+`Vec::with_capacity` are each followed immediately by that many fixed-size records, so
+`wire_count(count, stride, data.len(), pos)` caps them at what the remaining buffer could hold, at
+the point they are read. Landed for `num_detail` (stride 12), CfL `alpha_count` (2), `wm_len` (4)
+and `num_tiles` (**1**, not 8 — the gen>=11 index table is 8 bytes per tile, but the same count is
+reused for the tile vectors on every generation and a pre-GP11 tile blob has no guaranteed 8-byte
+minimum, so capping at remaining/8 could shrink a *legitimate* count and corrupt a well-formed
+file; one byte per tile is the bound that cannot be wrong). **`alpha_count` also fixed an
+overflow**: `2 * num_cfl_tiles * nsb` was computed in `u32` and wrapped in release, panicked in
+debug, before being compared to anything.
+
+**Well-formed streams are provably unaffected** — their counts satisfy the bound by construction —
+and item 8's 16 byte-identical decodes were re-run to show it. So a tiny hostile file can no longer
+turn into a multi-gigabyte allocation; it now runs off the end of the buffer and hits the same
+panic the parser already has everywhere else. **That is the DoS, not the contract.**
+
+**What is still open is only the contract**: whether the decoder should reject rather than panic,
+i.e. (a) versus (c). The panic surface is unchanged and is still `assert!` plus `unwrap()`
+throughout, so pick one and write the record.
 
 **Not audited:** `abac.rs` (`vec![0i32; count]` at `:395`, `:636`), the rANS deserialiser, and the
 GNV container index. Same class of question, and the same answer probably applies, but "probably"
@@ -4228,44 +4249,35 @@ same PNG four times) codes `q=100` P-frames bit-exact at 3 198 bytes **before** 
 `all_skip_tiles=120/120`, so it went down the motion-skip path and never asked the transform for
 anything. A zero-residual probe cannot test a residual path.
 
-### BUG-44 — `read_reference_planes` reads a different stage on the two pipelines at `q=100` (todo, P3)
+### BUG-44 — `read_reference_planes` is symmetric at `q=100`; the 254.0039 row was a patched encoder (**CLOSED not-a-bug 2026-09-08**)
 
-**The instrument disagrees where the pictures do not, and it has already cost one session an
-afternoon's hypothesis.** RATE-4 diffed the encoder's reference against the decoder's on a
-256×256 gradient with `GNC_REF_DEBLOCK=0` and got:
+**Filed and closed the same hour, by measuring the thing the filing asserted.** The shipped
+instrument agrees exactly. `lossless_iframe_reference_matches_the_decoders`, on the same 256×256
+gradient with `GNC_REF_DEBLOCK=0` that produced the alarming row:
 
-| case | max \|enc − dec\| on Y | pixels differing |
-|---|---|---|
-| q=95..99, bit-exact sibling kept | 0.0000 | 0 / 65 536 |
-| q=100, MED | **254.0039** | 65 535 / 65 536 |
-| q=100, `GNC_MED=0` | 7.3965 | 65 535 / 65 536 |
+```
+q=99  transform=Wavelet     plane Y/Co/Cg: max |enc-dec| = 0.0000, nonzero 0/65536
+q=100 transform=MedPredict  plane Y/Co/Cg: max |enc-dec| = 0.0000, nonzero 0/65536
+```
 
-with the encoder side *fractional* (`-0.5019531, -0.00390625, 0.49414063, …`) and the decoder side
-*integral* (`-1.0, -1.0, -1.0, …`). That reads as "the decoder predicts from a picture it does not
-decode", which would be a defect upstream of everything BUG-39 fixed.
+That test is in the suite and green, and it has asserted this since `0042`.
 
-**It is not, and the evidence is decisive.** Since BUG-39 closed (`0064`), a `q=100` sequence is
-**bit-exact on every frame**, verified outside the harness with raw-RGB md5 through the real
-container: 48 of 48 frames on 3 sequences at ki=2 and ki=9. A P-frame cannot be md5-identical to
-its source while predicting from a picture the decoder does not hold — the residual is computed
-against the encoder's reference and added to the decoder's, so any difference between them lands
-in the output. So the two buffers `read_reference_planes` returns are **not the same stage of the
-pipeline** in this configuration, and the readback is what needs fixing.
+**Where the 254.0039 came from:** RATE-4 had *implemented `0040` point 4's source-copy reference*
+before taking that diff, so the encoder side was a colour-converted **source** plane rather than a
+reference — a buffer that has not been through the stage that produces one, in a different scale
+(the values are a ramp in steps of 0.498, i.e. ~127.5/256, against a reference in 0..255). The
+diff is a true statement about that patch and says nothing about the shipped pair.
 
-**Why it is worth an item rather than a comment.** This function is the repository's instrument of
-record for "do the two sides agree" — `0042` used it to find two causes, `0044` and RATE-4 used it
-after that, and CLAUDE.md's own lesson from `0040` is *diff the two things that must be equal
-before theorising*. An instrument that answers a different question in one configuration turns
-that lesson into a trap, and the trap only fires at `q=100`, which is the configuration nobody
-exercised until this week.
+**What I got wrong, since it is the reusable part.** I filed this from a peer's report plus my own
+bit-exactness result and reasoned that the two could not both be true, which was correct — and
+then picked the wrong one to blame. **The report was of a modified tree, and I did not check that
+before filing.** One `cargo test --release --lib lossless_iframe_reference_matches_the_decoders`
+would have closed it before it ever had an id; it is what closed it ten minutes later. Reading a
+peer's number is not the same as reading their tree.
 
-**Where to look:** the encoder's side is fractional, which is the shape of colour-converted source
-*before* whatever rounds it, and the decoder's is integral, which is the shape of a reconstructed
-picture. One of the two is reading a buffer earlier in the chain than the other.
-
-**Success criterion:** at `q=100` MED, the two sides agree to 0.0000 on a frame that is known
-bit-exact end to end — or the function documents, in one sentence per pipeline, which stage it
-returns and why they differ.
+**What stands from it:** `0040` point 4's route fails for a reason worth keeping — a lossless
+frame's reference is *not* simply its colour-converted source, because that buffer is at a
+different stage and scale. RATE-4 records the refutation.
 
 ### LOSSLESS-2 — at `q=100` inter costs +38% on camera content and wins 1.6% on animation (todo, P2)
 
@@ -4414,7 +4426,11 @@ artefact.** BUG-39 closed the same afternoon (`docs/decisions/0064`, `0f1d303`) 
 bit-exact on every frame — 48 of 48 md5-identical against source through a real container round
 trip, three sequences at ki=2 and ki=9. A P-frame cannot be md5-identical to its source if it
 predicted from a picture the decoder does not hold, so the two references *are* the same picture
-and **`read_reference_planes` returns a different stage on the two pipelines for the MED case**.
+and are not measuring the pictures. **They are not measuring a readback asymmetry either —
+BUG-44, closed the same hour:** on the shipped tree `lossless_iframe_reference_matches_the_decoders`
+reads `max |enc-dec| = 0.0000` on all three planes at q=100 MED. The rows were taken with the
+source-copy patch applied, so the encoder side was a source plane rather than a reference; what
+that implies for the route belongs to whoever holds the patch.
 The diff was measuring the readback.
 
 **What survives is the 0.0000 row, and it is the case the change targets.** The free half is
@@ -6144,6 +6160,17 @@ intra rate at *identical pixels* (ABAC-SHIP, four stills, q=50/75/90), −13.4% 
 lossless, and the FFV1 lossless gap from +23.9% to +7.3%. Nothing has to be implemented to collect
 any of it. It is larger than everything shipped to date put together.
 
+**Note from the ENT-3 session (2026-09-08), because this entry's figures are all intra and all at
+or below q=90.** `0045` measured abac against Rice on **inter** through the contribution range, at
+bit-identical pixels, and the saving **decays monotonically with quality**: P-frame bytes go
+−20.6% / −12.2% / −11.9% at q=90 to **−14.2% / −4.3% / −3.7% at q=99**. GNC is a contribution
+codec and q=95-99 is its home range, so a default decision taken on "−16.6% to −18.8%" is being
+taken on the flattering end of the range and on the wrong frame type. It does not settle the
+question either way — the intra figures above are real, and `0045` also found inter to be the
+*stronger* half at a given q — but the number to weigh against the 1.69x frame decode at q=99 is
+a few percent, not seventeen. `0017`'s reason 2 is also still open: encode time per frame has
+never been measured on an idle machine.
+
 **Why it needs an ID.** ENT-5 said plainly "**Not in scope: making abac the default** — that is a
 separate decision", 0017 carries the three reasons, and the priority order pointed at it obliquely
 for two days. None of those is a `NAME-<n>` heading with a priority, so `scripts/claim next` has
@@ -6307,7 +6334,102 @@ is an afternoon with an existing harness. Against that: the throughput half cann
 a shared machine at all (COORDINATION), and the rate gate may kill it before the shader work
 starts — which is why the gate is first.
 
-### ENT-9 — abac context-codes three decisions and bypasses the rest; at q>=95 the rest is where the file is (todo, P2)
+### ENT-9 — abac context-codes three decisions and bypasses the rest (**step 1 DONE 2026-09-08**, step 2 todo, P2)
+
+**Step 1 is answered and the item is not small. Decision record `0063`.** At q=99, **75.1% /
+75.5% / 43.6% of abac's own bits are bypassed** — sent at p=1/2 with no model at all — so the
+context model touches a quarter of the file on two of three sequences. Share of `Hctx` bypassed,
+first P frame, ki=9, 4:4:4:
+
+| sequence | q=75 | q=90 | q=95 | q=99 |
+|---|---|---|---|---|
+| crowd_run | 34.7% | 50.1% | 60.0% | **75.1%** |
+| bbb_extended | — | 29.9% | — | **43.6%** |
+| old_town_cross | — | 47.3% | — | **75.5%** |
+
+Broken out at crowd_run q=99: significant 7.1%, `>1` 9.6%, `>2` 8.2% coded; **Exp-Golomb 58.5%**,
+sign 16.6% bypassed. The suffix, not the sign, is the mass. Intra behaves the same (73.7% / 61.6%
+/ 72.4% at q=99), so this is not an inter finding.
+
+**Step 1b — both candidates are priced, before either is built** (ideal-adaptive bounds, no
+signalling or adaptation loss charged, the same convention as `Hnb`):
+
+*Taken at `f3f7254`, pre-RATE-3 — superseded by the re-take above, kept because the argument
+that follows is built on them.*
+
+| sequence | q | A: prefix ctx (6x4) | B: sign ctx (3x3) | A+B |
+|---|---|---|---|---|
+| crowd_run | 90 | −2.79% | −2.00% | −4.79% |
+| crowd_run | 99 | **−8.31%** | −1.18% | −9.49% |
+| bbb_extended | 90 | −0.55% | −0.81% | −1.36% |
+| bbb_extended | 99 | **−1.84%** | −0.50% | −2.34% |
+| old_town_cross | 90 | −2.85% | −2.33% | −5.18% |
+| old_town_cross | 99 | **−9.35%** | −1.31% | −10.66% |
+
+**Re-taken after RATE-3 (same session), and the conclusion strengthens.** RATE-3 lifted the
+lossless-fallback gate for sequences at q=95..=99, which changes the I-frame a P frame predicts
+from and so changes these coefficients. Pinned post-RATE-3 binary (`ba9e1c6e…` at `56c7b6c`),
+first P frame, inter:
+
+| sequence | q | bypassed | A: prefix ctx | B: sign ctx |
+|---|---|---|---|---|
+| crowd_run | 90 | 50.1% *(identical)* | −2.79% *(identical)* | −2.00% *(identical)* |
+| crowd_run | 95 | 59.8% | −4.43% | −1.62% |
+| crowd_run | 99 | **74.6%** | **−8.20%** | −1.17% |
+| bbb_extended | 90 | 29.9% *(identical)* | −0.55% *(identical)* | −0.81% *(identical)* |
+| bbb_extended | 95 | 34.3% | −0.88% | −0.72% |
+| bbb_extended | 99 | **46.7%** | **−2.44%** | −0.57% |
+| old_town_cross | 90 | 47.3% *(identical)* | −2.85% *(identical)* | −2.33% *(identical)* |
+| old_town_cross | 95 | 58.3% | −4.55% | −1.82% |
+| old_town_cross | 99 | **74.8%** | **−9.07%** | −1.29% |
+
+**The q=90 control is identical to the digit** on all three sequences and all three columns, which
+is what makes the q≥95 rows a change rather than a re-measurement. **Candidate A now clears the
+≥2% gate on three of three** (−2.44 / −8.20 / −9.07%) where before it cleared two and reached
+1.84% on the third; bbb_extended moved most (bypass 43.6% → 46.7%), which is consistent rather
+than surprising — a bit-exact reference carries detail a lossy one had quantised away, so the
+residual holds larger magnitudes, and larger magnitudes are exactly what falls out of the three
+coded decisions into the bypassed suffix. **B is below the gate three of three either way.** The
+pre-RATE-3 figures stay correct for `f3f7254`; where the two disagree, these are current.
+
+**Two of the three candidates this entry filed turned out to be one.** The Exp-Golomb prefix is a
+unary code, so its bit `i` *is* the decision "is the magnitude past threshold `i`" — "a context
+for the first suffix bit" and "more `>k` decisions" are the same lever, and **candidate A is its
+general form**. The mantissa stays bypassed on purpose: it is the low bits of a magnitude with no
+causal information about it.
+
+**The mechanism is confirmed twice.** The bypass share predicts which sequence keeps its
+advantage against Rice — bbb_extended bypasses 43.6% and keeps −14.5% (`0045`), crowd_run 75.1%
+and keeps −4.3%, old_town_cross 75.5% and keeps −3.7%, monotone across all three — and candidate
+A is largest on exactly the two sequences whose saving collapsed. The bounds also agree once put
+on one denominator: `0045`'s "shipped +12.5% over `Hnb`" is `Hnb` sitting **11.1% below shipped**
+(12.5/112.5), and A's −8.31% of `Hctx` is **−8.28% of shipped** — so A recovers 8.28 of the 11.1
+points a whole-magnitude model could, with 24 contexts against 50, *less* as it must be. B's
+−1.18% sits **outside** that bound, since `hnb_bits()` adds `sign_bits` unmodelled, so the ceiling
+is ≈12.3 points of shipped and nothing here had priced the sign before today.
+
+**Every figure here is the *first* P frame, and that is a real limitation.** The diagnostic
+fires once, through a `OnceLock`, so it prices a P frame predicting from an I frame. Later P
+frames predict from P frames and their residual statistics differ — reference drift is the whole
+subject of BUG-27 and RATE-3 — so the bypass share deeper in a GOP is unmeasured. The direction is
+not obvious either way, and step 2's gate is on whole-file rate, which does not inherit the
+limitation.
+
+**Step 2 — build candidate A. Not started, and it is its own claim.** It changes the bitstream, so
+`abac.rs`, `abac_encode.wgsl` and `abac_decode.wgsl` move together and must be re-verified
+byte-exact three ways; that is ENT-5-scale. Gate stays **≥2% of total rate at q=99 on ≥3
+sequences at bit-identical pixels** — A clears it on three of three post-RATE-3
+(−2.44 / −8.20 / −9.07%), and the bound is generous, so expect the realisable figure lower. **Candidate B is below the gate
+on all three sequences** (−0.50% to −1.31%) and should not be spent on its own; re-price it after
+A lands, since A moves the denominator.
+
+**Why still P2.** abac is opt-in and `0045` weakened `0017`'s case for it at the top of the range,
+so this improves a non-default coder where it is least convincing. What changed is that the size
+is now known rather than guessed.
+
+<details>
+<summary>The entry as filed, before step 1 was measured</summary>
+
 
 **Filed 2026-09-08 by the ENT-3 session, from its own numbers.** ENT-3 measured abac's saving
 against Rice on P-frame bytes decaying monotonically with quality — bbb_extended −20.6% at q=90 to
@@ -6352,6 +6474,8 @@ an afternoon; it is not filed as urgent.
 **Do not confuse this with ENT-6 or ENT-8.** ENT-6 priced the *initialisation* of the existing
 contexts (1.3%, closed). ENT-8 prices *parallelising* the existing contexts at fixed rate. This
 prices *which symbols get a context at all*, which neither touches.
+
+</details>
 
 ### ENT-6 — abac's cold start is worth 1.3%, not 4% (**CLOSED by measurement 2026-09-08**)
 
@@ -6572,6 +6696,36 @@ At ki=9 a whole-file ratio mixes abac's known intra saving in. `encode-sequence`
 
 I-frames from the same runs, for the contrast: −17.8/−14.7/−14.2/−12.3/−11.1/−9.5,
 −16.0/−12.7/−11.4/−8.6/−6.4/−3.3, −20.2/−14.5/−12.7/−10.2/−8.0/−4.7.
+
+**Re-taken after RATE-3, and the answer survives (2026-09-08, same session).** RATE-3 landed
+between the measurement and the merge, lifting the lossless-fallback gate for sequences at
+q=95..=99. Every table above is pinned to `f3f7254` and stays correct for it; re-run on a pinned
+post-RATE-3 binary (`ba9e1c6e…` at `56c7b6c`):
+
+- **The control passes exactly.** At q=90, I-frame *and* P-frame byte counts are **equal integers**
+  for both coders on all three sequences, so RATE-3 does not reach q=90 and the re-run is
+  comparable rather than merely similar.
+- **The P column — this item's answer — is unchanged.** Largest move 0.25 points (bbb_extended
+  q=99, −14.49% → −14.24%); the other eight q≥95 points move by ≤0.03. The decay stands: q=99 is
+  −14.2% / −4.3% / −3.7%.
+- **The I and container columns move, and RATE-3's own mechanism is visible in the bytes.**
+  I-frames shrink 15.3–32.3% at q≥95 while P-frames grow 0.68–1.56% — a bit-exact reference
+  carries detail a lossy one had quantised away, so the residual against it is bigger, exactly as
+  `0040`/RATE-3 describe.
+
+| I-frames only, post-RATE-3 | q=90 | q=95 | q=97 | q=99 |
+|---|---|---|---|---|
+| bbb_extended | −14.2% | −12.3% | −11.1% | −14.3% |
+| crowd_run | −11.4% | **−9.9%** | **−9.9%** | **−9.9%** |
+| old_town_cross | −12.7% | **−11.2%** | **−11.2%** | **−11.2%** |
+
+**That constant column is a finding, not a rounding artefact.** crowd_run's Rice I-frame is
+6 492 092 bytes at q=95, q=97 *and* q=99 — the same integer — and old_town_cross's is 6 352 476 at
+all three. Above the RATE-2 crossover the kept I-frame is the **bit-exact lossless** candidate, so
+its size stops being a function of q, and the entropy-coder ratio measured on sequence I-frames
+there is a comparison of the **lossless** path rather than the lossy one. Anyone measuring a coder
+on sequence I-frames at q≥95 after RATE-3 is measuring something different from what they measured
+before it, and the container column inherits that.
 
 **This entry's own prediction is falsified.** It said to expect a *smaller* number on inter than
 intra's −17% because a motion-compensated residual is noise-like. Measured inside the same run,

@@ -918,6 +918,25 @@ fn make_zero_subband_tile(
 /// Deserialize a CompressedFrame from GP12/GP11/GP10/GPC9/GPC8 binary format.
 /// Returns the frame without CRC validation. Use `deserialize_compressed_validated`
 /// for GP12/GP11 CRC checking.
+/// Cap a wire-supplied element count at what the rest of the buffer could possibly hold.
+///
+/// Every count this is applied to is immediately followed by that many fixed-size records, so
+/// a count above `remaining / stride` cannot be honest whatever the header says. Without the
+/// cap a four-byte field asking for four billion records reaches `Vec::with_capacity` and
+/// **aborts the process** on a file small enough to fit in a packet; with it, the parse runs
+/// off the end of the buffer and hits the same panic the parser already has everywhere else.
+///
+/// That is a strict improvement and not a fix: the decoder's contract on malformed input is
+/// still "panic", stated by the `assert!` at the top of `deserialize_compressed_validated`.
+/// **ROBUST-1 carries the decision** about rejecting instead — a `Result` boundary, a
+/// validating pre-pass, or documenting the contract. This only removes the cheapest denial of
+/// service, where a tiny hostile file turns into a huge allocation.
+///
+/// Well-formed streams are unaffected: their counts always satisfy the bound by construction.
+fn wire_count(count: usize, stride: usize, data_len: usize, pos: usize) -> usize {
+    count.min(data_len.saturating_sub(pos) / stride.max(1))
+}
+
 pub fn deserialize_compressed(data: &[u8]) -> crate::CompressedFrame {
     deserialize_compressed_validated(data).frame
 }
@@ -994,6 +1013,7 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
     let ll = f32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
     let num_detail = u32::from_le_bytes(data[pos + 4..pos + 8].try_into().unwrap()) as usize;
     pos += 8;
+    let num_detail = wire_count(num_detail, 12, data.len(), pos);
     let mut detail = Vec::with_capacity(num_detail);
     for _ in 0..num_detail {
         let lh = f32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
@@ -1013,7 +1033,12 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
         pos += 4;
         let num_cfl_tiles = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
         pos += 4;
-        let alpha_count = (2 * num_cfl_tiles * nsb) as usize;
+        // `2 * num_cfl_tiles * nsb` in u32 wrapped in release and panicked in debug before
+        // it was ever compared to anything; widen first, then bound.
+        let alpha_count = (num_cfl_tiles as usize)
+            .saturating_mul(nsb as usize)
+            .saturating_mul(2);
+        let alpha_count = wire_count(alpha_count, 2, data.len(), pos);
         let mut alphas = Vec::with_capacity(alpha_count);
         for _ in 0..alpha_count {
             let v = i16::from_le_bytes(data[pos..pos + 2].try_into().unwrap());
@@ -1039,6 +1064,7 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
     let adaptive_quantization = aq_flag != 0;
     let wm_len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
     pos += 4;
+    let wm_len = wire_count(wm_len, 4, data.len(), pos);
     let weight_map = if wm_len > 0 {
         let mut wm = Vec::with_capacity(wm_len);
         for _ in 0..wm_len {
@@ -1169,6 +1195,13 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
     pos += 4;
     let num_tiles = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
     pos += 4;
+    // Stride 1, not 8. The gen>=11 index table is 8 bytes per tile, but `num_tiles` is reused
+    // below for the tile vectors on every generation, and a pre-GP11 tile blob has no
+    // guaranteed minimum size of 8 — capping at remaining/8 could shrink a *legitimate*
+    // count and corrupt a well-formed file, which is worse than the problem. One byte per
+    // tile is the bound that cannot be wrong, and it still ties the allocation to the input
+    // size, which is the property that matters here.
+    let num_tiles = wire_count(num_tiles, 1, data.len(), pos);
 
     // GP11/GP12/GP13/GP14: tile index table with sizes + CRC-32s
     let (tile_sizes, tile_crcs) = if gen >= 11 {
@@ -1893,6 +1926,30 @@ pub fn seek_to_temporal_keyframe(header: &TemporalSequenceHeader, target_pts: u3
 
 #[cfg(test)]
 mod tests {
+    /// A wire count cannot ask for more records than the buffer could hold.
+    ///
+    /// Four of these counts reach `Vec::with_capacity` straight off the wire, so before
+    /// `wire_count` a four-byte field saying `u32::MAX` turned a packet-sized file into a
+    /// multi-gigabyte allocation and aborted the process. This asserts the bound directly
+    /// rather than through the parser, because the parser's contract on malformed input is
+    /// still to panic (ROBUST-1) and a test that has to catch a panic cannot tell an
+    /// intended one from an abort.
+    #[test]
+    fn a_wire_count_is_bounded_by_what_the_buffer_could_hold() {
+        // 64 bytes left, 12 bytes per record: at most 5 records however large the field is.
+        assert_eq!(super::wire_count(u32::MAX as usize, 12, 100, 36), 5);
+        assert_eq!(super::wire_count(usize::MAX, 2, 100, 36), 32);
+
+        // A well-formed count passes through untouched — the property that makes this safe
+        // to apply to a valid stream.
+        assert_eq!(super::wire_count(3, 12, 100, 36), 3);
+        assert_eq!(super::wire_count(5, 12, 100, 36), 5);
+
+        // Degenerate inputs must not divide by zero or wrap: `pos` past the end, zero stride.
+        assert_eq!(super::wire_count(9, 12, 10, 40), 0);
+        assert_eq!(super::wire_count(9, 0, 100, 0), 9);
+    }
+
     /// Exp-Golomb motion-vector coding must round-trip exactly, including the values that
     /// dominate a well-predicted field: zero deltas, and long runs of them.
     #[test]

@@ -6528,6 +6528,16 @@ by coefficients with |v| > 2 — still hundreds to thousands of decisions each. 
 arm *beats* the pooled bound it is tracking statistics that vary within the block, which a pooled
 estimate cannot.
 
+**The denominator was checked rather than assumed, and it barely moves.** Every candidate-A figure
+above is a share of *the coder's own bits*, while ENT-9's gate is a share of **total rate** — not
+the same denominator, and the difference runs against the item. Adding the per-block length
+fields, which ride along unchanged in both arms, moves it by **≤0.01 points** (crowd_run −8.37% →
+−8.37%, bbb_extended −2.49% → −2.49%, old_town_cross −8.70% → −8.69%): the fields are a few KB
+against 2.9–5.0 MB of abac tile bytes per frame. What is still uncounted is frame headers and
+motion vectors, which abac does not code — at q=99 the tiles dominate the frame, so the total-rate
+figure will be close but strictly smaller, and only a real encode settles it. **The gate is still
+not cleared; the bound is.**
+
 **What it clears, precisely.** The *bound*, on three of three at q=99. **Not** ENT-9's gate, which
 is ≥2% of **total rate** at bit-identical pixels — a real encode, and total rate carries the
 per-block length fields and container overhead these figures exclude. What is left is

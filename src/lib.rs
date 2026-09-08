@@ -975,16 +975,22 @@ pub fn lossless_sibling(cfg: &CodecConfig) -> CodecConfig {
     out.abac_code_block = cfg.abac_code_block;
     out.abac_gpu_sizing = cfg.abac_gpu_sizing;
     out.set_tile_size(cfg.tile_size);
-    // **The padding fill is one of those choices, and dropping it was a defect.** `0039` made
-    // `pad_fill_decay` a still-image lever and the sequence encoder clears it for every I-frame
-    // something predicts from; `quality_preset(100)` sets it back to `true`, so a sibling that
-    // did not inherit it was coded with *decay*-filled padding while the frame it stands in for
-    // was replicate-filled. Two consequences, and neither was visible before RATE-4 built a
-    // reference from the source: the kept bit-exact I-frame contradicted the sequence encoder's
-    // own decision, and the two candidates left *different* padded sources in `input_buf`.
-    // Measured: forcing both fills to agree makes 24 of 24 sequence points byte-identical
-    // between the source-built and reconstructed reference; without it, 10 move.
-    out.pad_fill_decay = cfg.pad_fill_decay;
+    // **The padding fill: replicate, always, and this supersedes BUG-47's inheritance.**
+    //
+    // BUG-47 made the sibling inherit `cfg.pad_fill_decay`, because `quality_preset(100)` set it
+    // to `true` while the sequence encoder had cleared it for every referenced I-frame — so the
+    // two candidates left *differently padded* sources in `input_buf` and 10 of 24 sequence
+    // points moved. Inheriting fixed that, and **BUG-48 then measured that a bit-exact picture
+    // wants replicate on its own terms**: the padding is coded exactly, so a fade to flat is
+    // spent on where replication is predicted for free. Four stills, replicate against decay:
+    // **−0.58% at q=99 and q=100**.
+    //
+    // Forcing `false` is both fixes at once and is stronger than the inheritance, because it
+    // cannot disagree with anything: the sequence encoder already clears the flag unconditionally
+    // for keyframes (`sequence.rs`), so both candidates are replicate there either way — and for
+    // a still, which is where the two differ, there is no reference to disagree with and the
+    // measurement says replicate.
+    out.pad_fill_decay = false;
     // Without this the sibling would ask for a sibling of its own.
     out.lossless_fallback = false;
     out
@@ -1264,6 +1270,8 @@ pub fn quality_preset(q: u32) -> CodecConfig {
         // PAD-1: this preset serves the still-image path, where there is no reference frame and
         // fading the padding flat is worth -4.63% RGB of rate at identical visible quality. The
         // sequence encoder clears it for the I-frames it codes, because those *are* references.
+        //
+        // **BUG-48 turns it off for a bit-exact preset — see below the struct.**
         pad_fill_decay: true,
         dct_freq_strength: 7.0,
         // Intra prediction is off by default: measured at -11.76 dB / +29% bitrate on lossy
@@ -1316,6 +1324,25 @@ pub fn quality_preset(q: u32) -> CodecConfig {
         cfg.adaptive_quantization = false;
         cfg.cfl_enabled = false;
         eprintln!("GNC: MED prediction path active (LOSSLESS-1) — wavelet bypassed");
+    }
+    // **BUG-48: a bit-exact picture wants replicated padding, not PAD-1's fade.** The padding is
+    // coded exactly, so a fade to flat has to be *spent on* where edge replication is what MED
+    // predicts for free. Measured over the four stills `0039` used, replicate against decay:
+    // **+4.86% at q=95** — decay wins, exactly as `0039` found — and **−0.58% at q=99 and q=100**,
+    // where replicate wins on all four.
+    //
+    // **The lever does not reverse at a quality; it reverses with which candidate is kept**, which
+    // is why this keys on `is_lossless_intent()` and not on `q`. q=97 shows both signs in one
+    // column: bbb still keeps the lossy candidate and pays **+6.26%** for replicate, while the
+    // other three have already switched to bit-exact and gain 0.4–0.6%. A `q` threshold would have
+    // to be fitted per image, which is the same trap RATE-2 refused when it chose to code both
+    // ways instead of guessing the boundary.
+    //
+    // Applied after the anchors rather than in the literal, so it covers the lossless *wavelet*
+    // path (`GNC_MED=0` at q=100) as well as MED, and any future preset that reaches
+    // `is_lossless_intent()` by another route.
+    if cfg.is_lossless_intent() {
+        cfg.pad_fill_decay = false;
     }
     // A lossless preset must not carry a quantiser weight above 1.0 (BUG-15). q=100 reaches this
     // with chroma_weight 1.2 from CHROMA-1, and with the whole perceptual ladder under

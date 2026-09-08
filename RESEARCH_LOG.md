@@ -4,6 +4,67 @@
 
 ---
 
+## BUG-48 — the padding fill follows the candidate that is kept, not the quality number (2026-09-08)
+
+**What was open.** LOSSLESS-3 found `quality_preset(100)` keeping PAD-1's decay padding fill and
+measured −0.66% to −0.78% on two stills. The item asked for the four stills `0039` used, at q=100
+*and* through RATE-2's candidate at q=95..99, before touching the preset.
+
+**Domain declaration.** Coded bytes of stills and sequences. A bitstream change for bit-exact
+pictures; nothing else moves.
+
+**Harness** `scripts/meas_bug48_pad_fill.py`, fingerprint-stamped (`700d5f8a` before, `9e2b1202`
+after — the tool from COORD-6 doing its job on its first outside use).
+
+### The measurement refuted the proposed fix, and named the real rule
+
+Shipped against forced `decay`, four stills:
+
+| | bbb | blue_sky | kristensara | touchdown | mean |
+|---|---|---|---|---|---|
+| q=95 | 0.00% | 0.00% | 0.00% | 0.00% | **0.00%** |
+| q=97 | 0.00% | −0.64% | −0.39% | −0.64% | **−0.42%** |
+| q=99 | −0.66% | −0.64% | −0.39% | −0.64% | **−0.58%** |
+| q=100 | −0.66% | −0.64% | −0.39% | −0.64% | **−0.58%** |
+
+**No point worse anywhere. Sequences byte-identical, 8 of 8**, against the actual pre-fix binary at
+q ∈ {95, 99, 100} × ki ∈ {2, 9} on bbb and crowd_run.
+
+**The lever reverses with the candidate, not with `q`.** At a bit-exact setting the padding is coded
+*exactly*, so a fade to flat is spent on where replication is predicted for free; where the lossy
+wavelet candidate is kept, the fade suppresses ringing and `0039` is simply right — forced
+replicate costs **+4.86% at q=95**. q=97 shows both signs in one column: bbb still keeps the lossy
+candidate and pays **+6.26%**, the other three have switched to bit-exact and gain 0.4–0.6%.
+
+So the fix is not `quality_preset(100).pad_fill_decay = false`, which would leave every bit-exact
+*candidate* RATE-2 codes at q=95..99 paying the fade — the case the item said compounds. It is
+`is_lossless_intent()` in the preset **plus** forcing `false` in `lossless_sibling`, which also
+**supersedes BUG-47's inheritance** with the same guarantee reached a stronger way: forcing cannot
+disagree with anything, because the sequence path already clears the flag for every keyframe. The
+RATE-4 byte-identity gate still passes 24 of 24 with the route firing 78 times.
+
+### The false alarm, which is the transferable part
+
+The first version of the harness used `GNC_PAD_FILL=decay` as the before-arm for sequences and
+reported this change as a **−7.21% regression on bbb**. It is not a before-arm: that knob *also*
+overrides the sequence encoder's deliberate keyframe clear, which PAD-1 chose on worst-frame PSNR
+(up to 4.03 dB on bbb_extended). Settled by building the actual pre-fix binary — 8 of 8
+byte-identical — rather than by reasoning about the knob.
+
+**A knob that does more than the change under test is not a control arm**, and this one failed in
+the expensive direction: it read as a plausible regression rather than as an error. The harness now
+compares sequences against `replicate` and says why in as many words.
+
+**Also found on the way:** `scripts/meas_rate3.py` can no longer parse crowd_run at q=95, because
+LOSSLESS-3 (`0073`) now ships that sequence **all-intra** and its P-frame regex finds nothing. Not
+caused by this change — verified identical with and without it — and left to that harness's owner
+rather than edited.
+
+**Gates:** `cargo test --release` **275 passed, 0 failed**; both clippy targets clean. Decision
+`docs/decisions/0079`.
+
+---
+
 ## COORD-6 — a cheap mechanism does exist, and it is what the encoder produces rather than what it is (2026-09-08)
 
 **What was open.** COORD-4 priced the two obvious mechanisms against six instances of a number read

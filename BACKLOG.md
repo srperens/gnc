@@ -4721,7 +4721,37 @@ decision (`0036`) is stated over 4:4:4 stills. It needs the still sweep re-run a
 before the default moves. **LOSSLESS-3 is gated to 4:4:4 for this reason** and the gate comes off
 here.
 
-### BUG-48 — `quality_preset(100)` keeps PAD-1's decay padding fill, which is a loss at q=100 (todo, **P3**)
+### BUG-48 — `quality_preset(100)` keeps PAD-1's decay padding fill, which is a loss at q=100 (**FIXED 2026-09-08**, −0.42% to −0.58% on stills at q≥97)
+
+**FIXED 2026-09-08. `docs/decisions/0079`, `scripts/meas_bug48_pad_fill.py`.** The diagnosis was
+right and the proposed one-line fix was half of it: a bit-exact picture is padded by replication
+now, both in `quality_preset` (via `is_lossless_intent()`, so it covers the lossless wavelet path
+too) *and* in `lossless_sibling`, which previously inherited the caller's fill and so left every
+bit-exact candidate RATE-2 codes at q=95..99 paying the fade.
+
+| | bbb | blue_sky | kristensara | touchdown | mean |
+|---|---|---|---|---|---|
+| q=95 | 0.00% | 0.00% | 0.00% | 0.00% | **0.00%** |
+| q=97 | 0.00% | −0.64% | −0.39% | −0.64% | **−0.42%** |
+| q=99 | −0.66% | −0.64% | −0.39% | −0.64% | **−0.58%** |
+| q=100 | −0.66% | −0.64% | −0.39% | −0.64% | **−0.58%** |
+
+**No point worse anywhere**, and **sequences are byte-identical, 8 of 8**, measured against the
+actual pre-fix binary — the sequence encoder already cleared the flag for keyframes, so the item's
+expectation there was right.
+
+**The lever reverses with the candidate that is kept, not with `q`** — which is why the switch is
+`is_lossless_intent()`. q=97 shows both signs in one column: bbb still keeps the lossy candidate
+and would pay **+6.26%** for replicate, while the other three have already switched to bit-exact.
+A `q` threshold would need one number per image, which is the trap RATE-2 refused.
+
+**One trap for the next harness, and it cost a false alarm here:** `GNC_PAD_FILL=decay` is **not**
+a before-arm for a sequence. It also overrides the sequence encoder's deliberate keyframe clear, so
+it reported this change as a **−7.21% regression on bbb** that the pre-fix binary does not show.
+A knob that does more than the change under test is not a control arm, and this one reads as a
+plausible regression rather than an error.
+
+**Original filing follows.**
 
 Found 2026-09-08 by LOSSLESS-3, measured on two stills against `GNC_PAD_FILL=replicate`:
 

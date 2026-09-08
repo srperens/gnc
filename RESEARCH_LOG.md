@@ -4,6 +4,149 @@
 
 ---
 
+## ENT-6 — abac's cold start is worth 1.3% of rate, not 4%: a bound cannot price an initialisation (2026-09-08)
+
+**Hypothesis and the fork.** `0024` measured abac's short code-blocks — the LL and level-3/4/5
+bands, which at tile 256 with 5 levels are 8, 16 and 32 px square and therefore one block each —
+at **+25.9% over the entropy bound at q=90** while carrying 18% of the rate, and put the cold
+start at **about 4% of the file**. `0030` then measured BPC-PaCo's stationary model at 7.9% below
+abac on the same coefficients, with the saving in the same bands, and redirected ENT-7's part 2
+here. ENT-6 asks whether that is collectable and how.
+
+**Success criteria, from BACKLOG, set before measuring:** ≥2% of total rate at q=90 on all four
+stills at bit-identical decoded pixels; **below 1%, close it**.
+
+### Why the existing number could not answer the question
+
+Every column in `coef_entropy_diag` is a bound whose probabilities are **pooled over a whole
+plane's worth of a subband**. On a short block, "shipped vs bound" therefore mixes two costs that
+have nothing to do with each other: the coder's cold start, which an initialisation fixes, and the
+gap between a per-block adaptive model and a plane-wide oracle, which nothing fixes. The pooling is
+the thing being priced. **A bound cannot separate them, so the 4% was never a collectable rate.**
+
+### Method — simulate the coder, do not bound it
+
+`src/encoder/abac_init_diag.rs`. It walks each code-block exactly as `abac::encode_block` does,
+drives the **shipped** `Prob::update` (imported, not reimplemented, so the simulation cannot drift
+from the coder it models), and charges `−log2 p` per context-coded decision plus one bit per
+bypassed one. Only the initialisation changes between arms, so every per-block cost the simulation
+omits is present on both sides and cancels.
+
+Four stills, q = 85/90/95/99, 4:4:4, tile 256, 5 levels, cb 64, `--abac` — `0024`'s parameters,
+which is what makes this comparable to it. Two candidates:
+
+* **Candidate 1** — signalled initial probabilities, 18 bytes per (plane, subband), **once per
+  frame** (864 B, 0.05% of a 1080p frame at q=90).
+* **Candidate 2** — stop cutting code-blocks on subband boundaries below `cb`, so a tile's
+  top-left 64×64 block carries LL *and* all of levels 3, 4 and 5: one block where the band-aligned
+  cut makes ten. No header of any kind; only the partition changes.
+
+**Instrument checks.** The cold arm lands 1.16% under what the bitstream spent, decomposing into
+0.29% of per-block length fields and **41.4 bits per code-block** of coder overhead. A unit test
+puts a measured band on that: over **240 engine/geometry/spread/density combinations** the
+simulation is a strict lower bound on **both** arithmetic engines, and the worst per-block overhead
+is **81.3 bits** (the range coder at 64×64). 41.4 is inside a band that was measured, not chosen.
+The `0024` columns print in the same run and reproduce byte-for-byte.
+
+**One instrument bug, caught by that check.** The first version of the canary compared against
+`abac::encode_block` and disagreed with the diagnostic by 5 bytes per block, which looked like a
+broken model. `encode_block` is the **Interval** engine; the shipped tiles are `Coder::Range` →
+`encode_block_rc`, whose per-block flush is several bytes where the other's is one. The test now
+runs both engines. Two coders sharing a binarisation but not a bitstream is exactly the shape that
+makes "compare against the real thing" ambiguous, and `AbacTile` records the engine per tile for
+this reason — the canary was not reading it.
+
+### Raw numbers — percentage of what abac's bitstream actually spent
+
+Candidate 1:
+
+| image | q=85 | q=90 | q=95 | q=99 |
+|---|---|---|---|---|
+| bbb_1080p | −1.33% | −1.07% | −0.84% | −0.59% |
+| blue_sky_1080p | −1.47% | −1.26% | −0.91% | −0.58% |
+| kristensara_720p | −1.79% | −1.52% | −1.13% | −0.68% |
+| touchdown_1080p | −1.34% | −1.15% | −0.82% | −0.58% |
+| **mean** | **−1.48%** | **−1.25%** | **−0.93%** | **−0.61%** |
+
+Candidate 2, and the two together (relative to the simulated band-aligned total, bbb q=90):
+
+| | q=85 | q=90 | q=95 | q=99 |
+|---|---|---|---|---|
+| candidate 2 alone, mean of four | −0.47% | −0.42% | −0.37% | −0.31% |
+| candidate 2 + a per-plane warm table (bbb) | −1.36% | −1.10% | −0.88% | −0.63% |
+| candidate 1 alone (bbb, same denominator) | −1.38% | −1.11% | −0.87% | −0.61% |
+
+Per-band, where the win sits (bbb q=90, candidate 1): `Y LL` **−8.03%**, `Y HH5` −13.67%,
+`Y HL5` −12.67%, `Y HL4` −4.81%, against `Y HL1` −1.04% and `Y HL2` −0.55%. The right shape — the
+short blocks — at a tenth of the magnitude the bound implied.
+
+### The answer
+
+**1.07–1.52% at q=90, against a 2% ship bar and a 1% close-floor. ENT-6 closes.** Decision record
+`docs/decisions/0031`.
+
+Three things turn "in the ambiguous band" into "no":
+
+- **The effect shrinks with quality and GNC's home range is the top.** −1.48% at q=85 → −0.61% at
+  q=99, while `0024`'s bound ratio moves the *other* way (+23.1/25.9/28.9/34.2%). That divergence
+  is the artefact itself: more symbols per block means adaptation converges earlier *and* the
+  pooled bound pulls further ahead.
+- **Candidate 1 makes the entropy encode two-pass** — gather the image's own per-band statistics,
+  then code — doubling the entropy stage's encode work for 1.25%, on a coder whose encode time per
+  frame `0017` has still never measured on an idle machine.
+- **The item's own proposed design is a loss.** Per-tile signalling is 288 B × 120 tiles = 34.5 kB,
+  **1.9% of the frame against a 2% target**, and measures **+0.4% to +1.2% net — larger files.**
+  Per frame it is 864 B. The factor of 40 between those two is the single most useful number here,
+  and nothing in the item said which one it meant.
+
+### Challenging the result — three ways it could have been wrong
+
+- **The simulation could be measuring a different coder.** It is not: it imports `Prob::update`
+  rather than restating it, it is a strict lower bound on both real engines over 240 combinations,
+  and its cold arm sits 41.4 bits per block under the real bitstream inside a measured 81.3-bit
+  band.
+- **The warm table could be an oracle.** It is not — per-(plane, subband) statistics of the image
+  being coded are exactly what a two-pass encoder computes. It *is* the ceiling for that design,
+  which is the point: 1.48% is what a **perfect** initialisation buys, so no cheaper variant beats
+  it.
+- **The two candidates could be additive, making the pair clear the bar.** They are not.
+  Candidate 2 plus a warm table measures −1.10% against candidate 1's −1.11% alone: substitutes,
+  both attacking the same cold start. This was the last way the item could have passed.
+
+### What survives, and where it goes
+
+**Candidate 2 is worth reopening if ENT-8 lands, and not before.** On its own it is −0.40% of rate,
+block count per 1080p 4:4:4 frame **3000 → 1920** (36% fewer length fields), and it deletes the
+banded partition rule — at tile 256 with cb 64 the only block that changes is each tile's top-left
+one, since level-1 bands are 128px and level-2 bands are exactly 64px and both cut identically
+either way. The objection is that fewer blocks is **less parallelism** and abac is one thread per
+code-block. **ENT-8 removes that objection**: if a block becomes 32 threads, block size stops being
+the parallelism knob. Recorded in ENT-8's entry.
+
+**One variant is untested and it is the cheapest one left:** a faster adaptation rate for the first
+symbols of a block — a two-speed `ADAPT_SHIFT` — needs no header, no partition change and no second
+pass, only a different update rule. It cannot beat 1.48%, because that is what a perfect
+initialisation buys, but it could get a fraction of it for nearly nothing. Noted in `0031` rather
+than filed: below the 1% floor by construction.
+
+### Caveats
+
+- **Simulated coder bits, not encoded bytes.** No bitstream was produced. The arm-to-arm difference
+  is sound because the unmodelled per-block costs are identical on both sides; the absolute figures
+  would land within the per-block flush band, not exactly on these numbers.
+- **Intra, stills.** Whether a warm start pays more on inter residuals is untested.
+- **`0024` and its log entry still say "worth about 4% of the file".** Corrected by `0031` rather
+  than edited out: 4% is a correct reading of a bound ratio, and the error was treating a bound
+  ratio as a collectable rate. That is the transferable lesson — **a bound whose statistics are
+  pooled cannot price a change to initialisation, because pooling is what the change is trying to
+  buy.**
+
+**Gates:** `cargo test --release -- --test-threads=1` green; `cargo clippy --release` clean; wasm
+`--lib` clean (the wasm *binary* target is red on `main`, pre-existing, BUG-24).
+
+
+---
+
 ## ENT-7 steps 2–3 — BPC-PaCo's model is *better* than abac's by 7.9%, and every way of collecting it costs more than 7.9% (2026-09-08)
 
 **Hypothesis and the fork.** ENT-7 asks whether GNC should replace abac with BPC-PaCo (bitplane

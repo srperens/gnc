@@ -1604,15 +1604,14 @@ machine — but the affected claim is a documented project rule, and step 1 may 
 > look before filing. That is COORDINATION.md's "Reserving an id is not filing the item" a third
 > time, and it is what this entry is now evidence for.
 >
-> **The mechanism half is written and tested — take it, do not rewrite it.** Worktree `gnc-drnum`,
-> branch **`drnum-mech`** (`git log --all --oneline --grep 'BUG-41 mechanism'`), one file
-> (`scripts/claim`): the `claim item <PREFIX>` allocator, the
-> duplicate-startable-id detection in `items`/`next`, and two new `selftest` properties. **`scripts/claim
-> selftest` passes all six.** It is deliberately **not merged to `main`** — COORD-3 holds the work,
-> and two sessions editing `scripts/claim` for the same reason is the failure this file exists to
-> prevent. Cherry-pick it, or ignore it and say so.
+> **The mechanism landed — COORD-3 shipped it, not this branch.** `1b1f8f6`,
+> `docs/decisions/0065`: `scripts/claim item <PREFIX>` allocates from the same union of committed
+> `main:BACKLOG.md` and live `refs/claims/*`, and `warn_duplicate_ids` reports an id with two
+> startable headings. The `drnum-mech` branch that held this session's independent implementation
+> of the same two things is **deleted**; standing down rather than racing it cost one unmerged
+> commit and duplicated nothing on `main`.
 >
-> What is *not* done anywhere: the ENT-9 renumber itself (COORD-3 holds `ENT-10` for it).
+> What COORD-3 also carried: the ENT-9 renumber itself, under `ENT-10`.
 
 `main:BACKLOG.md` carries two startable `### ENT-9` headings for **different work**:
 
@@ -2931,8 +2930,8 @@ The owner's scope, quoted from `git cat-file -p refs/claims/COORD-3`:
 It holds `ENT-10` for the renumber and `dr-0065` for the record. **Everything BUG-41 found is
 evidence for this item** — the ENT-9 timestamps, the audit that says 11 of the 12 duplicate ids in
 BACKLOG are the harmless "status entry plus original filing" convention, and a tested
-implementation of the allocator and the duplicate-id refusal on branch `drnum-mech` (one commit,
-`scripts/claim` only).
+the audit that says 11 of the 12 duplicate ids in BACKLOG are the harmless "status entry plus
+original filing" convention.
 Correct or replace this stub freely; it exists so the item outlives its session.
 
 ### BUG-27 — the encoder's P-frame reference was dequantised with the intra qstep (**FIXED 2026-09-07**)

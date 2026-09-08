@@ -4693,7 +4693,51 @@ peer's number is not the same as reading their tree.
 frame's reference is *not* simply its colour-converted source, because that buffer is at a
 different stage and scale. RATE-4 records the refutation.
 
-### BUG-46 — `lossless_sibling` does not carry the caller's chroma format, so RATE-2 compares 4:2:0 against 4:4:4 (todo, **P3**)
+### BUG-49 — `q=100` on subsampled chroma is not lossless, and not even in luma (todo, **P1**)
+
+Found 2026-09-08 by BUG-46, which needed the bit-exact candidate at 4:2:2 / 4:2:0 to be
+equivalent-quality and measured that it is not. Per-plane PSNR against the source, `gnc encode`
+→ `gnc decode`, ffmpeg `psnr` over `yuv444p`:
+
+| still | format | q | y | u | v |
+|---|---|---|---|---|---|
+| blue_sky | 4:2:0 | **100** | **51.16** | 43.23 | 44.74 |
+| blue_sky | 4:2:0 | 95 | 53.09 | 56.73 | 57.88 |
+| kristensara | 4:2:2 | **100** | **51.04** | 43.63 | 43.54 |
+| kristensara | 4:2:0 | **100** | **51.85** | 45.76 | 44.31 |
+| bbb | 4:2:2 | **100** | **47.34** | 37.10 | 38.71 |
+| bbb | 4:2:0 | **100** | **47.66** | 37.43 | 39.30 |
+
+**4:4:4 at q=100 is exact — PSNR `inf`.** At 4:2:2 and 4:2:0 it is not, and the plane that damns
+it is **luma**: subsampling does not touch luma, so a lossless configuration must return it
+bit-exact. It returns 47–52 dB. Worse, q=95 at the same format has *better* luma than q=100
+(53.09 against 51.16 on blue_sky 4:2:0), which no quantiser story explains.
+
+**In RGB the whole-image figures invert too.** q=100 reads **below** q=95 at the same format on
+every image measured: blue_sky 4:2:2 38.90 vs 52.05, 4:2:0 40.38 vs 51.60; kristensara 4:2:2 40.19
+vs 51.72; touchdown 4:2:2 40.72 vs 51.75; bbb 4:2:0 34.73 vs 38.56. And **4:2:2 is worse than
+4:2:0** on three of four images (blue_sky 38.90 vs 40.38, kristensara 40.19 vs 41.59, bbb 34.30 vs
+34.73), which is backwards: 4:2:2 keeps twice the chroma.
+
+**Why it matters beyond neatness.** It is the reason BUG-46's fix had to be refused rather than
+shipped (`0078`), it scopes every RATE-2 / RATE-3 / LOSSLESS-3 figure to 4:4:4, and "lossless" is a
+claim this codec makes in GOALS §1 — at 4:2:2 and 4:2:0 it is currently false in the one plane
+subsampling leaves alone.
+
+**Where to look first**, in the order the evidence suggests: the luma damage is the surprising half
+and it is *format-dependent*, so the fault is likely in how the MED path handles a plane geometry
+it only sees when chroma is subsampled — `chroma_padded_width()` / `chroma_padded_height()` and the
+tile grid derived from them, which is exactly the class BUG-11 and BUG-14 were (stream mapping
+against plane geometry). The 4:2:2-worse-than-4:2:0 inversion is the sharpest clue: 4:2:2 halves
+width only, so anything that assumes both dimensions shift together will read wrong there and
+"right" at 4:2:0.
+
+**Success criterion:** `q=100` at 4:2:2 and 4:2:0 returns **luma bit-exact** (max |diff| 0 on Y,
+verified outside the harness) on ≥3 stills and ≥1 sequence, chroma within the subsampling bound,
+and 4:2:2 never worse than 4:2:0. Then re-run BUG-46's sweep: the refusal in `encode` comes off
+with the numbers that justified it.
+
+### BUG-46 — `lossless_sibling` did not carry the caller's chroma format (**FIXED 2026-09-08**, and the fix had to be refused)
 
 Found 2026-09-08 by LOSSLESS-3. `lossless_sibling` builds from `quality_preset(100)`, which is
 4:4:4, and copies `entropy_coder`, `gpu_entropy_encode`, the abac knobs, `tile_size` and (since
@@ -4715,11 +4759,37 @@ did not ask for.
 coded (subsampled) domain, which is what the caller asked for by choosing 4:2:0, and the same
 two-axis win RATE-2 relies on: fewer bytes *and* exact coded samples.
 
-**Why it is P3 rather than a one-line fix.** The line is `out.chroma_format = cfg.chroma_format;`,
-but it turns the fallback on for a whole class of input that has never been measured, and RATE-2's
-decision (`0036`) is stated over 4:4:4 stills. It needs the still sweep re-run at 4:2:2 and 4:2:0
-before the default moves. **LOSSLESS-3 is gated to 4:4:4 for this reason** and the gate comes off
-here.
+**FIXED, and then the fallback it unlocked had to be refused.** `out.chroma_format =
+cfg.chroma_format` is in, so the candidate is honest — and `encode` now refuses the comparison on
+subsampled chroma outright, because the sweep the filing asked for says the two candidates are not
+the same picture there. Decision `0078`.
+
+**What the sweep found: `q=100` on subsampled chroma is not lossless, and not even in luma.** Per
+plane against the source, q=100:
+
+| still | format | y | u | v | q=95 at the same format |
+|---|---|---|---|---|---|
+| blue_sky | 4:2:0 | **51.16** | 43.23 | 44.74 | y 53.09, u 56.73, v 57.88 |
+| kristensara | 4:2:2 | **51.04** | 43.63 | 43.54 | — |
+| bbb | 4:2:2 | **47.34** | 37.10 | 38.71 | — |
+
+4:4:4 at q=100 is exact (PSNR inf). Luma is not subsampled at 4:2:2 or 4:2:0, so a lossless
+configuration must reproduce it exactly, and it does not — that is **BUG-49**, filed. In RGB the
+candidate is **8.5–13.1 dB worse** than the lossy arm at the same request, so with the one-line fix
+and no refusal, bbb at 4:2:0 q=99 took the bit-exact file for **−2.70% of rate and −3.9 dB**. That
+is a rate/quality trade, and RATE-2 exists precisely because it is *not* one.
+
+**So the resolution is: honest candidate, explicit refusal.** Before this fix the same input was
+refused by accident — the candidate was always 4:4:4 and could never win. Now the sibling says what
+it is and `encode` says why it will not compare. **Byte-identical to `main` on all six checked
+points** (bbb, 4:4:4 / 4:2:2 / 4:2:0 at q=97 and q=99), so nothing shipped moves. The refusal
+carries a canary naming the format and BUG-49.
+
+**Load-bearing beyond this item, and it was not flagged before:** RATE-3's mean **−4.28% → −6.09%**
+and everything RATE-2 claims about q=95..99 are **4:4:4-only figures**. Not "unmeasured elsewhere" —
+the mechanism could not fire elsewhere. Anyone reading `0036`, `0044` or RATE-3 should read that
+scope in. LOSSLESS-3's own 4:4:4 gate stands for the same reason and now cites BUG-49 rather than
+this item.
 
 ### BUG-48 — the padding fill is a wavelet lever, not a quality one (**FIXED 2026-09-08**)
 

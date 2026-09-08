@@ -1106,6 +1106,71 @@ theatre.
 reformatting 44 modules that eight live sessions are editing conflicts with all of them and
 carries no behaviour. It wants a quiet tree and one commit that changes nothing else.
 
+## BUG-46 — the bit-exact candidate was always 4:4:4, and fixing that exposed a lossless path that is not lossless (2026-09-08)
+
+**What was filed.** `lossless_sibling` builds RATE-2's bit-exact candidate from
+`quality_preset(100)` and copies the choices that say *how* to code — coder, GPU/CPU, abac knobs,
+tile size, and since BUG-47 the padding fill — but not `chroma_format`. The canary showed it
+plainly, bbb at q=97:
+
+```
+--chroma-format 444:  lossy 2 843 371 B vs bit-exact 3 257 157 B (+14.55%), keeping the lossy one
+--chroma-format 420:  lossy 1 660 019 B vs bit-exact 3 257 157 B (+96.21%), keeping the lossy one
+```
+
+**The same 3 257 157 B for both requests.** So on subsampled input RATE-2 compared a 4:2:0 wavelet
+encode against a 4:4:4 lossless one — three times the chroma samples — and could essentially never
+fire. Every RATE-2 / RATE-3 / LOSSLESS-3 figure is a 4:4:4 figure as a result: not "unmeasured
+elsewhere", *unreachable* elsewhere. That scope was not previously written down anywhere.
+
+**Domain declaration.** Whole coded stills, bytes from the encoder and per-plane PSNR from the
+decoded PNG against the source. The question is not "is the fix smaller" but "are the two
+candidates the same picture", which is what makes RATE-2 metric-free — so quality is the measured
+quantity here, not a control.
+
+### The one-line fix works, and it must not ship
+
+`out.chroma_format = cfg.chroma_format` makes the candidate honest, and the fallback then fires:
+bbb 4:2:0 q=99 takes the bit-exact file at 1 847 304 B against 1 898 635 B, **−2.70%**.
+
+**And 38.66 dB → 34.73 dB, −3.9 dB.** The reason is not the fix. It is that `q=100` on subsampled
+chroma is not lossless **and not even in luma**, which subsampling does not touch:
+
+| still | format | q | y | u | v |
+|---|---|---|---|---|---|
+| blue_sky | 4:2:0 | 100 | **51.16** | 43.23 | 44.74 |
+| blue_sky | 4:2:0 | 95 | 53.09 | 56.73 | 57.88 |
+| kristensara | 4:2:2 | 100 | **51.04** | 43.63 | 43.54 |
+| kristensara | 4:2:0 | 100 | **51.85** | 45.76 | 44.31 |
+| bbb | 4:2:2 | 100 | **47.34** | 37.10 | 38.71 |
+| bbb | 4:2:0 | 100 | **47.66** | 37.43 | 39.30 |
+
+4:4:4 at q=100 is exact (`inf`). Whole-image RGB, q=100 against q=95 at the same format: blue_sky
+4:2:2 38.90 vs 52.05, 4:2:0 40.38 vs 51.60; kristensara 4:2:2 40.19 vs 51.72; touchdown 4:2:2 40.72
+vs 51.75; bbb 4:2:0 34.73 vs 38.56. **8.5–13.1 dB, four of four images, and 4:2:2 comes out worse
+than 4:2:0 on three of them** — an inversion, since 4:2:2 keeps twice the chroma. Filed as
+**BUG-49 (P1)** with the plane-geometry hypothesis the inversion points at: 4:2:2 halves width
+only, so anything assuming both dimensions shift together reads wrong there and "right" at 4:2:0.
+
+### What shipped: an honest candidate and an explicit refusal
+
+The sibling carries the format, and `encode` refuses the comparison on subsampled chroma with a
+canary naming the format and BUG-49. **Byte-identical to `main`** on bbb at 4:4:4 / 4:2:2 / 4:2:0,
+q=97 and q=99 — the refusal restores exactly what the missing field was producing by accident,
+which is the point: the accident and the intention agree today and stop agreeing the moment BUG-49
+is fixed.
+
+Refusing rather than taking the −2.70% is not conservatism for its own sake. `0036`'s licence to
+act without a metric is that its candidate wins on both axes at once; a trade of −3.9 dB for 2.7%
+of rate is 13x CLAUDE.md's 0.3 dB "flag and investigate" threshold, and smuggling it in under that
+licence would make "q=99" mean something different at 4:2:0 without saying so.
+
+Decision `docs/decisions/0078`. Harness `scripts/meas_bug46_chroma_sibling.py` — it reports both
+arms' bytes *and* PSNR and flags any point that is not better on both axes, which is what caught
+this on the first run.
+
+---
+
 ## LOSSLESS-3 — above q=95 a camera sequence is dominated by its own lossless encode, and the swap is a sequence choice, not a frame choice (2026-09-08)
 
 **Hypothesis, from LOSSLESS-2's own numbers.** RATE-2 (`0036`) found a *still* above q~95 costs

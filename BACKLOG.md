@@ -3593,7 +3593,72 @@ falls while q rises (MEAS-9's harness now does). And for a 10-bit target the ext
 itself was never the problem. Harness: `scripts/meas_rate1_precision.py`, measured at `fa32a26`.
 Numbers in RESEARCH_LOG.
 
-### BUG-39 — `q=100` video: two causes fixed, 12.45 → 26.30 dB, still not lossless (**partly fixed 2026-09-08**, P1)
+### BUG-39 — `q=100` video: three causes fixed, 12.45 → 51.54 dB, still not bit-exact (todo, P1)
+
+**Third cause found and fixed, and it was not the one `0042` predicted.** `docs/decisions/0054`;
+numbers in RESEARCH_LOG. 3 sequences, 8 frames, ki=2 and ki=9, 4:4:4, shipped defaults — inter
+PSNR **26.30–26.76 → 51.54–53.62** (crowd_run ki=2), **21.77–26.51 → 50.41–51.54** (ki=9, drift
+down the GOP 4.74 → 1.13 dB), and the same shape on old_town_cross (29.7 → 51.8–52.5) and bbb
+(33.0 → 58.1). **q=99 is identical to the byte and to two decimals of PSNR on all six points**,
+because the fix cannot be reached wherever `wavelet_levels >= 1`.
+
+**Cause 3, fixed: a zero-level `forward` wrote nothing.** `WaveletTransform::forward` runs
+`for level in 0..levels`, so at `levels == 0` it dispatches nothing and never writes
+`output_buf`; `inverse` copies input to output before its own loop, so the decoder's zero-level
+case *is* the identity. `encode_pframe` quantises `plane_c`, so the encoder transmitted whatever
+the **previous frame** left there and the decoder added it to its prediction. Reached by every
+P/B frame of a `q=100` sequence (MED sets `wavelet_levels = 0`) and of a `--dct` one.
+
+**`0042`'s cause 3 was wrong about the mechanism and is corrected in place** (the original text
+kept visible): the P-scale taper is already 1.0 at `q=100` and the dead zone already 0.000, both
+printed by the encoder's own canary since INTER-1, so there was nothing to suppress.
+
+**Cause 4, open, and it has a named fix rather than a hypothesis.** 51.54 dB is **sub-pel
+prediction rounding**: bilinear quarter-pel interpolation makes the prediction fractional, so
+`cur - pred` is fractional and step 1.0 rounds it (≤ 0.5 per sample in YCoCg-R, amplified into
+RGB by the inverse colour transform — and bbb reads 58 dB because more of its blocks are full-pel
+or zero). The fix is H.264 lossless's: round the prediction to an integer in a lossless
+configuration, on both sides, so the residual is an integer and step 1.0 is exact. A `round()` in
+`motion_compensate.wgsl` behind a params flag gated on `config.is_lossless()`, which the decoder
+derives from the frame header it already carries — **no new bitstream field**. Needs a rate
+number too, since rounding the prediction changes the residual. Untried.
+
+**Success criterion unchanged:** every frame bit-exact at `q=100` on ≥3 sequences at ki=2 and 9,
+verified outside the harness. **Not met.**
+
+**Canary:** `zero_level_forward_is_an_identity_not_a_no_op` (verified to fail without the fix).
+
+**Probe that looks decisive and is not**, recorded so nobody repeats it: a static sequence (the
+same PNG four times) codes `q=100` P-frames bit-exact at 3 198 bytes **before** the fix too —
+`all_skip_tiles=120/120`, so it went down the motion-skip path and never asked the transform for
+anything. A zero-residual probe cannot test a residual path.
+
+### LOSSLESS-2 — at `q=100` the inter path costs 36% more than all-intra (todo, P2)
+
+**Measured, not argued.** crowd_run, 4 frames, ki=2, `q=100`, after BUG-39's cause-3 fix:
+
+| | bytes |
+|---|---|
+| I+P | **17 584 089** |
+| all-intra | 12 932 312 |
+
+**+36%, and the P-frames are not bit-exact either** (51.5 dB against the I-frames' `inf`). Before
+the fix the same comparison read −12%, but that saving was bought by transmitting a stale buffer
+instead of the residual, so it was never real.
+
+**Why it goes this way.** With no quantiser to discard anything, a quarter-pel MC residual is
+noise-like and costs more to code than the MED-predicted frame it replaces. This extends
+INTER-1 / `0023`'s line — the inter saving is already a wash at q=85–99 (−1.9% mean, −0.2%
+worst-frame) — past the wash into a loss.
+
+**The question:** should a lossless configuration code P-frames at all, or fall back to all-intra
+(per frame, on an RD decision, or per sequence)? It bears on a GOALS §1 row, and the honest
+answer may be that `q=100` video is all-intra by construction — which is what FFV1 does.
+
+**Not startable before BUG-39's cause 4**, because rounding the prediction changes the residual
+and therefore this number. Take it after, or take both.
+
+### BUG-39 — `q=100` video: two causes fixed, 12.45 → 26.30 dB (superseded 2026-09-08)
 
 **Two of three causes found, fixed and proven.** `docs/decisions/0042`; numbers in RESEARCH_LOG.
 crowd_run, 10 frames, `q=100`: P-frames go from **9.06–21.37 dB to 21.63–26.51 dB** at ki=9 and

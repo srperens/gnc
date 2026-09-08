@@ -305,6 +305,113 @@ baseline taken at the start of this session's work.
 
 ---
 
+## BUG-39 — `q=100` video: the encoder inverted a transform it had not used, and the P-frames advertised one they had not used either (2026-09-08)
+
+**Where this started.** RATE-3 found that a `q=100` sequence codes bit-exact I-frames and then
+P-frames that decode at **12.45 dB**, on `main`, with no flags. It spent three attempts on
+mechanism hypotheses, refuted two of them, and named the one measurement that would settle it
+(`0040`). This is that measurement and what it found.
+
+**Success criterion, unchanged from the item:** every frame bit-exact at `q=100` on ≥3 sequences at
+ki=2 and 9, verified outside the harness. **Not met.** Two of three causes are fixed and the
+figure moves 12.45 → 26.30 dB.
+
+### The measurement, and why it was available all along
+
+`read_reference_planes` exists on **both** the encoder and the decoder pipeline, and
+`test_pframe_reference_matches_decoder` has been diffing them since before this bug was filed —
+with `CodecConfig::default()`, which is qstep 4.0 and the wavelet. **The lossless case had never
+been run through it.** The tool was not missing; its configuration was the untested axis.
+
+Encoder reference against decoder reference, same I-frame, 256×256 gradient, reference deblocking
+off (it is encoder-only by design, as the existing lossy check also notes):
+
+| | max \|enc − dec\| | pixels differing |
+|---|---|---|
+| q=99, wavelet — control | **0.0000** all planes | 0 / 65 536 |
+| q=100, MED — Y | **33.0000** | 63 029 / 65 536 |
+| q=100, MED — Co | 0.0000 | 0 |
+| q=100, MED — Cg | **64.0000** | 64 266 / 65 536 |
+
+Ten minutes, against two hours of hypotheses. Worth writing down as a habit: **when two components
+must agree and one of them is wrong, diff them before theorising about why.**
+
+### Cause 1 — the encoder's local decode had no MED inverse
+
+`local_decode_iframe_gpu` dequantised and called `transform.inverse` unconditionally, so a MED
+frame's reference was the inverse **wavelet** of a MED residual. The decoder has always branched
+correctly (`decoder/gpu_work.rs:350`, `:373`) and `med.inverse` has always existed — only the
+encoder's copy of the reconstruction lacked the branch, which is why the I-frames themselves were
+perfect and everything downstream was not.
+
+Fixed. The table above now reads **0.0000 on every plane at q=100 as well as q=99**, asserted by
+`lossless_iframe_reference_matches_the_decoders`, which keeps the q=99 wavelet case as its control
+so a future regression cannot pass by breaking both arms equally.
+
+### Cause 2 — a P-frame advertised a transform it had not used
+
+`encode_pframe` codes its residual with `transform.forward` **always** — it never calls
+`med.forward` — but it cloned the sequence config into the frame it emitted. So a `q=100` P-frame
+carried `transform_type = MedPredict`, the decoder branches on that byte for P-frames too, and it
+dutifully inverted a MED prediction over a wavelet residual. The error compounded down the GOP.
+
+Fixed where the residual config is built: `res_config.transform_type = Wavelet`. The label now
+describes what the code does.
+
+**A wrong first attempt worth recording:** I put the same correction in
+`encode_from_wavelet_coeffs` and `encode_from_gpu_wavelet_planes_weighted` first, on the strength
+of their names, and it changed **nothing** — a P-frame's config comes from `res_config`, not from
+those emitters. Reverted rather than left in as an inert change with a confident comment on it.
+
+### Raw numbers — crowd_run, 10 frames, `q=100`
+
+| | ki=2 P-frames | ki=9 P-frames |
+|---|---|---|
+| before | 21.35 – 21.48 dB | **9.06 – 21.37 dB** |
+| cause 1 only | 21.35 – 21.48 | 9.06 – 21.37 |
+| both causes | **26.30 – 26.76** | **21.63 – 26.51** |
+
+The ki=9 span collapsing from **12.3 dB to 4.9 dB** is the drift disappearing: every P-frame's
+reference is now the one the decoder has, so error stops accumulating along the chain. That cause 1
+alone moved nothing at ki=9 is the reason it was not shipped alone — a partial number that reads as
+progress and hides a second cause.
+
+**No regression at lossy quality**, which is the gate that matters most here: crowd_run q=99 ki=9
+is **byte-identical** at 49 328 550 B with P-frames 60.61–60.64 dB, and q=85 reads 44.63–44.72 dB.
+
+### Cause 3 — open, and it is a design question rather than a patch
+
+P-frames at `q=100` are **26 dB, not bit-exact**, and they are lossy *by construction*: the residual
+is quantised at the P-frame taper (up to 1.25× the intra step) with a dead zone, and
+`wavelet_levels` is 0 there. **Nothing in the P-frame path asks to be lossless when the sequence
+is.** So "bit-exact lossless at q=100" remains true of a still and false of a sequence, for a
+reason unrelated to the two bugs above.
+
+Fixing it means suppressing the P-scale taper and the dead zone for a lossless configuration, and
+it needs a **rate** number as well as a quality one — a lossless P-frame is much larger, and
+whether `q=100` video should pay that is exactly the kind of choice that wants a decision record.
+BUG-39 stays open on it.
+
+### Also corrected, and not measured
+
+`--dct` sequences had their P-frames mislabelled the same way and are also wavelet-coded, so the
+same one-line fix corrects them. **No DCT video measurement was taken** — flagged rather than
+claimed.
+
+### Caveats
+
+- **Only the reference planes are proven equal**, at 256×256 on a gradient. The test asserts the
+  invariant that must hold; it does not sweep content or geometry.
+- **The README figure is updated, not deleted**: it now says 26.30 dB and names cause 3.
+- **`0040`'s refuted hypotheses stand refuted** — the colour transform's rounding mode and a
+  geometry difference at `wavelet_levels = 0` were both wrong, and neither is what this was.
+
+**Gates:** `cargo test --release -- --test-threads=1` green (244 passed, 0 failed, 9 ignored);
+`cargo clippy --release` clean; wasm `--lib` clean.
+
+
+---
+
 ## RATE-3 — a bit-exact I-frame is not a drop-in reference, and `q=100` video decodes at 12.45 dB (2026-09-08)
 
 **Hypothesis.** `0036` shipped RATE-2's lossless fallback for stills only, because letting it reach

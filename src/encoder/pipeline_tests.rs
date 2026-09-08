@@ -3857,3 +3857,77 @@ fn fused_qh_does_not_build_the_histogram_pipeline_on_the_default_path() {
          asserted nothing — check that fusion is still enabled for this configuration"
     );
 }
+
+/// BUG-39: the encoder's I-frame reference and the decoder's must be the same numbers.
+///
+/// `test_pframe_reference_matches_decoder` already checks this — with
+/// `CodecConfig::default()`, which is qstep 4.0 and the wavelet. **The lossless case was never
+/// checked**, and `q=100` sequences decode their P-frames at 12.45 dB, so this is where to look.
+/// q=99 is the control: it is the same code path with a lossy transform and is expected to match.
+///
+/// Encoder-internal reference deblocking is off for the comparison, exactly as the existing
+/// lossy check does it — it is encoder-only by design, so leaving it on would make a real
+/// divergence look like this one.
+#[test]
+fn lossless_iframe_reference_matches_the_decoders() {
+    let ctx = GpuContext::new();
+    let (w, h) = (256u32, 256u32);
+    let f0 = make_gradient_frame(w, h, 0.0);
+    let padded_w = (w + 255) & !255;
+    let padded_h = (h + 255) & !255;
+    let padded_pixels = (padded_w * padded_h) as usize;
+
+    std::env::set_var("GNC_REF_DEBLOCK", "0");
+    let mut worst = Vec::new();
+    for q in [99u32, 100] {
+        let mut cfg = crate::quality_preset(q);
+        cfg.tile_size = 256;
+        cfg.keyframe_interval = 1;
+        // The I-frame's own transform is what is under test, not RATE-2's choice between two.
+        cfg.lossless_fallback = false;
+
+        let mut enc = EncoderPipeline::new(&ctx);
+        let compressed = enc.encode_sequence(&ctx, &[&f0], w, h, &cfg);
+        assert_eq!(compressed.len(), 1);
+        let enc_ref = enc.read_reference_planes(&ctx, w, h).expect("encoder reference");
+
+        let dec = DecoderPipeline::new(&ctx);
+        let _ = dec.decode(&ctx, &compressed[0]);
+        let dec_ref = dec.read_reference_planes(&ctx, w, h).expect("decoder reference");
+
+        for (p, name) in ["Y", "Co", "Cg"].iter().enumerate() {
+            let a = &enc_ref[p * padded_pixels..(p + 1) * padded_pixels];
+            let b = &dec_ref[p * padded_pixels..(p + 1) * padded_pixels];
+            let mut max = 0.0f32;
+            let mut nonzero = 0usize;
+            let mut sum = 0.0f64;
+            for (x, y) in a.iter().zip(b) {
+                let d = (x - y).abs();
+                if d > 0.0 {
+                    nonzero += 1;
+                }
+                sum += f64::from(d);
+                if d > max {
+                    max = d;
+                }
+            }
+            eprintln!(
+                "q={q} transform={:?} plane {name}: max |enc-dec| = {max:.4}, mean = {:.6}, \
+                 nonzero {nonzero}/{padded_pixels}",
+                compressed[0].config.transform_type,
+                sum / padded_pixels as f64,
+            );
+            worst.push((q, *name, max));
+        }
+    }
+    std::env::remove_var("GNC_REF_DEBLOCK");
+
+    for (q, name, max) in worst {
+        assert!(
+            max < 1.0e-3,
+            "q={q} plane {name}: the encoder's reference differs from the decoder's by {max}, \
+             so every P-frame that references it starts from a different picture than the \
+             decoder has (BUG-39)"
+        );
+    }
+}

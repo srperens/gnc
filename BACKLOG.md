@@ -3593,7 +3593,44 @@ falls while q rises (MEAS-9's harness now does). And for a 10-bit target the ext
 itself was never the problem. Harness: `scripts/meas_rate1_precision.py`, measured at `fa32a26`.
 Numbers in RESEARCH_LOG.
 
-### BUG-39 — `q=100` video decodes at 12.45 dB: lossless sequences have never worked (todo, **P1**)
+### BUG-39 — `q=100` video: two causes fixed, 12.45 → 26.30 dB, still not lossless (**partly fixed 2026-09-08**, P1)
+
+**Two of three causes found, fixed and proven.** `docs/decisions/0042`; numbers in RESEARCH_LOG.
+crowd_run, 10 frames, `q=100`: P-frames go from **9.06–21.37 dB to 21.63–26.51 dB** at ki=9 and
+from 21.35–21.48 to **26.30–26.76** at ki=2, and the drift down the GOP is gone (the ki=9 span
+collapses from 12.3 dB to 4.9 dB). Nothing moved at lossy quality — crowd_run q=99 ki=9 is
+byte-identical at 49 328 550 B with P-frames 60.61–60.64.
+
+**Cause 1, fixed:** `local_decode_iframe_gpu` called `transform.inverse` unconditionally, so a MED
+I-frame's reference was built by inverting a transform it was not coded with. The decoder always
+did this right and `med.inverse` always existed; only the encoder's copy lacked the branch.
+Measured before: encoder reference against decoder reference differed by up to **33.0 on Y and
+64.0 on Cg**, on 63 029 and 64 266 of 65 536 pixels, while the q=99 wavelet control was
+bit-identical. Now 0.0000 on every plane, asserted by
+`lossless_iframe_reference_matches_the_decoders`.
+
+**Cause 2, fixed:** `encode_pframe` codes its residual with `transform.forward` **always**, but
+cloned the sequence config, so a `q=100` P-frame advertised `transform_type = MedPredict` and the
+decoder inverted a MED prediction over a wavelet residual. The label now says what the code does.
+**This also corrects `--dct` sequences**, mislabelled the same way — not measured, flagged.
+
+**Cause 3, open, and it is a design question rather than a patch.** P-frames at `q=100` are lossy
+*by construction*: the residual is quantised at the P-frame taper (up to 1.25× the intra step) with
+a dead zone, and `wavelet_levels` is 0. **Nothing in the P-frame path asks to be lossless when the
+sequence is.** Fixing it means suppressing the taper and the dead zone for a lossless
+configuration, and it needs a rate number as well as a quality one — a lossless P-frame is much
+larger. Success criterion unchanged: every frame bit-exact at `q=100` on ≥3 sequences at ki=2 and
+9, verified outside the harness.
+
+**The instrument to use, and the reason the first two causes hid for so long:**
+`read_reference_planes` exists on **both** pipelines and `test_pframe_reference_matches_decoder`
+has been diffing them all along — with `CodecConfig::default()`, qstep 4.0, wavelet. The lossless
+case was the untested axis, not a missing tool. Two hours of mechanism hypotheses (`0040`) against
+ten minutes of diffing the two things that must be equal.
+
+The original filing follows.
+
+### BUG-39 — `q=100` video decodes at 12.45 dB: lossless sequences have never worked (original filing)
 
 Filed 2026-09-08 by RATE-3, which found it while investigating something else and confirmed it is
 **not** caused by RATE-2.

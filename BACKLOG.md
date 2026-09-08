@@ -4201,44 +4201,35 @@ same PNG four times) codes `q=100` P-frames bit-exact at 3 198 bytes **before** 
 `all_skip_tiles=120/120`, so it went down the motion-skip path and never asked the transform for
 anything. A zero-residual probe cannot test a residual path.
 
-### BUG-44 — `read_reference_planes` reads a different stage on the two pipelines at `q=100` (todo, P3)
+### BUG-44 — `read_reference_planes` is symmetric at `q=100`; the 254.0039 row was a patched encoder (**CLOSED not-a-bug 2026-09-08**)
 
-**The instrument disagrees where the pictures do not, and it has already cost one session an
-afternoon's hypothesis.** RATE-4 diffed the encoder's reference against the decoder's on a
-256×256 gradient with `GNC_REF_DEBLOCK=0` and got:
+**Filed and closed the same hour, by measuring the thing the filing asserted.** The shipped
+instrument agrees exactly. `lossless_iframe_reference_matches_the_decoders`, on the same 256×256
+gradient with `GNC_REF_DEBLOCK=0` that produced the alarming row:
 
-| case | max \|enc − dec\| on Y | pixels differing |
-|---|---|---|
-| q=95..99, bit-exact sibling kept | 0.0000 | 0 / 65 536 |
-| q=100, MED | **254.0039** | 65 535 / 65 536 |
-| q=100, `GNC_MED=0` | 7.3965 | 65 535 / 65 536 |
+```
+q=99  transform=Wavelet     plane Y/Co/Cg: max |enc-dec| = 0.0000, nonzero 0/65536
+q=100 transform=MedPredict  plane Y/Co/Cg: max |enc-dec| = 0.0000, nonzero 0/65536
+```
 
-with the encoder side *fractional* (`-0.5019531, -0.00390625, 0.49414063, …`) and the decoder side
-*integral* (`-1.0, -1.0, -1.0, …`). That reads as "the decoder predicts from a picture it does not
-decode", which would be a defect upstream of everything BUG-39 fixed.
+That test is in the suite and green, and it has asserted this since `0042`.
 
-**It is not, and the evidence is decisive.** Since BUG-39 closed (`0064`), a `q=100` sequence is
-**bit-exact on every frame**, verified outside the harness with raw-RGB md5 through the real
-container: 48 of 48 frames on 3 sequences at ki=2 and ki=9. A P-frame cannot be md5-identical to
-its source while predicting from a picture the decoder does not hold — the residual is computed
-against the encoder's reference and added to the decoder's, so any difference between them lands
-in the output. So the two buffers `read_reference_planes` returns are **not the same stage of the
-pipeline** in this configuration, and the readback is what needs fixing.
+**Where the 254.0039 came from:** RATE-4 had *implemented `0040` point 4's source-copy reference*
+before taking that diff, so the encoder side was a colour-converted **source** plane rather than a
+reference — a buffer that has not been through the stage that produces one, in a different scale
+(the values are a ramp in steps of 0.498, i.e. ~127.5/256, against a reference in 0..255). The
+diff is a true statement about that patch and says nothing about the shipped pair.
 
-**Why it is worth an item rather than a comment.** This function is the repository's instrument of
-record for "do the two sides agree" — `0042` used it to find two causes, `0044` and RATE-4 used it
-after that, and CLAUDE.md's own lesson from `0040` is *diff the two things that must be equal
-before theorising*. An instrument that answers a different question in one configuration turns
-that lesson into a trap, and the trap only fires at `q=100`, which is the configuration nobody
-exercised until this week.
+**What I got wrong, since it is the reusable part.** I filed this from a peer's report plus my own
+bit-exactness result and reasoned that the two could not both be true, which was correct — and
+then picked the wrong one to blame. **The report was of a modified tree, and I did not check that
+before filing.** One `cargo test --release --lib lossless_iframe_reference_matches_the_decoders`
+would have closed it before it ever had an id; it is what closed it ten minutes later. Reading a
+peer's number is not the same as reading their tree.
 
-**Where to look:** the encoder's side is fractional, which is the shape of colour-converted source
-*before* whatever rounds it, and the decoder's is integral, which is the shape of a reconstructed
-picture. One of the two is reading a buffer earlier in the chain than the other.
-
-**Success criterion:** at `q=100` MED, the two sides agree to 0.0000 on a frame that is known
-bit-exact end to end — or the function documents, in one sentence per pipeline, which stage it
-returns and why they differ.
+**What stands from it:** `0040` point 4's route fails for a reason worth keeping — a lossless
+frame's reference is *not* simply its colour-converted source, because that buffer is at a
+different stage and scale. RATE-4 records the refutation.
 
 ### LOSSLESS-2 — at `q=100` inter costs +38% on camera content and wins 1.6% on animation (todo, P2)
 

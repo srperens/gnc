@@ -366,6 +366,39 @@ else is mid-operation on. The rule generalises to **never abort or switch away f
 you did not start**, and `.git/` names the operation — `MERGE_HEAD`, `REBASE_HEAD`,
 `rebase-merge/`, `CHERRY_PICK_HEAD`.
 
+## Two sessions' numbers that disagree may both be right — ask which tree
+
+**Found 2026-09-08, by both sides of it.** A RATE-4 measurement said the encoder's reference and
+the decoder's differ by 254.0039 at `q=100`. The BUG-39 session had just shown `q=100` video
+decoding bit-exact on 48 of 48 frames, which cannot be true of a codec predicting from a reference
+the decoder does not hold. Two results, both correctly measured, apparently contradictory.
+
+**They were taken on different trees.** The 254.0039 came from a *patched* encoder — a source-copy
+reference under test — so the encoder side of the diff was a colour-converted source plane rather
+than a reference. The shipped tree reads 0.0000 on the same instrument, same content. There was no
+bug in either measurement and no bug in the instrument.
+
+**The cost was an hour of writing and two rounds of corrections into `main`**, including a
+conclusion inverted and then re-inverted in the same entry — because each side reasoned about the
+other's number instead of asking one question:
+
+> **"Which commit was that measured on?"**
+
+Both cheap fixes went unreached. One side had a twenty-second test that settles it
+(`cargo test --release --lib <the oracle> -- --test-threads=1`); the other had one line of
+`git diff` they never asked for. Neither is expensive; both were skipped in favour of an
+explanation.
+
+**So: a number quoted across sessions is incomplete without its tree**, exactly as a claim is not a
+measurement. When you send one, say what it was measured on — `main` at `<sha>`, or "my branch with
+X applied". When you receive one that cannot coexist with yours, ask that before you file a bug,
+write a correction, or reverse a conclusion. And **never invert your own measured result on someone
+else's inference** — an inference is not a measurement no matter how good the reasoning is, and the
+session that inverted here had the refuting test on disk the whole time.
+
+Filed and closed the same hour as **BUG-44** (not-a-bug); the worked example lives in BACKLOG's
+RATE-4 entry, which carries both corrections struck in place rather than deleted.
+
 ## A subagent's load is your load, and it is transitive
 
 **Found 2026-09-08, by causing it.** A read-only literature agent was spawned to research how other

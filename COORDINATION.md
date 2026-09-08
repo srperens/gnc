@@ -378,7 +378,11 @@ whether `scripts/claim` should stamp the commit a measurement was taken on. It s
 only because the evidence points somewhere cheaper, not because the failure is rare. It is the
 most frequent measurement failure in this repository right now.
 
-**Six instances, and one of them is the only one a claim-time stamp would have caught:**
+**COORD-6 then found the mechanism that does work, and it is a subcommand rather than a rule —
+see "A number carries its codec, and `gnc fingerprint` is how" below. Read that first; the pricing
+below is why it took three items to get there, and the seventh instance is what made it urgent.**
+
+**Seven instances, and one of them is the only one a claim-time stamp would have caught:**
 
 | # | instance | shape | would `claim measured` have caught it? |
 |---|---|---|---|
@@ -388,10 +392,20 @@ most frequent measurement failure in this repository right now.
 | 4 | **the build-artefact near-miss** (2026-09-08, section below) — a rebuild during a 36-run sweep | intra-session, own `target/` | no |
 | 5 | **ARCH-3 / BUG-18** (2026-09-07) — `main` moved mid-item; rebased and re-measured | intra-session, `main` moved | no |
 | 6 | **quarter-pel #15** (2026-03-09) — "−0.63 dB vs stale baseline (`617d8e6`)" | comparison against a stale record | no |
+| 7 | **LOSSLESS-3 / `0070`** (2026-09-08) — its lossy columns hold bit-exact I-frames, which BUG-47 (`0072`) moved by ~1.8 points hours later while the q=100 column stayed put | intra-session, `main` moved — *between one session filing and another reading* | no |
 
-**So the tool is refused on its own numbers: 1 of 6.** The cheaper variant — printing the commit
-each *claim* was taken against — would have caught **0 of 6**, because a claim's commit is not a
+**So the tool is refused on its own numbers: 1 of 7.** The cheaper variant — printing the commit
+each *claim* was taken against — would have caught **0 of 7**, because a claim's commit is not a
 measurement's commit and instance 1's difference was uncommitted anyway. COORD-4 closed on this.
+**Five of the seven are the `main`-moved-under-a-table shape**, which is the one COORD-6 went after.
+
+**Instance 7 is the one that settles the argument, because it happened *after* this section was
+consolidated onto `main`.** LOSSLESS-3 published a q=95/97/99 table against a bit-exact q=100
+column and concluded camera content is dominated from q=95 up; those lossy columns contain
+bit-exact I-frames, so BUG-47 moved every one of them and left q=100 alone. The P1 conclusion
+survives; every margin in the table is overstated. **The prose did not prevent it** — which is the
+case for a mechanism, and would have been the case for closing this class as an accepted cost of
+concurrency had no cheap mechanism existed.
 
 **What the six actually say is that the rule is already written four times, by four sessions, on
 one afternoon, under four names — and that is why it keeps not being applied:**
@@ -425,12 +439,72 @@ git -C "$REPO" rev-parse --short HEAD   # say this next to any number you publis
   Instance 1 cost two sessions an hour and put two wrong inferences into `main`; the refuting test
   was on disk the whole time and takes twenty seconds.
 
-**Why now, and why it is not a competence problem.** Five of the six are from the two days this
+**Why now, and why it is not a competence problem.** Six of the seven are from the two days this
 repository has run eight concurrent sessions. Concurrency is what makes a published figure decay
 between measurement and reading, and the cost scales with how many sessions merge into one `main`,
-not with how careful any one of them is. A seventh instance is likelier than any of the four
-rule-writings preventing it, which is why COORD-4's answer is consolidation rather than another
-paragraph.
+not with how careful any one of them is. A seventh instance arrived the same day and is row 7 above, which is exactly what
+this sentence predicted — so consolidation was the right answer to COORD-4 and an insufficient one.
+COORD-6 is the mechanism.
+
+## A number carries its codec, and `gnc fingerprint` is how
+
+**COORD-6, 2026-09-08. `docs/decisions/0075`.** Five of the seven instances above are one
+session's table decaying because `main` moved under it. COORD-4 refused the two obvious mechanisms
+on those numbers — a claim-time `HEAD` stamp catches 1 of 7, printing each claim's commit 0 of 7 —
+and consolidating the prose did not prevent instance 7. So the answer had to be either a mechanism
+or an explicit "no mechanism exists; this is a cost of concurrency". **It is a mechanism, and it is
+half a second:**
+
+```bash
+gnc fingerprint                       # codec-fingerprint v1 abf86a50  (10 configurations)
+```
+
+It encodes a **pinned, versioned** 10-configuration matrix and digests the bytes, so it answers the
+only question that matters — *would this binary produce different output?* — by running the encoder
+rather than guessing from the diff. **Two numbers carrying the same fingerprint are comparable; two
+carrying different ones are not.**
+
+**Why not `shasum target/release/gnc`, which several harnesses already print.** It changes when a
+doc comment does. Measured while building this: adding a whole module and editing `main.rs` moved
+the binary hash from `94f25712…` to `333e2c62…` and left the fingerprint at `abf86a50`, because the
+encoder's output had not moved. A check that fires on every rebuild is a check nobody reads.
+
+Validated against knobs whose effect was already measured elsewhere:
+
+| knob | does output move? | fingerprint |
+|---|---|---|
+| `GNC_REF_FROM_SOURCE=0` | **no** — 24 of 24 sequence points byte-identical (`0072`) | **unchanged** |
+| `GNC_PAD_FILL=decay` | yes | changed |
+| `GNC_DEAD_ZONE=0.3` | yes | changed |
+| `GNC_REF_DEBLOCK=1` | yes | changed |
+
+**Two uses, and a harness wants both.** Print it beside the numbers so a later reader can tell
+whether a published table is still comparable — that is instances 2, 3, 5, 6 and 7. And take it
+before *and* after a sweep, so a mid-run rebuild is a refusal rather than a plausible table — that
+is instance 4, the near-miss that this repository got away with by luck.
+
+```python
+import fingerprint                       # scripts/fingerprint.py
+fp = fingerprint.read(GNC)               # print it with the numbers
+...                                      # the sweep
+fingerprint.check_unchanged(GNC, fp)     # exits if the binary was rebuilt underneath it
+```
+
+```bash
+FP=$(gnc fingerprint 2>/dev/null | grep -o 'v1 [0-9a-f]*')      # a shell loop needs no harness
+... your loop ...
+[ "$FP" = "$(gnc fingerprint 2>/dev/null | grep -o 'v1 [0-9a-f]*')" ] || echo "REBUILT MID-RUN"
+```
+
+`scripts/meas_rate4.py` and `scripts/rate4_ref_source_gate.py` do both already; copy from either.
+
+**What it does not do, stated because a check believed past its range is worse than none.** It
+cannot say *why* two fingerprints differ. It says nothing about a path outside its matrix — the
+matrix crosses entropy coder, chroma format, the lossless boundary and inter, and it is not
+exhaustive. It protects only numbers that carry it, which is the same adoption problem the prose
+has, met with one command instead of a paragraph. And **the matrix is pinned**: changing it changes
+every fingerprint ever published, so it carries `MATRIX_VERSION` and a change to it is a decision
+record, not a commit.
 
 ### The worked example, kept because it shows all three habits failing at once
 
@@ -596,6 +670,7 @@ If this table and `scripts/claim list` disagree, the table is wrong.
 | `../gnc-refdiff` | `refdiff` | **RATE-3 DONE 2026-09-08.** `0036`'s sequence gate lifted; mean **−4.28%** of sequence bytes (3 sequences × q ∈ {95,99} × ki ∈ {2,9}), best −13.16%, worst ΔP −0.01 dB, I-frames bit-exact through a real `encode-sequence` → `decode-sequence` md5 round trip. The gate was hiding the *mirror image* of `0040`'s bug: `encode_once` leaves only the **last** candidate's quantised planes in the side channel `local_decode_iframe_gpu` reads, so a kept *bit-exact* frame got the lossy candidate's — P-frames at 5.93 dB. `encode_as_reference` re-runs whichever was kept, at a third encode on those frames. Stills byte-identical. bbb q=99 regresses +0.4/+0.58% → **RATE-4** (with `0040` point 4's source-copy reference, whose refutation is confounded by BUG-39 cause 2). Decision `0044`.  **Its mean is now −6.09%, not −4.28%, and its two regressions are gone — RATE-4 found they were BUG-47** (`lossless_sibling` did not carry `pad_fill_decay`, so the bit-exact candidate was coded with a still's padding while acting as a reference). `docs/decisions/0072`. The decision is unchanged; only the price was wrong. |
 | `../gnc-next3` | `next3` | **DOC-3 DONE 2026-09-08.** `claim next` reported all 14 startable items held by *live* sessions (eight started within minutes; every holder's pid alive, so nothing stealable), so this went to the section that decides what the queue contains: BACKLOG's **priority order**, stale on **5 of 6** items — PAD-1/INTRA-2 both shipped, LOSSLESS-1 "buildable now" built two days earlier, CANARY-1 "never measured" DONE at 34x, BUG-14 DONE, abac's inter figure superseded by `0045`. GOALS/README/BASELINE/LOOP/CLAUDE carry **none** of the six. The one finding that is not a correction: item 1's "next largest known intra lever is still unbuilt" pointed at `--abac`, which is **built** and worth −16.6% to −18.8% of intra rate — and *making it the default had never been a heading with an ID*, so `claim next` could not offer the largest built lever in the codec. Filed **ENT-10 (P2)**, parked `blocked-idle-machine` (needs abac GPU encode ms/frame — ENT-5's criterion 3 — and a re-take of `0017`'s 1.69× decode). Documentation only; no code, no shader, no measurement. Decision `0060`. **Then COORD-3, caused by that filing:** the ENT-3 session had filed a *different* `### ENT-9` 16 min earlier, so two startable headings shared one id and `refs/claims/ENT-9` could lock only one — the other goes invisible to `next`. Fifth instance of the `0050` mechanism, first inside BACKLOG. Shipped **`scripts/claim id <PREFIX>`** (any prefix, mention-counts-as-taken; `claim bug` is now its shorthand) plus a duplicate-id warning in `items`/`next`, selftest extended 2 → 4 properties, **DOC-3's heading renumbered ENT-9 → ENT-10** (theirs was first and is held) and DOC-3's ENT-9 canary **withdrawn** as unreadable off an ambiguous ref. Touches `scripts/claim` — **overlaps BUG-19** (`gnc-drnum`), which is renumbering the `0018`/`0024` decision-record pairs; nothing here changes `docs/decisions/` numbering. Decision `0065`. **Then LOSSLESS-2 (DONE):** at `q=100` a P-frame that serialises larger than the previous I-frame is re-coded as an I-frame — camera content **−27.6% to −41.0%** of sequence rate at identical (bit-exact) pixels, animation **±0** (bbb keeps every P-frame), shipped output equal to the per-frame minimum on 8 of 8 points. 32/32 frames still md5-identical to source through the container; q=90 and q=99 byte-identical. Per-frame beats *both* per-sequence answers on a synthetic shot cut (25 562 037 B against 32 938 051 / 25 879 801). Touches `src/encoder/sequence.rs` (P-only branch) — **overlaps nothing held**, but RATE-4/`refdiff` and BUG-39/`losslessp` are in the same file's neighbourhood. New BASELINE section (lossless sequences). Filed **LOSSLESS-3 (P1)**: q=95-99 sequences are now dominated by bit-exact on camera content, +22.6% to +51.7%. Decision `0070`. |
 | `../gnc-nextitem` | `nextitem` | **BUG-35 (partial) 2026-09-08.** Left a three-session pile-up on BUG-32; `claim next` handed this. Guarded the fused/rANS histogram arena (`check_hist_arena_capacity`, 5120). Measured `--rans` stills: q=15 fits at 313–335 bins; q=70 fits at 3428; q≥85 refuses at 5322–7004 (was silent corruption). **Shrinking to ≤3266 rejected** — it would refuse the q=70 `--rans` point `0035` shipped. Five over-budget rANS entry points remain. Decision `0048`. |
+| `../gnc-drnum` | `drnum` | **COORD-6 ANSWERED 2026-09-08 — a cheap mechanism does exist: `gnc fingerprint`.** `docs/decisions/0075`. **Invalidates no measurement** — a CLI subcommand, a library module and two lines in two harnesses; no encoder path touched, and the shipped encoder's own fingerprint is unchanged by the work, which the tool asserts. It encodes a **pinned, versioned** 10-configuration matrix and digests the bytes, answering *would this binary produce different output?* in **0.52 s** — the honest test the item assumed was too expensive. **It beats the proxy this repo already prints, and the demonstrating pair came out of building it:** adding a whole module moved `shasum target/release/gnc` from `94f25712…` to `333e2c62…` and left the fingerprint at `abf86a50`. Silent under `GNC_REF_FROM_SOURCE=0` (byte-identical by measurement, `0072`), fires under `GNC_PAD_FILL` / `GNC_DEAD_ZONE` / `GNC_REF_DEBLOCK`. Against COORD-4's list it catches all seven if the rows carry it, against 1 of 7 and 0 of 7 for the two tools COORD-4 refused — and **instance 7 is new** (LOSSLESS-3's lossy columns hold bit-exact I-frames that BUG-47 moved hours later; its P1 conclusion survives, its margins are overstated), reported by the RATE-3 session and flagged to that item's owner rather than edited. **Not mandatory, deliberately:** matrix coverage is unproven outside those four knobs, and a check believed past its range is worse than none. Two implementation traps recorded: determinism is the product (now asserted), and hash-noise content made two of the ten rows code to identical bytes, so a row collision is now a test failure. |
 | `../gnc-drnum` | `drnum` | **RATE-4 DONE 2026-09-08 — the regression was the sibling's padding, not the ledger.** `docs/decisions/0072`. **BUG-47:** `lossless_sibling` did not carry `pad_fill_decay`, so a bit-exact I-frame kept at q = 95..=99 was coded with **decay-filled** padding while the sequence encoder had cleared that flag for every frame something predicts from (`0039`). One line, and RATE-3's twelve points go from **mean −4.28% / worst +0.58% / 2 of 12 worse than control** to **mean −6.09% / best −16.19% / worst +0.00% / 0 of 12**, worst P move unchanged at −0.01 dB — **RATE-4's criterion met in full.** **Invalidates RATE-3's and `0044`'s rate figures** (noted in both, plus BASELINE); 4:2:2 and 4:2:0 move the same way by an unmeasured amount; **stills are byte-identical** and that is checked, not argued. Also shipped: a bit-exact frame's reference is built from its **colour-converted source**, so RATE-3's third encode is gone — **24 of 24 sequence points byte-identical**, route fired 52×, refused on 4:2:0 and in the forced-off arm (`scripts/rate4_ref_source_gate.py`); the win is a count, not a time (`0058`). **How BUG-47 was found:** that route was the first thing ever to compare the two candidates' preprocessing — it was byte-identical at q=100 and moved bytes on 10 of 24 fallback points, and `GNC_PAD_FILL=replicate` named the cause in one run. **`0068`'s per-GOP ledger is retired unbuilt** (0 of 38 flips after the fix). Also filed: **BUG-45** — `is_lossless()` is a claim about the settings, not the input; fractional `f32` at q=100 is silently lossy (max 254.0039 against the source), which is the whole content of RATE-4's blocking row. Warned, not refused. Earlier in this worktree: BUG-19 fixed (four colliding decision-record numbers renumbered, `0059`), BUG-41 filed and closed as a COORD-3 duplicate, RATE-4's ledger measured (`0068`). |
 | `../gnc-drnum` | `drnum` | **BUG-19 FIXED 2026-09-08 — the four colliding decision-record numbers are renumbered.** `0018`→**`0055`**, `0019`→**`0056`**, `0024`→**`0057`**, `0027`→**`0058`**; the earlier-committed half of each pair kept the number, which in `0024` and `0027` is also the half that reserved it. **Invalidates no measurement** — prose plus one `///` comment in `entropy_helpers.rs`; gates run to prove it still compiles. 31 citation sites repointed and about as many left alone deliberately, because **the keepers are the more-cited half in every pair**: nearly every `0024` in the tree is INTRA-1's ≤7.5% bound, not ENT-5's encoder, so a blind replace would have broken 30 correct citations to fix 31 wrong ones. **Two citations were already wrong before this started** — RESEARCH_LOG's MEAS-9 entry cited "decision 0020 (GNC is broad on purpose)" twice, and `0020` is the colour-lead withdrawal; the number had been vacated by the hand renumbering hours earlier and nobody noticed for a day. Commit messages keep the old numbers and are **not** rewritten; instead all eight files carry a header note naming the other half and the dates the collision was live. Decision `docs/decisions/0059`. Also fixed one pre-existing broken markdown link; a link check over every `.md` now reports zero. |
 | `../gnc-dx12bidir` | `dx12bidir` | **BUG-34 DONE 2026-09-08.** Storage-buffer request 10 → **9** (`gnc::required_limits()`). `block_match_bidir.wgsl` binds 9, nothing else above 7, so 10 was slack; 8 still needs a merge in that file, refused because BUG-40 holds it, B-frames are off, and it is BUG-25's crash site. Decision `0047`. Test `tests/requested_limits.rs` asserts the whole `Limits` struct against default plus that one field. No shader change, no measurement moved. Worktree name predates the claim (`next` handed BUG-34 after a multi-session BUG-32 pile-up). |

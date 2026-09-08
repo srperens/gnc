@@ -416,6 +416,22 @@ enum Command {
     /// Names printed here are what `GNC_GPU_ADAPTER` matches against (substring,
     /// case-insensitive), so this is the first command to run on a new machine.
     GpuInfo,
+    /// Print a behavioural fingerprint of this binary's encoder: what it *produces*, not what it is.
+    ///
+    /// **COORD-6.** Five of the seven recorded measurement failures in this repository are one
+    /// session's table decaying because `main` moved under it, so its early rows and late rows come
+    /// from different codecs. Nothing errors; the numbers are simply from two encoders and read as
+    /// one. `shasum` of the binary cannot help — it changes when a doc comment does — and a
+    /// claim-time commit stamp caught 1 of 6 (COORD-4).
+    ///
+    /// This runs the only honest test there is, output equality, on a pinned matrix small enough to
+    /// be free: print it beside a number and any later reader can tell whether two tables are
+    /// comparable. Print it before *and* after a sweep and a mid-run rebuild becomes visible.
+    Fingerprint {
+        /// Print each configuration's own digest and coded size.
+        #[arg(long)]
+        verbose: bool,
+    },
 
     /// Run encode-decode benchmark on an image
     Benchmark {
@@ -1146,6 +1162,30 @@ fn main() {
             println!("Decoded to {}", output);
         }
 
+        Command::Fingerprint { verbose } => {
+            let ctx = pollster::block_on(gnc::GpuContext::try_new_async()).expect(
+                "no GPU adapter; a fingerprint describes an encoder, so there is no meaningful \
+                 answer without one",
+            );
+            let fp = gnc::fingerprint::compute(&ctx);
+            if verbose {
+                for row in &fp.rows {
+                    println!("  {:<20} {:>9} B  {:08x}", row.name, row.bytes, row.crc);
+                }
+            }
+            println!(
+                "codec-fingerprint {} {:08x}  ({} configurations)",
+                gnc::fingerprint::MATRIX_VERSION,
+                fp.digest,
+                fp.rows.len(),
+            );
+            println!(
+                "  This is what the encoder PRODUCES on a pinned matrix, so two numbers carrying \
+                 the same\n  fingerprint are comparable and two carrying different ones are not. \
+                 It does not cover\n  every path: a change that moves output only outside the \
+                 matrix will not show here."
+            );
+        }
         Command::GpuInfo => {
             let adapters = gnc::list_adapters();
             if adapters.is_empty() {

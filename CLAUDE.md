@@ -37,17 +37,24 @@ Modular pipeline with swappable stages:
    - **Bitplane** (parked): block-based, fully parallel decode
    - **abac** (`--abac`): adaptive binary arithmetic coding over 64px code-blocks, GPU encode
      *and* GPU decode (one thread per code-block on both sides, since ENT-5), with the CPU coder
-     in `abac.rs` as the reference both are verified byte-exact against. −16.6% to −18.8% of rate
-     against Rice at *identical pixels*, for ~1.69× frame decode, and on P-frame bytes **−21.6% to
-     −3.7% over q=50-99 — the saving decays monotonically with quality**, so it is under −4.5% at
-     q=99 on two of three sequences, which is GNC's own range (ENT-3, `0045`). The figure that
-     stood here, "−12.0% to −22.9%", was `0025`'s: its q=90 column reproduces exactly on a pinned
-     build of its own commit and its q=50 and q=75 columns were taken before INTER-2 halved the
-     inter dead zone, so those two are superseded. Opt-in —
-     `docs/decisions/0017`, `0057` for the encoder's two judgement calls, `0045` for the inter
-     figure (superseding `0025`'s). **Encode time per
+     in `abac.rs` as the reference both are verified byte-exact against. Since **ENT-9 (`0074`)
+     the Exp-Golomb unary prefix is context-coded** on (position, bucket) rather than bypassed —
+     bitstream generation **GP19**, and a GP18 abac frame is refused rather than misread. That was
+     worth **−2.07% to −8.76% of total rate at q=99**, −1.26% to −4.56% at q=95 and −0.85% to
+     −2.75% at q=90, measured before/after on one binary pair at bit-identical pixels.
+     **Against Rice on today's `main`, total rate: −12.3% to −16.0% at q=99**, −13.6% to −18.5%
+     at q=95, −14.3% to −20.4% at q=90 (three sequences, 18 frames, ki=9, 4:4:4), for ~1.69×
+     frame decode.
+     **`0045`'s "the saving decays monotonically with quality, under −4.5% at q=99" is
+     superseded** — P-frame bytes at q=99 now read −12.1% / −15.8% / −12.3%. Attribute that
+     carefully: ENT-9's own controlled contribution is the first figure above, and the rest of
+     the distance from `0045` is everything else that landed between (RATE-3, INTER-2, BUG-39,
+     LOSSLESS-2) plus a different denominator — `0045` reproduces on its own commit, which makes
+     it a change log rather than an error, its own lesson. Opt-in —
+     `docs/decisions/0017`, `0057` for the encoder's two judgement calls, `0074` for the prefix
+     contexts, `0045` for the inter figure it superseded (`0025`'s). **Encode time per
      frame is not yet measured on an idle machine**, so 0017's reason 2 has lost its mechanism but
-     kept its number.
+     kept its number, and only the *rate* half of its case has moved.
 5. Video: I/P/B frames, half-pel motion estimation, hierarchical block matching, CBR/VBR rate control
 6. Container: GNV1 sequence format with frame index, keyframe seeking, error resilience (per-tile CRC-32)
 

@@ -2162,6 +2162,37 @@ Every edit is in `#[cfg(test)]` code or an integration test target, checked file
 each file's `#[cfg(test)]` marker, so the shipped build is unchanged by construction and no
 figure in BASELINE moves.
 
+### MEAS-11 — BASELINE's `--abac` BD-rate row is conservative after ENT-9 (todo, P3)
+
+BASELINE's contribution ladder carries two rows against x264 at matched PSNR-Y — Rice at
+**+89.2%** mean and **`--abac` at +66.0%** ("1.9x the bitrate of H.264 … `--abac` is 1.66x"),
+pinned to `0a1b055`, 1920x1080, 17 frames, ki=9, 4:2:0, q = 85/92/96/99 against crf = 1/2/4/8.
+
+**ENT-9 (`0074`) made abac cheaper across that whole ladder**, so the `--abac` row and the 1.66x
+both improve by an unknown amount. Measured on the change itself, 18 frames, ki=9, 4:4:4, three
+sequences: total rate **−2.07% to −8.76% at q=99**, **−1.26% to −4.56% at q=95**, **−0.85% to
+−2.75% at q=90**. The ladder's rungs sit inside that range, so the row is *conservative* rather
+than wrong — the direction is known and only the size is not.
+
+**The Rice row is unaffected** and still holds: ENT-9 touches entropy type 5 only, and
+`gp19_rice_frames_are_gp18_payloads_with_a_new_label` asserts a Rice frame's payload is unchanged.
+
+**Deliberately not re-taken as part of ENT-9, and the reason is the point.** Today's `main` also
+carries RATE-3, BUG-39, INTER-2, LOSSLESS-2 and more. A ladder run now would attribute all of it
+to ENT-9 — which is the failure **COORD-6** was filed for, in the same afternoon. So:
+
+- **Pin a commit first** and say which, the way BASELINE's existing rows do (`0a1b055`).
+- **Re-take both rows on the same binary**, even though Rice has not moved. One binary is what
+  makes the two comparable, and BASELINE's own note says the `--abac` arm is "same pixels as Rice
+  at every rung (PSNR-Y identical to two decimals)" — that canary should be re-run, not inherited.
+- **Mind `0036`'s warning**: this ladder reaches q≥95, where the lossy top now flattens onto the
+  lossless point and `bd_rate` drops non-finite PSNR, so it is computed over fewer points than it
+  once was. Do not compare the new figure against a pre-RATE-2 one.
+- Read `docs/decisions/0074` for what moved and what did not.
+
+Filed 2026-09-08 by the `loopa` session on shipping ENT-9, rather than leaving a stale headline
+figure with no note attached.
+
 ### COORD-5 — `claim list` could not say whether 4 of 15 holders existed (**FIXED 2026-09-08**)
 
 COORD-1 put the pid in a claim's identity so *"an abandoned claim is detectable rather than merely
@@ -6694,7 +6725,45 @@ is an afternoon with an existing harness. Against that: the throughput half cann
 a shared machine at all (COORDINATION), and the rate gate may kill it before the shader work
 starts — which is why the gate is first.
 
-### ENT-9 — abac context-codes three decisions and bypasses the rest (**step 1 + step 2 milestone 1 DONE 2026-09-08**, bitstream half todo, P2)
+### ENT-9 — abac context-codes the Exp-Golomb prefix: −2.1% to −8.8% of total rate at q=99 (**DONE 2026-09-08**)
+
+**SHIPPED 2026-09-08. Candidate A is in the bitstream; the gate is met on three of three and
+the pixels are verified identical. Decision `docs/decisions/0074`.**
+
+| sequence (q=99) | step 1b bound | milestone 1, adaptation charged | **shipped, total rate** |
+|---|---|---|---|
+| crowd_run | −8.20% | −8.37% | **−8.04%** |
+| bbb_extended | −2.44% | −2.49% | **−2.07%** |
+| old_town_cross | −9.07% | −8.70% | **−8.76%** |
+
+18 frames, ki=9, 4:4:4, whole container. **Each realised figure lands just under its bound, by
+0.16 to 0.37 points** — the only direction that makes sense, and `0063` predicted it in as many
+words. Also −1.26% to −4.56% at q=95 and −0.85% to −2.75% at q=90; I-frame bytes move too
+(−2.74% to −6.23%), so it is not an inter result.
+
+**Verified three ways, which is what a bitstream change costs here.** `ent5_gpu_encode_gate.sh`
+**98 of 98 identical** (GPU encoder against the CPU reference, both engines, q=90/99/100,
+4:4:4/4:2:2/4:2:0, cb=16/32/64, sequence path ki=1 and 9); **pixels bit-identical on 6 of 6 arms**
+(3 sequences × q∈{99,90} × 18 frames, GPU encode → GPU decode, per-frame hashes); 270 tests pass,
+both clippy targets clean. Workgroup storage was the constraint checked *before* writing code:
+`probs` is `WG * NUM_CONTEXTS`, so 18 → 42 contexts took **6400 B → 9472 B** against the 16384 B
+budget on all four entry points.
+
+**Bitstream generation GP18 → GP19, and GP18 abac frames are refused rather than decoded** — the
+two binarisations differ only in how bits are modelled, so misreading one as the other gives a
+plausible wrong image, the failure `abac_tile.rs` warns about. Every other coder is unaffected and
+`gp19_rice_frames_are_gp18_payloads_with_a_new_label` asserts it.
+
+**Against Rice on today's `main`, total rate: −12.3% to −16.0% at q=99**, −13.6% to −18.5% at
+q=95, −14.3% to −20.4% at q=90. **That supersedes `0045`'s "under −4.5% at q=99"** (P bytes now
+−12.1% / −15.8% / −12.3%) — but attribute it carefully: ENT-9's own controlled contribution is the
+table above, and the remaining distance is everything else that landed between plus a different
+denominator. **BASELINE's `--abac` row and its 1.66x are now conservative; re-take filed as
+MEAS-11**, deliberately not run here because today's `main` would credit RATE-3, BUG-39 and
+LOSSLESS-2 to ENT-9 (COORD-6's failure, same afternoon).
+
+**Candidate B (sign contexts) is still unspent and is now cheaper to re-price**, since A moved the
+denominator. It was below the gate at −0.57% to −1.29%; re-price before building.
 
 **Step 1 is answered and the item is not small. Decision record `0063`.** At q=99, **75.1% /
 75.5% / 43.6% of abac's own bits are bypassed** — sent at p=1/2 with no model at all — so the

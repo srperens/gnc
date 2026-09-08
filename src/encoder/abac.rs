@@ -56,6 +56,25 @@ const THREE_QUARTER: u32 = HALF + QUARTER;
 pub(crate) const NUM_BUCKETS: usize = 6;
 /// Contexts: one bucket set per binary decision (significant, >1, >2).
 const NUM_CONTEXTS: usize = NUM_BUCKETS * 3;
+/// Positions the Exp-Golomb unary prefix distinguishes, the last one saturating.
+pub(crate) const PREFIX_POSITIONS: usize = 4;
+/// Where the prefix contexts start: they are appended after the 18, so the existing indices and
+/// their meaning are unchanged.
+pub(crate) const PREFIX_BASE: usize = NUM_CONTEXTS;
+/// Every context the coder holds: 18 shipped plus 24 for the prefix (ENT-9 candidate A).
+pub(crate) const NUM_CONTEXTS_ALL: usize = NUM_CONTEXTS + NUM_BUCKETS * PREFIX_POSITIONS;
+
+/// Context for unary prefix decision `position` under neighbourhood bucket `ctx`.
+///
+/// The Exp-Golomb prefix is a unary code, so its bit `i` *is* the decision "is the magnitude past
+/// threshold `i`" — modelling it is the general form of adding more `>k` decisions, which is why
+/// `0063` collapsed two of ENT-9's three candidates into this one. Position saturates at
+/// `PREFIX_POSITIONS - 1` because the deep positions are rare and would otherwise cold-start
+/// contexts that never see enough symbols to pay for themselves.
+#[inline]
+pub(crate) fn prefix_ctx(position: u32, ctx: usize) -> usize {
+    PREFIX_BASE + (position as usize).min(PREFIX_POSITIONS - 1) * NUM_BUCKETS + ctx
+}
 
 /// One adaptive binary probability, as P(bit == 0) scaled to `PROB_ONE`.
 #[derive(Clone, Copy)]
@@ -341,8 +360,11 @@ pub(crate) fn neighbour_sum(mag: &[u32], w: usize, y: usize, x: usize) -> u32 {
 /// Encode one code-block of quantised coefficients.
 ///
 /// Binarisation per coefficient: significant?, |v|>1?, |v|>2?, then the remainder as Exp-Golomb
-/// order 0 and the sign, both as bypass bits. Only the three decisions are context-coded, which is
-/// where the measured gain sits; bypassing the rest keeps the context count at 18.
+/// order 0 and the sign. **The unary prefix of that remainder is context-coded** on (position,
+/// bucket) — ENT-9 candidate A, 24 contexts on top of the 18 — because at q=99 three quarters of
+/// abac's own bits were bypassed and the prefix was 58.5% of them (`0063`). The mantissa and the
+/// sign stay bypassed: the mantissa is the low bits of a magnitude with no causal information
+/// about it, and the sign was priced at −0.57% to −1.29%, below ENT-9's gate (candidate B).
 pub fn encode_block(coefficients: &[i32], width: usize) -> Vec<u8> {
     assert!(width > 0, "code-block width must be non-zero");
     assert_eq!(
@@ -352,7 +374,7 @@ pub fn encode_block(coefficients: &[i32], width: usize) -> Vec<u8> {
         coefficients.len()
     );
     let height = coefficients.len() / width;
-    let mut probs = [Prob::new(); NUM_CONTEXTS];
+    let mut probs = [Prob::new(); NUM_CONTEXTS_ALL];
     let mut enc = Encoder::new();
     let mut mag = vec![0u32; coefficients.len()];
 
@@ -367,13 +389,19 @@ pub fn encode_block(coefficients: &[i32], width: usize) -> Vec<u8> {
                 if a > 1 {
                     enc.encode(a > 2, &mut probs[2 * NUM_BUCKETS + ctx]);
                     if a > 2 {
-                        // Exp-Golomb order 0 of (a - 3), MSB-first, as bypass bits.
+                        // Exp-Golomb order 0 of (a - 3): context-coded unary prefix,
+                        // bypassed mantissa.
                         let n = a - 3 + 1;
                         let len = 32 - n.leading_zeros();
-                        for _ in 0..len - 1 {
-                            enc.encode_bypass(false);
+                        // Unary prefix: `len - 1` "keep going" then one "stop", each in its own
+                        // (position, bucket) context instead of at p = 1/2 (ENT-9 candidate A).
+                        for i in 0..len {
+                            enc.encode(i == len - 1, &mut probs[prefix_ctx(i, ctx)]);
                         }
-                        for i in (0..len).rev() {
+                        // Mantissa: the low `len - 1` bits of `n`, MSB-first, still bypassed.
+                        // They are the low bits of a magnitude and carry no causal information
+                        // about it, so a context would only cost adaptation.
+                        for i in (0..len - 1).rev() {
                             enc.encode_bypass((n >> i) & 1 != 0);
                         }
                     }
@@ -390,7 +418,7 @@ pub fn encode_block(coefficients: &[i32], width: usize) -> Vec<u8> {
 pub fn decode_block(bytes: &[u8], count: usize, width: usize) -> Vec<i32> {
     assert!(width > 0, "code-block width must be non-zero");
     let height = count / width;
-    let mut probs = [Prob::new(); NUM_CONTEXTS];
+    let mut probs = [Prob::new(); NUM_CONTEXTS_ALL];
     let mut dec = Decoder::new(bytes);
     let mut out = vec![0i32; count];
     let mut mag = vec![0u32; count];
@@ -404,16 +432,16 @@ pub fn decode_block(bytes: &[u8], count: usize, width: usize) -> Vec<i32> {
                 if dec.decode(&mut probs[NUM_BUCKETS + ctx]) {
                     a = 2;
                     if dec.decode(&mut probs[2 * NUM_BUCKETS + ctx]) {
-                        // Exp-Golomb order 0
-                        let mut zeros = 0u32;
-                        while !dec.decode_bypass() {
-                            zeros += 1;
-                            if zeros > 32 {
+                        // Unary prefix, context-coded; the stop bit ends it.
+                        let mut len = 1u32;
+                        while !dec.decode(&mut probs[prefix_ctx(len - 1, ctx)]) {
+                            len += 1;
+                            if len > 32 {
                                 return out; // corrupt or truncated
                             }
                         }
                         let mut n = 1u32;
-                        for _ in 0..zeros {
+                        for _ in 0..len - 1 {
                             n = (n << 1) | u32::from(dec.decode_bypass());
                         }
                         a = n - 1 + 3;
@@ -594,7 +622,7 @@ pub fn encode_block_rc(coefficients: &[i32], width: usize) -> Vec<u8> {
         coefficients.len()
     );
     let height = coefficients.len() / width;
-    let mut probs = [RC_PROB_ONE / 2; NUM_CONTEXTS];
+    let mut probs = [RC_PROB_ONE / 2; NUM_CONTEXTS_ALL];
     let mut enc = RangeEncoder::new();
     let mut mag = vec![0u32; coefficients.len()];
 
@@ -611,10 +639,15 @@ pub fn encode_block_rc(coefficients: &[i32], width: usize) -> Vec<u8> {
                     if a > 2 {
                         let n = a - 3 + 1;
                         let len = 32 - n.leading_zeros();
-                        for _ in 0..len - 1 {
-                            enc.encode_bypass(false);
+                        // Unary prefix: `len - 1` "keep going" then one "stop", each in its own
+                        // (position, bucket) context instead of at p = 1/2 (ENT-9 candidate A).
+                        for i in 0..len {
+                            enc.encode(i == len - 1, &mut probs[prefix_ctx(i, ctx)]);
                         }
-                        for i in (0..len).rev() {
+                        // Mantissa: the low `len - 1` bits of `n`, MSB-first, still bypassed.
+                        // They are the low bits of a magnitude and carry no causal information
+                        // about it, so a context would only cost adaptation.
+                        for i in (0..len - 1).rev() {
                             enc.encode_bypass((n >> i) & 1 != 0);
                         }
                     }
@@ -631,7 +664,7 @@ pub fn encode_block_rc(coefficients: &[i32], width: usize) -> Vec<u8> {
 pub fn decode_block_rc(bytes: &[u8], count: usize, width: usize) -> Vec<i32> {
     assert!(width > 0, "code-block width must be non-zero");
     let height = count / width;
-    let mut probs = [RC_PROB_ONE / 2; NUM_CONTEXTS];
+    let mut probs = [RC_PROB_ONE / 2; NUM_CONTEXTS_ALL];
     let mut dec = RangeDecoder::new(bytes);
     let mut out = vec![0i32; count];
     let mut mag = vec![0u32; count];
@@ -645,15 +678,16 @@ pub fn decode_block_rc(bytes: &[u8], count: usize, width: usize) -> Vec<i32> {
                 if dec.decode(&mut probs[NUM_BUCKETS + ctx]) {
                     a = 2;
                     if dec.decode(&mut probs[2 * NUM_BUCKETS + ctx]) {
-                        let mut zeros = 0u32;
-                        while !dec.decode_bypass() {
-                            zeros += 1;
-                            if zeros > 32 {
+                        // Unary prefix, context-coded; the stop bit ends it.
+                        let mut len = 1u32;
+                        while !dec.decode(&mut probs[prefix_ctx(len - 1, ctx)]) {
+                            len += 1;
+                            if len > 32 {
                                 return out;
                             }
                         }
                         let mut n = 1u32;
-                        for _ in 0..zeros {
+                        for _ in 0..len - 1 {
                             n = (n << 1) | u32::from(dec.decode_bypass());
                         }
                         a = n - 1 + 3;

@@ -321,6 +321,15 @@ only the bytes moved. That is the canary the path ran. Saving vs Rice decays wit
 (crowd_run −12.2% at q=85 to −3.7% at q=99), which is ENT-3's finding on this ladder.
 Rice stays the default; quote **+89.2%** unless the command included `--abac`.
 
+> **The `--abac` row and the 1.66x are conservative as of 2026-09-08 — ENT-9 (`0074`) made abac
+> cheaper across this whole ladder.** Measured on that change: total rate **−2.07% to −8.76% at
+> q=99**, −1.26% to −4.56% at q=95, −0.85% to −2.75% at q=90 (three sequences, 18 frames, ki=9,
+> 4:4:4). Every rung here sits inside that range, so the direction is known and only the size is
+> not. **The Rice row is unaffected** — ENT-9 touches entropy type 5 only. Not re-taken with the
+> change, because today's `main` also carries RATE-3, BUG-39, INTER-2 and LOSSLESS-2, and a ladder
+> taken now would credit all of it to ENT-9 (the failure COORD-6 was filed for). Re-take is
+> **MEAS-11**, on a pinned commit.
+
 The move from QUAL-1's +90.5% to +89.2% is **1.3 points**, all in the direction INTER-2
 predicted: only q=85 of this ladder sits in the inter-dead-zone change (q ≤ 88), so a
 −4.77% GNC-vs-GNC BD-rate on that one rung dilutes to about a point against x264. VMAF

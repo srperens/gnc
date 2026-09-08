@@ -1,4 +1,4 @@
-//! `EntropyCoder::Abac` end to end: encode → GP18 bitstream → GPU decode.
+//! `EntropyCoder::Abac` end to end: encode → GP19 bitstream → GPU decode.
 //!
 //! The property that makes these tests strong is that entropy coding is **lossless**. Rice and
 //! abac code the identical quantised coefficients, so a frame encoded either way must decode to
@@ -106,7 +106,7 @@ fn abac_decodes_to_the_same_pixels_as_rice_and_is_smaller() {
 }
 
 #[test]
-fn abac_frames_are_gp18_and_carry_entropy_type_5() {
+fn abac_frames_are_gp19_and_carry_entropy_type_5() {
     let ctx = gpu();
     let (w, h) = (256u32, 256u32);
     let img = synth_image(w, h);
@@ -116,7 +116,7 @@ fn abac_frames_are_gp18_and_carry_entropy_type_5() {
     let mut encoder = EncoderPipeline::new(ctx);
     let compressed = encoder.encode(ctx, &img, w, h, &config);
     let bytes = gnc::format::serialize_compressed(&compressed);
-    assert_eq!(&bytes[0..4], b"GP18", "abac frames must declare GP18");
+    assert_eq!(&bytes[0..4], b"GP19", "abac frames must declare GP19");
 
     let back = gnc::format::deserialize_compressed(&bytes);
     assert_eq!(back.config.entropy_coder, EntropyCoder::Abac);
@@ -339,12 +339,13 @@ fn abac_survives_a_p_frame_chain() {
     );
 }
 
-/// GP18's only addition is entropy type 5, so a GP18 frame using any older coder must be a GP17
-/// frame with a different label. Asserting that directly is worth more than believing it: relabel
-/// the magic, decode, and require the identical picture. It also exercises the other half —
-/// that the decoder still reads GP17, which is what every file written before today says.
+/// GP19's only change is *how* entropy type 5 codes its Exp-Golomb prefix, so a GP19 frame using
+/// any other coder must be a GP18 frame with a different label. Asserting that directly is worth
+/// more than believing it: relabel the magic, decode, and require the identical picture. It also
+/// exercises the other half — that the decoder still reads GP18, which is what every file written
+/// before ENT-9 says.
 #[test]
-fn gp18_rice_frames_are_gp17_payloads_with_a_new_label() {
+fn gp19_rice_frames_are_gp18_payloads_with_a_new_label() {
     let ctx = gpu();
     let (w, h) = (256u32, 256u32);
     let img = synth_image(w, h);
@@ -354,19 +355,19 @@ fn gp18_rice_frames_are_gp17_payloads_with_a_new_label() {
     let mut encoder = EncoderPipeline::new(ctx);
     let compressed = encoder.encode(ctx, &img, w, h, &config);
     let mut bytes = gnc::format::serialize_compressed(&compressed);
-    assert_eq!(&bytes[0..4], b"GP18");
+    assert_eq!(&bytes[0..4], b"GP19");
 
     let decoder = DecoderPipeline::new(ctx);
+    let as_gp19 = decoder.decode(ctx, &gnc::format::deserialize_compressed(&bytes));
+
+    bytes[0..4].copy_from_slice(b"GP18");
     let as_gp18 = decoder.decode(ctx, &gnc::format::deserialize_compressed(&bytes));
 
-    bytes[0..4].copy_from_slice(b"GP17");
-    let as_gp17 = decoder.decode(ctx, &gnc::format::deserialize_compressed(&bytes));
-
     assert_eq!(
-        as_gp18, as_gp17,
-        "relabelling a Rice frame GP18 → GP17 changed the decode, so GP18 moved something other \
-         than the magic — either the generation added a field it should not have, or the decoder \
-         gates a field on gen >= 18 that older files also carry"
+        as_gp19, as_gp18,
+        "relabelling a Rice frame GP19 → GP18 changed the decode, so GP19 moved something other \
+         than the magic and abac's prefix binarisation — either the generation added a field it \
+         should not have, or the decoder gates a field on gen >= 19 that older files also carry"
     );
 }
 

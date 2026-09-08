@@ -4,6 +4,100 @@
 
 ---
 
+## ENT-9 step 2 — abac context-codes the Exp-Golomb prefix, and the bound was honest (2026-09-08)
+
+**Hypothesis.** `0063` measured that abac bypasses 46.7–74.8% of its own bits at q=99 and priced
+candidate A — context-coding the Exp-Golomb unary prefix on (position, bucket), 24 contexts on
+top of 18 — at −2.44% to −9.07% of the coder's bits. Step 2 milestone 1 then showed it survives
+real per-block adaptation (±0.4 points). What was untested was the only thing ENT-9's gate asks
+about: **total rate on a real encode, at bit-identical pixels.**
+
+**Domain.** Quantised wavelet coefficients → abac's binarisation → bitstream. Three coders move
+together by construction: `abac.rs` (the CPU reference), `abac_encode.wgsl`, `abac_decode.wgsl`.
+
+**Success criterion, stated by the item before this session touched it:** ≥2% of **total rate** at
+q=99 on ≥3 sequences, at bit-identical pixels.
+
+**Result — met on three of three, and every figure lands just under its own bound.**
+
+| sequence (q=99) | `0063`'s bound | milestone 1, adaptation charged | **shipped, total rate** | gap |
+|---|---|---|---|---|
+| crowd_run | −8.20% | −8.37% | **−8.04%** | 0.16 |
+| bbb_extended | −2.44% | −2.49% | **−2.07%** | 0.37 |
+| old_town_cross | −9.07% | −8.70% | **−8.76%** | 0.31 |
+
+18 frames, ki=9, 4:4:4, whole container including the headers and motion vectors abac does not
+code. Before/after on one binary pair built from the same tree, so nothing else moved.
+
+**The 0.16–0.37 point shortfall is the result worth keeping.** The bound was ideal-adaptive with
+no signalling charged, and `0063` said to "expect the realisable figure lower". It is lower, by
+a fraction of a point, on all three. **A figure at or above the bound would have meant the bound
+was wrong** — and this project has been caught by exactly that shape before (the offline model
+that said 3→4 wavelet levels was worth 1.2% when the codec gave 6%, because the model could not
+see Rice adapting per subband). Here the model saw everything the coder does and the arithmetic
+agrees to a third of a point.
+
+Not only a q=99 effect: **−1.26% to −4.56% at q=95, −0.85% to −2.75% at q=90.** I-frame bytes
+move as well (−2.74% to −6.23%), which matches `0063`'s finding that intra bypasses the same
+three quarters, so this is not an inter result.
+
+**Bit-identical pixels, measured rather than argued.** 3 sequences × q ∈ {99, 90} × 18 frames,
+each arm encoded *and* decoded through GPU encode → GPU decode, compared on per-frame PNG hashes:
+**identical on 6 of 6 arms, 108 frames.** The change cannot move a pixel — same coefficients in
+and out — and this is the check that says so.
+
+**Byte-exact three ways, re-passing ENT-5's whole gate.** `scripts/ent5_gpu_encode_gate.sh`:
+**98 of 98 identical**, GPU encoder against the CPU reference across both arithmetic engines,
+q=90/99/100, three chroma formats, cb=16/32/64, and the sequence path at ki=1 and ki=9. Plus the
+three unit gates (`gpu_encode_matches_cpu_encoder_byte_for_byte`, `gpu_decode_matches_cpu_coder`,
+`gpu_encode_round_trips_through_gpu_decode`).
+
+**The constraint that could have killed the design was checked before any code was written.**
+`probs` is `WG * NUM_CONTEXTS` in workgroup storage, so 18 → 42 contexts multiplies it: measured
+**6400 B → 9472 B** per entry point against the 16384 B requested budget, on all four abac entry
+points. Had it not fit, the answer was a different context layout, not a bug fix — which is why
+it was the first thing measured rather than the first thing discovered.
+
+**Bitstream generation GP18 → GP19, and a GP18 abac frame is now refused.** The two binarisations
+differ only in *how* bits are modelled, so a GP18 abac frame decoded as GP19 comes back as a
+**plausible wrong image** rather than an error — the exact failure `abac_tile.rs` warns about in
+its own header. The entropy-type-5 gate moved from `gen >= 18` to `gen >= 19` with a message
+naming the cause; GP18 files on every other coder still decode, asserted by
+`gp19_rice_frames_are_gp18_payloads_with_a_new_label`.
+
+**One thing the diagnostics needed, and it was a canary firing correctly.** The invariant test
+`simulation_is_a_lower_bound_on_the_real_coder` failed immediately with `real 344 < simulated
+366`, because `adapt_bits` models the *old* binarisation and the coder had become cheaper than a
+model of a binarisation it no longer uses. Repointed at `adapt_bits_prefix_ctx`, which is now the
+model of the shipped coder. **`adapt_bits` is deliberately left alone** — it is ENT-8's instrument
+and that table's figures stay reproducible only while it models what they were taken on. The
+`coef_entropy_diag` column labels were inverted by the same shift and are relabelled.
+
+**Against Rice on today's `main`, and read this one carefully.** Total rate: **−12.3% to −16.0% at
+q=99**, −13.6% to −18.5% at q=95, −14.3% to −20.4% at q=90. On P-frame bytes at q=99: −12.1% /
+−15.8% / −12.3%, which **supersedes `0045`'s "the saving decays monotonically with quality, under
+−4.5% at q=99 on two of three"**. But ENT-9's own contribution is the controlled before/after
+above (−2.07% to −8.76%), and the rest of the distance from `0045` is everything else that landed
+in between — RATE-3, INTER-2, BUG-39, LOSSLESS-2 — plus a different denominator. `0045`'s figures
+reproduce on their own commit, which by its own lesson makes them a change log rather than an
+error. **Do not quote the difference as ENT-9's.**
+
+**BASELINE's `--abac` BD-rate row and its "1.66x against H.264" are now conservative, and are
+annotated rather than re-taken.** The ladder is q=85/92/96/99, squarely in range. Re-taking it
+today would credit RATE-3, BUG-39 and LOSSLESS-2 to ENT-9, which is precisely the failure
+**COORD-6** was filed for the same afternoon — so the re-take is filed as **MEAS-11**, to be run
+on a pinned commit, with both rows on one binary. The Rice row is unaffected.
+
+**Candidate B is still unspent and is now cheaper to re-price**, since A moved the denominator.
+`0063` had it at −0.57% to −1.29%, below the gate on three of three. Re-price before building.
+
+**Gates.** `cargo test --release -- --test-threads=1`: **270 passed, 0 failed, 9 ignored**.
+`cargo clippy --release --all-targets` clean; `cargo clippy --release --target
+wasm32-unknown-unknown --lib` clean. Decision `0074`. **No timing figure was taken** — the machine
+had seven other sessions on it, and every figure above is bytes or a hash.
+
+---
+
 ## COORD-7 — the answer was in the file's own history, and `CLAUDE_PID` was in the environment all along (2026-09-08)
 
 **What was open.** `0069` fixed the diagnostic for an unverifiable claim and left the cause,

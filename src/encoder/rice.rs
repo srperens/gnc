@@ -790,12 +790,24 @@ fn write_tile_varint(out: &mut Vec<u8>, val: u16) {
 }
 
 /// Read unsigned varint → u16.
+///
+/// Bounded to `VARINT_MAX_BYTES`, which is what `varint_size` can ever emit for a `u16`.
+/// Without that bound a corrupt tile made of `0x80` bytes drove `shift` past 31 and
+/// `(b & 0x7F) << shift` **panicked** — "attempt to shift left with overflow" — in any build
+/// with overflow checks on, and silently wrapped in one without, while `*pos` ran to the end
+/// of the buffer and took the rest of the parse with it. The comment below promised the
+/// opposite, which is the part worth noticing: the stopping condition was "ran out of data",
+/// and a corrupt tile does not run out of data, it runs out of *format*.
+///
+/// Past the end means a truncated or corrupt tile: stop rather than panic and let the
+/// tile CRC reject it. See `take_bytes`.
 fn read_tile_varint(data: &[u8], pos: &mut usize) -> u16 {
+    /// A u16 varint is at most 3 groups of 7 bits; `varint_size` agrees.
+    const VARINT_MAX_BYTES: usize = 3;
     let mut result = 0u32;
     let mut shift = 0;
-    // Past the end means a truncated or corrupt tile: stop rather than panic and let the
-    // tile CRC reject it. See `take_bytes`.
-    while let Some(&byte) = data.get(*pos) {
+    for _ in 0..VARINT_MAX_BYTES {
+        let Some(&byte) = data.get(*pos) else { break };
         let b = byte as u32;
         *pos += 1;
         result |= (b & 0x7F) << shift;
@@ -1026,11 +1038,11 @@ mod tests {
     #[test]
     fn test_rice_roundtrip_varied() {
         let mut coefficients = vec![0i32; 65536];
-        for i in 0..65536 {
+        for (i, c) in coefficients.iter_mut().enumerate() {
             let y = i / 256;
             let x = i % 256;
             let g = compute_subband_group(x as u32, y as u32, 256, 3);
-            coefficients[i] = match g {
+            *c = match g {
                 0 => ((x + y) % 40) as i32 + 10,
                 1 => {
                     if i % 5 == 0 {
@@ -1071,6 +1083,33 @@ mod tests {
 
         let decoded = rice_decode_tile(&deserialized);
         assert_eq!(coefficients, decoded);
+    }
+
+    /// A varint made of continuation bytes must not shift past 31.
+    ///
+    /// `read_tile_varint` returns a `u16`, so three bytes is the most a well-formed one can
+    /// take, but its loop used to run until the data ended: 12 bytes of `0x80` drove `shift`
+    /// to 77 and panicked with "attempt to shift left with overflow" wherever overflow checks
+    /// are on, having already consumed the whole buffer. Release builds wrapped instead, which
+    /// is why no test in `--release` could see it — so this test asserts the *position*, which
+    /// is wrong in both profiles.
+    #[test]
+    fn a_varint_of_continuation_bytes_stops_at_three_and_does_not_overflow_the_shift() {
+        let data = vec![0x80u8; 32];
+        let mut pos = 0usize;
+        let v = read_tile_varint(&data, &mut pos);
+        assert_eq!(pos, 3, "a u16 varint must never consume more than 3 bytes");
+        assert_eq!(v, 0, "all-continuation bytes carry no payload bits");
+
+        // And the well-formed cases still round-trip, at each of the three lengths.
+        for value in [0u16, 1, 0x7F, 0x80, 0x3FFF, 0x4000, u16::MAX] {
+            let mut buf = Vec::new();
+            write_tile_varint(&mut buf, value);
+            assert_eq!(buf.len(), varint_size(value));
+            let mut p = 0usize;
+            assert_eq!(read_tile_varint(&buf, &mut p), value, "varint {value}");
+            assert_eq!(p, buf.len());
+        }
     }
 
     /// A corrupt `k` byte must not become a shift distance.
@@ -1123,8 +1162,8 @@ mod tests {
     #[test]
     fn test_rice_negative_values() {
         let mut coefficients = vec![0i32; 65536];
-        for i in 0..65536 {
-            coefficients[i] = -((i % 10) as i32);
+        for (i, c) in coefficients.iter_mut().enumerate() {
+            *c = -((i % 10) as i32);
         }
 
         let tile = rice_encode_tile(&coefficients, 256, 3);
@@ -1214,7 +1253,7 @@ mod tests {
     /// A corrupt tile must parse without panicking so the per-tile CRC can reject it.
     #[test]
     fn corrupt_tile_parses_without_panic() {
-        let coefficients: Vec<i32> = (0..65536).map(|i| (i % 13) as i32 - 6).collect();
+        let coefficients: Vec<i32> = (0..65536).map(|i| (i % 13) - 6).collect();
         let tile = rice_encode_tile(&coefficients, 256, 5);
         let bytes = serialize_tile_rice(&tile);
         for pos in [0, 5, 17, 40, bytes.len() / 2, bytes.len() - 1] {

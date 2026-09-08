@@ -1623,6 +1623,59 @@ impl EncoderPipeline {
         }
     }
 
+    /// Encode an intra frame **that something will predict from**, and leave the GPU side
+    /// channel belonging to the candidate that was kept.
+    ///
+    /// **RATE-3.** `encode` codes two candidates at q = 95..=99 and returns the smaller file,
+    /// but `encode_once` also leaves the quantised planes on the GPU (`Y → mc_out,
+    /// Co → ref_upload, Cg → plane_b`) and that is how `local_decode_iframe_gpu` builds a
+    /// reference without a CPU entropy decode. Only the *last* encode's planes survive, so when
+    /// the bit-exact sibling wins, the reference is reconstructed from the *lossy* candidate's
+    /// coefficients — with `0042`'s MED branch now in place, that means running `med.inverse`
+    /// over wavelet coefficients. Measured on crowd_run q=99 ki=2 with the sequence gate lifted
+    /// and this method absent: I-frames bit-exact at −32.3%, and the P-frames referencing them
+    /// at **5.93 dB** while growing from 4.99 MB to 8.89 MB.
+    ///
+    /// The fix is to re-run whichever candidate was kept, so the side channel is always its own.
+    /// It costs a **third** encode of that frame, and only on the frames where the bit-exact
+    /// candidate actually wins — which is why this is a separate entry point rather than
+    /// behaviour inside `encode`: a still has no reference to build and must not pay for one.
+    ///
+    /// The re-encode is deterministic, so the returned frame is the same bytes as the one
+    /// `encode` chose; `debug_assert` checks that rather than trusting it.
+    pub fn encode_as_reference(
+        &mut self,
+        ctx: &GpuContext,
+        rgb_data: &[f32],
+        width: u32,
+        height: u32,
+        config: &CodecConfig,
+    ) -> CompressedFrame {
+        let chosen = self.encode(ctx, rgb_data, width, height, config);
+        // The side channel is the second encode's, which is the configured path. It is already
+        // the right one unless the sibling won — and the sibling is the only candidate that can
+        // differ from `config` here, because `encode` refuses the fallback for anything else.
+        if !config.is_lossless() && chosen.config.is_lossless() {
+            let sibling = crate::lossless_sibling(config);
+            let again = self.encode_once(ctx, rgb_data, width, height, &sibling);
+            debug_assert_eq!(
+                crate::format::serialize_compressed(&again).len(),
+                crate::format::serialize_compressed(&chosen).len(),
+                "the re-encode that repairs the reference side channel is not the frame `encode` \
+                 chose, so one of the two is not deterministic"
+            );
+            // The canary: it prints only on the frames that pay the third encode, so
+            // "the repair ran" is distinguishable from "the sibling never won".
+            eprintln!(
+                "GNC: RATE-3 reference repair — bit-exact candidate kept, re-encoded so the \
+                 reference side channel is its own ({} B)",
+                crate::format::serialize_compressed(&again).len(),
+            );
+            return again;
+        }
+        chosen
+    }
+
     fn encode_once(
         &mut self,
         ctx: &GpuContext,

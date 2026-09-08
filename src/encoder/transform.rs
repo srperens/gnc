@@ -209,6 +209,22 @@ impl WaveletTransform {
         plane_idx: usize,
         overlap: u32,
     ) {
+        // Zero levels means "no transform", and that has to be an identity *copy*, not a
+        // no-op: the loops below dispatch nothing at `levels == 0`, so `output_buf` would keep
+        // whatever the previous frame left in it while the caller quantises it as if it were
+        // this frame's data. `inverse` has always copied `input_buf` into `output_buf` before
+        // its own loop, so the decoder's side of a zero-level transform is already the identity
+        // — this is the encoder's half of that agreement (BUG-39 cause 3).
+        //
+        // Reached by every P/B residual in a `q=100` sequence (MED sets `wavelet_levels = 0`)
+        // and in a `--dct` one, because a residual is always wavelet-coded whatever the
+        // sequence's own transform is.
+        if levels == 0 {
+            let buf_size = (info.padded_width() * info.padded_height()) as u64 * 4;
+            encoder.copy_buffer_to_buffer(input_buf, 0, output_buf, 0, buf_size);
+            return;
+        }
+
         // Each plane gets its own SLOTS_PER_PLANE-wide range in the forward half.
         let plane_slot_base = plane_idx * SLOTS_PER_PLANE;
         // Pre-fill all param slots for this forward transform.
@@ -320,6 +336,12 @@ impl WaveletTransform {
         // Copy input_buf -> output_buf first so we have all subbands in output_buf.
         encoder.copy_buffer_to_buffer(input_buf, 0, output_buf, 0, buf_size);
 
+        // Zero levels: the copy above *is* the inverse transform, and returning here also
+        // avoids `levels - 1` underflowing below (a panic in a debug build).
+        if levels == 0 {
+            return;
+        }
+
         // Inverse slots occupy the second half of the param buffer (after forward slots).
         // Each plane gets its own SLOTS_PER_PLANE-wide range within the inverse half.
         let base_slot = MAX_PLANES * SLOTS_PER_PLANE + plane_idx * SLOTS_PER_PLANE;
@@ -396,5 +418,89 @@ impl WaveletTransform {
 
             region *= 2;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ChromaFormat;
+
+    /// BUG-39 cause 3: a zero-level forward transform must be an identity, not a no-op.
+    ///
+    /// `inverse` has always copied its input into its output before its own loop, so the
+    /// decoder's zero-level transform is the identity. The encoder's `forward` dispatched
+    /// nothing and left `output_buf` holding the *previous* frame's contents, which the caller
+    /// then quantised and transmitted as this frame's data. Every P/B residual in a `q=100`
+    /// sequence goes through this (MED sets `wavelet_levels = 0`), and crowd_run's P-frames
+    /// decoded at 26.5 dB because of it.
+    ///
+    /// The pre-filled output buffer is the whole point of the test: it is what a stale buffer
+    /// looks like, and a `forward` that dispatches nothing passes it straight through.
+    #[test]
+    fn zero_level_forward_is_an_identity_not_a_no_op() {
+        let ctx = GpuContext::new();
+        let info = FrameInfo {
+            width: 256,
+            height: 256,
+            bit_depth: 8,
+            tile_size: 256,
+            chroma_format: ChromaFormat::Yuv444,
+        };
+        let count = (info.padded_width() * info.padded_height()) as usize;
+        let bytes = (count * std::mem::size_of::<f32>()) as u64;
+
+        // Input: something no plausible stale buffer would equal.
+        let input: Vec<f32> = (0..count)
+            .map(|i| ((i * 2654435761) % 511) as f32 - 255.0)
+            .collect();
+        // Output pre-filled with "the previous frame", so a no-op leaves it in place.
+        let stale = vec![-777.0f32; count];
+
+        let mk = |data: &[f32]| {
+            use wgpu::util::DeviceExt;
+            ctx.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: None,
+                    contents: bytemuck::cast_slice(data),
+                    usage: wgpu::BufferUsages::STORAGE
+                        | wgpu::BufferUsages::COPY_SRC
+                        | wgpu::BufferUsages::COPY_DST,
+                })
+        };
+        let input_buf = mk(&input);
+        let temp_buf = mk(&stale);
+        let output_buf = mk(&stale);
+
+        let transform = WaveletTransform::new(&ctx);
+        let mut cmd = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        transform.forward(
+            &ctx,
+            &mut cmd,
+            &input_buf,
+            &temp_buf,
+            &output_buf,
+            &info,
+            0, // levels
+            WaveletType::LeGall53,
+            0,
+            0,
+        );
+        ctx.queue.submit([cmd.finish()]);
+        let out = crate::gpu_util::read_buffer_f32(&ctx, &output_buf, count);
+        assert_eq!(bytes, (out.len() * 4) as u64);
+
+        let mismatches = input
+            .iter()
+            .zip(&out)
+            .filter(|(a, b)| (*a - *b).abs() > 0.0)
+            .count();
+        assert_eq!(
+            mismatches, 0,
+            "a zero-level forward transform must copy its input to its output; {mismatches} of \
+             {count} coefficients differ, so the caller would quantise stale data (BUG-39)"
+        );
     }
 }

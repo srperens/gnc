@@ -1,10 +1,15 @@
-# 0018 — GNC is broad on purpose, and "pick one segment" is rejected
+# 0055 — GNC is broad on purpose, and "pick one segment" is rejected
 
 **Date:** 2026-09-07
 **Status:** adopted — project owner's decision, stated explicitly
 **Scope:** what GNC is for. Sets the targets in GOALS §1, supersedes the central recommendation of
 docs/POSITIONING.md §2, and changes the priority order in BACKLOG. No effect on the bitstream or on
 any measurement already taken.
+
+> **Renumbered 0055 from 0018 by BUG-19 on 2026-09-08.** `0018` was taken by ENT-2's
+> [the entropy coders are level](0018-the-entropy-coders-are-level-and-0015s-prediction-was-wrong.md),
+> committed one minute earlier, so two files carried `0018` on `main` for a day. Nothing in the
+> record below changed. Commit messages, and any citation older than this date, call it `0018`.
 
 ## The decision
 

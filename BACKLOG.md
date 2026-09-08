@@ -1130,7 +1130,7 @@ Item 5 also found a live defect: the buffers labelled "never used" were mapped a
 bitstream effect, which is why nothing caught it. The 31.7 fps citation is retired from GOALS,
 README and POSITIONING. **Item 4 is verified and deliberately not landed — see PERF-2.** Items 2,
 8, 9, 10 and 11 were out of scope by construction and are PERF-2/PERF-3.
-RESEARCH_LOG 2026-09-08; decision `docs/decisions/0027`.
+RESEARCH_LOG 2026-09-08; decision `docs/decisions/0058`.
 
 Filed 2026-09-07. `docs/SIMPLE_PERF_FIXES.md` landed on `main` in `e8a8a45` as a **scan**, and says
 so itself: *"Not claimed as a BACKLOG item — this is a scan"*, and *"No throughput number in this
@@ -1783,39 +1783,43 @@ label prints it so the two arms cannot silently drift apart again. Nothing was e
 that arm, so this invalidates no result — it would have invalidated the head-to-head MEAS-5 exists
 to run.
 
-### BUG-19 — decision-record numbers collide, and two pairs are live on `main` (todo, P3)
+### BUG-19 — decision-record numbers collide, and two pairs are live on `main` (**FIXED 2026-09-08**)
 
-`docs/decisions/` currently holds **two 0018s and two 0019s**:
+`docs/decisions/` held **four** colliding pairs. All four are renumbered; the later-written half of
+each pair moved and the earlier one kept the number:
 
-```
-0018-gnc-is-broad-on-purpose.md
-0018-the-entropy-coders-are-level-and-0015s-prediction-was-wrong.md
-0019-the-inter-paths-saving-was-an-equal-setting-figure.md
-0019-the-pick-is-the-lock.md
-```
+| collided | kept by | moved to |
+|---|---|---|
+| `0018` | ENT-2, the entropy coders are level | **`0055`** — GNC is broad on purpose |
+| `0019` | COORD-1, the pick is the lock | **`0056`** — the inter path's saving was an equal-setting figure |
+| `0024` | INTRA-1 step 1, the J2K gap is upstream | **`0057`** — the GPU abac encoder counts before it writes |
+| `0027` | INTRA-1 step 2b, cross-tile allocation | **`0058`** — a simple perf fix is one whose win is a count |
 
-A third case was already cleaned up by hand — `0020-the-colour-lead-over-x264-is-withdrawn.md`
-was renumbered from 0018.
+In `0024` and `0027` the mover is also the half that never reserved the number through
+`scripts/claim`, so the two criteria agree; for `0018` and `0019` nobody reserved and the add-commit
+timestamps decided (one minute and twelve minutes apart). **31 inbound citations were repointed**
+across BACKLOG, COORDINATION, RESEARCH_LOG, GOALS, README, CLAUDE.md, `src/encoder/entropy_helpers.rs`
+and the sibling records `0017` and `0023`. **Every other citation of those four numbers was
+checked and deliberately left alone** — most `0024` and `0027` references mean the INTRA-1 records
+that kept the number, and the paragraphs in COORDINATION and RESEARCH_LOG that discuss the
+collisions are describing the numbers as they were. Decision `docs/decisions/0059`.
 
-**Same mechanism as the MEAS-9 claim collision, on a resource nobody thought to lock.** Two
-sessions run `ls docs/decisions/`, both compute "next is 0018", and neither can see the other:
-reading, deciding and writing are three steps, and the number is only taken once the file is
-committed. Determinism is what makes it reliable rather than unlikely, exactly as in
-`docs/decisions/0019-the-pick-is-the-lock.md` — which is itself one of the duplicates, filed
-against a number a peer session took in the same window.
+**Two stale citations found while checking `0020`**, which the item asked for because `0020` was
+renumbered by hand: RESEARCH_LOG's MEAS-9 entry cited "decision 0020 (GNC is broad on purpose)"
+twice, and `0020` is the colour-lead withdrawal. That is a *content* error, not a renumbering one —
+the MEAS-9 session mis-read a directory that was being renumbered underneath it — and it is the
+clearest evidence in the item for why ambiguous numbers cost more than the renaming does. Both now
+point at `0055`.
 
-**The mechanism already exists; it was documented one commit too late for these four.**
-`scripts/claim take dr-<NNNN> "<title>"` reserves the number before the file is written and is
-the same compare-and-swap as every other claim (COORDINATION.md, "The claim commands"). Nothing
-enforces it yet — `claim` does not know what a decision record is.
+**The second half of the item is closed by COORD-2, not here.** It asked whether `claim` should hand
+out the next free `dr-` number; `scripts/claim dr` does exactly that since `docs/decisions/0050`, and
+this item used it to reserve `dr-0055`..`dr-0059` before writing a line.
 
-**To close:** renumber the two later duplicates, fix every inbound reference (BACKLOG,
-COORDINATION, RESEARCH_LOG and any sibling record that cites them), and decide whether `claim`
-should learn to hand out the next free `dr-` number the way `next` hands out backlog items. The
-renumbering is the boring half and the references are where it goes wrong — 0020 was renumbered
-by hand and is worth checking for stale citations while here.
+**What is deliberately not fixed:** commit messages. Four merges and their records cite the old
+numbers and git history is the one place this is expensive to rewrite, so **both files in every pair
+carry a note naming the other** — that is what makes a pre-2026-09-08 citation resolvable at all.
 
-Filed 2026-09-07 by the `coord` session.
+Filed 2026-09-07 by the `coord` session. Fixed 2026-09-08 by the `drnum` session.
 
 ### BUG-20 — the clippy gate does not cover the test targets, and 88 warnings sit there (todo, P4)
 
@@ -2113,7 +2117,7 @@ at `1d67d29`** — so it is not caused by ARCH-3 and it is not about inter. Fili
 contradicts a standing claim, not because it was hit.
 
 **The claim it contradicts.** abac's headline is "−16.6% to −18.8% **at identical pixels**", and
-decision `0018` says abac "pays on intra, inter, lossless and every chroma format at once". Entropy
+decision `0055` says abac "pays on intra, inter, lossless and every chroma format at once". Entropy
 coding is lossless, so Rice and abac must decode a frame to the same bytes. At 4:4:4 they do, at
 every quality tried. **At 4:2:2 and 4:2:0 they do not.**
 
@@ -2572,7 +2576,7 @@ ki=9 4:4:4, mean/worst-frame PSNR: q=70 goes 13161434 B 35.20/32.08 dB -> 134231
 **37.02/35.70 dB** (+2.0% bytes for +1.82/+3.62 dB); q=50 +1.6% for +0.90/+1.78; q=25 +0.4% for
 +0.29/+0.41.
 
-**Invalidated:** every inter figure at q <= 80 — MEAS-3 and decision 0019 (mean +4.6% -> -0.3%,
+**Invalidated:** every inter figure at q <= 80 — MEAS-3 and decision 0056 (mean +4.6% -> -0.3%,
 worst-frame +19.1% -> +8.0%), TUNE-5's -3.3%, and TUNE-6's own justification. BASELINE's q=75
 sequence table too, though it was already stale for an unrelated reason (BUG-5).
 
@@ -4312,7 +4316,7 @@ needs more bits:**
 at the same q the inter arm codes P and B frames coarser on purpose (TUNE-6), so on crowd_run at
 q=70 it spends 4.7 bpp against intra's 8.0 **while sitting 7.6 dB lower**. Above q≈85 it stops
 paying at all, and at q=95 it costs *more* than all-intra on two of three sequences. Full tables
-and caveats in RESEARCH_LOG; the reversal is decision record 0019.
+and caveats in RESEARCH_LOG; the reversal is decision record 0056.
 
 ### INTER-1 — The inter path is a loss at contribution quality; decide what it is for (**DONE 2026-09-07** — the premise was 60% a bug; no default changes)
 
@@ -4329,7 +4333,7 @@ a reason nobody had measured.** `docs/decisions/0023`. At q=85-99 the shipped co
    dispatches used the intra quantiser step while its quantise dispatches used `res_qstep`, so the
    encoder's reference disagreed with the decoder's whenever `p_qp_scale != 1.0` — i.e. on the
    default path at **all q <= 80**. Worth up to +1.82 dB mean / +3.62 dB worst-frame for +2.0%
-   bytes. **Invalidated MEAS-3 and decision 0019** (mean +4.6% -> **-0.3%**, worst-frame +19.1% ->
+   bytes. **Invalidated MEAS-3 and decision 0056** (mean +4.6% -> **-0.3%**, worst-frame +19.1% ->
    **+8.0%**), **TUNE-5** and **TUNE-6's own justification**. Byte-identical at q >= 85 (27/27
    verified), so nothing at the contribution operating point moved.
 3. **P-scale priced properly (step 2): the taper stays, both endpoints now justified separately.**
@@ -4340,7 +4344,7 @@ a reason nobody had measured.** `docs/decisions/0023`. At q=85-99 the shipped co
    common-interval BD-rate, which is common *because* the coarse arms stop early.
 
 **Step 3's decision: nothing changes.** ki stays 9, the taper stays as-is, and inter stays a
-default rather than becoming opt-in — the case for demoting it was 0019's figure, and ~60% of its
+default rather than becoming opt-in — the case for demoting it was 0056's figure, and ~60% of its
 worst-frame penalty was BUG-27. What remains is content-specific (old_town_cross +28.7%
 worst-frame) and MEAS-4 already located it in prediction quality, not the coding model.
 Harnesses: `scripts/meas_inter1_ki.py`, `scripts/meas_inter1_pscale.py`. Follow-up: **INTER-2**.
@@ -4909,7 +4913,7 @@ does not hold across the ladder; if by much more, suspect the harness before cel
 
 **Why it matters beyond one number:** it says how much of the intra gap is entropy coding and how
 much is left for coefficient modelling, which is the difference between "keep going down this road"
-and "the remaining gap is somewhere else". Decision 0018 makes that the leading question, since
+and "the remaining gap is somewhere else". Decision 0055 makes that the leading question, since
 entropy coding is the one lever that pays on intra, inter, lossless and every chroma format at
 once.
 
@@ -5735,7 +5739,7 @@ built to the same rules as the decode grid:
 **decision 0017's reason 2 has lost its mechanism and kept its 129 ms.** Whoever runs it should
 also settle the sizing mode: `CountThenEmit` (2 coder passes, exactly-sized scratch) is the default
 and `BoundedSlots` (1 coder pass, 22-29x scratch) is selectable with `GNC_ABAC_GPU_SIZING=slots`;
-the bytes are identical either way, so the default can flip on one run. `docs/decisions/0024`.
+the bytes are identical either way, so the default can flip on one run. `docs/decisions/0057`.
 
 **What it does not do:** abac is still opt-in — 0017's reason 1, the 1.69x decode, is untouched,
 and reason 2's figure is unmeasured. (Reason 3 was discharged by ARCH-3, not here.) It does not
@@ -5755,7 +5759,7 @@ shader rather than a trade.
 **Why it is P1 now rather than a tidy-up.** ENT-4 measured what abac is worth: **−16.0% of rate over
 q=60-99 at identical pixels** (24/24 rungs bit-identical), closing **half** the RGB gap to JPEG 2000
 and taking GNC level with ProRes 4444. That is the largest single compression lever in the codec, it
-pays on intra, inter, lossless and every chroma format at once (decision 0018), and it is behind a
+pays on intra, inter, lossless and every chroma format at once (decision 0055), and it is behind a
 flag partly because of 129 ms/frame of CPU encode against Rice's 23 ms (`docs/decisions/0017`).
 
 It is also the *cause* of the ARCH-3 / BUG-18 class of defect, not merely a neighbour of it: abac has
@@ -5967,7 +5971,7 @@ wavelet coefficients of the motion-compensated residual, or on something else, a
 implementation matches — five conclusions in this repo turned on that exact question.
 
 Note the 2026-09-06 finding that inter breaks even at contribution quality is correct *at that
-operating point* and must not be read as "inter does not matter": under decision 0018 inter has to
+operating point* and must not be read as "inter does not matter": under decision 0055 inter has to
 work across the whole range, and the low end is where inter earns its keep.
 
 </details>

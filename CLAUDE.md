@@ -44,7 +44,7 @@ Modular pipeline with swappable stages:
      stood here, "−12.0% to −22.9%", was `0025`'s: its q=90 column reproduces exactly on a pinned
      build of its own commit and its q=50 and q=75 columns were taken before INTER-2 halved the
      inter dead zone, so those two are superseded. Opt-in —
-     `docs/decisions/0017`, `0024` for the encoder's two judgement calls, `0045` for the inter
+     `docs/decisions/0017`, `0057` for the encoder's two judgement calls, `0045` for the inter
      figure (superseding `0025`'s). **Encode time per
      frame is not yet measured on an idle machine**, so 0017's reason 2 has lost its mechanism but
      kept its number.

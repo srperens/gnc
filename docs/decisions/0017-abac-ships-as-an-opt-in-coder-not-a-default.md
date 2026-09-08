@@ -43,7 +43,7 @@ and leave Rice as the default at every quality preset.
    on it and COORDINATION forbids a wall-clock figure under load. Until that run happens this
    reason has lost its cause and kept its 129 ms, which is not the same as being discharged.
    `tests/abac_bench.rs::abac_encode_throughput_grid` is the instrument.
-   See [0024](0024-the-gpu-abac-encoder-counts-before-it-writes.md).
+   See [0057](0057-the-gpu-abac-encoder-counts-before-it-writes.md).
 
 3. **Inter frames are unmeasured.** This reason was withdrawn on 2026-09-07 when inter was
    measured at −14.4%, and then **reinstated the same day when that measurement was retracted**:

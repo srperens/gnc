@@ -68,7 +68,7 @@ impl EntropyMode {
 /// `use_gpu_encode` this function feeds. So a `false` here means "not in the batch", not "on the
 /// CPU": abac's entropy stage runs on the GPU either way. Deliberately kept separate — this flag
 /// also switches the fused quantize+histogram shader, and BUG-16 records that shader moving
-/// Rice's *pixels* at q=25. `docs/decisions/0024`.
+/// Rice's *pixels* at q=25. `docs/decisions/0057`.
 pub(super) fn inter_gpu_entropy_available(config: &CodecConfig) -> bool {
     matches!(
         config.entropy_coder,

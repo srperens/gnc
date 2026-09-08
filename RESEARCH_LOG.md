@@ -4,6 +4,83 @@
 
 ---
 
+## BUG-19 — the four colliding decision-record numbers are renumbered, and one of the citations was wrong about its own record (2026-09-08)
+
+**What was open.** `docs/decisions/` carried four pairs of records sharing a number on `main`:
+`0018`, `0019`, `0024`, `0027`. The item was filed as mechanical with a warning attached — *"the
+renumbering is the boring half and the references are where it goes wrong"*.
+
+**Domain declaration.** Prose and one doc comment. Four file renames, citation edits in BACKLOG,
+COORDINATION, RESEARCH_LOG, GOALS, README, CLAUDE.md, `docs/decisions/0017` and `0023`, and one
+`///` comment in `src/encoder/entropy_helpers.rs`. **No encoder, decoder, shader or test path is
+touched, so this invalidates no measurement** — and that claim is checked by the gates below rather
+than asserted, since a doc-comment edit is exactly the kind of change that can still fail to
+compile.
+
+### Which half of each pair moves
+
+| collided | kept by | moved to |
+|---|---|---|
+| `0018` | ENT-2 — the entropy coders are level | **`0055`** — GNC is broad on purpose |
+| `0019` | COORD-1 — the pick is the lock | **`0056`** — the inter path's saving was an equal-setting figure |
+| `0024` | INTRA-1 step 1 — the J2K gap is upstream | **`0057`** — the GPU abac encoder counts before it writes |
+| `0027` | INTRA-1 step 2b — cross-tile allocation | **`0058`** — a simple perf fix is one whose win is a count |
+
+Two rules were available and **both give the same four answers**, which is the only reason this
+needed no judgement call per pair. "The half that never reserved the number moves" decides `0024`
+and `0027` (INTRA-1 held `dr-0024` and `dr-0027` through `scripts/claim`; the other sessions did
+not) and is silent on `0018` and `0019`, where nobody reserved. "The later add-commit moves"
+decides all four: 19:59 vs 20:00, 20:23 vs 20:35, 22:09 vs 22:31, 23:49 vs 00:15. Decision
+`docs/decisions/0059` records why the first rule leads and the second fills in.
+
+New numbers came from `scripts/claim dr` — `dr-0055`..`dr-0059`, all five reserved before a file
+was touched, which is COORD-2's mechanism (`0050`) used in anger for the first time.
+
+### The references were indeed where it went wrong — in both directions
+
+**31 citation sites repointed, and about as many deliberately left alone.** The trap is that the
+*keepers* are the more-cited half in every pair: nearly every `` `0024` `` in the tree is INTRA-1's
+≤7.5% entropy bound, and nearly every `` `0027` `` is cross-tile allocation. A blind
+search-and-replace on the numbers would have corrupted 30-odd correct citations to fix 31 wrong
+ones. Each site was classified by what the sentence around it claims — "`0024`'s six columns
+reproduce byte-for-byte" is INTRA-1's diagnostic; "a throughput figure taken under load is worth
+nothing here" is ENT-5's.
+
+**Two citations were wrong before this item started, and finding them is the item's real result.**
+The BACKLOG entry asked for `0020` to be checked because it had been renumbered by hand a day
+earlier. RESEARCH_LOG's MEAS-9 entry says, twice:
+
+> This lands the same day as decision 0020 (GNC is broad on purpose) …
+> … the obvious successor to this item, especially under decision 0020.
+
+`0020` is *the colour lead over x264 is withdrawn*. "GNC is broad on purpose" was `0018` at the
+time and is `0055` now. The MEAS-9 session cited a number that had been vacated by the hand
+renumbering hours earlier — **a citation to a wrong-but-existing record reads exactly like a
+correct one**, which is why it survived a day and why the number namespace needed the lock rather
+than a habit. Both now point at `0055`.
+
+**What cannot be fixed and what stands in for it.** Commit messages cite the old numbers (`192267c`
+announces the ENT-5 record as 0024) and rewriting history to fix a citation is not worth the risk.
+Instead **all eight files now carry a header note naming the other half of their pair and the dates
+the collision was live**, so a citation written on 2026-09-07 or 2026-09-08 is resolvable from
+either landing point. That is the half of the fix that outlives it.
+
+### Also fixed while here
+
+One broken markdown link, pre-existing and unrelated: RESEARCH_LOG's inter-gap section linked
+`[docs/POSITIONING.md]` to `../GOALS.md` — wrong target *and* wrong label, from the root of the
+repo. A
+link checker over every `.md` in the tree now reports zero broken relative links.
+
+### Gates
+
+`cargo test --release`: **261 passed, 0 failed, 3 ignored** across 23 test binaries.
+`cargo clippy --release` and `cargo clippy --release --target wasm32-unknown-unknown --lib`: **zero
+`gnc` warnings** on both (the one line clippy prints is a future-incompat notice about the `block
+v0.1.6` dependency, present before this change).
+
+---
+
 ## ENT-3 — abac's inter saving is real, decays with quality, and the contexts are not the inter question (2026-09-08)
 
 **What was open.** Not the headline — ARCH-3 answered "does abac pay on inter" as a side effect
@@ -3599,7 +3676,7 @@ therefore only fire if the two passes disagree with each other. `BoundedSlots` e
 coder pass may well be worth 17 MB of scratch, and the point is that one idle-machine run can flip
 the default without touching a line of coder code: the bytes are identical either way, which is
 asserted rather than assumed. Decision
-[0024](docs/decisions/0024-the-gpu-abac-encoder-counts-before-it-writes.md) has the reasoning,
+[0057](docs/decisions/0057-the-gpu-abac-encoder-counts-before-it-writes.md) has the reasoning,
 including the two rejected alternatives — a heuristic slot with a panic behind it, which is BUG-22
 exactly (7.8-10.9 dB at q=90 when a Huffman stream spilled into its neighbour's 512-byte slot), and
 an atomic bump allocator with chunk chaining, which reintroduces the unbounded per-block structure
@@ -3805,7 +3882,7 @@ of bbb_extended: max |diff| 12-13 over 3.9-4.3% of samples at q=50, 5 over 0.6-1
 coefficients, not a coder bug in the ordinary sense.
 
 Two things it costs, and both are about scope rather than about a wrong number: abac's standing
-"−16.6% to −18.8% **at identical pixels**" and decision `0018`'s "every chroma format at once" are
+"−16.6% to −18.8% **at identical pixels**" and decision `0055`'s "every chroma format at once" are
 both 4:4:4 measurements, and the q boundary (differs at 50 and 75, agrees at 90) points at
 adaptive quantisation or CfL side data indexed with the luma tile count on planes that have a
 different tile grid. The magnitude — small differences over a large area — is precisely what a
@@ -11082,7 +11159,7 @@ codecs hit the same wall; they just hit it at different quality levels.
 
 **The inter gap is real at distribution bitrates**, where x264 earns +64% and GNC earns
 substantially less at matched quality. That is a genuine deficiency, but it is at the operating
-point [docs/POSITIONING.md](../GOALS.md) says GNC is not built for.
+point [docs/POSITIONING.md](docs/POSITIONING.md) says GNC is not built for.
 
 ### Consequence for where effort goes
 
@@ -13134,7 +13211,7 @@ x264 a sanity anchor rather than a competitor, and nothing else had ever been me
 closes that: **JPEG XS, JPEG 2000, ProRes and VC-2, in seven arms, on four images, through one
 metric path.** New harness, `scripts/meas9_contribution.py`.
 
-This lands the same day as decision 0020 (GNC is broad on purpose), and the two are connected: a
+This lands the same day as decision 0055 (GNC is broad on purpose), and the two are connected: a
 codec meant to be good at many things has to be measured against the incumbents of every segment
 it touches, not against one opponent at one operating point.
 
@@ -13340,7 +13417,7 @@ column cannot be compared with anyone else's.
   so no speed figure from it means anything, and BACKLOG's request to put the JPEG XS rate figure
   next to MEAS-6's latency row cannot be honoured from this build. Rate and quality are exact.
 - **Inter.** Every arm here is all-intra, on stills. The entropy gap on inter residuals is
-  unmeasured and is the obvious successor to this item, especially under decision 0020.
+  unmeasured and is the obvious successor to this item, especially under decision 0055.
 - **q=100.** No lossless arm: BUG-15 (the wavelet lossless path was not bit-exact on main until
   today, because CHROMA-1 raised chroma_weight to 1.2 for all q ≥ 60 including 100). Every GNC arm
   here is q=60–99 on the default MED path. `--huffman` and `--rans` are not used in any arm; both
@@ -14769,12 +14846,12 @@ q=85/90/99, both ways). Below q=85 it was live on the shipped default:
 
 (crowd_run, 10 frames, ki=9, 4:4:4, mean/worst-frame PSNR.)
 
-### What that costs the record: MEAS-3 and decision 0019 are corrected
+### What that costs the record: MEAS-3 and decision 0056 are corrected
 
 MEAS-3's ladder is q=25–95, so most of it ran with the defect live. Re-run on the same harness,
 same 18 frames, same sequences, against `2224c50`:
 
-| sequence | mean: 0019 → now | worst-frame: 0019 → now |
+| sequence | mean: 0056 → now | worst-frame: 0056 → now |
 |---|---|---|
 | crowd_run | +15.9% → **+6.5%** | +32.4% → **+12.0%** |
 | old_town_cross | +22.2% → **+19.3%** | +35.4% → **+28.7%** |

@@ -1,9 +1,14 @@
-# 0019 — The inter path's saving was an equal-setting figure, not a saving
+# 0056 — The inter path's saving was an equal-setting figure, not a saving
 
 **Date:** 2026-09-07
 **Status:** Accepted, and **its numbers are superseded by [0023](0023-the-p-frame-scale-taper-was-right-for-the-wrong-reason.md)
 (2026-09-07).** Corrects GOALS §4's "saves 17–27% vs all-I"; the default is **not** changed
 here — what to do about it was BACKLOG **INTER-1**, now done.
+
+> **Renumbered 0056 from 0019 by BUG-19 on 2026-09-08.** `0019` was taken by COORD-1's
+> [the pick is the lock](0019-the-pick-is-the-lock.md), committed twelve minutes earlier, so two
+> files carried `0019` on `main` for a day. Nothing in the record below changed. Commit messages,
+> and any citation older than this date, call it `0019`.
 
 > **Superseded figures.** The table below was measured over q=25–95 with **BUG-27** live: the
 > encoder's P-frame reference was dequantised with the *intra* quantiser step, so it disagreed

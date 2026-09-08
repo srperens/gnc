@@ -20,7 +20,7 @@ GNC is deliberately **broad**: intra and inter, 4:2:0 / 4:2:2 / 4:4:4 at 8 and 1
 
 **Where it stands against H.264** (measured 2026-09-06, `scripts/meas1_vs_h264.py`, 1080p, ki=9, x264 at defaults):
 
-- **Contribution quality: +90.5% BD-rate on PSNR** — about 1.9x the bitrate of x264 for the same luma quality, across three sequences.
+- **Contribution quality: +89.2% BD-rate on PSNR** with the default Rice coder — about 1.9x the bitrate of x264 for the same luma quality, across three sequences (MEAS-10, 2026-09-08; QUAL-1's +90.5% was the same ladder before INTER-2). **`--abac` on the same ladder is +66.0%** (1.66x), at bit-identical pixels to Rice.
 - **Colour: no advantage over x264, and the row that claimed one is withdrawn (CHROMA-2, 2026-09-07).** The control this README asked for has been run — give x264 the same allocation via `--chroma-qp-offset` and re-measure CIEDE2000 at the same total rate — and **x264 comes out ahead on all six runs** (three sequences x 4:2:0 and 4:4:4). On five of the six it does not need the offset at all: it leads on colour at offset 0 *while also leading luma by 4.1-7.4 dB*. The earlier row, which had GNC ahead on dE00, rested on a table measured an hour before CHROMA-1 changed q>=85 output and does not reproduce. GNC's colour is still good in absolute terms (dE00 0.54-0.92 mean, at or below the nominal JND) — it is just not better than x264's.
 - **Lossless: the best wavelet result in the field.** 1.99:1 at `q=100`, beating JPEG 2000 lossless by 10.8% and PNG by 7.8%; behind FFV1 by 27% and x264 `-qp 0` by 43%, both of which predict against the neighbouring pixel rather than across scales.
 - **Latency: ~80 ms round trip** at the default configuration, 1080p on an Apple M5 Pro
@@ -89,10 +89,10 @@ not** — so conformance must require decoder bit-exactness, not encoder reprodu
 
 | q | PSNR | BPP | VMAF | levels |
 |---|------|-----|------|--------|
-| 25 | 35.51 dB | 1.60 | 90.25 | 5 |
-| 50 | 40.30 dB | 2.73 | 95.02 | 5 |
-| 75 | 44.84 dB | 4.53 | 96.58 | 5 |
-| 90 | 50.06 dB | 8.07 | 97.08 | 5 |
+| 25 | 35.63 dB | 1.57 | 90.31 | 5 |
+| 50 | 40.25 dB | 2.60 | 95.07 | 5 |
+| 75 | 44.64 dB | 4.31 | 96.55 | 5 |
+| 90 | 49.89 dB | 7.21 | 97.06 | 5 |
 
 *Single-frame, 1080p bbb reference, Rice, 4:4:4. **[BASELINE.md](BASELINE.md) is the single source
 for these** — this table was three separate copies from 2026-02-27 and had drifted more than 2 dB.

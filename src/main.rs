@@ -589,6 +589,12 @@ enum Command {
         /// depth regardless; this selects what the codec encodes and stores.
         #[arg(long, default_value = "8")]
         bit_depth: u32,
+
+        /// Encode-only timing path (BUG-32). Skips CPU PSNR/SSIM, the all-I comparison
+        /// arm, and retaining a decoded copy of the sequence. Default is off: quality
+        /// metrics stay the honest default. Conflicts with --vmaf (VMAF needs a decode).
+        #[arg(long, conflicts_with = "vmaf")]
+        throughput: bool,
     },
 
     /// Encode a sequence of image frames into a .gnv container
@@ -1160,8 +1166,8 @@ fn main() {
                     Ok(ctx) => {
                         // Two columns, and the difference between them is the point:
                         // `have` is what the silicon offers, `use` is what GNC asks for.
-                        // GNC requests wgpu's defaults so the same shaders run under
-                        // WebGPU (GOALS rule 4), so a big GPU does not raise these.
+                        // Almost wgpu's defaults (GOALS rule 4); storage buffers / stage is
+                        // the one named override (BUG-34, docs/decisions/0047).
                         let have = ctx.adapter.limits();
                         let used = ctx.device.limits();
                         println!("\nDevice in use: {}", gnc::describe_adapter(&ctx.adapter.get_info()));
@@ -1200,6 +1206,16 @@ fn main() {
                             have.max_buffer_size / (1024 * 1024),
                             used.max_buffer_size / (1024 * 1024)
                         );
+                        let def = wgpu::Limits::default();
+                        if used.max_storage_buffers_per_shader_stage
+                            != def.max_storage_buffers_per_shader_stage
+                        {
+                            println!(
+                                "  storage buffers / stage overrides Limits::default() ({}); \
+                                 see docs/decisions/0047",
+                                def.max_storage_buffers_per_shader_stage
+                            );
+                        }
                     }
                     Err(e) => println!("\nCould not open a device to report limits: {e}"),
                 }
@@ -1573,6 +1589,7 @@ fn main() {
             chroma_format,
             tile_size,
             bit_depth,
+            throughput,
         } => {
             if diagnostics {
                 gnc::encoder::diagnostics::enable();
@@ -2350,6 +2367,65 @@ fn main() {
             let elapsed_ip = start.elapsed();
 
             println!("\n=== I+P+B (keyframe_interval={}) ===", keyframe_interval);
+
+            let frame_letter = |ft: gnc::FrameType| -> &'static str {
+                match ft {
+                    gnc::FrameType::Intra => "I",
+                    gnc::FrameType::Predicted => "P",
+                    gnc::FrameType::Bidirectional => "B",
+                }
+            };
+
+            if throughput {
+                // BUG-32: default wall clock is 86% CPU PSNR/SSIM plus a second all-I
+                // encode, and decode_sequence retains the whole sequence in RAM.
+                total_bytes_ip = 0;
+                frame_metrics_ip.clear();
+                for (i, cf) in compressed_ip.iter().enumerate() {
+                    let ft = frame_letter(cf.frame_type);
+                    total_bytes_ip += cf.byte_size();
+                    println!(
+                        "  Frame {:2} [{}]: {:6} bytes, {:.2} bpp",
+                        i,
+                        ft,
+                        cf.byte_size(),
+                        cf.bpp(),
+                    );
+                    frame_metrics_ip.push(FrameMetrics {
+                        frame_idx: i,
+                        frame_type: ft.to_string(),
+                        psnr: 0.0,
+                        ssim: 0.0,
+                        bpp: cf.bpp(),
+                        encoded_bytes: cf.byte_size(),
+                    });
+                }
+                avg_bpp_ip = compressed_ip.iter().map(|f| f.bpp()).sum::<f64>()
+                    / compressed_ip.len() as f64;
+                let i_count = compressed_ip
+                    .iter()
+                    .filter(|f| f.frame_type == gnc::FrameType::Intra)
+                    .count();
+                let p_count = compressed_ip
+                    .iter()
+                    .filter(|f| f.frame_type == gnc::FrameType::Predicted)
+                    .count();
+                let b_count = compressed_ip
+                    .iter()
+                    .filter(|f| f.frame_type == gnc::FrameType::Bidirectional)
+                    .count();
+                println!(
+                    "  Total: {} bytes, avg {:.2} bpp, {:.1}ms ({:.1} fps), {}I+{}P+{}B",
+                    total_bytes_ip,
+                    avg_bpp_ip,
+                    elapsed_ip.as_secs_f64() * 1000.0,
+                    compressed_ip.len() as f64 / elapsed_ip.as_secs_f64(),
+                    i_count,
+                    p_count,
+                    b_count,
+                );
+                eprintln!("[bug32] throughput=1 metrics=0 i_only=0 decode_retained=0");
+            } else {
             // Decode with B-frame reordering support
             let decoded_all = decoder.decode_sequence(&ctx, &compressed_ip);
 
@@ -2362,11 +2438,7 @@ fn main() {
             if diagnostics {
                 println!("\n=== ENCODE/DECODE QUALITY CHECK ===");
                 for (i, cf) in compressed_ip.iter().enumerate() {
-                    let ft = match cf.frame_type {
-                        gnc::FrameType::Intra => "I",
-                        gnc::FrameType::Predicted => "P",
-                        gnc::FrameType::Bidirectional => "B",
-                    };
+                    let ft = frame_letter(cf.frame_type);
                     let psnr = quality::psnr(&frames_data[i], &decoded_all[i], ip_peak);
                     let status = if psnr > 25.0 { "✓ OK" } else { "⚠ LOW" };
                     eprintln!(
@@ -2379,11 +2451,7 @@ fn main() {
             total_bytes_ip = 0;
             frame_metrics_ip.clear();
             for (i, cf) in compressed_ip.iter().enumerate() {
-                let ft = match cf.frame_type {
-                    gnc::FrameType::Intra => "I",
-                    gnc::FrameType::Predicted => "P",
-                    gnc::FrameType::Bidirectional => "B",
-                };
+                let ft = frame_letter(cf.frame_type);
                 let psnr = quality::psnr(&frames_data[i], &decoded_all[i], ip_peak);
                 let ssim = quality::ssim_approx(&frames_data[i], &decoded_all[i], ip_peak);
                 total_bytes_ip += cf.byte_size();
@@ -2526,21 +2594,24 @@ fn main() {
                 summary_i.max_psnr_drop,
                 summary_i.temporal_consistency,
             );
+            } // else: quality metrics (BUG-32 --throughput skips this)
 
             // Write CSV if requested (I+P metrics — the primary encoding mode)
             if let Some(ref csv_path) = csv {
-                let out_path = if run_temporal {
-                    csv_with_suffix(csv_path, "ip")
-                } else {
-                    csv_path.clone()
-                };
-                sequence_metrics::write_sequence_csv(
-                    &out_path,
-                    &frame_metrics_ip,
-                    summary_ip.as_ref().unwrap(),
-                )
+                if let Some(ref summary) = summary_ip {
+                    let out_path = if run_temporal {
+                        csv_with_suffix(csv_path, "ip")
+                    } else {
+                        csv_path.clone()
+                    };
+                    sequence_metrics::write_sequence_csv(
+                        &out_path,
+                        &frame_metrics_ip,
+                        summary,
+                    )
                     .expect("Failed to write sequence CSV");
-                println!("\nSequence metrics written to {}", out_path);
+                    println!("\nSequence metrics written to {}", out_path);
+                }
             }
 
             // Write GNV1 container if --output specified and not in temporal wavelet mode

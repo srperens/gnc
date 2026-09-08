@@ -46,9 +46,16 @@ var<workgroup> shared_min: array<i32, 256>;
 var<workgroup> shared_max: array<i32, 256>;
 var<workgroup> shared_reduce_u: array<u32, 256>;
 
-// Shared memory for histogram building (atomic)
-// Size must fit sum of all group alphabets: up to MAX_GROUPS * MAX_GROUP_ALPHABET
-var<workgroup> shared_hist: array<atomic<u32>, 5120>;
+// Shared memory for histogram building (atomic).
+// Sum of per-group alphabets can reach MAX_GROUPS * MAX_GROUP_ALPHABET = 49152.
+// The host refuses a frame that does not fit; the clamp here only keeps the
+// shader inside the array (BUG-35). Same arena as quantize_histogram_fused.wgsl.
+const SHARED_HIST_ENTRIES: u32 = 5120u;
+var<workgroup> shared_hist: array<atomic<u32>, SHARED_HIST_ENTRIES>;
+
+fn hist_in_arena(idx: u32) -> bool {
+    return idx < SHARED_HIST_ENTRIES;
+}
 
 // Per-group metadata broadcast from thread 0
 var<workgroup> shared_group_min: array<i32, 12>;
@@ -282,10 +289,11 @@ fn main(
         }
         workgroupBarrier();
 
-        // Initialize histogram to zero
+        // Initialize histogram to zero. Cap at the arena; the host refuses overflow.
         let total_hist_entries = shared_group_hist_off[num_groups - 1u]
                                + shared_group_asize[num_groups - 1u];
-        for (var i = lid; i < total_hist_entries; i += WG_SIZE) {
+        let hist_cap = min(total_hist_entries, SHARED_HIST_ENTRIES);
+        for (var i = lid; i < hist_cap; i += WG_SIZE) {
             atomicStore(&shared_hist[i], 0u);
         }
         workgroupBarrier();
@@ -329,7 +337,9 @@ fn main(
                             sym = shared_group_asize[g] - 1u;
                         }
                         let hist_idx = shared_group_hist_off[g] + sym;
-                        atomicAdd(&shared_hist[hist_idx], 1u);
+                        if (hist_in_arena(hist_idx)) {
+                            atomicAdd(&shared_hist[hist_idx], 1u);
+                        }
                     } else {
                         // Normal coefficient
                         var sym = u32(c - shared_group_min[g]);
@@ -337,7 +347,9 @@ fn main(
                             sym = shared_group_asize[g] - 1u;
                         }
                         let hist_idx = shared_group_hist_off[g] + sym;
-                        atomicAdd(&shared_hist[hist_idx], 1u);
+                        if (hist_in_arena(hist_idx)) {
+                            atomicAdd(&shared_hist[hist_idx], 1u);
+                        }
                         i += 1u;
                     }
                 }
@@ -356,7 +368,9 @@ fn main(
                     sym = shared_group_asize[g] - 1u;
                 }
                 let hist_idx = shared_group_hist_off[g] + sym;
-                atomicAdd(&shared_hist[hist_idx], 1u);
+                if (hist_in_arena(hist_idx)) {
+                    atomicAdd(&shared_hist[hist_idx], 1u);
+                }
             }
         }
         workgroupBarrier();
@@ -377,7 +391,12 @@ fn main(
             // Write histogram entries cooperatively
             let hist_base = shared_group_hist_off[g];
             for (var i = lid; i < asize; i += WG_SIZE) {
-                hist_output[out_base + write_off + 3u + i] = atomicLoad(&shared_hist[hist_base + i]);
+                let src = hist_base + i;
+                var bin = 0u;
+                if (hist_in_arena(src)) {
+                    bin = atomicLoad(&shared_hist[src]);
+                }
+                hist_output[out_base + write_off + 3u + i] = bin;
             }
             write_off += 3u + asize;
         }
@@ -470,7 +489,8 @@ fn main(
         let zrun_base = shared_group_zrun[0];
 
         // Initialize histogram to zero
-        for (var i = lid; i < alphabet_size; i += WG_SIZE) {
+        let single_cap = min(alphabet_size, SHARED_HIST_ENTRIES);
+        for (var i = lid; i < single_cap; i += WG_SIZE) {
             atomicStore(&shared_hist[i], 0u);
         }
         workgroupBarrier();
@@ -500,11 +520,15 @@ fn main(
                         let run_sym_val = zrun_base + i32(run_len) - 1;
                         var sym = u32(run_sym_val - min_val);
                         if (sym >= alphabet_size) { sym = alphabet_size - 1u; }
-                        atomicAdd(&shared_hist[sym], 1u);
+                        if (hist_in_arena(sym)) {
+                            atomicAdd(&shared_hist[sym], 1u);
+                        }
                     } else {
                         var sym = u32(c - min_val);
                         if (sym >= alphabet_size) { sym = alphabet_size - 1u; }
-                        atomicAdd(&shared_hist[sym], 1u);
+                        if (hist_in_arena(sym)) {
+                            atomicAdd(&shared_hist[sym], 1u);
+                        }
                         i += 1u;
                     }
                 }
@@ -516,7 +540,9 @@ fn main(
                 let c = read_coeff(tile_origin_x, tile_origin_y, local_idx);
                 var sym = u32(c - min_val);
                 if (sym >= alphabet_size) { sym = alphabet_size - 1u; }
-                atomicAdd(&shared_hist[sym], 1u);
+                if (hist_in_arena(sym)) {
+                    atomicAdd(&shared_hist[sym], 1u);
+                }
             }
         }
         workgroupBarrier();
@@ -528,7 +554,11 @@ fn main(
             hist_output[out_base + 2u] = bitcast<u32>(zrun_base);
         }
         for (var i = lid; i < alphabet_size; i += WG_SIZE) {
-            hist_output[out_base + 3u + i] = atomicLoad(&shared_hist[i]);
+            var bin = 0u;
+            if (hist_in_arena(i)) {
+                bin = atomicLoad(&shared_hist[i]);
+            }
+            hist_output[out_base + 3u + i] = bin;
         }
     }
 }

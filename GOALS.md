@@ -91,9 +91,9 @@ not a default — `docs/decisions/0017`.
 
 | q | PSNR | BPP | VMAF | levels |
 |---|------|-----|------|--------|
-| 25 | 35.63 dB | 1.64 | 90.31 | 5 |
-| 50 | 40.30 dB | 2.73 | 95.02 | 5 |
-| 75 | 44.84 dB | 4.53 | 96.58 | 5 |
+| 25 | 35.63 dB | 1.57 | 90.31 | 5 |
+| 50 | 40.25 dB | 2.60 | 95.07 | 5 |
+| 75 | 44.64 dB | 4.31 | 96.55 | 5 |
 | 90 | 49.89 dB | 7.21 | 97.06 | 5 |
 
 *Single-frame, 1080p bbb reference, Rice, 4:4:4. **[BASELINE.md](BASELINE.md) is the single source
@@ -163,9 +163,11 @@ the bitrate of H.264 (BD-rate +457% / +494% / +672%) at *distribution* bitrates,
 ladder above q=92 dead. Re-run at contribution quality with that ladder working, the same harness
 and the same parameters gives **+90.5% BD-rate on PSNR — about 1.9x** (+129.0% bbb, +71.9%
 old_town, +70.6% crowd_run). Nothing in the coder changed between the two; the 5-7x figure was
-measured somewhere GNC is not built to operate. **Use +90.5%, and do not quote a VMAF BD-rate at
-this end** — widening the quality ladder moved the VMAF figure by 47.5 points on average and the
-PSNR figure by 1.0. The +13.9% still-image figure is PSNR on stills, a third quantity again.
+measured somewhere GNC is not built to operate. **MEAS-10 re-took that ladder on 2026-09-08 at
+`0a1b055`: +89.2%** (+128.5% / +70.2% / +68.8%). INTER-2 moved the q=85 rung; 92/96/99 did not.
+**Use +89.2% for current HEAD, and do not quote a VMAF BD-rate at this end** — widening the
+quality ladder moved the VMAF figure by 47.5 points on average and the PSNR figure by 1.0. The
++13.9% still-image figure is PSNR on stills, a third quantity again.
 See [RESEARCH_LOG.md](RESEARCH_LOG.md), 2026-09-06, and the decision record
 [docs/decisions/0013](docs/decisions/0013-the-headline-gap-figure-was-the-wrong-operating-point.md).
 
@@ -231,7 +233,7 @@ GNC should become a **good, robust codec** — not optimized along a single axis
 | Bit depth | **8-bit and 10-bit, both shipping** (FMT-1, 2026-09-06; 10-bit lossless re-verified 2026-09-08) | met — keep it met as the format changes |
 | Chroma formats | 4:4:4, 4:2:2, 4:2:0 | keep all three working at 10-bit |
 | Compression (intra) | **Read these three numbers with their caveats, they are not one quantity.** +46–55% vs H.264 all-I on video is **VMAF, predates the high-q ladder fix and has not been re-run** (BASELINE says so); +13.9% on stills is PSNR against H.264 all-I; and against JPEG 2000 9/7 the gap is +27.1% of which **15.1 points are not coding deficiencies at all**, so the intra *coding* gap is nearer **+12%** (INTRA-1, answered 2026-09-08) | ≤ H.264 all-I, measured at contribution quality — and re-run the VMAF figure as PSNR |
-| Compression (video) | **+90.5% BD-rate on PSNR vs H.264 at contribution quality** (QUAL-1, 2026-09-06; +457% to +672% was distribution bitrates and is superseded) | ≤ +25%, and the remaining gap is intra |
+| Compression (video) | **+89.2% BD-rate on PSNR vs H.264 at contribution quality** with Rice; **+66.0% with `--abac`** at identical pixels (MEAS-10, 2026-09-08; QUAL-1's +90.5% was 2026-09-06; +457% to +672% was distribution bitrates and is superseded) | ≤ +25%, and the remaining gap is intra |
 | Colour accuracy | **no lead — withdrawn 2026-09-07, decision 0020.** x264 wins dE00 on 6 of 6 rate-matched runs, on five without needing a chroma-QP offset and while also leading luma. GNC's dE00 0.54–0.92 mean is good in absolute terms, just not better | close the luma gap; there is no colour lead to keep |
 | Luma/chroma split | on the frontier as of CHROMA-1 (2026-09-06) — `chroma_weight` 1.2 is the largest value that costs nothing on MEAS-8's criterion | leave it; the remaining gap is not here |
 | Quality range | q=1–100 functional | smooth, predictable quality curve |
@@ -261,8 +263,9 @@ MEAS-5's entry carry the detail.
 **On the compression numbers:** both objections to the +457% to +672% figures have now been
 settled rather than merely noted. B-frames were defective (BUG-5) and are off by default; the
 operating point was wrong, and QUAL-1 re-measured it at the contribution end, where the gap is
-**+90.5%**. Treat +457% to +672% as a historical distribution-bitrate figure only. The remaining
-gap is **intra** — inter breaks even for both codecs at this quality, and does so for x264 too.
+**+89.2%** (QUAL-1's +90.5% on 2026-09-06, re-taken MEAS-10). Treat +457% to +672% as a
+historical distribution-bitrate figure only. The remaining gap is **intra** — inter breaks even
+for both codecs at this quality, and does so for x264 too.
 
 VC-2 (Dirac) demonstrates that a patent-free wavelet codec can do real temporal work (MCTF) and
 reach H.264-class compression. That remains the reference point for where the inter path could go.

@@ -125,11 +125,13 @@ def normalise_source(src, work, n, pix_fmt="yuv420p"):
     return pngdir, ref_y4m
 
 
-def run_gnc(src, work, n, ki, q, chroma, gnc_bin):
+def run_gnc(src, work, n, ki, q, chroma, gnc_bin, extra=None):
+    extra = extra or []
     tag = f"gnc_q{q}"
     gnv = os.path.join(work, f"{tag}.gnv2")
     r = sh([gnc_bin, "benchmark-sequence", "-i", src, "-n", str(n), "-k", str(ki),
             "-q", str(q), "--chroma-format", chroma, "-o", gnv]
+           + extra
            + (["--bit-depth", "10"] if DEPTH[0] == 10 else []),
            env={**os.environ, "GNC_REF_DEBLOCK": "0"})
     if not os.path.exists(gnv):
@@ -190,6 +192,8 @@ def main():
     ap.add_argument("--workdir", default=None)
     ap.add_argument("--csv", default=None)
     ap.add_argument("--label", default="")
+    ap.add_argument("--abac", action="store_true",
+                    help="GNC --abac (opt-in code-block coder). Rice is the default.")
     args = ap.parse_args()
 
     w, h = y4m_geometry(args.src)
@@ -204,14 +208,17 @@ def main():
     gnc_input = os.path.join(ref_pngs, "%04d.png")
 
     name = args.label or os.path.basename(args.src)
+    gnc_extra = ["--abac"] if args.abac else []
+    coder = "abac" if args.abac else "Rice"
     print(f"\n=== MEAS-1 {name} — {w}x{h}, {args.frames} frames, ki={args.keyint}, "
-          f"chroma {args.chroma}, {args.depth}-bit ===")
+          f"chroma {args.chroma}, {args.depth}-bit, GNC {coder} ===")
 
     rows = []
     print(f"\n  {'codec':6} {'setting':>8} {'bpp':>9} {'VMAF':>8} {'PSNR-Y':>8}")
     gr, gq, gp = [], [], []
     for q in [int(x) for x in args.q.split(",")]:
-        res = run_gnc(gnc_input, work, args.frames, args.keyint, q, args.chroma, args.gnc)
+        res = run_gnc(gnc_input, work, args.frames, args.keyint, q, args.chroma, args.gnc,
+                      extra=gnc_extra)
         if not res or res[1] is None:
             continue
         size, (v, ps) = res

@@ -260,7 +260,8 @@ this document.** Re-running the same harness at the operating point §1 says GNC
 rather than at distribution bitrates, where the earlier figure was taken and where the quality
 ladder above q=92 was dead — gives **+90.5% BD-rate on PSNR**, about **1.9x**: +129.0% on bbb,
 +71.9% on old_town, +70.6% on crowd_run. Nothing in the coder changed between the two
-measurements.
+measurements. **Re-taken 2026-09-08 (MEAS-10) after INTER-2: +89.2%** (+128.5% / +70.2% /
++68.8%). Quote +89.2% for current HEAD; it is still 1.9x.
 
 Three consequences for this document's argument:
 
@@ -282,7 +283,7 @@ Three consequences for this document's argument:
   by 0.01 dB, because motion compensation leaves almost no chroma residual to reclaim. The knob is
   a real lever only where intra dominates (−20.8% all-intra against −2.9% on a ki=9 P-chain) —
   which is a normal contribution mode, so it is worth having, but it does not touch the gap.
-  **The +90.5% is genuine luma coding deficit. Intra is the only route, established by elimination.**
+  **The +89.2% (QUAL-1 +90.5%) is genuine luma coding deficit. Intra is the only route, established by elimination.**
 
 **And do not quote a VMAF BD-rate above about q=85.** Widening the quality ladder moved the VMAF
 figure by a mean of 47.5 points (old_town +81.1% → +191.4%) while PSNR moved 1.0 point. §3's note

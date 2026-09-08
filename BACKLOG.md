@@ -180,6 +180,11 @@ could not offer the largest built lever in the codec. Filed as **ENT-9** and par
 `blocked-idle-machine`, since deciding it needs two wall-clock figures and eight sessions share
 one GPU. Decision `docs/decisions/0060`.
 
+**The canary for this item is that it was taken.** ENT-9 was claimed by another session **six
+minutes after the heading landed on `main`** — before DOC-3 could park it — which is the whole
+argument of `0060` measured rather than asserted: the work was equally available for two days as
+prose and nobody could pick it up, because `scripts/claim` cannot see prose.
+
 **Why this is worth an item rather than a drive-by edit.** Every one of the five stale lines was
 written *correctly* and went stale when someone else finished the work — which is the normal case
 here, not negligence, and it is why the fix is structural: **a pointer to work that has no ID has

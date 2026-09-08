@@ -1214,6 +1214,42 @@ does, and it is the first command `docs/GPU_TIER_TEST.md` tells you to run on a 
 The count is now simply not asserted. And CLAUDE.md's argument against parallel role-based agents
 rested on *"the hardware is one M1 with 8 GPU cores"* — the contention argument survives, the
 hardware claim in it does not, so it now says "one machine with one GPU".
+### BUG-34 — GNC requests 10 storage buffers per stage against a default of 8 (todo, P2)
+
+Filed 2026-09-08 by ENT-7, found while checking a literature brief's claim about the WebGPU
+default rather than by looking for it.
+
+`src/lib.rs:1431` asks for `max_storage_buffers_per_shader_stage: 10` on top of
+`wgpu::Limits::default()`, whose value for that field is **8** — verified in
+`wgpu-types-24.0.0/src/lib.rs:1270`, and 8 is also the WebGPU specification's default. So
+**CLAUDE.md's "GNC asks for wgpu's default limits, not the hardware's, so the same shaders run
+under WebGPU (rule 4)" is not true for storage buffers**, and its portability table prints the 10
+without flagging that it is an override. `gnc gpu-info` shows `storage buffers / stage: adapter
+has 31, GNC requests 10`, which is exactly the line that should have made this obvious.
+
+**Same class as BUG-31, different limit.** Nothing fails here — the adapter offers 31 — so this is
+invisible on the dev machine and would surface as a failed `request_device` on a conformant
+implementation held to the defaults.
+
+**Three things to settle, and the third is the point.**
+
+1. **Which shader needs the tenth buffer?** Find it. If one stage can be split or two buffers
+   merged, the override goes away and rule 4 is true again.
+2. **If the override has to stay, it is a decision, not a line of code.** CLAUDE.md already says
+   raising a request "is unmeasured and would need a decision record, not a commit" — that applies
+   to a request already raised.
+3. **Nothing enforces this.** BUG-31's fix comes with a static test that sums `var<workgroup>`
+   declarations per `.wgsl` file against `Limits::default()`. The same test should assert every
+   field of the `Limits` GNC requests against `Limits::default()`, and fail on any override that
+   is not annotated. That is the change that stops a third instance.
+
+**Success criterion:** either the request is `Limits::default()` unmodified with all tests green,
+or the override is recorded in a decision record and asserted by a test that names it. Plus
+CLAUDE.md's portability prose corrected either way.
+
+**Why P2.** Same reasoning as BUG-31 — no measurement is invalidated and nothing fails on this
+machine — but the affected claim is a documented project rule, and step 1 may well be free.
+
 ### BUG-31 — abac's two GPU shaders ask for more workgroup memory than the device is created with (todo, P2)
 
 Filed 2026-09-08 by ENT-5, found by reading **BUG-29**'s new limits table rather than by hitting
@@ -4005,7 +4041,44 @@ threshold** — a threshold is what let 55 dB pass for lossless in BUG-15.
 **Invalidates:** any lossless figure taken with `GNC_DEAD_ZONE` set. No shipped default carried one,
 so no published number moves.
 
-### ENT-7 — fix the WGSL that breaks WebGPU's limits, or replace the coder with BPC-PaCo (todo, P2)
+### ENT-7 — replace abac with BPC-PaCo? No (**part 2 REJECTED 2026-09-08**; the WGSL half is BUG-31)
+
+**Steps 2 and 3 are done and the answer is no.** Decision record
+[0030](docs/decisions/0030-bpc-paco-is-not-the-sixth-entropy-coder.md), numbers in RESEARCH_LOG
+"ENT-7 steps 2–3". Priced on GNC's own shipped coefficients with a seventh model in the
+`GNC_COEF_ENTROPY=1` harness (`src/encoder/bpc_paco_diag.rs`), four stills, q=85 and 90, the
+parameters of `0024`:
+
+| mean over four stills | q=85 | q=90 |
+|---|---|---|
+| BPC-PaCo's model, oracle table trained on the image itself | −7.76% | −7.87% |
+| leave-one-image-out table (what a stationary coder ships) | −1.96% | −2.20% |
+| **+ its 32 fixed-length codeword streams per block** | **+2.81%** | **+1.85%** |
+| dropping the cross-lane exchange (vs the first row) | +9.35% | +8.63% |
+
+Fails the +2% criterion at q=85, scrapes it at q=90, and is +6.21%/+4.07% on bbb. The model's
+7.9% is abac's cold start counted from the other side — `Y LL` −50.4%, sub-64px bands −12% to
+−29%, full 64×64 blocks only −4% to −11% — so it belongs to **ENT-6**, not to a new backend. Two
+mechanisms extracted instead: **ENT-6** takes the stationary priors, **ENT-8** takes the
+two-column lockstep scan. Not taken: the fixed-length multi-codeword coder (4.0 pts here).
+
+**Part 1 is untouched and lives in BUG-31**, which is where the WGSL fix was always specified.
+Nothing in part 2's rejection changes it: WASM decode is still broken by 18 688 B of declared
+workgroup storage against a 16 384 B device, and BUG-34 is now a second instance of the same
+class. ENT-7 is out of rotation; take BUG-31.
+
+**What the papers say, for anyone who reopens this.** BPC-PaCo's parallelism is *free* in rate —
+its two-column lockstep scan sees an average of 4 already-coded neighbours, exactly what JPEG
+2000's raster scan gets, and the authors' own ablation puts the entire penalty on the multiple
+codeword streams. Its throughput needs `__shfl`, `__ballot` and `__popc`; the ballot **is** the
+bitstream ordering rule, and WGSL guarantees no relationship between subgroup lane ids and
+`local_invocation_index`, so a subgroup port would have a device-dependent bitstream. And the
+authors retired the stationary model in 2023 for an adaptive sliding window that beats JPEG 2000
+and HTJ2K at medium and high rates — **if the backend question ever returns, that paper is the
+specification, not the 2016 one.** The reference CUDA has no licence file at all and cannot be
+copied.
+
+The original filing follows, unchanged, as the record of what was asked.
 
 Filed 2026-09-08. Two halves; the second, if it pays, deletes the first.
 
@@ -4136,6 +4209,67 @@ decode, and the BUG-31 static workgroup-storage assertion in CI.
 **Decision record required either way** — a shipped coder is a default-adjacent choice, and a
 rejection is a recorded conclusion with numbers (the EBCOT entry is the template).
 
+### ENT-8 — abac could code 32 stripes per code-block instead of one, at no context cost (todo, P2)
+
+Filed 2026-09-08 by ENT-7 step 3, which found it while rejecting the coder it came from. **This is
+a throughput item with a rate gate, not a rate item.**
+
+**The mechanism, and it is the one genuinely surprising thing in the BPC-PaCo papers.** abac runs
+**one GPU thread per code-block** on both sides. BPC-PaCo splits a block into vertical stripes two
+columns wide, one thread per stripe, and steps them in lockstep — every thread codes the left
+column of row *y*, then every thread codes the right column of row *y*. A left-column coefficient
+then has **3** already-coded neighbours and a right-column one **5**, so the average is **4 —
+exactly what a sequential raster scan gets** (TIP 2016 §III-A). The parallelism is bought by
+*scheduling*, not by weakening the context, and the authors' own ablation confirms it costs
+essentially nothing in rate.
+
+**For a 64px code-block that is 32 threads where abac has 1.** ~3000 blocks per padded 1080p 4:4:4
+frame today; this would be ~96 000 invocations.
+
+**What has to be checked, in this order.**
+
+1. **The rate cost on abac's template, offline, before any shader.** abac's context is
+   `neighbour_sum` over left, up, up-left, up-right — 4 causal neighbours, all available in a
+   raster scan. Under the lockstep scan an even-column coefficient loses the *left* neighbour and
+   an odd-column one gains nothing it did not have, so the template degrades to 3 of 4 on half the
+   coefficients. **That is a different arithmetic from BPC-PaCo's 8-neighbourhood and it does not
+   inherit their result** — BPC-PaCo's average is unchanged because it reads 8 neighbours, abac
+   reads 4 and they are all on the causal side. Price it with `src/encoder/bpc_paco_diag.rs`'s
+   `visit_order`, which already produces the scan, against `Hctx` in the same harness. **Gate: if
+   this costs more than 1% of total rate at q=85/90 on the four stills, stop here** — the
+   throughput is not worth a rate regression, and 1% is roughly a quarter of everything abac has
+   left (`0024`: +4.1% on the full blocks).
+2. **Then the WGSL cost, which is the real question.** The exchange of the left neighbour across a
+   stripe boundary needs one bit per coefficient per step between adjacent threads. WGSL has no
+   portable subgroup shuffle, so it goes through workgroup storage plus a `workgroupBarrier()` per
+   step — 64 rows × 2 phases per block. The authors measured the same substitution at **~20% on
+   their DWT kernel**, which is far less exchange-dense, so treat 20% as a floor on the loss and
+   the open question as whether 32× the invocations beats it.
+3. **Barrier uniformity constrains the workgroup shape.** WGSL requires barriers in uniform
+   control flow, and abac's per-block loop bounds are per-block, so one code-block per workgroup
+   at `@workgroup_size(32)` is the shape that is legal without masking. That is 32 of 256
+   invocations, which wastes 7/8 of the workgroup unless the tail is filled with something.
+
+**Success criteria.** Bit-exact CPU/GPU on the full artefact set, like ENT-5 (98 of 98 whole
+files). Rate within **1%** of today's abac at q=85 and 90 on the four stills at bit-identical
+decoded pixels — abac is lossless recoding, so if quality moves the measurement is wrong. Decode
+**≥1.2×** today's abac at 1080p 4:4:4 on an idle machine, encode not worse. Below that, close it:
+the 1.9× ceiling on all entropy work (BACKLOG Part 6) means there is not much to win and a
+bit-exactness surface to maintain.
+
+**Canary:** a per-frame count of stripes coded and barriers executed under `GNC_PROFILE`, and the
+existing byte-exactness gate `scripts/ent5_gpu_encode_gate.sh` unchanged and green.
+
+**Do not measure step 2 with `benchmark-sequence` or `gpu_tier_bench.py --density`.** BUG-32
+(merged 2026-09-08) found that command spends **86% of its wall clock on CPU quality metrics**, so
+its frames-per-second is SSIM throughput, not GPU encode. Use `--density-still`. The rate half of
+this item is unaffected either way — bytes are deterministic.
+
+**Why P2.** It is the only remaining idea with a credible path to abac's decode cost, and step 1
+is an afternoon with an existing harness. Against that: the throughput half cannot be measured on
+a shared machine at all (COORDINATION), and the rate gate may kill it before the shader work
+starts — which is why the gate is first.
+
 ### ENT-6 — abac's deep subbands are one short code-block each, and they cost ~4% of the file (todo, P2)
 
 Filed 2026-09-07 by INTRA-1 step 1, which found it while measuring something else. **Not the answer
@@ -4169,10 +4303,30 @@ effect grows with quality: the small bands read +23.1% / +25.9% / +28.9% / +34.2
    coefficients; the level-4 set is 4x16x16 = 1024. Cutting one block per *level* instead of one
    per band gives the coder 4x the symbols. Costs the per-band homogeneity the current cut buys, so
    it must be measured, not assumed — the orientation difference is real.
-3. **Neighbourhood-derived initial probabilities rather than signalled ones** — BPC-PaCo's
-   stationary model, filed as **ENT-7** because it also raises the sixth-backend question. Same
-   mechanism as candidate 1 with no header bits, and ENT-7's step 3 reports exactly the rows this
-   item cares about. If it measures positive, this is the cheapest of the three.
+3. **Trained stationary initial probabilities rather than signalled ones** — BPC-PaCo's
+   mechanism. **ENT-7 step 3 has now measured it and it is the biggest of the three
+   (2026-09-08, decision `0030`).** A stationary per-bitplane, per-subband model over the same
+   shipped coefficients prices **7.8–7.9% below what abac spends**, and the saving sits exactly
+   where this item says it should: `Y LL` **−50.4%**, the sub-64px bands −12% to −29%, the full
+   64×64 blocks only −4% to −11%. Three things ENT-7 learned that this item should not have to
+   rediscover:
+
+   - **Use the table as a prior, not as the model.** Of that 7.9%, **5.7 points is what
+     *stationarity* costs** — a table trained on three of the four stills and applied to the
+     fourth gives back nearly everything. abac keeps adapting, so it pays that only on the first
+     symbols of each block, which is precisely the defect being fixed.
+   - **Chroma needs its own tables, or none.** The leave-one-out misses are ≤0.31% on Y and up to
+     **2.44% on Co**, and every band where the trained table came out *worse* than abac is a
+     chroma level-1 band. Four images is a thin corpus; the Y tables travelled and the chroma
+     tables did not.
+   - **Per bitplane matters.** The literature is explicit that a single pooled table degrades
+     every corpus, and that LUTs must be built bitplane by bitplane
+     (Aulí-Llinàs & Marcellin, *IEEE TM* 16(4), 2014, §IV).
+
+   Also from that literature, and the direct confirmation of this item from outside: a stationary
+   model *beats* adaptive JPEG 2000 as code-blocks shrink — lossless natural imagery, +0.04 bps at
+   64×64, 0.00 at 32×32, **−0.10 at 16×16**, with half JPEG 2000's degradation over that range.
+   Short blocks are where a prior wins, which is what this item is about.
 
 **Success criterion:** ≥2% of total rate at q=90 on all four stills, at bit-identical decoded
 pixels (abac is lossless recoding; if quality moves at all, something else changed). Below 1%,

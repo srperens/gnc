@@ -14031,3 +14031,117 @@ nobody has.
 left needs a discrete NVIDIA card with driver 610+/nvenc 13.1 or an idle Mac. Its entry was
 corrected and it is parked as `blocked-idle-machine-or-nvenc` so it stops being handed to every
 fresh session as the top P0.
+
+## 2026-09-08 — BUG-28 is BUG-16, abac was never the culprit, and the cause is a quantiser that only exists on one path
+
+### What the item claimed, and what is true
+
+BUG-28 said "abac and Rice decode to different pixels on subsampled chroma", suspected abac's
+per-plane chroma dispatch indexing CfL/AQ side data with the luma tile count, and sent the reader
+at `pipeline.rs`. **All three are wrong.** It is a duplicate of BUG-16, abac is the *correct* side,
+and it is not specific to subsampled chroma.
+
+### Reproduced first, then bisected
+
+The filed table reproduces exactly: 4:2:2 and 4:2:0 differ at q=50 and q=75, agree at q=90, 4:4:4
+agrees everywhere tried.
+
+The entry's two candidates both died immediately. `GNC_NO_CFL=1` does not change it, so CfL is not
+the cause; and it still differs at **q=25**, where AQ (30–80) and CfL (50–85) are *both off*.
+
+### The trap that cost the most time, recorded because it will catch the next person
+
+Two dead ends were mine, not the codebase's:
+
+- **A stale artefact read as a passing result.** An encode-then-decode helper wrote a fixed
+  `x.gnc`; when the encode failed the decode silently re-read the *previous* run's file and
+  reported "identical". That produced a confident, wrong refutation of the hypothesis that turned
+  out to be correct. Every helper now `rm`s its outputs first and fails loudly.
+- **zsh does not word-split unquoted parameters.** `run "--rice --cpu-encode"` passed *one*
+  argument, clap rejected it, and combined with the stale file the run looked like a clean
+  negative. Both traps had to fire together to be convincing, and they did.
+
+### Grayscale is the right reproducer
+
+`ffmpeg -i in.png -vf format=gray,format=rgb24 gray.png`. Chroma is then exactly zero, so chroma
+subsampling is lossless by construction and **any** difference is pure luma. Both decodes stay
+perfectly gray (0 non-gray pixels, channel spread 0), so this is not chroma leaking into luma.
+
+It also widens the window enormously — 4:2:2 now differs at **every q ≤ 86** instead of at two
+points. Anyone debugging BUG-16 should start here.
+
+Also worth stating because it nearly misled: splitting the decoded RGB into ffmpeg's BT.601 planes
+showed all three planes differing, which looks like a luma bug. It is not evidence of one — those
+planes are all functions of RGB, so a pure chroma error contaminates every one of them. That is
+exactly the contamination CLAUDE.md records as overstating a loss 3.7x. The grayscale construction
+is what makes the luma claim safe.
+
+### Three coders settle which side is wrong
+
+| q | chroma | Rice GPU | Rice CPU | abac | |
+|---|---|---|---|---|---|
+| 25 | 4:4:4 | 676a0f4410 | 8787c8cfeb | 8787c8cfeb | GPU differs |
+| 25 | 4:2:2 | 676a0f4410 | 8787c8cfeb | 8787c8cfeb | GPU differs |
+| 35 | 4:4:4 | 60b3abc6de | d4e50eb961 | d4e50eb961 | GPU differs |
+| 35 | 4:2:2 | 60b3abc6de | d4e50eb961 | d4e50eb961 | GPU differs |
+| 40 | 4:4:4 | 979d564d2b | 979d564d2b | 979d564d2b | agree |
+| 40 | 4:2:2 | 759addd835 | 979d564d2b | 979d564d2b | GPU differs |
+| 75 | 4:4:4 | d5b08733ae | d5b08733ae | d5b08733ae | agree |
+| 75 | 4:2:2 | f05b4d40a5 | d5b08733ae | d5b08733ae | GPU differs |
+| 90 | 4:4:4 | 658e394c1e | 658e394c1e | 658e394c1e | agree |
+| 90 | 4:2:2 | 658e394c1e | 658e394c1e | 658e394c1e | agree |
+
+**CPU-Rice and abac agree in 10 of 10.** Every divergence is GPU-Rice against both. abac is
+independently trustworthy here: `GNC_ABAC_COMPARE=1` at 4:2:2 reports all 5 242 880 coefficients
+bit-exact between its GPU decode and its CPU reference, and its luma is **501767 B at both 4:2:2
+and 4:4:4**, i.e. provably chroma-format-independent.
+
+So the shipped default encoder is the wrong one, and the corrected boundary is **4:4:4 differs at
+q ≤ 35** (not "below about q=30" as BUG-16 had it) and **4:2:2/4:2:0 differ at q ≤ 86**.
+
+### Root cause, proved by disabling it
+
+`src/shaders/quantize_histogram_fused.wgsl:441`, Phase-2 **sparse-group dead-zone expansion**: any
+non-LL subband group that is ≥95% zero after the first pass has its surviving `|q| == 1`
+coefficients re-quantised to 0. **`quantize.wgsl` contains no such step.** The two are not two
+implementations of one quantiser; the fused one is lossier on purpose, and
+`use_fused_qh = use_fused_quantize_histogram && use_gpu_encode && !use_cfl` silently decides which
+one codes the frame. abac never reaches it, because `use_gpu_encode` is false for abac by
+construction (`pipeline.rs:1720`).
+
+Setting that threshold to `>= 101u` so the branch cannot fire makes **GPU-Rice equal CPU-Rice at
+all 10 points**, with every hash equal to abac's. Reverted afterwards; no source change is
+committed.
+
+This also explains the shape BUG-16 could not: sparsity, not a feature flag, is the sufficient
+condition. Low q makes subbands sparse; on grayscale the chroma planes are sparse at almost any q;
+at q=90 nothing crosses 95% and the paths agree with the fused shader still active.
+
+### What the expansion buys, and why that makes this a decision rather than a repair
+
+Three 1080p stills, shipped (on) against disabled (off). The net column converts the PSNR loss to
+rate using each image's own local RD slope between adjacent ladder points:
+
+| image | point | PSNR on → off | size on → off | net |
+|---|---|---|---|---|
+| bbb | q=25 4:4:4 | 35.51 → 35.63 (+0.12 dB) | +2.50% | ~+1.1% win |
+| blue_sky | q=25 4:4:4 | 37.24 → 37.37 (+0.13 dB) | +2.40% | ~neutral |
+| touchdown | q=25 4:4:4 | 35.44 → 35.55 (+0.11 dB) | +3.69% | ~+0.6% win |
+| all three | q=40 4:4:4 | 0.00 dB | 0.00% | does not fire |
+| all three | q=50/75 4:2:2 | +0.03 to +0.06 dB | +0.14 to +1.85% | small win |
+
+**It is a marginal net win of 0–1%, not free and not harmful.** That is the whole reason this was
+not fixed on the spot: deleting it is cheap and costs that 0–1%; implementing it in
+`quantize.wgsl` keeps it but needs per-group zero counts the separate shader does not compute and
+would move abac's published −16.6% to −18.8%; gating it in config makes it a named tool. All three
+change shipped rate/quality and want a BD-rate ladder and a decision record. **Cause found and
+measured here; the answer deliberately not picked.**
+
+### Honest note on how this item was worked
+
+BUG-37 earlier today was filed rather than fixed on the reasoning that both obvious fixes were bad.
+Challenged on it, the third option took ten minutes to find and the bug turned out to be five times
+larger than filed. The same instinct nearly stopped this one at "abac and Rice differ, needs a GPU
+expert". The general lesson is not "always fix" — BUG-16's fix genuinely is a design decision — it
+is that **"this needs its own item" is a claim about the work, and it should be made after looking,
+not instead of looking.**

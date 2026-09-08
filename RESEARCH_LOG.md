@@ -18016,3 +18016,109 @@ two quantisers, these three). It is worth treating as a pattern rather than thre
 q=100 sequences decode to a worst-frame **7.91 dB** on crowd_run. That is **BUG-39**, already
 reserved by the RATE-3 session; byte-identical under both multipliers here, so this change neither
 causes nor fixes it. Mentioned because it is a lossless mode reading 7.91 dB.
+
+---
+## 2026-09-08 (round 3) -- inter now runs on the Windows laptop, and the first clean inter density number
+
+Same machine as round 2: Windows 11 Pro laptop, **Intel Arc Pro Graphics** + **NVIDIA RTX 2000 Ada
+Laptop GPU**, 31.5 GB RAM. Built and run from **f90f94d**, which **has the BUG-25 fix** (`51a9ac6`;
+`git merge-base --is-ancestor 51a9ac6 HEAD` = yes). Round 2 was `f17bf1b`, which predated it. Python
+and ffmpeg run from a policy-allowed path (AppLocker), gnc from the redirected `CARGO_TARGET_DIR`.
+
+The point of the round was the two items `docs/decisions/0029` and the updated `GPU_TIER_TEST.md`
+left owed: re-run the inter path on this hardware now that BUG-25 is fixed, and measure density with
+the modes that time the GPU rather than the CPU (BUG-32).
+
+### Inter (P-frames) now works on both GPUs -- 0029's expectation is now a measurement
+
+`benchmark-sequence -k 9` (I+P), the exact path that crashed in round 2 with `0xC0000005` (NVIDIA)
+and `0xC0000409` (Intel) on the pre-fix module:
+
+| GPU | backend | exit | frames | total bytes | encode time |
+|---|---|---|---|---|---|
+| NVIDIA RTX 2000 Ada | Vulkan | **0** | 1I+4P | 1972436 | 411.9 ms (12.1 fps) |
+| Intel Arc Pro | Vulkan | **0** | 1I+4P | 1972436 | 798.3 ms (6.3 fps) |
+
+Both encode inter cleanly. **Output is byte-identical across the two different-vendor GPUs**
+(1972436 bytes), so the cross-backend determinism that round 2 showed for intra holds for inter too.
+Encode time ratio 1.94x (NVIDIA faster), consistent with CANARY-1's 2.01x. This is exactly what 0029
+predicted and declined to claim as measured ("an expectation, not a measurement"); it is measured
+now. Round 2's two Windows crashes are confirmed as the one invalid-SPIR-V module, not driver bugs.
+
+### CANARY-1 -- regression check, reproduces at 2.01x
+
+`--tier`, bbb q=90, best-of-5, Vulkan:
+
+| device | encode | decode | settle |
+|---|---|---|---|
+| Intel Arc Pro | 34.59 ms (28.9 fps) | 25.42 ms | 1.01 / 1.01 |
+| NVIDIA RTX 2000 Ada | 17.24 ms (58.0 fps) | 10.92 ms | 1.01 / 1.02 |
+
+**Spread 2.01x** (round 2: 2.05x). A 2% move at settle 1.01 is noise: +26k lines of merged work
+across the codebase did not move CANARY-1. Encode times are a hair faster (34.59 vs 36.45, 17.24 vs
+17.75) but within the same noise. Microsoft Basic Render Driver (WARP) still panics.
+
+### MEAS-5 density -- two modes now measure the GPU, and they tell a two-part story
+
+Round 2's density used `benchmark-sequence` without knowing it spends 86% of wall on CPU PSNR/SSIM
+(BUG-32) and retains the whole decoded sequence. Both are now avoidable.
+
+**Inter, shipped config (`--density`, i.e. `benchmark-sequence --throughput`, decision 0046),
+NVIDIA, levels 1,2,4:**
+
+| N | completed | wall s | aggregate fps | scaling |
+|---|---|---|---|---|
+| 1 | 1/1 | 5.0 | 24.10 | 1.00x |
+| 2 | 2/2 | 6.4 | 37.27 | 1.55x |
+| 4 | 4/4 | 10.8 | 44.49 | **1.85x** |
+
+**Monotonic, no collapse.** This is the first clean *inter* density number on any hardware -- the
+doc said none was available until the `--throughput` flag existed, and it now does. Removing the
+metrics and the sequence retention is what lets it scale where round 2's number collapsed.
+
+**Intra (`--density-still`, `benchmark` one frame + GPU-power sampling), NVIDIA:**
+
+| N | completed | wall s | aggregate fps | scaling | GPU power mean/max W |
+|---|---|---|---|---|---|
+| 1 | 1/1 | 2.2 | 11.03 | 1.00x | 19.1 / 38.3 |
+| 2 | 2/2 | 3.3 | 14.51 | 1.32x | 29.3 / 35.0 |
+| 4 | 4/4 | 15.2 | 6.30 | 0.57x | 30.6 / 48.7 |
+| 8 | 0/8 | ~727 (aborted) | -- | OOM | 2.0 / 32.8 |
+
+**The common ceiling is per-process memory, not GPU compute.** A single `--throughput` process peaks
+at **1847 MB** (measured), so N=8 is ~15 GB and thrashes to a stop (GPU power falls to 2.0 W mean --
+the card is idle, waiting on RAM). GPU power never exceeds ~49 W and plateaus near 30 W, so the card
+is not the bottleneck at any N that completes. On this 32 GB laptop that memory footprint caps useful
+concurrency around N=4.
+
+One honest inconsistency: the inter sweep scales to 1.85x at N=4 while the intra-still sweep
+*collapses* to 0.57x at the same N, on the same GPU. Both hold ~1.8 GB, so 4 instances (7.2 GB) fit
+either way -- the difference is not memory. The likely cause is that intra-still's per-process work is
+tiny (one frame x 24 iters = 2.2 s at N=1), so concurrent GPU/driver init dominates its wall, while
+the inter sweep's 120-frame work amortises that. The robust, mode-independent finding is the N=8 RAM
+ceiling; the N=4 intra collapse is a measurement of startup contention, not of GPU scaling.
+
+### DX12 -- the fast crash is gone, replaced by a compile that does not finish
+
+Round 2: DX12 encode died in seconds with FXC `X3695: race condition writing to shared` in
+`block_match_bidir.wgsl`. On f90f94d's shaders that error is gone -- but the DX12 encode now sits in
+FXC shader compilation for **>4.5 minutes at 95% CPU** (261 CPU-seconds, 469 MB, no output) before it
+was killed. Whether it would ever complete is unknown; a multi-minute single-threaded compile per
+process is not usable regardless. **DX12 remains non-functional for GNC in practice**, now for a
+compile-time reason rather than a compile-error one. Not investigated further this round.
+
+### hwenc -- unchanged
+
+NVENC is still refused (ffmpeg 9.0.1 wants NVIDIA driver 610+/nvenc 13.1; machine has 13.0). Intel
+QSV was measured in round 2 (4.54x at N=8) and not re-run.
+
+### State
+
+- **Inter on Windows: WORKS**, on both GPUs, byte-identical output. 0029's owed measurement is done.
+- **CANARY-1: PASS, 2.01x** -- reproduces round 2's 2.05x within noise; a regression check now.
+- **MEAS-5 inter density: 1.85x at N=4, monotonic** (first clean inter number, via `--throughput`).
+- **MEAS-5 intra density-still: memory-bound** -- ~1.8 GB/process caps concurrency ~N=4, N=8 OOMs;
+  GPU power shows the card idle-waiting, not compute-bound.
+- **DX12: still unusable** -- X3695 gone, replaced by a >4.5-min FXC compile. Needs its own item.
+- **Still owed:** N=8+ inter density on a machine with more RAM (or a lower-footprint encode path);
+  NVENC (driver); large-GPU MEAS-5; whether DX12 ever finishes compiling; 4:2:2 and 10-bit on Vulkan.

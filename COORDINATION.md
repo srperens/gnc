@@ -1119,6 +1119,30 @@ wrong conclusions have come from this one error.
 
 ## Landed today, and what each one invalidates
 
+- **Three dead sessions' work was committed onto their own branches, and their items left free.**
+  `bug35rans` `c698d1c`, `next2` `20bb41b`, `g41232` `8872707`; PAD-2's *finished* commit
+  `6397188` was merged to `main` separately. **Invalidates nothing** — the three WIP commits touch
+  no branch anyone is on, and the merged one is a negative result that changes no default.
+
+  Three things worth carrying:
+
+  - **`0069` splits "must not be stolen" from "must not be left lying there", and both halves are
+    actionable at once.** An `OWNER UNIDENTIFIABLE` claim with uncommitted files may not be taken
+    without reading the diff — but nothing stops you *committing* it on its own branch and leaving
+    the item free. That preserves the work, repeats nobody, and steals nothing. It is strictly
+    better than the two options that were on the table when the pid oracle failed.
+  - **Preserving work in a branch does not make it findable, because the lock reads `main`.** A
+    session claiming BUG-35 through `claim next` has no way to learn that `bug35rans` holds a
+    committed fix. The pointer has to go in the **BACKLOG entry**, which is the file `next` and
+    `items` actually read — done for all three. Same shape as "an item that is not on `main` is
+    invisible to the lock", one level down: *work* that is not on `main` is invisible too.
+  - **A snapshot of who is dead goes stale while you act on it.** Four worktrees were surveyed as
+    abandoned; ten minutes later `gnc-tile1` had been inherited by a live session (`refdiff`,
+    "holder has no socket and no ListAgents row, 13 files idle 2h") which had already committed on
+    top. Acting on the first snapshot would have committed over a live session's in-progress work
+    — the merge-abort incident again, with a different verb. **Re-read `claim list` and
+    `git status` immediately before touching another session's worktree**, not when you decide to.
+
 - **ENT-9 — abac context-codes the Exp-Golomb prefix; bitstream is now GP19.**
   `docs/decisions/0074`. **This one changes output**, and only for `--abac`: total rate
   **−2.07% to −8.76% at q=99**, −1.26% to −4.56% at q=95, −0.85% to −2.75% at q=90, at

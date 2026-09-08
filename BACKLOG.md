@@ -1798,6 +1798,15 @@ where two different pieces of work share a startable id.
 
 ### BUG-35 — five more compute entry points are over the workgroup budget; the default path is done, the rANS half is not (todo, P2)
 
+**A committed starting point exists on branch `bug35rans` (`c698d1c`), and `claim next` cannot
+tell you that.** The session holding this item was gone for 2h26m with the work uncommitted; it
+was committed by the ENT-3 session on 2026-09-08 so it would survive, and the item was left free
+rather than stolen (`0069`: an `OWNER UNIDENTIFIABLE` claim must not be taken without reading the
+diff). **Read that branch before starting from scratch.** It moves the fused quantize+histogram
+accumulation out of a 5120-entry workgroup arena — 20 KB against the 16 KB device request — into
+`hist_output` storage atomics, leaving the binding layout alone so BUG-34's count stays at 9.
+**Reviewed for coherence, not verified: not gated, not measured, canary not run.**
+
 **The default encode path is off the over-budget entry point, and the histogram it was computing
 turned out to be dead work.** `quantize_histogram_fused.wgsl` gained
 `main_quantize_only` — same quantiser, no `shared_hist`, **3264 B measured** against `main`'s
@@ -2004,6 +2013,16 @@ than an opt-in coder's, and fix 1 is one line. It is P1 if a browser run confirm
 P3 if it shows the limit is not enforced there either.
 
 ### PERF-2 — the per-dispatch uniform buffers need dynamic offsets, not a cached UBO (todo, P3)
+
+**A committed starting point exists on branch `next2` (`20bb41b`), and `claim next` cannot tell
+you that.** Same story as BUG-35: session gone 2h26m, 8 files uncommitted, committed by the ENT-3
+session so it would survive, item left free rather than stolen. **Read that branch first.** It
+replaces per-dispatch `create_buffer_init` with one persistent uniform buffer addressed by dynamic
+offsets, plus a slot allocator (`reset_slots` per submit) and a documented fallback when slots run
+out rather than reusing a live one. Its comment names the hazard: Metal/wgpu stages
+`write_buffer`, so one cached UBO at offset 0 hands every dispatch in a shared submit the last
+write. **Reviewed for coherence, not verified** — and note this item's payoff is a throughput
+claim, which COORDINATION rule 1 forbids reading while other sessions are live.
 
 Filed 2026-09-08 by PERF-1, which verified the sites and then declined the fix as specified.
 
@@ -6450,6 +6469,17 @@ MC-friendly, collecting the remaining ~4.6% on video too — but it changes the 
 needs a bitstream version.
 
 ### PAD-2 — collect the padding fill on inter, by re-replicating in the decoder (todo, **P2**)
+
+**The finished half is now on `main`; the unfinished half is on branch `g41232` (`8872707`).**
+`6397188` — the Dirac zero-extend result, 8 of 12 worst-frame points regressing and −4.960 dB at
+worst — was committed in that worktree and never merged, and its session has been gone since. It
+was merged to `main` by the ENT-3 session because a measured negative result stranded on a dead
+branch is precisely what CLAUDE.md's logging rule exists to prevent. **What is still on the branch
+is this item's own "next step"** from that RESEARCH_LOG entry: `GNC_MC_CLAMP_VISIBLE=1` clamps
+motion-compensation reference reads to the visible picture instead of the padded plane, threading
+`orig_w`/`orig_h` through to `motion_compensate.wgsl`. Default off, so nothing shipped moves; it
+is a decode-process change if it ever does. **Reviewed for coherence, not verified.** The item is
+free.
 
 Filed 2026-09-08 by PAD-1, which shipped the still half and measured exactly why the inter half
 does not follow. **Worth roughly −7% to −10% of sequence rate** (that is what forcing the fill on

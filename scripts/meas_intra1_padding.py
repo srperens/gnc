@@ -123,6 +123,14 @@ def bd(ref, test, metric):
 
     The overlapping-quality window comes back with the figure and is worth watching: two ladders
     that barely overlap produce a number from almost no data.
+
+    **A rung whose quality is infinite is refused, not integrated.** Since RATE-2 (2026-09-08) the
+    encoder codes q=95..99 both ways and keeps the smaller, so a rung in that range can come back
+    *bit-exact lossless* — `psnr()` returns `inf` and `np.polyfit` then returns `nan` for the whole
+    curve. That is a silent nonsense number, and the padded crops in this harness are exactly the
+    arms that reach lossless first, because a flat padding region is cheap to code losslessly. So a
+    ladder that touches the dual-path range cannot be used for a BD-rate here: keep every rung at
+    **q <= 94** and this guard never fires.
     """
     ra = [p["bpp"] for p in ref]
     qa = [p[metric] for p in ref]
@@ -130,6 +138,8 @@ def bd(ref, test, metric):
     qb = [p[metric] for p in test]
     if min(len(ra), len(rb)) < 4:
         return None, (0.0, 0.0)
+    if not all(np.isfinite(q) for q in qa + qb):
+        return None, (float("nan"), float("nan"))
     return bd_rate_raw(ra, qa, rb, qb)
 
 
@@ -413,7 +423,7 @@ def project_native(csv_path, images):
     if out:
         print(f"  mean projected padding tax over {len(out)} images: "
               f"{np.mean(list(out.values())):+.2%}")
-        print("  Compare with Part 2's drop from ENT-4's native gap on the same images.")
+        print("  Compare with Part 2's native-against-padding-free drop on the same images.")
     return out
 
 
@@ -574,7 +584,11 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--images", nargs="+", required=True)
     ap.add_argument("--gnc-binary", default=None)
-    ap.add_argument("--qualities", default="80,85,90,95,98")
+    ap.add_argument("--qualities", default="80,85,90,94",
+                    help="every rung must stay at q<=94: since RATE-2 the encoder "
+                         "codes q=95..99 both ways and keeps the smaller, and a rung "
+                         "that comes back bit-exact lossless has infinite quality, "
+                         "which a BD-rate cannot integrate")
     ap.add_argument("--j2k-rates", default="4,6,8,12,20,40",
                     help="opj_compress -r compression ratios")
     ap.add_argument("--gnc-extra", default="--abac",
@@ -645,6 +659,10 @@ def main():
             wr.writeheader()
             wr.writerows(rows)
         print(f"\nwrote {len(rows)} rows to {args.csv}")
+        if 1 in parts:
+            # The projection is the number the harness exists to produce, so a Part 1 run should
+            # not need a second invocation to see it.
+            project_native(args.csv, args.images)
 
 
 if __name__ == "__main__":

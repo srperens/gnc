@@ -4097,6 +4097,13 @@ numbers and gates:**
 padding), so the honest form of the intra coding gap on these four images is **closer to +12% than
 +27%**. Anyone re-opening this should start from that number, not the headline one.
 
+**One pin worth carrying forward.** RATE-2 (`a7273ab`) made q=95..99 code both ways and keep the
+smaller, so **any still figure here taken on a ladder reaching q>=95 is pinned to pre-`a7273ab`
+code** — that includes step 1's and step 2's q=85..99 ladders. Nothing is retracted; they were
+right for the code they ran on and will not reproduce byte for byte today. Step 3's figures were
+re-measured on `c84fbd5` at q<=94 and moved by at most 0.25 points, with the headline projection
+identical.
+
 Decisions `0024`, `0026`, `0027`, `0028`, `0034`.
 
 **The question.** With `--abac` on, GNC needs **+27.1% more bits than JPEG 2000 in 9/7 mode** at
@@ -4496,6 +4503,17 @@ Three shapes, and they are not equivalent:
 figure is 4.6%, so this is a floor not a target), **and** no worst-frame regression above 0.3 dB on
 any of ≥3 sequences at ki=9 in either chroma format. If inter loses more than intra gains, shape 3
 or nothing.
+
+**RATE-2 already reclaims part of this for free above q=95, so price PAD-1 below it.** Found while
+re-checking step 3 against `a7273ab`: RATE-2 codes q=95..99 both ways and keeps the smaller, and it
+reaches the **padded** arm first — on bbb at q=98 the padded crop came back 5.78% smaller while the
+tile-aligned crop did not move at all, because a flat padding region is cheap to code losslessly.
+So a padded picture crosses RATE-2's threshold at a lower q than the same picture aligned, and the
+tax it is crossing is the one PAD-1 removes. **Two consequences for whoever takes this:** the
+remaining value is concentrated at q<95, and **a BD-rate ladder for it must stay at q<=94** —
+above that the padded arms come back bit-exact lossless, quality is `inf`, and a Bjontegaard fit
+over an infinity is a silent non-number. `scripts/meas_intra1_padding.py` now refuses a non-finite
+rung rather than integrating it, and defaults to q=80/85/90/94.
 
 **Ceiling, so nobody over-invests.** A fill change tops out at ~4.6 of the 6.6 points. Recovering
 all 6.6 means **not padding at all** — partial border tiles the way JPEG 2000 has them — which

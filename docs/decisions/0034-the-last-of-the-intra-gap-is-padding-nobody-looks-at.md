@@ -166,6 +166,26 @@ step discontinuity a flat fill puts at the picture edge costs less than the deta
 also that **replication was already the better of the two textbook extensions** — mirroring the
 picture into the padding copies real detail there and costs 11.5 points more.
 
+### Reproduction, and the pin
+
+Re-measured on `c84fbd5` after RATE-2 (`a7273ab`) landed, because RATE-2 codes q=95..99 both ways
+and keeps the smaller and this harness's first ladder was q=80..98. **One rung of eight moved**: the
+padded crop at q=98 came back 5.78% smaller, the aligned crop not at all. Worse than a shifted byte
+count — the padded arms come back **bit-exact lossless**, `psnr()` returns `inf`, and a Bjontegaard
+fit over an infinity is a silent non-number. `bd()` now refuses a non-finite rung and the default
+ladder is **q=80/85/90/94**, clear of the dual-path range.
+
+On that ladder the `C` rows read +8.07 / +8.45 / +18.06 / +8.29 against the original
++8.32 / +8.52 / +18.04 / +8.41, **within 0.25 points**, and the projection is **identical at
++6.60%** — it reads the q=90 rung, which is byte-identical across RATE-2. **The decision does not
+move.**
+
+Two things follow. **RATE-2 already reclaims part of the padding tax for free above q=95**, and it
+reaches the padded arm first, which concentrates PAD-1's value below q=95 — recorded there. And
+**any still figure in this repository taken on a ladder reaching q>=95 before `a7273ab` is pinned
+to that code**, including INTRA-1's own step 1 and step 2; nothing is retracted, but they will not
+reproduce byte for byte today.
+
 ## What was not chosen, and what it would have cost
 
 - **Changing `pad.wgsl`'s fill in this item.** It is a ~20-line shader change worth ~4.6% of intra

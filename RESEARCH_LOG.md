@@ -194,18 +194,23 @@ that the two ladders are at the same operating point:
 
 | image | variant | coded/visible | RGB BD-rate | Y BD-rate | dRGB@q90 | dbytes@q90 |
 |---|---|---|---|---|---|---|
-| bbb_1080p | B (+1 col) | 1.1422 | +3.68% | +3.73% | +0.001 | +3.70% |
-| bbb_1080p | C (+1 row) | 1.2488 | **+8.32%** | +8.20% | +0.002 | +8.29% |
-| bbb_1080p | D (both) | 1.4264 | +12.31% | +11.99% | +0.004 | +12.11% |
-| blue_sky_1080p | B | 1.1422 | +2.80% | +2.43% | +0.001 | +2.31% |
-| blue_sky_1080p | C | 1.2488 | **+8.52%** | +8.59% | +0.002 | +8.69% |
-| blue_sky_1080p | D | 1.4264 | +11.63% | +11.13% | +0.004 | +11.13% |
-| kristensara_720p | B | 1.2488 | +6.11% | +5.87% | +0.002 | +5.75% |
-| kristensara_720p | C | 1.4971 | +18.04% | +19.35% | +0.005 | +19.82% |
-| kristensara_720p | D | 1.8695 | +25.21% | +25.56% | +0.007 | +26.06% |
-| touchdown_1080p | B | 1.1422 | +4.37% | +4.41% | +0.001 | +4.38% |
-| touchdown_1080p | C | 1.2488 | **+8.41%** | +8.32% | +0.003 | +8.41% |
-| touchdown_1080p | D | 1.4264 | +13.00% | +12.81% | +0.004 | +12.91% |
+| bbb_1080p | B (+1 col) | 1.1422 | +3.69% | +3.68% | +0.001 | +3.70% |
+| bbb_1080p | C (+1 row) | 1.2488 | **+8.07%** | +8.08% | +0.002 | +8.29% |
+| bbb_1080p | D (both) | 1.4264 | +11.84% | +11.91% | +0.004 | +12.11% |
+| blue_sky_1080p | B | 1.1422 | +2.68% | +2.24% | +0.001 | +2.31% |
+| blue_sky_1080p | C | 1.2488 | **+8.45%** | +8.53% | +0.002 | +8.69% |
+| blue_sky_1080p | D | 1.4264 | +11.46% | +10.90% | +0.004 | +11.13% |
+| kristensara_720p | B | 1.2488 | +5.86% | +5.49% | +0.002 | +5.75% |
+| kristensara_720p | C | 1.4971 | +18.06% | +19.53% | +0.005 | +19.82% |
+| kristensara_720p | D | 1.8695 | +25.12% | +25.38% | +0.007 | +26.06% |
+| touchdown_1080p | B | 1.1422 | +4.25% | +4.27% | +0.001 | +4.38% |
+| touchdown_1080p | C | 1.2488 | **+8.29%** | +8.16% | +0.003 | +8.41% |
+| touchdown_1080p | D | 1.4264 | +12.80% | +12.53% | +0.004 | +12.91% |
+
+Ladder q=80/85/90/94 on `c84fbd5`. **The first run of this table used q=80/85/90/95/98 on
+`0bc4816`, before RATE-2 landed, and read +8.32 / +8.52 / +18.04 / +8.41 for the `C` rows** — within
+0.25 points of the above, so the figure is not sensitive to the ladder. Why the ladder had to move
+is in "Reproduced on today's main" below, and it is not cosmetic.
 
 **Quality does not move: 0.001–0.005 dB on every pair.** So the rate difference is padding and not
 content, and no Bjontegaard integration is needed to see it — the byte column at a single q says
@@ -229,6 +234,11 @@ columns at 720p — with a per-strip cost model whose independence assumption is
 | kristensara_720p | 1280x720 | 48 | 0 | **+2.65%** |
 | touchdown_1080p | 1920x1080 | 200 | 128 | **+8.30%** |
 | | | | **mean** | **+6.60%** |
+
+**This is the headline, and it is the figure least exposed to anything else moving**: the projection
+reads the *middle rung only*, which is q=90 on both ladders, and q=90 is byte-identical before and
+after RATE-2. The four per-image values above are the same to two decimals on `0bc4816` and on
+`c84fbd5`.
 
 The corner is counted in both strips, which overstates the projection by ~5% of itself. Left that
 way on purpose: an overstated tax is the conservative direction for a claim that a recorded gap is
@@ -364,6 +374,44 @@ the plane is already a whole number of tiles.
 **The candidate pointed at the right phenomenon in the wrong place.** GNC does replicate its picture
 edge and it does cost 6.6 points — but it happens in `pad.wgsl`, on pixels, before the transform
 runs at all. BACKLOG's text is corrected.
+
+### Reproduced on today's main, and RATE-2 changes the ladder
+
+Raised by the `ent7bpc` session after RATE-2 landed (`a7273ab`): **at q=95..99 the encoder now
+codes both ways and keeps the smaller**, so any still figure taken on a ladder reaching q>=95 is
+not comparable across that commit. This harness's first ladder was q=80..98, so it is exactly the
+case. Checked rather than argued — same crops, same flags, binary rebuilt at `c84fbd5`:
+
+| | q=80 | q=90 | q=95 | q=98 |
+|---|---|---|---|---|
+| `A`, aligned | identical | identical | identical | identical |
+| `C`, padded | identical | identical | identical | **−5.78%** (2 630 286 -> 2 478 321 B) |
+
+**One rung of eight moved, and it is worse than a shifted byte count: the padded arms now come back
+bit-exact lossless.** `psnr()` returns `inf` on a lossless rung, `np.polyfit` turns one `inf` into
+`nan` for the whole curve, and the BD-rate is then silently a non-number. On bbb, `B`/`C`/`D` all
+read `inf` at q=98; on blue_sky `C` reads `inf` at q=95 too. **The harness would have printed
+`nan%` and this entry would have carried it.** Two fixes, both in `bd()`: a non-finite quality point
+is now **refused rather than integrated**, and the default ladder moved to **q=80/85/90/94**, clear
+of the dual-path range, where zero rungs come back lossless.
+
+Re-measured on that ladder, the `C` rows read +8.07 / +8.45 / +18.06 / +8.29 against the original
++8.32 / +8.52 / +18.04 / +8.41 — **within 0.25 points**, and the projection is **identical at
++6.60%** because it reads q=90, which did not move. So the finding is robust to both the ladder and
+to RATE-2; what was fragile was the harness's silence about infinity.
+
+**And there is a real result in the interaction, which belongs to PAD-1.** RATE-2 reaches the
+*padded* arm first: on bbb at q=98 the padded crop got 5.78% smaller while the aligned crop did not
+move at all. A flat padding region is cheap to code losslessly, so a padded picture crosses
+RATE-2's "keep the smaller" threshold at a lower q than the same picture tile-aligned. **RATE-2
+therefore already reclaims part of the padding tax for free at q>=95**, which concentrates PAD-1's
+remaining value below q=95 and is worth knowing before anyone prices PAD-1 at the top of the
+ladder.
+
+**The general form, since it is not specific to this item:** any still figure in this repository
+taken on a ladder reaching q>=95 before `a7273ab` is pinned to that code. INTRA-1's own step 1 and
+step 2 used q=85..99 ladders on stills and are in that category. Nothing is retracted — they were
+right for the code they ran on — but they will not reproduce byte for byte today.
 
 ### Failures and dead ends on the way
 

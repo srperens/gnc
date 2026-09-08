@@ -4,7 +4,7 @@
 
 GNC is a patent-free **video codec** designed from scratch for GPU parallelism. Everything runs as wgpu compute shaders (WGSL), written against the WebGPU feature set so the same source targets Metal, Vulkan, DX12 and WebGPU/WASM. The core idea: tile-independent processing with thousands of parallel threads instead of sequential CPU-era algorithms.
 
-**That is the design, and it is not yet the measured state.** As of 2026-09-08 GNC is measured end to end on **Metal only**: on Vulkan intra encode and decode run but **inter coding does not** (BUG-25), DX12 has never been run, and the WASM path is unverified in a browser with one known limit breach (BUG-31). The README's *Portability, as measured* table is the current evidence and should be read before any claim of cross-platform support is repeated.
+**That is the design, and it is not yet fully the measured state.** As of 2026-09-08 every performance figure is **Metal**; on **Vulkan** intra *and* inter now run end to end on two independent implementations, with byte-identical output between them, but no inter throughput figure exists yet (BUG-25 **fixed** — `docs/decisions/0029`; the four driver crashes on record were all one upstream naga defect on invalid SPIR-V). DX12 has never been run beyond a software adapter that panicked, and the WASM path is unverified in a browser with one known limit breach (BUG-31). The README's *Portability, as measured* table is the current evidence and should be read before any claim of cross-platform support is repeated.
 
 ### GNC is broad on purpose — that is the decision, not an unresolved question (2026-09-07)
 
@@ -72,7 +72,7 @@ order rather than a format-specific feature.
 1. **Patent-free** — No patented techniques, period. If it's patented, we don't use it.
 2. **GPU-first** — Everything runs in compute shaders. No CPU fallback paths. CPU reference implementations only for validation/testing.
 3. **Massive parallelism via tile independence** — No cross-tile dependencies at any stage. Each tile encodes/decodes in isolation. This is what enables thousands of parallel GPU threads.
-4. **Cross-platform** — Must work on Metal, Vulkan, DX12, and WebGPU (WASM). No backend-specific features. WGSL shaders are the single source. **This is a requirement GNC does not currently meet** — see §1. Portability is the axis the project claims to win on (§1), so a backend it cannot run on is a headline defect and not a compatibility nit.
+4. **Cross-platform** — Must work on Metal, Vulkan, DX12, and WebGPU (WASM). No backend-specific features. WGSL shaders are the single source. **Half met as of 2026-09-08: Metal and Vulkan both run the whole codec; DX12 and the browser do not** — see §1. Portability is the axis the project claims to win on (§1), so a backend it cannot run on is a headline defect and not a compatibility nit.
 5. **No f64 in shaders** — Apple and mobile GPUs have no hardware double precision, and WGSL has no `f64` in any case.
 6. **Open source only** — All dependencies must be open source.
 7. **English only** — All code, comments, docs, and commit messages in English.

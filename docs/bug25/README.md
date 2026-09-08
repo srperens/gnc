@@ -1,11 +1,14 @@
 # BUG-25 — the minimal reproducer
 
-> **Standing, 2026-09-08: this file reproduces *a* driver crash, and it is no longer clear it is
-> ours.** The shape it isolates is naga's `buffer: Restrict` clamp — and `wgpu-hal`'s own rule
-> (`adapter.rs:1899`) gives `buffer: Unchecked` on any adapter that reports `robustBufferAccess2`,
-> which both of the bench box's Vulkan implementations do. The faithful reconstruction of what wgpu
-> should be shipping here contains **zero `OpArrayLength`**. Two independent caveats are below.
-> See **BUG-33** and RESEARCH_LOG 2026-09-08 before citing this file as evidence.
+> **Standing, 2026-09-08 — final: this is an upstream driver bug report, not GNC's blocker.**
+> **BUG-25 is fixed** (`51a9ac6`, the defect-A commit) and GNC now codes inter frames on Vulkan on
+> both an RTX 4000 Ada and Mesa lavapipe, with byte-identical output. This file still crashes the
+> driver, and that is still worth reporting — a valid module should be compiled or rejected, never
+> segfault the compiler — but the shape it isolates is naga's `buffer: Restrict` clamp, and
+> `wgpu-hal`'s rule (`adapter.rs:1899`) gives `buffer: Unchecked` on any adapter reporting
+> `robustBufferAccess2`, which both of these adapters do. **GNC never emits it.** The binding-number
+> caveat below is dead — `minimal_repro_binding0.spvasm` still segfaults, so the file does isolate
+> the clamp. See `docs/decisions/0029`.
 
 `minimal_repro.spvasm` is 42 lines of SPIR-V that **segfaults NVIDIA's Vulkan driver at pipeline
 creation** and passes `spirv-val`. It was produced by `spirv-reduce` from
@@ -76,9 +79,9 @@ in every configuration that crashed.
   descriptor set layout from the module — first binding 4. An NVIDIA report from August 2026 has
   `vkCreateComputePipeline` segfaulting inside the driver, with no validation output, **when the
   descriptor set layout's first binding is not 0**. Renumbering this file's `Binding 4` to `0` and
-  re-probing is a one-line test of whether this file reproduces anything of ours. The variant is
-  committed as `minimal_repro_binding0.spvasm` — identical but for that one decoration — so the
-  test is two commands. **It has not been run: no Vulkan on the dev machine.**
+  re-probing tests whether the binding number matters. **Run 2026-09-08: it does not** —
+  `minimal_repro_binding0.spvasm` (identical but for that one decoration) still segfaults, exit 139.
+  So the descriptor-layout hypothesis is dead and this file does isolate the clamp.
 * **Not fixed.** GNC still cannot run inter coding on Vulkan. `split_pipeline` is built lazily so
   the shader is only compiled when inter runs, which is what keeps intra, decode and CANARY-1
   alive.
@@ -93,27 +96,31 @@ Both original candidates are now **measured dead** (`b5a909c`):
 2. ~~Change the shader's control flow~~ — **DEAD.** Deleting the early `return` outright still
    crashes, so the returning branch in this file is an artefact of the reduction.
 
-What is left, in order, and the first two need no GPU:
+All three of the steps that were left here were run on 2026-09-08 and the item is closed; kept for
+what each one settled:
 
-1. **Probe `minimal_repro_binding0.spvasm`** (see the caveat above):
+1. **Probe `minimal_repro_binding0.spvasm`** — **exit 139**, still crashes:
 
    ```bash
    spirv-as docs/bug25/minimal_repro_binding0.spvasm -o /tmp/repro0.spv && spirv-val /tmp/repro0.spv
    WGPU_BACKEND=vulkan ./target/release/examples/spirv_pipeline_probe /tmp/repro0.spv main
    ```
 
-   Exit 139 means the binding number is irrelevant and the file still isolates the clamp. Exit 1
-   (`OK`) means it was the descriptor layout all along and this reproducer is not ours.
-2. **Probe `caps_index_restrict.spv`** — expected OK, as the control for step 3.
-3. **Dump the module wgpu actually hands `vkCreateShaderModule`** and `sha256` it against the 19
-   emitted configurations. That is the experiment that ends the argument; **BUG-33** carries the two
-   hashes and what each one would mean.
+   The binding number is irrelevant, so the file does isolate the clamp and the NVIDIA
+   descriptor-layout report is not what we are hitting.
+2. **Probe `caps_index_restrict.spv`** (the `buffer: Unchecked` module, `537e7329…`) — **exit 1,
+   `OK`**, as predicted from it being byte-identical to `index_restrict_only`.
+3. **The dump was never needed.** Running the real WGSL through wgpu answered it directly:
+   `shader_probe block_match_split.wgsl` is **OK**, with and without `--trusted`, and
+   `gnc encode-sequence` codes 1I + 2P on Vulkan. So the shipped module never carried the clamp,
+   and the crash on record predated `51a9ac6`. **BUG-25 fixed, BUG-33 closed** — `docs/decisions/0029`.
 
-For the report itself, when it is time: defect A turned out to be upstream `gfx-rs/wgpu#7048`
-(closed by PR #7239), `#6329` is the same failure mode on AMD with valid SPIR-V — where adding
-`OpLine` debug instructions makes it disappear, a discriminator we have configs for and have not
-probed — and `OpArrayLength` sourced from a StorageBuffer variable has segfaulted Intel's compiler
-before (Mesa release notes). Three vendors, one instruction.
+For the upstream report, which is all this file is now for: defect A was
+`gfx-rs/wgpu#7048` (closed by PR #7239) and is what actually broke GNC; `#6329` is the same failure
+mode on AMD with valid SPIR-V — where adding `OpLine` debug instructions makes it disappear, a
+discriminator `debug_on_restrict` and `wgpu_native_debug` are emitted for and nobody has probed —
+and `OpArrayLength` sourced from a StorageBuffer variable has segfaulted Intel's compiler before
+(Mesa release notes). Three vendors, one instruction.
 
 It is also a legitimate driver bug report: a valid module should be rejected or compiled, never
 segfault the compiler. Two independent implementations crashing says the shape is unusual, not

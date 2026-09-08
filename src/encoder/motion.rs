@@ -1166,11 +1166,16 @@ impl MotionEstimator {
     /// The variable-block-size pipeline, compiled on first dispatch.
     ///
     /// Deliberately not built in `new`. Creating a pipeline hands the shader to
-    /// the driver's compiler, and `block_match_split.wgsl` segfaults NVIDIA's
-    /// Vulkan driver and loses the device on lavapipe (BUG-25). Because it was
-    /// created eagerly, a shader that only inter coding dispatches stopped a
-    /// still-image encode — which never reaches it — from starting at all: one
-    /// broken shader killed the whole codec on Vulkan.
+    /// the driver's compiler, and `block_match_split.wgsl` used to segfault
+    /// NVIDIA's Vulkan driver and lose the device on lavapipe (BUG-25, **fixed**
+    /// 2026-09-08 — it was invalid SPIR-V from an upstream naga defect, and this
+    /// shader now compiles on both). Because the pipeline was created eagerly, a
+    /// shader that only inter coding dispatches stopped a still-image encode —
+    /// which never reaches it — from starting at all: one broken shader killed
+    /// the whole codec on Vulkan.
+    ///
+    /// The laziness stays now that the crash is gone, on the rule below rather
+    /// than on the bug.
     ///
     /// The rule this encodes is general, and outlives the bug: a shader's cost,
     /// including the risk that it does not compile, is paid by the feature that

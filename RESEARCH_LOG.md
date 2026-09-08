@@ -4,6 +4,107 @@
 
 ---
 
+## BUG-25 is FIXED, and it was fixed before this session started — GNC runs inter on Vulkan (2026-09-08)
+
+**One `encode-sequence` retired the item.** `51a9ac6` — the defect-A commit, earlier the same day —
+fixed it, and nobody re-ran the failing path afterwards. Everything characterised after that point
+was characterised against a reconstruction, and the reconstruction was of a configuration wgpu never
+asks for here. Decision record `0029`.
+
+### Measured, NVIDIA RTX 4000 Ada + Mesa lavapipe (LLVM 20.1.2), driver 580.173.02, at `766196a`
+
+| test | result |
+|---|---|
+| `shader_probe` sweep, all 63 shaders, WGSL through wgpu, Vulkan | **62 compile.** The one failure is `blit.wgsl` (exit 101): it has 2 vertex/fragment entry points and **0** `@compute`, so a compute-pipeline probe cannot build it — a harness limit, not a driver one |
+| `shader_probe block_match_split.wgsl` | **OK** — this is the shader that killed the driver |
+| `shader_probe block_match_split.wgsl --trusted` | **OK** — turning naga's bounds checks off changes nothing, because there is no clamp to remove |
+| `gnc encode-sequence`, 3 frames 384x256, 1I + 2P, q=75, NVIDIA/Vulkan | **OK** — 102244 / 30301 / 27563 bytes, 180.1 ms, container 160199 |
+| `gnc decode-sequence` of that container, NVIDIA/Vulkan | **OK** — 3 frames out, 28.6 ms |
+| the same encode on **lavapipe** | **OK** — **byte-identical frame sizes**, 1553.8 ms |
+| `spirv_pipeline_probe` on an emitted `buffer: Restrict` module | **SIGSEGV** — the driver bug is real |
+| `spirv_pipeline_probe` on the emitted `buffer: Unchecked` module (`537e7329…`) | **OK** |
+| `minimal_repro_binding0.spvasm` (`Binding 4` → `Binding 0`) | **SIGSEGV** — the NVIDIA descriptor-layout hypothesis is dead, and the reproducer does isolate the clamp |
+
+Two Vulkan implementations that share no compiler code produce **byte-identical output**, which is a
+stronger statement than "it did not crash". P-frames at 2.47 and 2.24 bpp against the I-frame's
+8.32 say motion compensation ran, and `estimate_split` — the dispatch that builds the shader's
+pipeline — is unconditional on the P path (`sequence.rs:3487`), so this is not a lucky skip.
+
+### The four crashes were one cause, and the commit dates hid it
+
+| where | when | built from | contains the fix (`51a9ac6`)? |
+|---|---|---|---|
+| NVIDIA RTX 4000 Ada, Linux — SIGSEGV | 09-07 | `07c01b1` | no |
+| Mesa lavapipe, Linux — `Parent device is lost` | 09-07 | `07c01b1` | no |
+| NVIDIA RTX 2000 Ada, Windows — `0xC0000005` | 09-08 | `f17bf1b` | **no** |
+| Intel Arc Pro, Windows — `0xC0000409` | 09-08 | `f17bf1b` | **no** |
+
+The bottom two are the ones worth checking, because they were *committed after* the fix and were
+read as independent confirmation from new hardware. **`f17bf1b` predates `51a9ac6`**, and
+`block_match_split.wgsl` differs between them by 66 deleted lines. `git merge-base --is-ancestor`
+settles it in one command, and it only settles it because the entry recorded its commit.
+
+And lavapipe's `Parent device is lost` is **verbatim** what upstream `#7198` reports for the same
+naga defect on llvmpipe. Four crash signatures, four machines, three vendors, one invalid module.
+
+### What the reconstruction was actually testing
+
+`wgpu-hal` 24.0.4 asks naga for `buffer: robust_buffer_access2 ? Unchecked : Restrict`
+(`vulkan/adapter.rs:1899`), reading the cap from a **queried** `VK_EXT_robustness2` (`:1595`,
+`:1372`) — support decides it, not enablement. Confirmed on the box, both adapters:
+
+```
+deviceName = NVIDIA RTX 4000 Ada Generation      robustBufferAccess2 = true
+deviceName = llvmpipe (LLVM 20.1.2, 256 bits)    robustBufferAccess2 = true
+```
+
+So the shipped module carries no clamp, and `examples/bug25_emit`'s `wgpu_native` config — which
+hard-codes `buffer: Restrict` — was never it. The A/B that "isolated" defect B was `Restrict`
+against `Unchecked` on modules the driver would never have seen. The clamp does segfault NVIDIA;
+GNC just does not emit it.
+
+**The one stale datum that held it all up was "the real WGSL path crashes."** True when written,
+one commit out of date by the time the elimination argument used it — and every later step
+inherited it: four dead hypotheses, a `spirv-reduce` run, a 42-line reproducer, and BUG-33, which
+existed only to explain a choice wgpu was not making.
+
+### Withdrawn
+
+* "The valid module still segfaults; defect B is `BoundsCheckPolicy::Restrict` on buffers."
+* "`buffer: Unchecked` is the only proven fix."
+* "`block_match_split.wgsl` crashes three independent drivers, so P/B coding is unreachable on any
+  of them." — GOALS rule 4 and the README's portability table both carried this; both corrected.
+
+### What survives
+
+* **`docs/bug25/` is still a legitimate upstream report**, relabelled as one: a valid module should
+  be compiled or rejected, never segfault the compiler, and `OpArrayLength` sourced from a
+  StorageBuffer variable has segfaulted Intel's compiler before (Mesa release notes) — three
+  vendors, one instruction. It is not GNC's blocker.
+* **Defect A is upstream `gfx-rs/wgpu#7048`, closed by PR #7239.** Our `switch` rewrite duplicates
+  a fix that exists. "Upgrade wgpu" was measured dead for the crash we were chasing (`b5a909c`) and
+  would have fixed the one that mattered.
+* `shader_probe --trusted` stays. It is one flag and it is the thing that proved the clamp absent.
+
+### Not measured, and not claimed
+
+**Intel Arc Pro and Windows NVIDIA have not been re-run since the fix.** Their crash was on the
+invalid module, so the expectation is that they are fine — an expectation, not a measurement. The
+README's portability table says exactly that rather than generalising from two Linux
+implementations.
+
+No throughput figure is quoted from these runs: they are 384x256 and 3 frames, chosen to be
+correctness tests on a machine that was carrying other work. The Vulkan performance numbers in
+BASELINE stand as they were (intra, CANARY-1, 2026-09-07); **an inter figure on Vulkan is now
+measurable for the first time and is owed.**
+
+### The rule
+
+**When a fix lands, re-run the failing path before characterising what is left.** The investigation
+moved from the real path to a reconstruction at exactly the moment the real path started working.
+And: *"reproduced on an independent driver" is only independent if the builds are.*
+
+
 ## BUG-25 / BUG-33 — the module we characterised is probably not the module that crashes (2026-09-08)
 
 **Yesterday's session closed with an elimination argument and a 42-line reproducer, and both rest

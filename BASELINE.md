@@ -116,7 +116,10 @@ threshold of 9, and the encoder emits 2I+8P. Do not build a density claim on it.
 
 NVIDIA RTX 4000 Ada Generation, Ubuntu 24.04.3, driver 580.173.02, Vulkan, wgpu 24.0.5,
 `scripts/gpu_tier_bench.py --tier` on the pinned bbb_1080p (`f83f355f…02bf`). From `main` plus
-BUG-25's lazy-pipeline change — GNC does not start on Vulkan without it.
+BUG-25's lazy-pipeline change — GNC did not start on Vulkan without it. *(History as of
+2026-09-08: the shader was emitting invalid SPIR-V and `51a9ac6` fixed that, so GNC now starts on
+Vulkan either way and codes inter frames there. The lazy pipeline stays on its own merits — a
+shader's cost is paid by the feature that uses it. `docs/decisions/0029`.)*
 
 | | encode | decode | round trip |
 |---|---|---|---|

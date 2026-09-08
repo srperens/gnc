@@ -2,7 +2,7 @@
 
 Research project exploring what video compression looks like when designed from scratch for GPU parallelism, rather than adapting CPU-era algorithms.
 
-**Rust + wgpu compute shaders (WGSL). Written against the WebGPU feature set — Metal, Vulkan, DX12, WebGPU/WASM. Patent-free.** Metal is the only backend GNC is measured on end to end; see [Portability, as measured](#portability-as-measured) before relying on any of the others.
+**Rust + wgpu compute shaders (WGSL). Written against the WebGPU feature set — Metal, Vulkan, DX12, WebGPU/WASM. Patent-free.** Metal is the backend every figure in this file is measured on. **Vulkan runs intra *and* inter end to end on two independent implementations** as of 2026-09-08; see [Portability, as measured](#portability-as-measured) before relying on any backend but those two.
 
 ## Why
 
@@ -16,7 +16,7 @@ GNC is deliberately **broad**: intra and inter, 4:2:0 / 4:2:2 / 4:4:4 at 8 and 1
 
 ## Status
 
-**Working end to end:** I/P/B video pipeline with motion estimation, 8- and 10-bit, 4:4:4 / 4:2:2 / 4:2:0, five entropy coders of which three are selectable (Rice, `--rans`, `--abac`; Huffman and Bitplane are parked), and bit-exact lossless at `q=100`. **On Metal.** What runs on the other three backends is measured below and is less than this sentence used to claim.
+**Working end to end:** I/P/B video pipeline with motion estimation, 8- and 10-bit, 4:4:4 / 4:2:2 / 4:2:0, five entropy coders of which three are selectable (Rice, `--rans`, `--abac`; Huffman and Bitplane are parked), and bit-exact lossless at `q=100`. **On Metal**, and — for correctness, not for throughput — **on Vulkan** since 2026-09-08. What runs on DX12 and in a browser is measured below and is less than this sentence used to claim.
 
 **Where it stands against H.264** (measured 2026-09-06, `scripts/meas1_vs_h264.py`, 1080p, ki=9, x264 at defaults):
 
@@ -63,12 +63,13 @@ as of 2026-09-08:
 | backend | status | evidence |
 |---|---|---|
 | **Metal** | measured end to end | every figure in this README |
-| **Vulkan** | intra encode and decode run; **inter coding does not** | Measured on three real GPUs: RTX 4000 Ada 13.95 ms encode / 7.29 ms decode, and on Windows an Intel Arc Pro at 36.45 / 26.63 ms against an RTX 2000 Ada at 17.75 / 11.33 ms. `block_match_split.wgsl` crashes **three independent drivers** — NVIDIA, Mesa lavapipe and Intel Arc — so P/B coding is unreachable on any of them (BUG-25, open) |
+| **Vulkan** | **intra and inter both run**, on two independent implementations | Intra throughput measured on three real GPUs: RTX 4000 Ada 13.95 ms encode / 7.29 ms decode, and on Windows an Intel Arc Pro at 36.45 / 26.63 ms against an RTX 2000 Ada at 17.75 / 11.33 ms. **Inter added 2026-09-08**: `encode-sequence` codes 1I + 2P and `decode-sequence` round-trips it on an RTX 4000 Ada, and Mesa lavapipe produces **byte-identical** frame sizes — two Vulkan implementations sharing no compiler code. *(This row said `block_match_split.wgsl` crashes three independent drivers and that P/B coding was unreachable. All four recorded crashes were on invalid SPIR-V from an upstream naga defect, fixed in `51a9ac6`; the Windows builds that looked like independent confirmation predate that commit. BUG-25 **fixed**, `docs/decisions/0029`.)* **No inter throughput figure yet, and Intel Arc has not been re-run since the fix** |
 | **DX12** | **run once, on a software adapter, and it panicked** | Microsoft Basic Render Driver (WARP, CPU): exit 101 on a single frame, 2026-09-08. Adapter *enumeration* works across Vulkan/DX12/GL. **No DX12 hardware adapter has ever been tried** |
 | **WebGPU / WASM** | compiles; **not verified in a browser**, and one known blocker | both abac GPU shaders declare 18 688 B of workgroup storage against WebGPU's 16 384 B limit. Native wgpu does not enforce it; a conformant implementation must. The decoder builds the abac decoder unconditionally, so if it bites, *every* WASM decode fails, Rice files included (BUG-31, open) |
 
-Not one of the three non-Metal rows is clean. That is why the top of this file no longer states
-cross-platform support as a fact: GNC is *written* to be portable and is *measured* on Metal.
+**Two of the three non-Metal rows are still not clean**, which is why the top of this file states
+Metal and Vulkan and stops there: GNC is *written* to be portable, is *measured* end to end on
+Metal, and is measured *correct* — not yet fast — on Vulkan.
 Platforms it has run on at all: macOS/Metal, Linux/Vulkan, and — since 2026-09-08 — Windows,
 where it builds clean and runs all-intra on both GPUs of a two-GPU laptop.
 

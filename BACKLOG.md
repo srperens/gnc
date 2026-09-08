@@ -765,7 +765,35 @@ sequential test run could ever have caught, and the instinct to make it go away 
 suite would have preserved it.
 
 
-### BUG-25 — `block_match_split.wgsl` kills two Vulkan drivers (**contained**; cause **withdrawn** 2026-09-08, **not fixed**, P1)
+### BUG-25 — `block_match_split.wgsl` killed two Vulkan drivers (**FIXED** 2026-09-08)
+
+**FIXED, and it was fixed by `51a9ac6` — the defect-A commit — before anyone noticed.** Measured at
+`766196a` on the bench box: `gnc encode-sequence` codes **1I + 2P on NVIDIA/Vulkan** (102244 /
+30301 / 27563 bytes, 180.1 ms), `decode-sequence` round-trips it, and **lavapipe produces
+byte-identical frame sizes**. `shader_probe` compiles **62 of 63** shaders through wgpu's real WGSL
+path — the one failure is `blit.wgsl`, which has no `@compute` entry point, so the probe cannot
+build a compute pipeline from it.
+
+**All four recorded driver crashes were the invalid module.** NVIDIA/Linux and lavapipe were built
+from `07c01b1`; the Windows NVIDIA and Intel Arc crashes, which read as independent confirmation
+because they were *committed after* the fix, were built from **`f17bf1b` — which predates
+`51a9ac6`** by 66 deleted lines of this shader. Four signatures, one cause. And lavapipe's
+`Parent device is lost` is verbatim what upstream `#7198` reports for the same naga defect.
+
+**Defect B is withdrawn, not fixed, because GNC never reached it.** `buffer: Restrict` does segfault
+NVIDIA — verified again today — but wgpu asks for `buffer: Unchecked` on any adapter reporting
+`robustBufferAccess2`, and both adapters here report it. The stale datum that held this up was "the
+real WGSL path crashes": true when written, one commit out of date when the elimination argument
+used it. `docs/decisions/0029`, RESEARCH_LOG 2026-09-08, and **BUG-33 closed**.
+
+**Not re-measured, and not claimed: Intel Arc Pro and Windows NVIDIA.** Their crash was on the
+invalid module too, so the expectation is that they are fine — an expectation, not a measurement.
+
+**Owed:** an inter throughput figure on Vulkan, now measurable for the first time. Today's runs are
+384x256 and 3 frames — correctness tests on a machine carrying other work, not a benchmark.
+
+Older text follows, kept because the withdrawal is the point.
+
 
 **Correction 2026-09-08 — the second one on this item. Defect B's *cause* is withdrawn; its
 *measurements* are not.** Every driver result below was measured and stands. What is withdrawn is
@@ -1562,7 +1590,23 @@ decoder down a GOP"), which may be this seen from the other side.
 
 </details>
 
-### BUG-33 — does wgpu ship `buffer: Restrict` here at all? Its own source says it does not (todo, P1)
+### BUG-33 — does wgpu ship `buffer: Restrict` here at all? (**CLOSED** 2026-09-08 — no, and the question rested on a stale datum)
+
+**Answered: it does not, exactly as its source says.** Both adapters on the bench box report
+`robustBufferAccess2 = true` (`vulkaninfo`, checked per device), so `wgpu-hal/src/vulkan/adapter.rs:1899`
+resolves to `buffer: Unchecked` and the shipped module carries no clamp. There was never a
+contradiction to explain: the item existed because "the real WGSL path crashes" was still on record
+after `51a9ac6` had stopped it, and the crash it was reconciling against came from `bug25_emit`
+modules that hard-code `Restrict`.
+
+Confirmed behaviourally rather than by reading alone, which is what this item asked for:
+`shader_probe block_match_split.wgsl --trusted` — bounds checks off, the one thing the flag changes
+— is **OK**, and so is the same probe *without* the flag. Nothing to switch off.
+
+So neither of the two fixes this item was scoping is needed: no `[patch.crates-io]` pin, and no
+`create_shader_module_trusted` in the encoder (which would have wanted an `unsafe` call inside a
+library that is `#![forbid(unsafe_code)]`). See `docs/decisions/0029`. Original text follows.
+
 
 **Rewritten 2026-09-08 after the premise inverted.** This item was filed as "why does wgpu ask for
 `buffer: Restrict` on an adapter that reports `robustBufferAccess2`?". Reading the path it asked to

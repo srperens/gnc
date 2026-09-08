@@ -1751,6 +1751,20 @@ impl EncoderPipeline {
         let use_fused_qh =
             config.use_fused_quantize_histogram && use_gpu_encode && !use_cfl;
 
+        // BUG-35: the fused shader's histogram is read by exactly one consumer — the rANS batch
+        // encoder's `encode_3planes_skip_histogram`. Everywhere else it was dead work written to
+        // device memory and never read, and its 20480 B of workgroup atomics put the shader
+        // 7416 B over the limit the device is created with.
+        //
+        // Mirror that consumer's branch condition rather than testing the entropy coder, because
+        // the branch order is what decides it: Rice is checked first and never reaches the rANS
+        // arm, while Huffman *without* the 4:4:4 batch layout falls through to it and does
+        // consume the tables. Approximating this as "coder == rANS" would quietly stop feeding
+        // that case.
+        let is_444 = chroma_format == ChromaFormat::Yuv444;
+        let fused_qh_needs_hist =
+            use_fused_qh && is_444 && use_gpu_encode && !use_gpu_rice && !(use_gpu_huffman && is_444);
+
         let weights_luma = config.subband_weights.pack_weights();
         let weights_chroma = config.subband_weights.pack_weights_chroma();
 
@@ -2057,6 +2071,7 @@ impl EncoderPipeline {
                     config.per_subband_entropy,
                     1,
                     wm_param,
+                    fused_qh_needs_hist,
                 );
             } else {
                 self.quantize.dispatch_adaptive(
@@ -2178,6 +2193,7 @@ impl EncoderPipeline {
                     config.per_subband_entropy,
                     1,
                     wm_param,
+                    fused_qh_needs_hist,
                 );
             } else {
                 self.quantize.dispatch_adaptive(
@@ -2294,6 +2310,7 @@ impl EncoderPipeline {
                     config.per_subband_entropy,
                     1,
                     wm_param,
+                    fused_qh_needs_hist,
                 );
             } else {
                 self.quantize.dispatch_adaptive(

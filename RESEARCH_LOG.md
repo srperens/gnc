@@ -110,6 +110,108 @@ with this curve as its input.
 **Gates:** `cargo test --release -- --test-threads=1` green; `cargo clippy --release` clean; wasm
 `--lib` clean (the wasm *binary* target is red on `main`, pre-existing, BUG-24).
 
+## BUG-35 — the fused histogram was dead work on the default path, and 20 KB of it (2026-09-08)
+
+**Hypothesis.** `quantize_histogram_fused.wgsl:main` declares 23800 B of workgroup memory against a
+device created with 16384 B, and unlike BUG-31's abac shaders it is **not opt-in**: `use_fused_qh`
+is true for Rice whenever CfL is off, which is every operating point above q=85 — GNC's stated home
+range.
+
+**Success criteria, set first:** the default path off the over-budget entry point; output
+byte-identical on both the Rice and rANS arms; a *count* proving which entry point ran, because
+byte-identity cannot distinguish "the flag works" from "the flag is stuck at true".
+
+### The measurement that changed the fix
+
+The histogram has exactly one consumer — the rANS batch encoder's
+`encode_3planes_skip_histogram` — and the entropy branch tests Rice **first**, so the Rice path
+never reaches it. On every path but rANS the shader was filling a 20 KB workgroup histogram with
+atomics, re-reading the whole quantised tile to do it, writing the result to device memory, and
+nobody ever read it.
+
+`GNC_PROFILE` now names the entry point per dispatch:
+
+| configuration | fused dispatches | of which with histogram |
+|---|---|---|
+| q=90, Rice, 4:4:4 (**the default**) | 3 | **0** |
+| q=100, Rice, 4:4:4 | 3 | **0** |
+| q=90, Rice, 4:2:0 | 3 | **0** |
+| q=15, rANS, 4:4:4 | 3 | **3** |
+| q=15, rANS, 4:2:0 | 3 | **0** |
+| q=50, q=70 (CfL on) | 0 | 0 |
+| q=90, abac | 0 | 0 |
+
+### The fix, and why a flag would not have done
+
+`main_quantize_only`: same quantiser, never references `shared_hist`. **3264 B, measured** — I
+predicted 3320 by subtraction and was wrong, which is the reason to read it off the instrument.
+The quantise and histogram phases became two functions called by two entry points, so nothing is
+duplicated.
+
+**A runtime `if (params.write_histogram)` would not have helped.** Declared workgroup memory is
+charged per entry point at pipeline creation; a guarded array is still referenced, still allocated,
+still refused. Only an entry point that cannot name the array gets under budget.
+
+**And the pipeline is created lazily, which is the part that actually fixes the browser.** It is
+pipeline *creation* a conformant WebGPU implementation refuses, not dispatch — so building `main`
+eagerly in `FusedQuantizeHistogram::new` would fail every browser encode even when nothing asks
+for a histogram. `main_quantize_only` is eager; `main` goes in a `OnceCell` and on the default path
+is never built. Same distinction BUG-31 turned on, one layer up.
+
+The flag mirrors the *consumer's branch condition* rather than the entropy coder, because branch
+order is what decides it: Rice is checked first and never reaches the rANS arm, while Huffman
+without the 4:4:4 batch layout falls through to it and does consume the tables. "coder == rANS"
+would have quietly stopped feeding that case.
+
+### Verification
+
+- **10 of 10 encodes byte-identical** before and after, "before" rebuilt from stashed sources:
+  Rice q=50/90/100 4:4:4, Rice q=90 4:2:0, q=15 (rANS default), `--rans` q=50 and q=70, `--abac`
+  q=90, and sequences ki=1 and ki=9 — the last two cover the I-frame and P-frame dispatch sites
+  that a still image cannot reach. Re-checked on the final build.
+- **The Rice arm being identical is itself the proof the histogram was dead.** The histogram phases
+  only read the quantised buffer and write `hist_output`; anything on that path depending on them
+  would have moved the file.
+- **Permanent canary, not just a print.**
+  `fused_qh_does_not_build_the_histogram_pipeline_on_the_default_path` asserts zero histogram
+  dispatches on a Rice encode *and* that the quantise path ran at all, so it cannot pass by
+  asserting nothing.
+- **236 tests, 0 failures** (re-run after rebasing onto ten upstream commits; they touch only diagnostic modules and markdown, but the gate is cheaper than reading the diff, and the byte-identity arms were re-checked too). `clippy --release` and `--target wasm32-unknown-unknown --lib` clean.
+  `--tests` warnings measured against `main` before and after: **90 both ways**, so BUG-20's pile
+  did not grow (one `field_reassign_with_default` I introduced was fixed rather than left).
+
+### What is still open, and one hazard found on the way
+
+`main` is unchanged at 23800 B, so rANS at 4:4:4 still builds an over-budget pipeline. Shrinking
+`shared_hist` to fit needs the arena from 5120 to <=3266 entries — and that makes an existing
+hazard worse:
+
+**`total_hist_entries` is unguarded.** It is the sum of up to 12 per-group alphabets, each clamped
+at `MAX_GROUP_ALPHABET = 4096`, so it can reach 49152, and nothing compares it to 5120. Writes past
+the end are clamped by naga's bounds policy, so an overflow **silently corrupts frequencies rather
+than failing**. A smaller arena overflows sooner, so the guard has to come first. The neighbouring
+rANS *encode* shader does have such a guard, on the host, and it is explicit: "tile 13 needs 6658
+cumfreq entries but the encode shader's workgroup table holds 4097". The fused histogram arena has
+no equivalent.
+
+Two more readings from the sweep: **`rans_decode.wgsl:main` and `rans_encode_lean.wgsl:main` both
+sit at exactly 16384 B** — inside budget with zero headroom, so any addition to either is an
+instant defect — and `rans_encode.wgsl:main` is at 16388 B, over by 4.
+
+### Not measured
+
+**Throughput**, again deliberately. Taking 20 KB of workgroup atomics and a full tile re-read off
+the default path should help, and 23800 B -> 3264 B is a large occupancy change, but the machine was
+shared. Owed on an idle machine; BUG-32 rules out `benchmark-sequence`'s wall clock as the
+instrument.
+
+### Footnote: both id checks were needed, an hour after they were written
+
+Reserving this record's number, `git ls-tree --name-only main docs/decisions/` said the last
+committed file was `0032` — but `scripts/claim list` showed `dr-0033` and `dr-0034` already
+reserved by other sessions, with no files yet. Either check alone hands out a collision; `0035` is
+what the two together give. That is the orthogonality COORD-2 was corrected to say this morning,
+demonstrated by accident the same afternoon.
 
 ---
 

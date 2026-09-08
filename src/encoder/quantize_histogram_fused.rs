@@ -55,11 +55,28 @@ pub struct FusedQuantizeHistogramParams {
 }
 
 /// GPU pipeline for the fused quantize + histogram shader.
+///
+/// **Two pipelines, and the histogram one is created lazily on purpose (BUG-35).** The `main`
+/// entry point declares 23800 B of workgroup memory against a device created with 16384 B, and it
+/// is *pipeline creation* that a conformant WebGPU implementation refuses — not dispatch. So
+/// building it eagerly here would fail every browser encode even when nothing ever asks for a
+/// histogram. `main_quantize_only` (3320 B) is built eagerly because every coder needs it;
+/// `main` is built the first time a coder actually consumes frequency tables, which today means
+/// rANS alone.
 pub struct FusedQuantizeHistogram {
-    pipeline: wgpu::ComputePipeline,
+    /// `main_quantize_only` — within budget, used by every entropy coder.
+    pipeline_quantize_only: wgpu::ComputePipeline,
+    /// `main` — over budget, so built only if something asks for the histogram.
+    pipeline_with_hist: std::cell::OnceCell<wgpu::ComputePipeline>,
+    shader: wgpu::ShaderModule,
+    pipeline_layout: wgpu::PipelineLayout,
     bind_group_layout: wgpu::BindGroupLayout,
     /// Dummy 1-element buffer used when adaptive quantization is disabled.
     dummy_weight_buf: wgpu::Buffer,
+    /// BUG-35 canary. Byte-identical output does not prove the new entry point ran — a flag stuck
+    /// at `true` would also be byte-identical — so the two pipelines are counted and reported
+    /// under `GNC_PROFILE`. `hist=0` on a Rice encode is the evidence.
+    dispatches: std::cell::Cell<(u32, u32)>,
 }
 
 impl FusedQuantizeHistogram {
@@ -145,16 +162,16 @@ impl FusedQuantizeHistogram {
                 push_constant_ranges: &[],
             });
 
-        let pipeline = ctx
-            .device
-            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("fused_qh_pipeline"),
-                layout: Some(&pipeline_layout),
-                module: &shader,
-                entry_point: Some("main"),
-                compilation_options: Default::default(),
-                cache: None,
-            });
+        let pipeline_quantize_only =
+            ctx.device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("fused_qh_quantize_only_pipeline"),
+                    layout: Some(&pipeline_layout),
+                    module: &shader,
+                    entry_point: Some("main_quantize_only"),
+                    compilation_options: Default::default(),
+                    cache: None,
+                });
 
         let dummy_weight_buf = ctx
             .device
@@ -165,10 +182,35 @@ impl FusedQuantizeHistogram {
             });
 
         Self {
-            pipeline,
+            pipeline_quantize_only,
+            pipeline_with_hist: std::cell::OnceCell::new(),
+            shader,
+            pipeline_layout,
             bind_group_layout,
             dummy_weight_buf,
+            dispatches: std::cell::Cell::new((0, 0)),
         }
+    }
+
+    /// `(quantize_only, with_histogram)` dispatch counts since construction.
+    pub(super) fn dispatch_counts(&self) -> (u32, u32) {
+        self.dispatches.get()
+    }
+
+    /// The histogram entry point, built on first use. See the struct comment for why this is not
+    /// eager: it is over the workgroup budget, and pipeline creation is what WebGPU refuses.
+    fn pipeline_with_hist(&self, ctx: &GpuContext) -> &wgpu::ComputePipeline {
+        self.pipeline_with_hist.get_or_init(|| {
+            ctx.device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("fused_qh_pipeline"),
+                    layout: Some(&self.pipeline_layout),
+                    module: &self.shader,
+                    entry_point: Some("main"),
+                    compilation_options: Default::default(),
+                    cache: None,
+                })
+        })
     }
 
     /// Dispatch the fused quantize + histogram shader.
@@ -199,6 +241,7 @@ impl FusedQuantizeHistogram {
         per_subband: bool,
         flags: u32,
         weight_map: Option<(&wgpu::Buffer, u32, u32, u32)>,
+        write_histogram: bool,
     ) {
         let tiles_x = width / tile_size;
         let tiles_y = height / tile_size;
@@ -280,7 +323,25 @@ impl FusedQuantizeHistogram {
             label: Some("fused_qh_pass"),
             timestamp_writes: None,
         });
-        pass.set_pipeline(&self.pipeline);
+        let (n_qo, n_hist) = self.dispatch_counts();
+        self.dispatches.set(if write_histogram {
+            (n_qo, n_hist + 1)
+        } else {
+            (n_qo + 1, n_hist)
+        });
+        if std::env::var("GNC_PROFILE").is_ok() {
+            eprintln!(
+                "[fused_qh] dispatch {} (quantize_only={}, with_histogram={})",
+                if write_histogram { "main" } else { "main_quantize_only" },
+                n_qo + u32::from(!write_histogram),
+                n_hist + u32::from(write_histogram),
+            );
+        }
+        pass.set_pipeline(if write_histogram {
+            self.pipeline_with_hist(ctx)
+        } else {
+            &self.pipeline_quantize_only
+        });
         pass.set_bind_group(0, &bind_group, &[]);
         pass.dispatch_workgroups(num_tiles, 1, 1);
     }

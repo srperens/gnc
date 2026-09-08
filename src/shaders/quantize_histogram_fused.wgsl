@@ -261,24 +261,41 @@ fn reduce_max_i32(lid: u32, val: i32) -> i32 {
     return shared_min[0];
 }
 
-@compute @workgroup_size(256)
-fn main(
-    @builtin(local_invocation_index) lid: u32,
-    @builtin(workgroup_id) wid: vec3<u32>,
-) {
-    let tile_id = wid.x;
-    if (tile_id >= params.num_tiles) {
-        return;
-    }
+// ---------------------------------------------------------------------------
+// The two phases are separate functions so that the entry point which does not need a histogram
+// never references `shared_hist` (BUG-35).
+//
+// That is not a style choice. Declared workgroup memory is charged per entry point, and
+// `shared_hist` is 20480 B of the shader's 23800 B against a device created with 16384 B — so a
+// runtime `if (write_histogram)` would not have helped, because the array would still be
+// referenced and still be allocated. An entry point that cannot name it is the only thing that
+// gets under the budget. `main_quantize_only` costs 3320 B; `main` is unchanged and still over,
+// which is the rANS half of BUG-35.
+//
+// The quantised `output` buffer is written entirely by the quantise phases; the histogram phases
+// only *read* `output` and write `hist_output`. So dropping them cannot change coded pixels, and
+// the byte-identity of the default path is both the check on this refactor and the proof that the
+// histogram was dead work wherever the consumer is not rANS.
 
+struct TileGeom {
+    tile_origin_x: u32,
+    tile_origin_y: u32,
+    coeffs_per_thread: u32,
+    out_base: u32,
+}
+
+fn tile_geom(tile_id: u32) -> TileGeom {
     let tile_x = tile_id % params.tiles_x;
     let tile_y = tile_id / params.tiles_x;
-    let tile_origin_x = tile_x * params.tile_size;
-    let tile_origin_y = tile_y * params.tile_size;
+    var g: TileGeom;
+    g.tile_origin_x = tile_x * params.tile_size;
+    g.tile_origin_y = tile_y * params.tile_size;
+    g.coeffs_per_thread = params.coefficients_per_tile / WG_SIZE;
+    g.out_base = tile_id * HIST_TILE_STRIDE;
+    return g;
+}
 
-    let coeffs_per_thread = params.coefficients_per_tile / WG_SIZE;
-    let out_base = tile_id * HIST_TILE_STRIDE;
-
+fn quantize_phases(lid: u32, tile_origin_x: u32, tile_origin_y: u32, coeffs_per_thread: u32, out_base: u32) {
     if (params.per_subband != 0u) {
         // --- Per-subband mode ---
         let num_groups = params.num_levels * 2u;
@@ -463,7 +480,90 @@ fn main(
         }
         // Barrier: ensure all Phase 1.5 output writes are visible to Phase 2.
         workgroupBarrier();
+    } else {
+        // --- Single-table mode ---
 
+        // Phase 1: Quantize + track stats
+        var local_min: i32 = 2147483647;
+        var local_max: i32 = -2147483647;
+        var local_zero_count: u32 = 0u;
+        var local_max_abs_nz: i32 = 0;
+        var local_total: u32 = 0u;
+
+        for (var j = 0u; j < coeffs_per_thread; j++) {
+            let local_idx = lid + j * WG_SIZE;
+            let c = quantize_and_read(tile_origin_x, tile_origin_y, local_idx);
+            if (c < local_min) { local_min = c; }
+            if (c > local_max) { local_max = c; }
+            local_total += 1u;
+            if (c == 0) {
+                local_zero_count += 1u;
+            } else {
+                let a = abs(c);
+                if (a > local_max_abs_nz) { local_max_abs_nz = a; }
+            }
+        }
+
+        // min/max reduction
+        shared_min[lid] = local_min;
+        shared_max[lid] = local_max;
+        workgroupBarrier();
+
+        for (var stride = 128u; stride > 0u; stride = stride >> 1u) {
+            if (lid < stride) {
+                if (shared_min[lid + stride] < shared_min[lid]) {
+                    shared_min[lid] = shared_min[lid + stride];
+                }
+                if (shared_max[lid + stride] > shared_max[lid]) {
+                    shared_max[lid] = shared_max[lid + stride];
+                }
+            }
+            workgroupBarrier();
+        }
+
+        let gmin = shared_min[0];
+        let gmax = shared_max[0];
+
+        let total_zeros = reduce_sum(lid, local_zero_count);
+        let total_count = reduce_sum(lid, local_total);
+        let max_abs_nz = reduce_max_i32(lid, local_max_abs_nz);
+
+        if (lid == 0u) {
+            var zrun_base_val = 0;
+            if ((params.flags & 1u) == 0u && total_count > 0u) {
+                let non_zrl_asize = u32(2 * max_abs_nz + 1);
+                let zrl_eligible = (total_zeros * 5u >= total_count * 3u)
+                                && (non_zrl_asize >= 16u);
+                if (zrl_eligible) {
+                    let candidate_zrun = max_abs_nz + 1;
+                    let expanded_max = candidate_zrun + i32(MAX_ZERO_RUN) - 1;
+                    let expanded_asize = u32(expanded_max - gmin) + 1u;
+                    if (expanded_asize <= MAX_ALPHABET) {
+                        zrun_base_val = candidate_zrun;
+                    }
+                }
+            }
+            shared_group_zrun[0] = zrun_base_val;
+
+            if (zrun_base_val != 0) {
+                let new_max = zrun_base_val + i32(MAX_ZERO_RUN) - 1;
+                let new_asize = min(u32(new_max - gmin) + 1u, MAX_ALPHABET);
+                shared_group_min[0] = gmin;
+                shared_group_asize[0] = new_asize;
+            } else {
+                shared_group_min[0] = gmin;
+                var asize = u32(gmax - gmin) + 1u;
+                if (asize > MAX_ALPHABET) { asize = MAX_ALPHABET; }
+                shared_group_asize[0] = asize;
+            }
+        }
+        workgroupBarrier();
+    }
+}
+
+fn histogram_phases(lid: u32, tile_origin_x: u32, tile_origin_y: u32, coeffs_per_thread: u32, out_base: u32) {
+    if (params.per_subband != 0u) {
+        let num_groups = params.num_levels * 2u;
         // Compute histogram offsets, check any_zrl
         if (lid == 0u) {
             shared_num_groups = num_groups;
@@ -580,84 +680,6 @@ fn main(
         }
 
     } else {
-        // --- Single-table mode ---
-
-        // Phase 1: Quantize + track stats
-        var local_min: i32 = 2147483647;
-        var local_max: i32 = -2147483647;
-        var local_zero_count: u32 = 0u;
-        var local_max_abs_nz: i32 = 0;
-        var local_total: u32 = 0u;
-
-        for (var j = 0u; j < coeffs_per_thread; j++) {
-            let local_idx = lid + j * WG_SIZE;
-            let c = quantize_and_read(tile_origin_x, tile_origin_y, local_idx);
-            if (c < local_min) { local_min = c; }
-            if (c > local_max) { local_max = c; }
-            local_total += 1u;
-            if (c == 0) {
-                local_zero_count += 1u;
-            } else {
-                let a = abs(c);
-                if (a > local_max_abs_nz) { local_max_abs_nz = a; }
-            }
-        }
-
-        // min/max reduction
-        shared_min[lid] = local_min;
-        shared_max[lid] = local_max;
-        workgroupBarrier();
-
-        for (var stride = 128u; stride > 0u; stride = stride >> 1u) {
-            if (lid < stride) {
-                if (shared_min[lid + stride] < shared_min[lid]) {
-                    shared_min[lid] = shared_min[lid + stride];
-                }
-                if (shared_max[lid + stride] > shared_max[lid]) {
-                    shared_max[lid] = shared_max[lid + stride];
-                }
-            }
-            workgroupBarrier();
-        }
-
-        let gmin = shared_min[0];
-        let gmax = shared_max[0];
-
-        let total_zeros = reduce_sum(lid, local_zero_count);
-        let total_count = reduce_sum(lid, local_total);
-        let max_abs_nz = reduce_max_i32(lid, local_max_abs_nz);
-
-        if (lid == 0u) {
-            var zrun_base_val = 0;
-            if ((params.flags & 1u) == 0u && total_count > 0u) {
-                let non_zrl_asize = u32(2 * max_abs_nz + 1);
-                let zrl_eligible = (total_zeros * 5u >= total_count * 3u)
-                                && (non_zrl_asize >= 16u);
-                if (zrl_eligible) {
-                    let candidate_zrun = max_abs_nz + 1;
-                    let expanded_max = candidate_zrun + i32(MAX_ZERO_RUN) - 1;
-                    let expanded_asize = u32(expanded_max - gmin) + 1u;
-                    if (expanded_asize <= MAX_ALPHABET) {
-                        zrun_base_val = candidate_zrun;
-                    }
-                }
-            }
-            shared_group_zrun[0] = zrun_base_val;
-
-            if (zrun_base_val != 0) {
-                let new_max = zrun_base_val + i32(MAX_ZERO_RUN) - 1;
-                let new_asize = min(u32(new_max - gmin) + 1u, MAX_ALPHABET);
-                shared_group_min[0] = gmin;
-                shared_group_asize[0] = new_asize;
-            } else {
-                shared_group_min[0] = gmin;
-                var asize = u32(gmax - gmin) + 1u;
-                if (asize > MAX_ALPHABET) { asize = MAX_ALPHABET; }
-                shared_group_asize[0] = asize;
-            }
-        }
-        workgroupBarrier();
-
         let min_val = shared_group_min[0];
         let alphabet_size = shared_group_asize[0];
         let zrun_base = shared_group_zrun[0];
@@ -733,4 +755,34 @@ fn main(
             hist_output[out_base + 3u + i] = atomicLoad(&shared_hist[i]);
         }
     }
+}
+
+@compute @workgroup_size(256)
+fn main(
+    @builtin(local_invocation_index) lid: u32,
+    @builtin(workgroup_id) wid: vec3<u32>,
+) {
+    let tile_id = wid.x;
+    if (tile_id >= params.num_tiles) {
+        return;
+    }
+    let g = tile_geom(tile_id);
+    quantize_phases(lid, g.tile_origin_x, g.tile_origin_y, g.coeffs_per_thread, g.out_base);
+    histogram_phases(lid, g.tile_origin_x, g.tile_origin_y, g.coeffs_per_thread, g.out_base);
+}
+
+// Quantise only: same quantiser, same output buffer, no histogram and therefore no `shared_hist`.
+// Used wherever the entropy coder does not consume the frequency tables, which is every coder but
+// rANS — and rANS is not the default (GOALS §5b).
+@compute @workgroup_size(256)
+fn main_quantize_only(
+    @builtin(local_invocation_index) lid: u32,
+    @builtin(workgroup_id) wid: vec3<u32>,
+) {
+    let tile_id = wid.x;
+    if (tile_id >= params.num_tiles) {
+        return;
+    }
+    let g = tile_geom(tile_id);
+    quantize_phases(lid, g.tile_origin_x, g.tile_origin_y, g.coeffs_per_thread, g.out_base);
 }

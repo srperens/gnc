@@ -1403,6 +1403,59 @@ preset and manual paths agree and that the library default still permits B-frame
 No decision record: no default changed. The shipped default was already P-only since 2026-09-06;
 this makes four CLI paths actually honour it.
 
+### BUG-54 — CfL is silently off at 4:2:2 and 4:2:0, and the limit is documented nowhere (todo, **P2**)
+
+**Found 2026-09-08 by an external reviewer's question** — *"if chroma is subsampled the chroma
+subbands get different dimensions than the luma subbands, which complicates CfL's per-subband alpha
+mapping"* — which is correct, and GNC's answer to it is one line:
+
+```rust
+// src/encoder/pipeline.rs:2035
+let use_cfl = config.cfl_enabled && chroma_format == ChromaFormat::Yuv444;
+```
+
+**So `cfl_enabled` is true at q=50–85 and CfL still does not run unless the format is 4:4:4.**
+There is a real implementation reason — `cfl_alpha.wgsl` mirrors `quantize.wgsl`'s subband index off
+`tile_size`, and at subsampled chroma the chroma plane tiles to a different grid — so the gate is
+not wrong. **What is wrong is that it is silent and undocumented.**
+
+**Three things that follow, in order of how much they matter:**
+
+1. **The format this disables is one GOALS advertises as a differentiator.** §1's table lists
+   **10-bit 4:2:2** as *"a design target from the start"*, in the row claiming an advantage over
+   NVENC (which needs Blackwell for it). Broadcast contribution commonly wants at least 4:2:2. So a
+   measured chroma feature is off in a headline format and nothing says so.
+2. **It is a silent feature, which GOALS §5b forbids by name:** *"No silent features — every new
+   code path must have a way to verify it actually executes."* Same defect class as **BUG-16** (the
+   fused quantiser's dead zone that existed on one path only) and **BUG-46** (`lossless_sibling`
+   dropping the caller's `chroma_format`). Chroma-format flags silently changing behaviour is now a
+   family, not an incident.
+3. **It relabels an existing figure.** MEAS-2's *"CfL earns its keep"* — 9% smaller and better
+   colour on bbb — **does not state its chroma format**, and since CfL only runs at 4:4:4 it can
+   only be a 4:4:4 figure. Same for `CHROMA-3`'s whole question. Both need the label.
+
+**What to do, cheapest first. Note that only step 1 is certainly worth doing:**
+
+1. **Document it and label the figures.** One line in GOALS §3 and in `docs/PIPELINE.md`'s CfL
+   stage, and `4:4:4` added to MEAS-2's and CHROMA-3's figures. A canary would be better than a
+   comment: `GNC_DIAGNOSTICS` should print whether CfL ran, so the next person reads it instead of
+   grepping `pipeline.rs`.
+2. **Measure what is actually forgone before building anything.** At 4:2:2 the chroma planes are
+   already halved, so there are fewer chroma bits for CfL to reclaim and **the 9% does not transfer
+   — it is an unknown, not a smaller version of itself.** Price it by running the 4:4:4 arm with and
+   without CfL and comparing the chroma bit share against 4:2:2's, on ≥3 images at q=50/75/85, with
+   **dE00 alongside rate** (VMAF cannot see chroma and has given a confident wrong answer on this
+   exact class twice — the 2026-09-05 `chroma_weight` sweep and CHROMA-1, where VMAF read 97.08
+   before and after a 6% rate move).
+3. **Only if step 2 shows real headroom:** index the chroma subbands off the chroma plane's own tile
+   grid rather than luma's. That is the reviewer's *"nedskala eller separat indexera"*, and it
+   touches three shaders (`cfl_alpha`, `cfl_forward`, `cfl_predict`) plus the `num_subbands`
+   signalling in `format.rs`. Not obviously worth it, which is why it is third.
+
+**Interacts with CHROMA-3**, which asks where CfL's per-subband gain sits. Answer that first: if the
+gain is LL-concentrated, the subsampled case is easier than it looks, because LL is the band whose
+grid mismatch is smallest.
+
 ### BUG-52 — DX12: BUG-40 removed the crash and exposed an FXC compile-time wall (todo, **P2**)
 
 **Filed 2026-09-08 by the session that ran the Mac's quiet hour, on an observation it did not
@@ -5980,6 +6033,43 @@ exactly the frames where a propagation argument would look confirmed.
 **Flagged:** per-frame PSNR now declines across a GOP (blue_sky q=50: 41.3 → 35.8 dB, was
 41.3 → 38.3). That decline is real, and is what a lower-rate operating point looks like; at matched
 rate the floor is higher. PSNR and VMAF disagree in sign here, and VMAF is primary.
+
+### FMT-3 — GNC ships 10-bit and has no stated position on transfer functions (todo, **P3**)
+
+**Raised 2026-09-08 by an external reviewer:** *"Om 5G-produktionsfallet innefattar HDR-kameraflöden
+är ICtCp bättre matchad mot PQ/HLG-perceptuell kvantisering än YCoCg-R. Om allt är SDR är frågan
+irrelevant."*
+
+**The reviewer could not tell which, and neither can anyone reading this repository.** `HDR`,
+`ICtCp`, `PQ`, `HLG` and `BT.2020` appear **nowhere** in GOALS, `docs/POSITIONING.md`, README or
+BASELINE. What does appear is 10-bit as a shipped feature (FMT-1) and **10-bit 4:2:2 listed in
+GOALS §1 as "a design target from the start"**, in the table claiming an advantage over
+fixed-function encoders. Bit depth is stated; the transfer function it carries is not.
+
+**This item is a scope decision, not work, and it belongs to the project owner.** It is filed so
+that the question has an id rather than being re-asked by the next reviewer — which is the same
+reason ENT-10 had to be filed for a lever that had been named three times and never given a
+heading.
+
+**The decision to make, and it is genuinely open:**
+
+- **If HDR is out of scope**, say so in GOALS §6 (Non-Goals) in one line. That is a legitimate
+  answer for a contribution codec whose targets are SDR broadcast chains, and it closes the
+  question permanently.
+- **If HDR is in scope**, then two things follow and both are real work: YCoCg-R is a *reversible
+  integer* transform chosen for the lossless path, and swapping or supplementing it with ICtCp
+  means a second colour front end, because ICtCp is not reversible in integers. And the quality
+  metrics change with it — PSNR and CIEDE2000 on PQ-coded samples do not mean what they mean on
+  SDR, so `scripts/ypsnr_de00.py` and every figure taken through it would need an HDR arm.
+
+**What is cheap and worth doing either way:** state which transfer function the existing 10-bit
+figures were measured on. FMT-1 verified 10-bit bit-exactness *"on a genuine 10-bit 1080p source"*
+without naming its transfer characteristics, and a lossless figure is transfer-function-independent
+while the q=90 **61.33 dB** is not.
+
+**Not a defect.** Nothing is broken; 10-bit works and is verified. This is an unstated scope
+boundary, and the cost of leaving it unstated is that every reviewer asks about it and every answer
+is a guess.
 
 ### FMT-2 — Stream-length tables cost more than the coefficients they describe (**DONE 2026-09-06**, GP17)
 Each tile carries a 256-entry table of entropy-stream lengths — the price of 256 independent

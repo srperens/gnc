@@ -1449,7 +1449,11 @@ that is not a shader it does not use. **Why P2:** it invalidates no measurement 
 nothing on Vulkan or Metal, but GOALS rule 4 claims DX12 and step 1 is close to free. Step 1
 alone converts "DX12 does not run GNC" into a measurement.
 
-### ROBUST-1 — the decoder's contract on malformed input is "panic", and one place promised otherwise (partly done 2026-09-08, P2)
+### ROBUST-1 — should the decoder reject malformed input, or is panicking the contract? (todo, P2)
+
+**The two contained defects are fixed and the denial of service is closed; what is left is one
+choice.** Read the "what is still open" paragraph at the end — the panic surface is untouched, and
+the item is now a decision record with an implementation, not an audit.
 
 The audit BUG-43 left open: which other decoder inputs reach a shift, an index or an allocation
 unvalidated. Run 2026-09-08. **One contained defect found and fixed; the larger finding is a

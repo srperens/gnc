@@ -669,15 +669,18 @@ fn deserialize_mvs_delta(
 /// MV overhead by 50-80% for typical content.
 pub fn serialize_compressed(frame: &crate::CompressedFrame) -> Vec<u8> {
     let mut out = Vec::new();
-    // Magic: GP18 adds entropy type 5, the adaptive binary code-block coder (`EntropyData::Abac`).
-    // Nothing else moved, so a GP18 frame using any older coder is byte-identical to the GP17 one
-    // apart from these four bytes — but a GP17 decoder would reject type 5 rather than
-    // misinterpret it, which is what the generation is for.
+    // Magic: GP19 context-codes abac's Exp-Golomb unary prefix instead of bypassing it (ENT-9
+    // candidate A). Only entropy type 5 changes, so a GP19 frame using any other coder is
+    // byte-identical to the GP18 one apart from these four bytes — and a GP18 abac frame is
+    // *refused* below rather than decoded with the new binarisation, because the two differ only
+    // in how bits are modelled and misreading one as the other yields a plausible wrong image
+    // rather than an error.
+    // GP18 adds entropy type 5, the adaptive binary code-block coder (`EntropyData::Abac`).
     // GP17 added Golomb-Rice stream-length tables (tile flag 0x08).
     // GP15 splits Rice k_zrl into k_zrl_nz + k_zrl_z per subband (K_STRIDE 17→25 per tile, #53).
     // GP14 adds fwd_ref_idx + bwd_ref_idx for hierarchical pyramid B-frames.
     // GP13 is GP12 + chroma_format byte.
-    out.extend_from_slice(b"GP18");
+    out.extend_from_slice(b"GP19");
     // Common header fields (includes chroma_format byte for GP13)
     serialize_frame_header(frame, &mut out);
     // Motion field — GP12 uses delta-coded varint MVs
@@ -711,7 +714,7 @@ pub fn serialize_compressed(frame: &crate::CompressedFrame) -> Vec<u8> {
         }
     }
     // Entropy coder type: 0 = rANS, 1 = bitplane, 2 = per-subband rANS, 3 = Rice, 4 = Huffman,
-    // 5 = abac code-blocks (GP18)
+    // 5 = abac code-blocks (GP18; GP19 context-codes their Exp-Golomb prefix)
     let entropy_type: u32 = match &frame.entropy {
         crate::EntropyData::Rans(_) => 0,
         crate::EntropyData::SubbandRans(_) => 2,
@@ -965,8 +968,11 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
         b"GP17" => 17,
         // GP18: entropy type 5, the adaptive binary code-block coder.
         b"GP18" => 18,
+        // GP19: abac context-codes the Exp-Golomb unary prefix (ENT-9 candidate A). Only type 5
+        // moved; every other coder is byte-identical to GP18.
+        b"GP19" => 19,
         _ => panic!(
-            "Invalid magic (expected GPC8..GP18; older files must be re-encoded)"
+            "Invalid magic (expected GPC8..GP19; older files must be re-encoded)"
         ),
     };
 
@@ -1320,9 +1326,13 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
             )
         }
         5 => {
+            // GP19, not GP18: the binarisation changed under the same entropy type, so a GP18
+            // abac frame decoded here would come back as a plausible wrong image rather than an
+            // error. Refusing it is the whole point of the generation number.
             assert!(
-                gen >= 18,
-                "entropy type 5 (abac) requires GP18 or later, got GP{gen}"
+                gen >= 19,
+                "entropy type 5 (abac) requires GP19 or later, got GP{gen} — GP18 abac frames \
+                 predate ENT-9's context-coded Exp-Golomb prefix and must be re-encoded"
             );
             let mut tiles = Vec::with_capacity(num_tiles);
             for i in 0..num_tiles {

@@ -921,9 +921,9 @@ fn prefix_ctx_summary(stats: &[Vec<BandStats>]) {
     if blocks == 0 || cold <= 0.0 {
         return;
     }
-    eprintln!("  --- ENT-9 step 2 milestone 1: candidate A with adaptation charged ---");
+    eprintln!("  --- ENT-9 candidate A, now shipped: prefix context-coded vs the old bypass ---");
     eprintln!(
-        "    {blocks} blocks, same engine, cold start both arms: shipped binarisation          {:.0} B, prefix context-coded {:.0} B  =>  {:+.2}% of the coder's own bits",
+        "    {blocks} blocks, same engine, cold start both arms: pre-ENT-9 bypassed prefix     {:.0} B, shipped (context-coded) {:.0} B  =>  {:+.2}% of the coder's own bits",
         cold / 8.0,
         prefix / 8.0,
         100.0 * (prefix - cold) / cold,
@@ -940,7 +940,7 @@ fn prefix_ctx_summary(stats: &[Vec<BandStats>]) {
         "    (still not the gate: a frame carries headers and MVs abac does not code, so the share of total file rate is smaller again)"
     );
     eprintln!(
-        "    (step 1b's pooled bound for the same change is printed above as \"candidate A\"; a pooled figure that does not survive this is not a win)"
+        "    (step 1b's pooled bound for the same change is printed above as \"candidate A\". Both are now *history*: candidate A shipped, so the right-hand column is the coder and the left-hand one is what it replaced. Measured end to end at -2.07% to -8.76% of total rate at q=99; see `0074`.)"
     );
 }
 

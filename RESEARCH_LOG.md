@@ -88,6 +88,107 @@ worse than an optional one read with judgement.
 
 ---
 
+## ENT-9 step 2 — abac context-codes the Exp-Golomb prefix, and the bound was honest (2026-09-08)
+
+**Hypothesis.** `0063` measured that abac bypasses 46.7–74.8% of its own bits at q=99 and priced
+candidate A — context-coding the Exp-Golomb unary prefix on (position, bucket), 24 contexts on
+top of 18 — at −2.44% to −9.07% of the coder's bits. Step 2 milestone 1 then showed it survives
+real per-block adaptation (±0.4 points). What was untested was the only thing ENT-9's gate asks
+about: **total rate on a real encode, at bit-identical pixels.**
+
+**Domain.** Quantised wavelet coefficients → abac's binarisation → bitstream. Three coders move
+together by construction: `abac.rs` (the CPU reference), `abac_encode.wgsl`, `abac_decode.wgsl`.
+
+**Success criterion, stated by the item before this session touched it:** ≥2% of **total rate** at
+q=99 on ≥3 sequences, at bit-identical pixels.
+
+**Result — met on three of three, and every figure lands just under its own bound.**
+
+| sequence (q=99) | `0063`'s bound | milestone 1, adaptation charged | **shipped, total rate** | gap |
+|---|---|---|---|---|
+| crowd_run | −8.20% | −8.37% | **−8.04%** | 0.16 |
+| bbb_extended | −2.44% | −2.49% | **−2.07%** | 0.37 |
+| old_town_cross | −9.07% | −8.70% | **−8.76%** | 0.31 |
+
+18 frames, ki=9, 4:4:4, whole container including the headers and motion vectors abac does not
+code. Before/after on one binary pair **both built from `f871a33`**, differing only by this
+change, so nothing else moved.
+
+**Name the tree, because two things landed on `main` between the measurement and the merge.**
+RATE-4 (`ec931e7`) and LOSSLESS-2's re-code fix-up (`d10e414`) both touch the encode path at
+q ≥ 95 — the range these figures live in. They do not invalidate the *delta*, which is a
+controlled before/after on one tree, but they will move the **absolute** byte counts, so the
+container sizes above reproduce at `f871a33` and are not expected to on today's `main`. That is
+`0045`'s lesson applied in advance rather than discovered afterwards: a figure that reproduces on
+its own commit and not on `main` is a change log, not an error.
+
+**The 0.16–0.37 point shortfall is the result worth keeping.** The bound was ideal-adaptive with
+no signalling charged, and `0063` said to "expect the realisable figure lower". It is lower, by
+a fraction of a point, on all three. **A figure at or above the bound would have meant the bound
+was wrong** — and this project has been caught by exactly that shape before (the offline model
+that said 3→4 wavelet levels was worth 1.2% when the codec gave 6%, because the model could not
+see Rice adapting per subband). Here the model saw everything the coder does and the arithmetic
+agrees to a third of a point.
+
+Not only a q=99 effect: **−1.26% to −4.56% at q=95, −0.85% to −2.75% at q=90.** I-frame bytes
+move as well (−2.74% to −6.23%), which matches `0063`'s finding that intra bypasses the same
+three quarters, so this is not an inter result.
+
+**Bit-identical pixels, measured rather than argued.** 3 sequences × q ∈ {99, 90} × 18 frames,
+each arm encoded *and* decoded through GPU encode → GPU decode, compared on per-frame PNG hashes:
+**identical on 6 of 6 arms, 108 frames.** The change cannot move a pixel — same coefficients in
+and out — and this is the check that says so.
+
+**Byte-exact three ways, re-passing ENT-5's whole gate.** `scripts/ent5_gpu_encode_gate.sh`:
+**98 of 98 identical**, GPU encoder against the CPU reference across both arithmetic engines,
+q=90/99/100, three chroma formats, cb=16/32/64, and the sequence path at ki=1 and ki=9. Plus the
+three unit gates (`gpu_encode_matches_cpu_encoder_byte_for_byte`, `gpu_decode_matches_cpu_coder`,
+`gpu_encode_round_trips_through_gpu_decode`).
+
+**The constraint that could have killed the design was checked before any code was written.**
+`probs` is `WG * NUM_CONTEXTS` in workgroup storage, so 18 → 42 contexts multiplies it: measured
+**6400 B → 9472 B** per entry point against the 16384 B requested budget, on all four abac entry
+points. Had it not fit, the answer was a different context layout, not a bug fix — which is why
+it was the first thing measured rather than the first thing discovered.
+
+**Bitstream generation GP18 → GP19, and a GP18 abac frame is now refused.** The two binarisations
+differ only in *how* bits are modelled, so a GP18 abac frame decoded as GP19 comes back as a
+**plausible wrong image** rather than an error — the exact failure `abac_tile.rs` warns about in
+its own header. The entropy-type-5 gate moved from `gen >= 18` to `gen >= 19` with a message
+naming the cause; GP18 files on every other coder still decode, asserted by
+`gp19_rice_frames_are_gp18_payloads_with_a_new_label`.
+
+**One thing the diagnostics needed, and it was a canary firing correctly.** The invariant test
+`simulation_is_a_lower_bound_on_the_real_coder` failed immediately with `real 344 < simulated
+366`, because `adapt_bits` models the *old* binarisation and the coder had become cheaper than a
+model of a binarisation it no longer uses. Repointed at `adapt_bits_prefix_ctx`, which is now the
+model of the shipped coder. **`adapt_bits` is deliberately left alone** — it is ENT-8's instrument
+and that table's figures stay reproducible only while it models what they were taken on. The
+`coef_entropy_diag` column labels were inverted by the same shift and are relabelled.
+
+**Against Rice on today's `main`, and read this one carefully.** Total rate: **−12.3% to −16.0% at
+q=99**, −13.6% to −18.5% at q=95, −14.3% to −20.4% at q=90. On P-frame bytes at q=99: −12.1% /
+−15.8% / −12.3%, which **supersedes `0045`'s "the saving decays monotonically with quality, under
+−4.5% at q=99 on two of three"**. But ENT-9's own contribution is the controlled before/after
+above (−2.07% to −8.76%), and the rest of the distance from `0045` is everything else that landed
+in between — RATE-3, INTER-2, BUG-39, LOSSLESS-2 — plus a different denominator. `0045`'s figures
+reproduce on their own commit, which by its own lesson makes them a change log rather than an
+error. **Do not quote the difference as ENT-9's.**
+
+**BASELINE's `--abac` BD-rate row and its "1.66x against H.264" are now conservative, and are
+annotated rather than re-taken.** The ladder is q=85/92/96/99, squarely in range. Re-taking it
+today would credit RATE-3, BUG-39 and LOSSLESS-2 to ENT-9, which is precisely the failure
+**COORD-6** was filed for the same afternoon — so the re-take is filed as **MEAS-11**, to be run
+on a pinned commit, with both rows on one binary. The Rice row is unaffected.
+
+**Candidate B is still unspent and is now cheaper to re-price**, since A moved the denominator.
+`0063` had it at −0.57% to −1.29%, below the gate on three of three. Re-price before building.
+
+**Gates.** `cargo test --release -- --test-threads=1`: **270 passed, 0 failed, 9 ignored**.
+`cargo clippy --release --all-targets` clean; `cargo clippy --release --target
+wasm32-unknown-unknown --lib` clean. Decision `0074`. **No timing figure was taken** — the machine
+had seven other sessions on it, and every figure above is bytes or a hash.
+
 ## RATE-4 — the regression was the sibling's padding, and a bit-exact frame's reference is its source (2026-09-08)
 
 **What was open.** `0068` (this morning, same session) measured RATE-4's ledger theory and priced
@@ -806,6 +907,105 @@ theatre.
 **BUG-38 (P4)** with the heading committed alongside the reserved id, not fixed here:
 reformatting 44 modules that eight live sessions are editing conflicts with all of them and
 carries no behaviour. It wants a quiet tree and one commit that changes nothing else.
+
+## LOSSLESS-3 — above q=95 a camera sequence is dominated by its own lossless encode, and the swap is a sequence choice, not a frame choice (2026-09-08)
+
+**Hypothesis, from LOSSLESS-2's own numbers.** RATE-2 (`0036`) found a *still* above q~95 costs
+more as a wavelet encode than as a bit-exact MED encode; RATE-3 lifted that into sequences for
+I-frames only. The P-frames were never compared against anything bit-exact, and LOSSLESS-2 had
+just taken `q=100` on crowd_run from 43.0 MB to 25.9 MB without the ladder above it moving.
+
+**Domain declaration.** Whole coded frames, container payload, compared as totals over the clip.
+The bit-exact candidate is better on *both* axes when it is smaller — fewer bytes and exact pixels
+— so there is no rate/quality trade and CLAUDE.md's metric table does not arbitrate. What still
+has to be checked is that no frame gets *worse*, because replacing frames changes what later
+frames predict from; the harness reports per-frame PSNR against source for both arms and flags any
+frame that falls.
+
+**Tree, stated because it moved under this item.** Everything below is `d10e414` + this change,
+**after BUG-47 (`0072`)**. The first take of the table predated it, and BUG-47 changed exactly the
+q=95..99 bytes: the margins came down 1-3 points and the bbb row reversed. Flagged by the RATE-4
+session mid-item, re-taken rather than adjusted. COORDINATION, "Every number carries a tree".
+
+### The defect, 8 frames, ki=9, 4:4:4
+
+| sequence | q=95 | q=97 | q=99 | bit-exact | q=99 costs |
+|---|---|---|---|---|---|
+| crowd_run | 31 427 614 | 34 374 105 | 37 984 009 | **25 856 146** | **+46.9%** |
+| old_town_cross | 31 440 634 | 34 391 448 | 38 010 958 | **25 247 023** | **+50.5%** |
+| blue_sky | 19 231 299 | 21 659 527 | 24 812 142 | **17 294 725** | **+43.5%** |
+| bbb (animation) | 17 896 639 | 20 924 647 | 24 290 268 | 25 885 896 (est.) | −6.2% |
+
+Every rung from q=95 up is dominated on camera content: more bytes than bit-exact, for pixels that
+are not exact. Animation is not dominated at any rung.
+
+### The per-frame version was built first, and it is a ratchet
+
+It is what LOSSLESS-2 does, so it was the obvious shape. Measured over 24 points: **22 improved by
+7.9-33.6%, and bbb at q=99 ki=9 came out 5.51% larger** — failing the criterion this item filed
+before implementing ("the container never larger than today's").
+
+**Why, measured rather than reasoned about.** A P-frame costs *more* when it predicts from a
+bit-exact reference than from a lossy P-frame reconstruction. Mean over frames 2-7, q=99 ki=9:
+
+| sequence | lossy reference | exact reference | |
+|---|---|---|---|
+| crowd_run | 4 968 556 | 5 210 086 | **+4.86%** |
+| old_town_cross | 4 986 250 | 5 210 913 | **+4.51%** |
+| blue_sky | 3 238 448 | 3 403 731 | **+5.10%** |
+| bbb | 3 021 205 | 3 318 982 | **+9.86%** |
+
+Four of four, so it is a mechanism: a quantised reference carries error the next frame's own
+quantiser lands on, and an exact one does not. **Replacing frame k inflates frame k+1's
+candidate**, so each greedy step makes the next likelier — every step a local win, the whole
+worse. Reverted rather than tuned: a margin big enough to protect bbb (its P-frames exceeded the
+bit-exact I by only 1.68-2.08%) would be a constant fitted to one clip, which is the thing RATE-2
+concluded cannot be done.
+
+**This is also why LOSSLESS-2 is sound at `q=100`:** there every reference is exact, so the
+coupling cannot exist and the per-frame minimum is exactly achievable. The two items are the same
+comparison and only one of them is local.
+
+### What shipped: whole arms, decided on measured totals
+
+| sequence | ki=2 (q=95/97/99) | ki=9 (q=95/97/99) |
+|---|---|---|
+| crowd_run | −10.81% / −15.68% / −20.96% | −17.73% / −24.78% / **−31.93%** |
+| old_town_cross | −12.04% / −16.90% / −22.15% | −19.70% / −26.59% / **−33.58%** |
+| blue_sky | −5.95% / −12.67% / −19.97% | −10.07% / −20.15% / **−30.30%** |
+| bbb | ±0.00% | ±0.00% |
+
+**24 of 24 points: never larger, no frame worse, no PSNR regression.** Every switched point is
+bit-exact — 8 of 8 frames md5-identical to the source PNGs through
+`encode-sequence` → `.gnv` → `decode-sequence` — and the switched file is **byte-identical to the
+`q=100` encode** of the same frames on all three camera sequences. That is the cleanest way to say
+what this does: above q≈95 on camera content, GNC now emits its lossless encode.
+
+**bbb pays nothing at all**, because the trigger does not even fire: 8 × 3 235 737 = 25 885 896
+against lossy totals of 24 943 006 (ki=2) and 24 290 268 (ki=9). No second arm is coded there.
+
+**Controls:** q=90 and q=94 sequences, q=100 sequences, and stills at q=90/97/100 are all
+byte-identical with the feature on and off. Refused when a bitrate target is set — the bit-exact
+arm ignores it. Canary prints both totals whenever the second arm is coded.
+
+### Two bugs found on the way, filed rather than folded in
+
+**BUG-46** — `lossless_sibling` drops the caller's chroma format. The RATE-2 canary reports the
+*same* bit-exact candidate at `--chroma-format 444` and `420` (3 257 157 B both), so on subsampled
+input the comparison is against a 4:4:4 arm with three times the chroma and can essentially never
+fire. LOSSLESS-3 is gated to 4:4:4 because its trigger reads that number.
+
+**BUG-48** — `quality_preset(100)` keeps PAD-1's decay padding fill, and at q=100 that is a
+**loss**: crowd_run frame 0 3 240 148 vs 3 214 874 replicate (**−0.78%**), bbb frame 0 3 257 157 vs
+3 235 737 (**−0.66%**). PAD-1's −4.63% was gated on q=80..94. Found because this item's arm was
+0.78% larger than a plain `q=100` encode of the same frames until the flag was cleared — and the
+first explanation offered for that gap, "the fill is worth 0.77% here", was **tested and wrong in
+the other direction**: at q=100 on the *sequence* path the fill makes no difference at all, because
+that path already clears it.
+
+Decision `docs/decisions/0073`.
+
+---
 
 ## LOSSLESS-2 — a lossless P-frame competes with an I-frame of the same picture, and on camera content it loses by 75-80% (2026-09-08)
 

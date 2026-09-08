@@ -141,6 +141,12 @@ pub(crate) fn adapt_bits(coefficients: &[i32], width: usize, init: &[u32]) -> f6
 }
 
 /// [`adapt_bits`] with the visit order named explicitly — ENT-8's step 1.
+///
+/// **This models the pre-ENT-9 binarisation**, with the Exp-Golomb prefix bypassed at `2*len - 1`
+/// bits. It is deliberately not updated to the shipped coder: ENT-8's published scan figures
+/// (`k=2 +0.74%/+0.65%`, and the rest of that table) were taken on this binarisation, and they
+/// stay reproducible only while it does. For a model of what the coder does *now*, use
+/// [`adapt_bits_prefix_ctx`].
 pub(crate) fn adapt_bits_scan(
     coefficients: &[i32],
     width: usize,
@@ -175,8 +181,9 @@ pub(crate) fn adapt_bits_scan(
     bits
 }
 
-/// ENT-9 step 2, milestone 1: the same real engine with candidate A active — the Exp-Golomb
-/// unary prefix **context-coded** instead of bypassed.
+/// The shipped binarisation since ENT-9 candidate A: the Exp-Golomb unary prefix
+/// **context-coded** rather than bypassed. Was step 2 milestone 1's instrument; it is now the
+/// model of the real coder, which is why the canary below compares against it.
 ///
 /// This is the check `0063` said had to come before any shader work. Step 1b priced candidate A
 /// on statistics pooled per plane and subband, which is generous by construction: it charges no
@@ -270,7 +277,14 @@ mod tests {
                         }
                     })
                     .collect();
-                let sim_bits = adapt_bits(&coefficients, w, &cold);
+                // **The model must be of the *shipped* binarisation, which since ENT-9 is
+                // `adapt_bits_prefix_ctx`.** `adapt_bits` still models the pre-ENT-9 coder — it
+                // is ENT-8's instrument and its published scan figures were taken on that
+                // binarisation, so it stays as it was. Pointing this canary at it after the
+                // prefix became context-coded made it fail with `real 344 < simulated 366`,
+                // which is the canary doing its job: the coder had got *cheaper* than the model
+                // of a binarisation it no longer uses.
+                let sim_bits = adapt_bits_prefix_ctx(&coefficients, w, &cold);
                 // **Both engines.** They share this binarisation and this probability model but
                 // not a bitstream, and their per-block flush differs — the range coder's is
                 // several bytes where the interval coder's is one. Testing only one is how the

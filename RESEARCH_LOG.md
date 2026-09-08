@@ -112,6 +112,7 @@ worse than an optional one read with judgement.
 **Gates:** `cargo test --release` and both clippy targets. Decision `docs/decisions/0075`.
 
 ---
+
 ## MEAS-11 — the abac ladder re-taken: +66.0% -> +61.0%, and ENT-9 flattened the decay (2026-09-08)
 
 **Pinned to `a0880c7`.** `scripts/meas1_vs_h264.py`, 1920x1080, 17 frames, ki=9, 4:2:0, 8-bit,

@@ -4,6 +4,111 @@
 
 ---
 
+## RATE-4 — the I-frame ledger is one frame deep, not one GOP deep, and the penalty is paid once (2026-09-08)
+
+**What was open.** RATE-3 keeps whichever I-frame candidate is smaller *on that frame's own bytes*,
+and measured the cost of doing so: bbb q=99 regresses +0.58% (ki=2) and +0.40% (ki=9), the only two
+regressions in its twelve-point table (`0044`). RATE-4 said the fix "needs the GOP encoded both ways
+or a model of the residual cost" and banned a margin constant. **This is the measurement of which of
+those it is. No code shipped; the encoder is unchanged.**
+
+**Domain declaration.** Coded bytes of whole sequences, per frame, from the container the encoder
+actually writes — not coefficients and not a model. Both arms are existing code paths from one
+binary differing only in `GNC_LOSSLESS_FALLBACK`, so every delta below is exact.
+
+**Harness** `scripts/meas_rate4.py`. RATE-3's parameters unchanged: bbb (8), crowd_run (10),
+old_town_cross (10), q ∈ {95, 99}, ki ∈ {2, 9}, `benchmark-sequence`, I+P+B arm only. Binary
+hash-recorded before the sweep (`948d7fc5…`). **The whole sweep was run twice and every number is
+byte-identical**, which is CLAUDE.md's rule 8 discharged rather than asserted.
+
+### The premise was checked first, because everything rests on it
+
+A GOP must be closed for GOP bytes to be the right unit. Confirmed by the RATE-3 session: no
+B-frames at ki=2 or ki=9 (`5I+5P+0B`, `2I+8P+0B`), `rate_ctrl` is `None` unless `--bitrate` is
+passed, `pending_me` is reset at every keyframe, `gpu_ref_planes` is overwritten rather than
+accumulated. The harness adds two assertions it can fail on: both arms must produce the identical
+frame-type partition before being differenced — scene-cut detection runs before the keyframe
+decision, and if it ever read reconstructed pixels the arms could disagree about where a GOP starts
+— and any GOP whose I bytes agree across arms while its totals differ makes the script **refuse to
+print an oracle**. **0 of 38 GOPs disagreed.**
+
+### 1. The exact per-GOP ledger is worth 0.09 points of mean
+
+| | mean of 12 | worst point | worse than control |
+|---|---|---|---|
+| today, per-frame ledger | **−4.28%** | **+0.58%** | 2 of 12 |
+| exact per-GOP ledger | **−4.37%** | +0.00% | 0 of 12 |
+
+The −4.28% reproduces `0044` exactly, which is the harness validating itself against a published
+figure before its new column is believed. The per-GOP arm cannot be worse than the control at any
+point because the control is one of its two arms — the property RATE-4's ban on a margin constant
+was reaching for. It changes the choice on 5 of 38 GOPs, **all five in bbb q=99**.
+
+### 2. The penalty is paid by the first P-frame, and P2 onwards is noise
+
+Per-frame bytes inside each ki=9 GOP whose arms chose differently, bit-exact minus lossy:
+
+| sequence | q | I | P1 | P2 | P3 | P4 | P5 | P6 | P7 | P8 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| bbb | 99 | −279 336 | **+321 525** | +20 104 | +10 539 | +9 967 | +7 003 | +4 823 | +2 877 | |
+| crowd_run | 95 | −645 809 | **+212 583** | +6 768 | +725 | −3 698 | −802 | −375 | −672 | +2 154 |
+| crowd_run | 99 | −1 549 505 | **+284 074** | +16 754 | +1 705 | +5 803 | −1 903 | +1 486 | −3 027 | −6 351 |
+| old_town_cross | 95 | −575 709 | **+187 647** | +7 328 | +2 931 | +3 363 | +1 517 | +1 496 | −79 | +5 051 |
+| old_town_cross | 99 | −1 489 769 | **+249 662** | +10 385 | +6 955 | +3 943 | −5 186 | +2 043 | +2 687 | +790 |
+
+P2 is 2–6% of P1; P2..P8 together are 1–17% of it. **P2's reference is P1's reconstruction, which is
+lossy in both arms**, so the extra detail a bit-exact I-frame carries is re-coded once and gone. It
+never becomes a property of the GOP.
+
+So the item's own framing was wrong in a useful direction: **a one-frame lookahead — compare
+`I + P1` under each candidate's reference — reaches the exact per-GOP decision on 33 of 33 GOPs**,
+at one extra P-frame encode per GOP rather than the losing arm's whole GOP. At ki=2 they are the
+same computation; at ki=9 it is an eightfold difference. The approximation's size is in the table:
+the one-frame ledger is optimistic about bit-exact by the sum of P2.., 4 100 B to 55 313 B on GOPs
+of ~20 MB, so it can misjudge only a GOP whose true delta lies inside that band. Evidence, not a
+guarantee.
+
+### 3. A margin constant would have passed all twelve points — and must still be refused
+
+The P1 penalty is nearly **independent of the I-frame saving**: 187 647–321 525 B across six
+sequence/q pairs, against savings spanning 279 336–1 549 505 B. So "keep the bit-exact frame iff its
+saving exceeds T" reproduces every one of the twelve points for any T in **(279 336, 575 709) B**.
+
+That is the fit RATE-4 forbids, and the reason to keep forbidding it is visible in the same numbers:
+the window's two ends come from two of the three sequences, the penalty varies 1.7× inside this
+small set, every sequence here is 1080p so the constant is untested against resolution, and the
+point setting the lower bound is the single regression the item exists to remove. **A twelve-point
+sweep is not enough to license a constant, and this is the sweep that proves it** — it passes.
+
+### Would we ship it? Not yet, and the reason is a price rather than a doubt
+
+RATE-4 is demoted **P2 → P3**. The mean is 0.09 points; the regressions are one sequence at one
+quality point; and the implementation has to hold **two live I-frame references** — build reference
+A, encode P1, build reference B, encode P1, restore the winner's for P2 — through the
+`encode_once` → `local_decode_iframe_gpu` side channel that has already produced four separate
+defects (`0040`, `0042`, RATE-3's gate, and the ordering constraint in `encode`'s own comment). The
+cheap version snapshots `gpu_ref_planes` (~24 MB at 1080p 4:4:4) instead of re-encoding, so the
+marginal cost is one extra I and one extra P per GOP.
+
+**And the item's other half should go first, because it changes this price.** If a bit-exact frame's
+reference is its colour-converted source, RATE-3's third encode disappears and the ledger's marginal
+cost roughly halves. That route is refuted at q=100 and **unexplained at q=95..99, where the
+encoder's and decoder's references match to 0.0000** — which is exactly the case this ledger cares
+about.
+
+**Rejected on the way:** the whole-sequence double encode (exact, breaks streaming, and finding 2
+says almost nothing it buys lies past P1); deciding once per sequence from the first GOP (collects
+the entire win here, because the choice never varies within a sequence — but that uniformity is
+measured on 8- and 10-frame clips with no scene change); and extrapolating the GOP from the measured
+P1 penalty as `saving + n_P × penalty`, which the data that suggested it refutes — on crowd_run q=95
+ki=9 it prefers lossy by a wide margin where the exact GOP prefers bit-exact (−429 126).
+
+**No encode-time figure and no quality figure.** Seven other sessions were on this machine, so every
+cost above is a count of encodes rather than a measurement of them (COORDINATION rule 1); and no
+pixels moved, because the encoder is untouched. Decision `docs/decisions/0068`.
+
+---
+
 ## BUG-20 — the clippy gate never read a test, and 91 warnings sat behind it (2026-09-08)
 
 **Hypothesis.** CLAUDE.md requires zero clippy warnings and named the gate as

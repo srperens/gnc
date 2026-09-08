@@ -113,6 +113,8 @@ def main():
 
     unsound = 0
     rows_out = []
+    ledgers = []
+    decay = []
     for seq in a.sequences:
         n = SEQUENCES[seq]
         for q in a.q:
@@ -144,6 +146,28 @@ def main():
                     if s_off < s_on:
                         flips += 1
                     oracle += min(s_on, s_off)
+                # How far ahead does the ledger actually have to look? Three ledgers on the
+                # same GOPs: the I-frame's own bytes (today), I + the first P (a one-frame
+                # lookahead, which is exact at ki=2 and a 1-of-8 sample at ki=9), and the whole
+                # GOP. If the one-frame ledger never disagrees with the whole-GOP one, the
+                # criterion is reachable at one extra P-frame encode per GOP instead of the
+                # losing arm's whole GOP -- an eightfold difference at ki=9.
+                for g_on, g_off in zip(on_g, off_g):
+                    if g_on[0][2] == g_off[0][2]:
+                        continue          # both arms kept the same I: no choice to make
+                    full = sum(b for _, _, b in g_on) - sum(b for _, _, b in g_off)
+                    ip1 = (g_on[0][2] + (g_on[1][2] if len(g_on) > 1 else 0)) \
+                        - (g_off[0][2] + (g_off[1][2] if len(g_off) > 1 else 0))
+                    ionly = g_on[0][2] - g_off[0][2]
+                    ledgers.append((seq, q, k, ionly, ip1, full))
+                    # Where in the GOP the penalty is actually paid. Per-frame deltas inside one
+                    # GOP, bit-exact arm minus lossy arm: if the extra detail a bit-exact
+                    # reference carries propagates, these decay slowly; if it is re-coded once
+                    # and gone, P2 onwards are ~0 and the ledger only ever needs one frame.
+                    if k > 2 and len(g_on) > 2:
+                        decay.append((seq, q, [b_on - b_off
+                                               for (_, _, b_on), (_, _, b_off)
+                                               in zip(g_on, g_off)]))
                 rows_out.append((seq, q, k, on_total, off_total, oracle, flips, len(on_g)))
                 print(f"{seq:<16}{q:>4}{k:>4}{on_total:>14}{off_total:>16}{oracle:>17}"
                       f"{(on_total / off_total - 1) * 100:>11.2f}%"
@@ -174,6 +198,33 @@ def main():
           f"per-GOP oracle {sum(1 for r in rows_out if r[5] > r[4])} of {n} (0 by construction)")
     print(f"GOPs where the per-GOP choice differs from the per-frame one: "
           f"{sum(r[6] for r in rows_out)} of {sum(r[7] for r in rows_out)}")
+
+    # How far the ledger has to look. Sign convention: negative means keeping the bit-exact
+    # I-frame is the smaller of the two, which is the choice today's ledger makes on `ionly`.
+    print()
+    print("How far ahead the ledger has to look, over every GOP where the arms chose differently")
+    print("(bytes, negative = keeping the bit-exact I-frame is smaller under that ledger):")
+    print(f"  {'sequence':<16}{'q':>4}{'ki':>4}{'I only (today)':>16}{'I + first P':>14}"
+          f"{'whole GOP':>12}{'  1-frame == GOP?':>18}")
+    agree = 0
+    for seq, q, k, ionly, ip1, full in ledgers:
+        same = (ip1 < 0) == (full < 0)
+        agree += same
+        print(f"  {seq:<16}{q:>4}{k:>4}{ionly:>16}{ip1:>14}{full:>12}"
+              f"{'  yes' if same else '  NO':>18}")
+    if ledgers:
+        print(f"  the one-frame lookahead reaches the whole-GOP decision on "
+              f"{agree} of {len(ledgers)} GOPs")
+
+    if decay:
+        print()
+        print("Where in the GOP the penalty is paid — per-frame bytes, bit-exact arm minus lossy")
+        print("arm, inside each ki=9 GOP whose arms chose differently (frame 0 is the I-frame):")
+        for seq, q, ds in decay:
+            cells = "  ".join(f"{d:+9d}" for d in ds)
+            print(f"  {seq:<16}q={q}  {cells}")
+        print("  If P2.. are small against P1, the cost is re-coded once and does not propagate,")
+        print("  and a one-frame ledger is not an approximation of the GOP — it is nearly all of it.")
     return 0
 
 

@@ -5615,6 +5615,52 @@ is an afternoon with an existing harness. Against that: the throughput half cann
 a shared machine at all (COORDINATION), and the rate gate may kill it before the shader work
 starts — which is why the gate is first.
 
+### ENT-9 — abac context-codes three decisions and bypasses the rest; at q>=95 the rest is where the file is (todo, P2)
+
+**Filed 2026-09-08 by the ENT-3 session, from its own numbers.** ENT-3 measured abac's saving
+against Rice on P-frame bytes decaying monotonically with quality — bbb_extended −20.6% at q=90 to
+−14.5% at q=99, crowd_run −12.2% to −4.3%, old_town_cross −11.9% to −3.7% (`0045`). The same
+run's entropy bound says the shortfall is the **context template**, not adaptation: shipped sits
++12.5% over `Hnb` on inter at q=99 while adaptation loss is under 0.7%.
+
+**Hypothesis.** abac context-codes exactly three binary decisions per coefficient — significant,
+`>1`, `>2` — and sends the Exp-Golomb order-0 remainder of `(|v| - 3)` and the sign as **bypass**
+bits at p=0.5 (`abac.rs`, `encode_block`). As the quantiser fines, magnitudes grow and the
+population moves out of the three context-coded decisions and into the bypassed suffix. So the
+decay is not abac running out of structure; it is abac coding a shrinking share of the file. Rice
+codes exactly that population well, which is why the two converge.
+
+**Step 1, and nothing should be built before it: measure the split.** What fraction of the shipped
+bits at q=90 / 95 / 99 are (a) the three context-coded decisions, (b) the Exp-Golomb suffix, (c)
+the sign? **This is not yet measured and the hypothesis above stands or falls on it.** If the
+suffix is 15% of the file at q=99 the ceiling on this item is small; if it is 60% the item is the
+largest thing left in the coder. `coef_entropy_diag` already walks abac's binarisation and
+`abac_decode_tile` gives the coefficients back, so this is a counter in an existing read-only
+diagnostic, not new coder work.
+
+**Step 2, only if step 1 justifies it.** The cheap candidates, in ascending cost:
+
+- **A context for the first suffix bit**, conditioned on the same magnitude bucket. One extra
+  context set of 6; the bit is far from uniform when the neighbourhood is large.
+- **A sign context** from the signs of the left and up neighbours. Wavelet subband signs are not
+  independent along the direction of the band — HL is horizontally correlated, LH vertically —
+  and this is the standard JPEG 2000 sign-context argument, which GNC has never priced.
+- **More `>k` decisions** before the bypass starts (`>3`, `>4`), which is a straight
+  context-count-for-rate trade and the one most likely to be a wash.
+
+**Success criterion.** ≥2% of total rate at q=99 on ≥3 sequences at bit-identical pixels, which is
+the same gate ENT-6 was closed against and the same bar its 1.3% failed. Below that, close it:
+a context experiment worth 1% is not worth the decode dependency it adds.
+
+**Why it is P2 and not P1.** abac is opt-in and `0017`'s case for it is *weaker* at the top of the
+range after `0045`, so this improves a non-default coder in the range where it is least
+convincing. It is filed because the mechanism is specific, the instrument exists, and step 1 is
+an afternoon; it is not filed as urgent.
+
+**Do not confuse this with ENT-6 or ENT-8.** ENT-6 priced the *initialisation* of the existing
+contexts (1.3%, closed). ENT-8 prices *parallelising* the existing contexts at fixed rate. This
+prices *which symbols get a context at all*, which neither touches.
+
 ### ENT-6 — abac's cold start is worth 1.3%, not 4% (**CLOSED by measurement 2026-09-08**)
 
 **Closed. Neither candidate ships.** Decision record

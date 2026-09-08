@@ -219,20 +219,21 @@ If this table and `scripts/claim list` disagree, the table is wrong.
 | `../gnc-abacgpu` | `abacgpu` | **ENT-5 — abac now encodes on the GPU, one thread per code-block, and it is the CPU encoder's exact bytes** (98 of 98 whole-file comparisons; `scripts/ent5_gpu_encode_gate.sh`). **Invalidates no measurement and moves no bitstream** — byte identity is what is asserted, so ENT-4's −16.0% and the −13.4% lossless figure are unchanged by construction. Deliberately does *not* touch `use_gpu_encode` or `sequence.rs`'s frame-pipeline selection: abac routes on `gpu_entropy_encode` directly inside `encode_entropy`, so this is orthogonal to **ARCH-3** rather than racing it, and it keeps abac off the fused quantiser that BUG-16 says moves Rice's pixels. **One criterion outstanding: encode time per 1080p frame is NOT measured** — the machine had three other sessions on it, one of them running `encode-sequence`. Instrument: `cargo test --release --test abac_bench -- --ignored --nocapture --test-threads=1`. Until it runs, decision 0017's reason 2 has lost its mechanism and kept its 129 ms. See `docs/decisions/0024`. **Merged 2026-09-07 (`a2405d7`), claim dropped, worktree removed.** Rebased onto ARCH-3 after it landed — one markdown conflict, no code change, gates re-run (224 tests, identity gate 98/98). Two notes for whoever picks up the leftovers: **abac's 4:2:2 and 4:2:0 output is byte-identical between the GPU and CPU encoders**, so whatever BUG-28 is (filed as BUG-26 and renumbered — see below), it is not in abac's encoder; and ARCH-3's `inter_gpu_entropy_available()` returning `false` for abac now means "not in the batched dispatch", not "on the CPU" — its comment says so. |
 | _(removed)_ | `ent7file` | **ENT-7 filed at the project owner's request 2026-09-08 — and it was already filed, which is the news.** Another session had committed an ENT-7 for BPC-PaCo hours earlier on **`claude/wgsl-bpc-paco-encoder-tvws1m`, pushed to origin and never merged**, so `scripts/claim` (which reads `main:BACKLOG.md`) could not offer it and a grep of the tree found nothing. **The lock does not cover ideas that live only on an unmerged branch** — that is the `0018` collision in a new place, and the cheap habit that would have caught it is `git fetch && git log --all --oneline` before filing, not a grep. Resolved by cherry-picking the original commit (authorship preserved) and merging both filings into **one** ENT-7 rather than leaving two: the original's BUG-31 framing, order of work, criteria and canary stand, and the second filing adds `0024`'s ≤7.5% ceiling (abac is +4.1% of the bound on the 82% of rate in full 64x64 blocks, so stationary models should be expected to **lose** rate there), the **1.9x** cap Rice's 47%-of-decode entropy stage puts on the throughput half, the two things it must not be bought for (PCRD at 0.00 dB; ~72% of the J2K gap is upstream), and two cheap gated steps that can settle it with no GPU — a literature read and a seventh model column in the existing `GNC_COEF_ENTROPY=1` harness. **Markdown only; no code, no shader, no measurement moved, GPU suite deliberately not run.** ENT-7 is left **unclaimed** so `next` can hand it out. If the original branch is merged later, expect a duplicate-content conflict in that section — keep the merged version. |
 
-## `main` and `origin/main` have diverged, and the lock only sees one of them (noticed 2026-09-08)
+## `main` and `origin/main` diverged for about an hour — RESOLVED 2026-09-08, and the lesson is not about pushing
 
-Found while filing ENT-7. `scripts/claim next` and `items` read **`main:BACKLOG.md`** — the local
-branch in the shared checkout — and it is not what `origin/main` holds:
+Noticed while filing ENT-7, resolved within the hour by another session, which rebased the local
+commits onto `origin/main` and pushed (DOC-1 and ENT-7 now read `a8ac8c5`, `290920a`, `7dc9302`,
+`bae4b83`, `0918d30` — the hashes in older rows and messages predate that rebase). What diverged:
+local `main` had DOC-1 unpushed while `origin/main` had `6d2ecce` (BUG-33) and `0b9ff78` (DX12 does
+not run GNC) unmerged. Nothing was lost and nothing was forced.
 
-- **local `main` has DOC-1 and origin does not** — `d9d1923`, `ca3db8b`, `c064505`, unpushed.
-- **`origin/main` has two commits local `main` does not** — `6d2ecce` (BUG-33 filed, GOALS stopped
-  claiming portability) and `0b9ff78` (DX12 does not run GNC — FXC X3695 in `block_match_bidir.wgsl`).
-
-Nothing is lost and nothing needs undoing, but two consequences are worth knowing while it lasts:
-a session that follows "End of session" literally (`git rebase origin/main`) rebases onto a `main`
-without DOC-1, and **an item filed on a branch that is pushed but not merged is invisible to the
-lock** — which is exactly how ENT-7 came to be filed twice. Whoever pushes next should merge the
-two, not force either one.
+**Keep the part that outlives it.** `scripts/claim next` and `items` read **`main:BACKLOG.md`** —
+the local branch in the shared checkout — so *an item that exists only on a branch, pushed or not,
+is invisible to the lock*. That is how ENT-7 came to be filed twice in one day: the first filing
+sat on `claude/wgsl-bpc-paco-encoder-tvws1m`, and the second session's grep of the tree found
+nothing because a grep does not read unmerged branches. The habit that catches it costs one
+command — **`git fetch && git log --all --oneline --grep=<idea>` before filing, not a grep** — and
+it is the same class of miss as the `0018` decision-record collision.
 
 ## The test material was missing entirely, and was refetched (2026-09-07) — RESOLVED
 

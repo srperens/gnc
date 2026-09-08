@@ -77,7 +77,7 @@ order rather than a format-specific feature.
 6. **Open source only** — All dependencies must be open source.
 7. **English only** — All code, comments, docs, and commit messages in English.
 8. **Measure everything** — Every change benchmarked: PSNR, SSIM, bpp, encode/decode FPS. Compare against baseline and previous best. Optionally compare against relevant codecs (H.264, H.265, AV1, MJPEG, JPEG XS, ProRes) for context.
-9. **No code duplication** — Extract shared logic. Code must pass `cargo fmt` and `cargo clippy` with zero warnings.
+9. **No code duplication** — Extract shared logic. Code must pass `cargo fmt` and `cargo clippy` with zero warnings. The exact clippy commands are in CLAUDE.md, "Code Style": `--all-targets` on native since BUG-20 (`docs/decisions/0062`), `--lib` on wasm. **The `cargo fmt` half of this rule is currently false** — 566 diffs in 61 files, 504 of them under `src/` — filed as **BUG-38**, not yet decided.
 10. **No legacy** — Nobody runs GNC in production. We can break the bitstream format, change the container, rename fields, restructure anything. No backward compatibility constraints.
 11. **Video codec first** — GNC is a video codec, not an image codec. Sequence encode/decode performance is the primary metric. Single-frame performance only matters as a component of video throughput.
 

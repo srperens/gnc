@@ -46,6 +46,95 @@ and a different scale. RATE-4 holds the refutation.
 
 ---
 
+## BUG-20 — the clippy gate never read a test, and 91 warnings sat behind it (2026-09-08)
+
+**Hypothesis.** CLAUDE.md requires zero clippy warnings and named the gate as
+`cargo clippy --release` plus the wasm `--lib` form. `cargo clippy --release` compiles the lib and
+the bins and never reads a test, so the rule and the check disagreed about what "the code" is.
+Either the gate should widen or the rule should say it excludes tests. Predicted: the warnings are
+mostly style noise, and one or two are not.
+
+**Domain.** No codec domain. Test code and two markdown gate definitions — `#[cfg(test)]` modules
+under `src/` and one integration test target. No shipped code path, no shader, no bitstream.
+
+**Before.** `cargo clippy --release --all-targets` on `main` at `a73e0a2`: **91 warnings** —
+`gnc (lib test) generated 90 warnings`, 24 of them auto-applicable, plus 1 in
+`tests/requested_limits.rs`. `cargo clippy --release` and
+`cargo clippy --release --target wasm32-unknown-unknown --lib`: clean, both. The one remaining
+`warning:` line on the native target is the future-incompatibility notice for the third-party
+crate `block v0.1.6`, which is not a lint on this code — BUG-20's entry already said so and it is
+still true after.
+
+The 91 by lint: 38 `field_reassign_with_default`, 27 `needless_range_loop`, 17
+`unnecessary_cast`, 4 `unused_variables`, 2 `assertions_on_constants`, 1 `needless_borrow`, 1
+`manual_div_ceil`, 1 `manual_range_contains`.
+
+**After.** `cargo clippy --release --all-targets`: **0**. `cargo clippy --release`: 0. Wasm
+`--lib`: 0. **The gate is now `--all-targets` on native** (CLAUDE.md, LOOP.md step 5), wasm stays
+`--lib` because the CLI is not a wasm artifact (BUG-24). Nothing was suppressed: no `#[allow]`
+was added at any level.
+
+**The prediction held, and the two exceptions are the reason the item was worth doing.**
+
+- `assertions_on_constants` was pointing at the BUG-35 guard test asserting
+  `MAX_GROUPS * MAX_GROUP_ALPHABET > SHARED_HIST_ENTRIES` and `3266 < SHARED_HIST_ENTRIES` at
+  **run time**, over three `const usize` values. Those relations cannot change while a test runs —
+  they change when someone edits a constant, which is a build event. Now `const _: () =
+  assert!(…)`: shrinking the arena fails the build instead of failing a test that has to be run
+  to say so. This is the one place where the widened gate found something a reviewer reading a
+  diff would not have.
+- `unused_variables` found one genuinely dead binding (`storage_dst` in `rice_gpu.rs`, a
+  `BufferUsages` value computed and never used while the buffers around it spell theirs inline) —
+  deleted. The other three are two GPU read-backs in a debug test whose values are never asserted
+  on, and an unused `y` in a horizontal-gradient generator; prefixed `_`, which keeps the
+  read-back and says in the source that nothing checks it.
+
+**The other 89 are style, and one of them is worth naming as the argument against widening.** 27
+of the 91 are `needless_range_loop`, and `for (i, cf) in compressed.iter().enumerate().take(8)
+.skip(1)` is not plainly better than `for i in 1..8`. That is the strongest case for exempting
+tests, and it lost to the two findings above plus the absence of any other gate: there is no CI
+here, so the clippy command in LOOP.md step 5 is the only thing that ever reads this code
+mechanically. Decision `0062` records both alternatives and what each would have cost.
+
+**One subtlety worth carrying, because it is the vacuous-pass trap in miniature.**
+`for i in 0..n { a[i] = … }` panics when `a` is shorter than `n`; `a.iter_mut().enumerate()`
+cannot — it just does less work. Where `n` and `a.len()` are the same expression the rewrite is
+free, but **four of the 27 sites had `n` from a separate computation**, so the rewrite would have
+traded a loud panic for a quiet short loop. Those four now say the bound out loud:
+`assert!(tiles.len() >= tiles_per_plane)` in `pipeline_tests.rs`, and
+`assert_eq!(decoded.len(), …)` at three `rice_decode_tile` sites in `rice_gpu.rs`. A fifth
+candidate needed nothing — `plane_tiles` is a slice whose length *is* the bound, so its `.take()`
+was redundant and went — and the five `compressed`/`psnr` sites already had an
+`assert_eq!(len, 9)` above them. Net: the tests state four invariants they previously only
+implied.
+
+**Gates.** `cargo test --release -- --test-threads=1`: **261 passed, 0 failed, 9 ignored** on the
+branch, **265 passed, 0 failed, 9 ignored** on the tree that landed. `main` moved under this item **five
+times** while it was being written, so the gates were re-run on each sync that brought Rust rather
+than assumed: BUG-43 changed `src/encoder/rice.rs` and BUG-39 changed
+`src/encoder/pipeline_tests.rs`, both files this branch also edits (test code only, in both
+cases). The two syncs that brought only markdown and `scripts/claim` did not need a re-run, and
+the entry says which is which rather than claiming one figure covers all five. `cargo clippy --release --all-targets` clean and
+`cargo clippy --release --target wasm32-unknown-unknown --lib` clean, both before and after the
+merge. The only `warning:` line either way is the `block v0.1.6` future-incompatibility notice.
+
+**No codec figure moves, and that is checked rather than assumed.** Every edit is inside
+`#[cfg(test)]` code or an integration test target. Of the eleven `src/` files touched, **nine**
+have their first changed line below that file's own `#[cfg(test)]` marker, and the other **two**
+are test files with no marker of their own — `src/{encoder,decoder}/pipeline_tests.rs`, reached
+only via `#[cfg(test)] #[path = …] mod tests;`. The twelfth file is
+`tests/requested_limits.rs`, an integration test target. So the shipped build is unchanged by
+construction. **There is no before/after on ≥3 sequences here and there should not be** — the
+measurement for this item is the warning count and the suite, and an encode ladder would be
+theatre.
+
+**Found on the way: `cargo fmt --check` is red the same way and worse.** 566 diffs in 61 files,
+**504 of them in 44 files under `src/`** — so unlike BUG-20 this one is mostly shipped code. GOALS
+§9 requires `cargo fmt` clean; neither CLAUDE.md nor LOOP.md names it as a gate. Filed as
+**BUG-38 (P4)** with the heading committed alongside the reserved id, not fixed here:
+reformatting 44 modules that eight live sessions are editing conflicts with all of them and
+carries no behaviour. It wants a quiet tree and one commit that changes nothing else.
+
 ## BUG-39 — lossless video works: a fractional prediction cannot survive a step-1.0 quantiser (2026-09-08)
 
 **Hypothesis, named in this log an hour earlier and now tested.** After cause 3, `q=100` inter
@@ -210,10 +299,47 @@ matches to **0.0000** under the same code. Two lossless MED frames, one matching
 exactly and one off by 254, is not a difference the "fractional versus integral" story accounts for
 on its own. Anyone resuming should start there rather than with the q=100 rows.
 
-**Raised with the BUG-39 session rather than acted on:** if the decoder's own reference at q=100 is
-integral where its decoded output is bit-exact, then the decoder holds two different pictures and
-the P-frames predict from the wrong one. That is BUG-39's surface (its cause 4 is sub-pel rounding
-in the prediction path), and it may be a fifth cause rather than anything about RATE-2's fallback.
+**CORRECTION, same day, and it inverts this entry's conclusion.** BUG-39 closed with `q=100` video
+bit-exact on every frame — 48 of 48 frames md5-identical against source through a real container
+round trip, three sequences at ki=2 and ki=9 (`docs/decisions/0064`). A P-frame cannot be
+md5-identical to its source if it predicted from a picture the decoder does not hold: the residual
+is computed against the encoder's reference and added to the decoder's, so any difference between
+the two lands in the output. It does not. **The two q=100 rows above are therefore not
+measuring the pictures.**
+
+**Second correction, same hour, and this one is mine to own: the readback is not the culprit
+either.** I told this entry's author that `read_reference_planes` must be returning a different
+stage on the two pipelines, and that sentence went into `main` on my word. It is wrong. On the
+*shipped* tree the two sides agree exactly, on the same 256×256 gradient with `GNC_REF_DEBLOCK=0`
+— `lossless_iframe_reference_matches_the_decoders`, green in the suite and asserting it since
+`0042`:
+
+```
+q=99  transform=Wavelet     plane Y/Co/Cg: max |enc-dec| = 0.0000, nonzero 0/65536
+q=100 transform=MedPredict  plane Y/Co/Cg: max |enc-dec| = 0.0000, nonzero 0/65536
+```
+
+The q=100 rows were taken with the source-copy patch **applied**, so what came back on the encoder
+side was a colour-converted source plane rather than a reference. That is a fact about the patched
+tree, and **what it implies for the route is the patch author's to say, not mine** — the honest
+statement is that the shipped readback is symmetric and the q=100 rows need re-taking with the
+patch's own behaviour stated. Filed and closed as BUG-44, with the lesson: two sessions' numbers
+that cannot both be true have a third answer beyond "one is wrong" — they were taken on different
+trees.
+
+The uncontaminated row is the **0.0000** one — which is exactly the case the change targets — so
+**the source-copy route is not refuted and this entry had it backwards.** The
+fractional-versus-integral observation stands as an observation; the conclusion drawn from it does
+not, and the asymmetry flagged above ("why does the fallback case match while q=100 does not")
+dissolves into the readback difference rather than needing an explanation. Whoever resumes should
+verify against `fallback_iframe_reference_matches_the_decoders` alone until that readback is fixed;
+if the route holds, RATE-3's third encode goes away and `encode_as_reference` can be deleted.
+
+**~~Raised with the BUG-39 session rather than acted on:~~ WITHDRAWN — there is no fifth cause.**
+This entry suggested the decoder might hold two different pictures at q=100. BUG-39's md5 evidence
+refutes it, and cause 4 turned out to be sub-pel interpolation rounding — fixed by rounding the
+motion vectors to full-pel in a lossless configuration, for +1.83% of bytes on average and q=99
+identical to the byte.
 
 The other half of RATE-4 — choosing the candidate on *sequence* bytes instead of the I-frame's own,
 which is what makes bbb q=99 regress +0.58% — is untouched.

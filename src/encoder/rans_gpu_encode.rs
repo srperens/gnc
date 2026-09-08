@@ -2079,10 +2079,12 @@ mod hist_arena_tests {
 
     #[test]
     fn theoretical_max_overflows_the_arena_and_a_budget_shrink_is_smaller_still() {
-        assert!(MAX_GROUPS * MAX_GROUP_ALPHABET > SHARED_HIST_ENTRIES);
+        // Both bounds are relations between compile-time constants, so they are checked at
+        // compile time: a shrink that breaks them should fail the build, not one test.
+        const _: () = assert!(MAX_GROUPS * MAX_GROUP_ALPHABET > SHARED_HIST_ENTRIES);
         // 16384 minus the rest of the fused shader (~3320) leaves ~3266 bins.
         // That shrink is why the guard has to land first: it overflows sooner.
-        assert!(3266 < SHARED_HIST_ENTRIES);
+        const _: () = assert!(3266 < SHARED_HIST_ENTRIES);
         assert_eq!(SHARED_HIST_ENTRIES, 5120);
     }
 }

@@ -2007,7 +2007,7 @@ carry a note naming the other** — that is what makes a pre-2026-09-08 citation
 
 Filed 2026-09-07 by the `coord` session. Fixed 2026-09-08 by the `drnum` session.
 
-### BUG-20 — the clippy gate does not cover the test targets, and 88 warnings sit there (todo, P4)
+### BUG-20 — the clippy gate does not cover the test targets, and 88 warnings sit there (**FIXED 2026-09-08**)
 
 CLAUDE.md requires **zero clippy warnings** and names the gate as `cargo clippy --release` plus
 the wasm target. Both are clean. But `cargo clippy --release --all-targets` reports
@@ -2028,6 +2028,71 @@ remaining `warning:` line on the native target is the future-incompatibility not
 third-party crate `block v0.1.6`, not a lint on this code.
 
 Filed 2026-09-07 by the `coord` session.
+
+**Fixed 2026-09-08 by the `loopa` session — the gate widened and the warnings cleared, not
+exempted.** It was **91** by the time the item was picked up (88 on 2026-09-07, 90 later that
+day): 90 in `gnc (lib test)` plus 1 in `tests/requested_limits.rs`. The native gate in CLAUDE.md
+and LOOP.md step 5 is now `cargo clippy --release --all-targets`; the wasm gate stays `--lib`
+(BUG-24). `--all-targets` reports **0**, and no `#[allow]` was added at any level.
+
+By lint: 38 `field_reassign_with_default`, 27 `needless_range_loop`, 17 `unnecessary_cast`, 4
+`unused_variables`, 2 `assertions_on_constants`, 1 each `needless_borrow`, `manual_div_ceil`,
+`manual_range_contains`. **Two of the eight were substantive** — `assertions_on_constants` was
+BUG-35's guard test asserting relations between three `const usize` values at *run* time (now
+`const _: () = assert!(…)`, so an arena shrink fails the build), and `unused_variables` found one
+dead `BufferUsages` binding in `rice_gpu.rs`. The remaining 89 are style, and the 27
+`needless_range_loop` are the strongest case for the alternative. Decision `0062` records why the
+alternative lost.
+
+Every edit is in `#[cfg(test)]` code or an integration test target, checked file by file against
+each file's `#[cfg(test)]` marker, so the shipped build is unchanged by construction and no
+figure in BASELINE moves.
+
+### BUG-42 — `ENT-9` is filed twice (**CLOSED 2026-09-08 — duplicate of COORD-3, which is now FIXED**)
+
+Filed and closed inside the same hour by the `loopa` session, which found the two live `### ENT-9`
+headings on `main` while merging BUG-20. **BUG-41 had already been filed and closed against
+COORD-3 for exactly this, and COORD-3 shipped while this entry was being written** — `ENT-9` is
+renumbered to `ENT-10`, `scripts/claim` gained the item-id allocator and a
+`warn_duplicate_ids` check, decision `0065`. The awk duplicate scan this entry originally proposed
+is that check; read COORD-3 and `0065`, not this.
+
+**What the instance adds is the count: three sessions filed one finding in one hour**, and the
+third did it *after* COORD-3's stub was on `main`. Two distinct causes, and neither is a lock
+failing:
+
+- **`scripts/claim bug` gives a free *id*, and nothing anywhere compares the *subject*.** BUG-42
+  was genuinely free; the allocator did its job. An id allocator cannot be the check for "has
+  someone already filed this".
+- **A stale base hides a stub.** This worktree was branched before COORD-3's stub landed, so its
+  own `BACKLOG.md` did not contain it, and filing a bug reads no committed ref. Same shape as the
+  `dr-0029` case in COORDINATION: *reserving from a stale base is indistinguishable from reserving
+  a free one.*
+
+The two reads that would have caught it are now in COORDINATION, above the shared-checkout merge
+section. The second is what BUG-41 and BUG-42 had in common: **an item held with no heading yet is
+invisible to `grep`, to `next` and to `items`, and visible only to `scripts/claim list`.**
+
+### BUG-38 — `cargo fmt --check` is red across the tree, and GOALS §9 names it as a gate (todo, P4)
+
+GOALS §9 says code "must pass `cargo fmt` and `cargo clippy` with zero warnings". `cargo fmt
+--check` reports **566 diffs in 61 files** — **504 in 44 files under `src/`**, 53 in 14 files
+under `tests/`, 9 in 3 under `examples/`. So unlike BUG-20, this is not a test-code question:
+the shipped code is the bulk of it.
+
+Measured 2026-09-08 on `main` at `a73e0a2`, by the `loopa` session while doing BUG-20 — same
+defect shape (a written rule and an unrun check disagreeing), found because BUG-20's entry asks
+which of the two is wrong and the same question applies one gate over.
+
+**Not fixed in passing, deliberately.** `cargo fmt` over 44 `src/` files is a diff that touches
+almost every module eight sessions are editing right now, and it would conflict with all of them
+while carrying no behaviour. The fix wants a quiet tree and one commit that changes nothing else,
+so it is a claimable item rather than something to do while holding another.
+
+**The decision to make is the same one BUG-20 has:** run `cargo fmt` once and add it to the gate
+list in CLAUDE.md and LOOP.md (neither of which mentions it today — only GOALS §9 does), or drop
+the `cargo fmt` half of GOALS §9 and say the project does not check formatting. Doing neither
+leaves a rule that has been false for an unknown length of time.
 
 ### ARCH-3 — `gpu_entropy_encode` selected a whole P-frame pipeline, not just where entropy runs (**DONE 2026-09-07**)
 
@@ -4262,6 +4327,25 @@ ran:
 | q=100, MED | **254.0039** | 65 535 / 65 536 |
 | q=100, `GNC_MED=0` (lossless wavelet) | 7.3965 | 65 535 / 65 536 |
 
+**CORRECTION 2026-09-08, and it inverts the conclusion: the two q=100 rows are an instrument
+artefact.** BUG-39 closed the same afternoon (`docs/decisions/0064`, `0f1d303`) with `q=100` video
+bit-exact on every frame — 48 of 48 md5-identical against source through a real container round
+trip, three sequences at ki=2 and ki=9. A P-frame cannot be md5-identical to its source if it
+predicted from a picture the decoder does not hold, so the two references *are* the same picture
+and are not measuring the pictures. **They are not measuring a readback asymmetry either —
+BUG-44, closed the same hour:** on the shipped tree `lossless_iframe_reference_matches_the_decoders`
+reads `max |enc-dec| = 0.0000` on all three planes at q=100 MED. The rows were taken with the
+source-copy patch applied, so the encoder side was a source plane rather than a reference; what
+that implies for the route belongs to whoever holds the patch.
+The diff was measuring the readback.
+
+**What survives is the 0.0000 row, and it is the case the change targets.** The free half is
+therefore **not refuted** — re-apply `reference_is_the_source`, verify against
+`fallback_iframe_reference_matches_the_decoders` only, and treat any q=100 MED row from
+`read_reference_planes` as unreadable until that readback is fixed. If it holds, RATE-3's third
+encode goes away and `encode_as_reference` can be deleted. The paragraph below is kept because the
+observation in it is real; the conclusion drawn from it is withdrawn.
+
 **So the source planes are not the picture the decoder reconstructs, and the tell is in the
 values**: the encoder's are fractional (`0.0, −0.5019531, −0.00390625, 0.49414063, …`) where the
 decoder's reference is integral (`0.0, −1.0, −1.0, −1.0, …`) — identical on both q=100 runs, so it
@@ -4271,10 +4355,10 @@ makes the reconstructed picture integral, and the raw source planes have not bee
 0.0000 while both q=100 cases do not, and that is where this restarts — not with another mechanism
 guess.
 
-**Related, and not this item's to fix:** if the decoder's own reference at q=100 is integral where
-its *output* is bit-exact, those are two different pictures and the P-frames predict from the
-first. BUG-39 owns that surface (its cause 4 is sub-pel rounding in the prediction path); this is a
-separate question about the reference, raised there rather than acted on here.
+**~~Related, and not this item's to fix:~~ WITHDRAWN.** This entry raised a possible fifth BUG-39
+cause — the decoder holding two different pictures. It does not: BUG-39's 48-of-48 md5 result
+closes it, and the asymmetry that suggested it ("why does the fallback case match while q=100 does
+not") dissolves into the readback difference above. **There is no fifth cause; do not chase it.**
 
 **Success criterion:** no point in RATE-3's table larger than the control arm, mean no worse than
 today's −4.28%, worst P within 0.1 dB. **Canary:** the two existing ones — RATE-2's per-frame

@@ -1261,7 +1261,71 @@ CLAUDE.md's portability prose corrected either way.
 **Why P2.** Same reasoning as BUG-31 — no measurement is invalidated and nothing fails on this
 machine — but the affected claim is a documented project rule, and step 1 may well be free.
 
-### BUG-31 — abac's two GPU shaders ask for more workgroup memory than the device is created with (todo, P2)
+### BUG-35 — five more compute entry points are over the workgroup budget, one on the default encode path (todo, P2)
+
+Found 2026-09-08 by `tests/workgroup_storage_limit.rs`, the check written for BUG-31. That item
+was filed as "abac's two GPU shaders"; the sweep found **nine** entry points over budget across
+five shaders. Four were abac's and are fixed. These five are not:
+
+| shader:entry point | declares | over budget by | path |
+|---|---|---|---|
+| `rans_normalize_encode_fused.wgsl:main` | 33816 B | +17432 B | rANS (parked) |
+| `quantize_histogram_fused.wgsl:main` | 23800 B | +7416 B | **default encode** |
+| `rans_histogram.wgsl:main` | 23752 B | +7368 B | rANS (parked) |
+| `rans_normalize.wgsl:main` | 18460 B | +2076 B | rANS (parked) |
+| `rans_encode.wgsl:main` | 16388 B | **+4 B** | rANS (parked) |
+
+Budget is 16384 B, which is what `GpuContext` requests and what the WebGPU spec guarantees as a
+minimum. Nothing enforces it natively — see BUG-31 and `docs/decisions/0032` for why, and for the
+reason a passing browser would not close this.
+
+**`quantize_histogram_fused.wgsl` is the one that matters and it is not opt-in.**
+`EncoderPipeline::new` constructs `FusedQuantizeHistogram::new(ctx)` unconditionally
+(`src/encoder/pipeline.rs:727`), and it is the fused quantise+histogram stage CLAUDE.md lists as
+part of the architecture. So the *default encoder* asks for 7416 B more than the device it created.
+The encoder is not exposed to JS today, which is the only reason this is not already a browser
+failure; GOALS §2 rule 4 does not distinguish encoder from decoder.
+
+**`rans_encode.wgsl` at +4 B is worth its own line**, because it is the shape of a defect that a
+tolerance would hide: it is 16388 B against 16384. One `vec4` of slack would fix it, and no
+plausible occupancy argument is disturbed by it.
+
+**Order of work.** `quantize_histogram_fused` first — it is the only one on a live path. The rANS
+four are a parked backend (GOALS §5b: rANS must never be the default), so they are less urgent and
+not less real; if the answer for them is "park the shaders too", that needs saying explicitly
+rather than leaving the test's exception list as the record.
+
+**Do not fix these by raising the limit request.** That is the one option BUG-31 ruled out with a
+reason that applies unchanged here.
+
+**Canary already in place:** the exception list in `tests/workgroup_storage_limit.rs` holds each
+shader's *exact* current size, so a fix cannot land silently and the record cannot rot. Closing
+this item means that array is empty and the machinery around it can go.
+
+### BUG-31 — abac's two GPU shaders ask for more workgroup memory than the device is created with (**FIXED 2026-09-08**)
+
+**Fixed by packing, not by narrowing the workgroup. 18688 B -> 6400 B on both shaders, and the
+emitted bytes did not move: 98 of 98 whole-file comparisons identical, four decoded outputs hashed
+equal before and after.** `rows` now stores one clamped byte per magnitude, four to a word, and the
+clamp is exact rather than approximate — `bucket` saturates at `nb >= 1 << (NUM_BUCKETS - 2)`, so a
+clamped contributor and the true one land in the same bucket and contributors below the clamp are
+stored exactly. Rejected: `WG` 32 -> 28 (fits, trivially identical, idles 12.5% of the lanes and
+still only one workgroup per core), `MAX_BLOCK_W` 64 -> 48 (invalidates every abac rate figure),
+raising the request to 32768 (trades GOALS rule 4's portability axis), and moving `probs` back to
+function scope (a measured regression the shader's own comment records). Decision `0032`.
+
+**The item understated its own finding by more than half.** The check it needed —
+`tests/workgroup_storage_limit.rs`, which computes declared workgroup storage per compute entry
+point from naga and asserts it against `wgpu::Limits::default()` — found **nine** entry points over
+budget, not four. The five that are not abac are **BUG-35**, and one of them is on the default
+encode path. That test now guards the class: a new offender fails it, and a recorded one that
+grows, shrinks or is fixed fails it too.
+
+**Its stated first step was deliberately not made the gate.** "Run it in a browser; if it passes,
+this is P3 documentation" does not follow — a browser that happens not to validate would not make
+18688 B against a 16384 B device conformant, it would only hide the defect behind one
+implementation's leniency. The deterministic test is the gate; a browser run is still worth having
+as evidence and is still owed. Original entry follows.
 
 Filed 2026-09-08 by ENT-5, found by reading **BUG-29**'s new limits table rather than by hitting
 it. Nothing fails on this machine, and that is the whole point: the check that would fail is one

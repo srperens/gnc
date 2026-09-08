@@ -106,7 +106,34 @@ const MAX_BLOCK_W: u32 = 64u;
 // every neighbour read. `[i * WG + tid]` puts lane `tid` in bank `tid`. Budget: 576 + 4096 words
 // = 18.3 KB of the M1's 32 KB.
 var<workgroup> probs: array<u32, 576>;
-var<workgroup> rows: array<u32, 4096>;
+var<workgroup> rows: array<u32, 1024>;              // WG * ROW_WORDS
+
+// `rows` packs four magnitudes per word, one byte each, because the full u32 was 16 KB on its own
+// and put the shader over the workgroup budget the device is created with (BUG-31).
+//
+// **Clamping at ROW_CLAMP cannot change a single context, which is why this is bit-exact and not
+// an approximation.** `bucket` saturates: any `nb >= 1 << (NUM_BUCKETS - 2)` returns
+// `NUM_BUCKETS - 1`. So for a contributor `a`:
+//   * `a < ROW_CLAMP` is stored exactly, and a sum of such contributors is exact;
+//   * `a >= ROW_CLAMP` stores ROW_CLAMP, and both the clamped and the true sum are then
+//     `>= ROW_CLAMP` and both bucket to `NUM_BUCKETS - 1`.
+// Either way `bucket(nb)` is identical, so the coder sees the same context sequence and emits the
+// same bytes. Asserted rather than argued: the abac identity gates compare whole files against the
+// CPU coder in `abac.rs`, which stores true magnitudes.
+const ROW_CLAMP: u32 = 1u << (NUM_BUCKETS - 2u);
+const ROW_WORDS: u32 = 2u * MAX_BLOCK_W / 4u;       // 32 words of 4 magnitudes per thread
+
+fn row_get(i: u32, tid: u32) -> u32 {
+    let w = rows[(i >> 2u) * WG + tid];
+    return (w >> ((i & 3u) * 8u)) & 0xFFu;
+}
+
+fn row_set(i: u32, tid: u32, a: u32) {
+    let idx = (i >> 2u) * WG + tid;
+    let sh = (i & 3u) * 8u;
+    rows[idx] = (rows[idx] & ~(0xFFu << sh)) | (min(a, ROW_CLAMP) << sh);
+}
+
 
 // `unsigned_abs`, exactly: negating in u32 wraps, so i32::MIN maps to 2^31 rather than to itself.
 fn mag_of(v: i32) -> u32 {
@@ -283,7 +310,7 @@ fn main(
     for (var i = 0u; i < NUM_CONTEXTS; i++) {
         probs[i * WG + tid] = PROB_HALF;
     }
-    for (var i = 0u; i < 2u * MAX_BLOCK_W; i++) {
+    for (var i = 0u; i < ROW_WORDS; i++) {
         rows[i * WG + tid] = 0u;
     }
 
@@ -307,15 +334,15 @@ fn main(
         for (var x = 0u; x < info.width; x++) {
             var nb = 0u;
             if (x > 0u) {
-                nb = nb + rows[(cur + x - 1u) * WG + tid];
+                nb = nb + row_get(cur + x - 1u, tid);
             }
             if (y > 0u) {
-                nb = nb + rows[(prev + x) * WG + tid];
+                nb = nb + row_get(prev + x, tid);
                 if (x > 0u) {
-                    nb = nb + rows[(prev + x - 1u) * WG + tid];
+                    nb = nb + row_get(prev + x - 1u, tid);
                 }
                 if (x + 1u < info.width) {
-                    nb = nb + rows[(prev + x + 1u) * WG + tid];
+                    nb = nb + row_get(prev + x + 1u, tid);
                 }
             }
             let ctx = bucket(nb);
@@ -347,7 +374,7 @@ fn main(
                 }
                 e_encode_bypass(&e, u32(v < 0));
             }
-            rows[(cur + x) * WG + tid] = a;
+            row_set(cur + x, tid, a);
         }
     }
     e_finish(&e);
@@ -501,7 +528,7 @@ fn main_rc(
     for (var i = 0u; i < NUM_CONTEXTS; i++) {
         probs[i * WG + tid] = RC_PROB_HALF;
     }
-    for (var i = 0u; i < 2u * MAX_BLOCK_W; i++) {
+    for (var i = 0u; i < ROW_WORDS; i++) {
         rows[i * WG + tid] = 0u;
     }
 
@@ -525,15 +552,15 @@ fn main_rc(
         for (var x = 0u; x < info.width; x++) {
             var nb = 0u;
             if (x > 0u) {
-                nb = nb + rows[(cur + x - 1u) * WG + tid];
+                nb = nb + row_get(cur + x - 1u, tid);
             }
             if (y > 0u) {
-                nb = nb + rows[(prev + x) * WG + tid];
+                nb = nb + row_get(prev + x, tid);
                 if (x > 0u) {
-                    nb = nb + rows[(prev + x - 1u) * WG + tid];
+                    nb = nb + row_get(prev + x - 1u, tid);
                 }
                 if (x + 1u < info.width) {
-                    nb = nb + rows[(prev + x + 1u) * WG + tid];
+                    nb = nb + row_get(prev + x + 1u, tid);
                 }
             }
             let ctx = bucket(nb);
@@ -562,7 +589,7 @@ fn main_rc(
                 }
                 r_encode_bypass(&e, u32(v < 0));
             }
-            rows[(cur + x) * WG + tid] = a;
+            row_set(cur + x, tid, a);
         }
     }
     r_finish(&e);

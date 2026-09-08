@@ -38,6 +38,28 @@ on this adapter (31 storage buffers) cannot tell 9 from 10.
 
 ---
 
+## BUG-32 — `benchmark-sequence --throughput` (2026-09-08)
+
+**Hypothesis.** 86% of `benchmark-sequence` wall clock is CPU PSNR/SSIM plus a second all-I
+encode plus retaining the decoded sequence. A flag that skips those three, leaving the default
+honest, should make wall track the printed encode time.
+
+**What changed.** `--throughput` on `benchmark-sequence`. Default path byte-identical in the
+printed totals. `--vmaf` conflicts. `--density` now passes the flag. Canary:
+`[bug32] throughput=1 metrics=0 i_only=0 decode_retained=0`. Decision `0046`.
+
+**Measured**, bbb_extended, n=8, q=90, Rice, this Mac, not idle (no fps quoted):
+
+| | k=1 wall | printed encode | k=9 wall | bitstream |
+|---|---|---|---|---|
+| default | 2.467 s | 142.5 ms + 142.4 ms I-only | 1.434 s | 15 825 673 B (k=1) |
+| `--throughput` | **0.541 s** | 144.1 ms | **0.720 s** | **identical** |
+
+k=1 wall **4.56×**. Remaining wall on the flag is GPU init + PNG load, which amortises with
+frame count; the SSIM tax does not. Tests: `tests/bug32_throughput.rs`.
+
+No codec path changed. No BASELINE compression figure moved.
+
 ## MEAS-10 — BASELINE re-taken at `0a1b055` (2026-09-08)
 
 **Hypothesis.** PAD-1, INTRA-2, INTER-2, BUG-16 and RATE-2 all landed after the last whole-table

@@ -79,9 +79,12 @@ measured advantage over x264 on any axis at this operating point.**
 0. ~~**INTRA-1 — where is the remaining 27%?**~~ — **ANSWERED 2026-09-08 by step 3, and closed as
    a queue entry.** 26.2 of the 27.1 points are named and **15.1 of them are not coding
    deficiencies** (8.5 chroma allocation, 6.6 tile padding), so the intra coding gap on these four
-   images is closer to **+12%** than +27%. The remaining work is **PAD-1 (P1)** — the padding fill,
-   −4.5% of shipped intra rate, gated on inter — and **INTRA-2 (P1)** — the dead zone on I-frames
-   only, ~3 points. History below. Added 2026-09-07 after ENT-4. With `--abac` on, GNC
+   images is closer to **+12%** than +27%. ~~The remaining work is **PAD-1 (P1)** ... and
+   **INTRA-2 (P1)**~~ — **both shipped 2026-09-08** (PAD-1 −4.63% RGB / −4.60% Y of intra rate on
+   stills, `0039`; INTRA-2 BD-rate −5.01% on four stills at q≥85, `0041`). **What is left of this
+   item is the inter half of the padding — PAD-2 (P2), −7% to −10% of sequence rate, gated on a
+   bitstream version — and TILE-1 (P2)**, partial border tiles, the remaining ~2 points on stills
+   plus the tile-size/frame-size decoupling. History below. Added 2026-09-07 after ENT-4. With `--abac` on, GNC
    needs 27.1% more bits than JPEG 2000 *using the same transform at the same depth*, and nothing in
    this repository accounts for it. Largest known compression gap. **Step 1 is done (2026-09-07):
    GNC spends within 7.5% of the entropy of its own coefficients at q >= 85, so entropy coding can
@@ -116,27 +119,77 @@ measured advantage over x264 on any axis at this operating point.**
 1. **Intra at contribution quality** — the whole remaining +89.2% lives here, per findings 1 and 5.
    Inter breaks even at this operating point for x264 too, so this is the only place the gap is.
    **First instalment paid 2026-09-07 (ABAC-SHIP): −17.3% of intra rate at q=90, opt-in.** Against
-   the corrected +90.5% denominator that is roughly a fifth of the gap, from one mechanism. The
-   next largest known intra lever is still unbuilt — see EBCOT Part 7's open items.
+   the corrected +90.5% denominator that is roughly a fifth of the gap, from one mechanism.
+   ~~The next largest known intra lever is still unbuilt — see EBCOT Part 7's open items.~~
+   **Corrected 2026-09-08 (DOC-3): Part 7 has no open items left** — 1 and 2 were closed by Parts 6
+   and 7, 3 was re-measured and closed by **ENT-3** (`0045`), and 4 ("129 ms of CPU encode") was
+   removed by **ENT-5**'s GPU encoder, leaving only a wall-clock figure that needs an idle machine.
+   **And the next largest intra lever is not unbuilt — it is built and behind a flag:** making
+   `--abac` the default is worth −16.6% to −18.8% of intra rate at identical pixels, to everyone,
+   with nothing left to implement. It was never filed with an ID, so `scripts/claim next` could not
+   offer it; it is now **ENT-9**. The largest genuinely *unbuilt* levers are **PAD-2** (−7% to
+   −10% of sequence rate) and **TILE-1**.
 2. **LOSSLESS-1** — both gates green (10–26% for ~5 ms/frame). The one lever this week that passed
-   rather than failed. Buildable now.
-3. **MEAS-5 / CANARY-1** — blocked on a discrete GPU. The entire strategic thesis rests on MEAS-5
-   and it has never been measured.
+   rather than failed. ~~Buildable now.~~ **Built and measured 2026-09-06** — see the entry below;
+   this line outlived its item by two days.
+3. **MEAS-5** — **Claim A holds and is fully sourced**; Claim B (density against NVENC) is the
+   half that is unmeasured, and it is parked on hardware: a discrete NVIDIA card, or an idle Mac for
+   the `--density-still` re-take. ~~**CANARY-1** — blocked on a discrete GPU~~ — **DONE 2026-09-07,
+   PASSES at 34x.** "The entire strategic thesis rests on MEAS-5 and it has never been measured" was
+   true of the item as a whole and is not true of Claim A.
 4. ~~**QUAL-1**~~ — done 2026-09-06: the contribution gap is **+90.5% BD-rate on PSNR**, about
    1.9x, not the 5.6x recorded at distribution bitrates. ~~Follow-up: `GNC_CHROMA_WEIGHT`~~ — done
    too (CHROMA-1): the frontier is steep but intra-only, so it does **not** explain the video gap.
    That gap is genuine luma coding deficit, which is why item 1 is intra.
-5. Bugs: BUG-14. BUG-9 closed 2026-09-07 (the cause was the cumfreq table, not the slot), BUG-12
-   closed 2026-09-06. **ARCH-3 and BUG-18 closed 2026-09-07** — one P/B frame encoder, so
+5. Bugs: ~~BUG-14~~ — **DONE 2026-09-07**, so this list is empty of open bugs and the live ones are
+   in the queue below, not here. BUG-9 closed 2026-09-07 (the cause was the cumfreq table, not the
+   slot), BUG-12 closed 2026-09-06. **ARCH-3 and BUG-18 closed 2026-09-07** — one P/B frame encoder, so
    `gpu_entropy_encode` chooses only where entropy runs. Default output byte-identical (54/54);
-   **abac's inter rate is measurable again at −12.0% to −22.9% against Rice at bit-identical
-   pixels**, replacing the retracted −14.4%. `docs/decisions/0025`.
+   **abac's inter rate is measurable again** — ~~−12.0% to −22.9%~~, **superseded 2026-09-08 by
+   ENT-3: −21.6% to −3.7% over q=50-99, decaying monotonically with quality**, so under −4.5% at
+   q=99 on two of three sequences. `docs/decisions/0045`, superseding `0025`.
 
 **Do not re-test** (measured and closed this week): MCTF, GOP length, the B-pyramid at contribution
 quality, RD decisions, multi-reference, sub-pel filters, motion search, block transforms, sub-block
 masking, smaller tiles, prediction *before* the wavelet.
 
 ## Active priority list
+
+### DOC-3 — BACKLOG's own priority order pointed at closed work on five of six items (**FIXED 2026-09-08**)
+
+**DOC-2 fixed the priority table in GOALS. This is the same defect in the file GOALS points at.**
+`scripts/claim next` reads BACKLOG's *headings*, but a session deciding whether the item it was
+handed is still the right one reads the **priority order** at the top — and on 2026-09-08 that
+section named six things, five of which were closed:
+
+| the priority order said | what is true |
+|---|---|
+| item 0: "the remaining work is **PAD-1 (P1)** ... and **INTRA-2 (P1)**" | **both shipped 2026-09-08** (`0039`, `0041`). The remaining work is PAD-2 (P2) and TILE-1 (P2) |
+| item 1: "the next largest known intra lever is **still unbuilt** — see EBCOT Part 7's open items" | Part 7 has **no open items**: 1 and 2 closed by Parts 6/7, 3 by ENT-3, 4 by ENT-5's GPU encoder. And the lever is **built** — it is `--abac`, behind a flag |
+| item 2: "**LOSSLESS-1** ... **Buildable now**" | **built and measured 2026-09-06**, two days before |
+| item 3: "**MEAS-5 / CANARY-1** — blocked on a discrete GPU ... never been measured" | **CANARY-1 DONE 2026-09-07, PASSES at 34x.** MEAS-5's Claim A holds and is fully sourced; only Claim B is unmeasured |
+| item 5: "Bugs: **BUG-14**" | **DONE 2026-09-07.** The list had no open bug in it |
+| item 5: abac inter "**−12.0% to −22.9%**" | **superseded the same day by ENT-3** (`0045`): −21.6% to −3.7%, decaying with quality |
+
+**The one finding that is not a correction.** Item 1 had been pointing for two days at "the next
+largest known intra lever", and the thing it pointed at is not an unbuilt lever — it is
+**`--abac`, shipped, bit-exact, and worth −16.6% to −18.8% of intra rate at identical pixels to
+anyone who passes a flag.** Making it the default has been named in ENT-5's out-of-scope note, in
+`0017`, and in this pointer, and **never once as a heading with an ID**, so `scripts/claim next`
+could not offer the largest built lever in the codec. Filed as **ENT-9** and parked
+`blocked-idle-machine`, since deciding it needs two wall-clock figures and eight sessions share
+one GPU. Decision `docs/decisions/0060`.
+
+**Why this is worth an item rather than a drive-by edit.** Every one of the five stale lines was
+written *correctly* and went stale when someone else finished the work — which is the normal case
+here, not negligence, and it is why the fix is structural: **a pointer to work that has no ID has
+nothing to keep it honest.** ENT-9 exists so that item 1 can point at a heading whose status
+`scripts/claim` maintains. Same lesson as COORD-2 (`0050`), one level up: an id is the only thing
+another session can see.
+
+**Documentation only.** No code, no shader, no bitstream, no measurement — every number above is
+quoted from an entry in this file or from a decision record, and the audit was to check each one
+against the heading it came from.
 
 ### DOC-2 — GOALS's target table was stale on the rows that set every session's priority (**FIXED 2026-09-08**)
 
@@ -3645,13 +3698,20 @@ pixels** (35.51 vs 35.63 dB on bbb at q=25; max |diff| 1.69 at 4:2:2) — both a
 is the quantise stage, not entropy coding. Pre-existing, not chased, now pinned by a test so it is
 not re-found as an abac bug. It is why **q=25 is not quoted as a rate figure** above.
 
-**Still open:**
+**Still open:** ~~nothing~~ — **all four are closed as of 2026-09-08, and the priority order's
+"see EBCOT Part 7's open items" pointer was retired with them (DOC-3).** What is left of this
+family is **ENT-9** (should abac be the default) and **ENT-8 step 2** (stripes), both parked on an
+idle machine. Item by item:
 1. ~~GPU decode shader and honest fps against Rice on an idle machine.~~ Done — Part 6.
 2. ~~Bitstream integration.~~ Done — Part 7.
 3. **Inter frames — retracted (BUG-18), and re-measured 2026-09-07 after ARCH-3 closed it.**
    ~~−14.4% mean at q=90~~ — abac's video path was the CPU-entropy P-frame path, and that path
    encoded every P-frame wrong. The comparison put abac on a broken arm.
    **The replacement figure is −12.0% to −22.9%, on nine of nine points at bit-identical pixels**
+   — itself superseded 2026-09-08 by **ENT-3** (`0045`): **−21.6% to −3.7% over q=50-99, decaying
+   monotonically with quality**, so two of the three columns below were taken before INTER-2 halved
+   the inter dead zone. The q=90 column reproduces exactly. Read `0045`, not this paragraph, for
+   the current figure —
    (bbb_extended / crowd_run / old_town_cross, q=50/75/90, 18 frames, ki=9, 4:4:4; decoded PNGs
    hashed rather than PSNR compared). With one frame encoder the two coders code the same
    coefficients, so this is a pure rate delta with a quality delta of exactly zero — a stronger
@@ -3668,9 +3728,12 @@ not re-found as an abac bug. It is why **q=25 is not quoted as a rate figure** a
    path the two *encode paths* never agree exactly (BUG-22, filed from this measurement), and abac
    is CPU-encoded where Rice is GPU-encoded. **q=75 is not quoted at all**: the gap is worth
    0.54 dB there.
-4. **CPU encode is 129 ms/frame against Rice's 23 ms (todo, P3).** Serial per symbol by
-   construction, but parallel across ~3000 code-blocks and currently single-threaded. This is what
-   stands between abac and being a candidate default, more than the decode debt does.
+4. ~~**CPU encode is 129 ms/frame against Rice's 23 ms (todo, P3).**~~ **Closed by ENT-5 on
+   2026-09-07** — `abac_encode.wgsl`, one thread per code-block, bit-exact against the CPU coder on
+   98 of 98 whole-file comparisons. The prediction in this line ("parallel across ~3000
+   code-blocks") is exactly what shipped. **What it leaves behind is a number, not a mechanism:**
+   the GPU encoder has never been timed on an idle machine, so 0017's reason 2 kept the 129 ms it no
+   longer measures. That is ENT-5's outstanding criterion 3, and it is now ENT-9's gate.
 
 **Code-block size settled: 128px, i.e. one block per subband.** Swept on bbb at q=55: 16px
 **+1.1% — worse than Rice**, 32px −15.1%, 64px −19.2%, 128px −20.0%, 256px identical to 128 (no
@@ -5486,6 +5549,51 @@ decode, and the BUG-31 static workgroup-storage assertion in CI.
 
 **Decision record required either way** — a shipped coder is a default-adjacent choice, and a
 rejection is a recorded conclusion with numbers (the EBCOT entry is the template).
+
+### ENT-9 — should abac be the default? The largest built lever in the codec has never been an item (todo, **P2**)
+
+Filed 2026-09-08 by DOC-3, which found the priority order pointing at "the next largest known intra
+lever is still unbuilt". It is not unbuilt. It shipped on 2026-09-07 and it is behind a flag.
+
+**What flipping the default is worth, from figures already in this file:** −16.6% to −18.8% of
+intra rate at *identical pixels* (ABAC-SHIP, four stills, q=50/75/90), −13.4% on bit-exact
+lossless, and the FFV1 lossless gap from +23.9% to +7.3%. Nothing has to be implemented to collect
+any of it. It is larger than everything shipped to date put together.
+
+**Why it needs an ID.** ENT-5 said plainly "**Not in scope: making abac the default** — that is a
+separate decision", 0017 carries the three reasons, and the priority order pointed at it obliquely
+for two days. None of those is a `NAME-<n>` heading with a priority, so `scripts/claim next` has
+never been able to offer it — the same defect ENT-5 was itself filed against ("the mechanism has
+been named three times today ... and never as an item with an ID").
+
+**Where decision 0017's three reasons stand as of 2026-09-08:**
+
+| reason | status |
+|---|---|
+| 1. ~1.69x frame decode | **standing, and its own figure needs re-taking** — the same abac decode has read 25.2 / 31.1 / 37.5 ms across three runs on this shared machine (ENT-8) |
+| 2. 129 ms/frame CPU encode | **mechanism removed by ENT-5's GPU encoder, number never replaced.** ENT-5's criterion 3 is the outstanding one; the instrument exists (`cargo test --release --test abac_bench -- --ignored --nocapture --test-threads=1`) |
+| 3. inter unmeasured | **discharged** — ENT-3 measured it end to end. But read `0045` before quoting it: the saving **decays monotonically with quality** to under −4.5% at q=99 on two of three sequences, which is GNC's own operating point |
+
+**So the case at contribution quality rests on intra, not on video**, and that is the honest framing
+this item has to argue from — the −21.6% headline on inter belongs to q=50, a range GOALS §1 says
+GNC is not for.
+
+**What it needs, and why it is parked rather than open:** two wall-clock numbers on an idle machine
+— abac GPU encode ms/frame, and a re-take of the decode debt — and eight sessions share one GPU, so
+neither can be taken today (COORDINATION's measurement rules; the 1.9x clock-ramp note). Parked
+`blocked-idle-machine` for the same reason as ENT-8 step 2, MEAS-6 and CANARY-1's re-runs. **Unpark
+it on an idle box, and take ENT-5's criterion 3 in the same sitting** — it is the same measurement.
+
+**State the criterion before measuring, not after.** What encode and decode figures would flip the
+default? Write them down first: this is a decision about what every user gets by not passing a
+flag, and a decision record either way (`0017` amended or superseded). Also settle
+`GNC_ABAC_GPU_SIZING` while the machine is idle — `CountThenEmit` (default, 2 passes, exact
+scratch) against `BoundedSlots` (1 pass, 22-29x scratch); the bytes are identical, so the default
+can flip on one run.
+
+**If it does flip:** BASELINE.md moves, Rice files stop being the reference output for the default
+path, and every fps figure in the repository that was taken on Rice needs its coder named. That is
+part of the item, not a follow-up.
 
 ### ENT-8 — abac could code 16 stripes per code-block instead of one (**step 1 DONE 2026-09-08**, step 2 todo, P2)
 

@@ -168,22 +168,36 @@ matches to **0.0000** under the same code. Two lossless MED frames, one matching
 exactly and one off by 254, is not a difference the "fractional versus integral" story accounts for
 on its own. Anyone resuming should start there rather than with the q=100 rows.
 
-**CORRECTION, same day, and it inverts this entry's conclusion.** BUG-39 closed with `q=100` video
-bit-exact on every frame — 48 of 48 frames md5-identical against source through a real container
-round trip, three sequences at ki=2 and ki=9 (`docs/decisions/0064`). A P-frame cannot be
-md5-identical to its source if it predicted from a picture the decoder does not hold: the residual
-is computed against the encoder's reference and added to the decoder's, so any difference between
-the two lands in the output. It does not. **The two q=100 rows above are therefore measuring
-`read_reference_planes`, which returns a different stage on the two pipelines for the MED case, and
-not the pictures.**
+**CORRECTION 1, withdrawn.** It said the two q=100 rows were an instrument artefact —
+`read_reference_planes` returning a different stage on the two pipelines for MED — and therefore
+that the source-copy route was not refuted. That was an inference from the BUG-39 session, accepted
+here without re-deriving it, and its author retracted it within the hour (BUG-44, closed
+not-a-bug).
 
-The uncontaminated row is the **0.0000** one — which is exactly the case the change targets — so
-**the source-copy route is not refuted and this entry had it backwards.** The
-fractional-versus-integral observation stands as an observation; the conclusion drawn from it does
-not, and the asymmetry flagged above ("why does the fallback case match while q=100 does not")
-dissolves into the readback difference rather than needing an explanation. Whoever resumes should
-verify against `fallback_iframe_reference_matches_the_decoders` alone until that readback is fixed;
-if the route holds, RATE-3's third encode goes away and `encode_as_reference` can be deleted.
+**CORRECTION 2, measured, and it reinstates this entry's original reading.** On the **clean** tree
+`lossless_iframe_reference_matches_the_decoders` reads **0.0000 on every plane at q=99 and at q=100
+MED** — re-run by hand on the same 256×256 gradient with `GNC_REF_DEBLOCK=0`. On the **patched**
+tree the same instrument read **254.0039** at q=100. So the decoder's reference *is* the
+reconstruction, the instrument is sound in both trees, and what the patched run measured is exactly
+what it was asked to measure: **the colour-converted source planes are not equal to the
+reconstruction at q=100.** The route is refuted there. The rows above stand as taken.
+
+The tell in the values is also explained rather than mysterious: the source-plane row ramps in steps
+of ~0.498 ≈ 127.5/256 against a reference in 0..255, so the two are not even in the same scale —
+which is a stronger statement than "they differ" and a better starting point than the
+fractional-versus-integral wording above.
+
+**What survives from correction 1** is the withdrawal below, and it never depended on the readback
+inference: BUG-39's 48-of-48 md5 result refutes a fifth cause on its own evidence.
+
+**The live question is unchanged:** why the q=95..99 fallback case reads 0.0000 under the same
+patch. That row is what would make the route shippable *gated to the fallback case* rather than as
+a universal replacement, and it is where a resumption starts.
+
+**Process note.** Two peers' numbers that cannot both be true have a third answer beyond "one is
+wrong": they were taken on different trees. Neither side asked which tree — the BUG-39 session
+filed a bug on my numbers without my diff, and I inverted my own conclusion on their inference
+without re-running the twenty-second test that settles it. The instrument was never at fault.
 
 **~~Raised with the BUG-39 session rather than acted on:~~ WITHDRAWN — there is no fifth cause.**
 This entry suggested the decoder might hold two different pictures at q=100. BUG-39's md5 evidence

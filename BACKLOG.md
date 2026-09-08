@@ -4271,20 +4271,35 @@ ran:
 | q=100, MED | **254.0039** | 65 535 / 65 536 |
 | q=100, `GNC_MED=0` (lossless wavelet) | 7.3965 | 65 535 / 65 536 |
 
-**CORRECTION 2026-09-08, and it inverts the conclusion: the two q=100 rows are an instrument
-artefact.** BUG-39 closed the same afternoon (`docs/decisions/0064`, `0f1d303`) with `q=100` video
-bit-exact on every frame — 48 of 48 md5-identical against source through a real container round
-trip, three sequences at ki=2 and ki=9. A P-frame cannot be md5-identical to its source if it
-predicted from a picture the decoder does not hold, so the two references *are* the same picture
-and **`read_reference_planes` returns a different stage on the two pipelines for the MED case**.
-The diff was measuring the readback.
+**This entry was corrected twice on 2026-09-08 and the second correction reinstates the first
+reading. Both corrections are kept in place, because the way it went wrong is the reusable part.**
 
-**What survives is the 0.0000 row, and it is the case the change targets.** The free half is
-therefore **not refuted** — re-apply `reference_is_the_source`, verify against
-`fallback_iframe_reference_matches_the_decoders` only, and treat any q=100 MED row from
-`read_reference_planes` as unreadable until that readback is fixed. If it holds, RATE-3's third
-encode goes away and `encode_as_reference` can be deleted. The paragraph below is kept because the
-observation in it is real; the conclusion drawn from it is withdrawn.
+*Correction 1 (withdrawn):* said the two q=100 rows were an instrument artefact — that
+`read_reference_planes` returns a different stage on the two pipelines for MED — and therefore that
+the source-copy route was **not** refuted. That was an inference offered by the BUG-39 session and
+accepted here without re-deriving it. **It is wrong**, and its author retracted it (BUG-44, filed
+and closed not-a-bug the same hour).
+
+*Correction 2, measured:* on the **clean** tree the reconstruct path and the decoder agree exactly —
+`lossless_iframe_reference_matches_the_decoders` reads 0.0000 on every plane at q=99 *and* q=100
+MED, re-run by hand. On the **patched** tree the same instrument read 254.0039 at q=100. Both runs,
+same content, same `GNC_REF_DEBLOCK=0`. So the reference the decoder holds is the reconstruction,
+and **the colour-converted source planes are not equal to it at q=100.** The route is refuted
+there, on a measurement, and the rows below stand as taken.
+
+*What survives from correction 1, and it stands on its own evidence:* the **fifth-cause paragraph
+is still withdrawn**. That one never depended on the readback inference — BUG-39's 48-of-48 md5
+result refutes it directly, because a P-frame cannot be md5-identical to its source if it predicted
+from a picture the decoder does not hold.
+
+*The live question is unchanged from the original entry:* why the q=95..99 fallback case reads
+**0.0000** under the same patch. That is the row that would make this shippable — gated to the
+fallback case rather than as a universal replacement — and it is where a resumption starts.
+
+**Process note, because it cost two flips in one hour.** A peer's numbers and yours can both be
+right and still disagree: they were taken on different trees. Neither of us asked "on which tree?"
+— they filed on my numbers without my diff, and I inverted a conclusion of my own on their
+inference without re-running the one test that settles it. Re-run it. It took twenty seconds.
 
 **So the source planes are not the picture the decoder reconstructs, and the tell is in the
 values**: the encoder's are fractional (`0.0, −0.5019531, −0.00390625, 0.49414063, …`) where the

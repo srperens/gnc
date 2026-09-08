@@ -1027,8 +1027,8 @@ impl EncoderPipeline {
                         );
                         if std::env::var("GNC_BFRAME_PYRAMID").is_ok() {
                             eprintln!(
-                                "[pyramid_b] Frame {} (display) layer=2 fwd_ref=0 bwd_ref=2",
-                                b2_display
+                                "[pyramid_b] Frame {} (display) layer=2 fwd_ref=0 bwd_ref=2 qstep={:.2} (l2_scale={:.2}x)",
+                                b2_display, b_config.quantization_step, l2_qp_scale
                             );
                         }
                     }
@@ -1098,8 +1098,8 @@ impl EncoderPipeline {
                         );
                         if std::env::var("GNC_BFRAME_PYRAMID").is_ok() {
                             eprintln!(
-                                "[pyramid_b] Frame {} (display) layer=2 fwd_ref=2 bwd_ref=1",
-                                b6_display
+                                "[pyramid_b] Frame {} (display) layer=2 fwd_ref=2 bwd_ref=1 qstep={:.2} (l2_scale={:.2}x)",
+                                b6_display, b_config.quantization_step, l2_qp_scale
                             );
                         }
                     }

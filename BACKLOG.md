@@ -2255,7 +2255,27 @@ magnitude (4.04 dB with the defect, 0.86 dB from the inter dead zone alone, thre
 reaches the taper through q=50 rather than an env var, since a `set_var` in a `#[test]` is the race
 that masked a real decoder bug in `abac_bitstream`. Decision record 0023.
 
-### BUG-24 — `clippy --target wasm32-unknown-unknown` fails on `main` (todo, P3)
+### BUG-24 — `clippy --target wasm32-unknown-unknown` fails on `main` (**FIXED 2026-09-08**)
+
+**Fixed by excluding the CLI from targets it cannot compile for, not by making it compile.** The
+binary is now declared explicitly with `required-features = ["cli"]` and `cli` is in the default
+feature set, so native builds are unchanged (`cargo build --release` still produces `gnc`) while
+`--no-default-features` yields a genuinely bin-free wasm build. CLAUDE.md's gate now reads
+`--lib`, matching what LOOP.md already said.
+
+**Why not the other resolution.** Making the CLI's context creation cfg-aware would mean writing
+wasm-specific code for a tool that cannot run there — `pollster` cannot block on wasm and the CLI
+needs an adapter, a filesystem and ffmpeg. That is dead code carried for a gate, and the gate was
+asking the wrong question: the library is what WASM ships, and it was clean all along.
+
+**Verified:** `clippy --release --target wasm32-unknown-unknown --lib` clean;
+`--no-default-features` clean; `clippy --release` (native) clean; native binary still built and
+runs; full suite unchanged. Without a `[[bin]]` section the binary was auto-discovered and built
+for every target, which is why no command-line convention could have fixed this on its own.
+
+Original entry follows.
+
+#### BUG-24, as originally filed
 11 × `no associated function or constant named 'new' found for struct GpuContext`, all in the
 **bin** target: `GpuContext::new` is `#[cfg(not(target_arch = "wasm32"))]` and `main.rs` calls it
 unconditionally. Reproduced on a clean tree at `bc851c7`, so it predates BUG-14's branch; it most

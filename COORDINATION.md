@@ -478,7 +478,16 @@ from the *start* of the file is what makes it cheap.
 crowd_run, so a run against these reproduces the *content* but not the length, and BASELINE says
 17 frames where the QUAL-1 log says 24. Say which you used.
 
-## The wasm clippy gate is red on `main`, and it is the *binary*, not the library (2026-09-07, intra1)
+## The wasm clippy gate is red on `main`, and it is the *binary*, not the library — FIXED 2026-09-08
+
+**Resolved (BUG-24).** The binary now carries `required-features = ["cli"]` with `cli` in the
+default set, so it is excluded from any build that does not ask for it, and CLAUDE.md's gate reads
+`--lib` — which is what LOOP.md had already drifted to. `cargo clippy --release --target
+wasm32-unknown-unknown --lib` and `--no-default-features` are both clean; the plain command still
+fails, and now it fails *because Cargo is being asked to build a CLI for wasm*, which is a
+question with no sensible answer rather than a defect in the codec. Original note follows.
+
+### The original note (2026-09-07, intra1)
 
 CLAUDE.md names `cargo clippy --release --target wasm32-unknown-unknown` as a gate that must be
 clean. **It does not compile on `main` at `07c01b1`** — 11 errors, all `src/main.rs` calling

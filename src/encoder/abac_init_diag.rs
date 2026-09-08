@@ -175,6 +175,56 @@ pub(crate) fn adapt_bits_scan(
     bits
 }
 
+/// ENT-9 step 2, milestone 1: the same real engine with candidate A active — the Exp-Golomb
+/// unary prefix **context-coded** instead of bypassed.
+///
+/// This is the check `0063` said had to come before any shader work. Step 1b priced candidate A
+/// on statistics pooled per plane and subband, which is generous by construction: it charges no
+/// adaptation and lets every block share one set of counts. Here the 24 new contexts are
+/// **cold-started per code-block**, exactly like the 18 they join, and learn on the same 4096
+/// symbols. That is the effect that collapsed abac's 256-stream variant from −6.6% to −0.7%, so
+/// a pooled bound is not evidence about it either way.
+///
+/// The mantissa and the sign stay bypassed, as in the shipped coder — candidate B is not modelled
+/// here.
+pub(crate) fn adapt_bits_prefix_ctx(coefficients: &[i32], width: usize, init: &[u32]) -> f64 {
+    let height = coefficients.len() / width;
+    // 18 shipped contexts, then 24 for the prefix: (bucket, min(position, 3)).
+    let mut probs: Vec<Prob> = init.iter().map(|&p| Prob::from_p_zero(p)).collect();
+    probs.extend((0..NUM_BUCKETS * 4).map(|_| Prob::from_p_zero(PROB_ONE / 2)));
+    let base = init.len();
+    let mut mag = vec![0u32; coefficients.len()];
+    let mut bits = 0.0;
+
+    for (y, x) in Scan::Raster.order(width, height) {
+        let v = coefficients[y * width + x];
+        let a = v.unsigned_abs();
+        let ctx = bucket(neighbour_sum(&mag, width, y, x));
+        code(&mut bits, &mut probs, ctx, a > 0);
+        if a > 0 {
+            code(&mut bits, &mut probs, NUM_BUCKETS + ctx, a > 1);
+            if a > 1 {
+                code(&mut bits, &mut probs, 2 * NUM_BUCKETS + ctx, a > 2);
+                if a > 2 {
+                    let n = a - 3 + 1;
+                    let len = 32 - n.leading_zeros();
+                    // The prefix is `len - 1` "keep going" bits then one "stop", each coded in
+                    // its own (bucket, position) context instead of at p = 1/2.
+                    for i in 0..len {
+                        let slot = (i as usize).min(3);
+                        code(&mut bits, &mut probs, base + slot * NUM_BUCKETS + ctx, i == len - 1);
+                    }
+                    // Mantissa: `len - 1` bypass bits, unchanged.
+                    bits += f64::from(len - 1);
+                }
+            }
+            bits += 1.0; // sign, bypassed
+        }
+        mag[y * width + x] = a;
+    }
+    bits
+}
+
 /// Charge one context-coded decision at `−log2 p` and advance the probability, exactly as the
 /// coder does. Split out rather than inlined so the accumulator and the probability array can be
 /// borrowed separately.

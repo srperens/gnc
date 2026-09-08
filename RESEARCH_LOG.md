@@ -206,6 +206,38 @@ residual holds larger magnitudes, and larger magnitudes are exactly what falls o
 coded decisions into the bypassed suffix. **B is below the gate three of three either way.** The
 pre-RATE-3 figures stay correct for `f3f7254`; where the two disagree, these are current.
 
+### Step 2 milestone 1 — candidate A survives real per-block adaptation (2026-09-08)
+
+`0063` named this the first thing step 2 must check: step 1b's bound pools statistics per plane
+and subband, charging no adaptation, while a real implementation cold-starts **24 new contexts per
+64×64 code-block** on the same 4096 symbols the existing 18 learn from — the effect that collapsed
+abac's own 256-stream variant from −6.6% to −0.7%.
+
+`adapt_bits_prefix_ctx` runs abac's **real probability engine** over the real shipped code-blocks
+(same `Prob`, same `ADAPT_SHIFT`, same cold start, −log2 p per decision), with the Exp-Golomb
+prefix context-coded instead of bypassed. Both arms cold, so only the binarisation differs:
+
+| sequence | q | step 1b, pooled | **adaptation charged** |
+|---|---|---|---|
+| crowd_run | 90 | −2.79% | **−2.83%** |
+| crowd_run | 99 | −8.20% | **−8.37%** |
+| bbb_extended | 90 | −0.55% | **−0.39%** |
+| bbb_extended | 99 | −2.44% | **−2.49%** |
+| old_town_cross | 90 | −2.85% | **−2.63%** |
+| old_town_cross | 99 | −9.07% | **−8.70%** |
+
+**It survives within ±0.4 points, and is larger with adaptation charged on three of six points.**
+The 256-stream precedent does not transfer, and why matters: there each coder had ~256 symbols for
+18 contexts; here the 24 new contexts sit inside a 4096-coefficient block and are exercised only
+by coefficients with |v| > 2 — still hundreds to thousands of decisions each. Where the adaptive
+arm *beats* the pooled bound it is tracking statistics that vary within the block, which a pooled
+estimate cannot.
+
+**What it clears, precisely.** The *bound*, on three of three at q=99. **Not** ENT-9's gate, which
+is ≥2% of **total rate** at bit-identical pixels — a real encode, and total rate carries the
+per-block length fields and container overhead these figures exclude. What is left is
+implementation cost, not whether the signal is there.
+
 ### Three things that make this a mechanism rather than a coincidence
 
 - **The bypass share predicts which sequence keeps its advantage.** q=99 inter: bbb_extended
@@ -690,8 +722,27 @@ construction — and the 16 byte-identical decodes were re-run to show it rather
 packet-sized hostile file can no longer become a multi-gigabyte allocation; it now runs off the
 end of the buffer into the same panic the parser has everywhere else.
 
-**What is left open is only the contract** — (a) versus (c) — because the panic surface is
-untouched. That is a decision record, not a commit.
+### The contract, decided: reject (`docs/decisions/0067`)
+
+(a) versus (c), settled in favour of rejecting, with the mechanism named so the implementation is
+a specified job rather than an open question: a `Cursor` with checked `u8/u32/f32/bytes` readers,
+a `try_deserialize_compressed -> Result`, and `deserialize_compressed` kept as a panicking wrapper
+over it. **That last part is what makes it landable, and it rests on a count rather than a hope:
+`deserialize_compressed` has 33 call sites** (`lib.rs` x10, `main.rs` x2, the rest tests). Changing
+its signature makes all 33 decide what to do with an error inside the same diff that rewrites the
+parser; keeping the wrapper leaves all 33 untouched and makes the rewrite provably
+behaviour-preserving for existing callers.
+
+**`catch_unwind` was the tempting one and it is wrong twice:** it cannot distinguish "this input is
+malformed" from "this decoder has a bug", so it would convert our own defects into `Err` — exactly
+what the project's rules exist to surface — and it is inert under `panic = "abort"`, which an
+embedder may set.
+
+Filed as **ROBUST-2**, with the verification that makes a 400-line mechanical rewrite cheap to
+trust: byte-identical decodes before and after, since the parser is deterministic and any pixel
+that moves means the rewrite is wrong. **Not started here** — it is a whole-function rewrite of
+`format.rs`, which several sessions edit at once, and starting it at the end of a session is how
+it gets rebased more than it gets written.
 
 **Not audited and not claimed:** `abac.rs` (`vec![0i32; count]`), the rANS deserialiser, the GNV
 container index. Same class of question; "probably the same answer" is not a result.

@@ -10,16 +10,52 @@
 decisions per coefficient — significant, `>1`, `>2` — and sends the Exp-Golomb order-0 remainder
 and the sign as bypass bits at p=1/2. Measured on the shipped tiles:
 
-**At q=99, 75.1% / 75.5% / 43.6% of abac's own bits are bypassed** — sent with no model at all.
-The context model touches a quarter of the file on two of three sequences.
+**At q=99, 74.6% / 74.8% / 46.7% of abac's own bits are bypassed** — sent with no model at all.
+The context model touches a quarter of the file on two of three sequences. (Figures re-taken after
+RATE-3; see the section below. Pre-RATE-3 they were 75.1% / 75.5% / 43.6%.)
 
 **Step 2 goes to candidate A first, and candidate B is below the gate.** Both were priced in the
 same read-only pass, before either was built:
 
 - **A — context the Exp-Golomb unary prefix** (6 buckets × 4 positions = 24 extra contexts):
-  **−1.84% to −9.35% of the coder's bits at q=99.**
-- **B — context the sign** on the left and up neighbours' signs (3×3 = 9 contexts): **−0.50% to
-  −1.31% at q=99**, below ENT-9's ≥2% gate on all three sequences.
+  **−2.44% to −9.07% of the coder's bits at q=99**, clearing ENT-9's ≥2% gate on three of three.
+- **B — context the sign** on the left and up neighbours' signs (3×3 = 9 contexts): **−0.57% to
+  −1.29% at q=99**, below that gate on three of three.
+
+## Re-taken after RATE-3 (2026-09-08, same session) — the conclusion strengthens
+
+RATE-3 landed between the measurement and the merge, lifting the lossless-fallback gate for
+sequences at q=95..=99. That changes the I-frame a P frame predicts from, so it changes these
+coefficients. Re-run on a pinned post-RATE-3 binary (`ba9e1c6e…` at `56c7b6c`), first P frame,
+inter:
+
+| sequence | q | bypassed | A: prefix ctx | B: sign ctx |
+|---|---|---|---|---|
+| crowd_run | 90 | 50.1% *(identical)* | −2.79% *(identical)* | −2.00% *(identical)* |
+| crowd_run | 95 | 59.8% | −4.43% | −1.62% |
+| crowd_run | 99 | **74.6%** | **−8.20%** | −1.17% |
+| bbb_extended | 90 | 29.9% *(identical)* | −0.55% *(identical)* | −0.81% *(identical)* |
+| bbb_extended | 95 | 34.3% | −0.88% | −0.72% |
+| bbb_extended | 99 | **46.7%** | **−2.44%** | −0.57% |
+| old_town_cross | 90 | 47.3% *(identical)* | −2.85% *(identical)* | −2.33% *(identical)* |
+| old_town_cross | 95 | 58.3% | −4.55% | −1.82% |
+| old_town_cross | 99 | **74.8%** | **−9.07%** | −1.29% |
+
+**The q=90 control is identical to the digit on all three sequences and all three columns**, which
+is what makes the q≥95 rows a change rather than a re-measurement.
+
+**One conclusion strengthens and it is the load-bearing one.** Candidate A now clears ENT-9's
+≥2% gate on **three of three** sequences (−2.44% / −8.20% / −9.07%) where the pre-RATE-3 figures
+cleared it on two and reached 1.84% on the third. bbb_extended moved most — bypass 43.6% → 46.7%
+— which is consistent rather than surprising: RATE-3's bit-exact reference carries detail a lossy
+one had quantised away, so the residual against it holds larger magnitudes, and larger magnitudes
+are exactly what falls out of the three coded decisions into the bypassed suffix.
+
+**Candidate B is below the gate on three of three either way** (−0.57% to −1.29%), so its
+disposition does not move.
+
+The pre-RATE-3 tables below stay as they were taken and are correct for `f3f7254`; where the two
+disagree, these are the current figures.
 
 ## Why this was worth measuring before building anything
 
@@ -49,7 +85,7 @@ bbb_extended / old_town_cross, ki=9, 4:4:4, `--abac`. Share of `Hctx` that abac 
 Broken out at crowd_run q=99 inter: significant 7.1%, `>1` 9.6%, `>2` 8.2% context-coded;
 **Exp-Golomb 58.5%**, sign 16.6% bypassed. The suffix, not the sign, is the mass.
 
-**The candidates, priced (inter, negative = smaller):**
+**The candidates, priced at `f3f7254` — pre-RATE-3, superseded by the table above but kept because the argument below is built on them (inter, negative = smaller):**
 
 | sequence | q | bypassed | A: prefix ctx | B: sign ctx | A+B |
 |---|---|---|---|---|---|
@@ -68,8 +104,9 @@ old_town_cross bypasses 75.5% and keeps −3.7%. Monotone across all three, and 
 same one `0045` measured independently.
 
 **And the fix is largest exactly where the deficit is.** Candidate A is worth −8.31% and −9.35% on
-the two sequences whose saving collapsed, and −1.84% on the one that did not. A lever that is
-biggest where the problem is biggest is the shape of a real mechanism rather than a coincidence.
+the two sequences whose saving collapsed, and −1.84% on the one that did not (post-RATE-3: −8.20%,
+−9.07% and −2.44%, same ordering). A lever that is biggest where the problem is biggest is the
+shape of a real mechanism rather than a coincidence.
 
 **The bounds agree with each other, which they did not have to — once put on one denominator.**
 `0045` reported shipped sitting **+12.5% over `Hnb`** on crowd_run inter at q=99, which is `Hnb`

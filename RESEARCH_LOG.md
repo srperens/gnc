@@ -43,6 +43,9 @@ Ideal-adaptive bounds with no signalling and no adaptation loss charged — the 
 `Hnb`/`Hbig`, deliberately generous, so a candidate that fails here fails. Inter, negative =
 smaller:
 
+*Taken at `f3f7254`, pre-RATE-3 — superseded by the re-take above, kept because the argument
+that follows is built on them.*
+
 | sequence | q | bypassed | A: prefix ctx (6x4) | B: sign ctx (3x3) | A+B |
 |---|---|---|---|---|---|
 | crowd_run | 90 | 50.1% | −2.79% | −2.00% | −4.79% |
@@ -57,6 +60,32 @@ its bit `i` *is* the decision "is the magnitude past threshold `i`" — "a conte
 suffix bit" and "more `>k` decisions" are the same lever, and A is its general form (every prefix
 position, keyed on `(bucket, min(i,3))`). The mantissa stays bypassed on purpose: low bits of a
 magnitude, no causal information, and modelling it would buy contexts for noise.
+
+**Re-taken after RATE-3 (same session), and the conclusion strengthens.** RATE-3 lifted the
+lossless-fallback gate for sequences at q=95..=99, which changes the I-frame a P frame predicts
+from and so changes these coefficients. Pinned post-RATE-3 binary (`ba9e1c6e…` at `56c7b6c`),
+first P frame, inter:
+
+| sequence | q | bypassed | A: prefix ctx | B: sign ctx |
+|---|---|---|---|---|
+| crowd_run | 90 | 50.1% *(identical)* | −2.79% *(identical)* | −2.00% *(identical)* |
+| crowd_run | 95 | 59.8% | −4.43% | −1.62% |
+| crowd_run | 99 | **74.6%** | **−8.20%** | −1.17% |
+| bbb_extended | 90 | 29.9% *(identical)* | −0.55% *(identical)* | −0.81% *(identical)* |
+| bbb_extended | 95 | 34.3% | −0.88% | −0.72% |
+| bbb_extended | 99 | **46.7%** | **−2.44%** | −0.57% |
+| old_town_cross | 90 | 47.3% *(identical)* | −2.85% *(identical)* | −2.33% *(identical)* |
+| old_town_cross | 95 | 58.3% | −4.55% | −1.82% |
+| old_town_cross | 99 | **74.8%** | **−9.07%** | −1.29% |
+
+**The q=90 control is identical to the digit** on all three sequences and all three columns, which
+is what makes the q≥95 rows a change rather than a re-measurement. **Candidate A now clears the
+≥2% gate on three of three** (−2.44 / −8.20 / −9.07%) where before it cleared two and reached
+1.84% on the third; bbb_extended moved most (bypass 43.6% → 46.7%), which is consistent rather
+than surprising — a bit-exact reference carries detail a lossy one had quantised away, so the
+residual holds larger magnitudes, and larger magnitudes are exactly what falls out of the three
+coded decisions into the bypassed suffix. **B is below the gate three of three either way.** The
+pre-RATE-3 figures stay correct for `f3f7254`; where the two disagree, these are current.
 
 ### Three things that make this a mechanism rather than a coincidence
 
@@ -435,6 +464,36 @@ here the two halves are summed separately. abac against Rice, negative = abac sm
 | bbb_extended | −16.6% | −20.0% | −19.7% | −17.5% | −15.9% | −13.9% |
 | crowd_run | −18.0% | −14.1% | −12.1% | −9.5% | −7.3% | −4.2% |
 | old_town_cross | −21.5% | −14.6% | −12.0% | −9.6% | −7.3% | −3.8% |
+
+**Re-taken after RATE-3, and the answer survives (2026-09-08, same session).** RATE-3 landed
+between the measurement and the merge, lifting the lossless-fallback gate for sequences at
+q=95..=99. Every table above is pinned to `f3f7254` and stays correct for it; re-run on a pinned
+post-RATE-3 binary (`ba9e1c6e…` at `56c7b6c`):
+
+- **The control passes exactly.** At q=90, I-frame *and* P-frame byte counts are **equal integers**
+  for both coders on all three sequences, so RATE-3 does not reach q=90 and the re-run is
+  comparable rather than merely similar.
+- **The P column — this item's answer — is unchanged.** Largest move 0.25 points (bbb_extended
+  q=99, −14.49% → −14.24%); the other eight q≥95 points move by ≤0.03. The decay stands: q=99 is
+  −14.2% / −4.3% / −3.7%.
+- **The I and container columns move, and RATE-3's own mechanism is visible in the bytes.**
+  I-frames shrink 15.3–32.3% at q≥95 while P-frames grow 0.68–1.56% — a bit-exact reference
+  carries detail a lossy one had quantised away, so the residual against it is bigger, exactly as
+  `0040`/RATE-3 describe.
+
+| I-frames only, post-RATE-3 | q=90 | q=95 | q=97 | q=99 |
+|---|---|---|---|---|
+| bbb_extended | −14.2% | −12.3% | −11.1% | −14.3% |
+| crowd_run | −11.4% | **−9.9%** | **−9.9%** | **−9.9%** |
+| old_town_cross | −12.7% | **−11.2%** | **−11.2%** | **−11.2%** |
+
+**That constant column is a finding, not a rounding artefact.** crowd_run's Rice I-frame is
+6 492 092 bytes at q=95, q=97 *and* q=99 — the same integer — and old_town_cross's is 6 352 476 at
+all three. Above the RATE-2 crossover the kept I-frame is the **bit-exact lossless** candidate, so
+its size stops being a function of q, and the entropy-coder ratio measured on sequence I-frames
+there is a comparison of the **lossless** path rather than the lossy one. Anyone measuring a coder
+on sequence I-frames at q≥95 after RATE-3 is measuring something different from what they measured
+before it, and the container column inherits that.
 
 **ENT-3's own prediction is falsified.** The entry said to expect a smaller number on inter than
 intra's −17%, because a motion-compensated residual is noise-like and offers a context coder less

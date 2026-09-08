@@ -256,7 +256,7 @@ breath.**
 this table is for. Each of these is someone's half-finished item, not a free id: inheriting beats
 repeating, and `git -C "$REPO-<area>" diff` is the whole cost.
 
-### Checking whether a holder is alive: use the socket directory, not the process table
+### Checking whether a holder is alive: not the process table, and not the socket list alone
 
 **`pgrep -x claude` is not sound for this and will tell you a live session is dead.** Measured while
 building the table above: it missed `19376`, a live session, which `ps -p 19376 -o comm` reports as
@@ -264,21 +264,35 @@ building the table above: it missed `19376`, a live session, which `ps -p 19376 
 shared checkout all report *its* path as their cwd, not their worktree's, so cwd does not identify
 a worktree at all.
 
-What is sound:
+**The socket directory is a registry, not a liveness test** — corrected here 2026-09-08, at the
+request of the session that wrote the paragraph above. What was actually verified is that
+`/tmp/cc-socks/` *matched* `ListAgents`, not that a socket implies a live process: several of the
+sixteen socket files date from Aug 31 to Sep 7, and knowing they were not stale took a liveness
+probe on each pid. So the sound test is the registry **plus** a probe:
 
 ```bash
-ls /tmp/cc-socks/                # one socket per live session, named by pid
+ls /tmp/cc-socks/                              # one socket per session, named by pid — a registry
+for s in /tmp/cc-socks/*.sock; do p=$(basename "$s" .sock)
+  kill -0 "$p" 2>/dev/null && echo "$p $(ps -o comm= -p "$p")"; done
 ```
 
-Nine gnc sockets existed when this was written and all nine map to named sessions; none of the four
-above had one. `ListAgents` agrees with the socket list, which is expected — it is the same
-registry. **Caveat:** a live session that never registered a socket would look dead by this test. No
-example of one has been seen, but the test is "has a socket", not "is alive", and the difference is
-worth remembering before a `steal`.
+All sixteen were live `claude` processes when this was checked, nine of them gnc sessions, and
+`ListAgents` agreed — which is why the registry looked like an oracle. **Two caveats, and they
+point opposite ways:** a live session that never registered a socket looks dead, and a socket
+whose process has exited looks alive. Neither has bitten yet; both would bite before a `steal`.
 
-This is COORD-5's subject: `claim list` now annotates a holder with its uncommitted-file count and
-edit age, which is what made this table a one-liner, but it still says "verify before trusting"
-without saying how — and the obvious how is wrong.
+**Better than testing rows one at a time: let `claim list` do the arithmetic.** COORD-8 /
+`docs/decisions/0076`. Its last three lines report how many worktree claims exist, how many
+**distinct** live sessions hold one or more, and how many identities cannot be tested. Count the
+sessions actually running and subtract — the excess over the accounted holders is the most that
+could still be real. On 2026-09-08: 17 claims, 8 distinct live holders, 6 untestable, 9 live
+sessions ⇒ **at least 5 of the 6 orphaned, and it does not say which 5.** Report the bound, not
+the reading it suggests.
+
+**"Distinct" is load-bearing, and the first version of that summary got it wrong.** One session
+held two worktree claims (`refdiff` and `tile1`, both pid 19376), so counting rows reported 9
+holders where the truth was 8 — the exact subtraction the bound turns on. Whoever steals a second
+worktree changes a count another session may be computing.
 
 ## Reserving an id is not filing the item, and a dead session takes the difference with it
 
@@ -647,7 +661,7 @@ If this table and `scripts/claim list` disagree, the table is wrong.
 
 | worktree | branch | area |
 |---|---|---|
-| `../gnc-loopa` | `loopa` | **BUG-20 FIXED 2026-09-08 — the native clippy gate is `--all-targets` and the 91 warnings are cleared, not exempted.** `cargo clippy --release` reads the lib and the bins and never a test; `--all-targets` reported **91** (90 lib-test + 1 `tests/requested_limits.rs`), 88 on 2026-09-07 and 90 later that day, so the count drifts on its own. Now **0**, with no `#[allow]` added at any level. **Two of the eight lints were substantive**: `assertions_on_constants` was BUG-35's guard test asserting relations between three `const usize` values at *run* time (now `const _: () = assert!(…)`, so an arena shrink fails the build), and `unused_variables` found a dead `BufferUsages` binding in `rice_gpu.rs`. The other 89 are style, and the 27 `needless_range_loop` are the honest case for the alternative — exempting tests — which lost because there is no CI here, so step 5's clippy command is the only thing that reads this code mechanically. Decision `0062`. **Invalidates no measurement**: every edit is inside `#[cfg(test)]` code or an integration test target — nine of the eleven `src/` files have their first changed line below their own `#[cfg(test)]` marker, and the other two *are* test files (`{encoder,decoder}/pipeline_tests.rs`, included only under `#[cfg(test)]`) — so the shipped build is unchanged by construction. Filed **BUG-38** on the way — `cargo fmt --check` is red the same way and worse (566 diffs, 61 files, **504 of them in 44 files under `src/`**), heading committed with the reserved id. **COORD-8 FIXED** (`0076`): `claim list` closes with the orphan arithmetic (distinct live holders, untestable identities), and `pgrep -x claude` is recorded as unsound — it omitted a live session, and two sessions hit that within the hour. On the day: 17 worktree claims, 8 distinct live holders, 9 live sessions ⇒ **at least 5 of 6 untestable claims orphaned**, which does not say which 5, so nothing was stolen. **16 uncommitted files sit in those orphaned worktrees**; preserving them behind a ref was refused by the permission layer and needs an owner's call. **ENT-9 DONE** (`0074`): abac context-codes the Exp-Golomb unary prefix — bitstream **GP19**, GP18 abac frames refused. **−2.07% to −8.76% of total rate at q=99** at bit-identical pixels (98/98 GPU-vs-CPU identity, 6/6 pixel arms, workgroup storage 6400 → 9472 B of 16384). Every figure lands just under `0063`'s bound by 0.16–0.37 points. BASELINE's `--abac` row annotated conservative; re-take is **MEAS-11**. **COORD-7 FIXED** (`0071`): the `#g…` identity came through `--as` — no committed version of `scripts/claim` can emit a `g` prefix — so `--as` now refuses a session part `session_alive` cannot read; `CLAUDE_PID` (verified against `ps`) is preferred over the twelve-hop walk; an `s?` claim records `walk: claude-pid=… chain: …` so the next one is a reading; `basename --` at four sites, found by reading the instrument's own output. **COORD-5 FIXED** (`0069`): `claim list` reports the holder's worktree when liveness cannot be established — at 18:58, with `next` reporting all 15 startable items claimed, **4 could not be tested** (`s?` x3 and one `g01a08196` that `me()` cannot produce), all idle ~67m holding 1/7/13/8 uncommitted files. Cause left to **COORD-7** with an instrument rather than a guess; "cannot say" is deliberately not collapsed into `SESSION GONE`. New `selftest` case mutation-tested. **BUG-38 DECIDED, reformat parked** (`0066`): no rustfmt config fits (default is best of seven at **573** diffs; `"Max"` 1114, `max_width = 90` 964), **44 of the 61 dirty files were changed on `main` in 24 h**, so both the big-bang and the per-touched-file rule cost the same conflicts and the cold subset is only 10%. Rule kept, one atomic `cargo fmt` commit owed on a quiet tree with its sha in `.git-blame-ignore-revs`. Also filed and closed **BUG-42** in the same hour: the *third* filing of the ENT-9 duplicate-id finding after BUG-41 and COORD-3 (which then shipped, `0065`), from a worktree branched before COORD-3's stub landed — `claim bug` gives a free id and nothing compares the subject. See the note above the shared-checkout merge section. |
+| `../gnc-loopa` | `loopa` | **BUG-20 FIXED 2026-09-08 — the native clippy gate is `--all-targets` and the 91 warnings are cleared, not exempted.** `cargo clippy --release` reads the lib and the bins and never a test; `--all-targets` reported **91** (90 lib-test + 1 `tests/requested_limits.rs`), 88 on 2026-09-07 and 90 later that day, so the count drifts on its own. Now **0**, with no `#[allow]` added at any level. **Two of the eight lints were substantive**: `assertions_on_constants` was BUG-35's guard test asserting relations between three `const usize` values at *run* time (now `const _: () = assert!(…)`, so an arena shrink fails the build), and `unused_variables` found a dead `BufferUsages` binding in `rice_gpu.rs`. The other 89 are style, and the 27 `needless_range_loop` are the honest case for the alternative — exempting tests — which lost because there is no CI here, so step 5's clippy command is the only thing that reads this code mechanically. Decision `0062`. **Invalidates no measurement**: every edit is inside `#[cfg(test)]` code or an integration test target — nine of the eleven `src/` files have their first changed line below their own `#[cfg(test)]` marker, and the other two *are* test files (`{encoder,decoder}/pipeline_tests.rs`, included only under `#[cfg(test)]`) — so the shipped build is unchanged by construction. Filed **BUG-38** on the way — `cargo fmt --check` is red the same way and worse (566 diffs, 61 files, **504 of them in 44 files under `src/`**), heading committed with the reserved id. **BUG-51 FILED, guard landed** — `GP19` is claimed twice: ENT-9's on `main` (`0074`) and TILE-1's uncommitted work in `gnc-tile1`. `tests/bitstream_generation.rs` now refuses two magics at one generation and refuses a writer that stamps a magic newer than the table (both mutation-tested); the **renumber to GP20 is TILE-1's owner's**. A duplicated generation is P1 where a duplicated id was P2: it yields a plausible wrong image, and a clean textual merge resolution hides it. **COORD-8 FIXED** (`0076`): `claim list` closes with the orphan arithmetic (distinct live holders, untestable identities), and `pgrep -x claude` is recorded as unsound — it omitted a live session, and two sessions hit that within the hour. On the day: 17 worktree claims, 8 distinct live holders, 9 live sessions ⇒ **at least 5 of 6 untestable claims orphaned**, which does not say which 5, so nothing was stolen. **16 uncommitted files sit in those orphaned worktrees**; preserving them behind a ref was refused by the permission layer and needs an owner's call. **ENT-9 DONE** (`0074`): abac context-codes the Exp-Golomb unary prefix — bitstream **GP19**, GP18 abac frames refused. **−2.07% to −8.76% of total rate at q=99** at bit-identical pixels (98/98 GPU-vs-CPU identity, 6/6 pixel arms, workgroup storage 6400 → 9472 B of 16384). Every figure lands just under `0063`'s bound by 0.16–0.37 points. BASELINE's `--abac` row annotated conservative; re-take is **MEAS-11**. **COORD-7 FIXED** (`0071`): the `#g…` identity came through `--as` — no committed version of `scripts/claim` can emit a `g` prefix — so `--as` now refuses a session part `session_alive` cannot read; `CLAUDE_PID` (verified against `ps`) is preferred over the twelve-hop walk; an `s?` claim records `walk: claude-pid=… chain: …` so the next one is a reading; `basename --` at four sites, found by reading the instrument's own output. **COORD-5 FIXED** (`0069`): `claim list` reports the holder's worktree when liveness cannot be established — at 18:58, with `next` reporting all 15 startable items claimed, **4 could not be tested** (`s?` x3 and one `g01a08196` that `me()` cannot produce), all idle ~67m holding 1/7/13/8 uncommitted files. Cause left to **COORD-7** with an instrument rather than a guess; "cannot say" is deliberately not collapsed into `SESSION GONE`. New `selftest` case mutation-tested. **BUG-38 DECIDED, reformat parked** (`0066`): no rustfmt config fits (default is best of seven at **573** diffs; `"Max"` 1114, `max_width = 90` 964), **44 of the 61 dirty files were changed on `main` in 24 h**, so both the big-bang and the per-touched-file rule cost the same conflicts and the cold subset is only 10%. Rule kept, one atomic `cargo fmt` commit owed on a quiet tree with its sha in `.git-blame-ignore-revs`. Also filed and closed **BUG-42** in the same hour: the *third* filing of the ENT-9 duplicate-id finding after BUG-41 and COORD-3 (which then shipped, `0065`), from a worktree branched before COORD-3's stub landed — `claim bug` gives a free id and nothing compares the subject. See the note above the shared-checkout merge section. |
 
 | `../gnc-refdiff` | `refdiff` | **RATE-4 half done, dropped 2026-09-08.** The free half — `0040` point 4's source-copy reference — is **refuted by a direct buffer diff** rather than by 0040's confounded PSNR: 0.0000 in RATE-3's q=95..99 fallback case, **254.0039** at q=100 MED, 7.3965 at q=100 lossless wavelet. Encoder's source planes are fractional where the decoder's reference is integral, and identical between the MED and wavelet runs, so it is not the transform. Reverted; tree unchanged. **The unexplained half is why the fallback case matches exactly** — start there. The other half (choose the candidate on sequence bytes, which is what makes bbb q=99 regress) is untouched. |
 | `../gnc-refdiff` | `refdiff` | **RATE-3 DONE 2026-09-08.** `0036`'s sequence gate lifted; mean **−4.28%** of sequence bytes (3 sequences × q ∈ {95,99} × ki ∈ {2,9}), best −13.16%, worst ΔP −0.01 dB, I-frames bit-exact through a real `encode-sequence` → `decode-sequence` md5 round trip. The gate was hiding the *mirror image* of `0040`'s bug: `encode_once` leaves only the **last** candidate's quantised planes in the side channel `local_decode_iframe_gpu` reads, so a kept *bit-exact* frame got the lossy candidate's — P-frames at 5.93 dB. `encode_as_reference` re-runs whichever was kept, at a third encode on those frames. Stills byte-identical. bbb q=99 regresses +0.4/+0.58% → **RATE-4** (with `0040` point 4's source-copy reference, whose refutation is confounded by BUG-39 cause 2). Decision `0044`.  **Its mean is now −6.09%, not −4.28%, and its two regressions are gone — RATE-4 found they were BUG-47** (`lossless_sibling` did not carry `pad_fill_decay`, so the bit-exact candidate was coded with a still's padding while acting as a reference). `docs/decisions/0072`. The decision is unchanged; only the price was wrong. |
@@ -1041,6 +1055,28 @@ the option that spends more bits. Use BD-rate, or compare at matched rate. At le
 wrong conclusions have come from this one error.
 
 ## Landed today, and what each one invalidates
+
+- **BUG-51 — `GP19` is claimed twice, and one of the two is on `main`.** **Read this before you
+  touch `src/format.rs`.** ENT-9's GP19 (abac's context-coded prefix, `0074`) is on `main`;
+  TILE-1's uncommitted work in `gnc-tile1` defines the same number as "plane padded to 32". A
+  **guard** landed — `tests/bitstream_generation.rs`, mutation-tested — so the clash now fails at
+  `cargo test`. The **renumber has not**: TILE-1 needs GP20, and that is its owner's call.
+
+  Two things worth carrying:
+
+  - **A duplicated generation is not the same severity as a duplicated id, and the difference is
+    the whole reason this is P1.** A decision number colliding is a documentation nuisance; an item
+    id colliding is a queue nuisance (COORD-3); a *generation* colliding means a file can be either
+    format while `deserialize_compressed_validated`'s `gen >= N` gates are right for only one of
+    them — a **plausible wrong image, not an error**, which `0074` had already written down for
+    this exact pair. And **a clean textual merge resolution hides it**: keeping either side of the
+    `format.rs` conflict looks like a resolution.
+  - **`0050` and `0065` both said they were closing "the id namespace" and neither enumerated it.**
+    They fixed decision numbers and item ids. Nobody asked which *other* numbers here are picked by
+    reading a file and adding one — and the answer included the bitstream generation, the only one
+    of the three that corrupts pixels rather than labels. **When a fix is framed as closing a
+    class, list the members.** The generation still has no allocator; the guard only makes the
+    collision loud.
 
 - **COORD-8 — `verify before trusting` now says how, and the obvious how was wrong.**
   `docs/decisions/0076`. **Invalidates nothing** — `scripts/claim` only. What changes is the last

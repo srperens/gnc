@@ -4,6 +4,61 @@
 
 ---
 
+## BUG-51 — `GP19` is claimed twice, and the namespace where that corrupts data had no guard (2026-09-08)
+
+**How it was found.** Not by looking. A peer session, having inherited the orphaned `gnc-tile1`
+worktree (COORD-8), mentioned in passing that its uncommitted work "carries a GP18→GP19 bitstream
+bump". ENT-9 had taken **GP19** for abac's context-coded prefix an hour earlier. Verified in both
+trees rather than assumed:
+
+- `main`: `b"GP19" => 19`, and the entropy-type-5 gate is `gen >= 19` (`0074`).
+- `gnc-tile1`, uncommitted, based on `a73e0a2`: `b"GP19" => 19`, *"TILE-1 stage 1 — plane padded
+  to 32, not to tile_size"*.
+
+**This is the `0018` mechanism in the one namespace where it corrupts data rather than annoying
+someone.** A duplicated decision number is a documentation nuisance; a duplicated item id is a
+queue nuisance (COORD-3); a duplicated *generation* means **a file at GP19 can be either format
+while `deserialize_compressed_validated`'s `gen >= N` gates are right for only one of them.**
+`0074` had already written the failure mode down for exactly this pair of binarisations: they
+differ only in how bits are modelled, so misreading one as the other gives a **plausible wrong
+image rather than an error**. Filed P1 where COORD-3 was P2, for that reason alone.
+
+**The trap is that a clean textual resolution hides it.** Merging `main` into tile1 conflicts in
+`src/format.rs`; keeping either side alone looks like a resolution and leaves the semantic clash
+intact. TILE-1's padding needs GP20, its own table entry and its own gate.
+
+**Guard landed, race not closed, and the split is deliberate.** `tests/bitstream_generation.rs`
+asserts two things over the table in `deserialize_compressed_validated`, which is the single
+source: no generation number is claimed by two magics, and the magic `serialize_compressed` stamps
+is the newest generation in the table. **Mutation-tested both ways** — injecting a second arm at
+19 reproduces the real message (`two magics claim one generation: [(19, ["GP19", "GP1X"])]`), and
+bumping the writer without a table entry fails the second test. What it buys is that the collision
+**fails at `cargo test` instead of at a merge**. What it does not buy is exclusion: two sessions
+can still both read `format.rs` and pick the next number, which is precisely how `0018`, `0024`
+and `0027` happened. That wants the allocator the other three namespaces now have (`claim gen`
+beside `claim dr` / `claim bug` / `claim id`, per `0050` and `0065`), and it is still open.
+
+**The renumber is not done and is not mine to do** — it is another session's worktree and its owner
+is mid-debug in it. Flagged to them directly, with one thing worth repeating here: their
+`full_pipeline_rice_roundtrip` reads **4.95 dB at 1920x1088** against 56.21 dB at 256x256, which is
+the border-tile bug TILE-1 exists to fix, but it was taken on a tree whose `format.rs` disagrees
+with `main` about what GP19 means. Re-take it after the renumber rather than debug two faults as
+one.
+
+**The general lesson, and it is about scope rather than about ids.** `0050` and `0065` closed the
+decision-number and item-id namespaces and both records framed the problem as "ids". Neither asked
+**which other numbers in this repository are picked by reading a file and adding one** — and the
+answer included the bitstream generation, the only one of the three whose collision produces a
+wrong picture instead of a wrong label. When a fix is framed as closing a class, enumerate the
+class.
+
+**Gates.** `cargo test --release --test bitstream_generation`: 2 passed, and both fail on the
+mutations above. Full suite on the merged tree before this test was added: **274 passed, 0 failed,
+9 ignored**; `cargo clippy --release --all-targets` and wasm `--lib` clean; `claim selftest`
+passes. No codec behaviour changed — this adds a test and one BACKLOG entry.
+
+---
+
 ## COORD-8 — the orphan count is arithmetic, and the obvious oracle was unsound (2026-09-08)
 
 **What was open.** `0069` reported the holder's worktree when liveness could not be tested, which

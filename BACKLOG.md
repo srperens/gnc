@@ -2297,6 +2297,58 @@ is no before-number and a guessed fix would be exactly the change this project's
 Filed as **COORD-7**. Shell only — no Rust, no shader, no bitstream, so the cargo gates cannot be
 affected and were not re-run (DOC-1 / ENT-7 precedent); `claim selftest` passes.
 
+### BUG-51 — `GP19` is claimed twice; the guard is in, the renumber is not (todo, P1)
+
+**Two different bitstream formats currently claim generation 19.**
+
+- `main`, from ENT-9 (`docs/decisions/0074`, landed 2026-09-08): `b"GP19" => 19` means abac's
+  Exp-Golomb unary prefix is context-coded, and the entropy-type-5 gate is `gen >= 19`.
+- `gnc-tile1`, uncommitted, based on `a73e0a2`: `b"GP19" => 19` with the comment *"GP19: TILE-1
+  stage 1 — plane padded to 32, not to tile_size"*.
+
+Found 2026-09-08 by the `loopa` session, from a peer's remark that tile1 "carries a GP18→GP19
+bitstream bump", verified against both trees. tile1's session is one of the orphans (COORD-8) and
+its worktree has since been inherited, so the collision is live rather than historical.
+
+**This is the `0018` mechanism in the one namespace where it corrupts data instead of annoying
+someone.** A duplicated decision number is a documentation nuisance; a duplicated item id is a
+queue nuisance (COORD-3); a duplicated *generation* means **a GP19 file can be either format and
+the `gen >= N` gates in `deserialize_compressed_validated` are wrong for one of them.** `0074`
+spells the failure mode out for this exact case: the two differ only in how bits are modelled, so
+misreading one as the other yields a **plausible wrong image rather than an error**. That is why
+this is P1 while COORD-3 was P2.
+
+**The trap is that a clean textual resolution hides it.** Merging `main` into tile1 conflicts in
+`src/format.rs`, and keeping either side alone looks like a resolution while leaving the semantic
+clash intact. TILE-1's padding change needs **GP20** — its own table entry, its own gate, and the
+padding gated on `gen >= 20` rather than folded into 19.
+
+**Two halves, and the second is what stops the next one:**
+
+1. **Renumber TILE-1's work to GP20.** It is the later, uncommitted half; ENT-9's GP19 is on `main`
+   and referenced from `0074`, CLAUDE.md, `tests/abac_bitstream.rs` and `tests/conformance.rs`.
+   BUG-19 / `0059` is the precedent for which half moves and how the inbound references go wrong.
+   **Not done here: it is another session's worktree and its owner is mid-debug on it.**
+2. **DONE — `tests/bitstream_generation.rs`** makes the collision fail at `cargo test` instead of
+   at a merge, where a clean textual resolution hides it. Two assertions over the table in
+   `deserialize_compressed_validated`, which is the single source: **no generation number is
+   claimed by two magics**, and **the magic `serialize_compressed` stamps is the newest generation
+   in the table** (so a writer bumped without a table entry, or an entry added without switching
+   the writer, is also caught). Both mutation-tested — injecting a second arm at 19 reproduces
+   the real BUG-51 message, and bumping the writer alone fails the second test.
+
+   **It does not close the race**, and that is deliberate: two sessions can still both read
+   `format.rs` and pick the next number, exactly as they did for `0018`, `0024` and `0027`. Closing
+   it wants the allocator the other namespaces have (`claim gen`, alongside `claim dr` / `claim
+   bug` / `claim id`, per `0050` and `0065`). The guard was worth landing first because it is a few
+   lines and turns a silent data-corrupting clash into a red test; the allocator is the real fix
+   and is still open.
+
+**Also worth re-checking once (1) lands:** tile1's `full_pipeline_rice_roundtrip` reads 4.95 dB at
+1920x1088 against 56.21 dB at 256x256, which is the border-tile bug TILE-1 exists to fix — but it
+was measured on a tree whose `format.rs` disagrees with `main` about what GP19 means. Re-take it
+after the renumber so the reading is not two faults read as one.
+
 ### COORD-8 — `verify before trusting` now says how, and `pgrep` was the wrong how (**FIXED 2026-09-08**)
 
 `0069` made an untestable claim actionable by reporting the holder's worktree and left the

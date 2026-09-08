@@ -13,14 +13,49 @@ racing callers N distinct ids.
 
 **What changed.** `scripts/claim bug` and `scripts/claim dr`. First gap over `git show
 main:BACKLOG.md` / `git ls-tree main docs/decisions/` union `refs/claims/*`. Lost CAS retries.
-This record is `0049`, printed by `claim dr` — canary that the allocator consulted `main`
-(0046 is a file) and live claims (0044, 0045, 0047, 0048 were held) rather than `ls` of this
-worktree.
+Record **`0050`**: the first `claim dr` printed 0049, then BUG-40 merged
+`0049-bidir-pipelines-are-paid-by-b-frames.md` (they had dropped the reservation). Retry
+allocated 0050. The CAS was fair; a dropped claim loses to a branch that already wrote the
+file.
 
 **selftest.** 8 processes on `claim bug`: 8 claimed, 8 distinct. 8 on `claim dr`: 8 claimed,
 8 distinct. Combined with the existing 16-racer / 6-picker tests: PASS.
 
 No codec change. No measurement moved.
+
+## BUG-40 — bidir pipelines are paid by B-frames, not by everything else (2026-09-08)
+
+**Hypothesis.** `MotionEstimator::new` compiles `block_match_bidir.wgsl` (and the two bidir MC
+shaders) on every encode, including intra. B-frames are off by default. On DX12 that eager
+compile is FXC `X3695` and the codec never starts. Making the three pipelines lazy, mirroring
+`split_pipeline`, should be bitstream-identical on Metal and should stop the default path from
+touching those shaders.
+
+**Domain.** GPU pipeline creation. Not coefficients, not the bitstream, not motion search.
+
+**Before (this worktree at `015657c`, Metal, not idle):**
+
+| artefact | sha256 | size | bpp |
+|---|---|---|---|
+| still q=75 bbb_1080p | `0b5cc74305e3cfb3f860d2c0cc47c225207b00e9d40f71a082c071c7d64d063c` | 1 116 667 | 4.31 |
+| 9-frame ki=9 q=75 bbb_extended (1I+8P) | `d75c72ee8f656dc96a29e20ee48ba87a5255dc6e82f227bc202ad16068cc7702` | 6 776 008 | 2.90 |
+
+**After.** Both hashes identical. Three more stills match BASELINE bpp: q=90 bbb 7.21, q=75
+blue_sky 3.54, q=75 touchdown 3.84.
+
+**Canary.** `bidir_pipelines_are_lazy_until_dispatched`: all three `OnceLock`s empty after
+`new` and after a P-frame `estimate`; `Some` after the bidir getter. `GNC_PROFILE=1` intra
+prints no `[bug40]`. `GNC_B_PYRAMID=1` on the 9-frame clip prints
+`[bug40] match_bidir_pipeline=1` and `[bug40] compensate_bidir_pipeline=1` (the clip still
+coded 1I+8P; the compile is the canary, not the GOP).
+
+**Not measured:** DX12 intra. That is the laptop round. Step 2 — whether FXC's `X3695` is a
+real race — is untouched and needs a B-frame dispatch on Windows.
+
+**Gates.** `cargo test --release -- --test-threads=1`; `cargo clippy --release`;
+`cargo clippy --release --target wasm32-unknown-unknown --lib`. Decision `0049`.
+
+---
 
 ## BUG-32 — `benchmark-sequence --throughput` (2026-09-08)
 

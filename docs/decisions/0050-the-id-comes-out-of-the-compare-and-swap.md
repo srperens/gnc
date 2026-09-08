@@ -1,4 +1,4 @@
-# 0049 — The id comes *out* of the compare-and-swap
+# 0050 — The id comes *out* of the compare-and-swap
 
 **Date:** 2026-09-08
 **Item:** COORD-2
@@ -29,8 +29,14 @@ return value, not an argument.
 you *get* a number.
 
 `claim selftest` now races 8 processes on `claim bug` and 8 on `claim dr` and asserts N
-distinct ids. Measured: 8 claimed, 8 distinct, both kinds. This record itself was allocated
-by `claim dr`.
+distinct ids. Measured: 8 claimed, 8 distinct, both kinds.
+
+This record was first allocated as `0049`. Before it merged, BUG-40 landed
+`0049-bidir-pipelines-are-paid-by-b-frames.md` on `main` — they had reserved `dr-0049`,
+dropped it to merge, and the gap reopened. `claim dr` then handed this session 0049
+fairly. Retry via `claim dr` produced **0050**. The allocator did its job; a dropped
+reservation still loses the race against a branch that already wrote the file. Keep the
+claim until the merge, or commit the stub with the reservation.
 
 ## What was not chosen
 

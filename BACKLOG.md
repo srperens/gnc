@@ -6383,6 +6383,53 @@ motion estimator (8x8/±16: 0.99→1.01x). Full measurement in RESEARCH_LOG 2026
 Reaches the same verdict as ICME 2006 and MPEG's deletion of the SVC temporal update step, from an
 independent direction.
 
+### CHROMA-3 — where is CfL's gain, per subband? And the deep subbands pay alpha either way (todo, **P3**)
+
+**Raised 2026-09-08 by an external review of the pipeline diagram**, which flagged CfL on wavelet
+coefficients as non-standard and predicted the correlation would be *"best on the LL band and
+degrade in the high-frequency bands"*, recommending an explicit per-subband decision rather than
+uniform application.
+
+**Half of that is already handled and half is untested.** The alpha is already computed **per tile
+*and* per subband** by least squares (`cfl.rs`), so a subband with no cross-channel correlation
+gets alpha ≈ 0 and cannot *hurt* the prediction. What has never been measured is **where the gain
+actually is**. `MEAS-2` (2026-09-07) toggled `GNC_NO_CFL` and settled the wholesale question — CfL
+earns its keep, 9% smaller *and* better colour on bbb, while costing 2–3% on blue_sky — but nothing
+decomposes that by subband. A grep of RESEARCH_LOG and this file finds no per-subband CfL figure at
+all.
+
+**And alpha ≈ 0 is not free, which is the sharper version of the reviewer's point.** The alphas are
+*signalled*: `format.rs` writes `num_subbands` and one i16 per tile per subband per chroma plane.
+At 5 levels and 1080p that is **16 subbands x 40 tiles x 2 planes = 1280 alphas = 2560 B per
+frame**, about **0.22%** of a q=75 frame. A subband contributing nothing still pays. If the gain
+turns out to live in LL plus the first level, roughly **0.16% of the frame is pure header waste**,
+and the fix is to signal alpha only where it pays — the same shape as ENT-6, which found the deep
+subbands costing ~4% of the file as short code-blocks.
+
+**Three questions, in cost order — none needs a GPU:**
+
+1. **Where is the gain?** Sweep CfL per subband group (LL, level 1, level 2+) on ≥3 images at
+   q=50/75/85, with `GNC_NO_CFL` as the control. Report rate *and* dE00 — VMAF cannot see chroma
+   and has produced a confident wrong answer on exactly this kind of question twice
+   (`chroma_weight` 2026-09-05, CHROMA-1 2026-09-06).
+2. **Is the alpha header recoverable?** If level 2+ contributes under noise, signal a subband mask
+   instead of a dense array. 0.22% is small, so this only ships if question 1 says most of it is
+   dead — measure before building.
+3. **Why does the window stop at q=85?** The *lower* bound has a recorded reason in
+   `quality_preset`'s own comments — *"CfL alpha precision too coarse at high qstep"* and *"alpha
+   too coarse at qstep=16; hurts gradients"*. **The upper bound has none I can find.** That matters
+   because CHROMA-1 found the neighbouring intuition wrong in the same range: `chroma_weight` was
+   dropped above q=85 on the assumption chroma mattered less there, and holding it at 1.2 instead
+   was worth −5.2% luma BD-rate for +1.2% on colour. q=90–99 is GNC's home range, so an unjustified
+   cutoff there is worth one sweep.
+
+**Success criterion:** a per-subband-group gain figure on ≥3 images at ≥2 quality points, in rate
+and dE00, plus a stated answer on the q=85 cutoff. **A null result is a result** — "the gain is
+spread evenly, leave it alone" retires the reviewer's hypothesis and question 2 with it.
+
+**What this is not:** a re-litigation of whether CfL should exist. MEAS-2 settled that with numbers
+and it stays on.
+
 ### CHROMA-2 — Is the colour result more than an allocation difference? (**DONE 2026-09-07** — no, and worse)
 
 **Answer: it is an allocation artefact, and the control found something stronger than that.**

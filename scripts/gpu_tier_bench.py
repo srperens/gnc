@@ -188,7 +188,8 @@ def density(binary: Path, clip: Path, frames: int, quality: int, ki: int,
     """Aggregate throughput with N concurrent GNC encodes of the same clip."""
     env = {"GNC_GPU_ADAPTER": adapter} if adapter else {}
     cmd = [str(binary), "benchmark-sequence", "-i", str(clip),
-           "-n", str(frames), "-q", str(quality), "-k", str(ki), "--rice"]
+           "-n", str(frames), "-q", str(quality), "-k", str(ki), "--rice",
+           "--throughput"]
     rows = []
     for n in levels:
         wall, codes, errs = run_concurrent([cmd] * n, env=env)
@@ -225,11 +226,10 @@ def density_still(binary: Path, image: Path, iterations: int, quality: int,
                   levels: list[int], adapter: str | None) -> list[dict]:
     """MEAS-5, measured through `benchmark` rather than `benchmark-sequence`.
 
-    `benchmark-sequence` spends its wall clock on CPU-side quality metrics, not on
-    encoding: measured on an RTX 4000 Ada, 8 frames at k=1 is 2726 ms wall against
-    376 ms of encode, and `decode_sequence` holds the whole decoded sequence in RAM,
-    so cost per frame degrades superlinearly (341 ms at 8 frames, 6.9 s at 120).
-    Swept concurrently it measures how well N SSIM computations share the CPU.
+    Historically `benchmark-sequence` spent 86% of wall on CPU PSNR/SSIM (BUG-32,
+    2726 ms vs 376 ms encode on an RTX 4000 Ada at 8 frames). `--throughput` now
+    skips that; `--density` passes it. This still-frame path stays because it has
+    no sequence load and amortises startup over `--iterations`.
 
     `benchmark` loops the GPU encode/decode phases on one frame. Characterised on the
     same card: ~705 ms fixed startup (GPU init, shader compilation) plus 6.8 ms per
@@ -373,15 +373,14 @@ def main() -> None:
     ap.add_argument("--list", action="store_true", help="list adapters and exit")
     ap.add_argument("--tier", action="store_true", help="CANARY-1: encode time per GPU")
     ap.add_argument("--density", action="store_true",
-                    help="MEAS-5 through `benchmark-sequence`. BUG-32: 86%% of that wall clock is "
-                         "CPU quality metrics, so swept concurrently it measures how well N SSIM "
-                         "computations share the CPU. Prefer --density-still")
+                    help="MEAS-5 through `benchmark-sequence --throughput` (BUG-32). Times encode, "
+                         "not CPU SSIM. --density-still is still the cheaper single-frame form")
     ap.add_argument("--density-still", action="store_true",
                     help="MEAS-5 through `benchmark` on one frame: no CPU quality metrics, "
                          "so it measures GPU encode rather than SSIM throughput")
     ap.add_argument("--hwenc", action="store_true", help="MEAS-5: the same sweep through NVENC/QSV")
     ap.add_argument("--all", action="store_true",
-                    help="tier, then density-still, then hwenc. Not --density: see BUG-32")
+                    help="tier, then density-still, then hwenc. --density is opt-in (needs a clip)")
     ap.add_argument("--adapter", help="GNC_GPU_ADAPTER substring for the density sweeps")
     ap.add_argument("--encoder", default="h264_nvenc", help="ffmpeg hardware encoder for --hwenc")
     ap.add_argument("--preset", default="p7", help="hardware encoder preset (p7 = slowest/best)")
@@ -454,12 +453,11 @@ def main() -> None:
         print_tier(out["tier"])
 
     if args.density:
-        print("\n**--density is the instrument BUG-32 characterised, not the GPU.** "
-              "`benchmark-sequence` spends 86% of its wall clock on CPU-side PSNR and SSIM "
-              "for two encode arms, and retains the whole decoded sequence, so `frames / wall` "
-              "swept concurrently measures how well N metric computations share the CPU. It is "
-              "kept because the inter path is the shipped configuration and --density-still "
-              "cannot reach it; read the rows as completion counts, not as throughput.")
+        print("\n**--density uses `benchmark-sequence --throughput` (BUG-32).** "
+              "Without that flag the command's wall clock was 86% CPU PSNR/SSIM for two encode "
+              "arms. The flag skips those and the decode retention; `frames / wall` is then "
+              "encode plus process startup. --density-still remains the cheaper single-frame "
+              "form. Sub-linear scaling is still expected — the question is how far it goes.")
         out["density"] = density(args.binary, clip, args.frames, args.quality,
                                  args.keyframe_interval, levels, args.adapter)
         print_density(f"MEAS-5 — GNC, {args.frames} frames at q={args.quality}"

@@ -1378,7 +1378,19 @@ that is not a shader it does not use. **Why P2:** it invalidates no measurement 
 nothing on Vulkan or Metal, but GOALS rule 4 claims DX12 and step 1 is close to free. Step 1
 alone converts "DX12 does not run GNC" into a measurement.
 
-### BUG-34 — GNC requests 10 storage buffers per stage against a default of 8 (todo, P2)
+### BUG-34 — GNC requests 10 storage buffers per stage against a default of 8 (**DONE 2026-09-08**)
+
+Request is now **9**, via `gnc::required_limits()`. 10 was unused slack: naga counts
+`block_match_bidir.wgsl:main` alone at 9 storage buffers, next heaviest at 7
+(`motion_compensate_bidir` and `_chroma`). 9 is still an
+override of `Limits::default()`'s 8 (and the WebGPU spec). Recorded in `docs/decisions/0047`.
+`tests/requested_limits.rs` asserts the whole `Limits` struct against default plus that one
+field, and that the heaviest entry point is still `block_match_bidir` at 9 — so a tenth
+binding, or a new override, fails the test rather than a browser. **Not done: merging two
+bindings to reach 8.** B-frames are off by default, the shader is BUG-25's crash site, and
+BUG-40 holds the file. Canary: `[bug34] … max block_match_bidir.wgsl:… at 9 storage buffers;
+request 9`. `gnc gpu-info` prints the override against default 8. No codec change; no
+measurement moved.
 
 Filed 2026-09-08 by ENT-7, found while checking a literature brief's claim about the WebGPU
 default rather than by looking for it.

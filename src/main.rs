@@ -1160,8 +1160,8 @@ fn main() {
                     Ok(ctx) => {
                         // Two columns, and the difference between them is the point:
                         // `have` is what the silicon offers, `use` is what GNC asks for.
-                        // GNC requests wgpu's defaults so the same shaders run under
-                        // WebGPU (GOALS rule 4), so a big GPU does not raise these.
+                        // Almost wgpu's defaults (GOALS rule 4); storage buffers / stage is
+                        // the one named override (BUG-34, docs/decisions/0047).
                         let have = ctx.adapter.limits();
                         let used = ctx.device.limits();
                         println!("\nDevice in use: {}", gnc::describe_adapter(&ctx.adapter.get_info()));
@@ -1200,6 +1200,16 @@ fn main() {
                             have.max_buffer_size / (1024 * 1024),
                             used.max_buffer_size / (1024 * 1024)
                         );
+                        let def = wgpu::Limits::default();
+                        if used.max_storage_buffers_per_shader_stage
+                            != def.max_storage_buffers_per_shader_stage
+                        {
+                            println!(
+                                "  storage buffers / stage overrides Limits::default() ({}); \
+                                 see docs/decisions/0047",
+                                def.max_storage_buffers_per_shader_stage
+                            );
+                        }
                     }
                     Err(e) => println!("\nCould not open a device to report limits: {e}"),
                 }

@@ -4,6 +4,40 @@
 
 ---
 
+## BUG-34 — storage-buffer request 10 → 9, named and asserted (2026-09-08)
+
+**Hypothesis.** `GpuContext` asks for `max_storage_buffers_per_shader_stage: 10` against
+`Limits::default()`'s 8. Either some shader needs 10, or the extra two are slack, and either
+way the override is undocumented. A conformant WebGPU device held to 8 would fail
+`request_device`.
+
+**Measurement (no GPU).** naga count of `var<storage>` actually used per compute entry point,
+every file in `src/shaders/`:
+
+| storage buffers | count of entry points | heaviest |
+|---|---|---|
+| 9 | 1 | `block_match_bidir.wgsl:main` |
+| 7 | 2 | `motion_compensate_bidir`, `_chroma` |
+| ≤6 | the rest | |
+
+So 10 is unused slack. 9 is the least request that still creates the B-frame matcher. 8
+needs that shader to shed a buffer.
+
+**Change.** `gnc::required_limits()` is `Limits::default()` with that field set to 9. Wired
+into `GpuContext` and both probe examples. `tests/requested_limits.rs` asserts PartialEq
+against default-plus-9, that wgpu's default is still 8, and that the heaviest entry point
+is still `block_match_bidir` at 9. `gnc gpu-info` prints the override against default 8.
+
+**Not done: merge to 8.** Same file is BUG-25's crash site; BUG-40 holds it (eager pipeline /
+DX12); B-frames off by default since BUG-5. Decision `0047`.
+
+**Canary.** `[bug34] … max block_match_bidir.wgsl:… at 9 storage buffers; request 9`.
+
+**Invalidates no measurement.** No shader, no bitstream, no encoder path. Device creation
+on this adapter (31 storage buffers) cannot tell 9 from 10.
+
+---
+
 ## MEAS-10 — BASELINE re-taken at `0a1b055` (2026-09-08)
 
 **Hypothesis.** PAD-1, INTRA-2, INTER-2, BUG-16 and RATE-2 all landed after the last whole-table

@@ -4,6 +4,65 @@
 
 ---
 
+## DOC-2 — the source of truth had drifted while the public document stayed right (2026-09-08)
+
+Asked to re-evaluate what mattered most, and the answer was not an engineering item: **GOALS.md was
+stale on four rows of the table that sets every session's priority order**, including the one
+sentence that states the ordering. CLAUDE.md designates GOALS as *"the single source of truth"* and
+tells all eight sessions to read it first.
+
+**The direction of the drift is the notable part.** README — corrected by DOC-1 — was already right
+about every one of these: "8 and 10 bits" in two places, and "At ~80 ms GNC sits below the
+low-latency-HEVC band". The *public* document was current and the *internal* one was two days
+behind. That is the more expensive direction, because work is picked from the internal one.
+
+### What was wrong
+
+| GOALS said | true |
+|---|---|
+| "8-bit only (10-bit not implemented) — **the main format gap** for broadcast contribution" | FMT-1 shipped 10-bit **2026-09-06** |
+| "Latency per frame — **never measured**" | MEAS-6 measured it twice; ~80 ms, 0 frames of reordering |
+| "Bit depth: 8-bit → 10-bit" | both ship; target met |
+| "Compression (intra): +46–55% vs H.264 all-I (VMAF)" | uncaveated, and BASELINE says that figure predates the high-q ladder fix and has not been re-run |
+| "The two metrics … have never been measured … **They come before further compression work**" | one is measured, the other is parked on *hardware*, not effort — so the ordering had stopped meaning anything |
+
+### The one measurement: 10-bit, verified rather than taken from the backlog
+
+The backlog said FMT-1 was DONE. Checking it is cheap and the whole point of this repository's
+protocol, so a genuine 10-bit source was built (`scripts/png16.py`, 10-bit samples in the high bits
+of 16-bit PNG channels, 8→10 by bit replication so the full 0–1023 range is used):
+
+| | result |
+|---|---|
+| `--bit-depth 10 -q 100`, 1080p | **bit-exact: max error 0, 0 wrong samples of 6 220 800** |
+| `--bit-depth 10 -q 90`, 1080p | 61.33 dB, 14.26 bpp |
+
+So the claim GOALS denied is not only implemented, it is lossless. FMT-1 had called bit depth *"the
+first-order problem"* for a contribution codec, which is what made that line the most misleading
+sentence in the file.
+
+### ENT-3 retitled, not closed — and a correction to my own assessment
+
+I first reported ENT-3 as "already answered, should be closed". That came from reading the first
+sixteen lines of its entry, and it is wrong. The **headline** is answered — ARCH-3 measured abac on
+inter as −12.0% to −22.9% at bit-identical pixels, nine points — but three things are genuinely
+open: which frame mix produced that table (at ki=9 there are two, `2I+16P+0B` or `2I+2P+14B`, and
+`0025` does not record which), the q=95-99 contribution range, and whether contexts tuned on intra
+coefficients are worth retuning for residual statistics.
+
+So it keeps P1 and gets a title that describes what is open. The old title asked a question its own
+body answers, which hands a session a solved problem.
+
+**That is the second time today I generalised from a partial read** — the first was reporting
+BUG-16's scope from a 4:4:4-only sweep when subsampled chroma reaches q=86. Both were caught, one
+by another session and one by re-reading. The pattern is the same: measure or read one arm, report
+it as the whole.
+
+**Documentation only.** No code, no shader, no bitstream, no figure moved. Tests and clippy
+untouched by construction.
+
+---
+
 ## PAD-1 — the padding fill is a still-image lever, because the padding is a reference (2026-09-08)
 
 **Hypothesis and the item's own gate.** `0034` measured that GNC codes 20.9% of a 1080p frame's

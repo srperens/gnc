@@ -137,6 +137,29 @@ masking, smaller tiles, prediction *before* the wavelet.
 
 ## Active priority list
 
+### DOC-2 — GOALS's target table was stale on the rows that set every session's priority (**FIXED 2026-09-08**)
+
+**The internal source of truth had drifted while the public one stayed current**, which is the
+dangerous direction: CLAUDE.md points every session at GOALS for priorities, and README — fixed by
+DOC-1 — was already right about all of it.
+
+**Four rows and one sentence, all corrected:**
+
+| what GOALS said | what is true |
+|---|---|
+| "8-bit only (10-bit not implemented) — **the main format gap** for broadcast contribution" | **FMT-1 shipped 10-bit on 2026-09-06.** Verified here end to end on a genuine 10-bit 1080p source: **q=100 is bit-exact, max error 0 over 6 220 800 samples**, and q=90 reads 61.33 dB. FMT-1 had called bit depth *"the first-order problem"*, so this was the most misleading sentence in the file |
+| Target table: "Latency per frame — **never measured**" | MEAS-6 measured it twice; **~80 ms round trip, 0 frames of reordering**, below the low-latency-HEVC band. `docs/decisions/0033` |
+| "Bit depth: 8-bit → 10-bit, in the format from the start" | both ship; the target is met and the row now says so |
+| "Compression (intra): +46–55% vs H.264 all-I (VMAF)" | presented uncaveated, while **BASELINE says that figure predates the high-q ladder fix and has not been re-run** — and it is a VMAF BD-rate, which BASELINE forbids quoting at the contribution end one line earlier. Now carries its caveats plus INTRA-1's better framing: the intra *coding* gap is nearer **+12%** than +27% |
+| "The two metrics at the top of that table have never been measured … **They come before further compression work**" | the operative sentence, and it had stopped meaning anything: one metric is measured, the other is **parked on hardware, not on effort**. Restated so the ordering is actionable |
+
+**Also retitled ENT-3**, whose heading asked a question its own body answers with nine measured
+points. Not closed — q=95-99 and context retuning are genuinely open, and the frame mix behind the
+table is unrecorded.
+
+**Documentation only.** No code, no shader, no bitstream. The one measurement taken was the 10-bit
+verification above, which confirms an existing claim rather than making a new one.
+
 ### DOC-1 — five stale prose claims in the public README (**DONE 2026-09-08**)
 
 Line numbers below are where each was **found**, before the edit shifted them; the two live pointers (`README.md:192`, `abac_gpu_encode.rs:381`) are post-edit and were re-checked.
@@ -5361,7 +5384,25 @@ predicate and a dispatch arm beside the Rice and rANS ones in `sequence.rs` — 
 touching a frame encoder, which is the whole point of ARCH-3. abac video is also *correct* now, so
 a GPU encoder can be checked against the CPU one for bit-exactness on inter, not only on intra.
 
-### ENT-3 — Does abac pay on inter residuals? (todo, P1, claimed and released unmeasured 2026-09-07)
+### ENT-3 — abac on inter: the headline is answered, q=95-99 and context retuning are not (todo, P1)
+
+**Retitled 2026-09-08 (DOC-2), because the old title asked a question this entry answers.** It read
+"Does abac pay on inter residuals? (todo, P1, claimed and released unmeasured 2026-09-07)", which
+was wrong twice over: ARCH-3 measured it as a side effect — **yes, −12.0% to −22.9% at bit-identical
+pixels on nine points** — and "unmeasured" stopped being true on 2026-09-07. A session picking this
+off the queue was being handed a solved question with the solution in its own body.
+
+**What is actually open, in the order it should be done:**
+
+1. **Which frame mix produced the nine-point table.** At ki=9 there are two (`2I+16P+0B` or
+   `2I+2P+14B`) and `0025` does not record which. Settle it by reading `benchmark-sequence`'s own
+   stdout, not by reasoning — and pass `-q`, since BUG-37 was exactly that trap.
+2. **The contribution range proper, q=95-99**, which is GNC's home range and is where RATE-2 says
+   the ladder misbehaves anyway.
+3. **Whether the contexts are worth retuning for residual statistics** — they were tuned on intra
+   coefficients.
+
+Nothing below is retracted; the numbers stand for the range they were taken in.
 
 **The inter half of the entropy question, which ABAC-SHIP explicitly left out of scope** ("intra
 only; inter is out of scope for this row"). Nothing has been measured. Claimed at the end of the

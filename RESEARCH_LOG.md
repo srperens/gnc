@@ -4,6 +4,82 @@
 
 ---
 
+## BUG-32 — the density harness measures SSIM throughput, not GPU encode (2026-09-08)
+
+**Provenance first, because it decides how much these numbers are worth.** This entry is a rescue.
+The measurements below were taken by the MEAS-5 session on an RTX 4000 Ada earlier on 2026-09-08 and
+were **never committed** — the session ended with 145 lines uncommitted in its worktree, no
+RESEARCH_LOG entry, and `BUG-32` reserved through `scripts/claim` against a heading that did not
+exist. This session took the claims over (`SESSION GONE`), reviewed the diff, and filed it. **I did
+not re-run any of it**, and the harness change is unmeasured here beyond a syntax check. So: the
+mechanism below is verifiable by reading the handler, and the ratios are one session's single run.
+Treat the mechanism as the finding and the numbers as indicative.
+
+### The instrument
+
+`RTX 4000 Ada, Vulkan, -q 90 -k 1 --rice, 120-frame crowd_run clip:`
+
+| command | wall | of which encode | not encode |
+|---|---|---|---|
+| `benchmark-sequence -n 8` | **2726 ms** | 208.7 ms (I+P) + 167.7 ms (I-only) | **86%** |
+| `benchmark -n 8` | 934 ms | 175 ms GPU work | 759 ms, mostly fixed startup |
+
+**Cause, and it is readable in the handler rather than inferred.** Per frame it runs
+`quality::psnr` and `quality::ssim_approx` on the CPU for *both* arms, and
+`decoder.decode_sequence` retains the whole decoded sequence. Both arms run on the default path:
+`run_baseline = !run_temporal || ab`, and `--temporal-wavelet none` makes `run_temporal` false, so
+`--ab` is not needed to get the second encode. Four passes of work per measured frame.
+
+**It degrades superlinearly with length**, because the retained sequence is ~3 GB per arm at 120
+frames of 1080p f32: **341 ms/frame at 8 frames, 6.9 s/frame at 120** — one instance ran **13m52s**
+for 120 frames against ~1.7 s of actual GPU encode. The same unexplained pathology is why a
+24-frame `encode-sequence` on the Mac took 54 minutes at 100% of one core the same night.
+
+**The GPU drew 43-46 W of a 130 W limit throughout, while `nvidia-smi` reported
+`utilization.gpu 100%`.** Utilisation is an activity flag, not saturation. Any future throughput
+work should sample power instead; `--density-still` now does.
+
+### What it invalidates
+
+`gpu_tier_bench.py --density` computes `aggregate_fps = frames / wall`, so swept concurrently it
+measures **how well N SSIM computations share the CPU**, not GPU encode. No published figure rests
+on it — it had never been run before this — so nothing is retracted. What it removes is the
+instrument MEAS-5 was going to use, which is why this is filed rather than fixed in passing.
+
+**Untouched:** the encoder's *own printed* fps (208.7 ms for 8 frames here) times the encode phase
+and is BASELINE's quantity **A**. Compression figures from this command are untouched too — bytes,
+bpp and pixel identity are deterministic and do not care what the wall clock did. Checked with the
+session that landed ARCH-3/BUG-18: none of its published numbers are throughput, and `0025` says so.
+
+**Candidate, not a finding: POSITIONING's M-series density table** (7.02 -> 14.15 fps, "~2x at N=8,
+most of it already at N=2") has exactly the shape CPU-bound work on N cores produces. But it was
+taken 2026-09-05 by a method BACKLOG records as unrecorded, and this harness was built the day
+after, so **it cannot be attributed to this code path.** It needs re-taking, not retracting.
+
+### Worked around, not fixed
+
+`--density-still` sweeps `benchmark` instead: no per-frame CPU metrics, ~705 ms fixed startup plus
+6.8 ms/iteration of non-GPU work against 21.3 ms of GPU work — 24% overhead, and the fixed part
+amortises, so run large `--iterations`. It also samples GPU power per level.
+
+**The fix proper** is a flag on `benchmark-sequence` that skips the metrics, the second arm and the
+whole-sequence decode retention, so a throughput sweep can use the same clip as the hardware-encoder
+arm. Deliberately not done: it touches a 4000-line handler whose blocks feed each other's summaries.
+Whoever takes it should keep the metrics on by default — the default should stay the honest one.
+
+### A second defect in the same harness, also fixed here
+
+`hwenc_density` never passed a GOP length, so the fixed-function arm used its own default — 250
+frames on NVENC — against whatever `-k` GNC was given. An all-intra GNC arm against a
+250-frame-GOP NVENC arm is a comparison of GOP lengths wearing a throughput label. Nothing was
+published from that arm, so this invalidates no result; it would have invalidated the head-to-head
+MEAS-5 exists to run. `--keyframe-interval` now goes through as ffmpeg's `-g` and the row label
+prints it.
+
+**No codec code, no shader, no bitstream — one Python harness and two markdown files.**
+
+---
+
 ## BUG-25 is FIXED, and it was fixed before this session started — GNC runs inter on Vulkan (2026-09-08)
 
 **One `encode-sequence` retired the item.** `51a9ac6` — the defect-A commit, earlier the same day —

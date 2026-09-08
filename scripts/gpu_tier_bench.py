@@ -41,6 +41,7 @@ import statistics
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -197,12 +198,75 @@ def density(binary: Path, clip: Path, frames: int, quality: int, ki: int,
     return rows
 
 
+def sample_power(stop: threading.Event, out: list[float]) -> None:
+    """Poll GPU power draw until told to stop. `nvidia-smi`'s utilization.gpu is an
+    activity flag — it reads 100% while the card draws 43 W of a 130 W budget — so
+    power is the occupancy signal that actually discriminates."""
+    while not stop.is_set():
+        try:
+            r = subprocess.run(
+                ["nvidia-smi", "--query-gpu=power.draw", "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=5,
+            )
+            v = float(r.stdout.strip().splitlines()[0])
+            out.append(v)
+        except Exception:
+            pass
+        stop.wait(0.5)
+
+
+def density_still(binary: Path, image: Path, iterations: int, quality: int,
+                  levels: list[int], adapter: str | None) -> list[dict]:
+    """MEAS-5, measured through `benchmark` rather than `benchmark-sequence`.
+
+    `benchmark-sequence` spends its wall clock on CPU-side quality metrics, not on
+    encoding: measured on an RTX 4000 Ada, 8 frames at k=1 is 2726 ms wall against
+    376 ms of encode, and `decode_sequence` holds the whole decoded sequence in RAM,
+    so cost per frame degrades superlinearly (341 ms at 8 frames, 6.9 s at 120).
+    Swept concurrently it measures how well N SSIM computations share the CPU.
+
+    `benchmark` loops the GPU encode/decode phases on one frame. Characterised on the
+    same card: ~705 ms fixed startup (GPU init, shader compilation) plus 6.8 ms per
+    iteration of non-GPU work against 21.3 ms of GPU work — 24% overhead, and the
+    fixed part amortises, which is why `iterations` should stay large.
+    """
+    env = {"GNC_GPU_ADAPTER": adapter} if adapter else {}
+    cmd = [str(binary), "benchmark", "-i", str(image),
+           "-n", str(iterations), "-q", str(quality)]
+    rows = []
+    for n in levels:
+        stop = threading.Event()
+        power: list[float] = []
+        t = threading.Thread(target=sample_power, args=(stop, power), daemon=True)
+        t.start()
+        wall, codes, errs = run_concurrent([cmd] * n, env=env)
+        stop.set()
+        t.join(timeout=3)
+        ok = sum(1 for c in codes if c == 0)
+        rows.append({
+            "instances": n,
+            "completed": ok,
+            "wall_s": wall,
+            "aggregate_fps": (ok * iterations / wall) if wall > 0 and ok else 0.0,
+            "power_w_mean": (sum(power) / len(power)) if power else None,
+            "power_w_max": max(power) if power else None,
+            "error": None if ok == n else (errs[codes.index(next(c for c in codes if c != 0))]
+                                           .strip().splitlines() or [""])[-1],
+        })
+    return rows
+
+
 def hwenc_density(ffmpeg: str, clip: Path, encoder: str, preset: str, qp: int,
-                  frames: int, levels: list[int]) -> list[dict]:
+                  frames: int, levels: list[int], ki: int) -> list[dict]:
     """The same sweep through the machine's fixed-function encoder.
 
     A failure at some N is a result, not an error: a driver session cap is exactly
     what the positioning argument claims exists.
+
+    `ki` is passed through as `-g` so both arms code the same GOP structure. Without
+    it the hardware encoder used its own default (250 frames on NVENC) against
+    whatever GNC was given, and an all-intra arm against a long-GOP arm is a
+    comparison of GOP lengths wearing a throughput label.
     """
     rows = []
     with tempfile.TemporaryDirectory() as tmp:
@@ -211,7 +275,7 @@ def hwenc_density(ffmpeg: str, clip: Path, encoder: str, preset: str, qp: int,
             for i in range(n):
                 out = str(Path(tmp) / f"out_{n}_{i}.264")
                 cmd = [ffmpeg, "-y", "-v", "error", "-i", str(clip),
-                       "-frames:v", str(frames), "-c:v", encoder]
+                       "-frames:v", str(frames), "-c:v", encoder, "-g", str(ki)]
                 if "nvenc" in encoder:
                     cmd += ["-preset", preset, "-rc", "constqp", "-qp", str(qp)]
                 elif "qsv" in encoder:
@@ -299,6 +363,9 @@ def main() -> None:
     ap.add_argument("--list", action="store_true", help="list adapters and exit")
     ap.add_argument("--tier", action="store_true", help="CANARY-1: encode time per GPU")
     ap.add_argument("--density", action="store_true", help="MEAS-5: concurrent GNC encodes")
+    ap.add_argument("--density-still", action="store_true",
+                    help="MEAS-5 through `benchmark` on one frame: no CPU quality metrics, "
+                         "so it measures GPU encode rather than SSIM throughput")
     ap.add_argument("--hwenc", action="store_true", help="MEAS-5: the same sweep through NVENC/QSV")
     ap.add_argument("--all", action="store_true", help="tier, then density, then hwenc")
     ap.add_argument("--adapter", help="GNC_GPU_ADAPTER substring for --density")
@@ -320,7 +387,7 @@ def main() -> None:
         sys.exit(f"No GNC binary at {args.binary} — run `cargo build --release` first.")
 
     adapters = list_adapters(args.binary)
-    if args.list or not (args.tier or args.density or args.hwenc or args.all):
+    if args.list or not (args.tier or args.density or args.density_still or args.hwenc or args.all):
         print(f"{len(adapters)} adapter(s) on {platform.system()} {platform.release()}:")
         for a in adapters:
             print(f"  {a['name']} [{a['backend']}, {a['kind']}]  "
@@ -374,6 +441,26 @@ def main() -> None:
                       "Sub-linear scaling is expected — the question is how far it goes before "
                       "it flattens.")
 
+    if args.density_still:
+        if not args.input:
+            sys.exit("--density-still needs -i <image>")
+        rows = density_still(args.binary, args.input, args.iterations, args.quality,
+                             levels, args.adapter)
+        out["density_still"] = rows
+        print_density(
+            f"MEAS-5 (still, `benchmark`) — GNC q={args.quality}, "
+            f"{args.iterations} iterations/instance",
+            rows,
+        )
+        have_power = [r for r in rows if r.get("power_w_mean")]
+        if have_power:
+            print("\n| instances | GPU power mean W | max W |")
+            print("|---|---|---|")
+            for r in have_power:
+                print(f"| {r['instances']} | {r['power_w_mean']:.1f} | {r['power_w_max']:.1f} |")
+            print("\nPower, not `utilization.gpu`, is the occupancy signal: utilisation reads "
+                  "100% while the card draws a third of its budget.")
+
     if args.hwenc or args.all:
         ffmpeg = shutil.which("ffmpeg")
         if not ffmpeg:
@@ -382,10 +469,12 @@ def main() -> None:
             sys.exit("--hwenc needs -i <y4m clip>")
         else:
             out["hwenc"] = hwenc_density(ffmpeg, args.input, args.encoder, args.preset,
-                                         args.qp, args.frames, levels)
+                                         args.qp, args.frames, levels,
+                                         args.keyframe_interval)
             uses_preset = "nvenc" in args.encoder or "qsv" in args.encoder
-            label = (f"{args.encoder} preset {args.preset}, qp {args.qp}" if uses_preset
-                     else f"{args.encoder}, q {args.qp}")
+            label = (f"{args.encoder} preset {args.preset}, qp {args.qp}, g={args.keyframe_interval}"
+                     if uses_preset
+                     else f"{args.encoder}, q {args.qp}, g={args.keyframe_interval}")
             print_density(f"MEAS-5 — {label}",
                           out["hwenc"],
                           "**Not quality-matched to the GNC rows.** Bitrate and distortion are "

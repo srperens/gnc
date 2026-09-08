@@ -7,7 +7,21 @@ description = "GPU-native broadcast video codec using wgpu compute shaders"
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+# Explicit so that `required-features` can apply; without a `[[bin]]` section the binary is
+# auto-discovered and is built for every target, including wasm. See the `cli` feature.
+[[bin]]
+name = "gnc"
+path = "src/main.rs"
+required-features = ["cli"]
+
 [features]
+default = ["cli"]
+# The `gnc` CLI. On by default, and a feature only so that the binary can be *excluded* from a
+# target it cannot compile for: `GpuContext::new` is `#[cfg(not(target_arch = "wasm32"))]` and
+# `pollster` cannot block on wasm, so type-checking a command-line tool for wasm produced 11
+# errors that had nothing to do with the codec (BUG-24). The library is what WASM ships, and it
+# was clean all along. `--no-default-features` is therefore the wasm build, not a reduced one.
+cli = []
 # BUG-25 only. Enables wgpu's SPIR-V passthrough so `spirv_pipeline_probe` can hand the driver a
 # module wgpu did not generate — which is what `spirv-reduce` needs as an interestingness test.
 # Off by default: it is a diagnostic, it changes no codec behaviour, and the codec must keep

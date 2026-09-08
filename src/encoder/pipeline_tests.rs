@@ -4105,3 +4105,82 @@ fn lossless_iframe_reference_matches_the_decoders() {
         );
     }
 }
+
+/// BUG-39: a `q=100` *sequence* must decode bit-exact on every frame, not just its I-frames.
+///
+/// This is the item's success criterion as a test. It cannot pass with sub-pel motion vectors:
+/// `motion_compensate.wgsl` interpolates the reference bilinearly, so a sub-pel vector makes the
+/// prediction fractional, `cur - pred` fractional with it, and the step-1.0 quantiser rounds it.
+/// So it is also the canary for the full-pel rounding — a P-frame that is bit-exact is proof the
+/// path ran, in a way a log line is not.
+///
+/// The content is textured (per-pixel hash over a gradient) rather than smooth on purpose: a
+/// gradient interpolates almost exactly, so sub-pel error would hide in it.
+#[test]
+fn lossless_sequence_is_bit_exact_on_every_frame() {
+    let ctx = GpuContext::new();
+    let (w, h) = (256u32, 256u32);
+    // Integer samples: `make_textured_frame` mixes a gradient with noise and lands on
+    // fractional values, and no codec is bit-exact on input an 8-bit pipeline cannot represent
+    // in the first place — the still-image lossless test uses `make_integer_test_image` for the
+    // same reason. Rounding here keeps the texture and makes the question well-posed.
+    let integral = |f: Vec<f32>| f.into_iter().map(f32::round).collect::<Vec<f32>>();
+    let frames_data = [
+        integral(make_textured_frame(w, h, 0, 0)),
+        integral(make_textured_frame(w, h, 3, 2)),
+        integral(make_textured_frame(w, h, 5, 3)),
+    ];
+    let frames: Vec<&[f32]> = frames_data.iter().map(|f| f.as_slice()).collect();
+
+    let mut config = crate::quality_preset(100);
+    config.tile_size = 256;
+    config.keyframe_interval = 30; // frames 1 and 2 are P-frames
+    assert!(config.is_lossless(), "q=100 must be a lossless configuration");
+
+    let worst = |frames: &Vec<&[f32]>, compressed: &[crate::CompressedFrame]| {
+        let dec = DecoderPipeline::new(&ctx);
+        let mut out = Vec::new();
+        for (i, c) in compressed.iter().enumerate() {
+            let decoded = dec.decode(&ctx, c);
+            let mut max_err = 0.0f32;
+            let mut n_err = 0usize;
+            for (a, b) in frames[i].iter().zip(&decoded) {
+                let d = (a - b).abs();
+                if d > 0.0 {
+                    n_err += 1;
+                }
+                max_err = max_err.max(d);
+            }
+            out.push((c.frame_type, max_err, n_err));
+        }
+        out
+    };
+
+    let mut enc = EncoderPipeline::new(&ctx);
+    let compressed = enc.encode_sequence(&ctx, &frames, w, h, &config);
+    assert_eq!(compressed.len(), 3);
+    assert_eq!(compressed[1].frame_type, FrameType::Predicted);
+    let results = worst(&frames, &compressed);
+
+    // Informational, not asserted: the same encode with sub-pel vectors restored. It is what
+    // this test is protecting against, and printing it keeps the test's power visible — but
+    // asserting it would mean asserting that a *better* codec must stay broken.
+    {
+        std::env::set_var("GNC_LOSSLESS_FULLPEL", "0");
+        let mut enc_sub = EncoderPipeline::new(&ctx);
+        let sub = enc_sub.encode_sequence(&ctx, &frames, w, h, &config);
+        std::env::remove_var("GNC_LOSSLESS_FULLPEL");
+        for (i, (ft, max_err, n_err)) in worst(&frames, &sub).into_iter().enumerate() {
+            eprintln!("  sub-pel arm frame {i} [{ft:?}]: max_err={max_err} differing={n_err}");
+        }
+    }
+
+    for (i, (ft, max_err, n_err)) in results.into_iter().enumerate() {
+        eprintln!("  frame {i} [{ft:?}]: max_err={max_err} differing={n_err}");
+        assert_eq!(
+            n_err, 0,
+            "q=100 frame {i} ({ft:?}) is not bit-exact: {n_err} samples differ, max_err={max_err} \
+             (BUG-39 — a fractional prediction cannot survive a step-1.0 quantiser)"
+        );
+    }
+}

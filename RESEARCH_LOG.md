@@ -91,6 +91,126 @@ theatre.
 reformatting 44 modules that eight live sessions are editing conflicts with all of them and
 carries no behaviour. It wants a quiet tree and one commit that changes nothing else.
 
+## BUG-39 — lossless video works: a fractional prediction cannot survive a step-1.0 quantiser (2026-09-08)
+
+**Hypothesis, named in this log an hour earlier and now tested.** After cause 3, `q=100` inter
+frames read 51.5–58.2 dB rather than bit-exact. The predicted mechanism was sub-pel prediction
+rounding: `motion_compensate.wgsl` interpolates the reference bilinearly at quarter-pel, so a
+sub-pel vector makes the prediction fractional, `cur - pred` fractional with it, and a lossless
+configuration quantises at step 1.0 — which rounds.
+
+**Confirmed, fixed, and the success criterion is met.** `docs/decisions/0064`.
+
+### The measurement that isolated it before any code was written
+
+An **integer-shift** sequence — a real frame displaced 8 px per frame with ffmpeg crop+pad —
+coded at `q=100`:
+
+```
+Residual Y: mean_abs=0.01 stddev=0.05 near_zero=100%
+Frame 1 [P] PSNR=75.59 dB
+```
+
+The residual is **exactly zero wherever the vector landed on full-pel**, and the whole 75.6 dB
+(rather than `inf`) is the blocks the split search refined to sub-pel. Content built to have a
+known integer motion leaves the search's own refinement as the only variable, which is what makes
+one run decisive. Compare the two earlier probes in this item: a *static* sequence proved nothing
+because it took the skip path, and `GNC_MED=0` moved three things at once.
+
+### The fix
+
+Round the motion vectors to full-pel when `config.is_lossless()`, in place, at the point the
+vector field is final — after `tile_skip_motion` and MV smoothing, before **both** motion
+compensation and the MV entropy coding. `src/shaders/mv_round_fullpel.wgsl`, one dispatch from
+`encode_pframe`. One place, two consumers, no way for them to disagree.
+
+**The decoder is unchanged and has to be**: it uses the vectors the bitstream carries, so
+`bilinear_ref`'s `fx == 0 && fy == 0` early-out returns a reference sample unchanged there too.
+`GNC_LOSSLESS_FULLPEL=0` restores sub-pel for the measurement arm.
+
+### Raw numbers — bit-exactness, verified outside the harness
+
+Real container (`encode-sequence` -> `.gnv` -> `decode-sequence`), raw RGB md5 of every decoded
+frame against its source PNG — the `0036` standard, not the benchmark's own PSNR:
+
+| | ki=2 | ki=9 |
+|---|---|---|
+| crowd_run | **8/8 bit-exact** | **8/8** |
+| old_town_cross | **8/8** | **8/8** |
+| bbb | **8/8** | **8/8** |
+
+**48 of 48 frames md5-identical.** In-harness agrees: every inter frame prints `PSNR inf`.
+
+### Raw numbers — what full-pel costs
+
+Same encode with `GNC_LOSSLESS_FULLPEL=0`, bytes, 8 frames, `q=100`:
+
+| | sub-pel | full-pel | cost |
+|---|---|---|---|
+| crowd_run ki=2 | 35 132 592 | 35 712 641 | +1.65% |
+| crowd_run ki=9 | 41 814 962 | 43 003 751 | +2.84% |
+| old_town_cross ki=2 | 34 658 827 | 35 209 443 | +1.59% |
+| old_town_cross ki=9 | 41 545 518 | 42 778 003 | +2.97% |
+| bbb ki=2 | 25 371 086 | 25 484 805 | +0.45% |
+| bbb ki=9 | 24 808 854 | 25 183 274 | +1.51% |
+
+**Mean +1.83%, worst +2.97%**, and the arm it is measured against is not bit-exact — so this is
+the price of the guarantee, not a regression against an equal-quality alternative.
+
+**q=99 identical to the byte** on all six points: the gate is `config.is_lossless()`, false for
+every rung below 100.
+
+### Why not H.264's rounded-prediction route, which is the better codec
+
+Rounding the *interpolated prediction* keeps sub-pel accuracy for the same guarantee. It needs the
+flag in `MotionCompensateParams`, which is built in three places including a **geometry-keyed
+cache** — a params buffer built for a lossy encode and reused for a lossless one in the same
+process is a silent wrong answer, so the cache key changes too. Full-pel needs one shader, one
+dispatch, no struct change, no cache key, no decoder change, and costs 1.83%. Recorded in `0064`
+with the numbers to beat, because the trade flips if the P path ever becomes worth more than a
+couple of percent at `q=100`.
+
+### What this leaves, and it is a rate question rather than a defect
+
+Both arms are now bit-exact, so the inter-vs-intra comparison at `q=100` is **exact at identical
+pixels** rather than a BD-rate estimate — the cleanest form it can take. 8 frames, ki=2:
+
+| | I+P | all-intra | |
+|---|---|---|---|
+| crowd_run | 35 712 641 | 25 855 950 | **+38.1%** |
+| old_town_cross | 35 209 443 | 25 246 827 | **+39.5%** |
+| bbb | 25 484 805 | 25 899 452 | **−1.6%** |
+
+So lossless inter loses badly on camera content and wins slightly on animation, which is the same
+content split the B-pyramid decision found (`0023`). That is **LOSSLESS-2**, now unparked with a
+real number on three sequences.
+
+### Canary
+
+`lossless_sequence_is_bit_exact_on_every_frame` — textured content, three frames, ki=30, asserts
+every decoded frame is bit-exact. It **cannot pass with sub-pel vectors**, so it is the canary for
+the dispatch as well as the criterion. It also runs the `GNC_LOSSLESS_FULLPEL=0` arm and prints it
+without asserting (620 and 1073 differing samples, max_err 2.5), so the test's power is visible
+rather than assumed — asserting that arm would mean asserting a better codec must stay broken.
+
+**Test content note worth keeping:** the first version used `make_textured_frame` directly and
+failed on the **I-frame** with max_err 122. The helper mixes a gradient with noise and lands on
+*fractional* sample values, and no codec is bit-exact on input an 8-bit pipeline cannot represent.
+Rounding the content fixed it. A lossless test asserts something about integers or it asserts
+nothing.
+
+### Caveats
+
+- **4:4:4 only.** 4:2:0 box-filters both chroma planes in chroma-domain MC, fractional by
+  construction — and 4:2:0 is not a lossless format anyway.
+- **B-frames are still not bit-exact**, and now for exactly one stated reason: bidirectional MC
+  averages two predictions, so `(p0 + p1)/2` is half-integer even at full-pel. Off by default.
+- **The sub-pel refinement in `block_match_split.wgsl` is thrown away at q=100**, which is what
+  the 1.83% buys back.
+
+**Gates:** `cargo test --release -- --test-threads=1` green (263 passed, 0 failed, 9 ignored);
+`cargo clippy --release` clean; wasm `--lib` clippy clean.
+
 ---
 
 ## RATE-4 — the free reference is not free, and `0040` point 4 fails for a different reason than it recorded (2026-09-08)

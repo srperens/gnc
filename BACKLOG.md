@@ -96,6 +96,17 @@ measured advantage over x264 on any axis at this operating point.**
    zone is worth **~3 points on stills** but is a **worst-frame regression on 9 of 9 sequence
    points**, so it is filed as **INTRA-2** rather than shipped. **~6 points remain, and every
    candidate the item listed has now been measured.** Decision `docs/decisions/0028`.
+   **Step 3 done (2026-09-08): the remaining ~6 points are tile-alignment padding, and the
+   accounting closes.** GNC pads every plane to whole tiles with edge replication and codes the
+   padded plane, so a 1920x1080 frame is coded as **2048x1280 — 20.9% of the coded samples outside
+   the picture**, while J2K in whole-picture mode codes none, and both arms are divided by the
+   visible pixel count. Two methods agree: **+6.60%** projected from a content-controlled crop pair
+   (quality held to 0.005 dB), **+6.58 points** as the drop in the cross-codec gap from native to
+   padding-free content on one ladder (26.76 → 20.17 RGB, 51.09 → 40.54 Y) — means agreeing to
+   0.02 points, per-image figures scattering ±2.2 with the content change. Like the chroma 8.5,
+   this is **not** a coding deficiency —
+   but unlike it, **two thirds is recoverable: a fill change is worth −4.6% of shipped intra rate**
+   at unchanged visible quality, filed as **PAD-1**. Decision `docs/decisions/0034`.
 1. **Intra at contribution quality** — the whole remaining +90.5% lives here, per findings 1 and 5.
    Inter breaks even at this operating point for x264 too, so this is the only place the gap is.
    **First instalment paid 2026-09-07 (ABAC-SHIP): −17.3% of intra rate at q=90, opt-in.** Against
@@ -1214,6 +1225,93 @@ does, and it is the first command `docs/GPU_TIER_TEST.md` tells you to run on a 
 The count is now simply not asserted. And CLAUDE.md's argument against parallel role-based agents
 rested on *"the hardware is one M1 with 8 GPU cores"* — the contention argument survives, the
 hardware claim in it does not, so it now says "one machine with one GPU".
+### BUG-36 — concurrent `--vmaf` runs scored each other's frames, through a fixed temp filename (**FIXED 2026-09-08**)
+
+Found 2026-09-08 while reading the VMAF path under MEAS-6. Every VMAF call site wrote its
+reference and distorted Y4M to a **fixed** name under `std::env::temp_dir()` — `gnc_vmaf_ref.y4m`,
+`gnc_ip_vmaf_ref.y4m`, `gnc_bench_vmaf_ref.y4m`, `gnc_rdcurve_vmaf_ref.y4m`, and the
+`gnc_j2k_compare` directory. `TMPDIR` is per *user*, not per process, and COORDINATION.md's
+working mode is **eight sessions on one machine**. Two concurrent `--vmaf` runs of the same
+subcommand therefore opened the same two files and each scored whatever frames won the race.
+
+**Measured, not inferred.** `benchmark-sequence --vmaf`, 9 frames, q=75, ki=9, two sequences whose
+serial scores are bit-stable across repeated runs:
+
+| run | old_town_cross | bbb_extended |
+|---|---|---|
+| serial, twice | 97.39 | 95.91 |
+| concurrent, twice | 97.39 | **97.19** (+1.28) |
+| concurrent, once | **96.37** (−1.02) | 95.91 |
+
+**Exactly one of the pair is wrong in every concurrent run**, in whichever direction the race
+decided. The error is 1.02–1.28 VMAF points against the **>0.5-point move CLAUDE.md calls a
+BLOCK** — 2–2.5x the threshold, from nothing but another session existing.
+
+**What makes it the bad kind of bug:** it is silent, and the wrong number is plausible. No error,
+no warning, no implausible value — 97.19 reads as a perfectly ordinary score. VMAF is the lead
+metric at q≤85 (CLAUDE.md), so this is the project's primary number being quietly replaced by
+another session's clip. Nothing in a log distinguishes a contaminated run from a clean one.
+
+**Fixed** by routing all nine sites through `gnc::session_temp_path()`, which stamps the process id
+into the filename. Verified with the same canary: **6 of 6** concurrent runs now return the serial
+values exactly, against 3 of 6 before. `tests/temp_path_collision.rs` scans `src/` and fails on any
+`temp_dir()` outside the helper, so it cannot be reintroduced by writing a literal.
+
+**What this does and does not invalidate.** It cannot be reconstructed after the fact — no run
+records whether another session was in its VMAF window — so no specific past result is retracted
+here. Two things bound the exposure: the four filenames are per-subcommand, so `benchmark` and
+`benchmark-sequence` never collided with each other, and only the *overlap* of two VMAF windows
+does damage. Longer windows are the higher risk: `rd-curve --vmaf` scores every quality point in
+one process. **Rate figures are immune** — bytes are bytes; this reaches only what VMAF scored.
+
+### BUG-37 — `benchmark-sequence` without `-q` silently codes the B-pyramid (**FIXED 2026-09-08**)
+
+Found 2026-09-08 under MEAS-6. `benchmark-sequence`'s quality argument is `Option<u32>` with **no
+default** (`src/main.rs:515`), where `benchmark` (:436), `encode-sequence` (:606) and
+`benchmark-suite` (:765) all carry `default_value = "75"`. `build_ip_config` only calls
+`quality_preset()` when quality is `Some`, and `quality_preset()` is the *only* place the B-pyramid
+veto lives (`src/lib.rs:1021`). `CodecConfig::default()` still has `b_pyramid: true`.
+
+So `benchmark-sequence -k 9` with no `-q` codes **`2I+2P+14B`** — the hierarchical pyramid that two
+independent measurements rejected as a default on 2026-09-06 — while the same command with `-q 75`
+codes `2I+16P+0B`. Verified both ways on the current build; the `B-pyramid suppressed` canary fires
+only in the second. It also silently selects qstep 4.0 and LeGall 5/3 rather than a preset, so two
+things move at once.
+
+**Nothing recorded is contaminated:** every harness in `scripts/` passes `-q` — checked all five
+that invoke `benchmark-sequence` (`meas1_vs_h264.py`, `gpu_tier_bench.py`, `meas_inter1_ki.py`,
+`meas3_sequence_rd.py`, `meas_chroma2.py`). The exposure is interactive use, and the trap is that
+the flag named *quality* is also the only thing selecting the *GOP structure*.
+
+**It was five sites, not one.** `main.rs` had five `if let Some(q) { quality_preset(q) } else
+{ CodecConfig { …, ..Default::default() } }` constructions — `build_ip_config` (:911) plus the
+temporal-wavelet and warmup paths at :1643, :1698 and :2555, and the still-image `Encode` path at
+:1042. Four of the five code sequences. So `default_value = "75"` would have closed one instance,
+left the mechanism, and left three more already diverging.
+
+**Fixed at the root instead.** `gnc::b_pyramid_enabled()` is now the single statement of the
+shipped policy; `quality_preset()` and the new `gnc::manual_config(qstep)` both ask it, and all
+five CLI sites go through one or the other. `CodecConfig::default()` is deliberately **unchanged**
+at `b_pyramid: true` — `src/encoder/pipeline_tests.rs:87` and `:278` build a `Default` config
+precisely to exercise the B-frame path, and flipping it would leave those tests green while
+silently testing P-only, which is worse than the bug.
+
+Verified on the command that was broken, `-k 9`, 18 frames:
+
+| invocation | before | after |
+|---|---|---|
+| no `-q` | `2I+2P+14B`, silent | **`2I+16P+0B`, canary fires** |
+| `-q 75` | `2I+16P+0B` | `2I+16P+0B`, **26911589 bytes both times** |
+| `GNC_B_PYRAMID=1`, no `-q` | `2I+2P+14B` | `2I+2P+14B` (opt-in preserved) |
+
+**Invalidates no measurement:** the `-q` path is byte-identical, and all five `scripts/` harnesses
+pass `-q`. `tests/cli_shipped_config.rs` asserts the structural invariant — `main.rs` builds no
+config from `Default::default()` — so a sixth site cannot quietly reintroduce it, plus that the
+preset and manual paths agree and that the library default still permits B-frames.
+
+No decision record: no default changed. The shipped default was already P-only since 2026-09-06;
+this makes four CLI paths actually honour it.
+
 ### BUG-34 — GNC requests 10 storage buffers per stage against a default of 8 (todo, P2)
 
 Filed 2026-09-08 by ENT-7, found while checking a literature brief's claim about the WebGPU
@@ -2391,26 +2489,42 @@ The honest next step is neither of those: it is **amortising per-process startup
 clip instead of buffering it**, because those are what the two density runs actually measured. Until
 they are fixed, a density number on any hardware measures pipeline compilation.
 
-### MEAS-6 — Latency per frame (first pass done 2026-09-06, P1)
+### MEAS-6 — Latency per frame (second pass 2026-09-08, P1)
 
-**The B-pyramid costs 8 frames of lookahead before any coding runs.** From the encoder's own
-diagnostics, `ki=17` encodes in the order `0[I] 4[B] 8[P] 2[B] 6[B] 1[B] 3[B] ...` — frame 1
-cannot be encoded until frame 8 has arrived. At 50 fps that is **160 ms of structural delay**.
-`ki=8` (P-only) encodes in display order: **zero reordering delay**. This is not a tuning
-parameter; it is what a hierarchical pyramid is.
+**The default is no longer the B-pyramid, and three documents said it was for two days.** Found
+2026-09-08: `quality_preset()` has vetoed the pyramid since **2026-09-06**
+(`b_pyramid: … .unwrap_or(false)`, `src/lib.rs:1021`), on the two measurements below — but
+POSITIONING, the README and this entry all still called it the "current default" and quoted
+~240 ms as GNC's latency. **GNC's default latency is ~80 ms, and it is below the low-latency-HEVC
+band (120 ms floor), not inside it.** See `docs/decisions/0033`.
 
-Coding time, 1080p, M1, all-intra: GPU encode ~47 ms/frame, decode ~35 ms/frame (upper bound,
-includes PNG write), **codec round trip ~80 ms**.
+Verified on the current build rather than read off the source, at the default `ki=9`:
+
+| configuration | frame mix | canary | reordering delay |
+|---|---|---|---|
+| `benchmark-sequence -q 75` (default) | `2I+16P+0B` | `B-pyramid suppressed … zero reordering latency` | **0 frames** |
+| `GNC_B_PYRAMID=1` | `2I+2P+14B` | silent | **8 frames** (160 ms at 50 fps) |
+
+**The two halves of the latency figure have very different standing, and quoting them together
+hides that.** The reordering delay is *structural* — 0 frames or 8, read from the encoder's own
+frame-type output, unmovable by machine load. The coding time is a 2026-09-06 wall-clock
+measurement on a **non-idle** machine, labelled M1 when it was the M5 Pro (BUG-29): GPU encode
+~47 ms/frame, decode ~35 ms/frame (upper bound, includes PNG write), **round trip ~80 ms**.
 
 | | latency |
 |---|---|
 | JPEG XS | 1-32 lines; EBU measured < 1 frame |
 | NDI High Bandwidth | < 16 ms |
-| **GNC, intra or P-only** | **~80 ms** |
-| **GNC, B-pyramid (default)** | **~240 ms** |
+| **GNC, default (P-only, zero reordering)** | **~80 ms** |
 | low-latency HEVC | 120-3060 ms (EBU, real vendors) |
+| GNC, `GNC_B_PYRAMID=1` (opt-in) | ~240 ms |
 
-**GNC's default configuration sits in the low-latency-HEVC band, not the JPEG XS band.**
+**Still to do, and the first one is cheap.** Re-take the ~80 ms on an **idle** machine — BASELINE
+already records that a run taken during a `cargo test` reads 20% slow, and this figure was taken
+on a loaded box. It was not re-taken on 2026-09-08 either: the machine sat at load 21-39 with
+other sessions running the test suite for the whole session, which is exactly why the structural
+half was pinned instead. Then glass-to-glass, which needs instrumentation nobody has:
+capture-to-input, output-to-network and output-to-display are all unmeasured.
 
 **Converges with BUG-5.** The B-pyramid already measured as *costing* 7-31% at contribution
 quality on camera content. It now also costs 160 ms. Two independent measurements, one
@@ -3972,6 +4086,14 @@ entropy coder and is now closed. **Nothing in this repository accounts for the o
 That makes this the biggest known compression gap in GNC, and it is not a tuning item: something
 structural is costing a quarter of the bitrate and we cannot currently name it.
 
+**ANSWERED 2026-09-08 (step 3). 26.3 of the 27.1 points are named**, and 15.2 of them are not
+coding deficiencies at all: 8.5 is a deliberate chroma allocation the RGB metric cannot see
+(`0026`) and **6.6 is GNC coding its own tile-alignment padding** (`0034`), which JPEG 2000 in
+whole-picture mode does not do. The coding half is ≤7.5 entropy (`0024`), ~3 dead zone (`0028`,
+filed as INTRA-2) and 0.6 tiling. **The one actionable piece is PAD-1: −4.6% of shipped intra rate
+from a fill change, at unchanged visible quality.** The question below is kept as written because
+the shape of the answer only makes sense against it.
+
 **What is already ruled out, so nobody re-measures it:**
 
 - **PCRD / rate allocation.** 0.00 dB at code-block granularity, at every rate from 0.05 to 3.5 bpp,
@@ -4034,11 +4156,18 @@ baseline is reproduced rather than assumed.
 |---|---|---|
 | chroma allocation against an RGB metric | **8.5** | measured; a deliberate perceptual trade, **not** a coding deficiency |
 | entropy coder headroom | **≤7.5** | decision 0024; half is ENT-6's small-block cold start |
+| **tile-alignment padding** | **6.6** | **step 3, decision 0034 — samples GNC codes and J2K does not; also not a coding deficiency, and 4.6 points of it are recoverable (PAD-1)** |
+| dead zone / quantiser rounding rule | **~3** | step 2c, decision 0028 — intra-only, filed as INTRA-2 |
 | tiling, 256px vs whole picture | **≤12.4 for J2K, 0.6 realisable in GNC** | measured in both codecs |
 | lifting normalisation | **~0** | closed — synthesis norms 0.984–1.066, uniform steps within ~5% of MSE-optimal |
-| remainder | **~9.8** | tiling is the leading suspect; GNC does not collect it |
+| cross-tile rate allocation | **0.95, rejected** | step 2b, decision 0027 |
+| tile-boundary extension | **0** | already whole-point symmetric; the candidate was wrong |
+| remainder | **~0.8** | **26.3 of 27.1 named** |
 
-In sequence: +27.2% → +18.7% (chroma) → **+9.8%** (entropy ceiling).
+In sequence: +27.2% → +18.7% (chroma) → +9.8% (entropy ceiling) → **+3.1%** (padding) — and the
+dead zone is roughly what is left. **The honest form of the intra coding gap on these four images
+is closer to +12% than to +27%**, since 15.2 of the 27.1 points are allocation and padding rather
+than coding.
 
 **The colour transform is where the normalisation error is.** YCoCg-R synthesis norms are
 (Y 1.7321, Co 0.7071, Cg 0.8660), spread **2.45**, so RGB-MSE-optimal chroma steps are 2.45x/2.00x
@@ -4073,15 +4202,77 @@ kristensara the oracle picks a *single* q for all 15 tiles at q = 92/94/96/98. U
 close to optimal there, it is the optimum — EBCOT part 1's argument one scale up. Decision
 `docs/decisions/0027`.
 
-**Where the item stands: ~9 points remain and the obvious candidates are spent.** Untested and
-cheap: the deadzone and quantiser rounding rule against J2K's, and the wavelet's tile-boundary
-handling (`transform_97.wgsl` replicates the edge sample where J2K uses symmetric extension).
-Neither is obviously worth 9 points, which is worth saying out loud rather than assuming the next
-idea closes it.
+**Where the item stands after step 3: the accounting closes.** The two candidates this paragraph
+used to list are both settled and neither was worth what was left. The dead zone is ~3 points and
+is INTRA-2. **The tile-boundary handling was never a candidate: `transform_97.wgsl` already
+implements whole-point symmetric extension** — the lifting steps substitute `low[half-1]` for
+`low[half]` and `high[0]` for `high[-1]`, which is `x[N] = x[N-2]`, `x[-1] = x[1]` exactly, and the
+inverse pass substitutes the same values. Settled by step 2c and re-derived by step 3; **0 points**.
+The "boundary replication" comment at `transform_97.wgsl:78` is about the image-edge clamp in the
+*overlap* load path, which does nothing on the default path (`overlap_pixels` is 0 and the plane is
+already a whole number of tiles).
+
+**The candidate pointed at the right phenomenon in the wrong place, and step 3 found it.** GNC does
+replicate its picture edge, and it costs **6.6 of the 27.1 points** — but it happens in
+`pad.wgsl`, on pixels, before the transform runs. See step 3 below.
 
 Full numbers in RESEARCH_LOG 2026-09-07 and `docs/decisions/0026`, `0027`. Also found on the way:
 **BUG-26** (fixed) — `--tile-size 1024` silently destroyed the image, and so did any tile size not
 divisible by `2^levels`.
+
+### Step 3 — **DONE 2026-09-08. The remaining ~6 points are padding, and 4.6 of them are recoverable.**
+
+**GNC pads every plane up to a whole multiple of `tile_size` with edge replication
+(`src/shaders/pad.wgsl`) and codes the padded plane.** A 1920x1080 frame is coded as **2048x1280 —
+26.4% more coefficients, 20.9% of the coded samples outside the picture**, and the decoder crops
+them. OpenJPEG in whole-picture mode codes 1920x1080 exactly. Both arms are divided by the
+*visible* pixel count, so the GNC arm has carried a tax the J2K arm does not, in every cross-codec
+figure since MEAS-9. RESEARCH_LOG had padding only as a **tile-size comparison** confound, which is
+a different question.
+
+**Canary first, because everything rests on one mechanism.** Rebuild the padded plane in Python,
+encode it as a picture in its own right: `bbb_1080p` 1920x1080 -> 2048x1280 gives **1 793 794 B
+against 1 793 794 B, identical** — and that is the figure this file already records for bbb at
+q=90 with `--abac`. Same for kristensara (554 346 B both ways).
+
+**Part 1's own control, measured rather than argued:** JPEG 2000 codes both crops exactly as given,
+so its `A` -> `D` BD-rate is the content term — **−0.13% to +0.02% RGB** across the four images,
+against GNC's +11.6% to +25.2% on the same pair. Under 1% of the effect.
+
+**Two methods, means agreeing to 0.02 points:**
+
+| | method | mean over the 4 ENT-4 images |
+|---|---|---|
+| projected from a content-controlled crop pair | GNC only, content fixed, quality held to 0.005 dB | **+6.60%** |
+| drop in the cross-codec gap, native against padding-free | GNC `--abac` vs J2K 9/7, one ladder | **+6.58 points** (26.76 -> 20.17 RGB, 51.09 -> 40.54 Y) |
+
+Per image, projected against measured: bbb 7.90/7.44, blue_sky 7.54/8.68, kristensara 2.65/2.25,
+touchdown 8.30/9.53. **kristensara is the discriminating case** — it pads only 720 -> 768 and reads
+a third of the 1080p figure in *both* methods, which a measurement of the crop's content change
+would not do.
+
+**Two thirds of it is a fill choice.** The padded samples are don't-care, so edge replication is a
+choice; the canary means alternatives can be priced with no code change. BD-rate against the
+shipped fill at unchanged visible quality (bbb q=90: 50.060 dB flat against 50.061 dB replicate):
+
+| fill | mean RGB | mean Y |
+|---|---|---|
+| replicate, then fade to one scalar over 8 px | **−4.62%** | −4.71% |
+| one scalar everywhere outside the picture | −4.60% | −4.72% |
+| the same fade over 32 px | −4.08% | −4.12% |
+| whole-point mirror of the picture into the padding | **+11.54%** | +11.48% |
+
+So **replication was already the better of the two textbook extensions** — mirroring copies real
+detail into the padding and costs 11.5 points more. What matters is being *flat in the direction of
+extension*, not smooth at the seam.
+
+**Not shipped here, and the reason is not in these numbers:** the decoder keeps the padded region
+in the reference buffer and motion compensation reads it for edge blocks, where edge replication is
+the standard choice. Filed as **PAD-1** with the inter gate named. The ceiling above a fill change
+is 6.6 points, not 27, and reaching it means partial border tiles.
+
+Harness `scripts/meas_intra1_padding.py`; full numbers in RESEARCH_LOG 2026-09-08 and
+`docs/decisions/0034`.
 
 ### Step 2 — the candidates as originally specified, cheapest first
 
@@ -4227,6 +4418,77 @@ comparison is confounded by padding. 1920x1080 pads to 2048x1280 at tile 256 and
 at tile 512 — 20% more coefficients — which reads as +6.1% rate for tile 512 that is entirely
 padding and reverses the sign of the real effect. Measure tile size on content that is a multiple
 of both sizes; `1024x512` centre crops are what INTRA-1 used.
+
+### PAD-1 — GNC codes its own tile padding, and 4.6% of intra rate is a fill choice (todo, **P1**)
+
+Filed 2026-09-08 by INTRA-1 step 3, which measured the tax and then measured how much of it a fill
+change returns. **−4.6% of intra rate at 1080p, at unchanged visible quality, from ~20 lines of
+`pad.wgsl` — gated on inter, which is unmeasured.** Decision `docs/decisions/0034`.
+
+**What is proven.** `src/shaders/pad.wgsl` edge-replicates every plane up to a whole multiple of
+`tile_size` and the codec then codes the padded plane. A 1920x1080 frame is coded as **2048x1280 —
+26.4% more coefficients, 20.9% of the coded samples outside the picture**, which the decoder crops
+and no metric ever sees.
+
+- **It is really coded**, and byte for byte: rebuild the padded plane in Python, encode it as a
+  picture in its own right, and bbb_1080p at q=90 with `--abac` gives **1 793 794 B against
+  1 793 794 B** — the same figure this file records for the production encode.
+- **It costs 6.60% of rate** (projected from a content-controlled crop pair, quality held to
+  0.005 dB) or **6.58 points** (drop in the cross-codec gap to J2K 9/7, native against
+  padding-free, on one ladder). Per image
+  2.65–8.30% projected, and it tracks the padding fraction: kristensara_720p pads only 720 -> 768
+  and reads a third of the 1080p figure. The content term is measured, not assumed: JPEG 2000 reads
+  **−0.13% to +0.02%** between the same two crops where GNC reads +11.6% to +25.2%.
+- **A fill change returns two thirds of it.** BD-rate against the shipped edge replication, on the
+  four ENT-4 stills at q=80–98 with `--abac`: replicate-then-fade-to-a-scalar over 8 px is
+  **−4.62% RGB / −4.71% Y**, a flat scalar is −4.60%, the same fade over 32 px is −4.08%, and a
+  whole-point mirror of the picture into the padding is **+11.54%** — so replication was already
+  the better of the two textbook extensions, and what matters is being flat in the *direction of
+  extension* rather than smooth at the seam.
+- **Visible quality does not move**: bbb at q=90 reads 50.060 dB under a flat fill against
+  50.061 dB under replication, so the step discontinuity a flat fill puts at the picture edge costs
+  less than the detail it saves.
+
+**Why it is not already done, and this is the whole content of the item.** The decoder keeps the
+padded region in the **reference buffer**, and motion compensation reads it for blocks at the frame
+edge — edge replication is the standard choice there precisely because it extends the picture
+plausibly. Nothing in the intra measurement says what a flat or faded fill does to inter
+prediction, and a change that pays 4.6% on stills and loses more than that on a P-chain is not a
+change. **So the gate is an inter measurement, not an intra one.**
+
+Three shapes, and they are not equivalent:
+
+1. **Change the fill unconditionally.** Cheapest to write, and it puts the whole risk on inter.
+   Needs the P-chain measurement first: ki=9 and all-intra, ≥3 sequences, at q=85 and q=92, on both
+   4:4:4 and 4:2:0, with **worst-frame** PSNR reported and not just the mean — that is the figure
+   the dead zone failed on (INTRA-2, up to −1.93 dB), and an edge-block prediction change has the
+   same shape of risk.
+2. **Change the fill on I-frames only.** Same split INTRA-2 arrived at, and for the same reason.
+   But an I-frame is also a reference, so this narrows the exposure rather than removing it.
+3. **Have the decoder re-replicate the picture edge into the padding after reconstruction.** The
+   encoder may then write whatever is cheapest while the reference stays MC-friendly, so the intra
+   win is collected with no inter risk at all. It changes the **decoding process**, so it needs a
+   bitstream version and old streams keep the old behaviour — a design decision, and the reason
+   this is a P1 item rather than a shader tweak.
+
+**Success criteria, stated in advance.** ≥3% of intra rate at q=90 on ≥3 stills (the measured
+figure is 4.6%, so this is a floor not a target), **and** no worst-frame regression above 0.3 dB on
+any of ≥3 sequences at ki=9 in either chroma format. If inter loses more than intra gains, shape 3
+or nothing.
+
+**Ceiling, so nobody over-invests.** A fill change tops out at ~4.6 of the 6.6 points. Recovering
+all 6.6 means **not padding at all** — partial border tiles the way JPEG 2000 has them — which
+touches tile origins, the tile grid, every shader deriving a position from `tile_size`, and the
+per-tile CRC and seek structures. Knowing the ceiling is 6.6 and not 27 is the useful part; the
+cost of that change is not estimated.
+
+**Canary.** The fill is a silent feature by construction — it writes pixels nobody looks at — so it
+needs one that does not depend on quality: `scripts/meas_intra1_padding.py --canary` must show the
+production encode and the Python-rebuilt padded plane **still byte-identical** under the new fill,
+which is the only thing that proves the shader and the model of it agree.
+
+**Harness already built:** `scripts/meas_intra1_padding.py` (`--canary`, `--part 3` for the fill
+sweep, `--project-from` for the projection with no GPU).
 
 ### INTRA-2 — apply the dead zone to I-frames only (todo, **P1**)
 

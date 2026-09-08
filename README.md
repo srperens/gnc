@@ -23,8 +23,13 @@ GNC is deliberately **broad**: intra and inter, 4:2:0 / 4:2:2 / 4:4:4 at 8 and 1
 - **Contribution quality: +90.5% BD-rate on PSNR** — about 1.9x the bitrate of x264 for the same luma quality, across three sequences.
 - **Colour: no advantage over x264, and the row that claimed one is withdrawn (CHROMA-2, 2026-09-07).** The control this README asked for has been run — give x264 the same allocation via `--chroma-qp-offset` and re-measure CIEDE2000 at the same total rate — and **x264 comes out ahead on all six runs** (three sequences x 4:2:0 and 4:4:4). On five of the six it does not need the offset at all: it leads on colour at offset 0 *while also leading luma by 4.1-7.4 dB*. The earlier row, which had GNC ahead on dE00, rested on a table measured an hour before CHROMA-1 changed q>=85 output and does not reproduce. GNC's colour is still good in absolute terms (dE00 0.54-0.92 mean, at or below the nominal JND) — it is just not better than x264's.
 - **Lossless: the best wavelet result in the field.** 1.99:1 at `q=100`, beating JPEG 2000 lossless by 10.8% and PNG by 7.8%; behind FFV1 by 27% and x264 `-qp 0` by 43%, both of which predict against the neighbouring pixel rather than across scales.
-- **Latency: ~80 ms round trip** intra or P-only, ~240 ms with the B-pyramid, 1080p on an Apple M5 Pro. On an NVIDIA RTX 4000 Ada over Vulkan the single-frame loop is **13.95 ms encode / 7.29 ms decode** (CANARY-1, 2026-09-07)
-  (MEAS-6). That is the low-latency-HEVC band, **not** the JPEG XS band — JPEG XS codes 1–32
+- **Latency: ~80 ms round trip** at the default configuration, 1080p on an Apple M5 Pro
+  (MEAS-6). The default codes P-only with **zero reordering delay**; the hierarchical B-pyramid,
+  which adds 8 frames of lookahead and takes the round trip to ~240 ms, has been **off by default
+  since 2026-09-06** and is opt-in via `GNC_B_PYRAMID=1`. This bullet described the pyramid as the
+  default until 2026-09-08. On an NVIDIA RTX 4000 Ada over Vulkan the single-frame loop is
+  **13.95 ms encode / 7.29 ms decode** (CANARY-1, 2026-09-07). At ~80 ms GNC sits **below** the
+  low-latency-HEVC band (EBU: 120–3060 ms) and well above the JPEG XS band — JPEG XS codes 1–32
   lines and EBU measures it under one frame. The 256-line tile floor is not reachable today: the
   pipeline processes whole frames, so the practical floor is one full frame whatever the tile
   size. See [`docs/POSITIONING.md`](docs/POSITIONING.md) for where that leaves GNC against the
@@ -44,7 +49,7 @@ GNC is deliberately **broad**: intra and inter, 4:2:0 / 4:2:2 / 4:4:4 at 8 and 1
   is the entropy coder: J2K's is EBCOT, and `--abac` closes **exactly half** of it (ENT-4, −16.0%
   of rate at bit-identical pixels on 24 of 24 rungs). With `--abac` GNC matches ProRes 4444 and is
   ahead of JPEG XS 4:4:4 on RGB PSNR, and stays behind both on luma — an entropy coder does not
-  move bits between planes. **Where the remaining 27% lives is now mostly accounted for** (INTRA-1, 2026-09-08, decisions `0026`–`0028`): entropy coding ≤7.5 points, chroma rate allocation 8.5 and *not* a coding deficiency, tiling 0.6% realisable, cross-tile allocation 0.95%, tile-boundary handling 0, and a dead zone worth ~3 — intra-only, because on video it costs up to 1.93 dB of worst-frame PSNR. **~6 points remain unexplained**, with no candidate left on the list.
+  move bits between planes. **Where the remaining 27% lives is now accounted for** (INTRA-1, 2026-09-08, decisions `0026`–`0028`, `0034`): entropy coding ≤7.5 points, chroma rate allocation 8.5 and *not* a coding deficiency, **tile-alignment padding 6.6 and also not a coding deficiency**, tiling 0.6% realisable, cross-tile allocation 0.95%, tile-boundary handling 0, and a dead zone worth ~3 — intra-only, because on video it costs up to 1.93 dB of worst-frame PSNR. **The padding is the one that changes how this table should be read:** GNC pads every plane to whole tiles and codes it, so a 1920x1080 frame is coded as 2048x1280 — 20.9% of the coded samples are outside the picture, and JPEG 2000 in whole-picture mode codes none. On padding-free content the same arms read **+20.2% RGB / +40.5% Y**. Two thirds of that tax is a fill choice worth **−4.6% of shipped intra rate** (PAD-1).
   The 4:2:2 arms — JPEG XS 4:2:2, ProRes 422 — cannot be BD-rate compared at all: chroma
   subsampling caps them at 39–45 dB RGB PSNR, below GNC's range, and at matched rate GNC beats
   both on luma and colour, which is what full chroma resolution buys rather than a coding result.

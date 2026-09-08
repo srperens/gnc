@@ -184,22 +184,39 @@ matters is *"visually lossless at 6:1, still clean at the third generation."*
 | low-latency HEVC | EBU measured **120 ms – 3060 ms** across real vendors |
 
 **Measured 2026-09-06 (MEAS-6):** GNC's codec round trip at 1080p on the Mac is **~80 ms** — about
-47 ms encode plus 35 ms decode. On top of that, **the default B-pyramid costs 8 frames of
-lookahead**: `ki=17` encodes in the order `0[I] 4[B] 8[P] 2[B] 6[B] 1[B] ...`, so frame 1 cannot
-be coded until frame 8 has arrived. At 50 fps that is **160 ms of structural delay before any
-coding runs**. P-only coding encodes in display order with **zero** reordering delay.
+47 ms encode plus 35 ms decode. The B-pyramid adds 8 frames of lookahead on top of that: it
+encodes in the order `0[I] 4[B] 8[P] 2[B] 6[B] 1[B] ...`, so frame 1 cannot be coded until frame 8
+has arrived — **160 ms of structural delay at 50 fps, before any coding runs.** P-only coding
+encodes in display order with **zero** reordering delay.
+
+**The pyramid is no longer the default, and this section said it was for two days
+(MEAS-6, 2026-09-08).** `quality_preset()` has vetoed it since 2026-09-06 —
+`b_pyramid: … .unwrap_or(false)`, `src/lib.rs:1021` — on exactly the two measurements quoted
+below. Verified on the current build: at the default `ki=9`, `benchmark-sequence -q 75` codes
+`2I+16P+0B` and prints `B-pyramid suppressed … zero reordering latency`, while `GNC_B_PYRAMID=1`
+codes `2I+2P+14B`. So the 240 ms row describes an **opt-in** configuration.
 
 | | latency |
 |---|---|
 | JPEG XS | 1–32 lines; EBU measured under one frame |
 | NDI High Bandwidth | under 16 ms |
-| **GNC, intra or P-only** | **~80 ms** |
-| **GNC, B-pyramid (current default)** | **~240 ms** |
+| **GNC, default (P-only, zero reordering)** | **~80 ms** |
 | low-latency HEVC | 120–3060 ms |
+| GNC, `GNC_B_PYRAMID=1` (opt-in) | ~240 ms |
 
-**GNC's default configuration sits in the low-latency-HEVC band, not the JPEG XS band.** Dropping
-the pyramid is worth roughly 3× — and BUG-5 independently measured that same pyramid as *costing*
-7–31% in rate at contribution quality on camera content. Two measurements, one conclusion.
+**GNC's default configuration is below the low-latency-HEVC band, not inside it** — ~80 ms against
+that band's 120 ms floor. It sits between NDI High Bandwidth and low-latency HEVC, and remains two
+orders of magnitude off JPEG XS, which is line-based by construction. The claim this section
+carried until 2026-09-08 — that the default sits *in* the HEVC band — was true when written and
+was invalidated by the config change made the same day.
+
+**One half of that is exact and the other is not.** The reordering delay is structural: it is 0
+frames or 8, read from the encoder's own frame-type output, and no machine load can move it. The
+~80 ms coding time is a 2026-09-06 measurement on a **non-idle** machine, labelled M1 when it was
+in fact the M5 Pro (BUG-29). It is a first bound, and re-taking it on an idle machine is still
+owed. Dropping the pyramid is worth roughly 3x on latency — and BUG-5 independently measured that
+same pyramid as *costing* 7–31% in rate at contribution quality on camera content. Two
+measurements, one conclusion, and the default now follows it.
 
 Note also that the often-quoted ~256-line tile floor is not currently reachable: the pipeline
 processes whole frames, so the practical floor is one full frame regardless of tile size. Getting

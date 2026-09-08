@@ -1064,7 +1064,12 @@ pub fn quality_preset(q: u32) -> CodecConfig {
         // directly for the contribution use case (docs/POSITIONING.md).
         //
         // Set GNC_B_PYRAMID=1 to restore it — worth it on animation and at low bitrate.
-        b_pyramid: std::env::var("GNC_B_PYRAMID").map(|v| v == "1").unwrap_or(false),
+        //
+        // The policy itself lives in `b_pyramid_enabled()` rather than inline here, because
+        // being inline here is exactly how BUG-37 happened: this was the *only* place it was
+        // applied, so every CLI path that did not go through a quality preset silently got
+        // `CodecConfig::default()`'s opposite answer.
+        b_pyramid: b_pyramid_enabled(),
         ..Default::default()
     };
     // The DWT runs per tile, so the tile size, not the image size, sets the ceiling. Record the
@@ -1268,8 +1273,84 @@ pub fn decode_order(frames: &[CompressedFrame]) -> Vec<usize> {
 }
 
 /// One line describing an adapter: name, backend and what kind of device it is.
+/// Whether the hierarchical B-pyramid is permitted, as GNC *ships* it: off, unless
+/// `GNC_B_PYRAMID=1`.
+///
+/// This is deliberately a function and not a constant on [`CodecConfig`]. `CodecConfig::default()`
+/// answers `true` — "do not veto" — because a library caller constructing a config directly is
+/// asking for the historical behaviour, and because `encoder::pipeline_tests` builds a `Default`
+/// config specifically to exercise the B-frame path. Flipping that default would leave those tests
+/// green while silently testing P-only, which is worse than the bug it would close.
+///
+/// So there are legitimately two answers, and the defect (BUG-37) was that only one caller knew
+/// the shipped one. Every entry point that represents *GNC as configured for users* — the quality
+/// presets and [`manual_config`] — must ask this function; nothing should re-read the variable.
+///
+/// Off by default on two independent measurements from 2026-09-06: the pyramid costs 7–31% in rate
+/// at contribution quality on camera content (BUG-5), and 8 frames of reordering — 160 ms at
+/// 50 fps — before any coding runs (MEAS-6, `docs/decisions/0033`). It *wins* 34–39% on animation,
+/// so it is kept as an opt-in rather than deleted.
+pub fn b_pyramid_enabled() -> bool {
+    std::env::var("GNC_B_PYRAMID").map(|v| v == "1").unwrap_or(false)
+}
+
+/// GNC's shipped configuration at an explicit `qstep`, for callers that do not select a quality
+/// preset.
+///
+/// The counterpart to [`quality_preset`]: same shipped policy, quantiser chosen by hand. It exists
+/// so that "the user did not pass `-q`" cannot mean "silently get different coding tools", which
+/// is what BUG-37 was — `benchmark-sequence -k 9` with no `-q` coded `2I+2P+14B` where the same
+/// command with `-q 75` coded `2I+16P+0B`.
+pub fn manual_config(qstep: f32) -> CodecConfig {
+    CodecConfig {
+        quantization_step: qstep,
+        b_pyramid: b_pyramid_enabled(),
+        ..Default::default()
+    }
+}
+
 pub fn describe_adapter(info: &wgpu::AdapterInfo) -> String {
     format!("{} [{:?}, {:?}]", info.name, info.backend, info.device_type)
+}
+
+/// A temp-file path that no other concurrently running GNC process will pick.
+///
+/// Eight sessions share this machine and therefore one `TMPDIR` (COORDINATION.md), so a *fixed*
+/// temp filename is a cross-session data race, not a tidiness question: two `--vmaf` runs of the
+/// same subcommand write the same reference/distorted Y4M and each scores whatever frames won the
+/// race. It fails silently and plausibly — no error, no warning, a believable score.
+///
+/// Measured 2026-09-08 (BUG-36), `benchmark-sequence --vmaf`, 9 frames, q=75, two sequences whose
+/// serial scores are bit-stable at 97.39 and 95.91:
+///
+/// | run | old_town_cross | bbb_extended |
+/// |---|---|---|
+/// | serial (x2) | 97.39 | 95.91 |
+/// | concurrent x2 | 97.39 | **97.19** (+1.28) |
+/// | concurrent x1 | **96.37** (-1.02) | 95.91 |
+///
+/// One of the two is wrong in every concurrent run, in either direction, by 2-2.5x the
+/// >0.5-point VMAF regression threshold that CLAUDE.md calls a BLOCK.
+///
+/// The pid is enough: two live processes cannot share one. On wasm there is no process id and no
+/// second process to collide with, so the name is returned unchanged.
+pub fn session_temp_path(name: &str) -> std::path::PathBuf {
+    let suffix = process_suffix();
+    let stamped = match name.rsplit_once('.') {
+        Some((stem, ext)) => format!("{stem}{suffix}.{ext}"),
+        None => format!("{name}{suffix}"),
+    };
+    std::env::temp_dir().join(stamped)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn process_suffix() -> String {
+    format!("_p{}", std::process::id())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn process_suffix() -> String {
+    String::new()
 }
 
 /// Every adapter wgpu can see, across every backend. Used by the `gpu-info`

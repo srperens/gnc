@@ -4,6 +4,7 @@ pub mod bench;
 pub mod decoder;
 pub mod encoder;
 pub mod experiments;
+pub mod fingerprint;
 pub mod format;
 pub mod gpu_util;
 pub mod image_util;
@@ -969,6 +970,15 @@ pub fn lossless_sibling(cfg: &CodecConfig) -> CodecConfig {
         EntropyCoder::Rans => EntropyCoder::Rice,
         other => other,
     };
+    // **BUG-46: the chroma format is a "how", not a "how much".** Without this the sibling was
+    // always `quality_preset(100)`'s 4:4:4, so on subsampled input RATE-2 compared a 4:2:0 wavelet
+    // encode against a **4:4:4** lossless one — three times the chroma samples — and reported the
+    // same candidate size for both requests (3 257 157 B on bbb at q=97, whether the caller asked
+    // for 4:4:4 or 4:2:0). The fallback could therefore essentially never fire off 4:4:4, and if
+    // it ever had, the output would have carried a chroma format the caller did not ask for.
+    // "Bit-exact" here means exact in the domain the caller chose to code in, which is what makes
+    // the two candidates comparable at all.
+    out.chroma_format = cfg.chroma_format;
     out.gpu_entropy_encode = cfg.gpu_entropy_encode;
     out.abac_coder = cfg.abac_coder;
     out.abac_code_block = cfg.abac_code_block;
@@ -1314,6 +1324,29 @@ pub fn quality_preset(q: u32) -> CodecConfig {
         cfg.subband_weights = SubbandWeights::uniform(0);
         cfg.adaptive_quantization = false;
         cfg.cfl_enabled = false;
+        // BUG-48: PAD-1's decay fill is a *wavelet* lever and it reverses sign under MED.
+        //
+        // `0039` fades the padding flat so its detail subbands go to zero, worth −4.63% RGB on
+        // four stills at q=80..94. MED has no subbands: it predicts each pixel from its left and
+        // upper neighbours, so a fade is something the residual has to *code* across, where plain
+        // edge replication predicts exactly. Same four stills, same binary, both arms via
+        // `GNC_PAD_FILL`, at q=100:
+        //
+        //   |                  | decay (was shipped) | replicate |         |
+        //   |------------------|--------------------:|----------:|--------:|
+        //   | bbb_1080p        |           3 257 157 | 3 235 737 | −0.657% |
+        //   | blue_sky_1080p   |           2 166 911 | 2 153 118 | −0.637% |
+        //   | kristensara_720p |             931 263 |   927 600 | −0.393% |
+        //   | touchdown_1080p  |           2 627 186 | 2 610 478 | −0.636% |
+        //
+        // **It belongs here and not on `q == 100`**, which is where the item filing put it: with
+        // `GNC_MED=0` the same q=100 is a lossless *wavelet* encode, and there decay is worth
+        // **−4.64%** on the same four stills — PAD-1's figure, reproduced at the top of the
+        // ladder. Keying this on the quality would have handed that arm a 4.6% regression.
+        //
+        // Pixels are untouched either way: the fill writes padding outside the visible area, and
+        // `pad_fill_mode` notes it is an encoder-side choice with no bitstream implication.
+        cfg.pad_fill_decay = false;
         eprintln!("GNC: MED prediction path active (LOSSLESS-1) — wavelet bypassed");
     }
     // A lossless preset must not carry a quantiser weight above 1.0 (BUG-15). q=100 reaches this

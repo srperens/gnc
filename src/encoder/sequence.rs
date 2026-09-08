@@ -1503,13 +1503,14 @@ impl EncoderPipeline {
         // Refused when a bitrate target is set: choosing lossless would blow it silently.
         // `GNC_LOSSLESS_SEQUENCE_FALLBACK=0` turns it off, which is the measurement arm.
         //
-        // **4:4:4 only, deliberately, until BUG-46 is fixed.** The trigger reads a size that
-        // `encode` measured for RATE-2, and `lossless_sibling` builds its candidate from
-        // `quality_preset(100)` without carrying the caller's chroma format — so on subsampled
-        // input that number is a *4:4:4* encode (3 257 157 B on bbb whether the request is 4:4:4
-        // or 4:2:0). The trigger would compare against an arm three times too large in chroma and
-        // never fire. It already fails closed, but by accident; this gate makes it deliberate,
-        // and it comes off with BUG-46.
+        // **4:4:4 only, deliberately, and the obstacle is BUG-49 rather than the trigger.**
+        // BUG-46 made `lossless_sibling` carry the caller's chroma format, so the trigger's number
+        // is honest now — but on subsampled chroma `q=100` is **not lossless even in luma**
+        // (blue_sky 4:2:0: y 51.16, u 43.23, against q=95's y 53.09, u 56.73), so the bit-exact
+        // arm is 8.5-13.1 dB worse in RGB than the arm it would replace. There is no two-axis win
+        // to collect until that is fixed, which is why `encode` refuses the same comparison for
+        // stills (`0078`). This gate comes off with **BUG-49**, and the sequence sweep at 4:2:2
+        // and 4:2:0 is part of that item, not this one.
         let sequence_fallback = config.lossless_fallback
             && !config.is_lossless()
             && rate_ctrl.is_none()

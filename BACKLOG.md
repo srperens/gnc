@@ -2227,7 +2227,37 @@ Every edit is in `#[cfg(test)]` code or an integration test target, checked file
 each file's `#[cfg(test)]` marker, so the shipped build is unchanged by construction and no
 figure in BASELINE moves.
 
-### MEAS-11 — BASELINE's `--abac` BD-rate row is conservative after ENT-9 (todo, P3)
+### MEAS-11 — BASELINE's `--abac` BD-rate row is conservative after ENT-9 (**DONE 2026-09-08 — +66.0% → +61.0%**)
+
+**Answered, pinned to `a0880c7`.** `--abac` mean **+66.0% → +61.0%** (1.66x → **1.61x**):
+bbb_extended +91.8%→+89.0%, old_town_cross +53.1%→+47.4%, crowd_run +53.0%→+46.6%. **Rice
+reproduced exactly on all three** (+128.5% / +70.2% / +68.8%, mean +89.2%, overlap bands
+included), which both confirms the attribution and shows RATE-3, BUG-39, INTER-2 and LOSSLESS-2
+did not move this ladder.
+
+**The canary is stronger than BASELINE recorded it:** the Rice-vs-abac PSNR-Y delta is
+**+0.0000 dB at all 12 rungs** — bit-identical, not "identical to two decimals".
+
+**And the bigger finding: ENT-9 flattened the decay.** ENT-3's conclusion was that abac's saving
+over Rice collapses with quality (crowd_run −12.2% at q=85 → −3.7% at q=99, 8.5 points). It is now
+**−14.10% → −11.78%, 2.3 points.** `0074` helps most at high q, which is exactly where the old
+decay bit. That decay was the argument against making abac the default at contribution quality, so
+the argument is much weaker than recorded.
+
+**Both rows are conservative again, and not because of abac. LOSSLESS-3 (`ab3e2d2`) landed after
+the pin** — camera sequences bit-exact above q=95, −5.95% to −33.58% — and this ladder has rungs at
+q=96 and q=99. It is coder-independent so the abac-vs-Rice comparison holds, but **this is the
+second consecutive re-take invalidated by a landing during it**, which is a pattern: with eight
+sessions merging, a hand-run four-rung ladder cannot describe "current HEAD". BASELINE now quotes
+both rows with their commit instead. **Do not re-take this chasing HEAD.**
+
+Two corrections to MEAS-10's record, found in setup: its source frame counts are wrong (all three
+sequences hold 24, not 24/200/32 — nothing invalidated, and the exact Rice reproduction proves the
+first 17 frames are unchanged; inputs are now hashed in RESEARCH_LOG so the next run can verify
+identity rather than trust a count), and `meas1_vs_h264.py` needs `.venv/bin/python` because numpy
+is not in the system interpreter. Full numbers in RESEARCH_LOG 2026-09-08.
+
+Original filing follows.
 
 BASELINE's contribution ladder carries two rows against x264 at matched PSNR-Y — Rice at
 **+89.2%** mean and **`--abac` at +66.0%** ("1.9x the bitrate of H.264 … `--abac` is 1.66x"),
@@ -3147,7 +3177,58 @@ frequency 1 everywhere the alphabet is uniform and the depth is 6). Both change 
 codebook, and therefore its bitstream, wherever clamping currently occurs. Not done for a parked
 coder.
 
-### COORD-6 — `main` moves under an in-flight measurement and nothing says so (todo, P4)
+### COORD-6 — `main` moves under an in-flight measurement and nothing says so (**ANSWERED 2026-09-08 — a mechanism exists and ships: `gnc fingerprint`**)
+
+**ANSWERED with a mechanism, not with prose. `gnc fingerprint`, `docs/decisions/0075`.**
+
+```
+$ gnc fingerprint
+codec-fingerprint v1 abf86a50  (10 configurations)
+```
+
+It encodes a pinned, versioned 10-configuration matrix and digests the bytes, so it answers *would
+this binary produce different output?* by running the encoder — **0.52 s**, against the minutes a
+real sweep costs. Two numbers carrying the same fingerprint are comparable; two carrying different
+ones are not. Print it beside the numbers (instances 2, 3, 5, 6, 7 of COORD-4's table) and take it
+before *and* after a sweep so a mid-run rebuild is a refusal (instance 4). `scripts/fingerprint.py`
+is the harness helper; `scripts/meas_rate4.py` and `scripts/rate4_ref_source_gate.py` do both
+already; a bare shell loop needs no helper and COORDINATION shows the two lines.
+
+**Each difficulty this entry listed, answered:**
+
+- *"the only honest test is running the thing twice"* — **yes, and that is what this is.** The trick
+  is running it on a 384×384 matrix instead of a 12-point 1080p sweep.
+- *"a `src/`-touched proxy over-warns"* — it does, and so does hashing the binary. Measured while
+  building this: a whole new module moved `shasum` from `94f25712…` to `333e2c62…` and left the
+  fingerprint unchanged, because output had not moved. It is also **silent** under
+  `GNC_REF_FROM_SOURCE=0` (byte-identical by measurement, `0072`) and **fires** under
+  `GNC_PAD_FILL`, `GNC_DEAD_ZONE` and `GNC_REF_DEBLOCK`.
+- *"it cannot live in `scripts/claim`"* — it does not. It is a CLI subcommand and two lines in a
+  harness.
+- *"the measurement is usually a shell loop"* — one `grep -o 'v1 [0-9a-f]*'` before and after.
+
+**A seventh instance arrived while this sat in the queue**, after COORD-4's prose was consolidated
+onto `main`: LOSSLESS-3's lossy columns (`0070`) hold bit-exact I-frames, which BUG-47 (`0072`)
+moved by ~1.8 points hours later while its q=100 column stayed put. The tally is now **5 of 7 for
+the `main`-moved-under-a-table shape** against 1 of 7 for the cross-session shape COORD-4 refused a
+tool for.
+
+**It was caught before publication, by people rather than by a mechanism, and that is the half that
+shapes this answer.** The RATE-4 session noticed BUG-47 moved the sibling's bytes, the RATE-3
+session relayed it, and LOSSLESS-3's owner re-took the sweep on `d10e414` — nothing was published
+wrong, and the re-take showed the stakes were not a stale margin: bbb was the cell predicted to flip
+*toward* domination and moved the other way, −1.9% as filed to ±0.00% with the trigger not firing.
+So: **the class recurred, and the prose plus one attentive peer was enough that once.** The
+mechanism ships on price — half a second — as a **backstop for that chain, not a replacement for
+it**, and the case for closing answered-no was real rather than a straw man.
+
+**What it does not do**, because a check believed past its range is worse than none: it cannot say
+*why* two fingerprints differ; it says nothing about a path outside its matrix (entropy coder,
+chroma format, the lossless boundary, inter — not exhaustive, and the output says so every time);
+it protects only numbers that carry it; and the matrix is **pinned**, so changing it is a decision
+record and not a commit.
+
+**Original filing follows.**
 
 **Filed as an open question, not as work, which is the whole point of the heading.** COORD-4
 counted six instances of a number being read against the wrong tree and refused the tool it was
@@ -3183,7 +3264,7 @@ someone reads this, close it as answered-no and cite COORD-4's table.
 
 **The doubt attached to this item at filing was the right one, and the measurement it asked for
 settles it — but not by rarity.** The class is the most frequent measurement failure in the repo
-right now: **six instances**, five of them in the two days of eight-session concurrency.
+right now: **seven instances** (a seventh was found by COORD-6 — see below), six of them in the two days of eight-session concurrency.
 
 | # | instance | shape | caught by a claim-time stamp? |
 |---|---|---|---|
@@ -3193,12 +3274,20 @@ right now: **six instances**, five of them in the two days of eight-session conc
 | 4 | the build-artefact near-miss — rebuild during a 36-run sweep | own `target/` | no |
 | 5 | ARCH-3 / BUG-18 (2026-09-07) — `main` moved mid-item | `main` moved | no |
 | 6 | quarter-pel #15 (2026-03-09) — "−0.63 dB vs stale baseline `617d8e6`" | stale record | no |
+| 7 | LOSSLESS-3 / `0070` (2026-09-08) — lossy columns hold bit-exact I-frames that BUG-47 moved hours later | `main` moved, between filing and reading | no |
 
 **Both candidate shapes are refused on these numbers.** `claim measured` (stamp `HEAD` + dirty bit)
-would have caught **1 of 6** — only the cross-session one. Printing each claim's commit in
-`claim list` would have caught **0 of 6**: a claim's commit is not a measurement's commit, and
+would have caught **1 of 7** — only the cross-session one. Printing each claim's commit in
+`claim list` would have caught **0 of 7**: a claim's commit is not a measurement's commit, and
 instance 1's difference was uncommitted anyway. Five of six are one session's own table decaying
 because `main` moved under it, which no claim-time stamp can see.
+
+**Superseded in its conclusion by COORD-6 (`docs/decisions/0075`), which found the mechanism this
+item could not.** COORD-4 was right to refuse *both tools it priced* and right that the failure is
+frequent; it was wrong that consolidation was the answer, and instance 7 above is the proof — it
+happened after the consolidated section was on `main`. The mechanism is `gnc fingerprint`: encode a
+pinned matrix, digest the bytes, 0.52 s. It is not a proxy for an output change, it *is* the output
+change, which is the property both tools priced here lacked.
 
 **What the evidence supports instead, and it is shipped:** the rule was already written **four
 times on one afternoon, by four sessions, under four names** — this entry's own COORDINATION
@@ -4706,7 +4795,51 @@ peer's number is not the same as reading their tree.
 frame's reference is *not* simply its colour-converted source, because that buffer is at a
 different stage and scale. RATE-4 records the refutation.
 
-### BUG-46 — `lossless_sibling` does not carry the caller's chroma format, so RATE-2 compares 4:2:0 against 4:4:4 (todo, **P3**)
+### BUG-49 — `q=100` on subsampled chroma is not lossless, and not even in luma (todo, **P1**)
+
+Found 2026-09-08 by BUG-46, which needed the bit-exact candidate at 4:2:2 / 4:2:0 to be
+equivalent-quality and measured that it is not. Per-plane PSNR against the source, `gnc encode`
+→ `gnc decode`, ffmpeg `psnr` over `yuv444p`:
+
+| still | format | q | y | u | v |
+|---|---|---|---|---|---|
+| blue_sky | 4:2:0 | **100** | **51.16** | 43.23 | 44.74 |
+| blue_sky | 4:2:0 | 95 | 53.09 | 56.73 | 57.88 |
+| kristensara | 4:2:2 | **100** | **51.04** | 43.63 | 43.54 |
+| kristensara | 4:2:0 | **100** | **51.85** | 45.76 | 44.31 |
+| bbb | 4:2:2 | **100** | **47.34** | 37.10 | 38.71 |
+| bbb | 4:2:0 | **100** | **47.66** | 37.43 | 39.30 |
+
+**4:4:4 at q=100 is exact — PSNR `inf`.** At 4:2:2 and 4:2:0 it is not, and the plane that damns
+it is **luma**: subsampling does not touch luma, so a lossless configuration must return it
+bit-exact. It returns 47–52 dB. Worse, q=95 at the same format has *better* luma than q=100
+(53.09 against 51.16 on blue_sky 4:2:0), which no quantiser story explains.
+
+**In RGB the whole-image figures invert too.** q=100 reads **below** q=95 at the same format on
+every image measured: blue_sky 4:2:2 38.90 vs 52.05, 4:2:0 40.38 vs 51.60; kristensara 4:2:2 40.19
+vs 51.72; touchdown 4:2:2 40.72 vs 51.75; bbb 4:2:0 34.73 vs 38.56. And **4:2:2 is worse than
+4:2:0** on three of four images (blue_sky 38.90 vs 40.38, kristensara 40.19 vs 41.59, bbb 34.30 vs
+34.73), which is backwards: 4:2:2 keeps twice the chroma.
+
+**Why it matters beyond neatness.** It is the reason BUG-46's fix had to be refused rather than
+shipped (`0078`), it scopes every RATE-2 / RATE-3 / LOSSLESS-3 figure to 4:4:4, and "lossless" is a
+claim this codec makes in GOALS §1 — at 4:2:2 and 4:2:0 it is currently false in the one plane
+subsampling leaves alone.
+
+**Where to look first**, in the order the evidence suggests: the luma damage is the surprising half
+and it is *format-dependent*, so the fault is likely in how the MED path handles a plane geometry
+it only sees when chroma is subsampled — `chroma_padded_width()` / `chroma_padded_height()` and the
+tile grid derived from them, which is exactly the class BUG-11 and BUG-14 were (stream mapping
+against plane geometry). The 4:2:2-worse-than-4:2:0 inversion is the sharpest clue: 4:2:2 halves
+width only, so anything that assumes both dimensions shift together will read wrong there and
+"right" at 4:2:0.
+
+**Success criterion:** `q=100` at 4:2:2 and 4:2:0 returns **luma bit-exact** (max |diff| 0 on Y,
+verified outside the harness) on ≥3 stills and ≥1 sequence, chroma within the subsampling bound,
+and 4:2:2 never worse than 4:2:0. Then re-run BUG-46's sweep: the refusal in `encode` comes off
+with the numbers that justified it.
+
+### BUG-46 — `lossless_sibling` did not carry the caller's chroma format (**FIXED 2026-09-08**, and the fix had to be refused)
 
 Found 2026-09-08 by LOSSLESS-3. `lossless_sibling` builds from `quality_preset(100)`, which is
 4:4:4, and copies `entropy_coder`, `gpu_entropy_encode`, the abac knobs, `tile_size` and (since
@@ -4728,13 +4861,85 @@ did not ask for.
 coded (subsampled) domain, which is what the caller asked for by choosing 4:2:0, and the same
 two-axis win RATE-2 relies on: fewer bytes *and* exact coded samples.
 
-**Why it is P3 rather than a one-line fix.** The line is `out.chroma_format = cfg.chroma_format;`,
-but it turns the fallback on for a whole class of input that has never been measured, and RATE-2's
-decision (`0036`) is stated over 4:4:4 stills. It needs the still sweep re-run at 4:2:2 and 4:2:0
-before the default moves. **LOSSLESS-3 is gated to 4:4:4 for this reason** and the gate comes off
-here.
+**FIXED, and then the fallback it unlocked had to be refused.** `out.chroma_format =
+cfg.chroma_format` is in, so the candidate is honest — and `encode` now refuses the comparison on
+subsampled chroma outright, because the sweep the filing asked for says the two candidates are not
+the same picture there. Decision `0078`.
 
-### BUG-48 — `quality_preset(100)` keeps PAD-1's decay padding fill, which is a loss at q=100 (todo, **P3**)
+**What the sweep found: `q=100` on subsampled chroma is not lossless, and not even in luma.** Per
+plane against the source, q=100:
+
+| still | format | y | u | v | q=95 at the same format |
+|---|---|---|---|---|---|
+| blue_sky | 4:2:0 | **51.16** | 43.23 | 44.74 | y 53.09, u 56.73, v 57.88 |
+| kristensara | 4:2:2 | **51.04** | 43.63 | 43.54 | — |
+| bbb | 4:2:2 | **47.34** | 37.10 | 38.71 | — |
+
+4:4:4 at q=100 is exact (PSNR inf). Luma is not subsampled at 4:2:2 or 4:2:0, so a lossless
+configuration must reproduce it exactly, and it does not — that is **BUG-49**, filed. In RGB the
+candidate is **8.5–13.1 dB worse** than the lossy arm at the same request, so with the one-line fix
+and no refusal, bbb at 4:2:0 q=99 took the bit-exact file for **−2.70% of rate and −3.9 dB**. That
+is a rate/quality trade, and RATE-2 exists precisely because it is *not* one.
+
+**So the resolution is: honest candidate, explicit refusal.** Before this fix the same input was
+refused by accident — the candidate was always 4:4:4 and could never win. Now the sibling says what
+it is and `encode` says why it will not compare. **Byte-identical to `main` on all six checked
+points** (bbb, 4:4:4 / 4:2:2 / 4:2:0 at q=97 and q=99), so nothing shipped moves. The refusal
+carries a canary naming the format and BUG-49.
+
+**Load-bearing beyond this item, and it was not flagged before:** RATE-3's mean **−4.28% → −6.09%**
+and everything RATE-2 claims about q=95..99 are **4:4:4-only figures**. Not "unmeasured elsewhere" —
+the mechanism could not fire elsewhere. Anyone reading `0036`, `0044` or RATE-3 should read that
+scope in. LOSSLESS-3's own 4:4:4 gate stands for the same reason and now cites BUG-49 rather than
+this item.
+
+### BUG-48 — the padding fill is a wavelet lever, not a quality one (**FIXED 2026-09-08**)
+
+**Fixed, and the fix is not where the filing put it.** `docs/decisions/0077`. `pad_fill_decay` is
+now cleared **inside `quality_preset`'s MED branch**, so the fade-to-flat fill is off exactly when
+the transform is MED. Four stills at q=100: **−0.393% to −0.658%** (bbb 3 257 157 → 3 235 737).
+
+**The filing's own one-liner (`pad_fill_decay: q != 100`) would have cost 4.6%.** q=100 is not
+always MED: with `GNC_MED=0` it is a lossless *wavelet* encode, and there the fill is worth
+**−4.64%** on the same four stills — `0039`'s −4.63%, reproduced at the top of the ladder. The
+fill is a property of what codes the padding, not of how hard the picture is squeezed.
+
+**Gate:** `scripts/gate_bug48.py`, 40 encodes across two binaries. Only the four q=100 MED cells
+move; q=85/90/95/97/99, the `GNC_MED=0` arm, and 8 sequence points are byte-identical.
+
+**Canary:** `GNC_DIAGNOSTICS=1` — q=100 reads `pad fill = replicate`, q=100 `GNC_MED=0` reads
+`decay`, q=90 reads `decay`.
+
+**Left on the table, filed as BUG-50:** the still path's bit-exact sibling at q=95..99 is a MED
+encode that still carries decay padding, and it is shipped output on 3 of 4 stills at q=97/99.
+
+### BUG-50 — the still path's bit-exact sibling is a MED encode with wavelet padding (todo, P3)
+
+**Worth 0.4–0.7% of shipped bytes, on rungs where the sibling is what ships.** BUG-48 (`0077`)
+established that the decay padding fill reverses sign under MED. `lossless_sibling` is a MED
+encode by construction — and on the still path it inherits the *caller's* `pad_fill_decay`, which
+`quality_preset(95..99)` sets to `true`. So the bit-exact candidate is coded with the fill that
+costs it 0.4–0.7%.
+
+**This is not hypothetical.** In BUG-48's own gate table, q=97 and q=99 emit byte-identical files
+on blue_sky (2 166 911), kristensara (931 263) and touchdown (2 627 186) — that is the sibling
+winning and being kept, at both rungs, on 3 of 4 stills. Those are the files that would shrink.
+
+**Why it was not done in BUG-48, and what to check first.** `0072` (BUG-47) *deliberately* made
+`lossless_sibling` inherit the caller's fill, so that the two candidates leave the **same** padded
+source in `input_buf` — with the measurement that forcing them to agree makes 24 of 24 sequence
+points byte-identical, where 10 moved without it. Clearing the fill on the still path breaks that
+agreement again, in the still direction. Nothing in `0072` says the invariant is *only* about
+sequences, and `encode()` is shared between both paths, so **re-measure `0072`'s 24 points before
+believing the still path is independent** — that is the whole item.
+
+The sequence path needs nothing: `0039` clears the flag for referenced I-frames and LOSSLESS-3's
+all-intra arm clears it explicitly, citing BUG-48.
+
+**Success criterion:** the four stills at q=95..99 no larger on any point, `0072`'s 24 sequence
+points still byte-identical, and the q=97/99 sibling files smaller by the predicted 0.4–0.7%.
+
+### BUG-48 — `quality_preset(100)` keeps PAD-1's decay padding fill, which is a loss at q=100 (original filing)
 
 Found 2026-09-08 by LOSSLESS-3, measured on two stills against `GNC_PAD_FILL=replicate`:
 
@@ -7043,9 +7248,10 @@ plausible wrong image, the failure `abac_tile.rs` warns about. Every other coder
 q=95, −14.3% to −20.4% at q=90. **That supersedes `0045`'s "under −4.5% at q=99"** (P bytes now
 −12.1% / −15.8% / −12.3%) — but attribute it carefully: ENT-9's own controlled contribution is the
 table above, and the remaining distance is everything else that landed between plus a different
-denominator. **BASELINE's `--abac` row and its 1.66x are now conservative; re-take filed as
-MEAS-11**, deliberately not run here because today's `main` would credit RATE-3, BUG-39 and
-LOSSLESS-2 to ENT-9 (COORD-6's failure, same afternoon).
+denominator. **BASELINE's `--abac` row and its 1.66x were conservative; MEAS-11 re-took them on
+2026-09-08 and the row is now +61.0% / 1.61x** at `a0880c7`, with Rice reproducing exactly on all
+three sequences — so the attribution held and the caution here was justified. ENT-9's share of the
+five-point move is the controlled table above; the rest is the different denominator.
 
 **Candidate B (sign contexts) is still unspent and is now cheaper to re-price**, since A moved the
 denominator. It was below the gate at −0.57% to −1.29%; re-price before building.

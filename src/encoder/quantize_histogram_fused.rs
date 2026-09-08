@@ -31,7 +31,7 @@ pub struct FusedQuantizeHistogramParams {
     pub tiles_x: u32,
     pub per_subband: u32,
     pub num_levels: u32,
-    pub flags: u32, // bit 0: disable ZRL
+    pub flags: u32, // bit 0: disable ZRL, bit 1: enable the sparse dead-zone expansion (BUG-16)
 
     // Quantize params
     pub total_count: u32,

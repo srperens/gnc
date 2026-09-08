@@ -4,6 +4,87 @@
 
 ---
 
+## BUG-16 — the fused quantiser had a dead zone the other two did not, and it priced out at +1% (2026-09-08)
+
+**Hypothesis, taken from the entry's own guess and confirmed:** Rice's GPU and CPU encode paths
+disagreed on the *coefficients*, not the coding, and the difference was a dead-zone or rounding
+divergence between the fused quantiser and the separate one.
+
+**Cause.** Phase 1.5 of `quantize_histogram_fused.wgsl` re-quantised the remaining ±1 values to
+zero in non-LL subband groups already ≥95% zero, up to a 1.25× dead-zone expansion. `dz_mul`
+appears seven times in that shader and **zero times in `quantize.wgsl`** or the CPU quantiser. So
+which coefficients an encode produced depended on which quantiser ran, and that depended on
+`use_fused_qh`.
+
+### All three rows of BUG-16's table are that one feature
+
+| | recorded | now |
+|---|---|---|
+| bbb q=25 GPU | 35.51 dB, 415 544 B | **35.63 dB, 425 944 B** |
+| bbb q=25 CPU | 35.63 dB, 610 264 B | unchanged |
+| 4:2:2 q=75, GPU vs CPU pixels | max abs diff 1.69 | **max abs diff 0**, 0 of 6 220 800 pixels differ |
+
+The old GPU row reproduces exactly with `GNC_SPARSE_DZ=1`, so nothing about the original
+measurement was wrong. **The remaining 43% size gap is expected**: the CPU reference Rice coder
+lacks per-stream *k* and the checkerboard *k*-context, which is what the entry already said about
+its q=90 row. Agreement on the *picture* was the thing to fix, and it is now three decimals.
+
+### Pricing it needed the same coder in both arms
+
+The entry's framing — the GPU path emits a smaller *and* worse file, so it is discarding something
+— cannot be settled against the CPU arm, because that arm is independently worse. A new `flags`
+bit made a GPU-versus-GPU comparison possible. Three stills, q=15/25/30:
+
+| image | rate | PSNR | BD-rate of the feature |
+|---|---|---|---|
+| bbb_1080p | −2.17% to −3.27% | −0.101 to −0.152 dB | **−0.35%** |
+| blue_sky_1080p | −2.18% to −4.12% | −0.094 to −0.214 dB | **+4.20%** |
+| kristensara_720p | −2.47% to −3.97% | −0.123 to −0.156 dB | **−0.79%** |
+
+**Mean +1.02%, and the sign disagrees across content.** Three points per arm is a thin ladder and
+`blue_sky` dominates the mean, so the honest reading is *neutral*, not *harmful* — either way it
+does not pay for having two different quantisers.
+
+### Decision: off by default, kept behind a flag
+
+Rejected **deleting** it (three quality points is thin evidence against a deliberate feature, and
+the flag costs one bit and one `if` — whoever re-prices it should not have to re-implement it
+first); rejected **porting** it to the other two quantisers (that is the right move for a feature
+that pays, and this one does not); rejected **documenting the divergence and leaving it** (it
+invalidates every GPU-arm-versus-CPU-arm comparison below q=30, which is the trap the item was
+filed for). Decision `0038`.
+
+### Scope, measured rather than assumed
+
+**Only q ≤ 30 is affected.** Byte-identical either way at q=40, 50, 75, 85, 90 and 100 — above
+q≈30 the dead zone is too narrow for a subband to reach 95% zeros. So **GNC's home range (q > 85)
+is untouched**, and only one BASELINE row needed re-measuring:
+
+**BASELINE q=25: 35.51 dB / 1.60 bpp / VMAF 90.25 → 35.63 dB / 1.64 bpp / VMAF 90.31.** VMAF leads
+at this operating point and moved **+0.06 — an improvement**, far inside the 0.5-point tolerance.
+`GOALS.md`'s copy of the table is updated too.
+
+### One test had to be inverted, which is worth noting as a pattern
+
+`rice_gpu_and_cpu_encode_paths_differ_at_subsampled_chroma` asserted `worst > 0.0` — it existed to
+pin the known gap so a regression could be told from it. Its own failure message anticipated this
+day ("if that is deliberate, delete this test"). It is now
+`..._agree_at_subsampled_chroma` asserting `worst == 0.0`, with the cause named in the message so
+a future divergence is diagnosed rather than re-investigated. That is the **third** test this
+session that encoded a defect as expected behaviour — after BUG-23's `should_panic` and BUG-22's
+slot assert. A test written to pin a bug needs an inversion plan, or it becomes an argument against
+fixing it.
+
+Left alone deliberately: `abac_handles_subsampled_chroma` pins Rice to the CPU path as a workaround
+for this gap, and that pin is now probably unnecessary — but **BUG-28** is a separate open defect
+about abac and Rice disagreeing at subsampled chroma and is held by another session, so unpinning
+belongs to that item.
+
+**Gates:** 243 tests pass, 0 failures; both clippy targets clean; q=90 byte-identical to the
+baseline taken at the start of this session's work.
+
+---
+
 ## RATE-2 — the top of the lossy ladder now codes both ways and keeps the smaller: −21.66% at q=99, bit-exact on 12 of 20 points (2026-09-08)
 
 **Hypothesis.** On every photographic image measured, above q≈95–98 the wavelet ladder spends more

@@ -1579,6 +1579,47 @@ that is not a shader it does not use. **Why P2:** it invalidates no measurement 
 nothing on Vulkan or Metal, but GOALS rule 4 claims DX12 and step 1 is close to free. Step 1
 alone converts "DX12 does not run GNC" into a measurement.
 
+### ROBUST-3 — a lost or corrupt reference frame has no specified behaviour (todo, **P2**)
+
+**Found 2026-09-08 by an external reviewer asking what the spec says**, which turned out to be
+nothing. `docs/BITSTREAM_SPEC.md` has no concealment clause, no defined behaviour for a missing
+reference, and no client contract for the case. The only recovery language it carries is about
+*tile* corruption within a frame.
+
+**What is solved, and it is more than the reviewer expected.** CRC-32 is per **tile**, in an index
+table `[size: u32, crc32: u32] × num_tiles` covering the whole tile blob — so a bit error anywhere
+in that tile's 256 streams is a **detectable event**, not a silent artefact, and the spec guarantees
+*"a single corrupt tile does not affect other tiles."* `deserialize_*_validated` returns
+`corrupt_tiles()` and `all_valid()`, and `tests/conformance.rs` asserts detection on modified tile
+data. **Spatial resync is a solved problem** and it is solved by the architecture rather than by a
+recovery path.
+
+**What is not solved is temporal.** A corrupt or missing *reference* propagates through every
+P-frame that predicts from it, and nothing says what a decoder should do:
+
+- Is the GOP dropped to the next keyframe? The GNV1 frame index and keyframe seek make that
+  possible, but it is not specified as the required behaviour.
+- Is a corrupt tile's *previous* content held over (temporal hold), zeroed, or left as whatever the
+  reference buffer contains? Today it is the third by default, which is the one answer no format
+  should specify by accident.
+- Does the decoder signal the caller that output is degraded, or return it silently? `corrupt_tiles()`
+  exists per frame; there is no equivalent for "this frame is fine but its reference was not".
+
+**Why P2 rather than lower.** GOALS §1 lists **low-latency contribution over links** among the
+target uses, and 5G contribution is a lossy-link case by construction. `ROBUST-1` already decided
+the neighbouring question — *"the decoder should reject malformed input, not panic"* (`0067`) — so
+the malformed-input contract exists and the *lost-reference* contract is the hole next to it. The
+reviewer's framing is right that this is a field that becomes dangerous only when someone runs it
+over a real link, not before.
+
+**What it needs:** a specified behaviour in `BITSTREAM_SPEC.md` first, then a conformance test that
+corrupts a reference rather than a tile. **Deciding is the work; implementing is likely small** —
+the seek machinery for "drop to next keyframe" already exists.
+
+**Not in scope:** FEC, retransmission or anything on the wire. This is the decoder's contract when
+data is already missing. Note that per-subband UEP was proposed alongside and is a *different*
+item — that is about protecting the stream, this is about what to do when protection failed.
+
 ### ROBUST-2 — put the frame parser on a checked cursor, additively (todo, P2)
 
 The implementation `docs/decisions/0067` decided and deliberately did not do. **The decision is
@@ -2440,6 +2481,84 @@ alternative lost.
 Every edit is in `#[cfg(test)]` code or an integration test target, checked file by file against
 each file's `#[cfg(test)]` marker, so the shipped build is unchanged by construction and no
 figure in BASELINE moves.
+
+### MEAS-13 — the EBU multi-generation result is at the wrong q, predates BUG-8, and its harness was never saved (todo, **P2**)
+
+**The 2026-09-05 result is good and it is the reason to fix this rather than ignore it.** EBU
+TR 091-style: encode → decode → pixel-shift → re-encode, 5 generations, shifts also applied to an
+uncoded reference chain so only codec degradation is measured. **No breakdown point, no cliff, no
+tile-grid catastrophe** — roughly linear at −0.6 to −1.5 VMAF per generation with flat bitrate, and
+GNC beats ProRes 422 HQ decisively (−2.46 / −3.43 / −6.21 against −11.51 / −9.02 / −8.78) while
+losing to x264 intra on smooth content (blue_sky −6.21 against −1.51). That measurement is what
+retired the risk that the fixed 256x256 tile grid would kill the contribution positioning.
+
+**Three reasons it cannot be leaned on as it stands, raised 2026-09-08 by an external reviewer:**
+
+1. **It was run at q=75** — EBU's recommended JPEG XS operating ratio, ~6:1 — **not at q=85–99,
+   which is GNC's own contribution range.** Whether the blue_sky weakness is worse, better or
+   irrelevant at the real operating point is unmeasured. Wavelet ringing on smooth gradients is
+   exactly the kind of thing that could behave differently when the quantiser is barely quantising.
+2. **It predates BUG-8** (2026-09-06), which changed what PSNR measures from the encoder's `f32`
+   reconstruction to what the decoder emits. The VMAF column is unaffected — VMAF was always
+   computed from decoded output — but the PSNR column is not comparable to anything current. It also
+   predates BUG-6's wavelet-level default, INTER-2, INTRA-2, RATE-2/3/4, BUG-16, BUG-39 and PAD-1.
+3. **The harness was never saved, which is the finding worth acting on.** There is no
+   `scripts/meas_*` for it and the log entry names none — the only entry of its kind that does not.
+   So **the numbers are testimony rather than an instrument**: nobody can re-derive them, and the
+   reviewer's assumption that a re-run is cheap because "you already have the harness" is false.
+   That is the same defect ENT-11 raises about a *rejection* whose instrument might be deleted, in
+   the harder direction: this is a *positive* result the positioning rests on.
+
+**So step 1 is to write the harness**, as `scripts/meas_generations.py`, with the shift schedule
+from the log entry — (+4,+4), (0,+2), (−2,0), (+2,−4), (−4,+2) — the uncoded reference chain, and
+pinned hashed inputs. **Reproduce q=75 first as a control**: if the 2026-09-05 numbers come back on
+today's tree, everything after is trustworthy; if they do not, that is a finding of its own.
+
+**Then re-run at q=85, 92 and 99.** Lead with PSNR above q=85 per CLAUDE.md, report VMAF alongside
+rather than instead, and include dE00 — five generations of chroma error is exactly where a
+luma-only metric would miss accumulation.
+
+**Blocks MEAS-14**, which needs this harness to exist.
+
+### MEAS-14 — does the lossy encoder's cross-backend divergence *accumulate*? (todo, **P2**)
+
+**Test design contributed 2026-09-08 by an external reviewer, adopted as given** because it is the
+right shape: it converts a number nobody knew what to do with into a falsifiable question.
+
+**The measurement it starts from:** at the same commit and input, `q=100` lossless is
+**byte-identical** between Metal and Vulkan while `q=75` lossy **differs by one byte**. BASELINE
+records that as a *testing* consequence — *"any regression test that hashes lossy encoder output
+will fail across backends"* — and that framing is incomplete. **For mezzanine, where the same
+content passes different hardware at different pipeline stages, encoder non-determinism is a
+product property, not a test artefact.** One byte is the wrong quantity to stop at; the question is
+whether the divergence is bounded noise or compounds.
+
+**The test, in the reviewer's words:** run the existing 5-generation EBU chain but **switch backend
+per generation** — Metal → Vulkan → Metal → Vulkan → Metal — and compare the ΔVMAF curve against
+the single-backend baseline.
+
+- **Curves coincide** → bounded noise that does not accumulate. Close the question, record the
+  number, and BASELINE's testing-only framing was right after all.
+- **Cross-backend curve diverges** → it compounds, and it is a real mezzanine constraint that
+  belongs in POSITIONING rather than in a test note.
+
+**Two practical constraints the design does not account for, and they change the cost:**
+
+1. **No machine here has two working backends.** This Mac reports **one adapter, Metal only**
+   (`gnc gpu-info`). The Linux box is Vulkan; the Windows laptop is Vulkan plus a DX12 that has
+   never produced a frame (BUG-52). So the interleaved chain needs either **the intermediate PNGs
+   shipped between machines** between generations — which the chain's own structure allows, since
+   generations are separated by decoded frames on disk — or **MoltenVK installed on the Mac** to get
+   Vulkan on Apple hardware in one place. The second is much cheaper and is the recommended route.
+2. **The harness does not exist.** See MEAS-13: the 2026-09-05 chain was never saved as a script.
+   **MEAS-13 blocks this item**, and doing MEAS-13 first gets both the single-backend baseline and
+   the instrument in one pass.
+
+**Do the arithmetic before believing a divergence.** A one-byte difference at q=75 is ~1e-6 of the
+frame. If five generations amplify that into a visible ΔVMAF gap, the mechanism is not the byte —
+it is that a different byte changes a quantisation decision that changes the next generation's
+input, which is a genuine chaotic-amplification claim and needs the per-generation PSNR against the
+*same-backend* chain to support it, not just the endpoint.
 
 ### MEAS-11 — BASELINE's `--abac` BD-rate row is conservative after ENT-9 (**DONE 2026-09-08 — +66.0% → +61.0%**)
 
@@ -5963,7 +6082,22 @@ precision in PSNR terms** — qstep 0.75 buys 3.9 dB over qstep 1.0 for 13% more
 mispriced only against lossless, which is what makes option (1) — compare and keep the smaller —
 the right shape of fix rather than a ladder clamp.
 
-### MEAS-2 — Feature toggling: what contributes and how much? (todo, P3)
+### MEAS-2 — Feature toggling: what contributes and how much? (todo, **P2** — re-priced 2026-09-08)
+
+**Re-priced from P3 to P2 on an external reviewer's argument, which is sound:** this item asks
+whether the parameters that flip together at a preset breakpoint are *coupled* or merely *untested
+together*, and **BUG-30 already proved at least one of those couplings was accidental** —
+`GNC_DEAD_ZONE` silently defeated bit-exact lossless at q=100, one knob away from where it
+belonged. So the question is no longer hypothetical, and the item was sitting below work whose
+premise it might invalidate.
+
+**Note what is already answered, so nobody re-measures it:** the q=100 breakpoint itself is a
+*measured* boundary, not a preset designer's line. INTRA-NEARLOSSLESS was filed to ask exactly
+whether MED-instead-of-wavelet keeps paying at q=88–99 and the answer is **no** — it wins −14.9% at
+q=100 and does not survive into the lossy range. What is untested is the *other* parameters that
+change at the same breakpoint.
+
+
 
 **Sixth and seventh toggles measured 2026-09-08 — the pyramid's two layer quantiser scales.**
 `GNC_PYRAMID_L3_QP_SCALE` **is now a taper, not a constant 1.5** (`docs/decisions/0061`): the

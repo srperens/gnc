@@ -2819,7 +2819,47 @@ frequency 1 everywhere the alphabet is uniform and the depth is 6). Both change 
 codebook, and therefore its bitstream, wherever clamping currently occurs. Not done for a parked
 coder.
 
-### COORD-4 — a number quoted across sessions does not carry its tree (todo, P4)
+### COORD-4 — priced, tool refused 1-of-6, consolidation shipped instead (**ANSWERED 2026-09-08**)
+
+**The doubt attached to this item at filing was the right one, and the measurement it asked for
+settles it — but not by rarity.** The class is the most frequent measurement failure in the repo
+right now: **six instances**, five of them in the two days of eight-session concurrency.
+
+| # | instance | shape | caught by a claim-time stamp? |
+|---|---|---|---|
+| 1 | BUG-44 — 254.0039 vs 0.0000, patched vs shipped tree | cross-session | **yes** |
+| 2 | PAD-1 / `0039` (`c109128`) — q=85 pre-INTER-2, q=92 post | `main` moved mid-table | no |
+| 3 | ENT-3 / `0025` (`0045`) — two of nine published points superseded | `main` moved | no |
+| 4 | the build-artefact near-miss — rebuild during a 36-run sweep | own `target/` | no |
+| 5 | ARCH-3 / BUG-18 (2026-09-07) — `main` moved mid-item | `main` moved | no |
+| 6 | quarter-pel #15 (2026-03-09) — "−0.63 dB vs stale baseline `617d8e6`" | stale record | no |
+
+**Both candidate shapes are refused on these numbers.** `claim measured` (stamp `HEAD` + dirty bit)
+would have caught **1 of 6** — only the cross-session one. Printing each claim's commit in
+`claim list` would have caught **0 of 6**: a claim's commit is not a measurement's commit, and
+instance 1's difference was uncommitted anyway. Five of six are one session's own table decaying
+because `main` moved under it, which no claim-time stamp can see.
+
+**What the evidence supports instead, and it is shipped:** the rule was already written **four
+times on one afternoon, by four sessions, under four names** — this entry's own COORDINATION
+section, "Do not swap a shared build artefact while someone is measuring", ENT-3's "a figure that
+reproduces exactly on its own pinned commit and not on `main` is a change log, not an error", and
+PAD-1's "a table whose q=85 and q=92 came from different binaries is unreadable". The failure is
+**discoverability, not absence**: each session met the class fresh and none could see the others'
+wording. COORDINATION's "Every number carries a tree" section is now the class's home, indexes all
+four, and states the three habits they add up to — state the tree with the number, a table is one
+binary, ask which tree before filing or reversing.
+
+**What would reopen this.** A seventh instance of the *cross-session* shape specifically —
+instance 1 is the only one of its kind, and one instance does not buy a tool. If two more appear,
+`claim measured` is worth building and the dirty bit is the half that matters. Instances 2, 3 and 5
+argue for something different if anyone wants it: a check that warns when `main` has moved since a
+worktree's base *while a measurement is in flight*, which is a different tool with a better hit
+rate (4 of 6) and no obvious cheap implementation.
+
+*Original filing, kept because the doubt in it was correct:*
+
+### COORD-4 — a number quoted across sessions does not carry its tree (original filing)
 
 **Filed from a worked example that cost two sessions about an hour**, recorded in COORDINATION's
 "Two sessions' numbers that disagree may both be right — ask which tree" and in RATE-4 and BUG-44.

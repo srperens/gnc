@@ -366,7 +366,68 @@ else is mid-operation on. The rule generalises to **never abort or switch away f
 you did not start**, and `.git/` names the operation — `MERGE_HEAD`, `REBASE_HEAD`,
 `rebase-merge/`, `CHERRY_PICK_HEAD`.
 
-## Two sessions' numbers that disagree may both be right — ask which tree
+## Every number carries a tree, and this is the class's home
+
+**COORD-4 priced this on 2026-09-08 and the answer changed what to do about it.** The question was
+whether `scripts/claim` should stamp the commit a measurement was taken on. It should not — but
+only because the evidence points somewhere cheaper, not because the failure is rare. It is the
+most frequent measurement failure in this repository right now.
+
+**Six instances, and one of them is the only one a claim-time stamp would have caught:**
+
+| # | instance | shape | would `claim measured` have caught it? |
+|---|---|---|---|
+| 1 | **BUG-44** (2026-09-08) — 254.0039 against 0.0000, patched tree vs shipped | cross-session | **yes** |
+| 2 | **PAD-1 / `0039`** (2026-09-08, `c109128`) — q=85 rows pre-INTER-2, q=92 rows post | intra-session, `main` moved | no |
+| 3 | **ENT-3 / `0025`** (2026-09-08, `0045`) — nine published points, two superseded by INTER-2 | intra-session, `main` moved | no |
+| 4 | **the build-artefact near-miss** (2026-09-08, section below) — a rebuild during a 36-run sweep | intra-session, own `target/` | no |
+| 5 | **ARCH-3 / BUG-18** (2026-09-07) — `main` moved mid-item; rebased and re-measured | intra-session, `main` moved | no |
+| 6 | **quarter-pel #15** (2026-03-09) — "−0.63 dB vs stale baseline (`617d8e6`)" | comparison against a stale record | no |
+
+**So the tool is refused on its own numbers: 1 of 6.** The cheaper variant — printing the commit
+each *claim* was taken against — would have caught **0 of 6**, because a claim's commit is not a
+measurement's commit and instance 1's difference was uncommitted anyway. COORD-4 closed on this.
+
+**What the six actually say is that the rule is already written four times, by four sessions, on
+one afternoon, under four names — and that is why it keeps not being applied:**
+
+- *this section* — ask which tree, when two sessions' numbers cannot coexist
+- *"Do not swap a shared build artefact while someone is measuring"*, below — the same failure
+  inside one session, where nothing errors and the numbers quietly come from two codecs
+- *ENT-3's bullet in the merge log* — **"a figure that reproduces exactly on its own pinned commit
+  and not on `main` is a change log, not an error"**, and its instruction to *pin the old commit
+  before attributing*. That one is the most valuable of the four and the hardest to find.
+- *PAD-1's `c109128`* — "a table whose q=85 and q=92 came from different binaries is unreadable —
+  the same failure mode as a before-number and an after-number taken across a rebase"
+
+They are one rule: **a number is incomplete without the tree it was measured on, and `main` moves
+under you.** Four articulations exist because each session met the class fresh and none could see
+the others' wording. Read the four together; do not write a fifth.
+
+**The three habits they add up to**, cheapest first:
+
+```bash
+git -C "$REPO" rev-parse --short HEAD   # say this next to any number you publish or send
+```
+
+- **State the tree with the number.** `main` at `<sha>`, or "my branch with X applied, `src/`
+  otherwise identical to `<sha>`". `RESEARCH_LOG` already has good examples of this done right
+  (`ent2` pinned at `c0dd27f`; the Huffman-mapping gate naming both binaries and asserting `src/`
+  byte-identity between them) — those are the model, and neither is one of the six.
+- **A table is one binary.** If `main` moves mid-table, re-run the table, do not patch the rows.
+  Instances 2 and 3 are both published tables split across a merge.
+- **When two results cannot both be true, ask which tree before you file, correct, or reverse.**
+  Instance 1 cost two sessions an hour and put two wrong inferences into `main`; the refuting test
+  was on disk the whole time and takes twenty seconds.
+
+**Why now, and why it is not a competence problem.** Five of the six are from the two days this
+repository has run eight concurrent sessions. Concurrency is what makes a published figure decay
+between measurement and reading, and the cost scales with how many sessions merge into one `main`,
+not with how careful any one of them is. A seventh instance is likelier than any of the four
+rule-writings preventing it, which is why COORD-4's answer is consolidation rather than another
+paragraph.
+
+### The worked example, kept because it shows all three habits failing at once
 
 **Found 2026-09-08, by both sides of it.** A RATE-4 measurement said the encoder's reference and
 the decoder's differ by 254.0039 at `q=100`. The BUG-39 session had just shown `q=100` video

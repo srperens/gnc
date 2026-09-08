@@ -80,6 +80,95 @@ is not obviously independent — re-measuring `0072`'s 24 points is the whole of
 the commit. Decision record: `docs/decisions/0077`.
 
 ---
+---
+
+## MEAS-11 — the abac ladder re-taken: +66.0% -> +61.0%, and ENT-9 flattened the decay (2026-09-08)
+
+**Pinned to `a0880c7`.** `scripts/meas1_vs_h264.py`, 1920x1080, 17 frames, ki=9, 4:2:0, 8-bit,
+x264 at defaults, q = 85/92/96/99 against crf = 1/2/4/8 — MEAS-10's ladder exactly. Both arms on
+**one binary**, which is the whole point: MEAS-11 was filed because a re-take on a moving `main`
+would credit every landing to ENT-9.
+
+### Rice is the control, and it reproduces exactly on all three
+
+| sequence | Rice, MEAS-10 (`0a1b055`) | Rice, here (`a0880c7`) | overlap |
+|---|---|---|---|
+| bbb_extended | +128.5% | **+128.5%** | 49.9–56.0 dB |
+| old_town_cross | +70.2% | **+70.2%** | 49.8–55.9 dB |
+| crowd_run | +68.8% | **+68.8%** | 49.8–56.0 dB |
+| **mean** | **+89.2%** | **+89.2%** | |
+
+Three of three to the decimal, overlap bands included. **That is a result in its own right**, not
+just a control: `main` took RATE-3, BUG-39, INTER-2 and LOSSLESS-2 between the two commits, and
+none of them moved this ladder. It also means any abac movement is ENT-9's.
+
+### abac: +66.0% -> +61.0%, five points, and it is not uniform
+
+| sequence | before (MEAS-10) | after (`a0880c7`) | delta |
+|---|---|---|---|
+| bbb_extended | +91.8% | **+89.0%** | −2.8 |
+| old_town_cross | +53.1% | **+47.4%** | −5.7 |
+| crowd_run | +53.0% | **+46.6%** | −6.4 |
+| **mean** | **+66.0%** | **+61.0%** | **−5.0** |
+
+**1.66x -> 1.61x** against x264. The animation sequence gains least and the two camera sequences
+gain most, in the same order `0074` measured for the change itself.
+
+### The canary, measured rather than inherited
+
+BASELINE said "PSNR-Y identical to two decimals". MEAS-11 required re-running that rather than
+carrying it forward, and it is **stronger than recorded: the PSNR-Y delta between the Rice and
+abac arms is `+0.0000 dB` at all 12 rungs** — bit-identical, which is what "only the bytes moved"
+ought to mean. So the rate difference is entirely entropy coding, with no quality confound.
+
+### The finding worth more than the headline: the decay is mostly gone
+
+ENT-3's conclusion on this ladder was that abac's saving over Rice **decays with quality** —
+crowd_run −12.2% at q=85 falling to −3.7% at q=99, an 8.5-point collapse. At `a0880c7`:
+
+| q | bbb_extended | old_town_cross | crowd_run |
+|---|---|---|---|
+| 85 | −20.12% | −13.82% | −14.10% |
+| 92 | −18.56% | −13.57% | −13.41% |
+| 96 | −16.14% | −13.27% | −12.91% |
+| 99 | −14.26% | −12.24% | −11.78% |
+
+**crowd_run now falls 2.3 points across the ladder, not 8.5.** The mechanism agrees: `0074`
+context-codes the Exp-Golomb unary prefix and is worth −6.29% mean at q=99 against −2.06% at
+q=90, so it helps most exactly where the old decay bit hardest. **"abac's advantage decays with
+quality" is now much weaker than recorded, not merely smaller** — which matters, because that
+decay was the argument for not making abac the default at contribution quality.
+
+### Both rows are already conservative again, and that is the process finding
+
+**LOSSLESS-3 (`ab3e2d2`) landed after `a0880c7`** — a camera sequence emitted bit-exact above
+q=95, −5.95% to −33.58% of container bytes at exact pixels. This ladder has rungs at **q=96 and
+q=99** and two of its three sequences are camera content, so both rows are cheaper on today's HEAD
+by an unmeasured amount concentrated in the ladder's top half. It is coder-independent, so the
+abac-vs-Rice comparison above is untouched.
+
+**This is the second consecutive re-take invalidated by a landing during or just after it.** ENT-9
+made MEAS-10's row conservative; LOSSLESS-3 made MEAS-11's conservative before it was written up.
+With eight sessions merging, **"current HEAD" is not something a hand-run four-rung ladder can
+describe**, and the fix is not another re-take. BASELINE now quotes both rows with their commit.
+
+### Two corrections to MEAS-10's record, found while setting this up
+
+- **Its source frame counts are wrong.** It states "bbb_extended (24 frames), old_town_cross
+  (200), crowd_run (32)". All three hold exactly 24 (`frame_0000`–`frame_0023`). The ladder uses
+  17, so nothing is invalidated — and the exact Rice reproduction proves the first 17 frames are
+  the same content. **Hashed the actual inputs** so the next re-take can verify identity rather
+  than trust a count: bbb_extended `18b86a49d376dd79`, old_town_cross `d398ff1265752113`,
+  crowd_run `b4008977b24b0585` (sha256 of the concatenated per-frame md5s, frames 0–16).
+- **`meas1_vs_h264.py` needs `.venv/bin/python`**, not `python3` — numpy is not in the system
+  interpreter, and all six runs died on `ModuleNotFoundError` first time. `meas10_rebaseline.sh`
+  hardcodes the venv; the Python harness does not mention it and neither did BASELINE.
+
+### VMAF is still not a number here, as recorded
+
+old_town_cross reads **+2548.6%** Rice / **+2200.7%** abac at a VMAF band of 99.8–99.8. BASELINE
+recorded +2548% / +2289% — the Rice figure reproduces exactly and the abac one moved because abac
+did. Do not quote it; PSNR leads above q=85.
 
 ## ENT-9 step 2 — abac context-codes the Exp-Golomb prefix, and the bound was honest (2026-09-08)
 
@@ -173,6 +262,12 @@ annotated rather than re-taken.** The ladder is q=85/92/96/99, squarely in range
 today would credit RATE-3, BUG-39 and LOSSLESS-2 to ENT-9, which is precisely the failure
 **COORD-6** was filed for the same afternoon — so the re-take is filed as **MEAS-11**, to be run
 on a pinned commit, with both rows on one binary. The Rice row is unaffected.
+
+> **MEAS-11 ran the same day, at `a0880c7`: the row is +61.0% / 1.61x**, and the caution above was
+> justified — Rice reproduced exactly on all three sequences, so the five-point move is attributable.
+> It also found that ENT-9 **flattened** the quality decay of abac's advantage (crowd_run's fall
+> across the ladder went from 8.5 points to 2.3), which is the part this entry could not see from
+> the controlled table alone. See the MEAS-11 entry at the top of this log.
 
 **Candidate B is still unspent and is now cheaper to re-price**, since A moved the denominator.
 `0063` had it at −0.57% to −1.29%, below the gate on three of three. Re-price before building.
@@ -13986,8 +14081,6 @@ five-byte flush are the next two steps, in that order.
 
 ---
 
----
-
 ## 2026-09-06 — Web demo repaired, and the temporal wavelet is not what we assumed
 
 ### BUG-15: the GNV2 decode path ignored the output pattern
@@ -14216,8 +14309,6 @@ halves now exist in this repo.
 Decode throughput on the real path. Four sessions were building on this machine and COORDINATION
 rule 1 forbids timing under load; the 201 fps figure is the isolated gate, not the shipped
 decoder. Measure on an idle machine before quoting any lossless fps.
-
----
 
 ---
 

@@ -2227,7 +2227,37 @@ Every edit is in `#[cfg(test)]` code or an integration test target, checked file
 each file's `#[cfg(test)]` marker, so the shipped build is unchanged by construction and no
 figure in BASELINE moves.
 
-### MEAS-11 — BASELINE's `--abac` BD-rate row is conservative after ENT-9 (todo, P3)
+### MEAS-11 — BASELINE's `--abac` BD-rate row is conservative after ENT-9 (**DONE 2026-09-08 — +66.0% → +61.0%**)
+
+**Answered, pinned to `a0880c7`.** `--abac` mean **+66.0% → +61.0%** (1.66x → **1.61x**):
+bbb_extended +91.8%→+89.0%, old_town_cross +53.1%→+47.4%, crowd_run +53.0%→+46.6%. **Rice
+reproduced exactly on all three** (+128.5% / +70.2% / +68.8%, mean +89.2%, overlap bands
+included), which both confirms the attribution and shows RATE-3, BUG-39, INTER-2 and LOSSLESS-2
+did not move this ladder.
+
+**The canary is stronger than BASELINE recorded it:** the Rice-vs-abac PSNR-Y delta is
+**+0.0000 dB at all 12 rungs** — bit-identical, not "identical to two decimals".
+
+**And the bigger finding: ENT-9 flattened the decay.** ENT-3's conclusion was that abac's saving
+over Rice collapses with quality (crowd_run −12.2% at q=85 → −3.7% at q=99, 8.5 points). It is now
+**−14.10% → −11.78%, 2.3 points.** `0074` helps most at high q, which is exactly where the old
+decay bit. That decay was the argument against making abac the default at contribution quality, so
+the argument is much weaker than recorded.
+
+**Both rows are conservative again, and not because of abac. LOSSLESS-3 (`ab3e2d2`) landed after
+the pin** — camera sequences bit-exact above q=95, −5.95% to −33.58% — and this ladder has rungs at
+q=96 and q=99. It is coder-independent so the abac-vs-Rice comparison holds, but **this is the
+second consecutive re-take invalidated by a landing during it**, which is a pattern: with eight
+sessions merging, a hand-run four-rung ladder cannot describe "current HEAD". BASELINE now quotes
+both rows with their commit instead. **Do not re-take this chasing HEAD.**
+
+Two corrections to MEAS-10's record, found in setup: its source frame counts are wrong (all three
+sequences hold 24, not 24/200/32 — nothing invalidated, and the exact Rice reproduction proves the
+first 17 frames are unchanged; inputs are now hashed in RESEARCH_LOG so the next run can verify
+identity rather than trust a count), and `meas1_vs_h264.py` needs `.venv/bin/python` because numpy
+is not in the system interpreter. Full numbers in RESEARCH_LOG 2026-09-08.
+
+Original filing follows.
 
 BASELINE's contribution ladder carries two rows against x264 at matched PSNR-Y — Rice at
 **+89.2%** mean and **`--abac` at +66.0%** ("1.9x the bitrate of H.264 … `--abac` is 1.66x"),
@@ -6987,9 +7017,10 @@ plausible wrong image, the failure `abac_tile.rs` warns about. Every other coder
 q=95, −14.3% to −20.4% at q=90. **That supersedes `0045`'s "under −4.5% at q=99"** (P bytes now
 −12.1% / −15.8% / −12.3%) — but attribute it carefully: ENT-9's own controlled contribution is the
 table above, and the remaining distance is everything else that landed between plus a different
-denominator. **BASELINE's `--abac` row and its 1.66x are now conservative; re-take filed as
-MEAS-11**, deliberately not run here because today's `main` would credit RATE-3, BUG-39 and
-LOSSLESS-2 to ENT-9 (COORD-6's failure, same afternoon).
+denominator. **BASELINE's `--abac` row and its 1.66x were conservative; MEAS-11 re-took them on
+2026-09-08 and the row is now +61.0% / 1.61x** at `a0880c7`, with Rice reproducing exactly on all
+three sequences — so the attribution held and the caution here was justified. ENT-9's share of the
+five-point move is the controlled table above; the rest is the different denominator.
 
 **Candidate B (sign contexts) is still unspent and is now cheaper to re-price**, since A moved the
 denominator. It was below the gate at −0.57% to −1.29%; re-price before building.

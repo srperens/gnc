@@ -328,24 +328,48 @@ q=85,92,96,99 against crf=1,2,4,8.
 | | bbb_extended | old_town_cross | crowd_run | **mean** |
 |---|---|---|---|---|
 | full video (ki=9), Rice | **+128.5%** | **+70.2%** | **+68.8%** | **+89.2%** |
-| full video (ki=9), `--abac` | **+91.8%** | **+53.1%** | **+53.0%** | **+66.0%** |
+| full video (ki=9), `--abac` | **+89.0%** | **+47.4%** | **+46.6%** | **+61.0%** |
 | curve overlap | 49.9–56.0 dB | 49.8–55.9 dB | 49.8–56.0 dB | |
+| `--abac` before ENT-9 (MEAS-10) | +91.8% | +53.1% | +53.0% | +66.0% |
 | QUAL-1 (2026-09-06), Rice | +129.0% | +71.9% | +70.6% | +90.5% |
 
+**The `--abac` row is MEAS-11 (2026-09-08), re-taken at `a0880c7`; the Rice row reproduced there
+exactly and is unchanged.** Both arms on one binary, which is what makes them comparable.
+
 **GNC Rice needs about 1.9x the bitrate of H.264 for the same luma PSNR at contribution quality.
-`--abac` is 1.66x** — same pixels as Rice at every rung (PSNR-Y identical to two decimals),
-only the bytes moved. That is the canary the path ran. Saving vs Rice decays with quality
-(crowd_run −12.2% at q=85 to −3.7% at q=99), which is ENT-3's finding on this ladder.
+`--abac` is 1.61x** — same pixels as Rice at every rung, and MEAS-11 measured that canary rather
+than inheriting it: the PSNR-Y delta is **+0.0000 dB at all 12 rungs**, i.e. bit-identical, not
+merely equal to two decimals as this line used to say. Only the bytes moved.
 Rice stays the default; quote **+89.2%** unless the command included `--abac`.
 
-> **The `--abac` row and the 1.66x are conservative as of 2026-09-08 — ENT-9 (`0074`) made abac
-> cheaper across this whole ladder.** Measured on that change: total rate **−2.07% to −8.76% at
-> q=99**, −1.26% to −4.56% at q=95, −0.85% to −2.75% at q=90 (three sequences, 18 frames, ki=9,
-> 4:4:4). Every rung here sits inside that range, so the direction is known and only the size is
-> not. **The Rice row is unaffected** — ENT-9 touches entropy type 5 only. Not re-taken with the
-> change, because today's `main` also carries RATE-3, BUG-39, INTER-2 and LOSSLESS-2, and a ladder
-> taken now would credit all of it to ENT-9 (the failure COORD-6 was filed for). Re-take is
-> **MEAS-11**, on a pinned commit.
+**ENT-9 also flattened the decay, which is the part worth noticing.** The saving over Rice used to
+collapse as quality rose — crowd_run −12.2% at q=85 to −3.7% at q=99, an 8.5-point fall, and that
+was ENT-3's headline finding on this ladder. Measured at `a0880c7` it is **−14.10% at q=85 to
+−11.78% at q=99: a 2.3-point fall.** The mechanism agrees — `0074` context-codes the Exp-Golomb
+prefix and is worth −6.29% mean at q=99 against −2.06% at q=90, so it helps most exactly where the
+old decay hurt. **So "abac's advantage decays with quality" is much weaker than recorded, not
+merely smaller.** Per-rung saving vs Rice at `a0880c7`:
+
+| q | bbb_extended | old_town_cross | crowd_run |
+|---|---|---|---|
+| 85 | −20.12% | −13.82% | −14.10% |
+| 92 | −18.56% | −13.57% | −13.41% |
+| 96 | −16.14% | −13.27% | −12.91% |
+| 99 | −14.26% | −12.24% | −11.78% |
+
+> **Both rows are conservative again, and this time it is not abac. LOSSLESS-3 (`ab3e2d2`) landed
+> after `a0880c7`** and emits a camera sequence bit-exact above q=95, worth −5.95% to −33.58% of
+> container bytes at exact pixels. **This ladder has rungs at q=96 and q=99**, and two of its three
+> sequences are camera content, so both the Rice and the `--abac` rows are cheaper on today's HEAD
+> by an unmeasured amount concentrated in the top half of the ladder. The change is
+> coder-independent, so it does **not** disturb the abac-vs-Rice comparison above — both arms were
+> measured on the same binary at the same commit, which is exactly why MEAS-11 required that.
+>
+> **This is the second consecutive re-take invalidated by a landing during or just after it, and
+> that is now a pattern rather than bad luck.** ENT-9 made MEAS-10's row conservative; LOSSLESS-3
+> made MEAS-11's conservative before it was written up. With eight sessions merging, "current HEAD"
+> is not a thing a hand-run four-rung ladder can describe. **Do not re-take this chasing HEAD** —
+> quote it with its commit, as the rows above now do.
 
 The move from QUAL-1's +90.5% to +89.2% is **1.3 points**, all in the direction INTER-2
 predicted: only q=85 of this ladder sits in the inter-dead-zone change (q ≤ 88), so a

@@ -69,8 +69,10 @@ fn wgpu_default_storage_buffers_is_still_eight() {
 
 #[test]
 fn required_limits_only_overrides_the_named_storage_buffer_row() {
-    let mut expected = wgpu::Limits::default();
-    expected.max_storage_buffers_per_shader_stage = gnc::MAX_STORAGE_BUFFERS_PER_SHADER_STAGE;
+    let expected = wgpu::Limits {
+        max_storage_buffers_per_shader_stage: gnc::MAX_STORAGE_BUFFERS_PER_SHADER_STAGE,
+        ..Default::default()
+    };
     assert_eq!(
         gnc::MAX_STORAGE_BUFFERS_PER_SHADER_STAGE,
         9,

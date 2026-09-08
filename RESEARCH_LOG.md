@@ -127,6 +127,95 @@ limitation.
 **Nothing shipped moved.** Verified rather than asserted: same input with the gate set and unset
 both hash `756c0cbd…`, and so does the pre-ENT-9 build. Gates: 261 passed, 0 failed, both clippy
 targets clean. Decision record `0063`.
+## BUG-20 — the clippy gate never read a test, and 91 warnings sat behind it (2026-09-08)
+
+**Hypothesis.** CLAUDE.md requires zero clippy warnings and named the gate as
+`cargo clippy --release` plus the wasm `--lib` form. `cargo clippy --release` compiles the lib and
+the bins and never reads a test, so the rule and the check disagreed about what "the code" is.
+Either the gate should widen or the rule should say it excludes tests. Predicted: the warnings are
+mostly style noise, and one or two are not.
+
+**Domain.** No codec domain. Test code and two markdown gate definitions — `#[cfg(test)]` modules
+under `src/` and one integration test target. No shipped code path, no shader, no bitstream.
+
+**Before.** `cargo clippy --release --all-targets` on `main` at `a73e0a2`: **91 warnings** —
+`gnc (lib test) generated 90 warnings`, 24 of them auto-applicable, plus 1 in
+`tests/requested_limits.rs`. `cargo clippy --release` and
+`cargo clippy --release --target wasm32-unknown-unknown --lib`: clean, both. The one remaining
+`warning:` line on the native target is the future-incompatibility notice for the third-party
+crate `block v0.1.6`, which is not a lint on this code — BUG-20's entry already said so and it is
+still true after.
+
+The 91 by lint: 38 `field_reassign_with_default`, 27 `needless_range_loop`, 17
+`unnecessary_cast`, 4 `unused_variables`, 2 `assertions_on_constants`, 1 `needless_borrow`, 1
+`manual_div_ceil`, 1 `manual_range_contains`.
+
+**After.** `cargo clippy --release --all-targets`: **0**. `cargo clippy --release`: 0. Wasm
+`--lib`: 0. **The gate is now `--all-targets` on native** (CLAUDE.md, LOOP.md step 5), wasm stays
+`--lib` because the CLI is not a wasm artifact (BUG-24). Nothing was suppressed: no `#[allow]`
+was added at any level.
+
+**The prediction held, and the two exceptions are the reason the item was worth doing.**
+
+- `assertions_on_constants` was pointing at the BUG-35 guard test asserting
+  `MAX_GROUPS * MAX_GROUP_ALPHABET > SHARED_HIST_ENTRIES` and `3266 < SHARED_HIST_ENTRIES` at
+  **run time**, over three `const usize` values. Those relations cannot change while a test runs —
+  they change when someone edits a constant, which is a build event. Now `const _: () =
+  assert!(…)`: shrinking the arena fails the build instead of failing a test that has to be run
+  to say so. This is the one place where the widened gate found something a reviewer reading a
+  diff would not have.
+- `unused_variables` found one genuinely dead binding (`storage_dst` in `rice_gpu.rs`, a
+  `BufferUsages` value computed and never used while the buffers around it spell theirs inline) —
+  deleted. The other three are two GPU read-backs in a debug test whose values are never asserted
+  on, and an unused `y` in a horizontal-gradient generator; prefixed `_`, which keeps the
+  read-back and says in the source that nothing checks it.
+
+**The other 89 are style, and one of them is worth naming as the argument against widening.** 27
+of the 91 are `needless_range_loop`, and `for (i, cf) in compressed.iter().enumerate().take(8)
+.skip(1)` is not plainly better than `for i in 1..8`. That is the strongest case for exempting
+tests, and it lost to the two findings above plus the absence of any other gate: there is no CI
+here, so the clippy command in LOOP.md step 5 is the only thing that ever reads this code
+mechanically. Decision `0062` records both alternatives and what each would have cost.
+
+**One subtlety worth carrying, because it is the vacuous-pass trap in miniature.**
+`for i in 0..n { a[i] = … }` panics when `a` is shorter than `n`; `a.iter_mut().enumerate()`
+cannot — it just does less work. Where `n` and `a.len()` are the same expression the rewrite is
+free, but **four of the 27 sites had `n` from a separate computation**, so the rewrite would have
+traded a loud panic for a quiet short loop. Those four now say the bound out loud:
+`assert!(tiles.len() >= tiles_per_plane)` in `pipeline_tests.rs`, and
+`assert_eq!(decoded.len(), …)` at three `rice_decode_tile` sites in `rice_gpu.rs`. A fifth
+candidate needed nothing — `plane_tiles` is a slice whose length *is* the bound, so its `.take()`
+was redundant and went — and the five `compressed`/`psnr` sites already had an
+`assert_eq!(len, 9)` above them. Net: the tests state four invariants they previously only
+implied.
+
+**Gates.** `cargo test --release -- --test-threads=1`: **261 passed, 0 failed, 9 ignored** on the
+branch, **265 passed, 0 failed, 9 ignored** on the tree that landed. `main` moved under this item **five
+times** while it was being written, so the gates were re-run on each sync that brought Rust rather
+than assumed: BUG-43 changed `src/encoder/rice.rs` and BUG-39 changed
+`src/encoder/pipeline_tests.rs`, both files this branch also edits (test code only, in both
+cases). The two syncs that brought only markdown and `scripts/claim` did not need a re-run, and
+the entry says which is which rather than claiming one figure covers all five. `cargo clippy --release --all-targets` clean and
+`cargo clippy --release --target wasm32-unknown-unknown --lib` clean, both before and after the
+merge. The only `warning:` line either way is the `block v0.1.6` future-incompatibility notice.
+
+**No codec figure moves, and that is checked rather than assumed.** Every edit is inside
+`#[cfg(test)]` code or an integration test target. Of the eleven `src/` files touched, **nine**
+have their first changed line below that file's own `#[cfg(test)]` marker, and the other **two**
+are test files with no marker of their own — `src/{encoder,decoder}/pipeline_tests.rs`, reached
+only via `#[cfg(test)] #[path = …] mod tests;`. The twelfth file is
+`tests/requested_limits.rs`, an integration test target. So the shipped build is unchanged by
+construction. **There is no before/after on ≥3 sequences here and there should not be** — the
+measurement for this item is the warning count and the suite, and an encode ladder would be
+theatre.
+
+**Found on the way: `cargo fmt --check` is red the same way and worse.** 566 diffs in 61 files,
+**504 of them in 44 files under `src/`** — so unlike BUG-20 this one is mostly shipped code. GOALS
+§9 requires `cargo fmt` clean; neither CLAUDE.md nor LOOP.md names it as a gate. Filed as
+**BUG-38 (P4)** with the heading committed alongside the reserved id, not fixed here:
+reformatting 44 modules that eight live sessions are editing conflicts with all of them and
+carries no behaviour. It wants a quiet tree and one commit that changes nothing else.
+
 ## BUG-39 — lossless video works: a fractional prediction cannot survive a step-1.0 quantiser (2026-09-08)
 
 **Hypothesis, named in this log an hour earlier and now tested.** After cause 3, `q=100` inter
@@ -391,6 +480,60 @@ link checker over every `.md` in the tree now reports zero broken relative links
 `cargo clippy --release` and `cargo clippy --release --target wasm32-unknown-unknown --lib`: **zero
 `gnc` warnings** on both (the one line clippy prints is a future-incompat notice about the `block
 v0.1.6` dependency, present before this change).
+
+## ROBUST-1 — the decoder panics on malformed input by design, and the CRC-32 is not input validation (2026-09-08)
+
+The audit BUG-43 left open. Swept the decode paths for bitstream values reaching a shift, an index
+or an allocation without validation.
+
+### Fixed: one contained defect, in the one place that promised it would not happen
+
+`read_tile_varint` (`src/encoder/rice.rs`) returns a `u16` — three bytes at most for a well-formed
+varint — but looped until the *data* ended. Demonstrated standalone before touching it:
+
+```
+12 bytes of 0x80  ->  panicked at 'attempt to shift left with overflow'
+```
+
+`shift` reaches 77. With overflow checks off it wraps silently instead, and either way `*pos` has
+already run to the end of the buffer, so the rest of the tile parse reads from the wrong place.
+Bounded to `VARINT_MAX_BYTES = 3`. The test asserts the **consumed position**, not just the value,
+because a release build wraps rather than panics and the position is the part that is wrong in both
+profiles — which is exactly why `cargo test --release`, the project's gate, could never have caught
+this.
+
+**What is worth taking from it:** the function's own comment said it would "stop rather than panic
+and let the tile CRC reject it". The comment was written about running out of *data*. A corrupt
+tile does not run out of data — it runs out of *format*, and the loop had no bound on that.
+
+### The larger finding, which is a contract and not a bug
+
+`deserialize_compressed_validated` (`src/format.rs:928`) **opens with**
+`assert!(data.len() >= 37, "File too small")`. That is the contract, stated in code: malformed
+input panics. Downstream of it the frame-header parser indexes with
+`data[pos..pos + 4].try_into().unwrap()` throughout, and sizes allocations from wire `u32`s —
+`num_detail` (`:997`), `wm_len` (`:1043`), `num_tiles` (`:1175`), each reaching
+`Vec::with_capacity(n)` for an `n` that can be four billion.
+
+**And the per-tile CRC-32 does not cover any of this, because it is checked after parsing.** CRC is
+error resilience for bit rot in a stream that is otherwise well-formed. It is not input validation,
+and the presence of the feature should not be read as saying malformed input is handled.
+
+**So this is a decision, not a fix**, and ROBUST-1 carries it: (a) a `Result` boundary, which
+breaks `deserialize_compressed`'s signature; (b) a validating pre-pass that bounds every length
+against `data.len()` before the parser runs, which breaks nothing and is the cheapest; (c) document
+panic-on-malformed and require callers to sandbox. Not chosen here, because choosing it without
+pricing (b) would be guessing.
+
+**Not audited and not claimed:** `abac.rs` (`vec![0i32; count]`), the rANS deserialiser, the GNV
+container index. Same class of question; "probably the same answer" is not a result.
+
+### The rule
+
+**A gate that runs only in one profile cannot see bugs that only exist in the other.** The varint
+overflow is a panic with overflow checks on and a silent wrong answer with them off. GNC's gate is
+`cargo test --release`, so the panic was invisible and the wrong answer was untested. Where a
+defect changes shape between profiles, assert the thing that is wrong in both.
 
 ## PERF-3 item 8 — the 32-bit Rice window is bit-exact and its throughput claim is unmeasured (2026-09-08)
 

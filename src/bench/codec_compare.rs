@@ -323,7 +323,7 @@ mod tests {
     fn test_default_quality_values() {
         let vals = default_jpeg_quality_values();
         assert!(vals.len() >= 10);
-        assert!(vals.iter().all(|&v| v >= 1 && v <= 100));
+        assert!(vals.iter().all(|&v| (1..=100).contains(&v)));
     }
 
     #[test]

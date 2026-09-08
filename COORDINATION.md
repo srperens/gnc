@@ -255,6 +255,32 @@ Two habits, both cheap:
   work and repeating it. Three of the rows in the table above were written by sessions that are
   gone; that is normal here, so this check belongs in the takeover, not in an incident.
 
+**And the same gap makes sessions file the same finding repeatedly. Three did, in one hour, on
+2026-09-08.** Two `### ENT-9` headings went live on `main` minutes apart; the owner claimed
+**COORD-3** to repair it and held it for four minutes with no heading, so a second session filed
+**BUG-41** for the same thing, and a third filed **BUG-42** for it *after* COORD-3's stub was on
+`main`.
+
+The third one is the instructive one, and `scripts/claim bug` is not what failed: it walks
+`main:BACKLOG.md` and `refs/claims/*` for a free **id**, and BUG-42 *was* a free id. **Nothing
+anywhere compares the subject.** The third session had also branched its worktree before the stub
+landed, so its own `BACKLOG.md` did not contain COORD-3 — the same **stale base** that handed out
+`dr-0029` above, one namespace over. So before filing anything, two reads, neither of which is
+your working tree:
+
+```bash
+git show main:BACKLOG.md | grep -i '<the subject, not the id>'   # already filed on committed main?
+scripts/claim list                                               # held with no heading yet?
+```
+
+The second is the one both misses had in common: **a held item whose heading does not exist yet is
+invisible to every read except `claim list`** — not to `grep`, not to `next`, not to `items`.
+
+**COORD-3 shipped the id half the same afternoon** (`docs/decisions/0065`): `scripts/claim` now
+allocates item ids through the same CAS as `dr` and `bug`, warns on duplicate startable ids, and
+`ENT-9` is renumbered to `ENT-10`. The two reads above remain the *subject* half, which no
+allocator can cover.
+
 ## Two sessions cannot merge in the shared checkout at the same time
 
 **Found 2026-09-08, by causing it.** The `intrasym` session ran `git merge --no-ff intrasym` in the
@@ -465,6 +491,8 @@ If this table and `scripts/claim list` disagree, the table is wrong.
 
 | worktree | branch | area |
 |---|---|---|
+| `../gnc-loopa` | `loopa` | **BUG-20 FIXED 2026-09-08 — the native clippy gate is `--all-targets` and the 91 warnings are cleared, not exempted.** `cargo clippy --release` reads the lib and the bins and never a test; `--all-targets` reported **91** (90 lib-test + 1 `tests/requested_limits.rs`), 88 on 2026-09-07 and 90 later that day, so the count drifts on its own. Now **0**, with no `#[allow]` added at any level. **Two of the eight lints were substantive**: `assertions_on_constants` was BUG-35's guard test asserting relations between three `const usize` values at *run* time (now `const _: () = assert!(…)`, so an arena shrink fails the build), and `unused_variables` found a dead `BufferUsages` binding in `rice_gpu.rs`. The other 89 are style, and the 27 `needless_range_loop` are the honest case for the alternative — exempting tests — which lost because there is no CI here, so step 5's clippy command is the only thing that reads this code mechanically. Decision `0062`. **Invalidates no measurement**: every edit is inside `#[cfg(test)]` code or an integration test target — nine of the eleven `src/` files have their first changed line below their own `#[cfg(test)]` marker, and the other two *are* test files (`{encoder,decoder}/pipeline_tests.rs`, included only under `#[cfg(test)]`) — so the shipped build is unchanged by construction. Filed **BUG-38** on the way — `cargo fmt --check` is red the same way and worse (566 diffs, 61 files, **504 of them in 44 files under `src/`**), heading committed with the reserved id. Also filed and closed **BUG-42** in the same hour: the *third* filing of the ENT-9 duplicate-id finding after BUG-41 and COORD-3 (which then shipped, `0065`), from a worktree branched before COORD-3's stub landed — `claim bug` gives a free id and nothing compares the subject. See the note above the shared-checkout merge section. |
+
 | `../gnc-refdiff` | `refdiff` | **RATE-4 half done, dropped 2026-09-08.** The free half — `0040` point 4's source-copy reference — is **refuted by a direct buffer diff** rather than by 0040's confounded PSNR: 0.0000 in RATE-3's q=95..99 fallback case, **254.0039** at q=100 MED, 7.3965 at q=100 lossless wavelet. Encoder's source planes are fractional where the decoder's reference is integral, and identical between the MED and wavelet runs, so it is not the transform. Reverted; tree unchanged. **The unexplained half is why the fallback case matches exactly** — start there. The other half (choose the candidate on sequence bytes, which is what makes bbb q=99 regress) is untouched. |
 | `../gnc-refdiff` | `refdiff` | **RATE-3 DONE 2026-09-08.** `0036`'s sequence gate lifted; mean **−4.28%** of sequence bytes (3 sequences × q ∈ {95,99} × ki ∈ {2,9}), best −13.16%, worst ΔP −0.01 dB, I-frames bit-exact through a real `encode-sequence` → `decode-sequence` md5 round trip. The gate was hiding the *mirror image* of `0040`'s bug: `encode_once` leaves only the **last** candidate's quantised planes in the side channel `local_decode_iframe_gpu` reads, so a kept *bit-exact* frame got the lossy candidate's — P-frames at 5.93 dB. `encode_as_reference` re-runs whichever was kept, at a third encode on those frames. Stills byte-identical. bbb q=99 regresses +0.4/+0.58% → **RATE-4** (with `0040` point 4's source-copy reference, whose refutation is confounded by BUG-39 cause 2). Decision `0044`. |
 | `../gnc-next3` | `next3` | **DOC-3 DONE 2026-09-08.** `claim next` reported all 14 startable items held by *live* sessions (eight started within minutes; every holder's pid alive, so nothing stealable), so this went to the section that decides what the queue contains: BACKLOG's **priority order**, stale on **5 of 6** items — PAD-1/INTRA-2 both shipped, LOSSLESS-1 "buildable now" built two days earlier, CANARY-1 "never measured" DONE at 34x, BUG-14 DONE, abac's inter figure superseded by `0045`. GOALS/README/BASELINE/LOOP/CLAUDE carry **none** of the six. The one finding that is not a correction: item 1's "next largest known intra lever is still unbuilt" pointed at `--abac`, which is **built** and worth −16.6% to −18.8% of intra rate — and *making it the default had never been a heading with an ID*, so `claim next` could not offer the largest built lever in the codec. Filed **ENT-10 (P2)**, parked `blocked-idle-machine` (needs abac GPU encode ms/frame — ENT-5's criterion 3 — and a re-take of `0017`'s 1.69× decode). Documentation only; no code, no shader, no measurement. Decision `0060`. **Then COORD-3, caused by that filing:** the ENT-3 session had filed a *different* `### ENT-9` 16 min earlier, so two startable headings shared one id and `refs/claims/ENT-9` could lock only one — the other goes invisible to `next`. Fifth instance of the `0050` mechanism, first inside BACKLOG. Shipped **`scripts/claim id <PREFIX>`** (any prefix, mention-counts-as-taken; `claim bug` is now its shorthand) plus a duplicate-id warning in `items`/`next`, selftest extended 2 → 4 properties, **DOC-3's heading renumbered ENT-9 → ENT-10** (theirs was first and is held) and DOC-3's ENT-9 canary **withdrawn** as unreadable off an ambiguous ref. Touches `scripts/claim` — **overlaps BUG-19** (`gnc-drnum`), which is renumbering the `0018`/`0024` decision-record pairs; nothing here changes `docs/decisions/` numbering. Decision `0065`. |
@@ -856,6 +884,30 @@ the option that spends more bits. Use BD-rate, or compare at matched rate. At le
 wrong conclusions have come from this one error.
 
 ## Landed today, and what each one invalidates
+
+- **BUG-20 — test code is code, and the native clippy gate is now `--all-targets`.**
+  `docs/decisions/0062`. **Invalidates nothing measured** — every edit is inside `#[cfg(test)]`
+  code or an integration test target, so the shipped build is unchanged by construction rather
+  than by comparison. What it changes is **the gate you must run**: step 5's native command is
+  `cargo clippy --release --all-targets`, not `cargo clippy --release`. The wasm form stays
+  `--lib` (BUG-24) — the asymmetry is deliberate and CLAUDE.md now says why.
+
+  Two things worth carrying that are not about this item:
+
+  - **A gate that cannot see a class of code will accumulate warnings in it at a rate nobody
+    notices.** BUG-20 counted 88 on 2026-09-07; a later entry recorded 90; it was **91** when the
+    item was picked up two days later. Nothing regressed — the drift is just what an unread
+    directory does. The general shape: a rule enforced by a command is only as wide as the
+    command's target selection, and `--all-targets` versus the default is exactly that kind of
+    invisible narrowing.
+  - **The two findings worth having were in the two lints nobody would call noisy, and the noisy
+    lint was the bulk.** 27 of 91 were `needless_range_loop`, which is genuinely arguable in test
+    code; 2 were `assertions_on_constants`, pointing at a guard test that asserted compile-time
+    constants at run time. If the decision had been made by counting warnings it would have gone
+    the other way. **Count what the warnings are, not how many.**
+  - **And the same defect is live one gate over, unfixed: `cargo fmt --check` is red on 566 diffs
+    in 61 files, 504 of them under `src/`.** GOALS §9 requires it; no gate list mentions it.
+    Filed **BUG-38 (P4)**, deliberately not fixed while eight sessions hold those files.
 
 - **ENT-3 — abac's inter saving decays with quality, and two of `0025`'s nine points are
   superseded.** `docs/decisions/0045`. **Invalidates nothing measured** — the only code is one

@@ -87,7 +87,7 @@ Shader source is in `src/shaders/*.wgsl`. Rust host code is in `src/encoder/` an
 ## Code Style
 
 - Rust, edition 2021. Keep shader code (WGSL) simple and readable — comment non-obvious GPU-specific tricks.
-- **Zero clippy warnings** — `cargo clippy --release` and `cargo clippy --release --target wasm32-unknown-unknown --lib` must both be clean. The wasm gate is `--lib` because **the CLI is not a wasm artifact**: `GpuContext::new` is `#[cfg(not(target_arch = "wasm32"))]` and `pollster` cannot block there, so type-checking a command-line tool for wasm produced 11 errors about the tool and none about the codec (BUG-24, fixed 2026-09-08). The binary now carries `required-features = ["cli"]`, so `--no-default-features` is the equivalent whole-target form and no target builds the CLI for wasm by accident. Fix warnings before committing. Prefer fixing the code over suppressing; `#[allow(clippy::…)]` is OK on individual items with justification but **blanket allows** (module-level `#![allow(…)]`, `dead_code` on entire impls, etc.) are **not acceptable**.
+- **Zero clippy warnings** — `cargo clippy --release --all-targets` and `cargo clippy --release --target wasm32-unknown-unknown --lib` must both be clean. **`--all-targets` is the native gate, not `cargo clippy --release`** (BUG-20, `docs/decisions/0062`): the plain form reads the lib and the bins and never looks at a test, and 91 warnings had accumulated behind it — cleared, not exempted, on 2026-09-08. So test code is code here, and the two commands are asymmetric on purpose. The wasm gate is `--lib` because **the CLI is not a wasm artifact**: `GpuContext::new` is `#[cfg(not(target_arch = "wasm32"))]` and `pollster` cannot block there, so type-checking a command-line tool for wasm produced 11 errors about the tool and none about the codec (BUG-24, fixed 2026-09-08). The binary now carries `required-features = ["cli"]`, so `--no-default-features` is the equivalent whole-target form and no target builds the CLI for wasm by accident. Fix warnings before committing. Prefer fixing the code over suppressing; `#[allow(clippy::…)]` is OK on individual items with justification but **blanket allows** (module-level `#![allow(…)]`, `dead_code` on entire impls, etc.) are **not acceptable**.
 - **No `unsafe`** unless absolutely unavoidable. Prefer safe abstractions.
 - Each pipeline stage is a separate module; new experiments go in `src/experiments/`.
 - Don't commit test material to git (it's in `.gitignore`).
@@ -241,7 +241,7 @@ without an org chart:
 - Separate GPU buffer per plane (Y/Cb/Cr) — no aliased write_buffer calls
 - Single command encoder per GOP for spatial wavelet dispatches — no inter-frame races
 - All tests must pass after every change
-- Zero clippy warnings after every change
+- Zero clippy warnings after every change — `--all-targets` on native, `--lib` on wasm (see Code Style)
 - If the same bug resurfaces after two fix attempts — stop, diagnose root cause properly, do not loop
 - **No silent features** — every new code path must have a way to verify it actually executes
 - **Serial dependencies must be bounded, not absent.** A dependency chain whose length grows with

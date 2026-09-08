@@ -1445,6 +1445,46 @@ that is not a shader it does not use. **Why P2:** it invalidates no measurement 
 nothing on Vulkan or Metal, but GOALS rule 4 claims DX12 and step 1 is close to free. Step 1
 alone converts "DX12 does not run GNC" into a measurement.
 
+### BUG-43 — the decoder took Rice `k` off the wire and used it as a shift distance (**FIXED** 2026-09-08)
+
+Found while implementing PERF-3 item 8, by asking what bounds `read_bits(count)` now that the
+32-bit window let `take` grow past 8. Answer: nothing did.
+
+**Every `k` in a GNC bitstream is 0..=15** — all four k arrays go through `optimal_k`, which ends
+`.min(15)`. But `deserialize_tile_rice` reads them with `take_bytes`, so **a corrupt or hostile
+stream can say 255**, and `k` is a shift distance on both decode paths: `1u32 << k` in
+`rice.rs`, and `read_bits(k)` plus `1u << shared_k[g]` in `rice_decode.wgsl`. **A WGSL shift of
+32 or more is undefined**, and in Rust it panics in debug and is masked in release.
+
+**Two things were true and only one of them was mine.** The byte-at-a-time reader capped `take`
+at "bits left in this byte", so it could never shift by more than 8 whatever `k` said — safe by
+accident. The 32-bit window removed that accident: `take = min(remaining, p_win_bits)` reaches 32
+on a bad `k`, and `p_window << 32u` is undefined. So item 8 introduced a real regression on
+malformed input, in the same commit that made the reader faster on well-formed input. The
+GPU's `1u << shared_k[g]` and the CPU's `1u32 << k` were unbounded **before** item 8 and are the
+pre-existing half.
+
+**Fixed in the one place both decode paths pass through.** `RICE_MAX_K = 15` is now named in
+`rice.rs` with the reasoning, `deserialize_tile_rice` clamps all four k arrays (`k_values`,
+`k_zrl_nz_values`, `k_zrl_z_values`, `k_stream_odd`) on the way in, and the shader caps `take` at
+`MAX_TAKE = 16u` so the shift stays in range even if something upstream of it ever does not
+clamp. Clamping **cannot change a well-formed stream**, because 15 is already the maximum the
+format can express — so a bad byte now produces wrong pixels that the per-tile CRC-32 catches,
+which is what that CRC is for, instead of undefined behaviour inside the decoder.
+
+**Verified:** `a_corrupt_k_byte_is_clamped_and_never_becomes_a_shift_of_32` corrupts every byte of
+the tile header to `0xFF`, `0x80` and `0x20` in turn and asserts no k exceeds `RICE_MAX_K` and
+nothing panics — it does not hard-code where the k blocks sit, so it cannot go stale when the
+header changes. Plus the 16 of 16 byte-identical decodes from item 8, re-run after the clamp
+because the clamp is on the CPU path too. Suite green, both clippy targets clean.
+
+**Not audited, and it is the reason this is worth reading twice:** `k` is not the only bitstream
+field used as a shift or a length. `deserialize_tile_rice` also reads `len_k` with `br.get(4)`
+(bounded to 15 by the field width, so fine) and stream lengths as Rice codes. **The general
+question — which other decoder inputs reach a shift, an index or an allocation unvalidated — is
+open and is not this item's.** GNC ships per-tile CRC-32 as an error-resilience feature, which
+means malformed input is a case the format explicitly expects to meet.
+
 ### BUG-34 — GNC requests 10 storage buffers per stage against a default of 8 (**DONE 2026-09-08**)
 
 Request is now **9**, via `gnc::required_limits()`. 10 was unused slack: naga counts
@@ -1503,6 +1543,57 @@ CLAUDE.md's portability prose corrected either way.
 
 **Why P2.** Same reasoning as BUG-31 — no measurement is invalidated and nothing fails on this
 machine — but the affected claim is a documented project rule, and step 1 may well be free.
+
+### BUG-41 — ENT-9 is filed twice with two different subjects, and item ids have no allocator (todo, P2)
+
+`main:BACKLOG.md` carries two startable `### ENT-9` headings for **different work**:
+
+```
+5691: ENT-9 — should abac be the default? (filed 18:29 by DOC-3)
+5864: ENT-9 — abac context-codes three decisions and bypasses the rest (filed 18:12 by ENT-3)
+```
+
+**Why this is worse than the decision-record collisions BUG-19 just fixed.** A duplicate `0018`
+misdirects a *reader*. A duplicate item id misdirects the **lock**: `refs/claims/ENT-9` is keyed on
+the string, so one claim covers both items. `scripts/claim items` prints ENT-9 twice, both `HELD` by
+the session that is in fact working only one of them, and `next` will never offer the other — so
+the second ENT-9 is **work that looks claimed and is not being done**, which is the failure mode
+COORDINATION.md's "Reserving an id is not filing the item" section is about, arriving by a different
+route.
+
+**Mechanism: `claim` allocates `BUG-N` and `dr-NNNN` and nothing else.** COORD-2 (`0050`) made the
+id come *out* of the compare-and-swap for exactly those two namespaces. Every other prefix — ENT,
+MEAS, RATE, TUNE, PERF, COORD, INTRA, PAD, TILE, DOC — is still picked by reading a file and
+choosing, which is the `0018` race one level up. Both ENT-9 filings did that and neither could see
+the other; they are 17 minutes apart.
+
+**And the session that collided was the one filing ids on purpose.** DOC-3's whole item was to give
+unnamed ideas an `ID (todo, P<n>)` so `next` can offer them (`docs/decisions/0060`); it picked ENT-9
+seventeen minutes after ENT-9 was taken. That is the strongest available argument that this is not
+a carelessness bug.
+
+**To close:**
+
+1. Renumber the later-filed, unclaimed heading — DOC-3's — to the first free `ENT-` id, and repoint
+   its inbound references. It is the later of the two *and* the one no session holds, so both of
+   `0059`'s rules agree; the tie-breaker that matters here is that the other id is a **live claim
+   ref**, and renaming a held item silently orphans it.
+2. Teach `claim` an allocator for any item prefix (`scripts/claim item ENT "<why>"`), built the
+   same way as `claim bug`: union committed `main:BACKLOG.md` with live `refs/claims/*`, CAS the
+   first gap, retry on a lost race.
+3. Make `claim items` **refuse** on a duplicate startable id rather than printing it twice, and add
+   the assertion to `claim selftest`. A queue that lists the same id twice is the observable
+   symptom, and it was visible for an hour before anyone read it as a defect.
+
+**Success criterion:** one startable heading per id on `main`, `scripts/claim item <PREFIX>` racing
+N processes to N distinct ids in `selftest`, and a `claim items` that fails loudly on a duplicate.
+
+**Why P2.** Invalidates no measurement — no codec path is involved — but it is losing work, which
+is what the `BUG-32` incident cost eleven hours to discover. Filed 2026-09-08 by the `drnum`
+session, immediately after BUG-19, while checking whether the same class of collision existed
+elsewhere in the id namespace. It does: 12 ids have duplicate headings, and **11 of the 12 are the
+documented "status entry plus original filing" convention and are fine** — ENT-9 is the only pair
+where two different pieces of work share a startable id.
 
 ### BUG-35 — five more compute entry points are over the workgroup budget; the default path is done, the rANS half is not (todo, P2)
 
@@ -4071,13 +4162,33 @@ own comment says why: the boundary is content-dependent — q=95 on blue_sky, q=
 the reason the fallback codes both ways instead of guessing. The honest fix compares *sequence*
 bytes, which needs the GOP encoded both ways or a model of the residual cost.
 
-**Its other half is free and is a correction to `0040`.** A bit-exact frame's reference *is* its
-colour-converted source, which both forward transforms only read — so `local_decode_iframe_gpu`
-could copy it instead of re-running the encode `encode_as_reference` now pays for. `0040` point 4
-measured that route at 21.37 dB and reverted it, **but BUG-39 cause 2 was live at the time**, so the
-P-frames were decoding a wavelet residual as a MED prediction regardless of the reference. The
-refutation does not survive its own cause being fixed, and the instrument to settle it already
-exists: `fallback_iframe_reference_matches_the_decoders`.
+**The free half was tried on 2026-09-08 and does not work — but now for a measured reason, which
+is the useful part.** The idea: a bit-exact frame's reference *is* its colour-converted source, and
+both forward transforms only read `plane_a` / `co_plane` / `cg_plane`, so `local_decode_iframe_gpu`
+could copy those instead of paying the third encode. `0040` point 4 measured 21.37 dB and reverted,
+and that refutation *was* confounded by BUG-39 cause 2. Implemented and put under `0044`'s
+instrument — diffing the encoder's reference against the decoder's, which is the oracle 0040 never
+ran:
+
+| case | max abs(enc − dec), Y | pixels differing |
+|---|---|---|
+| q=95..99, sibling kept (the RATE-3 case) | **0.0000** | 0 / 65 536 |
+| q=100, MED | **254.0039** | 65 535 / 65 536 |
+| q=100, `GNC_MED=0` (lossless wavelet) | 7.3965 | 65 535 / 65 536 |
+
+**So the source planes are not the picture the decoder reconstructs, and the tell is in the
+values**: the encoder's are fractional (`0.0, −0.5019531, −0.00390625, 0.49414063, …`) where the
+decoder's reference is integral (`0.0, −1.0, −1.0, −1.0, …`) — identical on both q=100 runs, so it
+is not MED-specific and not the transform. Something between the deinterleaver and the reference
+makes the reconstructed picture integral, and the raw source planes have not been through it.
+**Reverted; the tree is unchanged.** The unexplained half is why the fallback case matches to
+0.0000 while both q=100 cases do not, and that is where this restarts — not with another mechanism
+guess.
+
+**Related, and not this item's to fix:** if the decoder's own reference at q=100 is integral where
+its *output* is bit-exact, those are two different pictures and the P-frames predict from the
+first. BUG-39 owns that surface (its cause 4 is sub-pel rounding in the prediction path); this is a
+separate question about the reference, raised there rather than acted on here.
 
 **Success criterion:** no point in RATE-3's table larger than the control arm, mean no worse than
 today's −4.28%, worst P within 0.1 dB. **Canary:** the two existing ones — RATE-2's per-frame

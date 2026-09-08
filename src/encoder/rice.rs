@@ -67,6 +67,17 @@ pub const RICE_MAX_STREAM_BYTES: usize = 4096;
 /// `rice_encode.wgsl` and `rice_decode.wgsl`.
 pub const RICE_MAX_GROUPS: usize = 12;
 
+/// The largest Golomb-Rice parameter a valid GNC bitstream can carry.
+///
+/// Every `k` written by the encoder comes from `optimal_k`, which clamps to `0..=15`, so
+/// this is not a policy choice — it is what the format already contains. It exists because
+/// the *decoder* takes `k` off the wire as a raw byte, where a corrupt or hostile stream can
+/// say 255, and `k` is used as a shift distance on both the CPU (`1u32 << k`) and the GPU
+/// (`read_bits(k)`, `1u << shared_k[g]`). A shift of 32 or more is undefined in WGSL and
+/// panics or is masked in Rust depending on profile, so an unclamped `k` turns a bad byte
+/// into undefined behaviour inside the decoder rather than into a CRC failure.
+pub const RICE_MAX_K: u8 = 15;
+
 /// Bits set for every group present in a tile, used to detect "all groups skipped".
 pub fn all_groups_mask(num_groups: u32) -> u16 {
     let ng = num_groups.min(16);
@@ -916,16 +927,23 @@ pub fn deserialize_tile_rice(data: &[u8]) -> (RiceTile, usize) {
     }
 
     // k_values + k_zrl_nz_values + k_zrl_z_values + skip_bitmap
-    let k_values = take_bytes(data, &mut pos, num_groups as usize);
-    let k_zrl_nz_values = take_bytes(data, &mut pos, num_groups as usize);
-    let k_zrl_z_values = take_bytes(data, &mut pos, num_groups as usize);
+    //
+    // Clamped to RICE_MAX_K on the way in, because every one of these bytes ends up as a
+    // shift distance and a valid stream never exceeds 15 (see RICE_MAX_K). Clamping here
+    // covers the CPU reference decoder and the GPU packer in one place; it cannot change any
+    // well-formed stream, and it turns a corrupt byte into wrong pixels the per-tile CRC-32
+    // catches instead of an undefined shift.
+    let clamp_k = |v: Vec<u8>| -> Vec<u8> { v.into_iter().map(|k| k.min(RICE_MAX_K)).collect() };
+    let k_values = clamp_k(take_bytes(data, &mut pos, num_groups as usize));
+    let k_zrl_nz_values = clamp_k(take_bytes(data, &mut pos, num_groups as usize));
+    let k_zrl_z_values = clamp_k(take_bytes(data, &mut pos, num_groups as usize));
     let skip_bitmap = read_skip_bitmap(data, &mut pos, num_groups);
 
     // Checkerboard per-odd-stream k (128 odd streams × ck_stride groups,
     // present only when TILE_FLAG_CHECKERBOARD_K set)
     let k_stream_odd = if has_ck {
         let ck_bytes = 128 * ck_stride(num_groups);
-        take_bytes(data, &mut pos, ck_bytes)
+        clamp_k(take_bytes(data, &mut pos, ck_bytes))
     } else {
         Vec::new()
     };
@@ -1053,6 +1071,53 @@ mod tests {
 
         let decoded = rice_decode_tile(&deserialized);
         assert_eq!(coefficients, decoded);
+    }
+
+    /// A corrupt `k` byte must not become a shift distance.
+    ///
+    /// `k` is deserialised as a raw byte and used as a shift on both decode paths
+    /// (`1u32 << k` on the CPU, `read_bits(k)` and `1u << shared_k[g]` in
+    /// `rice_decode.wgsl`). The encoder can only ever write 0..=15 — `optimal_k` clamps —
+    /// so nothing in a round-trip test can reach this. Corrupt the serialised bytes
+    /// directly, which is what a damaged stream or a hostile one does.
+    #[test]
+    fn a_corrupt_k_byte_is_clamped_and_never_becomes_a_shift_of_32() {
+        let mut coefficients = vec![0i32; 65536];
+        for i in (0..65536).step_by(3) {
+            coefficients[i] = (i % 15) as i32 - 7;
+        }
+        let tile = rice_encode_tile(&coefficients, 256, 3);
+        let clean = serialize_tile_rice(&tile);
+
+        let (parsed, _) = deserialize_tile_rice(&clean);
+        assert!(!parsed.k_values.is_empty(), "need a tile with k blocks to corrupt");
+
+        // Corrupt every byte of the header region in turn rather than hard-coding where the
+        // k blocks start: the invariant is "no k above RICE_MAX_K, whatever the bytes say",
+        // and asserting it for every byte cannot go stale when the header layout changes.
+        // The stream payload is the bulk of the file and cannot carry a k, so stopping
+        // before it keeps this a fast test.
+        let header_len = (clean.len() - parsed.stream_data.len()).min(clean.len());
+        for i in 0..header_len {
+            for bad in [0xFFu8, 0x80, 0x20] {
+                let mut corrupt = clean.clone();
+                corrupt[i] = bad;
+                // Must not panic, and no k may exceed RICE_MAX_K.
+                let (t, _) = deserialize_tile_rice(&corrupt);
+                for &k in t
+                    .k_values
+                    .iter()
+                    .chain(t.k_zrl_nz_values.iter())
+                    .chain(t.k_zrl_z_values.iter())
+                    .chain(t.k_stream_odd.iter())
+                {
+                    assert!(
+                        k <= RICE_MAX_K,
+                        "byte {i} = {bad:#x} produced k = {k}, above RICE_MAX_K"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

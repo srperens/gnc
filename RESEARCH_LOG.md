@@ -1260,24 +1260,33 @@ quantity here, not a control.
 `out.chroma_format = cfg.chroma_format` makes the candidate honest, and the fallback then fires:
 bbb 4:2:0 q=99 takes the bit-exact file at 1 847 304 B against 1 898 635 B, **−2.70%**.
 
-**And 38.66 dB → 34.73 dB, −3.9 dB.** The reason is not the fix. It is that `q=100` on subsampled
-chroma is not lossless **and not even in luma**, which subsampling does not touch:
+**And a large colour regression.** The reason is not the fix: `q=100` on subsampled chroma is much
+worse in *colour* than `q=99`. dE00 against the source, each arm forced with
+`GNC_LOSSLESS_FALLBACK=0`:
 
-| still | format | q | y | u | v |
-|---|---|---|---|---|---|
-| blue_sky | 4:2:0 | 100 | **51.16** | 43.23 | 44.74 |
-| blue_sky | 4:2:0 | 95 | 53.09 | 56.73 | 57.88 |
-| kristensara | 4:2:2 | 100 | **51.04** | 43.63 | 43.54 |
-| kristensara | 4:2:0 | 100 | **51.85** | 45.76 | 44.31 |
-| bbb | 4:2:2 | 100 | **47.34** | 37.10 | 38.71 |
-| bbb | 4:2:0 | 100 | **47.66** | 37.43 | 39.30 |
+| still | format | dE00 mean q=95 | q=99 | **q=100** | p95 q=99 | **p95 q=100** |
+|---|---|---|---|---|---|---|
+| blue_sky | 4:2:2 | 0.333 | 0.115 | **2.307** | 0.664 | **7.358** |
+| blue_sky | 4:2:0 | 0.354 | 0.139 | **1.949** | 0.727 | **5.742** |
+| bbb | 4:2:2 | 0.801 | 0.735 | **2.723** | 2.348 | **6.575** |
+| bbb | 4:2:0 | 1.017 | 0.960 | **2.557** | 3.210 | **6.146** |
+| kristensara | 4:2:2 | 0.408 | 0.140 | **2.142** | 0.716 | **5.649** |
+| kristensara | 4:2:0 | 0.423 | 0.160 | **1.888** | 0.746 | **4.850** |
 
-4:4:4 at q=100 is exact (`inf`). Whole-image RGB, q=100 against q=95 at the same format: blue_sky
-4:2:2 38.90 vs 52.05, 4:2:0 40.38 vs 51.60; kristensara 4:2:2 40.19 vs 51.72; touchdown 4:2:2 40.72
-vs 51.75; bbb 4:2:0 34.73 vs 38.56. **8.5–13.1 dB, four of four images, and 4:2:2 comes out worse
-than 4:2:0 on three of them** — an inversion, since 4:2:2 keeps twice the chroma. Filed as
-**BUG-49 (P1)** with the plane-geometry hypothesis the inversion points at: 4:2:2 halves width
-only, so anything assuming both dimensions shift together reads wrong there and "right" at 4:2:0.
+**2.7x to 20x worse, 6 of 6 points**, p95 above 4.8 everywhere, and 4:4:4 at q=100 is exact (dE00
+0.0000). The inversion survives in this metric and is *specific to q=100*: 4:2:2 beats 4:2:0 at
+q=95 and q=99 as it must (0.333 vs 0.354, 0.115 vs 0.139 on blue_sky) and loses to it at q=100 on
+all three images. Filed as **BUG-49 (P1)**.
+
+**Retracted on the way, and it is CLAUDE.md's own example.** The first version of this entry and of
+BUG-49 said "`q=100` is not lossless *even in luma*", from per-plane PSNR on the decoded RGB
+converted to `yuv444p` — 47-52 dB. That is the contaminated measurement CLAUDE.md warns about
+("a luma computed from decoded RGB is contaminated by chroma error", recorded there at 3.7x
+overstatement). In **YCoCg-R**, the plane GNC actually codes, luma at q=100 is **the best of the
+three rungs**: 57.4-66.9 dB against 52.3-52.7 at q=95. The luma claim is withdrawn; the colour
+defect above is what is real, and it is larger than the thing that was retracted. Cost of the
+error: one wrong filing, live on `main` for about an hour, corrected in the same session by running
+`scripts/ypsnr_de00.py` — which the rule says to use first for anything touching chroma.
 
 ### What shipped: an honest candidate and an explicit refusal
 

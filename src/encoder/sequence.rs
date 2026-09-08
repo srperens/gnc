@@ -1505,9 +1505,9 @@ impl EncoderPipeline {
         //
         // **4:4:4 only, deliberately, and the obstacle is BUG-49 rather than the trigger.**
         // BUG-46 made `lossless_sibling` carry the caller's chroma format, so the trigger's number
-        // is honest now — but on subsampled chroma `q=100` is **not lossless even in luma**
-        // (blue_sky 4:2:0: y 51.16, u 43.23, against q=95's y 53.09, u 56.73), so the bit-exact
-        // arm is 8.5-13.1 dB worse in RGB than the arm it would replace. There is no two-axis win
+        // is honest now — but on subsampled chroma `q=100` is **2.7x to 20x worse in colour than
+        // `q=99`** (dE00 mean 0.139 -> 1.949 on blue_sky 4:2:0, p95 0.727 -> 5.742), so the
+        // bit-exact arm is worse on the axis it would be chosen to protect. There is no two-axis win
         // to collect until that is fixed, which is why `encode` refuses the same comparison for
         // stills (`0078`). This gate comes off with **BUG-49**, and the sequence sweep at 4:2:2
         // and 4:2:0 is part of that item, not this one.

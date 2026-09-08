@@ -1603,19 +1603,23 @@ impl EncoderPipeline {
 
         // **A fourth refusal, and it is a refusal to compare rather than a refusal to code.**
         // This whole decision rests on the bit-exact candidate being better on *both* axes when
-        // it is smaller. On subsampled chroma it is not: `q=100` at 4:2:2 / 4:2:0 is **not
-        // lossless even in luma**, which subsampling does not touch. Measured against the source,
-        // per plane, at q=100 — 4:4:4 is exact (PSNR inf) and the subsampled formats are not:
+        // it is smaller. On subsampled chroma it is not: `q=100` there is **much worse in colour
+        // than `q=99`**. dE00 against the source (`scripts/ypsnr_de00.py`, the metric CLAUDE.md
+        // prescribes for anything touching chroma — VMAF and RGB PSNR cannot answer this):
         //
-        //   blue_sky   4:2:0   y 51.16  u 43.23  v 44.74     (q=95 at 4:2:0: y 53.09, u 56.73)
-        //   kristensara 4:2:2  y 51.04  u 43.63  v 43.54
-        //   bbb        4:2:2   y 47.34  u 37.10  v 38.71
+        //   blue_sky 4:2:2   mean 0.115 -> 2.307   p95 0.664 -> 7.358   (q=99 -> q=100)
+        //   blue_sky 4:2:0   mean 0.139 -> 1.949   p95 0.727 -> 5.742
+        //   bbb      4:2:0   mean 0.960 -> 2.557   p95 3.210 -> 6.146
         //
-        // So the candidate is 8.5-13.1 dB *worse* in RGB than the lossy arm it would replace, and
-        // taking it on bytes alone would trade 3.9 dB for 2.7% of rate at 4:2:0 — measured on bbb
-        // at q=99, which is exactly what BUG-46's one-line fix turned on before this refusal was
+        // 2.7x to 20x worse, and 4:4:4 at q=100 is exact (dE00 0.0000), so it is specific to
+        // subsampled input. Taking the candidate on bytes alone would trade that for 2.7% of rate
+        // at 4:2:0 — which is exactly what BUG-46's one-line fix turned on before this refusal was
         // added. That defect is **BUG-49**; until it is fixed there is no two-axis win to collect
         // here, and this must stay a refusal rather than become a rate/quality trade.
+        //
+        // (An earlier version of this comment claimed a *luma* defect. Withdrawn: that came from
+        // RGB converted to yuv444p, which CLAUDE.md warns is contaminated by chroma error. In
+        // YCoCg-R, luma at q=100 is the best of the three rungs.)
         //
         // Before BUG-46 the same input was refused *by accident*: `lossless_sibling` did not carry
         // `chroma_format`, so the candidate was always a 4:4:4 encode and never won. The sibling

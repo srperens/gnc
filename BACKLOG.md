@@ -1839,6 +1839,27 @@ third-party crate `block v0.1.6`, not a lint on this code.
 
 Filed 2026-09-07 by the `coord` session.
 
+### BUG-38 — `cargo fmt --check` is red across the tree, and GOALS §9 names it as a gate (todo, P4)
+
+GOALS §9 says code "must pass `cargo fmt` and `cargo clippy` with zero warnings". `cargo fmt
+--check` reports **566 diffs in 61 files** — **504 in 44 files under `src/`**, 53 in 14 files
+under `tests/`, 9 in 3 under `examples/`. So unlike BUG-20, this is not a test-code question:
+the shipped code is the bulk of it.
+
+Measured 2026-09-08 on `main` at `a73e0a2`, by the `loopa` session while doing BUG-20 — same
+defect shape (a written rule and an unrun check disagreeing), found because BUG-20's entry asks
+which of the two is wrong and the same question applies one gate over.
+
+**Not fixed in passing, deliberately.** `cargo fmt` over 44 `src/` files is a diff that touches
+almost every module eight sessions are editing right now, and it would conflict with all of them
+while carrying no behaviour. The fix wants a quiet tree and one commit that changes nothing else,
+so it is a claimable item rather than something to do while holding another.
+
+**The decision to make is the same one BUG-20 has:** run `cargo fmt` once and add it to the gate
+list in CLAUDE.md and LOOP.md (neither of which mentions it today — only GOALS §9 does), or drop
+the `cargo fmt` half of GOALS §9 and say the project does not check formatting. Doing neither
+leaves a rule that has been false for an unknown length of time.
+
 ### ARCH-3 — `gpu_entropy_encode` selected a whole P-frame pipeline, not just where entropy runs (**DONE 2026-09-07**)
 
 **Fixed by separating the concerns, which was the option this entry argued for.** There is one

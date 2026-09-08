@@ -1556,20 +1556,39 @@ impl EncoderPipeline {
         height: u32,
         config: &CodecConfig,
     ) -> CompressedFrame {
-        let lossy = self.encode_once(ctx, rgb_data, width, height, config);
         // Three refusals. Already lossless: there is nothing to compare against. Not the wavelet:
         // `--dct` is an explicit request for a third transform, and swapping it for MED would
         // make the flag mean something else — this one was caught by
         // `test_block_dct_quality_preset` going red, which is what that test is for. And the flag
-        // itself, which `quality_preset` sets only for q = 95..=99 and the sequence paths clear.
+        // itself, which `quality_preset` sets only for q = 95..=99.
         if !config.lossless_fallback
             || config.is_lossless()
             || config.transform_type != crate::TransformType::Wavelet
         {
-            return lossy;
+            return self.encode_once(ctx, rgb_data, width, height, config);
         }
+
+        // **The order of these two encodes is load-bearing. Do not swap them back.**
+        //
+        // `encode_once` leaves state on the GPU that the sequence encoder reads as a side channel:
+        // the quantised planes (`Y → mc_out, Co → ref_upload, Cg → plane_b`) are how
+        // `local_decode_iframe_gpu` builds an I-frame's reference without a CPU entropy decode.
+        // Two encodes in a row therefore leave the *second* one's state behind, and if that is not
+        // the candidate we return, the reference is reconstructed from coefficients belonging to
+        // a different transform. Measured: with the lossless sibling running second on bbb q=95,
+        // where the *lossy* file is the smaller one and is kept, P-frames decoded at **9.83 dB**
+        // and the sequence grew **+40.55%** (RATE-3).
+        //
+        // Running the sibling first makes the side channel always the wavelet encode's, which is
+        // what that path expects — and the lossless branch of `local_decode_iframe_gpu` does not
+        // read it at all, because a bit-exact frame's reference is the source
+        // (`plane_a` / `co_plane` / `cg_plane`, which both forward transforms only *read*:
+        // `transform.forward` writes `plane_c` with `plane_b` as temp, and `med.forward` writes
+        // `plane_c`). So both outcomes are correct with this ordering and one is wrong with the
+        // other.
         let sibling = crate::lossless_sibling(config);
         let lossless = self.encode_once(ctx, rgb_data, width, height, &sibling);
+        let lossy = self.encode_once(ctx, rgb_data, width, height, config);
         let (lossy_bytes, lossless_bytes) = (
             crate::format::serialize_compressed(&lossy).len(),
             crate::format::serialize_compressed(&lossless).len(),

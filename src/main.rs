@@ -915,10 +915,10 @@ fn build_ip_config(
         gnc::manual_config(qstep.unwrap_or(4.0))
     };
     // RATE-2's lossless fallback is intra-only and this is one of the two funnels that refuse it.
-    // A MED I-frame carries `wavelet_levels = 0` and the P-frame path's reference cannot
-    // reconstruct from it — measured at 9.80 dB against 60.69 dB (RATE-3). The sequence encoder
-    // clears it again internally; this line is what stops the throwaway GPU warm-up encodes from
-    // paying for a second encode and printing a canary for a path that will not take it.
+    // RATE-3 investigated lifting this and could not: see its BACKLOG entry for what is
+    // established and the one measurement that would settle it. This line also stops the
+    // throwaway GPU warm-up encodes from paying for a second encode on a path that will not
+    // take it.
     config.lossless_fallback = false;
     if let Some(qs) = qstep {
         config.quantization_step = qs;

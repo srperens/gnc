@@ -904,7 +904,7 @@ mod tests {
             apply_cfl_predict_cpu(&chroma, &recon_y, &dq_alphas, w, h, tile_size, num_levels);
 
         // Inverse: reconstructed = residual + alpha * luma
-        let tiles_x = (w + tile_size - 1) / tile_size;
+        let tiles_x = w.div_ceil(tile_size);
         let nsb = num_subbands(num_levels) as usize;
         let mut reconstructed = vec![0.0f32; n];
         for gy in 0..h {

@@ -1038,11 +1038,11 @@ mod tests {
     #[test]
     fn test_rice_roundtrip_varied() {
         let mut coefficients = vec![0i32; 65536];
-        for i in 0..65536 {
+        for (i, c) in coefficients.iter_mut().enumerate() {
             let y = i / 256;
             let x = i % 256;
             let g = compute_subband_group(x as u32, y as u32, 256, 3);
-            coefficients[i] = match g {
+            *c = match g {
                 0 => ((x + y) % 40) as i32 + 10,
                 1 => {
                     if i % 5 == 0 {
@@ -1162,8 +1162,8 @@ mod tests {
     #[test]
     fn test_rice_negative_values() {
         let mut coefficients = vec![0i32; 65536];
-        for i in 0..65536 {
-            coefficients[i] = -((i % 10) as i32);
+        for (i, c) in coefficients.iter_mut().enumerate() {
+            *c = -((i % 10) as i32);
         }
 
         let tile = rice_encode_tile(&coefficients, 256, 3);
@@ -1253,7 +1253,7 @@ mod tests {
     /// A corrupt tile must parse without panicking so the per-tile CRC can reject it.
     #[test]
     fn corrupt_tile_parses_without_panic() {
-        let coefficients: Vec<i32> = (0..65536).map(|i| (i % 13) as i32 - 6).collect();
+        let coefficients: Vec<i32> = (0..65536).map(|i| (i % 13) - 6).collect();
         let tile = rice_encode_tile(&coefficients, 256, 5);
         let bytes = serialize_tile_rice(&tile);
         for pos in [0, 5, 17, 40, bytes.len() / 2, bytes.len() - 1] {

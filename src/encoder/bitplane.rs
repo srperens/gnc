@@ -734,8 +734,8 @@ mod tests {
         let n = (tile_size * tile_size) as usize;
         let mut coefficients = vec![0i32; n];
         // Simulate wavelet-like distribution: mostly zeros, some small values
-        for i in 0..n {
-            coefficients[i] = if i % 7 == 0 {
+        for (i, c) in coefficients.iter_mut().enumerate() {
+            *c = if i % 7 == 0 {
                 (i % 50) as i32 - 25
             } else if i % 3 == 0 {
                 (i % 10) as i32 - 5
@@ -773,8 +773,8 @@ mod tests {
         let tile_size = 256u32;
         let n = (tile_size * tile_size) as usize;
         let mut coefficients = vec![0i32; n];
-        for i in 0..n {
-            coefficients[i] = if i % 4 == 0 { (i % 10) as i32 - 5 } else { 0 };
+        for (i, c) in coefficients.iter_mut().enumerate() {
+            *c = if i % 4 == 0 { (i % 10) as i32 - 5 } else { 0 };
         }
         let tile = bitplane_encode_tile(&coefficients, tile_size);
         let serialized = serialize_tile_bitplane(&tile);

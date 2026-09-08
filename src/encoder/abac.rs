@@ -723,7 +723,7 @@ mod tests {
         roundtrip(&vec![0i32; 64 * 64], 64, "all zero");
         roundtrip(&vec![1i32; 64 * 64], 64, "all one");
         roundtrip(&vec![-1i32; 64 * 64], 64, "all minus one");
-        roundtrip(&(0..64 * 64).map(|i| (i % 7) as i32 - 3).collect::<Vec<_>>(), 64, "small cycle");
+        roundtrip(&(0..64 * 64).map(|i| (i % 7) - 3).collect::<Vec<_>>(), 64, "small cycle");
         // Sparse with a large outlier: exercises the Exp-Golomb suffix and the significance path.
         let mut sparse = vec![0i32; 64 * 64];
         sparse[0] = 1;
@@ -731,8 +731,8 @@ mod tests {
         sparse[64 * 64 - 1] = 4095;
         roundtrip(&sparse, 64, "sparse with outliers");
         // Non-square blocks happen at subband edges.
-        roundtrip(&(0..64 * 17).map(|i| ((i * 31) % 11) as i32 - 5).collect::<Vec<_>>(), 17, "17 wide");
-        roundtrip(&(0..5).map(|i| i as i32).collect::<Vec<_>>(), 5, "single row");
+        roundtrip(&(0..64 * 17).map(|i| ((i * 31) % 11) - 5).collect::<Vec<_>>(), 17, "17 wide");
+        roundtrip(&(0..5i32).collect::<Vec<_>>(), 5, "single row");
     }
 
     #[test]
@@ -743,7 +743,7 @@ mod tests {
 
     #[test]
     fn corrupt_stream_does_not_panic() {
-        let coefficients: Vec<i32> = (0..64 * 64).map(|i| (i % 13) as i32 - 6).collect();
+        let coefficients: Vec<i32> = (0..64 * 64).map(|i| (i % 13) - 6).collect();
         for coder in [Coder::Interval, Coder::Range] {
             let bytes = coder.encode_block(&coefficients, 64);
             for cut in [0, 1, 7, bytes.len() / 3, bytes.len() / 2] {

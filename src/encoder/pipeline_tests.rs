@@ -58,9 +58,11 @@ fn test_encode_sequence_all_iframes() {
     let f1 = make_gradient_frame(w, h, 5.0);
     let f2 = make_gradient_frame(w, h, 10.0);
 
-    let mut config = CodecConfig::default();
-    config.tile_size = 256;
-    config.keyframe_interval = 1; // all I-frames
+    let config = CodecConfig {
+        tile_size: 256,
+        keyframe_interval: 1, // all I-frames
+        ..Default::default()
+    };
 
     let frames: Vec<&[f32]> = vec![&f0, &f1, &f2];
     let compressed = enc.encode_sequence(&ctx, &frames, w, h, &config);
@@ -90,9 +92,11 @@ fn test_encode_sequence_ip_pattern() {
         .collect();
     let frame_refs: Vec<&[f32]> = frames_rgb.iter().map(|f| f.as_slice()).collect();
 
-    let mut config = CodecConfig::default();
-    config.tile_size = 256;
-    config.keyframe_interval = 9; // I [B×7] P pattern
+    let config = CodecConfig {
+        tile_size: 256,
+        keyframe_interval: 9, // I [B×7] P pattern
+        ..Default::default()
+    };
 
     let compressed = enc.encode_sequence(&ctx, &frame_refs, w, h, &config);
 
@@ -100,9 +104,9 @@ fn test_encode_sequence_ip_pattern() {
     assert_eq!(compressed[0].frame_type, FrameType::Intra);
     // Display order: I B B B B B B B P
     // Frames 1-7 are B-frames, frame 8 is the P-frame anchor
-    for i in 1..8 {
+    for (i, cf) in compressed.iter().enumerate().take(8).skip(1) {
         assert_eq!(
-            compressed[i].frame_type,
+            cf.frame_type,
             FrameType::Bidirectional,
             "Frame {i} should be Bidirectional"
         );
@@ -110,17 +114,17 @@ fn test_encode_sequence_ip_pattern() {
     assert_eq!(compressed[8].frame_type, FrameType::Predicted);
 
     // All inter frames must have motion fields
-    for i in 1..9 {
+    for (i, cf) in compressed.iter().enumerate().take(9).skip(1) {
         assert!(
-            compressed[i].motion_field.is_some(),
+            cf.motion_field.is_some(),
             "Inter frame {i} should have motion field"
         );
     }
 
     // B₄ (display index 4) is encoded as forward-only via #49 — backward_vectors=None.
     // All other B-frames are truly bidirectional.
-    for i in 1..8 {
-        let mf = compressed[i].motion_field.as_ref().unwrap();
+    for (i, cf) in compressed.iter().enumerate().take(8).skip(1) {
+        let mf = cf.motion_field.as_ref().unwrap();
         if i == 4 {
             // B₄-as-P: forward-only signal
             assert!(
@@ -151,9 +155,11 @@ fn test_pframe_roundtrip_quality() {
     let f0 = make_gradient_frame(w, h, 0.0);
     let f1 = make_gradient_frame(w, h, 2.0); // slight shift
 
-    let mut config = CodecConfig::default();
-    config.tile_size = 256;
-    config.keyframe_interval = 8;
+    let config = CodecConfig {
+        tile_size: 256,
+        keyframe_interval: 8,
+        ..Default::default()
+    };
 
     let frames: Vec<&[f32]> = vec![&f0, &f1];
     let compressed = enc.encode_sequence(&ctx, &frames, w, h, &config);
@@ -189,9 +195,11 @@ fn test_pframe_identical_frames_correct_decode() {
     let f0 = make_gradient_frame(w, h, 0.0);
     let f1 = f0.clone(); // identical frame
 
-    let mut config = CodecConfig::default();
-    config.tile_size = 256;
-    config.keyframe_interval = 8;
+    let config = CodecConfig {
+        tile_size: 256,
+        keyframe_interval: 8,
+        ..Default::default()
+    };
 
     let frames: Vec<&[f32]> = vec![&f0, &f1];
     let compressed = enc.encode_sequence(&ctx, &frames, w, h, &config);
@@ -241,9 +249,11 @@ fn test_sequence_decode_all_frames() {
         .collect();
     let frame_refs: Vec<&[f32]> = frames_rgb.iter().map(|f| f.as_slice()).collect();
 
-    let mut config = CodecConfig::default();
-    config.tile_size = 256;
-    config.keyframe_interval = 3; // I P P I P (no B-frames, ki < 4)
+    let config = CodecConfig {
+        tile_size: 256,
+        keyframe_interval: 3, // I P P I P (no B-frames, ki < 4)
+        ..Default::default()
+    };
 
     let compressed = enc.encode_sequence(&ctx, &frame_refs, w, h, &config);
 
@@ -281,18 +291,20 @@ fn test_bframe_sequence_roundtrip() {
         .collect();
     let frame_refs: Vec<&[f32]> = frames_rgb.iter().map(|f| f.as_slice()).collect();
 
-    let mut config = CodecConfig::default();
-    config.tile_size = 256;
-    config.keyframe_interval = 9; // ki >= 8 triggers B-frames
+    let config = CodecConfig {
+        tile_size: 256,
+        keyframe_interval: 9, // ki >= 8 triggers B-frames
+        ..Default::default()
+    };
 
     let compressed = enc.encode_sequence(&ctx, &frame_refs, w, h, &config);
     assert_eq!(compressed.len(), 9);
 
     // Verify frame types: I [B₁..B₇] P
     assert_eq!(compressed[0].frame_type, FrameType::Intra);
-    for i in 1..8 {
+    for (i, cf) in compressed.iter().enumerate().take(8).skip(1) {
         assert_eq!(
-            compressed[i].frame_type,
+            cf.frame_type,
             FrameType::Bidirectional,
             "Frame {i} should be Bidirectional"
         );
@@ -394,13 +406,15 @@ fn test_fused_quantize_histogram_matches_separate() {
     let frame = make_gradient_frame(w, h, 42.0);
 
     // Baseline: separate quantize + histogram (default path)
-    let mut config_separate = CodecConfig::default();
-    config_separate.use_fused_quantize_histogram = false;
-    config_separate.gpu_entropy_encode = true;
-    config_separate.per_subband_entropy = true;
-    config_separate.quantization_step = 4.0;
-    config_separate.dead_zone = 0.5;
-    config_separate.cfl_enabled = false;
+    let config_separate = CodecConfig {
+        use_fused_quantize_histogram: false,
+        gpu_entropy_encode: true,
+        per_subband_entropy: true,
+        quantization_step: 4.0,
+        dead_zone: 0.5,
+        cfl_enabled: false,
+        ..Default::default()
+    };
 
     let compressed_sep = enc.encode(&ctx, &frame, w, h, &config_separate);
     let decoded_sep = dec.decode(&ctx, &compressed_sep);
@@ -454,15 +468,17 @@ fn test_fused_quantize_histogram_with_aq() {
     let frame = make_gradient_frame(w, h, 17.0);
 
     // Baseline: separate path with AQ
-    let mut config_separate = CodecConfig::default();
-    config_separate.use_fused_quantize_histogram = false;
-    config_separate.gpu_entropy_encode = true;
-    config_separate.per_subband_entropy = true;
-    config_separate.quantization_step = 4.0;
-    config_separate.dead_zone = 0.5;
-    config_separate.cfl_enabled = false;
-    config_separate.adaptive_quantization = true;
-    config_separate.aq_strength = 0.5;
+    let config_separate = CodecConfig {
+        use_fused_quantize_histogram: false,
+        gpu_entropy_encode: true,
+        per_subband_entropy: true,
+        quantization_step: 4.0,
+        dead_zone: 0.5,
+        cfl_enabled: false,
+        adaptive_quantization: true,
+        aq_strength: 0.5,
+        ..Default::default()
+    };
 
     let compressed_sep = enc.encode(&ctx, &frame, w, h, &config_separate);
     let decoded_sep = dec.decode(&ctx, &compressed_sep);
@@ -514,14 +530,16 @@ fn test_block_dct_roundtrip() {
     let h = 256;
     let rgb = make_gradient_frame(w, h, 0.0);
 
-    let mut config = CodecConfig::default();
-    config.tile_size = 256;
-    config.transform_type = TransformType::BlockDCT8;
-    config.cfl_enabled = false;
-    config.adaptive_quantization = false;
-    config.use_fused_quantize_histogram = false;
-    config.quantization_step = 2.0;
-    config.dead_zone = 0.0;
+    let mut config = CodecConfig {
+        tile_size: 256,
+        transform_type: TransformType::BlockDCT8,
+        cfl_enabled: false,
+        adaptive_quantization: false,
+        use_fused_quantize_histogram: false,
+        quantization_step: 2.0,
+        dead_zone: 0.0,
+        ..Default::default()
+    };
     // DCT path uses Rice: GPU rANS encoder requires wavelet levels > 0
     config.entropy_coder = crate::EntropyCoder::Rice;
 
@@ -586,14 +604,16 @@ fn test_block_dct_multitile() {
     let h = 512;
     let rgb = make_gradient_frame(w, h, 0.0);
 
-    let mut config = CodecConfig::default();
-    config.tile_size = 256;
-    config.transform_type = TransformType::BlockDCT8;
-    config.cfl_enabled = false;
-    config.adaptive_quantization = false;
-    config.use_fused_quantize_histogram = false;
-    config.quantization_step = 2.0;
-    config.dead_zone = 0.0;
+    let mut config = CodecConfig {
+        tile_size: 256,
+        transform_type: TransformType::BlockDCT8,
+        cfl_enabled: false,
+        adaptive_quantization: false,
+        use_fused_quantize_histogram: false,
+        quantization_step: 2.0,
+        dead_zone: 0.0,
+        ..Default::default()
+    };
     // DCT path uses Rice: GPU rANS encoder requires wavelet levels > 0
     config.entropy_coder = crate::EntropyCoder::Rice;
 
@@ -634,14 +654,16 @@ fn test_block_dct_nonaligned() {
     let h = 300;
     let rgb = make_gradient_frame(w, h, 0.0);
 
-    let mut config = CodecConfig::default();
-    config.tile_size = 256;
-    config.transform_type = TransformType::BlockDCT8;
-    config.cfl_enabled = false;
-    config.adaptive_quantization = false;
-    config.use_fused_quantize_histogram = false;
-    config.quantization_step = 2.0;
-    config.dead_zone = 0.0;
+    let mut config = CodecConfig {
+        tile_size: 256,
+        transform_type: TransformType::BlockDCT8,
+        cfl_enabled: false,
+        adaptive_quantization: false,
+        use_fused_quantize_histogram: false,
+        quantization_step: 2.0,
+        dead_zone: 0.0,
+        ..Default::default()
+    };
     // DCT path uses Rice: GPU rANS encoder requires wavelet levels > 0
     config.entropy_coder = crate::EntropyCoder::Rice;
 
@@ -978,7 +1000,7 @@ fn test_block_dct_noisy_content() {
         // Now verify the ACTUAL compressed frame's Rice tiles
         // CPU-decode the Rice tiles from the compressed frame and compare to the direct quant data
         if let EntropyData::Rice(ref tiles) = compressed99.entropy {
-            let tiles_per_plane = (tiles_x as usize) * (tiles_y as usize);
+            let tiles_per_plane = tiles_x * tiles_y;
             eprintln!(
                 "Rice tiles: {} total, {} per plane, num_levels={}",
                 tiles.len(),
@@ -987,11 +1009,12 @@ fn test_block_dct_noisy_content() {
             );
 
             // Decode plane 0 (Y) from the compressed frame's Rice tiles
+            assert!(tiles.len() >= tiles_per_plane, "fewer tiles than one plane needs");
             let mut cpu_decoded_plane = vec![0.0f32; sz];
-            for t in 0..tiles_per_plane {
-                let tx_i = t % tiles_x as usize;
-                let ty_i = t / tiles_x as usize;
-                let decoded_tile = rice::rice_decode_tile(&tiles[t]);
+            for (t, tile) in tiles.iter().enumerate().take(tiles_per_plane) {
+                let tx_i = t % tiles_x;
+                let ty_i = t / tiles_x;
+                let decoded_tile = rice::rice_decode_tile(tile);
                 for row in 0..tile_size {
                     for col in 0..tile_size {
                         let py = ty_i * tile_size + row;
@@ -1148,9 +1171,9 @@ fn test_block_dct_color_debug() {
         crate::gpu_util::read_buffer_f32(&ctx, &enc.cached.as_ref().unwrap().mc_out, npix);
     let enc_plane_a =
         crate::gpu_util::read_buffer_f32(&ctx, &enc.cached.as_ref().unwrap().plane_a, npix);
-    let enc_ref_upload =
+    let _enc_ref_upload =
         crate::gpu_util::read_buffer_f32(&ctx, &enc.cached.as_ref().unwrap().ref_upload, npix);
-    let enc_plane_b =
+    let _enc_plane_b =
         crate::gpu_util::read_buffer_f32(&ctx, &enc.cached.as_ref().unwrap().plane_b, npix);
 
     // Per-channel PSNR for DCT
@@ -1688,10 +1711,10 @@ fn test_block_dct_color_debug() {
 
                 // CPU-decode Rice tiles
                 let mut rice_decoded = vec![0.0f32; sz];
-                for t in 0..tiles_per_plane {
+                for (t, tile) in plane_tiles.iter().enumerate() {
                     let tx_i = t % tiles_x;
                     let ty_i = t / tiles_x;
-                    let decoded = crate::encoder::rice::rice_decode_tile(&plane_tiles[t]);
+                    let decoded = crate::encoder::rice::rice_decode_tile(tile);
                     for row in 0..tile_size {
                         for col in 0..tile_size {
                             let py_coord = ty_i * tile_size + row;
@@ -1781,9 +1804,11 @@ fn test_motion_comp_effectiveness() {
     let f1 = make_textured_frame(w, h, shift_px, 0);
     let f2 = make_textured_frame(w, h, shift_px * 2, 0);
 
-    let mut config = CodecConfig::default();
-    config.tile_size = 256;
-    config.keyframe_interval = 10;
+    let config = CodecConfig {
+        tile_size: 256,
+        keyframe_interval: 10,
+        ..Default::default()
+    };
 
     let frames: Vec<&[f32]> = vec![&f0, &f1, &f2];
     let compressed = enc.encode_sequence(&ctx, &frames, w, h, &config);
@@ -1812,7 +1837,7 @@ fn test_motion_comp_effectiveness() {
     // Decode and verify quality — all frames should decode cleanly
     let decoded = dec.decode_sequence(&ctx, &compressed);
     for (i, dec_frame) in decoded.iter().enumerate() {
-        let psnr = compute_psnr(&frames[i], dec_frame);
+        let psnr = compute_psnr(frames[i], dec_frame);
         eprintln!("  Frame {i}: PSNR={psnr:.2} dB");
         assert!(psnr > 25.0, "Frame {i} PSNR too low: {psnr:.2} dB");
     }
@@ -1840,9 +1865,11 @@ fn test_motion_comp_identical_frames_small_pframe() {
     let h = 256;
     let frame = make_textured_frame(w, h, 0, 0);
 
-    let mut config = CodecConfig::default();
-    config.tile_size = 256;
-    config.keyframe_interval = 10;
+    let config = CodecConfig {
+        tile_size: 256,
+        keyframe_interval: 10,
+        ..Default::default()
+    };
 
     // 3 identical frames
     let frames: Vec<&[f32]> = vec![&frame, &frame, &frame];
@@ -2156,7 +2183,7 @@ fn test_intra_prediction_modes_sanity() {
     let h = 256u32;
     // Horizontal gradient: should prefer horizontal prediction
     let mut rgb = Vec::with_capacity((w * h * 3) as usize);
-    for y in 0..h {
+    for _y in 0..h {
         for x in 0..w {
             let v = (x as f32 / w as f32 * 255.0).clamp(0.0, 255.0);
             rgb.push(v);
@@ -2253,10 +2280,12 @@ fn test_pframe_divergence_checkpoints() {
     // (an optimization since the reference won't be used again), which means
     // gpu_ref_planes would still contain the I-frame reference.
     let mut enc = EncoderPipeline::new(&ctx);
-    let mut config = CodecConfig::default();
-    config.tile_size = 256;
-    config.keyframe_interval = 30; // P-frame for frame 1+
-    config.gpu_entropy_encode = true;
+    let config = CodecConfig {
+        tile_size: 256,
+        keyframe_interval: 30, // P-frame for frame 1+
+        gpu_entropy_encode: true,
+        ..Default::default()
+    };
 
     // Use f1 as both frame 1 and frame 2 (content doesn't matter for frame 2)
     let frames: Vec<&[f32]> = vec![&f0, &f1, &f1];
@@ -2769,12 +2798,14 @@ fn test_temporal_wavelet_roundtrip_per_plane() {
     let f0 = make_gradient_frame(w, h, 0.0);
     let f1 = make_gradient_frame(w, h, 30.0);
 
-    let mut config = CodecConfig::default();
-    config.tile_size = 256;
-    config.quantization_step = 4.0;
-    config.keyframe_interval = 1;
-    config.temporal_transform = TemporalTransform::Haar;
-    config.cfl_enabled = false;
+    let config = CodecConfig {
+        tile_size: 256,
+        quantization_step: 4.0,
+        keyframe_interval: 1,
+        temporal_transform: TemporalTransform::Haar,
+        cfl_enabled: false,
+        ..Default::default()
+    };
 
     let frames: Vec<&[f32]> = vec![&f0, &f1];
     let seq = enc.encode_sequence_temporal_wavelet(&ctx, &frames, w, h, &config, TemporalTransform::Haar, 2);
@@ -2809,12 +2840,14 @@ fn test_temporal_wavelet_planes_are_distinct() {
     // Build spatial wavelet coefficients for one frame.
     let frame = make_gradient_frame(w, h, 0.0);
 
-    let mut config = CodecConfig::default();
-    config.tile_size = 256;
-    config.quantization_step = 4.0;
-    config.keyframe_interval = 1;
-    config.temporal_transform = TemporalTransform::None;
-    config.cfl_enabled = false;
+    let config = CodecConfig {
+        tile_size: 256,
+        quantization_step: 4.0,
+        keyframe_interval: 1,
+        temporal_transform: TemporalTransform::None,
+        cfl_enabled: false,
+        ..Default::default()
+    };
 
     let info = FrameInfo { width: w, height: h, bit_depth: 8, tile_size: config.tile_size, chroma_format: crate::ChromaFormat::Yuv444 };
     let prequant = enc.debug_wavelet_prequant(&ctx, &frame, &info, &config);
@@ -2867,10 +2900,12 @@ fn chroma_roundtrip(chroma_fmt: crate::ChromaFormat) -> f64 {
     let h = 256u32;
     let rgb = make_gradient_frame(w, h, 0.0);
 
-    let mut config = crate::CodecConfig::default();
-    config.chroma_format = chroma_fmt;
-    config.quantization_step = 4.0;
-    config.cfl_enabled = false; // CfL requires 444
+    let config = crate::CodecConfig {
+        chroma_format: chroma_fmt,
+        quantization_step: 4.0,
+        cfl_enabled: false, // CfL requires 444
+        ..Default::default()
+    };
 
     let compressed = encoder.encode(&ctx, &rgb, w, h, &config);
     let decoded = decoder.decode(&ctx, &compressed);
@@ -2921,10 +2956,12 @@ fn test_yuv420_encode_decode_roundtrip_512() {
     // Use solid gray (R=G=B=128) — with 4:2:0 chroma is flat, roundtrip should be ~inf dB
     let rgb: Vec<f32> = vec![128.0f32; (w * h * 3) as usize];
 
-    let mut config = crate::CodecConfig::default();
-    config.chroma_format = crate::ChromaFormat::Yuv420;
-    config.quantization_step = 4.0;
-    config.cfl_enabled = false;
+    let config = crate::CodecConfig {
+        chroma_format: crate::ChromaFormat::Yuv420,
+        quantization_step: 4.0,
+        cfl_enabled: false,
+        ..Default::default()
+    };
 
     let compressed = encoder.encode(&ctx, &rgb, w, h, &config);
     let decoded = decoder.decode(&ctx, &compressed);
@@ -2932,10 +2969,12 @@ fn test_yuv420_encode_decode_roundtrip_512() {
     eprintln!("YUV 4:2:0 512×512 PSNR = {psnr:.2} dB chroma_format={:?}", compressed.info.chroma_format);
 
     // Also test 4:4:4 at same settings to verify encoder/decoder work
-    let mut config2 = crate::CodecConfig::default();
-    config2.chroma_format = crate::ChromaFormat::Yuv444;
-    config2.quantization_step = 4.0;
-    config2.cfl_enabled = false;
+    let config2 = crate::CodecConfig {
+        chroma_format: crate::ChromaFormat::Yuv444,
+        quantization_step: 4.0,
+        cfl_enabled: false,
+        ..Default::default()
+    };
     let mut encoder2 = EncoderPipeline::new(&ctx);
     let decoder2 = crate::decoder::pipeline::DecoderPipeline::new(&ctx);
     let compressed2 = encoder2.encode(&ctx, &rgb, w, h, &config2);
@@ -2961,9 +3000,11 @@ fn test_chroma_format_bitstream_roundtrip() {
         crate::ChromaFormat::Yuv422,
         crate::ChromaFormat::Yuv420,
     ] {
-        let mut config = crate::CodecConfig::default();
-        config.chroma_format = fmt;
-        config.cfl_enabled = false;
+        let config = crate::CodecConfig {
+            chroma_format: fmt,
+            cfl_enabled: false,
+            ..Default::default()
+        };
 
         let compressed = encoder.encode(&ctx, &rgb, w, h, &config);
         let serialized = crate::format::serialize_compressed(&compressed);
@@ -2996,11 +3037,13 @@ fn pframe_chroma_sequence_psnr(chroma_fmt: crate::ChromaFormat) -> (f64, f64) {
     let f1 = make_gradient_frame(w, h, 10.0);
     let f2 = make_gradient_frame(w, h, 20.0);
 
-    let mut config = crate::CodecConfig::default();
-    config.chroma_format = chroma_fmt;
-    config.quantization_step = 4.0;
-    config.cfl_enabled = false; // CfL requires 444
-    config.keyframe_interval = 10; // I P P …
+    let config = crate::CodecConfig {
+        chroma_format: chroma_fmt,
+        quantization_step: 4.0,
+        cfl_enabled: false, // CfL requires 444
+        keyframe_interval: 10, // I P P …
+        ..Default::default()
+    };
 
     let frames: Vec<&[f32]> = vec![&f0, &f1, &f2];
     let compressed = encoder.encode_sequence(&ctx, &frames, w, h, &config);
@@ -3082,11 +3125,13 @@ fn bframe_yuv420_quality_check(w: u32, h: u32) {
         .collect();
     let frame_refs: Vec<&[f32]> = frames_rgb.iter().map(|f| f.as_slice()).collect();
 
-    let mut config = crate::CodecConfig::default();
-    config.chroma_format = crate::ChromaFormat::Yuv420;
-    config.cfl_enabled = false; // CfL requires 4:4:4
-    config.tile_size = 256;
-    config.keyframe_interval = 9; // I [B x7] P — one full pyramid group
+    let config = crate::CodecConfig {
+        chroma_format: crate::ChromaFormat::Yuv420,
+        cfl_enabled: false, // CfL requires 4:4:4
+        tile_size: 256,
+        keyframe_interval: 9, // I [B x7] P — one full pyramid group
+        ..Default::default()
+    };
 
     let compressed = encoder.encode_sequence(&ctx, &frame_refs, w, h, &config);
     assert_eq!(compressed.len(), 9);
@@ -3096,9 +3141,9 @@ fn bframe_yuv420_quality_check(w: u32, h: u32) {
     // vacuously, so check the structure before measuring quality.
     assert_eq!(compressed[0].frame_type, crate::FrameType::Intra, "frame 0 should be I");
     assert_eq!(compressed[8].frame_type, crate::FrameType::Predicted, "frame 8 should be P");
-    for i in 1..8 {
+    for (i, cf) in compressed.iter().enumerate().take(8).skip(1) {
         assert_eq!(
-            compressed[i].frame_type,
+            cf.frame_type,
             crate::FrameType::Bidirectional,
             "frame {i} should be B — scene-cut detection may have fired",
         );
@@ -3132,7 +3177,7 @@ fn bframe_yuv420_quality_check(w: u32, h: u32) {
     // split MV grid, which genuinely coincides with the chroma block grid — they were never
     // affected by the bug, so they are the in-test control.
     let reference = psnr[8];
-    for i in 1..8 {
+    for (i, &p) in psnr.iter().enumerate().take(8).skip(1) {
         if !true_b(i) {
             continue;
         }
@@ -3141,10 +3186,10 @@ fn bframe_yuv420_quality_check(w: u32, h: u32) {
         // worst B-frame sits 4.8 dB below P8; with it wrong the layer-3 frames fall 8-13 dB
         // below. 6 dB separates the two cleanly with ~1 dB margin on each side.
         assert!(
-            psnr[i] > reference - 6.0,
+            p > reference - 6.0,
             "{w}x{h} 4:2:0 B-frame {i} at {:.2} dB is more than 6 dB below the P-path \
              reference ({reference:.2} dB) — chroma MV grid or stride wrong? (BUG-1 / BUG-3)",
-            psnr[i],
+            p,
         );
     }
 }
@@ -3173,11 +3218,13 @@ fn test_multi_group_yuv420_anchor_pframe() {
         .collect();
     let frame_refs: Vec<&[f32]> = frames_rgb.iter().map(|f| f.as_slice()).collect();
 
-    let mut config = crate::CodecConfig::default();
-    config.chroma_format = crate::ChromaFormat::Yuv420;
-    config.cfl_enabled = false;
-    config.tile_size = 256;
-    config.keyframe_interval = 17; // I [B x7] P [B x7] P — two groups, one keyframe
+    let config = crate::CodecConfig {
+        chroma_format: crate::ChromaFormat::Yuv420,
+        cfl_enabled: false,
+        tile_size: 256,
+        keyframe_interval: 17, // I [B x7] P [B x7] P — two groups, one keyframe
+        ..Default::default()
+    };
 
     let compressed = encoder.encode_sequence(&ctx, &frame_refs, w, h, &config);
     assert_eq!(compressed.len(), n);
@@ -3241,11 +3288,13 @@ fn sequence_serialize_roundtrip(n: usize, ki: u32, w: u32, h: u32) {
         .collect();
     let refs: Vec<&[f32]> = frames_rgb.iter().map(|f| f.as_slice()).collect();
 
-    let mut config = crate::CodecConfig::default();
-    config.chroma_format = crate::ChromaFormat::Yuv420;
-    config.cfl_enabled = false;
-    config.tile_size = 256;
-    config.keyframe_interval = ki;
+    let config = crate::CodecConfig {
+        chroma_format: crate::ChromaFormat::Yuv420,
+        cfl_enabled: false,
+        tile_size: 256,
+        keyframe_interval: ki,
+        ..Default::default()
+    };
 
     let compressed = encoder.encode_sequence(&ctx, &refs, w, h, &config);
     let direct = decoder.decode_sequence(&ctx, &compressed);
@@ -3302,11 +3351,13 @@ fn test_byte_size_matches_serialized_length() {
         .collect();
     let refs: Vec<&[f32]> = frames_rgb.iter().map(|f| f.as_slice()).collect();
 
-    let mut config = crate::CodecConfig::default();
-    config.chroma_format = crate::ChromaFormat::Yuv420;
-    config.cfl_enabled = false;
-    config.tile_size = 256;
-    config.keyframe_interval = 9; // exercises I, B and P
+    let config = crate::CodecConfig {
+        chroma_format: crate::ChromaFormat::Yuv420,
+        cfl_enabled: false,
+        tile_size: 256,
+        keyframe_interval: 9, // exercises I, B and P
+        ..Default::default()
+    };
 
     for (i, c) in encoder
         .encode_sequence(&ctx, &refs, w, h, &config)
@@ -3338,9 +3389,11 @@ fn test_non444_falls_back_to_rice() {
             crate::EntropyCoder::Huffman,
             crate::EntropyCoder::Bitplane,
         ] {
-            let mut config = crate::CodecConfig::default();
-            config.chroma_format = fmt;
-            config.entropy_coder = coder;
+            let mut config = crate::CodecConfig {
+                chroma_format: fmt,
+                entropy_coder: coder,
+                ..Default::default()
+            };
             config.normalize_for_chroma();
             assert_eq!(
                 config.entropy_coder,
@@ -3350,9 +3403,11 @@ fn test_non444_falls_back_to_rice() {
         }
     }
     // 4:4:4 keeps whatever was asked for.
-    let mut c = crate::CodecConfig::default();
-    c.chroma_format = crate::ChromaFormat::Yuv444;
-    c.entropy_coder = crate::EntropyCoder::Rans;
+    let mut c = crate::CodecConfig {
+        chroma_format: crate::ChromaFormat::Yuv444,
+        entropy_coder: crate::EntropyCoder::Rans,
+        ..Default::default()
+    };
     c.normalize_for_chroma();
     assert_eq!(c.entropy_coder, crate::EntropyCoder::Rans);
 }
@@ -3401,8 +3456,10 @@ fn test_10bit_survives_the_frame_header() {
         }
     }
 
-    let mut config = crate::CodecConfig::default();
-    config.bit_depth = 10;
+    let config = crate::CodecConfig {
+        bit_depth: 10,
+        ..Default::default()
+    };
     let compressed = encoder.encode(&ctx, &rgb, w, h, &config);
 
     assert_eq!(
@@ -3446,9 +3503,11 @@ fn test_10bit_survives_the_sequence_container() {
         .collect();
     let refs: Vec<&[f32]> = frames.iter().map(|f| f.as_slice()).collect();
 
-    let mut config = crate::CodecConfig::default();
-    config.bit_depth = 10;
-    config.keyframe_interval = 4;
+    let config = crate::CodecConfig {
+        bit_depth: 10,
+        keyframe_interval: 4,
+        ..Default::default()
+    };
 
     let compressed = encoder.encode_sequence(&ctx, &refs, w, h, &config);
     assert_eq!(compressed.len(), 4);
@@ -3500,10 +3559,12 @@ fn test_rice_128x128_tiles() {
     let h = 256u32;
     let frame = make_gradient_frame(w, h, 0.0);
 
-    let mut config = CodecConfig::default();
-    config.tile_size = 128;
-    config.keyframe_interval = 1; // all I-frames
-    config.entropy_coder = EntropyCoder::Rice;
+    let config = CodecConfig {
+        tile_size: 128,
+        keyframe_interval: 1, // all I-frames
+        entropy_coder: EntropyCoder::Rice,
+        ..Default::default()
+    };
     // q=75 default (quantization_step=1/75 equivalent via CodecConfig::default)
 
     let frames: Vec<&[f32]> = vec![&frame];
@@ -3537,10 +3598,12 @@ fn test_bilinear_chroma_upsample_tile_boundary_422() {
     let h = 256u32;
     let frame = make_gradient_frame(w, h, 0.0);
 
-    let mut config = CodecConfig::default();
-    config.chroma_format = crate::ChromaFormat::Yuv422;
-    config.cfl_enabled = false;
-    config.keyframe_interval = 1;
+    let config = CodecConfig {
+        chroma_format: crate::ChromaFormat::Yuv422,
+        cfl_enabled: false,
+        keyframe_interval: 1,
+        ..Default::default()
+    };
 
     let frames: Vec<&[f32]> = vec![&frame];
     let compressed = enc.encode_sequence(&ctx, &frames, w, h, &config);
@@ -3563,10 +3626,12 @@ fn test_bilinear_chroma_upsample_tile_boundary_420() {
     let h = 256u32;
     let frame = make_gradient_frame(w, h, 15.0);
 
-    let mut config = CodecConfig::default();
-    config.chroma_format = crate::ChromaFormat::Yuv420;
-    config.cfl_enabled = false;
-    config.keyframe_interval = 1;
+    let config = CodecConfig {
+        chroma_format: crate::ChromaFormat::Yuv420,
+        cfl_enabled: false,
+        keyframe_interval: 1,
+        ..Default::default()
+    };
 
     let frames: Vec<&[f32]> = vec![&frame];
     let compressed = enc.encode_sequence(&ctx, &frames, w, h, &config);
@@ -3603,13 +3668,15 @@ fn test_10bit_roundtrip() {
         }
     }
 
-    let mut config = CodecConfig::default();
-    config.tile_size = 256;
-    config.quantization_step = 1.0; // near-lossless so pixel-exact comparison is valid
-    config.keyframe_interval = 1;
-    config.temporal_transform = TemporalTransform::None;
-    config.cfl_enabled = false;
-    config.bit_depth = 10;
+    let config = CodecConfig {
+        tile_size: 256,
+        quantization_step: 1.0, // near-lossless so pixel-exact comparison is valid
+        keyframe_interval: 1,
+        temporal_transform: TemporalTransform::None,
+        cfl_enabled: false,
+        bit_depth: 10,
+        ..Default::default()
+    };
 
     let compressed = enc.encode(&ctx, &frame, w, h, &config);
 
@@ -3732,11 +3799,13 @@ fn test_scene_cut_forced_keyframe() {
     let frames: Vec<&[f32]> = vec![&black, &slow_motion, &white, &white2, &white3];
 
     // With scene cut detection enabled (threshold=50), frame 2 should be forced I-frame.
-    let mut config = crate::CodecConfig::default();
-    config.tile_size = 256;
-    config.keyframe_interval = 8; // large interval so frame 2 would not be a natural keyframe
-    config.scene_cut_threshold = 50.0;
-    config.cfl_enabled = false;
+    let config = crate::CodecConfig {
+        tile_size: 256,
+        keyframe_interval: 8, // large interval so frame 2 would not be a natural keyframe
+        scene_cut_threshold: 50.0,
+        cfl_enabled: false,
+        ..Default::default()
+    };
 
     let compressed = enc.encode_sequence(&ctx, &frames, w, h, &config);
 
@@ -3791,11 +3860,13 @@ fn test_scene_cut_disabled_at_zero_threshold() {
 
     let frames: Vec<&[f32]> = vec![&black, &white, &white2];
 
-    let mut config = crate::CodecConfig::default();
-    config.tile_size = 256;
-    config.keyframe_interval = 8;
-    config.scene_cut_threshold = 0.0; // disabled
-    config.cfl_enabled = false;
+    let config = crate::CodecConfig {
+        tile_size: 256,
+        keyframe_interval: 8,
+        scene_cut_threshold: 0.0, // disabled
+        cfl_enabled: false,
+        ..Default::default()
+    };
 
     let compressed = enc.encode_sequence(&ctx, &frames, w, h, &config);
     assert_eq!(compressed.len(), 3);

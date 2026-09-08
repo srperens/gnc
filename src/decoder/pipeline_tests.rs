@@ -27,9 +27,11 @@ fn test_decode_to_texture_dimensions() {
     let h = 256;
     let frame_data = make_gradient_frame(w, h);
 
-    let mut config = CodecConfig::default();
-    config.tile_size = 256;
-    config.keyframe_interval = 1;
+    let config = CodecConfig {
+        tile_size: 256,
+        keyframe_interval: 1,
+        ..Default::default()
+    };
 
     let compressed = enc.encode_sequence(&ctx, &[frame_data.as_slice()], w, h, &config);
     assert_eq!(compressed.len(), 1);
@@ -53,9 +55,11 @@ fn test_decode_to_texture_non_square() {
     let h = 192;
     let frame_data = make_gradient_frame(w, h);
 
-    let mut config = CodecConfig::default();
-    config.tile_size = 64;
-    config.keyframe_interval = 1;
+    let config = CodecConfig {
+        tile_size: 64,
+        keyframe_interval: 1,
+        ..Default::default()
+    };
 
     let compressed = enc.encode_sequence(&ctx, &[frame_data.as_slice()], w, h, &config);
     let handle = dec.decode_to_texture(&ctx, &compressed[0]);

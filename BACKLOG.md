@@ -4090,6 +4090,45 @@ same PNG four times) codes `q=100` P-frames bit-exact at 3 198 bytes **before** 
 `all_skip_tiles=120/120`, so it went down the motion-skip path and never asked the transform for
 anything. A zero-residual probe cannot test a residual path.
 
+### BUG-44 — `read_reference_planes` reads a different stage on the two pipelines at `q=100` (todo, P3)
+
+**The instrument disagrees where the pictures do not, and it has already cost one session an
+afternoon's hypothesis.** RATE-4 diffed the encoder's reference against the decoder's on a
+256×256 gradient with `GNC_REF_DEBLOCK=0` and got:
+
+| case | max \|enc − dec\| on Y | pixels differing |
+|---|---|---|
+| q=95..99, bit-exact sibling kept | 0.0000 | 0 / 65 536 |
+| q=100, MED | **254.0039** | 65 535 / 65 536 |
+| q=100, `GNC_MED=0` | 7.3965 | 65 535 / 65 536 |
+
+with the encoder side *fractional* (`-0.5019531, -0.00390625, 0.49414063, …`) and the decoder side
+*integral* (`-1.0, -1.0, -1.0, …`). That reads as "the decoder predicts from a picture it does not
+decode", which would be a defect upstream of everything BUG-39 fixed.
+
+**It is not, and the evidence is decisive.** Since BUG-39 closed (`0064`), a `q=100` sequence is
+**bit-exact on every frame**, verified outside the harness with raw-RGB md5 through the real
+container: 48 of 48 frames on 3 sequences at ki=2 and ki=9. A P-frame cannot be md5-identical to
+its source while predicting from a picture the decoder does not hold — the residual is computed
+against the encoder's reference and added to the decoder's, so any difference between them lands
+in the output. So the two buffers `read_reference_planes` returns are **not the same stage of the
+pipeline** in this configuration, and the readback is what needs fixing.
+
+**Why it is worth an item rather than a comment.** This function is the repository's instrument of
+record for "do the two sides agree" — `0042` used it to find two causes, `0044` and RATE-4 used it
+after that, and CLAUDE.md's own lesson from `0040` is *diff the two things that must be equal
+before theorising*. An instrument that answers a different question in one configuration turns
+that lesson into a trap, and the trap only fires at `q=100`, which is the configuration nobody
+exercised until this week.
+
+**Where to look:** the encoder's side is fractional, which is the shape of colour-converted source
+*before* whatever rounds it, and the decoder's is integral, which is the shape of a reconstructed
+picture. One of the two is reading a buffer earlier in the chain than the other.
+
+**Success criterion:** at `q=100` MED, the two sides agree to 0.0000 on a frame that is known
+bit-exact end to end — or the function documents, in one sentence per pipeline, which stage it
+returns and why they differ.
+
 ### LOSSLESS-2 — at `q=100` inter costs +38% on camera content and wins 1.6% on animation (todo, P2)
 
 **Measured at identical pixels, which is the cleanest form this comparison can take.** Both arms
@@ -4232,6 +4271,21 @@ ran:
 | q=100, MED | **254.0039** | 65 535 / 65 536 |
 | q=100, `GNC_MED=0` (lossless wavelet) | 7.3965 | 65 535 / 65 536 |
 
+**CORRECTION 2026-09-08, and it inverts the conclusion: the two q=100 rows are an instrument
+artefact.** BUG-39 closed the same afternoon (`docs/decisions/0064`, `0f1d303`) with `q=100` video
+bit-exact on every frame — 48 of 48 md5-identical against source through a real container round
+trip, three sequences at ki=2 and ki=9. A P-frame cannot be md5-identical to its source if it
+predicted from a picture the decoder does not hold, so the two references *are* the same picture
+and **`read_reference_planes` returns a different stage on the two pipelines for the MED case**.
+The diff was measuring the readback.
+
+**What survives is the 0.0000 row, and it is the case the change targets.** The free half is
+therefore **not refuted** — re-apply `reference_is_the_source`, verify against
+`fallback_iframe_reference_matches_the_decoders` only, and treat any q=100 MED row from
+`read_reference_planes` as unreadable until that readback is fixed. If it holds, RATE-3's third
+encode goes away and `encode_as_reference` can be deleted. The paragraph below is kept because the
+observation in it is real; the conclusion drawn from it is withdrawn.
+
 **So the source planes are not the picture the decoder reconstructs, and the tell is in the
 values**: the encoder's are fractional (`0.0, −0.5019531, −0.00390625, 0.49414063, …`) where the
 decoder's reference is integral (`0.0, −1.0, −1.0, −1.0, …`) — identical on both q=100 runs, so it
@@ -4241,10 +4295,10 @@ makes the reconstructed picture integral, and the raw source planes have not bee
 0.0000 while both q=100 cases do not, and that is where this restarts — not with another mechanism
 guess.
 
-**Related, and not this item's to fix:** if the decoder's own reference at q=100 is integral where
-its *output* is bit-exact, those are two different pictures and the P-frames predict from the
-first. BUG-39 owns that surface (its cause 4 is sub-pel rounding in the prediction path); this is a
-separate question about the reference, raised there rather than acted on here.
+**~~Related, and not this item's to fix:~~ WITHDRAWN.** This entry raised a possible fifth BUG-39
+cause — the decoder holding two different pictures. It does not: BUG-39's 48-of-48 md5 result
+closes it, and the asymmetry that suggested it ("why does the fallback case match while q=100 does
+not") dissolves into the readback difference above. **There is no fifth cause; do not chase it.**
 
 **Success criterion:** no point in RATE-3's table larger than the control arm, mean no worse than
 today's −4.28%, worst P within 0.1 dB. **Canary:** the two existing ones — RATE-2's per-frame

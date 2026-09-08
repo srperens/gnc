@@ -2436,7 +2436,17 @@ frequency 1 everywhere the alphabet is uniform and the depth is 6). Both change 
 codebook, and therefore its bitstream, wherever clamping currently occurs. Not done for a parked
 coder.
 
-### COORD-2 — An id must come *from* the compare-and-swap, not be checked against it (todo, P2)
+### COORD-2 — An id must come *from* the compare-and-swap, not be checked against it (**DONE 2026-09-08**)
+
+**Built.** `scripts/claim bug "<why>"` and `scripts/claim dr "<why>"`. Each unions committed
+`main` (BACKLOG `BUG-N`, `git ls-tree main docs/decisions/`) with live `refs/claims/*`, CAS
+the first gap, retries on a lost race. `take dr-NNNN` remains for a number you already hold.
+`claim selftest` now races 8 `bug` allocators and 8 `dr` allocators: **8 claimed, 8 distinct**
+both times. This item's record is `0049`, allocated by `claim dr`. Decision `0049`.
+
+Original filing follows.
+
+### COORD-2 — An id must come *from* the compare-and-swap, not be checked against it (original filing)
 
 `scripts/claim` made picking *work* atomic and it did not make picking an *id* atomic. The cost so
 far, all on 2026-09-07: **`BUG-25` used twice** (Vulkan shader / P-frame dequant), **`BUG-26` used

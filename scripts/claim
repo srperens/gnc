@@ -41,9 +41,9 @@ scripts/claim -- the lock for concurrent sessions (COORDINATION.md, "Start of se
 Take an item out of rotation without holding it as a session:
   claim take --as blocked-<reason> <ITEM> "<why>"
 
-Reserve a decision-record number before writing the file -- `main` already carries two 0018s
-because two sessions both read `ls docs/decisions/` and both computed "next is 0018":
-  claim take dr-0021 "<title>"
+Allocate the next free id *as* the reservation (COORD-2). Do not pick a number and then take it:
+  claim bug "<why>"                next free BUG-N, reserved in the same CAS
+  claim dr  "<why>"                next free dr-NNNN, reserved in the same CAS
 USAGE
   exit "${1:-1}"
 }
@@ -398,6 +398,62 @@ cmd_worktree() {
     echo "took over worktree $base from $o (its session is gone)"
 }
 
+# --- id allocation: the number comes *out* of the CAS (COORD-2) --------------------------------
+#
+# `take dr-NNNN` excludes another taker of that string. It never reads the namespace, so a number
+# that has been on `main` for hours still reserves, and two sessions that both computed "next is
+# 0031" still both get it. `claim next` already closed that for work items by making the pick be
+# the CAS. These two commands do the same for BUG-N and dr-NNNN: union committed `main` with live
+# `refs/claims/*`, CAS the first gap, retry on a lost race.
+
+used_bug_numbers() {
+  {
+    backlog_source | grep -oE 'BUG-[0-9]+' | sed 's/^BUG-//'
+    git for-each-ref --format='%(refname:lstrip=2)' refs/claims/ | sed -n 's/^BUG-//p'
+  } | grep -E '^[0-9]+$' || true
+}
+
+used_dr_numbers() {
+  {
+    git ls-tree --name-only main docs/decisions/ 2>/dev/null \
+      | sed -n 's|.*/||; s/^\([0-9][0-9][0-9][0-9]\)-.*/\1/p'
+    git for-each-ref --format='%(refname:lstrip=2)' refs/claims/ | sed -n 's/^dr-//p'
+  } | sed 's/^0*//' | grep -E '^[1-9][0-9]*$' || true
+}
+
+first_free_number() {
+  awk '
+    { if ($1 + 0 > 0) a[$1 + 0] = 1 }
+    END { for (i = 1; i <= 100000; i++) if (!a[i]) { print i; exit } }
+  '
+}
+
+# kind is "bug" or "dr". Prints the claimed id on success.
+cmd_alloc() {
+  local kind=$1; shift
+  local note="$*"
+  [ -n "$note" ] || { echo "$kind needs a reason: scripts/claim $kind \"<why>\"" >&2; return 2; }
+  [ -n "${CLAIM_AS:-}" ] || require_own_worktree || return 1
+  local n id attempt
+  for attempt in $(seq 64); do
+    case "$kind" in
+      bug) n=$(used_bug_numbers | first_free_number); id="BUG-$n" ;;
+      dr)  n=$(used_dr_numbers  | first_free_number); id=$(printf 'dr-%04d' "$n") ;;
+      *) echo "internal: unknown alloc kind $kind" >&2; return 2 ;;
+    esac
+    if try_take "$id" "$note"; then
+      echo "claimed $id as $(me)"
+      echo "  reserved; file a BACKLOG heading / docs/decisions/ stub with this id before the session ends"
+      return 0
+    fi
+  done
+  echo "REFUSED: could not reserve a $kind id after 64 CAS attempts" >&2
+  return 1
+}
+
+cmd_bug() { cmd_alloc bug "$@"; }
+cmd_dr()  { cmd_alloc dr  "$@"; }
+
 # The canary CLAUDE.md asks for: proof the mutual exclusion is real, not asserted. Two properties,
 # because they fail differently -- one item must have exactly one winner, and N sessions picking
 # from one queue must end up on N different items.
@@ -433,8 +489,36 @@ cmd_selftest() {
   [ "$ngot" -eq "$nuniq" ] || { echo "FAIL: two pickers got the same item"; rc=1; }
   for j in $(seq "$m"); do "$0" drop --force "SELF$$-$j" >/dev/null 2>&1; done
 
+  # COORD-2: N callers of `claim bug` at once get N distinct numbers. Real allocator,
+  # then drop: the ids are the first gaps in the live namespace, held only for this test.
+  local b=8 k gotb nuniq_b
+  for k in $(seq "$b"); do
+    ( CLAIM_AS="selftest-bug-$k" "$0" bug "racer $k" \
+        >"$out/b$k.ok" 2>"$out/b$k.err"; echo $? >"$out/b$k.rc" ) &
+  done
+  wait
+  gotb=$(sed -n 's/^claimed \(BUG-[0-9][0-9]*\) .*/\1/p' "$out"/b*.ok | sort)
+  ngot=$(echo "$gotb" | grep -c . ); nuniq_b=$(echo "$gotb" | sort -u | grep -c . )
+  echo "claim bug, $b racing processes: $ngot claimed, $nuniq_b distinct"
+  [ "$ngot" -eq "$b" ] || { echo "FAIL: expected all $b bug allocators to get an id"; rc=1; }
+  [ "$ngot" -eq "$nuniq_b" ] || { echo "FAIL: two bug allocators got the same id"; echo "$gotb"; rc=1; }
+  for id in $gotb; do "$0" drop --force "$id" >/dev/null 2>&1; done
+
+  local d=8 gotd nuniq_d
+  for k in $(seq "$d"); do
+    ( CLAIM_AS="selftest-dr-$k" "$0" dr "racer $k" \
+        >"$out/d$k.ok" 2>"$out/d$k.err"; echo $? >"$out/d$k.rc" ) &
+  done
+  wait
+  gotd=$(sed -n 's/^claimed \(dr-[0-9][0-9]*\) .*/\1/p' "$out"/d*.ok | sort)
+  ngot=$(echo "$gotd" | grep -c . ); nuniq_d=$(echo "$gotd" | sort -u | grep -c . )
+  echo "claim dr, $d racing processes: $ngot claimed, $nuniq_d distinct"
+  [ "$ngot" -eq "$d" ] || { echo "FAIL: expected all $d dr allocators to get an id"; rc=1; }
+  [ "$ngot" -eq "$nuniq_d" ] || { echo "FAIL: two dr allocators got the same id"; echo "$gotd"; rc=1; }
+  for id in $gotd; do "$0" drop --force "$id" >/dev/null 2>&1; done
+
   rm -rf "$out"
-  [ "$rc" -eq 0 ] && echo "PASS: claims are atomic, and so is the pick"
+  [ "$rc" -eq 0 ] && echo "PASS: claims are atomic, the pick is atomic, and so is id allocation"
   return "$rc"
 }
 
@@ -449,6 +533,8 @@ case "${1:-}" in
   owner)       shift; cmd_owner "$@" ;;
   list|ls|"")  cmd_list ;;
   selftest)    cmd_selftest ;;
+  bug)         shift; cmd_bug "$@" ;;
+  dr)          shift; cmd_dr "$@" ;;
   -h|--help|help) usage 0 ;;
   *) echo "unknown subcommand: $1" >&2; usage 1 ;;
 esac

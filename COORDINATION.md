@@ -114,14 +114,17 @@ currently carries **two** files numbered `0018` — `0018-gnc-is-broad-on-purpos
 `0018-the-entropy-coders-are-level-and-0015s-prediction-was-wrong.md` — plus an 0020 that had to
 be renumbered from 0018 by hand. Same mechanism as the MEAS-9 collision: two sessions read
 `ls docs/decisions/`, both computed "next is 0018", and neither could see the other. The lock
-already handles this — **reserve the number before you write the file**:
+already handles this — **do not pick a number**. `scripts/claim dr` (and `claim bug`) walk
+committed `main` *and* live `refs/claims/*` and CAS the first gap, so the id comes *out* of
+the compare-and-swap (COORD-2, `docs/decisions/0049`):
 
 ```bash
-scripts/claim take dr-0019 "the pick is the lock"   # non-zero: someone has it, use the next one
+scripts/claim dr "the pick is the lock"    # prints dr-NNNN; that is the reservation
+scripts/claim bug "why, briefly"          # prints BUG-N
 ```
 
-Reserving costs one command and is the difference between picking a number and being *given*
-one. Drop it once the record is merged.
+`take dr-NNNN` still exists for a number you already hold. It is not how you get one. Drop
+the claim once the record is merged.
 
 **`0024` is now colliding too** — `0024-the-gpu-abac-encoder-counts-before-it-writes.md` (ENT-5)
 and `0024-the-jpeg-2000-gap-is-upstream-of-the-entropy-coder.md` (INTRA-1), both on `main`, both
@@ -179,10 +182,11 @@ habits would have caught the `0018`, `0024` and `0027` pairs therefore depends o
 winner had committed by the time the loser looked — unknown for those three, so do not read them as
 evidence for either habit.
 
-**Only COORD-2's build closes the third case**, and its title is the design: the number must come
-*out* of the compare-and-swap rather than be checked against it — walk `git ls-tree main
-docs/decisions/` and `refs/claims/dr-*` together and CAS the first gap, so reading and reserving
-are one operation. Until then these two commands are mitigation, not a fix.
+**COORD-2's build closes the third case** (`docs/decisions/0049`): `scripts/claim dr` and
+`scripts/claim bug` walk `git ls-tree main` and `refs/claims/*` together and CAS the first
+gap, so reading and reserving are one operation. `claim selftest` races 8 allocators of each
+kind and asserts distinct ids. The `ls-tree` + `claim list` habits below remain useful as a
+read of the namespace; they are no longer how you reserve.
 
 Caught this time by reading `scripts/claim list` against `ls docs/decisions/` during unrelated
 cleanup, before the file was written — luck, not process. The right-oracle correction came from the
@@ -431,6 +435,7 @@ If this table and `scripts/claim list` disagree, the table is wrong.
 
 | worktree | branch | area |
 |---|---|---|
+| `../gnc-coord2` | `coord2` | **COORD-2 — `claim bug` / `claim dr` allocate the next id as the CAS.** First gap over committed `main` plus `refs/claims/*`; lost races retry. `selftest` 8+8 distinct. This record is `0049`, allocated by the new command. No codec change. |
 | `../gnc-bug32` | `bug32` | **BUG-32 FIXED — `--throughput` on `benchmark-sequence`.** Skips CPU PSNR/SSIM, the all-I arm, and decode retention. Default unchanged. `--density` now passes it. k=1 n=8 wall 2.467 s → 0.541 s, bytes identical. Decision `0046`. |
 | `../gnc-rebaseline` | `rebaseline` | **MEAS-10 DONE 2026-09-08.** Re-took BASELINE at `0a1b055`. Stills q=25/50/75 bpp −4.3/−4.8/−4.9% from PAD-1 (`GNC_PAD_FILL=replicate` reproduces the old rows); q=90 unchanged. Sequences replaced the withdrawn I+P+B/BUG-27 rows; on camera content at q=90 inter costs more than all-intra. QUAL-1 ladder **+90.5% → +89.2%** (bbb +128.5, old_town +70.2, crowd_run +68.8). No fps. No codec change. |
 | `../gnc-abac`, `.claude/worktrees/abac` (`abac-gate`) | `abac` | **released — question answered, see BACKLOG Part 6.** The idle-machine bench is run. Range at cb=64 costs **1.69× frame decode for −16.7% rate** at q=90; Interval costs 3.99×. Rice's own entropy stage is 47% of frame decode, which caps any entropy work at 1.9×. What remains is a positioning call, not an engineering one. |

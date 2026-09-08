@@ -4,6 +4,24 @@
 
 ---
 
+## COORD-2 — `claim bug` / `claim dr` (2026-09-08)
+
+**Hypothesis.** `take dr-NNNN` cannot close the 0018-race because the read and the reservation
+are two operations, and it cannot see numbers already on `main` because it never looks there.
+Making the pick *be* the CAS, the way `claim next` already does for work items, should hand N
+racing callers N distinct ids.
+
+**What changed.** `scripts/claim bug` and `scripts/claim dr`. First gap over `git show
+main:BACKLOG.md` / `git ls-tree main docs/decisions/` union `refs/claims/*`. Lost CAS retries.
+This record is `0049`, printed by `claim dr` — canary that the allocator consulted `main`
+(0046 is a file) and live claims (0044, 0045, 0047, 0048 were held) rather than `ls` of this
+worktree.
+
+**selftest.** 8 processes on `claim bug`: 8 claimed, 8 distinct. 8 on `claim dr`: 8 claimed,
+8 distinct. Combined with the existing 16-racer / 6-picker tests: PASS.
+
+No codec change. No measurement moved.
+
 ## BUG-32 — `benchmark-sequence --throughput` (2026-09-08)
 
 **Hypothesis.** 86% of `benchmark-sequence` wall clock is CPU PSNR/SSIM plus a second all-I

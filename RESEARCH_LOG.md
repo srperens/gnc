@@ -4,6 +4,56 @@
 
 ---
 
+## RATE-4 — the free reference is not free, and `0040` point 4 fails for a different reason than it recorded (2026-09-08)
+
+**Hypothesis.** RATE-3 pays a third encode of any I-frame whose bit-exact candidate wins, purely to
+make the GPU side channel belong to the candidate that was kept. A bit-exact frame's reference *is*
+its colour-converted source, and both forward transforms only read `plane_a` / `co_plane` /
+`cg_plane`, so copying those would be exact by construction, free, and independent of which
+candidate ran last. `0040` point 4 rejected this at 21.37 dB — with BUG-39 cause 2 live, so the
+P-frames were inverting a wavelet residual as a MED prediction whatever the reference held. That
+refutation does not survive its own cause being fixed.
+
+**Implemented (`reference_is_the_source`, gated on bit-exact + 4:4:4 + no intra prediction) and put
+under the instrument `0040` never ran: a direct diff of the encoder's reference against the
+decoder's.**
+
+| case | max abs(enc − dec) on Y | pixels differing |
+|---|---|---|
+| q=95..99, bit-exact sibling kept (RATE-3's case) | **0.0000** | 0 / 65 536 |
+| q=100, MED | **254.0039** | 65 535 / 65 536 |
+| q=100, `GNC_MED=0`, lossless wavelet | 7.3965 | 65 535 / 65 536 |
+
+**Refuted, and reverted — the tree is unchanged.** But the refutation is now a measurement of the
+two buffers that must be equal, not a PSNR read through three other defects, and it points
+somewhere specific. The encoder's source planes are **fractional** where the decoder's reference is
+**integral**:
+
+```
+q=100 Y  enc[0..6] = [0.0, -0.5019531, -0.00390625, 0.49414063, 0.9921875, 1.4902344]
+         dec[0..6] = [0.0, -1.0,       -1.0,        -1.0,        -1.0,      -1.0     ]
+```
+
+The encoder's row is **byte-identical between the MED and the lossless-wavelet run**, so this is
+not the transform and not MED: `plane_a` holds the same thing either way, and it is not what the
+decoder reconstructs. Something between the deinterleaver and the reference makes the reconstructed
+picture integral — a lossless colour transform is integer-exact by definition — and the raw source
+planes have not been through it. That is one grep away for whoever picks this up, and it is a
+better place to start than another mechanism hypothesis.
+
+**The half this does not explain, and the reason it is not closed:** the q=95..99 fallback case
+matches to **0.0000** under the same code. Two lossless MED frames, one matching the decoder
+exactly and one off by 254, is not a difference the "fractional versus integral" story accounts for
+on its own. Anyone resuming should start there rather than with the q=100 rows.
+
+**Raised with the BUG-39 session rather than acted on:** if the decoder's own reference at q=100 is
+integral where its decoded output is bit-exact, then the decoder holds two different pictures and
+the P-frames predict from the wrong one. That is BUG-39's surface (its cause 4 is sub-pel rounding
+in the prediction path), and it may be a fifth cause rather than anything about RATE-2's fallback.
+
+The other half of RATE-4 — choosing the candidate on *sequence* bytes instead of the I-frame's own,
+which is what makes bbb q=99 regress +0.58% — is untouched.
+
 ## RATE-3 — the gate was hiding the mirror image of the bug `0040` fixed (2026-09-08)
 
 **Hypothesis.** `0036` refuses RATE-2's lossless fallback inside a sequence because the P-frames

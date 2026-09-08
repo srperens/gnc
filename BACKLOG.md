@@ -3897,13 +3897,33 @@ own comment says why: the boundary is content-dependent — q=95 on blue_sky, q=
 the reason the fallback codes both ways instead of guessing. The honest fix compares *sequence*
 bytes, which needs the GOP encoded both ways or a model of the residual cost.
 
-**Its other half is free and is a correction to `0040`.** A bit-exact frame's reference *is* its
-colour-converted source, which both forward transforms only read — so `local_decode_iframe_gpu`
-could copy it instead of re-running the encode `encode_as_reference` now pays for. `0040` point 4
-measured that route at 21.37 dB and reverted it, **but BUG-39 cause 2 was live at the time**, so the
-P-frames were decoding a wavelet residual as a MED prediction regardless of the reference. The
-refutation does not survive its own cause being fixed, and the instrument to settle it already
-exists: `fallback_iframe_reference_matches_the_decoders`.
+**The free half was tried on 2026-09-08 and does not work — but now for a measured reason, which
+is the useful part.** The idea: a bit-exact frame's reference *is* its colour-converted source, and
+both forward transforms only read `plane_a` / `co_plane` / `cg_plane`, so `local_decode_iframe_gpu`
+could copy those instead of paying the third encode. `0040` point 4 measured 21.37 dB and reverted,
+and that refutation *was* confounded by BUG-39 cause 2. Implemented and put under `0044`'s
+instrument — diffing the encoder's reference against the decoder's, which is the oracle 0040 never
+ran:
+
+| case | max abs(enc − dec), Y | pixels differing |
+|---|---|---|
+| q=95..99, sibling kept (the RATE-3 case) | **0.0000** | 0 / 65 536 |
+| q=100, MED | **254.0039** | 65 535 / 65 536 |
+| q=100, `GNC_MED=0` (lossless wavelet) | 7.3965 | 65 535 / 65 536 |
+
+**So the source planes are not the picture the decoder reconstructs, and the tell is in the
+values**: the encoder's are fractional (`0.0, −0.5019531, −0.00390625, 0.49414063, …`) where the
+decoder's reference is integral (`0.0, −1.0, −1.0, −1.0, …`) — identical on both q=100 runs, so it
+is not MED-specific and not the transform. Something between the deinterleaver and the reference
+makes the reconstructed picture integral, and the raw source planes have not been through it.
+**Reverted; the tree is unchanged.** The unexplained half is why the fallback case matches to
+0.0000 while both q=100 cases do not, and that is where this restarts — not with another mechanism
+guess.
+
+**Related, and not this item's to fix:** if the decoder's own reference at q=100 is integral where
+its *output* is bit-exact, those are two different pictures and the P-frames predict from the
+first. BUG-39 owns that surface (its cause 4 is sub-pel rounding in the prediction path); this is a
+separate question about the reference, raised there rather than acted on here.
 
 **Success criterion:** no point in RATE-3's table larger than the control arm, mean no worse than
 today's −4.28%, worst P within 0.1 dB. **Canary:** the two existing ones — RATE-2's per-frame

@@ -1233,8 +1233,19 @@ implementation held to the defaults.
 
 **Three things to settle, and the third is the point.**
 
-1. **Which shader needs the tenth buffer?** Find it. If one stage can be split or two buffers
-   merged, the override goes away and rule 4 is true again.
+1. **Which shader needs the tenth buffer? None — this is already answered.** Verified 2026-09-08
+   (found by the BUG-32/COORD-2 session, re-checked here):
+   `for f in src/shaders/*.wgsl; do echo "$(grep -cE 'var<storage' $f)  $f"; done | sort -rn`
+   puts **`block_match_bidir.wgsl` alone at 9** — bindings 1–9 storage, binding 0 the uniform —
+   and the next four shaders at 7. So **10 → 9 in `src/lib.rs:1431` is free** and needs no shader
+   change. That does not retire the override, since 9 is still above the default's 8, which is why
+   it is not worth a commit on its own: getting to **8** means that one shader shedding one
+   buffer, and it has two obvious merge candidates — `fwd_motion_vectors` + `bwd_motion_vectors`
+   are both `read_write array<i32>`, and `predictor_fwd_mvs` + `predictor_bwd_mvs` are both
+   `read array<i32>`. **Price the merge before starting it:** this is the B-frame bidirectional
+   path, B-frames have been off by default since BUG-5, and this same file is the DX12 FXC X3695
+   failure and was BUG-25's crash site. A low-traffic file with three open reasons for caution is
+   either the ideal first target or the worst one, and that judgement is this item's to make.
 2. **If the override has to stay, it is a decision, not a line of code.** CLAUDE.md already says
    raising a request "is unmeasured and would need a decision record, not a commit" — that applies
    to a request already raised.
@@ -4289,10 +4300,19 @@ bit-exactness surface to maintain.
 **Canary:** a per-frame count of stripes coded and barriers executed under `GNC_PROFILE`, and the
 existing byte-exactness gate `scripts/ent5_gpu_encode_gate.sh` unchanged and green.
 
-**Do not measure step 2 with `benchmark-sequence` or `gpu_tier_bench.py --density`.** BUG-32
-(merged 2026-09-08) found that command spends **86% of its wall clock on CPU quality metrics**, so
-its frames-per-second is SSIM throughput, not GPU encode. Use `--density-still`. The rate half of
-this item is unaffected either way — bytes are deterministic.
+**Which instrument, because two of the obvious ones are wrong** (from BUG-32's session,
+2026-09-08). `gpu_tier_bench.py --density` and any `frames / wall` from `benchmark-sequence` are
+out: that command spends **86% of its wall clock on CPU quality metrics**, so its frames per second
+is SSIM throughput. `--density-still` is the right instrument for the criterion above — it sweeps
+`benchmark`, which loops on one still frame at 1080p 4:4:4 — **and for exactly that reason it
+cannot say anything about inter**. If this item is ever extended to P/B residuals, the figure to
+use is `benchmark-sequence`'s own **printed encode timing** (BASELINE quantity A, 208.7 ms for 8
+frames in the BUG-32 run), which times the encode phase and is unaffected by the defect. Two
+further cautions on `--density-still`: ~705 ms of fixed startup plus 6.8 ms per iteration of
+non-GPU work, so 24% overhead at the default `--iterations` — run it large; and power sampling is
+`nvidia-smi` only and swallows its own errors, so on Metal the power table is silently absent and
+that is not evidence of an idle GPU. The rate half of this item is unaffected by all of it — bytes
+are deterministic.
 
 **Why P2.** It is the only remaining idea with a credible path to abac's decode cost, and step 1
 is an afternoon with an existing harness. Against that: the throughput half cannot be measured on

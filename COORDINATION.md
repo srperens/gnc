@@ -221,6 +221,38 @@ Two habits, both cheap:
   work and repeating it. Three of the rows in the table above were written by sessions that are
   gone; that is normal here, so this check belongs in the takeover, not in an incident.
 
+## Two sessions cannot merge in the shared checkout at the same time
+
+**Found 2026-09-08, by causing it.** The `intrasym` session ran `git merge --no-ff intrasym` in the
+shared checkout while the `ent7bpc` session had a merge **already in progress there** with a
+conflicted `RESEARCH_LOG.md` and its RATE-2 changes staged. Git refused the second merge —
+`fatal: Exiting because of an unresolved conflict` — which reads exactly like a conflict in *your
+own* merge. It was not: it was a refusal to start. The reflex that follows, `git merge --abort`,
+then **threw away the other session's merge state.**
+
+**Nothing was lost, and that is the part worth knowing before anyone panics.** An abort discards a
+merge in progress, never commits: RATE-2's work, `0036` included, was still on `ent7bpc` at
+`7c3768d`, and redoing the merge is one command. But the other session's `--abort`-shaped hole
+appears with no explanation, and the abort was performed by someone who had no idea a merge was
+underway.
+
+**The rule this needs.** There is exactly one working tree on `main` and eight sessions merge into
+it, so **look before you merge, and never abort a merge you did not start:**
+
+```bash
+git -C "$REPO" status --short          # dirty or `UU` means someone else is mid-merge — wait
+ls "$REPO/.git/MERGE_HEAD" 2>/dev/null # exists = a merge is in progress and it may not be yours
+```
+
+If `MERGE_HEAD` exists and you did not create it, stop: leave it alone and come back, or merge from
+your own worktree instead (`git -C "$REPO-$AREA" push` to a branch and let the owner merge). A
+fast-forward (`git merge --ff-only`) touches the least and is the right shape when your branch is
+already based on the current `main`.
+
+**And read a merge refusal literally.** "Exiting because of an unresolved conflict" with no
+conflict markers from *your* merge means the tree was already busy. `git status` distinguishes the
+two cases in one line.
+
 ## Builds queue on one lock, and that looks like a hang
 
 Each worktree has its own `target/`, so builds no longer block on each other's **target** lock —

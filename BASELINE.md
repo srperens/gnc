@@ -137,7 +137,7 @@ Three different quantities have been called "encode fps" here. State which one, 
 | | what it times | measured 2026-09-06 (1080p, ki=8, Rice, **the Mac, labelled M1 — see above**, machine not idle) |
 |---|---|---|
 | **A — GPU encode phase** | `benchmark-sequence` with Y4M input | **27.8 fps** (was 12.2) |
-| **B — encoder loop** | the figure `encode-sequence` prints | **19.4 fps** (was 5.6) |
+| **B — encoder loop** | the figure `encode-sequence` prints — **includes PNG decode**, see below | **19.4 fps** (was 5.6) |
 | **C — end to end** | wall clock around `encode-sequence`, PNG input | **15.4 fps** (was 5.0) |
 
 **Re-taken 2026-09-08 on an idle machine (MEAS-12), median of 3, same parameters — 1080p, 8 frames,
@@ -147,6 +147,23 @@ sessions on this Mac and **every quantity was understated by 2.3x to 3.5x**. `--
 BUG-32's 86% finding applies to the command's wall clock and not to this table's figures.
 
 **A is 1.8x C**, not 2.4x. Use A to compare against another codec's encoder, C to claim throughput.
+
+**Quantity B was never an encoder figure, and the tool now says so (BUG-53, 2026-09-08).**
+`encode-sequence` reads PNG and calls its frame source *inside* the timed region, so every PNG
+decode lands in the figure it prints. Measured directly by the command now: **123.7 ms of 460.4 ms
+— 27%**, about 15 ms per 1080p frame. It prints three lines instead of one:
+
+```
+Encoded 8 frames (1I + 7P) in 460.4ms (17.4 fps) — includes PNG decode
+  of which input decode 123.7ms (27%); coding alone 336.7ms (23.8 fps)
+```
+
+So **B splits into 23.8 fps of coding and 17.4 fps combined**, and the 19.4 fps in the table above
+is the combined figure from a run without the split. **Quote the coding line against another
+encoder.** It still does not equal quantity A (23.8 against 27.8 fps): the residue is the rest of
+`encode-sequence`'s host-side loop, which is the same 29-of-65-ms finding MEAS-12 decomposed.
+**PNG input is not a sensible way to measure fps at all** — `benchmark-sequence` with Y4M avoids
+the decode entirely, which is what quantity A is.
 
 **The decomposition is the useful part, because it says where the time is not going.** Per frame:
 GPU encode phase **36 ms**, encoder loop **51 ms**, end to end **65 ms** — so **29 of the 65 ms is

@@ -3993,6 +3993,37 @@ The honest next step is neither of those: it is **amortising per-process startup
 clip instead of buffering it**, because those are what the two density runs actually measured. Until
 they are fixed, a density number on any hardware measures pipeline compilation.
 
+### BUG-53 — `encode-sequence` printed an fps figure with input decode inside it (**FIXED 2026-09-08**)
+
+**Raised by the project owner:** PNG as input is not a sensible way to measure fps, because the time
+lands in the image decode instead. Correct, and worse than a documentation problem — the decode was
+inside the *timed region*, so it was inside the number the tool printed as its throughput figure.
+`encode-sequence` calls its frame source from within `encode_sequence_streaming`, and `start` is
+taken immediately before that call, so every PNG decode counted.
+
+**Measured directly by the command now, not inferred:** **123.7 ms of 460.4 ms — 27%**, about 15 ms
+per 1080p frame. It prints the split instead of one figure:
+
+```
+Encoded 8 frames (1I + 7P) in 460.4ms (17.4 fps) — includes PNG decode
+  of which input decode 123.7ms (27%); coding alone 336.7ms (23.8 fps)
+```
+
+plus a line saying which figure to quote against another encoder and that Y4M through
+`benchmark-sequence` avoids the decode entirely.
+
+**Canary and gate:** container output byte-identical either side of the change (6 014 785 B on the
+same 8 frames), 279 tests pass, both clippy targets clean. The added cost is one `Instant::now()`
+per frame into an `AtomicU64`.
+
+**Why it is worth a fix rather than a note.** `benchmark-sequence`'s `-i` help already warned that
+Y4M "avoids PNG decode overhead"; `encode-sequence` had no such warning and is the command whose
+printed figure BASELINE calls **quantity B**. So the caveat existed for the command that did not
+need it and was missing from the one that did. This is the COORD-6 principle applied to an
+instrument: a number should carry its context at the point it is emitted.
+
+BASELINE's fps section records the split. RESEARCH_LOG 2026-09-08.
+
 ### MEAS-12 — the sequence throughput figures were understated 2.3–3.5x (**DONE 2026-09-08**)
 
 Run because 5.0 fps end to end could not be reconciled with the 15.34 ms single-frame encode taken

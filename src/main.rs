@@ -3375,13 +3375,23 @@ fn main() {
             }
 
             let input_pattern = input.clone();
+            // The frame source is called *inside* the timed region, so PNG decode lands in
+            // `encode_time` and therefore in the fps figure printed below. Measured 2026-09-08
+            // (MEAS-12) it is about 15 of 51 ms per 1080p frame — 29% of that figure. Time it
+            // separately rather than leave the number quietly inflated.
+            let load_nanos = std::sync::atomic::AtomicU64::new(0);
             let start = std::time::Instant::now();
             let compressed = encoder.encode_sequence_streaming(
                 &ctx,
                 frame_count,
                 |i| {
+                    let load_start = std::time::Instant::now();
                     let path = input_pattern.replace("%04d", &format!("{:04}", i));
                     let (rgb, fw, fh) = load_image_rgb_f32_bits(&path, bit_depth);
+                    load_nanos.fetch_add(
+                        load_start.elapsed().as_nanos() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                     assert!(
                         fw == w && fh == h,
                         "Frame {} has different dimensions ({}x{} vs {}x{})",
@@ -3424,13 +3434,32 @@ fn main() {
                 .filter(|f| f.frame_type == gnc::FrameType::Intra)
                 .count();
 
+            // Two figures, not one. This command reads PNG, and the decode happens inside the
+            // timed region, so the combined figure is not GNC's encoder throughput. Anyone
+            // comparing against another codec's encoder wants the second line.
+            let load_secs =
+                load_nanos.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1_000_000_000.0;
+            let coding_secs = (encode_time.as_secs_f64() - load_secs).max(f64::MIN_POSITIVE);
             println!(
-                "\nEncoded {} frames ({}I + {}P) in {:.1}ms ({:.1} fps)",
+                "\nEncoded {} frames ({}I + {}P) in {:.1}ms ({:.1} fps) — includes PNG decode",
                 compressed.len(),
                 i_count,
                 compressed.len() - i_count,
                 encode_time.as_secs_f64() * 1000.0,
                 compressed.len() as f64 / encode_time.as_secs_f64(),
+            );
+            println!(
+                "  of which input decode {:.1}ms ({:.0}%); coding alone {:.1}ms ({:.1} fps)",
+                load_secs * 1000.0,
+                100.0 * load_secs / encode_time.as_secs_f64(),
+                coding_secs * 1000.0,
+                compressed.len() as f64 / coding_secs,
+            );
+            println!(
+                "  Quote the coding figure against another encoder, the combined one for \
+                 end-to-end throughput, and neither without saying which (BASELINE, \"How to \
+                 read the fps figures in this file\"). Y4M input via `benchmark-sequence` avoids \
+                 the decode entirely."
             );
             println!(
                 "Container: {} bytes, avg {:.2} bpp → {}",

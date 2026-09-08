@@ -234,6 +234,52 @@ number, which in `0024` and `0027` is also the half that never reserved it:
 note naming the other, because **a commit message cannot be renumbered** and the ambiguous
 citations that predate the fix are the part that outlives it.
 
+## Four worktrees are holding 29 uncommitted files and their sessions are gone (2026-09-08, 20:0x)
+
+**Snapshot taken read-only, and it is the BUG-32 lesson at 4x scale, two hours in rather than
+eleven.** All four hold a startable item and none has a live session behind it.
+
+| worktree / item | base | uncommitted | unmerged commits | newest edit |
+|---|---|---|---|---|
+| `../gnc-tile1` — **TILE-1** (P2) | `a73e0a2` | **13**, incl. `format.rs`, `pipeline.rs`, `sequence.rs`, `rice_gpu.rs` | 0 | ~2h4m |
+| `../gnc-next2` — **PERF-2** (P3) | `a73e0a2` | 8, incl. `color.rs`, `quantize.rs`, `interleave.rs` | 0 | ~2h |
+| `../gnc-g41232` — **PAD-2** (P2) | `6397188` | 7, incl. `motion.rs`, `gpu_work.rs`, `checkpoint.rs` | **1** | ~2h3m |
+| `../gnc-bug35rans` — **BUG-35** (P2) | `a73e0a2` | 1, `quantize_histogram_fused.wgsl` | 0 | ~2h3m |
+
+**A fifth item is parked behind the first.** ROBUST-2 (P2) is `blocked-format-rs-in-flight` because
+"gnc-tile1 holds uncommitted edits to `deserialize_compressed_validated` in 4 hunks". If that
+session is gone the park's premise is void — but a park is invisible to `claim next` by design, so
+nothing will notice on its own. **Whoever confirms tile1 is dead should unpark ROBUST-2 in the same
+breath.**
+
+**Before you steal any of them, read the worktree** — that rule is two sections up and it is what
+this table is for. Each of these is someone's half-finished item, not a free id: inheriting beats
+repeating, and `git -C "$REPO-<area>" diff` is the whole cost.
+
+### Checking whether a holder is alive: use the socket directory, not the process table
+
+**`pgrep -x claude` is not sound for this and will tell you a live session is dead.** Measured while
+building the table above: it missed `19376`, a live session, which `ps -p 19376 -o comm` reports as
+`claude`. Cross-referencing it with `lsof -d cwd` does not help either — sessions launched from the
+shared checkout all report *its* path as their cwd, not their worktree's, so cwd does not identify
+a worktree at all.
+
+What is sound:
+
+```bash
+ls /tmp/cc-socks/                # one socket per live session, named by pid
+```
+
+Nine gnc sockets existed when this was written and all nine map to named sessions; none of the four
+above had one. `ListAgents` agrees with the socket list, which is expected — it is the same
+registry. **Caveat:** a live session that never registered a socket would look dead by this test. No
+example of one has been seen, but the test is "has a socket", not "is alive", and the difference is
+worth remembering before a `steal`.
+
+This is COORD-5's subject: `claim list` now annotates a holder with its uncommitted-file count and
+edit age, which is what made this table a one-liner, but it still says "verify before trusting"
+without saying how — and the obvious how is wrong.
+
 ## Reserving an id is not filing the item, and a dead session takes the difference with it
 
 **Found 2026-09-08.** `scripts/claim list` showed `BUG-32` held by a session that was gone, with

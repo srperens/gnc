@@ -14748,3 +14748,103 @@ larger than filed. The same instinct nearly stopped this one at "abac and Rice d
 expert". The general lesson is not "always fix" — BUG-16's fix genuinely is a design decision — it
 is that **"this needs its own item" is a claim about the work, and it should be made after looking,
 not instead of looking.**
+
+## 2026-09-08 — INTER-2: the inter dead zone was double the intra one, and double was the wrong number
+
+### The mechanism, before any measurement
+
+`res_dead_zone = config.dead_zone * inter_dz_mul` with `inter_dz_mul = 2.0`. The inter dead zone
+was never tuned — it *inherited* the intra curve's shape and doubled it. Combined with INTRA-1's
+finding that any dead zone ≤ 0.5 is a no-op (GNC quantises as `floor(|v|/step + 0.5)` after a
+`|v| < dz*step` test), the preset anchors make that:
+
+| q | intra dz | intra active? | inter dz (×2.0) | inter active? |
+|---|---|---|---|---|
+| 25–75 | 0.75 | yes | 1.5 | yes |
+| **85** | **0.5** | **no** | **1.0** | **yes** |
+| 92 | 0.05 | no | 0.1 | no |
+
+So **q=85 is the last rung where the inter dead zone is the only dead zone still running**, which
+is exactly the anomaly INTER-2 was filed for — the q=85 rung going *cheap and worse* while every
+rung above it goes dearer and better. The item's single point sized the lever; this is why it is
+there.
+
+### Reproduced first
+
+The filed point reproduces **byte-for-byte** on today's `main` — crowd_run q=85 ki=9 24 frames:
+65293226 B / 45.02 / 44.61 at mul=2.0, 74831067 B / 47.89 / 47.48 at mul=1.0, all-intra 72379589 B.
+So PAD-1 and the BUG-16 fix, both of which landed today, left the sequence path alone as claimed.
+
+### The ladder
+
+4 rungs (q=70/75/80/85) x 3 sequences x 4 arms, 24 frames, ki=9, 4:4:4. BD-rate on PSNR against
+shipped 2.0, integrated per sequence over the intersection of all arms' quality ranges:
+
+| sequence | mul=1.5 | **mul=1.0** | mul=0.0 |
+|---|---|---|---|
+| bbb_extended (animation) | −2.70% | −2.13% | **+12.48%** |
+| crowd_run (high motion) | −3.01% | **−6.04%** | −2.40% |
+| old_town_cross (camera) | −2.76% | **−6.14%** | −3.34% |
+| **mean** | −2.82% | **−4.77%** | +2.25% |
+
+**Worst-frame PSNR improves at 12 of 12 points, +2.44 to +5.23 dB.** 1.0 beats both neighbours, so
+the optimum is bracketed rather than picked. **0.0 is worse than shipped on animation**, so the
+feature earns its place — the rationale for having an inter dead zone (a residual is largely the
+reference's own quantisation noise) was right; only the factor was wrong.
+
+Shipped 1.0 rather than fitting something between 1.0 and 1.5: at exactly 1.0 the special case
+*disappears* instead of becoming a second magic number that has to be re-tuned whenever the intra
+anchors move. The remaining value is under a point of BD-rate on one content type.
+
+### A built-in consistency check, and it passed
+
+At q=85 the intra dead zone is exactly 0.5, so mul=1.0 lands precisely on the no-op boundary and
+**mul=1.0 must equal mul=0.0 there**. It does, on all three sequences, byte-identically —
+74831067 / 74465815 / 35377914 B with identical PSNR. The arithmetic model of the whole item is
+therefore not just plausible, it is confirmed by an equality nobody arranged.
+
+### VMAF could not decide this, and that is the reportable part
+
+CLAUDE.md puts VMAF in the lead at q ≤ 85. **On this ladder it is saturated and returns nonsense.**
+crowd_run's four rungs span **99.86 to 99.88** — a 0.02-point interval — across a **5.5 dB** PSNR
+spread, and a BD-rate integrated over that interval reads **+35.41%**. That is the "not a weak
+number, it is not a number" failure the repo documents for q > 85, occurring at q = 70–85.
+
+The reason is that the q≤85 rule was written for **stills**. GNC's inter ladder at 4:4:4 runs at
+4.9–12.0 bpp, which is far above the rate where VMAF discriminates. It is not uniform across
+content: old_town_cross reads 96.45 at q=70 mul=2.0 and is *not* saturated at the bottom, and
+there VMAF gives −6.82% and agrees with PSNR. **So the rule needs a rate qualifier, not just a q
+one** — worth carrying into CLAUDE.md if another item hits the same wall.
+
+### Scope, measured
+
+crowd_run, 12 frames, ki=9, new default against `GNC_INTER_DZ_MUL=2.0`:
+
+| q | 84 | 85 | 86 | 87 | 88 | 89 | 90 |
+|---|---|---|---|---|---|---|---|
+| | differs | differs | differs | differs | differs | **identical** | **identical** |
+
+**q ≥ 89 byte-identical; q=100 byte-identical both ways** (15710346 B — `dead_zone` is 0.0 there);
+the still path is untouched by construction. So the blast radius is inter frames at q ≤ 88.
+
+### What it invalidates
+
+BASELINE's q=75 sequence table (already stale for two other reasons; noted there), the q=85 rung —
+**one of four** — of BASELINE's headline +90.5% against x264, and `0025`'s abac-versus-Rice inter
+columns at q=50 and q=75 but not q=90. The +90.5% should improve, since this improves the inter RD
+curve, but that is a prediction and the figure stands as recorded until re-run.
+
+### Three copies of the default, again
+
+The factor was inlined at **three** sites in `sequence.rs` — the P path and two B paths — each with
+its own `unwrap_or(2.0)`. Changing two of three would have been a frame-type-dependent quantiser
+difference, i.e. BUG-16's failure mode arriving by BUG-37's route. Now `gnc::inter_dead_zone_mul()`,
+with a test that fails if `sequence.rs` reads the variable again. **This is the third time today
+that a shipped default turned out to have more than one home** (BUG-37's five CLI sites, BUG-16's
+two quantisers, these three). It is worth treating as a pattern rather than three coincidences.
+
+### Noticed, not caused
+
+q=100 sequences decode to a worst-frame **7.91 dB** on crowd_run. That is **BUG-39**, already
+reserved by the RATE-3 session; byte-identical under both multipliers here, so this change neither
+causes nor fixes it. Mentioned because it is a lossless mode reading 7.91 dB.

@@ -3166,14 +3166,9 @@ impl EncoderPipeline {
         let uniform_weights = crate::SubbandWeights::uniform(config.wavelet_levels);
         let weights_luma = uniform_weights.pack_weights();
         let weights_chroma = uniform_weights.pack_weights_chroma();
-        // Inter residuals get twice the intra dead zone. GNC_INTER_DZ_MUL exposes that factor:
-        // on a pure pan the residual is essentially the reference's own quantisation noise, and
-        // GNC codes it finely enough to end up *better* than the I-frame it predicts from, which
-        // is bits spent on nothing a viewer asked for.
-        let inter_dz_mul: f32 = std::env::var("GNC_INTER_DZ_MUL")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(2.0);
+        // Inter residuals take the same dead zone as intra (INTER-2, docs/decisions/0041).
+        // One source of truth: this factor used to be inlined at all three of these sites.
+        let inter_dz_mul: f32 = crate::inter_dead_zone_mul();
         let res_dead_zone = config.dead_zone * inter_dz_mul;
 
         // Config stored in CompressedFrame must match encoder parameters so decoder
@@ -4967,14 +4962,9 @@ impl EncoderPipeline {
         let uniform_weights = crate::SubbandWeights::uniform(config.wavelet_levels);
         let weights_luma = uniform_weights.pack_weights();
         let weights_chroma = uniform_weights.pack_weights_chroma();
-        // Inter residuals get twice the intra dead zone. GNC_INTER_DZ_MUL exposes that factor:
-        // on a pure pan the residual is essentially the reference's own quantisation noise, and
-        // GNC codes it finely enough to end up *better* than the I-frame it predicts from, which
-        // is bits spent on nothing a viewer asked for.
-        let inter_dz_mul: f32 = std::env::var("GNC_INTER_DZ_MUL")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(2.0);
+        // Inter residuals take the same dead zone as intra (INTER-2, docs/decisions/0041).
+        // One source of truth: this factor used to be inlined at all three of these sites.
+        let inter_dz_mul: f32 = crate::inter_dead_zone_mul();
         let res_dead_zone = config.dead_zone * inter_dz_mul;
 
         let mut res_config = config.clone();
@@ -5914,14 +5904,9 @@ impl EncoderPipeline {
         let uniform_weights = crate::SubbandWeights::uniform(config.wavelet_levels);
         let weights_luma = uniform_weights.pack_weights();
         let weights_chroma = uniform_weights.pack_weights_chroma();
-        // Inter residuals get twice the intra dead zone. GNC_INTER_DZ_MUL exposes that factor:
-        // on a pure pan the residual is essentially the reference's own quantisation noise, and
-        // GNC codes it finely enough to end up *better* than the I-frame it predicts from, which
-        // is bits spent on nothing a viewer asked for.
-        let inter_dz_mul: f32 = std::env::var("GNC_INTER_DZ_MUL")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(2.0);
+        // Inter residuals take the same dead zone as intra (INTER-2, docs/decisions/0041).
+        // One source of truth: this factor used to be inlined at all three of these sites.
+        let inter_dz_mul: f32 = crate::inter_dead_zone_mul();
         let res_dead_zone = config.dead_zone * inter_dz_mul;
 
         let is_non_444 = info.chroma_format != ChromaFormat::Yuv444;

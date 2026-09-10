@@ -17,6 +17,10 @@ struct Params {
     dst_height_padded: u32,   // = chroma_padded_height (tile-aligned)
     shift_x:           u32,
     shift_y:           u32,
+    round_output:      u32,   // BUG-49: 1 = round the average to an integer before writing
+    _pad0:             u32,
+    _pad1:             u32,
+    _pad2:             u32,
 }
 
 @group(0) @binding(0) var<uniform>             params: Params;
@@ -53,6 +57,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             count += 1u;
         }
     }
+    // BUG-49: a lossless transform needs an integral plane. The box filter averages 2 or 4
+    // integer samples, so without this the plane is fractional, the step-1 quantiser rounds the
+    // residual, and on the MED path that rounding accumulates along the decoder's DPCM chain
+    // (encoder predicts from `src`, decoder from its reconstruction). `round` is ties-to-even in
+    // WGSL; the decoder never repeats it, so only determinism matters here.
+    var v = sum / f32(count);
+    if params.round_output != 0u {
+        v = round(v);
+    }
     // idx == row * dst_stride + col, which is the correct padded-layout offset.
-    dst[idx] = sum / f32(count);
+    dst[idx] = v;
 }

@@ -18349,3 +18349,110 @@ QSV was measured in round 2 (4.54x at N=8) and not re-run.
 - **DX12: still unusable** -- X3695 gone, replaced by a >4.5-min FXC compile. Needs its own item.
 - **Still owed:** N=8+ inter density on a machine with more RAM (or a lower-footprint encode path);
   NVENC (driver); large-GPU MEAS-5; whether DX12 ever finishes compiling; 4:2:2 and 10-bit on Vulkan.
+
+---
+
+## 2026-09-10 — BUG-49: the box filter makes fractions, and MED turns a half-LSB into drift
+
+**Hypothesis on entry (the item's own):** a `MedPredict` branch in `chroma_resample.rs` changes
+the filter or skips a pass, or a plane extent is derived two ways (`entropy_helpers.rs:110`
+computes `padded_w * (tiles_y * tile_size)` where the buffer is `padded_w * padded_h`).
+**Both refuted.** The resampler has one code path for every quality and never sees the transform
+type, and `chroma_padded_height()` *is* `chroma_tiles_y() * tile_size` by construction, so the two
+derivations cannot disagree.
+
+**Reproduced first**, on the pinned entry commit `e6d3794`, three stills x three formats x
+q ∈ {95, 99, 100}, `GNC_LOSSLESS_FALLBACK=0`, `scripts/ypsnr_de00.py`. Matched the filed table to
+four decimals on all six subsampled q=100 points, so the filing was measuring what it claimed.
+
+### The instrument that found it
+
+Not a metric — a **profile**. `dE00` says how wrong, not where. Grouping mean |Co error| by
+Chebyshev distance from the origin of the chroma plane's own 256x256 tile separates the
+candidates in one run, because only one of them has a shape:
+
+| distance from tile origin | 0 | 1–3 | 4–15 | 16–63 | 64–127 | 128–191 | 192–255 |
+|---|---|---|---|---|---|---|---|
+| bbb 4:2:2 **q=100, before** | 0.40 | 0.56 | 1.39 | 2.55 | 4.35 | 5.79 | **6.38** |
+| bbb 4:2:2 q=99, control | 0.60 | 0.34 | 0.35 | 0.36 | 0.36 | 0.35 | **0.35** |
+| bbb 4:2:2 **q=100, after** | 0.40 | 0.24 | 0.25 | 0.26 | 0.26 | 0.25 | **0.25** |
+
+A 16x ramp that resets at a tile boundary is a DPCM chain, and there is exactly one in the
+pipeline. `chroma_downsample.wgsl` box-averages 2 samples (4:2:2) or 4 (4:2:0), so the plane is a
+multiple of 0.5 or 0.25 — fractional; the step-1 quantiser rounds the residual; and
+`med_predict.wgsl` is **open-loop on purpose** ("at lossless the encoder's reconstruction is its
+input"), which holds only while coding is exact. Encoder predicts from `src`, decoder predicts
+from its own reconstruction, error accumulates until the tile resets it.
+
+This is **BUG-45's mechanism arising inside the pipeline** rather than from the caller's samples —
+which is why its guard (`source_is_integral(rgb_data)`) never fired: PNG input is integral, and
+the fractions are manufactured three stages later.
+
+**Cross-check that split the rounding from the amplification:** the lossless 5/3 arm (`GNC_MED=0`)
+was 0.9640 dE00 against a 0.7482 floor on bbb 4:2:2 — wrong, but **flat** (0.88–0.97 across the
+tile). Same rounding, no DPCM chain to compound it. So the fix belongs at the downsample, where it
+serves both transforms, not inside MED.
+
+### The fix
+
+Round the averaged plane to integers when `is_lossless()` — `round_output` on
+`ChromaResampleParams`, reached via `ChromaResampler::dispatch_with_rounding`. Canary:
+`chroma_downsample: … rounded=true` at q=100, `rounded=false` at q=90, verified on both.
+No generation bump — the decoder is untouched and old files decode to the same pixels.
+
+### After, on three stills (`GNC_LOSSLESS_FALLBACK=0`, dE00 mean / p95, Y-PSNR in YCoCg-R)
+
+| still | fmt | q=99 dE00 | q=100 **before** | q=100 **after** | predicted floor | Y q=100 before → after | q=100 bytes |
+|---|---|---|---|---|---|---|---|
+| blue_sky | 4:2:2 | 0.1145 | 2.3066 / 7.3581 | **0.0792 / 0.5846** | 0.0792 / 0.5846 | 65.24 → **70.35** dB | 1 843 999 → 1 780 758 (−3.43%) |
+| blue_sky | 4:2:0 | 0.1393 | 1.9488 / 5.7420 | **0.0996 / 0.6250** | 0.0996 / 0.6250 | 64.18 → **66.98** dB | 1 518 089 → 1 516 299 (−0.12%) |
+| kristensara | 4:2:2 | 0.1398 | 2.1422 / 5.6486 | **0.0976 / 0.7062** | 0.0976 / 0.7062 | 63.54 → **71.69** dB | 788 652 → 764 860 (−3.02%) |
+| kristensara | 4:2:0 | 0.1599 | 1.8875 / 4.8499 | **0.1116 / 0.7308** | 0.1116 / 0.7308 | 66.89 → **70.98** dB | 658 093 → 654 779 (−0.50%) |
+| bbb | 4:2:2 | 0.7354 | 2.7226 / 6.5746 | **0.7482 / 2.3472** | 0.7482 / 2.3472 | 57.40 → **68.16** dB | 2 348 848 → 2 272 845 (−3.24%) |
+| bbb | 4:2:0 | 0.9601 | 2.5567 / 6.1459 | **0.9648 / 3.2061** | 0.9648 / 3.2061 | 59.91 → **64.58** dB | 1 835 951 → 1 826 534 (−0.51%) |
+
+**The "predicted floor" column was computed before the fix was written**, by an independent CPU
+model in numpy — YCoCg-R, box average, round, nearest upsample, inverse — and every measured
+after-figure equals it to four decimals. Comparing the decoded PNG against that model image
+directly: **dE00 0.0000 and max absolute RGB error 0, on 6 of 6 points**, against 25 and 19 before.
+The lossless 5/3 arm is exact too. So this is not "much better"; it is the codec being bit-exact
+for the plane it codes, and the residual dE00 is the subsample, which is lossy by definition.
+
+**Success criteria, against the item's own wording:**
+
+- *4:2:2 never worse than 4:2:0 at q=100* — **3 of 3, the inversion is gone.**
+- *Luma must stay better at q=100 than q=99* — **6 of 6**, and by 9.8–13.6 dB rather than the
+  previous 0.9–6.9.
+- *q=100 dE00 no worse than q=99* — **4 of 6.** On bbb it is worse by **0.0128 (4:2:2)** and
+  **0.0047 (4:2:0)**, ~1.7% and ~0.5%. Reported rather than rounded away: q=100 now sits *on* the
+  subsampling floor and cannot go below it, while q=99's quantisation happens to blunt the
+  nearest-neighbour upsample slightly on that one image. That is the upsample filter's business,
+  not the lossless path's, and it is a separate item.
+
+**Lossy output does not move**: every q=95 and q=99 row, and q=100 4:4:4, is byte-identical before
+and after. All 201 unit tests plus every integration test pass; both clippy gates clean.
+
+### Regression guard
+
+`tests/bug49_subsampled_lossless.rs` asserts the *shape*, not a recorded number: far-corner error
+over near-origin error must stay under 1.5. Mutation-tested by deleting the `round` — 2.25x (4:2:2)
+and 1.98x (4:2:0) with the bug, 0.98x and 0.99x with the fix.
+
+**Two synthetics failed to detect the bug before the third one did, and both failures are the
+lesson.** Per-pixel colour noise buried a ~4-level drift under ~5.5 levels of subsampling error —
+the instrument was swamped by the thing it sat on. An `(x&1)` dither then made *every* box average
+exactly 0.5, so every MED residual was integral and the plane coded exactly even with the bug
+present: a test picture can be too clean to be wrong. What works is a 3-bit dither, which makes the
+fractional parts **vary** — that, not merely being fractional, is what the defect needs.
+
+### Not done, deliberately
+
+`0078` refused the RATE-2 lossless fallback at non-444 *because of this bug*, so its premise is
+void. Taking it off is **RATE-5**, not this item: on 2 of 6 points the bit-exact candidate wins
+rate and ~10 dB of luma while giving back 0.5–1.7% of dE00 — a trade, where RATE-2's rule wants an
+outright win — and the fallback has never once run at non-444, so RATE-3's ordering side channel
+(9.83 dB and +40.55% when it went wrong at 4:4:4) is unverified in that format. The refusal's
+*message* was corrected in place: it still claimed q=100 is "not lossless even in luma", which
+`0078` had already withdrawn.
+
+Decision record: `docs/decisions/0080`.

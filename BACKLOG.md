@@ -5176,6 +5176,75 @@ now stops at 55 dB, above which the 8-bit grid dominates and two encodes within 
 can order either way. Verified that a plain gradient reconstructs *exactly* from q=92 up, so there
 is no defect behind that.
 
+### RATE-5 — `0078`'s refusal has lost its premise, and the inter path still makes fractional planes (todo, **P2**)
+
+**Filed 2026-09-10 by BUG-49, which removed the reason this refusal exists.** `0078` refuses the
+RATE-2 lossless-fallback comparison at 4:2:2/4:2:0 because the bit-exact candidate was damaged
+there. It is not any more: since `0080` the subsampled q=100 encode decodes bit-exact against a CPU
+model of box-average + round + nearest-upsample (max abs RGB error 0, 6 of 6 points), and it is
+usually the *smaller* file too.
+
+**Two halves, and the second is the reason the first cannot just be deleted.**
+
+1. **Re-decide the refusal.** Measured on the three stills at q=99, lossy arm against bit-exact:
+
+   | still | fmt | bytes | dE00 | Y-PSNR (YCoCg-R) |
+   |---|---|---|---|---|
+   | blue_sky | 4:2:2 | **−12.01%** | 0.1145 → **0.0792** | 58.58 → **70.35** dB |
+   | blue_sky | 4:2:0 | **−6.38%** | 0.1393 → **0.0996** | 57.70 → **66.98** dB |
+   | kristensara | 4:2:2 | **−18.25%** | 0.1398 → **0.0976** | 58.13 → **71.69** dB |
+   | kristensara | 4:2:0 | **−12.17%** | 0.1599 → **0.1116** | 57.62 → **70.98** dB |
+   | bbb | 4:2:2 | **−3.01%** | 0.7354 → **0.7482** | 55.15 → **68.16** dB |
+   | bbb | 4:2:0 | **−3.80%** | 0.9601 → **0.9648** | 54.73 → **64.58** dB |
+
+   Four of six win on every axis. The other two win rate and ~10 dB of luma and give back 0.5–1.7%
+   of dE00 — a *trade*, where RATE-2's rule is that the bit-exact candidate wins outright. That is
+   a judgement call and it owes a decision record; three stills is not the sample to take it on.
+
+2. **The fallback has never once run at non-444, so RATE-3's side channel is unverified there.**
+   `local_decode_iframe_gpu` reads the quantised planes the last `encode_once` left on the GPU;
+   when the ordering was wrong at 4:4:4 it cost **9.83 dB and +40.55%** of sequence bytes. Enabling
+   the comparison at 4:2:2/4:2:0 without a sequence-level check at those formats is how that gets
+   re-discovered. `tests/lossless_intra_fallback.rs` is 4:4:4 only.
+
+**And the part BUG-49 did not fix at all.** `0080` rounds the chroma plane only at the *still*
+encoder's input downsample. The **inter path box-filters reconstructed references into fractional
+planes at every P and B frame** — `sequence.rs` around lines 4154, 4168, 4252, 4688, 5753, 5766,
+5780, 5877 and the decoder's mirror in `gpu_work.rs` — and those call sites are untouched. They are
+harmless while lossless inter at non-444 is unreachable, and they are the first thing to break when
+it becomes reachable. Encoder and decoder must agree on the rounding or the reference drifts, so
+this is a paired change, not two.
+
+**Success criterion:** a decision record that either enables the comparison with a sequence-level
+bit-exactness check at 4:2:2 and 4:2:0 in `tests/`, or states the trade it refuses and why, on ≥3
+sequences rather than ≥3 stills.
+
+### CHROMA-6 — nearest neighbour is the whole remaining subsampled error, and it is the cheapest filter there is (todo, **P3**)
+
+**Filed 2026-09-10 by BUG-49.** With `0080` in, `q=100` at 4:2:2/4:2:0 is bit-exact for the plane
+it codes, so **100% of its remaining dE00 is the resample** — box average down, nearest neighbour
+up. Measured floors: bbb **0.7482** (4:2:2) / **0.9648** (4:2:0), blue_sky 0.0792 / 0.0996,
+kristensara 0.0976 / 0.1116.
+
+**The tell that this is the filter and not the subsample:** at q=99 on bbb the *lossy* encode reads
+0.7354 and 0.9601 — **below** the lossless floor, on both formats. Quantisation noise blunting a
+blocky upsample is worth more than the last 1.7% of colour accuracy, which is a statement about
+`chroma_upsample.wgsl`, not about quantisation.
+
+`chroma_upsample.wgsl` is six lines: `src[(dy >> shift_y) * src_width + (dx >> shift_x)]`. Every
+other codec at this operating point uses at least a bilinear or a 4-tap filter with the right
+siting — MPEG chroma is sited between luma samples, and nearest neighbour also gets the *phase*
+wrong by half a chroma sample, which is a shift, not just a softness.
+
+**Careful about the direction of the win.** The encoder's box filter and the decoder's upsample are
+a matched pair; changing one alone changes what the coded plane means. And the P/B chroma-domain MC
+path relies on `box_filter(NN_upsample(x)) == x` (`sequence.rs`, the comment at ~4154), which a
+non-trivial upsample breaks. So this is a bitstream-visible change with an inter-path consequence,
+not a shader swap.
+
+**Success criterion:** ≥0.2 dE00 mean improvement at q=100 on ≥3 stills at both 4:2:2 and 4:2:0,
+with the inter path's identity either preserved or explicitly re-derived, and no luma change.
+
 ### RATE-1 — Above ~q=90 an 8-bit encode buys precision it cannot emit (**ANSWERED NO 2026-09-07 — do not build the rule**)
 **Measured across content, and the premise does not survive it.** The item said the gradient is
 the best case and real content would show less. It shows *nothing*: **no real image reaches
@@ -5301,7 +5370,45 @@ peer's number is not the same as reading their tree.
 frame's reference is *not* simply its colour-converted source, because that buffer is at a
 different stage and scale. RATE-4 records the refutation.
 
-### BUG-49 — `q=100` chroma is 3-20x worse than `q=99` on subsampled input, and only there does 4:2:2 lose to 4:2:0 (todo, **P1**)
+### BUG-49 — `q=100` chroma is 3-20x worse than `q=99` on subsampled input, and only there does 4:2:2 lose to 4:2:0 (**FIXED 2026-09-10**, `docs/decisions/0080`)
+
+**FIXED 2026-09-10.** Neither suspect this entry named was right. There is no `MedPredict` branch
+in the resample — one code path for every quality, and it never sees the transform type — and the
+plane extents cannot disagree, because `chroma_padded_height()` *is* `chroma_tiles_y() * tile_size`
+by construction.
+
+**What it was: the box filter manufactures fractions, and MED compounds them.**
+`chroma_downsample.wgsl` averages 2 samples (4:2:2) or 4 (4:2:0), so the plane is a multiple of 0.5
+or 0.25. The step-1 quantiser rounds the residual — BUG-45's mechanism, arising *inside* the
+pipeline where its `source_is_integral(rgb_data)` guard could not see it. And `med_predict.wgsl` is
+open-loop by design, so once the residual is rounded the encoder predicts from `src` while the
+decoder predicts from its reconstruction, and the error **accumulates along the DPCM chain until
+the tile resets it**. Mean |Co error| on bbb 4:2:2 by distance from the tile origin: **0.40 at the
+origin, 6.38 at the far corner** — a 16x ramp, against a flat 0.35 for the q=99 control.
+
+**Fix:** round the averaged plane to integers when `is_lossless()`
+(`ChromaResampler::dispatch_with_rounding`). Decoded output now equals an independent CPU model of
+box-average + round + nearest-upsample **exactly — dE00 0.0000, max abs RGB error 0, 6 of 6
+points**. dE00 lands on the subsampling floor: blue_sky 4:2:2 2.3066 → **0.0792**, 4:2:0 1.9488 →
+**0.0996**; kristensara 2.1422 → **0.0976** and 1.8875 → **0.1116**; bbb 2.7226 → **0.7482** and
+2.5567 → **0.9648**. Luma (YCoCg-R) at q=100 rises 9.8–13.6 dB over q=99 and files get 0.1–3.4%
+*smaller*. 4:2:2 now beats 4:2:0 on all three stills — the inversion is gone. Lossy output is
+byte-identical. Guard: `tests/bug49_subsampled_lossless.rs`, mutation-tested.
+
+**One criterion is not fully met and is not being rounded away.** *"q=100 dE00 no worse than q=99"*
+holds on 4 of 6 points; on bbb, q=100 is worse by 0.0128 (4:2:2) and 0.0047 (4:2:0). q=100 now sits
+*on* the subsampling floor and cannot go below it, while q=99's quantisation slightly blunts the
+nearest-neighbour upsample on that image. That is the upsample filter's business — nearest
+neighbour is the cheapest reconstruction there is — and it wants its own item, not a reopening of
+this one.
+
+**What this unblocks, and what it does not.** `0078`'s refusal of the RATE-2 lossless fallback at
+non-444 has lost its premise; taking it off is **RATE-5**. The sequence sweep at 4:2:2/4:2:0 that
+LOSSLESS-3 could not run is now measurable for stills; the *inter* path still box-filters
+reconstructed references into fractional planes at every P and B frame, and this fix does not touch
+those call sites — that is RATE-5's other half. BUG-45 itself is untouched: `is_lossless()` still
+reports true for a subsampled encode that is lossy against the source by construction.
+
 **RETRACTION FIRST, because the filing was wrong about which plane.** This was filed as "not
 lossless even in luma" on per-plane PSNR taken from the decoded **RGB** converted to `yuv444p`.
 CLAUDE.md says exactly why that is invalid — *"a luma computed from decoded RGB is contaminated by

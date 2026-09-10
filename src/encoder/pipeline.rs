@@ -1630,12 +1630,36 @@ impl EncoderPipeline {
         // Before BUG-46 the same input was refused *by accident*: `lossless_sibling` did not carry
         // `chroma_format`, so the candidate was always a 4:4:4 encode and never won. The sibling
         // is honest now and the refusal is explicit.
+        //
+        // **BUG-49 is fixed and this refusal has outlived its reason — RATE-5 decides it.**
+        // The candidate is no longer the damaged one: at q=100 the subsampled planes now decode
+        // bit-exact against a CPU model of box-average + round + NN-upsample (max abs RGB error
+        // 0, 6 of 6 points), so dE00 sits *on* the subsampling floor instead of 2.7x to 20x
+        // above it. Re-measured on the three stills at q=99, lossy against bit-exact:
+        //
+        // | still | fmt | bytes | dE00 | Y-PSNR (YCoCg-R) |
+        // |---|---|---|---|---|
+        // | blue_sky | 4:2:2 | −12.01% | 0.1145 → 0.0792 | 58.58 → 70.35 dB |
+        // | blue_sky | 4:2:0 | −6.38%  | 0.1393 → 0.0996 | 57.70 → 66.98 dB |
+        // | kristensara | 4:2:2 | −18.25% | 0.1398 → 0.0976 | 58.13 → 71.69 dB |
+        // | kristensara | 4:2:0 | −12.17% | 0.1599 → 0.1116 | 57.62 → 70.98 dB |
+        // | bbb | 4:2:2 | −3.01% | 0.7354 → **0.7482** | 55.15 → 68.16 dB |
+        // | bbb | 4:2:0 | −3.80% | 0.9601 → **0.9648** | 54.73 → 64.58 dB |
+        //
+        // Four of six win on every axis. The other two win rate and ~10 dB of luma and give back
+        // 0.5–1.7% of dE00, which is a trade rather than a free win — and RATE-2's rule is that
+        // the bit-exact candidate must win outright. That is a judgement call with a decision
+        // record owed, and it cannot be taken on stills alone: the fallback has never once run at
+        // non-444, so the ordering side channel below (RATE-3, 9.83 dB and +40.55% when it went
+        // wrong at 4:4:4) is unverified in this format. Left refused on purpose, with the reason
+        // it now actually has.
         if config.chroma_format != crate::ChromaFormat::Yuv444 {
             // Canary: it prints on exactly the encodes that would otherwise have compared two
             // candidates of different quality (CLAUDE.md, "no silent features").
             eprintln!(
-                "GNC: RATE-2 lossless fallback refused — {:?} chroma, where q=100 is \
-not lossless even in luma (BUG-49). Coding the wavelet candidate only.",
+                "GNC: RATE-2 lossless fallback refused — {:?} chroma. Since BUG-49 the bit-exact \
+candidate is sound here and usually smaller; enabling the comparison needs the sequence path \
+verified at non-444 (RATE-5). Coding the wavelet candidate only.",
                 config.chroma_format
             );
             return self.encode_once(ctx, rgb_data, width, height, config);
@@ -1946,7 +1970,14 @@ not lossless even in luma (BUG-49). Coding the wavelet candidate only.",
             // Pass chroma_padded_w as dst_stride and chroma_padded_h as dst_height_padded
             // so the shader fills the entire padded buffer (valid region + padding zone)
             // with edge-replicated values before the wavelet transform runs.
-            self.chroma_down.dispatch(
+            //
+            // BUG-49: on a lossless configuration the averaged plane is rounded to integers
+            // first. Without that the plane is fractional (multiples of 0.5 at 4:2:2, 0.25 at
+            // 4:2:0), the step-1 quantiser rounds the residual, and MED's open-loop prediction
+            // turns that half-LSB into drift that grows across each tile. See
+            // `ChromaResampler::dispatch_with_rounding`.
+            let round_chroma = config.is_lossless();
+            self.chroma_down.dispatch_with_rounding(
                 ctx,
                 &mut cmd,
                 &bufs.co_plane,
@@ -1957,8 +1988,9 @@ not lossless even in luma (BUG-49). Coding the wavelet candidate only.",
                 shift_y,
                 chroma_padded_w,
                 chroma_padded_h,
+                round_chroma,
             );
-            self.chroma_down.dispatch(
+            self.chroma_down.dispatch_with_rounding(
                 ctx,
                 &mut cmd,
                 &bufs.cg_plane,
@@ -1969,16 +2001,20 @@ not lossless even in luma (BUG-49). Coding the wavelet candidate only.",
                 shift_y,
                 chroma_padded_w,
                 chroma_padded_h,
+                round_chroma,
             );
+            // Canary: `rounded=` is the only externally visible sign that the BUG-49 path ran,
+            // and it must read true for exactly the lossless configurations.
             log::debug!(
-                "chroma_downsample: {:?} {}x{} -> {}x{} shift=({},{})",
+                "chroma_downsample: {:?} {}x{} -> {}x{} shift=({},{}) rounded={}",
                 chroma_format,
                 padded_w,
                 padded_h,
                 chroma_padded_w,
                 chroma_padded_h,
                 shift_x,
-                shift_y
+                shift_y,
+                round_chroma
             );
         }
 

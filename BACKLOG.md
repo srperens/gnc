@@ -1863,7 +1863,80 @@ unmeasured**; the fix applies wherever the sibling is used and should move them 
 
 Decision `docs/decisions/0072`. Fixed 2026-09-08 by the `drnum` session while closing RATE-4.
 
-### BUG-45 — `is_lossless()` is a claim about the settings, not about the input (todo, P3)
+### LOSSLESS-4 — "lossless" means something narrower for Y4M input than for PNG, and nothing says so (todo, **P2**)
+
+**Filed 2026-09-10 by BUG-45 / `0081`.** That fix makes `q=100` on a Y4M source bit-exact **with
+respect to the RGB the reader produces**. It is not bit-exact with respect to the file's original
+Y'CbCr samples, and it cannot be: `Y4mReader::read_frame_rgb` applies BT.601 limited-range with
+float coefficients and `0081` now rounds the result, so the Y4M → RGB step is itself lossy before
+the codec sees anything. A Y4M → RGB → YCoCg-R → RGB → Y'CbCr round trip cannot return the input
+whatever the entropy coder does.
+
+**Why it matters beyond pedantry.** GOALS §1 claims lossless as a mode and `docs/POSITIONING.md`
+sells it into contribution, where the input is overwhelmingly Y'CbCr and the customer's question is
+"do I get my samples back". The answer today is *no, you get the samples back that survived a
+BT.601 round trip*, and `gnc encode-sequence -q 100` says nothing about it. That is the same class
+of silent-scope problem as BUG-54 (CfL off at 4:2:2) and FMT-3 (no stated transfer-function
+position).
+
+**Also a rate argument.** Coding BT.601-expanded RGB losslessly is more expensive than coding the
+original YUV: the 1.164 gain manufactures levels that were not in the 8-bit source. bbb at q=100
+costs 10.42 bpp through the Y4M path against 8.42 bpp for the (lossy) old behaviour, and the
+PNG-sourced BASELINE rows are a third comparison again. A native Y'CbCr path would code fewer
+distinct levels *and* be genuinely lossless.
+
+**Three options, and they are not equivalent:**
+
+1. **Document it.** One line in the CLI and README: for Y4M input, `q=100` is bit-exact after the
+   BT.601 conversion. Cheapest, honest, and leaves the product claim weaker than it reads.
+2. **A native Y'CbCr path** that skips the RGB matrix entirely — the codec already works in
+   YCoCg-R, and Y'CbCr → YCoCg-R has an integer-reversible form. Correct, and it touches the
+   input API (PERF-3 item 2 wants the same thing for a different reason: packed-u8 YUV upload is
+   4x less DMA and no CPU colour).
+3. **An integer-reversible BT.601.** Possible in principle, wrong in practice — it standardises a
+   conversion nobody else uses, and the file's samples still would not survive a viewer's own
+   matrix.
+
+**Success criterion:** either the documentation lands and GOALS/POSITIONING are amended to match,
+or a Y4M source round-trips md5-identical through `encode-sequence -q 100` / `decode-sequence` on
+≥3 clips. Do not close it by measuring RGB PSNR — that is the metric that hid the problem.
+
+### BUG-45 — `is_lossless()` is a claim about the settings, not about the input (**FIXED 2026-09-10**, `docs/decisions/0081` — and it was P1, not P3)
+
+**FIXED 2026-09-10, and the filing under-priced it by two levels.** This entry said the defect was
+unreachable except from an API caller, because *"PNG and Y4M input is integral"*. **The Y4M half is
+false.** `Y4mReader::read_frame_rgb` converts with the BT.601 limited-range matrix —
+`1.164*(Y-16)`, 1.596, 0.392, 0.813, 2.017 — and not one coefficient is an integer, so **every Y4M
+frame arrives fractional, `C444` included**. It is the matrix, not the chroma upsample. Counted by
+the new canary on bbb.y4m: **6 150 134 of 6 220 800 samples per frame, 98.9%**.
+
+**So q=100 was not lossless on the most common video input format there is.** Measured before the
+fix, `benchmark-sequence -i bbb.y4m -n 8 -k 8 -q 100`: **PSNR 32.89 dB at 8.42 bpp**, varying
+32.48–33.16 frame to frame. The amplifier is `0080`'s mechanism with a different producer — step-1
+quantiser rounds the residual, `med_predict.wgsl` is open-loop, and the error accumulates along
+each tile's diagonal wavefront instead of staying a half-LSB.
+
+**How it was found: a person watched the web demos in a browser and said q=100 flickered in tiles
+and moved sideways.** Both halves named the mechanism. It reproduces on the CLI — the browser and
+the WASM decoder were faithful. The encoder had been printing this entry's own warning on every
+frame the whole time.
+
+**Fix:** round the source to integers in `encode_once` when `is_lossless()`, replacing the warning.
+That reverses this entry's and `0078`'s "warn, do not normalise" stance, on the grounds that the
+comparison was never rounding-versus-keeping-the-picture: full argument in `0081`. Result: **PSNR
+inf on four Y4M sequences**, SSIM 1.0000, max PSNR drop 0.00 dB. Rate rises 23.7% on bbb (8.42 →
+10.42 bpp), which is the honest price of no longer discarding the picture; **every q=100 rate
+figure taken from a Y4M source before today is superseded.** Lossy is byte-identical, checked
+against artefacts built by the previous binary at q=25/50/75.
+
+Guard: `tests/bug45_fractional_source_lossless.rs`, asserting the invariant rather than a number.
+Mutation-tested at **max abs error 134** on a 0–255 scale.
+
+**Not closed by this: LOSSLESS-4.** q=100 from Y4M is bit-exact against the *converted RGB*, not
+the file's original Y'CbCr. The BT.601 matrix is not integer-invertible.
+
+#### BUG-45, as originally filed
+
 
 At q=100 the quantiser step is 1.0 and MED's residual is a difference of **integers**. Feed the
 encoder fractional `f32` samples and the step-1 quantiser rounds them, so the reconstruction leaves

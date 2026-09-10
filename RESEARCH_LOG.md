@@ -18456,3 +18456,90 @@ outright win — and the fallback has never once run at non-444, so RATE-3's ord
 `0078` had already withdrawn.
 
 Decision record: `docs/decisions/0080`.
+
+---
+
+## 2026-09-10 — BUG-45: q=100 was never lossless on Y4M, and the encoder said so on every frame
+
+**How it was found: a person opened the web player and said the picture flickered.** Not a test,
+not a sweep — the demo set built that afternoon, watched in a browser. The report was "q=100 is
+broken, it flickers in tiles, and it moves sideways". Both halves of that turned out to name the
+mechanism exactly.
+
+**First conclusion, and it was wrong in a useful way.** The natural suspect was the browser: q=100
+is the only rung using MED, whose decoder (`med_reconstruct.wgsl`) is the codec's one serial
+dependency — 511 anti-diagonals with a `storageBarrier()` between them, one workgroup per tile.
+A backend-specific barrier defect would look exactly like tile-shaped flicker. **It reproduces on
+the CLI.** The browser and the WASM decoder are faithful; they were rendering what was in the file.
+
+### The measurement
+
+`benchmark-sequence -i bbb.y4m -n 8 -k 8 -q 100`, before:
+
+```
+PSNR:  avg 32.89 dB  min 32.48  max 33.16  stddev 0.22
+BPP:   avg 8.4193
+```
+
+**32.89 dB from the bit-exact mode.** The 0.68 dB spread across eight frames is the flicker: at
+this operating point LOSSLESS-2 re-codes every P-frame as an I-frame (+110% for P here), so each
+frame carries an independent drift pattern and the loop cycles through eight different pictures.
+
+And on every one of those frames the encoder printed BUG-45's warning — *"non-integer input
+samples … NOT bit-exact"*. It had been printing it for the life of the feature.
+
+### Cause
+
+Not the chroma upsample, which was the first guess and is worth recording as wrong: `Y4mReader`
+maps 4:2:0 chroma with `col/2`, which is integral. It is the **colour matrix**. BT.601
+limited-range is `1.164*(Y-16)` plus 1.596/0.392/0.813/2.017 — no integer coefficient anywhere —
+so **every Y4M frame is fractional, `C444` included**. Counted by the new canary: **6 150 134 of
+6 220 800 samples per frame, 98.9%.**
+
+From there it is `0080`'s mechanism with a different producer. Step-1 quantiser rounds the
+residual; `med_predict.wgsl` is open-loop on purpose; encoder predicts from `src` and decoder from
+its reconstruction; the error accumulates along each tile's diagonal wavefront. Tile-shaped,
+because the chain resets per tile. Moving sideways, because the wavefront runs diagonally.
+
+**BUG-45's own filing said this was unreachable except from an API caller** — *"PNG and Y4M input
+is integral"*. The PNG half is true. The Y4M half is why this sat at P3 while being the defect
+that makes the flagship mode not do what it says on the most common video input format there is.
+
+### Fix and result
+
+Round the source to integers in `encode_once` when `config.is_lossless()`, replacing the warning.
+`0078` and BUG-45 both argued against normalising — *"cannot be normalised without changing the
+picture"* — but that weighs rounding against keeping the picture, and keeping the picture was never
+what the alternative delivered. Full argument in `docs/decisions/0081`.
+
+| Y4M, 8 frames, ki=8, q=100 | bytes | PSNR |
+|---|---|---|
+| bbb, **before** | 17 458 361 | **32.89 dB** |
+| bbb, after | 21 600 670 | **inf** |
+| blue_sky, after | 18 234 795 | **inf** |
+| crowd_run, after | 26 381 563 | **inf** |
+| old_town_cross, after | 25 538 510 | **inf** |
+
+SSIM 1.0000, max PSNR drop 0.00 dB, four of four. **Rate rises 23.7% on bbb** — the honest price;
+the smaller file was smaller because it was throwing the picture away, so that comparison was never
+valid, and every q=100 rate figure taken from Y4M before today is superseded.
+
+**Lossy is byte-identical**, checked against demo artefacts produced by the *previous* binary —
+q=25 1 153 801, q=50 2 352 009, q=75 6 190 783 — which is a real before/after rather than an
+argument from where the `if` sits.
+
+Guard: `tests/bug45_fractional_source_lossless.rs`. Mutation-tested — removing the rounding gives
+**max abs error 134** on a 0–255 scale while the integral-source control keeps passing.
+
+### What this says about how the session verified BUG-49 that morning
+
+`0080` was verified end to end on **PNG stills**, which are integral by construction. Nothing in
+that verification could have reached the Y4M path, and `0080` even records "BUG-45 … this record
+does not close it" as a known remainder. It turned out to be the larger half, and it took about ten
+seconds of a person watching a video to surface what a day of measuring on stills did not.
+**A bit-exactness claim is only as broad as the input formats it was taken on**, and the log now
+has one instance of that costing a shipped defect and one of it being caught by a viewer.
+
+Filed: **LOSSLESS-4** — q=100 from Y4M is bit-exact against the *converted RGB*, not the file's
+original Y'CbCr. The BT.601 matrix is not integer-invertible, so "lossless" is narrower for Y4M
+input than for PNG input and nothing in the CLI says so.

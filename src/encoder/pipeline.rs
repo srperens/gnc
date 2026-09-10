@@ -1801,12 +1801,34 @@ verified at non-444 (RATE-5). Coding the wavelet candidate only.",
         // frame the caller can legitimately want coded lossily is worse than telling them what
         // they got. `local_decode_iframe_gpu` uses the same predicate to decline building a
         // reference from a source the reconstruction does not equal.
-        if config.is_lossless() && !crate::source_is_integral(rgb_data) {
+        //
+        // **The warning became a fix on 2026-09-10 (`docs/decisions/0081`).** Saying "this is not
+        // bit-exact" and coding it anyway is the worst of the three options: measured on
+        // `bbb.y4m`, `benchmark-sequence -q 100` produced **PSNR 32.89 dB at 8.42 bpp**, varying
+        // 32.48–33.16 frame to frame. The step-1 quantiser rounds the *residual*, and MED's
+        // open-loop prediction accumulates that along each tile's diagonal scan — the `0080`
+        // mechanism, one producer over — so the picture was already being destroyed, far past
+        // the half-LSB that rounding the input costs. Rounding here makes the guarantee true.
+        //
+        // **Every Y4M source reaches this**, not just subsampled ones: the reader's BT.601
+        // matrix is `1.164*(Y-16)` and friends, so even `C444` 8-bit input arrives fractional.
+        let non_integral = if config.is_lossless() {
+            rgb_data.iter().filter(|v| v.fract() != 0.0).count()
+        } else {
+            0
+        };
+        let rounded_source: Option<Vec<f32>> = if non_integral > 0 {
+            // Canary: a count, not a boolean — it is the only externally visible sign that the
+            // source was fractional at all, and it is what a silent regression would zero.
             eprintln!(
-                "GNC: lossless settings (q=100 / qstep<=1) with non-integer input samples — the \
-                 step-1 quantiser rounds, so this frame is NOT bit-exact (BUG-45)"
+                "GNC: lossless settings (q=100 / qstep<=1) with {non_integral} non-integer input \
+samples — rounded to integers so the step-1 quantiser has something it can code exactly (BUG-45)"
             );
-        }
+            Some(rgb_data.iter().map(|v| v.round()).collect())
+        } else {
+            None
+        };
+        let rgb_data: &[f32] = rounded_source.as_deref().unwrap_or(rgb_data);
         let profile = std::env::var("GNC_PROFILE").is_ok();
         let t_start = std::time::Instant::now();
 

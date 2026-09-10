@@ -247,8 +247,12 @@ No fps is quoted — the machine was not idle.
 New section 2026-09-08 (LOSSLESS-2). There was no lossless *sequence* row here before, because
 until BUG-39 (`0064`) `q=100` video was not bit-exact and there was nothing to regress against.
 
-**These rows are 4:4:4 and are untouched by BUG-49 (`0080`, 2026-09-10)** — verified
-byte-identical. Every subsampled `q=100` figure taken **before** 2026-09-10 is superseded: at
+**These rows are 4:4:4 and PNG-sourced, so both of 2026-09-10's lossless fixes leave them
+alone** — verified byte-identical. `encode-sequence` reads PNG, whose samples are integral, which
+is the reason they survived; **any q=100 figure taken from a Y4M source before 2026-09-10 is
+superseded** and by a wide margin, because that path was not lossless at all (BUG-45, `0081`:
+bbb read PSNR 32.89 dB at 8.42 bpp, and now reads inf at 10.42 bpp). Rate and quality both moved,
+so such a figure cannot be adjusted — it has to be retaken. Every subsampled `q=100` figure taken **before** 2026-09-10 is superseded: at
 4:2:2/4:2:0 the lossless path was drifting inside each tile, so those encodes were both larger and
 2.7x to 20x worse in colour than they now are. There are still no non-444 rows in this file; there
 now *could* be, which is the change. Numbers in RESEARCH_LOG, 2026-09-10.

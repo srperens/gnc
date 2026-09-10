@@ -283,15 +283,18 @@
             </div>
 
             <div class="file-selector">
-                <label>Demo files</label>
+                <label>Demo files <span style="font-weight:normal;font-size:0.85em">&mdash; <a href="chroma.html" style="color:#7fb4ff">how to see 4:4:4 vs 4:2:2 vs 4:2:0</a></span></label>
                 <div class="file-row">
                     <select id="demoSelect">
                         <option value="">-- Select a demo --</option>
                     </select>
-                    <button id="loadDemoBtn">Load</button>
                     <a id="demoDlLink" style="display:none" title="Download"><button type="button" style="background:#2a2a4a;padding:7px 10px;font-size:0.82em;">&#x2B07;</button></a>
                     <a id="demoDiagLink" style="display:none" target="_blank" title="Open .diag"><button type="button" style="background:#2a2a4a;padding:7px 10px;font-size:0.72em;">diag</button></a>
                 </div>
+                <label style="display:flex;align-items:center;gap:6px;margin-top:6px;font-weight:normal;cursor:pointer;">
+                    <input type="checkbox" id="autoAdvanceChk">
+                    <span>Auto-advance &mdash; play the next demo in this group instead of looping</span>
+                </label>
                 <div class="file-desc" id="demoDesc"></div>
             </div>
 
@@ -372,7 +375,10 @@
         const canvasWrap = $('canvasWrap');
         const rightPanel = $('rightPanel');
         const demoSelect = $('demoSelect');
-        const loadDemoBtn = $('loadDemoBtn');
+        const autoAdvanceChk = $('autoAdvanceChk');
+        // The file currently loaded, so auto-advance knows where it is in the manifest. Set by
+        // loadUrl rather than read off the <select>, which the user may have moved since.
+        let currentDemoName = null;
         const demoDesc = $('demoDesc');
         const demoDlLink = $('demoDlLink');
         const demoDiagLink = $('demoDiagLink');
@@ -653,6 +659,17 @@
             demoSelect.appendChild(optgroup);
         }
 
+        // Next file in the same manifest group, or null at the end of it. Group order is the
+        // manifest's, which is generate_demos.sh's, which is the order the files were made in —
+        // so for a movie cut into segments it is chronological.
+        function nextInGroup(name) {
+            if (!name) return null;
+            const here = demoFiles.findIndex(d => d.name === name);
+            if (here < 0) return null;
+            const next = demoFiles[here + 1];
+            return next && next.group === demoFiles[here].group ? next.name : null;
+        }
+
         // Show description + links when selection changes
         demoSelect.addEventListener('change', () => {
             const sel = demoSelect.selectedOptions[0];
@@ -670,22 +687,16 @@
             demoDiagLink.href = diagName;
             demoDiagLink.title = 'Open ' + diagName;
             demoDiagLink.style.display = '';
-        });
 
-        loadDemoBtn.addEventListener('click', () => {
-            const val = demoSelect.value;
-            if (val) loadUrl(val);
-        });
-
-        // Double-click on select to load immediately
-        demoSelect.addEventListener('dblclick', () => {
-            const val = demoSelect.value;
-            if (val) loadUrl(val);
+            // Picking a demo loads it. There used to be a Load button and a double-click
+            // shortcut, which were two ways of saying "yes, the one I just chose".
+            loadUrl(sel.value);
         });
 
         async function loadUrl(filename) {
             if (!wasmReady) { setStatus('WASM still loading, please wait...', 'info'); return; }
             stop();
+            currentDemoName = filename;
             try {
                 const url = filename;
                 setStatus(`Fetching ${filename}...`);
@@ -911,6 +922,22 @@
             }
 
             if (jsCurrentFrame === 0) {
+                // End of clip. Either loop it (the default, and what an A/B comparison wants) or
+                // walk to the next file in the same manifest group — which is how a movie cut
+                // into segments plays as a movie. Advancing is deliberately scoped to the group:
+                // running off the end of "Quality range" into "Chroma format" would be nonsense.
+                const nextDemo = autoAdvanceChk.checked ? nextInGroup(currentDemoName) : null;
+                if (nextDemo) {
+                    // Fire and forget: loadUrl stops playback, swaps the player, and play()
+                    // below restarts the clock. Returning here ends this rAF chain on purpose.
+                    (async () => {
+                        const sel = [...demoSelect.options].find(o => o.value === nextDemo);
+                        if (sel) demoSelect.value = nextDemo;
+                        await loadUrl(nextDemo);
+                        play();
+                    })();
+                    return;
+                }
                 if (zeroCopy) player.reset();
                 playbackStartTime = performance.now();
                 playbackStartFrame = 0;

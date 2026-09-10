@@ -42,10 +42,14 @@ claims the positioning rests on are the ones with the least evidence.**
   low-latency-HEVC band, above JPEG XS.
 - **Throughput** is roughly 4x short of the 60 fps target, and about half of the per-frame cost is
   not GPU coding work.
-- **Portability is half met.** Metal and Vulkan both run the whole codec with byte-identical
-  output across independent implementations. **DX12 has never produced a single frame, and the
-  browser path has never been verified in a browser.** That is a headline defect, not a
-  compatibility nit, because portability is the axis the project claims to win on.
+- **Portability is three-quarters met.** Metal and Vulkan both run the whole codec with
+  byte-identical output across independent implementations, and **the browser now decodes** —
+  verified 2026-09-10 in Chrome *and* Safari on macOS, which are two independent WebGPU
+  implementations rather than two builds of one. Both containers, the whole quality range
+  including lossless, all three chroma formats, and a full-length film. **DX12 has never produced
+  a single frame** (BUG-52), and **browser *encode* cannot work yet**: the default encode path's
+  `quantize_histogram_fused.wgsl` asks for 23 800 B of workgroup storage against the 16 384 B a
+  conformant WebGPU device guarantees (BUG-35). Decode is the half that is done.
 - **Scale is unmeasured.** "A bigger GPU buys more GNC instances than it buys hardware encoder
   blocks" is the central structural claim and it has no number yet. Concurrency currently saturates
   on host memory and per-process startup, not on the GPU.
@@ -75,6 +79,22 @@ gnc fingerprint                                   # what this binary produces
 cd test_material && bash fetch_test_frames.sh     # Xiph.org frames; needs ffmpeg + curl
 wasm-pack build --target web --release            # browser decoder
 ```
+
+### Web player
+
+`examples/web/` is a working WebGPU decoder in a page — a still-frame demo, a video player, and
+a side-by-side of what chroma subsampling actually costs.
+
+```bash
+examples/web/generate_demos.sh                   # comparison clips + stills
+examples/web/generate_movie.sh <film.mov>        # a full-length source, cut into segments
+examples/web/generate_chroma_ab.py               # assets for the 4:4:4 / 4:2:2 / 4:2:0 page
+examples/web/serve.sh                            # builds the WASM, serves on localhost
+```
+
+`http://localhost` is a secure context, so WebGPU works without a certificate. The player holds a
+whole container in memory before it can decode one, so long material is cut into segments and
+played with auto-advance rather than served as one file.
 
 ## Pipeline
 

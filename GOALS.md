@@ -4,7 +4,7 @@
 
 GNC is a patent-free **video codec** designed from scratch for GPU parallelism. Everything runs as wgpu compute shaders (WGSL), written against the WebGPU feature set so the same source targets Metal, Vulkan, DX12 and WebGPU/WASM. The core idea: tile-independent processing with thousands of parallel threads instead of sequential CPU-era algorithms.
 
-**That is the design, and it is not yet fully the measured state.** As of 2026-09-08 every performance figure is **Metal**; on **Vulkan** intra *and* inter now run end to end on two independent implementations, with byte-identical output between them, but no inter throughput figure exists yet (BUG-25 **fixed** — `docs/decisions/0029`; the four driver crashes on record were all one upstream naga defect on invalid SPIR-V). DX12 has never been run beyond a software adapter that panicked, and the WASM path is unverified in a browser with one known limit breach (BUG-31). The evidence is in the items themselves — `docs/decisions/0029` for Vulkan, **BUG-52** for DX12's compile-time wall and **BUG-31** for the WASM limit breach — and should be read before any claim of cross-platform support is repeated. The README carries the one-line summary, not the evidence.
+**That is the design, and it is not yet fully the measured state.** As of 2026-09-08 every performance figure is **Metal**; on **Vulkan** intra *and* inter now run end to end on two independent implementations, with byte-identical output between them, but no inter throughput figure exists yet (BUG-25 **fixed** — `docs/decisions/0029`; the four driver crashes on record were all one upstream naga defect on invalid SPIR-V). DX12 has never been run beyond a software adapter that panicked. **The WASM path is verified as of 2026-09-10**: the decoder runs in Chrome *and* Safari on macOS — two independent WebGPU implementations, not two builds of one — through `examples/web/player.html`, on both containers (GNV1 I+P and GNV2 temporal wavelet), the whole quality ladder including the q=100 MED lossless path, all three chroma formats, and a full-length film in segments. **Browser *encode* remains impossible**, and rule 4 does not distinguish the two: `quantize_histogram_fused.wgsl` is on the default encode path and asks 23 800 B of workgroup storage against the 16 384 B a conformant WebGPU device guarantees (BUG-35). An earlier version of this line cited BUG-31 as an open limit breach; that was fixed 2026-09-08. The evidence is in the items themselves — `docs/decisions/0029` for Vulkan, **BUG-52** for DX12's compile-time wall and **BUG-35** for the encode-side limit breach that still keeps the *encoder* out of a browser — and should be read before any claim of cross-platform support is repeated. The README carries the one-line summary, not the evidence.
 
 ### GNC is broad on purpose — that is the decision, not an unresolved question (2026-09-07)
 
@@ -72,7 +72,7 @@ order rather than a format-specific feature.
 1. **Patent-free** — No patented techniques, period. If it's patented, we don't use it.
 2. **GPU-first** — Everything runs in compute shaders. No CPU fallback paths. CPU reference implementations only for validation/testing.
 3. **Massive parallelism via tile independence** — No cross-tile dependencies at any stage. Each tile encodes/decodes in isolation. This is what enables thousands of parallel GPU threads.
-4. **Cross-platform** — Must work on Metal, Vulkan, DX12, and WebGPU (WASM). No backend-specific features. WGSL shaders are the single source. **Half met as of 2026-09-08: Metal and Vulkan both run the whole codec; DX12 and the browser do not** — see §1. Portability is the axis the project claims to win on (§1), so a backend it cannot run on is a headline defect and not a compatibility nit.
+4. **Cross-platform** — Must work on Metal, Vulkan, DX12, and WebGPU (WASM). No backend-specific features. WGSL shaders are the single source. **Three-quarters met as of 2026-09-10: Metal and Vulkan run the whole codec, and the browser decodes on two independent WebGPU implementations; DX12 runs nothing, and the browser cannot encode (BUG-35)** — see §1. Portability is the axis the project claims to win on (§1), so a backend it cannot run on is a headline defect and not a compatibility nit.
 5. **No f64 in shaders** — Apple and mobile GPUs have no hardware double precision, and WGSL has no `f64` in any case.
 6. **Open source only** — All dependencies must be open source.
 7. **English only** — All code, comments, docs, and commit messages in English.
@@ -114,7 +114,7 @@ and 3.1x by a shared machine.
 - Fused quantize+histogram shader
 - 128+ tests, golden-baseline regression, 5 conformance bitstreams
 - 33 WGSL compute shaders
-- WASM/WebGPU decoder builds (263 KB)
+- WASM/WebGPU decoder **runs in a browser** — Chrome and Safari on macOS, 2026-09-10; 628 KB from `wasm-pack --release`. The web player in `examples/web/` plays GNV1 and GNV2, seeks, and auto-advances a segmented film
 
 **Key GPU architecture insight:** shared-memory occupancy dominates performance. 16KB is the budget because that is what **GNC requests** (wgpu defaults, for WebGPU portability) — the adapter here offers 32KB, so this is a self-imposed ceiling, not the chip's (BUG-29). At 16KB, 2 workgroups/core is full occupancy; Rice uses < 1KB shared, so occupancy is excellent.
 

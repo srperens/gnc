@@ -1863,6 +1863,44 @@ unmeasured**; the fix applies wherever the sibling is used and should move them 
 
 Decision `docs/decisions/0072`. Fixed 2026-09-08 by the `drnum` session while closing RATE-4.
 
+### BUG-55 — the WASM decoder asks for a limit only the encoder needs, and a spec-minimum device refuses the whole context (todo, **P2**)
+
+**Found 2026-09-10, while writing up the browser verification.** `GpuContext::try_new_async` — the
+WASM path — requests `required_limits()`, which is `Limits::default()` plus one override:
+`max_storage_buffers_per_shader_stage: 9`, one above the **8 that the WebGPU spec guarantees**
+(`docs/decisions/0047`, and CLAUDE.md's limits table).
+
+**The override exists for `block_match_bidir.wgsl`, which is a motion-estimation shader.** It is
+encode-only. The decoder never binds nine storage buffers and does not need the raise — but it is
+requested at *device creation*, before any shader is involved.
+
+**So on a conformant device that grants exactly the spec minimum, GNC does not fail at a shader —
+it fails to start**, with no decode attempted and an error about limits rather than about the
+codec. Chrome and Safari on macOS both pass it because Metal exposes far more (`gnc gpu-info`
+reports **31** on this adapter), which is exactly why the browser verification did not catch it:
+every engine tested so far sits on the same backend, and the backend is generous.
+
+**This is the same shape as BUG-35 and worth keeping distinct from it.** BUG-35 is a *shader* over
+the workgroup-storage budget on the encode path; this is a *context* request over the storage-buffer
+budget that the decode path makes for no reason of its own. Either one keeps GNC off a strict
+device; only this one also keeps the **decoder** off it, which is the half the project has just
+claimed works.
+
+**Fix, and it is small:** ask for `Limits::default()` on the decode-only path, and keep
+`required_limits()` for the encoder. That likely means splitting the context constructor, or
+passing the limits in. `tests/requested_limits.rs` compares the struct field-for-field against
+`Limits::default()` and must be extended to assert the *decoder* asks for no override at all,
+otherwise the split can regress silently.
+
+**Success criterion:** a decode-only context created against `Limits::default()` decodes the
+conformance bitstreams byte-identically, and `tests/requested_limits.rs` fails if any override
+reappears on that path. Then the browser claim holds on any conformant device rather than on
+generous ones — which is the difference between "runs in two browsers" and "portable".
+
+**Do not close it by testing another browser on this machine.** All three WebGPU implementations
+on macOS sit on Metal; none of them can produce the failure. It needs either a device with the
+spec-floor limits or a deliberately clamped request.
+
 ### LOSSLESS-4 — "lossless" means something narrower for Y4M input than for PNG, and nothing says so (todo, **P2**)
 
 **Filed 2026-09-10 by BUG-45 / `0081`.** That fix makes `q=100` on a Y4M source bit-exact **with

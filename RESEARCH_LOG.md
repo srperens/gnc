@@ -18543,3 +18543,62 @@ has one instance of that costing a shipped defect and one of it being caught by 
 Filed: **LOSSLESS-4** — q=100 from Y4M is bit-exact against the *converted RGB*, not the file's
 original Y'CbCr. The BT.601 matrix is not integer-invertible, so "lossless" is narrower for Y4M
 input than for PNG input and nothing in the CLI says so.
+
+---
+
+## 2026-09-10 — The browser path is verified, on two independent WebGPU implementations
+
+**What was run.** `examples/web/player.html`, served over `http://localhost` (a secure context, so
+WebGPU needs no certificate), driving the `wasm-pack --release` build of the library — 628 KB of
+`gnc_bg.wasm`. Watched by the project owner in **Chrome and Safari on macOS**. Those are not two
+builds of one engine: Safari's WebGPU is WebKit's own implementation, not Dawn, so this is the same
+shape of evidence as the Vulkan result — a second implementation agreeing with the first.
+
+**What it exercised:**
+
+- **Both containers** — GNV1 (I+P) and GNV2 (the Haar temporal wavelet).
+- **The whole quality ladder** — q=25 through q=100, including the MED lossless path, which is the
+  only rung with a serial dependency in its decoder (`med_reconstruct.wgsl`, 511 anti-diagonals
+  with a `storageBarrier()` between them, one workgroup per tile).
+- **All three chroma formats** — 4:4:4, 4:2:2, 4:2:0.
+- **A full-length film** — 14 315 frames of 1080p in 20 segments, played end to end with the
+  player's auto-advance.
+
+**Play rate, and read it as what it is.** The page's own timing display reported roughly **150 fps
+on the short 1080p clips and 120 fps on crowd_run and old_town_cross**. That is a decoder keeping
+far ahead of any real frame rate, which is the useful conclusion. It is **not a throughput figure**:
+it was read off a page on a machine with eight sessions live, and BASELINE's rule about non-idle
+runs applies to browsers as much as to `benchmark-sequence`. Nobody should quote it as a benchmark.
+
+### What the documentation said, and why it was wrong twice over
+
+README carried *"the browser path has never been verified in a browser"* as a headline defect, and
+this session repeated it back to the owner as fact. The correction came from the person who had
+actually run it. **Two separate errors were sitting in that one sentence:**
+
+1. **Too broad.** What the log actually recorded (2026-09-07) was narrower and correct at the time:
+   *"Verified: WASM builds, its four exports match what both pages import, all ten bitstreams decode
+   through the CLI, both pages' modules parse … **Not verified: an actual browser render**"* — a
+   statement about that afternoon's freshly-built demo set, not about the decoder's whole history.
+   README generalised it into a claim about the feature, and GOALS repeated the generalisation.
+2. **Stale.** GOALS §1 said the WASM path had *"one known limit breach (BUG-31)"*. BUG-31 was fixed
+   on 2026-09-08. The remaining breach is BUG-35's, it is **encode**-side, and it is worse in kind:
+   `quantize_histogram_fused.wgsl` is on the *default* encode path at 23 800 B against a 16 384 B
+   guarantee, where BUG-31's was an opt-in coder's. The doc named the closed bug and missed the open
+   one, in the milder direction.
+
+The same-day lesson from BUG-45 is one layer up from this: a claim is only as broad as what it was
+taken on. Here the claim was *narrower* than the sentence carrying it, which fails the other way —
+the project talked itself out of a capability it had.
+
+### Still not verified, and none of it is implied by the above
+
+- **Browser encode.** Not merely untested — currently impossible, and the encoder is not exposed to
+  JS anyway. BUG-35. GOALS rule 4 does not distinguish encoder from decoder, so rule 4 is
+  three-quarters met, not met.
+- **Any non-Apple GPU in a browser**, and any browser on Windows or Linux. Both engines tested here
+  sit on Metal. A conformant-but-stricter device is exactly what BUG-35 would catch.
+- **DX12**, which still has not produced a frame (BUG-52).
+
+Documentation updated: README's portability bullet and a new "Web player" section, GOALS §1 and
+rule 4 and the feature list, `docs/POSITIONING.md`'s in-browser-decode line.

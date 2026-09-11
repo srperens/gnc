@@ -424,13 +424,18 @@ impl CachedEncodeBuffers {
             input_buf: ctx.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("enc_input"),
                 size: buf_size_3,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                // COPY_SRC since LOSSLESS-5: a Y'CbCr-native frame has no colour transform to run,
+                // so the padded interleaved planes are copied straight into `color_out`.
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::COPY_SRC,
                 mapped_at_creation: false,
             }),
             color_out: ctx.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("enc_color_out"),
                 size: buf_size_3,
-                usage: wgpu::BufferUsages::STORAGE,
+                // COPY_DST since LOSSLESS-5: destination of that same copy.
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }),
 

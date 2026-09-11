@@ -206,17 +206,34 @@ impl EncoderPipeline {
         padded_h: u32,
         padded_pixels: u32,
         reversible: bool,
+        convert_colour: bool,
     ) {
-        self.color.dispatch(
-            ctx,
-            cmd,
-            input_buf,
-            color_out,
-            padded_w,
-            padded_h,
-            true,
-            reversible,
-        );
+        // **LOSSLESS-5.** When the frame arrived as the source's own Y'CbCr there is nothing to
+        // convert: `color_out` is fed the interleaved planes directly and only the deinterleave
+        // has to run. Skipping the matrix is the whole of the colour-space saving — measured at
+        // **−13.2%** on four clips once the chroma-format change it used to be confused with was
+        // separated out (2026-09-11). The pad shader above is channel-agnostic, so nothing else
+        // on this path needs to know.
+        if convert_colour {
+            self.color.dispatch(
+                ctx,
+                cmd,
+                input_buf,
+                color_out,
+                padded_w,
+                padded_h,
+                true,
+                reversible,
+            );
+        } else {
+            cmd.copy_buffer_to_buffer(
+                input_buf,
+                0,
+                color_out,
+                0,
+                (padded_pixels as u64) * 3 * std::mem::size_of::<f32>() as u64,
+            );
+        }
         self.deinterleaver
             .dispatch(ctx, cmd, color_out, out_y, out_co, out_cg, padded_pixels);
     }
@@ -1817,6 +1834,7 @@ impl EncoderPipeline {
                                 padded_h,
                                 padded_pixels as u32,
                                 cfg.is_lossless(),
+                                cfg.color_space == crate::ColorSpace::YCoCgR,
                             );
 
                             let planes: [&wgpu::Buffer; 3] =
@@ -2049,6 +2067,7 @@ impl EncoderPipeline {
                             padded_h,
                             padded_pixels as u32,
                             cfg.is_lossless(),
+                            cfg.color_space == crate::ColorSpace::YCoCgR,
                         );
 
                         let planes: [&wgpu::Buffer; 3] =
@@ -2366,6 +2385,7 @@ impl EncoderPipeline {
                         padded_h,
                         padded_pixels as u32,
                         cfg.is_lossless(),
+                        cfg.color_space == crate::ColorSpace::YCoCgR,
                     );
 
                     let planes: [&wgpu::Buffer; 3] =
@@ -2878,6 +2898,7 @@ impl EncoderPipeline {
                             padded_h,
                             padded_pixels as u32,
                             cfg.is_lossless(),
+                            cfg.color_space == crate::ColorSpace::YCoCgR,
                         );
                         let planes_b: [&wgpu::Buffer; 3] =
                             [&sp_b.plane_a, &sp_b.co_plane, &sp_b.cg_plane];
@@ -3254,6 +3275,7 @@ impl EncoderPipeline {
                 padded_h,
                 padded_pixels as u32,
                 true,
+                config.color_space == crate::ColorSpace::YCoCgR,
             );
             ctx.queue.submit(std::iter::once(cmd.finish()));
             for p in 0..3 {
@@ -3847,6 +3869,7 @@ impl EncoderPipeline {
                 padded_h,
                 padded_pixels as u32,
                 config.is_lossless(),
+                config.color_space == crate::ColorSpace::YCoCgR,
             );
         }
 
@@ -5033,6 +5056,7 @@ impl EncoderPipeline {
                     padded_h,
                     padded_pixels as u32,
                     config.is_lossless(),
+                    config.color_space == crate::ColorSpace::YCoCgR,
                 );
                 // Pyramid ME for look-ahead: same 4-stage flow as main path.
                 let la_pyr_w = padded_w / 4;
@@ -5596,6 +5620,7 @@ impl EncoderPipeline {
                 padded_h,
                 padded_pixels as u32,
                 config.is_lossless(),
+                config.color_space == crate::ColorSpace::YCoCgR,
             );
         }
 
@@ -6046,6 +6071,7 @@ impl EncoderPipeline {
                     padded_h,
                     padded_pixels as u32,
                     config.is_lossless(),
+                    config.color_space == crate::ColorSpace::YCoCgR,
                 );
                 // Use current frame's MVs as temporal predictor for the look-ahead.
                 let bidir_params_la = &bufs.bidir_params_pred;
@@ -6808,6 +6834,7 @@ impl EncoderPipeline {
             padded_h,
             padded_pixels as u32,
             config.is_lossless(),
+            config.color_space == crate::ColorSpace::YCoCgR,
         );
 
         let weights_luma = config.subband_weights.pack_weights();
@@ -6906,6 +6933,7 @@ impl EncoderPipeline {
             padded_h,
             padded_pixels as u32,
             config.is_lossless(),
+            config.color_space == crate::ColorSpace::YCoCgR,
         );
 
         let planes: [&wgpu::Buffer; 3] = [&bufs.plane_a, &bufs.co_plane, &bufs.cg_plane];

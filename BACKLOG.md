@@ -1904,6 +1904,40 @@ unmeasured**; the fix applies wherever the sibling is used and should move them 
 
 Decision `docs/decisions/0072`. Fixed 2026-09-08 by the `drnum` session while closing RATE-4.
 
+### BUG-56 — the Y4M reader cannot ingest 4:2:2, the format the project headlines (todo, **P1**)
+
+**Found 2026-09-11.** `Y4mReader::open` decides the chroma format with one test:
+
+```rust
+chroma = if fmt_base.starts_with("444") { C444 } else { C420 }  // default; 420jpeg / 420mpeg2 / plain 420
+```
+
+So **every format that is not 4:4:4 is assumed to be 4:2:0**. A `C422` file has twice the chroma
+rows the reader expects; it reads half of them, runs off the plane boundaries, and panics on the
+next frame header. `Cmono` does the same. Verified: `ffmpeg -pix_fmt yuv422p` into
+`benchmark-sequence` panics at `src/main.rs:153`.
+
+**Why this is P1 and not a nit.** GOALS §1 headlines **10-bit 4:2:2**; `docs/POSITIONING.md` sells
+contribution, where 4:2:2 is the dominant professional interchange format; the encoder has
+supported `--chroma-format 422` for months and BUG-49 made it bit-exact at q=100 on 2026-09-10. The
+codec can code 4:2:2. **The tool cannot read it.** Every 4:2:2 figure in this repository was
+therefore produced by converting to something else first, and no 4:2:2 *source* has ever been
+ingested as itself.
+
+**It also silently narrows every measurement taken through Y4M.** The reader's own comment lists
+"420jpeg / 420mpeg2 / plain 420" as the things it is defaulting for, which reads as deliberate
+coverage rather than as a fallback that swallows two other formats.
+
+**Fix:** parse the `C` tag properly — 420 variants, 422, 444, mono — and **refuse** what it does not
+know instead of guessing. A wrong chroma format is not an error the user sees, it is a wrong
+picture or a panic three frames later, which is the same failure class as `0074`'s generation
+argument and BUG-45's silent rounding.
+
+**Success criterion:** a 4:2:2 and a 4:4:4 Y4M both round-trip through `benchmark-sequence -q 100`
+bit-exactly against their own samples, an unknown `C` tag is refused by name, and
+`test_material/` gains a 4:2:2 clip so the case is covered by default rather than by someone
+remembering. Pairs naturally with LOSSLESS-5, which is where planar ingest lands.
+
 ### BUG-55 — the WASM decoder asks for a limit only the encoder needs, and a spec-minimum device refuses the whole context (todo, **P2**)
 
 **Found 2026-09-10, while writing up the browser verification.** `GpuContext::try_new_async` — the

@@ -1901,7 +1901,7 @@ generous ones — which is the difference between "runs in two browsers" and "po
 on macOS sit on Metal; none of them can produce the failure. It needs either a device with the
 spec-floor limits or a deliberately clamped request.
 
-### LOSSLESS-4 — "lossless" means something narrower for Y4M input than for PNG, and nothing says so (todo, **P2**)
+### LOSSLESS-4 — the RGB conversion costs +64.2% of the lossless rate, seven times the entropy gap (todo, **P1** — re-priced 2026-09-11)
 
 **Filed 2026-09-10 by BUG-45 / `0081`.** That fix makes `q=100` on a Y4M source bit-exact **with
 respect to the RGB the reader produces**. It is not bit-exact with respect to the file's original
@@ -1917,11 +1917,33 @@ BT.601 round trip*, and `gnc encode-sequence -q 100` says nothing about it. That
 of silent-scope problem as BUG-54 (CfL off at 4:2:2) and FMT-3 (no stated transfer-function
 position).
 
-**Also a rate argument.** Coding BT.601-expanded RGB losslessly is more expensive than coding the
-original YUV: the 1.164 gain manufactures levels that were not in the 8-bit source. bbb at q=100
-costs 10.42 bpp through the Y4M path against 8.42 bpp for the (lossy) old behaviour, and the
-PNG-sourced BASELINE rows are a third comparison again. A native Y'CbCr path would code fewer
-distinct levels *and* be genuinely lossless.
+**The rate argument, measured 2026-09-11, and it is the reason this is now P1.** Eight frames of
+`bbb.y4m`, every arm lossless and bit-exact for what it codes:
+
+| arm | bytes | vs FFV1 native | vs FFV1 gbrp |
+|---|---|---|---|
+| **FFV1 native** (`yuv420p`, codes the file's own samples and returns them) | 10 056 857 | — | −39.1% |
+| **FFV1 gbrp** (converted to RGB first, exactly as GNC does) | 16 515 377 | **+64.2%** | — |
+| GNC q=100, Rice | 21 600 670 | +114.8% | +30.8% |
+| **GNC q=100, `--abac`** | 17 972 947 | +78.7% | **+8.8%** |
+
+**Two comparisons, two meanings, and quoting either alone misleads.** Against FFV1 *on the same
+signal* GNC is **+8.8%** with abac — which independently reproduces the published +7.3% on stills,
+on different content and through a different input path, so the entropy-coding gap is real and it
+is small. Against FFV1 *on the same file* — what a user actually has — GNC is **+78.7%**.
+
+**The difference between those two rows is 64.2 percentage points of colour conversion, paid before
+GNC codes anything.** That is seven times the entropy-coding gap, and it is the largest single item
+in the lossless picture. BT.601's 1.164 gain manufactures levels that were never in the 8-bit
+source, and full-resolution RGB carries chroma the 4:2:0 file did not have. A native Y'CbCr path
+would code fewer distinct levels *and* return the user's samples — it fixes the correctness
+complaint and the rate complaint with one change.
+
+**This also re-frames every lossless rate figure in the repo.** The published FFV1 comparison ran
+on PNGs (RESEARCH_LOG, "The FFV1 gap, measured today rather than carried forward": *"on the same
+four PNGs"*), where the input is integral and the conversion penalty is the *source's* problem
+rather than GNC's — so those numbers are honest for still images and say nothing about video
+ingest. Nobody has published the Y4M row until now.
 
 **Three options, and they are not equivalent:**
 

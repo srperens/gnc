@@ -18602,3 +18602,51 @@ the project talked itself out of a capability it had.
 
 Documentation updated: README's portability bullet and a new "Web player" section, GOALS §1 and
 rule 4 and the feature list, `docs/POSITIONING.md`'s in-browser-decode line.
+
+---
+
+## 2026-09-11 — Did fixing lossless cost us the FFV1 comparison? No. It exposed a bigger one.
+
+**The question, from the project owner:** now that BUG-45 raised the Y4M lossless rate 23.7%, is
+GNC still competitive? Reasonable suspicion, and the answer is two-part.
+
+**The published comparison did not move, and that is checkable rather than arguable.** The standing
+FFV1 result was taken *"on the same four PNGs"* (RESEARCH_LOG, "The FFV1 gap, measured today rather
+than carried forward"). PNG samples are integral, so `0081`'s rounding — which only fires on a
+fractional source — cannot reach that arm. Verified byte-identically: `bbb_1080p.png` at q=100
+encodes to **3 235 737 bytes** both before and after the fix, across both of the weekend's lossless
+changes.
+
+**But the arm nobody had published is much worse.** Eight frames of `bbb.y4m`, every row lossless
+and bit-exact for the signal it codes:
+
+| arm | bytes | vs FFV1 native | vs FFV1 gbrp |
+|---|---|---|---|
+| **FFV1 native** (`yuv420p` — codes the file's own samples, returns them exactly) | 10 056 857 | — | −39.1% |
+| **FFV1 gbrp** (converted to RGB first, exactly as GNC does) | 16 515 377 | **+64.2%** | — |
+| GNC q=100, Rice (default) | 21 600 670 | +114.8% | +30.8% |
+| **GNC q=100, `--abac`** | 17 972 947 | +78.7% | **+8.8%** |
+
+**Two comparisons, two meanings, and quoting either alone misleads** — the same rule CLAUDE.md
+already carries for the x264 luma/chroma split, arriving from a different direction.
+
+- *Codec against codec, same signal:* **+8.8%** with abac. That independently reproduces the
+  published **+7.3%** on stills, on different content and through a different input path. The
+  entropy-coding gap is real, small, and now confirmed twice.
+- *Product against product, same file:* **+78.7%**. This is what a user with a Y4M file sees.
+
+**The 64.2 points between those two rows are colour conversion, paid before GNC codes anything.**
+That is **seven times** the entropy-coding gap and the largest single item in the lossless picture.
+Two mechanisms: BT.601's 1.164 gain manufactures levels that were never in the 8-bit source, and
+full-resolution RGB carries chroma detail the 4:2:0 file never had. FFV1 pays it too when told to
+(`-pix_fmt gbrp`, +64.2%) — it is not a GNC defect, it is a consequence of coding RGB at all.
+
+**So the honest summary is that the suspicion was right about the wrong thing.** The fix did not
+make GNC worse; it removed a comparison that was never valid, and measuring the replacement showed
+the rate story on video ingest is dominated by something that is not the entropy coder. Every
+effort spent on the abac gap buys at most ~9 points; a native Y'CbCr path buys ~64 and fixes
+LOSSLESS-4's correctness complaint in the same change.
+
+**LOSSLESS-4 re-priced P2 → P1** on this measurement. PERF-3 item 2 (packed-u8 YUV upload, 4x less
+DMA and no CPU colour) wants the same input path for an unrelated reason, which is worth knowing
+before either is designed.

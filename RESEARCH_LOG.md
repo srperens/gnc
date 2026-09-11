@@ -18656,3 +18656,69 @@ on the board; the mis-statement was in the arithmetic of comparing them, not in 
 **LOSSLESS-4 re-priced P2 → P1** on this measurement. PERF-3 item 2 (packed-u8 YUV upload, 4x less
 DMA and no CPU colour) wants the same input path for an unrelated reason, which is worth knowing
 before either is designed.
+
+---
+
+## 2026-09-11 — LOSSLESS-4: the still path codes Y'CbCr natively, −39.2% end to end
+
+Built in four stages behind a generation bump, each verified before the next.
+
+**Stage 1 — GP21.** A colour-space byte next to GP13's chroma byte, gated on `gen >= 21`; older
+generations decode as YCoCg-R, which for them is not a default but the only thing they could have
+been. An unknown byte panics rather than falling back: a wrong colour space is a plausible wrong
+picture, `0074`'s failure mode. **GP20 is skipped on purpose** — it is written on unmerged tile1
+work and held as `gen-20`, so taking the next number by inspection would have been BUG-51 twice.
+
+**Stage 2 — `EncodeInput`.** `Rgb` pads on the GPU, converts, deinterleaves, subsamples. `Planes`
+does none of those four. Padding moves to the CPU for a planar source because that source arrives
+there anyway — one pass over data about to be uploaded, against the 25 MB interleaved buffer the
+same frame used to build.
+
+**Stage 3 — the decoder stops inverting a transform that never happened.** Two buffer usages had to
+widen for the copy that replaces it.
+
+**Stage 4 — the CLI reads Y4M planes.** `gnc encode -i clip.y4m` now codes them directly;
+`GNC_RGB_PATH=1` forces the old arm.
+
+### The number, end to end through the tool
+
+| sequence, frame 0, q=100 | RGB path | planar | delta |
+|---|---|---|---|
+| bbb | 2 699 215 | 1 604 025 | **−40.6%** |
+| blue_sky | 2 270 626 | 1 291 127 | **−43.1%** |
+| crowd_run | 3 281 233 | 2 068 733 | **−37.0%** |
+| old_town_cross | 3 192 704 | 1 994 249 | **−37.5%** |
+| **mean** | 11 443 778 | 6 958 134 | **−39.2%** |
+
+**Identical to the spike, sequence for sequence.** The estimate was taken before any code was
+written, by coding each plane separately as a grayscale image — `Co = R−B = 0` and `Cg = 0` exactly,
+so the two empty planes cost 3 191 B and the luma plane goes through the normal path. Predicting the
+shipped number to the byte is the strongest argument that neither the estimate nor the
+implementation is doing something unintended.
+
+### Three things that went wrong, all mine
+
+**A commit message claimed both clippy gates were clean when they were not.** I ran the gates in the
+same command as the commit rather than before it. Two warnings, one of which was dead scaffolding
+(`unused_marker`) left over from restructuring. Fixed and the commit rewritten before pushing — but
+the lesson is that a gate run *after* `git commit` in the same line is not a gate.
+
+**The BUG-51 guard went blind and reported success.** It found what the writer stamps by scanning
+`format.rs` for `out.extend_from_slice(b"GP..`. Switching the writer to a `CURRENT_MAGIC` constant
+made that scan match nothing — a guard that passes because it stopped looking. It now follows the
+indirection and checks both links. Worth generalising: **every guard that locates its subject by
+matching source text can be silenced by a refactor that is otherwise correct.**
+
+**The `GNC_RGB_PATH=1` escape hatch could not run.** `gnc encode` never read Y4M before, so forcing
+the RGB arm fell through to an image loader that refuses the extension — an A/B with one arm, which
+is the shape of several retracted results in this log. The forced arm now does the conversion
+itself.
+
+### Stopped deliberately, at the half that matters most
+
+The planar path is in the **still** encoder. Video goes through `sequence.rs`, which has **nine**
+separate `color.dispatch` sites across I/P/B, streaming and not, temporal-wavelet and not — in a
+file ARCH-4 already records as 7 590 lines in one impl block and as where the reference bugs live.
+Branching nine sites by hand on the same afternoon the still path was verified is how a measured win
+becomes an unmeasured regression. **LOSSLESS-5**, which says to do the shared-preprocessing part of
+ARCH-4 first so the branch is written once instead of nine times and deleted eight.

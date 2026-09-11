@@ -128,8 +128,21 @@ impl Y4mReader {
         }
     }
 
-    /// Read one frame and return interleaved RGB f32 (0-255), or None at EOF.
-    fn read_frame_rgb(&mut self) -> Option<Vec<f32>> {
+    /// The chroma format these planes arrive in, as the codec names it.
+    fn chroma_format(&self) -> gnc::ChromaFormat {
+        match self.chroma {
+            Y4mChroma::C420 => gnc::ChromaFormat::Yuv420,
+            Y4mChroma::C444 => gnc::ChromaFormat::Yuv444,
+        }
+    }
+
+    /// Read one frame as its three planes, at their own resolutions, or None at EOF.
+    ///
+    /// **LOSSLESS-4.** This is the frame as the file actually stores it. `read_frame_rgb` below
+    /// converts it with BT.601, which is what every caller used to do — and that conversion is
+    /// both irreversible (the matrix is not integer-invertible, so these samples cannot come back)
+    /// and expensive (coding its output costs 39.2% more bits than coding these planes).
+    fn read_frame_planes(&mut self) -> Option<(Vec<f32>, Vec<f32>, Vec<f32>)> {
         use std::io::BufRead;
         use std::io::Read;
 
@@ -185,6 +198,14 @@ impl Y4mReader {
             Y4mChroma::C444 => (read_plane(y_size, "Cb"), read_plane(y_size, "Cr")),
         };
 
+        Some((y_plane, cb_plane, cr_plane))
+    }
+
+    /// Read one frame and return interleaved RGB f32 (0-255), or None at EOF.
+    fn read_frame_rgb(&mut self) -> Option<Vec<f32>> {
+        let (y_plane, cb_plane, cr_plane) = self.read_frame_planes()?;
+        let w = self.width as usize;
+        let h = self.height as usize;
         // Convert YCbCr → RGB f32 (0-255), BT.601 limited-range (studio swing).
         //   Y:  16-235 (luma)
         //   Cb/Cr: 16-240 (chroma, centre at 128)
@@ -1091,7 +1112,35 @@ fn main() {
             chroma_format,
             bit_depth,
         } => {
-            let (rgb_data, w, h) = load_image_rgb_f32_bits(&input, bit_depth);
+            // **LOSSLESS-4.** A Y4M source is read as its own planes and coded as they are.
+            // The old path ran BT.601 first, which cannot be undone — the matrix is not
+            // integer-invertible, so the file's samples could never come back — and costs 39.2%
+            // more bits. `GNC_RGB_PATH=1` forces the old behaviour, which is what an A/B needs.
+            let force_rgb = std::env::var("GNC_RGB_PATH").map(|v| v != "0").unwrap_or(false);
+            let y4m_planes = if input.ends_with(".y4m") && !force_rgb {
+                let mut r = Y4mReader::open(&input);
+                let (yw, yh, cf) = (r.width, r.height, r.chroma_format());
+                let p = r.read_frame_planes().expect("Y4M file has no frames");
+                Some((p, yw, yh, cf))
+            } else {
+                None
+            };
+            let (rgb_data, w, h) = match &y4m_planes {
+                Some((_, yw, yh, _)) => (Vec::new(), *yw, *yh),
+                // `gnc encode` never read Y4M before, so the forced-RGB arm has to do the
+                // conversion itself. Without this the A/B the flag exists for cannot run at all:
+                // the image loader refuses the extension and the comparison silently has one arm.
+                None if input.ends_with(".y4m") => {
+                    let mut r = Y4mReader::open(&input);
+                    let (yw, yh) = (r.width, r.height);
+                    (
+                        r.read_frame_rgb().expect("Y4M file has no frames"),
+                        yw,
+                        yh,
+                    )
+                }
+                None => load_image_rgb_f32_bits(&input, bit_depth),
+            };
             println!("Input: {}x{} ({} pixels)", w, h, w * h);
 
             let ctx = GpuContext::new();
@@ -1142,11 +1191,26 @@ fn main() {
             if cpu_encode {
                 config.gpu_entropy_encode = false;
             }
-            config.chroma_format = parse_chroma_format(&chroma_format);
+            // A Y4M file's chroma format is a property of the file, not a request: coding its
+            // planes at any other sampling would mean resampling them, which is the cost this
+            // path exists to avoid.
+            config.chroma_format = match &y4m_planes {
+                Some((_, _, _, cf)) => *cf,
+                None => parse_chroma_format(&chroma_format),
+            };
             config.normalize_for_chroma();
             config.bit_depth = bit_depth;
 
-            let compressed = encoder.encode(&ctx, &rgb_data, w, h, &config);
+            let compressed = match &y4m_planes {
+                Some(((y, cb, cr), _, _, _)) => {
+                    eprintln!(
+                        "GNC: Y4M source — coding its own Y'CbCr planes, no colour conversion \
+(LOSSLESS-4). GNC_RGB_PATH=1 for the old behaviour."
+                    );
+                    encoder.encode_planar(&ctx, y, cb, cr, w, h, &config)
+                }
+                None => encoder.encode(&ctx, &rgb_data, w, h, &config),
+            };
             println!(
                 "Compressed: {} bytes ({:.2} bpp)",
                 compressed.byte_size(),
@@ -1174,7 +1238,30 @@ fn main() {
             let ctx = GpuContext::new();
             let decoder = DecoderPipeline::new(&ctx);
 
-            let rgb_data = decoder.decode(&ctx, &compressed);
+            let decoded = decoder.decode(&ctx, &compressed);
+            // **LOSSLESS-4 / GP21.** A native file decodes to its own Y'CbCr planes, which a PNG
+            // cannot hold — so writing one means converting, and that conversion is the lossy
+            // step the coding path no longer has. Said out loud rather than done quietly: the
+            // whole point of the native path is that the samples survive, and they survive into
+            // a `.y4m` output, not into a PNG.
+            let rgb_data = if compressed.config.color_space == gnc::ColorSpace::YCbCrNative {
+                eprintln!(
+                    "GNC: this file holds Y'CbCr; converting to RGB for image output. The samples \
+survive only into a Y4M output (LOSSLESS-4)."
+                );
+                let mut out = vec![0.0f32; decoded.len()];
+                for p in 0..decoded.len() / 3 {
+                    let yy = 1.164_f32 * (decoded[p * 3] - 16.0);
+                    let pb = decoded[p * 3 + 1] - 128.0;
+                    let pr = decoded[p * 3 + 2] - 128.0;
+                    out[p * 3] = (yy + 1.596 * pr).clamp(0.0, 255.0);
+                    out[p * 3 + 1] = (yy - 0.392 * pb - 0.813 * pr).clamp(0.0, 255.0);
+                    out[p * 3 + 2] = (yy + 2.017 * pb).clamp(0.0, 255.0);
+                }
+                out
+            } else {
+                decoded
+            };
             // Write at the bit depth the frame was coded at. Writing 8-bit unconditionally threw
             // away the extra precision a 10-bit encode had just preserved, which made the 10-bit
             // path pointless end to end (MEAS-8: 8-bit is what limits colour fidelity, not the

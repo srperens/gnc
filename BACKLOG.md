@@ -1901,7 +1901,69 @@ generous ones — which is the difference between "runs in two browsers" and "po
 on macOS sit on Metal; none of them can produce the failure. It needs either a device with the
 spec-floor limits or a deliberately clamped request.
 
-### LOSSLESS-4 — the RGB conversion costs +64.2% of the lossless rate, seven times the entropy gap (todo, **P1** — re-priced 2026-09-11)
+### LOSSLESS-5 — the sequence encoder has nine colour-transform sites and none of them take planes (todo, **P1**)
+
+**Filed 2026-09-11 by LOSSLESS-4, which did the still path and stopped deliberately.** The 39.2%
+measured there is a *per-frame* saving on intra content and there is no reason it should not carry
+to video — but `EncoderPipeline::encode_planar` feeds `encode_once`, the still path, and video goes
+through `sequence.rs`, which does its own preprocessing.
+
+**Why it was not done in the same session.** `sequence.rs` calls `self.color.dispatch` at nine
+distinct sites (I/P/B, streaming and non-streaming, temporal-wavelet and not), each with its own
+buffer plumbing. ARCH-4 already has that file at **7 590 lines in one impl block** and files it as
+where the reference bugs live. Branching nine sites by hand, in one pass, on the same afternoon the
+still path was verified, is how a measured win becomes an unmeasured regression.
+
+**The shape of the work, and the order that keeps it honest:**
+
+1. **ARCH-4 first, or at least the preprocessing part of it.** Nine copies of "pad, convert,
+   deinterleave, maybe subsample" is the actual obstacle; one shared entry point is the change that
+   makes this item small. Doing them in the other order means writing the branch nine times and then
+   deleting eight of them.
+2. Thread `EncodeInput` through the sequence entry points the way `encode_once` took it.
+3. The inter path needs care that the still path did not: `sequence.rs` box-filters reconstructed
+   references into chroma dimensions at every P and B frame (RATE-5's other half), and those
+   filters assume the planes are YCoCg-R-shaped. A native 4:2:0 source has chroma at its own
+   resolution already, so several of those resamples should disappear rather than be ported.
+
+**Success criterion:** `benchmark-sequence -i <clip>.y4m -q 100` is bit-exact against the source's
+own Y'CbCr on ≥3 clips, and smaller than the same clip through the RGB path. Report both arms;
+`GNC_RGB_PATH=1` already selects the old one on the still path and should mean the same here.
+
+**Also still open from LOSSLESS-4:** a native 4:2:0 file decodes to *full-resolution* Y'CbCr,
+because the decoder still nearest-neighbour upsamples chroma before interleaving. The coded planes
+are exact; the output is a presentation choice. Planar output at native resolution needs a Y4M
+writer path, and is what makes "the user gets their samples back" true for 4:2:0 as well as 4:4:4.
+
+### LOSSLESS-4 — the RGB conversion costs 39.2% of the lossless rate (**stills DONE 2026-09-11**, `GP21`; video is LOSSLESS-5)
+
+**DONE for the still path, 2026-09-11.** `gnc encode -i <file>.y4m` now codes the file's own Y'CbCr
+planes: no BT.601 conversion, no YCoCg-R transform, no chroma resample. Measured end to end through
+the CLI, one frame each at q=100, `GNC_RGB_PATH=1` for the other arm:
+
+| sequence | RGB path | planar | delta |
+|---|---|---|---|
+| bbb | 2 699 215 | 1 604 025 | **−40.6%** |
+| blue_sky | 2 270 626 | 1 291 127 | **−43.1%** |
+| crowd_run | 3 281 233 | 2 068 733 | **−37.0%** |
+| old_town_cross | 3 192 704 | 1 994 249 | **−37.5%** |
+| **mean** | 11 443 778 | 6 958 134 | **−39.2%** |
+
+Identical to the no-code-changes spike, sequence for sequence — the tool produces exactly what the
+estimate predicted. Shipped across `docs/decisions/0080`-style staging: GP21 carries a colour-space
+byte, `EncodeInput::Planes` skips four preprocessing stages, the decoder stops inverting a transform
+that never happened, and the CLI reads Y4M planes directly. Guards in
+`tests/lossless4_native_planes.rs`: the samples come back bit-exactly, and the planar file must stay
+smaller than the RGB one.
+
+**The RGB path did not move**, checked rather than asserted: `bbb_1080p.png` at q=100 went
+3 235 737 → 3 235 738 bytes, exactly the one new header byte.
+
+**What remains is the half that matters most, and it is LOSSLESS-5:** video. The planar path lives
+in the *still* encoder; `sequence.rs` has its own preprocessing with nine separate colour-transform
+sites, and none of them take planes. So `benchmark-sequence` and `encode-sequence` still convert.
+
+
 
 **Filed 2026-09-10 by BUG-45 / `0081`.** That fix makes `q=100` on a Y4M source bit-exact **with
 respect to the RGB the reader produces**. It is not bit-exact with respect to the file's original

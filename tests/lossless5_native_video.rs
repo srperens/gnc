@@ -1,33 +1,3 @@
-//! **STATUS 2026-09-11: both tests are `#[ignore]`d and this file is a specification, not a
-//! passing guard.** The encoder plumbing is in and verified byte-identical for RGB input; what
-//! does not work yet is the native arm end to end. Two attempts failed and CLAUDE.md's rule
-//! ("if the same bug resurfaces after two fix attempts — stop, diagnose root cause properly")
-//! applies, so the requirement is recorded here rather than half-fixed.
-//!
-//! What is known:
-//!   - `worst sample error 258` on frame 0, i.e. reconstruction is badly wrong, not slightly.
-//!   - The encoder records `ColorSpace::YCbCrNative` correctly — that assertion passes.
-//!   - Widening `enc_input`/`enc_color_out` usages fixed a wgpu validation error; not the cause.
-//!   - `decoder/pipeline.rs` has **five** more `self.color.dispatch` sites, all identical in shape,
-//!     that the still-path fix in `gpu_work.rs` never touched. Branching them the same way did
-//!     **not** change the result, so either the sequence decode path reaches a sixth site or the
-//!     fault is encode-side. That dedup is worth doing on its own merits — five copies of one
-//!     dispatch, exactly the shape LOSSLESS-5 step 1 removed on the encoder side — but it is
-//!     deliberately *not* in this commit, because it fixes nothing here and was not worth carrying
-//!     as unverified risk.
-//!   - The byte counts did not move between attempts (513 315 native vs 476 728 converted), which
-//!     is encode-side evidence: a decoder fix cannot change them.
-//!
-//! What was mis-diagnosed on the way, and is *not* the problem: the sequence encoder does pad
-//! before this point — via `dispatch_gpu_pad_cached`, not an inline `pad_pass`, which is why a
-//! grep for the latter returned zero and suggested otherwise. `input_buf` is the padded buffer and
-//! `color_out` the destination, exactly as in the still path, and both are `buf_size_3`.
-//!
-//! The rate test is *also* suspect on its own terms: this synthetic has near-constant Cb and a
-//! smooth Cr ramp, so YCoCg-R over the derived RGB may genuinely win on it where it loses on real
-//! clips. Before treating its failure as a defect, re-run the assertion on real material — the
-//! −13.2% in RESEARCH_LOG was measured on four clips, not on this.
-
 //! LOSSLESS-5 — a Y'CbCr *sequence* round-trips as itself, with no colour transform at either end.
 //!
 //! LOSSLESS-4 did this for stills. Video goes through `sequence.rs`, which ran its own colour
@@ -40,6 +10,9 @@
 //! to the colour space; separated, the colour space is worth **−13.2%** on four clips and the
 //! format change is worth −31.6% (RESEARCH_LOG, 2026-09-11). Both arms here are 4:4:4, so only the
 //! matrix differs.
+//!
+//! A third test covers 4:2:0, where the interleaved buffer is the only door into the sequence
+//! encoder and the chroma has to survive both the resampling and the motion vectors.
 
 use gnc::decoder::pipeline::DecoderPipeline;
 use gnc::encoder::pipeline::EncoderPipeline;
@@ -52,22 +25,46 @@ fn gpu() -> &'static GpuContext {
     GPU.get_or_init(GpuContext::new)
 }
 
-/// Interleaved Y'CbCr with motion, so the P-frames have something to predict and the test is not
-/// secretly an all-intra one.
+/// Interleaved Y'CbCr that **translates**, so the P-frames have something to predict and the
+/// assertion below is not secretly an all-intra test.
+///
+/// The texture is a function of the *shifted* column, noise included, so frame `f` is frame 0
+/// scrolled by `3f` pixels and nothing else. Two earlier versions of this generator did not
+/// survive the `Predicted` assertion, and both failures were about `q=100` rather than about the
+/// colour space:
+///
+///   1. The noise was reseeded per frame, so motion compensation had nothing to find at all.
+///   2. With the noise made positional but the picture still a smooth ramp, MED's intra
+///      prediction coded it so cheaply that LOSSLESS-2 re-coded every P-frame as an I-frame
+///      anyway — a correct decision about rate that left the inter path untested.
+///
+/// So the content is blocks *and* texture: expensive enough to intra-code that an exactly
+/// matched P-frame wins (~114 kB I against ~30 kB P here), which is the regime this test needs
+/// and the one `GNC_LOSSLESS_INTRA_RECODE` exists to force. Nothing here sets it — the
+/// environment is process-global and cargo runs tests as threads (see
+/// `tests/pframe_reference_drift.rs`), so the content has to earn its P-frames.
 fn ycbcr_frames(w: usize, h: usize, n: usize) -> Vec<Vec<f32>> {
+    // Position-seeded, so the value at column `c` is the same in every frame that shows it.
+    let tex = |c: usize, j: usize| -> f32 {
+        let mut s = 0x1357_9bdfu32
+            .wrapping_add(c as u32)
+            .wrapping_mul(2_654_435_761)
+            .wrapping_add((j as u32).wrapping_mul(40_503));
+        s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        ((s >> 26) & 0x7) as f32
+    };
     (0..n)
         .map(|f| {
             let mut out = vec![0.0f32; w * h * 3];
             let shift = f * 3;
-            let mut s = 0x1357_9bdfu32.wrapping_add(f as u32);
             for j in 0..h {
                 for i in 0..w {
-                    s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-                    let n8 = ((s >> 26) & 0x7) as f32;
+                    let c = (i + shift) % w;
+                    let blk = ((c / 32) + (j / 32) * 4) % 7;
                     let p = (j * w + i) * 3;
-                    out[p] = (16.0 + (((i + shift) % w) * 200 / w) as f32 + n8).round();
-                    out[p + 1] = (128.0 + ((j * 80 / h) as f32 - 40.0)).round();
-                    out[p + 2] = (128.0 + (((i + shift) % w) * 60 / w) as f32 - 30.0).round();
+                    out[p] = (16.0 + (blk * 28) as f32 + tex(c, j)).round();
+                    out[p + 1] = (128.0 + (blk as f32) * 7.0 - 20.0 + tex(c + 7, j)).round();
+                    out[p + 2] = (128.0 + (blk as f32) * 5.0 - 15.0 + tex(c, j + 3)).round();
                 }
             }
             out
@@ -88,7 +85,6 @@ fn config(native: bool) -> gnc::CodecConfig {
 }
 
 #[test]
-#[ignore = "LOSSLESS-5: native sequence path not working yet; see the file header"]
 fn q100_native_planes_survive_a_sequence_with_p_frames() {
     let (w, h, n) = (256usize, 256usize, 6usize);
     let frames = ycbcr_frames(w, h, n);
@@ -126,7 +122,6 @@ fn q100_native_planes_survive_a_sequence_with_p_frames() {
 
 /// The rate half, with both arms at 4:4:4 so only the colour matrix differs.
 #[test]
-#[ignore = "LOSSLESS-5: see the file header; this synthetic may also be the wrong content"]
 fn native_planes_beat_the_rgb_they_convert_to_across_a_sequence() {
     let (w, h, n) = (256usize, 256usize, 6usize);
     let frames = ycbcr_frames(w, h, n);
@@ -163,4 +158,126 @@ fn native_planes_beat_the_rgb_they_convert_to_across_a_sequence() {
         "coding the sequence's own planes ({native} B) did not beat coding the RGB they convert \
          to ({converted} B) — the colour-space saving has regressed or reversed"
     );
+}
+
+/// 4:2:0, where the interleaved buffer is the encoder's only door and the chroma has to survive
+/// both the resampling and the motion vectors.
+///
+/// **Two claims, and the content is built for the second one.**
+///
+/// 1. The CLI reaches the sequence encoder with interleaved triples, so a 4:2:0 Y4M's half-size
+///    chroma is nearest-neighbour replicated to luma resolution on the way in and the encoder's
+///    own box filter takes it back down. That is exact — the average of four copies of one
+///    integer is that integer — but it is exact because of what a *shader* does, so it is
+///    asserted rather than assumed.
+///
+/// 2. The chroma motion vector is the luma one arithmetic-shifted right by a bit, so a *full-pel*
+///    luma vector is a **half-pel chroma** vector and `bilinear_ref` puts back exactly the
+///    fraction BUG-39's rounding exists to remove. The encoder therefore rounds luma vectors to
+///    two pixels at 4:2:0, and this asserts the invariant directly: every coded component is a
+///    multiple of 8 quarter-pels.
+///
+/// **A static background with one moving band** is what makes claim 2 testable. A synthetic that
+/// pans as a whole cannot: at `q=100` LOSSLESS-2 compares each P-frame against an I-frame of the
+/// same picture, an odd-pixel pan mis-predicts every block once the vectors are rounded, and the
+/// P-frame is sent back to I before any chroma vector is used — measured at every odd step from
+/// 1 to 5. With most of the frame static the P-frame wins on the still part and the moving band
+/// still carries the odd vectors. Run against the pre-fix encoder this content reads a worst
+/// sample error of **0.5** with 236-256 of 256 vectors not multiples of 8, so it discriminates.
+#[test]
+fn chroma_4_2_0_survives_the_interleaved_round_trip() {
+    let (w, h, n) = (256usize, 256usize, 4usize);
+    // One band moves 3 px per frame — odd, so the rounding has something to do.
+    let frames = moving_band_ycbcr(w, h, n, 3);
+    let refs: Vec<&[f32]> = frames.iter().map(|f| f.as_slice()).collect();
+
+    let mut cfg = config(true);
+    cfg.chroma_format = ChromaFormat::Yuv420;
+    cfg.normalize_for_chroma();
+
+    let mut enc = EncoderPipeline::new(gpu());
+    let cf = enc.encode_sequence(gpu(), &refs, w as u32, h as u32, &cfg);
+    assert!(
+        cf.iter().any(|f| f.frame_type == gnc::FrameType::Predicted),
+        "the clip coded all-intra, so no chroma motion vector was ever derived"
+    );
+
+    for (i, f) in cf.iter().enumerate() {
+        let Some(mf) = f.motion_field.as_ref() else {
+            continue;
+        };
+        let stray = mf
+            .vectors
+            .iter()
+            .filter(|v| v[0] % 8 != 0 || v[1] % 8 != 0)
+            .count();
+        assert_eq!(
+            stray, 0,
+            "frame {i} carries {stray} of {} motion vectors that are not a multiple of 8 \
+             quarter-pels, so their halves are half-pel in chroma and the prediction is \
+             fractional (BUG-39 cause 4, chroma side)",
+            mf.vectors.len()
+        );
+    }
+
+    let decoded = DecoderPipeline::new(gpu()).decode_sequence(gpu(), &cf);
+    for (i, (d, o)) in decoded.iter().zip(&frames).enumerate() {
+        let worst_of = |c: usize| {
+            o.iter()
+                .skip(c)
+                .step_by(3)
+                .zip(d.iter().skip(c).step_by(3))
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max)
+        };
+        let (y, cb, cr) = (worst_of(0), worst_of(1), worst_of(2));
+        assert_eq!(
+            (y, cb, cr),
+            (0.0, 0.0, 0.0),
+            "frame {i} is not bit-exact at 4:2:0: worst Y {y}, Cb {cb}, Cr {cr}"
+        );
+    }
+}
+
+/// A still picture with one horizontally moving band, chroma replicated 2x2 the way a 4:2:0
+/// source looks once it has been interleaved.
+fn moving_band_ycbcr(w: usize, h: usize, n: usize, step: usize) -> Vec<Vec<f32>> {
+    let tex = |c: usize, j: usize| -> f32 {
+        let mut s = 0x1357_9bdfu32
+            .wrapping_add(c as u32)
+            .wrapping_mul(2_654_435_761)
+            .wrapping_add((j as u32).wrapping_mul(40_503));
+        s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        ((s >> 26) & 0x7) as f32
+    };
+    (0..n)
+        .map(|f| {
+            let mut out = vec![0.0f32; w * h * 3];
+            for j in 0..h {
+                for i in 0..w {
+                    let c = if (h / 4..h / 2).contains(&j) {
+                        i + f * step
+                    } else {
+                        i
+                    };
+                    let blk = ((c / 32) + (j / 32) * 4) % 7;
+                    let p = (j * w + i) * 3;
+                    out[p] = (16.0 + (blk * 28) as f32 + tex(c, j)).round();
+                    out[p + 1] = (128.0 + (blk as f32) * 7.0 - 20.0 + tex(c + 7, j)).round();
+                    out[p + 2] = (128.0 + (blk as f32) * 5.0 - 15.0 + tex(c, j + 3)).round();
+                }
+            }
+            // Replicate each 2x2 chroma block from its top-left sample.
+            let src = out.clone();
+            for j in 0..h {
+                for i in 0..w {
+                    let s0 = ((j & !1) * w + (i & !1)) * 3;
+                    let d = (j * w + i) * 3;
+                    out[d + 1] = src[s0 + 1];
+                    out[d + 2] = src[s0 + 2];
+                }
+            }
+            out
+        })
+        .collect()
 }

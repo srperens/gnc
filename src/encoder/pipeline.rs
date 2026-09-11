@@ -2092,27 +2092,32 @@ samples — rounded to integers so the step-1 quantiser has something it can cod
                 pass.dispatch_workgroups(workgroups, 1, 1);
             }
 
-            // Color convert (RGB -> YCoCg-R): input_buf -> color_out (interleaved)
-            self.color.dispatch(
+            // Colour convert (RGB -> YCoCg-R) and deinterleave into plane_a/co_plane/cg_plane.
+            //
+            // **LOSSLESS-5.** The matrix runs only when the samples are RGB. `EncodeInput::Rgb`
+            // named the *layout*, interleaved triples, and was read as naming the *colour space*
+            // — so a caller that set `color_space = YCbCrNative` and handed over interleaved
+            // Y'CbCr got the matrix applied on the way in and nothing applied on the way out, and
+            // the frame came back with a worst sample error of 258 on a 0-255 scale. The decoder
+            // has obeyed the header since GP21; this is the encoder side of the same switch.
+            //
+            // It is the same decision `preprocess_to_planes` makes for the sequence encoder, so
+            // it is the same function: the sequence path's intra frames come through here (via
+            // `encode` / `encode_as_reference`), and two copies of this branch is how they would
+            // have disagreed.
+            self.preprocess_to_planes(
                 ctx,
                 &mut cmd,
                 &bufs.input_buf,
                 &bufs.color_out,
-                padded_w,
-                padded_h,
-                true,
-                config.is_lossless(),
-            );
-
-            // GPU deinterleave: color_out -> plane_a(Y), co_plane(Co), cg_plane(Cg)
-            self.deinterleaver.dispatch(
-                ctx,
-                &mut cmd,
-                &bufs.color_out,
                 &bufs.plane_a,
                 &bufs.co_plane,
                 &bufs.cg_plane,
+                padded_w,
+                padded_h,
                 padded_pixels as u32,
+                config.is_lossless(),
+                config.color_space == crate::ColorSpace::YCoCgR,
             );
 
             // Chroma downsampling for 4:2:2 / 4:2:0

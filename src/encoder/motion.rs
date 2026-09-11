@@ -2285,23 +2285,40 @@ impl MotionEstimator {
     ///
     /// The decoder needs no counterpart: it uses the vectors the bitstream carries, so it takes
     /// the same exact path. Which also means calling this changes the *bitstream*, not the
-    /// decoder — the vectors it codes are simply all multiples of 4.
+    /// decoder — the vectors it codes are simply all multiples of `quantum`.
+    ///
+    /// `quantum` is 4 (one pixel) per axis, and **8 on any axis the chroma planes subsample** —
+    /// LOSSLESS-5, so (8, 8) at 4:2:0 and (8, 4) at 4:2:2. On a subsampled axis the chroma
+    /// displacement is the luma one halved, so only an even pixel offset stays full-pel there,
+    /// and a half-pel chroma vector interpolates exactly the fraction this method exists to
+    /// remove. Keeping the constraint on the luma vector rather than rounding the chroma buffer
+    /// is what keeps the decoder out of it.
     pub fn dispatch_mv_round_fullpel(
         &self,
         ctx: &GpuContext,
         cmd: &mut wgpu::CommandEncoder,
         mvs: &wgpu::Buffer,
         total_blocks: u32,
+        quantum: (i32, i32),
     ) {
+        debug_assert!(
+            matches!(quantum, (4, 4) | (8, 4) | (8, 8)),
+            "mv rounding quantum is one pixel (4) or two (8) per axis, and an axis is coarse only \
+             where chroma subsamples it, got {quantum:?}"
+        );
         #[repr(C)]
         #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
         struct MvRoundParams {
             total_blocks: u32,
-            _pad: [u32; 3],
+            quantum_x: i32,
+            quantum_y: i32,
+            _pad: u32,
         }
         let params = MvRoundParams {
             total_blocks,
-            _pad: [0; 3],
+            quantum_x: quantum.0,
+            quantum_y: quantum.1,
+            _pad: 0,
         };
         let params_buf = ctx
             .device

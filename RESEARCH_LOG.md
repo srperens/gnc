@@ -4,6 +4,165 @@
 
 ---
 
+## LOSSLESS-5 — a Y'CbCr sequence codes as itself, and the chroma motion vectors were half-pel all along (2026-09-11)
+
+**What was open.** LOSSLESS-4 gave the still path a native Y'CbCr arm; the sequence path did not
+have one. The previous session landed the plumbing — `preprocess_to_planes` with a
+`convert_colour` flag threaded through all eleven sites — and recorded, honestly, that the native
+arm still produced a worst sample error of **258** on a 0-255 scale and left both requirements as
+`#[ignore]`d tests.
+
+### The cause was one call site, and it was in the still path
+
+Four isolation runs on one 256x256 frame, encoder arm x decoder arm:
+
+| | worst sample error |
+|---|---|
+| sequence encode, sequence decode | 258 |
+| sequence encode, single-frame decode | 258 |
+| **single-frame encode, single-frame decode** | **258** |
+| single-frame encode, sequence decode | 258 |
+
+All four, which rules the sequence path out entirely: `encode()` with
+`color_space = YCbCrNative` was already wrong before any of this. `EncodeInput::Rgb` names the
+*layout* — interleaved triples — and was being read as naming the *colour space*, so `encode_once`
+ran the YCoCg-R matrix unconditionally while the decoder, correct since GP21, ran no inverse. The
+sequence encoder's own eleven sites all branched correctly; its I-frames simply do not go through
+them, they go through `encode` / `encode_as_reference`.
+
+`encode_once` now calls `preprocess_to_planes` — the same function, the same decision, one copy.
+All four arms read **0**, and the frame got 55% smaller on that synthetic (86 185 -> 38 799 B),
+which is the colour transform no longer being applied to samples that did not want it.
+
+### Then the chroma motion vectors, which is the real find
+
+With the colour space fixed, `bbb.y4m` at q=100 4:2:0 decoded **bit-exact on I-frames and
+66.5-70.4 dB on every P-frame**, the error entirely in Cb and Cr. Cause: BUG-39 rounds luma
+vectors to full-pel because a step-1.0 quantiser cannot survive a fractional prediction —
+and `motion_mv_scale.wgsl` then **halves** that vector for chroma. A multiple of 4 quarter-pels
+becomes a multiple of 2. Half-pel. `bilinear_ref` averages two reference samples, the prediction
+is fractional again, and the quantiser rounds it. The same defect the rounding exists to prevent,
+one subsampling factor over.
+
+It could not be seen before. Through the RGB path a Y4M's own samples can never come back at all
+(the BT.601 matrix is not integer-invertible, and BUG-45 rounds the fractional input), so
+"P-frames are not bit-exact at 4:2:0" read as that already-known loss.
+
+**The fix is on the luma vector, not the chroma one.** Rounding the encoder's `mv_chroma_buf`
+after the scale was tried first and is wrong: the decoder halves whatever the bitstream carries
+and does no rounding of its own, so the two drift — measured, 55.6 dB on the first P-frame falling
+to **46.4 dB** by the eighth. Making the luma vector a multiple of 8 quarter-pels instead means it
+arrives as a multiple of 4 on *both* sides. No decoder change, no bitstream generation. Per axis,
+so 4:2:2 gets (8, 4) and 4:4:4 keeps (4, 4).
+
+`bbb.y4m`, q=100, 8 frames, ki=8, worst-frame PSNR:
+
+| | before | after | bytes |
+|---|---|---|---|
+| 4:2:0 | 66.47 dB (7 of 7 P-frames inexact) | **inf on 7 of 8 frames** | 12 002 673 -> 11 863 639 (**−1.16%**) |
+| 4:2:2 | 7 of 8 frames inexact | **inf on 7 of 8** | 13 830 698 -> 13 440 827 (**−2.82%**) |
+| 4:4:4 | unchanged (quantum stays 4) | inf on 7 of 8 | 17 773 215 |
+
+The coarser vectors *save* rate here because the MV field costs less and the residual does not
+get worse on this content. That is not general — see the cost below.
+
+### The rate, with both arms at the source's own chroma format
+
+`benchmark-sequence -q 100`, 8 frames, native against `GNC_RGB_PATH=1 --chroma-format 420`, which
+is the arm that isolates the **colour space alone** (the 2026-09-11 correction: comparing against
+a 4:4:4 RGB encode credits a chroma-format change to the colour space).
+
+| clip (4:2:0) | ki | native B | RGB B | delta |
+|---|---|---|---|---|
+| bbb | 8 | 11 863 639 | 13 949 160 | **−14.95%** |
+| blue_sky | 8 | 10 378 585 | 12 177 781 | **−14.77%** |
+| crowd_run | 8 | 16 679 183 | 18 596 938 | **−10.31%** |
+| old_town_cross | 8 | 15 952 107 | 17 940 092 | **−11.08%** |
+| **sum** | 8 | 54 873 514 | 62 663 971 | **−12.43%** |
+| **sum** | 2 | 55 290 846 | 63 464 162 | **−12.88%** |
+
+Four of four, at two keyframe intervals, and it lands where the corrected still-path figure said
+it would: **−13.2%**. The `−39%`/`−40.6%` headlines remain superseded.
+
+On bbb's converted clips, where both arms are at the file's own format: 4:2:2 13 440 827 against
+16 978 198 (**−20.8%**) and 4:4:4 17 773 215 against 24 084 895 (**−26.2%**). Both are larger than
+−13% because the RGB arm codes those all-intra — LOSSLESS-2 throws its P-frames out — so they mix
+a colour-space delta with a frame-type one. The 4:2:0 table above is the clean comparison.
+
+**And the quality half is not a trade.** At q=100 the native arm returns the source's own samples;
+the RGB arm returns a picture BT.601 produced from them, exactly (4:4:4) or with subsampling loss
+(4:2:0 / 4:2:2, PSNR 38.6 dB against its own RGB). There is nothing to weigh: one arm is the file
+and the other is a conversion of it.
+
+### What it cost, and where
+
+Making the luma vector a multiple of two pixels costs prediction accuracy at 4:2:0 and 4:2:2.
+With `GNC_LOSSLESS_INTRA_RECODE=0` so P-frames are kept whatever they cost, PNG source, q=100,
+4 frames, 4:2:0:
+
+| clip | before | after | delta |
+|---|---|---|---|
+| bbb | 7 137 373 | 7 177 025 | +0.56% |
+| blue_sky | 7 827 417 | 8 051 957 | +2.87% |
+| crowd_run | 11 489 766 | 11 809 723 | +2.79% |
+| old_town_cross | 11 140 956 | 11 376 531 | +2.11% |
+
+**In shipped configuration that cost is not paid.** LOSSLESS-2 re-codes a lossless P-frame that
+costs more than an I-frame, and on all three camera clips it throws every P-frame out at q=100
+anyway; on bbb, the one clip that keeps them, the change is **−1.16%**. So the measured shipped
+effect across four clips is −1.16%, 0.00%, 0.00%, 0.00%. The +2.9% is what the measurement arm
+pays, and it is in the record because a future change to LOSSLESS-2's rule would start paying it.
+
+It also fixes the RGB path, which had the same defect invisibly: PNG source, 4:2:0, q=100,
+P-frames forced, per-frame PSNR goes **38.60 -> 38.63 dB**, exactly the I-frame's figure. The
+residual P-frame-only loss is gone; what remains is the chroma subsampling of an RGB source,
+which is not this item's to fix.
+
+### The RGB path did not move anywhere else
+
+144 encode-sequence runs md5'd against a binary built from `c633cc4`: four clips x {q=50, q=100} x
+{4:4:4, 4:2:0, 4:2:2} x {default, abac, rice} x {B-pyramid on, off}, ki=2, 4 frames.
+**132 byte-identical.** The 12 that moved are bbb at q=100 at 4:2:0 and 4:2:2 — the exact arm the
+MV quantum targets, and the only clip whose P-frames survive q=100.
+
+### What is still wrong, and it is not this item
+
+**BUG-57.** One frame in eight of `bbb.y4m` is not bit-exact: frame 2, **3 606 luma samples**, max
+error 10, all inside the bottom-right tile starting at (1797, 1024) — the corner tile, which is
+mostly padding. Same frame and same region at 4:4:4 (where all three planes are affected) and at
+4:2:2. It **disappears at `--tile-size 128`**, it is deterministic across runs, and it does not
+propagate: frame 3 is exact again. That is an encoder/decoder disagreement confined to one frame's
+own reconstruction, not reference drift, and it is a separate defect from anything LOSSLESS-5
+touched — it is simply the first time a sequence was exact enough for one frame in eight to stand
+out. Filed with the repro.
+
+### What was deliberately not done
+
+The sequence CLI turns the native arm on **only for a lossless request**, unlike the still path
+which takes it at every q. Below q=100 the change is a rate/quality trade in a different colour
+space — the subband weights and the CfL range were tuned on YCoCg-R, VMAF cannot see the chroma
+half of what moves, and a luma PSNR computed in two different spaces is not a comparison. That
+measurement has not been made, so the lossy default stays where it was. **LOSSLESS-6.**
+
+### Three test-content failures worth recording, because each said something
+
+The `Predicted` assertion in `lossless5_native_video.rs` rejected three synthetics before one
+passed, and none of the rejections was about the colour space:
+
+1. Noise reseeded per frame — motion compensation had nothing to find.
+2. Positional noise on a smooth ramp — MED intra-coded it so cheaply that LOSSLESS-2 re-coded
+   every P-frame as I.
+3. At 4:2:0, *any* whole-frame pan by an odd number of pixels — with the vectors now rounded to
+   two pixels the prediction is off by one everywhere, and LOSSLESS-2 correctly throws the
+   P-frame out. Measured at every odd step from 1 to 5.
+
+The content that works is blocks plus texture for 4:4:4, and a **static background with one moving
+band** for 4:2:0 — the still part earns the P-frame and the band carries the odd vectors. Against
+the pre-fix encoder that third test reads a worst error of **0.5** with 236-256 of 256 vectors not
+multiples of 8, so it discriminates rather than merely passes.
+
+---
+
 ## MEAS-12 — every sequence throughput figure was understated 2.3x to 3.5x, and 29 of 65 ms per frame is not coding (2026-09-08)
 
 **Why this was run.** The project owner observed that GNC has "massive performance issues", and the

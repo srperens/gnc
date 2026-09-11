@@ -2040,6 +2040,26 @@ still path was verified, is how a measured win becomes an unmeasured regression.
    filters assume the planes are YCoCg-R-shaped. A native 4:2:0 source has chroma at its own
    resolution already, so several of those resamples should disappear rather than be ported.
 
+**The prize carries to video — measured 2026-09-11, before building.** Same spike as LOSSLESS-4's,
+run on 8-frame sequences with P-frames rather than on frame 0. Each plane coded as its own clip
+with flat chroma (`U=V=128` gives `R=G=B` after BT.601, so `Co=Cg=0` exactly); the empty-plane
+floor is 15 665 B per 8-frame encode and is subtracted.
+
+| sequence, 8 frames, ki=8, q=100 | RGB path | Y+Cb+Cr | delta |
+|---|---|---|---|
+| bbb | 21 600 670 | 11 638 621 | **−46.1%** |
+| blue_sky | 18 234 795 | 10 306 794 | **−43.5%** |
+| crowd_run | 26 381 563 | 16 634 584 | **−36.9%** |
+| old_town_cross | 25 538 510 | 15 906 563 | **−37.7%** |
+| **mean** | 91 755 538 | 54 486 562 | **−40.6%** |
+
+Four of four, same magnitude as the still result (−39.2%) and slightly better.
+
+**Read it with its bias, which is knowable.** In this spike each chroma plane gets its *own* motion
+estimation, where a real planar encoder derives chroma vectors from luma. So the estimate flatters
+the planar path by some amount, and the shipped figure should be expected to land at or below
+−40.6%. It is a bound to build against, not the result.
+
 **Success criterion:** `benchmark-sequence -i <clip>.y4m -q 100` is bit-exact against the source's
 own Y'CbCr on ≥3 clips, and smaller than the same clip through the RGB path. Report both arms;
 `GNC_RGB_PATH=1` already selects the old one on the still path and should mean the same here.

@@ -193,7 +193,7 @@ impl EncoderPipeline {
     /// running these two dispatches, and that decision now has one site to be made at instead of
     /// eleven.
     #[allow(clippy::too_many_arguments)]
-    fn preprocess_to_planes(
+    pub(crate) fn preprocess_to_planes(
         &self,
         ctx: &GpuContext,
         cmd: &mut wgpu::CommandEncoder,
@@ -4103,11 +4103,40 @@ impl EncoderPipeline {
                 .map(|v| v != "0")
                 .unwrap_or(true);
         if lossless_fullpel {
+            // **On a subsampled axis the quantum is two luma pixels, not one — LOSSLESS-5.**
+            // The chroma displacement is this vector halved on every axis chroma subsamples
+            // (`motion_mv_scale.wgsl` at 4:2:0; the luma-domain path at 4:2:2 box-filters a
+            // warped NN-upsampled plane, which comes to the same thing), so a *full-pel* luma
+            // vector is a **half-pel chroma** vector, `bilinear_ref` averages two reference
+            // samples, and the fractional prediction this rounding exists to remove comes
+            // straight back in Cb and Cr. Measured at q=100 on 8 frames, before this: luma exact,
+            // P-frames **66.5-70.4 dB** on `bbb.y4m` 4:2:0 and 7 of 8 frames inexact at 4:2:2.
+            //
+            // It stayed invisible because no source could expose it. Through the RGB path a Y4M's
+            // own samples can never come back (the BT.601 matrix is not integer-invertible, and
+            // BUG-45 rounds the fractional input anyway), so "P-frames are not bit-exact at
+            // 4:2:0" read as that already-known loss. A native Y'CbCr source has no such excuse,
+            // which is how LOSSLESS-5 found it.
+            //
+            // **The constraint belongs on the luma vector, not on the scaled chroma one.** The
+            // decoder halves the vectors the bitstream carries and does no rounding of its own,
+            // so rounding `mv_chroma_buf` here makes the two disagree — measured, and it drifts:
+            // 55.6 dB on the first P-frame falling to 46.4 dB by the eighth. A vector that is
+            // already a multiple of 8 arrives as a multiple of 4 on both sides, and the decoder
+            // needs no change and no bitstream generation.
+            //
+            // Per axis, because 4:2:2 subsamples only the columns and there is no reason to make
+            // its vertical vectors coarse.
+            let quantum = (
+                if chroma_shift_x > 0 { 8 } else { 4 },
+                if chroma_shift_y > 0 { 8 } else { 4 },
+            );
             self.motion.dispatch_mv_round_fullpel(
                 ctx,
                 &mut cmd,
                 &split_mv_buf,
                 bufs.split_total_blocks,
+                quantum,
             );
             // Canary (CLAUDE.md, "No silent features"): says the path ran and on how many
             // vectors, so "the gate never fired" and "it fired and did nothing" stay distinct.

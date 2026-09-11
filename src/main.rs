@@ -61,6 +61,10 @@ struct Y4mReader {
     pub fps_num: u32,
     pub fps_den: u32,
     chroma: Y4mChroma,
+    /// **LOSSLESS-5.** When set, `read_frame_interleaved` hands back the file's own Y'CbCr
+    /// instead of BT.601 RGB. Off by default so an existing caller keeps the picture it had;
+    /// the sequence commands turn it on for Y4M input unless `GNC_RGB_PATH=1`.
+    native: bool,
 }
 
 impl Y4mReader {
@@ -142,6 +146,7 @@ impl Y4mReader {
             fps_den,
             chroma,
             bit_depth,
+            native: false,
         }
     }
 
@@ -224,6 +229,56 @@ impl Y4mReader {
         Some((y_plane, cb_plane, cr_plane))
     }
 
+    /// One frame, interleaved, in whichever colour space this reader was opened for.
+    ///
+    /// **LOSSLESS-5.** `native` returns the file's own Y'CbCr; otherwise BT.601 RGB, which is
+    /// what every caller got before. The sequence encoder takes interleaved triples, so the
+    /// native arm reaches it through the same door the RGB arm uses and needs no second entry
+    /// point into `sequence.rs` — the encoder's own `color_space` field is what decides whether
+    /// the matrix runs, at both ends.
+    ///
+    /// **Subsampled chroma survives this round trip exactly**, which is the reason a 4:2:0 clip
+    /// can come through an interleaved buffer at all: the replication below is nearest-neighbour,
+    /// and the encoder's chroma downsample is the average of the 2x1 / 2x2 block it replicated
+    /// from — an average of identical integers, so the planes the codec quantises are the file's
+    /// own samples and not a resampling of them. `chroma_4_2_0_survives_the_interleaved_round_trip`
+    /// in `tests/lossless5_native_video.rs` is the guard, because this is an assumption about a
+    /// shader, not about this function.
+    fn read_frame_interleaved(&mut self) -> Option<Vec<f32>> {
+        if !self.native {
+            return self.read_frame_rgb();
+        }
+        let (y_plane, cb_plane, cr_plane) = self.read_frame_planes()?;
+        let w = self.width as usize;
+        let h = self.height as usize;
+        let mut out = vec![0.0f32; w * h * 3];
+        for row in 0..h {
+            for col in 0..w {
+                let (cb, cr) = match self.chroma {
+                    Y4mChroma::C444 => {
+                        let idx = row * w + col;
+                        (cb_plane[idx], cr_plane[idx])
+                    }
+                    Y4mChroma::C420 => {
+                        let uv_w = w.div_ceil(2);
+                        let idx = (row / 2) * uv_w + col / 2;
+                        (cb_plane[idx], cr_plane[idx])
+                    }
+                    Y4mChroma::C422 => {
+                        let uv_w = w.div_ceil(2);
+                        let idx = row * uv_w + col / 2;
+                        (cb_plane[idx], cr_plane[idx])
+                    }
+                };
+                let base = (row * w + col) * 3;
+                out[base] = y_plane[row * w + col];
+                out[base + 1] = cb;
+                out[base + 2] = cr;
+            }
+        }
+        Some(out)
+    }
+
     /// Read one frame and return interleaved RGB f32 (0-255), or None at EOF.
     fn read_frame_rgb(&mut self) -> Option<Vec<f32>> {
         let (y_plane, cb_plane, cr_plane) = self.read_frame_planes()?;
@@ -278,6 +333,10 @@ struct Y4mWriter {
     writer: std::io::BufWriter<std::fs::File>,
     width: usize,
     height: usize,
+    /// **LOSSLESS-5.** When set, the interleaved input already *is* Y'CbCr and the BT.601 matrix
+    /// below must not run. Applying it to both the reference and the distorted stream would be
+    /// symmetric and still wrong: VMAF would be scoring a pair of doubly-converted pictures.
+    native: bool,
 }
 
 impl Y4mWriter {
@@ -297,10 +356,12 @@ impl Y4mWriter {
             writer,
             width,
             height,
+            native: false,
         }
     }
 
-    /// Write one frame. `rgb` is interleaved R,G,B f32 values in [0,255].
+    /// Write one frame. `rgb` is interleaved R,G,B f32 values in [0,255] — or, when this writer
+    /// was made by `create_native`, interleaved Y',Cb,Cr on the same scale.
     fn write_frame(&mut self, rgb: &[f32]) {
         use std::io::Write;
         let w = self.width;
@@ -317,20 +378,23 @@ impl Y4mWriter {
         for row in 0..h {
             for col in 0..w {
                 let base = (row * w + col) * 3;
-                let r = rgb[base];
-                let g = rgb[base + 1];
-                let b = rgb[base + 2];
-                let y = (0.299 * r + 0.587 * g + 0.114 * b).clamp(0.0, 255.0) as u8;
-                y_plane[row * w + col] = y;
+                let (c0, c1, c2) = (rgb[base], rgb[base + 1], rgb[base + 2]);
+                let (y, cb, cr) = if self.native {
+                    (c0, c1, c2)
+                } else {
+                    let (r, g, b) = (c0, c1, c2);
+                    (
+                        0.299 * r + 0.587 * g + 0.114 * b,
+                        -0.168736 * r - 0.331264 * g + 0.5 * b + 128.0,
+                        0.5 * r - 0.418688 * g - 0.081312 * b + 128.0,
+                    )
+                };
+                y_plane[row * w + col] = y.clamp(0.0, 255.0) as u8;
                 // Subsample chroma: average 2×2 block top-left pixel (fast approximation)
                 if row % 2 == 0 && col % 2 == 0 {
-                    let cb =
-                        (-0.168736 * r - 0.331264 * g + 0.5 * b + 128.0).clamp(0.0, 255.0) as u8;
-                    let cr =
-                        (0.5 * r - 0.418688 * g - 0.081312 * b + 128.0).clamp(0.0, 255.0) as u8;
                     let uv_idx = (row / 2) * uv_w + (col / 2);
-                    cb_plane[uv_idx] = cb;
-                    cr_plane[uv_idx] = cr;
+                    cb_plane[uv_idx] = cb.clamp(0.0, 255.0) as u8;
+                    cr_plane[uv_idx] = cr.clamp(0.0, 255.0) as u8;
                 }
             }
         }
@@ -349,6 +413,42 @@ impl Y4mWriter {
         use std::io::Write;
         self.writer.flush().expect("Y4M flush failed");
     }
+}
+
+/// **LOSSLESS-5.** Whether a Y4M input is coded as its own Y'CbCr rather than converted to RGB
+/// first. On by default; `GNC_RGB_PATH=1` is the other arm, which is the switch LOSSLESS-4 gave
+/// the still path and the only way to measure the two against each other.
+fn y4m_native_path() -> bool {
+    !std::env::var("GNC_RGB_PATH")
+        .map(|v| v != "0")
+        .unwrap_or(false)
+}
+
+/// Point a config at the source's own colour space and chroma format.
+///
+/// The chroma format is a property of the file, not a request — coding a 4:2:0 clip at any other
+/// sampling means resampling its planes, which is the cost this path exists to avoid. Same rule
+/// the still path applies in `Command::Encode`.
+fn use_source_colour(config: &mut CodecConfig, chroma: gnc::ChromaFormat) {
+    config.color_space = gnc::ColorSpace::YCbCrNative;
+    config.chroma_format = chroma;
+    config.normalize_for_chroma();
+}
+
+/// A Y4M writer for VMAF's reference and distorted streams, in whichever colour space the frames
+/// handed to it are in. `native` is LOSSLESS-5's arm: the frames already are Y'CbCr and the
+/// writer's BT.601 matrix must not run on them.
+fn y4m_writer(
+    path: &str,
+    width: usize,
+    height: usize,
+    fps_num: u32,
+    fps_den: u32,
+    native: bool,
+) -> Y4mWriter {
+    let mut w = Y4mWriter::create(path, width, height, fps_num, fps_den);
+    w.native = native;
+    w
 }
 
 /// Run the `vmaf` CLI on two Y4M files and return (mean, min, max) VMAF scores.
@@ -1068,7 +1168,7 @@ impl StreamingY4m {
     fn load(&mut self, i: usize) -> Arc<Vec<f32>> {
         // Advance reader to cover frame i
         while self.next_pos <= i && self.next_pos < self.frame_count {
-            if let Some(rgb) = self.reader.read_frame_rgb() {
+            if let Some(rgb) = self.reader.read_frame_interleaved() {
                 self.cache[self.next_pos] = Some(Arc::new(rgb));
                 self.next_pos += 1;
             } else {
@@ -1805,6 +1905,58 @@ survive only into a Y4M output (LOSSLESS-4)."
                 input, num_frames, keyframe_interval, qstep_display, rc_display
             );
 
+            // **LOSSLESS-5.** A Y4M sequence is coded in its own colour space and its own chroma
+            // format, the way LOSSLESS-4 already codes a Y4M still. The source's chroma format
+            // comes out of the header and overrides `--chroma-format`, because at this point the
+            // flag would be a request to *resample* the file.
+            //
+            // **Gated on a lossless request, unlike the still path, and that asymmetry is
+            // deliberate.** At `q=100` the two arms decode the same picture — the native one
+            // exactly, so the comparison is bytes alone and there is nothing for CLAUDE.md's
+            // metric table to arbitrate. Below it the change is a rate/quality trade in a
+            // different colour space: the subband weights and the CfL range were tuned on
+            // YCoCg-R, VMAF cannot see the chroma half of what moves, and a luma PSNR computed
+            // in two different spaces is not a comparison. That measurement has not been made,
+            // so the lossy default stays where it was. `LOSSLESS-6` is the item.
+            let lossless_request = {
+                let mut c = if let Some(q) = quality {
+                    gnc::quality_preset(q)
+                } else {
+                    gnc::manual_config(qstep.unwrap_or(4.0))
+                };
+                if let Some(qs) = qstep {
+                    c.quantization_step = qs;
+                }
+                c.is_lossless()
+            };
+            let is_y4m = input.ends_with(".y4m");
+            let y4m_native = is_y4m && lossless_request && y4m_native_path();
+            let source_chroma = if is_y4m {
+                Some(Y4mReader::open(&input).chroma_format())
+            } else {
+                None
+            };
+            // The canary (CLAUDE.md, "no silent features"): it prints on every Y4M input and says
+            // which arm ran, so "the native path was taken" is distinguishable from "the native
+            // path was never reached" and from each of the two reasons it can be refused.
+            if y4m_native {
+                eprintln!(
+                    "GNC: Y4M sequence — coding its own {:?} Y'CbCr, no colour conversion at \
+either end (LOSSLESS-5). GNC_RGB_PATH=1 for the old behaviour.",
+                    source_chroma.unwrap(),
+                );
+            } else if is_y4m && !lossless_request {
+                eprintln!(
+                    "GNC: Y4M sequence — lossy request, converting to RGB with BT.601 first. \
+The native colour space is measured at q=100 only (LOSSLESS-5); below it the trade is unmeasured."
+                );
+            } else if is_y4m {
+                eprintln!(
+                    "GNC: Y4M sequence — GNC_RGB_PATH=1, converting to RGB with BT.601 first \
+(the pre-LOSSLESS-5 arm)."
+                );
+            }
+
             let ctx = GpuContext::new();
             let mut encoder = EncoderPipeline::new(&ctx);
             let decoder = DecoderPipeline::new(&ctx);
@@ -1846,7 +1998,8 @@ survive only into a Y4M output (LOSSLESS-4)."
                 // For Y4M we keep the reader open so we can reuse it for warmup frames,
                 // avoiding a separate probe-only open.
                 let (w, h, y4m_fps, y4m_probe_reader) = if use_y4m {
-                    let probe = Y4mReader::open(&input);
+                    let mut probe = Y4mReader::open(&input);
+                    probe.native = y4m_native;
                     let fw = probe.width;
                     let fh = probe.height;
                     let y4m_fps_val = probe.fps_num as f64 / probe.fps_den.max(1) as f64;
@@ -1894,6 +2047,9 @@ survive only into a Y4M output (LOSSLESS-4)."
                 }
                 config_tw.chroma_format = parse_chroma_format(&chroma_format);
                 config_tw.normalize_for_chroma();
+                if y4m_native {
+                    use_source_colour(&mut config_tw, source_chroma.unwrap());
+                }
                 println!(
                     "\n=== Temporal wavelet ({:?}, streaming, {}) ===",
                     temporal_mode,
@@ -1935,7 +2091,7 @@ survive only into a Y4M output (LOSSLESS-4)."
                 // is a separate, independent open that always restarts from frame 0.
                 let warmup_frames: Vec<Vec<f32>> = if let Some(mut y4m_warmup) = y4m_probe_reader {
                     (0..gop_size)
-                        .filter_map(|_| y4m_warmup.read_frame_rgb())
+                        .filter_map(|_| y4m_warmup.read_frame_interleaved())
                         .collect()
                 } else {
                     (0..gop_size)
@@ -1982,7 +2138,9 @@ survive only into a Y4M output (LOSSLESS-4)."
                 // For Y4M: open the file once and stream frames sequentially.
                 // For PNG: re-derive paths from the pattern per-GOP.
                 let mut y4m_stream: Option<Y4mReader> = if use_y4m {
-                    Some(Y4mReader::open(&input))
+                    let mut r = Y4mReader::open(&input);
+                    r.native = y4m_native;
+                    Some(r)
                 } else {
                     None
                 };
@@ -2008,23 +2166,25 @@ survive only into a Y4M output (LOSSLESS-4)."
                 let tmp_ref = gnc::session_temp_path("gnc_vmaf_ref.y4m");
                 let tmp_dist = gnc::session_temp_path("gnc_vmaf_dist.y4m");
                 let mut vmaf_ref_writer: Option<Y4mWriter> = if vmaf {
-                    Some(Y4mWriter::create(
+                    Some(y4m_writer(
                         tmp_ref.to_str().unwrap(),
                         w as usize,
                         h as usize,
                         (effective_fps * 1000.0) as u32,
                         1000,
+                        y4m_native,
                     ))
                 } else {
                     None
                 };
                 let mut vmaf_dist_writer: Option<Y4mWriter> = if vmaf {
-                    Some(Y4mWriter::create(
+                    Some(y4m_writer(
                         tmp_dist.to_str().unwrap(),
                         w as usize,
                         h as usize,
                         (effective_fps * 1000.0) as u32,
                         1000,
+                        y4m_native,
                     ))
                 } else {
                     None
@@ -2053,7 +2213,7 @@ survive only into a Y4M output (LOSSLESS-4)."
                         let mut frames = Vec::with_capacity(gop_size);
                         if let Some(ref mut y4m) = y4m_stream {
                             for _ in 0..gop_size {
-                                match y4m.read_frame_rgb() {
+                                match y4m.read_frame_interleaved() {
                                     Some(rgb) => frames.push(rgb),
                                     None => break,
                                 }
@@ -2124,7 +2284,7 @@ survive only into a Y4M output (LOSSLESS-4)."
                         let mut next_frames = Vec::with_capacity(gop_size);
                         if let Some(ref mut y4m) = y4m_stream {
                             for _ in 0..gop_size {
-                                match y4m.read_frame_rgb() {
+                                match y4m.read_frame_interleaved() {
                                     Some(rgb) => next_frames.push(rgb),
                                     None => break,
                                 }
@@ -2301,7 +2461,7 @@ survive only into a Y4M output (LOSSLESS-4)."
                 for i in tail_start..num_frames {
                     let t_io_start = std::time::Instant::now();
                     let rgb = if let Some(ref mut y4m) = y4m_stream {
-                        match y4m.read_frame_rgb() {
+                        match y4m.read_frame_interleaved() {
                             Some(f) => f,
                             None => break,
                         }
@@ -2454,7 +2614,9 @@ survive only into a Y4M output (LOSSLESS-4)."
                 );
                 config_ip.set_tile_size(tile_size);
                 config_ip.bit_depth = bit_depth;
-                config_ip.bit_depth = bit_depth;
+                if y4m_native {
+                    use_source_colour(&mut config_ip, source_chroma.unwrap());
+                }
 
                 let ki_window = config_ip.keyframe_interval as usize + 4;
                 let frame_size_mb = w as f64 * h as f64 * 3.0 * 4.0 / 1_048_576.0;
@@ -2466,7 +2628,11 @@ survive only into a Y4M output (LOSSLESS-4)."
                 );
 
                 let mut streaming_y4m = StreamingY4m {
-                    reader: Y4mReader::open(&input),
+                    reader: {
+                        let mut r = Y4mReader::open(&input);
+                        r.native = y4m_native;
+                        r
+                    },
                     cache: vec![None; num_frames],
                     next_pos: 0,
                     released_up_to: 0,
@@ -2543,10 +2709,11 @@ survive only into a Y4M output (LOSSLESS-4)."
             let mut h = 0u32;
             if input.ends_with(".y4m") {
                 let mut y4m = Y4mReader::open(&input);
+                y4m.native = y4m_native;
                 w = y4m.width;
                 h = y4m.height;
                 for _ in 0..num_frames {
-                    match y4m.read_frame_rgb() {
+                    match y4m.read_frame_interleaved() {
                         Some(rgb) => frames_data.push(rgb),
                         None => break,
                     }
@@ -2585,6 +2752,9 @@ survive only into a Y4M output (LOSSLESS-4)."
                 );
                 config_ip.set_tile_size(tile_size);
                 config_ip.bit_depth = bit_depth;
+                if y4m_native {
+                    use_source_colour(&mut config_ip, source_chroma.unwrap());
+                }
 
                 // Warm up GPU shader pipelines (triggers Metal lazy compilation)
                 let _ = encoder.encode(&ctx, &frames_data[0], w, h, &config_ip);
@@ -2711,19 +2881,21 @@ survive only into a Y4M output (LOSSLESS-4)."
                         let tmp_ref = gnc::session_temp_path("gnc_ip_vmaf_ref.y4m");
                         let tmp_dist = gnc::session_temp_path("gnc_ip_vmaf_dist.y4m");
                         let fps_int = fps.round() as u32;
-                        let mut ref_wr = Y4mWriter::create(
+                        let mut ref_wr = y4m_writer(
                             tmp_ref.to_str().unwrap(),
                             w as usize,
                             h as usize,
                             fps_int,
                             1,
+                            y4m_native,
                         );
-                        let mut dist_wr = Y4mWriter::create(
+                        let mut dist_wr = y4m_writer(
                             tmp_dist.to_str().unwrap(),
                             w as usize,
                             h as usize,
                             fps_int,
                             1,
+                            y4m_native,
                         );
                         for (orig, dec) in frames_data.iter().zip(decoded_all.iter()) {
                             ref_wr.write_frame(orig);

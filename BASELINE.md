@@ -254,8 +254,8 @@ superseded** and by a wide margin, because that path was not lossless at all (BU
 bbb read PSNR 32.89 dB at 8.42 bpp, and now reads inf at 10.42 bpp). Rate and quality both moved,
 so such a figure cannot be adjusted — it has to be retaken. Every subsampled `q=100` figure taken **before** 2026-09-10 is superseded: at
 4:2:2/4:2:0 the lossless path was drifting inside each tile, so those encodes were both larger and
-2.7x to 20x worse in colour than they now are. There are still no non-444 rows in this file; there
-now *could* be, which is the change. Numbers in RESEARCH_LOG, 2026-09-10.
+2.7x to 20x worse in colour than they now are. **The non-444 rows exist as of 2026-09-11** and are
+in the Y4M section below (LOSSLESS-5). Numbers in RESEARCH_LOG, 2026-09-10.
 Container bytes, `encode-sequence`, and every frame md5-identical to its source PNG through
 `decode-sequence`:
 
@@ -274,6 +274,42 @@ up to **+69% for identical pixels**. `GNC_LOSSLESS_INTRA_RECODE=0` reproduces th
 
 Animation keeps its P-frames and its rows are unchanged. **No fps is quoted: eight sessions shared
 the GPU.**
+
+## Lossless sequences from a Y4M source, in the source's own colour space (q=100, 8 frames)
+
+New section 2026-09-11 (LOSSLESS-5, `0082` / `0083`). These are the first non-444 rows in this
+file, and the first Y4M-sourced lossless rows that mean anything: before 2026-09-10 that path was
+not lossless at all (BUG-45), and before today it converted to RGB with a matrix that cannot be
+undone.
+
+`benchmark-sequence -q 100`, both arms at the file's own **4:2:0**. The native arm is the default
+for a lossless request; `GNC_RGB_PATH=1 --chroma-format 420` is the control, and is what the
+column on the right is.
+
+| sequence (4:2:0) | ki | native | RGB, same format | delta | frames |
+|---|---|---|---|---|---|
+| bbb (animation) | 8 | **11 863 639** | 13 949 160 | −14.95% | 1I+7P |
+| blue_sky | 8 | **10 378 585** | 12 177 781 | −14.77% | 8I |
+| crowd_run | 8 | **16 679 183** | 18 596 938 | −10.31% | 8I |
+| old_town_cross | 8 | **15 952 107** | 17 940 092 | −11.08% | 8I |
+| **sum** | 8 | **54 873 514** | 62 663 971 | **−12.43%** | |
+| bbb | 2 | **12 280 971** | 14 749 351 | −16.74% | 4I+4P |
+| **sum** | 2 | **55 290 846** | 63 464 162 | **−12.88%** | |
+
+The camera rows are identical at ki=2 and ki=8 for the same reason the 4:4:4 rows above are: a
+lossless P-frame that costs more than an I-frame is re-coded (`0070`), so camera content converges
+to all-intra.
+
+**Every frame is bit-exact against the source's own Y'CbCr except one** — `bbb.y4m` frame 2, which
+is **BUG-57** and reproduces at 4:4:4 and 4:2:2 as well. The RGB arm is not bit-exact against the
+source at all in any of these rows, which is the point of the section rather than a caveat.
+
+bbb converted to its other two formats, same comparison: 4:2:2 **13 440 827** against 16 978 198,
+4:4:4 **17 773 215** against 24 084 895. Both deltas are larger than −13% because the RGB arm codes
+those all-intra, so they mix a colour-space change with a frame-type one; the 4:2:0 table is the
+clean one.
+
+**No fps is quoted: eight sessions shared the GPU.**
 
 ## Lossless sequences at q = 95..=99 (8 frames, 4:4:4, Rice)
 

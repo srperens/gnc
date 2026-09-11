@@ -1987,7 +1987,31 @@ generous ones — which is the difference between "runs in two browsers" and "po
 on macOS sit on Metal; none of them can produce the failure. It needs either a device with the
 spec-floor limits or a deliberately clamped request.
 
-### LOSSLESS-5 — the sequence encoder's preprocessing is now one site instead of eleven (**step 1 DONE 2026-09-11**; the planar branch is what remains, P1)
+### LOSSLESS-5 — a Y'CbCr sequence codes as itself (**DONE 2026-09-11**, `−12.4%` on four clips; the chroma motion vectors were half-pel)
+
+> **DONE 2026-09-11.** `benchmark-sequence` codes a Y4M in the source's own colour space and chroma
+> format at `q=100`; `GNC_RGB_PATH=1` is the other arm. Four clips at their own 4:2:0, native
+> against RGB at the same format: **−14.95% / −14.77% / −10.31% / −11.08%, −12.43% on the sum**
+> (ki=8; −12.88% at ki=2), which lands on the corrected still-path figure of −13.2%. Decision
+> records `0082` and `0083`; numbers and the three test-content failures in RESEARCH_LOG.
+>
+> **The cause of the 258 was one call site, and it was in the *still* path.** `encode()` with
+> `color_space = YCbCrNative` ran the colour matrix regardless: `EncodeInput::Rgb` names the
+> layout, not the colour space, and the sequence encoder's I-frames go through it. `encode_once`
+> now calls `preprocess_to_planes` — the same function the eleven sites already used. Four
+> isolation arms all read 258 before and 0 after.
+>
+> **And it found a real defect: at subsampled chroma a full-pel luma vector is a half-pel chroma
+> vector.** BUG-39 rounds luma MVs to full-pel; `motion_mv_scale.wgsl` then halves them, so the
+> chroma prediction interpolates and the step-1.0 quantiser rounds it — every P-frame at 66.5-70.4
+> dB on `bbb.y4m` 4:2:0, the error entirely in Cb and Cr. The quantum is now **8 quarter-pels on
+> each axis chroma subsamples**, applied to the luma vector so the decoder needs no counterpart
+> (`0082` — rounding the encoder's chroma buffer instead was tried and drifts to 46.4 dB). Shipped
+> cost across four clips: **−1.16%, 0.00%, 0.00%, 0.00%**.
+>
+> Still open and filed separately: **BUG-57** (one frame in eight of bbb is inexact in the
+> bottom-right corner tile at `--tile-size 256`) and **LOSSLESS-6** (the native arm below q=100).
+
 
 > **CORRECTION, 2026-09-11 — the headline number was two changes added together.**
 >
@@ -2044,8 +2068,8 @@ transform must be the reversible one. The suspicion is withdrawn. It was worth r
 it was indistinguishable from a typo while sitting among ten near-identical neighbours; now it is
 one argument at one call site with a comment saying why.
 
-**What remains is the actual item:** make that one site take planes. The decision that used to need
-making eleven times now needs making once.
+**And step 2 turned out not to be "make that one site take planes" at all.** The eleven sites were
+already right; the frames that were wrong never reached them. See the DONE block at the top.
 
 
 
@@ -2092,14 +2116,70 @@ estimation, where a real planar encoder derives chroma vectors from luma. So the
 the planar path by some amount, and the shipped figure should be expected to land at or below
 −40.6%. It is a bound to build against, not the result.
 
-**Success criterion:** `benchmark-sequence -i <clip>.y4m -q 100` is bit-exact against the source's
-own Y'CbCr on ≥3 clips, and smaller than the same clip through the RGB path. Report both arms;
-`GNC_RGB_PATH=1` already selects the old one on the still path and should mean the same here.
+**Superseded by the shipped measurement**, which reads **−12.4%** against an RGB arm at the same
+chroma format. The −40.6% is the 4:4:4-against-4:2:0 comparison the correction block above already
+withdrew; the spike's own bias, priced honestly here in advance, turned out to be the smaller of
+the two errors in it.
+
+**Success criterion** (met, with one exception): `benchmark-sequence -i <clip>.y4m -q 100` is
+bit-exact against the source's own Y'CbCr on ≥3 clips, and smaller than the same clip through the
+RGB path. Three of four clips are exact on every frame; `bbb.y4m` is exact on 7 frames of 8 and
+its remaining frame is **BUG-57**, which is not a colour-space defect and reproduces in all three
+chroma formats.
 
 **Also still open from LOSSLESS-4:** a native 4:2:0 file decodes to *full-resolution* Y'CbCr,
 because the decoder still nearest-neighbour upsamples chroma before interleaving. The coded planes
 are exact; the output is a presentation choice. Planar output at native resolution needs a Y4M
 writer path, and is what makes "the user gets their samples back" true for 4:2:0 as well as 4:4:4.
+
+### BUG-57 — one lossless P-frame in eight is inexact in the corner tile, and only at tile_size 256 (todo, P2)
+
+Found by LOSSLESS-5, once the native colour space made a sequence exact enough for one frame to
+stand out. It is not a LOSSLESS-5 defect: nothing that item changed is in the region.
+
+**Repro**, deterministic across runs:
+
+```
+gnc benchmark-sequence -i test_material/frames/sequences/bbb/bbb.y4m \
+    --num-frames 4 -q 100 --keyframe-interval 8
+```
+
+Frame 2 reads **75.31 dB** where 0, 1 and 3 read `inf`. **3 606 luma samples**, max error 10, all
+inside the tile that starts at **(1797, 1024)** — the bottom-right corner tile, which at
+1920x1080 padded to 2048x1280 is mostly padding (128 real columns, 56 real rows).
+
+What is known:
+
+- Same frame, same region, at **4:4:4** (there all three planes are affected: Y max 10 / Cb 5 /
+  Cr 3) and at **4:2:2**. So it is not chroma-format-specific and not the chroma MV path.
+- **It disappears at `--tile-size 128`.** That is the sharpest handle on it.
+- It does **not propagate**: frame 3 is bit-exact again. So the encoder's reference and the
+  decoder's reconstruction agree — the disagreement is inside frame 2's own coding.
+- The RGB path at 4:4:4 from PNG (integral input) is bit-exact on the same four frames, so the
+  content values matter; a Y'CbCr picture reaches it and an RGB one does not.
+
+Start with what differs about a tile that is mostly replicated padding at `q=100`: MED's
+per-pixel wavefront over it, and the corner tile's Rice/ZRL streams.
+
+### LOSSLESS-6 — the native colour space below q=100 (todo, P2)
+
+`benchmark-sequence` takes a Y4M's own Y'CbCr only for a **lossless** request (`0083`). The still
+path takes it at every q, and the asymmetry is deliberate rather than settled: at q=100 both arms
+decode the same picture so the comparison is bytes alone, and below it the same change is a
+rate/quality trade this session did not measure.
+
+What makes it a trade rather than a free extension:
+
+- the perceptual subband weights and the CfL range were tuned on YCoCg-R and would simply be
+  applied to Y'CbCr;
+- **VMAF scores luma only**, so it cannot validate the chroma half (CHROMA-1: a 6% rate move read
+  97.08 before and 97.08 after);
+- and a luma PSNR computed in two different colour spaces is not a comparison, so the measurement
+  needs decoded output brought into one space — `scripts/ypsnr_de00.py` plus dE00, per CLAUDE.md's
+  rule for anything touching chroma.
+
+The gate is one boolean in `Command::BenchmarkSequence` and reverses in a line. Do the measurement
+first; the rate half will look like a win on its own and that is exactly the trap CHROMA-1 records.
 
 ### LOSSLESS-4 — the colour conversion costs ~13% of the lossless rate (headline corrected 2026-09-11) (**stills DONE 2026-09-11**, `GP21`; video is LOSSLESS-5)
 

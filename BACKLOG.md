@@ -1904,7 +1904,18 @@ unmeasured**; the fix applies wherever the sibling is used and should move them 
 
 Decision `docs/decisions/0072`. Fixed 2026-09-08 by the `drnum` session while closing RATE-4.
 
-### BUG-56 — the Y4M reader cannot ingest 4:2:2, the format the project headlines (todo, **P1**)
+### BUG-56 — the Y4M reader cannot ingest 4:2:2, the format the project headlines (**FIXED 2026-09-11**)
+
+**FIXED same day.** 420 variants, 422 and 444 are each parsed on their own terms; anything else is
+**refused by name** instead of guessed. Verified at q=100 on 4 frames: all three formats round-trip
+with PSNR inf, where 4:2:2 previously panicked. Guard is `y4m_tests` in `main.rs`, using two-frame
+files because a wrong plane size does not corrupt frame one — it desynchronises the stream, which
+is the shape the bug had. Mutation-tested; with the 422 branch removed the refusal catches the case
+rather than silently guessing 4:2:0, so the backstop sits under the feature.
+
+**Still owed from the success criterion:** `test_material/` has no 4:2:2 clip, so the format is
+covered by unit tests but not by any end-to-end measurement. Every 4:2:2 figure in the repository
+still predates this fix and was taken on converted material.
 
 **Found 2026-09-11.** `Y4mReader::open` decides the chroma format with one test:
 

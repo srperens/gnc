@@ -141,9 +141,19 @@ The team's core principle: **correctness over speed, measurement over assumption
 | q > 85 (contribution, near lossless) | **PSNR** | VMAF is saturated and reads noise. Measured 2026-09-06: on old_town it returns 99.62–99.68 across a 6 dB PSNR spread, and widening a BD-rate ladder moved the VMAF figure by **47.5 points on average, 110 at worst**, while the PSNR figure moved **1.0**. A VMAF BD-rate at this end is not a weak number, it is not a number. |
 | anything touching chroma | **CIEDE2000** (`scripts/chroma_metric.py`) | VMAF cannot see colour at all. See below. |
 
-Since GNC is a *contribution* codec (GOALS §1), the second row is the project's home range —
-which means **PSNR leads more often than the old "VMAF is primary" rule implied.** That rule was
-written for the lossy range and was wrong above it.
+**Which row applies is a property of the measurement, not of the project.** PSNR leads more often
+than the old "VMAF is primary" rule implied, because that rule was written for the lossy range and
+is wrong above q=85. That is all the table says.
+
+**It does not say q>85 is where GNC lives, and an earlier version of this line did — citing GOALS
+§1 for the opposite of what GOALS §1 decides.** GOALS opens with *"GNC is broad on purpose — that
+is the decision, not an unresolved question"*, re-affirmed 2026-09-07 **after the repository had
+already drifted into narrowing it once**, and says all the segments are in scope at once with none
+of them primary (`docs/decisions/0055`). The range runs from heavy compression to bit-exact
+lossless, and a result at q=25 is not out of scope for being at q=25.
+
+The drift is easy to repeat because the narrow reading is convenient: it lets you dismiss a win by
+saying it landed in the wrong part of the range. Price a result on its numbers, not on its q.
 
 **VMAF scores the luma plane only.** It cannot see chroma being degraded, so it cannot validate
 any decision about a chroma parameter — chroma weighting, CfL range, chroma format trade-offs.

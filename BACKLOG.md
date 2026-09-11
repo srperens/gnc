@@ -1421,8 +1421,12 @@ and `Cg = 0` exactly, so the difference is what chroma costs:
 
 **Read the q=95 row carefully: those are not zeros because CfL fails there, but because CfL is not
 switched on there.** `quality_preset`'s anchors enable it at q=50, 75 and 85 only — off at q=25
-("CfL alpha too coarse at qstep=16") and off above 85. **So CfL is inactive across the whole of
-GNC's home range** (contribution, q>85, GOALS §1), and this item's prize exists only at q=50–85.
+("CfL alpha too coarse at qstep=16") and off above 85. So this item's prize exists only at q=50–85.
+
+**An earlier version of this entry said that range was outside GNC's "home range" and used it as
+half the argument. That was wrong and the argument is withdrawn** — GOALS §1 decides the opposite
+(`docs/decisions/0055`, "broad on purpose … none of them is the primary one"), and q=50–85 is
+squarely in scope. The prize has to stand on its numbers alone, and it still does not stand:
 
 **Within that range the win is one image in three.** bbb is the 9% everyone quotes; blue_sky and
 kristensara are 0.60% and 0.01%. Scale the one real win by the chroma share and the ceiling at
@@ -1435,8 +1439,9 @@ which pushes the real figure below it.
 - **Step 1 (document the limitation, add a `GNC_DIAGNOSTICS` canary) is still worth doing and is
   now worth more**, because BUG-49 made 4:2:2/4:2:0 bit-exact at q=100, so subsampled formats are
   a credible shipping target and a silently-inert feature is a worse trap than it was.
-- **Step 3 (enable CfL at non-444) is not worth building on this evidence.** A few percent, on some
-  content, in a quality range GNC does not call home. Re-priced P2 → P3.
+- **Step 3 (enable CfL at non-444) is not worth building on this evidence** — but on the evidence,
+  not on the range. One image in three, a ~6% ceiling on that one, and the encoder's own comment
+  says the prediction degrades on subsampled chroma. Re-priced P2 → P3 on those grounds.
 - **CHROMA-3 gets sharper, not weaker.** "Where is CfL's gain per subband" is now also "why is it
   9% on one image and 0.01% on another" — and that question is worth answering at 4:4:4, where the
   feature is actually on, before anyone ports it anywhere.
@@ -8387,6 +8392,20 @@ decode, and the BUG-31 static workgroup-storage assertion in CI.
 
 **Decision record required either way** — a shipped coder is a default-adjacent choice, and a
 rejection is a recorded conclusion with numbers (the EBCOT entry is the template).
+
+### ENT-10 — needs re-pricing: its case was discounted for landing in the "wrong" part of the range (2026-09-11)
+
+**Flagged, not answered.** The standing argument against making abac the default leans on its rate
+win being "intra and low-q", collapsing to ~−4% on inter at q=99, "and q=95–99 is GNC's home range".
+**That last clause is false** — GOALS §1 decides the range is the whole of it (`0055`), and the
+line in CLAUDE.md that said otherwise was corrected on 2026-09-11.
+
+So **−16.6% to −18.8% on intra is a real win in a real operating range**, not a curiosity outside
+one. The case against abac now has to rest entirely on cost, which is where it is strongest anyway:
+**3.19x decode and 5.57x encode**, measured on an idle machine, about twice what `0017` recorded.
+
+Re-price it as a per-operating-point decision rather than a single yes/no, and say which rungs it
+should default on. Nothing below this line has been re-derived.
 
 ### ENT-10 — should abac be the default? **The cost side is measured and it is twice what `0017` says** (todo, **P2**)
 

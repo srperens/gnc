@@ -83,7 +83,7 @@ measured advantage over x264 on any axis at this operating point.**
    **INTRA-2 (P1)**~~ — **both shipped 2026-09-08** (PAD-1 −4.63% RGB / −4.60% Y of intra rate on
    stills, `0039`; INTRA-2 BD-rate −5.01% on four stills at q≥85, `0041`). **What is left of this
    item is the inter half of the padding — PAD-2 (P2), −7% to −10% of sequence rate, gated on a
-   bitstream version — and TILE-1 (P2)**, partial border tiles, the remaining ~2 points on stills
+   bitstream version — and TILE-2 (P2)**, partial border tiles, the remaining ~2 points on stills
    plus the tile-size/frame-size decoupling. History below. Added 2026-09-07 after ENT-4. With `--abac` on, GNC
    needs 27.1% more bits than JPEG 2000 *using the same transform at the same depth*, and nothing in
    this repository accounts for it. Largest known compression gap. **Step 1 is done (2026-09-07):
@@ -128,7 +128,7 @@ measured advantage over x264 on any axis at this operating point.**
    `--abac` the default is worth −16.6% to −18.8% of intra rate at identical pixels, to everyone,
    with nothing left to implement. It was never filed with an ID, so `scripts/claim next` could not
    offer it; it is now **ENT-10**. The largest genuinely *unbuilt* levers are **PAD-2** (−7% to
-   −10% of sequence rate) and **TILE-1**.
+   −10% of sequence rate) and **TILE-2**.
 2. **LOSSLESS-1** — both gates green (10–26% for ~5 ms/frame). The one lever this week that passed
    rather than failed. ~~Buildable now.~~ **Built and measured 2026-09-06** — see the entry below;
    this line outlived its item by two days.
@@ -164,7 +164,7 @@ section named six things, five of which were closed:
 
 | the priority order said | what is true |
 |---|---|
-| item 0: "the remaining work is **PAD-1 (P1)** ... and **INTRA-2 (P1)**" | **both shipped 2026-09-08** (`0039`, `0041`). The remaining work is PAD-2 (P2) and TILE-1 (P2) |
+| item 0: "the remaining work is **PAD-1 (P1)** ... and **INTRA-2 (P1)**" | **both shipped 2026-09-08** (`0039`, `0041`). The remaining work is PAD-2 (P2) and TILE-2 (P2) |
 | item 1: "the next largest known intra lever is **still unbuilt** — see EBCOT Part 7's open items" | Part 7 has **no open items**: 1 and 2 closed by Parts 6/7, 3 by ENT-3, 4 by ENT-5's GPU encoder. And the lever is **built** — it is `--abac`, behind a flag |
 | item 2: "**LOSSLESS-1** ... **Buildable now**" | **built and measured 2026-09-06**, two days before |
 | item 3: "**MEAS-5 / CANARY-1** — blocked on a discrete GPU ... never been measured" | **CANARY-1 DONE 2026-09-07, PASSES at 34x.** MEAS-5's Claim A holds and is fully sourced; only Claim B is unmeasured |
@@ -8024,7 +8024,8 @@ so none of them can carry five wavelet levels. Broadcast heights are not power-o
 **+81% of rate** against tile 256 with 20.9% padding and five levels. So the padding is by far the
 cheaper evil, and **having to choose at all is the defect** — partial border tiles the way JPEG
 2000 has them decouple tile size from frame size and give both. That is a bigger item than PAD-2, and it is
-filed as **TILE-1**; the number above is what justifies scoping it.
+filed as **TILE-2** (it was TILE-1 until the id collision was cleared on 2026-09-11); the
+number above is what justifies scoping it.
 
 **The original filing** — the pre-shipping version of PAD-1, with the three candidate shapes and
 the oracle figure of −4.5% — is superseded by the two decision records that came out of it
@@ -8106,7 +8107,20 @@ The original filing follows.
 defect below is fixed — it produces 5 dB pictures.** This entry is on `main` so the diagnosis
 is inheritable without the breakage.
 
-### TILE-1 — partial border tiles, so tile size and frame size stop being alternatives (original filing, **P2**)
+### TILE-2 — partial border tiles, so tile size and frame size stop being alternatives (**P2**)
+
+> **Renumbered from `TILE-1` on 2026-09-11 (COORD-3).** Two startable headings carried that id —
+> this one, the original filing by PAD-1, and the stage-1 item above — and `refs/claims/TILE-1`
+> can lock only one of them, so claiming either made the other **invisible to `claim next`**. The
+> stage-1 heading keeps `TILE-1` because everything else already points at it: `dr-0053`, BUG-51's
+> generation argument, and the committed `tile1` branch. Nothing pointed at this one, so it is the
+> cheap side to move.
+>
+> The two are not duplicates and neither is stale. This is the goal — border tiles clipped to what
+> is left of the picture, no bitstream change. `TILE-1` is the inherited stage-1 work toward it
+> (pad to `2^levels` rather than to `tile_size`), which is committed on a branch, red on its own
+> target case, and blocked behind BUG-51's generation clash.
+
 
 Filed 2026-09-08 by PAD-1, which shipped 4.6 of the 6.6 points the padding costs and then measured
 why the obvious cheaper escape does not exist. **Worth the remaining ~2 points on stills and the

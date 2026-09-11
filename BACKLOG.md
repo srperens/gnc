@@ -1403,7 +1403,43 @@ preset and manual paths agree and that the library default still permits B-frame
 No decision record: no default changed. The shipped default was already P-only since 2026-09-06;
 this makes four CLI paths actually honour it.
 
-### BUG-54 — CfL is silently off at 4:2:2 and 4:2:0, and the limit is documented nowhere (todo, **P2**)
+### BUG-54 — CfL is silently off at 4:2:2 and 4:2:0; **priced 2026-09-11 and the prize is small** (todo, **P3** — re-priced from P2)
+
+**Priced before building, 2026-09-11.** The forgone gain was listed as unknown. It is now bounded,
+and the bound says step 3 is not worth doing on current evidence.
+
+Two measurements. What CfL is actually worth today at 4:4:4 (`--no-cfl` against the default), and
+what share of the file is even chroma — the latter by coding a grayscale copy, where `Co = R−B = 0`
+and `Cg = 0` exactly, so the difference is what chroma costs:
+
+| still | q | CfL saves at 4:4:4 | chroma share 4:4:4 | chroma share 4:2:0 | **ceiling at 4:2:0** |
+|---|---|---|---|---|---|
+| bbb | 75 | **+9.49%** | 50.4% | 31.4% | **+5.91%** |
+| blue_sky | 75 | +0.60% | 61.6% | 33.2% | +0.33% |
+| kristensara | 75 | +0.01% | 47.8% | 26.0% | +0.00% |
+| all three | 95 | **not enabled** | ~58% | ~31% | — |
+
+**Read the q=95 row carefully: those are not zeros because CfL fails there, but because CfL is not
+switched on there.** `quality_preset`'s anchors enable it at q=50, 75 and 85 only — off at q=25
+("CfL alpha too coarse at qstep=16") and off above 85. **So CfL is inactive across the whole of
+GNC's home range** (contribution, q>85, GOALS §1), and this item's prize exists only at q=50–85.
+
+**Within that range the win is one image in three.** bbb is the 9% everyone quotes; blue_sky and
+kristensara are 0.60% and 0.01%. Scale the one real win by the chroma share and the ceiling at
+4:2:0 is **+5.91% on bbb, +0.33% and +0.00% on the others** — and it is a *ceiling*, because the
+encoder's own comment says spatial luma-chroma prediction is less reliable on subsampled chroma,
+which pushes the real figure below it.
+
+**What this changes:**
+
+- **Step 1 (document the limitation, add a `GNC_DIAGNOSTICS` canary) is still worth doing and is
+  now worth more**, because BUG-49 made 4:2:2/4:2:0 bit-exact at q=100, so subsampled formats are
+  a credible shipping target and a silently-inert feature is a worse trap than it was.
+- **Step 3 (enable CfL at non-444) is not worth building on this evidence.** A few percent, on some
+  content, in a quality range GNC does not call home. Re-priced P2 → P3.
+- **CHROMA-3 gets sharper, not weaker.** "Where is CfL's gain per subband" is now also "why is it
+  9% on one image and 0.01% on another" — and that question is worth answering at 4:4:4, where the
+  feature is actually on, before anyone ports it anywhere.
 
 **Found 2026-09-08 by an external reviewer's question** — *"if chroma is subsampled the chroma
 subbands get different dimensions than the luma subbands, which complicates CfL's per-subband alpha
@@ -1988,8 +2024,10 @@ smaller than the RGB one.
 3 235 737 → 3 235 738 bytes, exactly the one new header byte.
 
 **What remains is the half that matters most, and it is LOSSLESS-5:** video. The planar path lives
-in the *still* encoder; `sequence.rs` has its own preprocessing with nine separate colour-transform
-sites, and none of them take planes. So `benchmark-sequence` and `encode-sequence` still convert.
+in the *still* encoder, and `sequence.rs` does its own preprocessing. That preprocessing was
+**eleven** copy-pasted copies when this was written — this paragraph said nine, from a truncated
+`grep` — and is **one** function since LOSSLESS-5 step 1. So `benchmark-sequence` and
+`encode-sequence` still convert, but the change now has a single site to be made at.
 
 
 
@@ -2907,7 +2945,33 @@ is no before-number and a guessed fix would be exactly the change this project's
 Filed as **COORD-7**. Shell only — no Rust, no shader, no bitstream, so the cargo gates cannot be
 affected and were not re-run (DOC-1 / ENT-7 precedent); `claim selftest` passes.
 
-### BUG-51 — `GP19` is claimed twice; the guard is in, the renumber is not (todo, P1)
+### BUG-51 — the renumber landed on `tile1`; merging it now needs a **third** generation (todo, P1 — restated 2026-09-11)
+
+**Restated 2026-09-11, because this entry was wrong about its own state.** The renumber *is* done:
+`93ae1f8 "TILE-1: renumber the padding grid GP19 -> GP20 (BUG-51)"`, committed and pushed on branch
+`tile1`. What the entry called "not done: it is another session's worktree and its owner is
+mid-debug" no longer holds either — `gnc-tile1` is **clean**, zero uncommitted files, three commits
+ahead of `main`.
+
+**But the merge got harder, and partly by my hand.** `main` moved to **GP21** on 2026-09-11 for
+LOSSLESS-4's colour-space byte, taking GP21 precisely *because* GP20 was reserved. So two
+generations are now live in two trees:
+
+| | GP20 | GP21 |
+|---|---|---|
+| where | `tile1`, unmerged | `main`, pushed |
+| what | plane padded to 2^levels, not tile_size | planes may be native Y'CbCr |
+
+`git merge-tree main tile1` conflicts in `src/format.rs`, `tests/abac_bitstream.rs`,
+`src/encoder/pipeline_tests.rs` and `BACKLOG.md`. **The format conflict cannot be resolved by
+picking a side.** A merged encoder does *both* things, so a file it writes is neither GP20 nor
+GP21 — it needs **GP22 meaning both**, with GP20 and GP21 kept in the table as readable history.
+Picking either side textually produces exactly what this item exists to prevent: a file that
+decodes to a plausible wrong picture.
+
+**Still open, and now the whole of it:** the `claim gen` allocator (`0050`/`0065` gave `claim dr`,
+`claim bug` and `claim id` one; generations never got theirs, which is why GP21 was reserved by
+hand). Plus TILE-1's 4.95 dB re-reading, which must be re-based on GP22 rather than GP19.
 
 **Two different bitstream formats currently claim generation 19.**
 
@@ -2953,6 +3017,11 @@ padding gated on `gen >= 20` rather than folded into 19.
    bug` / `claim id`, per `0050` and `0065`). The guard was worth landing first because it is a few
    lines and turns a silent data-corrupting clash into a red test; the allocator is the real fix
    and is still open.
+
+**The BUG-49 cross-link in this entry is withdrawn (2026-09-11).** It speculated that BUG-49 "is
+plausibly the same class" and might share a cause with the tile grid. BUG-49 was fixed on
+2026-09-10 (`docs/decisions/0080`) and the cause was the chroma box filter handing MED a fractional
+plane at the *still* encoder's input — nothing to do with tile addressing. The two are unrelated.
 
 **Also worth re-checking once (1) lands:** tile1's `full_pipeline_rice_roundtrip` reads 4.95 dB at
 1920x1088 against 56.21 dB at 256x256, which is the border-tile bug TILE-1 exists to fix — but it

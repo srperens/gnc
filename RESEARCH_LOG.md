@@ -18644,8 +18644,14 @@ full-resolution RGB carries chroma detail the 4:2:0 file never had. FFV1 pays it
 **So the honest summary is that the suspicion was right about the wrong thing.** The fix did not
 make GNC worse; it removed a comparison that was never valid, and measuring the replacement showed
 the rate story on video ingest is dominated by something that is not the entropy coder. Every
-effort spent on the abac gap buys at most ~9 points; a native Y'CbCr path buys ~64 and fixes
-LOSSLESS-4's correctness complaint in the same change.
+effort spent on the abac gap buys at most ~8% of today's output; a native Y'CbCr path buys ~39%
+and fixes LOSSLESS-4's correctness complaint in the same change.
+
+**Correction, 2026-09-11.** An earlier version of this paragraph said the native path "buys ~64",
+comparing a +64.2% *cost* against a +8.8% *cost* — percentages of two different denominators.
+Expressed against the same baseline, today's output: the native path removes **39.2%**, closing the
+entropy gap removes **8.1%**, so it is worth about **4.8x**, not seven times. Still the largest item
+on the board; the mis-statement was in the arithmetic of comparing them, not in which one wins.
 
 **LOSSLESS-4 re-priced P2 → P1** on this measurement. PERF-3 item 2 (packed-u8 YUV upload, 4x less
 DMA and no CPU colour) wants the same input path for an unrelated reason, which is worth knowing

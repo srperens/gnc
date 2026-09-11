@@ -1933,8 +1933,32 @@ on different content and through a different input path, so the entropy-coding g
 is small. Against FFV1 *on the same file* — what a user actually has — GNC is **+78.7%**.
 
 **The difference between those two rows is 64.2 percentage points of colour conversion, paid before
-GNC codes anything.** That is seven times the entropy-coding gap, and it is the largest single item
-in the lossless picture. BT.601's 1.164 gain manufactures levels that were never in the 8-bit
+GNC codes anything**, and it is the largest single item in the lossless picture.
+
+**Both numbers as savings against today's output, because they have different baselines and the
+raw figures do not compare.** The conversion costs +64.2% *on top of* native YUV, which is the same
+thing as removing **39.2%** of what GNC emits today. Closing the entropy gap to FFV1 entirely —
+abac is +8.8% against FFV1 on the same signal — would remove **8.1%**. So the native path is worth
+about **4.8x** the entropy gap, not seven times: an earlier version of this entry compared a +64.2%
+cost against a +8.8% cost, which are percentages of different denominators.
+
+**Confirmed by direct measurement 2026-09-11, on four sequences and by a second method.** A
+grayscale input gives `Co = R-B = 0` and `Cg = 0` exactly, so GNC codes a single plane through its
+normal path and the two empty planes cost almost nothing (measured floor: 3 191 B full-res, 1 007 B
+half-res). Coding Y, Cb and Cr separately at their native resolutions therefore estimates a planar
+path with no code changes:
+
+| sequence (frame 0, q=100) | RGB today | Y+Cb+Cr | delta |
+|---|---|---|---|
+| bbb | 2 699 263 | 1 604 025 | **−40.6%** |
+| blue_sky | 2 270 674 | 1 291 127 | **−43.1%** |
+| crowd_run | 3 281 281 | 2 068 733 | **−37.0%** |
+| old_town_cross | 3 192 752 | 1 994 249 | **−37.5%** |
+| **mean** | 11 443 970 | 6 958 134 | **−39.2%** |
+
+Four of four, no outlier, and it lands within **0.1 points** of what FFV1's own RGB penalty
+predicted (+64.2% cost ⇒ −39.1% saving) — two independent methods agreeing on the size of the
+prize. BT.601's 1.164 gain manufactures levels that were never in the 8-bit
 source, and full-resolution RGB carries chroma the 4:2:0 file did not have. A native Y'CbCr path
 would code fewer distinct levels *and* return the user's samples — it fixes the correctness
 complaint and the rate complaint with one change.

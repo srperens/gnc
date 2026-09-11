@@ -47,6 +47,7 @@ fn max_val_for_depth(bit_depth: u32) -> f64 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Y4mChroma {
     C420,
+    C422,
     C444,
 }
 
@@ -100,10 +101,26 @@ impl Y4mReader {
                 Some('C') => {
                     let fmt = &token[1..];
                     let fmt_base = fmt.trim_start_matches(|c: char| !c.is_ascii_digit());
+                    // **BUG-56.** This used to be `starts_with("444")` or else 4:2:0, so every
+                    // format that was not 4:4:4 was *assumed* to be 4:2:0. A `C422` file has twice
+                    // the chroma rows that assumption allocates: the reader consumed half of them,
+                    // walked off the plane boundary, and panicked at the next frame header — while
+                    // GOALS §1 headlines 10-bit 4:2:2 and the encoder has coded it for months.
+                    //
+                    // Refuse what is not recognised, by name. A guessed chroma format is not an
+                    // error anyone sees; it is a wrong picture, or a panic three frames later.
                     chroma = if fmt_base.starts_with("444") {
                         Y4mChroma::C444
+                    } else if fmt_base.starts_with("422") {
+                        Y4mChroma::C422
+                    } else if fmt_base.starts_with("420") {
+                        Y4mChroma::C420 // 420jpeg / 420mpeg2 / 420paldv / plain 420
                     } else {
-                        Y4mChroma::C420 // default; 420jpeg / 420mpeg2 / plain 420
+                        panic!(
+                            "Y4M chroma format 'C{fmt}' is not supported (known: 420, 422, 444, \
+                             each optionally with a bit-depth suffix). Refusing rather than \
+                             guessing — a wrong chroma format decodes as a wrong picture (BUG-56)."
+                        )
                     };
                     // The bit-depth suffix ("420p10", "444p10") used to be stripped and
                     // discarded, so a 10-bit file was read as 8-bit — half the samples, and
@@ -132,6 +149,7 @@ impl Y4mReader {
     fn chroma_format(&self) -> gnc::ChromaFormat {
         match self.chroma {
             Y4mChroma::C420 => gnc::ChromaFormat::Yuv420,
+            Y4mChroma::C422 => gnc::ChromaFormat::Yuv422,
             Y4mChroma::C444 => gnc::ChromaFormat::Yuv444,
         }
     }
@@ -195,6 +213,11 @@ impl Y4mReader {
                 let uv_size = w.div_ceil(2) * h.div_ceil(2);
                 (read_plane(uv_size, "Cb"), read_plane(uv_size, "Cr"))
             }
+            // 4:2:2 halves the columns only — every luma row has its own chroma row.
+            Y4mChroma::C422 => {
+                let uv_size = w.div_ceil(2) * h;
+                (read_plane(uv_size, "Cb"), read_plane(uv_size, "Cr"))
+            }
             Y4mChroma::C444 => (read_plane(y_size, "Cb"), read_plane(y_size, "Cr")),
         };
 
@@ -224,9 +247,12 @@ impl Y4mReader {
                     }
                     Y4mChroma::C420 => {
                         let uv_w = w.div_ceil(2);
-                        let uv_row = row / 2;
-                        let uv_col = col / 2;
-                        let idx = uv_row * uv_w + uv_col;
+                        let idx = (row / 2) * uv_w + col / 2;
+                        (cb_plane[idx], cr_plane[idx])
+                    }
+                    Y4mChroma::C422 => {
+                        let uv_w = w.div_ceil(2);
+                        let idx = row * uv_w + col / 2;
                         (cb_plane[idx], cr_plane[idx])
                     }
                 };
@@ -4380,5 +4406,88 @@ survive only into a Y4M output (LOSSLESS-4)."
             // Fused mega-kernel benchmark
             experiments::transform_shootout::run_fused_benchmark(&ctx, &rgb_data, w, h, iterations);
         }
+    }
+}
+
+/// BUG-56 — the Y4M reader's chroma handling.
+///
+/// Until 2026-09-11 the format was decided by `starts_with("444")` or else 4:2:0, so **every**
+/// other format was assumed to be 4:2:0. A `C422` file has twice the chroma rows that assumption
+/// allocates: the reader consumed half of them, walked off the plane boundary, and panicked at the
+/// next frame header — while GOALS §1 headlines 10-bit 4:2:2 and the encoder has coded it for
+/// months. The codec could code 4:2:2; the tool could not read it.
+///
+/// These tests use **two-frame** files on purpose. A wrong plane size does not corrupt frame one —
+/// it desynchronises the stream, and the damage shows up as a missing second `FRAME` header. That
+/// is the shape the bug actually had, so it is the shape the guard checks.
+#[cfg(test)]
+mod y4m_tests {
+    use super::*;
+    use std::io::Write;
+
+    /// Write a synthetic two-frame Y4M with the given `C` tag and chroma plane size.
+    fn write_y4m(name: &str, tag: &str, w: usize, h: usize, uv_len: usize) -> String {
+        // Through the helper, not around it: it owns the per-process suffix that keeps concurrent
+        // sessions from sharing a temp file (BUG-36), and `tests/temp_path_collision.rs` enforces
+        // that there is exactly one place doing it. Hand-rolling the same suffix here still failed
+        // that guard, correctly — the rule is about where the knowledge lives, not the result.
+        let path = gnc::session_temp_path(&format!("gnc_bug56_{name}.y4m"));
+        let mut f = std::fs::File::create(&path).expect("create temp y4m");
+        writeln!(f, "YUV4MPEG2 W{w} H{h} F30:1 Ip A0:0 C{tag}").unwrap();
+        for frame in 0..2u8 {
+            f.write_all(b"FRAME\n").unwrap();
+            f.write_all(&vec![16 + frame; w * h]).unwrap();
+            f.write_all(&vec![100 + frame; uv_len]).unwrap();
+            f.write_all(&vec![200 + frame; uv_len]).unwrap();
+        }
+        path.to_string_lossy().into_owned()
+    }
+
+    fn reads_two_frames(path: &str) -> bool {
+        let mut r = Y4mReader::open(path);
+        let a = r.read_frame_planes().is_some();
+        let b = r.read_frame_planes().is_some();
+        let eof = r.read_frame_planes().is_none();
+        a && b && eof
+    }
+
+    #[test]
+    fn y4m_422_reads_both_frames_and_reports_422() {
+        let (w, h) = (16usize, 8usize);
+        let p = write_y4m("422", "422", w, h, w.div_ceil(2) * h);
+        let r = Y4mReader::open(&p);
+        assert_eq!(
+            r.chroma_format(),
+            gnc::ChromaFormat::Yuv422,
+            "a C422 file must be read as 4:2:2, not guessed as 4:2:0 (BUG-56)"
+        );
+        assert!(
+            reads_two_frames(&p),
+            "the 4:2:2 stream desynchronised — the chroma planes are being read at the wrong size, \
+             which is exactly how BUG-56 presented"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn y4m_420_and_444_are_unaffected() {
+        let (w, h) = (16usize, 8usize);
+        for (tag, uv, want) in [
+            ("420jpeg", w.div_ceil(2) * h.div_ceil(2), gnc::ChromaFormat::Yuv420),
+            ("444", w * h, gnc::ChromaFormat::Yuv444),
+        ] {
+            let p = write_y4m(tag, tag, w, h, uv);
+            assert_eq!(Y4mReader::open(&p).chroma_format(), want, "{tag} misread");
+            assert!(reads_two_frames(&p), "{tag} desynchronised");
+            let _ = std::fs::remove_file(&p);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "is not supported")]
+    fn an_unknown_chroma_tag_is_refused_rather_than_guessed() {
+        let (w, h) = (16usize, 8usize);
+        let p = write_y4m("mono", "mono", w, h, 0);
+        let _ = Y4mReader::open(&p);
     }
 }

@@ -1901,14 +1901,42 @@ generous ones — which is the difference between "runs in two browsers" and "po
 on macOS sit on Metal; none of them can produce the failure. It needs either a device with the
 spec-floor limits or a deliberately clamped request.
 
-### LOSSLESS-5 — the sequence encoder has nine colour-transform sites and none of them take planes (todo, **P1**)
+### LOSSLESS-5 — the sequence encoder's preprocessing is now one site instead of eleven (**step 1 DONE 2026-09-11**; the planar branch is what remains, P1)
+
+**Step 1 done, and the count in this entry was wrong.** It said nine colour-transform sites; there
+are **eleven**. The nine came from a `grep` truncated by `head -40`, repeated several times without
+being re-checked — which is exactly the class of unverified number this repository keeps retracting.
+The refactor found them all because it parsed the calls rather than matching a line.
+
+`preprocess_to_planes` now holds the two dispatches every encode path starts with. The eleven
+copies differed only in which buffer set they used, what the command encoder was called, and where
+the planes landed — never in what they did. Each replacement was checked structurally before it was
+made: argument counts, that the colour step writes where the deinterleave reads, and that both use
+the same command encoder.
+
+**Gate: byte-identical output on 32 runs** — four clips x {q=50, q=100, ki=2}, plus haar,
+no-temporal, abac and 4:2:0 arms, each with the B-pyramid on and off. Every md5 unchanged. A
+refactor that moves a byte is not a refactor, and this one moved none. 28 test suites green, both
+clippy gates clean, `sequence.rs` 23 lines shorter.
+
+**And it answered the `true` question.** One site passes `reversible = true` unconditionally where
+the others compute it. That is **correct, not a bug** — the encoder is labelled
+`local_decode_ref_from_source` and builds a bit-exact frame's reference from the source, so the
+transform must be the reversible one. The suspicion is withdrawn. It was worth raising only because
+it was indistinguishable from a typo while sitting among ten near-identical neighbours; now it is
+one argument at one call site with a comment saying why.
+
+**What remains is the actual item:** make that one site take planes. The decision that used to need
+making eleven times now needs making once.
+
+
 
 **Filed 2026-09-11 by LOSSLESS-4, which did the still path and stopped deliberately.** The 39.2%
 measured there is a *per-frame* saving on intra content and there is no reason it should not carry
 to video — but `EncoderPipeline::encode_planar` feeds `encode_once`, the still path, and video goes
 through `sequence.rs`, which does its own preprocessing.
 
-**Why it was not done in the same session.** `sequence.rs` calls `self.color.dispatch` at nine
+**Why it was not done in the same session.** `sequence.rs` called `self.color.dispatch` at eleven
 distinct sites (I/P/B, streaming and non-streaming, temporal-wavelet and not), each with its own
 buffer plumbing. ARCH-4 already has that file at **7 590 lines in one impl block** and files it as
 where the reference bugs live. Branching nine sites by hand, in one pass, on the same afternoon the

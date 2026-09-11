@@ -18722,3 +18722,39 @@ file ARCH-4 already records as 7 590 lines in one impl block and as where the re
 Branching nine sites by hand on the same afternoon the still path was verified is how a measured win
 becomes an unmeasured regression. **LOSSLESS-5**, which says to do the shared-preprocessing part of
 ARCH-4 first so the branch is written once instead of nine times and deleted eight.
+
+
+---
+
+## 2026-09-11 — LOSSLESS-5 step 1: eleven copies of the same two dispatches become one
+
+**The count in the filing was wrong, and the way it was wrong is the point.** LOSSLESS-5 said the
+sequence encoder had *nine* colour-transform sites. It had **eleven**. The nine came from a `grep`
+truncated by `head -40`, and I repeated it in a backlog entry, a commit message and three answers
+without re-deriving it. Nothing downstream depended on the number being nine — but that is luck, not
+process, and it is the same class of unverified figure this log keeps retracting.
+
+The refactor found all eleven because it **parsed** the calls instead of matching lines: locate
+`self.color.dispatch(`, balance parentheses, require `self.deinterleaver.dispatch(` next, split the
+arguments, and assert before rewriting — argument counts, that the colour step writes to the buffer
+the deinterleave reads, and that both use the same command encoder. Eleven sites, eleven passes.
+
+`preprocess_to_planes` now holds those two dispatches. The copies differed only in buffer set,
+command-encoder name, and where the planes landed.
+
+**Gate: 32 runs, every md5 unchanged.** Four clips x {q=50, q=100, ki=2}, plus haar, no-temporal,
+abac and 4:2:0 arms, each with the B-pyramid on and off — chosen to reach as many of the eleven as
+the CLI can. Captured *before* the edit, which is the only order in which the gate means anything.
+28 test suites green, both clippy gates clean, the file 23 lines shorter.
+
+**A suspicion withdrawn.** One site passed `reversible = true` unconditionally where the others
+computed it, and I raised it as "either deliberate or a latent bug". It is deliberate: the encoder is
+labelled `local_decode_ref_from_source`, and a bit-exact frame's reference is built from the source,
+so the reversible transform is the right one there. Worth having raised only because ten
+near-identical neighbours made it unreadable either way; now it is one argument with a reason
+attached.
+
+**Why this before the feature.** Branching eleven sites by hand would have meant writing the same
+decision eleven times and deleting ten. It now needs making once — and the byte-identity gate means
+any later regression in video lossless cannot be blamed on this step, because this step provably
+changed nothing.

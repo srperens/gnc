@@ -178,6 +178,49 @@ impl EncoderPipeline {
     ///
     /// When `config.target_bitrate` is set, a rate controller adjusts the
     /// quantization step per frame to hit the target bitrate (CBR or VBR).
+    /// Pad-aligned RGB in, three planes out: the two dispatches that every encode path starts
+    /// with, in one place.
+    ///
+    /// **This existed eleven times.** They differed only in which buffer set they used, what the
+    /// command encoder was called, and where the planes landed — never in what they did. Eleven
+    /// copies is why an inconsistency between them could not be seen: `local_decode_ref_from_source`
+    /// passes `reversible = true` unconditionally where the others compute it, which is correct
+    /// (a bit-exact frame's reference is built from the source, so the transform must be the
+    /// reversible one) but was indistinguishable from a typo while it sat among ten near-identical
+    /// neighbours.
+    ///
+    /// It is also what LOSSLESS-5 needs: coding a Y4M source's own Y'CbCr planes means *not*
+    /// running these two dispatches, and that decision now has one site to be made at instead of
+    /// eleven.
+    #[allow(clippy::too_many_arguments)]
+    fn preprocess_to_planes(
+        &self,
+        ctx: &GpuContext,
+        cmd: &mut wgpu::CommandEncoder,
+        input_buf: &wgpu::Buffer,
+        color_out: &wgpu::Buffer,
+        out_y: &wgpu::Buffer,
+        out_co: &wgpu::Buffer,
+        out_cg: &wgpu::Buffer,
+        padded_w: u32,
+        padded_h: u32,
+        padded_pixels: u32,
+        reversible: bool,
+    ) {
+        self.color.dispatch(
+            ctx,
+            cmd,
+            input_buf,
+            color_out,
+            padded_w,
+            padded_h,
+            true,
+            reversible,
+        );
+        self.deinterleaver
+            .dispatch(ctx, cmd, color_out, out_y, out_co, out_cg, padded_pixels);
+    }
+
     pub fn encode_sequence(
         &mut self,
         ctx: &GpuContext,
@@ -1762,24 +1805,18 @@ impl EncoderPipeline {
                             );
                             self.dispatch_gpu_pad_cached(ctx, &mut cmd, padded_w, padded_h);
                             let bufs = self.cached.as_ref().unwrap();
-                            self.color.dispatch(
+                            self.preprocess_to_planes(
                                 ctx,
                                 &mut cmd,
                                 &bufs.input_buf,
                                 &bufs.color_out,
-                                padded_w,
-                                padded_h,
-                                true,
-                                cfg.is_lossless(),
-                            );
-                            self.deinterleaver.dispatch(
-                                ctx,
-                                &mut cmd,
-                                &bufs.color_out,
                                 &bufs.plane_a,
                                 &bufs.co_plane,
                                 &bufs.cg_plane,
+                                padded_w,
+                                padded_h,
                                 padded_pixels as u32,
+                                cfg.is_lossless(),
                             );
 
                             let planes: [&wgpu::Buffer; 3] =
@@ -2000,24 +2037,18 @@ impl EncoderPipeline {
                                 });
                         self.dispatch_gpu_pad_cached(ctx, &mut cmd, padded_w, padded_h);
                         let bufs = self.cached.as_ref().unwrap();
-                        self.color.dispatch(
+                        self.preprocess_to_planes(
                             ctx,
                             &mut cmd,
                             &bufs.input_buf,
                             &bufs.color_out,
-                            padded_w,
-                            padded_h,
-                            true,
-                            cfg.is_lossless(),
-                        );
-                        self.deinterleaver.dispatch(
-                            ctx,
-                            &mut cmd,
-                            &bufs.color_out,
                             &bufs.plane_a,
                             &bufs.co_plane,
                             &bufs.cg_plane,
+                            padded_w,
+                            padded_h,
                             padded_pixels as u32,
+                            cfg.is_lossless(),
                         );
 
                         let planes: [&wgpu::Buffer; 3] =
@@ -2323,24 +2354,18 @@ impl EncoderPipeline {
                     );
                     self.dispatch_gpu_pad_cached(ctx, &mut cmd, padded_w, padded_h);
                     let bufs = self.cached.as_ref().unwrap();
-                    self.color.dispatch(
+                    self.preprocess_to_planes(
                         ctx,
                         &mut cmd,
                         &bufs.input_buf,
                         &bufs.color_out,
-                        padded_w,
-                        padded_h,
-                        true,
-                        cfg.is_lossless(),
-                    );
-                    self.deinterleaver.dispatch(
-                        ctx,
-                        &mut cmd,
-                        &bufs.color_out,
                         &bufs.plane_a,
                         &bufs.co_plane,
                         &bufs.cg_plane,
+                        padded_w,
+                        padded_h,
                         padded_pixels as u32,
+                        cfg.is_lossless(),
                     );
 
                     let planes: [&wgpu::Buffer; 3] =
@@ -2841,24 +2866,18 @@ impl EncoderPipeline {
                             padded_w,
                             padded_h,
                         );
-                        self.color.dispatch(
+                        self.preprocess_to_planes(
                             ctx,
                             &mut cmd_pre,
                             &sp_b.input_buf,
                             &sp_b.color_out,
-                            padded_w,
-                            padded_h,
-                            true,
-                            cfg.is_lossless(),
-                        );
-                        self.deinterleaver.dispatch(
-                            ctx,
-                            &mut cmd_pre,
-                            &sp_b.color_out,
                             &sp_b.plane_a,
                             &sp_b.co_plane,
                             &sp_b.cg_plane,
+                            padded_w,
+                            padded_h,
                             padded_pixels as u32,
+                            cfg.is_lossless(),
                         );
                         let planes_b: [&wgpu::Buffer; 3] =
                             [&sp_b.plane_a, &sp_b.co_plane, &sp_b.cg_plane];
@@ -3223,24 +3242,18 @@ impl EncoderPipeline {
                 });
             // Forward, reversible: the same two dispatches `encode_once` runs on this buffer, so
             // the padded region is filled exactly as the coded planes were.
-            self.color.dispatch(
+            self.preprocess_to_planes(
                 ctx,
                 &mut cmd,
                 &bufs.input_buf,
                 &bufs.color_out,
-                padded_w,
-                padded_h,
-                true,
-                true,
-            );
-            self.deinterleaver.dispatch(
-                ctx,
-                &mut cmd,
-                &bufs.color_out,
                 &bufs.gpu_ref_planes[0],
                 &bufs.gpu_ref_planes[1],
                 &bufs.gpu_ref_planes[2],
+                padded_w,
+                padded_h,
                 padded_pixels as u32,
+                true,
             );
             ctx.queue.submit(std::iter::once(cmd.finish()));
             for p in 0..3 {
@@ -3822,24 +3835,18 @@ impl EncoderPipeline {
             self.dispatch_gpu_pad_cached(ctx, &mut cmd, padded_w, padded_h);
 
             // Phase 1a/1b: Color conversion + deinterleave → plane_a/co_plane/cg_plane
-            self.color.dispatch(
+            self.preprocess_to_planes(
                 ctx,
                 &mut cmd,
                 &bufs.input_buf,
                 &bufs.color_out,
-                padded_w,
-                padded_h,
-                true,
-                config.is_lossless(),
-            );
-            self.deinterleaver.dispatch(
-                ctx,
-                &mut cmd,
-                &bufs.color_out,
                 &bufs.plane_a,
                 &bufs.co_plane,
                 &bufs.cg_plane,
+                padded_w,
+                padded_h,
                 padded_pixels as u32,
+                config.is_lossless(),
             );
         }
 
@@ -5014,24 +5021,18 @@ impl EncoderPipeline {
                             label: Some("pf_lookahead_me"),
                         });
                 self.dispatch_gpu_pad_cached(ctx, &mut me_cmd, padded_w, padded_h);
-                self.color.dispatch(
+                self.preprocess_to_planes(
                     ctx,
                     &mut me_cmd,
                     &bufs.input_buf,
                     &bufs.color_out,
-                    padded_w,
-                    padded_h,
-                    true,
-                    config.is_lossless(),
-                );
-                self.deinterleaver.dispatch(
-                    ctx,
-                    &mut me_cmd,
-                    &bufs.color_out,
                     &bufs.plane_a,
                     &bufs.co_plane,
                     &bufs.cg_plane,
+                    padded_w,
+                    padded_h,
                     padded_pixels as u32,
+                    config.is_lossless(),
                 );
                 // Pyramid ME for look-ahead: same 4-stage flow as main path.
                 let la_pyr_w = padded_w / 4;
@@ -5583,24 +5584,18 @@ impl EncoderPipeline {
             self.dispatch_gpu_pad_cached(ctx, &mut cmd, padded_w, padded_h);
 
             // Phase 1a: Color conversion + deinterleave
-            self.color.dispatch(
+            self.preprocess_to_planes(
                 ctx,
                 &mut cmd,
                 &bufs.input_buf,
                 &bufs.color_out,
-                padded_w,
-                padded_h,
-                true,
-                config.is_lossless(),
-            );
-            self.deinterleaver.dispatch(
-                ctx,
-                &mut cmd,
-                &bufs.color_out,
                 &bufs.plane_a,
                 &bufs.co_plane,
                 &bufs.cg_plane,
+                padded_w,
+                padded_h,
                 padded_pixels as u32,
+                config.is_lossless(),
             );
         }
 
@@ -6039,24 +6034,18 @@ impl EncoderPipeline {
                             label: Some("bf_lookahead_me"),
                         });
                 self.dispatch_gpu_pad_cached(ctx, &mut me_cmd, padded_w, padded_h);
-                self.color.dispatch(
+                self.preprocess_to_planes(
                     ctx,
                     &mut me_cmd,
                     &bufs.input_buf,
                     &bufs.color_out,
-                    padded_w,
-                    padded_h,
-                    true,
-                    config.is_lossless(),
-                );
-                self.deinterleaver.dispatch(
-                    ctx,
-                    &mut me_cmd,
-                    &bufs.color_out,
                     &bufs.plane_a,
                     &bufs.co_plane,
                     &bufs.cg_plane,
+                    padded_w,
+                    padded_h,
                     padded_pixels as u32,
+                    config.is_lossless(),
                 );
                 // Use current frame's MVs as temporal predictor for the look-ahead.
                 let bidir_params_la = &bufs.bidir_params_pred;
@@ -6807,24 +6796,18 @@ impl EncoderPipeline {
             });
 
         self.dispatch_gpu_pad_cached(ctx, &mut cmd, padded_w, padded_h);
-        self.color.dispatch(
+        self.preprocess_to_planes(
             ctx,
             &mut cmd,
             &bufs.input_buf,
             &bufs.color_out,
-            padded_w,
-            padded_h,
-            true,
-            config.is_lossless(),
-        );
-        self.deinterleaver.dispatch(
-            ctx,
-            &mut cmd,
-            &bufs.color_out,
             &bufs.plane_a,
             &bufs.co_plane,
             &bufs.cg_plane,
+            padded_w,
+            padded_h,
             padded_pixels as u32,
+            config.is_lossless(),
         );
 
         let weights_luma = config.subband_weights.pack_weights();
@@ -6911,24 +6894,18 @@ impl EncoderPipeline {
             });
 
         self.dispatch_gpu_pad_cached(ctx, &mut cmd, padded_w, padded_h);
-        self.color.dispatch(
+        self.preprocess_to_planes(
             ctx,
             &mut cmd,
             &bufs.input_buf,
             &bufs.color_out,
-            padded_w,
-            padded_h,
-            true,
-            config.is_lossless(),
-        );
-        self.deinterleaver.dispatch(
-            ctx,
-            &mut cmd,
-            &bufs.color_out,
             &bufs.plane_a,
             &bufs.co_plane,
             &bufs.cg_plane,
+            padded_w,
+            padded_h,
             padded_pixels as u32,
+            config.is_lossless(),
         );
 
         let planes: [&wgpu::Buffer; 3] = [&bufs.plane_a, &bufs.co_plane, &bufs.cg_plane];

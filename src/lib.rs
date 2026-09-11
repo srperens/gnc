@@ -22,6 +22,47 @@ pub enum ChromaFormat {
     Yuv420,
 }
 
+/// What the three coded planes actually are.
+///
+/// **LOSSLESS-4.** GNC's native path converts RGB to YCoCg-R, which is integer-reversible and
+/// right for RGB sources. A Y4M source is not an RGB source: the reader applies BT.601 to get RGB
+/// first, and that conversion is both lossy in principle — the matrix is not integer-invertible,
+/// so the file's own Y'CbCr samples cannot be returned — and expensive in practice. Measured
+/// 2026-09-11 over four sequences at q=100: coding the planes as they arrive costs **39.2% fewer
+/// bits** than coding the RGB they convert to (−37.0% to −43.1%, four of four), which independently
+/// matches FFV1's own +64.2% penalty for being told to code RGB instead of YUV.
+///
+/// So a planar source is coded as it arrives, and the container records which it was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ColorSpace {
+    /// Planes are YCoCg-R, produced from RGB input by the reversible forward transform.
+    #[default]
+    YCoCgR,
+    /// Planes are the source's own Y'CbCr, coded verbatim. No colour transform at either end.
+    YCbCrNative,
+}
+
+impl ColorSpace {
+    /// Byte written into the header from GP21 onwards.
+    pub fn to_byte(self) -> u8 {
+        match self {
+            ColorSpace::YCoCgR => 0,
+            ColorSpace::YCbCrNative => 1,
+        }
+    }
+
+    /// Inverse of [`to_byte`]. Anything unknown is refused rather than guessed: a wrong colour
+    /// space is a plausible wrong picture, not an error, which is the failure mode `0074` spells
+    /// out for generations and the reason this is not a boolean.
+    pub fn from_byte(b: u8) -> Option<Self> {
+        match b {
+            0 => Some(ColorSpace::YCoCgR),
+            1 => Some(ColorSpace::YCbCrNative),
+            _ => None,
+        }
+    }
+}
+
 impl ChromaFormat {
     /// Horizontal log2 scale factor for chroma (0 = no reduction, 1 = half width)
     pub fn horiz_shift(self) -> u32 {
@@ -483,6 +524,10 @@ pub struct CodecConfig {
     pub adaptive_temporal_mul: bool,
     /// Chroma subsampling format (default: Yuv444 = no subsampling).
     pub chroma_format: ChromaFormat,
+    /// What the coded planes are: YCoCg-R from RGB (default), or the source's own Y'CbCr
+    /// coded verbatim. See [`ColorSpace`] — the native path is worth 39.2% of the rate on a
+    /// Y4M source and is the only way the file's own samples survive the round trip.
+    pub color_space: ColorSpace,
     /// Bit depth of the input/output signal (8 or 10). Default: 8.
     /// Affects FrameInfo.bit_depth, PSNR normalisation, and save/load helpers.
     pub bit_depth: u32,
@@ -643,6 +688,7 @@ impl Default for CodecConfig {
             temporal_highpass_qstep_mul: 2.0,
             adaptive_temporal_mul: true,
             chroma_format: ChromaFormat::Yuv444,
+            color_space: ColorSpace::YCoCgR,
             bit_depth: 8,
             scene_cut_threshold: 50.0,
             overlap_pixels: 0,

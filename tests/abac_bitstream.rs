@@ -1,4 +1,4 @@
-//! `EntropyCoder::Abac` end to end: encode → GP19 bitstream → GPU decode.
+//! `EntropyCoder::Abac` end to end: encode → bitstream → GPU decode.
 //!
 //! The property that makes these tests strong is that entropy coding is **lossless**. Rice and
 //! abac code the identical quantised coefficients, so a frame encoded either way must decode to
@@ -121,7 +121,11 @@ fn abac_frames_are_gp19_and_carry_entropy_type_5() {
     let mut encoder = EncoderPipeline::new(ctx);
     let compressed = encoder.encode(ctx, &img, w, h, &config);
     let bytes = gnc::format::serialize_compressed(&compressed);
-    assert_eq!(&bytes[0..4], b"GP19", "abac frames must declare GP19");
+    assert_eq!(
+        &bytes[0..4],
+        gnc::format::CURRENT_MAGIC,
+        "abac frames must declare the current generation"
+    );
 
     let back = gnc::format::deserialize_compressed(&bytes);
     assert_eq!(back.config.entropy_coder, EntropyCoder::Abac);
@@ -353,13 +357,18 @@ fn abac_survives_a_p_frame_chain() {
     );
 }
 
-/// GP19's only change is *how* entropy type 5 codes its Exp-Golomb prefix, so a GP19 frame using
-/// any other coder must be a GP18 frame with a different label. Asserting that directly is worth
-/// more than believing it: relabel the magic, decode, and require the identical picture. It also
-/// exercises the other half — that the decoder still reads GP18, which is what every file written
-/// before ENT-9 says.
+/// **A generation that adds a header field must not be readable as the one before it.**
+///
+/// This test used to assert the opposite, and correctly so: GP19 changed only *how* entropy type 5
+/// binarised its Exp-Golomb prefix, added nothing to the header, and so a GP19 Rice frame relabelled
+/// GP18 decoded to the identical picture. GP21 (LOSSLESS-4) breaks that premise on purpose — it adds
+/// the colour-space byte — so the honest successor is the inverse claim.
+///
+/// Keeping the old assertion and bumping the literal would have passed only if the new byte were
+/// ungated, which is precisely the defect. BUG-51's warning is that a clean textual resolution hides
+/// a semantic clash; this is that warning arriving in a test rather than in a merge.
 #[test]
-fn gp19_rice_frames_are_gp18_payloads_with_a_new_label() {
+fn a_generation_that_adds_a_header_field_cannot_be_read_as_the_previous_one() {
     let ctx = gpu();
     let (w, h) = (256u32, 256u32);
     let img = synth_image(w, h);
@@ -369,20 +378,27 @@ fn gp19_rice_frames_are_gp18_payloads_with_a_new_label() {
     let mut encoder = EncoderPipeline::new(ctx);
     let compressed = encoder.encode(ctx, &img, w, h, &config);
     let mut bytes = gnc::format::serialize_compressed(&compressed);
-    assert_eq!(&bytes[0..4], b"GP19");
+    assert_eq!(&bytes[0..4], gnc::format::CURRENT_MAGIC);
 
     let decoder = DecoderPipeline::new(ctx);
-    let as_gp19 = decoder.decode(ctx, &gnc::format::deserialize_compressed(&bytes));
+    let correct = decoder.decode(ctx, &gnc::format::deserialize_compressed(&bytes));
 
+    // Relabel as GP18, which has no colour-space byte. Every field after it now reads one byte
+    // early. Either the parse gives up or it yields a different picture; what it must not do is
+    // agree, because agreeing would mean the byte is not actually gated on the generation.
     bytes[0..4].copy_from_slice(b"GP18");
-    let as_gp18 = decoder.decode(ctx, &gnc::format::deserialize_compressed(&bytes));
+    let misread = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        decoder.decode(ctx, &gnc::format::deserialize_compressed(&bytes))
+    }));
 
-    assert_eq!(
-        as_gp19, as_gp18,
-        "relabelling a Rice frame GP19 → GP18 changed the decode, so GP19 moved something other \
-         than the magic and abac's prefix binarisation — either the generation added a field it \
-         should not have, or the decoder gates a field on gen >= 19 that older files also carry"
-    );
+    if let Ok(picture) = misread {
+        assert_ne!(
+            correct, picture,
+            "a frame written at the current generation decoded identically when relabelled GP18, \
+             so the field that generation added is not gated on it — an older decoder would read \
+             a new file as a plausible wrong picture rather than refusing it"
+        );
+    }
 }
 
 // `inter_reconstruction_depends_on_the_encode_path` lived here and asserted that the two encode

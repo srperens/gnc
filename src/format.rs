@@ -308,6 +308,9 @@ fn serialize_frame_header(frame: &crate::CompressedFrame, out: &mut Vec<u8>) {
     out.push(u8::from(frame.config.per_subband_entropy));
     // Chroma format byte (GP13 — always written here to maintain correct byte alignment)
     out.push(frame.info.chroma_format.to_u8());
+    // Colour space byte (GP21, LOSSLESS-4). Same rule: always written, gated on read. Says
+    // whether the three planes are YCoCg-R from RGB or the source's own Y'CbCr coded verbatim.
+    out.push(frame.config.color_space.to_byte());
     // Subband weights: ll, num_detail_levels, per-level [LH, HL, HH], chroma_weight
     let sw = &frame.config.subband_weights;
     out.extend_from_slice(&sw.ll.to_le_bytes());
@@ -687,7 +690,14 @@ pub fn serialize_compressed(frame: &crate::CompressedFrame) -> Vec<u8> {
     // GP15 splits Rice k_zrl into k_zrl_nz + k_zrl_z per subband (K_STRIDE 17→25 per tile, #53).
     // GP14 adds fwd_ref_idx + bwd_ref_idx for hierarchical pyramid B-frames.
     // GP13 is GP12 + chroma_format byte.
-    out.extend_from_slice(b"GP19");
+    //
+    // GP21 adds the colour-space byte: the planes may now be the source's own Y'CbCr, coded with
+    // no colour transform at either end (LOSSLESS-4 — 39.2% fewer bits on a Y4M source, and the
+    // only way the file's own samples survive the round trip). **GP20 is deliberately skipped**:
+    // it is written on unmerged `tile1` work for the partial-border-tile padding change and
+    // claimed as `gen-20`, so taking the next free number by inspection would have produced
+    // BUG-51's collision a second time.
+    out.extend_from_slice(CURRENT_MAGIC);
     // Common header fields (includes chroma_format byte for GP13)
     serialize_frame_header(frame, &mut out);
     // Motion field — GP12 uses delta-coded varint MVs
@@ -765,6 +775,11 @@ impl TileCrcResult {
 }
 
 /// Result of deserializing a GP11 frame with CRC validation.
+/// The magic `serialize_compressed` stamps. Single source of truth: `tests/bitstream_generation.rs`
+/// asserts it is the newest entry in the table below, and tests assert against this rather than a
+/// literal so that a bump touches one place instead of five.
+pub const CURRENT_MAGIC: &[u8; 4] = b"GP21";
+
 #[derive(Debug, Clone)]
 pub struct DeserializeResult {
     pub frame: crate::CompressedFrame,
@@ -978,7 +993,8 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
         // GP19: abac context-codes the Exp-Golomb unary prefix (ENT-9 candidate A). Only type 5
         // moved; every other coder is byte-identical to GP18.
         b"GP19" => 19,
-        _ => panic!("Invalid magic (expected GPC8..GP19; older files must be re-encoded)"),
+        b"GP21" => 21,
+        _ => panic!("Invalid magic (expected GPC8..GP21; older files must be re-encoded)"),
     };
 
     // --- Common header (same layout for GPC9/GP10/GP11; GPC8 lacks per-subband flag) ---
@@ -1017,6 +1033,21 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
         cf
     } else {
         crate::ChromaFormat::Yuv444
+    };
+
+    // Colour space byte (GP21; every older generation converted from RGB, so YCoCg-R is not a
+    // guess for them — it is the only thing they could have been). An unknown value is refused
+    // rather than defaulted: the planes would decode to a plausible wrong picture, which is the
+    // failure mode `0074` spells out.
+    let color_space_decoded = if gen >= 21 {
+        let byte = data[pos];
+        let cs = crate::ColorSpace::from_byte(byte).unwrap_or_else(|| {
+            panic!("Unknown colour space byte {byte} at offset {pos} in a GP{gen} frame")
+        });
+        pos += 1;
+        cs
+    } else {
+        crate::ColorSpace::YCoCgR
     };
 
     // --- Subband weights ---
@@ -1374,6 +1405,7 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
                 chroma_format: chroma_format_decoded,
             },
             config: crate::CodecConfig {
+                color_space: color_space_decoded,
                 tile_size,
                 quantization_step: qstep,
                 dead_zone,

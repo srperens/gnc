@@ -86,13 +86,33 @@ fn the_magic_written_is_the_newest_generation_in_the_table() {
         .max_by_key(|(_, gen)| *gen)
         .expect("the generation table is not empty");
 
-    // What `serialize_compressed` actually stamps on a frame.
-    let written = src
+    // What `serialize_compressed` actually stamps on a frame. Since GP21 the writer names the
+    // `CURRENT_MAGIC` constant rather than a literal, so this follows the indirection — and
+    // checks *both* links, which is stronger than the literal scan it replaced: the writer must
+    // reference the constant, and the constant must hold the newest generation. An earlier
+    // version looked only for `out.extend_from_slice(b"GP..` and went blind the moment the
+    // literal moved, which is a guard that reports success because it stopped looking.
+    let written = if let Some(m) = src
         .lines()
         .filter_map(|l| l.trim().strip_prefix("out.extend_from_slice(b\""))
         .filter_map(|r| r.split_once('"').map(|(m, _)| m))
         .find(|m| m.starts_with("GP"))
-        .expect("serialize_compressed writes a GP magic");
+    {
+        m
+    } else {
+        assert!(
+            src.contains("out.extend_from_slice(CURRENT_MAGIC)"),
+            "serialize_compressed stamps neither a GP literal nor CURRENT_MAGIC — this guard \
+             cannot see what generation is being written, so it is not guarding anything"
+        );
+        src.lines()
+            .find_map(|l| {
+                l.trim()
+                    .strip_prefix("pub const CURRENT_MAGIC: &[u8; 4] = b\"")
+                    .and_then(|r| r.split_once('"').map(|(m, _)| m))
+            })
+            .expect("CURRENT_MAGIC is defined with a b\"GPnn\" literal")
+    };
 
     assert_eq!(
         written, newest.0,

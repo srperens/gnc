@@ -127,7 +127,11 @@ fn conformance_gradient_q25() {
 
     // Verify GP19 magic. GP19 changed only how entropy type 5 (abac) codes its Exp-Golomb
     // prefix, so a Rice frame's payload is unchanged from GP18 — only these four bytes moved.
-    assert_eq!(&serialized[0..4], b"GP19", "Expected GP19 magic");
+    assert_eq!(
+        &serialized[0..4],
+        gnc::format::CURRENT_MAGIC,
+        "Expected the current generation magic"
+    );
 
     // Verify decode is deterministic (re-decode)
     let ctx = gpu();
@@ -322,7 +326,7 @@ fn conformance_lossless_q100() {
     );
 
     // Verify GP19 magic — see the note in conformance_gradient_q25.
-    assert_eq!(&serialized[0..4], b"GP19");
+    assert_eq!(&serialized[0..4], gnc::format::CURRENT_MAGIC);
 
     // Verify bit-exact round-trip
     let ctx = gpu();

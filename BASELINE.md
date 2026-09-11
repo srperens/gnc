@@ -288,24 +288,26 @@ column on the right is.
 
 | sequence (4:2:0) | ki | native | RGB, same format | delta | frames |
 |---|---|---|---|---|---|
-| bbb (animation) | 8 | **11 863 639** | 13 949 160 | −14.95% | 1I+7P |
+| bbb (animation) | 8 | **11 871 842** | 13 949 160 | −14.89% | 1I+7P |
 | blue_sky | 8 | **10 378 585** | 12 177 781 | −14.77% | 8I |
 | crowd_run | 8 | **16 679 183** | 18 596 938 | −10.31% | 8I |
 | old_town_cross | 8 | **15 952 107** | 17 940 092 | −11.08% | 8I |
-| **sum** | 8 | **54 873 514** | 62 663 971 | **−12.43%** | |
-| bbb | 2 | **12 280 971** | 14 749 351 | −16.74% | 4I+4P |
-| **sum** | 2 | **55 290 846** | 63 464 162 | **−12.88%** | |
+| **sum** | 8 | **54 881 717** | 62 663 971 | **−12.42%** | |
+| bbb | 2 | **12 291 502** | 14 749 351 | −16.66% | 4I+4P |
+| **sum** | 2 | **55 301 377** | 63 464 162 | **−12.86%** | |
 
 The camera rows are identical at ki=2 and ki=8 for the same reason the 4:4:4 rows above are: a
 lossless P-frame that costs more than an I-frame is re-coded (`0070`), so camera content converges
 to all-intra.
 
-**Every frame is bit-exact against the source's own Y'CbCr except one** — `bbb.y4m` frame 2, which
-is **BUG-57** and reproduces at 4:4:4 and 4:2:2 as well. The RGB arm is not bit-exact against the
-source at all in any of these rows, which is the point of the section rather than a caveat.
+**Every frame is bit-exact against the source's own Y'CbCr.** The one exception on the day this
+section was written — `bbb.y4m` frame 2 — was BUG-57, fixed the same afternoon (`0084`); the bbb
+rows above are the post-fix figures and are **+0.069% / +0.086%** on what that entry first recorded.
+The RGB arm is not bit-exact against the source at all in any of these rows, which is the point of
+the section rather than a caveat.
 
-bbb converted to its other two formats, same comparison: 4:2:2 **13 440 827** against 16 978 198,
-4:4:4 **17 773 215** against 24 084 895. Both deltas are larger than −13% because the RGB arm codes
+bbb converted to its other two formats, same comparison: 4:2:2 **13 448 505** against 16 978 198,
+4:4:4 **17 789 345** against 24 084 895. Both deltas are larger than −13% because the RGB arm codes
 those all-intra, so they mix a colour-space change with a frame-type one; the 4:2:0 table is the
 clean one.
 

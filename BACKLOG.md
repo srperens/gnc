@@ -2121,18 +2121,37 @@ chroma format. The −40.6% is the 4:4:4-against-4:2:0 comparison the correction
 withdrew; the spike's own bias, priced honestly here in advance, turned out to be the smaller of
 the two errors in it.
 
-**Success criterion** (met, with one exception): `benchmark-sequence -i <clip>.y4m -q 100` is
-bit-exact against the source's own Y'CbCr on ≥3 clips, and smaller than the same clip through the
-RGB path. Three of four clips are exact on every frame; `bbb.y4m` is exact on 7 frames of 8 and
-its remaining frame is **BUG-57**, which is not a colour-space defect and reproduces in all three
-chroma formats.
+**Success criterion — met in full.** `benchmark-sequence -i <clip>.y4m -q 100` is bit-exact
+against the source's own Y'CbCr and smaller than the same clip through the RGB path. Four clips of
+four, every frame, in 4:2:0, 4:2:2 and 4:4:4, at ki=2 and ki=8. The one exception this line
+recorded on the day — `bbb.y4m` frame 2 — was **BUG-57**, fixed the same afternoon (`0084`), and it
+was not a colour-space defect: it was the tile-skip pass deleting a border tile's residual.
 
 **Also still open from LOSSLESS-4:** a native 4:2:0 file decodes to *full-resolution* Y'CbCr,
 because the decoder still nearest-neighbour upsamples chroma before interleaving. The coded planes
 are exact; the output is a presentation choice. Planar output at native resolution needs a Y4M
 writer path, and is what makes "the user gets their samples back" true for 4:2:0 as well as 4:4:4.
 
-### BUG-57 — one lossless P-frame in eight is inexact in the corner tile, and only at tile_size 256 (todo, P2)
+### BUG-57 — the bit-exact rung was deleting a tile's residual (**FIXED 2026-09-11**, `0084`)
+
+> **FIXED.** `tile_skip_motion` declares a tile static when its **mean** per-pixel zero-MV SAD is
+> under `qstep/2` and the encoder then zeroes that tile's quantised coefficients — a rate/quality
+> trade, running at the rung that has no quality to trade. **A border tile's mean is a lie in
+> proportion to its padding:** at 1080p with `tile_size=256` the bottom-right tile is 128x56 of
+> picture inside 256x256, so **89% of the mean is padding** with a SAD of exactly zero, the mean
+> falls under the threshold, and the real 11% that still differs by ±1 is deleted with it.
+> `GNC_SKIP_DIAG=1` read `skip_tiles=1/40` on frame 2 and `0/40` on its neighbours.
+>
+> Coefficients are no longer zeroed when `config.is_lossless()`; the zero-MV forcing stays, because
+> removing it too is **rate-neutral** (six points, −0.009% to +0.011%, sign varying). After:
+> **every frame of every clip in every chroma format at both keyframe intervals is bit-exact**, at
+> a cost of **+0.057% to +0.108%** and only on bbb — the camera clips code all-intra at q=100
+> anyway. The RGB/PNG path is byte-identical over 144 runs, q=100 included.
+>
+> The narrowing is in RESEARCH_LOG and is worth reading as method: five experiments ruled out the
+> tile content, the entropy coder, the transform, reference drift and the motion field before
+> anything was changed. `tests/lossless_tile_skip.rs` is the guard.
+
 
 Found by LOSSLESS-5, once the native colour space made a sequence exact enough for one frame to
 stand out. It is not a LOSSLESS-5 defect: nothing that item changed is in the region.

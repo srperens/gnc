@@ -204,13 +204,17 @@ impl CachedBuffers {
         let ycocg_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("dec_ycocg"),
             size: buf_size_3,
-            usage: wgpu::BufferUsages::STORAGE,
+            // COPY_SRC since GP21: a Y'CbCr-native frame has no inverse colour transform to run,
+            // so the interleaved planes are copied straight to the output buffer instead.
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
         let rgb_out_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("dec_rgb_out"),
             size: buf_size_3,
-            usage: wgpu::BufferUsages::STORAGE,
+            // COPY_DST since GP21: the Y'CbCr-native path copies the interleaved planes in here
+            // instead of running an inverse colour transform that has nothing to invert.
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let cropped_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {

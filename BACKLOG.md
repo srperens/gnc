@@ -1989,6 +1989,38 @@ spec-floor limits or a deliberately clamped request.
 
 ### LOSSLESS-5 — the sequence encoder's preprocessing is now one site instead of eleven (**step 1 DONE 2026-09-11**; the planar branch is what remains, P1)
 
+> **CORRECTION, 2026-09-11 — the headline number was two changes added together.**
+>
+> Both the −39.2% (stills) and the −40.6% (video) compared the planar path against an RGB encode
+> at **4:4:4**, from a **4:2:0** source. That baseline upsamples chroma to full resolution first,
+> which nobody would do. The comparison therefore contained the colour-space change *and* a
+> chroma-format change, and credited both to the colour space.
+>
+> Decomposed on the same 8-frame clips at q=100, with the missing middle arm measured:
+>
+> | | RGB 4:4:4 | RGB 4:2:0 | native planar | format | colour space |
+> |---|---|---|---|---|---|
+> | bbb | 21 600 670 | 14 037 096 | 11 638 621 | −35.0% | −17.1% |
+> | blue_sky | 18 234 795 | 12 177 977 | 10 306 794 | −33.2% | −15.4% |
+> | crowd_run | 26 381 563 | 18 597 134 | 16 634 584 | −29.5% | −10.6% |
+> | old_town_cross | 25 538 510 | 17 940 288 | 15 906 563 | −29.8% | −11.3% |
+> | **mean** | 91 755 538 | 62 752 495 | 54 486 562 | **−31.6%** | **−13.2%** |
+>
+> **FFV1 decomposes the same way**, which is the independent check: on the same 8 frames,
+> `yuv420p` 10 056 857 → `yuv444p` 13 648 989 → `gbrp` 16 515 377. So the "+64.2% penalty for
+> coding RGB" published here was **+35.7% chroma format and +21.0% colour space**, not 64.2% of
+> colour conversion.
+>
+> **So the colour-space prize is ~13%, not ~39%.** It is still worth having — larger than closing
+> the entropy gap to FFV1 entirely (8.1%) — and the correctness half is untouched: a Y'CbCr source
+> getting its own samples back does not depend on the size of the rate win. But the case is a third
+> of what was claimed, and every figure above that says otherwise is superseded by this block.
+>
+> The shipped behaviour is not affected. `gnc encode` on a Y4M now uses the file's own chroma
+> format *and* its own colour space, and both are improvements over the previous state, which was
+> that it could not read Y4M at all. What was wrong was the attribution, not the code.
+
+
 **Step 1 done, and the count in this entry was wrong.** It said nine colour-transform sites; there
 are **eleven**. The nine came from a `grep` truncated by `head -40`, repeated several times without
 being re-checked — which is exactly the class of unverified number this repository keeps retracting.
@@ -2069,7 +2101,39 @@ because the decoder still nearest-neighbour upsamples chroma before interleaving
 are exact; the output is a presentation choice. Planar output at native resolution needs a Y4M
 writer path, and is what makes "the user gets their samples back" true for 4:2:0 as well as 4:4:4.
 
-### LOSSLESS-4 — the RGB conversion costs 39.2% of the lossless rate (**stills DONE 2026-09-11**, `GP21`; video is LOSSLESS-5)
+### LOSSLESS-4 — the colour conversion costs ~13% of the lossless rate (headline corrected 2026-09-11) (**stills DONE 2026-09-11**, `GP21`; video is LOSSLESS-5)
+
+> **CORRECTION, 2026-09-11 — the headline number was two changes added together.**
+>
+> Both the −39.2% (stills) and the −40.6% (video) compared the planar path against an RGB encode
+> at **4:4:4**, from a **4:2:0** source. That baseline upsamples chroma to full resolution first,
+> which nobody would do. The comparison therefore contained the colour-space change *and* a
+> chroma-format change, and credited both to the colour space.
+>
+> Decomposed on the same 8-frame clips at q=100, with the missing middle arm measured:
+>
+> | | RGB 4:4:4 | RGB 4:2:0 | native planar | format | colour space |
+> |---|---|---|---|---|---|
+> | bbb | 21 600 670 | 14 037 096 | 11 638 621 | −35.0% | −17.1% |
+> | blue_sky | 18 234 795 | 12 177 977 | 10 306 794 | −33.2% | −15.4% |
+> | crowd_run | 26 381 563 | 18 597 134 | 16 634 584 | −29.5% | −10.6% |
+> | old_town_cross | 25 538 510 | 17 940 288 | 15 906 563 | −29.8% | −11.3% |
+> | **mean** | 91 755 538 | 62 752 495 | 54 486 562 | **−31.6%** | **−13.2%** |
+>
+> **FFV1 decomposes the same way**, which is the independent check: on the same 8 frames,
+> `yuv420p` 10 056 857 → `yuv444p` 13 648 989 → `gbrp` 16 515 377. So the "+64.2% penalty for
+> coding RGB" published here was **+35.7% chroma format and +21.0% colour space**, not 64.2% of
+> colour conversion.
+>
+> **So the colour-space prize is ~13%, not ~39%.** It is still worth having — larger than closing
+> the entropy gap to FFV1 entirely (8.1%) — and the correctness half is untouched: a Y'CbCr source
+> getting its own samples back does not depend on the size of the rate win. But the case is a third
+> of what was claimed, and every figure above that says otherwise is superseded by this block.
+>
+> The shipped behaviour is not affected. `gnc encode` on a Y4M now uses the file's own chroma
+> format *and* its own colour space, and both are improvements over the previous state, which was
+> that it could not read Y4M at all. What was wrong was the attribution, not the code.
+
 
 **DONE for the still path, 2026-09-11.** `gnc encode -i <file>.y4m` now codes the file's own Y'CbCr
 planes: no BT.601 conversion, no YCoCg-R transform, no chroma resample. Measured end to end through

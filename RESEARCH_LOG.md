@@ -18758,3 +18758,50 @@ attached.
 decision eleven times and deleting ten. It now needs making once — and the byte-identity gate means
 any later regression in video lossless cannot be blamed on this step, because this step provably
 changed nothing.
+
+
+---
+
+## 2026-09-11 — The −39%/−40% headline was two changes added together; the colour space is worth ~13%
+
+**Caught before building on it, and it is the third number of mine to need correcting today.**
+
+Both LOSSLESS-4's −39.2% (stills) and LOSSLESS-5's −40.6% (video) compared the native planar path
+against an RGB encode at **4:4:4** — from a **4:2:0** source. That baseline upsamples chroma to full
+resolution before coding it, which no one would do. The comparison therefore contained a
+chroma-format change as well as a colour-space change, and credited all of it to the colour space.
+
+The missing middle arm, measured on the same 8-frame clips at q=100:
+
+| | RGB 4:4:4 | RGB 4:2:0 | native planar | format | colour space |
+|---|---|---|---|---|---|
+| bbb | 21 600 670 | 14 037 096 | 11 638 621 | −35.0% | −17.1% |
+| blue_sky | 18 234 795 | 12 177 977 | 10 306 794 | −33.2% | −15.4% |
+| crowd_run | 26 381 563 | 18 597 134 | 16 634 584 | −29.5% | −10.6% |
+| old_town_cross | 25 538 510 | 17 940 288 | 15 906 563 | −29.8% | −11.3% |
+| **mean** | 91 755 538 | 62 752 495 | 54 486 562 | **−31.6%** | **−13.2%** |
+
+**FFV1 decomposes identically**, which is what turns this from an argument into a measurement: same
+8 frames, `yuv420p` 10 056 857 → `yuv444p` 13 648 989 → `gbrp` 16 515 377. The "+64.2% penalty for
+being told to code RGB" published here yesterday is **+35.7% chroma format and +21.0% colour
+space**. The colour conversion costs a fifth, not two thirds.
+
+### What survives
+
+**The colour-space prize is ~13%.** Still worth building — it is larger than closing the entropy
+gap to FFV1 entirely (8.1%) — and the correctness half does not depend on the rate at all: a
+Y'CbCr source getting its own samples back is either true or it is not. The shipped code is
+unaffected; `gnc encode` on a Y4M uses the file's own chroma format *and* colour space, both
+improvements on not being able to read Y4M at all. **What was wrong was the attribution.**
+
+### The pattern, which is worth more than the correction
+
+Three of my own figures needed correcting today: a +64.2% *cost* compared against a +8.8% *cost* as
+though they shared a denominator; "nine" preprocessing sites that were eleven, from a `grep`
+truncated by `head`; and now a headline that was two effects summed. None was caught by a test,
+because none of them was a bug in the codec — they were bugs in the comparison. **The measurements
+were being produced faster than they were being controlled.**
+
+The specific habit that would have caught all three: *before quoting a delta, name what the other
+arm is and why it is the right one.* The 4:4:4 baseline fails that question immediately — nobody
+codes a 4:2:0 source at 4:4:4, so it was never the arm to beat.

@@ -4,6 +4,100 @@
 
 ---
 
+## BUG-57 — the bit-exact rung was deleting a tile's residual, and a border tile's mean is 89% padding (2026-09-11)
+
+**Filed by LOSSLESS-5 the same afternoon**, once a Y4M sequence was exact enough end to end for one
+frame in eight to stand out: `bbb.y4m` at q=100 read **75.31 dB** on frame 2 while every other
+frame read `inf`.
+
+### The narrowing, which took five experiments and no guessing
+
+| experiment | result | what it ruled out |
+|---|---|---|
+| error extent | `x 1792..1919, y 1024..1079`, 3 606 samples, max 10 | it is **one tile**, the bottom-right, and its whole visible part |
+| `--tile-size 128` | exact | the tile **grid**, not the content |
+| Rice / abac x GPU / CPU entropy x MED / wavelet | **identical** error, same 3 606, same max 10 | the entropy coder and the transform |
+| encoder reference vs decoder reference, whole padded plane | identical, all three planes, padding included | reference drift |
+| coded MVs vs the encoder's raw i32 MVs, all 40 960 | identical | the motion field and its i32→i16 serialisation |
+
+That left the residual. Dumping the numbers for ten failing pixels settled it in one line: MV
+`(0,0)`, prediction equal to the reference and **correct**, `resid_enc = 1`, `resid_dec = 0`. The
+encoder coded a residual the decoder never saw.
+
+### The cause
+
+`tile_skip_motion.wgsl` declares a tile static when its **mean** per-pixel zero-MV SAD is under
+`qstep/2` and no worse than the motion-compensated error, and the encoder then zeroes that tile's
+quantised coefficients — the decoder reconstructs it from prediction alone. A rate/quality trade,
+running at the rung that has no quality to trade.
+
+**A border tile's mean is a lie in proportion to its padding.** The tile grid pads 1080 up to 1280,
+so at `tile_size=256` the bottom-right tile is 128x56 of picture inside 256x256 — **89% padding**,
+which replicates the picture's edge, is identical frame to frame, and contributes a SAD of exactly
+zero. The mean is diluted ~9x, falls under 0.5, and the real 11% that still differs by ±1 is
+deleted with it. `GNC_SKIP_DIAG=1` on the unfixed encoder: `skip_tiles=1/40` on frame 2, `0/40` on
+its neighbours. At `--tile-size 128` the same corner is 56 of 128 rows and clears the threshold.
+
+**Why nothing caught it.** At q=100 the encoder's reference is the source
+(`reference_from_source`), so the error never enters the next frame and never shows as drift —
+frame 3 was exact again. And before LOSSLESS-5 no Y4M encode was bit-exact end to end, so one
+slightly wrong frame had nothing to stand out against. BASELINE's PNG-sourced lossless rows were
+honest for a duller reason: on that content the corner tile never falls under the threshold.
+
+### The fix, and the alternative that was measured and refused
+
+Do not zero coefficients when `config.is_lossless()`. `GNC_TILE_SKIP_THRESH` is refused there too,
+with a canary. Decision record `0084`.
+
+**Turning the whole pass off at lossless was the tidier statement and is rate-neutral, so it was
+not taken.** The MV forcing's stated purpose is to make the residual small *so the quantiser zeroes
+it*, and at step 1.0 the quantiser zeroes nothing — the mechanism is gone even though the code
+runs. But measured on six points (bbb at 4:2:0 / 4:2:2 / 4:4:4, ki=8 and ki=2, 8 frames) the
+difference is **−0.009%, −0.005%, +0.011%, +0.006%, −0.004%, +0.000%** — sign varying, every figure
+under 0.011%. Nothing to collect, so the diff stays at the one line that is wrong.
+
+### After
+
+**Every frame of every clip, in every chroma format, at both keyframe intervals, is bit-exact** —
+which is LOSSLESS-5's success criterion with no exception left in it:
+
+| clip | format | ki=8 | ki=2 | frames |
+|---|---|---|---|---|
+| bbb | 4:2:0 | 11 871 842 | 12 291 502 | 1I+7P / 4I+4P |
+| blue_sky | 4:2:0 | 10 378 585 | 10 378 585 | 8I |
+| crowd_run | 4:2:0 | 16 679 183 | 16 679 183 | 8I |
+| old_town_cross | 4:2:0 | 15 952 107 | 15 952 107 | 8I |
+| bbb | 4:2:2 | 13 448 505 | 13 975 917 | 1I+7P / 4I+4P |
+| bbb | 4:4:4 | 17 789 345 | 17 977 284 | 1I+7P / 4I+4P |
+
+Cost: **+0.057% to +0.108%**, and only on bbb — the three camera clips code all-intra at q=100
+(`0070`) and are byte-identical.
+
+**The RGB / PNG path does not move at all.** 144 `encode-sequence` runs md5'd against the pre-fix
+binary — four clips x {q=50, 75, 100} x {4:4:4, 4:2:0, 4:2:2} x {Rice, abac} x {ki=2, ki=9} —
+**byte-identical, q=100 included**.
+
+### Two things about the regression test, because both were got wrong first
+
+`tests/lossless_tile_skip.rs` reproduces the geometry at 320x300 (padded 512x512, so the corner
+tile is 4.3% picture) and fails against the unfixed encoder with *2 709 samples wrong over
+x 256..318, y 256..298*. Getting it to fail took two corrections, and each is a fact about the
+mechanism:
+
+1. **The change must stop before the last row and column.** Padding replicates the picture's edge,
+   so an edge that moves makes the padding move with it and the tile's mean stops being a lie.
+2. **The change must be one no motion vector can predict.** The first version alternated a
+   checkerboard, `(i + j + f) % 2` — which is the previous frame shifted one pixel, so the search
+   found it, `mean_mc` collapsed, and the shader's second condition correctly refused the skip. A
+   uniform per-frame offset over the interior is invisible to the search.
+
+**And the instrument had the same defect as the code.** `GNC_SKIP_DIAG`'s buffer copy sat *inside*
+the block the fix gates, so with the zeroing off it copied nothing and the readback reported a
+stale `skip_tiles=0` — on the real clip, after the fix, while the diagnosis was being written. It
+now reports what the pass decided either way, and says when the coefficients were kept.
+
+---
+
 ## LOSSLESS-5 — a Y'CbCr sequence codes as itself, and the chroma motion vectors were half-pel all along (2026-09-11)
 
 **What was open.** LOSSLESS-4 gave the still path a native Y'CbCr arm; the sequence path did not

@@ -4404,8 +4404,23 @@ impl EncoderPipeline {
         // catches tiles that are *static*; this catches tiles that are merely
         // well-predicted, which on a pure pan is the whole frame. Off by default
         // (GNC_TILE_SKIP_THRESH); see RESEARCH_LOG 2026-09-05.
+        // Refused at `q=100` for BUG-57's reason: it deletes coefficients, and the bit-exact
+        // rung has no quality to trade for the bits. It is off by default, so this only catches
+        // someone measuring with `GNC_TILE_SKIP_THRESH` at a lossless q.
         let p_skip_thr = tile_skip_threshold(config.quantization_step);
-        if matches!(entropy_mode, EntropyMode::Rice) && p_skip_thr > 0.0 {
+        if p_skip_thr > 0.0 && config.is_lossless() {
+            static LOSSLESS_SKIP_REFUSED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            LOSSLESS_SKIP_REFUSED.get_or_init(|| {
+                eprintln!(
+                    "GNC: GNC_TILE_SKIP_THRESH ignored at q=100 — coefficient-domain tile skip \
+                     deletes residual, which a bit-exact encode cannot do (BUG-57)."
+                );
+            });
+        }
+        if matches!(entropy_mode, EntropyMode::Rice)
+            && p_skip_thr > 0.0
+            && !config.is_lossless()
+        {
             self.dispatch_tile_skip(
                 ctx,
                 &mut cmd,
@@ -4450,7 +4465,27 @@ impl EncoderPipeline {
         // different tile grid than the luma skip map. To stay correct and simple, only
         // zero luma (recon_y) for non-444. Chroma gains are secondary and zeroing chroma
         // tiles at different tile granularity requires a separate map; defer to future work.
-        {
+        //
+        // **BUG-57: not at `q=100`.** Zeroing a tile's coefficients throws its residual away,
+        // which is a rate/quality trade and there is no quality to trade at the bit-exact rung.
+        // The tile that exposed it is the bottom-right corner at 1080p with `tile_size=256`: it
+        // is 128x56 of picture inside a 256x256 tile, so **89% of the mean this threshold takes
+        // is padding**, identical between frames and contributing a SAD of exactly zero. The
+        // mean falls under `qstep/2` while the real 11% still differs by +/-1, the tile is
+        // declared static, and its residual is deleted. Measured on `bbb.y4m` q=100 4:2:0: frame
+        // 2 decoded at **75.31 dB**, 3 606 luma samples wrong across exactly x 1792..1919,
+        // y 1024..1079, max error 10 — and `--tile-size 128` made it vanish, because at that size
+        // the same corner is 56 of 128 rows rather than 56 of 256 and clears the threshold.
+        //
+        // It survived because nothing could see it: the encoder's own reference at `q=100` is the
+        // *source* (`reference_from_source`), so the error never propagates into the next frame
+        // and never shows up as drift, and no Y4M encode was bit-exact end to end before
+        // LOSSLESS-5 for it to stand out against.
+        //
+        // **The MV forcing above stays on.** Setting a static tile's vectors to zero is exact —
+        // the residual is then coded against the same-position prediction — and it is what makes
+        // those tiles cheap in the first place. Only the deletion is the lossy half.
+        if !config.is_lossless() {
             // Always zero luma coefficients for skip tiles.
             self.dispatch_zero_skip_tiles_by_map(
                 ctx,
@@ -4482,19 +4517,24 @@ impl EncoderPipeline {
                     config.tile_size,
                 );
             }
+        }
 
-            // GNC_SKIP_DIAG: copy tile skip map to staging for CPU readback after submit.
-            if std::env::var_os("GNC_SKIP_DIAG").is_some() {
-                let map_count = bufs.tile_skip_map_count;
-                let map_bytes = (map_count as u64) * 4;
-                cmd.copy_buffer_to_buffer(
-                    &bufs.tile_skip_map_buf,
-                    0,
-                    &bufs.tile_skip_map_staging,
-                    0,
-                    map_bytes,
-                );
-            }
+        // GNC_SKIP_DIAG: copy tile skip map to staging for CPU readback after submit.
+        //
+        // **Outside the gate above on purpose.** The map records what the skip pass *decided*,
+        // which is a fact about the frame either way; leaving the copy inside meant that with the
+        // zeroing off the readback found a stale buffer and reported `skip_tiles=0`. That is how
+        // BUG-57's own instrument nearly talked me out of the diagnosis after the fix was in.
+        if std::env::var_os("GNC_SKIP_DIAG").is_some() {
+            let map_count = bufs.tile_skip_map_count;
+            let map_bytes = (map_count as u64) * 4;
+            cmd.copy_buffer_to_buffer(
+                &bufs.tile_skip_map_buf,
+                0,
+                &bufs.tile_skip_map_staging,
+                0,
+                map_bytes,
+            );
         }
 
         // Profiling: flush forward phase to measure GPU time
@@ -4981,12 +5021,17 @@ impl EncoderPipeline {
             let tiles_x = padded_w / config.tile_size;
             let tiles_y = padded_h / config.tile_size;
             eprintln!(
-                "[skip_diag] P-frame: skip_tiles={}/{} ({}×{} tile grid, threshold={:.2})",
+                "[skip_diag] P-frame: skip_tiles={}/{} ({}×{} tile grid, threshold={:.2}){}",
                 skip_count,
                 map_count,
                 tiles_x,
                 tiles_y,
                 tile_skip_motion_threshold(config.quantization_step),
+                if config.is_lossless() {
+                    " -- coefficients NOT zeroed: bit-exact encode (BUG-57)"
+                } else {
+                    ""
+                },
             );
         }
 

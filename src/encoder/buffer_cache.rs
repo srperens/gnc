@@ -704,6 +704,8 @@ impl CachedEncodeBuffers {
                 padded_h,
                 true,
                 ME_BLOCK_SIZE,
+                orig_w,
+                orig_h,
             ),
             mc_bidir_inv_params: Self::make_mc_params_bs(
                 ctx,
@@ -711,6 +713,8 @@ impl CachedEncodeBuffers {
                 padded_h,
                 false,
                 ME_BLOCK_SIZE,
+                orig_w,
+                orig_h,
             ),
             mc_fwd_params_8: Self::make_mc_params_bs(
                 ctx,
@@ -718,6 +722,8 @@ impl CachedEncodeBuffers {
                 padded_h,
                 true,
                 ME_SPLIT_BLOCK_SIZE,
+                orig_w,
+                orig_h,
             ),
             mc_inv_params_8: Self::make_mc_params_bs(
                 ctx,
@@ -725,6 +731,8 @@ impl CachedEncodeBuffers {
                 padded_h,
                 false,
                 ME_SPLIT_BLOCK_SIZE,
+                orig_w,
+                orig_h,
             ),
 
             // 4:2:0 chroma MC params. The chroma plane is padded to a tile multiple
@@ -739,6 +747,10 @@ impl CachedEncodeBuffers {
                 ME_SPLIT_BLOCK_SIZE / 2,
                 padded_w / ME_SPLIT_BLOCK_SIZE,
                 padded_h / ME_SPLIT_BLOCK_SIZE,
+                // 4:2:0 visible chroma extent, rounded up: an odd picture dimension still has a
+                // chroma sample covering the last column or row.
+                orig_w.div_ceil(2),
+                orig_h.div_ceil(2),
             ),
             mc_inv_params_chroma420: Self::make_mc_params_bs_mv(
                 ctx,
@@ -748,6 +760,8 @@ impl CachedEncodeBuffers {
                 ME_SPLIT_BLOCK_SIZE / 2,
                 padded_w / ME_SPLIT_BLOCK_SIZE,
                 padded_h / ME_SPLIT_BLOCK_SIZE,
+                orig_w.div_ceil(2),
+                orig_h.div_ceil(2),
             ),
 
             mv_chroma_buf: {
@@ -1059,6 +1073,9 @@ impl CachedEncodeBuffers {
         padded_h: u32,
         forward: bool,
         block_size: u32,
+        // PAD-2: this plane's visible extent, before tile padding.
+        visible_w: u32,
+        visible_h: u32,
     ) -> wgpu::Buffer {
         Self::make_mc_params_bs_mv(
             ctx,
@@ -1068,6 +1085,8 @@ impl CachedEncodeBuffers {
             block_size,
             padded_w / block_size,
             padded_h / block_size,
+            visible_w,
+            visible_h,
         )
     }
 
@@ -1083,9 +1102,16 @@ impl CachedEncodeBuffers {
         block_size: u32,
         mv_blocks_x: u32,
         mv_blocks_y: u32,
+        // PAD-2: this plane's visible extent, before tile padding.
+        visible_w: u32,
+        visible_h: u32,
     ) -> wgpu::Buffer {
         #[repr(C)]
         #[derive(Copy, Clone, Pod, Zeroable)]
+        // Layout must match `MotionCompensateParams` in `motion.rs` and `Params` in
+        // `motion_compensate.wgsl`. Three copies of one struct is a standing hazard; the two
+        // shaders that read only its first half make it worse, so any field added here is added
+        // in all three.
         struct MotionCompensateParams {
             width: u32,
             height: u32,
@@ -1095,7 +1121,13 @@ impl CachedEncodeBuffers {
             total_pixels: u32,
             mv_blocks_x: u32,
             mv_blocks_y: u32,
+            visible_w: u32,
+            visible_h: u32,
+            _pad0: u32,
+            _pad1: u32,
         }
+        let (visible_w, visible_h) =
+            super::motion::mc_extent((padded_w, padded_h), (visible_w.max(1), visible_h.max(1)));
         let params = MotionCompensateParams {
             width: padded_w,
             height: padded_h,
@@ -1105,6 +1137,10 @@ impl CachedEncodeBuffers {
             total_pixels: padded_w * padded_h,
             mv_blocks_x,
             mv_blocks_y,
+            visible_w,
+            visible_h,
+            _pad0: 0,
+            _pad1: 0,
         };
         ctx.device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {

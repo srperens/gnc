@@ -266,6 +266,10 @@ impl DecoderPipeline {
                 false, // inverse: recon = residual + predicted
                 bufs.mc_block_size,
                 None, // luma: MV grid == this plane's block grid
+                // PAD-2: the picture, not the padded plane. This diagnostic reconstructs a frame
+                // the way the decoder does, so it has to clamp the way the decoder does or its
+                // diff is against a frame nothing produces.
+                Some((info.width, info.height)),
             );
 
             ctx.queue.submit(Some(cmd.finish()));

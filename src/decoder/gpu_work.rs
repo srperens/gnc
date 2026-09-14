@@ -490,6 +490,13 @@ impl DecoderPipeline {
                     // — not this chroma plane's own p_padded_w/(block_size/2), which differs
                     // whenever chroma pads to a different tile count than luma. (BUG-3)
                     Some((padded_w / bufs.mc_block_size, padded_h / bufs.mc_block_size)),
+                    // PAD-2: this chroma plane's visible extent, from the frame header's picture
+                    // size and this format's shifts. Rounded up, so an odd dimension keeps the
+                    // chroma sample that covers its last column or row.
+                    Some((
+                        w.div_ceil(1 << info.chroma_format.horiz_shift()),
+                        h.div_ceil(1 << info.chroma_format.vert_shift()),
+                    )),
                 );
                 // Step 3: NN-upsample chroma_recon_buf → plane_results[p] (luma dims).
                 self.chroma_up.dispatch_upsample(
@@ -616,6 +623,9 @@ impl DecoderPipeline {
                     false, // inverse: recon = residual + predicted
                     bufs.mc_block_size,
                     None, // luma: MV grid == this plane's block grid
+                    // PAD-2: the picture itself. At 4:4:4 and 4:2:2 the chroma planes are carried
+                    // at luma dimensions here, so this is right for all three.
+                    Some((w, h)),
                 );
             } else {
                 // I-frame: scratch_a has reconstructed spatial data (luma-sized after any upsample)

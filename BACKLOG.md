@@ -8270,7 +8270,45 @@ after reconstruction would let the encoder write a cheap fill while the referenc
 MC-friendly, collecting the remaining ~4.6% on video too — but it changes the decoding process and
 needs a bitstream version.
 
-### PAD-2 — collect the padding fill on inter, by re-replicating in the decoder (todo, **P1**)
+### PAD-2 — collect the padding fill on inter (**the proposed shape is REFUTED 2026-09-15**, `0087`; the item survives, the design does not, **P2**)
+
+> **The saving and the hazard are the same fact, and that kills the design this item was named
+> after.** `docs/decisions/0087`. Built `GNC_MC_CLAMP_VISIBLE` — `visible_w`/`visible_h` threaded
+> through `MotionCompensateParams` and `motion_compensate.wgsl`, off by default, fingerprint
+> unchanged when off and changed when on. Clamping a reference read to the visible extent is
+> **exactly equivalent** to the reference having replicated padding, so the cheap first step this
+> item suggested tests the expensive design too, for free.
+>
+> `meas_pad1_inter.py`, 3 sequences x q ∈ {85,92}, 17 frames, ki=9, 4:4:4, forced decay against
+> replicate, each arm under its own clamp setting:
+>
+> | | mean rate | worst dWORST | regressing > 0.3 dB |
+> |---|---|---|---|
+> | MC clamped to the **padded plane** (shipped) | **−8.06%** | −3.860 dB | 2 of 6 |
+> | MC clamped to the **visible picture** | **−0.61%** | −3.630 dB | 2 of 6 |
+>
+> **It does not fix the regression** (−3.860 → −3.630 dB) — so the premise is false: **the loss is
+> not edge blocks predicting from the padding.** **And it destroys the rate win** (−8.06% →
+> −0.61%), because the fill's inter saving exists *only* while the reference contains the same
+> fill: the padding's P-frame residual is then ≈ 0. Clamp, and the fade becomes a residual coded on
+> every P-frame. **"Write the cheap fill, replicate it away in the reference" is not a smaller
+> version of the design — it is the design**, and it collects 0.61%.
+>
+> **Dropped to P2**: the −7% to −10% this item was worth is not reachable by the route it named,
+> and no other route has a measurement behind it yet.
+>
+> **The better question it leaves.** bbb_extended still loses 2.400 / 3.630 dB **with the padding
+> removed from prediction entirely**, so the fill damages *visible* pixels. Standing hypothesis:
+> a border tile's wavelet coefficients reconstruct the padding and the visible part together, so
+> the fill moves where quantisation error lands inside the picture near the edge, and a reference
+> whose border differs propagates it down the GOP. Consistent with it being invisible on stills
+> (PAD-1 measured at identical visible quality, one frame, no chain), one-clip, and with this
+> item's own note that INTER-2 made it worse. **Cheap test first:** PSNR of the reference's visible
+> pixels within one tile-width of the right and bottom edges against its interior, decay against
+> replicate — `quality::psnr_tile_boundary` exists and `GNC_TILE_BOUNDARY=1` already wires it in.
+> **If that holds, this item is really TILE-2**, which is filed, priced and worth more.
+
+
 
 **The finished half is now on `main`; the unfinished half is on branch `g41232` (`8872707`).**
 `6397188` — the Dirac zero-extend result, 8 of 12 worst-frame points regressing and −4.960 dB at

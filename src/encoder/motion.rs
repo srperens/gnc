@@ -65,6 +65,41 @@ struct MotionCompensateParams {
     /// chroma — see the note in motion_compensate.wgsl.
     mv_blocks_x: u32,
     mv_blocks_y: u32,
+    /// PAD-2: the visible extent a reference read may reach. Equal to `width`/`height` unless
+    /// [`clamp_visible`] is on. See the long note in `motion_compensate.wgsl`.
+    ///
+    /// The bidir shaders declare only the first eight fields and read the same buffer, which is
+    /// legal and means **bidir MC does not get the clamp**. B-frames are off by default
+    /// (`docs/decisions/0033`), so nothing shipped is affected; whoever turns them back on owes
+    /// the same two fields in `motion_compensate_bidir{,_chroma}.wgsl`.
+    visible_w: u32,
+    visible_h: u32,
+    _pad0: u32,
+    _pad1: u32,
+}
+
+/// PAD-2: is motion compensation clamped to the visible picture instead of the padded plane?
+///
+/// **Off by default, because it is a decoding-process change**: encoder and decoder must agree or
+/// the reference buffers diverge and the error accumulates down the GOP. Shipping it needs a
+/// bitstream version so old streams keep the old behaviour. The flag exists so the measurement
+/// can be taken before that cost is paid.
+pub fn clamp_visible() -> bool {
+    std::env::var("GNC_MC_CLAMP_VISIBLE").is_ok_and(|v| v != "0")
+}
+
+/// The extent a reference read may reach: the visible picture when PAD-2's clamp is on, and the
+/// whole padded plane otherwise. One place, so the encoder and the decoder cannot disagree by
+/// each deciding for themselves.
+pub fn mc_extent(padded: (u32, u32), visible: (u32, u32)) -> (u32, u32) {
+    if clamp_visible() {
+        (
+            visible.0.min(padded.0).max(1),
+            visible.1.min(padded.1).max(1),
+        )
+    } else {
+        padded
+    }
 }
 
 /// How the chroma 4x4 block grid maps onto the motion-vector / block-mode field.
@@ -751,10 +786,15 @@ impl MotionEstimator {
         // Grid of the MV field being indexed. `None` means it coincides with this plane's own
         // block grid (luma and 4:4:4); subsampled chroma must pass the luma split grid.
         mv_grid: Option<(u32, u32)>,
+        // PAD-2: this plane's visible extent. `None` means "the whole padded plane", which is the
+        // pre-PAD-2 behaviour and what every caller that has not been taught the picture size
+        // should pass.
+        visible: Option<(u32, u32)>,
     ) {
         let blocks_x = width / block_size;
         let total_pixels = width * height;
         let (mv_blocks_x, mv_blocks_y) = mv_grid.unwrap_or((blocks_x, height / block_size));
+        let (visible_w, visible_h) = mc_extent((width, height), visible.unwrap_or((width, height)));
 
         let params = MotionCompensateParams {
             width,
@@ -765,6 +805,10 @@ impl MotionEstimator {
             total_pixels,
             mv_blocks_x,
             mv_blocks_y,
+            visible_w,
+            visible_h,
+            _pad0: 0,
+            _pad1: 0,
         };
 
         let params_buf = ctx
@@ -1000,6 +1044,12 @@ impl MotionEstimator {
             total_pixels,
             mv_blocks_x,
             mv_blocks_y,
+            // The bidir shaders declare only the first eight fields, so these are inert here.
+            // Recorded rather than zeroed so a reader of the buffer sees the same layout.
+            visible_w: width,
+            visible_h: height,
+            _pad0: 0,
+            _pad1: 0,
         };
 
         let params_buf = ctx
@@ -2890,6 +2940,7 @@ mod tests {
             true,
             ME_BLOCK_SIZE,
             None,
+            None, // fixture plane is all picture: no padding to clamp away
         );
         ctx.queue.submit(Some(cmd.finish()));
 
@@ -2911,6 +2962,7 @@ mod tests {
             false,
             ME_BLOCK_SIZE,
             None,
+            None, // fixture plane is all picture: no padding to clamp away
         );
         ctx.queue.submit(Some(cmd.finish()));
 

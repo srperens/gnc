@@ -82,6 +82,77 @@ the context cost.
 
 ---
 
+## PAD-2 — the fill's inter saving and the fill's inter hazard are the same fact (2026-09-15)
+
+**Machine: Apple M1 Pro, 16 GB, Metal.** `codec-fingerprint 027e58bc` with the flag off —
+unchanged, nothing ships; `ba5fdb18` with it on, which is the canary. `docs/decisions/0087`.
+
+### Hypothesis, and why it was worth building the flag
+
+PAD-1's cheap flat padding is worth −4.63% of intra rate and is refused on any frame something
+predicts from, because it costs up to −3.86 dB on a P-chain's worst frame. PAD-2's proposed shape:
+*write the cheap fill, and have both sides overwrite the padding with edge replication of the
+decoded picture before it is used as a reference.* Its own suggested first step: clamp MC's reads
+to the visible bounds instead of the padded ones.
+
+**Both rest on one premise — the fill hurts because motion compensation predicts from it** — and
+clamping a reference read to the visible extent is *exactly equivalent* to the reference having
+replicated padding. So the cheap step tests the expensive design too, at zero bitstream cost.
+
+Built: `visible_w`/`visible_h` through `MotionCompensateParams` and `motion_compensate.wgsl`, from
+the picture size both sides already hold, with `motion::mc_extent` as the single place that decides
+so encoder and decoder cannot disagree. Gated; off it is bit-identical and the fingerprint says so.
+
+### Result — it fails on both halves at once
+
+`meas_pad1_inter.py`, 3 sequences x q ∈ {85,92}, 17 frames, ki=9, 4:4:4, forced
+`GNC_PAD_FILL=decay` against `replicate`, each arm under its own clamp setting:
+
+| | mean rate | worst dWORST | regressing > 0.3 dB |
+|---|---|---|---|
+| MC clamped to the **padded plane** (shipped) | **−8.06%** | −3.860 dB | 2 of 6 |
+| MC clamped to the **visible picture** (candidate) | **−0.61%** | −3.630 dB | 2 of 6 |
+
+**1. It does not fix the regression** — −3.860 → −3.630 dB, still 2 of 6. **The premise is false:
+the loss is not edge blocks predicting from the padding.** Remove the padding from prediction
+entirely and the dB stays.
+
+**2. It destroys the rate win** — −8.06% → **−0.61%** — and the mechanism is the finding. The
+fill's inter saving exists *because the reference contains the same fill*: the padding's P-frame
+residual is then ≈ 0. Clamp the reads and MC predicts that region from the replicated edge, so the
+fade becomes a residual coded on every P-frame, paying back exactly what the cheap fill saved.
+
+**The saving and the hazard are the same fact.** The fill is cheap on inter only while it is also
+what prediction sees. **PAD-2's proposed shape is refuted**, not merely its cheap first step — it
+*is* the design, tested for free, and it collects 0.61% instead of 8%.
+
+### Also not run, and why
+
+**Restricting motion vectors so no block's footprint leaves the picture.** Encoder-only, no
+bitstream change, and it would also stop MC reading the fill — but result 1 says reading the fill
+is not what costs the dB, so it inherits the same false premise and additionally costs legitimate
+outward motion.
+
+### What it leaves, which is a better question
+
+bbb_extended regresses −2.400 dB at q=85 and −3.630 at q=92 **with the padding removed from
+prediction entirely**, so whatever the fill does on that clip it does to the *visible* pixels.
+The standing hypothesis, untested here: **a border tile's wavelet coefficients reconstruct the
+padding and the visible part together**, so changing the fill changes where quantisation error
+lands inside the picture near the edge, and a reference whose border differs propagates that down
+the GOP. Consistent with all of it — invisible on stills (PAD-1 measured at *identical visible
+quality*, one frame, no chain), one clip, and PAD-2's own note that INTER-2 made it worse because
+*"a lower inter dead zone stopped quantising away part of the prediction error the fill causes"*,
+which is about coded residual **inside** the picture.
+
+**Cheap test before anyone writes a shader:** PSNR of the reference's visible pixels within one
+tile-width of the right and bottom edges against its interior, decay against replicate.
+`quality::psnr_tile_boundary` exists and `GNC_TILE_BOUNDARY=1` already wires it into `benchmark`.
+If the loss is concentrated at the border, PAD-2 becomes a question about border tiles — which is
+**TILE-2**, already filed and a bigger prize.
+
+---
+
 ## ENT-12 — direction in the context is a ~1% lever, not the other half of the J2K gap (CLOSED by measurement 2026-09-14)
 
 **Machine-independent: deterministic numpy over DWT+quantised coefficients — no GPU, no wall clock,

@@ -23,6 +23,24 @@ struct Params {
     total_pixels: u32,
     mv_blocks_x: u32,  // row stride of the MV field
     mv_blocks_y: u32,  // rows in the MV field
+    // PAD-2: the *visible* extent of this plane, which is what a reference read may see.
+    //
+    // `width`/`height` are the **padded** plane: a 1920x1080 frame is carried as 2048x1280, and
+    // the reference buffer keeps all of it. Clamping a reference read to the padded bounds means
+    // an edge block whose motion vector points outward predicts from the **coded padding** — and
+    // since PAD-1 that padding is a cheap flat fade, chosen to be cheap to *code* with no regard
+    // for being predicted from. Measured cost of letting it through: up to **-3.86 dB** on the
+    // worst frame of bbb_extended at q=92.
+    //
+    // Clamping to the visible extent instead makes a reference read behave exactly as if the
+    // padding were edge replication of the decoded picture, which is the standard extension and
+    // what the pre-PAD-1 encoder effectively had. It is a **decoding-process change** — both
+    // sides must do it or they diverge — so it is gated, and when off these carry `width`/`height`
+    // and every clamp below is bit-identical to before.
+    visible_w: u32,
+    visible_h: u32,
+    _pad0: u32,
+    _pad1: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -34,8 +52,11 @@ struct Params {
 // Bilinear sample from reference plane at quarter-pel position (qx, qy).
 // qx, qy are in quarter-pel units (pixel * 4 + subpel_offset, range 0..3).
 fn bilinear_ref(qx: i32, qy: i32) -> f32 {
-    let w = i32(params.width);
-    let h = i32(params.height);
+    // PAD-2: clamp to what the picture actually contains, not to what the buffer carries. The row
+    // stride below stays `params.width` — the buffer is still padded, only the reachable extent
+    // shrinks.
+    let w = i32(params.visible_w);
+    let h = i32(params.visible_h);
 
     let ix = qx >> 2;        // integer part
     let iy = qy >> 2;

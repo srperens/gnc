@@ -2720,6 +2720,7 @@ fn test_pframe_divergence_checkpoints() {
             false, // inverse: output = zero + prediction = prediction
             mf.block_size,
             None,
+            None, // fixture plane is all picture: no padding to clamp away
         );
         ctx.queue.submit(Some(cmd.finish()));
         ctx.device.poll(wgpu::Maintain::Wait);

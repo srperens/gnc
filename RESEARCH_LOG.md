@@ -19423,3 +19423,31 @@ it stores as the pyramid-slot reference) may drop the residual. Distinguishing t
 of the per-frame-PSNR path in `sequence.rs` plus fixing `encode-sequence` to emit the pyramid so a
 container decode can be compared. BUG-5 stays reopened (P2) with this corrected, narrower state; the
 `GNC_B4_QSTEP_MUL` canary stands. **No overclaim survives: the pulse is real, its cause is not.**
+
+### Traced further: B4 is genuinely broken, and reference + dispatch both match
+
+Followed the two candidates. Both narrow rather than resolve, but they rule things out.
+
+**The measurement is a full decode, not a buffer read.** `main.rs:3221` computes the printed
+per-frame PSNR as `quality::psnr(frames_data[i], decoded_all[i])`, and `decoded_all` is
+`decoder.decode_sequence(&compressed_ip)` (`main.rs:3192`) -- a real bitstream decode of the whole
+reordered sequence. So B4's 35.56 dB is source-vs-decoded on the actual container. **B4 is genuinely
+broken; the "benchmark measures a reference buffer" candidate is ruled out.**
+
+**Encoder and decoder agree on B4's reference and its MC path.** Encoder: B4 is `encode_pframe` with
+`gpu_ref_planes = I0` as sole reference (`sequence.rs:939`). Decoder: before the anchor it saves I0,
+sets `reference_planes = I0`, and decodes B4 (`decoder/pipeline.rs:743-748`), with `gpu_work` folding
+the `Bidirectional`+`backward_vectors=None` frame into the P-frame MC path (`gpu_work.rs:69-78`).
+Same reference (I0), same dispatch (forward P). So a wrong-reference or wrong-dispatch prediction
+mismatch is ruled out too.
+
+**Which sharpens the puzzle rather than solving it.** With reference and dispatch matching, encoder
+and decoder should compute the *same* prediction, and a finer residual should then close on the
+source -- yet 10x finer moves PSNR 0.01 dB. That leaves the residual round-trip for B4 specifically:
+the frame is coded through the P path but tagged `Bidirectional`, and the one place encode and decode
+still diverge by frame type is **serialisation** -- motion-vector layout (P writes forward-only, a
+Bidirectional frame's reader may expect forward+backward) or coefficient/entropy framing. That is the
+next place to look, and it needs an instrumented dump (B4's prediction, its dequantised residual, and
+its reconstruction, each compared encode-vs-decode) rather than another black-box sweep. Not guessed
+at further here. BUG-5 stays reopened (P2); the canary stands; each pass has removed a candidate
+(rate, averaging, decoder dispatch, wrong reference, mis-measurement) without yet naming the defect.

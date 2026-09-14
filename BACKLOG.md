@@ -389,12 +389,17 @@ decoder is not that difference** — `decoder/gpu_work.rs:69-78` already detects
 B-frame (`Bidirectional` + `backward_vectors=None`) and runs the P-frame MC path, as
 `sequence.rs:943` claims; that hypothesis is retracted. The independent container round-trip that
 would isolate B4 is blocked: `encode-sequence` codes `mode=I+P` even with `GNC_B_PYRAMID=1` (the
-pyramid is only in `benchmark-sequence`) and panicked (exit 101) on extracted frames. **So the live
-candidates are on the encoder/measurement side:** benchmark-sequence may report B4 from a
-reference/prediction buffer rather than a full re-decode, or the encoder's local reconstruction it
-stores as the pyramid-slot reference may drop the residual. **Next step (no Windows):** trace the
-per-frame-PSNR path in `sequence.rs`, and fix `encode-sequence` to emit the pyramid so a container
-decode of B4 can be compared. The `GNC_B4_QSTEP_MUL` knob is the canary a fix must make responsive.
+pyramid is only in `benchmark-sequence`) and panicked (exit 101) on extracted frames. **Traced further (same session):** the printed per-frame PSNR is a *full* decode --
+`main.rs:3221` compares `frames_data[i]` to `decoder.decode_sequence(...)[i]` -- so B4 is genuinely
+broken, not mis-measured. And encoder and decoder **agree** on B4: both use I0 as its sole reference
+and the forward P-frame MC path (`sequence.rs:939`, `decoder/pipeline.rs:743-748`, `gpu_work.rs:69-78`).
+So reference, dispatch, measurement, rate and averaging are all ruled out. What is left is the
+**residual round-trip for a frame coded through the P path but tagged `Bidirectional`** -- the one
+axis where encode and decode still diverge by frame type is *serialisation* (MV layout: P writes
+forward-only, a Bidirectional reader may expect forward+backward; or coefficient/entropy framing).
+**Next step:** an instrumented dump comparing B4's prediction, dequantised residual and
+reconstruction encode-vs-decode -- not another black-box sweep. The `GNC_B4_QSTEP_MUL` knob is the
+canary a fix must make responsive.
 **Do not re-enable the pyramid default** on the back of this — the rate and latency reasons above
 are unchanged; this is about correctness of the opt-in path.
 

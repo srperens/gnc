@@ -4,6 +4,84 @@
 
 ---
 
+## ENT-17 — a cross-subband *parent* context is a real ~2-4.5% lever, the first that clears the bar (2026-09-15)
+
+**Machine-independent: deterministic numpy over DWT+quantised coefficients — reproduces anywhere,
+no GPU.** Python 3.12 / numpy 1.26. `scripts/meas_parent_context.py`, new; reuses `meas4_oracle` and
+`cond_entropy_bits`. This runs the one test `0024` pre-registered and left for last.
+
+### Why this test, now
+
+`0024` (INTRA-1 step 1) bounded the entropy coder's headroom with *spatial* neighbourhood models
+only and put ~72% of the +27.1% JPEG 2000 gap upstream of the coder. It named the untested class to
+try **if the spatial line came back empty**: a parent / cross-subband context — SPIHT/EZW condition
+a coefficient on its parent in the coarser band; the measurement covered only causal spatial
+neighbours. *"It is the one model class that could still find something."* The spatial line is now
+empty on every axis, including direction (ENT-12, 2026-09-14). So the condition is met.
+
+### Method — a clean isolation, parent term and nothing else
+
+Domain: quantised wavelet coefficients. A coefficient at (y,x) in a detail band has a parent at
+(y//2, x//2) in the same-orientation band one level coarser, already fully decoded coarse-to-fine;
+condition on its **quantised** magnitude (what a decoder actually has). Both arms share the coder
+(sig / |v|>1 / |v|>2 context-coded, then bypassed Exp-Golomb remainder + sign, common-mode) and the
+static per-subband table. They differ in one thing:
+
+- **spatial** (arm A) = (subband, bucket(magL + magU + magD)) — abac's model.
+- **spatial+parent** (arm B) = (subband, spatial bucket, bucket(parent magnitude)).
+
+LL and the coarsest level have no parent and are coded spatial-only in both arms (common-mode), so
+the delta is exactly what the parent term buys where a parent exists. Both charged the same
+0.5·log2(n)-per-context KT cost; **+KT is the number to believe** — arm B has B× more contexts,
+which mechanically lowers raw conditional entropy, and KT is what makes the bigger table pay.
+
+### Result — 4 images, 3 qsteps (+KT, the fair column)
+
+| image | +parent vs spatial (+KT) |
+|---|---|
+| bbb (animation) | −1.5% … −2.6% |
+| blue_sky (low-motion sky) | −3.3% … −4.4% |
+| kristensara (camera) | −2.8% … −4.7% |
+| touchdown (sport) | −0.8% … −3.0% |
+
+**This does not falsify.** ~1.5-4.5% typical, ~4.7% best — 2-4× ENT-12's spatial direction (~1%),
+and the **first context lever to clear "a few percent" on multiple sequences**.
+
+### The result is physically coherent, which is the strongest check it has
+
+- The effect **grows with qstep** (biggest at low quality): exactly the zerotree mechanism — as the
+  bands go sparse, an insignificant parent predicts insignificant children.
+- **blue_sky (smooth) largest, touchdown (busy) smallest**: smooth content has strong zerotree
+  structure, busy content weak. The ordering across content types is the expected one, so this is
+  the SPIHT/EZW effect and not a context-count artefact.
+
+### What it does and does not mean
+
+- **It does not close the upstream gap.** Single-digit %, not the ~19.6 points. `0024`'s own
+  prediction — *"a parent term is not plausibly worth 20 points"* — holds. It moves a few points
+  from "upstream/uncodeable" to "codeable with cross-band context", not the whole gap.
+- **It has a cost the spatial levers did not: a bounded coarse-to-fine dependency.** A parent
+  context needs the coarser band decoded before the finer one, so abac's ~3000-blocks-at-once
+  decode becomes level-by-level (≤5 waves, hundreds of blocks per wave). **Bounded** — fixed at the
+  level count, does not grow with frame size — so CLAUDE.md's dependency rule allows it, but it is a
+  real throughput cost that must be priced against the 1.5-4.5%.
+
+### Caveats
+
+- Conditional entropy is a **ceiling**; a built coder reaches less.
+- Luma stills (ENT-4's gap was RGB stills — comparable, not identical).
+- Deterministic, so reproducibility is exact.
+
+### Verdict
+
+Unlike ENT-12 this is a **candidate, not a closure.** Filed as **ENT-17** with the dependency gate:
+worth building only if the ~2-4.5% survives a real coder and justifies the coarse-to-fine ordering
+against decode throughput. Cheapest first variant to try before the full coder: the
+**significance-only** parent term (pure zerotree), which may hold most of the gain at a fraction of
+the context cost.
+
+---
+
 ## ENT-12 — direction in the context is a ~1% lever, not the other half of the J2K gap (CLOSED by measurement 2026-09-14)
 
 **Machine-independent: deterministic numpy over DWT+quantised coefficients — no GPU, no wall clock,

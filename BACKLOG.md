@@ -8913,6 +8913,55 @@ is the default at q>20 as of 2026-09-14. This item defends that decision rather 
 the cheaper abac gets, the less of GOALS §5's "log the cost with the win" there is to log. It is
 also the item that stops abac's cost from being the reason a future rate lever gets declined.
 
+### ENT-17 — a cross-subband *parent* (zerotree) context: the one entropy lever that cleared the bar (todo, **P2**)
+
+**Filed 2026-09-15 from the measurement `0024` pre-registered and left for last.** `0024` put ~72%
+of the +27.1% JPEG 2000 gap upstream of the coder using *spatial* neighbourhood models only, and
+named the parent/cross-subband context (SPIHT/EZW-style) as *"the one model class that could still
+find something ... if step 2 comes back empty, this is the thing to try before concluding."* Every
+spatial axis is now empty, including direction (ENT-12). So it was tried.
+
+**Measured, and it is the first context lever that does not falsify.** Clean isolation
+(`scripts/meas_parent_context.py` — same coder, same causal spatial neighbours, static per-subband
+table, the *only* difference a parent-magnitude term from the same-orientation band one level
+coarser). Over 4 diverse images × 3 qsteps, **+KT (fair) −1.5% to −4.7%**, best on smooth/low-quality
+content — 2-4× ENT-12's spatial direction. Physically coherent: the effect grows with qstep and is
+largest on smooth content, which is the zerotree mechanism (an insignificant parent predicts
+insignificant children), not a context-count artefact. Full numbers/caveats in RESEARCH_LOG.
+
+**What it is not.** Not the missing half-gap — single-digit %, not the ~19.6 upstream points, so
+`0024`'s *"not plausibly worth 20 points"* holds. And it is a **ceiling** (conditional entropy); a
+built coder reaches less.
+
+**The gate, and it is what makes this P2 not P1: a bounded coarse-to-fine dependency.** A parent
+context needs the coarser band decoded before the finer one, so abac's ~3000-independent-blocks
+decode becomes level-by-level — **≤5 waves, hundreds of blocks per wave**. It is *bounded* (fixed at
+the level count, does not grow with frame size), so CLAUDE.md's dependency rule allows it, but the
+throughput cost must be priced against the 1.5-4.5% before anyone commits to it — the same
+"price the tool, don't refuse it on principle" the rule demands.
+
+**Do the cheapest variant first.** Measure the **significance-only** parent term (pure zerotree: does
+an insignificant parent predict an insignificant child, nothing more) before the full magnitude
+context. If most of the −1.5-4.7% sits there, the coder change is far smaller and the context-count
+cost lower. `meas_parent_context.py` is the harness to extend; it is machine-independent, so this
+step needs no idle GPU.
+
+**Success criteria, before any shader.**
+1. **Significance-only vs full parent term**, offline, on the four stills — decide which carries the
+   gain. Machine-independent.
+2. **A real CPU-coder prototype reproduces the offline ceiling within its known adaptation loss.** A
+   ceiling that a built coder cannot approach is not a lever.
+3. **The coarse-to-fine decode throughput cost, measured on an idle Mac**, against the rate win. If
+   the 1.5-4.5% does not survive the parallelism hit, close it — this is the gate the whole item
+   turns on and it cannot be taken on a shared machine.
+4. **Bit-exact CPU/GPU and unchanged decoded pixels** if it ships — a context change is lossless
+   recoding, so decoded quality must not move (the abac invariant).
+
+**Coordination.** Overlaps nothing in flight; it is a new coder context, orthogonal to ENT-13/ENT-15
+(those are abac *throughput*, this is *rate*). The offline steps (1) are runnable anywhere; steps 3
+onward are Mac-gated. Whoever ships it writes a decision record — it either adds a cross-subband
+dependency to the decode or rejects a measured rate lever, and both are choices.
+
 ### ENT-12 — abac buckets the neighbourhood *sum*; EBCOT keys on the *pattern*. Is that the other half of the J2K gap? (**CLOSED by measurement 2026-09-14 — direction is a ~1% lever, not the half-gap**)
 
 **Answer: no.** The item's own falsification test was run (`scripts/meas_ent12_pattern.py`, a clean

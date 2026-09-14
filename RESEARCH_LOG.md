@@ -4,6 +4,65 @@
 
 ---
 
+## RATE-6 RESOLVED by the owner: the code-block default is 64 again, and the shipped ladder reads +60.9% (2026-09-15)
+
+**Machine: Apple M5 Pro [Metal, IntegratedGpu]**, idle. `DEFAULT_CB` 32 → 64 in
+`src/encoder/abac_tile.rs`, one constant. **`codec-fingerprint v1 1ea00f81` → `99a2e8ec`** — the
+encoder writes different bytes and the tool says so. `docs/decisions/0088`.
+
+The owner's call, with the reason in it: *"jag vill att vi går tillbaka till 64 just nu. notera att
+priset för 32 är mycket bitrate just nu."*
+
+### The re-take, same ladder, same sources, same harness
+
+1920x1080, 17 frames, ki=9, 4:2:0, 8-bit, q = 85/92/96/99 against crf = 1/2/4/8, x264 at defaults,
+sources derived at `yuv420p` (MEAS-16).
+
+| sequence | cb=32 (`d7dc8d8`) | **cb=64 (now)** | MEAS-11 (`a0880c7`, cb=64) |
+|---|---|---|---|
+| bbb_extended | +93.9% | **+88.8%** | +89.0% |
+| old_town_cross | +50.8% | **+47.3%** | +47.4% |
+| crowd_run | +49.7% | **+46.5%** | +46.6% |
+| **mean** | **+64.8%** | **+60.9%** | **+61.0%** |
+
+**The 3.9 points come back in full, and the cross-check is that the new figure lands 0.1 points
+under MEAS-11's** — same cb, a week of landings apart, so ENT-14 and LOSSLESS-3 are worth about a
+tenth of a point on this ladder and the rest of the distance was always the code-block size.
+
+Bytes at q=85: bbb 3.0627 → 2.9550 bpp (−3.52%), old_town 5.5817 → 5.4670 (−2.06%), crowd_run
+5.7291 → 5.6109 (−2.06%). **PSNR-Y is unchanged at every rung** — 49.88 / 51.64 / 54.05 / 58.29 on
+bbb before and after — so this is bytes only, as a code-block size must be.
+
+**What it costs, and the number is `0051`'s, not retracted:** encode goes from ~2.2–5.1x Rice back
+to ~5.0–12.0x, frame decode from ~1.3–2.1x back to ~2.6–4.8x; in absolute terms ~127–199 ms per
+1080p frame instead of ~73–80 ms, on an M1 Pro. The phase decision is what makes that the right way
+round today — rate leads, latency is phase 2 — and `0088` says so explicitly so that the day the
+phase flips, the price list is one file away.
+
+### What moved in the documentation, because this is the first figure measured on the shipped coder
+
+BASELINE's contribution table had **no row for what the binary actually does**: its `--abac` rows
+predate `0051` and ENT-14, and its headline **+89.2%** is a Rice figure that stopped describing the
+default at `58b637f`. Both are now stated: **+60.9% shipped, +89.2% only if the run forced Rice.**
+Current Focus's phase-1 scoreboard moved the same way — **1.61x from H.264 on luma, not 1.9x.**
+
+**The gap closed by 0.1 points of measurement and 28 points of bookkeeping.** Nothing in the codec
+improved today; what changed is that the number being tracked is now the number the binary
+produces. That is worth saying plainly, because a scoreboard that flatters by 28 points is how a
+project prioritises the wrong item for a week.
+
+### The owner's next question, filed rather than answered
+
+*"om abac är rätt verktyg. den verkar vara seriell i sin natur?"* — yes, and `0088` just made that
+more expensive. An arithmetic coder's state updates per symbol, so the only parallelism is chunking,
+and chunking is the `cb` dial: +0% / +3.9 / +17% of rate for 1x / 2.3x / 2.5x of encode at
+64 / 32 / 16. The lever is spent in both directions. **ENT-18** asks the question that decides
+whether that matters: how much of abac's −14% is the *arithmetic engine* and how much is the
+*context modelling*, since only the first is inherently serial and the second could ride on rANS's
+interleaved streams. `meas4_oracle.py` can answer it without a GPU.
+
+---
+
 ## MEAS-1 re-taken on `d7dc8d8` — two of three reproduce; bbb's outlier is the *source*, not the codec (2026-09-15)
 
 **Machine: Apple M5 Pro [Metal, IntegratedGpu]**, `gnc gpu-info` quoted rather than trusted to

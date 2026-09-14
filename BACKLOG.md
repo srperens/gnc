@@ -34,7 +34,7 @@ Nu är vi fortfarande i forskning kring om designen för att möta bitrate."*
 
 | phase | what leads | status |
 |---|---|---|
-| **1 — now** | **bitrate.** Get within reach of H.264 and set a baseline there | **+89.2% BD-rate against x264** at the contribution point (MEAS-10). The target is ~1.9x away |
+| **1 — now** | **bitrate.** Get within reach of H.264 and set a baseline there | **+60.9% BD-rate against x264** on the shipped binary at the contribution point (RATE-6, 2026-09-15, abac at cb=64). **1.61x away**, against the 1.9x this row read while it quoted the Rice figure |
 | 2 — later | concurrent sessions, performance, low latency, robustness | measured where cheap, **not prioritised, not optimised** |
 
 **What this changes in practice, and it changes the queue rather than the rules:**
@@ -51,9 +51,14 @@ Nu är vi fortfarande i forskning kring om designen för att möta bitrate."*
   applies unchanged. Phase 1 is where a wrong number is most expensive, because it is where the
   design decisions are being made.
 
-**The rate ladder, so the phase has a scoreboard:** +89.2% BD-rate on PSNR against x264 at the
-contribution operating point; **+61.0% with `--abac` on** (MEAS-11). ENT-10 is therefore not a
-tuning item — **it is over a third of the remaining gap, already built, sitting behind a flag.**
+**The rate ladder, so the phase has a scoreboard — re-taken 2026-09-15 (RATE-6):** **+60.9%** on
+the binary `main` ships, abac at cb=64, fingerprint `99a2e8ec`. The +89.2% this line used to lead
+with is a **Rice** figure and Rice is no longer the default; ENT-10 shipped the flag, so that third
+of the gap is collected, not pending.
+
+**Quote the cb with the figure.** The same ladder at cb=32 reads **+64.8%**, and `main` shipped
+exactly that for one day (`0051` -> `0088`). Three sequences, 17 frames, ki=9, 4:2:0, sources
+derived at `yuv420p` — see MEAS-16 before re-taking it.
 
 ## Current Focus (updated 2026-09-06)
 
@@ -1800,7 +1805,15 @@ three sequences reproduced and hid the problem.
 **Success criterion:** two runs from a clean checkout, by two people, produce the same bbb figure
 without either of them having to ask how the y4m was made.
 
-### RATE-6 — the scoreboard is quoted at cb=64 and `main` ships cb=32: price the knob and pick one (todo, P1 — bisected 2026-09-15)
+### RATE-6 — the scoreboard was quoted at cb=64 and `main` shipped cb=32 (**DONE 2026-09-15** — cb is 64 again, `docs/decisions/0088`)
+
+> **RESOLVED the same day by the owner: back to cb=64.** *"jag vill att vi går tillbaka till 64
+> just nu. notera att priset för 32 är mycket bitrate just nu."* `DEFAULT_CB` 32 -> 64, one
+> constant, not a format change. Re-taken on the same ladder: bbb **+88.8%**, old_town **+47.3%**,
+> crowd_run **+46.5%**, **mean +60.9%** against cb=32's +64.8%. Pixels identical; bytes −2.1% to
+> −3.5%. BASELINE, Current Focus and `docs/decisions/0088` updated; the encode/decode side that
+> `0051` bought is given back in full and that record stays the price list. Follow-up filed as
+> **ENT-18**.
 
 > **BISECTED 2026-09-15 to `5affeef` (`docs/decisions/0051`) — not a bug, a recorded trade.**
 > `git bisect` over 106 commits, 7 steps, probe with `--abac` on both sides. The cost is
@@ -1867,6 +1880,41 @@ first or the bisect inherits the same unrecorded step.
 **Then decide whether the cost is bought.** A correctness fix that had to cost bits is a different
 answer from an accident, and both are acceptable outcomes of this item — but it has to be stated,
 because right now the scoreboard moved and nothing in the tree says why.
+
+### ENT-18 — is a per-symbol-serial coder the right tool, or does abac's win live in its contexts? (todo, P2)
+
+**The owner's question, 2026-09-15:** *"om abac är rätt verktyg. den verkar vara seriell i sin
+natur?"* It is, and `0088` has just made the consequence more expensive: an arithmetic coder's
+interval and context state update per symbol, so the only parallelism available is *splitting the
+data into independent chunks* — which is precisely the `cb` knob, and every halving costs rate for
+per-block floor and re-learned contexts. cb=64 vs cb=32 vs cb=16 is the same dial read three times:
++0% / +3.9 / +17% of rate for 1x / 2.3x / 2.5x of encode. **There is no setting of it that is
+cheap, because the serialism is in the algorithm, not in the implementation** — which is what
+ENT-15 (`0086`) concluded independently: abac's GPU encode is not badly written, it is running a
+workload GPUs are bad at.
+
+**The question this opens is not "drop abac".** It is: *which half of abac's −12% to −20% against
+Rice is the arithmetic engine, and which half is the context modelling?* Only the first half is
+inherently serial. Adaptive significance contexts, the ENT-9 prefix contexts, and ENT-17's parent
+context are **models**, and a model can be carried by a coder that parallelises — rANS is already
+in this tree with 32 interleaved streams per tile, and a static or twice-passed table costs a
+table, not a serial chain.
+
+**Measure before designing, and the instrument exists.** `meas4_oracle.py` and
+`cond_entropy_bits` already compute ideal code length under a given context model, deterministically
+in numpy with no GPU. Three numbers answer it:
+1. ideal bits under **Rice's** model,
+2. ideal bits under **abac's context** model,
+3. abac's **actual** bytes.
+
+(2) vs (1) is what the modelling is worth; (3) vs (2) is what the engine costs on top. If the gap
+is mostly (2), a parallel coder carrying abac's contexts keeps most of the win **and** the
+occupancy, and `0088`'s 3.9 points stop being a trade at all. If it is mostly (3), then abac is the
+tool and the cb dial is the only lever there is.
+
+**Success criterion:** a split of the −14% into modelling and engine, on ≥3 sequences, with the
+per-block floor accounted separately — enough to say whether a rANS-with-abac-contexts prototype is
+worth building, or to close the question for good.
 
 ### ROBUST-2 — put the frame parser on a checked cursor, additively (todo, P2)
 

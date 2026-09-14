@@ -195,6 +195,17 @@ threshold of 9, and the encoder emits 2I+8P. Do not build a density claim on it.
 > a re-take of the shipped default rather than of an option. Until it is done, read every rate row
 > below as "what the previous default did".
 
+> **2026-09-15, RATE-6: the re-take is DONE, and the shipped default now reads +60.9%.** Measured
+> on today's `main` with abac at **cb=64** (`0088` put the code-block default back after `0051`
+> halved it): bbb_extended **+88.8%**, old_town_cross **+47.3%**, crowd_run **+46.5%**, **mean
+> +60.9%** — the ladder above, same sources, same harness, Apple M5 Pro, fingerprint `99a2e8ec`.
+> **So GNC ships at about 1.61x H.264 on luma at contribution quality, not 1.9x.** The +89.2%
+> Rice figure is still correct for Rice and is no longer what the binary does.
+>
+> Read the cb with the figure, because it is worth 3.9 points: the same ladder at **cb=32** reads
+> **+64.8%** (`d7dc8d8`, 2026-09-15). MEAS-11's +61.0% was taken at cb=64 and reproduces here to
+> 0.1 points — the difference is ENT-14 and LOSSLESS-3 landing since.
+
 ## Stream density is a pixel rate, and on a laptop GPU it is ~70-90 Mpixel/s (2026-09-14, PERF-4)
 
 **This is a *reach* number, not a *scale* number** (GOALS §1). It says what an integrated 30 W
@@ -459,14 +470,30 @@ q=85,92,96,99 against crf=1,2,4,8.
 | `--abac` before ENT-9 (MEAS-10) | +91.8% | +53.1% | +53.0% | +66.0% |
 | QUAL-1 (2026-09-06), Rice | +129.0% | +71.9% | +70.6% | +90.5% |
 
+| **shipped default (2026-09-15, abac cb=64)** | **+88.8%** | **+47.3%** | **+46.5%** | **+60.9%** |
+| same ladder at cb=32 (`d7dc8d8`) | +93.9% | +50.8% | +49.7% | +64.8% |
+
 **The `--abac` row is MEAS-11 (2026-09-08), re-taken at `a0880c7`; the Rice row reproduced there
 exactly and is unchanged.** Both arms on one binary, which is what makes them comparable.
+
+**The last two rows are RATE-6 (2026-09-15), on `main` with fingerprint `99a2e8ec`.** They are the
+first rows in this table measured on the *shipped* coder rather than on an option. The cb=32 row is
+kept because it is what `main` shipped for one day and it prices `0088`'s decision: **3.9 points of
+BD-rate for 2.3x encode and ~2x decode.**
+
+**Source derivation, which this table never stated and which is worth 4 points on bbb_extended:**
+the 17-frame y4m is built from the PNG sequences at **`yuv420p`** (`ffmpeg -pix_fmt yuv420p`).
+Derived at 4:4:4 instead, the same binary on the same frames reads **+252.3%** on bbb rather than
++93.9%, because PSNR-Y comes off decoded RGB and a 4:2:0 codec path measured against a full-chroma
+reference pays for subsampling twice. MEAS-16 is wiring this into the harness; until it lands, a
+re-take that does not say `-pix_fmt yuv420p` is not comparable to this table.
 
 **GNC Rice needs about 1.9x the bitrate of H.264 for the same luma PSNR at contribution quality.
 `--abac` is 1.61x** — same pixels as Rice at every rung, and MEAS-11 measured that canary rather
 than inheriting it: the PSNR-Y delta is **+0.0000 dB at all 12 rungs**, i.e. bit-identical, not
 merely equal to two decimals as this line used to say. Only the bytes moved.
-Rice stays the default; quote **+89.2%** unless the command included `--abac`.
+**abac is the default since `58b637f`; quote +60.9% for the shipped binary,** and +89.2%
+only for a run that forced Rice.
 
 **ENT-9 also flattened the decay, which is the part worth noticing.** The saving over Rice used to
 collapse as quality rose — crowd_run −12.2% at q=85 to −3.7% at q=99, an 8.5-point fall, and that

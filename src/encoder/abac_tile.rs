@@ -20,32 +20,37 @@
 
 use super::abac::Coder;
 
-/// Code-block edge in pixels. **32 since ENT-10 (2026-09-14, `docs/decisions/0086`).**
+/// Code-block edge in pixels. **64 again since RATE-6 (2026-09-15, `docs/decisions/0088`),
+/// reversing `0051`'s 64 → 32 of the previous day.**
 ///
-/// This was 64, on a measurement that said cb=64 dominated once decode was priced in: "−13.8%
-/// rate at 33.0 ms of entropy decode, where cb=32 is −10.9% at 31.4 ms". **The rate half of that
-/// still reproduces; the decode half does not, because the decoder it was measured on no longer
-/// exists.** ENT-5 moved abac decode onto the GPU, one thread per code-block — and thread count
-/// *is* the code-block count, so halving the edge quadruples the parallelism of both the encoder
-/// and the decoder. On today's path (3 stills x q ∈ {90,99}, `gnc benchmark`, idle M1 Pro):
+/// The history matters because both changes were right on their own terms and the third number is
+/// what settled it:
+///
+/// 1. **64 originally**, on a decode measurement that stopped being true when ENT-5 moved abac
+///    decode onto the GPU, one thread per code-block.
+/// 2. **32 on 2026-09-14** (`0051`): thread count *is* the block count, so halving the edge
+///    quadruples the parallelism of both sides. Priced at ~2.5–3.5 points of rate for **2.3x off
+///    encode and ~2x off decode**, 6 of 6 points, on 3 stills x q ∈ {90,99}.
+/// 3. **64 again on 2026-09-15** (`0088`): the same trade measured on *sequences* costs **+3.8
+///    points of BD-rate against x264** (+61.0% → +64.8%, three sequences, contribution ladder),
+///    and the project is in its bitrate phase. The owner spends the encode time:
+///    *"jag vill att vi går tillbaka till 64 just nu. notera att priset för 32 är mycket bitrate
+///    just nu."*
 ///
 /// | | rate vs Rice | encode vs Rice | frame decode vs Rice |
 /// |---|---|---|---|
-/// | cb=64 | −14.1% to −17.5% | **5.0x to 12.0x** | **2.6x to 4.8x** |
-/// | cb=32 | −11.8% to −14.9% | **2.2x to 5.1x** | **1.3x to 2.1x** |
+/// | cb=64 | −14.1% to −17.5% | 5.0x to 12.0x | 2.6x to 4.8x |
+/// | cb=32 | −11.8% to −14.9% | 2.2x to 5.1x | 1.3x to 2.1x |
 ///
-/// So cb=32 gives back ~2.5 to 3.5 points of rate and buys **2.3x off encode and ~2x off decode**,
-/// 6 of 6 points. The old note's 33.0 → 31.4 ms could not have predicted that: it is a 5% move
-/// where the whole frame decode moves 2x, which is how you can tell it was measuring a different
-/// decoder. **A number carries its codec** (COORDINATION).
-///
-/// Smaller still is not better: cb=16 buys ~8% more encode speed for +17% rate against cb=64's
-/// +3.8%, so 32 is the knee, not a slide. Larger is capped anyway — `abac_decode.wgsl` keeps two
-/// rows of neighbour magnitudes per thread in workgroup memory and is sized for 64.
+/// **Nothing in the table is retracted — the phase changed, not the measurement.** When latency
+/// leads again, 32 is the knee to come back to: cb=16 buys ~8% more encode speed for +17% rate
+/// against cb=64's +3.8%. 64 is also the ceiling: `abac_decode.wgsl` keeps two rows of neighbour
+/// magnitudes per thread in workgroup memory and is sized for it (`MAX_BLOCK_W`).
 ///
 /// `cb` is written per tile, so this is an encoder default and not a format change: a decoder
-/// reads whatever the stream says, and files written at cb=64 keep decoding.
-pub const DEFAULT_CB: u32 = 32;
+/// reads whatever the stream says, and files written at either cb keep decoding. `GNC_ABAC_CB`
+/// overrides it for a measurement without a rebuild.
+pub const DEFAULT_CB: u32 = 64;
 
 /// One tile's worth of code-block streams.
 #[derive(Debug, Clone, PartialEq, Eq)]

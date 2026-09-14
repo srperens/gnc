@@ -186,8 +186,10 @@ threshold of 9, and the encoder emits 2I+8P. Do not build a density claim on it.
 ## Stream density is a pixel rate, and it is ~70-90 Mpixel/s (2026-09-14, PERF-4)
 
 `gnc density`, one device per stream, q=90, steady state only (no setup in the window), on the
-machine `gnc gpu-info` calls **Apple M1 Pro** — *not* the M5 Pro of CLAUDE.md's Platform Notes;
-see COORDINATION. Binary `codec-fingerprint 6a9fa6bd`.
+machine `gnc gpu-info` calls **Apple M1 Pro, 16 cores, 16 GB**. **There are two Macs** — the other
+is the M5 Pro / 20 cores / 64 GB of CLAUDE.md's Platform Notes, and it is **unmeasured** (MEAS-15).
+A Mac row without its machine is not comparable to another Mac row. Binary
+`codec-fingerprint 6a9fa6bd`.
 
 | resolution | one stream | ceiling | streams to reach it | Mpixel/s at the ceiling |
 |---|---|---|---|---|

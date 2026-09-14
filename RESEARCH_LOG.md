@@ -113,11 +113,14 @@ devices. Process-per-stream stays, and the isolation PERF-4 flagged as possibly 
 - **8K does not encode at all.** `bbb_8k.png` wants a 398 MB `enc_raw_input` against the 256 MiB
   `max_buffer_size` GNC deliberately requests (GOALS rule 4). Filed **BUG-58**. It cost the fourth
   resolution point above.
-- **This machine is an Apple M1 Pro with 16 GB.** CLAUDE.md's Platform Notes say *M5 Pro, 20 GPU
-  cores, 64 GB*, and BUG-29 already records that the changeover date is written down nowhere. So
-  either the 2026-09-08 Mac rows came from a different machine or the note is wrong; **nothing
-  here is comparable to an M5 Pro row**, and every number above is labelled with what `gpu-info`
-  printed. That question is for the owner and is not resolved by editing the line.
+- **This machine is an Apple M1 Pro with 16 GB; CLAUDE.md's Platform Notes say M5 Pro / 20 GPU
+  cores / 64 GB. Asked the owner, answered the same day: there are TWO Macs, and both notes were
+  right.** Nothing in the tree said which machine a row came from, which is BUG-29 one level up —
+  the rule now written into CLAUDE.md and COORDINATION is that a throughput row quotes
+  `gnc gpu-info`. **And the answer hands MEAS-5 a cheap experiment**: the other Mac is a 25%
+  larger GPU already in the owner's hands, so "does a bigger GPU carry more Mpixel/s" is one
+  command on it rather than a discrete NVIDIA card. Filed **MEAS-15 (P1)**, with the three
+  outcomes and what each means written down before the run.
 
 ---
 

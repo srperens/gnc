@@ -2848,6 +2848,52 @@ input and q as the `--density-still` rows, with GPU power sampled alongside. **I
 out near 49 W the bottleneck is elsewhere again** and the next suspect is the submission path, not
 the codec.
 
+### MEAS-15 — the second Mac is a 25% bigger GPU, and Claim B is now one command on it (todo, P1)
+
+**Filed 2026-09-14, the moment the owner confirmed there are two Macs.** MEAS-5's Claim B — *a
+bigger GPU buys more GNC throughput where it buys no more fixed-function encoder blocks* — has
+been parked on "needs a discrete NVIDIA card" since it was written. `0085` changed what it costs
+twice over: it restated the unit as **Mpixel/s** rather than instances, and `gnc density` measures
+that in one command. And the hardware is already here.
+
+| machine | GPU | measured ceiling |
+|---|---|---|
+| Apple M1 Pro, 16 GB | 16 cores | **70.8 Mpixel/s** at 1080p (`0085`) |
+| Apple M5 Pro, 64 GB | 20 cores | **unmeasured** |
+
+**The experiment, in full:**
+
+```bash
+gnc gpu-info                                   # paste what it prints into the row
+gnc fingerprint                                # both machines must read the same digest
+python scripts/gpu_tier_bench.py --density-inproc -i test_material/frames/bbb_1080p.png \
+       --quality 90 --iterations 16
+```
+
+Same binary digest, same frame, same q. Read the **Mpixel/s** column, not the fps column.
+
+**What each outcome means, decided before the run** — this is the part that makes it worth an
+item rather than a drive-by:
+
+- **~88 Mpixel/s (+25%, tracking core count).** Claim B holds in its strongest form on this
+  evidence: throughput is core-bound, and a bigger GPU is a bigger encoder. Say so in POSITIONING,
+  with the two rows.
+- **Meaningfully more than +25%.** The M5 generation brings more than cores; good news, and the
+  *architecture*, not just the core count, is part of the claim. Do not attribute it to cores.
+- **~70 Mpixel/s (flat).** Claim B is in trouble and the ceiling is something that does not scale
+  with the GPU — memory bandwidth, the submission path, or PERF-5's device-wide waits. **This is
+  the outcome that matters most and the one the project would least like**, which is exactly why
+  the criterion is written down first.
+
+**Weaker than a discrete card and much cheaper.** Two points, one vendor, generation and core
+count confounded — it cannot separate "more cores" from "newer architecture", and it says nothing
+about a 300 W card. It can still falsify Claim B, and falsifying it on an afternoon is worth more
+than confirming it in a quarter. The NVENC column and the discrete-GPU row stay owed on MEAS-5.
+
+**Do PERF-5 first if both are free.** A third of the M1 Pro is idle on a single stream; measuring
+a second GPU through a pipeline with a known stall reports the stall as much as the hardware.
+
+
 ### PERF-5 — a third of the GPU is idle while one stream runs, and the readback waits device-wide (todo, P1)
 
 **Filed by PERF-4, 2026-09-14, with the number that makes it P1 rather than tuning.** One 1080p

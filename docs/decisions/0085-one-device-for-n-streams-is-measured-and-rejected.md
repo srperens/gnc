@@ -3,8 +3,8 @@
 **Date:** 2026-09-14
 **Item:** PERF-4 (and a correction to MEAS-5's scaling column)
 **Status:** accepted
-**Machine:** Apple M1 Pro, 16 GB, Metal — `gnc gpu-info`, not the CLAUDE.md line (see "What this
-does not settle")
+**Machine:** Apple M1 Pro, 16 GB, Metal — `gnc gpu-info`. **One of two Macs**; the Platform Notes
+describe the other (M5 Pro, 20 GPU cores, 64 GB). See "What this does not settle".
 **Binary:** `codec-fingerprint v1 6a9fa6bd`
 
 ## Context
@@ -113,12 +113,16 @@ the thing GOALS calls the single most important measurement, and this record mov
 answering it: the unit is now **Mpixel/s**, not instances, and the question is whether that number
 tracks GPU size. It needs a second and third GPU, which this machine cannot provide.
 
-**Which Mac the 2026-09-08 rows came from.** CLAUDE.md's Platform Notes describe the dev machine
-as an *Apple M5 Pro, 20 GPU cores, 64 GB*. On the machine that produced every number above,
-`gnc gpu-info` reports **Apple M1 Pro** and `sysctl` reports **16 GB**, 16 cores. So either those
-rows were taken on a different machine or the note is wrong, and BUG-29 already says the changeover
-date is recorded nowhere. Nothing here is comparable to an M5 Pro row, and this record's numbers
-are labelled with what `gpu-info` printed, not with what the note says.
+**Which Mac the 2026-09-08 rows came from — answered 2026-09-14, and it hands MEAS-5 a cheap
+experiment.** There are **two** Macs: the **M5 Pro / 20 GPU cores / 64 GB** of CLAUDE.md's
+Platform Notes, and the **M1 Pro / 16 cores / 16 GB** every number above was taken on. Both notes
+were correct and neither said which machine, which is the BUG-29 shape one level up.
+
+What that is worth: **the second machine is a 25%-larger GPU of a later generation, already in the
+owner's hands.** Claim B restated in this record's unit — *does a bigger GPU carry proportionally
+more Mpixel/s* — is therefore measurable today with `gnc density`, on one input, with no NVIDIA
+hardware. It is a weaker test than a discrete card (two points, same vendor, confounded generation
+and core count) and it is a far cheaper one. Filed as **MEAS-15**.
 
 **The 8K arm.** `bbb_8k.png` cannot be encoded at all: `enc_raw_input` wants 398 MB against a
 256 MiB `max_buffer_size` (the wgpu default GNC deliberately requests, GOALS rule 4). Filed as

@@ -62,11 +62,18 @@ Shader source is in `src/shaders/*.wgsl`. Rust host code is in `src/encoder/` an
 
 ## Platform Notes
 
-- Dev machine: **Apple M5 Pro** — 20 GPU cores, 18 CPU cores, 64 GB, Metal 4. This line said
-  "Apple M1 — 8 GPU cores, ~2.6 TFLOPS FP32" until 2026-09-07 and **the changeover date is not
-  recorded anywhere**, so every throughput figure in this repository labelled M1 is of unknown
-  provenance (BUG-29). Run `gnc gpu-info` rather than trusting this line: it now prints the device
-  and its limits, which is what would have contradicted the wrong text months ago.
+- **Dev machines: there are TWO Macs, and a throughput row must say which one** (confirmed by the
+  owner 2026-09-14):
+  - **Apple M5 Pro** — 20 GPU cores, 18 CPU cores, 64 GB, Metal 4
+  - **Apple M1 Pro** — 16 cores, 16 GB — PERF-4/`0085`'s density ceiling was taken here
+
+  Their GPU core counts differ by 25% and their memory by 4x, so **"on the Mac" is not a label**
+  and two Mac rows are not comparable unless both name their machine. This line said "Apple M1 —
+  8 GPU cores, ~2.6 TFLOPS FP32" until 2026-09-07 with **no changeover date recorded anywhere**,
+  so every throughput figure labelled M1 before then is of unknown provenance (BUG-29) — and the
+  two-machine fact is why that was never resolvable by reading the tree. **Run `gnc gpu-info` and
+  quote what it prints**, rather than trusting this list; it prints the device and its limits,
+  which is what would have contradicted the wrong text months ago.
 - **GNC asks for wgpu's default limits, not the hardware's — with one named override**, so
   *almost* the same shaders run under WebGPU (rule 4). The gap to the adapter is large and
   deliberate — from `gnc gpu-info` on this machine:

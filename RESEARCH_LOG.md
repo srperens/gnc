@@ -114,6 +114,62 @@ the repository, which is what MEAS-16's remaining half does.
 
 ---
 
+### RATE-6 bisected to one commit: it is `0051`'s code-block trade, and it was recorded
+
+`git bisect` over the 106 commits between `a0880c7` and `d7dc8d8`, 7 steps, probe = crowd_run
+17 frames ki=9 q=85 4:2:0 **with `--abac` on both sides** (without it the probe measures
+`58b637f`'s default flip instead of the regression — the first attempt did exactly that and read
+`d7dc8d8` as *cheaper*).
+
+```
+040886c 24736499 GOOD      9863b61 24736516 GOOD
+9e40664 24736516 GOOD      5affeef 25291441 BAD   <- first bad commit
+2fa5775 24736516 GOOD      747815d 25291441 BAD
+```
+
+**`5affeef` — "ENT-10 step 1: abac was not expensive, it was empty — cb 64 -> 32 buys 2.3x encode,
+2x decode" (`docs/decisions/0051`).** The code-block default halved, so a 1080p plane carries 4000
+code-blocks instead of 1000, and every block pays its own floor. That is why the cost is flat
+across content and quality — it is per-block overhead, not coefficient coding, exactly as the shape
+of the data suggested.
+
+**It was measured and written down at the time.** `0051` states the trade in its own commit
+message: *"~2.5 to 3.5 points of rate buys ~2.3x off encode and ~2x off decode"*. My independent
+figure is **+2.0% to +3.5% of rate**, from a different harness, on sequences rather than stills, on
+a different machine. It reproduces the recorded number. **RATE-6 is not a bug and nothing was
+hidden** — the commit even names the consequence: *"BASELINE's --abac rows are now at a non-default
+cb — re-take is MEAS-11."*
+
+**So this entry is that re-take, arrived at backwards.** MEAS-11's +61.0% was measured at
+`a0880c7`, which predates `5affeef` and therefore ran at **cb=64**. The +64.8% here is the same
+ladder at the current default of cb=32. Both numbers are correct; they are different
+configurations, and only one of them is what `main` ships.
+
+### What is left is a decision, not an investigation
+
+The two inputs pull in opposite directions and they are 92 minutes apart on the same day:
+
+- **`8ebfd9e`, 2026-09-14 20:56 — the phase decision.** *"A rate win is worth taking even when it
+  costs encode or decode time."* Phase 1 is bitrate; density, latency and performance items are
+  deferred to P3.
+- **`5affeef`, 2026-09-14 22:28 — `0051`.** Trades ~3 points of rate for 2.3x encode and 2x decode,
+  on the owner's explicit request: *"abac är för mycket latency nu.. något känns knas med den."*
+
+An owner instruction is not overridden by a rule the owner wrote, so `0051` is not in error and
+this is not a case of two documents disagreeing by accident. But **the scoreboard in Current Focus
+still reads +61.0%, and `main` ships +64.8%** — and the gap between them is one knob with a decision
+record. Two things that were not available when `0051` was taken: the rate cost now has a
+**sequence-level, inter-inclusive** number (0051 measured three stills at q∈{90,99}), and the
+encode/decode side has since been re-argued by ENT-15 (abac's GPU encode is running a workload GPUs
+are bad at, not badly written code).
+
+Filed as the restated RATE-6: put cb back on the table as a **priced choice**, measure cb=64 and
+cb=32 on the same ladder, and let the owner spend or keep 3.8 points knowingly. It may well stay at
+32 — but then Current Focus's ladder is re-taken at 32 and stops flattering the project by 3.8
+points.
+
+---
+
 ### Two harness notes
 
 - **The coder label is wrong now.** `meas1_vs_h264.py` prints "GNC Rice" whenever `--abac` is

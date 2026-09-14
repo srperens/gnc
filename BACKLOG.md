@@ -1800,7 +1800,40 @@ three sequences reproduced and hid the problem.
 **Success criterion:** two runs from a clean checkout, by two people, produce the same bbb figure
 without either of them having to ask how the y4m was made.
 
-### RATE-6 — `main` costs +2.0% to +3.5% of rate against `a0880c7` on every sequence, at bit-identical pixels (todo, P1 — restated 2026-09-15)
+### RATE-6 — the scoreboard is quoted at cb=64 and `main` ships cb=32: price the knob and pick one (todo, P1 — bisected 2026-09-15)
+
+> **BISECTED 2026-09-15 to `5affeef` (`docs/decisions/0051`) — not a bug, a recorded trade.**
+> `git bisect` over 106 commits, 7 steps, probe with `--abac` on both sides. The cost is
+> `0051`'s code-block default, 64 -> 32: four times as many code-blocks per plane, each paying its
+> own floor, which is why it is flat across content and quality. `0051` priced it at *"~2.5 to 3.5
+> points of rate buys 2.3x off encode and 2x off decode"* and this measurement reproduces that
+> independently. **Nothing is broken and nothing was hidden.** What remains is the decision below.
+
+**The live problem is that two numbers describe two different codecs.** Current Focus and BASELINE
+quote **+61.0%**, measured at `a0880c7` — before `5affeef`, therefore at **cb=64**. `main` ships
+**cb=32** and measures **+64.8%** on the same ladder. Every rate item is being prioritised against a
+scoreboard the shipped binary does not reach.
+
+**The decision, which is the owner's and nobody else's.** Two inputs, 92 minutes apart on
+2026-09-14: the phase decision (`8ebfd9e`, 20:56) says *a rate win is worth taking even when it
+costs encode or decode time*; `0051` (`5affeef`, 22:28) spends ~3 points of rate for 2.3x encode
+and 2x decode, because the owner asked for exactly that (*"abac är för mycket latency nu"*). An
+owner instruction outranks a rule the owner wrote, so `0051` is not in error — but it was taken on
+**three stills at q in {90,99}** and the sequence-level, inter-inclusive price was unknown until
+now.
+
+**What to do:**
+1. **Run the contribution ladder at cb=64 and cb=32 on the same binary**, three sequences, so the
+   trade is one table instead of two dates. The rate half is ~4 minutes with the harness as it
+   stands; the encode/decode half needs the idle machine (`docs/QUIET_HOUR.md`).
+2. **Re-take Current Focus's +61.0% at whichever cb survives**, and say the cb next to the figure.
+   This is the part that is owed regardless of which way the decision goes.
+3. **Bring ENT-15 into the argument.** It concluded abac's GPU encode is running a workload GPUs
+   are bad at rather than being badly written — which is an argument that cb is buying occupancy
+   that a different structure could buy without paying rate, and that changes what the 2.3x is
+   worth.
+
+**Not a bisect item any more.** The original body is kept below for the numbers.
 
 Measured on a like-for-like 4:2:0-derived source (MEAS-16), same harness, same machine, 1080p,
 17 frames, ki=9, q=85/92/96/99. **PSNR-Y delta is `+0.0000 dB` at all 12 rungs** — bit-identical

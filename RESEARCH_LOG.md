@@ -4,6 +4,73 @@
 
 ---
 
+## ENT-12 — direction in the context is a ~1% lever, not the other half of the J2K gap (CLOSED by measurement 2026-09-14)
+
+**Machine-independent: deterministic numpy over DWT+quantised coefficients — no GPU, no wall clock,
+so unlike a throughput figure this reproduces anywhere.** Ran under Python 3.12 / numpy 1.26.
+`scripts/meas_ent12_pattern.py`, new; reuses `meas4_oracle` and `cond_entropy_bits` from the
+existing `meas_ebcot_context.py`.
+
+### Hypothesis and why it was worth a measurement, not a shader
+
+abac buckets a neighbourhood magnitude **sum** into its context. A sum discards direction: a
+horizontal edge and a vertical edge with the same neighbour-magnitude total land in the same
+context, where EBCOT's orientation-separated zero-coding contexts keep them apart — and edge
+orientation is exactly what a wavelet subband's own orientation makes informative. ENT-4 measured
+abac closing **exactly half** the +54% RGB gap to JPEG 2000 9/7, so ~27 points are unaccounted for,
+and this was a candidate for part of it. The item was filed with its own falsification test: measure
+conditional entropy, don't build a bitstream.
+
+### Method — a clean isolation, direction and nothing else
+
+Domain: quantised wavelet coefficients (the coder's own input). The two arms share the coder
+(significant? / |v|>1 / |v|>2 as context-coded binary decisions, then a bypassed Exp-Golomb
+remainder and sign — common-mode, so they cancel in the delta), share the four *causal* neighbours a
+parallel-safe decode already has (left, up, up-left+up-right), and share a static per-subband table.
+They differ in **one** thing:
+
+- **sum** context = (subband, bucket(magL + magU + magD)) — abac's model
+- **dir** context = (subband, bucket(magL), bucket(magU), bucket(magD)) — direction kept
+
+Both charged the same 0.5·log2(n)-per-context KT cost, which is what punishes the dir arm for having
+more contexts to fill (B³=64 vs 12 per subband). **+KT is the number to believe; raw overstates the
+win because more contexts mechanically lowers conditional entropy.**
+
+### Result — 4 images (animation / low-motion / camera 720p / sport), 3 qsteps
+
+| image | dir vs sum (raw ceiling) | dir vs sum (+KT, fair) |
+|---|---|---|
+| bbb (animation) | −1.1% … −1.2% | −0.4% … −0.9% |
+| blue_sky (low-motion) | −1.6% … −1.7% | −0.7% … −1.2% |
+| kristensara (camera) | −3.0% … −4.6% | −2.1% … −2.6% |
+| touchdown (sport) | −1.3% … −1.6% | −0.5% … −1.0% |
+
+Direction buys **~1% typically (fair accounting often sub-1%), ~2.6% at best** on high-detail camera
+content. Against the pre-registered criterion — *"if it does not move more than a few percent of the
+remaining 27 points, the hypothesis is wrong and the gap is somewhere else"* — this **fails the
+bar**. Direction is a real but marginal lever, not the missing half-gap.
+
+**Corroborated independently by the existing harness**, which contains both models under a different
+binarisation: on `meas_ebcot_context.py`, abac's own sum-based code-block coder (`cb64`, −11.0% to
+−14.5% vs rice-split) already **beats** the pattern-based EBCOT ceiling (`ebcot`, −5.8% to −6.2%).
+Two independent paths agree that spatial-context direction is not where the residue sits.
+
+### Caveats
+
+- Conditional entropy is a **ceiling**; a built static-table coder reaches less. The truth sits
+  between raw and +KT, both small.
+- Luma stills; ENT-4's gap was RGB stills — comparable, not identical.
+- Deterministic, so reproducibility is exact: the bbb and blue_sky rows were byte-identical across
+  two runs (the >5%-variance gate is trivially met at zero variance).
+
+### Verdict
+
+**Close ENT-12 as falsified-by-measurement**, the way the item was designed to be closeable. What
+remains of the J2K gap is not context direction — the next hypothesis has to look elsewhere (ENT-8's
+stripes, or upstream of the entropy coder in the transform/quantiser, per `docs/decisions/0024`).
+
+---
+
 ## ENT-14 — an empty code-block now costs one byte, and that turned abac's worst case into its best (2026-09-14)
 
 **Machine: Apple M1 Pro, 16 cores, 16 GB, Metal.** `codec-fingerprint fb2fe82a` → **`027e58bc`**.

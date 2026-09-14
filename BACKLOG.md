@@ -8845,7 +8845,17 @@ is the default at q>20 as of 2026-09-14. This item defends that decision rather 
 the cheaper abac gets, the less of GOALS §5's "log the cost with the win" there is to log. It is
 also the item that stops abac's cost from being the reason a future rate lever gets declined.
 
-### ENT-12 — abac buckets the neighbourhood *sum*; EBCOT keys on the *pattern*. Is that the other half of the J2K gap? (todo, **P1**)
+### ENT-12 — abac buckets the neighbourhood *sum*; EBCOT keys on the *pattern*. Is that the other half of the J2K gap? (**CLOSED by measurement 2026-09-14 — direction is a ~1% lever, not the half-gap**)
+
+**Answer: no.** The item's own falsification test was run (`scripts/meas_ent12_pattern.py`, a clean
+isolation — same coder, same causal neighbours, static per-subband table, the *only* difference
+sum-context vs direction-context). Direction buys **~1% typically (fair +KT accounting often
+sub-1%), ~2.6% at best** on high-detail camera content, over 4 diverse images at 3 qsteps — below
+the pre-registered "few percent of the remaining 27 points" bar. Corroborated independently: on the
+existing `meas_ebcot_context.py`, abac's sum-based code-block coder (`cb64`, −11% to −14.5%) already
+beats the pattern-based EBCOT ceiling (`ebcot`, −5.8% to −6.2%). Full numbers, method and caveats in
+RESEARCH_LOG. What remains of the J2K gap is not context direction — look to ENT-8's stripes or
+upstream of the coder (`docs/decisions/0024`). Original filing follows.
 
 **Proposed 2026-09-08 by an external reviewer**, whose framing was half wrong about the current
 state and whose surviving half is a good hypothesis with its own falsification test.

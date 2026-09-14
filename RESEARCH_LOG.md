@@ -19263,3 +19263,54 @@ alphabet can be tiled. Not chased this round; it wants its own item.
 - **DX12 still produces zero frames**, now for a groupshared-size reason. First-frame path: make
   rANS pipelines lazy (per 0049), or shrink the shader's groupshared.
 - **Unchanged:** CANARY-1 (2.01x), inter works, MEAS-5 inter 1.85x@N=4, NVENC driver-blocked.
+
+### ...and then the first DX12 frame -- the fused pipeline was eager dead weight
+
+The groupshared blocker fell in one change, and the change taught something. Following 0049, the
+fused rANS pipeline was made lazy: `fused_norm_enc_pipeline` in `rans_gpu_encode.rs` is now a
+`OnceLock` built by an accessor on first dispatch, not in `new`. The shader module and pipeline
+layout stay eager (neither compiles backend code); only `create_compute_pipeline` -- the step DXC's
+DXIL validator runs -- is deferred.
+
+**The discovery in doing it: `encode_3planes_fused` has zero call sites.** The default rANS path
+dispatches `encode_3planes_skip_histogram` / `encode_3planes_to_tiles`, never the fused variant. So
+the 33 KB shader was compiled eagerly in `new` and *never dispatched by anything* -- pure eager dead
+weight that only DX12's validator ever objected to. Making it lazy removes it from every real path.
+
+**Result: GNC encodes on DX12 for the first time.** `benchmark -i bbb -q 90`,
+`GNC_GPU_BACKEND=dx12 WGPU_DX12_COMPILER=dxc`:
+
+| adapter | backend | exit | bytes | PSNR | encode | decode |
+|---|---|---|---|---|---|---|
+| NVIDIA RTX 2000 Ada | DX12 | **0** | 1869134 | 49.89 | 31.97 ms | 21.29 ms |
+| Intel Arc Pro | DX12 | **0** | 1869134 | 49.89 | -- | -- |
+| NVIDIA RTX 2000 Ada | Vulkan | 0 | 1869134 | 49.89 | ~17 ms | -- |
+| Intel Arc Pro | Vulkan | 0 | 1869134 | 49.89 | -- | -- |
+
+**Byte-identical across all four** (2 backends x 2 vendors): 1869134 bytes, PSNR 49.89. DX12's output
+matches Vulkan's exactly. rANS on DX12 works too (`--rans -q 50`: 669465 bytes, byte-identical to
+Vulkan) -- because the default rANS path never touches the fused shader, and the pipelines it does
+use (histogram, normalize, encode, encode_lean) are all under 32 KB.
+
+DX12 is slower than Vulkan on the same card (~32 ms vs ~17 ms encode on the RTX 2000 Ada) -- not
+chased; the point of this item was a *frame*, and portability before speed.
+
+**Verified:** native clippy clean, `--lib` wasm clippy clean, 39 rANS unit tests pass, and rANS
+still encodes correctly on Vulkan (unchanged output). The env-gated DXC change and this laziness
+change are both in.
+
+**What this leaves.** GOALS rule 4 claims DX12, and for the first time GNC meets it -- intra, Rice
+and rANS, on two vendors, byte-identical to Vulkan. `encode_3planes_fused` and its shader are now
+confirmed dead code reachable from no encode path; a follow-up could delete them outright rather than
+keep a lazy pipeline nothing calls. Inter (B-frame) on DX12 is still untested -- `block_match_bidir`
+(BUG-40) may have its own DX12 story. And DX12 needs `dxcompiler.dll` + `dxil.dll` shipped, which the
+release process does not yet do.
+
+### State (updated)
+
+- **DX12: RUNS.** First GNC frame on DX12, both GPUs, byte-identical to Vulkan, Rice and rANS. The
+  two changes: env-gated DXC (`WGPU_DX12_COMPILER=dxc`), and the fused rANS pipeline made lazy.
+- **BUG-52: resolved** -- FXC compile wall gone (DXC), and the groupshared overflow it exposed is
+  gone too (the overflowing shader was never dispatched; lazy creation removes it from the path).
+- **Follow-ups:** delete the dead `encode_3planes_fused` + shader; ship the DXC DLLs in the release;
+  test inter on DX12; DX12 vs Vulkan speed (~2x slower) if it ever matters.

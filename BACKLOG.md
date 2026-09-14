@@ -1617,6 +1617,15 @@ compiles eagerly, so it blocks *every* coder — `--abac` hits the identical err
 default Rice path can produce GNC's first DX12 frame, or shrink the shader under 32 KB. It also
 exceeds GNC's own 16 KB workgroup request.
 
+**Resolved 2026-09-14 (same round, later): DX12 runs.** The fused pipeline was made lazy (`OnceLock`
+in `rans_gpu_encode.rs`, 0049 pattern) — and the lazy change surfaced that `encode_3planes_fused`
+has **zero call sites**: the 33 KB shader was compiled eagerly in `new` and never dispatched by any
+path, pure dead weight only DX12's validator objected to. **GNC now encodes on DX12 for the first
+time** — `bbb q=90` on both GPUs, exit 0, 1869134 bytes / PSNR 49.89, **byte-identical to Vulkan**;
+`--rans -q 50` works too (669465 B, byte-identical). Clippy (native + `--lib` wasm) clean, 39 rANS
+tests pass. **BUG-52 is closed.** Follow-ups (own items): delete the dead `encode_3planes_fused` +
+shader; ship `dxcompiler.dll`/`dxil.dll` in the release; test inter/B-frames on DX12.
+
 ### BUG-40 — the eager `block_match_bidir` pipeline is BUG-25's shape on DX12 (**FIXED 2026-09-08**, step 1)
 
 **Step 1 landed 2026-09-08.** `match_bidir_pipeline`, `compensate_bidir_pipeline` and

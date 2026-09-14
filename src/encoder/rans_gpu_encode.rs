@@ -206,9 +206,15 @@ pub struct GpuRansEncoder {
     encode_pipeline: wgpu::ComputePipeline,
     encode_lean_pipeline: wgpu::ComputePipeline,
     encode_bgl: wgpu::BindGroupLayout,
-    // Fused normalize+encode: single dispatch replaces normalize + encode_lean
-    fused_norm_enc_pipeline: wgpu::ComputePipeline,
+    // Fused normalize+encode: single dispatch replaces normalize + encode_lean.
+    // Built lazily on first dispatch (OnceLock): this shader declares ~33 KB of
+    // threadgroup storage, over DX12's 32 KB limit, so eager creation in `new`
+    // made every DX12 encode fail — including the default Rice path, which never
+    // dispatches rANS. Same rule as motion's split/bidir pipelines (0049).
+    fused_norm_enc_pipeline: std::sync::OnceLock<wgpu::ComputePipeline>,
     fused_norm_enc_bgl: wgpu::BindGroupLayout,
+    fused_ne_shader: wgpu::ShaderModule,
+    fused_ne_pl: wgpu::PipelineLayout,
     cached: Option<CachedEncodeBuffers>,
 }
 
@@ -418,16 +424,11 @@ impl GpuRansEncoder {
                 push_constant_ranges: &[],
             });
 
-        let fused_norm_enc_pipeline =
-            ctx.device
-                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some("rans_fused_ne_pipeline"),
-                    layout: Some(&fused_ne_pl),
-                    module: &fused_ne_shader,
-                    entry_point: Some("main"),
-                    compilation_options: Default::default(),
-                    cache: None,
-                });
+        // The fused pipeline is NOT compiled here — see the field comment and
+        // `fused_norm_enc_pipeline()`. Its shader over-declares threadgroup storage
+        // for DX12, so it is built on first rANS dispatch instead. The shader module
+        // and pipeline layout are kept (neither compiles backend code) so the
+        // accessor only pays for `create_compute_pipeline`.
 
         Self {
             histogram_pipeline,
@@ -437,8 +438,10 @@ impl GpuRansEncoder {
             encode_pipeline,
             encode_lean_pipeline,
             encode_bgl,
-            fused_norm_enc_pipeline,
+            fused_norm_enc_pipeline: std::sync::OnceLock::new(),
             fused_norm_enc_bgl,
+            fused_ne_shader,
+            fused_ne_pl,
             cached: None,
         }
     }
@@ -1222,6 +1225,28 @@ impl GpuRansEncoder {
     /// Fused 3-plane encode: histogram → fused_normalize_encode (2 dispatches instead of 3).
     /// The fused shader keeps cumfreq in shared memory and uses reciprocal multiplication
     /// for faster rANS division.
+    /// Fused normalize+encode pipeline, compiled on first rANS dispatch.
+    ///
+    /// The rule is motion's `split_pipeline`/`match_bidir_pipeline` (0049): a
+    /// shader's cost, including the risk it does not compile, is paid by the
+    /// feature that uses it and not by everything else. `rans_normalize_encode_fused.wgsl`
+    /// declares ~33 KB of threadgroup storage, which DXC rejects against DX12's
+    /// 32 KB limit — so building it in `new` broke every DX12 encode, including the
+    /// default Rice path that never dispatches rANS (BUG-52 follow-up).
+    fn fused_norm_enc_pipeline(&self, ctx: &GpuContext) -> &wgpu::ComputePipeline {
+        self.fused_norm_enc_pipeline.get_or_init(|| {
+            ctx.device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("rans_fused_ne_pipeline"),
+                    layout: Some(&self.fused_ne_pl),
+                    module: &self.fused_ne_shader,
+                    entry_point: Some("main"),
+                    compilation_options: Default::default(),
+                    cache: None,
+                })
+        })
+    }
+
     pub fn encode_3planes_fused(
         &mut self,
         ctx: &GpuContext,
@@ -1341,7 +1366,7 @@ impl GpuRansEncoder {
                     label: Some("rans_fused_ne_pass"),
                     timestamp_writes: None,
                 });
-                pass.set_pipeline(&self.fused_norm_enc_pipeline);
+                pass.set_pipeline(self.fused_norm_enc_pipeline(ctx));
                 pass.set_bind_group(0, &fused_bg, &[]);
                 pass.dispatch_workgroups(num_tiles as u32, 1, 1);
             }

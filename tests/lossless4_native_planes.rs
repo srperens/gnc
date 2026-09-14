@@ -106,9 +106,14 @@ fn native_planes_cost_fewer_bits_than_the_rgb_they_convert_to() {
         &config(100),
     ))
     .len();
-    let via_rgb =
-        gnc::format::serialize_compressed(&enc.encode(gpu(), &rgb, w as u32, h as u32, &config(100)))
-            .len();
+    let via_rgb = gnc::format::serialize_compressed(&enc.encode(
+        gpu(),
+        &rgb,
+        w as u32,
+        h as u32,
+        &config(100),
+    ))
+    .len();
 
     assert!(
         native < via_rgb,

@@ -123,7 +123,10 @@ fn drift_ratio(fmt: ChromaFormat, shift_x: u32, shift_y: u32) -> (f64, Vec<(u32,
     let far = bands[bands.len() - 1].1;
     // A picture this codec reproduces perfectly would divide 0 by 0; the synthetic above always
     // loses something to the subsample, so `near` is comfortably above zero.
-    assert!(near > 0.0, "no error at all near the tile origin: {bands:?}");
+    assert!(
+        near > 0.0,
+        "no error at all near the tile origin: {bands:?}"
+    );
     (far / near, bands)
 }
 

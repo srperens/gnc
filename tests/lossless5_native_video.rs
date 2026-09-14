@@ -212,7 +212,8 @@ fn chroma_4_2_0_survives_the_interleaved_round_trip() {
             .filter(|v| v[0] % 8 != 0 || v[1] % 8 != 0)
             .count();
         assert_eq!(
-            stray, 0,
+            stray,
+            0,
             "frame {i} carries {stray} of {} motion vectors that are not a multiple of 8 \
              quarter-pels, so their halves are half-pel in chroma and the prediction is \
              fractional (BUG-39 cause 4, chroma side)",

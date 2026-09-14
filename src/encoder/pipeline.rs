@@ -1988,192 +1988,219 @@ samples — rounded to integers so the step-1 quantiser has something it can cod
                     (width >> chroma_format.horiz_shift()) as usize,
                     (height >> chroma_format.vert_shift()) as usize,
                 );
-                let luma = pad_plane(y, width as usize, height as usize,
-                                     padded_w as usize, padded_h as usize);
-                let cbp = pad_plane(cb, cw, ch, chroma_padded_w as usize, chroma_padded_h as usize);
-                let crp = pad_plane(cr, cw, ch, chroma_padded_w as usize, chroma_padded_h as usize);
+                let luma = pad_plane(
+                    y,
+                    width as usize,
+                    height as usize,
+                    padded_w as usize,
+                    padded_h as usize,
+                );
+                let cbp = pad_plane(
+                    cb,
+                    cw,
+                    ch,
+                    chroma_padded_w as usize,
+                    chroma_padded_h as usize,
+                );
+                let crp = pad_plane(
+                    cr,
+                    cw,
+                    ch,
+                    chroma_padded_w as usize,
+                    chroma_padded_h as usize,
+                );
                 let (co_buf, cg_buf) = if chroma_format == ChromaFormat::Yuv444 {
                     (&bufs.co_plane, &bufs.cg_plane)
                 } else {
                     (&bufs.co_plane_ds, &bufs.cg_plane_ds)
                 };
-                ctx.queue.write_buffer(&bufs.plane_a, 0, bytemuck::cast_slice(&luma));
-                ctx.queue.write_buffer(co_buf, 0, bytemuck::cast_slice(&cbp));
-                ctx.queue.write_buffer(cg_buf, 0, bytemuck::cast_slice(&crp));
+                ctx.queue
+                    .write_buffer(&bufs.plane_a, 0, bytemuck::cast_slice(&luma));
+                ctx.queue
+                    .write_buffer(co_buf, 0, bytemuck::cast_slice(&cbp));
+                ctx.queue
+                    .write_buffer(cg_buf, 0, bytemuck::cast_slice(&crp));
                 // Canary: the only externally visible sign the planar path ran at all.
                 log::debug!(
                     "planar input: {:?} luma {}x{} -> {}x{}, chroma {}x{} -> {}x{} (no colour \
                      transform, no chroma resample)",
-                    chroma_format, width, height, padded_w, padded_h,
-                    cw, ch, chroma_padded_w, chroma_padded_h
+                    chroma_format,
+                    width,
+                    height,
+                    padded_w,
+                    padded_h,
+                    cw,
+                    ch,
+                    chroma_padded_w,
+                    chroma_padded_h
                 );
             }
             EncodeInput::Rgb(rgb_data) => {
-            // Upload raw (unpadded) input directly to GPU — GPU shader handles padding
-            ctx.queue
-                .write_buffer(&bufs.raw_input_buf, 0, bytemuck::cast_slice(rgb_data));
+                // Upload raw (unpadded) input directly to GPU — GPU shader handles padding
+                ctx.queue
+                    .write_buffer(&bufs.raw_input_buf, 0, bytemuck::cast_slice(rgb_data));
 
-            t_pad = t_start.elapsed();
+                t_pad = t_start.elapsed();
 
-            // ---- Preprocess: GPU pad + color convert + deinterleave ----
-            // Recorded into the same encoder as wavelet+quant+entropy below and submitted once
-            // (PERF-1 item 6). It was its own submit; the P-frame path already batched preprocess
-            // with the rest, so this only brought the I-frame path in line with it. Dispatches in
-            // one encoder are ordered, which is what the wavelet already relies on.
-            //
-            // Under GNC_PROFILE the split is kept, because a phase you cannot time separately is a
-            // phase you cannot profile — same pattern as the wavelet/Rice split further down.
-            cmd = ctx
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("encode_preprocess"),
-                });
+                // ---- Preprocess: GPU pad + color convert + deinterleave ----
+                // Recorded into the same encoder as wavelet+quant+entropy below and submitted once
+                // (PERF-1 item 6). It was its own submit; the P-frame path already batched preprocess
+                // with the rest, so this only brought the I-frame path in line with it. Dispatches in
+                // one encoder are ordered, which is what the wavelet already relies on.
+                //
+                // Under GNC_PROFILE the split is kept, because a phase you cannot time separately is a
+                // phase you cannot profile — same pattern as the wavelet/Rice split further down.
+                cmd = ctx
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("encode_preprocess"),
+                    });
 
-            // GPU pad: raw_input_buf -> input_buf (tile alignment)
-            {
-                // PAD-1: this is the **still-image path, which has no reference frame**, so the
-                // padding may be faded flat — worth -4.63% RGB of intra rate at identical visible
-                // quality (decision 0039). The cached buffer is built with plain replication because
-                // every *sequence* path takes it as-is, and fading it there costs up to 4.03 dB of
-                // worst-frame PSNR by changing what edge blocks predict from. This is the only place
-                // the mode is raised, which is also why the sequence encoder needed no change.
-                #[repr(C)]
-                #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-                struct PadParams {
-                    width: u32,
-                    height: u32,
-                    padded_w: u32,
-                    padded_h: u32,
-                    fill_mode: u32,
-                    _pad0: u32,
-                    _pad1: u32,
-                    _pad2: u32,
+                // GPU pad: raw_input_buf -> input_buf (tile alignment)
+                {
+                    // PAD-1: this is the **still-image path, which has no reference frame**, so the
+                    // padding may be faded flat — worth -4.63% RGB of intra rate at identical visible
+                    // quality (decision 0039). The cached buffer is built with plain replication because
+                    // every *sequence* path takes it as-is, and fading it there costs up to 4.03 dB of
+                    // worst-frame PSNR by changing what edge blocks predict from. This is the only place
+                    // the mode is raised, which is also why the sequence encoder needed no change.
+                    #[repr(C)]
+                    #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+                    struct PadParams {
+                        width: u32,
+                        height: u32,
+                        padded_w: u32,
+                        padded_h: u32,
+                        fill_mode: u32,
+                        _pad0: u32,
+                        _pad1: u32,
+                        _pad2: u32,
+                    }
+                    ctx.queue.write_buffer(
+                        &bufs.pad_params_buf,
+                        0,
+                        bytemuck::bytes_of(&PadParams {
+                            width,
+                            height,
+                            padded_w,
+                            padded_h,
+                            fill_mode: crate::pad_fill_mode(config.pad_fill_decay),
+                            _pad0: 0,
+                            _pad1: 0,
+                            _pad2: 0,
+                        }),
+                    );
+                    let pad_bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("pad_bg"),
+                        layout: &self.pad_bgl,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: bufs.pad_params_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: bufs.raw_input_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: bufs.input_buf.as_entire_binding(),
+                            },
+                        ],
+                    });
+                    let total_padded_pixels = padded_w * padded_h;
+                    let workgroups = total_padded_pixels.div_ceil(256);
+                    let mut pass = cmd.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("pad_pass"),
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(&self.pad_pipeline);
+                    pass.set_bind_group(0, &pad_bg, &[]);
+                    pass.dispatch_workgroups(workgroups, 1, 1);
                 }
-                ctx.queue.write_buffer(
-                    &bufs.pad_params_buf,
-                    0,
-                    bytemuck::bytes_of(&PadParams {
-                        width,
-                        height,
+
+                // Colour convert (RGB -> YCoCg-R) and deinterleave into plane_a/co_plane/cg_plane.
+                //
+                // **LOSSLESS-5.** The matrix runs only when the samples are RGB. `EncodeInput::Rgb`
+                // named the *layout*, interleaved triples, and was read as naming the *colour space*
+                // — so a caller that set `color_space = YCbCrNative` and handed over interleaved
+                // Y'CbCr got the matrix applied on the way in and nothing applied on the way out, and
+                // the frame came back with a worst sample error of 258 on a 0-255 scale. The decoder
+                // has obeyed the header since GP21; this is the encoder side of the same switch.
+                //
+                // It is the same decision `preprocess_to_planes` makes for the sequence encoder, so
+                // it is the same function: the sequence path's intra frames come through here (via
+                // `encode` / `encode_as_reference`), and two copies of this branch is how they would
+                // have disagreed.
+                self.preprocess_to_planes(
+                    ctx,
+                    &mut cmd,
+                    &bufs.input_buf,
+                    &bufs.color_out,
+                    &bufs.plane_a,
+                    &bufs.co_plane,
+                    &bufs.cg_plane,
+                    padded_w,
+                    padded_h,
+                    padded_pixels as u32,
+                    config.is_lossless(),
+                    config.color_space == crate::ColorSpace::YCoCgR,
+                );
+
+                // Chroma downsampling for 4:2:2 / 4:2:0
+                if chroma_format != ChromaFormat::Yuv444 {
+                    let shift_x = chroma_format.horiz_shift();
+                    let shift_y = chroma_format.vert_shift();
+                    // Pass chroma_padded_w as dst_stride and chroma_padded_h as dst_height_padded
+                    // so the shader fills the entire padded buffer (valid region + padding zone)
+                    // with edge-replicated values before the wavelet transform runs.
+                    //
+                    // BUG-49: on a lossless configuration the averaged plane is rounded to integers
+                    // first. Without that the plane is fractional (multiples of 0.5 at 4:2:2, 0.25 at
+                    // 4:2:0), the step-1 quantiser rounds the residual, and MED's open-loop prediction
+                    // turns that half-LSB into drift that grows across each tile. See
+                    // `ChromaResampler::dispatch_with_rounding`.
+                    let round_chroma = config.is_lossless();
+                    self.chroma_down.dispatch_with_rounding(
+                        ctx,
+                        &mut cmd,
+                        &bufs.co_plane,
+                        &bufs.co_plane_ds,
                         padded_w,
                         padded_h,
-                        fill_mode: crate::pad_fill_mode(config.pad_fill_decay),
-                        _pad0: 0,
-                        _pad1: 0,
-                        _pad2: 0,
-                    }),
-                );
-                let pad_bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("pad_bg"),
-                    layout: &self.pad_bgl,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: bufs.pad_params_buf.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: bufs.raw_input_buf.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: bufs.input_buf.as_entire_binding(),
-                        },
-                    ],
-                });
-                let total_padded_pixels = padded_w * padded_h;
-                let workgroups = total_padded_pixels.div_ceil(256);
-                let mut pass = cmd.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("pad_pass"),
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(&self.pad_pipeline);
-                pass.set_bind_group(0, &pad_bg, &[]);
-                pass.dispatch_workgroups(workgroups, 1, 1);
-            }
-
-            // Colour convert (RGB -> YCoCg-R) and deinterleave into plane_a/co_plane/cg_plane.
-            //
-            // **LOSSLESS-5.** The matrix runs only when the samples are RGB. `EncodeInput::Rgb`
-            // named the *layout*, interleaved triples, and was read as naming the *colour space*
-            // — so a caller that set `color_space = YCbCrNative` and handed over interleaved
-            // Y'CbCr got the matrix applied on the way in and nothing applied on the way out, and
-            // the frame came back with a worst sample error of 258 on a 0-255 scale. The decoder
-            // has obeyed the header since GP21; this is the encoder side of the same switch.
-            //
-            // It is the same decision `preprocess_to_planes` makes for the sequence encoder, so
-            // it is the same function: the sequence path's intra frames come through here (via
-            // `encode` / `encode_as_reference`), and two copies of this branch is how they would
-            // have disagreed.
-            self.preprocess_to_planes(
-                ctx,
-                &mut cmd,
-                &bufs.input_buf,
-                &bufs.color_out,
-                &bufs.plane_a,
-                &bufs.co_plane,
-                &bufs.cg_plane,
-                padded_w,
-                padded_h,
-                padded_pixels as u32,
-                config.is_lossless(),
-                config.color_space == crate::ColorSpace::YCoCgR,
-            );
-
-            // Chroma downsampling for 4:2:2 / 4:2:0
-            if chroma_format != ChromaFormat::Yuv444 {
-                let shift_x = chroma_format.horiz_shift();
-                let shift_y = chroma_format.vert_shift();
-                // Pass chroma_padded_w as dst_stride and chroma_padded_h as dst_height_padded
-                // so the shader fills the entire padded buffer (valid region + padding zone)
-                // with edge-replicated values before the wavelet transform runs.
-                //
-                // BUG-49: on a lossless configuration the averaged plane is rounded to integers
-                // first. Without that the plane is fractional (multiples of 0.5 at 4:2:2, 0.25 at
-                // 4:2:0), the step-1 quantiser rounds the residual, and MED's open-loop prediction
-                // turns that half-LSB into drift that grows across each tile. See
-                // `ChromaResampler::dispatch_with_rounding`.
-                let round_chroma = config.is_lossless();
-                self.chroma_down.dispatch_with_rounding(
-                    ctx,
-                    &mut cmd,
-                    &bufs.co_plane,
-                    &bufs.co_plane_ds,
-                    padded_w,
-                    padded_h,
-                    shift_x,
-                    shift_y,
-                    chroma_padded_w,
-                    chroma_padded_h,
-                    round_chroma,
-                );
-                self.chroma_down.dispatch_with_rounding(
-                    ctx,
-                    &mut cmd,
-                    &bufs.cg_plane,
-                    &bufs.cg_plane_ds,
-                    padded_w,
-                    padded_h,
-                    shift_x,
-                    shift_y,
-                    chroma_padded_w,
-                    chroma_padded_h,
-                    round_chroma,
-                );
-                // Canary: `rounded=` is the only externally visible sign that the BUG-49 path ran,
-                // and it must read true for exactly the lossless configurations.
-                log::debug!(
-                    "chroma_downsample: {:?} {}x{} -> {}x{} shift=({},{}) rounded={}",
-                    chroma_format,
-                    padded_w,
-                    padded_h,
-                    chroma_padded_w,
-                    chroma_padded_h,
-                    shift_x,
-                    shift_y,
-                    round_chroma
-                );
-            }
+                        shift_x,
+                        shift_y,
+                        chroma_padded_w,
+                        chroma_padded_h,
+                        round_chroma,
+                    );
+                    self.chroma_down.dispatch_with_rounding(
+                        ctx,
+                        &mut cmd,
+                        &bufs.cg_plane,
+                        &bufs.cg_plane_ds,
+                        padded_w,
+                        padded_h,
+                        shift_x,
+                        shift_y,
+                        chroma_padded_w,
+                        chroma_padded_h,
+                        round_chroma,
+                    );
+                    // Canary: `rounded=` is the only externally visible sign that the BUG-49 path ran,
+                    // and it must read true for exactly the lossless configurations.
+                    log::debug!(
+                        "chroma_downsample: {:?} {}x{} -> {}x{} shift=({},{}) rounded={}",
+                        chroma_format,
+                        padded_w,
+                        padded_h,
+                        chroma_padded_w,
+                        chroma_padded_h,
+                        shift_x,
+                        shift_y,
+                        round_chroma
+                    );
+                }
             }
         }
 

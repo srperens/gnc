@@ -55,7 +55,10 @@ fn fractional(w: u32, h: u32) -> Vec<f32> {
 fn roundtrip(img: &[f32], w: u32, h: u32) -> Vec<f32> {
     let mut config = gnc::quality_preset(100);
     config.entropy_coder = EntropyCoder::Rice;
-    assert!(config.is_lossless(), "q=100 must be a lossless configuration");
+    assert!(
+        config.is_lossless(),
+        "q=100 must be a lossless configuration"
+    );
     let mut enc = EncoderPipeline::new(gpu());
     let frame = enc.encode(gpu(), img, w, h, &config);
     DecoderPipeline::new(gpu()).decode(gpu(), &frame)

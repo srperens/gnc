@@ -1242,7 +1242,9 @@ fn main() {
             // The old path ran BT.601 first, which cannot be undone — the matrix is not
             // integer-invertible, so the file's samples could never come back — and costs 39.2%
             // more bits. `GNC_RGB_PATH=1` forces the old behaviour, which is what an A/B needs.
-            let force_rgb = std::env::var("GNC_RGB_PATH").map(|v| v != "0").unwrap_or(false);
+            let force_rgb = std::env::var("GNC_RGB_PATH")
+                .map(|v| v != "0")
+                .unwrap_or(false);
             let y4m_planes = if input.ends_with(".y4m") && !force_rgb {
                 let mut r = Y4mReader::open(&input);
                 let (yw, yh, cf) = (r.width, r.height, r.chroma_format());
@@ -1259,11 +1261,7 @@ fn main() {
                 None if input.ends_with(".y4m") => {
                     let mut r = Y4mReader::open(&input);
                     let (yw, yh) = (r.width, r.height);
-                    (
-                        r.read_frame_rgb().expect("Y4M file has no frames"),
-                        yw,
-                        yh,
-                    )
+                    (r.read_frame_rgb().expect("Y4M file has no frames"), yw, yh)
                 }
                 None => load_image_rgb_f32_bits(&input, bit_depth),
             };
@@ -4645,7 +4643,11 @@ mod y4m_tests {
     fn y4m_420_and_444_are_unaffected() {
         let (w, h) = (16usize, 8usize);
         for (tag, uv, want) in [
-            ("420jpeg", w.div_ceil(2) * h.div_ceil(2), gnc::ChromaFormat::Yuv420),
+            (
+                "420jpeg",
+                w.div_ceil(2) * h.div_ceil(2),
+                gnc::ChromaFormat::Yuv420,
+            ),
             ("444", w * h, gnc::ChromaFormat::Yuv444),
         ] {
             let p = write_y4m(tag, tag, w, h, uv);

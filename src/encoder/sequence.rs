@@ -216,14 +216,7 @@ impl EncoderPipeline {
         // on this path needs to know.
         if convert_colour {
             self.color.dispatch(
-                ctx,
-                cmd,
-                input_buf,
-                color_out,
-                padded_w,
-                padded_h,
-                true,
-                reversible,
+                ctx, cmd, input_buf, color_out, padded_w, padded_h, true, reversible,
             );
         } else {
             cmd.copy_buffer_to_buffer(
@@ -4417,10 +4410,7 @@ impl EncoderPipeline {
                 );
             });
         }
-        if matches!(entropy_mode, EntropyMode::Rice)
-            && p_skip_thr > 0.0
-            && !config.is_lossless()
-        {
+        if matches!(entropy_mode, EntropyMode::Rice) && p_skip_thr > 0.0 && !config.is_lossless() {
             self.dispatch_tile_skip(
                 ctx,
                 &mut cmd,

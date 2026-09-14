@@ -2282,11 +2282,10 @@ samples — rounded to integers so the step-1 quantiser has something it can cod
             0
         };
         let is_444 = chroma_format == ChromaFormat::Yuv444;
-        let fused_qh_needs_hist = use_fused_qh
-            && is_444
-            && use_gpu_encode
-            && !use_gpu_rice
-            && !(use_gpu_huffman && is_444);
+        // `is_444` is already required above, so the Huffman term's own `&& is_444` was
+        // redundant — clippy::nonminimal_bool, and the simplification is exact.
+        let fused_qh_needs_hist =
+            use_fused_qh && is_444 && use_gpu_encode && !use_gpu_rice && !use_gpu_huffman;
 
         let weights_luma = config.subband_weights.pack_weights();
         let weights_chroma = config.subband_weights.pack_weights_chroma();

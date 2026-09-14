@@ -183,6 +183,32 @@ VMAF, dE00) are deterministic and unaffected; fps and latency are not.
 stated parameters are also inconsistent — "ki=8 ... I+P+B", but ki=8 is below the B-frame
 threshold of 9, and the encoder emits 2I+8P. Do not build a density claim on it.
 
+## Stream density is a pixel rate, and it is ~70-90 Mpixel/s (2026-09-14, PERF-4)
+
+`gnc density`, one device per stream, q=90, steady state only (no setup in the window), on the
+machine `gnc gpu-info` calls **Apple M1 Pro** — *not* the M5 Pro of CLAUDE.md's Platform Notes;
+see COORDINATION. Binary `codec-fingerprint 6a9fa6bd`.
+
+| resolution | one stream | ceiling | streams to reach it | Mpixel/s at the ceiling |
+|---|---|---|---|---|
+| 1280x720 | 46.00 fps | 76.47 fps | 4 | **70.5** |
+| 1920x1080 | 21.69 fps | 34.16 fps | 4 | **70.8** |
+| 3840x2160 | 7.58 fps | 10.72 fps | 2 | **88.9** |
+
+**Quote the Mpixel/s, not the fps and not the instance count.** The fps ceiling moves 7x across
+that range and the pixel rate does not, which is what identifies the limit as GPU throughput
+rather than per-frame or per-process overhead. **One 1080p stream uses ~64% of this GPU** — the
+gap is PERF-5 — and two streams reach the ceiling.
+
+**`--density-still`'s scaling column is not this measurement.** Its N=1 reads 7.27 fps against the
+23.4 above, because its wall clock contains device creation, pipeline build, PNG decode and the
+CPU quality metrics; its 1.69x/1.85x/1.98x is largely those costs amortising. Use it for "what an
+operator sees running N processes", `--density-inproc` for "what this GPU carries".
+
+Setup, for anyone pricing an instance: device 12.9 ms, `EncoderPipeline::new` **24.8 ms** with a
+warm OS shader cache (1 987 ms on the first run after a build), RSS **230 MB** per process and
+~80 MB per additional in-process stream. `docs/decisions/0085`.
+
 ## A second GPU, and the first figures not taken on the Mac (2026-09-07)
 
 NVIDIA RTX 4000 Ada Generation, Ubuntu 24.04.3, driver 580.173.02, Vulkan, wgpu 24.0.5,

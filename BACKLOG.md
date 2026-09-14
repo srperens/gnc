@@ -2180,6 +2180,36 @@ What is known:
 Start with what differs about a tile that is mostly replicated padding at `q=100`: MED's
 per-pixel wavefront over it, and the corner tile's Rice/ZRL streams.
 
+### BUG-58 — 8K does not encode: one buffer wants 398 MB against the 256 MiB GNC requests (todo, P2)
+
+**Found by PERF-4 2026-09-14**, trying to add a fourth resolution point to a throughput sweep:
+
+```
+gnc density -i test_material/frames/bbb_8k.png ...
+wgpu error: Validation Error
+  In Device::create_buffer, label = 'enc_raw_input'
+  Buffer size 398131200 is greater than the maximum buffer size (268435456)
+```
+
+7680x4320 x 3 planes x 4 B = 398 MB in one allocation. **The 256 MiB is not the adapter's limit —
+it is `wgpu::Limits::default()`, which GNC requests on purpose** so the shaders stay inside what a
+WebGPU implementation must provide (GOALS rule 4, `gnc gpu-info`). This adapter would allow
+9 093 MiB. So the fix is not to raise the request; raising it is a decision record and it would
+cost the wasm target the largest frame it can handle.
+
+**The fix is to stop needing one buffer per plane per frame.** The encoder already tiles; the raw
+input does not. Options, cheapest first: (a) chunk `enc_raw_input` into per-tile-row uploads, (b)
+one buffer per plane rather than one for all three (133 MB each, still inside 256 MiB and enough
+for 8K but not for 16K), (c) accept a documented maximum frame size and refuse above it with a
+clear message rather than a wgpu validation panic — which is worth doing **regardless**, since the
+panic above is what a user gets today.
+
+**Why P2 and not lower:** `bbb_8k.png` is in the test material and the README does not say GNC
+cannot encode it. GOALS headlines contribution formats; 8K is at the edge of that, but a validation
+panic is the wrong way to find out. **Why not P1:** no measurement or shipped path depends on it,
+and it cost PERF-4 one data point, not a conclusion.
+
+
 ### LOSSLESS-6 — the native colour space below q=100 (todo, P2)
 
 `benchmark-sequence` takes a Y4M's own Y'CbCr only for a **lossless** request (`0083`). The still
@@ -2739,7 +2769,44 @@ microseconds against a 25 ms frame; do it only alongside the first half.
 after, printed under `GNC_PROFILE`. Below a 50% reduction in that count, close it — the scan's own
 estimate for the whole of item 4 was 0.6 ms of command recording.
 
-### PERF-4 — one device with N queues instead of N processes: the density sweep measures process duplication (todo, **P1**)
+### PERF-4 — one device with N queues instead of N processes: **ANSWERED and rejected 2026-09-14** (`0085`)
+
+**The prescription was built, measured, and does not hold.** `gnc density` runs N encode streams
+as threads in one process, timed on the steady state only, behind a barrier. On an **Apple M1 Pro
+/ 16 GB** (what `gnc gpu-info` prints here — *not* CLAUDE.md's M5 Pro line; see BUG-29), q=90,
+`bbb_1080p.png`, binary `codec-fingerprint 6a9fa6bd`:
+
+| arm | N=1 | N=2 | N=4 | N=8 |
+|---|---|---|---|---|
+| one shared device | 21.90 fps | 1.30x | **1.31x** | 1.30x |
+| one device per stream | 21.69 fps | 1.25x | **1.57x** | 1.54x |
+
+**Removing every per-process cost did not raise the ceiling** (1.31x against the process sweep's
+1.69x), and **sharing the device is worse than not sharing it** — the readback path waits with
+`device.poll(Maintain::Wait)`, which is device-wide, so N streams on one device each wait for all
+N. That is **PERF-5**, and its entire prize is the gap to a number a device per stream already
+gets for free.
+
+**The ceiling is a pixel rate, which is what identifies it.** Per-stream devices, three
+resolutions: 720p 70.5 Mpixel/s, 1080p 70.8, 4K 88.9 — against fps ceilings of 76.5, 34.2 and
+10.7. A fixed overhead would flatten in fps; this flattens in pixels. **GNC is throughput-bound at
+~70-90 Mpixel/s on this GPU**, one 1080p stream uses ~64% of it, and two streams reach it.
+
+**And `--density-still`'s scaling column is not a concurrency measurement.** Its N=1 reads
+**7.27 fps** where steady state is **23.4** — the wall clock contains device creation, pipeline
+build, PNG decode and CPU quality metrics — so its 1.69x/1.85x/1.98x is substantially setup
+amortisation. Use it for "what an operator sees running N processes"; use `--density-inproc` for
+"how many streams does this GPU carry".
+
+**Two of the premises did not reproduce here.** Pipeline build is **24.8 ms** with a warm shader
+cache (1 987 ms on the first run after a build, which is where the "15 s per instance" came from),
+and RSS is **230 MB** per process / ~80 MB per additional in-process stream, not 1.8 GB.
+
+**Shipped:** `gnc density`, `gpu_tier_bench.py --density-inproc`, `tests/concurrent_streams.rs`
+(four streams on one device must code byte-identically to one stream alone), `docs/decisions/0085`.
+**Refused:** the shared-device build. Process-per-stream stays, and the isolation this item flagged
+as possibly a requirement is now free rather than a trade. Full numbers in RESEARCH_LOG.
+
 
 **Diagnosed 2026-09-08 by an external reviewer, from MEAS-5's own numbers**, and correctly framed
 as a question rather than a recommendation: *"är arkitekturen en process per ström, var och en med
@@ -2780,6 +2847,37 @@ constraint and Claim B has to be argued with it included, not measured around it
 input and q as the `--density-still` rows, with GPU power sampled alongside. **If power still tops
 out near 49 W the bottleneck is elsewhere again** and the next suspect is the submission path, not
 the codec.
+
+### PERF-5 — a third of the GPU is idle while one stream runs, and the readback waits device-wide (todo, P1)
+
+**Filed by PERF-4, 2026-09-14, with the number that makes it P1 rather than tuning.** One 1080p
+stream encodes at **45.0 Mpixel/s** on a GPU whose measured ceiling is **70.8** (`0085`). So
+**36% of this GPU is idle while a single stream runs**, and the only way GNC currently reaches the
+ceiling is by running a second stream — which is exactly the thing an operator would rather not
+have to do to use the card they paid for.
+
+**The suspect is named and is in the tree.** The readback path waits with
+`device.poll(Maintain::Wait)`: it returns when *everything* submitted on that device has completed.
+There are ~40 counted call sites (`gpu_util::poll_wait` and its callers in `sequence.rs`,
+`pipeline.rs`, `abac_gpu_encode.rs`). `POLL_WAITS` already counts them per frame — PERF-1 built
+that counter precisely because a wall-clock delta on a shared machine means nothing — so the
+instrument exists and the before/after is a count, not a stopwatch.
+
+Two things this buys, and they are different sizes:
+
+1. **Single stream.** Each wait is a full driver round trip that stalls the CPU until the GPU
+   drains. Fewer of them, or waits scoped to the caller's own submission
+   (`Maintain::WaitForSubmissionIndex`, threaded from each `queue.submit`), should close part of
+   the 45 → 70 Mpixel/s gap. This is the prize.
+2. **Shared device.** It also removes the coupling that made a shared device *worse* than N
+   devices in `0085` (1.31x against 1.57x). That half is worth little on its own — `0085` rejected
+   the architecture it would help — and must not be used to justify the item.
+
+**Success criterion:** `poll_wait_count()` per frame down, and single-stream 1080p Mpixel/s up by
+≥10% at unchanged `codec-fingerprint`. Measure with `gnc density --streams 1` (steady state only,
+no setup in the window) and confirm the ceiling with `--streams 4`. An unchanged fingerprint is
+mandatory: this must move timing and nothing else.
+
 
 ### PERF-3 — the decode side is **not** bandwidth-bound; item 8 is a wash and items 9–11 are mispriced (**item 8 answered 2026-09-08**, P3)
 
@@ -4656,6 +4754,24 @@ whether moving bits from chroma to luma closes part of the +90.5%. Judge on luma
 together — that sweep was run once on VMAF, looked like a free 15%, and reversed sign on dE00.
 
 ### MEAS-5 — Concurrent streams per GPU vs fixed-function: Claim A on a third machine, and a red flag against Claim B (P0)
+
+> **2026-09-14, PERF-4 (`0085`): the scaling column below is not a concurrency measurement, and
+> the unit of Claim B changes.** `--density-still`'s N=1 row reads **7.27 fps** on an idle M1 Pro
+> where the same binary's steady-state encode is **23.4 fps** — its wall clock carries device
+> creation, pipeline build, PNG decode and the CPU quality metrics. Dividing by an N=1 that is 3x
+> too slow is most of why the column reads 1.69x/1.85x/1.98x: an in-process build with **every**
+> per-process cost removed reaches only **1.31x** (shared device) / **1.57x** (device per stream).
+> The rows are still the right answer to "what does an operator see running N processes"; they are
+> not evidence about GPU concurrency.
+>
+> **And the ceiling has been identified: it is a pixel rate, not instances and not processes.**
+> 70.5 / 70.8 / 88.9 Mpixel/s at 720p / 1080p / 4K, against fps ceilings that move 7x across that
+> range. One 1080p stream already uses ~64% of this GPU. **So Claim B should be stated in
+> Mpixel/s** — "does a bigger GPU carry proportionally more pixels per second" — which is
+> measurable on one machine at a time and does not depend on how streams are packaged. The NVENC
+> column is still owed; the per-process memory and startup work this item called "actionable ahead
+> of it" is answered and was not the constraint (pipeline build 24.8 ms warm, RSS 230 MB/process).
+
 
 **`--density-still` ran on an idle Mac 2026-09-08.** q=90, 24 iterations per instance:
 

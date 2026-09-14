@@ -587,6 +587,67 @@ enum Command {
     /// Names printed here are what `GNC_GPU_ADAPTER` matches against (substring,
     /// case-insensitive), so this is the first command to run on a new machine.
     GpuInfo,
+
+    /// PERF-4 / MEAS-5: N concurrent encode streams inside **one process**.
+    ///
+    /// `scripts/gpu_tier_bench.py --density-still` answers the same question by launching N
+    /// copies of this binary, so every instance pays its own device creation, its own shader
+    /// compilation and its own buffers. Two machines then agreed on ~1.7-1.85x from N=4 while
+    /// the GPU drew 2-49 W — an overhead ceiling, not a compute one. This subcommand removes
+    /// the duplication that measurement was dominated by, and keeps a control that puts it
+    /// back one layer at a time:
+    ///
+    /// * default — one `GpuContext`, N streams, N sets of pipelines and buffers;
+    /// * `--per-stream-device` — N devices in one process (what N processes do, minus the
+    ///   process);
+    /// * `--serial` — the same total frames through one stream, so the aggregate row has a
+    ///   same-binary 1x to divide by.
+    ///
+    /// Steady state is timed on its own, behind a barrier, after every stream has built its
+    /// pipelines and encoded a warm-up frame — the setup cost is reported separately rather
+    /// than folded into the frame rate.
+    Density {
+        /// Input image file (a still; this loops one frame, like `--density-still`)
+        #[arg(short, long)]
+        input: String,
+
+        /// Encode iterations **per stream** in the timed window
+        #[arg(short = 'n', long, default_value = "24")]
+        iterations: u32,
+
+        /// Quality preset (1-100)
+        #[arg(short = 'q', long, default_value = "90")]
+        quality: u32,
+
+        /// Number of concurrent streams in this process
+        #[arg(long, default_value = "1")]
+        streams: u32,
+
+        /// Give every stream its own device instead of sharing one. The control for
+        /// "is the ceiling the device, or the process?"
+        #[arg(long)]
+        per_stream_device: bool,
+
+        /// Run the same total frame count through a single stream. The same-binary 1x.
+        #[arg(long)]
+        serial: bool,
+
+        /// Decode each encoded frame too, so the row covers a round trip rather than encode only
+        #[arg(long)]
+        decode: bool,
+
+        /// Use the abac entropy coder
+        #[arg(long)]
+        abac: bool,
+
+        /// Chroma subsampling format: 444 (default), 422, or 420
+        #[arg(long, default_value = "444")]
+        chroma_format: String,
+
+        /// Emit the summary as one JSON object on stdout, for a harness to collect
+        #[arg(long)]
+        json: bool,
+    },
     /// Print a behavioural fingerprint of this binary's encoder: what it *produces*, not what it is.
     ///
     /// **COORD-6.** Five of the seven recorded measurement failures in this repository are one
@@ -1093,6 +1154,285 @@ fn csv_with_suffix(path: &str, suffix: &str) -> String {
     }
 }
 
+/// Parameters of one `density` run. A struct rather than ten positional arguments,
+/// because the two boolean control flags are the point of the command and are easy
+/// to transpose.
+struct DensityArgs {
+    input: String,
+    iterations: u32,
+    quality: u32,
+    streams: u32,
+    per_stream_device: bool,
+    serial: bool,
+    decode: bool,
+    abac: bool,
+    chroma_format: String,
+    json: bool,
+}
+
+/// What one stream reports back. Every duration is measured inside the stream's own
+/// thread, so the setup columns are per stream and genuinely concurrent, not a sum.
+struct StreamTiming {
+    stream: u32,
+    device_ms: f64,
+    pipeline_ms: f64,
+    warmup_ms: f64,
+    /// When this stream left the barrier, relative to the run's start.
+    start_s: f64,
+    /// When this stream finished its last iteration, relative to the run's start.
+    end_s: f64,
+    frames: u32,
+    bytes: usize,
+}
+
+/// PERF-4: N concurrent streams in one process, with the device shared or not.
+///
+/// The measurement the process-per-stream sweep cannot make. It is timed in two parts on
+/// purpose: `setup` is everything paid once per stream (device, pipelines, first frame) and
+/// `steady` is the timed window behind a barrier. Folding the two together is what made
+/// `--density-still` report a 15-second pipeline compilation as a frame rate.
+fn run_density(args: DensityArgs) {
+    use std::sync::Barrier;
+    use std::time::Instant;
+
+    let DensityArgs {
+        input,
+        iterations,
+        quality,
+        streams,
+        per_stream_device,
+        serial,
+        decode,
+        abac,
+        chroma_format,
+        json,
+    } = args;
+
+    let streams = streams.max(1);
+    // `--serial` puts the same total work through one stream, so the aggregate row has a
+    // 1x from this binary rather than from a different harness.
+    let (n_threads, per_thread_iters) = if serial {
+        (1u32, streams * iterations)
+    } else {
+        (streams, iterations)
+    };
+
+    let load_start = Instant::now();
+    let (rgb_data, w, h) = load_image_rgb_f32_bits(&input, 8);
+    let load_ms = load_start.elapsed().as_secs_f64() * 1000.0;
+    let rgb_data = Arc::new(rgb_data);
+
+    let mut config = gnc::quality_preset(quality);
+    if abac {
+        config.entropy_coder = gnc::EntropyCoder::Abac;
+    }
+    config.chroma_format = parse_chroma_format(&chroma_format);
+    config.normalize_for_chroma();
+
+    // One device, or one per stream. Built before the threads start either way, so the
+    // shared device is not itself inside the timed window.
+    let shared_start = Instant::now();
+    let shared_ctx: Option<Arc<GpuContext>> = if per_stream_device {
+        None
+    } else {
+        Some(Arc::new(GpuContext::new()))
+    };
+    let shared_device_ms = shared_start.elapsed().as_secs_f64() * 1000.0;
+
+    let adapter_name = shared_ctx
+        .as_ref()
+        .map(|c| gnc::describe_adapter(&c.adapter.get_info()));
+
+    if !json {
+        println!(
+            "density: {}x{} q={} {} stream(s) x {} iterations, {} device(s), {}",
+            w,
+            h,
+            quality,
+            n_threads,
+            per_thread_iters,
+            if per_stream_device { n_threads } else { 1 },
+            if decode { "encode+decode" } else { "encode" }
+        );
+        if let Some(name) = &adapter_name {
+            println!("  device: {}", name);
+        }
+    }
+
+    let barrier = Barrier::new(n_threads as usize);
+    let run_start = Instant::now();
+
+    let timings: Vec<StreamTiming> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..n_threads)
+            .map(|stream| {
+                let barrier = &barrier;
+                let rgb = Arc::clone(&rgb_data);
+                let config = config.clone();
+                let shared = shared_ctx.clone();
+                scope.spawn(move || {
+                    // Each stream's own device, or a handle on the shared one.
+                    let dev_start = Instant::now();
+                    let owned;
+                    let ctx: &GpuContext = match &shared {
+                        Some(c) => c,
+                        None => {
+                            owned = GpuContext::new();
+                            &owned
+                        }
+                    };
+                    let device_ms = dev_start.elapsed().as_secs_f64() * 1000.0;
+
+                    // Pipelines are per stream even when the device is shared: they own the
+                    // mutable buffer cache, which is stream state, not program state.
+                    let pipe_start = Instant::now();
+                    let mut encoder = EncoderPipeline::new(ctx);
+                    let decoder = decode.then(|| DecoderPipeline::new(ctx));
+                    let pipeline_ms = pipe_start.elapsed().as_secs_f64() * 1000.0;
+
+                    // Warm-up. First-frame cost is buffer allocation and driver warm-up, and
+                    // it belongs in setup rather than in the frame rate.
+                    let warm_start = Instant::now();
+                    let warm = encoder.encode(ctx, &rgb, w, h, &config);
+                    if let Some(d) = &decoder {
+                        let _ = d.decode_u8(ctx, &warm);
+                    }
+                    let warmup_ms = warm_start.elapsed().as_secs_f64() * 1000.0;
+
+                    barrier.wait();
+
+                    let start_s = run_start.elapsed().as_secs_f64();
+                    let mut bytes = 0usize;
+                    for _ in 0..per_thread_iters {
+                        let compressed = encoder.encode(ctx, &rgb, w, h, &config);
+                        bytes += compressed.byte_size();
+                        if let Some(d) = &decoder {
+                            let px = d.decode_u8(ctx, &compressed);
+                            std::hint::black_box(&px);
+                        }
+                    }
+                    let end_s = run_start.elapsed().as_secs_f64();
+
+                    StreamTiming {
+                        stream,
+                        device_ms,
+                        pipeline_ms,
+                        warmup_ms,
+                        start_s,
+                        end_s,
+                        frames: per_thread_iters,
+                        bytes,
+                    }
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("density stream panicked"))
+            .collect()
+    });
+
+    // The timed window runs from the last stream leaving the barrier to the last stream
+    // finishing. Taking the *max* start is deliberate: the barrier releases within
+    // microseconds, and using the min would credit the aggregate with time no stream
+    // could have used.
+    let window_start = timings.iter().map(|t| t.start_s).fold(f64::MIN, f64::max);
+    let window_end = timings.iter().map(|t| t.end_s).fold(f64::MIN, f64::max);
+    let steady_s = (window_end - window_start).max(f64::EPSILON);
+    let total_frames: u32 = timings.iter().map(|t| t.frames).sum();
+    let aggregate_fps = total_frames as f64 / steady_s;
+    let per_stream_fps = aggregate_fps / n_threads as f64;
+
+    let setup_ms: f64 = timings
+        .iter()
+        .map(|t| t.device_ms + t.pipeline_ms + t.warmup_ms)
+        .fold(0.0, f64::max);
+
+    if json {
+        let per_stream: Vec<String> = timings
+            .iter()
+            .map(|t| {
+                format!(
+                    "{{\"stream\":{},\"device_ms\":{:.1},\"pipeline_ms\":{:.1},\
+                     \"warmup_ms\":{:.1},\"frames\":{},\"bytes\":{},\"seconds\":{:.3}}}",
+                    t.stream,
+                    t.device_ms,
+                    t.pipeline_ms,
+                    t.warmup_ms,
+                    t.frames,
+                    t.bytes,
+                    t.end_s - t.start_s
+                )
+            })
+            .collect();
+        println!(
+            "{{\"streams\":{},\"iterations\":{},\"quality\":{},\"shared_device\":{},\
+             \"serial\":{},\"decode\":{},\"width\":{},\"height\":{},\"total_frames\":{},\
+             \"steady_s\":{:.3},\"aggregate_fps\":{:.2},\"per_stream_fps\":{:.2},\
+             \"setup_ms_max\":{:.1},\"shared_device_ms\":{:.1},\"load_ms\":{:.1},\
+             \"per_stream\":[{}]}}",
+            n_threads,
+            per_thread_iters,
+            quality,
+            !per_stream_device,
+            serial,
+            decode,
+            w,
+            h,
+            total_frames,
+            steady_s,
+            aggregate_fps,
+            per_stream_fps,
+            setup_ms,
+            shared_device_ms,
+            load_ms,
+            per_stream.join(",")
+        );
+        return;
+    }
+
+    // The canary: per-stream rows prove N streams ran and each did its own frames.
+    // A run that silently collapsed to one stream is visible here and nowhere else.
+    println!(
+        "\n  {:>6} {:>10} {:>10} {:>10} {:>8} {:>9} {:>10}",
+        "stream", "device ms", "pipe ms", "warmup ms", "frames", "seconds", "fps"
+    );
+    for t in &timings {
+        let secs = (t.end_s - t.start_s).max(f64::EPSILON);
+        println!(
+            "  {:>6} {:>10.1} {:>10.1} {:>10.1} {:>8} {:>9.3} {:>10.2}",
+            t.stream,
+            t.device_ms,
+            t.pipeline_ms,
+            t.warmup_ms,
+            t.frames,
+            secs,
+            t.frames as f64 / secs
+        );
+    }
+    println!(
+        "\n  image load           {:>8.1} ms (once for the process; N processes pay it N times)",
+        load_ms
+    );
+    if !per_stream_device {
+        println!(
+            "  shared device        {:>8.1} ms (once for the process)",
+            shared_device_ms
+        );
+    }
+    println!(
+        "  setup, worst stream  {:>8.1} ms (device + pipelines + first frame)",
+        setup_ms
+    );
+    println!(
+        "  steady window        {:>8.3} s for {} frames",
+        steady_s, total_frames
+    );
+    println!(
+        "  aggregate            {:>8.2} fps   ({:.2} fps per stream)",
+        aggregate_fps, per_stream_fps
+    );
+}
+
 /// Build a `CodecConfig` from the common CLI parameters shared by both the
 /// streaming and non-streaming I+P+B encode paths.
 // Every parameter comes directly from CLI args; a builder struct would be
@@ -1507,6 +1847,32 @@ survive only into a Y4M output (LOSSLESS-4)."
                     Err(e) => println!("\nCould not open a device to report limits: {e}"),
                 }
             }
+        }
+
+        Command::Density {
+            input,
+            iterations,
+            quality,
+            streams,
+            per_stream_device,
+            serial,
+            decode,
+            abac,
+            chroma_format,
+            json,
+        } => {
+            run_density(DensityArgs {
+                input,
+                iterations,
+                quality,
+                streams,
+                per_stream_device,
+                serial,
+                decode,
+                abac,
+                chroma_format,
+                json,
+            });
         }
 
         Command::Benchmark {

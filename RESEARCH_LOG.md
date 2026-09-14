@@ -4,6 +4,123 @@
 
 ---
 
+## PERF-4 — the density sweep was not measuring process duplication, and one device for N streams is worse than N devices (2026-09-14)
+
+**Machine: Apple M1 Pro, 16 GB, Metal** — what `gnc gpu-info` printed, not what CLAUDE.md's
+Platform Notes say (see the last section). **Binary: `codec-fingerprint v1 6a9fa6bd`.** All rows
+q=90, `bbb_1080p.png` unless stated, 16 iterations per stream, machine otherwise idle.
+
+### The hypothesis, and why it was the right experiment
+
+PERF-4 came from an external reviewer reading MEAS-5's own numbers: the process sweep flattens at
+1.69x (Mac) / 1.85x (Windows) from N=4 while the GPU draws 2-49 W, each process costs ~1.8 GB and
+~15 s of pipeline compilation. Diagnosis: what flattens is **process duplication**, not the GPU.
+Prescription: one device, one set of pipelines, N submissions in flight, in one process.
+
+It is the right experiment because MEAS-5 Claim B — a bigger GPU buys more GNC streams where it
+buys no more fixed-function encoder blocks — is what GOALS calls the single most important thing
+to measure, and it was being measured by a harness whose N=1 row is dominated by setup.
+
+**Success criterion, set before building:** aggregate throughput against N for a shared-device
+build, same input and q as `--density-still`. If the diagnosis is right, the shared build scales
+past 1.69x.
+
+### What was built
+
+`gnc density` — N encode streams as threads in one process, timed **only** over the steady-state
+window, behind a barrier, after every stream has built its pipelines and encoded a warm-up frame.
+Three arms: one shared device; one device per stream (what N processes do, minus the process);
+`--serial`, the same total frames through one stream, so the aggregate row has a same-binary 1x.
+`scripts/gpu_tier_bench.py --density-inproc` runs the first two and prints a Mpixel/s column.
+Canary: the per-stream table prints each stream's device, pipeline, warm-up and frame count, so a
+run that silently collapsed to one stream is visible.
+
+### Result — the hypothesis is refuted
+
+| arm | N=1 | N=2 | N=4 | N=8 |
+|---|---|---|---|---|
+| one shared device | 21.90 fps | 28.39 (1.30x) | 28.67 (**1.31x**) | 28.39 (1.30x) |
+| one device per stream | 21.69 fps | 27.13 (1.25x) | 34.16 (**1.57x**) | 33.49 (1.54x) |
+| `--serial`, 128 frames one stream | 21.74 fps | | | |
+
+**Removing every per-process cost did not raise the ceiling** — 1.31x against the process sweep's
+1.69x. And **sharing the device is worse than not sharing it.** Reproduced across three sweeps;
+the ratios hold within 0.05 while absolute fps drifted 7% between the first and second run
+(thermal — the ratios are the quotable part, per COORDINATION's timing rule).
+
+### Why sharing is worse, and it is in the tree rather than in the driver
+
+The readback path waits with `device.poll(Maintain::Wait)`, which is **device-wide**: it returns
+when everything submitted on that device has completed, not when the caller's own submission has.
+N streams on one device means each stream's readback waits for all N. ~40 call sites
+(`gpu_util::poll_wait` and callers). Filed as **PERF-5** — `Maintain::WaitForSubmissionIndex`
+threaded from each `queue.submit` — but note the prize: it recovers 1.31x to at best the 1.57x a
+device per stream already gets for free.
+
+### What the ceiling actually is — a pixel rate, measured at three resolutions
+
+A fixed per-frame or per-dispatch overhead flattens in **frames** per second and reads the same at
+every resolution. A GPU throughput limit flattens in **pixels** per second. One device per stream:
+
+| resolution | N=1 fps | ceiling fps | Mpixel/s at the ceiling | N=1 as % of ceiling |
+|---|---|---|---|---|
+| 1280x720 (`kristensara`) | 46.00 | 76.47 (N=4) | **70.5** | 60% |
+| 1920x1080 (`bbb`) | 21.69 | 34.16 (N=4) | **70.8** | 64% |
+| 3840x2160 (`bbb`, resampled) | 7.58 | 10.72 (N=2) | **88.9** | 71% |
+
+The fps ceiling moves 7x across that range; the pixel rate does not. **GNC is throughput-bound at
+~70-90 Mpixel/s on this GPU**, one 1080p stream already uses ~64% of it, and two streams reach it.
+That is the density statement for this machine, and it is about the GPU.
+
+### The harness correction, which is the other half of the finding
+
+`--density-still` on this machine, same frame, same q, same 24 iterations: **N=1 = 7.27 fps**,
+against a true steady-state **23.4 fps**. Its wall clock contains device creation, pipeline build,
+PNG decode, the CPU quality metrics and teardown. **Dividing by an N=1 row that is 3x too slow is
+what produced a scaling column larger than an idealised in-process build can reach**, and its
+1.69x/1.85x/1.98x rows are substantially setup amortisation, not concurrency. They are still the
+right rows for "what does an operator see running N processes" — they are not a concurrency
+measurement, and MEAS-5 should stop reading them as one.
+
+### Two premises that did not reproduce
+
+- **~15 s of pipeline compilation per instance.** With a warm OS shader cache,
+  `EncoderPipeline::new` is **24.8 ms** and device creation **12.9 ms**. The first run after a
+  fresh build took **1 987 ms**. It is a cold-cache first-run cost, not a per-instance one.
+- **~1.8 GB per process.** `gnc benchmark` peaks at **230 MB** RSS at 1080p here; in-process
+  streams cost 164 MB for the first and ~80 MB for each additional (651 MB at N=8). The 1.8 GB is
+  a Windows/Vulkan inter-frame figure and should be re-taken rather than carried.
+
+### Correctness, since concurrency is new
+
+`tests/concurrent_streams.rs`: four streams sharing one device, four rounds each, must each code
+the reference frame to **exactly** the byte count one stream alone produces. A race would show as
+a slightly different coded size, which no throughput number would notice and the fingerprint
+matrix cannot see because it is single-threaded. Passes. `codec-fingerprint` unchanged at
+`6a9fa6bd` across the one encoder edit in this change (a `clippy::nonminimal_bool` simplification
+in `pipeline.rs` that was blocking the gate, exact by inspection and by the fingerprint).
+
+### Would we ship this? What it cost, and what was refused
+
+Shipped: the measurement (`gnc density`, `--density-inproc`), the test, and `docs/decisions/0085`
+rejecting the shared-device architecture. **Refused:** building it. It is more code, it couples
+the streams through a device-wide wait, and its number is already available from N independent
+devices. Process-per-stream stays, and the isolation PERF-4 flagged as possibly a *requirement*
+(crash containment, tenancy) is now free rather than a trade.
+
+### Two things this ran into and did not chase
+
+- **8K does not encode at all.** `bbb_8k.png` wants a 398 MB `enc_raw_input` against the 256 MiB
+  `max_buffer_size` GNC deliberately requests (GOALS rule 4). Filed **BUG-58**. It cost the fourth
+  resolution point above.
+- **This machine is an Apple M1 Pro with 16 GB.** CLAUDE.md's Platform Notes say *M5 Pro, 20 GPU
+  cores, 64 GB*, and BUG-29 already records that the changeover date is written down nowhere. So
+  either the 2026-09-08 Mac rows came from a different machine or the note is wrong; **nothing
+  here is comparable to an M5 Pro row**, and every number above is labelled with what `gpu-info`
+  printed. That question is for the owner and is not resolved by editing the line.
+
+---
+
 ## BUG-57 — the bit-exact rung was deleting a tile's residual, and a border tile's mean is 89% padding (2026-09-11)
 
 **Filed by LOSSLESS-5 the same afternoon**, once a Y4M sequence was exact enough end to end for one

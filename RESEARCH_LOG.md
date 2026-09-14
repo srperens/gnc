@@ -19364,3 +19364,40 @@ signature to test it against.
 **Net:** DX12 inter is done -- P and B both run and match Vulkan, and DXC closes BUG-40 step 2. The
 B-frame quality defect is real but pre-existing, backend-independent, and already filed as BUG-5;
 chasing its root cause is the next item.
+
+### Chasing it: the B-frame valley is not rate, not averaging -- B4's residual does not reconstruct
+
+The pulse lives on **B4**, the pyramid base. `sequence.rs:937` (#49) codes B4 as a **forward-only
+P-frame** from I0 (via `encode_pframe`), tagged `Bidirectional` with `backward_vectors=None`, so
+P8 can reference it at 4 frames instead of 8. So B4 is a long-range forward prediction, and its
+35.56 dB is byte-for-byte the quality a plain P-frame gets at 4-frame distance (ki=5 P-only frame 4
+is *also* 35.56 dB). That much looked like "B4 is just a hard P."
+
+It is not. Added an env-gated diagnostic, `GNC_B4_QSTEP_MUL`, that scales **only B4's** qstep
+(`sequence.rs`, default unset = unchanged). Finer quantisation on B4 should raise its PSNR toward
+lossless -- the residual is `source - prediction`, and coding it finely recovers `source` whatever
+the prediction was. It does not:
+
+| GNC_B4_QSTEP_MUL | B4 bytes | B4 PSNR | total bytes |
+|---|---|---|---|
+| 1.0 (default) | 387201 | 35.56 | 3685051 |
+| 0.5 | 481458 | 35.56 | 3752545 |
+| 0.25 | 575709 | 35.57 | 3839671 |
+| 0.1 | 714930 | 35.57 | 3979965 |
+
+**10x finer qstep nearly doubles B4's bytes and moves its PSNR by 0.01 dB.** The residual is being
+coded -- the bytes prove it -- and it is not reconstructing the signal. That rules out both prior
+stories: it is **not** rate allocation (more bits do nothing) and **not** BUG-5's "bidirectional
+averaging is half a step off" (the other B-frames are fine at 59 dB; B4 is coded forward-only, no
+averaging involved).
+
+**The signature of a fixed prediction mismatch.** A quality pinned against qstep is what you get when
+the decoder reconstructs B4 from a *different* prediction than the encoder subtracted: reconstruction
+becomes `decoder_pred + (source - encoder_pred) = source + (decoder_pred - encoder_pred)`, and that
+error term is independent of how finely the residual is coded. B4 is coded through the P-frame path
+but tagged `Bidirectional`; the comment at `sequence.rs:943` *asserts* the decoder "treats it as a
+P-frame (P-frame MC path)", and this measurement is the first thing to test that assertion. **Next
+step:** confirm the decoder's B4 prediction equals the encoder's forward-only one -- if it runs a
+bidirectional or wrong-reference MC for a frame the encoder coded forward-only, that is the bug, and
+it is in the decoder's frame-type dispatch, not in rate control. Filed on BUG-5 (reopened, P2); the
+`GNC_B4_QSTEP_MUL` knob stays as the canary that a fix must make responsive.

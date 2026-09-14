@@ -949,13 +949,26 @@ impl EncoderPipeline {
                     // Must happen before B₄ encode overwrites gpu_ref_planes.
                     self.copy_fwd_ref_to_pyramid_slot(ctx, 3, plane_size); // I₀ → slot 3
 
-                    let b4_config = if let Some(ref rc) = rate_ctrl {
+                    let mut b4_config = if let Some(ref rc) = rate_ctrl {
                         let mut cfg = config.clone();
                         cfg.quantization_step = rc.estimate_qstep();
                         cfg
                     } else {
                         config.clone()
                     };
+                    // BUG-5 diagnostic: B₄ is the pyramid base — a forward-only long-range P that
+                    // P₈, B₂, B₆ and the layer-3 B-frames all reference — yet it takes the same
+                    // qstep as the leaf B-frames, so it becomes the temporal quality valley (a
+                    // ~35 dB pulse among ~59 dB neighbours). GNC_B4_QSTEP_MUL scales B₄'s qstep so
+                    // a finer setting for the base layer can be tried without a rebuild; default
+                    // (unset) leaves behaviour unchanged.
+                    if let Some(mul) = std::env::var("GNC_B4_QSTEP_MUL")
+                        .ok()
+                        .and_then(|s| s.parse::<f32>().ok())
+                    {
+                        b4_config.quantization_step *= mul;
+                        eprintln!("[bug5] B4 qstep x{mul} = {}", b4_config.quantization_step);
+                    }
                     let b4_frame_data = frames.get(b4_display);
                     // Encode B₄ as P-frame (ref=I₀, no temporal MV predictor, no look-ahead).
                     // save_bwd_ref=false: don't overwrite bwd yet (P₈ will do that).

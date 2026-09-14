@@ -295,7 +295,7 @@ something a `git diff --stat` of two `.md` files already proves.
 existed and four of them lost. The one judgement call — softening the portability claim rather than
 deleting it — is argued in the section itself.
 
-### BUG-5 — B-frames stop paying on camera content (**FIXED 2026-09-06** — pyramid off by default)
+### BUG-5 — B-frames stop paying, and the B4 pyramid base does not reconstruct (default fixed 2026-09-06; root cause reopened, todo, **P2**)
 Measured 2026-09-05 on 17 byte-identical 1080p frames (bbb, 4:4:4, Rice, fixed qstep, rate
 control off) — content where the correct answer for every inter frame is "nothing changed".
 
@@ -374,6 +374,23 @@ both halves.
 **Fix:** default the pyramid off on the quality-preset path, keep it available via
 `GNC_B_PYRAMID=1`. Justified on two independent measurements — rate on camera content, and 160 ms
 of reordering latency (MEAS-6) that applies regardless of content.
+
+**Reopened 2026-09-14 (root cause, todo, P2 — RESEARCH_LOG same date).** The 2026-09-06 fix
+disabled the pyramid; it did not explain it, and the "averaging is half a quantiser step off"
+hypothesis is now contradicted. On `clip420_60` (Vulkan **and** DX12, identical) the pulse is a
+single frame: **B4**, the pyramid base, at 35.56 dB among ~59 dB neighbours, flagged by the codec's
+own metric (max PSNR drop 26.23 dB). `sequence.rs:937` (#49) codes B4 as a **forward-only P-frame**
+tagged `Bidirectional`, so no bidirectional averaging is even involved. Decisive test: an env-gated
+`GNC_B4_QSTEP_MUL` (default unset = unchanged) that scales only B4's qstep — **10× finer nearly
+doubles B4's bytes (387K→715K) and moves its PSNR 0.01 dB.** Quality pinned against qstep means the
+residual is coded but not reconstructing: the signature of the decoder rebuilding B4 from a
+*different* prediction than the encoder subtracted (`decoder_pred − encoder_pred` is a fixed error
+no residual can cancel). **Next step (does not need Windows):** verify the decoder runs the
+forward-only P-frame MC for a frame tagged `Bidirectional` with `backward_vectors=None`, as
+`sequence.rs:943` asserts — if it runs a bidirectional or wrong-reference MC, that is the bug, in
+the decoder's frame-type dispatch, not in rate control. The `GNC_B4_QSTEP_MUL` knob is the canary a
+fix must make responsive. **Do not re-enable the pyramid default** on the back of this — the rate
+and latency reasons above are unchanged; this is about correctness of the opt-in path.
 
 ### BUG-10 — P-frame quality saturates (**CORRECTED AND CLOSED 2026-09-06** — it is TUNE-5)
 **The original diagnosis in this entry was wrong.** It is not a structural ceiling and none of the

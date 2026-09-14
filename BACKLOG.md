@@ -1767,6 +1767,58 @@ the seek machinery for "drop to next keyframe" already exists.
 data is already missing. Note that per-subband UEP was proposed alongside and is a *different*
 item — that is about protecting the stream, this is about what to do when protection failed.
 
+### MEAS-16 — the ladder's source derivation is unrecorded, and it decides bbb's number (todo, P2)
+
+**MEAS-1/10/11 all run against "17-frame y4m derived from the PNG sequences" and none of them says
+*how*.** It is not a detail: derived at `yuv444p` the bbb_extended ladder caps at **50.44 dB** and
+reads **+252.3%**; MEAS-11's source was evidently already 4:2:0-limited and the same content read
+**+89.0%** with overlap to 56 dB. Same frames — the recorded hashes reproduce exactly
+(`18b86a49d376dd79`) — same harness, same binary. Verified on `a0880c7` and `d7dc8d8`: the cap is
+identical on both, so this is the harness, not the coder (2026-09-15 entry in RESEARCH_LOG).
+
+The mechanism is known and already priced in CLAUDE.md: PSNR-Y comes off *decoded RGB*, so chroma
+error contaminates it, and a 4:2:0 codec path measured against a full-chroma reference pays for
+subsampling twice. Saturated animation exposes it; camera content does not, which is why two of
+three sequences reproduced and hid the problem.
+
+**What to do, in order:**
+1. **Pick the derivation and write it into the harness**, not into a shell history — a
+   `--source-chroma` argument or an explicit y4m build step inside `meas1_vs_h264.py`, so the next
+   re-take cannot differ from this one by accident.
+2. **Re-take bbb on whichever derivation is chosen** and state it in BASELINE next to the figure.
+   Until then bbb's +89.0% and +252.3% are two different measurements and neither corrects the
+   other.
+3. **Fix the coder label while in the file:** it prints "GNC Rice" whenever `--abac` is absent, but
+   abac is the default since `58b637f`, so unflagged runs are labelled as their own control.
+
+**Success criterion:** two runs from a clean checkout, by two people, produce the same bbb figure
+without either of them having to ask how the y4m was made.
+
+### RATE-6 — +3.6% of rate on bbb_extended between `a0880c7` and `d7dc8d8`, at bit-identical pixels (todo, P2)
+
+Measured as a side effect of MEAS-16's control, so it comes with its own canary: **PSNR-Y is equal
+to two decimals at all four rungs across all three arms** — only the bytes moved.
+
+| arm | bpp @ q85 | q92 | q96 | q99 |
+|---|---|---|---|---|
+| `a0880c7` --abac | 2.8179 | 3.4448 | 4.4223 | 5.6821 |
+| `d7dc8d8` default (abac) | 2.9202 | 3.5503 | 4.5296 | 5.7974 |
+
+**+3.6% at q=85 and the same direction at every rung**, on the same source, same harness, same
+machine, 1080p 4:2:0 ki=9 17 frames. Phase 1 is bitrate (Current Focus), and this is rate going the
+wrong way on a sequence nobody was watching.
+
+**It is not entropy coding** — both arms are abac, and ENT-14 (empty code-block costs no bytes)
+moves bytes *down*. The candidates are what landed between the two commits: RATE-3, INTER-2,
+BUG-39, LOSSLESS-2/3, PAD-2 and `0087`'s MC clamp. `0087` is the first place to look: it is an inter
+change, bbb is the animation sequence, and its own decision record says the clamp cancels the
+saving it was meant to collect.
+
+**First step is a bisect, not a theory** — six commits, one 40-second ladder each, ~5 minutes total.
+Then decide whether the cost is bought (a correctness fix that had to cost bits) or accidental.
+Check the other two sequences at the same time: they were not run against `a0880c7` here, so it is
+unknown whether this is bbb-only.
+
 ### ROBUST-2 — put the frame parser on a checked cursor, additively (todo, P2)
 
 The implementation `docs/decisions/0067` decided and deliberately did not do. **The decision is

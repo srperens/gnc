@@ -4,6 +4,77 @@
 
 ---
 
+## MEAS-1 re-taken on `d7dc8d8` — two of three reproduce; bbb's outlier is the *source*, not the codec (2026-09-15)
+
+**Machine: Apple M5 Pro [Metal, IntegratedGpu]**, `gnc gpu-info` quoted rather than trusted to
+CLAUDE.md. Gate check 3 clear (no cargo/ffmpeg/vmaf/python running). Binary `d7dc8d8`,
+`codec-fingerprint v1 1ea00f81`. Harness `scripts/meas1_vs_h264.py`, **byte-identical to its
+`a0880c7` version** (`git diff a0880c7 d7dc8d8 -- scripts/meas1_vs_h264.py` is empty), so the
+harness is held constant across everything below and only the binary moves.
+
+1920x1080, 17 frames, ki=9, 4:2:0, 8-bit, q = 85/92/96/99 against crf = 1/2/4/8, x264 at defaults,
+GNC on the **default** coder (abac since `58b637f`). MEAS-10/11's ladder exactly.
+
+**Inputs verified, not assumed.** MEAS-11's recorded frame hashes reproduce bit-for-bit:
+bbb_extended `18b86a49d376dd79`, old_town_cross `d398ff1265752113`, crowd_run `b4008977b24b0585`
+(sha256 of the concatenated per-frame md5s, frames 0–16 — newline-separated, which MEAS-11's
+wording left ambiguous and cost one wrong hash before it was pinned down).
+
+| sequence | BD-rate PSNR-Y, here | overlap | MEAS-11 abac (`a0880c7`) |
+|---|---|---|---|
+| old_town_cross | **+43.4%** | 50.1–55.9 dB | +47.4% |
+| crowd_run | **+42.9%** | 50.0–56.0 dB | +46.6% |
+| bbb_extended | +252.3% | 49.5–50.4 dB | +89.0% |
+
+VMAF on this ladder stays unquotable as recorded: +151.4% / +410.9% inside a band of 99.8–99.8.
+
+### bbb_extended is not a regression, and the control says so
+
+GNC's bbb curve stops at **50.44 dB** at q=99 where both camera sequences reach 60.00 dB — the
+whole ladder is compressed (47.92 / 48.90 / 49.79 / 50.44). MEAS-11's overlap for bbb was
+49.9–56.0 dB, so GNC reached ~56 dB there on the same frames.
+
+**Built `a0880c7` and ran the same bbb ladder on it, same harness, same source:**
+
+| arm | q85 | q92 | q96 | q99 | bpp @ q85 | BD-rate |
+|---|---|---|---|---|---|---|
+| `a0880c7` Rice | 47.92 | 48.90 | 49.79 | **50.44** | 3.5310 | +310.6% |
+| `a0880c7` abac | 47.92 | 48.90 | 49.79 | **50.44** | 2.8179 | +244.3% |
+| `d7dc8d8` default (abac) | 47.92 | 48.90 | 49.79 | **50.44** | 2.9202 | +252.3% |
+
+**The same cap on both commits, PSNR-Y identical to two decimals at every rung.** A regression
+between the two commits would have shown the old binary climbing to ~56 dB. It does not.
+
+**The cause is the source derivation.** The y4m fed to the harness here was built from the PNG
+sequences at **`yuv444p`**; MEAS-11's bbb source was evidently already 4:2:0-limited. Against a
+full-chroma reference GNC's 4:2:0 path cannot pass ~50 dB on this content, because PSNR-Y here is
+computed on *decoded RGB* and chroma error leaks into the luma figure — the contamination CLAUDE.md
+already prices at 3.7x. Confirmed directly: **the same bbb on the same binary at `--chroma 444`
+reaches 60.00 dB with a normal ladder** (+148.3% PSNR / +116.7% VMAF, overlap 50.4–55.7 dB).
+
+Camera content is insensitive to the choice and saturated animation is not, which is exactly why
+old_town and crowd_run reproduced and bbb did not. **So bbb's +252.3% and MEAS-11's +89.0% are not
+the same measurement and neither figure corrects the other.** Filed as MEAS-16.
+
+### The observation worth more than the headline
+
+At **bit-identical pixels** (PSNR-Y equal to two decimals at all four rungs), today's default costs
+**2.9202 bpp against `a0880c7` --abac's 2.8179 — +3.6% of rate on bbb_extended**, and the same
+direction shows at every rung. Only the bytes moved, so it is not a quality trade; something that
+landed between the two commits is spending more bits on this content. Not explained here. Filed as
+RATE-6.
+
+### Two harness notes
+
+- **The coder label is wrong now.** `meas1_vs_h264.py` prints "GNC Rice" whenever `--abac` is
+  absent, but abac has been the *default* since `58b637f`, so every unflagged run is labelled as
+  its own control. Cosmetic in the print, not cosmetic in a CSV somebody reads next year.
+- **The run is fast — 117 s for all three sequences** (22:43:43 → 22:45:40), ~40 s each. A 45–60
+  minute estimate was given at the start of this session and was wrong by roughly 50x. Nothing
+  about the ladder needs a quiet hour booked for it.
+
+---
+
 ## ENT-17 — a cross-subband *parent* context is a real ~2-4.5% lever, the first that clears the bar (2026-09-15)
 
 **Machine-independent: deterministic numpy over DWT+quantised coefficients — reproduces anywhere,

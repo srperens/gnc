@@ -64,6 +64,56 @@ direction shows at every rung. Only the bytes moved, so it is not a quality trad
 landed between the two commits is spending more bits on this content. Not explained here. Filed as
 RATE-6.
 
+### MEAS-16 ANSWERED same day: the source was 4:2:0, and it reproduces three of three
+
+Re-derived the three y4m sources at **`yuv420p`** instead of `yuv444p`, changing nothing else, and
+ran `a0880c7 --abac` — MEAS-11's exact arm — against them:
+
+| sequence | MEAS-11 record | `a0880c7 --abac` on a 4:2:0-derived source | overlap |
+|---|---|---|---|
+| bbb_extended | +89.0% | **+89.0%** | 49.9–56.0 dB |
+| old_town_cross | +47.4% | **+47.4%** | 49.8–55.9 dB |
+| crowd_run | +46.6% | **+46.6%** | 49.8–56.0 dB |
+| **mean** | **+61.0%** | **+61.0%** | |
+
+**Three of three to the decimal, overlap bands included.** The derivation was the whole difference,
+and bbb was simply the only sequence sensitive enough to show it. The 4:4:4-source rows earlier in
+this entry measure something real but different, and must not be compared to any MEAS-10/11 figure.
+
+### And on a like-for-like source, `main` is WORSE than `a0880c7`, on all three
+
+| sequence | `a0880c7` abac | `d7dc8d8` default (abac) | delta |
+|---|---|---|---|
+| bbb_extended | +89.0% | **+93.9%** | +4.9 |
+| old_town_cross | +47.4% | **+50.8%** | +3.4 |
+| crowd_run | +46.6% | **+49.7%** | +3.1 |
+| **mean** | **+61.0%** | **+64.8%** | **+3.8** |
+
+**This reverses the first conclusion in this entry.** On the 4:4:4 source the two camera sequences
+read +43.4% / +42.9% against the record's +47.4% / +46.6% and that looked like four points of
+improvement. It was the source, not the codec. Like for like, the ladder has moved **3.8 points the
+wrong way** since `a0880c7` — and phase 1 is bitrate.
+
+**The rate cost is uniform and the pixels are identical:**
+
+| sequence | q85 | q92 | q96 | q99 |
+|---|---|---|---|---|
+| bbb_extended | +3.48% | +2.89% | +2.30% | +1.98% |
+| old_town_cross | +2.05% | +2.14% | +2.44% | +2.54% |
+| crowd_run | +2.05% | +2.02% | +2.12% | +2.21% |
+
+**PSNR-Y delta is `+0.0000 dB` at all 12 rungs** — bit-identical pictures, only the bytes moved. So
+RATE-6 is not a bbb curiosity: it is **+2.0% to +3.5% of rate across every sequence and every rung
+tested**, landed by something between `a0880c7` and `d7dc8d8`. RATE-6 restated accordingly.
+
+**Process note, and it is the same one MEAS-11 wrote.** Two sessions took what they believed was
+the same measurement and differed by 4 points because of an undocumented `-pix_fmt` in a step that
+happens *before* the harness runs. The harness was byte-identical; the inputs hashed identical; the
+difference was upstream of both. A re-take is only comparable if the *source construction* is in
+the repository, which is what MEAS-16's remaining half does.
+
+---
+
 ### Two harness notes
 
 - **The coder label is wrong now.** `meas1_vs_h264.py` prints "GNC Rice" whenever `--abac` is

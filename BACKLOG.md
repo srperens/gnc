@@ -1767,7 +1767,13 @@ the seek machinery for "drop to next keyframe" already exists.
 data is already missing. Note that per-subband UEP was proposed alongside and is a *different*
 item — that is about protecting the stream, this is about what to do when protection failed.
 
-### MEAS-16 — the ladder's source derivation is unrecorded, and it decides bbb's number (todo, P2)
+### MEAS-16 — wire the ladder's source derivation into the harness (todo, P2 — diagnosis DONE 2026-09-15)
+
+> **ANSWERED 2026-09-15, same day.** The source was the whole difference: re-derived at
+> `yuv420p` instead of `yuv444p`, `a0880c7 --abac` reproduces MEAS-11 **three of three to the
+> decimal** — bbb +89.0%, old_town +47.4%, crowd_run +46.6%, mean +61.0%, overlap bands included.
+> What remains of this item is steps 1 and 3 below: put the derivation in the harness and fix the
+> coder label. Step 2 is done and its numbers are in RATE-6.
 
 **MEAS-1/10/11 all run against "17-frame y4m derived from the PNG sequences" and none of them says
 *how*.** It is not a detail: derived at `yuv444p` the bbb_extended ladder caps at **50.44 dB** and
@@ -1794,30 +1800,40 @@ three sequences reproduced and hid the problem.
 **Success criterion:** two runs from a clean checkout, by two people, produce the same bbb figure
 without either of them having to ask how the y4m was made.
 
-### RATE-6 — +3.6% of rate on bbb_extended between `a0880c7` and `d7dc8d8`, at bit-identical pixels (todo, P2)
+### RATE-6 — `main` costs +2.0% to +3.5% of rate against `a0880c7` on every sequence, at bit-identical pixels (todo, P1 — restated 2026-09-15)
 
-Measured as a side effect of MEAS-16's control, so it comes with its own canary: **PSNR-Y is equal
-to two decimals at all four rungs across all three arms** — only the bytes moved.
+Measured on a like-for-like 4:2:0-derived source (MEAS-16), same harness, same machine, 1080p,
+17 frames, ki=9, q=85/92/96/99. **PSNR-Y delta is `+0.0000 dB` at all 12 rungs** — bit-identical
+pictures, so only the bytes moved and there is no quality trade to argue about.
 
-| arm | bpp @ q85 | q92 | q96 | q99 |
-|---|---|---|---|---|
-| `a0880c7` --abac | 2.8179 | 3.4448 | 4.4223 | 5.6821 |
-| `d7dc8d8` default (abac) | 2.9202 | 3.5503 | 4.5296 | 5.7974 |
+| sequence | q85 | q92 | q96 | q99 | BD-rate `a0880c7` -> `d7dc8d8` |
+|---|---|---|---|---|---|
+| bbb_extended | +3.48% | +2.89% | +2.30% | +1.98% | +89.0% -> **+93.9%** |
+| old_town_cross | +2.05% | +2.14% | +2.44% | +2.54% | +47.4% -> **+50.8%** |
+| crowd_run | +2.05% | +2.02% | +2.12% | +2.21% | +46.6% -> **+49.7%** |
+| **mean** | | | | | **+61.0% -> +64.8%** |
 
-**+3.6% at q=85 and the same direction at every rung**, on the same source, same harness, same
-machine, 1080p 4:2:0 ki=9 17 frames. Phase 1 is bitrate (Current Focus), and this is rate going the
-wrong way on a sequence nobody was watching.
+**P1, not P2, and the priority is the point.** Current Focus says phase 1 is bitrate and the target
+is ~1.9x away; ENT-10 is carried as over a third of the remaining gap. This is **3.8 points of
+BD-rate given back** on the same scoreboard, on every sequence and every rung tested, for no
+measured quality. It was invisible until now because the only re-take since `a0880c7` was taken
+against a differently derived source (MEAS-16) that flattered the two camera sequences by ~4 points
+in the opposite direction.
 
-**It is not entropy coding** — both arms are abac, and ENT-14 (empty code-block costs no bytes)
-moves bytes *down*. The candidates are what landed between the two commits: RATE-3, INTER-2,
-BUG-39, LOSSLESS-2/3, PAD-2 and `0087`'s MC clamp. `0087` is the first place to look: it is an inter
-change, bbb is the animation sequence, and its own decision record says the clamp cancels the
-saving it was meant to collect.
+**It is not entropy coding** — both arms are abac, and ENT-14 moves bytes *down*. The candidates are
+what landed between the two commits: RATE-3, INTER-2, BUG-39, LOSSLESS-2/3, PAD-2 and `0087`'s MC
+clamp. `0087` is the first place to look: it is an inter change and its own decision record says the
+clamp cancels the saving it was meant to collect. That the cost is nearly flat across content and
+quality (2.0–3.5% everywhere, no trend) argues for a per-frame or per-tile overhead rather than a
+coefficient-coding change.
 
-**First step is a bisect, not a theory** — six commits, one 40-second ladder each, ~5 minutes total.
-Then decide whether the cost is bought (a correctness fix that had to cost bits) or accidental.
-Check the other two sequences at the same time: they were not run against `a0880c7` here, so it is
-unknown whether this is bbb-only.
+**First step is a bisect, not a theory** — six commits, one 40-second ladder each on one sequence,
+~5 minutes total. The sources are derived in `scripts/`-adjacent form in MEAS-16's step 1; do that
+first or the bisect inherits the same unrecorded step.
+
+**Then decide whether the cost is bought.** A correctness fix that had to cost bits is a different
+answer from an accident, and both are acceptable outcomes of this item — but it has to be stated,
+because right now the scoreboard moved and nothing in the tree says why.
 
 ### ROBUST-2 — put the frame parser on a checked cursor, additively (todo, P2)
 

@@ -50,6 +50,24 @@ constant no matter how large and expensive the GPU is, while shader throughput s
 card. A bigger GPU should therefore buy more GNC instances; it does not buy more NVENC blocks.
 **That claim is currently unproven and is the single most important thing to measure** (MEAS-5).
 
+### The project is in phase 1, and phase 1 is bitrate (owner, 2026-09-14)
+
+**Everything in this section describes where GNC is going. Right now it is doing one thing:
+getting the compression within reach of H.264 and setting a baseline there.** The owner:
+*"Vi försöker få till hyfsad komprimering och sätta en baseline som är i närheten av H.264. Sen
+kommer andra aspekter att bli så mycket mera viktiga… då blir det parallella sessioner,
+performance, låg latency, robustness som blir fokus. Nu är vi fortfarande i forskning kring om
+designen för att möta bitrate."*
+
+So: **concurrent sessions, throughput, latency and robustness are phase 2.** They are real targets
+and they are not cancelled — they are simply not what a session should pick up while the rate gap
+is open. **The one consequence that reverses standing decisions: a rate win is worth taking even
+when it costs encode or decode time.** Several were declined on speed grounds that belong to
+phase 2. BACKLOG's Current Focus carries the queue this implies.
+
+Current score: **+89.2% BD-rate on PSNR against x264** at the contribution operating point, ~1.9x
+away from the target.
+
 ### Reach and scale are two claims, on two classes of hardware (owner, 2026-09-14)
 
 The row above compresses two different promises into one line, and conflating them is how a

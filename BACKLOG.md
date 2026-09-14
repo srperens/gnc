@@ -24,6 +24,37 @@ Current state and priorities are described in [GOALS.md](GOALS.md).
 
 See [BASELINE.md](BASELINE.md) for current benchmark numbers.
 
+## Current Focus — **the phase decision, 2026-09-14 (owner)**
+
+**GNC is in its research phase, and the only thing that counts right now is compression.** In the
+owner's words: *"Vi är också i ett tidigt skede här. Vi försöker få till hyfsad komprimering och
+sätta en baseline som är i närheten av H.264. Sen kommer andra aspekter att bli så mycket mera
+viktiga… då blir det parallella sessioner, performance, låg latency, robustness som blir fokus.
+Nu är vi fortfarande i forskning kring om designen för att möta bitrate."*
+
+| phase | what leads | status |
+|---|---|---|
+| **1 — now** | **bitrate.** Get within reach of H.264 and set a baseline there | **+89.2% BD-rate against x264** at the contribution point (MEAS-10). The target is ~1.9x away |
+| 2 — later | concurrent sessions, performance, low latency, robustness | measured where cheap, **not prioritised, not optimised** |
+
+**What this changes in practice, and it changes the queue rather than the rules:**
+
+- **A rate win is worth taking even when it costs encode or decode time.** That trade was being
+  declined on phase-2 grounds while phase 1 is unfinished. It reverses ENT-10's standing argument
+  (below) and it is why that item is now **P0**.
+- **Density, latency and platform items are deferred to P3** — MEAS-5, MEAS-15, PERF-5, MEAS-6.
+  They are not wrong and they are not cancelled; they are phase 2. PERF-4/`0085` finished and is
+  filed; do not start another performance item over a rate item.
+- **Correctness is not deferred.** Bugs, lossless exactness and bitstream integrity stay where they
+  are. A codec that compresses well and decodes wrong has not finished phase 1 either.
+- **Measurement discipline is not deferred.** Everything under "Research Protocol" in CLAUDE.md
+  applies unchanged. Phase 1 is where a wrong number is most expensive, because it is where the
+  design decisions are being made.
+
+**The rate ladder, so the phase has a scoreboard:** +89.2% BD-rate on PSNR against x264 at the
+contribution operating point; **+61.0% with `--abac` on** (MEAS-11). ENT-10 is therefore not a
+tuning item — **it is over a third of the remaining gap, already built, sitting behind a flag.**
+
 ## Current Focus (updated 2026-09-06)
 
 **Positioning: GNC is a contribution codec** ([docs/POSITIONING.md](docs/POSITIONING.md), GOALS §1).
@@ -2848,7 +2879,7 @@ input and q as the `--density-still` rows, with GPU power sampled alongside. **I
 out near 49 W the bottleneck is elsewhere again** and the next suspect is the submission path, not
 the codec.
 
-### MEAS-15 — run the density sweep on a professional GPU: `0085`'s ceiling is a laptop's, and scale is a datacenter claim (todo, P1)
+### MEAS-15 — run the density sweep on a professional GPU: `0085`'s ceiling is a laptop's, and scale is a datacenter claim (todo, **P3 — deferred by the 2026-09-14 phase decision**)
 
 **Filed 2026-09-14, re-pointed the same hour by the owner, and the re-pointing is the content.**
 The first draft of this item aimed at the second Mac (M5 Pro, 20 GPU cores) because it was free.
@@ -2911,7 +2942,7 @@ how much of that card one stream leaves on the table, and on the M1 Pro it is a 
 **Do PERF-5 first if both are free.** A third of the M1 Pro is idle on a single stream; measuring
 a new GPU through a pipeline with a known stall reports the stall as much as the hardware.
 
-### PERF-5 — a third of the GPU is idle while one stream runs, and the readback waits device-wide (todo, P1)
+### PERF-5 — a third of the GPU is idle while one stream runs, and the readback waits device-wide (todo, **P3 — deferred by the 2026-09-14 phase decision**)
 
 **Filed by PERF-4, 2026-09-14, with the number that makes it P1 rather than tuning.** One 1080p
 stream encodes at **45.0 Mpixel/s** on a GPU whose measured ceiling is **70.8** (`0085`). So
@@ -4816,7 +4847,7 @@ explicitly and MD5-confirmed distinct: bbb_extended (24 frames), old_town_cross 
 whether moving bits from chroma to luma closes part of the +90.5%. Judge on luma PSNR **and** dE00
 together — that sweep was run once on VMAF, looked like a free 15%, and reversed sign on dE00.
 
-### MEAS-5 — Concurrent streams per GPU vs fixed-function: Claim A on a third machine, and a red flag against Claim B (P0)
+### MEAS-5 — Concurrent streams per GPU vs fixed-function: Claim A on a third machine, and a red flag against Claim B (**P3 — deferred by the 2026-09-14 phase decision**)
 
 > **2026-09-14, PERF-4 (`0085`): the scaling column below is not a concurrency measurement, and
 > the unit of Claim B changes.** `--density-still`'s N=1 row reads **7.27 fps** on an idle M1 Pro
@@ -5017,7 +5048,7 @@ Updated: BASELINE's A/B/C table, GOALS §3 and §4, README's two throughput site
 2026-09-08. **Follow-up worth an item: BASELINE's rule estimates the shared-machine penalty at
 20%; five figures re-taken in one quiet hour moved by 1.5–3.5x.**
 
-### MEAS-6 — Latency per frame: **25.2 ms, not ~80 ms** (**coding half DONE 2026-09-08**; glass-to-glass owed, P1)
+### MEAS-6 — Latency per frame: **25.2 ms, not ~80 ms** (**coding half DONE 2026-09-08**; glass-to-glass owed, **P3 — deferred by the 2026-09-14 phase decision**)
 
 **The ~80 ms was load.** Re-taken on an idle machine through the same harness and operating point
 as the RTX row (`gpu_tier_bench.py --tier`, `--quality 90`, pinned `f83f355f…`): **15.34 ms encode /
@@ -5947,7 +5978,7 @@ this is a paired change, not two.
 bit-exactness check at 4:2:2 and 4:2:0 in `tests/`, or states the trade it refuses and why, on ≥3
 sequences rather than ≥3 stills.
 
-### CHROMA-6 — nearest neighbour is the whole remaining subsampled error, and it is the cheapest filter there is (todo, **P3**)
+### CHROMA-6 — nearest neighbour is the whole remaining subsampled error, and it is the cheapest filter there is (todo, **P2**)
 
 **Filed 2026-09-10 by BUG-49.** With `0080` in, `q=100` at 4:2:2/4:2:0 is bit-exact for the plane
 it codes, so **100% of its remaining dE00 is the resample** — box average down, nearest neighbour
@@ -8164,7 +8195,7 @@ after reconstruction would let the encoder write a cheap fill while the referenc
 MC-friendly, collecting the remaining ~4.6% on video too — but it changes the decoding process and
 needs a bitstream version.
 
-### PAD-2 — collect the padding fill on inter, by re-replicating in the decoder (todo, **P2**)
+### PAD-2 — collect the padding fill on inter, by re-replicating in the decoder (todo, **P1**)
 
 **The finished half is now on `main`; the unfinished half is on branch `g41232` (`8872707`).**
 `6397188` — the Dirac zero-extend result, 8 of 12 worst-frame points regressing and −4.960 dB at
@@ -8305,7 +8336,7 @@ The original filing follows.
 defect below is fixed — it produces 5 dB pictures.** This entry is on `main` so the diagnosis
 is inheritable without the breakage.
 
-### TILE-2 — partial border tiles, so tile size and frame size stop being alternatives (**P2**)
+### TILE-2 — partial border tiles, so tile size and frame size stop being alternatives (todo, **P1**)
 
 > **Renumbered from `TILE-1` on 2026-09-11 (COORD-3).** Two startable headings carried that id —
 > this one, the original filing by PAD-1, and the stage-1 item above — and `refs/claims/TILE-1`
@@ -8568,7 +8599,7 @@ threshold** — a threshold is what let 55 dB pass for lossless in BUG-15.
 **Invalidates:** any lossless figure taken with `GNC_DEAD_ZONE` set. No shipped default carried one,
 so no published number moves.
 
-### ENT-12 — abac buckets the neighbourhood *sum*; EBCOT keys on the *pattern*. Is that the other half of the J2K gap? (todo, **P2**)
+### ENT-12 — abac buckets the neighbourhood *sum*; EBCOT keys on the *pattern*. Is that the other half of the J2K gap? (todo, **P1**)
 
 **Proposed 2026-09-08 by an external reviewer**, whose framing was half wrong about the current
 state and whose surviving half is a good hypothesis with its own falsification test.
@@ -8828,7 +8859,7 @@ one. The case against abac now has to rest entirely on cost, which is where it i
 Re-price it as a per-operating-point decision rather than a single yes/no, and say which rungs it
 should default on. Nothing below this line has been re-derived.
 
-### ENT-10 — should abac be the default? **The cost side is measured and it is twice what `0017` says** (todo, **P2**)
+### ENT-10 — should abac be the default? The cost side is measured, and 2026-09-14's phase decision is what it was waiting for (todo, **P0**)
 
 **Unparked and measured in the quiet hour, 2026-09-08.** Median of 3+ at `19354a4`,
 `codec-fingerprint v1 9e2b1202`, idle machine:
@@ -8848,6 +8879,33 @@ it, and abac decode goes 29.86 → 32.69 ms (**+9.5%**) with encode 76.73 → 84
 −2.07% to −8.76% of rate. GOALS §5 consequence 2 requires that cost to be logged with the win.
 **Pre-ENT-9 abac is still 2.91×, so 1.65× → 2.91× is unattributed** — candidates ENT-5's GPU decode,
 ABAC-SHIP, `0031`, `0032`, ENT-8 step 1. That bisect is this item's remaining measurement.
+
+> **2026-09-14: the decision this item was waiting for has been made, and it points at yes.**
+> ENT-10's whole standing argument against flipping is **cost** — 5.57x encode, 3.19x decode.
+> The owner's phase decision (Current Focus, top of this file) puts the project in a **bitrate**
+> phase and phase-2 costs explicitly behind it: *"nu är vi fortfarande i forskning kring om
+> designen för att möta bitrate"*. **A rate win is worth taking even when it costs encode time.**
+> Promoted P2 → **P0**: at +89.2% → +61.0% BD-rate this is over a third of the remaining gap to
+> H.264, it is already built, and it is behind a flag.
+>
+> **The cost side reproduces on a second machine** (Apple M1 Pro, `gnc density`, steady state only,
+> single stream, `codec-fingerprint 6a9fa6bd`, 2026-09-14) — and `gnc density` is the instrument
+> this item wanted, since it times steady-state encode with no setup in the window:
+>
+> | q | Rice | abac | encode ratio | abac rate |
+> |---|---|---|---|---|
+> | 90 | 21.61 fps | 4.86 fps | **4.45x** | 1 526 vs 1 825 KB — **−16.4%** |
+> | 95 | 10.21 fps | 2.07 fps | **4.93x** | 1 929 vs 2 282 KB — **−15.5%** |
+> | 99 | 10.15 fps | 1.91 fps | **5.31x** | 2 606 vs 3 160 KB — **−17.5%** |
+>
+> One still, one machine, so it corroborates the 5.57x rather than replacing it. **What it settles
+> is that the ratio is not a measurement artefact of the 2026-09-08 harness**, which is what
+> `0017`'s "lost its mechanism but kept its number" was worried about.
+>
+> **What the taker still owes**, and the phase decision does not excuse any of it: ≥3 sequences and
+> ≥2 quality points, intra *and* inter (the inter saving decays — `0045`), a decision record either
+> way, and an honest statement of the encode cost in the same sentence as the rate win (GOALS §5
+> consequence 2). **The likely shape is still per operating point rather than a global flip.**
 
 **What is left is the decision, not a number.** The rate side is +89.2% → +61.0% BD-rate (MEAS-11) but
 decays to −3.7% on inter at q=99, GNC's own range (`0045`). Argue it from intra; and the likely shape is

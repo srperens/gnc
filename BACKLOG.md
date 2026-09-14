@@ -295,7 +295,7 @@ something a `git diff --stat` of two `.md` files already proves.
 existed and four of them lost. The one judgement call — softening the portability claim rather than
 deleting it — is argued in the section itself.
 
-### BUG-5 — B-frames stop paying; the pyramid pulse is forward-P saturation (default fixed 2026-09-06; root cause reopened, todo, **P2**)
+### BUG-5 — B-frames stop paying on camera content (**FIXED 2026-09-06** — pyramid off by default; the "temporal pulse" reopen was a testsrc2 artifact, closed 2026-09-14)
 Measured 2026-09-05 on 17 byte-identical 1080p frames (bbb, 4:4:4, Rice, fixed qstep, rate
 control off) — content where the correct answer for every inter frame is "nothing changed".
 
@@ -409,8 +409,17 @@ plain P-only encode watching one frame across q -- no B-frames, no diagnostic bu
 `GNC_B4_QSTEP_MUL`/`GNC_B4_PROBE` scaffolding was reverted (B4-specific knobs mislead now).
 **BUG-5's pulse is re-attributed to the forward-P path**; its "stop paying on camera content" half
 is unaffected.
-**Do not re-enable the pyramid default** on the back of this — the rate and latency reasons above
-are unchanged; this is about correctness of the opt-in path.
+
+**Closed 2026-09-14 (real content): the pulse is a testsrc2 artifact, not a defect.** Ran the P-only
+test on two real sequences (`sequences/bbb` animation, `sequences/blue_sky` nature). Forward-P frames
+respond to quantisation normally — frame 4 [P] rises 49.56→50.09→51.37 dB (bbb) and 49.59→50.13→51.43
+(blue_sky) across q=90/92/94, where testsrc2 stays pinned at 35.56. And the pyramid pulse is gone: max
+PSNR drop **0.13 dB (bbb) / 0.03 dB (blue_sky)** against **26.23 dB** on testsrc2, all frames ~49.5 dB,
+no frame-4 valley. So testsrc2's synthetic moving pattern saturates the forward-prediction path in a
+way no real content does; the reopened root-cause thread is closed. **Standing note:** testsrc2 is fine
+for throughput (MEAS-5 density) but must not be used for inter *quality* or temporal-consistency work.
+**Do not re-enable the pyramid default** on the back of any of this — the rate and latency reasons for
+the 2026-09-06 default are unchanged.
 
 ### BUG-10 — P-frame quality saturates (**CORRECTED AND CLOSED 2026-09-06** — it is TUNE-5)
 **The original diagnosis in this entry was wrong.** It is not a structural ceiling and none of the

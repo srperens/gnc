@@ -19584,3 +19584,35 @@ that the effect is not B4-specific. **BUG-5's pulse is re-attributed to the forw
 "stop paying on camera content" half is unaffected and stays as measured. The honest close: I chased a
 B4 reconstruction bug through five candidates and it was a P-frame all along — visible only because the
 pyramid stands a saturated forward frame next to unsaturated bidirectional ones.
+
+### Closed on real content: the pulse and the qstep-immunity are both testsrc2 artifacts
+
+The open item above — is forward-P qstep-immunity general or content-specific — is now answered on real
+sequences (`test_material/frames/sequences/{bbb,blue_sky}`, real motion, 4:2:0), and it is
+content-specific. Plain P-only, frame 4 [P] vs q:
+
+| sequence | q=90 | q=92 | q=94 |
+|---|---|---|---|
+| testsrc2 (synthetic) | 35.56 | 35.55 | 35.56 (**pinned**) |
+| bbb (animation) | 49.56 | 50.09 | **51.37** |
+| blue_sky (nature) | 49.59 | 50.13 | **51.43** |
+
+On real content forward-P frames respond to quantisation normally (+1.8 dB over four q-steps, bytes
+rising). The pin is testsrc2 only. And the B-pyramid pulse follows: with `GNC_B_PYRAMID=1` on the same
+real clips, every frame sits at ~49.5 dB and the codec's temporal-consistency metric reads **max drop
+0.13 dB (bbb) and 0.03 dB (blue_sky)** — against **26.23 dB** on testsrc2. **No frame-4 valley on real
+content.**
+
+**So the whole pulse was a synthetic-clip artifact.** testsrc2's moving high-frequency pattern produces
+a forward-prediction residual that does not close under finer quantisation; a hierarchical pyramid then
+stands that one saturated forward frame (B4/P8) next to the unsaturated bidirectional leaves and prints
+a 26 dB pulse. Real animation and real camera content show neither the pin nor the pulse. This is
+exactly what the protocol's "≥3 sequences before concluding" exists to catch — one synthetic clip
+manufactured a 26 dB defect that does not exist on anything real.
+
+**Consequences.** BUG-5's *reopened* root-cause thread is closed: the temporal pulse it chased is not a
+real defect. BUG-5's *original* finding — B-frames cost rate on camera content, pyramid off by default —
+was measured on real sequences and is untouched. And a standing note for the harness: **testsrc2 is fine
+for throughput (MEAS-5 density) but must not be used for inter *quality* or temporal-consistency
+measurements** — it saturates the forward-prediction path in a way no real content does. The user's
+"B-frames look broken" was a true reading of a synthetic clip that does not generalise.

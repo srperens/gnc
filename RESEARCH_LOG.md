@@ -19314,3 +19314,53 @@ release process does not yet do.
   gone too (the overflowing shader was never dispatched; lazy creation removes it from the path).
 - **Follow-ups:** delete the dead `encode_3planes_fused` + shader; ship the DXC DLLs in the release;
   test inter on DX12; DX12 vs Vulkan speed (~2x slower) if it ever matters.
+
+### Inter on DX12 -- P and B both run, and BUG-40 step 2 is retired by DXC
+
+Follow-on to the same day: does inter work on DX12, and are B-frames (`block_match_bidir.wgsl`,
+BUG-40 step 2's open FXC X3695) usable? `clip420_60.y4m`, q=90, Rice, `WGPU_DX12_COMPILER=dxc`.
+
+**P-frames (`-k 9`, 1I+8P):** run on both GPUs, exit 0.
+
+| GPU | backend | total bytes |
+|---|---|---|
+| NVIDIA | Vulkan | 3450781 |
+| NVIDIA | DX12 | 3450788 |
+| Intel | DX12 | 3450265 |
+
+Not byte-identical across backends (7 B NVIDIA, ~500 B Intel) -- expected: the lossy inter path's
+motion search is float work whose HLSL and SPIR-V codegen differ, the same reason the lossy intra
+encoder is not byte-exact across backends. Intra was byte-identical because its integer path is; the
+inter divergence is small and in the noise the encoder already carries.
+
+**B-frames (`GNC_B_PYRAMID=1`, 1I+1P+7B):** also run on both backends, exit 0, no crash.
+`block_match_bidir.wgsl` compiles under **DXC** where it failed FXC with X3695 (BUG-40 step 2) --
+**so DXC retires BUG-40 step 2 the same way it retired the intra compile wall.** DX12 reproduces
+Vulkan's B-frame output nearly exactly (3685055 vs 3685051 B; the middle B-frame is byte-identical
+at 387201 B).
+
+### But B-frames are defective, and it is BUG-5, on both backends
+
+The per-frame PSNR is not flat. Vulkan **and** DX12, identical numbers:
+
+| frame | type | PSNR dB |
+|---|---|---|
+| 0 | I | 59.13 |
+| 1,2,3 | B | ~59 |
+| **4** | **B** | **35.56** |
+| 5,6,7 | B | ~59 |
+| **8** | **P** | **32.61** |
+
+The codec's own temporal-consistency metric flags it: **max PSNR drop 26.23 dB, stddev 14.58 dB** --
+a 24 dB pulse on the middle B-frame is visible flicker. It is **identical on Vulkan and DX12**, so it
+is not a backend bug; it is **BUG-5** (B-frames "stop paying", pyramid off by default since
+2026-09-06, root cause an *untested* hypothesis). The mechanism is even visible in the numbers:
+frame 4 is the one B-frame that references the P-anchor at frame 8 directly, and P@8 has degraded to
+32.61 dB by ordinary P-frame accumulation; averaging a 59 dB and a 32 dB reference caps frame 4 near
+35 dB, while the other B-frames reference higher-quality neighbours. Consistent with BUG-5's
+"averaging two reconstructed references puts the prediction off" hypothesis, now with a temporal
+signature to test it against.
+
+**Net:** DX12 inter is done -- P and B both run and match Vulkan, and DXC closes BUG-40 step 2. The
+B-frame quality defect is real but pre-existing, backend-independent, and already filed as BUG-5;
+chasing its root cause is the next item.

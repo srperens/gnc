@@ -1667,6 +1667,14 @@ the failure BUG-25's laziness was introduced to stop.
    `block_match_bidir.wgsl` is also the file BUG-34 wants to shed a storage buffer from — three
    open reasons for caution in one low-traffic file.
 
+**Step 2 resolved 2026-09-14 (laptop, RESEARCH_LOG same date): DXC compiles it.** With
+`WGPU_DX12_COMPILER=dxc`, a `GNC_B_PYRAMID=1` encode (1I+1P+7B) runs on both Intel Arc Pro and
+NVIDIA RTX 2000 Ada, exit 0, no X3695 — `block_match_bidir.wgsl` compiles under DXC where it failed
+FXC. DX12 reproduces Vulkan's B-frame output nearly exactly (middle B-frame byte-identical). So
+FXC's X3695 was FXC's problem, not the shader's, and switching to DXC (the BUG-52 change) closes
+step 2 without touching the WGSL. The B-frame *quality* defect that surfaces in that run is
+backend-independent (identical on Vulkan) and is BUG-5, not this item.
+
 **Success criterion:** an intra DX12 encode on Windows either completes or fails on something
 that is not a shader it does not use. **Why P2:** it invalidates no measurement and blocks
 nothing on Vulkan or Metal, but GOALS rule 4 claims DX12 and step 1 is close to free. Step 1

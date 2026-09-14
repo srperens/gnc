@@ -546,6 +546,12 @@ impl GpuAbacEncoder {
 
         // --- Gather the bytes ---
         let (bytes, src_off) = match sizing {
+            // ENT-14 made `total == 0` reachable: a plane whose every code-block is empty now
+            // codes to nothing at all, where before each block still paid a terminated interval.
+            // A zero-length readback is not a special case worth a GPU round trip — and
+            // `read_buffer_u32` would panic on a zero-sized staging buffer rather than return
+            // nothing.
+            _ if total == 0 => (Vec::new(), slot_off.clone()),
             Sizing::CountThenEmit => {
                 // Slots are already the exact output, one block after another with at most three
                 // bytes of word padding between them.

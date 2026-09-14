@@ -1378,21 +1378,27 @@ pub fn quality_preset(q: u32) -> CodecConfig {
         //
         // Only 4:4:4: the rANS GPU path assumes all three planes share the luma tile layout.
         // `normalize_for_chroma` falls back to Rice for subsampled formats.
-        // **ENT-10, 2026-09-14: abac was measured against this and is NOT yet the default here —
-        // one content class blocks it.** `docs/decisions/0052`. On photographic stills and on
-        // sequences it codes **10.1% to 17.4% fewer bits than Rice at identical pixels**, all the
-        // way to q=100 where both stay bit-exact, for 1.5x-4.2x encode after `0051`. On **sparse**
-        // content it loses catastrophically: a 512x512 gradient reads **+64.7% at q=90 and +234.5%
-        // at q=25**, because abac pays a terminated arithmetic interval plus a length word for
-        // **every** code-block whether or not the block has anything in it — 840 blocks x ~11.5 B
-        // is the whole file there. That is **ENT-14**, it is a known defect with a known fix
-        // (signal an empty block in a bit rather than coding it), and this line moves when it is
-        // fixed, not before. Flat frames, fades and static P-frames are not a corner case in
-        // contribution video.
+        // **ENT-10, 2026-09-14: above the rANS cutoff the default is abac** (`docs/decisions/0053`,
+        // superseding `0052`'s refusal once ENT-14 removed the reason for it).
+        //
+        // It codes **11.9% to 20.7% fewer bits than Rice at identical pixels** — entropy coding is
+        // lossless over the same quantised coefficients, and the measured PSNR delta is 0.00 dB in
+        // every channel at every point — for 1.7x-5.4x encode and 1.0x-2.3x decode. Measured over
+        // three photographic stills at q ∈ {25,50,75,85,90,95,99}, four sequences at q ∈ {90,95,99},
+        // a **held static shot** (−16.7% / −16.9%, the case GOALS says should cost almost nothing
+        // and which nobody had measured), and a sparse synthetic gradient (**−8.7% to −27.9%**,
+        // which read **+234.5%** before ENT-14).
+        //
+        // **The cutoff is unchanged, and that is a finding rather than a convenience.** abac loses
+        // to rANS below it and wins above it, on all three images, at the same q where rANS already
+        // stopped being the default. Measured before ENT-14, so these are its floor: q=15 read
+        // +5.8% / +0.3% / −0.1%, q=20 read +1.6% / −2.8% / −3.4%, q=25 read −6.0% / −7.2% / −7.9%.
+        // Whatever makes rANS strong at four decomposition levels makes abac weak there too, so one
+        // boundary serves both — **the three constants move together if any of them moves.**
         entropy_coder: if q <= 20 {
             EntropyCoder::Rans
         } else {
-            EntropyCoder::Rice
+            EntropyCoder::Abac
         },
         per_subband_entropy: disc.per_subband,
         adaptive_quantization: aq_enabled,

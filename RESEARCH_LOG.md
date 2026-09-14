@@ -4,6 +4,84 @@
 
 ---
 
+## ENT-14 — an empty code-block now costs one byte, and that turned abac's worst case into its best (2026-09-14)
+
+**Machine: Apple M1 Pro, 16 cores, 16 GB, Metal.** `codec-fingerprint fb2fe82a` → **`027e58bc`**.
+`docs/decisions/0053`, superseding `0052`.
+
+### The fix, and the property that made it free
+
+An all-zero code-block codes to **no bytes at all** instead of a terminated arithmetic interval.
+The reason that needed no format change was **tested, not assumed**: a zero-length stream already
+decodes to zeros on both engines (`empty_stream_decodes_to_zeros`), because the decoders read past
+the end as zero bytes and the initial contexts resolve every significance decision to "not
+significant". **The format already expressed "this block is nothing"; the encoder simply never said
+it.** So no generation moved, old files are unaffected, and existing decoders read the new streams.
+
+Three places had to agree — the CPU reference in `abac_tile.rs`, and `block_is_empty` in
+`abac_encode.wgsl` used by both coder entry points *and* by `bound`. The existing byte-identity
+gate is what proves they do. One degenerate case became reachable: a plane whose every block is
+empty codes to zero total bytes, and `read_buffer_u32` panics on a zero-sized staging buffer.
+
+**Canary:** `empty=264` of 280 blocks on the gradient — and **`empty=420..476` of 2800 on a
+photograph.** 15-17% of blocks are empty even on busy content, which is why this helped everywhere
+rather than only in the corner it was filed for.
+
+### What it did
+
+| | before | after |
+|---|---|---|
+| gradient q=25 | **+234.5%** | **−8.7%** |
+| gradient q=90 | +64.7% | −27.9% |
+| stills q=25..85 | −10.1% to −15.0% | **−12.9% to −20.7%** |
+| sequences q=90 | −12.3% to −17.4% | −12.7% to **−17.8%** |
+
+**And the case `0052` said was the real risk.** Its sequence rows were all busy content; a held
+static shot was unmeasured. One real 1920x1080 frame held nine times: **q=90 −16.7%, q=99 −16.9%.**
+The predicted worst case is abac's **best** case.
+
+All five of ENT-14's criteria, written before the work, are met; two are exceeded — the gradient
+target was ±5% of Rice and came in at −8.7% to −27.9%.
+
+### So the flip landed: abac is the default above the rANS cutoff
+
+`quality_preset` selects `Abac` for q > 20. **The cutoff did not move**, and that is a finding: abac
+loses to rANS below it and wins above it at the same q, measured *before* ENT-14 so those are its
+floor (q=15 +5.8/+0.3/−0.1, q=20 +1.6/−2.8/−3.4, q=25 −6.0/−7.2/−7.9). **Cost in the same breath as
+the win: 1.7x-5.4x encode, 1.0x-2.3x decode.** ENT-10 closes after six days blocked on exactly that
+number.
+
+### The sizing grid, run the same hour another session asked for it
+
+Their ENT-5 handoff wanted `abac_encode_throughput_grid` on an idle Mac against a Windows prior
+(RTX 2000 Ada) of **1.54x** for one coder pass against two. M1 Pro, Metal, best of 24, `med/best`
+1.02-1.03 — **with ENT-14 in the build, which the Windows prior did not have**:
+
+| path | bytes | plane ms | frame ms |
+|---|---|---|---|
+| GPU Range / CountThenEmit (2 passes) | 395 501 | 51.97 | **155.92** |
+| GPU Range / BoundedSlots (1 pass) | 395 501 | 32.49 | **97.46** |
+| CPU Range, one thread | 395 501 | 26.57 | **79.71** |
+
+**The Windows ratio reproduces on Metal: 1.60x.** Bytes identical across the pair, as required.
+**`0017` reason 2 / ENT-5 criterion 3 is discharged**: 97.46 ms/frame against the 129 ms that
+record quotes.
+
+**Two findings in that table that are not footnotes.** (1) The single-threaded **CPU** coder is
+*faster than the GPU one* — 79.71 against 97.46 ms/frame, on a 16-core GPU, for 2800 independent
+blocks. (2) A whole-frame `gnc benchmark` moves only **1.10x-1.27x** between the sizing modes where
+the coder stage moves 1.60x, so **the coder stage is a minority of abac's frame encode time.**
+**ENT-13 was filed on the assumption that double-coding is the main cost. It is not**, and that
+item must be re-read before anyone starts it — the readback and submission path is the larger half.
+
+### What is now owed
+
+BASELINE, GOALS §1 and POSITIONING quote **+89.2% BD-rate** against x264 with Rice, and MEAS-11
+recorded **+61.0%** with abac. That re-take is now a re-take of the **default**, not of an option,
+and every `--abac` row in BASELINE predates both `0051` and ENT-14.
+
+---
+
 ## ENT-10 step 2 — abac's rate case is overwhelming and it is still not the default (2026-09-14)
 
 **Machine: Apple M1 Pro, 16 cores, 16 GB, Metal.** Binary `codec-fingerprint fb2fe82a` (post-

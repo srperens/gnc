@@ -174,7 +174,22 @@ pub fn abac_encode_tile(
             let row = (by + y) * ts + bx;
             blk.extend_from_slice(&coefficients[row..row + bw]);
         }
-        let bytes = coder.encode_block(&blk, bw);
+        // **ENT-14: an all-zero block costs one varint, not a coded stream.** Every block used to
+        // pay a terminated arithmetic interval — ~11.5 B measured — whether or not it held a
+        // single significant coefficient, and on sparse content that floor *was* the file: a
+        // 512x512 gradient came out 2.3x larger than Rice, all of it 840 empty blocks.
+        //
+        // **This is an encoder-side change and nothing else.** A zero-length stream already
+        // decodes to zeros on both coders — `empty_stream_decodes_to_zeros` proves it rather
+        // than assuming it — because the decoders read past the end as zero bytes and the initial
+        // contexts then resolve every significance bit to "not significant". So the bitstream
+        // format is untouched, no generation moves, existing decoders read these tiles correctly,
+        // and files written before this change are unaffected.
+        let bytes = if blk.iter().all(|&c| c == 0) {
+            Vec::new()
+        } else {
+            coder.encode_block(&blk, bw)
+        };
         block_lengths.push(bytes.len() as u32);
         block_data.extend_from_slice(&bytes);
         covered += blk.len();
@@ -412,11 +427,15 @@ mod tests {
         // A handful of bytes per code-block. Anything near the coefficient count means the
         // significance contexts are not learning.
         //
-        // The bound is **per block**, not a flat 512: an empty block still costs its terminated
-        // interval plus its length word, so the floor scales with the block count and the block
-        // count scales with `DEFAULT_CB`. Writing it flat is how this test failed when ENT-10
-        // moved the default 64 → 32 (25 blocks → 100, 763 bytes) — a correct consequence of the
-        // change reading as a regression.
+        // **The bound is per block, not a flat 512**, and the history is the reason: it was flat,
+        // and it failed when ENT-10 moved `DEFAULT_CB` 64 → 32 and the block count went 25 → 100
+        // (763 bytes) — a correct consequence of the change reading as a regression, which is what
+        // a flat bound on a derived quantity does.
+        //
+        // Since **ENT-14** an empty block costs only its length varint, so this now passes with
+        // enormous slack; the tight assertion lives in `tests/abac_empty_blocks.rs`, which pins
+        // the lengths to zero rather than the total to a ceiling. Kept here as the cheap in-module
+        // smoke test it always was.
         let blocks = code_blocks(256, 5, DEFAULT_CB as usize).len();
         assert!(
             tile.byte_size() < 20 * blocks,

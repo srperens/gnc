@@ -3481,14 +3481,16 @@ fn test_non444_falls_back_to_rice() {
     assert_eq!(c.entropy_coder, crate::EntropyCoder::Rans);
 }
 
-/// The quality preset picks rANS at low quality and Rice above, per the measured crossover.
+/// The quality preset picks rANS at low quality and abac above, per the measured crossover.
 ///
-/// **abac is not here, and ENT-10 (`docs/decisions/0052`) says exactly why.** It beats Rice by
-/// 10.1% to 17.4% on photographic stills and on sequences, at identical pixels, all the way to
-/// q=100 — and loses by **+64.7% to +234.5%** on a sparse synthetic gradient, because it pays a
-/// terminated interval and a length word for every code-block whether or not the block is empty.
-/// That is ENT-14. When it is fixed this arm becomes `Abac` and `regression_gradient_*` is the
-/// test that will say whether it is really fixed.
+/// **abac replaced Rice above the cutoff in ENT-10 (`docs/decisions/0053`)**: 11.9% to 20.7%
+/// fewer bits at identical pixels, over stills, sequences, a held static shot and a sparse
+/// gradient, all the way to q=100 where both coders stay bit-exact. `0052` refused this same flip
+/// hours earlier because abac read **+234.5%** on the gradient — it paid a coded stream for every
+/// empty code-block — and ENT-14 removed that floor rather than the criterion.
+///
+/// The cutoff itself did not move: abac loses to rANS below it (q=15 read +5.8% / +0.3% / −0.1%
+/// on three images, *before* ENT-14) and wins above it.
 #[test]
 fn test_entropy_coder_follows_quality() {
     for q in [1, 10, 20] {
@@ -3501,8 +3503,8 @@ fn test_entropy_coder_follows_quality() {
     for q in [21, 40, 75, 100] {
         assert_eq!(
             crate::quality_preset(q).entropy_coder,
-            crate::EntropyCoder::Rice,
-            "q={q} should use Rice",
+            crate::EntropyCoder::Abac,
+            "q={q} should use abac",
         );
     }
 }

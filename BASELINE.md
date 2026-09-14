@@ -183,6 +183,18 @@ VMAF, dE00) are deterministic and unaffected; fps and latency are not.
 stated parameters are also inconsistent — "ki=8 ... I+P+B", but ki=8 is below the B-frame
 threshold of 9, and the encoder emits 2I+8P. Do not build a density claim on it.
 
+> **2026-09-14: the default entropy coder changed, so every rate figure below is from the previous
+> default.** ENT-10 (`docs/decisions/0053`) made **abac** the default for q > 20; rANS still holds
+> q ≤ 20. abac codes **11.9% to 20.7% fewer bits than Rice at identical pixels** over stills,
+> sequences, a held static shot and a sparse gradient, for 1.7x-5.4x encode and 1.0x-2.3x decode.
+>
+> **So the headline gap moves and this file has not caught up.** The **+89.2% BD-rate** against
+> x264 quoted here, in GOALS §1 and in POSITIONING is a **Rice** figure; MEAS-11 recorded **+61.0%**
+> with abac, at cb=64 and before ENT-14 — i.e. before both of the day's improvements. **Every
+> `--abac` row in this file predates `0051` and ENT-14 too.** The re-take is MEAS-11 and it is now
+> a re-take of the shipped default rather than of an option. Until it is done, read every rate row
+> below as "what the previous default did".
+
 ## Stream density is a pixel rate, and on a laptop GPU it is ~70-90 Mpixel/s (2026-09-14, PERF-4)
 
 **This is a *reach* number, not a *scale* number** (GOALS §1). It says what an integrated 30 W

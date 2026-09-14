@@ -8674,7 +8674,34 @@ threshold** — a threshold is what let 55 dB pass for lossless in BUG-15.
 **Invalidates:** any lossless figure taken with `GNC_DEAD_ZONE` set. No shipped default carried one,
 so no published number moves.
 
-### ENT-14 — abac codes an empty code-block in full, and that is the whole file on sparse content (todo, **P0**)
+### ENT-14 — abac codes an empty code-block in full (**FIXED 2026-09-14**, `0053`)
+
+> **FIXED.** An all-zero code-block codes to **no bytes at all** instead of a terminated
+> arithmetic interval. **No format change and no generation moved**, because a zero-length stream
+> already decodes to zeros on both engines — tested, not assumed (`empty_stream_decodes_to_zeros`):
+> the decoders read past the end as zero bytes and the initial contexts resolve every significance
+> decision to "not significant". The format already expressed "this block is nothing"; the encoder
+> simply never said it. Old files unaffected, existing decoders read the new streams.
+>
+> | | before | after |
+> |---|---|---|
+> | gradient q=25 | **+234.5%** | **−8.7%** |
+> | gradient q=90 | +64.7% | −27.9% |
+> | stills q=25..85 | −10.1% to −15.0% | **−12.9% to −20.7%** |
+> | sequences q=90 | −12.3% to −17.4% | −12.7% to **−17.8%** |
+> | **held static shot** (new) | — | **−16.7% / −16.9%** |
+>
+> **All five criteria met, two exceeded** (the gradient target was ±5% of Rice). The case this
+> item said was the real risk — a static shot, unmeasured by anyone until now — is abac's **best**
+> case, not its worst. Canary: `empty=264/280` on the gradient and **`empty=420..476/2800` on a
+> photograph**, so 15-17% of blocks are empty even on busy content, which is why it helped
+> everywhere. One degenerate case became reachable and is handled: an all-empty plane codes to zero
+> total bytes and `read_buffer_u32` panics on a zero-sized staging buffer.
+>
+> **Rejected:** a bitmap or run-length instead of a zero varint — a zero varint is already one
+> byte, so a bitmap saves at most 7/8 of 840 bytes on the worst frame measured. A run-length over
+> consecutive empties is better motivated (deep subbands are empty in runs) and deserves its own
+> measurement rather than a guess bundled into this one.
 
 **This is what blocks abac from being the default, and it was found by a test rather than by a
 sweep.** ENT-10's rate case is overwhelming on real pictures — −10.1% to −17.4% against Rice at
@@ -8738,7 +8765,28 @@ number). The existing gates are the right ones: 98/98 GPU-vs-CPU byte identity, 
 
 Then ENT-10's default flip lands, with `0052` amended rather than rewritten.
 
-### ENT-13 — abac's remaining cost is structural, not algorithmic: it codes every frame twice (todo, **P1**)
+### ENT-13 — abac's remaining cost is structural, not algorithmic: it codes every frame twice (todo, **P1** — **re-read the premise first, 2026-09-14**)
+
+> **This item's headline is half wrong, and the measurement that says so landed the day it was
+> filed.** `abac_encode_throughput_grid` on an idle M1 Pro (best of 24, `med/best` 1.02-1.03),
+> with ENT-14 in the build:
+>
+> | path | bytes | plane ms | frame ms |
+> |---|---|---|---|
+> | GPU Range / CountThenEmit (2 passes) | 395 501 | 51.97 | **155.92** |
+> | GPU Range / BoundedSlots (1 pass) | 395 501 | 32.49 | **97.46** |
+> | CPU Range, **one thread** | 395 501 | 26.57 | **79.71** |
+>
+> **The coder stage moves 1.60x between the sizing modes** — reproducing another session's Windows
+> prior of 1.54x on an RTX 2000 Ada, and discharging `0017` reason 2 / ENT-5 criterion 3 (97.46
+> ms/frame against the 129 ms that record quotes). **But a whole-frame `gnc benchmark` moves only
+> 1.10x-1.27x between the same two modes.** So the coder passes are a *minority* of abac's frame
+> encode time, and item 1 below is worth ~20% of the frame rather than ~2x. **Item 3 — the
+> readback and submission path — is the larger half and is still unmeasured.** Do the timer first.
+>
+> **And the table has a second finding that belongs to this item:** the single-threaded **CPU**
+> coder is faster than the GPU one, 79.71 against 97.46 ms/frame, on a 16-core GPU, for 2800
+> independent blocks. That is not a sizing question at all.
 
 **Filed 2026-09-14 at the owner's request** — *"känns som att det finns mycket att fixa här.. se
 över perf i abac"* — after `0051` took 2.3x off encode and 2x off decode by fixing occupancy alone.
@@ -9057,7 +9105,23 @@ one. The case against abac now has to rest entirely on cost, which is where it i
 Re-price it as a per-operating-point decision rather than a single yes/no, and say which rungs it
 should default on. Nothing below this line has been re-derived.
 
-### ENT-10 — should abac be the default? **Rate case MEASURED and it says yes; BLOCKED on ENT-14** (todo, **P0**)
+### ENT-10 — should abac be the default? **YES. DONE 2026-09-14** (`0053`, superseding `0052`)
+
+> **DONE.** `quality_preset` selects `EntropyCoder::Abac` for q > 20; rANS keeps q ≤ 20. Open since
+> 2026-09-08 and blocked on cost for all of it. **−11.9% to −20.7% of the bits at identical pixels**
+> (0.00 dB PSNR delta in every channel at every point) over three stills at q ∈ {25,50,75,85,90,95,
+> 99,100}, four sequences at q ∈ {90,95,99}, a held static shot (−16.7%/−16.9%) and a sparse
+> gradient (−8.7% to −27.9%). **Cost, in the same breath as the win: 1.7x-5.4x encode, 1.0x-2.3x
+> decode** — after `0051` took 2.3x out and ENT-14 removed the floor that `0052` refused it for.
+>
+> **The cutoff did not move, and that is a finding.** abac loses to rANS below it and wins above it
+> at the same q, measured *before* ENT-14 so those are its floor: q=15 +5.8/+0.3/−0.1, q=20
+> +1.6/−2.8/−3.4, q=25 −6.0/−7.2/−7.9. The three constants move together if any moves.
+>
+> **What this owes the rest of the tree:** BASELINE, GOALS §1 and POSITIONING quote **+89.2%
+> BD-rate** against x264 with Rice, and MEAS-11 recorded **+61.0%** with abac. That re-take is now
+> a re-take of the **default**, not of an option, and every `--abac` row in BASELINE predates both
+> `0051` and ENT-14. `codec-fingerprint fb2fe82a` → `027e58bc`.
 
 > **2026-09-14, step 2 (`docs/decisions/0052`): the answer is yes on every real picture and no on
 > sparse content, and the second half is a defect rather than a verdict.**

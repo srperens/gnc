@@ -154,6 +154,32 @@ fn mag_of(v: i32) -> u32 {
     return u;
 }
 
+// ENT-14: is every coefficient in this block zero?
+//
+// An all-zero block is coded as **no bytes at all** — length 0 — instead of a terminated
+// arithmetic interval. The floor that removes was ~11.5 B per block measured, and on sparse
+// content it was the whole file: a 512x512 gradient at cb=32 has 840 blocks and came out 2.3x
+// larger than Rice, all of it this.
+//
+// **Not a format change.** A zero-length stream already decodes to zeros on both coders
+// (`empty_stream_decodes_to_zeros` proves it), because the decoders read past the end as zero
+// bytes and the initial contexts resolve every significance bit to "not significant". So the
+// decode side needs nothing, old files still read, and the CPU reference in `abac_tile.rs` makes
+// the same decision from the same values — which is what keeps the two byte-exact.
+//
+// The scan returns on the first non-zero, so a busy block pays a few reads and a cold one pays a
+// full sweep of data it would otherwise have coded.
+fn block_is_empty(info: EncBlock) -> bool {
+    for (var y = 0u; y < info.height; y++) {
+        for (var x = 0u; x < info.width; x++) {
+            if (i32(round(input[info.in_offset + y * info.stride + x])) != 0) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 // Must match `bucket` in abac.rs: `32 - leading_zeros(nb)` clamped. WGSL has firstLeadingBit,
 // and 32 - leading_zeros == firstLeadingBit + 1.
 fn bucket(nb: u32) -> u32 {
@@ -316,6 +342,14 @@ fn main(
         return;
     }
     let info = blocks[blk];
+
+    // ENT-14: an empty block is length 0 and no bytes. Both passes must agree — the count pass
+    // and the emit pass make the same decision from the same coefficients, so the slot sized in
+    // pass 1 is exactly the nothing pass 2 writes.
+    if (block_is_empty(info)) {
+        lengths[info.index] = 0u;
+        return;
+    }
 
     for (var i = 0u; i < NUM_CONTEXTS_ALL; i++) {
         probs[i * WG + tid] = PROB_HALF;
@@ -538,6 +572,13 @@ fn main_rc(
     }
     let info = blocks[blk];
 
+    // ENT-14, same rule as `main` above: empty means length 0 and no bytes, decided identically
+    // in the count pass and the emit pass.
+    if (block_is_empty(info)) {
+        lengths[info.index] = 0u;
+        return;
+    }
+
     for (var i = 0u; i < NUM_CONTEXTS_ALL; i++) {
         probs[i * WG + tid] = RC_PROB_HALF;
     }
@@ -646,6 +687,14 @@ fn bound(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
     let info = blocks[blk];
+    // ENT-14: an empty block emits nothing, so its bound is nothing. Without this the slot
+    // buffer still reserves ~3 bytes per coefficient for blocks that write zero bytes — correct
+    // but wasteful, and `BoundedSlots`' scratch is already the reason it can hit the storage
+    // binding limit.
+    if (block_is_empty(info)) {
+        lengths[info.index] = 0u;
+        return;
+    }
     var n_ctx = 0u;
     var n_byp = 0u;
     for (var y = 0u; y < info.height; y++) {

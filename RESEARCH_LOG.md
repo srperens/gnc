@@ -4,6 +4,99 @@
 
 ---
 
+## ENT-10 step 1 — abac was not expensive, it was empty: 1000 threads for a 1080p plane (2026-09-14)
+
+**Machine: Apple M1 Pro, 16 cores, 16 GB, Metal** (`gnc gpu-info`; one of two Macs). Binary
+`codec-fingerprint 6a9fa6bd` before, `fb2fe82a` after. `gnc benchmark -n 5`, idle machine.
+
+### The question came from the owner, and it was the right one
+
+ENT-10 was promoted to P0 under the phase-1 rule — a rate win is worth an encode cost — and the
+first move should have been to flip the default and measure. The owner stopped that:
+
+> *"Vad jag funderar på om vi kan få abac inte så tung först? ... något känns knas med den."*
+
+**Something was.** One diagnostic line, already in the tree: `GNC_DIAGNOSTICS=1` prints
+`abac_blocks=1000` for a 1080p plane. abac's GPU encode runs **one thread per code-block**, so at
+the default cb=64 the entire parallelism of the encode is **1000 threads** — each serially coding
+4 096 coefficients, bit by bit, on a 16-core GPU. Rice runs 256 independent streams *per tile*:
+**10 240 per plane.** The 5x was not the price of arithmetic coding. It was occupancy.
+
+### The measurement
+
+Three stills x q ∈ {90, 99} x cb ∈ {64, 32} x sizing ∈ {CountThenEmit, BoundedSlots}. Bytes are
+identical between sizing modes in **12 of 12** cells, as their documentation promises, so rate is a
+function of `cb` alone.
+
+| | rate vs Rice | encode vs Rice | frame decode vs Rice |
+|---|---|---|---|
+| cb=64 (was default) | −14.1% to −17.5% | **5.0x to 12.0x** | **2.6x to 4.8x** |
+| cb=32 (is now) | −11.8% to −14.9% | **2.2x to 5.1x** | **1.3x to 2.1x** |
+
+**6 of 6 points agree in both directions.** Halving the edge quadruples the block count, and since
+ENT-5 put the *decoder* on the GPU on the same one-thread-per-block rule, it buys both sides:
+**~2.3x off encode, ~2x off decode, for ~2.5 to 3.5 points of rate.**
+
+Controls: **the pixels do not move** (49.89 dB at both cb on bbb q=90, identical to two decimals in
+all three channels — entropy coding is lossless over the same coefficients). And **32 is a knee,
+not a slide**: cb=16 buys ~8% more encode speed for **+17%** rate against cb=64's +3.8%; cb=8 is
+worse on both.
+
+### The ratio column hides the thing a latency question needs
+
+At cb=32/BoundedSlots, 1080p encode is **73.4 ms on bbb and 73.3 ms on stockholm** — the same —
+while Rice moves 39.5 → 15.7 ms with the content. So abac reads "11.96x" on stockholm and "1.86x"
+on bbb **for the same absolute work**; the ratio is mostly a statement about Rice. **abac's encode
+cost is nearly content-independent**, ~73–80 ms per 1080p frame at cb=32 against ~127–199 ms at
+cb=64, and that absolute figure is what a latency budget is spent against.
+
+### Why the old default was 64, and why that reason expired
+
+`DEFAULT_CB`'s doc comment: *"−13.8% rate at 33.0 ms of entropy decode, where cb=32 is −10.9% at
+31.4 ms — cb=64 dominates."* **The rate half still reproduces** (2.9 points then, 2.5–3.5 now).
+**The decode half does not, because the decoder it was measured on no longer exists** — ENT-5 moved
+abac decode onto the GPU, one thread per code-block, which is exactly the axis `cb` controls. A
+33.0 → 31.4 ms reading is a 5% move where today's whole-frame decode moves **2x**; a 5% difference
+cannot be the shadow of a 2x one, and that is how the two are distinguishable as measurements of
+different code.
+
+**This is COORDINATION's "a number carries its codec" in its natural habitat**: a correct
+measurement, recorded as a constant, outliving the thing it measured — and sitting in a `const`'s
+doc comment, where nothing re-runs it and `gnc fingerprint` cannot see it.
+
+### Shipped, and what was declined
+
+`DEFAULT_CB` 64 → **32**. Not a format change: `cb` is written per tile, so a decoder reads what
+the stream says and cb=64 files keep decoding. Decision `docs/decisions/0051`.
+
+**Declined: `BoundedSlots` as the default sizing.** Worth a further **1.1x to 1.6x** at
+byte-identical output, but `CountThenEmit` codes twice and is exact by construction while
+`BoundedSlots` codes once against a shader-computed ceiling and **panics** if that ceiling is ever
+wrong (BUG-22's failure mode). Take the 2.3x that cannot fail before the 1.2x that can; the mode
+stays reachable as `GNC_ABAC_GPU_SIZING=slots` and is now measured rather than merely offered.
+
+**Declined: chasing occupancy further.** cb=16 says that lever is spent. What remains is structural
+— two full coder passes, a readback between them, a `poll(Wait)` per pass — which is ENT-8 and
+PERF-5, and neither is needed to decide ENT-10.
+
+### One test failed, and it was right to
+
+`all_zero_tile_is_cheap` asserted a flat 512-byte ceiling for a 256x256 tile and read 763. An empty
+code-block still costs a terminated interval and a length word, so the floor scales with the block
+count, and the block count scales with `DEFAULT_CB` — 25 blocks became 100. **A correct consequence
+of the change, reading as a regression**, which is what a flat bound on a derived quantity does.
+The assertion is now per block.
+
+### What this does not do
+
+**It does not decide ENT-10.** It moves the cost side: the trade is now **−11.8% to −14.9% at ~2.3x
+encode and ~1.7x decode**, against −14.1% to −17.5% at 5.0–12.0x and 2.6–4.8x. Whether abac becomes
+the default still needs sequences as well as stills and inter as well as intra — `0045` records the
+saving decaying on inter — and its own decision record. **BASELINE's `--abac` rows are now at a
+non-default `cb`**; re-take is MEAS-11, already open.
+
+---
+
 ## PERF-4 — the density sweep was not measuring process duplication, and one device for N streams is worse than N devices (2026-09-14)
 
 **Machine: Apple M1 Pro, 16 GB, Metal** — what `gnc gpu-info` printed, not what CLAUDE.md's

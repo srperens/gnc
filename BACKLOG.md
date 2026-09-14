@@ -8916,7 +8916,44 @@ one. The case against abac now has to rest entirely on cost, which is where it i
 Re-price it as a per-operating-point decision rather than a single yes/no, and say which rungs it
 should default on. Nothing below this line has been re-derived.
 
-### ENT-10 — should abac be the default? The cost side is measured, and 2026-09-14's phase decision is what it was waiting for (todo, **P0**)
+### ENT-10 — should abac be the default? **Step 1 DONE 2026-09-14 — the cost side moved 2.3x** (step 2 todo, **P0**)
+
+> **Step 1: abac was not expensive, it was empty.** `docs/decisions/0051`. The owner refused to
+> accept the 5x as a property of the codec — *"kan vi få abac inte så tung först? ... något känns
+> knas med den"* — and one diagnostic line settled it: `GNC_DIAGNOSTICS=1` prints
+> `abac_blocks=1000` for a 1080p plane. abac's GPU encode runs **one thread per code-block**, so
+> at cb=64 the whole parallelism of the encode is **1000 threads**, each serially coding 4 096
+> coefficients on a 16-core GPU. Rice runs 256 independent streams *per tile* — 10 240 per plane.
+>
+> `DEFAULT_CB` 64 → **32** (3 stills x q ∈ {90,99}, 6 of 6 points agree):
+>
+> | | rate vs Rice | encode vs Rice | frame decode vs Rice |
+> |---|---|---|---|
+> | cb=64 (was) | −14.1% to −17.5% | 5.0x to 12.0x | 2.6x to 4.8x |
+> | cb=32 (is) | −11.8% to −14.9% | **2.2x to 5.1x** | **1.3x to 2.1x** |
+>
+> **~2.5 to 3.5 points of rate buys ~2.3x off encode and ~2x off decode.** Pixels identical
+> (49.89 dB both), 32 is a knee not a slide (cb=16 costs +17% rate for ~8% speed), not a format
+> change (`cb` is per tile). `codec-fingerprint 6a9fa6bd` → `fb2fe82a`.
+>
+> **The old default's justification had expired:** its comment priced cb=64 at "33.0 ms of entropy
+> decode against cb=32's 31.4" — a 5% move, measured before ENT-5 put the decoder on the GPU one
+> thread per code-block. Today's whole-frame decode moves **2x** on the same axis. A number in a
+> `const`'s doc comment that nothing re-runs, outliving the code it measured.
+>
+> **So the trade this item must now decide is −11.8% to −14.9% at ~2.3x encode / ~1.7x decode**,
+> not −14.1% to −17.5% at 5.0–12.0x / 2.6–4.8x. Different decision, same evidence base.
+>
+> **Step 2, still owed and unchanged by this:** ≥3 *sequences* as well as stills, inter as well as
+> intra (`0045` records the saving decaying on inter), the likely per-operating-point shape rather
+> than a global flip, and a decision record either way. **BASELINE's `--abac` rows are now at a
+> non-default `cb`** — re-take is MEAS-11.
+>
+> **Declined in step 1, with numbers:** `BoundedSlots` as default sizing (a further 1.1–1.6x at
+> byte-identical output, but it panics if its shader-computed ceiling is ever wrong — take the
+> 2.3x that cannot fail before the 1.2x that can; reachable as `GNC_ABAC_GPU_SIZING=slots`), and
+> chasing occupancy further (cb=16 says that lever is spent; what remains is two coder passes and
+> a readback — ENT-8 and PERF-5).
 
 **Unparked and measured in the quiet hour, 2026-09-08.** Median of 3+ at `19354a4`,
 `codec-fingerprint v1 9e2b1202`, idle machine:

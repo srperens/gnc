@@ -71,6 +71,91 @@ stripes, or upstream of the entropy coder in the transform/quantiser, per `docs/
 
 ---
 
+## ENT-15 — abac's GPU encode is not badly written; it is running a workload the hardware is bad at (2026-09-14)
+
+**Machine: Apple M1 Pro, 16 GPU cores, 10 CPU cores, Metal.** `codec-fingerprint 027e58bc`,
+unchanged either side — **nothing shipped.** `docs/decisions/0086`.
+
+### The question
+
+`0053`'s sizing grid turned up a figure nobody had gone looking for: the **single-threaded CPU**
+coder beats the **whole GPU** on one 2.62 Mcoeff plane, 27.47 ms against 32.64. The owner: *"det är
+inte klokt"*. It is not — 2800 independent code-blocks, one thread each, no shared state, is the
+textbook GPU shape. Two structural explanations were available and both were fixable.
+
+### Hypothesis 1: SIMD divergence between blocks — REFUTED, and the fix is a regression
+
+A Metal SIMD group runs at its slowest lane. The dispatch sorts by **area**; content makes two
+equal-area blocks differ by an order of magnitude in bytes, and since ENT-14 an empty block returns
+immediately. `slot_sizes` is an exact per-block cost already in hand, so sorting by it should pack
+each group with equal work.
+
+**It does, by that metric — waste 2.94x → 1.03x — and the encoder got 3% to 8% SLOWER on 6 of 6
+points.**
+
+**The proxy was wrong.** A block's *time* is the per-coefficient traversal, i.e. its **area**, not
+the bytes it emits; sorting by bytes mixes a 32x32 block with an 8x8 one whenever they code to
+similar lengths, and the group then costs the larger area. **The shipped area sort was already
+optimal: 1.00x on the proxy that predicts time.** Reverted. `simd_waste` now prints both columns
+and names which one predicts time, because the byte column looks like a 3x opportunity and is not.
+
+### Hypothesis 2: occupancy starved by workgroup memory — REAL, worth 3%
+
+`probs` + `rows` = **9472 B per 32-thread workgroup**, 296 B per thread, so 3 resident workgroups
+on a 32 KB core budget. `rows` is sized for `MAX_BLOCK_W=64` while the shipped default is cb=32
+(`0051`) — over-provisioned exactly 2x. Halving it: 9472 → 7424 B, 3 workgroups → 4.
+
+**Gain 0.3% to 5.9%, mean ~3%** on the same six points. A 33% occupancy increase bought 3%, so
+occupancy is a real term and a small one. **Not taken:** it costs cb=64 support (a compile-time
+constant sizes the workgroup array) for 3%. A WGSL `override` keeps both and is worth doing with a
+change that makes it matter.
+
+### What the numbers say once both are refuted
+
+| path | ms/plane | passes | lanes | Mcoeff/s | coeff/s **per lane** |
+|---|---|---|---|---|---|
+| GPU Range / CountThenEmit | 51.91 | 2 | 2800 | 100.9 | 36 051 |
+| GPU Range / BoundedSlots | 32.64 | 1 | 2800 | 80.3 | 28 668 |
+| **CPU Range, one thread** | **27.47** | 1 | 1 | **95.4** | **95 376 775** |
+
+**One CPU lane does the work of about 3 300 GPU lanes here.** An adaptive binary arithmetic coder
+is a bit-serial state machine with a data-dependent branch per symbol and a threadgroup
+read-modify-write per binary decision — precisely what a branch predictor and an out-of-order
+engine exist for, and precisely what a SIMD lane is worst at. **More lanes do not fix it**, and
+that is independently visible: cb=16 quadruples the block count and buys ~8%.
+
+**So the implementation is not leaving anything on the table.** Packing 1.00x, blocks +8%, memory
++3%. **Every lane-count lever on the GPU is spent**, which is the useful half of a negative result:
+ENT-13 must stop looking at the dispatch and start looking at work per coefficient. In a non-empty
+block most coefficients are still zero, and each costs a coded "not significant" bit plus a
+threadgroup read-modify-write; JPEG 2000 answers that with a run-length mode in the significance
+pass, which would be a rate lever **and** a time lever.
+
+### And the question it opens, filed rather than answered
+
+The coder is embarrassingly parallel over code-blocks on **either** device, and this machine has
+ten CPU cores (`tests/abac_cpu_threads.rs`; its 1-thread figure matches `abac_bench` to 0.2%,
+which is the control that says the two are comparable):
+
+| CPU threads | ms/plane | Mcoeff/s | vs 1 thread |
+|---|---|---|---|
+| 1 | 27.52 | 95.2 | 1.00x |
+| 4 | 8.00 | 327.5 | 3.44x |
+| **8** | **4.37** | **599.3** | **6.29x** |
+| 10 | 5.32 | 492.4 | 5.17x |
+
+**Eight CPU threads are 7.5x faster than the entire GPU at this stage**, scaling near-linearly.
+
+That is a real tension with GOALS §1's "everything runs as wgpu compute shaders", and it is a
+**direction question for the owner**. Filed as **ENT-16 (P2)** with the three things an honest
+version has to price and none of which is measured: the coefficient readback (~31 MB per 4:4:4
+frame plus a sync — nearly free on unified memory, not on a discrete card, **and the discrete card
+is where the density claim lives**); what it costs the browser path; and whether the same holds for
+Rice, in which case the question is about GNC's architecture rather than about abac. **Deciding it
+on this Mac's numbers would be `0085`'s mistake repeated.**
+
+---
+
 ## ENT-14 — an empty code-block now costs one byte, and that turned abac's worst case into its best (2026-09-14)
 
 **Machine: Apple M1 Pro, 16 cores, 16 GB, Metal.** `codec-fingerprint fb2fe82a` → **`027e58bc`**.

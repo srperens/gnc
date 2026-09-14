@@ -504,6 +504,20 @@ impl GpuAbacEncoder {
             b.dst_byte = slot_off[i];
             b.cap_bytes = slot_sizes[i];
         }
+
+        // **ENT-15 measured re-sorting the dispatch by coded size here, and it is a regression.**
+        // Kept as a comment because the reasoning is seductive and someone will have it again.
+        //
+        // The argument: a Metal SIMD group runs at its slowest lane, `slot_sizes` is a free and
+        // exact per-block cost, so sorting by it should pack each group with equal work. By the
+        // byte-waste metric it works perfectly — `simd_waste` goes from **2.94x to 1.03x**.
+        //
+        // It is **3% to 8% slower**, on 6 of 6 points (three stills x q ∈ {90,99}). The proxy is
+        // wrong: a block's *time* is dominated by the per-coefficient traversal, which is its
+        // **area**, not by the bytes it emits. Sorting by bytes mixes a 32x32 block with an 8x8
+        // one whenever they code to similar lengths, and the group then costs the larger area.
+        // The area sort above was already the right answer, and `simd_waste` now prints the area
+        // column beside the byte one so the next reader sees which is which.
         ensure_var_buf(
             ctx,
             &mut self.slots_buf,
@@ -668,9 +682,60 @@ impl GpuAbacEncoder {
                  (empty={empty}) bytes={total_bytes} scratch={total} passes={coder_passes} \
                  coder={coder:?} cb={cb} sizing={sizing:?}"
             );
+            eprintln!("  [abac-gpu] {}", simd_waste(&blocks, &lengths));
         }
         tiles
     }
+}
+
+/// ENT-15: how much of each SIMD group the dispatch order wastes, by two different proxies.
+///
+/// One thread codes one block, and **a Metal SIMD group runs at its slowest lane**, so a group of
+/// 32 blocks costs the *maximum* of its 32, not the mean. `blocks` is in dispatch order, so
+/// `blocks[g*32 .. g*32+32]` is exactly one group.
+///
+/// **Two proxies, because the obvious one is wrong and that cost a measurement.**
+///
+/// - **area** — the block's coefficient count. This is what the coder's outer loop runs over, and
+///   it is the one that predicts time.
+/// - **bytes** — what the block coded to. Seductive, because it is exact and free, and it is what
+///   an intuition about "work" reaches for first.
+///
+/// Sorting the dispatch by **bytes** drives the byte column to 1.03x from 2.94x and is **3-8%
+/// slower** on 6 of 6 points, because it mixes block sizes whenever two blocks of different areas
+/// happen to code to similar lengths. Sorting by **area**, which is what this encoder does, leaves
+/// the byte column looking terrible and is the faster of the two. **Read the area column.**
+fn simd_waste(blocks: &[EncBlock], lengths: &[u32]) -> String {
+    const SIMD: usize = 32;
+    if blocks.is_empty() {
+        return "simd: no blocks".to_string();
+    }
+    // (charged, needed) for one proxy: a group is charged its max, on every lane.
+    let mut by_area = (0u64, 0u64);
+    let mut by_bytes = (0u64, 0u64);
+    for group in blocks.chunks(SIMD) {
+        let n = group.len() as u64;
+        let areas = group.iter().map(|b| u64::from(b.width * b.height));
+        let bytes = group.iter().map(|b| u64::from(lengths[b.index as usize]));
+        by_area.0 += areas.clone().max().unwrap_or(0) * n;
+        by_area.1 += areas.sum::<u64>();
+        by_bytes.0 += bytes.clone().max().unwrap_or(0) * n;
+        by_bytes.1 += bytes.sum::<u64>();
+    }
+    let ratio = |(charged, needed): (u64, u64)| {
+        if needed > 0 {
+            charged as f64 / needed as f64
+        } else {
+            1.0
+        }
+    };
+    format!(
+        "simd: {} groups of {SIMD}, lanes charged / lanes needed = {:.2}x by area \
+         (the one that predicts time), {:.2}x by bytes",
+        blocks.len().div_ceil(SIMD),
+        ratio(by_area),
+        ratio(by_bytes)
+    )
 }
 
 /// Unpack little-endian bytes out of the words the shader wrote, exactly as the decoder's

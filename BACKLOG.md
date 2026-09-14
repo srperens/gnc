@@ -8765,6 +8765,74 @@ number). The existing gates are the right ones: 98/98 GPU-vs-CPU byte identity, 
 
 Then ENT-10's default flip lands, with `0052` amended rather than rewritten.
 
+### ENT-15 — why abac's GPU encode loses to one CPU thread (**ANSWERED 2026-09-14**, `0086`)
+
+> **ANSWERED, and nothing shipped.** The owner's *"det är inte klokt"* was the right reaction — 2800
+> independent code-blocks, one thread each, is the textbook GPU workload, and the single-threaded
+> CPU coder still beat the whole GPU (27.47 ms/plane against 32.64). **Both structural explanations
+> are now refuted.**
+>
+> **1. SIMD divergence between blocks — refuted, and the fix is a regression.** The dispatch sorts
+> by area; sorting by `slot_sizes` (an exact, free per-block byte count) drives the waste metric
+> from **2.94x to 1.03x** and makes the encoder **3-8% slower**, 6 of 6 points. The proxy was
+> wrong: a block's *time* is its **area**, not its bytes, and sorting by bytes mixes block sizes.
+> **The shipped area sort is already optimal — 1.00x on the proxy that predicts time.**
+> `simd_waste` now prints both columns, because the byte column looks like a 3x opportunity.
+>
+> **2. Occupancy starved by workgroup memory — real, worth 3%.** `rows` is sized for
+> `MAX_BLOCK_W=64` while the default is now cb=32, so it is over-provisioned 2x: 9472 → 7424 B per
+> workgroup, 3 resident workgroups → 4. **Gain 0.3% to 5.9%, mean ~3%.** Not taken: it costs cb=64
+> support for 3%. A WGSL `override` would keep both and is worth doing *with* a change that makes
+> it matter.
+>
+> **What is left is the hardware.** One CPU lane does the work of **~3 300 GPU lanes** here: 95.4
+> Mcoeff/s on one core against 80.3 across 2800 GPU lanes. An adaptive binary arithmetic coder is a
+> bit-serial state machine with a data-dependent branch per symbol and a threadgroup
+> read-modify-write per binary decision — what a branch predictor exists for and what a SIMD lane
+> is worst at. **More lanes do not fix it:** cb=16 quadruples the block count for ~8%.
+>
+> **So every lane-count lever on the GPU is spent** (packing 1.00x, blocks +8%, memory +3%), and
+> **ENT-13 should be read in that light**: what remains is doing less work *per coefficient*. In a
+> non-empty block most coefficients are still zero and each costs a coded bit plus a threadgroup
+> read-modify-write; JPEG 2000 answers that with a run-length mode in the significance pass, which
+> would be a rate lever **and** a time lever.
+
+### ENT-16 — should abac's entropy stage run on the CPU at all? Eight threads are 7.5x the GPU (todo, **P2** — **direction question**)
+
+**Filed by ENT-15 (`0086`), which measured it rather than speculating.** The coder is embarrassingly
+parallel over code-blocks on **either** device, and this machine has ten CPU cores
+(`tests/abac_cpu_threads.rs`, 1-thread figure matching `abac_bench` to 0.2%):
+
+| CPU threads | ms/plane | Mcoeff/s | vs 1 thread |
+|---|---|---|---|
+| 1 | 27.52 | 95.2 | 1.00x |
+| 4 | 8.00 | 327.5 | 3.44x |
+| **8** | **4.37** | **599.3** | **6.29x** |
+| 10 | 5.32 | 492.4 | 5.17x |
+
+**Eight CPU threads are 7.5x faster than the entire GPU** at this stage, scaling near-linearly,
+against the GPU's 32.64 ms / 80.3 Mcoeff/s.
+
+**This is a direction question, not an engineering one**, and it is in tension with GOALS §1's
+"everything runs as wgpu compute shaders". **Do not act on it without the owner.** What an honest
+version has to price, none of it measured:
+
+1. **The readback.** Coefficients live on the GPU: ~10.5 MB per plane, ~31 MB per 4:4:4 frame, plus
+   a sync point. On unified memory that may be nearly free; on a discrete card it is not — **and
+   the discrete card is where the density claim lives** (MEAS-15). One Mac cannot settle this, and
+   a decision taken on this machine's numbers would be exactly the `0085` mistake again.
+2. **The browser.** The WASM decoder is verified (GOALS §1); a CPU encode path in a browser is a
+   different animal from a native thread pool, and rule 4 is about what a *conformant WebGPU device*
+   can do.
+3. **Whether it is the coder or the codec.** Rice runs ~10 240 streams per plane against abac's
+   2800 and is no faster per lane. If the CPU wins this comfortably on abac it may win on Rice too.
+   Nobody has measured that, and if it holds there as well then the question is about GNC's
+   architecture and not about abac.
+
+**Success criterion:** a like-for-like frame-level comparison — GPU entropy stage against CPU
+entropy stage **including** the readback and the sync — on **two** machines, one of them not a Mac.
+Anything less is a machine-specific curiosity.
+
 ### ENT-13 — abac's remaining cost is structural, not algorithmic: it codes every frame twice (todo, **P1** — **re-read the premise first, 2026-09-14**)
 
 > **This item's headline is half wrong, and the measurement that says so landed the day it was

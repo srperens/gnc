@@ -1977,8 +1977,13 @@ impl GpuContext {
     /// Fallible version of `new_async()`. Returns an error string if GPU is unavailable.
     pub async fn try_new_async() -> Result<Self, String> {
         let backends = env_backends()?;
+        // `backend_options` from the environment so `WGPU_DX12_COMPILER=dxc` selects DXC over
+        // the default FXC (BUG-52: FXC stalls for minutes compiling GNC's compute shaders; DXC
+        // compiles them in seconds, matching naga-SPIR-V and Metal). Unset, this is FXC — the
+        // default is unchanged, and DXC also needs `dxcompiler.dll` + `dxil.dll` beside the exe.
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends,
+            backend_options: wgpu::BackendOptions::from_env_or_default(),
             ..Default::default()
         });
 

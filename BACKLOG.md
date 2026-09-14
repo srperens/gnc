@@ -1605,6 +1605,18 @@ turns out to be.
 **Whoever takes this needs the Windows laptop.** It cannot be started on the Mac: there is no DX12
 adapter here (`gnc gpu-info` lists one, Metal). Park it if the machine is not available.
 
+**Update 2026-09-14 (measured on the laptop, RESEARCH_LOG round 4): the DXC candidate is verified,
+and it exposed the next wall.** Wiring `WGPU_DX12_COMPILER=dxc` (env-gated `BackendOptions::from_env_or_default()`
+in `src/lib.rs`, DLLs from the Windows SDK) drops DX12 compile from FXC's >4.5 min to **14.7 s
+(NVIDIA) / 17.5 s (Intel)** — the compile-time wall is gone, so this half of BUG-52 is done and the
+env-gated change is committed. DX12 still produces no frame: DXC's DXIL validator now rejects
+**`rans_normalize_encode_fused.wgsl`** for **33816 B of threadgroup shared memory > 32768 B**
+(`shared_freq[4096]` + `shared_cumfreq[4096]` = 32 KB, plus `shared_sum[256]` and scalars). It
+compiles eagerly, so it blocks *every* coder — `--abac` hits the identical error. **New item owed
+(needs a number):** either make the rANS encode pipelines lazy (BUG-40 / `0049` pattern) so the
+default Rice path can produce GNC's first DX12 frame, or shrink the shader under 32 KB. It also
+exceeds GNC's own 16 KB workgroup request.
+
 ### BUG-40 — the eager `block_match_bidir` pipeline is BUG-25's shape on DX12 (**FIXED 2026-09-08**, step 1)
 
 **Step 1 landed 2026-09-08.** `match_bidir_pipeline`, `compensate_bidir_pipeline` and

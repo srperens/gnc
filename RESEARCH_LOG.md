@@ -19178,3 +19178,88 @@ were being produced faster than they were being controlled.**
 The specific habit that would have caught all three: *before quoting a delta, name what the other
 arm is and why it is the right one.* The 4:4:4 baseline fails that question immediately — nobody
 codes a 4:2:0 source at 4:4:4, so it was never the arm to beat.
+
+---
+## 2026-09-14 (round 4) -- the DXC fix works, DX12 clears the compile wall, and hits a 32 KB groupshared overflow
+
+Same Windows laptop (Intel Arc Pro + NVIDIA RTX 2000 Ada, 31.5 GB). Built from **8ebfd9e** plus one
+local, env-gated change: the device `wgpu::Instance` in `src/lib.rs` now takes
+`backend_options: wgpu::BackendOptions::from_env_or_default()`, so `WGPU_DX12_COMPILER=dxc` selects
+DXC. Unset, it is FXC -- the default is unchanged. `dxcompiler.dll` and `dxil.dll` (x64) were copied
+next to the exe from the Windows SDK (`10.0.26100.0\x64`); no download.
+
+This tests **BUG-52's candidate fix** end to end. Round 3 left DX12 dying in a >4.5-min FXC compile;
+the reviewer's diagnosis was that GNC has always used wgpu's default DX12 compiler, FXC ("old, slow,
+unmaintained"), and that DXC would compile the same shaders in seconds. Both halves check out.
+
+### DXC clears the compile wall -- BUG-52's fix is correct
+
+`benchmark -i bbb -n 3 -q 90`, `GNC_GPU_BACKEND=dx12`, `WGPU_DX12_COMPILER=dxc`:
+
+| GPU | compiler | wall to first error/exit |
+|---|---|---|
+| NVIDIA RTX 2000 Ada | FXC (round 3) | **>4.5 min, killed, no output** |
+| NVIDIA RTX 2000 Ada | **DXC** | **14.7 s** |
+| Intel Arc Pro | **DXC** | **17.5 s** |
+
+DXC compiles GNC's shader set in seconds where FXC did not finish in minutes. The candidate fix in
+BUG-52 -- switch to DXC, ship the two DLLs -- is verified. It should land; env-gating it costs
+nothing and lets the next session reach DX12 with one variable.
+
+### ...and DX12 hits the next wall: a shader over the 32 KB threadgroup limit
+
+DXC does not produce a frame either, but it fails **fast and specifically** where FXC failed slow and
+opaquely. Identical error on both GPUs:
+
+```
+DXC validation error: Total Thread Group Shared Memory storage is 33816, exceeded 32768.
+```
+
+The shader is **`rans_normalize_encode_fused.wgsl`**. Its groupshared declarations:
+
+| declaration | bytes |
+|---|---|
+| `shared_freq: array<u32, 4096>` | 16384 |
+| `shared_cumfreq: array<u32, 4096>` | 16384 |
+| `shared_sum: array<u32, 256>` | 1024 |
+| 8 scalar `u32` (w_total, w_assigned, ...) | 32 |
+| **total** | **~33824** (validator reports 33816) |
+
+The two 4096-entry frequency/cumulative-frequency arrays alone are exactly 32 KB; the histogram sum
+and scalars push it over DX12's hard **32768 B** threadgroup limit. This is a static property of the
+shader, not a driver quirk -- hence byte-identical failure on NVIDIA and Intel.
+
+**Two things worth recording.** First, this shader also exceeds **GNC's own requested workgroup
+budget** -- CLAUDE.md's Platform Notes say GNC asks wgpu for a 16384 B workgroup-storage limit, and
+this shader wants 33816. It is over budget by 2x; Vulkan/naga-SPIR-V and Metal simply never enforced
+it, and only DXC's DXIL validator does. Second, it compiles eagerly at device creation, so it blocks
+DX12 for **every** coder including the default Rice path, not just `--rans`. Tested directly:
+`benchmark-sequence --abac` on DX12+DXC fails with the *same* 33816 > 32768 error before the first
+frame -- picking a different entropy coder does not avoid a pipeline that is built unconditionally.
+
+### Where DX12 now stands -- three walls, each fix exposing the next
+
+| round | commit | DX12 blocker |
+|---|---|---|
+| 2 | f17bf1b | FXC compile **error** X3695 (race) in `block_match_bidir.wgsl` -- BUG-40 fixed |
+| 3 | f90f94d | FXC compile **time** wall, >4.5 min -- BUG-52; DXC fixes it (this round) |
+| 4 | 8ebfd9e | DXC **validation**: `rans_normalize_encode_fused.wgsl` groupshared 33816 > 32768 |
+
+DX12 has still never produced a frame, but the reason is now a single named shader over a documented
+limit rather than an unbounded compile. **The cheapest path to GNC's first DX12 frame** is probably
+to make the rANS encode pipelines lazy the way BUG-40 made the bidir MC pipelines lazy (`0049`): the
+default Rice benchmark does not use `rans_normalize_encode_fused` at all, so if that pipeline is not
+built until `--rans` dispatches it, a still Rice encode on DX12 should compile and run. Failing that,
+the shader itself has to fit 32 KB -- the two 4096-entry arrays need not both be resident, or the
+alphabet can be tiled. Not chased this round; it wants its own item.
+
+### State
+
+- **BUG-52 DXC fix: VERIFIED.** FXC->DXC removes the compile wall (14.7 s / 17.5 s vs >4.5 min).
+  The env-gated change is kept in `src/lib.rs`; default behaviour (FXC) is unchanged.
+- **New DX12 blocker:** `rans_normalize_encode_fused.wgsl` declares 33816 B of threadgroup shared
+  memory, over DX12's 32768 B limit and over GNC's own 16 KB request. Needs its own bug number.
+  Blocks DX12 for all coders because it compiles eagerly.
+- **DX12 still produces zero frames**, now for a groupshared-size reason. First-frame path: make
+  rANS pipelines lazy (per 0049), or shrink the shader's groupshared.
+- **Unchanged:** CANARY-1 (2.01x), inter works, MEAS-5 inter 1.85x@N=4, NVENC driver-blocked.

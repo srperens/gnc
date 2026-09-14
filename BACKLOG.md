@@ -295,7 +295,7 @@ something a `git diff --stat` of two `.md` files already proves.
 existed and four of them lost. The one judgement call — softening the portability claim rather than
 deleting it — is argued in the section itself.
 
-### BUG-5 — B-frames stop paying, and the B4 pyramid base does not reconstruct (default fixed 2026-09-06; root cause reopened, todo, **P2**)
+### BUG-5 — B-frames stop paying; the pyramid pulse is forward-P saturation (default fixed 2026-09-06; root cause reopened, todo, **P2**)
 Measured 2026-09-05 on 17 byte-identical 1080p frames (bbb, 4:4:4, Rice, fixed qstep, rate
 control off) — content where the correct answer for every inter frame is "nothing changed".
 
@@ -393,13 +393,22 @@ pyramid is only in `benchmark-sequence`) and panicked (exit 101) on extracted fr
 `main.rs:3221` compares `frames_data[i]` to `decoder.decode_sequence(...)[i]` -- so B4 is genuinely
 broken, not mis-measured. And encoder and decoder **agree** on B4: both use I0 as its sole reference
 and the forward P-frame MC path (`sequence.rs:939`, `decoder/pipeline.rs:743-748`, `gpu_work.rs:69-78`).
-So reference, dispatch, measurement, rate and averaging are all ruled out. What is left is the
-**residual round-trip for a frame coded through the P path but tagged `Bidirectional`** -- the one
-axis where encode and decode still diverge by frame type is *serialisation* (MV layout: P writes
-forward-only, a Bidirectional reader may expect forward+backward; or coefficient/entropy framing).
-**Next step:** an instrumented dump comparing B4's prediction, dequantised residual and
-reconstruction encode-vs-decode -- not another black-box sweep. The `GNC_B4_QSTEP_MUL` knob is the
-canary a fix must make responsive.
+So reference, dispatch, measurement, rate and averaging are all ruled out.
+
+**Resolved (same session): B4 is an ordinary forward P-frame; the pulse is forward-P saturation,
+not a B4 bug.** `sequence.rs:963` codes B4 via `encode_pframe` -- it *is* a P-frame. Turn the pyramid
+off and code plain P-frames (`ki=9`, no `GNC_B_PYRAMID`): frame 4 [P] = **35.56 dB** and frame 8 [P]
+= **32.61 dB**, the exact numbers B4 and P8 carry in the pyramid. The pulse is just forward-P quality
+sitting among bidirectional leaf B-frames (~59 dB, two near references). A probe confirmed every
+decoded frame matches its own source (no reference/frame mixup). **The real open item:** that
+forward-P quality is pinned against quantisation -- frame 4 [P] holds 35.56 dB across q=90..94 and
+across `GNC_P_QP_SCALE` = 1.0/0.5, so it is **not TUNE-5** (`BUG-10`); above ~q=94 the encoder codes
+all-I. **Next step needs a second, real sequence** (protocol wants ≥3; this box has only testsrc2):
+confirm whether forward-P qstep-immunity is a general residual-coding cap or content-specific, with a
+plain P-only encode watching one frame across q -- no B-frames, no diagnostic build. The
+`GNC_B4_QSTEP_MUL`/`GNC_B4_PROBE` scaffolding was reverted (B4-specific knobs mislead now).
+**BUG-5's pulse is re-attributed to the forward-P path**; its "stop paying on camera content" half
+is unaffected.
 **Do not re-enable the pyramid default** on the back of this — the rate and latency reasons above
 are unchanged; this is about correctness of the opt-in path.
 

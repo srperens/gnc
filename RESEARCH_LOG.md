@@ -19544,3 +19544,43 @@ next place to look, and it needs an instrumented dump (B4's prediction, its dequ
 its reconstruction, each compared encode-vs-decode) rather than another black-box sweep. Not guessed
 at further here. BUG-5 stays reopened (P2); the canary stands; each pass has removed a candidate
 (rate, averaging, decoder dispatch, wrong reference, mis-measurement) without yet naming the defect.
+
+### Resolved: B4 is not special — it is an ordinary forward P-frame, and forward P-frames saturate
+
+The instrumented dump was not needed; two black-box measurements settled it. First, a probe printing
+each decoded frame's best-matching source frame: every frame including B4 matches **its own** source
+(B4 = frame 4 at 35.56 dB, no cross-match), so it is right content at low quality, not a
+frame/reference mixup. Then the decisive one — **turn the pyramid off and code plain P-frames**
+(`ki=9`, no `GNC_B_PYRAMID`, 1I+8P):
+
+| frame | q=90 P-only |
+|---|---|
+| 4 [P] | **35.56 dB** |
+| 8 [P] | **32.61 dB** |
+
+Those are the *exact* numbers B4 and P8 carry inside the pyramid. **B4 is coded through `encode_pframe`
+(`sequence.rs:963`) — it *is* a forward P-frame** — and a plain forward P-frame at 4-frame distance is
+already 35.56 dB. The pyramid pulse is nothing but ordinary forward-P quality (B4, P8) sitting among
+the bidirectional leaf B-frames, which predict from two near neighbours and reach ~59 dB. No B4 defect,
+no reconstruction bug, no serialisation.
+
+**And that forward-P quality is pinned against quantisation, which is the real open item.** On this clip
+frame 4 [P] holds 35.56 dB across q=90/91/92/93/94 (bytes 371K→401K) and across `GNC_P_QP_SCALE` =
+default/1.0/0.5 — coarser *or* finer, the number does not move. So it is **not TUNE-5** (the known
+P_QP_SCALE saturation, `BUG-10`): forcing the scale to 1.0 at q=90, where TUNE-6's taper should already
+put it, changes nothing, and neither does 0.5. Above ~q=94 the encoder abandons inter and codes all-I
+(lossless), so there is no inter operating point where the P residual closes on the source.
+
+**What is and isn't claimed.** Claimed, and measured: the B-frame pulse is forward-P behaviour, not a
+B-frame bug, and it reproduces with no B-frames at all; and it is not TUNE-5. **Not claimed:** that this
+is a general P-frame defect. It is one synthetic clip (testsrc2, 4:2:0), and the P chain also *descends*
+(41→32 dB over 8 frames) which is ordinary error accumulation. Whether the qstep-immunity is a real
+residual-coding cap or a property of this content needs a second, real sequence — the protocol's ≥3
+sequences, which this box does not have to hand. The reproduction is a plain P-only encode watching one
+frame across q and `GNC_P_QP_SCALE`; no B-frames, no diagnostic build.
+
+The `GNC_B4_QSTEP_MUL` and `GNC_B4_PROBE` scaffolding is reverted — B4-specific knobs would mislead now
+that the effect is not B4-specific. **BUG-5's pulse is re-attributed to the forward-P path**; its own
+"stop paying on camera content" half is unaffected and stays as measured. The honest close: I chased a
+B4 reconstruction bug through five candidates and it was a P-frame all along — visible only because the
+pyramid stands a saturated forward frame next to unsaturated bidirectional ones.

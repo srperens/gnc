@@ -8674,6 +8674,129 @@ threshold** — a threshold is what let 55 dB pass for lossless in BUG-15.
 **Invalidates:** any lossless figure taken with `GNC_DEAD_ZONE` set. No shipped default carried one,
 so no published number moves.
 
+### ENT-14 — abac codes an empty code-block in full, and that is the whole file on sparse content (todo, **P0**)
+
+**This is what blocks abac from being the default, and it was found by a test rather than by a
+sweep.** ENT-10's rate case is overwhelming on real pictures — −10.1% to −17.4% against Rice at
+identical pixels on three photographic stills over q ∈ {25,50,75,85,90,95,99,100} and on four
+sequences — so the default flip was made. `regression_gradient_q50` and `_q75` failed immediately:
+**bpp 0.3379 against a 0.2397 ceiling, +41%.** The flip was reverted the same hour.
+
+**On a 512x512 synthetic gradient, abac is worse than Rice by:**
+
+| q | Rice | abac cb=64 | abac cb=32 (today's default) |
+|---|---|---|---|
+| 25 | 3 227 B | 6 474 B (**+100.6%**) | 10 794 B (**+234.5%**) |
+| 50 | 3 636 B | 6 850 B (+88.4%) | 11 170 B (+207.2%) |
+| 75 | 5 232 B | 7 301 B (+39.5%) | 11 621 B (+122.1%) |
+| 90 | 7 849 B | 8 565 B (+9.1%) | 12 929 B (**+64.7%**) |
+
+**The cause is measured, not guessed.** `GNC_DIAGNOSTICS=1` on that image at q=25:
+`abac_blocks=280 (empty=0)` per plane — **840 blocks, and not one of them is recognised as
+empty.** The three planes code 9 641 bytes between them, i.e. **~11.5 B per block**, against
+Rice's 3 227 B for the entire picture. **The file is nothing but per-block floor.** Every
+code-block pays a terminated arithmetic interval plus a 4-byte length word whether or not it has a
+single significant coefficient in it.
+
+**And `0051`'s cb=64 → 32 doubles that floor**, which is why the same table reads +9.1% at cb=64
+and +64.7% at cb=32 for q=90. That does not make `0051` wrong — it wins on every real picture and
+buys 2.3x encode — but the two changes interact and **ENT-14 must be fixed before cb is tuned
+again.** The all-zero unit test saw the same thing from the other side: a 256x256 tile of zeros
+costs 763 B over 100 blocks.
+
+**Why this is P0 rather than a curiosity.** Flat frames, fades to black, title cards, letterbox
+bars and — the big one — **static P-frames** are not corner cases in contribution video; GOALS
+says in as many words that *"a static studio shot should cost almost nothing"*. A coder whose
+floor is 11.5 bytes per code-block cannot deliver that, and the sequence rows that look good today
+(−11.8% to −17.4%) are all **busy** content. **Nobody has measured abac on a static shot**, and the
+gradient says what that measurement will find.
+
+**The fix is standard and is not novel work.** JPEG 2000 signals zero bit-planes per code-block
+rather than coding them; the same move here is a per-block "this block is empty" bit in the tile
+header, with the block's stream omitted entirely. 840 bits is 105 bytes where 840 empty blocks
+currently cost ~9 600. Cheaper variants worth pricing in the same item: dropping the length word
+for an empty block, and a run-length over consecutive empty blocks (deep subbands are empty in
+runs, not at random).
+
+**What it touches, and why that needs care.** The CPU coder in `abac.rs` is the reference that both
+`abac_encode.wgsl` and `abac_decode.wgsl` are verified byte-exact against, so all three move
+together or none do. It **is** a bitstream change (a new generation — check `tests/bitstream_generation.rs`
+and coordinate with whoever holds the current one; BUG-51 is already about a contested generation
+number). The existing gates are the right ones: 98/98 GPU-vs-CPU byte identity, and the pixel arms.
+
+**Success criteria, written before the work:**
+
+1. `regression_gradient_q25/50/75/90` pass with abac as the default — that is the test that
+   caught this and it is the one that closes it.
+2. On the gradient, abac within **±5%** of Rice at every q (today: +64.7% to +234.5%).
+3. **No loss on the content that already wins**: the three stills and four sequences stay within
+   0.5 points of −10.1% to −17.4%.
+4. A static-shot sequence measured for the first time, both coders, and the number recorded either
+   way.
+5. `empty=` in the diagnostic line stops reading 0 on sparse content — the canary that the new path
+   runs at all.
+
+Then ENT-10's default flip lands, with `0052` amended rather than rewritten.
+
+### ENT-13 — abac's remaining cost is structural, not algorithmic: it codes every frame twice (todo, **P1**)
+
+**Filed 2026-09-14 at the owner's request** — *"känns som att det finns mycket att fixa här.. se
+över perf i abac"* — after `0051` took 2.3x off encode and 2x off decode by fixing occupancy alone.
+That was the easy half. **What is left is not the arithmetic coder being slow; it is the shape of
+the pipeline around it**, and every item below is measurable independently.
+
+**Where abac stands after `0051`** (1080p, idle M1 Pro, `gnc benchmark`, cb=32): encode
+**73–213 ms** against Rice's 16–91, decode **24–43 ms** against 13–26. Nearly content-independent
+on the abac side, which is itself the clue — a fixed cost per pixel, not per bit.
+
+**1. It codes the whole frame twice, and the second pass exists only to learn the first one's
+answer.** `Sizing::CountThenEmit` runs the full coder once writing nothing but byte counts, reads
+the lengths back, computes slot offsets on the host, then runs the full coder *again* to emit. The
+reason is real: an arithmetic coder's output length is not knowable before coding, and thousands of
+blocks share one output buffer, so block 500 cannot know where to start writing. **`BoundedSlots`
+already solves it** — bound the slot, code once, compact on the host — and is worth a measured
+**1.1x to 1.6x at byte-identical output** (12 of 12 cells, `0051`). It is not the default because
+its ceiling lives in `abac_encode.wgsl` and the encoder **panics** if it is ever wrong (BUG-22's
+failure mode).
+
+> **The third option nobody has built, and it is the actual fix.** Use the bound, but have a block
+> that would overflow **flag itself and stop** instead of overrunning — then re-code only the
+> flagged blocks in a second pass. One coder pass in the common case, no panic ever, and the
+> fallback is proportional to how wrong the bound was rather than to the frame. The machinery is
+> already there: `flags_buf` exists and `check_flags` reads it; today it asserts where it could
+> dispatch. **This is the item's first task**, because it makes `BoundedSlots` safe enough to be
+> the default and retires the second pass at the same time.
+
+**2. Every pass is a separate submit and a `poll(Maintain::Wait)`.** `run()` builds its own command
+encoder, submits, and blocks the CPU until the GPU drains — three to four times per plane, nine to
+twelve times per frame. That wait is also **device-wide** (PERF-5), so it is a full round trip each
+time. Batching the passes of all three planes into one encoder, and waiting once, is a separate
+change from item 1 and composes with it.
+
+**3. `read_buffer_u32` allocates a fresh staging buffer per call and `words_to_bytes` copies the
+result again.** The encoder's own source says so and says what to do: *"if the readback turns out
+to dominate, cached staging and a borrow instead of a copy are the two obvious moves, and neither
+touches the shader or the bytes."* **Nobody has measured whether it dominates.** Do that first —
+it is a timer, not a refactor — because items 1 and 2 both reduce the number of readbacks and the
+answer changes what they are worth.
+
+**4. ENT-8 step 2 — stripes within a code-block.** The remaining parallelism lever. `0051` shows
+occupancy is spent *at the block level*: cb=16 buys only ~8% more encode speed for +17% rate,
+because smaller blocks restart their adaptive statistics from scratch. **Stripes are the way to
+get threads without getting more contexts** — 16 or 32 threads per block, one adaptive model. This
+is the only item here that raises thread count without paying rate for it, and it is already
+half-built.
+
+**What "done" looks like.** Single-stream 1080p abac encode inside **2x Rice at every operating
+point** (worst today is 4.16x on stockholm), decode inside **1.5x** (worst today 2.04x), at
+**byte-identical output** — items 1, 2 and 3 must not move a single bit, and `codec-fingerprint`
+is the check. ENT-8 may move bytes and needs its own rate table if it does.
+
+**Why P1 and not P0.** Phase 1 is bitrate (Current Focus) and abac's *rate* case is settled — it
+is the default at q>20 as of 2026-09-14. This item defends that decision rather than making it:
+the cheaper abac gets, the less of GOALS §5's "log the cost with the win" there is to log. It is
+also the item that stops abac's cost from being the reason a future rate lever gets declined.
+
 ### ENT-12 — abac buckets the neighbourhood *sum*; EBCOT keys on the *pattern*. Is that the other half of the J2K gap? (todo, **P1**)
 
 **Proposed 2026-09-08 by an external reviewer**, whose framing was half wrong about the current
@@ -8934,7 +9057,32 @@ one. The case against abac now has to rest entirely on cost, which is where it i
 Re-price it as a per-operating-point decision rather than a single yes/no, and say which rungs it
 should default on. Nothing below this line has been re-derived.
 
-### ENT-10 — should abac be the default? **Step 1 DONE 2026-09-14 — the cost side moved 2.3x** (step 2 todo, **P0**)
+### ENT-10 — should abac be the default? **Rate case MEASURED and it says yes; BLOCKED on ENT-14** (todo, **P0**)
+
+> **2026-09-14, step 2 (`docs/decisions/0052`): the answer is yes on every real picture and no on
+> sparse content, and the second half is a defect rather than a verdict.**
+>
+> **The rate side, at identical pixels (0.00 dB PSNR delta everywhere):** stills −10.1% to −15.0%
+> over q ∈ {25,50,75,85,90,95,99,100}, no decay at either end, **q=100 included** (both coders
+> bit-exact, abac 11.8–14.9% smaller). Sequences, `-n 9 -k 9`, four clips: crowd_run −12.3/−12.8,
+> rush_hour **−16.8**/−14.1/−13.4, stockholm −13.1/−11.9/−11.8, bbb **−17.4**/−15.9/−14.1 at
+> q=90/95/99. **`0045`'s inter decay to −3.7% is gone** — superseded by ENT-9 and `0051` changing
+> the coder under it. **The rANS cutoff did not need moving**: abac loses below it and wins above
+> it on all three images at the same q (q=15 +5.8/+0.3/−0.1, q=25 −6.0/−7.2/−7.9).
+>
+> **Then `regression_gradient_q50` failed at +41% bpp.** On a 512x512 gradient abac is **+64.7% at
+> q=90 and +234.5% at q=25** against Rice, because `abac_blocks=280 (empty=0)` — 840 blocks, none
+> recognised as empty, ~11.5 B of floor each, which is the entire file. **That is ENT-14 (P0)** and
+> the flip was reverted the same hour.
+>
+> **Rejected, with reasons:** widening the gradient baselines (disables the instrument that caught
+> it); a q threshold (the gradient is still +64.7% *inside* GNC's own range — the predictor is
+> content sparsity, not quality); coding both per tile and keeping the smaller (doubles encode to
+> paper over a one-bit defect; kept as a fallback).
+>
+> **What remains for this item after ENT-14:** re-run the gradient arm, add the static-shot
+> sequence nobody has measured, flip the line in `quality_preset`, amend `0052`. The rate table
+> above does not need re-taking.
 
 > **Step 1: abac was not expensive, it was empty.** `docs/decisions/0051`. The owner refused to
 > accept the 5x as a property of the codec — *"kan vi få abac inte så tung först? ... något känns

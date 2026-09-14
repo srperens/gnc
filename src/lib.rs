@@ -1378,6 +1378,17 @@ pub fn quality_preset(q: u32) -> CodecConfig {
         //
         // Only 4:4:4: the rANS GPU path assumes all three planes share the luma tile layout.
         // `normalize_for_chroma` falls back to Rice for subsampled formats.
+        // **ENT-10, 2026-09-14: abac was measured against this and is NOT yet the default here —
+        // one content class blocks it.** `docs/decisions/0052`. On photographic stills and on
+        // sequences it codes **10.1% to 17.4% fewer bits than Rice at identical pixels**, all the
+        // way to q=100 where both stay bit-exact, for 1.5x-4.2x encode after `0051`. On **sparse**
+        // content it loses catastrophically: a 512x512 gradient reads **+64.7% at q=90 and +234.5%
+        // at q=25**, because abac pays a terminated arithmetic interval plus a length word for
+        // **every** code-block whether or not the block has anything in it — 840 blocks x ~11.5 B
+        // is the whole file there. That is **ENT-14**, it is a known defect with a known fix
+        // (signal an empty block in a bit rather than coding it), and this line moves when it is
+        // fixed, not before. Flat frames, fades and static P-frames are not a corner case in
+        // contribution video.
         entropy_coder: if q <= 20 {
             EntropyCoder::Rans
         } else {

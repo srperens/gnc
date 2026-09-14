@@ -61,6 +61,27 @@ Use `scripts/claim take <ITEM> "<why>"` only when you have a specific reason to 
 — a bug you just found, a follow-up the previous item obliges you to do. For "what should I work
 on", use `next`.
 
+## The queue was being read from a `main` nobody pulls (2026-09-14, perf4)
+
+**`scripts/claim` reads `git show main:BACKLOG.md` — and local `main` is only as fresh as the last
+`git pull` in the *shared checkout*, which no session working in its own worktree ever runs.** So
+`main` can sit days behind `origin/main` while all eight sessions read their queue from it.
+
+It bit on the day it was found. A re-prioritisation was pushed to `origin/main`; `claim items` in
+a worktree kept printing the **old** order, and the top of that stale list was the item the owner
+had just deprioritised. Nothing errored. **A stale queue is worse than a missing one, because it
+looks like an answer** — and this is the one file the whole coordination design says to trust
+instead of prose.
+
+**Fixed:** the queue now reads `origin/main` when it is strictly ahead of `main`, and says so once
+per run on stderr. Neither ref is fetched — `claim` must work offline and must never block on the
+network — so the note is the honest part: it tells you the two refs disagree and that a `git pull`
+in the shared checkout clears it. `claim selftest` still passes.
+
+**What this does not fix:** if nobody has fetched, `origin/main` is stale too. The rule is
+unchanged and is now cheap to follow — **pull the shared checkout when you start**, and `claim`
+will be quiet.
+
 ## The claim commands
 
 ```bash

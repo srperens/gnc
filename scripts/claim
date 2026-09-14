@@ -321,9 +321,27 @@ require_own_worktree() {
 #
 # Read from committed `main`, not from anyone's working tree: the queue must not depend on whose
 # editor happens to be dirty.
+#
+# **`origin/main` wins when it is ahead**, and that is not a nicety. Local `main` is only as fresh
+# as the last `git pull` in the *shared checkout* -- which no session working in its own worktree
+# ever runs -- so `main` can sit days behind while every session reads its queue from it. On
+# 2026-09-14 that put a re-prioritisation on `origin/main` and left `items`/`next` handing out the
+# *old* order until somebody pulled: top of the stale list was the item the owner had just
+# deprioritised. A stale queue is worse than a missing one, because it looks like an answer.
+#
+# Neither ref is fetched here -- `claim` must work offline and must never block on the network --
+# so this picks the newer of the two, and `note_stale_main` says so once per run. (The note lives
+# at the dispatcher rather than here because `items` and `next` each read the queue more than
+# once, and a subshell cannot tell its parent that it has already printed.)
 backlog_source() {
   if [ -n "${CLAIM_BACKLOG:-}" ]; then cat "$CLAIM_BACKLOG"; return; fi
-  git show main:BACKLOG.md 2>/dev/null || cat "$TOP/BACKLOG.md"
+  ref=main
+  if git rev-parse --verify --quiet origin/main >/dev/null 2>&1 &&
+     git rev-parse --verify --quiet main >/dev/null 2>&1 &&
+     ! git merge-base --is-ancestor origin/main main >/dev/null 2>&1; then
+    ref=origin/main
+  fi
+  git show "$ref:BACKLOG.md" 2>/dev/null || cat "$TOP/BACKLOG.md"
 }
 
 candidates() { # -> "<prio> <ID> <heading text>", best priority first, file order within a priority
@@ -829,6 +847,18 @@ cmd_selftest() {
   [ "$rc" -eq 0 ] && echo "PASS: claims are atomic, the pick is atomic, and so is id allocation"
   return "$rc"
 }
+
+# Say once, before anything runs, that the queue below is not the one local `main` would give.
+# Silent when the refs agree, which is the normal case.
+note_stale_main() {
+  [ -n "${CLAIM_BACKLOG:-}" ] && return 0
+  git rev-parse --verify --quiet origin/main >/dev/null 2>&1 || return 0
+  git rev-parse --verify --quiet main >/dev/null 2>&1 || return 0
+  git merge-base --is-ancestor origin/main main >/dev/null 2>&1 && return 0
+  echo "note: queue read from origin/main -- local main is behind it." >&2
+  echo "      a 'git pull' in the shared checkout clears this note." >&2
+}
+note_stale_main
 
 case "${1:-}" in
   take|claim)  shift; cmd_take "$@" ;;

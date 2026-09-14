@@ -19401,3 +19401,25 @@ step:** confirm the decoder's B4 prediction equals the encoder's forward-only on
 bidirectional or wrong-reference MC for a frame the encoder coded forward-only, that is the bug, and
 it is in the decoder's frame-type dispatch, not in rate control. Filed on BUG-5 (reopened, P2); the
 `GNC_B4_QSTEP_MUL` knob stays as the canary that a fix must make responsive.
+
+**Correction, same session: that decoder hypothesis is wrong.** The decoder's frame-type dispatch is
+already correct -- `decoder/gpu_work.rs:69-78` detects a `Bidirectional` frame with
+`backward_vectors=None` (`is_fwd_only_bframe`) and folds it into `is_pframe`, running the P-frame MC
+path exactly as `sequence.rs:943` claims. So the decoder does **not** run a bidirectional or
+wrong-reference MC for B4, and "decoder_pred ≠ encoder_pred via frame-type dispatch" is retracted.
+
+The independent check that would have settled it -- a real container round-trip of B4 -- is blocked:
+`encode-sequence` prints `mode=I+P` and codes no B-frames even with `GNC_B_PYRAMID=1` (the pyramid
+lives only in `benchmark-sequence`'s throughput path), and on the extracted frames it also panicked
+(exit 101, a separate lead). So B4 cannot yet be decoded through the container and measured on its
+own.
+
+**What still stands, and what is now open.** The hard fact is unchanged and still unexplained: B4's
+PSNR is pinned against its own qstep (10× finer = +85% bytes, +0.01 dB), which is not rate and not
+averaging. With the decoder dispatch ruled out, the live candidates are narrower and both sit on the
+*measurement/encoder* side, not the decoder: benchmark-sequence may report B4 from a reference or
+prediction buffer rather than a full re-decode, or the encoder's local reconstruction of B4 (the one
+it stores as the pyramid-slot reference) may drop the residual. Distinguishing them is a code trace
+of the per-frame-PSNR path in `sequence.rs` plus fixing `encode-sequence` to emit the pyramid so a
+container decode can be compared. BUG-5 stays reopened (P2) with this corrected, narrower state; the
+`GNC_B4_QSTEP_MUL` canary stands. **No overclaim survives: the pulse is real, its cause is not.**

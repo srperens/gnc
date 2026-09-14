@@ -383,14 +383,20 @@ own metric (max PSNR drop 26.23 dB). `sequence.rs:937` (#49) codes B4 as a **for
 tagged `Bidirectional`, so no bidirectional averaging is even involved. Decisive test: an env-gated
 `GNC_B4_QSTEP_MUL` (default unset = unchanged) that scales only B4's qstep — **10× finer nearly
 doubles B4's bytes (387K→715K) and moves its PSNR 0.01 dB.** Quality pinned against qstep means the
-residual is coded but not reconstructing: the signature of the decoder rebuilding B4 from a
-*different* prediction than the encoder subtracted (`decoder_pred − encoder_pred` is a fixed error
-no residual can cancel). **Next step (does not need Windows):** verify the decoder runs the
-forward-only P-frame MC for a frame tagged `Bidirectional` with `backward_vectors=None`, as
-`sequence.rs:943` asserts — if it runs a bidirectional or wrong-reference MC, that is the bug, in
-the decoder's frame-type dispatch, not in rate control. The `GNC_B4_QSTEP_MUL` knob is the canary a
-fix must make responsive. **Do not re-enable the pyramid default** on the back of this — the rate
-and latency reasons above are unchanged; this is about correctness of the opt-in path.
+residual is coded but not reconstructing: the signature of a reconstruction rebuilt from a
+*different* prediction than the encoder subtracted (a fixed error no residual can cancel). **The
+decoder is not that difference** — `decoder/gpu_work.rs:69-78` already detects the forward-only
+B-frame (`Bidirectional` + `backward_vectors=None`) and runs the P-frame MC path, as
+`sequence.rs:943` claims; that hypothesis is retracted. The independent container round-trip that
+would isolate B4 is blocked: `encode-sequence` codes `mode=I+P` even with `GNC_B_PYRAMID=1` (the
+pyramid is only in `benchmark-sequence`) and panicked (exit 101) on extracted frames. **So the live
+candidates are on the encoder/measurement side:** benchmark-sequence may report B4 from a
+reference/prediction buffer rather than a full re-decode, or the encoder's local reconstruction it
+stores as the pyramid-slot reference may drop the residual. **Next step (no Windows):** trace the
+per-frame-PSNR path in `sequence.rs`, and fix `encode-sequence` to emit the pyramid so a container
+decode of B4 can be compared. The `GNC_B4_QSTEP_MUL` knob is the canary a fix must make responsive.
+**Do not re-enable the pyramid default** on the back of this — the rate and latency reasons above
+are unchanged; this is about correctness of the opt-in path.
 
 ### BUG-10 — P-frame quality saturates (**CORRECTED AND CLOSED 2026-09-06** — it is TUNE-5)
 **The original diagnosis in this entry was wrong.** It is not a structural ceiling and none of the

@@ -8176,55 +8176,71 @@ and "the remaining gap is somewhere else". Decision 0055 makes that the leading 
 entropy coding is the one lever that pays on intra, inter, lossless and every chroma format at
 once.
 
-### BUG-59 — `cargo test --release` hard-locked the machine twice from an out-of-bounds grid bug (todo, **P1** — filed 2026-09-15)
+### BUG-59 — `cargo test --release` hard-locked the machine twice; the mechanism is NOT established (todo, **P1** — filed 2026-09-15, rewritten the same day)
 
-**The owner power-cycled this Mac twice in eight minutes** (reboots 00:18 and 00:26) because the
-UI stopped responding entirely. Both were `cargo test --release` on branch `tile2`, which carries
-TILE-1's half-finished grid change. Nothing in this repository warns that a test run can do that.
+**The observation is solid and the explanation is not.** This entry was first filed asserting a
+GPU wedge as the cause. That was overstated on the evidence, and it is rewritten here before
+anyone inherits the guess as a fact — the failure mode this repository has the most scars from.
 
-**The mechanism, and it is not "the tests are heavy".** On `tile2` the entropy path still sizes a
-plane as `padded_w * tiles_y * tile_size` (1920x1280) while the buffer is `padded_w * padded_h`
-(1920x1088), so Rice reads past the end of the plane. **WGSL does not trap an out-of-bounds
-access** — the standing reminder BUG-26 was filed for — and a shader that indexes outside its
-buffer or gets a mis-sized dispatch can wedge the GPU. wgpu says so explicitly before the machine
-goes:
+**What is established.** The owner power-cycled this Mac twice in eight minutes (reboots 00:18 and
+00:26, `last reboot`) because the desktop stopped responding entirely. Both times the machine was
+running `cargo test --release` on branch `tile2`, which carries TILE-1's half-finished grid change.
+`Terminal` `cpu_resource.diag` reports at 00:04 and 00:23 record 100% CPU and *unresponsive for 42
+seconds before sampling*. No kernel panic was written, which is what a power cycle looks like.
+
+**What the branch is known to do wrong**, independently: the entropy path sizes a plane as
+`padded_w * tiles_y * tile_size` (1920x1280) while the buffer is `padded_w * padded_h` (1920x1088),
+so Rice reads past the end of the plane. abac's canary asserts on exactly this mismatch.
+
+**The wgpu output, in the order it actually appeared** — the ordering matters and the first filing
+ignored it:
 
 ```
-wgpu-core/src/device/queue.rs:192
-We timed out while waiting on the last successful submission to complete!
+1. panicked at rice_gpu.rs:909     Rice stream overflow in tile 31
+2. panicked at wgpu queue.rs:192   "We timed out while waiting on the last successful
+                                    submission to complete!"   ...inside <Queue as Drop>::drop
+3. panic in a destructor during cleanup -> aborting
 ```
 
-On Apple Silicon the GPU is shared with WindowServer, so a wedged queue takes the desktop with it
-and the power button is the only way out. The `Terminal` `cpu_resource.diag` reports at 00:04 and
-00:23 (100% CPU, *unresponsive for 42 seconds before sampling*) are the visible half; the GPU is
-the half that needed the power cycle.
+Step 2 is in a **destructor, during unwinding from step 1**. That is not the same thing as a
+shader hanging the device: it is equally consistent with the queue being torn down with work in
+flight and the wait timing out for that reason.
 
-**Why this is worth a P1 rather than a note.** Eight sessions share one GPU (COORDINATION rule 1).
-A single session running the standard, documented command from CLAUDE.md's "Build & Run" can take
-down every other session's machine state and the owner's desktop, and it does so on exactly the
-branches where someone is mid-fix on a geometry bug — the most likely state for a working tree to
-be in. The blast radius is the machine, not the run.
+**Two candidate mechanisms. Neither is established, and they want different fixes.**
 
-**What is actually missing, in order of value:**
+| | candidate A — a shader wedges the GPU | candidate B — cleanup after panic, on a loaded machine |
+|---|---|---|
+| story | a bad index or a long dispatch stalls the queue; on Apple Silicon the GPU is shared with WindowServer, so the desktop goes with it | the test harness panics per-test, aborts mid-submission, leaks GPU state; eight sessions share the machine and it thrashes |
+| supports | the timeout message; the branch really does read out of bounds; WGSL does not trap that (BUG-26) and wgpu asks for `buffer: Unchecked` on an adapter reporting `robustBufferAccess2`, so nothing catches it | the timeout is in `Drop`; `cargo test` runs tests in parallel, each building a device; a `JetsamEvent` on 2026-09-09 shows this machine does hit memory pressure |
+| argues against | **an out-of-bounds *read* on Metal usually returns garbage or faults rather than hanging.** Hangs are characteristic of non-terminating loops — and the obvious loop is bounded: `tw = min(tile_size, plane_width - tile_origin_x)` clamps even a u32 underflow to 256, so `symbols_per_stream` cannot exceed 256. Rice's stream writes were already guarded against `max_stream_bytes`, which is why it panicked rather than writing wild | does not obviously explain a *desktop* freeze needing the power button |
 
-1. **A bounds clamp in the shaders that index a plane from host-supplied geometry.** Cheap
-   insurance: `min(idx, len - 1u)` costs nothing measurable and converts a machine lock into a
-   wrong picture, which the tests already catch. Today the only thing between a bad host-side
-   extent and a wedged GPU is that the host arithmetic is right.
-2. **A documented rule that `cargo test --release` is not safe on a branch with a known geometry
-   defect** — run the affected test files individually, and fix the addressing with CPU-side unit
-   tests first. CLAUDE.md lists the full command with no such caveat.
-3. **A way to bound a dispatch.** There is no timeout, no watchdog and no canary; the first sign
-   of trouble is the desktop freezing.
+**Why it stays P1 anyway.** The priority rests on the observation, not on either story: the
+documented command from CLAUDE.md's "Build & Run" took the owner's machine down twice, on the kind
+of branch a working tree is most likely to be in — someone mid-fix on a geometry bug. Eight
+sessions share one GPU (COORDINATION rule 1), so the blast radius is the machine, not the run.
 
-**Do not reproduce this to confirm it.** The reproduction costs the owner a power cycle, and the
-causal chain above is already sourced from the wgpu panic, the reboot times and the diagnostic
-reports. If it must be re-run, it belongs on the Linux/NVIDIA box where a wedged GPU loses a
-display server rather than the machine, not on either Mac.
+**What has been done, and it is insurance rather than a fix.** `9bb3f4f` clamps all 21
+host-geometry index sites in the four coder-path shaders (`abac_{encode,decode}`,
+`rice_{encode,decode}`) to `min(i, max(arrayLength(&buf), 1u) - 1u)`. It fires only when the host
+arithmetic is already wrong, costs nothing on correct geometry, and removes a real class of
+undefined behaviour on hardware where wgpu disables its own bounds checks. **It addresses
+candidate A only, and candidate A is the one the reasoning above argues against.** Validated
+through naga with `spirv_probe` (no GPU); barriers in conditionally-reached blocks unchanged at
+2/2/3/4, so it adds no BUG-25-class hazard. **Not verified behaviourally.** 27 other shaders index
+a plane from host geometry and are untouched.
 
-**Filed by the session that caused it.** It re-ran the suite after the first lock because it read
-the killed background job as "the session ended" rather than "the machine went down" — the two are
-indistinguishable from inside the harness, which is its own small lesson.
+**How to settle it, and where.** Run the 1080p case on the **Linux/NVIDIA box**, where a wedged
+GPU loses a display server rather than the machine, and watch whether the submission completes:
+that separates A from B directly. **Do not reproduce it on either Mac** — the reproduction costs
+the owner a power cycle, and a confirmed cause is not worth that when the cheap test exists
+elsewhere. If it must be narrowed here first, it should be one test file at a time in the
+foreground, never the suite.
+
+**Filed by the session that caused it**, which re-ran the suite after the first lock because it
+read the killed background job as "the session ended" rather than "the machine went down" — the
+two are indistinguishable from inside the harness. `uptime` and `last reboot` would have told it
+apart in one second, and are now the first thing to check when a long background job vanishes.
+
 
 ### BUG-26 — `--tile-size 1024` silently destroys the image (**FIXED 2026-09-07**)
 

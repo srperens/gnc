@@ -42,14 +42,11 @@ claims the positioning rests on are the ones with the least evidence.**
   low-latency-HEVC band, above JPEG XS.
 - **Throughput** is roughly 4x short of the 60 fps target, and about half of the per-frame cost is
   not GPU coding work.
-- **Portability is three-quarters met.** Metal and Vulkan both run the whole codec with
-  byte-identical output across independent implementations, and **the browser now decodes** —
-  verified 2026-09-10 in Chrome *and* Safari on macOS, which are two independent WebGPU
-  implementations rather than two builds of one. Both containers, the whole quality range
-  including lossless, all three chroma formats, and a full-length film. **DX12 has never produced
-  a single frame** (BUG-52), and **browser *encode* cannot work yet**: the default encode path's
-  `quantize_histogram_fused.wgsl` asks for 23 800 B of workgroup storage against the 16 384 B a
-  conformant WebGPU device guarantees (BUG-35). Decode is the half that is done.
+- **Portability.** Metal and Vulkan run the whole codec with byte-identical output across
+  independent implementations, and **DX12 now runs too** — intra, byte-identical to Vulkan, via the
+  DXC shader compiler. **The browser decodes**, on Chrome and Safari — two independent WebGPU
+  implementations — across both containers, the full quality range including lossless, and all
+  chroma formats. Browser *encode* is the one piece still missing. Decode runs everywhere.
 - **Scale is unmeasured.** "A bigger GPU buys more GNC instances than it buys hardware encoder
   blocks" is the central structural claim and it has no number yet. Concurrency currently saturates
   on host memory and per-process startup, not on the GPU.

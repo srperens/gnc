@@ -2848,51 +2848,68 @@ input and q as the `--density-still` rows, with GPU power sampled alongside. **I
 out near 49 W the bottleneck is elsewhere again** and the next suspect is the submission path, not
 the codec.
 
-### MEAS-15 — the second Mac is a 25% bigger GPU, and Claim B is now one command on it (todo, P1)
+### MEAS-15 — run the density sweep on a professional GPU: `0085`'s ceiling is a laptop's, and scale is a datacenter claim (todo, P1)
 
-**Filed 2026-09-14, the moment the owner confirmed there are two Macs.** MEAS-5's Claim B — *a
-bigger GPU buys more GNC throughput where it buys no more fixed-function encoder blocks* — has
-been parked on "needs a discrete NVIDIA card" since it was written. `0085` changed what it costs
-twice over: it restated the unit as **Mpixel/s** rather than instances, and `gnc density` measures
-that in one command. And the hardware is already here.
+**Filed 2026-09-14, re-pointed the same hour by the owner, and the re-pointing is the content.**
+The first draft of this item aimed at the second Mac (M5 Pro, 20 GPU cores) because it was free.
+The owner's correction: *"vårt target är ju inte egentligen en M1 eller M5 GPU... kanske den
+massiva skalningen är på professionella GPU i serverhall. Det är liksom nåt annat."* — and
+*"vi ska kunna köra på telefoner, raspi, desktop, chrometop whatever... allt med en GPU."*
 
-| machine | GPU | measured ceiling |
-|---|---|---|
-| Apple M1 Pro, 16 GB | 16 cores | **70.8 Mpixel/s** at 1080p (`0085`) |
-| Apple M5 Pro, 64 GB | 20 cores | **unmeasured** |
+**That splits this into the two claims GOALS §1 now separates.** *Reach* — runs anywhere there is
+a GPU — is about phones, Pis and Chromebooks, and `0085`'s Apple M1 Pro row is **good** evidence
+for it. *Scale* — many concurrent streams on one card where fixed-function blocks cap out — is
+MEAS-5 Claim B, it is about an L40S / A10G / RTX 6000 Ada in a server hall, and **no measurement
+in this repository has ever been taken on such a part.** A 30 W integrated GPU sharing LPDDR5 with
+the CPU cannot answer a question about a 300 W card with 300-900 GB/s of dedicated bandwidth.
 
-**The experiment, in full:**
+**The nearest thing already on record points the right way, and is not the measurement.**
+BASELINE's CANARY-1 row has an **RTX 4000 Ada** — a 130 W workstation card, still two tiers below
+the target — encoding 1080p at **71.7 fps single-stream** against the M1 Pro's ~21.7. ~3x on one
+stream from a modest discrete card is what a shader-bound ceiling that scales with the GPU looks
+like. But it is CANARY-1's quantity (the encode loop) not `gnc density`'s (a steady-state window
+of full `encode()` calls), cross-backend, and **single-stream — it says nothing about density.**
+
+**The experiment, wherever a discrete GPU can be reached:**
 
 ```bash
 gnc gpu-info                                   # paste what it prints into the row
-gnc fingerprint                                # both machines must read the same digest
+gnc fingerprint                                # every machine must read the same digest
 python scripts/gpu_tier_bench.py --density-inproc -i test_material/frames/bbb_1080p.png \
        --quality 90 --iterations 16
+python scripts/gpu_tier_bench.py --density-still -i test_material/frames/bbb_1080p.png \
+       --quality 90 --iterations 24      # the process-per-stream row an operator would see
 ```
 
-Same binary digest, same frame, same q. Read the **Mpixel/s** column, not the fps column.
+Read the **Mpixel/s** column. Report `gnc gpu-info`'s device string, the card's TDP and memory
+bandwidth beside it, and both the single-stream and ceiling figures — the ratio between them is
+how much of that card one stream leaves on the table, and on the M1 Pro it is a third (PERF-5).
 
-**What each outcome means, decided before the run** — this is the part that makes it worth an
-item rather than a drive-by:
+**Hardware, best first:**
 
-- **~88 Mpixel/s (+25%, tracking core count).** Claim B holds in its strongest form on this
-  evidence: throughput is core-bound, and a bigger GPU is a bigger encoder. Say so in POSITIONING,
-  with the two rows.
-- **Meaningfully more than +25%.** The M5 generation brings more than cores; good news, and the
-  *architecture*, not just the core count, is part of the claim. Do not attribute it to cores.
-- **~70 Mpixel/s (flat).** Claim B is in trouble and the ceiling is something that does not scale
-  with the GPU — memory bandwidth, the submission path, or PERF-5's device-wide waits. **This is
-  the outcome that matters most and the one the project would least like**, which is exactly why
-  the criterion is written down first.
+1. **A datacenter GPU** — L40S, A10G, A100, RTX 6000 Ada. This is the one the claim is about.
+   Rentable by the hour; an afternoon of one instance settles a claim that has been unproven since
+   it was written. Needs an owner's call on spend.
+2. **The RTX 4000 Ada box** (Ubuntu 24.04.3, driver 580.173.02, Vulkan) that produced BASELINE's
+   CANARY-1 row. Already has a working GNC and it is a real discrete card with its own VRAM.
+   **Cheapest genuine test of Claim B available** — do this one even if (1) happens.
+3. **The M5 Pro Mac**, 20 cores against 16. Two points, one vendor, generation confounded with
+   core count, and *both integrated*. It is a reach datapoint, not a scale one. Lowest value; do
+   it only because it is free.
 
-**Weaker than a discrete card and much cheaper.** Two points, one vendor, generation and core
-count confounded — it cannot separate "more cores" from "newer architecture", and it says nothing
-about a 300 W card. It can still falsify Claim B, and falsifying it on an afternoon is worth more
-than confirming it in a quarter. The NVENC column and the discrete-GPU row stay owed on MEAS-5.
+**What each outcome means, decided before the run:**
+
+- **Mpixel/s rises roughly with the card's shader throughput.** Claim B holds, GOALS §1's table
+  row is earned, and POSITIONING can say it with two machines behind it.
+- **It rises, but far less than the hardware.** The ceiling is partly something that does not
+  scale — bandwidth, the submission path, PERF-5's device-wide waits. Still good news; the item
+  becomes "find the non-scaling part".
+- **It barely moves.** Claim B is in trouble on the most important axis the project has.
+  **This is the outcome the project would least like, which is exactly why the criterion is
+  written down first.**
 
 **Do PERF-5 first if both are free.** A third of the M1 Pro is idle on a single stream; measuring
-a second GPU through a pipeline with a known stall reports the stall as much as the hardware.
-
+a new GPU through a pipeline with a known stall reports the stall as much as the hardware.
 
 ### PERF-5 — a third of the GPU is idle while one stream runs, and the readback waits device-wide (todo, P1)
 

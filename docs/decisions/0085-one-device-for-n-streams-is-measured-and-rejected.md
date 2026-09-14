@@ -108,6 +108,34 @@ and prints a Mpixel/s column beside the fps.
 
 ## What this does not settle
 
+**The hardware. This is an integrated laptop GPU, and GNC's target is a server card.** Everything
+above was measured on an Apple M1 Pro: 16 cores, no dedicated VRAM, LPDDR5 shared with 18 CPU
+cores, a ~30 W part. A contribution encoder is deployed on an L40S, an A10G, an RTX 6000 Ada — a
+300 W part with 300-900 GB/s of dedicated bandwidth and 5-10x the shader cores. **A throughput
+ceiling measured on the first tells you almost nothing about the second**, and "70-90 Mpixel/s" is
+a floor with a machine name attached, not a property of the codec.
+
+**And the evidence already in this file points the other way.** BASELINE's CANARY-1 row has an
+**RTX 4000 Ada** — itself only a 130 W workstation card, not a datacenter one — encoding 1080p at
+**71.7 fps single-stream** against this machine's ~21.7. That is ~3x on one stream from a card two
+tiers below the target, which is what one would expect if the ceiling is shader-bound and scales
+with the GPU. It is *not* the same measurement (CANARY-1 times the encode loop; `gnc density`
+times a steady-state window of full `encode()` calls) and it is cross-backend, so it is a hint and
+not a result.
+
+**Nobody has run `gnc density` on a discrete GPU.** That is now the measurement, it is one command,
+and **MEAS-15** is where it lives — re-pointed by the owner the same day from "the other Mac" to
+"a professional GPU in a server hall", because the two Macs are both integrated parts and the
+claim is not about either of them.
+
+**GOALS §1 now separates the two claims this record sits between.** *Reach* — GNC runs anywhere
+there is a GPU, phone to Raspberry Pi to Chromebook — and *scale* — one card carries many streams
+where fixed-function silicon caps out. **Read every number here as evidence for reach**, where it
+is encouraging: a ~30 W laptop chip carries a 1080p stream with a third of the GPU still idle.
+Read as evidence about a server card it is worth nothing, and it must not reach POSITIONING in
+that role.
+
+
 **Whether a bigger GPU buys proportionally more pixels per second.** That is MEAS-5 Claim B, it is
 the thing GOALS calls the single most important measurement, and this record moves it rather than
 answering it: the unit is now **Mpixel/s**, not instances, and the question is whether that number

@@ -50,6 +50,27 @@ constant no matter how large and expensive the GPU is, while shader throughput s
 card. A bigger GPU should therefore buy more GNC instances; it does not buy more NVENC blocks.
 **That claim is currently unproven and is the single most important thing to measure** (MEAS-5).
 
+### Reach and scale are two claims, on two classes of hardware (owner, 2026-09-14)
+
+The row above compresses two different promises into one line, and conflating them is how a
+laptop measurement ends up being read as a datacenter one. They are separate, they have separate
+evidence, and **a result must say which claim it is evidence for:**
+
+| | the claim | the hardware it is about | what it needs to be true |
+|---|---|---|---|
+| **reach** | GNC *runs* anywhere there is a GPU — phone, Raspberry Pi, Chromebook, laptop, browser | small, integrated, power-constrained parts | the WebGPU feature set, honestly requested limits (rule 4), and a decoder that works in a browser — verified 2026-09-10, §1 |
+| **scale** | GNC carries *many* concurrent streams on one card, where fixed-function silicon caps out | professional GPUs in a server hall — L40S, A10G, RTX 6000 Ada class | shader throughput that rises with the card, which is **MEAS-5 Claim B and is unmeasured** |
+
+**Reach is the one that is nearly proven and scale is the one that matters commercially.** The
+massive-density argument is about a datacenter part; it is not a claim about a MacBook, and the
+MacBook is not where it can be tested.
+
+**So `docs/decisions/0085`'s 70-90 Mpixel/s ceiling is a *reach* number, not a *scale* number.**
+It was measured on an Apple M1 Pro — an integrated laptop GPU sharing LPDDR5 with the CPU — and
+read as evidence for reach it is encouraging: a ~30 W laptop chip carries a 1080p stream with a
+third of the GPU still idle. Read as evidence about a server card it is worth nothing, and it must
+not be quoted that way. The same measurement on a discrete professional GPU is **MEAS-15**.
+
 Two things that follow, and they are about *measurement discipline*, not about narrowing scope:
 
 - **Every operating point is in scope, so a result must say which one it was measured at.** The

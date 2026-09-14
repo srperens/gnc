@@ -183,7 +183,11 @@ VMAF, dE00) are deterministic and unaffected; fps and latency are not.
 stated parameters are also inconsistent — "ki=8 ... I+P+B", but ki=8 is below the B-frame
 threshold of 9, and the encoder emits 2I+8P. Do not build a density claim on it.
 
-## Stream density is a pixel rate, and it is ~70-90 Mpixel/s (2026-09-14, PERF-4)
+## Stream density is a pixel rate, and on a laptop GPU it is ~70-90 Mpixel/s (2026-09-14, PERF-4)
+
+**This is a *reach* number, not a *scale* number** (GOALS §1). It says what an integrated 30 W
+laptop GPU carries. It says nothing about the professional server card GNC's density claim is
+actually about — that measurement has never been taken on any machine, and it is **MEAS-15**.
 
 `gnc density`, one device per stream, q=90, steady state only (no setup in the window), on the
 machine `gnc gpu-info` calls **Apple M1 Pro, 16 cores, 16 GB**. **There are two Macs** — the other

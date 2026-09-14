@@ -46,6 +46,29 @@ struct Params {
 // One u32 per tile; set to 1 if any stream in that tile overflows max_stream_bytes.
 @group(0) @binding(5) var<storage, read_write> overflow_flags: array<atomic<u32>>;
 
+// --- BUG-59: every index below is clamped to its buffer -----------------------------------------
+// Host-supplied geometry (tile extents, offsets, strides) decides these indices, and that geometry
+// is exactly what TILE-1 is in the middle of changing. WGSL does not trap an out-of-bounds access
+// (BUG-26), and wgpu asks for `buffer: Unchecked` on any adapter reporting robustBufferAccess2, so
+// on this hardware nothing catches one. A bad index wedges the GPU queue -- and on Apple Silicon
+// the GPU is shared with WindowServer, so that takes the whole desktop with it (two power cycles,
+// 2026-09-15). Clamping converts a machine lock into a wrong picture, which the round-trip tests
+// already fail on. It fires only when the host arithmetic is already wrong: on correct geometry
+// every index is in range and `min` is a no-op.
+
+fn in_at(i: u32) -> f32 {
+    return input[min(i, max(arrayLength(&input), 1u) - 1u)];
+}
+
+fn stream_store(i: u32, v: u32) {
+    stream_output[min(i, max(arrayLength(&stream_output), 1u) - 1u)] = v;
+}
+
+fn k_store(i: u32, v: u32) {
+    k_output[min(i, max(arrayLength(&k_output), 1u) - 1u)] = v;
+}
+
+
 // Tile-local raster index of symbol `s` in stream `stream_id`.
 //
 // Streams walk the tile in column-major order, cut into STREAMS_PER_TILE contiguous segments, so
@@ -129,7 +152,7 @@ fn emit_byte(byte_val: u32) {
     if (p_bytes_in_word == 4u) {
         let max_words = params.max_stream_bytes / 4u;
         if (p_word_pos < max_words) {
-            stream_output[p_stream_word_base + p_word_pos] = p_word_buffer;
+            stream_store(p_stream_word_base + p_word_pos, p_word_buffer);
         } else {
             // Overflow: stream exceeded max_stream_bytes. Signal the tile.
             atomicStore(&overflow_flags[p_tile_id], 1u);
@@ -176,7 +199,7 @@ fn flush_remaining() {
     }
     let max_words = params.max_stream_bytes / 4u;
     if (p_bytes_in_word > 0u && p_word_pos < max_words) {
-        stream_output[p_stream_word_base + p_word_pos] = p_word_buffer;
+        stream_store(p_stream_word_base + p_word_pos, p_word_buffer);
     }
 }
 
@@ -241,7 +264,7 @@ fn main(
             let tile_col = coeff_idx % params.tile_size;
             let plane_idx = (tile_origin_y + tile_row) * params.plane_width
                           + (tile_origin_x + tile_col);
-            let coeff = i32(round(input[plane_idx]));
+            let coeff = i32(round(in_at(plane_idx)));
 
             if (coeff != 0) {
                 let abs_val = u32(abs(coeff)) - 1u;
@@ -351,12 +374,12 @@ fn main(
     // Write k values to output.
     // Layout: [k_mag ×MAX_GROUPS][k_zrl_nz ×MAX_GROUPS][k_zrl_z ×MAX_GROUPS][skip_bitmap]
     if (thread_id < num_groups) {
-        k_output[tile_id * K_STRIDE + thread_id] = shared_k[thread_id];
-        k_output[tile_id * K_STRIDE + MAX_GROUPS + thread_id] = shared_k_zrl_nz[thread_id];
-        k_output[tile_id * K_STRIDE + MAX_GROUPS * 2u + thread_id] = shared_k_zrl_z[thread_id];
+        k_store(tile_id * K_STRIDE + thread_id, shared_k[thread_id]);
+        k_store(tile_id * K_STRIDE + MAX_GROUPS + thread_id, shared_k_zrl_nz[thread_id]);
+        k_store(tile_id * K_STRIDE + MAX_GROUPS * 2u + thread_id, shared_k_zrl_z[thread_id]);
     }
     if (thread_id == 0u) {
-        k_output[tile_id * K_STRIDE + K_STRIDE - 1u] = shared_skip_bitmap;
+        k_store(tile_id * K_STRIDE + K_STRIDE - 1u, shared_skip_bitmap);
     }
     workgroupBarrier();
 
@@ -406,7 +429,7 @@ fn main(
 
             let plane_idx_e = (tile_origin_y + tile_row_e) * params.plane_width
                             + (tile_origin_x + tile_col_e);
-            let coeff_e = i32(round(input[plane_idx_e]));
+            let coeff_e = i32(round(in_at(plane_idx_e)));
 
             if (coeff_e == 0) {
                 let g_zrl_e = skip_ge;
@@ -424,7 +447,7 @@ fn main(
                         continue;
                     }
                     let np_e = (tile_origin_y + nr_e) * params.plane_width + (tile_origin_x + nc_e);
-                    if (i32(round(input[np_e])) != 0) {
+                    if (i32(round(in_at(np_e))) != 0) {
                         break;
                     }
                     run_e += 1u;
@@ -550,7 +573,7 @@ fn main(
 
             let plane_idx_o = (tile_origin_y + tile_row_o) * params.plane_width
                             + (tile_origin_x + tile_col_o);
-            let coeff_o = i32(round(input[plane_idx_o]));
+            let coeff_o = i32(round(in_at(plane_idx_o)));
 
             if (coeff_o == 0) {
                 let g_zrl_o = skip_go;
@@ -568,7 +591,7 @@ fn main(
                         continue;
                     }
                     let np_o = (tile_origin_y + nr_o) * params.plane_width + (tile_origin_x + nc_o);
-                    if (i32(round(input[np_o])) != 0) {
+                    if (i32(round(in_at(np_o))) != 0) {
                         break;
                     }
                     run_o += 1u;

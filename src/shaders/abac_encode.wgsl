@@ -108,6 +108,21 @@ struct Params {
 // conditions, which is exactly why they are counted rather than assumed.
 @group(0) @binding(5) var<storage, read_write> flags: array<atomic<u32>>;
 
+// --- BUG-59: every index below is clamped to its buffer -----------------------------------------
+// Host-supplied geometry (tile extents, offsets, strides) decides these indices, and that geometry
+// is exactly what TILE-1 is in the middle of changing. WGSL does not trap an out-of-bounds access
+// (BUG-26), and wgpu asks for `buffer: Unchecked` on any adapter reporting robustBufferAccess2, so
+// on this hardware nothing catches one. A bad index wedges the GPU queue -- and on Apple Silicon
+// the GPU is shared with WindowServer, so that takes the whole desktop with it (two power cycles,
+// 2026-09-15). Clamping converts a machine lock into a wrong picture, which the round-trip tests
+// already fail on. It fires only when the host arithmetic is already wrong: on correct geometry
+// every index is in range and `min` is a no-op.
+
+fn in_at(i: u32) -> f32 {
+    return input[min(i, max(arrayLength(&input), 1u) - 1u)];
+}
+
+
 const WG: u32 = 32u;
 const MAX_BLOCK_W: u32 = 64u;
 
@@ -172,7 +187,7 @@ fn mag_of(v: i32) -> u32 {
 fn block_is_empty(info: EncBlock) -> bool {
     for (var y = 0u; y < info.height; y++) {
         for (var x = 0u; x < info.width; x++) {
-            if (i32(round(input[info.in_offset + y * info.stride + x])) != 0) {
+            if (i32(round(in_at(info.in_offset + y * info.stride + x))) != 0) {
                 return false;
             }
         }
@@ -393,7 +408,7 @@ fn main(
 
             // The quantiser emits integral f32, so this round is a no-op that matches the host's
             // `.round() as i32` exactly; every other GPU entropy encoder here reads it the same way.
-            let v = i32(round(input[info.in_offset + y * info.stride + x]));
+            let v = i32(round(in_at(info.in_offset + y * info.stride + x)));
             let a = mag_of(v);
             if (a >= 0x20000000u) {
                 atomicOr(&flags[1], 1u);
@@ -619,7 +634,7 @@ fn main_rc(
             }
             let ctx = bucket(nb);
 
-            let v = i32(round(input[info.in_offset + y * info.stride + x]));
+            let v = i32(round(in_at(info.in_offset + y * info.stride + x)));
             let a = mag_of(v);
             if (a >= 0x20000000u) {
                 atomicOr(&flags[1], 1u);
@@ -699,7 +714,7 @@ fn bound(@builtin(global_invocation_id) gid: vec3<u32>) {
     var n_byp = 0u;
     for (var y = 0u; y < info.height; y++) {
         for (var x = 0u; x < info.width; x++) {
-            let a = mag_of(i32(round(input[info.in_offset + y * info.stride + x])));
+            let a = mag_of(i32(round(in_at(info.in_offset + y * info.stride + x))));
             n_ctx = n_ctx + 1u;
             if (a > 0u) {
                 n_byp = n_byp + 1u;          // sign

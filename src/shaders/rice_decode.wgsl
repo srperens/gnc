@@ -39,6 +39,21 @@ struct Params {
 @group(0) @binding(3) var<storage, read> stream_offsets: array<u32>;
 @group(0) @binding(4) var<storage, read_write> output: array<f32>;
 
+// --- BUG-59: every index below is clamped to its buffer -----------------------------------------
+// Host-supplied geometry (tile extents, offsets, strides) decides these indices, and that geometry
+// is exactly what TILE-1 is in the middle of changing. WGSL does not trap an out-of-bounds access
+// (BUG-26), and wgpu asks for `buffer: Unchecked` on any adapter reporting robustBufferAccess2, so
+// on this hardware nothing catches one. A bad index wedges the GPU queue -- and on Apple Silicon
+// the GPU is shared with WindowServer, so that takes the whole desktop with it (two power cycles,
+// 2026-09-15). Clamping converts a machine lock into a wrong picture, which the round-trip tests
+// already fail on. It fires only when the host arithmetic is already wrong: on correct geometry
+// every index is in range and `min` is a no-op.
+
+fn out_store(i: u32, v: f32) {
+    output[min(i, max(arrayLength(&output), 1u) - 1u)] = v;
+}
+
+
 // Shared k values for this tile
 var<workgroup> shared_k: array<u32, 12>;
 var<workgroup> shared_k_zrl_nz: array<u32, 12>; // k_zrl after a large nonzero (|coeff|>=2)
@@ -195,7 +210,7 @@ fn decode_stream_body(
         let skip_g = compute_subband_group(cc0, cr0);
         if ((shared_skip_bitmap >> skip_g) & 1u) == 1u {
             let pi0 = (tile_origin_y + cr0) * params.plane_width + (tile_origin_x + cc0);
-            output[pi0] = 0.0;
+            out_store(pi0, 0.0);
             s += 1u;
             continue;
         }
@@ -217,11 +232,11 @@ fn decode_stream_body(
                 let ws_g = compute_subband_group(cc, cr);
                 if ((shared_skip_bitmap >> ws_g) & 1u) == 1u {
                     // Bitmap-skipped position: write zero but don't count toward run
-                    output[pi] = 0.0;
+                    out_store(pi, 0.0);
                     ws += 1u;
                     continue;
                 }
-                output[pi] = 0.0;
+                out_store(pi, 0.0);
                 written += 1u;
                 ws += 1u;
             }
@@ -244,7 +259,7 @@ fn decode_stream_body(
             let rice_val = read_rice(k);
             let magnitude = rice_val + 1u;
             let value = select(i32(magnitude), -i32(magnitude), sign == 1u);
-            output[plane_idx] = f32(value);
+            out_store(plane_idx, f32(value));
 
             // Update EMA with decoded magnitude
             p_ema[g] = p_ema[g] - (p_ema[g] >> 3u) + (rice_val << 1u);

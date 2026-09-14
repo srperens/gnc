@@ -68,6 +68,21 @@ struct Params {
 // quiet NaN as f32. Quantised coefficients are far inside f32's exact-integer range.
 @group(0) @binding(3) var<storage, read_write> out: array<f32>;
 
+// --- BUG-59: every index below is clamped to its buffer -----------------------------------------
+// Host-supplied geometry (tile extents, offsets, strides) decides these indices, and that geometry
+// is exactly what TILE-1 is in the middle of changing. WGSL does not trap an out-of-bounds access
+// (BUG-26), and wgpu asks for `buffer: Unchecked` on any adapter reporting robustBufferAccess2, so
+// on this hardware nothing catches one. A bad index wedges the GPU queue -- and on Apple Silicon
+// the GPU is shared with WindowServer, so that takes the whole desktop with it (two power cycles,
+// 2026-09-15). Clamping converts a machine lock into a wrong picture, which the round-trip tests
+// already fail on. It fires only when the host arithmetic is already wrong: on correct geometry
+// every index is in range and `min` is a no-op.
+
+fn out_store(i: u32, v: f32) {
+    out[min(i, max(arrayLength(&out), 1u) - 1u)] = v;
+}
+
+
 // Decoder state, per thread. Kept in one struct so the helpers read like the Rust ones.
 struct Dec {
     low: u32,
@@ -322,7 +337,7 @@ fn main(
                     v = i32(a);
                 }
             }
-            out[info.out_offset + y * info.stride + x] = f32(v);
+            out_store(info.out_offset + y * info.stride + x, f32(v));
             row_set(cur + x, tid, a);
         }
     }
@@ -487,7 +502,7 @@ fn main_rc(
                     v = i32(a);
                 }
             }
-            out[info.out_offset + y * info.stride + x] = f32(v);
+            out_store(info.out_offset + y * info.stride + x, f32(v));
             row_set(cur + x, tid, a);
         }
     }
